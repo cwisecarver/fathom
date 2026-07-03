@@ -61,8 +61,12 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
 
       # Force that lapse: the heartbeat expired before its next renewal (bumps the
       # generation), then recovers fresh. Now the fence can't just trust the
-      # heartbeat — it must revalidate the lock.
-      :sys.replace_state(hb, fn s -> %{s | expires_at_ms: now_ms() - 1_000} end)
+      # heartbeat — it must revalidate the lock. (Lapse detection is monotonic
+      # elapsed time — expert review #21.)
+      :sys.replace_state(hb, fn s ->
+        %{s | mono_deadline_ms: System.monotonic_time(:millisecond) - 1_000}
+      end)
+
       send(hb, :renew)
       _ = :sys.get_state(hb)
 
@@ -90,7 +94,10 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
     Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
 
     lapse = fn ->
-      :sys.replace_state(hb, fn s -> %{s | expires_at_ms: now_ms() - 1_000} end)
+      :sys.replace_state(hb, fn s ->
+        %{s | mono_deadline_ms: System.monotonic_time(:millisecond) - 1_000}
+      end)
+
       send(hb, :renew)
       _ = :sys.get_state(hb)
       :ok
