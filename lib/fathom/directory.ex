@@ -239,6 +239,43 @@ defmodule Fathom.Directory do
     Repo.aggregate(from(s in Shard, where: s.status == "migration_failed"), :count)
   end
 
+  @doc "The quarantined (`migration_failed`) shards."
+  @spec failed_shards() :: [Shard.t()]
+  def failed_shards do
+    Repo.all(from s in Shard, where: s.status == "migration_failed")
+  end
+
+  @doc """
+  Returns quarantined shards to `active` so the sweeps see them again — the exit path
+  `migration_failed` never had (expert review #25): quarantined shards were excluded
+  from laggards, reverts, and every sweep forever, so a wave of transient failures
+  (an S3 outage burning attempts) froze a slice of the fleet at the old version even
+  after the cause was fixed, and un-quarantining took hand-written SQL. Pass a list of
+  shard ids to requeue selectively, or `:all`. Returns the number requeued.
+  """
+  @spec requeue_failed(:all | [String.t()]) :: non_neg_integer()
+  def requeue_failed(shard_ids \\ :all)
+
+  def requeue_failed(:all) do
+    {n, _} =
+      Repo.update_all(
+        from(s in Shard, where: s.status == "migration_failed"),
+        set: [status: "active", updated_at: DateTime.utc_now()]
+      )
+
+    n
+  end
+
+  def requeue_failed(shard_ids) when is_list(shard_ids) do
+    {n, _} =
+      Repo.update_all(
+        from(s in Shard, where: s.status == "migration_failed" and s.shard_id in ^shard_ids),
+        set: [status: "active", updated_at: DateTime.utc_now()]
+      )
+
+    n
+  end
+
   @doc """
   The most-recently-active shards, newest first, capped at `limit` — the fleet-wide
   hot set a warm-standby (`Fathom.Shard.WarmFollower`) pre-pulls so a failover skips

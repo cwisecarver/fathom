@@ -81,6 +81,31 @@ defmodule Fathom.Migrator.RolloutTest do
     end
   end
 
+  # Expert review #25: migration_failed was a terminal state with no exit path —
+  # quarantined shards were excluded from laggards and every sweep forever, so a wave
+  # of transient failures froze a slice of the fleet at the old version even after the
+  # cause was fixed; un-quarantining took hand-written SQL against the shards table.
+  # The invariant: an operator API returns quarantined shards to the rollout.
+  describe "retry_failed/0" do
+    test "un-quarantines failed shards and re-enqueues their migration to HEAD" do
+      {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
+      {:ok, _} = Directory.resolve("fq")
+      {:ok, _} = Directory.mark_failed("fq")
+
+      # Quarantined: invisible to the sweep.
+      assert {:ok, 0} = Migrator.rollout()
+      refute_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => "fq"})
+
+      assert {:ok, 1} = Migrator.retry_failed()
+
+      assert {:ok, %{status: "active"}} = Directory.get("fq")
+      assert_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => "fq", "target" => 2})
+
+      # Idempotent: nothing left to requeue.
+      assert {:ok, 0} = Migrator.retry_failed()
+    end
+  end
+
   describe "revert/2" do
     test "enqueues a revert job for each active shard at the from-version" do
       for id <- ~w(a b) do

@@ -125,6 +125,37 @@ defmodule Fathom.Migrator do
   end
 
   @doc """
+  Un-quarantines every `migration_failed` shard and re-enqueues its migration to the
+  current HEAD (expert review #25) — the operator's "the cause is fixed, converge the
+  frozen slice" API. Returns `{:ok, enqueued_count}` (0 when nothing is quarantined
+  or no version is released).
+  """
+  @spec retry_failed() :: {:ok, non_neg_integer()}
+  def retry_failed do
+    failed = Directory.failed_shards()
+    _ = Directory.requeue_failed(Enum.map(failed, & &1.shard_id))
+
+    case {failed, head()} do
+      {[], _} ->
+        {:ok, 0}
+
+      {_, 0} ->
+        {:ok, 0}
+
+      {failed, head} ->
+        count =
+          failed
+          |> Enum.filter(&(&1.schema_version < head))
+          |> Enum.map(
+            &{&1.shard_id, ShardMigrationJob.new(%{shard_id: &1.shard_id, target: head})}
+          )
+          |> enqueue_unique()
+
+        {:ok, count}
+    end
+  end
+
+  @doc """
   Whether a fleet revert away from `from_version` has completed, and what's left:
   `%{remaining, in_flight, failed}` — shards still active at the version, revert jobs
   still in flight for them, and quarantined shards fleet-wide. Before this the only
