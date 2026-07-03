@@ -412,6 +412,23 @@ defmodule Fathom.ShardDurabilityTest do
     Connection.close(ro)
   end
 
+  # Expert review #5: the coordinator traps exits so a supervisor :shutdown runs
+  # terminate/2's final flush — but with no explicit :shutdown in the child spec, the
+  # worker default of 5 000 ms applied, and the supervisor brutal-killed the coordinator
+  # mid-flush whenever the fence + checkpoint + full-file S3 PUT + lease release exceeded
+  # 5 s (routine for multi-MB shards on a deploy, with every coordinator flushing through
+  # one Finch pool). The violated invariant: the shutdown budget must cover the terminate
+  # flush, and must be tunable for bigger shards / slower links.
+  test "the coordinator child spec carries an explicit shutdown budget for the terminate flush" do
+    assert %{shutdown: 60_000} = Fathom.Shard.child_spec("any_shard")
+
+    Application.put_env(:fathom, :shard_shutdown_ms, 120_000)
+    on_exit(fn -> Application.delete_env(:fathom, :shard_shutdown_ms) end)
+
+    assert %{shutdown: 120_000} = Fathom.Shard.child_spec("any_shard"),
+           "the budget must be config-tunable via :shard_shutdown_ms"
+  end
+
   test "a warm restart (local file present) opens dirty", %{shard: shard} do
     Application.put_env(:fathom, :shard_idle_ms, 50)
     # A valid empty local db stands in for un-flushed local state from a prior boot.

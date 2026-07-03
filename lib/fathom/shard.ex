@@ -60,6 +60,24 @@ defmodule Fathom.Shard do
   @default_lease_ttl_ms 30_000
   @default_flush_interval_ms 30_000
   @pull_timeout 60_000
+  # Supervisor shutdown budget for terminate/2's final fence + checkpoint + full-file
+  # S3 PUT + lease release. The worker default (5 000 ms) brutal-killed the flush
+  # mid-PUT on rolling deploys — a multi-MB shard at real S3 latency, queued behind
+  # every sibling coordinator flushing through the same Finch pool, easily exceeds
+  # 5 s — silently defeating the clean-shutdown durability guarantee trap_exit exists
+  # for. Bounded (not :infinity) so a hung storage call can't wedge the deploy; the
+  # in-flight PUT it may still cut off is etag-conditional, so never torn.
+  @default_shutdown_ms 60_000
+
+  # Overrides `use GenServer`'s generated child_spec to attach the shutdown budget
+  # (config-tunable: bigger shards / slower links warrant more).
+  @doc false
+  def child_spec(arg) do
+    arg
+    |> super()
+    |> Map.put(:shutdown, Application.get_env(:fathom, :shard_shutdown_ms, @default_shutdown_ms))
+  end
+
   # Above the coordinator's own open budget (@pull_timeout + lease acquire + any inline
   # flush), so a slow-but-normal cold open never trips the caller's checkout timeout.
   @default_checkout_timeout @pull_timeout + 15_000
