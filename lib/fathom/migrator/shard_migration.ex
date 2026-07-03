@@ -38,10 +38,16 @@ defmodule Fathom.Migrator.ShardMigration do
   @spec run(String.t(), non_neg_integer(), term()) ::
           :ok | {:ok, map()} | {:retry, term()} | {:error, term()}
   def run(shard_id, target, token \\ make_token()) do
-    case Directory.resolve(shard_id) do
+    # Directory.get, NOT resolve (expert review #40): resolve upserts last_active_at
+    # and registers unknown ids, so every rollout/reconcile sweep attempt — including
+    # ones that merely snooze — phantom-bumped recency on shards no client touched
+    # (corrupting warm-follower targeting, laggard ordering, and over-refusing the
+    # revert write-age guard), and a mistyped id minted a bogus active v0 row.
+    # Registering genuinely-new shards is the checkout path's job.
+    case Directory.get(shard_id) do
       {:ok, %{schema_version: v}} when v >= target -> :ok
       {:ok, _} -> with_lease(shard_id, token, fn lease -> do_run(shard_id, target, lease) end)
-      {:error, _} = error -> error
+      :error -> {:error, :unknown_shard}
     end
   end
 

@@ -128,6 +128,26 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert %{rows: [[1]]} = query_live!(shard, "PRAGMA user_version")
   end
 
+  # Expert review #40: run/3 used Directory.resolve — which upserts last_active_at and
+  # registers unknown ids — as its version read. Every sweep attempt phantom-bumped
+  # recency on shards no client touched (corrupting warm-follower targeting, laggard
+  # ordering, and over-refusing the revert write-age guard), and a mistyped shard id
+  # minted a bogus active v0 directory row. The invariant: the control plane READS the
+  # directory; only the checkout path registers and touches.
+  test "run reads the directory without touching recency or minting rows", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, before} = Directory.get(shard)
+
+    # The already-at-target no-op path must not bump last_active_at.
+    assert :ok = ShardMigration.run(shard, 1)
+    {:ok, unchanged} = Directory.get(shard)
+    assert DateTime.compare(unchanged.last_active_at, before.last_active_at) == :eq
+
+    # A mistyped id errors instead of minting an active v0 row.
+    assert {:error, :unknown_shard} = ShardMigration.run("no_such_shard_mig40", 1)
+    assert Directory.get("no_such_shard_mig40") == :error
+  end
+
   test "run is a no-op once the shard is already at the target", %{shard: shard} do
     seed_v1!(shard)
     {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)

@@ -135,6 +135,9 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
   end
 
   test "a held lease snoozes the job", %{shard: shard} do
+    # Jobs only ever target directory-known shards (they're enqueued from directory
+    # queries) — register it, since run/3 no longer implicitly mints rows (#40).
+    {:ok, _} = Directory.resolve(shard)
     put_foreign_lock(shard)
     {:ok, _} = Migrator.release(2, "v2", @v2_statements)
 
@@ -185,6 +188,7 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
   end
 
   test "exhausted attempts quarantine the shard", %{shard: shard} do
+    {:ok, _} = Directory.resolve(shard)
     # target 9 has no released statements -> a permanent {:error, :unknown_version}.
     capture_log(fn ->
       assert {:cancel, _} =
