@@ -88,13 +88,74 @@ defmodule Fathom.Migrator.Capture do
 
       {%{buffer: buffer, count_at_begin: before}, state} ->
         if count > before and buffer != [] do
-          {:reply, record(Enum.reverse(buffer)), state}
+          statements = Enum.reverse(buffer)
+
+          case record(statements) do
+            {:recorded, _} = recorded ->
+              {:reply, recorded, state}
+
+            {:error, _} = error ->
+              # Expert review #19: the migration has ALREADY committed on the template
+              # shard, so re-running `manage.py migrate` is a no-op — dropping this
+              # buffer on a Postgres blip would permanently fork template schema from
+              # fleet schema (every subsequent captured version assumes DDL the fleet
+              # never received, so all future replays fail or half-apply). Keep the
+              # statements and retry until the control plane recovers.
+              {:reply, error, stash_pending(state, statements)}
+          end
         else
           {:reply, :noop, state}
         end
     end
   end
 
+  @impl true
+  def handle_info(:retry_pending, state) do
+    state = Map.delete(state, :retry_timer)
+
+    case Map.pop(state, :pending, []) do
+      {[], state} ->
+        {:noreply, state}
+
+      {pending, state} ->
+        case drain_pending(pending) do
+          [] -> {:noreply, state}
+          still -> {:noreply, schedule_retry(Map.put(state, :pending, still))}
+        end
+    end
+  end
+
+  # Record pending captures IN ORDER, stopping at the first failure — each release
+  # takes head()+1, so recording a later capture past a failed earlier one would
+  # assign the fleet versions out of order.
+  defp drain_pending([]), do: []
+
+  defp drain_pending([statements | rest] = all) do
+    case record(statements) do
+      {:recorded, _} -> drain_pending(rest)
+      {:error, _} -> all
+    end
+  end
+
+  defp stash_pending(state, statements) do
+    schedule_retry(Map.update(state, :pending, [statements], &(&1 ++ [statements])))
+  end
+
+  defp schedule_retry(state) do
+    if Map.get(state, :retry_timer) do
+      state
+    else
+      Map.put(state, :retry_timer, Process.send_after(self(), :retry_pending, retry_ms()))
+    end
+  end
+
+  defp retry_ms, do: Application.get_env(:fathom, :capture_retry_ms, 5_000)
+
+  # The version is computed per attempt (head()+1 under the unique index as the
+  # arbiter), so a retry after the control plane recovers picks the then-current
+  # head. Rescue/catch: a Postgres outage RAISES from Repo (it doesn't return an
+  # error tuple), and a crash here would take the whole capture state — including
+  # every pending buffer this path exists to preserve — down with it.
   defp record(statements) do
     version = Migrator.head() + 1
 
@@ -107,5 +168,13 @@ defmodule Fathom.Migrator.Capture do
         Logger.error("failed to record captured version #{version}: #{inspect(error)}")
         error
     end
+  rescue
+    e ->
+      Logger.error("failed to record captured version: #{Exception.message(e)}")
+      {:error, e}
+  catch
+    :exit, reason ->
+      Logger.error("failed to record captured version: #{inspect(reason)}")
+      {:error, {:exit, reason}}
   end
 end

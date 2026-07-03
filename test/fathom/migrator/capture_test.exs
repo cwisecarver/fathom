@@ -36,6 +36,37 @@ defmodule Fathom.Migrator.CaptureTest do
              ]
     end
 
+    # Expert review #19: capture was fire-and-forget at the exact moment durability
+    # matters — on a failed Release insert (Postgres blip) the buffered statements were
+    # already popped from state, and the Django migration has ALREADY committed on the
+    # template shard, so re-running `manage.py migrate` is a no-op: the fleet version
+    # was permanently uncapturable, silently forking template schema from fleet schema
+    # (every later capture assumes DDL the fleet never received). The invariant: a
+    # capture survives a control-plane outage and records once it recovers.
+    test "a failed release keeps the captured statements and records them on retry" do
+      import ExUnit.CaptureLog
+
+      conn = make_ref()
+      Capture.begin(conn, 0)
+      Capture.append(conn, "CREATE TABLE app_kept (id INTEGER PRIMARY KEY)")
+
+      # The outage: cut the Capture process off from Postgres for the commit.
+      Ecto.Adapters.SQL.Sandbox.mode(Fathom.Repo, :manual)
+
+      log = capture_log(fn -> assert {:error, _} = Capture.commit(conn, 1) end)
+      assert log =~ "failed to record captured version"
+
+      # Postgres recovers; drive the retry tick deterministically (no sleep).
+      owner = Ecto.Adapters.SQL.Sandbox.start_owner!(Fathom.Repo, shared: true)
+      on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(owner) end)
+
+      send(Capture, :retry_pending)
+      _ = :sys.get_state(Capture)
+
+      assert Migrator.head() == 1, "the pending capture must record once Postgres recovers"
+      assert Migrator.statements(1) == ["CREATE TABLE app_kept (id INTEGER PRIMARY KEY)"]
+    end
+
     test "records nothing when the count doesn't rise" do
       conn = make_ref()
       Capture.begin(conn, 5)
