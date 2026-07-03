@@ -99,7 +99,15 @@ defmodule Fathom.Shard.Heartbeat do
       # > 2*ttl/3 left, so flushes never block; the margin only trips when a renewal
       # has been missed.
       margin_ms: max(div(ttl, 3), 1),
+      # Wall clock — what peers read in the stored heartbeat object.
       expires_at_ms: 0,
+      # Monotonic — drives the LOCAL validity/lapse decisions (expert review #21):
+      # "am I still valid?" and "did I lapse?" are pure elapsed-time questions that
+      # need no clock agreement, and a backward wall-clock step (NTP correction, VM
+      # live-migration) could otherwise inflate perceived validity past a real lapse —
+      # never edge-detecting it, never bumping the generation, and letting flushes
+      # skip revalidation against a peer that legitimately stole our shards.
+      mono_deadline_ms: nil,
       generation: generation,
       lapsed: false,
       timer: nil
@@ -118,15 +126,22 @@ defmodule Fathom.Shard.Heartbeat do
   def handle_call(:generation, _from, state), do: {:reply, state.generation, state}
 
   def handle_call({:valid_for_write, acquire_gen}, _from, state) do
-    now = Storage.now_ms()
+    now = System.monotonic_time(:millisecond)
 
     reply =
       cond do
-        # Not comfortably valid (expired or about to) — never write without confirmed liveness.
-        now + state.margin_ms >= state.expires_at_ms -> :not_valid
+        # Not comfortably valid (no confirmed renewal yet, expired, or about to) —
+        # never write without confirmed liveness. Monotonic, so a wall-clock step
+        # can't inflate perceived validity (expert review #21).
+        is_nil(state.mono_deadline_ms) or now + state.margin_ms >= state.mono_deadline_ms ->
+          :not_valid
+
         # A lapse happened since this shard was acquired — re-check ownership first.
-        state.generation != acquire_gen -> :revalidate
-        true -> :ok
+        state.generation != acquire_gen ->
+          :revalidate
+
+        true ->
+          :ok
       end
 
     {:reply, reply, state}
@@ -154,13 +169,18 @@ defmodule Fathom.Shard.Heartbeat do
   def terminate(_reason, _state), do: :ok
 
   defp do_renew(state) do
-    now = Storage.now_ms()
+    # Captured BEFORE the storage PUT: the local deadline must not outlive the stored
+    # object's expiry, and the PUT takes time — measuring after it would skew the
+    # deadline later (the unsafe direction).
+    now = System.monotonic_time(:millisecond)
 
     # Edge-detect a lapse: we had a valid heartbeat and it expired before we renewed.
+    # Monotonic elapsed time, immune to wall-clock steps (expert review #21).
     state =
-      if not state.lapsed and state.expires_at_ms > 0 and now > state.expires_at_ms,
-        do: mark_lapse(state),
-        else: state
+      if not state.lapsed and not is_nil(state.mono_deadline_ms) and
+           now > state.mono_deadline_ms,
+         do: mark_lapse(state),
+         else: state
 
     state =
       case Storage.renew_heartbeat(state.owner, state.ttl_ms) do
@@ -172,7 +192,7 @@ defmodule Fathom.Shard.Heartbeat do
           )
 
           # Recovered — fresh expiry, lapse episode over.
-          %{state | expires_at_ms: exp, lapsed: false}
+          %{state | expires_at_ms: exp, mono_deadline_ms: now + state.ttl_ms, lapsed: false}
 
         {:error, reason} ->
           Logger.warning("heartbeat renew failed for #{state.owner}: #{inspect(reason)}")

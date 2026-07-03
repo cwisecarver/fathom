@@ -63,7 +63,7 @@ defmodule Fathom.Shard.HeartbeatTest do
 
     # Simulate a missed renewal: the heartbeat expired before the next tick ran.
     :sys.replace_state(pid, fn s ->
-      %{s | expires_at_ms: System.system_time(:millisecond) - 1_000}
+      %{s | mono_deadline_ms: System.monotonic_time(:millisecond) - 1_000}
     end)
 
     capture_log(fn ->
@@ -82,10 +82,43 @@ defmodule Fathom.Shard.HeartbeatTest do
   test "not_valid when the heartbeat is not comfortably valid", %{pid: pid} do
     # Drive the confirmed expiry into the past: no comfortable margin ⇒ no write.
     :sys.replace_state(pid, fn s ->
-      %{s | expires_at_ms: System.system_time(:millisecond) - 1}
+      %{s | mono_deadline_ms: System.monotonic_time(:millisecond) - 1}
     end)
 
     assert Heartbeat.valid_for_write?(0) == :not_valid
+  end
+
+  # Expert review #21: the local validity/lapse decisions used the wall clock, so a
+  # backward clock step (NTP correction, VM live-migration) after a renewal inflated
+  # perceived remaining validity — a genuine lapse (during which a peer with a correct
+  # clock legitimately stole shards) was never edge-detected: no generation bump,
+  # valid_for_write? kept saying :ok, and flushes skipped revalidation against the
+  # stealer. The invariant: local expiry is elapsed time (monotonic), immune to steps.
+  # Simulated by the state a backward step produces: wall-clock expiry in the future,
+  # real (monotonic) deadline already passed.
+  test "a backward wall-clock step cannot mask a lapse", %{pid: pid} do
+    assert Heartbeat.valid_for_write?(0) == :ok
+
+    :sys.replace_state(pid, fn s ->
+      %{
+        s
+        | expires_at_ms: System.system_time(:millisecond) + 3_600_000,
+          mono_deadline_ms: System.monotonic_time(:millisecond) - 1_000
+      }
+    end)
+
+    assert Heartbeat.valid_for_write?(0) == :not_valid,
+           "a stepped-back wall clock must not make an expired heartbeat look valid"
+
+    capture_log(fn ->
+      send(pid, :renew)
+      _ = :sys.get_state(pid)
+    end)
+
+    assert Heartbeat.generation() == 1,
+           "the lapse must be edge-detected off elapsed (monotonic) time"
+
+    assert Heartbeat.valid_for_write?(0) == :revalidate
   end
 
   test "clears its heartbeat on clean shutdown", %{pid: pid, owner: owner} do
