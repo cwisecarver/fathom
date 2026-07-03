@@ -412,6 +412,44 @@ defmodule Fathom.ShardDurabilityTest do
     Connection.close(ro)
   end
 
+  # Expert review #15: `PRAGMA user_version = N` writes the database header but reports
+  # num_changes == 0 and no columns, and the blanket "pragma is control" classification
+  # treated it as a read — the shard stayed clean, idle drop_clean deleted the local copy
+  # without a flush, and the acknowledged version stamp silently vanished (a shard then
+  # looks un-migrated after a flush-and-drop cycle). The invariant: durable header writes
+  # dirty the shard; the bare read form and connection-local assignments stay clean.
+  test "PRAGMA user_version assignment dirties the shard and survives an idle drop",
+       %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, coordinator} = Shards.ensure(shard)
+
+    # Clean baseline so the pragma is the ONLY thing that can re-dirty the shard.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    flush_now(coordinator)
+    refute dirty?(shard), "baseline: clean after a flush"
+
+    # The read form and a connection-local assignment must NOT dirty.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("PRAGMA user_version"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("PRAGMA busy_timeout = 9000"))
+    refute dirty?(shard), "reads and connection-local pragmas must stay clean"
+
+    # The durable header write must dirty.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("PRAGMA user_version = 42"))
+    assert dirty?(shard), "a user_version stamp is a durable write"
+
+    # Round-trip: idle drop must flush the stamp, not lose it.
+    close_and_stop(shard, conn)
+    {:ok, conn2} = ShardExecutor.open(shard)
+
+    assert {:ok, %StmtResult{rows: [[42]]}} =
+             ShardExecutor.execute(conn2, stmt("PRAGMA user_version")),
+           "the version stamp must survive an idle-drop/reopen cycle"
+
+    close_and_stop(shard, conn2)
+  end
+
   # Expert review #14: the WriteCounter's ETS table dies with its owner, and a restart
   # handed every open coordinator a FRESH EMPTY table — count(id) = 0 — while each kept
   # its old flushed_through watermark, so `count > flushed_through` classified every

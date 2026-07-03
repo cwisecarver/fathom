@@ -121,12 +121,32 @@ defmodule Fathom.ShardExecutor do
 
   @control_prefixes ~w(begin commit end rollback savepoint release pragma)
 
+  # Header-writing pragma ASSIGNMENTS are durable file mutations that report
+  # num_changes == 0 and no columns, so the blanket "pragma is control" rule dropped
+  # them on idle (expert review #15): the shard stayed clean, drop_clean deleted the
+  # local copy without a flush, and the acknowledged stamp vanished. Pointed because
+  # `user_version` is fathom's own O(1) schema-version gate — external migration
+  # tooling stamping it through the data path is exactly the write that was lost.
+  # Whitelist (not "any pragma with ="): connection-local assignments like
+  # busy_timeout must stay clean, or per-connection setup pragmas would re-dirty
+  # read-only shards into needless durability uploads.
+  @durable_pragmas ~w(user_version application_id schema_version)
+
   defp control_statement?(sql) when is_binary(sql) do
     lead = sql |> String.trim_leading() |> String.downcase()
-    Enum.any?(@control_prefixes, &String.starts_with?(lead, &1))
+
+    Enum.any?(@control_prefixes, &String.starts_with?(lead, &1)) and
+      not durable_pragma_write?(lead)
   end
 
   defp control_statement?(_sql), do: false
+
+  # The assignment form (`pragma [db.]name = value`) of a header-writing pragma; the
+  # bare read form (`pragma user_version`) has no `=` and stays a read.
+  defp durable_pragma_write?(lead) do
+    String.starts_with?(lead, "pragma") and String.contains?(lead, "=") and
+      Enum.any?(@durable_pragmas, &String.contains?(lead, &1))
+  end
 
   # exqlite exposes no autocommit query; libSQL's hrana2 clients never ask, and
   # hrana3 `is_autocommit` is consulted only by batch conditions our paths don't
