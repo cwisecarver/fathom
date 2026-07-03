@@ -53,6 +53,31 @@ defmodule Fathom.Shards.NovelLimiterTest do
     end
   end
 
+  # Expert review #28: novel_refused?/1 called NovelLimiter.allow with no exit
+  # protection, while the adjacent directory read carefully caught :exit. The limiter's
+  # own backpressure model is mailbox saturation — exactly when GenServer.call starts
+  # exiting :timeout — and a crash/restart window exits :noproc. Un-caught, the spray
+  # the limiter exists to absorb crashed the whole open path (stream 500s) instead of
+  # refusing cleanly. The invariant: a down/saturated limiter fails CLOSED to the same
+  # clean {:error, :novel_shard_rate_limited} refusal.
+  test "a down limiter fails closed to a clean rate-limit refusal, not a caller crash" do
+    Application.put_env(:fathom, :novel_shard_rate, 1000)
+    shard = unique_shard("novel_down")
+
+    # Take the app's limiter down without a restart (a supervisor terminate_child
+    # stays down until restart_child) — the :noproc window, held open deterministically.
+    :ok = Supervisor.terminate_child(Fathom.DataPlane.Supervisor, Fathom.Shards.NovelLimiter)
+
+    on_exit(fn ->
+      Supervisor.restart_child(Fathom.DataPlane.Supervisor, Fathom.Shards.NovelLimiter)
+    end)
+
+    assert {:error, :novel_shard_rate_limited} = checkout(shard),
+           "an exit from the limiter must fail closed, not crash the open"
+
+    {:ok, _} = Supervisor.restart_child(Fathom.DataPlane.Supervisor, Fathom.Shards.NovelLimiter)
+  end
+
   # --- the token bucket itself (private instance, injected clock) ---
 
   describe "the bucket" do

@@ -225,8 +225,23 @@ defmodule Fathom.Shards do
       _rate ->
         not File.exists?(Fathom.Shard.db_path(shard_id)) and
           not known_to_directory?(shard_id) and
-          match?({:error, _}, Fathom.Shards.NovelLimiter.allow(shard_id))
+          limiter_refused?(shard_id)
     end
+  end
+
+  # The limiter call needs the same exit protection the directory read below has
+  # (expert review #28): the limiter's own backpressure model is mailbox saturation,
+  # which is exactly when GenServer.call starts exiting :timeout — and a limiter
+  # crash/restart window exits :noproc. Un-caught, those exits crashed the whole open
+  # path (Hrana stream 500s) under precisely the novel-shard spray the limiter exists
+  # to absorb, with each saturated caller pinning its connection 5 s. Fail CLOSED
+  # (refused) on an exit: under a spray, refusing is the limiter doing its job; a
+  # crashed limiter recovering for a few ms refusing a genuinely novel mint is the
+  # cheap direction (existing shards never reach this call).
+  defp limiter_refused?(shard_id) do
+    match?({:error, _}, Fathom.Shards.NovelLimiter.allow(shard_id))
+  catch
+    :exit, _ -> true
   end
 
   # The directory read fails OPEN (treat as known): the data path never blocks on or fails
