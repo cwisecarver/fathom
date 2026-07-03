@@ -32,6 +32,24 @@ defmodule Fathom.ShardDrainTest do
     assert Shards.drain(shard) == :ok
   end
 
+  # Expert review #41 (contract test): drain/2 must leave the caller's mailbox free of
+  # {:drain_aborted, _} whatever branch resolved it — a stale abort pins a DIFFERENT
+  # coordinator pid on any later call, so it would sit in a long-lived caller's mailbox
+  # forever. The specific leak window (an abort racing the +30s safety-net timeout)
+  # isn't reproducible in-suite; this pins the observable hygiene contract.
+  test "drain/2 leaves no stray drain_aborted in the caller's mailbox", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    # Busy path: the coordinator aborts the 50ms drain; drain/2 consumes the message.
+    assert {:error, :busy} = Shards.drain(shard, 50)
+    refute_receive {:drain_aborted, _}, 100
+
+    # Completed path: the coordinator stops; no abort left behind either.
+    :ok = ShardExecutor.close(conn)
+    assert :ok = Shards.drain(shard, 1_000)
+    refute_receive {:drain_aborted, _}, 100
+  end
+
   # Expert review #33: a checkout hitting a draining coordinator returned
   # {:error, :draining}, and open_error had no clause for it — the generic fallthrough
   # carried NO status, i.e. the transport-default 500. A drain is a routine, short-lived

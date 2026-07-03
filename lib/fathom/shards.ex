@@ -155,6 +155,7 @@ defmodule Fathom.Shards do
 
         receive do
           {:DOWN, ^ref, :process, ^pid, reason} ->
+            flush_drain_aborted(pid)
             drain_down_result(reason)
 
           {:drain_aborted, ^pid} ->
@@ -165,8 +166,23 @@ defmodule Fathom.Shards do
           # :drain_aborted well before this.
           drain_timeout + 30_000 ->
             Process.demonitor(ref, [:flush])
+            flush_drain_aborted(pid)
             {:error, :busy}
         end
+    end
+  end
+
+  # Consume a counterpart {:drain_aborted, pid} the coordinator may have sent before
+  # (or instead of) the branch we resolved on (expert review #41): a later drain/2
+  # call pins a DIFFERENT coordinator pid, so a stale message left behind is never
+  # matched again — an unbounded mailbox leak in long-lived callers (migration job
+  # runners, admin shells) and a hazard for any future bare receive. The [:flush]
+  # demonitor already covers the DOWN side symmetrically.
+  defp flush_drain_aborted(pid) do
+    receive do
+      {:drain_aborted, ^pid} -> :ok
+    after
+      0 -> :ok
     end
   end
 
