@@ -1,0 +1,130 @@
+defmodule Fathom.Cluster.HeartbeatFenceTest do
+  @moduledoc """
+  The coordinator in HEARTBEAT mode (the F1 fix): liveness is the node heartbeat, so
+  a coordinator does NO per-shard lease renewal (the storm is gone), and the flush
+  fence is the heartbeat's validity + a lock re-check only after a lapse. Proves both
+  the win (no renewal timer) and that single-writer safety still holds (a stolen
+  shard self-fences instead of clobbering the new owner).
+  """
+  use Fathom.ClusterShardCase, async: false
+
+  alias Fathom.Shard.Heartbeat
+
+  @hb_file Path.join([System.tmp_dir!(), "fathom_remote_test", "heartbeats", to_string(node())])
+
+  setup %{shard: shard} do
+    # Idle-stop fast so the flush path runs during the test.
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+    # Start the node heartbeat (the app leaves it off in test) → coordinators open in
+    # heartbeat mode. Long TTL so it never lapses on its own; tests force a lapse.
+    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
+    _ = :sys.get_state(hb)
+    on_exit(fn -> File.rm(@hb_file) end)
+    %{shard: shard, hb: hb}
+  end
+
+  test "an open shard schedules NO per-shard renewal (the storm is gone)", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, coordinator} = Shards.ensure(shard)
+    state = :sys.get_state(coordinator)
+
+    assert state.renew_timer == nil, "heartbeat mode must not arm a per-shard renewal timer"
+    assert is_integer(state.acquire_gen), "heartbeat mode records the acquire generation"
+
+    close_and_stop(shard, conn)
+  end
+
+  test "a clean idle flush still persists data (durability works without renewal)",
+       %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+
+    close_and_stop(shard, conn)
+
+    assert File.exists?(remote_db(shard)),
+           "a clean idle flush persists the shard in heartbeat mode"
+  end
+
+  test "a stolen shard self-fences at flush: revalidate → drop, never clobber the new owner",
+       %{shard: shard, hb: hb} do
+    capture_log(fn ->
+      {:ok, conn} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+
+      {:ok, coordinator} = Shards.ensure(shard)
+      ref = Process.monitor(coordinator)
+
+      # A thief takes the lock — which is only possible because our heartbeat lapsed.
+      put_raw_lock(shard, "thief@node", 999, now_ms() + 60_000)
+
+      # Force that lapse: the heartbeat expired before its next renewal (bumps the
+      # generation), then recovers fresh. Now the fence can't just trust the
+      # heartbeat — it must revalidate the lock.
+      :sys.replace_state(hb, fn s -> %{s | expires_at_ms: now_ms() - 1_000} end)
+      send(hb, :renew)
+      _ = :sys.get_state(hb)
+
+      # Releasing the last connection idles → flush → fence: :revalidate →
+      # check_lease sees the thief → drop local WITHOUT flushing.
+      :ok = ShardExecutor.close(conn)
+      assert_receive {:DOWN, ^ref, :process, ^coordinator, :normal}, 2_000
+    end)
+
+    refute File.exists?(remote_db(shard)), "fenced coordinator must not flush over the new owner"
+    refute File.exists?(local_db(shard)), "fenced coordinator drops its local copy"
+  end
+
+  # Finding #5: the fence baseline (acquire_gen) must be sampled BEFORE acquire_lease. Force a
+  # heartbeat lapse+recover DURING acquire (the VM-pause window the bug rides): if the baseline
+  # is captured after acquire it records the post-lapse generation, so the later flush trusts
+  # the heartbeat and clobbers a thief; captured before acquire, the lapse trips :revalidate and
+  # the coordinator self-fences. (Unlike the test above, this forces the lapse during open, not
+  # after — so it fails pre-fix.)
+  test "a lapse during open leaves the baseline stale so the flush self-fences", %{
+    shard: shard,
+    hb: hb
+  } do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    lapse = fn ->
+      :sys.replace_state(hb, fn s -> %{s | expires_at_ms: now_ms() - 1_000} end)
+      send(hb, :renew)
+      _ = :sys.get_state(hb)
+      :ok
+    end
+
+    Application.put_env(:fathom, :faulty_before, {:acquire, lapse})
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    capture_log(fn ->
+      {:ok, conn} = ShardExecutor.open(shard)
+      # Only wanted the lapse during the open's acquire_lease.
+      Application.delete_env(:fathom, :faulty_before)
+
+      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+
+      {:ok, coordinator} = Shards.ensure(shard)
+      ref = Process.monitor(coordinator)
+
+      # A thief takes the lock (possible only because our heartbeat lapsed during open).
+      put_raw_lock(shard, "thief@node", 999, now_ms() + 60_000)
+
+      :ok = ShardExecutor.close(conn)
+      assert_receive {:DOWN, ^ref, :process, ^coordinator, :normal}, 2_000
+    end)
+
+    refute File.exists?(remote_db(shard)),
+           "a lapse during open must leave the acquire baseline stale so the flush self-fences"
+  end
+end

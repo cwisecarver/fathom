@@ -1,0 +1,100 @@
+defmodule Fathom.ShardDrainTest do
+  # Fathom.Shards.drain/2 stands a coordinator down (refuse new checkouts, drain
+  # in-flight, flush, release the lease, stop) so the migrator can take over. Uses
+  # the real coordinator + filesystem storage; not async (shards are global).
+  use ExUnit.Case, async: false
+
+  alias Fathom.{Shard, ShardExecutor, Shards}
+  alias Fathom.Shard.Connection
+  alias Filo.{Error, Stmt}
+
+  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
+  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
+
+  setup do
+    shard = "drain_#{System.unique_integer([:positive])}"
+
+    on_exit(fn ->
+      for dir <- [@local_dir, @remote_dir],
+          suffix <- [".db", ".db-wal", ".db-shm", ".lock"],
+          do: File.rm(Path.join(dir, shard <> suffix))
+    end)
+
+    %{shard: shard}
+  end
+
+  defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
+  defp local_db(shard), do: Path.join(@local_dir, "#{shard}.db")
+  defp remote_db(shard), do: Path.join(@remote_dir, "#{shard}.db")
+  defp lock_file(shard), do: Path.join(@remote_dir, "#{shard}.lock")
+
+  test "drain on a shard with no coordinator is a no-op", %{shard: shard} do
+    assert Shards.drain(shard) == :ok
+  end
+
+  test "drain flushes the latest data, releases the lease, and stops", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+    :ok = ShardExecutor.close(conn)
+
+    assert :ok = Shards.drain(shard)
+
+    assert File.exists?(remote_db(shard)), "data was flushed to storage"
+    refute File.exists?(local_db(shard)), "local copy was dropped"
+    refute File.exists?(lock_file(shard)), "lease was released"
+
+    {:ok, ro} = Connection.open(remote_db(shard))
+    assert {:ok, %{rows: [["alice"]]}} = Connection.query(ro, "SELECT v FROM kv", [])
+    Connection.close(ro)
+  end
+
+  test "draining lets an in-flight connection finish, then flushes and stops", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('bob')"))
+
+    {:ok, pid} = Shards.ensure(shard)
+    ref = Process.monitor(pid)
+
+    Shard.request_drain(pid, 5_000, self())
+    _ = :sys.get_state(pid)
+    assert :sys.get_state(pid).draining
+
+    :ok = ShardExecutor.close(conn)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 1_000
+
+    refute File.exists?(lock_file(shard))
+
+    {:ok, ro} = Connection.open(remote_db(shard))
+    assert {:ok, %{rows: [["bob"]]}} = Connection.query(ro, "SELECT v FROM kv", [])
+    Connection.close(ro)
+  end
+
+  test "checkout is refused while the shard is draining", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, pid} = Shards.ensure(shard)
+
+    Shard.request_drain(pid, 5_000, self())
+    _ = :sys.get_state(pid)
+
+    assert {:error, %Error{code: "FILO_SHARD_OPEN"}} = ShardExecutor.open(shard)
+
+    ref = Process.monitor(pid)
+    :ok = ShardExecutor.close(conn)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 1_000
+  end
+
+  test "drain times out and the coordinator resumes when connections don't drain",
+       %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, pid} = Shards.ensure(shard)
+
+    assert {:error, :busy} = Shards.drain(shard, 100)
+
+    assert Process.alive?(pid)
+    refute :sys.get_state(pid).draining
+
+    ShardExecutor.close(conn)
+  end
+end

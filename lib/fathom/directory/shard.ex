@@ -1,0 +1,57 @@
+defmodule Fathom.Directory.Shard do
+  @moduledoc """
+  A row in the Postgres shard **directory** — the control plane's record of a
+  shard: which schema version its data sits at, its lifecycle `status`, when it
+  was last used, and (once retired) how long to keep it.
+
+  This is metadata *about* a shard, distinct from `Fathom.Shard` (the per-shard
+  coordinator process that owns the live SQLite file). The directory is what the
+  rollout/migration machinery reads and flips; the data path keeps running off
+  `Fathom.Shards` whether or not the directory is reachable.
+  """
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  @statuses ~w(active migrating retired migration_failed)
+
+  @type t :: %__MODULE__{}
+
+  schema "shards" do
+    field :shard_id, :string
+    field :schema_version, :integer, default: 0
+    field :status, :string, default: "active"
+    field :last_active_at, :utc_datetime_usec
+    field :retain_until, :utc_datetime_usec
+    # When the shard entered `migrating` — the reconcile sweep times a migration out from
+    # this (not updated_at, which traffic bumps). Set on mark_migrating, cleared on cutover /
+    # mark_failed.
+    field :migrating_since, :utc_datetime_usec
+
+    timestamps(type: :utc_datetime_usec)
+  end
+
+  @doc "Valid lifecycle statuses for a directory entry."
+  def statuses, do: @statuses
+
+  @doc false
+  def changeset(shard, attrs) do
+    shard
+    |> cast(attrs, [
+      :shard_id,
+      :schema_version,
+      :status,
+      :last_active_at,
+      :retain_until,
+      :migrating_since
+    ])
+    |> validate_required([:shard_id, :schema_version, :status, :last_active_at])
+    # Shard ids become SQLite file names and registry keys elsewhere; defer to the single
+    # source of truth (Fathom.ShardId) rather than duplicating the pattern (finding #19).
+    |> validate_change(:shard_id, fn :shard_id, id ->
+      if Fathom.ShardId.valid?(id), do: [], else: [shard_id: "is not a valid shard id"]
+    end)
+    |> validate_number(:schema_version, greater_than_or_equal_to: 0)
+    |> validate_inclusion(:status, @statuses)
+    |> unique_constraint(:shard_id)
+  end
+end

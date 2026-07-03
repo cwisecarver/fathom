@@ -1,0 +1,439 @@
+defmodule Fathom.ShardDurabilityTest do
+  # The periodic durability flush: a busy shard (connection still open, never
+  # idle) still gets a consistent snapshot pushed to storage, so the data-loss
+  # window is bounded to the flush interval instead of the whole session. Fenced
+  # like the idle flush. Not async: shards are global.
+  use ExUnit.Case, async: false
+
+  import ExUnit.CaptureLog
+
+  alias Fathom.{Shard, ShardExecutor, Shards}
+  alias Fathom.Shard.{Connection, Storage}
+  alias Filo.{Stmt, StmtResult}
+
+  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
+  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
+
+  setup do
+    shard = "dur_#{System.unique_integer([:positive])}"
+    prev_flush = Application.get_env(:fathom, :shard_flush_interval_ms)
+    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
+
+    on_exit(fn ->
+      restore(:shard_flush_interval_ms, prev_flush)
+      restore(:shard_idle_ms, prev_idle)
+
+      for dir <- [@local_dir, @remote_dir],
+          suffix <- [".db", ".db-wal", ".db-shm", ".lock"],
+          do: File.rm(Path.join(dir, shard <> suffix))
+
+      for snap <- Path.wildcard(Path.join(@local_dir, "#{shard}.db.snap.*")), do: File.rm(snap)
+    end)
+
+    %{shard: shard}
+  end
+
+  defp restore(key, nil), do: Application.delete_env(:fathom, key)
+  defp restore(key, value), do: Application.put_env(:fathom, key, value)
+
+  defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
+  defp now_ms, do: System.system_time(:millisecond)
+  defp local_db(shard), do: Path.join(@local_dir, "#{shard}.db")
+  defp remote_db(shard), do: Path.join(@remote_dir, "#{shard}.db")
+
+  defp dirty?(shard) do
+    {:ok, pid} = Shards.ensure(shard)
+    Shard.dirty?(pid)
+  end
+
+  defp close_and_stop(shard, conn) do
+    {:ok, pid} = Shards.ensure(shard)
+    ref = Process.monitor(pid)
+    :ok = ShardExecutor.close(conn)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 2_000
+  end
+
+  defp put_raw_lock(shard, owner, epoch, expires_at_ms) do
+    File.mkdir_p!(@remote_dir)
+
+    File.write!(
+      Path.join(@remote_dir, "#{shard}.lock"),
+      Jason.encode!(%{"owner" => owner, "epoch" => epoch, "expires_at_ms" => expires_at_ms})
+    )
+  end
+
+  # Drive exactly one durability flush and wait for the coordinator to finish it.
+  defp flush_now(coordinator) do
+    send(coordinator, :durability_flush)
+    _ = :sys.get_state(coordinator)
+    :ok
+  end
+
+  test "a durability flush snapshots committed writes to storage while a connection stays open",
+       %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (1, 'alice')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+
+    # Cold shard, connection still open: nothing has reached storage yet.
+    refute File.exists?(remote_db(shard))
+
+    flush_now(coordinator)
+
+    # The consistent snapshot reached storage mid-session, and it captured the
+    # committed row.
+    assert File.exists?(remote_db(shard))
+
+    {:ok, ro} = Connection.open(remote_db(shard))
+    assert {:ok, %{rows: [["alice"]]}} = Connection.query(ro, "SELECT v FROM kv WHERE k = 1", [])
+    Connection.close(ro)
+
+    # The live connection is unaffected by the snapshot.
+    assert {:ok, %StmtResult{}} =
+             ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (2, 'bob')"))
+
+    ShardExecutor.close(conn)
+  end
+
+  test "the durability flush is fenced: a lost lease self-fences instead of clobbering",
+       %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    ref = Process.monitor(coordinator)
+
+    # Another node steals the lease before the periodic flush fires.
+    put_raw_lock(shard, "thief@node", 999, now_ms() + 60_000)
+
+    capture_log(fn ->
+      send(coordinator, :durability_flush)
+      assert_receive {:DOWN, ^ref, :process, ^coordinator, {:shutdown, :lease_lost}}, 1_000
+    end)
+
+    refute File.exists?(remote_db(shard)),
+           "a fenced durability flush must not clobber the new owner"
+  end
+
+  # Finding #15: the LEASE fence (above) passes if the lease is still ours when the flush
+  # STARTS — but the data PUT itself was unconditional, so a steal DURING the upload (a long
+  # snapshot/PUT outliving the lease margin) still let a stale PUT clobber the new owner. The
+  # fenced flush If-Matches the object etag, so a mid-flush change surfaces as :superseded and
+  # the coordinator self-fences instead of overwriting. Here the object is stolen from inside
+  # the flush call (FaultyStorage :faulty_before hook), after the fence check has passed.
+  test "the durability flush is etag-fenced: an object stolen mid-flush self-fences, no clobber",
+       %{shard: shard} do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    # During the flush PUT, a stealer overwrites the shard object (changing its etag).
+    steal = fn -> File.write!(remote_db(shard), "stolen-by-a-newer-owner") end
+    Application.put_env(:fathom, :faulty_before, {:flush, steal})
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    ref = Process.monitor(coordinator)
+
+    capture_log(fn ->
+      send(coordinator, :durability_flush)
+      assert_receive {:DOWN, ^ref, :process, ^coordinator, {:shutdown, :lease_lost}}, 1_000
+    end)
+
+    assert File.read!(remote_db(shard)) == "stolen-by-a-newer-owner",
+           "the coordinator must not clobber the object a stealer wrote during the flush"
+  end
+
+  # Finding #27: dirtiness is a write-counter watermark, not a boolean cleared after the flush. A
+  # write that lands DURING the (blocking) snapshot/upload must keep the shard dirty — the flush
+  # captures the counter BEFORE snapshotting and only advances the watermark to that, so a mid-flush
+  # bump stays ahead of it and re-flushes next interval. An unconditional clear would silently drop
+  # that write. Here the write is simulated by bumping the counter from inside the flush call.
+  test "a write landing during a flush keeps the shard dirty (watermark, not a boolean)",
+       %{shard: shard} do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    Application.put_env(
+      :fathom,
+      :faulty_before,
+      {:flush, fn -> Fathom.Shard.WriteCounter.bump(shard) end}
+    )
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    flush_now(coordinator)
+
+    assert Shard.dirty?(coordinator),
+           "a write during the flush must keep the shard dirty, not be cleared by the flush"
+
+    ShardExecutor.close(conn)
+  end
+
+  test "a zero interval disables the periodic flush timer", %{shard: shard} do
+    Application.put_env(:fathom, :shard_flush_interval_ms, 0)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, coordinator} = Shards.ensure(shard)
+
+    assert %{flush_timer: nil} = :sys.get_state(coordinator)
+
+    ShardExecutor.close(conn)
+  end
+
+  # --- dirty-flag / durability-storm fix ---
+
+  test "a read leaves the shard clean; a write dirties it", %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    {:ok, _} = ShardExecutor.execute(conn, stmt("SELECT 1"))
+    refute dirty?(shard), "a read must not dirty the shard"
+
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    assert dirty?(shard), "a write (DDL here) dirties the shard"
+
+    close_and_stop(shard, conn)
+  end
+
+  test "INSERT ... RETURNING dirties the shard so idle-drop flushes it, not loses it",
+       %{shard: shard} do
+    # Regression: SQLite's RETURNING makes a write return columns, and the classifier
+    # tested columns before num_changes — so a RETURNING insert looked like a read, the
+    # shard never went dirty, and idle-drop deleted the only copy. Django emits
+    # `INSERT ... RETURNING "id"` on every object save, so this lost data on the common path.
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, coordinator} = Shards.ensure(shard)
+
+    # Reach a clean baseline: create the table and flush it to storage. This isolates
+    # the RETURNING insert as the ONLY thing that can re-dirty the shard afterward —
+    # otherwise the CREATE TABLE's own dirtying would mask the classifier bug.
+    {:ok, _} =
+      ShardExecutor.execute(conn, stmt("CREATE TABLE kv (id INTEGER PRIMARY KEY, v TEXT)"))
+
+    flush_now(coordinator)
+    refute dirty?(shard), "baseline: the shard is clean after a flush"
+
+    {:ok, %StmtResult{}} =
+      ShardExecutor.execute(conn, stmt("INSERT INTO kv (v) VALUES ('alice') RETURNING id"))
+
+    assert dirty?(shard), "a RETURNING insert must mark the shard dirty"
+
+    # Round-trip: closing the last connection idle-stops the coordinator, which (being
+    # dirty) flushes to storage before dropping the local copy; reopening pulls it back.
+    # Pre-fix the shard stayed clean, so the local copy was dropped un-flushed and the
+    # RETURNING row was lost.
+    close_and_stop(shard, conn)
+
+    {:ok, conn2} = ShardExecutor.open(shard)
+
+    assert {:ok, %StmtResult{rows: [["alice"]]}} =
+             ShardExecutor.execute(conn2, stmt("SELECT v FROM kv")),
+           "the RETURNING-inserted row must survive an idle-drop/reopen cycle"
+
+    close_and_stop(shard, conn2)
+  end
+
+  test "a dirty durability flush uploads and clears the flag; a clean one skips",
+       %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('a')"))
+    assert dirty?(shard)
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    flush_now(coordinator)
+    assert File.exists?(remote_db(shard)), "a dirty durability flush uploads"
+    refute dirty?(shard), "the flush clears the dirty flag"
+
+    # Now clean: remove the object and flush again — a clean flush must NOT recreate it.
+    File.rm!(remote_db(shard))
+    flush_now(coordinator)
+    refute File.exists?(remote_db(shard)), "a clean durability flush skips the upload"
+
+    close_and_stop(shard, conn)
+  end
+
+  test "a failed durability upload keeps the shard dirty so a later idle-drop doesn't lose it",
+       %{shard: shard} do
+    # Regression: the periodic flush cleared `dirty` unconditionally, even when the
+    # snapshot/upload failed (the error was only logged). A transient storage blip then
+    # left the shard "clean" with un-flushed writes, and idle-drop deleted the only copy.
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :storage_fault)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+    assert dirty?(shard)
+
+    {:ok, coordinator} = Shards.ensure(shard)
+
+    # The upload fails: the shard MUST stay dirty (retry next interval, flush before drop).
+    Application.put_env(:fathom, :storage_fault, :flush)
+
+    capture_log(fn -> flush_now(coordinator) end)
+
+    assert dirty?(shard), "a failed durability upload must NOT clear the dirty flag"
+    refute File.exists?(remote_db(shard)), "the failed upload left nothing in storage"
+
+    # Storage recovers: the next flush uploads the still-dirty state and clears the flag.
+    Application.delete_env(:fathom, :storage_fault)
+    flush_now(coordinator)
+
+    assert File.exists?(remote_db(shard)), "the retry uploads the un-lost writes"
+    refute dirty?(shard), "a successful flush clears the flag"
+
+    {:ok, ro} = Connection.open(remote_db(shard))
+    assert {:ok, %{rows: [["alice"]]}} = Connection.query(ro, "SELECT v FROM kv", [])
+    Connection.close(ro)
+
+    close_and_stop(shard, conn)
+  end
+
+  test "a supervisor shutdown flushes via terminate/2 instead of losing the write",
+       %{shard: shard} do
+    # Regression: the coordinator didn't trap exits, so a supervisor `:shutdown` (SIGTERM,
+    # rolling deploy) killed it WITHOUT running terminate/2 — the final flush never ran and
+    # writes since the last periodic flush were lost. Disable the periodic flush and use a
+    # long idle window so ONLY terminate/2 can push the write to storage.
+    Application.put_env(:fathom, :shard_flush_interval_ms, 0)
+    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    assert Shard.dirty?(coordinator)
+
+    # Close the connection: conns -> 0, but no idle stop (long window) and no periodic
+    # flush (interval 0), so nothing has reached storage yet.
+    :ok = ShardExecutor.close(conn)
+    _ = :sys.get_state(coordinator)
+    refute File.exists?(remote_db(shard)), "nothing flushed before the shutdown"
+
+    # Supervisor-initiated shutdown — the SIGTERM/deploy path (parent terminates child).
+    ref = Process.monitor(coordinator)
+    :ok = DynamicSupervisor.terminate_child(Fathom.ShardSupervisor, coordinator)
+    assert_receive {:DOWN, ^ref, :process, ^coordinator, _}, 2_000
+
+    assert File.exists?(remote_db(shard)), "terminate/2 flushed the write on shutdown"
+
+    {:ok, ro} = Connection.open(remote_db(shard))
+    assert {:ok, %{rows: [["alice"]]}} = Connection.query(ro, "SELECT v FROM kv", [])
+    Connection.close(ro)
+  end
+
+  test "a warm restart (local file present) opens dirty", %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+    # A valid empty local db stands in for un-flushed local state from a prior boot.
+    {:ok, c} = Connection.open(local_db(shard))
+    Connection.close(c)
+
+    capture_log(fn ->
+      {:ok, pid, ref, _path} = Shards.checkout(shard)
+      assert Shard.dirty?(pid), "a warm restart may hold un-flushed writes → opens dirty"
+
+      mref = Process.monitor(pid)
+      Shard.checkin(pid, ref)
+      assert_receive {:DOWN, ^mref, :process, ^pid, :normal}, 2_000
+    end)
+  end
+
+  test "a clean cold-pulled shard idle-stops without re-uploading", %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+    # Seed the object so opening is a cold PULL (local == storage ⇒ clean).
+    seed = Path.join(System.tmp_dir!(), "seed_#{shard}.db")
+    {:ok, c} = Connection.open(seed)
+    :ok = Connection.exec(c, "CREATE TABLE kv (v TEXT)")
+    :ok = Connection.exec(c, "INSERT INTO kv VALUES ('seed')")
+    :ok = Connection.exec(c, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(c)
+    :ok = Storage.flush(shard, seed)
+    for s <- ["", "-wal", "-shm"], do: File.rm(seed <> s)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, %StmtResult{rows: [["seed"]]}} = ShardExecutor.execute(conn, stmt("SELECT v FROM kv"))
+    refute dirty?(shard), "a cold-pulled, read-only shard is clean"
+
+    # Drop the object: a clean idle-stop must NOT recreate it (skip the upload).
+    File.rm!(remote_db(shard))
+    close_and_stop(shard, conn)
+
+    refute File.exists?(remote_db(shard)), "a clean idle-stop skips the upload"
+    refute File.exists?(local_db(shard)), "idle-stop still drops the local copy"
+  end
+
+  # Finding #8: the coordinator is restart: :temporary, so a hard crash must NOT auto-restart it.
+  # A restarted-but-empty coordinator (conns: %{}) would later flush-and-drop the file under the
+  # surviving Filo streams that still hold it open, or hold the shard + lease forever. Instead the
+  # next checkout re-creates it fresh, re-adopting the warm local file (the un-flushed write survives).
+  test "a crashed coordinator is not auto-restarted; the next checkout re-adopts the warm file",
+       %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    ref = Process.monitor(coordinator)
+
+    # Hard crash: bypasses terminate/2, so no flush, no drop_local, no lease release.
+    Process.exit(coordinator, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^coordinator, :killed}, 1_000
+
+    # Flush the supervisor's mailbox so its (non-)restart decision has been made, then assert no
+    # phantom coordinator was restarted. Under :transient this returns the auto-restarted pid.
+    _ = :sys.get_state(Fathom.ShardSupervisor)
+
+    assert Registry.lookup(Fathom.ShardRegistry, shard) == [],
+           "a :temporary coordinator must not be auto-restarted after a crash"
+
+    ShardExecutor.close(conn)
+
+    # The next checkout re-creates the coordinator, which re-adopts the present local file.
+    {:ok, conn2} = ShardExecutor.open(shard)
+
+    assert {:ok, %StmtResult{rows: [["alice"]]}} =
+             ShardExecutor.execute(conn2, stmt("SELECT v FROM kv")),
+           "the un-flushed committed write survived the crash and was re-adopted"
+
+    ShardExecutor.close(conn2)
+  end
+end

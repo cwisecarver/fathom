@@ -1,0 +1,3 @@
+# Timestamped test/bench output (pruned daily). Keep the dir, ignore its contents.
+*
+!.gitignore

@@ -1,0 +1,100 @@
+defmodule Fathom.LazyMigrateTest do
+  # Migrate-then-serve on checkout: a behind-HEAD shard is migrated inline before
+  # it serves. Real shard machinery + storage + directory; not async.
+  use Fathom.DataCase, async: false
+
+  alias Fathom.{Directory, Migrator, ShardExecutor}
+  alias Fathom.Shard.{Connection, Storage}
+  alias Filo.{Stmt, StmtResult}
+
+  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
+
+  @v2_statements [
+    "ALTER TABLE app_thing ADD COLUMN created_at TEXT",
+    "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0002', 'now')"
+  ]
+
+  setup do
+    shard = "lazy_#{System.unique_integer([:positive])}"
+    prev = Application.get_env(:fathom, :lazy_migrate)
+
+    on_exit(fn ->
+      if prev == nil,
+        do: Application.delete_env(:fathom, :lazy_migrate),
+        else: Application.put_env(:fathom, :lazy_migrate, prev)
+
+      for path <- Path.wildcard(Path.join(@remote_dir, "#{shard}*")), do: File.rm(path)
+
+      for path <- Path.wildcard(Path.join([System.tmp_dir!(), "fathom_shards", "#{shard}*"])),
+          do: File.rm(path)
+    end)
+
+    %{shard: shard}
+  end
+
+  defp seed_v1!(shard) do
+    seed = Path.join(System.tmp_dir!(), "seedl_#{shard}_#{System.unique_integer([:positive])}.db")
+    {:ok, conn} = Connection.open(seed)
+    :ok = Connection.exec(conn, "CREATE TABLE app_thing (id INTEGER PRIMARY KEY, name TEXT)")
+    :ok = Connection.exec(conn, "INSERT INTO app_thing (id, name) VALUES (1, 'alice')")
+
+    :ok =
+      Connection.exec(
+        conn,
+        "CREATE TABLE django_migrations (id INTEGER PRIMARY KEY, app TEXT, name TEXT, applied TEXT)"
+      )
+
+    :ok =
+      Connection.exec(
+        conn,
+        "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0001', 'now')"
+      )
+
+    :ok = Connection.exec(conn, "PRAGMA user_version = 1")
+    :ok = Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(conn)
+
+    :ok = Storage.flush(shard, seed)
+    for s <- ["", "-wal", "-shm"], do: File.rm(seed <> s)
+
+    {:ok, _} = Directory.resolve(shard)
+    {:ok, _} = Directory.cutover(shard, 1)
+    :ok
+  end
+
+  defp exec(conn, sql), do: ShardExecutor.execute(conn, %Stmt{sql: sql, args: []})
+
+  test "checkout migrates a behind-HEAD shard before serving", %{shard: shard} do
+    Application.put_env(:fathom, :lazy_migrate, true)
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    # HEAD is read from the TTL cache on the checkout path; force it fresh so the test
+    # doesn't race the background refresh window (see Fathom.Migrator.HeadCache).
+    Migrator.HeadCache.refresh()
+
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    # The shard was migrated to v2 before serving.
+    assert {:ok, %{schema_version: 2}} = Directory.get(shard)
+
+    # And the connection serves v2 (new column present, original row preserved).
+    assert {:ok, %StmtResult{rows: [[1, "alice", nil]]}} =
+             exec(conn, "SELECT id, name, created_at FROM app_thing")
+
+    ShardExecutor.close(conn)
+  end
+
+  test "without lazy_migrate, checkout serves the shard as-is", %{shard: shard} do
+    # lazy_migrate stays disabled (default).
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    assert {:ok, %{schema_version: 1}} = Directory.get(shard)
+    # No new column — the shard is still v1.
+    assert {:ok, %StmtResult{cols: ["id", "name"]}} = exec(conn, "SELECT * FROM app_thing")
+
+    ShardExecutor.close(conn)
+  end
+end
