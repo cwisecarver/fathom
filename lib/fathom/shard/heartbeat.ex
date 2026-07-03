@@ -71,8 +71,26 @@ defmodule Fathom.Shard.Heartbeat do
         Application.get_env(:fathom, :shard_lease_ttl_ms, @default_ttl_ms)
       )
 
+    owner = Keyword.get(opts, :owner, owner())
+
+    # The lapse generation must survive this process: it is the coordinators' proof
+    # that "no lapse happened since acquire ⇒ no steal was possible", and a restart
+    # gap is itself a window in which the heartbeat may have lapsed and a steal
+    # occurred. Resetting to 0 on restart forged that proof for every coordinator
+    # acquired at generation 0 of the previous incarnation. Persist it per owner and
+    # treat every re-boot of an already-seen owner as a lapse episode — all
+    # pre-restart acquire_gens then mismatch and force one cheap revalidation.
+    generation = :persistent_term.get(gen_key(owner), -1) + 1
+    :persistent_term.put(gen_key(owner), generation)
+
+    if generation > 0 do
+      Logger.warning(
+        "heartbeat restarted for #{owner} (generation #{generation}); coordinators will revalidate"
+      )
+    end
+
     state = %{
-      owner: Keyword.get(opts, :owner, owner()),
+      owner: owner,
       ttl_ms: ttl,
       # Renew every third of the TTL (a couple of misses don't lapse the lease).
       renew_ms: max(div(ttl, 3), 1),
@@ -82,7 +100,7 @@ defmodule Fathom.Shard.Heartbeat do
       # has been missed.
       margin_ms: max(div(ttl, 3), 1),
       expires_at_ms: 0,
-      generation: 0,
+      generation: generation,
       lapsed: false,
       timer: nil
     }
@@ -164,8 +182,12 @@ defmodule Fathom.Shard.Heartbeat do
     schedule_renew(state)
   end
 
+  # The persisted-generation key for `owner` (see init/1 — restart continuity).
+  defp gen_key(owner), do: {__MODULE__, :generation, owner}
+
   defp mark_lapse(state) do
     gen = state.generation + 1
+    :persistent_term.put(gen_key(state.owner), gen)
 
     Logger.warning(
       "heartbeat lapsed for #{state.owner} (generation #{gen}); coordinators will revalidate"

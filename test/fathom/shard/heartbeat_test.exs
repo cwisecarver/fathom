@@ -96,6 +96,33 @@ defmodule Fathom.Shard.HeartbeatTest do
     assert Storage.read_heartbeat(owner) == :not_found
   end
 
+  # Expert review #8: the lapse generation was process-local state resetting to 0 on
+  # restart, so a coordinator that acquired at generation 0 of the PREVIOUS heartbeat
+  # incarnation compared 0 != 0 → false → :ok, and flushed without revalidating — even
+  # though the restart gap is exactly a window in which a lapse (and a steal) may have
+  # occurred. The invariant: "no lapse since acquire" must not be forged by a restart;
+  # every re-boot of an already-seen owner counts as a lapse episode.
+  test "a heartbeat restart bumps the generation so prior acquirers revalidate",
+       %{pid: pid, owner: owner} do
+    assert Heartbeat.generation() == 0
+    assert Heartbeat.valid_for_write?(0) == :ok
+
+    ref = Process.monitor(pid)
+    :ok = stop_supervised(Fathom.Shard.Heartbeat)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _}, 1_000
+
+    # The supervisor brings it back with the same owner (crash-restart / new boot).
+    pid2 = start_supervised!({Heartbeat, ttl_ms: @ttl, owner: owner}, id: :heartbeat_restarted)
+    _ = :sys.get_state(pid2)
+
+    assert Heartbeat.generation() == 1, "a restart must count as a lapse episode"
+
+    assert Heartbeat.valid_for_write?(0) == :revalidate,
+           "a coordinator acquired before the restart must revalidate ownership"
+
+    assert Heartbeat.valid_for_write?(1) == :ok
+  end
+
   # Expert review #7: terminate/2 cleared the heartbeat object for ANY reason —
   # including a crash the supervisor immediately reverses (a raise in a callback runs
   # terminate with the exception reason before exiting). During the restart gap the
