@@ -95,7 +95,9 @@ defmodule Fathom.Application do
 
   # Data plane (serves shards). Kept separate from the control plane so a control-plane
   # wobble can't restart it — that decoupling is the whole architecture's thesis.
-  defp data_plane_children do
+  # Public (@doc false) so the ordering invariant below is testable.
+  @doc false
+  def data_plane_children do
     [
       # Dedicated Finch pool for S3 shard storage. Started unconditionally: idle pools
       # hold no connections, so it's free when the backend is Local or S3 is idle.
@@ -110,13 +112,23 @@ defmodule Fathom.Application do
       Fathom.ShardLoad,
       # Owns the per-shard write-counter ETS table (the dirty-flag signal, off the coordinator
       # mailbox — finding #27). Always on (a data-loss invariant), before the shard supervisor.
-      Fathom.Shard.WriteCounter,
-      # Shard processes: a Registry for find-by-id and a DynamicSupervisor that owns one
-      # Fathom.Shard process per active shard. The supervisor's restart budget is sized to
-      # the shard fan-out (see shard_supervisor_opts/0), not the OTP default.
-      {Registry, keys: :unique, name: Fathom.ShardRegistry},
-      {DynamicSupervisor, shard_supervisor_opts()}
-    ] ++ heartbeat_children() ++ warm_follower_children()
+      Fathom.Shard.WriteCounter
+    ] ++
+      heartbeat_children() ++
+      [
+        # Shard processes: a Registry for find-by-id and a DynamicSupervisor that owns one
+        # Fathom.Shard process per active shard. The supervisor's restart budget is sized to
+        # the shard fan-out (see shard_supervisor_opts/0), not the OTP default.
+        #
+        # The heartbeat MUST start before this pair: supervisors stop children in reverse
+        # start order, so on a clean shutdown the heartbeat (and its stored liveness object)
+        # outlives every coordinator's terminate-flush. Listed after the supervisor, the
+        # heartbeat object was deleted first, every open shard on the stopping node became
+        # stealable mid-deploy, and the fenced terminate-flushes self-fenced and dropped
+        # their writes (expert review #4).
+        {Registry, keys: :unique, name: Fathom.ShardRegistry},
+        {DynamicSupervisor, shard_supervisor_opts()}
+      ] ++ warm_follower_children()
   end
 
   # Default DynamicSupervisor restart intensity is 3 restarts / 5 s — sized for a small

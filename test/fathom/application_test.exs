@@ -46,6 +46,38 @@ defmodule Fathom.ApplicationTest do
     assert wait_restarted(Fathom.Directory.Recorder, recorder)
   end
 
+  # Expert review #4: supervisors stop children in reverse start order. If the heartbeat
+  # stops (deleting its stored liveness object) before the shard supervisor, every
+  # coordinator still running its terminate-flush on a stopping node is judged dead and
+  # stealable — a survivor steals the lock, the dying coordinator's fenced flush
+  # self-fences, and up to a flush interval of acknowledged writes is dropped on a routine
+  # deploy. The violated invariant: the heartbeat must outlive the coordinators' final
+  # flushes, i.e. start before the shard Registry/DynamicSupervisor.
+  test "the heartbeat starts before the shard supervisor so it stops after the coordinators" do
+    prev = Application.get_env(:fathom, :heartbeat_server)
+    Application.put_env(:fathom, :heartbeat_server, true)
+
+    on_exit(fn ->
+      if is_nil(prev),
+        do: Application.delete_env(:fathom, :heartbeat_server),
+        else: Application.put_env(:fathom, :heartbeat_server, prev)
+    end)
+
+    ids =
+      for spec <- Fathom.Application.data_plane_children(),
+          do: Supervisor.child_spec(spec, []).id
+
+    heartbeat = Enum.find_index(ids, &(&1 == Fathom.Shard.Heartbeat))
+    shard_sup = Enum.find_index(ids, &(&1 == Fathom.ShardSupervisor))
+
+    assert is_integer(heartbeat), "heartbeat child missing with :heartbeat_server on"
+    assert is_integer(shard_sup), "shard DynamicSupervisor child missing"
+
+    assert heartbeat < shard_sup,
+           "the heartbeat must start before (stop after) the shard supervisor, " <>
+             "or a clean shutdown makes every flushing shard stealable"
+  end
+
   defp assert_child_of(supervisor, name) do
     pid = Process.whereis(name)
     assert is_pid(pid), "#{inspect(name)} should be running"
