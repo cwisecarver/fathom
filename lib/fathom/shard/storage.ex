@@ -322,16 +322,39 @@ defmodule Fathom.Shard.Storage do
   def atomic_copy(src, dst), do: with_atomic_temp(dst, &File.cp(src, &1))
 
   # Materialize into a sibling temp, then atomically rename into `dst`; drop the temp on error.
+  #
+  # The temp is fsynced BEFORE the rename (expert review #17): rename-without-data-fsync
+  # is atomic against process crash but not power loss — after a power cut the name can
+  # exist with zero-length/partial content (guaranteed on XFS, heuristic on ext4). A torn
+  # local file would then be adopted as authoritative on reboot (`warm?` ⇒ dirty) and
+  # flushed over the good stored object with a valid If-Match — the corruption becomes
+  # the durable truth. With the data fsynced first, a power cut yields whole-old (rename
+  # not yet persisted) or whole-new, never torn. Persisting the rename itself would need
+  # a directory fsync, which the BEAM can't do portably (`:file.open` on a dir is
+  # eisdir); losing the rename only re-exposes the old object, which is safe.
   defp with_atomic_temp(dst, produce) do
     File.mkdir_p!(Path.dirname(dst))
     tmp = "#{dst}.tmp.#{System.unique_integer([:positive])}"
 
     with :ok <- produce.(tmp),
+         :ok <- sync_file(tmp),
          :ok <- File.rename(tmp, dst) do
       :ok
     else
       {:error, _} = err ->
         File.rm(tmp)
+        err
+    end
+  end
+
+  defp sync_file(path) do
+    case :file.open(path, [:read, :write, :raw, :binary]) do
+      {:ok, fd} ->
+        result = :file.sync(fd)
+        :ok = :file.close(fd)
+        result
+
+      {:error, _} = err ->
         err
     end
   end
