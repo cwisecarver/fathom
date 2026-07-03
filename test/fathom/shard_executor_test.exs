@@ -194,6 +194,49 @@ defmodule Fathom.ShardExecutorTest do
     assert Fathom.Application.check_template_default!() == nil
   end
 
+  # Expert review #9: template capture replays a shard's SQL fleet-wide, and AGENTS.md forbids a
+  # prod template without auth on that shard — but no guard enforced it, so an anonymously
+  # reachable template shard (auth :disabled, one Host header away) could poison a fleet version
+  # that Migrator.Copy replays onto every tenant. Prod must refuse to boot with that config.
+  test "the boot guard refuses a prod template_shard_id with hrana auth disabled" do
+    prev_env = Application.get_env(:fathom, :env)
+    prev_tpl = Application.get_env(:fathom, :template_shard_id)
+    prev_auth = Application.get_env(:fathom, :hrana_auth)
+
+    on_exit(fn ->
+      Application.put_env(:fathom, :env, prev_env)
+      Application.put_env(:fathom, :template_shard_id, prev_tpl)
+
+      if is_nil(prev_auth),
+        do: Application.delete_env(:fathom, :hrana_auth),
+        else: Application.put_env(:fathom, :hrana_auth, prev_auth)
+    end)
+
+    Application.put_env(:fathom, :env, :prod)
+    Application.put_env(:fathom, :template_shard_id, "template")
+    Application.put_env(:fathom, :hrana_auth, :disabled)
+
+    assert_raise RuntimeError, ~r/poisoning vector/, fn ->
+      Fathom.Application.check_template_auth!()
+    end
+
+    # An unset :hrana_auth defaults to :disabled — still refused.
+    Application.delete_env(:fathom, :hrana_auth)
+
+    assert_raise RuntimeError, ~r/poisoning vector/, fn ->
+      Fathom.Application.check_template_auth!()
+    end
+
+    # Auth required (or any non-:disabled value, which fails closed to required) boots fine.
+    Application.put_env(:fathom, :hrana_auth, :required)
+    assert Fathom.Application.check_template_auth!() == nil
+
+    # No template in prod boots fine regardless of auth mode.
+    Application.put_env(:fathom, :hrana_auth, :disabled)
+    Application.put_env(:fathom, :template_shard_id, nil)
+    assert Fathom.Application.check_template_auth!() == nil
+  end
+
   # Finding #3: the Hrana port carries no in-app credential, so the listener's bind interface is
   # a network-hardening control (pin to the private interface the LB reaches). Default is all
   # interfaces; prod sets it from HRANA_BIND_IP (config/runtime.exs).

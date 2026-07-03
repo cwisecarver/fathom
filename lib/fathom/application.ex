@@ -8,6 +8,7 @@ defmodule Fathom.Application do
   @impl true
   def start(_type, _args) do
     check_template_default!()
+    check_template_auth!()
     Fathom.HranaAuth.check_config!()
 
     # Grouped into plane sub-supervisors (each with its own restart budget) rather than
@@ -54,6 +55,25 @@ defmodule Fathom.Application do
                 "anonymous default traffic would drive fleet-wide template capture (finding #17). " <>
                 "Set :default_shard to a non-template shard, or leave it unset to fail closed."
       end
+    end
+  end
+
+  # Expert review #9: template-shard capture replays a shard's SQL fleet-wide, and
+  # AGENTS.md forbids a prod :template_shard_id without auth on that shard — but only
+  # the default≠template guard above was enforced. With auth :disabled the template
+  # shard is reachable via its ordinary Host subdomain, and one anonymous poisoned
+  # capture is later replayed verbatim onto every tenant's database. Refuse to boot
+  # instead of trusting the network alone. Only the exact :disabled mode is open
+  # (any other value fails closed to :required — see Fathom.HranaAuth).
+  @doc false
+  def check_template_auth! do
+    if Application.get_env(:fathom, :env) == :prod and
+         not is_nil(Application.get_env(:fathom, :template_shard_id)) and
+         Application.get_env(:fathom, :hrana_auth, :disabled) == :disabled do
+      raise "config error: :template_shard_id is set in prod with :hrana_auth disabled — " <>
+              "an anonymously reachable template shard is a fleet-wide poisoning vector " <>
+              "(a captured migration is replayed onto every shard; expert review #9). " <>
+              "Set HRANA_AUTH=required or unset the template."
     end
   end
 
