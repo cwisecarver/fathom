@@ -154,6 +154,36 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     assert {:snooze, _} = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
   end
 
+  # Expert review #24: a RevertJob that exhausted its attempts was silently discarded —
+  # no directory mark, no telemetry, no quarantine analog of the forward path — so a
+  # partial fleet revert stranded shards on the bad version with the operator believing
+  # the revert landed. The invariant: revert failure is durable fleet state, and
+  # Migrator.revert_status/1 answers "did the fleet revert complete?".
+  test "an exhausted revert quarantines the shard and shows up in revert_status", %{
+    shard: shard
+  } do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+
+    # Retire the retained v1 so the revert's restore 404s — a permanent storage error.
+    assert :ok = perform_job(RetirementJob, %{"shard_id" => shard, "version" => 1})
+
+    capture_log(fn ->
+      assert {:cancel, _} =
+               perform_job(
+                 RevertJob,
+                 %{"shard_id" => shard, "to_version" => 1, "force" => true},
+                 attempt: 5
+               )
+    end)
+
+    assert {:ok, %{status: "migration_failed"}} = Directory.get(shard)
+
+    status = Migrator.revert_status(2)
+    assert status.failed >= 1, "the quarantined shard must be visible in revert_status"
+  end
+
   test "exhausted attempts quarantine the shard", %{shard: shard} do
     # target 9 has no released statements -> a permanent {:error, :unknown_version}.
     capture_log(fn ->

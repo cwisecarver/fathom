@@ -21,10 +21,12 @@ defmodule Fathom.Migrator.RevertJob do
   @retention_seconds 7 * 24 * 60 * 60
 
   @impl Oban.Worker
-  def perform(%Oban.Job{
-        args: %{"shard_id" => shard_id, "to_version" => to_version} = args,
-        id: id
-      }) do
+  def perform(
+        %Oban.Job{
+          args: %{"shard_id" => shard_id, "to_version" => to_version} = args,
+          id: id
+        } = job
+      ) do
     # Job id as the lease token — distinct from any forward ShardMigrationJob's owner, so the two
     # can't merge via the same-owner reclaim path (finding #9).
     case ShardMigration.revert(shard_id, to_version, id, force: Map.get(args, "force", false)) do
@@ -58,9 +60,26 @@ defmodule Fathom.Migrator.RevertJob do
         {:cancel, guard}
 
       {:error, reason} ->
-        Logger.warning("shard #{shard_id}: revert error, will retry (#{inspect(reason)})")
-        {:error, reason}
+        handle_error(job, shard_id, reason)
     end
+  end
+
+  # Expert review #24: a RevertJob that exhausted its attempts was just discarded by
+  # Oban — no directory mark, no quarantine analog of the forward path — so a partial
+  # fleet revert silently stranded shards on the bad version while the operator
+  # believed the revert landed. Mirror ShardMigrationJob.handle_error: the final
+  # attempt quarantines the shard (durable fleet state, visible via
+  # Migrator.revert_status/1 and Directory.count_failed/0).
+  defp handle_error(%Oban.Job{attempt: attempt, max_attempts: max}, shard_id, reason)
+       when attempt >= max do
+    Fathom.Directory.mark_failed(shard_id)
+    Logger.error("shard #{shard_id}: revert failed permanently (#{inspect(reason)})")
+    {:cancel, reason}
+  end
+
+  defp handle_error(_job, shard_id, reason) do
+    Logger.warning("shard #{shard_id}: revert error, will retry (#{inspect(reason)})")
+    {:error, reason}
   end
 
   defp cancel_retirement(shard_id, version) do

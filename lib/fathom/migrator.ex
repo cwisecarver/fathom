@@ -124,6 +124,45 @@ defmodule Fathom.Migrator do
     {:ok, enqueued + forced}
   end
 
+  @doc """
+  Whether a fleet revert away from `from_version` has completed, and what's left:
+  `%{remaining, in_flight, failed}` — shards still active at the version, revert jobs
+  still in flight for them, and quarantined shards fleet-wide. Before this the only
+  way to answer "did the revert land?" was trawling `oban_jobs` for discarded rows
+  (expert review #24).
+  """
+  @spec revert_status(non_neg_integer()) :: %{
+          remaining: non_neg_integer(),
+          in_flight: non_neg_integer(),
+          failed: non_neg_integer()
+        }
+  def revert_status(from_version) do
+    remaining = Directory.shards_at_version(from_version)
+
+    in_flight =
+      case Enum.map(remaining, & &1.shard_id) do
+        [] ->
+          0
+
+        ids ->
+          ids
+          |> Enum.chunk_every(@enqueue_chunk)
+          |> Enum.reduce(0, fn chunk, acc ->
+            acc +
+              Repo.aggregate(
+                from(j in Job,
+                  where: j.worker == "Fathom.Migrator.RevertJob",
+                  where: j.state in @unique_states,
+                  where: fragment("?->>'shard_id'", j.args) in ^chunk
+                ),
+                :count
+              )
+          end)
+      end
+
+    %{remaining: length(remaining), in_flight: in_flight, failed: Directory.count_failed()}
+  end
+
   defp force_inflight_reverts(shard_ids) do
     shard_ids
     |> Enum.chunk_every(@enqueue_chunk)

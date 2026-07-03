@@ -230,6 +230,16 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  How many shards are quarantined (`migration_failed` — set when a forward migration
+  or a revert exhausts its attempts). A gauge next to `count_laggards/1` so quarantine
+  growth is observable instead of silently accumulating (expert review #24).
+  """
+  @spec count_failed() :: non_neg_integer()
+  def count_failed do
+    Repo.aggregate(from(s in Shard, where: s.status == "migration_failed"), :count)
+  end
+
+  @doc """
   The most-recently-active shards, newest first, capped at `limit` — the fleet-wide
   hot set a warm-standby (`Fathom.Shard.WarmFollower`) pre-pulls so a failover skips
   the cold-open from S3.
