@@ -111,9 +111,26 @@ defmodule Fathom.Shard do
     # The coordinator self-stopped while opening storage (lease held by another
     # node, or pull failed) — its `{:shutdown, reason}` exit reaches the pending
     # call. Surface the reason as a clean error rather than crashing the caller.
-    :exit, {{:shutdown, reason}, _} -> {:error, reason}
-    :exit, {:noproc, _} -> {:error, :unavailable}
-    :exit, {reason, _} -> {:error, reason}
+    :exit, {{:shutdown, reason}, _} ->
+      {:error, reason}
+
+    :exit, {:noproc, _} ->
+      {:error, :unavailable}
+
+    # The call timed out but the :checkout message is still in the coordinator's
+    # mailbox (expert review #26): when it is later dequeued, the coordinator would
+    # register a phantom connection for this caller — the late reply is dropped by the
+    # call alias, no checkin ever arrives, and the monitor only fires if the CALLER
+    # dies (a Filo stream or Oban runner can live for hours). The shard then never
+    # idles: pinned open, lease held forever, drains aborting :busy. Compensate with a
+    # cast that is FIFO-ordered behind the stale :checkout, telling the coordinator to
+    # drop any conn it granted to this caller.
+    :exit, {:timeout, _} ->
+      GenServer.cast(pid, {:abandon_checkout, self()})
+      {:error, :timeout}
+
+    :exit, {reason, _} ->
+      {:error, reason}
   end
 
   @doc "Releases a connection previously checked out with `checkout/1`."
@@ -407,7 +424,8 @@ defmodule Fathom.Shard do
 
   def handle_call(:checkout, {caller, _tag}, state) do
     ref = Process.monitor(caller)
-    state = %{cancel_idle(state) | conns: Map.put(state.conns, ref, true)}
+    # The value is the caller pid so {:abandon_checkout, caller} can find its grants.
+    state = %{cancel_idle(state) | conns: Map.put(state.conns, ref, caller)}
     {:reply, {:ok, ref, state.path}, state}
   end
 
@@ -415,6 +433,18 @@ defmodule Fathom.Shard do
 
   @impl true
   def handle_cast({:checkin, ref}, state), do: stop_when_drained(release(state, ref))
+
+  # A caller's checkout call timed out (expert review #26): drop every conn granted to
+  # it that it never received. Ordering makes this exact: the cast is sent AFTER the
+  # call gave up, so per-pair FIFO puts it BEHIND the stale :checkout — the phantom
+  # grant (if the coordinator processed it) is always visible here. A caller that got
+  # its reply never abandons, and fathom's callers (one Filo stream / one Oban runner
+  # per checkout) hold at most one conn per coordinator, so there is no live grant to
+  # this pid to over-drop.
+  def handle_cast({:abandon_checkout, caller}, state) do
+    refs = for {ref, pid} <- state.conns, pid == caller, do: ref
+    stop_when_drained(Enum.reduce(refs, state, &release(&2, &1)))
+  end
 
   # Begin standing down. With no connections we stop immediately (terminate
   # flushes + releases). Otherwise wait for the drain, bounded by a timer.
