@@ -361,6 +361,57 @@ defmodule Fathom.ShardDurabilityTest do
     Connection.close(ro)
   end
 
+  # Expert review #2: `wal_checkpoint(TRUNCATE)` reports "couldn't fold the WAL" as a
+  # busy=1 ROW, not an error — and the pre-drop checkpoint discarded the result. A blocked
+  # checkpoint (here: a lingering reader transaction, the zombie-stream class) then let the
+  # idle flush upload a main-file image MISSING the committed WAL frames and delete the WAL:
+  # silent loss of acknowledged writes with a "successful" flush in the logs. The violated
+  # invariant: whatever blocks the checkpoint, a flush-and-drop must persist every
+  # acknowledged write (snapshot fallback).
+  test "an idle flush with a blocked checkpoint still captures WAL-resident writes",
+       %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+
+    # A zombie reader: a second connection holding an open read transaction pins its WAL
+    # read mark, so the checkpoint can neither copy frames written after that mark into
+    # the main file nor truncate the log (busy=1). Opened directly on the shard file —
+    # the coordinator doesn't know about it, like a brutally-killed stream's connection
+    # awaiting NIF-resource GC.
+    {:ok, zombie} = Connection.open(local_db(shard))
+    {:ok, _} = Connection.query(zombie, "BEGIN", [])
+    {:ok, _} = Connection.query(zombie, "SELECT count(*) FROM kv", [])
+    on_exit(fn -> Connection.close(zombie) end)
+
+    # Committed AFTER the zombie's snapshot: this write is beyond the pinned read mark,
+    # so the blocked checkpoint cannot fold it into the main file — it exists only in
+    # the WAL that drop_local/1 is about to delete.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('bob')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    ref = Process.monitor(coordinator)
+
+    capture_log(fn ->
+      :ok = ShardExecutor.close(conn)
+      # The blocked checkpoint waits out its (shortened) busy timeout before falling back.
+      assert_receive {:DOWN, ^ref, :process, ^coordinator, :normal}, 10_000
+    end)
+
+    assert File.exists?(remote_db(shard)),
+           "the idle flush must upload despite the blocked checkpoint"
+
+    {:ok, ro} = Connection.open(remote_db(shard))
+
+    assert {:ok, %{rows: [["alice"], ["bob"]]}} =
+             Connection.query(ro, "SELECT v FROM kv ORDER BY v", []),
+           "WAL-resident committed rows must be captured by the flush"
+
+    Connection.close(ro)
+  end
+
   test "a warm restart (local file present) opens dirty", %{shard: shard} do
     Application.put_env(:fathom, :shard_idle_ms, 50)
     # A valid empty local db stands in for un-flushed local state from a prior boot.

@@ -607,9 +607,7 @@ defmodule Fathom.Shard do
       # Fathom.Shard.Fence.
       case Fence.check(fence_ctx(state)) do
         {:ok, _updates} ->
-          checkpoint(state.path)
-
-          case Storage.flush(state.id, state.path, state.etag) do
+          case upload_for_drop(state) do
             {:ok, _new_etag} ->
               drop_local(state.path)
               Storage.release_lease(state.id, state.lease)
@@ -646,6 +644,27 @@ defmodule Fathom.Shard do
     :ok
   end
 
+  # Upload the shard for a drop. The cheap path folds the WAL into the main file in
+  # place (checkpoint) and uploads it. When the checkpoint can't complete — a
+  # lingering reader's mark blocks TRUNCATE (e.g. a brutally-killed stream's
+  # connection awaiting NIF-resource GC), or the open fails under fd pressure —
+  # uploading just the main file would silently miss the committed WAL frames that
+  # drop_local/1 is about to delete, so fall back to a VACUUM INTO snapshot, which
+  # captures WAL content regardless.
+  defp upload_for_drop(state) do
+    case checkpoint(state.path) do
+      :ok ->
+        Storage.flush(state.id, state.path, state.etag)
+
+      {:error, reason} ->
+        Logger.warning(
+          "shard #{state.id}: pre-drop checkpoint incomplete (#{inspect(reason)}); snapshot-flushing instead"
+        )
+
+        snapshot_and_upload(state)
+    end
+  end
+
   # The fence decision itself lives in Fathom.Shard.Fence (unit-tested there). This
   # projects the coordinator state down to the fields the fence reads; the caller
   # merges the returned `updates` (a possibly-refreshed lease/generation) back in.
@@ -668,17 +687,28 @@ defmodule Fathom.Shard do
   end
 
   # Fold the WAL into the main file so a single object captures the whole shard.
+  # `wal_checkpoint(TRUNCATE)` reports "couldn't fold the WAL" as data, not an
+  # error — a `(busy, log, checkpointed)` row with busy=1 — so only a 0-busy row
+  # counts as success. The busy wait is shortened below: on a blocked checkpoint
+  # the caller snapshot-flushes instead, so burning the shutdown budget waiting on
+  # a zombie reader buys nothing.
   defp checkpoint(path) do
     case Connection.open(path) do
       {:ok, conn} ->
-        Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", [])
+        Connection.exec(conn, "PRAGMA busy_timeout=1000")
+        result = Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", [])
         Connection.close(conn)
 
-      _ ->
-        :ok
-    end
+        case result do
+          {:ok, %{rows: [[0, _log, _checkpointed]]}} -> :ok
+          {:ok, %{rows: [[busy, _log, _checkpointed]]}} -> {:error, {:checkpoint_busy, busy}}
+          {:ok, other} -> {:error, {:checkpoint_unexpected, other}}
+          {:error, reason} -> {:error, {:checkpoint_failed, reason}}
+        end
 
-    :ok
+      other ->
+        {:error, {:checkpoint_open_failed, other}}
+    end
   end
 
   defp drop_local(path), do: Enum.each(["", "-wal", "-shm"], &File.rm(path <> &1))
