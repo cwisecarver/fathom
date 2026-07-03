@@ -106,13 +106,29 @@ defmodule Fathom.Directory.Recorder do
         rescue
           e ->
             Logger.warning("Directory.Recorder flush failed: #{inspect(e)}")
+            restore(rows)
             0
         catch
           :exit, reason ->
             Logger.warning("Directory.Recorder flush exited: #{inspect(reason)}")
+            restore(rows)
             0
         end
     end
+  end
+
+  # A failed batch must not lose the drained touches (expert review #11): these feed
+  # `last_active_at`, the sole input to the revert write-age force-guard — dropping
+  # them during a Postgres outage is exactly when operators are reverting things.
+  # Re-buffer them for the next cycle. `insert_new` (not `insert`) so a fresher touch
+  # recorded DURING the failed flush wins — anything re-recorded post-drain is by
+  # construction newer than the drained value.
+  defp restore(rows) do
+    Enum.each(rows, &:ets.insert_new(@table, &1))
+    :telemetry.execute([:fathom, :directory, :flush_retry], %{count: length(rows)}, %{})
+  rescue
+    # Table gone (teardown) — nothing to restore into.
+    ArgumentError -> :ok
   end
 
   # Atomically take each buffered key (`:ets.take` reads + deletes in one op), so a

@@ -53,6 +53,33 @@ defmodule Fathom.Directory.RecorderTest do
     assert DateTime.compare(second.last_active_at, first.last_active_at) in [:gt, :eq]
   end
 
+  # Expert review #11: do_flush drained the ETS buffer BEFORE the Postgres write, and a
+  # failed batch (outage) just logged — the drained touches were gone. Those touches feed
+  # last_active_at, the sole input to the revert write-age force-guard, and a Postgres
+  # outage is exactly when operators revert things. The invariant: a failed flush
+  # re-buffers what it drained, so the touches land once Postgres recovers.
+  test "a failed flush re-buffers the drained touches instead of dropping them" do
+    import ExUnit.CaptureLog
+
+    a = uniq()
+    assert :ok = Recorder.record(a)
+
+    # The outage: cut the recorder process off from Postgres, so record_batch raises
+    # an ownership error inside the flush.
+    Ecto.Adapters.SQL.Sandbox.mode(Fathom.Repo, :manual)
+
+    log = capture_log(fn -> assert Recorder.flush() == 0 end)
+    assert log =~ "Recorder flush"
+
+    # Postgres recovers (a fresh shared owner): the touch must still be buffered
+    # and flush through.
+    owner = Ecto.Adapters.SQL.Sandbox.start_owner!(Fathom.Repo, shared: true)
+    on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(owner) end)
+
+    assert Recorder.flush() == 1
+    assert {:ok, %{shard_id: ^a}} = Directory.get(a)
+  end
+
   @tag :bench
   test "record/1 stays off the Postgres hot path (sub-50µs ETS write)" do
     id = uniq()

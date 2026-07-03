@@ -63,6 +63,13 @@ defmodule Fathom.Migrator.ShardMigration do
     force? = Keyword.get(opts, :force, false)
 
     with_lease(shard_id, token, fn lease ->
+      # Push this node's buffered directory touches down before reading the guard's
+      # inputs (expert review #11): a checkout sitting in the Recorder's ≤1s buffer is
+      # otherwise invisible to the write-age guard, letting an unforced revert discard
+      # real post-cutover activity. Best-effort and node-local — another node's buffer
+      # can still lag; the guard remains the safe-direction approximation it documents.
+      flush_recorder()
+
       {current, last_active, cutover_at} = current_state(shard_id)
       tmp = temp_path(shard_id, "revert")
 
@@ -314,6 +321,15 @@ defmodule Fathom.Migrator.ShardMigration do
 
     Connection.close(conn)
     version
+  end
+
+  # Synchronous recorder flush, tolerant of the recorder being down (a control-plane
+  # blip must not turn a revert into a crash — the guard then just sees the directory
+  # as-is, no worse than before).
+  defp flush_recorder do
+    Fathom.Directory.Recorder.flush()
+  catch
+    :exit, _ -> 0
   end
 
   # Per-operation lease owner so a forward and a revert on the same shard can't be merged by the

@@ -239,6 +239,25 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert retained?(shard, 2), "a forced revert still backs up the live version"
   end
 
+  # Expert review #11 (guard-input freshness): a checkout sitting in the Recorder's ≤1s
+  # buffer was invisible to the write-age guard — the guard read the directory while the
+  # touch that should refuse the revert hadn't flushed yet, so an unforced revert passed
+  # and discarded real post-cutover activity. The revert must flush this node's buffer
+  # before reading the guard's inputs.
+  test "the write-age guard sees touches still sitting in the Recorder buffer", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, _} = ShardMigration.run(shard, 2)
+
+    # Post-cutover tenant activity via the ASYNC path: buffered, not yet in Postgres.
+    :ok = Fathom.Directory.Recorder.record(shard)
+
+    assert {:error, {:writes_since_cutover, _}} = ShardMigration.revert(shard, 1),
+           "a buffered touch must refuse the unforced revert"
+
+    assert %{rows: [[2]]} = query_live!(shard, "PRAGMA user_version")
+  end
+
   # A quiet shard (no directory activity since cutover) reverts without force: cutover stamps
   # last_active_at and cutover_at with the same instant, so "no activity" is exactly equality.
   test "revert of a quiet shard needs no force", %{shard: shard} do
