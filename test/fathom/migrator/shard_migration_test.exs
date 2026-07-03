@@ -176,6 +176,39 @@ defmodule Fathom.Migrator.ShardMigrationTest do
              query_version!(shard, 2, "SELECT id, name FROM app_thing WHERE id = 2")
   end
 
+  # Expert review #10: a revert retry after a failed cutover clobbered the vN backup. Attempt 1
+  # runs retain(vN) -> restore(vN-1) -> cutover, and if the cutover fails (Postgres blip) Oban
+  # retries; on attempt 2 the directory STILL says current = vN, so retain(vN) copied the live
+  # object — now holding vN-1 bytes from attempt 1's restore — over <shard>@vN, destroying the
+  # only copy of the post-cutover vN writes. The invariant: a revert retry must converge
+  # (crash-forward off the live file's user_version) without ever overwriting the backup.
+  test "a revert retry after a failed cutover does not clobber the vN backup", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, _} = ShardMigration.run(shard, 2)
+
+    # Post-cutover tenant write on v2 — the data the backup exists to preserve.
+    write_live!(shard, "INSERT INTO app_thing (id, name) VALUES (2, 'bob')")
+
+    # Attempt 1, up to the crash: retain the real v2 bytes, restore v1 over live — and die
+    # before Directory.cutover (the directory still says v2).
+    :ok = Storage.retain(shard, 2)
+    :ok = Storage.restore(shard, 1)
+    assert {:ok, %{schema_version: 2}} = Directory.get(shard)
+    assert %{rows: [[1]]} = query_live!(shard, "PRAGMA user_version")
+
+    # Attempt 2 (Oban retry). Pre-fix this re-ran retain(2), copying the v1 bytes now in
+    # live over the <shard>@2 backup — bob destroyed unrecoverably.
+    assert {:ok, %{from: 2, to: 1}} = ShardMigration.revert(shard, 1, "retry-token", force: true)
+
+    assert {:ok, %{schema_version: 1}} = Directory.get(shard)
+    assert %{rows: [[1]]} = query_live!(shard, "PRAGMA user_version")
+
+    assert %{rows: [[2, "bob"]]} =
+             query_version!(shard, 2, "SELECT id, name FROM app_thing WHERE id = 2"),
+           "the retry must not overwrite the vN backup with the already-restored vN-1 bytes"
+  end
+
   # Finding #13 (force-guard): a revert discards every write made on the live version since its
   # cutover. Pre-guard, `revert/2` silently proceeded no matter how long the shard had been live
   # (the review's "a revert issued days into the retention window silently discards days of tenant

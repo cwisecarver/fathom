@@ -64,19 +64,41 @@ defmodule Fathom.Migrator.ShardMigration do
 
     with_lease(shard_id, token, fn lease ->
       {current, last_active, cutover_at} = current_state(shard_id)
+      tmp = temp_path(shard_id, "revert")
 
-      # Self-fence before the clobbering restore: a steal since acquire means a newer owner is
-      # authoritative, so abort rather than overwrite it (finding #7).
-      with :ok <- write_age_guard(shard_id, last_active, cutover_at, force?),
-           :ok <- fence(shard_id, lease),
-           # Back up the live vN object BEFORE overwriting it with vN-1, so the discarded
-           # post-cutover writes survive at <shard>@<current> for the retention window instead of
-           # being destroyed unrecoverably (finding #13). RevertJob schedules its retirement.
-           :ok <- Storage.retain(shard_id, current),
-           :ok <- Storage.restore(shard_id, to_version),
-           {:ok, _} <- Directory.cutover(shard_id, to_version) do
-        warn_revert(shard_id, current, to_version, last_active)
-        {:ok, %{from: current, to: to_version}}
+      try do
+        with :ok <- pull_live(shard_id, tmp) do
+          if live_version(tmp) == to_version and to_version != current do
+            # Crash-forward (expert review #10): a prior attempt already restored
+            # to_version over live but died before the cutover, so the directory still
+            # says `current`. Re-running retain(current) here would copy the RESTORED
+            # bytes now in live over the <shard>@<current> backup — destroying the only
+            # copy of the post-cutover writes that backup exists to preserve (and the
+            # write-age guard passes identically on a retry, so nothing else stops it).
+            # The live file's own user_version is the truth: just finish the cutover.
+            with {:ok, _} <- Directory.cutover(shard_id, to_version) do
+              warn_revert(shard_id, current, to_version, last_active)
+              {:ok, %{from: current, to: to_version}}
+            end
+          else
+            # Self-fence before the clobbering restore: a steal since acquire means a newer
+            # owner is authoritative, so abort rather than overwrite it (finding #7).
+            with :ok <- write_age_guard(shard_id, last_active, cutover_at, force?),
+                 :ok <- fence(shard_id, lease),
+                 # Back up the live vN object BEFORE overwriting it with vN-1, so the discarded
+                 # post-cutover writes survive at <shard>@<current> for the retention window
+                 # instead of being destroyed unrecoverably (finding #13). RevertJob schedules
+                 # its retirement.
+                 :ok <- Storage.retain(shard_id, current),
+                 :ok <- Storage.restore(shard_id, to_version),
+                 {:ok, _} <- Directory.cutover(shard_id, to_version) do
+              warn_revert(shard_id, current, to_version, last_active)
+              {:ok, %{from: current, to: to_version}}
+            end
+          end
+        end
+      after
+        drop_temp(tmp)
       end
     end)
   end
