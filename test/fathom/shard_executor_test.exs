@@ -133,6 +133,39 @@ defmodule Fathom.ShardExecutorTest do
              "acme"
   end
 
+  # Expert reviews #32 + #35: shard_from_host is the primary production tenant-selection
+  # path, exposed to a fully attacker-controlled header — but only its 3-label happy path
+  # was tested. Pin the adversarial edges. #35 specifically: a trailing-dot FQDN
+  # ("localhost.") split to ["localhost", ""] and promoted an otherwise-bare hostname to
+  # a shard, so the same logical host routed to a named shard WITH the dot and the
+  # default shard without it — a tenant silently split by a legal client behavior.
+  test "host-subdomain routing edge cases cannot select unintended shards" do
+    resolve = fn url -> ShardExecutor.shard_from_conn(conn(:get, url)) end
+
+    # Trailing-dot FQDNs are the same logical host: no bare-host promotion (#35)…
+    assert resolve.("http://localhost./") == "demo",
+           "a trailing dot must not promote a bare hostname to a shard"
+
+    # …and the multi-label form resolves identically with or without the dot.
+    assert resolve.("http://acme.fathom.test./") == "acme"
+
+    # Nested/multi-label subdomains take the FIRST label — a foreign zone suffix cannot
+    # smuggle a different label into resolution.
+    assert resolve.("http://victim.attacker.fathom.test/") == "victim"
+
+    # Empty labels never resolve to a shard.
+    assert resolve.("http://..fathom.test/") == "demo"
+
+    # IPv4 hosts are not shards (fall through to the default).
+    assert resolve.("http://127.0.0.1/") == "demo"
+
+    # An explicit port doesn't disturb subdomain extraction (Plug strips it from host).
+    assert resolve.("http://acme.fathom.test:8080/") == "acme"
+
+    # Invalid first labels (shard-id validation) never resolve.
+    assert resolve.("http://bad_%40label.fathom.test/") == "demo"
+  end
+
   # Finding #19: shard-id case is normalized at the trust boundary, so `ACME` and `acme` name the
   # ONE shard (one file / registry key / S3 key) instead of splitting a tenant (case-sensitive FS)
   # or colliding by accident (case-insensitive FS).

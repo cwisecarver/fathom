@@ -276,9 +276,17 @@ defmodule Fathom.ShardExecutor do
 
   defp shard_from_host(host) do
     # A multi-label host like "acme.fathom.example" yields "acme"; bare hosts
-    # ("localhost") and IPs are not shards.
+    # ("localhost") and IPs are not shards. A single trailing dot (a legal FQDN form
+    # some clients/resolvers emit) is stripped FIRST — pre-fix "localhost." split to
+    # ["localhost", ""] and promoted an otherwise-bare hostname to a shard, so the
+    # same logical host routed to different shards with vs without the dot (expert
+    # review #35). All remaining labels must be non-empty, so ".."/leading-dot hosts
+    # never resolve.
+    host = String.trim_trailing(host, ".")
+
     with false <- ip?(host),
-         [sub, _ | _] <- String.split(host, "."),
+         [sub, _ | _] = labels <- String.split(host, "."),
+         true <- Enum.all?(labels, &(&1 != "")),
          true <- Fathom.ShardId.valid?(sub) do
       sub
     else
