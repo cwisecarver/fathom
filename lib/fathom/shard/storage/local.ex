@@ -130,14 +130,20 @@ defmodule Fathom.Shard.Storage.Local do
   # --- leasing ---
   #
   # The lease is a `<shard_id>.lock` JSON file next to the `.db` object. A fresh
-  # lease is created with `O_EXCL` so concurrent first-creators can't both win;
-  # steal/reclaim/renew read-modify-write. On a single machine (the only place the
-  # filesystem backend runs) the local Registry already guarantees one coordinator
-  # per shard, so the read-modify-write race can't actually happen here — the lock
-  # file makes the Local backend a faithful test double for the S3 fence semantics.
+  # lease is created with `O_EXCL` so concurrent first-creators can't both win.
+  # Steal/reclaim/renew/release are read-modify-write, made ATOMIC by a per-shard
+  # node-local critical section (expert review #38): this backend's domain is one
+  # machine, so serializing in-VM gives it the same exactly-one-winner semantics
+  # S3's conditional writes give the production fence — and lets the contention
+  # paths (two concurrent stealers) be tested against the behaviour, not just
+  # request shapes.
 
   @impl true
   def acquire_lease(shard_id, owner, ttl_ms) do
+    with_lock_mutex(shard_id, fn -> do_acquire_lease(shard_id, owner, ttl_ms) end)
+  end
+
+  defp do_acquire_lease(shard_id, owner, ttl_ms) do
     now = Storage.now_ms()
 
     case read_lock(shard_id) do
@@ -253,7 +259,11 @@ defmodule Fathom.Shard.Storage.Local do
   end
 
   @impl true
-  def renew_lease(shard_id, %{owner: owner, epoch: epoch}, ttl_ms) do
+  def renew_lease(shard_id, lease, ttl_ms) do
+    with_lock_mutex(shard_id, fn -> do_renew_lease(shard_id, lease, ttl_ms) end)
+  end
+
+  defp do_renew_lease(shard_id, %{owner: owner, epoch: epoch}, ttl_ms) do
     now = Storage.now_ms()
 
     case read_lock(shard_id) do
@@ -273,7 +283,14 @@ defmodule Fathom.Shard.Storage.Local do
   end
 
   @impl true
-  def release_lease(shard_id, %{owner: owner, epoch: epoch}) do
+  def release_lease(shard_id, lease) do
+    with_lock_mutex(shard_id, fn -> do_release_lease(shard_id, lease) end)
+  end
+
+  # Conditional release (the S3 backend's finding-#22 fix, mirrored): only remove
+  # the lock while it is still OURS — under the mutex, a stealer's fresh lock can
+  # never be deleted by a stale owner's release racing it.
+  defp do_release_lease(shard_id, %{owner: owner, epoch: epoch}) do
     case read_lock(shard_id) do
       {:ok, %{owner: ^owner, epoch: ^epoch}} -> File.rm(lock_path(shard_id))
       _ -> :ok
@@ -335,6 +352,17 @@ defmodule Fathom.Shard.Storage.Local do
   defp lock_path(shard_id), do: Path.join(dir(), "#{shard_id}.lock")
   # One heartbeat object per node (owner), under a subdir so it never collides with
   # a shard id (owner strings like "fathom@host" are valid filenames).
+  # Per-shard node-local critical section for lock mutations (expert review #38).
+  # :global.trans with a node-local scope — no cluster involved (fathom has no BEAM
+  # cluster; this backend runs on one machine). Infinite retries: the sections are
+  # microseconds long, so waiting is correct and :aborted is unreachable in practice.
+  defp with_lock_mutex(shard_id, fun) do
+    case :global.trans({{__MODULE__, shard_id}, self()}, fun, [node()]) do
+      :aborted -> {:error, :lock_mutex_busy}
+      result -> result
+    end
+  end
+
   defp heartbeat_path(owner), do: Path.join([dir(), "heartbeats", owner])
 
   defp dir do
