@@ -10,6 +10,7 @@ defmodule Fathom.Application do
     check_template_default!()
     check_template_auth!()
     Fathom.HranaAuth.check_config!()
+    check_storage_fence!()
 
     # Grouped into plane sub-supervisors (each with its own restart budget) rather than
     # one flat list, so a control-plane restart-storm (e.g. Repo) is contained to its
@@ -74,6 +75,20 @@ defmodule Fathom.Application do
               "an anonymously reachable template shard is a fleet-wide poisoning vector " <>
               "(a captured migration is replayed onto every shard; expert review #9). " <>
               "Set HRANA_AUTH=required or unset the template."
+    end
+  end
+
+  # Expert review #16: when the S3 backend is configured, verify at boot that the
+  # store actually ENFORCES conditional writes — every safety property (lease mutual
+  # exclusion, flush fence, conditional release) rides on 412-on-failed-If-Match, and
+  # a store that ignores the header yields silent, error-free split-brain. Runs the
+  # probe before the tree starts so a lax store never serves a byte. Opt out
+  # explicitly with `config :fathom, :verify_storage_fence, false` (e.g. a rig where
+  # boot-time storage reachability isn't guaranteed and the store is known-good).
+  defp check_storage_fence! do
+    if Application.get_env(:fathom, :shard_storage) == Fathom.Shard.Storage.S3 and
+         Application.get_env(:fathom, :verify_storage_fence, true) do
+      Fathom.Shard.Storage.S3.verify_conditional_writes!()
     end
   end
 

@@ -82,6 +82,52 @@ defmodule Fathom.Shard.Storage.S3 do
   defp pool_size, do: config()[:pool_size] || @default_pool_size
   defp pool_count, do: config()[:pool_count] || @default_pool_count
 
+  @doc """
+  Boot-time self-test that the configured store **enforces** HTTP conditional writes
+  (expert review #16). Every safety property in the system — lease mutual exclusion,
+  the flush fence, conditional release — is load-bearing on the store returning 412
+  for a failed `If-Match` / `If-None-Match` PUT. A store that ignores the headers
+  returns 200, so two concurrent acquirers both "win" and every fenced flush
+  "succeeds": silent, error-free split-brain with zero signal until data is lost
+  (AWS S3 only added If-Match-on-PUT in late 2024; S3-compatibles vary). Raises —
+  refusing the boot — if the store doesn't enforce them, or if the probe can't
+  reach the store at all (fail closed: an unverifiable fence is not a fence).
+  """
+  @spec verify_conditional_writes!() :: :ok
+  def verify_conditional_writes! do
+    key = prefix() <> "fence-probe/" <> to_string(node())
+
+    # Seed the probe object unconditionally.
+    probe_status!(key, [], 200..299, "probe PUT")
+
+    # A PUT fenced with a wrong etag MUST be refused.
+    probe_status!(key, [{"if-match", ~s("fathom-bogus-etag")}], [412], "If-Match enforcement")
+
+    # A create-only PUT against an existing object MUST be refused.
+    probe_status!(key, [{"if-none-match", "*"}], [412], "If-None-Match enforcement")
+
+    _ = Req.delete(req(), url: url_path(key))
+    :ok
+  end
+
+  defp probe_status!(key, headers, expected, label) do
+    case Req.put(req(), url: url_path(key), body: "fathom-fence-probe", headers: headers) do
+      {:ok, %{status: s}} ->
+        if s in expected do
+          :ok
+        else
+          raise "shard storage fence self-test failed (#{label}): expected " <>
+                  "#{inspect(expected)}, got #{s}. This store does not enforce the " <>
+                  "conditional writes the single-writer lease and flush fence depend on — " <>
+                  "refusing to boot (expert review #16)."
+        end
+
+      {:error, reason} ->
+        raise "shard storage fence self-test unreachable (#{label}): #{inspect(reason)}. " <>
+                "Refusing to boot with an unverified fence (expert review #16)."
+    end
+  end
+
   @impl true
   def pull(shard_id, local_path) do
     case Req.get(req(), url: object_path(shard_id)) do
