@@ -412,6 +412,56 @@ defmodule Fathom.ShardDurabilityTest do
     Connection.close(ro)
   end
 
+  # Expert review #14: the WriteCounter's ETS table dies with its owner, and a restart
+  # handed every open coordinator a FRESH EMPTY table — count(id) = 0 — while each kept
+  # its old flushed_through watermark, so `count > flushed_through` classified every
+  # dirty shard on the node as clean and the idle path took drop_clean: the local copy
+  # deleted WITHOUT an upload, all in-flight unflushed writes silently lost. The
+  # invariant: a counter reset is unknown state, and unknown state must flush.
+  test "a WriteCounter restart cannot reclassify dirty shards as clean", %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+    assert dirty?(shard)
+
+    # The owner crashes; the supervisor restarts it with a fresh empty table.
+    wc = Process.whereis(Fathom.Shard.WriteCounter)
+    ref = Process.monitor(wc)
+    Process.exit(wc, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^wc, :killed}, 1_000
+
+    capture_log(fn ->
+      assert wait_restarted(Fathom.Shard.WriteCounter, wc), "WriteCounter should restart"
+      # The restarted counter notified registered coordinators during init; sync the
+      # coordinator so the reset message has been processed before we ask.
+      {:ok, coordinator} = Shards.ensure(shard)
+      _ = :sys.get_state(coordinator)
+
+      assert Shard.dirty?(coordinator),
+             "a counter reset must leave the shard dirty (unknown state ⇒ flush)"
+
+      # And the idle stop must FLUSH (upload) rather than drop_clean.
+      close_and_stop(shard, conn)
+    end)
+
+    assert File.exists?(remote_db(shard)),
+           "idle stop after a counter reset must upload, not drop the only copy"
+
+    {:ok, ro} = Connection.open(remote_db(shard))
+    assert {:ok, %{rows: [["alice"]]}} = Connection.query(ro, "SELECT v FROM kv", [])
+    Connection.close(ro)
+  end
+
+  defp wait_restarted(name, old, tries \\ 200) do
+    case Process.whereis(name) do
+      pid when is_pid(pid) and pid != old -> _ = :sys.get_state(pid) && true
+      _ when tries > 0 -> Process.sleep(5) && wait_restarted(name, old, tries - 1)
+      _ -> false
+    end
+  end
+
   # Expert review #5: the coordinator traps exits so a supervisor :shutdown runs
   # terminate/2's final flush — but with no explicit :shutdown in the child spec, the
   # worker default of 5 000 ms applied, and the supervisor brutal-killed the coordinator

@@ -446,6 +446,15 @@ defmodule Fathom.Shard do
 
   def handle_info(:idle_timeout, state), do: {:noreply, state}
 
+  # The WriteCounter's table died with its owner and restarted empty (expert review
+  # #14): every count is now 0 while our flushed_through watermark may be ahead, so a
+  # dirty shard would compare clean and drop_clean would delete un-flushed writes.
+  # Unknown state must flush: force the watermark below any possible count; the next
+  # successful flush re-anchors it to the fresh counter.
+  def handle_info(:write_counter_reset, state) do
+    {:noreply, %{state | flushed_through: -1}}
+  end
+
   def handle_info(:renew_lease, state) do
     case Storage.renew_lease(state.id, state.lease, state.ttl_ms) do
       {:ok, lease} ->

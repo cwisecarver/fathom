@@ -95,6 +95,32 @@ defmodule Fathom.Shard.WriteCounter do
       read_concurrency: true
     ])
 
+    # Expert review #14: this table dies with its owner, and a restart hands every open
+    # coordinator a FRESH EMPTY table — count(id) = 0 for all shards — while each keeps
+    # its old flushed_through watermark, so `count > flushed_through` classified every
+    # dirty shard on the node as clean and drop_clean deleted un-flushed writes. Detect
+    # our own re-boot (persistent_term generation, the Heartbeat #8 pattern) and tell
+    # every registered coordinator to treat its dirtiness as unknown ⇒ flush.
+    gen = :persistent_term.get({__MODULE__, :generation}, -1) + 1
+    :persistent_term.put({__MODULE__, :generation}, gen)
+    if gen > 0, do: force_dirty_open_shards()
+
     {:ok, %{}}
+  end
+
+  # Best-effort: if the registry itself is down (a whole-plane restart, not just this
+  # process), the coordinators are dead too and there is nobody to notify.
+  defp force_dirty_open_shards do
+    require Logger
+
+    Logger.warning(
+      "WriteCounter restarted with a fresh table; forcing open coordinators dirty (unknown ⇒ flush)"
+    )
+
+    Fathom.ShardRegistry
+    |> Registry.select([{{:_, :"$1", :_}, [], [:"$1"]}])
+    |> Enum.each(&send(&1, :write_counter_reset))
+  rescue
+    ArgumentError -> :ok
   end
 end
