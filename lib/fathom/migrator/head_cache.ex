@@ -19,10 +19,12 @@ defmodule Fathom.Migrator.HeadCache do
 
   ## Why it's safe to be slightly stale
 
-  HEAD is **monotonic**: it only rises as versions release (a revert flips shard
-  pointers but leaves the `Release` row, so `max(version)` never drops). A stale cache
-  is therefore only ever **too low**, which merely *delays* a lazy migration — it can
-  never wrongly trigger one. `get/0` reads `:persistent_term` (lock-free, no process
+  HEAD rises as versions release, and a stale-LOW cache merely *delays* a lazy
+  migration — it can never wrongly trigger one. HEAD can also **drop** when a release
+  is yanked (`Fathom.Migrator.yank/1`, expert review #12): the yanking node refreshes
+  its cache synchronously, and other nodes can read a stale-HIGH head for up to one
+  TTL — but a yanked version's `statements/1` is `nil`, so a straggler lazy migration
+  targeting it errors out instead of re-applying the bad schema. `get/0` reads `:persistent_term` (lock-free, no process
   hop); the background poll runs only while `:lazy_migrate` is enabled (nothing reads
   the cache otherwise — the `Fathom.ShardLoad` philosophy).
   """

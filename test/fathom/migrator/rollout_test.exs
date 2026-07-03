@@ -81,6 +81,59 @@ defmodule Fathom.Migrator.RolloutTest do
     end
   end
 
+  # Expert review #12: a revert flipped shard pointers back but HEAD never dropped
+  # (max(version) over Release rows), so every reverted shard was immediately a laggard
+  # — the hourly ReconcileJob re-enqueued migrations to the same bad version within the
+  # hour, and lazy migrate re-applied it on the next checkout. Revert was effectively
+  # unusable without hand-deleting the shard_migrations row. The invariant: a fleet
+  # revert yanks the release — HEAD drops, the sweep re-applies nothing, and the yanked
+  # version's statements can never be replayed again.
+  describe "yank/1" do
+    test "a fleet revert yanks the release so the sweep cannot re-apply it" do
+      {:ok, _} = Migrator.release(1, "good", ["SELECT 1"])
+      {:ok, _} = Migrator.release(2, "bad", ["SELECT 1"])
+
+      for id <- ~w(a b) do
+        {:ok, _} = Directory.resolve(id)
+        {:ok, _} = Directory.cutover(id, 2)
+      end
+
+      assert Migrator.head() == 2
+      assert {:ok, 2} = Migrator.revert(2, 1)
+
+      assert Migrator.head() == 1, "the revert must yank the from-version out of HEAD"
+      assert Migrator.statements(2) == nil, "a yanked version must never be appliable again"
+
+      # The shards flip back (the revert jobs' effect, applied here directly)…
+      for id <- ~w(a b), do: {:ok, _} = Directory.cutover(id, 1)
+
+      # …and the hourly sweep must NOT re-enqueue forward migrations to the yanked v2.
+      assert {:ok, 0} = Migrator.rollout()
+      refute_enqueued(worker: ShardMigrationJob)
+    end
+
+    test "yank cancels pending forward jobs targeting the version" do
+      {:ok, _} = Migrator.release(2, "bad", ["SELECT 1"])
+      {:ok, _} = Directory.resolve("c")
+      assert {:ok, 1} = Migrator.rollout()
+      assert_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => "c", "target" => 2})
+
+      assert :ok = Migrator.yank(2)
+
+      refute_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => "c", "target" => 2})
+      assert Migrator.yank(9) == {:error, :unknown_version}
+    end
+
+    test "revert with yank: false keeps the release live" do
+      {:ok, _} = Migrator.release(2, "canary", ["SELECT 1"])
+      {:ok, _} = Directory.resolve("d")
+      {:ok, _} = Directory.cutover("d", 2)
+
+      assert {:ok, 1} = Migrator.revert(2, 1, yank: false)
+      assert Migrator.head() == 2, "a canary revert must be able to keep the release live"
+    end
+  end
+
   # Expert review #25: migration_failed was a terminal state with no exit path —
   # quarantined shards were excluded from laggards and every sweep forever, so a wave
   # of transient failures froze a slice of the fleet at the old version even after the

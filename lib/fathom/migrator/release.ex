@@ -15,6 +15,9 @@ defmodule Fathom.Migrator.Release do
     field :version, :integer
     field :name, :string
     field :statements, {:array, :string}, default: []
+    # Expert review #12: a yanked release is dead — excluded from HEAD, its statements
+    # never applied again. Set by Migrator.yank/1 (a revert yanks by default).
+    field :yanked, :boolean, default: false
 
     timestamps(type: :utc_datetime_usec, updated_at: false)
   end

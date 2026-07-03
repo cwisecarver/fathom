@@ -36,18 +36,68 @@ defmodule Fathom.Migrator do
     |> Repo.insert()
   end
 
-  @doc "The captured SQL statements for `version`, or `nil` if it isn't released."
+  @doc """
+  The captured SQL statements for `version`, or `nil` if it isn't released — or if it
+  was YANKED (expert review #12): a yanked version must never be applied again, so the
+  replay machinery sees it as unknown and any straggler job targeting it errors out
+  instead of re-applying the bad schema.
+  """
   @spec statements(pos_integer()) :: [String.t()] | nil
   def statements(version) do
     case Repo.get_by(Release, version: version) do
       nil -> nil
+      %{yanked: true} -> nil
       release -> release.statements
     end
   end
 
-  @doc "The fleet HEAD: the highest released version, or 0 if none are released."
+  @doc """
+  The fleet HEAD: the highest released, non-yanked version, or 0 if none. Yanked
+  releases are excluded (expert review #12) so a revert actually sticks — pre-fix
+  `max(version)` never dropped, every reverted shard was immediately a laggard, and
+  the hourly reconcile (or lazy migrate, within seconds) re-applied the reverted-from
+  version.
+  """
   @spec head() :: non_neg_integer()
-  def head, do: Repo.aggregate(Release, :max, :version) || 0
+  def head do
+    Repo.aggregate(from(r in Release, where: not r.yanked), :max, :version) || 0
+  end
+
+  @doc """
+  Yanks `version`: drops it from HEAD, makes its statements unappliable, cancels any
+  pending forward migration jobs targeting it, and refreshes this node's HeadCache
+  (other nodes converge within the cache TTL). `Migrator.revert/3` yanks the
+  from-version by default; call this directly to pull a bad release before any revert.
+  """
+  @spec yank(pos_integer()) :: :ok | {:error, :unknown_version}
+  def yank(version) do
+    case Repo.get_by(Release, version: version) do
+      nil ->
+        {:error, :unknown_version}
+
+      release ->
+        {:ok, _} = release |> Ecto.Changeset.change(yanked: true) |> Repo.update()
+
+        Oban.cancel_all_jobs(
+          from(j in Job,
+            where: j.worker == "Fathom.Migrator.ShardMigrationJob",
+            where: j.state in ["scheduled", "available", "retryable"],
+            where: fragment("(?->>'target')::bigint = ?", j.args, ^version)
+          )
+        )
+
+        refresh_head_cache()
+        :ok
+    end
+  end
+
+  # Best-effort: the cache TTL-refreshes anyway; a down cache must not fail a yank.
+  defp refresh_head_cache do
+    _ = Fathom.Migrator.HeadCache.refresh()
+    :ok
+  catch
+    :exit, _ -> :ok
+  end
 
   @doc "All released versions, oldest first."
   @spec list() :: [Release.t()]
@@ -95,12 +145,18 @@ defmodule Fathom.Migrator do
   the directory shows active since its cutover refuses the revert (its job cancels)
   rather than silently discarding post-cutover writes — see
   `Fathom.Migrator.ShardMigration.revert/4` (finding #13).
+
+  Yanks `from_version` first (expert review #12) so HEAD drops and the reconcile
+  sweep / lazy migrate cannot re-apply the version being reverted away from. Pass
+  `yank: false` to keep the release live (rare — e.g. reverting a few canary shards
+  while the rollout continues).
   """
   @enqueue_chunk 5_000
 
   @spec revert(non_neg_integer(), non_neg_integer(), keyword()) :: {:ok, non_neg_integer()}
   def revert(from_version, to_version, opts \\ []) do
     force? = Keyword.get(opts, :force, false)
+    if Keyword.get(opts, :yank, true), do: yank(from_version)
     shards = Directory.shards_at_version(from_version)
 
     # Expert review #23: the per-shard dedup below ignores `force`, so in the intended
