@@ -102,15 +102,30 @@ defmodule Fathom.Migrator do
     {:ok, count}
   end
 
-  # Bulk-enqueue a fleet sweep in one round-trip instead of one Oban.insert per shard
-  # (a fleet-wide rollout was N serialized inserts). Takes `{shard_id, changeset}` pairs.
-  # insert_all/1 skips the workers' `unique` config, so we first drop shards that already
-  # have an in-flight job for this worker (preserving per-shard uniqueness against the lazy
-  # path, earlier sweeps, and the hourly reconcile), then insert the rest at once. A shard
+  # Bulk-enqueue a fleet sweep in batched round-trips instead of one Oban.insert per
+  # shard (a fleet-wide rollout was N serialized inserts). Takes `{shard_id, changeset}`
+  # pairs. insert_all/1 skips the workers' `unique` config, so we first drop shards that
+  # already have an in-flight job for this worker (preserving per-shard uniqueness against
+  # the lazy path, earlier sweeps, and the hourly reconcile), then insert the rest. A shard
   # slipping in between the check and the insert only costs a redundant idempotent job.
+  #
+  # CHUNKED because Postgres's wire protocol caps a statement at 65,535 bind parameters:
+  # one unpartitioned Oban.insert_all crashed past ~7,281 jobs (9 params each), which a
+  # fleet revert (unbounded — every shard at a version) or a big rollout limit hits at
+  # scale (found by scripts/directory_scale.exs at 3.1M directory rows). 5,000 pairs per
+  # chunk keeps both statements comfortably under the cap (dedup: 1 param/id; insert:
+  # 9 params/job = 45,000).
+  @enqueue_chunk 5_000
+
   defp enqueue_unique([]), do: 0
 
   defp enqueue_unique(id_changesets) do
+    id_changesets
+    |> Enum.chunk_every(@enqueue_chunk)
+    |> Enum.reduce(0, fn chunk, acc -> acc + enqueue_unique_chunk(chunk) end)
+  end
+
+  defp enqueue_unique_chunk(id_changesets) do
     shard_ids = Enum.map(id_changesets, &elem(&1, 0))
     worker = id_changesets |> hd() |> elem(1) |> Ecto.Changeset.get_field(:worker)
 

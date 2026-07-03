@@ -42,6 +42,33 @@ defmodule Fathom.Migrator.RolloutTest do
 
       assert length(all_enqueued(worker: ShardMigrationJob)) == 2
     end
+
+    # Found by scripts/directory_scale.exs at 3.1M directory rows: Postgres caps a statement
+    # at 65,535 bind parameters, so one unpartitioned Oban.insert_all crashed past ~7,281
+    # jobs (9 params each) — which a fleet revert (unbounded: every shard at a version) or a
+    # rollout limit above that hits at real fleet size. enqueue_unique must chunk both the
+    # dedup pre-check and the insert.
+    test "a sweep bigger than the bind-parameter cap enqueues in chunks, not one statement" do
+      {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      rows =
+        for i <- 1..8_000 do
+          %{
+            shard_id: "bulk#{i}",
+            schema_version: 0,
+            status: "active",
+            last_active_at: now,
+            inserted_at: now,
+            updated_at: now
+          }
+        end
+
+      rows |> Enum.chunk_every(4_000) |> Enum.each(&Repo.insert_all("shards", &1))
+
+      assert {:ok, 8_000} = Migrator.rollout(8_000)
+      assert length(all_enqueued(worker: ShardMigrationJob)) == 8_000
+    end
   end
 
   describe "reconcile" do
