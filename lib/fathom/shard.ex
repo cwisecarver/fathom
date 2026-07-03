@@ -191,7 +191,12 @@ defmodule Fathom.Shard do
     # later open would wrongly treat as authoritative (a present local copy wins).
     # A present local copy means a warm restart (may hold un-flushed writes) — skip
     # the pull entirely.
-    warm? = File.exists?(path)
+    # Expert review #1: a present local file is only authoritative if it derives from
+    # the stored object's current lineage. A crashed node whose shard was stolen,
+    # written, and released elsewhere still has its old file — quarantine it (and
+    # re-pull) rather than adopt the store's current etag and clobber the newer
+    # lineage with a stale fork.
+    warm? = File.exists?(path) and not quarantined_fork?(shard_id, path)
     pull_task = if warm?, do: nil, else: start_pull(shard_id, path)
 
     # Sample the heartbeat generation BEFORE acquire_lease. The fence's invariant is
@@ -355,10 +360,28 @@ defmodule Fathom.Shard do
   # `{:ok, etag_or_nil}` or `{:error, reason}`. `nil` task ⇒ a local copy already existed
   # (warm restart): no pull ran, so fetch the etag with a HEAD so the first fenced flush can
   # If-Match it. Otherwise await the speculative pull and promote its temp into place.
-  defp await_pull(nil, _path, shard_id) do
-    case Storage.object_etag(shard_id) do
-      {:ok, etag} -> {:ok, etag}
-      {:error, reason} -> {:error, {:etag_unavailable, reason}}
+  defp await_pull(nil, path, shard_id) do
+    # Warm restart: fence with the local copy's PROVENANCE etag (the sidecar written
+    # at pull/flush time), never "whatever the store holds now" (expert review #1) —
+    # adopting the current etag let a stale fork flush over a newer lineage with a
+    # valid If-Match. quarantined_fork?/2 already re-pulled a mismatched copy when the
+    # store was reachable, so this normally equals the current etag; when the store
+    # was unreachable at open, fencing with the provenance etag makes a forked flush
+    # 412 (self-fence) instead of clobbering. A missing sidecar is a legacy warm file
+    # from before provenance tracking: fall back to adopting the current etag, once.
+    case read_etag_sidecar(path) do
+      {:ok, etag} ->
+        {:ok, etag}
+
+      :missing ->
+        Logger.warning(
+          "shard #{shard_id}: warm file has no provenance sidecar (legacy); adopting current etag"
+        )
+
+        case Storage.object_etag(shard_id) do
+          {:ok, etag} -> {:ok, etag}
+          {:error, reason} -> {:error, {:etag_unavailable, reason}}
+        end
     end
   end
 
@@ -399,10 +422,19 @@ defmodule Fathom.Shard do
       File.rm(path <> "-shm")
 
       case File.rename(temp, path) do
-        :ok -> {:ok, etag}
-        {:error, _} = err -> err
+        :ok ->
+          # Record the pulled object's etag as the local copy's provenance (expert
+          # review #1). Best-effort: a failed sidecar write degrades to the legacy
+          # adopt-current warm path, never fails the open.
+          write_etag_sidecar(path, etag)
+          {:ok, etag}
+
+        {:error, _} = err ->
+          err
       end
     else
+      # Brand-new shard: no object, no local file — no provenance either.
+      File.rm(etag_sidecar(path))
       {:ok, etag}
     end
   end
@@ -612,8 +644,10 @@ defmodule Fathom.Shard do
             flushed_to = WriteCounter.count(state.id)
 
             case snapshot_and_upload(state) do
-              # Uploaded; advance the fence etag and the flushed watermark (clears dirty).
+              # Uploaded; advance the fence etag, the provenance sidecar, and the
+              # flushed watermark (clears dirty).
               {:ok, new_etag} ->
+                write_etag_sidecar(state.path, new_etag)
                 {:noreply, schedule_flush(%{state | flushed_through: flushed_to, etag: new_etag})}
 
               # The data PUT's If-Match failed: a stealer flushed in the upload window since our
@@ -840,7 +874,88 @@ defmodule Fathom.Shard do
     end
   end
 
-  defp drop_local(path), do: Enum.each(["", "-wal", "-shm"], &File.rm(path <> &1))
+  defp drop_local(path), do: Enum.each(["", "-wal", "-shm", ".etag"], &File.rm(path <> &1))
+
+  # --- etag provenance sidecar (expert review #1) ---
+  #
+  # `<path>.etag` records which stored-object version the live local file derives
+  # from — written on every pull promotion and successful flush, removed with the
+  # local copy. A warm restart compares it to the store's current etag: equal ⇒ the
+  # local file continues the stored lineage (and may hold newer un-flushed writes);
+  # different ⇒ the lineages FORKED (another node wrote and released while we were
+  # down) and serving or flushing our copy would clobber acknowledged writes.
+
+  defp etag_sidecar(path), do: path <> ".etag"
+
+  defp write_etag_sidecar(_path, nil), do: :ok
+
+  defp write_etag_sidecar(path, etag) do
+    # A plain write, deliberately NOT atomic_write: the sidecar has a single writer
+    # (this coordinator) and is read only at open, before any writer exists, so no
+    # torn CONCURRENT read is possible — and a torn value after a crash merely reads
+    # as a mismatch ⇒ a spurious, recoverable quarantine (the safe direction). The
+    # temp+rename pattern costs ~5× more (two APFS-journaled metadata ops) on the
+    # timed cold-open path.
+    case File.write(etag_sidecar(path), etag) do
+      :ok -> :ok
+      {:error, reason} -> Logger.warning("etag sidecar write failed: #{inspect(reason)}")
+    end
+  end
+
+  defp read_etag_sidecar(path) do
+    case File.read(etag_sidecar(path)) do
+      {:ok, ""} -> :missing
+      {:ok, etag} -> {:ok, etag}
+      {:error, _} -> :missing
+    end
+  end
+
+  # Warm-restart fork detection. true ⇒ the local copy was quarantined (renamed to
+  # `<path>.forked*`, preserved for operator recovery) and the open proceeds COLD,
+  # pulling the store's current lineage. An unreachable store falls back to serving
+  # warm fenced by the provenance etag (a forked flush then 412s and self-fences
+  # instead of clobbering).
+  defp quarantined_fork?(shard_id, path) do
+    case read_etag_sidecar(path) do
+      :missing ->
+        false
+
+      {:ok, sidecar_etag} ->
+        case Storage.object_etag(shard_id) do
+          {:ok, ^sidecar_etag} ->
+            false
+
+          # The object is GONE but we have provenance from one — treat as fork-adjacent?
+          # No: a deliberately deleted object with a live local copy is the un-flushed
+          # brand-new case; serve warm and let the fenced flush recreate it.
+          {:ok, nil} ->
+            false
+
+          {:ok, _newer} ->
+            quarantine_fork!(shard_id, path)
+            true
+
+          {:error, _unreachable} ->
+            false
+        end
+    end
+  end
+
+  defp quarantine_fork!(shard_id, path) do
+    dest = path <> ".forked"
+    Enum.each(["", "-wal", "-shm"], &File.rm(dest <> &1))
+    Enum.each(["", "-wal", "-shm"], &File.rename(path <> &1, dest <> &1))
+    File.rm(etag_sidecar(path))
+
+    Logger.error(
+      "shard #{shard_id}: local copy FORKED from the stored lineage (another node wrote " <>
+        "and released while this one was down); quarantined at #{dest} and re-pulling. " <>
+        "Operator recovery: the forked writes live in that file (expert review #1)."
+    )
+
+    :telemetry.execute([:fathom, :shard, :forked], %{count: 1}, %{shard_id: shard_id})
+    :ok
+  end
 
   # Snapshot the live DB to a temp file and upload it (fenced by the object etag), keeping the
   # working copy. Returns `{:ok, new_etag}` when both the snapshot and the conditional upload

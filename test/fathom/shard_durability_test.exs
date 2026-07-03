@@ -500,6 +500,79 @@ defmodule Fathom.ShardDurabilityTest do
     close_and_stop(shard, conn2)
   end
 
+  # Expert review #1 (the panel's one CRITICAL): a warm restart fenced its first flush
+  # with the store's CURRENT etag (await_pull's HEAD), not the etag its local copy
+  # derives from. Node A crashes with un-flushed writes; its shard is stolen, written,
+  # and RELEASED elsewhere; A restarts, sees its local file, adopts the store's (newer)
+  # etag, is seeded dirty — and within one flush interval uploads its stale fork with a
+  # VALID If-Match, silently destroying the other node's acknowledged, durably-flushed
+  # writes. The invariant: the local copy's provenance (an etag sidecar written at pull/
+  # flush time) decides — a mismatched lineage is quarantined and re-pulled, never
+  # served or flushed.
+  test "a warm restart cannot adopt a newer lineage and clobber it", %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+    on_exit(fn -> File.rm_rf(local_db(shard) <> ".forked") end)
+
+    # The shard's original lineage in storage.
+    seed = Path.join(System.tmp_dir!(), "seed1_#{shard}.db")
+    {:ok, c} = Connection.open(seed)
+    :ok = Connection.exec(c, "CREATE TABLE kv (v TEXT)")
+    :ok = Connection.exec(c, "INSERT INTO kv VALUES ('base')")
+    :ok = Connection.exec(c, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(c)
+    :ok = Storage.flush(shard, seed)
+    for s <- ["", "-wal", "-shm"], do: File.rm(seed <> s)
+
+    # Node "A": cold-pull, write locally, then CRASH — local file (with A's un-flushed
+    # write) left on disk, nothing flushed.
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('a-fork')"))
+    {:ok, coordinator} = Shards.ensure(shard)
+    ref = Process.monitor(coordinator)
+    Process.exit(coordinator, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^coordinator, :killed}, 1_000
+    _ = :sys.get_state(Fathom.ShardSupervisor)
+    ShardExecutor.close(conn)
+
+    # Node "B" (elsewhere): steals, serves, flushes NEW acknowledged writes, releases.
+    b = Path.join(System.tmp_dir!(), "seedb_#{shard}.db")
+    {:ok, cb} = Connection.open(b)
+    :ok = Connection.exec(cb, "CREATE TABLE kv (v TEXT)")
+    :ok = Connection.exec(cb, "INSERT INTO kv VALUES ('b-write')")
+    :ok = Connection.exec(cb, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(cb)
+    :ok = Storage.flush(shard, b)
+    for s <- ["", "-wal", "-shm"], do: File.rm(b <> s)
+    File.rm(Path.join(@remote_dir, "#{shard}.lock"))
+
+    # "A" returns: the warm open must detect the fork, quarantine A's copy, and serve
+    # B's lineage — pre-fix it adopted B's etag and later flushed A's fork over it.
+    capture_log(fn ->
+      {:ok, conn2} = ShardExecutor.open(shard)
+
+      assert {:ok, %StmtResult{rows: [["b-write"]]}} =
+               ShardExecutor.execute(conn2, stmt("SELECT v FROM kv WHERE v = 'b-write'")),
+             "the returning node must serve the stored lineage, not its stale fork"
+
+      assert {:ok, %StmtResult{rows: []}} =
+               ShardExecutor.execute(conn2, stmt("SELECT v FROM kv WHERE v = 'a-fork'"))
+
+      assert File.exists?(local_db(shard) <> ".forked"),
+             "the forked local copy must be quarantined for recovery, not deleted"
+
+      close_and_stop(shard, conn2)
+    end)
+
+    # After the full idle flush cycle, B's acknowledged write is still the durable truth.
+    {:ok, ro} = Connection.open(remote_db(shard))
+
+    assert {:ok, %{rows: [["b-write"]]}} =
+             Connection.query(ro, "SELECT v FROM kv WHERE v = 'b-write'", []),
+           "the stored lineage must never be clobbered by the returning node's fork"
+
+    Connection.close(ro)
+  end
+
   # Expert review #14: the WriteCounter's ETS table dies with its owner, and a restart
   # handed every open coordinator a FRESH EMPTY table — count(id) = 0 — while each kept
   # its old flushed_through watermark, so `count > flushed_through` classified every
