@@ -115,12 +115,25 @@ defmodule Fathom.Shard.Heartbeat do
   end
 
   @impl true
-  def terminate(_reason, state) do
+  def terminate(reason, state) when reason in [:normal, :shutdown] do
     # Clean shutdown: drop our heartbeat so this node's shards are immediately
     # stealable (fast planned-failover) rather than waiting out the TTL.
     Storage.clear_heartbeat(state.owner)
     :ok
   end
+
+  def terminate({:shutdown, _}, state) do
+    Storage.clear_heartbeat(state.owner)
+    :ok
+  end
+
+  # A crash the supervisor is about to reverse must NOT delete the liveness object:
+  # with per-shard locks never renewed in heartbeat mode, an absent heartbeat makes
+  # every long-lived shard on this (perfectly healthy, still-serving) node look dead
+  # to owner_live?'s :not_found fallback and instantly stealable during the restart
+  # gap. Leave the object in place — the restarted process re-renews it within
+  # renew_ms, and until then the stale-but-present object still fences stealers.
+  def terminate(_reason, _state), do: :ok
 
   defp do_renew(state) do
     now = Storage.now_ms()

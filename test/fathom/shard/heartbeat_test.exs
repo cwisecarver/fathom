@@ -95,4 +95,26 @@ defmodule Fathom.Shard.HeartbeatTest do
     assert_receive {:DOWN, ^ref, :process, ^pid, _}, 1_000
     assert Storage.read_heartbeat(owner) == :not_found
   end
+
+  # Expert review #7: terminate/2 cleared the heartbeat object for ANY reason —
+  # including a crash the supervisor immediately reverses (a raise in a callback runs
+  # terminate with the exception reason before exiting). During the restart gap the
+  # object was absent, so a contender's owner_live? hit the :not_found fallback,
+  # judged every long-lived shard on this perfectly-healthy node dead (locks are
+  # never renewed in heartbeat mode, so their TTLs are long stale), and stole them
+  # while the node was still serving — a fleet-wide split-brain window per crash.
+  # The invariant: only a PLANNED shutdown deletes the liveness object.
+  test "a crash does NOT clear the heartbeat object", %{pid: pid, owner: owner} do
+    assert {:ok, _} = Storage.read_heartbeat(owner)
+    ref = Process.monitor(pid)
+
+    capture_log(fn ->
+      # An abnormal stop reason takes the crash path through terminate/2.
+      GenServer.stop(pid, :simulated_crash)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :simulated_crash}, 1_000
+    end)
+
+    assert {:ok, _} = Storage.read_heartbeat(owner),
+           "a crash must leave the heartbeat object for the restarted process to re-renew"
+  end
 end
