@@ -112,10 +112,26 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
   test "RetirementJob drops the retained version", %{shard: shard} do
     seed_v1!(shard)
     :ok = Storage.retain(shard, 1)
+    # The retained version is genuinely OLD (live has moved past it) — the normal case.
+    {:ok, _} = Directory.cutover(shard, 2)
     assert File.exists?(Path.join(@remote_dir, "#{shard}@1.db"))
 
     assert :ok = perform_job(RetirementJob, %{"shard_id" => shard, "version" => 1})
     refute File.exists?(Path.join(@remote_dir, "#{shard}@1.db"))
+  end
+
+  # Expert review #22: the drop must skip a version the directory shows LIVE — a revert
+  # restored it after this retirement was scheduled, and its retained copy is the
+  # recovery point the next revert restores from, not garbage.
+  test "RetirementJob skips a version that is live again", %{shard: shard} do
+    seed_v1!(shard)
+    :ok = Storage.retain(shard, 1)
+
+    assert {:cancel, :version_live} =
+             perform_job(RetirementJob, %{"shard_id" => shard, "version" => 1})
+
+    assert File.exists?(Path.join(@remote_dir, "#{shard}@1.db")),
+           "the live version's retained copy must not be dropped"
   end
 
   test "a held lease snoozes the job", %{shard: shard} do
@@ -165,6 +181,26 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     assert File.exists?(Path.join(@remote_dir, "#{shard}@2.db")),
            "the live v2 object is backed up"
 
+    assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 2})
+  end
+
+  # Expert review #22: the design doc's revert sequence ends with "cancel the pending
+  # RetirementJob", but the cancellation was never implemented — after a revert, the
+  # forward migration's scheduled drop of the restored version stayed live, and a revert
+  # issued near the retention deadline raced it (restore 404s, the RevertJob burns its
+  # attempts). The invariant: a successful revert cancels the restored version's pending
+  # retirement, while the new backup's own retirement stays scheduled.
+  test "a revert cancels the pending retirement of the restored version", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+    assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1})
+
+    assert :ok = perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 1})
+
+    refute_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1})
+
+    # The revert's own backup (v2) still gets retired after the window.
     assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 2})
   end
 

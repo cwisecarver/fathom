@@ -14,6 +14,8 @@ defmodule Fathom.Migrator.RevertJob do
 
   require Logger
 
+  import Ecto.Query, only: [from: 2]
+
   alias Fathom.Migrator.{RetirementJob, ShardMigration}
 
   @retention_seconds 7 * 24 * 60 * 60
@@ -31,6 +33,12 @@ defmodule Fathom.Migrator.RevertJob do
         # after the retention window so it doesn't leak (RetirementJob only ever drops the
         # forward `from` version otherwise).
         schedule_retirement(shard_id, backed_up)
+        # And cancel the forward migration's pending retirement of the version we just
+        # restored (expert review #22, per the design doc's revert sequence): to_version
+        # is LIVE again, and its retained copy near the retention deadline is what the
+        # next revert restores from — leaving the drop scheduled made reverts near the
+        # boundary race it and fail on a 404 restore.
+        cancel_retirement(shard_id, to_version)
         :ok
 
       {:retry, reason} ->
@@ -53,6 +61,17 @@ defmodule Fathom.Migrator.RevertJob do
         Logger.warning("shard #{shard_id}: revert error, will retry (#{inspect(reason)})")
         {:error, reason}
     end
+  end
+
+  defp cancel_retirement(shard_id, version) do
+    Oban.cancel_all_jobs(
+      from(j in Oban.Job,
+        where: j.worker == "Fathom.Migrator.RetirementJob",
+        where: j.state in ["scheduled", "available", "retryable"],
+        where: fragment("?->>'shard_id' = ?", j.args, ^shard_id),
+        where: fragment("(?->>'version')::bigint = ?", j.args, ^version)
+      )
+    )
   end
 
   defp schedule_retirement(shard_id, version) do
