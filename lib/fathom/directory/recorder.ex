@@ -57,6 +57,13 @@ defmodule Fathom.Directory.Recorder do
 
   @impl true
   def init(opts) do
+    # Trap exits so a supervisor :shutdown runs terminate/2's final flush (expert
+    # review #30): without this a GenServer is killed outright by the shutdown
+    # signal and terminate never runs — the documented "don't lose the last window
+    # of touches on a graceful stop" was dead code on every deploy, and those
+    # touches feed last_active_at, the revert write-age guard's input.
+    Process.flag(:trap_exit, true)
+
     # public + write_concurrency: many checkout processes insert concurrently;
     # the recorder is the only reader (during flush).
     :ets.new(@table, [:set, :public, :named_table, write_concurrency: true])

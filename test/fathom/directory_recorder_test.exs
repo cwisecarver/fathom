@@ -80,6 +80,29 @@ defmodule Fathom.Directory.RecorderTest do
     assert {:ok, %{shard_id: ^a}} = Directory.get(a)
   end
 
+  # Expert review #30: terminate/2 documents "don't lose the last window of touches on
+  # a graceful stop" and flushes the buffer — but the Recorder never trapped exits, so a
+  # supervisor :shutdown killed it outright and terminate NEVER ran: the documented
+  # guarantee was dead code on every deploy, and the dropped touches feed
+  # last_active_at, the revert write-age guard's sole input. The invariant: a graceful
+  # stop flushes the buffered window.
+  test "a supervisor shutdown flushes the buffered touches via terminate/2" do
+    a = uniq()
+    assert :ok = Recorder.record(a)
+
+    pid = Process.whereis(Recorder)
+    ref = Process.monitor(pid)
+    :ok = Supervisor.terminate_child(Fathom.ControlPlane.Supervisor, Recorder)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :shutdown}, 1_000
+
+    on_exit(fn -> Supervisor.restart_child(Fathom.ControlPlane.Supervisor, Recorder) end)
+
+    assert {:ok, %{shard_id: ^a}} = Directory.get(a),
+           "the buffered touch must be flushed by the graceful stop"
+
+    {:ok, _} = Supervisor.restart_child(Fathom.ControlPlane.Supervisor, Recorder)
+  end
+
   @tag :bench
   test "record/1 stays off the Postgres hot path (sub-50µs ETS write)" do
     id = uniq()
