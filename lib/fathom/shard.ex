@@ -366,9 +366,23 @@ defmodule Fathom.Shard do
   defp promote_pull(path, etag) do
     temp = pull_temp(path)
 
-    case if(File.exists?(temp), do: File.rename(temp, path), else: :ok) do
-      :ok -> {:ok, etag}
-      {:error, _} = err -> err
+    if File.exists?(temp) do
+      # Remove any stale sidecars BEFORE the pulled file lands (expert review #18): a
+      # crash between drop_local's two File.rm calls (db deleted, -wal not yet) leaves
+      # an orphan WAL, and SQLite's first open would run WAL recovery against it —
+      # replaying a different generation's frames into the freshly pulled database
+      # (resurrected deletes, torn pages, or a malformed db, then flushed back as the
+      # durable object). A pulled object is always a self-contained checkpointed
+      # image, so any sidecars next to it are by definition stale.
+      File.rm(path <> "-wal")
+      File.rm(path <> "-shm")
+
+      case File.rename(temp, path) do
+        :ok -> {:ok, etag}
+        {:error, _} = err -> err
+      end
+    else
+      {:ok, etag}
     end
   end
 

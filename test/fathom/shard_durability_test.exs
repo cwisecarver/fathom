@@ -412,6 +412,56 @@ defmodule Fathom.ShardDurabilityTest do
     Connection.close(ro)
   end
 
+  # Expert review #18: promote_pull renamed the pulled temp onto `path` without removing
+  # pre-existing `-wal`/`-shm` sidecars, and drop_local deletes the db FIRST, wal second —
+  # so a crash between those two rm calls leaves an orphan WAL. The next cold open pulled
+  # a fresh object, renamed it into place, and SQLite's first open ran WAL recovery
+  # against the stale, different-generation WAL — replaying old frames into the freshly
+  # pulled database (resurrected data, torn pages, or a malformed db, then flushed back
+  # as the durable object). The invariant: a pulled object is a self-contained
+  # checkpointed image; stale sidecars must never survive its promotion.
+  test "a cold open onto an orphaned stale WAL does not contaminate the pulled object",
+       %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+
+    # Build a WAL from a PREVIOUS generation of this shard: write through a raw
+    # connection (frames live in -wal), snapshot the -wal aside before close
+    # (close checkpoints + truncates it), then simulate the crash artifact:
+    # db deleted, stale -wal left behind.
+    path = local_db(shard)
+    {:ok, c} = Connection.open(path)
+    :ok = Connection.exec(c, "CREATE TABLE stale (v TEXT)")
+    :ok = Connection.exec(c, "INSERT INTO stale VALUES ('old-generation')")
+    stale_wal = path <> ".stale_wal_copy"
+    File.cp!(path <> "-wal", stale_wal)
+    Connection.close(c)
+    for s <- ["", "-wal", "-shm"], do: File.rm(path <> s)
+    File.rename!(stale_wal, path <> "-wal")
+
+    # The durable object is a different, self-contained image (the truth to serve).
+    seed = Path.join(System.tmp_dir!(), "seed18_#{shard}.db")
+    {:ok, sc} = Connection.open(seed)
+    :ok = Connection.exec(sc, "CREATE TABLE good (v TEXT)")
+    :ok = Connection.exec(sc, "INSERT INTO good VALUES ('fresh-pull')")
+    :ok = Connection.exec(sc, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(sc)
+    :ok = Storage.flush(shard, seed)
+    for s <- ["", "-wal", "-shm"], do: File.rm(seed <> s)
+
+    # Cold open (db absent ⇒ pull + promote). The pulled image must be served intact.
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    assert {:ok, %StmtResult{rows: [["ok"]]}} =
+             ShardExecutor.execute(conn, stmt("PRAGMA integrity_check")),
+           "the stale WAL must not corrupt the pulled database"
+
+    assert {:ok, %StmtResult{rows: [["fresh-pull"]]}} =
+             ShardExecutor.execute(conn, stmt("SELECT v FROM good")),
+           "the pulled object's content must be served, not the old generation's"
+
+    close_and_stop(shard, conn)
+  end
+
   # Expert review #15: `PRAGMA user_version = N` writes the database header but reports
   # num_changes == 0 and no columns, and the blanket "pragma is control" classification
   # treated it as a read — the shard stayed clean, idle drop_clean deleted the local copy
