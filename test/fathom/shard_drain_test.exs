@@ -32,6 +32,26 @@ defmodule Fathom.ShardDrainTest do
     assert Shards.drain(shard) == :ok
   end
 
+  # Expert review #33: a checkout hitting a draining coordinator returned
+  # {:error, :draining}, and open_error had no clause for it — the generic fallthrough
+  # carried NO status, i.e. the transport-default 500. A drain is a routine, short-lived
+  # migration state; client SDKs treat 500 as failure, not back-off, turning every
+  # planned blue/green window into visible errors. The invariant: checkout-during-drain
+  # surfaces as a retryable 503.
+  test "opening a draining shard surfaces as a retryable 503, not a 500", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, pid} = Shards.ensure(shard)
+
+    # Held connection keeps the drain pending; new opens are refused meanwhile.
+    Shard.request_drain(pid, 10_000, self())
+
+    assert {:error, %Error{code: "FILO_DRAINING", status: 503}} = ShardExecutor.open(shard)
+
+    ref = Process.monitor(pid)
+    :ok = ShardExecutor.close(conn)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 2_000
+  end
+
   # Expert review #29: a second overlapping drain overwrote the first's timer and
   # reply_to WITHOUT cancelling the timer. The orphaned first timer then fired,
   # spuriously aborting the second drain long before its own window, while the first
@@ -102,7 +122,8 @@ defmodule Fathom.ShardDrainTest do
     Shard.request_drain(pid, 5_000, self())
     _ = :sys.get_state(pid)
 
-    assert {:error, %Error{code: "FILO_SHARD_OPEN"}} = ShardExecutor.open(shard)
+    # Refused with the retryable drain code (expert review #33), not a generic 500.
+    assert {:error, %Error{code: "FILO_DRAINING", status: 503}} = ShardExecutor.open(shard)
 
     ref = Process.monitor(pid)
     :ok = ShardExecutor.close(conn)

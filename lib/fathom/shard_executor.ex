@@ -231,6 +231,13 @@ defmodule Fathom.ShardExecutor do
   defp open_error(:novel_shard_rate_limited),
     do: %Error{message: "shard creation rate limited", code: "FILO_RATE_LIMITED", status: 429}
 
+  # A drain is a routine, short-lived migration state ("the caller should retry
+  # later"), not a server fault: 503, so client SDKs back off and retry instead of
+  # treating every planned blue/green window as an error (expert review #33 — the
+  # fallthrough's status-less error surfaced as the transport-default 500).
+  defp open_error(:draining),
+    do: %Error{message: "shard draining", code: "FILO_DRAINING", status: 503}
+
   defp open_error(reason),
     do: %Error{message: "cannot open shard: #{inspect(reason)}", code: "FILO_SHARD_OPEN"}
 
