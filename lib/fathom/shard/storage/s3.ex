@@ -134,9 +134,11 @@ defmodule Fathom.Shard.Storage.S3 do
       {:ok, %{status: 200, body: body, headers: h}} ->
         # Atomic local write so a concurrent reader never sees a half-downloaded file (#24).
         # Return the object's etag so the coordinator can fence its first flush (#15).
-        case Storage.atomic_write(local_path, body) do
-          :ok -> {:ok, etag(h)}
-          err -> err
+        # The body is verified against an MD5-shaped etag first (expert review #37) so
+        # a corrupted transfer is an error, not a served shard.
+        with :ok <- verify_body(body, etag(h)),
+             :ok <- Storage.atomic_write(local_path, body) do
+          {:ok, etag(h)}
         end
 
       # Brand-new shard — no object, nothing written, no etag to fence against yet.
@@ -154,7 +156,12 @@ defmodule Fathom.Shard.Storage.S3 do
   @impl true
   def flush(shard_id, local_path) do
     with {:ok, body} <- File.read(local_path),
-         {:ok, %{status: status}} <- Req.put(req(), url: object_path(shard_id), body: body) do
+         {:ok, %{status: status}} <-
+           Req.put(req(),
+             url: object_path(shard_id),
+             body: body,
+             headers: [{"content-md5", content_md5(body)}]
+           ) do
       if status in 200..299, do: :ok, else: {:error, {:s3_put_status, status}}
     end
   end
@@ -170,7 +177,11 @@ defmodule Fathom.Shard.Storage.S3 do
 
     with {:ok, body} <- File.read(local_path),
          {:ok, resp} <-
-           Req.put(req(), url: object_path(shard_id), body: body, headers: cond_headers) do
+           Req.put(req(),
+             url: object_path(shard_id),
+             body: body,
+             headers: [{"content-md5", content_md5(body)} | cond_headers]
+           ) do
       case resp.status do
         s when s in 200..299 -> {:ok, etag(resp.headers)}
         412 -> {:error, :superseded}
@@ -178,6 +189,33 @@ defmodule Fathom.Shard.Storage.S3 do
       end
     end
   end
+
+  # Integrity (expert review #37): TLS/TCP catch wire corruption, but nothing caught
+  # corruption introduced BEFORE the socket — a torn File.read against a bad disk, a
+  # buggy proxy, or an S3-compatible store bug. A corrupted upload was accepted as the
+  # durable object, and because the fence etag chain advances from the response, every
+  # later conditional op treated the corrupt object as truth — discovered only at the
+  # next cold open, after the good local copy was gone.
+  #
+  # Content-MD5 on every data PUT makes the store reject a torn upload; on pull, the
+  # body is verified against the returned etag when it's the MD5-shaped single-part
+  # form (32 hex chars — multipart/encrypted etags are not MD5s and are skipped).
+  defp content_md5(body), do: :crypto.hash(:md5, body) |> Base.encode64()
+
+  defp verify_body(_body, nil), do: :ok
+
+  defp verify_body(body, etag) do
+    plain = String.trim(etag, ~s("))
+
+    if md5_etag?(plain) and
+         Base.encode16(:crypto.hash(:md5, body), case: :lower) != String.downcase(plain) do
+      {:error, :checksum_mismatch}
+    else
+      :ok
+    end
+  end
+
+  defp md5_etag?(plain), do: plain =~ ~r/\A[0-9a-fA-F]{32}\z/
 
   @impl true
   def object_etag(shard_id) do
@@ -203,9 +241,10 @@ defmodule Fathom.Shard.Storage.S3 do
 
       {:ok, %{status: 200, body: body, headers: h}} ->
         # Atomic so a warm-cache rewrite can't be read half-old/half-new by a promotion (#24).
-        case Storage.atomic_write(local_path, body) do
-          :ok -> {:ok, {:written, etag(h)}}
-          err -> err
+        # Verified like pull/2 (expert review #37).
+        with :ok <- verify_body(body, etag(h)),
+             :ok <- Storage.atomic_write(local_path, body) do
+          {:ok, {:written, etag(h)}}
         end
 
       {:ok, %{status: 404}} ->
