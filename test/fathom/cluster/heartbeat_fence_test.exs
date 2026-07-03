@@ -59,16 +59,11 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
       # A thief takes the lock — which is only possible because our heartbeat lapsed.
       put_raw_lock(shard, "thief@node", 999, now_ms() + 60_000)
 
-      # Force that lapse: the heartbeat expired before its next renewal (bumps the
-      # generation), then recovers fresh. Now the fence can't just trust the
-      # heartbeat — it must revalidate the lock. (Lapse detection is monotonic
-      # elapsed time — expert review #21.)
-      :sys.replace_state(hb, fn s ->
-        %{s | mono_deadline_ms: System.monotonic_time(:millisecond) - 1_000}
-      end)
-
-      send(hb, :renew)
-      _ = :sys.get_state(hb)
+      # Force that lapse by bumping the generation DIRECTLY (no renew tick, so no
+      # lapse broadcast — the proactive #34 path is tested separately below; this
+      # test pins the lazy flush-path fence that guards a missed broadcast). Now the
+      # fence can't just trust the heartbeat — it must revalidate the lock.
+      :sys.replace_state(hb, fn s -> %{s | generation: s.generation + 1, lapsed: true} end)
 
       # Releasing the last connection idles → flush → fence: :revalidate →
       # check_lease sees the thief → drop local WITHOUT flushing.
@@ -78,6 +73,40 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
 
     refute File.exists?(remote_db(shard)), "fenced coordinator must not flush over the new owner"
     refute File.exists?(local_db(shard)), "fenced coordinator drops its local copy"
+  end
+
+  # Expert review #34: the Heartbeat moduledoc promised a lapse "broadcasts so
+  # coordinators can revalidate proactively instead of waiting for their next flush" —
+  # but nothing subscribed, so a superseded coordinator kept accepting writes it would
+  # later discard for up to a full flush interval (unboundedly with the durability
+  # flush disabled). The invariant: the lapse broadcast alone makes a stolen shard's
+  # coordinator revalidate and self-fence, no flush needed.
+  test "a lapse broadcast proactively self-fences a stolen shard without waiting for a flush",
+       %{shard: shard, hb: hb} do
+    capture_log(fn ->
+      {:ok, conn} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+
+      {:ok, coordinator} = Shards.ensure(shard)
+      ref = Process.monitor(coordinator)
+
+      # A thief takes the lock during the lapse.
+      put_raw_lock(shard, "thief@node", 999, now_ms() + 60_000)
+
+      # Force the lapse: the renew tick bumps the generation and broadcasts.
+      :sys.replace_state(hb, fn s ->
+        %{s | mono_deadline_ms: System.monotonic_time(:millisecond) - 1_000}
+      end)
+
+      send(hb, :renew)
+      _ = :sys.get_state(hb)
+
+      # The broadcast alone must fence the coordinator — the connection stays open,
+      # no idle flush runs. Pre-fix nothing subscribed and this timed out.
+      assert_receive {:DOWN, ^ref, :process, ^coordinator, {:shutdown, :lease_lost}}, 2_000
+
+      :ok = ShardExecutor.close(conn)
+    end)
   end
 
   # Finding #5: the fence baseline (acquire_gen) must be sampled BEFORE acquire_lease. Force a

@@ -265,6 +265,10 @@ defmodule Fathom.Shard do
         }
 
         state = if acquire_gen == nil, do: schedule_renew(state), else: state
+        # Heartbeat mode: subscribe to lapse broadcasts so a steal window is
+        # revalidated proactively (expert review #34), not just lazily at the next
+        # flush. Legacy mode revalidates via its own per-shard renewals.
+        if acquire_gen != nil, do: subscribe_lapse()
         {:noreply, schedule_flush(state)}
 
       {:error, reason} ->
@@ -412,6 +416,16 @@ defmodule Fathom.Shard do
     :ok
   end
 
+  # Best-effort, mirroring Heartbeat.broadcast_lapse: a missing PubSub (the
+  # scale/bench harness) must not fail an open — the flush-time fence still guards.
+  defp subscribe_lapse do
+    Phoenix.PubSub.subscribe(Fathom.PubSub, Heartbeat.topic())
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
   defp pull_temp(path), do: path <> ".pull"
   defp rm_pull_temp(path), do: Enum.each(["", "-wal", "-shm"], &File.rm(pull_temp(path) <> &1))
 
@@ -513,6 +527,34 @@ defmodule Fathom.Shard do
   # successful flush re-anchors it to the fresh counter.
   def handle_info(:write_counter_reset, state) do
     {:noreply, %{state | flushed_through: -1}}
+  end
+
+  # Proactive revalidation on a heartbeat lapse (expert review #34): the Heartbeat
+  # moduledoc promised coordinators revalidate on the lapse broadcast instead of
+  # waiting for their next flush, but nothing subscribed — a superseded coordinator
+  # kept ACCEPTING writes it would later discard for up to a full flush interval
+  # (unboundedly, with the durability flush disabled). On a lapse past our acquire
+  # generation, re-check ownership now and self-fence if a steal happened.
+  def handle_info({:heartbeat_lapsed, gen}, state) do
+    if state.acquire_gen != nil and gen != state.acquire_gen do
+      case Fence.check(fence_ctx(state)) do
+        {:ok, updates} ->
+          {:noreply, Map.merge(state, updates)}
+
+        :superseded ->
+          Logger.error(
+            "shard #{state.id}: lease superseded (heartbeat lapse broadcast); self-fencing"
+          )
+
+          {:stop, {:shutdown, :lease_lost}, %{state | lease_lost: true}}
+
+        # Ownership unconfirmed (transient) — the next flush's fence remains the guard.
+        :skip ->
+          {:noreply, state}
+      end
+    else
+      {:noreply, state}
+    end
   end
 
   def handle_info(:renew_lease, state) do
