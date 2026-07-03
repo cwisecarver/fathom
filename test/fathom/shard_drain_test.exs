@@ -32,6 +32,30 @@ defmodule Fathom.ShardDrainTest do
     assert Shards.drain(shard) == :ok
   end
 
+  # Expert review #29: a second overlapping drain overwrote the first's timer and
+  # reply_to WITHOUT cancelling the timer. The orphaned first timer then fired,
+  # spuriously aborting the second drain long before its own window, while the first
+  # caller was never notified at all (stuck on its 30 s safety net) — and the leaked
+  # live timer could survive into a resumed-serving state and stop a serving shard
+  # early. The invariant: a concurrent drain is refused immediately (drain_aborted),
+  # and the first drain runs to completion undisturbed.
+  test "a concurrent drain is refused; the first completes undisturbed", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, pid} = Shards.ensure(shard)
+    ref = Process.monitor(pid)
+
+    # First drain waits on the held connection (long window).
+    Shard.request_drain(pid, 10_000, self())
+
+    # Overlapping drain: refused immediately, no timer overwritten.
+    Shard.request_drain(pid, 10_000, self())
+    assert_receive {:drain_aborted, ^pid}, 1_000
+
+    # The first drain still completes normally when the connection closes.
+    :ok = ShardExecutor.close(conn)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 2_000
+  end
+
   test "drain flushes the latest data, releases the lease, and stops", %{shard: shard} do
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))

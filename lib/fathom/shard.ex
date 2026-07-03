@@ -453,6 +453,17 @@ defmodule Fathom.Shard do
     {:stop, :normal, state}
   end
 
+  # A drain is already in progress (expert review #29): refuse the second one
+  # immediately rather than overwriting the first's timer/reply_to. Overwriting
+  # leaked the FIRST timer live — when it fired it aborted the SECOND drain long
+  # before its own window and stranded the first caller on its 30 s safety net —
+  # and a leaked timer surviving into a resumed-serving state could stop an
+  # idle-but-serving shard early.
+  def handle_cast({:drain, _timeout, reply_to}, %{draining: true} = state) do
+    if reply_to, do: send(reply_to, {:drain_aborted, self()})
+    {:noreply, state}
+  end
+
   def handle_cast({:drain, timeout, reply_to}, state) do
     timer = Process.send_after(self(), :drain_timeout, timeout)
 
@@ -471,6 +482,11 @@ defmodule Fathom.Shard do
   # parent supervisor's EXIT is handled by the gen_server engine (→ terminate/2), not
   # routed to handle_info, so this never swallows a shutdown.
   def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
+
+  # A stale timer firing after the drain already resolved (resume_serving cancelled
+  # it, but a fire could already be in flight) must be inert — pre-guard it could
+  # stop an idle-but-serving shard early (expert review #29).
+  def handle_info(:drain_timeout, %{draining: false} = state), do: {:noreply, state}
 
   # Drain window elapsed with connections still open: give up standing down and
   # resume serving (the migration reschedules). No force-close, no torn flush.
