@@ -92,6 +92,20 @@ without a usable secret, and an unrecognized `:hrana_auth` value fails closed to
 Auth on the template shard also removes the capture-poisoning caveat on setting a prod
 `:template_shard_id` (finding #17).
 
+**Novel-shard churn (opt-in rate limit).** Every *unseen* valid subdomain that reaches a
+node mints a brand-new shard — a coordinator, ~3 fds, a local file, an S3 lock PUT, and a
+Postgres row — bounded in count by `MAX_OPEN_SHARDS` but not in rate. If 8080 is reachable
+by anything that can invent subdomains (or you just want spray protection behind the LB),
+cap the mint rate:
+
+    NOVEL_SHARD_RATE=5     # grants/sec for brand-new ids; unset = off
+    NOVEL_SHARD_BURST=10   # bucket size (default max(10, 2 × rate))
+
+Over-budget novel creations get `429` before any work runs. Existing shards — a directory
+row, a local file, or a running coordinator — are never limited, so failover warming and
+cold re-opens are unaffected; the directory check fails open if Postgres is down. Size the
+rate to tenant signups with headroom (legitimate novel creation is rare).
+
 ## Running a node
 
 Each node is an ordinary fathom release with the Hrana listener on (`hrana_server: true`,

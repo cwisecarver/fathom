@@ -21,6 +21,13 @@ config :fathom,
 # raise it from the measured density (mix fathom.scale --ramp) via MAX_OPEN_SHARDS (config/runtime.exs).
 config :fathom, :max_open_shards, 10_000
 
+# The churn half of finding #14: :max_open_shards bounds how many shards a node holds open;
+# this bounds how FAST unseen ids can mint new ones. Grants/sec for NOVEL creations only —
+# existing-shard cold opens are never limited, and the directory check behind it fails open.
+# nil = off (default; the cold path pays one get_env); prod enables via NOVEL_SHARD_RATE
+# (+ NOVEL_SHARD_BURST, default max(10, 2 × rate)). See Fathom.Shards.NovelLimiter.
+config :fathom, :novel_shard_rate, nil
+
 # In-app bearer-token auth on the Hrana data path (Fathom.HranaAuth). :disabled means the
 # trust boundary is the network alone (LB-only reachability — docs/deploy-cluster.md);
 # :required makes every stream open present a per-shard Phoenix.Token (mint: mix fathom.token).

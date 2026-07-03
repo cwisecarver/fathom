@@ -98,6 +98,17 @@ if config_env() == :prod do
     config :fathom, :max_open_shards, String.to_integer(cap)
   end
 
+  # Novel-shard creation rate limit (finding #14's churn half; see Fathom.Shards.NovelLimiter).
+  # Grants/sec for brand-new shard ids only; unset = off. Size to tenant-signup rate with
+  # headroom — legitimate novel creation is rare, so single digits/sec is generous.
+  if rate = System.get_env("NOVEL_SHARD_RATE") do
+    config :fathom, :novel_shard_rate, String.to_integer(rate)
+  end
+
+  if burst = System.get_env("NOVEL_SHARD_BURST") do
+    config :fathom, :novel_shard_burst, String.to_integer(burst)
+  end
+
   config :fathom, FathomWeb.Endpoint,
     url: [host: host, port: 443, scheme: "https"],
     http: [

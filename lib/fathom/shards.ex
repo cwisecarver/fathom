@@ -78,6 +78,7 @@ defmodule Fathom.Shards do
   defp checkout_outcome({:error, {:shard_held, _}}), do: :held
   defp checkout_outcome({:error, :unavailable}), do: :unavailable
   defp checkout_outcome({:error, :node_at_capacity}), do: :at_capacity
+  defp checkout_outcome({:error, :novel_shard_rate_limited}), do: :novel_rate_limited
   defp checkout_outcome({:error, _}), do: :error
 
   # Migrate-then-serve: once a fleet version is released, a shard behind HEAD can't
@@ -196,12 +197,48 @@ defmodule Fathom.Shards do
   # Off by default (`:max_open_shards` == :infinity); the operator sets it from the
   # measured fd/RSS density budget (`mix fathom.scale --ramp`).
   defp start_if_capacity(shard_id) do
-    if at_capacity?() do
-      :telemetry.execute([:fathom, :shards, :at_capacity], %{count: 1}, %{shard_id: shard_id})
-      {:error, :node_at_capacity}
-    else
-      start(shard_id)
+    cond do
+      at_capacity?() ->
+        :telemetry.execute([:fathom, :shards, :at_capacity], %{count: 1}, %{shard_id: shard_id})
+        {:error, :node_at_capacity}
+
+      # The churn half of finding #14: the cap above bounds how many shards this node holds
+      # open; this bounds how FAST unseen ids can mint new ones (coordinator + fds + file +
+      # S3 lock PUT + Postgres row per novel id). Refused before any of that work runs.
+      novel_refused?(shard_id) ->
+        {:error, :novel_shard_rate_limited}
+
+      true ->
+        start(shard_id)
     end
+  end
+
+  # Should this open be refused as an over-rate NOVEL creation? Only consulted on the
+  # registry-miss path, and only does work when `:novel_shard_rate` is configured (nil =
+  # off, the default — the cold path pays one get_env). "Novel" = nothing knows the shard:
+  # no local file (a present file is an authoritative un-flushed copy) and no directory row.
+  defp novel_refused?(shard_id) do
+    case Application.get_env(:fathom, :novel_shard_rate) do
+      nil ->
+        false
+
+      _rate ->
+        not File.exists?(Fathom.Shard.db_path(shard_id)) and
+          not known_to_directory?(shard_id) and
+          match?({:error, _}, Fathom.Shards.NovelLimiter.allow(shard_id))
+    end
+  end
+
+  # The directory read fails OPEN (treat as known): the data path never blocks on or fails
+  # because of Postgres (the Recorder principle) — an outage disables the limiter, it never
+  # refuses real traffic. An existing-but-never-recorded shard costs one token; the bucket
+  # absorbs it.
+  defp known_to_directory?(shard_id) do
+    match?({:ok, _}, Fathom.Directory.get(shard_id))
+  rescue
+    _ -> true
+  catch
+    :exit, _ -> true
   end
 
   # Soft cap: `Registry.count` is O(1) and a couple of concurrent opens may overshoot

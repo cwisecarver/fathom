@@ -729,7 +729,10 @@ defmodule Fathom.Shard do
 
   # --- helpers ---
 
-  defp db_path(id), do: Path.join(data_dir(), "#{id}.db")
+  # Public for Fathom.Shards' novel-shard check (a present local file means the shard
+  # exists — an authoritative un-flushed copy — so it is never "novel").
+  @doc false
+  def db_path(id), do: Path.join(data_dir(), "#{id}.db")
 
   defp data_dir do
     Application.get_env(

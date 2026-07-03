@@ -102,6 +102,9 @@ defmodule Fathom.Application do
       # Sizing it larger than Req's default ~50-conn pool lets warming pull many shards
       # from S3 at once (startup/failover) without bottlenecking on the conn ceiling.
       Fathom.Shard.Storage.S3.finch_child_spec(),
+      # Rate-limits novel-shard creation (finding #14's churn half). Started
+      # unconditionally — idle when `:novel_shard_rate` is unset (the default).
+      Fathom.Shards.NovelLimiter,
       # Owns the per-shard load-counter ETS table. Before the shard supervisor so the
       # table is up before any coordinator records or forgets.
       Fathom.ShardLoad,

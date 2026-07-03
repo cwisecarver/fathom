@@ -205,6 +205,12 @@ defmodule Fathom.ShardExecutor do
   defp open_error(:node_at_capacity),
     do: %Error{message: "node at capacity", code: "FILO_AT_CAPACITY", status: 503}
 
+  # An over-rate NOVEL shard creation (finding #14): the caller is asking to mint a
+  # brand-new shard faster than the node's budget. 429 (back off), not 503 — the node
+  # is healthy and existing shards keep serving.
+  defp open_error(:novel_shard_rate_limited),
+    do: %Error{message: "shard creation rate limited", code: "FILO_RATE_LIMITED", status: 429}
+
   defp open_error(reason),
     do: %Error{message: "cannot open shard: #{inspect(reason)}", code: "FILO_SHARD_OPEN"}
 
