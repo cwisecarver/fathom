@@ -134,6 +134,16 @@ defmodule Fathom.ShardExecutor do
   @impl true
   def autocommit?(_handle), do: true
 
+  # The coordinator is the connection's owner (Filo's owner seam): the stream holding this
+  # handle monitors it and tears down — closing the exqlite connection — if it dies. Without
+  # this, a stream outliving a crashed coordinator kept writing as an orphan: the NEXT
+  # checkout re-creates a fresh coordinator (restart: :temporary) that doesn't know the old
+  # connection exists, so its idle flush-and-drop checkpoints past the orphan's un-folded WAL
+  # frames and unlinks the db/wal/shm under it — the orphan's writes land in unlinked inodes
+  # and vanish (finding #8, the residual orphan-writer race).
+  @impl true
+  def owner({pid, _ref, _conn, _shard_id}), do: pid
+
   @impl true
   def close({pid, ref, conn, shard_id}) do
     Connection.close(conn)
