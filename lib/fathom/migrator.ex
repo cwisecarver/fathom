@@ -96,20 +96,50 @@ defmodule Fathom.Migrator do
   rather than silently discarding post-cutover writes — see
   `Fathom.Migrator.ShardMigration.revert/4` (finding #13).
   """
+  @enqueue_chunk 5_000
+
   @spec revert(non_neg_integer(), non_neg_integer(), keyword()) :: {:ok, non_neg_integer()}
   def revert(from_version, to_version, opts \\ []) do
     force? = Keyword.get(opts, :force, false)
+    shards = Directory.shards_at_version(from_version)
 
-    count =
-      from_version
-      |> Directory.shards_at_version()
+    # Expert review #23: the per-shard dedup below ignores `force`, so in the intended
+    # operator flow — non-force sweep, guard cancels some shards, re-issue with
+    # force: true — any shard whose first RevertJob was still in flight (snoozing on
+    # :shard_busy / {:held, _}) was silently dropped from the force sweep; the surviving
+    # non-force job then hit the guard and cancelled, so the shard was never reverted
+    # despite the explicit force. Upgrade in-flight jobs' args to force: true instead of
+    # skipping them; they count toward the returned total.
+    forced =
+      if force?, do: force_inflight_reverts(Enum.map(shards, & &1.shard_id)), else: 0
+
+    enqueued =
+      shards
       |> Enum.map(
         &{&1.shard_id,
          RevertJob.new(%{shard_id: &1.shard_id, to_version: to_version, force: force?})}
       )
       |> enqueue_unique()
 
-    {:ok, count}
+    {:ok, enqueued + forced}
+  end
+
+  defp force_inflight_reverts(shard_ids) do
+    shard_ids
+    |> Enum.chunk_every(@enqueue_chunk)
+    |> Enum.reduce(0, fn chunk, acc ->
+      {n, _} =
+        from(j in Job,
+          where: j.worker == "Fathom.Migrator.RevertJob",
+          where: j.state in @unique_states,
+          where: fragment("?->>'shard_id'", j.args) in ^chunk,
+          where: fragment("(?->>'force')::boolean IS DISTINCT FROM true", j.args),
+          update: [set: [args: fragment(~s(? || '{"force": true}'::jsonb), j.args)]]
+        )
+        |> Repo.update_all([])
+
+      acc + n
+    end)
   end
 
   # Bulk-enqueue a fleet sweep in batched round-trips instead of one Oban.insert per
@@ -125,7 +155,6 @@ defmodule Fathom.Migrator do
   # scale (found by scripts/directory_scale.exs at 3.1M directory rows). 5,000 pairs per
   # chunk keeps both statements comfortably under the cap (dedup: 1 param/id; insert:
   # 9 params/job = 45,000).
-  @enqueue_chunk 5_000
 
   defp enqueue_unique([]), do: 0
 

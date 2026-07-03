@@ -110,6 +110,33 @@ defmodule Fathom.Migrator.RolloutTest do
       assert length(all_enqueued(worker: RevertJob)) == 2
     end
 
+    # Expert review #23: both dedup layers keyed on shard_id only, ignoring `force`. The
+    # intended operator flow — non-force sweep, the guard cancels shards with post-cutover
+    # writes, re-issue with force: true — silently dropped any shard whose first RevertJob
+    # was still in flight (snoozing on :shard_busy / {:held, _}): the force sweep skipped
+    # it, the surviving non-force job hit the guard and cancelled, and the shard was never
+    # reverted despite the explicit force. The invariant: a forced re-issue reaches every
+    # shard, upgrading in-flight jobs' args instead of skipping them.
+    test "a forced re-issue upgrades in-flight revert jobs instead of skipping them" do
+      for id <- ~w(a b) do
+        {:ok, _} = Directory.resolve(id)
+        {:ok, _} = Directory.cutover(id, 2)
+      end
+
+      assert {:ok, 2} = Migrator.revert(2, 1)
+
+      refute Enum.any?(all_enqueued(worker: RevertJob), &(&1.args["force"] == true))
+
+      # Pre-fix this returned {:ok, 0} and left both in-flight jobs non-force.
+      assert {:ok, 2} = Migrator.revert(2, 1, force: true)
+
+      jobs = all_enqueued(worker: RevertJob)
+      assert length(jobs) == 2
+
+      assert Enum.all?(jobs, &(&1.args["force"] == true)),
+             "in-flight revert jobs must be upgraded to force: true"
+    end
+
     test "RevertJob reverts a migrated shard back to the prior version" do
       shard = "revert_#{System.unique_integer([:positive])}"
 
