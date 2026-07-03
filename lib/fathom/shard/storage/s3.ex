@@ -190,6 +190,41 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  # Steal-time data-object etag invalidation (expert review #3): a conditional
+  # server-side self-copy — same bytes, new etag. S3 requires the REPLACE metadata
+  # directive for a self-copy. 404 (no object yet — a brand-new shard was stolen) is
+  # fine: there is nothing a zombie flush could clobber that a nil-etag fence
+  # doesn't already refuse. A 412 means the object changed between our read and the
+  # copy — re-running the touch once covers the benign race.
+  defp touch_object(shard_id, attempt \\ 1) do
+    key = db_key(shard_id)
+
+    case object_etag(shard_id) do
+      {:ok, nil} ->
+        :ok
+
+      {:ok, etag} ->
+        source = "/" <> fetch!(config(), :bucket) <> "/" <> key
+
+        case Req.put(req(),
+               url: url_path(key),
+               headers: [
+                 {"x-amz-copy-source", source},
+                 {"x-amz-metadata-directive", "REPLACE"},
+                 {"x-amz-copy-source-if-match", etag}
+               ]
+             ) do
+          {:ok, %{status: s}} when s in 200..299 -> :ok
+          {:ok, %{status: 412}} when attempt < 2 -> touch_object(shard_id, attempt + 1)
+          {:ok, %{status: s}} -> {:error, {:s3_touch_status, s}}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   # Integrity (expert review #37): TLS/TCP catch wire corruption, but nothing caught
   # corruption introduced BEFORE the socket — a torn File.read against a bad disk, a
   # buggy proxy, or an S3-compatible store bug. A corrupted upload was accepted as the
@@ -329,9 +364,35 @@ defmodule Fathom.Shard.Storage.S3 do
             {:error, {:held, other}}
 
           :dead ->
-            put_lock(shard_id, %{owner: owner, epoch: epoch + 1, expires_at_ms: now + ttl_ms},
-              if_match: etag
-            )
+            case put_lock(
+                   shard_id,
+                   %{owner: owner, epoch: epoch + 1, expires_at_ms: now + ttl_ms},
+                   if_match: etag
+                 ) do
+              {:ok, lease} ->
+                # Expert review #3: invalidate the DATA object's etag at steal time,
+                # BEFORE the new owner pulls/serves. The old owner may be stalled
+                # inside a fenced flush it already passed the fence for (whole-VM
+                # pause) — the steal never touched the data object, so its late
+                # `If-Match` PUT would still land AFTER our pull, leaving us serving
+                # a copy missing its final acknowledged writes and self-fencing away
+                # our own on the first flush. A conditional self-copy changes the
+                # etag without moving bytes, so the zombie's PUT deterministically
+                # 412s and IT self-fences instead.
+                case touch_object(shard_id) do
+                  :ok ->
+                    {:ok, Map.put(lease, :took_over, true)}
+
+                  # Fail closed: an un-fenced steal is not a steal. Release our
+                  # fresh lock claim implicitly by not serving (the caller refuses
+                  # the open and retries).
+                  {:error, reason} ->
+                    {:error, {:transient_lookup, {:touch_failed, reason}}}
+                end
+
+              other ->
+                other
+            end
 
           # Fail closed: don't steal a possibly-live owner on a heartbeat read blip.
           {:error, reason} ->

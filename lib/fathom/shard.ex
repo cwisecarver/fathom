@@ -234,57 +234,93 @@ defmodule Fathom.Shard do
   end
 
   defp open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen) do
-    case await_pull(pull_task, path, shard_id) do
-      {:ok, etag} ->
-        # No idle timer yet: a coordinator is always checked out right after it
-        # starts, and the timer is (re)armed only when the last connection checks
-        # back in. This avoids a start-vs-checkout idle race. The lease renewal
-        # timer runs from the start, independent of checkouts.
-        # `acquire_gen` (captured in handle_continue BEFORE acquire_lease — see finding #5)
-        # fixes the liveness mode for this shard's life: non-nil ⇒ heartbeat mode (the node
-        # heartbeat proves liveness, so NO per-shard lease renewal — the F1 storm — and the
-        # generation gates the flush fence); nil ⇒ legacy mode (per-shard renewal + renew-PUT
-        # fence, so a heartbeat outage degrades gracefully instead of dropping shards).
-        state = %{
-          id: shard_id,
-          path: path,
-          conns: %{},
-          idle_ms: idle_ms(),
-          timer: nil,
-          owner: owner,
-          lease: lease,
-          ttl_ms: ttl,
-          renew_timer: nil,
-          acquire_gen: acquire_gen,
-          # The current etag of the remote object (nil = brand-new / no object yet). The flush
-          # fence If-Matches it so a stale PUT can't clobber a stealer (finding #15); each
-          # successful flush advances it.
-          etag: etag,
-          lease_lost: false,
-          # High-water mark of the shard's write counter (Fathom.Shard.WriteCounter) as of the
-          # last successful flush; the shard is dirty iff count(id) > flushed_through (unflushed?/1).
-          # A cold pull is clean (local == storage); a warm restart may hold un-flushed writes, so
-          # init_flushed_through/2 seeds it one behind ⇒ dirty. Clean shards skip the durability
-          # upload — the durability-storm fix (findings #1/#2, #27).
-          flushed_through: init_flushed_through(shard_id, warm?),
-          flush_timer: nil,
-          draining: false,
-          drain_timer: nil,
-          drain_reply_to: nil
-        }
+    with {:ok, etag0} <- await_pull(pull_task, path, shard_id),
+         {:ok, etag} <- revalidate_takeover(shard_id, path, lease, etag0, warm?) do
+      # No idle timer yet: a coordinator is always checked out right after it
+      # starts, and the timer is (re)armed only when the last connection checks
+      # back in. This avoids a start-vs-checkout idle race. The lease renewal
+      # timer runs from the start, independent of checkouts.
+      # `acquire_gen` (captured in handle_continue BEFORE acquire_lease — see finding #5)
+      # fixes the liveness mode for this shard's life: non-nil ⇒ heartbeat mode (the node
+      # heartbeat proves liveness, so NO per-shard lease renewal — the F1 storm — and the
+      # generation gates the flush fence); nil ⇒ legacy mode (per-shard renewal + renew-PUT
+      # fence, so a heartbeat outage degrades gracefully instead of dropping shards).
+      state = %{
+        id: shard_id,
+        path: path,
+        conns: %{},
+        idle_ms: idle_ms(),
+        timer: nil,
+        owner: owner,
+        lease: lease,
+        ttl_ms: ttl,
+        renew_timer: nil,
+        acquire_gen: acquire_gen,
+        # The current etag of the remote object (nil = brand-new / no object yet). The flush
+        # fence If-Matches it so a stale PUT can't clobber a stealer (finding #15); each
+        # successful flush advances it.
+        etag: etag,
+        lease_lost: false,
+        # High-water mark of the shard's write counter (Fathom.Shard.WriteCounter) as of the
+        # last successful flush; the shard is dirty iff count(id) > flushed_through (unflushed?/1).
+        # A cold pull is clean (local == storage); a warm restart may hold un-flushed writes, so
+        # init_flushed_through/2 seeds it one behind ⇒ dirty. Clean shards skip the durability
+        # upload — the durability-storm fix (findings #1/#2, #27).
+        flushed_through: init_flushed_through(shard_id, warm?),
+        flush_timer: nil,
+        draining: false,
+        drain_timer: nil,
+        drain_reply_to: nil
+      }
 
-        state = if acquire_gen == nil, do: schedule_renew(state), else: state
-        # Heartbeat mode: subscribe to lapse broadcasts so a steal window is
-        # revalidated proactively (expert review #34), not just lazily at the next
-        # flush. Legacy mode revalidates via its own per-shard renewals.
-        if acquire_gen != nil, do: subscribe_lapse()
-        {:noreply, schedule_flush(state)}
-
+      state = if acquire_gen == nil, do: schedule_renew(state), else: state
+      # Heartbeat mode: subscribe to lapse broadcasts so a steal window is
+      # revalidated proactively (expert review #34), not just lazily at the next
+      # flush. Legacy mode revalidates via its own per-shard renewals.
+      if acquire_gen != nil, do: subscribe_lapse()
+      {:noreply, schedule_flush(state)}
+    else
       {:error, reason} ->
         # Couldn't make the file available — give the lease back so another node
         # can try, rather than holding a shard we can't serve.
         Storage.release_lease(shard_id, lease)
         {:stop, {:shutdown, {:pull_failed, reason}}, %{id: shard_id}}
+    end
+  end
+
+  # Expert review #3: a TAKEOVER's speculative pull (started before the lease
+  # confirmed) can capture bytes from before the old owner's final in-flight flush
+  # landed — and the steal touched the object's etag, so serving/fencing with the
+  # pulled etag would mean stale reads followed by our own first flush self-fencing.
+  # Re-check the current etag once (only on takeovers — a fresh epoch-1 create has no
+  # prior owner, so the cold-open fast path pays nothing): a cold pull that mismatches
+  # is re-pulled; a warm takeover adopts the post-touch etag (the #1 provenance check
+  # already established the local file continues the stored lineage, and the touch
+  # moved no bytes).
+  defp revalidate_takeover(shard_id, path, lease, etag, warm?) do
+    if lease[:took_over] do
+      case Storage.object_etag(shard_id) do
+        {:ok, ^etag} ->
+          {:ok, etag}
+
+        {:ok, nil} ->
+          {:ok, etag}
+
+        {:ok, current} when warm? ->
+          write_etag_sidecar(path, current)
+          {:ok, current}
+
+        {:ok, _newer} ->
+          case Storage.pull(shard_id, pull_temp(path)) do
+            {:ok, new_etag} -> promote_pull(path, new_etag)
+            {:error, reason} -> {:error, {:revalidate_failed, reason}}
+          end
+
+        {:error, reason} ->
+          {:error, {:revalidate_failed, reason}}
+      end
+    else
+      {:ok, etag}
     end
   end
 

@@ -153,7 +153,19 @@ defmodule Fathom.Shard.Storage.Local do
             {:error, {:held, other}}
 
           :dead ->
-            write_lock(shard_id, %{owner: owner, epoch: epoch + 1, expires_at_ms: now + ttl_ms})
+            # took_over: the caller revalidates its speculative pull (expert review
+            # #3). Local has no steal-time etag touch — content-hash etags can't
+            # change without the bytes changing, and this backend is single-node
+            # (the in-VM Registry already serializes coordinators), so the S3 zombie
+            # scenario can't arise here.
+            case write_lock(shard_id, %{
+                   owner: owner,
+                   epoch: epoch + 1,
+                   expires_at_ms: now + ttl_ms
+                 }) do
+              {:ok, lease} -> {:ok, Map.put(lease, :took_over, true)}
+              other -> other
+            end
 
           # Fail closed: don't steal a possibly-live owner on a heartbeat read blip.
           {:error, reason} ->
