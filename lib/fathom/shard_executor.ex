@@ -268,6 +268,11 @@ defmodule Fathom.ShardExecutor do
   # as nil. Validation stays at open/1 / ensure/1 — this only canonicalizes case.
   defp normalize_resolved(nil), do: nil
   defp normalize_resolved(id) when is_binary(id), do: String.downcase(id, :ascii)
+  # Fail closed on any non-binary reaching the trust boundary (expert review #36):
+  # Plug parses `?db[]=a` into a list and `?db[k]=v` into a map, and a
+  # FunctionClauseError here crashed the whole resolve path (a remote 500 oracle
+  # wherever the override is enabled). nil falls through to open(nil)'s 400.
+  defp normalize_resolved(_other), do: nil
 
   # The `?db=` / `x-fathom-shard` fallbacks are an unauthenticated shard-selection primitive
   # (finding #4): a caller who reaches a node directly controls the Host, so a bare/IP host
@@ -303,7 +308,13 @@ defmodule Fathom.ShardExecutor do
 
   defp shard_from_params(conn) do
     conn = Plug.Conn.fetch_query_params(conn)
-    conn.query_params["db"] || conn |> Plug.Conn.get_req_header("x-fathom-shard") |> List.first()
+
+    case conn.query_params["db"] do
+      # Only a plain string selects a shard — `?db[]=`/`?db[k]=` arrive as list/map
+      # and must not crash resolution (expert review #36).
+      db when is_binary(db) -> db
+      _ -> conn |> Plug.Conn.get_req_header("x-fathom-shard") |> List.first()
+    end
   end
 
   defp ip?(host), do: host =~ ~r/^\d+\.\d+\.\d+\.\d+$/

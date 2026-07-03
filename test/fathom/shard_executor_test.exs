@@ -111,6 +111,25 @@ defmodule Fathom.ShardExecutorTest do
     assert ShardExecutor.shard_from_conn(conn(:get, "http://localhost/")) == "demo"
   end
 
+  # Expert review #36: Plug parses `?db[]=a&db[]=b` into a LIST and `?db[k]=v` into a
+  # MAP, and normalize_resolved only had nil/binary heads — a crafted query param raised
+  # FunctionClauseError on the resolve path (shard_from_conn is Filo's open_arg with no
+  # rescue): a trivial remote crash oracle wherever the override is enabled. The
+  # invariant: non-binary trust-boundary values fail closed to the fallback chain.
+  test "list/map ?db= params fail closed instead of crashing resolution" do
+    assert ShardExecutor.shard_from_conn(conn(:get, "http://localhost/?db[]=a&db[]=b")) ==
+             "demo"
+
+    assert ShardExecutor.shard_from_conn(conn(:get, "http://localhost/?db[k]=v")) == "demo"
+
+    # A map-shaped db still lets the header fallback work.
+    header_conn =
+      conn(:get, "http://localhost/?db[]=x")
+      |> Plug.Conn.put_req_header("x-fathom-shard", "gamma")
+
+    assert ShardExecutor.shard_from_conn(header_conn) == "gamma"
+  end
+
   # Finding #4: the ?db= / x-fathom-shard fallbacks are an unauthenticated shard-selection
   # primitive — a caller who reaches a node directly controls the Host, so a bare/IP host forces
   # the fallback and `?db=<victim>` opens any shard. With :allow_shard_override off (the prod
