@@ -2,7 +2,7 @@
 
 Fathom is a multi-tenant sharded data platform built on Phoenix: **one SQLite database per shard** (targeting millions), served to unchanged libSQL clients — e.g. an unchanged Django app via `django-libsql` — over the [Hrana wire protocol](https://github.com/libsql/hrana-client-ts/blob/main/HRANA_3_SPEC.md) via the [Filo](https://github.com/cwisecarver/filo) library.
 
-Filo speaks HTTP Hrana v1/v2/v3 (including cursor) and WebSocket hrana1/2/3. The Hrana listener runs on port 8080 (separate from the Phoenix dashboard on 4000). The target shard is derived from the `Host` subdomain (`acme.fathom.example` → shard `acme`), with `?db=` and `x-fathom-shard` as **dev-only** fallbacks (gated by `:allow_shard_override`, off in prod). The Hrana path has no in-app credential — the trust boundary is the network (the port must be LB-only-reachable; see `docs/deploy-cluster.md`).
+Filo speaks HTTP Hrana v1/v2/v3 (including cursor) and WebSocket hrana1/2/3. The Hrana listener runs on port 8080 (separate from the Phoenix dashboard on 4000). The target shard is derived from the `Host` subdomain (`acme.fathom.example` → shard `acme`), with `?db=` and `x-fathom-shard` as **dev-only** fallbacks (gated by `:allow_shard_override`, off in prod). Per-shard bearer-token auth (`Phoenix.Token`, presented as libSQL's `authToken`) is available via `HRANA_AUTH=required`; with it disabled (the default) the trust boundary is the network — the port must be LB-only-reachable (see `docs/deploy-cluster.md`).
 
 ## What's built
 

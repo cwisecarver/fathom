@@ -8,6 +8,7 @@ defmodule Fathom.Application do
   @impl true
   def start(_type, _args) do
     check_template_default!()
+    Fathom.HranaAuth.check_config!()
 
     # Grouped into plane sub-supervisors (each with its own restart budget) rather than
     # one flat list, so a control-plane restart-storm (e.g. Repo) is contained to its
@@ -200,7 +201,11 @@ defmodule Fathom.Application do
       executor: Fathom.ShardExecutor,
       streams: Fathom.HranaStreams,
       key: Filo.Baton.new_key(),
-      open_arg: &Fathom.ShardExecutor.shard_from_conn/1
+      open_arg: &Fathom.ShardExecutor.shard_from_conn/1,
+      # In-app bearer-token auth (Fathom.HranaAuth). The callback is always wired;
+      # whether it checks anything is the runtime :hrana_auth mode (:disabled default,
+      # HRANA_AUTH=required in prod), so flipping the mode needs no listener restart.
+      authorize: &Fathom.HranaAuth.authorize/2
     ]
 
     Supervisor.child_spec(

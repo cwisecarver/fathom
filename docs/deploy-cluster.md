@@ -48,9 +48,10 @@ and in-request failover on node death.
 
 ## Trust boundary and authentication
 
-**The Hrana data path (port 8080) carries no in-app credential by design.** A request's
-shard is taken from the `Host` subdomain the LB sets — there is no bearer token, no JWT
-check, no per-tenant secret. Isolation is **placement + lease** (above), not identity.
+**By default the Hrana data path (port 8080) carries no in-app credential.** A request's
+shard is taken from the `Host` subdomain the LB sets — no bearer token, no JWT check, no
+per-tenant secret. Isolation is **placement + lease** (above), not identity. In-app
+per-shard auth exists and is opt-in — see "Per-tenant credentials" below.
 
 The consequence, and the operator's responsibility: **the Hrana port MUST be reachable only
 through the LB.** Anything that reaches a node directly (a leaked node address, SSRF, a
@@ -71,12 +72,25 @@ with no routable subdomain name a shard directly (curl/testing). They are gated 
 a request that reaches a node without a valid subdomain resolves to the default shard, not an
 attacker-named one. Real clients address by subdomain and are unaffected.
 
-**Future — per-tenant credentials.** When network-only isolation is not enough (e.g. 8080 must
-be exposed beyond a trusted LB, or tenants need revocable credentials), the planned step is
-in-app bearer-token auth: a Fathom plug in front of `Filo.Plug` verifies a `Phoenix.Token`
-(signed with `secret_key_base`) that binds the caller to its shard, sent as
-`Authorization: Bearer <token>` (libSQL's `authToken` channel). It covers HTTP and WebSocket
-and needs no Filo fork. Not built yet.
+**Per-tenant credentials (built, opt-in).** When network-only isolation is not enough
+(e.g. 8080 must be exposed beyond a trusted LB, or tenants need revocable credentials),
+turn on in-app bearer-token auth:
+
+    HRANA_AUTH=required            # every stream open must present a token (401 otherwise)
+    HRANA_TOKEN_MAX_AGE=86400      # optional expiry in seconds; unset = non-expiring
+
+`Fathom.HranaAuth` verifies a `Phoenix.Token` (signed with `SECRET_KEY_BASE`) that binds
+the caller to exactly one shard. Clients pass it as libSQL's `authToken` and it reaches
+the server two different ways: HTTP requests carry `Authorization: Bearer <token>`, but
+the WebSocket clients (django-libsql) send it **only as the `jwt` field of the Hrana
+`hello` message** — no upgrade header — which is why this is implemented as `Filo.Plug`'s
+`:authorize` callback (checked at every stream open / WS hello, before the executor runs)
+rather than the pre-plug originally scoped here. Mint a token with `mix fathom.token
+<shard>` (dev) or `Fathom.HranaAuth.token_for/1` from a release's remote console; revoke
+by rotating `SECRET_KEY_BASE` (or set an expiry). A boot guard refuses `HRANA_AUTH=required`
+without a usable secret, and an unrecognized `:hrana_auth` value fails closed to required.
+Auth on the template shard also removes the capture-poisoning caveat on setting a prod
+`:template_shard_id` (finding #17).
 
 ## Running a node
 

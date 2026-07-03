@@ -76,6 +76,22 @@ if config_env() == :prod do
     end
   end
 
+  # In-app bearer-token auth on the Hrana data path (Fathom.HranaAuth). Off by default —
+  # the network trust boundary above stands alone; set HRANA_AUTH=required to make every
+  # stream open present a per-shard token (needed if 8080 is ever reachable beyond the LB,
+  # or for revocable per-tenant credentials). Tokens are signed with SECRET_KEY_BASE.
+  case System.get_env("HRANA_AUTH", "disabled") do
+    "required" -> config :fathom, :hrana_auth, :required
+    "disabled" -> config :fathom, :hrana_auth, :disabled
+    other -> raise "HRANA_AUTH must be \"required\" or \"disabled\", got: #{inspect(other)}"
+  end
+
+  # Optional token expiry in seconds (unset ⇒ tokens don't expire; revoke by rotating
+  # SECRET_KEY_BASE).
+  if max_age = System.get_env("HRANA_TOKEN_MAX_AGE") do
+    config :fathom, :hrana_token_max_age, String.to_integer(max_age)
+  end
+
   # Per-node open-shard cap (finding #14). config.exs sets a conservative finite default; operators
   # tune it to their node's measured fd/RSS density (mix fathom.scale --ramp) here.
   if cap = System.get_env("MAX_OPEN_SHARDS") do

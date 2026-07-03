@@ -21,6 +21,13 @@ config :fathom,
 # raise it from the measured density (mix fathom.scale --ramp) via MAX_OPEN_SHARDS (config/runtime.exs).
 config :fathom, :max_open_shards, 10_000
 
+# In-app bearer-token auth on the Hrana data path (Fathom.HranaAuth). :disabled means the
+# trust boundary is the network alone (LB-only reachability — docs/deploy-cluster.md);
+# :required makes every stream open present a per-shard Phoenix.Token (mint: mix fathom.token).
+# Prod opts in via HRANA_AUTH=required (config/runtime.exs). Any other value fails closed
+# to :required, and a boot guard refuses :required without a usable secret_key_base.
+config :fathom, :hrana_auth, :disabled
+
 # Shard databases (libSQL/Turso) are opened dynamically per shard via
 # Fathom.ShardRepo. It is intentionally NOT listed in :ecto_repos (there is no
 # single static shard database) and is not started in the supervision tree.
