@@ -106,6 +106,14 @@ scripts/benchmark.sh        # runs mix fathom.bench and appends to perf_history.
 mix fathom.scale            # fan-out density at real shard sizes
 ```
 
+## Examples
+
+- [django-fathom-example](https://github.com/cwisecarver/django-fathom-example) —
+  a sample Django app with invisible per-tenant shard routing: a `shard_id` in
+  ordinary queryset parameters routes every query to the tenant's own shard
+  (custom QuerySet + database router, fail-closed, proven end-to-end against a
+  live fathom).
+
 ## Further reading
 
 | Document | What it covers |
