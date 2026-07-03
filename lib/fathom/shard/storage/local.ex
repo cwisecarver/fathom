@@ -202,10 +202,13 @@ defmodule Fathom.Shard.Storage.Local do
   @impl true
   def renew_heartbeat(owner, ttl_ms) do
     hb = %{owner: owner, expires_at_ms: Storage.now_ms() + ttl_ms}
-    path = heartbeat_path(owner)
-    File.mkdir_p!(Path.dirname(path))
 
-    case File.write(path, Storage.encode_heartbeat(hb)) do
+    # atomic_write, not a bare File.write (expert review #39): open-truncate-write lets a
+    # concurrent read_heartbeat (another shard's acquire_lease / owner_live?) observe the
+    # empty/partial file between truncate and write — a spurious :corrupt_heartbeat that
+    # fails lease acquisition closed, and a semantic divergence from S3's atomic PUT that
+    # this backend is the test double for. Temp+rename gives readers whole-old or whole-new.
+    case Storage.atomic_write(heartbeat_path(owner), Storage.encode_heartbeat(hb)) do
       :ok -> {:ok, hb}
       err -> err
     end

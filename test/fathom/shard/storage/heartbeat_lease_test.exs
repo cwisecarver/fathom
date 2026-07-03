@@ -58,6 +58,33 @@ defmodule Fathom.Shard.Storage.HeartbeatLeaseTest do
     assert Local.read_heartbeat(a) == :not_found
   end
 
+  # Expert review #39: renew_heartbeat used a bare File.write (open-truncate-write), so a
+  # concurrent read_heartbeat — another shard's acquire_lease/owner_live?, or a test reading
+  # right as the supervisor-restarted heartbeat re-renews — could observe the empty/truncated
+  # file between truncate and write: a spurious :corrupt_heartbeat that fails lease
+  # acquisition closed (this bit CI on the #7 regression test). The invariant, same as the
+  # data/lease objects: renewals swap the object in whole (temp + rename), so an fd opened
+  # before a renewal still reads the complete OLD document, never a torn one.
+  test "renew_heartbeat replaces the object whole, not in place", %{dir: dir, a: a} do
+    assert {:ok, %{expires_at_ms: exp1}} = Local.renew_heartbeat(a, @ttl)
+
+    # A concurrent reader: opened before the next renewal.
+    {:ok, fd} = File.open(Path.join([dir, "heartbeats", a]), [:read, :binary])
+
+    assert {:ok, %{expires_at_ms: exp2}} = Local.renew_heartbeat(a, @ttl * 2)
+    assert exp2 > exp1
+
+    # Rename semantics: the pre-renewal fd points at the old inode and reads the whole
+    # OLD heartbeat. An in-place truncate+write would show the new bytes (or a torn
+    # prefix) through this same fd.
+    assert {:ok, %{owner: ^a, expires_at_ms: ^exp1}} =
+             Storage.decode_heartbeat(IO.binread(fd, 10_000))
+
+    File.close(fd)
+
+    assert {:ok, %{expires_at_ms: ^exp2}} = Local.read_heartbeat(a)
+  end
+
   test "a live owner (fresh heartbeat) blocks a steal", %{shard: shard, a: a, b: b} do
     {:ok, _} = Local.renew_heartbeat(a, @ttl)
     assert {:ok, %{owner: ^a, epoch: 1}} = Local.acquire_lease(shard, a, @ttl)
