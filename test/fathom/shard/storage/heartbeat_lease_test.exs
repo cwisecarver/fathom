@@ -149,6 +149,44 @@ defmodule Fathom.Shard.Storage.HeartbeatLeaseTest do
     assert {:error, {:held, ^a}} = Local.acquire_lease(shard, b, @ttl)
   end
 
+  # Expert review #6: owner identity was the bare node name, so a NEW incarnation of
+  # the same node (replaced pod, blue/green overlap) hit the same-owner reclaim path
+  # and got a lease BYTE-IDENTICAL to the old incarnation's ({owner, epoch}) — both
+  # zombies passed every fence simultaneously, and the epoch stopped being a fencing
+  # token. With incarnation-qualified owners, a later boot is a FOREIGN owner: a live
+  # zombie's lock is protected by its liveness, and taking over a dead one BUMPS the
+  # epoch.
+  test "a later incarnation cannot silently reclaim the previous one's lock",
+       %{shard: shard, dir: dir} do
+    inc1 = "samenode@host#aaaa1111"
+    inc2 = "samenode@host#bbbb2222"
+
+    # The previous incarnation holds the lock and is still alive (a lingering zombie).
+    {:ok, _} = Local.renew_heartbeat(inc1, @ttl)
+    write_lock(dir, shard, inc1, 3, System.system_time(:millisecond) + @ttl)
+
+    # The new boot is a foreign owner — the live zombie's lock is NOT reclaimable.
+    assert {:error, {:held, ^inc1}} = Local.acquire_lease(shard, inc2, @ttl)
+
+    # The zombie dies (heartbeat stale past the margin): the new incarnation STEALS,
+    # bumping the epoch — pre-fix this was a silent same-epoch reclaim at epoch 3.
+    past = System.system_time(:millisecond) - Storage.steal_margin_ms() - 1_000
+    write_heartbeat(dir, inc1, past)
+
+    assert {:ok, %{owner: ^inc2, epoch: 4}} = Local.acquire_lease(shard, inc2, @ttl)
+  end
+
+  test "the same incarnation still reclaims its own lock without an epoch bump",
+       %{shard: shard, dir: dir} do
+    inc = "samenode@host#cccc3333"
+    {:ok, _} = Local.renew_heartbeat(inc, @ttl)
+    write_lock(dir, shard, inc, 7, System.system_time(:millisecond) - 1)
+
+    # Same boot re-acquiring (e.g. a coordinator restart within one VM): same writer,
+    # same epoch — no fence discontinuity.
+    assert {:ok, %{owner: ^inc, epoch: 7}} = Local.acquire_lease(shard, inc, @ttl)
+  end
+
   test "check_lease confirms ownership and detects supersession",
        %{shard: shard, dir: dir, a: a, b: b} do
     {:ok, _} = Local.renew_heartbeat(a, @ttl)

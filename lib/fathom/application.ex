@@ -7,6 +7,16 @@ defmodule Fathom.Application do
 
   @impl true
   def start(_type, _args) do
+    # Expert review #6: this boot's identity. Lease owners are node()#<nonce>, so a
+    # lock can never be silently reclaimed (same owner, same epoch) by a DIFFERENT
+    # incarnation of the same node name — a replaced pod goes through the steal path
+    # (liveness check + epoch bump) like any other contender. Set here, before the
+    # tree, so every reader sees one value with no initialization race.
+    :persistent_term.put(
+      {Fathom, :incarnation},
+      Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)
+    )
+
     check_template_default!()
     check_template_auth!()
     Fathom.HranaAuth.check_config!()

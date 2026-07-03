@@ -40,8 +40,32 @@ defmodule Fathom.Shard.Heartbeat do
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
-  @doc "This node's heartbeat owner string (matches the shard lease `owner`)."
-  def owner, do: to_string(node())
+  @doc """
+  This node's heartbeat owner string (matches the shard lease `owner`):
+  `node()#<boot nonce>` (expert review #6). The incarnation nonce makes lease
+  ownership boot-scoped — a lock held by a PREVIOUS incarnation of this node name
+  is a foreign owner, so it goes through the liveness check and the epoch-bumping
+  steal path instead of the silent same-owner/same-epoch reclaim, and a lingering
+  same-name zombie (a replaced pod still S3-reachable) renews its OWN per-
+  incarnation heartbeat object rather than sharing ours.
+  """
+  def owner, do: "#{node()}##{incarnation()}"
+
+  @doc false
+  # The boot nonce, set by Fathom.Application.start before the tree (race-free).
+  # Lazy fallback for standalone use (iex without the app); the put is last-wins,
+  # acceptable outside the supervised boot path.
+  def incarnation do
+    case :persistent_term.get({Fathom, :incarnation}, nil) do
+      nil ->
+        nonce = Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)
+        :persistent_term.put({Fathom, :incarnation}, nonce)
+        nonce
+
+      nonce ->
+        nonce
+    end
+  end
 
   @doc "PubSub topic broadcast on a heartbeat lapse (`{:heartbeat_lapsed, generation}`)."
   def topic, do: @topic
@@ -72,6 +96,13 @@ defmodule Fathom.Shard.Heartbeat do
       )
 
     owner = Keyword.get(opts, :owner, owner())
+
+    # Same-machine restart fast path (expert review #6): our previous incarnation's
+    # heartbeat object would otherwise stay fresh for up to a TTL, holding this
+    # node's own old locks {:held} against us. The previous nonce is persisted
+    # locally (a replaced pod / other machine doesn't share the file, so a live
+    # same-name zombie elsewhere is never cleared — its liveness protects it).
+    if owner == owner(), do: clear_previous_incarnation()
 
     # The lapse generation must survive this process: it is the coordinators' proof
     # that "no lapse happened since acquire ⇒ no steal was possible", and a restart
@@ -204,6 +235,33 @@ defmodule Fathom.Shard.Heartbeat do
 
   # The persisted-generation key for `owner` (see init/1 — restart continuity).
   defp gen_key(owner), do: {__MODULE__, :generation, owner}
+
+  # See init/1. The nonce file lives next to the shard files (node-local disk).
+  defp clear_previous_incarnation do
+    path = incarnation_file()
+    current = incarnation()
+
+    case File.read(path) do
+      {:ok, prev} when prev != "" and prev != current ->
+        _ = Storage.clear_heartbeat("#{node()}##{prev}")
+        :ok
+
+      _ ->
+        :ok
+    end
+
+    File.mkdir_p!(Path.dirname(path))
+    File.write(path, current)
+    :ok
+  rescue
+    e ->
+      Logger.warning("previous-incarnation heartbeat clear failed: #{Exception.message(e)}")
+      :ok
+  end
+
+  defp incarnation_file do
+    Path.join(Path.dirname(Fathom.Shard.db_path("x")), ".incarnation")
+  end
 
   defp mark_lapse(state) do
     gen = state.generation + 1

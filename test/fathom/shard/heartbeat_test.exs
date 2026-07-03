@@ -129,6 +129,39 @@ defmodule Fathom.Shard.HeartbeatTest do
     assert Storage.read_heartbeat(owner) == :not_found
   end
 
+  # Expert review #6: the coordinator's lease owner is the incarnation-qualified
+  # node()#<nonce>, and a same-machine restart clears the PREVIOUS incarnation's
+  # heartbeat object (its nonce is persisted locally) — otherwise the node's own old
+  # locks would stay {:held} against it for up to a heartbeat TTL after a crash.
+  test "owner is incarnation-qualified and a restart clears the previous incarnation's heartbeat" do
+    assert Heartbeat.owner() =~ ~r/##{Heartbeat.incarnation()}\z/
+
+    # Simulate the previous boot: its nonce persisted locally, its object still fresh.
+    inc_file = Path.join(Path.dirname(Fathom.Shard.db_path("x")), ".incarnation")
+    prev_content = File.read(inc_file)
+    File.mkdir_p!(Path.dirname(inc_file))
+    File.write!(inc_file, "prevnonce99")
+    prev_owner = "#{node()}#prevnonce99"
+    {:ok, _} = Storage.renew_heartbeat(prev_owner, 60_000)
+
+    on_exit(fn ->
+      case prev_content do
+        {:ok, c} -> File.write!(inc_file, c)
+        _ -> File.rm(inc_file)
+      end
+    end)
+
+    # A default-owner boot (the app path) clears the predecessor and records itself.
+    :ok = stop_supervised(Fathom.Shard.Heartbeat)
+    pid = start_supervised!({Heartbeat, ttl_ms: @ttl}, id: :heartbeat_default_owner)
+    _ = :sys.get_state(pid)
+
+    assert Storage.read_heartbeat(prev_owner) == :not_found,
+           "the previous incarnation's heartbeat must be cleared so its locks are stealable"
+
+    assert File.read!(inc_file) == Heartbeat.incarnation()
+  end
+
   # Expert review #8: the lapse generation was process-local state resetting to 0 on
   # restart, so a coordinator that acquired at generation 0 of the PREVIOUS heartbeat
   # incarnation compared 0 != 0 → false → :ok, and flushed without revalidating — even

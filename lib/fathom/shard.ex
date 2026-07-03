@@ -180,7 +180,11 @@ defmodule Fathom.Shard do
     open_started = System.monotonic_time()
     path = db_path(shard_id)
     File.mkdir_p!(Path.dirname(path))
-    owner = to_string(node())
+    # node()#<boot nonce> — boot-scoped lease identity (expert review #6): a lock
+    # left by a previous incarnation of this node name is a FOREIGN owner, so it is
+    # stolen (liveness check + epoch bump), never silently reclaimed at the same
+    # epoch, and the epoch stays a real fencing token across incarnations.
+    owner = Heartbeat.owner()
     ttl = lease_ttl_ms()
 
     # Overlap the lease acquire with the storage pull to cut the cold-open toward
