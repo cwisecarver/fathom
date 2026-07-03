@@ -19,10 +19,13 @@ defmodule Fathom.Migrator.RevertJob do
   @retention_seconds 7 * 24 * 60 * 60
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"shard_id" => shard_id, "to_version" => to_version}, id: id}) do
+  def perform(%Oban.Job{
+        args: %{"shard_id" => shard_id, "to_version" => to_version} = args,
+        id: id
+      }) do
     # Job id as the lease token — distinct from any forward ShardMigrationJob's owner, so the two
     # can't merge via the same-owner reclaim path (finding #9).
-    case ShardMigration.revert(shard_id, to_version, id) do
+    case ShardMigration.revert(shard_id, to_version, id, force: Map.get(args, "force", false)) do
       {:ok, %{from: backed_up}} ->
         # The revert backed the live vN object up as <shard>@<backed_up> (finding #13); retire it
         # after the retention window so it doesn't leak (RetirementJob only ever drops the
@@ -33,6 +36,18 @@ defmodule Fathom.Migrator.RevertJob do
       {:retry, reason} ->
         Logger.info("shard #{shard_id}: revert deferred (#{inspect(reason)})")
         {:snooze, 5}
+
+      # The force-guard refused (finding #13): the shard was written since its cutover, so the
+      # revert would discard tenant data. Deterministic — retrying can only see MORE writes —
+      # so cancel rather than burn retries; the operator re-issues with force: true to confirm
+      # the discard.
+      {:error, {guard, details}} when guard in [:writes_since_cutover, :unknown_write_age] ->
+        Logger.warning(
+          "shard #{shard_id}: revert REFUSED (#{guard}) — post-cutover writes would be " <>
+            "discarded; re-run with force: true to confirm (#{inspect(details)})"
+        )
+
+        {:cancel, guard}
 
       {:error, reason} ->
         Logger.warning("shard #{shard_id}: revert error, will retry (#{inspect(reason)})")

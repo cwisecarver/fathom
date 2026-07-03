@@ -90,13 +90,23 @@ defmodule Fathom.Migrator do
   Enqueues a revert job for every active shard at `from_version`, flipping them back
   to `to_version` (a pointer flip restoring the retained copy). Returns
   `{:ok, enqueued_count}`.
+
+  Pass `force: true` to override the per-shard write-age guard: without it, any shard
+  the directory shows active since its cutover refuses the revert (its job cancels)
+  rather than silently discarding post-cutover writes — see
+  `Fathom.Migrator.ShardMigration.revert/4` (finding #13).
   """
-  @spec revert(non_neg_integer(), non_neg_integer()) :: {:ok, non_neg_integer()}
-  def revert(from_version, to_version) do
+  @spec revert(non_neg_integer(), non_neg_integer(), keyword()) :: {:ok, non_neg_integer()}
+  def revert(from_version, to_version, opts \\ []) do
+    force? = Keyword.get(opts, :force, false)
+
     count =
       from_version
       |> Directory.shards_at_version()
-      |> Enum.map(&{&1.shard_id, RevertJob.new(%{shard_id: &1.shard_id, to_version: to_version})})
+      |> Enum.map(
+        &{&1.shard_id,
+         RevertJob.new(%{shard_id: &1.shard_id, to_version: to_version, force: force?})}
+      )
       |> enqueue_unique()
 
     {:ok, count}

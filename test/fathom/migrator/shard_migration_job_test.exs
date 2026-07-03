@@ -167,4 +167,30 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
 
     assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 2})
   end
+
+  # Finding #13 (force-guard at the job level): a guard refusal is deterministic — retrying can
+  # only observe MORE post-cutover writes — so the job must CANCEL, not burn its 5 attempts, and
+  # a force: true re-issue is the operator's confirmation path.
+  test "revert job cancels on the write-age guard and proceeds with force", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+
+    # Activity after cutover — the revert would discard it.
+    {:ok, _} = Directory.resolve(shard)
+
+    log =
+      capture_log(fn ->
+        assert {:cancel, :writes_since_cutover} =
+                 perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 1})
+      end)
+
+    assert log =~ "revert REFUSED"
+    assert {:ok, %{schema_version: 2}} = Directory.get(shard)
+
+    assert :ok =
+             perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 1, "force" => true})
+
+    assert {:ok, %{schema_version: 1}} = Directory.get(shard)
+  end
 end

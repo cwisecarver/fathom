@@ -53,6 +53,15 @@ defmodule Fathom.DirectoryTest do
       assert {:ok, %Shard{schema_version: 5, status: "active"}} = Directory.cutover("acme", 5)
     end
 
+    # The revert force-guard (finding #13) reads "activity since cutover" as strictly
+    # last_active_at > cutover_at, which only works if cutover stamps BOTH with the same
+    # instant — two separate now() calls would make every fresh cutover read as active.
+    test "cutover stamps cutover_at and last_active_at with the same instant" do
+      assert {:ok, %Shard{} = entry} = Directory.cutover("acme", 5)
+      assert entry.cutover_at
+      assert DateTime.compare(entry.cutover_at, entry.last_active_at) == :eq
+    end
+
     test "mark_migrating / mark_failed set status" do
       assert {:ok, %Shard{status: "migrating"}} = Directory.mark_migrating("acme")
       assert {:ok, %Shard{status: "migration_failed"}} = Directory.mark_failed("acme")

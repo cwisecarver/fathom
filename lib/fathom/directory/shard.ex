@@ -26,6 +26,11 @@ defmodule Fathom.Directory.Shard do
     # this (not updated_at, which traffic bumps). Set on mark_migrating, cleared on cutover /
     # mark_failed.
     field :migrating_since, :utc_datetime_usec
+    # When the shard last cut over to its current schema_version — stamped by
+    # Directory.cutover with the SAME instant as last_active_at, so "activity since
+    # cutover" is exactly last_active_at > cutover_at. The revert force-guard reads this
+    # (fable-review #13); nil (pre-column row / never cut over) = unknown write-age.
+    field :cutover_at, :utc_datetime_usec
 
     timestamps(type: :utc_datetime_usec)
   end
@@ -42,7 +47,8 @@ defmodule Fathom.Directory.Shard do
       :status,
       :last_active_at,
       :retain_until,
-      :migrating_since
+      :migrating_since,
+      :cutover_at
     ])
     |> validate_required([:shard_id, :schema_version, :status, :last_active_at])
     # Shard ids become SQLite file names and registry keys elsewhere; defer to the single

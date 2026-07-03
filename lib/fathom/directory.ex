@@ -128,15 +128,23 @@ defmodule Fathom.Directory do
 
   @doc """
   Cuts a shard over to `schema_version` and marks it `active` — the atomic flip a
-  completed migration performs.
+  completed migration (or revert) performs.
+
+  `cutover_at` and `last_active_at` are stamped with the SAME instant, so
+  immediately after a cutover the shard reads as "no activity since cutover" —
+  the revert force-guard (`Fathom.Migrator.ShardMigration.revert/4`) detects
+  post-cutover activity as strictly `last_active_at > cutover_at` (finding #13).
   """
   @spec cutover(String.t(), non_neg_integer()) ::
           {:ok, Shard.t()} | {:error, :not_found | Ecto.Changeset.t()}
   def cutover(shard_id, schema_version) do
+    now = DateTime.utc_now()
+
     update_shard(shard_id, %{
       schema_version: schema_version,
       status: "active",
-      last_active_at: DateTime.utc_now(),
+      last_active_at: now,
+      cutover_at: now,
       migrating_since: nil
     })
   end

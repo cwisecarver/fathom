@@ -49,16 +49,26 @@ defmodule Fathom.Migrator.ShardMigration do
   Reverts `shard_id` to `to_version` by restoring its retained copy. Backs up the current live
   version first so the revert is recoverable (finding #13); returns `{:ok, %{from, to}}` where
   `from` is the backed-up version. See `run/3` re `token`.
+
+  **Force-guard (finding #13):** a revert discards every write made on the live version since
+  its cutover. If the directory shows activity after `cutover_at` — or the cutover age is
+  unknown (`cutover_at` nil) — the revert refuses with
+  `{:error, {:writes_since_cutover | :unknown_write_age, details}}` unless `opts` carries
+  `force: true`. The refusal is deterministic (retrying won't change it): callers should
+  surface it to the operator, not retry.
   """
-  @spec revert(String.t(), non_neg_integer(), term()) ::
+  @spec revert(String.t(), non_neg_integer(), term(), keyword()) ::
           {:ok, map()} | {:retry, term()} | {:error, term()}
-  def revert(shard_id, to_version, token \\ make_token()) do
+  def revert(shard_id, to_version, token \\ make_token(), opts \\ []) do
+    force? = Keyword.get(opts, :force, false)
+
     with_lease(shard_id, token, fn lease ->
-      {current, last_active} = current_state(shard_id)
+      {current, last_active, cutover_at} = current_state(shard_id)
 
       # Self-fence before the clobbering restore: a steal since acquire means a newer owner is
       # authoritative, so abort rather than overwrite it (finding #7).
-      with :ok <- fence(shard_id, lease),
+      with :ok <- write_age_guard(shard_id, last_active, cutover_at, force?),
+           :ok <- fence(shard_id, lease),
            # Back up the live vN object BEFORE overwriting it with vN-1, so the discarded
            # post-cutover writes survive at <shard>@<current> for the retention window instead of
            # being destroyed unrecoverably (finding #13). RevertJob schedules its retirement.
@@ -69,6 +79,33 @@ defmodule Fathom.Migrator.ShardMigration do
         {:ok, %{from: current, to: to_version}}
       end
     end)
+  end
+
+  # The hard guard in front of the destructive restore (finding #13). Directory.cutover stamps
+  # cutover_at and last_active_at with the same instant, so strictly-greater last_active_at
+  # means the shard was USED since it cut over to the live version — a revert would discard
+  # those writes. Approximation, in the safe direction: last_active_at is bumped by checkouts
+  # (reads too, via the async Recorder), so this can over-refuse (a read-only shard, or a
+  # just-flushed touch) but only under-refuses for writes that bypassed checkout entirely.
+  # Runs before retain/restore so a refused revert leaves storage completely untouched.
+  defp write_age_guard(_shard_id, _last_active, _cutover_at, true), do: :ok
+
+  defp write_age_guard(shard_id, last_active, cutover_at, false) do
+    details = %{shard_id: shard_id, last_active_at: last_active, cutover_at: cutover_at}
+
+    cond do
+      # No cutover stamp (pre-column row, or a shard the directory doesn't know): the write-age
+      # is unknowable, so fail closed — the operator confirms with force rather than the revert
+      # silently assuming "no writes".
+      is_nil(cutover_at) or is_nil(last_active) ->
+        {:error, {:unknown_write_age, details}}
+
+      DateTime.compare(last_active, cutover_at) == :gt ->
+        {:error, {:writes_since_cutover, details}}
+
+      true ->
+        :ok
+    end
   end
 
   # A revert throws away every write made on the live version since its cutover. That data is
@@ -235,12 +272,12 @@ defmodule Fathom.Migrator.ShardMigration do
     end
   end
 
-  # The live version plus its last-active timestamp (captured before a revert's cutover
-  # overwrites it), for the revert backup + write-age warning.
+  # The live version plus its last-active/cutover timestamps (captured before a revert's
+  # cutover overwrites them), for the revert backup, force-guard, and write-age warning.
   defp current_state(shard_id) do
     case Directory.get(shard_id) do
-      {:ok, %{schema_version: v, last_active_at: la}} -> {v, la}
-      :error -> {0, nil}
+      {:ok, %{schema_version: v, last_active_at: la, cutover_at: co}} -> {v, la, co}
+      :error -> {0, nil, nil}
     end
   end
 

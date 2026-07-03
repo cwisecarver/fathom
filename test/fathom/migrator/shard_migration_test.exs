@@ -176,6 +176,66 @@ defmodule Fathom.Migrator.ShardMigrationTest do
              query_version!(shard, 2, "SELECT id, name FROM app_thing WHERE id = 2")
   end
 
+  # Finding #13 (force-guard): a revert discards every write made on the live version since its
+  # cutover. Pre-guard, `revert/2` silently proceeded no matter how long the shard had been live
+  # (the review's "a revert issued days into the retention window silently discards days of tenant
+  # writes"). The invariant pinned: a shard the directory shows ACTIVE since cutover_at refuses
+  # the revert — before anything touches storage — unless the operator passes force: true.
+  test "revert refuses a shard active since cutover unless forced", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, _} = ShardMigration.run(shard, 2)
+
+    # Tenant traffic after the cutover: a checkout access bumps last_active_at past cutover_at.
+    {:ok, _} = Directory.resolve(shard)
+
+    assert {:error, {:writes_since_cutover, %{last_active_at: la, cutover_at: co}}} =
+             ShardMigration.revert(shard, 1)
+
+    assert DateTime.compare(la, co) == :gt
+
+    # The refusal happened before retain/restore: live is untouched (still v2), no v2 backup
+    # object was created, and the directory still points at v2.
+    assert %{rows: [[2]]} = query_live!(shard, "PRAGMA user_version")
+    refute retained?(shard, 2), "a refused revert must not touch storage"
+    assert {:ok, %{schema_version: 2}} = Directory.get(shard)
+
+    # force: true is the operator's explicit confirmation — the same revert proceeds.
+    assert {:ok, %{from: 2, to: 1}} = ShardMigration.revert(shard, 1, "force-token", force: true)
+    assert %{rows: [[1]]} = query_live!(shard, "PRAGMA user_version")
+    assert retained?(shard, 2), "a forced revert still backs up the live version"
+  end
+
+  # A quiet shard (no directory activity since cutover) reverts without force: cutover stamps
+  # last_active_at and cutover_at with the same instant, so "no activity" is exactly equality.
+  test "revert of a quiet shard needs no force", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, _} = ShardMigration.run(shard, 2)
+
+    assert {:ok, %{from: 2, to: 1}} = ShardMigration.revert(shard, 1)
+  end
+
+  # A row with no cutover stamp (predates the cutover_at column, or the directory lost it) has
+  # an UNKNOWN write-age — fail closed and make the operator confirm, rather than assuming
+  # "no writes" on missing data.
+  test "revert fails closed when the cutover age is unknown", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, _} = ShardMigration.run(shard, 2)
+
+    {1, _} =
+      Repo.update_all(
+        from(s in Fathom.Directory.Shard, where: s.shard_id == ^shard),
+        set: [cutover_at: nil]
+      )
+
+    assert {:error, {:unknown_write_age, _}} = ShardMigration.revert(shard, 1)
+    assert %{rows: [[2]]} = query_live!(shard, "PRAGMA user_version")
+
+    assert {:ok, %{from: 2, to: 1}} = ShardMigration.revert(shard, 1, "force-token", force: true)
+  end
+
   # Finding #7: the migrator holds a lease but never re-checks it before flushing. If the shard
   # is stolen mid-copy (its lock lapsed / a checkout took over), the pre-flush fence (check_lease)
   # must abort the migration so it doesn't clobber the new owner with the migrated file. Steal the
