@@ -157,6 +157,70 @@ defmodule Fathom.Shard.WarmPromotionTest do
     refute_receive {:warm_promoted, _}, 300
   end
 
+  # Expert review #13 (warm-promotion TOCTOU): between the coordinator's 304 and its
+  # File.cp of the cache, the follower's poll can atomically swap FRESHER bytes into
+  # the cache path (a dying old owner's final flush landed right after our freshness
+  # check). The cp then copies the newer bytes while the coordinator records the OLDER
+  # etag as provenance — its first fenced flush 412s and the terminate path drops the
+  # local copy WITHOUT uploading, discarding acknowledged post-open writes though no
+  # other node owns the shard. The invariant: a promotion must serve bytes under the
+  # etag that actually describes them; a swapped cache falls back to a fresh pull.
+  test "a cache swapped between the freshness check and the copy is not promoted under the old etag",
+       %{shard: shard} do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    seed_remote(shard, "v1")
+    e1 = warm_cache_from_remote(shard)
+    cache = WarmFollower.cache_path(shard)
+
+    # Fires between the 304 and the promotion copy: the dying owner lands its final
+    # flush, and the follower's poll swaps the fresh bytes into the cache — bytes
+    # first, sidecar after, the real follower's ordering.
+    swap = fn ->
+      seed_remote(shard, "v2")
+
+      {:ok, {:written, e2}} =
+        Fathom.Shard.Storage.Local.pull_if_changed(shard, cache, e1)
+
+      File.write!(cache <> ".etag", e2)
+    end
+
+    Application.put_env(:fathom, :faulty_before, {:promote, swap})
+
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    # Whatever was promoted, the coordinator serves the current lineage ...
+    assert {:ok, %StmtResult{rows: [["v2"]]}} =
+             ShardExecutor.execute(conn, stmt("SELECT v FROM kv"))
+
+    # ... and acknowledges a post-open write.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('mine')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    ref = Process.monitor(coordinator)
+    :ok = ShardExecutor.close(conn)
+    assert_receive {:DOWN, ^ref, :process, ^coordinator, :normal}, 2_000
+
+    # The acknowledged write must be durable — pre-fix the idle flush fenced with the
+    # stale pre-swap etag, 412'd, and dropped the local copy without uploading.
+    {:ok, ro} = Connection.open(Path.join(@remote_dir, "#{shard}.db"))
+
+    assert {:ok, %{rows: [["mine"]]}} =
+             Connection.query(ro, "SELECT v FROM kv WHERE v = 'mine'", []),
+           "post-open writes must survive a cache swap during warm promotion"
+
+    Connection.close(ro)
+  end
+
   test "a live-dir warm restart wins over the follower cache (own writes authoritative)",
        %{shard: shard} do
     # This node's own un-flushed local copy says "restart"; the follower cache and the

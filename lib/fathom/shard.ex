@@ -373,11 +373,15 @@ defmodule Fathom.Shard do
         Storage.pull(shard_id, temp)
 
       etag ->
+        # Identity of the cache file the sidecar `etag` describes, captured BEFORE the
+        # freshness check — the promotion re-checks it after the copy (expert review #13).
+        pre_stat = warm_cache_stat(shard_id)
+
         case Storage.pull_if_changed(shard_id, temp, etag) do
           {:ok, :unchanged} ->
             emit_warm(shard_id, :hit)
             # 304 ⇒ the cache equals storage's current object, so `etag` IS the current etag.
-            case promote_warm_cache(shard_id, temp) do
+            case promote_warm_cache(shard_id, temp, etag, pre_stat) do
               :ok -> {:ok, etag}
               {:ok, _} = ok -> ok
               {:error, _} = error -> error
@@ -400,10 +404,33 @@ defmodule Fathom.Shard do
   # (the warm promotion). If the cache vanished under us (the follower evicted it between our
   # etag read and now), fall back to a fresh cold pull (which returns `{:ok, etag}`) rather
   # than promote nothing.
-  defp promote_warm_cache(shard_id, temp) do
-    case File.cp(WarmFollower.cache_path(shard_id), temp) do
-      :ok -> :ok
-      {:error, _} -> Storage.pull(shard_id, temp)
+  #
+  # TOCTOU (expert review #13): between our 304 and this copy, the follower's poll can
+  # atomically swap FRESHER bytes into the cache path (a dying old owner's final flush,
+  # landed after our freshness check). The cp would then copy the newer bytes while the
+  # coordinator records the OLDER etag as provenance — its first fenced flush 412s
+  # against an object that is effectively its own lineage, discarding acknowledged
+  # post-open writes with no competing owner. So after the copy, require the cache file
+  # to still be the very inode we validated (the follower's atomic_write promotion
+  # always replaces the inode) AND its sidecar to still name `etag`; any doubt falls
+  # back to a fresh cold pull (spurious transfer, never wrong provenance).
+  defp promote_warm_cache(shard_id, temp, etag, pre_stat) do
+    with :ok <- File.cp(WarmFollower.cache_path(shard_id), temp),
+         true <- pre_stat != nil and warm_cache_stat(shard_id) == pre_stat,
+         ^etag <- WarmFollower.cached_etag(shard_id) do
+      :ok
+    else
+      _ -> Storage.pull(shard_id, temp)
+    end
+  end
+
+  # Identity triple for the follower's cache file. The inode is the load-bearing part:
+  # a swapped-in fresh pull is a rename, which always changes it (mtime/size guard the
+  # exotic in-place rewrite).
+  defp warm_cache_stat(shard_id) do
+    case File.stat(WarmFollower.cache_path(shard_id), time: :posix) do
+      {:ok, %File.Stat{inode: inode, mtime: mtime, size: size}} -> {inode, mtime, size}
+      {:error, _} -> nil
     end
   end
 

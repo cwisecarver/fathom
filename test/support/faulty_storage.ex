@@ -61,9 +61,16 @@ defmodule Fathom.Test.FaultyStorage do
   def pull_if_changed(shard_id, local_path, etag) do
     delay()
 
-    if fault() == :pull,
-      do: {:error, :s3_unreachable},
-      else: Local.pull_if_changed(shard_id, local_path, etag)
+    if fault() == :pull do
+      {:error, :s3_unreachable}
+    else
+      result = Local.pull_if_changed(shard_id, local_path, etag)
+      # run_before(:promote) fires between a 304 and the caller's warm-cache copy,
+      # exercising the promotion TOCTOU (#13): the follower swaps fresher bytes into
+      # the cache path after the freshness check validated the older etag.
+      if result == {:ok, :unchanged}, do: run_before(:promote)
+      result
+    end
   end
 
   @impl true
