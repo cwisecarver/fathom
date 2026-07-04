@@ -80,7 +80,7 @@ defmodule Fathom.HranaAuth do
     with {:ok, %{"s" => granted, "v" => version}} <-
            Phoenix.Token.verify(secret!(), @salt, token, max_age: max_age()),
          {:ok, ^granted} <- ShardId.cast(shard_id),
-         true <- version >= Revocations.floor(granted) do
+         true <- above_floor?(version, Revocations.floor(granted)) do
       :ok
     else
       # Bad signature/expiry, a token for a different shard, a revoked (stale-version)
@@ -91,6 +91,12 @@ defmodule Fathom.HranaAuth do
   end
 
   defp verify(_shard_id, _token), do: {:error, @unauthorized}
+
+  # `:unavailable` is the fail-closed posture during a floor-read outage with no
+  # last-known-good value (round-2 #25, `:hrana_revocation_on_error`): refuse
+  # explicitly rather than via term-ordering accident.
+  defp above_floor?(version, floor) when is_integer(floor), do: version >= floor
+  defp above_floor?(_version, :unavailable), do: false
 
   @doc """
   Mints a bearer token granting access to `shard_id` (canonicalized).

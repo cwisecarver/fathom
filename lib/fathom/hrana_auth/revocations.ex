@@ -37,9 +37,18 @@ defmodule Fathom.HranaAuth.Revocations do
 
   @doc """
   The cached revocation floor for `shard_id`. A hit returns instantly; a miss reads
-  through to the directory and caches it; a read-through error returns `0`.
+  through to the directory and caches it. A read-through ERROR (Postgres outage)
+  serves the last-known-good cached floor even past its TTL — stale-but-safe, never
+  weaker than what this node already knew (expert review round-2 #25: collapsing to
+  `0` silently re-activated every revoked credential fleet-wide after one TTL,
+  coupling an availability failure to a security-control bypass). With no prior
+  value at all, `:hrana_revocation_on_error` decides: `:fail_open` (default — the
+  signature stays the enforced control) returns `0`; `:fail_closed` returns
+  `:unavailable` and the token is refused. Every error path emits
+  `[:fathom, :hrana, :revocation, :floor_error]` so a floor-read outage is visible
+  as a security-control-down, not just a log line.
   """
-  @spec floor(String.t()) :: non_neg_integer()
+  @spec floor(String.t()) :: non_neg_integer() | :unavailable
   def floor(shard_id) do
     now = System.monotonic_time(:millisecond)
 
@@ -99,9 +108,39 @@ defmodule Fathom.HranaAuth.Revocations do
   rescue
     e ->
       Logger.warning("revocation floor read failed for #{shard_id}: #{Exception.message(e)}")
-      0
+      read_error_fallback(shard_id)
   catch
-    :exit, _ -> 0
+    :exit, reason ->
+      Logger.warning("revocation floor read failed for #{shard_id}: #{inspect(reason)}")
+      read_error_fallback(shard_id)
+  end
+
+  # See floor/1 (round-2 #25). Expired entries are never deleted, only overwritten,
+  # so the last-known-good floor is still in the table to serve stale.
+  defp read_error_fallback(shard_id) do
+    :telemetry.execute([:fathom, :hrana, :revocation, :floor_error], %{count: 1}, %{
+      shard_id: shard_id
+    })
+
+    case stale_floor(shard_id) do
+      {:ok, version} ->
+        version
+
+      :none ->
+        case Application.get_env(:fathom, :hrana_revocation_on_error, :fail_open) do
+          :fail_closed -> :unavailable
+          _ -> 0
+        end
+    end
+  end
+
+  defp stale_floor(shard_id) do
+    case :ets.lookup(@table, shard_id) do
+      [{^shard_id, version, _expires_at}] -> {:ok, version}
+      [] -> :none
+    end
+  rescue
+    ArgumentError -> :none
   end
 
   defp insert(shard_id, version, now) do

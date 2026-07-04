@@ -117,6 +117,92 @@ defmodule Fathom.HranaAuthRevocationTest do
            "a stale notification must never lower the floor this node already knows"
   end
 
+  # Round-2 #25: a floor read-through error returned 0 ("no revocations") without
+  # caching and with no last-known-good fallback — so a Postgres outage (natural or
+  # attacker-induced) drove the floor to 0 for every expired-cache shard, and after
+  # one TTL for ALL shards: the entire revocation mechanism silently disengaged and
+  # every revoked/leaked credential worked again. An availability failure must not
+  # be a security-control bypass: serve the stale floor (never weaker than what this
+  # node knew), emit telemetry, and let :hrana_revocation_on_error pick the
+  # no-prior-value posture.
+  test "a floor-read outage serves the last-known-good floor, stale past its TTL" do
+    import ExUnit.CaptureLog
+
+    shard = uniq()
+    prev_ttl = Application.get_env(:fathom, :hrana_revocation_ttl_ms)
+    # TTL 0: the cached entry is immediately expired, forcing the read-through.
+    Application.put_env(:fathom, :hrana_revocation_ttl_ms, 0)
+
+    on_exit(fn ->
+      if prev_ttl == nil,
+        do: Application.delete_env(:fathom, :hrana_revocation_ttl_ms),
+        else: Application.put_env(:fathom, :hrana_revocation_ttl_ms, prev_ttl)
+    end)
+
+    test_pid = self()
+    handler_id = "floor-error-#{shard}"
+
+    :telemetry.attach(
+      handler_id,
+      [:fathom, :hrana, :revocation, :floor_error],
+      fn _e, _m, meta, _ -> send(test_pid, {:floor_error, meta.shard_id}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    Revocations.put(shard, 5)
+
+    # The outage: cut this process off from Postgres so the read-through raises.
+    Ecto.Adapters.SQL.Sandbox.mode(Fathom.Repo, :manual)
+    owner_restored = fn -> Ecto.Adapters.SQL.Sandbox.start_owner!(Fathom.Repo, shared: true) end
+
+    capture_log(fn ->
+      assert Revocations.floor(shard) == 5,
+             "an outage must serve the stale floor, not collapse to 0 (pre-fix: 0)"
+    end)
+
+    assert_receive {:floor_error, ^shard}, 1_000
+
+    # Postgres recovers (keeps later on_exit hooks working).
+    owner = owner_restored.()
+    on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(owner) end)
+  end
+
+  test "with no known floor, :hrana_revocation_on_error picks the outage posture" do
+    import ExUnit.CaptureLog
+
+    shard = uniq()
+    prev_ttl = Application.get_env(:fathom, :hrana_revocation_ttl_ms)
+    prev_posture = Application.get_env(:fathom, :hrana_revocation_on_error)
+    Application.put_env(:fathom, :hrana_revocation_ttl_ms, 0)
+
+    on_exit(fn ->
+      if prev_ttl == nil,
+        do: Application.delete_env(:fathom, :hrana_revocation_ttl_ms),
+        else: Application.put_env(:fathom, :hrana_revocation_ttl_ms, prev_ttl)
+
+      if prev_posture == nil,
+        do: Application.delete_env(:fathom, :hrana_revocation_on_error),
+        else: Application.put_env(:fathom, :hrana_revocation_on_error, prev_posture)
+    end)
+
+    Ecto.Adapters.SQL.Sandbox.mode(Fathom.Repo, :manual)
+
+    capture_log(fn ->
+      # Default: fail open — the signature stays the enforced control.
+      Application.delete_env(:fathom, :hrana_revocation_on_error)
+      assert Revocations.floor(shard) == 0
+
+      # Fail closed: no floor knowledge means no token acceptance.
+      Application.put_env(:fathom, :hrana_revocation_on_error, :fail_closed)
+      assert Revocations.floor(shard) == :unavailable
+    end)
+
+    owner = Ecto.Adapters.SQL.Sandbox.start_owner!(Fathom.Repo, shared: true)
+    on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(owner) end)
+  end
+
   test "tokens sign with the dedicated secret, independent of secret_key_base" do
     shard = uniq()
     {:ok, _} = Directory.resolve(shard)
