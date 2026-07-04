@@ -151,15 +151,103 @@ defmodule Fathom.Shard.HeartbeatTest do
       end
     end)
 
-    # A default-owner boot (the app path) clears the predecessor and records itself.
+    # A default-owner boot (the app path). The predecessor's heartbeat is FRESH, so
+    # it is not cleared immediately (expert review #16: fresh can't distinguish
+    # "crashed seconds ago" from "alive on a shared volume") — the boot schedules a
+    # re-check instead.
     :ok = stop_supervised(Fathom.Shard.Heartbeat)
     pid = start_supervised!({Heartbeat, ttl_ms: @ttl}, id: :heartbeat_default_owner)
     _ = :sys.get_state(pid)
 
+    assert {:ok, %{expires_at_ms: prev_exp}} = Storage.read_heartbeat(prev_owner),
+           "a still-fresh predecessor heartbeat must not be cleared before the re-check"
+
+    # Drive the scheduled re-check: the predecessor's expiry is FROZEN (no renewer —
+    # it is dead), so the second read clears it — the #6 fast restart, one renew
+    # interval late instead of a full TTL.
+    send(pid, {:clear_previous_incarnation, prev_owner, prev_exp})
+    _ = :sys.get_state(pid)
+
     assert Storage.read_heartbeat(prev_owner) == :not_found,
-           "the previous incarnation's heartbeat must be cleared so its locks are stealable"
+           "a frozen (dead) previous incarnation's heartbeat must be cleared so its locks are stealable"
 
     assert File.read!(inc_file) == Heartbeat.incarnation()
+  end
+
+  # Expert review round-2 #16: sharing the .incarnation file is NOT proof the
+  # predecessor is dead — a persisted/remounted :shard_data_dir (hostPath/PV/NFS) is
+  # shared with a node still serving (termination grace, or a PV remounted across
+  # machines). Clearing a LIVE node's heartbeat declares its every long-held shard
+  # instantly stealable (locks are never renewed in heartbeat mode) while the victim
+  # keeps serving — fleet-wide split-brain. The invariant: a heartbeat whose expiry
+  # ADVANCES between the boot read and the re-check has a live renewer and must
+  # never be cleared.
+  test "a live predecessor's renewed heartbeat is refused, not cleared" do
+    inc_file = Path.join(Path.dirname(Fathom.Shard.db_path("x")), ".incarnation")
+    prev_content = File.read(inc_file)
+    File.mkdir_p!(Path.dirname(inc_file))
+    File.write!(inc_file, "livenonce42")
+    prev_owner = "#{node()}#livenonce42"
+    {:ok, _} = Storage.renew_heartbeat(prev_owner, 60_000)
+
+    on_exit(fn ->
+      Storage.clear_heartbeat(prev_owner)
+
+      case prev_content do
+        {:ok, c} -> File.write!(inc_file, c)
+        _ -> File.rm(inc_file)
+      end
+    end)
+
+    :ok = stop_supervised(Fathom.Shard.Heartbeat)
+    pid = start_supervised!({Heartbeat, ttl_ms: @ttl}, id: :heartbeat_live_prev)
+    _ = :sys.get_state(pid)
+
+    assert {:ok, %{expires_at_ms: exp_at_boot}} = Storage.read_heartbeat(prev_owner),
+           "a fresh predecessor heartbeat must survive the boot read"
+
+    # The predecessor is ALIVE: it renews between the boot read and the re-check.
+    {:ok, _} = Storage.renew_heartbeat(prev_owner, 90_000)
+
+    log =
+      capture_log(fn ->
+        send(pid, {:clear_previous_incarnation, prev_owner, exp_at_boot})
+        _ = :sys.get_state(pid)
+      end)
+
+    assert {:ok, _} = Storage.read_heartbeat(prev_owner),
+           "a heartbeat with a live renewer must never be cleared (split-brain steal window)"
+
+    assert log =~ "refusing to clear previous incarnation"
+  end
+
+  # The other side of #16's trade: a predecessor already stale by the steal margin is
+  # dead for certain (a live renewer can never leave its heartbeat stale), so the #6
+  # fast path clears it immediately at boot — no re-check wait.
+  test "a stale previous incarnation's heartbeat is cleared immediately at boot" do
+    inc_file = Path.join(Path.dirname(Fathom.Shard.db_path("x")), ".incarnation")
+    prev_content = File.read(inc_file)
+    File.mkdir_p!(Path.dirname(inc_file))
+    File.write!(inc_file, "deadnonce77")
+    prev_owner = "#{node()}#deadnonce77"
+    # Expired well past the steal margin (a negative TTL back-dates the expiry).
+    {:ok, _} = Storage.renew_heartbeat(prev_owner, -60_000)
+
+    on_exit(fn ->
+      Storage.clear_heartbeat(prev_owner)
+
+      case prev_content do
+        {:ok, c} -> File.write!(inc_file, c)
+        _ -> File.rm(inc_file)
+      end
+    end)
+
+    :ok = stop_supervised(Fathom.Shard.Heartbeat)
+    pid = start_supervised!({Heartbeat, ttl_ms: @ttl}, id: :heartbeat_stale_prev)
+    _ = :sys.get_state(pid)
+
+    assert Storage.read_heartbeat(prev_owner) == :not_found,
+           "a stale-by-margin predecessor heartbeat is provably dead and clears at boot"
   end
 
   # Expert review #8: the lapse generation was process-local state resetting to 0 on

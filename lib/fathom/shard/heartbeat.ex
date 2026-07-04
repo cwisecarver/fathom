@@ -99,10 +99,14 @@ defmodule Fathom.Shard.Heartbeat do
 
     # Same-machine restart fast path (expert review #6): our previous incarnation's
     # heartbeat object would otherwise stay fresh for up to a TTL, holding this
-    # node's own old locks {:held} against us. The previous nonce is persisted
-    # locally (a replaced pod / other machine doesn't share the file, so a live
-    # same-name zombie elsewhere is never cleared — its liveness protects it).
-    if owner == owner(), do: clear_previous_incarnation()
+    # node's own old locks {:held} against us. But sharing the nonce file is NOT
+    # proof the predecessor is dead (expert review round-2 #16: a persisted /
+    # remounted :shard_data_dir is shared with a live node), so a stale-by-margin
+    # heartbeat is cleared now, while a still-fresh one is only RE-CHECKED after one
+    # renew interval (see {:clear_previous_incarnation, ...} below): frozen expiry ⇒
+    # dead predecessor ⇒ clear; advancing expiry ⇒ live renewer ⇒ refuse.
+    clear_action =
+      if owner == owner(), do: clear_previous_incarnation(), else: :ok
 
     # The lapse generation must survive this process: it is the coordinators' proof
     # that "no lapse happened since acquire ⇒ no steal was possible", and a restart
@@ -152,6 +156,20 @@ defmodule Fathom.Shard.Heartbeat do
       timer: nil
     }
 
+    case clear_action do
+      {:recheck, prev_owner, exp} ->
+        # One full renew interval (+ slack) so a live predecessor renews at least
+        # once before the second read.
+        Process.send_after(
+          self(),
+          {:clear_previous_incarnation, prev_owner, exp},
+          state.renew_ms + 1_000
+        )
+
+      :ok ->
+        :ok
+    end
+
     {:ok, state, {:continue, :renew}}
   end
 
@@ -160,6 +178,33 @@ defmodule Fathom.Shard.Heartbeat do
 
   @impl true
   def handle_info(:renew, state), do: {:noreply, do_renew(state)}
+
+  # Second read of a previous incarnation's still-fresh heartbeat (expert review #16;
+  # scheduled from init). A dead predecessor's heartbeat is frozen at the expiry we
+  # captured, so an unchanged value means it is safe to clear (the #6 fast restart, one
+  # renew interval late). ANY advance means a live renewer shares this data dir —
+  # clearing its heartbeat would declare its every long-held shard stealable while it
+  # keeps serving (split-brain), so refuse loudly and leave it.
+  @impl true
+  def handle_info({:clear_previous_incarnation, prev_owner, prev_exp}, state) do
+    case Storage.read_heartbeat(prev_owner) do
+      {:ok, %{expires_at_ms: ^prev_exp}} ->
+        _ = Storage.clear_heartbeat(prev_owner)
+
+      {:ok, _advanced} ->
+        Logger.error(
+          "refusing to clear previous incarnation #{prev_owner}: its heartbeat is being " <>
+            "RENEWED, so a live node shares this data dir (persisted/remounted volume?). " <>
+            "Clearing it would open a split-brain steal window (expert review #16)."
+        )
+
+      # Gone (cleanly shut down meanwhile) or unreadable — nothing to do / fail closed.
+      _ ->
+        :ok
+    end
+
+    {:noreply, state}
+  end
 
   @impl true
   def handle_call(:generation, _from, state), do: {:reply, state.generation, state}
@@ -245,26 +290,65 @@ defmodule Fathom.Shard.Heartbeat do
   defp gen_key(owner), do: {__MODULE__, :generation, owner}
 
   # See init/1. The nonce file lives next to the shard files (node-local disk).
+  # Returns :ok, or {:recheck, prev_owner, expires_at_ms} when the previous
+  # incarnation's heartbeat is still fresh and needs the second read (#16).
   defp clear_previous_incarnation do
     path = incarnation_file()
     current = incarnation()
 
-    case File.read(path) do
-      {:ok, prev} when prev != "" and prev != current ->
-        _ = Storage.clear_heartbeat("#{node()}##{prev}")
-        :ok
+    action =
+      case File.read(path) do
+        {:ok, prev} when prev != "" and prev != current ->
+          judge_previous("#{node()}##{prev}")
 
-      _ ->
-        :ok
-    end
+        _ ->
+          :ok
+      end
 
     File.mkdir_p!(Path.dirname(path))
     File.write(path, current)
-    :ok
+    action
   rescue
     e ->
       Logger.warning("previous-incarnation heartbeat clear failed: #{Exception.message(e)}")
       :ok
+  end
+
+  # Expert review round-2 #16: "shares the .incarnation file" is NOT proof the
+  # predecessor is dead. A persisted :shard_data_dir (hostPath / PV / NFS — which the
+  # warm-restart design actively encourages) is shared with a predecessor still in
+  # its termination grace, or with a live node on another machine after a PV remount.
+  # Unconditionally deleting a LIVE node's heartbeat declares its every long-held
+  # shard instantly stealable (locks are never renewed in heartbeat mode, so their
+  # frozen TTLs are long expired) while the victim keeps serving — fleet-wide
+  # split-brain. So: stale-by-margin ⇒ dead for sure, clear now (the #6 fast path);
+  # still fresh ⇒ can't tell "crashed seconds ago" from "alive", re-check after one
+  # renew interval (a live renewer will have advanced the expiry; a dead one is
+  # frozen); unreadable ⇒ leave it (fail closed — a TTL wait is the recoverable
+  # direction, a spurious steal is not).
+  defp judge_previous(prev_owner) do
+    now = System.system_time(:millisecond)
+    margin = Storage.steal_margin_ms()
+
+    case Storage.read_heartbeat(prev_owner) do
+      :not_found ->
+        :ok
+
+      {:ok, %{expires_at_ms: exp}} when now > exp + margin ->
+        _ = Storage.clear_heartbeat(prev_owner)
+        :ok
+
+      {:ok, %{expires_at_ms: exp}} ->
+        {:recheck, prev_owner, exp}
+
+      {:error, reason} ->
+        Logger.warning(
+          "could not verify previous incarnation #{prev_owner} before clearing " <>
+            "(#{inspect(reason)}); leaving its heartbeat (fail closed)"
+        )
+
+        :ok
+    end
   end
 
   defp incarnation_file do
