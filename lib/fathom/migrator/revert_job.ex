@@ -27,6 +27,18 @@ defmodule Fathom.Migrator.RevertJob do
           id: id
         } = job
       ) do
+    # Cancel the forward migration's pending retirement of to_version BEFORE touching
+    # storage (expert review #22, tightened by round-2 #17): to_version's retained copy
+    # is this revert's RESTORE SOURCE, and the #22 cancel lived in the :ok branch —
+    # after the whole race window — so a retirement dequeuing just before/mid-revert
+    # still deleted it (its skip-when-live guard reads the directory, which says
+    # from_version until our cutover). Cancelling up front is safe even if the revert
+    # then fails or is refused: a retained copy that outlives its drop merely leaks
+    # until the S3 lifecycle backstop; a deleted restore source quarantines the shard
+    # unrecoverably. An already-EXECUTING retirement is uncancellable — that side is
+    # closed by RetirementJob's revert-in-flight guard.
+    cancel_retirement(shard_id, to_version)
+
     # Job id as the lease token — distinct from any forward ShardMigrationJob's owner, so the two
     # can't merge via the same-owner reclaim path (finding #9).
     case ShardMigration.revert(shard_id, to_version, id, force: Map.get(args, "force", false)) do
@@ -35,12 +47,6 @@ defmodule Fathom.Migrator.RevertJob do
         # after the retention window so it doesn't leak (RetirementJob only ever drops the
         # forward `from` version otherwise).
         schedule_retirement(shard_id, backed_up)
-        # And cancel the forward migration's pending retirement of the version we just
-        # restored (expert review #22, per the design doc's revert sequence): to_version
-        # is LIVE again, and its retained copy near the retention deadline is what the
-        # next revert restores from — leaving the drop scheduled made reverts near the
-        # boundary race it and fail on a 404 restore.
-        cancel_retirement(shard_id, to_version)
         :ok
 
       {:retry, reason} ->

@@ -134,6 +134,52 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
            "the live version's retained copy must not be dropped"
   end
 
+  # Expert review round-2 #17: the #22 skip-when-live guard reads the directory, which
+  # still says from_version until the revert's cutover — so a RetirementJob dequeuing
+  # just before/during a revert passed the guard and deleted the retained copy that is
+  # the revert's RESTORE SOURCE (restore then 404s every retry; the shard quarantines
+  # with its recovery point destroyed). RevertJob's cancel can't reach an
+  # already-executing retirement, so the retirement itself must check for an in-flight
+  # revert referencing its version as to_version.
+  test "RetirementJob skips a version whose revert is in flight", %{shard: shard} do
+    seed_v1!(shard)
+    :ok = Storage.retain(shard, 1)
+    # The shard is past v1 (the normal retirement case) ...
+    {:ok, _} = Directory.cutover(shard, 2)
+    # ... but a revert BACK to v1 is in flight (inserted, not yet cut over — the
+    # directory still shows v2, so the #22 live-guard alone passes).
+    {:ok, _} = Oban.insert(RevertJob.new(%{shard_id: shard, to_version: 1}))
+
+    assert {:cancel, :revert_in_flight} =
+             perform_job(RetirementJob, %{"shard_id" => shard, "version" => 1})
+
+    assert File.exists?(Path.join(@remote_dir, "#{shard}@1.db")),
+           "an in-flight revert's restore source must not be dropped"
+  end
+
+  # The other half of #17: RevertJob cancels the pending retirement at the TOP of
+  # perform (before restore), not in the :ok branch — so the restore source is
+  # protected even when the revert itself then fails and retries.
+  test "RevertJob cancels the pending retirement before restoring, even on failure",
+       %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Directory.cutover(shard, 2)
+    # A retirement of v1 is pending (scheduled by the forward migration).
+    {:ok, _} = Oban.insert(RetirementJob.new(%{shard_id: shard, version: 1}, schedule_in: 60))
+    assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1})
+
+    # The live object is gone, so the revert's retain-backup step FAILS after the
+    # cancel — pre-fix the cancel lived in the :ok branch and never ran on this path.
+    File.rm!(Path.join(@remote_dir, "#{shard}.db"))
+
+    capture_log(fn ->
+      assert {:error, _} =
+               perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 1})
+    end)
+
+    refute_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1})
+  end
+
   test "a held lease snoozes the job", %{shard: shard} do
     # Jobs only ever target directory-known shards (they're enqueued from directory
     # queries) — register it, since run/3 no longer implicitly mints rows (#40).
