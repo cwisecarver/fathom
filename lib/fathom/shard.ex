@@ -268,6 +268,10 @@ defmodule Fathom.Shard do
         # upload — the durability-storm fix (findings #1/#2, #27).
         flushed_through: init_flushed_through(shard_id, warm?),
         flush_timer: nil,
+        # The in-flight off-process durability flush (expert review #27) and the
+        # watermark it will advance flushed_through to on success.
+        flush_task: nil,
+        flush_pending: nil,
         draining: false,
         drain_timer: nil,
         drain_reply_to: nil
@@ -557,6 +561,44 @@ defmodule Fathom.Shard do
      %{cancel_idle(state) | draining: true, drain_timer: timer, drain_reply_to: reply_to}}
   end
 
+  # The in-flight durability-flush task's reply (expert review #27). Matched BEFORE
+  # the generic :DOWN clause below so the task's monitor is never mistaken for a
+  # connection release.
+  @impl true
+  def handle_info({ref, result}, %{flush_task: %Task{ref: ref}} = state) do
+    Process.demonitor(ref, [:flush])
+    state = %{state | flush_task: nil}
+
+    case result do
+      # Uploaded; advance the fence etag, the provenance sidecar, and the flushed
+      # watermark captured when the task started (clears dirty up to that point).
+      {:ok, new_etag} ->
+        write_etag_sidecar(state.path, new_etag)
+
+        {:noreply,
+         schedule_flush(%{state | flushed_through: state.flush_pending, etag: new_etag})}
+
+      # The data PUT's If-Match failed: a stealer flushed in the upload window since
+      # our fence check. Self-fence — do NOT retry over the new owner (finding #15).
+      {:error, :superseded} ->
+        Logger.error("shard #{state.id}: object superseded during durability flush; self-fencing")
+
+        {:stop, {:shutdown, :lease_lost}, %{state | lease_lost: true}}
+
+      # Snapshot/PUT failed transiently: don't advance the watermark, so it stays
+      # dirty and the next interval retries — and a later idle-drop flushes before
+      # dropping instead of deleting un-stored writes.
+      {:error, _reason} ->
+        {:noreply, schedule_flush(state)}
+    end
+  end
+
+  # The flush task crashed before replying: treat like a transient flush failure.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{flush_task: %Task{ref: ref}} = state) do
+    Logger.warning("shard #{state.id}: durability flush task crashed (#{inspect(reason)})")
+    {:noreply, schedule_flush(%{state | flush_task: nil})}
+  end
+
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
     stop_when_drained(release(state, ref))
@@ -661,8 +703,23 @@ defmodule Fathom.Shard do
   # Periodic durability flush: snapshot + upload the live shard without dropping
   # it, so a busy shard's data-loss window is bounded to the flush interval rather
   # than the whole session. Fenced like the idle flush.
+  #
+  # The snapshot + upload run OFF-PROCESS in a monitored task (expert review #27):
+  # inline, the fence RTT + full-shard VACUUM INTO + full-object PUT blocked the
+  # coordinator's mailbox every interval, so every :checkout / :checkin / :DOWN for
+  # the shard queued behind seconds of I/O — recurring p99 checkout spikes on
+  # exactly the hot (write-active) shards, the same blocking pattern the cold-open
+  # path was already restructured to avoid. The watermark design already tolerates
+  # concurrent writes during the snapshot; the fence check and watermark capture
+  # stay in the coordinator, the result is applied when the task replies, and at
+  # most one flush task is in flight.
   def handle_info(:durability_flush, state) do
     cond do
+      # A flush is already in flight — don't stack a second snapshot/PUT; the next
+      # interval retries anything the in-flight one doesn't cover.
+      state.flush_task != nil ->
+        {:noreply, schedule_flush(state)}
+
       # Clean: local == storage, so there's nothing to upload and no clobber risk.
       # Skip entirely (no fence, no PUT) — this is the durability-flush storm fix: at
       # a million mostly-idle/read-only shards, durability PUTs now track *writes*,
@@ -678,33 +735,14 @@ defmodule Fathom.Shard do
         case Fence.check(fence_ctx(state)) do
           {:ok, updates} ->
             state = Map.merge(state, updates)
-            # Capture the write count BEFORE snapshotting: a write landing during the (blocking)
-            # snapshot/upload bumps the counter past this, so the shard stays dirty and re-flushes
-            # next interval — never silently cleared (findings #1/#2/#27).
+            # Capture the write count BEFORE snapshotting: a write landing during the
+            # snapshot/upload bumps the counter past this, so the shard stays dirty and
+            # re-flushes next interval — never silently cleared (findings #1/#2/#27).
             flushed_to = WriteCounter.count(state.id)
+            snapshot_state = Map.take(state, [:id, :path, :etag])
+            task = Task.async(fn -> snapshot_and_upload(snapshot_state) end)
 
-            case snapshot_and_upload(state) do
-              # Uploaded; advance the fence etag, the provenance sidecar, and the
-              # flushed watermark (clears dirty).
-              {:ok, new_etag} ->
-                write_etag_sidecar(state.path, new_etag)
-                {:noreply, schedule_flush(%{state | flushed_through: flushed_to, etag: new_etag})}
-
-              # The data PUT's If-Match failed: a stealer flushed in the upload window since our
-              # fence check. Self-fence — do NOT retry over the new owner (finding #15).
-              {:error, :superseded} ->
-                Logger.error(
-                  "shard #{state.id}: object superseded during durability flush; self-fencing"
-                )
-
-                {:stop, {:shutdown, :lease_lost}, %{state | lease_lost: true}}
-
-              # Snapshot/PUT failed transiently: don't advance the watermark, so it stays dirty and
-              # the next interval retries — and a later idle-drop flushes before dropping instead of
-              # deleting un-stored writes.
-              {:error, _reason} ->
-                {:noreply, schedule_flush(state)}
-            end
+            {:noreply, %{state | flush_task: task, flush_pending: flushed_to}}
 
           # Lost the lease — self-fence (stop without flushing).
           :superseded ->
@@ -728,6 +766,7 @@ defmodule Fathom.Shard do
       when map_size(conns) == 0 do
     # We no longer own the shard; flushing our local copy would clobber the node
     # that took over. Drop it and leave the lease alone (it's theirs now).
+    _ = settle_flush_task(state)
     Fathom.ShardLoad.forget(state.id)
     WriteCounter.forget(state.id)
     drop_local(state.path)
@@ -735,6 +774,11 @@ defmodule Fathom.Shard do
   end
 
   def terminate(_reason, %{conns: conns} = state) when map_size(conns) == 0 do
+    # Settle any in-flight flush task FIRST (expert review #27): its conditional PUT
+    # may land at any moment, and the drop-flush below fences on the etag — racing
+    # them would make one 412 spuriously (the drop-flush's :superseded branch drops
+    # the local copy WITHOUT uploading writes made after the task's snapshot).
+    state = settle_flush_task(state)
     Fathom.ShardLoad.forget(state.id)
     # flush_and_drop reads the write counter (unflushed?/1) to decide whether to upload before
     # dropping, so forget the counter AFTER it — forgetting first would zero the count and make a
@@ -1022,6 +1066,23 @@ defmodule Fathom.Shard do
       end
     after
       Enum.each(["", "-wal", "-shm"], &File.rm(temp <> &1))
+    end
+  end
+
+  # Wait out an in-flight durability-flush task and fold its result into the state
+  # (expert review #27) — used on the terminate path so the final drop-flush never
+  # races the task's conditional PUT. A task error/timeout leaves the state as-is
+  # (still dirty ⇒ the drop-flush uploads everything itself).
+  defp settle_flush_task(%{flush_task: nil} = state), do: state
+
+  defp settle_flush_task(%{flush_task: task} = state) do
+    case Task.yield(task, 30_000) || Task.shutdown(task) do
+      {:ok, {:ok, new_etag}} ->
+        write_etag_sidecar(state.path, new_etag)
+        %{state | flush_task: nil, flushed_through: state.flush_pending, etag: new_etag}
+
+      _ ->
+        %{state | flush_task: nil}
     end
   end
 

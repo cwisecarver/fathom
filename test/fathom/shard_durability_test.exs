@@ -62,11 +62,25 @@ defmodule Fathom.ShardDurabilityTest do
     )
   end
 
-  # Drive exactly one durability flush and wait for the coordinator to finish it.
+  # Drive exactly one durability flush and wait for it to settle. The snapshot +
+  # upload now run in an off-process task (expert review #27), so syncing the
+  # mailbox isn't enough — poll until the task has been consumed (bounded).
   defp flush_now(coordinator) do
     send(coordinator, :durability_flush)
-    _ = :sys.get_state(coordinator)
-    :ok
+    wait_flush_settled(coordinator, 400)
+  end
+
+  defp wait_flush_settled(_coordinator, 0), do: flunk("durability flush task never settled")
+
+  defp wait_flush_settled(coordinator, tries) do
+    case :sys.get_state(coordinator) do
+      %{flush_task: nil} ->
+        :ok
+
+      _ ->
+        Process.sleep(5)
+        wait_flush_settled(coordinator, tries - 1)
+    end
   end
 
   test "a durability flush snapshots committed writes to storage while a connection stays open",
@@ -192,6 +206,70 @@ defmodule Fathom.ShardDurabilityTest do
            "a write during the flush must keep the shard dirty, not be cleared by the flush"
 
     ShardExecutor.close(conn)
+  end
+
+  # Expert review #27: the durability flush ran inline in the coordinator's
+  # handle_info — fence RTT + full-shard VACUUM INTO + full-object PUT — so every
+  # :checkout for the shard queued behind seconds of I/O, a recurring p99 spike on
+  # exactly the hot (write-active) shards. The invariant: the coordinator keeps
+  # serving checkouts while a flush's upload is in flight.
+  test "a checkout is served while a durability flush is in flight", %{shard: shard} do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    prev_timeout = Application.get_env(:fathom, :shard_checkout_timeout_ms)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Application.put_env(:fathom, :shard_checkout_timeout_ms, 500)
+
+    test_pid = self()
+
+    # Block the flush's PUT until released — the coordinator must stay responsive.
+    blocker = fn ->
+      send(test_pid, :flush_started)
+
+      receive do
+        :release_flush -> :ok
+      after
+        10_000 -> :ok
+      end
+    end
+
+    Application.put_env(:fathom, :faulty_before, {:flush, blocker})
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+      restore(:shard_checkout_timeout_ms, prev_timeout)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    send(coordinator, :durability_flush)
+    assert_receive :flush_started, 2_000
+
+    # The upload is wedged mid-flight; a checkout must still be served promptly.
+    # Pre-fix the coordinator was blocked inside handle_info and this timed out.
+    task = Task.async(fn -> Shards.checkout(shard) end)
+    assert {:ok, pid, ref, _path} = Task.await(task, 2_000)
+    Fathom.Shard.checkin(pid, ref)
+
+    # Release the flush and let it settle; the write reached storage.
+    send(flush_task_pid(coordinator), :release_flush)
+    wait_flush_settled(coordinator, 400)
+    assert File.exists?(remote_db(shard))
+
+    ShardExecutor.close(conn)
+  end
+
+  defp flush_task_pid(coordinator) do
+    case :sys.get_state(coordinator) do
+      %{flush_task: %Task{pid: pid}} when is_pid(pid) -> pid
+      _ -> flunk("no flush task in flight")
+    end
   end
 
   test "a zero interval disables the periodic flush timer", %{shard: shard} do
