@@ -831,6 +831,81 @@ defmodule Fathom.ShardDurabilityTest do
     assert Enum.sort(values) == ["fork-one", "fork-two"]
   end
 
+  # Expert review round-2 #29: on a takeover, revalidate_takeover's {:ok, nil}
+  # branch (the object VANISHED between the speculative pull and the re-check)
+  # returned the STALE pulled etag — so the first flush deterministically
+  # self-fenced (If-Match against a gone object never succeeds) and every write
+  # accepted in that cycle was dropped. The invariant: a vanished object means the
+  # brand-new contract — fence with nil and let the first flush RECREATE it.
+  test "a takeover whose object vanished mid-open recreates it instead of self-fencing",
+       %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    # The old owner's lineage in storage, and its long-dead lock (no heartbeat, TTL
+    # far expired) — this open is a TAKEOVER (took_over: true).
+    seed = Path.join(System.tmp_dir!(), "seed29_#{shard}.db")
+    {:ok, c} = Connection.open(seed)
+    :ok = Connection.exec(c, "CREATE TABLE kv (v TEXT)")
+    :ok = Connection.exec(c, "INSERT INTO kv VALUES ('old')")
+    :ok = Connection.exec(c, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(c)
+    :ok = Storage.flush(shard, seed)
+    for s <- ["", "-wal", "-shm"], do: File.rm(seed <> s)
+    put_raw_lock(shard, "dead@node", 3, now_ms() - 60_000)
+
+    # Mid-open, after the speculative pull captured the bytes but before the
+    # takeover revalidation: the object vanishes (deleted by an operator/lifecycle).
+    pull_temp = local_db(shard) <> ".pull"
+
+    vanish = fn ->
+      # The pull runs concurrently with this acquire — wait for its temp, then
+      # delete the object so the revalidation's etag read sees nothing.
+      Enum.reduce_while(1..400, :ok, fn _, _ ->
+        if File.exists?(pull_temp) or File.exists?(local_db(shard)),
+          do: {:halt, :ok},
+          else: Process.sleep(5) && {:cont, :ok}
+      end)
+
+      File.rm(remote_db(shard))
+    end
+
+    Application.put_env(:fathom, :faulty_before, {:acquire, vanish})
+
+    capture_log(fn ->
+      {:ok, conn} = ShardExecutor.open(shard)
+
+      # Serving the pulled copy, and accepting writes.
+      assert {:ok, %StmtResult{rows: [["old"]]}} =
+               ShardExecutor.execute(conn, stmt("SELECT v FROM kv"))
+
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('mine')"))
+
+      close_and_stop(shard, conn)
+    end)
+
+    # The idle flush must have RECREATED the object with the accepted write —
+    # pre-fix it fenced on the vanished etag, self-fenced, and dropped it.
+    assert File.exists?(remote_db(shard)), "the first flush must recreate a vanished object"
+
+    {:ok, ro} = Connection.open(remote_db(shard))
+
+    assert {:ok, %{rows: [["mine"]]}} =
+             Connection.query(ro, "SELECT v FROM kv WHERE v = 'mine'", []),
+           "writes accepted after a vanished-object takeover must be durable"
+
+    Connection.close(ro)
+  end
+
   # Expert review round-2 #27: externally-killed pulls/snapshots (Task.shutdown
   # brutal_kill, pull timeouts, the follower's :kill_task) strand uniquely-named
   # `.dl.<n>` / `.snap.<n>` temps that no fixed-suffix sweeper matches — an

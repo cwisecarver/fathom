@@ -344,8 +344,18 @@ defmodule Fathom.Shard do
         {:ok, ^etag} ->
           {:ok, etag}
 
+        # The object VANISHED between the pull and this re-check (expert review
+        # round-2 #29). Returning the stale pulled etag made the first flush
+        # deterministically self-fence (If-Match against a gone object never
+        # succeeds), dropping every write accepted in that cycle. Adopt the
+        # brand-new contract instead — same stance as quarantined_fork?'s
+        # deliberately-deleted-object case: serve the pulled copy and fence with
+        # nil, so the first flush RECREATES the object via If-None-Match:* (never a
+        # clobber). Drop the now-wrong provenance sidecar so a crash before that
+        # flush doesn't strand the next open fencing on the vanished etag.
         {:ok, nil} ->
-          {:ok, etag}
+          File.rm(etag_sidecar(path))
+          {:ok, nil}
 
         {:ok, current} when warm? ->
           write_etag_sidecar(path, current)
