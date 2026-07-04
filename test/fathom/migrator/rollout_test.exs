@@ -132,6 +132,61 @@ defmodule Fathom.Migrator.RolloutTest do
       assert {:ok, 1} = Migrator.revert(2, 1, yank: false)
       assert Migrator.head() == 2, "a canary revert must be able to keep the release live"
     end
+
+    # Round-2 #22: yank excluded executing/suspended, so a job mid-copy (statements
+    # already fetched) survived the yank, fenced, and cut its shard over to the
+    # yanked version AFTER revert/3 read shards_at_version — stranding it above HEAD
+    # where no laggard sweep converges it. Cancelling an executing job kills it
+    # safely: the copy's `after` releases the lease and no cutover has happened.
+    test "yank cancels EXECUTING forward jobs targeting the version" do
+      {:ok, _} = Migrator.release(2, "bad", ["SELECT 1"])
+      {:ok, _} = Directory.resolve("e")
+      assert {:ok, 1} = Migrator.rollout()
+
+      # The job dequeues (executing) just before the yank.
+      {1, _} =
+        Repo.update_all(
+          from(j in Oban.Job,
+            where: j.worker == "Fathom.Migrator.ShardMigrationJob",
+            where: fragment("?->>'shard_id' = 'e'", j.args)
+          ),
+          set: [state: "executing", attempted_at: DateTime.utc_now()]
+        )
+
+      assert :ok = Migrator.yank(2)
+
+      assert [%{state: "cancelled"}] =
+               Repo.all(
+                 from(j in Oban.Job,
+                   where: j.worker == "Fathom.Migrator.ShardMigrationJob",
+                   where: fragment("?->>'shard_id' = 'e'", j.args)
+                 )
+               ),
+             "an executing forward job must be cancelled by the yank, not left to cut over"
+    end
+
+    # Round-2 #22 (the belt): a migration that completed IN the yank-cancel race
+    # window leaves its shard active at the yanked version, above HEAD — invisible
+    # to shards_at_version at revert time and to every laggard sweep after. The
+    # reconcile sweep must enqueue its revert.
+    test "the reconcile sweep enqueues reverts for shards stranded on a yanked version" do
+      {:ok, _} = Migrator.release(1, "good", ["SELECT 1"])
+      {:ok, _} = Migrator.release(2, "bad", ["SELECT 1"])
+
+      # The fleet reverted 2 → 1 (yanking 2) while this shard's migration was
+      # completing: it lands on v2 AFTER the revert's shard-set read.
+      assert :ok = Migrator.yank(2)
+      {:ok, _} = Directory.resolve("stranded")
+      {:ok, _} = Directory.cutover("stranded", 2)
+      assert Migrator.head() == 1
+
+      assert :ok = perform_job(ReconcileJob, %{})
+
+      assert_enqueued(
+        worker: RevertJob,
+        args: %{"shard_id" => "stranded", "to_version" => 1}
+      )
+    end
   end
 
   # Expert review #25: migration_failed was a terminal state with no exit path —

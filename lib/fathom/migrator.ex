@@ -90,16 +90,54 @@ defmodule Fathom.Migrator do
       release ->
         {:ok, _} = release |> Ecto.Changeset.change(yanked: true) |> Repo.update()
 
+        # ALL live states, including executing/suspended (expert review round-2 #22):
+        # an executing job already fetched its statements, so it would keep running
+        # past the yank, fence, and cut the shard over to the yanked version AFTER
+        # revert/3 read shards_at_version — stranding it (schema_version > head means
+        # no laggard sweep ever sees it). Cancelling an executing job kills it, and
+        # the migration aborts safely: the lease is released in the copy's `after`,
+        # and no cutover has happened yet. The ReconcileJob's stranded sweep is the
+        # belt for any job that completes in the cancel's race window.
         Oban.cancel_all_jobs(
           from(j in Job,
             where: j.worker == "Fathom.Migrator.ShardMigrationJob",
-            where: j.state in ["scheduled", "available", "retryable"],
+            where: j.state in @unique_states,
             where: fragment("(?->>'target')::bigint = ?", j.args, ^version)
           )
         )
 
         refresh_head_cache()
         :ok
+    end
+  end
+
+  @doc """
+  Enqueues reverts for active shards stranded ON a yanked version above HEAD
+  (expert review round-2 #22): a migration that completed in the yank's race window
+  cut its shard over to the yanked version AFTER the fleet revert read
+  `shards_at_version`, and — being above HEAD — no laggard sweep ever converges it.
+  Reverts go to the current HEAD (the version the fleet reverted to), non-forced, so
+  the per-shard write-age guard still protects post-cutover writes. Shards at a
+  yanked version BELOW head are ordinary laggards; the forward rollout handles them.
+  Run from `ReconcileJob`; returns `{:ok, enqueued_count}`.
+  """
+  @spec revert_stranded() :: {:ok, non_neg_integer()}
+  def revert_stranded do
+    case head() do
+      0 ->
+        {:ok, 0}
+
+      head ->
+        yanked_above =
+          Repo.all(from(r in Release, where: r.yanked and r.version > ^head, select: r.version))
+
+        count =
+          Enum.reduce(yanked_above, 0, fn version, acc ->
+            {:ok, n} = revert(version, head, yank: false)
+            acc + n
+          end)
+
+        {:ok, count}
     end
   end
 

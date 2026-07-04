@@ -27,6 +27,21 @@ defmodule Fathom.Migrator.ReconcileJob do
     end
 
     {:ok, _count} = Migrator.rollout()
+
+    # Converge shards stranded ON a yanked version above HEAD (round-2 #22): a
+    # migration completing in the yank-cancel race window cut them over AFTER the
+    # fleet revert read its shard set, and no laggard sweep sees schema_version >
+    # head. Enqueue their reverts (idempotent — per-shard uniqueness dedups).
+    case Migrator.revert_stranded() do
+      {:ok, 0} ->
+        :ok
+
+      {:ok, n} ->
+        Logger.warning(
+          "reconcile: enqueued reverts for #{n} shard(s) stranded on yanked versions"
+        )
+    end
+
     :ok
   end
 end
