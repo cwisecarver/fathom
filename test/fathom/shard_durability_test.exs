@@ -746,6 +746,86 @@ defmodule Fathom.ShardDurabilityTest do
     Connection.close(ro)
   end
 
+  # Expert review #11 (#14 × #27): the reset broadcast set flushed_through: -1, but an
+  # IN-FLIGHT flush task restores flushed_through from flush_pending when it replies — a
+  # watermark captured from the OLD dead table (e.g. 3) while the restarted table counts
+  # from 0. The shard then compared clean until that many NEW writes accumulated:
+  # durability flushes skipped, and the idle stop took drop_clean — the local copy
+  # deleted WITHOUT uploading acknowledged post-restart writes. The invariant: a
+  # watermark is only meaningful against the counter table it was captured from
+  # (unflushed?/1 compares the WriteCounter generation; any mismatch ⇒ dirty).
+  test "a WriteCounter restart during an in-flight flush cannot mark the shard clean",
+       %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    test_pid = self()
+
+    # Park the flush task mid-PUT until released.
+    blocker = fn ->
+      send(test_pid, :flush_started)
+
+      receive do
+        :release_flush -> :ok
+      after
+        10_000 -> :ok
+      end
+    end
+
+    Application.put_env(:fathom, :faulty_before, {:flush, blocker})
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    send(coordinator, :durability_flush)
+    assert_receive :flush_started, 2_000
+    flush_pid = flush_task_pid(coordinator)
+
+    capture_log(fn ->
+      # The counter's owner dies while the flush task is parked; the restarted owner
+      # hands every shard a fresh empty table.
+      wc = Process.whereis(Fathom.Shard.WriteCounter)
+      ref = Process.monitor(wc)
+      Process.exit(wc, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^wc, :killed}, 1_000
+      assert wait_restarted(Fathom.Shard.WriteCounter, wc), "WriteCounter should restart"
+
+      # An acknowledged write lands in the FRESH table — its count sits far below the
+      # dead table's watermark the in-flight task is about to restore.
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('bob')"))
+
+      # Release the flush; its reply restores flushed_through from flush_pending.
+      send(flush_pid, :release_flush)
+      wait_flush_settled(coordinator, 400)
+
+      assert Shard.dirty?(coordinator),
+             "a watermark from the dead counter table must not classify the shard clean"
+
+      # And the idle stop must upload bob, not drop_clean the only copy holding it.
+      # (Un-park storage first: the terminate drop-flush goes through it too.)
+      Application.delete_env(:fathom, :faulty_before)
+      close_and_stop(shard, conn)
+    end)
+
+    {:ok, ro} = Connection.open(remote_db(shard))
+
+    assert {:ok, %{rows: [["alice"], ["bob"]]}} =
+             Connection.query(ro, "SELECT v FROM kv ORDER BY v", [])
+
+    Connection.close(ro)
+  end
+
   defp wait_restarted(name, old, tries \\ 200) do
     case Process.whereis(name) do
       pid when is_pid(pid) and pid != old -> _ = :sys.get_state(pid) && true

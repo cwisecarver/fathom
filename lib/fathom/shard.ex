@@ -266,12 +266,19 @@ defmodule Fathom.Shard do
         # A cold pull is clean (local == storage); a warm restart may hold un-flushed writes, so
         # init_flushed_through/2 seeds it one behind ⇒ dirty. Clean shards skip the durability
         # upload — the durability-storm fix (findings #1/#2, #27).
+        # Read the generation BEFORE the count: a WriteCounter restart between the two
+        # then leaves a stale generation ⇒ dirty (the safe direction), never a fresh
+        # generation legitimizing a dead table's watermark (expert review #11).
+        counter_gen: WriteCounter.generation(),
         flushed_through: init_flushed_through(shard_id, warm?),
         flush_timer: nil,
-        # The in-flight off-process durability flush (expert review #27) and the
-        # watermark it will advance flushed_through to on success.
+        # The in-flight off-process durability flush (expert review #27), the watermark
+        # it will advance flushed_through to on success, and the counter generation that
+        # watermark was captured under (expert review #11 — restoring a watermark from a
+        # table that died mid-flight would read clean against the fresh table's counts).
         flush_task: nil,
         flush_pending: nil,
+        flush_pending_gen: nil,
         draining: false,
         drain_timer: nil,
         drain_reply_to: nil
@@ -576,7 +583,12 @@ defmodule Fathom.Shard do
         write_etag_sidecar(state.path, new_etag)
 
         {:noreply,
-         schedule_flush(%{state | flushed_through: state.flush_pending, etag: new_etag})}
+         schedule_flush(%{
+           state
+           | flushed_through: state.flush_pending,
+             counter_gen: state.flush_pending_gen,
+             etag: new_etag
+         })}
 
       # The data PUT's If-Match failed (412). The OBJECT changed — but a 412 is NOT
       # proof of a STEAL (expert review #2): our own PUT can land server-side while its
@@ -644,7 +656,10 @@ defmodule Fathom.Shard do
   # #14): every count is now 0 while our flushed_through watermark may be ahead, so a
   # dirty shard would compare clean and drop_clean would delete un-flushed writes.
   # Unknown state must flush: force the watermark below any possible count; the next
-  # successful flush re-anchors it to the fresh counter.
+  # successful flush re-anchors it to the fresh counter. The generation compare in
+  # unflushed?/1 (expert review #11) is the primary guard — it holds even when this
+  # message can't land (an in-flight flush restoring flush_pending over the -1, or a
+  # coordinator already in terminate); this handler remains as the eager belt.
   def handle_info(:write_counter_reset, state) do
     {:noreply, %{state | flushed_through: -1}}
   end
@@ -744,11 +759,19 @@ defmodule Fathom.Shard do
             # Capture the write count BEFORE snapshotting: a write landing during the
             # snapshot/upload bumps the counter past this, so the shard stays dirty and
             # re-flushes next interval — never silently cleared (findings #1/#2/#27).
+            # Generation before count, same reasoning as init (expert review #11).
+            pending_gen = WriteCounter.generation()
             flushed_to = WriteCounter.count(state.id)
             snapshot_state = Map.take(state, [:id, :path, :etag])
             task = Task.async(fn -> snapshot_and_upload(snapshot_state) end)
 
-            {:noreply, %{state | flush_task: task, flush_pending: flushed_to}}
+            {:noreply,
+             %{
+               state
+               | flush_task: task,
+                 flush_pending: flushed_to,
+                 flush_pending_gen: pending_gen
+             }}
 
           # Lost the lease — self-fence (stop without flushing).
           :superseded ->
@@ -922,7 +945,14 @@ defmodule Fathom.Shard do
         case Storage.object_etag(state.id) do
           {:ok, etag} when not is_nil(etag) ->
             write_etag_sidecar(state.path, etag)
-            {:ok, %{state | etag: etag, flushed_through: state.flush_pending}}
+
+            {:ok,
+             %{
+               state
+               | etag: etag,
+                 flushed_through: state.flush_pending,
+                 counter_gen: state.flush_pending_gen
+             }}
 
           _ ->
             {:ok, state}
@@ -965,7 +995,16 @@ defmodule Fathom.Shard do
 
   # The shard is dirty — holds writes not yet flushed to storage — iff its write counter has
   # advanced past the last successfully-flushed watermark (finding #27). Lock-free ETS read.
-  defp unflushed?(state), do: WriteCounter.count(state.id) > state.flushed_through
+  # The watermark only means anything against the table it was captured from: if the
+  # WriteCounter restarted since (fresh empty table, counts near 0), a watermark from the
+  # dead table would read clean until that many NEW writes accumulate, and drop_clean would
+  # delete un-uploaded writes (expert review #11). Generation mismatch ⇒ unknown ⇒ dirty.
+  # This also covers the terminate path, where the reset broadcast can no longer be
+  # processed — the generation is read from persistent_term, not the mailbox.
+  defp unflushed?(state) do
+    state.counter_gen != WriteCounter.generation() or
+      WriteCounter.count(state.id) > state.flushed_through
+  end
 
   # Seed the flushed watermark at open. A cold pull is clean (local == storage) ⇒ watermark ==
   # count ⇒ not dirty. A warm restart may hold un-flushed local writes (incl. after a crash where
@@ -1124,7 +1163,14 @@ defmodule Fathom.Shard do
     case Task.yield(task, 30_000) || Task.shutdown(task) do
       {:ok, {:ok, new_etag}} ->
         write_etag_sidecar(state.path, new_etag)
-        %{state | flush_task: nil, flushed_through: state.flush_pending, etag: new_etag}
+
+        %{
+          state
+          | flush_task: nil,
+            flushed_through: state.flush_pending,
+            counter_gen: state.flush_pending_gen,
+            etag: new_etag
+        }
 
       _ ->
         %{state | flush_task: nil}

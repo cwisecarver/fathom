@@ -61,6 +61,16 @@ defmodule Fathom.Shard.WriteCounter do
     ArgumentError -> 0
   end
 
+  @doc """
+  The counter-table generation: bumped every time the owner (re)starts with a fresh empty
+  table. Coordinators anchor their `flushed_through` watermark to the generation it was
+  captured under (expert review #11); a mismatch means the watermark refers to a dead
+  table whose counts are gone — unknown state, so the shard must read dirty. `-1` before
+  the first boot orders below any real generation.
+  """
+  @spec generation() :: integer()
+  def generation, do: :persistent_term.get({__MODULE__, :generation}, -1)
+
   @doc "Drops `shard_id`'s row — called from `Fathom.Shard.terminate` so stopped shards don't leak."
   @spec forget(String.t()) :: :ok
   def forget(shard_id) do
