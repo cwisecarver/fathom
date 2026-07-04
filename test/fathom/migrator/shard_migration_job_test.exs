@@ -309,4 +309,37 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
 
     assert {:ok, %{schema_version: 1}} = Directory.get(shard)
   end
+
+  # Round-2 #21a: an EXECUTING RevertJob already deserialized its args, so the force
+  # sweep's jsonb row update couldn't reach it — the execution hit the write-age
+  # guard, returned {:cancel, guard} (terminal), and the operator's explicit
+  # force: true was silently dropped (the sweep's dedup had already counted this job
+  # as handled). The invariant: a guard refusal re-checks the ROW args before going
+  # terminal, and snoozes to re-run when they changed mid-execution.
+  test "a guard refusal re-runs when the row args were force-upgraded mid-execution",
+       %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+
+    # Post-cutover activity — the non-forced revert will hit the write-age guard.
+    {:ok, _} = Directory.resolve(shard)
+
+    stale_args = %{"shard_id" => shard, "to_version" => 1, "force" => false}
+    {:ok, job} = Oban.insert(RevertJob.new(stale_args))
+
+    # A force sweep rewrites the ROW while the job is executing (the running
+    # execution still carries the stale deserialized copy).
+    {1, _} =
+      Fathom.Repo.update_all(
+        from(j in Oban.Job, where: j.id == ^job.id),
+        set: [args: %{"shard_id" => shard, "to_version" => 1, "force" => true}]
+      )
+
+    # Drive perform with the STALE args + the real row id, as the in-flight
+    # execution would. Pre-fix: {:cancel, :writes_since_cutover} — force dropped.
+    capture_log(fn ->
+      assert {:snooze, 1} = RevertJob.perform(%{job | args: stale_args})
+    end)
+  end
 end

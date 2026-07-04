@@ -176,10 +176,15 @@ defmodule Fathom.Migrator do
     # force: true — any shard whose first RevertJob was still in flight (snoozing on
     # :shard_busy / {:held, _}) was silently dropped from the force sweep; the surviving
     # non-force job then hit the guard and cancelled, so the shard was never reverted
-    # despite the explicit force. Upgrade in-flight jobs' args to force: true instead of
-    # skipping them; they count toward the returned total.
+    # despite the explicit force. Upgrade in-flight jobs' args instead of skipping
+    # them; they count toward the returned total. Round-2 #21 tightened this to the
+    # WHOLE operation: upgrading only `force` while a snoozing job targeted a
+    # different to_version force-reverted the shard (a destructive discard) to the
+    # WRONG version — so the retarget sets to_version too (last operator command wins).
     forced =
-      if force?, do: force_inflight_reverts(Enum.map(shards, & &1.shard_id)), else: 0
+      if force?,
+        do: retarget_inflight_reverts(Enum.map(shards, & &1.shard_id), to_version),
+        else: 0
 
     enqueued =
       shards
@@ -262,7 +267,16 @@ defmodule Fathom.Migrator do
     %{remaining: length(remaining), in_flight: in_flight, failed: Directory.count_failed()}
   end
 
-  defp force_inflight_reverts(shard_ids) do
+  # Rewrite in-flight revert jobs to THIS force sweep's operation — force: true AND
+  # its to_version (round-2 #21; see the call site). An EXECUTING job's deserialized
+  # args can't be changed here, but a guard refusal re-checks its row before going
+  # terminal (RevertJob), so the upgrade still lands.
+  defp retarget_inflight_reverts(shard_ids, to_version) do
+    # type/2 so the patch binds as a jsonb OBJECT — a plain/pre-encoded binding goes
+    # over as a jsonb string scalar, and `object || scalar` builds a 2-element array
+    # instead of merging.
+    patch = %{"force" => true, "to_version" => to_version}
+
     shard_ids
     |> Enum.chunk_every(@enqueue_chunk)
     |> Enum.reduce(0, fn chunk, acc ->
@@ -271,8 +285,10 @@ defmodule Fathom.Migrator do
           where: j.worker == "Fathom.Migrator.RevertJob",
           where: j.state in @unique_states,
           where: fragment("?->>'shard_id'", j.args) in ^chunk,
-          where: fragment("(?->>'force')::boolean IS DISTINCT FROM true", j.args),
-          update: [set: [args: fragment(~s(? || '{"force": true}'::jsonb), j.args)]]
+          where:
+            fragment("(?->>'force')::boolean IS DISTINCT FROM true", j.args) or
+              fragment("(?->>'to_version')::bigint IS DISTINCT FROM ?", j.args, ^to_version),
+          update: [set: [args: fragment("? || ?", j.args, type(^patch, :map))]]
         )
         |> Repo.update_all([])
 

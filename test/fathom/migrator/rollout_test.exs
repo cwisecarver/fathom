@@ -215,6 +215,27 @@ defmodule Fathom.Migrator.RolloutTest do
              "in-flight revert jobs must be upgraded to force: true"
     end
 
+    # Round-2 #21b: the force upgrade set only `force: true`, keeping the in-flight
+    # job's OLD to_version — so `revert(5, 3, force: true)` while a non-forced
+    # revert(5→4) snoozed would force-revert the shard (a destructive discard of
+    # post-cutover writes) to v4, never reaching v3, with the →3 job deduped away.
+    # The invariant: a force sweep retargets the WHOLE operation — last command wins.
+    test "a forced re-issue retargets in-flight revert jobs to its own to_version" do
+      {:ok, _} = Directory.resolve("retarget")
+      {:ok, _} = Directory.cutover("retarget", 5)
+
+      # A non-forced revert 5→4 is in flight (never executed — manual testing mode).
+      assert {:ok, 1} = Migrator.revert(5, 4)
+      assert [%{args: %{"to_version" => 4}}] = all_enqueued(worker: RevertJob)
+
+      # The operator force-reverts 5→3 instead.
+      assert {:ok, 1} = Migrator.revert(5, 3, force: true)
+
+      assert [job] = all_enqueued(worker: RevertJob)
+      assert job.args["to_version"] == 3, "the retarget must carry the NEW to_version"
+      assert job.args["force"] == true
+    end
+
     test "RevertJob reverts a migrated shard back to the prior version" do
       shard = "revert_#{System.unique_integer([:positive])}"
 

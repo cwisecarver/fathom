@@ -56,14 +56,22 @@ defmodule Fathom.Migrator.RevertJob do
       # The force-guard refused (finding #13): the shard was written since its cutover, so the
       # revert would discard tenant data. Deterministic — retrying can only see MORE writes —
       # so cancel rather than burn retries; the operator re-issues with force: true to confirm
-      # the discard.
+      # the discard. EXCEPT (round-2 #21a): a force sweep may have rewritten this job's ROW
+      # args while we were executing — the jsonb update can't reach the copy this execution
+      # deserialized — and going terminal would silently drop the operator's explicit force.
+      # Re-check the row first; changed args snooze so the next execution runs with them.
       {:error, {guard, details}} when guard in [:writes_since_cutover, :unknown_write_age] ->
-        Logger.warning(
-          "shard #{shard_id}: revert REFUSED (#{guard}) — post-cutover writes would be " <>
-            "discarded; re-run with force: true to confirm (#{inspect(details)})"
-        )
+        if row_args_changed?(id, args) do
+          Logger.info("shard #{shard_id}: revert args upgraded mid-execution; re-running")
+          {:snooze, 1}
+        else
+          Logger.warning(
+            "shard #{shard_id}: revert REFUSED (#{guard}) — post-cutover writes would be " <>
+              "discarded; re-run with force: true to confirm (#{inspect(details)})"
+          )
 
-        {:cancel, guard}
+          {:cancel, guard}
+        end
 
       {:error, reason} ->
         handle_error(job, shard_id, reason)
@@ -87,6 +95,18 @@ defmodule Fathom.Migrator.RevertJob do
     Logger.warning("shard #{shard_id}: revert error, will retry (#{inspect(reason)})")
     {:error, reason}
   end
+
+  # Whether the job's persisted row args differ from the args this execution ran
+  # with (a mid-execution force retarget — round-2 #21a). A nil/absent id (e.g.
+  # Oban.Testing's unsaved job struct) reads as unchanged.
+  defp row_args_changed?(id, args) when is_integer(id) do
+    case Fathom.Repo.get(Oban.Job, id) do
+      %Oban.Job{args: current} -> current != args
+      _ -> false
+    end
+  end
+
+  defp row_args_changed?(_id, _args), do: false
 
   defp cancel_retirement(shard_id, version) do
     Oban.cancel_all_jobs(
