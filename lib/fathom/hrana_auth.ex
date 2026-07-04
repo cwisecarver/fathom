@@ -133,10 +133,17 @@ defmodule Fathom.HranaAuth do
   def revoke(shard_id) do
     case ShardId.cast(shard_id) do
       {:ok, canonical} ->
-        version = Directory.bump_token_version(canonical)
-        Revocations.put(canonical, version)
-        notify_revocation(canonical, version)
-        {:ok, version}
+        # canonical passed ShardId.cast, so a changeset refusal here means the
+        # directory's own validation disagrees — surface it as the same error.
+        case Directory.bump_token_version(canonical) do
+          {:ok, version} ->
+            Revocations.put(canonical, version)
+            notify_revocation(canonical, version)
+            {:ok, version}
+
+          {:error, _changeset} ->
+            {:error, :invalid_shard_id}
+        end
 
       :error ->
         {:error, :invalid_shard_id}

@@ -258,19 +258,38 @@ defmodule Fathom.Directory do
   @doc """
   Revokes every outstanding Hrana token for `shard_id` by bumping its
   `token_version` (expert review #31). Registers the shard first if unknown (so a
-  revoke is never lost to a not-yet-recorded shard). Returns the new version.
+  revoke is never lost to a not-yet-recorded shard) — WITHOUT bumping
+  `last_active_at` on an existing row (round-2 #32: a revoke is operator action,
+  not tenant activity; the resolve/1 it used to call phantom-bumped recency, so
+  revoking during an incident made the subsequent revert's write-age guard cancel
+  untouched shards). Returns `{:ok, new_version}`, or `{:error, changeset}` for an
+  invalid id (previously a MatchError crash).
   """
-  @spec bump_token_version(String.t()) :: pos_integer()
+  @spec bump_token_version(String.t()) :: {:ok, pos_integer()} | {:error, Ecto.Changeset.t()}
   def bump_token_version(shard_id) do
-    {:ok, _} = resolve(shard_id)
+    register =
+      %Shard{}
+      |> Shard.changeset(%{
+        shard_id: shard_id,
+        schema_version: 0,
+        status: "active",
+        last_active_at: DateTime.utc_now()
+      })
+      |> Repo.insert(on_conflict: :nothing, conflict_target: :shard_id)
 
-    {1, [version]} =
-      Repo.update_all(
-        from(s in Shard, where: s.shard_id == ^shard_id, select: s.token_version),
-        inc: [token_version: 1]
-      )
+    case register do
+      {:ok, _} ->
+        {1, [version]} =
+          Repo.update_all(
+            from(s in Shard, where: s.shard_id == ^shard_id, select: s.token_version),
+            inc: [token_version: 1]
+          )
 
-    version
+        {:ok, version}
+
+      {:error, changeset} ->
+        {:error, changeset}
+    end
   end
 
   @doc """

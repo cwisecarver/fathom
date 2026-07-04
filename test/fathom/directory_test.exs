@@ -34,6 +34,38 @@ defmodule Fathom.DirectoryTest do
     end
   end
 
+  describe "bump_token_version/1" do
+    # Round-2 #32: bump_token_version called resolve/1, phantom-bumping
+    # last_active_at — a revoke is operator action, not tenant activity, so
+    # revoking during an incident made the subsequent revert's write-age guard
+    # cancel untouched shards (the #40 class via the token path). And the
+    # {:ok, _} = resolve match CRASHED on an invalid id.
+    test "does not bump last_active_at on an existing shard" do
+      {:ok, before} = Directory.resolve("acme")
+      {:ok, _} = Directory.cutover("acme", 1)
+      {:ok, at_cutover} = Directory.get("acme")
+
+      assert {:ok, 2} = Directory.bump_token_version("acme")
+
+      {:ok, after_bump} = Directory.get("acme")
+
+      assert DateTime.compare(after_bump.last_active_at, at_cutover.last_active_at) == :eq,
+             "a revoke must not read as tenant activity (it would guard-cancel the next revert)"
+
+      assert after_bump.token_version == before.token_version + 1
+    end
+
+    test "registers an unknown shard so the revoke is never lost" do
+      assert {:ok, 2} = Directory.bump_token_version("brand_new")
+      assert {:ok, %Shard{token_version: 2, schema_version: 0}} = Directory.get("brand_new")
+    end
+
+    test "returns an error tuple for an invalid id instead of crashing" do
+      assert {:error, changeset} = Directory.bump_token_version("bad/../id")
+      refute changeset.valid?
+    end
+  end
+
   describe "get/1" do
     test "returns :error for an unknown shard, the entry once registered" do
       assert Directory.get("missing") == :error
