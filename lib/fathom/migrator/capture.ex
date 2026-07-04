@@ -126,8 +126,8 @@ defmodule Fathom.Migrator.Capture do
   end
 
   # Record pending captures IN ORDER, stopping at the first failure — each release
-  # takes head()+1, so recording a later capture past a failed earlier one would
-  # assign the fleet versions out of order.
+  # takes next_version(), so recording a later capture past a failed earlier one
+  # would assign the fleet versions out of order.
   defp drain_pending([]), do: []
 
   defp drain_pending([statements | rest] = all) do
@@ -151,13 +151,15 @@ defmodule Fathom.Migrator.Capture do
 
   defp retry_ms, do: Application.get_env(:fathom, :capture_retry_ms, 5_000)
 
-  # The version is computed per attempt (head()+1 under the unique index as the
-  # arbiter), so a retry after the control plane recovers picks the then-current
-  # head. Rescue/catch: a Postgres outage RAISES from Repo (it doesn't return an
-  # error tuple), and a crash here would take the whole capture state — including
-  # every pending buffer this path exists to preserve — down with it.
+  # The version is computed per attempt (next_version() under the unique index as
+  # the arbiter — NOT head()+1, which excludes yanked rows and would collide on
+  # the tombstoned number forever after a yank, expert review #10), so a retry
+  # after the control plane recovers picks the then-current max. Rescue/catch: a
+  # Postgres outage RAISES from Repo (it doesn't return an error tuple), and a
+  # crash here would take the whole capture state — including every pending
+  # buffer this path exists to preserve — down with it.
   defp record(statements) do
-    version = Migrator.head() + 1
+    version = Migrator.next_version()
 
     case Migrator.release(version, "auto-captured", statements) do
       {:ok, _} ->

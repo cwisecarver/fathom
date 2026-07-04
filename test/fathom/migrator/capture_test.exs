@@ -105,5 +105,31 @@ defmodule Fathom.Migrator.CaptureTest do
     test "a commit with no tracked transaction is a no-op" do
       assert Capture.commit(make_ref(), 9) == :noop
     end
+
+    # Expert review #10: `head/0` excludes yanked releases (so a revert sticks, #12),
+    # but capture allocated `head() + 1` — after any yank the yanked row still
+    # occupies its version number, so the next capture collided on the unique
+    # version index FOREVER: the 5 s retry recomputed the same colliding number,
+    # `drain_pending` stopped at the first failure, and every later capture wedged
+    # behind it (template schema silently forks from fleet schema, the #19 failure,
+    # via the routine revert-yank path). The invariant: a yanked version is a
+    # tombstone, not a free slot — capture allocates PAST it (next_version/0).
+    test "capture after a yank allocates past the yanked version, not onto it" do
+      conn = make_ref()
+      Capture.begin(conn, 0)
+      Capture.append(conn, "stmt-v1")
+      assert {:recorded, 1} = Capture.commit(conn, 1)
+
+      assert :ok = Migrator.yank(1)
+      assert Migrator.head() == 0, "yank must drop the version from HEAD"
+
+      Capture.begin(conn, 1)
+      Capture.append(conn, "stmt-v2")
+      assert {:recorded, 2} = Capture.commit(conn, 2)
+
+      assert Migrator.head() == 2
+      assert Migrator.statements(2) == ["stmt-v2"]
+      assert Migrator.statements(1) == nil, "the yanked version stays unappliable"
+    end
   end
 end

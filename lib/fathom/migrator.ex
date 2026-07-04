@@ -64,6 +64,18 @@ defmodule Fathom.Migrator do
   end
 
   @doc """
+  The next version number a new release may allocate: `max(version) + 1` INCLUDING
+  yanked releases (expert review #10). A yanked version is a tombstone, not a free
+  slot — `head/0` excludes yanked for rollout targeting, so allocating from
+  `head() + 1` after a yank would collide on the unique version index forever,
+  permanently wedging capture.
+  """
+  @spec next_version() :: pos_integer()
+  def next_version do
+    (Repo.aggregate(Release, :max, :version) || 0) + 1
+  end
+
+  @doc """
   Yanks `version`: drops it from HEAD, makes its statements unappliable, cancels any
   pending forward migration jobs targeting it, and refreshes this node's HeadCache
   (other nodes converge within the cache TTL). `Migrator.revert/3` yanks the
