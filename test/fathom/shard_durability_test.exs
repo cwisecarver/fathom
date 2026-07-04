@@ -704,6 +704,73 @@ defmodule Fathom.ShardDurabilityTest do
     Connection.close(ro)
   end
 
+  # Expert review #12: the sidecar is a plain O_TRUNC File.write, and power loss
+  # classically leaves a ZERO-LENGTH file. read_etag_sidecar mapped {:ok, ""} to
+  # :missing — the legacy no-provenance branch that ADOPTS the store's current etag —
+  # so a crashed node whose shard was stolen/written/released elsewhere came back,
+  # adopted the newer lineage's etag, and its next flush clobbered it with a valid
+  # If-Match: the exact #1 clobber, through the crash-consistency hole in #1's own
+  # safe-direction argument. The invariant: only a truly ABSENT sidecar is legacy;
+  # an empty/unreadable one is unknown provenance and must quarantine.
+  test "a torn-to-empty sidecar quarantines the local copy instead of adopting the store's lineage",
+       %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+    on_exit(fn -> File.rm_rf(local_db(shard) <> ".forked") end)
+
+    # Node "A": open a brand-new shard, write locally, then CRASH — local file left.
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('a-fork')"))
+    {:ok, coordinator} = Shards.ensure(shard)
+    ref = Process.monitor(coordinator)
+    Process.exit(coordinator, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^coordinator, :killed}, 1_000
+    _ = :sys.get_state(Fathom.ShardSupervisor)
+    ShardExecutor.close(conn)
+
+    # Node "B" (elsewhere): steals, flushes NEW acknowledged writes, releases.
+    b = Path.join(System.tmp_dir!(), "seedb_#{shard}.db")
+    {:ok, cb} = Connection.open(b)
+    :ok = Connection.exec(cb, "CREATE TABLE kv (v TEXT)")
+    :ok = Connection.exec(cb, "INSERT INTO kv VALUES ('b-write')")
+    :ok = Connection.exec(cb, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(cb)
+    :ok = Storage.flush(shard, b)
+    for s <- ["", "-wal", "-shm"], do: File.rm(b <> s)
+    File.rm(Path.join(@remote_dir, "#{shard}.lock"))
+
+    # The crash tore A's sidecar to EMPTY (O_TRUNC + power loss).
+    File.write!(local_db(shard) <> ".etag", "")
+
+    # "A" returns: unknown provenance must quarantine and re-pull B's lineage —
+    # pre-fix the empty sidecar read as legacy-missing, adopted B's etag, and the
+    # idle flush clobbered B's acknowledged write with a valid If-Match.
+    capture_log(fn ->
+      {:ok, conn2} = ShardExecutor.open(shard)
+
+      assert {:ok, %StmtResult{rows: [["b-write"]]}} =
+               ShardExecutor.execute(conn2, stmt("SELECT v FROM kv WHERE v = 'b-write'")),
+             "the returning node must serve the stored lineage, not its unknown-provenance fork"
+
+      assert {:ok, %StmtResult{rows: []}} =
+               ShardExecutor.execute(conn2, stmt("SELECT v FROM kv WHERE v = 'a-fork'"))
+
+      assert File.exists?(local_db(shard) <> ".forked"),
+             "the unknown-provenance local copy must be quarantined for recovery, not deleted"
+
+      close_and_stop(shard, conn2)
+    end)
+
+    # After the full idle flush cycle, B's acknowledged write is still the durable truth.
+    {:ok, ro} = Connection.open(remote_db(shard))
+
+    assert {:ok, %{rows: [["b-write"]]}} =
+             Connection.query(ro, "SELECT v FROM kv WHERE v = 'b-write'", []),
+           "the stored lineage must never be clobbered off a torn sidecar"
+
+    Connection.close(ro)
+  end
+
   # Expert review #14: the WriteCounter's ETS table dies with its owner, and a restart
   # handed every open coordinator a FRESH EMPTY table — count(id) = 0 — while each kept
   # its old flushed_through watermark, so `count > flushed_through` classified every

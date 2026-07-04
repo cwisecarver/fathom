@@ -424,6 +424,13 @@ defmodule Fathom.Shard do
       {:ok, etag} ->
         {:ok, etag}
 
+      # Normally unreachable — quarantined_fork?/2 already quarantined a corrupt
+      # sidecar before warm? could hold — but if it ever surfaces (the quarantine's
+      # sidecar rm failed), NEVER adopt-current off unknown provenance (expert
+      # review #12); fail the open instead.
+      :corrupt ->
+        {:error, :sidecar_corrupt}
+
       :missing ->
         Logger.warning(
           "shard #{shard_id}: warm file has no provenance sidecar (legacy); adopting current etag"
@@ -1072,9 +1079,17 @@ defmodule Fathom.Shard do
 
   defp read_etag_sidecar(path) do
     case File.read(etag_sidecar(path)) do
-      {:ok, ""} -> :missing
+      # A zero-length sidecar is a TORN WRITE, not "no provenance" (expert review
+      # #12): File.write is O_TRUNC and power loss classically leaves the truncated
+      # empty file. Mapping it to :missing fell through to the legacy adopt-current
+      # branch — the exact clobber the sidecar exists to prevent. Corrupt routes to
+      # quarantine instead (spurious but recoverable, the safe direction).
+      {:ok, ""} -> :corrupt
       {:ok, etag} -> {:ok, etag}
-      {:error, _} -> :missing
+      # Only a truly ABSENT sidecar is legacy (pre-provenance warm file).
+      {:error, :enoent} -> :missing
+      # Unreadable (eacces/eio/...) is unknown provenance, same safe direction.
+      {:error, _} -> :corrupt
     end
   end
 
@@ -1088,6 +1103,13 @@ defmodule Fathom.Shard do
       :missing ->
         false
 
+      # Torn/unreadable sidecar (expert review #12): the local copy's provenance is
+      # unknown, so it cannot be trusted to continue the stored lineage — quarantine
+      # it and re-pull, exactly as a detected fork.
+      :corrupt ->
+        quarantine_fork!(shard_id, path, :corrupt_sidecar)
+        true
+
       {:ok, sidecar_etag} ->
         case Storage.object_etag(shard_id) do
           {:ok, ^sidecar_etag} ->
@@ -1100,7 +1122,7 @@ defmodule Fathom.Shard do
             false
 
           {:ok, _newer} ->
-            quarantine_fork!(shard_id, path)
+            quarantine_fork!(shard_id, path, :diverged)
             true
 
           {:error, _unreachable} ->
@@ -1109,16 +1131,25 @@ defmodule Fathom.Shard do
     end
   end
 
-  defp quarantine_fork!(shard_id, path) do
+  defp quarantine_fork!(shard_id, path, reason) do
     dest = path <> ".forked"
     Enum.each(["", "-wal", "-shm"], &File.rm(dest <> &1))
     Enum.each(["", "-wal", "-shm"], &File.rename(path <> &1, dest <> &1))
     File.rm(etag_sidecar(path))
 
+    cause =
+      case reason do
+        :corrupt_sidecar ->
+          "provenance sidecar torn/unreadable (crash mid-write), lineage unknown (expert review #12)"
+
+        :diverged ->
+          "another node wrote and released while this one was down (expert review #1)"
+      end
+
     Logger.error(
-      "shard #{shard_id}: local copy FORKED from the stored lineage (another node wrote " <>
-        "and released while this one was down); quarantined at #{dest} and re-pulling. " <>
-        "Operator recovery: the forked writes live in that file (expert review #1)."
+      "shard #{shard_id}: local copy FORKED from the stored lineage — #{cause}; " <>
+        "quarantined at #{dest} and re-pulling. " <>
+        "Operator recovery: the forked writes live in that file."
     )
 
     :telemetry.execute([:fathom, :shard, :forked], %{count: 1}, %{shard_id: shard_id})
