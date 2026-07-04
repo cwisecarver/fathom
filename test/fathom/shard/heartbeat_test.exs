@@ -248,6 +248,27 @@ defmodule Fathom.Shard.HeartbeatTest do
 
     assert Storage.read_heartbeat(prev_owner) == :not_found,
            "a stale-by-margin predecessor heartbeat is provably dead and clears at boot"
+
+    # Round-2 #34: the fast-restart path was incomplete — post-clear, the
+    # predecessor's RECENTLY-RENEWED locks (fresh TTL) fell to the :not_found
+    # lock-TTL fallback and blocked this node ~TTL+margin per recently-held shard.
+    # A PROVEN-dead incarnation's fresh lock must be stealable immediately.
+    dir = Application.get_env(:fathom, Fathom.Shard.Storage.Local)[:dir]
+    File.mkdir_p!(dir)
+
+    File.write!(
+      Path.join(dir, "sh34.lock"),
+      Jason.encode!(%{
+        "owner" => prev_owner,
+        "epoch" => 1,
+        "expires_at_ms" => System.system_time(:millisecond) + 60_000
+      })
+    )
+
+    assert {:ok, %{epoch: 2, took_over: true}} =
+             Storage.acquire_lease("sh34", "contender@node", 30_000),
+           "a proven-dead incarnation's fresh lock must be stealable immediately, " <>
+             "not after the ~35s lock-TTL fallback"
   end
 
   # Expert review #8: the lapse generation was process-local state resetting to 0 on

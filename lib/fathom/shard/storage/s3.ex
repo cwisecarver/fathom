@@ -568,8 +568,15 @@ defmodule Fathom.Shard.Storage.S3 do
       # Without this, a live owner that renews its lock per-shard (the legacy fence) looks
       # instantly dead and any contender steals it. The heartbeat stays primary; this is the
       # pre-heartbeat lease-TTL fence, applied only when there is no heartbeat to consult.
+      # Exception (round-2 #34): this node's PROVEN-DEAD previous incarnation (heartbeat
+      # verified stale/frozen and cleared) — its recently-renewed locks must not block
+      # the restarted node for TTL+margin. Exact owner match only.
       :not_found ->
-        if now <= lock_expires_at_ms + margin, do: :live, else: :dead
+        cond do
+          Storage.incarnation_dead?(other) -> :dead
+          now <= lock_expires_at_ms + margin -> :live
+          true -> :dead
+        end
 
       {:error, reason} ->
         {:error, reason}

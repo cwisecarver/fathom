@@ -214,7 +214,15 @@ defmodule Fathom.Shard.Storage.Local do
       # heartbeat was cleared): fall back to the lock's OWN TTL for liveness (finding #11), so
       # a live owner renewing its lock per-shard isn't instantly stolen. Heartbeat stays primary.
       :not_found ->
-        if now <= lock_expires_at_ms + margin, do: :live, else: :dead
+        cond do
+          # This node's PROVEN-DEAD previous incarnation (round-2 #34: heartbeat
+          # verified stale/frozen and cleared — see Fathom.Shard.Heartbeat): its
+          # recently-renewed locks would otherwise block the restarted node for
+          # TTL+margin through the fallback below. Exact owner match only.
+          Storage.incarnation_dead?(other) -> :dead
+          now <= lock_expires_at_ms + margin -> :live
+          true -> :dead
+        end
 
       {:error, reason} ->
         {:error, reason}

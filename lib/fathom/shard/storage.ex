@@ -368,6 +368,27 @@ defmodule Fathom.Shard.Storage do
   end
 
   @doc """
+  Record that `owner` — a previous incarnation of THIS node — was verified dead and
+  its heartbeat cleared (expert review round-2 #34; the proof-of-death rules are
+  #16's, in `Fathom.Shard.Heartbeat`). `incarnation_dead?/1` lets the backends'
+  `owner_live?` treat that exact owner's locks as stealable immediately instead of
+  waiting out the lock-TTL fallback (~TTL+margin of unavailability per
+  recently-held shard on every fast restart — the fallback exists for foreign
+  owners whose liveness we can't know, which a proven-dead predecessor is not).
+  """
+  @spec mark_incarnation_dead(String.t()) :: :ok
+  def mark_incarnation_dead(owner) do
+    :persistent_term.put({__MODULE__, :dead_incarnation}, owner)
+    :ok
+  end
+
+  @doc "Whether `owner` is the previous incarnation `mark_incarnation_dead/1` recorded. Exact string match, so migrator/foreign owners can never match."
+  @spec incarnation_dead?(String.t()) :: boolean()
+  def incarnation_dead?(owner) do
+    :persistent_term.get({__MODULE__, :dead_incarnation}, nil) == owner
+  end
+
+  @doc """
   Remove orphaned sibling temps of `base` older than `older_than_ms` (expert review
   round-2 #27): externally-killed downloads/snapshots (`Task.shutdown` brutal_kill,
   pull timeouts, the follower's `:kill_task`) strand uniquely-named `.dl.*` /

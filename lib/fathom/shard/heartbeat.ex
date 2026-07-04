@@ -190,6 +190,8 @@ defmodule Fathom.Shard.Heartbeat do
     case Storage.read_heartbeat(prev_owner) do
       {:ok, %{expires_at_ms: ^prev_exp}} ->
         _ = Storage.clear_heartbeat(prev_owner)
+        # Frozen expiry = no renewer = proven dead; see judge_previous (round-2 #34).
+        Storage.mark_incarnation_dead(prev_owner)
 
       {:ok, _advanced} ->
         Logger.error(
@@ -336,6 +338,10 @@ defmodule Fathom.Shard.Heartbeat do
 
       {:ok, %{expires_at_ms: exp}} when now > exp + margin ->
         _ = Storage.clear_heartbeat(prev_owner)
+        # Proven dead (round-2 #16) ⇒ its recently-renewed LOCKS are also dead —
+        # skip the lock-TTL fallback that would otherwise block this node ~TTL+margin
+        # per recently-held shard (round-2 #34).
+        Storage.mark_incarnation_dead(prev_owner)
         :ok
 
       {:ok, %{expires_at_ms: exp}} ->
