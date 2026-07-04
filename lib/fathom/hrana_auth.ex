@@ -117,9 +117,11 @@ defmodule Fathom.HranaAuth do
 
   @doc """
   Revokes every outstanding token for `shard_id` (expert review #31): bumps the
-  directory revocation version and refreshes this node's cache so the floor takes
-  effect immediately here (other nodes converge within the cache TTL). Returns the
-  new version, or `{:error, :invalid_shard_id}`.
+  directory revocation version, refreshes this node's cache so the floor takes
+  effect immediately here, and pushes the new floor fleet-wide over Postgres
+  LISTEN/NOTIFY (round-2 #24 — no BEAM cluster, so PubSub can't cross nodes; a
+  lost notify still converges within the cache TTL). Returns the new version, or
+  `{:error, :invalid_shard_id}`.
   """
   @spec revoke(term()) :: {:ok, pos_integer()} | {:error, :invalid_shard_id}
   def revoke(shard_id) do
@@ -127,11 +129,23 @@ defmodule Fathom.HranaAuth do
       {:ok, canonical} ->
         version = Directory.bump_token_version(canonical)
         Revocations.put(canonical, version)
+        notify_revocation(canonical, version)
         {:ok, version}
 
       :error ->
         {:error, :invalid_shard_id}
     end
+  end
+
+  # Best-effort fleet push (round-2 #24): a notify failure must never fail the
+  # revoke — the directory bump is the durable truth and the TTL converges.
+  defp notify_revocation(shard_id, version) do
+    Oban.Notifier.notify(Oban, :fathom_revocations, %{shard_id: shard_id, version: version})
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
   end
 
   @doc """

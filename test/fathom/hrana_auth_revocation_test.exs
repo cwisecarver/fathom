@@ -69,6 +69,54 @@ defmodule Fathom.HranaAuthRevocationTest do
     assert HranaAuth.authorize(shard, token) == :ok
   end
 
+  # Round-2 #24: revoke/1 bumped the directory + the revoking node's ETS but pushed
+  # nothing to other nodes, so a revoked/leaked token kept opening streams on every
+  # OTHER node for up to a full cache TTL (30 s default). Fathom has no BEAM cluster
+  # (PubSub is node-local), so the push rides Postgres LISTEN/NOTIFY (Oban.Notifier).
+  # NOTIFY only fires on commit — invisible inside the test sandbox — so this drives
+  # the receiving side directly with the notifier's message shape: the notification
+  # must bump the local floor with NO directory read (the token 401s immediately).
+  test "a revocation notification bumps the local floor without a directory read" do
+    shard = uniq()
+    {:ok, token} = HranaAuth.token_for(shard)
+    Revocations.put(shard, 1)
+    assert HranaAuth.authorize(shard, token) == :ok
+
+    # Another node revoked: its notify arrives (no directory row exists here at all,
+    # so any effect must come from the notification, not a read-through).
+    send(
+      Process.whereis(Revocations),
+      {:notification, :fathom_revocations, %{"shard_id" => shard, "version" => 2}}
+    )
+
+    _ = :sys.get_state(Revocations)
+
+    assert {:error, %Filo.Error{status: 401}} = HranaAuth.authorize(shard, token),
+           "a revocation pushed from another node must take effect before the TTL"
+  end
+
+  test "a late or duplicate revocation notification never lowers the floor" do
+    shard = uniq()
+
+    send(
+      Process.whereis(Revocations),
+      {:notification, :fathom_revocations, %{"shard_id" => shard, "version" => 7}}
+    )
+
+    _ = :sys.get_state(Revocations)
+
+    # A stale notification (an earlier revoke's notify delivered late).
+    send(
+      Process.whereis(Revocations),
+      {:notification, :fathom_revocations, %{"shard_id" => shard, "version" => 3}}
+    )
+
+    _ = :sys.get_state(Revocations)
+
+    assert Revocations.floor(shard) == 7,
+           "a stale notification must never lower the floor this node already knows"
+  end
+
   test "tokens sign with the dedicated secret, independent of secret_key_base" do
     shard = uniq()
     {:ok, _} = Directory.resolve(shard)

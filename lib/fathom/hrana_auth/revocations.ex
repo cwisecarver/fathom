@@ -60,8 +60,28 @@ defmodule Fathom.HranaAuth.Revocations do
   def init(opts) do
     # public read_concurrency: verify/2 runs in the stream process and reads directly.
     :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
+
+    # Fleet-wide revocation push (expert review round-2 #24): a revoked token kept
+    # working on every OTHER node for up to a full TTL, because only the revoking
+    # node's cache was bumped. Fathom has no BEAM cluster, so Phoenix.PubSub cannot
+    # cross nodes — the one shared channel is Postgres, and Oban's LISTEN/NOTIFY
+    # notifier is already running on it. Best-effort: without it (Oban down, bench
+    # harness), the TTL remains the convergence backstop.
+    listen_for_revocations()
     {:ok, %{ttl_ms: Keyword.get(opts, :ttl_ms, ttl_ms())}}
   end
+
+  @impl true
+  def handle_info(
+        {:notification, :fathom_revocations, %{"shard_id" => shard_id, "version" => version}},
+        state
+      )
+      when is_binary(shard_id) and is_integer(version) do
+    put_max(shard_id, version)
+    {:noreply, state}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
 
   defp lookup(shard_id, now) do
     case :ets.lookup(@table, shard_id) do
@@ -88,6 +108,29 @@ defmodule Fathom.HranaAuth.Revocations do
     :ets.insert(@table, {shard_id, version, now + ttl_ms()})
   rescue
     ArgumentError -> :ok
+  end
+
+  # A late/duplicate notification must never LOWER the floor below what this node
+  # already knows (versions only rise; even an expired entry's version is a valid
+  # lower bound).
+  defp put_max(shard_id, version) do
+    current =
+      case :ets.lookup(@table, shard_id) do
+        [{^shard_id, v, _expires_at}] -> v
+        [] -> 0
+      end
+
+    insert(shard_id, max(version, current), System.monotonic_time(:millisecond))
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp listen_for_revocations do
+    :ok = Oban.Notifier.listen(Oban, [:fathom_revocations])
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
   end
 
   defp ttl_ms, do: Application.get_env(:fathom, :hrana_revocation_ttl_ms, @default_ttl_ms)
