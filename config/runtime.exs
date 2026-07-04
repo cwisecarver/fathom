@@ -73,7 +73,13 @@ if config_env() == :prod do
   # with SHARD_BASE_DOMAIN=fathom.example, only <shard>.fathom.example selects a
   # shard; any foreign/misrouted Host fails closed to the default-shard chain.
   # Unset = unanchored (the pre-anchor behavior) — set it in any real deployment.
-  if zone = System.get_env("SHARD_BASE_DOMAIN") do
+  # A BLANK env var is a misconfig, not a zone (round-2 #35): `if "" do` is truthy,
+  # and an empty configured zone makes zone_matches? deny ALL subdomain routing —
+  # fail-closed 400s in prod, but cross-tenant COMMINGLING into :default_shard if
+  # that is ever set. Treat blank/whitespace as unset.
+  zone = "SHARD_BASE_DOMAIN" |> System.get_env("") |> String.trim()
+
+  if zone != "" do
     config :fathom, :shard_base_domain, zone
   end
 

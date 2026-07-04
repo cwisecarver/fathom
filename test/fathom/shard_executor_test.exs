@@ -143,6 +143,30 @@ defmodule Fathom.ShardExecutorTest do
     assert resolve.("http://fathom.test/") == "demo"
   end
 
+  # Round-2 #35: `if System.get_env(...)` treats "" as truthy, so a BLANK
+  # SHARD_BASE_DOMAIN configured an empty zone — zone_matches? then denied ALL
+  # subdomain routing: fail-closed 400s in prod, but cross-tenant COMMINGLING into
+  # :default_shard wherever that is set (as it is in dev/test). The invariant: a
+  # blank zone is a misconfig treated as unset — every host still routes to its OWN
+  # shard, never to the shared default.
+  test "a blank serving zone is treated as unset, not as deny-everything" do
+    import ExUnit.CaptureLog
+
+    prev = Application.get_env(:fathom, :shard_base_domain)
+    Application.put_env(:fathom, :shard_base_domain, "")
+
+    on_exit(fn ->
+      if is_nil(prev),
+        do: Application.delete_env(:fathom, :shard_base_domain),
+        else: Application.put_env(:fathom, :shard_base_domain, prev)
+    end)
+
+    capture_log(fn ->
+      assert ShardExecutor.shard_from_conn(conn(:get, "http://acme.fathom.test/")) == "acme",
+             "a blank zone must not commingle tenants into the default shard"
+    end)
+  end
+
   # Expert review #36: Plug parses `?db[]=a&db[]=b` into a LIST and `?db[k]=v` into a
   # MAP, and normalize_resolved only had nil/binary heads — a crafted query param raised
   # FunctionClauseError on the resolve path (shard_from_conn is Filo's open_arg with no

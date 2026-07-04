@@ -321,8 +321,18 @@ defmodule Fathom.ShardExecutor do
         true
 
       zone ->
-        normalized = zone |> String.trim_leading(".") |> String.trim_trailing(".")
-        String.downcase(Enum.join(rest, ".")) == String.downcase(normalized)
+        # An empty/whitespace zone matches NOTHING — denying all subdomain routing,
+        # and commingling every tenant into :default_shard where that is set.
+        # runtime.exs treats a blank env var as unset (round-2 #35); this is the
+        # belt for a blank value arriving through any other config path.
+        case zone |> String.trim() |> String.trim_leading(".") |> String.trim_trailing(".") do
+          "" ->
+            Logger.warning("shard_base_domain is blank; treating as unset (misconfig)")
+            true
+
+          normalized ->
+            String.downcase(Enum.join(rest, ".")) == String.downcase(normalized)
+        end
     end
   end
 
