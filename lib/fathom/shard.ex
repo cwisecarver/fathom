@@ -114,6 +114,14 @@ defmodule Fathom.Shard do
   when the connection closes.
   """
   def checkout(pid) when is_pid(pid) do
+    # The op tag makes a later abandon PRECISE (expert review round-2 #33): it names
+    # exactly this call's grant, so abandoning a timed-out checkout can never drop a
+    # LIVE grant the same caller holds from an earlier checkout of the same shard
+    # (which would let a flush run under an active writer — the #8 hazard).
+    do_checkout(pid, make_ref())
+  end
+
+  defp do_checkout(pid, op) do
     # The open path (handle_continue) can legitimately block a queued :checkout for up to
     # @pull_timeout (a large cold pull, cross-region S3), and an inline durability flush can
     # add more. The default 5s GenServer.call timeout is far below that, so a slow-but-normal
@@ -122,7 +130,7 @@ defmodule Fathom.Shard do
     # for a caller that had already given up. Give the call a budget above the coordinator's
     # own open budget; the coordinator still bounds the pull with @pull_timeout, so this
     # never waits forever on a genuinely stuck open. Configurable for real-S3 tuning.
-    GenServer.call(pid, :checkout, checkout_timeout())
+    GenServer.call(pid, {:checkout, op}, checkout_timeout())
   catch
     # The coordinator self-stopped while opening storage (lease held by another
     # node, or pull failed) — its `{:shutdown, reason}` exit reaches the pending
@@ -140,9 +148,9 @@ defmodule Fathom.Shard do
     # dies (a Filo stream or Oban runner can live for hours). The shard then never
     # idles: pinned open, lease held forever, drains aborting :busy. Compensate with a
     # cast that is FIFO-ordered behind the stale :checkout, telling the coordinator to
-    # drop any conn it granted to this caller.
+    # drop exactly THIS call's grant (round-2 #33: by op tag, never by pid alone).
     :exit, {:timeout, _} ->
-      GenServer.cast(pid, {:abandon_checkout, self()})
+      GenServer.cast(pid, {:abandon_checkout, self(), op})
       {:error, :timeout}
 
     :exit, {reason, _} ->
@@ -589,14 +597,15 @@ defmodule Fathom.Shard do
   # While standing down, refuse new checkouts so the shard can drain. The caller
   # retries elsewhere (and, once the migrator holds the lease, lands on :held).
   @impl true
-  def handle_call(:checkout, _from, %{draining: true} = state) do
+  def handle_call({:checkout, _op}, _from, %{draining: true} = state) do
     {:reply, {:error, :draining}, state}
   end
 
-  def handle_call(:checkout, {caller, _tag}, state) do
+  def handle_call({:checkout, op}, {caller, _tag}, state) do
     ref = Process.monitor(caller)
-    # The value is the caller pid so {:abandon_checkout, caller} can find its grants.
-    state = %{cancel_idle(state) | conns: Map.put(state.conns, ref, caller)}
+    # The value carries the caller AND the call's op tag, so an abandon names
+    # exactly one grant (round-2 #33) instead of every grant this pid holds.
+    state = %{cancel_idle(state) | conns: Map.put(state.conns, ref, {caller, op})}
     {:reply, {:ok, ref, state.path}, state}
   end
 
@@ -605,15 +614,16 @@ defmodule Fathom.Shard do
   @impl true
   def handle_cast({:checkin, ref}, state), do: stop_when_drained(release(state, ref))
 
-  # A caller's checkout call timed out (expert review #26): drop every conn granted to
+  # A caller's checkout call timed out (expert review #26): drop the conn granted to
   # it that it never received. Ordering makes this exact: the cast is sent AFTER the
   # call gave up, so per-pair FIFO puts it BEHIND the stale :checkout — the phantom
-  # grant (if the coordinator processed it) is always visible here. A caller that got
-  # its reply never abandons, and fathom's callers (one Filo stream / one Oban runner
-  # per checkout) hold at most one conn per coordinator, so there is no live grant to
-  # this pid to over-drop.
-  def handle_cast({:abandon_checkout, caller}, state) do
-    refs = for {ref, pid} <- state.conns, pid == caller, do: ref
+  # grant (if the coordinator processed it) is always visible here. Matching on the
+  # call's op TAG (round-2 #33), not the pid alone: a caller that checks the same
+  # shard out twice must not lose its LIVE grant to the timed-out one's abandon —
+  # dropping a grant under an active writer re-opens the #8 flush-under-writer
+  # hazard the conn tracking exists to prevent.
+  def handle_cast({:abandon_checkout, caller, op}, state) do
+    refs = for {ref, {pid, tag}} <- state.conns, pid == caller and tag == op, do: ref
     stop_when_drained(Enum.reduce(refs, state, &release(&2, &1)))
   end
 

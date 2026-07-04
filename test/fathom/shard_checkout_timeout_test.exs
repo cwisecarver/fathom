@@ -72,6 +72,44 @@ defmodule Fathom.ShardCheckoutTimeoutTest do
     end)
   end
 
+  # Round-2 #33: abandon_checkout dropped EVERY grant for the caller pid — so a
+  # caller holding a LIVE connection whose SECOND checkout of the same shard timed
+  # out lost the live grant too. With zero tracked conns the coordinator then
+  # idle-flushes under the still-active writer — the #8 flush-under-writer hazard
+  # the conn tracking exists to prevent. The invariant: an abandon names exactly
+  # the timed-out call's grant.
+  test "an abandoned second checkout does not drop the caller's live grant", %{shard: shard} do
+    # First checkout: ample budget, a real live grant.
+    Application.put_env(:fathom, :shard_checkout_timeout_ms, 60_000)
+    assert {:ok, pid, live_ref, _path} = Shards.checkout(shard)
+
+    # Second checkout of the SAME shard by the SAME caller times out (the
+    # coordinator is suspended so the 1ms budget deterministically expires); its
+    # grant is processed on resume and then abandoned — the cast is FIFO behind
+    # the stale call.
+    Application.put_env(:fathom, :shard_checkout_timeout_ms, 1)
+    :ok = :sys.suspend(pid)
+
+    capture_log(fn ->
+      assert {:error, :timeout} = Fathom.Shard.checkout(pid)
+    end)
+
+    :ok = :sys.resume(pid)
+
+    # Sync: the coordinator has processed the stale :checkout AND the abandon.
+    _ = :sys.get_state(pid)
+
+    conns = :sys.get_state(pid).conns
+
+    assert Map.has_key?(conns, live_ref),
+           "the live grant must survive the timed-out checkout's abandon (pre-fix it was dropped)"
+
+    assert map_size(conns) == 1, "the timed-out call's phantom grant must still be dropped"
+
+    Fathom.Shard.checkin(pid, live_ref)
+    stop_coordinator(shard)
+  end
+
   test "a slow cold open under the timeout budget still yields a connection", %{shard: shard} do
     # The same 400ms pull, but an ample budget: the checkout waits it out and gets a connection
     # rather than failing — the actual fix, letting a normal slow open through.
