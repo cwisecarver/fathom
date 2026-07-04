@@ -968,6 +968,32 @@ defmodule Fathom.ShardDurabilityTest do
   # 5 s (routine for multi-MB shards on a deploy, with every coordinator flushing through
   # one Finch pool). The violated invariant: the shutdown budget must cover the terminate
   # flush, and must be tunable for bigger shards / slower links.
+  # Expert review round-2 #18: settle_flush_task's flat 30 s Task.yield (+5 s task
+  # shutdown grace) could consume over half the 60 s shutdown budget BEFORE the
+  # terminate drop-flush (fence RTT + checkpoint + full-file PUT + lease release)
+  # even began — on a rolling deploy every coordinator settles and flushes through
+  # one Finch pool at once, reintroducing the #5 brutal-kill-mid-PUT and feeding the
+  # #2 poisoned-etag case with the killed task's landed PUT. The invariant: the
+  # settle wait is derived from the configured budget and leaves at least two
+  # thirds of it for the drop-flush.
+  test "the settle yield leaves at least two thirds of the shutdown budget for the drop-flush" do
+    prev = Application.get_env(:fathom, :shard_shutdown_ms)
+    on_exit(fn -> restore(:shard_shutdown_ms, prev) end)
+
+    # Default budget (60 s): settle caps at 20 s, leaving 40 s for the drop-flush.
+    Application.delete_env(:fathom, :shard_shutdown_ms)
+    assert Shard.settle_yield_ms() == 20_000
+
+    # A tightened budget scales the settle down with it.
+    Application.put_env(:fathom, :shard_shutdown_ms, 9_000)
+    assert Shard.settle_yield_ms() == 3_000
+
+    # A huge budget still caps the settle at 30 s — anything the task hasn't
+    # finished by then the drop-flush re-uploads itself anyway.
+    Application.put_env(:fathom, :shard_shutdown_ms, 300_000)
+    assert Shard.settle_yield_ms() == 30_000
+  end
+
   test "the coordinator child spec carries an explicit shutdown budget for the terminate flush" do
     assert %{shutdown: 60_000} = Fathom.Shard.child_spec("any_shard")
 

@@ -60,13 +60,16 @@ defmodule Fathom.Shard do
   @default_lease_ttl_ms 30_000
   @default_flush_interval_ms 30_000
   @pull_timeout 60_000
-  # Supervisor shutdown budget for terminate/2's final fence + checkpoint + full-file
+  # Supervisor shutdown budget for terminate/2's WHOLE exit path: settling any
+  # in-flight durability-flush task (settle_yield_ms/0 caps that at a third of this
+  # budget — expert review #18) and then the final fence + checkpoint + full-file
   # S3 PUT + lease release. The worker default (5 000 ms) brutal-killed the flush
   # mid-PUT on rolling deploys — a multi-MB shard at real S3 latency, queued behind
   # every sibling coordinator flushing through the same Finch pool, easily exceeds
   # 5 s — silently defeating the clean-shutdown durability guarantee trap_exit exists
   # for. Bounded (not :infinity) so a hung storage call can't wedge the deploy; the
-  # in-flight PUT it may still cut off is etag-conditional, so never torn.
+  # in-flight PUT it may still cut off is etag-conditional, so never torn. When
+  # tuning `:shard_shutdown_ms`, size it to cover settle + drop-flush together.
   @default_shutdown_ms 60_000
 
   # Overrides `use GenServer`'s generated child_spec to attach the shutdown budget
@@ -76,6 +79,19 @@ defmodule Fathom.Shard do
     arg
     |> super()
     |> Map.put(:shutdown, Application.get_env(:fathom, :shard_shutdown_ms, @default_shutdown_ms))
+  end
+
+  # How long the terminate path waits for an in-flight durability-flush task before
+  # starting its own drop-flush. A flat 30 s yield could eat over half the 60 s
+  # shutdown budget BEFORE the drop-flush (fence RTT + checkpoint + full-file PUT +
+  # lease release) even began — on a rolling deploy every coordinator settles and
+  # flushes through one Finch pool at once, reintroducing the #5 brutal-kill-mid-PUT
+  # (expert review round-2 #18). Cap the settle at a third of the configured budget so
+  # at least two thirds always remain for the drop-flush itself.
+  @doc false
+  def settle_yield_ms do
+    shutdown_ms = Application.get_env(:fathom, :shard_shutdown_ms, @default_shutdown_ms)
+    min(30_000, div(shutdown_ms, 3))
   end
 
   # Above the coordinator's own open budget (@pull_timeout + lease acquire + any inline
@@ -1243,7 +1259,7 @@ defmodule Fathom.Shard do
   defp settle_flush_task(%{flush_task: nil} = state), do: state
 
   defp settle_flush_task(%{flush_task: task} = state) do
-    case Task.yield(task, 30_000) || Task.shutdown(task) do
+    case Task.yield(task, settle_yield_ms()) || Task.shutdown(task) do
       {:ok, {:ok, new_etag}} ->
         write_etag_sidecar(state.path, new_etag)
 
