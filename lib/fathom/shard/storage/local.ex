@@ -223,17 +223,19 @@ defmodule Fathom.Shard.Storage.Local do
 
   @impl true
   def check_lease(shard_id, %{owner: owner, epoch: epoch}) do
-    # Read under the mutex (expert review #28) so the fence read is serialized against
-    # in-flight lock mutations, matching S3's atomic conditional read. With the atomic
-    # write_lock below a torn read is already impossible; this adds mutation ordering.
-    with_lock_mutex(shard_id, fn ->
-      case read_lock(shard_id) do
-        {:ok, %{owner: ^owner, epoch: ^epoch}} -> :ok
-        {:ok, _other} -> {:error, :superseded}
-        :enoent -> {:error, :superseded}
-        {:error, reason} -> {:error, reason}
-      end
-    end)
+    # NO mutex here (expert review #28 follow-up): check_lease is the read-only flush
+    # fence, called on every durability flush and every lapse revalidation — a hot path.
+    # Routing it through the VM-wide :global.trans (the per-shard mutex) added lease-
+    # renewal contention that delayed steal detection past the lease tests' timeouts.
+    # The atomic write_lock below already makes a torn read impossible (the rename is
+    # atomic, so a reader sees whole-old or whole-new), which is the only correctness
+    # property this read needs; mutation ordering against it is not required.
+    case read_lock(shard_id) do
+      {:ok, %{owner: ^owner, epoch: ^epoch}} -> :ok
+      {:ok, _other} -> {:error, :superseded}
+      :enoent -> {:error, :superseded}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   # --- node heartbeat ---

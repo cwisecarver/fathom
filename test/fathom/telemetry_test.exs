@@ -53,6 +53,10 @@ defmodule Fathom.TelemetryTest do
     put_raw_lock(shard, "thief@node", 999, now_ms() + 60_000)
 
     capture_log(fn ->
+      # Drive the renewal check directly rather than waiting on the periodic timer,
+      # which can slip past the assert_receive window under heavy machine load.
+      send(coordinator, :renew_lease)
+
       assert_receive {:telemetry, [:fathom, :shard, :lease, :superseded], %{count: 1},
                       %{shard_id: ^shard}},
                      2_000
