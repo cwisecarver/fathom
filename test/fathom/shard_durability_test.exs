@@ -642,7 +642,7 @@ defmodule Fathom.ShardDurabilityTest do
   # served or flushed.
   test "a warm restart cannot adopt a newer lineage and clobber it", %{shard: shard} do
     Application.put_env(:fathom, :shard_idle_ms, 50)
-    on_exit(fn -> File.rm_rf(local_db(shard) <> ".forked") end)
+    on_exit(fn -> Enum.each(Path.wildcard(local_db(shard) <> ".forked*"), &File.rm_rf/1) end)
 
     # The shard's original lineage in storage.
     seed = Path.join(System.tmp_dir!(), "seed1_#{shard}.db")
@@ -688,7 +688,7 @@ defmodule Fathom.ShardDurabilityTest do
       assert {:ok, %StmtResult{rows: []}} =
                ShardExecutor.execute(conn2, stmt("SELECT v FROM kv WHERE v = 'a-fork'"))
 
-      assert File.exists?(local_db(shard) <> ".forked"),
+      assert Path.wildcard(local_db(shard) <> ".forked.*") != [],
              "the forked local copy must be quarantined for recovery, not deleted"
 
       close_and_stop(shard, conn2)
@@ -715,7 +715,7 @@ defmodule Fathom.ShardDurabilityTest do
   test "a torn-to-empty sidecar quarantines the local copy instead of adopting the store's lineage",
        %{shard: shard} do
     Application.put_env(:fathom, :shard_idle_ms, 50)
-    on_exit(fn -> File.rm_rf(local_db(shard) <> ".forked") end)
+    on_exit(fn -> Enum.each(Path.wildcard(local_db(shard) <> ".forked*"), &File.rm_rf/1) end)
 
     # Node "A": open a brand-new shard, write locally, then CRASH — local file left.
     {:ok, conn} = ShardExecutor.open(shard)
@@ -755,7 +755,7 @@ defmodule Fathom.ShardDurabilityTest do
       assert {:ok, %StmtResult{rows: []}} =
                ShardExecutor.execute(conn2, stmt("SELECT v FROM kv WHERE v = 'a-fork'"))
 
-      assert File.exists?(local_db(shard) <> ".forked"),
+      assert Path.wildcard(local_db(shard) <> ".forked.*") != [],
              "the unknown-provenance local copy must be quarantined for recovery, not deleted"
 
       close_and_stop(shard, conn2)
@@ -769,6 +769,66 @@ defmodule Fathom.ShardDurabilityTest do
            "the stored lineage must never be clobbered off a torn sidecar"
 
     Connection.close(ro)
+  end
+
+  # Expert review round-2 #14: quarantine_fork! used a FIXED `.forked` name and rm'd it
+  # first — a node that forks the same shard twice (crash-looping in exactly the
+  # stolen/written/released environment that produces forks) silently destroyed the
+  # first quarantine, whose sole purpose is preserving acknowledged writes. The
+  # invariant: every quarantine gets a unique name; a later fork never deletes an
+  # earlier fork's recovery copy.
+  test "a second fork does not destroy the first fork's recovery copy", %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+    on_exit(fn -> Enum.each(Path.wildcard(local_db(shard) <> ".forked*"), &File.rm_rf/1) end)
+
+    # The stored lineage.
+    seed = Path.join(System.tmp_dir!(), "seed14_#{shard}.db")
+    {:ok, c} = Connection.open(seed)
+    :ok = Connection.exec(c, "CREATE TABLE kv (v TEXT)")
+    :ok = Connection.exec(c, "INSERT INTO kv VALUES ('base')")
+    :ok = Connection.exec(c, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(c)
+    :ok = Storage.flush(shard, seed)
+    for s <- ["", "-wal", "-shm"], do: File.rm(seed <> s)
+
+    # Two successive forks: a stale local copy whose provenance sidecar mismatches the
+    # stored object. Each open must quarantine it and serve the stored lineage.
+    for fork_value <- ["fork-one", "fork-two"] do
+      path = local_db(shard)
+      File.mkdir_p!(Path.dirname(path))
+      {:ok, cf} = Connection.open(path)
+      :ok = Connection.exec(cf, "CREATE TABLE kv (v TEXT)")
+      :ok = Connection.exec(cf, "INSERT INTO kv VALUES ('#{fork_value}')")
+      :ok = Connection.exec(cf, "PRAGMA wal_checkpoint(TRUNCATE)")
+      Connection.close(cf)
+      File.write!(path <> ".etag", "bogus-provenance-#{fork_value}")
+
+      capture_log(fn ->
+        {:ok, conn} = ShardExecutor.open(shard)
+
+        assert {:ok, %StmtResult{rows: [["base"]]}} =
+                 ShardExecutor.execute(conn, stmt("SELECT v FROM kv"))
+
+        close_and_stop(shard, conn)
+      end)
+    end
+
+    recovery_copies =
+      Path.wildcard(local_db(shard) <> ".forked.*")
+      |> Enum.reject(&(String.ends_with?(&1, "-wal") or String.ends_with?(&1, "-shm")))
+
+    assert length(recovery_copies) == 2,
+           "both forks' recovery copies must survive; found #{inspect(recovery_copies)}"
+
+    values =
+      Enum.map(recovery_copies, fn f ->
+        {:ok, ro} = Connection.open(f)
+        {:ok, %{rows: [[v]]}} = Connection.query(ro, "SELECT v FROM kv", [])
+        Connection.close(ro)
+        v
+      end)
+
+    assert Enum.sort(values) == ["fork-one", "fork-two"]
   end
 
   # Expert review #14: the WriteCounter's ETS table dies with its owner, and a restart

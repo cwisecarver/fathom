@@ -1132,10 +1132,11 @@ defmodule Fathom.Shard do
 
       # Torn/unreadable sidecar (expert review #12): the local copy's provenance is
       # unknown, so it cannot be trusted to continue the stored lineage — quarantine
-      # it and re-pull, exactly as a detected fork.
+      # it and re-pull, exactly as a detected fork. A FAILED quarantine (the rename
+      # never moved the copy) must not report quarantined, or the cold-open's
+      # promote_pull would overwrite the un-moved recovery copy (expert review #14).
       :corrupt ->
-        quarantine_fork!(shard_id, path, :corrupt_sidecar)
-        true
+        quarantine_fork!(shard_id, path, :corrupt_sidecar) == :ok
 
       {:ok, sidecar_etag} ->
         case Storage.object_etag(shard_id) do
@@ -1148,9 +1149,9 @@ defmodule Fathom.Shard do
           {:ok, nil} ->
             false
 
+          # Same failed-quarantine rule as :corrupt above (expert review #14).
           {:ok, _newer} ->
-            quarantine_fork!(shard_id, path, :diverged)
-            true
+            quarantine_fork!(shard_id, path, :diverged) == :ok
 
           {:error, _unreachable} ->
             false
@@ -1158,29 +1159,53 @@ defmodule Fathom.Shard do
     end
   end
 
+  # Returns :ok when the local copy was moved aside (the caller opens COLD), or
+  # {:error, reason} when the main-file rename failed — the copy never moved, so the
+  # caller must NOT report it quarantined (expert review #14: promote_pull's rename
+  # would overwrite the recovery copy the quarantine exists to preserve).
   defp quarantine_fork!(shard_id, path, reason) do
-    dest = path <> ".forked"
-    Enum.each(["", "-wal", "-shm"], &File.rm(dest <> &1))
-    Enum.each(["", "-wal", "-shm"], &File.rename(path <> &1, dest <> &1))
-    File.rm(etag_sidecar(path))
+    # Unique per quarantine (expert review #14): a fixed `.forked` name + rm-first
+    # destroyed the FIRST fork's recovery copy whenever the same shard forked twice —
+    # and a crash-looping node in a stolen/written/released environment is exactly
+    # where repeat forks happen. A quarantine's sole purpose is preserving
+    # acknowledged writes; never delete a prior one.
+    dest =
+      path <> ".forked.#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
 
-    cause =
-      case reason do
-        :corrupt_sidecar ->
-          "provenance sidecar torn/unreadable (crash mid-write), lineage unknown (expert review #12)"
+    # The main-file rename is load-bearing; the WAL/SHM companions are best-effort
+    # (promote_pull removes stale ones before landing the pulled object).
+    case File.rename(path, dest) do
+      :ok ->
+        Enum.each(["-wal", "-shm"], &File.rename(path <> &1, dest <> &1))
+        File.rm(etag_sidecar(path))
 
-        :diverged ->
-          "another node wrote and released while this one was down (expert review #1)"
-      end
+        cause =
+          case reason do
+            :corrupt_sidecar ->
+              "provenance sidecar torn/unreadable (crash mid-write), lineage unknown (expert review #12)"
 
-    Logger.error(
-      "shard #{shard_id}: local copy FORKED from the stored lineage — #{cause}; " <>
-        "quarantined at #{dest} and re-pulling. " <>
-        "Operator recovery: the forked writes live in that file."
-    )
+            :diverged ->
+              "another node wrote and released while this one was down (expert review #1)"
+          end
 
-    :telemetry.execute([:fathom, :shard, :forked], %{count: 1}, %{shard_id: shard_id})
-    :ok
+        Logger.error(
+          "shard #{shard_id}: local copy FORKED from the stored lineage — #{cause}; " <>
+            "quarantined at #{dest} and re-pulling. " <>
+            "Operator recovery: the forked writes live in that file."
+        )
+
+        :telemetry.execute([:fathom, :shard, :forked], %{count: 1}, %{shard_id: shard_id})
+        :ok
+
+      {:error, _} = error ->
+        Logger.error(
+          "shard #{shard_id}: fork quarantine FAILED (#{inspect(error)}); the local copy " <>
+            "stays in place and the open serves it warm, fenced by the provenance etag — " <>
+            "never overwritten by a re-pull (expert review #14)."
+        )
+
+        error
+    end
   end
 
   # Snapshot the live DB to a temp file and upload it (fenced by the object etag), keeping the
