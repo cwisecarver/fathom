@@ -173,6 +173,10 @@ defmodule Fathom.Shard.HeartbeatTest do
     assert Heartbeat.generation() == 0
     assert Heartbeat.valid_for_write?(0) == :ok
 
+    # Subscribe like a coordinator does (expert review #34), so the restart's
+    # broadcast delivery is asserted below.
+    :ok = Phoenix.PubSub.subscribe(Fathom.PubSub, Heartbeat.topic())
+
     ref = Process.monitor(pid)
     :ok = stop_supervised(Fathom.Shard.Heartbeat)
     assert_receive {:DOWN, ^ref, :process, ^pid, _}, 1_000
@@ -187,6 +191,15 @@ defmodule Fathom.Shard.HeartbeatTest do
            "a coordinator acquired before the restart must revalidate ownership"
 
     assert Heartbeat.valid_for_write?(1) == :ok
+
+    # Expert review round-2 #15: the restart bumped the generation but never
+    # BROADCAST it, so subscribed coordinators (the #34 proactive fence) kept stale
+    # acquire_gens until their next flush — unboundedly with the periodic flush
+    # disabled — while the restart gap is a real steal window. A restart must
+    # proactively notify exactly like a lapse.
+    assert_receive {:heartbeat_lapsed, 1},
+                   1_000,
+                   "a heartbeat restart must broadcast the lapse so coordinators revalidate now"
   end
 
   # Expert review #7: terminate/2 cleared the heartbeat object for ANY reason —

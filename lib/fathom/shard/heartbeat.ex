@@ -118,6 +118,14 @@ defmodule Fathom.Shard.Heartbeat do
       Logger.warning(
         "heartbeat restarted for #{owner} (generation #{generation}); coordinators will revalidate"
       )
+
+      # A restart IS a lapse episode (the bump above says so), but only mark_lapse
+      # broadcast — so the proactive revalidation coordinators subscribe to (expert
+      # review #34) never fired for the restart-lapse case, and they sat on stale
+      # acquire_gens until their next flush (unboundedly in idle-only mode) while the
+      # restart gap is a real steal window. Broadcast so they revalidate NOW (expert
+      # review round-2 #15).
+      broadcast_lapse(generation)
     end
 
     state = %{
