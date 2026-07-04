@@ -43,6 +43,8 @@ defmodule Fathom.HranaAuth do
   release's remote console.
   """
 
+  require Logger
+
   alias Fathom.{Directory, ShardId}
   alias Fathom.HranaAuth.Revocations
 
@@ -178,6 +180,18 @@ defmodule Fathom.HranaAuth do
     if configured == :required and byte_size(secret!()) < 32 do
       raise "config error: :hrana_auth is :required but secret_key_base is too short " <>
               "(need >= 32 bytes) — generate one with: mix phx.gen.secret"
+    end
+
+    # The boot warning the moduledoc has promised all along (round-2 #36): running
+    # :required on the secret_key_base FALLBACK silently couples the data-path
+    # credential to web session/CSRF signing — a routine web SECRET_KEY_BASE
+    # rotation then invalidates every outstanding Hrana token, fleet-wide.
+    if configured == :required and is_nil(Application.get_env(:fathom, :hrana_token_secret)) do
+      Logger.warning(
+        "hrana_auth is :required with no :hrana_token_secret — tokens are signing with " <>
+          "the web secret_key_base, so rotating it will invalidate EVERY Hrana token. " <>
+          "Set HRANA_TOKEN_SECRET to decouple the data path from web sessions."
+      )
     end
 
     :ok

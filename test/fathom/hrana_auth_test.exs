@@ -125,6 +125,34 @@ defmodule Fathom.HranaAuthTest do
     assert_raise RuntimeError, ~r/too short/, fn -> HranaAuth.check_config!() end
   end
 
+  # Round-2 #36: the moduledoc has always promised a boot warning for the
+  # secret_key_base fallback, but secret! was a silent || chain — running
+  # :required on the fallback couples the data-path credential to web
+  # session/CSRF signing, so a routine web SECRET_KEY_BASE rotation invalidates
+  # every outstanding Hrana token with no hint why.
+  test "check_config! warns when :required runs on the secret_key_base fallback" do
+    import ExUnit.CaptureLog
+
+    require_auth!()
+    prev = Application.get_env(:fathom, :hrana_token_secret)
+
+    on_exit(fn ->
+      if is_nil(prev),
+        do: Application.delete_env(:fathom, :hrana_token_secret),
+        else: Application.put_env(:fathom, :hrana_token_secret, prev)
+    end)
+
+    Application.delete_env(:fathom, :hrana_token_secret)
+
+    assert capture_log(fn -> assert :ok = HranaAuth.check_config!() end) =~
+             "no :hrana_token_secret",
+           "the documented fallback boot warning must fire"
+
+    # With the dedicated secret set, no warning.
+    Application.put_env(:fathom, :hrana_token_secret, String.duplicate("a", 64))
+    refute capture_log(fn -> assert :ok = HranaAuth.check_config!() end) =~ "hrana_token_secret"
+  end
+
   # --- end to end: Filo.Plug -> shard_from_conn -> HranaAuth -> ShardExecutor ---
 
   describe "through the real Hrana pipeline" do
