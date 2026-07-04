@@ -80,7 +80,9 @@ defmodule Fathom.Migrator.ShardMigration do
       tmp = temp_path(shard_id, "revert")
 
       try do
-        with :ok <- pull_live(shard_id, tmp) do
+        # The revert doesn't fence its restore on the etag (deferred with the CopyObject
+        # fencing work — round-2 #4/#8), so it ignores the pulled etag.
+        with {:ok, _etag} <- pull_live(shard_id, tmp) do
           if live_version(tmp) == to_version and to_version != current do
             # Crash-forward (expert review #10): a prior attempt already restored
             # to_version over live but died before the cutover, so the directory still
@@ -252,12 +254,12 @@ defmodule Fathom.Migrator.ShardMigration do
     new = temp_path(shard_id, "new")
 
     try do
-      with :ok <- pull_live(shard_id, old) do
+      with {:ok, etag} <- pull_live(shard_id, old) do
         if live_version(old) == target do
           # Crash-forward: the new version is already live; just finish the cutover.
           finalize(shard_id, target)
         else
-          forward(shard_id, target, statements, old, new, lease)
+          forward(shard_id, target, statements, old, new, lease, etag)
         end
       end
     after
@@ -266,7 +268,7 @@ defmodule Fathom.Migrator.ShardMigration do
     end
   end
 
-  defp forward(shard_id, target, statements, old, new, lease) do
+  defp forward(shard_id, target, statements, old, new, lease, expected_etag) do
     prev = current_version(shard_id)
 
     with :ok <- Storage.retain(shard_id, prev),
@@ -274,11 +276,24 @@ defmodule Fathom.Migrator.ShardMigration do
          # Self-fence right before the clobbering flush: if we were superseded during the (long)
          # copy, abort instead of overwriting the new owner's object (finding #7).
          :ok <- fence(shard_id, lease),
-         :ok <- Storage.flush(shard_id, new),
+         # The data flush itself is If-Match-fenced on the live object's etag at pull
+         # time (round-2 expert review #5): the read-only `fence/2` above only proves the
+         # LOCK is ours at THIS instant, but the migrator can then stall (the renewer loop
+         # merely stops on failure) and a coordinator can steal + flush new bytes before
+         # this PUT lands. An unconditional PUT would clobber the new owner's object with
+         # a migrated copy of the OLD lineage, with zero error signal. If-Match turns that
+         # into a 412 → :superseded, and the job retries from a fresh pull.
+         {:ok, _new_etag} <- flush_fenced(shard_id, new, expected_etag),
          {:ok, _} <- Directory.cutover(shard_id, target) do
       Logger.info("shard #{shard_id}: migrated v#{prev} -> v#{target}")
       {:ok, %{from: prev, to: target}}
     end
+  end
+
+  # Storage.flush/3 returns {:ok, etag} | {:error, :superseded} | {:error, reason};
+  # normalize into the with-chain (a bare :superseded aborts the migration cleanly).
+  defp flush_fenced(shard_id, path, expected_etag) do
+    Storage.flush(shard_id, path, expected_etag)
   end
 
   defp finalize(shard_id, target) do
@@ -292,10 +307,10 @@ defmodule Fathom.Migrator.ShardMigration do
   # --- helpers ---
 
   defp pull_live(shard_id, path) do
-    # pull/2 now returns the object etag ({:ok, nil} when absent); the migrator doesn't fence
-    # its version copies, so it only cares that the live file materialized.
+    # Keep the object etag (round-2 expert review #5): the forward flush If-Matches it so
+    # a steal that lands between pull and flush is caught instead of clobbered.
     case Storage.pull(shard_id, path) do
-      {:ok, _etag} -> if File.exists?(path), do: :ok, else: {:error, :no_live_object}
+      {:ok, etag} -> if File.exists?(path), do: {:ok, etag}, else: {:error, :no_live_object}
       error -> error
     end
   end

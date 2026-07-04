@@ -336,6 +336,41 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert %{rows: [[1]]} = query_live!(shard, "PRAGMA user_version")
   end
 
+  # Round-2 expert review #5: the read-only `fence/2` above only proves the LOCK is ours
+  # at that instant. The migrator can then stall and a new owner can flush different bytes
+  # to the live object before the migrator's PUT lands — and the migrator flushed
+  # UNCONDITIONALLY (Storage.flush/2), clobbering the new owner's object with a migrated
+  # copy of the OLD lineage, with zero error signal. The flush is now If-Match-fenced on
+  # the object's pull-time etag. Here the object (not the lock) is overwritten inside the
+  # flush call, AFTER the lock-fence check passed.
+  test "a live-object change after the fence check aborts the migrator flush, no clobber",
+       %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+
+    prev = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    # A new owner flushes different bytes to the live object during the migrator's flush,
+    # after its lock-fence passed — changing the object etag but NOT the lock.
+    overwrite = fn -> File.write!(Path.join(@remote_dir, "#{shard}.db"), "new-owner-bytes") end
+    Application.put_env(:fathom, :faulty_before, {:flush, overwrite})
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if prev,
+        do: Application.put_env(:fathom, :shard_storage, prev),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    # Pre-fix: the unconditional PUT clobbered the object with the migrated v2.
+    assert {:error, :superseded} = ShardMigration.run(shard, 2)
+
+    assert File.read!(Path.join(@remote_dir, "#{shard}.db")) == "new-owner-bytes",
+           "the migrator must not clobber the new owner's object"
+  end
+
   # A foreign owner takes the shard's lock (a different owner/epoch than the migrator's), so the
   # migrator's check_lease reports :superseded. No heartbeat needed — check_lease compares the
   # lock, not liveness.
