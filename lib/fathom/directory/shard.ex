@@ -31,6 +31,10 @@ defmodule Fathom.Directory.Shard do
     # cutover" is exactly last_active_at > cutover_at. The revert force-guard reads this
     # (fable-review #13); nil (pre-column row / never cut over) = unknown write-age.
     field :cutover_at, :utc_datetime_usec
+    # Per-shard Hrana-token revocation counter (expert review #31): a token embeds the
+    # version it was minted at; bumping this via Fathom.HranaAuth.revoke/1 invalidates
+    # every outstanding token for THIS shard alone (no fleet-wide secret rotation).
+    field :token_version, :integer, default: 1
 
     timestamps(type: :utc_datetime_usec)
   end

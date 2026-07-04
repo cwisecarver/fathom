@@ -246,6 +246,34 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  The shard's current Hrana-token revocation version (expert review #31), or `nil`
+  if the shard has no directory row. A token minted at a version below this no
+  longer verifies.
+  """
+  @spec token_version(String.t()) :: pos_integer() | nil
+  def token_version(shard_id) do
+    Repo.one(from s in Shard, where: s.shard_id == ^shard_id, select: s.token_version)
+  end
+
+  @doc """
+  Revokes every outstanding Hrana token for `shard_id` by bumping its
+  `token_version` (expert review #31). Registers the shard first if unknown (so a
+  revoke is never lost to a not-yet-recorded shard). Returns the new version.
+  """
+  @spec bump_token_version(String.t()) :: pos_integer()
+  def bump_token_version(shard_id) do
+    {:ok, _} = resolve(shard_id)
+
+    {1, [version]} =
+      Repo.update_all(
+        from(s in Shard, where: s.shard_id == ^shard_id, select: s.token_version),
+        inc: [token_version: 1]
+      )
+
+    version
+  end
+
+  @doc """
   Returns quarantined shards to `active` so the sweeps see them again — the exit path
   `migration_failed` never had (expert review #25): quarantined shards were excluded
   from laggards, reverts, and every sweep forever, so a wave of transient failures

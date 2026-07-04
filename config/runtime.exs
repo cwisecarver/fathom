@@ -88,6 +88,13 @@ if config_env() == :prod do
   # the network trust boundary above stands alone; set HRANA_AUTH=required to make every
   # stream open present a per-shard token (needed if 8080 is ever reachable beyond the LB,
   # or for revocable per-tenant credentials). Tokens are signed with SECRET_KEY_BASE.
+  # Dedicated token-signing secret (expert review #31), separate from
+  # SECRET_KEY_BASE so a data-path secret rotation never touches web sessions/CSRF.
+  # Falls back to secret_key_base when unset (backward compatible).
+  if token_secret = System.get_env("HRANA_TOKEN_SECRET") do
+    config :fathom, :hrana_token_secret, token_secret
+  end
+
   case System.get_env("HRANA_AUTH", "disabled") do
     "required" -> config :fathom, :hrana_auth, :required
     "disabled" -> config :fathom, :hrana_auth, :disabled

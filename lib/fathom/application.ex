@@ -133,6 +133,9 @@ defmodule Fathom.Application do
       # per-checkout `max(version)` on Postgres. Cheap when unused (polls only while
       # :lazy_migrate is on).
       Fathom.Migrator.HeadCache,
+      # Read-through cache of per-shard Hrana-token revocation versions, so token
+      # verification stays off the Postgres hot path (expert review #31).
+      Fathom.HranaAuth.Revocations,
       # Captures template-shard Django migrations into fleet versions.
       Fathom.Migrator.Capture
     ]

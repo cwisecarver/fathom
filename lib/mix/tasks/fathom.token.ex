@@ -6,11 +6,12 @@ defmodule Mix.Tasks.Fathom.Token do
 
       mix fathom.token acme
 
-  Clients present it as libSQL's `authToken`. Signing uses the configured
-  `secret_key_base`, so mint with the environment whose secret the target node
-  runs under (a token minted against the dev secret won't verify in prod). In a
-  release (no Mix), mint from the remote console instead:
-  `Fathom.HranaAuth.token_for("acme")`.
+  Clients present it as libSQL's `authToken`. Signing uses the dedicated
+  `:hrana_token_secret` (or `secret_key_base` when unset), so mint with the
+  environment whose secret the target node runs under (a token minted against the
+  dev secret won't verify in prod). In a release (no Mix), mint from the remote
+  console instead: `Fathom.HranaAuth.token_for("acme")`. Revoke a shard's tokens
+  with `Fathom.HranaAuth.revoke("acme")`.
   """
 
   use Mix.Task

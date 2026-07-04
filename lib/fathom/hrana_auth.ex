@@ -21,12 +21,30 @@ defmodule Fathom.HranaAuth do
       guard (`check_config!/0`) refuses `:required` without a usable secret.
       Any other configured value fails closed to `:required`.
 
-  Tokens don't expire by default (they are database credentials — revoke by
-  rotating `SECRET_KEY_BASE`); set `config :fathom, :hrana_token_max_age` (or
-  `HRANA_TOKEN_MAX_AGE`, seconds) to enforce expiry. Mint with
+  ## Revocation and signing secret (expert review #31)
+
+  A token embeds the shard's `token_version` at mint time.
+  `Fathom.HranaAuth.revoke/1` bumps that version in the directory, so every
+  outstanding token for **that one shard** stops verifying — no fleet-wide
+  `SECRET_KEY_BASE` rotation (which used to be the only lever and also logged out
+  the dashboard). The current floor is read through the
+  `Fathom.HranaAuth.Revocations` cache, so verification stays off the Postgres hot
+  path and a Postgres outage fails **open** on the version check only (a valid
+  signature still opens; revocation converges within the cache TTL).
+
+  Signing uses a **dedicated** secret — `config :fathom, :hrana_token_secret`
+  (`HRANA_TOKEN_SECRET`) — separate from the web endpoint's `secret_key_base`, so a
+  data-path secret rotation never touches web sessions/CSRF and vice versa. It falls
+  back to `secret_key_base` when unset (backward compatible), with a boot warning.
+
+  Tokens don't expire by default; set `config :fathom, :hrana_token_max_age` (or
+  `HRANA_TOKEN_MAX_AGE`, seconds) to bound exposure. Mint with
   `mix fathom.token <shard>` in dev, or `Fathom.HranaAuth.token_for/1` from a
   release's remote console.
   """
+
+  alias Fathom.{Directory, ShardId}
+  alias Fathom.HranaAuth.Revocations
 
   @salt "fathom hrana shard"
 
@@ -59,13 +77,15 @@ defmodule Fathom.HranaAuth do
   defp verify(_shard_id, nil), do: {:error, @missing}
 
   defp verify(shard_id, token) when is_binary(token) do
-    with {:ok, granted} <- Phoenix.Token.verify(secret!(), @salt, token, max_age: max_age()),
-         {:ok, ^granted} <- Fathom.ShardId.cast(shard_id) do
+    with {:ok, %{"s" => granted, "v" => version}} <-
+           Phoenix.Token.verify(secret!(), @salt, token, max_age: max_age()),
+         {:ok, ^granted} <- ShardId.cast(shard_id),
+         true <- version >= Revocations.floor(granted) do
       :ok
     else
-      # Bad signature/expiry, a token for a different shard, or an id that doesn't
-      # cast (defense-in-depth: even if open/1's validation ever regressed, nothing
-      # unauthorized gets past here). One opaque refusal for all of them.
+      # Bad signature/expiry, a token for a different shard, a revoked (stale-version)
+      # token, or an id that doesn't cast (defense-in-depth). One opaque refusal for
+      # all of them — a probe can't tell a wrong token from a wrong/revoked shard.
       _ -> {:error, @unauthorized}
     end
   end
@@ -79,9 +99,38 @@ defmodule Fathom.HranaAuth do
   """
   @spec token_for(term(), keyword()) :: {:ok, String.t()} | {:error, :invalid_shard_id}
   def token_for(shard_id, opts \\ []) do
-    case Fathom.ShardId.cast(shard_id) do
-      {:ok, canonical} -> {:ok, Phoenix.Token.sign(secret!(), @salt, canonical, opts)}
-      :error -> {:error, :invalid_shard_id}
+    case ShardId.cast(shard_id) do
+      {:ok, canonical} ->
+        # Embed the shard's current revocation version (expert review #31); a later
+        # revoke/1 bumps the floor above this, so this token stops verifying. A
+        # directory-unreachable mint (the `mix fathom.token` task runs with config
+        # only, no Repo) defaults to version 1 — the floor is also read fail-open, so
+        # a v1 token works until a revoke actually bumps the floor above 1.
+        version = current_token_version(canonical)
+        payload = %{"s" => canonical, "v" => version}
+        {:ok, Phoenix.Token.sign(secret!(), @salt, payload, opts)}
+
+      :error ->
+        {:error, :invalid_shard_id}
+    end
+  end
+
+  @doc """
+  Revokes every outstanding token for `shard_id` (expert review #31): bumps the
+  directory revocation version and refreshes this node's cache so the floor takes
+  effect immediately here (other nodes converge within the cache TTL). Returns the
+  new version, or `{:error, :invalid_shard_id}`.
+  """
+  @spec revoke(term()) :: {:ok, pos_integer()} | {:error, :invalid_shard_id}
+  def revoke(shard_id) do
+    case ShardId.cast(shard_id) do
+      {:ok, canonical} ->
+        version = Directory.bump_token_version(canonical)
+        Revocations.put(canonical, version)
+        {:ok, version}
+
+      :error ->
+        {:error, :invalid_shard_id}
     end
   end
 
@@ -116,14 +165,27 @@ defmodule Fathom.HranaAuth do
     end
   end
 
-  # The endpoint's secret_key_base straight from config (Phoenix.Token key-derives
-  # per salt, so sharing the secret with cookie signing is fine); no dependency on
-  # the endpoint process, so this works in mix tasks and before Edge starts.
+  # The token-signing secret: a DEDICATED :hrana_token_secret when set (expert
+  # review #31 — decouples the data-path credential from web session/CSRF signing),
+  # falling back to the endpoint's secret_key_base for backward compatibility. No
+  # dependency on the endpoint process, so this works in mix tasks and before Edge
+  # starts.
   defp secret! do
-    Application.get_env(:fathom, FathomWeb.Endpoint, [])[:secret_key_base] ||
-      raise "config error: :hrana_auth needs a secret_key_base under " <>
-              "config :fathom, FathomWeb.Endpoint (prod sets it from SECRET_KEY_BASE)"
+    Application.get_env(:fathom, :hrana_token_secret) ||
+      Application.get_env(:fathom, FathomWeb.Endpoint, [])[:secret_key_base] ||
+      raise "config error: :hrana_auth needs :hrana_token_secret (or a " <>
+              "secret_key_base under config :fathom, FathomWeb.Endpoint)"
   end
 
   defp max_age, do: Application.get_env(:fathom, :hrana_token_max_age, :infinity)
+
+  # Read the shard's mint-time version, defaulting to 1 when the directory can't be
+  # reached (the mix-task path has no Repo; the floor is read fail-open to match).
+  defp current_token_version(canonical) do
+    Directory.token_version(canonical) || 1
+  rescue
+    _ -> 1
+  catch
+    :exit, _ -> 1
+  end
 end
