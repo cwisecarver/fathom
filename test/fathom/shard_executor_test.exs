@@ -111,6 +111,38 @@ defmodule Fathom.ShardExecutorTest do
     assert ShardExecutor.shard_from_conn(conn(:get, "http://localhost/")) == "demo"
   end
 
+  # Expert review #13: with no serving-zone anchor, the first label of ANY multi-label
+  # Host selected a shard — the primary production tenant-selection path trusted a fully
+  # attacker-controlled header. With :shard_base_domain configured, only
+  # <shard>.<zone> resolves; foreign zones, nested labels, and zone-suffix smuggling
+  # fail closed to the default chain. Cross-tenant selection is release-blocker class
+  # (AGENTS.md shard-isolation gate).
+  test "with a serving zone configured, only hosts in the zone select shards" do
+    prev = Application.get_env(:fathom, :shard_base_domain)
+    Application.put_env(:fathom, :shard_base_domain, "fathom.test")
+
+    on_exit(fn ->
+      if is_nil(prev),
+        do: Application.delete_env(:fathom, :shard_base_domain),
+        else: Application.put_env(:fathom, :shard_base_domain, prev)
+    end)
+
+    resolve = fn url -> ShardExecutor.shard_from_conn(conn(:get, url)) end
+
+    # In-zone hosts resolve (case-insensitively, trailing dot tolerated).
+    assert resolve.("http://acme.fathom.test/") == "acme"
+    assert resolve.("http://acme.FATHOM.test./") == "acme"
+
+    # A foreign zone with a shard-shaped first label must NOT select that shard.
+    assert resolve.("http://victimshard.attacker.com/") == "demo"
+
+    # Nested labels can't smuggle a different shard under the zone suffix.
+    assert resolve.("http://victim.attacker.fathom.test/") == "demo"
+
+    # A bare zone host (no shard label) falls through.
+    assert resolve.("http://fathom.test/") == "demo"
+  end
+
   # Expert review #36: Plug parses `?db[]=a&db[]=b` into a LIST and `?db[k]=v` into a
   # MAP, and normalize_resolved only had nil/binary heads — a crafted query param raised
   # FunctionClauseError on the resolve path (shard_from_conn is Filo's open_arg with no

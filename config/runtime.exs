@@ -69,6 +69,14 @@ if config_env() == :prod do
   # boundary is the network, so the port must be reachable only via the L7 LB. Pin the listener
   # to the private interface the LB reaches as defense-in-depth alongside the firewall/security
   # group (the primary control). Unset ⇒ bind all interfaces (relies on network isolation alone).
+  # Anchor Host-subdomain shard routing to the serving zone (expert review #13):
+  # with SHARD_BASE_DOMAIN=fathom.example, only <shard>.fathom.example selects a
+  # shard; any foreign/misrouted Host fails closed to the default-shard chain.
+  # Unset = unanchored (the pre-anchor behavior) — set it in any real deployment.
+  if zone = System.get_env("SHARD_BASE_DOMAIN") do
+    config :fathom, :shard_base_domain, zone
+  end
+
   if bind = System.get_env("HRANA_BIND_IP") do
     case :inet.parse_address(String.to_charlist(bind)) do
       {:ok, ip} -> config :fathom, :hrana_bind_ip, ip

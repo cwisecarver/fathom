@@ -297,12 +297,32 @@ defmodule Fathom.ShardExecutor do
     host = String.trim_trailing(host, ".")
 
     with false <- ip?(host),
-         [sub, _ | _] = labels <- String.split(host, "."),
-         true <- Enum.all?(labels, &(&1 != "")),
+         [sub | rest] when rest != [] <- String.split(host, "."),
+         true <- Enum.all?([sub | rest], &(&1 != "")),
+         true <- zone_matches?(rest),
          true <- Fathom.ShardId.valid?(sub) do
       sub
     else
       _ -> nil
+    end
+  end
+
+  # Expert review #13: the first label of ANY multi-label host used to select a
+  # shard, so the primary tenant-selection path trusted a fully attacker-controlled
+  # header with no domain anchoring — the same unauthenticated primitive finding #4
+  # gated the ?db= override for, left open on the main path. With
+  # `config :fathom, :shard_base_domain` set (prod: SHARD_BASE_DOMAIN, e.g.
+  # "fathom.example"), the first label is promoted ONLY when the remaining labels
+  # equal the serving zone; anything else fails closed to the default-shard chain.
+  # nil (the dev/test default) keeps the unanchored behavior for localhost rigs.
+  defp zone_matches?(rest) do
+    case Application.get_env(:fathom, :shard_base_domain) do
+      nil ->
+        true
+
+      zone ->
+        normalized = zone |> String.trim_leading(".") |> String.trim_trailing(".")
+        String.downcase(Enum.join(rest, ".")) == String.downcase(normalized)
     end
   end
 
