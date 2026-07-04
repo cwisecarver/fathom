@@ -105,6 +105,11 @@ defmodule Fathom.Shards do
         # Nothing to migrate yet (a brand-new shard is born at HEAD via
         # fork-from-template, not migrated).
         {:error, :no_live_object} -> :ok
+        # HEAD dropped (a yank) between this node's cache refresh and the run
+        # (round-2 #23): the target no longer exists, and serving the shard at its
+        # OLD version is exactly correct — never fail the client checkout for a
+        # version the fleet just reverted away from.
+        {:error, {:unknown_version, _}} -> :ok
         # Another worker holds it / it's busy — the caller retries.
         {:retry, reason} -> {:error, {:shard_migrating, reason}}
         {:error, _} = error -> error

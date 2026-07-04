@@ -43,6 +43,20 @@ defmodule Fathom.Migrator.ShardMigrationJob do
         Logger.info("shard #{shard_id}: migration deferred (#{inspect(reason)})")
         {:snooze, @snooze_seconds}
 
+      # The target is unknown or YANKED (round-2 #23) — deterministic: the version
+      # will never exist again, so retrying burns attempts against nothing, and
+      # mark_failed would QUARANTINE a shard that was never touched and is healthy
+      # at its old version (quarantine also hides it from shards_at_version, so a
+      # later revert skips it too). Cancel without marking; the shard stays a
+      # normal active citizen of whatever sweep applies next.
+      {:error, {:unknown_version, target}} ->
+        Logger.warning(
+          "shard #{shard_id}: migration target v#{target} is unknown/yanked; " <>
+            "cancelling (shard untouched, not quarantined)"
+        )
+
+        {:cancel, :unknown_version}
+
       {:error, reason} ->
         handle_error(job, shard_id, reason)
     end

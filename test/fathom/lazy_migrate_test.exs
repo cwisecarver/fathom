@@ -84,6 +84,33 @@ defmodule Fathom.LazyMigrateTest do
     ShardExecutor.close(conn)
   end
 
+  # Round-2 #23 (the client-visible half): when HEAD drops on a yank, other nodes
+  # read a stale-HIGH head from their TTL cache for up to one TTL. The lazy path
+  # then targets the yanked version, gets {:error, {:unknown_version, _}}, and
+  # pre-fix FAILED THE CLIENT CHECKOUT — for a shard that is perfectly healthy at
+  # its old version, which is exactly what the fleet wants it to serve.
+  test "a stale-high HEAD after a yank serves the old version instead of failing checkout",
+       %{shard: shard} do
+    Application.put_env(:fathom, :lazy_migrate, true)
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    assert :ok = Migrator.yank(2)
+
+    # Another node's stale cache window: HEAD still reads 2 for up to one TTL.
+    pt_key = {Fathom.Migrator.HeadCache, :head}
+    prev_head = :persistent_term.get(pt_key, 0)
+    on_exit(fn -> :persistent_term.put(pt_key, prev_head) end)
+    :persistent_term.put(pt_key, 2)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    # Served at the old version — no failure, no migration to the yanked target.
+    assert {:ok, %{schema_version: 1}} = Directory.get(shard)
+    assert {:ok, %StmtResult{cols: ["id", "name"]}} = exec(conn, "SELECT * FROM app_thing")
+
+    ShardExecutor.close(conn)
+  end
+
   test "without lazy_migrate, checkout serves the shard as-is", %{shard: shard} do
     # lazy_migrate stays disabled (default).
     seed_v1!(shard)

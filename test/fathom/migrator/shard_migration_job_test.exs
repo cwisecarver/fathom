@@ -235,10 +235,14 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
 
   test "exhausted attempts quarantine the shard", %{shard: shard} do
     {:ok, _} = Directory.resolve(shard)
-    # target 9 has no released statements -> a permanent {:error, :unknown_version}.
+    # A RELEASED target but no live storage object -> a persistent {:error, _}
+    # through every retry. (An unknown/yanked target no longer quarantines — that
+    # cancels without marking, round-2 #23 — so it can't be the vehicle here.)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+
     capture_log(fn ->
       assert {:cancel, _} =
-               perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 9}, attempt: 5)
+               perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2}, attempt: 5)
     end)
 
     assert {:ok, %{status: "migration_failed"}} = Directory.get(shard)
@@ -308,6 +312,30 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
              perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 1, "force" => true})
 
     assert {:ok, %{schema_version: 1}} = Directory.get(shard)
+  end
+
+  # Round-2 #23: a job surviving a yank (or dequeuing after it) hit
+  # statements/1 == nil → {:error, {:unknown_version, target}} — a DETERMINISTIC
+  # error it retried 5 times against a version that will never exist, and then
+  # mark_failed QUARANTINED a shard that was never touched and is healthy at its old
+  # version (quarantine also hides it from shards_at_version, so a later revert
+  # skipped it too). The invariant: an unknown/yanked target cancels the job and
+  # leaves the shard an ordinary active citizen.
+  test "a yanked target cancels the job without quarantining the untouched shard",
+       %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    assert :ok = Migrator.yank(2)
+
+    capture_log(fn ->
+      # Even on the FINAL attempt, no quarantine — pre-fix this marked the shard
+      # migration_failed and returned {:cancel, {:unknown_version, 2}}.
+      assert {:cancel, :unknown_version} =
+               perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2}, attempt: 5)
+    end)
+
+    assert {:ok, %{status: "active", schema_version: 1}} = Directory.get(shard),
+           "a healthy shard must not be quarantined for a target that no longer exists"
   end
 
   # Round-2 #21a: an EXECUTING RevertJob already deserialized its args, so the force
