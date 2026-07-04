@@ -44,25 +44,33 @@ defmodule Fathom.Shard.Storage.Local do
     # remote's current etag still matches what the coordinator last saw (or, for a brand-new
     # shard, only if no object exists). A mismatch means a stealer flushed in the window since
     # the fence check → superseded, don't clobber (finding #15).
-    with {:ok, body} <- File.read(local_path) do
-      current =
-        case File.read(remote_path(shard_id)) do
-          {:ok, remote_body} -> content_etag(remote_body)
-          {:error, :enoent} -> nil
-          {:error, reason} -> throw({:error, reason})
-        end
-
-      cond do
-        expected_etag != current ->
-          {:error, :superseded}
-
-        true ->
-          case Storage.atomic_write(remote_path(shard_id), body) do
-            :ok -> {:ok, content_etag(body)}
-            err -> err
+    #
+    # Runs UNDER the per-shard mutex (expert review #28): the read-compare-write must be
+    # atomic to faithfully double S3's server-side conditional PUT. Without it two concurrent
+    # fenced flushes both read the same `current`, both pass the compare, and both write
+    # (last-write-wins) — a split-brain the fence exists to prevent, invisible to any test
+    # driven through this backend. #38 mutexed the LOCK ops but not this DATA flush.
+    with_lock_mutex(shard_id, fn ->
+      with {:ok, body} <- File.read(local_path) do
+        current =
+          case File.read(remote_path(shard_id)) do
+            {:ok, remote_body} -> content_etag(remote_body)
+            {:error, :enoent} -> nil
+            {:error, reason} -> throw({:error, reason})
           end
+
+        cond do
+          expected_etag != current ->
+            {:error, :superseded}
+
+          true ->
+            case Storage.atomic_write(remote_path(shard_id), body) do
+              :ok -> {:ok, content_etag(body)}
+              err -> err
+            end
+        end
       end
-    end
+    end)
   catch
     {:error, _} = err -> err
   end
@@ -207,12 +215,17 @@ defmodule Fathom.Shard.Storage.Local do
 
   @impl true
   def check_lease(shard_id, %{owner: owner, epoch: epoch}) do
-    case read_lock(shard_id) do
-      {:ok, %{owner: ^owner, epoch: ^epoch}} -> :ok
-      {:ok, _other} -> {:error, :superseded}
-      :enoent -> {:error, :superseded}
-      {:error, reason} -> {:error, reason}
-    end
+    # Read under the mutex (expert review #28) so the fence read is serialized against
+    # in-flight lock mutations, matching S3's atomic conditional read. With the atomic
+    # write_lock below a torn read is already impossible; this adds mutation ordering.
+    with_lock_mutex(shard_id, fn ->
+      case read_lock(shard_id) do
+        {:ok, %{owner: ^owner, epoch: ^epoch}} -> :ok
+        {:ok, _other} -> {:error, :superseded}
+        :enoent -> {:error, :superseded}
+        {:error, reason} -> {:error, reason}
+      end
+    end)
   end
 
   # --- node heartbeat ---
@@ -322,10 +335,12 @@ defmodule Fathom.Shard.Storage.Local do
   end
 
   defp write_lock(shard_id, lease) do
-    path = lock_path(shard_id)
-    File.mkdir_p!(Path.dirname(path))
-
-    case File.write(path, Storage.encode_lease(lease)) do
+    # atomic_write, not a truncating File.write (expert review #28/#39): a concurrent
+    # reader (check_lease, owner_live?) must never observe the empty/partial file
+    # between truncate and write — that reads as :corrupt_lock and fails the fence
+    # closed spuriously. Callers already hold the per-shard mutex; this covers a read
+    # racing the write. Mirrors the renew_heartbeat fix.
+    case Storage.atomic_write(lock_path(shard_id), Storage.encode_lease(lease)) do
       :ok -> {:ok, lease}
       err -> err
     end

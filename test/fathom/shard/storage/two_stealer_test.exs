@@ -75,4 +75,51 @@ defmodule Fathom.Shard.Storage.TwoStealerTest do
              "round #{round}: the loser must be refused with the winner as holder"
     end
   end
+
+  # Expert review #28: #38 mutexed the LOCK ops but not the conditional DATA flush —
+  # `flush/3` was a read-compare-write outside the mutex, so two concurrent fenced
+  # flushes with the same expected etag both read the same `current`, both pass the
+  # compare, and both write (last-write-wins): a split-brain the fence exists to
+  # prevent, and structurally invisible to any test driven through this backend (the
+  # double S3 tests can't reproduce it). The invariant: of two concurrent flushes
+  # fencing the same etag, exactly one commits and the other is superseded.
+  test "of two concurrent fenced flushes on the same etag, exactly one wins", %{dir: dir} do
+    File.mkdir_p!(dir)
+
+    for round <- 1..@rounds do
+      shard = "flushrace_#{round}"
+
+      # Seed a base object; capture its etag as the shared fence baseline.
+      base = Path.join(dir, "base_#{round}.db")
+      File.write!(base, "base-#{round}")
+      :ok = Local.flush(shard, base)
+      {:ok, e0} = Local.object_etag(shard)
+
+      a = Path.join(dir, "a_#{round}.db")
+      b = Path.join(dir, "b_#{round}.db")
+      File.write!(a, "writer-a-#{round}")
+      File.write!(b, "writer-b-#{round}")
+
+      tasks =
+        for path <- [a, b] do
+          Task.async(fn ->
+            receive do
+              :go -> Local.flush(shard, path, e0)
+            end
+          end)
+        end
+
+      Enum.each(tasks, &send(&1.pid, :go))
+      results = Task.await_many(tasks, 5_000)
+
+      oks = for {:ok, _etag} <- results, do: :ok
+      superseded = for {:error, :superseded} <- results, do: :superseded
+
+      assert length(oks) == 1,
+             "round #{round}: exactly one fenced flush must commit, got #{inspect(results)}"
+
+      assert length(superseded) == 1,
+             "round #{round}: the loser must be :superseded, got #{inspect(results)}"
+    end
+  end
 end
