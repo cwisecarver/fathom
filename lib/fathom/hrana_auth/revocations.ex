@@ -66,7 +66,7 @@ defmodule Fathom.HranaAuth.Revocations do
   end
 
   @impl true
-  def init(opts) do
+  def init(_opts) do
     # public read_concurrency: verify/2 runs in the stream process and reads directly.
     :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
 
@@ -77,7 +77,12 @@ defmodule Fathom.HranaAuth.Revocations do
     # notifier is already running on it. Best-effort: without it (Oban down, bench
     # harness), the TTL remains the convergence backstop.
     listen_for_revocations()
-    {:ok, %{ttl_ms: Keyword.get(opts, :ttl_ms, ttl_ms())}}
+
+    # No per-process TTL state (round-2 #37): lookup/insert run in CALLER processes
+    # against the public table and read `:hrana_revocation_ttl_ms` directly, so a
+    # child-spec ttl_ms option was stored here but never consulted — a silently
+    # no-op knob. The app env IS the knob (see ttl_ms/0).
+    {:ok, %{}}
   end
 
   @impl true
