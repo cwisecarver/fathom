@@ -25,7 +25,7 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
       for path <- Path.wildcard(Path.join([System.tmp_dir!(), "fathom_shards", "#{shard}*"])),
           do: File.rm(path)
 
-      File.rm(Path.join([@remote_dir, "heartbeats", "thief@node"]))
+      File.rm(Path.join([@remote_dir, "heartbeats", URI.encode_www_form("thief@node")]))
     end)
 
     %{shard: shard}
@@ -78,7 +78,7 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     File.mkdir_p!(hb_dir)
 
     File.write!(
-      Path.join(hb_dir, "thief@node"),
+      Path.join(hb_dir, URI.encode_www_form("thief@node")),
       Jason.encode!(%{"owner" => "thief@node", "expires_at_ms" => exp})
     )
   end

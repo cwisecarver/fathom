@@ -29,8 +29,9 @@ defmodule Fathom.ShardLeaseTest do
           do: File.rm(Path.join(dir, shard <> suffix))
 
       # Heartbeats are keyed by owner (not shard); drop the simulated foreign nodes'.
+      # Owner is percent-encoded in the path (round-2 #3).
       for owner <- ["a@node", "b@node", "thief@node"],
-          do: File.rm(Path.join([@remote_dir, "heartbeats", owner]))
+          do: File.rm(Path.join([@remote_dir, "heartbeats", URI.encode_www_form(owner)]))
     end)
 
     %{shard: shard}
@@ -62,8 +63,9 @@ defmodule Fathom.ShardLeaseTest do
     dir = Path.join(@remote_dir, "heartbeats")
     File.mkdir_p!(dir)
 
+    # Encode the owner to match the backend's heartbeat_path (round-2 #3).
     File.write!(
-      Path.join(dir, owner),
+      Path.join(dir, URI.encode_www_form(owner)),
       Jason.encode!(%{"owner" => owner, "expires_at_ms" => expires_at_ms})
     )
   end

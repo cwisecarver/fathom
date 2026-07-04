@@ -33,8 +33,10 @@ defmodule Fathom.Shard.Storage.HeartbeatLeaseTest do
   defp write_heartbeat(dir, owner, expires_at_ms) do
     File.mkdir_p!(Path.join(dir, "heartbeats"))
 
+    # Encode the owner to match the backend's heartbeat_path (round-2 #3): the backend
+    # reads `heartbeats/<encoded-owner>`, so a raw-path write is invisible to it.
     File.write!(
-      Path.join([dir, "heartbeats", owner]),
+      Path.join([dir, "heartbeats", URI.encode_www_form(owner)]),
       Storage.encode_heartbeat(%{owner: owner, expires_at_ms: expires_at_ms})
     )
   end

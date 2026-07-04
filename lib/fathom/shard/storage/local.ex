@@ -203,13 +203,21 @@ defmodule Fathom.Shard.Storage.Local do
     margin = Storage.steal_margin_ms()
 
     case Storage.read_heartbeat(other) do
-      {:ok, %{expires_at_ms: exp}} when now <= exp + margin -> :live
-      {:ok, _stale} -> :dead
+      # Owner-match verification (expert review round-2 #3), mirroring the S3 backend.
+      {:ok, %{owner: ^other, expires_at_ms: exp}} ->
+        if now <= exp + margin, do: :live, else: :dead
+
+      {:ok, _mismatch} ->
+        if now <= lock_expires_at_ms + margin, do: :live, else: :dead
+
       # No heartbeat object at all (`heartbeat_server: false` legacy mode, or the owner's
       # heartbeat was cleared): fall back to the lock's OWN TTL for liveness (finding #11), so
       # a live owner renewing its lock per-shard isn't instantly stolen. Heartbeat stays primary.
-      :not_found -> if now <= lock_expires_at_ms + margin, do: :live, else: :dead
-      {:error, reason} -> {:error, reason}
+      :not_found ->
+        if now <= lock_expires_at_ms + margin, do: :live, else: :dead
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -378,7 +386,11 @@ defmodule Fathom.Shard.Storage.Local do
     end
   end
 
-  defp heartbeat_path(owner), do: Path.join([dir(), "heartbeats", owner])
+  # Encode the owner for parity with the S3 backend (expert review round-2 #3): `#` is a
+  # legal filename char so Local never needed it, but keying both doubles identically
+  # keeps the fence's test-double faithful (the S3 backend must encode — a raw `#` is a
+  # URI fragment there).
+  defp heartbeat_path(owner), do: Path.join([dir(), "heartbeats", URI.encode_www_form(owner)])
 
   defp dir do
     Application.get_env(:fathom, __MODULE__, [])[:dir] ||

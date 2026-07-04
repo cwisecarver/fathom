@@ -517,15 +517,27 @@ defmodule Fathom.Shard.Storage.S3 do
     margin = Storage.steal_margin_ms()
 
     case Storage.read_heartbeat(other) do
-      {:ok, %{expires_at_ms: exp}} when now <= exp + margin -> :live
-      {:ok, _stale} -> :dead
+      # Verify the heartbeat body's owner matches (expert review round-2 #3, defense in
+      # depth): with the per-owner key this always holds, but never trust a mismatched
+      # body to declare `other` live.
+      {:ok, %{owner: ^other, expires_at_ms: exp}} ->
+        if now <= exp + margin, do: :live, else: :dead
+
+      # A heartbeat object that isn't `other`'s — treat as no signal and fall back to the
+      # lock's own TTL, same as :not_found.
+      {:ok, _mismatch} ->
+        if now <= lock_expires_at_ms + margin, do: :live, else: :dead
+
       # No heartbeat object at all (`heartbeat_server: false` legacy mode, or the owner's
       # heartbeat was cleared): fall back to the lock's OWN TTL for liveness (finding #11).
       # Without this, a live owner that renews its lock per-shard (the legacy fence) looks
       # instantly dead and any contender steals it. The heartbeat stays primary; this is the
       # pre-heartbeat lease-TTL fence, applied only when there is no heartbeat to consult.
-      :not_found -> if now <= lock_expires_at_ms + margin, do: :live, else: :dead
-      {:error, reason} -> {:error, reason}
+      :not_found ->
+        if now <= lock_expires_at_ms + margin, do: :live, else: :dead
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -700,7 +712,14 @@ defmodule Fathom.Shard.Storage.S3 do
 
   defp object_path(shard_id), do: url_path(db_key(shard_id))
   defp lock_path(shard_id), do: url_path(prefix() <> shard_id <> ".lock")
-  defp heartbeat_path(owner), do: url_path(prefix() <> "heartbeats/" <> owner)
+  # Percent-encode the owner (expert review round-2 #3): the incarnation-qualified owner
+  # is `node()#<nonce>`, and Req parses the URL with URI.parse — a raw `#` is a fragment
+  # delimiter, never transmitted, so every incarnation of a node name collided on
+  # `heartbeats/<node>` with the nonce silently stripped (voiding #6's boot-scoped
+  # identity on S3 while the Local double, using `#` as a legal filename char, passed).
+  # encode_www_form makes the whole owner one safe path segment.
+  defp heartbeat_path(owner),
+    do: url_path(prefix() <> "heartbeats/" <> URI.encode_www_form(owner))
 
   defp db_key(shard_id), do: prefix() <> shard_id <> ".db"
 
