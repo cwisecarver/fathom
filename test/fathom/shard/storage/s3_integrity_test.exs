@@ -81,6 +81,21 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
     assert {:error, :checksum_mismatch} = S3.pull_if_changed("s", Path.join(dir, "w.db"), nil)
   end
 
+  # Expert review #20: a single PUT past S3's 5 GB ceiling used to fail opaquely
+  # mid-transfer; it is now refused up front with an explicit error. (Ceiling
+  # shrunk via config so the test doesn't need a 5 GB file.)
+  test "a flush past the single-PUT ceiling is refused explicitly", %{dir: dir} do
+    put_s3_config(fn conn -> Plug.Conn.send_resp(conn, 200, "") end)
+    Application.put_env(:fathom, :s3_max_single_put, 4)
+    on_exit(fn -> Application.delete_env(:fathom, :s3_max_single_put) end)
+
+    local = Path.join(dir, "big.db")
+    File.write!(local, "way-more-than-four-bytes")
+
+    assert {:error, {:object_too_large, _}} = S3.flush("big", local)
+    assert {:error, {:object_too_large, _}} = S3.flush("big", local, nil)
+  end
+
   test "a matching MD5 etag pulls normally; non-MD5 etags skip verification", %{dir: dir} do
     put_s3_config(fn conn ->
       case Plug.Conn.request_url(conn) =~ "multi" do

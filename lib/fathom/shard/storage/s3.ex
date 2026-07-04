@@ -53,6 +53,12 @@ defmodule Fathom.Shard.Storage.S3 do
   @default_pool_size 200
   @default_pool_count 1
 
+  # Streaming transfer tuning (expert review #20): bodies are streamed in chunks in
+  # both directions instead of materialized whole in the BEAM, and a single PUT is
+  # refused past S3's 5 GB single-request ceiling (previously it failed opaquely).
+  @stream_chunk 1024 * 1024
+  @max_single_put 5 * 1024 * 1024 * 1024
+
   @doc """
   Name of the dedicated Finch pool that carries all S3 traffic.
   """
@@ -130,37 +136,29 @@ defmodule Fathom.Shard.Storage.S3 do
 
   @impl true
   def pull(shard_id, local_path) do
-    case Req.get(req(), url: object_path(shard_id)) do
-      {:ok, %{status: 200, body: body, headers: h}} ->
-        # Atomic local write so a concurrent reader never sees a half-downloaded file (#24).
-        # Return the object's etag so the coordinator can fence its first flush (#15).
-        # The body is verified against an MD5-shaped etag first (expert review #37) so
-        # a corrupted transfer is an error, not a served shard.
-        with :ok <- verify_body(body, etag(h)),
-             :ok <- Storage.atomic_write(local_path, body) do
-          {:ok, etag(h)}
-        end
-
-      # Brand-new shard — no object, nothing written, no etag to fence against yet.
-      {:ok, %{status: 404}} ->
-        {:ok, nil}
-
-      {:ok, %{status: status}} ->
-        {:error, {:s3_get_status, status}}
-
-      {:error, reason} ->
-        {:error, reason}
+    # Streamed to disk, never buffered whole in the BEAM (expert review #20): the
+    # correlated moments — warming bursts, failover, N concurrent pulls — used to
+    # hold (transfers x shard size) resident. The body is MD5-verified against an
+    # MD5-shaped etag as it streams (expert review #37), then fsynced and renamed
+    # into place atomically (#24/#17).
+    case download(object_path(shard_id), local_path) do
+      {:ok, etag} -> {:ok, etag}
+      {:error, _} = error -> error
+      :absent -> {:ok, nil}
     end
   end
 
   @impl true
   def flush(shard_id, local_path) do
-    with {:ok, body} <- File.read(local_path),
+    with {:ok, size, md5} <- stat_and_md5(local_path),
          {:ok, %{status: status}} <-
            Req.put(req(),
              url: object_path(shard_id),
-             body: body,
-             headers: [{"content-md5", content_md5(body)}]
+             body: File.stream!(local_path, @stream_chunk),
+             headers: [
+               {"content-length", Integer.to_string(size)},
+               {"content-md5", md5}
+             ]
            ) do
       if status in 200..299, do: :ok, else: {:error, {:s3_put_status, status}}
     end
@@ -175,12 +173,15 @@ defmodule Fathom.Shard.Storage.S3 do
     cond_headers =
       if expected_etag, do: [{"if-match", expected_etag}], else: [{"if-none-match", "*"}]
 
-    with {:ok, body} <- File.read(local_path),
+    with {:ok, size, md5} <- stat_and_md5(local_path),
          {:ok, resp} <-
            Req.put(req(),
              url: object_path(shard_id),
-             body: body,
-             headers: [{"content-md5", content_md5(body)} | cond_headers]
+             body: File.stream!(local_path, @stream_chunk),
+             headers: [
+               {"content-length", Integer.to_string(size)},
+               {"content-md5", md5} | cond_headers
+             ]
            ) do
       case resp.status do
         s when s in 200..299 -> {:ok, etag(resp.headers)}
@@ -226,24 +227,41 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   # Integrity (expert review #37): TLS/TCP catch wire corruption, but nothing caught
-  # corruption introduced BEFORE the socket — a torn File.read against a bad disk, a
-  # buggy proxy, or an S3-compatible store bug. A corrupted upload was accepted as the
-  # durable object, and because the fence etag chain advances from the response, every
-  # later conditional op treated the corrupt object as truth — discovered only at the
-  # next cold open, after the good local copy was gone.
+  # corruption introduced BEFORE the socket — a torn read off a bad disk, a buggy
+  # proxy, or an S3-compatible store bug. Content-MD5 on every data PUT makes the
+  # store reject a torn upload; downloads verify the streamed body's MD5 against the
+  # returned etag when it's the MD5-shaped single-part form (32 hex chars —
+  # multipart/encrypted etags are not MD5s and are skipped).
   #
-  # Content-MD5 on every data PUT makes the store reject a torn upload; on pull, the
-  # body is verified against the returned etag when it's the MD5-shaped single-part
-  # form (32 hex chars — multipart/encrypted etags are not MD5s and are skipped).
-  defp content_md5(body), do: :crypto.hash(:md5, body) |> Base.encode64()
+  # Uploads hash the file in a chunked pass (Content-MD5 is a header, so it must be
+  # known before the body streams; the page cache makes the second pass cheap) and
+  # refuse a single PUT past the 5 GB ceiling (expert review #20).
+  defp stat_and_md5(path) do
+    with {:ok, %{size: size}} <- File.stat(path) do
+      if size > Application.get_env(:fathom, :s3_max_single_put, @max_single_put) do
+        {:error, {:object_too_large, size}}
+      else
+        md5 =
+          path
+          |> File.stream!(@stream_chunk)
+          |> Enum.reduce(:crypto.hash_init(:md5), &:crypto.hash_update(&2, &1))
+          |> :crypto.hash_final()
+          |> Base.encode64()
 
-  defp verify_body(_body, nil), do: :ok
+        {:ok, size, md5}
+      end
+    end
+  rescue
+    e in File.Error -> {:error, e.reason}
+  end
 
-  defp verify_body(body, etag) do
+  defp verify_md5(_digest, nil), do: :ok
+
+  defp verify_md5(digest, etag) do
     plain = String.trim(etag, ~s("))
 
     if md5_etag?(plain) and
-         Base.encode16(:crypto.hash(:md5, body), case: :lower) != String.downcase(plain) do
+         Base.encode16(digest, case: :lower) != String.downcase(plain) do
       {:error, :checksum_mismatch}
     else
       :ok
@@ -251,6 +269,61 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   defp md5_etag?(plain), do: plain =~ ~r/\A[0-9a-fA-F]{32}\z/
+
+  # Streamed GET straight to a sibling temp of `local_path` (expert review #20):
+  # chunks are written to disk and MD5-hashed as they arrive — the whole object is
+  # never resident in the BEAM. On 200 the digest is verified (#37) and the temp is
+  # fsynced + renamed into place (#24/#17). Returns {:ok, etag} | :absent |
+  # :unchanged (with allow_304) | {:error, reason}.
+  defp download(url, local_path, headers \\ [], opts \\ []) do
+    tmp = "#{local_path}.dl.#{System.unique_integer([:positive])}"
+    File.mkdir_p!(Path.dirname(local_path))
+    {:ok, fd} = File.open(tmp, [:write, :raw, :binary])
+
+    into = fn {:data, chunk}, {req, resp} ->
+      if resp.status == 200 do
+        :ok = IO.binwrite(fd, chunk)
+        md5 = resp.private[:fathom_md5] || :crypto.hash_init(:md5)
+        resp = Req.Response.put_private(resp, :fathom_md5, :crypto.hash_update(md5, chunk))
+        {:cont, {req, resp}}
+      else
+        {:cont, {req, resp}}
+      end
+    end
+
+    result = Req.get(req(), url: url, headers: headers, into: into)
+    :ok = File.close(fd)
+
+    case result do
+      {:ok, %{status: 200} = resp} ->
+        digest = :crypto.hash_final(resp.private[:fathom_md5] || :crypto.hash_init(:md5))
+
+        with :ok <- verify_md5(digest, etag(resp.headers)),
+             :ok <- Storage.promote_temp(tmp, local_path) do
+          {:ok, etag(resp.headers)}
+        else
+          {:error, _} = error ->
+            File.rm(tmp)
+            error
+        end
+
+      {:ok, %{status: 304}} ->
+        File.rm(tmp)
+        if opts[:allow_304], do: :unchanged, else: {:error, {:s3_get_status, 304}}
+
+      {:ok, %{status: 404}} ->
+        File.rm(tmp)
+        :absent
+
+      {:ok, %{status: status}} ->
+        File.rm(tmp)
+        {:error, {:s3_get_status, status}}
+
+      {:error, reason} ->
+        File.rm(tmp)
+        {:error, reason}
+    end
+  end
 
   @impl true
   def object_etag(shard_id) do
@@ -270,26 +343,12 @@ defmodule Fathom.Shard.Storage.S3 do
   def pull_if_changed(shard_id, local_path, etag) do
     headers = if etag, do: [{"if-none-match", etag}], else: []
 
-    case Req.get(req(), url: object_path(shard_id), headers: headers) do
-      {:ok, %{status: 304}} ->
-        {:ok, :unchanged}
-
-      {:ok, %{status: 200, body: body, headers: h}} ->
-        # Atomic so a warm-cache rewrite can't be read half-old/half-new by a promotion (#24).
-        # Verified like pull/2 (expert review #37).
-        with :ok <- verify_body(body, etag(h)),
-             :ok <- Storage.atomic_write(local_path, body) do
-          {:ok, {:written, etag(h)}}
-        end
-
-      {:ok, %{status: 404}} ->
-        {:ok, :absent}
-
-      {:ok, %{status: status}} ->
-        {:error, {:s3_get_status, status}}
-
-      {:error, reason} ->
-        {:error, reason}
+    # Streamed + verified like pull/2 (expert reviews #20/#37); a 304 transfers no body.
+    case download(object_path(shard_id), local_path, headers, allow_304: true) do
+      {:ok, new_etag} -> {:ok, {:written, new_etag}}
+      :unchanged -> {:ok, :unchanged}
+      :absent -> {:ok, :absent}
+      {:error, _} = error -> error
     end
   end
 

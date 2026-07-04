@@ -347,6 +347,26 @@ defmodule Fathom.Shard.Storage do
     end
   end
 
+  @doc """
+  Fsync + atomically rename an already-materialized temp into `dst` — the promotion
+  half of `atomic_write/2` for callers that STREAM their bytes into the temp
+  themselves (the S3 backend's downloads, expert review #20) instead of buffering a
+  whole object in memory. Same crash-consistency contract (expert review #17).
+  """
+  @spec promote_temp(Path.t(), Path.t()) :: :ok | {:error, term()}
+  def promote_temp(tmp, dst) do
+    File.mkdir_p!(Path.dirname(dst))
+
+    with :ok <- sync_file(tmp),
+         :ok <- File.rename(tmp, dst) do
+      :ok
+    else
+      {:error, _} = err ->
+        File.rm(tmp)
+        err
+    end
+  end
+
   defp sync_file(path) do
     case :file.open(path, [:read, :write, :raw, :binary]) do
       {:ok, fd} ->
