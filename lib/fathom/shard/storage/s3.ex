@@ -215,10 +215,17 @@ defmodule Fathom.Shard.Storage.S3 do
                  {"x-amz-copy-source-if-match", etag}
                ]
              ) do
-          {:ok, %{status: s}} when s in 200..299 -> :ok
-          {:ok, %{status: 412}} when attempt < 2 -> touch_object(shard_id, attempt + 1)
-          {:ok, %{status: s}} -> {:error, {:s3_touch_status, s}}
-          {:error, reason} -> {:error, reason}
+          {:ok, %{status: s, body: body}} when s in 200..299 ->
+            if copy_body_ok?(body), do: :ok, else: {:error, {:s3_touch_error_body, body}}
+
+          {:ok, %{status: 412}} when attempt < 2 ->
+            touch_object(shard_id, attempt + 1)
+
+          {:ok, %{status: s}} ->
+            {:error, {:s3_touch_status, s}}
+
+          {:error, reason} ->
+            {:error, reason}
         end
 
       {:error, reason} ->
@@ -414,11 +421,28 @@ defmodule Fathom.Shard.Storage.S3 do
     source = "/" <> fetch!(config(), :bucket) <> "/" <> src_key
 
     case Req.put(req(), url: url_path(dst_key), headers: [{"x-amz-copy-source", source}]) do
-      {:ok, %{status: status}} when status in 200..299 -> :ok
-      {:ok, %{status: status}} -> {:error, {:s3_copy_status, status}}
-      {:error, reason} -> {:error, reason}
+      {:ok, %{status: status, body: body}} when status in 200..299 ->
+        if copy_body_ok?(body), do: :ok, else: {:error, {:s3_copy_error_body, body}}
+
+      {:ok, %{status: status}} ->
+        {:error, {:s3_copy_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
+
+  # A CopyObject can return 200 OK then stream an `<Error>` XML body when the copy
+  # fails AFTER response headers are sent (expert review #8) — so status alone is not
+  # proof of success. A real success carries `<CopyObjectResult>`; treat an `<Error>`
+  # body as failure so the steal-touch fence (touch_object) and the migration
+  # retain/restore backups can't silently no-op (a lost fence is split-brain; a
+  # lost backup is an unrecoverable revert). An empty / non-XML 2xx body (some
+  # S3-compatible stores) is taken as success. NOTE: CopyObject also caps at 5 GB per
+  # request; a multipart-copy path for >5 GB shards is deferred (fathom's thesis is
+  # millions of SMALL shards — see the gated CopyObject work, round-2 #4).
+  defp copy_body_ok?(body) when is_binary(body), do: not String.contains?(body, "<Error")
+  defp copy_body_ok?(_), do: true
 
   # --- leasing ---
 
