@@ -143,8 +143,15 @@ defmodule Fathom.ShardDurabilityTest do
     prev_storage = Application.get_env(:fathom, :shard_storage)
     Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
 
-    # During the flush PUT, a stealer overwrites the shard object (changing its etag).
-    steal = fn -> File.write!(remote_db(shard), "stolen-by-a-newer-owner") end
+    # During the flush PUT, a REAL stealer takes the lock (a new owner/epoch) AND
+    # overwrites the shard object. Both matter now (expert review #2): a 412 with the
+    # lock still ours is treated as our own lost-but-applied PUT, so a genuine steal
+    # must also bump the lock for the coordinator to self-fence.
+    steal = fn ->
+      put_raw_lock(shard, "thief@node", 999, now_ms() + 60_000)
+      File.write!(remote_db(shard), "stolen-by-a-newer-owner")
+    end
+
     Application.put_env(:fathom, :faulty_before, {:flush, steal})
 
     on_exit(fn ->
@@ -169,6 +176,52 @@ defmodule Fathom.ShardDurabilityTest do
 
     assert File.read!(remote_db(shard)) == "stolen-by-a-newer-owner",
            "the coordinator must not clobber the object a stealer wrote during the flush"
+  end
+
+  # Round-2 expert review #2: a data-PUT 412 was unconditionally read as "a stealer
+  # flushed" → self-fence + drop_local (unrecoverable). But our OWN PUT can land
+  # server-side while its response is lost (Req retries the idempotent PUT, and the
+  # retry 412s against our first attempt's own write); the next flush then fences with
+  # our stale etag and 412s against our own durable bytes — with NO steal. The
+  # invariant: a 412 with the LOCK still ours must NOT self-fence off a shard we own.
+  # Simulated by changing the object etag mid-flush WITHOUT taking the lock.
+  test "a durability-flush 412 with the lock still ours does not self-fence", %{shard: shard} do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    # Our own PUT landed (lost response): the object etag changes under us so the fenced
+    # flush 412s — but NO stealer took the lock; it is still ours.
+    own_put = fn -> File.write!(remote_db(shard), "our-own-landed-snapshot") end
+    Application.put_env(:fathom, :faulty_before, {:flush, own_put})
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    ref = Process.monitor(coordinator)
+
+    capture_log(fn ->
+      send(coordinator, :durability_flush)
+      # Pre-fix: self-fenced ({:shutdown, :lease_lost}) off a shard it still owns.
+      refute_receive {:DOWN, ^ref, :process, ^coordinator, {:shutdown, :lease_lost}}, 500
+    end)
+
+    assert Process.alive?(coordinator), "the coordinator must keep owning a shard it never lost"
+
+    assert {:ok, %StmtResult{rows: [["alice"]]}} =
+             ShardExecutor.execute(conn, stmt("SELECT v FROM kv")),
+           "the shard keeps serving; its acknowledged writes are intact"
+
+    ShardExecutor.close(conn)
   end
 
   # Finding #27: dirtiness is a write-counter watermark, not a boolean cleared after the flush. A

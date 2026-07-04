@@ -578,12 +578,18 @@ defmodule Fathom.Shard do
         {:noreply,
          schedule_flush(%{state | flushed_through: state.flush_pending, etag: new_etag})}
 
-      # The data PUT's If-Match failed: a stealer flushed in the upload window since
-      # our fence check. Self-fence — do NOT retry over the new owner (finding #15).
+      # The data PUT's If-Match failed (412). The OBJECT changed — but a 412 is NOT
+      # proof of a STEAL (expert review #2): our own PUT can land server-side while its
+      # response is lost (Req retries the idempotent PUT, and the retry 412s against our
+      # first attempt's own write), and the next flush then fences with our stale etag
+      # and 412s against our own durable bytes. Only a real steal bumps the LOCK, so
+      # re-check it before self-fencing off a shard we still own and dropping
+      # acknowledged writes unrecoverably.
       {:error, :superseded} ->
-        Logger.error("shard #{state.id}: object superseded during durability flush; self-fencing")
-
-        {:stop, {:shutdown, :lease_lost}, %{state | lease_lost: true}}
+        case reconcile_superseded(state) do
+          {:ok, state} -> {:noreply, schedule_flush(state)}
+          :superseded -> {:stop, {:shutdown, :lease_lost}, %{state | lease_lost: true}}
+        end
 
       # Snapshot/PUT failed transiently: don't advance the watermark, so it stays
       # dirty and the next interval retries — and a later idle-drop flushes before
@@ -859,14 +865,26 @@ defmodule Fathom.Shard do
               drop_local(state.path)
               Storage.release_lease(state.id, state.lease)
 
-            # A stealer flushed since the fence check — don't clobber. We're stopping, so drop
-            # the local copy (the new owner is authoritative) without writing over it (#15).
+            # A data-PUT 412 (expert review #2): re-check the lock before treating it as
+            # a steal. Lock still ours ⇒ our own PUT landed (lost response); the object
+            # is durably ours ⇒ drop + release like a clean flush. Genuinely superseded ⇒
+            # keep the local copy (NOT drop_local, which is unrecoverable): the next
+            # open's provenance-sidecar check (#1) then arbitrates recoverably.
             {:error, :superseded} ->
-              Logger.warning(
-                "shard #{state.id}: object superseded before flush; dropping local without clobbering"
-              )
+              case Storage.check_lease(state.id, state.lease) do
+                :ok ->
+                  Logger.info(
+                    "shard #{state.id}: flush 412 but lock still ours; object is durable, dropping"
+                  )
 
-              drop_local(state.path)
+                  drop_local(state.path)
+                  Storage.release_lease(state.id, state.lease)
+
+                _ ->
+                  Logger.warning(
+                    "shard #{state.id}: object superseded before flush; keeping local for recovery"
+                  )
+              end
 
             {:error, reason} ->
               Logger.warning(
@@ -889,6 +907,33 @@ defmodule Fathom.Shard do
     end
 
     :ok
+  end
+
+  # Disambiguate a data-PUT 412 during the periodic durability flush (expert review #2).
+  # A 412 means the object changed since our fence etag; re-check the LOCK to tell "our
+  # own lost-but-applied PUT" (lock still ours — the single writer, so the object is our
+  # own bytes) from a real steal (lock superseded). Returns `{:ok, state}` (resync the
+  # fence etag to the object's current value and advance the watermark — our writes up
+  # to flush_pending are durable — keep serving) or `:superseded` (self-fence). On an
+  # unconfirmable lock read, don't self-fence on uncertainty: keep dirty and retry.
+  defp reconcile_superseded(state) do
+    case Storage.check_lease(state.id, state.lease) do
+      :ok ->
+        case Storage.object_etag(state.id) do
+          {:ok, etag} when not is_nil(etag) ->
+            write_etag_sidecar(state.path, etag)
+            {:ok, %{state | etag: etag, flushed_through: state.flush_pending}}
+
+          _ ->
+            {:ok, state}
+        end
+
+      {:error, :superseded} ->
+        :superseded
+
+      {:error, _transient} ->
+        {:ok, state}
+    end
   end
 
   # Upload the shard for a drop. The cheap path folds the WAL into the main file in
