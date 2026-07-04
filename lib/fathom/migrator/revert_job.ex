@@ -42,6 +42,11 @@ defmodule Fathom.Migrator.RevertJob do
     # Job id as the lease token — distinct from any forward ShardMigrationJob's owner, so the two
     # can't merge via the same-owner reclaim path (finding #9).
     case ShardMigration.revert(shard_id, to_version, id, force: Map.get(args, "force", false)) do
+      # Already fully reverted (a crashed-after-cutover retry, round-2 #30) — nothing
+      # was touched, so there is no fresh backup to schedule retirement for.
+      :ok ->
+        :ok
+
       {:ok, %{from: backed_up}} ->
         # The revert backed the live vN object up as <shard>@<backed_up> (finding #13); retire it
         # after the retention window so it doesn't leak (RetirementJob only ever drops the

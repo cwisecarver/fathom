@@ -180,6 +180,26 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     refute_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1})
   end
 
+  # Round-2 #30: a RevertJob dying between the cutover and the Oban ack retries with
+  # the revert ALREADY complete — and the re-run took the destructive path again:
+  # retain(current == to_version) copied live over the retained @to_version backup,
+  # destroying the recovery copy the NEXT revert restores from. The invariant: a
+  # completed revert's retry is a no-op that touches no storage.
+  test "a revert retry after a completed cutover is a no-op, not a destructive re-run",
+       %{shard: shard} do
+    # The completed revert's end state: directory AND live file both at v1 ...
+    seed_v1!(shard)
+    # ... and a retained @1 backup whose bytes must survive the retry.
+    backup = Path.join(@remote_dir, "#{shard}@1.db")
+    File.write!(backup, "the-retained-backup-bytes")
+    on_exit(fn -> File.rm(backup) end)
+
+    assert :ok = perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 1})
+
+    assert File.read!(backup) == "the-retained-backup-bytes",
+           "a completed-revert retry must not clobber the retained backup"
+  end
+
   test "a held lease snoozes the job", %{shard: shard} do
     # Jobs only ever target directory-known shards (they're enqueued from directory
     # queries) — register it, since run/3 no longer implicitly mints rows (#40).

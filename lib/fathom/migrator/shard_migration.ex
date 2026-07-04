@@ -62,9 +62,13 @@ defmodule Fathom.Migrator.ShardMigration do
   `{:error, {:writes_since_cutover | :unknown_write_age, details}}` unless `opts` carries
   `force: true`. The refusal is deterministic (retrying won't change it): callers should
   surface it to the operator, not retry.
+
+  Returns plain `:ok` when the revert has already fully completed (directory AND live
+  file both at `to_version` — a crashed-after-cutover retry, round-2 #30): re-running
+  the destructive path would clobber the retained backup with the restored bytes.
   """
   @spec revert(String.t(), non_neg_integer(), term(), keyword()) ::
-          {:ok, map()} | {:retry, term()} | {:error, term()}
+          :ok | {:ok, map()} | {:retry, term()} | {:error, term()}
   def revert(shard_id, to_version, token \\ make_token(), opts \\ []) do
     force? = Keyword.get(opts, :force, false)
 
@@ -83,39 +87,52 @@ defmodule Fathom.Migrator.ShardMigration do
         # The revert doesn't fence its restore on the etag (deferred with the CopyObject
         # fencing work — round-2 #4/#8), so it ignores the pulled etag.
         with {:ok, _etag} <- pull_live(shard_id, tmp) do
-          if live_version(tmp) == to_version and to_version != current do
-            # Crash-forward (expert review #10): a prior attempt already restored
-            # to_version over live but died before the cutover, so the directory still
-            # says `current`. Re-running retain(current) here would copy the RESTORED
-            # bytes now in live over the <shard>@<current> backup — destroying the only
-            # copy of the post-cutover writes that backup exists to preserve (and the
-            # write-age guard passes identically on a retry, so nothing else stops it).
-            # The live file's own user_version is the truth: just finish the cutover.
-            with {:ok, _} <- Directory.cutover(shard_id, to_version) do
-              warn_revert(shard_id, current, to_version, last_active)
-              {:ok, %{from: current, to: to_version}}
-            end
+          # Round-2 #30 (crash-forward, the OTHER half of #10 below): the cutover
+          # already completed and the job died before acking — the retry must be a
+          # NO-OP. Re-entering the destructive path would retain(current==to_version),
+          # copying live over the retained @to_version backup (destroying the recovery
+          # copy the next revert restores from), or spuriously log "revert REFUSED".
+          if live_version(tmp) == to_version and to_version == current do
+            :ok
           else
-            # Self-fence before the clobbering restore: a steal since acquire means a newer
-            # owner is authoritative, so abort rather than overwrite it (finding #7).
-            with :ok <- write_age_guard(shard_id, last_active, cutover_at, force?),
-                 :ok <- fence(shard_id, lease),
-                 # Back up the live vN object BEFORE overwriting it with vN-1, so the discarded
-                 # post-cutover writes survive at <shard>@<current> for the retention window
-                 # instead of being destroyed unrecoverably (finding #13). RevertJob schedules
-                 # its retirement.
-                 :ok <- Storage.retain(shard_id, current),
-                 :ok <- Storage.restore(shard_id, to_version),
-                 {:ok, _} <- Directory.cutover(shard_id, to_version) do
-              warn_revert(shard_id, current, to_version, last_active)
-              {:ok, %{from: current, to: to_version}}
-            end
+            do_revert(shard_id, to_version, current, last_active, cutover_at, tmp, lease, force?)
           end
         end
       after
         drop_temp(tmp)
       end
     end)
+  end
+
+  defp do_revert(shard_id, to_version, current, last_active, cutover_at, tmp, lease, force?) do
+    if live_version(tmp) == to_version and to_version != current do
+      # Crash-forward (expert review #10): a prior attempt already restored
+      # to_version over live but died before the cutover, so the directory still
+      # says `current`. Re-running retain(current) here would copy the RESTORED
+      # bytes now in live over the <shard>@<current> backup — destroying the only
+      # copy of the post-cutover writes that backup exists to preserve (and the
+      # write-age guard passes identically on a retry, so nothing else stops it).
+      # The live file's own user_version is the truth: just finish the cutover.
+      with {:ok, _} <- Directory.cutover(shard_id, to_version) do
+        warn_revert(shard_id, current, to_version, last_active)
+        {:ok, %{from: current, to: to_version}}
+      end
+    else
+      # Self-fence before the clobbering restore: a steal since acquire means a newer
+      # owner is authoritative, so abort rather than overwrite it (finding #7).
+      with :ok <- write_age_guard(shard_id, last_active, cutover_at, force?),
+           :ok <- fence(shard_id, lease),
+           # Back up the live vN object BEFORE overwriting it with vN-1, so the discarded
+           # post-cutover writes survive at <shard>@<current> for the retention window
+           # instead of being destroyed unrecoverably (finding #13). RevertJob schedules
+           # its retirement.
+           :ok <- Storage.retain(shard_id, current),
+           :ok <- Storage.restore(shard_id, to_version),
+           {:ok, _} <- Directory.cutover(shard_id, to_version) do
+        warn_revert(shard_id, current, to_version, last_active)
+        {:ok, %{from: current, to: to_version}}
+      end
+    end
   end
 
   # The hard guard in front of the destructive restore (finding #13). Directory.cutover stamps
