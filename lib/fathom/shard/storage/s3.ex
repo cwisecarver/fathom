@@ -275,9 +275,23 @@ defmodule Fathom.Shard.Storage.S3 do
   # never resident in the BEAM. On 200 the digest is verified (#37) and the temp is
   # fsynced + renamed into place (#24/#17). Returns {:ok, etag} | :absent |
   # :unchanged (with allow_304) | {:error, reason}.
+  # Bounded transient retries, each with a FRESH temp + fd (expert review #1). The
+  # download MUST run with `retry: false`: Req's default `:safe_transient` retry
+  # re-runs the request against the SAME still-open fd on a mid-body transport error,
+  # appending the retry's body after the first attempt's partial bytes — and because
+  # the streamed-chunk MD5 restarts per Response, the digest covers only the final
+  # attempt and CERTIFIES the `partial₁ ++ full₂` corruption (defeating #37's integrity
+  # check on exactly the tear it exists to catch). We instead retry the whole download
+  # ourselves so every attempt writes a clean temp.
+  @download_attempts 3
+
   defp download(url, local_path, headers \\ [], opts \\ []) do
-    tmp = "#{local_path}.dl.#{System.unique_integer([:positive])}"
     File.mkdir_p!(Path.dirname(local_path))
+    do_download(url, local_path, headers, opts, @download_attempts)
+  end
+
+  defp do_download(url, local_path, headers, opts, attempts_left) do
+    tmp = "#{local_path}.dl.#{System.unique_integer([:positive])}"
     {:ok, fd} = File.open(tmp, [:write, :raw, :binary])
 
     into = fn {:data, chunk}, {req, resp} ->
@@ -291,20 +305,26 @@ defmodule Fathom.Shard.Storage.S3 do
       end
     end
 
-    result = Req.get(req(), url: url, headers: headers, into: into)
+    result = Req.get(req(), url: url, headers: headers, into: into, retry: false)
     :ok = File.close(fd)
 
     case result do
       {:ok, %{status: 200} = resp} ->
         digest = :crypto.hash_final(resp.private[:fathom_md5] || :crypto.hash_init(:md5))
 
-        with :ok <- verify_md5(digest, etag(resp.headers)),
-             :ok <- Storage.promote_temp(tmp, local_path) do
-          {:ok, etag(resp.headers)}
-        else
-          {:error, _} = error ->
+        case verify_md5(digest, etag(resp.headers)) do
+          :ok ->
+            case Storage.promote_temp(tmp, local_path) do
+              :ok -> {:ok, etag(resp.headers)}
+              {:error, _} = error -> file_error(tmp, error)
+            end
+
+          # A torn transfer produced bytes that don't match the object's etag — a
+          # transient corruption, not a permanent one; retry the whole download with a
+          # fresh temp rather than failing the pull outright (expert review #1).
+          {:error, :checksum_mismatch} = error ->
             File.rm(tmp)
-            error
+            retry_or(error, url, local_path, headers, opts, attempts_left)
         end
 
       {:ok, %{status: 304}} ->
@@ -319,10 +339,25 @@ defmodule Fathom.Shard.Storage.S3 do
         File.rm(tmp)
         {:error, {:s3_get_status, status}}
 
+      # A transport error (possibly mid-body, so the temp may hold partial bytes):
+      # drop the partial temp and retry the whole download with a fresh one.
       {:error, reason} ->
         File.rm(tmp)
-        {:error, reason}
+        retry_or({:error, reason}, url, local_path, headers, opts, attempts_left)
     end
+  end
+
+  defp retry_or(error, url, local_path, headers, opts, attempts_left) do
+    if attempts_left > 1 do
+      do_download(url, local_path, headers, opts, attempts_left - 1)
+    else
+      error
+    end
+  end
+
+  defp file_error(tmp, error) do
+    File.rm(tmp)
+    error
   end
 
   @impl true

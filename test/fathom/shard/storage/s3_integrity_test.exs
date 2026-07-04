@@ -81,6 +81,38 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
     assert {:error, :checksum_mismatch} = S3.pull_if_changed("s", Path.join(dir, "w.db"), nil)
   end
 
+  # Round-2 expert review #1: the streamed download ran with Req's default
+  # `:safe_transient` retry, which re-runs the request over the SAME still-open fd on a
+  # mid-body transport error — appending the retry's body after the first attempt's
+  # partial bytes, while the per-Response streamed MD5 restarts and certifies the
+  # `partial ++ full` result. The download now runs `retry: false` and retries the
+  # WHOLE transfer itself with a fresh temp, treating a torn transfer (checksum
+  # mismatch) as retryable rather than fatal. The invariant: a transient bad transfer
+  # is recovered and the promoted file's bytes match the etag — never a certified-corrupt
+  # concatenation.
+  test "a torn transfer is retried with a fresh temp and recovers the correct bytes",
+       %{dir: dir} do
+    attempts = start_supervised!({Agent, fn -> 0 end})
+
+    put_s3_config(fn conn ->
+      n = Agent.get_and_update(attempts, &{&1 + 1, &1 + 1})
+      # Attempt 1: the store's etag claims the GOOD MD5 but the body is torn/corrupt.
+      # Attempt 2+: the clean body.
+      body = if n == 1, do: "torn-partial-garbage", else: @good
+
+      conn
+      |> Plug.Conn.put_resp_header("etag", md5_etag(@good))
+      |> Plug.Conn.send_resp(200, body)
+    end)
+
+    local = Path.join(dir, "torn.db")
+
+    # Pre-fix: attempt 1's mismatch was fatal ({:error, :checksum_mismatch}, no file).
+    assert {:ok, _etag} = S3.pull("s", local)
+    assert File.read!(local) == @good, "the recovered file must be the clean bytes, not a tear"
+    assert Agent.get(attempts, & &1) == 2, "must have retried exactly once"
+  end
+
   # Expert review #20: a single PUT past S3's 5 GB ceiling used to fail opaquely
   # mid-transfer; it is now refused up front with an explicit error. (Ceiling
   # shrunk via config so the test doesn't need a 5 GB file.)
