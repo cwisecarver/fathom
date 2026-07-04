@@ -482,11 +482,9 @@ defmodule Fathom.Shard.Storage.S3 do
             {:error, {:held, other}}
 
           :dead ->
-            case put_lock(
-                   shard_id,
-                   %{owner: owner, epoch: epoch + 1, expires_at_ms: now + ttl_ms},
-                   if_match: etag
-                 ) do
+            stolen = %{owner: owner, epoch: epoch + 1, expires_at_ms: now + ttl_ms}
+
+            case put_lock(shard_id, stolen, if_match: etag) do
               {:ok, lease} ->
                 # Expert review #3: invalidate the DATA object's etag at steal time,
                 # BEFORE the new owner pulls/serves. The old owner may be stalled
@@ -501,10 +499,22 @@ defmodule Fathom.Shard.Storage.S3 do
                   :ok ->
                     {:ok, Map.put(lease, :took_over, true)}
 
-                  # Fail closed: an un-fenced steal is not a steal. Release our
-                  # fresh lock claim implicitly by not serving (the caller refuses
-                  # the open and retries).
+                  # Fail closed: an un-fenced steal is not a steal — but the epoch+1
+                  # lock write already LANDED, and leaving it would let our own next
+                  # checkout RECLAIM it (same owner + epoch) with no `took_over`:
+                  # the zombie fence and the takeover revalidation both skipped for a
+                  # takeover that was never fenced (expert review round-2 #20). Roll
+                  # the lock back to the dead owner's original content (conditional —
+                  # a genuinely newer writer is never clobbered) so the retry redoes
+                  # the FULL steal + touch. Best-effort: if the rollback itself
+                  # fails, the etag data-fence still backstops a clobber.
                   {:error, reason} ->
+                    restore_lock(shard_id, stolen, %{
+                      owner: other,
+                      epoch: epoch,
+                      expires_at_ms: lock_exp
+                    })
+
                     {:error, {:transient_lookup, {:touch_failed, reason}}}
                 end
 
@@ -723,6 +733,22 @@ defmodule Fathom.Shard.Storage.S3 do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  # Roll a failed steal's lock write back to the prior (dead) owner's content
+  # (expert review round-2 #20), so the next acquire re-enters the steal path —
+  # epoch bump + data-object touch — instead of RECLAIMING an unfenced takeover.
+  # Conditional on the lock still being exactly our failed-steal write; any
+  # concurrent change wins and the rollback no-ops.
+  defp restore_lock(shard_id, ours, original) do
+    case get_lock(shard_id) do
+      {:ok, %{owner: o, epoch: e}, etag} when o == ours.owner and e == ours.epoch ->
+        _ = put_lock(shard_id, original, if_match: etag)
+        :ok
+
+      _ ->
+        :ok
     end
   end
 
