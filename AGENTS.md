@@ -48,7 +48,7 @@ iex -S mix phx.server   # start app (dashboard :4000)
 
 ## Workflow
 
-Plan mode for non-trivial tasks (3+ steps or an architectural decision). Stop and re-plan when something goes wrong. Use subagents for research/exploration/parallel work — one task each.
+Plan mode for non-trivial tasks (3+ steps or an architectural decision). Stop and re-plan when something goes wrong. Use subagents for research/exploration/parallel work — one task each. When the parent model is Fable, use your own judgement about which model each subagent should run on (match the model to the subtask's difficulty rather than defaulting to the parent's).
 
 **Implementation cycle:** implement → compile → test → (bench if hot path) → `mix precommit` → commit → **push**. Test after every change; fix failures before proceeding. Commit in logical units matching plan phases.
 
