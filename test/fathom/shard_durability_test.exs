@@ -831,6 +831,37 @@ defmodule Fathom.ShardDurabilityTest do
     assert Enum.sort(values) == ["fork-one", "fork-two"]
   end
 
+  # Expert review round-2 #27: externally-killed pulls/snapshots (Task.shutdown
+  # brutal_kill, pull timeouts, the follower's :kill_task) strand uniquely-named
+  # `.dl.<n>` / `.snap.<n>` temps that no fixed-suffix sweeper matches — an
+  # unbounded, shard-sized disk leak. The invariant: a coordinator open reaps its
+  # shard's STALE temps (age-gated past the pull timeout) while leaving fresh
+  # sibling work and real sidecars untouched.
+  test "a coordinator open reaps its shard's stale orphaned temps", %{shard: shard} do
+    path = local_db(shard)
+    File.mkdir_p!(Path.dirname(path))
+
+    stale_dl = path <> ".dl.99"
+    stale_snap = path <> ".snap.7"
+    fresh_dl = path <> ".dl.100"
+
+    File.write!(stale_dl, "orphaned partial download")
+    File.write!(stale_snap, "orphaned snapshot")
+    File.write!(fresh_dl, "a concurrent pull's live temp")
+    # The orphans predate any plausible in-flight work.
+    for f <- [stale_dl, stale_snap], do: File.touch!(f, {{2020, 1, 1}, {0, 0, 0}})
+
+    on_exit(fn -> Enum.each([stale_dl, stale_snap, fresh_dl], &File.rm/1) end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    refute File.exists?(stale_dl), "a stale orphaned download temp must be reaped at open"
+    refute File.exists?(stale_snap), "a stale orphaned snapshot temp must be reaped at open"
+    assert File.exists?(fresh_dl), "the age gate must protect fresh sibling work"
+
+    ShardExecutor.close(conn)
+  end
+
   # Expert review #14: the WriteCounter's ETS table dies with its owner, and a restart
   # handed every open coordinator a FRESH EMPTY table — count(id) = 0 — while each kept
   # its old flushed_through watermark, so `count > flushed_through` classified every

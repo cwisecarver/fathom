@@ -99,6 +99,16 @@ defmodule Fathom.Shard.WarmFollower do
   end
 
   defp refresh(state) do
+    # Reap orphaned temps from killed pulls (expert review round-2 #27): the
+    # `on_timeout: :kill_task` below strands a uniquely-named `.dl.*` temp every
+    # time a pull outlives its timeout — and failover congestion makes timeouts
+    # CLUSTER, with a retry every poll, so the disk-bound density budget fills with
+    # garbage nothing deletes. Age-gated past the pull timeout so live pulls'
+    # fresh temps are never touched; the cache dir is bounded by :warm_cache_max,
+    # so the glob is cheap.
+    reaped = Storage.reap_stale_temps(Path.join(cache_dir(), "*"), 2 * pull_timeout())
+    if reaped > 0, do: Logger.info("warm-follower: reaped #{reaped} orphaned temp(s)")
+
     target = target_set(state.cache_max)
     to_evict = MapSet.difference(state.cached, target)
 

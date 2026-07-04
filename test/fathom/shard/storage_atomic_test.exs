@@ -19,6 +19,27 @@ defmodule Fathom.Shard.StorageAtomicTest do
 
   defp temps(dir), do: Path.wildcard(Path.join(dir, "*.tmp.*"))
 
+  # Expert review round-2 #27: the reaper for temps stranded by external kills.
+  # Stale `.dl.*`/`.snap.*`/`.tmp.*`/`.pull*` siblings go; fresh temps (the age
+  # gate: possibly live work) and real files/sidecars stay.
+  test "reap_stale_temps removes only stale temp siblings", %{dir: dir} do
+    base = Path.join(dir, "shard.db")
+    old = {{2020, 1, 1}, {0, 0, 0}}
+
+    stale = [base <> ".dl.1", base <> ".snap.2", base <> ".tmp.3", base <> ".pull"]
+    keep = [base, base <> ".etag", base <> "-wal", base <> ".forked.123-4", base <> ".dl.9"]
+
+    for f <- stale ++ keep, do: File.write!(f, "x")
+    # Everything except the fresh .dl.9 (and the keeps' ages don't matter — suffix
+    # is what protects them; age the sidecars too to prove it).
+    for f <- stale ++ (keep -- [base <> ".dl.9"]), do: File.touch!(f, old)
+
+    assert Storage.reap_stale_temps(base, 60_000) == 4
+
+    for f <- stale, do: refute(File.exists?(f), "#{f} must be reaped")
+    for f <- keep, do: assert(File.exists?(f), "#{f} must survive the reap")
+  end
+
   test "atomic_write writes the whole body and leaves no temp residue", %{dir: dir} do
     dst = Path.join(dir, "obj.db")
     assert :ok = Storage.atomic_write(dst, "hello-world")

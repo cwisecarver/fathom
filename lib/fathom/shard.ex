@@ -196,6 +196,20 @@ defmodule Fathom.Shard do
     open_started = System.monotonic_time()
     path = db_path(shard_id)
     File.mkdir_p!(Path.dirname(path))
+
+    # Reap THIS shard's orphaned temps from externally-killed pulls/snapshots
+    # (expert review round-2 #27) — uniquely-named `.dl.*`/`.snap.*` files no
+    # fixed-suffix sweeper matches, an unbounded disk leak. Age-gated well past the
+    # pull timeout so a concurrent task's live temp is never touched; a previous
+    # coordinator for this shard is necessarily dead (registry-unique), so its
+    # stale temps are provably garbage.
+    reaped = Storage.reap_stale_temps(path, 2 * @pull_timeout)
+    if reaped > 0, do: Logger.info("shard #{shard_id}: reaped #{reaped} orphaned temp(s)")
+    # The wildcard's readdir garbage (O(data-dir entries) of binaries) would
+    # otherwise sit on this LONG-LIVED coordinator's heap until its next natural
+    # GC — measured as +68% fanout_kb_per_shard at 1000 open shards. Collect it
+    # now, while the heap holds nothing else worth keeping.
+    :erlang.garbage_collect()
     # node()#<boot nonce> — boot-scoped lease identity (expert review #6): a lock
     # left by a previous incarnation of this node name is a FOREIGN owner, so it is
     # stolen (liveness check + epoch bump), never silently reclaimed at the same

@@ -301,56 +301,62 @@ defmodule Fathom.Shard.Storage.S3 do
     tmp = "#{local_path}.dl.#{System.unique_integer([:positive])}"
     {:ok, fd} = File.open(tmp, [:write, :raw, :binary])
 
-    into = fn {:data, chunk}, {req, resp} ->
-      if resp.status == 200 do
-        :ok = IO.binwrite(fd, chunk)
-        md5 = resp.private[:fathom_md5] || :crypto.hash_init(:md5)
-        resp = Req.Response.put_private(resp, :fathom_md5, :crypto.hash_update(md5, chunk))
-        {:cont, {req, resp}}
-      else
-        {:cont, {req, resp}}
-      end
-    end
-
-    result = Req.get(req(), url: url, headers: headers, into: into, retry: false)
-    :ok = File.close(fd)
-
-    case result do
-      {:ok, %{status: 200} = resp} ->
-        digest = :crypto.hash_final(resp.private[:fathom_md5] || :crypto.hash_init(:md5))
-
-        case verify_md5(digest, etag(resp.headers)) do
-          :ok ->
-            case Storage.promote_temp(tmp, local_path) do
-              :ok -> {:ok, etag(resp.headers)}
-              {:error, _} = error -> file_error(tmp, error)
-            end
-
-          # A torn transfer produced bytes that don't match the object's etag — a
-          # transient corruption, not a permanent one; retry the whole download with a
-          # fresh temp rather than failing the pull outright (expert review #1).
-          {:error, :checksum_mismatch} = error ->
-            File.rm(tmp)
-            retry_or(error, url, local_path, headers, opts, attempts_left)
+    # try/after (expert review round-2 #27): `:ok = IO.binwrite` RAISES on
+    # ENOSPC/EIO mid-stream, which previously skipped both the close and the rm —
+    # leaking the fd and stranding a shard-sized temp nothing reaps. The after
+    # unwinds on any exception; a successful promote renames tmp away first, so its
+    # rm is a harmless enoent. (An external brutal kill still can't unwind — the
+    # age-gated temp reaper at coordinator open / follower refresh covers that.)
+    try do
+      into = fn {:data, chunk}, {req, resp} ->
+        if resp.status == 200 do
+          :ok = IO.binwrite(fd, chunk)
+          md5 = resp.private[:fathom_md5] || :crypto.hash_init(:md5)
+          resp = Req.Response.put_private(resp, :fathom_md5, :crypto.hash_update(md5, chunk))
+          {:cont, {req, resp}}
+        else
+          {:cont, {req, resp}}
         end
+      end
 
-      {:ok, %{status: 304}} ->
-        File.rm(tmp)
-        if opts[:allow_304], do: :unchanged, else: {:error, {:s3_get_status, 304}}
+      result = Req.get(req(), url: url, headers: headers, into: into, retry: false)
+      :ok = File.close(fd)
 
-      {:ok, %{status: 404}} ->
-        File.rm(tmp)
-        :absent
+      case result do
+        {:ok, %{status: 200} = resp} ->
+          digest = :crypto.hash_final(resp.private[:fathom_md5] || :crypto.hash_init(:md5))
 
-      {:ok, %{status: status}} ->
-        File.rm(tmp)
-        {:error, {:s3_get_status, status}}
+          case verify_md5(digest, etag(resp.headers)) do
+            :ok ->
+              case Storage.promote_temp(tmp, local_path) do
+                :ok -> {:ok, etag(resp.headers)}
+                {:error, _} = error -> error
+              end
 
-      # A transport error (possibly mid-body, so the temp may hold partial bytes):
-      # drop the partial temp and retry the whole download with a fresh one.
-      {:error, reason} ->
-        File.rm(tmp)
-        retry_or({:error, reason}, url, local_path, headers, opts, attempts_left)
+            # A torn transfer produced bytes that don't match the object's etag — a
+            # transient corruption, not a permanent one; retry the whole download with a
+            # fresh temp rather than failing the pull outright (expert review #1).
+            {:error, :checksum_mismatch} = error ->
+              retry_or(error, url, local_path, headers, opts, attempts_left)
+          end
+
+        {:ok, %{status: 304}} ->
+          if opts[:allow_304], do: :unchanged, else: {:error, {:s3_get_status, 304}}
+
+        {:ok, %{status: 404}} ->
+          :absent
+
+        {:ok, %{status: status}} ->
+          {:error, {:s3_get_status, status}}
+
+        # A transport error (possibly mid-body, so the temp may hold partial bytes):
+        # drop the partial temp and retry the whole download with a fresh one.
+        {:error, reason} ->
+          retry_or({:error, reason}, url, local_path, headers, opts, attempts_left)
+      end
+    after
+      _ = File.close(fd)
+      File.rm(tmp)
     end
   end
 
@@ -360,11 +366,6 @@ defmodule Fathom.Shard.Storage.S3 do
     else
       error
     end
-  end
-
-  defp file_error(tmp, error) do
-    File.rm(tmp)
-    error
   end
 
   @impl true

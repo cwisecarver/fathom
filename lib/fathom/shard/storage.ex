@@ -367,6 +367,38 @@ defmodule Fathom.Shard.Storage do
     end
   end
 
+  @doc """
+  Remove orphaned sibling temps of `base` older than `older_than_ms` (expert review
+  round-2 #27): externally-killed downloads/snapshots (`Task.shutdown` brutal_kill,
+  pull timeouts, the follower's `:kill_task`) strand uniquely-named `.dl.*` /
+  `.snap.*` / `.tmp.*` / `.pull*` temps that no fixed-suffix sweeper ever matched —
+  an unbounded disk leak that eats the warm-standby density budget. The age gate
+  keeps any live sibling work (a concurrent pull's fresh temp) safe. `base` may
+  contain wildcards itself (the follower reaps `<cache_dir>/*`). Returns the number
+  reaped.
+  """
+  @spec reap_stale_temps(Path.t(), non_neg_integer()) :: non_neg_integer()
+  def reap_stale_temps(base, older_than_ms) do
+    cutoff = System.system_time(:second) - div(older_than_ms, 1000)
+
+    for tmp <- Path.wildcard(base <> ".{dl,snap,tmp,pull}*"),
+        stale_file?(tmp, cutoff),
+        reduce: 0 do
+      acc ->
+        case File.rm(tmp) do
+          :ok -> acc + 1
+          _ -> acc
+        end
+    end
+  end
+
+  defp stale_file?(path, cutoff) do
+    case File.stat(path, time: :posix) do
+      {:ok, %File.Stat{mtime: mtime}} -> mtime < cutoff
+      _ -> false
+    end
+  end
+
   defp sync_file(path) do
     case :file.open(path, [:read, :write, :raw, :binary]) do
       {:ok, fd} ->
