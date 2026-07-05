@@ -348,8 +348,16 @@ defmodule Fathom.Shard do
   # moved no bytes).
   defp revalidate_takeover(shard_id, path, lease, etag, warm?) do
     cond do
+      # Round-2 #19 (merged M15): a NON-takeover warm open must ALSO re-check its
+      # provenance AFTER the lease is held. quarantined_fork?'s HEAD runs before
+      # the acquire, and in that gap another owner can do a full
+      # acquire→flush→release cycle — release deletes the lock, so our acquire is
+      # a fresh epoch-1 create with no took_over, and the un-revalidated warm file
+      # would serve a STALE lineage (then lose its first-cycle accepted writes at
+      # the self-fence). One HEAD on the warm path converts this into an ordinary
+      # quarantine. Cold non-takeover opens pay nothing.
       lease[:took_over] != true ->
-        {:ok, etag}
+        if warm?, do: post_lease_warm_check(shard_id, path, etag), else: {:ok, etag}
 
       # The S3 steal-touch threaded its lineage through the lease (round-2 #6):
       # no extra HEAD (a separate read widened the laundering window), and the
@@ -441,6 +449,39 @@ defmodule Fathom.Shard do
     case Storage.pull(shard_id, pull_temp(path)) do
       {:ok, new_etag} -> promote_pull(path, new_etag)
       {:error, reason} -> {:error, {:revalidate_failed, reason}}
+    end
+  end
+
+  # See revalidate_takeover's #19 branch: the post-lease authority check for a
+  # warm, non-takeover open.
+  defp post_lease_warm_check(shard_id, path, etag) do
+    case Storage.object_etag(shard_id) do
+      # Unchanged since the pre-lease provenance check — the common warm restart.
+      {:ok, ^etag} ->
+        {:ok, etag}
+
+      # Object gone with a live local copy: the un-flushed brand-new stance — serve
+      # warm, fence with nil so the first flush RECREATES it (an If-Match against a
+      # gone object could never succeed), and drop the dangling sidecar.
+      {:ok, nil} ->
+        File.rm(etag_sidecar(path))
+        {:ok, nil}
+
+      # The release-in-gap fork (#19): another owner acquired, flushed, and
+      # released between our fork check and our acquire. The stored lineage moved
+      # past our local copy — quarantine it (#1 contract, honoring #14's
+      # failed-rename rule) and serve the store's current bytes.
+      {:ok, _moved} ->
+        if quarantine_fork!(shard_id, path, :diverged) == :ok do
+          repull(shard_id, path)
+        else
+          {:error, :quarantine_failed}
+        end
+
+      # Unreachable store: keep availability, fenced by the provenance etag — a
+      # genuinely-forked flush 412s rather than clobbers.
+      {:error, _unreachable} ->
+        {:ok, etag}
     end
   end
 

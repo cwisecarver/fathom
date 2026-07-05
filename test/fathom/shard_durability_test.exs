@@ -831,6 +831,76 @@ defmodule Fathom.ShardDurabilityTest do
     assert Enum.sort(values) == ["fork-one", "fork-two"]
   end
 
+  # Round-2 #19 (merged M15): the provenance/fork check runs BEFORE the lease
+  # acquire, and in that gap another owner can do a FULL acquire→flush→release
+  # cycle. Release deletes the lock, so our acquire is a fresh epoch-1 create with
+  # no took_over — the takeover revalidation was skipped entirely, and the warm
+  # local file (whose sidecar matched the store at check time) served a STALE
+  # lineage over the newer flushed one, losing its first-cycle accepted writes at
+  # the eventual self-fence. The invariant: EVERY warm open re-checks provenance
+  # after the lease is held; a moved lineage quarantines and re-pulls.
+  test "a full owner cycle in the fork-check-to-acquire gap cannot serve the stale warm file",
+       %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    on_exit(fn -> Enum.each(Path.wildcard(local_db(shard) <> ".forked*"), &File.rm_rf/1) end)
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    # The stored lineage E1, and a warm local copy honestly derived from it.
+    seed = Path.join(System.tmp_dir!(), "seed19_#{shard}.db")
+    {:ok, c} = Connection.open(seed)
+    :ok = Connection.exec(c, "CREATE TABLE kv (v TEXT)")
+    :ok = Connection.exec(c, "INSERT INTO kv VALUES ('e1')")
+    :ok = Connection.exec(c, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(c)
+    :ok = Storage.flush(shard, seed)
+
+    File.mkdir_p!(Path.dirname(local_db(shard)))
+    File.cp!(seed, local_db(shard))
+    {:ok, e1} = Storage.object_etag(shard)
+    File.write!(local_db(shard) <> ".etag", e1)
+    for s <- ["", "-wal", "-shm"], do: File.rm(seed <> s)
+
+    # In the gap between the fork check and OUR acquire, another owner runs a
+    # full cycle: acquire, flush E2, clean release (lock deleted).
+    e2_seed = Path.join(System.tmp_dir!(), "seed19b_#{shard}.db")
+
+    cycle = fn ->
+      {:ok, c2} = Connection.open(e2_seed)
+      :ok = Connection.exec(c2, "CREATE TABLE kv (v TEXT)")
+      :ok = Connection.exec(c2, "INSERT INTO kv VALUES ('e2')")
+      :ok = Connection.exec(c2, "PRAGMA wal_checkpoint(TRUNCATE)")
+      Connection.close(c2)
+      :ok = Fathom.Shard.Storage.Local.flush(shard, e2_seed)
+      for s <- ["", "-wal", "-shm"], do: File.rm(e2_seed <> s)
+      File.rm(Path.join(@remote_dir, "#{shard}.lock"))
+    end
+
+    Application.put_env(:fathom, :faulty_before, {:acquire, cycle})
+
+    capture_log(fn ->
+      {:ok, conn} = ShardExecutor.open(shard)
+
+      # The store's newer lineage must be served — pre-fix the stale warm file won.
+      assert {:ok, %StmtResult{rows: [["e2"]]}} =
+               ShardExecutor.execute(conn, stmt("SELECT v FROM kv")),
+             "a lineage that moved in the fork-check-to-acquire gap must be re-pulled"
+
+      assert Path.wildcard(local_db(shard) <> ".forked.*") != [],
+             "the stale warm copy must be quarantined for recovery"
+
+      close_and_stop(shard, conn)
+    end)
+  end
+
   # Expert review round-2 #29: on a takeover, revalidate_takeover's {:ok, nil}
   # branch (the object VANISHED between the speculative pull and the re-check)
   # returned the STALE pulled etag — so the first flush deterministically
