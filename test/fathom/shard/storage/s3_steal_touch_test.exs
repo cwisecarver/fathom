@@ -91,7 +91,10 @@ defmodule Fathom.Shard.Storage.S3StealTouchTest do
 
     # The new owner dies unrenewed; a second contender steals the same bytes.
     Agent.update(store, fn s ->
-      %{s | objects: Map.put(s.objects, @lock_key, %{body: dead_lock(), form: :single})}
+      %{
+        s
+        | objects: Map.put(s.objects, @lock_key, %{body: dead_lock(), form: :single, meta: %{}})
+      }
     end)
 
     assert {:ok, %{took_over: true}} = S3.acquire_lease(@shard, "third@node#inc3", 30_000)

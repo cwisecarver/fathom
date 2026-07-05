@@ -172,6 +172,10 @@ defmodule Fathom.Shard.Storage.S3 do
     # into place atomically (#24/#17).
     case download(object_path(shard_id), local_path) do
       {:ok, etag} -> {:ok, etag}
+      # A steal-time brand-new sentinel (round-2 #7): the shard is brand-new — no
+      # local file is written — but the first flush must fence with the SENTINEL's
+      # etag (If-Match replaces it; the zombie's If-None-Match:* create 412s).
+      {:sentinel, etag} -> {:ok, etag}
       {:error, _} = error -> error
       :absent -> {:ok, nil}
     end
@@ -235,17 +239,54 @@ defmodule Fathom.Shard.Storage.S3 do
   # un-fenced steal is not a steal); verify_conditional_writes!/0 also probes
   # both directions at boot.
   #
-  # 404 (no object yet — a brand-new shard was stolen) is fine for now: there is
-  # nothing a zombie flush could clobber that a nil-etag fence doesn't already
-  # refuse. A 412 means the object changed between our read and the copy —
+  # 404 (a never-flushed brand-new shard was stolen): the old "nothing a zombie
+  # flush could clobber" reasoning was the WRONG direction (round-2 #7) — the
+  # zombie's brand-new fence is If-None-Match:*, which succeeds precisely when no
+  # object exists, so its stalled create-only PUT would land AFTER our steal and
+  # the stealer's own first flush (also If-None-Match:*) would then 412 and
+  # self-fence away its accepted writes. Create a SENTINEL at the data key
+  # (create-only, so a just-landed real flush is never clobbered): the zombie's
+  # PUT now deterministically 412s, and the stealer's pull recognizes the
+  # sentinel as brand-new while carrying its etag as the first flush's fence.
+  # A 412 means the object changed between our read and the copy —
   # re-running the touch once covers the benign race.
   defp touch_object(shard_id, attempt \\ 1) do
-    case object_etag(shard_id) do
-      {:ok, nil} ->
-        :ok
+    key = db_key(shard_id)
 
-      {:ok, etag} ->
-        case rotate_etag(db_key(shard_id), etag) do
+    case head_object(key) do
+      {:ok, nil, _} ->
+        case create_sentinel(key) do
+          :ok ->
+            :ok
+
+          # Lost the create race — a REAL object just landed (the zombie's flush,
+          # or a concurrent writer): re-run the touch against it.
+          {:error, :sentinel_exists} when attempt < 2 ->
+            touch_object(shard_id, attempt + 1)
+
+          {:error, _} = error ->
+            error
+        end
+
+      # A PRIOR steal's sentinel (that stealer died before its first flush): a
+      # form-rotation copy would strip the sentinel metadata and the next pull
+      # would open the placeholder as shard bytes. Refresh it instead — a fresh
+      # nonced body rotates the MD5 etag (fencing the previous stealer's zombie
+      # If-Match) while keeping the sentinel semantics intact.
+      {:ok, etag, true} ->
+        case refresh_sentinel(key, etag) do
+          :ok ->
+            confirm_rotation(shard_id, etag)
+
+          {:error, :touch_precondition} when attempt < 2 ->
+            touch_object(shard_id, attempt + 1)
+
+          {:error, _} = error ->
+            error
+        end
+
+      {:ok, etag, false} ->
+        case rotate_etag(key, etag) do
           :ok ->
             confirm_rotation(shard_id, etag)
 
@@ -258,6 +299,16 @@ defmodule Fathom.Shard.Storage.S3 do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  # HEAD with sentinel awareness: {:ok, etag_or_nil, sentinel?}.
+  defp head_object(key) do
+    case Req.head(req(), url: url_path(key)) do
+      {:ok, %{status: 200, headers: h}} -> {:ok, etag(h), sentinel_response?(h)}
+      {:ok, %{status: 404}} -> {:ok, nil, false}
+      {:ok, %{status: s}} -> {:error, {:s3_head_status, s}}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -408,6 +459,43 @@ defmodule Fathom.Shard.Storage.S3 do
     :ok
   end
 
+  # --- brand-new steal sentinel (round-2 #7) ---
+
+  @sentinel_meta "x-amz-meta-fathom-sentinel"
+  @sentinel_body "fathom-brand-new-sentinel"
+
+  defp create_sentinel(key) do
+    case put_sentinel(key, [{"if-none-match", "*"}]) do
+      {:ok, %{status: s}} when s in 200..299 -> :ok
+      {:ok, %{status: 412}} -> {:error, :sentinel_exists}
+      {:ok, %{status: s}} -> {:error, {:s3_sentinel_status, s}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp refresh_sentinel(key, etag) do
+    case put_sentinel(key, [{"if-match", etag}]) do
+      {:ok, %{status: s}} when s in 200..299 -> :ok
+      {:ok, %{status: 412}} -> {:error, :touch_precondition}
+      {:ok, %{status: s}} -> {:error, {:s3_sentinel_status, s}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # A fresh nonce per write so every sentinel carries a NEW MD5 etag — a refresh
+  # must rotate (same-body PUTs etag identically on MD5 stores).
+  defp put_sentinel(key, cond_headers) do
+    nonce = Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+
+    Req.put(req(),
+      url: url_path(key),
+      body: @sentinel_body <> ":" <> nonce,
+      headers: [{@sentinel_meta, "1"} | cond_headers]
+    )
+  end
+
+  defp sentinel_response?(headers), do: headers[@sentinel_meta] != nil
+
   # Integrity (expert review #37): TLS/TCP catch wire corruption, but nothing caught
   # corruption introduced BEFORE the socket — a torn read off a bad disk, a buggy
   # proxy, or an S3-compatible store bug. Content-MD5 on every data PUT makes the
@@ -499,20 +587,29 @@ defmodule Fathom.Shard.Storage.S3 do
 
       case result do
         {:ok, %{status: 200} = resp} ->
-          digest = :crypto.hash_final(resp.private[:fathom_md5] || :crypto.hash_init(:md5))
+          cond do
+            # A brand-new steal sentinel (round-2 #7): not shard bytes — never
+            # promote it into place. The after-block drops the temp; the caller
+            # carries the sentinel's etag as the brand-new shard's first-flush fence.
+            sentinel_response?(resp.headers) ->
+              {:sentinel, etag(resp.headers)}
 
-          case verify_md5(digest, etag(resp.headers)) do
-            :ok ->
-              case Storage.promote_temp(tmp, local_path) do
-                :ok -> {:ok, etag(resp.headers)}
-                {:error, _} = error -> error
+            true ->
+              digest = :crypto.hash_final(resp.private[:fathom_md5] || :crypto.hash_init(:md5))
+
+              case verify_md5(digest, etag(resp.headers)) do
+                :ok ->
+                  case Storage.promote_temp(tmp, local_path) do
+                    :ok -> {:ok, etag(resp.headers)}
+                    {:error, _} = error -> error
+                  end
+
+                # A torn transfer produced bytes that don't match the object's etag — a
+                # transient corruption, not a permanent one; retry the whole download with a
+                # fresh temp rather than failing the pull outright (expert review #1).
+                {:error, :checksum_mismatch} = error ->
+                  retry_or(error, url, local_path, headers, opts, attempts_left)
               end
-
-            # A torn transfer produced bytes that don't match the object's etag — a
-            # transient corruption, not a permanent one; retry the whole download with a
-            # fresh temp rather than failing the pull outright (expert review #1).
-            {:error, :checksum_mismatch} = error ->
-              retry_or(error, url, local_path, headers, opts, attempts_left)
           end
 
         {:ok, %{status: 304}} ->
@@ -566,6 +663,9 @@ defmodule Fathom.Shard.Storage.S3 do
       {:ok, new_etag} -> {:ok, {:written, new_etag}}
       :unchanged -> {:ok, :unchanged}
       :absent -> {:ok, :absent}
+      # A brand-new sentinel (round-2 #7) is nothing to warm: the follower treats
+      # it as absent and drops any stale cache entry.
+      {:sentinel, _etag} -> {:ok, :absent}
       {:error, _} = error -> error
     end
   end

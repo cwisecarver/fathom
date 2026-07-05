@@ -14,10 +14,18 @@ defmodule Fathom.Test.S3EtagStore do
 
   def initial(objects) do
     %{
-      objects: Map.new(objects, fn {k, body} -> {k, %{body: body, form: :single}} end),
+      objects: Map.new(objects, fn {k, body} -> {k, %{body: body, form: :single, meta: %{}}} end),
       uploads: %{},
       seq: 0
     }
+  end
+
+  @doc "The store's metadata map for `key` (nil when absent)."
+  def meta_of(agent, key) do
+    case Agent.get(agent, &Map.get(&1.objects, key)) do
+      nil -> nil
+      obj -> obj.meta
+    end
   end
 
   @doc "The store's current etag for `key` (nil when absent) — for test assertions."
@@ -79,8 +87,14 @@ defmodule Fathom.Test.S3EtagStore do
 
   defp head(conn, agent, key) do
     case Agent.get(agent, &Map.get(&1.objects, key)) do
-      nil -> Plug.Conn.send_resp(conn, 404, "")
-      obj -> conn |> Plug.Conn.put_resp_header("etag", etag(obj)) |> Plug.Conn.send_resp(200, "")
+      nil ->
+        Plug.Conn.send_resp(conn, 404, "")
+
+      obj ->
+        conn
+        |> Plug.Conn.put_resp_header("etag", etag(obj))
+        |> put_meta_headers(obj)
+        |> Plug.Conn.send_resp(200, "")
     end
   end
 
@@ -92,13 +106,23 @@ defmodule Fathom.Test.S3EtagStore do
       obj ->
         conn
         |> Plug.Conn.put_resp_header("etag", etag(obj))
+        |> put_meta_headers(obj)
         |> Plug.Conn.send_resp(200, obj.body)
     end
+  end
+
+  defp put_meta_headers(conn, obj) do
+    Enum.reduce(obj.meta, conn, fn {k, v}, c -> Plug.Conn.put_resp_header(c, k, v) end)
+  end
+
+  defp req_meta(conn) do
+    for {"x-amz-meta-" <> _ = k, v} <- conn.req_headers, into: %{}, do: {k, v}
   end
 
   defp put_object(conn, agent, key, body) do
     if_match = Plug.Conn.get_req_header(conn, "if-match")
     if_none_match = Plug.Conn.get_req_header(conn, "if-none-match")
+    meta = req_meta(conn)
 
     Agent.get_and_update(agent, fn s ->
       current = Map.get(s.objects, key)
@@ -111,7 +135,7 @@ defmodule Fathom.Test.S3EtagStore do
           {{412, nil}, s}
 
         true ->
-          obj = %{body: body, form: :single}
+          obj = %{body: body, form: :single, meta: meta}
           {{200, etag(obj)}, %{s | objects: Map.put(s.objects, key, obj)}}
       end
     end)
@@ -141,7 +165,7 @@ defmodule Fathom.Test.S3EtagStore do
           {{412, nil}, s}
 
         true ->
-          obj = %{body: src.body, form: :single}
+          obj = %{body: src.body, form: :single, meta: %{}}
           {{200, etag(obj)}, %{s | objects: Map.put(s.objects, dst_key, obj)}}
       end
     end)
@@ -215,7 +239,7 @@ defmodule Fathom.Test.S3EtagStore do
     Agent.get_and_update(agent, fn s ->
       case Map.get(s.uploads, upload_id) do
         %{body: body} when is_binary(body) ->
-          obj = %{body: body, form: :multipart}
+          obj = %{body: body, form: :multipart, meta: %{}}
 
           {{200, etag(obj)},
            %{
