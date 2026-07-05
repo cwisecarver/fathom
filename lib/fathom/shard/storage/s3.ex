@@ -112,8 +112,37 @@ defmodule Fathom.Shard.Storage.S3 do
     # A create-only PUT against an existing object MUST be refused.
     probe_status!(key, [{"if-none-match", "*"}], [412], "If-None-Match enforcement")
 
+    # Round-2 #4: the steal fence is only real if a touch produces a GENUINELY new
+    # etag — on MD5-etag stores a plain self-copy does NOT rotate (same bytes, same
+    # MD5). Probe BOTH alternating copy forms (single→multipart, multipart→single)
+    # and refuse boot on a store where either fails to move the etag.
+    probe_rotation!(key, "single→multipart touch rotation")
+    probe_rotation!(key, "multipart→single touch rotation")
+
     _ = Req.delete(req(), url: url_path(key))
     :ok
+  end
+
+  defp probe_rotation!(key, label) do
+    with {:ok, etag} when not is_nil(etag) <- head_etag(key),
+         :ok <- rotate_etag(key, etag),
+         {:ok, new_etag} when not is_nil(new_etag) and new_etag != etag <- head_etag(key) do
+      :ok
+    else
+      other ->
+        raise "shard storage fence self-test failed (#{label}): the steal-time touch " <>
+                "did not rotate the object etag (#{inspect(other)}). On this store the " <>
+                "zombie-flush fence would be a silent no-op — refusing to boot " <>
+                "(expert review round-2 #4)."
+    end
+  end
+
+  defp head_etag(key) do
+    case Req.head(req(), url: url_path(key)) do
+      {:ok, %{status: 200, headers: h}} -> {:ok, etag(h)}
+      {:ok, %{status: s}} -> {:error, {:s3_head_status, s}}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp probe_status!(key, headers, expected, label) do
@@ -191,46 +220,192 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
-  # Steal-time data-object etag invalidation (expert review #3): a conditional
-  # server-side self-copy — same bytes, new etag. S3 requires the REPLACE metadata
-  # directive for a self-copy. 404 (no object yet — a brand-new shard was stolen) is
-  # fine: there is nothing a zombie flush could clobber that a nil-etag fence
-  # doesn't already refuse. A 412 means the object changed between our read and the
-  # copy — re-running the touch once covers the benign race.
+  # Steal-time data-object etag invalidation (expert review #3, fixed for real
+  # stores by round-2 #4): the fence needs a GENUINELY new etag, but on an
+  # MD5-etag store (every non-multipart, non-KMS object — exactly what fathom's
+  # single-PUT uploads produce) a plain self-copy of identical bytes yields the
+  # SAME etag, making the whole zombie fence a silent no-op in production.
+  #
+  # The rotation that works for identical bytes at ANY size: ALTERNATE COPY FORMS.
+  # A single-form etag (32-hex MD5) is touched via a one-part MULTIPART copy —
+  # its etag is md5(part-md5s)-1, a different form entirely; a multipart-form
+  # etag ("...-N") is touched via a plain CopyObject — back to the single MD5
+  # form. Either direction provably moves the etag. The rotation is then
+  # CONFIRMED with a HEAD, and a non-rotating store fails the touch closed (an
+  # un-fenced steal is not a steal); verify_conditional_writes!/0 also probes
+  # both directions at boot.
+  #
+  # 404 (no object yet — a brand-new shard was stolen) is fine for now: there is
+  # nothing a zombie flush could clobber that a nil-etag fence doesn't already
+  # refuse. A 412 means the object changed between our read and the copy —
+  # re-running the touch once covers the benign race.
   defp touch_object(shard_id, attempt \\ 1) do
-    key = db_key(shard_id)
-
     case object_etag(shard_id) do
       {:ok, nil} ->
         :ok
 
       {:ok, etag} ->
-        source = "/" <> fetch!(config(), :bucket) <> "/" <> key
+        case rotate_etag(db_key(shard_id), etag) do
+          :ok ->
+            confirm_rotation(shard_id, etag)
 
-        case Req.put(req(),
-               url: url_path(key),
-               headers: [
-                 {"x-amz-copy-source", source},
-                 {"x-amz-metadata-directive", "REPLACE"},
-                 {"x-amz-copy-source-if-match", etag}
-               ]
-             ) do
-          {:ok, %{status: s, body: body}} when s in 200..299 ->
-            if copy_body_ok?(body), do: :ok, else: {:error, {:s3_touch_error_body, body}}
-
-          {:ok, %{status: 412}} when attempt < 2 ->
+          {:error, :touch_precondition} when attempt < 2 ->
             touch_object(shard_id, attempt + 1)
 
-          {:ok, %{status: s}} ->
-            {:error, {:s3_touch_status, s}}
-
-          {:error, reason} ->
-            {:error, reason}
+          {:error, _} = error ->
+            error
         end
 
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  # The fence is only real if the etag actually moved (round-2 #4): a store whose
+  # touch doesn't rotate would leave the zombie's If-Match valid — fail the steal
+  # closed instead of serving unfenced.
+  defp confirm_rotation(shard_id, old_etag) do
+    case object_etag(shard_id) do
+      {:ok, new_etag} when not is_nil(new_etag) and new_etag != old_etag -> :ok
+      {:ok, unmoved} -> {:error, {:touch_no_rotation, unmoved}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp multipart_etag_form?(etag), do: etag |> String.trim(~s(")) |> String.contains?("-")
+
+  defp rotate_etag(key, etag) do
+    if multipart_etag_form?(etag),
+      do: single_copy_touch(key, etag),
+      else: multipart_copy_touch(key, etag)
+  end
+
+  # Plain server-side self-copy: produces a single-form (MD5) etag. Used when the
+  # object currently carries a multipart-form etag, so the form flip IS the
+  # rotation. S3 requires the REPLACE metadata directive for a self-copy.
+  defp single_copy_touch(key, etag) do
+    source = "/" <> fetch!(config(), :bucket) <> "/" <> key
+
+    case Req.put(req(),
+           url: url_path(key),
+           headers: [
+             {"x-amz-copy-source", source},
+             {"x-amz-metadata-directive", "REPLACE"},
+             {"x-amz-copy-source-if-match", etag}
+           ]
+         ) do
+      {:ok, %{status: s, body: body}} when s in 200..299 ->
+        if copy_body_ok?(body), do: :ok, else: {:error, {:s3_touch_error_body, body}}
+
+      {:ok, %{status: 412}} ->
+        {:error, :touch_precondition}
+
+      {:ok, %{status: s}} ->
+        {:error, {:s3_touch_status, s}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # One-part multipart self-copy: Complete's etag is md5(part-md5s)-1 — never the
+  # single MD5 form, so it rotates even for identical bytes. A single-part
+  # multipart upload has no minimum part size, so this works for any shard.
+  defp multipart_copy_touch(key, etag) do
+    source = "/" <> fetch!(config(), :bucket) <> "/" <> key
+
+    case create_multipart(key) do
+      {:ok, upload_id} ->
+        with {:ok, part_etag} <- upload_part_copy(key, upload_id, source, etag),
+             :ok <- complete_multipart(key, upload_id, part_etag) do
+          :ok
+        else
+          {:error, _} = error ->
+            abort_multipart(key, upload_id)
+            error
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp create_multipart(key) do
+    case Req.post(req(), url: url_path(key) <> "?uploads", body: "") do
+      {:ok, %{status: s, body: body}} when s in 200..299 ->
+        case Regex.run(~r|<UploadId>([^<]+)</UploadId>|, to_string(body)) do
+          [_, id] -> {:ok, id}
+          _ -> {:error, {:s3_multipart_no_upload_id, body}}
+        end
+
+      {:ok, %{status: s}} ->
+        {:error, {:s3_multipart_status, s}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp upload_part_copy(key, upload_id, source, etag) do
+    case Req.put(req(),
+           url: url_path(key) <> "?partNumber=1&uploadId=#{URI.encode_www_form(upload_id)}",
+           headers: [
+             {"x-amz-copy-source", source},
+             {"x-amz-copy-source-if-match", etag}
+           ]
+         ) do
+      {:ok, %{status: s, body: body}} when s in 200..299 ->
+        body = to_string(body)
+
+        cond do
+          not copy_body_ok?(body) ->
+            {:error, {:s3_touch_error_body, body}}
+
+          true ->
+            case Regex.run(~r|<ETag>(?:&quot;\|")?([0-9a-fA-F-]+)|, body) do
+              [_, part_etag] -> {:ok, part_etag}
+              _ -> {:error, {:s3_part_copy_no_etag, body}}
+            end
+        end
+
+      {:ok, %{status: 412}} ->
+        {:error, :touch_precondition}
+
+      {:ok, %{status: s}} ->
+        {:error, {:s3_part_copy_status, s}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # CompleteMultipartUpload is the CLASSIC 200-with-<Error>-body case (#8) —
+  # copy_body_ok? guards it like the other copies.
+  defp complete_multipart(key, upload_id, part_etag) do
+    body =
+      "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>" <>
+        ~s(<ETag>"#{part_etag}"</ETag></Part></CompleteMultipartUpload>)
+
+    case Req.post(req(),
+           url: url_path(key) <> "?uploadId=#{URI.encode_www_form(upload_id)}",
+           body: body
+         ) do
+      {:ok, %{status: s, body: resp}} when s in 200..299 ->
+        if copy_body_ok?(to_string(resp)),
+          do: :ok,
+          else: {:error, {:s3_touch_error_body, resp}}
+
+      {:ok, %{status: s}} ->
+        {:error, {:s3_complete_status, s}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp abort_multipart(key, upload_id) do
+    _ = Req.delete(req(), url: url_path(key) <> "?uploadId=#{URI.encode_www_form(upload_id)}")
+    :ok
   end
 
   # Integrity (expert review #37): TLS/TCP catch wire corruption, but nothing caught
