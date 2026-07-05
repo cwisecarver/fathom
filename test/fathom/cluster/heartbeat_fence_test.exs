@@ -63,7 +63,10 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
       # lapse broadcast — the proactive #34 path is tested separately below; this
       # test pins the lazy flush-path fence that guards a missed broadcast). Now the
       # fence can't just trust the heartbeat — it must revalidate the lock.
-      :sys.replace_state(hb, fn s -> %{s | generation: s.generation + 1, lapsed: true} end)
+      # (publish_status syncs the lock-free ETS view the fence reads, round-2 #26.)
+      :sys.replace_state(hb, fn s ->
+        Heartbeat.publish_status(%{s | generation: s.generation + 1, lapsed: true})
+      end)
 
       # Releasing the last connection idles → flush → fence: :revalidate →
       # check_lease sees the thief → drop local WITHOUT flushing.

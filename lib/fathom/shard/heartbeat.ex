@@ -73,14 +73,69 @@ defmodule Fathom.Shard.Heartbeat do
   @doc "Whether the heartbeat process is running (coordinators fall back to the legacy fence if not)."
   def running?, do: Process.whereis(__MODULE__) != nil
 
+  # The status ETS row: {:status, generation, mono_deadline_ms, margin_ms}, written
+  # by the heartbeat process on every renew/lapse (round-2 #26). Reading it is
+  # lock-free from any process — no GenServer call, so a lapse-broadcast fan-out of
+  # fence checks can neither flood the heartbeat's mailbox nor time out into the
+  # per-shard renew_lease PUT storm (the F1 regression) while the process is merely
+  # busy. The named table dies with the process, so "table absent" still means
+  # "heartbeat down" and the callers' legacy fallback semantics are unchanged.
+  @status_table __MODULE__.Status
+
   @doc "Current lapse generation; a coordinator records this when it acquires a shard."
   @spec generation() :: non_neg_integer()
-  def generation, do: GenServer.call(__MODULE__, :generation)
+  def generation do
+    case status() do
+      {gen, _deadline, _margin} -> gen
+      # Down (or booting): the call preserves the old exit-when-down semantics.
+      :down -> GenServer.call(__MODULE__, :generation)
+    end
+  end
 
   @doc "Fence check for a flush given the generation recorded at acquire. See the moduledoc."
   @spec valid_for_write?(non_neg_integer()) :: :ok | :revalidate | :not_valid
-  def valid_for_write?(acquire_gen),
-    do: GenServer.call(__MODULE__, {:valid_for_write, acquire_gen})
+  def valid_for_write?(acquire_gen) do
+    case status() do
+      {gen, deadline, margin} ->
+        now = System.monotonic_time(:millisecond)
+
+        cond do
+          # Not comfortably valid (no confirmed renewal yet, expired, or about
+          # to) — never write without confirmed liveness. Monotonic, so a
+          # wall-clock step can't inflate perceived validity (expert review #21).
+          is_nil(deadline) or now + margin >= deadline -> :not_valid
+          gen != acquire_gen -> :revalidate
+          true -> :ok
+        end
+
+      :down ->
+        GenServer.call(__MODULE__, {:valid_for_write, acquire_gen})
+    end
+  end
+
+  defp status do
+    case :ets.lookup(@status_table, :status) do
+      [{:status, gen, deadline, margin}] -> {gen, deadline, margin}
+      [] -> :down
+    end
+  rescue
+    ArgumentError -> :down
+  end
+
+  # Publish the fence-relevant slice of `state` to the status table. Public (and
+  # the table is public) so tests that drive lapse/expiry via :sys.replace_state
+  # can keep the published view in sync with the state they forged.
+  @doc false
+  def publish_status(state) do
+    :ets.insert(
+      @status_table,
+      {:status, state.generation, state.mono_deadline_ms, state.margin_ms}
+    )
+
+    state
+  rescue
+    ArgumentError -> state
+  end
 
   @impl true
   def init(opts) do
@@ -155,6 +210,10 @@ defmodule Fathom.Shard.Heartbeat do
       lapsed: false,
       timer: nil
     }
+
+    # The lock-free fence-status view (round-2 #26); published on every renew/lapse.
+    :ets.new(@status_table, [:set, :public, :named_table, read_concurrency: true])
+    publish_status(state)
 
     case clear_action do
       {:recheck, prev_owner, exp} ->
@@ -285,6 +344,7 @@ defmodule Fathom.Shard.Heartbeat do
           state
       end
 
+    publish_status(state)
     schedule_renew(state)
   end
 
@@ -374,7 +434,7 @@ defmodule Fathom.Shard.Heartbeat do
     })
 
     broadcast_lapse(gen)
-    %{state | generation: gen, lapsed: true}
+    publish_status(%{state | generation: gen, lapsed: true})
   end
 
   # Best-effort: the lapse broadcast is observability/proactive-revalidation only, so

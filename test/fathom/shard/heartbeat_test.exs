@@ -81,8 +81,10 @@ defmodule Fathom.Shard.HeartbeatTest do
 
   test "not_valid when the heartbeat is not comfortably valid", %{pid: pid} do
     # Drive the confirmed expiry into the past: no comfortable margin ⇒ no write.
+    # (publish_status keeps the lock-free ETS view — what valid_for_write? reads
+    # post round-2 #26 — in sync with the forged state.)
     :sys.replace_state(pid, fn s ->
-      %{s | mono_deadline_ms: System.monotonic_time(:millisecond) - 1}
+      Heartbeat.publish_status(%{s | mono_deadline_ms: System.monotonic_time(:millisecond) - 1})
     end)
 
     assert Heartbeat.valid_for_write?(0) == :not_valid
@@ -100,11 +102,11 @@ defmodule Fathom.Shard.HeartbeatTest do
     assert Heartbeat.valid_for_write?(0) == :ok
 
     :sys.replace_state(pid, fn s ->
-      %{
+      Heartbeat.publish_status(%{
         s
         | expires_at_ms: System.system_time(:millisecond) + 3_600_000,
           mono_deadline_ms: System.monotonic_time(:millisecond) - 1_000
-      }
+      })
     end)
 
     assert Heartbeat.valid_for_write?(0) == :not_valid,
@@ -119,6 +121,25 @@ defmodule Fathom.Shard.HeartbeatTest do
            "the lapse must be edge-detected off elapsed (monotonic) time"
 
     assert Heartbeat.valid_for_write?(0) == :revalidate
+  end
+
+  # Round-2 #26: the lapse broadcast fans a fence check out to every open
+  # coordinator at the same instant, and each check was a GenServer.call into this
+  # single process — the flood serialized on its mailbox, and a timed-out call
+  # degraded to :legacy, resurrecting the per-shard renew_lease PUT storm (the F1
+  # regression) exactly when the node was unhealthy. The invariant: the fence
+  # reads (generation + validity) answer LOCK-FREE, even while the heartbeat
+  # process itself is completely unresponsive.
+  test "fence reads answer while the heartbeat process is unresponsive", %{pid: pid} do
+    :ok = :sys.suspend(pid)
+
+    task = Task.async(fn -> {Heartbeat.valid_for_write?(0), Heartbeat.generation()} end)
+
+    result = Task.await(task, 500)
+    :ok = :sys.resume(pid)
+
+    assert {:ok, 0} == result,
+           "fence reads must not block on the heartbeat's mailbox (pre-fix: GenServer.call)"
   end
 
   test "clears its heartbeat on clean shutdown", %{pid: pid, owner: owner} do

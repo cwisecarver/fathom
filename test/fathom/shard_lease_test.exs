@@ -205,4 +205,51 @@ defmodule Fathom.ShardLeaseTest do
     refute File.exists?(remote_db(shard)), "self-fenced coordinator must not flush"
     refute File.exists?(local_db(shard)), "self-fenced coordinator drops its local copy"
   end
+
+  # Round-2 #26: the lapse broadcast reaches every open coordinator at the same
+  # instant, and each ran Fence.check INLINE in handle_info — a synchronous
+  # O(open-shards) storm of storage GETs through one pool, fired exactly when the
+  # node just proved unhealthy (mailboxes blocked, checkouts queued fleet-wide).
+  # The invariant: the broadcast only SCHEDULES a jittered revalidation, repeat
+  # broadcasts coalesce onto the pending timer, the shard keeps serving through
+  # the window, and the deferred check still self-fences on a genuine steal.
+  test "a lapse broadcast defers revalidation behind jitter and coalesces repeats",
+       %{shard: shard} do
+    hb = start_supervised!({Fathom.Shard.Heartbeat, ttl_ms: 30_000})
+    _ = :sys.get_state(hb)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, coordinator} = Shards.ensure(shard)
+    %{acquire_gen: gen} = :sys.get_state(coordinator)
+    assert gen != nil, "with the heartbeat up, the coordinator must be in heartbeat mode"
+
+    # Two broadcasts: the first schedules, the second coalesces — neither runs the
+    # check inline (pre-fix: an immediate Fence.check per broadcast).
+    send(coordinator, {:heartbeat_lapsed, gen + 1})
+    send(coordinator, {:heartbeat_lapsed, gen + 2})
+    state = :sys.get_state(coordinator)
+    assert state.lapse_revalidate_pending, "the broadcast must schedule, not revalidate inline"
+
+    # The shard keeps serving through the jitter window.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('during-jitter')"))
+
+    # A steal really did happen during the lapse; the heartbeat's generation moved.
+    put_raw_lock(shard, "thief@node", 999, now_ms() + 60_000)
+
+    :sys.replace_state(hb, fn s ->
+      Fathom.Shard.Heartbeat.publish_status(%{s | generation: s.generation + 1})
+    end)
+
+    ref = Process.monitor(coordinator)
+
+    capture_log(fn ->
+      # Drive the deferred revalidation directly (the jitter timer is wall-clock).
+      send(coordinator, :revalidate_lapse)
+      assert_receive {:DOWN, ^ref, :process, ^coordinator, {:shutdown, :lease_lost}}, 2_000
+    end)
+
+    refute File.exists?(remote_db(shard)),
+           "the deferred revalidation must still self-fence without flushing"
+  end
 end

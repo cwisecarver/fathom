@@ -319,7 +319,10 @@ defmodule Fathom.Shard do
         flush_pending_gen: nil,
         draining: false,
         drain_timer: nil,
-        drain_reply_to: nil
+        drain_reply_to: nil,
+        # A lapse revalidation is scheduled (round-2 #26) — repeat broadcasts
+        # coalesce onto the pending jittered timer.
+        lapse_revalidate_pending: false
       }
 
       state = if acquire_gen == nil, do: schedule_renew(state), else: state
@@ -854,27 +857,43 @@ defmodule Fathom.Shard do
   # moduledoc promised coordinators revalidate on the lapse broadcast instead of
   # waiting for their next flush, but nothing subscribed — a superseded coordinator
   # kept ACCEPTING writes it would later discard for up to a full flush interval
-  # (unboundedly, with the durability flush disabled). On a lapse past our acquire
-  # generation, re-check ownership now and self-fence if a steal happened.
+  # (unboundedly, with the durability flush disabled).
+  #
+  # Round-2 #26: the broadcast reaches EVERY open coordinator at the same instant,
+  # and revalidating INLINE made it a synchronous O(open-shards) storm — a
+  # check_lease GET per shard through one connection pool, fired exactly when the
+  # node just proved unhealthy: mailboxes blocked, checkouts queued fleet-wide.
+  # Defer behind a per-shard random jitter instead, coalescing repeat lapses onto
+  # the one pending timer (the handler re-reads the CURRENT generation via the
+  # fence when it fires, so a coalesced later lapse is still covered). The flush
+  # fence remains the hard guard throughout the jitter window.
   def handle_info({:heartbeat_lapsed, gen}, state) do
-    if state.acquire_gen != nil and gen != state.acquire_gen do
-      case Fence.check(fence_ctx(state)) do
-        {:ok, updates} ->
-          {:noreply, Map.merge(state, updates)}
-
-        :superseded ->
-          Logger.error(
-            "shard #{state.id}: lease superseded (heartbeat lapse broadcast); self-fencing"
-          )
-
-          {:stop, {:shutdown, :lease_lost}, %{state | lease_lost: true}}
-
-        # Ownership unconfirmed (transient) — the next flush's fence remains the guard.
-        :skip ->
-          {:noreply, state}
-      end
+    if state.acquire_gen != nil and gen != state.acquire_gen and
+         not state.lapse_revalidate_pending do
+      Process.send_after(self(), :revalidate_lapse, :rand.uniform(lapse_jitter_ms()))
+      {:noreply, %{state | lapse_revalidate_pending: true}}
     else
       {:noreply, state}
+    end
+  end
+
+  def handle_info(:revalidate_lapse, state) do
+    state = %{state | lapse_revalidate_pending: false}
+
+    case Fence.check(fence_ctx(state)) do
+      {:ok, updates} ->
+        {:noreply, Map.merge(state, updates)}
+
+      :superseded ->
+        Logger.error(
+          "shard #{state.id}: lease superseded (heartbeat lapse broadcast); self-fencing"
+        )
+
+        {:stop, {:shutdown, :lease_lost}, %{state | lease_lost: true}}
+
+      # Ownership unconfirmed (transient) — the next flush's fence remains the guard.
+      :skip ->
+        {:noreply, state}
     end
   end
 
@@ -1442,6 +1461,9 @@ defmodule Fathom.Shard do
       Path.join(System.tmp_dir!(), "fathom_shards")
     )
   end
+
+  # Round-2 #26: spread the post-lapse revalidation fan-out across the jitter window.
+  defp lapse_jitter_ms, do: Application.get_env(:fathom, :lapse_revalidate_jitter_ms, 2_000)
 
   defp idle_ms, do: Application.get_env(:fathom, :shard_idle_ms, @default_idle_ms)
   defp lease_ttl_ms, do: Application.get_env(:fathom, :shard_lease_ttl_ms, @default_lease_ttl_ms)
