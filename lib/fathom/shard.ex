@@ -347,39 +347,100 @@ defmodule Fathom.Shard do
   # already established the local file continues the stored lineage, and the touch
   # moved no bytes).
   defp revalidate_takeover(shard_id, path, lease, etag, warm?) do
-    if lease[:took_over] do
-      case Storage.object_etag(shard_id) do
-        {:ok, ^etag} ->
-          {:ok, etag}
+    cond do
+      lease[:took_over] != true ->
+        {:ok, etag}
 
-        # The object VANISHED between the pull and this re-check (expert review
-        # round-2 #29). Returning the stale pulled etag made the first flush
-        # deterministically self-fence (If-Match against a gone object never
-        # succeeds), dropping every write accepted in that cycle. Adopt the
-        # brand-new contract instead — same stance as quarantined_fork?'s
-        # deliberately-deleted-object case: serve the pulled copy and fence with
-        # nil, so the first flush RECREATES the object via If-None-Match:* (never a
-        # clobber). Drop the now-wrong provenance sidecar so a crash before that
-        # flush doesn't strand the next open fencing on the vanished etag.
-        {:ok, nil} ->
-          File.rm(etag_sidecar(path))
-          {:ok, nil}
+      # The S3 steal-touch threaded its lineage through the lease (round-2 #6):
+      # no extra HEAD (a separate read widened the laundering window), and the
+      # warm branch adopts the post-touch etag ONLY when the touch's SOURCE was
+      # this file's own provenance.
+      is_binary(lease[:touch_post_etag]) ->
+        revalidate_touched(shard_id, path, lease, etag, warm?)
 
-        {:ok, current} when warm? ->
-          write_etag_sidecar(path, current)
-          {:ok, current}
+      # Legacy/Local takeover (no steal-touch — Local's content-hash etags can't
+      # rotate without the bytes changing, and it is single-node): the original
+      # HEAD-based re-check, including the #29 vanished-object branch.
+      true ->
+        legacy_revalidate(shard_id, path, etag, warm?)
+    end
+  end
 
-        {:ok, _newer} ->
-          case Storage.pull(shard_id, pull_temp(path)) do
-            {:ok, new_etag} -> promote_pull(path, new_etag)
-            {:error, reason} -> {:error, {:revalidate_failed, reason}}
-          end
+  defp revalidate_touched(shard_id, path, lease, etag, warm?) do
+    post = lease[:touch_post_etag]
+    pre = lease[:touch_pre_etag]
 
-        {:error, reason} ->
-          {:error, {:revalidate_failed, reason}}
-      end
-    else
-      {:ok, etag}
+    cond do
+      # The speculative pull already captured the post-touch object.
+      etag == post ->
+        {:ok, etag}
+
+      warm? ->
+        # Round-2 #6: the old warm branch assumed ANY etag change since the fork
+        # check was "our own touch, moved no bytes" and stamped the local file's
+        # sidecar with it — FORGED provenance. But the dead owner's in-flight
+        # fenced flush can land between the fork check and the touch: the touched
+        # object then holds the ZOMBIE's acknowledged durable writes while the
+        # local warm file is a diverged lineage, and the forged sidecar let the
+        # next flush If-Match-clobber them unrecoverably. Adopt the post-touch
+        # etag ONLY when the touch's SOURCE (`pre`) is this file's own
+        # provenance; anything else is a fork — quarantine and re-pull, the #1
+        # contract.
+        case read_etag_sidecar(path) do
+          {:ok, provenance} when is_binary(pre) and provenance == pre ->
+            write_etag_sidecar(path, post)
+            {:ok, post}
+
+          _ ->
+            if quarantine_fork!(shard_id, path, :diverged) == :ok do
+              repull(shard_id, path)
+            else
+              # The quarantine rename failed — never re-pull over the un-moved
+              # recovery copy (round-2 #14).
+              {:error, :quarantine_failed}
+            end
+        end
+
+      true ->
+        # A cold pull that raced the touch captured pre-touch bytes: re-pull.
+        repull(shard_id, path)
+    end
+  end
+
+  defp legacy_revalidate(shard_id, path, etag, warm?) do
+    case Storage.object_etag(shard_id) do
+      {:ok, ^etag} ->
+        {:ok, etag}
+
+      # The object VANISHED between the pull and this re-check (expert review
+      # round-2 #29). Returning the stale pulled etag made the first flush
+      # deterministically self-fence (If-Match against a gone object never
+      # succeeds), dropping every write accepted in that cycle. Adopt the
+      # brand-new contract instead — same stance as quarantined_fork?'s
+      # deliberately-deleted-object case: serve the pulled copy and fence with
+      # nil, so the first flush RECREATES the object via If-None-Match:* (never a
+      # clobber). Drop the now-wrong provenance sidecar so a crash before that
+      # flush doesn't strand the next open fencing on the vanished etag.
+      {:ok, nil} ->
+        File.rm(etag_sidecar(path))
+        {:ok, nil}
+
+      {:ok, current} when warm? ->
+        write_etag_sidecar(path, current)
+        {:ok, current}
+
+      {:ok, _newer} ->
+        repull(shard_id, path)
+
+      {:error, reason} ->
+        {:error, {:revalidate_failed, reason}}
+    end
+  end
+
+  defp repull(shard_id, path) do
+    case Storage.pull(shard_id, pull_temp(path)) do
+      {:ok, new_etag} -> promote_pull(path, new_etag)
+      {:error, reason} -> {:error, {:revalidate_failed, reason}}
     end
   end
 

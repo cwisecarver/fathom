@@ -250,14 +250,19 @@ defmodule Fathom.Shard.Storage.S3 do
   # sentinel as brand-new while carrying its etag as the first flush's fence.
   # A 412 means the object changed between our read and the copy —
   # re-running the touch once covers the benign race.
+  # Returns `{:ok, %{pre: etag_or_nil, post: etag}}` — the SOURCE etag the touch
+  # If-Matched (nil for a brand-new sentinel create) and the object's post-touch
+  # etag (round-2 #6): the takeover revalidation adopts the post-touch etag for a
+  # warm local file ONLY when `pre` equals its provenance sidecar, so a fork
+  # laundered through the touch is quarantined instead of clobbered.
   defp touch_object(shard_id, attempt \\ 1) do
     key = db_key(shard_id)
 
     case head_object(key) do
       {:ok, nil, _} ->
         case create_sentinel(key) do
-          :ok ->
-            :ok
+          {:ok, sentinel_etag} ->
+            {:ok, %{pre: nil, post: sentinel_etag}}
 
           # Lost the create race — a REAL object just landed (the zombie's flush,
           # or a concurrent writer): re-run the touch against it.
@@ -276,7 +281,8 @@ defmodule Fathom.Shard.Storage.S3 do
       {:ok, etag, true} ->
         case refresh_sentinel(key, etag) do
           :ok ->
-            confirm_rotation(shard_id, etag)
+            with {:ok, post} <- confirm_rotation(shard_id, etag),
+                 do: {:ok, %{pre: etag, post: post}}
 
           {:error, :touch_precondition} when attempt < 2 ->
             touch_object(shard_id, attempt + 1)
@@ -288,7 +294,8 @@ defmodule Fathom.Shard.Storage.S3 do
       {:ok, etag, false} ->
         case rotate_etag(key, etag) do
           :ok ->
-            confirm_rotation(shard_id, etag)
+            with {:ok, post} <- confirm_rotation(shard_id, etag),
+                 do: {:ok, %{pre: etag, post: post}}
 
           {:error, :touch_precondition} when attempt < 2 ->
             touch_object(shard_id, attempt + 1)
@@ -317,7 +324,7 @@ defmodule Fathom.Shard.Storage.S3 do
   # closed instead of serving unfenced.
   defp confirm_rotation(shard_id, old_etag) do
     case object_etag(shard_id) do
-      {:ok, new_etag} when not is_nil(new_etag) and new_etag != old_etag -> :ok
+      {:ok, new_etag} when not is_nil(new_etag) and new_etag != old_etag -> {:ok, new_etag}
       {:ok, unmoved} -> {:error, {:touch_no_rotation, unmoved}}
       {:error, reason} -> {:error, reason}
     end
@@ -466,7 +473,7 @@ defmodule Fathom.Shard.Storage.S3 do
 
   defp create_sentinel(key) do
     case put_sentinel(key, [{"if-none-match", "*"}]) do
-      {:ok, %{status: s}} when s in 200..299 -> :ok
+      {:ok, %{status: s, headers: h}} when s in 200..299 -> {:ok, etag(h)}
       {:ok, %{status: 412}} -> {:error, :sentinel_exists}
       {:ok, %{status: s}} -> {:error, {:s3_sentinel_status, s}}
       {:error, reason} -> {:error, reason}
@@ -772,8 +779,16 @@ defmodule Fathom.Shard.Storage.S3 do
                 # etag without moving bytes, so the zombie's PUT deterministically
                 # 412s and IT self-fences instead.
                 case touch_object(shard_id) do
-                  :ok ->
-                    {:ok, Map.put(lease, :took_over, true)}
+                  {:ok, %{pre: pre, post: post}} ->
+                    # Thread the touch's lineage through the lease (round-2 #6):
+                    # the takeover revalidation needs the SOURCE etag the touch
+                    # If-Matched to tell "our own lineage, moved no bytes" from a
+                    # zombie flush laundered into the touched object.
+                    {:ok,
+                     lease
+                     |> Map.put(:took_over, true)
+                     |> Map.put(:touch_pre_etag, pre)
+                     |> Map.put(:touch_post_etag, post)}
 
                   # Fail closed: an un-fenced steal is not a steal — but the epoch+1
                   # lock write already LANDED, and leaving it would let our own next
