@@ -18,11 +18,29 @@ defmodule Fathom.Migrator.Copy do
   (leaving `dest_path` at the old schema on a replay error).
   """
   @spec migrate(Path.t(), Path.t(), non_neg_integer(), [String.t()]) :: :ok | {:error, term()}
-  def migrate(source_path, dest_path, version, statements) do
+  def migrate(source_path, dest_path, version, statements),
+    do: migrate_chain(source_path, dest_path, [{version, statements}])
+
+  @doc """
+  Copies `source_path` to `dest_path` and replays a CHAIN of versions in order
+  (round-2 #9: a multi-step laggard must apply every intermediate version's
+  statements, not just the target's). Each `{version, statements}` step runs in its
+  own transaction and stamps its `user_version` after commit, so a failure
+  mid-chain leaves the copy at the last fully-applied version — never half a step.
+  Returns `:ok` or `{:error, reason}`.
+  """
+  @spec migrate_chain(Path.t(), Path.t(), [{non_neg_integer(), [String.t()]}]) ::
+          :ok | {:error, term()}
+  def migrate_chain(source_path, dest_path, chain) do
     with :ok <- copy_file(source_path, dest_path),
          {:ok, conn} <- Connection.open(dest_path) do
       try do
-        replay(conn, version, statements)
+        Enum.reduce_while(chain, :ok, fn {version, statements}, :ok ->
+          case replay(conn, version, statements) do
+            :ok -> {:cont, :ok}
+            {:error, _} = error -> {:halt, error}
+          end
+        end)
       after
         Connection.close(conn)
       end

@@ -259,24 +259,39 @@ defmodule Fathom.Migrator.ShardMigration do
   # --- the migration ---
 
   defp do_run(shard_id, target, lease) do
-    case Migrator.statements(target) do
-      nil -> {:error, {:unknown_version, target}}
-      statements -> migrate(shard_id, target, statements, lease)
-    end
-  end
-
-  defp migrate(shard_id, target, statements, lease) do
-    Directory.mark_migrating(shard_id)
     old = temp_path(shard_id, "old")
     new = temp_path(shard_id, "new")
 
     try do
       with {:ok, etag} <- pull_live(shard_id, old) do
-        if live_version(old) == target do
+        current = live_version(old)
+
+        cond do
           # Crash-forward: the new version is already live; just finish the cutover.
-          finalize(shard_id, target)
-        else
-          forward(shard_id, target, statements, old, new, lease, etag)
+          current == target ->
+            finalize(shard_id, target)
+
+          # The live file is AHEAD of the target (a stale sweep against a shard
+          # something else already moved past): replaying target's statements over
+          # a newer schema would corrupt it. Error out; nothing was touched.
+          current > target ->
+            {:error, {:ahead_of_target, current}}
+
+          true ->
+            # Round-2 #9: replay EVERY version from current+1 through target, in
+            # order — capture records one fleet version per Django migration
+            # transaction, so a cold-tail shard 2+ behind is routine, and jumping
+            # straight to target applied only target's DDL: silent per-shard schema
+            # corruption with all three version stamps agreeing. A missing/yanked
+            # intermediate makes the chain unbuildable — error (the shard stays
+            # untouched at its old version) rather than half-apply.
+            with {:ok, chain} <- statement_chain(current, target) do
+              # Marked only once the chain is buildable: an unknown/yanked target
+              # must leave the shard's status untouched (#23), and the copy window
+              # is what "migrating" pauses anyway.
+              Directory.mark_migrating(shard_id)
+              forward(shard_id, target, chain, old, new, lease, etag)
+            end
         end
       end
     after
@@ -285,11 +300,24 @@ defmodule Fathom.Migrator.ShardMigration do
     end
   end
 
-  defp forward(shard_id, target, statements, old, new, lease, expected_etag) do
+  defp statement_chain(current, target) do
+    Enum.reduce_while((current + 1)..target//1, {:ok, []}, fn v, {:ok, acc} ->
+      case Migrator.statements(v) do
+        nil -> {:halt, {:error, {:unknown_version, v}}}
+        statements -> {:cont, {:ok, [{v, statements} | acc]}}
+      end
+    end)
+    |> case do
+      {:ok, acc} -> {:ok, Enum.reverse(acc)}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp forward(shard_id, target, chain, old, new, lease, expected_etag) do
     prev = current_version(shard_id)
 
     with :ok <- Storage.retain(shard_id, prev),
-         :ok <- Copy.migrate(old, new, target, statements),
+         :ok <- Copy.migrate_chain(old, new, chain),
          # Self-fence right before the clobbering flush: if we were superseded during the (long)
          # copy, abort instead of overwriting the new owner's object (finding #7).
          :ok <- fence(shard_id, lease),

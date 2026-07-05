@@ -128,6 +128,60 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert %{rows: [[1]]} = query_live!(shard, "PRAGMA user_version")
   end
 
+  # Round-2 #9 (Critical): do_run fetched only statements(target) and stamped
+  # user_version = target — a shard 2+ behind jumped straight to HEAD applying only
+  # HEAD's DDL, silently missing every intermediate version's CREATE/ALTER and
+  # django_migrations rows, while all three version stamps agreed it was current.
+  # Capture records one fleet version per Django migration transaction, so
+  # multi-step laggards are ROUTINE on the cold tail. The invariant: a v1→v3
+  # migration applies v2's AND v3's statements, in order.
+  test "a multi-step laggard replays every intermediate version, not just the target",
+       %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+
+    {:ok, _} =
+      Migrator.release(3, "add tags", [
+        "CREATE TABLE app_tag (id INTEGER PRIMARY KEY, label TEXT)",
+        "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0003_add_tags', 'now')"
+      ])
+
+    assert {:ok, %{from: 1, to: 3}} = ShardMigration.run(shard, 3)
+
+    # v2's DDL landed (pre-fix: only v3's did — created_at was silently missing) ...
+    assert %{rows: [[1, "alice", nil]]} =
+             query_live!(shard, "SELECT id, name, created_at FROM app_thing")
+
+    # ... and v3's, and both bookkeeping rows, in order.
+    assert %{rows: [[0]]} = query_live!(shard, "SELECT count(*) FROM app_tag")
+
+    assert %{rows: [["0001_initial"], ["0002_add_created_at"], ["0003_add_tags"]]} =
+             query_live!(shard, "SELECT name FROM django_migrations ORDER BY name")
+
+    assert %{rows: [[3]]} = query_live!(shard, "PRAGMA user_version")
+    assert {:ok, %{schema_version: 3}} = Directory.get(shard)
+  end
+
+  # The chain's fail-closed half: a missing/yanked INTERMEDIATE makes the chain
+  # unbuildable — the migration must error with the shard untouched at its old
+  # version, never stamp target having skipped a step (pre-fix it "succeeded",
+  # applying only v3 — and a yanked middle version made the corruption
+  # unrecoverable).
+  test "a yanked intermediate version fails the chain, leaving the shard untouched",
+       %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "bad", @v2_statements)
+    {:ok, _} = Migrator.release(3, "good", ["CREATE TABLE app_ok (id INTEGER PRIMARY KEY)"])
+    assert :ok = Migrator.yank(2)
+
+    assert {:error, {:unknown_version, 2}} = ShardMigration.run(shard, 3)
+
+    assert {:ok, %{schema_version: 1}} = Directory.get(shard),
+           "the shard must stay at its old version, not half-migrate"
+
+    assert %{rows: [[1]]} = query_live!(shard, "PRAGMA user_version")
+  end
+
   # Expert review #40: run/3 used Directory.resolve — which upserts last_active_at and
   # registers unknown ids — as its version read. Every sweep attempt phantom-bumped
   # recency on shards no client touched (corrupting warm-follower targeting, laggard
