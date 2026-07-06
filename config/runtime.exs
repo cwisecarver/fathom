@@ -77,6 +77,21 @@ if ttl = System.get_env("SHARD_LEASE_TTL_MS") do
   config :fathom, :shard_lease_ttl_ms, String.to_integer(ttl)
 end
 
+# Periodic durability-flush cadence and idle (flush+drop+stop) threshold, ms.
+if ms = System.get_env("SHARD_FLUSH_INTERVAL_MS") do
+  config :fathom, :shard_flush_interval_ms, String.to_integer(ms)
+end
+
+if ms = System.get_env("SHARD_IDLE_MS") do
+  config :fathom, :shard_idle_ms, String.to_integer(ms)
+end
+
+# Opt out of the boot-time conditional-write probe (expert review #16) ONLY for rigs where
+# storage isn't reachable at boot and the store is known-good. Never in prod.
+if System.get_env("VERIFY_STORAGE_FENCE") in ~w(false 0) do
+  config :fathom, :verify_storage_fence, false
+end
+
 # Warm-standby follower (Phase 2 A1): opt-in per node role.
 if System.get_env("WARM_FOLLOWER") in ~w(true 1) do
   config :fathom, :warm_follower, true

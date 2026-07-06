@@ -1,0 +1,5 @@
+[
+  { "name": "s3-fathom1", "listen": "0.0.0.0:21001", "upstream": "minio:9000", "enabled": true },
+  { "name": "s3-fathom2", "listen": "0.0.0.0:21002", "upstream": "minio:9000", "enabled": true },
+  { "name": "s3-fathom3", "listen": "0.0.0.0:21003", "upstream": "minio:9000", "enabled": true }
+]

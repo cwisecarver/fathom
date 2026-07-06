@@ -1,0 +1,150 @@
+# Fathom chaos rig: 3 independent fathom nodes behind an nginx L7 LB
+# (hash-on-Host), sharing one MinIO bucket (the S3 lease store + bottomless
+# backend) through per-node toxiproxy proxies (fault injection: latency,
+# bandwidth, partition) and one Postgres (the directory / control plane).
+#
+#   driver: ./chaos.sh   docs: README.md + docs/deploy-cluster.md "Chaos testing"
+#
+# All numbers this rig produces are RELATIVE (shared host disk/CPU, loopback
+# MinIO) — inject S3 latency (chaos.sh latency 30) before timing anything.
+
+name: fathom-chaos
+
+x-fathom-env: &fathom-env
+  DATABASE_URL: ecto://postgres:postgres@postgres/fathom_chaos
+  # Rig-only secret; rotate for anything reachable beyond localhost.
+  SECRET_KEY_BASE: FRuJDVYlmnTBTuLbaH2npKe5RmB3rk4cvHKAHNvA31Gzp5m0z7JnkG8OwLbAGz9j
+  RELEASE_COOKIE: fathom-chaos-cookie
+  PHX_HOST: fathom.test
+  SHARD_BASE_DOMAIN: fathom.test
+  SHARD_STORAGE: s3
+  S3_BUCKET: fathom-shards
+  S3_PATH_STYLE: "true"
+  AWS_ACCESS_KEY_ID: fathom
+  AWS_SECRET_ACCESS_KEY: fathom-secret
+  SHARD_DATA_DIR: /data/shards
+  # Short TTL so failover experiments iterate quickly; the TTL is the
+  # failover-stall ceiling (a dead node's shards stay unstealable up to this long).
+  SHARD_LEASE_TTL_MS: "10000"
+  # Fast flush cadence so scenarios observe durability PUTs within seconds, and a
+  # short idle threshold so flush-and-drop happens inside a scenario's window.
+  SHARD_FLUSH_INTERVAL_MS: "5000"
+  SHARD_IDLE_MS: "20000"
+  # Every node is also a warm-standby follower, so kill-failover exercises the
+  # warm-promotion (304) path when the survivor has the shard cached.
+  WARM_FOLLOWER: "true"
+  WARM_CACHE_DIR: /data/warm
+  WARM_POLL_MS: "2000"
+
+x-fathom-node: &fathom-node
+  image: fathom-chaos:latest
+  restart: "no" # the rig kills nodes on purpose; auto-restart would fight the scenarios
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    minio-init:
+      condition: service_completed_successfully
+    toxiproxy:
+      condition: service_started
+  healthcheck:
+    test: ["CMD", "curl", "-sf", "http://localhost:8081/health"]
+    interval: 5s
+    timeout: 3s
+    retries: 12
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: fathom_chaos
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  minio:
+    image: minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: fathom
+      MINIO_ROOT_PASSWORD: fathom-secret
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "mc alias set local http://minio:9000 fathom fathom-secret &&
+                  mc mb -p local/fathom-shards"
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    command: ["-host=0.0.0.0", "-config=/etc/toxiproxy.json"]
+    volumes:
+      - ./toxiproxy.json:/etc/toxiproxy.json:ro
+    ports:
+      - "8474:8474" # control API, used by chaos.sh
+
+  migrate:
+    image: fathom-chaos:latest
+    build:
+      # The parent of BOTH repos (fathom + the ../filo path dep), relative to this file.
+      context: ../../..
+      dockerfile: fathom/deploy/chaos/Dockerfile
+    command: ["/app/bin/fathom", "eval", "Fathom.Release.migrate"]
+    environment:
+      <<: *fathom-env
+      # No storage/heartbeat needed to run Ecto migrations, and the fence probe
+      # would race minio-init; plain local defaults for this one-shot.
+      SHARD_STORAGE: local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  fathom1:
+    <<: *fathom-node
+    environment:
+      <<: *fathom-env
+      S3_ENDPOINT: http://toxiproxy:21001
+    ports:
+      - "18081:8080" # direct Hrana (bypasses the LB; zombie/steal experiments)
+      - "18091:8081" # direct health
+
+  fathom2:
+    <<: *fathom-node
+    environment:
+      <<: *fathom-env
+      S3_ENDPOINT: http://toxiproxy:21002
+    ports:
+      - "18082:8080"
+      - "18092:8081"
+
+  fathom3:
+    <<: *fathom-node
+    environment:
+      <<: *fathom-env
+      S3_ENDPOINT: http://toxiproxy:21003
+    ports:
+      - "18083:8080"
+      - "18093:8081"
+
+  lb:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      - fathom1
+      - fathom2
+      - fathom3
