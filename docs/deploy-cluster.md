@@ -277,8 +277,13 @@ Two layers, deliberately split:
 
 ## Status
 
-S1 (LB mechanism) — **DONE/PASS**. S2 (LB config + this doc + `/health`) — **DONE**. S3
-(lease-handoff tests), S4 (crash/commit-ack-lost contract), S5 (observability + OTel), S6
-(chaos/partition + the cross-node isolation gate) — **DONE**. Next: S7 (directory off the hot
-path), S8 (lease-RPS measurement + AGENTS.md reconciliation). See the design doc's
-`## ARCHITECTURE PIVOT 2` task list.
+S1 (LB mechanism), S2 (LB config + this doc + `/health`), S3 (lease-handoff tests), S4
+(crash/commit-ack-lost contract), S5 (observability + OTel), S6 (chaos/partition + the
+cross-node isolation gate), S7 (directory off the hot path), S8 (lease-RPS measurement +
+AGENTS.md reconciliation) — all **DONE**. See the design doc's `## ARCHITECTURE PIVOT 2`
+task list.
+
+The **failover-time-and-loss-window layer** (the real rig above) is now built and exercised:
+`deploy/chaos/` + `chaos.sh`, first run 2026-07-05 and full re-run 2026-07-06 (all scenarios
+pass — see `docs/reviews/chaos-run-2026-07-05.md`). Next cluster-phase work is Phase 2
+(dynamic rebalancing / locality), gated on real hot-spot evidence — see `docs/phase2-scoping.md`.
