@@ -31,6 +31,65 @@ if otlp_endpoint = System.get_env("OTEL_EXPORTER_OTLP_ENDPOINT") do
   config :opentelemetry_exporter, otlp_endpoint: otlp_endpoint
 end
 
+# ---- Shard-plane deploy knobs (env-gated, any config_env) --------------------------------
+# These configure the shard data plane for real deployments (a release in a container, the
+# deploy/chaos rig). Unset ⇒ the compile-time defaults (Local storage under System.tmp_dir!),
+# so dev/test are unaffected.
+
+# Storage backend for shard files. SHARD_STORAGE=s3 selects the S3 backend and reads its
+# connection settings; the boot fence probe (Fathom.Application.check_storage_fence!) then
+# verifies the store enforces conditional writes before serving a byte.
+case System.get_env("SHARD_STORAGE") do
+  nil ->
+    :ok
+
+  "local" ->
+    config :fathom, :shard_storage, Fathom.Shard.Storage.Local
+
+  "s3" ->
+    config :fathom, :shard_storage, Fathom.Shard.Storage.S3
+
+    config :fathom, Fathom.Shard.Storage.S3,
+      bucket: System.get_env("S3_BUCKET") || raise("SHARD_STORAGE=s3 requires S3_BUCKET"),
+      region: System.get_env("S3_REGION", "us-east-1"),
+      # Optional override for S3-compatible stores (MinIO, R2, Tigris). Unset ⇒ AWS.
+      endpoint: System.get_env("S3_ENDPOINT"),
+      # MinIO and R2 need path-style addressing (endpoint/bucket/key).
+      path_style: System.get_env("S3_PATH_STYLE") in ~w(true 1),
+      prefix: System.get_env("S3_PREFIX", ""),
+      access_key_id: System.get_env("AWS_ACCESS_KEY_ID"),
+      secret_access_key: System.get_env("AWS_SECRET_ACCESS_KEY"),
+      token: System.get_env("AWS_SESSION_TOKEN")
+
+  other ->
+    raise "SHARD_STORAGE must be \"s3\" or \"local\", got: #{inspect(other)}"
+end
+
+# Where shard files live locally while a shard is open (default: System.tmp_dir!/fathom_shards).
+# Point it at the node's fast local disk in a real deployment.
+if dir = System.get_env("SHARD_DATA_DIR") do
+  config :fathom, :shard_data_dir, dir
+end
+
+# Node heartbeat / lease TTL (ms). Bounds how long a dead node's shards stay unstealable —
+# the failover-stall ceiling. Default 30_000.
+if ttl = System.get_env("SHARD_LEASE_TTL_MS") do
+  config :fathom, :shard_lease_ttl_ms, String.to_integer(ttl)
+end
+
+# Warm-standby follower (Phase 2 A1): opt-in per node role.
+if System.get_env("WARM_FOLLOWER") in ~w(true 1) do
+  config :fathom, :warm_follower, true
+end
+
+if dir = System.get_env("WARM_CACHE_DIR") do
+  config :fathom, :warm_cache_dir, dir
+end
+
+if ms = System.get_env("WARM_POLL_MS") do
+  config :fathom, :warm_poll_ms, String.to_integer(ms)
+end
+
 if config_env() == :prod do
   database_url =
     System.get_env("DATABASE_URL") ||
