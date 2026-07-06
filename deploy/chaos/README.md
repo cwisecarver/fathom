@@ -29,6 +29,7 @@ cd deploy/chaos
 ./chaos.sh pause-fence acme   # freeze the owner past TTL, steal on a survivor, prove the zombie self-fences
 ./chaos.sh partition fathom2  # cut fathom2 off S3; observe heartbeat lapse + recovery
 ./chaos.sh soak 180           # sustained load + node churn; acked-vs-stored + isolation audit
+./chaos.sh warm-home acme     # a shard's home node must NOT warm its own shard (survivors do)
 
 ./chaos.sh down
 ```
@@ -57,3 +58,9 @@ enforcing conditional writes, nodes refuse to serve (that's the point).
 - **partition** — node↔S3 cut: heartbeat lapse, fenced flushes, recovery on heal.
 - **soak** — write load with node churn; ends with acked-vs-stored accounting and a
   per-tenant foreign-row isolation audit (must be zero).
+- **warm-home** — the warm follower should warm a shard only on the *survivor* nodes,
+  never on its LB home (a shard fails over away from its home, so the home warming its
+  own is wasted cache budget). Checks placement across all three nodes both while the
+  home serves the shard (live-coordinator exclusion) and after it idle-drops (the
+  `:warm_home_retention_ms` window — the case the home-set fix targets). Home must read
+  `warm=no`, survivors `warm=yes`, at both points.
