@@ -13,6 +13,8 @@
 #                                   unpause the zombie and prove it self-fences
 #   ./chaos.sh partition <node> [secs]  cut one node off S3; observe lapse + recovery
 #   ./chaos.sh soak <secs>        sustained load + node churn; end-to-end integrity check
+#   ./chaos.sh warm-home <shard>  a shard's home node must NOT warm its own shard
+#                                 (survivors do) — while served AND after idle-drop
 #
 # All timings are RELATIVE (one host, loopback MinIO): run `latency 30` first so
 # failover numbers reflect a real S3 RTT rather than loopback.
@@ -279,6 +281,44 @@ cmd_soak() {
   [ $leaks -eq 0 ]
 }
 
+# A shard's HOME node (the LB-hash target that serves it) must NOT warm its own
+# shard — only the survivors warm it, so a failover away from the home lands warm
+# while the home never wastes cache budget on a shard that routes back to it. The
+# regression is a home node re-warming a shard it just idle-dropped (lease released,
+# no live "home" signal); the fix remembers recently-owned shards for
+# :warm_home_retention_ms. This checks BOTH while-served and after-idle-drop.
+check_warm_placement() {
+  local shard=$1 home=$2 rc=0 n present
+  for n in "${NODES[@]}"; do
+    if compose exec -T "$n" test -f "/data/warm/$shard.db" 2>/dev/null; then present=yes; else present=no; fi
+    if [ "$n" = "$home" ]; then
+      printf "  %-8s warm=%-3s (home — MUST be no)\n" "$n" "$present"
+      [ "$present" = "no" ] || rc=1
+    else
+      printf "  %-8s warm=%-3s (survivor — should be yes)\n" "$n" "$present"
+    fi
+  done
+  [ $rc -eq 0 ] && echo "  PASS: home node does not warm its own shard" \
+    || echo "  *** FAIL: home node warmed its own shard"
+  return $rc
+}
+
+cmd_warm_home() {
+  local shard=${1:?usage: warm-home <shard>}
+  seed "$shard"
+  local home; home=$(cmd_owner "$shard") || { echo "no home found"; return 1; }
+  echo "home=$home — waiting ~8s for warm propagation (shard still served, < idle)"
+  sleep 8
+  echo "--- while served (live coordinator on home) ---"
+  check_warm_placement "$shard" "$home" || true
+  # Past SHARD_IDLE_MS (rig 20s) so home flushes+drops+releases, but within the
+  # home-retention window (default 60s) — the regression window.
+  echo "waiting past idle-drop, staying within the home-retention window..."
+  sleep 18
+  echo "--- after idle-drop, within home-retention (the fix's window) ---"
+  check_warm_placement "$shard" "$home"
+}
+
 case "${1:-}" in
   build)       cmd_build ;;
   up)          cmd_up ;;
@@ -291,5 +331,6 @@ case "${1:-}" in
   pause-fence) shift; cmd_pause_fence "$@" ;;
   partition)   shift; cmd_partition "$@" ;;
   soak)        shift; cmd_soak "$@" ;;
+  warm-home)   shift; cmd_warm_home "$@" ;;
   *) sed -n '2,20p' "$0"; exit 64 ;;
 esac
