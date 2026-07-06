@@ -126,5 +126,6 @@ mix fathom.scale            # fan-out density at real shard sizes
 | [docs/migration-plan.md](docs/migration-plan.md) | Blue/green per-shard schema migration design |
 | [docs/phase2-scoping.md](docs/phase2-scoping.md) | Phase 2 options (warm standby, rebalancing, locality) and recommendation |
 | [docs/benchmark-plan.md](docs/benchmark-plan.md) | Bench harness design, hot paths, regression gate |
+| [docs/cluster-architecture.md](docs/cluster-architecture.md) | Cluster architecture decision (LB-partition + S3 lease, why not the alternatives) + phase status |
 | [docs/deploy-cluster.md](docs/deploy-cluster.md) | Cluster deployment, LB config, chaos rig |
 | [docs/runbooks/cluster.md](docs/runbooks/cluster.md) | On-call runbook for the cluster layer |
