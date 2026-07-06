@@ -49,6 +49,10 @@ The L7 load balancer consistent-hashes the `Host` subdomain to one backend node;
 
 Schema version truth lives in three places: `_fathom_migrations` in each shard, `PRAGMA user_version` (O(1) gate), and `shards.schema_version` in Postgres (laggard queries without opening shards).
 
+### Warm standby (Phase 2, A1)
+
+`Fathom.Shard.WarmFollower` (gated by `:warm_follower`, off by default) pre-pulls the fleet's recently-active shards this node doesn't own into a separate cache dir — no lease, no serving. On failover the coordinator promotes the warm copy only after a freshness check (`Storage.pull_if_changed/3`, a conditional `If-None-Match` GET), so a stale copy is never served. The warm win is the object body transfer avoided: measured ≈2.3× (162 → 72 ms) at 1 MB / 30 ms one-way / 100 Mbps — the warm path still pays one S3 round-trip for the freshness check. Warm capacity is disk-bound (~0 BEAM/fd per cached shard), so a standby warms far more than it can serve open.
+
 ### Bench and scale harnesses
 
 - `mix fathom.bench` (+ `scripts/benchmark.sh`, regression-gated via `scripts/commit_with_bench.sh`) measures the hot paths: `cold_open_p50_us`, `cold_open_s3_p50_us` (opt-in), `dir_resolve_p50_us`, `copy_rows_per_s`, `fanout_kb_per_shard`.
@@ -82,9 +86,9 @@ See `docs/benchmark-plan.md` for the full harness description.
 
 ## What's next (Phase 2)
 
-Phase 2 is scoped in `docs/phase2-scoping.md`. The highest-value item is **A1 — S3-warm-cache standby** (`Fathom.Shard.WarmFollower`, in progress): a standby node proactively pre-pulls recently-active shards from S3 into a local cache (no lease, no serving) so that on failover the cold-open becomes a warm open (~2 ms instead of ~200 ms cross-region). It is additive, model-consistent, and reuses the warming infra already built.
+Phase 2 is scoped in `docs/phase2-scoping.md`. The warm standby (A1) is built — see above. Per-shard load counters for hot-spot detection (`Fathom.ShardLoad`, the rebalancing prerequisite) are also built, gated off by default.
 
-Not yet built: dynamic rebalancing (B1 — LB override + control-plane), WAL streaming (A2), per-shard load telemetry for hot-spot detection, a `fathom_native` Rust NIF, or a cached/PubSub-invalidated directory resolve on the request path.
+Not yet built: dynamic rebalancing (B — waiting on real hot-spot evidence), shard locality/affinity (C), WAL streaming (A2, deferred), a `fathom_native` Rust NIF, and a cached/PubSub-invalidated directory resolve on the request path.
 
 ## Build and run
 
