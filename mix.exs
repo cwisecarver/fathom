@@ -74,7 +74,6 @@ defmodule Fathom.MixProject do
       {:oban, "~> 2.18"},
       {:dns_cluster, "~> 0.2.0"},
       {:bandit, "~> 1.5"},
-      {:ecto_libsql, "~> 0.9"},
       {:exqlite, "~> 0.27"},
       # The Hrana (libSQL) protocol server — Fathom serves shards through it.
       {:filo, path: "../filo"}

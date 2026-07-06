@@ -77,8 +77,10 @@ app is vN. That collapses the whole problem to one rule:
 3. **Transform = captured Django SQL** (replayed verbatim per shard), not authored
    modules. Stored with the version in the registry.
 4. **Copy engine: exqlite.** Replays the SQL through `exqlite`, same as the live
-   path. **Resolves exqlite-vs-`ecto_libsql` in favor of exqlite**;
-   `Fathom.ShardRepo`/`ecto_libsql` stays unused unless real remote shards arrive.
+   path. **Resolves exqlite-vs-`ecto_libsql` in favor of exqlite** — the
+   `Fathom.ShardRepo`/`ecto_libsql` path was removed 2026-07-06 (see
+   `docs/cluster-architecture.md`); `Fathom.Shard.Connection` is the engine swap-point
+   if a client ever needs the libSQL engine.
 5. **Retention: a scheduled Oban job, no new table.** On cutover, enqueue
    `RetirementJob(shard_id, vN-1)` at `now + 7d`; an S3 lifecycle rule backstops
    orphans. The directory's `retire`/`retain_until` columns stay for the separate

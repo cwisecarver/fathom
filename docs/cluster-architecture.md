@@ -81,5 +81,17 @@ through node churn, warm-standby 304-promote observed). See
 freshness-validated (304) copy on failover. Remaining: **B** (dynamic rebalancing,
 gated on real hot-spot evidence — `Fathom.ShardLoad` is its built-but-off
 prerequisite), **C** (shard locality / affinity), **A2** (active-shard WAL follower,
-deferred). Open decision: adopt `Fathom.ShardRepo` / `Ecto.Adapters.LibSql` for the
-data path, or stay on `Fathom.Shard` / exqlite.
+deferred).
+
+**Data-path engine — decided 2026-07-06: exqlite.** The `Fathom.ShardRepo` /
+`Ecto.Adapters.LibSql` path (defined but never wired) was evaluated and removed. The
+data plane is a **SQL proxy** — it executes arbitrary opaque SQL from unchanged
+external clients and returns raw Hrana result shape (columns/rows/types/`num_changes`/
+`last_insert_rowid`), with zero Ecto schemas for shard tables — so Ecto's schema layer
+is inert here while adding per-query overhead and a Rust NIF. exqlite (SQLite via
+`Exqlite.Sqlite3`) is the right abstraction level and is what the migration copy, bench,
+scale, and cluster tests already run on. The one thing that could ever force a change is
+a client needing a **libSQL-only** SQL feature — that's an evidence-gated engine swap
+behind `Fathom.Shard.Connection` (the thin wrapper is the single swap-point), **not** a
+reason to adopt Ecto. Ecto stays where its schema is known: the Postgres control plane
+(`Fathom.Repo`).

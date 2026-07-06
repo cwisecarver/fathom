@@ -35,11 +35,6 @@ config :fathom, :novel_shard_rate, nil
 # to :required, and a boot guard refuses :required without a usable secret_key_base.
 config :fathom, :hrana_auth, :disabled
 
-# Shard databases (libSQL/Turso) are opened dynamically per shard via
-# Fathom.ShardRepo. It is intentionally NOT listed in :ecto_repos (there is no
-# single static shard database) and is not started in the supervision tree.
-config :fathom, Fathom.ShardRepo, pool_size: 1
-
 # Oban runs the shard migration rollout (per-shard migration jobs + scheduled
 # retirement of retained old versions). The reconcile cron re-runs the sweep so
 # the cold tail converges to HEAD and drift self-heals.

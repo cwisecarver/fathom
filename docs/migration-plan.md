@@ -16,14 +16,15 @@ actually built so nobody implements against the wrong model.
   `Fathom.Shards` (find-or-start). So "`template@vN` / `shard@vN` namespace"
   becomes concretely a **versioned file** (e.g. a fresh `<shard_id>@vN.db`), and
   the "directory pointer" is a row mapping `shard_id → current file/version`. The
-  namespace framing only returns if real Turso namespaces or the
-  defined-but-unused `Fathom.ShardRepo` / `ecto_libsql` remote path are adopted.
+  namespace framing only returns if real Turso namespaces or a remote-shard path
+  are adopted (the `Fathom.ShardRepo` / `ecto_libsql` scaffold for that was removed
+  2026-07-06 — data path is exqlite; see `docs/cluster-architecture.md`).
 - **The copy runs against *local* shards, not remote Hrana.** Filo (the Hrana
   server, `../filo`) is Fathom's **client-facing** protocol now — it is *not* the
   migration copy mechanism. The copy/transform reads the old shard and writes the
-  new one through the local shard layer (`Fathom.Shard` / `Fathom.Shards`, or
-  `Fathom.ShardRepo`), so the "ETL over Hrana (`ecto_libsql` remote)" decision
-  below does not apply to single-node, file-backed shards.
+  new one through the local shard layer (`Fathom.Shard` / `Fathom.Shards`), so the
+  "ETL over Hrana (remote libSQL)" decision below does not apply to single-node,
+  file-backed shards.
 - **Naming collision.** The *built* Filo executor is `Fathom.ShardExecutor`. This
   plan's migration-copy helper is named `Fathom.ShardExec` — rename it (e.g.
   `Fathom.Migrator.Copy`) so the two aren't confused.
@@ -126,9 +127,11 @@ no longer possible — by design.
   transaction-only. So Fathom reads the old shard and writes the new one
   (`Fathom.Migrator.Copy`, née `Fathom.ShardExec`). Bytes flow through Fathom —
   fine at shard size. Use ATTACH only if a specific self-hosted `sqld` build is
-  pinned and the deprecation risk is accepted. *(Note: "over Hrana / `ecto_libsql`
-  remote" assumes remote shards; the current shards are local files, so the copy
-  runs through `Fathom.Shards` locally — see Reality check.)*
+  pinned and the deprecation risk is accepted. *(Note: "over Hrana / remote
+  libSQL" assumes remote shards; the current shards are local files, so the copy
+  runs through `Fathom.Shards` locally — see Reality check. The `ecto_libsql` dep
+  that scaffolded this was removed 2026-07-06 as unused; a remote path would
+  re-add a libSQL driver.)*
 - **Retirement: Fathom delete job + S3 lifecycle backstop.** An Oban cron deletes
   namespaces past `retain_until`; an S3 lifecycle rule backstops any orphans the
   job misses.
@@ -172,7 +175,7 @@ no longer possible — by design.
 - `Fathom.Migrator.Copy` (renamed from `Fathom.ShardExec` to avoid colliding with
   the built `Fathom.ShardExecutor`) — run the copy/transform + stamp
   `user_version`. For the current local file-backed shards this goes through
-  `Fathom.Shards` directly; the "over Hrana (`ecto_libsql` remote)" form only
+  `Fathom.Shards` directly; the "over Hrana (remote libSQL)" form only
   applies if remote shards are adopted (see Reality check).
 - `Fathom.Directory` — `schema_version`, `live_namespace`, `retired_namespace`,
   `retain_until`, `migration_status`; atomic cutover + cache invalidation.
