@@ -134,6 +134,78 @@ defmodule Fathom.Shard.WarmFollowerTest do
     send(owner, :stop)
   end
 
+  # Register `a`, then let it be unregistered on command (an idle-drop: the coordinator
+  # stops, releasing the registry entry AND the lease). Returns the owner pid; drive it
+  # with :unregister / :stop, each acked so the registry mutation is observed before the
+  # next refresh.
+  defp own_shard(id) do
+    test = self()
+
+    pid =
+      spawn(fn ->
+        {:ok, _} = Registry.register(Fathom.ShardRegistry, id, nil)
+        send(test, {:owned, id})
+
+        receive do
+          :unregister ->
+            Registry.unregister(Fathom.ShardRegistry, id)
+            send(test, {:unregistered, id})
+            receive do: (:stop -> :ok)
+        end
+      end)
+
+    assert_receive {:owned, ^id}
+    pid
+  end
+
+  test "does not re-warm a shard it recently owned (an idle-dropped home shard)" do
+    a = seed_shard("warm_recent_#{uniq()}")
+    b = seed_shard("warm_recent_other_#{uniq()}")
+    owner = own_shard(a)
+
+    follower = start_supervised!(WarmFollower)
+    refute a in refresh(follower), "excluded while a live coordinator holds it"
+
+    # Idle-drop: coordinator gone, lease released — nothing on-disk/in-S3 marks this
+    # node as `a`'s home anymore, but it IS still the LB home, so `a` will route back
+    # here. The follower must remember it owned `a` and not re-warm it.
+    send(owner, :unregister)
+    assert_receive {:unregistered, ^a}
+
+    cached = refresh(follower)
+    refute a in cached, "must not re-warm a shard this node recently owned/dropped"
+    refute WarmFollower.cached?(a)
+    assert b in cached, "a shard this node never owned is still warmed"
+
+    send(owner, :stop)
+  end
+
+  test "re-warms a recently-owned shard once the home-retention window lapses (LB remap)" do
+    a = seed_shard("warm_lapse_#{uniq()}")
+    owner = own_shard(a)
+
+    follower = start_supervised!(WarmFollower)
+    refute a in refresh(follower)
+
+    send(owner, :unregister)
+    assert_receive {:unregistered, ^a}
+    refute a in refresh(follower), "still home within the retention window"
+
+    # Age the last-owned stamp past the window (deterministic, no sleep) — the proxy for
+    # `a`'s LB home having genuinely moved to another node, making this node a failover
+    # target that SHOULD warm it.
+    :sys.replace_state(follower, fn s ->
+      old = System.monotonic_time(:millisecond) - 10 * s.home_retention_ms
+      %{s | recent_owned: Map.put(s.recent_owned, a, old)}
+    end)
+
+    cached = refresh(follower)
+    assert a in cached, "after the home window lapses, the shard is a warmable failover target"
+    assert WarmFollower.cached?(a)
+
+    send(owner, :stop)
+  end
+
   test "evicts shards that leave the active set" do
     a = seed_shard("warm_evict_#{uniq()}")
     b = seed_shard("warm_keep_#{uniq()}")

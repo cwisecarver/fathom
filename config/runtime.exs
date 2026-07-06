@@ -105,6 +105,13 @@ if ms = System.get_env("WARM_POLL_MS") do
   config :fathom, :warm_poll_ms, String.to_integer(ms)
 end
 
+# How long after this node last owned a shard the warm follower still treats it as
+# "home" and won't re-warm it (a shard routes back to its home, so warming it has no
+# failover value). Outlast a routine idle→reopen gap; a real LB remap lapses it.
+if ms = System.get_env("WARM_HOME_RETENTION_MS") do
+  config :fathom, :warm_home_retention_ms, String.to_integer(ms)
+end
+
 if config_env() == :prod do
   database_url =
     System.get_env("DATABASE_URL") ||

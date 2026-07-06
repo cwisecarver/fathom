@@ -24,7 +24,23 @@ defmodule Fathom.Shard.WarmFollower do
 
   Gated by `:warm_follower` (off by default; a node opts in to the standby role) and
   bounded by `:warm_cache_max`. Refreshed every `:warm_poll_ms` from
-  `Fathom.Directory.active_recent/1`, minus the shards this node already owns.
+  `Fathom.Directory.active_recent/1`, minus the shards this node owns **or recently
+  owned**.
+
+  ## Why "recently owned", not just "owned"
+
+  A survivor only needs a shard warm if a *failover* will route it here — i.e. this
+  node is NOT the shard's LB home. The home node has zero failover use for its own
+  shards (they only move if the home itself dies, taking its cache with it), so
+  warming them is pure waste that competes for the `:warm_cache_max` budget with the
+  real failover set. The live exclusion catches a shard while a coordinator holds it,
+  but on idle the coordinator flushes, drops the local copy, and **releases the lease**
+  — so nothing on-disk or in S3 still marks this node as the home, and the next poll
+  would re-warm the shard this node just dropped. So the follower remembers shards it
+  owned for `:warm_home_retention_ms` past the last time it saw them owned, and excludes
+  those too. A routine idle→reopen re-stamps the shard before the window lapses, so it
+  never re-warms its own home set; a genuine LB remap (the home actually changed) lets
+  the window lapse and the shard becomes a warmable failover target again.
   """
   use GenServer
 
@@ -36,6 +52,10 @@ defmodule Fathom.Shard.WarmFollower do
   @default_cache_max 500
   # Per-shard warm-pull budget; a pull past this is killed and the shard skipped (finding #23).
   @default_pull_timeout 60_000
+  # How long after this node last owned a shard it still counts as "home" (so we don't
+  # re-warm what we just idle-dropped). Outlasts a routine idle→reopen gap; a real LB
+  # remap lapses it so the shard becomes a warmable failover target again.
+  @default_home_retention_ms 60_000
 
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -79,10 +99,25 @@ defmodule Fathom.Shard.WarmFollower do
         Application.get_env(:fathom, :warm_cache_max, @default_cache_max)
       )
 
+    home_retention_ms =
+      Keyword.get(
+        opts,
+        :home_retention_ms,
+        Application.get_env(:fathom, :warm_home_retention_ms, @default_home_retention_ms)
+      )
+
     File.mkdir_p!(cache_dir())
 
-    {:ok, %{poll_ms: poll_ms, cache_max: cache_max, cached: MapSet.new(), timer: nil},
-     {:continue, :refresh}}
+    {:ok,
+     %{
+       poll_ms: poll_ms,
+       cache_max: cache_max,
+       home_retention_ms: home_retention_ms,
+       cached: MapSet.new(),
+       # shard_id => monotonic-ms of the last refresh that saw this node own it
+       recent_owned: %{},
+       timer: nil
+     }, {:continue, :refresh}}
   end
 
   @impl true
@@ -109,7 +144,13 @@ defmodule Fathom.Shard.WarmFollower do
     reaped = Storage.reap_stale_temps(Path.join(cache_dir(), "*"), 2 * pull_timeout())
     if reaped > 0, do: Logger.info("warm-follower: reaped #{reaped} orphaned temp(s)")
 
-    target = target_set(state.cache_max)
+    # Stamp shards this node owns right now, decay ones last owned past the retention
+    # window, and treat the survivors as "home" — excluded from the warm target so we
+    # never re-warm what this node just idle-dropped.
+    recent_owned = refresh_home(state.recent_owned, state.home_retention_ms)
+    home = MapSet.new(Map.keys(recent_owned))
+
+    target = target_set(state.cache_max, home)
     to_evict = MapSet.difference(state.cached, target)
 
     Enum.each(to_evict, &evict/1)
@@ -123,17 +164,27 @@ defmodule Fathom.Shard.WarmFollower do
     # bounded to O(cached) conditional GETs per poll, not O(fleet).
     cached = pull_all(target)
 
-    schedule(%{state | cached: cached})
+    schedule(%{state | cached: cached, recent_owned: recent_owned})
   end
 
-  # The fleet hot set (most-recently-active) minus the shards this node already
-  # owns (no point warming what we serve) — capped at the cache budget.
-  defp target_set(cache_max) do
-    owned = owned_shards()
+  # Re-stamp currently-owned shards to now, then drop entries last owned longer ago
+  # than the retention window. The result's keys are the shards this node is (still
+  # plausibly) the home for.
+  defp refresh_home(recent_owned, retention_ms) do
+    now = System.monotonic_time(:millisecond)
 
+    recent_owned
+    |> Map.merge(Map.new(owned_shards(), &{&1, now}))
+    |> Map.reject(fn {_id, ts} -> now - ts > retention_ms end)
+  end
+
+  # The fleet hot set (most-recently-active) minus the shards this node owns or
+  # recently owned (its home set — no failover use in warming what routes back to us)
+  # — capped at the cache budget.
+  defp target_set(cache_max, home) do
     Fathom.Directory.active_recent(cache_max)
     |> Enum.map(& &1.shard_id)
-    |> Enum.reject(&MapSet.member?(owned, &1))
+    |> Enum.reject(&MapSet.member?(home, &1))
     |> Enum.take(cache_max)
     |> MapSet.new()
   rescue
@@ -145,7 +196,6 @@ defmodule Fathom.Shard.WarmFollower do
 
   defp owned_shards do
     Registry.select(Fathom.ShardRegistry, [{{:"$1", :_, :_}, [], [:"$1"]}])
-    |> MapSet.new()
   end
 
   defp pull_all(shard_ids) do
