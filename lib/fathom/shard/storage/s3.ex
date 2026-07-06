@@ -420,10 +420,7 @@ defmodule Fathom.Shard.Storage.S3 do
             {:error, {:s3_touch_error_body, body}}
 
           true ->
-            case Regex.run(~r|<ETag>(?:&quot;\|")?([0-9a-fA-F-]+)|, body) do
-              [_, part_etag] -> {:ok, part_etag}
-              _ -> {:error, {:s3_part_copy_no_etag, body}}
-            end
+            copy_part_etag(body)
         end
 
       {:ok, %{status: 412}} ->
@@ -434,6 +431,19 @@ defmodule Fathom.Shard.Storage.S3 do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  # The quote around the ETag value arrives in whatever XML escaping the store
+  # chose: AWS emits &quot;, MinIO emits the numeric entity &#34;, and a literal
+  # " is legal inside element content. Missing one of these fails the boot fence
+  # probe on a store whose conditional writes are actually fine (the chaos rig
+  # caught MinIO's &#34;).
+  @doc false
+  def copy_part_etag(body) do
+    case Regex.run(~r|<ETag>(?:&quot;\|&#34;\|")?([0-9a-fA-F-]+)|, body) do
+      [_, part_etag] -> {:ok, part_etag}
+      _ -> {:error, {:s3_part_copy_no_etag, body}}
     end
   end
 
