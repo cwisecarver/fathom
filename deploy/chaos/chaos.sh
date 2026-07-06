@@ -24,6 +24,10 @@ LB=${LB:-http://localhost:8080}
 TOXI=${TOXI:-http://localhost:8474}
 DOMAIN=fathom.test
 TTL_MS=10000
+# A steal is allowed once the owner's heartbeat age exceeds TTL + steal_margin
+# (the clock-skew guard, Fathom.Shard.Storage.steal_margin_ms, default 5000 and
+# not overridden in the rig). Scenarios that force a steal must wait past both.
+STEAL_MARGIN_MS=5000
 NODES=(fathom1 fathom2 fathom3)
 # direct (LB-bypassing) Hrana port per node, for forced-steal experiments.
 # A function (not an associative array) so the script runs on macOS's bash 3.2.
@@ -51,14 +55,23 @@ netname() { echo "fathom-chaos_default"; }
 now_ms() { /usr/bin/python3 -c 'import time; print(int(time.time()*1000))'; }
 
 # -- Hrana v2 pipeline over HTTP ------------------------------------------------
-# hrana <base-url> <shard> <sql>  → full pipeline response JSON on stdout,
-# rc 0 iff transport ok AND no per-statement error.
+# hrana <base-url> <shard> <sql>  → full pipeline response JSON on stdout.
+# rc 0 ONLY on a genuine success: HTTP 2xx AND a well-formed pipeline whose
+# execute result is type "ok". A refused stream open (lease held / node down)
+# comes back as a non-2xx or an error-shaped body with NO .results — those must
+# read as failure, or a failover experiment would time a false success (the
+# body without .results was silently passing the old per-statement-only check).
 hrana() {
-  local base=$1 shard=$2 sql=$3 out
-  out=$(curl -sS --max-time 5 -X POST "$base/v2/pipeline" \
+  local base=$1 shard=$2 sql=$3 raw code out
+  raw=$(curl -sS --max-time 8 -w $'\n%{http_code}' -X POST "$base/v2/pipeline" \
     -H "Host: $shard.$DOMAIN" -H "Content-Type: application/json" \
     -d "{\"requests\":[{\"type\":\"execute\",\"stmt\":{\"sql\":$(jq -Rn --arg s "$sql" '$s')}},{\"type\":\"close\"}]}") || return 1
+  code=${raw##*$'\n'}   # trailing status line
+  out=${raw%$'\n'*}     # body
   echo "$out"
+  [ "$code" = "200" ] || return 1
+  # The execute (first request) must have produced an ok result with a response.
+  [ "$(echo "$out" | jq -r 'try (.results[0].type) catch "none"')" = "ok" ] || return 1
   [ "$(echo "$out" | jq -r '[.results[]? | select(.type=="error")] | length')" = "0" ]
 }
 
@@ -155,8 +168,11 @@ cmd_failover() {
   post=$(sql "$shard" "SELECT count(*) FROM kv" | val)
   newowner=$(cmd_owner "$shard" || echo '?')
   echo "RESULT failover: $((t1 - t0)) ms to first acked write on a survivor"
-  echo "  new owner=$newowner rows pre=$pre post=$post (flushed data must survive: post >= pre)"
-  [ "$post" -ge "$pre" ] || echo "  *** DATA LOSS BEYOND RPO — investigate"
+  echo "  new owner=$newowner rows pre=$pre post=$post (seq=100 flushed pre-kill must survive)"
+  case $post in
+    ''|*[!0-9]*) echo "  *** post-read did not return a count ($post) — investigate" ;;
+    *) [ "$post" -ge "$pre" ] || echo "  *** DATA LOSS BEYOND RPO — investigate" ;;
+  esac
   grep_promote "$newowner"
   revive "$owner"
 }
@@ -169,16 +185,24 @@ grep_promote() { # did the survivor open warm (304-promote) or cold?
 cmd_pause_fence() {
   local shard=${1:?usage: pause-fence <shard>}
   seed "$shard"
+  # The schema must be DURABLE in S3 before the freeze, or the survivor steals a
+  # working lease but pulls an empty shard (the flush interval hasn't elapsed) and
+  # its write fails on a missing table — a false "couldn't steal".
+  echo "waiting one flush interval so $shard's schema is durable in S3..."
+  sleep 6
   local owner; owner=$(cmd_owner "$shard") || { echo "no owner"; return 1; }
   # pick a survivor for the forced steal
   local survivor; for survivor in "${NODES[@]}"; do [ "$survivor" != "$owner" ] && break; done
 
-  # a dirty, unflushed write right before the freeze — the zombie's flush payload
+  # a dirty, unflushed write right before the freeze — the zombie's flush payload.
+  # seq=300 is NOT in S3 (frozen before the next flush); losing it is within RPO.
+  # The invariant is that the zombie must not RESURRECT it over the survivor's write.
   sql "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', 300)" >/dev/null
-  echo "owner=$owner survivor=$survivor — pausing owner with a dirty write"
+  echo "owner=$owner survivor=$survivor — pausing owner with a dirty (unflushed) write"
   "$DOCKER" pause "$(cname "$owner")" >/dev/null
-  echo "frozen; waiting past TTL ($TTL_MS ms) + margin..."
-  sleep $(( TTL_MS / 1000 + 5 ))
+  local wait_s=$(( (TTL_MS + STEAL_MARGIN_MS) / 1000 + 6 ))  # + cushion past the steal threshold
+  echo "frozen; waiting ${wait_s}s (past TTL ${TTL_MS}ms + steal margin ${STEAL_MARGIN_MS}ms)..."
+  sleep "$wait_s"
 
   echo "forcing the steal: writing to $shard directly on $survivor (LB passive health can't see a frozen node — that hang is the documented OSS-nginx limitation)"
   if sql_direct "$survivor" "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', 400)" >/dev/null; then
@@ -190,10 +214,17 @@ cmd_pause_fence() {
   echo "unpausing the zombie; its next flush must self-fence, not overwrite"
   "$DOCKER" unpause "$(cname "$owner")" >/dev/null
   sleep 8   # > flush interval: let the zombie attempt its fenced flush
-  echo "zombie ($owner) fence log:"
-  compose logs --since 2m "$owner" 2>/dev/null | grep -Ei "fenc|supersed|quarantin|stale" | tail -5 | sed 's/^/  /'
-  local post; post=$(sql_direct "$survivor" "$shard" "SELECT count(*) FROM kv WHERE seq = 400" | val)
-  echo "RESULT pause-fence: survivor's post-steal write present=$post (must be 1); zombie must show a self-fence line above"
+  echo "zombie ($owner) fence log (self-fence = heartbeat lapse + flush refused):"
+  compose logs --since 2m "$owner" 2>/dev/null |
+    grep -Ei "lapse|unconfirmed|ownership|flush skipped|fenc|supersed|quarantin|stale|epoch" |
+    tail -6 | sed 's/^/  /'
+  local live; live=$(sql_direct "$survivor" "$shard" "SELECT count(*) FROM kv WHERE seq = 400" | val)
+  local zombie; zombie=$(sql_direct "$survivor" "$shard" "SELECT count(*) FROM kv WHERE seq = 300" | val)
+  echo "RESULT pause-fence:"
+  echo "  survivor's post-steal write (seq=400) present = $live   (MUST be 1)"
+  echo "  zombie's dirty write (seq=300) resurrected     = $zombie   (MUST be 0 — self-fence held)"
+  [ "$live" = "1" ] && [ "$zombie" = "0" ] && echo "  PASS: single-writer held across the zombie's flush" \
+    || echo "  *** SPLIT-BRAIN — the zombie overwrote the survivor"
 }
 
 cmd_partition() {
@@ -203,7 +234,8 @@ cmd_partition() {
   curl -sS -X POST "$TOXI/proxies/$proxy" -d '{"enabled": false}' >/dev/null
   sleep "$secs"
   echo "$node lapse/fence log during the partition:"
-  compose logs --since "${secs}s" "$node" 2>/dev/null | grep -Ei "heartbeat|lapse|fenc|error" | tail -8 | sed 's/^/  /'
+  compose logs --since "${secs}s" "$node" 2>/dev/null |
+    grep -Ei "heartbeat|lapse|unconfirmed|ownership|flush skipped|fenc|error" | tail -10 | sed 's/^/  /'
   curl -sS -X POST "$TOXI/proxies/$proxy" -d '{"enabled": true}' >/dev/null
   echo "restored; node should resume renewing (watch: ./chaos.sh logs $node)"
 }

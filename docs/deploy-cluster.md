@@ -259,13 +259,21 @@ Two layers, deliberately split:
     `crash_contract_test.exs`) — a steal loses only committed-but-unflushed writes;
   - **fail-closed under a lease-store partition + transient-blip tolerance** (`partition_test.exs`,
     via `Fathom.Test.FaultyStorage`).
-- **Failover time + loss window — the real rig (manual / CI).** Time-to-serve and the
-  committed-but-unflushed loss window are *measurements*, not pass/fail invariants, and they need
-  a real deployment: N nodes behind the LB, with a network fault injector (toxiproxy or iptables)
-  to (a) kill a node and time the LB reroute + cold-open on a survivor, and (b) partition a
-  node↔S3 and confirm it relinquishes (≤ lease-TTL) rather than serving stale. Record the numbers
-  against your S3 region RTT and the failover SLO. The in-process tests pin the *safety*; this rig
-  measures the *latency*.
+- **Failover time + loss window — the real rig (`deploy/chaos/`, built 2026-07-05).** Time-to-serve
+  and the committed-but-unflushed loss window are *measurements*, not pass/fail invariants, and they
+  need a real deployment. The rig is a one-host Docker Compose stack — 3 prod-release fathom nodes
+  behind nginx (`hash $host consistent`), one MinIO bucket reached through per-node **toxiproxy**
+  proxies (latency/bandwidth/partition injection), one Postgres — driven by `deploy/chaos/chaos.sh`:
+  `failover` (silent-kill an owner, time the LB reroute + lease steal on a survivor), `pause-fence`
+  (freeze an owner past TTL, steal on a survivor, prove the unpaused zombie self-fences),
+  `partition` (cut a node↔S3 and confirm it relinquishes rather than serving stale), and `soak`
+  (load + node churn, with an acked-vs-stored RPO count and a per-tenant isolation audit).
+  Docker suffices because nodes coordinate only through S3 (no BEAM cluster); all numbers are
+  **relative** (one host, loopback MinIO — inject latency first). The in-process tests pin the
+  *safety*; this rig measures the *latency* and demonstrates the failure modes end to end. See
+  `deploy/chaos/README.md`; the first run's numbers are in `docs/reviews/chaos-run-2026-07-05.md`
+  (held-shard failover ≈ TTL + steal margin; soak: 584 acked / 584 stored / 0 lost / 0 leaks
+  through 4 kills; warm-standby promotion observed live).
 
 ## Status
 
