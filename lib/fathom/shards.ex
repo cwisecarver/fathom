@@ -44,6 +44,9 @@ defmodule Fathom.Shards do
       # Per-shard load: the checkout (traffic) signal for the rebalancer. Lock-free
       # ETS bump, gated + off by default (see Fathom.ShardLoad).
       Fathom.ShardLoad.record_checkout(shard_id)
+      # Node-local recency for idle-eviction at capacity. Lock-free ETS insert, and a
+      # no-op unless a finite cap + :evict_idle_at_capacity make eviction reachable.
+      Fathom.Shards.Lru.touch(shard_id)
       {:ok, pid, ref, path}
     else
       # Race: `ensure` resolved a coordinator that lost a race with its own lifecycle, so a
@@ -219,7 +222,12 @@ defmodule Fathom.Shards do
   # measured fd/RSS density budget (`mix fathom.scale --ramp`).
   defp start_if_capacity(shard_id) do
     cond do
-      at_capacity?() ->
+      # At the cap, first try to make room by evicting the least-recently-used IDLE
+      # shard (soft cap). Only if nothing idle can be evicted do we refuse — a node
+      # saturated with *active* connections genuinely has no room, and 503 tells the
+      # LB/client to back off rather than letting DynamicSupervisor spawn past the fd
+      # cliff (emfile) and degrade the whole node.
+      at_capacity?() and not evicted_for_room?() ->
         :telemetry.execute([:fathom, :shards, :at_capacity], %{count: 1}, %{shard_id: shard_id})
         {:error, :node_at_capacity}
 
@@ -233,6 +241,43 @@ defmodule Fathom.Shards do
         start(shard_id)
     end
   end
+
+  # How many least-recently-used shards to probe for idleness before giving up and
+  # refusing. If the LRU-coldest handful are all still actively serving connections,
+  # the node is genuinely hot and refusing is correct — bounding the probe keeps the
+  # at-capacity path from doing O(open-shards) drain calls on a saturated node.
+  @max_evict_probes 16
+
+  # Evict the least-recently-used *idle* shard to free a slot, returning whether one was
+  # freed. Off when `:evict_idle_at_capacity` is false (hard cap). `drain(id, 0)` is the
+  # atomic evict-if-idle primitive: it stops the coordinator (flush + drop + release lease)
+  # iff it has zero checked-out connections, else returns `{:error, :busy}` untouched.
+  # Walks LRU-first, so the first probe — the coldest shard — is almost always idle and
+  # evicts in one call; a dirty idle shard pays one flush, a clean one skips the upload.
+  defp evicted_for_room? do
+    if Fathom.Shards.Lru.enabled?() do
+      Fathom.Shards.Lru.lru_order(@max_evict_probes)
+      |> Enum.filter(&shard_open?/1)
+      |> Enum.reduce_while(false, fn shard_id, _ ->
+        case drain(shard_id, 0) do
+          :ok ->
+            :telemetry.execute([:fathom, :shards, :evicted], %{count: 1}, %{shard_id: shard_id})
+            {:halt, true}
+
+          # Busy (connections checked out) or a drain failure — leave it, try the next.
+          _ ->
+            {:cont, false}
+        end
+      end)
+    else
+      false
+    end
+  end
+
+  # Is this shard currently open on this node? Filters stale Lru rows (a coordinator that
+  # already stopped without its `forget` having landed) so we don't count a no-op
+  # `drain/2` on an already-gone shard as having freed a slot.
+  defp shard_open?(shard_id), do: Registry.lookup(@registry, shard_id) != []
 
   # Should this open be refused as an over-rate NOVEL creation? Only consulted on the
   # registry-miss path, and only does work when `:novel_shard_rate` is configured (nil =

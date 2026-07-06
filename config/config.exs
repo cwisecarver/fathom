@@ -21,6 +21,13 @@ config :fathom,
 # raise it from the measured density (mix fathom.scale --ramp) via MAX_OPEN_SHARDS (config/runtime.exs).
 config :fathom, :max_open_shards, 10_000
 
+# Soften the cap above: at capacity, evict the least-recently-used IDLE shard (flush +
+# drop + release its lease) to admit a new open, rather than refusing with a 503. An idle
+# shard is bottomless-backed, so eviction costs only a cold re-open if it's touched again;
+# a busy shard (checked-out connections) is never evicted. Set false for a hard cap (503 at
+# the limit). Only active when :max_open_shards is finite (see Fathom.Shards.Lru).
+config :fathom, :evict_idle_at_capacity, true
+
 # The churn half of finding #14: :max_open_shards bounds how many shards a node holds open;
 # this bounds how FAST unseen ids can mint new ones. Grants/sec for NOVEL creations only —
 # existing-shard cold opens are never limited, and the directory check behind it fails open.
