@@ -86,6 +86,14 @@ if ms = System.get_env("SHARD_IDLE_MS") do
   config :fathom, :shard_idle_ms, String.to_integer(ms)
 end
 
+# Per-shard load counters (`Fathom.ShardLoad`) — the Phase-2 rebalancing input. Off by
+# default so the hot path doesn't pay for an unread counter; a node/deployment opts in
+# (the "turn on :shard_load on a deployed node" knob a rebalancer / hot-spot measurement
+# needs). Read live via `Application.get_env`, so it also gates the record_* calls.
+if System.get_env("SHARD_LOAD") in ~w(true 1) do
+  config :fathom, :shard_load, true
+end
+
 # Opt out of the boot-time conditional-write probe (expert review #16) ONLY for rigs where
 # storage isn't reachable at boot and the store is known-good. Never in prod.
 if System.get_env("VERIFY_STORAGE_FENCE") in ~w(false 0) do

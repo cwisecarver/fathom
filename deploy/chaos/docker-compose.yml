@@ -30,6 +30,9 @@ x-fathom-env: &fathom-env
   # short idle threshold so flush-and-drop happens inside a scenario's window.
   SHARD_FLUSH_INTERVAL_MS: "5000"
   SHARD_IDLE_MS: "20000"
+  # Per-shard load counters on, so `chaos.sh hotspots` can read Fathom.ShardLoad.top
+  # per node — the real-traffic hot-spot measurement (Phase-2 §B).
+  SHARD_LOAD: "true"
   # Every node is also a warm-standby follower, so kill-failover exercises the
   # warm-promotion (304) path when the survivor has the shard cached.
   WARM_FOLLOWER: "true"

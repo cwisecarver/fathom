@@ -143,12 +143,29 @@ hash. The fork is where the override lives:
     long as `Q/L` (stream count) stays ≫ N. So a node sustains tens of thousands of q/s
     against many shards; the earlier ~1.2k figure was the per-query harness artifact, not a
     fathom limit. (One-host relative; a staging run gives prod-absolute q/s.)
-  - **Verdict:** high capacity value but premature — the detection is proven and the
-    threshold shape is now known (p99/absolute, not median); the remaining gate before
-    building B is a **staging real-traffic run** (turn on `:shard_load` on a deployed node,
-    read `Fathom.ShardLoad.top/2` under a real skewed tenant load, confirm the synthetic
-    shape holds and set the absolute q/s floor + anti-flap window). B also depends on A1
-    (warm-handoff) to move a shard without a cold-open stall. **Do after A, with data.**
+  - **Staging real-traffic run — DONE (chaos rig, 2026-07-06).** The non-synthetic
+    confirmation: `SHARD_LOAD=true` on the 3 prod-release nodes (the new `runtime.exs` env),
+    then `deploy/chaos/chaos.sh hotspots` drove **17,455 real Hrana requests** through the
+    nginx LB (~290 req/s, Zipf s=1.1 over 200 shards), and read `Fathom.ShardLoad.top(20)`
+    on each node via `bin/fathom rpc`. Results match the synthetic harness end-to-end:
+    (1) the LB consistent-hash **spread the hot set across all three nodes** — hot_1 on
+    fathom2, hot_2 on fathom3, hot_4 on fathom1, each shard on exactly one node — so a
+    rebalancer reads `ShardLoad` per node and **merges** for the fleet view (the per-node
+    view is partial by design); (2) the merged ranking is a clean monotone Zipf head (hot_1
+    3767 q → hot_2 1727 → hot_3 1152 → …); (3) **`ShardLoad.top(20)` recovers the head:
+    top-5/10 recall 1.0, top-20 recall 0.95** under the real wire protocol + real LB routing
+    + real MinIO S3. So the detection signal holds non-synthetically, and the per-node-read/
+    merge model is confirmed. (Traffic is per-query over curl, ~290 req/s — enough to prove
+    detection; the throughput ceiling is the synthetic `--stream-len` result above.)
+  - **Verdict:** the prerequisites are met — detection is proven **synthetically and on the
+    rig under real traffic**, the threshold shape is known (p99/absolute, not median), and
+    the per-node-read/merge model is confirmed. What's left for B is the build itself: the
+    **B1 LB exception table** + a control plane that reads merged `ShardLoad`, applies a
+    p99/absolute hot rule with a 2-window anti-flap confirm, and orchestrates a warm handoff
+    (drain → warm via A1 → flip the override → old self-fences). It still **depends on A1**
+    (warm-handoff, built) and should be triggered by real hot-spot evidence in the target
+    deployment (a fixed absolute q/s floor tuned there). **Ready to build when a real hot
+    spot justifies it.**
 - **B2 — In-fathom routing/redirect for rebalanced shards.** Re-opens the rejected
   mailroom / `base_url`-redirect debate (per-request cross-node forwarding). **Don't.**
 

@@ -15,6 +15,9 @@
 #   ./chaos.sh soak <secs>        sustained load + node churn; end-to-end integrity check
 #   ./chaos.sh warm-home <shard>  a shard's home node must NOT warm its own shard
 #                                 (survivors do) — while served AND after idle-drop
+#   ./chaos.sh hotspots [shards secs zipf workers]  drive Zipf-skewed REAL Hrana
+#                                 traffic through the LB, then read Fathom.ShardLoad.top
+#                                 per node — the non-synthetic Phase-2 §B hot-spot run
 #
 # All timings are RELATIVE (one host, loopback MinIO): run `latency 30` first so
 # failover numbers reflect a real S3 RTT rather than loopback.
@@ -319,8 +322,90 @@ cmd_warm_home() {
   check_warm_placement "$shard" "$home"
 }
 
+# -- hotspots: real-traffic hot-spot detection (Phase-2 §B) --------------------
+# Drive Zipf-skewed REAL Hrana traffic (through the LB, so the subdomain hashes to a
+# node exactly as in prod), then read Fathom.ShardLoad.top per node via the release
+# RPC. This is the non-synthetic confirmation of `mix fathom.scale --hotspots`: does
+# the shipped read API recover the hot head under real wire traffic? Needs SHARD_LOAD
+# on (set in docker-compose's fathom-env).
+cmd_hotspots() {
+  local shards=${1:-200} secs=${2:-60} zexp=${3:-1.1} workers=${4:-24}
+  echo "hotspots: ${secs}s of Zipf(s=$zexp) REAL Hrana traffic over $shards shards via $workers workers (through the LB)"
+
+  # Reset the per-node counters so this run's rates aren't polluted by earlier traffic.
+  local n
+  for n in "${NODES[@]}"; do
+    compose exec -T "$n" /app/bin/fathom rpc 'Fathom.ShardLoad.reset()' >/dev/null 2>&1
+  done
+
+  # A pool of Zipf-drawn shard ids (hot_1 hottest). python3 is already a dep (now_ms).
+  local targets; targets=$(mktemp)
+  /usr/bin/python3 - "$shards" "$zexp" > "$targets" <<'PY'
+import sys, random, bisect
+n=int(sys.argv[1]); s=float(sys.argv[2])
+w=[1.0/(k**s) for k in range(1,n+1)]; tot=sum(w)
+cum=[]; c=0.0
+for x in w: c+=x/tot; cum.append(c)
+for _ in range(300000):
+    print(f"hot_{bisect.bisect_left(cum, random.random())+1}")
+PY
+
+  # `workers` background loops, each firing sql on every workers-th target line until
+  # the deadline. Each sql is a real open->execute(SELECT 1)->close Hrana stream.
+  local deadline=$(( $(now_ms) + secs * 1000 ))
+  local ackdir; ackdir=$(mktemp -d)
+  local w
+  for w in $(seq 1 "$workers"); do
+    (
+      awk -v off="$w" -v step="$workers" 'NR % step == (off % step)' "$targets" | while read -r shard; do
+        [ "$(now_ms)" -lt "$deadline" ] || break
+        sql "$shard" "SELECT 1" >/dev/null 2>&1 && echo 1 >> "$ackdir/$w"
+      done
+    ) &
+  done
+  wait
+
+  local total=0
+  for w in $(seq 1 "$workers"); do
+    [ -f "$ackdir/$w" ] && total=$(( total + $(wc -l < "$ackdir/$w") ))
+  done
+  local elapsed=$(( secs ))
+  echo "drove ~$total successful requests (~$(( total / (elapsed>0?elapsed:1) )) req/s through the LB)"
+
+  # Read the top shards each node saw, merge, and score recovery of the Zipf head.
+  local dump; dump=$(mktemp)
+  for n in "${NODES[@]}"; do
+    echo "== $n =="
+    compose exec -T "$n" /app/bin/fathom rpc \
+      'Fathom.ShardLoad.top(20, :queries) |> Enum.map(fn m -> {m.shard_id, m.queries} end) |> inspect(limit: :infinity) |> IO.puts' \
+      | tee -a "$dump"
+  done
+
+  echo "--- merged hot set + Zipf-head recovery ---"
+  /usr/bin/python3 - "$dump" <<'PY'
+import sys, re
+pairs=[]
+for line in open(sys.argv[1]):
+    for sid, q in re.findall(r'\{"(hot_\d+)",\s*(\d+)\}', line):
+        pairs.append((sid, int(q)))
+pairs.sort(key=lambda p: -p[1])
+top=pairs[:15]
+print("  rank  shard      queries")
+for i,(sid,q) in enumerate(top,1):
+    print(f"  {i:>4}  {sid:<9}  {q}")
+# Recall of the true Zipf head: of the observed top-K, how many are hot_1..hot_K.
+for K in (5,10,20):
+    obs={s for s,_ in pairs[:K]}
+    true={f"hot_{k}" for k in range(1,K+1)}
+    hit=len(obs & true)
+    print(f"  top-{K} Zipf-head recall: {hit}/{K} = {hit/K:.2f}")
+PY
+  rm -rf "$targets" "$ackdir" "$dump"
+}
+
 case "${1:-}" in
   build)       cmd_build ;;
+  hotspots)    shift; cmd_hotspots "$@" ;;
   up)          cmd_up ;;
   down)        cmd_down ;;
   logs)        shift; cmd_logs "$@" ;;
