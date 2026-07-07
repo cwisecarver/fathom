@@ -138,7 +138,7 @@ defmodule Fathom.Application do
       Fathom.HranaAuth.Revocations,
       # Captures template-shard Django migrations into fleet versions.
       Fathom.Migrator.Capture
-    ] ++ reporter_children()
+    ] ++ reporter_children() ++ command_poller_children()
   end
 
   # Per-node load reporter (Phase-2 B1): publishes this node's hot shards to Postgres so
@@ -148,6 +148,16 @@ defmodule Fathom.Application do
   defp reporter_children do
     if Application.get_env(:fathom, :load_reporter, false),
       do: [Fathom.Rebalancer.Reporter],
+      else: []
+  end
+
+  # Per-node handoff command executor (Phase-2 B1): acts on warm/drain commands the
+  # rebalancer addresses to this node (the cross-node channel there's no BEAM cluster
+  # for). Gated `:command_poller`, off by default. Acts on its timer, so starting before
+  # the DataPlane is fine.
+  defp command_poller_children do
+    if Application.get_env(:fathom, :command_poller, false),
+      do: [Fathom.Rebalancer.CommandPoller],
       else: []
   end
 

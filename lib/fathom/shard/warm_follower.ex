@@ -69,6 +69,24 @@ defmodule Fathom.Shard.WarmFollower do
   def cache_path(shard_id), do: Path.join(cache_dir(), "#{shard_id}.db")
 
   @doc """
+  Warm-pulls one specific shard into this node's warm cache **now**, bypassing the poll
+  cycle's owned/recently-owned exclusion — the targeted primitive the rebalance handoff
+  uses to pre-warm a shard on its new node before the LB flip. Conditional and idempotent
+  (an unchanged object 304s with no body transfer). Works whether or not the follower
+  GenServer is running (pure over `:warm_cache_dir` + storage). Returns `:ok` on a
+  warm/valid cache, `{:error, :not_warmable}` when the shard has no stored object yet
+  (never flushed) or the pull failed — safe either way, since the target's cold-open
+  revalidates or pulls fresh regardless.
+  """
+  @spec warm_now(String.t()) :: :ok | {:error, :not_warmable}
+  def warm_now(shard_id) do
+    case pull_one(shard_id) do
+      {:ok, ^shard_id} -> :ok
+      :skip -> {:error, :not_warmable}
+    end
+  end
+
+  @doc """
   The stored etag of `shard_id`'s warm copy, or `nil` when it isn't cached (the db
   file is absent) or no etag was recorded. This is the freshness token the coordinator
   presents to `Storage.pull_if_changed/3` before promoting the cache — a `nil` here
