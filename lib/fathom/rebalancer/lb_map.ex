@@ -6,9 +6,20 @@ defmodule Fathom.Rebalancer.LbMap do
 
   The base LB config keeps `upstream fathom_hrana { hash $host consistent; ... }` and does
   `proxy_pass http://$fathom_target;`. For a pinned shard the map resolves `$fathom_target`
-  to that node's single-server pin upstream; every other host falls through to `default
-  fathom_hrana` and stays on the pure hash. So the exception is *only* the hot minority —
-  the pure-hash story holds for everything else.
+  to that node's pin upstream; every other host falls through to `default fathom_hrana` and
+  stays on the pure hash. So the exception is *only* the hot minority — the pure-hash story
+  holds for everything else.
+
+  ## Dead-pin failover (finding #1)
+
+  Each pin upstream lists the pinned node as the primary `server` and **every other backend
+  as a `backup`** server. While the pinned node is up, all pinned traffic concentrates on it
+  (backups idle). When it dies, nginx (`max_fails`/`fail_timeout`) fails the pin over to a
+  surviving backend — which cold-opens the shard and steals the lease (the dead owner's
+  heartbeat is stale), exactly as a non-pinned shard would re-hash on death. Without the
+  backups a single-server pin turns its shard from self-healing into "down until an operator
+  unpins it" — worse the more shards the rebalancer has moved. The `{owner, epoch}` lease
+  still arbitrates single-writer across the failover.
 
   Pure and deterministic (overrides are rendered shard-sorted), so it is fully unit-tested
   and a re-render with unchanged inputs is byte-identical (a no-op reload).
@@ -42,11 +53,19 @@ defmodule Fathom.Rebalancer.LbMap do
         "    #{o.shard_id}.#{base_domain} #{upstream_name(o.pinned_node)};"
       end)
 
+    sorted = Enum.sort_by(backends, fn {node, _addr} -> node end)
+
     upstreams =
-      backends
-      |> Enum.sort_by(fn {node, _addr} -> node end)
-      |> Enum.map_join("\n\n", fn {node, addr} ->
-        "upstream #{upstream_name(node)} {\n    server #{addr} max_fails=2 fail_timeout=10s;\n    keepalive 16;\n}"
+      Enum.map_join(sorted, "\n\n", fn {node, addr} ->
+        # The pinned node is primary; every other backend is a `backup` so nginx fails a
+        # dead pin over to a survivor (which steals the stale lease). Backups sorted for a
+        # byte-identical re-render.
+        backups =
+          sorted
+          |> Enum.reject(fn {n, _addr} -> n == node end)
+          |> Enum.map_join("", fn {_n, addr} -> "\n    server #{addr} backup;" end)
+
+        "upstream #{upstream_name(node)} {\n    server #{addr} max_fails=2 fail_timeout=10s;#{backups}\n    keepalive 16;\n}"
       end)
 
     map_body = if entries == "", do: "", else: "\n" <> entries

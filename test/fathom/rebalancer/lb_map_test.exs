@@ -27,6 +27,32 @@ defmodule Fathom.Rebalancer.LbMapTest do
     assert out =~ "default fathom_hrana;"
   end
 
+  test "each pin upstream lists other backends as `backup` (dead-pin failover, #1)" do
+    # Regression for #1: a single-server pin upstream turns a pinned shard's node death
+    # into an indefinite 502 (no other server). With backups, nginx fails the pin over to
+    # a survivor, which steals the stale lease — restoring the self-healing a non-pinned
+    # shard gets from the hash pool.
+    out = LbMap.render([], @backends, "fathom.test")
+
+    # fathom1's pin: fathom1 primary, fathom2 as backup.
+    assert out =~
+             ~r/upstream fathom_pin_fathom1 \{\n    server fathom1:8080 max_fails=2 fail_timeout=10s;\n    server fathom2:8080 backup;\n    keepalive 16;\n\}/
+
+    # fathom2's pin: fathom2 primary, fathom1 as backup.
+    assert out =~
+             ~r/upstream fathom_pin_fathom2 \{\n    server fathom2:8080 max_fails=2 fail_timeout=10s;\n    server fathom1:8080 backup;\n    keepalive 16;\n\}/
+  end
+
+  test "a single-node fleet renders a pin upstream with no backup server" do
+    # No other backend to fail over to; just the primary (matches pre-#1 behavior).
+    out = LbMap.render([], %{"solo" => "solo:8080"}, "fathom.test")
+
+    assert out =~
+             "upstream fathom_pin_solo {\n    server solo:8080 max_fails=2 fail_timeout=10s;\n    keepalive 16;\n}"
+
+    refute out =~ "backup;"
+  end
+
   test "entries are shard-sorted so a re-render with the same pins is byte-identical" do
     a =
       LbMap.render(
