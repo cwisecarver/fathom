@@ -105,6 +105,37 @@ defmodule Fathom.ScaleTest do
     end
   end
 
+  test "hotspots: persistent-stream mode (stream_len > 1) bursts and still detects the head" do
+    keys = [:shard_load, :max_open_shards, :shard_idle_ms]
+    prev = Map.new(keys, &{&1, Application.get_env(:fathom, &1)})
+
+    # stream_len 8: each stream checks out once and runs 8 queries on the held connection.
+    # 8000/8 = 1000 streams over 40 shards keeps sampling adequate (streams >> shards).
+    result = Fathom.Scale.hotspots(shards: 40, queries: 8_000, zipf: 1.2, stream_len: 8)
+
+    try do
+      assert result.stream_len == 8
+      # Queries execute in whole 8-query bursts, so the count is a multiple of stream_len.
+      assert rem(result.queries_per_window, 8) == 0
+      assert result.queries_per_window > 0
+
+      # Detection still holds under bursts: the absolute floor isolates the top-5 head,
+      # and the shipped read API recovers most of the true head.
+      top5 = Enum.find(result.thresholds_absolute, &(&1.top_n == 5))
+      assert top5.floor_qps > 0.0
+      assert top5.zipf_recall >= 0.6
+      assert result.shardload_top20_zipf_recall >= 0.6
+    after
+      Fathom.Scale.cleanup()
+      Fathom.ShardLoad.reset()
+
+      Enum.each(prev, fn
+        {k, nil} -> Application.delete_env(:fathom, k)
+        {k, v} -> Application.put_env(:fathom, k, v)
+      end)
+    end
+  end
+
   test "ramp opens empty shards and reports a ceiling + fd prediction" do
     result = Fathom.Scale.ramp(max: 5, checkpoint: 100)
 

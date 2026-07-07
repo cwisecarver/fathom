@@ -471,13 +471,30 @@ defmodule Fathom.Scale do
 
   §B gates the rebalancer on **real** hot-spot data: turn on `:shard_load` and read
   `Fathom.ShardLoad.top/2`. Nothing reads those counters yet — this is the first
-  reader. It drives a **Zipf-skewed** query stream across N shards **through the real
-  recording path** (`Fathom.Shards.checkout` → `Fathom.ShardExecutor.execute`, so
-  `record_checkout`/`record_query` fire exactly as a Hrana stream would — one
-  connection opened + closed per query, the real per-stream model), then reads
+  reader. It drives a **Zipf-skewed** load across N shards **through the real recording
+  path** (`Fathom.Shards.checkout` → `Fathom.ShardExecutor.execute`, so
+  `record_checkout`/`record_query` fire exactly as a Hrana stream would), then reads
   `Fathom.ShardLoad` the way a rebalancer would: **diff two snapshots over a window**
   into per-shard *rates* (churn-safe — a shard that stopped between snapshots just
   drops out).
+
+  **Persistent-stream model (`:stream_len`).** Each unit of work is a Hrana *stream*:
+  checkout the target shard + open a connection **once** at stream start, run a burst of
+  `:stream_len` queries on the held connection (`record_query` per query), then close +
+  checkin at stream end — the real model (AGENTS.md: one connection per Hrana stream,
+  opened at stream start, closed at stream end). This amortizes the coordinator
+  checkout/checkin over the whole burst, so throughput is not capped by the per-query
+  coordinator round-trip. Streams draw their target shard from the Zipf distribution, so
+  hot shards get more concurrent streams *and* more queries — a hot shard held open by
+  many streams at once is exactly how it looks in production.
+
+  The default `:stream_len` is **1** — every query is its own one-shot stream. That is the
+  per-query lower bound, and it maximizes **detection sampling** (the unit of sampling is
+  the stream, so 1-query streams give the finest per-shard rate resolution for the
+  threshold/anti-flap finding). Raise `:stream_len` to measure **realistic throughput**
+  (persistent streams lift q/s several-fold), but then scale `:queries` so
+  `queries / stream_len` (the stream count) stays well above the shard count — otherwise
+  the tail is under-sampled and the top-set rates get noisy.
 
   It answers the two questions B needs before anyone builds the LB override table:
 
@@ -494,8 +511,10 @@ defmodule Fathom.Scale do
   follow-on this unblocks.
 
   Opts: `:shards` (1000), `:queries` (per window, 50_000), `:zipf` (exponent s, 1.1),
-  `:workers` (schedulers * 4). A hot shard sees many concurrent opens, so raise
-  `ulimit -n` before a large run.
+  `:workers` (schedulers * 4, the concurrent-stream count), `:stream_len` (1 — queries per
+  stream before it rotates to a new Zipf-drawn shard; raise it to measure persistent-stream
+  throughput). At most `:workers` connections are open at once, so `ulimit -n` bounds
+  `:workers`, not the shard count.
   """
   @spec hotspots(keyword()) :: map()
   def hotspots(opts \\ []) do
@@ -503,6 +522,7 @@ defmodule Fathom.Scale do
     per_window = Keyword.get(opts, :queries, 50_000)
     s = Keyword.get(opts, :zipf, 1.1) / 1.0
     workers = Keyword.get(opts, :workers, System.schedulers_online() * 4)
+    stream_len = max(Keyword.get(opts, :stream_len, 1), 1)
 
     setup()
     # Turn the counters on (record_* no-op otherwise) and keep coordinators from
@@ -518,12 +538,16 @@ defmodule Fathom.Scale do
 
     cdf = zipf_cdf(n, s)
 
-    Logger.warning("window A: driving #{per_window} Zipf(s=#{s}) queries over #{n} shards ...")
-    {rates_a, wa} = drive_window(per_window, cdf, workers)
-    Logger.warning("window B: repeating the drive for anti-flap stability ...")
-    {rates_b, wb} = drive_window(per_window, cdf, workers)
+    Logger.warning(
+      "window A: driving ~#{per_window} Zipf(s=#{s}) queries over #{n} shards " <>
+        "(#{workers} streams x #{stream_len} queries) ..."
+    )
 
-    result = report(n, s, per_window, rates_a, wa, rates_b, wb)
+    {rates_a, wa, exec_a} = drive_window(per_window, cdf, workers, stream_len)
+    Logger.warning("window B: repeating the drive for anti-flap stability ...")
+    {rates_b, wb, _exec_b} = drive_window(per_window, cdf, workers, stream_len)
+
+    result = report(n, s, stream_len, exec_a, rates_a, wa, rates_b, wb)
     # Stop the coordinators (idle was raised so they persist through the run) before the
     # caller's cleanup rm_rf's the store, so a teardown flush never races the delete or
     # self-fences on a vanished lease object.
@@ -547,12 +571,14 @@ defmodule Fathom.Scale do
     end)
   end
 
-  # One measurement window: snapshot, drive `q` Zipf queries concurrently, snapshot,
-  # diff into per-shard query/read rates over the wall-clock window. This is exactly
-  # how a rebalancer reads ShardLoad — cumulative counters differenced over a window.
-  defp drive_window(q, cdf, workers) do
+  # One measurement window: snapshot, drive ~`q` Zipf queries concurrently, snapshot,
+  # diff into per-shard query/read rates over the wall-clock window. This is exactly how
+  # a rebalancer reads ShardLoad — cumulative counters differenced over a window. Returns
+  # the rates, the window seconds, and the actual query count executed (streams round `q`
+  # down to a whole number of `stream_len` bursts).
+  defp drive_window(q, cdf, workers, stream_len) do
     before = index_by_id(Fathom.ShardLoad.snapshot())
-    {us, :ok} = :timer.tc(fn -> drive(q, cdf, workers) end)
+    {us, executed} = :timer.tc(fn -> drive(q, cdf, workers, stream_len) end)
     secs = max(us / 1_000_000, 0.001)
     now = index_by_id(Fathom.ShardLoad.snapshot())
 
@@ -569,34 +595,39 @@ defmodule Fathom.Scale do
       end)
       |> Enum.reject(&(&1.q_per_s <= 0))
 
-    {rates, secs}
+    {rates, secs, executed}
   end
 
   defp index_by_id(snapshot), do: Map.new(snapshot, &{&1.shard_id, &1})
 
-  # Drive `q` queries, each a full Hrana-stream lifecycle, concurrently across `workers`.
-  defp drive(q, cdf, workers) do
+  # Drive ~`q` queries as `q / stream_len` Hrana streams, `workers` running concurrently.
+  # Each stream bursts `stream_len` queries on one held connection, so the coordinator
+  # checkout/checkin is paid once per burst, not per query — the persistent-stream model.
+  defp drive(q, cdf, workers, stream_len) do
     stmt = %Stmt{sql: "SELECT id FROM t LIMIT 8", args: []}
+    streams = max(div(q, stream_len), 1)
 
-    1..q
-    |> Task.async_stream(fn _ -> stream_query("hot_#{zipf_sample(cdf)}", stmt) end,
+    1..streams
+    |> Task.async_stream(fn _ -> stream_burst("hot_#{zipf_sample(cdf)}", stmt, stream_len) end,
       max_concurrency: workers,
       timeout: :infinity,
       ordered: false
     )
     |> Stream.run()
 
-    :ok
+    streams * stream_len
   end
 
-  # One query as a real Hrana stream would run it: checkout (records the checkout
-  # signal, starts/reuses the coordinator), open a connection, execute (records the
-  # query-cost signal), then close + checkin. A failed checkout/open just drops that
-  # sample — the rate signal survives.
-  defp stream_query(id, stmt) do
+  # One Hrana stream, the real lifecycle: checkout (records the checkout signal,
+  # starts/reuses the coordinator) + open a connection **once** at stream start, run
+  # `len` queries on the held connection (each `execute` records the query-cost signal),
+  # then close + checkin at stream end. A failed checkout/open just drops that stream —
+  # the rate signal survives.
+  defp stream_burst(id, stmt, len) do
     with {:ok, pid, ref, path} <- Shards.checkout(id),
          {:ok, conn} <- Connection.open(path) do
-      _ = ShardExecutor.execute({pid, ref, conn, id}, stmt)
+      handle = {pid, ref, conn, id}
+      Enum.each(1..len, fn _ -> ShardExecutor.execute(handle, stmt) end)
       Connection.close(conn)
       Fathom.Shard.checkin(pid, ref)
     end
@@ -638,7 +669,7 @@ defmodule Fathom.Scale do
 
   # --- hot-spot reporting --------------------------------------------------
 
-  defp report(n, s, per_window, rates_a, wa, rates_b, wb) do
+  defp report(n, s, stream_len, executed, rates_a, wa, rates_b, wb) do
     qs_a = Enum.map(rates_a, & &1.q_per_s)
     median = percentile(qs_a, 50)
     p99 = percentile(qs_a, 99)
@@ -646,16 +677,22 @@ defmodule Fathom.Scale do
     # max/median is inflated when a long cold tail drags the median toward 0; max/p99 is
     # the tail-robust separation a fleet-scale threshold should key on.
     sep_p99 = safe_div(max_q, p99)
-    # At fleet scale the cold tail pulls the median under ~1 q/s, so a >Kx-median cutoff
-    # sits near zero and flags hundreds — median-relative is the wrong threshold shape.
-    median_collapsed = median < 1.0
 
-    # Three threshold families: >Kx median (breaks at scale — see median_collapsed),
-    # >Kx p99 (tail-robust), and an absolute q/s floor set to isolate the top-N (the
-    # portable production knob — a fixed rate, not a distribution ratio).
+    # Three threshold families: >Kx median (over-flags on a Zipf tail — see
+    # median_collapsed), >Kx p99 (tail-robust), and an absolute q/s floor set to isolate
+    # the top-N (the portable production knob — a fixed rate, not a distribution ratio).
     thresholds = ratio_sweep(rates_a, [5, 10, 20], median)
     thresholds_p99 = ratio_sweep(rates_a, [5, 10, 20], p99)
     thresholds_absolute = absolute_sweep(rates_a, [5, 10, 20, 50])
+
+    # Median-relative is the wrong threshold SHAPE when >10x-median flags many more shards
+    # than the tail-robust >10x-p99 rule — i.e. a K-multiple of the median still sits in the
+    # warm/cold bulk (a long Zipf tail or a near-idle fleet), not on the hot head. Compares
+    # the two sweeps (ground-truth-free), so it holds at any N or absolute throughput — an
+    # absolute `median < 1 q/s` test would flip just because a faster drive lifts all rates.
+    median_10x = flagged_at(thresholds, 10)
+    p99_10x = flagged_at(thresholds_p99, 10)
+    median_collapsed = median_10x > max(5, 3 * p99_10x)
 
     # Anti-flap on a scale-robust, policy-neutral set: are the top-20 hottest shards the
     # same across two windows? (A threshold-anchored flap set is empty at small N and
@@ -670,10 +707,11 @@ defmodule Fathom.Scale do
       mode: "hotspots",
       shards: n,
       zipf_s: round2(s),
-      queries_per_window: per_window,
+      stream_len: stream_len,
+      queries_per_window: executed,
       window_a_s: round1(wa),
       window_b_s: round1(wb),
-      queries_per_s: round(safe_div(per_window, wa)),
+      queries_per_s: round(safe_div(executed, wa)),
       active_shards: length(rates_a),
       rate_p50_qps: round1(median),
       rate_p90_qps: round1(percentile(qs_a, 90)),
@@ -695,6 +733,10 @@ defmodule Fathom.Scale do
       shardload_top20_zipf_recall: round2(zipf_recall(shardload_top)),
       verdict: verdict(top20_recall, flap, median_collapsed)
     }
+  end
+
+  defp flagged_at(sweep, k) do
+    Enum.find_value(sweep, 0, fn t -> if t.k == k, do: t.flagged end)
   end
 
   # >Kx-anchor sweep: for each k, how many shards exceed k*anchor and how well that set
@@ -783,7 +825,7 @@ defmodule Fathom.Scale do
 
     policy =
       if median_collapsed do
-        " — median≈0 (long cold tail): set the threshold on p99 (>Kx p99) or an absolute q/s floor, NOT >Kx median"
+        " — >Kx-median over-flags (a long Zipf tail / near-idle fleet): set the threshold on p99 (>Kx p99) or an absolute q/s floor, NOT >Kx median"
       else
         " — a p99-anchored or absolute-qps floor with a 2-window confirm is a viable anti-flap gate"
       end

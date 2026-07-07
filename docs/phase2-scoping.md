@@ -131,10 +131,18 @@ hash. The fork is where the override lives:
     forms stay tight: `> 20 x p99` flags **5** shards at recall 1.0; an absolute floor of
     **~32 q/s isolates the top-5** (recall 1.0), ~16 q/s the top-10. **So the rebalancer's
     hot-detection must key on p99-relative or an absolute q/s floor, never `> K x median`;**
-    `> K x p99` with a 2-window confirm is a viable anti-flap gate. (The per-query drive
-    caps at ~1.2k q/s because each query is a full checkout→execute→checkin — a harness
-    artifact, not a fathom limit; the detection conclusion is rate-distribution-shaped and
-    independent of it.)
+    `> K x p99` with a 2-window confirm is a viable anti-flap gate. (`median_collapsed` is
+    computed shape-first — `>10x-median` flagging many more shards than `>10x-p99` — so it
+    holds at any N or throughput, not from an absolute `median < 1 q/s` test.)
+  - **Throughput (prod, 1000 shards, ~20k streams, `--stream-len` sweep).** The load unit
+    is a Hrana stream (checkout + open once, burst L queries on the held connection,
+    checkin). At `L=1` (one query per stream) the drive is **~3.0k q/s** — the per-query
+    lower bound, bottlenecked on the coordinator checkout/checkin round-trip. Persistent
+    streams remove that: **L=16 ~24k q/s, L=64 ~51k q/s** per node (hottest shard 530 →
+    4.3k → 9.0k q/s), with detection quality flat (recall 0.95–1.0, anti-flap 0.9–1.0) as
+    long as `Q/L` (stream count) stays ≫ N. So a node sustains tens of thousands of q/s
+    against many shards; the earlier ~1.2k figure was the per-query harness artifact, not a
+    fathom limit. (One-host relative; a staging run gives prod-absolute q/s.)
   - **Verdict:** high capacity value but premature — the detection is proven and the
     threshold shape is now known (p99/absolute, not median); the remaining gate before
     building B is a **staging real-traffic run** (turn on `:shard_load` on a deployed node,

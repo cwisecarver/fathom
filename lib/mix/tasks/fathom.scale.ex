@@ -15,7 +15,7 @@ defmodule Mix.Tasks.Fathom.Scale do
 
       mix fathom.scale --ramp [--max 200000] [--checkpoint 10000]
       mix fathom.scale --lease-rps [--shards 5000] [--lease-ttl-ms 900] [--window-ms 3000]
-      mix fathom.scale --hotspots [--shards 1000] [--zipf 1.1] [--queries 50000] [--workers N]
+      mix fathom.scale --hotspots [--shards 1000] [--zipf 1.1] [--queries 50000] [--workers N] [--stream-len 1]
 
   `--ramp` opens empty shards until the fd ceiling to find the node-density limit
   cheaply. `--lease-rps` measures that the lease-renewal storm is gone: per-shard
@@ -50,7 +50,8 @@ defmodule Mix.Tasks.Fathom.Scale do
     hotspots: :boolean,
     zipf: :float,
     queries: :integer,
-    workers: :integer
+    workers: :integer,
+    stream_len: :integer
   ]
 
   @impl true
@@ -72,8 +73,9 @@ defmodule Mix.Tasks.Fathom.Scale do
            &print_warm_density/1}
 
         Keyword.get(opts, :hotspots, false) ->
-          {Fathom.Scale.hotspots(Keyword.take(opts, [:shards, :zipf, :queries, :workers])),
-           &print_hotspots/1}
+          {Fathom.Scale.hotspots(
+             Keyword.take(opts, [:shards, :zipf, :queries, :workers, :stream_len])
+           ), &print_hotspots/1}
 
         true ->
           {Fathom.Scale.run(Keyword.take(opts, [:shards, :shard_size_mb, :cold_open_samples])),
@@ -147,9 +149,9 @@ defmodule Mix.Tasks.Fathom.Scale do
         else: ""
 
     rows = [
-      {"shards / zipf", "#{r.shards} shards, s=#{r.zipf_s}, #{r.queries_per_window} q/window"},
+      {"shards / zipf", "#{r.shards} shards, s=#{r.zipf_s}, ~#{r.queries_per_window} q/window"},
       {"drive rate",
-       "#{r.queries_per_s} q/s (window #{r.window_a_s}s), #{r.active_shards} active"},
+       "#{r.queries_per_s} q/s (streams x #{r.stream_len} q, window #{r.window_a_s}s), #{r.active_shards} active"},
       {"rate p50/p90/p99",
        "#{r.rate_p50_qps} / #{r.rate_p90_qps} / #{r.rate_p99_qps} q/s (max #{r.rate_max_qps})"},
       {"separation",
