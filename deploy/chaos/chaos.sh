@@ -443,8 +443,10 @@ cmd_rebalance() {
   echo "  pinned $shard → $to; exception map rendered:"
   rpc fathom1 "Fathom.Rebalancer.LbMap.current() |> IO.puts()" | grep -E "$shard|fathom_pin_$to" | sed 's/^/    /'
 
-  # 2. Flip: reload the LB so new traffic for the shard routes to the target.
-  reload_lb && echo "  LB reloaded (flip applied)"
+  # 2. Flip: the lb-reloader sidecar reloads nginx on the map change (no host bridge);
+  # give it a moment to apply before draining, so the source stops taking new traffic.
+  echo "  waiting for the lb-reloader sidecar to apply the flip ..."
+  sleep 3
 
   # 3. Drain the source so it releases the lease (flip-first means it finishes fast).
   echo "  draining $shard on $from ..."

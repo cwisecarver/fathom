@@ -172,3 +172,40 @@ services:
       - fathom1
       - fathom2
       - fathom3
+
+  # Reloader sidecar: reloads nginx whenever the rebalancer rewrites the exception map,
+  # so a handoff's LB flip applies with NO host bridge. Shares the lb container's PID
+  # namespace (`pid: service:lb`) and sends the nginx master a HUP — no docker socket, no
+  # cross-container exec. This is what a deployment provides instead of the app reaching
+  # the LB (the alternative being `LB_RELOAD_CMD` where the app *can* reach it).
+  lb-reloader:
+    image: alpine:3.20
+    pid: "service:lb"
+    depends_on:
+      - lb
+    restart: unless-stopped
+    volumes:
+      - ./lb-runtime:/etc/nginx/lb:ro
+    # NB: `$$` escapes compose interpolation so the shell sees a literal `$`.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        echo "lb-reloader: watching /etc/nginx/lb/exceptions.conf"
+        last=""
+        while :; do
+          cur=$$(stat -c %Y /etc/nginx/lb/exceptions.conf 2>/dev/null)
+          if [ -n "$$cur" ] && [ "$$cur" != "$$last" ]; then
+            last=$$cur
+            master=""
+            for c in /proc/[0-9]*/comm; do
+              [ "$$(cat "$$c" 2>/dev/null)" = "nginx" ] || continue
+              pid=$${c#/proc/}; pid=$${pid%/comm}
+              if [ -z "$$master" ] || [ "$$pid" -lt "$$master" ]; then master=$$pid; fi
+            done
+            if [ -n "$$master" ]; then
+              kill -HUP "$$master" 2>/dev/null && echo "lb-reloader: reloaded nginx (master $$master)"
+            fi
+          fi
+          sleep 1
+        done

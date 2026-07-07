@@ -185,10 +185,15 @@ hash. The fork is where the override lives:
     channel, and the Oban cron + handoff orchestration all shipped and are gated off by
     default. What remains is **operational, not code**: turn it on in a real deployment
     (`REBALANCER_ENABLED` + `LOAD_REPORTER`/`COMMAND_POLLER` + `SHARD_LOAD`), tune the
-    absolute q/s floor to that fleet's rates, and — where the app can reach the LB — wire
-    `LB_RELOAD_CMD` so `HandoffJob` reloads nginx itself (the rig host-orchestrates the
-    reload because a container can't). A2 (WAL streaming) and Phase-2 **C** (locality)
-    remain the open Phase-2 items.
+    absolute q/s floor to that fleet's rates, and apply the rendered map — either
+    `LB_RELOAD_CMD` so `HandoffJob` reloads the LB itself (where the app can reach it) or a
+    reloader that watches the map file (the rig's `lb-reloader` sidecar shares nginx's PID
+    namespace and HUPs its master on a map change, so the handoff needs no host bridge). An
+    **autonomous** handoff was run end to end on the rig 2026-07-07: an engineered node
+    imbalance (green 49.6 q/s + blue 25.3 q/s on fathom2) → `Policy.propose` chose
+    `green: fathom2 → fathom1` on its own → `RebalanceJob`/`HandoffJob` executed it, the
+    sidecar applied the flip, and green moved with data intact. A2 (WAL streaming) and
+    Phase-2 **C** (locality) remain the open Phase-2 items.
 - **B2 — In-fathom routing/redirect for rebalanced shards.** Re-opens the rejected
   mailroom / `base_url`-redirect debate (per-request cross-node forwarding). **Don't.**
 
