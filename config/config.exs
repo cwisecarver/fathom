@@ -45,10 +45,18 @@ config :fathom, :hrana_auth, :disabled
 # Oban runs the shard migration rollout (per-shard migration jobs + scheduled
 # retirement of retained old versions). The reconcile cron re-runs the sweep so
 # the cold tail converges to HEAD and drift self-heals.
+# The rebalance cron (Phase-2 B1) runs every minute but is inert unless
+# `:rebalancer_enabled` is set — Oban peer leadership makes it a fleet singleton.
 config :fathom, Oban,
   repo: Fathom.Repo,
-  queues: [migrations: 10, retirement: 5],
-  plugins: [{Oban.Plugins.Cron, crontab: [{"0 * * * *", Fathom.Migrator.ReconcileJob}]}]
+  queues: [migrations: 10, retirement: 5, rebalance: 3],
+  plugins: [
+    {Oban.Plugins.Cron,
+     crontab: [
+       {"0 * * * *", Fathom.Migrator.ReconcileJob},
+       {"* * * * *", Fathom.Rebalancer.RebalanceJob}
+     ]}
+  ]
 
 # Configure the endpoint
 config :fathom, FathomWeb.Endpoint,
