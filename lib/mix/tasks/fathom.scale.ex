@@ -15,11 +15,14 @@ defmodule Mix.Tasks.Fathom.Scale do
 
       mix fathom.scale --ramp [--max 200000] [--checkpoint 10000]
       mix fathom.scale --lease-rps [--shards 5000] [--lease-ttl-ms 900] [--window-ms 3000]
+      mix fathom.scale --hotspots [--shards 1000] [--zipf 1.1] [--queries 50000] [--workers N]
 
   `--ramp` opens empty shards until the fd ceiling to find the node-density limit
   cheaply. `--lease-rps` measures that the lease-renewal storm is gone: per-shard
   renewals collapse to one node heartbeat (flat regardless of shard count) — see
-  `Fathom.Scale.lease_rps/1`.
+  `Fathom.Scale.lease_rps/1`. `--hotspots` drives a Zipf-skewed query load and reads
+  `Fathom.ShardLoad` to show whether hot shards are detectable + stable — the
+  Phase-2 §B rebalancing evidence (see `Fathom.Scale.hotspots/1`).
 
   Prints a human table to stderr and one JSON line to stdout. Optional `--append PATH`
   records the JSON line. Run prod-compiled (`MIX_ENV=prod`) for representative numbers.
@@ -43,7 +46,11 @@ defmodule Mix.Tasks.Fathom.Scale do
     lease_rps: :boolean,
     lease_ttl_ms: :integer,
     window_ms: :integer,
-    warm_density: :boolean
+    warm_density: :boolean,
+    hotspots: :boolean,
+    zipf: :float,
+    queries: :integer,
+    workers: :integer
   ]
 
   @impl true
@@ -63,6 +70,10 @@ defmodule Mix.Tasks.Fathom.Scale do
         Keyword.get(opts, :warm_density, false) ->
           {Fathom.Scale.warm_density(Keyword.take(opts, [:shards, :shard_size_mb])),
            &print_warm_density/1}
+
+        Keyword.get(opts, :hotspots, false) ->
+          {Fathom.Scale.hotspots(Keyword.take(opts, [:shards, :zipf, :queries, :workers])),
+           &print_hotspots/1}
 
         true ->
           {Fathom.Scale.run(Keyword.take(opts, [:shards, :shard_size_mb, :cold_open_samples])),
@@ -104,6 +115,38 @@ defmodule Mix.Tasks.Fathom.Scale do
     )
 
     Enum.each(rows, fn {k, v} -> Mix.shell().error("  #{String.pad_trailing(k, 22)} #{v}") end)
+    Mix.shell().error("")
+  end
+
+  defp print_hotspots(r) do
+    top =
+      r.top10
+      |> Enum.map(fn t -> "#{t.shard_id}=#{t.q_per_s}/s" end)
+      |> Enum.join(", ")
+
+    sweep =
+      r.thresholds
+      |> Enum.map(fn t -> ">#{t.k}x median: #{t.flagged} flagged (recall #{t.zipf_recall})" end)
+      |> Enum.join("  ")
+
+    rows = [
+      {"shards / zipf", "#{r.shards} shards, s=#{r.zipf_s}, #{r.queries_per_window} q/window"},
+      {"drive rate",
+       "#{r.queries_per_s} q/s (window #{r.window_a_s}s), #{r.active_shards} active"},
+      {"rate p50/p90/p99",
+       "#{r.rate_p50_qps} / #{r.rate_p90_qps} / #{r.rate_p99_qps} q/s (max #{r.rate_max_qps})"},
+      {"skew (max/median)", "#{r.skew_ratio}x"},
+      {"top-20 recall",
+       "diff #{r.top20_zipf_recall} · ShardLoad.top #{r.shardload_top20_zipf_recall}"},
+      {"threshold sweep", sweep},
+      {"anti-flap (>10x)",
+       "A #{r.flap_window_a_flagged} / B #{r.flap_window_b_flagged} flagged, Jaccard #{r.flap_stability_jaccard}"},
+      {"hottest 10", top},
+      {"verdict", r.verdict}
+    ]
+
+    Mix.shell().error("\n=== fathom.scale --hotspots (Phase-2 §B rebalancing evidence) ===")
+    Enum.each(rows, fn {k, v} -> Mix.shell().error("  #{String.pad_trailing(k, 18)} #{v}") end)
     Mix.shell().error("")
   end
 

@@ -27,7 +27,9 @@ defmodule Fathom.Scale do
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Storage
   alias Fathom.Shard.WarmFollower
+  alias Fathom.ShardExecutor
   alias Fathom.Shards
+  alias Filo.Stmt
 
   @blob_bytes 65_536
 
@@ -459,6 +461,288 @@ defmodule Fathom.Scale do
 
       _ ->
         0
+    end
+  end
+
+  # --- hot-spot evidence (Phase-2 §B rebalancing prerequisite) -------------
+
+  @doc """
+  Hot-spot evidence for Phase-2 dynamic rebalancing (`docs/phase2-scoping.md` §B).
+
+  §B gates the rebalancer on **real** hot-spot data: turn on `:shard_load` and read
+  `Fathom.ShardLoad.top/2`. Nothing reads those counters yet — this is the first
+  reader. It drives a **Zipf-skewed** query stream across N shards **through the real
+  recording path** (`Fathom.Shards.checkout` → `Fathom.ShardExecutor.execute`, so
+  `record_checkout`/`record_query` fire exactly as a Hrana stream would — one
+  connection opened + closed per query, the real per-stream model), then reads
+  `Fathom.ShardLoad` the way a rebalancer would: **diff two snapshots over a window**
+  into per-shard *rates* (churn-safe — a shard that stopped between snapshots just
+  drops out).
+
+  It answers the two questions B needs before anyone builds the LB override table:
+
+    * **Is the hot set detectable?** The query-rate distribution across shards
+      (p50/p90/p99/max), the skew ratio (max/median), and whether the shipped read
+      API `ShardLoad.top(20)` recovers the Zipf head (recall).
+    * **What threshold, and does it flap?** A `> K x median` rule swept at K = 5/10/20
+      (how many shards each flags, and does it catch the true hot set), plus **two
+      windows** to measure how stable the flagged set is (Jaccard) — the raw input for
+      the anti-flap policy.
+
+  The threshold value and anti-flap policy are an operator call; this produces the
+  numbers to make it. The staging real-traffic run (non-synthetic skew) is the
+  follow-on this unblocks.
+
+  Opts: `:shards` (1000), `:queries` (per window, 50_000), `:zipf` (exponent s, 1.1),
+  `:workers` (schedulers * 4). A hot shard sees many concurrent opens, so raise
+  `ulimit -n` before a large run.
+  """
+  @spec hotspots(keyword()) :: map()
+  def hotspots(opts \\ []) do
+    n = Keyword.get(opts, :shards, 1000)
+    per_window = Keyword.get(opts, :queries, 50_000)
+    s = Keyword.get(opts, :zipf, 1.1) / 1.0
+    workers = Keyword.get(opts, :workers, System.schedulers_online() * 4)
+
+    setup()
+    # Turn the counters on (record_* no-op otherwise) and keep coordinators from
+    # evicting/idle-stopping mid-drive, so the rate signal reflects load, not churn.
+    ensure_started(Fathom.ShardLoad, [])
+    Application.put_env(:fathom, :shard_load, true)
+    Application.put_env(:fathom, :max_open_shards, :infinity)
+    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    Fathom.ShardLoad.reset()
+
+    Logger.warning("provisioning #{n} tiny shards ...")
+    provision_tiny(n)
+
+    cdf = zipf_cdf(n, s)
+
+    Logger.warning("window A: driving #{per_window} Zipf(s=#{s}) queries over #{n} shards ...")
+    {rates_a, wa} = drive_window(per_window, cdf, workers)
+    Logger.warning("window B: repeating the drive for anti-flap stability ...")
+    {rates_b, wb} = drive_window(per_window, cdf, workers)
+
+    result = report(n, s, per_window, rates_a, wa, rates_b, wb)
+    # Stop the coordinators (idle was raised so they persist through the run) before the
+    # caller's cleanup rm_rf's the store, so a teardown flush never races the delete or
+    # self-fences on a vanished lease object.
+    stop_all_coordinators()
+    result
+  end
+
+  # Seed N tiny shards (a 10-row table) so `SELECT id FROM t LIMIT 8` reads a handful
+  # of rows — enough to populate the rows_read cost dimension without shard size
+  # mattering (hot-spot detection is about rate, not bytes).
+  defp provision_tiny(n) do
+    Enum.each(1..n, fn i ->
+      if rem(i, 500) == 0, do: Logger.warning("  provisioned #{i}/#{n}")
+      path = storage_path("hot_#{i}")
+      drop_db(path)
+      {:ok, conn} = Connection.open(path)
+      Connection.exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+      Connection.exec(conn, "INSERT INTO t (id) VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10)")
+      Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
+      Connection.close(conn)
+    end)
+  end
+
+  # One measurement window: snapshot, drive `q` Zipf queries concurrently, snapshot,
+  # diff into per-shard query/read rates over the wall-clock window. This is exactly
+  # how a rebalancer reads ShardLoad — cumulative counters differenced over a window.
+  defp drive_window(q, cdf, workers) do
+    before = index_by_id(Fathom.ShardLoad.snapshot())
+    {us, :ok} = :timer.tc(fn -> drive(q, cdf, workers) end)
+    secs = max(us / 1_000_000, 0.001)
+    now = index_by_id(Fathom.ShardLoad.snapshot())
+
+    rates =
+      now
+      |> Enum.map(fn {id, a} ->
+        b = Map.get(before, id, %{queries: 0, rows_read: 0})
+
+        %{
+          shard_id: id,
+          q_per_s: (a.queries - b.queries) / secs,
+          rows_read_per_s: (a.rows_read - b.rows_read) / secs
+        }
+      end)
+      |> Enum.reject(&(&1.q_per_s <= 0))
+
+    {rates, secs}
+  end
+
+  defp index_by_id(snapshot), do: Map.new(snapshot, &{&1.shard_id, &1})
+
+  # Drive `q` queries, each a full Hrana-stream lifecycle, concurrently across `workers`.
+  defp drive(q, cdf, workers) do
+    stmt = %Stmt{sql: "SELECT id FROM t LIMIT 8", args: []}
+
+    1..q
+    |> Task.async_stream(fn _ -> stream_query("hot_#{zipf_sample(cdf)}", stmt) end,
+      max_concurrency: workers,
+      timeout: :infinity,
+      ordered: false
+    )
+    |> Stream.run()
+
+    :ok
+  end
+
+  # One query as a real Hrana stream would run it: checkout (records the checkout
+  # signal, starts/reuses the coordinator), open a connection, execute (records the
+  # query-cost signal), then close + checkin. A failed checkout/open just drops that
+  # sample — the rate signal survives.
+  defp stream_query(id, stmt) do
+    with {:ok, pid, ref, path} <- Shards.checkout(id),
+         {:ok, conn} <- Connection.open(path) do
+      _ = ShardExecutor.execute({pid, ref, conn, id}, stmt)
+      Connection.close(conn)
+      Fathom.Shard.checkin(pid, ref)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  # Zipf(s) over ranks 1..n: P(k) ∝ 1/k^s. Precompute the ascending cumulative
+  # distribution once (a tuple) so each draw is an O(log n) binary search.
+  defp zipf_cdf(n, s) do
+    weights = Enum.map(1..n, fn k -> 1.0 / :math.pow(k, s) end)
+    total = Enum.sum(weights)
+
+    weights
+    |> Enum.scan(0.0, fn w, acc -> acc + w / total end)
+    |> List.to_tuple()
+  end
+
+  # Draw a rank 1..n from the cumulative tuple. Rank 1 is the hottest shard, so the
+  # true hot order is hot_1, hot_2, ... — `zipf_recall/1` scores ShardLoad's top-N
+  # against it.
+  defp zipf_sample(cdf) do
+    zipf_bsearch(cdf, :rand.uniform(), 0, tuple_size(cdf) - 1) + 1
+  end
+
+  defp zipf_bsearch(cdf, u, lo, hi) when lo < hi do
+    mid = div(lo + hi, 2)
+
+    if elem(cdf, mid) >= u,
+      do: zipf_bsearch(cdf, u, lo, mid),
+      else: zipf_bsearch(cdf, u, mid + 1, hi)
+  end
+
+  defp zipf_bsearch(_cdf, _u, lo, _hi), do: lo
+
+  # --- hot-spot reporting --------------------------------------------------
+
+  defp report(n, s, per_window, rates_a, wa, rates_b, wb) do
+    qs_a = Enum.map(rates_a, & &1.q_per_s)
+    median = percentile(qs_a, 50)
+    max_q = Enum.max([0.0 | qs_a])
+    skew = safe_div(max_q, median)
+
+    thresholds =
+      Enum.map([5, 10, 20], fn k ->
+        cutoff = k * median
+        flagged = for r <- rates_a, r.q_per_s > cutoff, do: r.shard_id
+        %{k: k, flagged: length(flagged), zipf_recall: round2(zipf_recall(flagged))}
+      end)
+
+    # Anti-flap: the > 10x-median flagged set in each window, and how much it drifts.
+    med_b = percentile(Enum.map(rates_b, & &1.q_per_s), 50)
+    set_a = flagged_set(rates_a, 10 * median)
+    set_b = flagged_set(rates_b, 10 * med_b)
+    stability = jaccard(set_a, set_b)
+
+    # Exercise the shipped read API a rebalancer would call, not just my diff.
+    shardload_top = Fathom.ShardLoad.top(20, :queries) |> Enum.map(& &1.shard_id)
+    top20_recall = zipf_recall(top_ids(rates_a, 20))
+
+    %{
+      mode: "hotspots",
+      shards: n,
+      zipf_s: round2(s),
+      queries_per_window: per_window,
+      window_a_s: round1(wa),
+      window_b_s: round1(wb),
+      queries_per_s: round(safe_div(per_window, wa)),
+      active_shards: length(rates_a),
+      rate_p50_qps: round1(median),
+      rate_p90_qps: round1(percentile(qs_a, 90)),
+      rate_p99_qps: round1(percentile(qs_a, 99)),
+      rate_max_qps: round1(max_q),
+      skew_ratio: round1(skew),
+      top10: top10_detail(rates_a),
+      thresholds: thresholds,
+      # Anti-flap input: how stable the >10x-median hot set is across two windows.
+      flap_window_a_flagged: MapSet.size(set_a),
+      flap_window_b_flagged: MapSet.size(set_b),
+      flap_stability_jaccard: round2(stability),
+      # Does the diff-based top and the cumulative ShardLoad.top both recover the head?
+      top20_zipf_recall: round2(top20_recall),
+      shardload_top20_zipf_recall: round2(zipf_recall(shardload_top)),
+      verdict: verdict(skew, top20_recall, stability)
+    }
+  end
+
+  # Precision of the flagged set vs the true top-|flagged| by Zipf weight (the true
+  # hot shards are hot_1..hot_m). 1.0 = the flag caught exactly the right shards.
+  defp zipf_recall([]), do: 1.0
+
+  defp zipf_recall(ids) do
+    m = length(ids)
+    true_top = MapSet.new(1..m, &"hot_#{&1}")
+    Enum.count(ids, &MapSet.member?(true_top, &1)) / m
+  end
+
+  defp flagged_set(rates, cutoff) do
+    for r <- rates, r.q_per_s > cutoff, into: MapSet.new(), do: r.shard_id
+  end
+
+  defp jaccard(a, b) do
+    union = MapSet.size(MapSet.union(a, b))
+    if union == 0, do: 1.0, else: MapSet.size(MapSet.intersection(a, b)) / union
+  end
+
+  defp top_ids(rates, k) do
+    rates |> Enum.sort_by(& &1.q_per_s, :desc) |> Enum.take(k) |> Enum.map(& &1.shard_id)
+  end
+
+  defp top10_detail(rates) do
+    rates
+    |> Enum.sort_by(& &1.q_per_s, :desc)
+    |> Enum.take(10)
+    |> Enum.map(fn r ->
+      %{
+        shard_id: r.shard_id,
+        q_per_s: round1(r.q_per_s),
+        rows_read_per_s: round1(r.rows_read_per_s)
+      }
+    end)
+  end
+
+  # A one-line human read of whether B is justified: the hot set must be both
+  # separable (high skew + the read API recovers it) and stable (low flap).
+  defp verdict(skew, top_recall, stability) do
+    separable = skew >= 10 and top_recall >= 0.8
+    stable = stability >= 0.8
+
+    cond do
+      separable and stable ->
+        "hot set cleanly separable (skew #{round1(skew)}x, top-20 recall #{round2(top_recall)}) " <>
+          "and stable across windows (Jaccard #{round2(stability)}) — a >Kx-median threshold with " <>
+          "a 2-window confirm is a viable anti-flap gate"
+
+      separable ->
+        "hot set separable (skew #{round1(skew)}x) but the flagged set drifts across windows " <>
+          "(Jaccard #{round2(stability)}) — widen the confirm window / add hysteresis before pinning"
+
+      true ->
+        "hot set not cleanly separable at this skew (skew #{round1(skew)}x, recall " <>
+          "#{round2(top_recall)}) — raise --zipf or --queries, or the load may be too flat to rebalance on"
     end
   end
 
