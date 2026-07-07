@@ -141,6 +141,14 @@ if cmd = System.get_env("LB_RELOAD_CMD") do
   config :fathom, :lb_reload_cmd, cmd
 end
 
+# Optional config test run against the candidate map BEFORE it's promoted (finding #3): a
+# non-zero exit aborts the promotion and keeps the last-good file. `{}` in the command is
+# replaced with the candidate temp path (also exported as LB_MAP_CANDIDATE), e.g.
+# LB_TEST_CMD="nginx -t -c /etc/nginx/test.conf" where test.conf includes the candidate.
+if cmd = System.get_env("LB_TEST_CMD") do
+  config :fathom, :lb_test_cmd, cmd
+end
+
 # The hot-detection floor (absolute q/s). Unset ⇒ the p99-relative rule.
 if floor = System.get_env("REBALANCE_HOT_QPS_FLOOR") do
   config :fathom, :rebalance_hot_qps_floor, String.to_float(floor)
