@@ -70,4 +70,27 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
     assert File.read!(map_path) =~ "#{shard}."
     assert_receive {:DOWN, ^down, :process, ^pid, _}, 5_000
   end
+
+  test "period: :infinity — a second handoff for the same shard is deduped past 60s", %{
+    shard: shard,
+    node: node
+  } do
+    # Regression for #5: a handoff routinely outlives Oban's default 60s unique window
+    # (warm + drain awaits + retry backoff). With period: 60, once the first job's
+    # inserted_at ages past 60s a second enqueue for the same shard is NOT deduped — two
+    # handoffs then pin + drain the same shard. period: :infinity keeps "one per shard
+    # until terminal".
+    args = %{"shard_id" => shard, "from_node" => node, "to_node" => node, "q_per_s" => 500.0}
+
+    {:ok, job1} = args |> HandoffJob.new() |> Oban.insert()
+
+    # Simulate a slow handoff: age the in-flight job past the old 60s window.
+    from(j in Oban.Job, where: j.id == ^job1.id)
+    |> Repo.update_all(set: [inserted_at: DateTime.add(DateTime.utc_now(), -120, :second)])
+
+    {:ok, job2} = args |> HandoffJob.new() |> Oban.insert()
+
+    assert job2.id == job1.id, "deduped to the still-in-flight handoff"
+    assert length(all_enqueued(worker: HandoffJob, args: %{"shard_id" => shard})) == 1
+  end
 end

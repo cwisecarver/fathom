@@ -30,8 +30,15 @@ defmodule Fathom.Rebalancer.HandoffJob do
   use Oban.Worker,
     queue: :rebalance,
     max_attempts: 3,
+    # period: :infinity — a handoff routinely outlives Oban's default 60s unique window
+    # (warm await + drain await + retry backoff across 3 attempts). With a 60s period, once
+    # the first job's inserted_at ages past 60s a second HandoffJob for the same shard is no
+    # longer deduped even while the first is still executing/retryable — two handoffs then
+    # pin + drain the same shard. With :infinity + the live states below, uniqueness is
+    # exactly "one handoff per shard until it reaches a terminal state" (finding #5).
     unique: [
       keys: [:shard_id],
+      period: :infinity,
       states: [:scheduled, :available, :executing, :retryable, :suspended]
     ]
 
