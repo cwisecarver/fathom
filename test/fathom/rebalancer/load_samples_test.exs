@@ -8,12 +8,12 @@ defmodule Fathom.Rebalancer.LoadSamplesTest do
   alias Fathom.Rebalancer.{LoadSample, LoadSamples}
   alias Fathom.Repo
 
-  # Insert a sample as node `owner` for `shard`, `age_ms` ago at rate `q`.
-  defp sample(owner, shard, q, age_ms) do
+  # Insert a sample from node `node_key` for `shard`, `age_ms` ago at rate `q`.
+  defp sample(node_key, shard, q, age_ms) do
     at = DateTime.add(DateTime.utc_now(), -age_ms, :millisecond)
 
     Repo.insert!(%LoadSample{
-      owner: owner,
+      node_key: node_key,
       shard_id: shard,
       q_per_s: q,
       rows_read_per_s: q * 8,
@@ -32,7 +32,7 @@ defmodule Fathom.Rebalancer.LoadSamplesTest do
 
     assert map_size(latest) == 2
     assert latest["hot_1"].q_per_s == 90.0, "newest hot_1 sample wins"
-    assert latest["hot_1"].owner == "nodeA#1"
+    assert latest["hot_1"].node_key == "nodeA#1"
     assert latest["hot_2"].q_per_s == 40.0
   end
 

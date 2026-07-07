@@ -9,8 +9,8 @@ defmodule Fathom.Rebalancer.Reporter do
   `:load_report_interval_ms` it reads `Fathom.ShardLoad.snapshot/0`, diffs against the
   previous snapshot into per-shard **rates** (the churn-safe method the `--hotspots`
   harness validated), and writes the top-N hottest shards to `shard_load_samples`,
-  tagged with this node's `Fathom.Shard.Heartbeat.owner/0` (its identity *and* the
-  shard's current serving node).
+  tagged with this node's `Fathom.Rebalancer.node_key/0` (its stable LB backend key,
+  which is also the shard's current serving node).
 
   Off the hot path and resilient like `Fathom.Directory.Recorder`: a Postgres outage
   drops a window, never crashes the node. Gated by `:load_reporter` (default off);
@@ -23,9 +23,9 @@ defmodule Fathom.Rebalancer.Reporter do
 
   require Logger
 
+  alias Fathom.Rebalancer
   alias Fathom.Rebalancer.LoadSample
   alias Fathom.Repo
-  alias Fathom.Shard.Heartbeat
   alias Fathom.ShardLoad
 
   import Ecto.Query, only: [from: 2]
@@ -87,7 +87,7 @@ defmodule Fathom.Rebalancer.Reporter do
 
   # Per-shard rates from two cumulative snapshots, top-N by q_per_s, as insert maps.
   defp hot_rows(prev, curr, window_s) do
-    owner = Heartbeat.owner()
+    node_key = Rebalancer.node_key()
     sampled_at = DateTime.utc_now()
 
     curr
@@ -95,7 +95,7 @@ defmodule Fathom.Rebalancer.Reporter do
       p = Map.get(prev, id, %{queries: 0, rows_read: 0, checkouts: 0})
 
       %{
-        owner: owner,
+        node_key: node_key,
         shard_id: id,
         q_per_s: rate(c.queries, p.queries, window_s),
         rows_read_per_s: rate(c.rows_read, p.rows_read, window_s),

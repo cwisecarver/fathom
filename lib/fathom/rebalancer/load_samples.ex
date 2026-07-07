@@ -28,13 +28,13 @@ defmodule Fathom.Rebalancer.LoadSamples do
     |> Map.values()
   end
 
-  @doc "Total current query rate per owner (serving node) — the target-selection input."
+  @doc "Total current query rate per node_key (serving node) — the target-selection input."
   @spec node_load(non_neg_integer()) :: %{optional(String.t()) => float()}
   def node_load(ms \\ 120_000) do
     ms
     |> latest_per_shard()
     |> Enum.reduce(%{}, fn s, acc ->
-      Map.update(acc, s.owner, s.q_per_s, &(&1 + s.q_per_s))
+      Map.update(acc, s.node_key, s.q_per_s, &(&1 + s.q_per_s))
     end)
   end
 

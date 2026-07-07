@@ -6,8 +6,8 @@ defmodule Fathom.Rebalancer.ReporterTest do
   """
   use Fathom.DataCase, async: false
 
+  alias Fathom.Rebalancer
   alias Fathom.Rebalancer.{LoadSamples, Reporter}
-  alias Fathom.Shard.Heartbeat
   alias Fathom.ShardLoad
 
   setup do
@@ -45,8 +45,8 @@ defmodule Fathom.Rebalancer.ReporterTest do
     assert latest["rep_hot_1"].q_per_s > 0.0
     assert latest["rep_hot_1"].q_per_s > latest["rep_hot_2"].q_per_s
     assert latest["rep_hot_1"].rows_read_per_s > 0.0
-    # Tagged with the reporting node's identity (= the shard's current serving node).
-    assert latest["rep_hot_1"].owner == Heartbeat.owner()
+    # Tagged with the reporting node's stable key (= the shard's current serving node).
+    assert latest["rep_hot_1"].node_key == Rebalancer.node_key()
   end
 
   test "top-N cap: only the hottest shards are published" do
