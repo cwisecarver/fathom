@@ -115,18 +115,31 @@ hash. The fork is where the override lives:
     reader of `Fathom.ShardLoad`: it drives a Zipf-skewed query load across N shards
     through the real recording path (`Shards.checkout` → `ShardExecutor.execute`) and reads
     the counters the way a rebalancer would — diff two `snapshot/0`s over a window into
-    per-shard rates. It reports the rate distribution (p50/p90/p99/max), the skew ratio, a
-    `> K x median` threshold sweep (K=5/10/20 — how many shards each flags and whether it
-    catches the true hot set), and cross-window flagged-set stability (Jaccard, the raw
-    anti-flap signal). Purpose: **see whether hot spots are detectable and pick the
-    threshold + anti-flap policy from real numbers before building the LB override table.**
-    Synthetic-relative (one host, seeded skew); the staging run below is the non-synthetic
-    confirmation.
-  - **Verdict:** high capacity value but premature — it should be justified by real
-    hot-spot evidence. The synthetic harness (`--hotspots`) shows the signal is usable and
-    lets you tune the threshold/anti-flap knobs; the remaining gate before building B is a
-    **staging real-traffic run** (turn on `:shard_load` on a deployed node, read
-    `Fathom.ShardLoad.top/2` under a skewed tenant load). B also depends on A1
+    per-shard rates. It reports the rate distribution (p50/p90/p99/max), two separation
+    measures (max/median and the tail-robust max/p99), **three threshold-family sweeps** —
+    `> K x median`, `> K x p99`, and an absolute q/s floor set to isolate the top-N — each
+    with a Zipf-recall check, plus a scale-robust anti-flap signal (top-20-by-rate set
+    overlap across the two windows) and whether the shipped `ShardLoad.top/2` recovers the
+    Zipf head. Purpose: **see whether hot spots are detectable and pick the threshold +
+    anti-flap policy from real numbers before building the LB override table.**
+  - **Finding (prod build, 10k shards, s=1.1, 150k q/window, 2026-07-06 — synthetic,
+    one-host relative).** Hot spots are **cleanly detectable at fleet scale**: `ShardLoad.top(20)`
+    recall **1.0**, a sharp Zipf head (hot_1 188 q/s → hot_2 89 → hot_3 57 …), top-20
+    anti-flap Jaccard **0.9**. But the threshold **shape matters** — with 8,396 active
+    shards the long cold tail pulls the median to ≈0 (p50 0.0, p90 0.1, p99 1.5 q/s), so a
+    `> K x median` rule flags **hundreds** (751/421/216 at K=5/10/20). The tail-robust
+    forms stay tight: `> 20 x p99` flags **5** shards at recall 1.0; an absolute floor of
+    **~32 q/s isolates the top-5** (recall 1.0), ~16 q/s the top-10. **So the rebalancer's
+    hot-detection must key on p99-relative or an absolute q/s floor, never `> K x median`;**
+    `> K x p99` with a 2-window confirm is a viable anti-flap gate. (The per-query drive
+    caps at ~1.2k q/s because each query is a full checkout→execute→checkin — a harness
+    artifact, not a fathom limit; the detection conclusion is rate-distribution-shaped and
+    independent of it.)
+  - **Verdict:** high capacity value but premature — the detection is proven and the
+    threshold shape is now known (p99/absolute, not median); the remaining gate before
+    building B is a **staging real-traffic run** (turn on `:shard_load` on a deployed node,
+    read `Fathom.ShardLoad.top/2` under a real skewed tenant load, confirm the synthetic
+    shape holds and set the absolute q/s floor + anti-flap window). B also depends on A1
     (warm-handoff) to move a shard without a cold-open stall. **Do after A, with data.**
 - **B2 — In-fathom routing/redirect for rebalanced shards.** Re-opens the rejected
   mailroom / `base_url`-redirect debate (per-request cross-node forwarding). **Don't.**

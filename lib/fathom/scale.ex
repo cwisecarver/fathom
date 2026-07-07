@@ -641,21 +641,26 @@ defmodule Fathom.Scale do
   defp report(n, s, per_window, rates_a, wa, rates_b, wb) do
     qs_a = Enum.map(rates_a, & &1.q_per_s)
     median = percentile(qs_a, 50)
+    p99 = percentile(qs_a, 99)
     max_q = Enum.max([0.0 | qs_a])
-    skew = safe_div(max_q, median)
+    # max/median is inflated when a long cold tail drags the median toward 0; max/p99 is
+    # the tail-robust separation a fleet-scale threshold should key on.
+    sep_p99 = safe_div(max_q, p99)
+    # At fleet scale the cold tail pulls the median under ~1 q/s, so a >Kx-median cutoff
+    # sits near zero and flags hundreds — median-relative is the wrong threshold shape.
+    median_collapsed = median < 1.0
 
-    thresholds =
-      Enum.map([5, 10, 20], fn k ->
-        cutoff = k * median
-        flagged = for r <- rates_a, r.q_per_s > cutoff, do: r.shard_id
-        %{k: k, flagged: length(flagged), zipf_recall: round2(zipf_recall(flagged))}
-      end)
+    # Three threshold families: >Kx median (breaks at scale — see median_collapsed),
+    # >Kx p99 (tail-robust), and an absolute q/s floor set to isolate the top-N (the
+    # portable production knob — a fixed rate, not a distribution ratio).
+    thresholds = ratio_sweep(rates_a, [5, 10, 20], median)
+    thresholds_p99 = ratio_sweep(rates_a, [5, 10, 20], p99)
+    thresholds_absolute = absolute_sweep(rates_a, [5, 10, 20, 50])
 
-    # Anti-flap: the > 10x-median flagged set in each window, and how much it drifts.
-    med_b = percentile(Enum.map(rates_b, & &1.q_per_s), 50)
-    set_a = flagged_set(rates_a, 10 * median)
-    set_b = flagged_set(rates_b, 10 * med_b)
-    stability = jaccard(set_a, set_b)
+    # Anti-flap on a scale-robust, policy-neutral set: are the top-20 hottest shards the
+    # same across two windows? (A threshold-anchored flap set is empty at small N and
+    # huge at large N — top-K is meaningful at both.)
+    flap = jaccard(MapSet.new(top_ids(rates_a, 20)), MapSet.new(top_ids(rates_b, 20)))
 
     # Exercise the shipped read API a rebalancer would call, not just my diff.
     shardload_top = Fathom.ShardLoad.top(20, :queries) |> Enum.map(& &1.shard_id)
@@ -672,20 +677,53 @@ defmodule Fathom.Scale do
       active_shards: length(rates_a),
       rate_p50_qps: round1(median),
       rate_p90_qps: round1(percentile(qs_a, 90)),
-      rate_p99_qps: round1(percentile(qs_a, 99)),
+      rate_p99_qps: round1(p99),
       rate_max_qps: round1(max_q),
-      skew_ratio: round1(skew),
+      # Separation, two ways: max/median (inflated by a near-0 median) vs max/p99 (robust).
+      skew_ratio: round1(safe_div(max_q, median)),
+      separation_over_p99: round1(sep_p99),
+      median_collapsed: median_collapsed,
       top10: top10_detail(rates_a),
+      # >Kx-median (deprecated at scale), >Kx-p99, and absolute top-N-floor sweeps.
       thresholds: thresholds,
-      # Anti-flap input: how stable the >10x-median hot set is across two windows.
-      flap_window_a_flagged: MapSet.size(set_a),
-      flap_window_b_flagged: MapSet.size(set_b),
-      flap_stability_jaccard: round2(stability),
+      thresholds_p99: thresholds_p99,
+      thresholds_absolute: thresholds_absolute,
+      # Anti-flap: top-20-by-rate set overlap across the two windows.
+      flap_top20_jaccard: round2(flap),
       # Does the diff-based top and the cumulative ShardLoad.top both recover the head?
       top20_zipf_recall: round2(top20_recall),
       shardload_top20_zipf_recall: round2(zipf_recall(shardload_top)),
-      verdict: verdict(skew, top20_recall, stability)
+      verdict: verdict(top20_recall, flap, median_collapsed)
     }
+  end
+
+  # >Kx-anchor sweep: for each k, how many shards exceed k*anchor and how well that set
+  # matches the true Zipf head (recall).
+  defp ratio_sweep(rates, ks, anchor) do
+    Enum.map(ks, fn k ->
+      cutoff = k * anchor
+      flagged = for r <- rates, r.q_per_s > cutoff, do: r.shard_id
+      %{k: k, flagged: length(flagged), zipf_recall: round2(zipf_recall(flagged))}
+    end)
+  end
+
+  # Absolute q/s floor set to the top-N-th highest rate: "flag shards at/above F q/s to
+  # catch the top N." The portable production knob (a fixed rate, not a distribution
+  # ratio), and the one that stays tight when the median collapses.
+  defp absolute_sweep(rates, top_ns) do
+    desc = rates |> Enum.map(& &1.q_per_s) |> Enum.sort(:desc)
+
+    Enum.map(top_ns, fn topn ->
+      floor = Enum.at(desc, topn - 1) || 0.0
+      flagged = for r <- rates, r.q_per_s >= floor, do: r.shard_id
+
+      %{
+        top_n: topn,
+        floor_qps: round1(floor),
+        flagged: length(flagged),
+        zipf_recall: round2(zipf_recall(flagged))
+      }
+    end)
   end
 
   # Precision of the flagged set vs the true top-|flagged| by Zipf weight (the true
@@ -696,10 +734,6 @@ defmodule Fathom.Scale do
     m = length(ids)
     true_top = MapSet.new(1..m, &"hot_#{&1}")
     Enum.count(ids, &MapSet.member?(true_top, &1)) / m
-  end
-
-  defp flagged_set(rates, cutoff) do
-    for r <- rates, r.q_per_s > cutoff, into: MapSet.new(), do: r.shard_id
   end
 
   defp jaccard(a, b) do
@@ -724,26 +758,37 @@ defmodule Fathom.Scale do
     end)
   end
 
-  # A one-line human read of whether B is justified: the hot set must be both
-  # separable (high skew + the read API recovers it) and stable (low flap).
-  defp verdict(skew, top_recall, stability) do
-    separable = skew >= 10 and top_recall >= 0.8
-    stable = stability >= 0.8
+  # A one-line human read of whether B is justified: the hot set must be recoverable by
+  # the shipped read API and stable across windows; the policy note names the threshold
+  # SHAPE the distribution supports (median-relative breaks once the tail pulls the
+  # median to ~0 — the fleet-scale finding).
+  defp verdict(top_recall, flap, median_collapsed) do
+    detectable = top_recall >= 0.8
+    stable = flap >= 0.8
 
-    cond do
-      separable and stable ->
-        "hot set cleanly separable (skew #{round1(skew)}x, top-20 recall #{round2(top_recall)}) " <>
-          "and stable across windows (Jaccard #{round2(stability)}) — a >Kx-median threshold with " <>
-          "a 2-window confirm is a viable anti-flap gate"
+    core =
+      cond do
+        detectable and stable ->
+          "hot set detectable (ShardLoad.top recall #{round2(top_recall)}) and stable across " <>
+            "windows (top-20 Jaccard #{round2(flap)})"
 
-      separable ->
-        "hot set separable (skew #{round1(skew)}x) but the flagged set drifts across windows " <>
-          "(Jaccard #{round2(stability)}) — widen the confirm window / add hysteresis before pinning"
+        detectable ->
+          "hot set detectable (recall #{round2(top_recall)}) but the top set drifts across " <>
+            "windows (Jaccard #{round2(flap)}) — widen the confirm window / add hysteresis"
 
-      true ->
-        "hot set not cleanly separable at this skew (skew #{round1(skew)}x, recall " <>
-          "#{round2(top_recall)}) — raise --zipf or --queries, or the load may be too flat to rebalance on"
-    end
+        true ->
+          "hot set not cleanly recovered (recall #{round2(top_recall)}) — raise --zipf/--queries, " <>
+            "or the load is too flat to rebalance on"
+      end
+
+    policy =
+      if median_collapsed do
+        " — median≈0 (long cold tail): set the threshold on p99 (>Kx p99) or an absolute q/s floor, NOT >Kx median"
+      else
+        " — a p99-anchored or absolute-qps floor with a 2-window confirm is a viable anti-flap gate"
+      end
+
+    core <> policy
   end
 
   # --- ramp: find the node-density ceiling ---------------------------------

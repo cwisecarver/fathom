@@ -124,10 +124,27 @@ defmodule Mix.Tasks.Fathom.Scale do
       |> Enum.map(fn t -> "#{t.shard_id}=#{t.q_per_s}/s" end)
       |> Enum.join(", ")
 
-    sweep =
+    median_sweep =
       r.thresholds
-      |> Enum.map(fn t -> ">#{t.k}x median: #{t.flagged} flagged (recall #{t.zipf_recall})" end)
+      |> Enum.map(fn t -> ">#{t.k}x: #{t.flagged} (recall #{t.zipf_recall})" end)
       |> Enum.join("  ")
+
+    p99_sweep =
+      r.thresholds_p99
+      |> Enum.map(fn t -> ">#{t.k}x: #{t.flagged} (recall #{t.zipf_recall})" end)
+      |> Enum.join("  ")
+
+    abs_sweep =
+      r.thresholds_absolute
+      |> Enum.map(fn t ->
+        "top#{t.top_n}=>#{t.floor_qps}/s: #{t.flagged} (recall #{t.zipf_recall})"
+      end)
+      |> Enum.join("  ")
+
+    collapse =
+      if r.median_collapsed,
+        do: " — COLLAPSED (median≈0): use p99/absolute, not median",
+        else: ""
 
     rows = [
       {"shards / zipf", "#{r.shards} shards, s=#{r.zipf_s}, #{r.queries_per_window} q/window"},
@@ -135,12 +152,14 @@ defmodule Mix.Tasks.Fathom.Scale do
        "#{r.queries_per_s} q/s (window #{r.window_a_s}s), #{r.active_shards} active"},
       {"rate p50/p90/p99",
        "#{r.rate_p50_qps} / #{r.rate_p90_qps} / #{r.rate_p99_qps} q/s (max #{r.rate_max_qps})"},
-      {"skew (max/median)", "#{r.skew_ratio}x"},
+      {"separation",
+       "max/median #{r.skew_ratio}x · max/p99 #{r.separation_over_p99}x#{collapse}"},
       {"top-20 recall",
        "diff #{r.top20_zipf_recall} · ShardLoad.top #{r.shardload_top20_zipf_recall}"},
-      {"threshold sweep", sweep},
-      {"anti-flap (>10x)",
-       "A #{r.flap_window_a_flagged} / B #{r.flap_window_b_flagged} flagged, Jaccard #{r.flap_stability_jaccard}"},
+      {"sweep >Kx median", median_sweep},
+      {"sweep >Kx p99", p99_sweep},
+      {"sweep absolute", abs_sweep},
+      {"anti-flap top-20", "Jaccard #{r.flap_top20_jaccard} across the two windows"},
       {"hottest 10", top},
       {"verdict", r.verdict}
     ]
