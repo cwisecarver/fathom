@@ -1,0 +1,138 @@
+defmodule Fathom.Rebalancer.Reporter do
+  @moduledoc """
+  Publishes this node's hot shards to Postgres so the control plane can read a merged,
+  fleet-wide view — the first half of Phase-2 B1 (dynamic rebalancing).
+
+  There is no BEAM cluster (the LB-partition model coordinates only through S3 for the
+  data path and Postgres for orchestration), so a control plane can't reach into every
+  node's `Fathom.ShardLoad` ETS table. Instead each node **reports**: every
+  `:load_report_interval_ms` it reads `Fathom.ShardLoad.snapshot/0`, diffs against the
+  previous snapshot into per-shard **rates** (the churn-safe method the `--hotspots`
+  harness validated), and writes the top-N hottest shards to `shard_load_samples`,
+  tagged with this node's `Fathom.Shard.Heartbeat.owner/0` (its identity *and* the
+  shard's current serving node).
+
+  Off the hot path and resilient like `Fathom.Directory.Recorder`: a Postgres outage
+  drops a window, never crashes the node. Gated by `:load_reporter` (default off);
+  needs `:shard_load` on for the counters to be non-empty.
+
+  Config: `:load_report_interval_ms` (10_000), `:load_report_top_n` (50 hottest shards
+  published per window), `:load_sample_retention_ms` (600_000 — older rows pruned).
+  """
+  use GenServer
+
+  require Logger
+
+  alias Fathom.Rebalancer.LoadSample
+  alias Fathom.Repo
+  alias Fathom.Shard.Heartbeat
+  alias Fathom.ShardLoad
+
+  import Ecto.Query, only: [from: 2]
+
+  @default_interval_ms 10_000
+  @default_top_n 50
+  @default_retention_ms 600_000
+
+  @doc "Whether per-node load reporting is enabled (`:load_reporter`, default off)."
+  @spec enabled?() :: boolean()
+  def enabled?, do: Application.get_env(:fathom, :load_reporter, false) == true
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @doc "Publishes one window synchronously (tests)."
+  @spec report_now() :: :ok
+  def report_now, do: GenServer.call(__MODULE__, :report_now)
+
+  @impl true
+  def init(_opts) do
+    # Seed the baseline snapshot so the first published window is a real diff, not a
+    # cold-start spike (every cumulative counter would read as a rate otherwise).
+    state = %{prev: snapshot_map(), prev_mono: mono_ms()}
+    schedule(interval_ms())
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_info(:report, state), do: {:noreply, do_report(state) |> tap_schedule()}
+
+  @impl true
+  def handle_call(:report_now, _from, state) do
+    {:reply, :ok, do_report(state)}
+  end
+
+  defp tap_schedule(state) do
+    schedule(interval_ms())
+    state
+  end
+
+  # Diff current vs previous snapshot into rates, publish the top-N by query rate, prune
+  # old rows. Returns the new state (current becomes previous). Best-effort: any failure
+  # drops this window and keeps the current snapshot as the next baseline.
+  defp do_report(%{prev: prev, prev_mono: prev_mono} = state) do
+    now_mono = mono_ms()
+    curr = snapshot_map()
+    window_s = max((now_mono - prev_mono) / 1000, 0.001)
+
+    rows = hot_rows(prev, curr, window_s)
+    publish(rows)
+    prune()
+
+    %{state | prev: curr, prev_mono: now_mono}
+  rescue
+    e ->
+      Logger.warning("load reporter window dropped: #{Exception.message(e)}")
+      %{state | prev: snapshot_map(), prev_mono: mono_ms()}
+  end
+
+  # Per-shard rates from two cumulative snapshots, top-N by q_per_s, as insert maps.
+  defp hot_rows(prev, curr, window_s) do
+    owner = Heartbeat.owner()
+    sampled_at = DateTime.utc_now()
+
+    curr
+    |> Enum.map(fn {id, c} ->
+      p = Map.get(prev, id, %{queries: 0, rows_read: 0, checkouts: 0})
+
+      %{
+        owner: owner,
+        shard_id: id,
+        q_per_s: rate(c.queries, p.queries, window_s),
+        rows_read_per_s: rate(c.rows_read, p.rows_read, window_s),
+        checkouts_per_s: rate(c.checkouts, p.checkouts, window_s),
+        window_s: window_s,
+        sampled_at: sampled_at,
+        inserted_at: sampled_at
+      }
+    end)
+    |> Enum.reject(&(&1.q_per_s <= 0.0))
+    |> Enum.sort_by(& &1.q_per_s, :desc)
+    |> Enum.take(top_n())
+  end
+
+  defp rate(curr, prev, window_s), do: max(curr - prev, 0) / window_s
+
+  defp publish([]), do: :ok
+  defp publish(rows), do: Repo.insert_all(LoadSample, rows)
+
+  defp prune do
+    cutoff = DateTime.add(DateTime.utc_now(), -retention_ms(), :millisecond)
+    Repo.delete_all(from s in LoadSample, where: s.sampled_at < ^cutoff)
+    :ok
+  end
+
+  defp snapshot_map do
+    ShardLoad.snapshot() |> Map.new(&{&1.shard_id, &1})
+  end
+
+  defp mono_ms, do: System.monotonic_time(:millisecond)
+  defp schedule(ms), do: Process.send_after(self(), :report, ms)
+
+  defp interval_ms,
+    do: Application.get_env(:fathom, :load_report_interval_ms, @default_interval_ms)
+
+  defp top_n, do: Application.get_env(:fathom, :load_report_top_n, @default_top_n)
+
+  defp retention_ms,
+    do: Application.get_env(:fathom, :load_sample_retention_ms, @default_retention_ms)
+end

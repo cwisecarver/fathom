@@ -138,7 +138,17 @@ defmodule Fathom.Application do
       Fathom.HranaAuth.Revocations,
       # Captures template-shard Django migrations into fleet versions.
       Fathom.Migrator.Capture
-    ]
+    ] ++ reporter_children()
+  end
+
+  # Per-node load reporter (Phase-2 B1): publishes this node's hot shards to Postgres so
+  # the rebalancer can read a merged fleet view. Gated `:load_reporter`, off by default
+  # (needs `:shard_load` on to have anything to report). Reads ShardLoad lazily on its
+  # timer (one interval in), so starting before the DataPlane's ShardLoad table is fine.
+  defp reporter_children do
+    if Application.get_env(:fathom, :load_reporter, false),
+      do: [Fathom.Rebalancer.Reporter],
+      else: []
   end
 
   # Data plane (serves shards). Kept separate from the control plane so a control-plane
