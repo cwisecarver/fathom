@@ -36,4 +36,32 @@ defmodule Fathom.RuntimeConfigTest do
     refute Keyword.has_key?(fathom_config(%{"SHARD_LOAD" => "false"}), :shard_load)
     refute Keyword.has_key?(fathom_config(%{"SHARD_LOAD" => "0"}), :shard_load)
   end
+
+  test "rebalancer env: node_key, gates, and the hot floor" do
+    cfg =
+      fathom_config(%{
+        "NODE_KEY" => "fathom2",
+        "LOAD_REPORTER" => "true",
+        "COMMAND_POLLER" => "1",
+        "REBALANCER_ENABLED" => "true",
+        "LB_MAP_PATH" => "/etc/nginx/lb/exceptions.conf",
+        "REBALANCE_HOT_QPS_FLOOR" => "500.0"
+      })
+
+    assert Keyword.get(cfg, :node_key) == "fathom2"
+    assert Keyword.get(cfg, :load_reporter) == true
+    assert Keyword.get(cfg, :command_poller) == true
+    assert Keyword.get(cfg, :rebalancer_enabled) == true
+    assert Keyword.get(cfg, :lb_map_path) == "/etc/nginx/lb/exceptions.conf"
+    assert Keyword.get(cfg, :rebalance_hot_qps_floor) == 500.0
+  end
+
+  test "LB_BACKENDS parses node_key=address pairs into a map" do
+    cfg = fathom_config(%{"LB_BACKENDS" => "fathom1=fathom1:8080, fathom2=fathom2:8080"})
+
+    assert Keyword.get(cfg, :lb_backends) == %{
+             "fathom1" => "fathom1:8080",
+             "fathom2" => "fathom2:8080"
+           }
+  end
 end

@@ -94,6 +94,71 @@ if System.get_env("SHARD_LOAD") in ~w(true 1) do
   config :fathom, :shard_load, true
 end
 
+# --- Phase-2 B1 dynamic rebalancing (all off by default) ---------------------------
+# A stable per-node key the LB addresses this node as (the exception table / backend set
+# reference it). Default node(); set per node in a fleet (e.g. NODE_KEY=fathom1).
+if key = System.get_env("NODE_KEY") do
+  config :fathom, :node_key, key
+end
+
+# The LB backend set as node_key=address pairs, e.g.
+# LB_BACKENDS="fathom1=fathom1:8080,fathom2=fathom2:8080". The policy picks targets from
+# the keys; the map renderer emits a pin-upstream per entry.
+if spec = System.get_env("LB_BACKENDS") do
+  backends =
+    spec
+    |> String.split(",", trim: true)
+    |> Map.new(fn pair ->
+      [k, v] = String.split(pair, "=", parts: 2)
+      {String.trim(k), String.trim(v)}
+    end)
+
+  config :fathom, :lb_backends, backends
+end
+
+# Publish this node's hot shards to Postgres (needs SHARD_LOAD too).
+if System.get_env("LOAD_REPORTER") in ~w(true 1) do
+  config :fathom, :load_reporter, true
+end
+
+# Act on handoff warm/drain commands addressed to this node.
+if System.get_env("COMMAND_POLLER") in ~w(true 1) do
+  config :fathom, :command_poller, true
+end
+
+# Run the rebalance control loop (the cron is scheduled everywhere but inert until this).
+if System.get_env("REBALANCER_ENABLED") in ~w(true 1) do
+  config :fathom, :rebalancer_enabled, true
+end
+
+# Where the rebalancer writes the rendered nginx exception map, and how to reload the LB
+# (e.g. "nginx -s reload"; unset ⇒ the map is written but reload is applied out of band).
+if path = System.get_env("LB_MAP_PATH") do
+  config :fathom, :lb_map_path, path
+end
+
+if cmd = System.get_env("LB_RELOAD_CMD") do
+  config :fathom, :lb_reload_cmd, cmd
+end
+
+# The hot-detection floor (absolute q/s). Unset ⇒ the p99-relative rule.
+if floor = System.get_env("REBALANCE_HOT_QPS_FLOOR") do
+  config :fathom, :rebalance_hot_qps_floor, String.to_float(floor)
+end
+
+# Rebalancer cadence/policy tunables (all have code defaults).
+if ms = System.get_env("LOAD_REPORT_INTERVAL_MS") do
+  config :fathom, :load_report_interval_ms, String.to_integer(ms)
+end
+
+if n = System.get_env("REBALANCE_CONFIRM_WINDOWS") do
+  config :fathom, :rebalance_confirm_windows, String.to_integer(n)
+end
+
+if ms = System.get_env("REBALANCE_COOLDOWN_MS") do
+  config :fathom, :rebalance_cooldown_ms, String.to_integer(ms)
+end
+
 # Opt out of the boot-time conditional-write probe (expert review #16) ONLY for rigs where
 # storage isn't reachable at boot and the store is known-good. Never in prod.
 if System.get_env("VERIFY_STORAGE_FENCE") in ~w(false 0) do

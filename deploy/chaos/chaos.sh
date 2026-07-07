@@ -18,6 +18,8 @@
 #   ./chaos.sh hotspots [shards secs zipf workers]  drive Zipf-skewed REAL Hrana
 #                                 traffic through the LB, then read Fathom.ShardLoad.top
 #                                 per node — the non-synthetic Phase-2 §B hot-spot run
+#   ./chaos.sh rebalance [shard secs]  the Phase-2 B1 handoff live: detect a hot shard,
+#                                 pin it + reload the LB, drain the source, prove it moved
 #
 # All timings are RELATIVE (one host, loopback MinIO): run `latency 30` first so
 # failover numbers reflect a real S3 RTT rather than loopback.
@@ -81,6 +83,13 @@ hrana() {
 }
 
 sql() { hrana "$LB" "$@"; }                      # through the LB
+
+# rpc <node> <elixir-expr>: evaluate on a running node via the release, return stdout.
+rpc() { local node=$1; shift; compose exec -T "$node" /app/bin/fathom rpc "$*" 2>/dev/null | tr -d '\r'; }
+# other_node <node>: any NODES element that isn't <node>.
+other_node() { local not=$1 n; for n in "${NODES[@]}"; do [ "$n" != "$not" ] && { echo "$n"; return 0; }; done; }
+# reload_lb: apply the rendered exception map (nginx re-reads the included file).
+reload_lb() { compose exec -T lb nginx -s reload; }
 sql_direct() { local node=$1; shift; hrana "http://localhost:$(direct_port "$node")" "$@"; }
 val() { jq -r '.results[0].response.result.rows[0][0].value'; } # first row/col
 
@@ -403,8 +412,63 @@ PY
   rm -rf "$targets" "$ackdir" "$dump"
 }
 
+# -- rebalance: the Phase-2 B1 handoff, live end to end ------------------------
+# Drives load on a shard, shows the reporter detected it, then executes the safe handoff
+# to another node — pin + render the exception map, RELOAD the LB (flip), drain the source
+# (release the lease), and prove the shard is now served by the target. The steps are
+# host-orchestrated here because a fathom container can't reach the nginx container to
+# reload; in a deployment where it can (`LB_RELOAD_CMD`), the HandoffJob runs the same
+# sequence itself. Ordering is the safety: flip BEFORE drain, so the source doesn't
+# re-acquire (the {owner,epoch} lease blocks a double-write regardless).
+cmd_rebalance() {
+  local shard=${1:-acme} secs=${2:-18}
+  seed "$shard" >/dev/null
+  echo "rebalance: driving ${secs}s of load on '$shard', then handing it off + reloading the LB"
+
+  local deadline=$(( $(now_ms) + secs * 1000 )) w
+  for w in 1 2 3 4 5 6; do
+    ( while [ "$(now_ms)" -lt "$deadline" ]; do sql "$shard" "SELECT 1" >/dev/null 2>&1; done ) &
+  done
+  wait
+
+  echo "--- detection: Fathom.Rebalancer.LoadSamples (published to Postgres) ---"
+  rpc fathom1 "Fathom.Rebalancer.LoadSamples.latest_per_shard(60_000) |> Enum.filter(&(&1.q_per_s > 3)) |> Enum.sort_by(&(-&1.q_per_s)) |> Enum.take(5) |> Enum.map(fn s -> {s.shard_id, s.node_key, Float.round(s.q_per_s, 1)} end) |> inspect() |> IO.puts()"
+
+  local from; from=$(cmd_owner "$shard" || echo "?")
+  local to; to=$(other_node "$from")
+  echo "  '$shard' is on $from → handing off to $to"
+
+  # 1. Pin + render the exception map (the app writes it to the shared lb-runtime dir).
+  rpc fathom1 "Fathom.Rebalancer.Overrides.pin(\"$shard\", \"$to\", reason: \"demo\"); Fathom.Rebalancer.LbApply.apply!()" >/dev/null
+  echo "  pinned $shard → $to; exception map rendered:"
+  rpc fathom1 "Fathom.Rebalancer.LbMap.current() |> IO.puts()" | grep -E "$shard|fathom_pin_$to" | sed 's/^/    /'
+
+  # 2. Flip: reload the LB so new traffic for the shard routes to the target.
+  reload_lb && echo "  LB reloaded (flip applied)"
+
+  # 3. Drain the source so it releases the lease (flip-first means it finishes fast).
+  echo "  draining $shard on $from ..."
+  rpc "$from" "Fathom.Shards.drain(\"$shard\", 10_000) |> inspect() |> IO.puts()" | sed 's/^/    drain: /'
+
+  # 4. A request now routes to the target, which acquires the freed lease and serves.
+  sql "$shard" "SELECT 1" >/dev/null 2>&1
+  sleep 1
+  local now_owner; now_owner=$(cmd_owner "$shard" || echo "?")
+  # Isolation must still hold after the move.
+  local foreign; foreign=$(sql "$shard" "SELECT count(*) FROM kv WHERE tenant <> '$shard'" | val 2>/dev/null)
+
+  echo "  '$shard' now served by: $now_owner (was $from, pinned to $to)"
+  if [ "$now_owner" = "$to" ] && [ "${foreign:-0}" = "0" ]; then
+    echo "rebalance: OK — $shard moved $from → $to, isolation intact"
+  else
+    echo "rebalance: owner=$now_owner (expected $to), foreign=$foreign"
+    return 1
+  fi
+}
+
 case "${1:-}" in
   build)       cmd_build ;;
+  rebalance)   shift; cmd_rebalance "$@" ;;
   hotspots)    shift; cmd_hotspots "$@" ;;
   up)          cmd_up ;;
   down)        cmd_down ;;

@@ -38,10 +38,27 @@ x-fathom-env: &fathom-env
   WARM_FOLLOWER: "true"
   WARM_CACHE_DIR: /data/warm
   WARM_POLL_MS: "2000"
+  # Phase-2 B1 dynamic rebalancing: every node reports its load, acts on handoff
+  # commands, and runs the (singleton) control loop; the LB backend set + where the
+  # rendered exception map is written. NODE_KEY is per-node (set on each service below).
+  LOAD_REPORTER: "true"
+  COMMAND_POLLER: "true"
+  REBALANCER_ENABLED: "true"
+  LB_BACKENDS: "fathom1=fathom1:8080,fathom2=fathom2:8080,fathom3=fathom3:8080"
+  LB_MAP_PATH: /etc/nginx/lb/exceptions.conf
+  # Fast, deterministic demo: report every 3s, confirm a hotspot over 2 windows, short
+  # cooldown, and an absolute q/s floor tuned to the rig's per-shard rates.
+  LOAD_REPORT_INTERVAL_MS: "3000"
+  REBALANCE_CONFIRM_WINDOWS: "2"
+  REBALANCE_COOLDOWN_MS: "15000"
+  REBALANCE_HOT_QPS_FLOOR: "10.0"
 
 x-fathom-node: &fathom-node
   image: fathom-chaos:latest
   restart: "no" # the rig kills nodes on purpose; auto-restart would fight the scenarios
+  # The rebalancer renders the LB exception map here; nginx includes the same host dir.
+  volumes:
+    - ./lb-runtime:/etc/nginx/lb
   depends_on:
     migrate:
       condition: service_completed_successfully
@@ -119,6 +136,7 @@ services:
     environment:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21001
+      NODE_KEY: fathom1
     ports:
       - "18081:8080" # direct Hrana (bypasses the LB; zombie/steal experiments)
       - "18091:8081" # direct health
@@ -128,6 +146,7 @@ services:
     environment:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21002
+      NODE_KEY: fathom2
     ports:
       - "18082:8080"
       - "18092:8081"
@@ -137,6 +156,7 @@ services:
     environment:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21003
+      NODE_KEY: fathom3
     ports:
       - "18083:8080"
       - "18093:8081"
@@ -145,6 +165,7 @@ services:
     image: nginx:1.27-alpine
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./lb-runtime:/etc/nginx/lb:ro
     ports:
       - "8080:80"
     depends_on:
