@@ -78,10 +78,13 @@ through node churn, warm-standby 304-promote observed). See
 
 `docs/phase2-scoping.md` scopes it. **A1 (warm standby)** is built —
 `Fathom.Shard.WarmFollower` pre-pulls the hot set to survivors and promotes a
-freshness-validated (304) copy on failover. Remaining: **B** (dynamic rebalancing,
-gated on real hot-spot evidence — `Fathom.ShardLoad` is its built-but-off
-prerequisite), **C** (shard locality / affinity), **A2** (active-shard WAL follower,
-deferred).
+freshness-validated (304) copy on failover. **B1 (dynamic rebalancing)** is built too
+(`Fathom.Rebalancer.*`, 2026-07-06): a per-node load reporter → Postgres, a p99/absolute
+hot policy with anti-flap, an nginx exception-table (`map $host $fathom_target`) layered
+on the hash, and an Oban cron + handoff (warm → flip the LB → drain the source → target
+acquires; the lease blocks any double-write). Proven live on the chaos rig
+(`chaos.sh rebalance`). All gated off by default. Remaining: **C** (shard locality /
+affinity), **A2** (active-shard WAL follower, deferred).
 
 **Data-path engine — decided 2026-07-06: exqlite.** The `Fathom.ShardRepo` /
 `Ecto.Adapters.LibSql` path (defined but never wired) was evaluated and removed. The

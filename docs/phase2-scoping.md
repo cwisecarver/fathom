@@ -95,13 +95,35 @@ model-consistent, tractable, reusing infra already built.
 Move a persistently hot shard (or hot node) off the overloaded node, overriding the
 hash. The fork is where the override lives:
 
-- **B1 — LB override map + control-plane rebalancer.** The LB keeps a small
-  per-subdomain **exception table** layered on the ketama hash (nginx `map` / HAProxy
-  ACL / Fly): the hot minority is pinned to a chosen node, everything else stays pure
-  hash. A control plane detects hot shards from load telemetry, orchestrates a **safe
-  handoff** (drain the old node → warm on the new via A1 → flip the override →
-  old self-fences via the lease), and reloads the LB. Keeps the LB as authority (just
-  an exception table for the hot few); reuses the lease/heartbeat fence for the handoff.
+- **B1 — LB override map + control-plane rebalancer — BUILT (`Fathom.Rebalancer.*`,
+  2026-07-06).** The LB keeps a small per-subdomain **exception table** layered on the
+  ketama hash (nginx `map $host $fathom_target`): the hot minority is pinned to a chosen
+  node, everything else stays `default fathom_hrana` (pure hash). A control plane detects
+  hot shards from load telemetry, orchestrates a **safe handoff**, and reloads the LB.
+  Keeps the LB as authority (just an exception table for the hot few); reuses the
+  lease/heartbeat fence for the handoff. **Proven live on the 3-node chaos rig
+  (`chaos.sh rebalance`): `acme` @ 143.9 q/s detected on fathom1 → pinned to fathom2 →
+  LB reloaded → source drained → served by fathom2, isolation intact.**
+  - **The pieces (all shipped):** per-node **reporter** → `shard_load_samples` Postgres
+    (each node diffs two `ShardLoad` snapshots into rates and publishes its hot set —
+    there's no BEAM cluster to read ETS across); the **`Policy`** (absolute q/s floor or
+    p99-relative — never median; 2-window anti-flap; cooldown; an improvement guard that
+    refuses to relocate a lone hotspot; least-loaded target); the **`shard_overrides`**
+    exception table + **`LbMap`** nginx renderer + **`LbApply`** (write + reload); a
+    **cross-node command channel** (`rebalance_commands` + per-node `CommandPoller`) so
+    the orchestrator can warm/drain a shard on a node it can't RPC; and the Oban
+    **`RebalanceJob`** (cron singleton via Oban's Postgres peer leadership) + **`HandoffJob`**
+    (unique per shard). All gated off by default (`:load_reporter`/`:command_poller`/
+    `:rebalancer_enabled`).
+  - **The handoff, corrected.** The scoping line above once said "old self-fences via the
+    lease" — recon showed that's only the **crash/partition** path (a steal needs the old
+    owner's heartbeat *stale*; a healthy node keeps its heartbeat fresh, so the new node's
+    `acquire_lease` just gets `{:held}`). So a healthy-node handoff goes through a
+    **voluntary drain**: warm the target → **flip the LB first** (new traffic → target,
+    which stops the inflow to the source and is what makes draining a *hot* shard finish
+    fast) → drain the source (flush + release the lease) → the target acquires the freed
+    lease on its next request. The `{owner,epoch}` lease + `Fence.check` still guarantee
+    no double-write across every interleaving; the flip-first ordering is for liveness.
   - **Tension:** it complicates the "pure stateless hash" story with a stateful
     exception table, and needs anti-flap. It's the **biggest** of the three (control
     plane + LB integration + handoff orchestration).
@@ -157,15 +179,16 @@ hash. The fork is where the override lives:
     + real MinIO S3. So the detection signal holds non-synthetically, and the per-node-read/
     merge model is confirmed. (Traffic is per-query over curl, ~290 req/s — enough to prove
     detection; the throughput ceiling is the synthetic `--stream-len` result above.)
-  - **Verdict:** the prerequisites are met — detection is proven **synthetically and on the
-    rig under real traffic**, the threshold shape is known (p99/absolute, not median), and
-    the per-node-read/merge model is confirmed. What's left for B is the build itself: the
-    **B1 LB exception table** + a control plane that reads merged `ShardLoad`, applies a
-    p99/absolute hot rule with a 2-window anti-flap confirm, and orchestrates a warm handoff
-    (drain → warm via A1 → flip the override → old self-fences). It still **depends on A1**
-    (warm-handoff, built) and should be triggered by real hot-spot evidence in the target
-    deployment (a fixed absolute q/s floor tuned there). **Ready to build when a real hot
-    spot justifies it.**
+  - **Verdict: B1 is BUILT (2026-07-06)** — `Fathom.Rebalancer.*`, proven live on the rig
+    (see §B1 above). Detection (reporter → Postgres, p99/absolute policy, 2-window
+    anti-flap), the exception table + nginx render + reload, the cross-node command
+    channel, and the Oban cron + handoff orchestration all shipped and are gated off by
+    default. What remains is **operational, not code**: turn it on in a real deployment
+    (`REBALANCER_ENABLED` + `LOAD_REPORTER`/`COMMAND_POLLER` + `SHARD_LOAD`), tune the
+    absolute q/s floor to that fleet's rates, and — where the app can reach the LB — wire
+    `LB_RELOAD_CMD` so `HandoffJob` reloads nginx itself (the rig host-orchestrates the
+    reload because a container can't). A2 (WAL streaming) and Phase-2 **C** (locality)
+    remain the open Phase-2 items.
 - **B2 — In-fathom routing/redirect for rebalanced shards.** Re-opens the rejected
   mailroom / `base_url`-redirect debate (per-request cross-node forwarding). **Don't.**
 
