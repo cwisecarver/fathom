@@ -66,7 +66,7 @@ defmodule Fathom.Rebalancer.Policy do
     |> Enum.filter(&(&1.q_per_s >= threshold and threshold > 0.0))
     |> Enum.filter(&(&1.node_key in backend_keys))
     |> Enum.reject(&(&1.shard_id in cooling))
-    |> Enum.filter(&confirmed_hot?(&1.shard_id, samples, threshold, confirm))
+    |> Enum.filter(&confirmed_hot?(&1, samples, threshold, confirm))
     |> Enum.sort_by(& &1.q_per_s, :desc)
     |> plan_moves(node_load, backend_keys, threshold, max_moves)
   end
@@ -132,9 +132,19 @@ defmodule Fathom.Rebalancer.Policy do
   defp hot_threshold(floor, _mult, _rates) when is_number(floor) and floor > 0, do: floor / 1.0
   defp hot_threshold(_floor, mult, rates), do: mult * percentile(rates, 99)
 
-  defp confirmed_hot?(shard_id, samples, threshold, confirm) do
+  # Anti-flap (finding #9): a candidate must clear the bar in ≥ confirm DISTINCT windows on
+  # its CURRENT serving node. Filtering to `candidate.node_key` stops an LB remap (where the
+  # same shard_id is reported by both the old and new serving node) from double-counting one
+  # hot window across nodes to reach `confirm`; de-duping by `sampled_at` counts windows, not
+  # rows. (Recency is already bounded by the caller's read horizon; the latest-rate filter in
+  # propose/4 ensures the shard is still hot right now.)
+  defp confirmed_hot?(candidate, samples, threshold, confirm) do
     samples
-    |> Enum.filter(&(&1.shard_id == shard_id and &1.q_per_s >= threshold))
+    |> Enum.filter(fn s ->
+      s.shard_id == candidate.shard_id and s.node_key == candidate.node_key and
+        s.q_per_s >= threshold
+    end)
+    |> Enum.uniq_by(& &1.sampled_at)
     |> length()
     |> Kernel.>=(confirm)
   end

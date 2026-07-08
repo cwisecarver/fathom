@@ -116,6 +116,22 @@ defmodule Fathom.Rebalancer.PolicyTest do
     assert one.shard_id == "hot_a"
   end
 
+  test "anti-flap counts distinct windows on the candidate's node, not cross-node rows (#9)" do
+    # A shard mid-remap is reported hot by both its old (n1) and current (n2) serving node —
+    # one hot window each. Counting rows across nodes reaches confirm: 2 spuriously; counting
+    # distinct windows on the CURRENT serving node (n2, the latest sample) sees only 1, so
+    # the transient isn't moved. Filler keeps n2 overloaded so a target genuinely exists
+    # (isolating the anti-flap fix, not the improvement guard).
+    samples = [
+      s("n1", "remap", 900, 10),
+      s("n2", "remap", 900, 0),
+      s("n2", "filler", 500, 0),
+      s("n3", "cool", 10, 0)
+    ]
+
+    assert propose(samples, floor: 500.0, confirm_windows: 2) == []
+  end
+
   test "ignores shards whose current node isn't a known LB backend" do
     samples = [
       s("ghost", "hot_1", 900, 10),
