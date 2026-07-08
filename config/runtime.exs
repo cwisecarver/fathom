@@ -149,9 +149,11 @@ if cmd = System.get_env("LB_TEST_CMD") do
   config :fathom, :lb_test_cmd, cmd
 end
 
-# The hot-detection floor (absolute q/s). Unset ⇒ the p99-relative rule.
+# The hot-detection floor (absolute q/s). Unset ⇒ the p99-relative rule. Accepts an integer
+# or float and raises at boot on an unusable value (finding #16) — a mis-set floor is an
+# operator footgun that would otherwise silently disable the rebalancer.
 if floor = System.get_env("REBALANCE_HOT_QPS_FLOOR") do
-  config :fathom, :rebalance_hot_qps_floor, String.to_float(floor)
+  config :fathom, :rebalance_hot_qps_floor, Fathom.Rebalancer.parse_hot_qps_floor!(floor)
 end
 
 # Rebalancer cadence/policy tunables (all have code defaults).

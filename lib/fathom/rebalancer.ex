@@ -28,4 +28,24 @@ defmodule Fathom.Rebalancer do
   """
   @spec lb_backends() :: %{optional(String.t()) => String.t()}
   def lb_backends, do: Application.get_env(:fathom, :lb_backends, %{})
+
+  @doc """
+  Parses `REBALANCE_HOT_QPS_FLOOR` into a positive float (finding #16). Accepts an integer
+  or float string (`"500"` or `"500.0"` — the old `String.to_float/1` boot-crashed on the
+  integer form) and **raises at boot** on an unusable value (non-numeric, ≤ 0, or trailing
+  junk) rather than silently degrading to the p99-relative path — a mis-set floor was a
+  silent no-op otherwise. Used by `config/runtime.exs`.
+  """
+  @spec parse_hot_qps_floor!(String.t()) :: float()
+  def parse_hot_qps_floor!(raw) do
+    case raw |> to_string() |> String.trim() |> Float.parse() do
+      {floor, ""} when floor > 0 ->
+        floor
+
+      _ ->
+        raise ArgumentError,
+              "REBALANCE_HOT_QPS_FLOOR must be a positive number (e.g. 500 or 500.0), got: " <>
+                inspect(raw)
+    end
+  end
 end
