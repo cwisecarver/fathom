@@ -29,6 +29,15 @@ defmodule Fathom.Rebalancer.Policy do
   Config (all overridable via `opts`): `:floor` (absolute q/s, default from
   `:rebalance_hot_qps_floor`, nil ⇒ p99-relative), `:p99_multiple` (20), `:confirm_windows`
   (2), `:cooldown_ms` (300_000), `:max_moves` (1).
+
+  ## Trust assumption (expert review #17)
+
+  The hot decision trusts `q_per_s`, a signal a tenant fully controls from the data path. So
+  enabling the rebalancer (`REBALANCER_ENABLED`) presumes the Hrana trust boundary is
+  enforced — the network boundary (LB-only reachability, the default posture) or
+  `HRANA_AUTH=required`. Without it, an LB-reachable caller could drive a shard they don't
+  own over the bar to induce a handoff (a brief drain blip on the victim). The anti-flap
+  guards above bound the abuse, but the boundary is the defense, not the policy.
   """
 
   @type move :: %{
