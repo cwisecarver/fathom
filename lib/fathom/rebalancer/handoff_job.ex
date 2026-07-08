@@ -60,8 +60,12 @@ defmodule Fathom.Rebalancer.HandoffJob do
         :ok
 
       {:error, reason} when attempt >= max ->
-        # Give up safely: return the shard to its source so it's served, not stranded.
-        Overrides.unpin(shard)
+        # Give up safely: return the shard to its source so it's served, not stranded. Mark
+        # (not delete) the override so it's retained as a cooldown record — the renderer
+        # skips it (traffic returns to source) but its fresh updated_at keeps the shard in
+        # the Policy cooldown, so a wedged hot shard backs off instead of re-proposing every
+        # tick (finding #4).
+        Overrides.mark_failed(shard)
         LbApply.apply!()
         Logger.warning("rebalance: handoff #{shard} drain failed (#{inspect(reason)}); reverted")
         {:cancel, "drain failed after #{max} attempts; reverted to #{from}"}

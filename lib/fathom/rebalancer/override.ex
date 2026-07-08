@@ -16,6 +16,10 @@ defmodule Fathom.Rebalancer.Override do
     field :reason, :string
     field :q_per_s_at_pin, :float
     field :from_node, :string
+    # Set when a handoff failed + reverted (finding #4): the renderer skips the row (traffic
+    # returns to the source) but the row is retained so its fresh updated_at keeps the shard
+    # in the Policy cooldown. Cleared (nil) by a later successful pin.
+    field :failed_at, :utc_datetime_usec
 
     timestamps(type: :utc_datetime_usec)
   end
@@ -23,7 +27,7 @@ defmodule Fathom.Rebalancer.Override do
   @doc false
   def changeset(override, attrs) do
     override
-    |> cast(attrs, [:shard_id, :pinned_node, :reason, :q_per_s_at_pin, :from_node])
+    |> cast(attrs, [:shard_id, :pinned_node, :reason, :q_per_s_at_pin, :from_node, :failed_at])
     |> validate_required([:shard_id, :pinned_node])
     |> unique_constraint(:shard_id)
   end

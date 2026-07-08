@@ -71,6 +71,33 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
     assert_receive {:DOWN, ^down, :process, ^pid, _}, 5_000
   end
 
+  test "drain failure on the last attempt reverts to a retained cooldown record (#4)", %{
+    shard: shard,
+    node: node
+  } do
+    # Regression for #4: with NO CommandPoller running, warm + drain commands never
+    # complete, so on the final attempt the handoff reverts. It must RETAIN the override
+    # (stamped failed_at) as a cooldown record — deleting it (the old unpin) left the still
+    # hot shard with no cooldown → re-proposed every tick (thrash).
+    prev_warm = Application.get_env(:fathom, :handoff_warm_timeout_ms)
+    prev_drain = Application.get_env(:fathom, :handoff_drain_timeout_ms)
+    Application.put_env(:fathom, :handoff_warm_timeout_ms, 50)
+    Application.put_env(:fathom, :handoff_drain_timeout_ms, 50)
+
+    on_exit(fn ->
+      restore(:handoff_warm_timeout_ms, prev_warm)
+      restore(:handoff_drain_timeout_ms, prev_drain)
+    end)
+
+    args = %{"shard_id" => shard, "from_node" => node, "to_node" => node, "q_per_s" => 500.0}
+    # attempt == max_attempts (3) so drain failure takes the revert branch, not a retry.
+    assert {:cancel, _} = perform_job(HandoffJob, args, attempt: 3)
+
+    o = Overrides.for_shard(shard)
+    assert o != nil, "override retained as a cooldown record after revert"
+    assert o.failed_at != nil
+  end
+
   test "period: :infinity — a second handoff for the same shard is deduped past 60s", %{
     shard: shard,
     node: node

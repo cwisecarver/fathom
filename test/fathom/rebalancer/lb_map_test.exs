@@ -80,6 +80,16 @@ defmodule Fathom.Rebalancer.LbMapTest do
     refute out =~ "fathom_pin_ghost_node"
   end
 
+  test "a failed/reverted override is skipped so traffic returns to the source (#4)" do
+    # A row with failed_at set is a cooldown record only — it must not render a map entry
+    # (that would keep routing to the target it failed to move to).
+    failed = Map.put(override("hot_1", "fathom2"), :failed_at, ~U[2026-07-07 00:00:00Z])
+    out = LbMap.render([failed], @backends, "fathom.test")
+
+    refute out =~ "hot_1.fathom.test"
+    assert out =~ "default fathom_hrana;"
+  end
+
   test "upstream_name sanitizes non-identifier chars (e.g. an IP node key)" do
     assert LbMap.upstream_name("fathom1") == "fathom_pin_fathom1"
     assert LbMap.upstream_name("10.0.0.12") == "fathom_pin_10_0_0_12"

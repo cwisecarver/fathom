@@ -47,6 +47,9 @@ defmodule Fathom.Rebalancer.LbMap do
   def render(overrides, backends, base_domain) do
     entries =
       overrides
+      # Skip failed/reverted rows (finding #4): they're retained only as a cooldown record,
+      # so the shard routes via the hash home (source), not the target it failed to move to.
+      |> Enum.reject(&Map.get(&1, :failed_at))
       |> Enum.filter(&Map.has_key?(backends, &1.pinned_node))
       |> Enum.sort_by(& &1.shard_id)
       |> Enum.map_join("\n", fn o ->
