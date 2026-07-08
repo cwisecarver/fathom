@@ -8,6 +8,18 @@ defmodule Fathom.Rebalancer.LoadSample do
   served where its subdomain hashes / is pinned). The rebalancer reads a short history of
   these across all nodes to find persistently-hot shards and their current node — the data
   the request path never persists.
+
+  ## Clock assumption (expert review #15)
+
+  `sampled_at` is each reporter's **wall clock** at publish time. The reporter's *window*
+  math is skew-immune (it diffs its own snapshots with a monotonic clock — see
+  `Fathom.Rebalancer.Reporter`), but the cross-node reads that compare `sampled_at` —
+  `LoadSamples.since/1` + `latest_per_shard/1` (which resolves a shard seen by two nodes
+  mid-remap by the newest `sampled_at`) and the pruning cutoff — assume the fleet's clocks
+  are **NTP-synced within a few seconds** (small vs the ~10s window). Under material skew a
+  fast-clock node's rows can win the "newest" tie or survive pruning longer, mis-attributing
+  a shard's current node or biasing load off a slow-clock node. Keep NTP healthy on
+  rebalancer nodes; a fuller fix (order/prune on a single server clock) is deferred.
   """
   use Ecto.Schema
 

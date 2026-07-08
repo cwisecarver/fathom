@@ -3,6 +3,11 @@ defmodule Fathom.Rebalancer.LoadSamples do
   Read side of the per-node load samples the `Fathom.Rebalancer.Reporter` publishes.
   The control plane reads a **short history** across all nodes to find persistently-hot
   shards (anti-flap) and their current serving node; the rebalance `Policy` consumes it.
+
+  NB (expert review #15): `since/1`, `latest_per_shard/1`, and `prune/1` order/compare on
+  `sampled_at` — each reporter's wall clock — so they assume the fleet is NTP-synced within
+  a few seconds (small vs the ~10s window). See `Fathom.Rebalancer.LoadSample` for the skew
+  failure modes; a single-server-clock ordering is a deferred fuller fix.
   """
   import Ecto.Query, only: [from: 2]
 

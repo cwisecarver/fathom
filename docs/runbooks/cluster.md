@@ -75,6 +75,13 @@ the same shards.
 - Fix clock skew (NTP). **Data is safe throughout** (the fence held); this is an availability /
   churn problem, not a corruption one. Confirm with the chaos/isolation test (S6).
 
+> **NTP also matters for the rebalancer (expert review #15).** Its per-node load samples
+> (`shard_load_samples.sampled_at`) are reporter wall clocks, and the cross-node reads that
+> pick a shard's "current" node and prune old samples compare them. A few seconds of skew is
+> fine (small vs the ~10s window); material skew can mis-attribute a shard's serving node or
+> bias load off a slow-clock node. Same fix: keep NTP healthy. Data is never at risk (the S3
+> `{owner,epoch}` lease, not the samples, arbitrates writes).
+
 ## Runbook: lease store (S3) is down
 
 **Symptom:** fleet-wide — many shards fail to acquire/renew; `checkout` outcome `error`
