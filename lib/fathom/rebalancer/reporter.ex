@@ -110,7 +110,14 @@ defmodule Fathom.Rebalancer.Reporter do
     |> Enum.take(top_n())
   end
 
-  defp rate(curr, prev, window_s), do: max(curr - prev, 0) / window_s
+  # A shard's ShardLoad counters are cumulative + monotonic, so curr < prev happens ONLY
+  # when the coordinator stopped + reopened between snapshots (the row was dropped and
+  # recreated at 0). This system LRU-evicts idle shards and cold-re-opens them, so that
+  # churn is routine — clamping the reset delta to max(curr-prev,0)=0 dropped a moderately
+  # hot churny shard from the window (and reset its confirm streak). On a reset the correct
+  # window rate is `curr` over the window, not 0 (finding #6).
+  defp rate(curr, prev, window_s) when curr < prev, do: curr / window_s
+  defp rate(curr, prev, window_s), do: (curr - prev) / window_s
 
   defp publish([]), do: :ok
   defp publish(rows), do: Repo.insert_all(LoadSample, rows)

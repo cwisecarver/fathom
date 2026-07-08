@@ -49,6 +49,36 @@ defmodule Fathom.Rebalancer.ReporterTest do
     assert latest["rep_hot_1"].node_key == Rebalancer.node_key()
   end
 
+  test "a counter reset between windows reports curr/window, not a spurious 0 (#6)" do
+    # Regression for #6: an idle shard evicted + cold-re-opened between snapshots resets its
+    # ShardLoad row to 0, so curr < prev. The old max(curr-prev,0) clamped that to 0 and the
+    # shard was dropped from the window (and its confirm streak reset) — a systematic bias
+    # against churny shards, which is the routine case here (LRU evict + cold re-open).
+    pid = start_supervised!(Reporter)
+    Ecto.Adapters.SQL.Sandbox.allow(Fathom.Repo, self(), pid)
+
+    # Window 1: shard accrues load; reporter's prev baseline becomes {reset_shard: 50}.
+    for _ <- 1..50, do: ShardLoad.record_query("reset_shard", 8, 0)
+    :ok = Reporter.report_now()
+
+    # Clear window-1's rows so the assertion below can ONLY see what window 2 publishes —
+    # otherwise window-1's positive sample masks a window-2 drop-to-0 (within the 60s read).
+    LoadSamples.prune(0)
+
+    # Simulate an evict + cold re-open: drop the row, then it re-accrues from 0 (curr < prev).
+    ShardLoad.forget("reset_shard")
+    for _ <- 1..5, do: ShardLoad.record_query("reset_shard", 8, 0)
+
+    :ok = Reporter.report_now()
+
+    latest = LoadSamples.latest_per_shard(60_000) |> Map.new(&{&1.shard_id, &1})
+
+    assert Map.has_key?(latest, "reset_shard"),
+           "reset shard published in window 2 (not dropped as a spurious 0)"
+
+    assert latest["reset_shard"].q_per_s > 0.0
+  end
+
   test "top-N cap: only the hottest shards are published" do
     Application.put_env(:fathom, :load_report_top_n, 3)
     on_exit(fn -> Application.delete_env(:fathom, :load_report_top_n) end)
