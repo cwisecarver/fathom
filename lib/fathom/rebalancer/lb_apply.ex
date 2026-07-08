@@ -35,9 +35,20 @@ defmodule Fathom.Rebalancer.LbApply do
   alias Fathom.Rebalancer.LbMap
 
   @doc """
-  Renders + promotes the map (atomic) and reloads the LB. Returns `:ok`, or `{:error, reason}`
-  if the candidate failed its config test / couldn't be written (the last-good file is kept).
-  Reload is best-effort (finding #11 surfaces reload failure separately).
+  Renders + promotes the map (atomic) and reloads the LB. Returns `:ok` when the flip is
+  live-or-will-be, or `{:error, reason}` when it is **known not live** so the caller can
+  decline to drain (finding #11):
+
+    * `{:error, {:config_test_failed | :config_test_raised, ..}}` / a `File` posix error —
+      the candidate failed its test or couldn't be written; the last-good file is kept and
+      the flip did not happen.
+    * `{:error, {:reload_failed, code}}` / `{:error, {:reload_raised, msg}}` — the map was
+      promoted (valid on disk for the next cold start) but the configured reload command
+      failed, so the running LB may not have picked it up.
+
+  `:ok` also covers the decision-plane-only mode (`:lb_map_path` unset) and out-of-band
+  reload (`:lb_reload_cmd` unset — e.g. the rig sidecar HUPs on the map's mtime), where the
+  app legitimately can't confirm the reload and proceeds optimistically.
   """
   @spec apply!() :: :ok | {:error, term()}
   def apply! do
@@ -52,7 +63,8 @@ defmodule Fathom.Rebalancer.LbApply do
   end
 
   # Write the candidate to a same-dir temp, config-test it, then atomically rename it over
-  # the live file. Any failure keeps the last-good file and leaves no partial behind.
+  # the live file. Any failure keeps the last-good file and leaves no partial behind. On a
+  # successful promotion the reload result (which may itself be an error) is surfaced.
   defp promote(path, content) do
     tmp = "#{path}.tmp.#{System.unique_integer([:positive])}"
 
@@ -60,7 +72,6 @@ defmodule Fathom.Rebalancer.LbApply do
          :ok <- config_test(tmp),
          :ok <- File.rename(tmp, path) do
       reload()
-      :ok
     else
       {:error, reason} ->
         File.rm(tmp)
@@ -94,6 +105,9 @@ defmodule Fathom.Rebalancer.LbApply do
     e -> {:error, {:config_test_raised, Exception.message(e)}}
   end
 
+  # Unset ⇒ out-of-band reload (the sidecar HUPs on mtime); can't confirm, so :ok. A set
+  # command that exits non-zero / raises surfaces {:error, ...} so the handoff won't drain
+  # against a flip that may not be live (finding #11).
   defp reload do
     case Application.get_env(:fathom, :lb_reload_cmd) do
       nil ->
@@ -102,12 +116,16 @@ defmodule Fathom.Rebalancer.LbApply do
       cmd ->
         {out, code} = System.shell(cmd, stderr_to_stdout: true)
 
-        if code != 0,
-          do: Logger.warning("rebalancer: LB reload `#{cmd}` exited #{code}: #{String.trim(out)}")
-
-        :ok
+        if code == 0 do
+          :ok
+        else
+          Logger.warning("rebalancer: LB reload `#{cmd}` exited #{code}: #{String.trim(out)}")
+          {:error, {:reload_failed, code}}
+        end
     end
   rescue
-    e -> Logger.warning("rebalancer: LB reload raised: #{Exception.message(e)}")
+    e ->
+      Logger.warning("rebalancer: LB reload raised: #{Exception.message(e)}")
+      {:error, {:reload_raised, Exception.message(e)}}
   end
 end

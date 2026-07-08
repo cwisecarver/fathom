@@ -73,6 +73,18 @@ defmodule Fathom.Rebalancer.LbApplyTest do
     assert Path.wildcard(map_path <> ".tmp.*") == []
   end
 
+  test "a reload-command failure surfaces {:error, {:reload_failed, _}} but still promotes (#11)",
+       %{map_path: map_path} do
+    # Regression for #11: apply! must surface a reload failure (not swallow it as :ok) so the
+    # handoff won't drain against a flip that may not be live. The map is still promoted (it
+    # passed any config test) — valid on disk for the next cold start.
+    Application.put_env(:fathom, :lb_reload_cmd, "false")
+    {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
+
+    assert {:error, {:reload_failed, _code}} = LbApply.apply!()
+    assert File.read!(map_path) =~ "hot_1."
+  end
+
   test "a passing config test receives the candidate path via {} and LB_MAP_CANDIDATE", %{
     map_path: map_path
   } do

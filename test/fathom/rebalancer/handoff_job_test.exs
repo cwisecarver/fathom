@@ -102,6 +102,39 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
     assert Commands.cancel_pending_drains(shard) == 0, "no pending drain left after revert"
   end
 
+  test "a flip that can't be applied skips the drain (source not stranded) (#11)", %{
+    shard: shard,
+    node: node
+  } do
+    # Regression for #11: if the LB flip isn't live (reload command fails), draining the
+    # source while traffic still routes to it would strand the shard. pin_and_flip surfaces
+    # the failure, so drain is SKIPPED — no drain command is issued and the source stays up.
+    prev_reload = Application.get_env(:fathom, :lb_reload_cmd)
+    prev_warm = Application.get_env(:fathom, :handoff_warm_timeout_ms)
+    Application.put_env(:fathom, :lb_reload_cmd, "false")
+    Application.put_env(:fathom, :handoff_warm_timeout_ms, 50)
+
+    on_exit(fn ->
+      restore(:lb_reload_cmd, prev_reload)
+      restore(:handoff_warm_timeout_ms, prev_warm)
+    end)
+
+    {:ok, pid, ref, _path} = Shards.checkout(shard)
+    Fathom.Shard.checkin(pid, ref)
+    down = Process.monitor(pid)
+
+    args = %{"shard_id" => shard, "from_node" => node, "to_node" => node, "q_per_s" => 500.0}
+    assert {:cancel, _} = perform_job(HandoffJob, args, attempt: 3)
+
+    # No drain command was ever issued (drain gated behind the failed flip).
+    assert Commands.pending_for(node) |> Enum.filter(&(&1.command == "drain")) == []
+    # Source coordinator was NOT drained.
+    refute_receive {:DOWN, ^down, :process, ^pid, _}, 300
+    assert Process.alive?(pid)
+    # Reverted to a cooldown record.
+    assert Overrides.for_shard(shard).failed_at != nil
+  end
+
   test "period: :infinity — a second handoff for the same shard is deduped past 60s", %{
     shard: shard,
     node: node

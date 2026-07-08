@@ -22,10 +22,12 @@ defmodule Fathom.Rebalancer.HandoffJob do
   inflow to the source, which is what makes draining a *hot* shard finish quickly. The
   `{owner, epoch}` lease guarantees no double-write across every interleaving regardless.
 
-  **On drain failure** (connections don't drain in time): retry (the source usually drains
-  on the next attempt now that traffic moved). If it still fails on the last attempt,
-  **revert the pin** so traffic returns to the source (which still owns + serves) — a
-  stuck shard is restored, not left pinned-and-unavailable.
+  **On failure** — either the flip couldn't be applied (finding #11: `LbApply.apply!`
+  returns `{:error, _}`, so the drain is *skipped* rather than stranding the source) or the
+  drain didn't finish in time: retry (both usually resolve on the next attempt now that
+  traffic moved). If it still fails on the last attempt, **revert the pin** so traffic
+  returns to the source (which still owns + serves) — a stuck shard is restored, not left
+  pinned-and-unavailable.
   """
   use Oban.Worker,
     queue: :rebalance,
@@ -52,31 +54,37 @@ defmodule Fathom.Rebalancer.HandoffJob do
     q = args["q_per_s"]
 
     warm(shard, to)
-    pin_and_flip(shard, to, from, q)
 
-    case drain(shard, from) do
-      :ok ->
-        Logger.info("rebalance: handoff #{shard} #{from} -> #{to} complete")
-        :ok
-
+    # Gate the drain on a confirmed live flip (finding #11): draining the source while the
+    # LB still routes to it (flip not applied) would strand the shard. pin_and_flip fails
+    # when the map/reload couldn't be applied, and then drain is skipped.
+    with :ok <- pin_and_flip(shard, to, from, q),
+         :ok <- drain(shard, from) do
+      Logger.info("rebalance: handoff #{shard} #{from} -> #{to} complete")
+      :ok
+    else
       {:error, reason} when attempt >= max ->
-        # Give up safely: return the shard to its source so it's served, not stranded. Mark
-        # (not delete) the override so it's retained as a cooldown record — the renderer
-        # skips it (traffic returns to source) but its fresh updated_at keeps the shard in
-        # the Policy cooldown, so a wedged hot shard backs off instead of re-proposing every
-        # tick (finding #4).
-        Overrides.mark_failed(shard)
-        # Cancel any drain whose await timed out (row still pending) so the source poller
-        # can't fire it after traffic was restored to the source (finding #7).
-        Commands.cancel_pending_drains(shard)
-        LbApply.apply!()
-        Logger.warning("rebalance: handoff #{shard} drain failed (#{inspect(reason)}); reverted")
-        {:cancel, "drain failed after #{max} attempts; reverted to #{from}"}
+        revert(shard, from, reason, max)
 
       {:error, reason} ->
-        # Source's connections haven't finished; retry — it usually drains next attempt.
+        # Flip not applied yet, or source's connections haven't finished — retry (both
+        # usually resolve on the next attempt).
         {:error, reason}
     end
+  end
+
+  # Give up safely: return the shard to its source so it's served, not stranded. Mark (not
+  # delete) the override so it's retained as a cooldown record — the renderer skips it
+  # (traffic returns to source) but its fresh updated_at keeps the shard in the Policy
+  # cooldown, so a wedged hot shard backs off instead of re-proposing every tick (#4). Cancel
+  # any drain whose await timed out (row still pending) so the source poller can't fire it
+  # after traffic was restored (#7).
+  defp revert(shard, from, reason, max) do
+    Overrides.mark_failed(shard)
+    Commands.cancel_pending_drains(shard)
+    LbApply.apply!()
+    Logger.warning("rebalance: handoff #{shard} failed (#{inspect(reason)}); reverted to #{from}")
+    {:cancel, "handoff failed after #{max} attempts (#{inspect(reason)}); reverted to #{from}"}
   end
 
   # Best-effort: a warm failure isn't fatal (the target cold-opens correctly), so proceed.
@@ -89,6 +97,8 @@ defmodule Fathom.Rebalancer.HandoffJob do
     end
   end
 
+  # Pin the DB override, then apply the LB map. Returns apply!'s result: :ok when the flip
+  # is live-or-out-of-band, {:error, reason} when it's known not live (so drain is skipped).
   defp pin_and_flip(shard, to, from, q) do
     {:ok, _} = Overrides.pin(shard, to, reason: "rebalance", q_per_s_at_pin: q, from_node: from)
     LbApply.apply!()
