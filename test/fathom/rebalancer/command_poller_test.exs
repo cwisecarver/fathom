@@ -87,6 +87,23 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     assert Commands.get(cmd.id).status == "pending"
   end
 
+  test "a poll batch executes all commands concurrently off the poller (#8)", %{node: node} do
+    # Multiple commands in one batch all complete via a single poll (the Task.Supervisor
+    # async_stream), so a slow drain can't head-of-line-block the warms behind it.
+    ids =
+      for i <- 1..3 do
+        {:ok, c} =
+          Commands.issue("warmbatch_#{i}_#{System.unique_integer([:positive])}", node, "warm")
+
+        c.id
+      end
+
+    start_supervised!(CommandPoller)
+    assert CommandPoller.poll_now() == 3
+
+    for id <- ids, do: assert(Commands.get(id).status == "done")
+  end
+
   test "a warm command is best-effort: an un-flushed shard still marks done",
        %{shard: shard, node: node} do
     # No stored object for this shard, so warm_now can't fetch — but warm is only an

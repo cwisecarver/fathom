@@ -102,6 +102,28 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
     assert Commands.cancel_pending_drains(shard) == 0, "no pending drain left after revert"
   end
 
+  test "drain await is ordered above the poller's worst-case drain (#8)" do
+    # The poller drains via Shards.drain(id, command_drain_ms), whose safety net adds +30s
+    # (coordinator shutdown). If the handoff's await were shorter, a slow-but-succeeding
+    # drain would be mislabeled a timeout → premature retry (duplicate drain) / spurious
+    # revert. The default must exceed command_drain_ms + 30s.
+    prev = Application.get_env(:fathom, :command_drain_ms)
+    prev_h = Application.get_env(:fathom, :handoff_drain_timeout_ms)
+    Application.put_env(:fathom, :command_drain_ms, 10_000)
+    Application.delete_env(:fathom, :handoff_drain_timeout_ms)
+
+    on_exit(fn ->
+      restore(:command_drain_ms, prev)
+      restore(:handoff_drain_timeout_ms, prev_h)
+    end)
+
+    assert HandoffJob.drain_timeout() >= 10_000 + 30_000
+
+    # An explicit override wins (operator owns the ordering).
+    Application.put_env(:fathom, :handoff_drain_timeout_ms, 12_345)
+    assert HandoffJob.drain_timeout() == 12_345
+  end
+
   test "an invalid shard_id doesn't crash the handoff (#14)", %{node: node} do
     # Regression for #14: pin_and_flip hard-matched {:ok, _}, so a rejected pin (invalid
     # shard_id) would MatchError-crash the job. It must handle the error and revert instead.

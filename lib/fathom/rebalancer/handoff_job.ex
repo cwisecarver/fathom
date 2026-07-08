@@ -119,5 +119,18 @@ defmodule Fathom.Rebalancer.HandoffJob do
   end
 
   defp warm_timeout, do: Application.get_env(:fathom, :handoff_warm_timeout_ms, 30_000)
-  defp drain_timeout, do: Application.get_env(:fathom, :handoff_drain_timeout_ms, 30_000)
+
+  # The drain await must exceed the poller's WORST-CASE drain — its `command_drain_ms` budget
+  # plus `Fathom.Shards.drain`'s coordinator-shutdown safety net (+30s) — so a legitimately
+  # slow-but-succeeding drain isn't mislabeled a timeout, which would trigger a premature
+  # Oban retry (duplicate drain, #5/#7) or a spurious revert (#4). Ordering (finding #8):
+  # handoff_drain_timeout_ms ≥ command_drain_ms + shutdown grace. Derived from
+  # command_drain_ms so the invariant holds if an operator tunes it; an explicit
+  # :handoff_drain_timeout_ms wins (operator owns the ordering then).
+  @shutdown_grace_ms 35_000
+  @doc false
+  def drain_timeout do
+    Application.get_env(:fathom, :handoff_drain_timeout_ms) ||
+      Application.get_env(:fathom, :command_drain_ms, 10_000) + @shutdown_grace_ms
+  end
 end

@@ -137,7 +137,11 @@ defmodule Fathom.Application do
       # verification stays off the Postgres hot path (expert review #31).
       Fathom.HranaAuth.Revocations,
       # Captures template-shard Django migrations into fleet versions.
-      Fathom.Migrator.Capture
+      Fathom.Migrator.Capture,
+      # Runs handoff warm/drain commands concurrently off the CommandPoller (finding #8), so
+      # a slow drain never head-of-line-blocks a warm the node needs. Unconditional + idle
+      # when unused, so the poller (and tests that start_supervised it) can rely on it.
+      {Task.Supervisor, name: Fathom.Rebalancer.TaskSupervisor}
     ] ++ reporter_children() ++ command_poller_children()
   end
 

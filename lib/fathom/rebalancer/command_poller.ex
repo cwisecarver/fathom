@@ -16,6 +16,16 @@ defmodule Fathom.Rebalancer.CommandPoller do
 
   Gated by `:command_poller` (default off). Only this node's poller matches a command
   addressed to this node's key, so there's no cross-node contention.
+
+  ## Concurrent execution (finding #8)
+
+  Commands in a poll batch run **concurrently** off the poller via a `Task.Supervisor`
+  (`async_stream_nolink`, bounded by `:command_poll_concurrency`), so a slow `drain` (up to
+  `Shards.drain`'s safety net) never head-of-line-blocks the `warm` commands the node needs
+  when it's simultaneously a handoff target. `poll_now/0` still consumes the whole batch
+  synchronously (so tests observe completion); `nolink` keeps a crashing command from taking
+  the poller down. The handoff-side timeout budget is ordered so a legitimately-slow drain
+  isn't mislabeled a timeout (`HandoffJob`'s drain await ≥ `command_drain_ms` + shutdown grace).
   """
   use GenServer
 
@@ -28,6 +38,8 @@ defmodule Fathom.Rebalancer.CommandPoller do
 
   @default_poll_ms 1_000
   @default_drain_ms 10_000
+  @default_concurrency 8
+  @task_supervisor Fathom.Rebalancer.TaskSupervisor
 
   @doc "Whether this node acts on handoff commands (`:command_poller`, default off)."
   @spec enabled?() :: boolean()
@@ -37,7 +49,7 @@ defmodule Fathom.Rebalancer.CommandPoller do
 
   @doc "Runs one poll synchronously and returns how many commands were executed (tests)."
   @spec poll_now() :: non_neg_integer()
-  def poll_now, do: GenServer.call(__MODULE__, :poll_now, 30_000)
+  def poll_now, do: GenServer.call(__MODULE__, :poll_now, 120_000)
 
   @impl true
   def init(_opts) do
@@ -56,12 +68,24 @@ defmodule Fathom.Rebalancer.CommandPoller do
   def handle_call(:poll_now, _from, state), do: {:reply, do_poll(), state}
 
   defp do_poll do
-    Rebalancer.node_key()
-    |> Commands.pending_for()
-    |> Enum.map(&execute/1)
-    |> length()
+    pending = Commands.pending_for(Rebalancer.node_key())
+
+    @task_supervisor
+    |> Task.Supervisor.async_stream_nolink(pending, &execute/1,
+      max_concurrency: concurrency(),
+      timeout: :infinity,
+      on_timeout: :kill_task
+    )
+    |> Enum.reduce(0, fn
+      {:ok, _}, acc ->
+        acc + 1
+
+      {:exit, reason}, acc ->
+        Logger.warning("command poller: a command crashed: #{inspect(reason)}")
+        acc
+    end)
   rescue
-    # A Postgres blip just means we retry next tick — never crash the node.
+    # A Postgres blip (e.g. pending_for) just means we retry next tick — never crash.
     e ->
       Logger.warning("command poller tick failed: #{Exception.message(e)}")
       0
@@ -115,4 +139,7 @@ defmodule Fathom.Rebalancer.CommandPoller do
   defp schedule, do: Process.send_after(self(), :poll, poll_ms())
   defp poll_ms, do: Application.get_env(:fathom, :command_poll_ms, @default_poll_ms)
   defp drain_ms, do: Application.get_env(:fathom, :command_drain_ms, @default_drain_ms)
+
+  defp concurrency,
+    do: Application.get_env(:fathom, :command_poll_concurrency, @default_concurrency)
 end
