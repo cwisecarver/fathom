@@ -47,10 +47,16 @@ config :fathom, :hrana_auth, :disabled
 # the cold tail converges to HEAD and drift self-heals.
 # The rebalance cron (Phase-2 B1) runs every minute but is inert unless
 # `:rebalancer_enabled` is set — Oban peer leadership makes it a fleet singleton.
+# The Pruner caps completed/cancelled/discarded job retention (finding #12): the rebalance
+# cron inserts+completes a row every minute in every env (~1,440/day) even while inert, so
+# without it the oban_jobs table grows unbounded. 7 days keeps a week of migration/rebalance
+# history for debugging while staying bounded. It only touches terminal jobs, so the
+# live-state uniqueness the migrator/handoff jobs rely on is unaffected.
 config :fathom, Oban,
   repo: Fathom.Repo,
   queues: [migrations: 10, retirement: 5, rebalance: 3],
   plugins: [
+    {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7},
     {Oban.Plugins.Cron,
      crontab: [
        {"0 * * * *", Fathom.Migrator.ReconcileJob},

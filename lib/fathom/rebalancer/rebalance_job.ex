@@ -16,9 +16,14 @@ defmodule Fathom.Rebalancer.RebalanceJob do
   require Logger
 
   alias Fathom.Rebalancer
-  alias Fathom.Rebalancer.{HandoffJob, LoadSamples, Overrides, Policy}
+  alias Fathom.Rebalancer.{Commands, HandoffJob, LoadSamples, Overrides, Policy}
 
   @sample_horizon_ms 120_000
+  # Command retention (finding #12): terminal rows deleted after this; pending rows older
+  # than the stale window (far past a handoff's warm+drain+retry lifetime) are expired so a
+  # command for an absent node doesn't stay pending forever.
+  @command_retention_ms 3_600_000
+  @command_stale_ms 900_000
 
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
@@ -30,6 +35,11 @@ defmodule Fathom.Rebalancer.RebalanceJob do
   end
 
   defp run do
+    # Bound the command channel each tick (finding #12): commands only exist when the
+    # rebalancer is enabled, so the enabled cron is the right home for the sweep.
+    Commands.prune_terminal(command_retention_ms())
+    Commands.expire_stale_pending(command_stale_ms())
+
     samples = LoadSamples.since(horizon_ms()) |> Enum.map(&Map.from_struct/1)
     overrides = Overrides.all()
     backends = Rebalancer.lb_backends()
@@ -66,4 +76,10 @@ defmodule Fathom.Rebalancer.RebalanceJob do
 
   defp horizon_ms,
     do: Application.get_env(:fathom, :rebalance_sample_horizon_ms, @sample_horizon_ms)
+
+  defp command_retention_ms,
+    do: Application.get_env(:fathom, :rebalance_command_retention_ms, @command_retention_ms)
+
+  defp command_stale_ms,
+    do: Application.get_env(:fathom, :rebalance_command_stale_ms, @command_stale_ms)
 end

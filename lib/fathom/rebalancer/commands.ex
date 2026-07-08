@@ -60,6 +60,44 @@ defmodule Fathom.Rebalancer.Commands do
   end
 
   @doc """
+  Deletes terminal (done/failed/cancelled) commands older than `older_than_ms` ago (finding
+  #12). `rebalance_commands` was never pruned, so terminal rows accumulated forever. Returns
+  the number deleted.
+  """
+  @spec prune_terminal(non_neg_integer()) :: non_neg_integer()
+  def prune_terminal(older_than_ms) do
+    cutoff = DateTime.add(DateTime.utc_now(), -older_than_ms, :millisecond)
+
+    {n, _} =
+      Repo.delete_all(
+        from(c in Command,
+          where: c.status in ["done", "failed", "cancelled"] and c.updated_at < ^cutoff
+        )
+      )
+
+    n
+  end
+
+  @doc """
+  Marks `pending` commands older than `older_than_ms` ago as `failed` (finding #12): a
+  command addressed to an off/absent node stays pending forever otherwise. The window is far
+  longer than a handoff's lifetime (await timeouts + retries), so a legitimately in-flight
+  command is never expired. Returns the number expired.
+  """
+  @spec expire_stale_pending(non_neg_integer()) :: non_neg_integer()
+  def expire_stale_pending(older_than_ms) do
+    cutoff = DateTime.add(DateTime.utc_now(), -older_than_ms, :millisecond)
+
+    {n, _} =
+      Repo.update_all(
+        from(c in Command, where: c.status == "pending" and c.inserted_at < ^cutoff),
+        set: [status: "failed", detail: "expired (node absent)", updated_at: DateTime.utc_now()]
+      )
+
+    n
+  end
+
+  @doc """
   Blocks until command `id` reaches a terminal status or `timeout_ms` elapses (polling
   every `poll_ms`). Returns `{:ok, command}` when `done`, `{:error, {:command_failed,
   detail}}` when `failed`, or `{:error, :timeout}`. Deadline is monotonic.

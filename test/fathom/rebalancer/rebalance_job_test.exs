@@ -3,8 +3,10 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
   use Fathom.DataCase, async: false
   use Oban.Testing, repo: Fathom.Repo
 
-  alias Fathom.Rebalancer.{HandoffJob, LoadSample, RebalanceJob}
+  alias Fathom.Rebalancer.{Command, Commands, HandoffJob, LoadSample, RebalanceJob}
   alias Fathom.Repo
+
+  import Ecto.Query, only: [from: 2]
 
   setup do
     prev = for k <- config_keys(), into: %{}, do: {k, Application.get_env(:fathom, k)}
@@ -65,6 +67,27 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
     assert_enqueued(worker: HandoffJob, args: %{"shard_id" => "hot_1", "from_node" => "n1"})
     [job] = all_enqueued(worker: HandoffJob)
     assert job.args["to_node"] == "n3", "least-loaded target"
+  end
+
+  test "an enabled tick sweeps the command channel: prunes terminal + expires stale (#12)" do
+    Application.put_env(:fathom, :rebalancer_enabled, true)
+    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+
+    {:ok, old_done} = Commands.issue("s1", "n1", "drain")
+    {:ok, _} = Commands.complete(old_done, "done", "drained")
+    {:ok, old_pending} = Commands.issue("s2", "n1", "warm")
+
+    # Age both ~2h so they clear the default retention (1h) / stale (15min) windows.
+    at = DateTime.add(DateTime.utc_now(), -7_200_000, :millisecond)
+
+    Repo.update_all(from(c in Command, where: c.id in ^[old_done.id, old_pending.id]),
+      set: [inserted_at: at, updated_at: at]
+    )
+
+    assert :ok = perform_job(RebalanceJob, %{})
+
+    assert Commands.get(old_done.id) == nil, "old terminal pruned"
+    assert Commands.get(old_pending.id).status == "failed", "old pending expired"
   end
 
   test "gate on but nothing hot: no handoffs" do
