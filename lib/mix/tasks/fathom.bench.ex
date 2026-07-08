@@ -26,10 +26,23 @@ defmodule Mix.Tasks.Fathom.Bench do
 
   `--only cold_open,copy,fanout` skips the directory bench, so it runs with no
   Postgres.
+
+  ## Benchmark lock
+
+  Benchmarks are only meaningful in isolation — a second run (this repo or a sibling
+  sharing the host) contends for CPU/disk and skews both. So the task takes a host-wide
+  lock file (`/tmp/fathom_bench.lock`) for the duration of the run: it refuses to start
+  if the lock already exists (another run is in progress, or a crashed run left it behind —
+  `rm` it), and creates + removes it otherwise (removed even if the bench fails). The
+  create is atomic (`O_EXCL`), so two simultaneous starts can't both win.
   """
   @shortdoc "Run fathom hot-path benchmarks, emit a perf-history JSON line"
 
   use Mix.Task
+
+  # Host-wide benchmark lock — one benchmark at a time across everything sharing this host,
+  # so no run measures under another run's load.
+  @lock_file "/tmp/fathom_bench.lock"
 
   # Load config + compile without starting the app — Fathom.Bench starts the
   # minimal subset it needs itself (no Oban, no Hrana port, no endpoint).
@@ -64,6 +77,41 @@ defmodule Mix.Tasks.Fathom.Bench do
     Logger.configure(level: :warning)
     {opts, _, _} = OptionParser.parse(argv, strict: @switches)
 
+    with_lock(@lock_file, fn -> do_run(opts) end)
+  end
+
+  # Runs `fun` while holding the host-wide benchmark lock at `path`, refusing (via `Mix.raise`)
+  # if the lock already exists so no benchmark measures under another's load. Creates the lock
+  # atomically (`O_EXCL`) and removes it when `fun` returns OR raises; a pre-existing lock (not
+  # ours) is left in place. Returns `fun`'s result. Public only so the lock logic is testable.
+  @doc false
+  @spec with_lock(Path.t(), (-> result)) :: result when result: var
+  def with_lock(path, fun) do
+    case File.open(path, [:write, :exclusive]) do
+      {:ok, io} ->
+        _ = IO.write(io, "fathom.bench pid #{System.pid()} #{DateTime.utc_now()}\n")
+        File.close(io)
+
+        try do
+          fun.()
+        after
+          File.rm(path)
+        end
+
+      {:error, :eexist} ->
+        Mix.raise("""
+        benchmark lock present: #{path}
+        A benchmark is already running (or a previous run crashed and left the lock behind).
+        Refusing to run — a concurrent benchmark would skew both. If nothing is running, remove it:
+            rm #{path}
+        """)
+
+      {:error, reason} ->
+        Mix.raise("could not create benchmark lock #{path}: #{:file.format_error(reason)}")
+    end
+  end
+
+  defp do_run(opts) do
     bench_opts =
       []
       |> put_opt(opts, :only, &parse_only/1)
