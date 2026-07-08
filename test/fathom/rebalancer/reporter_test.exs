@@ -88,6 +88,20 @@ defmodule Fathom.Rebalancer.ReporterTest do
     assert MapSet.member?(Nodes.alive(60_000), Rebalancer.node_key())
   end
 
+  test "beats its full-distribution p99 + sample count for the fleet bar (#2)" do
+    pid = start_supervised!(Reporter)
+    Ecto.Adapters.SQL.Sandbox.allow(Fathom.Repo, self(), pid)
+
+    for _ <- 1..20, do: ShardLoad.record_query("p99_hot", 8, 0)
+    for i <- 1..5, do: ShardLoad.record_query("p99_cold_#{i}", 1, 0)
+
+    :ok = Reporter.report_now()
+
+    beat = Fathom.Repo.get(Fathom.Rebalancer.NodeBeat, Rebalancer.node_key())
+    assert beat.sample_count >= 6, "p99 computed over the full active set, not just top-N"
+    assert beat.q_p99 > 0.0
+  end
+
   test "a Postgres outage drops the window without crashing the reporter (#13)" do
     import ExUnit.CaptureLog
 

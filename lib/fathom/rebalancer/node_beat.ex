@@ -13,5 +13,9 @@ defmodule Fathom.Rebalancer.NodeBeat do
 
   schema "rebalancer_nodes" do
     field :last_seen_at, :utc_datetime_usec
+    # This node's full-distribution q/s p99 and its sample count for the window (finding #2) —
+    # the fleet hot bar the policy uses, published alongside the liveness beat.
+    field :q_p99, :float
+    field :sample_count, :integer
   end
 end

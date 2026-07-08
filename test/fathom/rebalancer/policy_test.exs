@@ -93,6 +93,27 @@ defmodule Fathom.Rebalancer.PolicyTest do
     assert propose(uniform, p99_multiple: 20, confirm_windows: 1) == []
   end
 
+  test "a supplied fleet_p99 flags a small-N head the head-only p99 missed (#2)" do
+    # Only a handful of samples reach the policy (the reporter's top-N head). Computing p99
+    # from THAT head is ~the head itself → mult×p99 ≫ head → nothing flagged. With the
+    # fleet_p99 the reporters computed over their FULL distribution (a ~1 q/s cold baseline),
+    # the head clears mult×fleet_p99.
+    samples = [
+      s("n1", "hot_1", 100, 10),
+      s("n1", "hot_1", 100, 0),
+      s("n1", "filler", 40, 0),
+      s("n2", "b", 5, 0)
+    ]
+
+    assert [move] =
+             propose(samples, fleet_p99: 1.0, p99_multiple: 20, confirm_windows: 2)
+
+    assert move.shard_id == "hot_1"
+
+    # Without the fleet bar, the legacy head-only p99 (~100) → bar ~2000 → nothing moves.
+    assert propose(samples, p99_multiple: 20, confirm_windows: 2) == []
+  end
+
   test "max_moves caps per tick and spreads across targets (no new hotspot)" do
     # n1 hashed several hot shards (+ filler so it stays overloaded after the first move);
     # n2 and n3 are cold. With max_moves: 2 the two hottest fan out to different nodes.

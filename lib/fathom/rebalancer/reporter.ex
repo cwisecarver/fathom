@@ -24,7 +24,7 @@ defmodule Fathom.Rebalancer.Reporter do
   require Logger
 
   alias Fathom.Rebalancer
-  alias Fathom.Rebalancer.{LoadSample, Nodes}
+  alias Fathom.Rebalancer.{LoadSample, Nodes, Stats}
   alias Fathom.Repo
   alias Fathom.ShardLoad
 
@@ -86,10 +86,16 @@ defmodule Fathom.Rebalancer.Reporter do
     window_s = max((now_mono - prev_mono) / 1000, 0.001)
 
     try do
+      # The FULL positive-rate distribution this window (all active shards, before top-N
+      # truncation). Its p99 is the fleet hot bar (#2); the top-N of it is what's published.
+      rows = positive_rate_rows(prev, curr, window_s)
+      p99 = Stats.percentile(Enum.map(rows, & &1.q_per_s), 99)
+
       # Liveness beat for the dead-node reconciler (#1b) — rides this tick so a serving node
-      # is a beating node, independent of whether it has hot shards to publish.
-      Nodes.beat(Rebalancer.node_key())
-      publish(hot_rows(prev, curr, window_s))
+      # is a beating node — now carrying this node's full-distribution p99 + sample count for
+      # the fleet-relative hot bar (#2).
+      Nodes.beat(Rebalancer.node_key(), q_p99: p99, sample_count: length(rows))
+      publish(Enum.take(rows, top_n()))
       prune()
     rescue
       e -> Logger.warning("load reporter window dropped: #{Exception.message(e)}")
@@ -100,8 +106,10 @@ defmodule Fathom.Rebalancer.Reporter do
     %{state | prev: curr, prev_mono: now_mono}
   end
 
-  # Per-shard rates from two cumulative snapshots, top-N by q_per_s, as insert maps.
-  defp hot_rows(prev, curr, window_s) do
+  # Per-shard rates from two cumulative snapshots — every active shard (q_per_s > 0), sorted
+  # hottest first, as insert maps. NOT truncated: the caller takes the top-N to publish but
+  # computes the fleet p99 over the whole set (#2).
+  defp positive_rate_rows(prev, curr, window_s) do
     node_key = Rebalancer.node_key()
     sampled_at = DateTime.utc_now()
 
@@ -122,7 +130,6 @@ defmodule Fathom.Rebalancer.Reporter do
     end)
     |> Enum.reject(&(&1.q_per_s <= 0.0))
     |> Enum.sort_by(& &1.q_per_s, :desc)
-    |> Enum.take(top_n())
   end
 
   # A shard's ShardLoad counters are cumulative + monotonic, so curr < prev happens ONLY

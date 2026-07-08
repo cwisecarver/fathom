@@ -10,17 +10,22 @@ defmodule Fathom.Rebalancer.Nodes do
   """
   import Ecto.Query, only: [from: 2]
 
-  alias Fathom.Rebalancer.NodeBeat
+  alias Fathom.Rebalancer.{NodeBeat, Stats}
   alias Fathom.Repo
 
-  @doc "Records `node_key` as alive now (upsert on node_key). Returns `:ok`."
-  @spec beat(String.t()) :: :ok
-  def beat(node_key) do
+  @doc """
+  Records `node_key` as alive now, and optionally this window's full-distribution stats
+  (`:q_p99`, `:sample_count` — finding #2). Upsert on node_key. Returns `:ok`.
+  """
+  @spec beat(String.t(), keyword()) :: :ok
+  def beat(node_key, opts \\ []) do
     now = DateTime.utc_now()
+    q_p99 = opts[:q_p99]
+    sample_count = opts[:sample_count]
 
     Repo.insert!(
-      %NodeBeat{node_key: node_key, last_seen_at: now},
-      on_conflict: [set: [last_seen_at: now]],
+      %NodeBeat{node_key: node_key, last_seen_at: now, q_p99: q_p99, sample_count: sample_count},
+      on_conflict: [set: [last_seen_at: now, q_p99: q_p99, sample_count: sample_count]],
       conflict_target: :node_key
     )
 
@@ -35,5 +40,31 @@ defmodule Fathom.Rebalancer.Nodes do
     from(n in NodeBeat, where: n.last_seen_at >= ^cutoff, select: n.node_key)
     |> Repo.all()
     |> MapSet.new()
+  end
+
+  @doc """
+  The fleet hot bar (finding #2): the median of live nodes' full-distribution p99s, or `nil`
+  if the fleet's total sample count is below `min_samples` (the p99 isn't trustworthy yet, so
+  the policy falls back to the floor / legacy path rather than acting on noise). Only nodes
+  seen within `within_ms` with a non-nil `q_p99` count.
+  """
+  @spec fleet_p99(non_neg_integer(), non_neg_integer()) :: float() | nil
+  def fleet_p99(within_ms, min_samples) do
+    cutoff = DateTime.add(DateTime.utc_now(), -within_ms, :millisecond)
+
+    stats =
+      Repo.all(
+        from n in NodeBeat,
+          where: n.last_seen_at >= ^cutoff and not is_nil(n.q_p99),
+          select: {n.q_p99, n.sample_count}
+      )
+
+    total = stats |> Enum.map(fn {_p99, c} -> c || 0 end) |> Enum.sum()
+
+    if total >= min_samples and stats != [] do
+      stats |> Enum.map(fn {p99, _c} -> p99 end) |> Stats.median()
+    else
+      nil
+    end
   end
 end

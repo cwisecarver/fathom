@@ -13,6 +13,15 @@ defmodule Fathom.Rebalancer.Policy do
   bar self-scales: a uniform fleet has p99≈max so `mult × p99` flags nothing (no false
   hotspot); a sharp Zipf head has a low p99 so the head clears it.
 
+  The **fleet p99 is supplied by the orchestrator** (`:fleet_p99` — the median of live
+  nodes' FULL-distribution p99s, which each reporter computes over all its active shards
+  before the top-N publish truncation). This is what makes it genuinely fleet-relative
+  (finding #2): computing p99 from the truncated top-N *head* the reporter publishes gives a
+  systematically high bar that under-flags. When `:fleet_p99` isn't supplied (below the
+  sample floor, or a direct test caller), it falls back to `mult × percentile(samples, 99)`
+  over whatever samples were passed, using an interpolating percentile so a small-N sharp
+  head isn't pinned to the max.
+
   ## Anti-flap + safety
 
   - **Confirm windows:** a candidate must clear the bar in ≥ `confirm_windows` recent
@@ -40,6 +49,8 @@ defmodule Fathom.Rebalancer.Policy do
   guards above bound the abuse, but the boundary is the defense, not the policy.
   """
 
+  alias Fathom.Rebalancer.Stats
+
   @type move :: %{
           shard_id: String.t(),
           from_node: String.t(),
@@ -57,6 +68,7 @@ defmodule Fathom.Rebalancer.Policy do
   @spec propose([map()], [map()], %{optional(String.t()) => String.t()}, keyword()) :: [move()]
   def propose(samples, overrides, backends, opts \\ []) do
     floor = Keyword.get(opts, :floor, Application.get_env(:fathom, :rebalance_hot_qps_floor))
+    fleet_p99 = Keyword.get(opts, :fleet_p99)
     mult = Keyword.get(opts, :p99_multiple, cfg(:rebalance_p99_multiple, 20)) / 1.0
     confirm = Keyword.get(opts, :confirm_windows, cfg(:rebalance_confirm_windows, 2))
     cooldown_ms = Keyword.get(opts, :cooldown_ms, cfg(:rebalance_cooldown_ms, 300_000))
@@ -65,7 +77,7 @@ defmodule Fathom.Rebalancer.Policy do
 
     latest = latest_per_shard(samples)
     rates = latest |> Map.values() |> Enum.map(& &1.q_per_s)
-    threshold = hot_threshold(floor, mult, rates)
+    threshold = hot_threshold(floor, mult, fleet_p99, rates)
     node_load = node_load(latest)
     cooling = cooling_shards(overrides, now, cooldown_ms)
     backend_keys = Map.keys(backends)
@@ -144,9 +156,22 @@ defmodule Fathom.Rebalancer.Policy do
     end
   end
 
-  # The hot bar: an absolute floor if configured, else p99_multiple × fleet-p99.
-  defp hot_threshold(floor, _mult, _rates) when is_number(floor) and floor > 0, do: floor / 1.0
-  defp hot_threshold(_floor, mult, rates), do: mult * percentile(rates, 99)
+  # The hot bar, in precedence order (finding #2):
+  #   1. an absolute floor if configured (the recommended prod config);
+  #   2. else `mult × fleet_p99` when the orchestrator supplies a fleet-wide p99 (computed by
+  #      the reporters over their FULL rate distribution, not the truncated top-N head — the
+  #      head-only p99 was systematically too high and under-flagged);
+  #   3. else the legacy `mult × percentile(samples, 99)` (for callers/tests that pass the
+  #      full sample distribution directly; interpolating percentile, so a small-N sharp head
+  #      isn't pinned to max).
+  defp hot_threshold(floor, _mult, _fleet_p99, _rates) when is_number(floor) and floor > 0,
+    do: floor / 1.0
+
+  defp hot_threshold(_floor, mult, fleet_p99, _rates)
+       when is_number(fleet_p99) and fleet_p99 > 0,
+       do: mult * fleet_p99
+
+  defp hot_threshold(_floor, mult, _fleet_p99, rates), do: mult * Stats.percentile(rates, 99)
 
   # Anti-flap (finding #9): a candidate must clear the bar in ≥ confirm DISTINCT windows on
   # its CURRENT serving node. Filtering to `candidate.node_key` stops an LB remap (where the
@@ -190,14 +215,6 @@ defmodule Fathom.Rebalancer.Policy do
       nil -> true
       ts -> DateTime.diff(now, ts, :millisecond) < cooldown_ms
     end
-  end
-
-  defp percentile([], _), do: 0.0
-
-  defp percentile(values, pct) do
-    sorted = Enum.sort(values)
-    idx = round(pct / 100 * (length(sorted) - 1))
-    Enum.at(sorted, idx) || 0.0
   end
 
   defp cfg(key, default), do: Application.get_env(:fathom, key, default)

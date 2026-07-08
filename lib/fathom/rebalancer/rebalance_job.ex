@@ -27,6 +27,9 @@ defmodule Fathom.Rebalancer.RebalanceJob do
   # A node_key not seen (beaten) within this window is treated as dead by the reconciler
   # (finding #1b) — generous vs the ~10s reporter tick so a briefly-slow node keeps its pins.
   @node_stale_ms 60_000
+  # Minimum fleet-wide sample count before the fleet p99 is trusted as the hot bar (finding
+  # #2); below it, the p99 is noise, so the policy falls back to the floor / legacy path.
+  @min_p99_samples 50
 
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
@@ -57,8 +60,11 @@ defmodule Fathom.Rebalancer.RebalanceJob do
     samples = LoadSamples.since(horizon_ms()) |> Enum.map(&Map.from_struct/1)
     overrides = Overrides.all()
     backends = Rebalancer.lb_backends()
+    # The fleet-relative hot bar (finding #2): median of live nodes' full-distribution p99s,
+    # or nil (untrusted → policy uses the floor / legacy path) below the sample floor.
+    fleet_p99 = Nodes.fleet_p99(node_stale_ms(), min_p99_samples())
 
-    case Policy.propose(samples, overrides, backends) do
+    case Policy.propose(samples, overrides, backends, fleet_p99: fleet_p99) do
       [] ->
         :ok
 
@@ -121,4 +127,7 @@ defmodule Fathom.Rebalancer.RebalanceJob do
 
   defp node_stale_ms,
     do: Application.get_env(:fathom, :rebalance_node_stale_ms, @node_stale_ms)
+
+  defp min_p99_samples,
+    do: Application.get_env(:fathom, :rebalance_min_p99_samples, @min_p99_samples)
 end
