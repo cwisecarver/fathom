@@ -50,6 +50,9 @@ defmodule Fathom.Rebalancer.LbMap do
       # Skip failed/reverted rows (finding #4): they're retained only as a cooldown record,
       # so the shard routes via the hash home (source), not the target it failed to move to.
       |> Enum.reject(&Map.get(&1, :failed_at))
+      # Defense-in-depth (finding #14): never emit a raw shard_id into the nginx map key
+      # unless it passes Fathom.ShardId (mirrors the skip-unknown-backend filter below).
+      |> Enum.filter(&Fathom.ShardId.valid?(&1.shard_id))
       |> Enum.filter(&Map.has_key?(backends, &1.pinned_node))
       |> Enum.sort_by(& &1.shard_id)
       |> Enum.map_join("\n", fn o ->

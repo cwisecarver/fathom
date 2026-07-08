@@ -60,6 +60,19 @@ defmodule Fathom.Rebalancer.OverridesTest do
     assert Overrides.pinned_to("fathom3") == ["hot_1"]
   end
 
+  test "pin rejects an invalid shard_id at the write boundary (isolation gate, #14)" do
+    # The shard-isolation gate at the LB-exception boundary: an id that would inject nginx
+    # directives when rendered raw must be refused here, not just far upstream on the request
+    # path. Overrides.pin is public, so this is enforced by Override.changeset.
+    assert {:error, changeset} = Overrides.pin("evil; } server { deny all; } #", "fathom2")
+    assert %{shard_id: ["is not a valid shard id"]} = errors_on(changeset)
+    # Nothing was written.
+    assert Overrides.all() == []
+
+    # A dot (subdomain ambiguity / traversal) is also rejected.
+    assert {:error, _} = Overrides.pin("a.b", "fathom2")
+  end
+
   test "all is shard-sorted (stable render) and pinned_to filters by node" do
     {:ok, _} = Overrides.pin("hot_3", "fathom1")
     {:ok, _} = Overrides.pin("hot_1", "fathom2")

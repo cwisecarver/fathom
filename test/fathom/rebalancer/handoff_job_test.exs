@@ -102,6 +102,24 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
     assert Commands.cancel_pending_drains(shard) == 0, "no pending drain left after revert"
   end
 
+  test "an invalid shard_id doesn't crash the handoff (#14)", %{node: node} do
+    # Regression for #14: pin_and_flip hard-matched {:ok, _}, so a rejected pin (invalid
+    # shard_id) would MatchError-crash the job. It must handle the error and revert instead.
+    prev_warm = Application.get_env(:fathom, :handoff_warm_timeout_ms)
+    Application.put_env(:fathom, :handoff_warm_timeout_ms, 50)
+    on_exit(fn -> restore(:handoff_warm_timeout_ms, prev_warm) end)
+
+    args = %{
+      "shard_id" => "evil; } server { #",
+      "from_node" => node,
+      "to_node" => node,
+      "q_per_s" => 500.0
+    }
+
+    # No raise; a permanent invalid pin reverts (cancels) rather than crashing.
+    assert {:cancel, _} = perform_job(HandoffJob, args, attempt: 3)
+  end
+
   test "a flip that can't be applied skips the drain (source not stranded) (#11)", %{
     shard: shard,
     node: node

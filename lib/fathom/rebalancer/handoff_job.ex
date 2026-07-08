@@ -99,9 +99,13 @@ defmodule Fathom.Rebalancer.HandoffJob do
 
   # Pin the DB override, then apply the LB map. Returns apply!'s result: :ok when the flip
   # is live-or-out-of-band, {:error, reason} when it's known not live (so drain is skipped).
+  # A rejected pin (e.g. an invalid shard_id — finding #14) returns {:error, _} instead of
+  # MatchError-crashing the job; the with-chain reverts it rather than retrying forever.
   defp pin_and_flip(shard, to, from, q) do
-    {:ok, _} = Overrides.pin(shard, to, reason: "rebalance", q_per_s_at_pin: q, from_node: from)
-    LbApply.apply!()
+    case Overrides.pin(shard, to, reason: "rebalance", q_per_s_at_pin: q, from_node: from) do
+      {:ok, _} -> LbApply.apply!()
+      {:error, changeset} -> {:error, {:invalid_pin, changeset.errors}}
+    end
   end
 
   defp drain(shard, from) do

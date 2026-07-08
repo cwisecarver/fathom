@@ -80,6 +80,18 @@ defmodule Fathom.Rebalancer.LbMapTest do
     refute out =~ "fathom_pin_ghost_node"
   end
 
+  test "an entry with an invalid shard_id is skipped, never rendered raw (#14)" do
+    # Defense-in-depth: even if a malformed id reached the table, the renderer must not emit
+    # it as a raw map key (which would inject nginx directives).
+    evil = override("evil; } server { deny all; } #", "fathom1")
+    out = LbMap.render([evil, override("hot_1", "fathom2")], @backends, "fathom.test")
+
+    refute out =~ "evil"
+    refute out =~ "deny all"
+    # The valid pin still renders.
+    assert out =~ "hot_1.fathom.test fathom_pin_fathom2;"
+  end
+
   test "a failed/reverted override is skipped so traffic returns to the source (#4)" do
     # A row with failed_at set is a cooldown record only — it must not render a map entry
     # (that would keep routing to the target it failed to move to).
