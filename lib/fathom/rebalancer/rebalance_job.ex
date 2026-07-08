@@ -16,7 +16,7 @@ defmodule Fathom.Rebalancer.RebalanceJob do
   require Logger
 
   alias Fathom.Rebalancer
-  alias Fathom.Rebalancer.{Commands, HandoffJob, LbApply, LoadSamples, Overrides, Policy}
+  alias Fathom.Rebalancer.{Commands, HandoffJob, LbApply, LoadSamples, Nodes, Overrides, Policy}
 
   @sample_horizon_ms 120_000
   # Command retention (finding #12): terminal rows deleted after this; pending rows older
@@ -24,6 +24,9 @@ defmodule Fathom.Rebalancer.RebalanceJob do
   # command for an absent node doesn't stay pending forever.
   @command_retention_ms 3_600_000
   @command_stale_ms 900_000
+  # A node_key not seen (beaten) within this window is treated as dead by the reconciler
+  # (finding #1b) — generous vs the ~10s reporter tick so a briefly-slow node keeps its pins.
+  @node_stale_ms 60_000
 
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
@@ -40,10 +43,15 @@ defmodule Fathom.Rebalancer.RebalanceJob do
     Commands.prune_terminal(command_retention_ms())
     Commands.expire_stale_pending(command_stale_ms())
 
+    # Unpin any shard pinned to a dead node (finding #1b) BEFORE the re-render, so the shard
+    # returns to the hash pool (re-homes to a survivor — #1a already routes it there) instead
+    # of staying pinned to a node that isn't coming back.
+    reconcile_dead_pins()
+
     # Re-render the full override table each tick (finding #10): the leader re-applies the
     # LB map (a byte-identical render is a cheap no-op) so any drift between the DB table and
-    # the on-disk map — a raced apply!, a flip whose reload failed (#11) — self-heals within
-    # one tick without waiting for the next handoff.
+    # the on-disk map — a raced apply!, a flip whose reload failed (#11), or a just-reconciled
+    # dead-node unpin — self-heals within one tick without waiting for the next handoff.
     LbApply.apply!()
 
     samples = LoadSamples.since(horizon_ms()) |> Enum.map(&Map.from_struct/1)
@@ -58,6 +66,28 @@ defmodule Fathom.Rebalancer.RebalanceJob do
         Enum.each(moves, &enqueue/1)
         Logger.info("rebalance: enqueued #{length(moves)} handoff(s): #{summarize(moves)}")
         :ok
+    end
+  end
+
+  # Unpin overrides whose pinned_node isn't in the live fleet (finding #1b). FAIL OPEN: if
+  # nothing is beating (fresh deploy, or the beat mechanism is down), the alive set is empty
+  # and we unpin NOTHING — we only yank a pin when we have positive evidence the fleet is
+  # beating AND this node isn't. Already-failed rows are cooldown records that don't route,
+  # so they're left alone.
+  defp reconcile_dead_pins do
+    alive = Nodes.alive(node_stale_ms())
+
+    if MapSet.size(alive) > 0 do
+      Overrides.all()
+      |> Enum.reject(& &1.failed_at)
+      |> Enum.reject(&MapSet.member?(alive, &1.pinned_node))
+      |> Enum.each(fn o ->
+        Overrides.unpin(o.shard_id)
+
+        Logger.warning(
+          "rebalance: unpinned #{o.shard_id} — node #{o.pinned_node} not live (re-homing)"
+        )
+      end)
     end
   end
 
@@ -88,4 +118,7 @@ defmodule Fathom.Rebalancer.RebalanceJob do
 
   defp command_stale_ms,
     do: Application.get_env(:fathom, :rebalance_command_stale_ms, @command_stale_ms)
+
+  defp node_stale_ms,
+    do: Application.get_env(:fathom, :rebalance_node_stale_ms, @node_stale_ms)
 end

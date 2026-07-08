@@ -3,7 +3,16 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
   use Fathom.DataCase, async: false
   use Oban.Testing, repo: Fathom.Repo
 
-  alias Fathom.Rebalancer.{Command, Commands, HandoffJob, LoadSample, RebalanceJob}
+  alias Fathom.Rebalancer.{
+    Command,
+    Commands,
+    HandoffJob,
+    LoadSample,
+    Nodes,
+    Overrides,
+    RebalanceJob
+  }
+
   alias Fathom.Repo
 
   import Ecto.Query, only: [from: 2]
@@ -116,6 +125,29 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
 
     assert Commands.get(old_done.id) == nil, "old terminal pruned"
     assert Commands.get(old_pending.id).status == "failed", "old pending expired"
+  end
+
+  test "reconcile unpins a pin whose node is dead so the shard re-homes (#1b)" do
+    Application.put_env(:fathom, :rebalancer_enabled, true)
+    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+
+    # n1 is beating; dead_node is not. hot_1 is pinned to dead_node.
+    :ok = Nodes.beat("n1")
+    {:ok, _} = Overrides.pin("hot_1", "dead_node", reason: "test")
+
+    assert :ok = perform_job(RebalanceJob, %{})
+    assert Overrides.for_shard("hot_1") == nil, "dead-node pin unpinned (re-homed to hash)"
+  end
+
+  test "reconcile fails open: no beats ⇒ no unpins (#1b)" do
+    Application.put_env(:fathom, :rebalancer_enabled, true)
+    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+
+    {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
+    # Nothing has beaten — the alive set is empty, so the reconciler must NOT yank pins
+    # (the beat mechanism could just be starting / down).
+    assert :ok = perform_job(RebalanceJob, %{})
+    assert Overrides.for_shard("hot_1") != nil, "no unpin when nothing is beating"
   end
 
   test "gate on but nothing hot: no handoffs" do

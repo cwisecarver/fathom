@@ -7,7 +7,7 @@ defmodule Fathom.Rebalancer.ReporterTest do
   use Fathom.DataCase, async: false
 
   alias Fathom.Rebalancer
-  alias Fathom.Rebalancer.{LoadSamples, Reporter}
+  alias Fathom.Rebalancer.{LoadSamples, Nodes, Reporter}
   alias Fathom.ShardLoad
 
   setup do
@@ -77,6 +77,15 @@ defmodule Fathom.Rebalancer.ReporterTest do
            "reset shard published in window 2 (not dropped as a spurious 0)"
 
     assert latest["reset_shard"].q_per_s > 0.0
+  end
+
+  test "each tick beats this node's liveness for the reconciler (#1b)" do
+    pid = start_supervised!(Reporter)
+    Ecto.Adapters.SQL.Sandbox.allow(Fathom.Repo, self(), pid)
+
+    :ok = Reporter.report_now()
+
+    assert MapSet.member?(Nodes.alive(60_000), Rebalancer.node_key())
   end
 
   test "a Postgres outage drops the window without crashing the reporter (#13)" do

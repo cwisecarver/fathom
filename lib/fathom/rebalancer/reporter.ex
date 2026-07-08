@@ -24,7 +24,7 @@ defmodule Fathom.Rebalancer.Reporter do
   require Logger
 
   alias Fathom.Rebalancer
-  alias Fathom.Rebalancer.LoadSample
+  alias Fathom.Rebalancer.{LoadSample, Nodes}
   alias Fathom.Repo
   alias Fathom.ShardLoad
 
@@ -86,6 +86,9 @@ defmodule Fathom.Rebalancer.Reporter do
     window_s = max((now_mono - prev_mono) / 1000, 0.001)
 
     try do
+      # Liveness beat for the dead-node reconciler (#1b) — rides this tick so a serving node
+      # is a beating node, independent of whether it has hot shards to publish.
+      Nodes.beat(Rebalancer.node_key())
       publish(hot_rows(prev, curr, window_s))
       prune()
     rescue
