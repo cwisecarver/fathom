@@ -79,6 +79,22 @@ defmodule Fathom.Rebalancer.ReporterTest do
     assert latest["reset_shard"].q_per_s > 0.0
   end
 
+  test "a Postgres outage drops the window without crashing the reporter (#13)" do
+    import ExUnit.CaptureLog
+
+    pid = start_supervised!(Reporter)
+    for _ <- 1..5, do: ShardLoad.record_query("outage_shard", 8, 0)
+
+    # The outage: cut every non-owner process (incl. the reporter) off from Postgres, so its
+    # publish/prune fail. do_report must drop the window (rescue + catch :exit) and the
+    # reporter must survive — "a Postgres outage drops a window, never crashes the node".
+    Ecto.Adapters.SQL.Sandbox.mode(Fathom.Repo, :manual)
+
+    log = capture_log(fn -> assert Reporter.report_now() == :ok end)
+    assert log =~ "load reporter window dropped"
+    assert Process.alive?(pid)
+  end
+
   test "top-N cap: only the hottest shards are published" do
     Application.put_env(:fathom, :load_report_top_n, 3)
     on_exit(fn -> Application.delete_env(:fathom, :load_report_top_n) end)

@@ -65,6 +65,12 @@ defmodule Fathom.Rebalancer.CommandPoller do
     e ->
       Logger.warning("command poller tick failed: #{Exception.message(e)}")
       0
+  catch
+    # Pool / :noproc / shutdown surface as an exit, which `rescue` misses (finding #13);
+    # catch it too so a Postgres blip never takes the node down (like Directory.Recorder).
+    :exit, reason ->
+      Logger.warning("command poller tick exited: #{inspect(reason)}")
+      0
   end
 
   # Warm is best-effort: correctness comes from the target's cold-open, so even a skip is

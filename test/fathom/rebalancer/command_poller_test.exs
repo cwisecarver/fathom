@@ -64,6 +64,21 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     assert Process.alive?(pid)
   end
 
+  test "a Postgres outage makes a poll tick a no-op without crashing (#13)", %{shard: shard} do
+    import ExUnit.CaptureLog
+
+    {:ok, _} = Commands.issue(shard, Rebalancer.node_key(), "warm")
+    pid = start_supervised!(CommandPoller)
+
+    # Cut the poller off from Postgres: pending_for raises. do_poll must drop the tick
+    # (rescue + catch :exit) and the poller must survive.
+    Ecto.Adapters.SQL.Sandbox.mode(Fathom.Repo, :manual)
+
+    log = capture_log(fn -> assert CommandPoller.poll_now() == 0 end)
+    assert log =~ "command poller tick"
+    assert Process.alive?(pid)
+  end
+
   test "only commands addressed to this node are executed", %{shard: shard} do
     {:ok, cmd} = Commands.issue(shard, "some_other_node", "drain")
     start_supervised!(CommandPoller)

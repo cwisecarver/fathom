@@ -67,22 +67,30 @@ defmodule Fathom.Rebalancer.Reporter do
   end
 
   # Diff current vs previous snapshot into rates, publish the top-N by query rate, prune
-  # old rows. Returns the new state (current becomes previous). Best-effort: any failure
-  # drops this window and keeps the current snapshot as the next baseline.
+  # old rows. Returns the new state (current becomes previous). Best-effort like
+  # `Directory.Recorder`: a Postgres blip drops this window without crashing the node —
+  # both a `rescue` (DBConnection.ConnectionError / ownership raises) AND a `catch :exit`
+  # (pool / :noproc / shutdown surface as exits that `rescue` misses — finding #13).
+  #
+  # The snapshot + clock are read ONCE outside the try and the baseline always advances to
+  # them, so a dropped window doesn't re-scan ShardLoad / re-read the clock (a later baseline
+  # would shorten the next window — #18 minor), and the failed window's deltas roll cleanly
+  # into the next.
   defp do_report(%{prev: prev, prev_mono: prev_mono} = state) do
     now_mono = mono_ms()
     curr = snapshot_map()
     window_s = max((now_mono - prev_mono) / 1000, 0.001)
 
-    rows = hot_rows(prev, curr, window_s)
-    publish(rows)
-    prune()
+    try do
+      publish(hot_rows(prev, curr, window_s))
+      prune()
+    rescue
+      e -> Logger.warning("load reporter window dropped: #{Exception.message(e)}")
+    catch
+      :exit, reason -> Logger.warning("load reporter window dropped (exit): #{inspect(reason)}")
+    end
 
     %{state | prev: curr, prev_mono: now_mono}
-  rescue
-    e ->
-      Logger.warning("load reporter window dropped: #{Exception.message(e)}")
-      %{state | prev: snapshot_map(), prev_mono: mono_ms()}
   end
 
   # Per-shard rates from two cumulative snapshots, top-N by q_per_s, as insert maps.
