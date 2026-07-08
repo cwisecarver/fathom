@@ -33,4 +33,25 @@ defmodule Fathom.Rebalancer.CommandsTest do
     assert {:error, changeset} = Commands.issue("s", "n", "explode")
     assert "is invalid" in errors_on(changeset).command
   end
+
+  test "cancel_pending_drains cancels only pending drains for the shard (#7)" do
+    {:ok, d1} = Commands.issue("s", "src", "drain")
+    {:ok, d2} = Commands.issue("s", "src", "drain")
+    {:ok, warm} = Commands.issue("s", "tgt", "warm")
+    {:ok, done} = Commands.issue("s", "src", "drain")
+    {:ok, _} = Commands.complete(done, "done", "drained")
+    {:ok, other} = Commands.issue("other", "src", "drain")
+
+    assert Commands.cancel_pending_drains("s") == 2, "both pending drains for s cancelled"
+
+    assert Commands.get(d1.id).status == "cancelled"
+    assert Commands.get(d2.id).status == "cancelled"
+    # A warm, an already-terminal drain, and another shard's drain are untouched.
+    assert Commands.get(warm.id).status == "pending"
+    assert Commands.get(done.id).status == "done"
+    assert Commands.get(other.id).status == "pending"
+
+    # Idempotent: nothing left pending.
+    assert Commands.cancel_pending_drains("s") == 0
+  end
 end

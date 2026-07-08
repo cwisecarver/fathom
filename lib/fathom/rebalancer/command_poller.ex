@@ -10,7 +10,9 @@ defmodule Fathom.Rebalancer.CommandPoller do
       cold-open revalidates/pulls correctly anyway — warm only trims the blip.
     * **drain** — `Fathom.Shards.drain/2` flushes + releases the lease so another node can
       acquire it. `:ok` ⇒ `done`; a `{:error, _}` (e.g. `:busy` — connections didn't drain
-      in time) ⇒ `failed`, and the orchestrator decides whether to retry.
+      in time) ⇒ `failed`, and the orchestrator decides whether to retry. Skipped
+      (`cancelled`) if the shard has no active pin when the poller reaches it — the handoff
+      reverted and the source is serving again (finding #7).
 
   Gated by `:command_poller` (default off). Only this node's poller matches a command
   addressed to this node's key, so there's no cross-node contention.
@@ -20,7 +22,7 @@ defmodule Fathom.Rebalancer.CommandPoller do
   require Logger
 
   alias Fathom.Rebalancer
-  alias Fathom.Rebalancer.Commands
+  alias Fathom.Rebalancer.{Commands, Overrides}
   alias Fathom.Shard.WarmFollower
   alias Fathom.Shards
 
@@ -79,10 +81,24 @@ defmodule Fathom.Rebalancer.CommandPoller do
 
   # Drain releases the lease. Failure (busy / drain_failed) is terminal-for-this-command;
   # the orchestrator re-issues if it still wants the move.
+  #
+  # Defense-in-depth for #7: re-check the pin immediately before draining. If the shard has
+  # no active pin (never pinned, or reverted → failed_at set), the handoff was abandoned and
+  # the source is serving again — draining now would strand it. Skip (cancel) instead. This
+  # covers the race where the poller picks up the drain between issue and cancel_pending.
   defp execute(%{command: "drain", shard_id: id} = cmd) do
-    case Shards.drain(id, drain_ms()) do
-      :ok -> Commands.complete(cmd, "done", "drained")
-      {:error, reason} -> Commands.complete(cmd, "failed", "drain failed (#{inspect(reason)})")
+    case Overrides.for_shard(id) do
+      %{failed_at: nil} ->
+        case Shards.drain(id, drain_ms()) do
+          :ok ->
+            Commands.complete(cmd, "done", "drained")
+
+          {:error, reason} ->
+            Commands.complete(cmd, "failed", "drain failed (#{inspect(reason)})")
+        end
+
+      _gone_or_reverted ->
+        Commands.complete(cmd, "cancelled", "pin reverted; drain skipped")
     end
   end
 

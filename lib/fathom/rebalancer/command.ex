@@ -12,7 +12,9 @@ defmodule Fathom.Rebalancer.Command do
   @type t :: %__MODULE__{}
 
   @commands ~w(warm drain)
-  @statuses ~w(pending done failed)
+  # `cancelled` — a drain that's no longer wanted (the handoff reverted before the source
+  # poller ran it, finding #7); terminal like done/failed but distinguishes "abandoned".
+  @statuses ~w(pending done failed cancelled)
 
   schema "rebalance_commands" do
     field :shard_id, :string

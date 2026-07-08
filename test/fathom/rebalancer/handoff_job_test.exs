@@ -9,7 +9,7 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
   use Oban.Testing, repo: Fathom.Repo
 
   alias Fathom.Rebalancer
-  alias Fathom.Rebalancer.{CommandPoller, HandoffJob, Overrides}
+  alias Fathom.Rebalancer.{CommandPoller, Commands, HandoffJob, Overrides}
   alias Fathom.Shards
 
   setup do
@@ -96,6 +96,10 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
     o = Overrides.for_shard(shard)
     assert o != nil, "override retained as a cooldown record after revert"
     assert o.failed_at != nil
+
+    # The pending drain (its await timed out) was cancelled on revert (#7), so the source
+    # poller can't fire it later against the restored source.
+    assert Commands.cancel_pending_drains(shard) == 0, "no pending drain left after revert"
   end
 
   test "period: :infinity — a second handoff for the same shard is deduped past 60s", %{

@@ -6,7 +6,7 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
   use Fathom.DataCase, async: false
 
   alias Fathom.Rebalancer
-  alias Fathom.Rebalancer.{CommandPoller, Commands}
+  alias Fathom.Rebalancer.{CommandPoller, Commands, Overrides}
   alias Fathom.Shards
 
   setup do
@@ -23,6 +23,10 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
 
   test "a drain command releases the shard on this node and marks the command done",
        %{shard: shard, node: node} do
+    # A real drain is always preceded by a pin (pin_and_flip runs before drain is issued);
+    # the poller re-checks the pin before draining (#7), so pin the shard first.
+    {:ok, _} = Overrides.pin(shard, node, reason: "test")
+
     # Open the shard here (starts a coordinator), then release the connection so drain
     # isn't blocked by an in-flight checkout.
     {:ok, pid, ref, _path} = Shards.checkout(shard)
@@ -36,6 +40,28 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     # The coordinator stopped (lease released) and the command is done.
     assert_receive {:DOWN, ^down, :process, ^pid, _reason}, 5_000
     assert Commands.get(cmd.id).status == "done"
+  end
+
+  test "a drain for a reverted shard is skipped + cancelled; the source is not drained (#7)",
+       %{shard: shard, node: node} do
+    # Regression for #7: the handoff reverted (pin marked failed) but a pending drain
+    # remained. The poller must NOT drain the now-serving source — it cancels the command
+    # instead. (Covers the race where the poller reaches the drain before cancel_pending.)
+    {:ok, _} = Overrides.pin(shard, node, reason: "test")
+    :ok = Overrides.mark_failed(shard)
+
+    {:ok, pid, ref, _path} = Shards.checkout(shard)
+    Fathom.Shard.checkin(pid, ref)
+    down = Process.monitor(pid)
+
+    {:ok, cmd} = Commands.issue(shard, node, "drain")
+    start_supervised!(CommandPoller)
+    assert CommandPoller.poll_now() == 1
+
+    assert Commands.get(cmd.id).status == "cancelled"
+    # The coordinator was NOT drained (still alive serving the source).
+    refute_receive {:DOWN, ^down, :process, ^pid, _}, 500
+    assert Process.alive?(pid)
   end
 
   test "only commands addressed to this node are executed", %{shard: shard} do

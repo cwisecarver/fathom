@@ -42,6 +42,24 @@ defmodule Fathom.Rebalancer.Commands do
   def get(id), do: Repo.get(Command, id)
 
   @doc """
+  Cancels every still-`pending` `drain` for `shard_id` (finding #7). Called on a handoff
+  revert so a drain whose `await` timed out (row left `pending`) can't fire later and drain
+  the source right after traffic was restored to it. Returns the number cancelled.
+  """
+  @spec cancel_pending_drains(String.t()) :: non_neg_integer()
+  def cancel_pending_drains(shard_id) do
+    {n, _} =
+      Repo.update_all(
+        from(c in Command,
+          where: c.shard_id == ^shard_id and c.command == "drain" and c.status == "pending"
+        ),
+        set: [status: "cancelled", detail: "handoff reverted", updated_at: DateTime.utc_now()]
+      )
+
+    n
+  end
+
+  @doc """
   Blocks until command `id` reaches a terminal status or `timeout_ms` elapses (polling
   every `poll_ms`). Returns `{:ok, command}` when `done`, `{:error, {:command_failed,
   detail}}` when `failed`, or `{:error, :timeout}`. Deadline is monotonic.

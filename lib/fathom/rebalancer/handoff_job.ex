@@ -66,6 +66,9 @@ defmodule Fathom.Rebalancer.HandoffJob do
         # the Policy cooldown, so a wedged hot shard backs off instead of re-proposing every
         # tick (finding #4).
         Overrides.mark_failed(shard)
+        # Cancel any drain whose await timed out (row still pending) so the source poller
+        # can't fire it after traffic was restored to the source (finding #7).
+        Commands.cancel_pending_drains(shard)
         LbApply.apply!()
         Logger.warning("rebalance: handoff #{shard} drain failed (#{inspect(reason)}); reverted")
         {:cancel, "drain failed after #{max} attempts; reverted to #{from}"}
