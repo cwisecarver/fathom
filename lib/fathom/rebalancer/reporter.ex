@@ -46,8 +46,12 @@ defmodule Fathom.Rebalancer.Reporter do
 
   @impl true
   def init(_opts) do
-    # Seed the baseline snapshot so the first published window is a real diff, not a
-    # cold-start spike (every cumulative counter would read as a rate otherwise).
+    # Take the baseline snapshot. NB (#18): the ControlPlane (this reporter) starts before
+    # the DataPlane's ShardLoad table (see application.ex), so at boot this snapshot is
+    # usually empty (`snapshot/0` rescues the missing table to []). The first published
+    # window then reads each shard's cumulative counter as a rate — but on a fresh boot the
+    # counters are ~0 (the shard just opened ~one interval ago), so the over-report is
+    # negligible, and `confirm_windows` masks a single inflated window regardless.
     state = %{prev: snapshot_map(), prev_mono: mono_ms()}
     schedule(interval_ms())
     {:ok, state}

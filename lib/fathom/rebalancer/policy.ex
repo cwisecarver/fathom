@@ -76,9 +76,15 @@ defmodule Fathom.Rebalancer.Policy do
     |> Enum.filter(&(&1.node_key in backend_keys))
     |> Enum.reject(&(&1.shard_id in cooling))
     |> Enum.filter(&confirmed_hot?(&1, samples, threshold, confirm))
-    |> Enum.sort_by(& &1.q_per_s, :desc)
+    # Hottest first, tie-broken by shard_id for a canonical (not iteration-order) choice (#18).
+    |> Enum.sort_by(&{-&1.q_per_s, &1.shard_id})
     |> plan_moves(node_load, backend_keys, threshold, max_moves)
   end
+
+  # max_moves ≤ 0 means "make no moves" — short-circuit before the reduce, which otherwise
+  # appended one move and only then checked the bound (#18).
+  defp plan_moves(_hot, _node_load, _backend_keys, _threshold, max_moves) when max_moves <= 0,
+    do: []
 
   # Walk the hot shards (hottest first), assigning each to the least-loaded viable target,
   # updating a running projected node-load so we don't pile several onto one target in a
@@ -130,7 +136,8 @@ defmodule Fathom.Rebalancer.Policy do
     |> Enum.reject(&(&1 == from))
     |> Enum.map(&{&1, Map.get(node_load, &1, 0.0)})
     |> Enum.filter(fn {_t, t_load} -> t_load + sample.q_per_s < from_load end)
-    |> Enum.min_by(fn {_t, t_load} -> t_load end, fn -> nil end)
+    # Least-loaded, tie-broken by node_key so equal-load targets resolve canonically (#18).
+    |> Enum.min_by(fn {t, t_load} -> {t_load, t} end, fn -> nil end)
     |> case do
       nil -> nil
       {target, _load} -> target
@@ -172,10 +179,17 @@ defmodule Fathom.Rebalancer.Policy do
   end
 
   defp cooling_shards(overrides, now, cooldown_ms) do
-    for o <- overrides,
-        DateTime.diff(now, o.updated_at, :millisecond) < cooldown_ms,
-        into: MapSet.new(),
-        do: o.shard_id
+    for o <- overrides, cooling?(o, now, cooldown_ms), into: MapSet.new(), do: o.shard_id
+  end
+
+  # A nil/absent updated_at can't happen on a persisted row (timestamps always set it), but
+  # guard it (#18): a nil would crash DateTime.diff and drop the whole tick. Treat it as
+  # cooling (conservative — don't move a shard whose pin time is unknown).
+  defp cooling?(o, now, cooldown_ms) do
+    case Map.get(o, :updated_at) do
+      nil -> true
+      ts -> DateTime.diff(now, ts, :millisecond) < cooldown_ms
+    end
   end
 
   defp percentile([], _), do: 0.0

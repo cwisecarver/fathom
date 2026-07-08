@@ -141,4 +141,43 @@ defmodule Fathom.Rebalancer.PolicyTest do
 
     assert propose(samples, floor: 500.0, confirm_windows: 2) == []
   end
+
+  test "max_moves <= 0 makes no moves (#18)" do
+    # Bound was checked AFTER appending, so max_moves: 0 still emitted one move.
+    samples = [
+      s("n1", "hot_1", 900, 10),
+      s("n1", "hot_1", 900, 0),
+      s("n1", "filler", 300, 0),
+      s("n3", "cool", 10, 0)
+    ]
+
+    assert propose(samples, floor: 500.0, confirm_windows: 2, max_moves: 0) == []
+  end
+
+  test "equal-load targets resolve canonically by node_key, not iteration order (#18)" do
+    # n2 and n3 are both at 0 (cold). The move must deterministically pick the
+    # lexicographically-smaller node_key (n2), not whatever the map yields first.
+    samples = [
+      s("n1", "hot_1", 900, 10),
+      s("n1", "hot_1", 900, 0),
+      s("n1", "filler", 300, 0)
+    ]
+
+    assert [move] = propose(samples, floor: 500.0, confirm_windows: 2)
+    assert move.to_node == "n2", "ties broken by node_key ascending"
+  end
+
+  test "a nil updated_at on an override doesn't crash propose (#18)" do
+    # A corrupt/absent updated_at must be guarded (treated as cooling), not crash the tick.
+    samples = [
+      s("n1", "hot_1", 900, 10),
+      s("n1", "hot_1", 900, 0),
+      s("n1", "filler", 300, 0),
+      s("n3", "cool", 10, 0)
+    ]
+
+    overrides = [%{shard_id: "hot_1", pinned_node: "n1", updated_at: nil}]
+    # hot_1 is treated as cooling (nil pin time), so it isn't moved — and nothing raises.
+    assert propose(samples, overrides, floor: 500.0, confirm_windows: 2) == []
+  end
 end
