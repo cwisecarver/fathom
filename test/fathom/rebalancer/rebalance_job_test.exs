@@ -69,6 +69,34 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
     assert job.args["to_node"] == "n3", "least-loaded target"
   end
 
+  test "an enabled tick re-renders the LB map from the override table (#10)" do
+    Application.put_env(:fathom, :rebalancer_enabled, true)
+    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+
+    map_path =
+      Path.join(System.tmp_dir!(), "fathom_reblb_#{System.unique_integer([:positive])}.conf")
+
+    prev_map = Application.get_env(:fathom, :lb_map_path)
+    Application.put_env(:fathom, :lb_map_path, map_path)
+
+    on_exit(fn ->
+      if is_nil(prev_map),
+        do: Application.delete_env(:fathom, :lb_map_path),
+        else: Application.put_env(:fathom, :lb_map_path, prev_map)
+
+      File.rm(map_path)
+      for f <- Path.wildcard(map_path <> ".tmp.*"), do: File.rm(f)
+    end)
+
+    {:ok, _} = Fathom.Rebalancer.Overrides.pin("hot_1", "n2", reason: "test")
+    # Drift: the on-disk map is missing the pin (a raced/failed prior apply).
+    File.write!(map_path, "# stale\n")
+
+    assert :ok = perform_job(RebalanceJob, %{})
+    # The periodic re-render healed the drift from the current override table.
+    assert File.read!(map_path) =~ "hot_1."
+  end
+
   test "an enabled tick sweeps the command channel: prunes terminal + expires stale (#12)" do
     Application.put_env(:fathom, :rebalancer_enabled, true)
     Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)

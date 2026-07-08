@@ -73,6 +73,21 @@ defmodule Fathom.Rebalancer.LbApplyTest do
     assert Path.wildcard(map_path <> ".tmp.*") == []
   end
 
+  test "a byte-identical re-render is a no-op: no rewrite, no reload (#10)", %{map_path: map_path} do
+    # Regression for #10: the leader re-renders every tick, so an unchanged render must skip
+    # the write + reload. `false` would fail the reload if invoked.
+    Application.put_env(:fathom, :lb_reload_cmd, "false")
+    {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
+
+    # First apply changes the file → reload runs → fails (surfaced).
+    assert {:error, {:reload_failed, _}} = LbApply.apply!()
+    mtime = File.stat!(map_path).mtime
+
+    # Second apply: identical render → no-op → reload NOT invoked → :ok, file untouched.
+    assert LbApply.apply!() == :ok
+    assert File.stat!(map_path).mtime == mtime
+  end
+
   test "a reload-command failure surfaces {:error, {:reload_failed, _}} but still promotes (#11)",
        %{map_path: map_path} do
     # Regression for #11: apply! must surface a reload failure (not swallow it as :ok) so the

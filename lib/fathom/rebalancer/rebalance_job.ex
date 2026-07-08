@@ -16,7 +16,7 @@ defmodule Fathom.Rebalancer.RebalanceJob do
   require Logger
 
   alias Fathom.Rebalancer
-  alias Fathom.Rebalancer.{Commands, HandoffJob, LoadSamples, Overrides, Policy}
+  alias Fathom.Rebalancer.{Commands, HandoffJob, LbApply, LoadSamples, Overrides, Policy}
 
   @sample_horizon_ms 120_000
   # Command retention (finding #12): terminal rows deleted after this; pending rows older
@@ -39,6 +39,12 @@ defmodule Fathom.Rebalancer.RebalanceJob do
     # rebalancer is enabled, so the enabled cron is the right home for the sweep.
     Commands.prune_terminal(command_retention_ms())
     Commands.expire_stale_pending(command_stale_ms())
+
+    # Re-render the full override table each tick (finding #10): the leader re-applies the
+    # LB map (a byte-identical render is a cheap no-op) so any drift between the DB table and
+    # the on-disk map — a raced apply!, a flip whose reload failed (#11) — self-heals within
+    # one tick without waiting for the next handoff.
+    LbApply.apply!()
 
     samples = LoadSamples.since(horizon_ms()) |> Enum.map(&Map.from_struct/1)
     overrides = Overrides.all()

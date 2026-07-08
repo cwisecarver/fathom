@@ -33,6 +33,11 @@ defmodule Fathom.Rebalancer.LbApply do
   require Logger
 
   alias Fathom.Rebalancer.LbMap
+  alias Fathom.Repo
+
+  # A fixed application key for the fleet-wide LB-map advisory lock (finding #10) — any
+  # constant unique to this lock; pg_advisory_lock takes a single bigint.
+  @lock_key 7_040_010_010
 
   @doc """
   Renders + promotes the map (atomic) and reloads the LB. Returns `:ok` when the flip is
@@ -49,6 +54,16 @@ defmodule Fathom.Rebalancer.LbApply do
   `:ok` also covers the decision-plane-only mode (`:lb_map_path` unset) and out-of-band
   reload (`:lb_reload_cmd` unset — e.g. the rig sidecar HUPs on the map's mtime), where the
   app legitimately can't confirm the reload and proceeds optimistically.
+
+  ## Serialized + idempotent (finding #10)
+
+  The render+write+reload runs under a fleet-wide Postgres **advisory lock** (held on one
+  checked-out connection), so two `apply!`s on different nodes can't interleave a stale read
+  with a later write and drop a pin from the *file* though it's in the DB. Each render reads
+  the full override table, so serialized last-writer-wins is correct. And a re-render that is
+  byte-identical to the on-disk file is a **no-op** (no write, no reload) — which is what
+  lets the leader `RebalanceJob` re-render every tick cheaply to self-heal drift (this),
+  dead-node pins (#1b), and failed reloads (#11) without HUPing nginx every minute.
   """
   @spec apply!() :: :ok | {:error, term()}
   def apply! do
@@ -58,14 +73,48 @@ defmodule Fathom.Rebalancer.LbApply do
         :ok
 
       path ->
-        promote(path, LbMap.current())
+        with_lock(fn -> promote(path, LbMap.current()) end)
     end
+  end
+
+  # Serialize apply! fleet-wide (finding #10). A SESSION advisory lock, so lock + inner
+  # queries + unlock must share one connection — Repo.checkout pins it (a transaction-scoped
+  # xact lock would hold a DB transaction open across the shell reload). Blocks a concurrent
+  # apply! on another node until this one finishes, then that one re-renders the now-current
+  # table.
+  defp with_lock(fun) do
+    Repo.checkout(fn ->
+      Repo.query!("SELECT pg_advisory_lock($1)", [@lock_key])
+
+      try do
+        fun.()
+      after
+        Repo.query!("SELECT pg_advisory_unlock($1)", [@lock_key])
+      end
+    end)
   end
 
   # Write the candidate to a same-dir temp, config-test it, then atomically rename it over
   # the live file. Any failure keeps the last-good file and leaves no partial behind. On a
-  # successful promotion the reload result (which may itself be an error) is surfaced.
+  # successful promotion the reload result (which may itself be an error) is surfaced. A
+  # render identical to the live file is a no-op (skip write + reload) so a periodic
+  # re-render doesn't HUP nginx on every tick.
   defp promote(path, content) do
+    if content == read_existing(path) do
+      :ok
+    else
+      write_test_promote(path, content)
+    end
+  end
+
+  defp read_existing(path) do
+    case File.read(path) do
+      {:ok, existing} -> existing
+      _ -> nil
+    end
+  end
+
+  defp write_test_promote(path, content) do
     tmp = "#{path}.tmp.#{System.unique_integer([:positive])}"
 
     with :ok <- File.write(tmp, content),
