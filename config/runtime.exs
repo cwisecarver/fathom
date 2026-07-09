@@ -158,6 +158,17 @@ if cmd = System.get_env("LB_TEST_CMD") do
   config :fathom, :lb_test_cmd, cmd
 end
 
+# Hard deadlines for the LB config-test / reload shell commands (review 2026-07-09 #2): a hung
+# command is killed at the deadline so it can't hold the fleet advisory lock / a pooled
+# connection. Defaults 10s each.
+if ms = System.get_env("LB_TEST_TIMEOUT_MS") do
+  config :fathom, :lb_test_timeout_ms, String.to_integer(ms)
+end
+
+if ms = System.get_env("LB_RELOAD_TIMEOUT_MS") do
+  config :fathom, :lb_reload_timeout_ms, String.to_integer(ms)
+end
+
 # The hot-detection floor (absolute q/s). Unset ⇒ the p99-relative rule. Accepts an integer
 # or float and raises at boot on an unusable value (finding #16) — a mis-set floor is an
 # operator footgun that would otherwise silently disable the rebalancer.

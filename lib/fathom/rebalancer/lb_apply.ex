@@ -55,15 +55,28 @@ defmodule Fathom.Rebalancer.LbApply do
   reload (`:lb_reload_cmd` unset — e.g. the rig sidecar HUPs on the map's mtime), where the
   app legitimately can't confirm the reload and proceeds optimistically.
 
-  ## Serialized + idempotent (finding #10)
+  ## Serialized + idempotent (finding #10, hardened by review 2026-07-09 #2)
 
-  The render+write+reload runs under a fleet-wide Postgres **advisory lock** (held on one
-  checked-out connection), so two `apply!`s on different nodes can't interleave a stale read
+  The **file production** (render + config-test + atomic rename) runs under a fleet-wide
+  Postgres advisory lock, so two `apply!`s on different nodes can't interleave a stale read
   with a later write and drop a pin from the *file* though it's in the DB. Each render reads
-  the full override table, so serialized last-writer-wins is correct. And a re-render that is
-  byte-identical to the on-disk file is a **no-op** (no write, no reload) — which is what
-  lets the leader `RebalanceJob` re-render every tick cheaply to self-heal drift (this),
-  dead-node pins (#1b), and failed reloads (#11) without HUPing nginx every minute.
+  the full override table, so serialized last-writer-wins is correct. A re-render that is
+  byte-identical to the on-disk file is a **no-op** (no write, no reload) — which is what lets
+  the leader `RebalanceJob` re-render every tick cheaply to self-heal drift (this), dead-node
+  pins (#1b), and failed reloads (#11) without HUPing nginx every minute.
+
+  Two hardening properties keep a bad LB from freezing the fleet:
+
+  - The **shell reload runs OUTSIDE the lock** (only the file production is inside), and every
+    shell call — the config-test and the reload — is **hard-timeout-bounded** (killed at the
+    deadline). A hung `nginx -t`/`-s reload` can no longer hold the pooled connection + the
+    fleet lock indefinitely and freeze every node's LB updates.
+  - The lock is `pg_try_advisory_lock` (non-blocking): a waiter degrades to skipping this tick
+    (`{:error, :lock_contended}`) rather than blocking a pooled connection behind a slow
+    holder. The DB override is already committed, so the leader's periodic re-render applies
+    it within a tick and a handoff's own `apply!` retries.
+
+  Config: `:lb_test_timeout_ms` / `:lb_reload_timeout_ms` (both default 10_000).
   """
   @spec apply!() :: :ok | {:error, term()}
   def apply! do
@@ -74,45 +87,99 @@ defmodule Fathom.Rebalancer.LbApply do
         :ok
 
       path ->
-        with_lock(fn -> promote(path, LbMap.current()) end)
+        promote_then_reload(path)
+    end
+  end
+
+  # Produce the authoritative file UNDER the advisory lock (render + config-test + atomic
+  # rename — the part that must serialize fleet-wide, #10), then reload OUTSIDE the lock so a
+  # slow/hung reload can't hold the pooled connection + the fleet lock indefinitely and freeze
+  # every node's LB updates (review 2026-07-09 #2). The reload result still flows into the
+  # return so the handoff knows whether the flip went live (#11).
+  defp promote_then_reload(path) do
+    case with_lock(fn -> produce(path) end) do
+      {:changed, :ok} ->
+        case reload() do
+          :ok ->
+            emit(:applied)
+            :ok
+
+          {:error, _} = err ->
+            emit(reload_outcome(err))
+            err
+        end
+
+      {:unchanged, :ok} ->
+        emit(:noop)
+        :ok
+
+      {:error, reason} ->
+        emit(promote_error_outcome(reason))
+        {:error, reason}
+
+      :contended ->
+        # Another node/handoff holds the lock right now — skip this tick rather than block a
+        # pooled connection on it. The DB override is already committed, so the leader's
+        # periodic re-render applies it within a tick and a handoff's own apply! retries;
+        # return an error so a handoff doesn't drain against a flip that isn't live yet (#11).
+        emit(:lock_contended)
+        {:error, :lock_contended}
     end
   end
 
   # The LB-apply health signal (rebalancer telemetry): a rising :reload_failed /
-  # :config_test_failed is the fleet-routing-at-risk alert (#3/#11); :noop dominates (the
-  # per-tick re-render) and confirms the loop is live; :applied is a real flip.
+  # :reload_timeout / :config_test_failed is the fleet-routing-at-risk alert (#3/#11); :noop
+  # dominates (the per-tick re-render) and confirms the loop is live; :applied is a real flip.
   defp emit(outcome) do
     :telemetry.execute([:fathom, :rebalancer, :lb_apply], %{count: 1}, %{outcome: outcome})
   end
 
-  # Serialize apply! fleet-wide (finding #10). A SESSION advisory lock, so lock + inner
-  # queries + unlock must share one connection — Repo.checkout pins it (a transaction-scoped
-  # xact lock would hold a DB transaction open across the shell reload). Blocks a concurrent
-  # apply! on another node until this one finishes, then that one re-renders the now-current
-  # table.
+  # Non-blocking advisory lock (finding #10, hardened per review 2026-07-09 #2): pg_TRY, so a
+  # waiter degrades to :contended (skip this tick) instead of blocking a pooled connection —
+  # a hung holder would otherwise stack blocked waiters against the pool AND freeze fleet-wide
+  # LB updates. A SESSION lock, so lock + inner queries + unlock share one Repo.checkout'd
+  # connection. Only the file production runs inside; the shell reload is outside (see apply!).
   defp with_lock(fun) do
     Repo.checkout(fn ->
-      Repo.query!("SELECT pg_advisory_lock($1)", [@lock_key])
+      case Repo.query!("SELECT pg_try_advisory_lock($1)", [@lock_key]) do
+        %{rows: [[true]]} ->
+          try do
+            fun.()
+          after
+            Repo.query!("SELECT pg_advisory_unlock($1)", [@lock_key])
+          end
 
-      try do
-        fun.()
-      after
-        Repo.query!("SELECT pg_advisory_unlock($1)", [@lock_key])
+        _ ->
+          :contended
       end
     end)
   end
 
-  # Write the candidate to a same-dir temp, config-test it, then atomically rename it over
-  # the live file. Any failure keeps the last-good file and leaves no partial behind. On a
-  # successful promotion the reload result (which may itself be an error) is surfaced. A
-  # render identical to the live file is a no-op (skip write + reload) so a periodic
-  # re-render doesn't HUP nginx on every tick.
-  defp promote(path, content) do
+  # The advisory-locked critical section: render + no-op check + write same-dir temp +
+  # config-test + atomic rename. NO reload here. Returns `{:changed, :ok}` (promoted a new
+  # file), `{:unchanged, :ok}` (byte-identical — skip), or `{:error, reason}` (kept last-good).
+  defp produce(path) do
+    content = LbMap.current()
+
     if content == read_existing(path) do
-      emit(:noop)
-      :ok
+      {:unchanged, :ok}
     else
-      write_test_promote(path, content)
+      tmp = "#{path}.tmp.#{System.unique_integer([:positive])}"
+
+      with :ok <- File.write(tmp, content),
+           :ok <- config_test(tmp),
+           :ok <- File.rename(tmp, path) do
+        {:changed, :ok}
+      else
+        {:error, reason} ->
+          File.rm(tmp)
+
+          Logger.error(
+            "rebalancer: LB map not promoted (#{inspect(reason)}); kept last-good #{path}"
+          )
+
+          {:error, reason}
+      end
     end
   end
 
@@ -123,40 +190,21 @@ defmodule Fathom.Rebalancer.LbApply do
     end
   end
 
-  defp write_test_promote(path, content) do
-    tmp = "#{path}.tmp.#{System.unique_integer([:positive])}"
-
-    with :ok <- File.write(tmp, content),
-         :ok <- config_test(tmp),
-         :ok <- File.rename(tmp, path) do
-      result = reload()
-      emit(reload_outcome(result))
-      result
-    else
-      {:error, reason} ->
-        File.rm(tmp)
-
-        Logger.error(
-          "rebalancer: LB map not promoted (#{inspect(reason)}); kept last-good #{path}"
-        )
-
-        emit(promote_error_outcome(reason))
-        {:error, reason}
-    end
-  end
-
   # The map was promoted; classify by whether the running LB picked it up.
-  defp reload_outcome(:ok), do: :applied
   defp reload_outcome({:error, {:reload_failed, _}}), do: :reload_failed
+  defp reload_outcome({:error, {:reload_timeout, _}}), do: :reload_timeout
   defp reload_outcome({:error, {:reload_raised, _}}), do: :reload_raised
 
   # The map was NOT promoted (last-good kept); classify the pre-promotion failure.
   defp promote_error_outcome({:config_test_failed, _, _}), do: :config_test_failed
   defp promote_error_outcome({:config_test_raised, _}), do: :config_test_failed
+  defp promote_error_outcome({:config_test_timeout, _}), do: :config_test_timeout
   defp promote_error_outcome(_), do: :write_failed
 
   # Optional operator config test of the candidate before promotion. `{}` in the command is
   # replaced with the candidate path; it's also exported as LB_MAP_CANDIDATE. Unset ⇒ :ok.
+  # Runs inside the advisory lock, so it is HARD-timeout-bounded (review 2026-07-09 #2) — a
+  # hung `nginx -t` must not hold the fleet lock.
   defp config_test(candidate) do
     case Application.get_env(:fathom, :lb_test_cmd) do
       nil ->
@@ -165,38 +213,59 @@ defmodule Fathom.Rebalancer.LbApply do
       cmd ->
         full = String.replace(cmd, "{}", candidate)
 
-        {out, code} =
-          System.shell(full, stderr_to_stdout: true, env: [{"LB_MAP_CANDIDATE", candidate}])
-
-        if code == 0,
-          do: :ok,
-          else: {:error, {:config_test_failed, code, String.trim(out)}}
+        case run_shell(full, config_test_timeout_ms(), [{"LB_MAP_CANDIDATE", candidate}]) do
+          {:ok, {_out, 0}} -> :ok
+          {:ok, {out, code}} -> {:error, {:config_test_failed, code, String.trim(out)}}
+          :timeout -> {:error, {:config_test_timeout, config_test_timeout_ms()}}
+          {:error, msg} -> {:error, {:config_test_raised, msg}}
+        end
     end
-  rescue
-    e -> {:error, {:config_test_raised, Exception.message(e)}}
   end
 
   # Unset ⇒ out-of-band reload (the sidecar HUPs on mtime); can't confirm, so :ok. A set
-  # command that exits non-zero / raises surfaces {:error, ...} so the handoff won't drain
-  # against a flip that may not be live (finding #11).
+  # command that exits non-zero / times out / raises surfaces {:error, ...} so the handoff
+  # won't drain against a flip that may not be live (finding #11). Runs OUTSIDE the lock, and
+  # hard-timeout-bounded so a hung reload can't hang the caller.
   defp reload do
     case Application.get_env(:fathom, :lb_reload_cmd) do
       nil ->
         :ok
 
       cmd ->
-        {out, code} = System.shell(cmd, stderr_to_stdout: true)
+        case run_shell(cmd, reload_timeout_ms(), []) do
+          {:ok, {_out, 0}} ->
+            :ok
 
-        if code == 0 do
-          :ok
-        else
-          Logger.warning("rebalancer: LB reload `#{cmd}` exited #{code}: #{String.trim(out)}")
-          {:error, {:reload_failed, code}}
+          {:ok, {out, code}} ->
+            Logger.warning("rebalancer: LB reload `#{cmd}` exited #{code}: #{String.trim(out)}")
+            {:error, {:reload_failed, code}}
+
+          :timeout ->
+            Logger.warning("rebalancer: LB reload `#{cmd}` timed out (#{reload_timeout_ms()}ms)")
+            {:error, {:reload_timeout, reload_timeout_ms()}}
+
+          {:error, msg} ->
+            Logger.warning("rebalancer: LB reload raised: #{msg}")
+            {:error, {:reload_raised, msg}}
         end
     end
-  rescue
-    e ->
-      Logger.warning("rebalancer: LB reload raised: #{Exception.message(e)}")
-      {:error, {:reload_raised, Exception.message(e)}}
   end
+
+  # Run a shell command with a hard deadline: on timeout the task is killed so the command
+  # can't hold the caller (and, for the config-test, the advisory lock) indefinitely (review
+  # 2026-07-09 #2). Returns {:ok, {out, code}} | :timeout | {:error, message}. (A killed BEAM
+  # task closes the port; a truly-wedged OS process may linger — an operator concern, but it
+  # no longer holds any BEAM/DB resource.)
+  defp run_shell(cmd, timeout_ms, env) do
+    task = Task.async(fn -> System.shell(cmd, stderr_to_stdout: true, env: env) end)
+
+    case Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {out, code}} -> {:ok, {out, code}}
+      {:exit, reason} -> {:error, inspect(reason)}
+      nil -> :timeout
+    end
+  end
+
+  defp config_test_timeout_ms, do: Application.get_env(:fathom, :lb_test_timeout_ms, 10_000)
+  defp reload_timeout_ms, do: Application.get_env(:fathom, :lb_reload_timeout_ms, 10_000)
 end

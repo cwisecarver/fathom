@@ -73,6 +73,45 @@ defmodule Fathom.Rebalancer.LbApplyTest do
     assert Path.wildcard(map_path <> ".tmp.*") == []
   end
 
+  test "a hung reload is killed at the deadline, not held indefinitely (#2)", %{
+    map_path: map_path
+  } do
+    # Regression for #2: System.shell had no timeout, so a wedged reload blocked forever while
+    # (pre-restructure) holding the pooled connection + fleet advisory lock. Now it's killed at
+    # the deadline and surfaced as {:reload_timeout, _}.
+    Application.put_env(:fathom, :lb_reload_cmd, "sleep 30")
+    Application.put_env(:fathom, :lb_reload_timeout_ms, 200)
+    on_exit(fn -> Application.delete_env(:fathom, :lb_reload_timeout_ms) end)
+    {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
+
+    {elapsed_us, result} = :timer.tc(fn -> LbApply.apply!() end)
+
+    assert {:error, {:reload_timeout, 200}} = result
+    assert elapsed_us < 5_000_000, "reload killed at ~200ms, not after 30s"
+    # The map was still PROMOTED (produced under the lock before the out-of-lock reload).
+    assert File.read!(map_path) =~ "hot_1."
+  end
+
+  test "a hung config-test (inside the lock) is killed at the deadline (#2)", %{
+    map_path: map_path
+  } do
+    # The config-test runs inside the advisory lock, so a hang would freeze fleet-wide LB
+    # updates — it must be hard-timeout-bounded. On timeout the candidate is not promoted.
+    File.write!(map_path, "# last-good\n")
+    Application.put_env(:fathom, :lb_test_cmd, "sleep 30")
+    Application.put_env(:fathom, :lb_test_timeout_ms, 200)
+    on_exit(fn -> Application.delete_env(:fathom, :lb_test_timeout_ms) end)
+    {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
+
+    {elapsed_us, result} = :timer.tc(fn -> LbApply.apply!() end)
+
+    assert {:error, {:config_test_timeout, 200}} = result
+    assert elapsed_us < 5_000_000
+
+    assert File.read!(map_path) == "# last-good\n",
+           "candidate not promoted on config-test timeout"
+  end
+
   test "a byte-identical re-render is a no-op: no rewrite, no reload (#10)", %{map_path: map_path} do
     # Regression for #10: the leader re-renders every tick, so an unchanged render must skip
     # the write + reload. `false` would fail the reload if invoked.
