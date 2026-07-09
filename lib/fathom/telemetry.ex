@@ -126,6 +126,11 @@ defmodule Fathom.Telemetry do
       counter("fathom.rebalancer.reconcile.unpinned.count",
         event_name: [:fathom, :rebalancer, :reconcile, :unpinned],
         description: "Pins unpinned because their node went dead (#1b) — dead-node reconcile rate"
+      ),
+      counter("fathom.rebalancer.reconcile.divergence.count",
+        event_name: [:fathom, :rebalancer, :reconcile, :divergence],
+        description:
+          "A pinned node stopped BEATING but still HOLDS the shard's S3 lease — reporter/data-plane divergence; the pin was kept (fail-safe). Sustained > 0 ⇒ investigate a wedged/off Reporter"
       )
     ]
   end

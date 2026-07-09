@@ -230,6 +230,26 @@ defmodule Fathom.Shard.Storage.Local do
   end
 
   @impl true
+  def lease_holder(shard_id) do
+    now = Storage.now_ms()
+
+    case read_lock(shard_id) do
+      {:ok, %{owner: other, expires_at_ms: lock_exp}} ->
+        case owner_live?(other, now, lock_exp) do
+          :live -> {:held, other}
+          :dead -> :free
+          {:error, reason} -> {:error, reason}
+        end
+
+      :enoent ->
+        :free
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @impl true
   def check_lease(shard_id, %{owner: owner, epoch: epoch}) do
     # NO mutex here (expert review #28 follow-up): check_lease is the read-only flush
     # fence, called on every durability flush and every lapse revalidation — a hot path.

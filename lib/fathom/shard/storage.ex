@@ -133,6 +133,15 @@ defmodule Fathom.Shard.Storage do
   @callback check_lease(shard_id :: String.t(), lease :: lease()) ::
               :ok | {:error, :superseded} | {:error, term()}
 
+  # Read-only ownership probe: is `shard_id` currently owned by a LIVE node (its lock's
+  # owner has a fresh heartbeat, per the same `owner_live?` rule `acquire_lease` uses)?
+  # `{:held, owner}` = a live owner holds it; `:free` = no lock or the owner is dead
+  # (stealable). Does NOT mutate anything (unlike `acquire_lease`). The rebalancer's
+  # dead-node reconciler uses this as the authoritative data-plane liveness check before
+  # unpinning — the reporter beat is only a cheap prefilter.
+  @callback lease_holder(shard_id :: String.t()) ::
+              {:held, String.t()} | :free | {:error, term()}
+
   # Per-node liveness heartbeat (one object per node, not per shard).
   @callback renew_heartbeat(owner :: String.t(), ttl_ms :: pos_integer()) ::
               {:ok, heartbeat()} | {:error, term()}
@@ -218,6 +227,15 @@ defmodule Fathom.Shard.Storage do
   """
   @spec check_lease(String.t(), lease()) :: :ok | {:error, :superseded} | {:error, term()}
   def check_lease(shard_id, lease), do: backend().check_lease(shard_id, lease)
+
+  @doc """
+  Read-only ownership probe: `{:held, owner}` if `shard_id` is owned by a live node,
+  `:free` if no lock exists or its owner is dead (stealable), `{:error, reason}` on a
+  transient store error. Never mutates. The rebalancer reconciler uses this as the
+  authoritative "is this shard's data plane alive?" check before unpinning a dead node.
+  """
+  @spec lease_holder(String.t()) :: {:held, String.t()} | :free | {:error, term()}
+  def lease_holder(shard_id), do: backend().lease_holder(shard_id)
 
   @doc """
   Renews this node's liveness heartbeat (`owner`), extending its expiry by `ttl_ms`.

@@ -79,6 +79,7 @@ defmodule Fathom.Rebalancer.Policy do
     max_moves = Keyword.get(opts, :max_moves, cfg(:rebalance_max_moves, 1))
     warm_locations = Keyword.get(opts, :warm_locations, %{})
     band = Keyword.get(opts, :locality_band, cfg(:rebalance_locality_band, 0.5)) / 1.0
+    alive_nodes = Keyword.get(opts, :alive_nodes)
     now = Keyword.get(opts, :now, DateTime.utc_now())
 
     latest = latest_per_shard(samples)
@@ -87,6 +88,11 @@ defmodule Fathom.Rebalancer.Policy do
     node_load = node_load(latest)
     cooling = cooling_shards(overrides, now, cooldown_ms)
     backend_keys = Map.keys(backends)
+    # Only a node that's actually reporting is a viable handoff TARGET (review 2026-07-09 #1):
+    # a silent/dead backend reads as load 0.0 (the most attractive target) but pinning to it
+    # would be unavailable + immediately reconciled. The SOURCE filter stays `backend_keys`
+    # (a hot shard's current node is inherently reporting).
+    target_keys = target_keys(backend_keys, alive_nodes)
 
     latest
     |> Map.values()
@@ -96,7 +102,17 @@ defmodule Fathom.Rebalancer.Policy do
     |> Enum.filter(&confirmed_hot?(&1, samples, threshold, confirm))
     # Hottest first, tie-broken by shard_id for a canonical (not iteration-order) choice (#18).
     |> Enum.sort_by(&{-&1.q_per_s, &1.shard_id})
-    |> plan_moves(node_load, backend_keys, threshold, max_moves, warm_locations, band)
+    |> plan_moves(node_load, target_keys, threshold, max_moves, warm_locations, band)
+  end
+
+  # The viable target set: reporting nodes only. nil / empty alive ⇒ don't filter (fail-open —
+  # the beat mechanism may be nascent, and the reconciler also fails open on an empty alive set).
+  defp target_keys(backend_keys, nil), do: backend_keys
+
+  defp target_keys(backend_keys, alive) do
+    if MapSet.size(alive) == 0,
+      do: backend_keys,
+      else: Enum.filter(backend_keys, &MapSet.member?(alive, &1))
   end
 
   # max_moves ≤ 0 means "make no moves" — short-circuit before the reduce, which otherwise

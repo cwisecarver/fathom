@@ -137,6 +137,32 @@ defmodule Fathom.Rebalancer.PolicyTest do
     assert one.shard_id == "hot_a"
   end
 
+  test "excludes a non-reporting (silent) backend from target selection (#1)" do
+    # n2 is a configured backend but NOT beating (no samples → reads as load 0.0, the most
+    # attractive target); n3 is cold but alive. A move to the silent n2 would be unavailable
+    # and immediately reconciled, so the alive set must exclude it.
+    samples = [
+      s("n1", "hot_1", 900, 10),
+      s("n1", "hot_1", 900, 0),
+      s("n1", "filler", 300, 0),
+      s("n3", "y", 100, 0)
+    ]
+
+    # Without the alive filter, the silent n2 (0.0) is picked — the pre-fix hazard.
+    assert [cold] = propose(samples, floor: 500.0, confirm_windows: 2)
+    assert cold.to_node == "n2"
+
+    # With the alive set excluding n2, the move goes to the reporting n3.
+    assert [move] =
+             propose(samples,
+               floor: 500.0,
+               confirm_windows: 2,
+               alive_nodes: MapSet.new(["n1", "n3"])
+             )
+
+    assert move.to_node == "n3", "non-reporting n2 excluded; move goes to the live n3"
+  end
+
   test "affinity: prefers a warm target within the load band over the cold least-loaded (#C)" do
     # n1 overloaded (hot_1 900 + filler 300 = 1200). Viable targets: n2 @ 10 (coldest) and
     # n3 @ 100 (warm for hot_1, well within the band). Affinity sends it to the warm n3.

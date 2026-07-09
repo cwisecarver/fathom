@@ -72,6 +72,28 @@ defmodule Fathom.ShardLeaseTest do
 
   # ── Storage lease primitive ──
 
+  test "lease_holder: read-only probe — free, held-by-live, free-once-dead (review 2026-07-09 #1)",
+       %{shard: shard} do
+    # No lock → free.
+    assert Storage.lease_holder(shard) == :free
+
+    # A foreign owner with a fresh lock (no heartbeat → TTL fallback → live) → held.
+    put_raw_lock(shard, "a@node", 1, now_ms() + 30_000)
+    assert {:held, "a@node"} = Storage.lease_holder(shard)
+
+    # A live heartbeat also reports held.
+    put_raw_heartbeat("a@node", now_ms() + 30_000)
+    assert {:held, "a@node"} = Storage.lease_holder(shard)
+
+    # An expired lock past the steal margin with no fresh heartbeat → dead → free (stealable).
+    File.rm(Path.join([@remote_dir, "heartbeats", URI.encode_www_form("a@node")]))
+    put_raw_lock(shard, "a@node", 1, now_ms() - 60_000)
+    assert Storage.lease_holder(shard) == :free
+
+    # Read-only: the lock is still exactly what we put (owner a@node / epoch 1), not reclaimed.
+    assert :ok = Storage.check_lease(shard, %{owner: "a@node", epoch: 1})
+  end
+
   test "acquire on a fresh shard returns epoch 1; a live owner blocks other owners",
        %{shard: shard} do
     assert {:ok, %{owner: "a@node", epoch: 1}} = Storage.acquire_lease(shard, "a@node", 60_000)

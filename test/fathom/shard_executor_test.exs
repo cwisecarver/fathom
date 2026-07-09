@@ -302,6 +302,46 @@ defmodule Fathom.ShardExecutorTest do
     assert Fathom.Application.check_template_default!() == nil
   end
 
+  # Review 2026-07-09 #1: the rebalancer keys its exception table + dead-node reconciler on
+  # node_key = an lb_backends key; a NODE_KEY↔lb_backends mismatch makes every pin look dead
+  # and unpins the fleet each tick. Prod must refuse to boot with that config.
+  test "the boot guard refuses a prod NODE_KEY that isn't an lb_backends key" do
+    prev_env = Application.get_env(:fathom, :env)
+    prev_backends = Application.get_env(:fathom, :lb_backends)
+    prev_key = Application.get_env(:fathom, :node_key)
+
+    on_exit(fn ->
+      Application.put_env(:fathom, :env, prev_env)
+      restore_env(:lb_backends, prev_backends)
+      restore_env(:node_key, prev_key)
+    end)
+
+    Application.put_env(:fathom, :env, :prod)
+    Application.put_env(:fathom, :lb_backends, %{"fathom1" => "fathom1:8080"})
+    Application.put_env(:fathom, :node_key, "fathom9")
+
+    assert_raise RuntimeError, ~r/not a key of :lb_backends/, fn ->
+      Fathom.Application.check_rebalancer_config!()
+    end
+
+    # A matching NODE_KEY boots fine.
+    Application.put_env(:fathom, :node_key, "fathom1")
+    assert Fathom.Application.check_rebalancer_config!() == nil
+
+    # Inert when :lb_backends is unset (no rebalancer fleet), and outside prod.
+    Application.delete_env(:fathom, :lb_backends)
+    Application.put_env(:fathom, :node_key, "anything")
+    assert Fathom.Application.check_rebalancer_config!() == nil
+
+    Application.put_env(:fathom, :env, :test)
+    Application.put_env(:fathom, :lb_backends, %{"fathom1" => "x"})
+    Application.put_env(:fathom, :node_key, "mismatch")
+    assert Fathom.Application.check_rebalancer_config!() == nil
+  end
+
+  defp restore_env(k, nil), do: Application.delete_env(:fathom, k)
+  defp restore_env(k, v), do: Application.put_env(:fathom, k, v)
+
   # Expert review #9: template capture replays a shard's SQL fleet-wide, and AGENTS.md forbids a
   # prod template without auth on that shard — but no guard enforced it, so an anonymously
   # reachable template shard (auth :disabled, one Host header away) could poison a fleet version

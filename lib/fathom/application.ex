@@ -21,6 +21,7 @@ defmodule Fathom.Application do
     check_template_auth!()
     Fathom.HranaAuth.check_config!()
     check_storage_fence!()
+    check_rebalancer_config!()
 
     # Grouped into plane sub-supervisors (each with its own restart budget) rather than
     # one flat list, so a control-plane restart-storm (e.g. Repo) is contained to its
@@ -66,6 +67,27 @@ defmodule Fathom.Application do
                 "anonymous default traffic would drive fleet-wide template capture (finding #17). " <>
                 "Set :default_shard to a non-template shard, or leave it unset to fail closed."
       end
+    end
+  end
+
+  # Review 2026-07-09 #1: the rebalancer keys its exception table AND the dead-node reconciler
+  # on `node_key`, which must equal one of the `:lb_backends` keys. If NODE_KEY drifts from the
+  # lb_backends key for this node, NO `pinned_node` is ever in the reconciler's `alive` set, so
+  # every pin looks dead and the fleet is unpinned every tick — a silent total defeat. Fail
+  # closed at boot instead. Prod-only + only when :lb_backends is configured (the rebalancer
+  # fleet posture); dev/test leave it empty so the guard is inert.
+  @doc false
+  def check_rebalancer_config! do
+    backends = Application.get_env(:fathom, :lb_backends, %{})
+    node_key = Fathom.Rebalancer.node_key()
+
+    if Application.get_env(:fathom, :env) == :prod and map_size(backends) > 0 and
+         not Map.has_key?(backends, node_key) do
+      raise "config error: NODE_KEY (#{inspect(node_key)}) is not a key of :lb_backends " <>
+              "(#{inspect(Map.keys(backends))}). The rebalancer keys the exception table + the " <>
+              "dead-node reconciler on node_key = an lb_backends key; a mismatch makes every pin " <>
+              "look dead and unpins the whole fleet each tick (review 2026-07-09 #1). Set NODE_KEY " <>
+              "to this node's lb_backends key."
     end
   end
 

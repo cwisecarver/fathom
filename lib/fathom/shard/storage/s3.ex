@@ -740,6 +740,26 @@ defmodule Fathom.Shard.Storage.S3 do
   # --- leasing ---
 
   @impl true
+  def lease_holder(shard_id) do
+    now = Storage.now_ms()
+
+    case get_lock(shard_id) do
+      {:ok, %{owner: other, expires_at_ms: lock_exp}, _etag} ->
+        case owner_live?(other, now, lock_exp) do
+          :live -> {:held, other}
+          :dead -> :free
+          {:error, reason} -> {:error, reason}
+        end
+
+      :not_found ->
+        :free
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @impl true
   def acquire_lease(shard_id, owner, ttl_ms) do
     now = Storage.now_ms()
 

@@ -16,6 +16,7 @@ defmodule Fathom.Rebalancer.RebalanceJob do
   require Logger
 
   alias Fathom.Rebalancer
+  alias Fathom.Shard.Storage
 
   alias Fathom.Rebalancer.{
     Commands,
@@ -56,10 +57,14 @@ defmodule Fathom.Rebalancer.RebalanceJob do
     Commands.prune_terminal(command_retention_ms())
     Commands.expire_stale_pending(command_stale_ms())
 
+    # The live fleet (nodes beating within the staleness window) — the reconciler prefilter
+    # AND the policy's viable-target set. Computed once (review 2026-07-09 #1).
+    alive = Nodes.alive(node_stale_ms())
+
     # Unpin any shard pinned to a dead node (finding #1b) BEFORE the re-render, so the shard
     # returns to the hash pool (re-homes to a survivor — #1a already routes it there) instead
     # of staying pinned to a node that isn't coming back.
-    reconcile_dead_pins()
+    reconcile_dead_pins(alive)
 
     # Re-render the full override table each tick (finding #10): the leader re-applies the
     # LB map (a byte-identical render is a cheap no-op) so any drift between the DB table and
@@ -80,7 +85,8 @@ defmodule Fathom.Rebalancer.RebalanceJob do
 
     case Policy.propose(samples, overrides, backends,
            fleet_p99: fleet_p99,
-           warm_locations: warm_locations
+           warm_locations: warm_locations,
+           alive_nodes: alive
          ) do
       [] ->
         :ok
@@ -94,17 +100,27 @@ defmodule Fathom.Rebalancer.RebalanceJob do
 
   # Unpin overrides whose pinned_node isn't in the live fleet (finding #1b). FAIL OPEN: if
   # nothing is beating (fresh deploy, or the beat mechanism is down), the alive set is empty
-  # and we unpin NOTHING — we only yank a pin when we have positive evidence the fleet is
-  # beating AND this node isn't. Already-failed rows are cooldown records that don't route,
-  # so they're left alone.
-  defp reconcile_dead_pins do
-    alive = Nodes.alive(node_stale_ms())
-
+  # and we unpin NOTHING — we only reconcile when we have positive evidence the fleet is
+  # beating. Already-failed rows are cooldown records that don't route, so they're left alone.
+  defp reconcile_dead_pins(alive) do
     if MapSet.size(alive) > 0 do
       Overrides.all()
       |> Enum.reject(& &1.failed_at)
       |> Enum.reject(&MapSet.member?(alive, &1.pinned_node))
-      |> Enum.each(fn o ->
+      |> Enum.each(&reconcile_candidate/1)
+    end
+  end
+
+  # `pinned_node` isn't beating (the cheap reporter-beat prefilter). But the reporter beat is
+  # NOT the data-plane liveness the lease respects — a node whose Reporter died while its data
+  # plane keeps serving still holds the shard's S3 lease (review 2026-07-09 #1). Confirm
+  # against the AUTHORITATIVE per-shard signal before unpinning: unpin ONLY when the lease is
+  # free; on `{:held,_}` (the node is alive after all) or a store error, KEEP the pin
+  # (fail-safe — unpinning a live-owned shard would route it to a node that can't steal the
+  # held lease → unavailable) and flag the reporter-vs-data-plane divergence.
+  defp reconcile_candidate(o) do
+    case Storage.lease_holder(o.shard_id) do
+      :free ->
         Overrides.unpin(o.shard_id)
 
         :telemetry.execute([:fathom, :rebalancer, :reconcile, :unpinned], %{count: 1}, %{
@@ -113,10 +129,27 @@ defmodule Fathom.Rebalancer.RebalanceJob do
         })
 
         Logger.warning(
-          "rebalance: unpinned #{o.shard_id} — node #{o.pinned_node} not live (re-homing)"
+          "rebalance: unpinned #{o.shard_id} — #{o.pinned_node} not live (S3 lease free); re-homing"
         )
-      end)
+
+      {:held, owner} ->
+        divergence(o, "S3 lease held by #{owner}")
+
+      {:error, reason} ->
+        divergence(o, "S3 lease check failed (#{inspect(reason)})")
     end
+  end
+
+  defp divergence(o, why) do
+    :telemetry.execute([:fathom, :rebalancer, :reconcile, :divergence], %{count: 1}, %{
+      shard_id: o.shard_id,
+      node: o.pinned_node
+    })
+
+    Logger.warning(
+      "rebalance: kept pin #{o.shard_id} — #{o.pinned_node} isn't beating but #{why}; " <>
+        "reporter/data-plane divergence, not unpinning (fail-safe)"
+    )
   end
 
   defp enqueue(move, warm_locations) do

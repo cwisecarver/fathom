@@ -140,6 +140,27 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
     assert Overrides.for_shard("hot_1") == nil, "dead-node pin unpinned (re-homed to hash)"
   end
 
+  test "reconcile keeps a pin whose node stopped beating but still HOLDS the S3 lease (#1)" do
+    Application.put_env(:fathom, :rebalancer_enabled, true)
+    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+
+    shard = "recon_held_#{System.unique_integer([:positive])}"
+    lock = Path.join([System.tmp_dir!(), "fathom_remote_test", shard <> ".lock"])
+    on_exit(fn -> File.rm(lock) end)
+
+    # n1 beats; "ghost" does NOT beat but HOLDS the shard's S3 lease (its data plane is alive).
+    :ok = Nodes.beat("n1")
+    {:ok, _} = Fathom.Shard.Storage.acquire_lease(shard, "ghost", 30_000)
+    {:ok, _} = Overrides.pin(shard, "ghost", reason: "test")
+
+    assert :ok = perform_job(RebalanceJob, %{})
+
+    # The reporter beat says ghost is dead, but the S3 lease is held → KEEP the pin (fail-safe):
+    # unpinning a live-owned shard would route it to a node that can't steal the held lease.
+    refute is_nil(Overrides.for_shard(shard)), "held-lease pin kept despite the stale beat"
+    assert is_nil(Overrides.for_shard(shard).failed_at)
+  end
+
   test "reconcile fails open: no beats ⇒ no unpins (#1b)" do
     Application.put_env(:fathom, :rebalancer_enabled, true)
     Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
