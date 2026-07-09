@@ -87,6 +87,28 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     assert Commands.get(cmd.id).status == "pending"
   end
 
+  test "a crashing telemetry handler never wedges a command's completion (#8)", %{node: node} do
+    # Pins the safety property: an observability handler that raises must not prevent the
+    # durable Commands.complete (telemetry isolates handler crashes, and the emit is after the
+    # write). A wedged-pending command would otherwise re-execute every poll.
+    id = "crash-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      id,
+      [:fathom, :rebalancer, :command, :stop],
+      fn _e, _m, _meta, _cfg -> raise "handler boom" end,
+      %{}
+    )
+
+    on_exit(fn -> :telemetry.detach(id) end)
+
+    {:ok, cmd} = Commands.issue("crashwedge_#{System.unique_integer([:positive])}", node, "warm")
+    start_supervised!(CommandPoller)
+    assert CommandPoller.poll_now() == 1
+
+    assert Commands.get(cmd.id).status == "done", "command completed despite the crashing handler"
+  end
+
   test "a poll batch executes all commands concurrently off the poller (#8)", %{node: node} do
     # Multiple commands in one batch all complete via a single poll (the Task.Supervisor
     # async_stream), so a slow drain can't head-of-line-block the warms behind it.

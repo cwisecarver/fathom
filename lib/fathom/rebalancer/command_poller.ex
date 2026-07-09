@@ -138,14 +138,19 @@ defmodule Fathom.Rebalancer.CommandPoller do
 
   # Complete a command and emit its outcome (rebalancer telemetry): drain :failed is the
   # thrash signal at the executor (a wedged/busy source), :cancelled is the abandoned-pin
-  # skip (#7).
+  # skip (#7). Emit AFTER the durable completion (review 2026-07-09 #8) — for consistency with
+  # the other emit sites and so a buggy handler can never sit between the executor and the DB
+  # write. (`:telemetry.execute` already isolates a raising/exiting handler from the caller, so
+  # the emit can't abort the completion in EITHER order — but emit-after is the correct shape.)
   defp complete(cmd, status, detail) do
+    result = Commands.complete(cmd, status, detail)
+
     :telemetry.execute([:fathom, :rebalancer, :command, :stop], %{count: 1}, %{
       command: cmd.command,
       outcome: outcome_atom(status)
     })
 
-    Commands.complete(cmd, status, detail)
+    result
   end
 
   defp outcome_atom("done"), do: :done
