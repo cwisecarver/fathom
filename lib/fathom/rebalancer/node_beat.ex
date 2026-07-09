@@ -5,6 +5,19 @@ defmodule Fathom.Rebalancer.NodeBeat do
   be pinned to; `last_seen_at` is refreshed every reporter tick. Distinct from the S3
   heartbeat, which is keyed by the boot-scoped lease owner (`node()#incarnation`), not the
   node_key the LB exception table references.
+
+  ## Clock assumption (review 2026-07-09 #9)
+
+  `last_seen_at` is the *beating node's* wall clock, compared against the reader's clock in
+  `Fathom.Rebalancer.Nodes.alive/1` (and `fleet_p99/2`), so it assumes the fleet is NTP-synced
+  within a few seconds (small vs the ~60s stale window). The **destructive** risk this once
+  carried — a clock-lagged node judged dead and its hot pins deleted — is closed: the reconciler
+  confirms against the authoritative S3 lease (`Storage.lease_holder/1`) before unpinning
+  (review #1), so a skewed-but-live node keeps its pin. The residual is benign: a fast-clock
+  *dead* node lingers in the `alive` set until its future timestamp passes (its shards stay
+  available via the #1a backup upstreams + the freed lease), and the freshness windows include
+  slightly-skewed rows. Keep NTP healthy; a single-server-clock `last_seen_at` is a deferred
+  fuller fix (same pattern as #15).
   """
   use Ecto.Schema
 

@@ -96,6 +96,12 @@ the same shards.
 > fine (small vs the ~10s window); material skew can mis-attribute a shard's serving node or
 > bias load off a slow-clock node. Same fix: keep NTP healthy. Data is never at risk (the S3
 > `{owner,epoch}` lease, not the samples, arbitrates writes).
+>
+> The same applies to the node-liveness beat (`rebalancer_nodes.last_seen_at`, review #9). The
+> once-**destructive** risk — a clock-lagged node judged dead and its hot pins deleted — is
+> closed: the dead-node reconciler confirms against the S3 lease (`Storage.lease_holder/1`)
+> before unpinning (review #1). The residual under skew is benign (a fast-clock dead node's pin
+> lingers until its timestamp passes; its shards stay available via the #1a backups + freed lease).
 
 ## Runbook: lease store (S3) is down
 
