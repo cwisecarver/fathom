@@ -148,6 +148,12 @@ After a move, confirm the shard is served by the target and **isolation holds** 
 moved shard reads only its own data). Watch for thrash: a shard whose `failed_at` keeps getting
 set is un-drainable and backing off (#4) — investigate the shard, don't lower the cooldown.
 
+**Prefer metrics over RPCs for ongoing operation.** The RPCs above are for the first-handoff
+sanity check; in production wire the rebalancer metrics (`fathom.rebalancer.*` — handoff
+outcome, retry/thrash, `lb_apply` health, reconcile, affinity hit-rate) and the alerts in
+`docs/runbooks/cluster.md`. The **`handoff.stop{outcome="reverted"}`** and
+**`lb_apply{outcome="reload_failed"|"config_test_failed"}`** alerts are the two to page on.
+
 ### Stage 5 — tune
 
 Lower `REBALANCE_HOT_QPS_FLOOR` toward the real hot-spot threshold from the dry-run data. Watch

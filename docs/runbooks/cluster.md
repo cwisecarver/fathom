@@ -15,6 +15,13 @@ reporter) and an OpenTelemetry trace span on checkout (OTLP, env-gated).
 | `fathom.shard.lease.held.count` | counter | Starts refused against a live foreign lease (a request hit a non-owner — expected briefly on remap). |
 | `fathom.shards.checkout.stop.duration` | distribution (ms), tag `outcome` | Checkout latency by outcome: `ok` / `held` / `unavailable` / `error`. |
 | `fathom.shards.active` | last_value | Active shard coordinators on this node. |
+| `fathom.rebalancer.move.proposed.count` | counter | Shard moves the policy proposed (handoffs enqueued) — rebalancer activity rate. |
+| `fathom.rebalancer.affinity.count` | counter, tag `outcome` | Move target affinity: `hit` = landed on a warm target, `miss` = cold. The #C warm-hit rate. |
+| `fathom.rebalancer.handoff.stop.count` | counter, tag `outcome` | Handoff terminal outcome: `completed` / `reverted`. **The core health signal.** |
+| `fathom.rebalancer.handoff.retry.count` | counter | Handoff attempts that retried (flip not live / slow drain) — thrash precursor. |
+| `fathom.rebalancer.command.stop.count` | counter, tags `command`,`outcome` | Warm/drain command outcomes: `done` / `failed` / `cancelled`. `drain`+`failed` = thrash. |
+| `fathom.rebalancer.lb_apply.count` | counter, tag `outcome` | LB-map apply: `applied` / `noop` / `reload_failed` / `config_test_failed` / `write_failed`. **Routing-at-risk.** |
+| `fathom.rebalancer.reconcile.unpinned.count` | counter | Pins dropped because their node went dead (#1b) — dead-node reconcile rate. |
 
 **Export.** Metrics: pass `Fathom.Telemetry.metrics/0` to a reporter
 (`TelemetryMetricsPrometheus`, `TelemetryMetricsStatsd`, or a `ConsoleReporter` in dev) — none
@@ -28,6 +35,14 @@ is started by default; wire the one your backend uses. Traces: set
 - **lease-store-down:** `rate(fathom.shards.checkout.stop{outcome="error"})` spikes fleet-wide AND S3 error logs present.
 - **cold-open-latency:** `p99(fathom.shard.cold_open.duration{warm="false"})` above your failover SLO (tune against the S3 region RTT).
 - **lease-RPS-ceiling (F1):** `rate(fathom.shard.lease.renewed)` approaching the S3 PUT budget — the node-level-heartbeat lever (S8) is the fix.
+
+### Rebalancer alerts (when B1 is enabled — see `docs/runbooks/rebalancer.md`)
+
+- **handoff-revert-rate:** `rate(fathom.rebalancer.handoff.stop{outcome="reverted"})` sustained > 0 — handoffs are failing to drain and reverting; a shard is wedged (#4). Pair with `handoff.retry` rising.
+- **rebalancer-thrash:** `rate(fathom.rebalancer.command.stop{command="drain",outcome="failed"})` sustained — un-drainable hot shards; check whether the cooldown/backoff is holding.
+- **lb-routing-at-risk:** `rate(fathom.rebalancer.lb_apply{outcome="reload_failed"|"config_test_failed"|"write_failed"}) > 0` — the LB map couldn't be applied; the running LB may be stale and the next nginx cold start could fail (#3/#11). Investigate immediately.
+- **dead-node-reconcile:** `rate(fathom.rebalancer.reconcile.unpinned) > 0` — nodes going dead with pinned shards; correlate with node liveness / deploys (#1b).
+- **affinity-hit-rate (informational):** `fathom.rebalancer.affinity{outcome="hit"} / total` — how often handoffs land on a warm target (#C); a persistently low rate means the warm signal isn't helping (warm-follower off, or cap-evicted).
 
 ---
 
