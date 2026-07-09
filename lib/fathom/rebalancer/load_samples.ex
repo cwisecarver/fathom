@@ -43,6 +43,20 @@ defmodule Fathom.Rebalancer.LoadSamples do
     end)
   end
 
+  @doc """
+  Distinct shard_ids seen in any node's samples within `ms` — the recent fleet-hot set. The
+  reporter intersects this with its local warm cache to publish the warm-location signal (the
+  affinity-aware target input).
+  """
+  @spec recent_shard_ids(non_neg_integer()) :: [String.t()]
+  def recent_shard_ids(ms \\ 120_000) do
+    cutoff = DateTime.add(DateTime.utc_now(), -ms, :millisecond)
+
+    Repo.all(
+      from s in LoadSample, where: s.sampled_at >= ^cutoff, select: s.shard_id, distinct: true
+    )
+  end
+
   @doc "Deletes samples older than `ms` ago (ops/test helper; the reporter prunes too)."
   @spec prune(non_neg_integer()) :: {non_neg_integer(), nil}
   def prune(ms) do

@@ -102,6 +102,47 @@ defmodule Fathom.Rebalancer.ReporterTest do
     assert beat.q_p99 > 0.0
   end
 
+  test "advertises the fleet-hot shards it has warm-cached (affinity signal, #C)" do
+    alias Fathom.Rebalancer.{LoadSample, WarmLocations}
+
+    warm_dir = Path.join(System.tmp_dir!(), "warmloc_test_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(warm_dir)
+    prev_dir = Application.get_env(:fathom, :warm_cache_dir)
+    Application.put_env(:fathom, :warm_cache_dir, warm_dir)
+
+    on_exit(fn ->
+      if is_nil(prev_dir),
+        do: Application.delete_env(:fathom, :warm_cache_dir),
+        else: Application.put_env(:fathom, :warm_cache_dir, prev_dir)
+
+      File.rm_rf(warm_dir)
+    end)
+
+    # This node has "wl_hot" warm-cached; a recent sample (from another node) makes it
+    # fleet-hot. "wl_cold" is fleet-hot but not warm here.
+    File.write!(Path.join(warm_dir, "wl_hot.db"), "x")
+
+    for shard <- ["wl_hot", "wl_cold"] do
+      Repo.insert!(%LoadSample{
+        node_key: "other",
+        shard_id: shard,
+        q_per_s: 50.0,
+        rows_read_per_s: 0.0,
+        checkouts_per_s: 0.0,
+        window_s: 10.0,
+        sampled_at: DateTime.utc_now()
+      })
+    end
+
+    pid = start_supervised!(Reporter)
+    Ecto.Adapters.SQL.Sandbox.allow(Fathom.Repo, self(), pid)
+    :ok = Reporter.report_now()
+
+    wn = WarmLocations.warm_nodes(60_000)
+    assert wn["wl_hot"] == MapSet.new([Rebalancer.node_key()]), "warm+hot shard advertised"
+    refute Map.has_key?(wn, "wl_cold"), "hot-but-not-warm shard not advertised"
+  end
+
   test "a Postgres outage drops the window without crashing the reporter (#13)" do
     import ExUnit.CaptureLog
 

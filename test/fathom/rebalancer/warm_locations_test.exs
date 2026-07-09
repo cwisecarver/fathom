@@ -1,0 +1,39 @@
+defmodule Fathom.Rebalancer.WarmLocationsTest do
+  @moduledoc "The warm-location signal (affinity-aware target input, Phase 2 C)."
+  use Fathom.DataCase, async: true
+
+  alias Fathom.Rebalancer.{WarmLocation, WarmLocations}
+
+  test "publish upserts, retracts, and empties; warm_nodes maps shard → nodes" do
+    :ok = WarmLocations.publish("n1", ["a", "b"])
+    :ok = WarmLocations.publish("n2", ["a"])
+
+    wn = WarmLocations.warm_nodes(60_000)
+    assert wn["a"] == MapSet.new(["n1", "n2"])
+    assert wn["b"] == MapSet.new(["n1"])
+
+    # n1 stops warming "b" — its advertisement for "b" is retracted, "a" kept.
+    :ok = WarmLocations.publish("n1", ["a"])
+    wn = WarmLocations.warm_nodes(60_000)
+    assert wn["a"] == MapSet.new(["n1", "n2"])
+    refute Map.has_key?(wn, "b")
+
+    # Empty publish drops all of a node's rows.
+    :ok = WarmLocations.publish("n2", [])
+    assert WarmLocations.warm_nodes(60_000)["a"] == MapSet.new(["n1"])
+  end
+
+  test "warm_nodes ignores stale rows; prune deletes them" do
+    :ok = WarmLocations.publish("n1", ["a"])
+
+    from(w in WarmLocation, where: w.node_key == "n1")
+    |> Repo.update_all(
+      set: [updated_at: DateTime.add(DateTime.utc_now(), -120_000, :millisecond)]
+    )
+
+    # A dead node's unrefreshed row falls out of the read window.
+    assert WarmLocations.warm_nodes(60_000) == %{}
+    assert WarmLocations.prune(60_000) == 1
+    assert WarmLocations.warm_nodes(600_000) == %{}
+  end
+end

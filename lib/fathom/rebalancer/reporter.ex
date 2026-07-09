@@ -24,8 +24,9 @@ defmodule Fathom.Rebalancer.Reporter do
   require Logger
 
   alias Fathom.Rebalancer
-  alias Fathom.Rebalancer.{LoadSample, Nodes, Stats}
+  alias Fathom.Rebalancer.{LoadSample, LoadSamples, Nodes, Stats, WarmLocations}
   alias Fathom.Repo
+  alias Fathom.Shard.WarmFollower
   alias Fathom.ShardLoad
 
   import Ecto.Query, only: [from: 2]
@@ -33,6 +34,8 @@ defmodule Fathom.Rebalancer.Reporter do
   @default_interval_ms 10_000
   @default_top_n 50
   @default_retention_ms 600_000
+  # Shards hot within this window are handoff candidates; advertise warmth for them (#C).
+  @warm_hot_window_ms 120_000
 
   @doc "Whether per-node load reporting is enabled (`:load_reporter`, default off)."
   @spec enabled?() :: boolean()
@@ -97,6 +100,10 @@ defmodule Fathom.Rebalancer.Reporter do
       Nodes.beat(Rebalancer.node_key(), q_p99: p99, sample_count: length(rows))
       publish(Enum.take(rows, top_n()))
       prune()
+      # Advertise which fleet-hot shards THIS node has warm-cached (affinity-aware target, #C):
+      # the intersection of the recent fleet-hot set and this node's warm cache. Bounded to hot
+      # shards; a node not running the follower simply advertises none (cached? is false).
+      publish_warm_locations()
     rescue
       e -> Logger.warning("load reporter window dropped: #{Exception.message(e)}")
     catch
@@ -147,6 +154,21 @@ defmodule Fathom.Rebalancer.Reporter do
   defp prune do
     cutoff = DateTime.add(DateTime.utc_now(), -retention_ms(), :millisecond)
     Repo.delete_all(from s in LoadSample, where: s.sampled_at < ^cutoff)
+    :ok
+  end
+
+  # Advertise the fleet-hot shards this node has warm-cached (affinity-aware target, #C). The
+  # fleet-hot set is the recent samples' distinct shards; intersect with this node's warm cache
+  # (`WarmFollower.cached?/1` — a node not running the follower matches none). Prune dead-node
+  # leftovers past the same window the reader trusts.
+  defp publish_warm_locations do
+    warm_hot =
+      @warm_hot_window_ms
+      |> LoadSamples.recent_shard_ids()
+      |> Enum.filter(&WarmFollower.cached?/1)
+
+    WarmLocations.publish(Rebalancer.node_key(), warm_hot)
+    WarmLocations.prune(retention_ms())
     :ok
   end
 
