@@ -31,6 +31,10 @@ defmodule Fathom.Rebalancer.Policy do
   - **Improvement guard:** a move is proposed only if the target's *post-move* load stays
     below the source's *current* load — otherwise the move just relocates the hotspot.
     A uniformly-loaded fleet (nowhere better to put it) yields no moves.
+  - **Affinity (Phase 2 C):** among viable targets within a load band of the least-loaded,
+    prefer one that already has the shard warm-cached (`:warm_locations`) — a cheap 304
+    handoff instead of a full S3 pull. The band means affinity never picks a
+    materially-more-loaded target, so balance still improves.
   - **max_moves:** at most N moves per tick (default 1), hottest first, one shard per
     target per tick — moves are deliberate and re-evaluated against fresh samples next
     tick.
@@ -73,6 +77,8 @@ defmodule Fathom.Rebalancer.Policy do
     confirm = Keyword.get(opts, :confirm_windows, cfg(:rebalance_confirm_windows, 2))
     cooldown_ms = Keyword.get(opts, :cooldown_ms, cfg(:rebalance_cooldown_ms, 300_000))
     max_moves = Keyword.get(opts, :max_moves, cfg(:rebalance_max_moves, 1))
+    warm_locations = Keyword.get(opts, :warm_locations, %{})
+    band = Keyword.get(opts, :locality_band, cfg(:rebalance_locality_band, 0.5)) / 1.0
     now = Keyword.get(opts, :now, DateTime.utc_now())
 
     latest = latest_per_shard(samples)
@@ -90,21 +96,24 @@ defmodule Fathom.Rebalancer.Policy do
     |> Enum.filter(&confirmed_hot?(&1, samples, threshold, confirm))
     # Hottest first, tie-broken by shard_id for a canonical (not iteration-order) choice (#18).
     |> Enum.sort_by(&{-&1.q_per_s, &1.shard_id})
-    |> plan_moves(node_load, backend_keys, threshold, max_moves)
+    |> plan_moves(node_load, backend_keys, threshold, max_moves, warm_locations, band)
   end
 
   # max_moves ≤ 0 means "make no moves" — short-circuit before the reduce, which otherwise
   # appended one move and only then checked the bound (#18).
-  defp plan_moves(_hot, _node_load, _backend_keys, _threshold, max_moves) when max_moves <= 0,
-    do: []
+  defp plan_moves(_hot, _node_load, _keys, _threshold, max_moves, _warm, _band)
+       when max_moves <= 0,
+       do: []
 
-  # Walk the hot shards (hottest first), assigning each to the least-loaded viable target,
-  # updating a running projected node-load so we don't pile several onto one target in a
-  # single tick. Stops at max_moves.
-  defp plan_moves(hot, node_load, backend_keys, threshold, max_moves) do
+  # Walk the hot shards (hottest first), assigning each to the best viable target, updating a
+  # running projected node-load so we don't pile several onto one target in a single tick.
+  # Stops at max_moves.
+  defp plan_moves(hot, node_load, backend_keys, threshold, max_moves, warm_locations, band) do
     {moves, _load} =
       Enum.reduce_while(hot, {[], node_load}, fn s, {moves, load} ->
-        case best_target(s, load, backend_keys) do
+        warm_nodes = Map.get(warm_locations, s.shard_id, MapSet.new())
+
+        case best_target(s, load, backend_keys, warm_nodes, band) do
           nil ->
             {:cont, {moves, load}}
 
@@ -137,22 +146,39 @@ defmodule Fathom.Rebalancer.Policy do
     Enum.reverse(moves)
   end
 
-  # The least-loaded backend other than the source whose POST-move load stays below the
-  # source's current load (the improvement guard — else we'd just move the hotspot). nil
-  # when no target improves balance (uniform fleet).
-  defp best_target(sample, node_load, backend_keys) do
+  # Pick a handoff target among the backends other than the source whose POST-move load stays
+  # below the source's current load (the improvement guard — else we'd just move the hotspot).
+  # nil when no target improves balance (uniform fleet).
+  #
+  # Affinity (Phase 2 C): among the viable targets within a load BAND of the least-loaded
+  # (`least + band × (from_load − least)`), prefer one that already has the shard warm
+  # (`warm_nodes`) — a cheap 304 handoff instead of a full S3 pull. The band keeps affinity
+  # from ever picking a materially-more-loaded target, so balance still improves; outside it,
+  # or with no warm target, it's strict least-loaded (tie-broken by node_key, #18).
+  defp best_target(sample, node_load, backend_keys, warm_nodes, band) do
     from = sample.node_key
     from_load = Map.get(node_load, from, sample.q_per_s)
 
-    backend_keys
-    |> Enum.reject(&(&1 == from))
-    |> Enum.map(&{&1, Map.get(node_load, &1, 0.0)})
-    |> Enum.filter(fn {_t, t_load} -> t_load + sample.q_per_s < from_load end)
-    # Least-loaded, tie-broken by node_key so equal-load targets resolve canonically (#18).
-    |> Enum.min_by(fn {t, t_load} -> {t_load, t} end, fn -> nil end)
-    |> case do
-      nil -> nil
-      {target, _load} -> target
+    viable =
+      backend_keys
+      |> Enum.reject(&(&1 == from))
+      |> Enum.map(&{&1, Map.get(node_load, &1, 0.0)})
+      |> Enum.filter(fn {_t, t_load} -> t_load + sample.q_per_s < from_load end)
+
+    case viable do
+      [] ->
+        nil
+
+      _ ->
+        {_, least} = Enum.min_by(viable, fn {_t, l} -> l end)
+        ceiling = least + band * (from_load - least)
+
+        warm_within =
+          Enum.filter(viable, fn {t, l} -> l <= ceiling and MapSet.member?(warm_nodes, t) end)
+
+        chosen = if warm_within == [], do: viable, else: warm_within
+        {target, _load} = Enum.min_by(chosen, fn {t, l} -> {l, t} end)
+        target
     end
   end
 

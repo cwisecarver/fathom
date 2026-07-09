@@ -137,6 +137,46 @@ defmodule Fathom.Rebalancer.PolicyTest do
     assert one.shard_id == "hot_a"
   end
 
+  test "affinity: prefers a warm target within the load band over the cold least-loaded (#C)" do
+    # n1 overloaded (hot_1 900 + filler 300 = 1200). Viable targets: n2 @ 10 (coldest) and
+    # n3 @ 100 (warm for hot_1, well within the band). Affinity sends it to the warm n3.
+    samples = [
+      s("n1", "hot_1", 900, 10),
+      s("n1", "hot_1", 900, 0),
+      s("n1", "filler", 300, 0),
+      s("n2", "x", 10, 0),
+      s("n3", "y", 100, 0)
+    ]
+
+    warm = %{"hot_1" => MapSet.new(["n3"])}
+
+    assert [move] =
+             propose(samples, floor: 500.0, confirm_windows: 2, warm_locations: warm)
+
+    assert move.to_node == "n3", "warm target within band preferred"
+
+    # Without the warm signal, it's strict least-loaded (n2) — proving affinity flipped it.
+    assert [cold] = propose(samples, floor: 500.0, confirm_windows: 2)
+    assert cold.to_node == "n2"
+  end
+
+  test "affinity never picks a warm target outside the load band (balance protected) (#C)" do
+    # n3 is warm for hot_1 but heavily loaded (600) — viable (700 < 1000) yet outside the band
+    # (ceiling 505). It must NOT be preferred over the far-colder n2 (10).
+    samples = [
+      s("n1", "hot_1", 100, 10),
+      s("n1", "hot_1", 100, 0),
+      s("n1", "filler", 900, 0),
+      s("n2", "x", 10, 0),
+      s("n3", "y", 600, 0)
+    ]
+
+    warm = %{"hot_1" => MapSet.new(["n3"])}
+
+    assert [move] = propose(samples, floor: 50.0, confirm_windows: 2, warm_locations: warm)
+    assert move.to_node == "n2", "a too-loaded warm target is not chosen; balance wins"
+  end
+
   test "anti-flap counts distinct windows on the candidate's node, not cross-node rows (#9)" do
     # A shard mid-remap is reported hot by both its old (n1) and current (n2) serving node —
     # one hot window each. Counting rows across nodes reaches confirm: 2 spuriously; counting

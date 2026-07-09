@@ -16,7 +16,17 @@ defmodule Fathom.Rebalancer.RebalanceJob do
   require Logger
 
   alias Fathom.Rebalancer
-  alias Fathom.Rebalancer.{Commands, HandoffJob, LbApply, LoadSamples, Nodes, Overrides, Policy}
+
+  alias Fathom.Rebalancer.{
+    Commands,
+    HandoffJob,
+    LbApply,
+    LoadSamples,
+    Nodes,
+    Overrides,
+    Policy,
+    WarmLocations
+  }
 
   @sample_horizon_ms 120_000
   # Command retention (finding #12): terminal rows deleted after this; pending rows older
@@ -64,8 +74,14 @@ defmodule Fathom.Rebalancer.RebalanceJob do
     # full-distribution p99s, or nil (untrusted → policy uses the floor / legacy path) below
     # the sample floor.
     fleet_p99 = Nodes.fleet_p99(node_stale_ms(), min_p99_samples())
+    # Warm-location map for affinity-aware target selection (Phase 2 C): which nodes have each
+    # hot shard warm-cached, so a handoff prefers a warm target. Same freshness as liveness.
+    warm_locations = WarmLocations.warm_nodes(node_stale_ms())
 
-    case Policy.propose(samples, overrides, backends, fleet_p99: fleet_p99) do
+    case Policy.propose(samples, overrides, backends,
+           fleet_p99: fleet_p99,
+           warm_locations: warm_locations
+         ) do
       [] ->
         :ok
 

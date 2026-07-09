@@ -10,7 +10,8 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
     LoadSample,
     Nodes,
     Overrides,
-    RebalanceJob
+    RebalanceJob,
+    WarmLocations
   }
 
   alias Fathom.Repo
@@ -148,6 +149,28 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
     # (the beat mechanism could just be starting / down).
     assert :ok = perform_job(RebalanceJob, %{})
     assert Overrides.for_shard("hot_1") != nil, "no unpin when nothing is beating"
+  end
+
+  test "affinity: an enabled tick routes the handoff to a warm target (#C)" do
+    Application.put_env(:fathom, :rebalancer_enabled, true)
+    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+    Application.put_env(:fathom, :rebalance_confirm_windows, 2)
+
+    # n1 overloaded; n2 coldest (10), n3 warm for hot_1 and within the band (100).
+    sample("n1", "hot_1", 900, 10_000)
+    sample("n1", "hot_1", 900, 0)
+    sample("n1", "filler", 300, 0)
+    sample("n2", "x", 10, 0)
+    sample("n3", "y", 100, 0)
+    :ok = WarmLocations.publish("n3", ["hot_1"])
+
+    assert :ok = perform_job(RebalanceJob, %{})
+
+    [job] = all_enqueued(worker: HandoffJob)
+    assert job.args["shard_id"] == "hot_1"
+
+    assert job.args["to_node"] == "n3",
+           "warm-location signal steered the handoff to n3, not the cold n2"
   end
 
   test "gate on but nothing hot: no handoffs" do
