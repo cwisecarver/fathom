@@ -86,7 +86,7 @@ defmodule Fathom.Rebalancer.RebalanceJob do
         :ok
 
       moves ->
-        Enum.each(moves, &enqueue/1)
+        Enum.each(moves, &enqueue(&1, warm_locations))
         Logger.info("rebalance: enqueued #{length(moves)} handoff(s): #{summarize(moves)}")
         :ok
     end
@@ -107,6 +107,11 @@ defmodule Fathom.Rebalancer.RebalanceJob do
       |> Enum.each(fn o ->
         Overrides.unpin(o.shard_id)
 
+        :telemetry.execute([:fathom, :rebalancer, :reconcile, :unpinned], %{count: 1}, %{
+          shard_id: o.shard_id,
+          node: o.pinned_node
+        })
+
         Logger.warning(
           "rebalance: unpinned #{o.shard_id} — node #{o.pinned_node} not live (re-homing)"
         )
@@ -114,7 +119,23 @@ defmodule Fathom.Rebalancer.RebalanceJob do
     end
   end
 
-  defp enqueue(move) do
+  defp enqueue(move, warm_locations) do
+    # Observability (rebalancer telemetry): the move, and whether it landed on a warm target
+    # (affinity hit, #C) or a cold one — the warm-hit rate shows the affinity signal's payoff.
+    affinity = if warm_target?(move, warm_locations), do: :hit, else: :miss
+
+    :telemetry.execute([:fathom, :rebalancer, :move, :proposed], %{count: 1}, %{
+      shard_id: move.shard_id,
+      from_node: move.from_node,
+      to_node: move.to_node
+    })
+
+    :telemetry.execute([:fathom, :rebalancer, :affinity], %{count: 1}, %{
+      outcome: affinity,
+      shard_id: move.shard_id,
+      to_node: move.to_node
+    })
+
     %{
       "shard_id" => move.shard_id,
       "from_node" => move.from_node,
@@ -123,6 +144,10 @@ defmodule Fathom.Rebalancer.RebalanceJob do
     }
     |> HandoffJob.new()
     |> Oban.insert()
+  end
+
+  defp warm_target?(move, warm_locations) do
+    warm_locations |> Map.get(move.shard_id, MapSet.new()) |> MapSet.member?(move.to_node)
   end
 
   defp summarize(moves) do

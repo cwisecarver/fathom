@@ -106,7 +106,7 @@ defmodule Fathom.Rebalancer.CommandPoller do
         {:error, reason} -> "warm skipped (#{inspect(reason)})"
       end
 
-    Commands.complete(cmd, "done", detail)
+    complete(cmd, "done", detail)
   end
 
   # Drain releases the lease. Failure (busy / drain_failed) is terminal-for-this-command;
@@ -121,20 +121,37 @@ defmodule Fathom.Rebalancer.CommandPoller do
       %{failed_at: nil} ->
         case Shards.drain(id, drain_ms()) do
           :ok ->
-            Commands.complete(cmd, "done", "drained")
+            complete(cmd, "done", "drained")
 
           {:error, reason} ->
-            Commands.complete(cmd, "failed", "drain failed (#{inspect(reason)})")
+            complete(cmd, "failed", "drain failed (#{inspect(reason)})")
         end
 
       _gone_or_reverted ->
-        Commands.complete(cmd, "cancelled", "pin reverted; drain skipped")
+        complete(cmd, "cancelled", "pin reverted; drain skipped")
     end
   end
 
   defp execute(%{command: other} = cmd) do
-    Commands.complete(cmd, "failed", "unknown command #{inspect(other)}")
+    complete(cmd, "failed", "unknown command #{inspect(other)}")
   end
+
+  # Complete a command and emit its outcome (rebalancer telemetry): drain :failed is the
+  # thrash signal at the executor (a wedged/busy source), :cancelled is the abandoned-pin
+  # skip (#7).
+  defp complete(cmd, status, detail) do
+    :telemetry.execute([:fathom, :rebalancer, :command, :stop], %{count: 1}, %{
+      command: cmd.command,
+      outcome: outcome_atom(status)
+    })
+
+    Commands.complete(cmd, status, detail)
+  end
+
+  defp outcome_atom("done"), do: :done
+  defp outcome_atom("failed"), do: :failed
+  defp outcome_atom("cancelled"), do: :cancelled
+  defp outcome_atom(_), do: :other
 
   defp schedule, do: Process.send_after(self(), :poll, poll_ms())
   defp poll_ms, do: Application.get_env(:fathom, :command_poll_ms, @default_poll_ms)

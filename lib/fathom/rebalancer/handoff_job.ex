@@ -60,17 +60,26 @@ defmodule Fathom.Rebalancer.HandoffJob do
     # when the map/reload couldn't be applied, and then drain is skipped.
     with :ok <- pin_and_flip(shard, to, from, q),
          :ok <- drain(shard, from) do
+      emit(:stop, %{outcome: :completed, shard_id: shard, from_node: from, to_node: to})
       Logger.info("rebalance: handoff #{shard} #{from} -> #{to} complete")
       :ok
     else
       {:error, reason} when attempt >= max ->
-        revert(shard, from, reason, max)
+        result = revert(shard, from, reason, max)
+        emit(:stop, %{outcome: :reverted, shard_id: shard, from_node: from, to_node: to})
+        result
 
       {:error, reason} ->
         # Flip not applied yet, or source's connections haven't finished — retry (both
-        # usually resolve on the next attempt).
+        # usually resolve on the next attempt). Emit the retry: a rising rate flags a
+        # slow/wedged drain before it fully reverts (the #4 thrash precursor).
+        emit(:retry, %{shard_id: shard, from_node: from, to_node: to})
         {:error, reason}
     end
+  end
+
+  defp emit(event, meta) do
+    :telemetry.execute([:fathom, :rebalancer, :handoff, event], %{count: 1}, meta)
   end
 
   # Give up safely: return the shard to its source so it's served, not stranded. Mark (not

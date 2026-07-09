@@ -86,6 +86,46 @@ defmodule Fathom.Telemetry do
         event_name: [:fathom, :shards],
         measurement: :active,
         description: "Active shard coordinators on this node"
+      ),
+
+      # --- Rebalancer (Phase-2 B1) — operability for the enable runbook -------------------
+      # Low-cardinality only: tag by node/outcome, never shard_id (the ShardLoad cardinality
+      # rule). shard_id/from_node/to_node ride in event metadata for logs/traces.
+      counter("fathom.rebalancer.move.proposed.count",
+        event_name: [:fathom, :rebalancer, :move, :proposed],
+        description: "Shard moves the policy proposed (handoffs enqueued) — rebalancer activity"
+      ),
+      counter("fathom.rebalancer.affinity.count",
+        event_name: [:fathom, :rebalancer, :affinity],
+        tags: [:outcome],
+        description:
+          "Move target affinity (hit = warm target chosen, miss = cold) — the #C warm-hit rate"
+      ),
+      counter("fathom.rebalancer.handoff.stop.count",
+        event_name: [:fathom, :rebalancer, :handoff, :stop],
+        tags: [:outcome],
+        description: "Handoff terminal outcome (completed / reverted) — the core health signal"
+      ),
+      counter("fathom.rebalancer.handoff.retry.count",
+        event_name: [:fathom, :rebalancer, :handoff, :retry],
+        description:
+          "Handoff attempts that retried (flip not live / slow drain) — thrash precursor"
+      ),
+      counter("fathom.rebalancer.command.stop.count",
+        event_name: [:fathom, :rebalancer, :command, :stop],
+        tags: [:command, :outcome],
+        description:
+          "Warm/drain command outcomes (done / failed / cancelled) — drain-failed = thrash"
+      ),
+      counter("fathom.rebalancer.lb_apply.count",
+        event_name: [:fathom, :rebalancer, :lb_apply],
+        tags: [:outcome],
+        description:
+          "LB-map apply outcome (applied / noop / reload_failed / config_test_failed / …) — routing-at-risk"
+      ),
+      counter("fathom.rebalancer.reconcile.unpinned.count",
+        event_name: [:fathom, :rebalancer, :reconcile, :unpinned],
+        description: "Pins unpinned because their node went dead (#1b) — dead-node reconcile rate"
       )
     ]
   end

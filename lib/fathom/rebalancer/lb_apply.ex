@@ -70,11 +70,19 @@ defmodule Fathom.Rebalancer.LbApply do
     case Application.get_env(:fathom, :lb_map_path) do
       nil ->
         Logger.debug("rebalancer: :lb_map_path unset — LB map not written (decision-plane only)")
+        emit(:not_written)
         :ok
 
       path ->
         with_lock(fn -> promote(path, LbMap.current()) end)
     end
+  end
+
+  # The LB-apply health signal (rebalancer telemetry): a rising :reload_failed /
+  # :config_test_failed is the fleet-routing-at-risk alert (#3/#11); :noop dominates (the
+  # per-tick re-render) and confirms the loop is live; :applied is a real flip.
+  defp emit(outcome) do
+    :telemetry.execute([:fathom, :rebalancer, :lb_apply], %{count: 1}, %{outcome: outcome})
   end
 
   # Serialize apply! fleet-wide (finding #10). A SESSION advisory lock, so lock + inner
@@ -101,6 +109,7 @@ defmodule Fathom.Rebalancer.LbApply do
   # re-render doesn't HUP nginx on every tick.
   defp promote(path, content) do
     if content == read_existing(path) do
+      emit(:noop)
       :ok
     else
       write_test_promote(path, content)
@@ -120,7 +129,9 @@ defmodule Fathom.Rebalancer.LbApply do
     with :ok <- File.write(tmp, content),
          :ok <- config_test(tmp),
          :ok <- File.rename(tmp, path) do
-      reload()
+      result = reload()
+      emit(reload_outcome(result))
+      result
     else
       {:error, reason} ->
         File.rm(tmp)
@@ -129,9 +140,20 @@ defmodule Fathom.Rebalancer.LbApply do
           "rebalancer: LB map not promoted (#{inspect(reason)}); kept last-good #{path}"
         )
 
+        emit(promote_error_outcome(reason))
         {:error, reason}
     end
   end
+
+  # The map was promoted; classify by whether the running LB picked it up.
+  defp reload_outcome(:ok), do: :applied
+  defp reload_outcome({:error, {:reload_failed, _}}), do: :reload_failed
+  defp reload_outcome({:error, {:reload_raised, _}}), do: :reload_raised
+
+  # The map was NOT promoted (last-good kept); classify the pre-promotion failure.
+  defp promote_error_outcome({:config_test_failed, _, _}), do: :config_test_failed
+  defp promote_error_outcome({:config_test_raised, _}), do: :config_test_failed
+  defp promote_error_outcome(_), do: :write_failed
 
   # Optional operator config test of the candidate before promotion. `{}` in the command is
   # replaced with the candidate path; it's also exported as LB_MAP_CANDIDATE. Unset ⇒ :ok.
