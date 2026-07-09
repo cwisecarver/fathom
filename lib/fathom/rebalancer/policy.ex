@@ -31,10 +31,11 @@ defmodule Fathom.Rebalancer.Policy do
   - **Improvement guard:** a move is proposed only if the target's *post-move* load stays
     below the source's *current* load — otherwise the move just relocates the hotspot.
     A uniformly-loaded fleet (nowhere better to put it) yields no moves.
-  - **Affinity (Phase 2 C):** among viable targets within a load band of the least-loaded,
-    prefer one that already has the shard warm-cached (`:warm_locations`) — a cheap 304
-    handoff instead of a full S3 pull. The band means affinity never picks a
-    materially-more-loaded target, so balance still improves.
+  - **Affinity (Phase 2 C):** among viable targets whose load is within `band × q` of the
+    least-loaded (`q` = the load being moved), prefer one that already has the shard
+    warm-cached (`:warm_locations`) — a cheap 304 handoff instead of a full S3 pull. The band
+    is anchored to the coldest option, so affinity never lands more than `band × q` worse
+    (post-move) than the best available balance.
   - **max_moves:** at most N moves per tick (default 1), hottest first, one shard per
     target per tick — moves are deliberate and re-evaluated against fresh samples next
     tick.
@@ -187,7 +188,13 @@ defmodule Fathom.Rebalancer.Policy do
 
       _ ->
         {_, least} = Enum.min_by(viable, fn {_t, l} -> l end)
-        ceiling = least + band * (from_load - least)
+        # The affinity ceiling is anchored to the least-loaded viable node + a fraction of the
+        # load being MOVED — NOT to `from_load`. Anchoring to from_load ballooned the band on a
+        # hot source and admitted a warm target that ended up the new hotspot, hotter than the
+        # source became (review 2026-07-09 #3). Now affinity prefers a warm target only when it
+        # is within `band × q` of the coldest option, so it never lands more than band×q worse
+        # (post-move) than the best available balance.
+        ceiling = least + band * sample.q_per_s
 
         warm_within =
           Enum.filter(viable, fn {t, l} -> l <= ceiling and MapSet.member?(warm_nodes, t) end)

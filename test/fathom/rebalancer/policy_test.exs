@@ -186,6 +186,25 @@ defmodule Fathom.Rebalancer.PolicyTest do
     assert cold.to_node == "n2"
   end
 
+  test "affinity on a hot source doesn't relocate the hotspot onto the warm node (#3)" do
+    # Review 2026-07-09 #3's counterexample: n1 = hot_1(350) + filler(550) = 900; n2 warm-for-
+    # hot_1 @ 300; n3 cold @ 10. The old from_load-anchored band (ceiling 455) admitted the
+    # warm n2, whose post-move load (650) would exceed the source's (550) — a fresh hotspot.
+    # The q-anchored band (ceiling 10 + 0.5×350 = 185) rejects it → the cold n3 wins.
+    samples = [
+      s("n1", "hot_1", 350, 10),
+      s("n1", "hot_1", 350, 0),
+      s("n1", "filler", 550, 0),
+      s("n2", "warm_sib", 300, 0),
+      s("n3", "cool", 10, 0)
+    ]
+
+    warm = %{"hot_1" => MapSet.new(["n2"])}
+
+    assert [move] = propose(samples, floor: 300.0, confirm_windows: 2, warm_locations: warm)
+    assert move.to_node == "n3", "warm n2 would become the new hotspot; cold n3 chosen instead"
+  end
+
   test "affinity never picks a warm target outside the load band (balance protected) (#C)" do
     # n3 is warm for hot_1 but heavily loaded (600) — viable (700 < 1000) yet outside the band
     # (ceiling 505). It must NOT be preferred over the far-colder n2 (10).
