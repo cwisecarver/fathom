@@ -25,6 +25,15 @@ defmodule Fathom.Rebalancer.NodesTest do
     refute MapSet.member?(alive2, "n2")
   end
 
+  test "a liveness-only beat/1 preserves the node's published q_p99/sample_count (#5)" do
+    :ok = Nodes.beat("n1", q_p99: 5.0, sample_count: 100)
+    # A plain beat (no stats) must refresh last_seen_at WITHOUT wiping the published stats,
+    # or the node drops out of the fleet-p99 bar for a window.
+    :ok = Nodes.beat("n1")
+
+    assert Nodes.fleet_p99(60_000, 1) == 5.0
+  end
+
   test "fleet_p99 is the count-weighted mean of loaded nodes' p99, guarded by min samples (#2)" do
     # Unequal counts → the busier node's p99 dominates (a plain mean/median would not).
     :ok = Nodes.beat("n1", q_p99: 2.0, sample_count: 30)

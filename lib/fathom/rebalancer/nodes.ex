@@ -20,12 +20,15 @@ defmodule Fathom.Rebalancer.Nodes do
   @spec beat(String.t(), keyword()) :: :ok
   def beat(node_key, opts \\ []) do
     now = DateTime.utc_now()
-    q_p99 = opts[:q_p99]
-    sample_count = opts[:sample_count]
+    # A liveness-only `beat/1` (no stats) must NOT erase the node's last-published
+    # q_p99/sample_count (review 2026-07-09 #5): a plain beat with an unconditional
+    # `set: [q_p99: nil, ...]` would NULL them and drop the node from the fleet-p99 bar.
+    # Include the stats in the upsert ONLY when supplied.
+    stats = Keyword.take(opts, [:q_p99, :sample_count])
 
     Repo.insert!(
-      %NodeBeat{node_key: node_key, last_seen_at: now, q_p99: q_p99, sample_count: sample_count},
-      on_conflict: [set: [last_seen_at: now, q_p99: q_p99, sample_count: sample_count]],
+      struct(%NodeBeat{node_key: node_key, last_seen_at: now}, stats),
+      on_conflict: [set: Keyword.put(stats, :last_seen_at, now)],
       conflict_target: :node_key
     )
 
