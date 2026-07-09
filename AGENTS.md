@@ -23,7 +23,7 @@ Fathom is a multi-tenant sharded data platform built on Phoenix: one SQLite data
 
 **Planned (see `docs/migration-plan.md`), NOT in the code yet — don't assume these exist:**
 
-- **Phase 2 remainder**: shard locality/affinity (C) and live WAL streaming (A2, deferred). The warm standby (A1) and **dynamic rebalancing (B1)** are **built** — see the warm-standby and rebalancer bullets above. A `fathom_native` Rust NIF (no `native/`, no Rustler dep yet).
+- **Phase 2 remainder**: shard locality/affinity (C) — its **affinity-aware placement** piece is now **built** (folded into B1): a per-node **warm-location signal** (`Fathom.Rebalancer.WarmLocations` + `shard_warm_locations`) lets `Rebalancer.Policy.best_target` prefer a handoff target that already holds the shard warm, within a load band of the least-loaded so balance still improves (`:rebalance_locality_band`, default 0.5). What remains of C is C1 (rendezvous/bounded-load hashing — marginal per `docs/phase2-scoping.md` §C) and C2 (multi-region region-affinity — a separate initiative). Also **live WAL streaming (A2, deferred)**. The warm standby (A1) and **dynamic rebalancing (B1)** are **built** — see the warm-standby and rebalancer bullets above. A `fathom_native` Rust NIF (no `native/`, no Rustler dep yet).
 
 ## Execution style
 
