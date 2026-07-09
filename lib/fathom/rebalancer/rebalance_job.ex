@@ -60,8 +60,9 @@ defmodule Fathom.Rebalancer.RebalanceJob do
     samples = LoadSamples.since(horizon_ms()) |> Enum.map(&Map.from_struct/1)
     overrides = Overrides.all()
     backends = Rebalancer.lb_backends()
-    # The fleet-relative hot bar (finding #2): median of live nodes' full-distribution p99s,
-    # or nil (untrusted → policy uses the floor / legacy path) below the sample floor.
+    # The fleet-relative hot bar (finding #2): count-weighted mean of loaded nodes'
+    # full-distribution p99s, or nil (untrusted → policy uses the floor / legacy path) below
+    # the sample floor.
     fleet_p99 = Nodes.fleet_p99(node_stale_ms(), min_p99_samples())
 
     case Policy.propose(samples, overrides, backends, fleet_p99: fleet_p99) do

@@ -1,8 +1,8 @@
 defmodule Fathom.Rebalancer.Stats do
   @moduledoc """
-  Small numeric helpers shared by the reporter (which computes each node's full-distribution
-  p99) and the policy (which uses it as the hot bar). Kept in one place so the percentile
-  method can't drift between them (finding #2).
+  The shared percentile helper — used by the reporter (which computes each node's
+  full-distribution p99) and the policy (its legacy sample-based p99 fallback). Kept in one
+  place so the percentile method can't drift between them (finding #2).
   """
 
   @doc """
@@ -25,9 +25,4 @@ defmodule Fathom.Rebalancer.Stats do
 
     Enum.at(sorted, lo) * (1 - frac) + Enum.at(sorted, hi) * frac
   end
-
-  @doc "Median of `values` (linear-interpolating). Empty ⇒ 0.0."
-  @spec median([number()]) :: float()
-  def median([]), do: 0.0
-  def median(values), do: percentile(values, 50)
 end

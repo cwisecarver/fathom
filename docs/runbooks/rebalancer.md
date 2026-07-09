@@ -116,9 +116,10 @@ the poller is up (a node log line or a healthy process); no errors.
 
 ### Stage 4 — arm the control loop (moves begin)
 
-Pick the detection bar. **Use the absolute floor** (recommended — `#16`, and the 2026-07-08
-observation that the p99 median under-reports when hotspots concentrate on a few nodes). Start
-**conservative** (well above normal per-shard rates so only a real hotspot trips it):
+Pick the detection bar. **Use the absolute floor** (recommended — `#16`; the p99 path is a
+self-scaling fallback whose fleet bar, even after the 2026-07-08 count-weighted-mean refinement,
+is only an approximation of the true pooled-distribution p99). Start **conservative** (well above
+normal per-shard rates so only a real hotspot trips it):
 
 ```
 REBALANCE_HOT_QPS_FLOOR=200.0      # tune from your Stage-2 dry-run numbers; unset ⇒ p99 path

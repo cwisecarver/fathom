@@ -15,8 +15,8 @@ defmodule Fathom.Rebalancer.StatsTest do
   test "edge cases" do
     assert Stats.percentile([], 99) == 0.0
     assert Stats.percentile([5.0], 99) == 5.0
-    assert Stats.median([]) == 0.0
-    assert Stats.median([1.0, 3.0]) == 2.0
-    assert Stats.median([2.0, 4.0, 9.0]) == 4.0
+    # p50 interpolates the two middle ranks.
+    assert Stats.percentile([1.0, 3.0], 50) == 2.0
+    assert Stats.percentile([2.0, 4.0, 9.0], 50) == 4.0
   end
 end

@@ -13,14 +13,14 @@ defmodule Fathom.Rebalancer.Policy do
   bar self-scales: a uniform fleet has p99≈max so `mult × p99` flags nothing (no false
   hotspot); a sharp Zipf head has a low p99 so the head clears it.
 
-  The **fleet p99 is supplied by the orchestrator** (`:fleet_p99` — the median of live
-  nodes' FULL-distribution p99s, which each reporter computes over all its active shards
-  before the top-N publish truncation). This is what makes it genuinely fleet-relative
-  (finding #2): computing p99 from the truncated top-N *head* the reporter publishes gives a
-  systematically high bar that under-flags. When `:fleet_p99` isn't supplied (below the
-  sample floor, or a direct test caller), it falls back to `mult × percentile(samples, 99)`
-  over whatever samples were passed, using an interpolating percentile so a small-N sharp
-  head isn't pinned to the max.
+  The **fleet p99 is supplied by the orchestrator** (`:fleet_p99` — a count-weighted mean of
+  the FULL-distribution p99s of loaded nodes, each computed over all that node's active shards
+  before the top-N publish truncation; see `Fathom.Rebalancer.Nodes.fleet_p99/2`). This is what
+  makes it genuinely fleet-relative (finding #2): computing p99 from the truncated top-N *head*
+  the reporter publishes gives a systematically high bar that under-flags. When `:fleet_p99`
+  isn't supplied (below the sample floor, or a direct test caller), it falls back to
+  `mult × percentile(samples, 99)` over whatever samples were passed, using an interpolating
+  percentile so a small-N sharp head isn't pinned to the max.
 
   ## Anti-flap + safety
 

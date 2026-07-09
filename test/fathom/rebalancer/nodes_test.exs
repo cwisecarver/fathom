@@ -25,14 +25,27 @@ defmodule Fathom.Rebalancer.NodesTest do
     refute MapSet.member?(alive2, "n2")
   end
 
-  test "fleet_p99 is the median of live nodes' p99, guarded by min sample count (#2)" do
-    :ok = Nodes.beat("n1", q_p99: 2.0, sample_count: 40)
-    :ok = Nodes.beat("n2", q_p99: 4.0, sample_count: 40)
+  test "fleet_p99 is the count-weighted mean of loaded nodes' p99, guarded by min samples (#2)" do
+    # Unequal counts → the busier node's p99 dominates (a plain mean/median would not).
+    :ok = Nodes.beat("n1", q_p99: 2.0, sample_count: 30)
+    :ok = Nodes.beat("n2", q_p99: 12.0, sample_count: 70)
 
-    # total 80 ≥ min 50 → median([2.0, 4.0]) = 3.0
-    assert Nodes.fleet_p99(60_000, 50) == 3.0
-    # min guard: total 80 < 200 → nil (untrusted; policy falls back)
+    # total 100 ≥ min 50 → (2*30 + 12*70)/100 = (60 + 840)/100 = 9.0
+    assert Nodes.fleet_p99(60_000, 50) == 9.0
+    # min guard: total 100 < 200 → nil (untrusted; policy falls back)
     assert Nodes.fleet_p99(60_000, 200) == nil
+  end
+
+  test "fleet_p99 excludes idle nodes so a concentrated hotspot isn't dragged to 0 (#2 refinement)" do
+    # Regression for the 2026-07-08 rig observation: a hotspot on ONE node with the rest idle.
+    # The old median-over-all-live-nodes returned median([300, 0, 0]) = 0 → the p99 bar flagged
+    # nothing. Excluding idle nodes (sample_count 0) + count-weighting yields the loaded node's
+    # p99, so the bar is meaningful.
+    :ok = Nodes.beat("hot", q_p99: 300.0, sample_count: 100)
+    :ok = Nodes.beat("idle1", q_p99: 0.0, sample_count: 0)
+    :ok = Nodes.beat("idle2", q_p99: 0.0, sample_count: 0)
+
+    assert Nodes.fleet_p99(60_000, 50) == 300.0
   end
 
   test "fleet_p99 ignores stale nodes and nil-p99 nodes (#2)" do
@@ -47,7 +60,7 @@ defmodule Fathom.Rebalancer.NodesTest do
       set: [last_seen_at: DateTime.add(DateTime.utc_now(), -120_000, :millisecond)]
     )
 
-    # Only "live" contributes → median([5.0]) = 5.0
+    # Only "live" contributes → 5.0
     assert Nodes.fleet_p99(60_000, 50) == 5.0
   end
 end
