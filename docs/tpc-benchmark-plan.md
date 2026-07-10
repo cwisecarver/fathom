@@ -1,6 +1,6 @@
 # Fathom — TPC-B + TPC-C Benchmark Plan
 
-> Status: **Phase 1 BUILT (2026-07-10, rev. 4); Phases 2–4 planned.** This is the
+> Status: **Phases 0–2 BUILT (2026-07-10, rev. 5); Phases 3–4 planned.** This is the
 > implementation-ready design for adding *both* a TPC-B-derived and a TPC-C-derived
 > benchmark to fathom, additive to the existing harness (`docs/benchmark-plan.md`,
 > `Fathom.Bench`, `mix fathom.bench`, the `Fathom.Bench.Gate` regression gate,
@@ -15,6 +15,18 @@
 > here, loopback, relative): `hrana_rt_us` ≈ 100–175 µs, `cold_open_wire_p50_us` ≈ 2.5–4 ms
 > (vs the in-process `cold_open_p50_us` ≈ 1.6 ms — the delta is the WS software tax),
 > `tpcb_wire_overhead_us` ≈ 800 µs/txn (dominated by the 7 chatty round-trips).
+>
+> **Rev. 5 — Phase 2 shipped.** `Fathom.Bench.Wire.tpcb_node_tps/1` (Framing B) drives N shards
+> each bursting a concurrent TPC-B write stream through its own loopback WS stream, reported as
+> aggregate txn/s, and the `test/fathom/tpcb_isolation_test.exs` isolation-under-write-load test
+> proves per-shard consistency + cross-shard non-contamination through the same wire (teeth
+> checked out-of-band: a commingle-into-one-file variant trips the foreign-tag assertion RED).
+> **As-built vs the original plan:** the loose ~50% `tpcb_node_tps` gate is a **per-metric block
+> threshold in the `mix fathom.wire_bench` task** (`@thresholds`), **not** an extension to
+> `Fathom.Bench.Gate` — the WS client is dev/test-only, so wire metrics gate in the task against
+> `scripts/wire_history.jsonl`, never in the `MIX_ENV=prod` commit gate (`Fathom.Bench.Gate` is
+> untouched). The other wire metrics keep the global 20% band. Phase 2 is committed `[skip-bench]`
+> (test/support-only, no prod hot path), matching Phase 1.
 >
 > **Decision (this session) — where wire metrics are gated.** The WS client is `mint_web_socket`,
 > `only: [:dev, :test]` (never ships prod), and the per-commit gate `commit_with_bench.sh` runs
@@ -540,6 +552,14 @@ produces two `failover_*` columns).
 
 ### The `Fathom.Bench.Gate` change — per-metric thresholds
 
+> **AS BUILT (rev. 5):** the per-metric threshold did **not** land in `Fathom.Bench.Gate`. Because
+> Phase 1 gates all wire metrics in the `mix fathom.wire_bench` task (against
+> `scripts/wire_history.jsonl`), not in the `MIX_ENV=prod` commit gate, the loose `tpcb_node_tps`
+> threshold lives as a `@thresholds` map + a `threshold/1` helper **in the task** — `report/4`
+> blocks each metric at `threshold(metric)` (50% for `tpcb_node_tps`, the global 20% otherwise).
+> `Fathom.Bench.Gate` is untouched. The design below is retained as the shape to use **if** an
+> in-process (prod-gate) metric ever needs a loose band.
+
 Today `@metrics` entries are `{name, direction}` 2-tuples and `compare/4` applies **one**
 global `block` to every metric (a single `worst >= block` verdict). The loose `tpcb_node_tps`
 gate needs a **per-metric threshold**. Minimal, backward-compatible change:
@@ -646,7 +666,7 @@ assembly is linear in row count).
 |---|---|---|
 | **0 — prereq ✅ DONE** | Fixed `Connection.collect` (`++` → O(R)) + `@tag :bench` large-result regression test; committed through the bench gate (`23b5b6f`). | ~0.5 day |
 | **1 — loopback WS harness + wire gate metrics ✅ DONE** | Built `Fathom.Bench.HranaClient` (`test/support`, `Mint.WebSocket`, dev/test only) — starts `Filo.Streams` + a Bandit `Filo.Plug` listener on `127.0.0.1:0`, drives hello → open_stream → execute → close_stream with `Filo.Value` encode/decode, shard via `Host: <shard>.local`. `Fathom.Bench.Wire` + the **`MIX_ENV=test mix fathom.wire_bench`** task emit `hrana_rt_us`, `cold_open_wire_p50_us`, `tpcb_wire_overhead_us` (Framing A: TPC-B seed + 7-stmt deck, WS-vs-raw-exqlite delta with a reused-prepared baseline). **As-built vs the original row:** gating did NOT touch `Fathom.Bench.Gate`/`perf_history` — the wire metrics live in the gitignored `scripts/wire_history.jsonl` and are gated by the task's `--check` (last-same-host, block ≥20%), because the client dep is dev/test-only and the prod gate runs `MIX_ENV=prod`. The per-metric-threshold `Gate` extension moves to Phase 2 (it's only needed for the loose `tpcb_node_tps` gate). | ~3.5–4 days |
-| **2 — TPC-B aggregate + isolation (WS)** | `tpcb_node_tps` (Framing B) gated-loose via concurrent loopback WS streams; the concurrent-write **isolation-under-write-load** test through the loopback WS wire, under the shard-isolation gate. | ~2 days |
+| **2 — TPC-B aggregate + isolation (WS) ✅ DONE** | `Fathom.Bench.Wire.tpcb_node_tps/1` (Framing B): seed N shards in-process, then time a concurrent loopback-WS write burst per shard → aggregate txn/s; a new `mix fathom.wire_bench` metric with `--tpcb-shards`/`--tpcb-node-txns` knobs + a **loose 50% per-metric threshold in the task** (`@thresholds`). `test/fathom/tpcb_isolation_test.exs`: concurrent-write **isolation-under-write-load** through the wire (per-shard consistency + zero cross-shard contamination), under the shard-isolation gate; teeth proven RED against a commingle variant. **As-built vs the row:** the loose gate lives in the wire task, **not** `Fathom.Bench.Gate` (wire metrics are dev/test-only → never the `MIX_ENV=prod` commit gate). | ~2 days |
 | **3 — TPC-C loopback WS, W = 1..5 sweep** | `mix fathom.tpcc`: 9-table schema + seed, all 5 weighted txn profiles, warehouse×thread matrix over the WS client, run at **each W ∈ 1..5**, per-txn-type `p50/p95/p99/max` + `tpmC` **per W** → `scripts/tpc_history.jsonl` (one row per W). Recorded-only. (5× the seed+run work of a single-W run.) | ~4.5–5.5 days |
 | **4 — remote-client realism (rig headline)** | `chaos.sh tpcb` + `chaos.sh tpcc`: real remote libSQL client over the network through the LB (true cross-network RTT + the per-txn-type latency + tpmC W-sweep), written to `docs/reviews/tpc*-run-<date>.md`. | ~2.5–3.5 days |
 
