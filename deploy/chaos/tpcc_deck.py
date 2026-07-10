@@ -26,9 +26,16 @@ def cardinalities(scale):
 
 # --- schema + seed ---------------------------------------------------------------------------
 
+_TABLES = ["warehouse", "district", "customer", "history", "new_order",
+           "oorder", "order_line", "item", "stock"]
+
+
 def schema_ddl():
     dist = ", ".join(f"s_dist_{n:02d} TEXT" for n in range(1, 11))
-    return [
+    # DROP-first so each run starts clean — a no-op on fathom (every W gets a fresh shard file)
+    # but a reset on a shared-DB server like libsql-server/sqld (single database, so successive
+    # runs would otherwise collide on CREATE / double-insert on the seed).
+    return [f"DROP TABLE IF EXISTS {t}" for t in _TABLES] + [
         "CREATE TABLE warehouse (w_id INTEGER PRIMARY KEY, w_tax REAL, w_ytd REAL, w_name TEXT, "
         "w_street_1 TEXT, w_street_2 TEXT, w_city TEXT, w_state TEXT, w_zip TEXT)",
         "CREATE TABLE district (d_w_id INTEGER, d_id INTEGER, d_tax REAL, d_ytd REAL, "
