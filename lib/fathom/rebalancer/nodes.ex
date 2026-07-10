@@ -10,21 +10,21 @@ defmodule Fathom.Rebalancer.Nodes do
   """
   import Ecto.Query, only: [from: 2]
 
-  alias Fathom.Rebalancer.NodeBeat
+  alias Fathom.Rebalancer.{NodeBeat, Stats}
   alias Fathom.Repo
 
   @doc """
   Records `node_key` as alive now, and optionally this window's full-distribution stats
-  (`:q_p99`, `:sample_count` — finding #2). Upsert on node_key. Returns `:ok`.
+  (`:q_p99`, `:sample_count`, `:q_hist` — findings #2/#4). Upsert on node_key. Returns `:ok`.
   """
   @spec beat(String.t(), keyword()) :: :ok
   def beat(node_key, opts \\ []) do
     now = DateTime.utc_now()
     # A liveness-only `beat/1` (no stats) must NOT erase the node's last-published
-    # q_p99/sample_count (review 2026-07-09 #5): a plain beat with an unconditional
-    # `set: [q_p99: nil, ...]` would NULL them and drop the node from the fleet-p99 bar.
+    # q_p99/sample_count/q_hist (review 2026-07-09 #5): a plain beat with an unconditional
+    # `set: [q_hist: nil, ...]` would NULL them and drop the node from the fleet-p99 bar.
     # Include the stats in the upsert ONLY when supplied.
-    stats = Keyword.take(opts, [:q_p99, :sample_count])
+    stats = Keyword.take(opts, [:q_p99, :sample_count, :q_hist])
 
     Repo.insert!(
       struct(%NodeBeat{node_key: node_key, last_seen_at: now}, stats),
@@ -46,37 +46,47 @@ defmodule Fathom.Rebalancer.Nodes do
   end
 
   @doc """
-  The fleet hot bar (finding #2): a **count-weighted mean** of the full-distribution p99s of
-  live nodes that are **actually serving load** (`sample_count > 0`), or `nil` if the fleet's
-  total sample count is below `min_samples` (the bar isn't trustworthy yet, so the policy falls
-  back to the floor / legacy path rather than acting on noise).
+  The fleet hot bar (findings #2/#4): the **true pooled-distribution p99** of the fleet's
+  per-shard q/s, computed by summing live nodes' published `q_hist` histograms element-wise and
+  reading the p99 of the merged histogram (`Fathom.Rebalancer.Stats`). Returns `nil` when the
+  pooled sample count is below `min_samples` (the bar isn't trustworthy yet, so the policy makes
+  no p99-relative move — it does NOT fall back to a truncated-head percentile, review #4).
 
-  Aggregating only over loaded nodes, weighted by their sample count, is the refinement from the
-  2026-07-08 rig run: the earlier median over *all* live nodes collapsed toward 0 when a hotspot
-  concentrated on a minority of nodes (the idle nodes each contributed a p99 of 0), so the
-  p99-relative bar flagged nothing exactly when it mattered. A busier node now contributes
-  proportionally more and idle nodes can't drag the bar down. This is an approximation of the
-  true pooled-distribution p99 (a faithful merge would need per-node histograms, unwarranted for
-  a fallback bar — the absolute floor is the recommended path).
+  This replaced a count-weighted *mean* of per-node p99s, which is not the pooled percentile and
+  drifted with fleet composition (a busy node could pull the bar the wrong way). Summing the
+  histograms is exact up to bucket resolution: an idle node contributes all-zero counts (can't
+  drag the bar), and a busy node contributes its actual per-shard spread (not just its p99).
   """
   @spec fleet_p99(non_neg_integer(), non_neg_integer()) :: float() | nil
   def fleet_p99(within_ms, min_samples) do
     cutoff = DateTime.add(DateTime.utc_now(), -within_ms, :millisecond)
 
-    stats =
+    pooled =
       Repo.all(
         from n in NodeBeat,
-          where: n.last_seen_at >= ^cutoff and not is_nil(n.q_p99) and n.sample_count > 0,
-          select: {n.q_p99, n.sample_count}
+          where: n.last_seen_at >= ^cutoff and not is_nil(n.q_hist),
+          select: n.q_hist
       )
+      |> merge_histograms()
 
-    total = stats |> Enum.map(fn {_p99, c} -> c end) |> Enum.sum()
+    total = Enum.sum(pooled)
 
     if total >= min_samples and total > 0 do
-      weighted = stats |> Enum.map(fn {p99, c} -> p99 * c end) |> Enum.sum()
-      weighted / total
+      Stats.percentile_from_histogram(pooled, 99)
     else
       nil
+    end
+  end
+
+  # Element-wise sum of the live nodes' histograms. All share Stats.bucket_edges/0, so they're
+  # equal-length; a defensive length filter drops any pre-schema/legacy vector rather than
+  # silently truncating the sum via zip.
+  defp merge_histograms(hists) do
+    width = Stats.bucket_count()
+
+    case Enum.filter(hists, &(length(&1) == width)) do
+      [] -> []
+      [first | rest] -> Enum.reduce(rest, first, fn h, acc -> Enum.zip_with(acc, h, &+/2) end)
     end
   end
 end

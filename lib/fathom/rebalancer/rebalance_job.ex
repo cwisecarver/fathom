@@ -75,9 +75,9 @@ defmodule Fathom.Rebalancer.RebalanceJob do
     samples = LoadSamples.since(horizon_ms()) |> Enum.map(&Map.from_struct/1)
     overrides = Overrides.all()
     backends = Rebalancer.lb_backends()
-    # The fleet-relative hot bar (finding #2): count-weighted mean of loaded nodes'
-    # full-distribution p99s, or nil (untrusted → policy uses the floor / legacy path) below
-    # the sample floor.
+    # The fleet-relative hot bar (findings #2/#4): the TRUE pooled-distribution p99 from the
+    # live nodes' merged q/s histograms, or nil below the sample floor (untrusted → policy makes
+    # no p99-relative move; it does NOT fall back to a truncated-head percentile).
     fleet_p99 = Nodes.fleet_p99(node_stale_ms(), min_p99_samples())
     # Warm-location map for affinity-aware target selection (Phase 2 C): which nodes have each
     # hot shard warm-cached, so a handoff prefers a warm target. Same freshness as liveness.

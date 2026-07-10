@@ -13,14 +13,15 @@ defmodule Fathom.Rebalancer.Policy do
   bar self-scales: a uniform fleet has p99≈max so `mult × p99` flags nothing (no false
   hotspot); a sharp Zipf head has a low p99 so the head clears it.
 
-  The **fleet p99 is supplied by the orchestrator** (`:fleet_p99` — a count-weighted mean of
-  the FULL-distribution p99s of loaded nodes, each computed over all that node's active shards
-  before the top-N publish truncation; see `Fathom.Rebalancer.Nodes.fleet_p99/2`). This is what
-  makes it genuinely fleet-relative (finding #2): computing p99 from the truncated top-N *head*
-  the reporter publishes gives a systematically high bar that under-flags. When `:fleet_p99`
-  isn't supplied (below the sample floor, or a direct test caller), it falls back to
-  `mult × percentile(samples, 99)` over whatever samples were passed, using an interpolating
-  percentile so a small-N sharp head isn't pinned to the max.
+  The **fleet p99 is supplied by the orchestrator** (`:fleet_p99` — the TRUE pooled-distribution
+  p99 of the fleet's per-shard q/s, from the live nodes' merged q/s histograms; see
+  `Fathom.Rebalancer.Nodes.fleet_p99/2`). This is what makes it genuinely fleet-relative (finding
+  #2): computing p99 from the truncated top-N *head* the reporter publishes gives a
+  systematically high bar that under-flags. When the orchestrator supplies `:fleet_p99` but it's
+  `nil` (below the sample floor / no data), the policy makes **no** p99-relative move rather than
+  falling back to the head percentile #2 removed (finding #4). Only a *direct* caller that passes
+  no `:fleet_p99` at all uses the legacy `mult × percentile(samples, 99)` over the full
+  distribution it supplied (interpolating, so a small-N sharp head isn't pinned to the max).
 
   ## Anti-flap + safety
 
@@ -74,6 +75,12 @@ defmodule Fathom.Rebalancer.Policy do
   def propose(samples, overrides, backends, opts \\ []) do
     floor = Keyword.get(opts, :floor, Application.get_env(:fathom, :rebalance_hot_qps_floor))
     fleet_p99 = Keyword.get(opts, :fleet_p99)
+    # Whether the ORCHESTRATOR is driving detection with a fleet p99 (the key is present even
+    # when the value is nil below the sample floor). In that mode a nil p99 means "no trustworthy
+    # bar → make no p99-relative move" — NOT a fall-through to the truncated-head percentile that
+    # #2 removed (review #4). Absent key ⇒ a direct/test caller passing the full distribution,
+    # where the interpolating head percentile is correct.
+    fleet_mode? = Keyword.has_key?(opts, :fleet_p99)
     mult = Keyword.get(opts, :p99_multiple, cfg(:rebalance_p99_multiple, 20)) / 1.0
     confirm = Keyword.get(opts, :confirm_windows, cfg(:rebalance_confirm_windows, 2))
     cooldown_ms = Keyword.get(opts, :cooldown_ms, cfg(:rebalance_cooldown_ms, 300_000))
@@ -85,7 +92,7 @@ defmodule Fathom.Rebalancer.Policy do
 
     latest = latest_per_shard(samples)
     rates = latest |> Map.values() |> Enum.map(& &1.q_per_s)
-    threshold = hot_threshold(floor, mult, fleet_p99, rates)
+    threshold = hot_threshold(floor, mult, fleet_p99, fleet_mode?, rates)
     node_load = node_load(latest)
     cooling = cooling_shards(overrides, now, cooldown_ms)
     backend_keys = Map.keys(backends)
@@ -205,22 +212,30 @@ defmodule Fathom.Rebalancer.Policy do
     end
   end
 
-  # The hot bar, in precedence order (finding #2):
+  # The hot bar, in precedence order (findings #2/#4):
   #   1. an absolute floor if configured (the recommended prod config);
-  #   2. else `mult × fleet_p99` when the orchestrator supplies a fleet-wide p99 (computed by
-  #      the reporters over their FULL rate distribution, not the truncated top-N head — the
-  #      head-only p99 was systematically too high and under-flagged);
-  #   3. else the legacy `mult × percentile(samples, 99)` (for callers/tests that pass the
-  #      full sample distribution directly; interpolating percentile, so a small-N sharp head
-  #      isn't pinned to max).
-  defp hot_threshold(floor, _mult, _fleet_p99, _rates) when is_number(floor) and floor > 0,
-    do: floor / 1.0
+  #   2. else `mult × fleet_p99` when the orchestrator supplies a usable fleet-wide p99 (the true
+  #      pooled percentile the reporters' merged histograms give — Nodes.fleet_p99/2);
+  #   3. else, IN FLEET MODE with no usable p99 (below the sample floor / no data): NO p99 bar —
+  #      return 0.0 so the `q_per_s >= threshold and threshold > 0.0` filter flags nothing. This
+  #      deliberately does NOT fall back to the truncated-head percentile (#4): that head-only
+  #      p99 was systematically too high AND computed over the top-N head #2 set out to avoid.
+  #      Prod should configure an absolute floor for such a fleet.
+  #   4. else (direct/test caller, no :fleet_p99 supplied): the legacy `mult ×
+  #      percentile(samples, 99)` over the full distribution the caller passed (interpolating, so
+  #      a small-N sharp head isn't pinned to max).
+  defp hot_threshold(floor, _mult, _fleet_p99, _fleet?, _rates)
+       when is_number(floor) and floor > 0,
+       do: floor / 1.0
 
-  defp hot_threshold(_floor, mult, fleet_p99, _rates)
+  defp hot_threshold(_floor, mult, fleet_p99, _fleet?, _rates)
        when is_number(fleet_p99) and fleet_p99 > 0,
        do: mult * fleet_p99
 
-  defp hot_threshold(_floor, mult, _fleet_p99, rates), do: mult * Stats.percentile(rates, 99)
+  defp hot_threshold(_floor, _mult, _fleet_p99, true, _rates), do: 0.0
+
+  defp hot_threshold(_floor, mult, _fleet_p99, false, rates),
+    do: mult * Stats.percentile(rates, 99)
 
   # Anti-flap (finding #9): a candidate must clear the bar in ≥ confirm DISTINCT windows on
   # its CURRENT serving node. Filtering to `candidate.node_key` stops an LB remap (where the

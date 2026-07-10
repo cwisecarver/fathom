@@ -26,9 +26,14 @@ defmodule Fathom.Rebalancer.NodeBeat do
 
   schema "rebalancer_nodes" do
     field :last_seen_at, :utc_datetime_usec
-    # This node's full-distribution q/s p99 and its sample count for the window (finding #2) —
-    # the fleet hot bar the policy uses, published alongside the liveness beat.
+    # This node's full-distribution q/s p99 and its sample count for the window (finding #2),
+    # published alongside the liveness beat. Kept for observability; the fleet bar itself is
+    # now computed from q_hist (below).
     field :q_p99, :float
     field :sample_count, :integer
+    # A fixed-bucket histogram of this node's per-shard q/s (Fathom.Rebalancer.Stats.histogram/1),
+    # summed across nodes into the TRUE pooled-distribution p99 — the sound fleet hot bar that
+    # replaced the count-weighted mean of per-node p99s (finding #4).
+    field :q_hist, {:array, :integer}
   end
 end

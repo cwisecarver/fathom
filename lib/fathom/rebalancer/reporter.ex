@@ -96,14 +96,20 @@ defmodule Fathom.Rebalancer.Reporter do
 
     try do
       # The FULL positive-rate distribution this window (all active shards, before top-N
-      # truncation). Its p99 is the fleet hot bar (#2); the top-N of it is what's published.
+      # truncation). The top-N of it is what's published; the whole distribution feeds the
+      # fleet hot bar (#2/#4).
       rows = positive_rate_rows(prev, curr, window_s)
-      p99 = Stats.percentile(Enum.map(rows, & &1.q_per_s), 99)
+      qps = Enum.map(rows, & &1.q_per_s)
 
-      # Liveness beat for the dead-node reconciler (#1b) — rides this tick so a serving node
-      # is a beating node — now carrying this node's full-distribution p99 + sample count for
-      # the fleet-relative hot bar (#2).
-      Nodes.beat(Rebalancer.node_key(), q_p99: p99, sample_count: length(rows))
+      # Liveness beat for the dead-node reconciler (#1b) — rides this tick so a serving node is
+      # a beating node — carrying this node's full-distribution p99 + sample count (observability)
+      # and a q/s histogram the orchestrator merges into the TRUE pooled fleet p99 (#4).
+      Nodes.beat(Rebalancer.node_key(),
+        q_p99: Stats.percentile(qps, 99),
+        sample_count: length(rows),
+        q_hist: Stats.histogram(qps)
+      )
+
       publish(Enum.take(rows, top_n()))
       prune()
       # Advertise which fleet-hot shards THIS node has warm-cached (affinity-aware target, #C):

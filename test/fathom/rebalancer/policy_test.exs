@@ -114,6 +114,22 @@ defmodule Fathom.Rebalancer.PolicyTest do
     assert propose(samples, p99_multiple: 20, confirm_windows: 2) == []
   end
 
+  test "orchestrator mode with a nil fleet_p99 makes no move — no head-only fallback (#4)" do
+    # A long cold tail + sharp head: a head-only percentile over these samples is ~1 → bar ~20,
+    # so the head @500 clears it. That's exactly the truncated-head bar #2 removed.
+    tail = for i <- 1..100, do: s("n1", "cold_#{i}", 1.0, 0)
+    hot = [s("n1", "hot_1", 500, 10), s("n1", "hot_1", 500, 0)]
+    samples = hot ++ tail
+
+    # A DIRECT caller (no :fleet_p99 key) still uses the head percentile over the full samples.
+    assert [%{shard_id: "hot_1"}] = propose(samples, p99_multiple: 20, confirm_windows: 2)
+
+    # But in ORCHESTRATOR mode (key present) with nil p99 (below the sample floor / no fleet
+    # data), the policy must NOT fall back to that head percentile — it proposes nothing (#4).
+    # Prod configures an absolute floor for such a fleet instead.
+    assert propose(samples, fleet_p99: nil, p99_multiple: 20, confirm_windows: 2) == []
+  end
+
   test "max_moves caps per tick and spreads across targets (no new hotspot)" do
     # n1 hashed several hot shards (+ filler so it stays overloaded after the first move);
     # n2 and n3 are cold. With max_moves: 2 the two hottest fan out to different nodes.
