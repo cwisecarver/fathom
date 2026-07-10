@@ -20,28 +20,27 @@ defmodule Fathom.Rebalancer.WarmLocations do
     # Isolation gate (review 2026-07-09 #6): insert_all bypasses the changeset, and a
     # shard_warm_locations row feeds affinity target selection — so drop any id ShardId
     # wouldn't accept (defense-in-depth; the ids come from validated ShardLoad samples).
-    do_publish(node_key, Enum.filter(shard_ids, &Fathom.ShardId.valid?/1))
-  end
-
-  defp do_publish(node_key, []) do
-    Repo.delete_all(from w in WarmLocation, where: w.node_key == ^node_key)
-    :ok
-  end
-
-  defp do_publish(node_key, shard_ids) do
+    valid_ids = Enum.filter(shard_ids, &Fathom.ShardId.valid?/1)
     now = DateTime.utc_now()
 
-    # Retract advertisements for shards this node no longer warms (cooled out of the hot set,
-    # or LRU-evicted from the warm cache).
-    Repo.delete_all(
-      from w in WarmLocation, where: w.node_key == ^node_key and w.shard_id not in ^shard_ids
-    )
-
-    rows = Enum.map(shard_ids, &%{node_key: node_key, shard_id: &1, updated_at: now})
+    # Upsert FIRST, stamping `now` on every kept/inserted row (a no-op for an empty set).
+    rows = Enum.map(valid_ids, &%{node_key: node_key, shard_id: &1, updated_at: now})
 
     Repo.insert_all(WarmLocation, rows,
       on_conflict: {:replace, [:updated_at]},
       conflict_target: [:node_key, :shard_id]
+    )
+
+    # ...then retract exactly the rows this publish DIDN'T refresh — the ones this node no
+    # longer warms (cooled out of the hot set, or LRU-evicted). An age sweep (`updated_at <
+    # now`) is a constant 2-parameter query, not `shard_id not in ^valid_ids` — that bind list
+    # grows with the warm∩hot set and can blow Postgres's 65535-parameter limit at fleet scale,
+    # where the reporter's rescue would then silently drop every window (review #14). Safe
+    # without a transaction: only this node's single Reporter publishes for this node_key, and
+    # the sweep is node-scoped. Pairs with the [:updated_at] index (#13). Handles the empty set
+    # too: nothing stamped `now`, so every row is older and gets swept.
+    Repo.delete_all(
+      from w in WarmLocation, where: w.node_key == ^node_key and w.updated_at < ^now
     )
 
     :ok

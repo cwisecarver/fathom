@@ -23,6 +23,24 @@ defmodule Fathom.Rebalancer.WarmLocationsTest do
     assert WarmLocations.warm_nodes(60_000)["a"] == MapSet.new(["n1"])
   end
 
+  test "a re-publish refreshes kept rows so they survive the age-sweep retract (#14)" do
+    # Retract is now an age sweep (`updated_at < now`, a constant 2-param query) rather than
+    # `shard_id not in ^ids` (an unbounded bind list). It works because the upsert stamps a
+    # fresh `now` on every kept row: kept rows survive the sweep, unrefreshed ones are dropped.
+    :ok = WarmLocations.publish("n1", ["a", "b"])
+    a0 = Repo.get_by!(WarmLocation, node_key: "n1", shard_id: "a").updated_at
+
+    :ok = WarmLocations.publish("n1", ["a", "c"])
+
+    wn = WarmLocations.warm_nodes(60_000)
+    assert wn["a"] == MapSet.new(["n1"]), "kept + refreshed"
+    assert wn["c"] == MapSet.new(["n1"]), "newly added"
+    refute Map.has_key?(wn, "b"), "not refreshed ⇒ age-swept"
+
+    a1 = Repo.get_by!(WarmLocation, node_key: "n1", shard_id: "a").updated_at
+    assert DateTime.compare(a1, a0) == :gt, "kept row's updated_at bumped past the sweep cutoff"
+  end
+
   test "publish drops invalid shard_ids before insert_all (#6)" do
     # insert_all bypasses the changeset, and a warm-location row feeds affinity target
     # selection — an invalid id must never persist. Valid ids in the same call still publish.
