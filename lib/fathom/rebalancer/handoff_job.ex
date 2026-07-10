@@ -97,12 +97,22 @@ defmodule Fathom.Rebalancer.HandoffJob do
   end
 
   # Best-effort: a warm failure isn't fatal (the target cold-opens correctly), so proceed.
+  # A rejected issue (e.g. an invalid shard_id now gated at Command.changeset — #6) is logged
+  # and skipped, NOT hard-matched — so an invalid shard reverts at pin_and_flip (#14) instead
+  # of MatchError-crashing here before the with-chain can handle it.
   defp warm(shard, to) do
-    {:ok, cmd} = Commands.issue(shard, to, "warm")
+    case Commands.issue(shard, to, "warm") do
+      {:ok, cmd} ->
+        case Commands.await(cmd.id, timeout_ms: warm_timeout()) do
+          {:ok, _} ->
+            :ok
 
-    case Commands.await(cmd.id, timeout_ms: warm_timeout()) do
-      {:ok, _} -> :ok
-      other -> Logger.info("rebalance: warm #{shard} on #{to} not confirmed (#{inspect(other)})")
+          other ->
+            Logger.info("rebalance: warm #{shard} on #{to} not confirmed (#{inspect(other)})")
+        end
+
+      {:error, changeset} ->
+        Logger.info("rebalance: warm #{shard} not issued (#{inspect(changeset.errors)})")
     end
   end
 

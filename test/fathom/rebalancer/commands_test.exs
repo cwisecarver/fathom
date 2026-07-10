@@ -43,6 +43,19 @@ defmodule Fathom.Rebalancer.CommandsTest do
     assert "is invalid" in errors_on(changeset).command
   end
 
+  test "rejects an invalid shard_id at the command boundary (#6)" do
+    # The isolation gate: a command's shard_id is handed straight to Shards.drain /
+    # WarmFollower.warm_now (a file path) by the poller — a path-traversal or nginx-injection
+    # id must never be persisted for a node to execute.
+    for bad <- ["../etc/passwd", "acme.evil", "a/b", "has space", String.duplicate("x", 65)] do
+      assert {:error, changeset} = Commands.issue(bad, "n", "warm")
+      assert "is not a valid shard id" in errors_on(changeset).shard_id
+    end
+
+    # A valid id still issues.
+    assert {:ok, _} = Commands.issue("acme_1", "n", "warm")
+  end
+
   test "cancel_pending_drains cancels only pending drains for the shard (#7)" do
     {:ok, d1} = Commands.issue("s", "src", "drain")
     {:ok, d2} = Commands.issue("s", "src", "drain")

@@ -33,5 +33,18 @@ defmodule Fathom.Rebalancer.Command do
     |> validate_required([:shard_id, :node, :command])
     |> validate_inclusion(:command, @commands)
     |> validate_inclusion(:status, @statuses)
+    |> validate_shard_id()
+  end
+
+  # The isolation gate at the command write boundary (review 2026-07-09 #6): a command's
+  # `shard_id` is later handed straight to `Fathom.Shards.drain/2` and
+  # `Fathom.Shard.WarmFollower.warm_now/1` (→ `cache_path/1`, a `#{shard_id}.db` file path) by
+  # the target node's poller. Enforce `Fathom.ShardId`'s ONE rule (not a duplicated regex) here
+  # so a malformed/path-traversal id can never be persisted for a node to execute, rather than
+  # trusting the far-upstream request-path validation.
+  defp validate_shard_id(changeset) do
+    validate_change(changeset, :shard_id, fn :shard_id, id ->
+      if Fathom.ShardId.valid?(id), do: [], else: [shard_id: "is not a valid shard id"]
+    end)
   end
 end

@@ -66,7 +66,16 @@ defmodule Fathom.Shard.WarmFollower do
 
   @doc "Local path of `shard_id`'s warm cache copy (may not exist)."
   @spec cache_path(String.t()) :: Path.t()
-  def cache_path(shard_id), do: Path.join(cache_dir(), "#{shard_id}.db")
+  def cache_path(shard_id) do
+    # Path-traversal / isolation gate (review 2026-07-09 #6): shard_id becomes a file name
+    # here, so a `..`/`/` id would escape cache_dir. Enforce ShardId's one rule. The
+    # command-reachable entry (warm_now/1) validates first and skips gracefully, so this raise
+    # is a fail-closed assertion that should never fire on a validated id.
+    Fathom.ShardId.valid?(shard_id) ||
+      raise(ArgumentError, "invalid shard id: #{inspect(shard_id)}")
+
+    Path.join(cache_dir(), "#{shard_id}.db")
+  end
 
   @doc """
   Warm-pulls one specific shard into this node's warm cache **now**, bypassing the poll
@@ -80,9 +89,16 @@ defmodule Fathom.Shard.WarmFollower do
   """
   @spec warm_now(String.t()) :: :ok | {:error, :not_warmable}
   def warm_now(shard_id) do
-    case pull_one(shard_id) do
-      {:ok, ^shard_id} -> :ok
-      :skip -> {:error, :not_warmable}
+    # Validate at the command-reachable entry (#6): a poller runs this straight from a
+    # command's shard_id, so an invalid id is skipped gracefully (best-effort warm) rather than
+    # tripping cache_path/1's assertion and wedging the command.
+    if Fathom.ShardId.valid?(shard_id) do
+      case pull_one(shard_id) do
+        {:ok, ^shard_id} -> :ok
+        :skip -> {:error, :not_warmable}
+      end
+    else
+      {:error, :not_warmable}
     end
   end
 

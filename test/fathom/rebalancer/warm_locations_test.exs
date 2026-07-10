@@ -23,6 +23,22 @@ defmodule Fathom.Rebalancer.WarmLocationsTest do
     assert WarmLocations.warm_nodes(60_000)["a"] == MapSet.new(["n1"])
   end
 
+  test "publish drops invalid shard_ids before insert_all (#6)" do
+    # insert_all bypasses the changeset, and a warm-location row feeds affinity target
+    # selection — an invalid id must never persist. Valid ids in the same call still publish.
+    :ok = WarmLocations.publish("n1", ["ok_1", "../evil", "a/b", "also_ok"])
+
+    wn = WarmLocations.warm_nodes(60_000)
+    assert wn["ok_1"] == MapSet.new(["n1"])
+    assert wn["also_ok"] == MapSet.new(["n1"])
+    refute Map.has_key?(wn, "../evil")
+    refute Map.has_key?(wn, "a/b")
+
+    # An all-invalid list retracts the node's set (nothing valid to advertise).
+    :ok = WarmLocations.publish("n1", ["../evil"])
+    assert WarmLocations.warm_nodes(60_000) == %{}
+  end
+
   test "warm_nodes ignores stale rows; prune deletes them" do
     :ok = WarmLocations.publish("n1", ["a"])
 

@@ -60,6 +60,20 @@ defmodule Fathom.Shard.WarmFollowerTest do
   # Drive one refresh cycle synchronously and return the cached set.
   defp refresh(pid), do: GenServer.call(pid, :refresh)
 
+  test "warm_now skips an invalid shard_id gracefully; cache_path refuses to build the path (#6)" do
+    # A poller runs warm_now straight from a command's shard_id. A path-traversal id must not
+    # escape the cache dir — warm_now skips it (best-effort, no wedge) and cache_path fails
+    # closed rather than joining `../...` into cache_dir.
+    for bad <- ["../etc/passwd", "a/b", "acme.evil", "has space"] do
+      assert {:error, :not_warmable} = WarmFollower.warm_now(bad)
+      assert_raise ArgumentError, fn -> WarmFollower.cache_path(bad) end
+    end
+
+    # A valid id builds a path inside the cache dir.
+    path = WarmFollower.cache_path("acme_1")
+    assert Path.dirname(path) == Application.get_env(:fathom, :warm_cache_dir)
+  end
+
   test "pre-pulls recently-active shards it doesn't own" do
     a = seed_shard("warm_a_#{uniq()}")
     b = seed_shard("warm_b_#{uniq()}")

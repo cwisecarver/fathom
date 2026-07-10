@@ -16,12 +16,19 @@ defmodule Fathom.Rebalancer.WarmLocations do
   node's rows for shards no longer warm+hot. Returns `:ok`.
   """
   @spec publish(String.t(), [String.t()]) :: :ok
-  def publish(node_key, []) do
+  def publish(node_key, shard_ids) when is_list(shard_ids) do
+    # Isolation gate (review 2026-07-09 #6): insert_all bypasses the changeset, and a
+    # shard_warm_locations row feeds affinity target selection — so drop any id ShardId
+    # wouldn't accept (defense-in-depth; the ids come from validated ShardLoad samples).
+    do_publish(node_key, Enum.filter(shard_ids, &Fathom.ShardId.valid?/1))
+  end
+
+  defp do_publish(node_key, []) do
     Repo.delete_all(from w in WarmLocation, where: w.node_key == ^node_key)
     :ok
   end
 
-  def publish(node_key, shard_ids) do
+  defp do_publish(node_key, shard_ids) do
     now = DateTime.utc_now()
 
     # Retract advertisements for shards this node no longer warms (cooled out of the hot set,
