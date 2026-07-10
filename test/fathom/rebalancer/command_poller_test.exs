@@ -21,6 +21,9 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     %{shard: shard, node: Rebalancer.node_key()}
   end
 
+  defp restore(k, nil), do: Application.delete_env(:fathom, k)
+  defp restore(k, v), do: Application.put_env(:fathom, k, v)
+
   test "a drain command releases the shard on this node and marks the command done",
        %{shard: shard, node: node} do
     # A real drain is always preceded by a pin (pin_and_flip runs before drain is issued);
@@ -124,6 +127,79 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     assert CommandPoller.poll_now() == 3
 
     for id <- ids, do: assert(Commands.get(id).status == "done")
+  end
+
+  test "the per-command task timeout is ordered above the drain worst-case (#11)" do
+    # on_timeout: :kill_task is only meaningful with a FINITE timeout, and it must exceed the
+    # poller's worst-case drain (command_drain_ms + Shards.drain's +30s net) so a slow-but-
+    # succeeding drain isn't killed mid-flight — only a genuinely wedged command hits it.
+    prev = Application.get_env(:fathom, :command_drain_ms)
+    prev_t = Application.get_env(:fathom, :command_task_timeout_ms)
+    Application.put_env(:fathom, :command_drain_ms, 10_000)
+    Application.delete_env(:fathom, :command_task_timeout_ms)
+
+    on_exit(fn ->
+      restore(:command_drain_ms, prev)
+      restore(:command_task_timeout_ms, prev_t)
+    end)
+
+    assert CommandPoller.task_timeout() >= 10_000 + 30_000
+
+    # An explicit override wins (operator owns the ordering).
+    Application.put_env(:fathom, :command_task_timeout_ms, 99_999)
+    assert CommandPoller.task_timeout() == 99_999
+  end
+
+  test "the poll timer decouples from a slow in-flight drain (#11)", %{node: node} do
+    # A slow drain must not gate the next tick's warm pickup. Drive dispatch explicitly (high
+    # auto-poll interval) so the assertions are deterministic, and hold a connection so the
+    # drain blocks ~command_drain_ms instead of completing.
+    drain_shard = "poll11d_#{System.unique_integer([:positive])}"
+    warm_shard = "poll11w_#{System.unique_integer([:positive])}"
+
+    prev_poll = Application.get_env(:fathom, :command_poll_ms)
+    prev_drain = Application.get_env(:fathom, :command_drain_ms)
+    Application.put_env(:fathom, :command_poll_ms, 60_000)
+    Application.put_env(:fathom, :command_drain_ms, 5_000)
+
+    on_exit(fn ->
+      restore(:command_poll_ms, prev_poll)
+      restore(:command_drain_ms, prev_drain)
+
+      for id <- [drain_shard, warm_shard],
+          dir <- ["fathom_shards", "fathom_remote_test"],
+          s <- ["", "-wal", "-shm"] do
+        File.rm(Path.join([System.tmp_dir!(), dir, "#{id}.db"]) <> s)
+      end
+    end)
+
+    {:ok, _} = Overrides.pin(drain_shard, node, reason: "test")
+    {:ok, cpid, ref, _} = Shards.checkout(drain_shard)
+    {:ok, drain_cmd} = Commands.issue(drain_shard, node, "drain")
+
+    poller = start_supervised!(CommandPoller)
+
+    # Tick 1: dispatch the drain; its task blocks on the held connection (in-flight).
+    send(poller, :poll)
+    assert MapSet.member?(:sys.get_state(poller).in_flight, drain_cmd.id)
+
+    # A warm arrives while the drain is still blocked.
+    {:ok, warm_cmd} = Commands.issue(warm_shard, node, "warm")
+
+    # Tick 2: the warm is picked up and completes within a short window while the drain (5s) is
+    # still pending — the decoupling. (Pre-fix the poller blocked on the drain batch, so the
+    # warm couldn't be dispatched until the drain returned.)
+    send(poller, :poll)
+    assert {:ok, %{status: "done"}} = Commands.await(warm_cmd.id, timeout_ms: 2_000, poll_ms: 25)
+
+    assert Commands.get(drain_cmd.id).status == "pending",
+           "drain still draining, didn't block the warm"
+
+    # Release so the drain finishes; the poller survives.
+    down = Process.monitor(cpid)
+    Fathom.Shard.checkin(cpid, ref)
+    assert_receive {:DOWN, ^down, :process, ^cpid, _}, 8_000
+    assert Process.alive?(poller)
   end
 
   test "a warm command is best-effort: an un-flushed shard still marks done",
