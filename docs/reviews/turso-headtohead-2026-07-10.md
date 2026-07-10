@@ -74,10 +74,41 @@ machinery (a shared runtime, and a bounded `--max-active-namespaces` active set 
 namespaces churn cold) and hit a contention wall fathom doesn't. **fathom scales *out* with tenant
 count where a single-server design scales *up* and stalls.**
 
-This is still only *fan-out throughput at modest N*. The full **density** axis — *millions* of
-shards, where fathom cold-opens on demand (`mix fathom.scale` held 50k+ linearly to the fd ceiling)
-and a single sqld process cannot keep that many namespaces active — is the larger structural win
-and a separate measurement.
+This is still only *fan-out throughput at modest N*. The **density** axis below is the larger
+structural point.
+
+## Density — how many tenants can one server hold, and at what cost
+
+Both store a tenant as a file/dir. The question is what the *server* pays to hold N of them, and
+what the ceiling is. Measured on this box (`mix fathom.scale --ramp` for fathom; `turso_density.sh`
+for sqld):
+
+| | **fathom** (per node) | **libsql-server** (`sqld`, one process) |
+|---|---|---|
+| resident memory / tenant | ~26 KiB idle coordinator; ~176 KiB per *open* shard | ~17 KiB / namespace |
+| memory scales with | the **open working set** (idle-drop; the rest are cold files) | **total** namespaces (all resident in one process) |
+| disk / tenant | one shard file (S3-backed) | ~55 KiB (empty SQLite dir) |
+| create cost | **O(1)** — a shard is created by first write (cold-open ~2.6 ms); no registration | admin-API call, and the **rate degrades**: 116 → 59 → 29 /s at 1k → 2k → 4k |
+| open ceiling / node | 10k open at 1873 MB in this run (`max_open_shards` cap); hardware fd ceiling ~82k | RSS-bound: ~17 KiB × total (≈17 GB at 1M in one process) |
+| scale-out | tenants **LB-partition across the fleet** (millions across nodes) | single process (vertical, RAM-bound) |
+
+**The pivot is what memory scales with.** sqld keeps per-namespace state resident, so its RSS grows
+with *total* tenants — linear to 4000 (30 → 113 MiB, no plateau), extrapolating to ~17 GB for 1M in
+one process. fathom cold-opens a shard on demand and idle-drops it, so a node's memory tracks the
+**working set** (the tenants active *right now*), with the long cold tail sitting as files in
+storage for free. For a million tenants of which a few thousand are active at any moment, fathom
+holds a few thousand open; sqld holds a million resident.
+
+Two more walls sqld hits that fathom doesn't: **creation degrades** (116 → 29 /s and still
+dropping — minting a million namespaces would take many hours and keep slowing, vs fathom's O(1)
+first-write shard creation), and it is **one process** (no horizontal partition — fathom's LB hashes
+tenants across nodes, so "millions" is a fleet number, not a single-box number).
+
+**Verdict:** on the density axis they are not close. `sqld` namespaces are a solid multi-DB feature
+at thousands — tens of thousands; fathom is *architected* for the millions-of-small-tenants case
+(cold-openable files, working-set memory, O(1) creation, LB-partitioned). Neither was run to actual
+millions here (infeasible); this compares the per-tenant cost, the creation-rate slope, and the
+ceiling each design implies.
 
 ## Caveats (so this isn't oversold)
 
@@ -98,6 +129,11 @@ and a separate measurement.
   single synchronized window. Threads were GIL-bound (measuring the client, not the servers), which
   is why the process model is used. sqld's default `--max-active-namespaces` may contribute to its
   N=64 plateau (churning namespaces cold) — that overlaps the density axis and is not isolated here.
+- **Density is not run to millions** (infeasible). fathom's `--ramp` here was a dev/test build that
+  hit a `max_open_shards` soft cap at 10k (not the ~82k fd ceiling), and the idle-coordinator /
+  storage "millions" is architectural, not exhaustively run. sqld's per-namespace cost is measured
+  to 4k and the 1M figure is a linear extrapolation. The comparison is per-tenant cost + the
+  creation-rate slope + the ceiling each design implies, not a run to the limit.
 
 ## Reproduce
 
@@ -107,4 +143,6 @@ cd deploy/chaos
 ./turso_headtohead.sh               # per-DB: fresh sqld, drives both, prints the table
 # args: ./turso_headtohead.sh [rtt_samples tpcb_txns tpcc_txns]
 ./turso_multitenant.sh "8 32 64"    # multi-tenant: fresh sqld w/ namespaces, N shards vs N namespaces
+./turso_density.sh "500 1000 2000 4000"   # sqld namespace RSS/disk/create-rate sweep
+MIX_ENV=test mix fathom.scale --ramp --max 30000   # fathom open-shard density ceiling
 ```
