@@ -1,6 +1,6 @@
 # Fathom — TPC-B + TPC-C Benchmark Plan
 
-> Status: **Phases 0–2 BUILT (2026-07-10, rev. 5); Phases 3–4 planned.** This is the
+> Status: **Phases 0–3 BUILT (2026-07-10, rev. 6); Phase 4 planned.** This is the
 > implementation-ready design for adding *both* a TPC-B-derived and a TPC-C-derived
 > benchmark to fathom, additive to the existing harness (`docs/benchmark-plan.md`,
 > `Fathom.Bench`, `mix fathom.bench`, the `Fathom.Bench.Gate` regression gate,
@@ -27,6 +27,22 @@
 > `scripts/wire_history.jsonl`, never in the `MIX_ENV=prod` commit gate (`Fathom.Bench.Gate` is
 > untouched). The other wire metrics keep the global 20% band. Phase 2 is committed `[skip-bench]`
 > (test/support-only, no prod hot path), matching Phase 1.
+>
+> **Rev. 6 — Phase 3 shipped.** `Fathom.Bench.Tpcc` owns the 9-table schema + an in-process
+> recursive-CTE seeder (scaled by `--tpcc-scale`, default 1.0 = spec), all five weighted
+> transactions over the loopback WS client (New-Order ~45% / Payment ~43% / Order-Status /
+> Delivery / Stock-Level ~4% each), and the driver + W=1..5 sweep; `mix fathom.tpcc` appends one
+> row per W (`tpcc_tpmc` + per-txn-type `p50/p95/p99/max`) to `scripts/tpc_history.jsonl`.
+> **Recorded-only** — it never touches `Fathom.Bench.Gate` or `perf_history.jsonl`. **As-built
+> notes:** (1) read-modify-write txns use **`BEGIN IMMEDIATE`** so concurrent writers on the one
+> shard file serialize on the write lock rather than racing the district `d_next_o_id`
+> (single-writer SQLite — the plan didn't specify this). (2) The ~1% New-Order rollback rides the
+> **empty-rows** path (an unseeded item id → `SELECT item` returns no rows → `ROLLBACK`), so no
+> `HranaClient` error-threading was needed. (3) `tpc_history.jsonl` is **gitignored** (recorded-
+> only, host-specific — like `wire_history.jsonl`). Tests: exact seed cardinalities, per-txn write
+> effects over the wire (delta invariants that also pin rollback correctness), and a tiny-sweep
+> smoke asserting all 21 metric keys. Committed `[skip-bench]`. Phase 4 (the remote-client realism
+> headline) is the only remainder.
 >
 > **Decision (this session) — where wire metrics are gated.** The WS client is `mint_web_socket`,
 > `only: [:dev, :test]` (never ships prod), and the per-commit gate `commit_with_bench.sh` runs
@@ -667,7 +683,7 @@ assembly is linear in row count).
 | **0 — prereq ✅ DONE** | Fixed `Connection.collect` (`++` → O(R)) + `@tag :bench` large-result regression test; committed through the bench gate (`23b5b6f`). | ~0.5 day |
 | **1 — loopback WS harness + wire gate metrics ✅ DONE** | Built `Fathom.Bench.HranaClient` (`test/support`, `Mint.WebSocket`, dev/test only) — starts `Filo.Streams` + a Bandit `Filo.Plug` listener on `127.0.0.1:0`, drives hello → open_stream → execute → close_stream with `Filo.Value` encode/decode, shard via `Host: <shard>.local`. `Fathom.Bench.Wire` + the **`MIX_ENV=test mix fathom.wire_bench`** task emit `hrana_rt_us`, `cold_open_wire_p50_us`, `tpcb_wire_overhead_us` (Framing A: TPC-B seed + 7-stmt deck, WS-vs-raw-exqlite delta with a reused-prepared baseline). **As-built vs the original row:** gating did NOT touch `Fathom.Bench.Gate`/`perf_history` — the wire metrics live in the gitignored `scripts/wire_history.jsonl` and are gated by the task's `--check` (last-same-host, block ≥20%), because the client dep is dev/test-only and the prod gate runs `MIX_ENV=prod`. The per-metric-threshold `Gate` extension moves to Phase 2 (it's only needed for the loose `tpcb_node_tps` gate). | ~3.5–4 days |
 | **2 — TPC-B aggregate + isolation (WS) ✅ DONE** | `Fathom.Bench.Wire.tpcb_node_tps/1` (Framing B): seed N shards in-process, then time a concurrent loopback-WS write burst per shard → aggregate txn/s; a new `mix fathom.wire_bench` metric with `--tpcb-shards`/`--tpcb-node-txns` knobs + a **loose 50% per-metric threshold in the task** (`@thresholds`). `test/fathom/tpcb_isolation_test.exs`: concurrent-write **isolation-under-write-load** through the wire (per-shard consistency + zero cross-shard contamination), under the shard-isolation gate; teeth proven RED against a commingle variant. **As-built vs the row:** the loose gate lives in the wire task, **not** `Fathom.Bench.Gate` (wire metrics are dev/test-only → never the `MIX_ENV=prod` commit gate). | ~2 days |
-| **3 — TPC-C loopback WS, W = 1..5 sweep** | `mix fathom.tpcc`: 9-table schema + seed, all 5 weighted txn profiles, warehouse×thread matrix over the WS client, run at **each W ∈ 1..5**, per-txn-type `p50/p95/p99/max` + `tpmC` **per W** → `scripts/tpc_history.jsonl` (one row per W). Recorded-only. (5× the seed+run work of a single-W run.) | ~4.5–5.5 days |
+| **3 — TPC-C loopback WS, W = 1..5 sweep ✅ DONE** | `Fathom.Bench.Tpcc` + `mix fathom.tpcc`: 9-table schema + in-process recursive-CTE seed (`--tpcc-scale`, default 1.0 = spec), all 5 weighted txn profiles over the WS client, `--tpcc-threads` concurrent streams, run at **each W ∈ 1..--tpcc-max-w (default 5)**, per-txn-type `p50/p95/p99/max` + `tpmC` **per W** → `scripts/tpc_history.jsonl` (one row per W, gitignored). Recorded-only, never a gate. **As-built:** RMW txns use `BEGIN IMMEDIATE` (single-writer-safe `d_next_o_id`); the ~1% New-Order rollback rides the empty-rows path (no `HranaClient` change). Tests: seed cardinalities, per-txn write effects over the wire, tiny-sweep smoke (all 21 keys). | ~4.5–5.5 days |
 | **4 — remote-client realism (rig headline)** | `chaos.sh tpcb` + `chaos.sh tpcc`: real remote libSQL client over the network through the LB (true cross-network RTT + the per-txn-type latency + tpmC W-sweep), written to `docs/reviews/tpc*-run-<date>.md`. | ~2.5–3.5 days |
 
 Phases 0–1 deliver the entire *gated* value (a robust wire write-path delta, a real
