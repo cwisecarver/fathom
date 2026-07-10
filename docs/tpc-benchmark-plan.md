@@ -1,6 +1,6 @@
 # Fathom — TPC-B + TPC-C Benchmark Plan
 
-> Status: **Plan only (2026-07-09, rev. 2). Not implemented.** This is the
+> Status: **Plan only (2026-07-10, rev. 3). Not implemented.** This is the
 > implementation-ready design for adding *both* a TPC-B-derived and a TPC-C-derived
 > benchmark to fathom, additive to the existing harness (`docs/benchmark-plan.md`,
 > `Fathom.Bench`, `mix fathom.bench`, the `Fathom.Bench.Gate` regression gate,
@@ -9,19 +9,22 @@
 > nothing about fathom's per-tenant OLTP write path). Nothing here changes code; it
 > specifies what to build, in what order, and what each number does and does not mean.
 >
-> **Rev. 2 — every bench crosses the Hrana client wire.** The lead's directive: no TPC
-> bench measures the in-process `ShardExecutor` path. Instead:
-> - **GATE / CI benches** drive an **in-process loopback Hrana client** against Filo's
->   HTTP listener bound on `127.0.0.1` — so the measurement crosses the *full* wire
->   (JSON framing + `Filo.Value` encode/decode, baton-pinned stream, `Filo.Plug`
->   routing, the `Filo.Executor` callback, `ShardExecutor` → `Connection` → engine)
->   while staying single-host and reproducible enough for the ≥20% commit gate.
-> - A separate **PERIODIC chaos-rig run** drives a **real remote libSQL client over the
->   network** for the true cross-network RTT (the realism headline).
+> **Rev. 2 — every bench crosses the Hrana client wire.** No TPC bench measures the
+> in-process `ShardExecutor` path. GATE/CI benches drive an in-process loopback Hrana
+> client against Filo's listener on `127.0.0.1` (full wire: framing/encode, stream,
+> `Filo.Plug`/`Filo.Socket`, the `Executor` callback, `ShardExecutor` → `Connection` →
+> engine); a periodic chaos-rig run drives a real remote libSQL client over the network
+> for the true cross-network RTT.
 >
-> Both cross the wire; loopback is gate-viable, the rig is realism. This revision
-> reworks the harness, the gated metric definition, `hrana_rt_us`, the drivers, and the
-> metrics/gate tables to reflect that.
+> **Rev. 3 — lead resolutions folded in:** (1) `cold_open` gains a *parallel*
+> `cold_open_wire_p50_us` — the in-process metric is untouched (no re-baseline).
+> (2) A `dir_resolve` wire variant is **deferred** (resolve isn't on the request path
+> yet). (3) The gate loopback client is an **in-process Elixir Hrana-WebSocket client**
+> (`Filo.Socket` — django-libsql's transport), with the HTTP `/v2/pipeline` client kept
+> as an optional secondary. (4a) The `tpcb_wire_overhead_us` direct leg is **raw
+> `Exqlite.Sqlite3`** (whole fathom tax over bare SQLite). (4b) `tpcb_node_tps` gets a
+> **loose gate** (~50%), which requires a small **per-metric-threshold** extension to
+> `Fathom.Bench.Gate`. (4c) TPC-C runs a **W = 1..5 warehouse sweep**.
 
 ## Why add TPC at all — the write-path gap
 
@@ -44,25 +47,27 @@ per-row-fsync-bound — and it warns that a **TPC-B-style per-transaction-commit
 is dominated by macOS `F_FULLFSYNC` + APFS write-pressure artifacts**, which is exactly
 what would make a raw-TPS gate lie. This plan takes that warning as load-bearing:
 
-- **Only DELTA / no-write metrics gate.** The gated TPC-B number is the **overhead delta**
-  between the full loopback-wire per-txn latency and the same txn run direct on the engine
-  — run on the *same* shard file so the identical fsync cost **cancels in the subtraction**.
-  `hrana_rt_us` gates too, because it round-trips a *read* (`SELECT 1`) that issues **no
-  fsync at all**. Everything with an absolute-write-throughput number (TPC-B node TPS, all
-  TPC-C latencies) is **recorded, never gated** — the same discipline as the opt-in S3
-  metrics, which are measured but excluded from the commit gate.
-- Absolute throughput is still worth recording (trend over time, peer comparability) — it
-  just never blocks a commit, because a busy or thermally-throttled box moves it ±3× (the
-  host-drift caveat in `docs/benchmark-plan.md`) with no code change.
+- **Prefer DELTA / no-write metrics for gating.** The primary gated TPC-B number is the
+  **overhead delta** between the full loopback-wire per-txn latency and the same txn run
+  direct on the bare engine — run on the *same* shard file so the identical fsync cost
+  **cancels in the subtraction**. `hrana_rt_us` gates too, because it round-trips a *read*
+  (`SELECT 1`) that issues **no fsync at all**.
+- **One deliberate absolute-throughput exception, loosely gated.** The lead has decided
+  `tpcb_node_tps` (aggregate write throughput) **is** gated, but with a **relaxed ~50%
+  per-metric threshold** — wide enough to swallow `F_FULLFSYNC`/APFS run-to-run jitter,
+  tight enough to catch a catastrophic (≈2×) regression. This requires a per-metric
+  threshold in `Fathom.Bench.Gate` (below); it is the one place we knowingly gate a
+  host-sensitive absolute number, and we size the threshold for that.
+- All TPC-C latencies remain **recorded-only** (peer-comparability / trend, never a gate).
 
 ---
 
-## Harness change — the bench must start Filo and drive it over loopback
+## Harness change — the bench must start Filo and drive it over a loopback WebSocket
 
 Today `Fathom.Bench.setup/1` starts only `Fathom.ShardRegistry` + `Fathom.ShardSupervisor`
 (+ Local storage) and binds **no Hrana port** — no `Filo.Streams`, no Bandit listener. Every
 wire bench needs that infrastructure, so a **loopback-Hrana harness** is shared Phase-1
-work, reused by all the wire benches below and the retrofitted `cold_open`.
+work, reused by all the wire benches below and the new `cold_open_wire`.
 
 ### Server side — start Filo on `127.0.0.1` (mirrors `Fathom.Application.hrana_listener/0`)
 
@@ -87,7 +92,9 @@ opts = [
 ]
 
 {:ok, _} = Bandit.start_link(plug: {Filo.Plug, opts}, scheme: :http, ip: {127, 0, 0, 1}, port: 0)
-# port: 0 -> OS assigns a free port; read it back for the client base URL.
+# port: 0 -> OS assigns a free port; read it back for the WS/HTTP client base URL.
+# The same Bandit/Filo.Plug listener serves BOTH the WebSocket upgrade (-> Filo.Socket)
+# and the HTTP /v2/pipeline path, so one listener covers the primary + secondary clients.
 ```
 
 Shard selection stays on the production **Host-subdomain** path
@@ -96,52 +103,74 @@ multi-label host with no `:shard_base_domain` set → the first label is the sha
 as `shard_from_host/1` resolves it). No `?db=` override needed, so the bench exercises the
 same routing prod does.
 
-### Client side — recommendation: an in-process Req HTTP `/v2/pipeline` client
+### Client side — PRIMARY: an in-process Elixir Hrana-WebSocket client
 
-Filo is a Hrana **server** library only (`Filo` moduledoc: "a Hrana protocol *server*") —
-there is no Filo client to reuse. Two loopback-client options:
+**Why WebSocket is the primary gate transport.** fathom's canonical client, `django-libsql`
+(via `libsql-client`), speaks **only** Hrana over WebSocket — it has no HTTP-pipeline path
+(`Filo.Socket` moduledoc). Gating on HTTP alone would never exercise `Filo.Socket`, the
+handshake, or the persistent-socket stream bookkeeping that the real client uses. So the
+gate client opens a real WebSocket to Filo's loopback listener.
 
-1. **Req HTTP `POST /v2/pipeline`** (RECOMMENDED for the gate). Pure Elixir, uses the
-   already-present `Req` dep (no external toolchain), and drives the exact JSON wire path
-   `deploy/chaos/chaos.sh`'s `hrana()` uses — framing/encode, `Filo.Plug` routing, baton,
-   the `Executor` callback. Reproducible and single-host, which the ≥20% gate needs.
-   Trade-off: it does **not** exercise the WebSocket transport (`Filo.Socket`, the
-   `django-libsql` path) or a real client SDK's own encoder.
-2. **A real libSQL client** (`libsql-experimental`, the SDKs, or `django-libsql` over WS).
-   Higher realism (real client encode + WS), but pulls a non-Elixir dependency into the
-   gate and is heavier to run under `mix fathom.bench`.
+**There is no reusable in-process Elixir Hrana-WS client to borrow.** Filo's own WS
+integration test (`../filo/test/filo/integration_ws_test.exs`) shells out to a Python
+`libsql-client` (`ws_smoke.py`), and its pure-Elixir `socket_test.exs` drives
+`Filo.Socket.handle_in/2` **directly** with `{Jason.encode!(msg), [opcode: :text]}` frames —
+neither is a network client we can reuse. So we build a small one.
 
-**Recommendation:** the **gate/CI loopback client is the Req `/v2/pipeline` client**; the
-**rig realism run uses a real remote libSQL client over the network** (option 2), which the
-chaos rig can already drive. This matches the lead's split exactly: loopback = gate-viable
-wire, rig = realism headline.
+**Recommended WS lib: `Mint.WebSocket`.** `mint` (1.9) is **already in fathom's lock**
+(transitive via `Finch` ← `Req`), so `Mint.WebSocket` adds only the thin `mint_web_socket`
+hex package — a **new test/bench-only dep**, not a runtime one. (`:gun` is the alternative
+but pulls `cowlib` and is less idiomatic; shelling to a real Python/Rust client is the rig's
+job, not the gate's.) **Wrap it behind a project-owned module** (e.g.
+`Fathom.Bench.HranaClient`) per the "wrap third-party APIs" rule, so the bench code speaks
+`open_stream`/`execute`/`close_stream`, not raw Mint frames.
 
-The loopback client must speak Hrana values on the wire (confirmed in `Filo.Value`):
-`integer` is carried as a **string** (`%{"type" => "integer", "value" => "42"}`), `text`
-as `%{"type" => "text", "value" => "..."}`, `float` as a number, `blob` as unpadded base64,
-`null` as `%{"type" => "null"}`. A parameterized statement therefore encodes as:
+**The Hrana-over-WS protocol the client speaks** (from `Filo.Socket`, JSON encoding,
+subprotocol `hrana2`/`hrana3`; no batons — the socket + a client-allocated `stream_id`
+identify a stream):
 
 ```elixir
-# %Filo.Stmt{sql: "UPDATE pgbench_accounts SET abalance = abalance + ? WHERE aid = ?", args: [delta, aid]}
-# becomes this pipeline request body (args bound as Hrana values — NEVER interpolated into sql):
-%{
-  "requests" => [
-    %{"type" => "execute",
-      "stmt" => %{
-        "sql" => "UPDATE pgbench_accounts SET abalance = abalance + ? WHERE aid = ?",
-        "args" => [Filo.Value.encode(delta), Filo.Value.encode(aid)]
-      }},
-    %{"type" => "close"}
-  ]
-}
+# 1. Upgrade WS (subprotocol "hrana3"), then handshake:
+send:  %{"type" => "hello", "jwt" => nil}          # auth disabled on the gate; jwt when on
+recv:  %{"type" => "hello_ok"}
+
+# 2. Open a stream once (client allocates the stream_id) — the persistent connection:
+send:  %{"type" => "request", "request_id" => 1,
+         "request" => %{"type" => "open_stream", "stream_id" => 1}}
+recv:  %{"type" => "response_ok", "request_id" => 1, "response" => %{"type" => "open_stream"}}
+
+# 3. Execute a parameterized statement — args bound as Hrana values, NEVER interpolated:
+#    %Filo.Stmt{sql: "UPDATE pgbench_accounts SET abalance = abalance + ? WHERE aid = ?",
+#               args: [delta, aid]}
+send:  %{"type" => "request", "request_id" => 2,
+         "request" => %{"type" => "execute", "stream_id" => 1,
+           "stmt" => %{
+             "sql"  => "UPDATE pgbench_accounts SET abalance = abalance + ? WHERE aid = ?",
+             "args" => [Filo.Value.encode(delta), Filo.Value.encode(aid)]  # integer -> {"type":"integer","value":"<n>"}
+           }}}
+recv:  %{"type" => "response_ok", "request_id" => 2, "response" => %{"type" => "execute", "result" => %{...}}}
+
+# 4. Burst all a transaction's statements on the held stream_id, then close at the end:
+send:  %{"type" => "request", "request_id" => N,
+         "request" => %{"type" => "close_stream", "stream_id" => 1}}
 ```
 
-**Persistent stream via baton reuse.** Each pipeline response carries a fresh `baton`; the
-client reuses it on the next request to resume the *same* Filo stream (and therefore the
-same shard connection), instead of re-opening per request. This matches fathom's real
-per-stream model (one connection per Hrana stream, opened at stream start) and amortizes the
-stream-open/connection-open cost over a burst — essential for the steady-state delta and
-throughput numbers below. A burst omits the `close` until the last request.
+**Persistent stream.** Because WS has no baton, the stream is just the open socket plus the
+client-allocated `stream_id`: open once, burst many `execute`s (a TPC-B txn = 7 in sequence,
+bracketed by `BEGIN`/`COMMIT` executes), `close_stream` at the end. This is fathom's real
+per-stream model (one connection per stream for the stream's life) and amortizes stream-open
+over the burst — needed for the steady-state delta and throughput numbers below. `Filo.Value`
+carries integers as **strings** on the wire (`%{"type" => "integer", "value" => "42"}`), text
+as `%{"type" => "text", "value" => "..."}`, floats as numbers, blobs as unpadded base64.
+
+### Client side — SECONDARY (optional): the HTTP `/v2/pipeline` client
+
+Filo serves HTTP too, so a Req `POST /v2/pipeline` client (the shape `deploy/chaos/chaos.sh`'s
+`hrana()` uses, dep-free) is a cheap **optional** variant for cross-checking the WS numbers
+and for HTTP-only clients (`libsql-experimental`, the SDKs). It uses **batons** (each response
+returns a fresh `baton` to reuse on the next request) instead of a `stream_id`. Kept as a
+secondary because it was already specified and costs almost nothing; **the gate metric is the
+WS number.**
 
 ---
 
@@ -154,78 +183,79 @@ TPC-B branch-row hot-contention story **does not apply to fathom**: each tenant 
 single-writer SQLite file, so there is no cross-connection write contention on a shared
 branch row — worth a code comment so nobody "fixes" a contention problem that can't exist.
 
-### Framing A — wire proxy tax (`tpcb_wire_overhead_us`) — **GATED, loopback wire**
+### Framing A — wire proxy tax (`tpcb_wire_overhead_us`) — **GATED, loopback WS wire**
 
 **What it measures.** The per-transaction cost of reaching the engine *through fathom's
-full client wire* versus touching the engine directly. Two legs, each run on its own
-freshly-seeded identical shard (sequentially, so no connection interference):
+full client wire* versus touching bare SQLite directly. Two legs, each on its own
+freshly-seeded identical shard (run sequentially, so no connection interference):
 
-1. **Wire leg** — the TPC-B 7-statement transaction driven through the **loopback Hrana
-   client** → `Filo.Plug` (`/v2/pipeline`) → baton stream → `Fathom.ShardExecutor` →
-   `Fathom.Shard.Connection` → engine (WAL commit + fsync), on a **persistent baton-reused
-   stream** so per-stream open is amortized.
-2. **Direct leg** — the identical 7 statements run **in-process, direct on the engine**
-   (raw `Exqlite.Sqlite3` prepare/bind/step, or `Connection.query/3`) on a held connection
-   to the same freshly-seeded shard file (same WAL commit + fsync).
+1. **Wire leg** — the TPC-B 7-statement transaction driven through the **loopback Hrana-WS
+   client** → `Filo.Socket` → baton-less `stream_id` stream → `Fathom.ShardExecutor` →
+   `Fathom.Shard.Connection` → engine (WAL commit + fsync), on a **persistent stream** so
+   per-stream open is amortized.
+2. **Direct leg** — the identical 7 statements run **in-process on the bare engine via raw
+   `Exqlite.Sqlite3`** (`prepare` → `bind` → `step`, reusing statements), on a held
+   connection to the same freshly-seeded shard file (same WAL commit + fsync). **Not**
+   `Fathom.Shard.Connection.query/3` — going straight to `Exqlite.Sqlite3` puts the *whole*
+   of fathom's software above the engine on one side of the delta.
 
-**Metric:** `tpcb_wire_overhead_us = p50(wire_per_txn_us) − p50(direct_per_txn_us)`, µs per
-transaction. Positive = the wire+proxy layer got more expensive. (Renamed from rev. 1's
-`tpcb_overhead_us`, which subtracted at the executor boundary; the delta now spans the whole
-wire.)
+**Metric:** `tpcb_wire_overhead_us = p50(wire_per_txn_us) − p50(direct_engine_per_txn_us)`,
+µs per transaction. It is therefore the **entire fathom tax over bare SQLite**: the WS wire
+(Mint frame encode + socket) + JSON framing + `Filo.Socket` handshake/stream bookkeeping +
+`Filo.Plug` upgrade + `ShardExecutor` (`wrote?`, `ShardLoad`, `to_stmt_result`) +
+`Connection` (fathom's no-statement-cache re-prepare). Positive = that stack got more
+expensive.
 
 **Why the delta is gate-robust on native macOS.** Both legs execute the identical SQL,
 committing the same WAL to the same file, so **both pay the same `F_FULLFSYNC` commit cost
 per transaction**. The subtraction removes that shared, host-dominated term, leaving only
-fathom's per-transaction wire+proxy overhead: HTTP framing + `Filo.Value` encode/decode +
-baton verify + `Filo.Plug` routing + the `Executor`/`Connection` path (incl. fathom's
-no-statement-cache re-prepare). That residual is CPU + loopback-socket + syscall bound —
-**not** fsync-bound — so it is stable enough to gate the same way `cold_open_p50_us` is.
+fathom's per-transaction wire+proxy overhead, which is CPU + loopback-socket + syscall bound
+— **not** fsync-bound — so it is stable enough to gate the way `cold_open_p50_us` is.
 
-**Honest caveat (recorded in the metric's doc):** the loopback socket + Bandit accept +
-HTTP parse add more run-to-run variance than rev. 1's pure in-process delta. It is still
-not fsync-dominated (the fsync cancels), and the median-of-trials + the ≥20% band absorb the
+**Honest caveat (in the metric's doc):** the loopback socket + Bandit accept + WS frame
+parse add more run-to-run variance than a pure in-process delta. It is still not
+fsync-dominated (the fsync cancels), and the median-of-trials + the ≥20% band absorb the
 residual jitter — but expect a wider noise floor than the file-open metrics, and honor the
 "rerun once to rule out noise" rule before trusting a BLOCK.
 
-### `hrana_rt_us` — now measurable (GATED, loopback wire)
+### `hrana_rt_us` — now measurable (GATED, loopback WS wire)
 
-Rev. 1 left `hrana_rt_us` a `null` placeholder ("until remote shards land"). The loopback
-client makes it real: **the median round-trip latency of a trivial read (`SELECT 1`) through
-the loopback Hrana wire on a warm, baton-reused stream** — client encode → `POST
-/v2/pipeline` → `Filo.Plug` → `Executor.execute` → `StmtResult` → client decode. Warm
-(steady-state) stream, not a cold stream-open, so it is the minimal wire round-trip, not a
-cold-open. **`SELECT 1` writes nothing → issues no fsync → very stable → gate-viable.** Add
-to `Gate.@metrics` (higher_worse); populated only when the wire bench runs (else `nil` →
-skipped). On the chaos rig the same probe over the real network is the true cross-network
-RTT (recorded, not gated — the rig is periodic, not in the commit path).
+Rev. 1 left `hrana_rt_us` a `null` placeholder. The loopback WS client makes it real: **the
+median round-trip latency of a trivial read (`SELECT 1`) through the loopback Hrana-WS wire
+on a warm, open stream** — client frame encode → `Filo.Socket` → `Executor.execute` →
+`response_ok` → client decode. Warm (steady-state) stream, not a stream-open, so it is the
+minimal wire round-trip, not a cold-open. **`SELECT 1` writes nothing → no fsync → very
+stable → gate-viable.** Add to `Gate.@metrics` (higher_worse); populated only when the wire
+bench runs (else `nil` → skipped). On the chaos rig the same probe over the real network is
+the true cross-network RTT (recorded, not gated — the rig is periodic, not in the commit
+path).
 
-### Framing B — multi-tenant aggregate node TPS (`tpcb_node_tps`) — **RECORDED-ONLY**
+### Framing B — multi-tenant aggregate node TPS (`tpcb_node_tps`) — **GATED (loose, ~50%)**
 
 **What it measures.** Aggregate transactions/sec a node sustains with **N shards each
-running an independent TPC-B write stream concurrently, each through its own loopback Hrana
-stream** — fathom's real differentiator, **fan-out under genuine WRITE load**, now measured
-through the wire. Unlike the read-only `--hotspots` driver, it exercises WAL growth, the
-`wrote?` dirty-flag flips, the coordinator idle checkpoint, and the durability flush on every
-shard at once. Reuse the `Fathom.Scale` concurrency shape (`Task.async_stream` + a per-stream
-burst), but the per-stream unit is now a **loopback Hrana client** holding a baton-reused
-stream and bursting TPC-B transactions, not an in-process `ShardExecutor.execute` loop.
-Report aggregate txn/s across the node, plus (recorded for context) per-window write-path
-signals from the existing `[:fathom, :shard, ...]` telemetry (flushes, checkpoints,
-dirty→clean transitions).
+running an independent TPC-B write stream concurrently, each through its own loopback WS
+stream** — fathom's real differentiator, **fan-out under genuine WRITE load**, through the
+wire. Unlike the read-only `--hotspots` driver, it exercises WAL growth, the `wrote?`
+dirty-flag flips, the coordinator idle checkpoint, and the durability flush on every shard at
+once. Reuse the `Fathom.Scale` concurrency shape (`Task.async_stream` + a per-stream burst),
+but the per-stream unit is now a **loopback WS client** holding an open `stream_id` and
+bursting TPC-B transactions. Report aggregate txn/s across the node, plus (recorded for
+context) per-window write-path signals from the `[:fathom, :shard, ...]` telemetry (flushes,
+checkpoints, dirty→clean transitions).
 
-- **Gate/CI:** loopback wire, recorded to `perf_history.jsonl` (trend only, not gated).
+- **Gate/CI:** loopback WS, **gated with a loose ~50% threshold** (see below).
 - **Realism:** the chaos rig drives N concurrent **remote** libSQL clients over the network
   (`chaos.sh tpcb` shape), recorded to a chaos-run doc.
 
-**Why recorded-only, not gated.** Absolute write throughput is exactly the
-`F_FULLFSYNC`/APFS-dominated number `docs/benchmark-plan.md` warns against — a measurement of
-*SQLite + the host*, not a fathom regression. Worth recording for trend-watching and peer
-comparison; a genuine fan-out-under-write regression (e.g. a flush storm) should be confirmed
-against the `[:fathom,:shard]` flush/checkpoint telemetry, not the raw TPS scalar.
-
-**Sizing.** N is a knob (`--tpcb-shards`, default e.g. 64–256 so a laptop run is quick); this
-is not a millions-of-shards test (that is `fathom.scale --ramp`), it is "does write fan-out
-across a realistic hold-open set stay healthy."
+**Why the gate is loose (~50%), not the global 20%.** Absolute write throughput is the
+`F_FULLFSYNC`/APFS-dominated number `docs/benchmark-plan.md` warns about — it drifts ±3× with
+host load, so the standard 20% band would false-positive constantly. A **50% block** means
+"ignore ordinary fsync/APFS jitter, but catch a ≈2× throughput collapse" (e.g. a flush storm,
+an accidental per-row checkpoint, or a lost `write_concurrency`). Confirm a BLOCK against the
+`[:fathom,:shard]` flush/checkpoint telemetry before trusting it (a genuine regression shows
+a matching flush-count explosion; pure jitter does not). N is a knob (`--tpcb-shards`, default
+e.g. 64–256 so a laptop run is quick); this is not a millions-of-shards test (that is
+`fathom.scale --ramp`).
 
 ### TPC-B schema + seed (SF = 1 ≈ a small shard)
 
@@ -237,9 +267,9 @@ a "small shard."
 **Seeding is setup, not the measured workload, so it stays in-process** (a direct
 `Fathom.Shard.Connection` writing into the storage dir, exactly as
 `Fathom.Bench.seed_storage_shard/1` / `Fathom.Scale.provision/2` do today — then the wire
-cold-open pulls it). Only the *measured* TPC transactions cross the loopback wire. The `rows`
-count is harness-controlled (never user input), so inlining it into the recursive-CTE seed is
-safe:
+cold-open pulls it). Only the *measured* TPC transactions cross the loopback WS wire. The
+`rows` count is harness-controlled (never user input), so inlining it into the recursive-CTE
+seed is safe:
 
 ```sql
 CREATE TABLE pgbench_branches (bid INTEGER PRIMARY KEY, bbalance INTEGER, filler TEXT);
@@ -255,7 +285,7 @@ SELECT x, (x - 1) / 100000 + 1, 0, '' FROM c;
 ### TPC-B transaction — parameterized, never interpolated
 
 The 7 statements as `Filo.Stmt` structs with bound `?` placeholders. On the wire they encode
-as Hrana `args` (`Filo.Value.encode`, integers as strings); through `Filo.Plug` they decode
+as Hrana `args` (`Filo.Value.encode`, integers as strings); through `Filo.Socket` they decode
 back to native terms and bind via `Connection.query/3` → `Exqlite.Sqlite3.bind`. Random
 `aid ∈ 1..100000·SF`, `tid ∈ 1..10·SF`, `bid ∈ 1..SF`, `delta ∈ −5000..5000` are drawn in
 Elixir and passed as `args` — **values never touch the SQL string** (the project's
@@ -264,7 +294,7 @@ multi-tenant-safety principle: bind, never interpolate):
 ```elixir
 alias Filo.Stmt
 
-# BEGIN / COMMIT bracket the txn (sent as their own execute requests in the pipeline).
+# BEGIN / COMMIT bracket the txn (their own execute requests on the held stream_id).
 [
   %Stmt{sql: "UPDATE pgbench_accounts SET abalance = abalance + ? WHERE aid = ?", args: [delta, aid]},
   %Stmt{sql: "SELECT abalance FROM pgbench_accounts WHERE aid = ?",               args: [aid]},
@@ -277,22 +307,22 @@ alias Filo.Stmt
 
 Driven over the wire, `wrote?` classifies the four writes dirty and the `SELECT` clean,
 exercising the exact durability-classification code a Django write path hits — through the
-full protocol, not the executor shortcut.
+full WS protocol, not the executor shortcut.
 
-### Isolation-under-write-load test (`test/`, shard-isolation gate) — through the loopback wire
+### Isolation-under-write-load test (`test/`, shard-isolation gate) — through the loopback WS wire
 
 A concurrent-write isolation test belongs under the **shard-isolation gate**
 (`AGENTS.md` §Gates: any change to routing ships with a cross-shard-isolation test; a leak is
-a release blocker). Driving it **through the loopback Hrana wire** strengthens it — it now
-exercises `shard_from_conn` Host routing end-to-end, the real path a leak would travel.
-Design (`test/fathom/tpcb_isolation_test.exs`, tagged so it stays out of the default fast
-suite if slow):
+a release blocker). Driving it **through the loopback WS wire** strengthens it — it exercises
+`shard_from_conn` Host routing end-to-end, the real path a leak would travel. Design
+(`test/fathom/tpcb_isolation_test.exs`, tagged so it stays out of the default fast suite if
+slow):
 
 - Start the loopback Filo harness. Provision M shards with **unique ids** (real SQLite files,
   `File.rm` in `on_exit`, never share a file), seeded TPC-B (small SF) in-process.
-- Drive K TPC-B transactions **per shard concurrently through the loopback client** (each with
-  `Host: <shard>.local`), `Task.async_stream`, complete via `Task` join — **no
-  `Process.sleep`**.
+- Drive K TPC-B transactions **per shard concurrently through the loopback WS client** (each
+  connecting with `Host: <shard>.local`), `Task.async_stream`, complete via `Task` join —
+  **no `Process.sleep`**.
 - Assert two invariants (pin the invariant, not just the repro):
   1. **TPC-B consistency, per shard:** with all balances starting at 0,
      `sum(pgbench_branches.bbalance) == sum(pgbench_tellers.tbalance) ==
@@ -307,7 +337,7 @@ suite if slow):
 
 ---
 
-## TPC-C — comparability / concurrency characterization (RECORDED-ONLY)
+## TPC-C — comparability / concurrency characterization, W = 1..5 sweep (RECORDED-ONLY)
 
 **Why TPC-C, framed differently from TPC-B.** The most comparable peer — Turso's Rust-based
 libSQL engine — publishes its OLTP concurrency story as TPC-C: **throughput plus p95/p99/max
@@ -316,12 +346,33 @@ same benchmark and report the same shape. TPC-C is heavier (9 tables, 5 weighted
 types) and its latencies are host- and fsync-sensitive, so it is a **comparability /
 characterization** benchmark — **never a commit-gate metric**. Both variants cross the wire:
 
-- **Loopback-wire in-process** (`mix fathom.tpcc`, gate host, recorded-only): drives the
-  weighted deck through the loopback Hrana client. Good for a local trend line and the
-  write-path telemetry; single-host, so **not** a cross-network number.
+- **Loopback-WS in-process** (`mix fathom.tpcc`, gate host, recorded-only): the weighted deck
+  through the loopback Hrana-WS client. A local trend line and write-path telemetry;
+  single-host, so **not** a cross-network number.
 - **Rig remote client over the network** (`chaos.sh tpcc`, the realism headline): a real
   remote libSQL client through the LB (subdomain → node hash, as prod), yielding the true
   per-txn-type latency + tpmC. Written to `docs/reviews/tpcc-run-<date>.md`.
+
+### The warehouse sweep — W = 1, 2, 3, 4, 5
+
+Instead of a single default warehouse count, **the run executes the full 5-transaction
+weighted mix at each of W = 1, 2, 3, 4, 5**, reporting `tpcc_tpmc` + the per-txn
+`p50/p95/p99/max` **per W value**. The output is a **W-sweep** showing how throughput and
+latency scale as one tenant grows from 1→5 warehouses (a within-shard scaling curve, since a
+shard = one tenant DB = its whole W-warehouse set). One shard per W value (five shards total
+per run), each seeded independently and run in sequence.
+
+**Sizing honesty:** even at `W=1`, TPC-C is ~100k items + 100k stock + ~300k order-lines —
+~100 MB, the **large end** of "small shard"; `W=5` is ~5×. Fine for a *per-tenant
+comparability* sweep, but **not** a fan-out-density workload. Cross-warehouse New-Order lines
+stay *within* the shard — do **not** spread warehouses across shards (that would violate
+fathom's single-writer-per-file model). `--tpcc-max-w` (default 5) bounds the sweep.
+
+### Schema (9 tables)
+
+Per warehouse `W` ([TPC-C spec / Wikipedia][tpcc-wiki]): `warehouse` W, `district` 10·W,
+`customer` 30,000·W, `history` ~30,000·W, `new_order` ~9,000·W, `order` (`oorder`) 30,000·W,
+`order_line` ~300,000·W, `item` **100,000 (fixed, not scaled by W)**, `stock` 100,000·W.
 
 ### Transaction mix (authoritative)
 
@@ -339,20 +390,6 @@ one Stock-Level per ten New-Orders. In the standard weighted deck:
 
 `tpmC` is measured as **New-Order transactions per minute** (New-Order ≈ 44–45% of the deck).
 Cite these weights in the code so a reviewer can check the deck.
-
-### Schema (9 tables) and sizing
-
-Per warehouse `W` ([TPC-C spec / Wikipedia][tpcc-wiki]): `warehouse` W, `district` 10·W,
-`customer` 30,000·W, `history` ~30,000·W, `new_order` ~9,000·W, `order` (`oorder`) 30,000·W,
-`order_line` ~300,000·W, `item` **100,000 (fixed)**, `stock` 100,000·W.
-
-**Sizing honesty:** even at `W=1`, TPC-C is ~100k items + 100k stock + ~300k order-lines —
-~100 MB, the **large end** of "small shard." Fine for a *per-tenant comparability* run, but
-**not** a fan-out-density workload. Keep **one TPC-C dataset per shard** (a shard = a tenant
-DB = one independent W-warehouse set; cross-warehouse New-Order lines stay *within* the shard
-— do **not** spread warehouses across shards, which would violate fathom's
-single-writer-per-file model). `W` is a knob (`--tpcc-warehouses`, default 1). The
-multi-tenant "many small TPC-C at once" angle is already covered by TPC-B Framing B.
 
 ### New-Order — parameterized statement profile
 
@@ -405,17 +442,24 @@ Payment are spelled out here (they are ~88% of the deck and the two required by 
 customer-by-last-name select returns multiple rows — see the `Connection.collect`
 prerequisite below.
 
-### TPC-C driver — both variants cross the wire
+### TPC-C driver + `scripts/tpc_history.jsonl` (one row per W)
 
-- **Loopback-wire in-process** (`mix fathom.tpcc`): the weighted deck through the loopback
-  Hrana client, concurrency matrix `--tpcc-warehouses W` × `--tpcc-threads T` (each thread a
-  baton-reused loopback stream). Reports per-txn-type `p50/p95/p99/max` + `tpmC` to
-  `scripts/tpc_history.jsonl`. Recorded-only, single-host — a trend line, not a
-  cross-network number.
-- **Rig remote client** (`chaos.sh tpcc`, shaped like `cmd_hotspots`/`cmd_smoke`): real remote
-  Hrana pipeline requests over the network through the LB, args bound as Hrana `args`. The
-  peer-comparable headline (per-txn-type latency + tpmC), written to
-  `docs/reviews/tpcc-run-<date>.md`.
+- **Loopback-WS in-process** (`mix fathom.tpcc`): for each `W ∈ 1..--tpcc-max-w`, seed a shard,
+  run the weighted deck through the loopback WS client with `--tpcc-threads T` concurrent
+  streams, and append **one JSON row per W** to `scripts/tpc_history.jsonl`:
+
+  ```json
+  {"ts":"…","commit":"…","host":"darwin","warehouses":1,"threads":8,
+   "tpcc_tpmc":1234.0,
+   "tpcc_neworder_p50_us":900,"tpcc_neworder_p95_us":2100,"tpcc_neworder_p99_us":4200,"tpcc_neworder_max_us":9000,
+   "tpcc_payment_p50_us":650,"tpcc_payment_p95_us":1500, "…":"…for order_status/delivery/stock_level…"}
+  ```
+
+  Recorded-only, single-host — a trend line, not a cross-network number. Five rows per run
+  (W=1..5) let the reader plot the scaling curve.
+- **Rig remote client** (`chaos.sh tpcc`, shaped like `cmd_hotspots`/`cmd_smoke`): the same
+  W-sweep driven by a real remote libSQL client over the network through the LB, args bound as
+  Hrana `args`. The peer-comparable headline, written to `docs/reviews/tpcc-run-<date>.md`.
 
 ---
 
@@ -423,22 +467,21 @@ prerequisite below.
 
 The lead's directive extends to the existing request-path gate benches. The split:
 
-- **`cold_open_p50_us` → retrofit to the wire.** Measure cold-open by opening a **fresh
-  loopback Hrana stream** to a cold (storage-backed) shard and timing the first query's
-  round-trip — the checkout + pull happens inside `Executor.open` on that stream. This is the
-  real client cold-open. **Baseline reset required:** a wire-measured cold-open reads higher
-  than the stored in-process baseline (it adds the wire constant), so the first wire run would
-  read as a regression against the old line. Re-baseline the parent under the new harness
-  before the gate is meaningful (the documented stale-baseline procedure in
-  `docs/benchmark-plan.md`). Same applies to the opt-in S3 cold-open / failover metrics if
-  they are retrofitted. See Open Questions for redefine-in-place vs add-a-new-metric.
-- **`dir_resolve_p50_us` → stays in-process (with a note).** `Fathom.Directory.resolve/1` is a
-  control-plane function **not currently on the request path** (routing is Host-based today;
-  the cached, PubSub-invalidated request-path resolve is still aspirational per `AGENTS.md`).
-  There is no client query whose latency isolates a resolve — a wire query would be dominated
-  by the shard open, not the resolve. Keep it a direct in-process measurement for now; fold it
-  into the wire cold-open path when the request-path resolve lands. (Flagged as an open
-  question.)
+- **`cold_open` → ADD a parallel `cold_open_wire_p50_us`; the in-process metric is
+  UNCHANGED.** Keep `cold_open_p50_us` exactly as it is (no redefinition, **no re-baseline**).
+  Add a new **`cold_open_wire_p50_us`**: cold-open a storage-backed shard and run the first
+  query by **opening a fresh loopback WS stream** to it — the checkout + pull happens inside
+  `Executor.open` on that stream, so this is the real client cold-open including the wire. It
+  is a brand-new metric, so its first appearance simply seeds its own baseline (nothing to
+  re-baseline). GATED (higher_worse), opt-in with the wire harness (`nil` otherwise → skipped).
+  The two coexist: `cold_open_p50_us` isolates the file-open cost; `cold_open_wire_p50_us` adds
+  the client-visible wire constant on top.
+- **`dir_resolve` → stays in-process; a wire variant is DEFERRED.** `dir_resolve_p50_us`
+  remains the direct in-process measurement of `Fathom.Directory.resolve/1`, unchanged. Resolve
+  is **not on the request path today** (routing is Host-based; the cached, PubSub-invalidated
+  request-path resolve is still aspirational per `AGENTS.md`), so there is no client query that
+  isolates it — a wire `dir_resolve` metric is deferred until that request-path resolve
+  actually lands. No new metric now.
 - **Inherently-internal benches stay in-process — no client query exists:**
   - `copy_rows_per_s` — migration blue/green copy+transform; internal, no client.
   - `fanout_kb_per_shard` — memory per open coordinator; deliberately holds no connection, so
@@ -457,45 +500,58 @@ didn't run it.
 
 | Metric | Unit | Direction | Gate | Transport | Where recorded | Populated when |
 |---|---|---|---|---|---|---|
-| `tpcb_wire_overhead_us` | µs / txn | higher_worse | **GATED** | loopback wire (delta vs direct engine) | `perf_history.jsonl` **new col** + `Gate.@metrics` **new line** | only with `--tpcb`; else `nil` |
-| `hrana_rt_us` | µs | higher_worse | **GATED** | loopback wire (`SELECT 1` RT) | `perf_history.jsonl` **existing col** (was always `null`) + `Gate.@metrics` **new line** | only with the wire bench; else `nil` |
-| `tpcb_node_tps` | txn / s | (lower_worse) | recorded-only | loopback wire (gate host) / remote client (rig) | `perf_history.jsonl` **new col** (like `failover_*`, *not* in `Gate.@metrics`) | only with `--tpcb`; else `nil` |
-| `tpcc_tpmc` | New-Order / min | lower_worse | recorded-only | loopback wire (CI) / remote client (rig headline) | `scripts/tpc_history.jsonl` (**separate**) + chaos-run doc | only via the TPC-C tasks |
-| `tpcc_<txn>_p50/p95/p99/max_us` | µs | higher_worse | recorded-only | loopback wire (CI) / remote client (rig headline) | `scripts/tpc_history.jsonl` + chaos-run doc | only via the TPC-C tasks |
+| `tpcb_wire_overhead_us` | µs / txn | higher_worse | **GATED (20%)** | loopback WS (delta vs raw `Exqlite.Sqlite3`) | `perf_history.jsonl` **new col** + `Gate.@metrics` | only with `--tpcb`; else `nil` |
+| `hrana_rt_us` | µs | higher_worse | **GATED (20%)** | loopback WS (`SELECT 1` RT) | `perf_history.jsonl` **existing col** (was `null`) + `Gate.@metrics` | only with the wire bench; else `nil` |
+| `tpcb_node_tps` | txn / s | lower_worse | **GATED (loose ~50%)** | loopback WS (gate) / remote client (rig) | `perf_history.jsonl` **new col** + `Gate.@metrics` **with a per-metric threshold** | only with `--tpcb`; else `nil` |
+| `cold_open_wire_p50_us` | µs | higher_worse | **GATED (20%)** | loopback WS (cold-open + first query) | `perf_history.jsonl` **new col** + `Gate.@metrics` | only with the wire bench; else `nil` |
+| `tpcc_tpmc` (per W) | New-Order / min | lower_worse | recorded-only | loopback WS (CI) / remote client (rig headline) | `scripts/tpc_history.jsonl` (**separate**, one row per W) + chaos-run doc | only via the TPC-C tasks |
+| `tpcc_<txn>_p50/p95/p99/max_us` (per W) | µs | higher_worse | recorded-only | loopback WS (CI) / remote client (rig headline) | `scripts/tpc_history.jsonl` + chaos-run doc | only via the TPC-C tasks |
 
-**Exact `perf_history.jsonl` columns to add** (two new; `hrana_rt_us` already exists and just
+**Exact `perf_history.jsonl` columns to add** (three new; `hrana_rt_us` already exists and just
 starts carrying a value):
 
 ```
-"tpcb_wire_overhead_us": <float|null>,   // GATED  (nil unless --tpcb)
-"tpcb_node_tps":         <float|null>,    // recorded-only (nil unless --tpcb)
-"hrana_rt_us":           <float|null>,    // GATED — was always null; now populated by the wire bench
+"tpcb_wire_overhead_us": <float|null>,   // GATED 20%   (nil unless --tpcb)
+"tpcb_node_tps":         <float|null>,    // GATED loose 50% (nil unless --tpcb)
+"cold_open_wire_p50_us": <float|null>,    // GATED 20%   (nil unless the wire bench runs)
+"hrana_rt_us":           <float|null>,    // GATED 20% — was always null; now populated by the wire bench
 ```
 
-Wired in `Mix.Tasks.Fathom.Bench.build_line/3` (add the two new keys; `hrana_rt_us` already
+Wired in `Mix.Tasks.Fathom.Bench.build_line/3` (add the three new keys; `hrana_rt_us` already
 present), `print_table/2` (add rows), and `Fathom.Bench.@all_metrics` / `all/1` (a new `:tpcb`
-entry producing `tpcb_wire_overhead_us` + `tpcb_node_tps`, and `hrana_rt_us` produced whenever
-the wire harness is up — analogous to how `:failover_rto` produces two `failover_*` columns).
+entry producing `tpcb_wire_overhead_us` + `tpcb_node_tps`, plus `hrana_rt_us` and
+`cold_open_wire_p50_us` whenever the wire harness is up — analogous to how `:failover_rto`
+produces two `failover_*` columns).
 
-**Exact `Gate.@metrics` lines to add** (two — the delta and the no-fsync round-trip gate):
+### The `Fathom.Bench.Gate` change — per-metric thresholds
+
+Today `@metrics` entries are `{name, direction}` 2-tuples and `compare/4` applies **one**
+global `block` to every metric (a single `worst >= block` verdict). The loose `tpcb_node_tps`
+gate needs a **per-metric threshold**. Minimal, backward-compatible change:
 
 ```elixir
+# @metrics entries gain an OPTIONAL third element (the block %); absent -> the global default.
 @metrics [
   {:cold_open_p50_us, :higher_worse},
   {:cold_open_s3_p50_us, :higher_worse},
+  {:cold_open_wire_p50_us, :higher_worse},   # <-- add (wire cold-open)
   {:warm_s3_shards_per_s, :lower_worse},
   {:dir_resolve_p50_us, :higher_worse},
   {:copy_rows_per_s, :lower_worse},
   {:fanout_kb_per_shard, :higher_worse},
-  {:hrana_rt_us, :higher_worse},          # <-- add (loopback SELECT 1 RT; no fsync)
-  {:tpcb_wire_overhead_us, :higher_worse} # <-- add (loopback delta vs direct engine)
+  {:hrana_rt_us, :higher_worse},             # <-- add (loopback SELECT 1 RT; no fsync)
+  {:tpcb_wire_overhead_us, :higher_worse},   # <-- add (loopback delta vs raw exqlite)
+  {:tpcb_node_tps, :lower_worse, 50}         # <-- add, loose 50% override (fsync/APFS-tolerant)
 ]
 ```
 
-`tpcb_node_tps` is deliberately **not** in `Gate.@metrics` — recorded in the line but never
-gates, like `failover_cold_s3_p50_us` today. TPC-C metrics stay **out of
-`perf_history.jsonl`** (a per-txn-type × percentile matrix would bloat the gate file) and live
-in `scripts/tpc_history.jsonl` + a chaos-run doc.
+`compare/4` changes from a single `worst >= block` verdict to a **per-metric** decision: each
+comparable delta blocks if `d.pct >= threshold(metric)` where `threshold(metric)` is the
+tuple's third element or the global `block`; the verdict is `:block` if **any** metric crosses
+**its own** threshold (`:warn` similarly against a per-metric warn or the global). Normalize a
+2-tuple to `{name, dir, nil}` on read so existing entries and the pure-function unit tests are
+unaffected. This is a ~15-line change to one pure function + its `format/4` report (show each
+metric's effective threshold).
 
 ---
 
@@ -505,22 +561,24 @@ TPC never slows down or blocks an ordinary commit.
 
 - **Normal commit** (`scripts/commit_with_bench.sh -m "..."`) runs `scripts/benchmark.sh`
   **without** `--tpcb` and without the wire harness, so `tpcb_wire_overhead_us`,
-  `tpcb_node_tps`, and `hrana_rt_us` all record `nil`. Parents were benched the same way
-  (`nil`). `Gate.compare/4` skips any metric `nil` in either run → **none of the wire metrics
-  participate** in a normal gate, and the bench stays as fast as today.
-- **To gate on the wire metrics:** run `scripts/benchmark.sh --tpcb` (which starts the
-  loopback Filo harness and produces `tpcb_wire_overhead_us` + `hrana_rt_us` + `tpcb_node_tps`)
-  on **both** the parent (to seed a non-`nil` baseline) and the working tree. Identical to how
-  the opt-in S3 metrics gate only when `FATHOM_S3_TEST_*` is set on both runs.
+  `tpcb_node_tps`, `cold_open_wire_p50_us`, and `hrana_rt_us` all record `nil`. Parents were
+  benched the same way (`nil`). `Gate.compare/4` skips any metric `nil` in either run → **none
+  of the wire metrics participate** in a normal gate, and the bench stays as fast as today
+  (`cold_open_p50_us` and the other in-process metrics still gate exactly as now).
+- **To gate on the wire metrics:** run `scripts/benchmark.sh --tpcb` (which starts the loopback
+  Filo + WS-client harness and produces the four wire metrics) on **both** the parent (to seed a
+  non-`nil` baseline) and the working tree. Identical to how the opt-in S3 metrics gate only
+  when `FATHOM_S3_TEST_*` is set on both runs. `tpcb_node_tps` gates at its own 50%; the other
+  three at the global 20%.
 - **`--tpcb`** is a new pass-through flag on `mix fathom.bench` (add to `@switches` /
   `@all_metrics` / `parse_only`) and on `scripts/benchmark.sh` (`"$@"` already forwards it). It
-  also implies starting the loopback wire harness (needed for `hrana_rt_us` too).
-- **TPC-C** is **not** on `mix fathom.bench` — a separate `mix fathom.tpcc` (loopback,
-  recorded-only) and `chaos.sh tpcc` (remote, recorded-only). It never writes
-  `perf_history.jsonl`, so it cannot affect the gate.
+  starts the loopback WS harness (needed for all four wire metrics).
+- **TPC-C** is **not** on `mix fathom.bench` — a separate `mix fathom.tpcc` (loopback WS,
+  recorded-only, W-sweep) and `chaos.sh tpcc` (remote, recorded-only). It writes
+  `scripts/tpc_history.jsonl`, never `perf_history.jsonl`, so it cannot affect the gate.
 - The host-wide benchmark lock in `mix fathom.bench` still applies — a TPC-B run holds it like
-  any other, so no run measures under another's load. The loopback listener binds `port: 0`
-  (OS-assigned), so parallel unrelated processes don't collide on a fixed Hrana port.
+  any other. The loopback listener binds `port: 0` (OS-assigned), so parallel unrelated
+  processes don't collide on a fixed Hrana port.
 
 ---
 
@@ -572,42 +630,50 @@ assembly is linear in row count).
 | Phase | Deliverable | Est. |
 |---|---|---|
 | **0 — prereq** | Fix `Connection.collect` (`++` → O(R)) + `@tag :bench` large-result regression test; commit through the bench gate. | ~0.5 day |
-| **1 — loopback Hrana harness + wire gate metrics (highest value)** | Start `Filo.Streams` + a Bandit `Filo.Plug` listener on `127.0.0.1:0` in the bench harness; build the Req `/v2/pipeline` loopback client (baton reuse, `Filo.Value` arg encode/decode). Then `hrana_rt_us` (trivial once the client exists) + `tpcb_wire_overhead_us` (Framing A: TPC-B seed + 7-stmt deck, wire-vs-direct delta), `--tpcb` flag, `perf_history` columns, two `Gate.@metrics` lines, `@tag :bench` guards. **Retrofit `cold_open` to the wire** (+ re-baseline). First honest wire write-path numbers and the two new gates. | ~2.5–3 days |
-| **2 — TPC-B aggregate + isolation (wire)** | `tpcb_node_tps` (Framing B) recorded-only via concurrent loopback streams; the concurrent-write **isolation-under-write-load** test through the loopback wire, under the shard-isolation gate. | ~2 days |
-| **3 — TPC-C loopback wire (in-process)** | `mix fathom.tpcc`: 9-table schema + seed, all 5 weighted txn profiles, warehouse×thread matrix over the loopback client, per-txn-type `p50/p95/p99/max` + `tpmC` → `scripts/tpc_history.jsonl`. Recorded-only. | ~3.5–4.5 days |
-| **4 — remote-client realism (rig headline)** | `chaos.sh tpcb` + `chaos.sh tpcc`: real remote libSQL client over the network through the LB (true cross-network RTT + per-txn-type latency + tpmC), written to `docs/reviews/tpc*-run-<date>.md`. | ~2.5–3.5 days |
+| **1 — loopback WS harness + wire gate metrics (highest value)** | Start `Filo.Streams` + a Bandit `Filo.Plug` listener on `127.0.0.1:0` in the bench harness; build the **in-process Hrana-WS client** on `Mint.WebSocket` (new test/bench dep `mint_web_socket`), wrapped in `Fathom.Bench.HranaClient` (hello → open_stream → execute → close_stream, `Filo.Value` arg encode/decode). Extend `Fathom.Bench.Gate` for per-metric thresholds. Then `hrana_rt_us`, `cold_open_wire_p50_us`, `tpcb_wire_overhead_us` (Framing A: TPC-B seed + 7-stmt deck, WS-vs-raw-exqlite delta), `--tpcb` flag, three `perf_history` columns, four `Gate.@metrics` lines. First honest wire write-path numbers + the gate mechanism every later phase reuses. | ~3.5–4 days |
+| **2 — TPC-B aggregate + isolation (WS)** | `tpcb_node_tps` (Framing B) gated-loose via concurrent loopback WS streams; the concurrent-write **isolation-under-write-load** test through the loopback WS wire, under the shard-isolation gate. | ~2 days |
+| **3 — TPC-C loopback WS, W = 1..5 sweep** | `mix fathom.tpcc`: 9-table schema + seed, all 5 weighted txn profiles, warehouse×thread matrix over the WS client, run at **each W ∈ 1..5**, per-txn-type `p50/p95/p99/max` + `tpmC` **per W** → `scripts/tpc_history.jsonl` (one row per W). Recorded-only. (5× the seed+run work of a single-W run.) | ~4.5–5.5 days |
+| **4 — remote-client realism (rig headline)** | `chaos.sh tpcb` + `chaos.sh tpcc`: real remote libSQL client over the network through the LB (true cross-network RTT + the per-txn-type latency + tpmC W-sweep), written to `docs/reviews/tpc*-run-<date>.md`. | ~2.5–3.5 days |
 
-Phases 0–1 deliver the entire *gated* value (a robust wire write-path delta + a real
-`hrana_rt_us`) in ~3 days, including the shared loopback harness every later phase reuses; 2
-adds the multi-tenant write story and the isolation guarantee; 3–4 are the heavier
-comparability harness and the remote-client realism headline, and can follow independently.
+Phases 0–1 deliver the entire *gated* value (a robust wire write-path delta, a real
+`hrana_rt_us`, a wire cold-open, and the per-metric-threshold mechanism) in ~4 days, including
+the shared loopback WS harness + client every later phase reuses; 2 adds the multi-tenant write
+story (loose-gated) and the isolation guarantee; 3–4 are the heavier comparability sweep and the
+remote-client realism headline, and can follow independently.
 
 ---
 
 ## What this does NOT tell us about fathom (kept honest)
 
-- **Loopback crosses the full wire, but it is not a cross-network RTT.** The gate/CI benches
-  drive a `127.0.0.1` HTTP client through Bandit + `Filo.Plug` — real framing, encode/decode,
-  baton, routing, executor — but with **no network**: loopback has ~µs link latency and no
-  bandwidth-delay, congestion, TLS, or LB hop. So `hrana_rt_us` and `tpcb_wire_overhead_us` on
-  the gate are the **software** wire cost, not what a client in another region pays. **Only the
-  chaos-rig remote-client run gives the true cross-network RTT** — which is exactly why the rig
-  numbers are the realism headline and the loopback numbers are the reproducible gate.
+- **The WS loopback crosses django-libsql's real transport, but it is not a cross-network
+  RTT.** The gate benches open a real WebSocket through Bandit + `Filo.Socket` — the exact
+  transport `django-libsql` uses — with real framing, encode/decode, handshake, and stream
+  bookkeeping, but over `127.0.0.1`: ~µs link latency, no bandwidth-delay, congestion, TLS, or
+  LB hop. So `hrana_rt_us`, `tpcb_wire_overhead_us`, and `cold_open_wire_p50_us` on the gate are
+  the **software** wire cost, not what a client in another region pays. **Only the chaos-rig
+  remote-client run gives the true cross-network RTT** — which is why the rig numbers are the
+  realism headline and the loopback numbers are the reproducible gate.
+- **The loose `tpcb_node_tps` gate is a smoke alarm, not a precision instrument.** At a 50%
+  threshold it catches a ≈2× throughput collapse, not a real 15% loss — and it can still
+  false-positive on a badly loaded box. It is deliberately sized to tolerate the
+  `F_FULLFSYNC`/APFS jitter that makes absolute write TPS untrustworthy; confirm any BLOCK
+  against the flush/checkpoint telemetry before acting.
 - **TPC re-measures SQLite + the host, not fathom.** Both benchmarks are, at bottom, a
   measurement of the SQLite write engine and the machine's `F_FULLFSYNC`/WAL/APFS behavior.
   Absolute TPC-B TPS and all TPC-C latencies move with host load and fsync policy, not fathom
-  code — which is why only the *cancelling* overhead delta and the *no-fsync* `SELECT 1`
-  round-trip gate, and everything else is recorded-only.
+  code — which is why the two clean gates are the *cancelling* overhead delta and the *no-fsync*
+  `SELECT 1` round-trip, and the one absolute gate is deliberately loose.
 - **It says nothing about fathom's actual differentiators.** Cold-open latency, fan-out density
   across *millions* of shards, cross-node lease/epoch/heartbeat correctness, migration copy
   throughput, warm-standby RTO — fathom's whole reason to exist — are **already** measured by
   `mix fathom.scale` and the gated `fathom.bench` metrics. TPC adds the missing *write-path*
   dimension on a single (or a modest fan-out of) tenant DBs; it is not, and should not be sold
   as, a fathom-scale test.
-- **TPC-C comparability is per-tenant.** The peer-comparable TPC-C run characterizes *one tenant
-  DB's* OLTP concurrency; even over the rig's remote client it does not stress the LB partition,
-  the S3 lease, or the directory across shards. It answers "how does a single fathom shard
-  compare to peer X on TPC-C over the wire," not "how does fathom's architecture scale."
+- **TPC-C comparability is per-tenant.** The W=1..5 sweep characterizes *one tenant DB's* OLTP
+  concurrency as it grows; even over the rig's remote client it does not stress the LB
+  partition, the S3 lease, or the directory across shards. It answers "how does a single fathom
+  shard compare to peer X on TPC-C over the wire, 1→5 warehouses," not "how does fathom's
+  architecture scale."
 
 ---
 
@@ -619,9 +685,14 @@ comparability harness and the remote-client realism headline, and can follow ind
   ~43%, Order-Status/Delivery/Stock-Level ~4% each; one Delivery/Order-Status/Stock-Level per ten
   New-Orders), New-Order + Payment behavior: [TPC-C — Wikipedia][tpcc-wiki] and the [TPC-C chapter
   of the Benchmark Handbook (Jim Gray)][graybook].
-- Hrana wire (loopback client target): `Filo.Plug` routes (`/v2/pipeline` etc.) and `Filo.Value`
-  value encoding (integer carried as a string) — the `../filo` source; the in-process HTTP
-  pipeline driver pattern is `deploy/chaos/chaos.sh`'s `hrana()`.
+- Hrana WebSocket wire (loopback client target): `Filo.Socket` — WebSock handler, subprotocol
+  `hrana2`/`hrana3`, `hello`/`hello_ok` handshake, `request`/`response_ok` frames with
+  `request_id`, `open_stream` (client-allocated `stream_id`)/`execute`/`close_stream`, no
+  batons; and `Filo.Value` value encoding (integer carried as a string). The `../filo` source;
+  the pure-Elixir WS handler is driven directly in `../filo/test/filo/socket_test.exs`, and the
+  real-network WS path is exercised by shelling to Python `libsql-client` in
+  `../filo/test/filo/integration_ws_test.exs`. The HTTP `/v2/pipeline` secondary follows
+  `deploy/chaos/chaos.sh`'s `hrana()`.
 
 [pgbench]: https://www.postgresql.org/docs/current/pgbench.html
 [tpcc-wiki]: https://en.wikipedia.org/wiki/TPC-C
@@ -631,27 +702,19 @@ comparability harness and the remote-client realism headline, and can follow ind
 
 ## Open questions for the lead
 
-1. **Loopback client: Req HTTP `/v2/pipeline` (recommended, dep-free, HTTP-only) vs a real
-   libSQL client in-process (adds WS + real client encode, but a non-Elixir dep in the gate)?**
-   Plan recommends Req for the gate, a real remote client for the rig. Also: do we want the WS
-   transport (`Filo.Socket`, the `django-libsql` path) covered on the gate, or is HTTP-only
-   acceptable there and WS left to the rig?
-2. **`cold_open` retrofit — redefine in place vs add a new metric.** Redefining
-   `cold_open_p50_us` to be wire-measured is a **baseline reset** (it reads higher; the first
-   run flags as a regression until the parent is re-benched). Alternative: keep the in-process
-   `cold_open_p50_us` and add a new `cold_open_wire_p50_us` alongside. Plan assumes redefine +
-   re-baseline per the directive; confirm.
-3. **`dir_resolve` on the wire.** Resolve is not on the request path today, so the plan keeps
-   `dir_resolve_p50_us` an in-process measurement (a wire query wouldn't isolate it). Accept
-   that, or defer the metric until the request-path resolve lands?
-4. **`tpcb_wire_overhead_us` direct leg:** raw `Exqlite.Sqlite3` (measures fathom's *whole*
-   wire+proxy tax incl. `Connection`'s no-cache re-prepare — recommended) vs `Connection.query/3`
-   (folds the re-prepare into the baseline, so the delta is wire+executor only). Plan recommends
-   raw-exqlite.
-5. **Gate `tpcb_node_tps`?** Plan says no (fsync/APFS-dominated → recorded-only). A loose guard
-   (block only on a >50% drop) is possible but would need its own direction entry — flagged, not
-   assumed.
-6. **TPC-C default `W`:** plan defaults `--tpcc-warehouses 1` (~100 MB). Confirm that per-tenant
-   comparability size vs a smaller item/stock-reduced variant (which breaks strict peer
-   comparability). And confirm TPC-C metrics live in a **separate** `scripts/tpc_history.jsonl`,
-   not new `perf_history.jsonl` columns.
+1. **New test/bench dep `mint_web_socket`.** The in-process Hrana-WS client builds on
+   `Mint.WebSocket` (Mint itself is already in the lock via Finch/Req). Confirm the thin
+   `mint_web_socket` package is acceptable as a `only: [:dev, :test]` (bench) dep, vs `:gun`
+   (heavier, pulls `cowlib`) or shelling to a real client on the gate (defeats the "in-process,
+   reproducible" goal). Plan recommends `mint_web_socket`.
+2. **WS encoding scope on the gate: JSON (`hrana2`/`hrana3`) only, or also `hrana3-protobuf`?**
+   The plan's client speaks JSON (matches `socket_test.exs`); the Protobuf binary encoding is a
+   separate `Filo.Protobuf` path. Recommend JSON-only on the gate, leave Protobuf to a rig run
+   or a follow-on — confirm.
+3. **`tpcb_node_tps` loose threshold = 50%.** Proposed to catch a ≈2× collapse while tolerating
+   fsync/APFS jitter. Confirm 50%, or set a different loose value (and confirm the
+   `{name, direction, threshold}` `@metrics` shape for the `Gate` extension).
+4. **`cold_open_wire_p50_us` gate band.** Plan gates it at the global 20% (it is
+   pull-dominated + a small wire constant, like `cold_open`). If the added WS variance proves too
+   jittery in practice, it may want its own loose threshold via the same per-metric mechanism —
+   flagged, not assumed.
