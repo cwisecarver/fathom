@@ -1,0 +1,78 @@
+defmodule Fathom.Shard.ConnectionTest do
+  @moduledoc """
+  The per-stream exqlite connection wrapper. `Connection` is pure over a SQLite file path
+  (no coordinator, registry, or Postgres), so these are plain unit tests over a temp file.
+
+  Focus: `collect/3`'s result assembly. Phase-0 fix (docs/tpc-benchmark-plan.md) replaced the
+  O(R²) `acc ++ rows` with an O(R) batch-accumulate + reverse + concat — so both the ordering
+  invariant (batches must reassemble in arrival order) and the large-result cost are pinned here.
+  """
+  use ExUnit.Case, async: true
+
+  alias Fathom.Shard.Connection
+
+  setup do
+    path = Path.join(System.tmp_dir!(), "conn_test_#{System.unique_integer([:positive])}.db")
+    {:ok, conn} = Connection.open(path)
+    :ok = Connection.exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+
+    on_exit(fn ->
+      Connection.close(conn)
+      for s <- ["", "-wal", "-shm"], do: File.rm(path <> s)
+    end)
+
+    %{conn: conn}
+  end
+
+  # Bulk-seed n rows in one statement via a recursive CTE. n is a test constant (never user
+  # input), so inlining it is the same harness-controlled idiom the bench seeders use.
+  defp seed(conn, n) do
+    :ok =
+      Connection.exec(conn, """
+      WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < #{n})
+      INSERT INTO t (id, v) SELECT i, 'row-' || i FROM seq
+      """)
+  end
+
+  test "a large result reassembles in order with every row preserved", %{conn: conn} do
+    # 20k rows spans hundreds of multi_step batches, so this exercises the batch-boundary
+    # reassembly: a wrong reverse/concat would drop rows or reorder across batches.
+    n = 20_000
+    seed(conn, n)
+
+    {:ok, %{columns: cols, rows: rows}} =
+      Connection.query(conn, "SELECT id, v FROM t ORDER BY id", [])
+
+    assert cols == ["id", "v"]
+    assert length(rows) == n
+    assert List.first(rows) == [1, "row-1"]
+    assert List.last(rows) == [n, "row-#{n}"]
+    # A mid-stream spot check pins ordering across a batch boundary (not just the ends).
+    assert Enum.at(rows, 12_344) == [12_345, "row-12345"]
+    # No dupes / gaps: the id column is exactly 1..n in order.
+    assert Enum.map(rows, &hd/1) == Enum.to_list(1..n)
+  end
+
+  test "empty and single-row results are correct", %{conn: conn} do
+    assert {:ok, %{rows: []}} = Connection.query(conn, "SELECT id FROM t", [])
+    seed(conn, 1)
+    assert {:ok, %{rows: [[1, "row-1"]]}} = Connection.query(conn, "SELECT id, v FROM t", [])
+  end
+
+  @tag :bench
+  test "large-result collect stays O(R), not O(R²)", %{conn: conn} do
+    # Regression guard for the Phase-0 fix. The old `acc ++ rows` copied the whole accumulator
+    # on every multi_step batch → O(R²/batch); measured at 1385 ms for 200k rows here. The O(R)
+    # batch-accumulate + concat assembles the same 200k rows in ~tens of ms. Order-of-magnitude
+    # ceiling (per AGENTS.md hot-path guidance), not an exact latency: pre-fix blows 1s (verified
+    # by reverting collect), the fix clears it by ~20×.
+    n = 200_000
+    seed(conn, n)
+
+    {us, {:ok, %{rows: rows}}} =
+      :timer.tc(fn -> Connection.query(conn, "SELECT id FROM t", []) end)
+
+    assert length(rows) == n
+    assert us < 1_000_000, "collect of #{n} rows took #{div(us, 1000)}ms — O(R²) regression?"
+  end
+end

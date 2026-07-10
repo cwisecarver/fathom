@@ -61,10 +61,17 @@ defmodule Fathom.Shard.Connection do
     :ok
   end
 
-  defp collect(conn, stmt, acc \\ []) do
+  # Assemble the result in O(R), not O(R²). `multi_step` returns rows in batches; the old
+  # `acc ++ rows` copied the whole accumulator on every batch, so a large result cost
+  # O(R²/batch) — measured at 1385 ms for 200k rows (see connection_test.exs), pathological
+  # for a wide SELECT (TPC-C / the isolation checks hit it). Keep the batches in reverse
+  # arrival order (O(1) prepend), then reverse + one-level concat once at the end (O(R), ~tens
+  # of ms at 200k). `Enum.concat/1` joins the list of row-batches without recursing into a row
+  # (a row is itself a list of column values), so row shape + order are preserved.
+  defp collect(conn, stmt, batches \\ []) do
     case Sqlite3.multi_step(conn, stmt) do
-      {:rows, rows} -> collect(conn, stmt, acc ++ rows)
-      {:done, rows} -> {:ok, acc ++ rows}
+      {:rows, rows} -> collect(conn, stmt, [rows | batches])
+      {:done, rows} -> {:ok, [rows | batches] |> Enum.reverse() |> Enum.concat()}
       :busy -> {:error, :busy}
       {:error, reason} -> {:error, reason}
     end
