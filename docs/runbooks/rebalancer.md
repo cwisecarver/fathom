@@ -12,6 +12,15 @@ known-good full config to copy from.
 > Throughout, `rpc '<expr>'` means run the Elixir expression on a node, e.g.
 > `bin/fathom rpc '<expr>'` (a release) — the same mechanism `deploy/chaos/chaos.sh` uses.
 
+> **Where the gates live — there is no prod deploy target in this repo.** Every gate below is a
+> **deploy-time environment variable** read by `config/runtime.exs`; this repo ships **no**
+> production/staging deploy config (no fly.toml / k8s / terraform / env file) — only the chaos rig
+> (`deploy/chaos/`) and the LB config (`deploy/lb/`). "Enable a gate" therefore means setting that
+> env var in **your fleet's own env-var management** (the platform that deploys the release) and
+> redeploying that stage — not editing a file here. The staged procedure was rehearsed end-to-end
+> on the rig with all gates off → Stage 1→4 (see `docs/reviews/chaos-run-2026-07-09.md`); the rig
+> `docker-compose.yml` is the known-good full env to copy the variable set from.
+
 ---
 
 ## Preconditions (do NOT skip)
