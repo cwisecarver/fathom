@@ -20,6 +20,10 @@
 #                                 per node — the non-synthetic Phase-2 §B hot-spot run
 #   ./chaos.sh rebalance [shard secs]  the Phase-2 B1 handoff live: detect a hot shard,
 #                                 pin it + reload the LB, drain the source, prove it moved
+#   ./chaos.sh tpcb [shards txns accounts]  remote TPC-B: RTT probe + N tenant shards driven
+#                                 through the LB by a real libSQL client (the Phase-4 realism run)
+#   ./chaos.sh tpcc [max_w threads txns scale]  remote TPC-C: W=1..max_w sweep through the LB
+#                                 by a real libSQL client — per-txn-type latency + tpmC
 #
 # All timings are RELATIVE (one host, loopback MinIO): run `latency 30` first so
 # failover numbers reflect a real S3 RTT rather than loopback.
@@ -468,8 +472,32 @@ cmd_rebalance() {
   fi
 }
 
+# -- tpcb / tpcc: remote-client TPC over the real network through the LB --------
+# The realism layer for the TPC benchmarks (docs/tpc-benchmark-plan.md Phase 4): a real
+# libSQL/Hrana client (tpc_driver.py, dep-free stdlib) drives the workload statement-by-statement
+# on held streams through the LB — the true remote-client path the in-process loopback gate
+# (mix fathom.wire_bench / mix fathom.tpcc) cannot reach. Recorded-only; results go to
+# docs/reviews/. NOTE: the rig is single-host, so client→LB is loopback — the realism is the real
+# nginx LB hop + prod-release node (Bandit/Filo) + S3(MinIO)-backed storage, not a WAN RTT.
+cmd_tpcb() {
+  local shards=${1:-8} txns=${2:-4000} accounts=${3:-10000}
+  echo "tpcb: RTT probe + $shards tenant shards × TPC-B writes through the LB (remote client)" >&2
+  python3 tpc_driver.py rtt --lb "$LB" --domain "$DOMAIN" --shard tpcb_rtt --samples 200
+  python3 tpc_driver.py tpcb --lb "$LB" --domain "$DOMAIN" --shard tpcb \
+    --txns "$txns" --clients "$shards" --accounts "$accounts"
+}
+
+cmd_tpcc() {
+  local max_w=${1:-5} threads=${2:-8} txns=${3:-2000} scale=${4:-0.02}
+  echo "tpcc: W=1..$max_w sweep, $threads threads, $txns txns/W, scale $scale — remote client through the LB" >&2
+  python3 tpc_driver.py tpcc --lb "$LB" --domain "$DOMAIN" \
+    --max-w "$max_w" --threads "$threads" --txns "$txns" --scale "$scale"
+}
+
 case "${1:-}" in
   build)       cmd_build ;;
+  tpcb)        shift; cmd_tpcb "$@" ;;
+  tpcc)        shift; cmd_tpcc "$@" ;;
   rebalance)   shift; cmd_rebalance "$@" ;;
   hotspots)    shift; cmd_hotspots "$@" ;;
   up)          cmd_up ;;
