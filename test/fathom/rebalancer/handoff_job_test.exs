@@ -124,6 +124,36 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
     assert HandoffJob.drain_timeout() == 12_345
   end
 
+  test "drain supersedes a prior attempt's still-pending drain (single in-flight, #7)", %{
+    node: node
+  } do
+    shard = "drain_sup_#{System.unique_integer([:positive])}"
+    prev_warm = Application.get_env(:fathom, :handoff_warm_timeout_ms)
+    prev_drain = Application.get_env(:fathom, :handoff_drain_timeout_ms)
+    Application.put_env(:fathom, :handoff_warm_timeout_ms, 50)
+    Application.put_env(:fathom, :handoff_drain_timeout_ms, 50)
+
+    on_exit(fn ->
+      restore(:handoff_warm_timeout_ms, prev_warm)
+      restore(:handoff_drain_timeout_ms, prev_drain)
+    end)
+
+    # A prior attempt's drain left pending (await timed out, poller lagging).
+    {:ok, stale} = Commands.issue(shard, node, "drain")
+
+    args = %{"shard_id" => shard, "from_node" => node, "to_node" => node, "q_per_s" => 500.0}
+
+    # attempt 1 (non-final): drain/2 cancels the stale drain, issues its own, times out (no poller).
+    assert {:error, _} = perform_job(HandoffJob, args, attempt: 1)
+
+    assert Commands.get(stale.id).status == "cancelled", "the prior pending drain was superseded"
+    # Exactly one pending drain for the shard (this attempt's), never two racing.
+    pending =
+      Commands.pending_for(node) |> Enum.filter(&(&1.command == "drain" and &1.shard_id == shard))
+
+    assert length(pending) == 1
+  end
+
   test "an invalid shard_id doesn't crash the handoff (#14)", %{node: node} do
     # Regression for #14: pin_and_flip hard-matched {:ok, _}, so a rejected pin (invalid
     # shard_id) would MatchError-crash the job. It must handle the error and revert instead.

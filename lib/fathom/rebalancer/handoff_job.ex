@@ -118,6 +118,12 @@ defmodule Fathom.Rebalancer.HandoffJob do
   end
 
   defp drain(shard, from) do
+    # Supersede any drain a prior attempt left pending (its await timed out with the poller
+    # lagging) BEFORE issuing this attempt's — so the poller never runs two same-shard drains
+    # concurrently, where the second hits the coordinator's "draining" busy-guard and could
+    # mark THIS attempt failed even though the shard drained (review 2026-07-09 #7). One pending
+    # drain per shard; the {owner,epoch} lease prevents a double-write regardless.
+    Commands.cancel_pending_drains(shard)
     {:ok, cmd} = Commands.issue(shard, from, "drain")
 
     case Commands.await(cmd.id, timeout_ms: drain_timeout()) do
