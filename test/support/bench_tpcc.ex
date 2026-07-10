@@ -25,6 +25,7 @@ defmodule Fathom.Bench.Tpcc do
   into recursive-CTE bulk inserts; every *value a transaction later binds* is a bound `?`.
   """
 
+  alias Fathom.Bench.HranaClient
   alias Fathom.Shard.{Connection, Storage}
 
   @base_items 100_000
@@ -202,6 +203,417 @@ defmodule Fathom.Bench.Tpcc do
         "(abs(random() % 1000000)) / 100.0, 'tpcc-ol-dist-info-24char' FROM wq, dq, oq, nq"
     ]
   end
+
+  # --- transaction deck ----------------------------------------------------
+
+  @txn_types [:new_order, :payment, :order_status, :delivery, :stock_level]
+
+  @doc "The five TPC-C transaction types (deck order)."
+  def txn_types, do: @txn_types
+
+  @doc "Driver context for a shard: warehouse count + scaled cardinalities (id-draw ranges)."
+  @spec context(pos_integer(), number()) :: map()
+  def context(w_count, scale), do: %{w_count: w_count, card: cardinalities(scale)}
+
+  @doc """
+  A weighted transaction-type pick per the authoritative TPC-C deck: New-Order ~45%, Payment
+  ~43%, Order-Status / Delivery / Stock-Level ~4% each (TPC-C spec / Jim Gray Benchmark
+  Handbook ch. 12). `tpmC` counts New-Order.
+  """
+  @spec random_type() :: atom()
+  def random_type do
+    case :rand.uniform(100) do
+      r when r <= 45 -> :new_order
+      r when r <= 88 -> :payment
+      r when r <= 92 -> :order_status
+      r when r <= 96 -> :delivery
+      _ -> :stock_level
+    end
+  end
+
+  @doc """
+  Run one transaction of `type` over the wire client `c` with driver `ctx`. Returns
+  `{client, status}` where status is `:committed`, `:rolled_back` (New-Order's spec ~1% invalid-
+  item rollback), or `:skipped` (Delivery found no pending order). All values are bound `?`, never
+  interpolated (only harness-controlled column names — e.g. `s_dist_NN` — are). Read-modify-write
+  transactions use `BEGIN IMMEDIATE` so concurrent writers on the one shard file serialize on the
+  write lock instead of racing the district's `d_next_o_id` (single-writer SQLite).
+  """
+  @spec run(atom(), struct(), map()) :: {struct(), atom()}
+  def run(:new_order, c, ctx), do: new_order(c, ctx)
+  def run(:payment, c, ctx), do: payment(c, ctx)
+  def run(:order_status, c, ctx), do: order_status(c, ctx)
+  def run(:delivery, c, ctx), do: delivery(c, ctx)
+  def run(:stock_level, c, ctx), do: stock_level(c, ctx)
+
+  # New-Order: read Item+Stock, write Order+Order-Line+New-Order, update Stock + District. ~1% of
+  # txns draw an invalid item on the last line and roll back (spec-required rollback exercise).
+  defp new_order(c, %{card: card} = ctx) do
+    w_id = rand_w(ctx)
+    d_id = rand_d()
+    c_id = rand_c(ctx)
+    ol_cnt = 4 + :rand.uniform(11)
+    rollback? = :rand.uniform(100) == 1
+    entry_d = now_str()
+
+    c = exec(c, "BEGIN IMMEDIATE")
+    {c, _} = step(c, "SELECT w_tax FROM warehouse WHERE w_id = ?", [w_id])
+
+    {c, dist} =
+      step(c, "SELECT d_tax, d_next_o_id FROM district WHERE d_w_id = ? AND d_id = ?", [
+        w_id,
+        d_id
+      ])
+
+    [[_d_tax, o_id]] = dist.rows
+
+    c =
+      exec(c, "UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_w_id = ? AND d_id = ?", [
+        w_id,
+        d_id
+      ])
+
+    {c, _} =
+      step(
+        c,
+        "SELECT c_discount, c_last, c_credit FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",
+        [w_id, d_id, c_id]
+      )
+
+    c =
+      exec(
+        c,
+        "INSERT INTO oorder (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_ol_cnt, o_all_local) " <>
+          "VALUES (?, ?, ?, ?, ?, ?, 1)",
+        [o_id, d_id, w_id, c_id, entry_d, ol_cnt]
+      )
+
+    c =
+      exec(c, "INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES (?, ?, ?)", [
+        o_id,
+        d_id,
+        w_id
+      ])
+
+    new_order_lines(c, ctx, w_id, d_id, o_id, ol_cnt, rollback?, card.items)
+  end
+
+  # Process ol_cnt order lines; on the invalid last item (forced-rollback path) roll back the
+  # whole txn, else commit. Read via reduce_while so the rollback halts the loop.
+  defp new_order_lines(c, ctx, w_id, d_id, o_id, ol_cnt, rollback?, items) do
+    dist_col = "s_dist_#{pad(d_id)}"
+
+    {c, status} =
+      Enum.reduce_while(1..ol_cnt, {c, :committed}, fn n, {c, _} ->
+        i_id = if rollback? and n == ol_cnt, do: items + 1, else: rand_i(ctx)
+        {c, item} = step(c, "SELECT i_price, i_name, i_data FROM item WHERE i_id = ?", [i_id])
+
+        case item.rows do
+          [] ->
+            {c, _} = step(c, "ROLLBACK")
+            {:halt, {c, :rolled_back}}
+
+          [[price, _name, _data]] ->
+            {c, stock} =
+              step(
+                c,
+                "SELECT s_quantity, #{dist_col}, s_data FROM stock WHERE s_w_id = ? AND s_i_id = ?",
+                [w_id, i_id]
+              )
+
+            [[s_qty, dist_info, _s_data]] = stock.rows
+            qty = 5
+            new_qty = if s_qty - qty >= 10, do: s_qty - qty, else: s_qty - qty + 91
+
+            c =
+              exec(
+                c,
+                "UPDATE stock SET s_quantity = ?, s_ytd = s_ytd + ?, s_order_cnt = s_order_cnt + 1 " <>
+                  "WHERE s_w_id = ? AND s_i_id = ?",
+                [new_qty, qty, w_id, i_id]
+              )
+
+            c =
+              exec(
+                c,
+                "INSERT INTO order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, " <>
+                  "ol_supply_w_id, ol_quantity, ol_amount, ol_dist_info) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [o_id, d_id, w_id, n, i_id, w_id, qty, qty * price, dist_info]
+              )
+
+            {:cont, {c, :committed}}
+        end
+      end)
+
+    case status do
+      :rolled_back -> {c, :rolled_back}
+      :committed -> {exec(c, "COMMIT"), :committed}
+    end
+  end
+
+  # Payment: update Warehouse+District+Customer balances, insert History. 60% by-last-name (the
+  # multi-row select), 40% by-id.
+  defp payment(c, ctx) do
+    w_id = rand_w(ctx)
+    d_id = rand_d()
+    amount = (:rand.uniform(500_000) + 100) / 100.0
+    h_date = now_str()
+
+    c = exec(c, "BEGIN IMMEDIATE")
+    c = exec(c, "UPDATE warehouse SET w_ytd = w_ytd + ? WHERE w_id = ?", [amount, w_id])
+
+    {c, _} =
+      step(c, "SELECT w_name, w_street_1, w_city, w_state, w_zip FROM warehouse WHERE w_id = ?", [
+        w_id
+      ])
+
+    c =
+      exec(c, "UPDATE district SET d_ytd = d_ytd + ? WHERE d_w_id = ? AND d_id = ?", [
+        amount,
+        w_id,
+        d_id
+      ])
+
+    {c, _} =
+      step(
+        c,
+        "SELECT d_name, d_street_1, d_city, d_state, d_zip FROM district WHERE d_w_id = ? AND d_id = ?",
+        [w_id, d_id]
+      )
+
+    {c, c_id, credit} = pick_customer(c, ctx, w_id, d_id)
+
+    c =
+      exec(
+        c,
+        "UPDATE customer SET c_balance = c_balance - ?, c_ytd_payment = c_ytd_payment + ?, " <>
+          "c_payment_cnt = c_payment_cnt + 1 WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",
+        [amount, amount, w_id, d_id, c_id]
+      )
+
+    # Bad-credit customers get their c_data rewritten with the payment trail (spec behavior).
+    c =
+      if credit == "BC" do
+        exec(
+          c,
+          "UPDATE customer SET c_data = ? WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",
+          ["#{c_id} #{d_id} #{w_id} #{amount} |bc-data", w_id, d_id, c_id]
+        )
+      else
+        c
+      end
+
+    c =
+      exec(
+        c,
+        "INSERT INTO history (h_c_id, h_c_d_id, h_c_w_id, h_d_id, h_w_id, h_date, h_amount, h_data) " <>
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [c_id, d_id, w_id, d_id, w_id, h_date, amount, "payment"]
+      )
+
+    {exec(c, "COMMIT"), :committed}
+  end
+
+  # Order-Status (read-only): the customer's latest order + its order lines.
+  defp order_status(c, ctx) do
+    w_id = rand_w(ctx)
+    d_id = rand_d()
+
+    c = exec(c, "BEGIN")
+    {c, c_id, _credit} = pick_customer(c, ctx, w_id, d_id)
+
+    {c, order} =
+      step(
+        c,
+        "SELECT o_id, o_entry_d, o_carrier_id FROM oorder WHERE o_w_id = ? AND o_d_id = ? AND " <>
+          "o_c_id = ? ORDER BY o_id DESC LIMIT 1",
+        [w_id, d_id, c_id]
+      )
+
+    c =
+      case order.rows do
+        [[o_id, _entry, _carrier]] ->
+          {c, _lines} =
+            step(
+              c,
+              "SELECT ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_delivery_d FROM " <>
+                "order_line WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id = ?",
+              [w_id, d_id, o_id]
+            )
+
+          c
+
+        [] ->
+          c
+      end
+
+    {exec(c, "COMMIT"), :committed}
+  end
+
+  # Delivery (batch): for each district, deliver the oldest pending New-Order.
+  defp delivery(c, ctx) do
+    w_id = rand_w(ctx)
+    carrier = :rand.uniform(10)
+    delivery_d = now_str()
+
+    c = exec(c, "BEGIN IMMEDIATE")
+
+    c =
+      Enum.reduce(1..10, c, fn d_id, c -> deliver_district(c, w_id, d_id, carrier, delivery_d) end)
+
+    {exec(c, "COMMIT"), :committed}
+  end
+
+  defp deliver_district(c, w_id, d_id, carrier, delivery_d) do
+    {c, pending} =
+      step(
+        c,
+        "SELECT no_o_id FROM new_order WHERE no_w_id = ? AND no_d_id = ? ORDER BY no_o_id LIMIT 1",
+        [w_id, d_id]
+      )
+
+    case pending.rows do
+      [] ->
+        c
+
+      [[o_id]] ->
+        c =
+          exec(c, "DELETE FROM new_order WHERE no_w_id = ? AND no_d_id = ? AND no_o_id = ?", [
+            w_id,
+            d_id,
+            o_id
+          ])
+
+        {c, ord} =
+          step(c, "SELECT o_c_id FROM oorder WHERE o_w_id = ? AND o_d_id = ? AND o_id = ?", [
+            w_id,
+            d_id,
+            o_id
+          ])
+
+        [[c_id]] = ord.rows
+
+        c =
+          exec(
+            c,
+            "UPDATE oorder SET o_carrier_id = ? WHERE o_w_id = ? AND o_d_id = ? AND o_id = ?",
+            [
+              carrier,
+              w_id,
+              d_id,
+              o_id
+            ]
+          )
+
+        c =
+          exec(
+            c,
+            "UPDATE order_line SET ol_delivery_d = ? WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id = ?",
+            [delivery_d, w_id, d_id, o_id]
+          )
+
+        {c, sum} =
+          step(
+            c,
+            "SELECT COALESCE(SUM(ol_amount), 0) FROM order_line WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id = ?",
+            [w_id, d_id, o_id]
+          )
+
+        [[amount]] = sum.rows
+
+        exec(
+          c,
+          "UPDATE customer SET c_balance = c_balance + ?, c_delivery_cnt = c_delivery_cnt + 1 " <>
+            "WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",
+          [amount, w_id, d_id, c_id]
+        )
+    end
+  end
+
+  # Stock-Level (read-only join): distinct low-stock items across the last 20 orders' lines.
+  defp stock_level(c, ctx) do
+    w_id = rand_w(ctx)
+    d_id = rand_d()
+    threshold = 10 + :rand.uniform(11)
+
+    c = exec(c, "BEGIN")
+
+    {c, dist} =
+      step(c, "SELECT d_next_o_id FROM district WHERE d_w_id = ? AND d_id = ?", [w_id, d_id])
+
+    [[next_oid]] = dist.rows
+
+    {c, _} =
+      step(
+        c,
+        "SELECT COUNT(DISTINCT s_i_id) FROM order_line, stock WHERE ol_w_id = ? AND ol_d_id = ? " <>
+          "AND ol_o_id >= ? AND ol_o_id < ? AND s_w_id = ? AND s_i_id = ol_i_id AND s_quantity < ?",
+        [w_id, d_id, next_oid - 20, next_oid, w_id, threshold]
+      )
+
+    {exec(c, "COMMIT"), :committed}
+  end
+
+  # Customer selection: 60% by last name (multi-row, pick the middle by c_first), 40% by id. The
+  # by-name path falls back to by-id when a name group is empty (small scale). Returns credit too
+  # (Payment's bad-credit branch needs it).
+  defp pick_customer(c, ctx, w_id, d_id) do
+    if :rand.uniform(100) <= 60 do
+      last = "LAST" <> Integer.to_string(:rand.uniform(100) - 1)
+
+      {c, res} =
+        step(
+          c,
+          "SELECT c_id, c_credit FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_last = ? ORDER BY c_first",
+          [w_id, d_id, last]
+        )
+
+      case res.rows do
+        [] ->
+          pick_customer_by_id(c, ctx, w_id, d_id)
+
+        rows ->
+          [c_id, credit] = Enum.at(rows, div(length(rows) - 1, 2))
+          {c, c_id, credit}
+      end
+    else
+      pick_customer_by_id(c, ctx, w_id, d_id)
+    end
+  end
+
+  defp pick_customer_by_id(c, ctx, w_id, d_id) do
+    c_id = rand_c(ctx)
+
+    {c, res} =
+      step(
+        c,
+        "SELECT c_id, c_credit FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",
+        [w_id, d_id, c_id]
+      )
+
+    [[found_id, credit]] = res.rows
+    {c, found_id, credit}
+  end
+
+  # execute-and-thread: `exec` discards the result (writes/DDL/COMMIT); `step` keeps it (reads).
+  # Both raise on any wire error — fail-loud for the bench (busy is near-impossible under
+  # BEGIN IMMEDIATE at bench scale; the ~1% New-Order rollback rides the empty-rows path, not an
+  # error).
+  defp exec(c, sql, args \\ []) do
+    {:ok, c, _} = HranaClient.execute(c, sql, args)
+    c
+  end
+
+  defp step(c, sql, args \\ []) do
+    {:ok, c, res} = HranaClient.execute(c, sql, args)
+    {c, res}
+  end
+
+  defp rand_w(%{w_count: w}), do: :rand.uniform(w)
+  defp rand_d, do: :rand.uniform(10)
+  defp rand_c(%{card: %{per_district: p}}), do: :rand.uniform(p)
+  defp rand_i(%{card: %{items: i}}), do: :rand.uniform(i)
+  defp now_str, do: DateTime.utc_now() |> DateTime.to_iso8601()
 
   # --- internals -----------------------------------------------------------
 
