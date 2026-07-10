@@ -42,14 +42,42 @@ is competitive with a bare single-DB server. The per-txn cost on both is dominat
 thing — the chatty Hrana round-trips (7 for TPC-B, ~30–60 for New-Order) × the ~0.4 ms wire RTT —
 so neither server's language is the bottleneck at this workload; the protocol is.
 
-**The comparison is deliberately per-DB, which is sqld's home turf, not fathom's.** fathom's reason
-to exist — *millions* of small isolated single-writer shards, cheap cold-open, fan-out — is layered
+**The comparison above is deliberately per-DB, which is sqld's home turf, not fathom's.** fathom's
+reason to exist — many small isolated single-writer shards, cheap cold-open, fan-out — is layered
 *on top* of this per-DB serving, and the earlier findings show that layer is nearly free
 (`docs/reviews/competitive-oltp-2026-07-10.md`: durability free, orchestration off the hot path).
-So the honest framing is: **fathom gives you libSQL-server-class per-DB serving, plus the
-multi-tenant orchestration, at no measured per-DB cost.** A true multi-tenant head-to-head (sqld
-with `--enable-namespaces`, N databases, vs fathom's N shards) is the natural next step and the one
-that would actually stress fathom's design point — not run here.
+So on one DB the honest framing is: **fathom gives you libSQL-server-class per-DB serving, plus the
+multi-tenant orchestration, at no measured per-DB cost.** The multi-tenant comparison below is the
+one that actually stresses fathom's design point.
+
+## Multi-tenant — fathom shards vs sqld namespaces (the design point)
+
+libSQL server supports many databases via **namespaces** (`--enable-namespaces`), routed by the
+*same* Host-subdomain mechanism fathom uses — so the same driver drives both: N tenant DBs, one
+writer each, running TPC-B concurrently. Load is **N independent processes** (one per tenant), not
+threads — the Python driver is GIL-bound under many threads and would measure the client, not the
+servers' fan-out (`turso_multitenant.sh`). Aggregate tps = sum of the per-tenant process tps;
+latency = the median per-tenant p50/p99.
+
+| N tenants | fathom agg tps | sqld agg tps | fathom p50 | sqld p50 | fathom p99 | sqld p99 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 1324 | 1270 | 6.0 ms | 6.3 ms | 7.6 ms | 8.1 ms |
+| 32 | **2993** | 1735 | 10.7 ms | 19.1 ms | 13.7 ms | 23.4 ms |
+| 64 | **3654** | 1660 | 17.7 ms | 38.9 ms | 23.0 ms | 51.4 ms |
+
+**At N=8 they're even; as tenants grow, fathom pulls away.** Aggregate throughput *scales* on
+fathom (1324 → 2993 → 3654) but *plateaus then declines* on sqld (1270 → 1735 → 1660), and by N=64
+fathom's per-tenant latency is roughly **half** sqld's (17.7 vs 38.9 ms p50). This is fathom's
+thesis on the board: it fans out across many independent single-writer shards — each its own BEAM
+process, spread over the cores by the scheduler — while sqld's namespaces share more server-side
+machinery (a shared runtime, and a bounded `--max-active-namespaces` active set beyond which
+namespaces churn cold) and hit a contention wall fathom doesn't. **fathom scales *out* with tenant
+count where a single-server design scales *up* and stalls.**
+
+This is still only *fan-out throughput at modest N*. The full **density** axis — *millions* of
+shards, where fathom cold-opens on demand (`mix fathom.scale` held 50k+ linearly to the fd ceiling)
+and a single sqld process cannot keep that many namespaces active — is the larger structural win
+and a separate measurement.
 
 ## Caveats (so this isn't oversold)
 
@@ -65,12 +93,18 @@ that would actually stress fathom's design point — not run here.
 - **`sqld` is single-database**, so the runner starts it fresh each run (its accumulated state /
   a wedged connection otherwise hangs a later pass — the reason `turso_headtohead.sh` recreates the
   container). fathom stays robust on a fixed shard (idempotent seed + busy_timeout + coordinator).
+- **Multi-tenant load is N independent processes** (one per tenant), aggregate tps = the sum of
+  per-process tps and latency = the median per-tenant p50/p99 — an approximate aggregate, not a
+  single synchronized window. Threads were GIL-bound (measuring the client, not the servers), which
+  is why the process model is used. sqld's default `--max-active-namespaces` may contribute to its
+  N=64 plateau (churning namespaces cold) — that overlaps the density axis and is not isolated here.
 
 ## Reproduce
 
 ```bash
 cd deploy/chaos
 ./chaos.sh up                       # fathom rig (3 nodes + LB + MinIO)
-./turso_headtohead.sh               # starts a fresh sqld, drives both, prints the table
+./turso_headtohead.sh               # per-DB: fresh sqld, drives both, prints the table
 # args: ./turso_headtohead.sh [rtt_samples tpcb_txns tpcc_txns]
+./turso_multitenant.sh "8 32 64"    # multi-tenant: fresh sqld w/ namespaces, N shards vs N namespaces
 ```
