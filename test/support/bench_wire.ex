@@ -16,8 +16,11 @@ defmodule Fathom.Bench.Wire do
   """
 
   alias Fathom.Bench.HranaClient
+  alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Shards
 
   @hrana_rt_samples 200
+  @cold_open_wire_samples 30
 
   @doc """
   `hrana_rt_us` — median µs of a warm-stream `SELECT 1` round-trip over the wire. A read that
@@ -50,6 +53,73 @@ defmodule Fathom.Bench.Wire do
       end
     end)
   end
+
+  @doc """
+  `cold_open_wire_p50_us` — median µs for a client to first-query a **cold** shard over the
+  wire: a fresh WS connect whose `open_stream` triggers the cold `Shards.checkout` (pull from
+  storage + coordinator start), then the first `execute`. The wire parallel to the in-process
+  `Fathom.Bench.cold_open/1`; it adds the WS upgrade/hello + framing a real client pays on a
+  new connection. Each sample seeds a fresh shard into storage and drops its local copy, so
+  every open is genuinely cold.
+  """
+  @spec cold_open_wire(keyword()) :: float()
+  def cold_open_wire(opts \\ []) do
+    samples = Keyword.get(opts, :cold_open_wire_samples, @cold_open_wire_samples)
+
+    with_listener(fn port ->
+      # Warm code paths once (module/NIF/WS load), not timed.
+      warm = uniq("wire_co_warm")
+      seed_cold_shard(warm)
+      cold_first_query(port, warm)
+      teardown_cold(warm)
+
+      1..samples
+      |> Enum.map(fn _ ->
+        id = uniq("wire_co")
+        seed_cold_shard(id)
+        {us, :ok} = :timer.tc(fn -> cold_first_query(port, id) end)
+        teardown_cold(id)
+        us
+      end)
+      |> p50()
+    end)
+  end
+
+  # A fresh connection to a cold shard: connect (upgrade + hello + open_stream → cold checkout)
+  # then the first query. Closes the stream; returns :ok.
+  defp cold_first_query(port, shard) do
+    {:ok, c} = HranaClient.connect(port, shard)
+    {:ok, c, _} = HranaClient.execute(c, "SELECT 1")
+    HranaClient.close(c)
+    :ok
+  end
+
+  # Put a shard into storage but leave no local copy or coordinator, so the next open is a
+  # genuine cold pull (mirrors Fathom.Bench.seed_storage_shard/1). Uses a `.seed` temp so the
+  # coordinator's own `<id>.db` path stays absent.
+  defp seed_cold_shard(id) do
+    # The .seed is a throwaway local source for the Storage.flush PUT (the coordinator later
+    # pulls object `id` to its own data dir), so any writable path works — don't depend on
+    # :shard_data_dir, which is nil in test (the coordinator defaults it internally).
+    tmp = Path.join(System.tmp_dir!(), "#{id}.seed")
+    drop_local(tmp)
+    {:ok, conn} = Connection.open(tmp)
+    :ok = Connection.exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    :ok = Connection.exec(conn, "INSERT INTO t DEFAULT VALUES")
+    :ok = Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(conn)
+    :ok = Storage.flush(id, tmp)
+    drop_local(tmp)
+  end
+
+  # Stop the coordinator (flush + drop local + release lease) so nothing lingers between
+  # samples, then best-effort remove the storage-side seed.
+  defp teardown_cold(id) do
+    Shards.drain(id, 5_000)
+    rm_shard(id)
+  end
+
+  defp drop_local(path), do: Enum.each(["", "-wal", "-shm"], &File.rm(path <> &1))
 
   # --- shared harness ------------------------------------------------------
 

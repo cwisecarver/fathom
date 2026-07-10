@@ -12,4 +12,14 @@ defmodule Fathom.Bench.WireTest do
     assert us > 0.0
     assert us < 50_000.0, "hrana_rt p50 #{us}µs exceeded the 50ms smoke ceiling"
   end
+
+  test "cold_open_wire returns a sane cold-first-query p50 over the wire" do
+    # Each sample cold-opens a fresh shard (pull from storage + coordinator start) behind a
+    # fresh WS connect. Local storage on loopback is a few ms/open; 100 ms is a generous
+    # order-of-magnitude smoke ceiling.
+    us = Wire.cold_open_wire(cold_open_wire_samples: 5)
+    assert is_float(us)
+    assert us > 0.0
+    assert us < 100_000.0, "cold_open_wire p50 #{us}µs exceeded the 100ms smoke ceiling"
+  end
 end

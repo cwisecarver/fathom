@@ -23,7 +23,7 @@ defmodule Mix.Tasks.Fathom.WireBench do
   @block 20
 
   # metric => :higher_worse | :lower_worse (mirrors Fathom.Bench.Gate's direction convention).
-  @directions %{hrana_rt_us: :higher_worse}
+  @directions %{hrana_rt_us: :higher_worse, cold_open_wire_p50_us: :higher_worse}
 
   @impl true
   def run(argv) do
@@ -33,14 +33,23 @@ defmodule Mix.Tasks.Fathom.WireBench do
 
     {opts, _, _} =
       OptionParser.parse(argv,
-        strict: [append: :boolean, check: :boolean, hrana_rt_samples: :integer]
+        strict: [
+          append: :boolean,
+          check: :boolean,
+          hrana_rt_samples: :integer,
+          cold_open_wire_samples: :integer
+        ]
       )
 
     Mix.Task.run("app.start")
 
-    bench_opts = for k <- [:hrana_rt_samples], v = opts[k], do: {k, v}
+    bench_opts = for k <- [:hrana_rt_samples, :cold_open_wire_samples], v = opts[k], do: {k, v}
 
-    metrics = %{hrana_rt_us: Float.round(Fathom.Bench.Wire.hrana_rt(bench_opts), 1)}
+    metrics = %{
+      hrana_rt_us: Float.round(Fathom.Bench.Wire.hrana_rt(bench_opts), 1),
+      cold_open_wire_p50_us: Float.round(Fathom.Bench.Wire.cold_open_wire(bench_opts), 1)
+    }
+
     line = Map.merge(meta(), metrics)
 
     print(metrics, line)
@@ -69,7 +78,11 @@ defmodule Mix.Tasks.Fathom.WireBench do
     )
 
     IO.puts(
-      "  hrana_rt_us  #{fmt(metrics.hrana_rt_us)}  µs   (warm SELECT 1 round-trip over the WS wire)"
+      "  hrana_rt_us            #{fmt(metrics.hrana_rt_us)}  µs   (warm SELECT 1 round-trip over the WS wire)"
+    )
+
+    IO.puts(
+      "  cold_open_wire_p50_us  #{fmt(metrics.cold_open_wire_p50_us)}  µs   (cold shard, first query over the wire)"
     )
 
     IO.puts(Jason.encode!(line))
