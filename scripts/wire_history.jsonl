@@ -1,1 +1,1 @@
-{"dirty":false,"host":"darwin","branch":"main","commit":"f567409","commit_full":"f5674099289b7f6d2b1a877a8cbd8d2b71afb8e0","mix_env":"test","ts":"2026-07-10T20:16:03.651521Z","hrana_rt_us":98.0,"cold_open_wire_p50_us":2623.5,"tpcb_wire_overhead_us":371.0,"tpcb_node_tps":4167.2}
+{"dirty":false,"host":"darwin","branch":"main","commit":"b01d4be","commit_full":"b01d4be01ff03187a406b3a94c77e5640895240f","mix_env":"test","ts":"2026-07-10T21:27:23.594882Z","hrana_rt_us":99.0,"cold_open_wire_p50_us":2484.5,"tpcb_wire_overhead_us":372.5,"tpcb_node_tps":4154.2}
