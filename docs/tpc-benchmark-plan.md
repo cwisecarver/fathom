@@ -1,6 +1,6 @@
 # Fathom — TPC-B + TPC-C Benchmark Plan
 
-> Status: **Phases 0–3 BUILT (2026-07-10, rev. 6); Phase 4 planned.** This is the
+> Status: **Phases 0–4 BUILT (2026-07-10, rev. 7). COMPLETE.** This is the
 > implementation-ready design for adding *both* a TPC-B-derived and a TPC-C-derived
 > benchmark to fathom, additive to the existing harness (`docs/benchmark-plan.md`,
 > `Fathom.Bench`, `mix fathom.bench`, the `Fathom.Bench.Gate` regression gate,
@@ -43,6 +43,23 @@
 > effects over the wire (delta invariants that also pin rollback correctness), and a tiny-sweep
 > smoke asserting all 21 metric keys. Committed `[skip-bench]`. Phase 4 (the remote-client realism
 > headline) is the only remainder.
+>
+> **Rev. 7 — Phase 4 shipped; the plan is COMPLETE.** `deploy/chaos/tpc_driver.py` (+ the TPC-C
+> deck `tpcc_deck.py`) is a real libSQL/Hrana **remote client** (dep-free Python stdlib, baton-
+> threaded persistent stream) driven by `chaos.sh tpcb` / `chaos.sh tpcc` over the network through
+> the LB — statement-by-statement on held streams, the true remote-client path. **Run live on the
+> rig 2026-07-10** (`docs/reviews/tpc-run-2026-07-10.md`): warm-read RTT **~559 µs** through the
+> real LB (vs ~130 µs in-process WS); single-tenant TPC-B **~4 ms/txn** (7 stmts × RTT + server, 0
+> errors); TPC-C per-txn-type p50 stable across W=1..5 (New-Order ~27 ms, Payment ~5.7 ms,
+> Order-Status ~3 ms, Delivery ~41 ms, Stock-Level ~2.4 ms). **Headline finding:** a chatty
+> New-Order holds the `BEGIN IMMEDIATE` write lock across ~30–60 network round-trips (~27 ms), so
+> multiple threads on **one** shard convoy (p99 → 1–2 s, tpmC lock-bound) while the multi-tenant
+> TPC-B (8 shards, one writer each) has a tight p99 — i.e. the run *demonstrates* fathom's thesis:
+> scale by millions of single-writer shards, not by within-shard concurrency. **As-built notes:**
+> the rig is single-host so client→LB is loopback (not a WAN RTT — the realism is the real nginx LB
+> hop + prod-release node + S3/MinIO storage); the driver reconnects on transient LB 502s
+> (nginx↔node keepalive races, ~1–2%, auto-recovered); the rebalancer is quieted during a latency
+> run. Committed `[skip-bench]` (rig tooling + a review doc, no prod/test Elixir).
 >
 > **Decision (this session) — where wire metrics are gated.** The WS client is `mint_web_socket`,
 > `only: [:dev, :test]` (never ships prod), and the per-commit gate `commit_with_bench.sh` runs
@@ -684,7 +701,7 @@ assembly is linear in row count).
 | **1 — loopback WS harness + wire gate metrics ✅ DONE** | Built `Fathom.Bench.HranaClient` (`test/support`, `Mint.WebSocket`, dev/test only) — starts `Filo.Streams` + a Bandit `Filo.Plug` listener on `127.0.0.1:0`, drives hello → open_stream → execute → close_stream with `Filo.Value` encode/decode, shard via `Host: <shard>.local`. `Fathom.Bench.Wire` + the **`MIX_ENV=test mix fathom.wire_bench`** task emit `hrana_rt_us`, `cold_open_wire_p50_us`, `tpcb_wire_overhead_us` (Framing A: TPC-B seed + 7-stmt deck, WS-vs-raw-exqlite delta with a reused-prepared baseline). **As-built vs the original row:** gating did NOT touch `Fathom.Bench.Gate`/`perf_history` — the wire metrics live in the gitignored `scripts/wire_history.jsonl` and are gated by the task's `--check` (last-same-host, block ≥20%), because the client dep is dev/test-only and the prod gate runs `MIX_ENV=prod`. The per-metric-threshold `Gate` extension moves to Phase 2 (it's only needed for the loose `tpcb_node_tps` gate). | ~3.5–4 days |
 | **2 — TPC-B aggregate + isolation (WS) ✅ DONE** | `Fathom.Bench.Wire.tpcb_node_tps/1` (Framing B): seed N shards in-process, then time a concurrent loopback-WS write burst per shard → aggregate txn/s; a new `mix fathom.wire_bench` metric with `--tpcb-shards`/`--tpcb-node-txns` knobs + a **loose 50% per-metric threshold in the task** (`@thresholds`). `test/fathom/tpcb_isolation_test.exs`: concurrent-write **isolation-under-write-load** through the wire (per-shard consistency + zero cross-shard contamination), under the shard-isolation gate; teeth proven RED against a commingle variant. **As-built vs the row:** the loose gate lives in the wire task, **not** `Fathom.Bench.Gate` (wire metrics are dev/test-only → never the `MIX_ENV=prod` commit gate). | ~2 days |
 | **3 — TPC-C loopback WS, W = 1..5 sweep ✅ DONE** | `Fathom.Bench.Tpcc` + `mix fathom.tpcc`: 9-table schema + in-process recursive-CTE seed (`--tpcc-scale`, default 1.0 = spec), all 5 weighted txn profiles over the WS client, `--tpcc-threads` concurrent streams, run at **each W ∈ 1..--tpcc-max-w (default 5)**, per-txn-type `p50/p95/p99/max` + `tpmC` **per W** → `scripts/tpc_history.jsonl` (one row per W, gitignored). Recorded-only, never a gate. **As-built:** RMW txns use `BEGIN IMMEDIATE` (single-writer-safe `d_next_o_id`); the ~1% New-Order rollback rides the empty-rows path (no `HranaClient` change). Tests: seed cardinalities, per-txn write effects over the wire, tiny-sweep smoke (all 21 keys). | ~4.5–5.5 days |
-| **4 — remote-client realism (rig headline)** | `chaos.sh tpcb` + `chaos.sh tpcc`: real remote libSQL client over the network through the LB (true cross-network RTT + the per-txn-type latency + tpmC W-sweep), written to `docs/reviews/tpc*-run-<date>.md`. | ~2.5–3.5 days |
+| **4 — remote-client realism (rig headline) ✅ DONE** | `deploy/chaos/tpc_driver.py` + `tpcc_deck.py` (dep-free Python stdlib libSQL/Hrana client, baton-threaded) driven by `chaos.sh tpcb` / `chaos.sh tpcc` over the network through the LB — per-statement on held streams. **Run live 2026-07-10**, results + findings in `docs/reviews/tpc-run-2026-07-10.md`. **As-built:** single-host rig (client→LB loopback, not a WAN RTT — the realism is the real LB hop + prod node + S3 storage); the run *demonstrates the single-writer thesis* (chatty writes convoy on one shard; one-writer-per-tenant does not). | ~2.5–3.5 days |
 
 Phases 0–1 deliver the entire *gated* value (a robust wire write-path delta, a real
 `hrana_rt_us`, a wire cold-open, and the per-metric-threshold mechanism) in ~4 days, including
