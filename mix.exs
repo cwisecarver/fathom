@@ -76,7 +76,12 @@ defmodule Fathom.MixProject do
       {:bandit, "~> 1.5"},
       {:exqlite, "~> 0.27"},
       # The Hrana (libSQL) protocol server — Fathom serves shards through it.
-      {:filo, path: "../filo"}
+      {:filo, path: "../filo"},
+      # In-process Hrana WebSocket *client*, dev/test only — the loopback client the
+      # wire benches use to exercise the full Filo.Socket path (Phase 1,
+      # docs/tpc-benchmark-plan.md). `mint` + `castore` are already transitive (Finch/Req),
+      # so this adds only the thin WS layer, and never ships in a prod release.
+      {:mint_web_socket, "~> 1.0", only: [:dev, :test]}
     ]
   end
 
