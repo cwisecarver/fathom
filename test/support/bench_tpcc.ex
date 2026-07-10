@@ -27,6 +27,7 @@ defmodule Fathom.Bench.Tpcc do
 
   alias Fathom.Bench.HranaClient
   alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Shards
 
   @base_items 100_000
   @base_per_district 3_000
@@ -614,6 +615,135 @@ defmodule Fathom.Bench.Tpcc do
   defp rand_c(%{card: %{per_district: p}}), do: :rand.uniform(p)
   defp rand_i(%{card: %{items: i}}), do: :rand.uniform(i)
   defp now_str, do: DateTime.utc_now() |> DateTime.to_iso8601()
+
+  # --- driver / W-sweep ----------------------------------------------------
+
+  @default_max_w 5
+  @default_threads 8
+  @default_txns 2_000
+  @default_scale 1.0
+
+  @doc """
+  Run the TPC-C W-sweep and return one **string-keyed, JSON-ready** result map per warehouse
+  count `W ∈ 1..max_w` (recorded-only — the caller appends to `scripts/tpc_history.jsonl`). For
+  each W: seed a shard (`scale`), then drive the weighted deck with `threads` concurrent loopback
+  WS streams for `txns` total transactions, timing each transaction and reporting `tpcc_tpmc`
+  (New-Order/min) + per-txn-type `p50/p95/p99/max` (µs). One shard per W, run in sequence.
+
+  Options: `:max_w` (5), `:threads` (8), `:txns` (2000 total per W), `:scale` (1.0 = spec).
+  """
+  @spec sweep(keyword()) :: [map()]
+  def sweep(opts \\ []) do
+    max_w = Keyword.get(opts, :max_w, @default_max_w)
+    threads = Keyword.get(opts, :threads, @default_threads)
+    txns = Keyword.get(opts, :txns, @default_txns)
+    scale = Keyword.get(opts, :scale, @default_scale)
+
+    {:ok, sup, port} = HranaClient.start_listener()
+
+    try do
+      Enum.map(1..max_w, fn w -> run_one(port, w, scale, threads, txns) end)
+    after
+      HranaClient.stop_listener(sup)
+    end
+  end
+
+  # One warehouse count: seed, drive `threads` concurrent streams (each its own share of the txn
+  # budget on a persistent stream), collect per-thread latency samples + New-Order counts + the
+  # thread's txn-loop window, then summarize.
+  defp run_one(port, w, scale, threads, total_txns) do
+    id = uniq("tpcc_w#{w}")
+    :ok = seed_storage_shard(id, w, scale)
+    ctx = context(w, scale)
+    per_thread = max(1, div(total_txns, threads))
+
+    results =
+      1..threads
+      |> Task.async_stream(fn t -> drive_thread(port, id, ctx, t, w, per_thread) end,
+        max_concurrency: threads,
+        timeout: :infinity
+      )
+      |> Enum.map(fn {:ok, r} -> r end)
+
+    Shards.drain(id, 5_000)
+    rm_shard(id)
+    summarize(results, w, threads)
+  end
+
+  # One stream: connect (untimed — cold-open lives here, out of the per-txn timings), then run
+  # `n` weighted txns timing each. Deterministic per-(thread,W) PRNG.
+  defp drive_thread(port, id, ctx, t, w, n) do
+    :rand.seed(:exsss, {t, w, 4242})
+    {:ok, c} = HranaClient.connect(port, id)
+    t0 = System.monotonic_time(:microsecond)
+
+    {c, samples, no_count} =
+      Enum.reduce(1..n, {c, [], 0}, fn _, {c, acc, no} ->
+        type = random_type()
+        {us, {c, status}} = :timer.tc(fn -> run(type, c, ctx) end)
+        no2 = if type == :new_order and status in [:committed, :rolled_back], do: no + 1, else: no
+        {c, [{type, us} | acc], no2}
+      end)
+
+    t1 = System.monotonic_time(:microsecond)
+    HranaClient.close(c)
+    %{samples: samples, no_count: no_count, t0: t0, t1: t1}
+  end
+
+  # tpmC = New-Orders / minute over the concurrent window (max end − min start across threads);
+  # per-txn-type percentiles over all threads' samples. String-keyed for the JSON row.
+  defp summarize(results, w, threads) do
+    window_us = max(1, Enum.max_by(results, & &1.t1).t1 - Enum.min_by(results, & &1.t0).t0)
+    no_count = Enum.sum(Enum.map(results, & &1.no_count))
+    tpmc = no_count / (window_us / 60_000_000)
+
+    by_type =
+      results
+      |> Enum.flat_map(& &1.samples)
+      |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+
+    base = %{"warehouses" => w, "threads" => threads, "tpcc_tpmc" => Float.round(tpmc, 1)}
+    Enum.reduce(@txn_types, base, fn type, acc -> Map.merge(acc, pctl_keys(type, by_type)) end)
+  end
+
+  defp pctl_keys(type, by_type) do
+    samples = Map.get(by_type, type, [])
+    prefix = "tpcc_#{name(type)}"
+
+    %{
+      "#{prefix}_p50_us" => pctl(samples, 0.50),
+      "#{prefix}_p95_us" => pctl(samples, 0.95),
+      "#{prefix}_p99_us" => pctl(samples, 0.99),
+      "#{prefix}_max_us" =>
+        if(samples == [], do: nil, else: Float.round(Enum.max(samples) / 1, 1))
+    }
+  end
+
+  defp pctl([], _q), do: nil
+
+  defp pctl(samples, q) do
+    sorted = Enum.sort(samples)
+    n = length(sorted)
+    rank = q * (n - 1)
+    lo = trunc(rank)
+    hi = min(lo + 1, n - 1)
+    frac = rank - lo
+    Float.round((Enum.at(sorted, lo) * (1 - frac) + Enum.at(sorted, hi) * frac) / 1.0, 1)
+  end
+
+  defp name(:new_order), do: "neworder"
+  defp name(:payment), do: "payment"
+  defp name(:order_status), do: "order_status"
+  defp name(:delivery), do: "delivery"
+  defp name(:stock_level), do: "stock_level"
+
+  defp uniq(prefix), do: "#{prefix}_#{System.unique_integer([:positive])}"
+
+  defp rm_shard(id) do
+    for dir <- ["fathom_shards", "fathom_remote_test"], s <- ["", "-wal", "-shm"] do
+      File.rm(Path.join([System.tmp_dir!(), dir, "#{id}.db"]) <> s)
+    end
+  end
 
   # --- internals -----------------------------------------------------------
 
