@@ -64,6 +64,25 @@ defmodule Fathom.Shard.WarmFollower do
   @spec cached?(String.t()) :: boolean()
   def cached?(shard_id), do: File.exists?(cache_path(shard_id))
 
+  @doc """
+  All shard ids currently warm-cached on this node, via a single directory read — for a
+  caller that must test warm-membership across many shards without N `cached?/1` stat calls
+  (finding #12). Skips the `-wal`/`-shm`/`.etag` sidecars; order is unspecified; a missing
+  cache dir yields `[]`.
+  """
+  @spec cached_shard_ids() :: [String.t()]
+  def cached_shard_ids do
+    case File.ls(cache_dir()) do
+      {:ok, entries} ->
+        for name <- entries,
+            String.ends_with?(name, ".db"),
+            do: String.replace_suffix(name, ".db", "")
+
+      {:error, _} ->
+        []
+    end
+  end
+
   @doc "Local path of `shard_id`'s warm cache copy (may not exist)."
   @spec cache_path(String.t()) :: Path.t()
   def cache_path(shard_id) do

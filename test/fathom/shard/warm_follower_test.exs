@@ -86,6 +86,24 @@ defmodule Fathom.Shard.WarmFollowerTest do
     assert File.exists?(WarmFollower.cache_path(b))
   end
 
+  test "cached_shard_ids lists the warm set in one directory read, skipping sidecars (#12)" do
+    # The Reporter builds this set once per tick instead of N cached?/1 stat calls.
+    a = seed_shard("warm_ids_a_#{uniq()}")
+    b = seed_shard("warm_ids_b_#{uniq()}")
+
+    pid = start_supervised!(WarmFollower)
+    refresh(pid)
+
+    ids = MapSet.new(WarmFollower.cached_shard_ids())
+    assert MapSet.member?(ids, a)
+    assert MapSet.member?(ids, b)
+    # The .db.etag / -wal / -shm sidecars are not mistaken for shard ids.
+    refute Enum.any?(ids, &(String.contains?(&1, ".") or String.ends_with?(&1, "-wal")))
+    # A missing cache dir is [] (no follower has run), not a crash.
+    Application.put_env(:fathom, :warm_cache_dir, Path.join(System.tmp_dir!(), "nope_#{uniq()}"))
+    assert WarmFollower.cached_shard_ids() == []
+  end
+
   test "records an etag sidecar per cached shard so a failover can validate freshness" do
     a = seed_shard("warm_etag_#{uniq()}")
 

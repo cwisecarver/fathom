@@ -43,9 +43,15 @@ defmodule Fathom.Rebalancer.Reporter do
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
+  # report_now runs the full window (beat + publish + prune + warm-location publish) inline;
+  # a large recent-hot set plus several Postgres round-trips can exceed the default 5s call
+  # timeout and crash the caller (finding #12). It's test-only, so a generous explicit timeout
+  # is enough (the timer path just blocks its own process).
+  @report_now_timeout_ms 60_000
+
   @doc "Publishes one window synchronously (tests)."
   @spec report_now() :: :ok
-  def report_now, do: GenServer.call(__MODULE__, :report_now)
+  def report_now, do: GenServer.call(__MODULE__, :report_now, @report_now_timeout_ms)
 
   @impl true
   def init(_opts) do
@@ -162,10 +168,15 @@ defmodule Fathom.Rebalancer.Reporter do
   # (`WarmFollower.cached?/1` — a node not running the follower matches none). Prune dead-node
   # leftovers past the same window the reader trusts.
   defp publish_warm_locations do
+    # One directory read for this node's whole warm set, then in-memory membership — not one
+    # File.exists? per recent-hot shard inline in the GenServer (finding #12). A node not
+    # running the follower has an empty set and advertises none.
+    warm_set = MapSet.new(WarmFollower.cached_shard_ids())
+
     warm_hot =
       @warm_hot_window_ms
       |> LoadSamples.recent_shard_ids()
-      |> Enum.filter(&WarmFollower.cached?/1)
+      |> Enum.filter(&MapSet.member?(warm_set, &1))
 
     WarmLocations.publish(Rebalancer.node_key(), warm_hot)
     WarmLocations.prune(retention_ms())
