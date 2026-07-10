@@ -700,21 +700,26 @@ remote-client realism headline, and can follow independently.
 
 ---
 
-## Open questions for the lead
+## Decisions (resolved by the lead, 2026-07-10)
 
-1. **New test/bench dep `mint_web_socket`.** The in-process Hrana-WS client builds on
-   `Mint.WebSocket` (Mint itself is already in the lock via Finch/Req). Confirm the thin
-   `mint_web_socket` package is acceptable as a `only: [:dev, :test]` (bench) dep, vs `:gun`
-   (heavier, pulls `cowlib`) or shelling to a real client on the gate (defeats the "in-process,
-   reproducible" goal). Plan recommends `mint_web_socket`.
-2. **WS encoding scope on the gate: JSON (`hrana2`/`hrana3`) only, or also `hrana3-protobuf`?**
-   The plan's client speaks JSON (matches `socket_test.exs`); the Protobuf binary encoding is a
-   separate `Filo.Protobuf` path. Recommend JSON-only on the gate, leave Protobuf to a rig run
-   or a follow-on — confirm.
-3. **`tpcb_node_tps` loose threshold = 50%.** Proposed to catch a ≈2× collapse while tolerating
-   fsync/APFS jitter. Confirm 50%, or set a different loose value (and confirm the
-   `{name, direction, threshold}` `@metrics` shape for the `Gate` extension).
-4. **`cold_open_wire_p50_us` gate band.** Plan gates it at the global 20% (it is
-   pull-dominated + a small wire constant, like `cold_open`). If the added WS variance proves too
-   jittery in practice, it may want its own loose threshold via the same per-metric mechanism —
-   flagged, not assumed.
+These were open questions in earlier revisions; they are now settled defaults for the
+implementation. They can still be revisited if reality contradicts them (noted per item).
+
+1. **WS client dep — DECIDED: `mint_web_socket`, `only: [:dev, :test]`.** The in-process
+   Hrana-WS client builds on `Mint.WebSocket` (Mint is already in the lock via Finch/Req), so
+   this adds only the thin `mint_web_socket` package, bench/test-scoped — prod is untouched.
+   Rejected: `:gun` (heavier, pulls `cowlib`) and shelling to an external client (defeats the
+   in-process, reproducible goal).
+2. **WS encoding on the gate — DECIDED: JSON only (`hrana2`/`hrana3`).** The gate client speaks
+   JSON (matches `Filo`'s `socket_test.exs`), which is what exercises the wire path meaningfully.
+   The `hrana3-protobuf` binary path is deferred to a rig run / follow-on (only relevant if the
+   encode cost itself ever becomes a question).
+3. **`tpcb_node_tps` loose gate — DECIDED: 50%, via the `{name, direction, threshold}`
+   `@metrics` shape.** 50% blocks a ≈2× collapse while tolerating `F_FULLFSYNC`/APFS run-to-run
+   jitter. The `Gate` extension normalizes existing 2-tuples to the global 20% default, so no
+   other metric changes. (Revisit only if flush/checkpoint telemetry shows the real variance is
+   wider than 50%.)
+4. **`cold_open_wire_p50_us` gate band — DECIDED: the standard 20%.** It is pull-dominated + a
+   small wire constant (like `cold_open`), so it starts on the global band; loosen it via the
+   same per-metric mechanism **only if** the added WS variance proves jittery in practice — do
+   not pre-loosen.
