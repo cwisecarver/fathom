@@ -73,6 +73,31 @@ defmodule Fathom.Rebalancer.OverridesTest do
     assert {:error, _} = Overrides.pin("a.b", "fathom2")
   end
 
+  test "a mixed-case pin is canonicalized (downcased) so it doesn't dead-route (#15)" do
+    # Regression for #15: the request path stores shards downcased (ShardId.cast) and nginx
+    # lowercases $host, so a pin stored as "Acme" would render map key Acme.<zone> and never
+    # match incoming acme.<zone> — a silent dead pin. The pin boundary must canonicalize too.
+    {:ok, o} = Overrides.pin("Acme", "fathom2", from_node: "fathom1")
+    assert o.shard_id == "acme", "stored canonical (downcased)"
+
+    # Looked up case-insensitively both ways.
+    assert Overrides.for_shard("acme").pinned_node == "fathom2"
+    assert Overrides.for_shard("Acme").pinned_node == "fathom2"
+
+    # Re-pinning with a different case upserts the SAME row (no unique-constraint conflict, no
+    # duplicate) — the pre-fix raw-lookup + canonical-store combination would have collided.
+    {:ok, o2} = Overrides.pin("ACME", "fathom3")
+    assert o2.id == o.id
+    assert length(Overrides.all()) == 1
+    assert Overrides.pinned_to("fathom3") == ["acme"]
+
+    # mark_failed / unpin also honor case.
+    :ok = Overrides.mark_failed("aCmE")
+    assert Overrides.for_shard("acme").failed_at != nil
+    :ok = Overrides.unpin("ACME")
+    assert Overrides.for_shard("acme") == nil
+  end
+
   test "all is shard-sorted (stable render) and pinned_to filters by node" do
     {:ok, _} = Overrides.pin("hot_3", "fathom1")
     {:ok, _} = Overrides.pin("hot_1", "fathom2")

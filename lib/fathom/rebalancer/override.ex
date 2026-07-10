@@ -38,9 +38,23 @@ defmodule Fathom.Rebalancer.Override do
   # id could inject nginx directives. `Overrides.pin/2` is public and ops/refactors could
   # write here, so enforce Fathom.ShardId's ONE rule (not a duplicated regex) at the boundary
   # rather than trusting the far-upstream request-path validation.
+  #
+  # Canonicalize (downcase) too (finding #15): the request path stores the shard via
+  # `ShardId.cast/1` and nginx lowercases `$host` for the map lookup, so a mixed-case pin like
+  # "Acme" would render map key `Acme.<zone>` and never match the incoming `acme.<zone>` — the
+  # pin silently dead-routes to the hash pool. `cast/1` here keeps the pin boundary agreeing
+  # with the request path. Only `get_change` (a field actually being written) is processed, so
+  # an update that doesn't touch shard_id is left alone.
   defp validate_shard_id(changeset) do
-    validate_change(changeset, :shard_id, fn :shard_id, id ->
-      if Fathom.ShardId.valid?(id), do: [], else: [shard_id: "is not a valid shard id"]
-    end)
+    case get_change(changeset, :shard_id) do
+      nil ->
+        changeset
+
+      id ->
+        case Fathom.ShardId.cast(id) do
+          {:ok, canonical} -> put_change(changeset, :shard_id, canonical)
+          :error -> add_error(changeset, :shard_id, "is not a valid shard id")
+        end
+    end
   end
 end

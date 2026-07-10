@@ -16,6 +16,11 @@ defmodule Fathom.Rebalancer.Overrides do
   @spec pin(String.t(), String.t(), keyword()) ::
           {:ok, Override.t()} | {:error, Ecto.Changeset.t()}
   def pin(shard_id, pinned_node, opts \\ []) do
+    # Canonicalize so the upsert lookup, the stored key, and the LbMap render all agree with
+    # the request path (which downcases via ShardId.cast) — finding #15. An invalid id is left
+    # as-is so the changeset rejects it, preserving pin's {:error, changeset} contract (#14).
+    shard_id = canon(shard_id)
+
     attrs =
       %{
         shard_id: shard_id,
@@ -37,7 +42,7 @@ defmodule Fathom.Rebalancer.Overrides do
   @doc "Removes the pin for `shard_id` (returns to pure hash). Idempotent."
   @spec unpin(String.t()) :: :ok
   def unpin(shard_id) do
-    Repo.delete_all(from o in Override, where: o.shard_id == ^shard_id)
+    Repo.delete_all(from o in Override, where: o.shard_id == ^canon(shard_id))
     :ok
   end
 
@@ -52,7 +57,7 @@ defmodule Fathom.Rebalancer.Overrides do
   def mark_failed(shard_id) do
     now = DateTime.utc_now()
 
-    case Repo.get_by(Override, shard_id: shard_id) do
+    case Repo.get_by(Override, shard_id: canon(shard_id)) do
       nil ->
         :ok
 
@@ -68,7 +73,7 @@ defmodule Fathom.Rebalancer.Overrides do
 
   @doc "The pin for `shard_id`, or nil."
   @spec for_shard(String.t()) :: Override.t() | nil
-  def for_shard(shard_id), do: Repo.get_by(Override, shard_id: shard_id)
+  def for_shard(shard_id), do: Repo.get_by(Override, shard_id: canon(shard_id))
 
   @doc "The set of shard_ids actively pinned to `node_key` (failed/reverted rows excluded)."
   @spec pinned_to(String.t()) :: [String.t()]
@@ -78,5 +83,15 @@ defmodule Fathom.Rebalancer.Overrides do
         where: o.pinned_node == ^node_key and is_nil(o.failed_at),
         select: o.shard_id
     )
+  end
+
+  # Canonicalize a shard_id (downcase) so every Overrides lookup/write agrees with the stored
+  # canonical key (#15). An invalid id is passed through unchanged: pin's changeset then rejects
+  # it, and a read simply misses — never a crash.
+  defp canon(shard_id) do
+    case Fathom.ShardId.cast(shard_id) do
+      {:ok, canonical} -> canonical
+      :error -> shard_id
+    end
   end
 end
