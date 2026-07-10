@@ -14,19 +14,30 @@ defmodule Mix.Tasks.Fathom.WireBench do
   Options:
     * `--append`             append the JSON result line to `scripts/wire_history.jsonl`
     * `--check`              gate: compare each wire metric to the last same-host entry in the
-                             history and exit 1 on a >=20% regression
+                             history and exit 1 on a per-metric regression (20% default; the
+                             fsync/APFS-dominated `tpcb_node_tps` gets a loose 50% band)
     * `--hrana-rt-samples N` SELECT-1 round-trips to time for `hrana_rt_us` (default 200)
+    * `--cold-open-wire-samples N` cold-open samples for `cold_open_wire_p50_us` (default 30)
+    * `--tpcb-txns N`        TPC-B txns per leg for `tpcb_wire_overhead_us` (default 500)
+    * `--tpcb-shards N`      concurrent shards for `tpcb_node_tps` (default 16)
+    * `--tpcb-node-txns N`   TPC-B txns per shard for `tpcb_node_tps` (default 50)
   """
   use Mix.Task
 
   @history "scripts/wire_history.jsonl"
   @block 20
 
+  # Per-metric block thresholds; a metric absent here uses @block. tpcb_node_tps is absolute
+  # write throughput (F_FULLFSYNC/APFS-dominated), so it gets a loose 50% band — wide enough
+  # to swallow ordinary fsync jitter, tight enough to catch a ≈2× collapse.
+  @thresholds %{tpcb_node_tps: 50}
+
   # metric => :higher_worse | :lower_worse (mirrors Fathom.Bench.Gate's direction convention).
   @directions %{
     hrana_rt_us: :higher_worse,
     cold_open_wire_p50_us: :higher_worse,
-    tpcb_wire_overhead_us: :higher_worse
+    tpcb_wire_overhead_us: :higher_worse,
+    tpcb_node_tps: :lower_worse
   }
 
   @impl true
@@ -42,19 +53,30 @@ defmodule Mix.Tasks.Fathom.WireBench do
           check: :boolean,
           hrana_rt_samples: :integer,
           cold_open_wire_samples: :integer,
-          tpcb_txns: :integer
+          tpcb_txns: :integer,
+          tpcb_shards: :integer,
+          tpcb_node_txns: :integer
         ]
       )
 
     Mix.Task.run("app.start")
 
     bench_opts =
-      for k <- [:hrana_rt_samples, :cold_open_wire_samples, :tpcb_txns], v = opts[k], do: {k, v}
+      for k <- [
+            :hrana_rt_samples,
+            :cold_open_wire_samples,
+            :tpcb_txns,
+            :tpcb_shards,
+            :tpcb_node_txns
+          ],
+          v = opts[k],
+          do: {k, v}
 
     metrics = %{
       hrana_rt_us: Float.round(Fathom.Bench.Wire.hrana_rt(bench_opts), 1),
       cold_open_wire_p50_us: Float.round(Fathom.Bench.Wire.cold_open_wire(bench_opts), 1),
-      tpcb_wire_overhead_us: Float.round(Fathom.Bench.Wire.tpcb_wire_overhead(bench_opts), 1)
+      tpcb_wire_overhead_us: Float.round(Fathom.Bench.Wire.tpcb_wire_overhead(bench_opts), 1),
+      tpcb_node_tps: Float.round(Fathom.Bench.Wire.tpcb_node_tps(bench_opts), 1)
     }
 
     line = Map.merge(meta(), metrics)
@@ -96,6 +118,10 @@ defmodule Mix.Tasks.Fathom.WireBench do
       "  tpcb_wire_overhead_us  #{fmt(metrics.tpcb_wire_overhead_us)}  µs   (TPC-B txn: wire − raw exqlite, per txn)"
     )
 
+    IO.puts(
+      "  tpcb_node_tps          #{fmt(metrics.tpcb_node_tps)}  txn/s (concurrent TPC-B write fan-out across shards)"
+    )
+
     IO.puts(Jason.encode!(line))
   end
 
@@ -117,25 +143,33 @@ defmodule Mix.Tasks.Fathom.WireBench do
       end)
 
     if regressed do
-      IO.puts("  BLOCKED: a wire metric regressed >= #{@block}%.")
+      IO.puts("  BLOCKED: a wire metric regressed past its gate threshold.")
       exit({:shutdown, 1})
     else
       IO.puts("  verdict: OK")
     end
   end
 
-  # Returns true if this metric regressed past the block threshold.
+  # This metric's block threshold (%): its @thresholds override, else the global @block.
+  defp threshold(metric), do: Map.get(@thresholds, metric, @block)
+
+  # Returns true if this metric regressed past its block threshold.
   defp report(metric, old, new, _dir) when not is_number(old) or old == 0 do
     IO.puts("  #{metric}: #{fmt(new)} (no comparable baseline)  skipped")
     false
   end
 
   defp report(metric, old, new, dir) do
+    block = threshold(metric)
     pct = (new - old) / old * 100.0
     # higher_worse: a positive pct is a regression; lower_worse: a negative pct is.
-    regressed = if dir == :higher_worse, do: pct >= @block, else: -pct >= @block
+    regressed = if dir == :higher_worse, do: pct >= block, else: -pct >= block
     tag = if regressed, do: "REGRESSION", else: "ok"
-    IO.puts("  #{metric}: #{fmt(old)} -> #{fmt(new)}   #{Float.round(pct, 2)}%   #{tag}")
+
+    IO.puts(
+      "  #{metric}: #{fmt(old)} -> #{fmt(new)}   #{Float.round(pct, 2)}%   (block >=#{block}%)  #{tag}"
+    )
+
     regressed
   end
 

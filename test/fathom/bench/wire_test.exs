@@ -31,4 +31,14 @@ defmodule Fathom.Bench.WireTest do
     assert us > 0.0, "wire TPC-B txn should cost more than raw exqlite (got #{us}µs)"
     assert us < 100_000.0, "tpcb_wire_overhead #{us}µs exceeded the 100ms/txn smoke ceiling"
   end
+
+  test "tpcb_node_tps returns a sane aggregate write throughput over the wire" do
+    # A few shards each bursting a handful of concurrent TPC-B write txns through the wire.
+    # We assert only a sane positive rate here (throughput is host/fsync-dominated); the
+    # loose 50% gate lives in mix fathom.wire_bench, and isolation is proven separately in
+    # test/fathom/tpcb_isolation_test.exs.
+    tps = Wire.tpcb_node_tps(tpcb_shards: 4, tpcb_node_txns: 3)
+    assert is_float(tps)
+    assert tps > 0.0, "aggregate node TPS should be positive (got #{tps})"
+  end
 end

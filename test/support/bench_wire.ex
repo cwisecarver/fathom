@@ -27,6 +27,13 @@ defmodule Fathom.Bench.Wire do
   @tpcb_tellers 10
   @tpcb_warmup 5
 
+  # Framing B (tpcb_node_tps) fan-out knobs. A smaller account table than SF=1 keeps the
+  # in-process seed cheap while still dirtying distinct pages per txn; both are `mix
+  # fathom.wire_bench` switches (--tpcb-shards / --tpcb-node-txns).
+  @tpcb_node_shards 16
+  @tpcb_node_txns 50
+  @tpcb_node_accounts 10_000
+
   @doc """
   `hrana_rt_us` — median µs of a warm-stream `SELECT 1` round-trip over the wire. A read that
   issues no fsync, so it isolates the software wire cost (WS framing + `Filo.Value` decode,
@@ -269,7 +276,11 @@ defmodule Fathom.Bench.Wire do
 
   # TPC-B schema + SF=1 seed (1 branch, 10 tellers, 100k accounts), as parameterless DDL/seed
   # statements (row counts are harness constants, not user input).
-  defp tpcb_schema_sql do
+  defp tpcb_schema_sql, do: tpcb_schema_sql(@tpcb_accounts)
+
+  # Parameterized on the account count so the SF=1 wire-overhead leg keeps its frozen 100k
+  # baseline while the node-TPS fan-out seeds a smaller table — same schema, cheaper seed.
+  defp tpcb_schema_sql(accounts) do
     [
       "CREATE TABLE branches (bid INTEGER PRIMARY KEY, bbalance INTEGER)",
       "CREATE TABLE tellers (tid INTEGER PRIMARY KEY, bid INTEGER, tbalance INTEGER)",
@@ -277,7 +288,7 @@ defmodule Fathom.Bench.Wire do
       "CREATE TABLE history (tid INTEGER, bid INTEGER, aid INTEGER, delta INTEGER, mtime TEXT)",
       "INSERT INTO branches (bid, bbalance) VALUES (1, 0)",
       seq_insert("tellers (tid, bid, tbalance)", "i, 1, 0", @tpcb_tellers),
-      seq_insert("accounts (aid, bid, abalance)", "i, 1, 0", @tpcb_accounts)
+      seq_insert("accounts (aid, bid, abalance)", "i, 1, 0", accounts)
     ]
   end
 
@@ -289,6 +300,88 @@ defmodule Fathom.Bench.Wire do
   defp tpcb_rand_args do
     {:rand.uniform(@tpcb_accounts), :rand.uniform(@tpcb_tellers), :rand.uniform(10_001) - 5001,
      Integer.to_string(System.os_time(:second))}
+  end
+
+  @doc """
+  `tpcb_node_tps` (Framing B) — aggregate TPC-B write transactions/sec a single node sustains
+  with `--tpcb-shards` shards each running an independent TPC-B write stream **concurrently
+  through its own loopback WS stream**. Fathom's real differentiator: fan-out under genuine
+  WRITE load through the wire — WAL growth, the `wrote?` dirty-flag flips, the coordinator idle
+  checkpoint, and the durability flush, on every shard at once. Each shard is seeded in-process
+  into storage (setup, untimed); the timed window is the concurrent burst of `--tpcb-node-txns`
+  txns/shard, each the same 7-statement pgbench bank txn as `tpcb_wire_overhead`.
+
+  Loose-gated (~50%) in `mix fathom.wire_bench` because absolute write throughput is
+  F_FULLFSYNC/APFS-dominated — the band tolerates ordinary fsync jitter but catches a ≈2×
+  collapse (a flush storm, a per-row checkpoint, or a lost `write_concurrency`). Confirm any
+  BLOCK against the `[:fathom, :shard]` flush/checkpoint telemetry before trusting it.
+
+  There is no cross-connection write contention to model (TPC-B's classic hot branch row): each
+  tenant is its own single-writer SQLite file, so the branch UPDATE never contends across shards.
+  """
+  @spec tpcb_node_tps(keyword()) :: float()
+  def tpcb_node_tps(opts \\ []) do
+    shards = Keyword.get(opts, :tpcb_shards, @tpcb_node_shards)
+    txns_per = Keyword.get(opts, :tpcb_node_txns, @tpcb_node_txns)
+
+    with_listener(fn port ->
+      ids = for _ <- 1..shards, do: uniq("tpcb_node")
+
+      # Seed each shard into storage in-process, concurrently — setup, NOT the measured workload.
+      ids
+      |> Task.async_stream(&seed_tpcb_storage_shard/1,
+        max_concurrency: shards,
+        timeout: :infinity
+      )
+      |> Stream.run()
+
+      # Timed window: every shard bursts its txns concurrently, each on its own WS stream. The
+      # per-shard cold-open (pull from storage on the first execute) is inside the window but
+      # amortized over the burst, so it's negligible at the default txn count.
+      {us, :ok} =
+        :timer.tc(fn ->
+          ids
+          |> Task.async_stream(&node_burst(port, &1, txns_per),
+            max_concurrency: shards,
+            timeout: :infinity
+          )
+          |> Stream.run()
+        end)
+
+      Enum.each(ids, fn id ->
+        Shards.drain(id, 5_000)
+        rm_shard(id)
+      end)
+
+      shards * txns_per / (us / 1_000_000)
+    end)
+  end
+
+  # One shard's stream: cold-open over the wire, burst `n` TPC-B txns, close.
+  defp node_burst(port, id, n) do
+    {:ok, c} = HranaClient.connect(port, id)
+    c = Enum.reduce(1..n, c, fn _, c -> run_tpcb_txn_wire(c, node_rand_args()) end)
+    HranaClient.close(c)
+  end
+
+  # Like tpcb_rand_args/0 but draws aid within the smaller node-TPS account table.
+  defp node_rand_args do
+    {:rand.uniform(@tpcb_node_accounts), :rand.uniform(@tpcb_tellers),
+     :rand.uniform(10_001) - 5001, Integer.to_string(System.os_time(:second))}
+  end
+
+  # Seed one shard's TPC-B schema + data into storage in-process (a throwaway .seed source
+  # flushed to Storage), leaving no local copy — the timed wire open then cold-pulls it. Mirrors
+  # seed_cold_shard/1, but with the TPC-B schema at the node-TPS account count.
+  defp seed_tpcb_storage_shard(id) do
+    tmp = Path.join(System.tmp_dir!(), "#{id}.seed")
+    drop_local(tmp)
+    {:ok, conn} = Connection.open(tmp)
+    Enum.each(tpcb_schema_sql(@tpcb_node_accounts), &(:ok = Connection.exec(conn, &1)))
+    :ok = Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(conn)
+    :ok = Storage.flush(id, tmp)
+    drop_local(tmp)
   end
 
   # --- shared harness ------------------------------------------------------
