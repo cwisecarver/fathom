@@ -59,6 +59,15 @@ defmodule Fathom.Shard.ConnectionTest do
     assert {:ok, %{rows: [[1, "row-1"]]}} = Connection.query(conn, "SELECT id, v FROM t", [])
   end
 
+  test "opens WAL + synchronous=FULL for per-commit local durability", %{conn: conn} do
+    # Pin the durability choice: PRAGMA synchronous returns 2 (FULL), which fsyncs the WAL on
+    # every commit. It's ~free for fathom's sharded, wire-bound model (see
+    # docs/reviews/competitive-oltp-2026-07-10.md); the guarantee is the point, so a regression to
+    # NORMAL (1) should trip this.
+    assert {:ok, %{rows: [[2]]}} = Connection.query(conn, "PRAGMA synchronous", [])
+    assert {:ok, %{rows: [["wal"]]}} = Connection.query(conn, "PRAGMA journal_mode", [])
+  end
+
   @tag :bench
   test "large-result collect stays O(R), not O(R²)", %{conn: conn} do
     # Regression guard for the Phase-0 fix. The old `acc ++ rows` copied the whole accumulator

@@ -10,13 +10,21 @@ defmodule Fathom.Shard.Connection do
   """
   alias Exqlite.Sqlite3
 
-  @doc "Opens a connection to the shard file at `path` (WAL, 5s busy timeout)."
+  @doc "Opens a connection to the shard file at `path` (WAL, synchronous=FULL, 5s busy timeout)."
   @spec open(Path.t()) :: {:ok, reference()} | {:error, term()}
   def open(path) do
     File.mkdir_p!(Path.dirname(path))
 
     with {:ok, conn} <- Sqlite3.open(path),
          :ok <- Sqlite3.execute(conn, "PRAGMA journal_mode=WAL"),
+         # synchronous=FULL fsyncs the WAL on every commit, so a committed write survives a node
+         # crash (per-commit local durability, tightening the local RPO below the S3 flush
+         # interval). It is ~free for fathom's sharded model: throughput is wire/executor-bound,
+         # not commit-bound, and the per-shard fsyncs parallelize across the fan-out — measured
+         # FULL vs NORMAL is within noise (node_tps 4167→4140, TPC-C tpmC unchanged), whereas a
+         # single-DB engine pays ~2–3× for the same guarantee. See
+         # docs/reviews/competitive-oltp-2026-07-10.md.
+         :ok <- Sqlite3.execute(conn, "PRAGMA synchronous=FULL"),
          :ok <- Sqlite3.execute(conn, "PRAGMA busy_timeout=5000") do
       {:ok, conn}
     end
