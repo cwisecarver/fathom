@@ -22,4 +22,13 @@ defmodule Fathom.Bench.WireTest do
     assert us > 0.0
     assert us < 100_000.0, "cold_open_wire p50 #{us}µs exceeded the 100ms smoke ceiling"
   end
+
+  test "tpcb_wire_overhead is a positive per-txn delta (wire costs more than raw exqlite)" do
+    # The wire leg sends 7 statements as 7 round-trips vs raw local calls, so the delta is
+    # positive and dominated by the round-trips. Small txn count for a smoke check.
+    us = Wire.tpcb_wire_overhead(tpcb_txns: 20)
+    assert is_float(us)
+    assert us > 0.0, "wire TPC-B txn should cost more than raw exqlite (got #{us}µs)"
+    assert us < 100_000.0, "tpcb_wire_overhead #{us}µs exceeded the 100ms/txn smoke ceiling"
+  end
 end

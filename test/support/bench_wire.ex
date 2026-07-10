@@ -15,12 +15,17 @@ defmodule Fathom.Bench.Wire do
   started) and under the wire-bench task (which runs `app.start` first).
   """
 
+  alias Exqlite.Sqlite3
   alias Fathom.Bench.HranaClient
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Shards
 
   @hrana_rt_samples 200
   @cold_open_wire_samples 30
+  @tpcb_txns 500
+  @tpcb_accounts 100_000
+  @tpcb_tellers 10
+  @tpcb_warmup 5
 
   @doc """
   `hrana_rt_us` — median µs of a warm-stream `SELECT 1` round-trip over the wire. A read that
@@ -120,6 +125,171 @@ defmodule Fathom.Bench.Wire do
   end
 
   defp drop_local(path), do: Enum.each(["", "-wal", "-shm"], &File.rm(path <> &1))
+
+  @doc """
+  `tpcb_wire_overhead_us` — the per-TPC-B-transaction tax fathom adds over bare SQLite:
+  `p50(wire_per_txn) − p50(direct_per_txn)`. Both legs run the identical pgbench-style
+  7-statement bank txn (BEGIN, UPDATE accounts/tellers/branches, SELECT, INSERT history,
+  COMMIT) at scale factor 1, on identically-seeded + identically-PRAGMA'd shards (WAL +
+  busy_timeout, synchronous FULL) — so the COMMIT fsync cost is the same in both and cancels
+  in the subtraction, leaving the wire + framing + `Filo.Socket` + `ShardExecutor` +
+  `Connection` cost (incl. Connection's no-cache re-prepare, since the direct leg reuses its
+  prepared statements — decision 4a).
+
+  The wire leg sends the 7 statements as 7 separate `execute`s on one stream (a chatty,
+  non-batching client — the realistic django-libsql shape), so the delta is dominated by the
+  7 wire round-trips per txn. All SQL is parameterized (bound `?`), never interpolated.
+  """
+  @spec tpcb_wire_overhead(keyword()) :: float()
+  def tpcb_wire_overhead(opts \\ []) do
+    n = Keyword.get(opts, :tpcb_txns, @tpcb_txns)
+    wire_p50 = with_listener(fn port -> tpcb_wire_leg(port, n) end)
+    direct_p50 = tpcb_direct_leg(n)
+    wire_p50 - direct_p50
+  end
+
+  # WIRE leg: seed a shard over the wire, then time N txns sent as 7 executes each.
+  defp tpcb_wire_leg(port, n) do
+    shard = uniq("tpcb_wire")
+
+    try do
+      {:ok, c} = HranaClient.connect(port, shard)
+      c = Enum.reduce(tpcb_schema_sql(), c, fn sql, c -> exec_wire(c, sql) end)
+
+      # Warm the path (re-prepare, JIT) before timing.
+      c = Enum.reduce(1..@tpcb_warmup, c, fn _, c -> run_tpcb_txn_wire(c, tpcb_rand_args()) end)
+
+      {_c, us} =
+        Enum.reduce(1..n, {c, []}, fn _, {c, acc} ->
+          args = tpcb_rand_args()
+          {t, c} = :timer.tc(fn -> run_tpcb_txn_wire(c, args) end)
+          {c, [t | acc]}
+        end)
+
+      p50(us)
+    after
+      Shards.drain(shard, 5_000)
+      rm_shard(shard)
+    end
+  end
+
+  defp exec_wire(c, sql) do
+    {:ok, c, _} = HranaClient.execute(c, sql)
+    c
+  end
+
+  defp run_tpcb_txn_wire(c, {aid, tid, delta, mtime}) do
+    c = exec_wire(c, "BEGIN")
+
+    {:ok, c, _} =
+      HranaClient.execute(c, "UPDATE accounts SET abalance=abalance+? WHERE aid=?", [delta, aid])
+
+    {:ok, c, _} = HranaClient.execute(c, "SELECT abalance FROM accounts WHERE aid=?", [aid])
+
+    {:ok, c, _} =
+      HranaClient.execute(c, "UPDATE tellers SET tbalance=tbalance+? WHERE tid=?", [delta, tid])
+
+    {:ok, c, _} =
+      HranaClient.execute(c, "UPDATE branches SET bbalance=bbalance+? WHERE bid=1", [delta])
+
+    {:ok, c, _} =
+      HranaClient.execute(
+        c,
+        "INSERT INTO history (tid,bid,aid,delta,mtime) VALUES (?,1,?,?,?)",
+        [tid, aid, delta, mtime]
+      )
+
+    exec_wire(c, "COMMIT")
+  end
+
+  # DIRECT leg: raw Exqlite on a matching-PRAGMA file; reuse prepared statements so
+  # Connection's per-call re-prepare shows up in the delta (not cancelled here).
+  defp tpcb_direct_leg(n) do
+    path = Path.join(System.tmp_dir!(), "#{uniq("tpcb_direct")}.db")
+    drop_local(path)
+    {:ok, conn} = Sqlite3.open(path)
+    :ok = Sqlite3.execute(conn, "PRAGMA journal_mode=WAL")
+    :ok = Sqlite3.execute(conn, "PRAGMA busy_timeout=5000")
+    Enum.each(tpcb_schema_sql(), &(:ok = Sqlite3.execute(conn, &1)))
+
+    stmts = %{
+      upd_acc: prep(conn, "UPDATE accounts SET abalance=abalance+? WHERE aid=?"),
+      sel_acc: prep(conn, "SELECT abalance FROM accounts WHERE aid=?"),
+      upd_tel: prep(conn, "UPDATE tellers SET tbalance=tbalance+? WHERE tid=?"),
+      upd_bra: prep(conn, "UPDATE branches SET bbalance=bbalance+? WHERE bid=1"),
+      ins_hist: prep(conn, "INSERT INTO history (tid,bid,aid,delta,mtime) VALUES (?,1,?,?,?)")
+    }
+
+    try do
+      Enum.each(1..@tpcb_warmup, fn _ -> run_tpcb_txn_direct(conn, stmts, tpcb_rand_args()) end)
+
+      1..n
+      |> Enum.map(fn _ ->
+        args = tpcb_rand_args()
+        {t, :ok} = :timer.tc(fn -> run_tpcb_txn_direct(conn, stmts, args) end)
+        t
+      end)
+      |> p50()
+    after
+      Enum.each(stmts, fn {_k, s} -> Sqlite3.release(conn, s) end)
+      Sqlite3.close(conn)
+      drop_local(path)
+    end
+  end
+
+  defp run_tpcb_txn_direct(conn, s, {aid, tid, delta, mtime}) do
+    :ok = Sqlite3.execute(conn, "BEGIN")
+    raw_run(conn, s.upd_acc, [delta, aid])
+    raw_run(conn, s.sel_acc, [aid])
+    raw_run(conn, s.upd_tel, [delta, tid])
+    raw_run(conn, s.upd_bra, [delta])
+    raw_run(conn, s.ins_hist, [tid, aid, delta, mtime])
+    :ok = Sqlite3.execute(conn, "COMMIT")
+    :ok
+  end
+
+  defp prep(conn, sql) do
+    {:ok, stmt} = Sqlite3.prepare(conn, sql)
+    stmt
+  end
+
+  # Bind + step-to-done + reset, so the prepared statement is reusable next txn.
+  defp raw_run(conn, stmt, args) do
+    :ok = Sqlite3.bind(stmt, args)
+    drain_steps(conn, stmt)
+    :ok = Sqlite3.reset(stmt)
+  end
+
+  defp drain_steps(conn, stmt) do
+    case Sqlite3.step(conn, stmt) do
+      :done -> :ok
+      {:row, _} -> drain_steps(conn, stmt)
+    end
+  end
+
+  # TPC-B schema + SF=1 seed (1 branch, 10 tellers, 100k accounts), as parameterless DDL/seed
+  # statements (row counts are harness constants, not user input).
+  defp tpcb_schema_sql do
+    [
+      "CREATE TABLE branches (bid INTEGER PRIMARY KEY, bbalance INTEGER)",
+      "CREATE TABLE tellers (tid INTEGER PRIMARY KEY, bid INTEGER, tbalance INTEGER)",
+      "CREATE TABLE accounts (aid INTEGER PRIMARY KEY, bid INTEGER, abalance INTEGER)",
+      "CREATE TABLE history (tid INTEGER, bid INTEGER, aid INTEGER, delta INTEGER, mtime TEXT)",
+      "INSERT INTO branches (bid, bbalance) VALUES (1, 0)",
+      seq_insert("tellers (tid, bid, tbalance)", "i, 1, 0", @tpcb_tellers),
+      seq_insert("accounts (aid, bid, abalance)", "i, 1, 0", @tpcb_accounts)
+    ]
+  end
+
+  defp seq_insert(target, select, n) do
+    "WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM seq WHERE i < #{n}) " <>
+      "INSERT INTO #{target} SELECT #{select} FROM seq"
+  end
+
+  defp tpcb_rand_args do
+    {:rand.uniform(@tpcb_accounts), :rand.uniform(@tpcb_tellers), :rand.uniform(10_001) - 5001,
+     Integer.to_string(System.os_time(:second))}
+  end
 
   # --- shared harness ------------------------------------------------------
 

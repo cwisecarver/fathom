@@ -23,7 +23,11 @@ defmodule Mix.Tasks.Fathom.WireBench do
   @block 20
 
   # metric => :higher_worse | :lower_worse (mirrors Fathom.Bench.Gate's direction convention).
-  @directions %{hrana_rt_us: :higher_worse, cold_open_wire_p50_us: :higher_worse}
+  @directions %{
+    hrana_rt_us: :higher_worse,
+    cold_open_wire_p50_us: :higher_worse,
+    tpcb_wire_overhead_us: :higher_worse
+  }
 
   @impl true
   def run(argv) do
@@ -37,17 +41,20 @@ defmodule Mix.Tasks.Fathom.WireBench do
           append: :boolean,
           check: :boolean,
           hrana_rt_samples: :integer,
-          cold_open_wire_samples: :integer
+          cold_open_wire_samples: :integer,
+          tpcb_txns: :integer
         ]
       )
 
     Mix.Task.run("app.start")
 
-    bench_opts = for k <- [:hrana_rt_samples, :cold_open_wire_samples], v = opts[k], do: {k, v}
+    bench_opts =
+      for k <- [:hrana_rt_samples, :cold_open_wire_samples, :tpcb_txns], v = opts[k], do: {k, v}
 
     metrics = %{
       hrana_rt_us: Float.round(Fathom.Bench.Wire.hrana_rt(bench_opts), 1),
-      cold_open_wire_p50_us: Float.round(Fathom.Bench.Wire.cold_open_wire(bench_opts), 1)
+      cold_open_wire_p50_us: Float.round(Fathom.Bench.Wire.cold_open_wire(bench_opts), 1),
+      tpcb_wire_overhead_us: Float.round(Fathom.Bench.Wire.tpcb_wire_overhead(bench_opts), 1)
     }
 
     line = Map.merge(meta(), metrics)
@@ -83,6 +90,10 @@ defmodule Mix.Tasks.Fathom.WireBench do
 
     IO.puts(
       "  cold_open_wire_p50_us  #{fmt(metrics.cold_open_wire_p50_us)}  µs   (cold shard, first query over the wire)"
+    )
+
+    IO.puts(
+      "  tpcb_wire_overhead_us  #{fmt(metrics.tpcb_wire_overhead_us)}  µs   (TPC-B txn: wire − raw exqlite, per txn)"
     )
 
     IO.puts(Jason.encode!(line))
