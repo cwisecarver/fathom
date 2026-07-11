@@ -11,25 +11,39 @@ Each doc says whether it describes **built** behavior or a **plan**.
 
 ## How it works — built-engine stories
 
-The "how it actually works" narratives for the major built subsystems. Read them in this order —
-each later one builds on the lease from the first:
+The "how it actually works" narratives for the major built subsystems. A good learning order is
+single-node basics first, then what happens across nodes.
 
-1. **[single-writer.md](single-writer.md)** — the foundation: how fathom guarantees *at most one
-   node ever writes a shard's file*, across failover / remap / partition, with **no BEAM cluster** —
-   the storage behaviour, the S3 lease `{owner, epoch}`, the etag/epoch flush fence, and the
-   O(nodes) node heartbeat.
-2. **[warm-standby.md](warm-standby.md)** — how survivors pre-pull the hot set into a lease-less read
+**Single node — how one shard is served and made durable:**
+
+1. **[data-path.md](data-path.md)** — story 0: how a request becomes a served shard —
+   connection-per-stream, the coordinator that owns the file and monitors its streams, the dirty
+   flag, and the idle checkpoint → flush → drop.
+2. **[admission.md](admission.md)** — the front door: fail-closed Host-subdomain routing (never a
+   cross-tenant leak) and the double-gated novel-shard admission (soft `max_open_shards` cap + LRU
+   idle-eviction, the novel-shard rate limiter, the template-poisoning boot guards).
+3. **[durability.md](durability.md)** — how much data can be lost and when: WAL + `synchronous=FULL`
+   (a process crash loses nothing) and the write-gated periodic flush (node-loss RPO = the flush
+   interval).
+
+**Across nodes — the lease, and everything that rides it:**
+
+4. **[single-writer.md](single-writer.md)** — the distributed foundation: how fathom guarantees *at
+   most one node ever writes a shard's file*, across failover / remap / partition, with **no BEAM
+   cluster** — the S3 lease `{owner, epoch}`, the etag/epoch flush fence, and the O(nodes) node
+   heartbeat.
+5. **[warm-standby.md](warm-standby.md)** — how survivors pre-pull the hot set into a lease-less read
    cache and promote a warm copy on failover after a single conditional (304) round-trip instead of
    a full-body pull.
-3. **[rebalancing.md](rebalancing.md)** — how a persistently-hot shard is moved off an overloaded
+6. **[rebalancing.md](rebalancing.md)** — how a persistently-hot shard is moved off an overloaded
    node: detect (per-node load reporting) → decide (a fleet-singleton policy) → execute (the
    warm → flip-the-LB → drain-the-lease handoff).
-4. **[migration.md](migration.md)** — how a schema change rolls across millions of shards:
+7. **[migration.md](migration.md)** — how a schema change rolls across millions of shards:
    blue/green copy-then-flip per shard, cold-tail convergence, a guarded revert, and how the app
    tolerates a mixed vN-1/vN fleet.
 
 [cluster-architecture.md](cluster-architecture.md) is the **canonical, broader** cluster picture
-(the LB-keyspace-partition model + the S3 lease/heartbeat fence) that these four zoom into.
+(the LB-keyspace-partition model + the S3 lease/heartbeat fence) that these zoom into.
 
 ## Architecture & deployment
 
