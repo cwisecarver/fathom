@@ -29,14 +29,31 @@ defmodule Fathom.Telemetry do
   def init(_arg) do
     if otel_spans?(), do: attach_otel_span_bridge()
 
-    children = [
-      {:telemetry_poller,
-       measurements: [{__MODULE__, :measure_active_shards, []}],
-       period: 10_000,
-       name: Fathom.ShardPoller}
-    ]
+    children =
+      [
+        {:telemetry_poller,
+         measurements: [
+           {__MODULE__, :measure_active_shards, []},
+           {Fathom.Admin.Measurements, :node_memory, []},
+           {Fathom.Admin.Measurements, :durability, []}
+         ],
+         period: 10_000,
+         name: Fathom.ShardPoller}
+      ] ++ prometheus_children()
 
     Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  # In-process Prometheus reporter over metrics/0 — the metrics layer the admin dashboard reads
+  # (in-process) and any external Prometheus/Grafana scrapes. Gated with the rest of the admin
+  # observability layer (Fathom.Admin.enabled?, off in test). Named :fathom_metrics so the
+  # collector and the /metrics endpoint target it via TelemetryMetricsPrometheus.Core.scrape/1.
+  defp prometheus_children do
+    if Fathom.Admin.enabled?() do
+      [{TelemetryMetricsPrometheus.Core, metrics: metrics(), name: :fathom_metrics}]
+    else
+      []
+    end
   end
 
   @doc """
@@ -50,6 +67,7 @@ defmodule Fathom.Telemetry do
         measurement: :duration,
         unit: {:native, :millisecond},
         tags: [:warm],
+        reporter_options: [buckets: [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000]],
         description: "Shard cold-open latency (tag warm: local file present vs pulled from S3)"
       ),
       counter("fathom.shard.lease.acquired.count",
@@ -80,6 +98,7 @@ defmodule Fathom.Telemetry do
         measurement: :duration,
         unit: {:native, :millisecond},
         tags: [:outcome],
+        reporter_options: [buckets: [0.5, 1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000]],
         description: "Shard checkout latency by outcome (ok / held / unavailable / error)"
       ),
       last_value("fathom.shards.active",
@@ -131,6 +150,57 @@ defmodule Fathom.Telemetry do
         event_name: [:fathom, :rebalancer, :reconcile, :divergence],
         description:
           "A pinned node stopped BEATING but still HOLDS the shard's S3 lease — reporter/data-plane divergence; the pin was kept (fail-safe). Sustained > 0 ⇒ investigate a wedged/off Reporter"
+      ),
+
+      # --- Data-path metrics for the admin dashboard (all low-cardinality; per-shard data is the
+      # ShardLoad read-API, never a metric tag) ------------------------------------------------
+      distribution("fathom.shard.query.duration",
+        event_name: [:fathom, :shard, :query],
+        measurement: :duration,
+        unit: {:native, :millisecond},
+        reporter_options: [buckets: [0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 5000]],
+        description: "Per-statement SQLite query latency (node-wide; deliberately un-tagged)"
+      ),
+      counter("fathom.s3.op.count",
+        event_name: [:fathom, :s3, :op],
+        tags: [:op],
+        description:
+          "S3 operations by HTTP method (get/put/head/delete) — cost + rate-limit headroom"
+      ),
+      sum("fathom.s3.op.bytes",
+        event_name: [:fathom, :s3, :op],
+        measurement: :bytes,
+        tags: [:op],
+        unit: :byte,
+        description: "Bytes transferred to/from S3 by method"
+      ),
+      last_value("fathom.node.memory.total",
+        event_name: [:fathom, :node, :memory],
+        measurement: :total,
+        unit: :byte,
+        description: "BEAM total memory on this node"
+      ),
+      last_value("fathom.durability.dirty_shards",
+        event_name: [:fathom, :durability, :rpo],
+        measurement: :dirty_shards,
+        description: "Open shards holding un-flushed writes (live RPO exposure)"
+      ),
+      last_value("fathom.durability.oldest_age_ms",
+        event_name: [:fathom, :durability, :rpo],
+        measurement: :oldest_age_ms,
+        unit: :millisecond,
+        description: "Age of the oldest un-flushed write on this node (live RPO estimate)"
+      ),
+      last_value("fathom.storage.objects",
+        event_name: [:fathom, :storage, :usage],
+        measurement: :objects,
+        description: "Live shard objects stored (from the storage backend's stored_usage)"
+      ),
+      last_value("fathom.storage.bytes",
+        event_name: [:fathom, :storage, :usage],
+        measurement: :bytes,
+        unit: :byte,
+        description: "Total bytes stored across shard objects"
       )
     ]
   end

@@ -1088,6 +1088,58 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  # ListObjectsV2 over the shard prefix, summing live `<shard>.db` objects (excluding `.lock`,
+  # retained `@version` copies, `heartbeats/`, and probes), paginated via the continuation token.
+  # Expensive at fleet scale — the dashboard polls it slowly + caches; prefer S3 Inventory /
+  # CloudWatch in production (see Fathom.Shard.Storage.stored_usage/0). This backend is not yet
+  # exercised against a real bucket (see moduledoc), so the XML scan is deliberately best-effort.
+  @impl true
+  def stored_usage, do: list_usage(nil, 0, 0)
+
+  defp list_usage(token, count, bytes) do
+    params =
+      [{"list-type", "2"}, {"prefix", prefix()}] ++
+        if(token, do: [{"continuation-token", token}], else: [])
+
+    case Req.get(req(), url: url_path(""), params: params) do
+      {:ok, %{status: 200, body: body}} ->
+        {count, bytes} = tally_list(body, count, bytes)
+
+        case next_token(body) do
+          nil -> {count, bytes}
+          next -> list_usage(next, count, bytes)
+        end
+
+      {:ok, %{status: status}} ->
+        {:error, {:s3_list_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp tally_list(xml, count, bytes) when is_binary(xml) do
+    ~r{<Contents>.*?<Key>(.*?)</Key>.*?<Size>(\d+)</Size>.*?</Contents>}s
+    |> Regex.scan(xml)
+    |> Enum.reduce({count, bytes}, fn [_, key, size], {c, b} ->
+      if live_db_object?(key), do: {c + 1, b + String.to_integer(size)}, else: {c, b}
+    end)
+  end
+
+  defp tally_list(_body, count, bytes), do: {count, bytes}
+
+  defp next_token(xml) when is_binary(xml) do
+    case Regex.run(~r{<NextContinuationToken>(.*?)</NextContinuationToken>}s, xml) do
+      [_, token] -> token
+      _ -> nil
+    end
+  end
+
+  defp next_token(_body), do: nil
+
+  defp live_db_object?(key),
+    do: String.ends_with?(key, ".db") and not String.contains?(key, "@")
+
   defp object_path(shard_id), do: url_path(db_key(shard_id))
   defp lock_path(shard_id), do: url_path(prefix() <> shard_id <> ".lock")
   # Percent-encode the owner (expert review round-2 #3): the incarnation-qualified owner
@@ -1127,7 +1179,46 @@ defmodule Fathom.Shard.Storage.S3 do
         ]
       ] ++ finch_opt() ++ req_plug_opt(config)
     )
+    |> Req.Request.append_response_steps(fathom_s3_meter: &__MODULE__.meter/1)
   end
+
+  @doc false
+  # S3-op meter, attached as a Req response step in req/0 — the single choke point every
+  # `Req.*` S3 call routes through. Emits one `[:fathom, :s3, :op]` telemetry event per response
+  # tagged by HTTP method (low cardinality: get/put/head/delete), carrying the transferred byte
+  # count (Prometheus counter + sum → the S3 cost / rate-limit-headroom panel). A response step
+  # that raised would fail the S3 request, so the body is fully guarded and the event is a free
+  # no-op when no reporter is attached (test / metrics off).
+  def meter({request, %Req.Response{} = response}) do
+    :telemetry.execute(
+      [:fathom, :s3, :op],
+      %{count: 1, bytes: op_bytes(request, response)},
+      %{op: request.method}
+    )
+
+    {request, response}
+  rescue
+    _ -> {request, response}
+  end
+
+  def meter({request, other}), do: {request, other}
+
+  # Transferred bytes: the response content-length for a GET (streamed, so the body isn't
+  # resident but the header is present), else the request content-length for a PUT.
+  defp op_bytes(request, response) do
+    header_int(Req.Response.get_header(response, "content-length")) ||
+      header_int(Req.Request.get_header(request, "content-length")) ||
+      0
+  end
+
+  defp header_int([v | _]) when is_binary(v) do
+    case Integer.parse(v) do
+      {n, _} -> n
+      :error -> nil
+    end
+  end
+
+  defp header_int(_), do: nil
 
   # Test seam only: route requests through a `Plug`/`Req.Test` stub instead of the network,
   # so the conditional-lease semantics (If-Match / If-None-Match on PUT and DELETE) can be

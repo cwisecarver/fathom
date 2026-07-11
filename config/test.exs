@@ -38,6 +38,11 @@ config :fathom, heartbeat_server: false
 # Skip the checkout -> OpenTelemetry span bridge in tests (telemetry events + metrics still fire).
 config :fathom, otel_spans: false
 
+# Admin observability layer off in test (default on elsewhere): no in-process Prometheus reporter
+# singleton, and Fathom.Admin.FlushWatermark writes no-op. Tests that exercise the metrics/RPO
+# paths flip this on for their scope.
+config :fathom, :metrics_collector, false
+
 # Keep the filesystem storage backend's "remote" under a test-specific dir.
 # (Tests that exercise idle flush set a short :shard_idle_ms themselves.)
 config :fathom, Fathom.Shard.Storage.Local,

@@ -135,6 +135,21 @@ defmodule Fathom.Shard.Storage.Local do
     end
   end
 
+  @impl true
+  def stored_usage do
+    dir()
+    |> Path.join("*.db")
+    |> Path.wildcard()
+    # Count only live objects (`<shard>.db`), excluding retained `<shard>@<version>.db` copies.
+    |> Enum.reject(&String.contains?(Path.basename(&1), "@"))
+    |> Enum.reduce({0, 0}, fn path, {count, bytes} ->
+      case File.stat(path) do
+        {:ok, %File.Stat{size: size}} -> {count + 1, bytes + size}
+        _ -> {count, bytes}
+      end
+    end)
+  end
+
   # --- leasing ---
   #
   # The lease is a `<shard_id>.lock` JSON file next to the `.db` object. A fresh

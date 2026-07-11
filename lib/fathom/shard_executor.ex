@@ -71,6 +71,8 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp do_execute({_pid, _ref, conn, shard_id}, %Stmt{sql: sql, args: args}) do
+    started = System.monotonic_time()
+
     case Connection.query(conn, sql, args) do
       {:ok, result} ->
         # A write bumps the shard's write counter so the periodic durability flush knows local
@@ -88,6 +90,16 @@ defmodule Fathom.ShardExecutor do
           shard_id,
           stmt_result.rows_read,
           stmt_result.rows_written
+        )
+
+        # Node-wide query latency for the metrics layer (Prometheus distribution / the dashboard's
+        # latency chart). Deliberately UN-tagged — a per-shard latency histogram at millions of
+        # shards is the cardinality death Fathom.ShardLoad's read-API exists to avoid. On success
+        # only, matching the cold_open convention. A no-op when no reporter is attached.
+        :telemetry.execute(
+          [:fathom, :shard, :query],
+          %{duration: System.monotonic_time() - started},
+          %{}
         )
 
         {:ok, stmt_result}

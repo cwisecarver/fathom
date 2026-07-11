@@ -159,6 +159,13 @@ defmodule Fathom.Shard.Storage do
   @callback drop_version(shard_id :: String.t(), version :: non_neg_integer()) ::
               :ok | {:error, term()}
 
+  # Aggregate storage footprint for observability — `{object_count, total_bytes}` of the live
+  # shard objects. Optional: a backend that can't cheaply enumerate simply omits it, and the
+  # dispatcher returns `{:error, :unsupported}`. Potentially expensive (an S3 LIST), so callers
+  # poll it slowly + cache; at fleet scale prefer S3 Inventory / CloudWatch over a live LIST.
+  @callback stored_usage() :: {non_neg_integer(), non_neg_integer()} | {:error, term()}
+  @optional_callbacks stored_usage: 0
+
   @doc "Pulls the shard's stored file to `local_path`, returning its etag (`nil` if absent)."
   @spec pull(String.t(), Path.t()) :: {:ok, String.t() | nil} | {:error, term()}
   def pull(shard_id, local_path), do: backend().pull(shard_id, local_path)
@@ -264,6 +271,20 @@ defmodule Fathom.Shard.Storage do
   @doc "Deletes the shard's `version` object (idempotent; retirement)."
   @spec drop_version(String.t(), non_neg_integer()) :: :ok | {:error, term()}
   def drop_version(shard_id, version), do: backend().drop_version(shard_id, version)
+
+  @doc """
+  Aggregate storage footprint — `{object_count, total_bytes}` of the live shard objects — for the
+  admin dashboard's storage panel. Best-effort and potentially expensive (an S3 LIST): poll it
+  slowly and cache. Returns `{:error, :unsupported}` if the backend doesn't implement it.
+
+  > At fleet scale prefer S3 Inventory / CloudWatch (`BucketSizeBytes`, `NumberOfObjects`) over a
+  > live LIST — this is a small-scale / dev stand-in.
+  """
+  @spec stored_usage() :: {non_neg_integer(), non_neg_integer()} | {:error, term()}
+  def stored_usage do
+    b = backend()
+    if function_exported?(b, :stored_usage, 0), do: b.stored_usage(), else: {:error, :unsupported}
+  end
 
   @doc false
   @spec encode_lease(lease()) :: binary()

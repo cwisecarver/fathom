@@ -54,6 +54,7 @@ defmodule Fathom.Shard do
 
   require Logger
 
+  alias Fathom.Admin.FlushWatermark
   alias Fathom.Shard.{Connection, Fence, Heartbeat, Storage, WarmFollower, WriteCounter}
 
   @default_idle_ms 60_000
@@ -330,6 +331,9 @@ defmodule Fathom.Shard do
       # revalidated proactively (expert review #34), not just lazily at the next
       # flush. Legacy mode revalidates via its own per-shard renewals.
       if acquire_gen != nil, do: subscribe_lapse()
+      # Publish the initial flush watermark so the metrics layer can derive RPO/dirtiness for
+      # this shard without a per-coordinator GenServer call (Fathom.Admin.FlushWatermark).
+      FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
       {:noreply, schedule_flush(state)}
     else
       {:error, reason} ->
@@ -771,13 +775,16 @@ defmodule Fathom.Shard do
       {:ok, new_etag} ->
         write_etag_sidecar(state.path, new_etag)
 
-        {:noreply,
-         schedule_flush(%{
-           state
-           | flushed_through: state.flush_pending,
-             counter_gen: state.flush_pending_gen,
-             etag: new_etag
-         })}
+        state = %{
+          state
+          | flushed_through: state.flush_pending,
+            counter_gen: state.flush_pending_gen,
+            etag: new_etag
+        }
+
+        # Advance the published watermark (clears dirty up to flush_pending for the RPO reader).
+        FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
+        {:noreply, schedule_flush(state)}
 
       # The data PUT's If-Match failed (412). The OBJECT changed — but a 412 is NOT
       # proof of a STEAL (expert review #2): our own PUT can land server-side while its
@@ -1004,6 +1011,7 @@ defmodule Fathom.Shard do
     Fathom.ShardLoad.forget(state.id)
     Fathom.Shards.Lru.forget(state.id)
     WriteCounter.forget(state.id)
+    FlushWatermark.forget(state.id)
     drop_local(state.path)
     :ok
   end
@@ -1021,6 +1029,7 @@ defmodule Fathom.Shard do
     # dirty shard look clean, skipping the flush and losing the writes (findings #1/#27).
     flush_and_drop(state)
     WriteCounter.forget(state.id)
+    FlushWatermark.forget(state.id)
     :ok
   end
 
@@ -1030,6 +1039,7 @@ defmodule Fathom.Shard do
     Fathom.ShardLoad.forget(state.id)
     Fathom.Shards.Lru.forget(state.id)
     WriteCounter.forget(state.id)
+    FlushWatermark.forget(state.id)
     :ok
   end
 
@@ -1154,13 +1164,15 @@ defmodule Fathom.Shard do
           {:ok, etag} when not is_nil(etag) ->
             write_etag_sidecar(state.path, etag)
 
-            {:ok,
-             %{
-               state
-               | etag: etag,
-                 flushed_through: state.flush_pending,
-                 counter_gen: state.flush_pending_gen
-             }}
+            state = %{
+              state
+              | etag: etag,
+                flushed_through: state.flush_pending,
+                counter_gen: state.flush_pending_gen
+            }
+
+            FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
+            {:ok, state}
 
           _ ->
             {:ok, state}

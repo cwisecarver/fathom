@@ -209,7 +209,11 @@ defmodule Fathom.Application do
       Fathom.Shards.Lru,
       # Owns the per-shard write-counter ETS table (the dirty-flag signal, off the coordinator
       # mailbox — finding #27). Always on (a data-loss invariant), before the shard supervisor.
-      Fathom.Shard.WriteCounter
+      Fathom.Shard.WriteCounter,
+      # Owns the per-shard flush-watermark ETS table (the metrics layer's RPO/dirtiness source).
+      # Always-supervised owner so reads never crash; writes are gated by Fathom.Admin.enabled?.
+      # Before the shard supervisor so the table is up before any coordinator publishes/forgets.
+      Fathom.Admin.FlushWatermark
     ] ++
       heartbeat_children() ++
       [

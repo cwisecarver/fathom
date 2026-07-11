@@ -62,6 +62,11 @@ defmodule Fathom.MixProject do
       {:req, "~> 0.5"},
       {:telemetry_metrics, "~> 1.0"},
       {:telemetry_poller, "~> 1.0"},
+      # In-process Prometheus reporter: aggregates the Telemetry.Metrics in `Fathom.Telemetry`
+      # (ETS-backed, low-cardinality node/fleet signals) and exposes a `/metrics` scrape. The
+      # admin dashboard reads its in-process aggregation; external Prometheus/Grafana scrape the
+      # endpoint. `_core` (no bundled Bandit listener) — we mount the scrape ourselves.
+      {:telemetry_metrics_prometheus_core, "~> 1.1"},
       # OpenTelemetry: traces for cluster operations (cold-open, lease handoff). Metrics
       # stay on Telemetry.Metrics (OTel's BEAM metrics SDK is still experimental). The OTLP
       # exporter is env-gated in config/runtime.exs — a no-op until an endpoint is set.
