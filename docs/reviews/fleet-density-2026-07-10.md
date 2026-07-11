@@ -169,6 +169,33 @@ connection + page cache.
 Every regime scales with the **active** set, not total tenants; stored-but-idle tenants cost disk
 (bottomless in MinIO), not memory. That is the density thesis, measured on the rig from four angles.
 
+## Pushing the served-data ceiling (stress test)
+
+How many data-bearing shards can the fleet serve *at once*? With `nofile` raised to the 524288 hard
+limit (so fds stop binding) and a 6 GB `MemAvailable` guard (to self-halt before OOM), `served-data`
+was pushed per node with all three nodes concurrent:
+
+- **Reached 105,530 shards held under live data connections across the fleet (~35k/node) with 30 GB
+  RAM still free** — then stopped by hand. The per-shard cost stayed **linear the whole way** (~600–640
+  KiB/shard from 30k through 105k), so the RAM ceiling extrapolates cleanly: 30 GB free at 105k, 6 GB
+  reserve → **~150–160k fleet (~50k/node)** before the guard would fire.
+- **fds never bound** (the point of raising `nofile`): ~105k fds/node against the 524288 limit.
+- **The real limiter was open *throughput*, not a resource.** Opens decayed from ~236/s at low count →
+  ~29/s at 17k/node → **~9/s at 35k/node**, so reaching the RAM wall would take ~another hour of grind
+  — which is why the run was called at 105k.
+
+**Most of that throughput collapse is a test artifact, not fathom.** The probe holds *every* connection
+in **one** process, so its heap grows to 105k live handles and GC cost climbs with occupancy — the same
+one-process caveat the `--ramp` scale test carries. Production holds each connection in a **separate
+per-stream process** (`Fathom.Shard.Connection`, one per Hrana stream), so there is no single giant heap
+to GC and the per-open cost does not degrade this way. The RAM ceiling (~150k on this VM) is real; the
+throughput wall is the harness.
+
+So the data chaos test's practical ceiling on this **one shared VM** is **~105k demonstrated / ~150k
+RAM-bound** — bound by one machine's RAM and the single-process harness, neither of which a real cluster
+has. On N separate machines with per-stream processes, served-data density is ~50k/node × N, fd- and
+RAM-provisioned, not throughput-walled.
+
 ## Honest limits
 
 - **The idle run is empty shards, no load, no data.** The partition/floor tables measure the
