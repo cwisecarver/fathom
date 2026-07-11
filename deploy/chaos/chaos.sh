@@ -513,10 +513,12 @@ cmd_density() {
   local n i
   # New coordinators must outlive the read: the rig idle-drop is 20s and a coordinator
   # freezes idle_ms at init (Fathom.Shard init reads it once), so raise it BEFORE minting.
-  # And quiet the rebalancer so no handoff moves a shard off its hash-home node — that would
-  # blur the partition-evenness we're measuring. Restored at the end.
+  # Quiet the rebalancer so no handoff moves a shard off its hash-home node — that would blur
+  # the partition-evenness we're measuring. And lift the production `max_open_shards` soft cap
+  # (else a node near the cap starts LRU-evicting idle shards and we'd measure eviction churn,
+  # not raw density) — set it to N so no partition skew can hit it. All restored at the end.
   for n in "${NODES[@]}"; do
-    rpc "$n" 'Application.put_env(:fathom, :shard_idle_ms, 900_000); Application.put_env(:fathom, :rebalancer_enabled, false)' >/dev/null
+    rpc "$n" "Application.put_env(:fathom, :shard_idle_ms, 900_000); Application.put_env(:fathom, :rebalancer_enabled, false); Application.put_env(:fathom, :max_open_shards, $shards)" >/dev/null
   done
 
   # One round-trip per node -> "coordinators beam_bytes rss_kb". GC every process first so
@@ -574,9 +576,9 @@ cmd_density() {
   echo "              the ACTIVE set and scales out by adding nodes, not by growing one process."
 
   # Restore rig defaults (already-minted coordinators keep their frozen idle and drop on
-  # their own; this un-freezes future opens and re-arms the rebalancer).
+  # their own; this un-freezes future opens, re-arms the rebalancer, re-instates the cap).
   for n in "${NODES[@]}"; do
-    rpc "$n" 'Application.put_env(:fathom, :shard_idle_ms, 20_000); Application.put_env(:fathom, :rebalancer_enabled, true)' >/dev/null
+    rpc "$n" 'Application.put_env(:fathom, :shard_idle_ms, 20_000); Application.put_env(:fathom, :rebalancer_enabled, true); Application.put_env(:fathom, :max_open_shards, 10_000)' >/dev/null
   done
   unset -f _dsample
 }
