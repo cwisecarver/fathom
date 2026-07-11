@@ -128,19 +128,57 @@ all three nodes concurrent):
 - **~163k q/s aggregate** on a query pass over the 30000 held connections (each node ~50k/s, a single
   sequential sweep — a reachability/throughput check, not a sustained-load benchmark).
 
-So both regimes scale with the *active* set, not total tenants: the warm floor (~16 KiB, memory-bound,
-30k+ held) is what a node keeps *available*; the served ceiling (~220 KiB, fd-bound, 10k/node) is what
-it *serves at once*. Idle tenants beyond either are bottomless in MinIO at 0 resident cost.
+### With real data per shard (`served-data`)
+
+The runs so far are empty shards. `chaos.sh served-data 10000 256 1024` seeds each shard with 256 KiB
+(256 × 1 KiB blobs), holds a live connection, and scans the rows — **30000 data-bearing shards served
+across the fleet at once**:
+
+| node | held (data) | RSS / shard | fds / shard | q/s (scan) |
+|---|---:|---:|---:|---:|
+| fathom1 | 10000 | 629 KiB | 3.0 | 25716 |
+| fathom2 | 10000 | 639 KiB | 3.0 | 25281 |
+| fathom3 | 10000 | 649 KiB | 3.0 | 26529 |
+| **fleet** | **30000** | ~640 KiB | 3.0 | **~78k** |
+
+- **~640 KiB/shard** = the ~220 KiB connection + SQLite's per-connection page cache for the 256 KiB
+  scanned + WAL buffers. (The cache is bounded by SQLite's default `cache_size` ~2 MB, so past ~2 MB of
+  hot data per shard the RSS stops tracking the data.) Still the *active* set: 30000 served data shards
+  cost ~18 GB across the fleet (~6 GB/node) — fds, not memory, the wall.
+- **3 fds/shard, not 1** — writing data materialises the WAL's `-wal`/`-shm` files, so a WAL-active
+  connection is 3 fds (the empty read-only handle was 1). That tightens the served ceiling to
+  ~`nofile / 3` (~21k/node at soft 65536); 10k/node fits with room.
+- **~78k q/s** scanning real 256 KiB rows (each node ~26k/s) vs ~163k for the empty `SELECT 1` pass —
+  the cost of reading actual pages.
+
+**Data does not inflate the *idle* floor.** After the connections release, those 30000 coordinators
+sit idle holding their 256 KiB files: **0 fds and ~43 KiB RSS each** (coordinator + retained heap) —
+node RSS ~655 MB, not the ~2.5 GB/node the data would take if resident. The 256 KiB is on disk (and
+bottomless in MinIO), not in memory. A **stored** tenant costs disk; only an **active** one costs the
+connection + page cache.
+
+## The three regimes, at 30000 across the fleet
+
+| regime | per shard | bound by | held at 30k | what it is |
+|---|---:|---|---:|---|
+| **idle floor** (`density`) | ~16 KiB RSS, 0 fd | memory | yes (30k+) | keeping a shard *available* between requests |
+| **served, empty** (`served`) | ~220 KiB, 1 fd | fds (`nofile`) | yes | *serving* an empty shard under a live connection |
+| **served + data** (`served-data`) | ~640 KiB, 3 fds | fds (`nofile/3`) | yes | *serving* a shard scanning 256 KiB of real rows |
+| idle + data | ~43 KiB, 0 fd | memory | yes | a *stored* data-bearing tenant, connection closed |
+
+Every regime scales with the **active** set, not total tenants; stored-but-idle tenants cost disk
+(bottomless in MinIO), not memory. That is the density thesis, measured on the rig from four angles.
 
 ## Honest limits
 
 - **The idle run is empty shards, no load, no data.** The partition/floor tables measure the
   **warm-resident floor**: each shard is touched once (a cold-open + one constant `SELECT 1`), holds
   no data, and is idle during the read — the connection is already closed. So the ~16 KiB/shard is the
-  cost of *keeping a shard available between requests*. The **served** regime (shards under a live
-  connection) is measured separately above — 30000 held at once, ~220 KiB/shard, fd-bound. A shard
-  **with real data** would additionally warm OS page cache for its hot pages; that (a data-bearing
-  working set) is the one axis neither run exercises.
+  cost of *keeping a shard available between requests*. The **served** regime (empty shards under a
+  live connection, ~220 KiB, fd-bound) and the **served + data** regime (256 KiB/shard, ~640 KiB, 3
+  fds) are measured separately above — all four regimes at 30000 across the fleet. The remaining
+  synthetic edge: the query is a full-table scan of random blobs, not a real tenant's mixed
+  read/write workload, and page cache past SQLite's ~2 MB `cache_size` isn't exercised.
 - **Bounded, not run to millions.** N = 30000 across 3 nodes on one VM (which has 94 GB — memory was
   never the limit; the earlier 6000 run was conservatism before that was confirmed). The "millions"
   figure is arithmetic: **measured even partition × measured per-node ceiling × node count**. The
@@ -167,8 +205,9 @@ cd deploy/chaos
 # restart the fathom nodes first for a pristine baseline (held == minted); shard files are in MinIO,
 # so nothing is lost — coordinators are in-memory only:
 docker compose restart fathom1 fathom2 fathom3
-./chaos.sh density 30000 32         # idle floor: mint 30000 shards, per-node partition + cost
-./chaos.sh served  10000            # served ceiling: hold 10k live connections/node (30k fleet)
+./chaos.sh density 30000 32          # idle floor: mint 30000 shards, per-node partition + cost
+./chaos.sh served  10000             # served ceiling: hold 10k live connections/node (30k fleet)
+./chaos.sh served-data 10000 256 1024  # served + data: 30k shards seeded 256 KiB each, scanned
 ```
 
 `density` lifts the `max_open_shards` cap for the run (to `shards`), so N is bounded only by node

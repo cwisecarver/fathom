@@ -30,6 +30,8 @@
 #   ./chaos.sh served [per]       hold `per` shards under a LIVE connection on each node at once
 #                                 (the fd-bound served ceiling, ~220 KiB/shard); needs container
 #                                 nofile raised (compose sets soft 65536; default 1024 caps ~940)
+#   ./chaos.sh served-data [per rows blob]  same, but each shard seeded with rows×blob bytes and
+#                                 scanned — the data-bearing served cost (page cache + 3 WAL fds/shard)
 #
 # All timings are RELATIVE (one host, loopback MinIO): run `latency 30` first so
 # failover numbers reflect a real S3 RTT rather than loopback.
@@ -649,12 +651,73 @@ ELIXIR
   rm -rf "$tmp"
 }
 
+# -- served-data: the served ceiling with REAL DATA per shard (page cache + WAL cost)
+# `served` holds *empty* shards under a live connection (~220 KiB, 1 fd — a read-only handle). This
+# seeds each shard with `rows` × `blob` bytes and holds it under a live connection while scanning the
+# data, so the cost also carries SQLite's per-connection page cache (the pages read) and the WAL's
+# `-wal`/`-shm` fds materialise (a WAL-active connection is 3 fds, not 1). It measures the one axis the
+# empty runs don't: a shard actively serving real tenant data. Args: per (10000), rows (256), blob (1024).
+cmd_served_data() {
+  local per=${1:-10000} rows=${2:-256} blob=${3:-1024}
+  local ncount=${#NODES[@]}
+  local kib=$(( rows * blob / 1024 ))
+  echo "served-data: $per shards/node (fleet $(( per * ncount ))), each seeded ${rows}×${blob}B (~${kib} KiB) + held under a live connection scanning the rows ..."
+  echo "  (data-bearing: WAL-active = 3 fds/shard, so the fd ceiling is ~nofile/3; RSS carries the page cache)"
+  local n
+  for n in "${NODES[@]}"; do
+    rpc "$n" "Application.put_env(:fathom, :max_open_shards, $(( per + 5000 ))); Application.put_env(:fathom, :shard_idle_ms, 900_000); Application.put_env(:fathom, :rebalancer_enabled, false)" >/dev/null
+  done
+
+  # Per node: open `per` node-scoped shards, DROP+CREATE a table, seed `rows` blobs, scan (warms the
+  # page cache), hold the connection; then sample RSS/fds, run a scan pass (throughput on real data),
+  # release. Node-scoped id prefix so the three nodes never contend for the same lease.
+  local expr
+expr=$(cat <<'ELIXIR'
+base_rss = (File.read!("/proc/self/status") |> then(fn s -> [x] = Regex.run(~r/VmRSS:\s+(\d+)/, s, capture: :all_but_first); String.to_integer(x) end)); base_fds = length(File.ls!("/proc/self/fd")); pref = "srvd" <> String.replace(Atom.to_string(node()), ~r/[^a-z0-9]/, "") <> "_"; seed_ddl = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < __ROWS__) INSERT INTO t (b) SELECT randomblob(__BLOB__) FROM c"; scan = "SELECT count(*), sum(length(b)) FROM t"; {open_us, {op, hs}} = :timer.tc(fn -> Enum.reduce_while(1..__PER__, {0, []}, fn i, {c, a} -> id = pref <> Integer.to_string(i); r = (try do (with {:ok, p, rf, pa} <- Fathom.Shards.checkout(id), {:ok, cn} <- Fathom.Shard.Connection.open(pa), :ok <- Fathom.Shard.Connection.exec(cn, "DROP TABLE IF EXISTS t"), :ok <- Fathom.Shard.Connection.exec(cn, "CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB)"), :ok <- Fathom.Shard.Connection.exec(cn, seed_ddl), {:ok, _} <- Fathom.Shard.Connection.query(cn, scan, []), do: {:ok, {p, rf, cn}}) rescue e -> {:error, e} catch :exit, x -> {:error, x} end); case r do {:ok, h} -> {:cont, {c + 1, [h | a]}}; _ -> {:halt, {c, a}} end end) end); open_rate = if open_us > 0, do: round(op * 1_000_000 / open_us), else: 0; :erlang.garbage_collect(); rss = (File.read!("/proc/self/status") |> then(fn s -> [x] = Regex.run(~r/VmRSS:\s+(\d+)/, s, capture: :all_but_first); String.to_integer(x) end)); fds = length(File.ls!("/proc/self/fd")); {qus, _} = :timer.tc(fn -> Enum.each(hs, fn {_, _, cn} -> Fathom.Shard.Connection.query(cn, scan, []) end) end); Enum.each(hs, fn {p, rf, cn} -> Fathom.Shard.Connection.close(cn); Fathom.Shard.checkin(p, rf) end); qps = if qus > 0, do: round(op * 1_000_000 / qus), else: 0; IO.puts("opened=#{op} open_rate=#{open_rate} rss_per_shard_kb=#{div(rss - base_rss, max(op, 1))} fds_per_shard=#{Float.round((fds - base_fds) / max(op, 1), 2)} qps=#{qps}")
+ELIXIR
+)
+  expr=${expr//__PER__/$per}; expr=${expr//__ROWS__/$rows}; expr=${expr//__BLOB__/$blob}
+
+  local tmp; tmp=$(mktemp -d)
+  for n in "${NODES[@]}"; do ( rpc "$n" "$expr" > "$tmp/$n" 2>&1 ) & done
+  wait
+
+  echo ""
+  printf "  %-9s %8s %10s %9s %11s\n" node held "KiB/shd" "fds/shd" "q/s scan"
+  local total=0 tqps=0
+  for n in "${NODES[@]}"; do
+    local line held perkib fdsp qps
+    line=$(cat "$tmp/$n")
+    held=$(printf '%s' "$line" | grep -o 'opened=[0-9]*' | cut -d= -f2); held=${held:-0}
+    perkib=$(printf '%s' "$line" | grep -o 'rss_per_shard_kb=[0-9]*' | cut -d= -f2)
+    fdsp=$(printf '%s' "$line" | grep -o 'fds_per_shard=[0-9.]*' | cut -d= -f2)
+    qps=$(printf '%s' "$line" | grep -o 'qps=[0-9]*' | cut -d= -f2); qps=${qps:-0}
+    if [ "$held" = "0" ]; then
+      printf "  %-9s %8s  %s\n" "$n" "ERR" "$line"
+    else
+      printf "  %-9s %8d %10s %9s %11s\n" "$n" "$held" "${perkib:-?}" "${fdsp:-?}" "${qps:-?}"
+    fi
+    total=$(( total + held )); tqps=$(( tqps + qps ))
+  done
+  echo ""
+  echo "  fleet:  $total data-bearing shards (~${kib} KiB each) held under a live connection at once,"
+  echo "          ~$tqps q/s aggregate scanning real rows. Data-bearing served cost = the connection"
+  echo "          (~220 KiB) + SQLite page cache for the pages read + the WAL fds — so both RSS and"
+  echo "          fds/shard rise vs empty served; still the ACTIVE working set, not total tenants."
+
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :max_open_shards, 10_000); Application.put_env(:fathom, :shard_idle_ms, 20_000); Application.put_env(:fathom, :rebalancer_enabled, true)' >/dev/null
+  done
+  rm -rf "$tmp"
+}
+
 case "${1:-}" in
   build)       cmd_build ;;
   tpcb)        shift; cmd_tpcb "$@" ;;
   tpcc)        shift; cmd_tpcc "$@" ;;
   density)     shift; cmd_density "$@" ;;
   served)      shift; cmd_served "$@" ;;
+  served-data) shift; cmd_served_data "$@" ;;
   rebalance)   shift; cmd_rebalance "$@" ;;
   hotspots)    shift; cmd_hotspots "$@" ;;
   up)          cmd_up ;;
