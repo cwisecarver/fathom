@@ -105,6 +105,10 @@ noted).
 - **[reviews/latency-cost-2026-07-11.md](reviews/latency-cost-2026-07-11.md)** — what an injected S3
   RTT costs the two round-trip-bound paths (`chaos.sh latency-cost`): cold-open ≈ 1 RTT (matches the
   in-process sweep), flush ≈ 3.5 RTT (the drain/release path is *not* overlapped — the tuning target).
+- **[reviews/tpc-fleet-2026-07-11.md](reviews/tpc-fleet-2026-07-11.md)** — multi-tenant TPC-B across
+  the fleet (`chaos.sh tpc-fleet`): the throughput analog of density — one single-writer shard per
+  tenant, load partitions across the nodes (query load follows shards), per-txn p50 stays flat as
+  tenants scale (no convoy); absolute txn/s is single-host-bound, horizontal is the real axis.
 - **reviews/chaos-run-2026-07-0{5,8,9}.md** — chaos-rig run reports (failover, pause-fence, hotspots,
   rebalance handoff — the live proofs referenced by the built-engine docs).
 - **reviews/expert-review-2026-07-0\*.md** — expert-panel review passes (each with a `.progress.md`

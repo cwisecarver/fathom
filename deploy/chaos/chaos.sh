@@ -24,6 +24,9 @@
 #                                 through the LB by a real libSQL client (the Phase-4 realism run)
 #   ./chaos.sh tpcc [max_w threads txns scale]  remote TPC-C: W=1..max_w sweep through the LB
 #                                 by a real libSQL client — per-txn-type latency + tpmC
+#   ./chaos.sh tpc-fleet [tenants_csv per_client accounts]  multi-tenant TPC-B THROUGHPUT across the
+#                                 fleet: sweep the tenant count (one single-writer shard each), read
+#                                 aggregate txn/s + the per-node load split — the throughput-across-nodes run
 #   ./chaos.sh density [shards workers]  mint N novel shards through the LB; read per node
 #                                 the coordinators held (the partition) + BEAM/RSS per shard
 #                                 (the cost) — the fathom counterpart to turso_density.sh
@@ -825,6 +828,85 @@ ELIXIR
   rm -rf "$tmp"
 }
 
+# -- tpc-fleet: multi-tenant TPC-B THROUGHPUT across the fleet — the throughput-across-nodes angle ----
+# The 2026-07-10 tpc-run measured the real-stack *latency shape* (per-txn cost, the single-shard write
+# convoy) and flagged that *throughput* isn't a single-shard number. This is the complement: drive many
+# tenant shards — **one single-writer file each** (fathom's real model, no intra-shard convoy) — through
+# the real LB so they partition across the nodes, sweep the tenant count, and read back BOTH the aggregate
+# txn/s (throughput vs concurrency) AND the per-node distribution (the keyspace-partition carrying the
+# load). It is to throughput what `chaos.sh density` is to capacity: density proved the fleet holds ~N
+# shards ~N/nodes each; this proves the *work* partitions the same way. Honest ceiling: all three nodes
+# share ONE 12-vCPU colima VM, so the absolute txn/s is CPU-bound by one box — the horizontal-scaling
+# claim is carried by the even per-node split (on N real machines the work is ~N× additive), not by the
+# single-host aggregate. Needs SHARD_LOAD on (docker-compose sets it). Each step uses its own shard
+# namespace (`tfleet<c>_*`) so no shard is re-seeded; the distribution reads the whole `tfleet` set.
+cmd_tpc_fleet() {
+  local clients_csv=${1:-"8,16,32,64"} per_client=${2:-400} accounts=${3:-1000}
+  local ncount=${#NODES[@]}
+  echo "tpc-fleet: multi-tenant TPC-B throughput across $ncount nodes (one single-writer shard per tenant)" >&2
+  echo "  sweep tenants=$clients_csv, $per_client txns/tenant, $accounts accounts/tenant — aggregate txn/s + per-node split" >&2
+
+  # Quiet the rebalancer (a mid-run handoff would move a shard off its hash-home and blur the partition we
+  # read back) and freeze idle-drop (a dropped coordinator calls ShardLoad.forget, dropping its row from
+  # the distribution). Reset the counters so the per-node read is this run's. All restored at the end.
+  local n
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :rebalancer_enabled, false); Application.put_env(:fathom, :shard_idle_ms, 900_000); Fathom.ShardLoad.reset()' >/dev/null
+  done
+
+  # The cross-LB warm-read floor every statement of every txn pays (context for the per-txn numbers).
+  local rtt; rtt=$(python3 tpc_driver.py rtt --lb "$LB" --domain "$DOMAIN" --shard rttprobe --samples 200 2>/dev/null | jq -r '.rtt_p50_us // 0')
+  echo "" >&2
+  echo "  cross-LB warm SELECT 1 RTT p50: $(awk -v x="$rtt" 'BEGIN{printf "%.0f", x}')µs (the per-statement network floor)"
+  echo ""
+  echo "  --- throughput vs tenant concurrency (one writer per tenant, no intra-shard convoy) ---"
+  printf "  %-9s %9s %11s %9s %9s %9s %6s\n" tenants txns "txn/s" "p50 ms" "p95 ms" "p99 ms" errs
+  local c txns json tps p50 p95 p99 errs
+  local IFS=,
+  set -f; set -- $clients_csv; set +f   # split the CSV on commas (bash 3.2 safe)
+  unset IFS
+  for c in "$@"; do
+    txns=$(( per_client * c ))
+    json=$(python3 tpc_driver.py tpcb --lb "$LB" --domain "$DOMAIN" --shard "tfleet$c" \
+      --txns "$txns" --clients "$c" --accounts "$accounts" 2>/dev/null)
+    tps=$(printf '%s' "$json" | jq -r '.tpcb_tps // 0')
+    p50=$(printf '%s' "$json" | jq -r '.tpcb_p50_us // 0')
+    p95=$(printf '%s' "$json" | jq -r '.tpcb_p95_us // 0')
+    p99=$(printf '%s' "$json" | jq -r '.tpcb_p99_us // 0')
+    errs=$(printf '%s' "$json" | jq -r '.errors // 0')
+    printf "  %-9s %9s %11s %9s %9s %9s %6s\n" "$c" "$txns" "$tps" \
+      "$(awk -v x="$p50" 'BEGIN{printf "%.2f", x/1000}')" \
+      "$(awk -v x="$p95" 'BEGIN{printf "%.2f", x/1000}')" \
+      "$(awk -v x="$p99" 'BEGIN{printf "%.2f", x/1000}')" "$errs"
+  done
+
+  # Per-node distribution: how many tenant shards each node held + total query load it absorbed.
+  echo ""
+  echo "  --- per-node distribution (the LB keyspace-partition carrying the throughput) ---"
+  printf "  %-9s %10s %12s\n" node "shards" "queries"
+  local dist; dist=$(mktemp)
+  local total_shards=0 total_q=0 sh q
+  for n in "${NODES[@]}"; do
+    read -r sh q <<< "$(rpc "$n" 'ms = Enum.filter(Fathom.ShardLoad.snapshot(), fn m -> String.starts_with?(m.shard_id, "tfleet") end); IO.puts("#{length(ms)} #{Enum.reduce(ms, 0, fn m, a -> a + m.queries end)}")')"
+    sh=${sh:-0}; q=${q:-0}
+    printf "  %-9s %10s %12s\n" "$n" "$sh" "$q"
+    total_shards=$(( total_shards + sh )); total_q=$(( total_q + q ))
+    echo "$sh" >> "$dist"
+  done
+  echo ""
+  local minh maxh; minh=$(sort -n "$dist" | head -1); maxh=$(sort -n "$dist" | tail -1)
+  echo "  fleet:  $total_shards tenant shards over $ncount nodes ($total_q queries recorded), spread $(awk -v a="$maxh" -v b="$minh" 'BEGIN{printf "%.2f", (b>0)?a/b:0}')x (1.00 = perfect)."
+  echo "          Each tenant is one single-writer file on the node the LB hashed it to, so throughput"
+  echo "          partitions across the fleet with no cross-tenant contention (contrast the single-shard"
+  echo "          convoy in docs/reviews/tpc-run-2026-07-10.md). Absolute txn/s is CPU-bound by this one"
+  echo "          12-vCPU VM; on N separate machines the partitioned work is ~N× (the 'millions' angle)."
+  rm -f "$dist"
+
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :rebalancer_enabled, true); Application.put_env(:fathom, :shard_idle_ms, 20_000)' >/dev/null
+  done
+}
+
 case "${1:-}" in
   build)       cmd_build ;;
   tpcb)        shift; cmd_tpcb "$@" ;;
@@ -833,6 +915,7 @@ case "${1:-}" in
   served)      shift; cmd_served "$@" ;;
   served-data) shift; cmd_served_data "$@" ;;
   latency-cost) shift; cmd_latency_cost "$@" ;;
+  tpc-fleet)   shift; cmd_tpc_fleet "$@" ;;
   rebalance)   shift; cmd_rebalance "$@" ;;
   hotspots)    shift; cmd_hotspots "$@" ;;
   up)          cmd_up ;;
