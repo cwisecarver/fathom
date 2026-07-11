@@ -215,6 +215,27 @@ if ms = System.get_env("WARM_HOME_RETENTION_MS") do
   config :fathom, :warm_home_retention_ms, String.to_integer(ms)
 end
 
+# ---- Admin dashboard (/admin + /admin/metrics) BasicAuth ----------------------------------
+# Credentials for the operator surface. The router's admin_auth plug fails closed (503) when
+# unset, so the dashboard/scrape is never anonymously reachable — set both to enable it. Read in
+# any env so a dev can override the config/dev.exs default; prod has no default (see the warn).
+admin_user = System.get_env("ADMIN_USER")
+admin_pass = System.get_env("ADMIN_PASS")
+
+if is_binary(admin_user) and is_binary(admin_pass) do
+  config :fathom, :admin_auth, username: admin_user, password: admin_pass
+end
+
+if config_env() == :prod and (is_nil(admin_user) or is_nil(admin_pass)) do
+  # Warn loudly, but don't take the data plane down over a dashboard credential: the request-time
+  # admin_auth plug already fails closed (503), so the surface stays non-public without creds.
+  IO.warn(
+    "ADMIN_USER/ADMIN_PASS unset in prod: /admin and /admin/metrics will fail closed (503). " <>
+      "Set both to enable the operator dashboard.",
+    []
+  )
+end
+
 if config_env() == :prod do
   database_url =
     System.get_env("DATABASE_URL") ||

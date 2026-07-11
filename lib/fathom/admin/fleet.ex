@@ -70,9 +70,14 @@ defmodule Fathom.Admin.Fleet do
     }
   end
 
-  @doc "The fleet's currently-hot shards (merged from every node's reported load), newest rate wins."
-  @spec hot_shards() :: [map()]
-  def hot_shards, do: LoadSamples.latest_per_shard(@load_window_ms)
+  @doc "The fleet's currently-hot shards (merged from every node's reported load), hottest first, top 50."
+  @spec hot_shards() :: [Fathom.Rebalancer.LoadSample.t()]
+  def hot_shards do
+    @load_window_ms
+    |> LoadSamples.latest_per_shard()
+    |> Enum.sort_by(& &1.q_per_s, :desc)
+    |> Enum.take(50)
+  end
 
   @doc "Oban job counts grouped by `{queue, state}` — the background-jobs panel (Pruner-bounded)."
   @spec oban_counts() :: [%{queue: String.t(), state: String.t(), count: non_neg_integer()}]

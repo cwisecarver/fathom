@@ -73,6 +73,101 @@ defmodule FathomWeb.Layouts do
   end
 
   @doc """
+  The admin dashboard shell: a fixed sidebar nav + sticky top bar wrapping the page content.
+  Dark-capable via daisyUI base tokens; dense and near-monochrome. Every admin LiveView begins
+  its template with `<Layouts.admin flash={@flash} active={:overview} node_key={@node_key}>`.
+  """
+  attr :flash, :map, required: true
+
+  attr :active, :atom,
+    default: nil,
+    doc: "the active nav item (:overview | :shards | :migrations)"
+
+  attr :node_key, :string, default: ""
+  slot :actions, doc: "top-bar right-aligned controls (e.g. a time-range picker)"
+  slot :inner_block, required: true
+
+  def admin(assigns) do
+    ~H"""
+    <div class="min-h-screen bg-base-100 text-base-content">
+      <div class="flex">
+        <aside class="sticky top-0 hidden h-screen w-56 shrink-0 flex-col border-r border-base-300 md:flex">
+          <div class="flex h-14 items-center gap-2 border-b border-base-300 px-4">
+            <.icon name="hero-cube-transparent" class="size-5 text-primary" />
+            <span class="font-semibold tracking-tight">Fathom</span>
+            <span class="ml-1 text-[11px] text-base-content/40">admin</span>
+          </div>
+          <nav class="space-y-0.5 p-2 text-sm">
+            <.nav_item
+              navigate={~p"/admin"}
+              active={@active == :overview}
+              icon="hero-squares-2x2"
+              label="Overview"
+            />
+            <.nav_item
+              navigate={~p"/admin/shards"}
+              active={@active == :shards}
+              icon="hero-circle-stack"
+              label="Shards"
+            />
+            <.nav_item
+              navigate={~p"/admin/migrations"}
+              active={@active == :migrations}
+              icon="hero-arrow-path"
+              label="Migrations"
+            />
+          </nav>
+          <div class="mt-auto border-t border-base-300 p-3 text-[11px] text-base-content/50">
+            node <span class="num text-base-content/70">{@node_key}</span>
+          </div>
+        </aside>
+
+        <div class="min-w-0 flex-1">
+          <header class="sticky top-0 z-10 flex h-14 items-center gap-4 border-b border-base-300 bg-base-100/90 px-4 backdrop-blur md:px-6">
+            <span class="font-semibold md:hidden">Fathom</span>
+            <div class="ml-auto flex items-center gap-4">
+              {render_slot(@actions)}
+              <span class="flex items-center gap-1.5 text-xs text-base-content/60">
+                <span class="live-dot inline-block size-2 rounded-full bg-success"></span> live
+              </span>
+              <.theme_toggle />
+            </div>
+          </header>
+
+          <.flash_group flash={@flash} />
+
+          <main class="mx-auto max-w-[1400px] p-4 md:p-6">
+            {render_slot(@inner_block)}
+          </main>
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  attr :navigate, :string, required: true
+  attr :active, :boolean, default: false
+  attr :icon, :string, required: true
+  attr :label, :string, required: true
+
+  defp nav_item(assigns) do
+    ~H"""
+    <.link
+      navigate={@navigate}
+      class={[
+        "flex items-center gap-2.5 rounded-md border-l-2 px-2.5 py-1.5 transition-colors",
+        @active && "border-primary bg-base-content/5 text-base-content",
+        !@active &&
+          "border-transparent text-base-content/60 hover:bg-base-content/5 hover:text-base-content"
+      ]}
+    >
+      <.icon name={@icon} class="size-4" />
+      {@label}
+    </.link>
+    """
+  end
+
+  @doc """
   Shows the flash group with standard titles and content.
 
   ## Examples

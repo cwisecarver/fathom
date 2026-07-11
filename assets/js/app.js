@@ -24,12 +24,69 @@ import {Socket} from "phoenix"
 import {LiveSocket} from "phoenix_live_view"
 import {hooks as colocatedHooks} from "phoenix-colocated/fathom"
 import topbar from "../vendor/topbar"
+import uPlot from "../vendor/uplot/uPlot.esm.js"
+
+// Streaming time-series chart for the admin dashboard. The LiveView renders
+//   <div id="..." phx-hook="Chart" phx-update="ignore"
+//        data-opts={JSON: {height, maxlen, yLabel, series: [{label, stroke, fill?, width?}]}}
+//        data-initial={JSON: [[x...], [y1...], ...]}>
+// then push_event(socket, "chart:<id>", %{x: t_seconds, ys: [..]}) each tick to append a point,
+// or "chart:<id>:reset" with fresh data. Theme-neutral axis/grid greys read in light + dark.
+const Chart = {
+  mounted() {
+    const opts = JSON.parse(this.el.dataset.opts || "{}")
+    const maxlen = opts.maxlen || 300
+    this.maxlen = maxlen
+    this.data = JSON.parse(this.el.dataset.initial || "[[]]")
+
+    const axisStroke = "#8b8b8b"
+    const grid = {stroke: "rgba(125,125,125,0.18)", width: 1}
+    const ticks = {stroke: "rgba(125,125,125,0.25)", width: 1}
+    const axis = {stroke: axisStroke, grid, ticks, font: "11px ui-monospace, monospace"}
+
+    const series = [{}].concat((opts.series || []).map(s => ({
+      label: s.label,
+      stroke: s.stroke,
+      width: s.width || 1.5,
+      fill: s.fill || null,
+      points: {show: false},
+    })))
+
+    this.plot = new uPlot({
+      width: this.el.clientWidth || 600,
+      height: opts.height || 200,
+      cursor: {y: false},
+      legend: {show: true},
+      scales: {x: {time: true}},
+      axes: [axis, Object.assign({}, axis, {label: opts.yLabel})],
+      series,
+    }, this.data, this.el)
+
+    this.handleEvent(`chart:${this.el.id}`, ({x, ys}) => {
+      this.data[0].push(x)
+      ys.forEach((y, i) => this.data[i + 1].push(y))
+      if (this.data[0].length > this.maxlen) this.data.forEach(a => a.shift())
+      this.plot.setData(this.data)
+    })
+    this.handleEvent(`chart:${this.el.id}:reset`, (fresh) => {
+      this.data = fresh
+      this.plot.setData(this.data)
+    })
+
+    this.ro = new ResizeObserver(() => this.plot.setSize({width: this.el.clientWidth, height: opts.height || 200}))
+    this.ro.observe(this.el)
+  },
+  destroyed() {
+    this.ro && this.ro.disconnect()
+    this.plot && this.plot.destroy()
+  },
+}
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
   params: {_csrf_token: csrfToken},
-  hooks: {...colocatedHooks},
+  hooks: {...colocatedHooks, Chart},
 })
 
 // Show progress bar on live navigation and form submits

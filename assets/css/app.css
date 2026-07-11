@@ -102,4 +102,46 @@
 /* Make LiveView wrapper divs transparent for layout */
 [data-phx-session], [data-phx-teleported-src] { display: contents }
 
+/* ── Admin dashboard: uPlot (vendored) + a few bespoke utilities ─────────────────────────── */
+
+/* uPlot base styles (assets/vendor/uplot/uPlot.min.css, inlined so the Tailwind v4 pipeline
+   bundles them without a second stylesheet link). */
+.uplot, .uplot *, .uplot *::before, .uplot *::after { box-sizing: border-box; }
+.uplot { font-family: ui-sans-serif, system-ui, sans-serif; line-height: 1.5; width: min-content; }
+.u-title { text-align: center; font-size: 18px; font-weight: bold; }
+.u-wrap { position: relative; user-select: none; }
+.u-over, .u-under { position: absolute; }
+.u-under { overflow: hidden; }
+.uplot canvas { display: block; position: relative; width: 100%; height: 100%; }
+.u-axis { position: absolute; }
+.u-legend { font-size: 12px; margin: auto; text-align: center; }
+.u-inline { display: block; }
+.u-inline * { display: inline-block; }
+.u-inline tr { margin-right: 16px; }
+.u-legend th { font-weight: 600; }
+.u-legend th > * { vertical-align: middle; display: inline-block; }
+.u-legend .u-marker { width: 1em; height: 1em; margin-right: 4px; background-clip: padding-box !important; }
+.u-inline.u-live th::after { content: ":"; vertical-align: middle; }
+.u-inline:not(.u-live) .u-value { display: none; }
+.u-series > * { padding: 4px; }
+.u-series th { cursor: pointer; }
+.u-legend .u-off > * { opacity: 0.3; }
+.u-select { background: rgba(125,125,125,0.10); position: absolute; pointer-events: none; }
+.u-cursor-x, .u-cursor-y { position: absolute; left: 0; top: 0; pointer-events: none; will-change: transform; }
+.u-hz .u-cursor-x, .u-vt .u-cursor-y { height: 100%; border-right: 1px dashed #8b8b8b; }
+.u-hz .u-cursor-y, .u-vt .u-cursor-x { width: 100%; border-bottom: 1px dashed #8b8b8b; }
+.u-cursor-pt { position: absolute; top: 0; left: 0; border-radius: 50%; border: 0 solid; pointer-events: none; will-change: transform; background-clip: padding-box !important; }
+.u-axis.u-off, .u-select.u-off, .u-cursor-x.u-off, .u-cursor-y.u-off, .u-cursor-pt.u-off { display: none; }
+
+/* Tabular monospaced numerals for realtime data so digits don't jitter as they tick. */
+.num { font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace; font-variant-numeric: tabular-nums; }
+
+/* Pulsing "live" dot. */
+@keyframes fathom-pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.35 } }
+.live-dot { animation: fathom-pulse 1.6s ease-in-out infinite; }
+
+/* Skeleton shimmer for loading states. */
+@keyframes fathom-shimmer { 0% { background-position: -400px 0 } 100% { background-position: 400px 0 } }
+.skeleton { background: linear-gradient(90deg, rgba(125,125,125,0.10) 25%, rgba(125,125,125,0.20) 37%, rgba(125,125,125,0.10) 63%); background-size: 800px 100%; animation: fathom-shimmer 1.4s ease infinite; }
+
 /* This file is for your main application CSS */

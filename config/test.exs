@@ -43,6 +43,9 @@ config :fathom, otel_spans: false
 # paths flip this on for their scope.
 config :fathom, :metrics_collector, false
 
+# Admin dashboard BasicAuth creds for the LiveView tests (the fail-closed path test clears them).
+config :fathom, :admin_auth, username: "admin", password: "secret"
+
 # Keep the filesystem storage backend's "remote" under a test-specific dir.
 # (Tests that exercise idle flush set a short :shard_idle_ms themselves.)
 config :fathom, Fathom.Shard.Storage.Local,

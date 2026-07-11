@@ -16,6 +16,10 @@ config :fathom, :allow_shard_override, true
 # above so hostless localhost drives capture — intended in dev only).
 config :fathom, :default_shard, "demo"
 
+# Admin dashboard (/admin) BasicAuth — a dev default so http://localhost:4000/admin works without
+# env vars. Prod reads ADMIN_USER/ADMIN_PASS (config/runtime.exs) and fails closed when unset.
+config :fathom, :admin_auth, username: "admin", password: "admin"
+
 # Configure your database
 config :fathom, Fathom.Repo,
   username: "cwisecarver",
