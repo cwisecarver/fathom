@@ -24,6 +24,9 @@
 #                                 through the LB by a real libSQL client (the Phase-4 realism run)
 #   ./chaos.sh tpcc [max_w threads txns scale]  remote TPC-C: W=1..max_w sweep through the LB
 #                                 by a real libSQL client — per-txn-type latency + tpmC
+#   ./chaos.sh density [shards workers]  mint N novel shards through the LB; read per node
+#                                 the coordinators held (the partition) + BEAM/RSS per shard
+#                                 (the cost) — the fathom counterpart to turso_density.sh
 #
 # All timings are RELATIVE (one host, loopback MinIO): run `latency 30` first so
 # failover numbers reflect a real S3 RTT rather than loopback.
@@ -494,10 +497,95 @@ cmd_tpcc() {
     --max-w "$max_w" --threads "$threads" --txns "$txns" --scale "$scale"
 }
 
+# -- density: multi-node fleet shard density (the fathom counterpart to turso_density.sh) --
+# sqld holds every namespace resident in ONE process (~17 KiB/ns, degrading create rate);
+# fathom spreads shards across the fleet via the LB keyspace-partition, so each node pays
+# only for its ACTIVE working set (idle shards flush to MinIO, 0 resident) and capacity is
+# horizontally additive. This mints N novel shards through the LB — the consistent hash
+# spreads d_1..d_N across the nodes — then reads per node the coordinators held (the
+# partition) and BEAM/RSS memory (the per-shard cost), showing the fleet holds ~N total,
+# ~N/nodes each, at the single-node per-shard cost with no per-node degradation.
+cmd_density() {
+  local shards=${1:-6000} workers=${2:-24}
+  local ncount=${#NODES[@]}
+  echo "density: minting $shards novel shards through the LB across $ncount nodes ($workers workers) ..."
+
+  local n i
+  # New coordinators must outlive the read: the rig idle-drop is 20s and a coordinator
+  # freezes idle_ms at init (Fathom.Shard init reads it once), so raise it BEFORE minting.
+  # And quiet the rebalancer so no handoff moves a shard off its hash-home node — that would
+  # blur the partition-evenness we're measuring. Restored at the end.
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :shard_idle_ms, 900_000); Application.put_env(:fathom, :rebalancer_enabled, false)' >/dev/null
+  done
+
+  # One round-trip per node -> "coordinators beam_bytes rss_kb". GC every process first so
+  # :erlang.memory(:total) reflects LIVE memory, not un-collected garbage (which otherwise
+  # makes the per-shard BEAM cost lumpy across nodes by GC timing, not real variance).
+  _dsample() {
+    rpc "$1" 'Enum.each(Process.list(), fn p -> :erlang.garbage_collect(p) end); rss = (case File.read("/proc/self/status") do {:ok, s} -> (Regex.run(~r/VmRSS:\s+(\d+)/, s, capture: :all_but_first) || ["0"]) |> hd(); _ -> "0" end); IO.puts("#{Registry.count(Fathom.ShardRegistry)} #{:erlang.memory(:total)} #{rss}")'
+  }
+
+  local -a bc bm br   # baseline per node: coordinators, BEAM bytes, RSS kB
+  i=0
+  for n in "${NODES[@]}"; do
+    read -r bc[$i] bm[$i] br[$i] <<< "$(_dsample "$n")"
+    i=$((i + 1))
+  done
+
+  # Mint: SELECT 1 needs no table; each is a real cold-open (create the file + acquire the
+  # lease in MinIO) on the node the LB hashes d_<i>.<domain> to. Workers stride the id space.
+  local start_ms; start_ms=$(now_ms)
+  local w
+  for w in $(seq 1 "$workers"); do
+    ( local j=$w; while [ "$j" -le "$shards" ]; do sql "d_$j" "SELECT 1" >/dev/null 2>&1; j=$((j + workers)); done ) &
+  done
+  wait
+  local mint_ms=$(( $(now_ms) - start_ms )); [ "$mint_ms" -gt 0 ] || mint_ms=1
+  echo "minted in ${mint_ms}ms (~$(( shards * 1000 / mint_ms )) shards/s through the LB)"
+  echo ""
+
+  # Read back: the partition (coordinators held) + the cost (BEAM/RSS delta) per node.
+  printf "  %-9s %8s %11s %10s %11s\n" node held "BEAM MB" "KiB/shd" "RSS MB"
+  local th=0 tbeam=0 trss=0 minh=-1 maxh=-1
+  i=0
+  for n in "${NODES[@]}"; do
+    local ac am ar held dbeam drss perkib
+    read -r ac am ar <<< "$(_dsample "$n")"
+    held=$(( ac - bc[i] )); dbeam=$(( am - bm[i] )); drss=$(( ar - br[i] ))
+    if [ "$held" -gt 0 ]; then perkib=$(( dbeam / 1024 / held )); else perkib=0; fi
+    printf "  %-9s %8d %11s %10d %11s\n" "$n" "$held" \
+      "$(awk -v x="$dbeam" 'BEGIN{printf "%.1f", x/1048576}')" "$perkib" \
+      "$(awk -v x="$drss" 'BEGIN{printf "%.1f", x/1024}')"
+    th=$(( th + held )); tbeam=$(( tbeam + dbeam )); trss=$(( trss + drss ))
+    if [ "$minh" -lt 0 ] || [ "$held" -lt "$minh" ]; then minh=$held; fi
+    if [ "$maxh" -lt 0 ] || [ "$held" -gt "$maxh" ]; then maxh=$held; fi
+    i=$((i + 1))
+  done
+
+  echo ""
+  local ideal=$(( shards / ncount )) avgkib=0
+  [ "$th" -gt 0 ] && avgkib=$(( tbeam / 1024 / th ))
+  echo "  partition:  $th shards held across $ncount nodes (minted $shards); ideal ~$ideal/node,"
+  echo "              observed min $minh / max $maxh (spread $(awk -v a="$maxh" -v b="$minh" 'BEGIN{printf "%.2f", (b>0)?a/b:0}')x, 1.00 = perfect)"
+  echo "  cost:       ~$avgkib KiB/shard resident (BEAM Δ); fleet RSS Δ $(awk -v x="$trss" 'BEGIN{printf "%.0f", x/1024}') MB"
+  echo "  fleet:      capacity = nodes × per-node working set; idle shards flush to MinIO (0 resident)."
+  echo "              vs sqld (every namespace resident in one process): fathom's resident cost tracks"
+  echo "              the ACTIVE set and scales out by adding nodes, not by growing one process."
+
+  # Restore rig defaults (already-minted coordinators keep their frozen idle and drop on
+  # their own; this un-freezes future opens and re-arms the rebalancer).
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :shard_idle_ms, 20_000); Application.put_env(:fathom, :rebalancer_enabled, true)' >/dev/null
+  done
+  unset -f _dsample
+}
+
 case "${1:-}" in
   build)       cmd_build ;;
   tpcb)        shift; cmd_tpcb "$@" ;;
   tpcc)        shift; cmd_tpcc "$@" ;;
+  density)     shift; cmd_density "$@" ;;
   rebalance)   shift; cmd_rebalance "$@" ;;
   hotspots)    shift; cmd_hotspots "$@" ;;
   up)          cmd_up ;;

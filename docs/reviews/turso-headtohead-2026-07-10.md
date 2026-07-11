@@ -131,7 +131,9 @@ ceiling each design implies.
   N=64 plateau (churning namespaces cold) — that overlaps the density axis and is not isolated here.
 - **Density is not run to millions** (infeasible). fathom's `--ramp` here was a dev/test build that
   hit a `max_open_shards` soft cap at 10k (not the ~82k fd ceiling), and the idle-coordinator /
-  storage "millions" is architectural, not exhaustively run. sqld's per-namespace cost is measured
+  storage "millions" is architectural, not exhaustively run — the **fleet** half of it (the LB
+  partition spreading shards evenly across nodes at the single-node cost, so capacity is additive)
+  is now measured in [fleet-density-2026-07-10.md](fleet-density-2026-07-10.md). sqld's per-namespace cost is measured
   to 4k and the 1M figure is a linear extrapolation. The comparison is per-tenant cost + the
   creation-rate slope + the ceiling each design implies, not a run to the limit.
 

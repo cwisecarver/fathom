@@ -96,6 +96,10 @@ noted).
 - **[reviews/turso-headtohead-2026-07-10.md](reviews/turso-headtohead-2026-07-10.md)** — fathom vs
   the reference libSQL server (`sqld`): per-DB (on par), multi-tenant fan-out (fathom scales out),
   and density (fathom built for millions).
+- **[reviews/fleet-density-2026-07-10.md](reviews/fleet-density-2026-07-10.md)** — the multi-node
+  fleet density run (`chaos.sh density`): the LB keyspace-partition spreads N shards evenly across
+  the nodes at the single-node per-shard cost, so capacity is horizontally additive (the "millions"
+  mechanism the single-node density work left as architectural).
 - **[reviews/tpc-run-2026-07-10.md](reviews/tpc-run-2026-07-10.md)** — the remote-client TPC run over
   the chaos rig (true cross-LB latency) + the loopback spec-scale TPC-C comparability numbers.
 - **reviews/chaos-run-2026-07-0{5,8,9}.md** — chaos-rig run reports (failover, pause-fence, hotspots,
