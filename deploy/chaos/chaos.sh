@@ -32,6 +32,9 @@
 #                                 nofile raised (compose sets soft 65536; default 1024 caps ~940)
 #   ./chaos.sh served-data [per rows blob]  same, but each shard seeded with rows×blob bytes and
 #                                 scanned — the data-bearing served cost (page cache + 3 WAL fds/shard)
+#   ./chaos.sh latency-cost [ms samples rows blob]  MEASURE cold-open (pull) + flush (upload) cost
+#                                 per node, baseline vs an injected S3 RTT — the TPC Phase-4 follow-on
+#                                 (what `latency <ms>` INJECTS, this quantifies). Cold-open ≈ ~2× one-way
 #
 # All timings are RELATIVE (one host, loopback MinIO): run `latency 30` first so
 # failover numbers reflect a real S3 RTT rather than loopback.
@@ -711,6 +714,117 @@ ELIXIR
   rm -rf "$tmp"
 }
 
+# -- latency-cost: what an injected S3 RTT costs the two round-trip-bound paths ----------------
+# `latency <ms>` INJECTS S3 latency (a toxiproxy knob the other scenarios lean on). This MEASURES
+# what that latency costs the two paths whose wall-clock is S3-round-trip-bound (docs/benchmark-plan
+# "Hot paths"): a **cold-open** (coordinator start → lease acquire + pull the .db from MinIO, ~1 RTT
+# overlapped) and a **flush** (checkpoint → upload the .db → release, the durability write path via
+# drain/2). It times both per node with NO latency (the loopback-MinIO floor) and again under an
+# injected one-way RTT, so the delta isolates the S3 cost from the local work. This is the TPC Phase-4
+# follow-on carried in docs/reviews/fleet-density-2026-07-10.md's Remaining Work.
+#
+# Method per node (node-scoped ids, so the three nodes never contend for one lease; driven via rpc
+# LOCALLY, bypassing the LB — cold-open/flush are per-node properties, not partition ones):
+#   setup  : seed `samples` small shards (rows×blob) and drain each → bytes live in MinIO, local dropped.
+#   measure: for each, TIME checkout (a genuine cold pull, blocks until the open completes), then a
+#            dirty write + WriteCounter.bump (so the flush is write-gated ON — a clean shard skips the
+#            upload), then TIME drain (flush upload + drop + release; re-arms the next cold pull).
+# Small shards by default (~64 KiB) so the number reflects the RTT, not bulk transfer — raise rows/blob
+# to fold in transfer cost. Cold-open should land near ~2× one-way + a few ms (scripts/benchmark_s3_sweep.sh).
+cmd_latency_cost() {
+  local ms=${1:-30} samples=${2:-12} rows=${3:-64} blob=${4:-1024}
+  local ncount=${#NODES[@]}
+  local kib=$(( rows * blob / 1024 ))
+  echo "latency-cost: cold-open (pull) + flush (upload) cost per node — baseline vs ${ms}ms injected S3 RTT"
+  echo "  ($samples shards/node, ~${kib} KiB each; cold-open ≈ ~2× one-way + a few ms — scripts/benchmark_s3_sweep.sh)"
+
+  # Freeze idle-drop + quiet the rebalancer for the run so nothing drops or moves a shard mid-measure
+  # (we drain explicitly; this is belt-and-suspenders). Restored at the end. Sample count is tiny, so
+  # the production max_open_shards cap is never in play — left untouched.
+  local n
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :shard_idle_ms, 900_000); Application.put_env(:fathom, :rebalancer_enabled, false)' >/dev/null
+  done
+
+  # SETUP (untimed, no latency): create the MinIO object each measure round will pull.
+  local setup_expr
+setup_expr=$(cat <<'ELIXIR'
+pref = "lat" <> String.replace(Atom.to_string(node()), ~r/[^a-z0-9]/, "") <> "_"; seed = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < __ROWS__) INSERT INTO t (b) SELECT randomblob(__BLOB__) FROM c"; Enum.each(1..__N__, fn i -> id = pref <> Integer.to_string(i); {:ok, p, rf, pa} = Fathom.Shards.checkout(id); {:ok, cn} = Fathom.Shard.Connection.open(pa); Fathom.Shard.Connection.exec(cn, "DROP TABLE IF EXISTS t"); Fathom.Shard.Connection.exec(cn, "CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB)"); Fathom.Shard.Connection.exec(cn, seed); Fathom.Shard.Connection.close(cn); Fathom.Shard.WriteCounter.bump(id); Fathom.Shard.checkin(p, rf); Fathom.Shards.drain(id, 15_000) end); IO.puts("setup_ok=__N__")
+ELIXIR
+)
+  setup_expr=${setup_expr//__N__/$samples}; setup_expr=${setup_expr//__ROWS__/$rows}; setup_expr=${setup_expr//__BLOB__/$blob}
+
+  # MEASURE (timed): cold pull, then a bump-dirtied write, then drain — μs; median/min/max per node.
+  local measure_expr
+measure_expr=$(cat <<'ELIXIR'
+pref = "lat" <> String.replace(Atom.to_string(node()), ~r/[^a-z0-9]/, "") <> "_"; {opens, flushes} = Enum.reduce(1..__N__, {[], []}, fn i, {os, fs} -> id = pref <> Integer.to_string(i); {ou, res} = :timer.tc(fn -> Fathom.Shards.checkout(id) end); case res do {:ok, p, rf, pa} -> {:ok, cn} = Fathom.Shard.Connection.open(pa); Fathom.Shard.Connection.exec(cn, "INSERT INTO t (b) VALUES (randomblob(__BLOB__))"); Fathom.Shard.Connection.close(cn); Fathom.Shard.WriteCounter.bump(id); Fathom.Shard.checkin(p, rf); {fu, _} = :timer.tc(fn -> Fathom.Shards.drain(id, 15_000) end); {[ou | os], [fu | fs]}; _ -> {os, fs} end end); p50 = fn l -> case Enum.sort(l) do [] -> 0; s -> Enum.at(s, div(length(s), 2)) end end; lo = fn l -> if l == [], do: 0, else: Enum.min(l) end; hi = fn l -> if l == [], do: 0, else: Enum.max(l) end; IO.puts("samples=#{length(opens)} open_p50=#{p50.(opens)} open_min=#{lo.(opens)} open_max=#{hi.(opens)} flush_p50=#{p50.(flushes)} flush_min=#{lo.(flushes)} flush_max=#{hi.(flushes)}")
+ELIXIR
+)
+  measure_expr=${measure_expr//__N__/$samples}; measure_expr=${measure_expr//__BLOB__/$blob}
+
+  echo ""
+  echo "  setup: seeding $samples shards/node into MinIO (untimed) ..."
+  local tmp; tmp=$(mktemp -d)
+  for n in "${NODES[@]}"; do ( rpc "$n" "$setup_expr" > "$tmp/setup-$n" 2>&1 ) & done
+  wait
+
+  # baseline: no injected latency (loopback-MinIO floor)
+  cmd_latency clear >/dev/null
+  for n in "${NODES[@]}"; do ( rpc "$n" "$measure_expr" > "$tmp/base-$n" 2>&1 ) & done
+  wait
+
+  # injected: the requested one-way S3 RTT
+  cmd_latency "$ms" >/dev/null
+  for n in "${NODES[@]}"; do ( rpc "$n" "$measure_expr" > "$tmp/inj-$n" 2>&1 ) & done
+  wait
+  cmd_latency clear >/dev/null
+
+  _lc_field() { printf '%s' "$1" | grep -o "$2=[0-9]*" | cut -d= -f2; }
+  _lc_ms()    { awk -v x="${1:-0}" 'BEGIN{printf "%.1f", x/1000}'; }
+  _lc_row() { # <label-file-prefix> -> print one table row per node, echo fleet sums via globals
+    local phase=$1 n line held op omin omax fp fmin fmax
+    for n in "${NODES[@]}"; do
+      line=$(cat "$tmp/$phase-$n")
+      held=$(_lc_field "$line" samples); held=${held:-0}
+      if [ "$held" = "0" ]; then printf "  %-9s %8s  %s\n" "$n" "ERR" "$line"; continue; fi
+      op=$(_lc_field "$line" open_p50); omin=$(_lc_field "$line" open_min); omax=$(_lc_field "$line" open_max)
+      fp=$(_lc_field "$line" flush_p50); fmin=$(_lc_field "$line" flush_min); fmax=$(_lc_field "$line" flush_max)
+      printf "  %-9s %8d %10s %14s %10s %14s\n" "$n" "$held" \
+        "$(_lc_ms "$op")" "$(_lc_ms "$omin")–$(_lc_ms "$omax")" \
+        "$(_lc_ms "$fp")" "$(_lc_ms "$fmin")–$(_lc_ms "$fmax")"
+      _LC_OP_SUM=$(( _LC_OP_SUM + op )); _LC_FP_SUM=$(( _LC_FP_SUM + fp )); _LC_CNT=$(( _LC_CNT + 1 ))
+    done
+  }
+
+  echo ""
+  echo "  --- baseline (no injected latency — the loopback-MinIO floor) ---"
+  printf "  %-9s %8s %10s %14s %10s %14s\n" node samples "open p50" "open rng(ms)" "flush p50" "flush rng(ms)"
+  _LC_OP_SUM=0 _LC_FP_SUM=0 _LC_CNT=0; _lc_row base
+  local base_open=0 base_flush=0
+  [ "$_LC_CNT" -gt 0 ] && { base_open=$(( _LC_OP_SUM / _LC_CNT )); base_flush=$(( _LC_FP_SUM / _LC_CNT )); }
+
+  echo ""
+  echo "  --- injected (${ms}ms each way on every node's S3 path) ---"
+  printf "  %-9s %8s %10s %14s %10s %14s\n" node samples "open p50" "open rng(ms)" "flush p50" "flush rng(ms)"
+  _LC_OP_SUM=0 _LC_FP_SUM=0 _LC_CNT=0; _lc_row inj
+  local inj_open=0 inj_flush=0
+  [ "$_LC_CNT" -gt 0 ] && { inj_open=$(( _LC_OP_SUM / _LC_CNT )); inj_flush=$(( _LC_FP_SUM / _LC_CNT )); }
+
+  echo ""
+  local dopen=$(( inj_open - base_open )) dflush=$(( inj_flush - base_flush ))
+  echo "  fleet (avg of per-node p50):"
+  echo "    cold-open:  baseline $(_lc_ms "$base_open") ms → injected $(_lc_ms "$inj_open") ms  (Δ $(_lc_ms "$dopen") ms ≈ $(awk -v d="$dopen" -v m="$ms" 'BEGIN{printf "%.1f", (m>0)?d/1000.0/m:0}')× the ${ms}ms one-way)"
+  echo "    flush:      baseline $(_lc_ms "$base_flush") ms → injected $(_lc_ms "$inj_flush") ms  (Δ $(_lc_ms "$dflush") ms ≈ $(awk -v d="$dflush" -v m="$ms" 'BEGIN{printf "%.1f", (m>0)?d/1000.0/m:0}')× the ${ms}ms one-way)"
+  echo "    both paths are round-trip-bound: a cold-open overlaps lease+pull to ~1 RTT (≈2× one-way);"
+  echo "    a flush uploads the .db then releases the lease. Injected latency adds RTTs, not local work."
+
+  unset -f _lc_field _lc_ms _lc_row
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :shard_idle_ms, 20_000); Application.put_env(:fathom, :rebalancer_enabled, true)' >/dev/null
+  done
+  rm -rf "$tmp"
+}
+
 case "${1:-}" in
   build)       cmd_build ;;
   tpcb)        shift; cmd_tpcb "$@" ;;
@@ -718,6 +832,7 @@ case "${1:-}" in
   density)     shift; cmd_density "$@" ;;
   served)      shift; cmd_served "$@" ;;
   served-data) shift; cmd_served_data "$@" ;;
+  latency-cost) shift; cmd_latency_cost "$@" ;;
   rebalance)   shift; cmd_rebalance "$@" ;;
   hotspots)    shift; cmd_hotspots "$@" ;;
   up)          cmd_up ;;

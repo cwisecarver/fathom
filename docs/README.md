@@ -102,6 +102,9 @@ noted).
   mechanism the single-node density work left as architectural).
 - **[reviews/tpc-run-2026-07-10.md](reviews/tpc-run-2026-07-10.md)** — the remote-client TPC run over
   the chaos rig (true cross-LB latency) + the loopback spec-scale TPC-C comparability numbers.
+- **[reviews/latency-cost-2026-07-11.md](reviews/latency-cost-2026-07-11.md)** — what an injected S3
+  RTT costs the two round-trip-bound paths (`chaos.sh latency-cost`): cold-open ≈ 1 RTT (matches the
+  in-process sweep), flush ≈ 3.5 RTT (the drain/release path is *not* overlapped — the tuning target).
 - **reviews/chaos-run-2026-07-0{5,8,9}.md** — chaos-rig run reports (failover, pause-fence, hotspots,
   rebalance handoff — the live proofs referenced by the built-engine docs).
 - **reviews/expert-review-2026-07-0\*.md** — expert-panel review passes (each with a `.progress.md`
