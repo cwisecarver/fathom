@@ -245,6 +245,23 @@ defmodule Fathom.Directory do
     Repo.all(from s in Shard, where: s.status == "migration_failed")
   end
 
+  @doc "Total shard rows in the directory across all statuses (the fleet's known-shard count)."
+  @spec count() :: non_neg_integer()
+  def count, do: Repo.aggregate(Shard, :count)
+
+  @doc """
+  Shard counts grouped by lifecycle status, as a `%{status => count}` map — the dashboard's
+  status breakdown. NB: `status` alone is unindexed (the only status indexes are partial
+  `WHERE status='active'`), so this is a sequential group-by — cheap at current scale, revisit
+  with a covering index if the directory grows large.
+  """
+  @spec count_by_status() :: %{optional(String.t()) => non_neg_integer()}
+  def count_by_status do
+    from(s in Shard, group_by: s.status, select: {s.status, count(s.shard_id)})
+    |> Repo.all()
+    |> Map.new()
+  end
+
   @doc """
   The shard's current Hrana-token revocation version (expert review #31), or `nil`
   if the shard has no directory row. A token minted at a version below this no

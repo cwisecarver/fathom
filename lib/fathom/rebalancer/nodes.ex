@@ -35,6 +35,10 @@ defmodule Fathom.Rebalancer.Nodes do
     :ok
   end
 
+  @doc "Every node beat row — the raw fleet roster (node_key, last_seen_at, q_p99, sample_count). O(nodes)."
+  @spec all() :: [NodeBeat.t()]
+  def all, do: Repo.all(NodeBeat)
+
   @doc "The set of node_keys seen within `within_ms` ago (the live fleet)."
   @spec alive(non_neg_integer()) :: MapSet.t()
   def alive(within_ms) do

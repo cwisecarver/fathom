@@ -28,6 +28,12 @@ defmodule Fathom.Rebalancer.Commands do
     )
   end
 
+  @doc "Every still-`pending` command across the fleet, oldest first (the dashboard's in-flight handoffs)."
+  @spec all_pending() :: [Command.t()]
+  def all_pending do
+    Repo.all(from c in Command, where: c.status == "pending", order_by: [asc: c.inserted_at])
+  end
+
   @doc "Marks a command terminal (`\"done\"` | `\"failed\"`) with an optional detail string."
   @spec complete(Command.t(), String.t(), String.t() | nil) ::
           {:ok, Command.t()} | {:error, Ecto.Changeset.t()}
