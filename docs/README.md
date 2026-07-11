@@ -42,6 +42,15 @@ single-node basics first, then what happens across nodes.
    blue/green copy-then-flip per shard, cold-tail convergence, a guarded revert, and how the app
    tolerates a mixed vN-1/vN fleet.
 
+**Supporting — security and the control plane:**
+
+8. **[auth.md](auth.md)** — how an unchanged libSQL client authenticates per shard (a
+   `Phoenix.Token` as `authToken` on Filo's `:authorize` seam), the `:disabled`/`:required` modes,
+   and the network trust boundary when auth is off.
+9. **[directory.md](directory.md)** — the Postgres control plane the migration / rebalancing /
+   warm-standby readers use, and the off-hot-path recorder (lock-free ETS coalesce + batch-flush) so
+   a Postgres outage never fails a checkout.
+
 [cluster-architecture.md](cluster-architecture.md) is the **canonical, broader** cluster picture
 (the LB-keyspace-partition model + the S3 lease/heartbeat fence) that these zoom into.
 
