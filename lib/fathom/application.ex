@@ -269,12 +269,24 @@ defmodule Fathom.Application do
   defp edge_children do
     [
       # Cluster-phase observability: metrics over the shard/lease/checkout telemetry,
-      # the active-shard poller, and the checkout -> OpenTelemetry span bridge.
-      Fathom.Telemetry,
-      # Hrana (libSQL) protocol server: a stream registry plus a dedicated listener that
-      # serves shards to libSQL clients, on its own port, separate from the dashboard.
-      {Filo.Streams, name: Fathom.HranaStreams}
-    ] ++ hrana_listeners() ++ health_listeners() ++ [FathomWeb.Endpoint]
+      # the active-shard poller, and the checkout -> OpenTelemetry span bridge. Starts the
+      # in-process Prometheus reporter the metrics collector below scrapes, so it comes first.
+      Fathom.Telemetry
+    ] ++
+      metrics_collector_children() ++
+      [
+        # Hrana (libSQL) protocol server: a stream registry plus a dedicated listener that
+        # serves shards to libSQL clients, on its own port, separate from the dashboard.
+        {Filo.Streams, name: Fathom.HranaStreams}
+      ] ++ hrana_listeners() ++ health_listeners() ++ [FathomWeb.Endpoint]
+  end
+
+  # The admin dashboard's realtime metrics collector: reads this node's live metrics each tick and
+  # fans them out over PubSub. Gated with the rest of the admin observability layer
+  # (Fathom.Admin.enabled?, off in test). After Fathom.Telemetry so the Prometheus reporter it
+  # scrapes is already up.
+  defp metrics_collector_children do
+    if Fathom.Admin.enabled?(), do: [Fathom.Admin.MetricsCollector], else: []
   end
 
   # Tell Phoenix to update the endpoint configuration

@@ -181,4 +181,39 @@ defmodule Fathom.Admin.MetricsTest do
 
     assert {2, 300} = Storage.stored_usage()
   end
+
+  # ── MetricsCollector (Phase 2): broadcasts a well-formed metrics map each tick ──
+
+  test "the collector broadcasts a metrics map with direct + aggregate fields" do
+    prev_load = Application.get_env(:fathom, :shard_load)
+    prev_tick = Application.get_env(:fathom, :admin_tick_ms)
+    Application.put_env(:fathom, :shard_load, true)
+    Application.put_env(:fathom, :admin_tick_ms, 80)
+
+    on_exit(fn ->
+      restore(:shard_load, prev_load)
+      restore(:admin_tick_ms, prev_tick)
+    end)
+
+    Phoenix.PubSub.subscribe(Fathom.PubSub, Fathom.Admin.MetricsCollector.topic())
+    start_supervised!(Fathom.Admin.MetricsCollector)
+
+    assert_receive {:metrics, m}, 1_000
+
+    # Direct (node-local) fields are always populated, even with the Prometheus reporter off in test.
+    assert is_integer(m.open_shards) and m.open_shards >= 0
+    assert is_integer(m.memory_bytes) and m.memory_bytes > 0
+    assert is_number(m.node_qps)
+    assert is_list(m.hot_shards)
+    assert is_integer(m.dirty_shards)
+    # Aggregate (scrape-derived) fields degrade to zeros/maps when the reporter isn't running.
+    assert is_number(m.query_p50_ms)
+    assert is_map(m.s3_ops_per_s)
+    assert is_map(m.checkout_per_s)
+
+    # snapshot/0 serves the last value + a history ring for a freshly-connected LiveView.
+    snap = Fathom.Admin.MetricsCollector.snapshot()
+    assert is_map(snap.current)
+    assert is_list(snap.history)
+  end
 end
