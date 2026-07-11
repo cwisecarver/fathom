@@ -56,6 +56,13 @@ x-fathom-env: &fathom-env
 x-fathom-node: &fathom-node
   image: fathom-chaos:latest
   restart: "no" # the rig kills nodes on purpose; auto-restart would fight the scenarios
+  # Served density (a live connection per shard) is fd-bound: the default 1024 soft limit
+  # caps a node at ~940 held connections. Real deployments provision fds; raise it here so
+  # the `chaos.sh density --served` run can hold ~10k/node (see docs/reviews/fleet-density).
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 524288
   # The rebalancer renders the LB exception map here; nginx includes the same host dir.
   volumes:
     - ./lb-runtime:/etc/nginx/lb

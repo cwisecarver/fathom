@@ -92,16 +92,55 @@ in a single RSS with a create rate still dropping; fathom holds each node's work
 apiece (cheaper at scale), pages the idle tail to MinIO, and partitions the rest evenly across however
 many nodes you run — which is what this run measured the LB actually doing.
 
+## Served density — shards under a live connection (fd-bound)
+
+The run above is the warm-resident *floor* — idle coordinators, memory-bound. The *ceiling* is how
+many shards a node holds **under a live connection** at once (`open → query`, connection held): a
+served shard also holds an exqlite/SQLite handle, which is **fd-bound**. `chaos.sh served [per]`
+measures it — it opens `per` node-scoped shards per node, each keeping a connection, drives a query
+pass over all of them, and reads per-node RSS + fds. (Opens are local per node, not through the LB:
+the served ceiling is a per-node property; the LB partition is what the idle run measures.)
+
+**The default fd limit is the wall.** As shipped, the rig container's soft `nofile` is **1024** and
+the BEAM holds ~84 at rest — so a node hits `EMFILE` at **~945 served shards** (measured), at **1 fd
+per connection** (an empty WAL connection here holds one fd, not the three a macOS host shows) and
+**~190 KiB RSS each**. Memory is nowhere near the limit (~180 MB); fds are. Real deployments provision
+fds, so `docker-compose.yml` now sets the fathom nodes' `nofile` to soft 65536 / hard 524288.
+
+**With fds provisioned — 30000 held across the fleet at once** (`chaos.sh served 10000`, 10k/node,
+all three nodes concurrent):
+
+| node | held (live conn) | RSS / shard | fds / shard | q/s (pass) |
+|---|---:|---:|---:|---:|
+| fathom1 | 10000 | 232 KiB | 1.0 | 55319 |
+| fathom2 | 10000 | 216 KiB | 1.0 | 50694 |
+| fathom3 | 10000 | 231 KiB | 1.0 | 56723 |
+| **fleet** | **30000** | ~220 KiB | 1.0 | **~163k** |
+
+- **Served costs ~220 KiB/shard — ~14× the ~16 KiB idle floor.** That's the price of the held
+  connection (the exqlite handle + WAL) on top of the coordinator, and it matches the single-node
+  ~180–196 KiB fanout figure. Still memory-cheap: 30000 live connections cost ~6.6 GB across the
+  fleet, a rounding error against the VM's 94 GB.
+- **The ceiling is fds, and fds are a knob.** 1 fd per connection, so a node's served ceiling is
+  ~`nofile` (minus the ~84 baseline) — lift `nofile` to lift it. At soft 65536 a node holds well past
+  10k; the fleet multiplies by node count. "How many can we serve at once" = `nodes × nofile`, a
+  provisioning number, not an architectural wall.
+- **~163k q/s aggregate** on a query pass over the 30000 held connections (each node ~50k/s, a single
+  sequential sweep — a reachability/throughput check, not a sustained-load benchmark).
+
+So both regimes scale with the *active* set, not total tenants: the warm floor (~16 KiB, memory-bound,
+30k+ held) is what a node keeps *available*; the served ceiling (~220 KiB, fd-bound, 10k/node) is what
+it *serves at once*. Idle tenants beyond either are bottomless in MinIO at 0 resident cost.
+
 ## Honest limits
 
-- **Idle, empty shards — no load, no data.** This measures the **warm-resident floor**: each shard is
-  touched once (a cold-open + one constant `SELECT 1`), holds no data, and is idle during the read —
-  the connection is already closed. So the ~16 KiB/shard is the cost of *keeping a shard available
-  between requests*, not the cost of a shard under active query load. A shard **actively streaming**
-  additionally holds an exqlite connection + fds (the ~180 KiB fanout regime, fd-bound at ~82k/node),
-  and a shard **with real data** would add page cache for its hot pages. Both scale with the *active*
-  working set, not total tenants — which is the whole density point — but neither is exercised here.
-  This run answers "how many shards can a node hold *warm*," not "how many can it *serve at once*."
+- **The idle run is empty shards, no load, no data.** The partition/floor tables measure the
+  **warm-resident floor**: each shard is touched once (a cold-open + one constant `SELECT 1`), holds
+  no data, and is idle during the read — the connection is already closed. So the ~16 KiB/shard is the
+  cost of *keeping a shard available between requests*. The **served** regime (shards under a live
+  connection) is measured separately above — 30000 held at once, ~220 KiB/shard, fd-bound. A shard
+  **with real data** would additionally warm OS page cache for its hot pages; that (a data-bearing
+  working set) is the one axis neither run exercises.
 - **Bounded, not run to millions.** N = 30000 across 3 nodes on one VM (which has 94 GB — memory was
   never the limit; the earlier 6000 run was conservatism before that was confirmed). The "millions"
   figure is arithmetic: **measured even partition × measured per-node ceiling × node count**. The
@@ -128,11 +167,14 @@ cd deploy/chaos
 # restart the fathom nodes first for a pristine baseline (held == minted); shard files are in MinIO,
 # so nothing is lost — coordinators are in-memory only:
 docker compose restart fathom1 fathom2 fathom3
-./chaos.sh density 30000 32         # mint 30000 shards through the LB; per-node partition + cost
+./chaos.sh density 30000 32         # idle floor: mint 30000 shards, per-node partition + cost
+./chaos.sh served  10000            # served ceiling: hold 10k live connections/node (30k fleet)
 ```
 
-The harness lifts the `max_open_shards` cap for the run (to `shards`), so N is bounded only by node
-memory — the 94 GB VM here has room for far more than 30000.
+`density` lifts the `max_open_shards` cap for the run (to `shards`), so N is bounded only by node
+memory — the 94 GB VM here has room for far more than 30000. `served` is **fd-bound**, so
+`docker-compose.yml` raises the fathom nodes' `nofile` to soft 65536 (the default 1024 caps a node at
+~940); recreate the nodes (`docker compose up -d fathom1 fathom2 fathom3`) after changing it.
 
 The harness disables the rebalancer and raises the idle timeout for the run, then restores both.
 After any rig run, restore the rebalancer's tracked runtime artifact:
