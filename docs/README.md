@@ -85,6 +85,8 @@ what actually shipped (some plan assumptions were superseded).
 - **[runbooks/cluster.md](runbooks/cluster.md)** — operating the cluster.
 - **[runbooks/rebalancer.md](runbooks/rebalancer.md)** — the staged, gate-by-gate enable path for
   dynamic rebalancing (observe-before-arming dry run + rollback).
+- **[runbooks/admin-dashboard.md](runbooks/admin-dashboard.md)** — running the realtime `/admin`
+  dashboard, its auth/gates, and the macOS Tailwind re-sign + pending-migration gotchas.
 
 ## Reviews & run reports
 
