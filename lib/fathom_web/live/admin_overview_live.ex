@@ -10,10 +10,16 @@ defmodule FathomWeb.AdminOverviewLive do
 
   alias Fathom.Admin.{Fleet, MetricsCollector}
 
+  # Fleet (Postgres) roll-ups refresh on this cadence — slow, and off the realtime 1s tick.
+  @fleet_refresh_ms 5_000
+
   @impl true
   def mount(_params, _session, socket) do
-    if connected?(socket) do
+    connected = connected?(socket)
+
+    if connected do
       Phoenix.PubSub.subscribe(Fathom.PubSub, MetricsCollector.topic())
+      Process.send_after(self(), :refresh_fleet, @fleet_refresh_ms)
     end
 
     snap = MetricsCollector.snapshot()
@@ -24,10 +30,16 @@ defmodule FathomWeb.AdminOverviewLive do
       |> assign(:node_key, Fathom.Rebalancer.node_key())
       |> assign(:metrics, snap.current)
       |> assign(:history, snap.history)
-      |> assign_async(:fleet, fn -> {:ok, %{fleet: Fleet.overview()}} end)
+      |> assign(:fleet, nil)
+      |> load_fleet(connected)
 
     {:ok, socket}
   end
+
+  # Fetch the fleet roll-up off-process (no DB in the disconnected mount); handle_async assigns it.
+  # start_async keeps the previous @fleet visible while a refresh runs (no skeleton flicker).
+  defp load_fleet(socket, false), do: socket
+  defp load_fleet(socket, true), do: start_async(socket, :fleet, fn -> Fleet.overview() end)
 
   @impl true
   def handle_info({:metrics, m}, socket) do
@@ -43,6 +55,17 @@ defmodule FathomWeb.AdminOverviewLive do
     {:noreply, socket}
   end
 
+  def handle_info(:refresh_fleet, socket) do
+    Process.send_after(self(), :refresh_fleet, @fleet_refresh_ms)
+    {:noreply, load_fleet(socket, true)}
+  end
+
+  @impl true
+  def handle_async(:fleet, {:ok, fleet}, socket), do: {:noreply, assign(socket, :fleet, fleet)}
+
+  # Keep the last-good fleet data if a refresh crashes — a Postgres blip shouldn't blank the panels.
+  def handle_async(:fleet, {:exit, _reason}, socket), do: {:noreply, socket}
+
   @impl true
   def render(assigns) do
     ~H"""
@@ -53,32 +76,23 @@ defmodule FathomWeb.AdminOverviewLive do
 
       <div class="space-y-6">
         <%!-- Fleet KPI row (Postgres, async) --%>
-        <.async_result :let={fleet} assign={@fleet}>
-          <:loading>
-            <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
-              <div :for={_ <- 1..4} class="skeleton h-24 rounded-lg"></div>
-            </div>
-          </:loading>
-          <:failed :let={_}>
-            <.panel>
-              <span class="text-sm text-error">Fleet directory unavailable (Postgres).</span>
-            </.panel>
-          </:failed>
-          <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
-            <.stat_tile label="Total shards" value={fmt_int(fleet.total_shards)} />
-            <.stat_tile label="Active" value={fmt_int(fleet.by_status["active"] || 0)} />
-            <.stat_tile
-              label="Nodes live"
-              value={fmt_int(Enum.count(fleet.nodes, & &1.alive))}
-              unit={"/ #{length(fleet.nodes)}"}
-            />
-            <.stat_tile
-              label="Fleet HEAD"
-              value={if(fleet.head_version, do: "v#{fleet.head_version}", else: "—")}
-              unit={"#{fmt_int(fleet.laggards)} behind"}
-            />
-          </div>
-        </.async_result>
+        <div :if={@fleet == nil} class="grid grid-cols-2 gap-4 lg:grid-cols-4">
+          <div :for={_ <- 1..4} class="skeleton h-24 rounded-lg"></div>
+        </div>
+        <div :if={@fleet} class="grid grid-cols-2 gap-4 lg:grid-cols-4">
+          <.stat_tile label="Total shards" value={fmt_int(@fleet.total_shards)} />
+          <.stat_tile label="Active" value={fmt_int(@fleet.by_status["active"] || 0)} />
+          <.stat_tile
+            label="Nodes live"
+            value={fmt_int(Enum.count(@fleet.nodes, & &1.alive))}
+            unit={"/ #{length(@fleet.nodes)}"}
+          />
+          <.stat_tile
+            label="Fleet HEAD"
+            value={if(@fleet.head_version, do: "v#{@fleet.head_version}", else: "—")}
+            unit={"#{fmt_int(@fleet.laggards)} behind"}
+          />
+        </div>
 
         <%!-- This-node KPI row (realtime) --%>
         <div class="grid grid-cols-2 gap-4 md:grid-cols-3 lg:grid-cols-6">
@@ -193,67 +207,62 @@ defmodule FathomWeb.AdminOverviewLive do
         </div>
 
         <%!-- Nodes + migrations (fleet) --%>
-        <.async_result :let={fleet} assign={@fleet}>
-          <:loading>
-            <div class="skeleton h-40 rounded-lg"></div>
-          </:loading>
-          <:failed :let={_}></:failed>
-          <div class="grid grid-cols-1 gap-6 lg:grid-cols-2">
-            <.panel title="Nodes">
-              <table class="w-full text-sm">
-                <thead class="text-[11px] uppercase tracking-wide text-base-content/50">
-                  <tr class="border-b border-base-300">
-                    <th class="py-2 text-left font-medium">Node</th>
-                    <th class="py-2 text-right font-medium">q/s</th>
-                    <th class="py-2 text-right font-medium">p99</th>
-                    <th class="py-2 text-right font-medium">Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={n <- fleet.nodes} class="border-b border-base-300/50">
-                    <td class="num py-1.5 text-left">{n.node_key}</td>
-                    <td class="num py-1.5 text-right">
-                      {fmt_rate(Map.get(fleet.node_load, n.node_key, 0))}
-                    </td>
-                    <td class="num py-1.5 text-right text-base-content/60">{fmt_rate(n.q_p99)}</td>
-                    <td class="py-1.5 text-right">
-                      <.badge kind={if(n.alive, do: :ok, else: :error)}>
-                        {if(n.alive, do: "alive", else: "stale")}
-                      </.badge>
-                    </td>
-                  </tr>
-                  <tr :if={fleet.nodes == []}>
-                    <td colspan="4" class="py-6 text-center text-sm text-base-content/40">
-                      No nodes reporting (enable the load reporter).
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </.panel>
+        <div :if={@fleet == nil} class="skeleton h-40 rounded-lg"></div>
+        <div :if={@fleet} class="grid grid-cols-1 gap-6 lg:grid-cols-2">
+          <.panel title="Nodes">
+            <table class="w-full text-sm">
+              <thead class="text-[11px] uppercase tracking-wide text-base-content/50">
+                <tr class="border-b border-base-300">
+                  <th class="py-2 text-left font-medium">Node</th>
+                  <th class="py-2 text-right font-medium">q/s</th>
+                  <th class="py-2 text-right font-medium">p99</th>
+                  <th class="py-2 text-right font-medium">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr :for={n <- @fleet.nodes} class="border-b border-base-300/50">
+                  <td class="num py-1.5 text-left">{n.node_key}</td>
+                  <td class="num py-1.5 text-right">
+                    {fmt_rate(Map.get(@fleet.node_load, n.node_key, 0))}
+                  </td>
+                  <td class="num py-1.5 text-right text-base-content/60">{fmt_rate(n.q_p99)}</td>
+                  <td class="py-1.5 text-right">
+                    <.badge kind={if(n.alive, do: :ok, else: :error)}>
+                      {if(n.alive, do: "alive", else: "stale")}
+                    </.badge>
+                  </td>
+                </tr>
+                <tr :if={@fleet.nodes == []}>
+                  <td colspan="4" class="py-6 text-center text-sm text-base-content/40">
+                    No nodes reporting (enable the load reporter).
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </.panel>
 
-            <.panel title="Migrations">
-              <div class="grid grid-cols-3 gap-4">
-                <.stat_row
-                  label="HEAD"
-                  value={if(fleet.head_version, do: "v#{fleet.head_version}", else: "—")}
-                />
-                <.stat_row label="Laggards" value={fmt_int(fleet.laggards)} />
-                <.stat_row label="Quarantined" value={fmt_int(fleet.failed)} />
+          <.panel title="Migrations">
+            <div class="grid grid-cols-3 gap-4">
+              <.stat_row
+                label="HEAD"
+                value={if(@fleet.head_version, do: "v#{@fleet.head_version}", else: "—")}
+              />
+              <.stat_row label="Laggards" value={fmt_int(@fleet.laggards)} />
+              <.stat_row label="Quarantined" value={fmt_int(@fleet.failed)} />
+            </div>
+            <div class="mt-4 border-t border-base-300 pt-3">
+              <div class="mb-2 text-[11px] uppercase tracking-wide text-base-content/50">
+                Background jobs
               </div>
-              <div class="mt-4 border-t border-base-300 pt-3">
-                <div class="mb-2 text-[11px] uppercase tracking-wide text-base-content/50">
-                  Background jobs
-                </div>
-                <div :if={fleet.oban == []} class="text-sm text-base-content/40">No jobs.</div>
-                <div class="flex flex-wrap gap-2">
-                  <.badge :for={j <- fleet.oban} kind={oban_kind(j.state)}>
-                    {j.queue}/{j.state} {j.count}
-                  </.badge>
-                </div>
+              <div :if={@fleet.oban == []} class="text-sm text-base-content/40">No jobs.</div>
+              <div class="flex flex-wrap gap-2">
+                <.badge :for={j <- @fleet.oban} kind={oban_kind(j.state)}>
+                  {j.queue}/{j.state} {j.count}
+                </.badge>
               </div>
-            </.panel>
-          </div>
-        </.async_result>
+            </div>
+          </.panel>
+        </div>
       </div>
     </Layouts.admin>
     """
