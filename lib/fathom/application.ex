@@ -218,6 +218,7 @@ defmodule Fathom.Application do
       # Before the shard supervisor so the table is up before any coordinator publishes/forgets.
       Fathom.Admin.FlushWatermark
     ] ++
+      temp_reaper_children() ++
       heartbeat_children() ++
       [
         # Shard processes: a Registry for find-by-id and a DynamicSupervisor that owns one
@@ -298,6 +299,16 @@ defmodule Fathom.Application do
   def config_change(changed, _new, removed) do
     FathomWeb.Endpoint.config_change(changed, removed)
     :ok
+  end
+
+  # The amortized orphan-temp janitor (expert review 2026-07-14 #2): one directory
+  # scan every few minutes for the uniquely-suffixed `.dl/.snap/.tmp` temps a cold
+  # open must NOT scan for per-open. Gated `:temp_reaper` (default on; off in test,
+  # where it does periodic disk I/O and tests drive Fathom.Shard.TempReaper.sweep/0).
+  defp temp_reaper_children do
+    if Application.get_env(:fathom, :temp_reaper, true),
+      do: [Fathom.Shard.TempReaper],
+      else: []
   end
 
   # The per-node liveness heartbeat (the F1 fix — one PUT/node replaces per-shard

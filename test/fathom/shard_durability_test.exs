@@ -1033,33 +1033,49 @@ defmodule Fathom.ShardDurabilityTest do
     Connection.close(ro)
   end
 
-  # Expert review round-2 #27: externally-killed pulls/snapshots (Task.shutdown
-  # brutal_kill, pull timeouts, the follower's :kill_task) strand uniquely-named
-  # `.dl.<n>` / `.snap.<n>` temps that no fixed-suffix sweeper matches — an
-  # unbounded, shard-sized disk leak. The invariant: a coordinator open reaps its
-  # shard's STALE temps (age-gated past the pull timeout) while leaving fresh
-  # sibling work and real sidecars untouched.
-  test "a coordinator open reaps its shard's stale orphaned temps", %{shard: shard} do
+  # Expert review 2026-07-14 #2: the per-open temp reap used to `Path.wildcard`
+  # `<base>.{dl,snap,tmp,pull}*`, which can't prefix-optimize a `*`-in-filename pattern
+  # and so full-`readdir`d the fleet-sized shard data dir on EVERY open (tens-to-hundreds
+  # of ms at 30k–105k shards). A cold open now clears only its shard's DETERMINISTIC
+  # `.pull` family by direct name (O(1)) — which is ALSO the collision guard, since a
+  # stale `.pull` would be adopted by promote_pull/2 as the shard's db. The
+  # uniquely-suffixed `.dl.*`/`.snap.*` orphans (expert review round-2 #27) are the
+  # amortized Fathom.Shard.TempReaper's job, NOT the open's — so they must SURVIVE the
+  # open, which is exactly how this pins that the open no longer scans the directory.
+  test "a coordinator open reaps its shard's stale pull temps by direct name, not a dir scan",
+       %{shard: shard} do
     path = local_db(shard)
     File.mkdir_p!(Path.dirname(path))
 
+    stale_pull = path <> ".pull"
+    stale_pull_wal = path <> ".pull-wal"
     stale_dl = path <> ".dl.99"
     stale_snap = path <> ".snap.7"
-    fresh_dl = path <> ".dl.100"
 
-    File.write!(stale_dl, "orphaned partial download")
-    File.write!(stale_snap, "orphaned snapshot")
-    File.write!(fresh_dl, "a concurrent pull's live temp")
-    # The orphans predate any plausible in-flight work.
-    for f <- [stale_dl, stale_snap], do: File.touch!(f, {{2020, 1, 1}, {0, 0, 0}})
+    for f <- [stale_pull, stale_pull_wal, stale_dl, stale_snap],
+        do: File.write!(f, "orphaned temp")
 
-    on_exit(fn -> Enum.each([stale_dl, stale_snap, fresh_dl], &File.rm/1) end)
+    # All predate any plausible in-flight work (age-gated reap).
+    for f <- [stale_pull, stale_pull_wal, stale_dl, stale_snap],
+        do: File.touch!(f, {{2020, 1, 1}, {0, 0, 0}})
+
+    on_exit(fn -> Enum.each([stale_pull, stale_pull_wal, stale_dl, stale_snap], &File.rm/1) end)
 
     {:ok, conn} = ShardExecutor.open(shard)
 
-    refute File.exists?(stale_dl), "a stale orphaned download temp must be reaped at open"
-    refute File.exists?(stale_snap), "a stale orphaned snapshot temp must be reaped at open"
-    assert File.exists?(fresh_dl), "the age gate must protect fresh sibling work"
+    refute File.exists?(stale_pull),
+           "a stale orphaned .pull temp must be reaped at open (direct name + collision guard)"
+
+    refute File.exists?(stale_pull_wal), "the .pull-wal companion must be reaped too"
+
+    # The load-bearing pin: the open must NOT enumerate the directory to find these —
+    # they are swept off the hot path by Fathom.Shard.TempReaper. This assertion FAILS
+    # against the old glob-based per-open reap and PASSES against the O(1) direct-name reap.
+    assert File.exists?(stale_dl),
+           "a cold open must NOT dir-scan for uniquely-suffixed temps (that is TempReaper's job)"
+
+    assert File.exists?(stale_snap),
+           "same — .snap orphans are swept off the hot path, not at open"
 
     ShardExecutor.close(conn)
   end

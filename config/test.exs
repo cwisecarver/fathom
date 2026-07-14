@@ -35,6 +35,10 @@ config :fathom, :default_shard, "demo"
 # heartbeat tests start it themselves with a short TTL.
 config :fathom, heartbeat_server: false
 
+# Don't run the background orphan-temp reaper in tests (it does periodic disk I/O
+# over the shared shard data dir); the reaper test starts it / drives sweep/0 itself.
+config :fathom, temp_reaper: false
+
 # Skip the checkout -> OpenTelemetry span bridge in tests (telemetry events + metrics still fire).
 config :fathom, otel_spans: false
 

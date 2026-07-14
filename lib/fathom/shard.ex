@@ -206,18 +206,32 @@ defmodule Fathom.Shard do
     path = db_path(shard_id)
     File.mkdir_p!(Path.dirname(path))
 
-    # Reap THIS shard's orphaned temps from externally-killed pulls/snapshots
-    # (expert review round-2 #27) — uniquely-named `.dl.*`/`.snap.*` files no
-    # fixed-suffix sweeper matches, an unbounded disk leak. Age-gated well past the
-    # pull timeout so a concurrent task's live temp is never touched; a previous
-    # coordinator for this shard is necessarily dead (registry-unique), so its
-    # stale temps are provably garbage.
-    reaped = Storage.reap_stale_temps(path, 2 * @pull_timeout)
-    if reaped > 0, do: Logger.info("shard #{shard_id}: reaped #{reaped} orphaned temp(s)")
-    # The wildcard's readdir garbage (O(data-dir entries) of binaries) would
-    # otherwise sit on this LONG-LIVED coordinator's heap until its next natural
-    # GC — measured as +68% fanout_kb_per_shard at 1000 open shards. Collect it
-    # now, while the heap holds nothing else worth keeping.
+    # Clear THIS shard's DETERMINISTIC orphaned pull temps by direct name — O(1), no
+    # directory scan (expert review 2026-07-14 #2). The old `Storage.reap_stale_temps/2`
+    # here globbed `<base>.{dl,snap,tmp,pull}*`, and `Path.wildcard` can't prefix-optimize
+    # a `*`-in-filename pattern, so it full-`readdir`d the fleet-sized shard data dir on
+    # EVERY open — tens-to-hundreds of ms at 30k–105k shards, re-paid on every idle
+    # re-open. A stale `.pull` would otherwise be adopted by promote_pull/2 as this
+    # shard's db, so this direct-name reap is ALSO the pull's collision guard. The
+    # uniquely-suffixed orphans (`.dl.*`/`.snap.*`/`.tmp.*` from externally-killed
+    # pulls/snapshots — expert review round-2 #27) are swept amortized by
+    # `Fathom.Shard.TempReaper`, off this hot path. Age-gated well past the pull timeout
+    # so a concurrent task's live temp is never touched; a previous coordinator for this
+    # shard is necessarily dead (registry-unique), so its stale `.pull*` are provably garbage.
+    reaped =
+      Storage.reap_named_temps(
+        [path <> ".pull", path <> ".pull-wal", path <> ".pull-shm"],
+        2 * @pull_timeout
+      )
+
+    if reaped > 0, do: Logger.info("shard #{shard_id}: reaped #{reaped} orphaned pull temp(s)")
+    # Force a full-sweep GC on this LONG-LIVED coordinator after the memory-heavy init
+    # (GenServer setup + lease acquire + pull). :erlang.garbage_collect/0 also SHRINKS the
+    # heap back from its init high-water mark, which would otherwise sit resident until the
+    # next natural GC — measured as +53% fanout_kb_per_shard (16.99 → 26.06 KiB/shard) when
+    # dropped. (It formerly also collected the per-open wildcard-readdir garbage, now removed
+    # in favor of Storage.reap_named_temps/2 above — but the heap-shrink is the load-bearing
+    # part at density, independent of that.)
     :erlang.garbage_collect()
     # node()#<boot nonce> — boot-scoped lease identity (expert review #6): a lock
     # left by a previous incarnation of this node name is a FOREIGN owner, so it is
@@ -1472,7 +1486,10 @@ defmodule Fathom.Shard do
   @doc false
   def db_path(id), do: Path.join(data_dir(), "#{id}.db")
 
-  defp data_dir do
+  # Public (@doc false) so Fathom.Shard.TempReaper sweeps the same directory this
+  # coordinator writes its temps into, without duplicating the config/default.
+  @doc false
+  def data_dir do
     Application.get_env(
       :fathom,
       :shard_data_dir,

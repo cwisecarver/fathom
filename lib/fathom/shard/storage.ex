@@ -452,6 +452,34 @@ defmodule Fathom.Shard.Storage do
     end
   end
 
+  @doc """
+  Reap a KNOWN, fixed set of sibling temp `paths` older than `older_than_ms` by a
+  direct `File.stat`/`File.rm` on each — **no directory scan**. The O(1) counterpart
+  to `reap_stale_temps/2` for the DETERMINISTIC temp names (the coordinator's `.pull`
+  family) a cold open must clear off its hot path (expert review 2026-07-14 #2).
+
+  `reap_stale_temps/2`'s `Path.wildcard` cannot prefix-optimize a pattern whose
+  filename component holds a `*`, so it full-`readdir`s the (fleet-sized) shard data
+  dir on EVERY open — tens-to-hundreds of ms at 30k–105k shards. The uniquely-suffixed
+  orphans (`.dl.*` / `.snap.*` / `.tmp.*`) still need that scan, but it now runs
+  amortized in `Fathom.Shard.TempReaper`, not per open. Same age-gate semantics: a path
+  younger than the cutoff (possibly a live sibling's fresh temp) is left alone. Returns
+  the number reaped.
+  """
+  @spec reap_named_temps([Path.t()], non_neg_integer()) :: non_neg_integer()
+  def reap_named_temps(paths, older_than_ms) do
+    cutoff = System.system_time(:second) - div(older_than_ms, 1000)
+
+    Enum.reduce(paths, 0, fn path, acc ->
+      with true <- stale_file?(path, cutoff),
+           :ok <- File.rm(path) do
+        acc + 1
+      else
+        _ -> acc
+      end
+    end)
+  end
+
   defp stale_file?(path, cutoff) do
     case File.stat(path, time: :posix) do
       {:ok, %File.Stat{mtime: mtime}} -> mtime < cutoff

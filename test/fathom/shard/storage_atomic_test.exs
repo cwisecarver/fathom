@@ -40,6 +40,38 @@ defmodule Fathom.Shard.StorageAtomicTest do
     for f <- keep, do: assert(File.exists?(f), "#{f} must survive the reap")
   end
 
+  # Expert review 2026-07-14 #2: the O(1) direct-name reaper the cold-open hot path
+  # uses instead of the dir-scanning glob (Path.wildcard can't prefix-optimize a
+  # `*`-in-filename pattern, so `reap_stale_temps/2` full-readdir'd the fleet-sized
+  # shard data dir on EVERY open). Only the NAMED, stale paths go; a named-but-fresh
+  # path (the age gate) and any un-named sibling stay — the latter proving no dir scan.
+  test "reap_named_temps removes only the named stale paths, never scanning the dir", %{dir: dir} do
+    base = Path.join(dir, "shard.db")
+    old = {{2020, 1, 1}, {0, 0, 0}}
+
+    stale_pull = base <> ".pull"
+    stale_wal = base <> ".pull-wal"
+    fresh_shm = base <> ".pull-shm"
+    # Present but NOT named in the reap call — must survive (proves no dir scan).
+    unnamed = base <> ".dl.1"
+
+    for f <- [stale_pull, stale_wal, fresh_shm, unnamed], do: File.write!(f, "x")
+    # Age the named-stale ones and the un-named sibling; keep fresh_shm's fresh mtime.
+    for f <- [stale_pull, stale_wal, unnamed], do: File.touch!(f, old)
+
+    # Two of the four named paths are stale-and-present; the fresh one is age-protected
+    # and the `.pull-missing` one is absent — both skipped.
+    assert Storage.reap_named_temps(
+             [stale_pull, stale_wal, fresh_shm, base <> ".pull-missing"],
+             60_000
+           ) == 2
+
+    refute File.exists?(stale_pull), "a named, stale temp must be reaped"
+    refute File.exists?(stale_wal), "a named, stale companion must be reaped"
+    assert File.exists?(fresh_shm), "a named but FRESH temp is protected by the age gate"
+    assert File.exists?(unnamed), "an UN-named sibling is never touched (no dir scan)"
+  end
+
   test "atomic_write writes the whole body and leaves no temp residue", %{dir: dir} do
     dst = Path.join(dir, "obj.db")
     assert :ok = Storage.atomic_write(dst, "hello-world")
