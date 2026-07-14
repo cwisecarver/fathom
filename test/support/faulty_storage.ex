@@ -57,6 +57,16 @@ defmodule Fathom.Test.FaultyStorage do
     end
   end
 
+  # Optional artificial flush latency (ms) so a test can make a coordinator's terminate
+  # flush-to-storage slow — the "slow/hung S3" the admission-path eviction budget guards
+  # against (expert review 2026-07-14 #7).
+  defp flush_delay do
+    case Application.get_env(:fathom, :storage_flush_delay_ms) do
+      ms when is_integer(ms) and ms > 0 -> Process.sleep(ms)
+      _ -> :ok
+    end
+  end
+
   @impl true
   def pull_if_changed(shard_id, local_path, etag) do
     delay()
@@ -82,6 +92,8 @@ defmodule Fathom.Test.FaultyStorage do
 
   @impl true
   def flush(shard_id, local_path) do
+    flush_delay()
+
     if fault() == :flush,
       do: {:error, :s3_unreachable},
       else: Local.flush(shard_id, local_path)
@@ -92,6 +104,7 @@ defmodule Fathom.Test.FaultyStorage do
     # run_before(:flush) lets a test steal the shard (overwrite the object) in the window
     # between the coordinator's fence check and this write, exercising the fenced flush (#15).
     run_before(:flush)
+    flush_delay()
 
     if fault() == :flush,
       do: {:error, :s3_unreachable},

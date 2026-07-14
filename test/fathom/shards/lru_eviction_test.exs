@@ -11,8 +11,10 @@ defmodule Fathom.Shards.LruEvictionTest do
   # in the Registry but not this test's reset Lru, so it's never the one evicted).
   use ExUnit.Case, async: false
 
-  alias Fathom.Shards
+  alias Fathom.{ShardExecutor, Shards}
   alias Fathom.Shards.Lru
+  alias Fathom.Test.FaultyStorage
+  alias Filo.Stmt
 
   @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
   @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
@@ -122,5 +124,85 @@ defmodule Fathom.Shards.LruEvictionTest do
       assert Lru.lru_order(10) == []
       refute Lru.enabled?()
     end
+  end
+
+  # Expert review 2026-07-14 #7 (Reliability): at capacity, admission runs in the checkout
+  # (Filo stream) process and probed up to @max_evict_probes (16) LRU candidates, calling
+  # drain(id, 0) on each — a BLOCKING receive whose only bound was drain_timeout + 30_000.
+  # An evicted coordinator's terminate runs a synchronous flush-to-S3 with no supervisor
+  # timeout, so under slow/hung S3 a single new-tenant checkout could block 16 × 30s ≈ 8 min
+  # before finally 503ing — coupling new-tenant admission latency to OTHER tenants' flush
+  # latency. The fix bounds the admission-path WAIT (`:evict_budget_ms`), NOT the flush: the
+  # evicted coordinator still flushes/drops/releases in full in the background; admission
+  # just stops blocking on it and 503s fast (the LB retries).
+  describe "eviction is bounded by :evict_budget_ms under a slow-flushing evictable shard" do
+    setup do
+      prev_storage = Application.get_env(:fathom, :shard_storage)
+      prev_delay = Application.get_env(:fathom, :storage_flush_delay_ms)
+      prev_budget = Application.get_env(:fathom, :evict_budget_ms)
+      Application.put_env(:fathom, :shard_storage, FaultyStorage)
+
+      on_exit(fn ->
+        restore(:shard_storage, prev_storage)
+        restore(:storage_flush_delay_ms, prev_delay)
+        restore(:evict_budget_ms, prev_budget)
+      end)
+
+      :ok
+    end
+
+    test "admission 503s within the budget instead of blocking on the slow flush" do
+      # The evictable idle shard's terminate flush takes 3s (a slow/hung S3); the admission
+      # budget is 400ms. Pre-fix the checkout blocked ~3s (the full flush) — up to 16 × 30s
+      # in the worst case; post-fix it must refuse within a few × the 400ms budget.
+      Application.put_env(:fathom, :storage_flush_delay_ms, 3_000)
+      Application.put_env(:fathom, :evict_budget_ms, 400)
+
+      dirty = open_idle_dirty(uniq())
+      ref = Process.monitor(dirty)
+      Application.put_env(:fathom, :max_open_shards, 1)
+
+      t0 = System.monotonic_time(:millisecond)
+      result = Shards.checkout(uniq())
+      elapsed = System.monotonic_time(:millisecond) - t0
+
+      # No slot could be freed within the budget (the flush is still running), so admission
+      # refuses cleanly — the LB backs off and retries.
+      assert result == {:error, :node_at_capacity}
+
+      # The load-bearing assertion: it returned FAST, not after the ~6s flush (and nowhere
+      # near the pre-fix 30s-per-probe safety net).
+      assert elapsed < 2_000,
+             "admission blocked #{elapsed}ms on another tenant's slow flush (budget was 400ms)"
+
+      # The eviction still completes in the background: the coordinator flushed + dropped +
+      # released and stopped — durability/lease semantics untouched, just not blocked on.
+      assert_receive {:DOWN, ^ref, :process, ^dirty, _}, 8_000
+    end
+
+    test "with a fast flush under the budget, eviction still evicts and admits" do
+      # Same path, but the flush is fast (no injected delay): the budget must not break the
+      # happy path — the idle shard is evicted and the new tenant is admitted.
+      Application.put_env(:fathom, :evict_budget_ms, 2_000)
+
+      dirty = open_idle_dirty(uniq())
+      ref = Process.monitor(dirty)
+      Application.put_env(:fathom, :max_open_shards, 1)
+
+      assert {:ok, _pid, _r, _p} = Shards.checkout(uniq())
+      assert_receive {:DOWN, ^ref, :process, ^dirty, _}, 5_000
+    end
+  end
+
+  # Open a shard, WRITE to it (so it's dirty and its idle drop must flush), release the
+  # connection, and confirm it's idle (0 conns). Returns the coordinator pid. Touched into
+  # the Lru table at checkout (ShardExecutor.open → Shards.checkout).
+  defp open_idle_dirty(id) do
+    {:ok, conn} = ShardExecutor.open(id)
+    {:ok, _} = ShardExecutor.execute(conn, %Stmt{sql: "CREATE TABLE t (x)", args: []})
+    :ok = ShardExecutor.close(conn)
+    [{pid, _}] = Registry.lookup(Fathom.ShardRegistry, id)
+    _ = :sys.get_state(pid)
+    pid
   end
 end

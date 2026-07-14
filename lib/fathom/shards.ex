@@ -11,6 +11,19 @@ defmodule Fathom.Shards do
 
   @default_drain_ms 5_000
 
+  # drain/2's safety-net bound: how long a caller waits for the coordinator to EXIT after
+  # the drain window before giving up (it normally replies via DOWN/:drain_aborted well
+  # before this). The eviction path uses a much shorter budget instead — see evict/2.
+  @default_exit_grace_ms 30_000
+
+  # Total time the at-capacity admission path will spend WAITING for eviction to free a
+  # slot before refusing (expert review 2026-07-14 #7). Bounds a new-tenant checkout's
+  # coupling to OTHER tenants' flush-to-S3 latency: an evicted coordinator still runs its
+  # full checkpoint + flush + drop + release in terminate (durability/lease unchanged) —
+  # we just stop BLOCKING the checkout (Filo stream) process on it, so under slow/hung S3
+  # admission 503s fast and the LB retries (the eviction completes in the background).
+  @default_evict_budget_ms 2_000
+
   @doc """
   Ensures `shard_id`'s coordinator is running and checks out the shard for the
   caller, returning `{:ok, coordinator_pid, ref, path}` (or `{:error, reason}` for
@@ -161,22 +174,38 @@ defmodule Fathom.Shards do
         ref = Process.monitor(pid)
         Fathom.Shard.request_drain(pid, drain_timeout, self())
 
-        receive do
-          {:DOWN, ^ref, :process, ^pid, reason} ->
-            flush_drain_aborted(pid)
-            drain_down_result(reason)
-
-          {:drain_aborted, ^pid} ->
-            Process.demonitor(ref, [:flush])
-            {:error, :busy}
-        after
-          # Safety net only: the coordinator normally replies via DOWN or
-          # :drain_aborted well before this.
-          drain_timeout + 30_000 ->
-            Process.demonitor(ref, [:flush])
-            flush_drain_aborted(pid)
-            {:error, :busy}
+        # Preserve drain/2's public contract for its migration/admin callers: the
+        # safety-net timeout still reads as :busy (the coordinator normally replies via
+        # DOWN or :drain_aborted well before this). Only the eviction path (evict/2) uses
+        # a shorter budget and keeps the :exit_timeout as "couldn't confirm this exited".
+        case await_coordinator_exit(pid, ref, drain_timeout + @default_exit_grace_ms) do
+          {:error, :exit_timeout} -> {:error, :busy}
+          other -> other
         end
+    end
+  end
+
+  # Wait up to `exit_wait_ms` for the coordinator to exit after a drain request, cleaning
+  # the monitor and mailbox the SAME way on every branch (expert review #41): a bounded
+  # wait must never leak the monitor or a stale {:drain_aborted, pid} — a later drain/2 or
+  # evict/2 pins a DIFFERENT coordinator pid, so an unmatched abort would sit in a
+  # long-lived caller's mailbox forever. Returns the drain outcome; the timeout is
+  # {:error, :exit_timeout} so callers can distinguish it from a busy abort (drain/2 maps
+  # it to :busy; evict/2 keeps it — the coordinator is stopping in the background).
+  defp await_coordinator_exit(pid, ref, exit_wait_ms) do
+    receive do
+      {:DOWN, ^ref, :process, ^pid, reason} ->
+        flush_drain_aborted(pid)
+        drain_down_result(reason)
+
+      {:drain_aborted, ^pid} ->
+        Process.demonitor(ref, [:flush])
+        {:error, :busy}
+    after
+      exit_wait_ms ->
+        Process.demonitor(ref, [:flush])
+        flush_drain_aborted(pid)
+        {:error, :exit_timeout}
     end
   end
 
@@ -249,30 +278,81 @@ defmodule Fathom.Shards do
   @max_evict_probes 16
 
   # Evict the least-recently-used *idle* shard to free a slot, returning whether one was
-  # freed. Off when `:evict_idle_at_capacity` is false (hard cap). `drain(id, 0)` is the
-  # atomic evict-if-idle primitive: it stops the coordinator (flush + drop + release lease)
-  # iff it has zero checked-out connections, else returns `{:error, :busy}` untouched.
-  # Walks LRU-first, so the first probe — the coldest shard — is almost always idle and
-  # evicts in one call; a dirty idle shard pays one flush, a clean one skips the upload.
+  # freed. Off when `:evict_idle_at_capacity` is false (hard cap). `evict/2` is the atomic
+  # evict-if-idle primitive: it stops the coordinator (flush + drop + release lease) iff it
+  # has zero checked-out connections, else returns `{:error, :busy}` untouched. Walks
+  # LRU-first, so the first probe — the coldest shard — is almost always idle and evicts in
+  # one call; a dirty idle shard pays one flush, a clean one skips the upload.
+  #
+  # Time-bounded by `:evict_budget_ms` (expert review 2026-07-14 #7): probing stops once
+  # the total wait would exceed the budget, and each probe's wait for the coordinator to
+  # exit is capped at the REMAINING budget — so a slow/hung S3 flush in an evicted
+  # coordinator's terminate can't block the checkout stream for tens of seconds (up to
+  # 16 × 30 s across probes). Over budget we refuse fast; the LB retries.
   defp evicted_for_room? do
     if Fathom.Shards.Lru.enabled?() do
+      deadline = System.monotonic_time(:millisecond) + evict_budget_ms()
+
       Fathom.Shards.Lru.lru_order(@max_evict_probes)
       |> Enum.filter(&shard_open?/1)
       |> Enum.reduce_while(false, fn shard_id, _ ->
-        case drain(shard_id, 0) do
-          :ok ->
-            :telemetry.execute([:fathom, :shards, :evicted], %{count: 1}, %{shard_id: shard_id})
-            {:halt, true}
+        remaining = deadline - System.monotonic_time(:millisecond)
 
-          # Busy (connections checked out) or a drain failure — leave it, try the next.
-          _ ->
-            {:cont, false}
+        cond do
+          # Budget spent: stop probing and refuse fast (503) rather than block the checkout
+          # stream on another tenant's slow flush. Any coordinator we already told to drain
+          # frees its slot in the background; the LB's retry finds the room.
+          remaining <= 0 ->
+            {:halt, false}
+
+          true ->
+            case evict(shard_id, remaining) do
+              :ok ->
+                :telemetry.execute([:fathom, :shards, :evicted], %{count: 1}, %{
+                  shard_id: shard_id
+                })
+
+                {:halt, true}
+
+              # Accepted the drain but its terminate (S3 flush) didn't finish within the
+              # remaining budget: it's stopping in the background, so stop probing and 503
+              # fast — the freed slot shows up on the next admission attempt.
+              {:error, :exit_timeout} ->
+                {:halt, false}
+
+              # Busy (connections checked out) or a drain failure — leave it, try the next.
+              _ ->
+                {:cont, false}
+            end
         end
       end)
     else
       false
     end
   end
+
+  # Bounded-wait eviction primitive, used ONLY by the at-capacity admission path. Like
+  # `drain(id, 0)` — the atomic evict-if-idle — but it waits at most `budget_ms` (the
+  # remaining admission budget) for the coordinator to exit rather than drain/2's 30 s
+  # safety net (expert review 2026-07-14 #7). On :exit_timeout the coordinator has already
+  # accepted the drain and is stopping in the background — its terminate still runs the
+  # full checkpoint + flush + drop + release (durability/lease untouched); admission just
+  # stops waiting. Monitor/mailbox cleanup is shared with drain/2 via await_coordinator_exit
+  # (expert review #41), so a bounded wait never leaks a monitor or a stale abort.
+  defp evict(shard_id, budget_ms) do
+    case Registry.lookup(@registry, shard_id) do
+      [] ->
+        :ok
+
+      [{pid, _}] ->
+        ref = Process.monitor(pid)
+        Fathom.Shard.request_drain(pid, 0, self())
+        await_coordinator_exit(pid, ref, budget_ms)
+    end
+  end
+
+  defp evict_budget_ms,
+    do: Application.get_env(:fathom, :evict_budget_ms, @default_evict_budget_ms)
 
   # Is this shard currently open on this node? Filters stale Lru rows (a coordinator that
   # already stopped without its `forget` having landed) so we don't count a no-op
