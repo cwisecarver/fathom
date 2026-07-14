@@ -23,6 +23,17 @@ end
 config :fathom, FathomWeb.Endpoint,
   http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 
+# Optional web-endpoint bind IP (any env) — WEB_BIND_IP=0.0.0.0 to reach the dashboard from the LAN.
+# Unset ⇒ the per-env default (dev binds loopback). NB: on 0.0.0.0 the /admin dashboard is reachable
+# on every interface with the configured BasicAuth creds (dev default admin/admin — set
+# ADMIN_USER/ADMIN_PASS before exposing it). The prod block below sets its own bind.
+if bind = System.get_env("WEB_BIND_IP") do
+  case :inet.parse_address(String.to_charlist(bind)) do
+    {:ok, ip} -> config :fathom, FathomWeb.Endpoint, http: [ip: ip]
+    {:error, _} -> raise "WEB_BIND_IP is not a valid IP address: #{inspect(bind)}"
+  end
+end
+
 # OpenTelemetry OTLP trace export — enabled only when an endpoint is set, so it stays a no-op
 # in dev/test/CI and in any deploy without a collector (config/config.exs defaults to :none).
 # The exporter also honors the standard OTEL_EXPORTER_OTLP_* env vars (headers, protocol).
