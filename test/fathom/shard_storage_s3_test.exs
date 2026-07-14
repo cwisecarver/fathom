@@ -194,6 +194,36 @@ defmodule Fathom.ShardStorageS3Test do
     assert File.read!(dst) == "v1"
   end
 
+  # Expert review 2026-07-14 #4: the revert's restore must be If-Match-fenced on the live etag
+  # (mirroring the forward flush/3) so a steal landing between the migrator's fence and the
+  # copy-back is caught instead of clobbering the new owner's live object.
+  test "restore/3 is If-Match-fenced: a stale etag is superseded, the live etag restores",
+       %{shard: shard} do
+    v1 = tmp_path("#{shard}-v1")
+    File.write!(v1, "v1")
+    assert :ok = S3.flush(shard, v1)
+    assert :ok = S3.retain(shard, 1)
+
+    v2 = tmp_path("#{shard}-v2")
+    File.write!(v2, "v2")
+    assert :ok = S3.flush(shard, v2)
+
+    # A stale etag (the pre-steal snapshot) no longer matches live → superseded, no clobber.
+    assert {:error, :superseded} = S3.restore(shard, 1, ~s("stale-etag"))
+
+    still = tmp_path("#{shard}-still-v2")
+    assert :ok = S3.pull(shard, still)
+    assert File.read!(still) == "v2"
+
+    # The live object's current etag restores v1 over live.
+    {:ok, live_etag} = S3.object_etag(shard)
+    assert :ok = S3.restore(shard, 1, live_etag)
+
+    back = tmp_path("#{shard}-back-to-v1")
+    assert :ok = S3.pull(shard, back)
+    assert File.read!(back) == "v1"
+  end
+
   test "drop_version removes the versioned object (idempotent)", %{shard: shard} do
     src = tmp_path("#{shard}-d")
     File.write!(src, "v1")

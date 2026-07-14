@@ -156,6 +156,21 @@ defmodule Fathom.Shard.Storage do
               :ok | {:error, term()}
   @callback restore(shard_id :: String.t(), version :: non_neg_integer()) ::
               :ok | {:error, term()}
+
+  # Fenced restore (expert review 2026-07-14 #4): copy the shard's `version` object back over
+  # live only if the live object still matches `expected_etag` (`If-Match`) — the revert
+  # counterpart of the fenced `flush/3`. A revert's read-only `check_lease` fence proves the lock
+  # is ours only at THAT instant; the migrator can then stall while a coordinator steals + flushes
+  # new bytes, so an UNCONDITIONAL restore would clobber those acknowledged writes with the
+  # reverted lineage (and the stealer's next flush would 412 and self-fence away its own writes,
+  # since `check_lease` still sees our lock — the restore touched the DATA object, not the lock).
+  # A 412 / etag mismatch is `{:error, :superseded}` — the caller aborts and does NOT clobber.
+  @callback restore(
+              shard_id :: String.t(),
+              version :: non_neg_integer(),
+              expected_etag :: String.t() | nil
+            ) :: :ok | {:error, :superseded} | {:error, term()}
+
   @callback drop_version(shard_id :: String.t(), version :: non_neg_integer()) ::
               :ok | {:error, term()}
 
@@ -267,6 +282,17 @@ defmodule Fathom.Shard.Storage do
   @doc "Copies the shard's `version` object back to live (the revert step)."
   @spec restore(String.t(), non_neg_integer()) :: :ok | {:error, term()}
   def restore(shard_id, version), do: backend().restore(shard_id, version)
+
+  @doc """
+  Fenced restore: copies the shard's `version` object back over live only if the live object
+  still matches `expected_etag` (`If-Match`). `{:error, :superseded}` on a mismatch — a steal
+  changed the live object since the revert's fence, so the caller aborts instead of clobbering.
+  See the callback docs.
+  """
+  @spec restore(String.t(), non_neg_integer(), String.t() | nil) ::
+          :ok | {:error, :superseded} | {:error, term()}
+  def restore(shard_id, version, expected_etag),
+    do: backend().restore(shard_id, version, expected_etag)
 
   @doc "Deletes the shard's `version` object (idempotent; retirement)."
   @spec drop_version(String.t(), non_neg_integer()) :: :ok | {:error, term()}

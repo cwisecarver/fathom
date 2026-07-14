@@ -127,6 +127,33 @@ defmodule Fathom.Shard.Storage.Local do
   end
 
   @impl true
+  def restore(shard_id, version, expected_etag) do
+    # Fenced restore (expert review 2026-07-14 #4): mirror flush/3's emulated conditional write
+    # so the revert's copy-back only lands if live still matches the etag the migrator captured
+    # at pull. A steal since the read-only fence moves live's content-hash etag → :superseded, and
+    # the revert aborts instead of clobbering the newer owner's object. Under the per-shard mutex
+    # so the read-compare-write is atomic — the same faithful double of S3's conditional PUT the
+    # flush fence relies on (expert review #28).
+    with_lock_mutex(shard_id, fn ->
+      with {:ok, body} <- File.read(version_path(shard_id, version)) do
+        current =
+          case File.read(remote_path(shard_id)) do
+            {:ok, remote_body} -> content_etag(remote_body)
+            {:error, :enoent} -> nil
+            {:error, reason} -> throw({:error, reason})
+          end
+
+        cond do
+          expected_etag != current -> {:error, :superseded}
+          true -> Storage.atomic_write(remote_path(shard_id), body)
+        end
+      end
+    end)
+  catch
+    {:error, _} = err -> err
+  end
+
+  @impl true
   def drop_version(shard_id, version) do
     case File.rm(version_path(shard_id, version)) do
       :ok -> :ok

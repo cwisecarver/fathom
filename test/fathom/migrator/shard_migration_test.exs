@@ -425,6 +425,47 @@ defmodule Fathom.Migrator.ShardMigrationTest do
            "the migrator must not clobber the new owner's object"
   end
 
+  # Expert review 2026-07-14 #4 (the REVERT counterpart of the forward flush fence above): the
+  # forward flush was made If-Match-fenced but the revert's restore was NOT — do_revert guarded
+  # with a read-only fence/2 (check_lease) then performed an UNCONDITIONAL Storage.restore. A
+  # steal landing between the fence read and the copy-back was not caught: restore clobbered the
+  # stealer's freshly-flushed live object with the reverted lineage, and the stealer's next flush
+  # 412s while check_lease still returns :ok (the restore touched the DATA object, not the lock),
+  # so the stealer concludes "durable" and drops its local copy — discarding acknowledged
+  # post-steal writes. The restore is now If-Match-fenced on the live object's pull-time etag.
+  # Here a new owner overwrites the live object AFTER the migrator's lock-fence passed (and after
+  # the retain backup) but BEFORE the restore copy-back — changing the object etag, not the lock.
+  test "a live-object change after the fence check aborts the revert restore, no clobber",
+       %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, _} = ShardMigration.run(shard, 2)
+
+    prev = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    # A new owner flushes different bytes to the live object during the migrator's restore, after
+    # its lock-fence (and the retain backup) passed — changing the object etag but NOT the lock.
+    overwrite = fn -> File.write!(Path.join(@remote_dir, "#{shard}.db"), "new-owner-bytes") end
+    Application.put_env(:fathom, :faulty_before, {:restore, overwrite})
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if prev,
+        do: Application.put_env(:fathom, :shard_storage, prev),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    # force: true isolates the restore fence from the write-age guard (not under test here).
+    # Pre-fix: the unconditional restore clobbered the object with the reverted v1.
+    assert {:error, :superseded} =
+             ShardMigration.revert(shard, 1, "revert-fence-token", force: true)
+
+    assert File.read!(Path.join(@remote_dir, "#{shard}.db")) == "new-owner-bytes",
+           "the migrator must not clobber the new owner's object on revert"
+  end
+
   # Expert review 2026-07-14 #9: the migrator's lease renewer stopped on ANY non-{:ok,_},
   # conflating a TRANSIENT store blip ({:error, reason}) with real ownership loss
   # ({:error, :superseded}). A single S3 hiccup during a long copy would then silently END

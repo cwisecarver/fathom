@@ -84,9 +84,13 @@ defmodule Fathom.Migrator.ShardMigration do
       tmp = temp_path(shard_id, "revert")
 
       try do
-        # The revert doesn't fence its restore on the etag (deferred with the CopyObject
-        # fencing work — round-2 #4/#8), so it ignores the pulled etag.
-        with {:ok, _etag} <- pull_live(shard_id, tmp) do
+        # Capture the live object's etag at pull time so the destructive restore can If-Match
+        # on it (expert review 2026-07-14 #4): the revert's read-only fence/2 only proves the
+        # LOCK is ours at that instant, but the migrator can then stall and a coordinator steal +
+        # flush new bytes before the copy-back lands. Threading this etag into restore/3 turns a
+        # mid-window steal into :superseded instead of an unconditional clobber (the forward
+        # flush/3 already does the same — round-2 #5).
+        with {:ok, etag} <- pull_live(shard_id, tmp) do
           # Round-2 #30 (crash-forward, the OTHER half of #10 below): the cutover
           # already completed and the job died before acking — the retry must be a
           # NO-OP. Re-entering the destructive path would retain(current==to_version),
@@ -95,7 +99,17 @@ defmodule Fathom.Migrator.ShardMigration do
           if live_version(tmp) == to_version and to_version == current do
             :ok
           else
-            do_revert(shard_id, to_version, current, last_active, cutover_at, tmp, lease, force?)
+            do_revert(
+              shard_id,
+              to_version,
+              current,
+              last_active,
+              cutover_at,
+              tmp,
+              lease,
+              force?,
+              etag
+            )
           end
         end
       after
@@ -104,7 +118,17 @@ defmodule Fathom.Migrator.ShardMigration do
     end)
   end
 
-  defp do_revert(shard_id, to_version, current, last_active, cutover_at, tmp, lease, force?) do
+  defp do_revert(
+         shard_id,
+         to_version,
+         current,
+         last_active,
+         cutover_at,
+         tmp,
+         lease,
+         force?,
+         expected_etag
+       ) do
     if live_version(tmp) == to_version and to_version != current do
       # Crash-forward (expert review #10): a prior attempt already restored
       # to_version over live but died before the cutover, so the directory still
@@ -127,7 +151,14 @@ defmodule Fathom.Migrator.ShardMigration do
            # instead of being destroyed unrecoverably (finding #13). RevertJob schedules
            # its retirement.
            :ok <- Storage.retain(shard_id, current),
-           :ok <- Storage.restore(shard_id, to_version),
+           # If-Match-fence the restore on the live object's pull-time etag (expert review
+           # 2026-07-14 #4): the read-only fence/2 above only proves the LOCK is ours at THIS
+           # instant, but the migrator can then stall and a coordinator steal + flush new bytes
+           # before this copy-back lands. An UNCONDITIONAL restore would clobber the stealer's
+           # acknowledged writes with the reverted lineage, and the stealer's next flush would
+           # 412 and self-fence away its own writes (check_lease still sees our lock — the restore
+           # touched the DATA object, not the lock). A 412 → :superseded aborts here, no clobber.
+           :ok <- Storage.restore(shard_id, to_version, expected_etag),
            {:ok, _} <- Directory.cutover(shard_id, to_version) do
         warn_revert(shard_id, current, to_version, last_active)
         {:ok, %{from: current, to: to_version}}

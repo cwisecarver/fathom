@@ -741,6 +741,46 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   @impl true
+  def restore(shard_id, version, expected_etag) do
+    # Fenced restore (expert review 2026-07-14 #4): the revert counterpart of the fenced flush/3.
+    # A plain server-side CopyObject to live is UNCONDITIONAL, and S3 cannot carry an If-Match on
+    # a CopyObject DESTINATION — so a steal landing between the migrator's read-only fence and this
+    # copy-back would be clobbered. Mirror the forward flush instead: stream the version bytes to a
+    # temp, then conditional-PUT them to live via flush/3 (If-Match the live etag the migrator
+    # captured at pull). A 412 → :superseded → the revert aborts without clobbering the new owner.
+    tmp = restore_temp(shard_id, version)
+
+    try do
+      case download(url_path(version_key(shard_id, version)), tmp) do
+        {:ok, _etag} ->
+          case flush(shard_id, tmp, expected_etag) do
+            {:ok, _new_etag} -> :ok
+            {:error, _} = error -> error
+          end
+
+        :absent ->
+          {:error, :version_absent}
+
+        # A version key holding a brand-new sentinel is not restorable bytes.
+        {:sentinel, _etag} ->
+          {:error, :version_absent}
+
+        {:error, _} = error ->
+          error
+      end
+    after
+      File.rm(tmp)
+    end
+  end
+
+  defp restore_temp(shard_id, version) do
+    Path.join(
+      System.tmp_dir!(),
+      "fathom_s3_restore_#{shard_id}@#{version}_#{System.unique_integer([:positive])}.db"
+    )
+  end
+
+  @impl true
   def drop_version(shard_id, version) do
     case Req.delete(req(), url: url_path(version_key(shard_id, version))) do
       {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok

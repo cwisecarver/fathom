@@ -120,7 +120,21 @@ defmodule Fathom.Test.FaultyStorage do
   end
 
   @impl true
-  def restore(shard_id, version), do: Local.restore(shard_id, version)
+  def restore(shard_id, version) do
+    # run_before(:restore) lets a test steal the shard (change the live object) in the window
+    # between the migrator's read-only fence and this copy-back — the revert counterpart of the
+    # {:flush, ...} hook (expert review 2026-07-14 #4). Also on the arity-2 (unconditional) clause
+    # so the pre-fix reproduction, which calls restore/2, injects the steal at the same point.
+    run_before(:restore)
+    Local.restore(shard_id, version)
+  end
+
+  @impl true
+  def restore(shard_id, version, expected_etag) do
+    run_before(:restore)
+    Local.restore(shard_id, version, expected_etag)
+  end
+
   @impl true
   def drop_version(shard_id, version), do: Local.drop_version(shard_id, version)
 end
