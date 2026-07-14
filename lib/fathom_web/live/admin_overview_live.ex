@@ -43,9 +43,26 @@ defmodule FathomWeb.AdminOverviewLive do
 
   @impl true
   def handle_info({:metrics, m}, socket) do
+    # The server-rendered KPI sparklines read @history, which mount seeds once from the collector's
+    # ring but this handler never advanced — so they froze at the mount snapshot for the whole
+    # session. Fold each fresh metric into @history (the collector's ring-point shape), APPENDED so
+    # the series stays oldest-first (the sparkline draws left→right and the uPlot initial data needs
+    # ascending x), bounded to @ring (300 ≈ 5 min at 1 s) so memory stays flat. Expert review
+    # 2026-07-14 #13.
+    point = %{
+      t: m.at_ms,
+      qps: m.node_qps,
+      p50: m.query_p50_ms,
+      p95: m.query_p95_ms,
+      p99: m.query_p99_ms
+    }
+
+    history = Enum.take(socket.assigns.history ++ [point], -300)
+
     socket =
       socket
       |> assign(:metrics, m)
+      |> assign(:history, history)
       |> push_event("chart:qps-chart", %{x: m.at_ms / 1000, ys: [m.node_qps]})
       |> push_event("chart:latency-chart", %{
         x: m.at_ms / 1000,

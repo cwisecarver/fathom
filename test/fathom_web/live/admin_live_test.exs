@@ -106,6 +106,30 @@ defmodule FathomWeb.AdminLiveTest do
       assert html =~ "4,242"
       assert html =~ "acme"
     end
+
+    # Regression (expert review 2026-07-14 #13): mount seeded @history once from the collector
+    # snapshot, but handle_info({:metrics, …}) never advanced it — so the server-rendered KPI
+    # sparklines froze at mount. The SVG sparkline only renders a <polyline> once @history has ≥2
+    # points, so its appearance after successive broadcasts proves @history is being folded forward.
+    test "KPI sparklines advance with each collector broadcast (not frozen at mount)", %{
+      conn: conn
+    } do
+      {:ok, view, _html} = conn |> auth() |> live("/admin")
+
+      # Mount snapshot is empty in test (collector not running) ⇒ no history ⇒ no sparkline yet.
+      refute has_element?(view, "svg polyline")
+
+      for i <- 1..3 do
+        Phoenix.PubSub.broadcast(
+          Fathom.PubSub,
+          MetricsCollector.topic(),
+          {:metrics, metrics(%{at_ms: 1_700_000_000_000 + i * 1000, node_qps: 100.0 * i})}
+        )
+      end
+
+      # @history advanced to ≥2 points ⇒ the qps + p99 sparklines now render polylines.
+      assert has_element?(view, "svg polyline")
+    end
   end
 
   describe "other pages" do
