@@ -83,24 +83,35 @@ defmodule Fathom.Rebalancer.Stats do
   The `pct` percentile (0..100) of a pooled histogram (element-wise sum of `histogram/1`
   vectors), linearly interpolated within the crossing bucket — the fleet hot bar (finding #4).
   An empty/all-zero histogram ⇒ 0.0; a value landing in the open-topped overflow bucket returns
-  that bucket's lower edge.
+  that bucket's lower edge. Uses this module's q/s `bucket_edges/0`; pass explicit `edges` to
+  `percentile_from_histogram/3` for a histogram bucketed on a different scale (e.g. the µs
+  latency edges in `Fathom.ShardLatency`).
   """
   @spec percentile_from_histogram([non_neg_integer()], number()) :: float()
-  def percentile_from_histogram(counts, pct) do
+  def percentile_from_histogram(counts, pct),
+    do: percentile_from_histogram(counts, pct, @hist_edges)
+
+  @doc """
+  As `percentile_from_histogram/2`, but for a histogram bucketed on the given `edges` (lower
+  edges, ascending, `length(edges)` buckets, the last open-topped). Lets the same interpolation
+  serve both the q/s fleet histogram and the per-shard µs latency histogram without drift.
+  """
+  @spec percentile_from_histogram([non_neg_integer()], number(), [number()]) :: float()
+  def percentile_from_histogram(counts, pct, edges) do
     total = Enum.sum(counts)
 
     if total == 0 do
       0.0
     else
       target = pct / 100 * total
-      quantile_walk(counts, target)
+      quantile_walk(counts, target, edges)
     end
   end
 
   # The largest bucket index whose lower edge is ≤ v (values ≥ last edge land in the overflow).
   defp bucket_index(v), do: max(Enum.count(@hist_edges, &(&1 <= v)) - 1, 0)
 
-  defp quantile_walk(counts, target) do
+  defp quantile_walk(counts, target, edges) do
     {value, _cum} =
       counts
       |> Enum.with_index()
@@ -108,7 +119,7 @@ defmodule Fathom.Rebalancer.Stats do
         new_cum = cum + c
 
         if c > 0 and new_cum >= target do
-          {:halt, {bucket_value(i, (target - cum) / c), new_cum}}
+          {:halt, {bucket_value(i, (target - cum) / c, edges), new_cum}}
         else
           {:cont, {0.0, new_cum}}
         end
@@ -119,10 +130,10 @@ defmodule Fathom.Rebalancer.Stats do
 
   # Interpolate within bucket `i` at fraction `frac`; the open-topped last bucket has no upper
   # edge, so return its lower edge.
-  defp bucket_value(i, frac) do
-    lower = Enum.at(@hist_edges, i)
+  defp bucket_value(i, frac, edges) do
+    lower = Enum.at(edges, i)
 
-    case Enum.at(@hist_edges, i + 1) do
+    case Enum.at(edges, i + 1) do
       nil -> lower
       upper -> lower + frac * (upper - lower)
     end

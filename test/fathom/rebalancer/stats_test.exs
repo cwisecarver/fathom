@@ -46,4 +46,21 @@ defmodule Fathom.Rebalancer.StatsTest do
     # Empty / all-zero ⇒ 0.0.
     assert Stats.percentile_from_histogram(Stats.histogram([]), 99) == 0.0
   end
+
+  test "percentile_from_histogram/3 interpolates on arbitrary edges (per-shard µs latency reuse)" do
+    # The generalization Fathom.ShardLatency rides: same walk, caller-supplied edges. µs edges
+    # with all mass in the [1000, 2000) bucket → p99 interpolates near its top (≈ 1990).
+    edges = [0, 100, 500, 1_000, 2_000, 5_000]
+    # 6 edges → 6 buckets; put all 100 counts in bucket index 3 ([1000, 2000)).
+    counts = [0, 0, 0, 100, 0, 0]
+
+    p50 = Stats.percentile_from_histogram(counts, 50, edges)
+    p99 = Stats.percentile_from_histogram(counts, 99, edges)
+    assert p50 >= 1_000 and p50 <= 2_000
+    assert p99 >= 1_000 and p99 <= 2_000
+    assert p99 >= p50
+
+    # The 2-arity form is unchanged — still bucketed on the q/s bucket_edges/0.
+    assert Stats.percentile_from_histogram([0, 0, 0], 99) == 0.0
+  end
 end

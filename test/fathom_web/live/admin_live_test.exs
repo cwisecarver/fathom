@@ -38,7 +38,10 @@ defmodule FathomWeb.AdminLiveTest do
             q_per_s: 99.0,
             rows_read_per_s: 5.0,
             rows_written_per_s: 1.0,
-            queries: 500
+            queries: 500,
+            p50_ms: 1.5,
+            p95_ms: 7.0,
+            p99_ms: 42.0
           }
         ]
       },
@@ -109,6 +112,23 @@ defmodule FathomWeb.AdminLiveTest do
     test "shards page mounts", %{conn: conn} do
       {:ok, view, _html} = conn |> auth() |> live("/admin/shards")
       assert has_element?(view, "a", "Shards")
+    end
+
+    test "shards page shows per-shard p50/p99 latency on a collector broadcast", %{conn: conn} do
+      {:ok, view, _html} = conn |> auth() |> live("/admin/shards")
+
+      Phoenix.PubSub.broadcast(
+        Fathom.PubSub,
+        MetricsCollector.topic(),
+        {:metrics, metrics(%{})}
+      )
+
+      html = render(view)
+      # The hot-shard row carries per-shard tail latency: p99_ms 42.0 → "42 ms".
+      assert html =~ "acme"
+      assert html =~ "p50"
+      assert html =~ "p99"
+      assert html =~ "42 ms"
     end
 
     test "migrations page mounts and loads fleet state", %{conn: conn} do

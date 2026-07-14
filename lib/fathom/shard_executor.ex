@@ -92,15 +92,18 @@ defmodule Fathom.ShardExecutor do
           stmt_result.rows_written
         )
 
+        latency = System.monotonic_time() - started
+
+        # Per-shard tail latency: the "which shard is slow" companion to ShardLoad's "which shard
+        # is hot". Recorded in a per-shard ETS histogram (Fathom.ShardLatency), NOT a metric tag —
+        # a per-shard Prometheus label is the cardinality death the read-API avoids. Rides
+        # ShardLoad's :shard_load gate; one lock-free ETS bump on the same per-shard key class.
+        Fathom.ShardLatency.record(shard_id, latency)
+
         # Node-wide query latency for the metrics layer (Prometheus distribution / the dashboard's
-        # latency chart). Deliberately UN-tagged — a per-shard latency histogram at millions of
-        # shards is the cardinality death Fathom.ShardLoad's read-API exists to avoid. On success
-        # only, matching the cold_open convention. A no-op when no reporter is attached.
-        :telemetry.execute(
-          [:fathom, :shard, :query],
-          %{duration: System.monotonic_time() - started},
-          %{}
-        )
+        # latency chart). Deliberately UN-tagged, for the same cardinality reason. On success only,
+        # matching the cold_open convention. A no-op when no reporter is attached.
+        :telemetry.execute([:fathom, :shard, :query], %{duration: latency}, %{})
 
         {:ok, stmt_result}
 

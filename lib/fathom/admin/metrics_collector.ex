@@ -31,6 +31,7 @@ defmodule Fathom.Admin.MetricsCollector do
 
   alias Fathom.Admin.{FlushWatermark, PrometheusScrape}
   alias Fathom.Shard.WriteCounter
+  alias Fathom.ShardLatency
   alias Fathom.ShardLoad
 
   @default_tick_ms 1_000
@@ -130,6 +131,10 @@ defmodule Fathom.Admin.MetricsCollector do
       |> Enum.reject(&(&1.q_per_s <= 0.0))
       |> Enum.sort_by(& &1.q_per_s, :desc)
       |> Enum.take(@hot_n)
+      # Per-shard tail latency — computed ONLY for the top-N hot shards (cardinality-bounded:
+      # the read cost never scales with resident-shard count). Each is one ETS lookup + a
+      # histogram-percentile walk over Fathom.ShardLatency's µs buckets.
+      |> Enum.map(fn s -> Map.merge(s, ShardLatency.percentiles(s.shard_id)) end)
 
     scrape = PrometheusScrape.parse(safe_scrape())
 

@@ -1009,6 +1009,7 @@ defmodule Fathom.Shard do
     # that took over. Drop it and leave the lease alone (it's theirs now).
     _ = settle_flush_task(state)
     Fathom.ShardLoad.forget(state.id)
+    Fathom.ShardLatency.forget(state.id)
     Fathom.Shards.Lru.forget(state.id)
     WriteCounter.forget(state.id)
     FlushWatermark.forget(state.id)
@@ -1023,6 +1024,7 @@ defmodule Fathom.Shard do
     # the local copy WITHOUT uploading writes made after the task's snapshot).
     state = settle_flush_task(state)
     Fathom.ShardLoad.forget(state.id)
+    Fathom.ShardLatency.forget(state.id)
     Fathom.Shards.Lru.forget(state.id)
     # flush_and_drop reads the write counter (unflushed?/1) to decide whether to upload before
     # dropping, so forget the counter AFTER it — forgetting first would zero the count and make a
@@ -1037,6 +1039,7 @@ defmodule Fathom.Shard do
   # drop the shard's load row so a stopped shard never leaks a counter.
   def terminate(_reason, state) do
     Fathom.ShardLoad.forget(state.id)
+    Fathom.ShardLatency.forget(state.id)
     Fathom.Shards.Lru.forget(state.id)
     WriteCounter.forget(state.id)
     FlushWatermark.forget(state.id)

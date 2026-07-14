@@ -204,6 +204,9 @@ defmodule Fathom.Application do
       # Owns the per-shard load-counter ETS table. Before the shard supervisor so the
       # table is up before any coordinator records or forgets.
       Fathom.ShardLoad,
+      # Owns the per-shard query-latency histogram ETS table (the tail-latency companion to
+      # ShardLoad; rides its :shard_load gate). Before the shard supervisor, same as ShardLoad.
+      Fathom.ShardLatency,
       # Node-local recency index for idle-eviction at capacity. Before the shard
       # supervisor so the table exists before any checkout stamps or terminate forgets.
       Fathom.Shards.Lru,
