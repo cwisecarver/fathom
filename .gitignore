@@ -55,3 +55,4 @@ npm-debug.log
 # canonical baselines, like perf_history.jsonl. Entries are host-specific: the wire gate's
 # `--check` compares only same-host rows, and the TPC-C rows are a recorded-only trend. Commit a
 # clean-tree (dirty:false) run to update a host's baseline; append freely otherwise.
+.gstack/
