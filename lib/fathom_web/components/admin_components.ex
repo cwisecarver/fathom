@@ -151,8 +151,13 @@ defmodule FathomWeb.AdminComponents do
   def fmt_rate(nil), do: "—"
 
   def fmt_rate(n) when is_number(n) do
-    whole = trunc(n)
-    frac = round(abs(n - whole) * 10)
+    # Round to one decimal in ONE step (off n*10), so a fraction that rounds up to 10 CARRIES
+    # into the whole part instead of printing a bogus ".10": 9.96 → "10.0" (not "9.10"), 0.98 →
+    # "1.0" (not "0.10"). fmt_int keeps the thousands grouping on the integer part. Expert
+    # review 2026-07-14 #24. frac is abs'd so a fractional digit is always 0-9 (rates are ≥ 0).
+    rounded = round(n * 10)
+    whole = div(rounded, 10)
+    frac = rem(abs(rounded), 10)
     "#{fmt_int(whole)}.#{frac}"
   end
 
