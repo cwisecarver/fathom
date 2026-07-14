@@ -299,6 +299,14 @@ if config_env() == :prod do
     config :fathom, :shard_base_domain, zone
   end
 
+  # Explicit ack for a prod deployment that intends UNANCHORED Host-subdomain routing (no
+  # SHARD_BASE_DOMAIN). Without the zone anchor, shard_from_host promotes any attacker-controlled
+  # Host first-label to a shard id, so Fathom.Application.check_shard_base_domain! refuses to boot
+  # an exposed data plane with the zone unset (expert review 2026-07-14 #6) — set this to override.
+  if System.get_env("ALLOW_UNANCHORED_ROUTING") in ~w(true 1) do
+    config :fathom, :allow_unanchored_routing, true
+  end
+
   if bind = System.get_env("HRANA_BIND_IP") do
     case :inet.parse_address(String.to_charlist(bind)) do
       {:ok, ip} -> config :fathom, :hrana_bind_ip, ip

@@ -397,4 +397,258 @@ defmodule Fathom.ShardExecutorTest do
 
     assert Fathom.Application.hrana_bind_ip() == {127, 0, 0, 1}
   end
+
+  # Expert review 2026-07-14 #3: Local storage's lease is node-local only (:global.trans scoped to
+  # [node()]), so running it across a fleet (:lb_backends set) is silent split-brain — two nodes
+  # can each hold a shard's lease and both write. Prod must refuse to boot with that combination.
+  test "the boot guard refuses prod Local storage with a multi-node fleet" do
+    prev_env = Application.get_env(:fathom, :env)
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    prev_backends = Application.get_env(:fathom, :lb_backends)
+
+    on_exit(fn ->
+      Application.put_env(:fathom, :env, prev_env)
+      restore_env(:shard_storage, prev_storage)
+      restore_env(:lb_backends, prev_backends)
+    end)
+
+    Application.put_env(:fathom, :env, :prod)
+    Application.put_env(:fathom, :shard_storage, Fathom.Shard.Storage.Local)
+    Application.put_env(:fathom, :lb_backends, %{"fathom1" => "fathom1:8080"})
+
+    assert_raise RuntimeError, ~r/no cross-node single-writer guarantee/, fn ->
+      Fathom.Application.check_local_storage_fleet!()
+    end
+
+    # Single-node Local (no fleet) boots fine.
+    Application.delete_env(:fathom, :lb_backends)
+    assert Fathom.Application.check_local_storage_fleet!() == nil
+
+    # The S3 backend across a fleet boots fine (it enforces cross-node single-writer).
+    Application.put_env(:fathom, :lb_backends, %{"fathom1" => "fathom1:8080"})
+    Application.put_env(:fathom, :shard_storage, Fathom.Shard.Storage.S3)
+    assert Fathom.Application.check_local_storage_fleet!() == nil
+  end
+
+  # Expert review 2026-07-14 #6: without :shard_base_domain, Fathom.ShardExecutor.shard_from_host
+  # promotes any attacker-controlled Host first-label to a shard id (cross-tenant selection). Prod
+  # must refuse to boot an EXPOSED data plane (a fleet, or the Hrana listener on) with the zone
+  # unset/blank, unless ALLOW_UNANCHORED_ROUTING explicitly acks it.
+  test "the boot guard refuses a prod exposed data plane with no shard_base_domain" do
+    prev_env = Application.get_env(:fathom, :env)
+    prev_zone = Application.get_env(:fathom, :shard_base_domain)
+    prev_backends = Application.get_env(:fathom, :lb_backends)
+    prev_server = Application.get_env(:fathom, :hrana_server)
+    prev_ack = Application.get_env(:fathom, :allow_unanchored_routing)
+
+    on_exit(fn ->
+      Application.put_env(:fathom, :env, prev_env)
+      restore_env(:shard_base_domain, prev_zone)
+      restore_env(:lb_backends, prev_backends)
+      restore_env(:hrana_server, prev_server)
+      restore_env(:allow_unanchored_routing, prev_ack)
+    end)
+
+    Application.put_env(:fathom, :env, :prod)
+    Application.delete_env(:fathom, :shard_base_domain)
+    Application.put_env(:fathom, :lb_backends, %{"fathom1" => "fathom1:8080"})
+    Application.delete_env(:fathom, :allow_unanchored_routing)
+
+    assert_raise RuntimeError, ~r/SHARD_BASE_DOMAIN/, fn ->
+      Fathom.Application.check_shard_base_domain!()
+    end
+
+    # A blank/whitespace zone is treated as unset — still refused.
+    Application.put_env(:fathom, :shard_base_domain, "   ")
+
+    assert_raise RuntimeError, ~r/SHARD_BASE_DOMAIN/, fn ->
+      Fathom.Application.check_shard_base_domain!()
+    end
+
+    # An anchored zone boots fine.
+    Application.put_env(:fathom, :shard_base_domain, "fathom.example")
+    assert Fathom.Application.check_shard_base_domain!() == nil
+
+    # The explicit ack lets an unanchored deploy boot even with the zone unset.
+    Application.delete_env(:fathom, :shard_base_domain)
+    Application.put_env(:fathom, :allow_unanchored_routing, true)
+    assert Fathom.Application.check_shard_base_domain!() == nil
+
+    # With the data plane NOT exposed (no fleet, Hrana server off), the zone may be unset.
+    Application.delete_env(:fathom, :allow_unanchored_routing)
+    Application.delete_env(:fathom, :lb_backends)
+    Application.put_env(:fathom, :hrana_server, false)
+    assert Fathom.Application.check_shard_base_domain!() == nil
+
+    # The Hrana listener being enabled ALSO counts as exposed (refused with the zone unset).
+    Application.put_env(:fathom, :hrana_server, true)
+
+    assert_raise RuntimeError, ~r/SHARD_BASE_DOMAIN/, fn ->
+      Fathom.Application.check_shard_base_domain!()
+    end
+  end
+
+  # Expert review 2026-07-14 #15: the ?db= / x-fathom-shard override is an unauthenticated
+  # shard-selection primitive (finding #4) that must never be on in prod.
+  test "the boot guard refuses a prod config with allow_shard_override enabled" do
+    prev_env = Application.get_env(:fathom, :env)
+    prev_override = Application.get_env(:fathom, :allow_shard_override)
+
+    on_exit(fn ->
+      Application.put_env(:fathom, :env, prev_env)
+      restore_env(:allow_shard_override, prev_override)
+    end)
+
+    Application.put_env(:fathom, :env, :prod)
+    Application.put_env(:fathom, :allow_shard_override, true)
+
+    assert_raise RuntimeError, ~r/allow_shard_override/, fn ->
+      Fathom.Application.check_shard_override!()
+    end
+
+    # Off (the prod default) boots fine, whether explicit or unset.
+    Application.put_env(:fathom, :allow_shard_override, false)
+    assert Fathom.Application.check_shard_override!() == nil
+
+    Application.delete_env(:fathom, :allow_shard_override)
+    assert Fathom.Application.check_shard_override!() == nil
+  end
+
+  # Expert review 2026-07-14 #16: a non-nil :default_shard in prod commingles all unresolved
+  # requests into one shared shard instead of failing closed (finding #26). WARN, never raise —
+  # a shared default can be an intentional single-tenant choice.
+  test "the boot guard warns (never raises) on a prod non-nil default_shard" do
+    import ExUnit.CaptureLog
+
+    prev_env = Application.get_env(:fathom, :env)
+    prev_default = Application.get_env(:fathom, :default_shard)
+
+    on_exit(fn ->
+      Application.put_env(:fathom, :env, prev_env)
+      restore_env(:default_shard, prev_default)
+    end)
+
+    Application.put_env(:fathom, :env, :prod)
+    Application.put_env(:fathom, :default_shard, "shared")
+
+    log =
+      capture_log(fn ->
+        assert Fathom.Application.check_default_shard!() == nil
+      end)
+
+    assert log =~ "default_shard"
+    assert log =~ "commingles"
+
+    # Nil default (the fail-closed posture) emits no warning.
+    Application.put_env(:fathom, :default_shard, nil)
+
+    refute capture_log(fn ->
+             assert Fathom.Application.check_default_shard!() == nil
+           end) =~ "commingles"
+  end
+
+  # Expert review 2026-07-14 #18: an enabled, unauthenticated Hrana data plane bound to all
+  # interfaces leaves only an external firewall/SG as the tenant-isolation control. WARN, never
+  # raise — this is the documented network-trust posture.
+  test "the boot guard warns (never raises) on an exposed unauthenticated Hrana plane" do
+    import ExUnit.CaptureLog
+
+    prev_env = Application.get_env(:fathom, :env)
+    prev_server = Application.get_env(:fathom, :hrana_server)
+    prev_auth = Application.get_env(:fathom, :hrana_auth)
+    prev_bind = Application.get_env(:fathom, :hrana_bind_ip)
+
+    on_exit(fn ->
+      Application.put_env(:fathom, :env, prev_env)
+      restore_env(:hrana_server, prev_server)
+      restore_env(:hrana_auth, prev_auth)
+      restore_env(:hrana_bind_ip, prev_bind)
+    end)
+
+    Application.put_env(:fathom, :env, :prod)
+    Application.put_env(:fathom, :hrana_server, true)
+    Application.put_env(:fathom, :hrana_auth, :disabled)
+    Application.put_env(:fathom, :hrana_bind_ip, {0, 0, 0, 0})
+
+    log =
+      capture_log(fn ->
+        assert Fathom.Application.check_hrana_exposure!() == nil
+      end)
+
+    assert log =~ "unauthenticated"
+    assert log =~ "all interfaces"
+
+    # The IPv6 wildcard bind is flagged the same way.
+    Application.put_env(:fathom, :hrana_bind_ip, {0, 0, 0, 0, 0, 0, 0, 0})
+    assert capture_log(fn -> Fathom.Application.check_hrana_exposure!() end) =~ "firewall"
+
+    # Auth required silences it (the data path is authenticated).
+    Application.put_env(:fathom, :hrana_auth, :required)
+
+    refute capture_log(fn ->
+             assert Fathom.Application.check_hrana_exposure!() == nil
+           end) =~ "firewall"
+
+    # A pinned (non-wildcard) bind silences it (network-isolated to the LB interface).
+    Application.put_env(:fathom, :hrana_auth, :disabled)
+    Application.put_env(:fathom, :hrana_bind_ip, {127, 0, 0, 1})
+
+    refute capture_log(fn ->
+             assert Fathom.Application.check_hrana_exposure!() == nil
+           end) =~ "firewall"
+  end
+
+  # All five 2026-07-14 config guards are prod-only: with env != :prod (the dev/test default),
+  # every one is inert regardless of the risky config, so they never fire outside prod.
+  test "all 2026-07-14 config guards are inert when env is not prod" do
+    import ExUnit.CaptureLog
+
+    prev_env = Application.get_env(:fathom, :env)
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    prev_backends = Application.get_env(:fathom, :lb_backends)
+    prev_zone = Application.get_env(:fathom, :shard_base_domain)
+    prev_server = Application.get_env(:fathom, :hrana_server)
+    prev_override = Application.get_env(:fathom, :allow_shard_override)
+    prev_default = Application.get_env(:fathom, :default_shard)
+    prev_auth = Application.get_env(:fathom, :hrana_auth)
+    prev_bind = Application.get_env(:fathom, :hrana_bind_ip)
+
+    on_exit(fn ->
+      Application.put_env(:fathom, :env, prev_env)
+      restore_env(:shard_storage, prev_storage)
+      restore_env(:lb_backends, prev_backends)
+      restore_env(:shard_base_domain, prev_zone)
+      restore_env(:hrana_server, prev_server)
+      restore_env(:allow_shard_override, prev_override)
+      restore_env(:default_shard, prev_default)
+      restore_env(:hrana_auth, prev_auth)
+      restore_env(:hrana_bind_ip, prev_bind)
+    end)
+
+    # env :test (not :prod) + every risky config set at once.
+    Application.put_env(:fathom, :env, :test)
+    Application.put_env(:fathom, :shard_storage, Fathom.Shard.Storage.Local)
+    Application.put_env(:fathom, :lb_backends, %{"fathom1" => "fathom1:8080"})
+    Application.delete_env(:fathom, :shard_base_domain)
+    Application.put_env(:fathom, :hrana_server, true)
+    Application.put_env(:fathom, :allow_shard_override, true)
+    Application.put_env(:fathom, :default_shard, "shared")
+    Application.put_env(:fathom, :hrana_auth, :disabled)
+    Application.put_env(:fathom, :hrana_bind_ip, {0, 0, 0, 0})
+
+    # No raise from the RAISE guards…
+    assert Fathom.Application.check_local_storage_fleet!() == nil
+    assert Fathom.Application.check_shard_base_domain!() == nil
+    assert Fathom.Application.check_shard_override!() == nil
+
+    # …and no warning from the WARN guards.
+    log =
+      capture_log(fn ->
+        assert Fathom.Application.check_default_shard!() == nil
+        assert Fathom.Application.check_hrana_exposure!() == nil
+      end)
+
+    refute log =~ "commingles"
+    refute log =~ "firewall"
+  end
 end

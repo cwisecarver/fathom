@@ -5,6 +5,8 @@ defmodule Fathom.Application do
 
   use Application
 
+  require Logger
+
   @impl true
   def start(_type, _args) do
     # Expert review #6: this boot's identity. Lease owners are node()#<nonce>, so a
@@ -22,6 +24,11 @@ defmodule Fathom.Application do
     Fathom.HranaAuth.check_config!()
     check_storage_fence!()
     check_rebalancer_config!()
+    check_local_storage_fleet!()
+    check_shard_base_domain!()
+    check_shard_override!()
+    check_default_shard!()
+    check_hrana_exposure!()
 
     # Grouped into plane sub-supervisors (each with its own restart budget) rather than
     # one flat list, so a control-plane restart-storm (e.g. Repo) is contained to its
@@ -123,6 +130,107 @@ defmodule Fathom.Application do
       Fathom.Shard.Storage.S3.verify_conditional_writes!()
     end
   end
+
+  # Expert review 2026-07-14 #3: Fathom.Shard.Storage.Local's lease is node-local only — its
+  # :global.trans is scoped to [node()] (storage/local.ex), so it provides NO cross-node
+  # single-writer guarantee. Run across a fleet (>1 node — :lb_backends non-empty) and two nodes
+  # can each believe they hold a shard's lease and both write: silent, error-free split-brain.
+  # Refuse to boot. Prod-only + only when a fleet is configured; a single-node Local deploy is fine.
+  @doc false
+  def check_local_storage_fleet! do
+    if Application.get_env(:fathom, :env) == :prod and
+         Application.get_env(:fathom, :shard_storage) == Fathom.Shard.Storage.Local and
+         map_size(Application.get_env(:fathom, :lb_backends, %{})) > 0 do
+      raise "config error: :shard_storage is Fathom.Shard.Storage.Local with a multi-node fleet " <>
+              "(:lb_backends set) — Local provides no cross-node single-writer guarantee (its lease " <>
+              "is node-local only), so two nodes can each hold a shard's lease and both write " <>
+              "(silent split-brain). Use S3/R2/a conditional-write store for a fleet " <>
+              "(expert review 2026-07-14 #3)."
+    end
+  end
+
+  # Expert review 2026-07-14 #6: without a serving-zone anchor, Fathom.ShardExecutor.shard_from_host
+  # promotes ANY attacker-controlled Host first-label to a shard id — the primary production
+  # tenant-selection path then trusts a fully attacker-controlled header (release-blocker-class
+  # cross-tenant selection). Refuse to boot with no :shard_base_domain when the data plane is
+  # actually exposed (a fleet via :lb_backends, or the Hrana listener enabled) unless
+  # ALLOW_UNANCHORED_ROUTING explicitly acks a deployment that intends unanchored routing. Prod-only.
+  @doc false
+  def check_shard_base_domain! do
+    exposed? =
+      map_size(Application.get_env(:fathom, :lb_backends, %{})) > 0 or
+        Application.get_env(:fathom, :hrana_server, false)
+
+    if Application.get_env(:fathom, :env) == :prod and
+         blank?(Application.get_env(:fathom, :shard_base_domain)) and exposed? and
+         not Application.get_env(:fathom, :allow_unanchored_routing, false) do
+      raise "config error: :shard_base_domain is unset with the data plane exposed — " <>
+              "Host-subdomain routing then promotes ANY attacker-controlled Host first-label to a " <>
+              "shard id (cross-tenant selection). Set SHARD_BASE_DOMAIN=<serving-zone> to anchor " <>
+              "routing, or ALLOW_UNANCHORED_ROUTING=true to acknowledge unanchored routing " <>
+              "(expert review 2026-07-14 #6)."
+    end
+  end
+
+  # Expert review 2026-07-14 #15: the ?db= / x-fathom-shard override (finding #4) is an
+  # UNAUTHENTICATED shard-selection primitive — a caller reaching a node directly can name any
+  # shard. It's a dev/test-only fallback and must NEVER be on in prod. Refuse to boot.
+  @doc false
+  def check_shard_override! do
+    if Application.get_env(:fathom, :env) == :prod and
+         Application.get_env(:fathom, :allow_shard_override, false) do
+      raise "config error: :allow_shard_override is enabled in prod — the ?db= / x-fathom-shard " <>
+              "override is an unauthenticated shard-selection primitive (finding #4) and must never " <>
+              "be on in prod. Unset :allow_shard_override (expert review 2026-07-14 #15)."
+    end
+  end
+
+  # Expert review 2026-07-14 #16: a non-nil :default_shard in prod commingles EVERY unresolved
+  # request (no Host subdomain, no override) into one shared shard instead of failing closed
+  # (finding #26's safe posture is nil-in-prod). A shared default can be an intentional
+  # single-tenant choice, so WARN rather than raise. Prod-only.
+  @doc false
+  def check_default_shard! do
+    default = Application.get_env(:fathom, :default_shard)
+
+    if Application.get_env(:fathom, :env) == :prod and not is_nil(default) do
+      Logger.warning(
+        "config warning: :default_shard is set in prod (#{inspect(default)}) — every unresolved " <>
+          "request (no Host subdomain, no override) commingles into that one shared shard instead " <>
+          "of failing closed (finding #26). Leave it unset to fail closed unless a shared default " <>
+          "is an intentional single-tenant choice (expert review 2026-07-14 #16)."
+      )
+    end
+
+    nil
+  end
+
+  # Expert review 2026-07-14 #18: with the Hrana listener enabled, auth :disabled, AND bound to a
+  # wildcard interface, the data plane is unauthenticated and reachable on every interface — the
+  # ONLY tenant-isolation control is an external firewall/security-group. This is the documented
+  # network-trust posture (docs/auth.md), so WARN rather than raise. Prod-only.
+  @doc false
+  def check_hrana_exposure! do
+    wildcard_binds = [{0, 0, 0, 0}, {0, 0, 0, 0, 0, 0, 0, 0}]
+
+    if Application.get_env(:fathom, :env) == :prod and
+         Application.get_env(:fathom, :hrana_server, false) and
+         Application.get_env(:fathom, :hrana_auth, :disabled) == :disabled and
+         Application.get_env(:fathom, :hrana_bind_ip, {0, 0, 0, 0}) in wildcard_binds do
+      Logger.warning(
+        "config warning: the Hrana data plane is enabled, unauthenticated (:hrana_auth :disabled), " <>
+          "AND bound to all interfaces — the only tenant-isolation control is an external " <>
+          "firewall/security-group. Set HRANA_AUTH=required or pin HRANA_BIND_IP to the private " <>
+          "interface the LB reaches (expert review 2026-07-14 #18)."
+      )
+    end
+
+    nil
+  end
+
+  defp blank?(nil), do: true
+  defp blank?(s) when is_binary(s), do: String.trim(s) == ""
+  defp blank?(_), do: false
 
   defp normalize_id(nil), do: nil
 
