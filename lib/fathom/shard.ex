@@ -839,7 +839,18 @@ defmodule Fathom.Shard do
   end
 
   @impl true
-  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+    # A stream holding a checked-out connection that dies ABNORMALLY (a crash — a clean
+    # close casts {:checkin, ref} which demonitors first, so :normal never reaches here for
+    # a tracked conn) may have fsynced a committed write to the local WAL in the microsecond
+    # window between Connection.query returning (commit done) and the stream's post-hoc
+    # WriteCounter.bump — leaving the write durable-on-disk but UN-counted. The coordinator
+    # can't know, so conservatively force the shard dirty: an idle flush_and_drop then flushes
+    # (unflushed? is true) rather than drop_clean deleting the possibly-uncounted committed
+    # write (expert review 2026-07-14 #14). Zero per-statement cost (fires only on stream
+    # death); over-dirtying is the documented safe direction — an extra flush, never lost data.
+    if reason != :normal and Map.has_key?(state.conns, ref), do: WriteCounter.bump(state.id)
+
     stop_when_drained(release(state, ref))
   end
 

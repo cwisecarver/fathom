@@ -83,6 +83,20 @@ defmodule Fathom.ShardDurabilityTest do
     end
   end
 
+  # Poll a predicate until true (bounded) — for an eventually-consistent effect delivered by an
+  # async message (here, a monitor :DOWN the runtime enqueues after a process dies), which has no
+  # clean monitor-based synchronization from the test's side. Mirrors wait_flush_settled's shape.
+  defp until_true(_fun, 0), do: false
+
+  defp until_true(fun, tries) do
+    if fun.() do
+      true
+    else
+      Process.sleep(5)
+      until_true(fun, tries - 1)
+    end
+  end
+
   test "a durability flush snapshots committed writes to storage while a connection stays open",
        %{shard: shard} do
     {:ok, conn} = ShardExecutor.open(shard)
@@ -166,6 +180,40 @@ defmodule Fathom.ShardDurabilityTest do
            "the committed row must survive the flush-straddle + idle drop"
 
     ShardExecutor.close(conn2)
+  end
+
+  # Expert review 2026-07-14 #14: a stream holding a checked-out connection can be killed in the
+  # window between a write's SQLite commit (fsynced to the local WAL) and its post-hoc
+  # WriteCounter.bump — leaving a committed write durable-on-disk but UN-counted. The coordinator
+  # can't observe the in-flight write, so on an ABNORMAL connection :DOWN it conservatively
+  # force-dirties the shard, so an idle drop flushes rather than drop_cleaning the uncounted write.
+  test "an abnormal connection death force-dirties the shard (no clean-drop of a possible write)",
+       %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, coordinator} = Shards.ensure(shard)
+    flush_now(coordinator)
+    refute dirty?(shard)
+
+    # A second stream checks out a connection (the coordinator monitors the caller), then dies
+    # ABNORMALLY without a clean checkin — the lost-bump window.
+    parent = self()
+
+    holder =
+      spawn(fn ->
+        {:ok, _pid, _ref, _path} = Shards.checkout(shard)
+        send(parent, :held)
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive :held, 1_000
+    Process.exit(holder, :kill)
+
+    # The coordinator force-dirties on the abnormal :DOWN (delivered async → poll).
+    assert until_true(fn -> dirty?(shard) end, 100),
+           "an abnormal connection death must force the shard dirty"
+
+    ShardExecutor.close(conn)
   end
 
   test "the durability flush is fenced: a lost lease self-fences instead of clobbering",
