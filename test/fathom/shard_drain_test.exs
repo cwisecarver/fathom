@@ -50,6 +50,27 @@ defmodule Fathom.ShardDrainTest do
     refute_receive {:drain_aborted, _}, 100
   end
 
+  # Expert review 2026-07-14 #20: an evict-if-idle probe (drain timeout 0, from the at-capacity
+  # eviction path) against a BUSY shard must leave it untouched — the coordinator can't evict a
+  # shard with checked-out connections, and flipping it to :draining (even for the 0 ms window
+  # before the timer resumes) spuriously 503s a concurrent checkout of this healthy bystander.
+  test "an evict-if-idle drain probe does not draining-refuse a concurrent checkout on a busy shard",
+       %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, pid} = Shards.ensure(shard)
+
+    # The eviction path's probe (a cast). A checkout enqueued right after it (FIFO, before the
+    # pre-fix 0 ms drain-timer would resume) must NOT be refused with :draining.
+    Shard.request_drain(pid, 0, self())
+    result = Shard.checkout(pid)
+
+    refute match?({:error, :draining}, result),
+           "an evict-if-idle probe must not draining-503 a busy bystander"
+
+    assert_receive {:drain_aborted, ^pid}, 500
+    ShardExecutor.close(conn)
+  end
+
   # Expert review #33: a checkout hitting a draining coordinator returned
   # {:error, :draining}, and open_error had no clause for it — the generic fallthrough
   # carried NO status, i.e. the transport-default 500. A drain is a routine, short-lived

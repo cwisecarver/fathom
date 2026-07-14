@@ -779,6 +779,18 @@ defmodule Fathom.Shard do
     {:noreply, state}
   end
 
+  # An evict-if-idle probe (timeout 0, from the at-capacity eviction path) against a BUSY
+  # shard: leave it COMPLETELY untouched — never flip to :draining (expert review 2026-07-14
+  # #20). The general clause below would set draining: true and arm a 0 ms timer that
+  # immediately resumes, but in that window a concurrent checkout of this healthy bystander
+  # hits the draining guard and gets {:error, :draining} — a spurious 503 caused by an
+  # unrelated tenant's admission. A busy shard is never evictable anyway, so just report the
+  # abort (the caller moves to the next LRU candidate) and change no state.
+  def handle_cast({:drain, 0, reply_to}, %{conns: conns} = state) when map_size(conns) > 0 do
+    if reply_to, do: send(reply_to, {:drain_aborted, self()})
+    {:noreply, state}
+  end
+
   def handle_cast({:drain, timeout, reply_to}, state) do
     timer = Process.send_after(self(), :drain_timeout, timeout)
 
