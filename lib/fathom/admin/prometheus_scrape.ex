@@ -38,6 +38,11 @@ defmodule Fathom.Admin.PrometheusScrape do
       _ ->
         []
     end
+  rescue
+    # Belt-and-suspenders for the moduledoc's "never a crash / yields zeros" contract: a single
+    # malformed line must degrade to a dropped sample, never a MatchError that takes down the
+    # collector tick (which would then reset the rate baselines). Expert review 2026-07-14 #23.
+    _ -> []
   end
 
   defp parse_value("+Inf"), do: {:ok, :infinity}
@@ -59,10 +64,17 @@ defmodule Fathom.Admin.PrometheusScrape do
     |> String.trim_leading("{")
     |> String.trim_trailing("}")
     |> String.split(",", trim: true)
-    |> Map.new(fn pair ->
-      [k, v] = String.split(pair, "=", parts: 2)
-      {String.trim(k), v |> String.trim() |> String.trim("\"")}
+    # A pair with no "=" (e.g. a fragment left by splitting a label value that itself contained a
+    # comma or an escaped quote) is DROPPED, not matched — a naive `[k, v] = split` raised a
+    # MatchError that crashed the whole tick. Best-effort/total parse per the moduledoc contract.
+    # Expert review 2026-07-14 #23.
+    |> Enum.flat_map(fn pair ->
+      case String.split(pair, "=", parts: 2) do
+        [k, v] -> [{String.trim(k), v |> String.trim() |> String.trim("\"")}]
+        _ -> []
+      end
     end)
+    |> Map.new()
   end
 
   @doc """

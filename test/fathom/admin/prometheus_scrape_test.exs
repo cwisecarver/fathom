@@ -73,4 +73,31 @@ defmodule Fathom.Admin.PrometheusScrapeTest do
     cur = [{1.0, 2.0}, {5.0, 8.0}, {:infinity, 10.0}]
     assert PrometheusScrape.diff_buckets(cur, prev) == [{1.0, 1.0}, {5.0, 5.0}, {:infinity, 6.0}]
   end
+
+  # Regression (expert review 2026-07-14 #23): parse_labels split on "," then matched `[k, v]`,
+  # which raised a MatchError on a label value containing a comma or an escaped quote — and that
+  # crashed the whole collector tick (violating the moduledoc's "never a crash / yields zeros"
+  # contract). Parsing must now be TOTAL: a malformed line degrades to a dropped/best-effort
+  # sample, never a raise.
+  test "a label value containing a comma does not crash the parser" do
+    text = ~s(fathom_shard_query_duration{db="a,b"} 3\n)
+    samples = PrometheusScrape.parse(text)
+
+    # No raise; the line still yields a sample (best-effort labels are fine, the contract is no crash).
+    assert [{"fathom_shard_query_duration", labels, 3.0}] = samples
+    assert is_map(labels)
+  end
+
+  test "a label value containing an escaped quote does not crash the parser" do
+    text = ~s(fathom_s3_op_count{op="a\\"b"} 7\n)
+    samples = PrometheusScrape.parse(text)
+
+    assert [{"fathom_s3_op_count", labels, 7.0}] = samples
+    assert is_map(labels)
+  end
+
+  test "a label pair with no '=' is dropped, not raised" do
+    text = "fathom_thing{bogus} 1\n"
+    assert [{"fathom_thing", %{}, 1.0}] = PrometheusScrape.parse(text)
+  end
 end
