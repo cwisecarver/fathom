@@ -430,6 +430,85 @@ defmodule Fathom.ShardDurabilityTest do
     end
   end
 
+  # Expert review 2026-07-14 #8: #27 moved the flush's snapshot/upload off-process, but on
+  # a data-PUT 412 the RECONCILE (Storage.check_lease GET + object_etag HEAD) still ran IN
+  # the coordinator's flush-result handler — so a 412 (correlated with the very S3 flakiness
+  # that makes those calls slow) re-blocked the coordinator mailbox for 1-2 S3 RTTs, the
+  # exact stall #27 removed, just relocated onto the 412 path. The reconcile now runs inside
+  # the flush task. The invariant: the coordinator keeps serving checkouts while a 412
+  # reconcile's lock re-check is in flight — and the 412-lock-still-ours outcome (resync,
+  # keep serving) is preserved.
+  test "a checkout is served while a durability-flush 412 reconcile is in flight",
+       %{shard: shard} do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    prev_timeout = Application.get_env(:fathom, :shard_checkout_timeout_ms)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Application.put_env(:fathom, :shard_checkout_timeout_ms, 500)
+
+    test_pid = self()
+
+    # 412 with the lock still ours: our own PUT lands (the object etag changes ⇒ the fenced
+    # flush 412s) but NO stealer takes the lock ⇒ the reconcile's check_lease returns :ok and
+    # the task resolves {:reconciled, etag} (keep serving).
+    own_put = fn -> File.write!(remote_db(shard), "our-own-landed-snapshot") end
+
+    # Wedge the reconcile's lock re-check (the S3 GET) mid-flight: signal the moment it
+    # starts, then block until released — a slow/flaky check_lease, held deterministically.
+    reconcile_block = fn ->
+      send(test_pid, {:reconcile_started, self()})
+
+      receive do
+        :release_reconcile -> :ok
+      after
+        10_000 -> :ok
+      end
+    end
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+      Application.delete_env(:fathom, :faulty_check_lease)
+      restore(:shard_checkout_timeout_ms, prev_timeout)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    ref = Process.monitor(coordinator)
+
+    Application.put_env(:fathom, :faulty_before, {:flush, own_put})
+    Application.put_env(:fathom, :faulty_check_lease, reconcile_block)
+    send(coordinator, :durability_flush)
+
+    # The task has uploaded (412) and is now blocked IN the reconcile's lock re-check —
+    # off the coordinator process. Pre-fix this ran in the flush-result handler.
+    assert_receive {:reconcile_started, reconcile_pid}, 2_000
+
+    # The coordinator must serve a checkout promptly despite the wedged reconcile. Pre-fix
+    # it was blocked inside handle_info and this timed out (500ms checkout timeout).
+    checkout = Task.async(fn -> Shards.checkout(shard) end)
+    assert {:ok, pid, checkout_ref, _path} = Task.await(checkout, 2_000)
+    Fathom.Shard.checkin(pid, checkout_ref)
+
+    # Release the reconcile: lock still ours ⇒ resolve {:reconciled, etag}, keep serving.
+    send(reconcile_pid, :release_reconcile)
+    wait_flush_settled(coordinator, 400)
+
+    refute_receive {:DOWN, ^ref, :process, ^coordinator, {:shutdown, :lease_lost}}, 200
+    assert Process.alive?(coordinator), "a 412 with the lock still ours must not self-fence"
+
+    assert {:ok, %StmtResult{rows: [["alice"]]}} =
+             ShardExecutor.execute(conn, stmt("SELECT v FROM kv")),
+           "the shard keeps serving; its acknowledged writes are intact"
+
+    ShardExecutor.close(conn)
+  end
+
   test "a zero interval disables the periodic flush timer", %{shard: shard} do
     Application.put_env(:fathom, :shard_flush_interval_ms, 0)
 

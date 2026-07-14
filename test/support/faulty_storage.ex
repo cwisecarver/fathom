@@ -116,8 +116,22 @@ defmodule Fathom.Test.FaultyStorage do
 
   @impl true
   def release_lease(shard_id, lease), do: Local.release_lease(shard_id, lease)
+
   @impl true
-  def check_lease(shard_id, lease), do: Local.check_lease(shard_id, lease)
+  def check_lease(shard_id, lease) do
+    # A dedicated hook (separate from run_before/:faulty_before, whose single slot a test
+    # may already be using to force the data-PUT 412) to hold the periodic flush's
+    # 412-reconcile lock re-check WHILE the 412 is in flight — proving that re-check runs
+    # off the coordinator process (expert review 2026-07-14 #8). The two hooks fire on
+    # different ops: :faulty_before {:flush, ...} on the PUT, :faulty_check_lease here.
+    case Application.get_env(:fathom, :faulty_check_lease) do
+      fun when is_function(fun, 0) -> fun.()
+      _ -> :ok
+    end
+
+    Local.check_lease(shard_id, lease)
+  end
+
   @impl true
   def lease_holder(shard_id), do: Local.lease_holder(shard_id)
   @impl true
