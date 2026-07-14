@@ -128,6 +128,69 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
     assert {:error, {:object_too_large, _}} = S3.flush("big", local, nil)
   end
 
+  # Expert review 2026-07-14 #17: download MD5 verification only fired when the etag was the
+  # MD5-shaped single-part form. But the steal-time fence ROTATES a single-part etag to
+  # MULTIPART form (rotate_etag/touch_object) to invalidate a zombie's If-Match, so right after
+  # a steal the object carries a `...-N` etag and the new owner's failover cold-open pull ran
+  # with NO content check. A flush now records the body's MD5 in x-amz-meta-fathom-md5 metadata,
+  # verified on download regardless of etag shape. Invariants: the metadata is written on flush;
+  # a multipart-etag object with correct metadata verifies; a corrupt body under correct
+  # metadata fails EVEN THOUGH its etag is the would-be-skipped multipart form.
+  defp md5_hex(body), do: Base.encode16(:crypto.hash(:md5, body), case: :lower)
+
+  test "flush records the body md5 as x-amz-meta-fathom-md5 metadata", %{dir: dir} do
+    test_pid = self()
+
+    put_s3_config(fn conn ->
+      send(test_pid, {:meta, Plug.Conn.get_req_header(conn, "x-amz-meta-fathom-md5")})
+
+      conn
+      |> Plug.Conn.put_resp_header("etag", md5_etag(@good))
+      |> Plug.Conn.send_resp(200, "")
+    end)
+
+    local = Path.join(dir, "flush_meta.db")
+    File.write!(local, @good)
+    expected = md5_hex(@good)
+
+    assert :ok = S3.flush("s", local)
+    assert_receive {:meta, [^expected]}
+
+    assert {:ok, _} = S3.flush("s", local, nil)
+    assert_receive {:meta, [^expected]}
+  end
+
+  test "download verifies against md5 metadata even when the etag is multipart-shaped",
+       %{dir: dir} do
+    put_s3_config(fn conn ->
+      conn
+      # Multipart-form etag — verify_md5 alone would SKIP the check (post-steal state).
+      |> Plug.Conn.put_resp_header("etag", ~s("deadbeefcafebabe-3"))
+      |> Plug.Conn.put_resp_header("x-amz-meta-fathom-md5", md5_hex(@good))
+      |> Plug.Conn.send_resp(200, @good)
+    end)
+
+    local = Path.join(dir, "meta_ok.db")
+    assert {:ok, _etag} = S3.pull("s", local)
+    assert File.read!(local) == @good
+  end
+
+  test "download fails a corrupt body under correct md5 metadata (multipart etag)",
+       %{dir: dir} do
+    put_s3_config(fn conn ->
+      # Multipart etag (etag-MD5 check would skip) but the metadata pins the GOOD md5; the
+      # body is corrupt — the metadata check must still catch it.
+      conn
+      |> Plug.Conn.put_resp_header("etag", ~s("deadbeefcafebabe-3"))
+      |> Plug.Conn.put_resp_header("x-amz-meta-fathom-md5", md5_hex(@good))
+      |> Plug.Conn.send_resp(200, "corrupted-bytes")
+    end)
+
+    local = Path.join(dir, "meta_bad.db")
+    assert {:error, :checksum_mismatch} = S3.pull("s", local)
+    refute File.exists?(local), "a corrupt body must never be promoted"
+  end
+
   test "a matching MD5 etag pulls normally; non-MD5 etags skip verification", %{dir: dir} do
     put_s3_config(fn conn ->
       case Plug.Conn.request_url(conn) =~ "multi" do

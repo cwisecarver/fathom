@@ -59,6 +59,13 @@ defmodule Fathom.Shard.Storage.S3 do
   @stream_chunk 1024 * 1024
   @max_single_put 5 * 1024 * 1024 * 1024
 
+  # Object metadata carrying the body's MD5 as lowercase base16 hex, independent of the etag
+  # form (expert review 2026-07-14 #17). A steal-time fence rotates the etag between single-part
+  # and multipart form to invalidate a zombie's If-Match, which disabled the etag-MD5 download
+  # check for the new owner's first pull; this metadata survives the rotation. See
+  # verify_integrity/3.
+  @md5_meta "x-amz-meta-fathom-md5"
+
   @doc """
   Name of the dedicated Finch pool that carries all S3 traffic.
   """
@@ -183,14 +190,16 @@ defmodule Fathom.Shard.Storage.S3 do
 
   @impl true
   def flush(shard_id, local_path) do
-    with {:ok, size, md5} <- stat_and_md5(local_path),
+    with {:ok, size, md5, md5_hex} <- stat_and_md5(local_path),
          {:ok, %{status: status}} <-
            Req.put(req(),
              url: object_path(shard_id),
              body: File.stream!(local_path, @stream_chunk),
              headers: [
                {"content-length", Integer.to_string(size)},
-               {"content-md5", md5}
+               {"content-md5", md5},
+               # Etag-form-independent integrity hash (expert review 2026-07-14 #17).
+               {@md5_meta, md5_hex}
              ]
            ) do
       if status in 200..299, do: :ok, else: {:error, {:s3_put_status, status}}
@@ -206,14 +215,16 @@ defmodule Fathom.Shard.Storage.S3 do
     cond_headers =
       if expected_etag, do: [{"if-match", expected_etag}], else: [{"if-none-match", "*"}]
 
-    with {:ok, size, md5} <- stat_and_md5(local_path),
+    with {:ok, size, md5, md5_hex} <- stat_and_md5(local_path),
          {:ok, resp} <-
            Req.put(req(),
              url: object_path(shard_id),
              body: File.stream!(local_path, @stream_chunk),
              headers: [
                {"content-length", Integer.to_string(size)},
-               {"content-md5", md5} | cond_headers
+               {"content-md5", md5},
+               # Etag-form-independent integrity hash (expert review 2026-07-14 #17).
+               {@md5_meta, md5_hex} | cond_headers
              ]
            ) do
       case resp.status do
@@ -517,29 +528,57 @@ defmodule Fathom.Shard.Storage.S3 do
   # corruption introduced BEFORE the socket — a torn read off a bad disk, a buggy
   # proxy, or an S3-compatible store bug. Content-MD5 on every data PUT makes the
   # store reject a torn upload; downloads verify the streamed body's MD5 against the
+  # x-amz-meta-fathom-md5 metadata (etag-form-independent — #17) when present, else the
   # returned etag when it's the MD5-shaped single-part form (32 hex chars —
   # multipart/encrypted etags are not MD5s and are skipped).
   #
   # Uploads hash the file in a chunked pass (Content-MD5 is a header, so it must be
   # known before the body streams; the page cache makes the second pass cheap) and
-  # refuse a single PUT past the 5 GB ceiling (expert review #20).
+  # refuse a single PUT past the 5 GB ceiling (expert review #20). Returns both the
+  # base64 form (the Content-MD5 header wire format) and the base16 hex form (the
+  # metadata + download-comparison form).
   defp stat_and_md5(path) do
     with {:ok, %{size: size}} <- File.stat(path) do
       if size > Application.get_env(:fathom, :s3_max_single_put, @max_single_put) do
         {:error, {:object_too_large, size}}
       else
-        md5 =
+        digest =
           path
           |> File.stream!(@stream_chunk)
           |> Enum.reduce(:crypto.hash_init(:md5), &:crypto.hash_update(&2, &1))
           |> :crypto.hash_final()
-          |> Base.encode64()
 
-        {:ok, size, md5}
+        {:ok, size, Base.encode64(digest), Base.encode16(digest, case: :lower)}
       end
     end
   rescue
     e in File.Error -> {:error, e.reason}
+  end
+
+  # The download integrity gate (expert review 2026-07-14 #17). The etag-MD5 check
+  # (verify_md5/2) only fires when the etag is the MD5-shaped single-part form, but the
+  # steal-time fence ROTATES a single-part etag to MULTIPART form (rotate_etag/touch_object)
+  # to invalidate a zombie's If-Match — so right after a steal the object carries a `...-N`
+  # etag and the new owner's failover cold-open pull would run with NO content check until the
+  # next single-PUT flush. The `x-amz-meta-fathom-md5` metadata carries the body's MD5
+  # independent of the etag's shape and survives the rotation, so when it's present we verify
+  # against IT regardless of etag form. Falls back to the etag-MD5 check for objects with no
+  # metadata (older flushes, or the unfenced copy paths); a no-op when neither is available.
+  defp verify_integrity(digest, nil, etag), do: verify_md5(digest, etag)
+
+  defp verify_integrity(digest, meta_hex, _etag) do
+    if Base.encode16(digest, case: :lower) == String.downcase(meta_hex),
+      do: :ok,
+      else: {:error, :checksum_mismatch}
+  end
+
+  # The x-amz-meta-fathom-md5 value off a GET/HEAD response (list- or bare-valued), or nil.
+  defp meta_md5(headers) do
+    case headers[@md5_meta] do
+      [v | _] when is_binary(v) -> v
+      v when is_binary(v) -> v
+      _ -> nil
+    end
   end
 
   defp verify_md5(_digest, nil), do: :ok
@@ -614,7 +653,9 @@ defmodule Fathom.Shard.Storage.S3 do
             true ->
               digest = :crypto.hash_final(resp.private[:fathom_md5] || :crypto.hash_init(:md5))
 
-              case verify_md5(digest, etag(resp.headers)) do
+              # Prefer the etag-form-independent metadata hash (#17); fall back to the etag-MD5
+              # check when the object predates the metadata or came from an unfenced copy path.
+              case verify_integrity(digest, meta_md5(resp.headers), etag(resp.headers)) do
                 :ok ->
                   case Storage.promote_temp(tmp, local_path) do
                     :ok -> {:ok, etag(resp.headers)}
