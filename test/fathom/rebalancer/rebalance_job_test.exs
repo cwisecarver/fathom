@@ -161,6 +161,53 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
     assert is_nil(Overrides.for_shard(shard).failed_at)
   end
 
+  # Expert review 2026-07-14 #10: the handoff order is flip → drain source (releases the lease)
+  # → target acquires, so a shard mid-handoff passes through a window where its lease reads
+  # :free AND its target hasn't beaten into `alive` yet (a partial alive set on a rolling
+  # deploy / mid-warm target). The reconciler used to UNPIN that pin, silently undoing the
+  # handoff. The in-flight-HandoffJob guard defers to the handoff.
+  test "reconcile keeps a pin with an in-flight HandoffJob, even with a free lease + dead-looking target (#10)" do
+    Application.put_env(:fathom, :rebalancer_enabled, true)
+    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+
+    shard = "moving_#{System.unique_integer([:positive])}"
+
+    # n1 beats (so the reconciler runs); the target "mover" is NOT beating — the partial-alive
+    # window. No lock file ⇒ the S3 lease reads :free (so the pre-fix code WOULD have unpinned).
+    :ok = Nodes.beat("n1")
+    # reason "rebalance" but NO from_node, so the grace belt (from_node-scoped) can't apply —
+    # this isolates the PRIMARY guard (the live HandoffJob) as the only thing keeping the pin.
+    {:ok, _} = Overrides.pin(shard, "mover", reason: "rebalance")
+
+    {:ok, _job} =
+      %{"shard_id" => shard, "from_node" => "n1", "to_node" => "mover", "q_per_s" => 100.0}
+      |> HandoffJob.new()
+      |> Oban.insert()
+
+    assert :ok = perform_job(RebalanceJob, %{})
+
+    refute is_nil(Overrides.for_shard(shard)),
+           "an in-flight-handoff pin must not be reconciled away mid-move"
+
+    assert is_nil(Overrides.for_shard(shard).failed_at)
+  end
+
+  # The complementary direction (#10): a genuinely stale-node pin with NO live handoff still
+  # re-homes promptly — the guard defers to handoffs, it does not freeze every recent pin.
+  test "reconcile DOES unpin a stale-node pin that has no in-flight handoff (#10)" do
+    Application.put_env(:fathom, :rebalancer_enabled, true)
+    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+
+    shard = "stale_#{System.unique_integer([:positive])}"
+
+    :ok = Nodes.beat("n1")
+    # A plain dead-node pin: no from_node (grace belt N/A), no HandoffJob, free lease → re-home.
+    {:ok, _} = Overrides.pin(shard, "dead_node", reason: "test")
+
+    assert :ok = perform_job(RebalanceJob, %{})
+    assert is_nil(Overrides.for_shard(shard)), "stale-node pin with no live handoff re-homes"
+  end
+
   test "reconcile fails open: no beats ⇒ no unpins (#1b)" do
     Application.put_env(:fathom, :rebalancer_enabled, true)
     Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)

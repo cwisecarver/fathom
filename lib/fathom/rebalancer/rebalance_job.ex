@@ -14,8 +14,10 @@ defmodule Fathom.Rebalancer.RebalanceJob do
   use Oban.Worker, queue: :rebalance, max_attempts: 1
 
   require Logger
+  import Ecto.Query, only: [from: 2]
 
   alias Fathom.Rebalancer
+  alias Fathom.Repo
   alias Fathom.Shard.Storage
 
   alias Fathom.Rebalancer.{
@@ -118,7 +120,29 @@ defmodule Fathom.Rebalancer.RebalanceJob do
   # free; on `{:held,_}` (the node is alive after all) or a store error, KEEP the pin
   # (fail-safe — unpinning a live-owned shard would route it to a node that can't steal the
   # held lease → unavailable) and flag the reporter-vs-data-plane divergence.
+  #
+  # Expert review 2026-07-14 #10: a shard actively being moved by a HandoffJob passes through
+  # a window where BOTH prefilter conditions hold falsely — its lease reads `:free` (the
+  # handoff order is flip → drain source (releases the lease) → target acquires) and its
+  # target hasn't beaten into `alive` yet (a partial alive set on a rolling deploy or a target
+  # mid-warm). The reconciler would then UNPIN a shard a handoff is mid-move, silently undoing
+  # the handoff. So BEFORE the `:free` unpin, exclude any shard with a live HandoffJob
+  # (primary), or whose pin was written within a handoff's worst-case lifetime (a belt for a
+  # job between attempts / just past its terminal state but not yet re-homed).
   defp reconcile_candidate(o) do
+    cond do
+      handoff_in_flight?(o.shard_id) ->
+        skip_reconcile(o, "HandoffJob in flight")
+
+      pin_within_handoff_grace?(o) ->
+        skip_reconcile(o, "pin written within a handoff's worst-case lifetime")
+
+      true ->
+        reconcile_free(o)
+    end
+  end
+
+  defp reconcile_free(o) do
     case Storage.lease_holder(o.shard_id) do
       :free ->
         Overrides.unpin(o.shard_id)
@@ -138,6 +162,48 @@ defmodule Fathom.Rebalancer.RebalanceJob do
       {:error, reason} ->
         divergence(o, "S3 lease check failed (#{inspect(reason)})")
     end
+  end
+
+  # A HandoffJob is actively moving this shard iff an Oban job for it sits in a non-terminal
+  # state (expert review 2026-07-14 #10). Matches HandoffJob's worker + its string-keyed
+  # `shard_id` arg (the enqueue shape in enqueue/2); states mirror the migrator's in-flight
+  # set (`~w(scheduled available executing retryable suspended)` — HandoffJob's own uniqueness
+  # states plus :available).
+  @handoff_worker "Fathom.Rebalancer.HandoffJob"
+  @handoff_live_states ~w(scheduled available executing retryable suspended)
+  defp handoff_in_flight?(shard_id) do
+    Repo.exists?(
+      from j in Oban.Job,
+        where:
+          j.worker == @handoff_worker and j.state in @handoff_live_states and
+            fragment("?->>'shard_id'", j.args) == ^shard_id
+    )
+  end
+
+  # Belt for the primary in-flight check: a HANDOFF-shaped pin (one carrying `from_node` — set
+  # by `HandoffJob.pin_and_flip`, absent on a manual/dead-node pin) touched within a handoff's
+  # worst-case lifetime is treated as possibly-mid-move even if no live job row is visible right
+  # now (a job between Oban retries, or one that just completed the flip but hasn't yet
+  # re-homed). Scoped to `from_node` so a genuinely dead-node pin (#1b) still re-homes promptly
+  # — only handoff-authored pins get the grace. Window derived from the handoff timeouts.
+  defp pin_within_handoff_grace?(o) do
+    o.from_node != nil and o.updated_at != nil and
+      DateTime.compare(
+        o.updated_at,
+        DateTime.add(DateTime.utc_now(), -handoff_grace_ms(), :millisecond)
+      ) == :gt
+  end
+
+  defp skip_reconcile(o, why) do
+    :telemetry.execute([:fathom, :rebalancer, :reconcile, :skipped], %{count: 1}, %{
+      shard_id: o.shard_id,
+      node: o.pinned_node
+    })
+
+    Logger.info(
+      "rebalance: NOT unpinning #{o.shard_id} — #{o.pinned_node} isn't beating but #{why}; " <>
+        "deferring to the handoff (fail-safe)"
+    )
   end
 
   defp divergence(o, why) do
@@ -205,4 +271,12 @@ defmodule Fathom.Rebalancer.RebalanceJob do
 
   defp min_p99_samples,
     do: Application.get_env(:fathom, :rebalance_min_p99_samples, @min_p99_samples)
+
+  # A generous upper bound on a single HandoffJob's wall-clock life (warm await + drain await
+  # across its 3 attempts, plus retry backoff): the reconciler keeps any pin touched more
+  # recently than this (finding #10 belt). Wider than reality on purpose — over-keeping a pin
+  # for a tick is safe (re-checked next tick), under-keeping undoes a live handoff.
+  @default_handoff_grace_ms 300_000
+  defp handoff_grace_ms,
+    do: Application.get_env(:fathom, :rebalance_handoff_grace_ms, @default_handoff_grace_ms)
 end
