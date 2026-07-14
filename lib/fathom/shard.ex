@@ -677,12 +677,23 @@ defmodule Fathom.Shard do
       File.rm(path <> "-wal")
       File.rm(path <> "-shm")
 
+      # Establish provenance BEFORE the pulled file becomes authoritative (expert
+      # review 2026-07-14 #5). Writing the sidecar AFTER the rename left a crash
+      # window: an authoritative warm `.db` with NO sidecar. The next warm open reads
+      # `:missing` (quarantined_fork? → false, await_pull(nil) → adopt the store's
+      # CURRENT etag), so if another node stole+wrote+released the shard in between
+      # (reachable on a persisted/remounted `:shard_data_dir`), the stale local copy
+      # is served and fenced with the NEW lineage's etag — its first flush If-Matches
+      # and clobbers the newer owner's writes (the #1 clobber, through the promote's
+      # crash hole). Sidecar-first inverts the residue to an orphan `<path>.etag` with
+      # no `.db`, which is harmless: warm detection gates on File.exists?(path) (the
+      # `.db`, see handle_continue's `warm?`), and the brand-new-open branch below
+      # File.rm's a stale sidecar before landing. The sidecar path is `<path>.etag`,
+      # derived from the FINAL path, so it's writable before the rename.
+      write_etag_sidecar(path, etag)
+
       case File.rename(temp, path) do
         :ok ->
-          # Record the pulled object's etag as the local copy's provenance (expert
-          # review #1). Best-effort: a failed sidecar write degrades to the legacy
-          # adopt-current warm path, never fails the open.
-          write_etag_sidecar(path, etag)
           {:ok, etag}
 
         {:error, _} = err ->
@@ -1119,7 +1130,19 @@ defmodule Fathom.Shard do
       case Fence.check(fence_ctx(state)) do
         {:ok, _updates} ->
           case upload_for_drop(state) do
-            {:ok, _new_etag} ->
+            {:ok, new_etag} ->
+              # Stamp the new etag into the provenance sidecar BEFORE dropping (expert
+              # review 2026-07-14 #21). We're about to delete everything, so the write
+              # is normally invisible — but a crash after this upload lands (object now
+              # at new_etag) and before drop_local completes leaves the local `.db`
+              # with its sidecar still at the OLD etag. The next warm open then reads
+              # sidecar(old) != object(new) and FALSE-quarantines a FORK (error log,
+              # [:fathom,:shard,:forked], a leaked `.forked.<ts>` recovery copy) — a
+              # spurious alarm, since the local db equals the object we just uploaded
+              # (a clean crash-recovery of identical bytes). Writing it first closes the
+              # window so recovery is an ordinary clean warm restart, matching the
+              # periodic-flush, settle, and reconcile sites that already stamp on success.
+              write_etag_sidecar(state.path, new_etag)
               drop_local(state.path)
               Storage.release_lease(state.id, state.lease)
 

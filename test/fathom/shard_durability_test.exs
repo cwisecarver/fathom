@@ -1033,6 +1033,163 @@ defmodule Fathom.ShardDurabilityTest do
     Connection.close(ro)
   end
 
+  # Expert review 2026-07-14 #5: promote_pull made the pulled temp authoritative
+  # (File.rename temp -> path) and wrote the `.etag` provenance sidecar only AFTERWARD,
+  # so a crash in that window left an authoritative warm `.db` with NO sidecar. The next
+  # warm open read :missing (quarantined_fork? -> false, await_pull(nil) -> ADOPT the
+  # store's CURRENT etag) — so a stale local copy (another node stole+wrote+released in
+  # between, reachable on a persisted `:shard_data_dir`) got served and its first flush
+  # If-Match-clobbered the newer lineage (the #1 clobber, through the promote's crash
+  # hole). The fix writes the sidecar BEFORE the rename, inverting the residue to a
+  # harmless orphan sidecar. The observable invariant it establishes: whenever a promote
+  # makes a `.db` authoritative, the sidecar exists and records the PULLED object's etag
+  # exactly — never missing, never the ambiguous adopt-current fallback.
+  test "a cold-open promote establishes the provenance sidecar matching the pulled object",
+       %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+
+    # Seed the shard's object in storage so opening is a cold PULL + promote.
+    seed = Path.join(System.tmp_dir!(), "seed5_#{shard}.db")
+    {:ok, c} = Connection.open(seed)
+    :ok = Connection.exec(c, "CREATE TABLE kv (v TEXT)")
+    :ok = Connection.exec(c, "INSERT INTO kv VALUES ('base')")
+    :ok = Connection.exec(c, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(c)
+    :ok = Storage.flush(shard, seed)
+    for s <- ["", "-wal", "-shm"], do: File.rm(seed <> s)
+
+    {:ok, object_etag} = Storage.object_etag(shard)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    # The authoritative local `.db` landed with its provenance sidecar alongside it —
+    # never sidecar-less after a promote (the #5 crash residue is now unreachable).
+    assert File.exists?(local_db(shard))
+
+    sidecar = local_db(shard) <> ".etag"
+    assert File.exists?(sidecar), "a promoted `.db` must never be sidecar-less (#5)"
+
+    # And the sidecar records the PULLED object's etag exactly — so a later warm restart
+    # fences with the real lineage via await_pull(nil), never the adopt-current path the
+    # sidecar-less residue forced open.
+    assert File.read!(sidecar) == object_etag,
+           "the sidecar must record the pulled object's etag, not adopt-current"
+
+    close_and_stop(shard, conn)
+  end
+
+  # Expert review 2026-07-14 #21: flush_then_drop's success branch was
+  # `{:ok, _new_etag} -> drop_local(...)` — it discarded the new etag because it was
+  # about to delete everything. But a crash after the upload lands (object now at
+  # new_etag) and before drop_local completes leaves the local `.db` with its sidecar
+  # still holding the OLD etag, while the local db equals the object we just uploaded
+  # (identical bytes). The next warm open then reads sidecar(old) != object(new) and
+  # FALSE-quarantines a FORK — an ERROR log, a [:fathom,:shard,:forked] telemetry, and
+  # a leaked `.forked.<ts>` copy — for a clean crash-recovery of identical bytes. This
+  # pins the pre-fix residue: a STALE-etag sidecar over identical bytes spuriously forks.
+  test "a stale-etag sidecar over identical bytes false-quarantines a fork (the #21 residue)",
+       %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+    on_exit(fn -> Enum.each(Path.wildcard(local_db(shard) <> ".forked*"), &File.rm_rf/1) end)
+
+    # The flushed bytes B: what BOTH the local `.db` and the object hold after the upload.
+    path = local_db(shard)
+    File.mkdir_p!(Path.dirname(path))
+    {:ok, c} = Connection.open(path)
+    :ok = Connection.exec(c, "CREATE TABLE kv (v TEXT)")
+    :ok = Connection.exec(c, "INSERT INTO kv VALUES ('alice')")
+    :ok = Connection.exec(c, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(c)
+    for s <- ["-wal", "-shm"], do: File.rm(path <> s)
+
+    # Upload B: the object is now at new_etag = content_etag(B), bytes identical to the
+    # local `.db` — the exact post-upload, pre-drop state of flush_then_drop.
+    :ok = Storage.flush(shard, path)
+
+    # PRE-FIX residue: the sidecar was never advanced past the OLD pre-flush etag.
+    File.write!(path <> ".etag", "stale-pre-flush-etag")
+
+    handler = attach_forked(shard)
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    capture_log(fn ->
+      {:ok, conn} = ShardExecutor.open(shard)
+
+      # The bytes survive (re-pulled after the spurious quarantine), but at the cost of
+      # a false fork.
+      assert {:ok, %StmtResult{rows: [["alice"]]}} =
+               ShardExecutor.execute(conn, stmt("SELECT v FROM kv"))
+
+      close_and_stop(shard, conn)
+    end)
+
+    assert_receive {:forked, ^shard},
+                   1_000,
+                   "a stale-etag sidecar over identical bytes spuriously forks (the #21 bug)"
+
+    assert Path.wildcard(path <> ".forked.*") != [],
+           "the false fork leaks a `.forked` recovery copy"
+  end
+
+  # The counterpart to the residue above: what the #21 fix leaves. Stamping new_etag
+  # into the sidecar BEFORE drop_local means a crash-after-upload leaves the local `.db`
+  # with a FRESH sidecar matching the object — so the next warm open is an ordinary clean
+  # restart: no fork telemetry, no quarantine, the bytes served warm.
+  test "a fresh-etag sidecar (the #21 fix's residue) restarts clean with no fork",
+       %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+    on_exit(fn -> Enum.each(Path.wildcard(local_db(shard) <> ".forked*"), &File.rm_rf/1) end)
+
+    path = local_db(shard)
+    File.mkdir_p!(Path.dirname(path))
+    {:ok, c} = Connection.open(path)
+    :ok = Connection.exec(c, "CREATE TABLE kv (v TEXT)")
+    :ok = Connection.exec(c, "INSERT INTO kv VALUES ('alice')")
+    :ok = Connection.exec(c, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(c)
+    for s <- ["-wal", "-shm"], do: File.rm(path <> s)
+
+    :ok = Storage.flush(shard, path)
+    {:ok, new_etag} = Storage.object_etag(shard)
+
+    # POST-FIX residue: the sidecar was advanced to new_etag before the (interrupted) drop.
+    File.write!(path <> ".etag", new_etag)
+
+    handler = attach_forked(shard)
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    assert {:ok, %StmtResult{rows: [["alice"]]}} =
+             ShardExecutor.execute(conn, stmt("SELECT v FROM kv")),
+           "the fresh-sidecar warm restart serves the recovered bytes"
+
+    refute_receive {:forked, ^shard},
+                   200,
+                   "a fresh-etag sidecar over identical bytes must NOT false-fork (the #21 fix)"
+
+    refute Path.wildcard(path <> ".forked.*") != [],
+           "a clean warm restart must not quarantine a recovery copy"
+
+    close_and_stop(shard, conn)
+  end
+
+  # Attach a telemetry handler that forwards each fork quarantine to the test process,
+  # tagged with the shard id, so the residue tests can assert on false-fork emission.
+  defp attach_forked(shard) do
+    test_pid = self()
+    handler_id = "forked-#{shard}-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler_id,
+      [:fathom, :shard, :forked],
+      fn _event, _measure, %{shard_id: sid}, _cfg -> send(test_pid, {:forked, sid}) end,
+      nil
+    )
+
+    handler_id
+  end
+
   # Expert review 2026-07-14 #2: the per-open temp reap used to `Path.wildcard`
   # `<base>.{dl,snap,tmp,pull}*`, which can't prefix-optimize a `*`-in-filename pattern
   # and so full-`readdir`d the fleet-sized shard data dir on EVERY open (tens-to-hundreds
