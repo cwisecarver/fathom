@@ -33,6 +33,11 @@ RUN mix deps.compile
 COPY fathom/priv priv
 COPY fathom/lib lib
 COPY fathom/assets assets
+# Rig-only: compile the web endpoint for plaintext LAN access (SSL-force + WS origin check off),
+# so each node's admin dashboard is reachable from another host over http. force_ssl is a
+# compile-time config key, so this must be a BUILD-time env (see config/prod.exs). Never real prod.
+# Placed here (not earlier) so the dependency layers stay cached — only the app recompiles.
+ENV WEB_INSECURE_LOCAL=1
 # Compile FIRST: colocated LiveView hooks are extracted into the build dir at
 # compile time and the esbuild bundle imports them (phoenix-colocated/fathom).
 RUN mix compile

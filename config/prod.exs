@@ -9,13 +9,20 @@ config :fathom, FathomWeb.Endpoint, cache_static_manifest: "priv/static/cache_ma
 
 # Force using SSL in production. This also sets the "strict-security-transport" header,
 # known as HSTS. If you have a health check endpoint, you may want to exclude it below.
-# Note `:force_ssl` is required to be set at compile-time.
-config :fathom, FathomWeb.Endpoint,
-  force_ssl: [rewrite_on: [:x_forwarded_proto]],
-  exclude: [
-    # paths: ["/health"],
-    hosts: ["localhost", "127.0.0.1"]
-  ]
+# Note `:force_ssl` is required to be set at COMPILE-time (runtime overrides abort boot), so the
+# insecure-local escape hatch is compile-time too: WEB_INSECURE_LOCAL is a BUILD-time env set only
+# by the chaos rig / a plaintext LAN demo — it turns off SSL forcing + the LiveView WS origin check
+# so a browser on the LAN can reach the plaintext dashboard. NEVER build a real deployment with it.
+if System.get_env("WEB_INSECURE_LOCAL") in ~w(1 true) do
+  config :fathom, FathomWeb.Endpoint, force_ssl: false, check_origin: false
+else
+  config :fathom, FathomWeb.Endpoint,
+    force_ssl: [rewrite_on: [:x_forwarded_proto]],
+    exclude: [
+      # paths: ["/health"],
+      hosts: ["localhost", "127.0.0.1"]
+    ]
+end
 
 # Configure Swoosh API Client
 config :swoosh, api_client: Swoosh.ApiClient.Req
