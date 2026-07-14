@@ -417,15 +417,29 @@ defmodule Fathom.Shard.Storage do
   """
   @spec mark_incarnation_dead(String.t()) :: :ok
   def mark_incarnation_dead(owner) do
-    :persistent_term.put({__MODULE__, :dead_incarnation}, owner)
+    # A SET of every proven-dead incarnation, not a single overwriting slot (expert review
+    # 2026-07-14 #19): a node that restarts several times fast (incarnations X→Y→Z) proves each
+    # predecessor dead in turn, but a lone slot remembered only the LATEST — locks still held by
+    # the earlier, equally-dead incarnations then fell back to the slow lock-TTL liveness path
+    # (up to TTL+margin of extra unavailability per recently-held shard on every fast restart),
+    # the exact cost this fast-path exists to erase. The set is tiny (a handful of recent
+    # incarnations of THIS node) so it stays bounded and simple. persistent_term writes trigger
+    # a global GC, so write ONLY on a genuinely new discovery (membership-check first).
+    dead = dead_incarnations()
+
+    unless MapSet.member?(dead, owner) do
+      :persistent_term.put({__MODULE__, :dead_incarnations}, MapSet.put(dead, owner))
+    end
+
     :ok
   end
 
-  @doc "Whether `owner` is the previous incarnation `mark_incarnation_dead/1` recorded. Exact string match, so migrator/foreign owners can never match."
+  @doc "Whether `owner` is a previous incarnation `mark_incarnation_dead/1` proved dead. Exact string match, so migrator/foreign owners can never match."
   @spec incarnation_dead?(String.t()) :: boolean()
-  def incarnation_dead?(owner) do
-    :persistent_term.get({__MODULE__, :dead_incarnation}, nil) == owner
-  end
+  def incarnation_dead?(owner), do: MapSet.member?(dead_incarnations(), owner)
+
+  defp dead_incarnations,
+    do: :persistent_term.get({__MODULE__, :dead_incarnations}, MapSet.new())
 
   @doc """
   Remove orphaned sibling temps of `base` older than `older_than_ms` (expert review
