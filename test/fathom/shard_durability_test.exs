@@ -111,6 +111,63 @@ defmodule Fathom.ShardDurabilityTest do
     ShardExecutor.close(conn)
   end
 
+  # Expert review 2026-07-14 #1 (residual): an explicit transaction whose LAST data statement
+  # modifies 0 rows, straddling a periodic flush, must not lose its committed write on idle drop.
+  # The INSERT bumps WriteCounter (uncommitted); a flush landing mid-transaction snapshots WITHOUT
+  # the uncommitted row (VACUUM INTO on a separate connection) yet advances the watermark to that
+  # count. The 0-row UPDATE and the COMMIT that inherits its changes()=0 both leave wrote?/2 false,
+  # so — before the commit-boundary bump — count == flushed_through, the shard reads clean, and the
+  # idle drop_clean deletes the local copy without uploading the committed row. End-to-end probe
+  # (immune to the WriteCounter-restart generation backstop that confounds the dirty flag): drop
+  # the shard, cold-pull from storage, and assert the committed row survived. (The common case,
+  # where the last statement's changes()>0, already re-bumps via wrote?/2 — verified empirically;
+  # this closes the 0-row-tail residual.)
+  test "a committed transaction ending on a 0-row write, straddling a flush, is not lost on drop",
+       %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    # Clean baseline: flush the CREATE so flushed_through == count.
+    flush_now(coordinator)
+    refute dirty?(shard)
+
+    # Open a transaction and write a row (bumps WriteCounter; uncommitted, invisible to a
+    # separate-connection snapshot). Then a 0-row UPDATE — which still bumps (wrote?/2's DDL branch)
+    # but crucially resets sqlite3_changes() to 0, so the COMMIT that later inherits it is 0-change.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("BEGIN"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (1, 'alice')"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("UPDATE kv SET v = 'x' WHERE 1 = 0"))
+
+    # A flush lands mid-transaction, AFTER the last bumping statement: its snapshot can't see the
+    # uncommitted row, but it advances the watermark to the current count — so the shard now reads
+    # clean past an uncommitted write, with no further statement able to re-dirty it before COMMIT.
+    flush_now(coordinator)
+
+    refute dirty?(shard),
+           "the mid-transaction flush advances the watermark past the uncommitted row"
+
+    # COMMIT inherits the 0-row UPDATE's changes()=0, so wrote?/2 is false — only the commit-boundary
+    # bump re-dirties the shard. Without it, count == flushed_through and the shard reads clean.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("COMMIT"))
+
+    # Close the connection: the shard idles (50 ms), flushes-and-drops, and stops. A clean shard
+    # would drop WITHOUT uploading the committed row — losing it.
+    close_and_stop(shard, conn)
+    refute File.exists?(local_db(shard)), "idle drop removed the local copy"
+
+    # Re-open cold-pulls from storage. The committed row must be there.
+    {:ok, conn2} = ShardExecutor.open(shard)
+
+    assert {:ok, %StmtResult{rows: [["alice"]]}} =
+             ShardExecutor.execute(conn2, stmt("SELECT v FROM kv WHERE k = 1")),
+           "the committed row must survive the flush-straddle + idle drop"
+
+    ShardExecutor.close(conn2)
+  end
+
   test "the durability flush is fenced: a lost lease self-fences instead of clobbering",
        %{shard: shard} do
     {:ok, conn} = ShardExecutor.open(shard)

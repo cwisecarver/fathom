@@ -78,8 +78,19 @@ defmodule Fathom.ShardExecutor do
         # A write bumps the shard's write counter so the periodic durability flush knows local
         # holds un-flushed changes; a read-only shard stays clean and skips the upload (the
         # durability-flush storm fix). Lock-free ETS from this stream process — no per-write cast
-        # to the coordinator (finding #27).
-        if wrote?(result, sql), do: Fathom.Shard.WriteCounter.bump(shard_id)
+        # to the coordinator (finding #27). Also bump on the COMMIT/END boundary: a periodic flush
+        # landing mid-transaction captures WriteCounter (which already counts the in-flight
+        # INSERTs) but its VACUUM INTO snapshot — on a separate connection — excludes the
+        # uncommitted rows and then advances the watermark past them. In the common case the COMMIT
+        # inherits the last data statement's changes()>0 so wrote?/2 already re-bumps; but if the
+        # transaction's last data statement modified 0 rows (a no-op UPDATE/DELETE) changes() is 0
+        # and wrote?/2 is false, so an idle drop_clean could delete a committed row that never
+        # reached storage. Bumping on the commit boundary re-dirties the shard so the next flush
+        # re-snapshots the now-committed data. Over-counting is the safe direction (an extra flush,
+        # never lost data).
+        if wrote?(result, sql) or ends_transaction?(sql),
+          do: Fathom.Shard.WriteCounter.bump(shard_id)
+
         # On the reserved template shard, feed each successful statement to the
         # migration capture so a Django migrate becomes a fleet version.
         capture(shard_id, conn, sql)
@@ -155,6 +166,19 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp control_statement?(_sql), do: false
+
+  # A transaction-committing statement (COMMIT / END — SQLite treats END as a COMMIT synonym).
+  # This is the durability boundary where in-flight INSERTs become committed; see the bump site
+  # in do_execute/2 for why the commit must re-dirty the shard. ROLLBACK is deliberately excluded
+  # (it discards the writes, so there is nothing new to flush). Matches the leading token of the
+  # whole statement, so a trigger body's inner `... BEGIN ... END` (the statement starts with
+  # CREATE) is never mistaken for a transaction commit.
+  defp ends_transaction?(sql) when is_binary(sql) do
+    lead = sql |> String.trim_leading() |> String.downcase()
+    String.starts_with?(lead, "commit") or String.starts_with?(lead, "end")
+  end
+
+  defp ends_transaction?(_sql), do: false
 
   # The assignment form (`pragma [db.]name = value`) of a header-writing pragma; the
   # bare read form (`pragma user_version`) has no `=` and stays a read.
