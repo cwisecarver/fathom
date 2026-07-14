@@ -86,6 +86,26 @@ defmodule Fathom.ShardLatencyTest do
     assert ShardLatency.percentiles("empty") == %{p50_ms: 0.0, p95_ms: 0.0, p99_ms: 0.0}
   end
 
+  # The windowing seam the collector uses (expert review 2026-07-14 #12): percentiles taken over a
+  # PER-BUCKET DIFF of two ticks surface the recent window, not the lifetime cumulative max — a
+  # shard slow an hour ago must not show a permanently elevated p99. percentiles_from_histogram/1
+  # takes an already-fetched vector, so the collector can diff before taking percentiles.
+  test "percentiles_from_histogram windows a diff to the recent (fast) samples" do
+    # Lifetime: 100 slow (50 ms) then 100 fast (0.5 ms), cumulative.
+    for _ <- 1..100, do: ShardLatency.record("win", native_us(50_000))
+    slow_only = ShardLatency.histogram("win")
+
+    for _ <- 1..100, do: ShardLatency.record("win", native_us(500))
+    cumulative = ShardLatency.histogram("win")
+
+    # The cumulative read still catches the 50 ms tail…
+    assert ShardLatency.percentiles_from_histogram(cumulative).p99_ms >= 10.0
+
+    # …but a per-bucket diff (current − last tick's slow-only) is just the fast window ⇒ fast p99.
+    windowed = Enum.zip_with(cumulative, slow_only, fn c, p -> max(c - p, 0) end)
+    assert ShardLatency.percentiles_from_histogram(windowed).p99_ms < 5.0
+  end
+
   test "forget drops a shard's histogram" do
     ShardLatency.record("gone", native_us(1000))
     assert Enum.sum(ShardLatency.histogram("gone")) == 1

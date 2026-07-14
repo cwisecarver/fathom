@@ -129,9 +129,21 @@ defmodule Fathom.ShardLatency do
   in one lookup. `%{p50_ms: _, p95_ms: _, p99_ms: _}`; all-zero (no queries) ⇒ zeros.
   """
   @spec percentiles(String.t()) :: %{p50_ms: float(), p95_ms: float(), p99_ms: float()}
-  def percentiles(shard_id) do
-    counts = histogram(shard_id)
+  def percentiles(shard_id), do: shard_id |> histogram() |> percentiles_from_histogram()
 
+  @doc """
+  p50/p95/p99 (ms) from an already-fetched histogram vector (`histogram/1`'s shape). This is the
+  windowing seam for `Fathom.Admin.MetricsCollector`, which diffs two ticks' histograms *before*
+  taking percentiles so per-shard tail latency is a recent-window figure, not the lifetime
+  cumulative one (expert review 2026-07-14 #12). `percentiles/1` is this over the shard's current
+  cumulative histogram.
+  """
+  @spec percentiles_from_histogram([non_neg_integer()]) :: %{
+          p50_ms: float(),
+          p95_ms: float(),
+          p99_ms: float()
+        }
+  def percentiles_from_histogram(counts) do
     %{
       p50_ms: percentile_ms(counts, 50),
       p95_ms: percentile_ms(counts, 95),

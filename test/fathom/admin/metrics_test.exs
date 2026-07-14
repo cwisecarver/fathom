@@ -1,3 +1,20 @@
+defmodule Fathom.Admin.MetricsTestUsageStub do
+  @moduledoc false
+  # A `stored_usage/0` that blocks until the test releases it, so the collector's storage-usage
+  # poll is observably "in flight" and the overlap guard is testable (expert review 2026-07-14 #22).
+  # Signals the gate pid (the test) when the poll starts, then waits for `:release`.
+  def stored_usage do
+    pid = Application.get_env(:fathom, :usage_poll_gate)
+    send(pid, {:usage_poll_started, self()})
+
+    receive do
+      :release -> {5, 500}
+    after
+      5_000 -> {0, 0}
+    end
+  end
+end
+
 defmodule Fathom.Admin.MetricsTest do
   @moduledoc """
   The metrics-layer instrumentation: the per-shard flush watermark + RPO derivation
@@ -218,5 +235,112 @@ defmodule Fathom.Admin.MetricsTest do
     snap = Fathom.Admin.MetricsCollector.snapshot()
     assert is_map(snap.current)
     assert is_list(snap.history)
+  end
+
+  # ── #11: a blank/failed scrape must not reset the rate baselines (no false-recovery spike) ──
+
+  test "a blank scrape holds the diff baselines so recovery doesn't spike (expert review 2026-07-14 #11)" do
+    alias Fathom.Admin.{MetricsCollector, PrometheusScrape}
+
+    real = fn n -> PrometheusScrape.parse("fathom_s3_op_count{op=\"get\"} #{n}\n") end
+
+    # Tick 1: first sample establishes the baseline (rate 0 — no prior).
+    s1 = MetricsCollector.scrape_step(real.(10), [], %{}, 1.0)
+    assert s1.counter_rates.s3_ops["get"] == 0.0
+
+    # Tick 2: a genuine +5 over one window ⇒ 5 q/s.
+    s2 = MetricsCollector.scrape_step(real.(15), s1.query_buckets, s1.counters, 1.0)
+    assert_in_delta s2.counter_rates.s3_ops["get"], 5.0, 0.001
+
+    # Tick 3: the reporter errored/timed out ⇒ blank scrape. It emits zeros AND HOLDS the last-good
+    # baseline instead of storing the empty scrape (the bug: an all-zero baseline).
+    s3 = MetricsCollector.scrape_step([], s2.query_buckets, s2.counters, 1.0)
+    assert s3.counter_rates == %{s3_ops: %{}, s3_bytes: %{}, checkout: %{}}
+    assert s3.counters == s2.counters, "the last-good baseline is held, not reset to zeros"
+    assert s3.query_buckets == s2.query_buckets
+
+    # Tick 4: recovery. Because tick 3 held the baseline (15), the +5 → 20 reads as 5 q/s — NOT the
+    # whole cumulative 20 a zeroed baseline would have produced (the false-recovery spike).
+    s4 = MetricsCollector.scrape_step(real.(20), s3.query_buckets, s3.counters, 1.0)
+    assert_in_delta s4.counter_rates.s3_ops["get"], 5.0, 0.001
+    refute s4.counter_rates.s3_ops["get"] > 10.0
+  end
+
+  # ── #12: per-shard latency percentiles are windowed, not lifetime-cumulative ──
+
+  test "window_latency reports the recent window, not the lifetime max (expert review 2026-07-14 #12)" do
+    prev_load = Application.get_env(:fathom, :shard_load)
+    Application.put_env(:fathom, :shard_load, true)
+    Fathom.ShardLatency.reset()
+
+    on_exit(fn ->
+      Fathom.ShardLatency.reset()
+      restore(:shard_load, prev_load)
+    end)
+
+    id = uniq("w12")
+    native = fn us -> System.convert_time_unit(us, :microsecond, :native) end
+
+    # Tick 1: the shard is SLOW (50 ms). First appearance ⇒ cumulative fallback ⇒ p99 catches it.
+    for _ <- 1..50, do: Fathom.ShardLatency.record(id, native.(50_000))
+    {[h1], prev1} = Fathom.Admin.MetricsCollector.window_latency([%{shard_id: id}], %{})
+    assert h1.p99_ms >= 10.0, "tick1 p99 catches the 50ms samples (got #{h1.p99_ms})"
+
+    # Between ticks, only FAST (0.5 ms) traffic arrives; the histogram is cumulative (slow + fast).
+    for _ <- 1..50, do: Fathom.ShardLatency.record(id, native.(500))
+
+    # Tick 2: windowed against tick 1 ⇒ the diff is the fast samples only, so p99 is FAST — NOT the
+    # 50 ms lifetime max a straight cumulative read would still report.
+    {[h2], _prev2} = Fathom.Admin.MetricsCollector.window_latency([%{shard_id: id}], prev1)
+
+    assert h2.p99_ms < 5.0,
+           "tick2 p99 reflects the recent fast window, not the 50ms lifetime max (got #{h2.p99_ms})"
+  end
+
+  # ── #22: the storage-usage poll is supervised, overlap-guarded, and caches on completion ──
+
+  test "the storage-usage poll is supervised + overlap-guarded (expert review 2026-07-14 #22)" do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    prev_tick = Application.get_env(:fathom, :admin_tick_ms)
+    prev_usage = Application.get_env(:fathom, :admin_usage_ms)
+    prev_gate = Application.get_env(:fathom, :usage_poll_gate)
+
+    # Slow the automatic tick + poll cadence right down (we drive :usage_poll manually) and point
+    # storage at the blocking stub so a poll stays observably in flight.
+    Application.put_env(:fathom, :shard_storage, Fathom.Admin.MetricsTestUsageStub)
+    Application.put_env(:fathom, :admin_tick_ms, 60_000)
+    Application.put_env(:fathom, :admin_usage_ms, 60_000)
+    Application.put_env(:fathom, :usage_poll_gate, self())
+
+    on_exit(fn ->
+      restore(:shard_storage, prev_storage)
+      restore(:admin_tick_ms, prev_tick)
+      restore(:admin_usage_ms, prev_usage)
+      restore(:usage_poll_gate, prev_gate)
+    end)
+
+    attach([:fathom, :storage, :usage])
+    pid = start_supervised!(Fathom.Admin.MetricsCollector)
+
+    # init fires one :usage_poll ⇒ exactly one SUPERVISED task starts and blocks in the stub.
+    assert_receive {:usage_poll_started, task_pid}, 1_000
+    assert length(Task.Supervisor.children(Fathom.Admin.TaskSupervisor)) == 1
+
+    # A second :usage_poll while the first is in flight must NOT spawn a second task (overlap guard).
+    send(pid, :usage_poll)
+    refute_receive {:usage_poll_started, _}, 200
+    assert length(Task.Supervisor.children(Fathom.Admin.TaskSupervisor)) == 1
+
+    # Release the in-flight poll: it completes, caches usage (republished as the gauge), frees the slot.
+    send(task_pid, :release)
+    assert_receive {:telemetry, [:fathom, :storage, :usage], %{objects: 5, bytes: 500}, _}, 1_000
+
+    # The cache is updated and readable via snapshot/0 after a tick would read it — assert the state.
+    assert %{usage: {5, 500}, usage_task: nil} = :sys.get_state(pid)
+
+    # Slot freed ⇒ a subsequent poll runs (proves completion cleared the guard); release it to clean up.
+    send(pid, :usage_poll)
+    assert_receive {:usage_poll_started, task_pid2}, 1_000
+    send(task_pid2, :release)
   end
 end

@@ -36,6 +36,9 @@ defmodule Fathom.Admin.MetricsCollector do
 
   @default_tick_ms 1_000
   @default_usage_ms 60_000
+  # Budget for one storage-usage poll (an S3 LIST); a slower one is killed so it can't pin the
+  # overlap-guard slot (#22). Comfortably under the 60s poll cadence.
+  @default_usage_timeout_ms 30_000
   @hot_n 20
   # Bounded ring of recent points for the hero charts, so a freshly-connected LiveView can paint a
   # populated chart from snapshot/0 instead of waiting to accumulate ticks. ~5 min at 1 s.
@@ -66,6 +69,11 @@ defmodule Fathom.Admin.MetricsCollector do
       prev_mono: mono_ms(),
       prev_query_buckets: [],
       prev_counters: %{},
+      # Per-shard latency histograms from last tick (shard_id → raw count vector), for the reported
+      # hot shards only — the windowing baseline (#12). usage_task holds the in-flight storage-usage
+      # poll (overlap guard, #22). Both expert review 2026-07-14.
+      prev_latency: %{},
+      usage_task: nil,
       usage: nil,
       rings: [],
       current: nil
@@ -90,31 +98,72 @@ defmodule Fathom.Admin.MetricsCollector do
   end
 
   # Storage footprint on a slow cadence (an S3 LIST is expensive) — cache it + publish it as a
-  # gauge so Prometheus/Grafana also see it. Run the (possibly slow) call in a Task so it never
-  # blocks the realtime tick.
-  def handle_info(:usage_poll, state) do
-    parent = self()
-
-    Task.start(fn ->
-      usage =
-        case Fathom.Shard.Storage.stored_usage() do
-          {objects, bytes} when is_integer(objects) and is_integer(bytes) -> {objects, bytes}
-          _ -> nil
-        end
-
-      send(parent, {:usage, usage})
-    end)
-
+  # gauge so Prometheus/Grafana also see it. Runs as a SUPERVISED, TIMED, OVERLAP-GUARDED task
+  # (never an unlinked/unbounded `Task.start`), off the realtime tick — expert review 2026-07-14
+  # #22. A poll already in flight is skipped rather than piling up orphan S3 LISTs.
+  def handle_info(:usage_poll, %{usage_task: task} = state) when not is_nil(task) do
     schedule(:usage_poll, usage_ms())
     {:noreply, state}
   end
 
-  def handle_info({:usage, nil}, state), do: {:noreply, state}
+  def handle_info(:usage_poll, state) do
+    task =
+      Task.Supervisor.async_nolink(Fathom.Admin.TaskSupervisor, fn ->
+        case Fathom.Shard.Storage.stored_usage() do
+          {objects, bytes} when is_integer(objects) and is_integer(bytes) -> {objects, bytes}
+          _ -> nil
+        end
+      end)
 
-  def handle_info({:usage, {objects, bytes} = usage}, state) do
-    :telemetry.execute([:fathom, :storage, :usage], %{objects: objects, bytes: bytes}, %{})
-    {:noreply, %{state | usage: usage}}
+    # async_nolink monitors but doesn't time out on its own; arm our own budget so a wedged LIST
+    # can't pin the slot forever (we kill it in the :usage_timeout clause below).
+    timer = Process.send_after(self(), {:usage_timeout, task.ref}, usage_timeout_ms())
+    schedule(:usage_poll, usage_ms())
+    {:noreply, %{state | usage_task: %{ref: task.ref, pid: task.pid, timer: timer}}}
   end
+
+  # The poll task's result (async_nolink delivers `{ref, result}`): cache + republish it as a gauge,
+  # then drop the pending DOWN + our timeout and free the slot.
+  def handle_info({ref, result}, %{usage_task: %{ref: ref, timer: timer}} = state) do
+    Process.demonitor(ref, [:flush])
+    Process.cancel_timer(timer)
+
+    state =
+      case result do
+        {objects, bytes} ->
+          :telemetry.execute([:fathom, :storage, :usage], %{objects: objects, bytes: bytes}, %{})
+          %{state | usage: {objects, bytes}}
+
+        _ ->
+          state
+      end
+
+    {:noreply, %{state | usage_task: nil}}
+  end
+
+  # The poll task crashed (async_nolink monitors, doesn't link) — free the slot so the next tick polls.
+  def handle_info(
+        {:DOWN, ref, :process, _pid, _reason},
+        %{usage_task: %{ref: ref, timer: timer}} = state
+      ) do
+    Process.cancel_timer(timer)
+    {:noreply, %{state | usage_task: nil}}
+  end
+
+  # The poll overran its budget — kill the task and free the slot (a wedged LIST never wedges polling).
+  def handle_info({:usage_timeout, ref}, %{usage_task: %{ref: ref, pid: pid}} = state) do
+    Task.Supervisor.terminate_child(Fathom.Admin.TaskSupervisor, pid)
+    Process.demonitor(ref, [:flush])
+    {:noreply, %{state | usage_task: nil}}
+  end
+
+  # Late/stale reply, DOWN, or timeout for an already-cleared poll — ignore (never crash the tick).
+  def handle_info({ref, _result}, state) when is_reference(ref), do: {:noreply, state}
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) when is_reference(ref),
+    do: {:noreply, state}
+
+  def handle_info({:usage_timeout, _ref}, state), do: {:noreply, state}
 
   # --- the tick computation (kept as small pure-ish steps for readability) ---
 
@@ -131,19 +180,18 @@ defmodule Fathom.Admin.MetricsCollector do
       |> Enum.reject(&(&1.q_per_s <= 0.0))
       |> Enum.sort_by(& &1.q_per_s, :desc)
       |> Enum.take(@hot_n)
-      # Per-shard tail latency — computed ONLY for the top-N hot shards (cardinality-bounded:
-      # the read cost never scales with resident-shard count). Each is one ETS lookup + a
-      # histogram-percentile walk over Fathom.ShardLatency's µs buckets.
-      |> Enum.map(fn s -> Map.merge(s, ShardLatency.percentiles(s.shard_id)) end)
 
+    # Per-shard tail latency for the top-N hot shards only (cardinality-bounded: read cost never
+    # scales with resident-shard count). WINDOWED against last tick (see window_latency/2), so it
+    # lines up with the node-wide 1s-windowed p50/p95/p99 rather than a lifetime figure (#12).
+    {hot, latency} = window_latency(hot, state.prev_latency)
+
+    # Scrape-derived windowed series (query-latency percentiles + counter rates + cold-open p50).
+    # On a blank/failed scrape the diff baselines are HELD, not advanced, so recovery never spikes
+    # (#11); see scrape_step/4.
     scrape = PrometheusScrape.parse(safe_scrape())
+    s = scrape_step(scrape, state.prev_query_buckets, state.prev_counters, window_s)
 
-    query_buckets = PrometheusScrape.buckets(scrape, "fathom_shard_query_duration")
-    win = PrometheusScrape.diff_buckets(query_buckets, state.prev_query_buckets)
-
-    cold_buckets = PrometheusScrape.buckets(scrape, "fathom_shard_cold_open_duration")
-
-    {counters, counter_rates} = counter_rates(scrape, state.prev_counters, window_s)
     {dirty, oldest_rpo} = rpo()
 
     current = %{
@@ -152,15 +200,15 @@ defmodule Fathom.Admin.MetricsCollector do
       open_shards: Registry.count(Fathom.ShardRegistry),
       memory_bytes: :erlang.memory(:total),
       node_qps: node_qps,
-      query_p50_ms: PrometheusScrape.percentile_cumulative(win, 50),
-      query_p95_ms: PrometheusScrape.percentile_cumulative(win, 95),
-      query_p99_ms: PrometheusScrape.percentile_cumulative(win, 99),
-      cold_open_p50_ms: PrometheusScrape.percentile_cumulative(cold_buckets, 50),
+      query_p50_ms: PrometheusScrape.percentile_cumulative(s.win, 50),
+      query_p95_ms: PrometheusScrape.percentile_cumulative(s.win, 95),
+      query_p99_ms: PrometheusScrape.percentile_cumulative(s.win, 99),
+      cold_open_p50_ms: PrometheusScrape.percentile_cumulative(s.cold_buckets, 50),
       dirty_shards: dirty,
       oldest_rpo_ms: oldest_rpo,
-      s3_ops_per_s: counter_rates.s3_ops,
-      s3_bytes_per_s: counter_rates.s3_bytes,
-      checkout_per_s: counter_rates.checkout,
+      s3_ops_per_s: s.counter_rates.s3_ops,
+      s3_bytes_per_s: s.counter_rates.s3_bytes,
+      checkout_per_s: s.counter_rates.checkout,
       storage_objects: usage_elem(state.usage, 0),
       storage_bytes: usage_elem(state.usage, 1),
       hot_shards: hot
@@ -178,10 +226,73 @@ defmodule Fathom.Admin.MetricsCollector do
       state
       | prev_load: load,
         prev_mono: now,
-        prev_query_buckets: query_buckets,
-        prev_counters: counters,
+        prev_query_buckets: s.query_buckets,
+        prev_counters: s.counters,
+        prev_latency: latency,
         current: current,
         rings: [ring | state.rings] |> Enum.take(@ring)
+    }
+  end
+
+  @doc false
+  # Attaches WINDOWED p50/p95/p99 (ms) to each hot shard and returns the next `prev_latency`
+  # baseline (only the reported shards, so it stays bounded). ShardLatency histograms are
+  # lifetime-cumulative (reset only by forget/1), so a shard slow an hour ago would otherwise
+  # show a permanently elevated p99 next to the node-wide 1s-windowed p99 (#12). We diff each hot
+  # shard's current histogram against last tick's — clamped ≥ 0 per bucket to survive a coordinator
+  # reset/forget (mirrors rate/3's reset clamp) — and take percentiles over the window. A shard on
+  # its first appearance (no prior sample) falls back to its cumulative histogram for that tick.
+  def window_latency(hot, prev_latency) do
+    cur = Map.new(hot, fn s -> {s.shard_id, ShardLatency.histogram(s.shard_id)} end)
+
+    hot =
+      Enum.map(hot, fn s ->
+        c = Map.fetch!(cur, s.shard_id)
+
+        windowed =
+          case Map.get(prev_latency, s.shard_id) do
+            nil -> c
+            p -> diff_hist(c, p)
+          end
+
+        Map.merge(s, ShardLatency.percentiles_from_histogram(windowed))
+      end)
+
+    {hot, cur}
+  end
+
+  defp diff_hist(cur, prev), do: Enum.zip_with(cur, prev, fn c, p -> max(c - p, 0) end)
+
+  @doc false
+  # The scrape-derived windowed series. On a blank/failed scrape (`scrape == []`, i.e. the reporter
+  # errored/timed out) the diff baselines are HELD, not advanced, and this tick emits zeros — so
+  # the NEXT (recovered) tick diffs against the last GOOD scrape rather than against zeros. Storing
+  # the empty scrape as the baseline (the old behaviour) made recovery read the entire cumulative
+  # count as one window's worth — `rate(N, 0.0, window) = N` — a huge false spike (same for the
+  # query-latency percentiles, which would reflect the lifetime distribution). Expert review
+  # 2026-07-14 #11. Returns the emitted values + the next diff baselines.
+  def scrape_step([], prev_query_buckets, prev_counters, _window_s) do
+    %{
+      win: [],
+      cold_buckets: [],
+      counter_rates: %{s3_ops: %{}, s3_bytes: %{}, checkout: %{}},
+      query_buckets: prev_query_buckets,
+      counters: prev_counters
+    }
+  end
+
+  def scrape_step(scrape, prev_query_buckets, prev_counters, window_s) do
+    query_buckets = PrometheusScrape.buckets(scrape, "fathom_shard_query_duration")
+    win = PrometheusScrape.diff_buckets(query_buckets, prev_query_buckets)
+    cold_buckets = PrometheusScrape.buckets(scrape, "fathom_shard_cold_open_duration")
+    {counters, counter_rates} = counter_rates(scrape, prev_counters, window_s)
+
+    %{
+      win: win,
+      cold_buckets: cold_buckets,
+      counter_rates: counter_rates,
+      query_buckets: query_buckets,
+      counters: counters
     }
   end
 
@@ -273,4 +384,7 @@ defmodule Fathom.Admin.MetricsCollector do
 
   defp tick_ms, do: Application.get_env(:fathom, :admin_tick_ms, @default_tick_ms)
   defp usage_ms, do: Application.get_env(:fathom, :admin_usage_ms, @default_usage_ms)
+
+  defp usage_timeout_ms,
+    do: Application.get_env(:fathom, :admin_usage_timeout_ms, @default_usage_timeout_ms)
 end

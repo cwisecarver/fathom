@@ -397,8 +397,14 @@ defmodule Fathom.Application do
   # fans them out over PubSub. Gated with the rest of the admin observability layer
   # (Fathom.Admin.enabled?, off in test). After Fathom.Telemetry so the Prometheus reporter it
   # scrapes is already up.
+  #
+  # Fathom.Admin.TaskSupervisor is UNCONDITIONAL (idle when unused) — it supervises the collector's
+  # slow storage-usage polls (kept off the tick, timed, overlap-guarded — expert review 2026-07-14
+  # #22). Always-on so the collector, and tests that start_supervised/1 it directly, can always
+  # reach it; the collector itself stays gated.
   defp metrics_collector_children do
-    if Fathom.Admin.enabled?(), do: [Fathom.Admin.MetricsCollector], else: []
+    [{Task.Supervisor, name: Fathom.Admin.TaskSupervisor}] ++
+      if Fathom.Admin.enabled?(), do: [Fathom.Admin.MetricsCollector], else: []
   end
 
   # Tell Phoenix to update the endpoint configuration
