@@ -214,31 +214,64 @@ defmodule Fathom.Migrator.ShardMigration do
   end
 
   # A linked process that renews the migrator lease every ttl/3. Unlinked + stopped in the
-  # caller's `after`; if the migrator crashes the link tears the renewer down (no orphan). A
-  # renew returning :superseded / error just stops the loop — the pre-flush `fence/2` is the fence.
+  # caller's `after`; if the migrator crashes the link tears the renewer down (no orphan). Only
+  # `:superseded` stops the loop — the pre-flush `fence/2` is the last-resort fence.
   defp start_renewer(shard_id, lease) do
     ttl = ttl()
     interval = max(div(ttl, 3), 1)
     spawn_link(fn -> renew_loop(shard_id, lease, ttl, interval) end)
   end
 
+  # Expert review 2026-07-14 #9: the loop must distinguish a TRANSIENT store blip
+  # (`{:error, reason}` — a store hiccup: retry, don't fence) from real ownership loss
+  # (`{:error, :superseded}` — a newer owner took over). It previously stopped on ANY
+  # non-`{:ok,_}`, so a single S3 hiccup during a long (unbounded) copy silently ended
+  # renewal — the lock's TTL then lapses and a client steals the shard MID-MIGRATION, the
+  # exact failure the renewer exists to prevent. Mirror the coordinator's own renewal
+  # (`Fathom.Shard`'s `:renew_lease` handler): continue on `{:ok, _}` AND on a transient
+  # error, stop only on `:superseded`. The storage behaviour contract documents the same
+  # "retry, don't fence" split (`Fathom.Shard.Storage.renew_lease/3`).
   defp renew_loop(shard_id, lease, ttl, interval) do
     receive do
       :stop -> :ok
     after
       interval ->
-        renewed? =
+        result =
           try do
-            match?({:ok, _}, Storage.renew_lease(shard_id, lease, ttl))
+            Storage.renew_lease(shard_id, lease, ttl)
           rescue
-            _ -> false
+            # A raised store error is transient too — don't fence on an exception.
+            e -> {:error, e}
           catch
-            _, _ -> false
+            kind, reason -> {:error, {kind, reason}}
           end
 
-        if renewed?, do: renew_loop(shard_id, lease, ttl, interval), else: :ok
+        if renew_continue?(result) do
+          # Thread the fresh lease on success; keep the prior lease on a transient retry
+          # (its owner/epoch are unchanged — only the expiry lapsed, which the next renew
+          # extends). Same as the coordinator's `%{state | lease: lease}` threading.
+          next_lease =
+            case result do
+              {:ok, fresh} -> fresh
+              {:error, _transient} -> lease
+            end
+
+          renew_loop(shard_id, next_lease, ttl, interval)
+        else
+          :ok
+        end
     end
   end
+
+  # The renew loop's continue/stop decision, split out so the transient-vs-superseded
+  # distinction is testable without the loop's timing (expert review 2026-07-14 #9). Only a
+  # `:superseded` (real ownership loss) stops renewal; `{:ok, _}` and every transient
+  # `{:error, _}` keep it alive so a store blip can't lapse the migration lock.
+  @doc false
+  @spec renew_continue?({:ok, term()} | {:error, term()}) :: boolean()
+  def renew_continue?({:error, :superseded}), do: false
+  def renew_continue?({:ok, _}), do: true
+  def renew_continue?({:error, _transient}), do: true
 
   defp stop_renewer(pid) do
     Process.unlink(pid)

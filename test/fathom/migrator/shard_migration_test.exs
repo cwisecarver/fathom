@@ -425,6 +425,31 @@ defmodule Fathom.Migrator.ShardMigrationTest do
            "the migrator must not clobber the new owner's object"
   end
 
+  # Expert review 2026-07-14 #9: the migrator's lease renewer stopped on ANY non-{:ok,_},
+  # conflating a TRANSIENT store blip ({:error, reason}) with real ownership loss
+  # ({:error, :superseded}). A single S3 hiccup during a long copy would then silently END
+  # renewal — lapsing the lock's TTL and letting a client steal the shard MID-MIGRATION. The
+  # decision is now split into renew_continue?/1: continue on {:ok,_} AND on transient errors,
+  # stop ONLY on :superseded (mirroring the coordinator's own renewal in Fathom.Shard).
+  describe "renew_continue?/1 (the renew loop's continue/stop decision)" do
+    test "keeps the loop alive on a successful renew" do
+      lease = %{owner: "migrator@n@1", epoch: 3, expires_at_ms: 0}
+      assert ShardMigration.renew_continue?({:ok, lease})
+    end
+
+    test "keeps the loop alive on a TRANSIENT store error (retry, don't fence)" do
+      # A store blip is not loss of ownership — the loop must retry after the interval,
+      # exactly as the storage behaviour contract (renew_lease/3) documents.
+      assert ShardMigration.renew_continue?({:error, :timeout})
+      assert ShardMigration.renew_continue?({:error, {:transient_lookup, :econnrefused}})
+      assert ShardMigration.renew_continue?({:error, %RuntimeError{message: "boom"}})
+    end
+
+    test "STOPS the loop only on :superseded (real ownership loss)" do
+      refute ShardMigration.renew_continue?({:error, :superseded})
+    end
+  end
+
   # A foreign owner takes the shard's lock (a different owner/epoch than the migrator's), so the
   # migrator's check_lease reports :superseded. No heartbeat needed — check_lease compares the
   # lock, not liveness.
