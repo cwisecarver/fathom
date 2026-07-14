@@ -149,8 +149,11 @@ defmodule Fathom.Admin.MetricsTest do
   test "meter/1 emits an S3-op event with method tag and byte count" do
     attach([:fathom, :s3, :op])
 
+    # A PUT: the request carries the body size; S3's response is content-length 0. The upload
+    # bytes must come from the request body, not the response's 0 (regression: op_bytes preferred
+    # the response and 0 is truthy in Elixir, so PUT volume read 0).
     put_req = %Req.Request{method: :put, headers: %{"content-length" => ["2048"]}}
-    put_resp = %Req.Response{status: 200, headers: %{}}
+    put_resp = %Req.Response{status: 200, headers: %{"content-length" => ["0"]}}
     assert {^put_req, ^put_resp} = Fathom.Shard.Storage.S3.meter({put_req, put_resp})
     assert_receive {:telemetry, [:fathom, :s3, :op], %{count: 1, bytes: 2048}, %{op: :put}}
 

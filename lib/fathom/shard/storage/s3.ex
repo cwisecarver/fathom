@@ -1203,22 +1203,24 @@ defmodule Fathom.Shard.Storage.S3 do
 
   def meter({request, other}), do: {request, other}
 
-  # Transferred bytes: the response content-length for a GET (streamed, so the body isn't
-  # resident but the header is present), else the request content-length for a PUT.
+  # Payload size in whichever direction the op moved: the response body for a GET, the request
+  # body for a PUT/POST. S3's PUT response carries `content-length: 0`, so take the larger of the
+  # two rather than preferring one side (else PUT byte volume reads 0).
   defp op_bytes(request, response) do
-    header_int(Req.Response.get_header(response, "content-length")) ||
-      header_int(Req.Request.get_header(request, "content-length")) ||
-      0
+    max(
+      header_int(Req.Request.get_header(request, "content-length")),
+      header_int(Req.Response.get_header(response, "content-length"))
+    )
   end
 
   defp header_int([v | _]) when is_binary(v) do
     case Integer.parse(v) do
       {n, _} -> n
-      :error -> nil
+      :error -> 0
     end
   end
 
-  defp header_int(_), do: nil
+  defp header_int(_), do: 0
 
   # Test seam only: route requests through a `Plug`/`Req.Test` stub instead of the network,
   # so the conditional-lease semantics (If-Match / If-None-Match on PUT and DELETE) can be
