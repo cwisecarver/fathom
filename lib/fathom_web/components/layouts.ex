@@ -81,7 +81,7 @@ defmodule FathomWeb.Layouts do
 
   attr :active, :atom,
     default: nil,
-    doc: "the active nav item (:overview | :shards | :migrations | :query)"
+    doc: "the active nav item (:overview | :shards | :directory | :migrations | :query)"
 
   attr :node_key, :string, default: ""
   slot :actions, doc: "top-bar right-aligned controls (e.g. a time-range picker)"
@@ -109,6 +109,12 @@ defmodule FathomWeb.Layouts do
               active={@active == :shards}
               icon="hero-circle-stack"
               label="Shards"
+            />
+            <.nav_item
+              navigate={~p"/admin/directory"}
+              active={@active == :directory}
+              icon="hero-table-cells"
+              label="Directory"
             />
             <.nav_item
               navigate={~p"/admin/migrations"}

@@ -42,6 +42,25 @@ defmodule Fathom.Directory.Shard do
   @doc "Valid lifecycle statuses for a directory entry."
   def statuses, do: @statuses
 
+  @doc """
+  Restricted changeset for operator hand-edits from the admin directory UI
+  (expert review 2026-07-14 #22): only the fields **safe to flip by hand** —
+  `status` and `retain_until` — are castable. The migration-state-machine fields
+  (`schema_version`, `cutover_at`, `migrating_since`, `token_version`,
+  `last_active_at`) are deliberately excluded, so an admin edit can never corrupt
+  them even if they appear in `attrs` (`cast/3` drops unlisted keys). Editing
+  `schema_version` by hand, for example, would desync the three-place version
+  stamp and mislead the reconcile sweep — that stays a migration-engine
+  operation, not a hand-flip.
+  """
+  @spec admin_changeset(t(), map()) :: Ecto.Changeset.t()
+  def admin_changeset(shard, attrs) do
+    shard
+    |> cast(attrs, [:status, :retain_until])
+    |> validate_required([:status])
+    |> validate_inclusion(:status, @statuses)
+  end
+
   @doc false
   def changeset(shard, attrs) do
     shard

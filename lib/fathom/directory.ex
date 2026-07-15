@@ -353,6 +353,77 @@ defmodule Fathom.Directory do
     |> Repo.all()
   end
 
+  @max_page 200
+  @default_page 50
+
+  @doc """
+  A page of directory rows for the admin browser (expert review 2026-07-14 #22).
+  Filters by `:status` (exact) and `:q` (shard_id substring, case-insensitive),
+  ordered by `shard_id`, paginated by `:limit` (default #{@default_page}, capped at
+  #{@max_page}) / `:offset`. Returns `%{rows:, total:, limit:, offset:}` — `total`
+  is the full matching count so the UI can page.
+  """
+  @spec list_page(keyword()) :: %{
+          rows: [Shard.t()],
+          total: non_neg_integer(),
+          limit: pos_integer(),
+          offset: non_neg_integer()
+        }
+  def list_page(opts \\ []) do
+    limit = opts |> Keyword.get(:limit, @default_page) |> clamp_page()
+    offset = max(Keyword.get(opts, :offset, 0), 0)
+    query = admin_filter(opts)
+
+    rows =
+      query
+      |> order_by([s], asc: s.shard_id)
+      |> limit(^limit)
+      |> offset(^offset)
+      |> Repo.all()
+
+    %{rows: rows, total: Repo.aggregate(query, :count, :id), limit: limit, offset: offset}
+  end
+
+  defp admin_filter(opts) do
+    base = from(s in Shard)
+
+    base =
+      case Keyword.get(opts, :status) do
+        status when is_binary(status) and status != "" ->
+          from(s in base, where: s.status == ^status)
+
+        _ ->
+          base
+      end
+
+    case Keyword.get(opts, :q) do
+      term when is_binary(term) and term != "" ->
+        from(s in base, where: ilike(s.shard_id, ^("%" <> term <> "%")))
+
+      _ ->
+        base
+    end
+  end
+
+  defp clamp_page(n) when is_integer(n) and n > 0, do: min(n, @max_page)
+  defp clamp_page(_), do: @default_page
+
+  @doc """
+  Guarded operator update of a directory row from the admin UI (expert review
+  2026-07-14 #22). Only `:status` and `:retain_until` are castable — see
+  `Fathom.Directory.Shard.admin_changeset/2`, which is the edit-safety boundary
+  (the migration-state-machine fields can't be hand-flipped here). Returns
+  `{:error, :not_found}` for an unknown shard.
+  """
+  @spec admin_update(String.t(), map()) ::
+          {:ok, Shard.t()} | {:error, :not_found | Ecto.Changeset.t()}
+  def admin_update(shard_id, attrs) do
+    case Repo.get_by(Shard, shard_id: shard_id) do
+      nil -> {:error, :not_found}
+      shard -> shard |> Shard.admin_changeset(attrs) |> Repo.update()
+    end
+  end
+
   defp laggard_query(head_version) do
     from(s in Shard, where: s.schema_version < ^head_version and s.status == "active")
   end
