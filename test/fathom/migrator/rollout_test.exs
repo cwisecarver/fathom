@@ -23,6 +23,31 @@ defmodule Fathom.Migrator.RolloutTest do
       refute_enqueued(worker: Fathom.Migrator.ShardMigrationJob, args: %{"shard_id" => "c"})
     end
 
+    # Expert review 2026-07-14 #8: the capture template (config :template_shard_id) is migrated
+    # directly by Django, so its directory stamp never advances and it perpetually reads as a
+    # laggard. Left in the sweep, the reconcile job drains it + replays its OWN captured DDL onto
+    # itself → quarantine (and a drain racing an in-flight migrate can fork the fleet). It must be
+    # excluded. Pre-fix rollout enqueues it too ({:ok, 2}, and refute below fails).
+    test "the capture template is excluded from the rollout sweep" do
+      prev = Application.get_env(:fathom, :template_shard_id)
+      Application.put_env(:fathom, :template_shard_id, "tmpl_ex")
+
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:fathom, :template_shard_id, prev),
+          else: Application.delete_env(:fathom, :template_shard_id)
+      end)
+
+      {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
+      {:ok, _} = Directory.resolve("tmpl_ex")
+      {:ok, _} = Directory.resolve("tenant_x")
+
+      assert {:ok, 1} = Migrator.rollout()
+      assert_enqueued(migration_job_args("tenant_x"))
+      refute_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => "tmpl_ex"})
+      assert Directory.count_laggards(2) == 1
+    end
+
     test "is a no-op when no version is released (HEAD 0)" do
       {:ok, _} = Directory.resolve("a")
       assert {:ok, 0} = Migrator.rollout()

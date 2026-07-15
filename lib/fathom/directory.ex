@@ -425,7 +425,25 @@ defmodule Fathom.Directory do
   end
 
   defp laggard_query(head_version) do
-    from(s in Shard, where: s.schema_version < ^head_version and s.status == "active")
+    base = from(s in Shard, where: s.schema_version < ^head_version and s.status == "active")
+
+    # The reserved capture template (config :template_shard_id) is migrated directly by Django, so
+    # its directory stamp never advances and it perpetually reads as the most-recent laggard. Left
+    # in, the reconcile sweep drains it + replays its OWN captured DDL onto itself → "already exists"
+    # → quarantine, and a drain racing an in-flight `manage.py migrate` can drop the capture buffer
+    # and fork the fleet from the template (expert review 2026-07-14 #8). Exclude it from every
+    # laggard/rollout sweep. nil (prod default) ⇒ no exclusion.
+    case template_shard_id() do
+      nil -> base
+      id -> from(s in base, where: s.shard_id != ^id)
+    end
+  end
+
+  defp template_shard_id do
+    case Fathom.ShardId.cast(Application.get_env(:fathom, :template_shard_id)) do
+      {:ok, id} -> id
+      _ -> nil
+    end
   end
 
   defp update_shard(shard_id, attrs) do
