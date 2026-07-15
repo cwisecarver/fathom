@@ -28,6 +28,7 @@ defmodule Fathom.ShardDurabilityTest do
           do: File.rm(Path.join(dir, shard <> suffix))
 
       for snap <- Path.wildcard(Path.join(@local_dir, "#{shard}.db.snap.*")), do: File.rm(snap)
+      for f <- Path.wildcard(Path.join(@local_dir, "#{shard}.db.fenced.*")), do: File.rm(f)
     end)
 
     %{shard: shard}
@@ -235,6 +236,37 @@ defmodule Fathom.ShardDurabilityTest do
 
     refute File.exists?(remote_db(shard)),
            "a fenced durability flush must not clobber the new owner"
+  end
+
+  # Expert review 2026-07-14 #5: on a self-fence the coordinator must QUARANTINE its dirty local
+  # copy (acked-but-unflushed committed writes) as `.fenced.<ts>`, not drop_local it — the same
+  # class of data quarantine_fork! preserves. Requires conns == 0 so the lease_lost terminate clause
+  # runs. Pre-fix the local .db was deleted (assertions below fail); post-fix it survives.
+  test "a self-fence quarantines the dirty local copy instead of destroying it", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('acked')"))
+    # Check the connection in (conns == 0) but keep the shard dirty and the coordinator alive
+    # (idle timer is 60s), so the self-fence lands in the lease_lost terminate clause.
+    :ok = ShardExecutor.close(conn)
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    assert Shard.dirty?(coordinator)
+    ref = Process.monitor(coordinator)
+
+    # Another node steals the lease; the next flush's pre-flush fence self-fences.
+    put_raw_lock(shard, "thief@node", 999, now_ms() + 60_000)
+
+    capture_log(fn ->
+      send(coordinator, :durability_flush)
+      assert_receive {:DOWN, ^ref, :process, ^coordinator, {:shutdown, :lease_lost}}, 1_000
+    end)
+
+    assert Path.wildcard(local_db(shard) <> ".fenced.*") != [],
+           "acked-but-unflushed writes must survive a self-fence as .fenced.<ts>, not be dropped"
+
+    refute File.exists?(local_db(shard)),
+           "the superseded local .db was renamed aside, not left in place or deleted"
   end
 
   # Finding #15: the LEASE fence (above) passes if the lease is still ours when the flush

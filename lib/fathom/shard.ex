@@ -1078,15 +1078,19 @@ defmodule Fathom.Shard do
   @impl true
   def terminate(_reason, %{conns: conns, lease_lost: true} = state)
       when map_size(conns) == 0 do
-    # We no longer own the shard; flushing our local copy would clobber the node
-    # that took over. Drop it and leave the lease alone (it's theirs now).
-    _ = settle_flush_task(state)
+    # We no longer own the shard; flushing our local copy would clobber the node that took over.
+    # But don't DESTROY it: a dirty local holds acked-but-unflushed committed writes — exactly the
+    # class of data the fork path carefully preserves — so quarantine it (.fenced.<ts>) for recovery
+    # instead of drop_local (expert review 2026-07-14 #5). A clean copy (an in-flight flush task
+    # landed before the steal) is just dropped. Use the SETTLED state, and decide BEFORE forgetting
+    # the write counter (unflushed?/1 and the lost-window delta both read it).
+    state = settle_flush_task(state)
     Fathom.ShardLoad.forget(state.id)
     Fathom.ShardLatency.forget(state.id)
     Fathom.Shards.Lru.forget(state.id)
+    if unflushed?(state), do: quarantine_fenced!(state), else: drop_local(state.path)
     WriteCounter.forget(state.id)
     FlushWatermark.forget(state.id)
-    drop_local(state.path)
     :ok
   end
 
@@ -1228,11 +1232,14 @@ defmodule Fathom.Shard do
           end
 
         :superseded ->
+          # Lost the lease before we could flush (expert review #5). flush_then_drop only runs on a
+          # dirty shard, so the local copy holds acked-but-unflushed writes — quarantine them for
+          # recovery instead of drop_local. The stored object is the new owner's; we don't clobber it.
           Logger.warning(
-            "shard #{state.id}: lost lease before flush; dropping local without flushing"
+            "shard #{state.id}: lost lease before flush; quarantining local instead of flushing"
           )
 
-          drop_local(state.path)
+          quarantine_fenced!(state)
 
         :skip ->
           Logger.warning(
@@ -1414,6 +1421,47 @@ defmodule Fathom.Shard do
   end
 
   defp drop_local(path), do: Enum.each(["", "-wal", "-shm", ".etag"], &File.rm(path <> &1))
+
+  # Self-fence quarantine (expert review 2026-07-14 #5): the crash-steal counterpart to
+  # quarantine_fork!. On a self-fence (a stealer took our lease during a GC pause/partition) the
+  # local copy holds acked-but-unflushed committed writes; rename it aside (.fenced.<ts>) instead of
+  # deleting it, so those writes survive for forensics/recovery, and emit a structured event with
+  # the un-flushed count so the lost window is enumerable. The loss itself is within the documented
+  # RPO contract — this just stops needlessly destroying a healthy-disk copy the store never got.
+  defp quarantine_fenced!(state) do
+    dest =
+      state.path <>
+        ".fenced.#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
+
+    case File.rename(state.path, dest) do
+      :ok ->
+        Enum.each(["-wal", "-shm"], &File.rename(state.path <> &1, dest <> &1))
+        File.rm(etag_sidecar(state.path))
+        unflushed = max(WriteCounter.count(state.id) - state.flushed_through, 0)
+
+        Logger.error(
+          "shard #{state.id}: lease superseded with #{unflushed} un-flushed write(s) — quarantined " <>
+            "the local copy to #{dest} instead of dropping it (acked writes preserved for recovery; " <>
+            "within the RPO contract, the stored object is the new owner's)."
+        )
+
+        :telemetry.execute(
+          [:fathom, :shard, :fenced_quarantine],
+          %{count: 1, unflushed: unflushed},
+          %{shard_id: state.id}
+        )
+
+        :ok
+
+      {:error, _} = error ->
+        Logger.error(
+          "shard #{state.id}: fence quarantine FAILED (#{inspect(error)}); dropping local copy"
+        )
+
+        drop_local(state.path)
+        error
+    end
+  end
 
   # --- etag provenance sidecar (expert review #1) ---
   #
