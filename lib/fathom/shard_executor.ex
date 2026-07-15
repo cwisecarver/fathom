@@ -94,7 +94,7 @@ defmodule Fathom.ShardExecutor do
         # On the reserved template shard, feed each successful statement to the
         # migration capture so a Django migrate becomes a fleet version.
         capture(shard_id, conn, sql)
-        stmt_result = to_stmt_result(result)
+        stmt_result = to_stmt_result(result, sql)
         # Per-shard load: the query-cost signal for the rebalancer. Lock-free ETS bump,
         # gated + off by default (see Fathom.ShardLoad).
         Fathom.ShardLoad.record_query(
@@ -390,25 +390,43 @@ defmodule Fathom.ShardExecutor do
 
   defp ip?(host), do: host =~ ~r/^\d+\.\d+\.\d+\.\d+$/
 
-  # A statement that returns columns is a query: report no affected rows / rowid
-  # (SQLite otherwise leaks the previous write's counters).
-  defp to_stmt_result(%{
-         columns: cols,
-         rows: rows,
-         num_changes: changes,
-         last_insert_rowid: rowid
-       }) do
-    query? = cols != []
+  # A read-only statement (SELECT / read PRAGMA) returns columns but mutates nothing → report no
+  # affected rows / rowid (SQLite otherwise leaks the previous write's counters). But an
+  # `INSERT/UPDATE/DELETE ... RETURNING` returns columns AND mutates, so classifying by
+  # "returns columns" alone reported affected_row_count 0 / last_insert_rowid nil / rows_written 0
+  # for every RETURNING write (expert review 2026-07-14 #42). exqlite exposes no
+  # `sqlite3_stmt_readonly`, so use the leading DML keyword: a column-returning statement is
+  # read-only unless it is a mutation.
+  defp to_stmt_result(
+         %{columns: cols, rows: rows, num_changes: changes, last_insert_rowid: rowid},
+         sql
+       ) do
+    read_only? = cols != [] and not dml?(sql)
 
     %StmtResult{
       cols: cols,
       rows: rows,
-      affected_row_count: if(query?, do: 0, else: changes),
-      last_insert_rowid: if(not query? and changes > 0, do: rowid, else: nil),
+      affected_row_count: if(read_only?, do: 0, else: changes),
+      last_insert_rowid: if(not read_only? and changes > 0, do: rowid, else: nil),
       rows_read: length(rows),
-      rows_written: if(query?, do: 0, else: changes)
+      rows_written: if(read_only?, do: 0, else: changes)
     }
   end
+
+  @dml_prefixes ~w(insert update delete replace)
+
+  # Leading-keyword mutation detection so a `... RETURNING` write is classified as a mutation, not
+  # a query. A CTE-prefixed `WITH ... INSERT` is not detected here — Django emits plain
+  # `INSERT ... RETURNING "id"`, the case that matters; the CTE-DML edge falls back to the old
+  # column-based read classification.
+  defp dml?(sql) when is_binary(sql) do
+    # Only the leading keyword matters — slice + downcase a few chars rather than the whole
+    # statement, since this runs on every query result.
+    head = sql |> String.trim_leading() |> String.slice(0, 7) |> String.downcase()
+    Enum.any?(@dml_prefixes, &String.starts_with?(head, &1))
+  end
+
+  defp dml?(_), do: false
 
   # `:busy` (the busy-timeout expiry from Connection) is the SQLite "database is locked"
   # condition; give it the human message a client expects instead of the inspected atom ":busy"

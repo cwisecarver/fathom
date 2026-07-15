@@ -124,6 +124,49 @@ defmodule Fathom.ShardExecutorTest do
     ShardExecutor.close(conn)
   end
 
+  # Expert review 2026-07-14 #42: an INSERT/UPDATE/DELETE ... RETURNING returns columns AND mutates,
+  # so the old "returns columns ⇒ query" test reported affected_row_count 0 / last_insert_rowid nil.
+  # Pre-fix these assertions fail.
+  test "INSERT ... RETURNING reports affected_row_count and last_insert_rowid", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    {:ok, _} =
+      ShardExecutor.execute(conn, stmt("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"))
+
+    assert {:ok,
+            %StmtResult{cols: ["id"], rows: [[1]], affected_row_count: 1, last_insert_rowid: 1}} =
+             ShardExecutor.execute(conn, stmt("INSERT INTO t (v) VALUES ('a') RETURNING id"))
+
+    ShardExecutor.close(conn)
+  end
+
+  test "UPDATE ... RETURNING reports the affected row count", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    {:ok, _} =
+      ShardExecutor.execute(conn, stmt("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"))
+
+    {:ok, _} =
+      ShardExecutor.execute(conn, stmt("INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b')"))
+
+    assert {:ok, %StmtResult{affected_row_count: 2}} =
+             ShardExecutor.execute(conn, stmt("UPDATE t SET v = 'x' RETURNING id"))
+
+    ShardExecutor.close(conn)
+  end
+
+  # A plain SELECT still reports no affected rows (the read-classification the RETURNING fix preserves).
+  test "a SELECT reports affected_row_count 0", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE t (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES ('a')"))
+
+    assert {:ok, %StmtResult{affected_row_count: 0, last_insert_rowid: nil}} =
+             ShardExecutor.execute(conn, stmt("SELECT v FROM t"))
+
+    ShardExecutor.close(conn)
+  end
+
   # Finding #25: a statement that *raises* (connection.ex rescues only ArgumentError, so a
   # bad bind / exqlite NIF error / result-mapping bug propagates) must not crash the Hrana
   # stream — the executor boundary converts any raise to a %Filo.Error{}. Non-list args are a
