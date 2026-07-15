@@ -224,6 +224,36 @@ defmodule Fathom.ShardExecutorTest do
     ShardExecutor.close(conn)
   end
 
+  # Expert review 2026-07-14 #19: "limited dataset per shard" must be ENFORCEABLE — a per-shard
+  # size cap (`:shard_max_page_count`) so one runaway tenant can't grow unbounded and inflate every
+  # whole-shard cost. A write past the cap fails SQLITE_FULL. Pre-fix (no cap) the inserts all
+  # succeed and the loop never errors.
+  test "config :shard_max_page_count caps a shard's size (writes past it get SQLITE_FULL)", %{
+    shard: shard
+  } do
+    prev = Application.get_env(:fathom, :shard_max_page_count)
+    Application.put_env(:fathom, :shard_max_page_count, 20)
+    on_exit(fn -> restore_env(:shard_max_page_count, prev) end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE t (v TEXT)"))
+
+    result =
+      Enum.reduce_while(1..5_000, :ok, fn _i, _acc ->
+        case ShardExecutor.execute(
+               conn,
+               stmt("INSERT INTO t VALUES (?)", [String.duplicate("x", 400)])
+             ) do
+          {:ok, _} -> {:cont, :ok}
+          {:error, err} -> {:halt, {:error, err}}
+        end
+      end)
+
+    assert {:error, %Error{code: "SQLITE_FULL"}} = result
+
+    ShardExecutor.close(conn)
+  end
+
   # Finding #25: a statement that *raises* (connection.ex rescues only ArgumentError, so a
   # bad bind / exqlite NIF error / result-mapping bug propagates) must not crash the Hrana
   # stream — the executor boundary converts any raise to a %Filo.Error{}. Non-list args are a

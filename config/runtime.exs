@@ -343,6 +343,14 @@ if config_env() == :prod do
     config :fathom, :max_open_shards, String.to_integer(cap)
   end
 
+  # Per-shard size cap (expert review 2026-07-14 #19): the max SQLite pages a single tenant's db may
+  # grow to (size = pages × page_size, default 4096B; e.g. 262144 ≈ 1 GiB). A write past it fails
+  # SQLITE_FULL, so one runaway tenant can't inflate flush/cold-open/standby costs fleet-wide. Unset
+  # = unlimited. Enforces the "limited dataset per shard" premise.
+  if pages = System.get_env("SHARD_MAX_PAGE_COUNT") do
+    config :fathom, :shard_max_page_count, String.to_integer(pages)
+  end
+
   # Novel-shard creation rate limit (finding #14's churn half; see Fathom.Shards.NovelLimiter).
   # Grants/sec for brand-new shard ids only; unset = off. Size to tenant-signup rate with
   # headroom — legitimate novel creation is rare, so single digits/sec is generous.

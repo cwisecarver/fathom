@@ -29,7 +29,8 @@ defmodule Fathom.Shard.Connection do
          # docs/reviews/competitive-oltp-2026-07-10.md.
          :ok <- Sqlite3.execute(conn, "PRAGMA synchronous=FULL"),
          :ok <- Sqlite3.execute(conn, "PRAGMA busy_timeout=5000"),
-         :ok <- maybe_foreign_keys(conn) do
+         :ok <- maybe_foreign_keys(conn),
+         :ok <- maybe_max_page_count(conn) do
       {:ok, conn}
     end
   end
@@ -46,6 +47,20 @@ defmodule Fathom.Shard.Connection do
     if Application.get_env(:fathom, :foreign_keys, true),
       do: Sqlite3.execute(conn, "PRAGMA foreign_keys=ON"),
       else: :ok
+  end
+
+  # Enforce a per-shard size cap (expert review 2026-07-14 #19). "Limited dataset per shard" is
+  # fathom's premise but was never enforced, so one runaway tenant (an app bug, an unbounded log
+  # table) could grow to GBs — inflating every whole-shard cost (each dirty flush is a full-file
+  # PUT, cold-open pulls the whole body, eviction/drain/warm-standby all copy it). `max_page_count`
+  # is per-connection (not persisted), so set it on every open from `:shard_max_page_count` (pages;
+  # size = pages × page_size, default 4096B). A write past the cap fails `SQLITE_FULL` (mapped to the
+  # `SQLITE_FULL` Hrana code) — exactly the brake a platform wants. Unset ⇒ unlimited (no cap).
+  defp maybe_max_page_count(conn) do
+    case Application.get_env(:fathom, :shard_max_page_count) do
+      n when is_integer(n) and n > 0 -> Sqlite3.execute(conn, "PRAGMA max_page_count=#{n}")
+      _ -> :ok
+    end
   end
 
   @doc """
