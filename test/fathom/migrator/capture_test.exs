@@ -67,6 +67,38 @@ defmodule Fathom.Migrator.CaptureTest do
       assert Migrator.statements(1) == ["CREATE TABLE app_kept (id INTEGER PRIMARY KEY)"]
     end
 
+    # Expert review 2026-07-14 #1: a Django RunPython backfill crosses the wire as template-literal
+    # INSERT/UPDATE/DELETE on a tenant table and is captured into the fleet version — replayed
+    # verbatim it corrupts or silently skips tenant data. The version is still recorded (refusing
+    # would fork the template from the fleet), but the previously-SILENT case must now alarm loudly.
+    # Pre-fix commit only logs the :info "captured..." line, so the "data-migration" assertion fails.
+    test "flags a captured template-literal data migration instead of recording it silently" do
+      import ExUnit.CaptureLog
+
+      conn = make_ref()
+      Capture.begin(conn, 0)
+      Capture.append(conn, "CREATE TABLE app_thing (id INTEGER PRIMARY KEY, slug TEXT)")
+      Capture.append(conn, "UPDATE app_thing SET slug = 'from-template' WHERE id = 1")
+      Capture.append(conn, "INSERT INTO django_migrations (app, name) VALUES ('app', '0002')")
+
+      log = capture_log(fn -> assert {:recorded, _} = Capture.commit(conn, 1) end)
+      assert log =~ "DATA-MIGRATION"
+      # Still recorded — refusing would fork the template from the fleet.
+      assert Migrator.head() >= 1
+    end
+
+    test "does not flag a pure-DDL migration (only django_migrations bookkeeping DML)" do
+      import ExUnit.CaptureLog
+
+      conn = make_ref()
+      Capture.begin(conn, 0)
+      Capture.append(conn, "CREATE TABLE app_plain (id INTEGER PRIMARY KEY)")
+      Capture.append(conn, "INSERT INTO django_migrations (app, name) VALUES ('app', '0003')")
+
+      log = capture_log(fn -> assert {:recorded, _} = Capture.commit(conn, 1) end)
+      refute log =~ "DATA-MIGRATION"
+    end
+
     test "records nothing when the count doesn't rise" do
       conn = make_ref()
       Capture.begin(conn, 5)

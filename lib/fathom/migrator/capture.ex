@@ -151,6 +151,50 @@ defmodule Fathom.Migrator.Capture do
 
   defp retry_ms, do: Application.get_env(:fathom, :capture_retry_ms, 5_000)
 
+  # Detect template-literal DATA migrations in a captured buffer (expert review 2026-07-14 #1). A
+  # Django RunPython backfill's ORM writes cross the wire as literal INSERT/UPDATE/DELETE on tenant
+  # tables carrying the TEMPLATE's row values; replayed verbatim onto every shard they overwrite
+  # tenants whose ids collide or (from an empty template) silently never run — either way the
+  # version stamp says "applied". We still RECORD the version — refusing would fork the template
+  # from the fleet, since the migration already committed on the template (the expert-review-#19
+  # invariant) — but convert the previously SILENT corruption into a loud, structured, alertable
+  # signal so an operator can review/yank the version before rollout replays it fleet-wide.
+  defp alarm_on_data_migration(version, statements) do
+    case data_migration_statements(statements) do
+      [] ->
+        Logger.info("captured shard-schema version #{version} (#{length(statements)} statements)")
+
+      suspect ->
+        Logger.error(
+          "captured shard-schema version #{version} contains #{length(suspect)} DATA-MIGRATION " <>
+            "statement(s) (INSERT/UPDATE/DELETE on non-django_migrations tables) that REPLAY AS " <>
+            "TEMPLATE-LITERAL SQL onto every tenant (expert review #1) — review before rollout and " <>
+            "yank the version if unintended. First: #{inspect(hd(suspect))}"
+        )
+
+        :telemetry.execute(
+          [:fathom, :migrator, :data_migration_captured],
+          %{count: length(suspect)},
+          %{version: version}
+        )
+    end
+  end
+
+  @dml_leads ~w(insert update delete replace)
+
+  # A statement is a (template-literal) data migration if it's DML and doesn't touch
+  # `django_migrations` — Django's own bookkeeping `INSERT INTO django_migrations` is the one benign
+  # DML in a migration transaction. A heuristic, not a SQL parser: it flags the RunPython-backfill
+  # case; a data migration that references django_migrations in a WHERE clause (rare) would be missed.
+  defp data_migration_statements(statements) do
+    Enum.filter(statements, fn sql ->
+      lead = sql |> String.trim_leading() |> String.slice(0, 12) |> String.downcase()
+
+      Enum.any?(@dml_leads, &String.starts_with?(lead, &1)) and
+        not String.contains?(String.downcase(sql), "django_migrations")
+    end)
+  end
+
   # The version is computed per attempt (next_version() under the unique index as
   # the arbiter — NOT head()+1, which excludes yanked rows and would collide on
   # the tombstoned number forever after a yank, expert review #10), so a retry
@@ -163,7 +207,7 @@ defmodule Fathom.Migrator.Capture do
 
     case Migrator.release(version, "auto-captured", statements) do
       {:ok, _} ->
-        Logger.info("captured shard-schema version #{version} (#{length(statements)} statements)")
+        alarm_on_data_migration(version, statements)
         {:recorded, version}
 
       {:error, _} = error ->
