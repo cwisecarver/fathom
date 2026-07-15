@@ -80,6 +80,20 @@ defmodule Fathom.Shard.Connection do
   @spec exec(reference(), String.t()) :: :ok | {:error, term()}
   def exec(conn, sql), do: Sqlite3.execute(conn, sql)
 
+  @doc """
+  Whether `conn` is in **autocommit** mode — i.e. no explicit transaction is open
+  (`sqlite3_get_autocommit` via exqlite's `transaction_status`). Fails safe to `true`
+  (the historical default) if the status can't be read.
+  """
+  @spec autocommit?(reference()) :: boolean()
+  def autocommit?(conn) do
+    case Sqlite3.transaction_status(conn) do
+      {:ok, :idle} -> true
+      {:ok, :transaction} -> false
+      _ -> true
+    end
+  end
+
   @doc "Closes the connection."
   @spec close(reference()) :: :ok
   def close(conn) do

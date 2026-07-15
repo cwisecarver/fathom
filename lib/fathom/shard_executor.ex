@@ -187,11 +187,13 @@ defmodule Fathom.ShardExecutor do
       Enum.any?(@durable_pragmas, &String.contains?(lead, &1))
   end
 
-  # exqlite exposes no autocommit query; libSQL's hrana2 clients never ask, and
-  # hrana3 `is_autocommit` is consulted only by batch conditions our paths don't
-  # use. Report true.
+  # Report the connection's REAL autocommit state (expert review 2026-07-14 #35). Hrana 3's
+  # `get_autocommit` / `is_autocommit` batch conditions are consumed by libSQL SDK batch builders
+  # (`{:not, :is_autocommit}`-guarded COMMIT/ROLLBACK steps), so a hardcoded `true` skipped those
+  # steps mid-transaction — leaving an open transaction dangling on the connection, holding the WAL
+  # write lock until stream teardown. exqlite exposes `transaction_status`, so answer truthfully.
   @impl true
-  def autocommit?(_handle), do: true
+  def autocommit?({_pid, _ref, conn, _shard_id}), do: Connection.autocommit?(conn)
 
   # The coordinator is the connection's owner (Filo's owner seam): the stream holding this
   # handle monitors it and tears down — closing the exqlite connection — if it dies. Without

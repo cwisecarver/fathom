@@ -107,6 +107,23 @@ defmodule Fathom.ShardExecutorTest do
     ShardExecutor.close(conn)
   end
 
+  # Expert review 2026-07-14 #35: autocommit? must report the connection's REAL transaction state,
+  # not a hardcoded true — a libSQL batch's `{:not, :is_autocommit}`-guarded COMMIT/ROLLBACK is
+  # skipped when it lies, leaving a dangling transaction holding the WAL write lock. Pre-fix the
+  # in-transaction assertion (false) fails.
+  test "autocommit? reflects the real transaction state", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    assert ShardExecutor.autocommit?(conn) == true
+
+    {:ok, _} = ShardExecutor.execute(conn, stmt("BEGIN"))
+    assert ShardExecutor.autocommit?(conn) == false
+
+    {:ok, _} = ShardExecutor.execute(conn, stmt("COMMIT"))
+    assert ShardExecutor.autocommit?(conn) == true
+
+    ShardExecutor.close(conn)
+  end
+
   # Finding #25: a statement that *raises* (connection.ex rescues only ArgumentError, so a
   # bad bind / exqlite NIF error / result-mapping bug propagates) must not crash the Hrana
   # stream — the executor boundary converts any raise to a %Filo.Error{}. Non-list args are a
