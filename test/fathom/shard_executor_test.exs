@@ -23,6 +23,16 @@ defmodule Fathom.ShardExecutorTest do
 
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
 
+  defp rm_shard_files(id) do
+    for base <- [
+          Path.join([System.tmp_dir!(), "fathom_shards", "#{id}.db"]),
+          Path.join([System.tmp_dir!(), "fathom_remote_test", "#{id}.db"])
+        ],
+        suffix <- ["", "-wal", "-shm"] do
+      File.rm(base <> suffix)
+    end
+  end
+
   test "open returns a connection and execute runs CRUD, mapping to StmtResult", %{shard: shard} do
     assert {:ok, conn} = ShardExecutor.open(shard)
 
@@ -164,6 +174,53 @@ defmodule Fathom.ShardExecutorTest do
     assert {:ok, %StmtResult{affected_row_count: 0, last_insert_rowid: nil}} =
              ShardExecutor.execute(conn, stmt("SELECT v FROM t"))
 
+    ShardExecutor.close(conn)
+  end
+
+  # Expert review 2026-07-14 #7: a direct `manage.py migrate` on a tenant advances its schema while
+  # fathom's version stamp stays at 0, so the shard reads as a laggard and the engine replays the
+  # captured chain onto it → "already exists" → quarantine. With :block_tenant_ddl on, client DDL on
+  # a tenant is refused loudly at the source instead. Pre-fix (no guard) the CREATE succeeds.
+  test "with :block_tenant_ddl on, client DDL on a tenant is refused (DML unaffected)", %{
+    shard: shard
+  } do
+    prev = Application.get_env(:fathom, :block_tenant_ddl)
+    Application.put_env(:fathom, :block_tenant_ddl, true)
+    on_exit(fn -> restore_env(:block_tenant_ddl, prev) end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    assert {:error, %Error{code: "FILO_DDL_BLOCKED"}} =
+             ShardExecutor.execute(conn, stmt("CREATE TABLE t (v TEXT)"))
+
+    # A non-DDL statement on the same tenant is unaffected.
+    assert {:ok, %StmtResult{}} = ShardExecutor.execute(conn, stmt("SELECT 1"))
+
+    ShardExecutor.close(conn)
+  end
+
+  test "the template shard is exempt from the tenant-DDL guard" do
+    prev = Application.get_env(:fathom, :block_tenant_ddl)
+    prev_tmpl = Application.get_env(:fathom, :template_shard_id)
+    tmpl = "tmpl_ddl_#{System.unique_integer([:positive])}"
+    Application.put_env(:fathom, :block_tenant_ddl, true)
+    Application.put_env(:fathom, :template_shard_id, tmpl)
+
+    on_exit(fn ->
+      Fathom.Shards.drain(tmpl, 5_000)
+      restore_env(:block_tenant_ddl, prev)
+      restore_env(:template_shard_id, prev_tmpl)
+      rm_shard_files(tmpl)
+    end)
+
+    {:ok, conn} = ShardExecutor.open(tmpl)
+    assert {:ok, %StmtResult{}} = ShardExecutor.execute(conn, stmt("CREATE TABLE t (v TEXT)"))
+    ShardExecutor.close(conn)
+  end
+
+  test "with the guard off (default), tenant DDL is allowed", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    assert {:ok, %StmtResult{}} = ShardExecutor.execute(conn, stmt("CREATE TABLE t (v TEXT)"))
     ShardExecutor.close(conn)
   end
 

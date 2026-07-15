@@ -68,6 +68,24 @@ defmodule Fathom.Shard.ConnectionTest do
     assert {:ok, %{rows: [["wal"]]}} = Connection.query(conn, "PRAGMA journal_mode", [])
   end
 
+  # Expert review 2026-07-14 #2: SQLite defaults foreign_keys=OFF, but Django (>=2.2) assumes ON and
+  # can't be relied on to replay `PRAGMA foreign_keys=ON` on every transparently re-created stream.
+  # Without the server-side default a bad-FK insert SILENTLY succeeds (orphan rows) and
+  # on_delete=CASCADE/PROTECT stops being enforced. Pins enforcement-on-by-default; pre-fix the
+  # insert returns {:ok, _} and this fails.
+  test "foreign keys are enforced by default on a fresh connection", %{conn: conn} do
+    :ok = Connection.exec(conn, "CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+
+    :ok =
+      Connection.exec(
+        conn,
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))"
+      )
+
+    # pid 999 has no parent row → FK violation.
+    assert {:error, _} = Connection.query(conn, "INSERT INTO child (id, pid) VALUES (1, 999)", [])
+  end
+
   @tag :bench
   test "large-result collect stays O(R), not O(R²)", %{conn: conn} do
     # Regression guard for the Phase-0 fix. The old `acc ++ rows` copied the whole accumulator

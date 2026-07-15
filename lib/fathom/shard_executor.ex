@@ -70,7 +70,30 @@ defmodule Fathom.ShardExecutor do
       {:error, %Error{message: "shard connection unavailable", code: "SQLITE_ERROR"}}
   end
 
-  defp do_execute({_pid, _ref, conn, shard_id}, %Stmt{sql: sql, args: args}) do
+  defp do_execute({_pid, _ref, _conn, shard_id} = handle, %Stmt{sql: sql} = stmt) do
+    # Block client-issued DDL on a tenant shard when strict mode is on (expert review 2026-07-14
+    # #7): a direct `manage.py migrate` against a tenant advances its schema + `django_migrations`
+    # while fathom's three-place version stamp stays at 0, so the shard then reads as a laggard, the
+    # engine replays the captured chain onto the already-migrated file, hits "already exists", and
+    # quarantines the tenant. Refuse loudly at the client instead — schema evolution goes through the
+    # template + migration engine, never a direct tenant migrate. The template (the capture source)
+    # is exempt, and the engine's own replay uses `Connection` directly (not this Hrana path), so
+    # neither is affected. Off by default (`:block_tenant_ddl`); enable in prod to enforce the model.
+    if block_tenant_ddl?() and not template?(shard_id) and ddl?(sql) do
+      {:error,
+       %Error{
+         message:
+           "schema changes must go through the migration engine on the template shard, not a " <>
+             "direct migrate on tenant \"#{shard_id}\"",
+         code: "FILO_DDL_BLOCKED",
+         status: 400
+       }}
+    else
+      run_statement(handle, stmt)
+    end
+  end
+
+  defp run_statement({_pid, _ref, conn, shard_id}, %Stmt{sql: sql, args: args}) do
     started = System.monotonic_time()
 
     case Connection.query(conn, sql, args) do
@@ -427,6 +450,19 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp dml?(_), do: false
+
+  defp block_tenant_ddl?, do: Application.get_env(:fathom, :block_tenant_ddl, false)
+
+  @ddl_leads ~w(create alter drop)
+
+  # Leading-keyword schema-DDL detection (CREATE/ALTER/DROP — table/index/view/trigger). Cheap
+  # slice, since this runs on every statement when strict mode is on.
+  defp ddl?(sql) when is_binary(sql) do
+    lead = sql |> String.trim_leading() |> String.slice(0, 6) |> String.downcase()
+    Enum.any?(@ddl_leads, &String.starts_with?(lead, &1))
+  end
+
+  defp ddl?(_), do: false
 
   # `:busy` (the busy-timeout expiry from Connection) is the SQLite "database is locked"
   # condition; give it the human message a client expects instead of the inspected atom ":busy"
