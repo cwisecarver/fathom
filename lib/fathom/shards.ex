@@ -118,8 +118,9 @@ defmodule Fathom.Shards do
       case Fathom.Migrator.ShardMigration.run(shard_id, head) do
         :ok -> :ok
         {:ok, _} -> :ok
-        # Nothing to migrate yet (a brand-new shard is born at HEAD via
-        # fork-from-template, not migrated).
+        # Nothing stored to migrate yet: a brand-new shard was born empty (or, with
+        # :fork_from_template enabled, already at HEAD via maybe_fork_novel/1) and
+        # hasn't flushed — there is nothing behind HEAD to copy.
         {:error, :no_live_object} -> :ok
         # HEAD dropped (a yank) between this node's cache refresh and the run
         # (round-2 #23): the target no longer exists, and serving the shard at its
@@ -138,7 +139,8 @@ defmodule Fathom.Shards do
   defp behind?(shard_id, head) do
     case Fathom.Directory.get(shard_id) do
       {:ok, %{schema_version: v}} -> v < head
-      # Not yet in the directory (brand-new) — fork-from-template handles its birth.
+      # Not yet in the directory (brand-new): nothing to migrate — the shard is born
+      # empty (or at HEAD via the gated fork-from-template, which registers its row).
       :error -> false
     end
   end
@@ -267,8 +269,40 @@ defmodule Fathom.Shards do
         {:error, :novel_shard_rate_limited}
 
       true ->
+        maybe_fork_novel(shard_id)
         start(shard_id)
     end
+  end
+
+  # Fork-from-template (finding #10), gated OFF by default (`:fork_from_template`): when
+  # enabled and this id is genuinely NOVEL, birth it AT HEAD by copying the retained
+  # `template@HEAD` snapshot into its stored object (Fathom.Migrator.fork_from_template/1)
+  # BEFORE the coordinator starts — the coordinator's normal cold-open pull then picks the
+  # forked object up, so the lease/pull path is untouched. Best-effort in every direction:
+  # any fork outcome other than success (no release yet, no snapshot retained, storage or
+  # Postgres trouble, a concurrent forker holding the lease) falls back to today's
+  # born-empty behavior — a checkout is NEVER failed for the fork. Flag off ⇒ one get_env
+  # on the (already cold) novel-open path, nothing on the hot path.
+  defp maybe_fork_novel(shard_id) do
+    if Application.get_env(:fathom, :fork_from_template, false) and novel_shard?(shard_id) do
+      _ = Fathom.Migrator.fork_from_template(shard_id)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  # Novel = nothing knows the shard: no local file (a present file is an authoritative
+  # un-flushed copy) and no directory row — the same definition novel_refused?/1 uses.
+  # The directory read fails OPEN (treated as known ⇒ no fork), so a Postgres outage
+  # births empty rather than blocking the open; the fork itself additionally refuses a
+  # dst that already has a stored object (`:dst_exists`), so a flushed-then-forgotten
+  # shard is never overwritten.
+  defp novel_shard?(shard_id) do
+    not File.exists?(Fathom.Shard.db_path(shard_id)) and not known_to_directory?(shard_id)
   end
 
   # How many least-recently-used shards to probe for idleness before giving up and

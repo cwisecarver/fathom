@@ -210,6 +210,133 @@ defmodule Fathom.Migrator.ShardMigration do
     )
   end
 
+  # --- fork-from-template (finding #10) ---
+
+  @doc """
+  Births `dst_shard_id` AT `head` from the retained `<template_id>@<head>` snapshot —
+  the new-tenant bootstrap. Single-writer-safe (holds the dst shard's lease for the
+  whole operation, exactly like `run/3`) and stamps the same version places a real
+  migration does: `PRAGMA user_version` in the file (via `Fathom.Migrator.Copy`) and
+  the directory row (`Fathom.Directory.cutover/2`). The snapshot carries the
+  template's schema + `django_migrations` rows only (the template is schema-only by
+  design), so a forked tenant inherits ZERO tenant data.
+
+  Steps: lease the dst → server-side copy the snapshot to the dst live object
+  (`Storage.fork_from/3`) → pull it, stamp `user_version = head` (an empty-statement
+  `Copy.migrate/4`), fence, and flush it back If-Matched → register + cut the
+  directory row over to `head` → release the lease.
+
+  Idempotent / crash-forward: a dst live object already stamped at `head` just
+  re-registers the directory row. A dst object at any OTHER version is refused
+  (`{:error, :dst_exists}`) — it isn't ours to overwrite. On a failure before the
+  stamp lands, the dst live object is dropped (`Storage.drop_live/1`) so the shard
+  cold-opens EMPTY next time — never carrying an unstamped schema copy a later
+  rollout would corrupt. Never dropped on `:superseded`/fence uncertainty (the
+  object may be a new owner's). Returns `{:ok, %{version: head}}`,
+  `{:error, :no_template_snapshot}` (no retained snapshot — the caller births
+  empty), `{:retry, reason}` (lease contention), or `{:error, reason}`.
+  """
+  @spec fork(String.t(), String.t(), pos_integer(), term()) ::
+          {:ok, map()} | {:retry, term()} | {:error, term()}
+  def fork(dst_shard_id, template_id, head, token \\ make_token()) do
+    with_lease(dst_shard_id, token, fn lease ->
+      do_fork(dst_shard_id, template_id, head, lease)
+    end)
+  end
+
+  defp do_fork(dst, template, head, lease) do
+    case Storage.object_etag(dst) do
+      # Genuinely novel: no live object yet — copy the snapshot in, then stamp.
+      {:ok, nil} ->
+        case Storage.fork_from(template, head, dst) do
+          :ok -> stamp_fork(dst, head, lease)
+          {:error, reason} -> classify_fork_error(reason)
+        end
+
+      # An object already exists. Crash-forward: a prior fork that flushed the
+      # stamped copy but died before the directory flip re-registers here; anything
+      # else is NOT ours to overwrite — refuse, and the normal cold-open serves it.
+      {:ok, _etag} ->
+        tmp = temp_path(dst, "fork-check")
+
+        try do
+          with {:ok, _etag} <- pull_live(dst, tmp) do
+            if live_version(tmp) == head do
+              register_fork(dst, head)
+            else
+              {:error, :dst_exists}
+            end
+          end
+        after
+          drop_temp(tmp)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # Pull the freshly-copied object, stamp user_version = head (Copy.migrate with an
+  # empty statement chain — the same stamp + wal_checkpoint a real migration runs),
+  # fence, and flush it back If-Matched on the pull etag.
+  defp stamp_fork(dst, head, lease) do
+    old = temp_path(dst, "fork-old")
+    new = temp_path(dst, "fork-new")
+
+    stamped =
+      try do
+        with {:ok, etag} <- pull_live(dst, old),
+             :ok <- Copy.migrate(old, new, head, []),
+             :ok <- fence(dst, lease),
+             {:ok, _new_etag} <- flush_fenced(dst, new, etag) do
+          :ok
+        end
+      after
+        drop_temp(old)
+        drop_temp(new)
+      end
+
+    case stamped do
+      :ok ->
+        register_fork(dst, head)
+
+      # A steal/supersede means a newer owner may own the object — never drop it.
+      {:error, :superseded} = error ->
+        error
+
+      # Ownership unconfirmed (transient fence error): don't write (don't drop).
+      {:error, {:fence_failed, _}} = error ->
+        error
+
+      # The fork failed while the live object is still our unstamped snapshot copy
+      # (we hold the lease): remove it so the shard cold-opens EMPTY next time.
+      {:error, _} = error ->
+        _ = Storage.drop_live(dst)
+        error
+    end
+  end
+
+  # Register the forked shard in the directory AT head. resolve/1 registers a
+  # first-sight row (birth IS tenant activity); cutover/2 stamps schema_version +
+  # cutover_at — the same directory flip a completed migration performs. If this
+  # fails after the stamped flush, the shard self-heals: its file already reads
+  # `user_version == head`, so the next lazy-migrate/rollout run crash-forwards
+  # straight to the cutover (see run/3's `current == target` branch).
+  defp register_fork(dst, head) do
+    with {:ok, _} <- Directory.resolve(dst),
+         {:ok, _} <- Directory.cutover(dst, head) do
+      Logger.info("shard #{dst}: born at v#{head} via fork-from-template")
+      {:ok, %{version: head}}
+    end
+  end
+
+  # A missing snapshot object surfaces backend-specifically: Local's atomic_copy is
+  # {:error, :enoent}; S3's CopyObject is a 404 copy status. Both mean "no retained
+  # template@head snapshot" — the caller births the shard empty.
+  defp classify_fork_error(:enoent), do: {:error, :no_template_snapshot}
+  defp classify_fork_error({:s3_copy_status, 404}), do: {:error, :no_template_snapshot}
+  defp classify_fork_error(reason), do: {:error, reason}
+
   # --- lease orchestration ---
 
   defp with_lease(shard_id, token, fun) do

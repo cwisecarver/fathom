@@ -153,6 +153,96 @@ defmodule Fathom.Migrator do
   @spec list() :: [Release.t()]
   def list, do: Repo.all(from r in Release, order_by: [asc: r.version])
 
+  # --- fork-from-template (finding #10): new-tenant bootstrap at HEAD ---
+
+  @default_template_drain_ms 5_000
+
+  @doc """
+  Retains a `template@HEAD` snapshot — the fork source for `fork_from_template/1`.
+  Run after migrating the template (e.g. via `mix fathom.snapshot template-head`).
+
+  Drains the template's coordinator first so its stored object is flushed +
+  current (`{:error, :busy}` if it won't drain — e.g. a `manage.py migrate` session
+  is still open; retry once it finishes), then refuses if a LIVE node still holds
+  the template's lease (`{:error, {:held, owner}}` — the cross-node guard, same as
+  `Fathom.Snapshots.restore/3`), then copies the template's live stored object to
+  `<template>@<HEAD>` via the existing `Storage.retain/2`. Never snapshots a
+  half-migrated template: an active migrate session holds a connection, so the
+  drain refuses. Returns `{:ok, head}`, `{:error, :no_template}` (no
+  `:template_shard_id` configured), or `{:error, :no_head}` (no released version).
+  """
+  @spec retain_template_head(pos_integer()) :: {:ok, pos_integer()} | {:error, term()}
+  def retain_template_head(drain_timeout \\ @default_template_drain_ms) do
+    with {:ok, template} <- template_shard_id() do
+      case head() do
+        0 ->
+          {:error, :no_head}
+
+        head ->
+          case Fathom.Shards.drain(template, drain_timeout) do
+            :ok ->
+              case Fathom.Shard.Storage.lease_holder(template) do
+                :free -> retain_snapshot(template, head)
+                {:held, owner} -> {:error, {:held, owner}}
+                {:error, reason} -> {:error, reason}
+              end
+
+            {:error, :busy} ->
+              {:error, :busy}
+
+            {:error, reason} ->
+              {:error, {:drain_failed, reason}}
+          end
+      end
+    end
+  end
+
+  defp retain_snapshot(template, head) do
+    case Fathom.Shard.Storage.retain(template, head) do
+      :ok -> {:ok, head}
+      # No stored object for the template at all (never flushed): nothing to snapshot.
+      {:error, :enoent} -> {:error, :no_template_object}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Births `dst_shard_id` AT the fleet HEAD by copying the retained `template@HEAD`
+  snapshot into its live object and stamping the version places (finding #10) — see
+  `Fathom.Migrator.ShardMigration.fork/4` for the mechanism. The admission path
+  (`Fathom.Shards`, gated by `config :fathom, :fork_from_template`, off by default)
+  calls this when minting a novel shard; on ANY non-`{:ok, _}` result the shard is
+  simply born empty (today's behavior) — a checkout is never failed for this.
+
+  Returns `{:ok, %{version: head}}`, or `{:error, :no_template_snapshot}` when no
+  version is released (HEAD 0), no `:template_shard_id` is configured, or no
+  `template@HEAD` snapshot object exists; `{:error, :template_shard}` refuses
+  forking the template onto itself; other errors/`{:retry, _}` pass through.
+  """
+  @spec fork_from_template(String.t()) :: {:ok, map()} | {:retry, term()} | {:error, term()}
+  def fork_from_template(dst_shard_id) do
+    case template_shard_id() do
+      {:ok, template} when template == dst_shard_id ->
+        {:error, :template_shard}
+
+      {:ok, template} ->
+        case head() do
+          0 -> {:error, :no_template_snapshot}
+          head -> Fathom.Migrator.ShardMigration.fork(dst_shard_id, template, head)
+        end
+
+      {:error, :no_template} ->
+        {:error, :no_template_snapshot}
+    end
+  end
+
+  defp template_shard_id do
+    case Fathom.ShardId.cast(Application.get_env(:fathom, :template_shard_id)) do
+      {:ok, id} -> {:ok, id}
+      :error -> {:error, :no_template}
+    end
+  end
+
   @doc "Enqueues a per-shard migration job to bring `shard_id` to `target`."
   @spec enqueue_migration(String.t(), pos_integer()) ::
           {:ok, Oban.Job.t()} | {:error, Ecto.Changeset.t()}

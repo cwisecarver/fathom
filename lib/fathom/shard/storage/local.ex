@@ -162,6 +162,23 @@ defmodule Fathom.Shard.Storage.Local do
     end
   end
 
+  @impl true
+  def fork_from(template_id, version, dst_shard_id) do
+    # Fork-from-template (finding #10): retained snapshot -> the new tenant's live
+    # object. Atomic (temp + rename) like retain/restore, so a torn copy is never
+    # adopted. A missing snapshot is {:error, :enoent} (File.cp through atomic_copy).
+    Storage.atomic_copy(version_path(template_id, version), remote_path(dst_shard_id))
+  end
+
+  @impl true
+  def drop_live(shard_id) do
+    case File.rm(remote_path(shard_id)) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   # --- point-in-time snapshots (#12) ---
 
   @impl true

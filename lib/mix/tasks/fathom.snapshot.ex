@@ -10,6 +10,13 @@ defmodule Mix.Tasks.Fathom.Snapshot do
       mix fathom.snapshot list <shard>             # list stored snapshots
       mix fathom.snapshot restore <shard> <id>     # restore live from a snapshot
       mix fathom.snapshot drop <shard> <id>        # delete a snapshot
+      mix fathom.snapshot template-head            # retain template@HEAD (fork source)
+
+  `template-head` drains the reserved capture template (`:template_shard_id`) so its
+  stored object is current, then retains it at the fleet HEAD
+  (`Fathom.Migrator.retain_template_head/1`) — the snapshot
+  `Fathom.Migrator.fork_from_template/1` births new tenants from (finding #10). Run it
+  after each template migration + release, before enabling `:fork_from_template`.
 
   `create`/`list`/`drop` operate on stored objects directly. `restore` copies a
   snapshot over the live object; it drains any local coordinator and **refuses if a
@@ -80,8 +87,38 @@ defmodule Mix.Tasks.Fathom.Snapshot do
           {:error, reason} -> Mix.raise("drop failed: #{inspect(reason)}")
         end
 
+      ["template-head"] ->
+        # Needs the app: the drain reaches a running coordinator (registry/supervisor)
+        # and HEAD comes from the Postgres migration registry.
+        start_app!()
+
+        case Fathom.Migrator.retain_template_head() do
+          {:ok, head} ->
+            Mix.shell().info("retained template@#{head} — fork-from-template source is ready")
+
+          {:error, :no_template} ->
+            Mix.raise("no :template_shard_id configured — set TEMPLATE_SHARD_ID / config")
+
+          {:error, :no_head} ->
+            Mix.raise("no released fleet version (HEAD 0) — release a version first")
+
+          {:error, :busy} ->
+            Mix.raise(
+              "the template shard would not drain (a migrate session may be open); retry " <>
+                "once it finishes"
+            )
+
+          {:error, {:held, owner}} ->
+            Mix.raise("refused: the template is served by a live node (#{owner}); quiesce it")
+
+          {:error, reason} ->
+            Mix.raise("template-head snapshot failed: #{inspect(reason)}")
+        end
+
       _ ->
-        Mix.raise("usage: mix fathom.snapshot create|list|restore|drop <shard> [id|label]")
+        Mix.raise(
+          "usage: mix fathom.snapshot create|list|restore|drop <shard> [id|label] | template-head"
+        )
     end
   end
 

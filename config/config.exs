@@ -35,6 +35,15 @@ config :fathom, :evict_idle_at_capacity, true
 # (+ NOVEL_SHARD_BURST, default max(10, 2 × rate)). See Fathom.Shards.NovelLimiter.
 config :fathom, :novel_shard_rate, nil
 
+# Fork-from-template (finding #10): when true, an admitted NOVEL shard is born AT the fleet
+# HEAD by copying the retained `template@HEAD` snapshot (produced by
+# `mix fathom.snapshot template-head`) into its stored object, instead of empty at v0 — so a
+# new tenant's first ORM query finds its schema. Off by default (the safety valve): current
+# born-empty behavior is unchanged until an operator opts in with a snapshot ready
+# (prod: FORK_FROM_TEMPLATE=true). Any fork failure falls back to born-empty; a checkout is
+# never failed for it. See Fathom.Migrator.fork_from_template/1.
+config :fathom, :fork_from_template, false
+
 # In-app bearer-token auth on the Hrana data path (Fathom.HranaAuth). :disabled means the
 # trust boundary is the network alone (LB-only reachability — docs/deploy-cluster.md);
 # :required makes every stream open present a per-shard Phoenix.Token (mint: mix fathom.token).

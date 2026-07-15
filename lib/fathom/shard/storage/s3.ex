@@ -789,6 +789,24 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  @impl true
+  def fork_from(template_id, version, dst_shard_id) do
+    # Fork-from-template (finding #10): server-side copy of the retained
+    # `<template>@<version>` snapshot to the new tenant's live object — same
+    # CopyObject as retain/restore (a missing snapshot is a 404 copy status the
+    # caller classifies as :no_template_snapshot).
+    copy_object(version_key(template_id, version), db_key(dst_shard_id))
+  end
+
+  @impl true
+  def drop_live(shard_id) do
+    case Req.delete(req(), url: object_path(shard_id)) do
+      {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
+      {:ok, %{status: status}} -> {:error, {:s3_delete_status, status}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   # --- point-in-time snapshots (#12) ---
 
   @impl true

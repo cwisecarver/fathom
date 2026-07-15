@@ -174,6 +174,24 @@ defmodule Fathom.Shard.Storage do
   @callback drop_version(shard_id :: String.t(), version :: non_neg_integer()) ::
               :ok | {:error, term()}
 
+  # Fork-from-template (finding #10): copy the retained snapshot at
+  # `<template_id>@<version>` to the LIVE object of `dst_shard_id` — the new-tenant
+  # bootstrap. The caller (`Fathom.Migrator.fork_from_template/1`) holds the dst
+  # shard's lease and stamps the copied object's `user_version` afterward; this is
+  # just the byte copy. A missing snapshot object is an ordinary `{:error, term}`
+  # (Local: `:enoent`; S3: a 404 copy status) the caller classifies.
+  @callback fork_from(
+              template_id :: String.t(),
+              version :: non_neg_integer(),
+              dst_shard_id :: String.t()
+            ) :: :ok | {:error, term()}
+
+  # Delete `shard_id`'s LIVE object (idempotent). The fork path's cleanup: a fork
+  # that fails before stamping must leave the dst with NO live object, so the shard
+  # simply cold-opens empty next time instead of carrying an unstamped schema copy
+  # a later rollout would corrupt (replaying DDL over already-present tables).
+  @callback drop_live(shard_id :: String.t()) :: :ok | {:error, term()}
+
   @typedoc "A stored point-in-time snapshot: its `id` and the object's byte size."
   @type snapshot :: %{id: String.t(), bytes: non_neg_integer()}
 
@@ -315,6 +333,24 @@ defmodule Fathom.Shard.Storage do
   @doc "Deletes the shard's `version` object (idempotent; retirement)."
   @spec drop_version(String.t(), non_neg_integer()) :: :ok | {:error, term()}
   def drop_version(shard_id, version), do: backend().drop_version(shard_id, version)
+
+  @doc """
+  Copies the retained `<template_id>@<version>` snapshot to `dst_shard_id`'s LIVE
+  object — the fork-from-template new-tenant bootstrap (finding #10). The caller must
+  hold the dst shard's lease and stamp the copy's `user_version` afterward; see
+  `Fathom.Migrator.fork_from_template/1`.
+  """
+  @spec fork_from(String.t(), non_neg_integer(), String.t()) :: :ok | {:error, term()}
+  def fork_from(template_id, version, dst_shard_id),
+    do: backend().fork_from(template_id, version, dst_shard_id)
+
+  @doc """
+  Deletes `shard_id`'s LIVE object (idempotent) — the fork path's failure cleanup, so
+  an aborted fork leaves the shard to cold-open empty rather than carrying an
+  unstamped schema copy. Callers must hold the shard's lease.
+  """
+  @spec drop_live(String.t()) :: :ok | {:error, term()}
+  def drop_live(shard_id), do: backend().drop_live(shard_id)
 
   @doc "Copies the shard's live object to a point-in-time snapshot `<shard>@snap-<snapshot_id>`."
   @spec snapshot(String.t(), String.t()) :: :ok | {:error, term()}

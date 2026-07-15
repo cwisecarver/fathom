@@ -166,6 +166,20 @@ defmodule Fathom.Test.FaultyStorage do
   def drop_version(shard_id, version), do: Local.drop_version(shard_id, version)
 
   @impl true
+  def fork_from(template_id, version, dst_shard_id) do
+    # run_before(:fork_from) lets a test inject an event just before the fork's snapshot
+    # copy lands at the dst live object (fork-from-template, finding #10).
+    run_before(:fork_from)
+
+    if fault() == :fork_from,
+      do: {:error, :s3_unreachable},
+      else: Local.fork_from(template_id, version, dst_shard_id)
+  end
+
+  @impl true
+  def drop_live(shard_id), do: Local.drop_live(shard_id)
+
+  @impl true
   def snapshot(shard_id, snapshot_id), do: Local.snapshot(shard_id, snapshot_id)
   @impl true
   def list_snapshots(shard_id), do: Local.list_snapshots(shard_id)

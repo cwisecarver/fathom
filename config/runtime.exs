@@ -354,6 +354,14 @@ if config_env() == :prod do
     config :fathom, :novel_shard_burst, String.to_integer(burst)
   end
 
+  # Fork-from-template (finding #10): birth admitted NOVEL shards at the fleet HEAD from
+  # the retained template@HEAD snapshot (mix fathom.snapshot template-head). Off by
+  # default; enable only with a template + snapshot in place. Fork failures fall back to
+  # born-empty. See config/config.exs and Fathom.Migrator.fork_from_template/1.
+  if System.get_env("FORK_FROM_TEMPLATE") in ~w(true 1) do
+    config :fathom, :fork_from_template, true
+  end
+
   config :fathom, FathomWeb.Endpoint,
     url: [host: host, port: 443, scheme: "https"],
     http: [
