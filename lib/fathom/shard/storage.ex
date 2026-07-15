@@ -174,6 +174,24 @@ defmodule Fathom.Shard.Storage do
   @callback drop_version(shard_id :: String.t(), version :: non_neg_integer()) ::
               :ok | {:error, term()}
 
+  @typedoc "A stored point-in-time snapshot: its `id` and the object's byte size."
+  @type snapshot :: %{id: String.t(), bytes: non_neg_integer()}
+
+  # Point-in-time snapshots (expert review 2026-07-14 #12): fathom-managed, time-labeled copies
+  # of a shard's live object, kept under `<shard_id>@snap-<snapshot_id>` — a namespace distinct
+  # from the integer-`@<version>` migration copies above (and excluded from `stored_usage`, which
+  # already skips any `@`-keyed object). Backend-uniform (Local + S3), so the whole snapshot/
+  # restore path is testable without a real object store; S3 bucket versioning
+  # (`docs/durability.md`) layers underneath as defense-in-depth. `snapshot/2` copies live →
+  # snapshot; `restore_snapshot/2` copies snapshot → live (the caller must ensure the shard is not
+  # actively served — see `Fathom.Snapshots.restore/2`, which drains first).
+  @callback snapshot(shard_id :: String.t(), snapshot_id :: String.t()) :: :ok | {:error, term()}
+  @callback list_snapshots(shard_id :: String.t()) :: {:ok, [snapshot()]} | {:error, term()}
+  @callback restore_snapshot(shard_id :: String.t(), snapshot_id :: String.t()) ::
+              :ok | {:error, term()}
+  @callback drop_snapshot(shard_id :: String.t(), snapshot_id :: String.t()) ::
+              :ok | {:error, term()}
+
   # Aggregate storage footprint for observability — `{object_count, total_bytes}` of the live
   # shard objects. Optional: a backend that can't cheaply enumerate simply omits it, and the
   # dispatcher returns `{:error, :unsupported}`. Potentially expensive (an S3 LIST), so callers
@@ -297,6 +315,27 @@ defmodule Fathom.Shard.Storage do
   @doc "Deletes the shard's `version` object (idempotent; retirement)."
   @spec drop_version(String.t(), non_neg_integer()) :: :ok | {:error, term()}
   def drop_version(shard_id, version), do: backend().drop_version(shard_id, version)
+
+  @doc "Copies the shard's live object to a point-in-time snapshot `<shard>@snap-<snapshot_id>`."
+  @spec snapshot(String.t(), String.t()) :: :ok | {:error, term()}
+  def snapshot(shard_id, snapshot_id), do: backend().snapshot(shard_id, snapshot_id)
+
+  @doc "Lists the shard's stored snapshots (`id` + byte size), newest id first."
+  @spec list_snapshots(String.t()) :: {:ok, [snapshot()]} | {:error, term()}
+  def list_snapshots(shard_id), do: backend().list_snapshots(shard_id)
+
+  @doc """
+  Copies a snapshot back over the shard's live object. The caller MUST ensure the shard is not
+  actively served (no coordinator will flush over the copy) — `Fathom.Snapshots.restore/2` drains
+  first. Unconditional (unlike the fenced migration `restore/3`), since restore runs after a drain.
+  """
+  @spec restore_snapshot(String.t(), String.t()) :: :ok | {:error, term()}
+  def restore_snapshot(shard_id, snapshot_id),
+    do: backend().restore_snapshot(shard_id, snapshot_id)
+
+  @doc "Deletes a stored snapshot (idempotent)."
+  @spec drop_snapshot(String.t(), String.t()) :: :ok | {:error, term()}
+  def drop_snapshot(shard_id, snapshot_id), do: backend().drop_snapshot(shard_id, snapshot_id)
 
   @doc """
   Aggregate storage footprint — `{object_count, total_bytes}` of the live shard objects — for the

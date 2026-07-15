@@ -194,6 +194,31 @@ defmodule Fathom.ShardStorageS3Test do
     assert File.read!(dst) == "v1"
   end
 
+  # Point-in-time snapshots (expert review 2026-07-14 #12): server-side copy to/from
+  # `<shard>@snap-<id>`, listed via ListObjectsV2 over the snapshot prefix.
+  test "snapshot + restore_snapshot round-trip; list and drop", %{shard: shard} do
+    v1 = tmp_path("#{shard}-v1")
+    File.write!(v1, "v1")
+    assert :ok = S3.flush(shard, v1)
+    assert :ok = S3.snapshot(shard, "test1")
+
+    v2 = tmp_path("#{shard}-v2")
+    File.write!(v2, "v2")
+    assert :ok = S3.flush(shard, v2)
+
+    assert {:ok, snaps} = S3.list_snapshots(shard)
+    assert Enum.any?(snaps, &(&1.id == "test1" and &1.bytes == 2))
+
+    assert :ok = S3.restore_snapshot(shard, "test1")
+    dst = tmp_path("#{shard}-dst")
+    assert :ok = S3.pull(shard, dst)
+    assert File.read!(dst) == "v1"
+
+    assert :ok = S3.drop_snapshot(shard, "test1")
+    assert {:ok, after_drop} = S3.list_snapshots(shard)
+    refute Enum.any?(after_drop, &(&1.id == "test1"))
+  end
+
   # Expert review 2026-07-14 #4: the revert's restore must be If-Match-fenced on the live etag
   # (mirroring the forward flush/3) so a steal landing between the migrator's fence and the
   # copy-back is caught instead of clobbering the new owner's live object.

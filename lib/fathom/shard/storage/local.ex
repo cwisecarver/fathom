@@ -162,6 +162,60 @@ defmodule Fathom.Shard.Storage.Local do
     end
   end
 
+  # --- point-in-time snapshots (#12) ---
+
+  @impl true
+  def snapshot(shard_id, snapshot_id) do
+    # Atomic (temp + rename), like retain/1 — a snapshot copy is never left torn.
+    Storage.atomic_copy(remote_path(shard_id), snapshot_path(shard_id, snapshot_id))
+  end
+
+  @impl true
+  def restore_snapshot(shard_id, snapshot_id) do
+    Storage.atomic_copy(snapshot_path(shard_id, snapshot_id), remote_path(shard_id))
+  end
+
+  @impl true
+  def drop_snapshot(shard_id, snapshot_id) do
+    case File.rm(snapshot_path(shard_id, snapshot_id)) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @impl true
+  def list_snapshots(shard_id) do
+    prefix = "#{shard_id}@snap-"
+
+    case File.ls(dir()) do
+      {:ok, names} ->
+        snaps =
+          names
+          |> Enum.filter(&(String.starts_with?(&1, prefix) and String.ends_with?(&1, ".db")))
+          |> Enum.map(fn name ->
+            id = name |> String.replace_prefix(prefix, "") |> String.replace_suffix(".db", "")
+
+            bytes =
+              case File.stat(Path.join(dir(), name)) do
+                {:ok, %File.Stat{size: size}} -> size
+                _ -> 0
+              end
+
+            %{id: id, bytes: bytes}
+          end)
+          |> Enum.sort_by(& &1.id, :desc)
+
+        {:ok, snaps}
+
+      {:error, :enoent} ->
+        {:ok, []}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   @impl true
   def stored_usage do
     dir()
@@ -444,6 +498,10 @@ defmodule Fathom.Shard.Storage.Local do
 
   defp remote_path(shard_id), do: Path.join(dir(), "#{shard_id}.db")
   defp version_path(shard_id, version), do: Path.join(dir(), "#{shard_id}@#{version}.db")
+
+  defp snapshot_path(shard_id, snapshot_id),
+    do: Path.join(dir(), "#{shard_id}@snap-#{snapshot_id}.db")
+
   defp lock_path(shard_id), do: Path.join(dir(), "#{shard_id}.lock")
   # One heartbeat object per node (owner), under a subdir so it never collides with
   # a shard id (owner strings like "fathom@host" are valid filenames).

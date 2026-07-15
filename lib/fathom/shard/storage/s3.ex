@@ -789,6 +789,71 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  # --- point-in-time snapshots (#12) ---
+
+  @impl true
+  def snapshot(shard_id, snapshot_id) do
+    copy_object(db_key(shard_id), snapshot_key(shard_id, snapshot_id))
+  end
+
+  @impl true
+  def restore_snapshot(shard_id, snapshot_id) do
+    copy_object(snapshot_key(shard_id, snapshot_id), db_key(shard_id))
+  end
+
+  @impl true
+  def drop_snapshot(shard_id, snapshot_id) do
+    case Req.delete(req(), url: url_path(snapshot_key(shard_id, snapshot_id))) do
+      {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
+      {:ok, %{status: status}} -> {:error, {:s3_delete_status, status}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @impl true
+  def list_snapshots(shard_id), do: list_snapshots(shard_id, nil, [])
+
+  # ListObjectsV2 over the `<shard>@snap-` prefix (reusing the same paginated scan as
+  # stored_usage/0), parsing each object's snapshot id + byte size.
+  defp list_snapshots(shard_id, token, acc) do
+    snap_prefix = prefix() <> shard_id <> "@snap-"
+
+    params =
+      [{"list-type", "2"}, {"prefix", snap_prefix}] ++
+        if(token, do: [{"continuation-token", token}], else: [])
+
+    case Req.get(req(), url: url_path(""), params: params) do
+      {:ok, %{status: 200, body: body}} ->
+        entries = snapshot_entries(body, snap_prefix)
+
+        case next_token(body) do
+          nil -> {:ok, Enum.sort_by(acc ++ entries, & &1.id, :desc)}
+          next -> list_snapshots(shard_id, next, acc ++ entries)
+        end
+
+      {:ok, %{status: status}} ->
+        {:error, {:s3_list_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp snapshot_entries(xml, snap_prefix) when is_binary(xml) do
+    ~r{<Contents>.*?<Key>(.*?)</Key>.*?<Size>(\d+)</Size>.*?</Contents>}s
+    |> Regex.scan(xml)
+    |> Enum.flat_map(fn [_, key, size] ->
+      if String.starts_with?(key, snap_prefix) and String.ends_with?(key, ".db") do
+        id = key |> String.replace_prefix(snap_prefix, "") |> String.replace_suffix(".db", "")
+        [%{id: id, bytes: String.to_integer(size)}]
+      else
+        []
+      end
+    end)
+  end
+
+  defp snapshot_entries(_body, _prefix), do: []
+
   # Server-side copy: the destination is the request URL; the source is the
   # bucket-qualified key in x-amz-copy-source (S3/MinIO copy without download).
   defp copy_object(src_key, dst_key) do
@@ -1236,6 +1301,9 @@ defmodule Fathom.Shard.Storage.S3 do
 
   defp version_key(shard_id, version),
     do: prefix() <> shard_id <> "@" <> to_string(version) <> ".db"
+
+  defp snapshot_key(shard_id, snapshot_id),
+    do: prefix() <> shard_id <> "@snap-" <> snapshot_id <> ".db"
 
   # Virtual-hosted style carries the bucket in the host; path-style carries it in
   # the URL path (MinIO, R2).

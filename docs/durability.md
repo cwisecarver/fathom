@@ -56,6 +56,48 @@ demonstrates: the survivor's post-steal write survives, the zombie's unflushed w
 resurrected. Warm standby ([warm-standby](warm-standby.md)) shrinks the *time* of that failover, not
 the loss window — the loss window is set by the flush interval.
 
+## Snapshots & point-in-time restore (logical-corruption recovery)
+
+The flush window above is the RPO for **node/disk loss**. It does nothing for **logical
+corruption** — a bad deploy, a mass `UPDATE`, an accidental `DELETE` — which propagates to the one
+durable object within a flush interval and overwrites the last good state. That's the far more
+common incident, and Postgres-on-RDS gives it to a Django shop for free (PITR). Fathom's answer
+leans on the shape of the data: a tenant **is** one SQLite object, so a snapshot is a server-side
+copy of that object under `<shard>@snap-<id>`, and a restore is the copy back — no WAL-replay engine
+or copy-on-write page server (expert review 2026-07-14 #12).
+
+- **Create / list / drop:** `mix fathom.snapshot create|list|drop <shard> [id|label]`, or
+  `Fathom.Snapshots.create/2` / `list/1` / `drop/2` from a node console. A snapshot captures the
+  shard's **last durably-flushed state** (every flush is a complete, checkpointed DB file, so a
+  snapshot is always a consistent database); to snapshot the very latest writes, drain the shard or
+  let it idle-flush first.
+- **Restore:** `Fathom.Snapshots.restore/3` (or `mix fathom.snapshot restore`). It drains any local
+  coordinator and then **refuses unless no live node owns the shard** (`Storage.lease_holder/1`), so
+  the copy-back can't be clobbered by a writer elsewhere — safe regardless of where it's run.
+  Restore is destructive to the current live object; take a fresh snapshot first if you might want
+  to undo the undo.
+- The same copy-one-object primitive is the kernel of **database forking** (copy to a *new* shard
+  id) and preview/staging environments — the differentiator Turso/Neon/PlanetScale market.
+
+Snapshots are backend-uniform (Local + S3), so the whole path is testable without a real object
+store (`test/fathom/snapshots_test.exs`).
+
+## Harden the bucket (defense-in-depth beneath snapshots)
+
+One object per shard in one bucket is the durability floor, and S3's 11-nines protects against
+*media* failure, not against a bucket deletion, a lifecycle misconfig, a compromised credential with
+`s3:DeleteObject`, or a fat-fingered `aws s3 rm --recursive` (expert review 2026-07-14 #13). Harden
+the bucket underneath the fathom-managed snapshots above:
+
+- **Versioning on** + a lifecycle policy to expire noncurrent versions — every fenced flush then
+  leaves an automatic version trail at zero code cost, a second recovery path beneath the explicit
+  snapshots.
+- **Object Lock (or MFA-delete)** on the live prefix, and **cross-region/-account replication**, so
+  a single bucket-level mistake or compromise can't erase every tenant at once.
+- **Least-privilege node credentials:** the data plane needs read/write on `<shard>.db` and the
+  `.lock`/`@version`/`@snap-` keys but should not hold broad `DeleteObject` on the live prefix —
+  scope deletes to the version/snapshot keys the retirement/retention paths actually remove.
+
 ## The dials
 
 - **`synchronous`** — `FULL` (default): per-commit fsync, local durability to a process crash.
