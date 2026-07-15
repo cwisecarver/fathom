@@ -42,6 +42,21 @@ defmodule Fathom.ShardDurabilityTest do
   defp local_db(shard), do: Path.join(@local_dir, "#{shard}.db")
   defp remote_db(shard), do: Path.join(@remote_dir, "#{shard}.db")
 
+  # Pull the shard's stored object to a fresh path and assert it is a valid, quick_check-clean
+  # SQLite db holding `expected_rows` rows of table `t` (expert review #41).
+  defp assert_stored_object_valid(shard, expected_rows) do
+    dst = Path.join(System.tmp_dir!(), "fathom_verify_#{System.unique_integer([:positive])}.db")
+    assert {:ok, _etag} = Storage.pull(shard, dst)
+    assert Shard.verify_integrity(dst) == :ok, "the stored object is not a quick_check-clean db"
+
+    {:ok, conn} = Connection.open(dst)
+    {:ok, %{rows: [[n]]}} = Connection.query(conn, "SELECT count(*) FROM t", [])
+    :ok = Connection.close(conn)
+    assert n == expected_rows
+
+    for s <- ["", "-wal", "-shm"], do: File.rm(dst <> s)
+  end
+
   defp dirty?(shard) do
     {:ok, pid} = Shards.ensure(shard)
     Shard.dirty?(pid)
@@ -267,6 +282,40 @@ defmodule Fathom.ShardDurabilityTest do
 
     refute File.exists?(local_db(shard)),
            "the superseded local .db was renamed aside, not left in place or deleted"
+  end
+
+  # Expert review 2026-07-14 #41: pin the invariant "every flushed object is an openable,
+  # quick_check-clean SQLite database" across the flush paths that run in the default suite —
+  # the checkpoint-then-raw-upload (idle drop) and the VACUUM-INTO snapshot (periodic flush).
+  # A regression in either (e.g. uploading before a checkpoint folds) would ship corrupt
+  # "backups" noticed only at restore time.
+  test "the idle-drop checkpoint+raw-upload flush stores a valid, quick_check-clean db", %{
+    shard: shard
+  } do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE t (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES ('a'), ('b')"))
+    :ok = ShardExecutor.close(conn)
+
+    # Idle drop → flush_then_drop → upload_for_drop → checkpoint ok → raw upload.
+    :ok = Shards.drain(shard, 10_000)
+
+    assert_stored_object_valid(shard, 2)
+  end
+
+  test "the periodic VACUUM-INTO durability flush stores a valid, quick_check-clean db", %{
+    shard: shard
+  } do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE t (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES ('a'), ('b'), ('c')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    # Busy shard (connection still open) → the periodic flush snapshots via VACUUM INTO.
+    flush_now(coordinator)
+
+    assert_stored_object_valid(shard, 3)
+    ShardExecutor.close(conn)
   end
 
   # Finding #15: the LEASE fence (above) passes if the lease is still ours when the flush
