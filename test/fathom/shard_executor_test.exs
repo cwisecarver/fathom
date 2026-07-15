@@ -76,6 +76,37 @@ defmodule Fathom.ShardExecutorTest do
     ShardExecutor.close(conn)
   end
 
+  # Expert review 2026-07-14 #3: constraint violations must carry the specific SQLITE_CONSTRAINT*
+  # code (not a flat SQLITE_ERROR), or django-libsql can't map them to Python IntegrityError —
+  # so get_or_create's `except IntegrityError` race handling never fires and the request 500s.
+  test "a UNIQUE violation surfaces as SQLITE_CONSTRAINT_UNIQUE", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE u (x INTEGER UNIQUE)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO u VALUES (1)"))
+
+    assert {:error, %Error{code: "SQLITE_CONSTRAINT_UNIQUE"}} =
+             ShardExecutor.execute(conn, stmt("INSERT INTO u VALUES (1)"))
+
+    ShardExecutor.close(conn)
+  end
+
+  test "a FOREIGN KEY violation surfaces as SQLITE_CONSTRAINT_FOREIGNKEY", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE parent (id INTEGER PRIMARY KEY)"))
+
+    {:ok, _} =
+      ShardExecutor.execute(
+        conn,
+        stmt("CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))")
+      )
+
+    # Relies on FK enforcement being on by default (review #2).
+    assert {:error, %Error{code: "SQLITE_CONSTRAINT_FOREIGNKEY"}} =
+             ShardExecutor.execute(conn, stmt("INSERT INTO child VALUES (1, 999)"))
+
+    ShardExecutor.close(conn)
+  end
+
   # Finding #25: a statement that *raises* (connection.ex rescues only ArgumentError, so a
   # bad bind / exqlite NIF error / result-mapping bug propagates) must not crash the Hrana
   # stream — the executor boundary converts any raise to a %Filo.Error{}. Non-list args are a

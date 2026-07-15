@@ -119,7 +119,7 @@ defmodule Fathom.ShardExecutor do
         {:ok, stmt_result}
 
       {:error, reason} ->
-        {:error, %Error{message: reason_to_string(reason), code: "SQLITE_ERROR"}}
+        {:error, %Error{message: reason_to_string(reason), code: sqlite_code(reason)}}
     end
   end
 
@@ -408,6 +408,39 @@ defmodule Fathom.ShardExecutor do
     }
   end
 
+  # `:busy` (the busy-timeout expiry from Connection) is the SQLite "database is locked"
+  # condition; give it the human message a client expects instead of the inspected atom ":busy"
+  # (expert review 2026-07-14 #3).
+  defp reason_to_string(:busy), do: "database is locked"
   defp reason_to_string(reason) when is_binary(reason), do: reason
   defp reason_to_string(reason), do: inspect(reason)
+
+  # Map an exqlite error reason to a real Hrana/libSQL error `code` string so a client's driver
+  # can classify it (expert review 2026-07-14 #3): Django keys `IntegrityError` off
+  # `SQLITE_CONSTRAINT*` and "database is locked"/`OperationalError` off `SQLITE_BUSY`, so
+  # flattening everything to `SQLITE_ERROR` broke `get_or_create` race handling, unique/FK
+  # violation handling, and busy-retry loops. exqlite surfaces the extended condition in the
+  # message text (there's no result-code accessor), so classify on that; `:busy` is our own atom.
+  defp sqlite_code(:busy), do: "SQLITE_BUSY"
+
+  defp sqlite_code(reason) when is_binary(reason) do
+    r = String.downcase(reason)
+
+    cond do
+      contains?(r, "unique constraint failed") -> "SQLITE_CONSTRAINT_UNIQUE"
+      contains?(r, "foreign key constraint failed") -> "SQLITE_CONSTRAINT_FOREIGNKEY"
+      contains?(r, "not null constraint failed") -> "SQLITE_CONSTRAINT_NOTNULL"
+      contains?(r, "primary key constraint failed") -> "SQLITE_CONSTRAINT_PRIMARYKEY"
+      contains?(r, "check constraint failed") -> "SQLITE_CONSTRAINT_CHECK"
+      contains?(r, "constraint failed") -> "SQLITE_CONSTRAINT"
+      contains?(r, "readonly") -> "SQLITE_READONLY"
+      contains?(r, "disk is full") -> "SQLITE_FULL"
+      contains?(r, "database is locked") or contains?(r, "database is busy") -> "SQLITE_BUSY"
+      true -> "SQLITE_ERROR"
+    end
+  end
+
+  defp sqlite_code(_), do: "SQLITE_ERROR"
+
+  defp contains?(haystack, needle), do: String.contains?(haystack, needle)
 end
