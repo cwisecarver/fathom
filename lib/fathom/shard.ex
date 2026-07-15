@@ -1215,6 +1215,12 @@ defmodule Fathom.Shard do
                   )
               end
 
+            # quick_check failed (expert review #4): upload_for_drop already quarantined the corrupt
+            # local and refused the flush, so the good stored object is untouched. Release the lease
+            # so the next open pulls that good object (there's no valid local copy left to keep).
+            {:error, {:corrupt_local, _reason}} ->
+              Storage.release_lease(state.id, state.lease)
+
             {:error, reason} ->
               Logger.warning(
                 "shard #{state.id}: flush failed, keeping local copy (#{inspect(reason)})"
@@ -1288,7 +1294,22 @@ defmodule Fathom.Shard do
   defp upload_for_drop(state) do
     case checkpoint(state.path) do
       :ok ->
-        Storage.flush(state.id, state.path, state.etag)
+        # Verify SQLite page-level integrity BEFORE the raw-file upload (expert review 2026-07-14
+        # #4). The checkpoint-then-raw-upload fast path uploads the bytes as-is, so a locally
+        # corrupted db (disk/fs/memory fault, exqlite/OS bug) would be flushed with a valid
+        # If-Match by the legitimate owner — the fence can't help, it's not a steal — clobbering
+        # the last good stored object permanently. On failure: refuse the flush (the good object
+        # stays authoritative), quarantine the corrupt copy for forensics, and alarm. (The
+        # snapshot_and_upload fallback below runs VACUUM INTO, which reads every page and so fails
+        # on corruption already — only this raw path was blind.)
+        case verify_integrity(state.path) do
+          :ok ->
+            Storage.flush(state.id, state.path, state.etag)
+
+          {:error, reason} ->
+            quarantine_corrupt!(state, reason)
+            {:error, {:corrupt_local, reason}}
+        end
 
       {:error, reason} ->
         Logger.warning(
@@ -1297,6 +1318,44 @@ defmodule Fathom.Shard do
 
         snapshot_and_upload(state)
     end
+  end
+
+  # Run `PRAGMA quick_check` on the file at `path`; `:ok` iff SQLite reports the single row "ok".
+  # Cheap (shards are small by premise). `@doc false` public so the corrupt-flush guard is
+  # testable directly (expert review 2026-07-14 #4).
+  @doc false
+  @spec verify_integrity(Path.t()) :: :ok | {:error, term()}
+  def verify_integrity(path) do
+    case Connection.open(path) do
+      {:ok, conn} ->
+        result = Connection.query(conn, "PRAGMA quick_check", [])
+        Connection.close(conn)
+
+        case result do
+          {:ok, %{rows: [["ok"]]}} -> :ok
+          {:ok, %{rows: rows}} -> {:error, {:quick_check, rows}}
+          {:error, reason} -> {:error, {:quick_check_failed, reason}}
+        end
+
+      other ->
+        {:error, {:quick_check_open_failed, other}}
+    end
+  end
+
+  # A local db failed quick_check: move it aside (preserve for forensics) and drop its now-stale
+  # WAL/SHM so the next open pulls the last-good stored object instead of adopting the corrupt
+  # local copy. Loud error + telemetry so an operator sees it (the good object is still safe).
+  defp quarantine_corrupt!(state, reason) do
+    dest = "#{state.path}.corrupt.#{System.system_time(:second)}"
+    _ = File.rename(state.path, dest)
+    Enum.each(["-wal", "-shm"], &File.rm(state.path <> &1))
+
+    Logger.error(
+      "shard #{state.id}: local db failed quick_check (#{inspect(reason)}); REFUSING flush so the " <>
+        "last good stored object stays authoritative; quarantined corrupt copy to #{dest}"
+    )
+
+    :telemetry.execute([:fathom, :shard, :corrupt_flush], %{count: 1}, %{shard_id: state.id})
   end
 
   # The fence decision itself lives in Fathom.Shard.Fence (unit-tested there). This
