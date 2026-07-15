@@ -87,24 +87,34 @@ defmodule Fathom.Migrator.Capture do
         {:reply, :noop, state}
 
       {%{buffer: buffer, count_at_begin: before}, state} ->
-        if count > before and buffer != [] do
-          statements = Enum.reverse(buffer)
+        cond do
+          count > before and buffer != [] ->
+            statements = Enum.reverse(buffer)
 
-          case record(statements) do
-            {:recorded, _} = recorded ->
-              {:reply, recorded, state}
+            case record(statements) do
+              {:recorded, _} = recorded ->
+                {:reply, recorded, state}
 
-            {:error, _} = error ->
-              # Expert review #19: the migration has ALREADY committed on the template
-              # shard, so re-running `manage.py migrate` is a no-op — dropping this
-              # buffer on a Postgres blip would permanently fork template schema from
-              # fleet schema (every subsequent captured version assumes DDL the fleet
-              # never received, so all future replays fail or half-apply). Keep the
-              # statements and retry until the control plane recovers.
-              {:reply, error, stash_pending(state, statements)}
-          end
-        else
-          {:reply, :noop, state}
+              {:error, _} = error ->
+                # Expert review #19: the migration has ALREADY committed on the template
+                # shard, so re-running `manage.py migrate` is a no-op — dropping this
+                # buffer on a Postgres blip would permanently fork template schema from
+                # fleet schema (every subsequent captured version assumes DDL the fleet
+                # never received, so all future replays fail or half-apply). Keep the
+                # statements and retry until the control plane recovers.
+                {:reply, error, stash_pending(state, statements)}
+            end
+
+          # django_migrations SHRANK: a backwards Django migrate (`manage.py migrate <app> <prev>`)
+          # deleted its bookkeeping row (expert review 2026-07-14 #6). The fleet does NOT follow a
+          # backwards migrate — fleet undo is a fathom revert — so alarm and reconcile before the
+          # next capture, or the next captured version assumes DDL the fleet still has.
+          count < before ->
+            alarm_backwards(before, count)
+            {:reply, :noop, state}
+
+          true ->
+            {:reply, :noop, state}
         end
     end
   end
@@ -178,6 +188,21 @@ defmodule Fathom.Migrator.Capture do
           %{version: version}
         )
     end
+  end
+
+  # A backwards Django migrate on the template (expert review #6): shout, don't silently :noop.
+  defp alarm_backwards(before, count) do
+    Logger.error(
+      "template django_migrations shrank #{before} → #{count} on commit — a BACKWARDS Django " <>
+        "migrate ran on the template (expert review #6). The fleet does NOT follow a backwards " <>
+        "migrate; fleet undo is a fathom revert. Reconcile before the next capture."
+    )
+
+    :telemetry.execute(
+      [:fathom, :migrator, :backwards_migrate],
+      %{before: before, count: count},
+      %{}
+    )
   end
 
   @dml_leads ~w(insert update delete replace)

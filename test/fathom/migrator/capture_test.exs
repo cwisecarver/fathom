@@ -99,6 +99,21 @@ defmodule Fathom.Migrator.CaptureTest do
       refute log =~ "DATA-MIGRATION"
     end
 
+    # Expert review 2026-07-14 #6: a backwards migrate deletes a django_migrations row (count falls),
+    # which the count-rose boundary silently treated as :noop — the template schema moved and the
+    # fleet never heard. It must alarm now. Fresh Capture instance so the :baseline is isolated.
+    test "a backwards Django migrate (django_migrations shrinks) is flagged, not silently ignored" do
+      import ExUnit.CaptureLog
+
+      cap = start_supervised!({Capture, name: :"cap_back_#{System.unique_integer([:positive])}"})
+      conn = make_ref()
+      Capture.begin(conn, 1, cap)
+      Capture.append(conn, "DELETE FROM django_migrations WHERE app='app' AND name='0002'", cap)
+
+      log = capture_log(fn -> assert :noop = Capture.commit(conn, 0, cap) end)
+      assert log =~ "BACKWARDS"
+    end
+
     test "records nothing when the count doesn't rise" do
       conn = make_ref()
       Capture.begin(conn, 5)
