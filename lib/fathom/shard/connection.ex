@@ -10,7 +10,10 @@ defmodule Fathom.Shard.Connection do
   """
   alias Exqlite.Sqlite3
 
-  @doc "Opens a connection to the shard file at `path` (WAL, synchronous=FULL, 5s busy timeout)."
+  @doc """
+  Opens a connection to the shard file at `path` (WAL, synchronous=FULL, 5s busy
+  timeout, and — unless `config :fathom, :foreign_keys` is false — foreign keys ON).
+  """
   @spec open(Path.t()) :: {:ok, reference()} | {:error, term()}
   def open(path) do
     File.mkdir_p!(Path.dirname(path))
@@ -25,9 +28,24 @@ defmodule Fathom.Shard.Connection do
          # single-DB engine pays ~2–3× for the same guarantee. See
          # docs/reviews/competitive-oltp-2026-07-10.md.
          :ok <- Sqlite3.execute(conn, "PRAGMA synchronous=FULL"),
-         :ok <- Sqlite3.execute(conn, "PRAGMA busy_timeout=5000") do
+         :ok <- Sqlite3.execute(conn, "PRAGMA busy_timeout=5000"),
+         :ok <- maybe_foreign_keys(conn) do
       {:ok, conn}
     end
+  end
+
+  # SQLite defaults foreign_keys=OFF, but Django (≥2.2) assumes ON and enforces it via a
+  # per-connection `PRAGMA foreign_keys = ON` in get_new_connection (expert review 2026-07-14
+  # #2). A remote client can't be relied on to replay that on every stream — and even when it
+  # does, the pragma is scoped to the current Hrana stream's connection, so a transparently
+  # re-created stream (HTTP idle-expiry + reconnect) would silently come up with enforcement OFF.
+  # Default it ON here, server-side, so on_delete=CASCADE/PROTECT and FK integrity hold regardless
+  # of client init. A migration needing it off can still send `PRAGMA foreign_keys=OFF` for its own
+  # stream (that overrides this connection's setting); set `:foreign_keys` false to flip the default.
+  defp maybe_foreign_keys(conn) do
+    if Application.get_env(:fathom, :foreign_keys, true),
+      do: Sqlite3.execute(conn, "PRAGMA foreign_keys=ON"),
+      else: :ok
   end
 
   @doc """
