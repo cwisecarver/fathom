@@ -50,6 +50,10 @@ single-node basics first, then what happens across nodes.
 9. **[directory.md](directory.md)** — the Postgres control plane the migration / rebalancing /
    warm-standby readers use, and the off-hot-path recorder (lock-free ETS coalesce + batch-flush) so
    a Postgres outage never fails a checkout.
+10. **[tenant-lifecycle.md](tenant-lifecycle.md)** — whole-shard **delete** (GDPR erasure /
+    offboarding) and **export** (portability): the synchronous tombstone + fleet-wide re-mint guard,
+    the force-stop-then-purge erase (why it can't leave a `.fenced.<ts>` copy behind), and the admin
+    delete/export surface — plus the operator runbook.
 
 [cluster-architecture.md](cluster-architecture.md) is the **canonical, broader** cluster picture
 (the LB-keyspace-partition model + the S3 lease/heartbeat fence) that these zoom into.

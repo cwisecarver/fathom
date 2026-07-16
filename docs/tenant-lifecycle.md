@@ -1,0 +1,136 @@
+# Tenant lifecycle — delete & export
+
+*How `Fathom.Tenants` erases and exports a whole tenant. Built for expert-review finding #15.*
+
+A tenant **is** one shard — one SQLite file plus its lease, retained migration versions, and
+snapshots. The migration engine deliberately scoped out the two whole-shard lifecycle operations
+every multi-tenant platform eventually needs:
+
+- **delete** — GDPR Article 17 erasure / offboarding: erase everything, and make sure it can't
+  silently come back.
+- **export** — GDPR portability: hand the customer their data. Trivial here, because their data
+  *is* a `.db` file.
+
+Neither has a feature flag. They're inert until an operator invokes them.
+
+## Delete
+
+`Fathom.Tenants.delete/1` does the safety-critical work **synchronously**, then hands the slow
+physical erase to a durable, retryable job.
+
+```
+delete(id):
+  Directory.tombstone(id)          # 1. durable: status -> "deleted" (upsert; never resurrected)
+  broadcast_deleted(id)            # 2. fleet-wide: ETS re-mint gate + warm-cache purge, now
+  enqueue DeleteJob(id)            # 3. the physical erase, off the request path
+```
+
+By the time `delete/1` returns, **no new stream can open the shard** anywhere in the fleet — the
+re-mint guard is set before a single object is touched.
+
+### The re-mint guard (why a deleted tenant can't resurrect)
+
+The original bug: novel-shard admission mints a shard on first request, and the directory's
+"is this known?" check treats *any* row as known (and fails open on a Postgres blip). So a stray
+request for a just-deleted subdomain would re-create it as an empty shard — the tenant "comes back".
+
+The guard is `Fathom.Tenants.Tombstones`, modeled on `HranaAuth.Revocations`:
+
+- a **public ETS set** of deleted shard ids, checked O(1) as the *first* branch of
+  `Fathom.Shards.start_if_capacity` ⇒ `{:error, :shard_tombstoned}`. No Postgres on the (near-hot)
+  open path, so it never touches cold-open latency and holds even during a directory outage.
+- **loaded from the directory at boot** (`Directory.deleted_shard_ids/0`),
+- **pushed fleet-wide on delete** over Oban's `LISTEN/NOTIFY` (`:fathom_tenant_deleted`) — the same
+  notification also drops each node's lease-less **warm-follower copy** of the shard, so an erased
+  tenant's cached bytes don't linger until the follower's next poll,
+- **refreshed periodically** (`:tenant_tombstone_refresh_ms`, default 5 min) so a node that booted
+  during a Postgres outage, or missed a fire-and-forget notification, still converges. The set is
+  append-only in memory (a tombstone is permanent).
+
+The directory row is kept tombstoned (not hard-deleted) as the permanent record — it holds no tenant
+*data*, just the id + `deleted` status. `resolve`/`record_batch` on-conflict only bump recency, never
+status, so a late access can't un-delete it.
+
+### The physical erase (`DeleteJob` → `Tenants.purge/1`)
+
+```
+purge(id):
+  cancel_pending_jobs(id)   # scheduled/available/retryable migration/revert/retirement/handoff jobs
+  Shards.stop(id)           # FORCE-stop the home coordinator (see below)
+  Storage.purge_shard(id)   # delete every stored object of the shard
+  rm_local(id)              # sweep the local working file + any quarantine copies
+```
+
+`Storage.purge_shard/1` deletes the live `.db`, the `.lock`, every retained `@<version>`, and every
+`@snap-<id>` in one sweep. Matching is **exact on the id delimiter** — the character after the id must
+be `.` (live/lock) or `@` (a version/snapshot). A bare `starts_with(<id>)` match would erase a
+different tenant, so purging `acme` provably never touches `acme2` (this is the shard-isolation gate,
+pinned by test).
+
+### Why `Shards.stop/1` and not `drain/2` (a real leak, fixed)
+
+The obvious implementation — graceful-drain then delete — has a data-surviving-the-erase bug. A
+graceful drain **can't stop a coordinator that's actively serving** (held connections); it returns
+`:busy` and leaves it running. If you then delete the storage, the still-live coordinator's next
+fenced flush 412s against the now-gone object and **self-fences**, quarantining its un-flushed writes
+to a `.fenced.<ts>` file on local disk (finding #5's safety mechanism). That quarantine file is a copy
+of the *erased tenant's data*, surviving the erasure.
+
+`Fathom.Shards.stop/1` fixes it: it terminates the coordinator via the supervisor **while its lease is
+still valid**, so shutdown flushes/releases cleanly (or is brutal-killed) and never takes the
+self-fence path. Only *then* does `purge` delete the storage. `rm_local` additionally sweeps any
+stray `.fenced.*` / `.forked.*` / `.corrupt.*` copies (anchored at `<id>.db` so it can't hit a sibling
+id). No copy of a deleted tenant is left on disk.
+
+### Cross-node safety
+
+Deletes are usually issued from a node that isn't the shard's LB home. Purging the storage is safe
+even if a live node still holds the lease: **every coordinator flush is fenced** (`If-Match`), so once
+the live object is gone that node's next flush 412s and it self-fences — dropping its buffered writes
+(exactly the erase we want) instead of re-creating the object. This is logged + `[:fathom, :tenants,
+:purge_while_held]` telemetry. Promptly draining a *busy* remote coordinator (via the
+`rebalance_commands` / `command_poller` path) is a follow-up; single-home routing plus the fenced-flush
+self-fence cover correctness today.
+
+## Export
+
+`Fathom.Tenants.export/1` pulls the shard's current **durable** stored object to a temp file and
+returns its path + a suggested filename. Because a tenant is one SQLite file, that *is* the export —
+no format to build. It reflects the last flush (an active shard may have newer writes buffered on its
+coordinator; drain or let it idle for the very latest — the same caveat as a snapshot).
+
+`GET /admin/tenants/:id/export` (BasicAuth, `AdminTenantController`) streams the file via
+`send_download` through the `:4000` admin endpoint and **deletes the temp afterward**, so an exported
+copy never lingers. It's served through the operator boundary, never a public presigned URL (a
+presigned-GET path for very large shards is a possible follow-up). The `:id` is validated by
+`ShardId.cast`, so a path-traversal id is a 400, not a file read.
+
+## Operator runbook
+
+**Delete a tenant.** In the admin dashboard, **Directory** (`/admin/directory`), find the row and
+click **Delete** (a confirm dialog states the erase is permanent). The tombstone + fleet-wide re-mint
+block take effect immediately; the physical erase runs as a background `DeleteJob` (queue `:tenants`,
+watchable in **Migrations**/Oban panels). To delete programmatically: `Fathom.Tenants.delete("acme")`
+from a release remote console.
+
+- **Want a safety net first?** Take a snapshot (`mix fathom.snapshot create acme`) before deleting —
+  delete is immediate and irreversible by design.
+- **A delete looks stuck.** Check the `:tenants` Oban queue for a retrying/failed `DeleteJob`; a
+  storage error retries. Re-running `Tenants.delete/1` is safe (idempotent) and re-enqueues.
+- **Re-use a deleted id.** The tombstone is permanent. To make the subdomain mintable again, hard-
+  delete the directory row and let the tombstone set refresh (or restart the node).
+
+**Export a tenant.** In **Directory**, click **Export** on the row (downloads `<id>.db`), or
+`Fathom.Tenants.export/1` for a temp-file path. Open the file with any SQLite client.
+
+## Where it lives
+
+- `lib/fathom/tenants.ex` — `delete/1`, `purge/1`, `export/1`, `tombstoned?/1`, `broadcast_deleted/1`.
+- `lib/fathom/tenants/tombstones.ex` — the ETS re-mint gate + notifier listener + warm-cache purge.
+- `lib/fathom/tenants/delete_job.ex` — the Oban worker (queue `:tenants`, unique per shard).
+- `lib/fathom/shard/storage.ex` (+ `local.ex` / `s3.ex`) — `purge_shard/1`.
+- `lib/fathom/shards.ex` — `stop/1` (force-stop for deletion).
+- `lib/fathom/directory.ex` / `directory/shard.ex` — `tombstone/1`, `deleted_shard_ids/0`, the
+  `deleted` status.
+- `lib/fathom_web/controllers/admin_tenant_controller.ex` + `live/admin_directory_live.ex` — the
+  export download and the admin delete/export actions.
