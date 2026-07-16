@@ -201,6 +201,49 @@ defmodule Fathom.Telemetry do
         measurement: :bytes,
         unit: :byte,
         description: "Total bytes stored across shard objects"
+      ),
+
+      # --- Page-worthy signals that already emit telemetry but weren't exported (review #30) ----
+      # Each is referenced by a rule in deploy/observability/alert-rules.yml. Low-cardinality
+      # (no shard_id tag — that's the ShardLoad read-API; shard_id rides event metadata for logs).
+
+      # Durability / data-loss precursors.
+      counter("fathom.shard.corrupt_flush.count",
+        event_name: [:fathom, :shard, :corrupt_flush],
+        description:
+          "Pre-flush PRAGMA quick_check failures — a corrupt local was quarantined, NOT flushed over the good S3 copy (#4). Any occurrence is page-worthy"
+      ),
+      counter("fathom.shard.fenced_quarantine.count",
+        event_name: [:fathom, :shard, :fenced_quarantine],
+        description:
+          "Self-fences that quarantined un-flushed writes to a .fenced.<ts> file (#5) — acked-but-unflushed data preserved for recovery; sustained > 0 ⇒ ownership churn losing writes"
+      ),
+
+      # Capacity / admission — the tenant-visible refusals.
+      counter("fathom.shards.novel_rate_limited.count",
+        event_name: [:fathom, :shards, :novel_rate_limited],
+        description:
+          "Novel-shard opens refused by the NovelLimiter (429) — new-tenant minting hit the :novel_shard_rate budget"
+      ),
+      counter("fathom.shards.evicted.count",
+        event_name: [:fathom, :shards, :evicted],
+        description:
+          "Idle shards LRU-evicted at the soft cap to admit a new open (#14) — node running at :max_open_shards; sustained ⇒ under-provisioned"
+      ),
+
+      # Liveness — the mass-self-fence precursor.
+      counter("fathom.shard.heartbeat.lapsed.count",
+        event_name: [:fathom, :shard, :heartbeat, :lapsed],
+        description:
+          "A node heartbeat lapsed (renewal didn't land within the TTL margin) — its shards become stealable; sustained ⇒ S3 reachability / mass self-fence risk"
+      ),
+
+      # Control plane — a stalled Oban is a silent migration/reconcile/rebalancer/retirement outage.
+      counter("fathom.oban.job.exception.count",
+        event_name: [:oban, :job, :exception],
+        tags: [:queue],
+        description:
+          "Oban job failures by queue — migrations/reconcile/rebalancer/retirement/tenant-lifecycle progress; sustained ⇒ control-plane stall (often a Postgres incident, see operations.md)"
       )
     ]
   end

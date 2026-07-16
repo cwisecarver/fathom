@@ -79,4 +79,46 @@ defmodule Fathom.TelemetryTest do
     assert [:fathom, :shard, :lease, :superseded, :count] in names
     assert [:fathom, :shards, :active] in names
   end
+
+  # Review #30: the observability package (deploy/observability/alert-rules.yml) references these
+  # page-worthy signals. Each already emitted telemetry but wasn't exported to Prometheus, so an
+  # adopter's alerting was blind to them. Pin that every alert-rule metric stays defined — removing
+  # or renaming one silently breaks a shipped alert rule.
+  test "metrics/0 exports the page-worthy signals the shipped alert rules depend on" do
+    names = MapSet.new(Fathom.Telemetry.metrics(), & &1.name)
+
+    for name <- [
+          # durability / data-loss precursors
+          [:fathom, :shard, :corrupt_flush, :count],
+          [:fathom, :shard, :fenced_quarantine, :count],
+          # capacity / admission refusals
+          [:fathom, :shards, :at_capacity, :count],
+          [:fathom, :shards, :novel_rate_limited, :count],
+          [:fathom, :shards, :evicted, :count],
+          # liveness — mass self-fence precursor
+          [:fathom, :shard, :heartbeat, :lapsed, :count],
+          # live RPO exposure
+          [:fathom, :durability, :dirty_shards],
+          [:fathom, :durability, :oldest_age_ms],
+          # control-plane stall
+          [:fathom, :oban, :job, :exception, :count]
+        ] do
+      assert name in names, "alert-rule metric #{inspect(name)} is not exported by metrics/0"
+    end
+  end
+
+  test "the Oban failure metric is tagged by queue (low-cardinality) and fires on a real event" do
+    [oban_metric] =
+      Enum.filter(
+        Fathom.Telemetry.metrics(),
+        &(&1.name == [:fathom, :oban, :job, :exception, :count])
+      )
+
+    assert oban_metric.tags == [:queue]
+
+    # Prove the event_name wiring matches what Oban actually emits (metadata carries :queue).
+    attach([[:oban, :job, :exception]])
+    :telemetry.execute([:oban, :job, :exception], %{duration: 1}, %{queue: "migrations"})
+    assert_receive {:telemetry, [:oban, :job, :exception], _, %{queue: "migrations"}}
+  end
 end

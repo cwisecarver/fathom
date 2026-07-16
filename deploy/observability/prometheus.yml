@@ -1,0 +1,49 @@
+# Fathom — Prometheus scrape config (review #30).
+#
+# Each fathom node exposes an in-process Prometheus scrape at GET /admin/metrics (port 4000,
+# behind the admin BasicAuth). The metric set is Fathom.Telemetry.metrics/0 — see
+# deploy/observability/README.md for the SLOs and alert-rules.yml for the shipped alerts.
+#
+# Fleet-merge is by the `node` label (relabeled from the target address below): fathom is an
+# LB-keyspace partition, so a shard's signal lives on exactly one node — you sum/aggregate across
+# `node` to get a fleet view. Do NOT tag metrics per-shard (cardinality death at millions of
+# shards); per-shard hot-set is the Fathom.ShardLoad read API, not a metric.
+#
+# TLS: the scrape target is the node's PRIVATE interface (the same one HRANA_BIND_IP pins). Scrape
+# over http on the private network, or front /admin/metrics with TLS and set scheme: https.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alert-rules.yml
+
+# Point this at your Alertmanager. Commented so a bare `promtool check config` passes standalone.
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: fathom
+    metrics_path: /admin/metrics
+    scheme: http
+    # The admin BasicAuth (ADMIN_USER / ADMIN_PASS). Prefer a file / secret store over inline.
+    basic_auth:
+      username: ${ADMIN_USER}
+      password: ${ADMIN_PASS}
+    static_configs:
+      # One target per node's private address:4000. Replace with your fleet (or use a
+      # service-discovery SD in place of static_configs).
+      - targets:
+          - fathom1:4000
+          - fathom2:4000
+          - fathom3:4000
+    relabel_configs:
+      # Derive a stable `node` label from the target host so alerts/dashboards read per-node and
+      # aggregate cleanly. Keep it aligned with each node's NODE_KEY.
+      - source_labels: [__address__]
+        regex: '([^:]+):.*'
+        target_label: node
+        replacement: '$1'
