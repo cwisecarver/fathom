@@ -1,0 +1,122 @@
+# Fathom single-node EVAL stack (review #17) — fathom + MinIO + Postgres + nginx, safe defaults.
+#
+# The "zero to serving a tenant" on-ramp: one `docker compose up` gives a complete fathom you can
+# provision a tenant on and connect a libSQL client (or django-libsql) to. See README.md for the
+# <30-minute walkthrough and docs/quickstart-django.md for the Django side.
+#
+# This is an EVALUATION stack, not production:
+#   - The dashboard/API run over plain HTTP on localhost (WEB_INSECURE_LOCAL build arg).
+#   - MinIO stands in for S3/R2/Tigris; Postgres + MinIO hold no durable volume unless you add one.
+#   - Secrets below are DEV PLACEHOLDERS. For anything reachable beyond localhost, read
+#     docs/configuration.md and set real SECRET_KEY_BASE / ADMIN_PASS / S3 creds, turn on
+#     HRANA_AUTH, and build WITHOUT WEB_INSECURE_LOCAL. Never expose this stack as-is.
+
+name: fathom-eval
+
+x-fathom-env: &fathom-env
+  DATABASE_URL: ecto://postgres:postgres@postgres/fathom
+  # DEV PLACEHOLDER — generate your own with `mix phx.gen.secret` (or `openssl rand -base64 48`).
+  SECRET_KEY_BASE: eval0nlyeval0nlyeval0nlyeval0nlyeval0nlyeval0nlyeval0nlyeval0nly1234
+  RELEASE_COOKIE: fathom-eval-cookie
+  PHX_SERVER: "1"
+  PHX_HOST: localhost
+  # Anchor Host-subdomain routing to this zone: only <shard>.localhost selects a shard.
+  SHARD_BASE_DOMAIN: localhost
+  # Storage: MinIO (S3-compatible). Swap for real S3/R2/Tigris by changing these five.
+  SHARD_STORAGE: s3
+  S3_BUCKET: fathom-shards
+  S3_ENDPOINT: http://minio:9000
+  S3_PATH_STYLE: "true"
+  AWS_ACCESS_KEY_ID: fathom
+  AWS_SECRET_ACCESS_KEY: fathom-secret
+  SHARD_DATA_DIR: /data/shards
+  # Admin dashboard + control-plane API (/api/tenants) BasicAuth. CHANGE THE PASSWORD.
+  ADMIN_USER: admin
+  ADMIN_PASS: admin
+  # Eval convenience: reach the plaintext dashboard/API on localhost:4000. Paired with the
+  # WEB_INSECURE_LOCAL build arg below (SSL forcing off). Never in a real deployment.
+  WEB_INSECURE_LOCAL: "1"
+  # Auth is DISABLED by default (the network is the trust boundary). To require per-shard tokens,
+  # set HRANA_AUTH=required and mint tokens with `bin/fathom eval 'Fathom.HranaAuth.token_for(...)'`
+  # or the /api/tenants/:id/token endpoint. See docs/auth.md.
+  # HRANA_AUTH: required
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: fathom
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: fathom
+      MINIO_ROOT_PASSWORD: fathom-secret
+    ports:
+      - "9001:9001" # MinIO console (optional; browse the shard objects)
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "mc alias set local http://minio:9000 fathom fathom-secret &&
+                  mc mb -p local/fathom-shards"
+
+  migrate:
+    image: fathom:eval
+    build: &fathom-build
+      # The parent of BOTH repos (fathom + the ../filo path dep), relative to this file.
+      context: ../../..
+      dockerfile: fathom/deploy/compose/Dockerfile
+      args:
+        WEB_INSECURE_LOCAL: "1"
+    command: ["/app/bin/fathom", "eval", "Fathom.Release.migrate"]
+    environment:
+      <<: *fathom-env
+      SHARD_STORAGE: local # no storage/fence needed to run Ecto migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  fathom:
+    image: fathom:eval
+    build: *fathom-build
+    environment: *fathom-env
+    ports:
+      - "4000:4000" # admin dashboard + control-plane API (BasicAuth)
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8081/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  lb:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:8080" # the Hrana endpoint clients connect to (libsql://<shard>.localhost:8080)
+    depends_on:
+      fathom:
+        condition: service_healthy

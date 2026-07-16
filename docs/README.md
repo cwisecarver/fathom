@@ -65,6 +65,13 @@ single-node basics first, then what happens across nodes.
   LB-keyspace-partition (consistent-hash Host → node) + the S3 lease/epoch/heartbeat fence. *Built.*
 - **[deploy-cluster.md](deploy-cluster.md)** — deploying the cluster (LB config, health/observability,
   the two-layer chaos-testing split), plus the phase status (S1–S8). *Built.*
+- **[../deploy/compose/README.md](../deploy/compose/README.md)** — the single-node **eval stack**:
+  one `docker compose up` (fathom + MinIO + Postgres + nginx, safe defaults) to zero-to-a-served
+  tenant in <30 min. *Built.*
+- **[configuration.md](configuration.md)** — the env-var reference: every knob fathom reads, its
+  default, and its **safety consequence** (kept complete by a drift test). *Built.*
+- **[quickstart-django.md](quickstart-django.md)** — pointing an unchanged Django app at a fathom
+  tenant over `django-libsql` (multi-tenant routing helper is the pending #16 companion package). *Built.*
 
 ## Design / plans
 

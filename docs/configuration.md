@@ -1,0 +1,129 @@
+# Configuration reference — fathom environment variables
+
+Every environment variable fathom reads at boot (`config/runtime.exs`), grouped, with its default
+and — the column that matters for a multi-tenant data plane — its **safety consequence** if set
+wrong. A drift test (`test/fathom/configuration_doc_test.exs`) fails CI if a new `System.get_env`
+knob is added to `runtime.exs` without a row here, so this list stays complete.
+
+Boot guards catch several dangerous misconfigs (`Fathom.Application` refuses to start on them) —
+those are called out. When in doubt, the eval stack (`deploy/compose/`) is a known-good starting
+config; diff from it.
+
+> **Safety-critical, read these first:** `SECRET_KEY_BASE`, `SHARD_BASE_DOMAIN`, `HRANA_AUTH`,
+> `HRANA_BIND_IP`, `MAX_OPEN_SHARDS`, `NOVEL_SHARD_RATE`, `ADMIN_USER`/`ADMIN_PASS`. Getting these
+> wrong is how you commingle tenants, expose the data path, or take a tenant down.
+
+## Core (required in prod)
+
+| Var | Default | What it does | Safety consequence |
+|---|---|---|---|
+| `DATABASE_URL` | — (**required in prod**, boot raises) | Postgres directory / control-plane connection (`ecto://user:pass@host/db`). | No directory ⇒ no migrations/rebalancer/lifecycle. The data path survives a Postgres outage (fails open), but boot requires it. |
+| `SECRET_KEY_BASE` | — (**required in prod**, boot raises) | Signs cookies + (by default) Hrana tokens. Generate with `mix phx.gen.secret`. | A shared/leaked value lets anyone forge admin sessions and per-shard tokens. Never commit it. |
+| `PHX_HOST` | `example.com` | Public host used to build URLs. | Cosmetic for the data path; set it so generated links/redirects are correct. |
+| `PHX_SERVER` | unset (release doesn't serve) | Set to start the Phoenix/web endpoint from a release. | Without it a release boots but serves no web/dashboard. The eval stack sets it. |
+| `PORT` | `4000` | Web/dashboard + control-plane API listener port. | — |
+
+## Routing & tenant isolation (safety-critical)
+
+| Var | Default | What it does | Safety consequence |
+|---|---|---|---|
+| `SHARD_BASE_DOMAIN` | unset (unanchored) | Anchors Host-subdomain routing to a zone: only `<shard>.<zone>` selects a shard; any other Host fails closed. | **The isolation anchor.** Unset = any attacker-controlled Host first-label becomes a shard id. A *blank* value is treated as unset (a blank zone would deny all routing). Boot refuses an exposed data plane with this unset unless `ALLOW_UNANCHORED_ROUTING`. |
+| `ALLOW_UNANCHORED_ROUTING` | unset | Explicit ack to run the data plane WITHOUT `SHARD_BASE_DOMAIN`. | Only for a deliberately unanchored deploy. Leaving routing unanchored on an exposed port is a cross-tenant hazard. |
+
+## Storage (shard bottomless backend)
+
+| Var | Default | What it does | Safety consequence |
+|---|---|---|---|
+| `SHARD_STORAGE` | Local (`System.tmp_dir!`) | `s3` selects the S3 backend (+ reads the S3 vars); `local` a filesystem store. | `local` on a multi-node fleet has no shared durability/lease store — use `s3` (or S3-compatible) in any real cluster. |
+| `S3_BUCKET` | — (**required when `SHARD_STORAGE=s3`**) | The bucket holding every shard object + lease/heartbeat. | The single most important object store; loss/compromise affects every tenant (harden per `docs/durability.md`). |
+| `S3_REGION` | `us-east-1` | S3 region. | — |
+| `S3_ENDPOINT` | unset (AWS) | Override for S3-compatible stores (MinIO/R2/Tigris). | — |
+| `S3_PATH_STYLE` | `false` | Path-style addressing (needed by MinIO/R2). | — |
+| `S3_PREFIX` | `""` | Key prefix for all shard objects. | Use to share a bucket; a wrong prefix silently reads/writes the wrong keyspace. |
+| `AWS_ACCESS_KEY_ID` | unset | S3 credential. | Use least-privilege creds scoped to the bucket/prefix (`docs/durability.md`). |
+| `AWS_SECRET_ACCESS_KEY` | unset | S3 credential. | As above; keep out of images/logs. |
+| `AWS_SESSION_TOKEN` | unset | Optional STS session token. | — |
+| `VERIFY_STORAGE_FENCE` | `true` | Boot probe that the store enforces conditional writes (the fence). Set `false` to skip. | **Never `false` in prod.** The fence is what makes single-writer safe; skipping the probe on a store that doesn't enforce `If-*` risks split-brain. |
+
+## Shard data plane
+
+| Var | Default | What it does | Safety consequence |
+|---|---|---|---|
+| `SHARD_DATA_DIR` | `System.tmp_dir!/fathom_shards` | Local working copy of every open shard. | Point at fast local disk; size for `MAX_OPEN_SHARDS × shard size` + warm-cache headroom (see `docs/runbooks/operations.md` disk-full). |
+| `SHARD_LEASE_TTL_MS` | `30000` | Node heartbeat / lease TTL. Bounds how long a dead node's shards stay unstealable (the failover-stall ceiling). | Too low → false steals under load/skew; too high → slower failover. Pair with clock discipline (NTP). |
+| `SHARD_FLUSH_INTERVAL_MS` | code default | Periodic durability-flush cadence. | Directly sets the RPO floor: a node lost between flushes loses up to this window of writes. |
+| `SHARD_IDLE_MS` | code default | Idle threshold before a shard flush+drop+stops. | Lower = more S3 churn; higher = more resident shards. |
+| `SHARD_MAX_PAGE_COUNT` | unset (unlimited) | Per-shard `PRAGMA max_page_count` cap (pages; size = pages × 4096B). | Enforces "limited dataset per shard": a write past it fails `SQLITE_FULL`, so one runaway tenant can't inflate flush/cold-open/standby cost fleet-wide. |
+
+## Auth (Hrana data path)
+
+| Var | Default | What it does | Safety consequence |
+|---|---|---|---|
+| `HRANA_AUTH` | `disabled` | `required` makes every stream present a per-shard token; `disabled` trusts the network. Unknown values fail closed to required. | With `disabled`, the port MUST be reachable only via the LB (firewall/SG/private subnet + `HRANA_BIND_IP`). A reachable, unauthenticated `:8080` is open tenant access. Boot refuses `required` without a usable secret. |
+| `HRANA_TOKEN_SECRET` | falls back to `SECRET_KEY_BASE` | Dedicated token-signing secret, so a data-path secret rotation doesn't touch web sessions/CSRF. | Rotate independently; keep secret. |
+| `HRANA_TOKEN_MAX_AGE` | unset (tokens don't expire) | Optional token expiry (seconds). | Unset ⇒ revoke only by rotation; a boot warning fires when `required` runs with infinite max-age. |
+| `HRANA_BIND_IP` | unset (all interfaces) | Pins the Hrana listener to the private interface the LB reaches. | Defense-in-depth for the `disabled`-auth posture; unset relies on network isolation alone. |
+
+## Admission & limits (safety-critical)
+
+| Var | Default | What it does | Safety consequence |
+|---|---|---|---|
+| `MAX_OPEN_SHARDS` | conservative finite (config.exs) | Per-node cap on open shards (the fd-cliff protection). At the cap, the soft default evicts an idle shard; a hard cap 503s. | Tune to the node's measured fd/RSS density (`mix fathom.scale --ramp`). Too high → fd exhaustion; too low → needless evictions/503s. |
+| `NOVEL_SHARD_RATE` | unset (off) | Rate limit (grants/sec) on minting brand-NEW shard ids. | Bounds shard-minting abuse on an exposed data path. Its directory check **fails open** on a Postgres outage — don't rely on it as the only defense (`docs/runbooks/operations.md`). |
+| `NOVEL_SHARD_BURST` | code default | Token-bucket burst for the novel limiter. | — |
+| `FORK_FROM_TEMPLATE` | unset (born empty) | Birth novel shards at the fleet HEAD from the retained `template@HEAD` snapshot. | Only enable with a template + snapshot in place; a poisonable template reachable anonymously is a fleet-wide vector (never make `:default_shard` the template). |
+
+## Web / dashboard / API
+
+| Var | Default | What it does | Safety consequence |
+|---|---|---|---|
+| `ADMIN_USER` | dev default `admin` | BasicAuth user for `/admin`, `/admin/metrics`, and `/api/tenants`. | The control-plane guard; the plug fails closed (503) if unset in prod, so the surface is never anonymous. Set a real value before exposing `:4000`. |
+| `ADMIN_PASS` | dev default `admin` | BasicAuth password for the above. | Change from `admin`. It gates tenant provisioning/deletion and the metrics scrape. |
+| `WEB_BIND_IP` | per-env (dev loopback) | Bind IP for the web endpoint (e.g. `0.0.0.0` for LAN). | On `0.0.0.0` the dashboard is reachable on every interface with the BasicAuth creds — set real creds first. |
+| `WEB_INSECURE_LOCAL` | unset (SSL forced) | **Build-time** flag (compile-time in `config/prod.exs`): turns off `force_ssl` + the LiveView WS origin check for a plaintext LAN/localhost dashboard. | **Never build a real deployment with it.** Eval/chaos only. It's a Docker build-arg, not a runtime env. |
+
+## Observability
+
+| Var | Default | What it does | Safety consequence |
+|---|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (no-op) | Enables OpenTelemetry OTLP trace export (also honors the standard `OTEL_EXPORTER_OTLP_*` vars). | Off by default; traces contain shard ids — send to a trusted collector. |
+| `SHARD_LOAD` | off | Per-shard load counters (`Fathom.ShardLoad`) — the rebalancer / hot-spot input. | Off so the hot path doesn't pay for an unread counter; turn on where a rebalancer or `--hotspots` reads it. |
+
+## Cluster / node
+
+| Var | Default | What it does | Safety consequence |
+|---|---|---|---|
+| `NODE_KEY` | `node()` | Stable per-node key (heartbeat object, LB backend reference, load samples). | **Must be unique per node.** A collision makes two nodes share one heartbeat and corrupts liveness (`docs/runbooks/operations.md` heartbeat). |
+| `DNS_CLUSTER_QUERY` | unset | DNS-based BEAM clustering query (not required — fathom coordinates via S3, not BEAM). | — |
+| `ECTO_IPV6` | unset | Use IPv6 for the Postgres socket. | — |
+| `POOL_SIZE` | `10` | Postgres connection pool size. | Too small starves the control plane under load; size to cores/Postgres limits. |
+
+## Rebalancer (Phase-2 B1 — all off by default)
+
+Enable only per the staged runbook (`docs/runbooks/rebalancer.md`); the pin decision trusts a
+tenant-controllable signal, so it presumes the Hrana trust boundary is enforced.
+
+| Var | Default | What it does | Safety consequence |
+|---|---|---|---|
+| `REBALANCER_ENABLED` | off | Runs the (singleton) rebalance control loop. | Do NOT enable on a data path open to untrusted callers (a tenant could drive a shard hot to induce a handoff blip). |
+| `LOAD_REPORTER` | off | Publishes this node's hot set to Postgres (needs `SHARD_LOAD`). | — |
+| `COMMAND_POLLER` | off | Acts on handoff warm/drain commands addressed to this node. | — |
+| `LB_BACKENDS` | unset | The LB backend set (`node=addr,...`) the policy picks targets from. | Must match the real LB membership, or handoffs target a wrong/missing node. |
+| `LB_MAP_PATH` | unset | Where the rebalancer writes the rendered nginx exception map. | Must be the file the LB includes; a mismatch means pins never apply. |
+| `LB_RELOAD_CMD` | unset | How to reload the LB after a map change (e.g. `nginx -s reload`). | Unset ⇒ the map is written but reload is out-of-band. |
+| `LB_TEST_CMD` | unset | Config test run against a candidate map before promotion; non-zero exit aborts the promotion. | Guards against pushing a broken LB config. |
+| `LB_TEST_TIMEOUT_MS` | `10000` | Deadline for the LB config-test command. | A hung command is killed so it can't hold the fleet lock. |
+| `LB_RELOAD_TIMEOUT_MS` | `10000` | Deadline for the LB reload command. | As above. |
+| `REBALANCE_HOT_QPS_FLOOR` | unset (p99-relative) | Absolute q/s hot-detection floor; boot raises on an unusable value. | A mis-set floor silently disables the rebalancer — the boot guard catches unusable values. |
+| `LOAD_REPORT_INTERVAL_MS` | code default | How often a node reports its load. | — |
+| `REBALANCE_CONFIRM_WINDOWS` | code default | Windows a hotspot must persist before a move (anti-flap). | — |
+| `REBALANCE_COOLDOWN_MS` | code default | Cooldown between moves. | — |
+
+## Warm standby (Phase-2 A1 — off by default)
+
+| Var | Default | What it does | Safety consequence |
+|---|---|---|---|
+| `WARM_FOLLOWER` | off | This node pre-pulls recently-active foreign shards (no lease, never serves) for faster failover. | Disk-bound; a large warm cache can fill `WARM_CACHE_DIR` (`docs/runbooks/operations.md` disk-full). |
+| `WARM_CACHE_DIR` | code default | Separate cache dir for warm copies. | Size independently of `SHARD_DATA_DIR`. |
+| `WARM_POLL_MS` | code default | How often the follower refreshes its warm set. | — |
+| `WARM_HOME_RETENTION_MS` | code default | How long after last owning a shard the follower still treats it as "home" and won't re-warm. | Outlast a routine idle→reopen gap; a real LB remap lapses it. |

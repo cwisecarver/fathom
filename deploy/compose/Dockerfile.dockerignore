@@ -1,0 +1,15 @@
+# BuildKit per-Dockerfile ignore. The build context is the PARENT directory of
+# fathom/ and filo/ (see Dockerfile) — whitelist only what the build needs.
+*
+!fathom/mix.exs
+!fathom/mix.lock
+!fathom/config
+!fathom/lib
+!fathom/priv
+!fathom/assets
+!filo
+filo/_build
+filo/deps
+filo/.git
+filo/erl_crash.dump
+fathom/priv/static/assets
