@@ -87,7 +87,13 @@ what actually shipped (some plan assumptions were superseded).
 
 ## Runbooks
 
-- **[runbooks/cluster.md](runbooks/cluster.md)** — operating the cluster.
+- **[runbooks/cluster.md](runbooks/cluster.md)** — operating the cluster (lease/ownership incidents:
+  stuck-unavailable, split-brain, S3 down) + the metrics/alerts reference.
+- **[runbooks/operations.md](runbooks/operations.md)** — the non-lease incident classes:
+  Postgres-outage, disk-full, heartbeat-loss, dual-LB double-routing, shard restore drill, and the
+  per-dependency fail-open/fail-closed matrix.
+- **[runbooks/deploy.md](runbooks/deploy.md)** — rolling a new fathom version node-by-node,
+  clean-shutdown flush semantics, config-change vs full-restart, and node removal.
 - **[runbooks/rebalancer.md](runbooks/rebalancer.md)** — the staged, gate-by-gate enable path for
   dynamic rebalancing (observe-before-arming dry run + rollback).
 - **[runbooks/admin-dashboard.md](runbooks/admin-dashboard.md)** — running the realtime `/admin`

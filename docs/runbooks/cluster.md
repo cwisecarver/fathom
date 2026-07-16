@@ -4,6 +4,12 @@ Operational responses for the multi-node cluster phase. Architecture: `docs/depl
 Observability is `Fathom.Telemetry` — `:telemetry` events → `Telemetry.Metrics` (export with a
 reporter) and an OpenTelemetry trace span on checkout (OTLP, env-gated).
 
+This file covers **lease / ownership** incidents (stuck-unavailable, split-brain, S3 down). For the
+non-lease classes — **Postgres outage, disk full, heartbeat loss, dual-LB double-routing, and the
+shard restore drill** — plus the per-dependency **fail-open/fail-closed matrix**, see
+[`operations.md`](operations.md). For node upgrade/restart, see [`deploy.md`](deploy.md). Shippable
+alert rules + dashboards for these signals live in [`deploy/observability/`](../../deploy/observability/).
+
 ## Metrics (from `Fathom.Telemetry.metrics/0`)
 
 | Metric | Type | Meaning |
