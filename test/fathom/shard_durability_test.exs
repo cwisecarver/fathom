@@ -723,6 +723,70 @@ defmodule Fathom.ShardDurabilityTest do
     close_and_stop(shard, conn)
   end
 
+  # Expert review #27: a persistent flush failure (S3 auth / bucket-policy change) must be
+  # ALERTABLE, not just a per-interval Logger.warning that lets the RPO grow silently. The
+  # coordinator counts consecutive failures, emits [:fathom, :shard, :flush, :failed] with the
+  # running count, escalates to Logger.error past :flush_failure_alert_threshold, and RESETS the
+  # count on a durable flush. Pre-fix there was no telemetry, no escalation, and no counter.
+  test "consecutive flush failures emit escalating telemetry and reset on recovery",
+       %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    prev_threshold = Application.get_env(:fathom, :flush_failure_alert_threshold)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    # Threshold 2 keeps the test short: escalation fires on the 2nd consecutive failure.
+    Application.put_env(:fathom, :flush_failure_alert_threshold, 2)
+
+    test_pid = self()
+    handler = "flushfail-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shard, :flush, :failed],
+      fn _e, meas, meta, _cfg -> send(test_pid, {:flush_failed, meas, meta}) end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler)
+      Application.delete_env(:fathom, :storage_fault)
+      restore(:flush_failure_alert_threshold, prev_threshold)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+    {:ok, coordinator} = Shards.ensure(shard)
+
+    Application.put_env(:fathom, :storage_fault, :flush)
+
+    # First failure: consecutive == 1, below threshold (no error escalation).
+    capture_log(fn -> flush_now(coordinator) end)
+    assert_receive {:flush_failed, %{count: 1, consecutive: 1}, %{shard_id: ^shard}}
+
+    # Second failure: consecutive == 2, hits the threshold ⇒ escalate to Logger.error.
+    log = capture_log(fn -> flush_now(coordinator) end)
+    assert_receive {:flush_failed, %{count: 1, consecutive: 2}, %{shard_id: ^shard}}
+    assert log =~ "FAILED 2× consecutively"
+
+    # Storage recovers: a durable flush RESETS the counter and emits NO failure event.
+    Application.delete_env(:fathom, :storage_fault)
+    flush_now(coordinator)
+    refute_receive {:flush_failed, _, _}, 100
+
+    # A fresh write + failure starts the count over at 1 — proving the reset.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('bob')"))
+    Application.put_env(:fathom, :storage_fault, :flush)
+    capture_log(fn -> flush_now(coordinator) end)
+    assert_receive {:flush_failed, %{consecutive: 1}, %{shard_id: ^shard}}
+
+    ShardExecutor.close(conn)
+  end
+
   test "a supervisor shutdown flushes via terminate/2 instead of losing the write",
        %{shard: shard} do
     # Regression: the coordinator didn't trap exits, so a supervisor `:shutdown` (SIGTERM,

@@ -35,6 +35,19 @@ groups:
           description: "More than 3 self-fences quarantined un-flushed writes in 15m — ownership churn is losing data windows. Check LB stability / clock skew."
           runbook: docs/runbooks/cluster.md#runbook-suspected-double-write--split-brain-on-remap
 
+      - alert: FathomFlushFailing
+        # The DIRECT flush-failure signal (#27): flushes are erroring, not just aging. A persistent
+        # rate means an S3 auth / bucket-policy / reachability problem turning "RPO = 30s" into
+        # "RPO = hours" silently. The coordinator also escalates to Logger.error past
+        # :flush_failure_alert_threshold consecutive failures.
+        expr: sum by (node) (rate(fathom_shard_flush_failed_count[5m])) > 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "Durability flushes failing on {{ $labels.node }}"
+          description: "Shard flushes have been erroring for 5m — the RPO is growing and un-flushed writes are at risk if the node is lost. Check S3 reachability, credentials, and bucket policy."
+          runbook: docs/runbooks/operations.md#runbook-node-disk-full-shard_data_dir
+
       - alert: FathomUnflushedAgeHigh
         # The RPO exposure gauge. Rising oldest-unflushed age = flushes are failing silently (S3
         # trouble or a stuck coordinator). This is the "flush failure rate" signal the RPO gauge

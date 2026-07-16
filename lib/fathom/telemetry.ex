@@ -208,6 +208,11 @@ defmodule Fathom.Telemetry do
       # (no shard_id tag — that's the ShardLoad read-API; shard_id rides event metadata for logs).
 
       # Durability / data-loss precursors.
+      counter("fathom.shard.flush.failed.count",
+        event_name: [:fathom, :shard, :flush, :failed],
+        description:
+          "Durability-flush failures (#27) — a persistent rate means flushes aren't landing and the RPO is growing silently (S3 auth / bucket-policy / reachability). The direct flush-failure signal behind the rising oldest-unflushed-age gauge"
+      ),
       counter("fathom.shard.corrupt_flush.count",
         event_name: [:fathom, :shard, :corrupt_flush],
         description:

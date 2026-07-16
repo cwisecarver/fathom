@@ -35,8 +35,22 @@ durability PUTs track *writes*, not open-shard count. Two things trigger a flush
    each interval; incremental WAL streaming — A2 — is future work, and is what would push the RPO
    toward zero for a continuously-hot shard.)
 
-So the RPO of a hot shard ≈ `:shard_flush_interval_ms`; smaller means a tighter window and more
-PUTs — the tuning dial.
+So the RPO of a hot shard is `:shard_flush_interval_ms` *plus the flush's own duration* — the
+watermark that clears "dirty" is captured when the flush task **starts**, and the interval timer
+re-arms only after it **settles**, so the honest worst case is `interval + ~2× snapshot/upload time`
+(the interval, plus the in-flight snapshot that didn't quite finish, plus the next one). On a fast
+store the flush duration is small and RPO ≈ interval; on a slow/large one, size it in.
+
+**This bound holds only while flushes succeed.** A *persistent* flush failure — an S3 auth change, a
+bucket-policy change, a credential expiry — makes the RPO **unbounded**: the shard stays dirty and
+retries every interval, the oldest-unflushed-age climbs, and (before review #27) the only trace was
+a per-interval `Logger.warning`. The coordinator now counts consecutive failures, emits
+`[:fathom, :shard, :flush, :failed]` telemetry, and escalates to `Logger.error` past
+`:flush_failure_alert_threshold` (default 3). **Alert on it** — the `FathomFlushFailing` and
+`FathomUnflushedAgeHigh` rules in [`deploy/observability/alert-rules.yml`](../deploy/observability/alert-rules.yml)
+turn a silent RPO blow-out into a page. Smaller `:shard_flush_interval_ms` means a tighter window
+and more PUTs — the tuning dial (it's currently a fleet-global knob; a per-shard override was scoped
+out as a tenant-tiering feature).
 
 ## Durability never buys split-brain
 

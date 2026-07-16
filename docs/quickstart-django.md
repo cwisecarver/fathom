@@ -91,3 +91,33 @@ migrations auto-captured) is `test/django_validation/` — run it as the referen
 > round-trip; ~2× the region RTT + a few ms). Django's default `CONN_MAX_AGE=0` opens a fresh stream
 > per request — set `CONN_MAX_AGE` to reuse connections and amortize stream setup. A fuller
 > latency/pooling contract is review #38 (pending).
+
+## Write concurrency — set `transaction_mode: IMMEDIATE` (important)
+
+Each shard is one SQLite database in WAL mode: **one writer at a time.** With more than one Django
+worker/thread writing the *same tenant* (the default multi-worker gunicorn/uwsgi deployment),
+you'll hit a footgun. Django issues a plain deferred `BEGIN`, so the common
+`with transaction.atomic(): obj = Model.objects.get(...); obj.save()` reads first, then upgrades to
+a write — and if another writer advanced the WAL in between, SQLite returns `SQLITE_BUSY_SNAPSHOT`
+**immediately**. The busy-timeout does *not* wait for this case, so the transaction fails
+**non-retryably** with a "database is locked"-class error (fathom surfaces the real `SQLITE_BUSY`
+code, review #3).
+
+The fix is client-side and one line — take the write lock up front so the upgrade conflict can't
+happen:
+
+```python
+DATABASES = {
+    "default": {
+        "ENGINE": "libsql.db.backends.sqlite3",
+        "NAME": "ws://acme.localhost:8080",
+        # Django 5.1+: begin every transaction as BEGIN IMMEDIATE (grabs the write lock up front).
+        "OPTIONS": {"transaction_mode": "IMMEDIATE"},
+    }
+}
+```
+
+On Django ≤ 5.0 (the `django-libsql` version ceiling above), issue `PRAGMA busy_timeout` /
+`BEGIN IMMEDIATE` via an init command or wrap write transactions accordingly. fathom deliberately
+does **not** rewrite your SQL server-side — you control the writes, so this stays a one-line client
+setting (review #18). Set it whenever a tenant sees concurrent writers.

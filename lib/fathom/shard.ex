@@ -332,6 +332,12 @@ defmodule Fathom.Shard do
         flush_task: nil,
         flush_pending: nil,
         flush_pending_gen: nil,
+        # Consecutive durability-flush failures (expert review #27): a persistent S3 failure
+        # (auth/bucket-policy change) would otherwise only Logger.warning per interval and let the
+        # RPO grow unbounded and silently. We count consecutive failures, emit
+        # [:fathom, :shard, :flush, :failed] telemetry, and ESCALATE to Logger.error past a
+        # threshold so it's alertable. Reset to 0 on any durable flush.
+        flush_failures: 0,
         draining: false,
         drain_timer: nil,
         drain_reply_to: nil,
@@ -839,7 +845,7 @@ defmodule Fathom.Shard do
         FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
         # Persist the durable-flush time so it survives node death (#28) — off the hot path.
         Fathom.Directory.Recorder.record_flush(state.id)
-        {:noreply, schedule_flush(state)}
+        {:noreply, schedule_flush(clear_flush_failures(state))}
 
       # The data PUT's If-Match failed (412) but the task's lock re-check found the lock
       # STILL OURS (expert review #2): a 412 is NOT proof of a steal — our own PUT can
@@ -860,7 +866,7 @@ defmodule Fathom.Shard do
         FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
         # Our bytes are durably the live object (#28) — record the flush time.
         Fathom.Directory.Recorder.record_flush(state.id)
-        {:noreply, schedule_flush(state)}
+        {:noreply, schedule_flush(clear_flush_failures(state))}
 
       # 412 + lock ours, but the object's etag came back nil/unreadable: keep serving with
       # no etag resync (mirrors the old reconcile's `_ -> {:ok, state}`); stays dirty and
@@ -876,15 +882,16 @@ defmodule Fathom.Shard do
       # Snapshot/PUT (or the reconcile's lock read) failed transiently: don't advance the
       # watermark, so it stays dirty and the next interval retries — and a later idle-drop
       # flushes before dropping instead of deleting un-stored writes.
-      {:error, _reason} ->
-        {:noreply, schedule_flush(state)}
+      {:error, reason} ->
+        {:noreply, schedule_flush(record_flush_failure(state, reason))}
     end
   end
 
   # The flush task crashed before replying: treat like a transient flush failure.
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{flush_task: %Task{ref: ref}} = state) do
     Logger.warning("shard #{state.id}: durability flush task crashed (#{inspect(reason)})")
-    {:noreply, schedule_flush(%{state | flush_task: nil})}
+    state = record_flush_failure(%{state | flush_task: nil}, {:task_crash, reason})
+    {:noreply, schedule_flush(state)}
   end
 
   @impl true
@@ -1609,6 +1616,44 @@ defmodule Fathom.Shard do
         error
     end
   end
+
+  # Track a failed durability flush (expert review #27). Emits [:fathom, :shard, :flush, :failed]
+  # with the running consecutive count every time, and ESCALATES to Logger.error past a threshold —
+  # so a persistent S3 failure (auth / bucket-policy change) that would otherwise grow the RPO
+  # silently (a per-interval warning only) becomes an alertable, escalating signal. The shard stays
+  # dirty and keeps retrying regardless; this is observability, not a behavior change.
+  defp record_flush_failure(state, reason) do
+    n = state.flush_failures + 1
+
+    :telemetry.execute([:fathom, :shard, :flush, :failed], %{count: 1, consecutive: n}, %{
+      shard_id: state.id
+    })
+
+    if n >= flush_failure_alert_threshold() do
+      Logger.error(
+        "shard #{state.id}: durability flush FAILED #{n}× consecutively (#{inspect(reason)}) — RPO is " <>
+          "growing unbounded; the shard stays dirty and keeps retrying. Check S3 reachability, " <>
+          "credentials, and bucket policy."
+      )
+    end
+
+    %{state | flush_failures: n}
+  end
+
+  # Reset the consecutive-failure counter on any durable flush. No-op (and silent) on the happy
+  # path; logs a one-line recovery only when clearing a real streak.
+  defp clear_flush_failures(%{flush_failures: 0} = state), do: state
+
+  defp clear_flush_failures(state) do
+    Logger.info(
+      "shard #{state.id}: durability flush recovered after #{state.flush_failures} consecutive failure(s)"
+    )
+
+    %{state | flush_failures: 0}
+  end
+
+  defp flush_failure_alert_threshold,
+    do: Application.get_env(:fathom, :flush_failure_alert_threshold, 3)
 
   # Snapshot the live DB to a temp file and upload it (fenced by the object etag), keeping the
   # working copy. Returns `{:ok, new_etag}` when both the snapshot and the conditional upload
