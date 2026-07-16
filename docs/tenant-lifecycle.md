@@ -170,6 +170,42 @@ Suspend denies new streams fleet-wide immediately and graceful-drains the home c
 in-flight transactions finish but nothing new opens. It does not delete data — resume brings the
 tenant straight back.
 
+## Fork (clone a tenant)
+
+Because a tenant *is* one SQLite object, **forking** it — for a preview environment, per-tenant
+staging, test-database forking, or cloning a tenant to debug an incident — is one object copy
+(`#14`). `Fathom.Tenants.fork/2`:
+
+```
+fork(src, dst):
+  refuse if dst is taken/tombstoned
+  Storage.fork_shard(src, dst)      # copy src.db -> dst.db (refuse :dst_exists / :no_source)
+  register dst @ src's schema version   # so the laggard sweep won't re-migrate the fork
+  mint a dst token
+  -> %{shard_id: dst, url, auth_token, auth_required}
+```
+
+It reflects `src`'s **last durably-flushed** state and does NOT disrupt `src` (no drain) — snapshot
+or drain `src` first for the very latest. Registering the dst directory row at the source's schema
+version is load-bearing: a fork left at `v0` while its copied `.db` is at `vN` would be swept as a
+laggard and quarantined when the engine replayed a migration onto the already-migrated file.
+
+## Operator tooling (`mix fathom.shard`)
+
+The recover/validate/clone commands over the `Storage` behaviour, so recovery isn't hand-rolled
+`aws-cli` + `sqlite3` under incident pressure:
+
+| Command | What |
+|---------|------|
+| `mix fathom.shard pull <shard> [path]` | download the stored `.db` |
+| `mix fathom.shard inspect <shard>` | pull + read-only `quick_check`, `user_version`, per-table row counts — a **per-shard restore drill** (an untested restore path is an unproven backup) |
+| `mix fathom.shard fork <src> <dst>` | clone a live tenant to a new id (or `POST /api/tenants/:id/fork`, or `Fathom.Tenants.fork/2` from a node console) |
+
+`pull`/`inspect` only touch stored objects; `fork` needs the directory + token secret (run it from a
+node console in a running release). A scheduled **fleet** restore-drill (sample N shards/day) is a
+follow-up — `inspect` is the manual per-shard form today. Point-in-time restore is `mix
+fathom.snapshot restore` (#12); a fleet schema revert is the migrator.
+
 ## Operator runbook
 
 **Delete a tenant.** In the admin dashboard, **Directory** (`/admin/directory`), find the row and
@@ -203,6 +239,8 @@ hold — the data is untouched, so resume brings the tenant straight back.
   `resume/1`, `tombstoned?/1`, `suspended?/1`, `broadcast_deleted/1`, `broadcast_suspension/2`.
 - `lib/fathom/tenants/suspensions.ex` — the reversible `suspended` ETS deny gate (#20).
 - `lib/fathom_web/controllers/api/tenant_controller.ex` — the `/api/tenants` JSON control-plane.
+- `lib/mix/tasks/fathom.shard.ex` — the `pull`/`inspect`/`fork` operator CLI (#14); `Storage.fork_shard/2`
+  is the copy primitive and `Tenants.fork/2` the orchestration.
 - `lib/fathom/tenants/tombstones.ex` — the ETS re-mint gate + notifier listener + warm-cache purge.
 - `lib/fathom/tenants/delete_job.ex` — the Oban worker (queue `:tenants`, unique per shard).
 - `lib/fathom/shard/storage.ex` (+ `local.ex` / `s3.ex`) — `purge_shard/1`.
