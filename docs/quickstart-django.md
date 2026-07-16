@@ -87,10 +87,44 @@ client stack:
 The end-to-end proof (an unchanged Django project migrating + doing ORM CRUD over fathom, with the
 migrations auto-captured) is `test/django_validation/` — run it as the reference integration.
 
-> **Latency note:** the first request to a *sleeping* tenant pays the shard cold-open inline (one S3
-> round-trip; ~2× the region RTT + a few ms). Django's default `CONN_MAX_AGE=0` opens a fresh stream
-> per request — set `CONN_MAX_AGE` to reuse connections and amortize stream setup. A fuller
-> latency/pooling contract is review #38 (pending).
+## Request latency & keeping tenants warm
+
+fathom is bottomless: a tenant that's been idle is flushed to S3 and dropped, so its **first**
+request pays a cold-open. Owning this number up front is the difference between "priced" and "slow".
+
+**The two regimes:**
+
+| Request | What it costs | Typical |
+|---|---|---|
+| **Warm** (tenant already open on the node) | local SQLite over an established stream — no S3, no network beyond the LB | sub-ms to low-ms query time |
+| **Cold** (first request to an idle/dropped tenant) | lease acquire + object pull, **≈ 1 S3 round-trip** + body transfer (scales with shard size × bandwidth), done *inline* in that first query | see below |
+
+**The cold-open contract.** Cold-open is optimized to ~1 S3 RTT (the lease acquire and the pull
+overlap). Measured on the fleet (`docs/reviews/latency-cost-2026-07-11.md`): at **10 / 30 / 60 ms**
+one-way S3 RTT, cold-open ≈ **24 / 77 / 137 ms** — roughly `~2× one-way RTT + a few ms`, plus body
+transfer for a large shard. So a p99 first-request contract is *your S3 region RTT × ~2 + shard-size
+term*; steady-state (warm) requests are not on this curve at all. A 100–300 ms first-request tail is
+**expected and bounded**, not pathological — it's the bottomless design, priced.
+
+**Three levers to keep it out of the hot path:**
+
+1. **`CONN_MAX_AGE`.** Django's default `CONN_MAX_AGE=0` opens (and tears down) a fresh Hrana
+   stream per request — re-running client init and per-stream `Connection.open` every time. Set
+   `CONN_MAX_AGE=None` (persistent connections) so a worker reuses one stream across requests and
+   only the *first* request per worker pays stream setup:
+   ```python
+   DATABASES = {"default": {"ENGINE": "libsql.db.backends.sqlite3", "NAME": "ws://acme.localhost:8080",
+                            "CONN_MAX_AGE": None}}
+   ```
+2. **Idle-flush timing.** A tenant goes cold after `SHARD_IDLE_MS` of no activity (flush + drop).
+   Raise it so active tenants stay resident longer (fewer cold-opens) at the cost of more open
+   shards per node — trade it against your node density (`docs/configuration.md`,
+   `docs/reviews/fleet-density-2026-07-10.md`).
+3. **Pre-warm on login (optional).** The warm-standby follower (A1) covers *failover*, not
+   *first-touch of a cold tenant*. To hide the cold-open from the user's first real request, open a
+   cheap stream (e.g. `SELECT 1`) against the tenant's subdomain when they log in / land — that
+   triggers the cold-open ahead of the work. Provisioning already returns the tenant URL, so this is
+   a client-side pattern, not a fathom feature.
 
 ## Write concurrency — set `transaction_mode: IMMEDIATE` (important)
 
