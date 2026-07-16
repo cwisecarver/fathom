@@ -124,3 +124,35 @@ or renew (it would rather be unavailable than risk a split-brain).
 - Do NOT bypass the fence (no unconditional writes) — that's the split-brain the design avoids.
 - Shards already open keep serving until their lease lapses (≤ TTL); new opens wait for S3.
 - When S3 recovers, opens resume automatically; no manual shard intervention needed.
+
+## Failover herd + warm-standby sizing
+
+When a node dies, **all** its tenants re-home onto survivors at once. Measured on the rig
+([`../reviews/failover-herd-2026-07-16.md`](../reviews/failover-herd-2026-07-16.md), N=300): the herd
+re-homes **cleanly** (300/300 served, no S3-throttle collapse, no survivor memory spike — the
+single-writer lease and the bounded Finch pool make it safe by construction). What you tune is the
+**latency** of the tail:
+
+- **Time-to-served is floored by the lease**, not the herd: `SHARD_LEASE_TTL_MS` + steal margin
+  (~15 s in the rig) is how long a *silent-killed* owner's shards stay unstealable while its
+  heartbeat lapses. Lower `SHARD_LEASE_TTL_MS` for faster crash failover (at the cost of more false
+  steals under clock skew / load). A **graceful** node stop releases leases immediately — no floor
+  (see [`deploy.md`](deploy.md)).
+- **The concurrent cold-open spread above the floor is small** (~1.3 s for 300 shards) — the pool
+  absorbs the herd. It grows with `active_shards_per_node / s3_pool_size × RTT`; size the S3
+  `pool_size` for your density.
+
+**When to enable the warm follower (`WARM_FOLLOWER=true`).** The warm win is the object **body
+transfer avoided** on failover, so it's marginal for tiny shards (the lease floor + ~1 RTT dominate;
+the rig measured ~0.5 s saved for one-row shards) and grows with shard size. Enable it when the
+cold-pull herd would move real bytes — roughly when
+
+```
+active_shards_per_node × avg_shard_size / S3_bandwidth   ≳   your failover-RTO budget
+```
+
+i.e. large shards (MB+) at high density (thousands/node). For KB-scale shards, leave it off — the
+follower's disk + revalidation cost buys almost nothing. **Size `:warm_cache_max`** so a survivor can
+hold a full dead peer's active set: `:warm_cache_max ≥ active_shards_per_node` (a warm copy costs
+its file on disk plus ~0 process/fd — it's disk-bound, so err generous). Watch
+`fathom.shard.warm.promoted{result="hit"}` to confirm failovers are landing on the warm path.

@@ -9,6 +9,8 @@
 #   ./chaos.sh owner <shard>      which node holds the shard file
 #   ./chaos.sh latency <ms>|clear inject S3 latency on every node (toxiproxy)
 #   ./chaos.sh failover <shard>   silent-kill the owner; time LB reroute + survivor steal
+#   ./chaos.sh failover-herd [shards warm]  kill a node holding N shards; measure time-to-served
+#                                 across ALL its tenants (p50/p90/p99/max) — the herd, warm=on|off
 #   ./chaos.sh deploy [shards node]  clean-shutdown (rolling-deploy) proof: hold N open+dirty shards
 #                                 on a node, SIGTERM it, verify the graceful terminate flushed EVERY
 #                                 shard (zero loss) — the herd analog of failover for a node upgrade
@@ -961,8 +963,75 @@ cmd_deploy() {
   revive "$node"
 }
 
+# cmd_failover_herd — the failover HERD at density (expert review #39). `failover` measures ONE
+# shard's re-home time; a real node death re-homes ALL its tenants onto survivors at once. This seeds
+# N shards on a node, kills it, then fires all N requests through the LB CONCURRENTLY and reports the
+# time-to-served distribution (p50/p90/p99/max + served/N) — the herd. `warm=off` disables the
+# survivors' warm follower + clears their cache so every re-home cold-opens (full pull); `warm=on`
+# (default) lets them 304-promote the pre-warmed copy. The floor is the lease TTL + steal margin
+# (~15s here): a silent-killed owner's shards are unstealable until its heartbeat lapses.
+cmd_failover_herd() {
+  local shards=${1:-300} warm=${2:-on} node=fathom1
+  echo "failover-herd: $shards shards on $node, warm=$warm — kill it, measure time-to-served across the herd"
+
+  rpc "$node" 'Application.put_env(:fathom, :shard_idle_ms, 600_000); Application.put_env(:fathom, :max_open_shards, 100_000)' >/dev/null
+
+  echo "seeding $shards shards on $node ..."
+  local i s
+  for i in $(seq 1 "$shards"); do
+    s="herd_${i}"
+    sql_direct "$node" "$s" "CREATE TABLE IF NOT EXISTS kv (id INTEGER PRIMARY KEY AUTOINCREMENT, seq INTEGER)" >/dev/null 2>&1
+    sql_direct "$node" "$s" "INSERT INTO kv (seq) VALUES (1)" >/dev/null 2>&1
+  done
+  echo "waiting for a durable flush (a kill must lose nothing) ..."
+  sleep 8
+
+  local sv
+  if [ "$warm" = "on" ]; then
+    echo "warm=on: waiting so survivors pre-warm $node's shards (2 poll cycles) ..."
+    sleep 6
+  else
+    echo "warm=off: disabling the follower + clearing warm caches on survivors (force cold-open) ..."
+    for sv in "${NODES[@]}"; do
+      [ "$sv" = "$node" ] && continue
+      rpc "$sv" 'Application.put_env(:fathom, :warm_follower, false)' >/dev/null
+      compose exec -T "$sv" sh -c 'rm -rf /data/warm/* 2>/dev/null' || true
+    done
+  fi
+
+  local tmp; tmp=$(mktemp -d)
+  echo "killing $node; firing $shards concurrent requests through the LB ..."
+  local t0; t0=$(now_ms)
+  silent_kill "$node"
+
+  for i in $(seq 1 "$shards"); do
+    (
+      s="herd_${i}"
+      until sql "$s" "SELECT seq FROM kv LIMIT 1" >/dev/null 2>&1; do sleep 0.05; done
+      echo $(($(now_ms) - t0)) >"$tmp/$i"
+    ) &
+    # Bound the fork fan-out in waves of 150 so the driver host isn't the bottleneck.
+    if [ $((i % 150)) -eq 0 ]; then wait; fi
+  done
+  wait
+
+  /usr/bin/python3 - "$tmp" "$shards" <<'PY'
+import sys, os, glob
+tmp, n = sys.argv[1], int(sys.argv[2])
+vals = sorted(int(open(f).read().strip()) for f in glob.glob(os.path.join(tmp, '*')) if open(f).read().strip())
+def pct(p):
+    return vals[min(len(vals) - 1, int(p / 100 * len(vals)))] if vals else 0
+print(f"RESULT failover-herd: served {len(vals)}/{n}  p50={pct(50)}ms  p90={pct(90)}ms  p99={pct(99)}ms  max={max(vals) if vals else 0}ms")
+print("  (floor ~= lease TTL + steal margin; the spread above it is the concurrent cold-open/pool cost)")
+PY
+  rm -rf "$tmp"
+
+  revive "$node"
+}
+
 case "${1:-}" in
   build)       cmd_build ;;
+  failover-herd) shift; cmd_failover_herd "$@" ;;
   deploy)      shift; cmd_deploy "$@" ;;
   tpcb)        shift; cmd_tpcb "$@" ;;
   tpcc)        shift; cmd_tpcc "$@" ;;
