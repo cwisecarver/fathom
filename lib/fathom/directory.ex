@@ -344,6 +344,33 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  The shard's revocation floor + the instant of the last graceful rotate — `{version, bumped_at}`
+  (#24). `HranaAuth` caches this and accepts a token at `version - 1` while `bumped_at` is within
+  the rotation grace window (a `revoke` sets `bumped_at` to `nil`, so the previous version is
+  refused immediately). `{nil, nil}` if the shard has no directory row.
+  """
+  @spec token_floor_info(String.t()) :: {pos_integer() | nil, DateTime.t() | nil}
+  def token_floor_info(shard_id) do
+    case Repo.one(
+           from s in Shard,
+             where: s.shard_id == ^shard_id,
+             select: {s.token_version, s.token_version_bumped_at}
+         ) do
+      nil -> {nil, nil}
+      {version, bumped_at} -> {version, bumped_at}
+    end
+  end
+
+  @doc """
+  Graceful zero-downtime rotation (#24): raises `token_version` (so a new token mints one higher)
+  and stamps `token_version_bumped_at` = now, so `HranaAuth` keeps accepting the PREVIOUS version
+  for the rotation grace window — mint-new → deploy → the old auto-hardens out. Returns
+  `{:ok, new_version}` or `{:error, changeset}` for an invalid id.
+  """
+  @spec rotate_token(String.t()) :: {:ok, pos_integer()} | {:error, Ecto.Changeset.t()}
+  def rotate_token(shard_id), do: bump_token(shard_id, DateTime.utc_now())
+
+  @doc """
   Revokes every outstanding Hrana token for `shard_id` by bumping its
   `token_version` (expert review #31). Registers the shard first if unknown (so a
   revoke is never lost to a not-yet-recorded shard) — WITHOUT bumping
@@ -354,7 +381,14 @@ defmodule Fathom.Directory do
   invalid id (previously a MatchError crash).
   """
   @spec bump_token_version(String.t()) :: {:ok, pos_integer()} | {:error, Ecto.Changeset.t()}
-  def bump_token_version(shard_id) do
+  def bump_token_version(shard_id), do: bump_token(shard_id, nil)
+
+  # Raise token_version by one, setting token_version_bumped_at to `bumped_at` (a DateTime for a
+  # graceful rotate — grace on; `nil` for a hard revoke — grace off, previous version refused
+  # immediately). Registers the shard first if unknown (a revoke/rotate is never lost to a
+  # not-yet-recorded shard) WITHOUT bumping last_active_at (round-2 #32: operator action, not
+  # tenant activity). Returns the NEW version.
+  defp bump_token(shard_id, bumped_at) do
     register =
       %Shard{}
       |> Shard.changeset(%{
@@ -370,7 +404,8 @@ defmodule Fathom.Directory do
         {1, [version]} =
           Repo.update_all(
             from(s in Shard, where: s.shard_id == ^shard_id, select: s.token_version),
-            inc: [token_version: 1]
+            inc: [token_version: 1],
+            set: [token_version_bumped_at: bumped_at]
           )
 
         {:ok, version}

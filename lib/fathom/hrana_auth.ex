@@ -50,6 +50,10 @@ defmodule Fathom.HranaAuth do
 
   @salt "fathom hrana shard"
 
+  # How long after a graceful rotate the PREVIOUS token version keeps verifying (#24) — long
+  # enough for the tenant to deploy the new token. Configurable via `:hrana_rotation_grace_ms`.
+  @default_rotation_grace_ms 3_600_000
+
   # Both refusals are 401 with the same code; the message distinguishes "you sent
   # nothing" (an unconfigured client) from "what you sent doesn't grant this shard"
   # (bad signature, expired, or a foreign shard's token — deliberately not told apart,
@@ -82,7 +86,7 @@ defmodule Fathom.HranaAuth do
     with {:ok, %{"s" => granted, "v" => version}} <-
            Phoenix.Token.verify(secret!(), @salt, token, max_age: max_age()),
          {:ok, ^granted} <- ShardId.cast(shard_id),
-         true <- above_floor?(version, Revocations.floor(granted)) do
+         true <- version_ok?(version, Revocations.floor_info(granted)) do
       :ok
     else
       # Bad signature/expiry, a token for a different shard, a revoked (stale-version)
@@ -94,11 +98,25 @@ defmodule Fathom.HranaAuth do
 
   defp verify(_shard_id, _token), do: {:error, @unauthorized}
 
-  # `:unavailable` is the fail-closed posture during a floor-read outage with no
-  # last-known-good value (round-2 #25, `:hrana_revocation_on_error`): refuse
-  # explicitly rather than via term-ordering accident.
-  defp above_floor?(version, floor) when is_integer(floor), do: version >= floor
-  defp above_floor?(_version, :unavailable), do: false
+  # Whether a token's embedded `version` clears the shard's revocation floor, honoring the
+  # graceful-rotation grace window (#24): the CURRENT floor always verifies, and the PREVIOUS
+  # version (`floor - 1`) verifies too while a rotate's `bumped_at` is within the grace window —
+  # so mint-new → deploy → the old auto-hardens out with no outage. A hard revoke sets `bumped_at`
+  # to nil (no grace), and a floor-read outage with no last-known-good value is `:unavailable`
+  # (fail-closed refuse, round-2 #25 — not a term-ordering accident).
+  defp version_ok?(_version, :unavailable), do: false
+
+  defp version_ok?(version, {floor, bumped_at}) do
+    version >= floor or (version == floor - 1 and within_grace?(bumped_at))
+  end
+
+  defp within_grace?(%DateTime{} = bumped_at),
+    do: DateTime.diff(DateTime.utc_now(), bumped_at, :millisecond) < rotation_grace_ms()
+
+  defp within_grace?(_), do: false
+
+  defp rotation_grace_ms,
+    do: Application.get_env(:fathom, :hrana_rotation_grace_ms, @default_rotation_grace_ms)
 
   @doc """
   Mints a bearer token granting access to `shard_id` (canonicalized).
@@ -139,8 +157,9 @@ defmodule Fathom.HranaAuth do
         # directory's own validation disagrees — surface it as the same error.
         case Directory.bump_token_version(canonical) do
           {:ok, version} ->
-            Revocations.put(canonical, version)
-            notify_revocation(canonical, version)
+            # No bump instant ⇒ no grace: a revoke kills the previous version immediately.
+            Revocations.put(canonical, version, nil)
+            notify_revocation(canonical, version, nil)
             {:ok, version}
 
           {:error, _changeset} ->
@@ -152,16 +171,55 @@ defmodule Fathom.HranaAuth do
     end
   end
 
-  # Best-effort fleet push (round-2 #24): a notify failure must never fail the
-  # revoke — the directory bump is the durable truth and the TTL converges.
-  defp notify_revocation(shard_id, version) do
-    Oban.Notifier.notify(Oban, :fathom_revocations, %{shard_id: shard_id, version: version})
+  @doc """
+  Zero-downtime rotation for `shard_id` (#24): raises the shard's token version — stamping the
+  rotate instant so the PREVIOUS version keeps verifying for the grace window
+  (`:hrana_rotation_grace_ms`, default 1h) — refreshes this node's cache, pushes the change
+  fleet-wide, and mints + returns a NEW token at the new version. Deploy the returned token within
+  the grace window and the old auto-hardens out with no per-tenant outage — unlike `revoke/1`,
+  which is immediate. `opts` pass through to the mint. Returns `{:ok, token}` or
+  `{:error, :invalid_shard_id}`.
+  """
+  @spec rotate(term(), keyword()) :: {:ok, String.t()} | {:error, :invalid_shard_id}
+  def rotate(shard_id, opts \\ []) do
+    case ShardId.cast(shard_id) do
+      {:ok, canonical} ->
+        case Directory.rotate_token(canonical) do
+          {:ok, version} ->
+            bumped_at = DateTime.utc_now()
+            Revocations.put(canonical, version, bumped_at)
+            notify_revocation(canonical, version, bumped_at)
+            # token_for reads the now-raised directory version, so it mints at the new version.
+            token_for(canonical, opts)
+
+          {:error, _changeset} ->
+            {:error, :invalid_shard_id}
+        end
+
+      :error ->
+        {:error, :invalid_shard_id}
+    end
+  end
+
+  # Best-effort fleet push (round-2 #24): a notify failure must never fail the revoke/rotate — the
+  # directory bump is the durable truth and the TTL converges. `bumped_at` (ISO or nil) carries the
+  # rotation grace instant so other nodes honor it too.
+  defp notify_revocation(shard_id, version, bumped_at) do
+    Oban.Notifier.notify(Oban, :fathom_revocations, %{
+      shard_id: shard_id,
+      version: version,
+      bumped_at: encode_bumped_at(bumped_at)
+    })
+
     :ok
   rescue
     _ -> :ok
   catch
     :exit, _ -> :ok
   end
+
+  defp encode_bumped_at(nil), do: nil
+  defp encode_bumped_at(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
 
   @doc """
   Boot guard (called from `Fathom.Application.start/2`): refuse to start with a

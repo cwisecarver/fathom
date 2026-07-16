@@ -43,6 +43,11 @@ defmodule Fathom.Directory.Shard do
     # version it was minted at; bumping this via Fathom.HranaAuth.revoke/1 invalidates
     # every outstanding token for THIS shard alone (no fleet-wide secret rotation).
     field :token_version, :integer, default: 1
+    # When `token_version` was last raised by a graceful rotate (#24) — `HranaAuth` accepts the
+    # PREVIOUS version for a grace window after this instant, so a rotate is zero-downtime. NULL
+    # (the default, and what a hard `revoke` resets it to) means "no grace": the previous version
+    # is refused immediately.
+    field :token_version_bumped_at, :utc_datetime_usec
 
     timestamps(type: :utc_datetime_usec)
   end

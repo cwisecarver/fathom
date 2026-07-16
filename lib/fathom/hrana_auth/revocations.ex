@@ -1,27 +1,27 @@
 defmodule Fathom.HranaAuth.Revocations do
   @moduledoc """
-  A node-local, TTL-refreshed cache of per-shard Hrana-token revocation versions
-  (expert review #31), keeping token verification off the Postgres hot path.
+  A node-local, TTL-refreshed cache of per-shard Hrana-token revocation state (expert review #31,
+  extended for graceful rotation #24), keeping token verification off the Postgres hot path.
 
-  `Fathom.HranaAuth.verify/2` needs a shard's current `token_version` (the
-  revocation floor) on every stream open. Reading Postgres per open would couple
-  the data path to the control plane — the exact cost `Fathom.Directory.Recorder`
-  exists to avoid — and a Postgres outage would then 401 all authenticated traffic.
+  Each entry is `{floor, bumped_at}`: the revocation **floor** (a token minted below it is refused)
+  and the instant of the last graceful **rotate** (`nil` after a hard revoke). `HranaAuth.verify/2`
+  accepts a token at `floor - 1` while `bumped_at` is within the rotation grace window, so a rotate
+  is zero-downtime (mint-new → deploy → the old auto-hardens out) while a revoke is immediate.
 
-  So each version is cached in ETS for `:hrana_revocation_ttl_ms` (default 30s):
+  `Fathom.HranaAuth.verify/2` needs this on every stream open. Reading Postgres per open would
+  couple the data path to the control plane — the exact cost `Fathom.Directory.Recorder` exists to
+  avoid — and a Postgres outage would then 401 all authenticated traffic. So it's cached for
+  `:hrana_revocation_ttl_ms` (default 30s):
 
     * a cache **hit** answers with no Postgres round-trip;
-    * a **miss** reads through to `Fathom.Directory.token_version/1` and caches it;
-    * a read-through that **errors** (Postgres blip) returns `0` — the "no
-      revocations known" floor — so a **validly-signed** token still opens. This is
-      the deliberate fail-open posture: the signature is still required (a leaked
-      credential is the pre-existing risk, unchanged), and revocation is
-      eventually-consistent, converging within the TTL once Postgres recovers —
-      the same best-effort contract the whole directory has.
+    * a **miss** reads through to `Fathom.Directory.token_floor_info/1` and caches it;
+    * a read-through that **errors** (Postgres blip) serves the last-known-good cached value even
+      past its TTL — stale-but-safe, never weaker than what this node already knew (round-2 #25).
+      With no prior value at all, `:hrana_revocation_on_error` decides: `:fail_open` (default)
+      returns floor `0`; `:fail_closed` returns `:unavailable` and the token is refused.
 
-  `bump/1` is called by `Fathom.HranaAuth.revoke/1` after it bumps the directory
-  version, so the revoking node sees the new floor immediately; other nodes
-  converge within the TTL.
+  `put/2` (revoke) and `put/3` (rotate) are called on the acting node so it sees the change
+  immediately; other nodes converge within the TTL (or instantly via the notifier push).
   """
   use GenServer
 
@@ -36,32 +36,37 @@ defmodule Fathom.HranaAuth.Revocations do
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
   @doc """
-  The cached revocation floor for `shard_id`. A hit returns instantly; a miss reads
-  through to the directory and caches it. A read-through ERROR (Postgres outage)
-  serves the last-known-good cached floor even past its TTL — stale-but-safe, never
-  weaker than what this node already knew (expert review round-2 #25: collapsing to
-  `0` silently re-activated every revoked credential fleet-wide after one TTL,
-  coupling an availability failure to a security-control bypass). With no prior
-  value at all, `:hrana_revocation_on_error` decides: `:fail_open` (default — the
-  signature stays the enforced control) returns `0`; `:fail_closed` returns
-  `:unavailable` and the token is refused. Every error path emits
-  `[:fathom, :hrana, :revocation, :floor_error]` so a floor-read outage is visible
-  as a security-control-down, not just a log line.
+  The cached `{floor, bumped_at}` for `shard_id` (`bumped_at` is a `DateTime` after a graceful
+  rotate, else `nil`), or `:unavailable` when a floor-read outage has no last-known-good value and
+  the on-error posture is `:fail_closed`. See the module doc.
   """
-  @spec floor(String.t()) :: non_neg_integer() | :unavailable
-  def floor(shard_id) do
+  @spec floor_info(String.t()) :: {non_neg_integer(), DateTime.t() | nil} | :unavailable
+  def floor_info(shard_id) do
     now = System.monotonic_time(:millisecond)
 
     case lookup(shard_id, now) do
-      {:hit, version} -> version
+      {:hit, info} -> info
       :miss -> read_through(shard_id, now)
     end
   end
 
-  @doc "Caches a freshly-bumped version for `shard_id` (called on the revoking node)."
+  @doc "The cached revocation floor for `shard_id` (the integer only; see `floor_info/1`)."
+  @spec floor(String.t()) :: non_neg_integer() | :unavailable
+  def floor(shard_id) do
+    case floor_info(shard_id) do
+      :unavailable -> :unavailable
+      {version, _bumped_at} -> version
+    end
+  end
+
+  @doc "Caches a freshly-revoked floor for `shard_id` (no rotation grace — the previous version dies now)."
   @spec put(String.t(), non_neg_integer()) :: :ok
-  def put(shard_id, version) do
-    insert(shard_id, version, System.monotonic_time(:millisecond))
+  def put(shard_id, version), do: put(shard_id, version, nil)
+
+  @doc "Caches a freshly-rotated floor + its bump instant for `shard_id` (grace on for the previous version)."
+  @spec put(String.t(), non_neg_integer(), DateTime.t() | nil) :: :ok
+  def put(shard_id, version, bumped_at) do
+    insert(shard_id, version, bumped_at, System.monotonic_time(:millisecond))
     :ok
   end
 
@@ -70,28 +75,22 @@ defmodule Fathom.HranaAuth.Revocations do
     # public read_concurrency: verify/2 runs in the stream process and reads directly.
     :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
 
-    # Fleet-wide revocation push (expert review round-2 #24): a revoked token kept
-    # working on every OTHER node for up to a full TTL, because only the revoking
-    # node's cache was bumped. Fathom has no BEAM cluster, so Phoenix.PubSub cannot
-    # cross nodes — the one shared channel is Postgres, and Oban's LISTEN/NOTIFY
-    # notifier is already running on it. Best-effort: without it (Oban down, bench
-    # harness), the TTL remains the convergence backstop.
+    # Fleet-wide push (round-2 #24): without it a change lands on every OTHER node only after a
+    # full TTL. Fathom has no BEAM cluster, so the one shared channel is Postgres — Oban's
+    # LISTEN/NOTIFY. Best-effort: without it (Oban down, bench harness) the TTL is the backstop.
     listen_for_revocations()
 
-    # No per-process TTL state (round-2 #37): lookup/insert run in CALLER processes
-    # against the public table and read `:hrana_revocation_ttl_ms` directly, so a
-    # child-spec ttl_ms option was stored here but never consulted — a silently
-    # no-op knob. The app env IS the knob (see ttl_ms/0).
     {:ok, %{}}
   end
 
   @impl true
   def handle_info(
-        {:notification, :fathom_revocations, %{"shard_id" => shard_id, "version" => version}},
+        {:notification, :fathom_revocations,
+         %{"shard_id" => shard_id, "version" => version} = msg},
         state
       )
       when is_binary(shard_id) and is_integer(version) do
-    put_max(shard_id, version)
+    put_max(shard_id, version, decode_bumped_at(Map.get(msg, "bumped_at")))
     {:noreply, state}
   end
 
@@ -99,17 +98,21 @@ defmodule Fathom.HranaAuth.Revocations do
 
   defp lookup(shard_id, now) do
     case :ets.lookup(@table, shard_id) do
-      [{^shard_id, version, expires_at}] when now < expires_at -> {:hit, version}
-      _ -> :miss
+      [{^shard_id, version, bumped_at, expires_at}] when now < expires_at ->
+        {:hit, {version, bumped_at}}
+
+      _ ->
+        :miss
     end
   rescue
     ArgumentError -> :miss
   end
 
   defp read_through(shard_id, now) do
-    version = Directory.token_version(shard_id) || 0
-    insert(shard_id, version, now)
-    version
+    {version, bumped_at} = Directory.token_floor_info(shard_id)
+    version = version || 0
+    insert(shard_id, version, bumped_at, now)
+    {version, bumped_at}
   rescue
     e ->
       Logger.warning("revocation floor read failed for #{shard_id}: #{Exception.message(e)}")
@@ -120,54 +123,67 @@ defmodule Fathom.HranaAuth.Revocations do
       read_error_fallback(shard_id)
   end
 
-  # See floor/1 (round-2 #25). Expired entries are never deleted, only overwritten,
-  # so the last-known-good floor is still in the table to serve stale.
+  # See floor_info/1 (round-2 #25). Expired entries are never deleted, only overwritten, so the
+  # last-known-good value is still in the table to serve stale.
   defp read_error_fallback(shard_id) do
     :telemetry.execute([:fathom, :hrana, :revocation, :floor_error], %{count: 1}, %{
       shard_id: shard_id
     })
 
     case stale_floor(shard_id) do
-      {:ok, version} ->
-        version
+      {:ok, info} ->
+        info
 
       :none ->
         case Application.get_env(:fathom, :hrana_revocation_on_error, :fail_open) do
           :fail_closed -> :unavailable
-          _ -> 0
+          _ -> {0, nil}
         end
     end
   end
 
   defp stale_floor(shard_id) do
     case :ets.lookup(@table, shard_id) do
-      [{^shard_id, version, _expires_at}] -> {:ok, version}
+      [{^shard_id, version, bumped_at, _expires_at}] -> {:ok, {version, bumped_at}}
       [] -> :none
     end
   rescue
     ArgumentError -> :none
   end
 
-  defp insert(shard_id, version, now) do
-    :ets.insert(@table, {shard_id, version, now + ttl_ms()})
+  defp insert(shard_id, version, bumped_at, now) do
+    :ets.insert(@table, {shard_id, version, bumped_at, now + ttl_ms()})
   rescue
     ArgumentError -> :ok
   end
 
-  # A late/duplicate notification must never LOWER the floor below what this node
-  # already knows (versions only rise; even an expired entry's version is a valid
-  # lower bound).
-  defp put_max(shard_id, version) do
-    current =
-      case :ets.lookup(@table, shard_id) do
-        [{^shard_id, v, _expires_at}] -> v
-        [] -> 0
-      end
+  # A late/duplicate notification must never LOWER the floor below what this node already knows
+  # (versions only rise). When the version rises, adopt the incoming bump instant; a stale
+  # same-version notification keeps whatever grace this node already had.
+  defp put_max(shard_id, version, bumped_at) do
+    now = System.monotonic_time(:millisecond)
 
-    insert(shard_id, max(version, current), System.monotonic_time(:millisecond))
+    case :ets.lookup(@table, shard_id) do
+      [{^shard_id, current, current_bumped, _expires}] when current >= version ->
+        insert(shard_id, current, current_bumped, now)
+
+      _ ->
+        insert(shard_id, version, bumped_at, now)
+    end
   rescue
     ArgumentError -> :ok
   end
+
+  defp decode_bumped_at(nil), do: nil
+
+  defp decode_bumped_at(iso) when is_binary(iso) do
+    case DateTime.from_iso8601(iso) do
+      {:ok, dt, _offset} -> dt
+      _ -> nil
+    end
+  end
+
+  defp decode_bumped_at(_), do: nil
 
   defp listen_for_revocations do
     :ok = Oban.Notifier.listen(Oban, [:fathom_revocations])
