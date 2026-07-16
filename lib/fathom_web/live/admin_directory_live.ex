@@ -27,6 +27,7 @@ defmodule FathomWeb.AdminDirectoryLive do
      |> assign(:page_title, "Directory")
      |> assign(:node_key, Fathom.Rebalancer.node_key())
      |> assign(:statuses, Shard.statuses())
+     |> assign(:editable_statuses, Shard.admin_editable_statuses())
      |> assign(:filter, %{"status" => "", "q" => ""})
      |> assign(:offset, 0)
      |> assign(:editing, nil)
@@ -57,6 +58,23 @@ defmodule FathomWeb.AdminDirectoryLive do
 
   def handle_event("cancel_edit", _params, socket) do
     {:noreply, assign(socket, editing: nil, edit_error: nil)}
+  end
+
+  # Tenant deletion (#15): tombstone + broadcast + enqueue the erase. Same admin-BasicAuth /
+  # live_session gate as every other event here; the `data-confirm` dialog is the destructive
+  # guard. Physical erase runs in the background DeleteJob, so we report "scheduled".
+  def handle_event("delete_tenant", %{"id" => shard_id}, socket) do
+    case Fathom.Tenants.delete(shard_id) do
+      {:ok, :scheduled} ->
+        {:noreply,
+         socket
+         |> assign(editing: nil, edit_error: nil)
+         |> put_flash(:info, "Deleting #{shard_id} — data erase scheduled")
+         |> load()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Could not delete #{shard_id}: #{inspect(reason)}")}
+    end
   end
 
   def handle_event("save", %{"edit" => %{"status" => status, "retain_until" => retain}}, socket) do
@@ -194,16 +212,37 @@ defmodule FathomWeb.AdminDirectoryLive do
                     <td class="num py-1.5 pr-4 text-right text-base-content/60">
                       {row.token_version}
                     </td>
-                    <td class="py-1.5 text-right">
-                      <button
-                        id={"dir-edit-#{row.shard_id}"}
-                        type="button"
-                        phx-click="edit"
-                        phx-value-id={row.shard_id}
-                        class="btn btn-ghost btn-xs"
-                      >
-                        Edit
-                      </button>
+                    <td class="py-1.5 text-right whitespace-nowrap">
+                      <%= if row.status == "deleted" do %>
+                        <span class="text-xs text-base-content/40">deleted</span>
+                      <% else %>
+                        <.link
+                          id={"dir-export-#{row.shard_id}"}
+                          href={~p"/admin/tenants/#{row.shard_id}/export"}
+                          class="btn btn-ghost btn-xs"
+                        >
+                          Export
+                        </.link>
+                        <button
+                          id={"dir-edit-#{row.shard_id}"}
+                          type="button"
+                          phx-click="edit"
+                          phx-value-id={row.shard_id}
+                          class="btn btn-ghost btn-xs"
+                        >
+                          Edit
+                        </button>
+                        <button
+                          id={"dir-delete-#{row.shard_id}"}
+                          type="button"
+                          phx-click="delete_tenant"
+                          phx-value-id={row.shard_id}
+                          data-confirm={"Permanently delete #{row.shard_id}? This ERASES all its data (every stored copy, snapshot, and version) and cannot be undone."}
+                          class="btn btn-ghost btn-xs text-error"
+                        >
+                          Delete
+                        </button>
+                      <% end %>
                     </td>
                   </tr>
                   <tr :if={@editing == row.shard_id} id="directory-edit-row" class="bg-base-content/5">
@@ -222,7 +261,7 @@ defmodule FathomWeb.AdminDirectoryLive do
                             class="rounded-lg border border-base-300 bg-base-100 px-2 py-1 text-sm"
                           >
                             <option
-                              :for={s <- @statuses}
+                              :for={s <- @editable_statuses}
                               value={s}
                               selected={row.status == s}
                             >

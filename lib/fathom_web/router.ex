@@ -31,6 +31,9 @@ defmodule FathomWeb.Router do
   scope "/admin", FathomWeb do
     pipe_through [:browser, :admin_auth]
 
+    # Tenant data export (#15): a file download, so a plain controller (not a LiveView).
+    get "/tenants/:id/export", AdminTenantController, :export
+
     live_session :admin do
       live "/", AdminOverviewLive, :index
       live "/shards", AdminShardsLive, :index

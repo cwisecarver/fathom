@@ -49,6 +49,9 @@ defmodule Fathom.Directory.Shard do
   @doc "Valid lifecycle statuses for a directory entry."
   def statuses, do: @statuses
 
+  @doc "Statuses an operator may hand-set from the admin edit UI (excludes `deleted`, #15)."
+  def admin_editable_statuses, do: @admin_editable_statuses
+
   @doc """
   Restricted changeset for operator hand-edits from the admin directory UI
   (expert review 2026-07-14 #22): only the fields **safe to flip by hand** —

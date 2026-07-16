@@ -68,6 +68,34 @@ defmodule FathomWeb.AdminDirectoryLiveTest do
     assert row.status == "retired"
   end
 
+  test "shows export + delete actions for a live tenant and hides them for a deleted one",
+       %{conn: conn} do
+    put_shard(%{shard_id: "ui_live", status: "active"})
+    put_shard(%{shard_id: "ui_gone", status: "deleted"})
+
+    {:ok, view, _html} = conn |> auth() |> live("/admin/directory")
+
+    assert has_element?(view, "#dir-export-ui_live")
+    assert has_element?(view, "#dir-delete-ui_live")
+    # A deleted tenant is already erased — no edit/export/delete actions, just a marker.
+    refute has_element?(view, "#dir-delete-ui_gone")
+    refute has_element?(view, "#dir-edit-ui_gone")
+    refute has_element?(view, "#dir-export-ui_gone")
+  end
+
+  test "clicking delete tombstones the tenant and schedules the erase", %{conn: conn} do
+    put_shard(%{shard_id: "ui_del", status: "active"})
+    on_exit(fn -> :ets.delete(Fathom.Tenants.Tombstones, "ui_del") end)
+
+    {:ok, view, _html} = conn |> auth() |> live("/admin/directory")
+    view |> element("#dir-delete-ui_del") |> render_click()
+
+    # Durable tombstone + the in-memory re-mint gate are both set (the physical erase is a
+    # background job).
+    assert {:ok, %{status: "deleted"}} = Directory.get("ui_del")
+    assert Fathom.Tenants.tombstoned?("ui_del")
+  end
+
   test "an invalid retain_until surfaces an error and does not persist", %{conn: conn} do
     put_shard(%{shard_id: "ui_badtime", status: "active"})
 

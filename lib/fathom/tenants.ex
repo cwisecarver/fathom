@@ -92,6 +92,41 @@ defmodule Fathom.Tenants do
   end
 
   @doc """
+  Exports a tenant's data for GDPR portability / offboarding: pulls the shard's current durable
+  stored object to a temp file and returns its path + a suggested download filename. Because a
+  tenant *is* one SQLite file, this is just a copy of that object — no export format to build.
+
+  Reflects the **last flush**: an active shard may have newer writes still buffered on its
+  coordinator (drain or let it idle for the very latest, same caveat as a snapshot). The CALLER
+  owns the returned temp file and must delete it after use (the admin download does, so an
+  exported copy never lingers on disk). Returns `{:error, :not_stored}` if the shard has no
+  stored object (never flushed, or already deleted), or `{:error, :invalid_shard_id}`.
+  """
+  @spec export(String.t()) :: {:ok, %{path: Path.t(), filename: String.t()}} | {:error, term()}
+  def export(shard_id) do
+    with {:ok, id} <- cast(shard_id) do
+      tmp =
+        Path.join(
+          System.tmp_dir!(),
+          "fathom_export_#{id}_#{System.unique_integer([:positive])}.db"
+        )
+
+      case Storage.pull(id, tmp) do
+        {:ok, nil} ->
+          File.rm(tmp)
+          {:error, :not_stored}
+
+        {:ok, _etag} ->
+          {:ok, %{path: tmp, filename: "#{id}.db"}}
+
+        {:error, reason} ->
+          File.rm(tmp)
+          {:error, reason}
+      end
+    end
+  end
+
+  @doc """
   True if `shard_id` has been deleted (tombstoned). Checked O(1) on the admission path so a
   request for an erased subdomain is refused instead of re-minting an empty shard.
   """

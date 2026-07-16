@@ -98,6 +98,34 @@ defmodule Fathom.TenantsTest do
     end
   end
 
+  describe "export/1" do
+    test "exports the tenant's durable data as an openable SQLite file", %{id: id} do
+      write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('portable')"])
+      flush!(id)
+
+      assert {:ok, %{path: path, filename: filename}} = Tenants.export(id)
+      on_exit(fn -> File.rm(path) end)
+
+      assert filename == "#{id}.db"
+      assert File.exists?(path)
+
+      # It's a real SQLite database carrying exactly this tenant's rows.
+      {:ok, db} = Exqlite.Sqlite3.open(path)
+      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT v FROM t")
+      assert {:row, ["portable"]} = Exqlite.Sqlite3.step(db, stmt)
+      :ok = Exqlite.Sqlite3.release(db, stmt)
+      :ok = Exqlite.Sqlite3.close(db)
+    end
+
+    test "not_stored for a shard that was never flushed", %{id: id} do
+      assert {:error, :not_stored} = Tenants.export(id)
+    end
+
+    test "refuses an invalid id" do
+      assert {:error, :invalid_shard_id} = Tenants.export("Not Valid!")
+    end
+  end
+
   test "the DeleteJob worker runs purge end to end", %{id: id} do
     write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
     flush!(id)
