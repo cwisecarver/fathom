@@ -42,7 +42,10 @@ defmodule Fathom.ShardExecutor do
       {:ok, pid, ref, path} ->
         case Connection.open(path) do
           {:ok, conn} ->
-            {:ok, {pid, ref, conn, shard_id}}
+            # The token's scope (rw/ro, #24) was stashed by HranaAuth.authorize/2 during this same
+            # stream open (same process); it rides the handle so execute/2 can enforce read-only
+            # across baton-resumes. Defaults to :rw when auth is disabled (no token) or absent.
+            {:ok, {pid, ref, conn, shard_id, Fathom.HranaAuth.take_scope()}}
 
           {:error, reason} ->
             Shard.checkin(pid, ref)
@@ -55,7 +58,7 @@ defmodule Fathom.ShardExecutor do
   end
 
   @impl true
-  def execute({_pid, _ref, _conn, shard_id} = handle, %Stmt{} = stmt) do
+  def execute({_pid, _ref, _conn, shard_id, _scope} = handle, %Stmt{} = stmt) do
     do_execute(handle, stmt)
   rescue
     # A statement must never crash the Hrana stream: exqlite/bind/result-mapping can raise
@@ -70,30 +73,42 @@ defmodule Fathom.ShardExecutor do
       {:error, %Error{message: "shard connection unavailable", code: "SQLITE_ERROR"}}
   end
 
-  defp do_execute({_pid, _ref, _conn, shard_id} = handle, %Stmt{sql: sql} = stmt) do
-    # Block client-issued DDL on a tenant shard when strict mode is on (expert review 2026-07-14
-    # #7): a direct `manage.py migrate` against a tenant advances its schema + `django_migrations`
-    # while fathom's three-place version stamp stays at 0, so the shard then reads as a laggard, the
-    # engine replays the captured chain onto the already-migrated file, hits "already exists", and
-    # quarantines the tenant. Refuse loudly at the client instead — schema evolution goes through the
-    # template + migration engine, never a direct tenant migrate. The template (the capture source)
-    # is exempt, and the engine's own replay uses `Connection` directly (not this Hrana path), so
-    # neither is affected. Off by default (`:block_tenant_ddl`); enable in prod to enforce the model.
-    if block_tenant_ddl?() and not template?(shard_id) and ddl?(sql) do
-      {:error,
-       %Error{
-         message:
-           "schema changes must go through the migration engine on the template shard, not a " <>
-             "direct migrate on tenant \"#{shard_id}\"",
-         code: "FILO_DDL_BLOCKED",
-         status: 400
-       }}
-    else
-      run_statement(handle, stmt)
+  defp do_execute({_pid, _ref, _conn, shard_id, scope} = handle, %Stmt{sql: sql} = stmt) do
+    cond do
+      # A read-only token (#24) may only read: refuse any write (DML or DDL) with a distinct 403 so
+      # export/analytics/BI credentials can't mutate a tenant. Checked before DDL-block/run so a `ro`
+      # token is refused even where a full token would be allowed.
+      scope == :ro and write?(sql) ->
+        {:error,
+         %Error{message: "read-only token cannot write", code: "FILO_READONLY", status: 403}}
+
+      # Block client-issued DDL on a tenant shard when strict mode is on (expert review 2026-07-14
+      # #7): a direct `manage.py migrate` against a tenant advances its schema + `django_migrations`
+      # while fathom's three-place version stamp stays at 0, so the shard then reads as a laggard, the
+      # engine replays the captured chain onto the already-migrated file, hits "already exists", and
+      # quarantines the tenant. Refuse loudly at the client instead — schema evolution goes through the
+      # template + migration engine, never a direct tenant migrate. The template (the capture source)
+      # is exempt, and the engine's own replay uses `Connection` directly (not this Hrana path), so
+      # neither is affected. Off by default (`:block_tenant_ddl`); enable in prod to enforce the model.
+      block_tenant_ddl?() and not template?(shard_id) and ddl?(sql) ->
+        {:error,
+         %Error{
+           message:
+             "schema changes must go through the migration engine on the template shard, not a " <>
+               "direct migrate on tenant \"#{shard_id}\"",
+           code: "FILO_DDL_BLOCKED",
+           status: 400
+         }}
+
+      true ->
+        run_statement(handle, stmt)
     end
   end
 
-  defp run_statement({_pid, _ref, conn, shard_id}, %Stmt{sql: sql, args: args}) do
+  # A write for read-only-scope purposes: data mutation (DML) or schema change (DDL).
+  defp write?(sql), do: dml?(sql) or ddl?(sql)
+
+  defp run_statement({_pid, _ref, conn, shard_id, _scope}, %Stmt{sql: sql, args: args}) do
     started = System.monotonic_time()
 
     case Connection.query(conn, sql, args) do
@@ -216,7 +231,7 @@ defmodule Fathom.ShardExecutor do
   # steps mid-transaction — leaving an open transaction dangling on the connection, holding the WAL
   # write lock until stream teardown. exqlite exposes `transaction_status`, so answer truthfully.
   @impl true
-  def autocommit?({_pid, _ref, conn, _shard_id}), do: Connection.autocommit?(conn)
+  def autocommit?({_pid, _ref, conn, _shard_id, _scope}), do: Connection.autocommit?(conn)
 
   # The coordinator is the connection's owner (Filo's owner seam): the stream holding this
   # handle monitors it and tears down — closing the exqlite connection — if it dies. Without
@@ -226,10 +241,10 @@ defmodule Fathom.ShardExecutor do
   # frames and unlinks the db/wal/shm under it — the orphan's writes land in unlinked inodes
   # and vanish (finding #8, the residual orphan-writer race).
   @impl true
-  def owner({pid, _ref, _conn, _shard_id}), do: pid
+  def owner({pid, _ref, _conn, _shard_id, _scope}), do: pid
 
   @impl true
-  def close({pid, ref, conn, shard_id}) do
+  def close({pid, ref, conn, shard_id, _scope}) do
     Connection.close(conn)
     Shard.checkin(pid, ref)
     if template?(shard_id), do: Capture.forget(conn)

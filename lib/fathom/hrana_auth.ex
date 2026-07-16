@@ -83,10 +83,13 @@ defmodule Fathom.HranaAuth do
   defp verify(_shard_id, nil), do: {:error, @missing}
 
   defp verify(shard_id, token) when is_binary(token) do
-    with {:ok, %{"s" => granted, "v" => version}} <-
+    with {:ok, %{"s" => granted, "v" => version} = payload} <-
            Phoenix.Token.verify(secret!(), @salt, token, max_age: max_age()),
          {:ok, ^granted} <- ShardId.cast(shard_id),
          true <- version_ok?(version, Revocations.floor_info(granted)) do
+      # Stash the token's scope for the stream open that follows in THIS process (#24); the executor
+      # reads it into the handle so it can enforce read-only per statement. Missing claim ⇒ rw.
+      stash_scope(decode_scope(Map.get(payload, "sc")))
       :ok
     else
       # Bad signature/expiry, a token for a different shard, a revoked (stale-version)
@@ -118,6 +121,29 @@ defmodule Fathom.HranaAuth do
   defp rotation_grace_ms,
     do: Application.get_env(:fathom, :hrana_rotation_grace_ms, @default_rotation_grace_ms)
 
+  # Explicit map — never String.to_atom on the claim (it's from a signed token, but atom-exhaustion
+  # hygiene is unconditional). Any unknown/missing value is the safe default: full access is only
+  # granted by the absence of a claim / an explicit rw, and `ro` is the only restriction.
+  defp decode_scope("ro"), do: :ro
+  defp decode_scope(_), do: :rw
+
+  @scope_key {__MODULE__, :stream_scope}
+
+  @doc false
+  @spec stash_scope(:rw | :ro) :: :ok
+  def stash_scope(scope) do
+    Process.put(@scope_key, scope)
+    :ok
+  end
+
+  @doc """
+  Read + clear the scope `authorize/2` stashed for the stream open running in THIS process (#24),
+  defaulting to `:rw` (auth disabled ⇒ no token ⇒ full access; the trust boundary is the network).
+  Called by `Fathom.ShardExecutor.open/1`.
+  """
+  @spec take_scope() :: :rw | :ro
+  def take_scope, do: Process.delete(@scope_key) || :rw
+
   @doc """
   Mints a bearer token granting access to `shard_id` (canonicalized).
 
@@ -125,6 +151,9 @@ defmodule Fathom.HranaAuth do
   """
   @spec token_for(term(), keyword()) :: {:ok, String.t()} | {:error, :invalid_shard_id}
   def token_for(shard_id, opts \\ []) do
+    # `:scope` (`:rw` default | `:ro`, #24) is consumed here; the rest pass to Phoenix.Token.sign.
+    {scope, sign_opts} = Keyword.pop(opts, :scope, :rw)
+
     case ShardId.cast(shard_id) do
       {:ok, canonical} ->
         # Embed the shard's current revocation version (expert review #31); a later
@@ -133,13 +162,18 @@ defmodule Fathom.HranaAuth do
         # only, no Repo) defaults to version 1 — the floor is also read fail-open, so
         # a v1 token works until a revoke actually bumps the floor above 1.
         version = current_token_version(canonical)
-        payload = %{"s" => canonical, "v" => version}
-        {:ok, Phoenix.Token.sign(secret!(), @salt, payload, opts)}
+        payload = put_scope(%{"s" => canonical, "v" => version}, scope)
+        {:ok, Phoenix.Token.sign(secret!(), @salt, payload, sign_opts)}
 
       :error ->
         {:error, :invalid_shard_id}
     end
   end
+
+  # A `ro` token carries an `"sc"` claim; a full (`rw`) token carries none — absence reads as `rw`,
+  # so every already-outstanding token stays full-access (backward-compatible).
+  defp put_scope(payload, :ro), do: Map.put(payload, "sc", "ro")
+  defp put_scope(payload, _rw), do: payload
 
   @doc """
   Revokes every outstanding token for `shard_id` (expert review #31): bumps the
