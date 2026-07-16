@@ -224,6 +224,43 @@ defmodule Fathom.DirectoryTest do
     end
   end
 
+  describe "tombstone/1 (tenant deletion, #15)" do
+    test "flips an existing row to deleted" do
+      {:ok, _} = Directory.resolve("acme")
+
+      assert {:ok, %Shard{shard_id: "acme", status: "deleted"}} = Directory.tombstone("acme")
+      assert {:ok, %Shard{status: "deleted"}} = Directory.get("acme")
+    end
+
+    test "registers a deleted row for a shard the directory never recorded" do
+      assert {:ok, %Shard{shard_id: "ghost", status: "deleted"}} = Directory.tombstone("ghost")
+      assert {:ok, %Shard{status: "deleted"}} = Directory.get("ghost")
+    end
+
+    test "a tombstoned shard is NOT resurrected by a later resolve/record_batch" do
+      {:ok, _} = Directory.resolve("acme")
+      {:ok, _} = Directory.tombstone("acme")
+
+      # A stray access after deletion only bumps recency — status stays deleted (the
+      # on-conflict never resets status), so the directory can't un-delete a tenant.
+      {:ok, again} = Directory.resolve("acme")
+      assert again.status == "deleted"
+
+      Directory.record_batch([{"acme", DateTime.utc_now()}])
+      assert {:ok, %Shard{status: "deleted"}} = Directory.get("acme")
+    end
+
+    test "deleted_shard_ids/0 returns exactly the tombstoned ids" do
+      {:ok, _} = Directory.resolve("live1")
+      {:ok, _} = Directory.tombstone("dead1")
+      {:ok, _} = Directory.tombstone("dead2")
+
+      ids = Directory.deleted_shard_ids()
+      assert "dead1" in ids and "dead2" in ids
+      refute "live1" in ids
+    end
+  end
+
   # Push a shard's migrating_since into the past so reclaim_stale_migrating sees it as stuck,
   # without a sleep (the real clock is only ever advanced by the migration lifecycle).
   defp backdate_migrating(shard_id, seconds) do

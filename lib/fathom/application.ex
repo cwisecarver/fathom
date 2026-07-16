@@ -266,6 +266,10 @@ defmodule Fathom.Application do
       # Read-through cache of per-shard Hrana-token revocation versions, so token
       # verification stays off the Postgres hot path (expert review #31).
       Fathom.HranaAuth.Revocations,
+      # ETS set of deleted (tombstoned) shard ids — the admission re-mint guard for tenant
+      # deletion (expert review #15). Loaded from the directory at boot, pushed fleet-wide on
+      # delete over Oban's notifier, refreshed periodically. Off the Postgres hot path.
+      Fathom.Tenants.Tombstones,
       # Captures template-shard Django migrations into fleet versions.
       Fathom.Migrator.Capture,
       # Runs handoff warm/drain commands concurrently off the CommandPoller (finding #8), so

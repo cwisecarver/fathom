@@ -206,6 +206,41 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  Tombstones a shard — flips its directory row to `deleted` for full tenant erasure (#15).
+
+  The tombstone is the permanent re-mint guard: `Fathom.Tenants.tombstoned?/1` reads
+  `deleted` rows into the admission ETS gate so a stray request can never re-create the
+  deleted tenant as an empty shard. Registers a fresh `deleted` row if none exists (a novel
+  shard the directory never recorded), so the guard holds regardless. Never resurrected —
+  `resolve`/`record_batch` on-conflict only bump recency, never status.
+  """
+  @spec tombstone(String.t()) :: {:ok, Shard.t()} | {:error, Ecto.Changeset.t()}
+  def tombstone(shard_id) do
+    now = DateTime.utc_now()
+
+    %Shard{}
+    |> Shard.changeset(%{
+      shard_id: shard_id,
+      schema_version: 0,
+      status: "deleted",
+      last_active_at: now
+    })
+    |> Repo.insert(
+      # An existing row (any status) flips to `deleted`; a novel id inserts one. Only status +
+      # bookkeeping move — schema_version/cutover_at/etc. are irrelevant once erased.
+      on_conflict: [set: [status: "deleted", updated_at: now]],
+      conflict_target: :shard_id,
+      returning: true
+    )
+  end
+
+  @doc "All tombstoned (`deleted`) shard ids — loaded into the admission tombstone gate at boot/refresh (#15)."
+  @spec deleted_shard_ids() :: [String.t()]
+  def deleted_shard_ids do
+    Repo.all(from s in Shard, where: s.status == "deleted", select: s.shard_id)
+  end
+
+  @doc """
   The rollout sweep cursor: active shards behind `head_version`, most-recently-used
   first (hot shards migrate first), capped at `limit`.
   """

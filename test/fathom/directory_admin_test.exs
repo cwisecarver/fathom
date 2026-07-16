@@ -62,6 +62,21 @@ defmodule Fathom.DirectoryAdminTest do
       assert row.status == "active"
     end
 
+    # `deleted` is a real lifecycle status but NOT hand-editable (#15): a hand-flip to
+    # deleted would tombstone the row while leaving the tenant's data live and other nodes'
+    # re-mint gate unset. Deletion must go through the delete orchestration, so the admin
+    # edit refuses the value.
+    test "rejects a hand-flip to deleted (deletion is an orchestration, not a status edit)" do
+      put_shard(%{shard_id: "dir_del", status: "active"})
+
+      assert {:error, %Ecto.Changeset{} = cs} =
+               Directory.admin_update("dir_del", %{status: "deleted"})
+
+      assert %{status: ["is invalid"]} = errors_on(cs)
+      assert {:ok, row} = Directory.get("dir_del")
+      assert row.status == "active"
+    end
+
     test "can clear retain_until" do
       put_shard(%{
         shard_id: "dir_clear",

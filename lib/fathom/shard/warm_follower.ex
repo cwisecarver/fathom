@@ -122,6 +122,24 @@ defmodule Fathom.Shard.WarmFollower do
   end
 
   @doc """
+  Drops `shard_id`'s warm copy from this node's cache **now** — the db file plus its
+  `-wal`/`-shm` siblings and the `.etag` sidecar. The targeted eviction a tenant delete
+  broadcasts fleet-wide (#15) so an erased shard's lease-less cached copy doesn't linger
+  until the poll loop evicts it for leaving `active_recent`. Idempotent (a shard that
+  isn't cached is a no-op) and pure over `:warm_cache_dir`, so it works whether or not the
+  follower GenServer is running. An invalid id is ignored (best-effort, like `warm_now/1`).
+  """
+  @spec purge_now(String.t()) :: :ok
+  def purge_now(shard_id) do
+    if Fathom.ShardId.valid?(shard_id), do: evict(shard_id)
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  @doc """
   The stored etag of `shard_id`'s warm copy, or `nil` when it isn't cached (the db
   file is absent) or no etag was recorded. This is the freshness token the coordinator
   presents to `Storage.pull_if_changed/3` before promoting the cache — a `nil` here

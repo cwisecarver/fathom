@@ -253,6 +253,14 @@ defmodule Fathom.Shards do
   # measured fd/RSS density budget (`mix fathom.scale --ramp`).
   defp start_if_capacity(shard_id) do
     cond do
+      # A deleted tenant must never silently resurrect (#15): once tombstoned, a stray
+      # request for the subdomain is refused rather than re-minting an empty shard. Checked
+      # FIRST and against an ETS set (O(1), no Postgres), so it never touches the cold-open
+      # path's latency and holds even during a directory outage (loaded at boot + pushed on
+      # delete). Only ids an operator explicitly deleted are in the set.
+      Fathom.Tenants.tombstoned?(shard_id) ->
+        {:error, :shard_tombstoned}
+
       # At the cap, first try to make room by evicting the least-recently-used IDLE
       # shard (soft cap). Only if nothing idle can be evicted do we refuse — a node
       # saturated with *active* connections genuinely has no room, and 503 tells the
