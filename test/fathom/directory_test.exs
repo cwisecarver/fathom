@@ -261,6 +261,55 @@ defmodule Fathom.DirectoryTest do
     end
   end
 
+  describe "flush accounting (#28)" do
+    test "record_flush_batch sets last_flushed_at and leaves last_active_at alone" do
+      {:ok, row} = Directory.resolve("fa")
+      assert row.last_flushed_at == nil
+
+      flushed = DateTime.utc_now()
+      assert 1 = Directory.record_flush_batch([{"fa", flushed}])
+
+      {:ok, updated} = Directory.get("fa")
+      assert updated.last_flushed_at
+      assert DateTime.compare(updated.last_active_at, row.last_active_at) == :eq
+    end
+
+    test "record_flush_batch advances but never rewinds the watermark (GREATEST)" do
+      {:ok, _} = Directory.resolve("fa2")
+      t2 = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      t1 = DateTime.add(t2, -60, :second)
+
+      Directory.record_flush_batch([{"fa2", t2}])
+      Directory.record_flush_batch([{"fa2", t1}])
+
+      {:ok, row} = Directory.get("fa2")
+      assert DateTime.compare(row.last_flushed_at, t2) == :eq
+    end
+
+    test "flush_lag_report lists shards active since their last flush, excluding clean/deleted" do
+      now = DateTime.utc_now()
+
+      {:ok, _} = Directory.resolve("fl_dirty")
+      Directory.record_flush_batch([{"fl_dirty", DateTime.add(now, -60, :second)}])
+
+      {:ok, _} = Directory.resolve("fl_clean")
+      Directory.record_flush_batch([{"fl_clean", DateTime.add(now, 60, :second)}])
+
+      {:ok, _} = Directory.resolve("fl_never")
+
+      {:ok, _} = Directory.resolve("fl_gone")
+      Directory.record_flush_batch([{"fl_gone", DateTime.add(now, -60, :second)}])
+      {:ok, _} = Directory.tombstone("fl_gone")
+
+      ids = Directory.flush_lag_report(100) |> Enum.map(& &1.shard_id)
+
+      assert "fl_dirty" in ids, "active since last flush ⇒ potentially lost"
+      assert "fl_never" in ids, "never flushed ⇒ potentially lost"
+      refute "fl_clean" in ids, "flushed after last activity ⇒ not lost"
+      refute "fl_gone" in ids, "deleted ⇒ excluded"
+    end
+  end
+
   # Push a shard's migrating_since into the past so reclaim_stale_migrating sees it as stuck,
   # without a sleep (the real clock is only ever advanced by the migration lifecycle).
   defp backdate_migrating(shard_id, seconds) do

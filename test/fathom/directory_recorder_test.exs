@@ -103,6 +103,19 @@ defmodule Fathom.Directory.RecorderTest do
     {:ok, _} = Supervisor.restart_child(Fathom.ControlPlane.Supervisor, Recorder)
   end
 
+  # #28: durable-flush times ride the same coalesce/batch buffer, off the coordinator's flush hot
+  # path, so they survive node death for the post-loss report.
+  test "record_flush buffers a durable-flush time and batch-writes last_flushed_at" do
+    a = uniq()
+    {:ok, %{last_flushed_at: nil}} = Directory.resolve(a)
+
+    assert :ok = Recorder.record_flush(a)
+    assert Recorder.flush() >= 1
+
+    assert {:ok, %{last_flushed_at: flushed}} = Directory.get(a)
+    assert flushed, "the buffered flush time must reach last_flushed_at"
+  end
+
   @tag :bench
   test "record/1 stays off the Postgres hot path (sub-50µs ETS write)" do
     id = uniq()

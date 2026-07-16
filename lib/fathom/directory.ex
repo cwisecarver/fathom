@@ -117,6 +117,87 @@ defmodule Fathom.Directory do
     end)
   end
 
+  @doc """
+  Batch-records durable-flush times — the flush counterpart of `record_batch/1` (expert review #28),
+  fed off the hot path by `Fathom.Directory.Recorder`. `entries` is `{shard_id, flushed_at}`. Only
+  `last_flushed_at` moves (GREATEST, so an out-of-order flush can't rewind it); `last_active_at` is
+  left to the access recorder. Returns rows written. Raises on a Postgres error (the recorder treats
+  flushing as best-effort).
+  """
+  @spec record_flush_batch([{String.t(), DateTime.t()}]) :: non_neg_integer()
+  def record_flush_batch([]), do: 0
+
+  def record_flush_batch(entries) do
+    now = DateTime.utc_now()
+
+    entries
+    |> Enum.chunk_every(@batch_chunk)
+    |> Enum.reduce(0, fn chunk, acc ->
+      rows =
+        Enum.map(chunk, fn {shard_id, flushed_at} ->
+          %{
+            shard_id: shard_id,
+            schema_version: 0,
+            status: "active",
+            last_active_at: flushed_at,
+            last_flushed_at: flushed_at,
+            inserted_at: now,
+            updated_at: now
+          }
+        end)
+
+      {count, _} =
+        Repo.insert_all(Shard, rows,
+          on_conflict:
+            from(s in Shard,
+              update: [
+                set: [
+                  # GREATEST ignores NULL, so a first flush sets it and a later one advances it;
+                  # an out-of-order flush from a cross-remap can't rewind the watermark.
+                  last_flushed_at:
+                    fragment("GREATEST(EXCLUDED.last_flushed_at, ?)", s.last_flushed_at),
+                  updated_at: fragment("EXCLUDED.updated_at")
+                ]
+              ]
+            ),
+          conflict_target: :shard_id
+        )
+
+      acc + count
+    end)
+  end
+
+  @doc """
+  The post-node-loss loss report (expert review #28): shards that were active since their last
+  durable flush — `last_flushed_at` is NULL (never recorded a flush) or `last_active_at >
+  last_flushed_at` — i.e. potentially holding writes that didn't reach storage. Most-recently-active
+  first, capped at `limit`. Each row is `%{shard_id, last_active_at, last_flushed_at}`; the caller
+  bounds the per-tenant loss window as `last_active_at - last_flushed_at` (or "never flushed").
+  Excludes `deleted` shards.
+  """
+  @spec flush_lag_report(pos_integer()) :: [
+          %{
+            shard_id: String.t(),
+            last_active_at: DateTime.t() | nil,
+            last_flushed_at: DateTime.t() | nil
+          }
+        ]
+  def flush_lag_report(limit \\ 100) do
+    from(s in Shard,
+      where:
+        s.status != "deleted" and not is_nil(s.last_active_at) and
+          (is_nil(s.last_flushed_at) or s.last_active_at > s.last_flushed_at),
+      order_by: [desc: s.last_active_at],
+      limit: ^limit,
+      select: %{
+        shard_id: s.shard_id,
+        last_active_at: s.last_active_at,
+        last_flushed_at: s.last_flushed_at
+      }
+    )
+    |> Repo.all()
+  end
+
   @doc "Reads a shard's directory entry without recording an access."
   @spec get(String.t()) :: {:ok, Shard.t()} | :error
   def get(shard_id) do

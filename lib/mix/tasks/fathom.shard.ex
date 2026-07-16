@@ -45,9 +45,15 @@ defmodule Mix.Tasks.Fathom.Shard do
       ["fork", src, dst] ->
         fork(src, dst)
 
+      ["loss-report"] ->
+        loss_report(100)
+
+      ["loss-report", n] ->
+        loss_report(parse_limit(n))
+
       _ ->
         Mix.raise(
-          "usage: mix fathom.shard pull <shard> [path] | inspect <shard> | fork <src> <dst>"
+          "usage: mix fathom.shard pull <shard> [path] | inspect <shard> | fork <src> <dst> | loss-report [limit]"
         )
     end
   end
@@ -131,6 +137,39 @@ defmodule Mix.Tasks.Fathom.Shard do
 
       {:error, reason} ->
         Mix.raise("fork failed: #{inspect(reason)}")
+    end
+  end
+
+  # Post-node-loss tenant loss report (#28): the shards active since their last durable flush, with
+  # the per-tenant loss window. Needs Postgres — run it on an admin/recovery box, or from a live
+  # node's console: `Fathom.Directory.flush_lag_report()`.
+  defp loss_report(limit) do
+    start_app!()
+
+    case Fathom.Directory.flush_lag_report(limit) do
+      [] ->
+        Mix.shell().info("no shards active since their last durable flush — nothing to report")
+
+      rows ->
+        Mix.shell().info("shard\tlast_active_at\tlast_flushed_at\tloss_window")
+
+        for %{shard_id: id, last_active_at: active, last_flushed_at: flushed} <- rows do
+          Mix.shell().info(
+            "#{id}\t#{active}\t#{flushed || "(never)"}\t#{window(active, flushed)}"
+          )
+        end
+    end
+  end
+
+  defp window(_active, nil), do: "never flushed"
+
+  defp window(%DateTime{} = active, %DateTime{} = flushed),
+    do: "#{DateTime.diff(active, flushed, :second)}s"
+
+  defp parse_limit(n) do
+    case Integer.parse(n) do
+      {v, _} when v > 0 -> v
+      _ -> 100
     end
   end
 

@@ -837,6 +837,8 @@ defmodule Fathom.Shard do
 
         # Advance the published watermark (clears dirty up to flush_pending for the RPO reader).
         FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
+        # Persist the durable-flush time so it survives node death (#28) — off the hot path.
+        Fathom.Directory.Recorder.record_flush(state.id)
         {:noreply, schedule_flush(state)}
 
       # The data PUT's If-Match failed (412) but the task's lock re-check found the lock
@@ -856,6 +858,8 @@ defmodule Fathom.Shard do
         }
 
         FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
+        # Our bytes are durably the live object (#28) — record the flush time.
+        Fathom.Directory.Recorder.record_flush(state.id)
         {:noreply, schedule_flush(state)}
 
       # 412 + lock ours, but the object's etag came back nil/unreadable: keep serving with
@@ -1205,6 +1209,9 @@ defmodule Fathom.Shard do
               # window so recovery is an ordinary clean warm restart, matching the
               # periodic-flush, settle, and reconcile sites that already stamp on success.
               write_etag_sidecar(state.path, new_etag)
+              # Record the durable-flush time before we drop + release (#28): the shard's writes
+              # reached storage, so it's NOT dirty-at-loss even though its coordinator is gone.
+              Fathom.Directory.Recorder.record_flush(state.id)
               drop_local(state.path)
               Storage.release_lease(state.id, state.lease)
 

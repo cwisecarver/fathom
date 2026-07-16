@@ -29,6 +29,11 @@ defmodule Fathom.Directory.Shard do
     field :schema_version, :integer, default: 0
     field :status, :string, default: "active"
     field :last_active_at, :utc_datetime_usec
+
+    # When the shard last flushed durably to storage (expert review #28), recorded off the hot path
+    # by `Fathom.Directory.Recorder`. Survives node death (unlike the node-local FlushWatermark ETS),
+    # so a post-node-loss report is `last_active_at > last_flushed_at` ⇒ dirty, window = the gap.
+    field :last_flushed_at, :utc_datetime_usec
     field :retain_until, :utc_datetime_usec
     # When the shard entered `migrating` — the reconcile sweep times a migration out from
     # this (not updated_at, which traffic bumps). Set on mark_migrating, cleared on cutover /

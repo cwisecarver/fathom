@@ -25,6 +25,7 @@ defmodule Fathom.Directory.Recorder do
   alias Fathom.Directory
 
   @table __MODULE__
+  @flush_table Module.concat(__MODULE__, Flushes)
   @default_flush_ms 1_000
 
   @doc false
@@ -48,6 +49,20 @@ defmodule Fathom.Directory.Recorder do
   end
 
   @doc """
+  Buffers a shard's durable-flush time for the next batch (expert review #28) — the flush
+  counterpart of `record/1`, keeping the coordinator's flush hot path off Postgres. Lock-free ETS;
+  best-effort (a missed flush record just reads as a slightly-larger loss window later — the safe
+  direction). Called by `Fathom.Shard` after a successful upload.
+  """
+  @spec record_flush(String.t()) :: :ok
+  def record_flush(shard_id) do
+    :ets.insert(@flush_table, {shard_id, DateTime.utc_now()})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  @doc """
   Flushes the buffer to Postgres now and returns the number of rows written.
   Synchronous — used by tests (deterministic, no sleep) and the graceful-stop
   path. The periodic timer does the same work in the background.
@@ -67,6 +82,8 @@ defmodule Fathom.Directory.Recorder do
     # public + write_concurrency: many checkout processes insert concurrently;
     # the recorder is the only reader (during flush).
     :ets.new(@table, [:set, :public, :named_table, write_concurrency: true])
+    # Parallel buffer for durable-flush times (#28), same coalesce/batch shape.
+    :ets.new(@flush_table, [:set, :public, :named_table, write_concurrency: true])
 
     flush_ms =
       Keyword.get(
@@ -101,24 +118,33 @@ defmodule Fathom.Directory.Recorder do
   defp schedule(ms), do: Process.send_after(self(), :flush, ms)
 
   defp do_flush do
-    case drain() do
+    flush_table(@table, &Directory.record_batch/1, [:fathom, :directory, :flush]) +
+      flush_table(
+        @flush_table,
+        &Directory.record_flush_batch/1,
+        [:fathom, :directory, :flush_recorded]
+      )
+  end
+
+  defp flush_table(table, upsert, event) do
+    case drain(table) do
       [] ->
         0
 
       rows ->
         try do
-          n = Directory.record_batch(rows)
-          if n > 0, do: :telemetry.execute([:fathom, :directory, :flush], %{count: n}, %{})
+          n = upsert.(rows)
+          if n > 0, do: :telemetry.execute(event, %{count: n}, %{})
           n
         rescue
           e ->
             Logger.warning("Directory.Recorder flush failed: #{inspect(e)}")
-            restore(rows)
+            restore(table, rows)
             0
         catch
           :exit, reason ->
             Logger.warning("Directory.Recorder flush exited: #{inspect(reason)}")
-            restore(rows)
+            restore(table, rows)
             0
         end
     end
@@ -130,8 +156,8 @@ defmodule Fathom.Directory.Recorder do
   # Re-buffer them for the next cycle. `insert_new` (not `insert`) so a fresher touch
   # recorded DURING the failed flush wins — anything re-recorded post-drain is by
   # construction newer than the drained value.
-  defp restore(rows) do
-    Enum.each(rows, &:ets.insert_new(@table, &1))
+  defp restore(table, rows) do
+    Enum.each(rows, &:ets.insert_new(table, &1))
     :telemetry.execute([:fathom, :directory, :flush_retry], %{count: length(rows)}, %{})
   rescue
     # Table gone (teardown) — nothing to restore into.
@@ -141,9 +167,9 @@ defmodule Fathom.Directory.Recorder do
   # Atomically take each buffered key (`:ets.take` reads + deletes in one op), so a
   # touch arriving mid-flush is either captured with its freshest value or left in
   # the table for the next cycle — never silently lost.
-  defp drain do
-    @table
+  defp drain(table) do
+    table
     |> :ets.tab2list()
-    |> Enum.flat_map(fn {shard_id, _ts} -> :ets.take(@table, shard_id) end)
+    |> Enum.flat_map(fn {shard_id, _ts} -> :ets.take(table, shard_id) end)
   end
 end
