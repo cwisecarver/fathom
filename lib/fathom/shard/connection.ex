@@ -69,22 +69,80 @@ defmodule Fathom.Shard.Connection do
   """
   @spec query(reference(), String.t(), list()) :: {:ok, map()} | {:error, term()}
   def query(conn, sql, args) do
-    with {:ok, stmt} <- Sqlite3.prepare(conn, sql),
-         :ok <- Sqlite3.bind(stmt, args),
-         {:ok, columns} <- Sqlite3.columns(conn, stmt),
-         {:ok, rows} <- collect(conn, stmt) do
-      Sqlite3.release(conn, stmt)
+    # Statement deadline (expert review 2026-07-14 #26): when `:query_timeout_ms` is set, a runaway
+    # query (missing-index full scan) is interrupted so it can't pin memory and keep the shard busy
+    # (blocking eviction/drain/handoff). Only armed when configured — unset ⇒ no watchdog, no
+    # overhead (the default, matching fathom's other protective knobs).
+    case timeout_ms() do
+      nil ->
+        do_query(conn, sql, args)
 
-      {:ok,
-       %{
-         columns: columns,
-         rows: rows,
-         num_changes: changes(conn),
-         last_insert_rowid: last_rowid(conn)
-       }}
+      ms when is_integer(ms) and ms > 0 ->
+        with_deadline(conn, ms, fn -> do_query(conn, sql, args) end)
+
+      _ ->
+        do_query(conn, sql, args)
     end
   rescue
     e in ArgumentError -> {:error, Exception.message(e)}
+  end
+
+  defp do_query(conn, sql, args) do
+    with {:ok, stmt} <- Sqlite3.prepare(conn, sql) do
+      # Always release the prepared statement — including on a bind/collect error or a row-cap
+      # abort — so a failed query never leaks a statement handle on the connection.
+      try do
+        with :ok <- Sqlite3.bind(stmt, args),
+             {:ok, columns} <- Sqlite3.columns(conn, stmt),
+             {:ok, rows} <- collect(conn, stmt) do
+          {:ok,
+           %{
+             columns: columns,
+             rows: rows,
+             num_changes: changes(conn),
+             last_insert_rowid: last_rowid(conn)
+           }}
+        end
+      after
+        Sqlite3.release(conn, stmt)
+      end
+    end
+  end
+
+  # Run `fun` (the query) in THIS process while a cheap watchdog process interrupts `conn` if the
+  # deadline passes — the running `multi_step` is a blocking dirty NIF, so only another process can
+  # interrupt it. A completed query cancels the watchdog; a spurious late interrupt on an
+  # already-finished statement is a no-op, so a successful result is returned even then (we only
+  # surface `:query_timeout` when the interrupt actually errored the query).
+  defp with_deadline(conn, ms, fun) do
+    parent = self()
+    ref = make_ref()
+
+    watchdog =
+      spawn(fn ->
+        receive do
+          {:done, ^ref} -> :ok
+        after
+          ms ->
+            Sqlite3.interrupt(conn)
+            send(parent, {:timed_out, ref})
+        end
+      end)
+
+    result = fun.()
+    send(watchdog, {:done, ref})
+
+    timed_out? =
+      receive do
+        {:timed_out, ^ref} -> true
+      after
+        0 -> false
+      end
+
+    case {timed_out?, result} do
+      {true, {:error, _}} -> {:error, :query_timeout}
+      _ -> result
+    end
   end
 
   @doc """
@@ -123,14 +181,37 @@ defmodule Fathom.Shard.Connection do
   # arrival order (O(1) prepend), then reverse + one-level concat once at the end (O(R), ~tens
   # of ms at 200k). `Enum.concat/1` joins the list of row-batches without recursing into a row
   # (a row is itself a list of column values), so row shape + order are preserved.
-  defp collect(conn, stmt, batches \\ []) do
+  defp collect(conn, stmt, count \\ 0, batches \\ []) do
     case Sqlite3.multi_step(conn, stmt) do
-      {:rows, rows} -> collect(conn, stmt, [rows | batches])
-      {:done, rows} -> {:ok, [rows | batches] |> Enum.reverse() |> Enum.concat()}
-      :busy -> {:error, :busy}
-      {:error, reason} -> {:error, reason}
+      {:rows, rows} ->
+        # Max-result-rows cap (expert review 2026-07-14 #26): bound how much a single query can
+        # materialize in BEAM memory (a `SELECT *` on a large table), erroring instead of OOMing
+        # the node. Only counts when `:query_max_rows` is set — no cap ⇒ no per-batch length walk.
+        case max_rows() do
+          cap when is_integer(cap) and cap > 0 ->
+            count = count + length(rows)
+
+            if count > cap,
+              do: {:error, {:too_many_rows, cap}},
+              else: collect(conn, stmt, count, [rows | batches])
+
+          _ ->
+            collect(conn, stmt, count, [rows | batches])
+        end
+
+      {:done, rows} ->
+        {:ok, [rows | batches] |> Enum.reverse() |> Enum.concat()}
+
+      :busy ->
+        {:error, :busy}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
+
+  defp timeout_ms, do: Application.get_env(:fathom, :query_timeout_ms)
+  defp max_rows, do: Application.get_env(:fathom, :query_max_rows)
 
   defp changes(conn) do
     case Sqlite3.changes(conn) do

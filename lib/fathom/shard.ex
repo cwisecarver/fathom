@@ -736,11 +736,21 @@ defmodule Fathom.Shard do
   end
 
   def handle_call({:checkout, op}, {caller, _tag}, state) do
-    ref = Process.monitor(caller)
-    # The value carries the caller AND the call's op tag, so an abandon names
-    # exactly one grant (round-2 #33) instead of every grant this pid holds.
-    state = %{cancel_idle(state) | conns: Map.put(state.conns, ref, {caller, op})}
-    {:reply, {:ok, ref, state.path}, state}
+    # Per-shard concurrent-stream cap (expert review 2026-07-14 #26): bound how many streams one
+    # tenant can hold open at once, so a single tenant can't monopolize a node's streams (and,
+    # combined with the timeout/row caps, can't wedge the shard un-drainable). Off by default
+    # (`:max_checkouts_per_shard` unset ⇒ unlimited); the caller maps the refusal to a 503.
+    case max_checkouts() do
+      cap when is_integer(cap) and cap > 0 and map_size(state.conns) >= cap ->
+        {:reply, {:error, :shard_at_stream_capacity}, state}
+
+      _ ->
+        ref = Process.monitor(caller)
+        # The value carries the caller AND the call's op tag, so an abandon names
+        # exactly one grant (round-2 #33) instead of every grant this pid holds.
+        state = %{cancel_idle(state) | conns: Map.put(state.conns, ref, {caller, op})}
+        {:reply, {:ok, ref, state.path}, state}
+    end
   end
 
   def handle_call(:dirty?, _from, state), do: {:reply, unflushed?(state), state}
@@ -1687,6 +1697,9 @@ defmodule Fathom.Shard do
 
   defp checkout_timeout,
     do: Application.get_env(:fathom, :shard_checkout_timeout_ms, @default_checkout_timeout)
+
+  # Per-shard concurrent-stream cap (#26); unset ⇒ unlimited.
+  defp max_checkouts, do: Application.get_env(:fathom, :max_checkouts_per_shard)
 
   # --- telemetry (see Fathom.Telemetry) ---
 

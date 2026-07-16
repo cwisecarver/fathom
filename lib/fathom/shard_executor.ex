@@ -156,6 +156,24 @@ defmodule Fathom.ShardExecutor do
 
         {:ok, stmt_result}
 
+      # Per-query resource bounds (expert review 2026-07-14 #26) — distinct, non-SQLITE codes so a
+      # client can tell "my query was too expensive" from an ordinary SQL error.
+      {:error, :query_timeout} ->
+        {:error,
+         %Error{
+           message: "query exceeded the statement timeout",
+           code: "FILO_QUERY_TIMEOUT",
+           status: 503
+         }}
+
+      {:error, {:too_many_rows, cap}} ->
+        {:error,
+         %Error{
+           message: "result exceeded the #{cap}-row cap",
+           code: "FILO_RESULT_TOO_LARGE",
+           status: 400
+         }}
+
       {:error, reason} ->
         {:error, %Error{message: reason_to_string(reason), code: sqlite_code(reason)}}
     end
@@ -316,6 +334,11 @@ defmodule Fathom.ShardExecutor do
   # fallthrough's status-less error surfaced as the transport-default 500).
   defp open_error(:draining),
     do: %Error{message: "shard draining", code: "FILO_DRAINING", status: 503}
+
+  # The shard already holds its max concurrent streams (#26): one tenant can't monopolize a node's
+  # streams. 503 (retry later) — a checked-in stream frees a slot, and the shard is otherwise healthy.
+  defp open_error(:shard_at_stream_capacity),
+    do: %Error{message: "shard at stream capacity", code: "FILO_SHARD_BUSY", status: 503}
 
   # A suspended tenant (#20): administratively disabled, not a transient fault — 403 so the
   # client sees a distinct "forbidden" (a retry won't help; the operator must resume it).
