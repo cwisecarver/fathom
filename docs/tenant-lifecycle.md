@@ -142,6 +142,34 @@ to *known-tenants-only* by turning on `:novel_shard_rate` (the enforcement point
 an unprovisioned subdomain is rate-limited/refused rather than minted. That's a config choice, not
 part of the API.
 
+## Suspend / resume
+
+The administrative-offline lever short of deletion (`#20`) — for a non-paying, abusive, or
+legal-hold tenant. It's the reversible sibling of delete's tombstone:
+
+```
+suspend(id):
+  Directory.suspend(id)             # status -> suspended (refuses a deleted tenant)
+  broadcast (ETS gate + notify)     # every node denies NEW streams now
+  Shards.drain(id)                  # graceful: in-flight txns finish, coordinator stops
+
+resume(id):
+  Directory.resume(id)              # status -> active
+  broadcast (ETS gate + notify)     # gate stops denying; next request cold-opens fresh
+```
+
+`Fathom.Tenants.Suspensions` is the deny gate — the same ETS + notifier + boot-load shape as
+`Tombstones`, but a suspension **comes and goes**: the notification carries an add/remove flag, and
+the periodic refresh **reconciles** the set against the directory (insert-then-prune) so a missed
+resume converges. It's checked O(1) in `Fathom.Shards.ensure/1`, alongside the tombstone check, on
+**every** checkout — so a suspended (or deleted) tenant is refused a new stream even if a coordinator
+is still running. A suspended open surfaces a distinct **403 `FILO_TENANT_SUSPENDED`** (a retry won't
+help — an operator must resume); a deleted open is **410 `FILO_TENANT_DELETED`**.
+
+Suspend denies new streams fleet-wide immediately and graceful-drains the home coordinator, so
+in-flight transactions finish but nothing new opens. It does not delete data — resume brings the
+tenant straight back.
+
 ## Operator runbook
 
 **Delete a tenant.** In the admin dashboard, **Directory** (`/admin/directory`), find the row and
@@ -164,10 +192,16 @@ from a release remote console.
 connection URL + token, or `Fathom.Tenants.provision("acme")` from a remote console. `GET
 /api/tenants` lists the fleet; `DELETE /api/tenants/:id` is the API form of a delete.
 
+**Suspend / resume a tenant.** In **Directory**, click **Suspend** on the row (confirm), or `POST
+/api/tenants/:id/suspend`. New connections get a 403 fleet-wide until you **Resume** it (`POST
+/api/tenants/:id/resume` or `Fathom.Tenants.resume/1`). Use it for non-payment, abuse, or a legal
+hold — the data is untouched, so resume brings the tenant straight back.
+
 ## Where it lives
 
-- `lib/fathom/tenants.ex` — `delete/1`, `purge/1`, `export/1`, `provision/1`, `tombstoned?/1`,
-  `broadcast_deleted/1`.
+- `lib/fathom/tenants.ex` — `delete/1`, `purge/1`, `export/1`, `provision/1`, `suspend/1`,
+  `resume/1`, `tombstoned?/1`, `suspended?/1`, `broadcast_deleted/1`, `broadcast_suspension/2`.
+- `lib/fathom/tenants/suspensions.ex` — the reversible `suspended` ETS deny gate (#20).
 - `lib/fathom_web/controllers/api/tenant_controller.ex` — the `/api/tenants` JSON control-plane.
 - `lib/fathom/tenants/tombstones.ex` — the ETS re-mint gate + notifier listener + warm-cache purge.
 - `lib/fathom/tenants/delete_job.ex` — the Oban worker (queue `:tenants`, unique per shard).
