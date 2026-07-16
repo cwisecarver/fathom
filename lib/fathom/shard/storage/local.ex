@@ -234,6 +234,42 @@ defmodule Fathom.Shard.Storage.Local do
   end
 
   @impl true
+  def purge_shard(shard_id) do
+    # Full tenant erasure (#15): sweep the store dir for every object belonging to
+    # this id and delete each. Idempotent — a missing dir or object is `:ok`.
+    case File.ls(dir()) do
+      {:ok, names} ->
+        names
+        |> Enum.filter(&shard_object?(&1, shard_id))
+        |> Enum.reduce_while(:ok, fn name, :ok ->
+          case File.rm(Path.join(dir(), name)) do
+            :ok -> {:cont, :ok}
+            {:error, :enoent} -> {:cont, :ok}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+        end)
+
+      {:error, :enoent} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # A stored file belongs to `shard_id` iff the character AFTER the id is `.` (the
+  # live `.db`, the `.lock`, an atomic-write `.db.tmp…` temp) or `@` (a `@<version>`
+  # / `@snap-<id>` copy). Matching the delimiter — not a bare prefix — is what keeps
+  # purging `acme` from ever deleting `acme2.db`.
+  defp shard_object?(name, shard_id) do
+    case String.split_at(name, String.length(shard_id)) do
+      {^shard_id, "." <> _} -> true
+      {^shard_id, "@" <> _} -> true
+      _ -> false
+    end
+  end
+
+  @impl true
   def stored_usage do
     dir()
     |> Path.join("*.db")

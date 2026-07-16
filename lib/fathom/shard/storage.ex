@@ -210,6 +210,18 @@ defmodule Fathom.Shard.Storage do
   @callback drop_snapshot(shard_id :: String.t(), snapshot_id :: String.t()) ::
               :ok | {:error, term()}
 
+  # Full tenant erasure (expert review 2026-07-14 #15): delete EVERY stored object
+  # belonging to `shard_id` — the live `.db`, the `.lock`, every retained
+  # `@<version>` copy, and every `@snap-<snapshot_id>` — in one sweep, since a
+  # per-object caller (`drop_live`/`drop_version`/`drop_snapshot`) would first have
+  # to enumerate versions/snapshots the deleting node may not know. Idempotent (a
+  # shard with no objects is `:ok`). Matching is EXACT on the id delimiter — the
+  # character after the id must be `.` (live/lock) or `@` (a version/snapshot copy)
+  # — so purging `acme` can never touch `acme2`. The per-node `heartbeats/<owner>`
+  # object is not a shard object and is never matched. Caller must have drained the
+  # shard and confirmed no live node holds the lease (`Fathom.Tenants.DeleteJob`).
+  @callback purge_shard(shard_id :: String.t()) :: :ok | {:error, term()}
+
   # Aggregate storage footprint for observability — `{object_count, total_bytes}` of the live
   # shard objects. Optional: a backend that can't cheaply enumerate simply omits it, and the
   # dispatcher returns `{:error, :unsupported}`. Potentially expensive (an S3 LIST), so callers
@@ -372,6 +384,14 @@ defmodule Fathom.Shard.Storage do
   @doc "Deletes a stored snapshot (idempotent)."
   @spec drop_snapshot(String.t(), String.t()) :: :ok | {:error, term()}
   def drop_snapshot(shard_id, snapshot_id), do: backend().drop_snapshot(shard_id, snapshot_id)
+
+  @doc """
+  Deletes every stored object for `shard_id` — the live `.db`, the `.lock`, all retained
+  `@<version>` copies, and all `@snap-<id>` snapshots — for full tenant erasure (finding #15).
+  Idempotent and collision-safe (never touches a sibling id like `acme2`). See the callback.
+  """
+  @spec purge_shard(String.t()) :: :ok | {:error, term()}
+  def purge_shard(shard_id), do: backend().purge_shard(shard_id)
 
   @doc """
   Aggregate storage footprint — `{object_count, total_bytes}` of the live shard objects — for the

@@ -187,4 +187,7 @@ defmodule Fathom.Test.FaultyStorage do
   def restore_snapshot(shard_id, snapshot_id), do: Local.restore_snapshot(shard_id, snapshot_id)
   @impl true
   def drop_snapshot(shard_id, snapshot_id), do: Local.drop_snapshot(shard_id, snapshot_id)
+
+  @impl true
+  def purge_shard(shard_id), do: Local.purge_shard(shard_id)
 end

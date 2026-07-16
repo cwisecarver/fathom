@@ -829,6 +829,69 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   @impl true
+  def purge_shard(shard_id), do: purge_shard_page(shard_id, nil)
+
+  # Full tenant erasure (#15): ListObjectsV2 over `<prefix><shard_id>` (a broad
+  # prefix that can also surface sibling ids like `<shard_id>2.db`), then delete
+  # only the keys whose id-delimiter is `.` or `@` — so purging `acme` never deletes
+  # `acme2`. Paginated; per-object DELETEs are issued as each page lands (fathom's
+  # thesis is small shards with few versions/snapshots, so the per-shard object
+  # count is tiny — no DeleteObjects batching needed, matching drop_* elsewhere).
+  defp purge_shard_page(shard_id, token) do
+    params =
+      [{"list-type", "2"}, {"prefix", prefix() <> shard_id}] ++
+        if(token, do: [{"continuation-token", token}], else: [])
+
+    case Req.get(req(), url: url_path(""), params: params) do
+      {:ok, %{status: 200, body: body}} ->
+        case delete_keys(shard_object_keys(body, shard_id)) do
+          :ok ->
+            case next_token(body) do
+              nil -> :ok
+              next -> purge_shard_page(shard_id, next)
+            end
+
+          {:error, _} = err ->
+            err
+        end
+
+      {:ok, %{status: status}} ->
+        {:error, {:s3_list_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp shard_object_keys(xml, shard_id) when is_binary(xml) do
+    ~r{<Key>(.*?)</Key>}s
+    |> Regex.scan(xml)
+    |> Enum.flat_map(fn [_, key] -> if shard_object_key?(key, shard_id), do: [key], else: [] end)
+  end
+
+  defp shard_object_keys(_body, _shard_id), do: []
+
+  # Same delimiter rule as Local's shard_object?/2, on the prefix-qualified key: the
+  # char after `<prefix><shard_id>` must be `.` or `@` (never a bare-prefix match).
+  defp shard_object_key?(key, shard_id) do
+    case String.replace_prefix(key, prefix() <> shard_id, "") do
+      "." <> _ -> true
+      "@" <> _ -> true
+      _ -> false
+    end
+  end
+
+  defp delete_keys(keys) do
+    Enum.reduce_while(keys, :ok, fn key, :ok ->
+      case Req.delete(req(), url: url_path(key)) do
+        {:ok, %{status: status}} when status in 200..299 or status == 404 -> {:cont, :ok}
+        {:ok, %{status: status}} -> {:halt, {:error, {:s3_delete_status, status}}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  @impl true
   def list_snapshots(shard_id), do: list_snapshots(shard_id, nil, [])
 
   # ListObjectsV2 over the `<shard>@snap-` prefix (reusing the same paginated scan as
