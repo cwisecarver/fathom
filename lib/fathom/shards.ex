@@ -187,6 +187,30 @@ defmodule Fathom.Shards do
     end
   end
 
+  @doc """
+  Force-stops `shard_id`'s coordinator for tenant deletion (#15). Unlike `drain/2`, it does
+  NOT wait for in-flight connections — a delete deliberately kicks them — and it terminates
+  the coordinator via the supervisor **while its lease is still valid**, so the shutdown
+  flushes/releases cleanly (or is brutal-killed) and NEVER takes the self-fence path that
+  would quarantine the tenant's data to a `.fenced.<ts>` file the caller would then have to
+  hunt down. Caller purges storage AFTER this returns. Returns `:ok` (stopped or already cold).
+  """
+  @spec stop(String.t()) :: :ok
+  def stop(shard_id) do
+    case Registry.lookup(@registry, shard_id) do
+      [] ->
+        :ok
+
+      [{pid, _}] ->
+        # terminate_child blocks until the child is down (clean terminate, then brutal-kill
+        # at the child shutdown timeout). :not_found = it exited concurrently — also done.
+        case DynamicSupervisor.terminate_child(@supervisor, pid) do
+          :ok -> :ok
+          {:error, :not_found} -> :ok
+        end
+    end
+  end
+
   # Wait up to `exit_wait_ms` for the coordinator to exit after a drain request, cleaning
   # the monitor and mailbox the SAME way on every branch (expert review #41): a bounded
   # wait must never leak the monitor or a stale {:drain_aborted, pid} — a later drain/2 or

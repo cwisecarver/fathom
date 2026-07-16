@@ -63,7 +63,7 @@ config :fathom, :hrana_auth, :disabled
 # live-state uniqueness the migrator/handoff jobs rely on is unaffected.
 config :fathom, Oban,
   repo: Fathom.Repo,
-  queues: [migrations: 10, retirement: 5, rebalance: 3],
+  queues: [migrations: 10, retirement: 5, rebalance: 3, tenants: 3],
   plugins: [
     {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7},
     {Oban.Plugins.Cron,
