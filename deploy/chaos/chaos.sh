@@ -9,6 +9,9 @@
 #   ./chaos.sh owner <shard>      which node holds the shard file
 #   ./chaos.sh latency <ms>|clear inject S3 latency on every node (toxiproxy)
 #   ./chaos.sh failover <shard>   silent-kill the owner; time LB reroute + survivor steal
+#   ./chaos.sh deploy [shards node]  clean-shutdown (rolling-deploy) proof: hold N open+dirty shards
+#                                 on a node, SIGTERM it, verify the graceful terminate flushed EVERY
+#                                 shard (zero loss) — the herd analog of failover for a node upgrade
 #   ./chaos.sh pause-fence <shard>  freeze the owner past TTL; steal on a survivor;
 #                                   unpause the zombie and prove it self-fences
 #   ./chaos.sh partition <node> [secs]  cut one node off S3; observe lapse + recovery
@@ -907,8 +910,60 @@ cmd_tpc_fleet() {
   done
 }
 
+# cmd_deploy — the clean-shutdown (rolling-deploy) verification: the herd analog of `failover`.
+# `failover` SIGKILLs a node and measures the loss window; `deploy` SIGTERMs a node holding a HIGH
+# open-shard count and proves the graceful path flushes EVERY open shard (zero loss) — the property
+# a node-by-node upgrade relies on (docs/runbooks/deploy.md). We hold N shards open AND dirty by
+# disabling idle-drop + the periodic flush on the target, so the ONLY thing that can persist their
+# writes is the graceful-terminate flush. Then `docker stop` (SIGTERM -> BEAM init:stop -> supervised
+# terminate -> each coordinator flushes within :shard_shutdown_ms) and verify every committed row
+# survived via a survivor's cold-open from S3 (clean shutdown also RELEASES the leases, so a survivor
+# acquires immediately — no TTL wait).
+cmd_deploy() {
+  local shards=${1:-200} node=${2:-fathom1}
+  echo "clean-shutdown (deploy) verification: hold $shards open+dirty shards on $node, then SIGTERM"
+
+  # Keep every seeded shard open AND dirty through the run: only the graceful terminate may flush.
+  rpc "$node" 'Application.put_env(:fathom, :shard_idle_ms, 3_600_000); Application.put_env(:fathom, :shard_flush_interval_ms, 3_600_000); Application.put_env(:fathom, :max_open_shards, 100_000)' >/dev/null
+
+  echo "seeding $shards shards directly on $node (each a committed seq=999) ..."
+  local i s
+  for i in $(seq 1 "$shards"); do
+    s="deploy_${i}"
+    sql_direct "$node" "$s" "CREATE TABLE IF NOT EXISTS kv (id INTEGER PRIMARY KEY AUTOINCREMENT, seq INTEGER)" >/dev/null 2>&1
+    sql_direct "$node" "$s" "INSERT INTO kv (seq) VALUES (999)" >/dev/null 2>&1
+  done
+
+  local held; held=$(rpc "$node" 'IO.puts(Registry.count(Fathom.ShardRegistry))' | tr -dc 0-9)
+  echo "  $node holds $held open coordinators (idle-drop + periodic flush disabled ⇒ all dirty)"
+
+  local t0 t1
+  t0=$(now_ms)
+  "$DOCKER" stop -t 120 "$(cname "$node")" >/dev/null   # -t 120 so docker never premature-SIGKILLs
+  t1=$(now_ms)
+  echo "RESULT clean-shutdown: $((t1 - t0)) ms to graceful stop with $held open dirty shards ($(( (t1 - t0) / (held > 0 ? held : 1) )) ms/shard)"
+
+  echo "verifying survival of all $shards shards via a survivor cold-open from S3 ..."
+  local survivor lost=0 ok=0 got
+  survivor=$(other_node "$node")
+  for i in $(seq 1 "$shards"); do
+    s="deploy_${i}"
+    got=$(sql_direct "$survivor" "$s" "SELECT seq FROM kv LIMIT 1" 2>/dev/null | val 2>/dev/null)
+    if [ "$got" = "999" ]; then ok=$((ok + 1)); else lost=$((lost + 1)); fi
+  done
+  echo "  survived: $ok / $shards   lost: $lost"
+  if [ "$lost" -eq 0 ]; then
+    echo "PASS: clean shutdown flushed every open dirty shard — zero loss (contrast: failover/kill loses unflushed)"
+  else
+    echo "FAIL: $lost shard(s) lost committed writes on a CLEAN shutdown — investigate :shard_shutdown_ms vs flush time"
+  fi
+
+  revive "$node"
+}
+
 case "${1:-}" in
   build)       cmd_build ;;
+  deploy)      shift; cmd_deploy "$@" ;;
   tpcb)        shift; cmd_tpcb "$@" ;;
   tpcc)        shift; cmd_tpcc "$@" ;;
   density)     shift; cmd_density "$@" ;;
