@@ -62,6 +62,9 @@ defmodule FathomWeb.Router do
     delete "/tenants/:id", TenantController, :delete
     post "/tenants/:id/suspend", TenantController, :suspend
     post "/tenants/:id/resume", TenantController, :resume
+    post "/tenants/:id/token", TenantController, :mint_token
+    post "/tenants/:id/token/rotate", TenantController, :rotate_token
+    delete "/tenants/:id/token", TenantController, :revoke_token
   end
 
   # BasicAuth gate for /admin. Order-independent read of the `:admin_auth` keyword; challenges

@@ -14,7 +14,7 @@ defmodule FathomWeb.Api.TenantController do
   """
   use FathomWeb, :controller
 
-  alias Fathom.{Directory, Tenants}
+  alias Fathom.{Directory, HranaAuth, Tenants}
 
   # POST /api/tenants  {"shard_id": "acme"}
   def create(conn, params) do
@@ -85,6 +85,38 @@ defmodule FathomWeb.Api.TenantController do
   def resume(conn, %{"id" => id}) do
     lifecycle(conn, Tenants.resume(id), id, "active")
   end
+
+  # POST /api/tenants/:id/token   {"scope": "rw"|"ro"}   — mint a fresh token (#24)
+  def mint_token(conn, %{"id" => id} = params) do
+    scope = scope_param(params)
+
+    case HranaAuth.token_for(id, scope: scope) do
+      {:ok, token} -> json(conn, %{shard_id: id, auth_token: token, scope: to_string(scope)})
+      {:error, :invalid_shard_id} -> error(conn, :bad_request, "invalid shard id")
+    end
+  end
+
+  # POST /api/tenants/:id/token/rotate   {"scope": ...}   — zero-downtime graceful rotate (#24)
+  def rotate_token(conn, %{"id" => id} = params) do
+    scope = scope_param(params)
+
+    case HranaAuth.rotate(id, scope: scope) do
+      {:ok, token} -> json(conn, %{shard_id: id, auth_token: token, scope: to_string(scope)})
+      {:error, :invalid_shard_id} -> error(conn, :bad_request, "invalid shard id")
+    end
+  end
+
+  # DELETE /api/tenants/:id/token   — revoke every outstanding token immediately (#24)
+  def revoke_token(conn, %{"id" => id}) do
+    case HranaAuth.revoke(id) do
+      {:ok, version} -> json(conn, %{shard_id: id, revoked_below_version: version})
+      {:error, :invalid_shard_id} -> error(conn, :bad_request, "invalid shard id")
+    end
+  end
+
+  # Explicit map — never String.to_atom on the request scope (atom-exhaustion hygiene).
+  defp scope_param(%{"scope" => "ro"}), do: :ro
+  defp scope_param(_), do: :rw
 
   defp lifecycle(conn, result, id, new_status) do
     case result do

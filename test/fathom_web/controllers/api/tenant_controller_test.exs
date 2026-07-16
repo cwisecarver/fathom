@@ -118,4 +118,36 @@ defmodule FathomWeb.Api.TenantControllerTest do
       assert (conn |> auth() |> post("/api/tenants/api_ghost/suspend")).status == 404
     end
   end
+
+  describe "token lifecycle (#24)" do
+    test "mint returns a token; scope ro is reflected", %{conn: conn} do
+      put_shard("api_tok")
+
+      body = conn |> auth() |> post("/api/tenants/api_tok/token") |> json_response(200)
+      assert is_binary(body["auth_token"])
+      assert body["scope"] == "rw"
+
+      ro =
+        conn |> auth() |> post("/api/tenants/api_tok/token", %{scope: "ro"}) |> json_response(200)
+
+      assert ro["scope"] == "ro"
+      assert is_binary(ro["auth_token"])
+    end
+
+    test "rotate returns a fresh token", %{conn: conn} do
+      put_shard("api_rot")
+      body = conn |> auth() |> post("/api/tenants/api_rot/token/rotate") |> json_response(200)
+      assert is_binary(body["auth_token"])
+    end
+
+    test "revoke reports the new floor", %{conn: conn} do
+      put_shard("api_rev")
+      body = conn |> auth() |> delete("/api/tenants/api_rev/token") |> json_response(200)
+      assert is_integer(body["revoked_below_version"])
+    end
+
+    test "400 minting for an invalid id", %{conn: conn} do
+      assert (conn |> auth() |> post("/api/tenants/Bad%20Id/token")).status == 400
+    end
+  end
 end

@@ -7,11 +7,14 @@ defmodule Fathom.HranaAuthRotationTest do
   """
   use Fathom.DataCase, async: false
 
+  import ExUnit.CaptureLog
+
   alias Fathom.{Directory, HranaAuth}
 
   setup do
     prev_mode = Application.get_env(:fathom, :hrana_auth, :disabled)
     prev_grace = Application.get_env(:fathom, :hrana_rotation_grace_ms)
+    prev_max_age = Application.get_env(:fathom, :hrana_token_max_age)
     Application.put_env(:fathom, :hrana_auth, :required)
 
     on_exit(fn ->
@@ -20,9 +23,27 @@ defmodule Fathom.HranaAuthRotationTest do
       if is_nil(prev_grace),
         do: Application.delete_env(:fathom, :hrana_rotation_grace_ms),
         else: Application.put_env(:fathom, :hrana_rotation_grace_ms, prev_grace)
+
+      if is_nil(prev_max_age),
+        do: Application.delete_env(:fathom, :hrana_token_max_age),
+        else: Application.put_env(:fathom, :hrana_token_max_age, prev_max_age)
     end)
 
     :ok
+  end
+
+  test "the boot guard warns when tokens never expire (#24)" do
+    Application.delete_env(:fathom, :hrana_token_max_age)
+
+    log = capture_log(fn -> assert :ok = HranaAuth.check_config!() end)
+    assert log =~ "NEVER expire"
+  end
+
+  test "a finite max_age silences the never-expire warning" do
+    Application.put_env(:fathom, :hrana_token_max_age, 86_400)
+
+    log = capture_log(fn -> assert :ok = HranaAuth.check_config!() end)
+    refute log =~ "NEVER expire"
   end
 
   defp uniq, do: "rot_#{System.unique_integer([:positive])}"

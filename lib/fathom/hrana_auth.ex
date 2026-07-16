@@ -286,6 +286,17 @@ defmodule Fathom.HranaAuth do
       )
     end
 
+    # No default expiry (#24): a bearer token minted with no max_age lives forever, so a leaked
+    # credential's exposure grows unbounded. Warn loudly at boot; with graceful rotation
+    # (`HranaAuth.rotate/1`) a finite max_age no longer means a rotation outage.
+    if configured == :required and max_age() == :infinity do
+      Logger.warning(
+        "hrana_auth is :required but :hrana_token_max_age is unset (tokens NEVER expire). " <>
+          "Set HRANA_TOKEN_MAX_AGE (seconds) to bound credential-leak exposure — rotation is " <>
+          "now zero-downtime (HranaAuth.rotate/1), so a finite expiry is safe."
+      )
+    end
+
     :ok
   end
 
