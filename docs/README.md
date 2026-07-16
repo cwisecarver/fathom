@@ -71,7 +71,11 @@ single-node basics first, then what happens across nodes.
 - **[configuration.md](configuration.md)** — the env-var reference: every knob fathom reads, its
   default, and its **safety consequence** (kept complete by a drift test). *Built.*
 - **[quickstart-django.md](quickstart-django.md)** — pointing an unchanged Django app at a fathom
-  tenant over `django-libsql` (multi-tenant routing helper is the pending #16 companion package). *Built.*
+  tenant over `django-libsql` (connection, write-concurrency, latency, the mixed-window modes;
+  multi-tenant routing helper is the pending #16 companion package). *Built.*
+- **[django-migrations.md](django-migrations.md)** — the operator schema-migration workflow:
+  capture → release → converge (the `/api/migrations/status` deploy gate) → revert, expand-contract
+  rules, capture-time safety nets, and `migration_failed` triage. *Built.*
 
 ## Design / plans
 

@@ -66,6 +66,9 @@ defmodule FathomWeb.Router do
     post "/tenants/:id/token/rotate", TenantController, :rotate_token
     delete "/tenants/:id/token", TenantController, :revoke_token
     post "/tenants/:id/fork", TenantController, :fork
+
+    # Fleet migration convergence — the deploy gate a Django CI/CD reads (#25).
+    get "/migrations/status", MigrationController, :status
   end
 
   # BasicAuth gate for /admin. Order-independent read of the `:admin_auth` keyword; challenges

@@ -234,6 +234,33 @@ defmodule Fathom.Migrator do
   end
 
   @doc """
+  The fleet convergence snapshot (expert review #25) — the deploy gate a Django CI/CD reads before
+  shipping app code that depends on HEAD. `converged` (laggards == 0) is the "safe to deploy the new
+  app version" signal; `failed` surfaces quarantined shards to triage; `pending_review` lists
+  versions held below HEAD awaiting operator sign-off (#1/#6). Exposed over HTTP at
+  `GET /api/migrations/status`.
+  """
+  @spec status() :: %{
+          head: non_neg_integer(),
+          laggards: non_neg_integer(),
+          failed: non_neg_integer(),
+          converged: boolean(),
+          pending_review: [pos_integer()]
+        }
+  def status do
+    head = head()
+    laggards = Directory.count_laggards(head)
+
+    %{
+      head: head,
+      laggards: laggards,
+      failed: Directory.count_failed(),
+      converged: laggards == 0,
+      pending_review: Enum.map(pending_review(), & &1.version)
+    }
+  end
+
+  @doc """
   Post-revert template drift check (expert review #32). After a fleet revert yanks version vN and
   flips HEAD to vN-1, the **template** shard still has vN's Django migration applied in its
   `django_migrations` and its schema — Django's migration graph is linear, so the next
