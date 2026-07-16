@@ -57,7 +57,34 @@ That's the one place that can see the credential on the same footing for HTTP an
 
 Signing is **per shard**, so rotating a shard's signing element revokes every outstanding token for
 **that one shard** without a fleet-wide flush; revocation converges within the verifier's cache TTL.
-Tokens **don't expire by default**; set `:hrana_token_max_age` to bound their lifetime.
+Tokens **don't expire by default**; set `:hrana_token_max_age` to bound their lifetime — a node running
+`:required` with an infinite `max_age` logs a loud boot warning (#24).
+
+## Token lifecycle: rotate, revoke, scope (#24)
+
+A token embeds the shard's **version** (`v`), and `verify` accepts it while `v` clears the shard's
+revocation **floor**. That floor is the lever for two distinct operations:
+
+- **`HranaAuth.revoke/1` — immediate.** Raises the floor; every outstanding token below it stops
+  verifying at once. The compromise-response path.
+- **`HranaAuth.rotate/1` — zero-downtime.** Raises the version and mints a **new** token, but stamps
+  `token_version_bumped_at`, and `verify` keeps accepting the **previous** version for a grace window
+  (`:hrana_rotation_grace_ms`, default 1h): mint-new → deploy → the old auto-hardens out. This is the
+  fix for "rotation is an outage" — at fleet scale, routine credential hygiene no longer means
+  thousands of coordinated micro-outages. (A revoke clears `token_version_bumped_at`, so it never
+  gets the grace.) The verifier's per-node cache holds `{floor, bumped_at}`, so all of this stays off
+  the Postgres hot path.
+
+- **Read-only scope.** `token_for(id, scope: :ro)` mints a token carrying an `"sc": "ro"` claim (a full
+  token carries none — absence reads as read-write, so every already-issued token stays full-access).
+  On a `ro` stream, `Fathom.ShardExecutor` refuses any write (DML or DDL) with a distinct **403
+  `FILO_READONLY`**, so an export/analytics/BI credential can read but never mutate a tenant. The scope
+  reaches the executor without a Filo change: `authorize/2` stashes the verified scope and the stream's
+  `open` reads it into the connection handle, where it rides across baton-resumes.
+
+Mint, rotate, and revoke are exposed programmatically on the control-plane API: `POST
+/api/tenants/:id/token` (mint, `{"scope": "rw"|"ro"}`), `POST /api/tenants/:id/token/rotate`, and
+`DELETE /api/tenants/:id/token` — behind the same admin BasicAuth (see `docs/tenant-lifecycle.md`).
 
 ## The trust boundary when auth is disabled
 
