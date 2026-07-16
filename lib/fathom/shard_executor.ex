@@ -18,7 +18,7 @@ defmodule Fathom.ShardExecutor do
   alias Fathom.Shard
   alias Fathom.Shard.Connection
   alias Fathom.Shards
-  alias Filo.{Error, Stmt, StmtResult}
+  alias Filo.{Describe, Error, Stmt, StmtResult}
 
   @impl true
   # No shard could be resolved for the request (no subdomain, override off, and no configured
@@ -261,12 +261,84 @@ defmodule Fathom.ShardExecutor do
   @impl true
   def owner({pid, _ref, _conn, _shard_id, _scope}), do: pid
 
+  # Runs a SQL script (the Hrana `sequence` request — libSQL's `executescript()`, #34): one or more
+  # statements for side effects, no rows. A read-only token can't run one (a script writes), and the
+  # tenant-DDL block applies to its leading statement.
+  @impl true
+  def execute_sequence({_pid, _ref, conn, shard_id, scope}, sql) when is_binary(sql) do
+    cond do
+      scope == :ro ->
+        {:error,
+         %Error{
+           message: "read-only token cannot run a script",
+           code: "FILO_READONLY",
+           status: 403
+         }}
+
+      block_tenant_ddl?() and not template?(shard_id) and ddl?(sql) ->
+        {:error,
+         %Error{
+           message:
+             "schema changes must go through the migration engine on the template shard, not a " <>
+               "direct script on tenant \"#{shard_id}\"",
+           code: "FILO_DDL_BLOCKED",
+           status: 400
+         }}
+
+      true ->
+        case Connection.exec(conn, sql) do
+          :ok ->
+            # THE DURABILITY TRAP (#34): `exec` bypasses the `wrote?`-based WriteCounter bump in the
+            # single-statement path, so a script-only session would leave the shard CLEAN and its
+            # write-gated idle flush would drop the local copy WITHOUT uploading — silently losing the
+            # script's writes (same class as the RETURNING bug). A script is presumed to write, so
+            # bump unconditionally.
+            Fathom.Shard.WriteCounter.bump(shard_id)
+            # On the template shard, a script is (part of) a migration — feed it to capture.
+            capture(shard_id, conn, sql)
+            :ok
+
+          {:error, reason} ->
+            {:error, %Error{message: reason_to_string(reason), code: sqlite_code(reason)}}
+        end
+    end
+  end
+
+  # Introspects a statement without running it (the Hrana `describe` request, #34): its parameters,
+  # result columns, and whether it's an EXPLAIN / read-only. `is_readonly` is the leading-keyword
+  # classification (a SELECT/PRAGMA read vs a DML/DDL write) — the hint a libSQL client wants.
+  @impl true
+  def describe({_pid, _ref, conn, _shard_id, _scope}, sql) when is_binary(sql) do
+    case Connection.describe(conn, sql) do
+      {:ok, %{params: params, cols: cols}} ->
+        {:ok,
+         %Describe{
+           params: params,
+           cols: cols,
+           is_explain: explain?(sql),
+           is_readonly: not (dml?(sql) or ddl?(sql))
+         }}
+
+      {:error, reason} ->
+        {:error, %Error{message: reason_to_string(reason), code: sqlite_code(reason)}}
+    end
+  end
+
   @impl true
   def close({pid, ref, conn, shard_id, _scope}) do
     Connection.close(conn)
     Shard.checkin(pid, ref)
     if template?(shard_id), do: Capture.forget(conn)
     :ok
+  end
+
+  # Leading-keyword EXPLAIN detection for describe/2 (only ever called with binary sql).
+  defp explain?(sql) do
+    sql
+    |> String.trim_leading()
+    |> String.slice(0, 7)
+    |> String.downcase()
+    |> String.starts_with?("explain")
   end
 
   # --- migration capture (template shard only) ---

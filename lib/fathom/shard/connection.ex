@@ -154,6 +154,34 @@ defmodule Fathom.Shard.Connection do
   def exec(conn, sql), do: Sqlite3.execute(conn, sql)
 
   @doc """
+  Introspects a statement WITHOUT running it (the Hrana `describe` request, #34): returns its result
+  column names and its bound-parameter count as `%{params: [nil, …], cols: [name, …]}`. Parameters
+  are reported positionally (`nil` each — exqlite exposes the count, not the names), which is what a
+  libSQL client needs to know how many values to bind. The prepared statement is always released.
+  """
+  @spec describe(reference(), String.t()) ::
+          {:ok, %{params: [nil], cols: [String.t()]}} | {:error, term()}
+  def describe(conn, sql) do
+    with {:ok, stmt} <- Sqlite3.prepare(conn, sql) do
+      try do
+        cols = with {:ok, c} <- Sqlite3.columns(conn, stmt), do: c, else: (_ -> [])
+
+        count =
+          case Sqlite3.bind_parameter_count(stmt) do
+            n when is_integer(n) and n >= 0 -> n
+            _ -> 0
+          end
+
+        {:ok, %{params: List.duplicate(nil, count), cols: cols}}
+      after
+        Sqlite3.release(conn, stmt)
+      end
+    end
+  rescue
+    e in ArgumentError -> {:error, Exception.message(e)}
+  end
+
+  @doc """
   Whether `conn` is in **autocommit** mode — i.e. no explicit transaction is open
   (`sqlite3_get_autocommit` via exqlite's `transaction_status`). Fails safe to `true`
   (the historical default) if the status can't be read.
