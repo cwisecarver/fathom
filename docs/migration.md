@@ -43,6 +43,21 @@ The migration copies to a **fresh file** and flips a pointer; it never mutates a
 Because it's copy-then-flip on a fresh file, a shard being read *during* its migration never sees a
 half-applied schema.
 
+### Data migrations are gated for review (`requires_review`)
+
+Django DDL is safe to replay verbatim onto every shard; a **data** migration is not. A RunPython
+backfill (`for u in User.objects.all(): u.slug = slugify(u.name); u.save()`) crosses the wire as
+template-literal `INSERT/UPDATE/DELETE` carrying the *template's* row values — replayed onto every
+tenant it overwrites their data (or, from an empty template, silently backfills nothing) while all
+three stamps say "applied" (expert review #1). So capture **lints** each version's buffer: any DML
+on a table other than `django_migrations` flags the release `requires_review: true`. The version is
+still *recorded* (refusing would fork the template from the fleet — #19), but a flagged version
+**caps the fleet HEAD below it** (`Migrator.head/0`), so the rollout never replays that DML until an
+operator reviews it. `Migrator.pending_review/0` lists flagged versions; `Migrator.approve_review/1`
+clears the flag after the operator confirms it's safe (or supplies a real per-shard data-migration
+hook), and HEAD then advances. A flagged version blocks everything above it too (the linear graph
+has no skip).
+
 ## Oban jobs drive it, and the cold tail converges on its own
 
 - **`ShardMigrationJob`** (unique per shard) migrates one shard.

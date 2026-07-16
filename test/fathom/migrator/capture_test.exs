@@ -81,10 +81,18 @@ defmodule Fathom.Migrator.CaptureTest do
       Capture.append(conn, "UPDATE app_thing SET slug = 'from-template' WHERE id = 1")
       Capture.append(conn, "INSERT INTO django_migrations (app, name) VALUES ('app', '0002')")
 
-      log = capture_log(fn -> assert {:recorded, _} = Capture.commit(conn, 1) end)
+      {result, log} = with_log(fn -> Capture.commit(conn, 1) end)
+      assert {:recorded, version} = result
       assert log =~ "DATA-MIGRATION"
-      # Still recorded — refusing would fork the template from the fleet.
-      assert Migrator.head() >= 1
+
+      # Still RECORDED — refusing would fork the template from the fleet (#19) …
+      assert [%{version: ^version, requires_review: true}] = Migrator.list()
+      # … but FLAGGED requires_review (expert review #1), so it is held below HEAD (the rollout
+      # can't replay the template-literal DML) until an operator reviews it.
+      assert version in Enum.map(Migrator.pending_review(), & &1.version)
+
+      assert Migrator.head() == 0,
+             "a flagged data migration must not become HEAD until reviewed"
     end
 
     test "does not flag a pure-DDL migration (only django_migrations bookkeeping DML)" do

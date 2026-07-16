@@ -218,6 +218,31 @@ defmodule Fathom.Migrator.RolloutTest do
   # Django migration applied, so the next makemigrations builds on schema the fleet reverted away
   # from → fleet-wide replay failure. The check compares the template's captured django_migrations
   # count (recorded per release) against HEAD's, and yank/1 alarms when the template is left ahead.
+  # Expert review #1: a captured version carrying template-literal DATA migrations is flagged
+  # requires_review, which must CAP the fleet HEAD below it (blocking the rollout from replaying the
+  # dangerous DML fleet-wide) until an operator reviews and approves it — then HEAD advances.
+  describe "requires_review (data-migration review gate)" do
+    test "a flagged version caps HEAD below it until approved, then HEAD advances" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
+      # v2 carries a data migration → flagged requires_review (5th arg).
+      {:ok, _} = Migrator.release(2, "v2-data", ["UPDATE app_thing SET x = 1"], nil, true)
+      {:ok, _} = Migrator.release(3, "v3", ["SELECT 1"])
+
+      # HEAD is capped at v1 — the flagged v2 blocks v2 AND v3 (linear graph, no skipping past it).
+      assert Migrator.head() == 1
+      assert [%{version: 2}] = Migrator.pending_review()
+
+      # The operator reviews and approves v2 → HEAD advances to v3, review queue clears.
+      assert :ok = Migrator.approve_review(2)
+      assert Migrator.head() == 3
+      assert Migrator.pending_review() == []
+    end
+
+    test "approve_review on an unknown version errors" do
+      assert Migrator.approve_review(99) == {:error, :unknown_version}
+    end
+  end
+
   describe "template_drift/0" do
     test "reports :aligned when no yanked version is above HEAD" do
       {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"], 10)

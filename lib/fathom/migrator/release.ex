@@ -23,6 +23,11 @@ defmodule Fathom.Migrator.Release do
     # template's linear graph was left ahead of the yanked-away fleet, without opening the template
     # or parsing SQL. Nullable — pre-feature releases have none, and the check skips them.
     field :template_migration_count, :integer
+    # Expert review #1: set true when capture detects template-literal DATA migrations in the
+    # buffer (INSERT/UPDATE/DELETE on non-django_migrations tables) — a fleet-wide-corruption risk.
+    # Caps HEAD below this version (Migrator.head/0) so the rollout can't replay it until an operator
+    # reviews and clears the flag (Migrator.approve_review/1).
+    field :requires_review, :boolean, default: false
 
     timestamps(type: :utc_datetime_usec, updated_at: false)
   end
@@ -30,7 +35,7 @@ defmodule Fathom.Migrator.Release do
   @doc false
   def changeset(release, attrs) do
     release
-    |> cast(attrs, [:version, :name, :statements, :template_migration_count])
+    |> cast(attrs, [:version, :name, :statements, :template_migration_count, :requires_review])
     |> validate_required([:version, :name])
     |> validate_number(:version, greater_than: 0)
     |> unique_constraint(:version)

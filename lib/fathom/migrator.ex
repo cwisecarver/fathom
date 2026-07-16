@@ -31,15 +31,22 @@ defmodule Fathom.Migrator do
   (expert review #32) is the template's django_migrations count at capture time, used by
   `template_drift/0`; `nil` when unknown (a hand-authored release).
   """
-  @spec release(pos_integer(), String.t(), [String.t()], non_neg_integer() | nil) ::
+  @spec release(pos_integer(), String.t(), [String.t()], non_neg_integer() | nil, boolean()) ::
           {:ok, Release.t()} | {:error, Ecto.Changeset.t()}
-  def release(version, name, statements \\ [], template_migration_count \\ nil) do
+  def release(
+        version,
+        name,
+        statements \\ [],
+        template_migration_count \\ nil,
+        requires_review \\ false
+      ) do
     %Release{}
     |> Release.changeset(%{
       version: version,
       name: name,
       statements: statements,
-      template_migration_count: template_migration_count
+      template_migration_count: template_migration_count,
+      requires_review: requires_review
     })
     |> Repo.insert()
   end
@@ -68,7 +75,51 @@ defmodule Fathom.Migrator do
   """
   @spec head() :: non_neg_integer()
   def head do
-    Repo.aggregate(from(r in Release, where: not r.yanked), :max, :version) || 0
+    # Expert review #1: a `requires_review` version (a captured data-migration flagged as a
+    # fleet-wide-corruption risk) is a CEILING — the rollout must not advance to it or past it until
+    # an operator reviews and clears the flag (`approve_review/1`). So HEAD is the highest non-yanked
+    # version strictly below the lowest un-reviewed version. Respects the linear graph (no skipping):
+    # rollout proceeds up to just before the first flagged version.
+    review_floor =
+      Repo.aggregate(
+        from(r in Release, where: not r.yanked and r.requires_review),
+        :min,
+        :version
+      )
+
+    query = from(r in Release, where: not r.yanked)
+    query = if review_floor, do: from(r in query, where: r.version < ^review_floor), else: query
+
+    Repo.aggregate(query, :max, :version) || 0
+  end
+
+  @doc """
+  Releases flagged `requires_review` (expert review #1) — captured versions whose buffer contained
+  template-literal data migrations, held below HEAD until reviewed. Oldest first.
+  """
+  @spec pending_review() :: [Release.t()]
+  def pending_review do
+    Repo.all(
+      from(r in Release, where: r.requires_review and not r.yanked, order_by: [asc: r.version])
+    )
+  end
+
+  @doc """
+  Clears the `requires_review` flag on `version` (expert review #1) after an operator has confirmed
+  the captured data migration is safe to replay fleet-wide — HEAD then advances (up to the next
+  flagged version, if any) and the rollout proceeds. Refreshes this node's HeadCache.
+  """
+  @spec approve_review(pos_integer()) :: :ok | {:error, :unknown_version}
+  def approve_review(version) do
+    case Repo.get_by(Release, version: version) do
+      nil ->
+        {:error, :unknown_version}
+
+      release ->
+        {:ok, _} = release |> Ecto.Changeset.change(requires_review: false) |> Repo.update()
+        refresh_head_cache()
+        :ok
+    end
   end
 
   @doc """

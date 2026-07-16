@@ -233,8 +233,19 @@ defmodule Fathom.Migrator.Capture do
   # buffer this path exists to preserve — down with it.
   defp record(statements, template_migration_count) do
     version = Migrator.next_version()
+    # Expert review #1: flag a captured version that carries template-literal DATA migrations so
+    # HEAD stays below it until an operator reviews it — replaying that DML fleet-wide corrupts or
+    # silently skips tenant data. We still RECORD it (refusing would fork the template from the
+    # fleet, the #19 invariant); the flag blocks the rollout, not the capture.
+    requires_review = data_migration_statements(statements) != []
 
-    case Migrator.release(version, "auto-captured", statements, template_migration_count) do
+    case Migrator.release(
+           version,
+           "auto-captured",
+           statements,
+           template_migration_count,
+           requires_review
+         ) do
       {:ok, _} ->
         alarm_on_data_migration(version, statements)
         {:recorded, version}
