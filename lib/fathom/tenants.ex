@@ -1,8 +1,11 @@
 defmodule Fathom.Tenants do
   @moduledoc """
-  Tenant lifecycle orchestration (expert review 2026-07-14 #15) — the whole-shard
-  operations the migration engine deliberately left out of scope: **delete** (GDPR
-  Article 17 erasure / offboarding) and **export** (data portability).
+  Tenant lifecycle orchestration — the whole-shard operations the migration engine deliberately
+  left out of scope: **delete** (GDPR Article 17 erasure / offboarding, #15), **export** (data
+  portability, #15), **provision** (explicit create, #21), and **suspend/resume** (administrative
+  offline, #20). The admission gates for the last two are `Fathom.Tenants.Tombstones` (permanent)
+  and `Fathom.Tenants.Suspensions` (reversible) — ETS sets checked O(1) in `Fathom.Shards.ensure/1`
+  off the Postgres hot path.
 
   A "tenant" is one shard — one SQLite file. Deletion is the hard case: a full erase
   must reach the live stored object + lock, every retained migration version, every
@@ -31,7 +34,12 @@ defmodule Fathom.Tenants do
   alias Fathom.{Directory, HranaAuth, Shards}
   alias Fathom.Shard.Storage
   alias Fathom.ShardId
-  alias Fathom.Tenants.{DeleteJob, Tombstones}
+  alias Fathom.Tenants.{DeleteJob, Suspensions, Tombstones}
+
+  # Graceful-drain budget when suspending a tenant — in-flight streams finish, then the
+  # coordinator flushes + stops; a busy one keeps serving current streams (new opens are denied
+  # by the admission gate regardless).
+  @suspend_drain_ms 5_000
 
   # Per-shard Oban workers a delete must cancel so a queued migration/revert/retirement/
   # handoff can't run against (or resurrect) a shard being erased. The DeleteJob itself is
@@ -156,11 +164,65 @@ defmodule Fathom.Tenants do
   end
 
   @doc """
+  Suspends a tenant (#20): flips the directory row to `suspended`, broadcasts the suspension
+  fleet-wide (so every node's admission gate denies new streams immediately), and best-effort
+  graceful-drains the home coordinator so it stops serving (in-flight transactions finish; a busy
+  coordinator keeps its current streams but all new opens are denied). Reversible via `resume/1`.
+  Returns `:ok`, `{:error, :invalid_shard_id}`, `{:error, :not_found}`, or `{:error, :deleted}`
+  (a tombstoned tenant is gone, not suspendable).
+  """
+  @spec suspend(String.t()) :: :ok | {:error, term()}
+  def suspend(shard_id) do
+    with {:ok, id} <- cast(shard_id),
+         {:ok, _row} <- Directory.suspend(id) do
+      broadcast_suspension(id, true)
+      Shards.drain(id, @suspend_drain_ms)
+      :ok
+    end
+  end
+
+  @doc """
+  Resumes a suspended tenant (#20): flips the directory row back to `active` and broadcasts the
+  resume so every node's gate stops denying it. Next request cold-opens fresh. Returns `:ok`,
+  `{:error, :invalid_shard_id}`, `{:error, :not_found}`, or `{:error, :deleted}`.
+  """
+  @spec resume(String.t()) :: :ok | {:error, term()}
+  def resume(shard_id) do
+    with {:ok, id} <- cast(shard_id),
+         {:ok, _row} <- Directory.resume(id) do
+      broadcast_suspension(id, false)
+      :ok
+    end
+  end
+
+  @doc """
   True if `shard_id` has been deleted (tombstoned). Checked O(1) on the admission path so a
   request for an erased subdomain is refused instead of re-minting an empty shard.
   """
   @spec tombstoned?(String.t()) :: boolean()
   def tombstoned?(shard_id), do: Tombstones.tombstoned?(shard_id)
+
+  @doc "True if `shard_id` is administratively suspended (#20). Checked O(1) on the admission path."
+  @spec suspended?(String.t()) :: boolean()
+  def suspended?(shard_id), do: Suspensions.suspended?(shard_id)
+
+  @doc """
+  Broadcasts a suspend (`suspended: true`) or resume (`false`) fleet-wide: updates THIS node's
+  suspension gate immediately, then pushes over Oban's notifier so every other node converges (a
+  down node catches up on the periodic reconcile). Best-effort. See `Fathom.Tenants.Suspensions`.
+  """
+  @spec broadcast_suspension(String.t(), boolean()) :: :ok
+  def broadcast_suspension(shard_id, suspended?) do
+    if suspended?, do: Suspensions.put(shard_id), else: Suspensions.remove(shard_id)
+
+    Oban.Notifier.notify(Oban, Suspensions.channel(), %{shard_id: shard_id, suspended: suspended?})
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
 
   @doc """
   Announces `shard_id`'s deletion fleet-wide: records it in THIS node's tombstone set

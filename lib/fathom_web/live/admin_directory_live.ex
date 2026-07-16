@@ -77,6 +77,16 @@ defmodule FathomWeb.AdminDirectoryLive do
     end
   end
 
+  # Suspend / resume (#20): dedicated actions (not a status hand-flip) so the fleet-wide
+  # admission gate + coordinator drain fire. Same admin gate as every event here.
+  def handle_event("suspend_tenant", %{"id" => shard_id}, socket) do
+    lifecycle(socket, Fathom.Tenants.suspend(shard_id), shard_id, "Suspended")
+  end
+
+  def handle_event("resume_tenant", %{"id" => shard_id}, socket) do
+    lifecycle(socket, Fathom.Tenants.resume(shard_id), shard_id, "Resumed")
+  end
+
   def handle_event("save", %{"edit" => %{"status" => status, "retain_until" => retain}}, socket) do
     shard_id = socket.assigns.editing
 
@@ -87,6 +97,26 @@ defmodule FathomWeb.AdminDirectoryLive do
       :error ->
         {:noreply,
          assign(socket, :edit_error, "retain_until must be an ISO-8601 timestamp or blank")}
+    end
+  end
+
+  # Shared result-handling for the suspend/resume events (#20).
+  defp lifecycle(socket, result, shard_id, verb) do
+    case result do
+      :ok ->
+        {:noreply,
+         socket
+         |> assign(editing: nil, edit_error: nil)
+         |> put_flash(:info, "#{verb} #{shard_id}")
+         |> load()}
+
+      {:error, reason} ->
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "Could not #{String.downcase(verb)} #{shard_id}: #{inspect(reason)}"
+         )}
     end
   end
 
@@ -223,6 +253,28 @@ defmodule FathomWeb.AdminDirectoryLive do
                         >
                           Export
                         </.link>
+                        <%= if row.status == "suspended" do %>
+                          <button
+                            id={"dir-resume-#{row.shard_id}"}
+                            type="button"
+                            phx-click="resume_tenant"
+                            phx-value-id={row.shard_id}
+                            class="btn btn-ghost btn-xs text-success"
+                          >
+                            Resume
+                          </button>
+                        <% else %>
+                          <button
+                            id={"dir-suspend-#{row.shard_id}"}
+                            type="button"
+                            phx-click="suspend_tenant"
+                            phx-value-id={row.shard_id}
+                            data-confirm={"Suspend #{row.shard_id}? New connections are refused (403) fleet-wide until you resume it; in-flight transactions finish."}
+                            class="btn btn-ghost btn-xs text-warning"
+                          >
+                            Suspend
+                          </button>
+                        <% end %>
                         <button
                           id={"dir-edit-#{row.shard_id}"}
                           type="button"
@@ -329,6 +381,8 @@ defmodule FathomWeb.AdminDirectoryLive do
   defp status_class("active"), do: "num text-success"
   defp status_class("migration_failed"), do: "num text-error"
   defp status_class("migrating"), do: "num text-warning"
+  defp status_class("suspended"), do: "num text-warning"
+  defp status_class("deleted"), do: "num text-base-content/40"
   defp status_class(_), do: "num text-base-content/60"
 
   defp fmt_dt(nil), do: ""

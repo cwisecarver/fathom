@@ -10,7 +10,7 @@ defmodule Fathom.TenantsTest do
 
   alias Fathom.{Directory, ShardExecutor, Shards, Snapshots, Tenants}
   alias Fathom.Shard.Storage
-  alias Fathom.Tenants.{DeleteJob, Tombstones}
+  alias Fathom.Tenants.{DeleteJob, Suspensions, Tombstones}
   alias Filo.Stmt
 
   @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
@@ -19,8 +19,9 @@ defmodule Fathom.TenantsTest do
     id = "ten_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      # Tombstone ETS is app-global — forget this id so it can't gate another test's shard.
+      # The gate ETS tables are app-global — forget this id so it can't gate another test's shard.
       :ets.delete(Tombstones, id)
+      :ets.delete(Suspensions, id)
       Shards.drain(id, 2_000)
       Storage.purge_shard(id)
 
@@ -123,6 +124,33 @@ defmodule Fathom.TenantsTest do
 
     test "refuses an invalid id" do
       assert {:error, :invalid_shard_id} = Tenants.export("Not Valid!")
+    end
+  end
+
+  describe "suspend/1 and resume/1" do
+    test "suspend denies admission (403) and resume restores service", %{id: id} do
+      {:ok, _} = Directory.resolve(id)
+
+      assert :ok = Tenants.suspend(id)
+      assert Tenants.suspended?(id)
+      assert {:ok, %{status: "suspended"}} = Directory.get(id)
+      # New streams are refused while suspended.
+      assert {:error, :shard_suspended} = Shards.checkout(id)
+
+      assert :ok = Tenants.resume(id)
+      refute Tenants.suspended?(id)
+      assert {:ok, %{status: "active"}} = Directory.get(id)
+      assert {:ok, _pid, _ref, _path} = Shards.checkout(id)
+    end
+
+    test "refuses to suspend a deleted (tombstoned) tenant", %{id: id} do
+      {:ok, _} = Directory.tombstone(id)
+      assert {:error, :deleted} = Tenants.suspend(id)
+    end
+
+    test "refuses an unknown tenant and an invalid id", %{id: id} do
+      assert {:error, :not_found} = Tenants.suspend(id)
+      assert {:error, :invalid_shard_id} = Tenants.suspend("Not Valid!")
     end
   end
 

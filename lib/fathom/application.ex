@@ -270,6 +270,10 @@ defmodule Fathom.Application do
       # deletion (expert review #15). Loaded from the directory at boot, pushed fleet-wide on
       # delete over Oban's notifier, refreshed periodically. Off the Postgres hot path.
       Fathom.Tenants.Tombstones,
+      # ETS set of suspended shard ids — the admission deny gate for tenant suspension (expert
+      # review #20). Same shape as Tombstones but reversible (resume clears it; the periodic
+      # refresh reconciles). Off the Postgres hot path.
+      Fathom.Tenants.Suspensions,
       # Captures template-shard Django migrations into fleet versions.
       Fathom.Migrator.Capture,
       # Runs handoff warm/drain commands concurrently off the CommandPoller (finding #8), so

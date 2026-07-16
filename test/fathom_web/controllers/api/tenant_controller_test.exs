@@ -8,7 +8,7 @@ defmodule FathomWeb.Api.TenantControllerTest do
   alias Fathom.Directory
   alias Fathom.Directory.Shard
   alias Fathom.Repo
-  alias Fathom.Tenants.Tombstones
+  alias Fathom.Tenants.{Suspensions, Tombstones}
 
   @auth "Basic " <> Base.encode64("admin:secret")
 
@@ -97,6 +97,25 @@ defmodule FathomWeb.Api.TenantControllerTest do
       body = conn |> auth() |> delete("/api/tenants/api_del") |> json_response(202)
       assert body["status"] == "deleting"
       assert {:ok, %{status: "deleted"}} = Directory.get("api_del")
+    end
+  end
+
+  describe "POST /api/tenants/:id/{suspend,resume}" do
+    test "suspend then resume flip the status", %{conn: conn} do
+      put_shard("api_susp")
+      on_exit(fn -> :ets.delete(Suspensions, "api_susp") end)
+
+      body = conn |> auth() |> post("/api/tenants/api_susp/suspend") |> json_response(200)
+      assert body["status"] == "suspended"
+      assert {:ok, %{status: "suspended"}} = Directory.get("api_susp")
+
+      body = conn |> auth() |> post("/api/tenants/api_susp/resume") |> json_response(200)
+      assert body["status"] == "active"
+      assert {:ok, %{status: "active"}} = Directory.get("api_susp")
+    end
+
+    test "404 suspending an unknown tenant", %{conn: conn} do
+      assert (conn |> auth() |> post("/api/tenants/api_ghost/suspend")).status == 404
     end
   end
 end

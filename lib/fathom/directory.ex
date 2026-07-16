@@ -241,6 +241,42 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  Suspends a shard — flips its directory row to `suspended` (administrative offline, #20). A
+  suspended tenant is denied at admission (via the `Fathom.Tenants.Suspensions` gate) until
+  `resume/1`. Refuses `:not_found`, or `:deleted` (a tombstoned tenant is gone, not suspendable).
+  """
+  @spec suspend(String.t()) ::
+          {:ok, Shard.t()} | {:error, :not_found | :deleted | Ecto.Changeset.t()}
+  def suspend(shard_id) do
+    with {:ok, %Shard{status: status}} when status != "deleted" <- fetch_for_status(shard_id) do
+      update_shard(shard_id, %{status: "suspended"})
+    end
+  end
+
+  @doc "Resumes a suspended shard back to `active` (#20). Refuses `:not_found` or `:deleted`."
+  @spec resume(String.t()) ::
+          {:ok, Shard.t()} | {:error, :not_found | :deleted | Ecto.Changeset.t()}
+  def resume(shard_id) do
+    with {:ok, %Shard{status: status}} when status != "deleted" <- fetch_for_status(shard_id) do
+      update_shard(shard_id, %{status: "active"})
+    end
+  end
+
+  @doc "All `suspended` shard ids — loaded into the admission suspend gate at boot/refresh (#20)."
+  @spec suspended_shard_ids() :: [String.t()]
+  def suspended_shard_ids do
+    Repo.all(from s in Shard, where: s.status == "suspended", select: s.shard_id)
+  end
+
+  defp fetch_for_status(shard_id) do
+    case get(shard_id) do
+      {:ok, %Shard{status: "deleted"}} -> {:error, :deleted}
+      {:ok, %Shard{} = shard} -> {:ok, shard}
+      :error -> {:error, :not_found}
+    end
+  end
+
+  @doc """
   The rollout sweep cursor: active shards behind `head_version`, most-recently-used
   first (hot shards migrate first), capped at `limit`.
   """

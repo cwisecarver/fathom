@@ -60,6 +60,8 @@ defmodule FathomWeb.Router do
     get "/tenants", TenantController, :index
     get "/tenants/:id", TenantController, :show
     delete "/tenants/:id", TenantController, :delete
+    post "/tenants/:id/suspend", TenantController, :suspend
+    post "/tenants/:id/resume", TenantController, :resume
   end
 
   # BasicAuth gate for /admin. Order-independent read of the `:admin_auth` keyword; challenges

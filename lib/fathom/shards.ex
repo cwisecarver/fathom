@@ -259,13 +259,25 @@ defmodule Fathom.Shards do
 
   @doc "Returns `{:ok, pid}` for `shard_id`, starting the coordinator if needed."
   def ensure(shard_id) when is_binary(shard_id) do
-    if Fathom.ShardId.valid?(shard_id) do
-      case Registry.lookup(@registry, shard_id) do
-        [{pid, _}] -> {:ok, pid}
-        [] -> start_if_capacity(shard_id)
-      end
-    else
-      {:error, :invalid_shard_id}
+    cond do
+      not Fathom.ShardId.valid?(shard_id) ->
+        {:error, :invalid_shard_id}
+
+      # Lifecycle denies, checked on EVERY checkout (not just a new open) so a deleted or
+      # suspended tenant is refused even when a coordinator is still running — closing the
+      # window between a delete/suspend and the coordinator's stop. Both are O(1) ETS lookups
+      # off the Postgres hot path (`Fathom.Tenants.Tombstones` / `.Suspensions`).
+      Fathom.Tenants.tombstoned?(shard_id) ->
+        {:error, :shard_tombstoned}
+
+      Fathom.Tenants.suspended?(shard_id) ->
+        {:error, :shard_suspended}
+
+      true ->
+        case Registry.lookup(@registry, shard_id) do
+          [{pid, _}] -> {:ok, pid}
+          [] -> start_if_capacity(shard_id)
+        end
     end
   end
 
@@ -276,15 +288,9 @@ defmodule Fathom.Shards do
   # Off by default (`:max_open_shards` == :infinity); the operator sets it from the
   # measured fd/RSS density budget (`mix fathom.scale --ramp`).
   defp start_if_capacity(shard_id) do
+    # The deleted/suspended lifecycle denies are enforced in ensure/1 (above), before we ever
+    # reach here — so start_if_capacity only weighs capacity + novel-rate.
     cond do
-      # A deleted tenant must never silently resurrect (#15): once tombstoned, a stray
-      # request for the subdomain is refused rather than re-minting an empty shard. Checked
-      # FIRST and against an ETS set (O(1), no Postgres), so it never touches the cold-open
-      # path's latency and holds even during a directory outage (loaded at boot + pushed on
-      # delete). Only ids an operator explicitly deleted are in the set.
-      Fathom.Tenants.tombstoned?(shard_id) ->
-        {:error, :shard_tombstoned}
-
       # At the cap, first try to make room by evicting the least-recently-used IDLE
       # shard (soft cap). Only if nothing idle can be evicted do we refuse — a node
       # saturated with *active* connections genuinely has no room, and 503 tells the

@@ -96,6 +96,28 @@ defmodule FathomWeb.AdminDirectoryLiveTest do
     assert Fathom.Tenants.tombstoned?("ui_del")
   end
 
+  test "suspend and resume buttons flip the tenant's status", %{conn: conn} do
+    put_shard(%{shard_id: "ui_susp", status: "active"})
+    on_exit(fn -> :ets.delete(Fathom.Tenants.Suspensions, "ui_susp") end)
+
+    {:ok, view, _html} = conn |> auth() |> live("/admin/directory")
+
+    # Active tenant shows Suspend, not Resume.
+    assert has_element?(view, "#dir-suspend-ui_susp")
+    refute has_element?(view, "#dir-resume-ui_susp")
+
+    view |> element("#dir-suspend-ui_susp") |> render_click()
+    assert {:ok, %{status: "suspended"}} = Directory.get("ui_susp")
+    assert Fathom.Tenants.suspended?("ui_susp")
+    # Now it shows Resume instead.
+    assert has_element?(view, "#dir-resume-ui_susp")
+    refute has_element?(view, "#dir-suspend-ui_susp")
+
+    view |> element("#dir-resume-ui_susp") |> render_click()
+    assert {:ok, %{status: "active"}} = Directory.get("ui_susp")
+    refute Fathom.Tenants.suspended?("ui_susp")
+  end
+
   test "an invalid retain_until surfaces an error and does not persist", %{conn: conn} do
     put_shard(%{shard_id: "ui_badtime", status: "active"})
 

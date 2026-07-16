@@ -302,6 +302,16 @@ defmodule Fathom.ShardExecutor do
   defp open_error(:draining),
     do: %Error{message: "shard draining", code: "FILO_DRAINING", status: 503}
 
+  # A suspended tenant (#20): administratively disabled, not a transient fault — 403 so the
+  # client sees a distinct "forbidden" (a retry won't help; the operator must resume it).
+  defp open_error(:shard_suspended),
+    do: %Error{message: "tenant suspended", code: "FILO_TENANT_SUSPENDED", status: 403}
+
+  # A deleted tenant (#15): the shard is gone for good — 410 Gone, distinct from a 400/500, so
+  # the client can tell "this tenant no longer exists" from "bad request" / "server error".
+  defp open_error(:shard_tombstoned),
+    do: %Error{message: "tenant deleted", code: "FILO_TENANT_DELETED", status: 410}
+
   defp open_error(reason),
     do: %Error{message: "cannot open shard: #{inspect(reason)}", code: "FILO_SHARD_OPEN"}
 

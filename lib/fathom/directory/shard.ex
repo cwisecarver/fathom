@@ -12,13 +12,14 @@ defmodule Fathom.Directory.Shard do
   use Ecto.Schema
   import Ecto.Changeset
 
-  @statuses ~w(active migrating retired migration_failed deleted)
+  @statuses ~w(active migrating retired migration_failed deleted suspended)
 
   # Statuses an operator may hand-set from the admin directory edit (#22): the
-  # lifecycle values only. `deleted` is EXCLUDED — tenant deletion is a destructive
-  # orchestration (drain + purge every stored object + fleet-wide tombstone), never a
-  # hand-flip that would tombstone the row while leaving the data live and the other
-  # nodes' re-mint gate unset (#15). Deletion goes through the dedicated delete action.
+  # migration-lifecycle values only. `deleted` (#15) and `suspended` (#20) are EXCLUDED —
+  # they're destructive/administrative orchestrations (fleet-wide tombstone / admission gate
+  # + coordinator drain), never a hand-flip that would move the directory status while
+  # leaving the in-memory gate unset on this and every other node. They go through the
+  # dedicated delete / suspend / resume actions.
   @admin_editable_statuses ~w(active migrating retired migration_failed)
 
   @type t :: %__MODULE__{}

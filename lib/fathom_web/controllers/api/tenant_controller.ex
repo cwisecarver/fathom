@@ -76,6 +76,26 @@ defmodule FathomWeb.Api.TenantController do
     end
   end
 
+  # POST /api/tenants/:id/suspend
+  def suspend(conn, %{"id" => id}) do
+    lifecycle(conn, Tenants.suspend(id), id, "suspended")
+  end
+
+  # POST /api/tenants/:id/resume
+  def resume(conn, %{"id" => id}) do
+    lifecycle(conn, Tenants.resume(id), id, "active")
+  end
+
+  defp lifecycle(conn, result, id, new_status) do
+    case result do
+      :ok -> json(conn, %{shard_id: id, status: new_status})
+      {:error, :invalid_shard_id} -> error(conn, :bad_request, "invalid shard id")
+      {:error, :not_found} -> error(conn, :not_found, "no such tenant")
+      {:error, :deleted} -> error(conn, :conflict, "tenant is deleted")
+      {:error, reason} -> error(conn, :unprocessable_entity, "failed: #{inspect(reason)}")
+    end
+  end
+
   defp tenant_json(row) do
     %{
       shard_id: row.shard_id,
