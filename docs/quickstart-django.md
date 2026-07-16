@@ -57,6 +57,26 @@ An unchanged Django app now reads/writes its tenant's SQLite shard over the netw
 the migrations it serves into fleet versions (`Fathom.Migrator.list/0`) so the same schema can be
 rolled fleet-wide — the migration engine story is [`migration.md`](migration.md).
 
+## Schema rollout & the mixed window (`MIGRATE_ON_TOUCH`)
+
+When you ship a new migration, fathom captures it as a fleet version and rolls it onto tenants
+blue/green. Between the release and convergence, a **cold** tenant (idle, flushed to S3) is still at
+the old version until something migrates it. Django's expand-contract discipline makes serving the
+old schema *correct* in that window (the same discipline `docs/migration.md` enforces) — the
+question is only *when* each cold tenant converges, and who pays. Three modes (`MIGRATE_ON_TOUCH`):
+
+| Mode | First request to a cold laggard | Convergence | Cost |
+|---|---|---|---|
+| `off` (default) | served at vN-1, unblocked | the hourly reconcile cron | up to ~1h of stale-schema reads on untouched cold tenants |
+| `async` | served at vN-1, unblocked; the migration is **enqueued** | next job cycle after first touch | none inline — a background job per touched laggard |
+| `inline` | **blocks** on the full blue/green migration (drain + copy + replay + S3 round-trips) | immediate | multi-second first-request latency per cold laggard after a release |
+
+**Recommendation:** `async` is the middle ground — no multi-second inline tail *and* touched tenants
+converge promptly (the untouched cold tail still rides the reconcile cron). Use `inline` only if you
+cannot tolerate any old-schema read; `off` if your tenants are rarely cold and the hourly cron is
+fine. `async`/`inline` add a per-checkout directory read (the documented hot-path exception), so
+leave the default `off` unless you're rolling migrations.
+
 ## Multi-tenant routing (the pending piece)
 
 A SaaS serves many tenants from one Django deployment. fathom's model is **one shard per tenant,

@@ -54,6 +54,7 @@ config; diff from it.
 | `SHARD_FLUSH_INTERVAL_MS` | code default | Periodic durability-flush cadence. | Directly sets the RPO floor: a node lost between flushes loses up to this window of writes. |
 | `SHARD_IDLE_MS` | code default | Idle threshold before a shard flush+drop+stops. | Lower = more S3 churn; higher = more resident shards. |
 | `SHARD_MAX_PAGE_COUNT` | unset (unlimited) | Per-shard `PRAGMA max_page_count` cap (pages; size = pages × 4096B). | Enforces "limited dataset per shard": a write past it fails `SQLITE_FULL`, so one runaway tenant can't inflate flush/cold-open/standby cost fleet-wide. |
+| `MIGRATE_ON_TOUCH` | `off` | How a checkout handles a shard behind the fleet HEAD after a release: `off` (reconcile cron converges it), `async` (enqueue the migration on touch, serve vN-1 this request), `inline` (block on the full blue/green migration). | `off`/`async` serve the old schema briefly (safe under expand-contract); `inline` adds multi-second first-request latency. See `docs/quickstart-django.md`. |
 
 ## Auth (Hrana data path)
 

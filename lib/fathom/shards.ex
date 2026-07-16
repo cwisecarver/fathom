@@ -97,16 +97,57 @@ defmodule Fathom.Shards do
   defp checkout_outcome({:error, :novel_shard_rate_limited}), do: :novel_rate_limited
   defp checkout_outcome({:error, _}), do: :error
 
-  # Migrate-then-serve: once a fleet version is released, a shard behind HEAD can't
-  # serve the new app version's traffic, so migrate it inline before checking out.
-  # The deliberate hot-path/Postgres exception, off by default — enabled with the
-  # control plane (a directory-cache would remove the per-checkout reads).
+  # Migrate-on-touch: once a fleet version is released, a shard behind HEAD can serve the new
+  # app version's traffic only after it migrates. Three modes (expert review #40), the whole
+  # feature off by default — the deliberate hot-path/Postgres exception (a directory-cache would
+  # remove the per-checkout reads):
+  #
+  #   :off (default) — nothing on checkout; the hourly ReconcileJob converges the cold tail (a
+  #     stale-schema window up to the cron interval; expand-contract makes serving vN-1 correct).
+  #   :async — spot the laggard and ENQUEUE its ShardMigrationJob (deduped per shard), then serve
+  #     vN-1 THIS request. Converges the touched tenant within a job cycle with no inline blocking —
+  #     the middle ground.
+  #   :inline — block the checkout on the full blue/green migration (drain + copy + replay + S3
+  #     round-trips). Zero stale window, but multi-second first-request latency at real S3 latency.
+  #
+  # `:migrate_on_touch` selects the mode; the legacy boolean `:lazy_migrate, true` maps to :inline.
   defp maybe_lazy_migrate(shard_id) do
-    if Application.get_env(:fathom, :lazy_migrate, false) do
-      lazy_migrate(shard_id)
-    else
-      :ok
+    case migrate_on_touch_mode() do
+      :off -> :ok
+      :async -> enqueue_migrate_on_touch(shard_id)
+      :inline -> lazy_migrate(shard_id)
     end
+  end
+
+  defp migrate_on_touch_mode do
+    case Application.get_env(:fathom, :migrate_on_touch) do
+      mode when mode in [:off, :async, :inline] ->
+        mode
+
+      _ ->
+        # Backward compatibility: the pre-#40 `:lazy_migrate` boolean is the inline mode.
+        if Application.get_env(:fathom, :lazy_migrate, false), do: :inline, else: :off
+    end
+  end
+
+  # Enqueue-on-touch: hand the laggard to the async rollout and serve vN-1 now. Best-effort — a
+  # control-plane blip must never fail the checkout (the whole point of not blocking inline). The
+  # job's `unique: [keys: [:shard_id]]` dedups, so repeated touches of the same laggard don't pile
+  # up jobs.
+  defp enqueue_migrate_on_touch(shard_id) do
+    head = Fathom.Migrator.HeadCache.get()
+
+    if head > 0 and behind?(shard_id, head) do
+      %{shard_id: shard_id, target: head}
+      |> Fathom.Migrator.ShardMigrationJob.new()
+      |> Oban.insert()
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
   end
 
   defp lazy_migrate(shard_id) do

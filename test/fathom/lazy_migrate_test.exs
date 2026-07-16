@@ -2,8 +2,10 @@ defmodule Fathom.LazyMigrateTest do
   # Migrate-then-serve on checkout: a behind-HEAD shard is migrated inline before
   # it serves. Real shard machinery + storage + directory; not async.
   use Fathom.DataCase, async: false
+  use Oban.Testing, repo: Fathom.Repo
 
   alias Fathom.{Directory, Migrator, ShardExecutor}
+  alias Fathom.Migrator.ShardMigrationJob
   alias Fathom.Shard.{Connection, Storage}
   alias Filo.{Stmt, StmtResult}
 
@@ -17,11 +19,16 @@ defmodule Fathom.LazyMigrateTest do
   setup do
     shard = "lazy_#{System.unique_integer([:positive])}"
     prev = Application.get_env(:fathom, :lazy_migrate)
+    prev_mode = Application.get_env(:fathom, :migrate_on_touch)
 
     on_exit(fn ->
       if prev == nil,
         do: Application.delete_env(:fathom, :lazy_migrate),
         else: Application.put_env(:fathom, :lazy_migrate, prev)
+
+      if prev_mode == nil,
+        do: Application.delete_env(:fathom, :migrate_on_touch),
+        else: Application.put_env(:fathom, :migrate_on_touch, prev_mode)
 
       for path <- Path.wildcard(Path.join(@remote_dir, "#{shard}*")), do: File.rm(path)
 
@@ -122,6 +129,40 @@ defmodule Fathom.LazyMigrateTest do
     # No new column — the shard is still v1.
     assert {:ok, %StmtResult{cols: ["id", "name"]}} = exec(conn, "SELECT * FROM app_thing")
 
+    ShardExecutor.close(conn)
+  end
+
+  # Expert review #40: the enqueue-on-touch (:async) middle mode — spot the laggard on checkout,
+  # ENQUEUE its migration (deduped), and serve vN-1 THIS request (expand-contract makes that safe),
+  # instead of either the up-to-an-hour stale window (:off) or the multi-second inline block
+  # (:inline). The first request is not blocked; the tenant converges on the next job cycle.
+  test "migrate_on_touch: :async enqueues the migration and serves vN-1 this request",
+       %{shard: shard} do
+    Application.put_env(:fathom, :migrate_on_touch, :async)
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    Migrator.HeadCache.refresh()
+
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    # Served as-is (v1) — the checkout did NOT block on the migration.
+    assert {:ok, %{schema_version: 1}} = Directory.get(shard)
+    assert {:ok, %StmtResult{cols: ["id", "name"]}} = exec(conn, "SELECT * FROM app_thing")
+
+    # But the migration to HEAD was enqueued for the async rollout to converge it.
+    assert_enqueued(worker: ShardMigrationJob, args: %{shard_id: shard, target: 2})
+
+    ShardExecutor.close(conn)
+  end
+
+  test "migrate_on_touch: :async does not enqueue for a shard already at HEAD", %{shard: shard} do
+    Application.put_env(:fathom, :migrate_on_touch, :async)
+    seed_v1!(shard)
+    # No release beyond v1 → HEAD is (at most) 1, the shard is not behind.
+    Migrator.HeadCache.refresh()
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    refute_enqueued(worker: ShardMigrationJob, args: %{shard_id: shard})
     ShardExecutor.close(conn)
   end
 end

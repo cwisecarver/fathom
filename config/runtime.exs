@@ -105,6 +105,29 @@ if System.get_env("SHARD_LOAD") in ~w(true 1) do
   config :fathom, :shard_load, true
 end
 
+# Migrate-on-touch mode (expert review #40): how a checkout handles a shard behind the fleet HEAD
+# after a release. `off` (default) — the hourly reconcile converges the cold tail (stale-schema
+# window up to the cron; expand-contract makes serving vN-1 correct). `async` — enqueue the shard's
+# migration on touch and serve vN-1 this request (converges next job cycle, no inline block).
+# `inline` — block the checkout on the full blue/green migration (no stale window, multi-second
+# first-request latency). See docs/quickstart-django.md.
+case System.get_env("MIGRATE_ON_TOUCH") do
+  nil ->
+    :ok
+
+  "off" ->
+    config :fathom, :migrate_on_touch, :off
+
+  "async" ->
+    config :fathom, :migrate_on_touch, :async
+
+  "inline" ->
+    config :fathom, :migrate_on_touch, :inline
+
+  other ->
+    raise "MIGRATE_ON_TOUCH must be \"off\", \"async\", or \"inline\", got: #{inspect(other)}"
+end
+
 # --- Phase-2 B1 dynamic rebalancing (all off by default) ---------------------------
 # A stable per-node key the LB addresses this node as (the exception table / backend set
 # reference it). Default node(); set per node in a fleet (e.g. NODE_KEY=fathom1).
