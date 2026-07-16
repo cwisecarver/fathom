@@ -105,6 +105,43 @@ copy never lingers. It's served through the operator boundary, never a public pr
 presigned-GET path for very large shards is a possible follow-up). The `:id` is validated by
 `ShardId.cast`, so a path-traversal id is a 400, not a file read.
 
+## Provision (the control-plane API)
+
+Tenants used to exist only as a side effect of traffic — novel-shard admission mints one on the
+first request for a subdomain. That's a fine data-path fallback but not a product surface. `#21`
+adds an explicit control plane so a platform customer can create/list/delete tenants and get a
+connection URL + token.
+
+`Fathom.Tenants.provision/1`:
+
+```
+provision(id):
+  cast + refuse if tombstoned (:tombstoned) or already-exists (:already_exists)
+  Directory.resolve(id)              # explicit row, status "active"
+  maybe fork-from-template @HEAD     # when :fork_from_template is on (#10); else born empty
+  mint a bearer token
+  -> %{shard_id, url: "libsql://<id>.<base>", auth_token, auth_required}
+```
+
+`auth_required` reflects `:hrana_auth`: with auth on, the client must present `auth_token`; with it
+off the token is informational (the trust boundary is the network). `<base>` is `:shard_base_domain`
+(prod) or `local` (dev), matching how the Host-subdomain router resolves a shard.
+
+The JSON API (`FathomWeb.Api.TenantController`, `/api`, behind the same admin BasicAuth, on the
+`:4000` endpoint — separate from the Hrana data port):
+
+| Method | Path | Body / result |
+|--------|------|---------------|
+| `POST` | `/api/tenants` | `{"shard_id":"acme"}` → 201 `{shard_id, url, auth_token, auth_required}` · 409 exists/tombstoned · 400 invalid |
+| `GET` | `/api/tenants` | `?status=&q=&limit=&offset=` → 200 `{tenants:[…], total, limit, offset}` (reuses `Directory.list_page`) |
+| `GET` | `/api/tenants/:id` | 200 tenant · 404 |
+| `DELETE` | `/api/tenants/:id` | 202 `{status:"deleting"}` (reuses `Tenants.delete/1`) · 400 |
+
+Optionally, with the provisioning API as the front door, an operator can flip prod novel admission
+to *known-tenants-only* by turning on `:novel_shard_rate` (the enforcement point already exists) so
+an unprovisioned subdomain is rate-limited/refused rather than minted. That's a config choice, not
+part of the API.
+
 ## Operator runbook
 
 **Delete a tenant.** In the admin dashboard, **Directory** (`/admin/directory`), find the row and
@@ -123,9 +160,15 @@ from a release remote console.
 **Export a tenant.** In **Directory**, click **Export** on the row (downloads `<id>.db`), or
 `Fathom.Tenants.export/1` for a temp-file path. Open the file with any SQLite client.
 
+**Provision a tenant.** `POST /api/tenants` with `{"shard_id":"acme"}` (BasicAuth) returns the
+connection URL + token, or `Fathom.Tenants.provision("acme")` from a remote console. `GET
+/api/tenants` lists the fleet; `DELETE /api/tenants/:id` is the API form of a delete.
+
 ## Where it lives
 
-- `lib/fathom/tenants.ex` — `delete/1`, `purge/1`, `export/1`, `tombstoned?/1`, `broadcast_deleted/1`.
+- `lib/fathom/tenants.ex` — `delete/1`, `purge/1`, `export/1`, `provision/1`, `tombstoned?/1`,
+  `broadcast_deleted/1`.
+- `lib/fathom_web/controllers/api/tenant_controller.ex` — the `/api/tenants` JSON control-plane.
 - `lib/fathom/tenants/tombstones.ex` — the ETS re-mint gate + notifier listener + warm-cache purge.
 - `lib/fathom/tenants/delete_job.ex` — the Oban worker (queue `:tenants`, unique per shard).
 - `lib/fathom/shard/storage.ex` (+ `local.ex` / `s3.ex`) — `purge_shard/1`.
