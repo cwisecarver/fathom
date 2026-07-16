@@ -51,6 +51,17 @@ defmodule FathomWeb.Router do
     get "/metrics", MetricsController, :index
   end
 
+  # Tenant provisioning control-plane (#21): JSON create/list/get/delete, behind the same admin
+  # BasicAuth. On :4000, separate from the Hrana data port.
+  scope "/api", FathomWeb.Api do
+    pipe_through [:api, :admin_auth]
+
+    post "/tenants", TenantController, :create
+    get "/tenants", TenantController, :index
+    get "/tenants/:id", TenantController, :show
+    delete "/tenants/:id", TenantController, :delete
+  end
+
   # BasicAuth gate for /admin. Order-independent read of the `:admin_auth` keyword; challenges
   # (401) on a bad credential via Plug.BasicAuth, and fails closed (503) when unconfigured.
   defp require_admin_auth(conn, _opts) do

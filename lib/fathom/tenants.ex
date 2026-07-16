@@ -28,7 +28,7 @@ defmodule Fathom.Tenants do
 
   import Ecto.Query, only: [from: 2]
 
-  alias Fathom.{Directory, Shards}
+  alias Fathom.{Directory, HranaAuth, Shards}
   alias Fathom.Shard.Storage
   alias Fathom.ShardId
   alias Fathom.Tenants.{DeleteJob, Tombstones}
@@ -56,6 +56,35 @@ defmodule Fathom.Tenants do
       broadcast_deleted(id)
       enqueue_delete(id)
       {:ok, :scheduled}
+    end
+  end
+
+  @doc """
+  Provisions a tenant explicitly (control-plane #21) instead of waiting for traffic to mint it
+  on first request. Registers the directory row (`active`), forks its schema from the template at
+  HEAD when `:fork_from_template` is enabled (otherwise it's born empty on first connect, today's
+  behavior), and mints a bearer token. Returns
+  `%{shard_id, url, auth_token, auth_required}` — `url` is the `libsql://<id>.<base>` endpoint a
+  Django/libSQL client points at, `auth_required` reflects whether `:hrana_auth` is on (with it
+  off the token is informational — the trust boundary is the network).
+
+  Refuses `{:error, :already_exists}` (a live row), `{:error, :tombstoned}` (a deleted id — the
+  resurrection guard), or `{:error, :invalid_shard_id}`.
+  """
+  @spec provision(String.t()) :: {:ok, map()} | {:error, term()}
+  def provision(shard_id) do
+    with {:ok, id} <- cast(shard_id),
+         :ok <- refuse_if_taken(id),
+         {:ok, _row} <- Directory.resolve(id) do
+      maybe_fork(id)
+
+      {:ok,
+       %{
+         shard_id: id,
+         url: tenant_url(id),
+         auth_token: mint_token(id),
+         auth_required: auth_required?()
+       }}
     end
   end
 
@@ -157,6 +186,54 @@ defmodule Fathom.Tenants do
       :error -> {:error, :invalid_shard_id}
     end
   end
+
+  defp refuse_if_taken(id) do
+    cond do
+      tombstoned?(id) ->
+        {:error, :tombstoned}
+
+      true ->
+        case Directory.get(id) do
+          {:ok, %{status: "deleted"}} -> {:error, :tombstoned}
+          {:ok, _row} -> {:error, :already_exists}
+          :error -> :ok
+        end
+    end
+  end
+
+  # Fork the new tenant's schema from the template at HEAD when the fork path is enabled (#10);
+  # otherwise it's born empty on first connect (today's default). Best-effort — a provision is
+  # never failed for a fork miss (the shard just cold-opens empty).
+  defp maybe_fork(id) do
+    if Application.get_env(:fathom, :fork_from_template, false),
+      do: _ = Fathom.Migrator.fork_from_template(id)
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  defp mint_token(id) do
+    case HranaAuth.token_for(id) do
+      {:ok, token} -> token
+      _ -> nil
+    end
+  end
+
+  defp tenant_url(id), do: "libsql://#{id}.#{base_domain()}"
+
+  defp base_domain do
+    case Application.get_env(:fathom, :shard_base_domain) do
+      d when is_binary(d) and d != "" -> d
+      _ -> "local"
+    end
+  end
+
+  # `:disabled` is the only "no token needed" mode; unknown values fail closed to required, matching
+  # HranaAuth's own normalization.
+  defp auth_required?, do: Application.get_env(:fathom, :hrana_auth, :disabled) != :disabled
 
   defp enqueue_delete(id) do
     %{shard_id: id}

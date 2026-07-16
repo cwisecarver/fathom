@@ -126,6 +126,33 @@ defmodule Fathom.TenantsTest do
     end
   end
 
+  describe "provision/1" do
+    test "registers the tenant active and returns a libsql url + token", %{id: id} do
+      assert {:ok, tenant} = Tenants.provision(id)
+
+      assert tenant.shard_id == id
+      assert tenant.url == "libsql://#{id}.local"
+      assert is_binary(tenant.auth_token)
+      # test config has :hrana_auth disabled — the token is informational there.
+      assert tenant.auth_required == false
+      assert {:ok, %{status: "active"}} = Directory.get(id)
+    end
+
+    test "refuses a tenant that already exists", %{id: id} do
+      {:ok, _} = Directory.resolve(id)
+      assert {:error, :already_exists} = Tenants.provision(id)
+    end
+
+    test "refuses a tombstoned (deleted) id — no resurrection via provisioning", %{id: id} do
+      {:ok, _} = Directory.tombstone(id)
+      assert {:error, :tombstoned} = Tenants.provision(id)
+    end
+
+    test "refuses an invalid id" do
+      assert {:error, :invalid_shard_id} = Tenants.provision("Not Valid!")
+    end
+  end
+
   test "the DeleteJob worker runs purge end to end", %{id: id} do
     write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
     flush!(id)
