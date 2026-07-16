@@ -91,7 +91,9 @@ defmodule Fathom.Migrator.Capture do
           count > before and buffer != [] ->
             statements = Enum.reverse(buffer)
 
-            case record(statements) do
+            # `count` is the template's post-commit django_migrations count — recorded on the
+            # release so the post-revert drift check (#32) can compare the template against HEAD.
+            case record(statements, count) do
               {:recorded, _} = recorded ->
                 {:reply, recorded, state}
 
@@ -102,7 +104,7 @@ defmodule Fathom.Migrator.Capture do
                 # fleet schema (every subsequent captured version assumes DDL the fleet
                 # never received, so all future replays fail or half-apply). Keep the
                 # statements and retry until the control plane recovers.
-                {:reply, error, stash_pending(state, statements)}
+                {:reply, error, stash_pending(state, statements, count)}
             end
 
           # django_migrations SHRANK: a backwards Django migrate (`manage.py migrate <app> <prev>`)
@@ -140,15 +142,17 @@ defmodule Fathom.Migrator.Capture do
   # would assign the fleet versions out of order.
   defp drain_pending([]), do: []
 
-  defp drain_pending([statements | rest] = all) do
-    case record(statements) do
+  defp drain_pending([{statements, count} | rest] = all) do
+    case record(statements, count) do
       {:recorded, _} -> drain_pending(rest)
       {:error, _} -> all
     end
   end
 
-  defp stash_pending(state, statements) do
-    schedule_retry(Map.update(state, :pending, [statements], &(&1 ++ [statements])))
+  defp stash_pending(state, statements, count) do
+    schedule_retry(
+      Map.update(state, :pending, [{statements, count}], &(&1 ++ [{statements, count}]))
+    )
   end
 
   defp schedule_retry(state) do
@@ -227,10 +231,10 @@ defmodule Fathom.Migrator.Capture do
   # Postgres outage RAISES from Repo (it doesn't return an error tuple), and a
   # crash here would take the whole capture state — including every pending
   # buffer this path exists to preserve — down with it.
-  defp record(statements) do
+  defp record(statements, template_migration_count) do
     version = Migrator.next_version()
 
-    case Migrator.release(version, "auto-captured", statements) do
+    case Migrator.release(version, "auto-captured", statements, template_migration_count) do
       {:ok, _} ->
         alarm_on_data_migration(version, statements)
         {:recorded, version}

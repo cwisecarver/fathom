@@ -92,6 +92,34 @@ those post-cutover writes, so the job **cancels deterministically** unless `forc
 you are throwing them away. A revert must be a pointer flip *within the retention window* — past
 `retain_until` the old version is gone and there's nothing to flip back to.
 
+### Reverting a bad Django migration — the full loop (the template gotcha)
+
+The fathom-side pointer flip is only half the story (expert review #32). A fleet revert yanks vN and
+flips tenants back to vN-1, but the **template** shard still has vN applied — in its schema *and* its
+`django_migrations` table. Django's migration graph is **linear**: the next `makemigrations` builds
+on vN, so the next captured version emits DDL that assumes schema the fleet reverted away from, and
+its fleet-wide replay fails (the #6 fork). So a revert isn't done until the template is walked back
+too:
+
+1. **Yank + fleet revert** (fathom side): `Fathom.Migrator.revert(vN, vN-1)` (or the `RevertJob`)
+   yanks vN, backs up the live vN, and flips active tenants to vN-1 (within the retention window,
+   write-age guard as above). HEAD is now vN-1.
+2. **Backwards-migrate the template** (Django side): `manage.py migrate <app> <prev>` against the
+   template shard, walking its `django_migrations` back to vN-1. Capture **ignores** a backwards
+   migrate for the fleet (it only alarms — fleet undo is the fathom revert above), so this is
+   harmless post-yank and is exactly the step that realigns the template with HEAD.
+3. **Author the fixed migration**: `makemigrations` now builds on vN-1 (the aligned template), so the
+   corrected migration and its captured version assume the schema the fleet actually has.
+4. **Re-release** it forward as vN+1 through the normal rollout.
+
+**The consistency check.** `Fathom.Migrator.template_drift/0` catches a skipped step 2: it compares
+the template's captured `django_migrations` count (recorded per release) against HEAD's, and reports
+`{:drift, _}` when a yanked version above HEAD was captured with a higher count — i.e. the template
+is left ahead of the live fleet. `yank/1` runs it automatically and, on drift, emits
+`[:fathom, :migrator, :template_drift]` telemetry + a loud `Logger.error` naming the step-2 fix, so a
+wedged pipeline is an alert, not a surprise at the next `makemigrations`. (Releases captured before
+this feature carry no count and report `:unknown` rather than false-alarming.)
+
 ## The gate (a migration isn't done without these)
 
 1. **Forward** — seed a vN-1 shard, run the copy+transform, validate vN by row counts / checksums.

@@ -214,6 +214,64 @@ defmodule Fathom.Migrator.RolloutTest do
     end
   end
 
+  # Expert review #32: after a fleet revert (yank vN, HEAD → vN-1) the TEMPLATE still has vN's
+  # Django migration applied, so the next makemigrations builds on schema the fleet reverted away
+  # from → fleet-wide replay failure. The check compares the template's captured django_migrations
+  # count (recorded per release) against HEAD's, and yank/1 alarms when the template is left ahead.
+  describe "template_drift/0" do
+    test "reports :aligned when no yanked version is above HEAD" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"], 10)
+      {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"], 11)
+
+      assert Migrator.head() == 2
+      assert Migrator.template_drift() == :aligned
+    end
+
+    test "a yank leaves the template ahead: drift result + telemetry + escalating log" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"], 10)
+      {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"], 11)
+
+      test_pid = self()
+      handler = "drift-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:fathom, :migrator, :template_drift],
+        fn _e, meas, meta, _cfg -> send(test_pid, {:drift, meas, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      # yank/1 runs check_template_drift/0, which alarms because the template (still at v2, count 11)
+      # is ahead of the reverted-to HEAD v1 (count 10).
+      log = ExUnit.CaptureLog.capture_log(fn -> assert :ok = Migrator.yank(2) end)
+
+      assert log =~ "template migration drift after revert"
+      assert_received {:drift, %{count: 1}, %{template_version: 2, head_version: 1}}
+
+      assert Migrator.head() == 1
+
+      assert {:drift,
+              %{
+                template_version: 2,
+                template_migration_count: 11,
+                head_version: 1,
+                head_migration_count: 10
+              }} = Migrator.template_drift()
+    end
+
+    test "reports :unknown when the relevant releases predate template_migration_count (nil)" do
+      # Hand-authored / pre-feature releases carry no count — the check can't decide, so it must
+      # not false-alarm.
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
+      {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
+      assert :ok = Migrator.yank(2)
+
+      assert Migrator.template_drift() == :unknown
+    end
+  end
+
   # Expert review #25: migration_failed was a terminal state with no exit path —
   # quarantined shards were excluded from laggards and every sweep forever, so a wave
   # of transient failures froze a slice of the fleet at the old version even after the

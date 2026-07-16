@@ -18,6 +18,11 @@ defmodule Fathom.Migrator.Release do
     # Expert review #12: a yanked release is dead — excluded from HEAD, its statements
     # never applied again. Set by Migrator.yank/1 (a revert yanks by default).
     field :yanked, :boolean, default: false
+    # Expert review #32: the template's django_migrations count when this version was captured
+    # (Capture already computes it on commit). Lets the post-revert drift check tell whether the
+    # template's linear graph was left ahead of the yanked-away fleet, without opening the template
+    # or parsing SQL. Nullable — pre-feature releases have none, and the check skips them.
+    field :template_migration_count, :integer
 
     timestamps(type: :utc_datetime_usec, updated_at: false)
   end
@@ -25,7 +30,7 @@ defmodule Fathom.Migrator.Release do
   @doc false
   def changeset(release, attrs) do
     release
-    |> cast(attrs, [:version, :name, :statements])
+    |> cast(attrs, [:version, :name, :statements, :template_migration_count])
     |> validate_required([:version, :name])
     |> validate_number(:version, greater_than: 0)
     |> unique_constraint(:version)

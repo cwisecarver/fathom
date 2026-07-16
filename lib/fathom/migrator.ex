@@ -13,6 +13,7 @@ defmodule Fathom.Migrator do
   versioned shard storage and draining the live `Fathom.Shard` coordinator).
   """
   import Ecto.Query
+  require Logger
 
   alias Fathom.Directory
   alias Fathom.Migrator.{Release, RevertJob, ShardMigrationJob}
@@ -26,13 +27,20 @@ defmodule Fathom.Migrator do
 
   @doc """
   Records a released shard-schema `version` (HEAD becomes its max), carrying the
-  captured SQL `statements` the rollout replays per shard.
+  captured SQL `statements` the rollout replays per shard. `template_migration_count`
+  (expert review #32) is the template's django_migrations count at capture time, used by
+  `template_drift/0`; `nil` when unknown (a hand-authored release).
   """
-  @spec release(pos_integer(), String.t(), [String.t()]) ::
+  @spec release(pos_integer(), String.t(), [String.t()], non_neg_integer() | nil) ::
           {:ok, Release.t()} | {:error, Ecto.Changeset.t()}
-  def release(version, name, statements \\ []) do
+  def release(version, name, statements \\ [], template_migration_count \\ nil) do
     %Release{}
-    |> Release.changeset(%{version: version, name: name, statements: statements})
+    |> Release.changeset(%{
+      version: version,
+      name: name,
+      statements: statements,
+      template_migration_count: template_migration_count
+    })
     |> Repo.insert()
   end
 
@@ -107,6 +115,10 @@ defmodule Fathom.Migrator do
         )
 
         refresh_head_cache()
+
+        # Expert review #32: a yank leaves the template ahead of the fleet (it still has the yanked
+        # migration applied) — warn the operator to backwards-migrate it before the next release.
+        check_template_drift()
         :ok
     end
   end
@@ -152,6 +164,88 @@ defmodule Fathom.Migrator do
   @doc "All released versions, oldest first."
   @spec list() :: [Release.t()]
   def list, do: Repo.all(from r in Release, order_by: [asc: r.version])
+
+  @doc """
+  Post-revert template drift check (expert review #32). After a fleet revert yanks version vN and
+  flips HEAD to vN-1, the **template** shard still has vN's Django migration applied in its
+  `django_migrations` and its schema — Django's migration graph is linear, so the next
+  `makemigrations` builds on vN, and the next captured version assumes schema the fleet reverted
+  away from → fleet-wide replay failure. The operator must backwards-migrate the template first
+  (see `docs/migration.md`).
+
+  Detected from stored counts alone (no template I/O, no SQL parsing): the highest **yanked** release
+  above HEAD is where a fresh revert leaves the template, so if that version's captured template
+  `django_migrations` count exceeds HEAD's, the template is ahead of the live fleet. Returns
+  `:aligned`, `{:drift, details}`, or `:unknown` (the relevant releases predate
+  `template_migration_count`).
+  """
+  @spec template_drift() :: :aligned | :unknown | {:drift, map()}
+  def template_drift do
+    case head() do
+      0 ->
+        :aligned
+
+      head_version ->
+        head_release = Repo.get_by(Release, version: head_version)
+
+        yanked_above =
+          Repo.one(
+            from(r in Release,
+              where: r.yanked and r.version > ^head_version,
+              order_by: [desc: r.version],
+              limit: 1
+            )
+          )
+
+        cond do
+          is_nil(yanked_above) ->
+            :aligned
+
+          is_nil(head_release) or is_nil(head_release.template_migration_count) or
+              is_nil(yanked_above.template_migration_count) ->
+            :unknown
+
+          yanked_above.template_migration_count > head_release.template_migration_count ->
+            {:drift,
+             %{
+               template_version: yanked_above.version,
+               template_migration_count: yanked_above.template_migration_count,
+               head_version: head_version,
+               head_migration_count: head_release.template_migration_count
+             }}
+
+          true ->
+            :aligned
+        end
+    end
+  end
+
+  @doc """
+  Runs `template_drift/0` and, on `{:drift, _}`, emits `[:fathom, :migrator, :template_drift]`
+  telemetry + a loud `Logger.error` so a post-revert wedge is alertable, not discovered at the next
+  fleet-wide `makemigrations`. Called once from `yank/1` (the revert moment); also safe to run
+  manually. Returns the drift result.
+  """
+  @spec check_template_drift() :: :aligned | :unknown | {:drift, map()}
+  def check_template_drift do
+    case template_drift() do
+      {:drift, d} = drift ->
+        :telemetry.execute([:fathom, :migrator, :template_drift], %{count: 1}, d)
+
+        Logger.error(
+          "template migration drift after revert: the template still has v#{d.template_version} " <>
+            "applied (django_migrations count #{d.template_migration_count}) but fleet HEAD is " <>
+            "v#{d.head_version} (count #{d.head_migration_count}). Backwards-migrate the template " <>
+            "(`manage.py migrate <app> <prev>`) before the next makemigrations, or the next captured " <>
+            "version assumes reverted-away schema and fails fleet-wide. See docs/migration.md."
+        )
+
+        drift
+
+      other ->
+        other
+    end
+  end
 
   # --- fork-from-template (finding #10): new-tenant bootstrap at HEAD ---
 
