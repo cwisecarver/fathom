@@ -217,6 +217,23 @@ defmodule Fathom.Migrator do
   def list, do: Repo.all(from r in Release, order_by: [asc: r.version])
 
   @doc """
+  The template's `django_migrations` count recorded by the most recently captured version, or `nil`
+  if nothing is captured yet or the latest release predates the count (expert review #6). This is
+  the DURABLE baseline the non-atomic-gap check compares a new capture's pre-transaction count
+  against — no in-memory Capture state (the shared-singleton false-alarm the earlier attempt hit).
+  """
+  @spec last_template_count() :: non_neg_integer() | nil
+  def last_template_count do
+    Repo.one(
+      from(r in Release,
+        order_by: [desc: r.version],
+        limit: 1,
+        select: r.template_migration_count
+      )
+    )
+  end
+
+  @doc """
   Post-revert template drift check (expert review #32). After a fleet revert yanks version vN and
   flips HEAD to vN-1, the **template** shard still has vN's Django migration applied in its
   `django_migrations` and its schema — Django's migration graph is linear, so the next

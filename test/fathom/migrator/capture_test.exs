@@ -107,6 +107,50 @@ defmodule Fathom.Migrator.CaptureTest do
       refute log =~ "DATA-MIGRATION"
     end
 
+    # Expert review #6: a non-atomic (`atomic = False`) migration runs autocommit — no tracked
+    # BEGIN/COMMIT — so capture never sees it, the template schema moves, and the fleet never hears.
+    # Caught at the NEXT capture: its pre-transaction count exceeds the last captured count (the gap).
+    # Detected from DURABLE per-release counts (the shared-singleton false-alarm the earlier attempt
+    # hit is gone). The gap version is flagged requires_review so the rollout freezes below it.
+    test "a non-atomic-migration gap (pre-count exceeds the last captured count) is flagged" do
+      import ExUnit.CaptureLog
+
+      # First capture: the template goes 14 → 15, recorded as v1 (count 15), pure DDL.
+      c1 = make_ref()
+      Capture.begin(c1, 14)
+      Capture.append(c1, "CREATE TABLE t1 (id INTEGER PRIMARY KEY)")
+      Capture.append(c1, "INSERT INTO django_migrations (app, name) VALUES ('app', '0001')")
+      assert {:recorded, 1} = Capture.commit(c1, 15)
+
+      # An `atomic = False` migration ran on the template OUTSIDE a tracked transaction (count is
+      # now 16, uncaptured). The NEXT captured migration begins at 16 (> the last captured 15).
+      c2 = make_ref()
+      Capture.begin(c2, 16)
+      Capture.append(c2, "CREATE TABLE t2 (id INTEGER PRIMARY KEY)")
+      Capture.append(c2, "INSERT INTO django_migrations (app, name) VALUES ('app', '0003')")
+
+      test_pid = self()
+      handler = "gap-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:fathom, :migrator, :migration_gap],
+        fn _e, meas, meta, _cfg -> send(test_pid, {:gap, meas, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      {result, log} = with_log(fn -> Capture.commit(c2, 17) end)
+      assert {:recorded, version} = result
+      assert log =~ "OUTSIDE capture"
+      assert_received {:gap, %{gap: 1}, %{version: ^version}}
+
+      # Flagged requires_review → HEAD frozen at the last SAFE version (v1) until reviewed.
+      assert version in Enum.map(Migrator.pending_review(), & &1.version)
+      assert Migrator.head() == 1
+    end
+
     # Expert review 2026-07-14 #6: a backwards migrate deletes a django_migrations row (count falls),
     # which the count-rose boundary silently treated as :noop — the template schema moved and the
     # fleet never heard. It must alarm now. Fresh Capture instance so the :baseline is isolated.

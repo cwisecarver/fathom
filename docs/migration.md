@@ -58,6 +58,24 @@ clears the flag after the operator confirms it's safe (or supplies a real per-sh
 hook), and HEAD then advances. A flagged version blocks everything above it too (the linear graph
 has no skip).
 
+### Uncaptured template moves are detected (backwards + non-atomic)
+
+Capture's boundary detection is "the template's `django_migrations` count rose inside a tracked
+transaction." Two ordinary Django operations move the template *outside* that (expert review #6), and
+both are now caught instead of silently forking the fleet:
+
+- **Backwards migrate** (`manage.py migrate <app> <prev>`) deletes a `django_migrations` row — the
+  count *falls*. Capture alarms (`[:fathom, :migrator, :backwards_migrate]`) rather than treating it
+  as a no-op. **Fleet undo is a fathom revert, never a Django backwards migrate** — reconcile before
+  the next capture.
+- **Non-atomic migration** (`atomic = False`, Django's escape hatch for big-table ops) runs
+  autocommit, so capture never sees it. It's caught at the **next** capture: that transaction's
+  pre-count exceeds the last captured count (the *gap*), so capture alarms
+  (`[:fathom, :migrator, :migration_gap]`) **and flags the new version `requires_review`**, freezing
+  the rollout below it until an operator reconciles template↔fleet. The gap is measured against the
+  durable per-release count (not in-memory state), so it doesn't false-alarm across independent
+  capture sequences.
+
 ## Oban jobs drive it, and the cold tail converges on its own
 
 - **`ShardMigrationJob`** (unique per shard) migrates one shard.

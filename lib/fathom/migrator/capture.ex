@@ -91,9 +91,11 @@ defmodule Fathom.Migrator.Capture do
           count > before and buffer != [] ->
             statements = Enum.reverse(buffer)
 
-            # `count` is the template's post-commit django_migrations count — recorded on the
-            # release so the post-revert drift check (#32) can compare the template against HEAD.
-            case record(statements, count) do
+            # `count`/`before` are the template's post-commit and pre-transaction django_migrations
+            # counts — recorded so the post-revert drift check (#32) can compare the template against
+            # HEAD, and so record/3 can detect a non-atomic-migration GAP (#6): `before` should equal
+            # the last captured count; if it's higher, migrations ran OUTSIDE a tracked transaction.
+            case record(statements, count, before) do
               {:recorded, _} = recorded ->
                 {:reply, recorded, state}
 
@@ -104,7 +106,7 @@ defmodule Fathom.Migrator.Capture do
                 # fleet schema (every subsequent captured version assumes DDL the fleet
                 # never received, so all future replays fail or half-apply). Keep the
                 # statements and retry until the control plane recovers.
-                {:reply, error, stash_pending(state, statements, count)}
+                {:reply, error, stash_pending(state, statements, count, before)}
             end
 
           # django_migrations SHRANK: a backwards Django migrate (`manage.py migrate <app> <prev>`)
@@ -142,17 +144,16 @@ defmodule Fathom.Migrator.Capture do
   # would assign the fleet versions out of order.
   defp drain_pending([]), do: []
 
-  defp drain_pending([{statements, count} | rest] = all) do
-    case record(statements, count) do
+  defp drain_pending([{statements, count, before} | rest] = all) do
+    case record(statements, count, before) do
       {:recorded, _} -> drain_pending(rest)
       {:error, _} -> all
     end
   end
 
-  defp stash_pending(state, statements, count) do
-    schedule_retry(
-      Map.update(state, :pending, [{statements, count}], &(&1 ++ [{statements, count}]))
-    )
+  defp stash_pending(state, statements, count, before) do
+    entry = {statements, count, before}
+    schedule_retry(Map.update(state, :pending, [entry], &(&1 ++ [entry])))
   end
 
   defp schedule_retry(state) do
@@ -209,6 +210,34 @@ defmodule Fathom.Migrator.Capture do
     )
   end
 
+  # Expert review #6: a gap exists when this transaction's pre-count `before` exceeds the last
+  # captured template count — uncaptured migrations (a non-atomic `atomic = False` one runs
+  # autocommit, invisible to capture) landed in between. `nil` when nothing captured yet or the last
+  # release predates the recorded count (the documented Django-baseline offset / pre-feature rows).
+  defp migration_gap(before) do
+    case Migrator.last_template_count() do
+      last when is_integer(last) and before > last -> %{before: before, last: last}
+      _ -> nil
+    end
+  end
+
+  defp alarm_gap(version, %{before: before, last: last}) do
+    Logger.error(
+      "captured version #{version} began with django_migrations count #{before}, but the last " <>
+        "captured count was #{last} — #{before - last} migration(s) landed on the template OUTSIDE " <>
+        "capture (a non-atomic `atomic = False` migration runs autocommit and is invisible). The " <>
+        "fleet never received them, so this version and everything above it assume DDL the fleet " <>
+        "lacks. Flagged requires_review (rollout frozen below it); reconcile template↔fleet before " <>
+        "approving. Fleet undo is a fathom revert, never a Django backwards migrate."
+    )
+
+    :telemetry.execute(
+      [:fathom, :migrator, :migration_gap],
+      %{count: 1, gap: before - last},
+      %{version: version}
+    )
+  end
+
   @dml_leads ~w(insert update delete replace)
 
   # A statement is a (template-literal) data migration if it's DML and doesn't touch
@@ -231,22 +260,27 @@ defmodule Fathom.Migrator.Capture do
   # Postgres outage RAISES from Repo (it doesn't return an error tuple), and a
   # crash here would take the whole capture state — including every pending
   # buffer this path exists to preserve — down with it.
-  defp record(statements, template_migration_count) do
+  defp record(statements, count, before) do
     version = Migrator.next_version()
-    # Expert review #1: flag a captured version that carries template-literal DATA migrations so
-    # HEAD stays below it until an operator reviews it — replaying that DML fleet-wide corrupts or
-    # silently skips tenant data. We still RECORD it (refusing would fork the template from the
-    # fleet, the #19 invariant); the flag blocks the rollout, not the capture.
-    requires_review = data_migration_statements(statements) != []
 
-    case Migrator.release(
-           version,
-           "auto-captured",
-           statements,
-           template_migration_count,
-           requires_review
-         ) do
+    # Expert review #6: a NON-ATOMIC migration (`atomic = False`) runs autocommit — no tracked
+    # BEGIN/COMMIT — so capture never sees it, the template schema moves, and the fleet never hears.
+    # We catch it at the NEXT capture: `before` (this transaction's pre-count) should equal the last
+    # captured count; if it's higher, uncaptured migrations landed in between (the gap). Compared
+    # against DURABLE per-release state, not in-memory Capture state (the shared-singleton false-alarm
+    # the earlier attempt hit).
+    gap = migration_gap(before)
+
+    # Expert review #1: flag a captured version that carries template-literal DATA migrations (or a
+    # detected gap) so HEAD stays below it until an operator reviews it — replaying its DML fleet-wide
+    # corrupts/skips tenant data, and a gap means it assumes DDL the fleet doesn't have. We still
+    # RECORD it (refusing would fork the template from the fleet, the #19 invariant); the flag blocks
+    # the rollout, not the capture.
+    requires_review = data_migration_statements(statements) != [] or gap != nil
+
+    case Migrator.release(version, "auto-captured", statements, count, requires_review) do
       {:ok, _} ->
+        if gap, do: alarm_gap(version, gap)
         alarm_on_data_migration(version, statements)
         {:recorded, version}
 
