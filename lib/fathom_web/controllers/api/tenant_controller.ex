@@ -86,6 +86,18 @@ defmodule FathomWeb.Api.TenantController do
     lifecycle(conn, Tenants.resume(id), id, "active")
   end
 
+  # POST /api/tenants/:id/fork   {"dst": "acme-preview"}   — clone a live tenant to a new id (#14)
+  def fork(conn, %{"id" => src} = params) do
+    case Tenants.fork(src, params["dst"] || params["to"] || "") do
+      {:ok, tenant} -> conn |> put_status(:created) |> json(tenant)
+      {:error, :invalid_shard_id} -> error(conn, :bad_request, "invalid shard or destination id")
+      {:error, :already_exists} -> error(conn, :conflict, "destination already exists")
+      {:error, :tombstoned} -> error(conn, :conflict, "destination id was deleted")
+      {:error, :no_source} -> error(conn, :not_found, "no such source tenant")
+      {:error, reason} -> error(conn, :unprocessable_entity, "fork failed: #{inspect(reason)}")
+    end
+  end
+
   # POST /api/tenants/:id/token   {"scope": "rw"|"ro"}   — mint a fresh token (#24)
   def mint_token(conn, %{"id" => id} = params) do
     scope = scope_param(params)

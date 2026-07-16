@@ -97,6 +97,36 @@ defmodule Fathom.Tenants do
   end
 
   @doc """
+  Forks a live tenant to a NEW shard id (#14, the database-forking / tenant-clone kernel): copies
+  `src_id`'s stored object to `dst_id`, registers the dst directory row at `src`'s schema version
+  (so the laggard sweep never tries to replay a migration onto the already-migrated fork), and mints
+  a token. Returns `%{shard_id, url, auth_token, auth_required}` for the dst, like `provision/1`.
+
+  Reflects `src`'s **last durably-flushed** state and does NOT disrupt it (no drain) — snapshot or
+  drain `src` first for the very latest. Refuses `{:error, :already_exists}`/`{:error, :tombstoned}`
+  (dst taken), `{:error, :no_source}` (src has no stored object / directory row), or
+  `{:error, :invalid_shard_id}`.
+  """
+  @spec fork(String.t(), String.t()) :: {:ok, map()} | {:error, term()}
+  def fork(src_id, dst_id) do
+    with {:ok, src} <- cast(src_id),
+         {:ok, dst} <- cast(dst_id),
+         :ok <- refuse_if_taken(dst),
+         {:ok, %{schema_version: schema_version}} <- fetch_src(src),
+         :ok <- Storage.fork_shard(src, dst) do
+      register_fork(dst, schema_version)
+
+      {:ok,
+       %{
+         shard_id: dst,
+         url: tenant_url(dst),
+         auth_token: mint_token(dst),
+         auth_required: auth_required?()
+       }}
+    end
+  end
+
+  @doc """
   The physical erase, run by `DeleteJob` (and directly callable/testable). Cancels pending
   per-shard jobs, drains the home coordinator, and purges every stored object. Idempotent —
   every step tolerates already-gone state. Returns `:ok`, or `{:error, reason}` on a storage
@@ -282,6 +312,22 @@ defmodule Fathom.Tenants do
       {:ok, token} -> token
       _ -> nil
     end
+  end
+
+  defp fetch_src(src) do
+    case Directory.get(src) do
+      {:ok, row} -> {:ok, row}
+      :error -> {:error, :no_source}
+    end
+  end
+
+  # Register the fork's directory row AT the source's schema version — critical so the laggard sweep
+  # doesn't see the fork at v0 and replay a migration onto its already-vN copy (the #7/#8 quarantine
+  # trap). resolve inserts active@0; cutover stamps the real version (a no-op skip when src is at v0).
+  defp register_fork(dst, schema_version) do
+    Directory.resolve(dst)
+    if schema_version > 0, do: Directory.cutover(dst, schema_version)
+    :ok
   end
 
   defp tenant_url(id), do: "libsql://#{id}.#{base_domain()}"

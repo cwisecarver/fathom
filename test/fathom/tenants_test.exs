@@ -127,6 +127,68 @@ defmodule Fathom.TenantsTest do
     end
   end
 
+  describe "fork/1 (database forking, #14)" do
+    setup %{id: id} do
+      dst = "#{id}fork"
+
+      on_exit(fn ->
+        :ets.delete(Tombstones, dst)
+        Shards.drain(dst, 2_000)
+        Storage.purge_shard(dst)
+
+        for path <- Path.wildcard(Path.join([System.tmp_dir!(), "fathom_shards", "#{dst}*"])),
+            do: File.rm(path)
+      end)
+
+      %{dst: dst}
+    end
+
+    test "clones a live tenant to a new id, independent of the source", %{id: src, dst: dst} do
+      {:ok, _} = Directory.resolve(src)
+      write!(src, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('orig')"])
+      flush!(src)
+
+      assert {:ok, tenant} = Tenants.fork(src, dst)
+      assert tenant.shard_id == dst
+      assert tenant.url == "libsql://#{dst}.local"
+
+      # The fork has the source's data and its own active directory row.
+      assert {:ok, %{status: "active"}} = Directory.get(dst)
+      assert read_one(dst, "SELECT v FROM t") == [["orig"]]
+
+      # It's a real independent copy: writing the fork doesn't touch the source.
+      write!(dst, ["INSERT INTO t VALUES ('fork-only')"])
+      flush!(dst)
+      assert read_one(src, "SELECT v FROM t") == [["orig"]]
+      assert length(read_one(dst, "SELECT v FROM t")) == 2
+    end
+
+    test "carries the source's schema version so the laggard sweep won't re-migrate it",
+         %{id: src, dst: dst} do
+      {:ok, _} = Directory.resolve(src)
+      {:ok, _} = Directory.cutover(src, 4)
+      write!(src, ["CREATE TABLE t (v TEXT)"])
+      flush!(src)
+
+      assert {:ok, _} = Tenants.fork(src, dst)
+      assert {:ok, %{schema_version: 4}} = Directory.get(dst)
+    end
+
+    test "refuses to fork onto an existing tenant", %{id: src, dst: dst} do
+      {:ok, _} = Directory.resolve(src)
+      write!(src, ["CREATE TABLE t (v TEXT)"])
+      flush!(src)
+      {:ok, _} = Directory.resolve(dst)
+
+      assert {:error, :already_exists} = Tenants.fork(src, dst)
+    end
+
+    test "refuses a source with no stored object", %{id: src, dst: dst} do
+      {:ok, _} = Directory.resolve(src)
+      assert {:error, :no_source} = Tenants.fork(src, dst)
+    end
+  end
+
   describe "suspend/1 and resume/1" do
     test "suspend denies admission (403) and resume restores service", %{id: id} do
       {:ok, _} = Directory.resolve(id)
@@ -195,6 +257,13 @@ defmodule Fathom.TenantsTest do
     {:ok, handle} = ShardExecutor.open(shard)
     Enum.each(sqls, fn s -> {:ok, _} = ShardExecutor.execute(handle, stmt(s)) end)
     :ok = ShardExecutor.close(handle)
+  end
+
+  defp read_one(shard, sql) do
+    {:ok, handle} = ShardExecutor.open(shard)
+    {:ok, result} = ShardExecutor.execute(handle, stmt(sql))
+    :ok = ShardExecutor.close(handle)
+    result.rows
   end
 
   defp flush!(shard), do: :ok = Shards.drain(shard, 5_000)

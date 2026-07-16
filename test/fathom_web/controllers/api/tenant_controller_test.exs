@@ -150,4 +150,30 @@ defmodule FathomWeb.Api.TenantControllerTest do
       assert (conn |> auth() |> post("/api/tenants/Bad%20Id/token")).status == 400
     end
   end
+
+  describe "POST /api/tenants/:id/fork (#14)" do
+    test "404 forking a source with no stored object", %{conn: conn} do
+      put_shard("api_fork_src")
+
+      assert (conn
+              |> auth()
+              |> post("/api/tenants/api_fork_src/fork", %{dst: "api_fork_dst"})).status ==
+               404
+    end
+
+    test "409 forking onto an existing destination", %{conn: conn} do
+      put_shard("api_fs2")
+      put_shard("api_fd2")
+
+      assert (conn |> auth() |> post("/api/tenants/api_fs2/fork", %{dst: "api_fd2"})).status ==
+               409
+    end
+
+    test "400 for an invalid destination id", %{conn: conn} do
+      put_shard("api_fs3")
+
+      assert (conn |> auth() |> post("/api/tenants/api_fs3/fork", %{dst: "Bad Dst!"})).status ==
+               400
+    end
+  end
 end

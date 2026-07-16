@@ -192,6 +192,15 @@ defmodule Fathom.Shard.Storage do
   # a later rollout would corrupt (replaying DDL over already-present tables).
   @callback drop_live(shard_id :: String.t()) :: :ok | {:error, term()}
 
+  # Fork a LIVE shard to a NEW shard id (expert review #14): copy `<src_id>`'s live object to
+  # `<dst_id>`'s live object — the database-forking / tenant-clone kernel (a fork is one object
+  # copy). Refuses `{:error, :dst_exists}` if `dst_id` already has a stored object (never clobber a
+  # tenant) and `{:error, :no_source}` if `src_id` has none. Reflects `src`'s last durably-flushed
+  # state (like a snapshot); the caller (`Fathom.Tenants.fork/2`) registers the dst directory row +
+  # token. Distinct from `fork_from/3`, which copies a retained `@<version>` template snapshot.
+  @callback fork_shard(src_id :: String.t(), dst_id :: String.t()) ::
+              :ok | {:error, :dst_exists | :no_source | term()}
+
   @typedoc "A stored point-in-time snapshot: its `id` and the object's byte size."
   @type snapshot :: %{id: String.t(), bytes: non_neg_integer()}
 
@@ -363,6 +372,14 @@ defmodule Fathom.Shard.Storage do
   """
   @spec drop_live(String.t()) :: :ok | {:error, term()}
   def drop_live(shard_id), do: backend().drop_live(shard_id)
+
+  @doc """
+  Forks a live shard to a new shard id — copies `src_id`'s live object to `dst_id`'s (the
+  database-forking kernel, #14). `{:error, :dst_exists}` if the dst is already stored,
+  `{:error, :no_source}` if the src isn't. See the callback.
+  """
+  @spec fork_shard(String.t(), String.t()) :: :ok | {:error, :dst_exists | :no_source | term()}
+  def fork_shard(src_id, dst_id), do: backend().fork_shard(src_id, dst_id)
 
   @doc "Copies the shard's live object to a point-in-time snapshot `<shard>@snap-<snapshot_id>`."
   @spec snapshot(String.t(), String.t()) :: :ok | {:error, term()}

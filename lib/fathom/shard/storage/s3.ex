@@ -807,6 +807,26 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  @impl true
+  def fork_shard(src_id, dst_id) do
+    # Fork a live shard to a new id (#14): HEAD the dst first (never clobber a tenant), then HEAD the
+    # src, then CopyObject src.db → dst.db. Two heads + a copy is fine — a fork is a rare operator/API
+    # action, not a hot path.
+    case head_etag(db_key(dst_id)) do
+      {:ok, _} -> {:error, :dst_exists}
+      {:error, {:s3_head_status, 404}} -> fork_after_dst_check(src_id, dst_id)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp fork_after_dst_check(src_id, dst_id) do
+    case head_etag(db_key(src_id)) do
+      {:ok, _} -> copy_object(db_key(src_id), db_key(dst_id))
+      {:error, {:s3_head_status, 404}} -> {:error, :no_source}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   # --- point-in-time snapshots (#12) ---
 
   @impl true

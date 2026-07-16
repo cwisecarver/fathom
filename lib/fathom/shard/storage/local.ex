@@ -179,6 +179,17 @@ defmodule Fathom.Shard.Storage.Local do
     end
   end
 
+  @impl true
+  def fork_shard(src_id, dst_id) do
+    # Fork a live shard to a new id (#14): guard both ends, then an atomic (temp+rename) copy so a
+    # torn fork is never adopted. Refuse if the dst already exists (no clobber) or the src doesn't.
+    cond do
+      File.exists?(remote_path(dst_id)) -> {:error, :dst_exists}
+      not File.exists?(remote_path(src_id)) -> {:error, :no_source}
+      true -> Storage.atomic_copy(remote_path(src_id), remote_path(dst_id))
+    end
+  end
+
   # --- point-in-time snapshots (#12) ---
 
   @impl true
