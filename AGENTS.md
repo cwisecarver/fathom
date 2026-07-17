@@ -110,6 +110,10 @@ Complements the framework **Test guidelines** below (`start_supervised!`, no `Pr
 
 A "gate" is a check that must pass *before* a commit lands — not after.
 
+- **GitHub Actions CI is DISABLED** (repo-wide, `actions/permissions enabled=false`, 2026-07-16; the
+  `.github/workflows/ci.yml` file stays but is inert). So there is **no server-side safety net** — the
+  *local* gates below are the only enforcement. Never lean on CI to catch a break; run `mix precommit`
+  yourself before every commit. Re-enable with `gh api -X PUT repos/cwisecarver/fathom/actions/permissions -F enabled=true`.
 - **`mix precommit` is the commit gate** (defined in `mix.exs`): `compile --warnings-as-errors`, `deps.unlock --unused`, `format`, `test`. **Never commit if it fails.** Run it when you're done with all changes and fix everything it surfaces.
 - **Migration gate.** A schema migration must not ship without: (a) a forward copy+transform test, (b) a revert-flip test, (c) a cross-version-tolerance check. A migration that can't be reverted by pointer-flip within the retention window, or that the running app can't tolerate mid-rollout, is not done.
 - **Shard-isolation gate.** Any change to shard routing (`Fathom.ShardExecutor.shard_from_conn`, `Fathom.Shards`, shard-path construction, or the planned `Fathom.Directory` resolve) must have a test proving shard A never resolves to shard B. Treat a cross-tenant leak as a release blocker, not a finding.
