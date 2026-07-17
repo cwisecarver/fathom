@@ -175,5 +175,32 @@ defmodule FathomWeb.Api.TenantControllerTest do
       assert (conn |> auth() |> post("/api/tenants/api_fs3/fork", %{dst: "Bad Dst!"})).status ==
                400
     end
+
+    test "accepts flush_source: true (keystone-fork, #10)", %{conn: conn} do
+      put_shard("api_fs_fl")
+
+      # No stored object -> still 404, proving the flush_source param is parsed and doesn't break the path.
+      assert (conn
+              |> auth()
+              |> post("/api/tenants/api_fs_fl/fork", %{dst: "api_fd_fl", flush_source: true})).status ==
+               404
+    end
+  end
+
+  describe "POST /api/tenants/:id/flush (#10)" do
+    test "200 flushes (no-op :ok when no coordinator is running locally)", %{conn: conn} do
+      put_shard("api_flush")
+      body = conn |> auth() |> post("/api/tenants/api_flush/flush") |> json_response(200)
+      assert body["shard_id"] == "api_flush"
+      assert body["flushed"] == true
+    end
+
+    test "400 for an invalid id", %{conn: conn} do
+      assert (conn |> auth() |> post("/api/tenants/Bad%20Id/flush")).status == 400
+    end
+
+    test "401 without auth", %{conn: conn} do
+      assert post(conn, "/api/tenants/api_flush/flush").status == 401
+    end
   end
 end

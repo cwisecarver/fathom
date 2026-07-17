@@ -86,15 +86,29 @@ defmodule FathomWeb.Api.TenantController do
     lifecycle(conn, Tenants.resume(id), id, "active")
   end
 
-  # POST /api/tenants/:id/fork   {"dst": "acme-preview"}   — clone a live tenant to a new id (#14)
+  # POST /api/tenants/:id/fork   {"dst": "acme-preview", "flush_source": true}
+  # Clone a live tenant to a new id (#14). `flush_source: true` first force-flushes the source so
+  # the fork carries its latest writes (keystone-fork of a just-migrated template, #10).
   def fork(conn, %{"id" => src} = params) do
-    case Tenants.fork(src, params["dst"] || params["to"] || "") do
+    opts = if truthy?(params["flush_source"]), do: [flush_source: true], else: []
+
+    case Tenants.fork(src, params["dst"] || params["to"] || "", opts) do
       {:ok, tenant} -> conn |> put_status(:created) |> json(tenant)
       {:error, :invalid_shard_id} -> error(conn, :bad_request, "invalid shard or destination id")
       {:error, :already_exists} -> error(conn, :conflict, "destination already exists")
       {:error, :tombstoned} -> error(conn, :conflict, "destination id was deleted")
       {:error, :no_source} -> error(conn, :not_found, "no such source tenant")
       {:error, reason} -> error(conn, :unprocessable_entity, "fork failed: #{inspect(reason)}")
+    end
+  end
+
+  # POST /api/tenants/:id/flush   — force-flush the live coordinator so its state is durable (#10).
+  # Local to the node holding the coordinator (fan out on a multi-node fleet); a no-op :ok if none.
+  def flush(conn, %{"id" => id}) do
+    case Tenants.flush(id) do
+      :ok -> json(conn, %{shard_id: id, flushed: true})
+      {:error, :invalid_shard_id} -> error(conn, :bad_request, "invalid shard id")
+      {:error, reason} -> error(conn, :unprocessable_entity, "flush failed: #{inspect(reason)}")
     end
   end
 
@@ -129,6 +143,9 @@ defmodule FathomWeb.Api.TenantController do
   # Explicit map — never String.to_atom on the request scope (atom-exhaustion hygiene).
   defp scope_param(%{"scope" => "ro"}), do: :ro
   defp scope_param(_), do: :rw
+
+  # A JSON boolean, or a "true"/"1" string / 1 (form-ish clients), counts as true.
+  defp truthy?(v), do: v in [true, "true", "1", 1]
 
   defp lifecycle(conn, result, id, new_status) do
     case result do

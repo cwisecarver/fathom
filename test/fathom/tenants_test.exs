@@ -189,6 +189,64 @@ defmodule Fathom.TenantsTest do
     end
   end
 
+  describe "flush/1 + fork(flush_source:) — the keystone-fork affordance (#10)" do
+    setup %{id: id} do
+      dst = "#{id}fork"
+
+      on_exit(fn ->
+        :ets.delete(Tombstones, dst)
+        Shards.drain(dst, 2_000)
+        Storage.purge_shard(dst)
+
+        for path <- Path.wildcard(Path.join([System.tmp_dir!(), "fathom_shards", "#{dst}*"])),
+            do: File.rm(path)
+      end)
+
+      %{dst: dst}
+    end
+
+    test "flush/1 makes an open shard's writes durable WITHOUT stopping it", %{id: src, dst: dst} do
+      {:ok, _} = Directory.resolve(src)
+      write!(src, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('a')"])
+
+      # The coordinator is running with an UN-flushed write (no drain, no idle-drop yet).
+      [{pid_before, _}] = Registry.lookup(Fathom.ShardRegistry, src)
+      assert Fathom.Shard.dirty?(pid_before)
+
+      assert :ok = Shards.flush(src)
+
+      # Same coordinator, still running (non-disruptive) and now durably clean.
+      [{pid_after, _}] = Registry.lookup(Fathom.ShardRegistry, src)
+      assert pid_after == pid_before
+      refute Fathom.Shard.dirty?(pid_after)
+
+      # A plain fork (no flush_source) now carries the just-flushed write — the whole point.
+      assert {:ok, _} = Tenants.fork(src, dst)
+      assert read_one(dst, "SELECT v FROM t") == [["a"]]
+    end
+
+    test "fork(flush_source: true) carries writes made since the last flush",
+         %{id: src, dst: dst} do
+      {:ok, _} = Directory.resolve(src)
+      write!(src, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('a')"])
+      flush!(src)
+      # 'b' is written to the re-opened coordinator and left UN-flushed.
+      write!(src, ["INSERT INTO t VALUES ('b')"])
+
+      assert {:ok, _} = Tenants.fork(src, dst, flush_source: true)
+      assert read_one(dst, "SELECT v FROM t") == [["a"], ["b"]]
+    end
+
+    test "flush is a no-op :ok when no coordinator is running locally", %{id: id} do
+      assert :ok = Shards.flush(id)
+      assert :ok = Tenants.flush(id)
+    end
+
+    test "Tenants.flush/1 rejects an invalid id" do
+      assert {:error, :invalid_shard_id} = Tenants.flush("Not Valid!")
+    end
+  end
+
   describe "suspend/1 and resume/1" do
     test "suspend denies admission (403) and resume restores service", %{id: id} do
       {:ok, _} = Directory.resolve(id)

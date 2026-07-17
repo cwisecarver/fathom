@@ -61,6 +61,10 @@ defmodule Fathom.Shard do
   @default_lease_ttl_ms 30_000
   @default_flush_interval_ms 30_000
   @pull_timeout 60_000
+  # Synchronous force-flush (`:flush_now`) budget: a checkpoint + fenced full-file PUT (possibly
+  # queued behind sibling flushes through the shared Finch pool) at real S3 latency. Generous so a
+  # flush-before-fork of a large template doesn't time out; bounded so a hung store can't wedge a caller.
+  @flush_now_timeout 60_000
   # Supervisor shutdown budget for terminate/2's WHOLE exit path: settling any
   # in-flight durability-flush task (settle_yield_ms/0 caps that at a third of this
   # budget — expert review #18) and then the final fence + checkpoint + full-file
@@ -168,6 +172,14 @@ defmodule Fathom.Shard do
   internally on each flush decision. Finding #27 replaced a per-write cast with this ETS signal.
   """
   def dirty?(pid) when is_pid(pid), do: GenServer.call(pid, :dirty?)
+
+  @doc """
+  Force-flushes the coordinator's current on-disk state to storage WITHOUT dropping or stopping
+  it (it keeps serving) — the flush-before-fork primitive. Blocks until the shard is durably
+  clean; returns `:ok`, or `{:error, reason}` on a flush error / lease steal. See
+  `Fathom.Shards.flush/1` for the by-id, registry-resolving wrapper.
+  """
+  def flush_now(pid) when is_pid(pid), do: GenServer.call(pid, :flush_now, @flush_now_timeout)
 
   @doc """
   Asks the coordinator to stand down: refuse new checkouts, let in-flight
@@ -332,6 +344,10 @@ defmodule Fathom.Shard do
         flush_task: nil,
         flush_pending: nil,
         flush_pending_gen: nil,
+        # Callers of a synchronous force-flush (`:flush_now`, the flush-before-fork primitive):
+        # each waits until the shard is durably clean. Replied to (and cleared) when a flush
+        # task lands the shard clean, or with `{:error, _}` on a flush error / lease steal.
+        flush_waiters: [],
         # Consecutive durability-flush failures (expert review #27): a persistent S3 failure
         # (auth/bucket-policy change) would otherwise only Logger.warning per interval and let the
         # RPO grow unbounded and silently. We count consecutive failures, emit
@@ -761,6 +777,24 @@ defmodule Fathom.Shard do
 
   def handle_call(:dirty?, _from, state), do: {:reply, unflushed?(state), state}
 
+  # Synchronous force-flush (the flush-before-fork primitive): make the current on-disk state
+  # durable WITHOUT dropping/stopping — the coordinator keeps serving. Replies :ok once the
+  # shard is durably clean, or {:error, _} on a flush error / lease steal. Contract: guarantees
+  # durability of writes that completed before the call, given no concurrent writer (the
+  # fork-a-quiesced-template use case); a live writer can keep it re-flushing until the caller's
+  # call timeout. Reuses the exact off-process durability-flush path — no separate write path.
+  def handle_call(:flush_now, from, state) do
+    if not unflushed?(state) and state.flush_task == nil do
+      # Clean and nothing in flight: local == storage already.
+      {:reply, :ok, state}
+    else
+      state = %{state | flush_waiters: [from | state.flush_waiters]}
+      # Kick a flush now if one isn't already running (the result handler replies to waiters).
+      if state.flush_task == nil, do: send(self(), :durability_flush)
+      {:noreply, state}
+    end
+  end
+
   @impl true
   def handle_cast({:checkin, ref}, state), do: stop_when_drained(release(state, ref))
 
@@ -845,7 +879,7 @@ defmodule Fathom.Shard do
         FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
         # Persist the durable-flush time so it survives node death (#28) — off the hot path.
         Fathom.Directory.Recorder.record_flush(state.id)
-        {:noreply, schedule_flush(clear_flush_failures(state))}
+        {:noreply, schedule_flush(settle_waiters(clear_flush_failures(state), :flushed))}
 
       # The data PUT's If-Match failed (412) but the task's lock re-check found the lock
       # STILL OURS (expert review #2): a 412 is NOT proof of a steal — our own PUT can
@@ -866,24 +900,28 @@ defmodule Fathom.Shard do
         FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
         # Our bytes are durably the live object (#28) — record the flush time.
         Fathom.Directory.Recorder.record_flush(state.id)
-        {:noreply, schedule_flush(clear_flush_failures(state))}
+        {:noreply, schedule_flush(settle_waiters(clear_flush_failures(state), :flushed))}
 
       # 412 + lock ours, but the object's etag came back nil/unreadable: keep serving with
       # no etag resync (mirrors the old reconcile's `_ -> {:ok, state}`); stays dirty and
       # retries next interval.
       {:reconciled, nil} ->
-        {:noreply, schedule_flush(state)}
+        # Still dirty — re-kick for any flush_now waiter (else it waits a whole flush interval).
+        {:noreply, schedule_flush(settle_waiters(state, :flushed))}
 
       # 412 AND the task's lock re-check found the lock SUPERSEDED — a real steal. Never
-      # clobber the new owner: self-fence (stop without flushing).
+      # clobber the new owner: self-fence (stop without flushing). Fail any flush_now waiters.
       :superseded ->
-        {:stop, {:shutdown, :lease_lost}, %{state | lease_lost: true}}
+        {:stop, {:shutdown, :lease_lost},
+         settle_waiters(%{state | lease_lost: true}, {:error, :lease_lost})}
 
       # Snapshot/PUT (or the reconcile's lock read) failed transiently: don't advance the
       # watermark, so it stays dirty and the next interval retries — and a later idle-drop
-      # flushes before dropping instead of deleting un-stored writes.
+      # flushes before dropping instead of deleting un-stored writes. A synchronous flush_now
+      # caller gets the error (it can retry) rather than blocking to its call timeout.
       {:error, reason} ->
-        {:noreply, schedule_flush(record_flush_failure(state, reason))}
+        {:noreply,
+         schedule_flush(settle_waiters(record_flush_failure(state, reason), {:error, reason}))}
     end
   end
 
@@ -891,7 +929,8 @@ defmodule Fathom.Shard do
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{flush_task: %Task{ref: ref}} = state) do
     Logger.warning("shard #{state.id}: durability flush task crashed (#{inspect(reason)})")
     state = record_flush_failure(%{state | flush_task: nil}, {:task_crash, reason})
-    {:noreply, schedule_flush(state)}
+    # Dirty (the task never landed) — re-kick so a flush_now waiter retries rather than hangs.
+    {:noreply, schedule_flush(settle_waiters(state, :flushed))}
   end
 
   @impl true
@@ -1079,13 +1118,14 @@ defmodule Fathom.Shard do
                  flush_pending_gen: pending_gen
              }}
 
-          # Lost the lease — self-fence (stop without flushing).
+          # Lost the lease — self-fence (stop without flushing). Fail any flush_now waiters.
           :superseded ->
             Logger.error(
               "shard #{state.id}: lease superseded during durability flush; self-fencing"
             )
 
-            {:stop, {:shutdown, :lease_lost}, %{state | lease_lost: true}}
+            {:stop, {:shutdown, :lease_lost},
+             settle_waiters(%{state | lease_lost: true}, {:error, :lease_lost})}
 
           # Couldn't confirm ownership (transient store error / heartbeat not valid) —
           # don't write, keep dirty, retry next interval.
@@ -1638,6 +1678,27 @@ defmodule Fathom.Shard do
     end
 
     %{state | flush_failures: n}
+  end
+
+  # Reply to synchronous force-flush (`:flush_now`) waiters. On a durable flush: if the shard is
+  # now clean, reply :ok and clear them; if a write landed during the flush and left it dirty
+  # again, kick one more flush and keep waiting (so the caller only sees :ok once its writes are
+  # durable). On an error/steal: reply the error and clear, so a caller never blocks to timeout.
+  defp settle_waiters(%{flush_waiters: []} = state, _outcome), do: state
+
+  defp settle_waiters(state, :flushed) do
+    if unflushed?(state) do
+      send(self(), :durability_flush)
+      state
+    else
+      for w <- state.flush_waiters, do: GenServer.reply(w, :ok)
+      %{state | flush_waiters: []}
+    end
+  end
+
+  defp settle_waiters(state, {:error, _reason} = err) do
+    for w <- state.flush_waiters, do: GenServer.reply(w, err)
+    %{state | flush_waiters: []}
   end
 
   # Reset the consecutive-failure counter on any durable flush. No-op (and silent) on the happy

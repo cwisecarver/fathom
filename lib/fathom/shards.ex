@@ -252,6 +252,34 @@ defmodule Fathom.Shards do
     end
   end
 
+  @doc """
+  Force-flushes `shard_id`'s live coordinator so its current on-disk state is durable in storage,
+  WITHOUT dropping/stopping it (it keeps serving) — the flush-before-fork primitive (#10). Returns
+  `:ok` once the shard is durably clean, `:ok` if no coordinator is running on THIS node (nothing is
+  writing here, so the stored object is already current), or `{:error, reason}` on a flush error.
+
+  **Local only.** It flushes the coordinator on this node. A shard whose coordinator lives on its LB
+  home elsewhere must be flushed on that node — fan the call out across the fleet, or route it via the
+  command channel (the production generalization, the same cross-node-coordinator follow-up as
+  `Fathom.Tenants.purge`'s drain). The single-home / single-node case needs neither.
+  """
+  @spec flush(String.t()) :: :ok | {:error, term()}
+  def flush(shard_id) do
+    case Registry.lookup(@registry, shard_id) do
+      [] ->
+        :ok
+
+      [{pid, _}] ->
+        try do
+          Fathom.Shard.flush_now(pid)
+        catch
+          # The coordinator stopped mid-call (idle-drop flushes on its way out; a steal quarantines) —
+          # its stored state stands, so best-effort :ok. The common quiesced case never hits this.
+          :exit, _ -> :ok
+        end
+    end
+  end
+
   # Wait up to `exit_wait_ms` for the coordinator to exit after a drain request, cleaning
   # the monitor and mailbox the SAME way on every branch (expert review #41): a bounded
   # wait must never leak the monitor or a stale {:drain_aborted, pid} — a later drain/2 or

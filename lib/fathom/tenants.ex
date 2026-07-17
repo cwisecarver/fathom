@@ -102,17 +102,21 @@ defmodule Fathom.Tenants do
   (so the laggard sweep never tries to replay a migration onto the already-migrated fork), and mints
   a token. Returns `%{shard_id, url, auth_token, auth_required}` for the dst, like `provision/1`.
 
-  Reflects `src`'s **last durably-flushed** state and does NOT disrupt it (no drain) — snapshot or
-  drain `src` first for the very latest. Refuses `{:error, :already_exists}`/`{:error, :tombstoned}`
-  (dst taken), `{:error, :no_source}` (src has no stored object / directory row), or
-  `{:error, :invalid_shard_id}`.
+  Reflects `src`'s **last durably-flushed** state — pass `flush_source: true` to first force-flush
+  `src`'s live coordinator so the fork carries its very latest writes (the keystone-fork case: fork
+  a just-migrated template without waiting for the idle flush). The flush is non-disruptive (`src`
+  keeps serving) but **local** — see `Fathom.Shards.flush/1`; on a multi-node fleet flush `src` on its
+  home node first. Refuses `{:error, :already_exists}`/`{:error, :tombstoned}` (dst taken),
+  `{:error, :no_source}` (src has no stored object / directory row), the flush error if
+  `flush_source` fails, or `{:error, :invalid_shard_id}`.
   """
-  @spec fork(String.t(), String.t()) :: {:ok, map()} | {:error, term()}
-  def fork(src_id, dst_id) do
+  @spec fork(String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def fork(src_id, dst_id, opts \\ []) do
     with {:ok, src} <- cast(src_id),
          {:ok, dst} <- cast(dst_id),
          :ok <- refuse_if_taken(dst),
          {:ok, %{schema_version: schema_version}} <- fetch_src(src),
+         :ok <- maybe_flush_source(src, opts),
          :ok <- Storage.fork_shard(src, dst) do
       register_fork(dst, schema_version)
 
@@ -123,6 +127,20 @@ defmodule Fathom.Tenants do
          auth_token: mint_token(dst),
          auth_required: auth_required?()
        }}
+    end
+  end
+
+  @doc """
+  Force-flushes a tenant's live coordinator so its current state is durable in storage, without
+  disrupting it (the shard keeps serving) — the flush-before-fork affordance (#10). Returns `:ok`
+  (flushed, or already clean, or no coordinator running locally), `{:error, reason}` on a flush
+  failure, or `{:error, :invalid_shard_id}`. **Local**: flushes the coordinator on THIS node; see
+  `Fathom.Shards.flush/1` for the multi-node caveat.
+  """
+  @spec flush(String.t()) :: :ok | {:error, term()}
+  def flush(shard_id) do
+    with {:ok, id} <- cast(shard_id) do
+      Shards.flush(id)
     end
   end
 
@@ -312,6 +330,13 @@ defmodule Fathom.Tenants do
       {:ok, token} -> token
       _ -> nil
     end
+  end
+
+  # Flush src's live coordinator before a fork when `flush_source: true`, so the copy reflects the
+  # very latest writes (not just the last idle/periodic flush). A flush error fails the fork — better
+  # than silently forking stale bytes.
+  defp maybe_flush_source(src, opts) do
+    if Keyword.get(opts, :flush_source, false), do: Shards.flush(src), else: :ok
   end
 
   defp fetch_src(src) do
