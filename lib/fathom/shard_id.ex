@@ -11,10 +11,23 @@ defmodule Fathom.ShardId do
   both call `valid?/1`, so the isolation contract can never desync between the request
   path and the file path — the failure mode a duplicated regex invites. See the
   shard-isolation gate in AGENTS.md.
+
+  ## DNS / wildcard-TLS caveat
+
+  A shard id is *also* the Host **subdomain** (`<id>.<zone>`). The charset here admits
+  the underscore, but an underscore is not a valid DNS-label character, so a **wildcard
+  TLS cert** (`*.<zone>`) will not match `some_id.<zone>` — OpenSSL/RFC 6125 refuse to
+  expand the wildcard over a label containing `_`. So a tenant meant to be served over
+  wildcard TLS must use a **DNS-safe id (letters, digits, hyphens — no underscore)**.
+  Underscore ids still work on the plaintext path and would only be reachable over TLS via
+  a per-name (non-wildcard) cert. This is a naming guideline, not enforced here — the gate
+  stays permissive so the constraint lives with the deployment's TLS choice, not the id
+  validator. See the djathom demo, which mints hyphenated ids for exactly this reason.
   """
 
   # Alphanumerics, underscore, hyphen; 1..64 chars. No dot (blocks `..` traversal and
-  # dotted-subdomain ambiguity), no slash, no whitespace, no control chars.
+  # dotted-subdomain ambiguity), no slash, no whitespace, no control chars. NOTE: `_` is
+  # admitted but is not a valid DNS label char — see the wildcard-TLS caveat in @moduledoc.
   @pattern ~r/^[a-zA-Z0-9_-]{1,64}$/
 
   @doc """
