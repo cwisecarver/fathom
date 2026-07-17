@@ -14,7 +14,7 @@ defmodule FathomWeb.Api.TenantController do
   """
   use FathomWeb, :controller
 
-  alias Fathom.{Directory, HranaAuth, Tenants}
+  alias Fathom.{Directory, HranaAuth, Shards, Snapshots, Tenants}
 
   # POST /api/tenants  {"shard_id": "acme"}
   def create(conn, params) do
@@ -109,6 +109,78 @@ defmodule FathomWeb.Api.TenantController do
       :ok -> json(conn, %{shard_id: id, flushed: true})
       {:error, :invalid_shard_id} -> error(conn, :bad_request, "invalid shard id")
       {:error, reason} -> error(conn, :unprocessable_entity, "flush failed: #{inspect(reason)}")
+    end
+  end
+
+  # POST /api/tenants/:id/snapshots   {"label": "before-import", "flush": true}
+  # A point-in-time snapshot of the tenant's stored object (#12). It captures the last durably-flushed
+  # state; flush: true first force-flushes the live coordinator so the snapshot is the CURRENT state.
+  def create_snapshot(conn, %{"id" => id} = params) do
+    if truthy?(params["flush"]), do: Shards.flush(id)
+
+    case Snapshots.create(id, label: params["label"]) do
+      {:ok, snap} ->
+        conn |> put_status(:created) |> json(%{shard_id: id, snapshot_id: snap})
+
+      {:error, :invalid_shard_id} ->
+        error(conn, :bad_request, "invalid shard id")
+
+      {:error, reason} ->
+        error(conn, :unprocessable_entity, "snapshot failed: #{inspect(reason)}")
+    end
+  end
+
+  # GET /api/tenants/:id/snapshots   — list a tenant's snapshots (newest first), id + byte size.
+  def list_snapshots(conn, %{"id" => id}) do
+    case Snapshots.list(id) do
+      {:ok, snaps} ->
+        json(conn, %{shard_id: id, snapshots: snaps})
+
+      {:error, :invalid_shard_id} ->
+        error(conn, :bad_request, "invalid shard id")
+
+      {:error, reason} ->
+        error(conn, :unprocessable_entity, "list snapshots failed: #{inspect(reason)}")
+    end
+  end
+
+  # POST /api/tenants/:id/restore   {"snapshot": "<snapshot_id>"}
+  # Point-in-time restore (#12): drains the shard, then copies the snapshot back over the live object;
+  # the next connect cold-opens the restored state. Destructive — snapshot first if you might undo.
+  def restore(conn, %{"id" => id} = params) do
+    case Snapshots.restore(id, params["snapshot"] || "") do
+      :ok ->
+        json(conn, %{shard_id: id, restored: params["snapshot"]})
+
+      {:error, :invalid_shard_id} ->
+        error(conn, :bad_request, "invalid shard id")
+
+      {:error, {:shard_busy, _}} ->
+        error(conn, :conflict, "shard is busy (active connections) — quiesce it and retry")
+
+      {:error, {:held, owner}} ->
+        error(
+          conn,
+          :conflict,
+          "shard is served on another node (#{owner}) — quiesce it there first"
+        )
+
+      {:error, reason} ->
+        error(conn, :unprocessable_entity, "restore failed: #{inspect(reason)}")
+    end
+  end
+
+  # DELETE /api/tenants/:id/snapshots/:snapshot_id   — drop a snapshot (idempotent).
+  def drop_snapshot(conn, %{"id" => id, "snapshot_id" => snap}) do
+    case Snapshots.drop(id, snap) do
+      :ok ->
+        json(conn, %{shard_id: id, dropped: snap})
+
+      {:error, :invalid_shard_id} ->
+        error(conn, :bad_request, "invalid shard id")
+
+      {:error, reason} ->
+        error(conn, :unprocessable_entity, "drop snapshot failed: #{inspect(reason)}")
     end
   end
 

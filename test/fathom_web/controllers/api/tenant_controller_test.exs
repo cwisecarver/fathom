@@ -8,7 +8,10 @@ defmodule FathomWeb.Api.TenantControllerTest do
   alias Fathom.Directory
   alias Fathom.Directory.Shard
   alias Fathom.Repo
+  alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Shard.Storage
   alias Fathom.Tenants.{Suspensions, Tombstones}
+  alias Filo.Stmt
 
   @auth "Basic " <> Base.encode64("admin:secret")
 
@@ -187,6 +190,80 @@ defmodule FathomWeb.Api.TenantControllerTest do
     end
   end
 
+  describe "snapshots + restore (PITR, #12)" do
+    setup do
+      sid = "api_snap_#{System.unique_integer([:positive])}"
+
+      on_exit(fn ->
+        Shards.drain(sid, 2_000)
+        Storage.purge_shard(sid)
+
+        for path <- Path.wildcard(Path.join([System.tmp_dir!(), "fathom_shards", "#{sid}*"])),
+            do: File.rm(path)
+      end)
+
+      %{sid: sid}
+    end
+
+    test "snapshot -> mutate -> restore rolls the shard back, over the API", %{
+      conn: conn,
+      sid: sid
+    } do
+      {:ok, _} = Directory.resolve(sid)
+      write!(sid, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('v1')"])
+      flush!(sid)
+
+      # Snapshot the current (durable) state via the API.
+      body = conn |> auth() |> post("/api/tenants/#{sid}/snapshots") |> json_response(201)
+      snap = body["snapshot_id"]
+      assert is_binary(snap)
+
+      # It shows up in the list.
+      list = conn |> auth() |> get("/api/tenants/#{sid}/snapshots") |> json_response(200)
+      assert Enum.any?(list["snapshots"], &(&1["id"] == snap))
+
+      # Mutate past the snapshot.
+      write!(sid, ["INSERT INTO t VALUES ('v2')"])
+      flush!(sid)
+      assert read_one(sid, "SELECT v FROM t ORDER BY v") == [["v1"], ["v2"]]
+
+      # Restore over the API — the shard rolls back to the snapshot.
+      restored =
+        conn
+        |> auth()
+        |> post("/api/tenants/#{sid}/restore", %{snapshot: snap})
+        |> json_response(200)
+
+      assert restored["restored"] == snap
+      assert read_one(sid, "SELECT v FROM t ORDER BY v") == [["v1"]]
+    end
+
+    test "flush: true snapshots the LIVE (un-flushed) state", %{conn: conn, sid: sid} do
+      {:ok, _} = Directory.resolve(sid)
+      write!(sid, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('a')"])
+      # 'a' is NOT flushed; flush: true makes the snapshot capture it.
+      body =
+        conn
+        |> auth()
+        |> post("/api/tenants/#{sid}/snapshots", %{flush: true})
+        |> json_response(201)
+
+      # Restoring that snapshot into a fresh shard proves 'a' was captured.
+      flush!(sid)
+      write!(sid, ["INSERT INTO t VALUES ('b')"])
+      flush!(sid)
+      conn |> auth() |> post("/api/tenants/#{sid}/restore", %{snapshot: body["snapshot_id"]})
+      assert read_one(sid, "SELECT v FROM t") == [["a"]]
+    end
+
+    test "400 for an invalid id, 401 without auth", %{conn: conn} do
+      assert (conn |> auth() |> post("/api/tenants/Bad%20Id/snapshots")).status == 400
+      assert post(conn, "/api/tenants/whatever/snapshots").status == 401
+      assert get(conn, "/api/tenants/whatever/snapshots").status == 401
+      assert post(conn, "/api/tenants/whatever/restore").status == 401
+    end
+  end
+
   describe "POST /api/tenants/:id/flush (#10)" do
     test "200 flushes (no-op :ok when no coordinator is running locally)", %{conn: conn} do
       put_shard("api_flush")
@@ -203,4 +280,21 @@ defmodule FathomWeb.Api.TenantControllerTest do
       assert post(conn, "/api/tenants/api_flush/flush").status == 401
     end
   end
+
+  defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
+
+  defp write!(shard, sqls) do
+    {:ok, handle} = ShardExecutor.open(shard)
+    Enum.each(sqls, fn s -> {:ok, _} = ShardExecutor.execute(handle, stmt(s)) end)
+    :ok = ShardExecutor.close(handle)
+  end
+
+  defp read_one(shard, sql) do
+    {:ok, handle} = ShardExecutor.open(shard)
+    {:ok, result} = ShardExecutor.execute(handle, stmt(sql))
+    :ok = ShardExecutor.close(handle)
+    result.rows
+  end
+
+  defp flush!(shard), do: :ok = Shards.drain(shard, 5_000)
 end

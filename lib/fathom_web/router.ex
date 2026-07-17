@@ -67,6 +67,10 @@ defmodule FathomWeb.Router do
     delete "/tenants/:id/token", TenantController, :revoke_token
     post "/tenants/:id/fork", TenantController, :fork
     post "/tenants/:id/flush", TenantController, :flush
+    post "/tenants/:id/snapshots", TenantController, :create_snapshot
+    get "/tenants/:id/snapshots", TenantController, :list_snapshots
+    post "/tenants/:id/restore", TenantController, :restore
+    delete "/tenants/:id/snapshots/:snapshot_id", TenantController, :drop_snapshot
 
     # Fleet migration convergence — the deploy gate a Django CI/CD reads (#25).
     get "/migrations/status", MigrationController, :status
