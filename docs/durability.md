@@ -41,6 +41,31 @@ re-arms only after it **settles**, so the honest worst case is `interval + ~2× 
 (the interval, plus the in-flight snapshot that didn't quite finish, plus the next one). On a fast
 store the flush duration is small and RPO ≈ interval; on a slow/large one, size it in.
 
+## Measured — the loss window tracks the interval
+
+`mix fathom.rpo` (the `Fathom.Rpo` harness) quantifies the two numbers above: it drives a steady
+write stream and, at points spread across the flush sawtooth, compares the acked writes against what
+a survivor would cold-open — the **last flushed object** (a failover pulls exactly it, so the loss is
+measured directly, without killing a node). A sweep at **200 writes/s** (dev, one-host-relative — the
+window scales with write rate and interval, not with the host):
+
+| `:shard_flush_interval_ms` | lost rows (p50 / p99) | lost window (p50 / p99) |
+|---|---|---|
+| 1 000 | 97 / 160 | 0.6 s / 1.0 s |
+| 5 000 | 452 / 800 | 2.7 s / 4.8 s |
+| 30 000 (default) | 2 647 / 4 800 | 15.9 s / 28.9 s |
+| 0 (idle-only) | 2 600 / 4 800 | 16 s / 29 s — run-bounded, **unbounded** for a never-idle shard |
+
+Two things the table pins. The **p99 lost window ≈ the interval** (965 ms / 4.8 s / 28.9 s — a node
+that dies just before a flush loses the full interval; the p50 is ~half, mid-sawtooth), confirming the
+`RPO ≈ interval` formula empirically. And **lost rows ≈ rate × interval**, so the window is a knob you
+set by the interval: tighten `:shard_flush_interval_ms` and the loss shrinks linearly (5 s → ~0.5 k
+rows, 1 s → ~0.15 k). **Idle-only (`0`)** loses the whole busy session — only the run length bounded it
+here. The **process-crash row is 0** (`synchronous=FULL`: wrote 200, survived 200, with nothing flushed
+first — survival came purely from the local WAL), the local-durability layer proven end to end. The
+boundary is pinned as deterministic invariants in `test/fathom/rpo_test.exs`; the multi-node /
+real-disk complement is `deploy/chaos/chaos.sh soak`.
+
 **This bound holds only while flushes succeed.** A *persistent* flush failure — an S3 auth change, a
 bucket-policy change, a credential expiry — makes the RPO **unbounded**: the shard stays dirty and
 retries every interval, the oldest-unflushed-age climbs, and (before review #27) the only trace was
