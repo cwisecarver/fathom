@@ -1156,6 +1156,11 @@ defmodule Fathom.Shard do
     # the file open (Unix keeps the fd on the renamed inode); the streams tear down when their
     # monitor on this dying coordinator fires.
     state = settle_flush_task(state)
+    # Reply to any pending flush_now caller before we exit (expert review 2026-07-18 #4): we
+    # self-fenced WITHOUT flushing, so the on-disk state is NOT durable in storage. Without this,
+    # the caller's GenServer.call gets a bare :DOWN → Shards.flush catches the exit as :ok → the
+    # keystone-fork treats it as "source durably flushed" and forks stale bytes.
+    state = settle_waiters(state, {:error, :lease_lost})
     Fathom.ShardLoad.forget(state.id)
     Fathom.ShardLatency.forget(state.id)
     Fathom.Shards.Lru.forget(state.id)
@@ -1171,6 +1176,11 @@ defmodule Fathom.Shard do
     # them would make one 412 spuriously (the drop-flush's :superseded branch drops
     # the local copy WITHOUT uploading writes made after the task's snapshot).
     state = settle_flush_task(state)
+    # A flush_now caller pending at idle/drain time gets an explicit error rather than a bare
+    # exit that Shards.flush would mask as a false :ok (expert review 2026-07-18 #4). The retry
+    # is correct: after the drop-flush the shard is cold and Shards.flush returns :ok if storage
+    # is current — never forking stale bytes on the strength of a swallowed exit.
+    state = settle_waiters(state, {:error, :coordinator_stopped})
     Fathom.ShardLoad.forget(state.id)
     Fathom.ShardLatency.forget(state.id)
     Fathom.Shards.Lru.forget(state.id)
@@ -1186,6 +1196,10 @@ defmodule Fathom.Shard do
   # Stopping with connections still open (or from an early pre-open state) — always
   # drop the shard's load row so a stopped shard never leaks a counter.
   def terminate(_reason, state) do
+    # A flush_now caller pending when the coordinator is force-stopped (supervisor shutdown with
+    # conns > 0, a pre-open failure) gets an explicit error, not a swallowed exit → false :ok
+    # (expert review 2026-07-18 #4). settle_waiters is a no-op on the empty/pre-open waiter list.
+    state = settle_waiters(state, {:error, :coordinator_stopped})
     Fathom.ShardLoad.forget(state.id)
     Fathom.ShardLatency.forget(state.id)
     Fathom.Shards.Lru.forget(state.id)
@@ -1694,6 +1708,9 @@ defmodule Fathom.Shard do
   # now clean, reply :ok and clear them; if a write landed during the flush and left it dirty
   # again, kick one more flush and keep waiting (so the caller only sees :ok once its writes are
   # durable). On an error/steal: reply the error and clear, so a caller never blocks to timeout.
+  # A pre-open / minimal state (e.g. a lease-acquire failure in handle_continue, before the full
+  # state is built) has no :flush_waiters key and never accreted a waiter — nothing to settle.
+  defp settle_waiters(state, _outcome) when not is_map_key(state, :flush_waiters), do: state
   defp settle_waiters(%{flush_waiters: []} = state, _outcome), do: state
 
   defp settle_waiters(state, :flushed) do

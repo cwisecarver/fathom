@@ -332,6 +332,56 @@ defmodule Fathom.ShardDurabilityTest do
     refute File.exists?(remote_db(shard)), "a fenced flush must not clobber the new owner"
   end
 
+  # Expert review 2026-07-18 #4: a flush_now caller whose flush is still in flight when the
+  # coordinator is force-stopped (a supervisor shutdown with conns > 0) used to get a bare :DOWN —
+  # Shards.flush catches the exit and returns a FALSE :ok, and the keystone-fork (Tenants.fork
+  # flush_source:) then forks stale bytes on the strength of that swallowed exit. Every terminate/2
+  # clause must reply an explicit error to any pending flush_now waiter.
+  test "a flush_now caller pending at a force-stop gets an explicit error, not a false :ok",
+       %{shard: shard} do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    test_pid = self()
+
+    # Block the flush's PUT so the flush task stays in flight and the flush_now waiter stays pending.
+    blocker = fn ->
+      send(test_pid, :flush_started)
+
+      receive do
+        :release -> :ok
+      after
+        10_000 -> :ok
+      end
+    end
+
+    Application.put_env(:fathom, :faulty_before, {:flush, blocker})
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('acked')"))
+    {:ok, coordinator} = Shards.ensure(shard)
+
+    # A pending flush_now: adds a waiter and kicks a flush that blocks in the PUT. The connection
+    # stays open (conns > 0), so a force-stop lands in the catch-all terminate clause.
+    flush = Task.async(fn -> Shards.flush(shard) end)
+    assert_receive :flush_started, 2_000
+
+    # Force-stop the coordinator while the flush is in flight and the waiter is pending.
+    :ok = DynamicSupervisor.terminate_child(Fathom.ShardSupervisor, coordinator)
+
+    # Pre-fix: the waiter got a swallowed exit → Shards.flush returned :ok. Now: an explicit error.
+    assert {:error, :coordinator_stopped} = Task.await(flush, 2_000)
+  end
+
   # Expert review 2026-07-14 #41: pin the invariant "every flushed object is an openable,
   # quick_check-clean SQLite database" across the flush paths that run in the default suite —
   # the checkpoint-then-raw-upload (idle drop) and the VACUUM-INTO snapshot (periodic flush).
