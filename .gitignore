@@ -22,8 +22,8 @@ erl_crash.dump
 # Temporary files, for example, from tests.
 /tmp/
 
-# Benchmark run logs (scripts/benchmark.sh). perf_history.jsonl is tracked.
-/logs/
+# logs/ is a tracked run record (measurement sweeps); its ignore policy — which
+# ephemeral output to skip — lives in logs/.gitignore.
 
 # Python virtualenv for the django-libsql validation harness (test/django_validation).
 /.venv/

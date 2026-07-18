@@ -1,3 +1,7 @@
-# Timestamped test/bench output (pruned daily). Keep the dir, ignore its contents.
-*
-!.gitignore
+# This dir is a tracked run record (measurement sweeps like rpo-sweep-*). Ephemeral
+# output stays ignored: test/precommit logs are pruned daily, bench raw logs are
+# superseded by the tracked ../scripts/perf_history.jsonl, server logs are local.
+test-*.log
+precommit*.log
+bench-*.log
+server-*.log
