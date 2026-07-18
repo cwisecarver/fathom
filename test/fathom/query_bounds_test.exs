@@ -53,6 +53,30 @@ defmodule Fathom.QueryBoundsTest do
     :ok = ShardExecutor.close(h)
   end
 
+  # Expert review 2026-07-18 #13: a raise inside with_deadline (Sqlite3.bind raises ArgumentError on
+  # a bad bind value) skipped the watchdog-stop, orphaning the watchdog to interrupt a LATER
+  # statement on the reused connection `ms` later — a spurious FILO_QUERY_TIMEOUT on a healthy
+  # query. The try/after now always stops it. The precise late-interrupt timing isn't
+  # deterministically reproducible with a single query_timeout config (the orphan and a query's own
+  # watchdog fire near-simultaneously), so this covers the previously-untested raise-under-deadline
+  # path: a bad bind returns an error, and the connection stays healthy across the orphan's fire.
+  test "a raising query under a statement timeout keeps the connection healthy (no orphan watchdog)",
+       %{shard: shard} do
+    Application.put_env(:fathom, :query_timeout_ms, 30)
+    seed!(shard, ["CREATE TABLE t (v INTEGER)", "INSERT INTO t VALUES (1)"])
+
+    {:ok, h} = ShardExecutor.open(shard)
+
+    # A tuple arg exqlite can't bind raises ArgumentError inside with_deadline → error, not a crash.
+    assert {:error, _} = ShardExecutor.execute(h, stmt("SELECT v FROM t WHERE v = ?", [{:bad}]))
+
+    # Past the 30ms deadline, so any orphaned watchdog has fired; subsequent queries must succeed.
+    Process.sleep(50)
+    assert {:ok, %{rows: [[1]]}} = ShardExecutor.execute(h, stmt("SELECT v FROM t"))
+
+    :ok = ShardExecutor.close(h)
+  end
+
   test "a normal query is unaffected by a generous timeout", %{shard: shard} do
     Application.put_env(:fathom, :query_timeout_ms, 30_000)
     seed!(shard, ["CREATE TABLE t (v INTEGER)", "INSERT INTO t VALUES (1), (2)"])

@@ -129,8 +129,17 @@ defmodule Fathom.Shard.Connection do
         end
       end)
 
-    result = fun.()
-    send(watchdog, {:done, ref})
+    # Always stop the watchdog, even if fun raises (Sqlite3.bind raises ArgumentError on a bad bind
+    # value — the reason query/3 has a rescue). Without try/after the raise unwinds before the
+    # {:done, ref} send, leaving the watchdog alive to interrupt a LATER statement reusing this
+    # connection `ms` later — a spurious FILO_QUERY_TIMEOUT on a healthy query (expert review
+    # 2026-07-18 #13). The raise then propagates to query/3's rescue as before.
+    result =
+      try do
+        fun.()
+      after
+        send(watchdog, {:done, ref})
+      end
 
     timed_out? =
       receive do
