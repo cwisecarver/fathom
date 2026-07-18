@@ -840,6 +840,37 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   @impl true
+  def restore_snapshot(shard_id, snapshot_id, expected_etag) do
+    # Fenced snapshot restore (expert review 2026-07-18 #2): the snapshot counterpart of the fenced
+    # migration restore/3. S3 can't carry an If-Match on a CopyObject DESTINATION, so mirror the
+    # forward flush: download the snapshot bytes to a temp, then conditional-PUT them to live via
+    # flush/3 (If-Match the live etag the caller captured). A 412 → :superseded aborts without
+    # clobbering a writer that raced in after the drain.
+    tmp = restore_temp(shard_id, snapshot_id)
+
+    try do
+      case download(url_path(snapshot_key(shard_id, snapshot_id)), tmp) do
+        {:ok, _etag} ->
+          case flush(shard_id, tmp, expected_etag) do
+            {:ok, _new_etag} -> :ok
+            {:error, _} = error -> error
+          end
+
+        :absent ->
+          {:error, :snapshot_absent}
+
+        {:sentinel, _etag} ->
+          {:error, :snapshot_absent}
+
+        {:error, _} = error ->
+          error
+      end
+    after
+      File.rm(tmp)
+    end
+  end
+
+  @impl true
   def drop_snapshot(shard_id, snapshot_id) do
     case Req.delete(req(), url: url_path(snapshot_key(shard_id, snapshot_id))) do
       {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok

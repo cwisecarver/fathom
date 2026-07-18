@@ -59,9 +59,12 @@ defmodule Fathom.Snapshots do
 
   @doc """
   Restores `shard_id` to `snapshot_id`. Drains any coordinator on this node first,
-  then refuses unless no **live** node still owns the shard's lease — a cross-node
-  safety check (`Storage.lease_holder/1`) so the copy-back can't be clobbered by a
-  writer on another node, regardless of where restore is invoked. Returns
+  then refuses unless no **live** node still owns the shard's lease
+  (`Storage.lease_holder/1`). The copy-back itself is **etag-fenced** (If-Match the
+  live object, captured at the lease-free instant), so a write that races in after
+  the drain — a fresh checkout that acquired the freed lease and flushed, on this or
+  any node — aborts the restore with `{:error, :superseded}` instead of being
+  silently clobbered (expert review 2026-07-18 #2). Returns
   `{:error, {:shard_busy, reason}}` if the local coordinator won't drain, or
   `{:error, {:held, owner}}` if a live node owns it. `opts[:drain_timeout]`
   overrides the drain wait (default #{@drain_timeout}ms).
@@ -72,9 +75,21 @@ defmodule Fathom.Snapshots do
       case Shards.drain(id, Keyword.get(opts, :drain_timeout, @drain_timeout)) do
         :ok ->
           case Storage.lease_holder(id) do
-            :free -> Storage.restore_snapshot(id, snapshot_id)
-            {:held, owner} -> {:error, {:held, owner}}
-            {:error, reason} -> {:error, reason}
+            :free ->
+              # Capture the live etag at the lease-free instant and restore under an If-Match fence
+              # (expert review 2026-07-18 #2): a fresh checkout that acquires the freed lease and
+              # flushes between here and the copy-back moves the etag, so the restore aborts with
+              # {:error, :superseded} instead of silently clobbering those acked writes.
+              case Storage.object_etag(id) do
+                {:ok, etag} -> Storage.restore_snapshot(id, snapshot_id, etag)
+                {:error, reason} -> {:error, reason}
+              end
+
+            {:held, owner} ->
+              {:error, {:held, owner}}
+
+            {:error, reason} ->
+              {:error, reason}
           end
 
         {:error, reason} ->

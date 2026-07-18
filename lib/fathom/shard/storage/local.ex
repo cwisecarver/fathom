@@ -204,6 +204,31 @@ defmodule Fathom.Shard.Storage.Local do
   end
 
   @impl true
+  def restore_snapshot(shard_id, snapshot_id, expected_etag) do
+    # Fenced snapshot restore (expert review 2026-07-18 #2): the snapshot counterpart of the
+    # fenced migration restore/3. Under the per-shard mutex so the read-compare-write is atomic —
+    # if live's content-hash etag no longer matches what the caller captured (a write raced in
+    # after the drain), abort with :superseded instead of clobbering it.
+    with_lock_mutex(shard_id, fn ->
+      with {:ok, body} <- File.read(snapshot_path(shard_id, snapshot_id)) do
+        current =
+          case File.read(remote_path(shard_id)) do
+            {:ok, remote_body} -> content_etag(remote_body)
+            {:error, :enoent} -> nil
+            {:error, reason} -> throw({:error, reason})
+          end
+
+        cond do
+          expected_etag != current -> {:error, :superseded}
+          true -> Storage.atomic_write(remote_path(shard_id), body)
+        end
+      end
+    end)
+  catch
+    {:error, _} = err -> err
+  end
+
+  @impl true
   def drop_snapshot(shard_id, snapshot_id) do
     case File.rm(snapshot_path(shard_id, snapshot_id)) do
       :ok -> :ok

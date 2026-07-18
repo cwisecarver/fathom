@@ -210,12 +210,20 @@ defmodule Fathom.Shard.Storage do
   # already skips any `@`-keyed object). Backend-uniform (Local + S3), so the whole snapshot/
   # restore path is testable without a real object store; S3 bucket versioning
   # (`docs/durability.md`) layers underneath as defense-in-depth. `snapshot/2` copies live →
-  # snapshot; `restore_snapshot/2` copies snapshot → live (the caller must ensure the shard is not
-  # actively served — see `Fathom.Snapshots.restore/2`, which drains first).
+  # snapshot; `restore_snapshot/2` copies snapshot → live UNCONDITIONALLY (a low-level primitive,
+  # exercised only by backend round-trip tests). Production restore goes through the FENCED
+  # `restore_snapshot/3` — mirroring `restore/2` vs the fenced `restore/3` — which If-Match's the
+  # live etag so a write racing in after `Fathom.Snapshots.restore/3`'s drain can't be silently
+  # clobbered (expert review 2026-07-18 #2): a mismatch is `{:error, :superseded}`, no overwrite.
   @callback snapshot(shard_id :: String.t(), snapshot_id :: String.t()) :: :ok | {:error, term()}
   @callback list_snapshots(shard_id :: String.t()) :: {:ok, [snapshot()]} | {:error, term()}
   @callback restore_snapshot(shard_id :: String.t(), snapshot_id :: String.t()) ::
               :ok | {:error, term()}
+  @callback restore_snapshot(
+              shard_id :: String.t(),
+              snapshot_id :: String.t(),
+              expected_etag :: String.t() | nil
+            ) :: :ok | {:error, :superseded} | {:error, term()}
   @callback drop_snapshot(shard_id :: String.t(), snapshot_id :: String.t()) ::
               :ok | {:error, term()}
 
@@ -390,13 +398,24 @@ defmodule Fathom.Shard.Storage do
   def list_snapshots(shard_id), do: backend().list_snapshots(shard_id)
 
   @doc """
-  Copies a snapshot back over the shard's live object. The caller MUST ensure the shard is not
-  actively served (no coordinator will flush over the copy) — `Fathom.Snapshots.restore/2` drains
-  first. Unconditional (unlike the fenced migration `restore/3`), since restore runs after a drain.
+  Copies a snapshot back over the shard's live object, UNCONDITIONALLY. Low-level primitive
+  (backend round-trip tests); production restore uses the fenced `restore_snapshot/3`.
   """
   @spec restore_snapshot(String.t(), String.t()) :: :ok | {:error, term()}
   def restore_snapshot(shard_id, snapshot_id),
     do: backend().restore_snapshot(shard_id, snapshot_id)
+
+  @doc """
+  Fenced snapshot restore: copies the snapshot over live only if live still matches
+  `expected_etag` (captured by the caller right after its `lease_holder` check). A write that
+  raced in after `Fathom.Snapshots.restore/3`'s drain — a fresh checkout on this or any node that
+  acquired the freed lease and flushed — moves live's etag, so this returns `{:error, :superseded}`
+  and does NOT clobber it (expert review 2026-07-18 #2). Mirrors the fenced migration `restore/3`.
+  """
+  @spec restore_snapshot(String.t(), String.t(), String.t() | nil) ::
+          :ok | {:error, :superseded} | {:error, term()}
+  def restore_snapshot(shard_id, snapshot_id, expected_etag),
+    do: backend().restore_snapshot(shard_id, snapshot_id, expected_etag)
 
   @doc "Deletes a stored snapshot (idempotent)."
   @spec drop_snapshot(String.t(), String.t()) :: :ok | {:error, term()}

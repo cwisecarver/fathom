@@ -8,6 +8,7 @@ defmodule Fathom.SnapshotsTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{ShardExecutor, Shards, Snapshots}
+  alias Fathom.Shard.Storage
   alias Filo.Stmt
 
   setup do
@@ -56,6 +57,39 @@ defmodule Fathom.SnapshotsTest do
 
     assert :ok = Snapshots.restore(shard, snap_id)
     assert read_one(shard, "SELECT v FROM t") == [["v1"]]
+  end
+
+  # Expert review 2026-07-18 #2: restore_snapshot was an UNCONDITIONAL copy, so a write that raced
+  # in after Snapshots.restore's drain (a fresh checkout acquiring the freed lease and flushing)
+  # was silently clobbered — the exact TOCTOU the fenced migration restore/3 already closed.
+  # Snapshots.restore now captures the live etag at the lease-free instant and restores under an
+  # If-Match fence. This pins the fenced primitive: a stale etag must abort with :superseded and
+  # leave live untouched; the current etag restores.
+  test "restore_snapshot/3 is fenced: a stale etag aborts with :superseded and never clobbers live",
+       %{shard: shard} do
+    write!(shard, ["CREATE TABLE kv (v TEXT)", "INSERT INTO kv VALUES ('a')"])
+    flush!(shard)
+    assert {:ok, snap} = Snapshots.create(shard)
+
+    # Live advances past the snapshot (now holds a + b), lease free, no coordinator.
+    write!(shard, ["INSERT INTO kv VALUES ('b')"])
+    flush!(shard)
+    assert {:ok, live_etag} = Storage.object_etag(shard)
+
+    # A stale etag stands in for "a writer flushed after I looked" — the restore must NOT clobber.
+    assert {:error, :superseded} = Storage.restore_snapshot(shard, snap, "stale-etag")
+
+    assert read_one(shard, "SELECT count(*) FROM kv") == [[2]],
+           "a superseded restore must leave live untouched (still a + b)"
+
+    # Quiesce the read's coordinator; the live object (and its etag) is unchanged (reads don't flush).
+    flush!(shard)
+
+    # The live etag restores — the fenced happy path.
+    assert :ok = Storage.restore_snapshot(shard, snap, live_etag)
+
+    assert read_one(shard, "SELECT count(*) FROM kv") == [[1]],
+           "the fenced restore with the live etag reverts to the snapshot (a only)"
   end
 
   test "list returns snapshots newest-first and drop removes one", %{shard: shard} do
