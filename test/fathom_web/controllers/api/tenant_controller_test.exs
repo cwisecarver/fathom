@@ -256,6 +256,40 @@ defmodule FathomWeb.Api.TenantControllerTest do
       assert read_one(sid, "SELECT v FROM t") == [["a"]]
     end
 
+    # Expert review 2026-07-18 #15: flush: true is the caller's request for a guaranteed-current
+    # snapshot, so a failed force-flush must surface (422), not be swallowed into a silently-stale
+    # snapshot. Steal the lease so the coordinator's flush_now self-fences with an error.
+    test "flush: true surfaces a flush failure instead of a stale snapshot", %{
+      conn: conn,
+      sid: sid
+    } do
+      {:ok, _} = Directory.resolve(sid)
+
+      # 'a' is durably stored, so Snapshots.create WOULD succeed on its own — isolating the flush
+      # error as the only reason to fail. 'b' is live-only, held by a fresh coordinator.
+      write!(sid, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('a')"])
+      flush!(sid)
+      write!(sid, ["INSERT INTO t VALUES ('b')"])
+
+      # Another node steals the lease; the force-flush of 'b' fences and errors instead of flushing.
+      File.write!(
+        Path.join([System.tmp_dir!(), "fathom_remote_test", "#{sid}.lock"]),
+        Jason.encode!(%{
+          "owner" => "thief@node",
+          "epoch" => 999,
+          "expires_at_ms" => System.system_time(:millisecond) + 60_000
+        })
+      )
+
+      # Pre-fix the flush error was discarded and a (stale) snapshot was still created (201).
+      {result, _log} =
+        ExUnit.CaptureLog.with_log(fn ->
+          conn |> auth() |> post("/api/tenants/#{sid}/snapshots", %{flush: true})
+        end)
+
+      assert result.status == 422
+    end
+
     test "400 for an invalid id, 401 without auth", %{conn: conn} do
       assert (conn |> auth() |> post("/api/tenants/Bad%20Id/snapshots")).status == 400
       assert post(conn, "/api/tenants/whatever/snapshots").status == 401

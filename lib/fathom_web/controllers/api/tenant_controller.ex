@@ -116,17 +116,33 @@ defmodule FathomWeb.Api.TenantController do
   # A point-in-time snapshot of the tenant's stored object (#12). It captures the last durably-flushed
   # state; flush: true first force-flushes the live coordinator so the snapshot is the CURRENT state.
   def create_snapshot(conn, %{"id" => id} = params) do
-    if truthy?(params["flush"]), do: Shards.flush(id)
-
-    case Snapshots.create(id, label: params["label"]) do
-      {:ok, snap} ->
-        conn |> put_status(:created) |> json(%{shard_id: id, snapshot_id: snap})
+    # A failed force-flush must NOT be swallowed (expert review 2026-07-18 #15): flush: true is the
+    # caller's request for a guaranteed-current snapshot, so a flush error (a transient store error
+    # or a lease steal) has to surface — otherwise the snapshot is silently stale relative to the
+    # contract. Short-circuit before creating the (stale) snapshot.
+    with :ok <- maybe_flush(id, params),
+         {:ok, snap} <- Snapshots.create(id, label: params["label"]) do
+      conn |> put_status(:created) |> json(%{shard_id: id, snapshot_id: snap})
+    else
+      {:error, {:flush_failed, reason}} ->
+        error(conn, :unprocessable_entity, "flush before snapshot failed: #{inspect(reason)}")
 
       {:error, :invalid_shard_id} ->
         error(conn, :bad_request, "invalid shard id")
 
       {:error, reason} ->
         error(conn, :unprocessable_entity, "snapshot failed: #{inspect(reason)}")
+    end
+  end
+
+  defp maybe_flush(id, params) do
+    if truthy?(params["flush"]) do
+      case Shards.flush(id) do
+        :ok -> :ok
+        {:error, reason} -> {:error, {:flush_failed, reason}}
+      end
+    else
+      :ok
     end
   end
 
