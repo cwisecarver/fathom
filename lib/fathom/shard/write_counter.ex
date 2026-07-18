@@ -93,6 +93,19 @@ defmodule Fathom.Shard.WriteCounter do
 
   @impl true
   def init(_opts) do
+    # Bump the generation BEFORE creating the table (expert review 2026-07-18 #7). Expert review #14
+    # (below) closes the case where a restart hands every open coordinator a FRESH EMPTY table —
+    # count(id) = 0 for all shards — while each keeps its old flushed_through watermark, so
+    # `count > flushed_through` classified every dirty shard as clean and drop_clean deleted
+    # un-flushed writes. The generation guard (unflushed?/1) detects that reset — but only if the
+    # generation is already bumped when the fresh table becomes observable. Creating the table first
+    # left a window where the empty table exists under the OLD generation, so the guard passed and a
+    # dirty shard still read clean. Bumping first means any observation of a fresh/absent table also
+    # sees the new generation ⇒ treated dirty (the safe direction). (persistent_term generation, the
+    # Heartbeat #8 pattern; force_dirty_open_shards proactively notifies registered coordinators.)
+    gen = :persistent_term.get({__MODULE__, :generation}, -1) + 1
+    :persistent_term.put({__MODULE__, :generation}, gen)
+
     # public + write_concurrency: many stream processes bump concurrently, each on its own shard
     # key; the coordinator reads its own shard's count off the hot path. decentralized_counters
     # keeps concurrent update_counter writes off a shared counter cache line.
@@ -105,14 +118,6 @@ defmodule Fathom.Shard.WriteCounter do
       read_concurrency: true
     ])
 
-    # Expert review #14: this table dies with its owner, and a restart hands every open
-    # coordinator a FRESH EMPTY table — count(id) = 0 for all shards — while each keeps
-    # its old flushed_through watermark, so `count > flushed_through` classified every
-    # dirty shard on the node as clean and drop_clean deleted un-flushed writes. Detect
-    # our own re-boot (persistent_term generation, the Heartbeat #8 pattern) and tell
-    # every registered coordinator to treat its dirtiness as unknown ⇒ flush.
-    gen = :persistent_term.get({__MODULE__, :generation}, -1) + 1
-    :persistent_term.put({__MODULE__, :generation}, gen)
     if gen > 0, do: force_dirty_open_shards()
 
     {:ok, %{}}
