@@ -59,7 +59,10 @@ defmodule Fathom.Shard do
 
   @default_idle_ms 60_000
   @default_lease_ttl_ms 30_000
-  @default_flush_interval_ms 30_000
+  # 5s node-loss RPO for busy shards (write-gated — clean shards skip the PUT). Was 30s;
+  # the fathom.rpo sweep confirmed p99 loss ≈ interval (docs/durability.md), so 5s trades
+  # ~6× more PUTs on write-active shards for a ~6× tighter loss window.
+  @default_flush_interval_ms 5_000
   @pull_timeout 60_000
   # Synchronous force-flush (`:flush_now`) budget: a checkpoint + fenced full-file PUT (possibly
   # queued behind sibling flushes through the shared Finch pool) at real S3 latency. Generous so a

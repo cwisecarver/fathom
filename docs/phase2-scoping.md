@@ -27,7 +27,7 @@ re-opening a closed decision, not building Phase 2.
   dedicated S3 Finch pool, `warm_s3_shards_per_s`).
 - **Failover, RPO.** Data loss on a crash = writes since the last flush. Now
   write-gated (the durability dirty-flag): a dirty shard flushes every
-  `:shard_flush_interval_ms` (default 30s, tunable), so RPO ≤ that interval for
+  `:shard_flush_interval_ms` (default 5s, tunable), so RPO ≤ that interval for
   actively-written shards.
 - **Capacity / hot spots.** Placement is pure ketama hash — a persistently hot shard
   (or a node that hashed several hot shards) can't be moved. `docs/deploy-cluster.md`

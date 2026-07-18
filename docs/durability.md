@@ -52,8 +52,8 @@ window scales with write rate and interval, not with the host):
 | `:shard_flush_interval_ms` | lost rows (p50 / p99) | lost window (p50 / p99) |
 |---|---|---|
 | 1 000 | 97 / 160 | 0.6 s / 1.0 s |
-| 5 000 | 452 / 800 | 2.7 s / 4.8 s |
-| 30 000 (default) | 2 647 / 4 800 | 15.9 s / 28.9 s |
+| 5 000 (default) | 452 / 800 | 2.7 s / 4.8 s |
+| 30 000 | 2 647 / 4 800 | 15.9 s / 28.9 s |
 | 0 (idle-only) | 2 600 / 4 800 | 16 s / 29 s — run-bounded, **unbounded** for a never-idle shard |
 
 Two things the table pins. The **p99 lost window ≈ the interval** (965 ms / 4.8 s / 28.9 s — a node
@@ -142,8 +142,9 @@ the bucket underneath the fathom-managed snapshots above:
 - **`synchronous`** — `FULL` (default): per-commit fsync, local durability to a process crash.
   `NORMAL` trades that for fewer fsyncs (was the old default; FULL is ~free here, so there's little
   reason to weaken it).
-- **`:shard_flush_interval_ms`** — the RPO knob for hot shards. Smaller = tighter loss window, more
-  PUTs. `0` = idle-only (unbounded window for a never-idle shard).
+- **`:shard_flush_interval_ms`** — the RPO knob for hot shards (default **5 s** ⇒ ~5 s node-loss
+  window for busy shards). Smaller = tighter loss window, more PUTs. `0` = idle-only (unbounded
+  window for a never-idle shard).
 - **write-gating is automatic** — clean shards never flush, so tightening the interval costs PUTs
   only on shards actually being written.
 
