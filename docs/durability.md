@@ -144,7 +144,10 @@ the bucket underneath the fathom-managed snapshots above:
   reason to weaken it).
 - **`:shard_flush_interval_ms`** — the RPO knob for hot shards (default **5 s** ⇒ ~5 s node-loss
   window for busy shards). Smaller = tighter loss window, more PUTs. `0` = idle-only (unbounded
-  window for a never-idle shard).
+  window for a never-idle shard). **Keep the alert thresholds coupled:** `FathomUnflushedAgeHigh`
+  (~6×) and `FathomManyDirtyShards` (~12×) in [`alert-rules.yml`](../deploy/observability/alert-rules.yml)
+  are sized to this default — change one, retune the others, or a real S3 outage blows the intended
+  RPO by that multiple before paging.
 - **write-gating is automatic** — clean shards never flush, so tightening the interval costs PUTs
   only on shards actually being written.
 

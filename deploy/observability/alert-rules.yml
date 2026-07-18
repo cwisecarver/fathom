@@ -37,7 +37,7 @@ groups:
 
       - alert: FathomFlushFailing
         # The DIRECT flush-failure signal (#27): flushes are erroring, not just aging. A persistent
-        # rate means an S3 auth / bucket-policy / reachability problem turning "RPO = 30s" into
+        # rate means an S3 auth / bucket-policy / reachability problem turning "RPO = 5s" into
         # "RPO = hours" silently. The coordinator also escalates to Logger.error past
         # :flush_failure_alert_threshold consecutive failures.
         expr: sum by (node) (rate(fathom_shard_flush_failed_count[5m])) > 0
@@ -51,23 +51,28 @@ groups:
       - alert: FathomUnflushedAgeHigh
         # The RPO exposure gauge. Rising oldest-unflushed age = flushes are failing silently (S3
         # trouble or a stuck coordinator). This is the "flush failure rate" signal the RPO gauge
-        # surfaces. (TUNE) to your flush cadence + acceptable RPO.
-        expr: max by (node) (fathom_durability_oldest_age_ms) > 120000
+        # surfaces. (TUNE) to your flush cadence + acceptable RPO. Threshold is ~6x the default
+        # :shard_flush_interval_ms (5s, lib/fathom/shard.ex:62) — keep these coupled, so a busy
+        # shard un-flushed this long past its cadence, sustained 5m, is genuinely stuck, not
+        # mid-cadence (docs/durability.md dials). Was 120000 (4x the OLD 30s default).
+        expr: max by (node) (fathom_durability_oldest_age_ms) > 30000
         for: 5m
         labels: {severity: page}
         annotations:
-          summary: "Oldest un-flushed write > 2m on {{ $labels.node }} (RPO exposure rising)"
+          summary: "Oldest un-flushed write > 30s on {{ $labels.node }} (RPO exposure rising)"
           description: "A shard has held un-flushed writes beyond the RPO target for 5m — flushes are not landing. If the node is lost now, this window is lost. Check S3 reachability + coordinator health."
           runbook: docs/runbooks/operations.md#runbook-node-disk-full-shard_data_dir
 
       - alert: FathomManyDirtyShards
         # Informational capacity signal: a large fraction of open shards holding un-flushed writes.
-        expr: max by (node) (fathom_durability_dirty_shards) > 0 and max by (node) (fathom_durability_oldest_age_ms) > 300000
+        # Oldest-age bar is ~12x the default :shard_flush_interval_ms (5s) — keep coupled with the
+        # default (was 300000 for the OLD 30s default).
+        expr: max by (node) (fathom_durability_dirty_shards) > 0 and max by (node) (fathom_durability_oldest_age_ms) > 60000
         for: 10m
         labels: {severity: ticket}
         annotations:
           summary: "Dirty shards not draining on {{ $labels.node }}"
-          description: "Open shards are holding un-flushed writes with the oldest > 5m — periodic flush may be starved. Correlate with S3 op latency."
+          description: "Open shards are holding un-flushed writes with the oldest > 60s — periodic flush may be starved. Correlate with S3 op latency."
           runbook: docs/runbooks/cluster.md
 
   # ---------------------------------------------------------------------------------------------
