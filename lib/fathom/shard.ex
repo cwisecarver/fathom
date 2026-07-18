@@ -1140,14 +1140,21 @@ defmodule Fathom.Shard do
   end
 
   @impl true
-  def terminate(_reason, %{conns: conns, lease_lost: true} = state)
-      when map_size(conns) == 0 do
+  def terminate(_reason, %{lease_lost: true} = state) do
     # We no longer own the shard; flushing our local copy would clobber the node that took over.
     # But don't DESTROY it: a dirty local holds acked-but-unflushed committed writes — exactly the
     # class of data the fork path carefully preserves — so quarantine it (.fenced.<ts>) for recovery
     # instead of drop_local (expert review 2026-07-14 #5). A clean copy (an in-flight flush task
     # landed before the steal) is just dropped. Use the SETTLED state, and decide BEFORE forgetting
     # the write counter (unflushed?/1 and the lost-window delta both read it).
+    #
+    # This clause covers a self-fence with connections STILL CHECKED OUT (conns > 0) too — a busy
+    # self-fence, which is the *likely* case (self-fencing peaks under load: GC pauses / missed
+    # heartbeat renewals). Before expert review 2026-07-18 #1 that landed in the catch-all clause,
+    # which abandoned the dirty local at its normal path with no quarantine, log, or telemetry —
+    # silently stranding acked writes. quarantine_fenced!'s File.rename is safe while streams hold
+    # the file open (Unix keeps the fd on the renamed inode); the streams tear down when their
+    # monitor on this dying coordinator fires.
     state = settle_flush_task(state)
     Fathom.ShardLoad.forget(state.id)
     Fathom.ShardLatency.forget(state.id)

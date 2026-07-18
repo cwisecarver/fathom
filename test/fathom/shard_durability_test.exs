@@ -284,6 +284,54 @@ defmodule Fathom.ShardDurabilityTest do
            "the superseded local .db was renamed aside, not left in place or deleted"
   end
 
+  # Expert review 2026-07-18 #1: a self-fence with a stream STILL CHECKED OUT (conns > 0) — the
+  # BUSY case, which is the likely one (self-fencing peaks under load) — hit the terminate/2
+  # catch-all, which abandoned the dirty local <shard>.db in place with no quarantine, log, or
+  # telemetry: acked-but-unflushed writes silently stranded at the normal path. The lease_lost
+  # quarantine clause must cover conns > 0 too. Here the connection is kept open across the fence.
+  test "a BUSY self-fence (connection still checked out) quarantines the dirty local copy",
+       %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('acked')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    assert Shard.dirty?(coordinator)
+    # conns > 0: the connection is NEVER closed before the fence — the busy case.
+    ref = Process.monitor(coordinator)
+
+    test_pid = self()
+    handler = "fenced-busy-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shard, :fenced_quarantine],
+      fn _e, meas, meta, _cfg -> send(test_pid, {:quarantined, meas, meta}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    # Another node steals the lease; the durability flush's pre-flush fence self-fences.
+    put_raw_lock(shard, "thief@node", 999, now_ms() + 60_000)
+
+    capture_log(fn ->
+      send(coordinator, :durability_flush)
+      assert_receive {:DOWN, ^ref, :process, ^coordinator, {:shutdown, :lease_lost}}, 1_000
+    end)
+
+    assert Path.wildcard(local_db(shard) <> ".fenced.*") != [],
+           "a busy self-fence must quarantine acked-but-unflushed writes as .fenced.<ts>, not abandon them"
+
+    refute File.exists?(local_db(shard)),
+           "the superseded local .db was renamed aside, not left in place at the normal path"
+
+    assert_receive {:quarantined, %{unflushed: unflushed}, %{shard_id: ^shard}}
+    assert unflushed >= 1, "the busy self-fence must be as observable (telemetry) as the idle one"
+
+    refute File.exists?(remote_db(shard)), "a fenced flush must not clobber the new owner"
+  end
+
   # Expert review 2026-07-14 #41: pin the invariant "every flushed object is an openable,
   # quick_check-clean SQLite database" across the flush paths that run in the default suite —
   # the checkpoint-then-raw-upload (idle drop) and the VACUUM-INTO snapshot (periodic flush).
