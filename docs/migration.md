@@ -86,7 +86,13 @@ both are now caught instead of silently forking the fleet:
 - **`RetirementJob`** drops retained old versions past their `retain_until`.
 - **`RevertJob`** flips the fleet pointer back (see below).
 
-Directory lifecycle `status` runs `active → migrating → retired` (or `migration_failed`).
+Directory lifecycle `status` runs `active ⇄ migrating` on the migrate path — a shard returns to
+`active` after cutover (`Directory.cutover/2`); it is the retained **`<shard>@<version>` storage
+object**, not the shard's directory row, that `RetirementJob` retires. Other statuses are reached by
+their own paths: `migration_failed` (quarantine on exhausted attempts), and the tenant-lifecycle
+`deleted`/`suspended`. `retired` is a valid status (and hand-editable) but has no autonomous caller
+today — `Directory.retire/2` exists for a future decommission-but-not-delete flow (expert review
+2026-07-18 #17).
 
 ## Cross-version tolerance — the fleet is mixed mid-rollout
 
