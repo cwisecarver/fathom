@@ -17,7 +17,7 @@ defmodule FathomWeb.AdminQueryLive do
 
   import FathomWeb.AdminComponents
 
-  alias Fathom.QueryConsole
+  alias Fathom.{QueryConsole, ShardId}
 
   @impl true
   def mount(_params, _session, socket) do
@@ -42,6 +42,24 @@ defmodule FathomWeb.AdminQueryLive do
 
       sql == "" ->
         {:noreply, assign(socket, error: input_error("enter a SQL statement"), result: nil)}
+
+      # Validate the shard id before it reaches QueryConsole.host_for/1, which interpolates it into
+      # the Host (expert review 2026-07-18 #16). Unvalidated, a dotted id like "acme.other" is
+      # reinterpreted by Host-subdomain routing as its FIRST label ("acme") — an admin would run SQL
+      # against the WRONG tenant. ShardId.valid? enforces the DNS-label-safe format (no dots/slashes).
+      # Validate the shard id before it reaches QueryConsole.host_for/1, which interpolates it into
+      # the Host (expert review 2026-07-18 #16). Unvalidated, a dotted id like "acme.other" is
+      # reinterpreted by Host-subdomain routing as its FIRST label ("acme") — an admin would run SQL
+      # against the WRONG tenant. ShardId.valid? enforces the DNS-label-safe format (no dots/slashes).
+      not ShardId.valid?(shard) ->
+        {:noreply,
+         assign(socket,
+           error:
+             input_error(
+               "invalid shard id — letters, digits, hyphen or underscore only (no dots or slashes)"
+             ),
+           result: nil
+         )}
 
       true ->
         {:noreply,

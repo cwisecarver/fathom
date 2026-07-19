@@ -50,6 +50,21 @@ defmodule FathomWeb.AdminQueryLiveTest do
     assert html =~ "enter a shard id"
   end
 
+  # Expert review 2026-07-18 #16: the console only trimmed the shard field, then QueryConsole
+  # interpolated it into the Host. A dotted id ("acme.other") is reinterpreted by Host-subdomain
+  # routing as its FIRST label ("acme"), so an admin could run SQL against the WRONG tenant. The id
+  # is now validated with ShardId.valid? before the query runs.
+  test "an invalid (dotted) shard id renders an error without querying", %{conn: conn} do
+    {:ok, view, _html} = conn |> auth() |> live("/admin/query")
+
+    html =
+      view |> form("#query-form", q: %{shard: "acme.other", sql: "SELECT 1"}) |> render_submit()
+
+    assert html =~ "invalid shard id"
+    # It short-circuited before the async query — no result pane appears.
+    refute has_element?(view, "#query-results")
+  end
+
   test "runs a real front-door query and renders the result", %{conn: conn, id: id} do
     {:ok, _} = Fathom.QueryConsole.run(id, "CREATE TABLE t (v TEXT)")
     {:ok, _} = Fathom.QueryConsole.run(id, "INSERT INTO t VALUES ('hi')")
