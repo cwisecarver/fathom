@@ -34,9 +34,21 @@ defmodule Fathom.Test.FaultyStorage do
 
   @impl true
   def renew_lease(shard_id, lease, ttl_ms) do
+    renew_delay()
+
     if fault() == :renew,
       do: {:error, {:transient, :s3_unreachable}},
       else: Local.renew_lease(shard_id, lease, ttl_ms)
+  end
+
+  # Optional artificial lease-renew latency (ms) so a test can make the legacy-mode flush fence's
+  # renew PUT slow — proving it runs OFF the coordinator process and doesn't block the mailbox
+  # (expert review 2026-07-18 #18).
+  defp renew_delay do
+    case Application.get_env(:fathom, :storage_renew_delay_ms) do
+      ms when is_integer(ms) and ms > 0 -> Process.sleep(ms)
+      _ -> :ok
+    end
   end
 
   @impl true

@@ -951,6 +951,46 @@ defmodule Fathom.ShardDurabilityTest do
     ShardExecutor.close(conn)
   end
 
+  # Expert review 2026-07-18 #18: in legacy mode (heartbeat down — the test env default) the
+  # pre-flush fence does a renew PUT. Running it inline in handle_info(:durability_flush) blocked the
+  # coordinator mailbox a storage RTT every flush — the p99 checkout stall #27 removed, reintroduced
+  # for the degraded mode. The fence now runs in the flush task, so a slow renew leaves the
+  # coordinator free to serve other messages.
+  test "a slow legacy-mode fence renew does not block the coordinator mailbox (#18)",
+       %{shard: shard} do
+    Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Application.put_env(:fathom, :storage_renew_delay_ms, 500)
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :storage_renew_delay_ms)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, coordinator} = Shards.ensure(shard)
+
+    # Trigger a periodic flush: the coordinator spawns the fence+flush task, whose legacy renew now
+    # sleeps 500 ms OFF-process. A :sys.get_state queued right behind must return promptly — pre-fix
+    # the inline renew blocked the mailbox for ~500 ms, so it would take that long.
+    send(coordinator, :durability_flush)
+
+    started = System.monotonic_time(:millisecond)
+    _ = :sys.get_state(coordinator)
+    elapsed = System.monotonic_time(:millisecond) - started
+
+    assert elapsed < 200,
+           "coordinator blocked #{elapsed}ms on the fence renew (should run off-process)"
+
+    ShardExecutor.close(conn)
+  end
+
   test "a supervisor shutdown flushes via terminate/2 instead of losing the write",
        %{shard: shard} do
     # Regression: the coordinator didn't trap exits, so a supervisor `:shutdown` (SIGTERM,
