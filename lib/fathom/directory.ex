@@ -235,6 +235,32 @@ defmodule Fathom.Directory do
   def mark_migrating(shard_id),
     do: update_shard(shard_id, %{status: "migrating", migrating_since: DateTime.utc_now()})
 
+  @doc """
+  Renews a shard's `migrating_since` liveness stamp (expert review 2026-07-18 #11) — bumps it to
+  now, but ONLY while the shard is `migrating`. The migration lease renewer calls this on the same
+  cadence it renews the S3 lease, so a genuinely-running long copy keeps its stamp fresh (renewer
+  alive ⇒ `reclaim_stale_migrating/1` leaves it be), while a migration whose Oban job was lost
+  stops renewing (renewer dead ⇒ the stamp goes stale ⇒ it is reclaimed). `mark_migrating` stamps
+  it once; without this renewal a >`stale_after` copy was flipped back to `active` while still
+  running.
+
+  A no-op for any non-`migrating` status: the lease renewer also runs for a fork (which holds a
+  lease but never enters `migrating`), so this must never resurrect an active/cut-over/failed row.
+  Returns the number of rows touched (0 or 1) so a caller can tell a no-op from a real renewal.
+  """
+  @spec touch_migrating(String.t()) :: non_neg_integer()
+  def touch_migrating(shard_id) do
+    now = DateTime.utc_now()
+
+    {count, _} =
+      Repo.update_all(
+        from(s in Shard, where: s.shard_id == ^shard_id and s.status == "migrating"),
+        set: [migrating_since: now, updated_at: now]
+      )
+
+    count
+  end
+
   @doc "Quarantines a shard whose migration exhausted its retries."
   @spec mark_failed(String.t()) :: {:ok, Shard.t()} | {:error, :not_found | Ecto.Changeset.t()}
   def mark_failed(shard_id),

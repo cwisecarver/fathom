@@ -177,6 +177,44 @@ defmodule Fathom.DirectoryTest do
       assert {:ok, %Shard{status: "migrating"}} = Directory.get("fresh")
       assert {:ok, %Shard{status: "active"}} = Directory.get("plain")
     end
+
+    # Expert review 2026-07-18 #11: mark_migrating stamps migrating_since ONCE, so a genuinely
+    # running >stale_after copy was flipped back to `active` mid-run. touch_migrating (called by the
+    # migration lease renewer on the lease cadence) renews the stamp — a live long copy keeps a
+    # fresh stamp and is NOT reclaimed; only a lost-job migration (renewer dead, stamp goes stale)
+    # is reclaimed.
+    test "touch_migrating renews the stamp so a live long migration is not reclaimed" do
+      {:ok, _} = Directory.resolve("live_long")
+      {:ok, _} = Directory.mark_migrating("live_long")
+      # The copy started 2h ago — well past the 1h timeout — but the renewer is alive.
+      backdate_migrating("live_long", 7_200)
+
+      # A renewer tick lands, renewing the stamp to now.
+      assert Directory.touch_migrating("live_long") == 1
+
+      # With a fresh stamp it survives the reclaim sweep (pre-fix: nothing renewed it → reclaimed).
+      assert Directory.reclaim_stale_migrating(3_600) == []
+      assert {:ok, %Shard{status: "migrating"}} = Directory.get("live_long")
+
+      # Contrast: once the renewer stops (job lost) the stamp goes stale and it IS reclaimed —
+      # proving the stamp, not wall-clock-since-mark, is the signal.
+      backdate_migrating("live_long", 7_200)
+      assert Directory.reclaim_stale_migrating(3_600) == ["live_long"]
+      assert {:ok, %Shard{status: "active"}} = Directory.get("live_long")
+    end
+
+    test "touch_migrating is a no-op for a non-migrating shard (never resurrects it)" do
+      # A fork holds the lease and drives the renewer, but its dst is never `migrating` — the touch
+      # must not stamp migrating_since onto an active row.
+      {:ok, _} = Directory.resolve("not_migrating")
+      assert Directory.touch_migrating("not_migrating") == 0
+
+      assert {:ok, %Shard{status: "active", migrating_since: nil}} =
+               Directory.get("not_migrating")
+
+      # And an unknown shard is simply 0 rows, not an error.
+      assert Directory.touch_migrating("no_such_shard") == 0
+    end
   end
 
   # Finding #29: touches are coalesced and batch-flushed, and a stale flush (out-of-order

@@ -394,6 +394,14 @@ defmodule Fathom.Migrator.ShardMigration do
       :stop -> :ok
     after
       interval ->
+        # Renew the directory's `migrating_since` liveness stamp on the same cadence as the lease
+        # (expert review 2026-07-18 #11), so a genuinely-running long copy isn't reclaimed as stale
+        # mid-run. Best-effort: a Postgres blip must NEVER kill the renewer — that would lapse the
+        # lease and let a client steal the shard mid-migration (the exact failure this loop exists to
+        # prevent). A missed touch only risks one spurious reclaim, which re-enqueues the idempotent
+        # copy. A no-op for a fork (not `migrating`).
+        renew_migrating_stamp(shard_id)
+
         result =
           try do
             Storage.renew_lease(shard_id, lease, ttl)
@@ -435,6 +443,17 @@ defmodule Fathom.Migrator.ShardMigration do
     Process.unlink(pid)
     send(pid, :stop)
     :ok
+  end
+
+  # Best-effort directory liveness touch (#11); see the call site in renew_loop/4. Swallows any
+  # store/Repo error so the renewer keeps the lease alive regardless of Postgres reachability.
+  defp renew_migrating_stamp(shard_id) do
+    Directory.touch_migrating(shard_id)
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
   end
 
   # Confirm we still own the shard right before a clobbering write (flush / restore / cutover).
