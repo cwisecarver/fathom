@@ -20,32 +20,46 @@ defmodule Fathom.ShardExecutor do
   alias Fathom.Shards
   alias Filo.{Describe, Error, Stmt, StmtResult}
 
+  # The behaviour's required 1-arity open; the real open is open/2. A direct open/1 (or an
+  # executor caller with no auth context) gets the full-access default scope.
+  @impl true
+  def open(shard_id), do: open(shard_id, :rw)
+
   @impl true
   # No shard could be resolved for the request (no subdomain, override off, and no configured
   # default — the prod fail-closed posture, finding #26). Refuse rather than commingle the caller
   # into a shared default shard. A 400 status so Filo's HTTP pipeline surfaces it as a client error.
-  def open(nil),
+  def open(nil, _context),
     do: {:error, %Error{message: "no shard specified", code: "FILO_NO_SHARD", status: 400}}
 
-  def open(shard_id) do
+  # `context` is the token's scope (:rw/:ro, #24), which Filo threads from HranaAuth.authorize/2
+  # as the connection's authenticated context (Filo.Executor.open/2). This replaced a process-dict
+  # side-channel that silently failed across the HTTP request→stream process hop (a `ro` token then
+  # got full write access) and leaked on the 2nd WS stream of one connection — audit #3.
+  def open(shard_id, context) do
     # Normalize (validate + downcase) at this trust boundary so the handle's id — which drives the
     # write counter, template-capture check, and load counters — matches the registry key / file /
     # S3 key that Shards.checkout uses (finding #19). Build the handle from the canonical id.
     case Fathom.ShardId.cast(shard_id) do
-      {:ok, id} -> do_open(id)
+      {:ok, id} -> do_open(id, scope_of(context))
       :error -> {:error, open_error(:invalid_shard_id)}
     end
   end
 
-  defp do_open(shard_id) do
+  # The authorize context is HranaAuth's scope atom. Anything else — nil (a bare `:ok` / no
+  # authorize callback) or an unexpected term — is the safe default: full access is only granted
+  # by the absence of a restriction, and `:ro` is the only restriction, only ever set explicitly.
+  defp scope_of(:ro), do: :ro
+  defp scope_of(_), do: :rw
+
+  defp do_open(shard_id, scope) do
     case Shards.checkout(shard_id) do
       {:ok, pid, ref, path} ->
         case Connection.open(path) do
           {:ok, conn} ->
-            # The token's scope (rw/ro, #24) was stashed by HranaAuth.authorize/2 during this same
-            # stream open (same process); it rides the handle so execute/2 can enforce read-only
-            # across baton-resumes. Defaults to :rw when auth is disabled (no token) or absent.
-            {:ok, {pid, ref, conn, shard_id, Fathom.HranaAuth.take_scope()}}
+            # The scope rides the handle so execute/2 can enforce read-only across baton-resumes
+            # and every stream on the connection.
+            {:ok, {pid, ref, conn, shard_id, scope}}
 
           {:error, reason} ->
             Shard.checkin(pid, ref)

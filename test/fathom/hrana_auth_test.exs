@@ -34,13 +34,13 @@ defmodule Fathom.HranaAuthTest do
 
   test ":disabled (the default) accepts everything, token or not" do
     Application.put_env(:fathom, :hrana_auth, :disabled)
-    assert :ok = HranaAuth.authorize("demo", nil)
-    assert :ok = HranaAuth.authorize("demo", "garbage")
+    assert {:ok, :rw} = HranaAuth.authorize("demo", nil)
+    assert {:ok, :rw} = HranaAuth.authorize("demo", "garbage")
   end
 
   test ":required accepts a token minted for the same shard" do
     require_auth!()
-    assert :ok = HranaAuth.authorize("acme", token!("acme"))
+    assert {:ok, :rw} = HranaAuth.authorize("acme", token!("acme"))
   end
 
   test ":required refuses a missing token with 401" do
@@ -63,8 +63,8 @@ defmodule Fathom.HranaAuthTest do
   test "grant matching is case-canonical: a token minted for ACME authorizes acme (#19)" do
     require_auth!()
     token = token!("ACME")
-    assert :ok = HranaAuth.authorize("acme", token)
-    assert :ok = HranaAuth.authorize("ACME", token)
+    assert {:ok, :rw} = HranaAuth.authorize("acme", token)
+    assert {:ok, :rw} = HranaAuth.authorize("ACME", token)
   end
 
   test "an expired token is refused when :hrana_token_max_age is set" do
@@ -74,12 +74,13 @@ defmodule Fathom.HranaAuthTest do
 
     assert {:error, %Filo.Error{status: 401}} = HranaAuth.authorize("acme", stale)
     # A fresh token under the same max_age still passes.
-    assert :ok = HranaAuth.authorize("acme", token!("acme"))
+    assert {:ok, :rw} = HranaAuth.authorize("acme", token!("acme"))
   end
 
   test "a nil shard passes through so open(nil) keeps its fail-closed 400 (#26)" do
     require_auth!()
-    assert :ok = HranaAuth.authorize(nil, nil)
+    # {:ok, :rw} — the scope is moot; open(nil, _) refuses with a 400 regardless.
+    assert {:ok, :rw} = HranaAuth.authorize(nil, nil)
   end
 
   test "an invalid shard id is refused even with a well-signed token (defense-in-depth)" do

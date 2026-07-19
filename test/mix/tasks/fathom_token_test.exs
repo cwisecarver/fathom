@@ -30,7 +30,7 @@ defmodule Mix.Tasks.Fathom.TokenTest do
     Mix.Tasks.Fathom.Token.run([shard])
     assert_received {:mix_shell, :info, [token]}
 
-    assert HranaAuth.authorize(shard, token) == :ok,
+    assert match?({:ok, _}, HranaAuth.authorize(shard, token)),
            "the minted token must embed the CURRENT revocation floor (pre-fix: v=1, dead on arrival)"
   end
 

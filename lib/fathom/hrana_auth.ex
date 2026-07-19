@@ -65,17 +65,23 @@ defmodule Fathom.HranaAuth do
   Filo's `:authorize` callback: may `token` open a stream on `shard_id`?
 
   `shard_id` is the resolved open-arg (`Fathom.ShardExecutor.shard_from_conn/1`'s
-  result). Returns `:ok` or `{:error, %Filo.Error{status: 401}}`.
+  result). On success returns `{:ok, scope}` — the token's `:rw`/`:ro` scope
+  (#24) — which Filo threads to `Fathom.ShardExecutor.open/2` as the connection's
+  authenticated context (see `Filo.Executor.open/2`), so the executor can enforce
+  read-only per statement without a per-process side-channel. Auth-disabled or a
+  nil shard yields `{:ok, :rw}` (full access; the trust boundary is the network).
+  A refusal is `{:error, %Filo.Error{status: 401}}`.
   """
-  @spec authorize(String.t() | nil, String.t() | nil) :: :ok | {:error, Filo.Error.t()}
-  # No shard resolved: pass through so `ShardExecutor.open(nil)` refuses with its
+  @spec authorize(String.t() | nil, String.t() | nil) ::
+          {:ok, :rw | :ro} | {:error, Filo.Error.t()}
+  # No shard resolved: authorize as :rw so `ShardExecutor.open(nil, _)` refuses with its
   # clearer 400 (the fail-closed posture, finding #26) instead of a misleading 401 —
-  # nothing can open on a nil shard regardless.
-  def authorize(nil, _token), do: :ok
+  # nothing can open on a nil shard regardless, so the scope here is moot.
+  def authorize(nil, _token), do: {:ok, :rw}
 
   def authorize(shard_id, token) do
     case mode() do
-      :disabled -> :ok
+      :disabled -> {:ok, :rw}
       :required -> verify(shard_id, token)
     end
   end
@@ -87,10 +93,10 @@ defmodule Fathom.HranaAuth do
            Phoenix.Token.verify(secret!(), @salt, token, max_age: max_age()),
          {:ok, ^granted} <- ShardId.cast(shard_id),
          true <- version_ok?(version, Revocations.floor_info(granted)) do
-      # Stash the token's scope for the stream open that follows in THIS process (#24); the executor
-      # reads it into the handle so it can enforce read-only per statement. Missing claim ⇒ rw.
-      stash_scope(decode_scope(Map.get(payload, "sc")))
-      :ok
+      # The token's scope flows to the stream open as Filo's authorize context (#24) — no
+      # process-dict side-channel, so it survives the HTTP request→stream process hop and
+      # applies to every WS stream on the connection. Missing claim ⇒ :rw.
+      {:ok, decode_scope(Map.get(payload, "sc"))}
     else
       # Bad signature/expiry, a token for a different shard, a revoked (stale-version)
       # token, or an id that doesn't cast (defense-in-depth). One opaque refusal for
@@ -126,23 +132,6 @@ defmodule Fathom.HranaAuth do
   # granted by the absence of a claim / an explicit rw, and `ro` is the only restriction.
   defp decode_scope("ro"), do: :ro
   defp decode_scope(_), do: :rw
-
-  @scope_key {__MODULE__, :stream_scope}
-
-  @doc false
-  @spec stash_scope(:rw | :ro) :: :ok
-  def stash_scope(scope) do
-    Process.put(@scope_key, scope)
-    :ok
-  end
-
-  @doc """
-  Read + clear the scope `authorize/2` stashed for the stream open running in THIS process (#24),
-  defaulting to `:rw` (auth disabled ⇒ no token ⇒ full access; the trust boundary is the network).
-  Called by `Fathom.ShardExecutor.open/1`.
-  """
-  @spec take_scope() :: :rw | :ro
-  def take_scope, do: Process.delete(@scope_key) || :rw
 
   @doc """
   Mints a bearer token granting access to `shard_id` (canonicalized).

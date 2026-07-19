@@ -34,7 +34,7 @@ defmodule Fathom.HranaAuthRevocationTest do
     {:ok, _} = Directory.resolve(shard)
     {:ok, token} = HranaAuth.token_for(shard)
 
-    assert HranaAuth.authorize(shard, token) == :ok
+    assert {:ok, _} = HranaAuth.authorize(shard, token)
 
     assert {:ok, 2} = HranaAuth.revoke(shard)
 
@@ -43,7 +43,7 @@ defmodule Fathom.HranaAuthRevocationTest do
 
     # A freshly-minted token embeds the new version and works again.
     {:ok, token2} = HranaAuth.token_for(shard)
-    assert HranaAuth.authorize(shard, token2) == :ok
+    assert {:ok, _} = HranaAuth.authorize(shard, token2)
   end
 
   test "revoking one shard does not affect another shard's tokens" do
@@ -55,7 +55,7 @@ defmodule Fathom.HranaAuthRevocationTest do
 
     {:ok, _} = HranaAuth.revoke(a)
 
-    assert HranaAuth.authorize(b, token_b) == :ok,
+    assert match?({:ok, _}, HranaAuth.authorize(b, token_b)),
            "revoking shard A must not invalidate shard B's tokens"
   end
 
@@ -66,7 +66,7 @@ defmodule Fathom.HranaAuthRevocationTest do
     {:ok, token} = HranaAuth.token_for(shard)
     Revocations.put(shard, 0)
 
-    assert HranaAuth.authorize(shard, token) == :ok
+    assert {:ok, _} = HranaAuth.authorize(shard, token)
   end
 
   # Round-2 #24: revoke/1 bumped the directory + the revoking node's ETS but pushed
@@ -80,7 +80,7 @@ defmodule Fathom.HranaAuthRevocationTest do
     shard = uniq()
     {:ok, token} = HranaAuth.token_for(shard)
     Revocations.put(shard, 1)
-    assert HranaAuth.authorize(shard, token) == :ok
+    assert {:ok, _} = HranaAuth.authorize(shard, token)
 
     # Another node revoked: its notify arrives (no directory row exists here at all,
     # so any effect must come from the notification, not a read-through).
@@ -209,7 +209,7 @@ defmodule Fathom.HranaAuthRevocationTest do
 
     Application.put_env(:fathom, :hrana_token_secret, String.duplicate("a", 64))
     {:ok, token} = HranaAuth.token_for(shard)
-    assert HranaAuth.authorize(shard, token) == :ok
+    assert {:ok, _} = HranaAuth.authorize(shard, token)
 
     # Rotating ONLY the dedicated secret invalidates the token — proving it signs
     # with that secret, not secret_key_base (which is untouched here).

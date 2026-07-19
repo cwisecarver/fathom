@@ -53,12 +53,12 @@ defmodule Fathom.HranaAuthRotationTest do
     shard = uniq()
     {:ok, _} = Directory.resolve(shard)
     {:ok, old} = HranaAuth.token_for(shard)
-    assert HranaAuth.authorize(shard, old) == :ok
+    assert {:ok, _} = HranaAuth.authorize(shard, old)
 
     assert {:ok, new} = HranaAuth.rotate(shard)
     # Zero downtime: the new token works immediately AND the old keeps working during grace.
-    assert HranaAuth.authorize(shard, new) == :ok
-    assert HranaAuth.authorize(shard, old) == :ok
+    assert {:ok, _} = HranaAuth.authorize(shard, new)
+    assert {:ok, _} = HranaAuth.authorize(shard, old)
   end
 
   test "once the grace window has elapsed the old token stops verifying" do
@@ -68,7 +68,7 @@ defmodule Fathom.HranaAuthRotationTest do
     {:ok, old} = HranaAuth.token_for(shard)
 
     assert {:ok, new} = HranaAuth.rotate(shard)
-    assert HranaAuth.authorize(shard, new) == :ok
+    assert {:ok, _} = HranaAuth.authorize(shard, new)
 
     assert {:error, %Filo.Error{status: 401}} = HranaAuth.authorize(shard, old),
            "with the grace window elapsed the previous version must be refused"
@@ -93,7 +93,7 @@ defmodule Fathom.HranaAuthRotationTest do
     {:ok, v1} = HranaAuth.token_for(shard)
 
     {:ok, _v2} = HranaAuth.rotate(shard)
-    assert HranaAuth.authorize(shard, v1) == :ok, "v1 is floor-1 → covered by grace"
+    assert match?({:ok, _}, HranaAuth.authorize(shard, v1)), "v1 is floor-1 → covered by grace"
 
     {:ok, _v3} = HranaAuth.rotate(shard)
 
