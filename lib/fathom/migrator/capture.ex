@@ -47,6 +47,17 @@ defmodule Fathom.Migrator.Capture do
   def forget(conn_id, server \\ __MODULE__),
     do: GenServer.cast(server, {:forget, conn_id})
 
+  @doc """
+  How many captured template versions are buffered pending a Postgres write (expert review
+  2026-07-18 #6). A value > 0 means a control-plane outage is in progress: these migrations HAVE
+  committed on the template but have NOT been recorded fleet-wide, so a restart now (a rolling
+  deploy) loses them — and every later captured version then assumes DDL the fleet never received.
+  A deploy/drain gate can poll this and refuse a rolling restart until it drains to 0; `terminate/2`
+  alarms loudly if a shutdown happens while it's > 0.
+  """
+  @spec pending_count(GenServer.server()) :: non_neg_integer()
+  def pending_count(server \\ __MODULE__), do: GenServer.call(server, :pending_count)
+
   @doc "Classifies a statement's transaction role. Savepoints count as `:other`."
   @spec classify(String.t()) :: :begin | :commit | :rollback | :other
   def classify(sql) do
@@ -63,7 +74,12 @@ defmodule Fathom.Migrator.Capture do
   end
 
   @impl true
-  def init(state), do: {:ok, state}
+  def init(state) do
+    # Trap exits so a graceful supervisor shutdown (a rolling deploy / SIGTERM) runs terminate/2,
+    # where the #6 guard alarms if captures are still buffered pending a Postgres write.
+    Process.flag(:trap_exit, true)
+    {:ok, state}
+  end
 
   @impl true
   def handle_cast({:begin, conn_id, count}, state) do
@@ -81,6 +97,10 @@ defmodule Fathom.Migrator.Capture do
   def handle_cast({:forget, conn_id}, state), do: {:noreply, Map.delete(state, conn_id)}
 
   @impl true
+  def handle_call(:pending_count, _from, state) do
+    {:reply, length(Map.get(state, :pending, [])), state}
+  end
+
   def handle_call({:commit, conn_id, count}, _from, state) do
     case Map.pop(state, conn_id) do
       {nil, state} ->
@@ -136,6 +156,39 @@ defmodule Fathom.Migrator.Capture do
           [] -> {:noreply, state}
           still -> {:noreply, schedule_retry(Map.put(state, :pending, still))}
         end
+    end
+  end
+
+  # We trap exits (see init/1) for the shutdown guard; a stray non-parent EXIT would otherwise
+  # crash the process — and take the pending buffer this whole path exists to preserve down with it.
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  @impl true
+  def terminate(_reason, state) do
+    case Map.get(state, :pending, []) do
+      [] ->
+        :ok
+
+      pending ->
+        # Expert review 2026-07-18 #6: a clean shutdown (a rolling deploy) WHILE captures are
+        # buffered pending a Postgres write loses them silently — the buffer is in-memory only, and
+        # Postgres is the thing that's down so it can't be persisted. We can't veto the shutdown, but
+        # we make it LOUD (Logger.error + telemetry) so it's alertable, and pending_count/1 lets a
+        # deploy gate refuse the restart until the buffer drains.
+        Logger.error(
+          "Fathom.Migrator.Capture is shutting down with #{length(pending)} captured template " <>
+            "version(s) NOT yet recorded to Postgres (a control-plane outage) — these committed-on-" <>
+            "template migrations are being LOST, so the fleet will assume DDL it never received. Do " <>
+            "NOT deploy/restart during a control-plane outage; drain Capture.pending_count/1 to 0 first."
+        )
+
+        :telemetry.execute(
+          [:fathom, :migrator, :capture_pending_on_shutdown],
+          %{count: length(pending)},
+          %{}
+        )
+
+        :ok
     end
   end
 
