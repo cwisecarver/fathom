@@ -1130,11 +1130,15 @@ defmodule Fathom.Shard do
             {:stop, {:shutdown, :lease_lost},
              settle_waiters(%{state | lease_lost: true}, {:error, :lease_lost})}
 
-          # Couldn't confirm ownership (transient store error / heartbeat not valid) —
-          # don't write, keep dirty, retry next interval.
+          # Couldn't confirm ownership (transient store error / heartbeat not valid) — don't write,
+          # keep dirty, retry next interval. Feed the SAME RPO-alerting path a PUT failure does
+          # (expert review 2026-07-18 #8): a persistent heartbeat/lease outage grows the loss window
+          # exactly like a PUT failure, but the old bare per-interval warning produced none of the
+          # alertable signal. Route it through record_flush_failure/2 (consecutive counter +
+          # [:fathom,:shard,:flush,:failed] telemetry + escalation) with a distinct reason — a durable
+          # flush still clears the counter once ownership is reconfirmed.
           :skip ->
-            Logger.warning("shard #{state.id}: durability flush skipped, ownership unconfirmed")
-            {:noreply, schedule_flush(state)}
+            {:noreply, schedule_flush(record_flush_failure(state, :ownership_unconfirmed))}
         end
     end
   end

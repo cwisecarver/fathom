@@ -885,6 +885,72 @@ defmodule Fathom.ShardDurabilityTest do
     ShardExecutor.close(conn)
   end
 
+  # Expert review 2026-07-18 #8: an ownership-unconfirmed flush skip (Fence.check :skip — a
+  # transient lease/heartbeat store error, not a lost lease) grows the RPO exactly like a PUT
+  # failure, but used to produce only a per-interval Logger.warning: no telemetry, no escalation,
+  # nothing alertable. It must now feed the SAME record_flush_failure path — consecutive counter +
+  # [:fathom,:shard,:flush,:failed] telemetry + escalation, reset on a durable flush. Test env runs
+  # legacy-mode fences (heartbeat off), so faulting renew_lease makes Fence.check return :skip
+  # BEFORE any write — the ownership-unconfirmed path, distinct from the post-fence PUT failure the
+  # sibling test covers.
+  test "an ownership-unconfirmed flush skip feeds the RPO-alerting telemetry and escalates (#8)",
+       %{shard: shard} do
+    Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    prev_threshold = Application.get_env(:fathom, :flush_failure_alert_threshold)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Application.put_env(:fathom, :flush_failure_alert_threshold, 2)
+
+    test_pid = self()
+    handler = "skipfail-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shard, :flush, :failed],
+      fn _e, meas, meta, _cfg -> send(test_pid, {:flush_failed, meas, meta}) end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler)
+      Application.delete_env(:fathom, :storage_fault)
+      restore(:flush_failure_alert_threshold, prev_threshold)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+    {:ok, coordinator} = Shards.ensure(shard)
+
+    # Fault the lease RENEW (not the flush PUT): in legacy mode the fence renews the lease as its
+    # ownership proof, so a transient renew error makes Fence.check return :skip before any write.
+    Application.put_env(:fathom, :storage_fault, :renew)
+
+    # First skip: consecutive == 1 (pre-fix: no telemetry at all — assert_receive would time out).
+    capture_log(fn -> flush_now(coordinator) end)
+    assert_receive {:flush_failed, %{count: 1, consecutive: 1}, %{shard_id: ^shard}}
+
+    # Second skip: consecutive == 2, hits the threshold ⇒ escalate to Logger.error carrying the
+    # distinct :ownership_unconfirmed reason (proving it's the skip path, not a PUT failure).
+    log = capture_log(fn -> flush_now(coordinator) end)
+    assert_receive {:flush_failed, %{count: 1, consecutive: 2}, %{shard_id: ^shard}}
+    assert log =~ "FAILED 2× consecutively"
+    assert log =~ ":ownership_unconfirmed"
+
+    # Ownership reconfirmed: a durable flush RESETS the counter and emits NO failure event — a skip
+    # participates in the same reset-on-recovery contract as a PUT failure.
+    Application.delete_env(:fathom, :storage_fault)
+    flush_now(coordinator)
+    refute_receive {:flush_failed, _, _}, 100
+
+    ShardExecutor.close(conn)
+  end
+
   test "a supervisor shutdown flushes via terminate/2 instead of losing the write",
        %{shard: shard} do
     # Regression: the coordinator didn't trap exits, so a supervisor `:shutdown` (SIGTERM,
