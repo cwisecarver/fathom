@@ -41,6 +41,11 @@ defmodule Fathom.Tenants do
   # by the admission gate regardless).
   @suspend_drain_ms 5_000
 
+  # How long a fork waits to drain any LOCAL coordinator for the dst before acquiring its lease (#14),
+  # so this node isn't the one holding the lease it's about to acquire. Short — a novel dst usually
+  # has no coordinator, and a busy one means dst is genuinely in use (refuse rather than clobber).
+  @fork_drain_ms 5_000
+
   # Per-shard Oban workers a delete must cancel so a queued migration/revert/retirement/
   # handoff can't run against (or resurrect) a shard being erased. The DeleteJob itself is
   # excluded — it must not cancel its own kind.
@@ -106,9 +111,10 @@ defmodule Fathom.Tenants do
   `src`'s live coordinator so the fork carries its very latest writes (the keystone-fork case: fork
   a just-migrated template without waiting for the idle flush). The flush is non-disruptive (`src`
   keeps serving) but **local** — see `Fathom.Shards.flush/1`; on a multi-node fleet flush `src` on its
-  home node first. Refuses `{:error, :already_exists}`/`{:error, :tombstoned}` (dst taken),
-  `{:error, :no_source}` (src has no stored object / directory row), the flush error if
-  `flush_source` fails, or `{:error, :invalid_shard_id}`.
+  home node first. Refuses `{:error, :already_exists}`/`{:error, :tombstoned}` (dst taken in the
+  directory), `{:error, :dst_exists}` (dst already has a stored object), `{:error, :dst_busy}` (dst is
+  being opened/forked concurrently — its lease is held), `{:error, :no_source}` (src has no stored
+  object / directory row), the flush error if `flush_source` fails, or `{:error, :invalid_shard_id}`.
   """
   @spec fork(String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def fork(src_id, dst_id, opts \\ []) do
@@ -117,7 +123,7 @@ defmodule Fathom.Tenants do
          :ok <- refuse_if_taken(dst),
          {:ok, %{schema_version: schema_version}} <- fetch_src(src),
          :ok <- maybe_flush_source(src, opts),
-         :ok <- Storage.fork_shard(src, dst) do
+         :ok <- fork_into_leased_dst(src, dst) do
       register_fork(dst, schema_version)
 
       {:ok,
@@ -129,6 +135,48 @@ defmodule Fathom.Tenants do
        }}
     end
   end
+
+  # Copy src → dst while HOLDING the dst lease (expert review 2026-07-18 #14). Without it,
+  # `refuse_if_taken` (a directory check) then an unconditional `Storage.fork_shard` copy is a TOCTOU:
+  # a dst minted organically or by a second fork between the check and the copy is clobbered, and an
+  # organic coordinator that already holds the dst lease (with acked writes still in its WAL, not yet
+  # flushed) has its first flush 412 and self-fence — silently losing those writes. Mirror
+  # `ShardMigration.do_fork`'s guard: drain any local coordinator so THIS node isn't the holder, then
+  # `acquire_lease` — an atomic `If-None-Match:*` create on the `.lock` object, so a concurrent
+  # open/fork loses the acquire (`{:held, _}`) and is refused instead of racing at the `.db`. A fork
+  # is one object copy, well within the lease TTL, so no renewer is needed (unlike the migration copy).
+  defp fork_into_leased_dst(src, dst) do
+    case Shards.drain(dst, @fork_drain_ms) do
+      :ok ->
+        owner = fork_owner()
+
+        case Storage.acquire_lease(dst, owner, fork_lease_ttl()) do
+          {:ok, lease} ->
+            try do
+              Storage.fork_shard(src, dst)
+            after
+              Storage.release_lease(dst, lease)
+            end
+
+          # Another node/coordinator holds the dst lease — refuse rather than clobber it.
+          {:error, {:held, _holder}} ->
+            {:error, :dst_busy}
+
+          {:error, reason} ->
+            {:error, {:lease_unavailable, reason}}
+        end
+
+      # A local coordinator for dst is busy/undrainable — treat as dst-in-use, don't clobber.
+      {:error, :busy} ->
+        {:error, :dst_busy}
+
+      {:error, reason} ->
+        {:error, {:drain_failed, reason}}
+    end
+  end
+
+  defp fork_owner, do: "tenant-fork@#{node()}@#{System.unique_integer([:positive])}"
+  defp fork_lease_ttl, do: Application.get_env(:fathom, :shard_lease_ttl_ms, 30_000)
 
   @doc """
   Force-flushes a tenant's live coordinator so its current state is durable in storage, without

@@ -183,11 +183,17 @@ defmodule Fathom.Shard.Storage.Local do
   def fork_shard(src_id, dst_id) do
     # Fork a live shard to a new id (#14): guard both ends, then an atomic (temp+rename) copy so a
     # torn fork is never adopted. Refuse if the dst already exists (no clobber) or the src doesn't.
-    cond do
-      File.exists?(remote_path(dst_id)) -> {:error, :dst_exists}
-      not File.exists?(remote_path(src_id)) -> {:error, :no_source}
-      true -> Storage.atomic_copy(remote_path(src_id), remote_path(dst_id))
-    end
+    # The exists-check + copy run UNDER the dst mutex (expert review 2026-07-18 #14) so they are
+    # atomic — two concurrent forks (or a fork racing an organic first flush, which also takes this
+    # mutex) can't both pass File.exists? and then clobber; the loser sees the object → :dst_exists.
+    # This is the storage-layer double of the caller's dst-lease guard (Fathom.Tenants.fork).
+    with_lock_mutex(dst_id, fn ->
+      cond do
+        File.exists?(remote_path(dst_id)) -> {:error, :dst_exists}
+        not File.exists?(remote_path(src_id)) -> {:error, :no_source}
+        true -> Storage.atomic_copy(remote_path(src_id), remote_path(dst_id))
+      end
+    end)
   end
 
   # --- point-in-time snapshots (#12) ---

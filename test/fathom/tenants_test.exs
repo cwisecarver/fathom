@@ -187,6 +187,47 @@ defmodule Fathom.TenantsTest do
       {:ok, _} = Directory.resolve(src)
       assert {:error, :no_source} = Tenants.fork(src, dst)
     end
+
+    # Expert review 2026-07-18 #14: refuse_if_taken (a directory check) then an unconditional
+    # Storage.fork_shard copy was a TOCTOU — a dst opened organically or by a second fork between
+    # the check and the copy got clobbered, and an organic coordinator holding the dst lease (with
+    # acked-but-unflushed writes) had its first flush 412 + self-fence, silently losing them. The
+    # fork now holds the dst lease across the copy, so a held lease makes it refuse, not clobber.
+    test "refuses a dst whose lease is held — no clobber of a concurrent open/fork (#14)",
+         %{id: src, dst: dst} do
+      {:ok, _} = Directory.resolve(src)
+      write!(src, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('orig')"])
+      flush!(src)
+
+      # A concurrent owner (an organic coordinator on another node, or a second in-flight fork)
+      # holds the dst lease; a fresh 30s TTL keeps it :live via the lock's own TTL (no heartbeat
+      # needed, per the Local backend's owner_live? fallback).
+      {:ok, _held} = Storage.acquire_lease(dst, "other-node@holder", 30_000)
+
+      # The fork loses the acquire and refuses. Pre-fix (no lease guard) it copied src over dst and
+      # returned {:ok, _}, clobbering the holder / self-fencing its writes.
+      assert {:error, :dst_busy} = Tenants.fork(src, dst)
+
+      # It created no dst object and no dst directory row — the fork never touched it.
+      assert {:ok, nil} == Storage.object_etag(dst)
+      assert Directory.get(dst) == :error
+    end
+
+    # The storage-layer guard (now atomic under the dst mutex): a dst that already has a stored
+    # object but NO directory row (e.g. a prior fork that never finished registering) slips past the
+    # directory-only refuse_if_taken, so Storage.fork_shard's :dst_exists must catch it.
+    test "refuses when the dst already has a stored object (no clobber) (#14)",
+         %{id: src, dst: dst} do
+      {:ok, _} = Directory.resolve(src)
+      write!(src, ["CREATE TABLE t (v TEXT)"])
+      flush!(src)
+
+      :ok = Storage.fork_shard(src, dst)
+      assert {:ok, etag} = Storage.object_etag(dst)
+      assert etag != nil
+
+      assert {:error, :dst_exists} = Tenants.fork(src, dst)
+    end
   end
 
   describe "flush/1 + fork(flush_source:) — the keystone-fork affordance (#10)" do
