@@ -1373,11 +1373,32 @@ defmodule Fathom.Shard do
   end
 
   defp flush_and_reconcile(state) do
-    case snapshot_and_upload(state) do
-      {:error, :superseded} -> reconcile_superseded(state)
-      other -> other
-    end
+    started = System.monotonic_time()
+
+    result =
+      case snapshot_and_upload(state) do
+        {:error, :superseded} -> reconcile_superseded(state)
+        other -> other
+      end
+
+    # Flush-COST telemetry (expert review 2026-07-18 #20 — the cost side of the flush-interval knob,
+    # complementing the RPO benefit measured by Fathom.Rpo). The VACUUM INTO snapshot + object PUT
+    # ran here in the flush task; emit the duration + outcome so operators can watch the flush RATE
+    # (a tighter interval flushes proportionally more often) and per-flush cost, and so
+    # `mix fathom.rpo --cost` can quantify it. Un-tagged by shard (cardinality) beyond metadata.
+    :telemetry.execute(
+      [:fathom, :shard, :flush],
+      %{duration: System.monotonic_time() - started},
+      %{shard_id: state.id, outcome: flush_outcome(result)}
+    )
+
+    result
   end
+
+  defp flush_outcome({:ok, _}), do: :uploaded
+  defp flush_outcome({:reconciled, _}), do: :reconciled
+  defp flush_outcome(:superseded), do: :superseded
+  defp flush_outcome({:error, _}), do: :error
 
   # Disambiguate a data-PUT 412 during the periodic durability flush (expert review #2),
   # OFF the coordinator process (expert review 2026-07-14 #8 — runs inside the flush task).

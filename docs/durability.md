@@ -66,6 +66,26 @@ first — survival came purely from the local WAL), the local-durability layer p
 boundary is pinned as deterministic invariants in `test/fathom/rpo_test.exs`; the multi-node /
 real-disk complement is `deploy/chaos/chaos.sh soak`.
 
+### Cost — the flush rate the interval buys
+
+The loss window above is the *benefit* of a tighter interval; the *cost* is the flush **rate**.
+`mix fathom.rpo --cost` drives a continuously-write-active shard for a window at each interval and
+reports the flushes (each a **VACUUM INTO** snapshot + **full-object PUT**) and their per-flush
+duration. At **100 writes/s** over a 60 s window (dev, Local storage — the VACUUM + local-copy cost;
+real-S3 PUT cost is the `FATHOM_S3_TEST_*` / chaos-rig complement):
+
+| `:shard_flush_interval_ms` | flushes / 60 s | flush µs (p50 / p99) |
+|---|---|---|
+| 5 000 (default) | 12 | 6.0 ms / 7.7 ms |
+| 30 000 | 2 | 5.1 ms / 5.1 ms |
+
+The flush **rate scales ~1/interval** (12 vs 2 — ~6× for 5 s vs 30 s) at **~constant per-flush cost**
+(~5–8 ms on Local, dominated by the VACUUM INTO snapshot, which is also the long-lived reader that
+holds back the passive WAL checkpoint). So the default 5 s buys its ~6× smaller loss window (2.7 s vs
+15.9 s p50, above) at ~6× the VACUUM/PUT rate — the tradeoff review #20 flagged, now measured on the
+benefit **and** cost sides. The 6× PUT rate shares the S3 Finch pool with cold-opens, so before
+tightening below 5 s price the real-S3 PUT cost + that contention with `scripts/benchmark_s3_latency.sh`.
+
 **This bound holds only while flushes succeed.** A *persistent* flush failure — an S3 auth change, a
 bucket-policy change, a credential expiry — makes the RPO **unbounded**: the shard stays dirty and
 retries every interval, the oldest-unflushed-age climbs, and (before review #27) the only trace was

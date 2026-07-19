@@ -16,6 +16,19 @@ defmodule Mix.Tasks.Fathom.Rpo do
   coordinator, re-opens on the same disk, and confirms `synchronous=FULL` loses
   nothing. See `Fathom.Rpo` and `docs/durability.md`.
 
+  ## Cost side (`--cost`, expert review #20)
+
+      mix fathom.rpo --cost [--rate 100] [--window-ms 20000] [--intervals 5000,30000]
+
+  The complement to the RPO benefit: drives a continuously-write-active shard for
+  the window at each interval and reports the flush RATE (flushes/s) and per-flush
+  VACUUM-INTO+PUT duration (p50/p90/p99/max µs). A tighter interval flushes
+  proportionally more often (≈ `window/interval`) at ~constant per-flush cost, so
+  5s vs 30s is ~6× the VACUUM/PUT rate for a tighter RPO — the cost that buys the
+  loss-window reduction the default mode measures. Local storage prices the VACUUM
+  + local copy; point `FATHOM_S3_TEST_*` at real S3 for the PUT cost + Finch-pool
+  contention with cold-opens.
+
   Prints a human table to stderr and one JSON line to stdout. Optional
   `--append PATH` records the JSON line. Run prod-compiled (`MIX_ENV=prod`) for
   representative numbers; the multi-node / real-disk complement is
@@ -29,7 +42,14 @@ defmodule Mix.Tasks.Fathom.Rpo do
   # subsystem it needs itself (as Fathom.Scale does).
   @requirements ["app.config"]
 
-  @switches [rate: :integer, samples: :integer, intervals: :string, append: :string]
+  @switches [
+    rate: :integer,
+    samples: :integer,
+    intervals: :string,
+    append: :string,
+    cost: :boolean,
+    window_ms: :integer
+  ]
 
   @impl true
   def run(argv) do
@@ -45,15 +65,27 @@ defmodule Mix.Tasks.Fathom.Rpo do
           s |> String.split(",", trim: true) |> Enum.map(&String.to_integer(String.trim(&1)))
       end
 
-    measure_opts =
-      opts
-      |> Keyword.take([:rate, :samples])
-      |> maybe_put(:intervals, intervals)
+    # --cost measures the COST side (VACUUM/PUT rate + per-flush duration, expert review #20); the
+    # default measures the RPO benefit (loss window). Two complementary views of the same knob.
+    {result, printer} =
+      if Keyword.get(opts, :cost, false) do
+        cost_opts =
+          opts
+          |> Keyword.take([:rate, :window_ms])
+          |> maybe_put(:intervals, intervals || [5_000, 30_000])
 
-    result = Fathom.Rpo.measure(measure_opts)
+        {Fathom.Rpo.flush_cost(cost_opts), &print_cost/1}
+      else
+        measure_opts =
+          opts
+          |> Keyword.take([:rate, :samples])
+          |> maybe_put(:intervals, intervals)
+
+        {Fathom.Rpo.measure(measure_opts), &print/1}
+      end
 
     try do
-      print(result)
+      printer.(result)
       json = Jason.encode!(result)
       Mix.shell().info(json)
 
@@ -98,6 +130,28 @@ defmodule Mix.Tasks.Fathom.Rpo do
       Mix.shell().error(
         "  #{pad(label, 14)}#{pad(Integer.to_string(row.distinct_flush_points), 9)}" <>
           "#{pad("#{lr.p50}/#{lr.p90}/#{lr.p99}/#{lr.max}", 30)}#{lm.p50}/#{lm.p90}/#{lm.p99}/#{lm.max}"
+      )
+    end)
+
+    Mix.shell().error("")
+  end
+
+  defp print_cost(r) do
+    Mix.shell().error("\n=== fathom.rpo --cost — flush cost (VACUUM+PUT) vs flush interval ===")
+
+    Mix.shell().error("  #{r.rate_per_s} w/s sustained · #{r.window_ms} ms window/interval\n")
+
+    Mix.shell().error(
+      "  #{pad("interval", 14)}#{pad("flushes", 9)}#{pad("flushes/s", 11)}flush µs (VACUUM+PUT) p50/p90/p99/max"
+    )
+
+    Enum.each(r.intervals, fn row ->
+      f = row.flush_us
+
+      Mix.shell().error(
+        "  #{pad("#{row.interval_ms} ms", 14)}#{pad(Integer.to_string(row.flushes), 9)}" <>
+          "#{pad(:erlang.float_to_binary(row.flushes_per_s, decimals: 2), 11)}" <>
+          "#{f.p50}/#{f.p90}/#{f.p99}/#{f.max}"
       )
     end)
 

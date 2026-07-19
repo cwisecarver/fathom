@@ -991,6 +991,34 @@ defmodule Fathom.ShardDurabilityTest do
     ShardExecutor.close(conn)
   end
 
+  # Expert review 2026-07-18 #20: the periodic flush emits a cost signal — [:fathom,:shard,:flush]
+  # with the VACUUM-INTO+PUT duration + outcome — so operators can watch flush rate/cost and
+  # `mix fathom.rpo --cost` can quantify the cost side of the interval knob.
+  test "a successful flush emits the flush-cost telemetry with a duration (#20)", %{shard: shard} do
+    test_pid = self()
+    handler = "flushcost-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shard, :flush],
+      fn _e, meas, meta, _ -> send(test_pid, {:flush, meas, meta}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, coordinator} = Shards.ensure(shard)
+
+    flush_now(coordinator)
+
+    assert_receive {:flush, %{duration: d}, %{shard_id: ^shard, outcome: :uploaded}}
+    assert is_integer(d) and d > 0
+
+    ShardExecutor.close(conn)
+  end
+
   test "a supervisor shutdown flushes via terminate/2 instead of losing the write",
        %{shard: shard} do
     # Regression: the coordinator didn't trap exits, so a supervisor `:shutdown` (SIGTERM,

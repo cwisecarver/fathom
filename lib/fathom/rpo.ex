@@ -35,6 +35,9 @@ defmodule Fathom.Rpo do
   @default_samples 30
   @default_intervals [0, 5_000, 30_000]
 
+  @default_cost_intervals [5_000, 30_000]
+  @default_cost_window_ms 20_000
+
   @doc """
   Measure the node-loss window across a sweep of flush intervals, then the
   process-crash case. Options:
@@ -64,6 +67,104 @@ defmodule Fathom.Rpo do
       intervals: interval_rows,
       process_kill: pk
     }
+  end
+
+  @doc """
+  Measure the COST side of the flush-interval knob (expert review 2026-07-18 #20 — the complement to
+  `measure/1`'s RPO benefit). At each interval, drive a continuously-write-active shard for a window
+  so it's ALWAYS dirty (a flush every interval), and count the flushes (each a VACUUM INTO snapshot +
+  full-object PUT) and their per-flush duration. A tighter interval flushes proportionally more often
+  (≈ `window/interval`), each paying the snapshot + upload cost — so 5s vs 30s is ~6× the VACUUM/PUT
+  rate for a tighter RPO. Local storage measures the VACUUM + local-copy cost; point
+  `FATHOM_S3_TEST_*` at real S3 to price the PUT (and its Finch-pool contention with cold-opens).
+
+  Options: `:rate` (writes/sec, default `#{@default_rate}`), `:window_ms`
+  (write window per interval, default `#{@default_cost_window_ms}`), `:intervals`
+  (default `#{inspect(@default_cost_intervals)}`).
+  """
+  @spec flush_cost(keyword()) :: map()
+  def flush_cost(opts \\ []) do
+    rate = Keyword.get(opts, :rate, @default_rate)
+    window_ms = Keyword.get(opts, :window_ms, @default_cost_window_ms)
+    intervals = Keyword.get(opts, :intervals, @default_cost_intervals)
+
+    setup()
+    rows = Enum.map(intervals, &cost_interval(&1, rate, window_ms))
+
+    %{rate_per_s: rate, window_ms: window_ms, intervals: rows}
+  end
+
+  defp cost_interval(interval_ms, rate, window_ms) do
+    Application.put_env(:fathom, :shard_flush_interval_ms, interval_ms)
+
+    test_pid = self()
+    handler = "rpo-flush-cost-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shard, :flush],
+      fn _e, %{duration: d}, %{outcome: o}, _cfg -> send(test_pid, {:flush_cost, o, d}) end,
+      nil
+    )
+
+    shard = "rpo_cost_#{System.unique_integer([:positive])}"
+    {:ok, h} = ShardExecutor.open(shard)
+
+    {:ok, _} =
+      ShardExecutor.execute(
+        h,
+        %Stmt{sql: "CREATE TABLE t (seq INTEGER PRIMARY KEY, ts_ms INTEGER)"}
+      )
+
+    # Continuous writes for the window keep the shard dirty, so the periodic flush fires every
+    # interval — the sustained-write-load case where the cost is highest.
+    drive_writes_until(h, rate, now_ms() + window_ms)
+
+    # Let the last in-flight flush land, then drain and collect the telemetry.
+    sleep_ms(min(interval_ms, 2_000))
+    drain(shard, h)
+    :telemetry.detach(handler)
+
+    durations_us = collect_flushes([])
+
+    %{
+      interval_ms: interval_ms,
+      flushes: length(durations_us),
+      flushes_per_s: Float.round(length(durations_us) * 1_000 / window_ms, 2),
+      flush_us: dist(durations_us)
+    }
+  end
+
+  defp drive_writes_until(h, rate, t_end) do
+    gap = 1_000 / rate
+
+    Enum.reduce_while(Stream.iterate(1, &(&1 + 1)), :ok, fn s, _ ->
+      if now_ms() >= t_end do
+        {:halt, :ok}
+      else
+        {:ok, _} =
+          ShardExecutor.execute(
+            h,
+            %Stmt{sql: "INSERT INTO t (seq, ts_ms) VALUES (?, ?)", args: [s, now_ms()]}
+          )
+
+        sleep_ms(gap)
+        {:cont, :ok}
+      end
+    end)
+  end
+
+  # Drain the flush telemetry mailbox, keeping only the outcomes that actually did a VACUUM+PUT.
+  defp collect_flushes(acc) do
+    receive do
+      {:flush_cost, outcome, duration} when outcome in [:uploaded, :reconciled] ->
+        collect_flushes([System.convert_time_unit(duration, :native, :microsecond) | acc])
+
+      {:flush_cost, _outcome, _duration} ->
+        collect_flushes(acc)
+    after
+      0 -> acc
+    end
   end
 
   # --- node-loss sweep -----------------------------------------------------
