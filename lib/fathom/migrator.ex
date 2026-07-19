@@ -494,32 +494,38 @@ defmodule Fathom.Migrator do
   def revert(from_version, to_version, opts \\ []) do
     force? = Keyword.get(opts, :force, false)
     if Keyword.get(opts, :yank, true), do: yank(from_version)
-    shards = Directory.shards_at_version(from_version)
 
-    # Expert review #23: the per-shard dedup below ignores `force`, so in the intended
-    # operator flow — non-force sweep, guard cancels some shards, re-issue with
-    # force: true — any shard whose first RevertJob was still in flight (snoozing on
-    # :shard_busy / {:held, _}) was silently dropped from the force sweep; the surviving
-    # non-force job then hit the guard and cancelled, so the shard was never reverted
-    # despite the explicit force. Upgrade in-flight jobs' args instead of skipping
-    # them; they count toward the returned total. Round-2 #21 tightened this to the
-    # WHOLE operation: upgrading only `force` while a snoozing job targeted a
-    # different to_version force-reverted the shard (a destructive discard) to the
-    # WRONG version — so the retarget sets to_version too (last operator command wins).
-    forced =
-      if force?,
-        do: retarget_inflight_reverts(Enum.map(shards, & &1.shard_id), to_version),
-        else: 0
+    # Keyset-stream the shard_ids in pages instead of materializing every shard at the version as a
+    # full struct (expert review 2026-07-18 #12 — a fleet revert loaded millions of rows into
+    # memory). Process each page independently so a page's jobs commit and start reverting before
+    # the next page is fetched (the emergency path wants shards reverting ASAP, not after a
+    # full-fleet scan). Per page: upgrade in-flight jobs (force), then enqueue the rest.
+    total =
+      Directory.stream_ids_at_version(from_version, @enqueue_chunk)
+      |> Stream.chunk_every(@enqueue_chunk)
+      |> Enum.reduce(0, fn ids, acc ->
+        # Expert review #23: the per-shard dedup in enqueue_unique ignores `force`, so in the
+        # intended operator flow — non-force sweep, guard cancels some shards, re-issue with
+        # force: true — any shard whose first RevertJob was still in flight (snoozing on
+        # :shard_busy / {:held, _}) was silently dropped from the force sweep; the surviving
+        # non-force job then hit the guard and cancelled, so the shard was never reverted despite
+        # the explicit force. Upgrade in-flight jobs' args instead. Round-2 #21 tightened this to
+        # the WHOLE operation: upgrading only `force` while a snoozing job targeted a different
+        # to_version force-reverted the shard (a destructive discard) to the WRONG version — so the
+        # retarget sets to_version too (last operator command wins).
+        forced = if force?, do: retarget_inflight_reverts(ids, to_version), else: 0
 
-    enqueued =
-      shards
-      |> Enum.map(
-        &{&1.shard_id,
-         RevertJob.new(%{shard_id: &1.shard_id, to_version: to_version, force: force?})}
-      )
-      |> enqueue_unique()
+        enqueued =
+          ids
+          |> Enum.map(
+            &{&1, RevertJob.new(%{shard_id: &1, to_version: to_version, force: force?})}
+          )
+          |> enqueue_unique()
 
-    {:ok, enqueued + forced}
+        acc + enqueued + forced
+      end)
+
+    {:ok, total}
   end
 
   @doc """
@@ -566,30 +572,27 @@ defmodule Fathom.Migrator do
           failed: non_neg_integer()
         }
   def revert_status(from_version) do
-    remaining = Directory.shards_at_version(from_version)
+    # The remaining count is an aggregate (#12) — never materialize the (millions-large) set just to
+    # length/1 it. The in-flight count streams the ids in keyset pages and counts revert jobs per
+    # chunk, so memory stays bounded regardless of fleet size.
+    remaining = Directory.count_at_version(from_version)
 
     in_flight =
-      case Enum.map(remaining, & &1.shard_id) do
-        [] ->
-          0
+      Directory.stream_ids_at_version(from_version, @enqueue_chunk)
+      |> Stream.chunk_every(@enqueue_chunk)
+      |> Enum.reduce(0, fn chunk, acc ->
+        acc +
+          Repo.aggregate(
+            from(j in Job,
+              where: j.worker == "Fathom.Migrator.RevertJob",
+              where: j.state in @unique_states,
+              where: fragment("?->>'shard_id'", j.args) in ^chunk
+            ),
+            :count
+          )
+      end)
 
-        ids ->
-          ids
-          |> Enum.chunk_every(@enqueue_chunk)
-          |> Enum.reduce(0, fn chunk, acc ->
-            acc +
-              Repo.aggregate(
-                from(j in Job,
-                  where: j.worker == "Fathom.Migrator.RevertJob",
-                  where: j.state in @unique_states,
-                  where: fragment("?->>'shard_id'", j.args) in ^chunk
-                ),
-                :count
-              )
-          end)
-      end
-
-    %{remaining: length(remaining), in_flight: in_flight, failed: Directory.count_failed()}
+    %{remaining: remaining, in_flight: in_flight, failed: Directory.count_failed()}
   end
 
   # Rewrite in-flight revert jobs to THIS force sweep's operation — force: true AND

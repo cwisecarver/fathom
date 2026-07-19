@@ -217,6 +217,53 @@ defmodule Fathom.DirectoryTest do
     end
   end
 
+  # Expert review 2026-07-18 #12: shards_at_version/1 is an unbounded Repo.all — a fleet revert
+  # (millions of shards at a version) materialized every one as a full struct. revert/3 now
+  # keyset-streams the ids in pages and revert_status/1 uses an aggregate count, so memory stays
+  # bounded. These pin the two new primitives: the aggregate count and the keyset pagination
+  # (which must enumerate the full set exactly once across page boundaries — an off-by-one on the
+  # `shard_id > last` cursor would drop or duplicate shards from a revert).
+  describe "count_at_version/1 and stream_ids_at_version/2 (finding #12)" do
+    test "count_at_version aggregates the active set at a version, excluding others" do
+      for id <- ~w(a b c), do: Directory.resolve(id)
+      {:ok, _} = Directory.cutover("a", 5)
+      {:ok, _} = Directory.cutover("b", 5)
+      # c stays at version 0.
+      {:ok, _} = Directory.resolve("ret")
+      {:ok, _} = Directory.cutover("ret", 5)
+      {:ok, _} = Directory.retire("ret", DateTime.utc_now())
+
+      assert Directory.count_at_version(5) == 2, "only active shards at v5 (ret is retired)"
+      assert Directory.count_at_version(0) == 1
+      assert Directory.count_at_version(99) == 0
+    end
+
+    test "stream_ids_at_version keyset-pages the full active set exactly once across boundaries" do
+      ids = for n <- 1..7, do: "sv#{n}"
+
+      for id <- ids do
+        {:ok, _} = Directory.resolve(id)
+        {:ok, _} = Directory.cutover(id, 5)
+      end
+
+      # A non-active shard at the same version must be excluded.
+      {:ok, _} = Directory.resolve("sv_gone")
+      {:ok, _} = Directory.cutover("sv_gone", 5)
+      {:ok, _} = Directory.mark_failed("sv_gone")
+
+      # page_size 3 < 7 forces multiple keyset pages (3 + 3 + 1).
+      streamed = Directory.stream_ids_at_version(5, 3) |> Enum.to_list()
+
+      assert Enum.sort(streamed) == Enum.sort(ids)
+      assert length(streamed) == 7, "no dupes or misses across the keyset page boundary"
+      refute "sv_gone" in streamed
+    end
+
+    test "stream_ids_at_version yields nothing for an empty set" do
+      assert Directory.stream_ids_at_version(42, 3) |> Enum.to_list() == []
+    end
+  end
+
   # Finding #29: touches are coalesced and batch-flushed, and a stale flush (out-of-order
   # across a remap) must not rewind last_active_at — the recency heuristics depend on it.
   # record_batch keeps the newer of incoming vs stored (GREATEST).

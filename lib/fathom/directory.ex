@@ -401,10 +401,61 @@ defmodule Fathom.Directory do
     laggard_query(head_version) |> Repo.aggregate(:count)
   end
 
-  @doc "Active shards currently at `version` — the set a fleet revert flips back."
+  @doc """
+  Active shards currently at `version` — the set a fleet revert flips back.
+
+  Materializes the WHOLE set as full structs, so at fleet scale (millions at a version) this is a
+  memory blowup (expert review 2026-07-18 #12). The revert engine now uses `count_at_version/1`
+  (aggregate) and `stream_ids_at_version/2` (keyset-paged ids) instead; keep this only for small,
+  known-bounded callers (ops/iex).
+  """
   @spec shards_at_version(non_neg_integer()) :: [Shard.t()]
   def shards_at_version(version) do
     Repo.all(from s in Shard, where: s.schema_version == ^version and s.status == "active")
+  end
+
+  @doc """
+  How many active shards are at `version` — the aggregate count (#12) for a revert-status gauge,
+  without materializing the (potentially millions-large) set the way `shards_at_version/1` does.
+  """
+  @spec count_at_version(non_neg_integer()) :: non_neg_integer()
+  def count_at_version(version) do
+    Repo.aggregate(
+      from(s in Shard, where: s.schema_version == ^version and s.status == "active"),
+      :count
+    )
+  end
+
+  @doc """
+  Lazily streams the active shard_ids at `version` in keyset-paginated pages of `page_size` (#12),
+  so a fleet-wide set (millions) never materializes at once and never holds one long transaction:
+  each page is an independent short query ordered by `shard_id`, so the revert engine can enqueue +
+  commit per chunk (a job starts after the first page, not after a full scan). Returns a `Stream` of
+  shard_id strings. Robust to shards flipping out of the set mid-scan (a concurrently-reverted shard
+  is simply skipped — its revert is already in flight, and enqueue is idempotent).
+  """
+  @spec stream_ids_at_version(non_neg_integer(), pos_integer()) :: Enumerable.t()
+  def stream_ids_at_version(version, page_size \\ 5_000) do
+    Stream.resource(
+      fn -> "" end,
+      fn last ->
+        ids =
+          Repo.all(
+            from(s in Shard,
+              where: s.schema_version == ^version and s.status == "active" and s.shard_id > ^last,
+              order_by: [asc: s.shard_id],
+              limit: ^page_size,
+              select: s.shard_id
+            )
+          )
+
+        case ids do
+          [] -> {:halt, last}
+          _ -> {ids, List.last(ids)}
+        end
+      end,
+      fn _ -> :ok end
+    )
   end
 
   @doc """
