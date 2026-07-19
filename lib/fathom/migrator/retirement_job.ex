@@ -11,6 +11,23 @@ defmodule Fathom.Migrator.RetirementJob do
   alias Fathom.Directory
   alias Fathom.Shard.Storage
 
+  @retention_seconds 7 * 24 * 60 * 60
+
+  @doc "Retention window (seconds) a retired version's storage object is kept before this job drops it."
+  @spec retention_seconds() :: pos_integer()
+  def retention_seconds, do: @retention_seconds
+
+  @doc """
+  An Oban changeset scheduling `version`'s storage object for deletion after the retention window.
+  The migration/revert cutover `Oban.insert`s this INSIDE its Postgres transaction (the retirement
+  outbox, expert review 2026-07-18 #5), so a committed cutover always carries a durable retirement
+  enqueue — a Postgres blip can never leave a cut-over shard whose old `@version` object is never
+  scheduled for deletion (a silent, un-self-healing storage leak).
+  """
+  @spec schedule_changeset(String.t(), non_neg_integer()) :: Ecto.Changeset.t()
+  def schedule_changeset(shard_id, version),
+    do: new(%{shard_id: shard_id, version: version}, schedule_in: @retention_seconds)
+
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"shard_id" => shard_id, "version" => version}}) do
     cond do

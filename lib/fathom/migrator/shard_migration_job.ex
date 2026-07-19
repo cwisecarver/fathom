@@ -4,10 +4,12 @@ defmodule Fathom.Migrator.ShardMigrationJob do
   `Fathom.Migrator.ShardMigration.run/2`.
 
   Unique per `shard_id` (so the lazy path and the sweep never migrate the same
-  shard twice at once). On success it schedules a `Fathom.Migrator.RetirementJob`
-  to drop the retained old version after the retention window. A `{:retry, ...}`
-  (shard busy / lease held) snoozes; an `{:error, ...}` retries with Oban's backoff
-  and, once attempts are exhausted, quarantines the shard
+  shard twice at once). The retained old version's `Fathom.Migrator.RetirementJob`
+  is enqueued by the migration's cutover ATOMICALLY (the outbox, expert review
+  2026-07-18 #5 — see `ShardMigration.cutover_with_retirement/3`), not here, so a
+  Postgres blip can't leave a cut-over shard with an unscheduled retirement. A
+  `{:retry, ...}` (shard busy / lease held) snoozes; an `{:error, ...}` retries
+  with Oban's backoff and, once attempts are exhausted, quarantines the shard
   (`Directory.mark_failed/1`) so the rest of the rollout keeps converging.
   """
   use Oban.Worker,
@@ -21,9 +23,7 @@ defmodule Fathom.Migrator.ShardMigrationJob do
   require Logger
 
   alias Fathom.Directory
-  alias Fathom.Migrator.{RetirementJob, ShardMigration}
-
-  @retention_seconds 7 * 24 * 60 * 60
+  alias Fathom.Migrator.ShardMigration
   @snooze_seconds 5
 
   @impl Oban.Worker
@@ -35,8 +35,11 @@ defmodule Fathom.Migrator.ShardMigrationJob do
       :ok ->
         :ok
 
-      {:ok, %{from: from}} ->
-        schedule_retirement(shard_id, from)
+      # The migration's cutover already enqueued the old version's retention deletion atomically (the
+      # retirement outbox, expert review 2026-07-18 #5), so a Postgres blip can't leave a cut-over
+      # shard without a scheduled retirement — and this job's crash-forward retry (bare `:ok` above)
+      # doesn't need to re-enqueue.
+      {:ok, %{from: _from}} ->
         :ok
 
       {:retry, reason} ->
@@ -72,11 +75,5 @@ defmodule Fathom.Migrator.ShardMigrationJob do
   defp handle_error(_job, shard_id, reason) do
     Logger.warning("shard #{shard_id}: migration error, will retry (#{inspect(reason)})")
     {:error, reason}
-  end
-
-  defp schedule_retirement(shard_id, version) do
-    %{shard_id: shard_id, version: version}
-    |> RetirementJob.new(schedule_in: @retention_seconds)
-    |> Oban.insert()
   end
 end

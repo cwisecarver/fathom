@@ -25,9 +25,9 @@ defmodule Fathom.Migrator.ShardMigration do
   """
   require Logger
 
-  alias Fathom.Migrator.Copy
+  alias Fathom.Migrator.{Copy, RetirementJob}
   alias Fathom.Shard.{Connection, Storage}
-  alias Fathom.{Directory, Migrator, Shards}
+  alias Fathom.{Directory, Migrator, Repo, Shards}
 
   @doc """
   Brings `shard_id` to `target` (a no-op if it is already there). `token` uniquely identifies
@@ -136,8 +136,9 @@ defmodule Fathom.Migrator.ShardMigration do
       # bytes now in live over the <shard>@<current> backup — destroying the only
       # copy of the post-cutover writes that backup exists to preserve (and the
       # write-age guard passes identically on a retry, so nothing else stops it).
-      # The live file's own user_version is the truth: just finish the cutover.
-      with {:ok, _} <- Directory.cutover(shard_id, to_version) do
+      # The live file's own user_version is the truth: just finish the cutover (co-committing the
+      # backed-up @current object's retirement — the outbox, #5).
+      with {:ok, _} <- cutover_with_retirement(shard_id, to_version, current) do
         warn_revert(shard_id, current, to_version, last_active)
         {:ok, %{from: current, to: to_version}}
       end
@@ -159,7 +160,8 @@ defmodule Fathom.Migrator.ShardMigration do
            # 412 and self-fence away its own writes (check_lease still sees our lock — the restore
            # touched the DATA object, not the lock). A 412 → :superseded aborts here, no clobber.
            :ok <- Storage.restore(shard_id, to_version, expected_etag),
-           {:ok, _} <- Directory.cutover(shard_id, to_version) do
+           # Cut over AND schedule the backed-up @current object's retirement atomically (#5).
+           {:ok, _} <- cutover_with_retirement(shard_id, to_version, current) do
         warn_revert(shard_id, current, to_version, last_active)
         {:ok, %{from: current, to: to_version}}
       end
@@ -539,7 +541,7 @@ defmodule Fathom.Migrator.ShardMigration do
          # a migrated copy of the OLD lineage, with zero error signal. If-Match turns that
          # into a 412 → :superseded, and the job retries from a fresh pull.
          {:ok, _new_etag} <- flush_fenced(shard_id, new, expected_etag),
-         {:ok, _} <- Directory.cutover(shard_id, target) do
+         {:ok, _} <- cutover_with_retirement(shard_id, target, prev) do
       Logger.info("shard #{shard_id}: migrated v#{prev} -> v#{target}")
       {:ok, %{from: prev, to: target}}
     end
@@ -554,9 +556,27 @@ defmodule Fathom.Migrator.ShardMigration do
   defp finalize(shard_id, target) do
     prev = current_version(shard_id)
 
-    with {:ok, _} <- Directory.cutover(shard_id, target) do
+    with {:ok, _} <- cutover_with_retirement(shard_id, target, prev) do
       {:ok, %{from: prev, to: target}}
     end
+  end
+
+  # The retirement outbox (expert review 2026-07-18 #5): cut the directory over to `cutover_to` AND
+  # enqueue the retention deletion of `retire_version`'s `@version` object in ONE Postgres
+  # transaction. Committed together, so a Postgres blip can never leave a shard cut over with its old
+  # version's object never scheduled for deletion (previously the enqueue was a separate Oban.insert
+  # in the job's perform — a blip there crashed the job, and its retry short-circuited on the
+  # already-landed cutover to a bare `:ok` that skipped the enqueue, leaking the object indefinitely
+  # with no self-heal). On failure NEITHER lands and the job retries the cutover.
+  defp cutover_with_retirement(shard_id, cutover_to, retire_version) do
+    Repo.transaction(fn ->
+      with {:ok, row} <- Directory.cutover(shard_id, cutover_to),
+           {:ok, _job} <- Oban.insert(RetirementJob.schedule_changeset(shard_id, retire_version)) do
+        row
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
   end
 
   # --- helpers ---

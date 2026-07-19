@@ -16,9 +16,7 @@ defmodule Fathom.Migrator.RevertJob do
 
   import Ecto.Query, only: [from: 2]
 
-  alias Fathom.Migrator.{RetirementJob, ShardMigration}
-
-  @retention_seconds 7 * 24 * 60 * 60
+  alias Fathom.Migrator.ShardMigration
 
   @impl Oban.Worker
   def perform(
@@ -47,11 +45,10 @@ defmodule Fathom.Migrator.RevertJob do
       :ok ->
         :ok
 
-      {:ok, %{from: backed_up}} ->
-        # The revert backed the live vN object up as <shard>@<backed_up> (finding #13); retire it
-        # after the retention window so it doesn't leak (RetirementJob only ever drops the
-        # forward `from` version otherwise).
-        schedule_retirement(shard_id, backed_up)
+      # The revert backed the live vN object up as <shard>@<from> (finding #13) and its cutover
+      # enqueued that object's retention deletion atomically (the outbox, expert review 2026-07-18
+      # #5), so a Postgres blip can't leak it and this path needn't re-enqueue.
+      {:ok, %{from: _backed_up}} ->
         :ok
 
       {:retry, reason} ->
@@ -122,11 +119,5 @@ defmodule Fathom.Migrator.RevertJob do
         where: fragment("(?->>'version')::bigint = ?", j.args, ^version)
       )
     )
-  end
-
-  defp schedule_retirement(shard_id, version) do
-    %{shard_id: shard_id, version: version}
-    |> RetirementJob.new(schedule_in: @retention_seconds)
-    |> Oban.insert()
   end
 end

@@ -3,8 +3,9 @@ defmodule Fathom.Migrator.ShardMigrationTest do
   # async (shared sandbox so Postgres ops run in the test process; shards/storage
   # are global).
   use Fathom.DataCase, async: false
+  use Oban.Testing, repo: Fathom.Repo
 
-  alias Fathom.Migrator.ShardMigration
+  alias Fathom.Migrator.{RetirementJob, ShardMigration}
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.{Directory, Migrator}
 
@@ -126,6 +127,55 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert {:ok, %{schema_version: 1}} = Directory.get(shard)
     assert %{columns: ["id", "name"]} = query_live!(shard, "SELECT * FROM app_thing")
     assert %{rows: [[1]]} = query_live!(shard, "PRAGMA user_version")
+  end
+
+  # Expert review 2026-07-18 #5 (the retirement outbox): the migration's cutover now enqueues the
+  # old version's retention deletion ATOMICALLY (same Postgres transaction), so a Postgres blip can
+  # never leave a cut-over shard whose @prev object is never scheduled for deletion — a silent,
+  # un-self-healing storage leak. Pre-fix the enqueue was a separate Oban.insert in the JOB's
+  # perform, so run/3 itself enqueued nothing.
+  test "a forward migration enqueues the old version's retirement atomically with cutover",
+       %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+
+    assert {:ok, %{from: 1, to: 2}} = ShardMigration.run(shard, 2)
+
+    assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1})
+  end
+
+  # The leak's mechanism: a Postgres blip on the (pre-fix) separate retirement enqueue crashed the
+  # job; its Oban retry saw cutover already landed and short-circuited to a bare :ok that skipped
+  # re-enqueuing — so @prev leaked forever. With the outbox, the FIRST run enqueued it atomically, so
+  # the crash-forward retry neither loses nor duplicates it.
+  test "a crash-forward retry neither loses nor duplicates the retirement", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+
+    assert {:ok, %{from: 1, to: 2}} = ShardMigration.run(shard, 2)
+
+    # The Oban retry after a crashed perform: the directory is already at v2, so run short-circuits.
+    assert :ok = ShardMigration.run(shard, 2)
+
+    # Exactly one retirement of @1 survives. Pre-fix run/3 enqueued nothing (the whole path relied
+    # on perform, lost on its retry), so this would be 0.
+    assert length(
+             all_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1})
+           ) ==
+             1
+  end
+
+  # The revert half (finding #5 names RevertJob too): the revert's cutover enqueues the backed-up
+  # version's retirement atomically, so a blip can't strand the @from backup with no scheduled drop.
+  test "a revert enqueues the backed-up version's retirement atomically with its cutover",
+       %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, _} = ShardMigration.run(shard, 2)
+
+    assert {:ok, %{from: 2, to: 1}} = ShardMigration.revert(shard, 1)
+
+    assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 2})
   end
 
   # Round-2 #9 (Critical): do_run fetched only statements(target) and stamped
