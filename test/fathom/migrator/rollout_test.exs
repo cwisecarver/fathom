@@ -54,6 +54,28 @@ defmodule Fathom.Migrator.RolloutTest do
       refute_enqueued(worker: Fathom.Migrator.ShardMigrationJob)
     end
 
+    # Expert review 2026-07-18 #19: the hourly ReconcileJob swept a hardcoded 100 shards/run, so a
+    # deep cold tail took months to converge. The cap is now :reconcile_batch_size (default 100) so
+    # an operator can size convergence to the fleet.
+    test "the reconcile sweep honors :reconcile_batch_size" do
+      prev = Application.get_env(:fathom, :reconcile_batch_size)
+      Application.put_env(:fathom, :reconcile_batch_size, 2)
+
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:fathom, :reconcile_batch_size, prev),
+          else: Application.delete_env(:fathom, :reconcile_batch_size)
+      end)
+
+      {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
+      for id <- ~w(rb_a rb_b rb_c rb_d), do: Directory.resolve(id)
+
+      assert :ok = perform_job(ReconcileJob, %{})
+
+      # Only the configured 2 are enqueued this run, not all four laggards.
+      assert length(all_enqueued(worker: ShardMigrationJob)) == 2
+    end
+
     # Finding #21: the sweep bulk-enqueues with Oban.insert_all, whose basic-engine variant
     # does NOT honor the worker's per-shard :unique. Without the manual dedup, every hourly
     # reconcile would re-enqueue already-queued shards and pile up jobs. Pin idempotency.

@@ -11,6 +11,13 @@ defmodule Fathom.Migrator.ReconcileJob do
 
   alias Fathom.{Directory, Migrator}
 
+  # The rollout sweep's per-run cap (expert review 2026-07-18 #19). The default 100 keeps a single
+  # hourly run bounded (migration-queue depth + S3 headroom), but at fleet scale a deep cold tail
+  # (100k–millions) converges glacially — 100/hour is 2,400/day, i.e. months. Operators raise
+  # `:reconcile_batch_size` to size convergence to their fleet + S3 pool; the per-shard uniqueness
+  # dedup keeps a bigger bite idempotent, and enqueue_unique chunks under the Postgres bind cap.
+  @default_batch_size 100
+
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
     # Reclaim any shard stuck in `migrating` (its Oban job was lost) back to `active` first,
@@ -26,7 +33,7 @@ defmodule Fathom.Migrator.ReconcileJob do
         )
     end
 
-    {:ok, _count} = Migrator.rollout()
+    {:ok, _count} = Migrator.rollout(batch_size())
 
     # Converge shards stranded ON a yanked version above HEAD (round-2 #22): a
     # migration completing in the yank-cancel race window cut them over AFTER the
@@ -44,4 +51,6 @@ defmodule Fathom.Migrator.ReconcileJob do
 
     :ok
   end
+
+  defp batch_size, do: Application.get_env(:fathom, :reconcile_batch_size, @default_batch_size)
 end

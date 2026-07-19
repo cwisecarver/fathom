@@ -97,6 +97,12 @@ if ms = System.get_env("SHARD_IDLE_MS") do
   config :fathom, :shard_idle_ms, String.to_integer(ms)
 end
 
+# Rollout sweep per-run cap (#19): how many laggards the hourly ReconcileJob enqueues per run.
+# Default 100; raise it (RECONCILE_BATCH_SIZE) to converge a large cold tail faster.
+if n = System.get_env("RECONCILE_BATCH_SIZE") do
+  config :fathom, :reconcile_batch_size, String.to_integer(n)
+end
+
 # Per-shard load counters (`Fathom.ShardLoad`) — the Phase-2 rebalancing input. Off by
 # default so the hot path doesn't pay for an unread counter; a node/deployment opts in
 # (the "turn on :shard_load on a deployed node" knob a rebalancer / hot-spot measurement
