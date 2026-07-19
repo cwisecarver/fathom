@@ -1,7 +1,10 @@
 # Plan — fixing audit #3: read-only token scope is unenforced over HTTP
 
-**Status: DECIDED 2026-07-18 — build Option B. Not yet implemented.** Do this in a FRESH context
-(security-critical, two-repo). The options/analysis below are retained for reference.
+**Status: IMPLEMENTED 2026-07-18 (Option B).** Shipped in filo `df685a9` (`Filo.Executor.open/2`
+threading the authorize context through both transports) + fathom `cd62267` (`HranaAuth.authorize/2`
+returns `{:ok, scope}`; `ShardExecutor.open/2` rides it; the `stash_scope`/`take_scope` process-dict
+channel is deleted). Real-transport regression tests (HTTP pipeline + a 2-stream WS hello) close the
+I3 gap. The options/analysis below are retained for reference.
 
 ## Decision
 
