@@ -52,16 +52,24 @@ defmodule Fathom.Migrator do
   end
 
   @doc """
-  The captured SQL statements for `version`, or `nil` if it isn't released — or if it
-  was YANKED (expert review #12): a yanked version must never be applied again, so the
-  replay machinery sees it as unknown and any straggler job targeting it errors out
-  instead of re-applying the bad schema.
+  The captured SQL statements for `version`, or `nil` if it isn't released — or if it is
+  gated: YANKED (expert review #12) or flagged REQUIRES_REVIEW (expert review 2026-07-18 #10).
+
+  Both are structural gates on the replay path. A yanked version must never be applied again;
+  a `requires_review` version (a captured data-migration held as a fleet-corruption risk) must
+  not be replayed until an operator clears the flag (`approve_review/1`). `head/0` already
+  ceilings the *automated* rollout below the lowest flagged version, but a DIRECT
+  `ShardMigration.run/enqueue_migration` takes an explicit target and would otherwise replay the
+  flagged DML at/above the floor. Returning `nil` here makes `ShardMigration.statement_chain/2`
+  treat the version as unavailable, so that direct path errors (`{:unknown_version, v}`) with the
+  shard left untouched — the same fail-closed behavior yanked already gets.
   """
   @spec statements(pos_integer()) :: [String.t()] | nil
   def statements(version) do
     case Repo.get_by(Release, version: version) do
       nil -> nil
       %{yanked: true} -> nil
+      %{requires_review: true} -> nil
       release -> release.statements
     end
   end

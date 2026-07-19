@@ -182,6 +182,30 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert %{rows: [[1]]} = query_live!(shard, "PRAGMA user_version")
   end
 
+  # Expert review 2026-07-18 #10: a `requires_review` version was ceilinged only in head/0, so a
+  # DIRECT run(shard, N) at the flagged version bypassed the review floor and replayed the flagged
+  # data-migration. statements/1 now refuses it structurally (like yanked), so the chain is
+  # unbuildable and the shard stays untouched until an operator approves the version.
+  test "a requires_review target is refused by run, leaving the shard untouched until approved",
+       %{shard: shard} do
+    seed_v1!(shard)
+
+    # v2 flagged requires_review (release/5's 5th arg) — a captured data migration held for review.
+    {:ok, _} = Migrator.release(2, "data backfill", @v2_statements, nil, true)
+
+    assert {:error, {:unknown_version, 2}} = ShardMigration.run(shard, 2)
+
+    assert {:ok, %{schema_version: 1}} = Directory.get(shard),
+           "a flagged version must not be replayed by a direct run"
+
+    assert %{rows: [[1]]} = query_live!(shard, "PRAGMA user_version")
+
+    # After an operator clears the flag, the same run applies normally.
+    assert :ok = Migrator.approve_review(2)
+    assert {:ok, %{from: 1, to: 2}} = ShardMigration.run(shard, 2)
+    assert {:ok, %{schema_version: 2}} = Directory.get(shard)
+  end
+
   # Expert review #40: run/3 used Directory.resolve — which upserts last_active_at and
   # registers unknown ids — as its version read. Every sweep attempt phantom-bumped
   # recency on shards no client touched (corrupting warm-follower targeting, laggard
