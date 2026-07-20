@@ -332,7 +332,11 @@ defmodule Fathom.Application do
       # Owns the per-shard flush-watermark ETS table (the metrics layer's RPO/dirtiness source).
       # Always-supervised owner so reads never crash; writes are gated by Fathom.Admin.enabled?.
       # Before the shard supervisor so the table is up before any coordinator publishes/forgets.
-      Fathom.Admin.FlushWatermark
+      Fathom.Admin.FlushWatermark,
+      # Owns the write-fence ETS table (expert review #3): coordinators publish "provably stealable"
+      # shards here and ShardExecutor reads it lock-free before each write. Before the shard
+      # supervisor so the table is up before any coordinator publishes/forgets.
+      Fathom.Shard.WriteFence
     ] ++
       temp_reaper_children() ++
       heartbeat_children() ++

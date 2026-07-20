@@ -329,6 +329,12 @@ defmodule Fathom.Shard do
         # successful flush advances it.
         etag: etag,
         lease_lost: false,
+        # The monotonic-ms instant the periodic fence first came back not-valid (heartbeat stale),
+        # or nil while ownership is confirmed. Once it has held for ttl + steal_margin the coordinator
+        # publishes the write-fence (Fathom.Shard.WriteFence) so ShardExecutor refuses writes on this
+        # provably-stealable node — the RPO circuit-breaker (expert review #3). Cleared the moment a
+        # fence confirms ownership again.
+        not_valid_since: nil,
         # High-water mark of the shard's write counter (Fathom.Shard.WriteCounter) as of the
         # last successful flush; the shard is dirty iff count(id) > flushed_through (unflushed?/1).
         # A cold pull is clean (local == storage); a warm restart may hold un-flushed writes, so
@@ -868,7 +874,10 @@ defmodule Fathom.Shard do
       # flush verdict below. All its Storage S3 I/O ran in the task; only local state moves here
       # (write_etag_sidecar is local disk, FlushWatermark.record a local ETS insert).
       {:fenced, flush_result, updates} ->
-        state = Map.merge(state, updates)
+        # Ownership was confirmed off-process — lift any write-fence and reset the not-valid clock
+        # (expert review #3). A dirty shard keeps flushing each interval, so a healed partition
+        # clears the fence here on its next flush.
+        state = clear_write_fence(Map.merge(state, updates))
 
         case flush_result do
           # Uploaded; advance the fence etag, the provenance sidecar, and the flushed
@@ -943,7 +952,8 @@ defmodule Fathom.Shard do
       # Ownership unconfirmed (transient store error / heartbeat not valid): keep dirty, retry next
       # interval, feeding the RPO-alerting counter (#8) — the loss window grows like a PUT failure.
       :fence_skip ->
-        {:noreply, schedule_flush(record_flush_failure(state, :ownership_unconfirmed))}
+        {:noreply,
+         schedule_flush(record_flush_failure(note_not_valid(state), :ownership_unconfirmed))}
     end
   end
 
@@ -1042,7 +1052,7 @@ defmodule Fathom.Shard do
 
     case Fence.check(fence_ctx(state)) do
       {:ok, updates} ->
-        {:noreply, Map.merge(state, updates)}
+        {:noreply, clear_write_fence(Map.merge(state, updates))}
 
       :superseded ->
         Logger.error(
@@ -1061,7 +1071,7 @@ defmodule Fathom.Shard do
     case Storage.renew_lease(state.id, state.lease, state.ttl_ms) do
       {:ok, lease} ->
         emit_lease(:renewed, state.id)
-        {:noreply, schedule_renew(%{state | lease: lease})}
+        {:noreply, schedule_renew(clear_write_fence(%{state | lease: lease}))}
 
       # Another node took the lease — self-fence: stop without flushing so we
       # never clobber the new owner's copy.
@@ -1165,6 +1175,7 @@ defmodule Fathom.Shard do
     Fathom.ShardLoad.forget(state.id)
     Fathom.ShardLatency.forget(state.id)
     Fathom.Shards.Lru.forget(state.id)
+    Fathom.Shard.WriteFence.forget(state.id)
     if unflushed?(state), do: quarantine_fenced!(state), else: drop_local(state.path)
     WriteCounter.forget(state.id)
     FlushWatermark.forget(state.id)
@@ -1185,6 +1196,7 @@ defmodule Fathom.Shard do
     Fathom.ShardLoad.forget(state.id)
     Fathom.ShardLatency.forget(state.id)
     Fathom.Shards.Lru.forget(state.id)
+    Fathom.Shard.WriteFence.forget(state.id)
     # flush_and_drop reads the write counter (unflushed?/1) to decide whether to upload before
     # dropping, so forget the counter AFTER it — forgetting first would zero the count and make a
     # dirty shard look clean, skipping the flush and losing the writes (findings #1/#27).
@@ -1219,6 +1231,7 @@ defmodule Fathom.Shard do
     Fathom.ShardLoad.forget(state.id)
     Fathom.ShardLatency.forget(state.id)
     Fathom.Shards.Lru.forget(state.id)
+    Fathom.Shard.WriteFence.forget(state.id)
     # flush_and_drop reads the write counter (unflushed?/1) to decide whether to upload, so forget
     # the counter AFTER it — forgetting first would zero the count and skip a dirty shard's flush.
     unless Fathom.Tenants.Tombstones.tombstoned?(state.id), do: flush_and_drop(state)
@@ -1238,6 +1251,7 @@ defmodule Fathom.Shard do
     Fathom.ShardLoad.forget(state.id)
     Fathom.ShardLatency.forget(state.id)
     Fathom.Shards.Lru.forget(state.id)
+    Fathom.Shard.WriteFence.forget(state.id)
     WriteCounter.forget(state.id)
     FlushWatermark.forget(state.id)
     :ok
@@ -1782,6 +1796,53 @@ defmodule Fathom.Shard do
 
     %{state | flush_failures: n}
   end
+
+  # --- write-fence circuit-breaker (expert review 2026-07-19 #3) ---
+
+  # The periodic fence came back not-valid (heartbeat stale — the cut-from-storage symptom). Record
+  # WHEN that started; once it has held for ttl + steal_margin — the point past which a peer may
+  # legitimately have stolen the shard — publish the write-fence so ShardExecutor refuses NEW writes
+  # (reads keep serving from the local copy). This collapses the loss window from the whole partition
+  # duration to ~ttl + steal_margin: without it the coordinator keeps ACKing writes for the entire
+  # partition, then self-fences on heal and quarantines every one of them. Gated by
+  # `:fence_writes_when_stealable` (default: prod) — off, the flag is never set, so the executor's
+  # lock-free read is always false and nothing is refused.
+  defp note_not_valid(state) do
+    if fence_writes_when_stealable?() do
+      now = System.monotonic_time(:millisecond)
+      since = state.not_valid_since || now
+
+      if not Fathom.Shard.WriteFence.fenced?(state.id) and
+           now - since >= stealable_after_ms(state) do
+        Fathom.Shard.WriteFence.fence(state.id)
+        :telemetry.execute([:fathom, :shard, :write_fenced], %{count: 1}, %{shard_id: state.id})
+
+        Logger.warning(
+          "shard #{state.id}: heartbeat not valid for > ttl+steal_margin — fencing writes (node " <>
+            "provably stealable); reads still serve. Writes 503 FILO_STALE_LEASE until ownership " <>
+            "is reconfirmed."
+        )
+      end
+
+      %{state | not_valid_since: since}
+    else
+      state
+    end
+  end
+
+  # A fence just reconfirmed ownership — lift any write-fence and reset the not-valid clock. Cheap
+  # no-op when the clock was never started (the common, healthy path).
+  defp clear_write_fence(%{not_valid_since: nil} = state), do: state
+
+  defp clear_write_fence(state) do
+    Fathom.Shard.WriteFence.unfence(state.id)
+    %{state | not_valid_since: nil}
+  end
+
+  defp stealable_after_ms(state), do: state.ttl_ms + Storage.steal_margin_ms()
+
+  defp fence_writes_when_stealable?,
+    do: Application.get_env(:fathom, :fence_writes_when_stealable, false)
 
   # Reply to synchronous force-flush (`:flush_now`) waiters. On a durable flush: if the shard is
   # now clean, reply :ok and clear them; if a write landed during the flush and left it dirty

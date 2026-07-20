@@ -17,6 +17,7 @@ defmodule Fathom.ShardExecutor do
   alias Fathom.Migrator.Capture
   alias Fathom.Shard
   alias Fathom.Shard.Connection
+  alias Fathom.Shard.WriteFence
   alias Fathom.Shards
   alias Filo.{Describe, Error, Stmt, StmtResult}
 
@@ -95,6 +96,21 @@ defmodule Fathom.ShardExecutor do
       scope == :ro and write?(sql) ->
         {:error,
          %Error{message: "read-only token cannot write", code: "FILO_READONLY", status: 403}}
+
+      # The write circuit-breaker (expert review 2026-07-19 #3): this node's heartbeat has been
+      # not-valid long enough (> ttl + steal_margin) that a peer may already have stolen the shard,
+      # so a write ACKed here would be quarantined on partition-heal. Refuse writes with a retryable
+      # 503 while READS still serve from the local copy (the flag is set only for provably-stealable
+      # shards, and only when :fence_writes_when_stealable is on — default prod). Lock-free ETS read,
+      # only on writes.
+      write?(sql) and WriteFence.fenced?(shard_id) ->
+        {:error,
+         %Error{
+           message:
+             "shard \"#{shard_id}\" lease is stale on this node (storage unreachable); retry",
+           code: "FILO_STALE_LEASE",
+           status: 503
+         }}
 
       # Block client-issued DDL on a tenant shard when strict mode is on (expert review 2026-07-14
       # #7): a direct `manage.py migrate` against a tenant advances its schema + `django_migrations`

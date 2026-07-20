@@ -21,6 +21,15 @@ config :fathom,
 # raise it from the measured density (mix fathom.scale --ramp) via MAX_OPEN_SHARDS (config/runtime.exs).
 config :fathom, :max_open_shards, 10_000
 
+# The RPO write circuit-breaker (expert review #3). When a node is reachable by clients but cut
+# from object storage, its coordinators' heartbeats go stale and durability flushes skip — but by
+# default nothing stops them ACKing writes, which are quarantined on partition-heal (a loss window
+# equal to the partition duration, not the flush interval). With this on, once a shard's heartbeat
+# has been not-valid for longer than ttl + steal_margin (provably stealable), the coordinator fences
+# writes: ShardExecutor refuses them with 503 FILO_STALE_LEASE while reads keep serving. Default ON
+# in prod (a data-loss guard, like the flush fence itself), off in dev/test. See Fathom.Shard.WriteFence.
+config :fathom, :fence_writes_when_stealable, config_env() == :prod
+
 # Soften the cap above: at capacity, evict the least-recently-used IDLE shard (flush +
 # drop + release its lease) to admit a new open, rather than refusing with a 503. An idle
 # shard is bottomless-backed, so eviction costs only a cold re-open if it's touched again;

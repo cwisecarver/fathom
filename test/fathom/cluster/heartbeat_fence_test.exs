@@ -9,6 +9,7 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
   use Fathom.ClusterShardCase, async: false
 
   alias Fathom.Shard.Heartbeat
+  alias Fathom.Shard.WriteFence
 
   @hb_file Path.join([System.tmp_dir!(), "fathom_remote_test", "heartbeats", to_string(node())])
 
@@ -165,5 +166,80 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
 
     refute File.exists?(remote_db(shard)),
            "a lapse during open must leave the acquire baseline stale so the flush self-fences"
+  end
+
+  # Expert review 2026-07-19 #3: a node reachable by clients but cut from object storage keeps its
+  # coordinators alive — the heartbeat goes stale and durability flushes skip, but NOTHING on the
+  # write path consulted that, so the coordinator kept ACKing writes that are quarantined on
+  # partition-heal (loss window = the partition duration, not the flush interval the RPO contract
+  # advertises). The coordinator now publishes a write-fence once its heartbeat has been not-valid
+  # for ttl + steal_margin ("provably stealable"); ShardExecutor refuses writes with 503
+  # FILO_STALE_LEASE while READS still serve from the local copy, and a reconfirmed fence lifts it.
+  test "a provably-stealable node fences writes (reads continue) and lifts it on recovery (#3)",
+       %{shard: shard, hb: hb} do
+    Application.put_env(:fathom, :fence_writes_when_stealable, true)
+    on_exit(fn -> Application.delete_env(:fathom, :fence_writes_when_stealable) end)
+
+    test_pid = self()
+    handler = "writefence-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shard, :write_fenced],
+      fn _e, _m, meta, _ -> send(test_pid, {:write_fenced, meta}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    capture_log(fn ->
+      {:ok, conn} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('a')"))
+
+      {:ok, coordinator} = Shards.ensure(shard)
+
+      # Force the node heartbeat NOT comfortably valid (expired deadline, no renew) — the
+      # cut-from-storage symptom the flush fence reads — and preset the coordinator's not-valid
+      # clock an hour back so the very next fence verdict is already past ttl + steal_margin.
+      :sys.replace_state(hb, fn s ->
+        forged = %{s | mono_deadline_ms: System.monotonic_time(:millisecond) - 1_000}
+        Heartbeat.publish_status(forged)
+        forged
+      end)
+
+      :sys.replace_state(coordinator, fn s ->
+        %{s | not_valid_since: System.monotonic_time(:millisecond) - 3_600_000}
+      end)
+
+      # Drive the periodic durability flush: its fence returns not-valid → the coordinator fences.
+      send(coordinator, :durability_flush)
+      assert_receive {:write_fenced, %{shard_id: ^shard}}, 2_000
+      assert WriteFence.fenced?(shard)
+
+      # A WRITE is refused with a retryable 503; a READ still serves from the local copy.
+      assert {:error, %{code: "FILO_STALE_LEASE", status: 503}} =
+               ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('b')"))
+
+      assert {:ok, %{rows: [["a"]]}} = ShardExecutor.execute(conn, stmt("SELECT v FROM kv"))
+
+      # Recovery: the heartbeat is comfortably valid again → a revalidate reconfirms ownership and
+      # lifts the fence. revalidate_lapse runs the fence synchronously in the coordinator, so a
+      # :sys.get_state after it is a clean sync point (no async flush-task race).
+      :sys.replace_state(hb, fn s ->
+        forged = %{s | mono_deadline_ms: System.monotonic_time(:millisecond) + 60_000}
+        Heartbeat.publish_status(forged)
+        forged
+      end)
+
+      send(coordinator, :revalidate_lapse)
+      assert :sys.get_state(coordinator).not_valid_since == nil
+      refute WriteFence.fenced?(shard)
+
+      # And a write is accepted again.
+      assert {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('c')"))
+
+      :ok = ShardExecutor.close(conn)
+    end)
   end
 end
