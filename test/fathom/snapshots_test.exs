@@ -145,6 +145,52 @@ defmodule Fathom.SnapshotsTest do
     assert {:error, :invalid_shard_id} = Snapshots.create("Not A Shard!")
   end
 
+  # Expert review 2026-07-19 #1: `snapshot_id` is caller-supplied and flows straight into
+  # `Path.join(dir(), "<shard>@snap-<snapshot_id>.db")` (Local) and the S3 object key. Without a
+  # validation gate, a traversal id escapes the shard's key prefix — restore becomes an arbitrary
+  # file read written into the tenant's live object (then downloadable via export), and drop becomes
+  # an arbitrary `.db` delete. The invariant: `snapshot_id` is gated like a shard id (no `/`, no
+  # `..`), so an escape attempt is refused with `:invalid_snapshot_id` and never touches the fs.
+  test "restore/drop reject a path-traversal snapshot_id and never read/delete outside the store",
+       %{shard: shard} do
+    # A sentinel outside the shard store that a traversal restore could smuggle in / a drop erase.
+    outside =
+      Path.join(
+        System.tmp_dir!(),
+        "fathom_snap_traversal_#{System.unique_integer([:positive])}.db"
+      )
+
+    File.write!(outside, "SENTINEL-must-not-be-touched")
+    on_exit(fn -> File.rm(outside) end)
+
+    write!(shard, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('safe')"])
+    flush!(shard)
+
+    # Relative traversal (Local backend) and an absolute-ish key escape (S3-style) are both refused,
+    # as is a bare `..` and any id carrying a slash.
+    for bad <- [
+          "../../../../../etc/hosts",
+          "../../fathom_snap_traversal",
+          "..",
+          "a/b",
+          "x@snap-#{Path.basename(outside, ".db")}"
+        ] do
+      assert {:error, :invalid_snapshot_id} = Snapshots.restore(shard, bad),
+             "restore must reject traversal snapshot_id #{inspect(bad)}"
+
+      assert {:error, :invalid_snapshot_id} = Snapshots.drop(shard, bad),
+             "drop must reject traversal snapshot_id #{inspect(bad)}"
+    end
+
+    # The gate held: the outside sentinel was neither read into the shard nor deleted, and the
+    # live object is untouched.
+    assert File.read!(outside) == "SENTINEL-must-not-be-touched"
+    assert read_one(shard, "SELECT v FROM t") == [["safe"]]
+
+    # A non-binary id is rejected too (untrusted input).
+    assert {:error, :invalid_snapshot_id} = Snapshots.drop(shard, nil)
+  end
+
   defp rm_shard(id) do
     remote_dir = Path.join(System.tmp_dir!(), "fathom_remote_test")
 

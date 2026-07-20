@@ -34,6 +34,17 @@ defmodule Fathom.Snapshots do
 
   @drain_timeout 30_000
 
+  # The path-traversal / key-escape gate for the caller-supplied `snapshot_id`, the
+  # sibling of `ShardId` for the `@snap-<snapshot_id>` key segment (expert review
+  # 2026-07-19 #1). `restore/3` and `drop/2` take an operator-supplied id that flows
+  # straight into `Path.join(dir(), "<shard>@snap-<snapshot_id>.db")` (Local) and the
+  # S3 object key — so a `/` (or `..`) would escape the shard's key prefix and turn the
+  # control plane into an arbitrary-file read/write/delete primitive. Same conservative
+  # charset as `ShardId`: no dot (blocks `..`), no slash, no whitespace/control chars.
+  # Case is preserved (unlike shard ids) — a generated id carries uppercase `T`/`Z` from
+  # its UTC timestamp. 128 chars covers a timestamp + uniquifier + a 40-char label.
+  @snapshot_id_pattern ~r/^[a-zA-Z0-9_-]{1,128}$/
+
   @doc """
   Snapshots `shard_id`'s current stored object. `opts[:label]` adds a
   human-readable suffix to the generated (timestamp-based) id. Returns
@@ -71,7 +82,8 @@ defmodule Fathom.Snapshots do
   """
   @spec restore(String.t(), String.t(), keyword()) :: :ok | {:error, term()}
   def restore(shard_id, snapshot_id, opts \\ []) do
-    with {:ok, id} <- cast(shard_id) do
+    with {:ok, id} <- cast(shard_id),
+         {:ok, snapshot_id} <- cast_snapshot_id(snapshot_id) do
       case Shards.drain(id, Keyword.get(opts, :drain_timeout, @drain_timeout)) do
         :ok ->
           case Storage.lease_holder(id) do
@@ -101,7 +113,9 @@ defmodule Fathom.Snapshots do
   @doc "Deletes a stored snapshot (idempotent)."
   @spec drop(String.t(), String.t()) :: :ok | {:error, term()}
   def drop(shard_id, snapshot_id) do
-    with {:ok, id} <- cast(shard_id), do: Storage.drop_snapshot(id, snapshot_id)
+    with {:ok, id} <- cast(shard_id),
+         {:ok, snapshot_id} <- cast_snapshot_id(snapshot_id),
+         do: Storage.drop_snapshot(id, snapshot_id)
   end
 
   defp cast(shard_id) do
@@ -110,6 +124,16 @@ defmodule Fathom.Snapshots do
       :error -> {:error, :invalid_shard_id}
     end
   end
+
+  # The `snapshot_id` gate (see @snapshot_id_pattern). Untrusted, so non-binaries and
+  # any traversal/escape char are rejected before the id reaches storage-key construction.
+  defp cast_snapshot_id(snapshot_id) when is_binary(snapshot_id) do
+    if snapshot_id =~ @snapshot_id_pattern,
+      do: {:ok, snapshot_id},
+      else: {:error, :invalid_snapshot_id}
+  end
+
+  defp cast_snapshot_id(_), do: {:error, :invalid_snapshot_id}
 
   # A sortable, filename-safe id: compact UTC timestamp + a short uniquifier (so two
   # snapshots in the same second don't collide) + an optional sanitized label.
