@@ -1053,6 +1053,78 @@ defmodule Fathom.ShardDurabilityTest do
     Connection.close(ro)
   end
 
+  # Expert review 2026-07-19 #2: the terminate/2 catch-all (connections still open) flushed NOTHING.
+  # A rolling deploy enters terminate on the supervisor EXIT *before* the killed streams' :DOWNs are
+  # processed, so conns > 0 is the COMMON shutdown state — and a dirty shard there lost up to a full
+  # flush interval of acked writes on ephemeral disk, the very loss trap_exit + the shutdown budget
+  # exist to prevent. The existing shutdown test above closes the connection first (the conns == 0
+  # clause). This pins the conns > 0 clause: a clean stop flushes the acked writes to storage whether
+  # or not a connection is still checked out.
+  test "a supervisor shutdown flushes a dirty shard even with a connection still checked out (#2)",
+       %{shard: shard} do
+    Application.put_env(:fathom, :shard_flush_interval_ms, 0)
+    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    _ = :sys.get_state(coordinator)
+    assert Shard.dirty?(coordinator)
+
+    # The connection stays CHECKED OUT — the pre-fix data-loss condition. Assert conns > 0 so this
+    # genuinely exercises the catch-all clause, not the idle (conns == 0) path, and nothing has
+    # reached storage yet (periodic flush off, long idle window).
+    assert map_size(:sys.get_state(coordinator).conns) > 0,
+           "the connection must still be checked out (conns > 0)"
+
+    refute File.exists?(remote_db(shard)), "nothing flushed before the shutdown"
+
+    ref = Process.monitor(coordinator)
+    :ok = DynamicSupervisor.terminate_child(Fathom.ShardSupervisor, coordinator)
+    assert_receive {:DOWN, ^ref, :process, ^coordinator, _}, 5_000
+
+    assert File.exists?(remote_db(shard)),
+           "terminate/2 must flush the write on shutdown even with a connection checked out"
+
+    {:ok, ro} = Connection.open(remote_db(shard))
+    assert {:ok, %{rows: [["alice"]]}} = Connection.query(ro, "SELECT v FROM kv", [])
+    Connection.close(ro)
+  end
+
+  # The other intent of the same clause: a BUSY tenant delete (`Tenants.purge` → `Shards.stop`
+  # force-terminates with conns > 0, landing here). The id is tombstoned before the stop, so the
+  # flush must be SKIPPED — the object is about to be purged, and re-uploading it is wasted work.
+  # Pins that the #2 flush is gated on the tombstone so the delete path is unchanged.
+  test "a busy stop of a TOMBSTONED shard skips the flush (delete path unchanged) (#2)",
+       %{shard: shard} do
+    Application.put_env(:fathom, :shard_flush_interval_ms, 0)
+    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    _ = :sys.get_state(coordinator)
+    assert Shard.dirty?(coordinator)
+
+    # Tombstone AFTER opening (admission refuses a tombstoned open) — the real delete order, where the
+    # coordinator is already serving when `Tenants.delete` tombstones it ahead of the force-stop.
+    Fathom.Tenants.Tombstones.put(shard)
+    on_exit(fn -> :ets.delete(Fathom.Tenants.Tombstones, shard) end)
+
+    refute File.exists?(remote_db(shard)), "nothing flushed before the stop"
+
+    ref = Process.monitor(coordinator)
+    :ok = DynamicSupervisor.terminate_child(Fathom.ShardSupervisor, coordinator)
+    assert_receive {:DOWN, ^ref, :process, ^coordinator, _}, 5_000
+
+    refute File.exists?(remote_db(shard)),
+           "a tombstoned (being-deleted) shard must NOT re-upload on stop"
+  end
+
   # Expert review #2: `wal_checkpoint(TRUNCATE)` reports "couldn't fold the WAL" as a
   # busy=1 ROW, not an error — and the pre-drop checkpoint discarded the result. A blocked
   # checkpoint (here: a lingering reader transaction, the zombie-stream class) then let the

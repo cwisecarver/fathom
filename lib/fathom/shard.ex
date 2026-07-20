@@ -1194,12 +1194,46 @@ defmodule Fathom.Shard do
     :ok
   end
 
-  # Stopping with connections still open (or from an early pre-open state) — always
-  # drop the shard's load row so a stopped shard never leaks a counter.
+  # A fully-open coordinator force-stopped with connections STILL CHECKED OUT and its lease intact —
+  # the rolling-deploy / SIGTERM path (terminate/2 runs on the supervisor EXIT before the queued
+  # `:DOWN`s from Bandit-killed streams are processed, so conns > 0) and the busy-delete path
+  # (`Fathom.Shards.stop` force-terminates without draining). Before expert review 2026-07-19 #2 this
+  # fell to the catch-all below, which flushed NOTHING: a dirty shard lost up to a full flush interval
+  # of acked writes on ephemeral disk (containers), despite trap_exit + the shutdown budget existing
+  # precisely to flush on a clean stop. Settle the in-flight flush task FIRST — its result-fold stamps
+  # the provenance sidecar, closing the window where a killed task's already-landed PUT makes the next
+  # warm open read sidecar(old) != object(new) and FALSE-quarantine a fork (the #21 spurious-fork
+  # window, here on the shutdown path). Then flush the dirty state via the SAME fenced flush_and_drop
+  # the idle-stop clause uses (drops local + releases the lease for a fast planned failover; its
+  # 412/superseded/corrupt-local branches all apply) — UNLESS the shard is being DELETED.
+  # `Fathom.Tenants.delete` tombstones the id before `DeleteJob` → `purge` → `Shards.stop`, so a
+  # tombstoned id here means "about to be erased": skip the flush, since `purge_shard` deletes the
+  # object next and `stop()` blocks through this terminate (purge always runs AFTER — no resurrection
+  # even if the tombstone hasn't reached this node's ETS yet; worst case is one wasted upload purge
+  # then deletes). `tombstoned?` is an O(1) public-ETS read that rescues a missing table to `false`,
+  # so a shutdown-ordering edge (Tombstones dies first) fails toward flushing — the safe direction.
+  def terminate(_reason, %{conns: conns, lease: lease} = state)
+      when map_size(conns) > 0 and not is_nil(lease) do
+    state = settle_flush_task(state)
+    state = settle_waiters(state, {:error, :coordinator_stopped})
+    Fathom.ShardLoad.forget(state.id)
+    Fathom.ShardLatency.forget(state.id)
+    Fathom.Shards.Lru.forget(state.id)
+    # flush_and_drop reads the write counter (unflushed?/1) to decide whether to upload, so forget
+    # the counter AFTER it — forgetting first would zero the count and skip a dirty shard's flush.
+    unless Fathom.Tenants.Tombstones.tombstoned?(state.id), do: flush_and_drop(state)
+    WriteCounter.forget(state.id)
+    FlushWatermark.forget(state.id)
+    :ok
+  end
+
+  # Stopping from an early pre-open state (init/handle_continue failed before a lease/conns were set,
+  # so the state is the minimal `%{id: ...}` that matches no clause above) — always drop the shard's
+  # load row so a stopped shard never leaks a counter.
   def terminate(_reason, state) do
-    # A flush_now caller pending when the coordinator is force-stopped (supervisor shutdown with
-    # conns > 0, a pre-open failure) gets an explicit error, not a swallowed exit → false :ok
-    # (expert review 2026-07-18 #4). settle_waiters is a no-op on the empty/pre-open waiter list.
+    # A flush_now caller pending when the coordinator is force-stopped (a pre-open failure) gets an
+    # explicit error, not a swallowed exit → false :ok (expert review 2026-07-18 #4). settle_waiters
+    # is a no-op on the empty/pre-open waiter list.
     state = settle_waiters(state, {:error, :coordinator_stopped})
     Fathom.ShardLoad.forget(state.id)
     Fathom.ShardLatency.forget(state.id)
