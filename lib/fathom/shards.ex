@@ -273,9 +273,30 @@ defmodule Fathom.Shards do
         try do
           Fathom.Shard.flush_now(pid)
         catch
-          # The coordinator stopped mid-call (idle-drop flushes on its way out; a steal quarantines) —
-          # its stored state stands, so best-effort :ok. The common quiesced case never hits this.
-          :exit, _ -> :ok
+          # A hung/slow store (or a live-writer livelock) past @flush_now_timeout: the shard is
+          # NOT durably clean, so the flush-before-fork primitive (Tenants.fork flush_source:, the
+          # tenant API flush endpoint) must NOT report success — a keystone-fork would clone stale
+          # bytes on a swallowed timeout (expert review #14). Surface it as an error.
+          :exit, {:timeout, _} ->
+            {:error, :flush_timeout}
+
+          # The coordinator legitimately went away mid-call (idle-drop flushes on its way out; a
+          # steal quarantines; a normal/shutdown stop) — its stored state stands, so best-effort
+          # :ok. A force-stop with a pending waiter returns via an explicit reply, not this catch
+          # (review 2026-07-18 #4 settles flush_waiters in every terminate clause).
+          :exit, {reason, _} when reason in [:noproc, :normal, :shutdown] ->
+            :ok
+
+          :exit, {{:shutdown, _}, _} ->
+            :ok
+
+          # Any other exit (a genuine coordinator crash reason) left durability unknown — surface
+          # it rather than swallow it as a false success.
+          :exit, {reason, _} ->
+            {:error, {:flush_exited, reason}}
+
+          :exit, reason ->
+            {:error, {:flush_exited, reason}}
         end
     end
   end

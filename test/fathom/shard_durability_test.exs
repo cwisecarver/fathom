@@ -382,6 +382,50 @@ defmodule Fathom.ShardDurabilityTest do
     assert {:error, :coordinator_stopped} = Task.await(flush, 2_000)
   end
 
+  # Expert review #14: Shards.flush wrapped flush_now in a BLANKET `catch :exit, _ -> :ok`, which
+  # also swallowed the GenServer.call TIMEOUT exit — a hung/slow store (or a live-writer livelock)
+  # past @flush_now_timeout returned :ok while the shard was NOT durably clean, so a fork/export
+  # "after flush" (Tenants.fork flush_source:, the API flush endpoint) cloned stale bytes. The catch
+  # now narrows the timeout to {:error, :flush_timeout}, keeping :ok only for the coordinator that
+  # legitimately went away.
+  test "a hung coordinator makes Shards.flush return {:error, :flush_timeout}, not a false :ok",
+       %{shard: shard} do
+    prev_timeout = Application.get_env(:fathom, :flush_now_timeout_ms)
+    # A short flush_now timeout so a suspended coordinator times out fast (not the 60s default);
+    # a high idle so the coordinator can't idle-drop out from under the test.
+    Application.put_env(:fathom, :flush_now_timeout_ms, 100)
+    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+    on_exit(fn -> restore(:flush_now_timeout_ms, prev_timeout) end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('acked')"))
+    {:ok, coordinator} = Shards.ensure(shard)
+    assert Shard.dirty?(coordinator), "the shard must be dirty so the flush is meaningful"
+
+    # Suspend the coordinator so flush_now's GenServer.call can NEVER be answered — the hung/slow-
+    # store (or live-writer livelock) case. Pre-fix Shards.flush swallowed the {:timeout, _} exit
+    # as :ok; now it surfaces the timeout.
+    :sys.suspend(coordinator)
+
+    try do
+      assert {:error, :flush_timeout} = Shards.flush(shard),
+             "a flush that timed out must not report durable success"
+    after
+      :sys.resume(coordinator)
+    end
+
+    ref = Process.monitor(coordinator)
+    :ok = ShardExecutor.close(conn)
+    _ = Shards.drain(shard)
+
+    receive do
+      {:DOWN, ^ref, :process, ^coordinator, _} -> :ok
+    after
+      2_000 -> :ok
+    end
+  end
+
   # Expert review 2026-07-14 #41: pin the invariant "every flushed object is an openable,
   # quick_check-clean SQLite database" across the flush paths that run in the default suite —
   # the checkpoint-then-raw-upload (idle drop) and the VACUUM-INTO snapshot (periodic flush).

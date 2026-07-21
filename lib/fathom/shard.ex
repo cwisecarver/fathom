@@ -182,7 +182,13 @@ defmodule Fathom.Shard do
   clean; returns `:ok`, or `{:error, reason}` on a flush error / lease steal. See
   `Fathom.Shards.flush/1` for the by-id, registry-resolving wrapper.
   """
-  def flush_now(pid) when is_pid(pid), do: GenServer.call(pid, :flush_now, @flush_now_timeout)
+  def flush_now(pid) when is_pid(pid), do: GenServer.call(pid, :flush_now, flush_now_timeout())
+
+  # Configurable so a test can exercise the timeout path without a 60s wait (expert review #14);
+  # defaults to @flush_now_timeout in prod. Off the query hot path (this is the fork-before-flush
+  # primitive), so the per-call env read is negligible.
+  defp flush_now_timeout,
+    do: Application.get_env(:fathom, :flush_now_timeout_ms, @flush_now_timeout)
 
   @doc """
   Asks the coordinator to stand down: refuse new checkouts, let in-flight
