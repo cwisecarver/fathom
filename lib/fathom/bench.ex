@@ -251,9 +251,10 @@ defmodule Fathom.Bench do
   @doc """
   Failover RTO: median latency (µs) to open a shard on a survivor **cold** (pull the
   whole object from S3, today's failover cost) vs **warm** (the shard is already in
-  the warm-follower cache, so the H2 freshness check is a conditional `304` GET plus
-  a local copy instead of a full pull). Both at `:warm_size_kb`. Returns
-  `%{cold_us, warm_us}`, or `nil` without an S3 endpoint (opt-in, like `cold_open_s3/1`).
+  the warm-follower cache). Both take the real crash-failover path — a lease STEAL that
+  touches (etag-rotates) the object (#15) — so the warm sample exercises the steal+touch
+  takeover the warm follower must survive, not a no-steal open. Both at `:warm_size_kb`.
+  Returns `%{cold_us, warm_us}`, or `nil` without an S3 endpoint (opt-in, like `cold_open_s3/1`).
 
   The honest delta: the warm path is **not** purely local. H2 must confirm the cache
   hasn't gone stale (a warm copy can lag the owner's latest flush), so it still pays
@@ -281,24 +282,33 @@ defmodule Fathom.Bench do
         seed_s3_sized(warm, size_kb)
         teardown_open(warm, open_and_query(warm))
 
-        # Cold: every sample pulls the whole object from S3 (no warm cache).
+        # Cold: every sample pulls the whole object from S3 (no warm cache). A real
+        # failover STEALS the dead owner's lease, which touches (etag-rotates) the
+        # object — seed the dead-owner lock so the measurement takes that path (#15).
         cold =
           times(samples, fn _ ->
             id = uniq("bench_rto_cold")
             seed_s3_sized(id, size_kb)
+            seed_dead_lock(id)
             {us, handle} = :timer.tc(fn -> open_and_query(id) end)
             teardown_open(id, handle)
             us
           end)
           |> p50()
 
-        # Warm: the shard is pre-cached with its etag, so the open takes the H2
-        # freshness-validated promotion (a 304 + local copy), not a full pull.
+        # Warm: the shard is pre-cached with its etag. Expert review #15: on a real
+        # crash failover the steal touches (etag-rotates) the object, so the pre-cached
+        # etag no longer matches — seed the dead-owner lock so the "warm" sample
+        # measures the steal+touch takeover the warm follower must survive, not the
+        # no-steal open it took before (which never rotated the etag and so overstated
+        # the win). With the #15 fix the takeover adopts the touched etag from the copy
+        # it already holds instead of re-pulling the whole object.
         warm_us =
           times(samples, fn _ ->
             id = uniq("bench_rto_warm")
             seed_s3_sized(id, size_kb)
             populate_warm_cache(id)
+            seed_dead_lock(id)
             {us, handle} = :timer.tc(fn -> open_and_query(id) end)
             teardown_open(id, handle)
             us
@@ -328,6 +338,19 @@ defmodule Fathom.Bench do
     File.mkdir_p!(Path.dirname(path))
     {:ok, {:written, etag}} = Storage.pull_if_changed(id, path, nil)
     File.write!(path <> ".etag", etag)
+  end
+
+  # Seed a dead prior owner's lock so the next open STEALS it and touches (etag-rotates)
+  # the object — the crash-failover path (#15). A negative TTL lands `expires_at_ms` past
+  # the steal margin, and no heartbeat exists for this synthetic owner, so `owner_live?`
+  # resolves it dead. No prod seam needed: a plain `acquire_lease` writes the lock object.
+  defp seed_dead_lock(id) do
+    ttl = -(Storage.steal_margin_ms() + 60_000)
+
+    {:ok, _lease} =
+      Storage.acquire_lease(id, "dead@bench##{System.unique_integer([:positive])}", ttl)
+
+    :ok
   end
 
   defp open_and_query(id) do

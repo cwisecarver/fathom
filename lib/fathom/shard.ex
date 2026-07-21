@@ -461,8 +461,26 @@ defmodule Fathom.Shard do
             end
         end
 
+      # Expert review #15: the speculative pull captured the object the crash-steal
+      # touch used as its If-Match SOURCE (etag == pre). The touch is a self-copy — it
+      # rotates the etag but moves no bytes — so the pulled bytes are byte-identical to
+      # the post-touch object. Adopt the post-touch etag with NO re-pull (the same
+      # provenance argument the warm branch makes via its sidecar), stamping the sidecar
+      # to `post` so a later warm restart fences with the store's real etag. This is the
+      # warm standby's HEADLINE scenario — a data-bearing crash failover: the survivor's
+      # live path is empty (the warm copy lives in the follower cache, so warm? is false),
+      # so without this every such failover discarded the promoted/pulled copy for a full
+      # body re-pull, the exact cost the warm follower exists to avoid. `pre != post` is
+      # guaranteed by confirm_rotation, and `etag == post` was already handled above, so
+      # `etag == pre` unambiguously means the pre-touch object. Only reachable on the cold
+      # (non-warm) takeover path — the warm clause above catches warm? == true first.
+      is_binary(pre) and etag == pre ->
+        write_etag_sidecar(path, post)
+        {:ok, post}
+
       true ->
-        # A cold pull that raced the touch captured pre-touch bytes: re-pull.
+        # A cold pull that raced the touch captured pre-touch bytes from a diverged
+        # lineage (etag != pre — a zombie flush landed before the touch): re-pull.
         repull(shard_id, path)
     end
   end
