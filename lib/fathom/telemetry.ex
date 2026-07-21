@@ -106,6 +106,12 @@ defmodule Fathom.Telemetry do
         measurement: :active,
         description: "Active shard coordinators on this node"
       ),
+      counter("fathom.audit.event.count",
+        event_name: [:fathom, :audit, :event],
+        tags: [:action, :outcome],
+        description:
+          "Control-plane / admin audit events by action + outcome (#9) — delete / restore / export / token ops"
+      ),
 
       # --- Rebalancer (Phase-2 B1) — operability for the enable runbook -------------------
       # Low-cardinality only: tag by node/outcome, never shard_id (the ShardLoad cardinality

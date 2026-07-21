@@ -75,6 +75,27 @@ defmodule FathomWeb.Api.ApiKeyAuthTest do
     refute status in [401, 403], "a destroy key must pass the scope gate for delete"
   end
 
+  test "a delete via the API writes an audit event attributed to the key's actor (#9)", %{
+    conn: conn
+  } do
+    {:ok, token, _key} = ApiKeys.mint("ops-alice", "destroy")
+    id = "audit_del_#{System.unique_integer([:positive])}"
+    put_shard(id)
+    on_exit(fn -> :ets.delete(Tombstones, id) end)
+
+    conn |> bearer(token) |> delete("/api/tenants/#{id}")
+
+    assert [%{actor: "ops-alice", action: "delete", outcome: "ok", shard_id: ^id}] =
+             Fathom.Audit.list(shard_id: id)
+  end
+
+  test "a scope-denied action is NOT audited (the action never ran)", %{conn: conn} do
+    token = mint("read")
+    id = "audit_denied_#{System.unique_integer([:positive])}"
+    conn |> bearer(token) |> delete("/api/tenants/#{id}")
+    assert Fathom.Audit.list(shard_id: id) == []
+  end
+
   test "the legacy admin BasicAuth still works as a full-access fallback", %{conn: conn} do
     basic = "Basic " <> Base.encode64("admin:secret")
 

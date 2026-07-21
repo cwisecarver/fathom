@@ -64,7 +64,10 @@ defmodule FathomWeb.AdminDirectoryLive do
   # live_session gate as every other event here; the `data-confirm` dialog is the destructive
   # guard. Physical erase runs in the background DeleteJob, so we report "scheduled".
   def handle_event("delete_tenant", %{"id" => shard_id}, socket) do
-    case Fathom.Tenants.delete(shard_id) do
+    result = Fathom.Tenants.delete(shard_id)
+    audit("delete", shard_id, if(match?({:ok, _}, result), do: "ok", else: "error"))
+
+    case result do
       {:ok, :scheduled} ->
         {:noreply,
          socket
@@ -80,11 +83,11 @@ defmodule FathomWeb.AdminDirectoryLive do
   # Suspend / resume (#20): dedicated actions (not a status hand-flip) so the fleet-wide
   # admission gate + coordinator drain fire. Same admin gate as every event here.
   def handle_event("suspend_tenant", %{"id" => shard_id}, socket) do
-    lifecycle(socket, Fathom.Tenants.suspend(shard_id), shard_id, "Suspended")
+    lifecycle(socket, Fathom.Tenants.suspend(shard_id), shard_id, "suspend", "Suspended")
   end
 
   def handle_event("resume_tenant", %{"id" => shard_id}, socket) do
-    lifecycle(socket, Fathom.Tenants.resume(shard_id), shard_id, "Resumed")
+    lifecycle(socket, Fathom.Tenants.resume(shard_id), shard_id, "resume", "Resumed")
   end
 
   def handle_event("save", %{"edit" => %{"status" => status, "retain_until" => retain}}, socket) do
@@ -100,8 +103,16 @@ defmodule FathomWeb.AdminDirectoryLive do
     end
   end
 
+  # Best-effort audit of a dashboard action (#9). There is no conn in a LiveView and the BasicAuth
+  # username isn't threaded into the socket, so the actor is coarse ("admin (dashboard)") — finer
+  # per-operator dashboard identity is a follow-up. The action + shard + outcome are the audit's core.
+  defp audit(action, shard_id, outcome),
+    do: Fathom.Audit.record("admin (dashboard)", action, shard_id, nil, outcome, %{})
+
   # Shared result-handling for the suspend/resume events (#20).
-  defp lifecycle(socket, result, shard_id, verb) do
+  defp lifecycle(socket, result, shard_id, action, verb) do
+    audit(action, shard_id, if(result == :ok, do: "ok", else: "error"))
+
     case result do
       :ok ->
         {:noreply,

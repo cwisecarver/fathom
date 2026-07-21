@@ -56,6 +56,40 @@ defmodule FathomWeb.Api.TenantController do
     end
   end
 
+  # The mutating, high-blast-radius actions the audit log (#9) records. Reads (index/show/list) are
+  # not audited.
+  @audited_actions ~w(create delete suspend resume mint_token rotate_token revoke_token fork flush
+                      restore create_snapshot drop_snapshot)a
+
+  # Override the dispatch to write one audit event per mutating action (#9), attributing it to the
+  # #8 api_actor + source IP with the action's real outcome (from the response status). After the
+  # action, so a failed audit insert (best-effort) can never affect the response.
+  def action(conn, _opts) do
+    conn = apply(__MODULE__, action_name(conn), [conn, conn.params])
+    maybe_audit(conn)
+    conn
+  end
+
+  defp maybe_audit(conn) do
+    action = action_name(conn)
+
+    if action in @audited_actions do
+      outcome = if is_integer(conn.status) and conn.status < 400, do: "ok", else: "error"
+      Fathom.Audit.log(conn, action, audit_shard_id(conn), outcome, audit_detail(conn))
+    end
+  end
+
+  defp audit_shard_id(conn), do: conn.params["id"] || conn.params["shard_id"]
+
+  # Safe, non-secret request detail only — never a minted token (that's in the RESPONSE, not params)
+  # or any credential.
+  defp audit_detail(conn) do
+    conn.params
+    |> Map.take(["snapshot", "snapshot_id", "scope", "label", "force"])
+    |> Enum.reject(fn {_k, v} -> is_nil(v) end)
+    |> Map.new()
+  end
+
   # POST /api/tenants  {"shard_id": "acme"}
   def create(conn, params) do
     case Tenants.provision(params["shard_id"] || params["id"] || "") do
