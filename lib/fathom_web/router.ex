@@ -54,7 +54,7 @@ defmodule FathomWeb.Router do
   # Tenant provisioning control-plane (#21): JSON create/list/get/delete, behind the same admin
   # BasicAuth. On :4000, separate from the Hrana data port.
   scope "/api", FathomWeb.Api do
-    pipe_through [:api, :admin_auth]
+    pipe_through [:api, :api_auth]
 
     post "/tenants", TenantController, :create
     get "/tenants", TenantController, :index
@@ -74,6 +74,43 @@ defmodule FathomWeb.Router do
 
     # Fleet migration convergence — the deploy gate a Django CI/CD reads (#25).
     get "/migrations/status", MigrationController, :status
+  end
+
+  # Auth gate for the /api control plane (expert review #8). Prefers a scoped `Authorization: Bearer`
+  # API key (per-identity, revocable, least-privilege); falls back to the legacy shared admin
+  # BasicAuth (mapped to a full-`destroy` actor) so existing deployments keep working while they
+  # migrate to keys. Either way it assigns `conn.assigns.api_actor` = `%{name, scope}`, which
+  # `require_scope` enforces per action and the audit log (#9) attributes the action to.
+  defp api_auth(conn, _opts) do
+    case bearer_token(conn) do
+      {:ok, token} ->
+        case Fathom.ApiKeys.authenticate(token) do
+          {:ok, actor} ->
+            Plug.Conn.assign(conn, :api_actor, actor)
+
+          :error ->
+            conn
+            |> Plug.Conn.put_resp_content_type("text/plain")
+            |> Plug.Conn.send_resp(401, "invalid or revoked API key")
+            |> Plug.Conn.halt()
+        end
+
+      :none ->
+        # No Bearer token — fall back to the legacy shared admin BasicAuth (backward compat).
+        conn = require_admin_auth(conn, [])
+
+        if conn.halted,
+          do: conn,
+          else:
+            Plug.Conn.assign(conn, :api_actor, %{name: "admin (basic-auth)", scope: "destroy"})
+    end
+  end
+
+  defp bearer_token(conn) do
+    case Plug.Conn.get_req_header(conn, "authorization") do
+      ["Bearer " <> token | _] -> {:ok, String.trim(token)}
+      _ -> :none
+    end
   end
 
   # BasicAuth gate for /admin. Order-independent read of the `:admin_auth` keyword; challenges

@@ -14,7 +14,47 @@ defmodule FathomWeb.Api.TenantController do
   """
   use FathomWeb, :controller
 
-  alias Fathom.{Directory, HranaAuth, Shards, Snapshots, Tenants}
+  alias Fathom.{ApiKeys, Directory, HranaAuth, Shards, Snapshots, Tenants}
+
+  # Per-action scope enforcement (expert review #8): the `api_actor` set by the router's :api_auth
+  # plug must hold at least the action's required scope. read < manage < destroy. `destroy` gates the
+  # irreversible data/backup operations (erase a tenant, overwrite live via restore, delete a
+  # snapshot); `manage` the create/modify/credential operations; `read` the inspective ones.
+  plug :require_scope
+
+  @action_scopes %{
+    index: :read,
+    show: :read,
+    list_snapshots: :read,
+    status: :read,
+    create: :manage,
+    suspend: :manage,
+    resume: :manage,
+    fork: :manage,
+    flush: :manage,
+    create_snapshot: :manage,
+    mint_token: :manage,
+    rotate_token: :manage,
+    revoke_token: :manage,
+    delete: :destroy,
+    restore: :destroy,
+    drop_snapshot: :destroy
+  }
+
+  defp require_scope(conn, _opts) do
+    # Default to the most restrictive scope for any unmapped action (fail closed).
+    required = Map.get(@action_scopes, action_name(conn), :destroy)
+    actor = conn.assigns[:api_actor]
+
+    if actor && ApiKeys.scope_at_least?(actor.scope, required) do
+      conn
+    else
+      conn
+      |> put_status(:forbidden)
+      |> json(%{error: "insufficient scope: this action requires #{required}"})
+      |> halt()
+    end
+  end
 
   # POST /api/tenants  {"shard_id": "acme"}
   def create(conn, params) do
