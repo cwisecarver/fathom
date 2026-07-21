@@ -160,16 +160,28 @@ defmodule FathomWeb.Api.TenantController do
     end
   end
 
-  # POST /api/tenants/:id/restore   {"snapshot": "<snapshot_id>"}
+  # POST /api/tenants/:id/restore   {"snapshot": "<snapshot_id>", "force": true}
   # Point-in-time restore (#12): drains the shard, then copies the snapshot back over the live object;
   # the next connect cold-opens the restored state. Destructive — snapshot first if you might undo.
+  # A restore across a schema-migration boundary is refused unless `force` is true (#7).
   def restore(conn, %{"id" => id} = params) do
-    case Snapshots.restore(id, params["snapshot"] || "") do
+    case Snapshots.restore(id, params["snapshot"] || "", force: params["force"] == true) do
       :ok ->
         json(conn, %{shard_id: id, restored: params["snapshot"]})
 
       {:error, :invalid_shard_id} ->
         error(conn, :bad_request, "invalid shard id")
+
+      {:error, :snapshot_not_found} ->
+        error(conn, :not_found, "snapshot not found")
+
+      {:error, {:schema_version_mismatch, %{snapshot: snap, directory: dir}}} ->
+        error(
+          conn,
+          :conflict,
+          "snapshot is at schema_version #{snap} but the tenant is at #{dir}; restoring crosses a " <>
+            "migration boundary — pass \"force\": true to restore and re-migrate forward"
+        )
 
       {:error, {:shard_busy, _}} ->
         error(conn, :conflict, "shard is busy (active connections) — quiesce it and retry")

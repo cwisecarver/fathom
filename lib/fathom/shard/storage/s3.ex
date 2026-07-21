@@ -840,6 +840,16 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   @impl true
+  def pull_snapshot(shard_id, snapshot_id, local_path) do
+    case download(url_path(snapshot_key(shard_id, snapshot_id)), local_path) do
+      {:ok, etag} -> {:ok, etag}
+      {:sentinel, etag} -> {:ok, etag}
+      :absent -> {:ok, nil}
+      {:error, _} = error -> error
+    end
+  end
+
+  @impl true
   def restore_snapshot(shard_id, snapshot_id, expected_etag) do
     # Fenced snapshot restore (expert review 2026-07-18 #2): the snapshot counterpart of the fenced
     # migration restore/3. S3 can't carry an If-Match on a CopyObject DESTINATION, so mirror the

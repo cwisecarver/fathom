@@ -1,0 +1,82 @@
+defmodule Fathom.SnapshotsSchemaGuardTest do
+  @moduledoc """
+  The snapshot-restore schema-version guard (expert review 2026-07-19 #7). A snapshot carries the
+  schema version its bytes were captured at (the file's `PRAGMA user_version`). Restoring one across a
+  migration boundary — a `vN-1` snapshot after the fleet cut to `vN` — would leave the directory
+  claiming `vN` over a `vN-1` file: the laggard sweep believes it's migrated and never converges it,
+  and `vN` app code reads a `vN-1` schema. `Snapshots.restore` now refuses that without `force`, and
+  on `force` reconciles the directory to the restored version so the laggard sweep re-migrates forward.
+  Directory is sandboxed (DataCase); storage is real files seeded directly.
+  """
+  use Fathom.DataCase, async: false
+
+  alias Fathom.{Directory, Snapshots}
+  alias Fathom.Shard.{Connection, Storage}
+
+  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
+
+  defp uniq, do: "snapguard_#{System.unique_integer([:positive])}"
+
+  # Push a real SQLite file at `user_version` as the shard's live stored object (no coordinator).
+  defp seed_object(shard, user_version) do
+    tmp = Path.join(System.tmp_dir!(), "seed_#{shard}_#{System.unique_integer([:positive])}.db")
+    {:ok, conn} = Connection.open(tmp)
+    {:ok, _} = Connection.query(conn, "PRAGMA user_version = #{user_version}", [])
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (x)", [])
+    :ok = Connection.close(conn)
+    :ok = Storage.flush(shard, tmp)
+    for s <- ["", "-wal", "-shm"], do: File.rm(tmp <> s)
+  end
+
+  defp cleanup(shard) do
+    for s <- [".db", ".db-wal", ".db-shm", ".lock"],
+        do: File.rm(Path.join(@remote_dir, shard <> s))
+
+    for snap <- Path.wildcard(Path.join(@remote_dir, "#{shard}@snap-*.db")), do: File.rm(snap)
+  end
+
+  test "a cross-version restore is refused without force, and with force reconciles the directory (#7)" do
+    shard = uniq()
+    on_exit(fn -> cleanup(shard) end)
+    {:ok, _} = Directory.resolve(shard)
+    seed_object(shard, 0)
+    {:ok, snap} = Snapshots.create(shard)
+
+    # The fleet cut over to v2 and this shard migrated: the directory now says 2, the snapshot is v0.
+    {:ok, _} = Directory.cutover(shard, 2)
+    assert {:ok, %{schema_version: 2}} = Directory.get(shard)
+
+    # A restore across the boundary is refused — it would leave the directory claiming v2 over a v0 file.
+    assert {:error, {:schema_version_mismatch, %{snapshot: 0, directory: 2}}} =
+             Snapshots.restore(shard, snap)
+
+    assert {:ok, %{schema_version: 2}} = Directory.get(shard), "a refused restore changes nothing"
+
+    # With force, the restore proceeds AND reconciles the directory to the restored version, so the
+    # laggard sweep (schema_version 0 < head) converges it forward instead of believing it is migrated.
+    assert :ok = Snapshots.restore(shard, snap, force: true)
+    assert {:ok, %{schema_version: 0}} = Directory.get(shard)
+  end
+
+  test "a same-version restore needs no force and leaves the directory unchanged (#7)" do
+    shard = uniq()
+    on_exit(fn -> cleanup(shard) end)
+    {:ok, _} = Directory.resolve(shard)
+    seed_object(shard, 0)
+    {:ok, snap} = Snapshots.create(shard)
+
+    # A within-version restore (the common "undo the bad data change" case) is unaffected.
+    seed_object(shard, 0)
+    assert :ok = Snapshots.restore(shard, snap)
+    assert {:ok, %{schema_version: 0}} = Directory.get(shard)
+  end
+
+  test "restoring a missing snapshot id returns :snapshot_not_found (#7)" do
+    shard = uniq()
+    on_exit(fn -> cleanup(shard) end)
+    {:ok, _} = Directory.resolve(shard)
+    seed_object(shard, 0)
+
+    assert {:error, :snapshot_not_found} = Snapshots.restore(shard, "20260101T000000Z-0000")
+  end
+end

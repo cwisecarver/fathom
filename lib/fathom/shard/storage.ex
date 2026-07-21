@@ -227,6 +227,16 @@ defmodule Fathom.Shard.Storage do
   @callback drop_snapshot(shard_id :: String.t(), snapshot_id :: String.t()) ::
               :ok | {:error, term()}
 
+  # Downloads a snapshot's bytes to `local_path` (`{:ok, etag}`, or `{:ok, nil}` if the snapshot is
+  # absent) — the read counterpart of `pull` for the `@snap-<id>` namespace. `Fathom.Snapshots.restore`
+  # uses it to read a snapshot's `PRAGMA user_version` and refuse a cross-schema-version restore
+  # before the destructive copy-back (expert review #7).
+  @callback pull_snapshot(
+              shard_id :: String.t(),
+              snapshot_id :: String.t(),
+              local_path :: Path.t()
+            ) :: {:ok, String.t() | nil} | {:error, term()}
+
   # Full tenant erasure (expert review 2026-07-14 #15): delete EVERY stored object
   # belonging to `shard_id` — the live `.db`, the `.lock`, every retained
   # `@<version>` copy, and every `@snap-<snapshot_id>` — in one sweep, since a
@@ -439,6 +449,12 @@ defmodule Fathom.Shard.Storage do
   @doc "Deletes a stored snapshot (idempotent)."
   @spec drop_snapshot(String.t(), String.t()) :: :ok | {:error, term()}
   def drop_snapshot(shard_id, snapshot_id), do: backend().drop_snapshot(shard_id, snapshot_id)
+
+  @doc "Downloads a snapshot's bytes to `local_path` (`{:ok, nil}` if absent). See the callback (#7)."
+  @spec pull_snapshot(String.t(), String.t(), Path.t()) ::
+          {:ok, String.t() | nil} | {:error, term()}
+  def pull_snapshot(shard_id, snapshot_id, local_path),
+    do: backend().pull_snapshot(shard_id, snapshot_id, local_path)
 
   @doc """
   Deletes every stored object for `shard_id` — the live `.db`, the `.lock`, all retained

@@ -235,6 +235,23 @@ defmodule Fathom.Shard.Storage.Local do
   end
 
   @impl true
+  def pull_snapshot(shard_id, snapshot_id, local_path) do
+    case File.read(snapshot_path(shard_id, snapshot_id)) do
+      {:ok, body} ->
+        case Storage.atomic_write(local_path, body) do
+          :ok -> {:ok, content_etag(body)}
+          err -> err
+        end
+
+      {:error, :enoent} ->
+        {:ok, nil}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @impl true
   def drop_snapshot(shard_id, snapshot_id) do
     case File.rm(snapshot_path(shard_id, snapshot_id)) do
       :ok -> :ok

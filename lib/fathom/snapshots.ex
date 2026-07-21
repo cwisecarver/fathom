@@ -28,6 +28,8 @@ defmodule Fathom.Snapshots do
   snapshot before restoring an older one if you might want to undo.
   """
 
+  alias Fathom.Directory
+  alias Fathom.Shard.Connection
   alias Fathom.Shard.Storage
   alias Fathom.ShardId
   alias Fathom.Shards
@@ -79,11 +81,25 @@ defmodule Fathom.Snapshots do
   `{:error, {:shard_busy, reason}}` if the local coordinator won't drain, or
   `{:error, {:held, owner}}` if a live node owns it. `opts[:drain_timeout]`
   overrides the drain wait (default #{@drain_timeout}ms).
+
+  **Schema-version guard (expert review #7).** A snapshot carries the schema version its bytes were
+  captured at (its file's `PRAGMA user_version`). Restoring one whose version differs from the
+  directory's current `schema_version` — e.g. a `vN-1` snapshot after the fleet cut to `vN` — would
+  leave the directory claiming a version the file no longer has: the laggard sweep (`schema_version <
+  head`) then believes the shard is migrated and never converges it, and `vN`-expecting app code reads
+  a `vN-1` schema. So a cross-version restore is **refused** with
+  `{:error, {:schema_version_mismatch, %{snapshot: v, directory: v}}}` unless `opts[:force]` is true;
+  on `force` (or a same-version restore) the directory's `schema_version` is reconciled to the restored
+  version afterward, so the laggard sweep re-migrates it forward to head.
   """
   @spec restore(String.t(), String.t(), keyword()) :: :ok | {:error, term()}
   def restore(shard_id, snapshot_id, opts \\ []) do
+    force? = Keyword.get(opts, :force, false)
+
     with {:ok, id} <- cast(shard_id),
-         {:ok, snapshot_id} <- cast_snapshot_id(snapshot_id) do
+         {:ok, snapshot_id} <- cast_snapshot_id(snapshot_id),
+         {:ok, snap_version} <- snapshot_user_version(id, snapshot_id),
+         :ok <- check_schema_boundary(id, snap_version, force?) do
       case Shards.drain(id, Keyword.get(opts, :drain_timeout, @drain_timeout)) do
         :ok ->
           case Storage.lease_holder(id) do
@@ -93,8 +109,20 @@ defmodule Fathom.Snapshots do
               # flushes between here and the copy-back moves the etag, so the restore aborts with
               # {:error, :superseded} instead of silently clobbering those acked writes.
               case Storage.object_etag(id) do
-                {:ok, etag} -> Storage.restore_snapshot(id, snapshot_id, etag)
-                {:error, reason} -> {:error, reason}
+                {:ok, etag} ->
+                  case Storage.restore_snapshot(id, snapshot_id, etag) do
+                    :ok ->
+                      # Align the directory to the restored file's version so it never lies about the
+                      # schema (#7); a below-head version lets the laggard sweep converge it forward.
+                      reconcile_directory_schema(id, snap_version)
+                      :ok
+
+                    other ->
+                      other
+                  end
+
+                {:error, reason} ->
+                  {:error, reason}
               end
 
             {:held, owner} ->
@@ -108,6 +136,86 @@ defmodule Fathom.Snapshots do
           {:error, {:shard_busy, reason}}
       end
     end
+  end
+
+  # The schema version the snapshot's bytes carry (its file's PRAGMA user_version), read by pulling
+  # the snapshot to a temp — the version the live object will have after the copy-back. Guards the
+  # cross-version restore and drives the post-restore directory reconcile (#7).
+  defp snapshot_user_version(id, snapshot_id) do
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "fathom_snaprestore_#{id}_#{System.unique_integer([:positive])}.db"
+      )
+
+    try do
+      case Storage.pull_snapshot(id, snapshot_id, tmp) do
+        {:ok, nil} -> {:error, :snapshot_not_found}
+        {:ok, _etag} -> read_user_version(tmp)
+        {:error, reason} -> {:error, reason}
+      end
+    after
+      for s <- ["", "-wal", "-shm"], do: File.rm(tmp <> s)
+    end
+  end
+
+  defp read_user_version(path) do
+    case Connection.open(path) do
+      {:ok, conn} ->
+        result =
+          case Connection.query(conn, "PRAGMA user_version", []) do
+            {:ok, %{rows: [[v]]}} when is_integer(v) -> {:ok, v}
+            other -> {:error, {:user_version_unreadable, other}}
+          end
+
+        Connection.close(conn)
+        result
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # Refuse a restore that would cross a schema-migration boundary unless force: true (#7). With no
+  # directory row there is nothing to skew, so allow it. Fails OPEN on a directory (Postgres) error —
+  # a control-plane read must never break the restore (the data path never hard-depends on Postgres);
+  # any skew a restore-during-outage leaves is caught by `mix fathom.directory reconcile` (#6).
+  defp check_schema_boundary(id, snap_version, force?) do
+    case directory_schema_version(id) do
+      {:ok, dir_version} when dir_version != snap_version and not force? ->
+        {:error, {:schema_version_mismatch, %{snapshot: snap_version, directory: dir_version}}}
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp reconcile_directory_schema(id, snap_version) do
+    case directory_schema_version(id) do
+      {:ok, v} when v != snap_version ->
+        try do
+          Directory.reconcile_schema_version(id, snap_version)
+        rescue
+          _ -> :ok
+        catch
+          :exit, _ -> :ok
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  # The directory's schema_version for `id`, or `:none` (no row, or a Postgres error — fail open).
+  defp directory_schema_version(id) do
+    case Directory.get(id) do
+      {:ok, %{schema_version: v}} -> {:ok, v}
+      _ -> :none
+    end
+  rescue
+    _ -> :none
+  catch
+    :exit, _ -> :none
   end
 
   @doc "Deletes a stored snapshot (idempotent)."
