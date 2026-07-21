@@ -780,6 +780,11 @@ defmodule Fathom.Shard do
         # The value carries the caller AND the call's op tag, so an abandon names
         # exactly one grant (round-2 #33) instead of every grant this pid holds.
         state = %{cancel_idle(state) | conns: Map.put(state.conns, ref, {caller, op})}
+
+        # Publish the busy count so the at-capacity eviction probe skips this shard while it serves
+        # (expert review #14) — otherwise a long-lived held stream ages to the LRU front but can't be
+        # evicted, starving admission. A best-effort hint, no-op unless eviction is enabled.
+        Fathom.Shards.Lru.record_conns(state.id, map_size(state.conns))
         {:reply, {:ok, ref, state.path}, state}
     end
   end
@@ -1263,6 +1268,11 @@ defmodule Fathom.Shard do
     Process.demonitor(ref, [:flush])
     conns = Map.delete(state.conns, ref)
     state = %{state | conns: conns}
+
+    # Update the busy count and re-stamp recency (#14): a just-released shard was recently used, so it
+    # should not read as the LRU-coldest, and its lowered count lets the eviction probe consider it.
+    Fathom.Shards.Lru.record_conns(state.id, map_size(conns))
+    Fathom.Shards.Lru.touch(state.id)
 
     cond do
       map_size(conns) > 0 -> state

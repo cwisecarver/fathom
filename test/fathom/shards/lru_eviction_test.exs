@@ -93,6 +93,24 @@ defmodule Fathom.Shards.LruEvictionTest do
     assert Process.alive?(busy), "a shard with a live connection must never be evicted"
   end
 
+  # Expert review #14: the coordinator must publish its checked-out-connection count so the eviction
+  # probe (via lru_order) can skip a busy shard. Without it, a long-lived held stream ages to the LRU
+  # front but can't be evicted, starving admission (a soft cap degrading to a hard cap). This pins the
+  # wiring: a held shard reads busy, a released one reads not-busy.
+  test "the coordinator publishes its busy count for eviction (#14)" do
+    # A finite cap makes Lru tracking active (enabled?), but large enough that nothing is evicted.
+    Application.put_env(:fathom, :max_open_shards, 100)
+    id = uniq()
+
+    {:ok, pid, ref, _path} = Shards.checkout(id)
+    _ = :sys.get_state(pid)
+    assert Lru.busy?(id), "a held shard must publish as busy"
+
+    Fathom.Shard.checkin(pid, ref)
+    _ = :sys.get_state(pid)
+    refute Lru.busy?(id), "a released shard must publish as not-busy"
+  end
+
   test "with :evict_idle_at_capacity false (hard cap), an idle shard is not evicted" do
     Application.put_env(:fathom, :evict_idle_at_capacity, false)
     idle = open_idle(uniq())
@@ -123,6 +141,29 @@ defmodule Fathom.Shards.LruEvictionTest do
       Lru.touch("ghost")
       assert Lru.lru_order(10) == []
       refute Lru.enabled?()
+    end
+
+    # Expert review #14: the mixed busy-front + idle-tail case the old suite missed. lru_order must
+    # filter BUSY shards BEFORE the limit cut, so a bounded probe never wastes its slots on the busy
+    # LRU front and 503s while an evictable idle shard sits just past the probe window.
+    test "lru_order returns only IDLE candidates — a busy front never hides the idle tail (#14)" do
+      Application.put_env(:fathom, :max_open_shards, 100)
+      Lru.reset()
+
+      # 20 BUSY shards are the coldest (touched first); one IDLE shard is the warmest.
+      for i <- 1..20 do
+        id = "busy#{i}"
+        Lru.touch(id)
+        Lru.record_conns(id, 1)
+      end
+
+      Lru.touch("idle")
+      Lru.record_conns("idle", 0)
+
+      # Pre-#14, lru_order(2) returned the 2 coldest (both busy) and the idle was hidden past the
+      # window. Now the busy front is filtered out, so even a tight probe reaches the idle tail.
+      assert Lru.lru_order(2) == ["idle"]
+      assert Lru.lru_order(100) == ["idle"]
     end
   end
 
