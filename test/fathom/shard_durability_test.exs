@@ -943,10 +943,18 @@ defmodule Fathom.ShardDurabilityTest do
     assert log =~ ":ownership_unconfirmed"
 
     # Ownership reconfirmed: a durable flush RESETS the counter and emits NO failure event — a skip
-    # participates in the same reset-on-recovery contract as a PUT failure.
+    # participates in the same reset-on-recovery contract as a PUT failure. Use the SYNCHRONOUS
+    # flush_now (blocks until the shard is durably clean) so the reset is observable deterministically:
+    # a windowed `refute_receive` on the async `:durability_flush` was racy under full-suite load (it
+    # occasionally caught a re-scheduled skip and flaked). The counter reset is the recovery contract;
+    # any failure event would already be in the mailbox by the time the sync flush returns.
     Application.delete_env(:fathom, :storage_fault)
-    flush_now(coordinator)
-    refute_receive {:flush_failed, _, _}, 100
+    assert :ok = Shard.flush_now(coordinator)
+
+    assert :sys.get_state(coordinator).flush_failures == 0,
+           "a durable flush must reset the consecutive-failure counter (recovery contract)"
+
+    refute_received {:flush_failed, _, _}
 
     ShardExecutor.close(conn)
   end
