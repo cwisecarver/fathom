@@ -64,16 +64,24 @@ defmodule Fathom.Tenants.TombstonesDrTest do
            "a booted node must refuse a storage-tombstoned id even after the directory forgot it"
   end
 
-  defp wait_for_restart(old_pid, tries \\ 0)
+  # Wait for the supervisor to restart the Tombstones singleton under a NEW pid. A supervisor restart
+  # is async with no signal to await, so poll on a real time budget — a tight spin-loop finishes in
+  # microseconds, far faster than the restart, and spuriously "times out" under suite contention.
+  defp wait_for_restart(old_pid),
+    do: wait_for_restart(old_pid, System.monotonic_time(:millisecond) + 2_000)
 
-  defp wait_for_restart(_old_pid, tries) when tries > 2_000,
-    do: flunk("Tombstones did not restart")
-
-  defp wait_for_restart(old_pid, tries) do
+  defp wait_for_restart(old_pid, deadline) do
     case Process.whereis(Tombstones) do
-      nil -> wait_for_restart(old_pid, tries + 1)
-      ^old_pid -> wait_for_restart(old_pid, tries + 1)
-      new_pid -> new_pid
+      pid when is_pid(pid) and pid != old_pid ->
+        pid
+
+      _ ->
+        if System.monotonic_time(:millisecond) < deadline do
+          Process.sleep(10)
+          wait_for_restart(old_pid, deadline)
+        else
+          flunk("Tombstones did not restart within 2s")
+        end
     end
   end
 end
