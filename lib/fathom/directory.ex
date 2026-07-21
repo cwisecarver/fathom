@@ -235,6 +235,39 @@ defmodule Fathom.Directory do
   def mark_migrating(shard_id),
     do: update_shard(shard_id, %{status: "migrating", migrating_since: DateTime.utc_now()})
 
+  @doc "Every directory row — the DR reconcile sweep (#6). Operator tooling, not a hot path."
+  @spec all() :: [Shard.t()]
+  def all, do: Repo.all(Shard)
+
+  @doc """
+  Aligns a shard's `schema_version` to `version` WITHOUT the cutover side effects (no
+  `cutover_at`/`last_active_at` stamp) — the DR reconcile aligning the directory to the shard file's
+  authoritative `PRAGMA user_version` after a Postgres point-in-time restore rolled it back (#6). The
+  file's version lives in storage (not Postgres), so it survives the restore and is the source of truth.
+  """
+  @spec reconcile_schema_version(String.t(), non_neg_integer()) ::
+          {:ok, Shard.t()} | {:error, :not_found | Ecto.Changeset.t()}
+  def reconcile_schema_version(shard_id, version),
+    do: update_shard(shard_id, %{schema_version: version})
+
+  @doc """
+  Raises a shard's `token_version` to at least `floor` (never lowers) — the DR reconcile aligning the
+  directory to the durable storage revocation floor after a restore (#6). Returns the row count
+  touched (1 = raised, 0 = already at/above `floor`).
+  """
+  @spec raise_token_version(String.t(), non_neg_integer()) :: non_neg_integer()
+  def raise_token_version(shard_id, floor) do
+    now = DateTime.utc_now()
+
+    {count, _} =
+      Repo.update_all(
+        from(s in Shard, where: s.shard_id == ^shard_id and s.token_version < ^floor),
+        set: [token_version: floor, updated_at: now]
+      )
+
+    count
+  end
+
   @doc """
   Renews a shard's `migrating_since` liveness stamp (expert review 2026-07-18 #11) — bumps it to
   now, but ONLY while the shard is `migrating`. The migration lease renewer calls this on the same
