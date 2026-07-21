@@ -1260,17 +1260,26 @@ defmodule Fathom.Shard.Storage.S3 do
   defp owner_live?(other, now, lock_expires_at_ms) do
     margin = Storage.steal_margin_ms()
 
-    case Storage.read_heartbeat(other) do
+    case read_heartbeat_dated(other) do
       # Verify the heartbeat body's owner matches (expert review round-2 #3, defense in
       # depth): with the per-owner key this always holds, but never trust a mismatched
       # body to declare `other` live.
-      {:ok, %{owner: ^other, expires_at_ms: exp}} ->
-        if now <= exp + margin, do: :live, else: :dead
+      {:ok, %{owner: ^other, expires_at_ms: exp}, s3_now} ->
+        # Compare against S3's OWN clock (its response Date), not this reader's local clock (#13). A
+        # reader whose clock stepped forward (VM live-migration, a bad NTP step, a hypervisor pause
+        # resumed with a jumped RTC) would otherwise see a live owner's fresh heartbeat as expired and
+        # wrongfully steal — the victim then self-fences and QUARANTINES its acked writes, turning a
+        # skew event into data loss. S3's Date is a clock both sides share. Fall back to the local
+        # `now` only when the store returned no Date. (Owner-clock skew — the owner stamping `exp`
+        # wrong — is unaddressed here; the frozen-vs-advancing double-read is the follow-up for it.)
+        maybe_emit_skew(other, now, s3_now)
+        ref_now = s3_now || now
+        if ref_now <= exp + margin, do: :live, else: :dead
 
       # A heartbeat object that isn't `other`'s — treat as no signal and fall back to the
       # lock's own TTL, same as :not_found.
-      {:ok, _mismatch} ->
-        if now <= lock_expires_at_ms + margin, do: :live, else: :dead
+      {:ok, _mismatch, s3_now} ->
+        if (s3_now || now) <= lock_expires_at_ms + margin, do: :live, else: :dead
 
       # No heartbeat object at all (`heartbeat_server: false` legacy mode, or the owner's
       # heartbeat was cleared): fall back to the lock's OWN TTL for liveness (finding #11).
@@ -1280,16 +1289,27 @@ defmodule Fathom.Shard.Storage.S3 do
       # Exception (round-2 #34): this node's PROVEN-DEAD previous incarnation (heartbeat
       # verified stale/frozen and cleared) — its recently-renewed locks must not block
       # the restarted node for TTL+margin. Exact owner match only.
-      :not_found ->
+      {:not_found, s3_now} ->
         cond do
           Storage.incarnation_dead?(other) -> :dead
-          now <= lock_expires_at_ms + margin -> :live
+          (s3_now || now) <= lock_expires_at_ms + margin -> :live
           true -> :dead
         end
 
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  # Observability for clock skew (#13): the difference between this reader's local clock and S3's
+  # response Date, so operators can watch skew on a metric rather than out-of-band NTP monitoring — a
+  # large skew is what would (pre-#13) have driven wrongful steals. No-op when the store sent no Date.
+  defp maybe_emit_skew(_owner, _local_now, nil), do: :ok
+
+  defp maybe_emit_skew(owner, local_now, s3_now) do
+    :telemetry.execute([:fathom, :shard, :clock_skew], %{skew_ms: local_now - s3_now}, %{
+      owner: owner
+    })
   end
 
   # Create the lock only if it does not exist (`If-None-Match: *`). `:exists` on a
@@ -1381,21 +1401,52 @@ defmodule Fathom.Shard.Storage.S3 do
 
   @impl true
   def read_heartbeat(owner) do
+    case read_heartbeat_dated(owner) do
+      {:ok, hb, _s3_now} -> {:ok, hb}
+      {:not_found, _s3_now} -> :not_found
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # read_heartbeat, also returning S3's own clock (its response `Date` header, epoch-ms, or nil if
+  # absent/unparseable) so the steal decision can compare against a SHARED clock instead of this
+  # reader's local one (#13). owner_live?/3 is the only caller that needs the date.
+  defp read_heartbeat_dated(owner) do
     case Req.get(req(), url: heartbeat_path(owner)) do
-      {:ok, %{status: 200, body: body}} ->
+      {:ok, %{status: 200, body: body} = resp} ->
         case Storage.decode_heartbeat(body) do
-          {:ok, hb} -> {:ok, hb}
+          {:ok, hb} -> {:ok, hb, s3_date_ms(resp)}
           :error -> {:error, :corrupt_heartbeat}
         end
 
-      {:ok, %{status: 404}} ->
-        :not_found
+      {:ok, %{status: 404} = resp} ->
+        {:not_found, s3_date_ms(resp)}
 
       {:ok, %{status: status}} ->
         {:error, {:s3_get_status, status}}
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  # Epoch-ms of an S3 response's `Date` header (the store's own clock), or nil when absent/unparseable.
+  # HTTP dates are RFC 1123 in GMT; `:httpd_util.convert_request_date/1` parses them without inets running.
+  defp s3_date_ms(resp) do
+    with date when is_binary(date) <- date_header(resp),
+         {{y, mo, d}, {h, mi, s}} <- :httpd_util.convert_request_date(String.to_charlist(date)),
+         {:ok, naive} <- NaiveDateTime.new(y, mo, d, h, mi, s) do
+      naive |> DateTime.from_naive!("Etc/UTC") |> DateTime.to_unix(:millisecond)
+    else
+      _ -> nil
+    end
+  end
+
+  defp date_header(resp) do
+    case resp.headers["date"] do
+      [v | _] when is_binary(v) -> v
+      v when is_binary(v) -> v
+      _ -> nil
     end
   end
 

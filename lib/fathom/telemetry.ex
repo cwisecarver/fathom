@@ -112,6 +112,13 @@ defmodule Fathom.Telemetry do
         description:
           "Control-plane / admin audit events by action + outcome (#9) — delete / restore / export / token ops"
       ),
+      summary("fathom.shard.clock_skew.skew_ms",
+        event_name: [:fathom, :shard, :clock_skew],
+        measurement: :skew_ms,
+        unit: :millisecond,
+        description:
+          "Local clock minus S3's response Date at a steal-liveness check (#13) — watch for skew that would drive wrongful steals"
+      ),
 
       # --- Rebalancer (Phase-2 B1) — operability for the enable runbook -------------------
       # Low-cardinality only: tag by node/outcome, never shard_id (the ShardLoad cardinality

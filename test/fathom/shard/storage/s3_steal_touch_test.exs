@@ -165,4 +165,44 @@ defmodule Fathom.Shard.Storage.S3StealTouchTest do
     assert S3EtagStore.meta_of(store, @data_key)[@md5_meta_key] == md5,
            "the md5 metadata must ALSO survive the multipart→single touch"
   end
+
+  # Expert review #13: owner_live? compared this reader's LOCAL clock to the owner's stamped heartbeat
+  # expiry, so a reader whose clock stepped FORWARD (VM live-migration, a bad NTP step) saw a live
+  # owner's fresh heartbeat as expired and wrongfully stole — the victim then self-fenced and
+  # quarantined its acked writes (a skew event → data loss). The steal now compares against S3's OWN
+  # clock (its response Date), a clock both sides share. Modeled by an S3 store whose Date is BEHIND
+  # this reader's local clock (i.e. the reader is skewed ahead).
+  test "a forward reader-clock step does NOT wrongfully steal a live owner (uses S3's Date, #13)" do
+    now = Storage.now_ms()
+    owner = "liveowner"
+    # Heartbeat + lock read as EXPIRED by this reader's local clock (exp 10 s in its past)...
+    hb = Storage.encode_heartbeat(%{owner: owner, expires_at_ms: now - 10_000})
+    lock = Storage.encode_lease(%{owner: owner, epoch: 5, expires_at_ms: now - 10_000})
+
+    store =
+      start_store(%{@data_key => "shard-bytes", @lock_key => lock, "heartbeats/#{owner}" => hb})
+
+    # ...but S3's own clock is 20 s BEHIND the reader (the reader stepped forward), so by the SHARED
+    # S3 clock the heartbeat is still fresh — the owner is live and must not be stolen.
+    S3EtagStore.set_date_ms(store, now - 20_000)
+
+    assert {:error, {:held, ^owner}} = S3.acquire_lease(@shard, "new@node#inc2", 30_000),
+           "a forward reader-clock step must not steal a live owner (pre-#13: wrongful steal)"
+  end
+
+  test "a genuinely-dead owner is still stolen when S3's Date agrees it is stale (#13)" do
+    now = Storage.now_ms()
+    owner = "deadowner"
+    hb = Storage.encode_heartbeat(%{owner: owner, expires_at_ms: now - 60_000})
+    lock = Storage.encode_lease(%{owner: owner, epoch: 5, expires_at_ms: now - 60_000})
+
+    store =
+      start_store(%{@data_key => "shard-bytes", @lock_key => lock, "heartbeats/#{owner}" => hb})
+
+    # S3's clock agrees the heartbeat is 60 s stale — genuinely dead, so the steal proceeds.
+    S3EtagStore.set_date_ms(store, now)
+
+    assert {:ok, %{took_over: true}} = S3.acquire_lease(@shard, "new@node#inc2", 30_000),
+           "a heartbeat stale by the shared S3 clock is genuinely dead and IS stolen"
+  end
 end

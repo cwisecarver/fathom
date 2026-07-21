@@ -16,9 +16,15 @@ defmodule Fathom.Test.S3EtagStore do
     %{
       objects: Map.new(objects, fn {k, body} -> {k, %{body: body, form: :single, meta: %{}}} end),
       uploads: %{},
-      seq: 0
+      seq: 0,
+      # Optional: the epoch-ms this store reports as its response `Date` (the store's own clock). nil ⇒
+      # no Date header, so callers fall back to their local clock. Used to model clock skew (#13).
+      date_ms: nil
     }
   end
+
+  @doc "Set the store's reported `Date` clock (epoch-ms), or nil for no Date header (#13)."
+  def set_date_ms(agent, ms), do: Agent.update(agent, &%{&1 | date_ms: ms})
 
   @doc "The store's metadata map for `key` (nil when absent)."
   def meta_of(agent, key) do
@@ -86,6 +92,8 @@ defmodule Fathom.Test.S3EtagStore do
   # --- handlers ---
 
   defp head(conn, agent, key) do
+    conn = put_date(conn, agent)
+
     case Agent.get(agent, &Map.get(&1.objects, key)) do
       nil ->
         Plug.Conn.send_resp(conn, 404, "")
@@ -99,6 +107,8 @@ defmodule Fathom.Test.S3EtagStore do
   end
 
   defp get(conn, agent, key) do
+    conn = put_date(conn, agent)
+
     case Agent.get(agent, &Map.get(&1.objects, key)) do
       nil ->
         Plug.Conn.send_resp(conn, 404, "")
@@ -108,6 +118,25 @@ defmodule Fathom.Test.S3EtagStore do
         |> Plug.Conn.put_resp_header("etag", etag(obj))
         |> put_meta_headers(obj)
         |> Plug.Conn.send_resp(200, obj.body)
+    end
+  end
+
+  # The store's `Date` header (its own clock), when configured — models clock skew for #13.
+  defp put_date(conn, agent) do
+    case Agent.get(agent, & &1.date_ms) do
+      nil ->
+        conn
+
+      ms ->
+        # Format as an RFC 1123 GMT string directly (NOT :httpd_util.rfc1123_date/1, which treats its
+        # argument as LOCAL time and shifts by the machine's tz offset — corrupting the Date under test).
+        {:ok, dt} = DateTime.from_unix(ms, :millisecond)
+
+        Plug.Conn.put_resp_header(
+          conn,
+          "date",
+          Calendar.strftime(dt, "%a, %d %b %Y %H:%M:%S GMT")
+        )
     end
   end
 
