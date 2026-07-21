@@ -182,6 +182,7 @@ defmodule Fathom.HranaAuth do
           {:ok, version} ->
             # No bump instant ⇒ no grace: a revoke kills the previous version immediately.
             Revocations.put(canonical, version, nil)
+            back_token_floor(canonical, version)
             notify_revocation(canonical, version, nil)
             {:ok, version}
 
@@ -211,6 +212,7 @@ defmodule Fathom.HranaAuth do
           {:ok, version} ->
             bumped_at = DateTime.utc_now()
             Revocations.put(canonical, version, bumped_at)
+            back_token_floor(canonical, version)
             notify_revocation(canonical, version, bumped_at)
             # token_for reads the now-raised directory version, so it mints at the new version.
             token_for(canonical, opts)
@@ -227,6 +229,29 @@ defmodule Fathom.HranaAuth do
   # Best-effort fleet push (round-2 #24): a notify failure must never fail the revoke/rotate — the
   # directory bump is the durable truth and the TTL converges. `bumped_at` (ISO or nil) carries the
   # rotation grace instant so other nodes honor it too.
+  # Mirror the revocation floor to durable storage (the DR backstop, #6) so a Postgres directory
+  # point-in-time restore can't un-revoke tokens. Best-effort: the directory bump is the primary,
+  # already-committed truth, so a storage blip only leaves the backstop stale (the reconcile sweep
+  # backfills it) — never fail a revoke/rotate for it.
+  defp back_token_floor(shard_id, version) do
+    case Fathom.Shard.Storage.put_token_floor(shard_id, version) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("token floor backstop write failed for #{shard_id}: #{inspect(reason)}")
+        :ok
+    end
+  rescue
+    e ->
+      Logger.warning("token floor backstop write failed for #{shard_id}: #{Exception.message(e)}")
+      :ok
+  catch
+    :exit, reason ->
+      Logger.warning("token floor backstop write failed for #{shard_id}: #{inspect(reason)}")
+      :ok
+  end
+
   defp notify_revocation(shard_id, version, bumped_at) do
     Oban.Notifier.notify(Oban, :fathom_revocations, %{
       shard_id: shard_id,

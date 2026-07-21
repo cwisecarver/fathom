@@ -218,4 +218,44 @@ defmodule Fathom.HranaAuthRevocationTest do
     assert {:error, %Filo.Error{status: 401}} = HranaAuth.authorize(shard, token),
            "the token must be signed with the dedicated secret, not secret_key_base"
   end
+
+  # Expert review 2026-07-19 #6 (cross-store DR coherence). Revocation lives in the Postgres
+  # directory's token_version; a directory point-in-time restore rolls it back and un-revokes tokens.
+  # A durable storage floor is mirrored on revoke and unioned on a cold cache read so a revocation
+  # survives the restore.
+  test "revoke mirrors the token floor to durable storage (#6)" do
+    shard = uniq()
+    {:ok, _} = Directory.resolve(shard)
+
+    on_exit(fn ->
+      File.rm(Path.join([System.tmp_dir!(), "fathom_remote_test", "tokenfloors", shard]))
+    end)
+
+    assert {:ok, version} = HranaAuth.revoke(shard)
+    assert {:ok, ^version} = Fathom.Shard.Storage.read_token_floor(shard)
+  end
+
+  test "the storage floor unions over a lower directory floor on a cold miss (survives a directory rollback) (#6)" do
+    shard = uniq()
+    {:ok, _} = Directory.resolve(shard)
+
+    on_exit(fn ->
+      File.rm(Path.join([System.tmp_dir!(), "fathom_remote_test", "tokenfloors", shard]))
+    end)
+
+    {:ok, token} = HranaAuth.token_for(shard)
+    assert {:ok, _} = HranaAuth.authorize(shard, token), "the fresh token verifies"
+
+    # Post-restore state: the durable storage floor is AHEAD of the (rolled-back) directory floor,
+    # and this node has a cold cache (a node that booted after the restore). Writing a storage floor
+    # above the token's version and clearing the cache reproduces exactly that.
+    :ok = Fathom.Shard.Storage.put_token_floor(shard, 9)
+    :ets.delete(Revocations, shard)
+
+    assert Revocations.floor(shard) == 9,
+           "a cold read-through must union the durable storage floor over the lower directory floor"
+
+    assert {:error, %Filo.Error{status: 401}} = HranaAuth.authorize(shard, token),
+           "a token below the storage-backed floor stays revoked despite the directory rollback"
+  end
 end

@@ -109,8 +109,22 @@ defmodule Fathom.HranaAuth.Revocations do
   end
 
   defp read_through(shard_id, now) do
-    {version, bumped_at} = Directory.token_floor_info(shard_id)
-    version = version || 0
+    {dir_version, dir_bumped} = Directory.token_floor_info(shard_id)
+    dir_version = dir_version || 0
+
+    # Monotonic + DR backstop (expert review #6). A Postgres point-in-time restore can LOWER the
+    # directory's token_version, un-revoking tokens. So never drop below what this node already
+    # cached (protects a running node across a restore at zero storage cost — the floor only ever
+    # rises legitimately); and on a genuine COLD miss (empty cache — a node booting after a restore)
+    # union the durable storage floor so the revocation survives. The storage read is cold-miss-only,
+    # so it never touches the TTL-refresh hot path.
+    {version, bumped_at} =
+      case stale_floor(shard_id) do
+        {:ok, {cached, cached_bumped}} when cached >= dir_version -> {cached, cached_bumped}
+        {:ok, _} -> {dir_version, dir_bumped}
+        :none -> {max(dir_version, storage_floor(shard_id)), dir_bumped}
+      end
+
     insert(shard_id, version, bumped_at, now)
     {version, bumped_at}
   rescue
@@ -140,6 +154,20 @@ defmodule Fathom.HranaAuth.Revocations do
           _ -> {0, nil}
         end
     end
+  end
+
+  # The durable token-revocation floor from storage (the #6 DR backstop), read only on a cold miss.
+  # Best-effort: any error → 0, so a storage blip just falls back to the directory floor and never
+  # locks out valid traffic (the running-node monotonic guard already covers the common restore case).
+  defp storage_floor(shard_id) do
+    case Fathom.Shard.Storage.read_token_floor(shard_id) do
+      {:ok, v} when is_integer(v) -> v
+      _ -> 0
+    end
+  rescue
+    _ -> 0
+  catch
+    :exit, _ -> 0
   end
 
   defp stale_floor(shard_id) do

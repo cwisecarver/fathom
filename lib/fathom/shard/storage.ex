@@ -255,6 +255,16 @@ defmodule Fathom.Shard.Storage do
   @callback put_tombstone(shard_id :: String.t()) :: :ok | {:error, term()}
   @callback tombstoned_ids() :: {:ok, [String.t()]} | {:error, term()}
 
+  # The durable token-revocation floor (expert review #6, DR backstop). Token revocation bumps a
+  # per-shard `token_version` in the Postgres directory; a directory point-in-time restore rolls it
+  # back and revoked tokens verify again. This mirrors the floor (a monotonic high-water mark) to
+  # storage under a `tokenfloors/<shard_id>` key so `HranaAuth.Revocations` can union it on a cold
+  # read and never drop below it — keeping a revocation durable across a directory restore.
+  @callback put_token_floor(shard_id :: String.t(), version :: non_neg_integer()) ::
+              :ok | {:error, term()}
+  @callback read_token_floor(shard_id :: String.t()) ::
+              {:ok, non_neg_integer() | nil} | {:error, term()}
+
   @doc "Pulls the shard's stored file to `local_path`, returning its etag (`nil` if absent)."
   @spec pull(String.t(), Path.t()) :: {:ok, String.t() | nil} | {:error, term()}
   def pull(shard_id, local_path), do: backend().pull(shard_id, local_path)
@@ -451,6 +461,14 @@ defmodule Fathom.Shard.Storage do
   """
   @spec tombstoned_ids() :: {:ok, [String.t()]} | {:error, term()}
   def tombstoned_ids, do: backend().tombstoned_ids()
+
+  @doc "Mirrors `shard_id`'s token-revocation floor to durable storage (the DR backstop, #6). Idempotent."
+  @spec put_token_floor(String.t(), non_neg_integer()) :: :ok | {:error, term()}
+  def put_token_floor(shard_id, version), do: backend().put_token_floor(shard_id, version)
+
+  @doc "Reads `shard_id`'s durable token-revocation floor (`nil` if none) — the boot/cold-read union (#6)."
+  @spec read_token_floor(String.t()) :: {:ok, non_neg_integer() | nil} | {:error, term()}
+  def read_token_floor(shard_id), do: backend().read_token_floor(shard_id)
 
   @doc """
   Aggregate storage footprint — `{object_count, total_bytes}` of the live shard objects — for the

@@ -319,6 +319,31 @@ defmodule Fathom.Shard.Storage.Local do
     end
   end
 
+  @impl true
+  def put_token_floor(shard_id, version) do
+    path = Path.join([dir(), "tokenfloors", shard_id])
+    File.mkdir_p!(Path.dirname(path))
+    File.write(path, Integer.to_string(version))
+  end
+
+  @impl true
+  def read_token_floor(shard_id) do
+    case File.read(Path.join([dir(), "tokenfloors", shard_id])) do
+      {:ok, body} -> {:ok, parse_token_floor(body)}
+      {:error, :enoent} -> {:ok, nil}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp parse_token_floor(body) when is_binary(body) do
+    case Integer.parse(String.trim(body)) do
+      {n, _} when n >= 0 -> n
+      _ -> nil
+    end
+  end
+
+  defp parse_token_floor(_), do: nil
+
   # A stored file belongs to `shard_id` iff the character AFTER the id is `.` (the
   # live `.db`, the `.lock`, an atomic-write `.db.tmp…` temp) or `@` (a `@<version>`
   # / `@snap-<id>` copy). Matching the delimiter — not a bare prefix — is what keeps

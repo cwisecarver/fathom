@@ -997,6 +997,37 @@ defmodule Fathom.Shard.Storage.S3 do
   defp tombstone_key(shard_id), do: prefix() <> "tombstones/" <> shard_id
 
   @impl true
+  def put_token_floor(shard_id, version) do
+    case Req.put(req(),
+           url: url_path(token_floor_key(shard_id)),
+           body: Integer.to_string(version)
+         ) do
+      {:ok, %{status: status}} when status in 200..299 -> :ok
+      {:ok, %{status: status}} -> {:error, {:s3_put_status, status}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @impl true
+  def read_token_floor(shard_id) do
+    case Req.get(req(), url: url_path(token_floor_key(shard_id))) do
+      {:ok, %{status: 200, body: body}} -> {:ok, parse_token_floor(body)}
+      {:ok, %{status: 404}} -> {:ok, nil}
+      {:ok, %{status: status}} -> {:error, {:s3_get_status, status}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp token_floor_key(shard_id), do: prefix() <> "tokenfloors/" <> shard_id
+
+  defp parse_token_floor(body) do
+    case Integer.parse(String.trim(to_string(body))) do
+      {n, _} when n >= 0 -> n
+      _ -> nil
+    end
+  end
+
+  @impl true
   def list_snapshots(shard_id), do: list_snapshots(shard_id, nil, [])
 
   # ListObjectsV2 over the `<shard>@snap-` prefix (reusing the same paginated scan as

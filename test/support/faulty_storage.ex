@@ -181,6 +181,10 @@ defmodule Fathom.Test.FaultyStorage do
   def put_tombstone(shard_id), do: Local.put_tombstone(shard_id)
   @impl true
   def tombstoned_ids, do: Local.tombstoned_ids()
+  @impl true
+  def put_token_floor(shard_id, version), do: Local.put_token_floor(shard_id, version)
+  @impl true
+  def read_token_floor(shard_id), do: Local.read_token_floor(shard_id)
 
   @impl true
   def fork_from(template_id, version, dst_shard_id) do
