@@ -93,10 +93,27 @@ between the last check and idle never produces a clobbering write.
 ## Durability / loss contract
 
 Durability is WAL crash-consistency + a **periodic, write-gated flush** to the store (a clean shard
-skips the upload, so PUTs track writes, not open-shard count). A crash loses **committed-but-
-unflushed** writes — bounded by the flush interval, which *is* the RPO window. `synchronous=FULL`
-(now the default) makes each commit locally durable to a node crash; the flushed object is the
-cross-node durable record, and the lease guarantees only one writer ever produces it.
+skips the upload, so PUTs track writes, not open-shard count). A **node crash** loses
+**committed-but-unflushed** writes — bounded by the flush interval, which *is* the RPO window.
+`synchronous=FULL` (now the default) makes each commit locally durable to a node crash; the flushed
+object is the cross-node durable record, and the lease guarantees only one writer ever produces it.
+
+**The one-sided partition — where the flush-interval bound would otherwise break (audit #3).** The
+bound above holds for node *death*. It does **not** hold, on its own, for a node still reachable by
+its clients but **cut from object storage**: its heartbeat renewals fail, so every flush skips
+(`:fence_skip`) — but the checkout/execute path does not consult heartbeat validity, so absent a
+brake the coordinator keeps **accepting and ACKing writes**. After `ttl + steal_margin` a peer
+legitimately steals the shard; on partition-heal the cut node self-fences and quarantines **every
+write it ACKed since its last successful flush** — a loss window equal to the *partition duration*,
+not the flush interval. The **write circuit-breaker** closes this: once a coordinator's heartbeat has
+been not-valid for longer than `ttl + steal_margin` (it is *provably stealable*), it publishes the
+shard to `Fathom.Shard.WriteFence`, and `Fathom.ShardExecutor` refuses further **writes** with
+**503 `FILO_STALE_LEASE`** — while **reads keep serving** from the local copy — until a fence
+reconfirms ownership. This collapses the loss window back to ~`ttl + steal_margin` and removes the
+client-visible double-serve window. Gated by `:fence_writes_when_stealable` (**default on in prod**,
+off in dev/test); with it off the pre-brake behavior (ACK-then-quarantine) stands. So the honest RPO
+is: **flush interval on a crash; ~`ttl + steal_margin` on a one-sided storage partition** (with the
+gate on).
 
 ## Safety invariant + proof
 
