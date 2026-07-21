@@ -2,8 +2,11 @@
 
 The lease/ownership incidents (stuck-unavailable, split-brain, S3 down) live in
 [`cluster.md`](cluster.md); rebalancer incidents in [`rebalancer.md`](rebalancer.md); node
-upgrade/restart in [`deploy.md`](deploy.md). This file covers the **second-most-likely** outage
-classes — Postgres, disk, heartbeat, and LB misconfiguration — plus the shard restore drill.
+upgrade/restart in [`deploy.md`](deploy.md); a **Postgres point-in-time restore** (which can desync
+the directory from storage — resurrected deletes, un-revoked tokens, rewound `schema_version`) has
+its own coherence procedure in [`disaster-recovery.md`](disaster-recovery.md). This file covers the
+**second-most-likely** outage classes — Postgres *down*, disk, heartbeat, and LB misconfiguration —
+plus the shard restore drill.
 
 Read the dependency fail-mode matrix first: fathom deliberately fails **open** for some
 dependencies and **closed** for others, and the right on-call response depends on which.
