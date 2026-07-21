@@ -106,4 +106,63 @@ defmodule Fathom.Shard.Storage.S3StealTouchTest do
 
     refute single_etag =~ "-"
   end
+
+  # Expert review #12: the steal-time touch self-copies with x-amz-metadata-directive: REPLACE (single
+  # form) or a multipart copy — both of which DROP the object's user metadata unless it is re-sent. So
+  # the x-amz-meta-fathom-md5 integrity metadata (#17) was stripped by exactly the steal that precedes
+  # the new owner's highest-risk pull (a failover of a possibly-multi-MB shard over a degraded
+  # network), leaving that pull with no content verification. The touch now re-sends the md5 on both
+  # copy forms; these pin that it survives each direction.
+  @md5_meta_key "x-amz-meta-fathom-md5"
+
+  defp md5_hex(body), do: Base.encode16(:crypto.hash(:md5, body), case: :lower)
+
+  defp seed_md5_meta(store, key, md5) do
+    Agent.update(store, fn s ->
+      obj = Map.get(s.objects, key)
+      %{s | objects: Map.put(s.objects, key, %{obj | meta: %{@md5_meta_key => md5}})}
+    end)
+  end
+
+  test "a steal preserves x-amz-meta-fathom-md5 across the single→multipart touch (#12)" do
+    body = "shard-bytes"
+    md5 = md5_hex(body)
+    store = start_store(%{@data_key => body, @lock_key => dead_lock()})
+    seed_md5_meta(store, @data_key, md5)
+    refute S3EtagStore.etag_of(store, @data_key) =~ "-", "seed must carry a single-form etag"
+
+    assert {:ok, %{took_over: true}} = S3.acquire_lease(@shard, "new@node#inc2", 30_000)
+
+    assert S3EtagStore.etag_of(store, @data_key) =~ "-1", "the touch rotated to multipart form"
+
+    assert S3EtagStore.meta_of(store, @data_key)[@md5_meta_key] == md5,
+           "the integrity md5 metadata must survive the steal-time touch (pre-#12: dropped)"
+  end
+
+  test "a second steal preserves x-amz-meta-fathom-md5 across the multipart→single touch (#12)" do
+    body = "shard-bytes"
+    md5 = md5_hex(body)
+    store = start_store(%{@data_key => body, @lock_key => dead_lock()})
+    seed_md5_meta(store, @data_key, md5)
+
+    assert {:ok, _} = S3.acquire_lease(@shard, "new@node#inc2", 30_000)
+    assert S3EtagStore.etag_of(store, @data_key) =~ "-1"
+
+    assert S3EtagStore.meta_of(store, @data_key)[@md5_meta_key] == md5,
+           "the metadata survives the first (single→multipart) touch"
+
+    # A second contender steals the now-multipart object — rotate flips it back via single_copy_touch.
+    Agent.update(store, fn s ->
+      %{
+        s
+        | objects: Map.put(s.objects, @lock_key, %{body: dead_lock(), form: :single, meta: %{}})
+      }
+    end)
+
+    assert {:ok, %{took_over: true}} = S3.acquire_lease(@shard, "third@node#inc3", 30_000)
+    refute S3EtagStore.etag_of(store, @data_key) =~ "-", "rotated back to single form"
+
+    assert S3EtagStore.meta_of(store, @data_key)[@md5_meta_key] == md5,
+           "the md5 metadata must ALSO survive the multipart→single touch"
+  end
 end

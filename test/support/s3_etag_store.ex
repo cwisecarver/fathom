@@ -165,7 +165,15 @@ defmodule Fathom.Test.S3EtagStore do
           {{412, nil}, s}
 
         true ->
-          obj = %{body: src.body, form: :single, meta: %{}}
+          # Model S3's metadata directive: REPLACE takes the request's x-amz-meta-* (so a self-copy
+          # touch must RE-SEND the integrity md5 to keep it — #12); COPY/absent preserves the source's.
+          meta =
+            case Plug.Conn.get_req_header(conn, "x-amz-metadata-directive") do
+              ["REPLACE"] -> req_meta(conn)
+              _ -> src.meta
+            end
+
+          obj = %{body: src.body, form: :single, meta: meta}
           {{200, etag(obj)}, %{s | objects: Map.put(s.objects, dst_key, obj)}}
       end
     end)
@@ -186,10 +194,19 @@ defmodule Fathom.Test.S3EtagStore do
   end
 
   defp create_upload(conn, agent, key) do
+    # CreateMultipartUpload is where a multipart object's user metadata is set (#12) — capture it.
+    meta = req_meta(conn)
+
     id =
       Agent.get_and_update(agent, fn s ->
         id = "up-#{s.seq + 1}"
-        {id, %{s | seq: s.seq + 1, uploads: Map.put(s.uploads, id, %{key: key, body: nil})}}
+
+        {id,
+         %{
+           s
+           | seq: s.seq + 1,
+             uploads: Map.put(s.uploads, id, %{key: key, body: nil, meta: meta})
+         }}
       end)
 
     Plug.Conn.send_resp(
@@ -238,8 +255,8 @@ defmodule Fathom.Test.S3EtagStore do
   defp complete_upload(conn, agent, key, upload_id) do
     Agent.get_and_update(agent, fn s ->
       case Map.get(s.uploads, upload_id) do
-        %{body: body} when is_binary(body) ->
-          obj = %{body: body, form: :multipart, meta: %{}}
+        %{body: body, meta: meta} when is_binary(body) ->
+          obj = %{body: body, form: :multipart, meta: meta}
 
           {{200, etag(obj)},
            %{

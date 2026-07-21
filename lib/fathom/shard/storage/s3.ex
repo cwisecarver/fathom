@@ -132,7 +132,7 @@ defmodule Fathom.Shard.Storage.S3 do
 
   defp probe_rotation!(key, label) do
     with {:ok, etag} when not is_nil(etag) <- head_etag(key),
-         :ok <- rotate_etag(key, etag),
+         :ok <- rotate_etag(key, etag, nil),
          {:ok, new_etag} when not is_nil(new_etag) and new_etag != etag <- head_etag(key) do
       :ok
     else
@@ -270,7 +270,7 @@ defmodule Fathom.Shard.Storage.S3 do
     key = db_key(shard_id)
 
     case head_object(key) do
-      {:ok, nil, _} ->
+      {:ok, nil, _, _} ->
         case create_sentinel(key) do
           {:ok, sentinel_etag} ->
             {:ok, %{pre: nil, post: sentinel_etag}}
@@ -289,7 +289,7 @@ defmodule Fathom.Shard.Storage.S3 do
       # would open the placeholder as shard bytes. Refresh it instead — a fresh
       # nonced body rotates the MD5 etag (fencing the previous stealer's zombie
       # If-Match) while keeping the sentinel semantics intact.
-      {:ok, etag, true} ->
+      {:ok, etag, true, _} ->
         case refresh_sentinel(key, etag) do
           :ok ->
             with {:ok, post} <- confirm_rotation(shard_id, etag),
@@ -302,8 +302,8 @@ defmodule Fathom.Shard.Storage.S3 do
             error
         end
 
-      {:ok, etag, false} ->
-        case rotate_etag(key, etag) do
+      {:ok, etag, false, md5} ->
+        case rotate_etag(key, etag, md5) do
           :ok ->
             with {:ok, post} <- confirm_rotation(shard_id, etag),
                  do: {:ok, %{pre: etag, post: post}}
@@ -321,10 +321,13 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   # HEAD with sentinel awareness: {:ok, etag_or_nil, sentinel?}.
+  # HEAD, also returning the object's x-amz-meta-fathom-md5 (#17) so the touch can carry it forward:
+  # a self-copy/multipart-copy with REPLACE drops all user metadata unless re-sent, which would leave
+  # the post-touch object with no integrity metadata for the stealing node's first pull (#12).
   defp head_object(key) do
     case Req.head(req(), url: url_path(key)) do
-      {:ok, %{status: 200, headers: h}} -> {:ok, etag(h), sentinel_response?(h)}
-      {:ok, %{status: 404}} -> {:ok, nil, false}
+      {:ok, %{status: 200, headers: h}} -> {:ok, etag(h), sentinel_response?(h), meta_md5(h)}
+      {:ok, %{status: 404}} -> {:ok, nil, false, nil}
       {:ok, %{status: s}} -> {:error, {:s3_head_status, s}}
       {:error, reason} -> {:error, reason}
     end
@@ -343,25 +346,32 @@ defmodule Fathom.Shard.Storage.S3 do
 
   defp multipart_etag_form?(etag), do: etag |> String.trim(~s(")) |> String.contains?("-")
 
-  defp rotate_etag(key, etag) do
+  defp rotate_etag(key, etag, md5) do
     if multipart_etag_form?(etag),
-      do: single_copy_touch(key, etag),
-      else: multipart_copy_touch(key, etag)
+      do: single_copy_touch(key, etag, md5),
+      else: multipart_copy_touch(key, etag, md5)
   end
+
+  # The x-amz-meta-fathom-md5 header to carry across a REPLACE copy (#12) — `[]` when the source had
+  # no such metadata (a legacy object), so we never fabricate one.
+  defp md5_meta_header(nil), do: []
+  defp md5_meta_header(md5) when is_binary(md5), do: [{@md5_meta, md5}]
 
   # Plain server-side self-copy: produces a single-form (MD5) etag. Used when the
   # object currently carries a multipart-form etag, so the form flip IS the
-  # rotation. S3 requires the REPLACE metadata directive for a self-copy.
-  defp single_copy_touch(key, etag) do
+  # rotation. S3 requires the REPLACE metadata directive for a self-copy — which drops ALL user
+  # metadata, so re-send the object's integrity md5 (#12) or the post-touch object verifies nothing.
+  defp single_copy_touch(key, etag, md5) do
     source = "/" <> fetch!(config(), :bucket) <> "/" <> key
 
     case Req.put(req(),
            url: url_path(key),
-           headers: [
-             {"x-amz-copy-source", source},
-             {"x-amz-metadata-directive", "REPLACE"},
-             {"x-amz-copy-source-if-match", etag}
-           ]
+           headers:
+             [
+               {"x-amz-copy-source", source},
+               {"x-amz-metadata-directive", "REPLACE"},
+               {"x-amz-copy-source-if-match", etag}
+             ] ++ md5_meta_header(md5)
          ) do
       {:ok, %{status: s, body: body}} when s in 200..299 ->
         if copy_body_ok?(body), do: :ok, else: {:error, {:s3_touch_error_body, body}}
@@ -380,10 +390,10 @@ defmodule Fathom.Shard.Storage.S3 do
   # One-part multipart self-copy: Complete's etag is md5(part-md5s)-1 — never the
   # single MD5 form, so it rotates even for identical bytes. A single-part
   # multipart upload has no minimum part size, so this works for any shard.
-  defp multipart_copy_touch(key, etag) do
+  defp multipart_copy_touch(key, etag, md5) do
     source = "/" <> fetch!(config(), :bucket) <> "/" <> key
 
-    case create_multipart(key) do
+    case create_multipart(key, md5) do
       {:ok, upload_id} ->
         with {:ok, part_etag} <- upload_part_copy(key, upload_id, source, etag),
              :ok <- complete_multipart(key, upload_id, part_etag) do
@@ -399,8 +409,14 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
-  defp create_multipart(key) do
-    case Req.post(req(), url: url_path(key) <> "?uploads", body: "") do
+  # CreateMultipartUpload is where a multipart object's user metadata is set (parts carry none), so
+  # thread the integrity md5 here (#12) — the completed object then HEADs with x-amz-meta-fathom-md5.
+  defp create_multipart(key, md5) do
+    case Req.post(req(),
+           url: url_path(key) <> "?uploads",
+           body: "",
+           headers: md5_meta_header(md5)
+         ) do
       {:ok, %{status: s, body: body}} when s in 200..299 ->
         case Regex.run(~r|<UploadId>([^<]+)</UploadId>|, to_string(body)) do
           [_, id] -> {:ok, id}
