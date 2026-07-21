@@ -212,10 +212,24 @@ defmodule Fathom.Tenants do
 
       case Storage.purge_shard(id) do
         :ok ->
-          rm_local(id)
+          # Write the durable tombstone marker AFTER erasing every object (#6): storage isn't rolled
+          # back by a Postgres point-in-time restore, so this marker keeps the id refused on the next
+          # boot even if the directory row that backs the Tombstones ETS is restored away. Its
+          # `tombstones/` namespace is untouched by purge_shard, so a job retry can't sweep it. A write
+          # failure retries the (idempotent) job so the backstop is durably in place.
+          case Storage.put_tombstone(id) do
+            :ok ->
+              rm_local(id)
+              :telemetry.execute([:fathom, :tenants, :deleted], %{count: 1}, %{shard_id: id})
+              :ok
 
-          :telemetry.execute([:fathom, :tenants, :deleted], %{count: 1}, %{shard_id: id})
-          :ok
+            {:error, reason} ->
+              Logger.error(
+                "tenant #{id}: tombstone marker write failed (#{inspect(reason)}) — will retry"
+              )
+
+              {:error, reason}
+          end
 
         {:error, reason} ->
           Logger.error("tenant #{id}: storage purge failed (#{inspect(reason)}) — will retry")

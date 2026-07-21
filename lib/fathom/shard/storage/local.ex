@@ -299,6 +299,26 @@ defmodule Fathom.Shard.Storage.Local do
     end
   end
 
+  @impl true
+  def put_tombstone(shard_id) do
+    # A durable tombstone marker under a `tombstones/` subdir — a distinct namespace `purge_shard`
+    # never lists (it scans dir()'s top level, and `tombstones` there is not a shard object), so it
+    # outlives full erasure and a Postgres directory restore (#6). Shard ids are filename-safe
+    # (`[a-zA-Z0-9_-]`, ShardId), so the id IS the filename; the body is empty (the key is the fact).
+    path = Path.join([dir(), "tombstones", shard_id])
+    File.mkdir_p!(Path.dirname(path))
+    File.write(path, "")
+  end
+
+  @impl true
+  def tombstoned_ids do
+    case File.ls(Path.join(dir(), "tombstones")) do
+      {:ok, names} -> {:ok, names}
+      {:error, :enoent} -> {:ok, []}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   # A stored file belongs to `shard_id` iff the character AFTER the id is `.` (the
   # live `.db`, the `.lock`, an atomic-write `.db.tmp…` temp) or `@` (a `@<version>`
   # / `@snap-<id>` copy). Matching the delimiter — not a bare prefix — is what keeps

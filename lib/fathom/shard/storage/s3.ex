@@ -943,6 +943,60 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   @impl true
+  def put_tombstone(shard_id) do
+    # A durable tombstone marker under the `tombstones/` key prefix (#6) — a namespace distinct from
+    # every `<prefix><shard_id>…` object, so `purge_shard`'s prefix LIST never sees it and full erasure
+    # leaves it standing. Empty body; the key is the fact. Survives a Postgres directory restore.
+    case Req.put(req(), url: url_path(tombstone_key(shard_id)), body: "") do
+      {:ok, %{status: status}} when status in 200..299 -> :ok
+      {:ok, %{status: status}} -> {:error, {:s3_put_status, status}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @impl true
+  def tombstoned_ids, do: tombstoned_ids_page(nil, [])
+
+  # Paginated ListObjectsV2 over `<prefix>tombstones/`, stripping the scan prefix to recover each
+  # deleted shard id (same shape as purge_shard_page / list_snapshots).
+  defp tombstoned_ids_page(token, acc) do
+    scan_prefix = prefix() <> "tombstones/"
+
+    params =
+      [{"list-type", "2"}, {"prefix", scan_prefix}] ++
+        if(token, do: [{"continuation-token", token}], else: [])
+
+    case Req.get(req(), url: url_path(""), params: params) do
+      {:ok, %{status: 200, body: body}} ->
+        ids = tombstone_ids_from_xml(body, scan_prefix)
+
+        case next_token(body) do
+          nil -> {:ok, acc ++ ids}
+          next -> tombstoned_ids_page(next, acc ++ ids)
+        end
+
+      {:ok, %{status: status}} ->
+        {:error, {:s3_list_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp tombstone_ids_from_xml(xml, scan_prefix) when is_binary(xml) do
+    ~r{<Key>(.*?)</Key>}s
+    |> Regex.scan(xml)
+    |> Enum.flat_map(fn [_, key] ->
+      id = String.replace_prefix(key, scan_prefix, "")
+      if id != key and id != "", do: [id], else: []
+    end)
+  end
+
+  defp tombstone_ids_from_xml(_body, _scan_prefix), do: []
+
+  defp tombstone_key(shard_id), do: prefix() <> "tombstones/" <> shard_id
+
+  @impl true
   def list_snapshots(shard_id), do: list_snapshots(shard_id, nil, [])
 
   # ListObjectsV2 over the `<shard>@snap-` prefix (reusing the same paginated scan as

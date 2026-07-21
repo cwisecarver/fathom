@@ -178,6 +178,11 @@ defmodule Fathom.Test.FaultyStorage do
   def drop_version(shard_id, version), do: Local.drop_version(shard_id, version)
 
   @impl true
+  def put_tombstone(shard_id), do: Local.put_tombstone(shard_id)
+  @impl true
+  def tombstoned_ids, do: Local.tombstoned_ids()
+
+  @impl true
   def fork_from(template_id, version, dst_shard_id) do
     # run_before(:fork_from) lets a test inject an event just before the fork's snapshot
     # copy lands at the dst live object (fork-from-template, finding #10).

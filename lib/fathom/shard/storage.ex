@@ -246,6 +246,15 @@ defmodule Fathom.Shard.Storage do
   @callback stored_usage() :: {non_neg_integer(), non_neg_integer()} | {:error, term()}
   @optional_callbacks stored_usage: 0
 
+  # The cross-store DR backstop (expert review #6): a deleted tenant's re-mint guard is the Postgres
+  # directory (loaded into the Tombstones ETS), but a Postgres point-in-time restore rolls the
+  # directory back and can resurrect a deleted tenant. Storage is NOT rolled back, so a tiny tombstone
+  # marker here — under a `tombstones/<shard_id>` key that `purge_shard` never touches (a distinct
+  # namespace, not a `<shard>@…` object) — survives the restore. `put_tombstone/1` is written on
+  # delete; `tombstoned_ids/0` is the boot-time union scan that repopulates the ETS despite a rollback.
+  @callback put_tombstone(shard_id :: String.t()) :: :ok | {:error, term()}
+  @callback tombstoned_ids() :: {:ok, [String.t()]} | {:error, term()}
+
   @doc "Pulls the shard's stored file to `local_path`, returning its etag (`nil` if absent)."
   @spec pull(String.t(), Path.t()) :: {:ok, String.t() | nil} | {:error, term()}
   def pull(shard_id, local_path), do: backend().pull(shard_id, local_path)
@@ -428,6 +437,20 @@ defmodule Fathom.Shard.Storage do
   """
   @spec purge_shard(String.t()) :: :ok | {:error, term()}
   def purge_shard(shard_id), do: backend().purge_shard(shard_id)
+
+  @doc """
+  Writes the durable tombstone marker for `shard_id` (the DR backstop, #6) — a tiny object under a
+  `tombstones/` namespace that survives a Postgres directory restore and `purge_shard`. Idempotent.
+  """
+  @spec put_tombstone(String.t()) :: :ok | {:error, term()}
+  def put_tombstone(shard_id), do: backend().put_tombstone(shard_id)
+
+  @doc """
+  Lists every tombstoned (deleted) shard id from durable storage — the boot-time union scan that
+  keeps the re-mint guard complete even after a Postgres point-in-time restore (#6).
+  """
+  @spec tombstoned_ids() :: {:ok, [String.t()]} | {:error, term()}
+  def tombstoned_ids, do: backend().tombstoned_ids()
 
   @doc """
   Aggregate storage footprint — `{object_count, total_bytes}` of the live shard objects — for the

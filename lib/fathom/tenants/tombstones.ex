@@ -20,7 +20,12 @@ defmodule Fathom.Tenants.Tombstones do
       that booted during a Postgres outage, or missed a fire-and-forget notification,
       still converges. The set is append-only in memory — a tombstone is permanent, so a
       refresh never removes an id (an operator who wants an id reusable hard-deletes the
-      directory row and restarts, the same escape hatch as any tombstone).
+      directory row, deletes the storage tombstone, and restarts);
+    * **unioned at boot from durable storage** (`Fathom.Shard.Storage.tombstoned_ids/0`, #6):
+      a Postgres point-in-time restore rolls the directory back and can un-tombstone a deleted
+      tenant, but storage is *not* rolled back, so a `tombstones/<id>` marker written on delete
+      keeps the guard complete across a directory restore. Boot-only (the set is append-only, so
+      the directory-only periodic refresh never drops it) — no recurring storage LIST.
 
   Fathom has no BEAM cluster, so the one shared push channel is Postgres, and Oban's
   notifier is already running on it — best-effort, with the periodic refresh as the
@@ -69,6 +74,12 @@ defmodule Fathom.Tenants.Tombstones do
 
     listen()
     load_from_directory()
+
+    # Union in the durable storage tombstones at boot (#6): a Postgres point-in-time restore rolls the
+    # directory back and can un-tombstone a deleted tenant, but storage is not rolled back. This scan
+    # keeps the re-mint guard complete despite a directory restore. Boot-only — the in-memory set is
+    # append-only, so the periodic (directory-only) refresh never drops these; no recurring LIST.
+    load_from_storage()
     schedule_refresh()
 
     {:ok, %{}}
@@ -119,6 +130,26 @@ defmodule Fathom.Tenants.Tombstones do
   catch
     :exit, reason ->
       Logger.warning("tombstone load failed: #{inspect(reason)}")
+      :ok
+  end
+
+  # Additive union from durable storage (#6) — the DR backstop that survives a directory restore.
+  # Best-effort like load_from_directory: a storage blip at boot just means the directory-derived set
+  # stands until the storage is reachable (a restore is a rare, operator-driven event).
+  defp load_from_storage do
+    case Fathom.Shard.Storage.tombstoned_ids() do
+      {:ok, ids} -> for id <- ids, do: insert(id)
+      {:error, reason} -> Logger.warning("tombstone storage load failed: #{inspect(reason)}")
+    end
+
+    :ok
+  rescue
+    e ->
+      Logger.warning("tombstone storage load failed: #{Exception.message(e)}")
+      :ok
+  catch
+    :exit, reason ->
+      Logger.warning("tombstone storage load failed: #{inspect(reason)}")
       :ok
   end
 
