@@ -8,7 +8,7 @@ defmodule Fathom.ShardDurabilityTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Shard.{Connection, FlushGate, Storage}
   alias Filo.{Stmt, StmtResult}
 
   @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
@@ -380,6 +380,87 @@ defmodule Fathom.ShardDurabilityTest do
 
     # Pre-fix: the waiter got a swallowed exit → Shards.flush returned :ok. Now: an explicit error.
     assert {:error, :coordinator_stopped} = Task.await(flush, 2_000)
+  end
+
+  # Expert review #17: after a failover/LB flip re-homes a burst of shards, their phase-aligned
+  # flush timers would fire N snapshots + PUTs in lockstep and starve cold-open pulls. The node-wide
+  # FlushGate cap bounds concurrent flushes — over the cap a coordinator backs off and STAYS DIRTY
+  # (the safe direction, the flush just waits), then flushes once a slot frees.
+  test "over the node-wide flush cap a coordinator backs off (stays dirty), then flushes when a slot frees",
+       %{shard: shard} do
+    prev_cap = Application.get_env(:fathom, :shard_flush_max_concurrency)
+    Application.put_env(:fathom, :shard_flush_max_concurrency, 1)
+    FlushGate.reset()
+    on_exit(fn -> restore(:shard_flush_max_concurrency, prev_cap) end)
+    on_exit(fn -> FlushGate.reset() end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('acked')"))
+    {:ok, coordinator} = Shards.ensure(shard)
+    assert Shard.dirty?(coordinator)
+
+    # Occupy the node's only flush slot, as if a sibling shard were mid-flush.
+    assert :ok = FlushGate.try_acquire()
+    assert FlushGate.in_flight() == 1
+
+    # This coordinator's flush is now over the cap: it must back off — no flush task spawned, the
+    # shard stays dirty, and it does NOT consume a slot (the counter stays at the sibling's 1).
+    send(coordinator, :durability_flush)
+    _ = :sys.get_state(coordinator)
+    assert :sys.get_state(coordinator).flush_task == nil, "a capped flush must not spawn a task"
+    assert Shard.dirty?(coordinator), "a backed-off shard stays dirty (the safe direction)"
+    assert FlushGate.in_flight() == 1, "a refused flush must not consume a slot"
+
+    # Free the sibling's slot; the coordinator's next flush is admitted and the shard goes durable.
+    FlushGate.release()
+    flush_now(coordinator)
+    refute Shard.dirty?(coordinator), "once a slot frees, the flush runs and the shard is clean"
+    assert FlushGate.in_flight() == 0, "the admitted flush released its slot when it settled"
+  end
+
+  # Expert review #17: the flush timer is jittered so a mass re-home's phase-aligned timers drift
+  # apart instead of firing in lockstep. Pin that a scheduled delay stays within ±ratio of the
+  # interval (bounded, never 0/negative) and actually varies across coordinators.
+  test "the periodic flush timer is jittered within ±ratio and varies across coordinators" do
+    prev_jitter = Application.get_env(:fathom, :shard_flush_jitter_ratio)
+    prev_interval = Application.get_env(:fathom, :shard_flush_interval_ms)
+    interval = 4_000
+    Application.put_env(:fathom, :shard_flush_jitter_ratio, 0.5)
+    Application.put_env(:fathom, :shard_flush_interval_ms, interval)
+
+    ids = for i <- 1..6, do: "jit_#{System.unique_integer([:positive])}_#{i}"
+
+    on_exit(fn ->
+      restore(:shard_flush_jitter_ratio, prev_jitter)
+      restore(:shard_flush_interval_ms, prev_interval)
+
+      for id <- ids, do: _ = Shards.drain(id)
+
+      for id <- ids,
+          suffix <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock"],
+          do: File.rm(Path.join(@local_dir, id <> suffix))
+    end)
+
+    remaining =
+      for id <- ids do
+        {:ok, pid} = Shards.ensure(id)
+        # read_timer returns ms left on the armed flush timer (< the jittered delay by the tiny
+        # elapsed time since open) — the observable of the jittered schedule.
+        Process.read_timer(:sys.get_state(pid).flush_timer)
+      end
+
+    # Bounded: within [interval*(1-ratio), interval*(1+ratio)] = [2000, 6000], minus a little for
+    # elapsed time — and never 0/negative.
+    for ms <- remaining do
+      assert is_integer(ms) and ms > 0,
+             "a jittered delay must be positive (never fire immediately)"
+
+      assert ms >= 1_800 and ms <= 6_000, "delay #{ms} outside the ±50% jitter band"
+    end
+
+    assert Enum.uniq(remaining) |> length() >= 2,
+           "jitter must actually spread the timers, not return one fixed value (#{inspect(remaining)})"
   end
 
   # Expert review #14: Shards.flush wrapped flush_now in a BLANKET `catch :exit, _ -> :ok`, which

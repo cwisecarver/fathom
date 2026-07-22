@@ -55,7 +55,16 @@ defmodule Fathom.Shard do
   require Logger
 
   alias Fathom.Admin.FlushWatermark
-  alias Fathom.Shard.{Connection, Fence, Heartbeat, Storage, WarmFollower, WriteCounter}
+
+  alias Fathom.Shard.{
+    Connection,
+    Fence,
+    FlushGate,
+    Heartbeat,
+    Storage,
+    WarmFollower,
+    WriteCounter
+  }
 
   @default_idle_ms 60_000
   @default_lease_ttl_ms 30_000
@@ -63,6 +72,12 @@ defmodule Fathom.Shard do
   # the fathom.rpo sweep confirmed p99 loss ≈ interval (docs/durability.md), so 5s trades
   # ~6× more PUTs on write-active shards for a ~6× tighter loss window.
   @default_flush_interval_ms 5_000
+  # Spread each flush timer by ±25% (expert review #17) so a mass re-home's phase-aligned timers
+  # drift apart instead of firing N snapshots + PUTs in lockstep every interval. 0 disables.
+  @default_flush_jitter_ratio 0.25
+  # Short retry after the node-wide flush cap (Fathom.Shard.FlushGate) refused a slot (#17); the
+  # shard stayed dirty, so it just re-attempts soon rather than waiting a full interval.
+  @default_flush_backoff_ms 250
   @pull_timeout 60_000
   # Synchronous force-flush (`:flush_now`) budget: a checkpoint + fenced full-file PUT (possibly
   # queued behind sibling flushes through the shared Finch pool) at real S3 latency. Generous so a
@@ -357,6 +372,10 @@ defmodule Fathom.Shard do
         # watermark was captured under (expert review #11 — restoring a watermark from a
         # table that died mid-flight would read clean against the fresh table's counts).
         flush_task: nil,
+        # Whether the in-flight flush task reserved a Fathom.Shard.FlushGate slot (expert review
+        # #17): true only when the node-wide concurrent-flush cap is enabled and we acquired. The
+        # slot is released at every site that clears flush_task (completion, crash, terminate).
+        flush_slot_held: false,
         flush_pending: nil,
         flush_pending_gen: nil,
         # Callers of a synchronous force-flush (`:flush_now`, the flush-before-fork primitive):
@@ -892,7 +911,7 @@ defmodule Fathom.Shard do
   @impl true
   def handle_info({ref, result}, %{flush_task: %Task{ref: ref}} = state) do
     Process.demonitor(ref, [:flush])
-    state = %{state | flush_task: nil}
+    state = release_flush_slot(%{state | flush_task: nil})
 
     # The task replies a fully-RESOLVED verdict — the FENCE and the flush (incl. the #8
     # 412-reconcile) all ran off-process (expert review 2026-07-18 #18), so this handler does ZERO
@@ -989,7 +1008,10 @@ defmodule Fathom.Shard do
   # The flush task crashed before replying: treat like a transient flush failure.
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{flush_task: %Task{ref: ref}} = state) do
     Logger.warning("shard #{state.id}: durability flush task crashed (#{inspect(reason)})")
-    state = record_flush_failure(%{state | flush_task: nil}, {:task_crash, reason})
+
+    state =
+      release_flush_slot(record_flush_failure(%{state | flush_task: nil}, {:task_crash, reason}))
+
     # Dirty (the task never landed) — re-kick so a flush_now waiter retries rather than hangs.
     {:noreply, schedule_flush(settle_waiters(state, :flushed))}
   end
@@ -1157,25 +1179,43 @@ defmodule Fathom.Shard do
         {:noreply, schedule_flush(state)}
 
       true ->
-        # Capture the write count BEFORE snapshotting: a write landing during the snapshot/upload
-        # bumps the counter past this, so the shard stays dirty and re-flushes next interval — never
-        # silently cleared (findings #1/#2/#27). Generation before count, same reasoning as init (#11).
-        pending_gen = WriteCounter.generation()
-        flushed_to = WriteCounter.count(state.id)
+        # Node-wide concurrent-flush cap (expert review #17): over the cap, reschedule with a short
+        # backoff and stay dirty (the safe direction — the flush just waits), so a mass re-home's
+        # phase-aligned timers can't fire N snapshots + PUTs in lockstep and starve cold-open pulls.
+        # :disabled (no cap configured — the default) and :ok (slot reserved) both proceed to flush.
+        case FlushGate.try_acquire() do
+          :full ->
+            {:noreply, schedule_flush_backoff(state)}
 
-        # Run the FENCE and the flush together off-process (expert review 2026-07-18 #18). In legacy
-        # mode (heartbeat down) Fence.check does a renew PUT; running it inline blocked the coordinator
-        # mailbox a storage RTT every interval — the p99 checkout stall #27 removed, reintroduced for
-        # the degraded mode. The task fences, then (on {:ok}) snapshots + uploads, and replies a fully
-        # resolved verdict — extending the #8 pattern (the 412-reconcile already runs off-process). No
-        # EXTRA task: the flush already ran in one; the fence just moves into it. fence_ctx carries the
-        # lease/ttl/acquire_gen the fence needs; snapshot_state what flush_and_reconcile needs.
-        fence_ctx = fence_ctx(state)
-        snapshot_state = Map.take(state, [:id, :path, :etag, :lease])
-        task = Task.async(fn -> fenced_flush(fence_ctx, snapshot_state) end)
+          gate ->
+            # Capture the write count BEFORE snapshotting: a write landing during the snapshot/upload
+            # bumps the counter past this, so the shard stays dirty and re-flushes next interval —
+            # never silently cleared (findings #1/#2/#27). Generation before count, same reasoning as
+            # init (#11).
+            pending_gen = WriteCounter.generation()
+            flushed_to = WriteCounter.count(state.id)
 
-        {:noreply,
-         %{state | flush_task: task, flush_pending: flushed_to, flush_pending_gen: pending_gen}}
+            # Run the FENCE and the flush together off-process (expert review 2026-07-18 #18). In
+            # legacy mode (heartbeat down) Fence.check does a renew PUT; running it inline blocked the
+            # coordinator mailbox a storage RTT every interval — the p99 checkout stall #27 removed,
+            # reintroduced for the degraded mode. The task fences, then (on {:ok}) snapshots + uploads,
+            # and replies a fully resolved verdict — extending the #8 pattern (the 412-reconcile
+            # already runs off-process). No EXTRA task: the flush already ran in one; the fence just
+            # moves into it. fence_ctx carries the lease/ttl/acquire_gen the fence needs;
+            # snapshot_state what flush_and_reconcile needs.
+            fence_ctx = fence_ctx(state)
+            snapshot_state = Map.take(state, [:id, :path, :etag, :lease])
+            task = Task.async(fn -> fenced_flush(fence_ctx, snapshot_state) end)
+
+            {:noreply,
+             %{
+               state
+               | flush_task: task,
+                 flush_slot_held: gate == :ok,
+                 flush_pending: flushed_to,
+                 flush_pending_gen: pending_gen
+             }}
+        end
     end
   end
 
@@ -1952,22 +1992,36 @@ defmodule Fathom.Shard do
   defp settle_flush_task(%{flush_task: nil} = state), do: state
 
   defp settle_flush_task(%{flush_task: task} = state) do
-    case Task.yield(task, settle_yield_ms()) || Task.shutdown(task) do
-      {:ok, {:ok, new_etag}} ->
-        write_etag_sidecar(state.path, new_etag)
+    settled =
+      case Task.yield(task, settle_yield_ms()) || Task.shutdown(task) do
+        {:ok, {:ok, new_etag}} ->
+          write_etag_sidecar(state.path, new_etag)
 
-        %{
-          state
-          | flush_task: nil,
-            flushed_through: state.flush_pending,
-            counter_gen: state.flush_pending_gen,
-            etag: new_etag
-        }
+          %{
+            state
+            | flush_task: nil,
+              flushed_through: state.flush_pending,
+              counter_gen: state.flush_pending_gen,
+              etag: new_etag
+          }
 
-      _ ->
-        %{state | flush_task: nil}
-    end
+        _ ->
+          %{state | flush_task: nil}
+      end
+
+    release_flush_slot(settled)
   end
+
+  # Release the FlushGate slot this flush reserved, exactly once (expert review #17). Called at
+  # every site that clears flush_task — completion, task crash, and terminate — so the node-wide
+  # counter tracks live flush tasks. A no-op when no slot was held (cap disabled, or we didn't
+  # acquire), so it's safe to call unconditionally on each of those paths.
+  defp release_flush_slot(%{flush_slot_held: true} = state) do
+    FlushGate.release()
+    %{state | flush_slot_held: false}
+  end
+
+  defp release_flush_slot(state), do: state
 
   # A transactionally-consistent copy of the live shard, safe to run while writers
   # are active (unlike a raw file copy). `VACUUM INTO` requires a string literal
@@ -2054,6 +2108,12 @@ defmodule Fathom.Shard do
   defp flush_interval_ms,
     do: Application.get_env(:fathom, :shard_flush_interval_ms, @default_flush_interval_ms)
 
+  defp flush_jitter_ratio,
+    do: Application.get_env(:fathom, :shard_flush_jitter_ratio, @default_flush_jitter_ratio)
+
+  defp flush_backoff_ms,
+    do: Application.get_env(:fathom, :shard_flush_backoff_ms, @default_flush_backoff_ms)
+
   defp schedule_idle(state) do
     state = cancel_idle(state)
     %{state | timer: Process.send_after(self(), :idle_timeout, state.idle_ms)}
@@ -2088,12 +2148,42 @@ defmodule Fathom.Shard do
 
     case flush_interval_ms() do
       interval when is_integer(interval) and interval > 0 ->
-        %{state | flush_timer: Process.send_after(self(), :durability_flush, interval)}
+        %{
+          state
+          | flush_timer: Process.send_after(self(), :durability_flush, jitter_interval(interval))
+        }
 
       _ ->
         state
     end
   end
+
+  # Reschedule after the node-wide flush cap (Fathom.Shard.FlushGate) refused a slot (#17): a short,
+  # jittered backoff so the shard retries soon (it stayed dirty) without the backed-off shards
+  # forming their own lockstep retry herd. Bounded well below the full interval.
+  defp schedule_flush_backoff(state) do
+    state = cancel_flush(state)
+    delay = jitter_interval(flush_backoff_ms())
+    %{state | flush_timer: Process.send_after(self(), :durability_flush, delay)}
+  end
+
+  # Decorrelate flush timers across coordinators (expert review #17): a mass re-home phase-aligns
+  # their fixed-interval timers, so every interval N snapshots + PUTs fire in lockstep and starve
+  # cold-open pulls. Spread each scheduled delay by ±ratio so the timers drift apart. Ratio 0
+  # disables it (deterministic tests). :rand is per-process-seeded, so each coordinator picks
+  # independently.
+  defp jitter_interval(base) when is_integer(base) and base > 0 do
+    case flush_jitter_ratio() do
+      ratio when is_number(ratio) and ratio > 0 ->
+        spread = round(base * min(ratio, 1.0))
+        if spread > 0, do: max(1, base - spread + :rand.uniform(2 * spread + 1) - 1), else: base
+
+      _ ->
+        base
+    end
+  end
+
+  defp jitter_interval(base), do: base
 
   defp cancel_flush(%{flush_timer: nil} = state), do: state
 

@@ -336,7 +336,12 @@ defmodule Fathom.Application do
       # Owns the write-fence ETS table (expert review #3): coordinators publish "provably stealable"
       # shards here and ShardExecutor reads it lock-free before each write. Before the shard
       # supervisor so the table is up before any coordinator publishes/forgets.
-      Fathom.Shard.WriteFence
+      Fathom.Shard.WriteFence,
+      # Owns the node-wide concurrent-flush counter (expert review #17): coordinators reserve a slot
+      # before spawning a durability-flush task, bounding the flush storm after a mass re-home.
+      # Idle unless :shard_flush_max_concurrency is set. Before the shard supervisor so the table is
+      # up before any coordinator flushes.
+      Fathom.Shard.FlushGate
     ] ++
       temp_reaper_children() ++
       heartbeat_children() ++

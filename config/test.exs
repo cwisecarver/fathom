@@ -35,6 +35,10 @@ config :fathom, :default_shard, "demo"
 # heartbeat tests start it themselves with a short TTL.
 config :fathom, heartbeat_server: false
 
+# Deterministic flush timing in tests: no ±jitter on the periodic durability-flush timer
+# (expert review #17). The jitter unit test opts back in explicitly to check the range.
+config :fathom, :shard_flush_jitter_ratio, 0.0
+
 # Don't run the background orphan-temp reaper in tests (it does periodic disk I/O
 # over the shared shard data dir); the reaper test starts it / drives sweep/0 itself.
 config :fathom, temp_reaper: false
