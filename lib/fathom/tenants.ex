@@ -243,15 +243,26 @@ defmodule Fathom.Tenants do
   stored object to a temp file and returns its path + a suggested download filename. Because a
   tenant *is* one SQLite file, this is just a copy of that object — no export format to build.
 
-  Reflects the **last flush**: an active shard may have newer writes still buffered on its
-  coordinator (drain or let it idle for the very latest, same caveat as a snapshot). The CALLER
-  owns the returned temp file and must delete it after use (the admin download does, so an
-  exported copy never lingers on disk). Returns `{:error, :not_stored}` if the shard has no
-  stored object (never flushed, or already deleted), or `{:error, :invalid_shard_id}`.
+  **`flush: true` (the default, expert review #22)** force-flushes the shard's live coordinator
+  first, so the export reflects the tenant's newest writes and not just the last periodic flush — a
+  GDPR Article 20 portability export missing recent data is a compliance defect, not mere staleness.
+  A flush error is **surfaced** (not swallowed — this rides the #14 fix so a flush *timeout* can't
+  masquerade as a complete export), so the caller never hands over stale bytes believing they're
+  current. Pass `flush: false` for the old best-effort behavior (the last durable object as-is). The
+  flush is **local** — the same single-node caveat as fork/snapshot: a shard whose coordinator lives
+  on another node must be flushed on that node.
+
+  The pulled bytes are integrity-checked (`Fathom.Shard.verify_integrity/1`) before returning, so a
+  corrupt stored object is refused (`{:error, {:corrupt_export, _}}`) rather than handed to the
+  tenant. The CALLER owns the returned temp file and must delete it after use (the admin download
+  does, so an exported copy never lingers on disk). Returns `{:error, :not_stored}` if the shard has
+  no stored object (never flushed, or already deleted), or `{:error, :invalid_shard_id}`.
   """
-  @spec export(String.t()) :: {:ok, %{path: Path.t(), filename: String.t()}} | {:error, term()}
-  def export(shard_id) do
-    with {:ok, id} <- cast(shard_id) do
+  @spec export(String.t(), keyword()) ::
+          {:ok, %{path: Path.t(), filename: String.t()}} | {:error, term()}
+  def export(shard_id, opts \\ []) do
+    with {:ok, id} <- cast(shard_id),
+         :ok <- maybe_flush_export(id, opts) do
       tmp =
         Path.join(
           System.tmp_dir!(),
@@ -264,13 +275,36 @@ defmodule Fathom.Tenants do
           {:error, :not_stored}
 
         {:ok, _etag} ->
-          {:ok, %{path: tmp, filename: "#{id}.db"}}
+          case Fathom.Shard.verify_integrity(tmp) do
+            :ok ->
+              # verify_integrity opened the temp (WAL mode) for a read-only quick_check; drop any
+              # empty WAL siblings it left so the returned file is a self-contained db the caller
+              # can read + delete cleanly.
+              for s <- ["-wal", "-shm"], do: File.rm(tmp <> s)
+              {:ok, %{path: tmp, filename: "#{id}.db"}}
+
+            {:error, reason} ->
+              # A corrupt stored object must never be handed to the tenant as their portability
+              # export (#22) — drop the temp and surface it. Better a loud error than silent
+              # corruption the departing customer discovers later.
+              for s <- ["", "-wal", "-shm"], do: File.rm(tmp <> s)
+              {:error, {:corrupt_export, reason}}
+          end
 
         {:error, reason} ->
           File.rm(tmp)
           {:error, reason}
       end
     end
+  end
+
+  # Force-flush the shard's live coordinator before the export (#22). Default ON — an export is rare
+  # and the flush is cheap, and a portability export silently omitting recent writes is a compliance
+  # defect. Mirrors the fork/snapshot flush-before; `Shards.flush` surfaces a flush error (incl. the
+  # #14 timeout) rather than exporting stale, and is a no-op when no coordinator runs here (nothing
+  # writing on this node, so the stored object is already current).
+  defp maybe_flush_export(id, opts) do
+    if Keyword.get(opts, :flush, true), do: Shards.flush(id), else: :ok
   end
 
   @doc """

@@ -125,6 +125,63 @@ defmodule Fathom.TenantsTest do
     test "refuses an invalid id" do
       assert {:error, :invalid_shard_id} = Tenants.export("Not Valid!")
     end
+
+    # Expert review #22: a portability export must reflect the tenant's newest writes, not just the
+    # last periodic flush — otherwise a departing customer's most recent data is silently missing.
+    test "flush: true (the default) captures writes still buffered on the coordinator", %{id: id} do
+      write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('flushed')"])
+      flush!(id)
+      # A newer write, left buffered on a running coordinator (not yet durably flushed).
+      write!(id, ["INSERT INTO t VALUES ('buffered')"])
+
+      # flush: false reflects only the last durable flush (the pre-#22 behavior).
+      assert {:ok, %{path: stale}} = Tenants.export(id, flush: false)
+      on_exit(fn -> File.rm(stale) end)
+      assert export_rows(stale) == ["flushed"], "flush: false omits the buffered write"
+
+      # The default (flush: true) force-flushes first, so the export includes the newest write.
+      assert {:ok, %{path: fresh}} = Tenants.export(id)
+      on_exit(fn -> File.rm(fresh) end)
+
+      assert export_rows(fresh) == ["buffered", "flushed"],
+             "the default export captures the newest writes"
+    end
+
+    # #22: a corrupt stored object must never be handed to the tenant as a "complete" export.
+    test "refuses to export a corrupt stored object (integrity check)", %{id: id} do
+      File.mkdir_p!(@remote_dir)
+      File.write!(Path.join(@remote_dir, "#{id}.db"), "definitely not a sqlite database")
+
+      assert {:error, {:corrupt_export, _}} = Tenants.export(id, flush: false)
+    end
+
+    # #22 rides the #14 fix: a flush timeout must FAIL the export, not silently ship stale bytes.
+    test "surfaces a flush timeout instead of exporting stale", %{id: id} do
+      prev_timeout = Application.get_env(:fathom, :flush_now_timeout_ms)
+      prev_idle = Application.get_env(:fathom, :shard_idle_ms)
+      Application.put_env(:fathom, :flush_now_timeout_ms, 100)
+      Application.put_env(:fathom, :shard_idle_ms, 60_000)
+
+      on_exit(fn ->
+        restore_env(:flush_now_timeout_ms, prev_timeout)
+        restore_env(:shard_idle_ms, prev_idle)
+      end)
+
+      write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
+      {:ok, coordinator} = Shards.ensure(id)
+
+      # A hung coordinator: the flush-before-export can't complete.
+      :sys.suspend(coordinator)
+
+      try do
+        assert {:error, :flush_timeout} = Tenants.export(id),
+               "a flush timeout must fail the export, not silently ship stale data"
+      after
+        :sys.resume(coordinator)
+      end
+
+      _ = Shards.drain(id, 5_000)
+    end
   end
 
   describe "fork/1 (database forking, #14)" do
@@ -366,4 +423,24 @@ defmodule Fathom.TenantsTest do
   end
 
   defp flush!(shard), do: :ok = Shards.drain(shard, 5_000)
+
+  defp restore_env(key, nil), do: Application.delete_env(:fathom, key)
+  defp restore_env(key, value), do: Application.put_env(:fathom, key, value)
+
+  # Read `SELECT v FROM t ORDER BY v` from an exported SQLite file.
+  defp export_rows(path) do
+    {:ok, db} = Exqlite.Sqlite3.open(path)
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT v FROM t ORDER BY v")
+    rows = drain_rows(db, stmt, [])
+    :ok = Exqlite.Sqlite3.release(db, stmt)
+    :ok = Exqlite.Sqlite3.close(db)
+    rows
+  end
+
+  defp drain_rows(db, stmt, acc) do
+    case Exqlite.Sqlite3.step(db, stmt) do
+      {:row, [v]} -> drain_rows(db, stmt, [v | acc])
+      :done -> Enum.reverse(acc)
+    end
+  end
 end

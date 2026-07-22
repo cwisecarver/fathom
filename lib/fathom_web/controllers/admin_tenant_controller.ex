@@ -48,6 +48,24 @@ defmodule FathomWeb.AdminTenantController do
         |> put_resp_content_type("text/plain")
         |> send_resp(400, "invalid shard id")
 
+      # The stored object failed its integrity check (#22) — refuse rather than hand the departing
+      # customer a corrupt file that looks complete.
+      {:error, {:corrupt_export, _}} ->
+        Fathom.Audit.log(conn, "export", id, "error", %{reason: "corrupt"})
+
+        conn
+        |> put_resp_content_type("text/plain")
+        |> send_resp(500, "stored data for #{id} failed its integrity check; not exported")
+
+      # The flush-before-export timed out (#22 rides #14) — surface it so the operator retries
+      # rather than shipping an export that silently omits the newest writes.
+      {:error, :flush_timeout} ->
+        Fathom.Audit.log(conn, "export", id, "error", %{reason: "flush_timeout"})
+
+        conn
+        |> put_resp_content_type("text/plain")
+        |> send_resp(503, "could not flush #{id}'s latest writes in time; try again")
+
       {:error, _reason} ->
         Fathom.Audit.log(conn, "export", id, "error")
 
