@@ -18,13 +18,15 @@ defmodule Fathom.Tenants.Suspensions do
   require Logger
 
   alias Fathom.Directory
+  alias Fathom.Tenants.DenyList
 
   @table __MODULE__
   @channel :fathom_tenant_suspension
   @default_refresh_ms 300_000
 
   @doc false
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  def start_link(opts),
+    do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
 
   @doc "The Oban LISTEN/NOTIFY channel suspend/resume broadcasts on."
   @spec channel() :: atom()
@@ -41,82 +43,117 @@ defmodule Fathom.Tenants.Suspensions do
   @doc "Records `shard_id` suspended locally (called on the suspending node for immediacy)."
   @spec put(String.t()) :: :ok
   def put(shard_id) do
-    insert(shard_id)
+    insert(@table, shard_id)
     :ok
   end
 
   @doc "Clears `shard_id`'s suspension locally (called on the resuming node)."
   @spec remove(String.t()) :: :ok
   def remove(shard_id) do
-    delete(shard_id)
+    delete(@table, shard_id)
     :ok
   end
 
   @impl true
-  def init(_opts) do
-    :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
+  def init(opts) do
+    # `:table` / `:name` / `:loader` are seams for an isolated test instance; the app singleton
+    # uses the module defaults. `:retry_ms` overrides the first fast-retry delay per-instance.
+    table = Keyword.get(opts, :table, @table)
+    loader = Keyword.get(opts, :loader, &Directory.suspended_shard_ids/0)
+    retry_ms = Keyword.get(opts, :retry_ms, DenyList.initial_retry_ms())
+
+    :ets.new(table, [:set, :public, :named_table, read_concurrency: true])
 
     listen()
-    reconcile()
-    schedule_refresh()
 
-    {:ok, %{}}
+    state = %{table: table, loader: loader, retry_ms: retry_ms}
+
+    case reconcile(state) do
+      :ok ->
+        schedule_refresh()
+        {:ok, Map.put(state, :loaded, true)}
+
+      # Expert review #33: a FAILED boot reconcile must not wait the full refresh interval — that
+      # leaves the suspend gate empty (403 contract broken) for up to 5 min during a Postgres wobble
+      # coincident with this restart. Fast-retry with backoff, and signal degraded.
+      {:error, reason} ->
+        DenyList.degraded(:suspensions, reason)
+        schedule_retry(retry_ms)
+        {:ok, Map.put(state, :loaded, false)}
+    end
   end
 
   @impl true
   def handle_info({:notification, @channel, %{"shard_id" => id, "suspended" => true}}, state)
       when is_binary(id) do
-    insert(id)
+    insert(state.table, id)
     {:noreply, state}
   end
 
   def handle_info({:notification, @channel, %{"shard_id" => id, "suspended" => false}}, state)
       when is_binary(id) do
-    delete(id)
+    delete(state.table, id)
     {:noreply, state}
   end
 
   def handle_info(:refresh, state) do
-    reconcile()
+    reconcile(state)
     schedule_refresh()
     {:noreply, state}
   end
 
+  def handle_info(:retry_load, %{loaded: false} = state) do
+    case reconcile(state) do
+      :ok ->
+        DenyList.recovered(:suspensions)
+        schedule_refresh()
+        {:noreply, %{state | loaded: true}}
+
+      {:error, reason} ->
+        DenyList.degraded(:suspensions, reason)
+        next = DenyList.next_retry_ms(state.retry_ms)
+        schedule_retry(next)
+        {:noreply, %{state | retry_ms: next}}
+    end
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
-  defp insert(id) do
-    :ets.insert(@table, {id})
+  defp insert(table, id) do
+    :ets.insert(table, {id})
   rescue
     ArgumentError -> :ok
   end
 
-  defp delete(id) do
-    :ets.delete(@table, id)
+  defp delete(table, id) do
+    :ets.delete(table, id)
   rescue
     ArgumentError -> :ok
   end
 
   # Full reconcile against the directory: add every currently-suspended id, then drop any the
   # directory no longer shows suspended (a resume this node missed). Insert-then-prune (not
-  # clear-then-load) so a still-suspended id is never briefly absent from the gate.
-  defp reconcile do
-    current = MapSet.new(Directory.suspended_shard_ids())
-    Enum.each(current, &insert/1)
+  # clear-then-load) so a still-suspended id is never briefly absent from the gate. Returns
+  # `:ok` on a successful directory read, `{:error, reason}` on a failure so init/retry can
+  # fast-retry (expert review #33) instead of leaving the gate empty for the full refresh interval.
+  defp reconcile(%{table: table, loader: loader}) do
+    current = MapSet.new(loader.())
+    Enum.each(current, &insert(table, &1))
 
-    @table
+    table
     |> all_ids()
     |> Enum.reject(&MapSet.member?(current, &1))
-    |> Enum.each(&delete/1)
+    |> Enum.each(&delete(table, &1))
 
     :ok
   rescue
     e ->
       Logger.warning("suspension reconcile failed: #{Exception.message(e)}")
-      :ok
+      {:error, e}
   catch
     :exit, reason ->
       Logger.warning("suspension reconcile failed: #{inspect(reason)}")
-      :ok
+      {:error, reason}
   end
 
   defp all_ids(table) do
@@ -135,6 +172,10 @@ defmodule Fathom.Tenants.Suspensions do
 
   defp schedule_refresh do
     Process.send_after(self(), :refresh, refresh_ms())
+  end
+
+  defp schedule_retry(ms) do
+    Process.send_after(self(), :retry_load, ms)
   end
 
   defp refresh_ms,

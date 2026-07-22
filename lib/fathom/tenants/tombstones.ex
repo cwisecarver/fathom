@@ -36,13 +36,15 @@ defmodule Fathom.Tenants.Tombstones do
   require Logger
 
   alias Fathom.Directory
+  alias Fathom.Tenants.DenyList
 
   @table __MODULE__
   @channel :fathom_tenant_deleted
   @default_refresh_ms 300_000
 
   @doc false
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  def start_link(opts),
+    do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
 
   @doc "The Oban LISTEN/NOTIFY channel a delete broadcasts on."
   @spec channel() :: atom()
@@ -63,26 +65,47 @@ defmodule Fathom.Tenants.Tombstones do
   @doc "Records `shard_id` as tombstoned locally (called on the deleting node for immediacy)."
   @spec put(String.t()) :: :ok
   def put(shard_id) do
-    insert(shard_id)
+    insert(@table, shard_id)
     :ok
   end
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
+    # `:table` / `:name` / `:loader` are seams for an isolated test instance; the app singleton
+    # uses the module defaults. `:retry_ms` overrides the first fast-retry delay per-instance.
+    table = Keyword.get(opts, :table, @table)
+    loader = Keyword.get(opts, :loader, &Directory.deleted_shard_ids/0)
+    retry_ms = Keyword.get(opts, :retry_ms, DenyList.initial_retry_ms())
+
     # public read_concurrency: admission reads directly from the caller process.
-    :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
+    :ets.new(table, [:set, :public, :named_table, read_concurrency: true])
 
     listen()
-    load_from_directory()
 
     # Union in the durable storage tombstones at boot (#6): a Postgres point-in-time restore rolls the
     # directory back and can un-tombstone a deleted tenant, but storage is not rolled back. This scan
     # keeps the re-mint guard complete despite a directory restore. Boot-only — the in-memory set is
     # append-only, so the periodic (directory-only) refresh never drops these; no recurring LIST.
-    load_from_storage()
-    schedule_refresh()
+    # Storage is S3-derived, independent of the Postgres directory, so it also loads (and contributes
+    # deny coverage) during a Postgres outage that fails the directory load below.
+    load_from_storage(table)
 
-    {:ok, %{}}
+    state = %{table: table, loader: loader, retry_ms: retry_ms}
+
+    case load_from_directory(state) do
+      :ok ->
+        schedule_refresh()
+        {:ok, Map.put(state, :loaded, true)}
+
+      # Expert review #33: a FAILED boot load must not wait the full refresh interval — that
+      # leaves the re-mint guard empty (410 contract broken) for up to 5 min during a Postgres
+      # wobble coincident with this restart. Fast-retry with backoff, and signal degraded so the
+      # window is alertable.
+      {:error, reason} ->
+        DenyList.degraded(:tombstones, reason)
+        schedule_retry(retry_ms)
+        {:ok, Map.put(state, :loaded, false)}
+    end
   end
 
   @impl true
@@ -91,21 +114,41 @@ defmodule Fathom.Tenants.Tombstones do
     # One event does both jobs of a delete broadcast: block re-mint (ETS) and drop this
     # node's lease-less warm copy of the erased shard (GDPR timeliness — otherwise the
     # copy lingers until the follower's next refresh evicts it for leaving active_recent).
-    insert(shard_id)
+    insert(state.table, shard_id)
     purge_warm(shard_id)
     {:noreply, state}
   end
 
   def handle_info(:refresh, state) do
-    load_from_directory()
+    # Steady-state refresh: the set is already loaded and append-only, so a failure here just
+    # logs — the last-known set stands. Only the BOOT-unloaded path (below) fast-retries.
+    load_from_directory(state)
     schedule_refresh()
     {:noreply, state}
   end
 
+  def handle_info(:retry_load, %{loaded: false} = state) do
+    case load_from_directory(state) do
+      :ok ->
+        # Recovered — re-attempt the storage backstop (it may have failed at boot too), signal
+        # recovery, and fall back to the normal refresh cadence.
+        load_from_storage(state.table)
+        DenyList.recovered(:tombstones)
+        schedule_refresh()
+        {:noreply, %{state | loaded: true}}
+
+      {:error, reason} ->
+        DenyList.degraded(:tombstones, reason)
+        next = DenyList.next_retry_ms(state.retry_ms)
+        schedule_retry(next)
+        {:noreply, %{state | retry_ms: next}}
+    end
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
-  defp insert(shard_id) do
-    :ets.insert(@table, {shard_id})
+  defp insert(table, shard_id) do
+    :ets.insert(table, {shard_id})
   rescue
     ArgumentError -> :ok
   end
@@ -119,26 +162,28 @@ defmodule Fathom.Tenants.Tombstones do
   end
 
   # Additive load — never clears the set, so a transiently-empty query result (or a
-  # narrower refresh) can't un-tombstone an id this node already knows.
-  defp load_from_directory do
-    for id <- Directory.deleted_shard_ids(), do: insert(id)
+  # narrower refresh) can't un-tombstone an id this node already knows. Returns `:ok` on a
+  # successful directory read, `{:error, reason}` on a failure so init/retry can fast-retry
+  # (expert review #33) instead of silently waiting the full refresh interval.
+  defp load_from_directory(%{table: table, loader: loader}) do
+    for id <- loader.(), do: insert(table, id)
     :ok
   rescue
     e ->
       Logger.warning("tombstone load failed: #{Exception.message(e)}")
-      :ok
+      {:error, e}
   catch
     :exit, reason ->
       Logger.warning("tombstone load failed: #{inspect(reason)}")
-      :ok
+      {:error, reason}
   end
 
   # Additive union from durable storage (#6) — the DR backstop that survives a directory restore.
-  # Best-effort like load_from_directory: a storage blip at boot just means the directory-derived set
-  # stands until the storage is reachable (a restore is a rare, operator-driven event).
-  defp load_from_storage do
+  # Best-effort: a storage blip at boot just means the directory-derived set stands until the storage
+  # is reachable (a restore is a rare, operator-driven event).
+  defp load_from_storage(table) do
     case Fathom.Shard.Storage.tombstoned_ids() do
-      {:ok, ids} -> for id <- ids, do: insert(id)
+      {:ok, ids} -> for id <- ids, do: insert(table, id)
       {:error, reason} -> Logger.warning("tombstone storage load failed: #{inspect(reason)}")
     end
 
@@ -163,6 +208,10 @@ defmodule Fathom.Tenants.Tombstones do
 
   defp schedule_refresh do
     Process.send_after(self(), :refresh, refresh_ms())
+  end
+
+  defp schedule_retry(ms) do
+    Process.send_after(self(), :retry_load, ms)
   end
 
   defp refresh_ms,

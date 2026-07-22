@@ -73,6 +73,12 @@ config :fathom, :directory_flush_ms, 600_000
 # outside a sandbox owner (noise) — tests drive Fathom.Migrator.HeadCache.refresh/0.
 config :fathom, :migrator_head_ttl_ms, 3_600_000
 
+# The lifecycle deny-set singletons (Tombstones/Suspensions) boot-load from Postgres before any
+# sandbox checkout, so their app-startup load fails (ownerless) and now fast-retries (#33). Push
+# that first retry an hour out so it never spins during the suite; the #33 boot-retry test starts
+# its own isolated instances with a short :retry_ms.
+config :fathom, :tenant_denylist_retry_ms, 3_600_000
+
 # Oban: don't run queues/plugins in test; jobs are inserted and exercised with
 # Oban.Testing (perform_job / assert_enqueued).
 config :fathom, Oban, testing: :manual

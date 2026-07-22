@@ -303,6 +303,18 @@ defmodule Fathom.Telemetry do
           "A node heartbeat lapsed (renewal didn't land within the TTL margin) — its shards become stealable; sustained ⇒ S3 reachability / mass self-fence risk"
       ),
 
+      # Lifecycle deny-set boot-load health (#33): the tombstone (410) / suspend (403) admission
+      # gates load from the directory at boot and fast-retry a failed load (1s→30s) instead of
+      # silently waiting the 5-min refresh. This counter fires on every retry the set is still
+      # unloaded — a rising floor ⇒ a node's delete/suspend guarantees don't hold (Postgres
+      # unreachable from that node). Low cardinality: one series per kind.
+      counter("fathom.tenants.denylist.degraded.count",
+        event_name: [:fathom, :tenants, :denylist, :degraded],
+        tags: [:kind],
+        description:
+          "A lifecycle admission deny set (tombstones/suspensions) has an unloaded boot state and is retrying — the delete/suspend contract is not enforced on this node until it recovers (#33)"
+      ),
+
       # Control plane — a stalled Oban is a silent migration/reconcile/rebalancer/retirement outage.
       counter("fathom.oban.job.exception.count",
         event_name: [:oban, :job, :exception],
