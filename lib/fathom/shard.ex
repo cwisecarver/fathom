@@ -2057,6 +2057,21 @@ defmodule Fathom.Shard do
     )
   end
 
+  # The three quarantine-file kinds the coordinator writes to preserve acked-but-unflushed / corrupt
+  # local copies (`.db.fenced.*` self-fence, `.db.forked.*` diverged lineage, `.db.corrupt.*` failed
+  # quick_check). Naming lives at each quarantine_* site; this is the one enumerator (expert review
+  # #23), shared by the TempReaper retention sweep and `mix fathom.shard quarantines`.
+  @quarantine_kinds ["fenced", "forked", "corrupt"]
+
+  @doc false
+  def quarantine_kinds, do: @quarantine_kinds
+
+  @doc false
+  @spec quarantine_files(Path.t()) :: [Path.t()]
+  def quarantine_files(dir \\ data_dir()) do
+    for kind <- @quarantine_kinds, f <- Path.wildcard(Path.join(dir, "*.db.#{kind}.*")), do: f
+  end
+
   # Round-2 #26: spread the post-lapse revalidation fan-out across the jitter window.
   defp lapse_jitter_ms, do: Application.get_env(:fathom, :lapse_revalidate_jitter_ms, 2_000)
 

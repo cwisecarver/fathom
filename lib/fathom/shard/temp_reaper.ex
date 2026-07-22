@@ -33,6 +33,12 @@ defmodule Fathom.Shard.TempReaper do
   @default_interval_ms 300_000
   # Match the coordinator's per-open age gate (2 * Fathom.Shard @pull_timeout of 60_000).
   @stale_after_ms 120_000
+  # Expert review #23: age-cap on quarantine files (.db.fenced/.forked/.corrupt). They preserve
+  # acked-but-unflushed / corrupt local copies for recovery, but without retention they leak on
+  # local disk forever (swept only by a tenant delete). 30 days gives an operator a generous window
+  # to recover via `mix fathom.shard quarantines`; set `:quarantine_retention_ms` to 0 to keep
+  # forever. Deletion only touches files older than the cap — a fresh quarantine is never swept.
+  @default_quarantine_retention_ms 30 * 24 * 60 * 60 * 1000
 
   @doc "Start the reaper (registered under the module name)."
   def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -70,8 +76,48 @@ defmodule Fathom.Shard.TempReaper do
   defp do_sweep do
     reaped = Storage.reap_stale_temps(Path.join(Shard.data_dir(), "*"), @stale_after_ms)
     if reaped > 0, do: Logger.info("shard temp reaper: reaped #{reaped} orphaned temp(s)")
+    sweep_quarantines()
     reaped
   end
+
+  # Quarantine inventory gauge + age-capped retention (expert review #23). The coordinator preserves
+  # acked-but-unflushed / corrupt local copies in `.db.fenced/.forked/.corrupt` files; without
+  # retention they leak on local disk forever. Emit a GAUGE of the standing count (an alert can fire
+  # on a growing backlog — complements the per-event `[:fathom,:shard,:fenced_quarantine]` counter),
+  # then delete any older than the retention cap (default 30d; 0 keeps forever). Returns the count.
+  defp sweep_quarantines do
+    files = Shard.quarantine_files()
+    :telemetry.execute([:fathom, :shard, :quarantines], %{count: length(files)}, %{})
+
+    case quarantine_retention_ms() do
+      ms when is_integer(ms) and ms > 0 ->
+        now = System.system_time(:millisecond)
+        removed = for f <- files, quarantine_age_ms(f, now) > ms, File.rm(f) == :ok, do: f
+
+        if removed != [],
+          do:
+            Logger.info(
+              "shard temp reaper: swept #{length(removed)} quarantine file(s) past retention"
+            )
+
+      _ ->
+        :ok
+    end
+
+    length(files)
+  end
+
+  # Age from the file's mtime (the quarantine is never rewritten after the rename, so mtime is its
+  # creation time). Unstattable ⇒ age 0 ⇒ never swept (fail-safe: keep the data).
+  defp quarantine_age_ms(file, now_ms) do
+    case File.stat(file, time: :posix) do
+      {:ok, %File.Stat{mtime: mtime_sec}} -> now_ms - mtime_sec * 1000
+      _ -> 0
+    end
+  end
+
+  defp quarantine_retention_ms,
+    do: Application.get_env(:fathom, :quarantine_retention_ms, @default_quarantine_retention_ms)
 
   defp schedule(state) do
     Process.send_after(self(), :sweep, interval_ms())

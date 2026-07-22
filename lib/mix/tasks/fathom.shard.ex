@@ -6,14 +6,26 @@ defmodule Mix.Tasks.Fathom.Shard do
   recover/validate/clone commands that previously meant hand-rolling `aws-cli` + `sqlite3` against
   an undocumented key layout under incident pressure.
 
-      mix fathom.shard pull <shard> [<path>]   # download the stored .db (default ./<shard>.db)
-      mix fathom.shard inspect <shard>         # pull + read-only quick_check, user_version, tables
-      mix fathom.shard fork <src> <dst>        # clone a live tenant to a NEW shard id (+ token)
+      mix fathom.shard pull <shard> [<path>]        # download the stored .db (default ./<shard>.db)
+      mix fathom.shard inspect <shard>              # pull + read-only quick_check, user_version, tables
+      mix fathom.shard fork <src> <dst>             # clone a live tenant to a NEW shard id (+ token)
+      mix fathom.shard quarantines                  # list local quarantine files (shard, kind, age, size)
+      mix fathom.shard quarantine-diff <file> <shard>  # per-table row deltas vs the live object
 
   `pull` and `inspect` are the restore-drill / validation tools — `inspect` proves a stored object
   is a real, `quick_check`-clean database and reports its schema version and per-table row counts.
   An untested restore path is an unproven backup; run `inspect` on a sample of shards regularly (a
   scheduled fleet drill is a follow-up).
+
+  `quarantines` and `quarantine-diff` are the recovery tools for the coordinator's designated
+  data-loss artifacts (expert review #23): the `.db.fenced/.forked/.corrupt` files it renames aside
+  to *preserve* acked-but-unflushed / corrupt local copies instead of dropping them. `quarantines`
+  enumerates them on this node (no ssh + ls of a fleet-sized dir); `quarantine-diff` attaches a
+  quarantine file and the shard's current stored object and reports per-table row-count deltas —
+  enough to decide merge vs discard. The TempReaper age-caps them (`:quarantine_retention_ms`,
+  default 30d) so they don't leak forever; a `fathom.shard.quarantines` gauge tracks the standing
+  count. Recording each quarantine in the directory (survives the node, joins the loss report) and a
+  stale-`heartbeat/*`-object janitor are scoped follow-ups.
 
   `fork` is the database-forking kernel (a fork is one object copy): it clones `src`'s last
   durably-flushed state to a brand-new `dst` shard id, registers `dst` at `src`'s schema version,
@@ -51,9 +63,16 @@ defmodule Mix.Tasks.Fathom.Shard do
       ["loss-report", n] ->
         loss_report(parse_limit(n))
 
+      ["quarantines"] ->
+        quarantines()
+
+      ["quarantine-diff", file, shard] ->
+        quarantine_diff(file, shard)
+
       _ ->
         Mix.raise(
-          "usage: mix fathom.shard pull <shard> [path] | inspect <shard> | fork <src> <dst> | loss-report [limit]"
+          "usage: mix fathom.shard pull <shard> [path] | inspect <shard> | fork <src> <dst> | " <>
+            "loss-report [limit] | quarantines | quarantine-diff <file> <shard>"
         )
     end
   end
@@ -158,6 +177,132 @@ defmodule Mix.Tasks.Fathom.Shard do
             "#{id}\t#{active}\t#{flushed || "(never)"}\t#{window(active, flushed)}"
           )
         end
+    end
+  end
+
+  # Quarantine inventory (expert review #23): a local disk scan of the shard data dir for the three
+  # quarantine kinds the coordinator preserves acked-but-unflushed / corrupt copies in. Replaces
+  # "ssh + ls a fleet-sized data dir under incident pressure". No app/storage needed — pure disk.
+  @quarantine_re ~r/^(?<shard>.+)\.db\.(?<kind>fenced|forked|corrupt)\./
+
+  defp quarantines do
+    files = Fathom.Shard.quarantine_files()
+
+    if files == [] do
+      Mix.shell().info("no quarantine files in #{Fathom.Shard.data_dir()}")
+    else
+      now = System.system_time(:millisecond)
+      Mix.shell().info("shard\tkind\tage\tsize\tfile")
+
+      for file <- Enum.sort(files) do
+        {shard, kind} = parse_quarantine(file)
+        {age, size} = quarantine_stat(file, now)
+        Mix.shell().info("#{shard}\t#{kind}\t#{age}\t#{size}\t#{file}")
+      end
+
+      Mix.shell().info(
+        "\n#{length(files)} quarantine file(s). Row-level detail vs the live object: " <>
+          "mix fathom.shard quarantine-diff <file> <shard>"
+      )
+    end
+  end
+
+  defp parse_quarantine(file) do
+    case Regex.named_captures(@quarantine_re, Path.basename(file)) do
+      %{"shard" => shard, "kind" => kind} -> {shard, kind}
+      _ -> {Path.basename(file), "?"}
+    end
+  end
+
+  defp quarantine_stat(file, now_ms) do
+    case File.stat(file, time: :posix) do
+      {:ok, %File.Stat{size: size, mtime: mtime_sec}} ->
+        {"#{div(now_ms - mtime_sec * 1000, 1000)}s", "#{size}B"}
+
+      _ ->
+        {"?", "?"}
+    end
+  end
+
+  # Recovery helper (#23): the promised "the forked/fenced writes live in that file" made concrete —
+  # per-table row-count deltas between a quarantine file and the shard's current live object, enough
+  # to decide merge vs discard. The quarantine file is COPIED to a temp before opening so the
+  # operator's recovery artifact is never modified (no WAL sidecar next to it).
+  defp quarantine_diff(file, shard) do
+    unless File.exists?(file), do: Mix.raise("no such quarantine file: #{file}")
+    storage_deps!()
+
+    qtmp = copy_to_temp!(file)
+    ltmp = Path.join(System.tmp_dir!(), "fathom_qdiff_live_#{System.system_time()}.db")
+
+    try do
+      case Storage.pull(shard, ltmp) do
+        {:ok, nil} ->
+          Mix.raise("no stored object for #{shard} to diff against")
+
+        {:ok, _etag} ->
+          {:ok, qconn} = Exqlite.Sqlite3.open(qtmp)
+          {:ok, lconn} = Exqlite.Sqlite3.open(ltmp)
+
+          try do
+            diff_report(shard, file, qconn, lconn)
+          after
+            Exqlite.Sqlite3.close(qconn)
+            Exqlite.Sqlite3.close(lconn)
+          end
+
+        {:error, reason} ->
+          Mix.raise("pull failed: #{inspect(reason)}")
+      end
+    after
+      for t <- [qtmp, ltmp], s <- ["", "-wal", "-shm"], do: File.rm(t <> s)
+    end
+  end
+
+  defp copy_to_temp!(file) do
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "fathom_qdiff_q_#{System.system_time()}_#{System.unique_integer([:positive])}.db"
+      )
+
+    :ok = File.cp(file, tmp)
+    tmp
+  end
+
+  defp diff_report(shard, file, qconn, lconn) do
+    q = table_counts(qconn)
+    l = table_counts(lconn)
+    names = (Map.keys(q) ++ Map.keys(l)) |> Enum.uniq() |> Enum.sort()
+
+    Mix.shell().info("quarantine: #{file}")
+    Mix.shell().info("live:       stored object for #{shard}")
+    Mix.shell().info("table\tquarantine\tlive\tdelta")
+
+    ahead =
+      for name <- names, reduce: [] do
+        acc ->
+          qn = Map.get(q, name, 0)
+          ln = Map.get(l, name, 0)
+          Mix.shell().info("#{name}\t#{qn}\t#{ln}\t#{qn - ln}")
+          if qn > ln, do: [name | acc], else: acc
+      end
+
+    if ahead == [] do
+      Mix.shell().info(
+        "\nno table has more rows in the quarantine than in the live object — likely safe to DISCARD."
+      )
+    else
+      Mix.shell().error(
+        "\nquarantine has MORE rows in: #{ahead |> Enum.reverse() |> Enum.join(", ")} — " <>
+          "inspect before discarding (possible unflushed writes)."
+      )
+    end
+  end
+
+  defp table_counts(conn) do
+    for [name] <- rows(conn, tables_sql()), into: %{} do
+      {name, to_int(scalar(conn, "SELECT count(*) FROM \"#{escape(name)}\""))}
     end
   end
 

@@ -271,6 +271,12 @@ defmodule Fathom.Telemetry do
         description:
           "Self-fences that quarantined un-flushed writes to a .fenced.<ts> file (#5) — acked-but-unflushed data preserved for recovery; sustained > 0 ⇒ ownership churn losing writes"
       ),
+      last_value("fathom.shard.quarantines",
+        event_name: [:fathom, :shard, :quarantines],
+        measurement: :count,
+        description:
+          "Standing count of quarantine files (.db.fenced/.forked/.corrupt) on this node's data dir (#23), polled by the TempReaper — a growing backlog means preserved acked-but-unflushed writes are piling up unrecovered; enumerate with `mix fathom.shard quarantines`"
+      ),
 
       # Capacity / admission — the tenant-visible refusals.
       counter("fathom.shards.novel_rate_limited.count",
