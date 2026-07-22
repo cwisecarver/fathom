@@ -24,6 +24,14 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
   defp restore(k, nil), do: Application.delete_env(:fathom, k)
   defp restore(k, v), do: Application.put_env(:fathom, k, v)
 
+  defp wait_until(fun, tries \\ 400) do
+    cond do
+      fun.() -> :ok
+      tries <= 0 -> flunk("condition never met")
+      true -> Process.sleep(5) && wait_until(fun, tries - 1)
+    end
+  end
+
   test "a drain command releases the shard on this node and marks the command done",
        %{shard: shard, node: node} do
     # A real drain is always preceded by a pin (pin_and_flip runs before drain is issued);
@@ -213,5 +221,61 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     done = Commands.get(cmd.id)
     assert done.status == "done"
     assert done.detail =~ "warm"
+  end
+
+  test "a batch task killed by an exit signal frees its in-flight ids — no permanent leak (#19)",
+       %{node: node} do
+    # The detached batch task's try/after sends {:batch_done} on a normal exit or a raise, but NOT
+    # on an exit SIGNAL: a TaskSupervisor restart (or a kill) leaves the ids in in_flight forever,
+    # so fresh_pending rejects the command every future tick and it's wedged `pending`. The poller's
+    # MONITOR is the guaranteed cleanup — DOWN frees the ids regardless.
+    drain_shard = "poll19_#{System.unique_integer([:positive])}"
+
+    prev_poll = Application.get_env(:fathom, :command_poll_ms)
+    prev_drain = Application.get_env(:fathom, :command_drain_ms)
+    # High auto-poll interval (deterministic manual dispatch) + long drain so the batch blocks,
+    # giving us a live task to kill.
+    Application.put_env(:fathom, :command_poll_ms, 60_000)
+    Application.put_env(:fathom, :command_drain_ms, 30_000)
+
+    on_exit(fn ->
+      restore(:command_poll_ms, prev_poll)
+      restore(:command_drain_ms, prev_drain)
+
+      for dir <- ["fathom_shards", "fathom_remote_test"], s <- ["", "-wal", "-shm"] do
+        File.rm(Path.join([System.tmp_dir!(), dir, "#{drain_shard}.db"]) <> s)
+      end
+    end)
+
+    {:ok, _} = Overrides.pin(drain_shard, node, reason: "test")
+    # Hold a connection so the drain BLOCKS (busy) — keeping the batch task alive to kill.
+    {:ok, cpid, cref, _} = Shards.checkout(drain_shard)
+    {:ok, drain_cmd} = Commands.issue(drain_shard, node, "drain")
+
+    poller = start_supervised!(CommandPoller)
+
+    # Timer path: dispatch the drain as a detached batch; it blocks on the held connection.
+    send(poller, :poll)
+    assert MapSet.member?(:sys.get_state(poller).in_flight, drain_cmd.id)
+
+    # Kill every TaskSupervisor child with an exit SIGNAL (the batch task included) — a
+    # TaskSupervisor restart. try/after does NOT run, so no {:batch_done} is ever sent.
+    children = Task.Supervisor.children(Fathom.Rebalancer.TaskSupervisor)
+    assert children != [], "the blocked batch task must be alive to kill"
+    for pid <- children, do: Process.exit(pid, :kill)
+
+    # Pre-fix: the id stayed in in_flight forever. Now the monitor's DOWN frees it.
+    wait_until(fn -> not MapSet.member?(:sys.get_state(poller).in_flight, drain_cmd.id) end)
+    assert Process.alive?(poller), "the poller must survive the batch task's death"
+
+    # The command never completed (complete/3 never ran) — still pending, now re-selectable.
+    assert Commands.get(drain_cmd.id).status == "pending"
+
+    # Prove re-selection: release the connection so the re-drain succeeds, then poll again.
+    down = Process.monitor(cpid)
+    Fathom.Shard.checkin(cpid, cref)
+    assert CommandPoller.poll_now() == 1, "the freed command is re-selected on the next poll"
+    assert Commands.get(drain_cmd.id).status == "done"
+    assert_receive {:DOWN, ^down, :process, ^cpid, _}, 8_000
   end
 end

@@ -168,6 +168,12 @@ defmodule Fathom.Telemetry do
         description:
           "Warm/drain command outcomes (done / failed / cancelled) — drain-failed = thrash"
       ),
+      counter("fathom.rebalancer.command.orphaned.count",
+        event_name: [:fathom, :rebalancer, :command, :orphaned],
+        tags: [:reason],
+        description:
+          "In-flight command batches recovered after their task died to an exit signal without completing (#19) — the CommandPoller monitor freeing leaked ids; any occurrence means a TaskSupervisor blip mid-handoff"
+      ),
       counter("fathom.rebalancer.lb_apply.count",
         event_name: [:fathom, :rebalancer, :lb_apply],
         tags: [:outcome],

@@ -27,7 +27,10 @@ defmodule Fathom.Rebalancer.CommandPoller do
   the *next* tick either — a `warm` arriving just after a drain batch begins is picked up on the
   next tick rather than waiting the whole drain out. In-flight command ids are tracked in state
   so an overlapping tick can't re-select a command still running (it stays `pending` in Postgres
-  until its task calls `complete/3`). `nolink` keeps a crashing command from taking the poller
+  until its task calls `complete/3`). The poller **monitors** each detached batch task, so one
+  killed by an exit *signal* (a `TaskSupervisor` restart, which `try/after` doesn't cover) still
+  frees its ids on `DOWN` rather than wedging those commands `pending` forever (finding #19).
+  `nolink` keeps a crashing command from taking the poller
   down, and each task has a **finite** timeout (`:command_task_timeout_ms`, default ordered above
   the drain worst-case) so `on_timeout: :kill_task` actually bounds a wedged command rather than
   the batch blocking forever. `poll_now/0` still consumes one batch synchronously (so tests
@@ -66,7 +69,11 @@ defmodule Fathom.Rebalancer.CommandPoller do
   @impl true
   def init(_opts) do
     schedule()
-    {:ok, %{in_flight: MapSet.new()}}
+    # in_flight: the union of every dispatched batch's ids (the O(1) anti-re-select gate).
+    # batches: monitor_ref => that batch's ids, so a batch task that dies to an exit SIGNAL (a
+    # kill / TaskSupervisor restart — try/after doesn't cover it) still frees its ids on DOWN
+    # instead of wedging the commands `pending` forever (expert review #19).
+    {:ok, %{in_flight: MapSet.new(), batches: %{}}}
   end
 
   # Timer path: dispatch this tick's fresh commands as a detached batch and reschedule
@@ -78,10 +85,45 @@ defmodule Fathom.Rebalancer.CommandPoller do
     {:noreply, state}
   end
 
-  # A detached batch clears its ids from the in-flight set when it finishes (or dies).
+  # Fast path: a detached batch sends this from its `try/after` when it finishes (normal exit or
+  # a raise). Clears its ids from the in-flight set. The `batches` entry is cleaned on the DOWN.
   @impl true
   def handle_info({:batch_done, ids}, state) do
     {:noreply, %{state | in_flight: MapSet.difference(state.in_flight, ids)}}
+  end
+
+  # Guaranteed path (expert review #19): the batch task's monitor. `try/after` runs on a raise or
+  # normal exit but NOT on an exit SIGNAL — if the TaskSupervisor restarts (a crash-storm sibling
+  # budget, or its own shutdown) while the poller survives, the non-trapping batch task is killed
+  # without sending {:batch_done}, and its ids would stay in_flight forever, rejecting those
+  # commands every future tick. The monitor fires regardless, so we free the ids here too
+  # (idempotent with the fast path). If the ids are STILL in_flight on an abnormal DOWN, the fast
+  # path never ran — a recovered leak, surfaced as telemetry.
+  @impl true
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+    case Map.pop(state.batches, ref) do
+      {nil, _batches} ->
+        {:noreply, state}
+
+      {ids, batches} ->
+        orphaned = MapSet.intersection(ids, state.in_flight)
+
+        if reason != :normal and MapSet.size(orphaned) > 0 do
+          Logger.warning(
+            "command poller: batch task died (#{inspect(reason)}) without completing; " <>
+              "recovered #{MapSet.size(orphaned)} leaked in-flight command(s)"
+          )
+
+          :telemetry.execute(
+            [:fathom, :rebalancer, :command, :orphaned],
+            %{count: MapSet.size(orphaned)},
+            %{reason: reason}
+          )
+        end
+
+        {:noreply,
+         %{state | in_flight: MapSet.difference(state.in_flight, ids), batches: batches}}
+    end
   end
 
   # Test-only: run one batch to completion synchronously so a test observes results
@@ -116,15 +158,35 @@ defmodule Fathom.Rebalancer.CommandPoller do
         poller = self()
         ids = MapSet.new(fresh, & &1.id)
 
-        Task.Supervisor.start_child(@task_supervisor, fn ->
-          try do
-            run_batch(fresh)
-          after
-            send(poller, {:batch_done, ids})
-          end
-        end)
+        spawned =
+          Task.Supervisor.start_child(@task_supervisor, fn ->
+            try do
+              run_batch(fresh)
+            after
+              send(poller, {:batch_done, ids})
+            end
+          end)
 
-        %{state | in_flight: MapSet.union(state.in_flight, ids)}
+        case spawned do
+          {:ok, pid} ->
+            # Monitor the detached task so an exit SIGNAL that skips its `after` still frees these
+            # ids on DOWN (finding #19). Marking in-flight only AFTER a confirmed spawn also fixes a
+            # latent leak: a failed start_child previously marked ids in-flight with no task to
+            # ever clear them.
+            ref = Process.monitor(pid)
+
+            %{
+              state
+              | in_flight: MapSet.union(state.in_flight, ids),
+                batches: Map.put(state.batches, ref, ids)
+            }
+
+          other ->
+            # Couldn't spawn (supervisor down / at capacity): leave the ids pending and retry
+            # next tick, rather than marking them in-flight with no task behind them.
+            Logger.warning("command poller: batch dispatch did not start (#{inspect(other)})")
+            state
+        end
     end
   rescue
     # A Postgres blip (e.g. pending_for) just means we retry next tick — never crash.
