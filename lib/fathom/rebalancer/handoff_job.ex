@@ -9,9 +9,11 @@ defmodule Fathom.Rebalancer.HandoffJob do
   1. **Warm the target** (best-effort) — pre-pull the shard onto the target so its open is
      a 304, not a full body transfer.
   2. **Pin + flip the LB** — write the override (shard → target) and apply the LB map. New
-     requests for the shard now route to the target. The target can't serve yet (the
-     source still holds the lease → `acquire_lease` returns `{:held}`), so clients briefly
-     retry; existing connections on the source finish.
+     requests for the shard now route to the target. The target can't serve yet (the source
+     still holds the lease → `acquire_lease` returns `{:held}`), but `Fathom.Shards.checkout`
+     sees this node is the pinned handoff target and **holds + retries the acquire** up to the
+     drain window (finding #20) — so the first post-flip requests QUEUE for a few seconds
+     rather than erroring; existing connections on the source finish.
   3. **Drain the source** — with new traffic now going to the target, the source's
      in-flight connections finish and it flushes + releases the lease.
   4. The target's next request (already routed there) acquires the freed lease and serves

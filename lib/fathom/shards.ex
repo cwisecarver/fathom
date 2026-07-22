@@ -24,6 +24,15 @@ defmodule Fathom.Shards do
   # admission 503s fast and the LB retries (the eviction completes in the background).
   @default_evict_budget_ms 2_000
 
+  # Expert review #20: on a `{:shard_held}` at a pinned handoff target, how long a checkout will
+  # HOLD + retry the acquire (backoff, capped) before falling back to the error — so the first
+  # post-flip requests queue for the source's drain window instead of erroring. 0 disables the
+  # hold (immediate error, the pre-#20 behavior). Only ever reached when the shard is pinned to
+  # this node (a rebalancer handoff), so it's inert unless rebalancing is armed.
+  @default_held_budget_ms 10_000
+  @initial_held_backoff_ms 50
+  @max_held_backoff_ms 1_000
+
   @doc """
   Ensures `shard_id`'s coordinator is running and checks out the shard for the
   caller, returning `{:ok, coordinator_pid, ref, path}` (or `{:error, reason}` for
@@ -49,7 +58,7 @@ defmodule Fathom.Shards do
     end
   end
 
-  defp do_checkout(shard_id, attempts) do
+  defp do_checkout(shard_id, attempts, held \\ nil) do
     with :ok <- maybe_lazy_migrate(shard_id),
          {:ok, pid} <- ensure(shard_id),
          {:ok, ref, path} <- Fathom.Shard.checkout(pid) do
@@ -62,6 +71,17 @@ defmodule Fathom.Shards do
       Fathom.Shards.Lru.touch(shard_id)
       {:ok, pid, ref, path}
     else
+      # Expected in-flight handoff (expert review #20): the LB flips to the target BEFORE the
+      # source drains, so this node's acquire is `{:shard_held, source}` for the drain window.
+      # `retry_checkout?` deliberately excludes `:held` (a genuinely-held foreign lease must not
+      # spin), and the tenant's driver doesn't retry a mid-request 503 — so a handoff turns into a
+      # burst of client errors on the HOTTEST shard. If this node is the pinned handoff target,
+      # hold and retry the acquire with backoff up to a bounded budget (~the drain window) so the
+      # first post-flip requests QUEUE instead of erroring. Anything else (foreign lease, no pin,
+      # budget exhausted) falls back to the current error.
+      {:error, {:shard_held, _}} = err ->
+        held_retry(shard_id, attempts, held, err)
+
       # Race: `ensure` resolved a coordinator that lost a race with its own lifecycle, so a
       # 1 ms re-resolve to a fresh coordinator fixes it (see retry_checkout?/1). Bounded so a
       # genuinely unavailable shard still surfaces the error rather than spinning. Only the
@@ -69,7 +89,7 @@ defmodule Fathom.Shards do
       {:error, reason} when attempts > 1 ->
         if retry_checkout?(reason) do
           Process.sleep(1)
-          do_checkout(shard_id, attempts - 1)
+          do_checkout(shard_id, attempts - 1, held)
         else
           {:error, reason}
         end
@@ -78,6 +98,52 @@ defmodule Fathom.Shards do
         other
     end
   end
+
+  # `held` is nil until the first `{:shard_held}` error, then `{deadline_ms, next_backoff_ms}`.
+  # On the FIRST held error we decide once whether this is our in-flight handoff (one Overrides
+  # read); if so we open a time-bounded retry window and carry the deadline so we don't re-query
+  # Postgres per retry. A reverted handoff just exhausts the (bounded) budget and then errors.
+  defp held_retry(shard_id, attempts, nil, err) do
+    if handoff_held_budget_ms() > 0 and handoff_pin_here?(shard_id) do
+      :telemetry.execute([:fathom, :shards, :handoff_wait], %{count: 1}, %{shard_id: shard_id})
+      deadline = System.monotonic_time(:millisecond) + handoff_held_budget_ms()
+      backoff_held(shard_id, attempts, deadline, @initial_held_backoff_ms, err)
+    else
+      err
+    end
+  end
+
+  defp held_retry(shard_id, attempts, {deadline, backoff}, err),
+    do: backoff_held(shard_id, attempts, deadline, backoff, err)
+
+  defp backoff_held(shard_id, attempts, deadline, backoff, err) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining > 0 do
+      Process.sleep(min(backoff, remaining))
+      do_checkout(shard_id, attempts, {deadline, min(backoff * 2, @max_held_backoff_ms)})
+    else
+      err
+    end
+  end
+
+  # Whether this node is the pinned target of an active (not reverted) handoff for this shard —
+  # i.e. a `{:shard_held}` here is the expected post-flip / pre-drain window, not a foreign lease.
+  # Fails CLOSED (false ⇒ surface the error) on any Postgres doubt, so a directory blip never
+  # converts a real held-error into a multi-second stall.
+  defp handoff_pin_here?(shard_id) do
+    case Fathom.Rebalancer.Overrides.for_shard(shard_id) do
+      %{pinned_node: node, failed_at: nil} -> node == Fathom.Rebalancer.node_key()
+      _ -> false
+    end
+  rescue
+    _ -> false
+  catch
+    :exit, _ -> false
+  end
+
+  defp handoff_held_budget_ms,
+    do: Application.get_env(:fathom, :handoff_held_retry_budget_ms, @default_held_budget_ms)
 
   # Two checkout errors are transient lifecycle races, not real failures — both clear on a
   # re-resolve to a fresh coordinator:

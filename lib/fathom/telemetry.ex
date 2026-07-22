@@ -106,6 +106,11 @@ defmodule Fathom.Telemetry do
         description:
           "New-shard opens refused by per-node admission control (:max_open_shards) — the hot-spot / rebalance signal"
       ),
+      counter("fathom.shards.handoff_wait.count",
+        event_name: [:fathom, :shards, :handoff_wait],
+        description:
+          "Checkouts that queued (held + retried) at a pinned handoff target during the source's drain window instead of erroring (#20) — a per-handoff burst is expected; a sustained rate means handoffs are draining slowly"
+      ),
       counter("fathom.shard.warm.promoted.count",
         event_name: [:fathom, :shard, :warm, :promoted],
         tags: [:result],
