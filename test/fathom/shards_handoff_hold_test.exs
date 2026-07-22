@@ -14,6 +14,7 @@ defmodule Fathom.ShardsHandoffHoldTest do
   alias Fathom.{Shards, ShardExecutor}
   alias Fathom.Rebalancer
   alias Fathom.Rebalancer.Overrides
+  alias Fathom.Shard.Storage
   alias Filo.Stmt
 
   @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
@@ -23,11 +24,20 @@ defmodule Fathom.ShardsHandoffHoldTest do
     shard = "handoff_#{System.unique_integer([:positive])}"
     prev_idle = Application.get_env(:fathom, :shard_idle_ms)
     prev_budget = Application.get_env(:fathom, :handoff_held_retry_budget_ms)
+    prev_crash = Application.get_env(:fathom, :crash_failover_hold_ms)
+    prev_margin = Application.get_env(:fathom, :steal_margin_ms)
     Application.put_env(:fathom, :shard_idle_ms, 50)
+    # Off by default here so the #20 (handoff) tests exercise only the pin path; the #21 tests
+    # opt it back in.
+    Application.put_env(:fathom, :crash_failover_hold_ms, 0)
 
     on_exit(fn ->
       restore(:shard_idle_ms, prev_idle)
       restore(:handoff_held_retry_budget_ms, prev_budget)
+      restore(:crash_failover_hold_ms, prev_crash)
+      restore(:steal_margin_ms, prev_margin)
+      Storage.clear_heartbeat("dead@node#1")
+      Storage.clear_heartbeat("live@node#1")
 
       for dir <- [@local_dir, @remote_dir],
           suffix <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock"],
@@ -128,5 +138,43 @@ defmodule Fathom.ShardsHandoffHoldTest do
     assert {:error, {:shard_held, "source@node"}} = result
     assert us >= 250_000, "the checkout must have held ~the budget before falling back (#{us} us)"
     assert us < 3_000_000, "the hold must be bounded by the budget, not indefinite (#{us} us)"
+  end
+
+  # --- #21: hard-crash failover tail ---------------------------------------------------------
+
+  test "a checkout at the tail of a crashed owner's TTL window holds + retries, then steals and serves",
+       %{shard: shard} do
+    Application.put_env(:fathom, :crash_failover_hold_ms, 5_000)
+    Application.put_env(:fathom, :steal_margin_ms, 100)
+    seed_durable(shard)
+
+    # A hard-crashed owner: its heartbeat OBJECT survives (not cleared) but is frozen, expiring in
+    # ~200ms — so the steal becomes possible ~300ms out (exp + margin), inside the 5s budget.
+    put_live_foreign_lock(shard, "dead@node#1")
+    Storage.renew_heartbeat("dead@node#1", 200)
+
+    # Pre-#21 this errored immediately (retry_checkout? excludes :held). Now it HOLDS + retries and
+    # serves once the frozen heartbeat ages out and the acquire steals.
+    assert {:ok, pid, ref, _path} = Shards.checkout(shard),
+           "the crash-window tail must queue for the imminent steal, not error"
+
+    Fathom.Shard.checkin(pid, ref)
+    drain_and_wait(shard)
+  end
+
+  test "a held lease whose owner is LIVE (heartbeat far from expiry) errors immediately, never held",
+       %{shard: shard} do
+    Application.put_env(:fathom, :crash_failover_hold_ms, 5_000)
+    seed_durable(shard)
+
+    # A genuinely-live foreign owner keeps its heartbeat ~ttl ahead of now; holder_stealable_soon?
+    # is false, so we must NOT hold a request for it (that would be worse than the immediate error).
+    put_live_foreign_lock(shard, "live@node#1")
+    Storage.renew_heartbeat("live@node#1", 30_000)
+
+    {us, result} = :timer.tc(fn -> Shards.checkout(shard) end)
+
+    assert {:error, {:shard_held, "live@node#1"}} = result
+    assert us < 2_000_000, "a live holder must not enter the crash-hold budget (#{us} us)"
   end
 end

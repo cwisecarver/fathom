@@ -90,6 +90,37 @@ between the last check and idle never produces a clobbering write.
   blocks double-writes regardless, a healthy node can't be *stolen* from; a move is always a
   voluntary drain.
 
+## Failover RTO — the recovery-time floor (audit #21)
+
+The involuntary steal is **lazy and per-shard**: nothing proactively re-homes a dead node's shards.
+Each one is taken over only when the *next request* for it touches a survivor — and until the dead
+node's heartbeat ages past `ttl + steal_margin`, that survivor's `acquire_lease` returns `{:held}`.
+So after a **hard crash** (heartbeat not cleared), the dead node's whole keyspace slice has an **RTO
+floor ≈ `ttl + steal_margin`** (default `30s + 5s = 35s`), paid per shard, driven only by tenant
+traffic. Each tail shard re-pays its own steal + pull when first touched.
+
+**`:shard_lease_ttl_ms` is the RTO knob.** Lowering it shortens the failover window — at the cost of
+**pause-tolerance**: a GC/VM/hypervisor pause *longer than the TTL* makes a still-alive owner look
+dead, so a peer steals it and the paused node self-fences its un-flushed writes on resume (a pause →
+data-loss event). So the TTL trades failover speed against how long a node may freeze without being
+wrongly stolen; tune it to your infra's worst-case pause, not below. `steal_margin_ms` is the
+clock-skew guard on top (see `docs/single-writer.md` steady-state fence and audit #13).
+
+**What softens it today.** `Fathom.Shards.checkout` **holds + retries** a `{:held}` from a *crashed*
+owner (heartbeat frozen and aging out within the budget) for `:crash_failover_hold_ms` (default `5s`,
+0 disables), converting the **tail** of the TTL window into latency instead of client `503`s
+(`fathom.shards.crash_wait`). It's a tail conversion, not a fix: a request landing early in the
+window (its steal further out than the budget) still errors, and a *live* owner is never held (its
+heartbeat keeps advancing past the budget). The warm follower pre-positions bytes but **cannot**
+shorten the TTL wait.
+
+**The real fix (follow-up).** A **dead-node takeover sweeper** — a fleet-singleton (Oban, like
+`RebalanceJob`) that watches `heartbeat/<owner>` objects and, on confirmed death, enumerates the
+victim's recently-active shards and issues `warm`/open commands to survivors — would pay the
+`ttl + margin` window **once, at detection**, then fan out, instead of O(active) lazy per-request
+steals. It needs an ownership signal the directory doesn't record today (which node owns each shard
+lives in the S3 lock, not Postgres), so it's scoped separately (audit #21 lever 2).
+
 ## Durability / loss contract
 
 Durability is WAL crash-consistency + a **periodic, write-gated flush** to the store (a clean shard

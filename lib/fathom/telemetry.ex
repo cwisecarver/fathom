@@ -111,6 +111,11 @@ defmodule Fathom.Telemetry do
         description:
           "Checkouts that queued (held + retried) at a pinned handoff target during the source's drain window instead of erroring (#20) — a per-handoff burst is expected; a sustained rate means handoffs are draining slowly"
       ),
+      counter("fathom.shards.crash_wait.count",
+        event_name: [:fathom, :shards, :crash_wait],
+        description:
+          "Checkouts that queued (held + retried) at the TAIL of a crashed owner's lease-TTL window instead of erroring (#21) — a burst per hard node crash is expected. The RTO floor is :shard_lease_ttl_ms + steal_margin; this only converts the last :crash_failover_hold_ms of it to latency"
+      ),
       counter("fathom.shard.warm.promoted.count",
         event_name: [:fathom, :shard, :warm, :promoted],
         tags: [:result],

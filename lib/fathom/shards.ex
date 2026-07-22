@@ -33,6 +33,13 @@ defmodule Fathom.Shards do
   @initial_held_backoff_ms 50
   @max_held_backoff_ms 1_000
 
+  # Expert review #21: how long a checkout HOLDS + retries a `{:shard_held}` when the holder is a
+  # CRASHED node — heartbeat frozen and aging out within this window, so the steal is imminent. Turns
+  # the TAIL of the hard-crash TTL window (RTO floor ≈ :shard_lease_ttl_ms + steal_margin) into
+  # latency instead of client 503s. 0 disables. Separate from the handoff budget above — a crash and
+  # a voluntary handoff have different natures and an operator may want to tune them apart.
+  @default_crash_hold_ms 5_000
+
   @doc """
   Ensures `shard_id`'s coordinator is running and checks out the shard for the
   caller, returning `{:ok, coordinator_pid, ref, path}` (or `{:error, reason}` for
@@ -103,18 +110,56 @@ defmodule Fathom.Shards do
   # On the FIRST held error we decide once whether this is our in-flight handoff (one Overrides
   # read); if so we open a time-bounded retry window and carry the deadline so we don't re-query
   # Postgres per retry. A reverted handoff just exhausts the (bounded) budget and then errors.
-  defp held_retry(shard_id, attempts, nil, err) do
-    if handoff_held_budget_ms() > 0 and handoff_pin_here?(shard_id) do
-      :telemetry.execute([:fathom, :shards, :handoff_wait], %{count: 1}, %{shard_id: shard_id})
-      deadline = System.monotonic_time(:millisecond) + handoff_held_budget_ms()
-      backoff_held(shard_id, attempts, deadline, @initial_held_backoff_ms, err)
-    else
-      err
+  defp held_retry(shard_id, attempts, nil, {:error, {:shard_held, owner}} = err) do
+    cond do
+      # #20 — an in-flight handoff to THIS node: hold for the source's drain window.
+      handoff_held_budget_ms() > 0 and handoff_pin_here?(shard_id) ->
+        start_held_retry(shard_id, attempts, handoff_held_budget_ms(), :handoff_wait, err)
+
+      # #21 — a hard-crash failover: the holder's heartbeat is frozen (dead) and ages out within the
+      # budget, so the steal is imminent. Hold the TAIL of the TTL window as latency instead of a
+      # 503. A LIVE holder keeps renewing (its expiry stays ~ttl ahead > budget), so this never
+      # holds for one.
+      crash_failover_hold_ms() > 0 and holder_stealable_soon?(owner, crash_failover_hold_ms()) ->
+        start_held_retry(shard_id, attempts, crash_failover_hold_ms(), :crash_wait, err)
+
+      true ->
+        err
     end
   end
 
   defp held_retry(shard_id, attempts, {deadline, backoff}, err),
     do: backoff_held(shard_id, attempts, deadline, backoff, err)
+
+  defp start_held_retry(shard_id, attempts, budget, event, err) do
+    :telemetry.execute([:fathom, :shards, event], %{count: 1}, %{shard_id: shard_id})
+    deadline = System.monotonic_time(:millisecond) + budget
+    backoff_held(shard_id, attempts, deadline, @initial_held_backoff_ms, err)
+  end
+
+  # Whether the foreign holder's lease will become stealable within `budget` — its heartbeat expires
+  # (past the steal margin) inside the window. A crashed holder's heartbeat is frozen at crash+ttl,
+  # so as it ages this crosses into the budget (the crash-window TAIL); a LIVE holder keeps renewing,
+  # so its expiry stays ~ttl ahead of now and this is false (we never hold for a live owner). No
+  # heartbeat (legacy mode / cleared) ⇒ false: we can't cheaply tell dead-legacy from live-legacy, so
+  # surface the error rather than risk holding for a live legacy owner. Local clock is fine here — a
+  # skew just shifts the tail; the STEAL itself is fenced by acquire_lease's S3-Date check (#13).
+  defp holder_stealable_soon?(owner, budget) do
+    case Fathom.Shard.Storage.read_heartbeat(owner) do
+      {:ok, %{expires_at_ms: exp}} ->
+        exp + Fathom.Shard.Storage.steal_margin_ms() - System.system_time(:millisecond) <= budget
+
+      _ ->
+        false
+    end
+  rescue
+    _ -> false
+  catch
+    :exit, _ -> false
+  end
+
+  defp crash_failover_hold_ms,
+    do: Application.get_env(:fathom, :crash_failover_hold_ms, @default_crash_hold_ms)
 
   defp backoff_held(shard_id, attempts, deadline, backoff, err) do
     remaining = deadline - System.monotonic_time(:millisecond)
