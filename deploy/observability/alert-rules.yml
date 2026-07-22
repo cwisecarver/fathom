@@ -184,6 +184,43 @@ groups:
           description: "Background jobs are failing for 10m — the control plane may be stalling. Check Postgres health and the queue's worker logs."
           runbook: docs/runbooks/operations.md#runbook-postgres-directory--control-plane-is-down
 
+      - alert: FathomObanQueueBacklog
+        # The OTHER half of a stalling control plane (#18): jobs that DON'T RUN. The exception
+        # counter above stays flat when a queue is paused, or the backlog outpaces the concurrency
+        # limit — but the oldest runnable job just ages. > 10m unpicked for 10m is a real backlog
+        # (a per-shard migration is quick; nothing should sit available this long). (TUNE) per queue.
+        expr: max by (queue) (fathom_oban_queue_oldest_age_ms) > 600000
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Oban queue {{ $labels.queue }} is backlogged (oldest job > 10m unpicked)"
+          description: "A runnable job has sat in queue {{ $labels.queue }} for over 10m — the queue is paused or not draining, and NO exceptions are firing. Check `Oban` peer/queue state and Postgres."
+          runbook: docs/runbooks/operations.md#runbook-postgres-directory--control-plane-is-down
+
+      - alert: FathomRebalanceCronStalled
+        # A fleet-singleton cron that silently STOPPED (wedged Oban peer leadership) inserts no jobs
+        # and throws no exceptions. RebalanceJob runs every minute; > 2x its period means the leader
+        # isn't inserting. Only meaningful once rebalancing is enabled (the job is inert but still
+        # inserts+completes each minute), so pair with :rebalancer_enabled. (TUNE) to the schedule.
+        expr: max(fathom_oban_cron_age_ms{worker="Fathom.Rebalancer.RebalanceJob"}) > 120000
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "The rebalance cron hasn't inserted a job in > 2 minutes"
+          description: "RebalanceJob (every-minute fleet singleton) last inserted a job over 2m ago on every node — Oban peer leadership may be wedged, silently halting rebalance/reconcile/retirement. Check `Oban.Peer` leadership and Postgres."
+          runbook: docs/runbooks/operations.md#runbook-postgres-directory--control-plane-is-down
+
+      - alert: FathomReconcileCronStalled
+        # ReconcileJob is the hourly sweep that converges the cold migration tail; if its cron
+        # wedges, a schema rollout silently stops converging. > 2x the hourly period.
+        expr: max(fathom_oban_cron_age_ms{worker="Fathom.Migrator.ReconcileJob"}) > 7200000
+        for: 15m
+        labels: {severity: ticket}
+        annotations:
+          summary: "The reconcile cron hasn't inserted a job in > 2 hours"
+          description: "ReconcileJob (hourly fleet singleton) last inserted a job over 2h ago — the migration cold tail has stopped converging with zero exceptions. Check `Oban.Peer` leadership and Postgres."
+          runbook: docs/runbooks/operations.md#runbook-postgres-directory--control-plane-is-down
+
   # ---------------------------------------------------------------------------------------------
   # Rebalancer alerts (only meaningful once B1 is enabled — see docs/runbooks/rebalancer.md).
   - name: fathom-rebalancer

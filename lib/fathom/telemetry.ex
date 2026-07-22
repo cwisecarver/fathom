@@ -39,9 +39,28 @@ defmodule Fathom.Telemetry do
          ],
          period: 10_000,
          name: Fathom.ShardPoller}
-      ] ++ prometheus_children()
+      ] ++ oban_poller() ++ prometheus_children()
 
     Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  # The Oban control-plane health gauges (expert review #18) are the ONE measurement that queries
+  # Postgres, so they run on their own slower poller and only when the observability layer is on
+  # (Fathom.Admin.enabled?, off in test) — the fast 10s shard poller stays Postgres-free, and no
+  # poller touches the DB in test / when metrics are off. Every node polls the shared oban_jobs
+  # table (redundant but robust): if cron leadership wedges, live nodes still surface the growing
+  # queue depth + cron staleness.
+  defp oban_poller do
+    if Fathom.Admin.enabled?() do
+      [
+        {:telemetry_poller,
+         measurements: [{Fathom.Admin.Measurements, :oban_health, []}],
+         period: 30_000,
+         name: Fathom.ObanPoller}
+      ]
+    else
+      []
+    end
   end
 
   # In-process Prometheus reporter over metrics/0 — the metrics layer the admin dashboard reads
@@ -262,6 +281,40 @@ defmodule Fathom.Telemetry do
         tags: [:queue],
         description:
           "Oban job failures by queue — migrations/reconcile/rebalancer/retirement/tenant-lifecycle progress; sustained ⇒ control-plane stall (often a Postgres incident, see operations.md)"
+      ),
+
+      # Control plane — the OTHER half (#18): the exception counter catches jobs that FAIL; these
+      # catch jobs that DON'T RUN (a backlogged/paused queue, a wedged fleet-singleton cron leader).
+      # Low cardinality: one series per configured queue / per cron worker.
+      last_value("fathom.oban.queue.available",
+        event_name: [:fathom, :oban, :queue],
+        measurement: :available,
+        tags: [:queue],
+        description:
+          "Available (runnable, not yet picked up) jobs per queue — a rising floor ⇒ the queue isn't draining (paused, or depth outpacing the concurrency limit)"
+      ),
+      last_value("fathom.oban.queue.retryable",
+        event_name: [:fathom, :oban, :queue],
+        measurement: :retryable,
+        tags: [:queue],
+        description:
+          "Retryable (failed, awaiting backoff) jobs per queue — a rising floor ⇒ jobs are failing faster than they succeed"
+      ),
+      last_value("fathom.oban.queue.oldest_age_ms",
+        event_name: [:fathom, :oban, :queue],
+        measurement: :oldest_age_ms,
+        tags: [:queue],
+        unit: :millisecond,
+        description:
+          "Age of the oldest runnable (available) job per queue — high ⇒ the queue is backlogged/stalled and work is not being picked up (#18)"
+      ),
+      last_value("fathom.oban.cron.age_ms",
+        event_name: [:fathom, :oban, :cron],
+        measurement: :age_ms,
+        tags: [:worker],
+        unit: :millisecond,
+        description:
+          "Seconds since a fleet-singleton cron (reconcile/rebalance) last inserted a job — > 2× its period ⇒ leadership wedged and the cron silently stopped, zero exceptions (#18)"
       )
     ]
   end
