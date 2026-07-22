@@ -33,6 +33,14 @@ defmodule Fathom.Shards do
   @initial_held_backoff_ms 50
   @max_held_backoff_ms 1_000
 
+  # Node-level graceful drain (expert review #28). Defaults sized for the common ~60s SIGTERM grace:
+  # budget under 60s, a per-shard flush grace so a busy shard finishes its final flush before the
+  # deadline, and bounded fan-out concurrency so the drain doesn't fire every coordinator's flush at
+  # once (the #17 storm). All operator-tunable via config.
+  @default_drain_all_budget_ms 55_000
+  @default_drain_all_concurrency 16
+  @default_drain_all_flush_grace_ms 5_000
+
   # Expert review #21: how long a checkout HOLDS + retries a `{:shard_held}` when the holder is a
   # CRASHED node — heartbeat frozen and aging out within this window, so the steal is imminent. Turns
   # the TAIL of the hard-crash TTL window (RTO floor ≈ :shard_lease_ttl_ms + steal_margin) into
@@ -338,6 +346,72 @@ defmodule Fathom.Shards do
         end
     end
   end
+
+  @doc """
+  Node-level graceful drain (expert review #28): the ordered voluntary alternative to funnelling
+  every deploy / scale-down through the crash-adjacent supervisor-shutdown path. Marks this node
+  draining (`Fathom.HealthPlug.begin_draining/0`, so the LB deregisters it first), optionally waits
+  `:drain_lb_settle_ms` for the LB to notice, then fans out `request_drain` across every open
+  coordinator — refuse new checkouts → let in-flight streams finish → flush + release the lease + stop
+  — with bounded concurrency and a **bounded overall budget**. Returns `%{drained, busy, timed_out}`.
+
+  Each coordinator gets a slice of the remaining budget; the fan-out is bounded so the drain doesn't
+  fire every shard's flush simultaneously. Wire it as a release **pre-stop** (`bin/fathom rpc
+  "Fathom.Shards.drain_all()"`) ahead of SIGTERM — see `docs/runbooks/cluster.md`. It never
+  `end_draining`s: the node is on its way down, and a cancelled drain resets the flag explicitly.
+  """
+  @spec drain_all(pos_integer()) :: %{
+          drained: non_neg_integer(),
+          busy: non_neg_integer(),
+          timed_out: non_neg_integer()
+        }
+  def drain_all(budget_ms \\ drain_all_budget_ms()) do
+    Fathom.HealthPlug.begin_draining()
+    settle = drain_lb_settle_ms()
+    if settle > 0, do: Process.sleep(settle)
+
+    deadline = System.monotonic_time(:millisecond) + budget_ms
+    pids = Registry.select(@registry, [{{:_, :"$1", :_}, [], [:"$1"]}])
+
+    pids
+    |> Task.async_stream(
+      fn pid -> drain_pid(pid, max(0, deadline - System.monotonic_time(:millisecond))) end,
+      max_concurrency: drain_all_concurrency(),
+      timeout: :infinity,
+      ordered: false
+    )
+    |> Enum.reduce(%{drained: 0, busy: 0, timed_out: 0}, fn {:ok, outcome}, acc ->
+      Map.update!(acc, outcome, &(&1 + 1))
+    end)
+  end
+
+  # Drain one coordinator within `remaining` ms of budget. The coordinator waits for its streams up
+  # to `remaining - flush_grace`, then flushes + releases + stops within the grace, so it exits
+  # before the budget deadline and we observe `:drained`; a still-busy shard aborts (`:busy`) and one
+  # that neither finishes nor aborts in the window is `:timed_out` (left to the supervisor shutdown).
+  defp drain_pid(_pid, remaining) when remaining <= 0, do: :timed_out
+
+  defp drain_pid(pid, remaining) do
+    ref = Process.monitor(pid)
+    Fathom.Shard.request_drain(pid, max(0, remaining - drain_all_flush_grace_ms()), self())
+
+    case await_coordinator_exit(pid, ref, remaining) do
+      :ok -> :drained
+      {:error, :busy} -> :busy
+      _ -> :timed_out
+    end
+  end
+
+  defp drain_all_budget_ms,
+    do: Application.get_env(:fathom, :drain_all_budget_ms, @default_drain_all_budget_ms)
+
+  defp drain_all_concurrency,
+    do: Application.get_env(:fathom, :drain_all_concurrency, @default_drain_all_concurrency)
+
+  defp drain_all_flush_grace_ms,
+    do: Application.get_env(:fathom, :drain_all_flush_grace_ms, @default_drain_all_flush_grace_ms)
+
+  defp drain_lb_settle_ms, do: Application.get_env(:fathom, :drain_lb_settle_ms, 0)
 
   @doc """
   Force-stops `shard_id`'s coordinator for tenant deletion (#15). Unlike `drain/2`, it does

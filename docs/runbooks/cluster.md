@@ -156,3 +156,33 @@ follower's disk + revalidation cost buys almost nothing. **Size `:warm_cache_max
 hold a full dead peer's active set: `:warm_cache_max ≥ active_shards_per_node` (a warm copy costs
 its file on disk plus ~0 process/fd — it's disk-bound, so err generous). Watch
 `fathom.shard.warm.promoted{result="hit"}` to confirm failovers are landing on the warm path.
+
+## Graceful drain (rolling-deploy pre-stop) — audit #28
+
+A deploy or scale-down should NOT funnel through the crash-adjacent supervisor-shutdown path (burst
+flushes, hard-cut live streams, and — on ephemeral disk — real loss). `Fathom.Shards.drain_all/1` is
+the node-scope voluntary drain: it marks the node draining so `/health` returns **503** (the LB
+deregisters it and stops routing here first), then fans out `request_drain` across every open
+coordinator — refuse new checkouts → let in-flight streams finish → flush + release the lease + stop —
+with bounded concurrency and a bounded overall budget. It returns `%{drained, busy, timed_out}`.
+
+**Wire it as a release pre-stop, ahead of SIGTERM.** In your deploy orchestration (or a
+`rel/env.sh.eex` pre-stop hook), before stopping the node:
+
+```sh
+# 1. Stop the LB routing here + drain the open shards within a bounded budget.
+bin/fathom rpc 'IO.inspect(Fathom.Shards.drain_all())'
+# 2. THEN send SIGTERM / stop the release.
+bin/fathom stop
+```
+
+Set `:drain_lb_settle_ms` to your LB's health-probe interval so `drain_all` waits for the LB to
+notice the 503 before it drains (otherwise a request can still land mid-drain). Tune
+`:drain_all_budget_ms` (default 55s, keep under your orchestrator's SIGTERM grace),
+`:drain_all_concurrency` (default 16 — the fan-out width, so the drain doesn't fire every shard's
+flush at once), and `:drain_all_flush_grace_ms` (default 5s — the tail a busy shard needs to finish
+its final flush before the deadline). A clean drain reports `busy: 0, timed_out: 0`; a `timed_out`
+shard is left to the supervisor shutdown (raise the budget or lower per-node density). This is the
+structural companion to the busy-terminate flush fix (audit #2): together, a clean shutdown's
+deploy-time loss window is zero. Validating it against the chaos rig's rolling-deploy scenario and
+measuring the window with `mix fathom.rpo` is a follow-up.
