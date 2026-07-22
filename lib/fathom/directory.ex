@@ -198,6 +198,50 @@ defmodule Fathom.Directory do
     |> Repo.all()
   end
 
+  @doc """
+  Samples up to `n` **active** shards to restore-drill (expert review #24), least-recently-verified
+  first — `last_verified_at ASC NULLS FIRST`, so never-verified shards go before ones drilled long
+  ago, and the whole active fleet cycles through verification over time. Returns `shard_id` +
+  `schema_version` (the drill cross-checks the object's `user_version` against it).
+
+  There is deliberately **no index** on `last_verified_at` (it would tax the resolve/record hot path
+  for a gated, daily, bounded query — see the migration). So this is a sort over active shards; fine
+  at typical scale, and the drill's daily cadence absorbs it. An operator running the drill against
+  *millions* of active shards can add the index then.
+  """
+  @spec sample_for_drill(pos_integer()) :: [
+          %{shard_id: String.t(), schema_version: non_neg_integer()}
+        ]
+  def sample_for_drill(n) when is_integer(n) and n > 0 do
+    from(s in Shard,
+      where: s.status == "active",
+      order_by: [asc_nulls_first: s.last_verified_at],
+      limit: ^n,
+      select: %{shard_id: s.shard_id, schema_version: s.schema_version}
+    )
+    |> Repo.all()
+  end
+
+  @doc """
+  Records a restore-drill outcome (#24) on the shard's row: stamps `last_verified_at` (drives the
+  sampling weight) and `last_verify_status` (queryable durably). Returns how many rows were updated
+  (0 if the shard is gone). Best-effort — never raises the caller.
+  """
+  @spec record_verification(String.t(), String.t()) :: non_neg_integer()
+  def record_verification(shard_id, status) when is_binary(status) do
+    now = DateTime.utc_now()
+
+    {count, _} =
+      from(s in Shard, where: s.shard_id == ^shard_id)
+      |> Repo.update_all(
+        set: [last_verified_at: now, last_verify_status: status, updated_at: now]
+      )
+
+    count
+  rescue
+    _ -> 0
+  end
+
   @doc "Reads a shard's directory entry without recording an access."
   @spec get(String.t()) :: {:ok, Shard.t()} | :error
   def get(shard_id) do

@@ -54,6 +54,12 @@ defmodule Fathom.Directory.Shard do
     # is refused immediately.
     field :token_version_bumped_at, :utc_datetime_usec
 
+    # When the shard's durable object was last integrity-checked by the RestoreDrillJob (#24), and
+    # the outcome ("ok" / "corrupt" / "absent" / "sentinel" / "schema_mismatch" / "error"). NULL =
+    # never drilled; the drill samples least-recently-verified first (ASC NULLS FIRST).
+    field :last_verified_at, :utc_datetime_usec
+    field :last_verify_status, :string
+
     timestamps(type: :utc_datetime_usec)
   end
 

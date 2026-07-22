@@ -277,6 +277,12 @@ defmodule Fathom.Telemetry do
         description:
           "Standing count of quarantine files (.db.fenced/.forked/.corrupt) on this node's data dir (#23), polled by the TempReaper — a growing backlog means preserved acked-but-unflushed writes are piling up unrecovered; enumerate with `mix fathom.shard quarantines`"
       ),
+      counter("fathom.restore_drill.result.count",
+        event_name: [:fathom, :restore_drill, :result],
+        tags: [:status],
+        description:
+          "Automated restore-drill outcomes by status (#24): ok / corrupt / schema_mismatch / sentinel / absent / error. A durable object is fathom's only copy of a cold-tail tenant — corrupt/schema_mismatch/error means it's bad or unreachable and would surface only when the tenant returns; alert on those"
+      ),
 
       # Capacity / admission — the tenant-visible refusals.
       counter("fathom.shards.novel_rate_limited.count",

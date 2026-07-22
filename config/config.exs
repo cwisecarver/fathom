@@ -78,7 +78,11 @@ config :fathom, Oban,
     {Oban.Plugins.Cron,
      crontab: [
        {"0 * * * *", Fathom.Migrator.ReconcileJob},
-       {"* * * * *", Fathom.Rebalancer.RebalanceJob}
+       {"* * * * *", Fathom.Rebalancer.RebalanceJob},
+       # Automated sampled restore drill (#24): a fleet singleton (peer leadership) that verifies the
+       # least-recently-verified shards' durable objects daily. INERT unless `:restore_drill_sample`
+       # is set — it inserts+completes a no-op job/day until then (bounded by the Pruner).
+       {"0 6 * * *", Fathom.RestoreDrillJob}
      ]}
   ]
 

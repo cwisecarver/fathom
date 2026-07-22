@@ -48,6 +48,20 @@ groups:
           description: "Shard flushes have been erroring for 5m — the RPO is growing and un-flushed writes are at risk if the node is lost. Check S3 reachability, credentials, and bucket policy."
           runbook: docs/runbooks/operations.md#runbook-node-disk-full-shard_data_dir
 
+      - alert: FathomRestoreDrillFailure
+        # The automated restore drill (#24) found a durable object that is CORRUPT, of the wrong
+        # lineage (schema_version mismatch), or unpullable — a bad "backup" that would otherwise
+        # surface only when the (possibly-dormant) tenant returns. The durable object is fathom's
+        # only copy, so any occurrence is page-worthy. Only fires once the drill is enabled
+        # (:restore_drill_sample); `absent`/`sentinel` (brand-new, no data yet) are excluded.
+        expr: sum by (status) (increase(fathom_restore_drill_result_count{status=~"corrupt|schema_mismatch|error"}[1d])) > 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "Restore drill found a bad durable object ({{ $labels.status }})"
+          description: "The sampled restore drill classified a shard's durable object as {{ $labels.status }} — a cold-tail tenant's only copy is bad or unreachable. Find it via last_verify_status in the directory; recover from a snapshot/version if available (#12) before the tenant returns."
+          runbook: docs/runbooks/operations.md#runbook-postgres-directory--control-plane-is-down
+
       - alert: FathomUnflushedAgeHigh
         # The RPO exposure gauge. Rising oldest-unflushed age = flushes are failing silently (S3
         # trouble or a stuck coordinator). This is the "flush failure rate" signal the RPO gauge
