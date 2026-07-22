@@ -50,6 +50,20 @@ defmodule Fathom.Test.S3EtagStore do
     end
   end
 
+  @doc """
+  Force-set `key` to `body` at single (MD5) form, unconditionally (no If-Match).
+
+  Models an out-of-band write LANDING in the store between two of a caller's reads —
+  a dead owner's in-flight fenced flush, or another node's acquire→flush→release cycle
+  in the gap the takeover-revalidation lattice guards (expert review #30). Metadata is
+  cleared, as a fresh single-part PUT would.
+  """
+  def set_body(agent, key, body) do
+    Agent.update(agent, fn s ->
+      %{s | objects: Map.put(s.objects, key, %{body: body, form: :single, meta: %{}})}
+    end)
+  end
+
   def serve(%Plug.Conn{} = conn, agent) do
     {:ok, body, conn} = Plug.Conn.read_body(conn)
     key = strip_bucket(conn.request_path)
