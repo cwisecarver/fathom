@@ -1313,47 +1313,98 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   # Create the lock only if it does not exist (`If-None-Match: *`). `:exists` on a
-  # 412 — no extra read, the caller decides what to do next.
+  # 412 — no extra read, the caller decides what to do next. The PUT response's etag is
+  # carried in the lease (client-side only — encode_lease never serializes it) so
+  # renew/release can fence conditionally WITHOUT re-reading the lock: the old shape
+  # threw the etag away and re-GET'd the object we ourselves just wrote, one whole RTT
+  # per drain/renew (review 2026-07-23 #6 — the measured ~3.5-RTT drain's third trip).
   defp create_lock(shard_id, lease) do
     case Req.put(req(),
            url: lock_path(shard_id),
            body: Storage.encode_lease(lease),
            headers: [{"if-none-match", "*"}]
          ) do
-      {:ok, %{status: status}} when status in 200..299 -> {:ok, lease}
-      {:ok, %{status: 412}} -> :exists
-      {:ok, %{status: status}} -> {:error, {:s3_put_status, status}}
-      {:error, reason} -> {:error, reason}
-    end
-  end
+      {:ok, %{status: status, headers: headers}} when status in 200..299 ->
+        {:ok, put_lock_etag(lease, headers)}
 
-  @impl true
-  def renew_lease(shard_id, %{owner: owner, epoch: epoch}, ttl_ms) do
-    now = Storage.now_ms()
+      {:ok, %{status: 412}} ->
+        :exists
 
-    case get_lock(shard_id) do
-      {:ok, %{owner: ^owner, epoch: ^epoch}, etag} ->
-        case put_lock(shard_id, %{owner: owner, epoch: epoch, expires_at_ms: now + ttl_ms},
-               if_match: etag
-             ) do
-          {:ok, _} = ok -> ok
-          {:error, {:held, _}} -> {:error, :superseded}
-          {:error, :precondition_failed} -> {:error, :superseded}
-          err -> err
-        end
-
-      {:ok, _other, _etag} ->
-        {:error, :superseded}
-
-      :not_found ->
-        {:error, :superseded}
+      {:ok, %{status: status}} ->
+        {:error, {:s3_put_status, status}}
 
       {:error, reason} ->
         {:error, reason}
     end
   end
 
+  # Attach the lock object's etag from a successful lock-PUT response. Some stores could
+  # omit the header — then the lease simply has no cached etag and renew/release take the
+  # legacy read-then-fence path.
+  defp put_lock_etag(lease, headers) do
+    case etag(headers) do
+      etag when is_binary(etag) -> Map.put(lease, :lock_etag, etag)
+      _ -> lease
+    end
+  end
+
   @impl true
+  def renew_lease(shard_id, %{owner: owner, epoch: epoch} = lease, ttl_ms) do
+    now = Storage.now_ms()
+    renewed = %{owner: owner, epoch: epoch, expires_at_ms: now + ttl_ms}
+
+    case lease do
+      # Fast path (review 2026-07-23 #6): we cached the lock's etag when WE last wrote it
+      # (create/put/renew all return it), so renew is one conditional PUT — 1 RTT, not the
+      # legacy GET-then-PUT's 2. A 412 means the lock changed under us, which can only be
+      # another writer: superseded, exactly what the legacy read would have concluded.
+      %{lock_etag: etag} when is_binary(etag) ->
+        case put_lock(shard_id, renewed, if_match: etag) do
+          {:ok, _} = ok -> ok
+          {:error, {:held, _}} -> {:error, :superseded}
+          {:error, :precondition_failed} -> {:error, :superseded}
+          err -> err
+        end
+
+      # Legacy path — a lease with no cached etag (decoded from an old lock body, or the
+      # store omitted the header): read the lock to learn it, then fence the PUT.
+      _ ->
+        case get_lock(shard_id) do
+          {:ok, %{owner: ^owner, epoch: ^epoch}, etag} ->
+            case put_lock(shard_id, renewed, if_match: etag) do
+              {:ok, _} = ok -> ok
+              {:error, {:held, _}} -> {:error, :superseded}
+              {:error, :precondition_failed} -> {:error, :superseded}
+              err -> err
+            end
+
+          {:ok, _other, _etag} ->
+            {:error, :superseded}
+
+          :not_found ->
+            {:error, :superseded}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
+  end
+
+  @impl true
+  # Fast path (review 2026-07-23 #6): the lease carries the etag of the lock object WE last
+  # wrote, so release is one conditional DELETE — this was the drain path's third RTT (the
+  # GET below existed only to re-learn an etag the lock PUT had already returned). The fence
+  # semantics are identical: If-Match our own write, and a 412 means the lock is no longer
+  # ours (a stealer wrote in the gap — finding #22) so leave it and no-op.
+  def release_lease(shard_id, %{lock_etag: etag}) when is_binary(etag) do
+    case Req.delete(req(), url: lock_path(shard_id), headers: [{"if-match", etag}]) do
+      {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
+      {:ok, %{status: 412}} -> :ok
+      {:ok, %{status: status}} -> {:error, {:s3_delete_status, status}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   def release_lease(shard_id, %{owner: owner, epoch: epoch}) do
     case get_lock(shard_id) do
       {:ok, %{owner: ^owner, epoch: ^epoch}, etag} ->
@@ -1486,8 +1537,8 @@ defmodule Fathom.Shard.Storage.S3 do
            body: Storage.encode_lease(lease),
            headers: [{"if-match", etag}]
          ) do
-      {:ok, %{status: status}} when status in 200..299 ->
-        {:ok, lease}
+      {:ok, %{status: status, headers: headers}} when status in 200..299 ->
+        {:ok, put_lock_etag(lease, headers)}
 
       # Another node wrote between our read and our conditional write.
       {:ok, %{status: 412}} ->
