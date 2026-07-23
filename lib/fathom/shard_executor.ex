@@ -584,7 +584,13 @@ defmodule Fathom.ShardExecutor do
   # `sqlite3_stmt_readonly`, so use the leading DML keyword: a column-returning statement is
   # read-only unless it is a mutation.
   defp to_stmt_result(
-         %{columns: cols, rows: rows, num_changes: changes, last_insert_rowid: rowid},
+         %{
+           columns: cols,
+           rows: rows,
+           row_count: row_count,
+           num_changes: changes,
+           last_insert_rowid: rowid
+         },
          dml?
        ) do
     read_only? = cols != [] and not dml?
@@ -594,7 +600,9 @@ defmodule Fathom.ShardExecutor do
       rows: rows,
       affected_row_count: if(read_only?, do: 0, else: changes),
       last_insert_rowid: if(not read_only? and changes > 0, do: rowid, else: nil),
-      rows_read: length(rows),
+      # Counted once during collect — the old `length(rows)` here was a second full O(R)
+      # walk of the just-materialized list (review 2026-07-23 #16).
+      rows_read: row_count,
       rows_written: if(read_only?, do: 0, else: changes)
     }
   end

@@ -94,11 +94,12 @@ defmodule Fathom.Shard.Connection do
       try do
         with :ok <- Sqlite3.bind(stmt, args),
              {:ok, columns} <- Sqlite3.columns(conn, stmt),
-             {:ok, rows} <- collect(conn, stmt) do
+             {:ok, rows, row_count} <- collect(conn, stmt, row_cap()) do
           {:ok,
            %{
              columns: columns,
              rows: rows,
+             row_count: row_count,
              num_changes: changes(conn),
              last_insert_rowid: last_rowid(conn)
            }}
@@ -106,6 +107,16 @@ defmodule Fathom.Shard.Connection do
       after
         Sqlite3.release(conn, stmt)
       end
+    end
+  end
+
+  # Resolve `:query_max_rows` ONCE per query — the old shape re-read the app env inside every
+  # collect batch (a 200k-row result did ~4k redundant get_envs in one query's hot loop).
+  # Normalized here so collect's per-batch check is a bare integer comparison.
+  defp row_cap do
+    case Application.get_env(:fathom, :query_max_rows) do
+      cap when is_integer(cap) and cap > 0 -> cap
+      _ -> nil
     end
   end
 
@@ -211,6 +222,12 @@ defmodule Fathom.Shard.Connection do
     :ok
   end
 
+  # exqlite's default multi_step chunk is 50, so a 200k-row result cost 4,000 dirty-scheduler
+  # NIF round-trips; 500 amortizes the per-batch dispatch while a chunk stays cheap to build
+  # (review 2026-07-23 #12). The row cap below is enforced exactly (including the final batch),
+  # so the chunk size never changes what a capped query can materialize.
+  @multi_step_chunk 500
+
   # Assemble the result in O(R), not O(R²). `multi_step` returns rows in batches; the old
   # `acc ++ rows` copied the whole accumulator on every batch, so a large result cost
   # O(R²/batch) — measured at 1385 ms for 200k rows (see connection_test.exs), pathological
@@ -218,26 +235,29 @@ defmodule Fathom.Shard.Connection do
   # arrival order (O(1) prepend), then reverse + one-level concat once at the end (O(R), ~tens
   # of ms at 200k). `Enum.concat/1` joins the list of row-batches without recursing into a row
   # (a row is itself a list of column values), so row shape + order are preserved.
-  defp collect(conn, stmt, count \\ 0, batches \\ []) do
-    case Sqlite3.multi_step(conn, stmt) do
+  #
+  # Counts unconditionally and returns `{:ok, rows, count}` — the per-batch length sums to the
+  # same O(R) the executor's `length(rows)` walk paid AGAIN on the materialized list, so the
+  # count is now computed once here and threaded through (review 2026-07-23 #16). `cap` is the
+  # pre-resolved `:query_max_rows` (nil = uncapped): bound how much a single query can
+  # materialize in BEAM memory (a `SELECT *` on a large table, expert review 2026-07-14 #26),
+  # erroring instead of OOMing the node. Checked on EVERY batch including the final one, so
+  # enforcement is exact regardless of @multi_step_chunk.
+  defp collect(conn, stmt, cap, count \\ 0, batches \\ []) do
+    case Sqlite3.multi_step(conn, stmt, @multi_step_chunk) do
       {:rows, rows} ->
-        # Max-result-rows cap (expert review 2026-07-14 #26): bound how much a single query can
-        # materialize in BEAM memory (a `SELECT *` on a large table), erroring instead of OOMing
-        # the node. Only counts when `:query_max_rows` is set — no cap ⇒ no per-batch length walk.
-        case max_rows() do
-          cap when is_integer(cap) and cap > 0 ->
-            count = count + length(rows)
+        count = count + length(rows)
 
-            if count > cap,
-              do: {:error, {:too_many_rows, cap}},
-              else: collect(conn, stmt, count, [rows | batches])
-
-          _ ->
-            collect(conn, stmt, count, [rows | batches])
-        end
+        if is_integer(cap) and count > cap,
+          do: {:error, {:too_many_rows, cap}},
+          else: collect(conn, stmt, cap, count, [rows | batches])
 
       {:done, rows} ->
-        {:ok, [rows | batches] |> Enum.reverse() |> Enum.concat()}
+        count = count + length(rows)
+
+        if is_integer(cap) and count > cap,
+          do: {:error, {:too_many_rows, cap}},
+          else: {:ok, [rows | batches] |> Enum.reverse() |> Enum.concat(), count}
 
       :busy ->
         {:error, :busy}
@@ -248,7 +268,6 @@ defmodule Fathom.Shard.Connection do
   end
 
   defp timeout_ms, do: Application.get_env(:fathom, :query_timeout_ms)
-  defp max_rows, do: Application.get_env(:fathom, :query_max_rows)
 
   defp changes(conn) do
     case Sqlite3.changes(conn) do
