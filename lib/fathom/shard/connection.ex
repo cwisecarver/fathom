@@ -174,29 +174,26 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
-  # Run `fun` (the query) in THIS process while a cheap watchdog process interrupts `conn` if the
+  # Run `fun` (the query) in THIS process while a watchdog process interrupts `conn` if the
   # deadline passes — the running `multi_step` is a blocking dirty NIF, so only another process can
-  # interrupt it. A completed query cancels the watchdog; a spurious late interrupt on an
+  # interrupt it. A completed query disarms the watchdog; a spurious late interrupt on an
   # already-finished statement is a no-op, so a successful result is returned even then (we only
   # surface `:query_timeout` when the interrupt actually errored the query).
+  #
+  # ONE long-lived watchdog per connection, armed per query (review 2026-07-23 #26): the old
+  # shape spawned a fresh process per query — ~2–5 µs + a ~2.7 KB process heap + scheduler
+  # churn each, i.e. ~50k spawns/s of pure overhead at measured node throughput on exactly the
+  # co-tenancy deployments the timeout knob targets. Spawn cost now amortizes to once per
+  # connection; it lives in the owner's process dictionary beside the statement cache and dies
+  # with the owner (it monitors it) or at close/1.
   defp with_deadline(conn, ms, fun) do
-    parent = self()
     ref = make_ref()
+    watchdog = ensure_watchdog(conn)
+    send(watchdog, {:arm, ref, ms, self()})
 
-    watchdog =
-      spawn(fn ->
-        receive do
-          {:done, ^ref} -> :ok
-        after
-          ms ->
-            Sqlite3.interrupt(conn)
-            send(parent, {:timed_out, ref})
-        end
-      end)
-
-    # Always stop the watchdog, even if fun raises (Sqlite3.bind raises ArgumentError on a bad bind
+    # Always disarm, even if fun raises (Sqlite3.bind raises ArgumentError on a bad bind
     # value — the reason query/3 has a rescue). Without try/after the raise unwinds before the
-    # {:done, ref} send, leaving the watchdog alive to interrupt a LATER statement reusing this
+    # {:done, ref} send, leaving the watchdog armed to interrupt a LATER statement reusing this
     # connection `ms` later — a spurious FILO_QUERY_TIMEOUT on a healthy query (expert review
     # 2026-07-18 #13). The raise then propagates to query/3's rescue as before.
     result =
@@ -217,6 +214,76 @@ defmodule Fathom.Shard.Connection do
       {true, {:error, _}} -> {:error, :query_timeout}
       _ -> result
     end
+  end
+
+  defp ensure_watchdog(conn) do
+    key = {__MODULE__, :watchdog, conn}
+
+    case Process.get(key) do
+      pid when is_pid(pid) ->
+        # A dead watchdog (it can only die abnormally — e.g. interrupt on a torn-down conn)
+        # must not silently disable the deadline for the rest of the stream: replace it.
+        if Process.alive?(pid) do
+          pid
+        else
+          Process.delete(key)
+          ensure_watchdog(conn)
+        end
+
+      nil ->
+        owner = self()
+        pid = spawn(fn -> watchdog_init(conn, owner) end)
+        Process.put(key, pid)
+        pid
+    end
+  end
+
+  defp watchdog_init(conn, owner) do
+    mon = Process.monitor(owner)
+    watchdog_loop(conn, mon)
+  end
+
+  defp watchdog_loop(conn, mon) do
+    receive do
+      {:arm, ref, ms, parent} ->
+        receive do
+          {:done, ^ref} ->
+            :ok
+
+          {:DOWN, ^mon, :process, _, _} ->
+            exit(:normal)
+        after
+          ms ->
+            Sqlite3.interrupt(conn)
+            send(parent, {:timed_out, ref})
+
+            # Consume the guaranteed late {:done, ref} before the next arm (the interrupt
+            # errors the running step, so the executing after-clause always sends it) —
+            # blocking here is what makes a stale interrupt racing a NEWER statement
+            # structurally impossible, the same guarantee the per-query watchdog had.
+            receive do
+              {:done, ^ref} -> :ok
+              {:DOWN, ^mon, :process, _, _} -> exit(:normal)
+            end
+        end
+
+        watchdog_loop(conn, mon)
+
+      :stop ->
+        exit(:normal)
+
+      {:DOWN, ^mon, :process, _, _} ->
+        exit(:normal)
+    end
+  end
+
+  defp stop_watchdog(conn) do
+    case Process.delete({__MODULE__, :watchdog, conn}) do
+      nil -> :ok
+      pid -> send(pid, :stop)
+    end
+
+    :ok
   end
 
   @doc """
@@ -277,6 +344,7 @@ defmodule Fathom.Shard.Connection do
   @spec close(reference()) :: :ok
   def close(conn) do
     purge_stmt_cache(conn)
+    stop_watchdog(conn)
     Sqlite3.close(conn)
     :ok
   end

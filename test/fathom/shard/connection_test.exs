@@ -153,6 +153,36 @@ defmodule Fathom.Shard.ConnectionTest do
     assert Enum.map(rows, &hd/1) == ["keep", "keep2"]
   end
 
+  # Review 2026-07-23 #26: the query-deadline watchdog is now ONE long-lived process per
+  # connection, armed per query (was a fresh spawn per query). These pin the lifecycle the
+  # persistent shape must preserve: repeated timeouts on one connection each fire
+  # independently, and a healthy query between/after them is never spuriously interrupted
+  # (the 2026-07-18 #13 stale-interrupt guarantee, now enforced by the blocking
+  # late-done consume in watchdog_loop).
+  test "the per-connection watchdog re-arms across timeouts and healthy queries", %{conn: conn} do
+    prev = Application.get_env(:fathom, :query_timeout_ms)
+    Application.put_env(:fathom, :query_timeout_ms, 60)
+
+    on_exit(fn ->
+      if prev,
+        do: Application.put_env(:fathom, :query_timeout_ms, prev),
+        else: Application.delete_env(:fathom, :query_timeout_ms)
+    end)
+
+    # A recursive CTE big enough to blow a 60ms deadline.
+    slow = """
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 200000000)
+    SELECT count(*) FROM c
+    """
+
+    assert {:error, :query_timeout} = Connection.query(conn, slow, [])
+    # A healthy query right after the timeout runs clean on the same connection.
+    assert {:ok, %{rows: [[1]]}} = Connection.query(conn, "SELECT 1", [])
+    # A second timeout on the same (re-armed) watchdog fires independently.
+    assert {:error, :query_timeout} = Connection.query(conn, slow, [])
+    assert {:ok, %{rows: [[2]]}} = Connection.query(conn, "SELECT 2", [])
+  end
+
   @tag :bench
   test "repeated point-query throughput clears the statement-cache floor", %{conn: conn} do
     # Review 2026-07-23 #1 guard: 10k executions of one parameterized point SELECT. With the
