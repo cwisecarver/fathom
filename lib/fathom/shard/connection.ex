@@ -88,9 +88,11 @@ defmodule Fathom.Shard.Connection do
   end
 
   defp do_query(conn, sql, args) do
-    with {:ok, stmt} <- Sqlite3.prepare(conn, sql) do
-      # Always release the prepared statement — including on a bind/collect error or a row-cap
-      # abort — so a failed query never leaks a statement handle on the connection.
+    with {:ok, stmt} <- cached_stmt(conn, sql) do
+      # The statement is owned by this connection's cache — reset it (not release) when done,
+      # including on a bind/collect error or a row-cap abort. sqlite3_reset ends the statement's
+      # execution (releasing its locks / read-transaction hold, which release/finalize used to
+      # do) while keeping the compiled plan for the next execution of the same SQL.
       try do
         with :ok <- Sqlite3.bind(stmt, args),
              {:ok, columns} <- Sqlite3.columns(conn, stmt),
@@ -105,8 +107,60 @@ defmodule Fathom.Shard.Connection do
            }}
         end
       after
-        Sqlite3.release(conn, stmt)
+        Sqlite3.reset(stmt)
       end
+    end
+  end
+
+  # --- prepared-statement cache (review 2026-07-23 #1) -------------------------------------
+  #
+  # Every execution used to pay a full sqlite3_prepare_v2 parse+plan through the NIF —
+  # 5–50 µs, comparable to or larger than the step cost of the point reads/writes that
+  # dominate — even though ORM clients (Django) replay identical parameterized SQL on a
+  # stream for its whole life. Cache prepared statements per connection, keyed by the exact
+  # SQL string, LRU-capped. prepare_v2 statements auto-recompile on schema change, so no
+  # invalidation logic is needed.
+  #
+  # The cache lives in the OWNING process's dictionary keyed by the conn ref: a connection
+  # is single-owner by design (one per Hrana stream, used only by the stream process), so
+  # this is race-free, dies with the process (statement NIF resources are GC-finalized, and
+  # close is sqlite3_close_v2, which defers until they are), and keeps the executor-handle
+  # shape unchanged. `close/1` releases the cached statements explicitly for the orderly path.
+  @stmt_cache_cap 64
+
+  defp cached_stmt(conn, sql) do
+    key = {__MODULE__, :stmt_cache, conn}
+    {seq, cache} = Process.get(key, {0, %{}})
+
+    case cache do
+      %{^sql => {stmt, _stamp}} ->
+        Process.put(key, {seq + 1, Map.put(cache, sql, {stmt, seq + 1})})
+        {:ok, stmt}
+
+      _ ->
+        with {:ok, stmt} <- Sqlite3.prepare(conn, sql) do
+          cache = maybe_evict(conn, cache)
+          Process.put(key, {seq + 1, Map.put(cache, sql, {stmt, seq + 1})})
+          {:ok, stmt}
+        end
+    end
+  end
+
+  # At the cap, release the least-recently-used statement to make room. O(cap) scan, paid
+  # only on an over-cap miss — a workload cycling >64 distinct statements per stream is
+  # re-preparing anyway, exactly as before the cache.
+  defp maybe_evict(conn, cache) when map_size(cache) >= @stmt_cache_cap do
+    {lru_sql, {stmt, _stamp}} = Enum.min_by(cache, fn {_sql, {_stmt, stamp}} -> stamp end)
+    Sqlite3.release(conn, stmt)
+    Map.delete(cache, lru_sql)
+  end
+
+  defp maybe_evict(_conn, cache), do: cache
+
+  defp purge_stmt_cache(conn) do
+    case Process.delete({__MODULE__, :stmt_cache, conn}) do
+      {_seq, cache} -> Enum.each(cache, fn {_sql, {stmt, _}} -> Sqlite3.release(conn, stmt) end)
+      nil -> :ok
     end
   end
 
@@ -215,9 +269,14 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
-  @doc "Closes the connection."
+  @doc """
+  Closes the connection, releasing this process's cached prepared statements first.
+  (Statements cached by a process that died without closing are NIF resources —
+  they GC-finalize, and `sqlite3_close_v2` defers the close until they do.)
+  """
   @spec close(reference()) :: :ok
   def close(conn) do
+    purge_stmt_cache(conn)
     Sqlite3.close(conn)
     :ok
   end

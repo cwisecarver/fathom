@@ -86,6 +86,95 @@ defmodule Fathom.Shard.ConnectionTest do
     assert {:error, _} = Connection.query(conn, "INSERT INTO child (id, pid) VALUES (1, 999)", [])
   end
 
+  # --- prepared-statement cache (review 2026-07-23 #1) ---
+  # Every execution used to re-prepare (full parse+plan per query); statements are now cached
+  # per connection in the owning process, reset (not finalized) between executions. These pin
+  # the behavioral invariants the cache must preserve — same results on the hit path, distinct
+  # binds per execution, correct results after eviction, and a statement surviving an error.
+
+  test "repeated same-SQL executions return correct per-bind results (cache hit path)", %{
+    conn: conn
+  } do
+    seed(conn, 100)
+
+    # Same SQL string every time — after the first prepare these all hit the cached statement.
+    # Distinct args per execution pin that reset+rebind fully replaces the previous binding.
+    for i <- 1..100 do
+      assert {:ok, %{rows: [[^i, v]]}} =
+               Connection.query(conn, "SELECT id, v FROM t WHERE id = ?", [i])
+
+      assert v == "row-#{i}"
+    end
+
+    # A write through the cached-statement path is visible to the cached read statement
+    # (prepare_v2 statements see later data changes without re-preparing).
+    assert {:ok, _} = Connection.query(conn, "UPDATE t SET v = ? WHERE id = ?", ["patched", 7])
+
+    assert {:ok, %{rows: [[7, "patched"]]}} =
+             Connection.query(conn, "SELECT id, v FROM t WHERE id = ?", [7])
+  end
+
+  test "cycling more distinct statements than the cache cap still executes correctly", %{
+    conn: conn
+  } do
+    seed(conn, 3)
+
+    # >64 distinct SQL strings forces LRU eviction (released statements must not be reused);
+    # then re-run the earliest (evicted) statement — it re-prepares transparently.
+    for i <- 1..80 do
+      assert {:ok, %{rows: [[3]]}} =
+               Connection.query(conn, "SELECT count(*) FROM t -- v#{i}", [])
+    end
+
+    assert {:ok, %{rows: [[3]]}} = Connection.query(conn, "SELECT count(*) FROM t -- v1", [])
+  end
+
+  test "a cached statement survives an errored execution and runs again", %{conn: conn} do
+    :ok = Connection.exec(conn, "CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+    sql = "INSERT INTO u (id, v) VALUES (?, ?)"
+
+    assert {:ok, _} = Connection.query(conn, sql, [1, "a"])
+    # Constraint violation errors the execution; the reset in the after-block must leave the
+    # cached statement reusable, not poisoned.
+    assert {:error, _} = Connection.query(conn, sql, [1, "dupe"])
+    assert {:error, _} = Connection.query(conn, sql, [2, nil])
+    assert {:ok, _} = Connection.query(conn, sql, [2, "b"])
+    assert {:ok, %{rows: [[2]]}} = Connection.query(conn, "SELECT count(*) FROM u", [])
+  end
+
+  test "transactions work through cached BEGIN/COMMIT/ROLLBACK statements", %{conn: conn} do
+    for {v, commit?} <- [{"keep", true}, {"discard", false}, {"keep2", true}] do
+      assert {:ok, _} = Connection.query(conn, "BEGIN", [])
+      assert {:ok, _} = Connection.query(conn, "INSERT INTO t (v) VALUES (?)", [v])
+      assert {:ok, _} = Connection.query(conn, if(commit?, do: "COMMIT", else: "ROLLBACK"), [])
+    end
+
+    assert {:ok, %{rows: rows}} = Connection.query(conn, "SELECT v FROM t ORDER BY id", [])
+    assert Enum.map(rows, &hd/1) == ["keep", "keep2"]
+  end
+
+  @tag :bench
+  test "repeated point-query throughput clears the statement-cache floor", %{conn: conn} do
+    # Review 2026-07-23 #1 guard: 10k executions of one parameterized point SELECT. With the
+    # per-connection statement cache these skip prepare entirely after the first; an
+    # order-of-magnitude ceiling (not an exact latency) that a re-prepare-per-execution
+    # regression at ~5–50 µs/prepare would threaten on a loaded host.
+    seed(conn, 1_000)
+    sql = "SELECT id, v FROM t WHERE id = ?"
+    {:ok, _} = Connection.query(conn, sql, [1])
+
+    {us, :ok} =
+      :timer.tc(fn ->
+        for i <- 1..10_000 do
+          {:ok, %{rows: [_]}} = Connection.query(conn, sql, [rem(i, 1_000) + 1])
+        end
+
+        :ok
+      end)
+
+    assert us < 2_000_000, "10k cached point queries took #{div(us, 1000)}ms"
+  end
+
   @tag :bench
   test "large-result collect stays O(R), not O(R²)", %{conn: conn} do
     # Regression guard for the Phase-0 fix. The old `acc ++ rows` copied the whole accumulator
