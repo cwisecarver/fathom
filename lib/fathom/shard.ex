@@ -364,6 +364,10 @@ defmodule Fathom.Shard do
         conns: %{},
         idle_ms: idle_ms(),
         timer: nil,
+        # Monotonic-ms instant the shard last went idle (all connections checked in), or
+        # nil while busy — the coalesced idle-timer's comparison stamp (review 2026-07-23
+        # #17; see schedule_idle/1).
+        idle_since: nil,
         owner: owner,
         lease: lease,
         ttl_ms: ttl,
@@ -846,7 +850,10 @@ defmodule Fathom.Shard do
         ref = Process.monitor(caller)
         # The value carries the caller AND the call's op tag, so an abandon names
         # exactly one grant (round-2 #33) instead of every grant this pid holds.
-        state = %{cancel_idle(state) | conns: Map.put(state.conns, ref, {caller, op})}
+        # Clearing idle_since (not cancelling the timer) is what defers idle-stop: a
+        # pending timer fires as a cheap no-op/re-arm instead of paying a
+        # cancel_timer + send_after pair per stream cycle (review 2026-07-23 #17).
+        state = %{state | conns: Map.put(state.conns, ref, {caller, op}), idle_since: nil}
 
         # Publish the busy count so the at-capacity eviction probe skips this shard while it serves
         # (expert review #14) — otherwise a long-lived held stream ages to the LRU front but can't be
@@ -1080,11 +1087,29 @@ defmodule Fathom.Shard do
     {:noreply, resume_serving(state)}
   end
 
-  def handle_info(:idle_timeout, %{conns: conns} = state) when map_size(conns) == 0 do
-    {:stop, :normal, state}
-  end
+  # Coalesced idle deadline (review 2026-07-23 #17): the timer is armed at most once and
+  # compares against the idle_since stamp when it fires — stopping only after a full
+  # idle_ms of CONTINUOUS idleness (same contract as the old cancel/rearm-per-cycle
+  # shape, without the per-stream timer churn on the hottest shard's coordinator).
+  def handle_info(:idle_timeout, state) do
+    state = %{state | timer: nil}
+    now = System.monotonic_time(:millisecond)
 
-  def handle_info(:idle_timeout, state), do: {:noreply, state}
+    cond do
+      # Busy, draining, or the stamp was cleared by a checkout: no stop. The next
+      # release-to-idle arms a fresh timer.
+      map_size(state.conns) > 0 or state.draining or state.idle_since == nil ->
+        {:noreply, state}
+
+      now - state.idle_since >= state.idle_ms ->
+        {:stop, :normal, state}
+
+      # A newer stream cycle moved the stamp — re-arm for the remainder.
+      true ->
+        remaining = state.idle_ms - (now - state.idle_since)
+        {:noreply, %{state | timer: Process.send_after(self(), :idle_timeout, remaining)}}
+    end
+  end
 
   # The WriteCounter's table died with its owner and restarted empty (expert review
   # #14): every count is now 0 while our flushed_through watermark may be ahead, so a
@@ -2158,9 +2183,16 @@ defmodule Fathom.Shard do
   defp flush_backoff_ms,
     do: Application.get_env(:fathom, :shard_flush_backoff_ms, @default_flush_backoff_ms)
 
+  # Stamp the idle instant and arm ONE timer only when none is pending (review
+  # 2026-07-23 #17) — the :idle_timeout handler re-arms for the remainder when the
+  # stamp has moved, so a hot 1↔0 stream cycle pays a map put here instead of a
+  # cancel_timer + send_after pair on every cycle.
   defp schedule_idle(state) do
-    state = cancel_idle(state)
-    %{state | timer: Process.send_after(self(), :idle_timeout, state.idle_ms)}
+    state = %{state | idle_since: System.monotonic_time(:millisecond)}
+
+    if state.timer,
+      do: state,
+      else: %{state | timer: Process.send_after(self(), :idle_timeout, state.idle_ms)}
   end
 
   defp cancel_idle(%{timer: nil} = state), do: state

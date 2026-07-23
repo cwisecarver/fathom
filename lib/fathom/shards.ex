@@ -81,9 +81,11 @@ defmodule Fathom.Shards do
       # Per-shard load: the checkout (traffic) signal for the rebalancer. Lock-free
       # ETS bump, gated + off by default (see Fathom.ShardLoad).
       Fathom.ShardLoad.record_checkout(shard_id)
-      # Node-local recency for idle-eviction at capacity. Lock-free ETS insert, and a
-      # no-op unless a finite cap + :evict_idle_at_capacity make eviction reachable.
-      Fathom.Shards.Lru.touch(shard_id)
+      # Recency for idle-eviction has ONE writer — the coordinator's release/1 stamps it
+      # when the shard goes back to idle (review 2026-07-23 #17; a caller-side touch here
+      # double-stamped every cycle from a second process). While a stream is held the
+      # shard is busy-filtered from eviction anyway, so the release stamp is the one that
+      # defines its LRU order.
       {:ok, pid, ref, path}
     else
       # Expected in-flight handoff (expert review #20): the LB flips to the target BEFORE the
