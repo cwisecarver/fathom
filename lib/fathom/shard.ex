@@ -289,8 +289,18 @@ defmodule Fathom.Shard do
     # written, and released elsewhere still has its old file — quarantine it (and
     # re-pull) rather than adopt the store's current etag and clobber the newer
     # lineage with a stale fork.
-    warm? = File.exists?(path) and not quarantined_fork?(shard_id, path)
-    pull_task = if warm?, do: nil, else: start_pull(shard_id, path)
+    #
+    # The fork check's HEAD runs CONCURRENTLY with the lease acquire (review 2026-07-23
+    # #22): it ran sequentially before it, so a warm restart paid HEAD → lock PUT →
+    # post-lease HEAD = 3 serialized RTTs where a cold open pays ~1. Independent objects
+    # (`.db` HEAD vs `.lock` PUT) — the same overlap argument as the acquire∥pull below —
+    # and the verdict is consumed at exactly the same point (before any serving decision),
+    # so every quarantine/adopt branch is unchanged. The rare diverged-warm case now pulls
+    # sequentially after the acquire instead of overlapped — the common warm path drops to
+    # 2 RTTs (the post-lease re-check stays: it is the release-in-gap authority, round-2 #19).
+    file? = File.exists?(path)
+    fork_task = if file?, do: Task.async(fn -> quarantined_fork?(shard_id, path) end)
+    pull_task = if file?, do: nil, else: start_pull(shard_id, path)
 
     # Sample the heartbeat generation BEFORE acquire_lease. The fence's invariant is
     # "generation unchanged since acquire ⇒ no steal was possible," which only holds if the
@@ -304,6 +314,12 @@ defmodule Fathom.Shard do
     case Storage.acquire_lease(shard_id, owner, ttl) do
       {:ok, lease} ->
         emit_lease(:acquired, shard_id, %{epoch: lease.epoch})
+        # Consume the overlapped fork-check verdict here — the same pre-serving point the
+        # sequential check used. :infinity mirrors the old inline call (the HEAD carries the
+        # storage layer's own timeouts). A diverged local copy was quarantined by the task,
+        # so this open proceeds cold with a (late, rare-path) pull.
+        warm? = file? and not Task.await(fork_task, :infinity)
+        pull_task = pull_task || if warm?, do: nil, else: start_pull(shard_id, path)
         result = open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen)
         maybe_emit_cold_open(result, shard_id, warm?, open_started)
         result
@@ -312,15 +328,23 @@ defmodule Fathom.Shard do
       # restarted — a held shard must stay down, not restart-loop.
       {:error, {:held, holder}} ->
         emit_lease(:held, shard_id, %{holder: holder})
+        abandon_fork_check(fork_task)
         abandon_pull(pull_task, path)
         {:stop, {:shutdown, {:shard_held, holder}}, state}
 
       # Fail closed: without a confirmed lease we must not open the shard.
       {:error, reason} ->
+        abandon_fork_check(fork_task)
         abandon_pull(pull_task, path)
         {:stop, {:shutdown, {:lease_unavailable, reason}}, state}
     end
   end
+
+  # Stop an in-flight overlapped fork check on the no-open paths. Its only side effect
+  # (quarantining a diverged copy) is one the sequential pre-lease check also produced
+  # before a refused acquire, so completing or aborting mid-flight are both safe.
+  defp abandon_fork_check(nil), do: :ok
+  defp abandon_fork_check(task), do: Task.shutdown(task, :brutal_kill)
 
   defp open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen) do
     with {:ok, etag0} <- await_pull(pull_task, path, shard_id),
