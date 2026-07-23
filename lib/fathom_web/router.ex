@@ -52,9 +52,10 @@ defmodule FathomWeb.Router do
   end
 
   # Tenant provisioning control-plane (#21): JSON create/list/get/delete, behind the same admin
-  # BasicAuth. On :4000, separate from the Hrana data port.
+  # BasicAuth. On :4000, separate from the Hrana data port. `:api_rate_limit` (expert review #34)
+  # runs BEFORE auth so an unauthenticated flood is throttled too.
   scope "/api", FathomWeb.Api do
-    pipe_through [:api, :api_auth]
+    pipe_through [:api, :api_rate_limit, :api_auth]
 
     post "/tenants", TenantController, :create
     get "/tenants", TenantController, :index
@@ -113,22 +114,115 @@ defmodule FathomWeb.Router do
     end
   end
 
-  # BasicAuth gate for /admin. Order-independent read of the `:admin_auth` keyword; challenges
-  # (401) on a bad credential via Plug.BasicAuth, and fails closed (503) when unconfigured.
+  # BasicAuth gate for /admin (and the /api BasicAuth fallback). Order-independent read of the
+  # `:admin_auth` keyword; challenges (401) on a bad credential via Plug.BasicAuth, and fails closed
+  # (503) when unconfigured. A per-source-IP failed-attempt throttle (expert review #34, config-gated
+  # `:admin_auth_max_failures`, off by default) locks out an IP with 429 after too many failures in
+  # the window, so the one shared admin password (#8) isn't online-brute-forceable. Baked in here so
+  # BOTH the `:admin_auth` pipeline and the `api_auth` BasicAuth fallback are covered.
   defp require_admin_auth(conn, _opts) do
     creds = Application.get_env(:fathom, :admin_auth, [])
     user = creds[:username]
     pass = creds[:password]
 
-    if is_binary(user) and is_binary(pass) do
-      Plug.BasicAuth.basic_auth(conn, username: user, password: pass)
-    else
-      conn
-      |> Plug.Conn.put_resp_content_type("text/plain")
-      |> Plug.Conn.send_resp(503, "admin dashboard not configured (set ADMIN_USER/ADMIN_PASS)")
-      |> Plug.Conn.halt()
+    cond do
+      not (is_binary(user) and is_binary(pass)) ->
+        conn
+        |> Plug.Conn.put_resp_content_type("text/plain")
+        |> Plug.Conn.send_resp(503, "admin dashboard not configured (set ADMIN_USER/ADMIN_PASS)")
+        |> Plug.Conn.halt()
+
+      admin_auth_blocked?(conn) ->
+        :telemetry.execute([:fathom, :admin_auth, :blocked], %{count: 1}, %{})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("text/plain")
+        |> Plug.Conn.send_resp(429, "too many failed admin authentication attempts; retry later")
+        |> Plug.Conn.halt()
+
+      true ->
+        conn
+        |> Plug.BasicAuth.basic_auth(username: user, password: pass)
+        |> record_admin_auth_result()
     end
   end
+
+  defp admin_auth_blocked?(conn) do
+    case admin_fail_limit() do
+      nil ->
+        false
+
+      limit ->
+        Fathom.RateLimiter.count(:admin_auth, client_ip(conn), admin_fail_window()) >= limit
+    end
+  end
+
+  # After Plug.BasicAuth: a halt with 401 is a failed credential (count it); an unhalted conn is a
+  # success (clear the IP's failure count). A 503 (unconfigured) never reaches here.
+  defp record_admin_auth_result(conn) do
+    case admin_fail_limit() do
+      nil ->
+        conn
+
+      limit ->
+        cond do
+          conn.halted and conn.status == 401 ->
+            new_count = Fathom.RateLimiter.bump(:admin_auth, client_ip(conn), admin_fail_window())
+            :telemetry.execute([:fathom, :admin_auth, :failed], %{count: 1}, %{})
+
+            # Audit ONLY the lockout transition (the attempt that crosses the threshold), never every
+            # attempt — a brute-force flood must not amplify into a Postgres audit-write flood. The
+            # high-frequency per-attempt signal is the telemetry counter above.
+            if new_count == limit do
+              Fathom.Audit.log(conn, :admin_auth_locked_out, nil, :blocked, %{failures: new_count})
+            end
+
+            conn
+
+          not conn.halted ->
+            Fathom.RateLimiter.forget(:admin_auth, client_ip(conn))
+            conn
+
+          true ->
+            conn
+        end
+    end
+  end
+
+  # Per-source-IP request-rate limit for the /api control plane (expert review #34, config-gated
+  # `:api_rate_limit`, off by default) so an authenticated-but-hostile or buggy client can't hammer
+  # expensive ops (list/export/fork) unbounded. NovelLimiter protects only novel data-path minting.
+  defp api_rate_limit(conn, _opts) do
+    case api_rate_limit_config() do
+      nil ->
+        conn
+
+      limit ->
+        case Fathom.RateLimiter.check(:api, client_ip(conn), limit, api_rate_window()) do
+          :ok ->
+            conn
+
+          :limited ->
+            :telemetry.execute([:fathom, :api, :rate_limited], %{count: 1}, %{})
+
+            conn
+            |> Plug.Conn.put_resp_content_type("application/json")
+            |> Plug.Conn.send_resp(
+              429,
+              ~s({"error":"rate_limited","message":"control-plane rate limit exceeded"})
+            )
+            |> Plug.Conn.halt()
+        end
+    end
+  end
+
+  # Throttle config — all off by default (nil); prod enables via runtime.exs (ADMIN_AUTH_MAX_FAILURES
+  # / API_RATE_LIMIT). Windows default in code so only the limits need setting.
+  defp admin_fail_limit, do: Application.get_env(:fathom, :admin_auth_max_failures)
+  defp admin_fail_window, do: Application.get_env(:fathom, :admin_auth_window_ms, 300_000)
+  defp api_rate_limit_config, do: Application.get_env(:fathom, :api_rate_limit)
+  defp api_rate_window, do: Application.get_env(:fathom, :api_rate_window_ms, 60_000)
+  defp client_ip(conn), do: conn.remote_ip
 
   # The Hrana (libSQL) endpoint is served by Filo on its own listener (see
   # Fathom.Application.hrana_listener/0), not through this router.

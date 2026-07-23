@@ -249,6 +249,10 @@ defmodule Fathom.Application do
       Fathom.Repo,
       {DNSCluster, query: Application.get_env(:fathom, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Fathom.PubSub},
+      # Node-local ETS fixed-window counter behind the control-plane throttles (expert review #34):
+      # admin BasicAuth brute-force lockout + the /api request-rate limit. No deps (just owns the
+      # table + sweeps it), so it comes up early, before the endpoint accepts requests.
+      Fathom.RateLimiter,
       {Oban, Application.fetch_env!(:fathom, Oban)}
     ]
   end

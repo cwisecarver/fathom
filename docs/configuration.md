@@ -83,6 +83,10 @@ config; diff from it.
 | `ADMIN_PASS` | dev default `admin` | BasicAuth password for the above. | Change from `admin`. It gates tenant provisioning/deletion and the metrics scrape. |
 | `WEB_BIND_IP` | per-env (dev loopback) | Bind IP for the web endpoint (e.g. `0.0.0.0` for LAN). | On `0.0.0.0` the dashboard is reachable on every interface with the BasicAuth creds — set real creds first. |
 | `WEB_INSECURE_LOCAL` | unset (SSL forced) | **Build-time** flag (compile-time in `config/prod.exs`): turns off `force_ssl` + the LiveView WS origin check for a plaintext LAN/localhost dashboard. | **Never build a real deployment with it.** Eval/chaos only. It's a Docker build-arg, not a runtime env. |
+| `ADMIN_AUTH_MAX_FAILURES` | `20` (prod) / off (dev/test) | Lock out a source IP with 429 after this many failed admin BasicAuth attempts within the window (`Fathom.RateLimiter`, review #34). `0` disables. | Brute-force protection for the one shared admin password — the Hrana token path is HMAC-verified and not in scope. Per-IP, so behind a proxy it caps failures per proxy IP; keep generous enough not to lock out a fat-fingered operator. |
+| `ADMIN_AUTH_WINDOW_MS` | `300000` (5 min) | The sliding window over which failed admin auths are counted. | Larger = stricter (failures accumulate longer). |
+| `API_RATE_LIMIT` | `120` (prod) / off (dev/test) | Per-source-IP request cap on the `/api` control plane per window (review #34); over budget → 429 before auth runs. `0` disables. | Stops a hostile/buggy client hammering expensive ops (list/export/fork). `NovelLimiter` only protects novel *data-path* minting, not `/api`. Size above legitimate operator/CI burst. |
+| `API_RATE_WINDOW_MS` | `60000` (1 min) | The window for `API_RATE_LIMIT`. | — |
 
 ## Observability
 

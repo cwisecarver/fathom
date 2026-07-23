@@ -303,6 +303,25 @@ defmodule Fathom.Telemetry do
           "A node heartbeat lapsed (renewal didn't land within the TTL margin) — its shards become stealable; sustained ⇒ S3 reachability / mass self-fence risk"
       ),
 
+      # Control-plane abuse throttles (#34): the admin BasicAuth brute-force lockout + the /api
+      # request-rate limit. High-frequency security signals live here (not the Postgres audit log,
+      # which would amplify a flood) — a rising floor ⇒ a brute-force / hammering attempt in progress.
+      counter("fathom.admin_auth.failed.count",
+        event_name: [:fathom, :admin_auth, :failed],
+        description:
+          "Failed admin-password (BasicAuth) attempts — the brute-force signal for the one shared admin credential (#8/#34)"
+      ),
+      counter("fathom.admin_auth.blocked.count",
+        event_name: [:fathom, :admin_auth, :blocked],
+        description:
+          "Admin-auth requests refused with 429 because the source IP is locked out (too many failures in the window) (#34)"
+      ),
+      counter("fathom.api.rate_limited.count",
+        event_name: [:fathom, :api, :rate_limited],
+        description:
+          "Control-plane (/api) requests refused with 429 for exceeding the per-IP rate limit (#34)"
+      ),
+
       # Lifecycle deny-set boot-load health (#33): the tombstone (410) / suspend (403) admission
       # gates load from the directory at boot and fast-retry a failed load (1s→30s) instead of
       # silently waiting the 5-min refresh. This counter fires on every retry the set is still

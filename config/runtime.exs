@@ -391,6 +391,27 @@ if config_env() == :prod do
     config :fathom, :novel_shard_burst, String.to_integer(burst)
   end
 
+  # Control-plane abuse throttles (#34; see Fathom.RateLimiter). ON by default in prod with
+  # generous limits — brute-force / hammering protection should not be opt-in — tunable via env,
+  # `=0` disables. The Hrana token path is HMAC-verified (not brute-forceable); these guard the
+  # one shared admin password (#8) and the expensive /api ops (list/export/fork).
+  #
+  # Admin BasicAuth: lock out a source IP after this many failed attempts within the window.
+  admin_fail_max = String.to_integer(System.get_env("ADMIN_AUTH_MAX_FAILURES", "20"))
+  if admin_fail_max > 0, do: config(:fathom, :admin_auth_max_failures, admin_fail_max)
+
+  if window = System.get_env("ADMIN_AUTH_WINDOW_MS") do
+    config :fathom, :admin_auth_window_ms, String.to_integer(window)
+  end
+
+  # /api per-IP request rate: this many requests per window before 429.
+  api_rate = String.to_integer(System.get_env("API_RATE_LIMIT", "120"))
+  if api_rate > 0, do: config(:fathom, :api_rate_limit, api_rate)
+
+  if window = System.get_env("API_RATE_WINDOW_MS") do
+    config :fathom, :api_rate_window_ms, String.to_integer(window)
+  end
+
   # Fork-from-template (finding #10): birth admitted NOVEL shards at the fleet HEAD from
   # the retained template@HEAD snapshot (mix fathom.snapshot template-head). Off by
   # default; enable only with a template + snapshot in place. Fork failures fall back to
