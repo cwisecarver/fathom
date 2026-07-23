@@ -120,6 +120,51 @@ defmodule Fathom.Shard.WarmFollowerTest do
     assert WarmFollower.cached_etag(a) == etag
   end
 
+  # Review 2026-07-23 #15: revalidation used to be one conditional GET per cached shard
+  # per poll — request-bound at exactly the scale warm capacity should be disk-bound. A
+  # cached shard whose directory last_flushed_at hasn't advanced past its last validation
+  # is now skipped without touching storage. Proven behaviorally with FaultyStorage: with
+  # a :pull fault injected, a SKIPPED shard stays cached (storage never consulted), while
+  # pre-fix the revalidation hit the fault and dropped it from the cache. A flush-signal
+  # advance re-checks; shards with no signal (NULL last_flushed_at) revalidate every poll
+  # exactly as before (every other test in this file runs that way).
+  test "an unflushed-since-validation shard skips the storage round-trip (#15)" do
+    # Keep the id out of the rolling force-check slice for the first few cycles (the
+    # follower's init refresh is cycle 1; our explicit refreshes are 2..4).
+    id =
+      Enum.find(Stream.map(1..1000, &"warm_skip_#{uniq()}_#{&1}"), fn cand ->
+        :erlang.phash2(cand, 10) not in [1, 2, 3, 4]
+      end)
+
+    seed_shard(id)
+    assert Directory.record_flush_batch([{id, DateTime.utc_now()}]) >= 1
+
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    on_exit(fn -> restore_env(:shard_storage, prev_storage) end)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    pid = start_supervised!(WarmFollower)
+    # Cycle 2: normal pull — cached, and the flush stamp is recorded as the baseline.
+    assert id in refresh(pid)
+
+    # Cycle 3: storage now FAILS every pull. The flush signal hasn't advanced, so the
+    # follower must skip the round-trip entirely — the shard stays cached. Pre-fix this
+    # revalidated, hit the fault, and dropped the shard.
+    Application.put_env(:fathom, :storage_fault, :pull)
+    on_exit(fn -> Application.delete_env(:fathom, :storage_fault) end)
+
+    assert id in refresh(pid),
+           "an unflushed-since-validation shard must not touch storage on the poll (#15)"
+
+    # Cycle 4: the owner flushed (signal advances) — the follower must re-check, hit the
+    # (still-faulted) storage, and drop the shard: the skip never masks a real change.
+    assert Directory.record_flush_batch([{id, DateTime.add(DateTime.utc_now(), 5)}]) >= 1
+    refute id in refresh(pid)
+  end
+
+  defp restore_env(key, nil), do: Application.delete_env(:fathom, key)
+  defp restore_env(key, val), do: Application.put_env(:fathom, key, val)
+
   test "eviction drops the etag sidecar with the cached file" do
     a = seed_shard("warm_etagevict_#{uniq()}")
 

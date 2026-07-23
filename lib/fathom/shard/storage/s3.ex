@@ -670,7 +670,13 @@ defmodule Fathom.Shard.Storage.S3 do
 
   defp do_download(url, local_path, headers, opts, attempts_left) do
     tmp = "#{local_path}.dl.#{System.unique_integer([:positive])}"
-    {:ok, fd} = File.open(tmp, [:write, :raw, :binary])
+    # The temp file/fd is created LAZILY on the first 200 data chunk (review 2026-07-23
+    # #15b): a 304/404 has no body, and the eager open cost every warm-follower
+    # revalidation a create/open/close/rm disk cycle per 304 — pure churn at
+    # O(cached)/poll. The fd rides this process's dictionary (the `into` fun runs in the
+    # calling process) so the after-block can close it on ANY exit, including a transport
+    # error where Req returns no response to carry it.
+    fd_key = {__MODULE__, :dl_fd, tmp}
 
     # try/after (expert review round-2 #27): `:ok = IO.binwrite` RAISES on
     # ENOSPC/EIO mid-stream, which previously skipped both the close and the rm —
@@ -681,6 +687,17 @@ defmodule Fathom.Shard.Storage.S3 do
     try do
       into = fn {:data, chunk}, {req, resp} ->
         if resp.status == 200 do
+          fd =
+            case Process.get(fd_key) do
+              nil ->
+                {:ok, fd} = File.open(tmp, [:write, :raw, :binary])
+                Process.put(fd_key, fd)
+                fd
+
+              fd ->
+                fd
+            end
+
           :ok = IO.binwrite(fd, chunk)
           md5 = resp.private[:fathom_md5] || :crypto.hash_init(:md5)
           resp = Req.Response.put_private(resp, :fathom_md5, :crypto.hash_update(md5, chunk))
@@ -691,7 +708,11 @@ defmodule Fathom.Shard.Storage.S3 do
       end
 
       result = Req.get(req(), url: url, headers: headers, into: into, retry: false)
-      :ok = File.close(fd)
+
+      case Process.get(fd_key) do
+        nil -> :ok
+        fd -> :ok = File.close(fd)
+      end
 
       case result do
         {:ok, %{status: 200} = resp} ->
@@ -703,6 +724,9 @@ defmodule Fathom.Shard.Storage.S3 do
               {:sentinel, etag(resp.headers)}
 
             true ->
+              # A 200 with an empty body never opened the temp — materialize the empty
+              # file so the promote below behaves exactly as the eager-open code did.
+              if Process.get(fd_key) == nil, do: File.touch(tmp)
               digest = :crypto.hash_final(resp.private[:fathom_md5] || :crypto.hash_init(:md5))
 
               # Prefer the etag-form-independent metadata hash (#17); fall back to the etag-MD5
@@ -737,7 +761,11 @@ defmodule Fathom.Shard.Storage.S3 do
           retry_or({:error, reason}, url, local_path, headers, opts, attempts_left)
       end
     after
-      _ = File.close(fd)
+      case Process.delete(fd_key) do
+        nil -> :ok
+        fd -> _ = File.close(fd)
+      end
+
       File.rm(tmp)
     end
   end

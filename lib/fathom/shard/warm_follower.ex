@@ -16,11 +16,24 @@ defmodule Fathom.Shard.WarmFollower do
   Because the cache may lag the owner's latest flush, a cached copy is **never served
   as-is**: each pull goes through `Storage.pull_if_changed/3` and records the object's
   etag in a `<shard>.db.etag` sidecar, and at failover the coordinator revalidates that
-  etag against the store before promoting the cache (`Fathom.Shard.start_pull` — H2). To
-  keep the etag current, every poll **revalidates the whole cached set** (a conditional
-  GET per cached shard: a cheap 304 when unchanged, a re-pull when the owner has
-  flushed), so a failover promotion lands on the 304 fast path instead of a full cold
-  re-pull. That cost is O(cached) per poll, not O(fleet).
+  etag against the store before promoting the cache (`Fathom.Shard.start_pull` — H2).
+
+  ## Revalidation rides the directory's flush signal, not a GET-per-shard poll
+
+  Keeping etags current used to mean one conditional GET per cached shard per poll —
+  request-bound at exactly the scale warm capacity is supposed to be disk-bound (10k
+  cached ⇒ 1,000 GET/s/node of steady-state 304s; review 2026-07-23 #15). The directory
+  already persists **`last_flushed_at`** per shard (review #28), and `active_recent/1`
+  returns it in the same read the follower already does each poll — the exact "did the
+  owner flush since my pull" signal. So a cached shard whose `last_flushed_at` hasn't
+  advanced past the value recorded at its last validation is **skipped**: the GET count
+  tracks *flushes since the last poll*, not cache size. Two belts keep it honest: a
+  shard with no flush signal (NULL `last_flushed_at` — never flushed, or the signal was
+  dropped in a Postgres outage window) revalidates every poll exactly as before, and a
+  rolling 1-in-10 slice of the cached set is force-revalidated each cycle regardless, so
+  a lost signal bounds staleness at ~10 polls instead of forever. The failover
+  promotion's own freshness check is unchanged — this loop is a cache-freshness
+  optimization, never the serving authority.
 
   Gated by `:warm_follower` (off by default; a node opts in to the standby role) and
   bounded by `:warm_cache_max`. Refreshed every `:warm_poll_ms` from
@@ -56,6 +69,10 @@ defmodule Fathom.Shard.WarmFollower do
   # re-warm what we just idle-dropped). Outlasts a routine idle→reopen gap; a real LB
   # remap lapses it so the shard becomes a warmable failover target again.
   @default_home_retention_ms 60_000
+  # The rolling force-revalidation belt (see the moduledoc): each cycle force-checks the
+  # 1/@sweep_cycles slice of ids whose hash matches the cycle, so a shard whose flush
+  # signal was lost is at most ~@sweep_cycles polls stale.
+  @sweep_cycles 10
 
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -187,6 +204,11 @@ defmodule Fathom.Shard.WarmFollower do
        cached: MapSet.new(),
        # shard_id => monotonic-ms of the last refresh that saw this node own it
        recent_owned: %{},
+       # shard_id => the directory last_flushed_at observed when this shard was last
+       # revalidated against storage — the skip signal (review 2026-07-23 #15).
+       validated_flush: %{},
+       # Monotonic refresh counter driving the rolling force-revalidation slice.
+       cycle: 0,
        timer: nil
      }, {:continue, :refresh}}
   end
@@ -221,21 +243,52 @@ defmodule Fathom.Shard.WarmFollower do
     recent_owned = refresh_home(state.recent_owned, state.home_retention_ms)
     home = MapSet.new(Map.keys(recent_owned))
 
-    target = target_set(state.cache_max, home)
+    targets = target_rows(state.cache_max, home)
+    target = MapSet.new(targets, fn {id, _lfa} -> id end)
     to_evict = MapSet.difference(state.cached, target)
 
     Enum.each(to_evict, &evict/1)
 
-    # Revalidate the WHOLE target set each cycle, not just the newly-added shards:
-    # already-cached shards present their stored etag, so a `pull_if_changed` is a cheap
-    # 304 (no body) when the owner hasn't flushed since, or a re-pull when it has.
-    # Keeping caches current is what makes a failover promotion hit the 304 fast path
-    # instead of a full cold re-pull — without it the cache goes stale between the one
-    # initial pull and failover, and the warm-standby win never materializes. Cost is
-    # bounded to O(cached) conditional GETs per poll, not O(fleet).
-    cached = pull_all(target)
+    # Revalidate what the directory says COULD have moved (see the moduledoc): an
+    # already-cached shard whose last_flushed_at hasn't advanced past its last validation
+    # is skipped outright — no conditional GET — unless it lands in this cycle's rolling
+    # force-check slice. Everything else (new, flush-advanced, or signal-less shards)
+    # presents its stored etag, so a `pull_if_changed` is a cheap 304 (no body) when
+    # unchanged, or a re-pull when the owner flushed. Keeping caches current is what makes
+    # a failover promotion hit the 304 fast path instead of a full cold re-pull.
+    cycle = state.cycle + 1
 
-    schedule(%{state | cached: cached, recent_owned: recent_owned})
+    {skipped, to_check} =
+      Enum.split_with(targets, fn {id, lfa} -> skip_revalidation?(id, lfa, state, cycle) end)
+
+    {checked, checked_stamps} = pull_all(to_check)
+    cached = MapSet.union(MapSet.new(skipped, fn {id, _} -> id end), checked)
+
+    validated_flush =
+      state.validated_flush
+      |> Map.take(MapSet.to_list(cached))
+      |> Map.merge(checked_stamps)
+
+    schedule(%{
+      state
+      | cached: cached,
+        recent_owned: recent_owned,
+        validated_flush: validated_flush,
+        cycle: cycle
+    })
+  end
+
+  # Skip the conditional GET for a shard the directory shows unflushed since our last
+  # validation. Every condition is a belt: a nil flush signal never skips (revalidate as
+  # before), only an already-cached-and-still-on-disk copy can skip, the recorded stamp
+  # must equal the directory's current one, and the shard's rolling sweep slice
+  # force-checks it every @sweep_cycles cycles regardless.
+  defp skip_revalidation?(shard_id, last_flushed_at, state, cycle) do
+    not is_nil(last_flushed_at) and
+      MapSet.member?(state.cached, shard_id) and
+      Map.get(state.validated_flush, shard_id) == last_flushed_at and
+      :erlang.phash2(shard_id, @sweep_cycles) != rem(cycle, @sweep_cycles) and
+      File.exists?(cache_path(shard_id))
   end
 
   # Re-stamp currently-owned shards to now, then drop entries last owned longer ago
@@ -251,27 +304,30 @@ defmodule Fathom.Shard.WarmFollower do
 
   # The fleet hot set (most-recently-active) minus the shards this node owns or
   # recently owned (its home set — no failover use in warming what routes back to us)
-  # — capped at the cache budget.
-  defp target_set(cache_max, home) do
+  # — capped at the cache budget. Carries each shard's `last_flushed_at` (already in the
+  # same directory read) as the revalidation-skip signal.
+  defp target_rows(cache_max, home) do
     Fathom.Directory.active_recent(cache_max)
-    |> Enum.map(& &1.shard_id)
-    |> Enum.reject(&MapSet.member?(home, &1))
+    |> Enum.reject(&MapSet.member?(home, &1.shard_id))
     |> Enum.take(cache_max)
-    |> MapSet.new()
+    |> Enum.map(&{&1.shard_id, &1.last_flushed_at})
   rescue
     # The directory is best-effort here: a Postgres blip just skips a refresh.
     e ->
       Logger.warning("warm-follower: directory read failed (#{inspect(e)})")
-      MapSet.new()
+      []
   end
 
   defp owned_shards do
     Registry.select(Fathom.ShardRegistry, [{{:"$1", :_, :_}, [], [:"$1"]}])
   end
 
-  defp pull_all(shard_ids) do
-    shard_ids
-    |> Task.async_stream(&pull_one/1,
+  # Takes `{shard_id, last_flushed_at}` pairs; returns `{cached_set, stamps}` where
+  # `stamps` records the flush signal each successful validation was performed under —
+  # the next cycle's skip baseline.
+  defp pull_all(pairs) do
+    pairs
+    |> Task.async_stream(fn {shard_id, lfa} -> {pull_one(shard_id), lfa} end,
       max_concurrency: System.schedulers_online() * 4,
       timeout: pull_timeout(),
       # A single slow pull (a >timeout S3 fetch — exactly the failover-congestion moment)
@@ -281,9 +337,12 @@ defmodule Fathom.Shard.WarmFollower do
       on_timeout: :kill_task,
       ordered: false
     )
-    |> Enum.reduce(MapSet.new(), fn
-      {:ok, {:ok, shard_id}}, acc -> MapSet.put(acc, shard_id)
-      _other, acc -> acc
+    |> Enum.reduce({MapSet.new(), %{}}, fn
+      {:ok, {{:ok, shard_id}, lfa}}, {set, stamps} ->
+        {MapSet.put(set, shard_id), Map.put(stamps, shard_id, lfa)}
+
+      _other, acc ->
+        acc
     end)
   end
 
