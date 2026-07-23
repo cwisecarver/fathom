@@ -40,7 +40,12 @@ defmodule Fathom.Directory.Recorder do
   """
   @spec record(String.t()) :: :ok
   def record(shard_id) do
-    :ets.insert(@table, {shard_id, DateTime.utc_now()})
+    # A bare integer (µs — the schema's :utc_datetime_usec precision), not DateTime.utc_now():
+    # the buffer only needs an ordering timestamp, and the calendar conversion + 9-field
+    # struct allocation ran on EVERY checkout (review 2026-07-23 #24). The flush converts once
+    # per distinct buffered shard (coalescing means far fewer conversions than checkouts) —
+    # and the integer is a smaller ETS object too.
+    :ets.insert(@table, {shard_id, System.system_time(:microsecond)})
     :ok
   rescue
     # Table not up yet (boot/teardown). Best-effort: a dropped touch is harmless,
@@ -56,7 +61,7 @@ defmodule Fathom.Directory.Recorder do
   """
   @spec record_flush(String.t()) :: :ok
   def record_flush(shard_id) do
-    :ets.insert(@flush_table, {shard_id, DateTime.utc_now()})
+    :ets.insert(@flush_table, {shard_id, System.system_time(:microsecond)})
     :ok
   rescue
     ArgumentError -> :ok
@@ -133,7 +138,14 @@ defmodule Fathom.Directory.Recorder do
 
       rows ->
         try do
-          n = upsert.(rows)
+          # The buffer holds integer microsecond stamps (see record/1); Directory's batch API
+          # keeps its DateTime contract (:utc_datetime_usec — hence microsecond, not ms), so
+          # convert here — once per distinct shard per flush.
+          n =
+            upsert.(
+              Enum.map(rows, fn {id, us} -> {id, DateTime.from_unix!(us, :microsecond)} end)
+            )
+
           if n > 0, do: :telemetry.execute(event, %{count: n}, %{})
           n
         rescue
