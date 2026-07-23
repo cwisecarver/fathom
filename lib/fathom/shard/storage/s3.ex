@@ -131,8 +131,11 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   defp probe_rotation!(key, label) do
+    # The probe deliberately keeps its own HEAD-based verification (it is a boot-time
+    # self-test of the STORE, so it must not trust the copy response's claimed etag the
+    # way the steal path now does — review 2026-07-23 #13).
     with {:ok, etag} when not is_nil(etag) <- head_etag(key),
-         :ok <- rotate_etag(key, etag, nil),
+         {:ok, _claimed} <- rotate_etag(key, etag, nil),
          {:ok, new_etag} when not is_nil(new_etag) and new_etag != etag <- head_etag(key) do
       :ok
     else
@@ -291,8 +294,8 @@ defmodule Fathom.Shard.Storage.S3 do
       # If-Match) while keeping the sentinel semantics intact.
       {:ok, etag, true, _} ->
         case refresh_sentinel(key, etag) do
-          :ok ->
-            with {:ok, post} <- confirm_rotation(shard_id, etag),
+          {:ok, post} ->
+            with {:ok, post} <- resolved_post(shard_id, etag, post),
                  do: {:ok, %{pre: etag, post: post}}
 
           {:error, :touch_precondition} when attempt < 2 ->
@@ -304,8 +307,8 @@ defmodule Fathom.Shard.Storage.S3 do
 
       {:ok, etag, false, md5} ->
         case rotate_etag(key, etag, md5) do
-          :ok ->
-            with {:ok, post} <- confirm_rotation(shard_id, etag),
+          {:ok, post} ->
+            with {:ok, post} <- resolved_post(shard_id, etag, post),
                  do: {:ok, %{pre: etag, post: post}}
 
           {:error, :touch_precondition} when attempt < 2 ->
@@ -319,6 +322,18 @@ defmodule Fathom.Shard.Storage.S3 do
         {:error, reason}
     end
   end
+
+  # The post-touch etag, WITHOUT the confirm-rotation HEAD when the touch's own write
+  # response already proved it (review 2026-07-23 #13): the sentinel PUT returns the new
+  # etag in its response header, and both copy forms return it in their response body —
+  # a follow-up HEAD re-fetched what the write response had already said, one more
+  # serialized RTT per steal. The round-2 #4 fail-closed stance is unchanged: a response
+  # that did NOT prove rotation (no etag, or an unmoved one) falls back to the HEAD-based
+  # confirm_rotation, which fails the steal on an unrotated etag exactly as before.
+  defp resolved_post(_shard_id, old_etag, post) when is_binary(post) and post != old_etag,
+    do: {:ok, post}
+
+  defp resolved_post(shard_id, old_etag, _unproven), do: confirm_rotation(shard_id, old_etag)
 
   # HEAD with sentinel awareness: {:ok, etag_or_nil, sentinel?}.
   # HEAD, also returning the object's x-amz-meta-fathom-md5 (#17) so the touch can carry it forward:
@@ -361,6 +376,8 @@ defmodule Fathom.Shard.Storage.S3 do
   # object currently carries a multipart-form etag, so the form flip IS the
   # rotation. S3 requires the REPLACE metadata directive for a self-copy — which drops ALL user
   # metadata, so re-send the object's integrity md5 (#12) or the post-touch object verifies nothing.
+  # Returns `{:ok, new_etag_or_nil}` — the CopyObjectResult body carries the new etag
+  # (nil if unparseable; the caller then confirms via HEAD).
   defp single_copy_touch(key, etag, md5) do
     source = "/" <> fetch!(config(), :bucket) <> "/" <> key
 
@@ -374,7 +391,11 @@ defmodule Fathom.Shard.Storage.S3 do
              ] ++ md5_meta_header(md5)
          ) do
       {:ok, %{status: s, body: body}} when s in 200..299 ->
-        if copy_body_ok?(body), do: :ok, else: {:error, {:s3_touch_error_body, body}}
+        body = to_string(body)
+
+        if copy_body_ok?(body),
+          do: {:ok, body_etag(body)},
+          else: {:error, {:s3_touch_error_body, body}}
 
       {:ok, %{status: 412}} ->
         {:error, :touch_precondition}
@@ -387,6 +408,15 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  # The etag an XML copy/complete response body reports, in the same quoted form the etag
+  # header carries (confirm_rotation/object_etag compare header-form etags), or nil.
+  defp body_etag(body) do
+    case copy_part_etag(body) do
+      {:ok, bare} -> ~s(") <> bare <> ~s(")
+      _ -> nil
+    end
+  end
+
   # One-part multipart self-copy: Complete's etag is md5(part-md5s)-1 — never the
   # single MD5 form, so it rotates even for identical bytes. A single-part
   # multipart upload has no minimum part size, so this works for any shard.
@@ -396,8 +426,8 @@ defmodule Fathom.Shard.Storage.S3 do
     case create_multipart(key, md5) do
       {:ok, upload_id} ->
         with {:ok, part_etag} <- upload_part_copy(key, upload_id, source, etag),
-             :ok <- complete_multipart(key, upload_id, part_etag) do
-          :ok
+             {:ok, post} <- complete_multipart(key, upload_id, part_etag) do
+          {:ok, post}
         else
           {:error, _} = error ->
             abort_multipart(key, upload_id)
@@ -475,7 +505,9 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   # CompleteMultipartUpload is the CLASSIC 200-with-<Error>-body case (#8) —
-  # copy_body_ok? guards it like the other copies.
+  # copy_body_ok? guards it like the other copies. Returns `{:ok, new_etag_or_nil}`: the
+  # CompleteMultipartUploadResult body carries the completed object's etag (review
+  # 2026-07-23 #13 — the caller previously re-fetched it with a confirm HEAD).
   defp complete_multipart(key, upload_id, part_etag) do
     body =
       "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>" <>
@@ -486,8 +518,10 @@ defmodule Fathom.Shard.Storage.S3 do
            body: body
          ) do
       {:ok, %{status: s, body: resp}} when s in 200..299 ->
-        if copy_body_ok?(to_string(resp)),
-          do: :ok,
+        resp = to_string(resp)
+
+        if copy_body_ok?(resp),
+          do: {:ok, body_etag(resp)},
           else: {:error, {:s3_touch_error_body, resp}}
 
       {:ok, %{status: s}} ->
@@ -517,9 +551,11 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  # Returns `{:ok, new_etag_or_nil}` — the refreshed sentinel's etag from the PUT response
+  # header (nil if the store omitted it; the caller then confirms via HEAD).
   defp refresh_sentinel(key, etag) do
     case put_sentinel(key, [{"if-match", etag}]) do
-      {:ok, %{status: s}} when s in 200..299 -> :ok
+      {:ok, %{status: s, headers: h}} when s in 200..299 -> {:ok, etag(h)}
       {:ok, %{status: 412}} -> {:error, :touch_precondition}
       {:ok, %{status: s}} -> {:error, {:s3_sentinel_status, s}}
       {:error, reason} -> {:error, reason}
@@ -1260,7 +1296,7 @@ defmodule Fathom.Shard.Storage.S3 do
   defp owner_live?(other, now, lock_expires_at_ms) do
     margin = Storage.steal_margin_ms()
 
-    case read_heartbeat_dated(other) do
+    case cached_read_heartbeat_dated(other) do
       # Verify the heartbeat body's owner matches (expert review round-2 #3, defense in
       # depth): with the per-owner key this always holds, but never trust a mismatched
       # body to declare `other` live.
@@ -1456,6 +1492,32 @@ defmodule Fathom.Shard.Storage.S3 do
       {:ok, hb, _s3_now} -> {:ok, hb}
       {:not_found, _s3_now} -> :not_found
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # Memoized heartbeat read (review 2026-07-23 #13): a mass failover steals many shards from
+  # the SAME dead owner, and every steal re-read the identical heartbeat/<owner> object —
+  # ~N redundant GETs of one object on the takeover critical path. Cache the raw read per
+  # owner for @hb_cache_ttl_ms. Staleness bound: the cached verdict (including its s3_now
+  # clock sample) is at most the TTL old, which must stay well inside steal_margin_ms
+  # (default 5000 ms) — the margin absorbs exactly this class of skew. Errors are never
+  # cached, so the fail-closed no-steal-on-blip behavior stays per-call.
+  @hb_cache_ttl_ms 1_000
+
+  defp cached_read_heartbeat_dated(owner) do
+    case Fathom.Shard.Storage.HeartbeatCache.get(owner, @hb_cache_ttl_ms) do
+      {:hit, value} ->
+        value
+
+      :miss ->
+        case read_heartbeat_dated(owner) do
+          {:error, _} = error ->
+            error
+
+          value ->
+            Fathom.Shard.Storage.HeartbeatCache.put(owner, value)
+            value
+        end
     end
   end
 

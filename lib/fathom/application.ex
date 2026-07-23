@@ -318,6 +318,11 @@ defmodule Fathom.Application do
       # Sizing it larger than Req's default ~50-conn pool lets warming pull many shards
       # from S3 at once (startup/failover) without bottlenecking on the conn ceiling.
       Fathom.Shard.Storage.S3.finch_child_spec(),
+      # Per-owner memo of heartbeat reads for the S3 steal path (review 2026-07-23 #13):
+      # a mass failover steals many shards from ONE dead owner, and each steal re-read
+      # the same heartbeat object. Tiny public ETS; the backend degrades to per-call
+      # reads when it's absent.
+      Fathom.Shard.Storage.HeartbeatCache,
       # Rate-limits novel-shard creation (finding #14's churn half). Started
       # unconditionally — idle when `:novel_shard_rate` is unset (the default).
       Fathom.Shards.NovelLimiter,
