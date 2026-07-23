@@ -626,8 +626,10 @@ defmodule Fathom.Scale do
   defp stream_burst(id, stmt, len) do
     with {:ok, pid, ref, path} <- Shards.checkout(id),
          {:ok, conn} <- Connection.open(path) do
-      # Full-access handle (the benchmark isn't auth-gated); the 5th element is the token scope (#24).
-      handle = {pid, ref, conn, id, :rw}
+      # Full-access handle (the benchmark isn't auth-gated); the 5th element is the token scope
+      # (#24), the 6th the per-stream opts resolved at open (template capture / DDL guard are
+      # both off for the harness's synthetic shards).
+      handle = {pid, ref, conn, id, :rw, %{template?: false, block_ddl?: false}}
       Enum.each(1..len, fn _ -> ShardExecutor.execute(handle, stmt) end)
       Connection.close(conn)
       Fathom.Shard.checkin(pid, ref)

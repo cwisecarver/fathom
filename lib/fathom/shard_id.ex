@@ -28,15 +28,29 @@ defmodule Fathom.ShardId do
   # Alphanumerics, underscore, hyphen; 1..64 chars. No dot (blocks `..` traversal and
   # dotted-subdomain ambiguity), no slash, no whitespace, no control chars. NOTE: `_` is
   # admitted but is not a valid DNS label char — see the wildcard-TLS caveat in @moduledoc.
-  @pattern ~r/^[a-zA-Z0-9_-]{1,64}$/
+  #
+  # Implemented as an allocation-free byte walk, not a regex: this gate runs multiple times
+  # per stream open (each trust boundary re-validates — deliberate belt-and-suspenders), and
+  # a Regex.match? is ~10× the cost for a rule this small (review 2026-07-23 #21). Byte length
+  # is char length here because only ASCII bytes are admitted — any multibyte character fails
+  # the byte test itself.
 
   @doc """
   Whether `id` is a valid shard id (the isolation gate). Non-binaries are invalid, so
   callers can pass untrusted request-derived values straight in.
   """
   @spec valid?(term()) :: boolean()
-  def valid?(id) when is_binary(id), do: id =~ @pattern
+  def valid?(id) when is_binary(id) and byte_size(id) >= 1 and byte_size(id) <= 64,
+    do: valid_bytes?(id)
+
   def valid?(_), do: false
+
+  defp valid_bytes?(<<c, rest::binary>>)
+       when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_ or c == ?-,
+       do: valid_bytes?(rest)
+
+  defp valid_bytes?(<<>>), do: true
+  defp valid_bytes?(_), do: false
 
   @doc """
   Validates AND canonicalizes `id`: `{:ok, downcased_id}` for a valid id, `:error` otherwise.

@@ -60,7 +60,7 @@ defmodule Fathom.ShardExecutor do
           {:ok, conn} ->
             # The scope rides the handle so execute/2 can enforce read-only across baton-resumes
             # and every stream on the connection.
-            {:ok, {pid, ref, conn, shard_id, scope}}
+            {:ok, {pid, ref, conn, shard_id, scope, stream_opts(shard_id)}}
 
           {:error, reason} ->
             Shard.checkin(pid, ref)
@@ -73,7 +73,7 @@ defmodule Fathom.ShardExecutor do
   end
 
   @impl true
-  def execute({_pid, _ref, _conn, shard_id, _scope} = handle, %Stmt{} = stmt) do
+  def execute({_pid, _ref, _conn, shard_id, _scope, _opts} = handle, %Stmt{} = stmt) do
     do_execute(handle, stmt)
   rescue
     # A statement must never crash the Hrana stream: exqlite/bind/result-mapping can raise
@@ -88,7 +88,7 @@ defmodule Fathom.ShardExecutor do
       {:error, %Error{message: "shard connection unavailable", code: "SQLITE_ERROR"}}
   end
 
-  defp do_execute({_pid, _ref, _conn, shard_id, scope} = handle, %Stmt{sql: sql} = stmt) do
+  defp do_execute({_pid, _ref, _conn, shard_id, scope, opts} = handle, %Stmt{sql: sql} = stmt) do
     # Classify the statement ONCE — dml?/ddl? each slice+downcase the statement head, and the old
     # shape recomputed them up to 3× per statement (twice in this cond, again in to_stmt_result).
     dml? = dml?(sql)
@@ -125,7 +125,7 @@ defmodule Fathom.ShardExecutor do
       # template + migration engine, never a direct tenant migrate. The template (the capture source)
       # is exempt, and the engine's own replay uses `Connection` directly (not this Hrana path), so
       # neither is affected. Off by default (`:block_tenant_ddl`); enable in prod to enforce the model.
-      block_tenant_ddl?() and not template?(shard_id) and ddl?(sql) ->
+      opts.block_ddl? and not opts.template? and ddl?(sql) ->
         {:error,
          %Error{
            message:
@@ -140,7 +140,11 @@ defmodule Fathom.ShardExecutor do
     end
   end
 
-  defp run_statement({_pid, _ref, conn, shard_id, _scope}, %Stmt{sql: sql, args: args}, dml?) do
+  defp run_statement(
+         {_pid, _ref, conn, shard_id, _scope, opts},
+         %Stmt{sql: sql, args: args},
+         dml?
+       ) do
     started = System.monotonic_time()
 
     case Connection.query(conn, sql, args) do
@@ -163,23 +167,25 @@ defmodule Fathom.ShardExecutor do
 
         # On the reserved template shard, feed each successful statement to the
         # migration capture so a Django migrate becomes a fleet version.
-        capture(shard_id, conn, sql)
+        capture(opts.template?, conn, sql)
         stmt_result = to_stmt_result(result, dml?)
-        # Per-shard load: the query-cost signal for the rebalancer. Lock-free ETS bump,
-        # gated + off by default (see Fathom.ShardLoad).
-        Fathom.ShardLoad.record_query(
-          shard_id,
-          stmt_result.rows_read,
-          stmt_result.rows_written
-        )
-
         latency = System.monotonic_time() - started
 
-        # Per-shard tail latency: the "which shard is slow" companion to ShardLoad's "which shard
-        # is hot". Recorded in a per-shard ETS histogram (Fathom.ShardLatency), NOT a metric tag —
-        # a per-shard Prometheus label is the cardinality death the read-API avoids. Rides
-        # ShardLoad's :shard_load gate; one lock-free ETS bump on the same per-shard key class.
-        Fathom.ShardLatency.record(shard_id, latency)
+        # Per-shard load + tail latency: the "which shard is hot / slow" signals for the
+        # rebalancer. Lock-free ETS bumps, riding one :shard_load gate check here (the two
+        # modules each re-reading the same key was a doubled env lookup on every query —
+        # review 2026-07-23 #7). ShardLatency's per-shard ETS histogram is deliberately NOT a
+        # metric tag (a per-shard Prometheus label is cardinality death); the read API is the
+        # interface.
+        if Fathom.ShardLoad.enabled?() do
+          Fathom.ShardLoad.record_query(
+            shard_id,
+            stmt_result.rows_read,
+            stmt_result.rows_written
+          )
+
+          Fathom.ShardLatency.record(shard_id, latency)
+        end
 
         # Node-wide query latency for the metrics layer (Prometheus distribution / the dashboard's
         # latency chart). Deliberately UN-tagged, for the same cardinality reason. On success only,
@@ -292,7 +298,7 @@ defmodule Fathom.ShardExecutor do
   # steps mid-transaction — leaving an open transaction dangling on the connection, holding the WAL
   # write lock until stream teardown. exqlite exposes `transaction_status`, so answer truthfully.
   @impl true
-  def autocommit?({_pid, _ref, conn, _shard_id, _scope}), do: Connection.autocommit?(conn)
+  def autocommit?({_pid, _ref, conn, _shard_id, _scope, _opts}), do: Connection.autocommit?(conn)
 
   # The coordinator is the connection's owner (Filo's owner seam): the stream holding this
   # handle monitors it and tears down — closing the exqlite connection — if it dies. Without
@@ -302,13 +308,13 @@ defmodule Fathom.ShardExecutor do
   # frames and unlinks the db/wal/shm under it — the orphan's writes land in unlinked inodes
   # and vanish (finding #8, the residual orphan-writer race).
   @impl true
-  def owner({pid, _ref, _conn, _shard_id, _scope}), do: pid
+  def owner({pid, _ref, _conn, _shard_id, _scope, _opts}), do: pid
 
   # Runs a SQL script (the Hrana `sequence` request — libSQL's `executescript()`, #34): one or more
   # statements for side effects, no rows. A read-only token can't run one (a script writes), and the
   # tenant-DDL block applies to its leading statement.
   @impl true
-  def execute_sequence({_pid, _ref, conn, shard_id, scope}, sql) when is_binary(sql) do
+  def execute_sequence({_pid, _ref, conn, shard_id, scope, opts}, sql) when is_binary(sql) do
     cond do
       scope == :ro ->
         {:error,
@@ -318,7 +324,7 @@ defmodule Fathom.ShardExecutor do
            status: 403
          }}
 
-      block_tenant_ddl?() and not template?(shard_id) and ddl?(sql) ->
+      opts.block_ddl? and not opts.template? and ddl?(sql) ->
         {:error,
          %Error{
            message:
@@ -338,7 +344,7 @@ defmodule Fathom.ShardExecutor do
             # bump unconditionally.
             Fathom.Shard.WriteCounter.bump(shard_id)
             # On the template shard, a script is (part of) a migration — feed it to capture.
-            capture(shard_id, conn, sql)
+            capture(opts.template?, conn, sql)
             :ok
 
           {:error, reason} ->
@@ -351,7 +357,7 @@ defmodule Fathom.ShardExecutor do
   # result columns, and whether it's an EXPLAIN / read-only. `is_readonly` is the leading-keyword
   # classification (a SELECT/PRAGMA read vs a DML/DDL write) — the hint a libSQL client wants.
   @impl true
-  def describe({_pid, _ref, conn, _shard_id, _scope}, sql) when is_binary(sql) do
+  def describe({_pid, _ref, conn, _shard_id, _scope, _opts}, sql) when is_binary(sql) do
     case Connection.describe(conn, sql) do
       {:ok, %{params: params, cols: cols}} ->
         {:ok,
@@ -368,10 +374,10 @@ defmodule Fathom.ShardExecutor do
   end
 
   @impl true
-  def close({pid, ref, conn, shard_id, _scope}) do
+  def close({pid, ref, conn, _shard_id, _scope, opts}) do
     Connection.close(conn)
     Shard.checkin(pid, ref)
-    if template?(shard_id), do: Capture.forget(conn)
+    if opts.template?, do: Capture.forget(conn)
     :ok
   end
 
@@ -386,12 +392,9 @@ defmodule Fathom.ShardExecutor do
 
   # --- migration capture (template shard only) ---
 
-  defp capture(shard_id, conn, sql) when is_binary(sql) do
-    if template?(shard_id), do: observe(conn, sql)
-    :ok
-  end
-
-  defp capture(_shard_id, _conn, _sql), do: :ok
+  # First arg is the handle's precomputed `template?` boolean (see stream_opts/1).
+  defp capture(true, conn, sql) when is_binary(sql), do: observe(conn, sql)
+  defp capture(_template?, _conn, _sql), do: :ok
 
   defp observe(conn, sql) do
     case Capture.classify(sql) do
@@ -410,6 +413,16 @@ defmodule Fathom.ShardExecutor do
     :exit, reason ->
       Logger.warning("template capture unavailable: #{inspect(reason)}")
       :ok
+  end
+
+  # Per-stream config resolved ONCE at open (review 2026-07-23 #7 + #21): template?/1 re-cast
+  # the CONSTANT configured template id through the ShardId regex on every successful statement
+  # (and again at close), and block_tenant_ddl? re-read the app env per statement. Both are
+  # operator config — a stream seeing a consistent value for its lifetime is the correct
+  # semantic (the DDL guard / template identity never flip mid-stream), and every existing
+  # test configures them before opening.
+  defp stream_opts(shard_id) do
+    %{template?: template?(shard_id), block_ddl?: block_tenant_ddl?()}
   end
 
   # `shard_id` here is already canonical (normalized in open/1), so normalize the configured
