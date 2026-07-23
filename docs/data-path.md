@@ -41,6 +41,15 @@ snapshot, so two concurrent streams on the same shard are naturally isolated —
 writers serialize on `busy_timeout`, not on a fathom-level lock. Nothing is shared between streams
 except the file.
 
+**Sizing `:query_max_rows` — the in-flight memory multiplier** (review 2026-07-23 #10): a large
+result exists in more than one form at once while a response is being produced — the native rows in
+the stream process plus the pre-encoded JSON rows fragment (and, transiently, the outer response
+encoding). Budget an in-flight large result at roughly **2–3× its wire size**, not 1×, when picking
+the cap; the cap is off by default (a documented decision), but whatever value an operator chooses
+should be chosen against that multiplier. (Before filo's 2026-07-23 iodata-encoding work the HTTP
+path held ~4–5 simultaneous forms — tagged value maps plus a full inter-process copy of them; the
+rows now cross process boundaries as one refc binary.)
+
 ## The coordinator owns the file lifecycle
 
 `Fathom.Shard` is one GenServer per **active** shard (started on demand by `Fathom.Shards` via
