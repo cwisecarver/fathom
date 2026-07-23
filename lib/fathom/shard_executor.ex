@@ -89,11 +89,16 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp do_execute({_pid, _ref, _conn, shard_id, scope} = handle, %Stmt{sql: sql} = stmt) do
+    # Classify the statement ONCE — dml?/ddl? each slice+downcase the statement head, and the old
+    # shape recomputed them up to 3× per statement (twice in this cond, again in to_stmt_result).
+    dml? = dml?(sql)
+    write? = dml? or ddl?(sql)
+
     cond do
       # A read-only token (#24) may only read: refuse any write (DML or DDL) with a distinct 403 so
       # export/analytics/BI credentials can't mutate a tenant. Checked before DDL-block/run so a `ro`
       # token is refused even where a full token would be allowed.
-      scope == :ro and write?(sql) ->
+      scope == :ro and write? ->
         {:error,
          %Error{message: "read-only token cannot write", code: "FILO_READONLY", status: 403}}
 
@@ -103,7 +108,7 @@ defmodule Fathom.ShardExecutor do
       # 503 while READS still serve from the local copy (the flag is set only for provably-stealable
       # shards, and only when :fence_writes_when_stealable is on — default prod). Lock-free ETS read,
       # only on writes.
-      write?(sql) and WriteFence.fenced?(shard_id) ->
+      write? and WriteFence.fenced?(shard_id) ->
         {:error,
          %Error{
            message:
@@ -131,14 +136,11 @@ defmodule Fathom.ShardExecutor do
          }}
 
       true ->
-        run_statement(handle, stmt)
+        run_statement(handle, stmt, dml?)
     end
   end
 
-  # A write for read-only-scope purposes: data mutation (DML) or schema change (DDL).
-  defp write?(sql), do: dml?(sql) or ddl?(sql)
-
-  defp run_statement({_pid, _ref, conn, shard_id, _scope}, %Stmt{sql: sql, args: args}) do
+  defp run_statement({_pid, _ref, conn, shard_id, _scope}, %Stmt{sql: sql, args: args}, dml?) do
     started = System.monotonic_time()
 
     case Connection.query(conn, sql, args) do
@@ -162,7 +164,7 @@ defmodule Fathom.ShardExecutor do
         # On the reserved template shard, feed each successful statement to the
         # migration capture so a Django migrate becomes a fleet version.
         capture(shard_id, conn, sql)
-        stmt_result = to_stmt_result(result, sql)
+        stmt_result = to_stmt_result(result, dml?)
         # Per-shard load: the query-cost signal for the rebalancer. Lock-free ETS bump,
         # gated + off by default (see Fathom.ShardLoad).
         Fathom.ShardLoad.record_query(
@@ -244,11 +246,21 @@ defmodule Fathom.ShardExecutor do
   # read-only shards into needless durability uploads.
   @durable_pragmas ~w(user_version application_id schema_version)
 
+  # Slice + downcase a few head chars rather than the whole statement — this runs on every
+  # no-column/no-change result, and the full-statement downcase was an O(len) binary copy per
+  # query (a multi-KB ORM statement paid it on every execution). 9 covers the longest prefix
+  # ("savepoint"); only a pragma needs the full text (durable_pragma_write? scans the body for
+  # `=` and the header-writing names), and pragma statements are short, so the full downcase
+  # is confined to that branch.
   defp control_statement?(sql) when is_binary(sql) do
-    lead = sql |> String.trim_leading() |> String.downcase()
+    trimmed = String.trim_leading(sql)
+    head = trimmed |> String.slice(0, 9) |> String.downcase()
 
-    Enum.any?(@control_prefixes, &String.starts_with?(lead, &1)) and
-      not durable_pragma_write?(lead)
+    cond do
+      String.starts_with?(head, "pragma") -> not durable_pragma_write?(String.downcase(trimmed))
+      Enum.any?(@control_prefixes, &String.starts_with?(head, &1)) -> true
+      true -> false
+    end
   end
 
   defp control_statement?(_sql), do: false
@@ -258,10 +270,11 @@ defmodule Fathom.ShardExecutor do
   # in do_execute/2 for why the commit must re-dirty the shard. ROLLBACK is deliberately excluded
   # (it discards the writes, so there is nothing new to flush). Matches the leading token of the
   # whole statement, so a trigger body's inner `... BEGIN ... END` (the statement starts with
-  # CREATE) is never mistaken for a transaction commit.
+  # CREATE) is never mistaken for a transaction commit. Slice-first for the same per-query
+  # reason as control_statement?/1 — this runs on every clean (SELECT) result.
   defp ends_transaction?(sql) when is_binary(sql) do
-    lead = sql |> String.trim_leading() |> String.downcase()
-    String.starts_with?(lead, "commit") or String.starts_with?(lead, "end")
+    head = sql |> String.trim_leading() |> String.slice(0, 6) |> String.downcase()
+    String.starts_with?(head, "commit") or String.starts_with?(head, "end")
   end
 
   defp ends_transaction?(_sql), do: false
@@ -572,9 +585,9 @@ defmodule Fathom.ShardExecutor do
   # read-only unless it is a mutation.
   defp to_stmt_result(
          %{columns: cols, rows: rows, num_changes: changes, last_insert_rowid: rowid},
-         sql
+         dml?
        ) do
-    read_only? = cols != [] and not dml?(sql)
+    read_only? = cols != [] and not dml?
 
     %StmtResult{
       cols: cols,
