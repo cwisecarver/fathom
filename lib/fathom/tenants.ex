@@ -77,27 +77,24 @@ defmodule Fathom.Tenants do
   on first request. Registers the directory row (`active`), forks its schema from the template at
   HEAD when `:fork_from_template` is enabled (otherwise it's born empty on first connect, today's
   behavior), and mints a bearer token. Returns
-  `%{shard_id, url, auth_token, auth_required}` — `url` is the `libsql://<id>.<base>` endpoint a
-  Django/libSQL client points at, `auth_required` reflects whether `:hrana_auth` is on (with it
-  off the token is informational — the trust boundary is the network).
+  `%{shard_id, url, auth_token, auth_required, warnings}` — `url` is the `libsql://<id>.<base>`
+  endpoint a Django/libSQL client points at, `auth_required` reflects whether `:hrana_auth` is on
+  (with it off the token is informational — the trust boundary is the network), and `warnings` is a
+  (usually empty) list of non-fatal advisories about the id.
 
   Refuses `{:error, :already_exists}` (a live row), `{:error, :tombstoned}` (a deleted id — the
-  resurrection guard), or `{:error, :invalid_shard_id}`.
+  resurrection guard), `{:error, :invalid_shard_id}`, or — when `:wildcard_tls_serving` is set —
+  `{:error, :id_not_dns_safe}` for an id no `*.<zone>` cert can serve (#35); with that flag off such
+  an id provisions but carries a `warnings` entry instead.
   """
   @spec provision(String.t()) :: {:ok, map()} | {:error, term()}
   def provision(shard_id) do
     with {:ok, id} <- cast(shard_id),
          :ok <- refuse_if_taken(id),
+         {:ok, warnings} <- dns_safety(id),
          {:ok, _row} <- Directory.resolve(id) do
       maybe_fork(id)
-
-      {:ok,
-       %{
-         shard_id: id,
-         url: tenant_url(id),
-         auth_token: mint_token(id),
-         auth_required: auth_required?()
-       }}
+      {:ok, tenant_result(id, warnings)}
     end
   end
 
@@ -121,18 +118,12 @@ defmodule Fathom.Tenants do
     with {:ok, src} <- cast(src_id),
          {:ok, dst} <- cast(dst_id),
          :ok <- refuse_if_taken(dst),
+         {:ok, warnings} <- dns_safety(dst),
          {:ok, %{schema_version: schema_version}} <- fetch_src(src),
          :ok <- maybe_flush_source(src, opts),
          :ok <- fork_into_leased_dst(src, dst) do
       register_fork(dst, schema_version)
-
-      {:ok,
-       %{
-         shard_id: dst,
-         url: tenant_url(dst),
-         auth_token: mint_token(dst),
-         auth_required: auth_required?()
-       }}
+      {:ok, tenant_result(dst, warnings)}
     end
   end
 
@@ -449,6 +440,41 @@ defmodule Fathom.Tenants do
     Directory.resolve(dst)
     if schema_version > 0, do: Directory.cutover(dst, schema_version)
     :ok
+  end
+
+  # The provision/fork response shape. `warnings` is always present (empty when the id is fine) so
+  # the API surface is consistent (expert review #35).
+  defp tenant_result(id, warnings) do
+    %{
+      shard_id: id,
+      url: tenant_url(id),
+      auth_token: mint_token(id),
+      auth_required: auth_required?(),
+      warnings: warnings
+    }
+  end
+
+  # Wildcard-TLS servability gate (expert review #35). `provision`/`fork` is the one place that KNOWS
+  # the deployment's address (it composes the `libsql://<id>.<zone>` URL), so a non-DNS-safe id — an
+  # underscore id no `*.<zone>` cert can serve (RFC 6125) — is caught here, not discovered days later
+  # as an opaque TLS handshake failure. `ShardId.valid?` stays permissive (the plaintext path still
+  # works). By default (`:wildcard_tls_serving` unset) we PROVISION with a `warnings` entry; a
+  # deployment that terminates wildcard TLS sets the flag to REFUSE outright.
+  defp dns_safety(id) do
+    cond do
+      ShardId.dns_safe?(id) -> {:ok, []}
+      wildcard_tls_serving?() -> {:error, :id_not_dns_safe}
+      true -> {:ok, [dns_warning(id)]}
+    end
+  end
+
+  defp wildcard_tls_serving?,
+    do: Application.get_env(:fathom, :wildcard_tls_serving, false) == true
+
+  defp dns_warning(id) do
+    "shard id #{inspect(id)} is not a DNS-safe label (letters, digits, hyphens only; no underscore, " <>
+      "≤63 chars, no leading/trailing hyphen), so it cannot be served under wildcard TLS " <>
+      "(*.#{base_domain()}) — RFC 6125. It works on the plaintext path or with a per-name cert."
   end
 
   defp tenant_url(id), do: "libsql://#{id}.#{base_domain()}"

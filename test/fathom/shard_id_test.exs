@@ -81,4 +81,33 @@ defmodule Fathom.ShardIdTest do
       end
     end
   end
+
+  # Expert review #35: dns_safe?/1 is a SUPERSET gate over valid?/1 (never a replacement) — the
+  # wildcard-TLS servability check the one address-composing site (Tenants.provision/fork) uses.
+  describe "dns_safe?/1" do
+    test "accepts DNS-safe labels (letters, digits, hyphens)" do
+      assert ShardId.dns_safe?("acme")
+      assert ShardId.dns_safe?("acme-preview")
+      assert ShardId.dns_safe?("a-b-c-123")
+      assert ShardId.dns_safe?("x")
+      assert ShardId.dns_safe?(String.duplicate("a", 63)), "63 chars is the DNS-label max"
+    end
+
+    test "rejects an underscore id (RFC 6125 — no wildcard-TLS match) even though valid?/1 admits it" do
+      assert ShardId.valid?("tenant_42"), "the isolation validator stays permissive"
+      refute ShardId.dns_safe?("tenant_42"), "but it isn't wildcard-TLS-servable"
+    end
+
+    test "rejects over-63-char, leading/trailing hyphen, and every non-valid? id" do
+      refute ShardId.dns_safe?(String.duplicate("a", 64)),
+             "valid? but >63 chars = not a DNS label"
+
+      refute ShardId.dns_safe?("-lead")
+      refute ShardId.dns_safe?("trail-")
+      refute ShardId.dns_safe?("a/b")
+      refute ShardId.dns_safe?("")
+      refute ShardId.dns_safe?(nil)
+      refute ShardId.dns_safe?(123)
+    end
+  end
 end

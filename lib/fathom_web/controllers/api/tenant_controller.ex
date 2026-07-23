@@ -105,6 +105,14 @@ defmodule FathomWeb.Api.TenantController do
       {:error, :tombstoned} ->
         error(conn, :conflict, "tenant id was deleted and cannot be reused")
 
+      {:error, :id_not_dns_safe} ->
+        error(
+          conn,
+          :unprocessable_entity,
+          "shard id is not a DNS-safe label (no underscore, ≤63 chars, no leading/trailing hyphen); " <>
+            "this deployment serves wildcard TLS, which can't reach it (#35)"
+        )
+
       {:error, reason} ->
         error(conn, :internal_server_error, "provision failed: #{inspect(reason)}")
     end
@@ -167,12 +175,30 @@ defmodule FathomWeb.Api.TenantController do
     opts = if truthy?(params["flush_source"]), do: [flush_source: true], else: []
 
     case Tenants.fork(src, params["dst"] || params["to"] || "", opts) do
-      {:ok, tenant} -> conn |> put_status(:created) |> json(tenant)
-      {:error, :invalid_shard_id} -> error(conn, :bad_request, "invalid shard or destination id")
-      {:error, :already_exists} -> error(conn, :conflict, "destination already exists")
-      {:error, :tombstoned} -> error(conn, :conflict, "destination id was deleted")
-      {:error, :no_source} -> error(conn, :not_found, "no such source tenant")
-      {:error, reason} -> error(conn, :unprocessable_entity, "fork failed: #{inspect(reason)}")
+      {:ok, tenant} ->
+        conn |> put_status(:created) |> json(tenant)
+
+      {:error, :invalid_shard_id} ->
+        error(conn, :bad_request, "invalid shard or destination id")
+
+      {:error, :already_exists} ->
+        error(conn, :conflict, "destination already exists")
+
+      {:error, :tombstoned} ->
+        error(conn, :conflict, "destination id was deleted")
+
+      {:error, :no_source} ->
+        error(conn, :not_found, "no such source tenant")
+
+      {:error, :id_not_dns_safe} ->
+        error(
+          conn,
+          :unprocessable_entity,
+          "destination id is not a DNS-safe label (wildcard TLS can't serve it) (#35)"
+        )
+
+      {:error, reason} ->
+        error(conn, :unprocessable_entity, "fork failed: #{inspect(reason)}")
     end
   end
 

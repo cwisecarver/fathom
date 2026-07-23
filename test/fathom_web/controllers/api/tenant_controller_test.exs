@@ -65,6 +65,34 @@ defmodule FathomWeb.Api.TenantControllerTest do
     test "400 for an invalid id", %{conn: conn} do
       assert (conn |> auth() |> post("/api/tenants", %{shard_id: "Not Valid!"})).status == 400
     end
+
+    # Expert review #35: a non-DNS-safe id (underscore) can't be served under wildcard TLS.
+    test "warn mode (default): an underscore id provisions (201) with a wildcard-TLS warning", %{
+      conn: conn
+    } do
+      id = "api_warn_#{System.unique_integer([:positive])}"
+      on_exit(fn -> :ets.delete(Tombstones, id) end)
+
+      body = conn |> auth() |> post("/api/tenants", %{shard_id: id}) |> json_response(201)
+      assert [warning] = body["warnings"]
+      assert warning =~ "wildcard TLS"
+    end
+
+    test "reject mode (:wildcard_tls_serving): an underscore id is refused with 422", %{
+      conn: conn
+    } do
+      prev = Application.get_env(:fathom, :wildcard_tls_serving)
+      Application.put_env(:fathom, :wildcard_tls_serving, true)
+
+      on_exit(fn ->
+        if prev == nil,
+          do: Application.delete_env(:fathom, :wildcard_tls_serving),
+          else: Application.put_env(:fathom, :wildcard_tls_serving, prev)
+      end)
+
+      id = "api_reject_#{System.unique_integer([:positive])}"
+      assert (conn |> auth() |> post("/api/tenants", %{shard_id: id})).status == 422
+    end
   end
 
   describe "GET /api/tenants" do

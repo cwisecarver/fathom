@@ -74,6 +74,7 @@ config; diff from it.
 | `NOVEL_SHARD_RATE` | unset (off) | Rate limit (grants/sec) on minting brand-NEW shard ids. | Bounds shard-minting abuse on an exposed data path. Its directory check **fails open** on a Postgres outage — don't rely on it as the only defense (`docs/runbooks/operations.md`). |
 | `NOVEL_SHARD_BURST` | code default | Token-bucket burst for the novel limiter. | — |
 | `FORK_FROM_TEMPLATE` | unset (born empty) | Birth novel shards at the fleet HEAD from the retained `template@HEAD` snapshot. | Only enable with a template + snapshot in place; a poisonable template reachable anonymously is a fleet-wide vector (never make `:default_shard` the template). |
+| `WILDCARD_TLS_SERVING` | unset (warn only) | Set when the deployment terminates TLS with a `*.<zone>` wildcard cert. Then `Tenants.provision`/`fork` REFUSE a non-DNS-safe id (underscore, >63 chars, or leading/trailing hyphen) with 422 instead of returning an un-servable URL (review #35). | Off, the API still provisions such ids but returns a `warnings` field — an underscore id can't be served under wildcard TLS (RFC 6125), only on the plaintext path or a per-name cert. Prefer hyphenated ids. |
 
 ## Web / dashboard / API
 

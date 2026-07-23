@@ -399,6 +399,59 @@ defmodule Fathom.TenantsTest do
     end
   end
 
+  # Expert review #35: provision/fork is the one place that KNOWS the deployment's address (it
+  # composes the libsql://<id>.<zone> URL), so a non-DNS-safe id (an underscore no *.<zone> cert can
+  # serve) is warned about (default) or refused (when the deployment terminates wildcard TLS) — never
+  # handed back as an un-servable URL discovered days later as a TLS failure.
+  describe "provision/1 + fork/2 DNS safety (#35)" do
+    setup do
+      prev = Application.get_env(:fathom, :wildcard_tls_serving)
+
+      on_exit(fn ->
+        if prev == nil,
+          do: Application.delete_env(:fathom, :wildcard_tls_serving),
+          else: Application.put_env(:fathom, :wildcard_tls_serving, prev)
+      end)
+
+      :ok
+    end
+
+    test "a DNS-safe id provisions with no warnings" do
+      id = "dns-safe-#{System.unique_integer([:positive])}"
+      assert {:ok, tenant} = Tenants.provision(id)
+      assert tenant.warnings == []
+    end
+
+    test "warn mode (default): an underscore id still provisions but carries a warning" do
+      id = "dns_unsafe_#{System.unique_integer([:positive])}"
+      assert {:ok, tenant} = Tenants.provision(id)
+      assert [warning] = tenant.warnings
+      assert warning =~ "wildcard TLS"
+      assert {:ok, %{status: "active"}} = Directory.get(id), "warn mode still creates the tenant"
+    end
+
+    test "reject mode (:wildcard_tls_serving): an underscore id is refused and no row is created" do
+      Application.put_env(:fathom, :wildcard_tls_serving, true)
+      id = "dns_reject_#{System.unique_integer([:positive])}"
+
+      assert {:error, :id_not_dns_safe} = Tenants.provision(id)
+      assert Directory.get(id) == :error, "a refused provision must not leave a directory row"
+    end
+
+    test "reject mode: a DNS-safe id still provisions" do
+      Application.put_env(:fathom, :wildcard_tls_serving, true)
+      id = "dns-ok-#{System.unique_integer([:positive])}"
+      assert {:ok, %{warnings: []}} = Tenants.provision(id)
+    end
+
+    test "reject mode: fork refuses a non-DNS-safe DESTINATION id (before touching the source)" do
+      Application.put_env(:fathom, :wildcard_tls_serving, true)
+      # The dns_safety(dst) gate fires before fetch_src, so no real source is needed to prove it.
+      assert {:error, :id_not_dns_safe} =
+               Tenants.fork("some-src", "fork_bad_#{System.unique_integer([:positive])}")
+    end
+  end
+
   test "the DeleteJob worker runs purge end to end", %{id: id} do
     write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
     flush!(id)

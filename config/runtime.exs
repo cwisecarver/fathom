@@ -412,6 +412,14 @@ if config_env() == :prod do
     config :fathom, :api_rate_window_ms, String.to_integer(window)
   end
 
+  # Wildcard-TLS serving (#35): set when the deployment terminates TLS with a `*.<zone>` wildcard
+  # cert, which CANNOT serve an id that isn't a DNS-safe label (an underscore id — RFC 6125). With
+  # this on, `Tenants.provision`/`fork` REFUSE such an id (422) instead of handing back an un-servable
+  # `libsql://<id>.<zone>` URL; off (default) they provision but return a `warnings` entry.
+  if System.get_env("WILDCARD_TLS_SERVING") in ~w(true 1) do
+    config :fathom, :wildcard_tls_serving, true
+  end
+
   # Fork-from-template (finding #10): birth admitted NOVEL shards at the fleet HEAD from
   # the retained template@HEAD snapshot (mix fathom.snapshot template-head). Off by
   # default; enable only with a template + snapshot in place. Fork failures fall back to

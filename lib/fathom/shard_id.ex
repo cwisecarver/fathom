@@ -56,4 +56,27 @@ defmodule Fathom.ShardId do
   end
 
   def cast(_), do: :error
+
+  @doc """
+  Whether `id` is a valid **DNS label** — i.e. servable under a wildcard TLS cert (`*.<zone>`),
+  per the wildcard-TLS caveat above. A `valid?/1` id is DNS-safe iff it *also* satisfies RFC 1035
+  label rules the shard-id charset otherwise relaxes: no underscore (RFC 6125 refuses to expand a
+  wildcard over a `_` label), ≤ 63 bytes, and no leading/trailing hyphen.
+
+  This is a **superset gate over `valid?/1`, never a replacement** — the isolation validator stays
+  permissive (underscore ids still serve on the plaintext path / a per-name cert). It exists so the
+  one place that KNOWS the deployment's address — `Fathom.Tenants.provision/1` / `fork/2`, which
+  compose the `libsql://<id>.<zone>` URL — can warn or refuse instead of handing back an
+  un-servable URL (expert review #35).
+  """
+  @spec dns_safe?(term()) :: boolean()
+  def dns_safe?(id) when is_binary(id) do
+    valid?(id) and
+      not String.contains?(id, "_") and
+      byte_size(id) <= 63 and
+      not String.starts_with?(id, "-") and
+      not String.ends_with?(id, "-")
+  end
+
+  def dns_safe?(_), do: false
 end
