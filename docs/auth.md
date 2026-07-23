@@ -84,7 +84,21 @@ revocation **floor**. That floor is the lever for two distinct operations:
 
 Mint, rotate, and revoke are exposed programmatically on the control-plane API: `POST
 /api/tenants/:id/token` (mint, `{"scope": "rw"|"ro"}`), `POST /api/tenants/:id/token/rotate`, and
-`DELETE /api/tenants/:id/token` — behind the same admin BasicAuth (see `docs/tenant-lifecycle.md`).
+`DELETE /api/tenants/:id/token`. The `/api` control plane authenticates with **scoped API keys**
+(an `Authorization: Bearer` key, `read < manage < destroy`, minted via `mix fathom.apikey`),
+falling back to the shared admin BasicAuth for backward compatibility (see
+[tenant-lifecycle.md](tenant-lifecycle.md)); token routes require the `manage` scope.
+
+## Control-plane auth throttle (#34)
+
+The shared admin BasicAuth (`ADMIN_USER` / `ADMIN_PASS`) is the one password on the platform, so
+the router **locks out a source IP with 429** after `:admin_auth_max_failures` failed attempts
+within `:admin_auth_window_ms` — on by default in prod (`ADMIN_AUTH_MAX_FAILURES=20`, 5-min window;
+a successful auth clears the count) — and the `/api` surface has its own per-IP rate limit
+(`:api_rate_limit`, `API_RATE_LIMIT=120`/min, checked *before* auth). The Hrana *token* path is
+HMAC-verified and not brute-forceable, so these guard the password surface, not the data path. The
+lockout transition is audited (`admin_auth_locked_out`) and attempts emit
+`[:fathom, :admin_auth, :failed|:blocked]` telemetry. Knobs: [configuration.md](configuration.md).
 
 ## The trust boundary when auth is disabled
 

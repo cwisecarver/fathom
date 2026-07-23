@@ -50,7 +50,8 @@ Response:
   "shard_id": "acme",
   "url": "libsql://acme.localhost",
   "auth_token": "…",
-  "auth_required": false
+  "auth_required": false,
+  "warnings": []
 }
 ```
 

@@ -117,22 +117,32 @@ connection URL + token.
 ```
 provision(id):
   cast + refuse if tombstoned (:tombstoned) or already-exists (:already_exists)
+  dns_safety(id)                     # non-DNS-safe id → warn (default) or refuse (:id_not_dns_safe)
   Directory.resolve(id)              # explicit row, status "active"
   maybe fork-from-template @HEAD     # when :fork_from_template is on (#10); else born empty
   mint a bearer token
-  -> %{shard_id, url: "libsql://<id>.<base>", auth_token, auth_required}
+  -> %{shard_id, url: "libsql://<id>.<base>", auth_token, auth_required, warnings}
 ```
 
 `auth_required` reflects `:hrana_auth`: with auth on, the client must present `auth_token`; with it
 off the token is informational (the trust boundary is the network). `<base>` is `:shard_base_domain`
 (prod) or `local` (dev), matching how the Host-subdomain router resolves a shard.
 
+**DNS-safety (#35).** provision/fork is the one place that *knows* the deployment's address, so a
+non-DNS-safe shard id — an underscore, `>63` chars, or a leading/trailing hyphen — that no
+`*.<zone>` wildcard-TLS cert can serve (RFC 6125) is caught here rather than surfacing days later as
+an opaque TLS handshake failure. By default it still provisions but the result carries a `warnings`
+advisory (`Fathom.ShardId.dns_safe?/1` decides); set `:wildcard_tls_serving`
+(`WILDCARD_TLS_SERVING`) — for a deployment that terminates wildcard TLS — and provision/fork
+instead **refuse** with `{:error, :id_not_dns_safe}` (HTTP 422). `ShardId.valid?` stays permissive
+(the plaintext path still works); the gate lives only here. Prefer hyphenated ids.
+
 The JSON API (`FathomWeb.Api.TenantController`, `/api`, behind the same admin BasicAuth, on the
 `:4000` endpoint — separate from the Hrana data port):
 
 | Method | Path | Body / result |
 |--------|------|---------------|
-| `POST` | `/api/tenants` | `{"shard_id":"acme"}` → 201 `{shard_id, url, auth_token, auth_required}` · 409 exists/tombstoned · 400 invalid |
+| `POST` | `/api/tenants` | `{"shard_id":"acme"}` → 201 `{shard_id, url, auth_token, auth_required, warnings}` · 409 exists/tombstoned · 422 not DNS-safe (only when wildcard-TLS serving) · 400 invalid |
 | `GET` | `/api/tenants` | `?status=&q=&limit=&offset=` → 200 `{tenants:[…], total, limit, offset}` (reuses `Directory.list_page`) |
 | `GET` | `/api/tenants/:id` | 200 tenant · 404 |
 | `DELETE` | `/api/tenants/:id` | 202 `{status:"deleting"}` (reuses `Tenants.delete/1`) · 400 |
@@ -182,7 +192,7 @@ fork(src, dst):
   Storage.fork_shard(src, dst)      # copy src.db -> dst.db (refuse :dst_exists / :no_source)
   register dst @ src's schema version   # so the laggard sweep won't re-migrate the fork
   mint a dst token
-  -> %{shard_id: dst, url, auth_token, auth_required}
+  -> %{shard_id: dst, url, auth_token, auth_required, warnings}   # DNS-safety applies to dst too (#35)
 ```
 
 It reflects `src`'s **last durably-flushed** state and does NOT disrupt `src` (no drain) — snapshot

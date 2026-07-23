@@ -18,7 +18,7 @@ The same schema version `N` is recorded three times, each for a different job:
 
 | Where | What it is | Why |
 |---|---|---|
-| `_fathom_migrations` table, inside each shard | the migrations that shard has applied | **source of truth** |
+| `django_migrations` table, inside each shard | the migrations that shard has applied (Django's own migration ledger — `Migrator.Copy` replays its `INSERT INTO django_migrations` rows) | **source of truth** |
 | `PRAGMA user_version`, inside each shard | the integer `N` | **O(1) gate** — "is this shard at vN?" without reading a table (`Migrator.ShardMigration` skips a shard whose `user_version` already equals the target — the migration is idempotent) |
 | `shards.schema_version`, in Postgres (`Fathom.Directory`) | the version the fleet thinks the shard is at | **find who's behind without opening shards** — laggard queries over millions of tenants are a Postgres index scan, not millions of file opens |
 
@@ -31,10 +31,13 @@ The migration copies to a **fresh file** and flips a pointer; it never mutates a
 1. **`Migrator.Capture`** records a template's migrations as a fleet **version** (vN);
    **`Migrator.Release`** publishes the fleet **HEAD** (the target version), cached by
    `Migrator.HeadCache`.
-2. Per shard, **`Migrator.Copy`** replays vN's captured SQL into a fresh file **in a single
-   transaction** and stamps `PRAGMA user_version = N` **after** commit — so a failure rolls the
-   whole thing back and leaves the shard untouched at vN-1. **`Migrator.ShardMigration`**
-   orchestrates it and is **idempotent** (re-run on an already-migrated shard is a no-op).
+2. Per shard, **`Migrator.Copy`** replays a version's captured SQL into a fresh file **in a single
+   transaction** and stamps `PRAGMA user_version` **after** commit — so a failure rolls the whole
+   thing back and leaves the shard untouched at its prior version. A shard more than one version
+   behind is walked forward **one version at a time** (`current+1 … HEAD`), each step its own
+   copy-and-stamp transaction, so a cold-tail laggard converges the whole way in one job.
+   **`Migrator.ShardMigration`** orchestrates it and is **idempotent** (re-run on an
+   already-migrated shard is a no-op).
 3. Validate, then **`Fathom.Directory.cutover/2`** flips the shard's pointer to vN and stamps
    `cutover_at` (the same instant as `last_active_at`, so "written since cutover" is exactly
    `last_active_at > cutover_at`). The old vN-1 version is **retired with a `retain_until`** — kept

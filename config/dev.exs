@@ -20,11 +20,16 @@ config :fathom, :default_shard, "demo"
 # env vars. Prod reads ADMIN_USER/ADMIN_PASS (config/runtime.exs) and fails closed when unset.
 config :fathom, :admin_auth, username: "admin", password: "admin"
 
-# Configure your database
+# Configure your database.
+#
+# The Postgres role defaults to your OS user (PGUSER, else USER) so a fresh checkout works
+# unedited on a normal local Postgres; override PGUSER/PGPASSWORD/PGHOST/PGDATABASE (or edit
+# here) if your setup differs. Passwordless local trust auth is the default (PGPASSWORD unset).
 config :fathom, Fathom.Repo,
-  username: "cwisecarver",
-  hostname: "localhost",
-  database: "fathom_dev",
+  username: System.get_env("PGUSER") || System.get_env("USER") || "postgres",
+  password: System.get_env("PGPASSWORD"),
+  hostname: System.get_env("PGHOST") || "localhost",
+  database: System.get_env("PGDATABASE") || "fathom_dev",
   stacktrace: true,
   show_sensitive_data_on_connection_error: true,
   pool_size: 10

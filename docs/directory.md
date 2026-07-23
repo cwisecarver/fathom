@@ -30,9 +30,13 @@ round-trip in front of every query — latency on the hot path, and a Postgres o
   **re-buffers** the drained touches (`:ets.insert_new`, so a fresher touch already back in the
   table wins) to retry next cycle. Writes are fire-and-forget from the caller's view; the worst case
   is a slightly stale `last_active_at`, never a dropped request.
+- **A second, parallel buffer records durable-flush times** (review #28). Hooked at each successful
+  upload, `record_flush/1` coalesces and batch-flushes `last_flushed_at` the same off-hot-path way
+  (`Directory.record_flush_batch/1`), so a post-node-loss report survives the node even though the
+  node-local flush watermark dies with it — see [durability](durability.md).
 
 This is the same shape as `Fathom.ShardLoad` (lock-free ETS + a periodic drain — the "record off the
-hot path" pattern, used once for access recency and once for per-shard load).
+hot path" pattern, used for access recency, durable-flush time, and per-shard load).
 
 ## What the directory holds, and who reads it
 
@@ -44,8 +48,9 @@ control plane uses — all **without opening shards**:
 - **`last_active_at`** + **`active_recent/1`** — the recently-active set the warm follower pre-pulls
   ([warm-standby](warm-standby.md)); and, versus `cutover_at`, the **write-age** the revert
   force-guard checks (`last_active_at > cutover_at` ⇒ writes since cutover).
-- **`status`** (`active` / `migrating` / `retired` / `migration_failed`) + **`cutover/2`**,
-  **`retire/2`** — the lifecycle the migration engine flips.
+- **`status`** (`active` / `migrating` / `retired` / `migration_failed`, plus `deleted` / `suspended`
+  from the [tenant lifecycle](tenant-lifecycle.md)) + **`cutover/2`**, **`retire/2`** — the lifecycle
+  states: the migration engine flips the first four; `Fathom.Tenants` sets `deleted` / `suspended`.
 
 It's deliberately **decoupled from routing**: the directory is orchestration, not a request-path
 resolve (routing is Host-based today — see [admission](admission.md)). That's why a Postgres blip is

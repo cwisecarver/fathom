@@ -9,6 +9,10 @@ component map) is [`../AGENTS.md`](../AGENTS.md).** This folder holds the deeper
 references, the design plans, the benchmark plans, the operational runbooks, and the run reports.
 Each doc says whether it describes **built** behavior or a **plan**.
 
+**New here?** The root [`../README.md`](../README.md) has the project overview and a two-path
+"Getting started" (Docker eval stack + native dev); [`../CONTRIBUTING.md`](../CONTRIBUTING.md) is the
+set-up-and-land-a-change guide for developers.
+
 ## How it works — built-engine stories
 
 The "how it actually works" narratives for the major built subsystems. A good learning order is
@@ -109,6 +113,9 @@ what actually shipped (some plan assumptions were superseded).
   dynamic rebalancing (observe-before-arming dry run + rollback).
 - **[runbooks/admin-dashboard.md](runbooks/admin-dashboard.md)** — running the realtime `/admin`
   dashboard, its auth/gates, and the macOS Tailwind re-sign + pending-migration gotchas.
+- **[runbooks/disaster-recovery.md](runbooks/disaster-recovery.md)** — cross-store (Postgres + S3)
+  restore coherence: recovering from a directory point-in-time restore without resurrecting deleted
+  tenants or revoked tokens.
 
 ## Reviews & run reports
 

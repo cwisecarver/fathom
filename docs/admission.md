@@ -78,6 +78,11 @@ per-stream connection). The eviction path is the same **drain** (flush + drop + 
 that a [rebalance](rebalancing.md) uses, and it's safe for the same reason — the
 [lease](single-writer.md) means dropping an idle shard can't lose a live writer.
 
+Everything here guards the **data-path** front door (the Hrana port on `:8080`). The **control
+plane** (`/admin` + the `/api` provisioning surface on `:4000`) has its own, separate abuse throttles
+— an admin-auth brute-force lockout and an `/api` rate limit (`Fathom.RateLimiter`) — so
+`:max_open_shards` / `NovelLimiter` are not what protects that surface. See [auth](auth.md).
+
 ## One-line summary
 
 A request resolves to a shard by Host subdomain through one fail-closed function (dev-only `?db=`

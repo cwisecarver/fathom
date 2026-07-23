@@ -177,7 +177,7 @@ control-plane / cluster bullets under Project.
               → flip directory pointer → retire @vN-1 (retain_until)
 ```
 
-The migration machinery in this diagram is **built** — see the Migration engine bullet under Project. The version stamp lives in **three places**: `_fathom_migrations` in each shard (truth), `PRAGMA user_version` (O(1) gate), `shards.schema_version` in Postgres (laggard queries without opening shards). Still aspirational: the **cached, PubSub-invalidated resolve on the request path** (routing is Host-based today).
+The migration machinery in this diagram is **built** — see the Migration engine bullet under Project. The version stamp lives in **three places**: `django_migrations` in each shard (Django's own migration ledger — the truth), `PRAGMA user_version` (O(1) gate), `shards.schema_version` in Postgres (laggard queries without opening shards). Still aspirational: the **cached, PubSub-invalidated resolve on the request path** (routing is Host-based today).
 
 ---
 

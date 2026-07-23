@@ -5,9 +5,12 @@ import Config
 # The MIX_TEST_PARTITION environment variable can be used
 # to provide built-in test partitioning in CI environment.
 # Run `mix help test` for more information.
+# The Postgres role defaults to your OS user (PGUSER, else USER) so a fresh checkout runs the
+# suite unedited on a normal local Postgres; override PGUSER/PGPASSWORD/PGHOST if needed.
 config :fathom, Fathom.Repo,
-  username: "cwisecarver",
-  hostname: "localhost",
+  username: System.get_env("PGUSER") || System.get_env("USER") || "postgres",
+  password: System.get_env("PGPASSWORD"),
+  hostname: System.get_env("PGHOST") || "localhost",
   database: "fathom_test#{System.get_env("MIX_TEST_PARTITION")}",
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: System.schedulers_online() * 2

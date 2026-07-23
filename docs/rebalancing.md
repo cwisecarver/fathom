@@ -52,7 +52,7 @@ the "hot" test:
 
 Then the anti-thrash guards:
 
-- **2-window anti-flap** — a shard must read hot in two consecutive windows.
+- **2-window anti-flap** — a shard must read hot in `:rebalance_confirm_windows` (default 2) distinct sample windows (de-duped by `sampled_at`), not a single spike.
 - **Cooldown** — a shard pinned within `cooldown_ms` is skipped, so it isn't ping-ponged.
 - **Improvement guard** — never relocate a *lone* hotspot (moving it just moves the problem); only
   move when fleet balance genuinely improves.

@@ -79,15 +79,19 @@ turn on in-app bearer-token auth:
     HRANA_AUTH=required            # every stream open must present a token (401 otherwise)
     HRANA_TOKEN_MAX_AGE=86400      # optional expiry in seconds; unset = non-expiring
 
-`Fathom.HranaAuth` verifies a `Phoenix.Token` (signed with `SECRET_KEY_BASE`) that binds
-the caller to exactly one shard. Clients pass it as libSQL's `authToken` and it reaches
+`Fathom.HranaAuth` verifies a `Phoenix.Token` (signed with a dedicated `HRANA_TOKEN_SECRET`,
+falling back to `SECRET_KEY_BASE` only when it's unset) that binds the caller to exactly one
+shard. Clients pass it as libSQL's `authToken` and it reaches
 the server two different ways: HTTP requests carry `Authorization: Bearer <token>`, but
 the WebSocket clients (django-libsql) send it **only as the `jwt` field of the Hrana
 `hello` message** — no upgrade header — which is why this is implemented as `Filo.Plug`'s
 `:authorize` callback (checked at every stream open / WS hello, before the executor runs)
 rather than the pre-plug originally scoped here. Mint a token with `mix fathom.token
-<shard>` (dev) or `Fathom.HranaAuth.token_for/1` from a release's remote console; revoke
-by rotating `SECRET_KEY_BASE` (or set an expiry). A boot guard refuses `HRANA_AUTH=required`
+<shard>` (dev) or `Fathom.HranaAuth.token_for/1` from a release's remote console. **Revoke
+per shard** — `Fathom.HranaAuth.revoke/1` (immediate) or `rotate/1` (zero-downtime: the
+previous token stays valid for `:hrana_rotation_grace_ms`, default 1h), or
+`DELETE /api/tenants/:id/token`; a per-shard directory version floor backs it, so revocation
+is scoped, not "rotate the global secret." A boot guard refuses `HRANA_AUTH=required`
 without a usable secret, and an unrecognized `:hrana_auth` value fails closed to required.
 Auth on the template shard also removes the capture-poisoning caveat on setting a prod
 `:template_shard_id` (finding #17).
@@ -105,6 +109,20 @@ Over-budget novel creations get `429` before any work runs. Existing shards — 
 row, a local file, or a running coordinator — are never limited, so failover warming and
 cold re-opens are unaffected; the directory check fails open if Postgres is down. Size the
 rate to tenant signups with headroom (legitimate novel creation is rare).
+
+**Control-plane throttles (:4000, on by default in prod).** The `NovelLimiter` above guards only
+the *data-path* mint. The control plane (`/admin` + the `/api` provisioning surface) has its own
+per-IP throttles via `Fathom.RateLimiter`, on by default in prod (`=0` disables): a brute-force
+**lockout** on the shared admin BasicAuth and a **rate limit** on `/api` so a hostile/buggy client
+can't hammer expensive ops (list/export/fork).
+
+    ADMIN_AUTH_MAX_FAILURES=20   # lock out an IP with 429 after N failed admin auths / window
+    ADMIN_AUTH_WINDOW_MS=300000  # the failure window (default 5 min)
+    API_RATE_LIMIT=120           # per-IP /api requests per window before 429 (runs before auth)
+    API_RATE_WINDOW_MS=60000     # the /api window (default 1 min)
+
+The Hrana token path is HMAC-verified (not brute-forceable), so these guard the one shared admin
+password and the `/api` surface — see [configuration](configuration.md).
 
 ## Running a node
 

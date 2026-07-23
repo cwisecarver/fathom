@@ -18,7 +18,7 @@ dev. You need the Hrana endpoint reachable on `:8080`.
 ```bash
 curl -su admin:admin -X POST http://localhost:4000/api/tenants \
   -H 'content-type: application/json' -d '{"shard_id": "acme"}'
-# -> {"shard_id":"acme","url":"libsql://acme.localhost","auth_token":"…","auth_required":false}
+# -> {"shard_id":"acme","url":"libsql://acme.localhost","auth_token":"…","auth_required":false,"warnings":[]}
 ```
 
 The shard is `acme`, selected by the **Host subdomain** `acme.localhost`. (In dev without the eval
