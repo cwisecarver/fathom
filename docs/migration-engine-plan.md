@@ -106,8 +106,8 @@ app is vN. That collapses the whole problem to one rule:
 version). `Fathom.Migrator.release/3` becomes `(version, name, statements)`; HEAD
 is still `max(version)`. Version stamped on each migrated shard as
 `PRAGMA user_version = N` (O(1) gate + crash-recovery detection); Django's own
-`django_migrations` is maintained by the replay, so no separate `_fathom_migrations`
-table is needed.
+`django_migrations` is maintained by the replay, so no separate fathom-specific
+migrations table is needed.
 
 ## The per-shard algorithm (`Fathom.Migrator.ShardMigrationJob`, Oban, unique per `shard_id`)
 
