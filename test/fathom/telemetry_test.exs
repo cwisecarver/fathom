@@ -16,6 +16,25 @@ defmodule Fathom.TelemetryTest do
     on_exit(fn -> :telemetry.detach(id) end)
   end
 
+  # Expert review 2026-07-23 #3: the OTel checkout-span bridge attached by default even with no
+  # collector configured — :otel_spans defaulted true while the docs claimed traces were env-gated
+  # on OTEL_EXPORTER_OTLP_ENDPOINT, so every checkout built full recording spans exported to
+  # nothing. The invariant: with :otel_spans UNSET, the bridge must stay detached (runtime.exs
+  # flips it true only alongside a real exporter).
+  test "the OTel span bridge defaults OFF when :otel_spans is unset" do
+    original = Application.fetch_env(:fathom, :otel_spans)
+    Application.delete_env(:fathom, :otel_spans)
+
+    on_exit(fn ->
+      case original do
+        {:ok, v} -> Application.put_env(:fathom, :otel_spans, v)
+        :error -> Application.delete_env(:fathom, :otel_spans)
+      end
+    end)
+
+    refute Fathom.Telemetry.otel_spans?()
+  end
+
   test "a fresh open emits lease-acquired, cold-open, and a checkout-stop span", %{shard: shard} do
     attach([
       [:fathom, :shard, :lease, :acquired],

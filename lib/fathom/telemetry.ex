@@ -8,9 +8,11 @@ defmodule Fathom.Telemetry do
     OTLP) to `metrics/0` to export them — see `docs/runbooks/cluster.md`.
   - Runs a `telemetry_poller` that gauges the active-shard coordinator count on this node.
   - Bridges the `Fathom.Shards.checkout` `:telemetry.span` to an **OpenTelemetry trace span**
-    (so a cold checkout shows its cold-open cost in traces). The OTLP exporter is env-gated in
-    `config/runtime.exs` — a no-op until an endpoint is set. The bridge attach is gated by
-    `:otel_spans` (off in test).
+    (so a cold checkout shows its cold-open cost in traces). The bridge attach is gated by
+    `:otel_spans`, which defaults **off** and is set true by `config/runtime.exs` only when
+    `OTEL_EXPORTER_OTLP_ENDPOINT` configures a real exporter — without a collector the
+    handlers built full recording spans on every checkout and exported them to nothing
+    (expert review 2026-07-23 #3).
 
   Metrics stay on `Telemetry.Metrics` because OpenTelemetry's BEAM metrics SDK is still
   experimental; traces use OpenTelemetry.
@@ -385,7 +387,14 @@ defmodule Fathom.Telemetry do
 
   # --- OpenTelemetry span bridge: the checkout :telemetry.span -> an OTel trace span ---
 
-  defp otel_spans?, do: Application.get_env(:fathom, :otel_spans, true)
+  # Default FALSE: the bridge's handlers run inline in the checkout caller (span ctx alloc,
+  # active-span ETS insert/delete) and the default `always_on` sampler makes them full
+  # recording spans — pure per-checkout cost when no collector consumes them. runtime.exs
+  # flips this true alongside the exporter when OTEL_EXPORTER_OTLP_ENDPOINT is set, so the
+  # documented "traces are env-gated on the endpoint" posture is now literally true
+  # (expert review 2026-07-23 #3). Public (@doc false) so the default is pinned by test.
+  @doc false
+  def otel_spans?, do: Application.get_env(:fathom, :otel_spans, false)
 
   defp attach_otel_span_bridge do
     # Detach first so a supervisor restart re-attaches cleanly.

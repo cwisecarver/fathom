@@ -37,9 +37,13 @@ end
 # OpenTelemetry OTLP trace export — enabled only when an endpoint is set, so it stays a no-op
 # in dev/test/CI and in any deploy without a collector (config/config.exs defaults to :none).
 # The exporter also honors the standard OTEL_EXPORTER_OTLP_* env vars (headers, protocol).
+# The checkout-span bridge (:otel_spans) attaches together with the exporter: without a
+# collector its handlers built recording spans on every checkout and exported them to
+# nothing (expert review 2026-07-23 #3).
 if otlp_endpoint = System.get_env("OTEL_EXPORTER_OTLP_ENDPOINT") do
   config :opentelemetry, traces_exporter: {:opentelemetry_exporter, %{}}
   config :opentelemetry_exporter, otlp_endpoint: otlp_endpoint
+  config :fathom, otel_spans: true
 end
 
 # ---- Shard-plane deploy knobs (env-gated, any config_env) --------------------------------
