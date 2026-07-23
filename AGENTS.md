@@ -48,7 +48,11 @@ mix precommit      # the gate: compile --warnings-as-errors, deps.unlock --unuse
 iex -S mix phx.server   # start app (dashboard :4000)
 ```
 
-- **Shell is zsh.** Backticks and `$(...)` run command substitution even inside double quotes — a backtick or unescaped `$(` in a `git commit -m "..."` body gets executed and silently mangles the message. Don't wrap identifiers in backticks inside `-m`. Unquoted globs (`*`, `?`, `[...]`) and `{a,b}` brace-expand.
+- **Shell is zsh — stop re-learning this.** These bite every session; internalize them:
+  - Backticks and `$(...)` run command substitution even inside double quotes — a backtick or unescaped `$(` in a `git commit -m "..."` body gets executed and silently mangles the message. Don't wrap identifiers in backticks inside `-m`; use `git commit -F <file>` for any non-trivial message.
+  - **zsh parameter-expansion patterns glob.** `${var#pat}` / `${var%pat}` treat `(`, `[`, `]`, `#`, `?`, `*` as pattern metacharacters, so `${m#](}` dies with `bad pattern: ](`. Don't hand-strip brackets/parens with `${...#...}` — use `grep -oE`, or just do the text munging in `python3`.
+  - Unquoted globs (`*`, `?`, `[...]`) and `{a,b}` brace-expand — quote them when you mean literals.
+  - **Don't assume `sed`/`awk`/`dirname`/`head`/`tail` are on PATH** — several aren't in this sandbox (and AGENTS.md already says use Read/Grep/Edit to read/edit files, never those). For a text pipeline, reach for `grep` or a short `python3 - <<'PY'` heredoc, not `sed`/`awk`.
 - **When `fathom_native` lands:** the NIF builds via Rustler on `mix compile`; release builds need `MIX_ENV=prod` and are slow (set timeouts). Rust tests: `cd native && cargo test`.
 
 ## Workflow
