@@ -124,6 +124,19 @@ defmodule Fathom.ShardLoad do
     ArgumentError -> []
   end
 
+  # Raw table rows `{shard_id, checkouts, queries, rows_read, rows_written}` for a bulk
+  # reader that materializes its own shape (the Rebalancer.Reporter diffs two snapshots
+  # per window; the map-per-row of snapshot/0 was pure intermediate allocation at high
+  # shard counts — review 2026-07-23 #29). The read API remains the interface — this is
+  # that API in its cheapest form, not an invitation to touch the table directly.
+  @doc false
+  @spec snapshot_tuples() :: [tuple()]
+  def snapshot_tuples do
+    :ets.tab2list(@table)
+  rescue
+    ArgumentError -> []
+  end
+
   @doc """
   The `n` hottest shards on this node by `dimension`
   (`:checkouts | :queries | :rows_read | :rows_written`, default `:queries`), highest

@@ -132,22 +132,33 @@ defmodule Fathom.Rebalancer.Reporter do
     node_key = Rebalancer.node_key()
     sampled_at = DateTime.utc_now()
 
+    # Single reduce building only the positive-rate rows (review 2026-07-23 #29): the old
+    # map-then-reject built an insert map per resident shard — including the idle majority
+    # about to be rejected — per window. The hottest-first sort stays (publish/1 takes the
+    # top-N of it, and it costs far less than the per-shard map churn did).
     curr
-    |> Enum.map(fn {id, c} ->
-      p = Map.get(prev, id, %{queries: 0, rows_read: 0, checkouts: 0})
+    |> Enum.reduce([], fn {id, {co, q, rr}}, acc ->
+      {p_co, p_q, p_rr} = Map.get(prev, id, {0, 0, 0})
+      q_per_s = rate(q, p_q, window_s)
 
-      %{
-        node_key: node_key,
-        shard_id: id,
-        q_per_s: rate(c.queries, p.queries, window_s),
-        rows_read_per_s: rate(c.rows_read, p.rows_read, window_s),
-        checkouts_per_s: rate(c.checkouts, p.checkouts, window_s),
-        window_s: window_s,
-        sampled_at: sampled_at,
-        inserted_at: sampled_at
-      }
+      if q_per_s <= 0.0 do
+        acc
+      else
+        [
+          %{
+            node_key: node_key,
+            shard_id: id,
+            q_per_s: q_per_s,
+            rows_read_per_s: rate(rr, p_rr, window_s),
+            checkouts_per_s: rate(co, p_co, window_s),
+            window_s: window_s,
+            sampled_at: sampled_at,
+            inserted_at: sampled_at
+          }
+          | acc
+        ]
+      end
     end)
-    |> Enum.reject(&(&1.q_per_s <= 0.0))
     |> Enum.sort_by(& &1.q_per_s, :desc)
   end
 
@@ -189,8 +200,16 @@ defmodule Fathom.Rebalancer.Reporter do
     :ok
   end
 
+  # Raw-tuple snapshot: `%{id => {checkouts, queries, rows_read}}` — the retained `prev`
+  # and each window's `curr` used to be maps of 5-key atom maps built from an intermediate
+  # list of maps, i.e. two full materializations per window plus a comparable retained
+  # copy (tens of MB transient at 100k resident shards; review 2026-07-23 #29).
+  # rows_written isn't reported, so it's dropped at ingestion.
   defp snapshot_map do
-    ShardLoad.snapshot() |> Map.new(&{&1.shard_id, &1})
+    ShardLoad.snapshot_tuples()
+    |> Map.new(fn {id, checkouts, queries, rows_read, _rows_written} ->
+      {id, {checkouts, queries, rows_read}}
+    end)
   end
 
   defp mono_ms, do: System.monotonic_time(:millisecond)
