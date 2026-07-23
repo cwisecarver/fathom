@@ -1374,10 +1374,15 @@ defmodule Fathom.Shard do
   defp drop_clean(state) do
     # Clean: local == storage. Drop the local copy without re-uploading (nothing to
     # flush, no clobber possible) and release the lease for a clean handoff.
-    if File.exists?(state.path) do
-      drop_local(state.path)
-      Storage.release_lease(state.id, state.lease)
-    end
+    if File.exists?(state.path), do: drop_local(state.path)
+
+    # Release regardless of the local file (review 2026-07-23 #19): a coordinator can stop
+    # clean with NO local file at all — a checkout abandoned before any connection opened on
+    # a brand-new shard (the pull found no object; exqlite only creates the file on first
+    # connection open). The old file-gated release leaked the lock object: the next
+    # same-owner open silently downgraded from the optimistic 1-RTT create to the reclaim
+    # path, and a foreign node saw {:held, us} for as long as our heartbeat stayed fresh.
+    if is_map(state.lease), do: Storage.release_lease(state.id, state.lease)
 
     :ok
   end

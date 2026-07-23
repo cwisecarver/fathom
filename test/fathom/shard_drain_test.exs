@@ -32,6 +32,29 @@ defmodule Fathom.ShardDrainTest do
     assert Shards.drain(shard) == :ok
   end
 
+  # Review 2026-07-23 #19: drop_clean gated BOTH drop_local and release_lease behind
+  # File.exists?(path) — but a brand-new shard whose checkout never opened a connection has
+  # no local file (the pull found no object; exqlite creates the file on first connection
+  # open), so a clean stop leaked the lock object. The next same-owner open then silently
+  # downgraded from the optimistic 1-RTT create to the reclaim path, and a foreign node saw
+  # {:held, us} while our heartbeat stayed fresh. Pre-fix the final assertion fails: the
+  # .lock survives the drain.
+  test "a clean stop with no local file still releases the lease (#19)", %{shard: shard} do
+    {:ok, pid, ref, path} = Shards.checkout(shard)
+    Shard.checkin(pid, ref)
+    _ = :sys.get_state(pid)
+
+    # Preconditions that make this the leak scenario: the lease was acquired, but no local
+    # file was ever created (no connection opened on the brand-new shard).
+    refute File.exists?(path)
+    assert File.exists?(lock_file(shard)), "checkout must have acquired the lease"
+
+    assert :ok = Shards.drain(shard, 5_000)
+
+    refute File.exists?(lock_file(shard)),
+           "a clean stop must release the lock even when no local file exists (#19)"
+  end
+
   # Expert review #41 (contract test): drain/2 must leave the caller's mailbox free of
   # {:drain_aborted, _} whatever branch resolved it — a stale abort pins a DIFFERENT
   # coordinator pid on any later call, so it would sit in a long-lived caller's mailbox
