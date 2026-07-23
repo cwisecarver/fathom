@@ -93,9 +93,10 @@ no longer possible — by design.
 
 ## Reused from the orchestration design (these still apply)
 
-- **Version stamp, three places:** `_fathom_migrations(version, applied_at)` table
-  inside each shard (truth/audit) + `PRAGMA user_version` (O(1) gate) +
-  `shards.schema_version` in Postgres (laggard queries without opening shards).
+- **Version stamp, three places:** `django_migrations` table inside each shard
+  (Django's own migration ledger — the truth/audit) + `PRAGMA user_version` (O(1)
+  gate) + `shards.schema_version` in Postgres (laggard queries without opening
+  shards).
 - **Templates first:** migrate every node's `template@vN` *before* sweeping, so
   newly-created shards are born current and never need migrating.
 - **Hybrid rollout:**
