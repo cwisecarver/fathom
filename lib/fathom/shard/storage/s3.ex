@@ -1748,9 +1748,31 @@ defmodule Fathom.Shard.Storage.S3 do
 
   defp path_style?, do: config()[:path_style] == true
 
+  # The base Req struct is invariant per config, but every S3 call rebuilt it — config
+  # read, sigv4 options, response-step append, plus finch_opt's Process.whereis — which
+  # is measurable allocation churn at exactly the fan-out moments (warming bursts,
+  # follower polls, mass failover; review 2026-07-23 #25). Cache it in :persistent_term
+  # keyed by the config term: a config change (tests swap req_plug/buckets freely) misses
+  # the key and rebuilds, so correctness never depends on invalidation. The term is
+  # written once per distinct config (bounded; tests write a handful), so persistent_term
+  # GC churn is a non-issue. finch_opt's pool detection folds into the cached build:
+  # whether our dedicated pool is up is decided at supervision-tree boot, not per call.
   defp req do
     config = config()
+    key = {__MODULE__, :base_req, config, finch_running?()}
 
+    case :persistent_term.get(key, nil) do
+      nil ->
+        req = build_req(config)
+        :persistent_term.put(key, req)
+        req
+
+      req ->
+        req
+    end
+  end
+
+  defp build_req(config) do
     Req.new(
       [
         base_url: base_url(config),
@@ -1821,8 +1843,14 @@ defmodule Fathom.Shard.Storage.S3 do
   # Finch if it isn't started, so Storage.S3 still works standalone (iex,
   # one-off scripts) without a hard dependency on the supervision tree.
   defp finch_opt do
-    if Process.whereis(@finch), do: [finch: @finch], else: []
+    if finch_running?(), do: [finch: @finch], else: []
   end
+
+  # Deliberately still checked per call (as part of req/0's cache key): it is a ~100ns
+  # registry lookup, and keying on it keeps the cached struct correct across pool
+  # start/stop (tests, iex standalone) without invalidation logic. The saved cost is the
+  # Req.new/sigv4/step-append allocation churn, which dominated.
+  defp finch_running?, do: Process.whereis(@finch) != nil
 
   defp base_url(config) do
     cond do
