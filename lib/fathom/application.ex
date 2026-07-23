@@ -360,7 +360,13 @@ defmodule Fathom.Application do
         # heartbeat object was deleted first, every open shard on the stopping node became
         # stealable mid-deploy, and the fenced terminate-flushes self-fenced and dropped
         # their writes (expert review #4).
-        {Registry, keys: :unique, name: Fathom.ShardRegistry},
+        # Partitioned (review 2026-07-23 #11): the default single partition serializes every
+        # coordinator registration/unregistration/death-cleanup through one process + one ETS
+        # pair — capping coordinator CHURN (mass cold-open after failover, idle-stop waves at
+        # 10k+ coordinators, eviction storms at the soft cap) and widening the dead-pid window
+        # Shards.retry_checkout? papers over. Lookups are caller-side ETS either way.
+        {Registry,
+         keys: :unique, name: Fathom.ShardRegistry, partitions: System.schedulers_online()},
         {DynamicSupervisor, shard_supervisor_opts()}
       ] ++ warm_follower_children()
   end
