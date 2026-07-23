@@ -135,6 +135,23 @@ defmodule Fathom.Shards.LruEvictionTest do
       assert length(Lru.lru_order(100)) == 4
     end
 
+    # Review 2026-07-23 #14: lru_order was tab2list |> sort — O(N log N) + a full-table copy
+    # into the admitting stream's heap on EVERY at-capacity admission. The ordered-walk
+    # replacement requires touch to REPLACE its previous order key, or the order table would
+    # grow per checkout instead of per shard. Pre-fix (insert-only order keys) the size
+    # assertion fails at 53.
+    test "repeated touches keep one order key per shard; walk order is stamp order (#14)" do
+      Application.put_env(:fathom, :max_open_shards, 100)
+      Lru.reset()
+
+      for _ <- 1..50, do: Lru.touch("hot")
+      for i <- 1..3, do: Lru.touch("s#{i}")
+
+      # "hot" was touched last before s1..s3, so it is the coldest; s1..s3 follow in order.
+      assert Lru.lru_order(10) == ["hot", "s1", "s2", "s3"]
+      assert :ets.info(Fathom.Shards.Lru.Order, :size) == 4
+    end
+
     test "touch is a no-op when eviction is unreachable (no finite cap)" do
       Application.put_env(:fathom, :max_open_shards, :infinity)
       Lru.reset()

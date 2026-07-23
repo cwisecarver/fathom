@@ -9,12 +9,23 @@ defmodule Fathom.Shards.Lru do
   only a cold re-open if it's touched again. This table is how the router picks
   *which* idle shard is coldest.
 
-  It's a public ETS `set` of `{shard_id, monotonic_time}`, written **lock-free
-  from the checkout process** (`:ets.insert`, `write_concurrency` — the
-  `Fathom.ShardLoad` / `Fathom.Shard.WriteCounter` pattern, no GenServer hop), and
-  a stopped coordinator drops its row in `terminate` (`forget/1`). Reads
-  (`lru_order/1`) are off the hot path — only the cold at-capacity admission path
-  sorts the table.
+  It's a pair of public ETS tables written **lock-free from the checkout process**
+  (`:ets.insert`, `write_concurrency` — the `Fathom.ShardLoad` /
+  `Fathom.Shard.WriteCounter` pattern, no GenServer hop): a `set` of
+  `{shard_id, monotonic_time}` (each shard's current stamp — the authority) plus an
+  `:ordered_set` of `{{monotonic_time, shard_id}}` keys (the recency order). A
+  stopped coordinator drops its rows in `terminate` (`forget/1`).
+
+  Two tables because the probe must be cheap AT capacity (review 2026-07-23 #14):
+  the old single-table read did `tab2list |> sort` — an O(N log N) copy of the
+  whole recency table into the admitting stream's heap (milliseconds + a
+  multi-hundred-KB allocation at 30k open shards) on **every** at-capacity
+  admission, which is a dense node's designed steady state, exactly when the node
+  is saturated. `lru_order/1` now walks the ordered table from the cold end and
+  stops after `limit` validated candidates — O(probes), not O(N log N). A `touch`
+  replaces the shard's previous order key (so the order table stays ~one key per
+  shard); a concurrent-touch race can leave an occasional stale key, which the
+  walk detects (stamp ≠ the set's current stamp) and deletes lazily.
 
   `touch/1` is a **no-op unless eviction is actually reachable** (a finite
   `:max_open_shards` and `:evict_idle_at_capacity` on), so with the cap disabled
@@ -31,6 +42,10 @@ defmodule Fathom.Shards.Lru do
   # window (the soft cap silently degrading into a hard cap). The count is a best-effort HINT — the
   # `evict/2` primitive remains the atomic evict-if-idle arbiter — so a slightly-stale value is safe.
   @busy_table __MODULE__.Conns
+  # Recency order: `{{monotonic_time, shard_id}}` composite keys in an :ordered_set, walked
+  # cold-end-first by lru_order/1. The @table stamp is the authority; an order key whose stamp
+  # no longer matches is stale and lazily deleted during the walk.
+  @order_table __MODULE__.Order
 
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -49,10 +64,24 @@ defmodule Fathom.Shards.Lru do
   """
   @spec touch(String.t()) :: :ok
   def touch(shard_id) do
-    if enabled?(), do: :ets.insert(@table, {shard_id, System.monotonic_time()})
+    if enabled?() do
+      stamp = System.monotonic_time()
+
+      # Replace the previous order key so the order table stays ~one key per shard rather than
+      # growing per checkout. Two concurrent touches of one shard can each delete the same old
+      # key and insert their own — the loser's key goes stale and the probe walk cleans it.
+      case :ets.lookup(@table, shard_id) do
+        [{^shard_id, prev}] -> :ets.delete(@order_table, {prev, shard_id})
+        _ -> :ok
+      end
+
+      :ets.insert(@table, {shard_id, stamp})
+      :ets.insert(@order_table, {{stamp, shard_id}})
+    end
+
     :ok
   rescue
-    # The table only exists once this process has started; a checkout during boot
+    # The tables only exist once this process has started; a checkout during boot
     # (or in a test that didn't start it) must not crash the open path.
     ArgumentError -> :ok
   end
@@ -84,6 +113,13 @@ defmodule Fathom.Shards.Lru do
   @doc "Drop a shard's rows (called from the coordinator's terminate)."
   @spec forget(String.t()) :: :ok
   def forget(shard_id) do
+    # Drop the current order key too (a touch racing this forget can leave a stray —
+    # the probe walk cleans it lazily).
+    case :ets.lookup(@table, shard_id) do
+      [{^shard_id, stamp}] -> :ets.delete(@order_table, {stamp, shard_id})
+      _ -> :ok
+    end
+
     :ets.delete(@table, shard_id)
     :ets.delete(@busy_table, shard_id)
     :ok
@@ -94,24 +130,44 @@ defmodule Fathom.Shards.Lru do
   @doc """
   Up to `limit` **idle** shard ids, least-recently-used first — the eviction candidate order. Busy
   shards (a checked-out connection per `record_conns/2`) are filtered out BEFORE the `limit` cut (#14),
-  so the caller's bounded probe never wastes its slots on shards that can't be evicted anyway. Off the
-  hot path (cold at-capacity admission only), so the full sort + filter is fine.
+  so the caller's bounded probe never wastes its slots on shards that can't be evicted anyway.
+
+  Walks the ordered table from the cold end, stopping after `limit` validated candidates —
+  O(probes + stale/busy skipped), never the old full `tab2list |> sort` (review 2026-07-23 #14).
+  Stale keys met along the way are deleted (self-cleaning), so each is visited at most once.
   """
   @spec lru_order(pos_integer()) :: [String.t()]
   def lru_order(limit) when is_integer(limit) and limit > 0 do
-    @table
-    |> :ets.tab2list()
-    |> Enum.sort_by(fn {_id, t} -> t end)
-    |> Enum.flat_map(fn {id, _t} -> if busy?(id), do: [], else: [id] end)
-    |> Enum.take(limit)
+    collect_idle(:ets.first(@order_table), limit, [])
   rescue
     ArgumentError -> []
+  end
+
+  defp collect_idle(_key, 0, acc), do: Enum.reverse(acc)
+  defp collect_idle(:"$end_of_table", _limit, acc), do: Enum.reverse(acc)
+
+  defp collect_idle({stamp, id} = key, limit, acc) do
+    next = :ets.next(@order_table, key)
+
+    case :ets.lookup(@table, id) do
+      [{^id, ^stamp}] ->
+        # Current — a real candidate unless busy (busy keeps its key: still valid recency).
+        if busy?(id),
+          do: collect_idle(next, limit, acc),
+          else: collect_idle(next, limit - 1, [id | acc])
+
+      _ ->
+        # Superseded stamp or forgotten shard — self-clean and keep walking.
+        :ets.delete(@order_table, key)
+        collect_idle(next, limit, acc)
+    end
   end
 
   @doc false
   def reset do
     :ets.delete_all_objects(@table)
     :ets.delete_all_objects(@busy_table)
+    :ets.delete_all_objects(@order_table)
   end
 
   @impl true
@@ -121,6 +177,14 @@ defmodule Fathom.Shards.Lru do
     opts = [:set, :public, :named_table, write_concurrency: true, read_concurrency: true]
     :ets.new(@table, opts)
     :ets.new(@busy_table, opts)
+
+    :ets.new(@order_table, [
+      :ordered_set,
+      :public,
+      :named_table,
+      write_concurrency: true,
+      read_concurrency: true
+    ])
 
     {:ok, %{}}
   end
