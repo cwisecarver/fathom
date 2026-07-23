@@ -29,6 +29,15 @@ defmodule Fathom.Admin.Measurements do
   """
   @spec durability() :: :ok
   def durability do
+    # O(open shards) walk (a FlushWatermark snapshot copy + one counter read per shard):
+    # skip it entirely when the observability layer is off — nothing consumes the event,
+    # and the walk scales linearly with density (review 2026-07-23 #30). node_memory/0
+    # stays ungated (a single :erlang.memory call, effectively free).
+    if Fathom.Admin.enabled?(), do: do_durability()
+    :ok
+  end
+
+  defp do_durability do
     now = System.monotonic_time(:millisecond)
     gen = WriteCounter.generation()
 

@@ -567,6 +567,12 @@ defmodule Fathom.Shards do
   defp start_if_capacity(shard_id) do
     # The deleted/suspended lifecycle denies are enforced in ensure/1 (above), before we ever
     # reach here — so start_if_capacity only weighs capacity + novel-rate.
+    #
+    # Novelty ("nothing knows the shard") is consulted by BOTH the rate limiter and
+    # fork-from-template, so it's computed AT MOST ONCE per open (review 2026-07-23 #28 —
+    # with both gates on it ran twice: two File.exists? stats + two synchronous directory
+    # reads, doubling novel-open control-plane latency under exactly the signup/spray
+    # traffic these gates target). Neither gate on ⇒ no stat and no Postgres read at all.
     cond do
       # At the cap, first try to make room by evicting the least-recently-used IDLE
       # shard (soft cap). Only if nothing idle can be evicted do we refuse — a node
@@ -577,15 +583,21 @@ defmodule Fathom.Shards do
         :telemetry.execute([:fathom, :shards, :at_capacity], %{count: 1}, %{shard_id: shard_id})
         {:error, :node_at_capacity}
 
-      # The churn half of finding #14: the cap above bounds how many shards this node holds
-      # open; this bounds how FAST unseen ids can mint new ones (coordinator + fds + file +
-      # S3 lock PUT + Postgres row per novel id). Refused before any of that work runs.
-      novel_refused?(shard_id) ->
-        {:error, :novel_shard_rate_limited}
-
       true ->
-        maybe_fork_novel(shard_id)
-        start(shard_id)
+        rate_gated? = Application.get_env(:fathom, :novel_shard_rate) != nil
+        fork_gated? = Application.get_env(:fathom, :fork_from_template, false)
+        novel? = (rate_gated? or fork_gated?) and novel_shard?(shard_id)
+
+        # The churn half of finding #14: the cap above bounds how many shards this node
+        # holds open; this bounds how FAST unseen ids can mint new ones (coordinator +
+        # fds + file + S3 lock PUT + Postgres row per novel id). Refused before any of
+        # that work runs.
+        if rate_gated? and novel? and limiter_refused?(shard_id) do
+          {:error, :novel_shard_rate_limited}
+        else
+          if fork_gated? and novel?, do: fork_novel(shard_id)
+          start(shard_id)
+        end
     end
   end
 
@@ -598,11 +610,8 @@ defmodule Fathom.Shards do
   # Postgres trouble, a concurrent forker holding the lease) falls back to today's
   # born-empty behavior — a checkout is NEVER failed for the fork. Flag off ⇒ one get_env
   # on the (already cold) novel-open path, nothing on the hot path.
-  defp maybe_fork_novel(shard_id) do
-    if Application.get_env(:fathom, :fork_from_template, false) and novel_shard?(shard_id) do
-      _ = Fathom.Migrator.fork_from_template(shard_id)
-    end
-
+  defp fork_novel(shard_id) do
+    _ = Fathom.Migrator.fork_from_template(shard_id)
     :ok
   rescue
     _ -> :ok
@@ -707,22 +716,6 @@ defmodule Fathom.Shards do
   # already stopped without its `forget` having landed) so we don't count a no-op
   # `drain/2` on an already-gone shard as having freed a slot.
   defp shard_open?(shard_id), do: Registry.lookup(@registry, shard_id) != []
-
-  # Should this open be refused as an over-rate NOVEL creation? Only consulted on the
-  # registry-miss path, and only does work when `:novel_shard_rate` is configured (nil =
-  # off, the default — the cold path pays one get_env). "Novel" = nothing knows the shard:
-  # no local file (a present file is an authoritative un-flushed copy) and no directory row.
-  defp novel_refused?(shard_id) do
-    case Application.get_env(:fathom, :novel_shard_rate) do
-      nil ->
-        false
-
-      _rate ->
-        not File.exists?(Fathom.Shard.db_path(shard_id)) and
-          not known_to_directory?(shard_id) and
-          limiter_refused?(shard_id)
-    end
-  end
 
   # The limiter call needs the same exit protection the directory read below has
   # (expert review #28): the limiter's own backpressure model is mailbox saturation,
