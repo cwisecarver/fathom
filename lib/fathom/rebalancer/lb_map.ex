@@ -71,7 +71,7 @@ defmodule Fathom.Rebalancer.LbMap do
           |> Enum.reject(fn {n, _addr} -> n == node end)
           |> Enum.map_join("", fn {_n, addr} -> "\n    server #{addr} backup;" end)
 
-        "upstream #{upstream_name(node)} {\n    server #{addr} max_fails=2 fail_timeout=10s;#{backups}\n    keepalive 16;\n}"
+        "upstream #{upstream_name(node)} {\n    server #{addr} max_fails=2 fail_timeout=10s;#{backups}\n    keepalive 16;\n    keepalive_timeout 30s;\n}"
       end)
 
     map_body = if entries == "", do: "", else: "\n" <> entries

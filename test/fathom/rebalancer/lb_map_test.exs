@@ -36,11 +36,11 @@ defmodule Fathom.Rebalancer.LbMapTest do
 
     # fathom1's pin: fathom1 primary, fathom2 as backup.
     assert out =~
-             ~r/upstream fathom_pin_fathom1 \{\n    server fathom1:8080 max_fails=2 fail_timeout=10s;\n    server fathom2:8080 backup;\n    keepalive 16;\n\}/
+             ~r/upstream fathom_pin_fathom1 \{\n    server fathom1:8080 max_fails=2 fail_timeout=10s;\n    server fathom2:8080 backup;\n    keepalive 16;\n    keepalive_timeout 30s;\n\}/
 
     # fathom2's pin: fathom2 primary, fathom1 as backup.
     assert out =~
-             ~r/upstream fathom_pin_fathom2 \{\n    server fathom2:8080 max_fails=2 fail_timeout=10s;\n    server fathom1:8080 backup;\n    keepalive 16;\n\}/
+             ~r/upstream fathom_pin_fathom2 \{\n    server fathom2:8080 max_fails=2 fail_timeout=10s;\n    server fathom1:8080 backup;\n    keepalive 16;\n    keepalive_timeout 30s;\n\}/
   end
 
   test "a single-node fleet renders a pin upstream with no backup server" do
@@ -48,7 +48,7 @@ defmodule Fathom.Rebalancer.LbMapTest do
     out = LbMap.render([], %{"solo" => "solo:8080"}, "fathom.test")
 
     assert out =~
-             "upstream fathom_pin_solo {\n    server solo:8080 max_fails=2 fail_timeout=10s;\n    keepalive 16;\n}"
+             "upstream fathom_pin_solo {\n    server solo:8080 max_fails=2 fail_timeout=10s;\n    keepalive 16;\n    keepalive_timeout 30s;\n}"
 
     refute out =~ "backup;"
   end
