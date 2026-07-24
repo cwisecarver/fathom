@@ -36,7 +36,7 @@
 #   TPC_DRIVER=elixir ./chaos.sh tpcb|tpc-fleet  drive with the Filo.Client BEAM driver
 #                                 (tpc_driver.exs): one process per client instead of python's
 #                                 thread-per-client, so one box models far more concurrent clients.
-#                                 Covers rtt/tpcb; tpcc always uses the python driver.
+#                                 Covers rtt/tpcb/tpcc.
 #   TPC_NET=container TPC_DRIVER=elixir ./chaos.sh tpcb|tpc-fleet  run that driver IN-NETWORK
 #                                 (compose run driver → LB as http://lb), past the host forwarder's
 #                                 ~1k-conn ceiling. Build it once: `./chaos.sh build-driver`.
@@ -509,9 +509,9 @@ cmd_rebalance() {
 # (mix fathom.wire_bench / mix fathom.tpcc) cannot reach. Recorded-only; results go to
 # docs/reviews/. NOTE: the rig is single-host, so client→LB is loopback — the realism is the real
 # nginx LB hop + prod-release node (Bandit/Filo) + S3(MinIO)-backed storage, not a WAN RTT.
-# Driver selection: `python` (default; dep-free stdlib; the only one with a tpcc mode) or `elixir`
-# (the Filo.Client driver — one lightweight BEAM process per client instead of one python OS thread,
-# so one box models far more concurrent clients). Elixir covers rtt/tpcb; tpcc always uses python.
+# Driver selection: `python` (default; dep-free stdlib) or `elixir` (the Filo.Client driver — one
+# lightweight BEAM process per client instead of one python OS thread, so one box models far more
+# concurrent clients). Both cover rtt / tpcb / tpcc.
 TPC_DRIVER=${TPC_DRIVER:-python}
 
 # Where the elixir driver runs: `host` (default) or `container` — in-network via `compose run
@@ -532,13 +532,12 @@ tpc_prewarm() {
 }
 
 # Dispatch one driver run. tpc_run OWNS the --lb (the host $LB, or the in-network service name for a
-# containerized driver), so callers pass only the mode + workload flags. tpcc always uses python.
-# For elixir, keep only the final JSON line — insurance against Mix.install / compose chatter on a
-# cold cache.
+# containerized driver), so callers pass only the mode + workload flags. For elixir, keep only the
+# final JSON line — insurance against Mix.install / compose chatter on a cold cache.
 tpc_run() { # tpc_run <mode> [flags...]
   local mode=$1
   shift
-  if [ "$TPC_DRIVER" = elixir ] && [ "$mode" != tpcc ]; then
+  if [ "$TPC_DRIVER" = elixir ]; then
     if [ "$TPC_NET" = container ]; then
       compose run --rm -T driver "$mode" --lb "$LB_NET" "$@" | grep -E '^\{.*\}$' | tail -1
     else
@@ -560,7 +559,8 @@ cmd_tpcb() {
 
 cmd_tpcc() {
   local max_w=${1:-5} threads=${2:-8} txns=${3:-2000} scale=${4:-0.02}
-  echo "tpcc: W=1..$max_w sweep, $threads threads, $txns txns/W, scale $scale — remote client through the LB" >&2
+  echo "tpcc: W=1..$max_w sweep, $threads threads, $txns txns/W, scale $scale — remote client through the LB ($TPC_DRIVER driver)" >&2
+  tpc_prewarm
   tpc_run tpcc --domain "$DOMAIN" \
     --max-w "$max_w" --threads "$threads" --txns "$txns" --scale "$scale"
 }
