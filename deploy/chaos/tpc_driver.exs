@@ -104,21 +104,32 @@ defmodule Tpc do
   def mode_tpcb(args) do
     a = Map.put(args, :per_client, max(1, div(args.txns, args.clients)))
 
-    results =
+    raw =
       Task.async_stream(0..(a.clients - 1), fn cid -> worker(cid, a) end,
         max_concurrency: a.clients,
         timeout: :infinity,
         ordered: false
       )
-      |> Enum.map(fn {:ok, r} -> r end)
+      |> Enum.to_list()
+
+    # Workers are crash-proof (a tenant that can't connect returns an errored result), but treat any
+    # async_stream exit defensively as a fully-errored tenant rather than crashing the whole run.
+    results = for {:ok, r} <- raw, do: r
+    crashed = length(raw) - length(results)
 
     lat = Enum.flat_map(results, fn {l, _span, _e} -> l end)
     spans = Enum.map(results, fn {_l, span, _e} -> span end)
-    errs = Enum.sum(Enum.map(results, fn {_l, _span, e} -> e end))
+    errs = Enum.sum(Enum.map(results, fn {_l, _span, e} -> e end)) + crashed * a.per_client
 
     window_us =
-      Enum.max(Enum.map(spans, fn {_t0, t1} -> t1 end)) -
-        Enum.min(Enum.map(spans, fn {t0, _t1} -> t0 end))
+      case spans do
+        [] ->
+          0
+
+        _ ->
+          Enum.max(Enum.map(spans, fn {_t0, t1} -> t1 end)) -
+            Enum.min(Enum.map(spans, fn {t0, _t1} -> t0 end))
+      end
 
     tps = if window_us > 0, do: Float.round(length(lat) / (window_us / 1_000_000), 1), else: 0.0
     p = pctls(lat)
@@ -142,11 +153,29 @@ defmodule Tpc do
   end
 
   # One client = one tenant shard = one BEAM process holding one Filo.Client stream.
+  # Crash-proof: a tenant that can't establish its stream returns an errored result, never an
+  # exception (an uncaught worker exit would take down the whole run's aggregate).
   defp worker(cid, a) do
     :rand.seed(:exsss, {(cid + 1) * 7919, 104_729, 15_485_863})
-    {:ok, c} = Client.connect(a.lb, authority: authority(a, cid))
-    c = seed_with_retry(c, a.accounts, 3)
+    # Stagger the initial connect so thousands of workers don't hit the LB in one lockstep burst
+    # (a real fleet never connects simultaneously). Spread over ~N ms; negligible at small N.
+    Process.sleep(:rand.uniform(max(1, a.clients)))
 
+    case establish(a, cid, 8) do
+      {:ok, c} ->
+        run_txns(c, a)
+
+      :error ->
+        # Couldn't connect+seed after retries — on the single-host rig this is CPU starvation (the
+        # driver shares the VM with the nodes), so the server closes the idle-between-statements
+        # connection mid-seed. Count the whole tenant as errored with a valid span: an honest errs
+        # number, not a crashed run.
+        t = System.monotonic_time(:microsecond)
+        {[], {t, t}, a.per_client}
+    end
+  end
+
+  defp run_txns(c, a) do
     t0 = System.monotonic_time(:microsecond)
 
     {lat, errs, c} =
@@ -174,12 +203,31 @@ defmodule Tpc do
   defp authority(%{clients: n, shard: s, domain: d}, cid) when n > 1, do: "#{s}_#{cid}.#{d}"
   defp authority(%{shard: s, domain: d}, _cid), do: "#{s}.#{d}"
 
-  defp seed_with_retry(c, accounts, attempts) do
-    tpcb_seed(c, accounts)
+  # Open the stream and seed the shard, retrying the WHOLE thing (fresh connection) through a
+  # transient failure — a connect refused by the herd, or a mid-seed `:closed` when the server drops
+  # an idle-between-statements keepalive under load. The seed statements are idempotent
+  # (CREATE TABLE IF NOT EXISTS / INSERT OR IGNORE), so re-running on a fresh connection is safe.
+  defp establish(a, cid, attempts) do
+    with {:ok, c} <- Client.connect(a.lb, authority: authority(a, cid)),
+         {:ok, c} <- seed(c, a.accounts) do
+      {:ok, c}
+    else
+      _ ->
+        if attempts <= 1 do
+          :error
+        else
+          Process.sleep(50 + :rand.uniform(200))
+          establish(a, cid, attempts - 1)
+        end
+    end
+  end
+
+  defp seed(c, accounts) do
+    {:ok, tpcb_seed(c, accounts)}
   rescue
-    e ->
-      if attempts <= 1, do: reraise(e, __STACKTRACE__)
-      seed_with_retry(reconnect(c), accounts, attempts - 1)
+    _ ->
+      Client.close(c)
+      :error
   end
 
   defp tpcb_seed(c, accounts) do
