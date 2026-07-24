@@ -215,7 +215,19 @@ def mode_tpcb(args):
         random.seed((cid + 1) * 7919)
         shard = f"{args.shard}_{cid}" if args.clients > 1 else args.shard
         s = Stream(args.lb, args.domain, shard)
-        tpcb_seed(s, args.accounts)  # seed this tenant's own shard (untimed)
+        # Seed this tenant's own shard (untimed). Retried over a fresh connection: at high
+        # client counts the GIL-staggered cadence lets a keepalive conn idle past the
+        # server-side close (nginx 75s client / Bandit 60s), and raw http.client — unlike
+        # every real SDK — surfaces a silently-FIN'd socket as BrokenPipe instead of
+        # retrying the connect-level failure (root-caused 2026-07-23 at 1024 clients).
+        for attempt in range(3):
+            try:
+                tpcb_seed(s, args.accounts)
+                break
+            except (OSError, http.client.HTTPException):
+                if attempt == 2:
+                    raise
+                s.reconnect()
         local, e = [], 0
         t0 = time.perf_counter()
         for _ in range(per_client):
@@ -223,9 +235,13 @@ def mode_tpcb(args):
             try:
                 tpcb_txn(s, args.accounts)
                 local.append(time.perf_counter() - a)
-            except HranaError:
+            except (HranaError, OSError, http.client.HTTPException):
+                # Transient: a Hrana-level error (e.g. a rebalancer flip) OR a stale
+                # keepalive socket (BrokenPipe/reset/RemoteDisconnected — the server closed
+                # an idle conn between our requests). Real SDKs retry both; reconnect and
+                # skip this txn, counting it as a transient err either way.
                 e += 1
-                s.reconnect()  # transient (e.g. rebalancer flip) — reconnect, skip this txn
+                s.reconnect()
         t1 = time.perf_counter()
         s.close()
         with lat_lock:
