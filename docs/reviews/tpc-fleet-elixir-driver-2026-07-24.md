@@ -1,4 +1,4 @@
-# tpc-fleet with the Elixir (Filo.Client) driver — 2026-07-24 (1024 tenants from ONE process)
+# tpc-fleet with the Elixir (Filo.Client) driver — 2026-07-24 (4096 tenants from ONE process)
 
 The high-concurrency findings in [`tpc-fleet-highconc-2026-07-23.md`](tpc-fleet-highconc-2026-07-23.md)
 were all about the **Python driver's** limits, never fathom's: colima's host forwarder dies
@@ -8,8 +8,9 @@ needed **4 × 256-client processes** for 2,661 tps.
 
 This run swaps the driver for the new Elixir one — `Fathom`'s `tpc_driver.exs` over `Filo.Client`,
 one lightweight BEAM process per client — packaged as an in-network container. It clears every one
-of those driver ceilings: **6→1024 concurrent tenants from a single container, zero errors at every
-step, including the 256 point that broke the solo Python process.**
+of those driver ceilings: **6→4096 concurrent tenants from a single container, zero errors at every
+step**, including the 256 point that broke the solo Python process. (Getting past 1024 took one
+driver bugfix — see "The 2048/4096 crash" below; the fleet was never the limit.)
 
 ## Results (in-network, one `fathom-chaos-driver` container, 100 txns/tenant, 200 accounts/tenant)
 
@@ -20,61 +21,95 @@ step, including the 256 point that broke the solo Python process.**
 | 128 | 12,800 | 3,934 | 26.4 | 39.3 | 44.3 | 0 |
 | 256 | 25,600 | 3,992 | 39.4 | 59.0 | 65.7 | 0 |
 | 512 | 51,200 | 3,959 | 47.5 | 76.4 | 89.4 | 0 |
-| **1024** | **102,400** | **3,807** | **50.0** | **99.8** | **118.6** | **0** |
+| 1024 | 102,400 | 3,828 | 53.3 | 104.3 | 127.7 | 0 |
+| 2048 | 204,800 | 3,749 | 88.4 | 152.5 | 183.7 | 0 |
+| **4096** | **409,600** | **3,414** | **71.4** | **137.5** | **171.8** | **0** |
 
-Cross-LB warm `SELECT 1` RTT p50 ~200 µs (the per-statement network floor). Per-node split at 1024:
-491 / 507 / 538 shards (fathom1/2/3), 347k / 359k / 380k queries — 1,536 tenant shards, 1.09M
-queries, **spread 1.10×** (the consistent hash evening out with key count).
+Cross-LB warm `SELECT 1` RTT p50 ~200 µs (the per-statement network floor). Per-node split over the
+1024→4096 legs: 2,233 / 2,366 / 2,569 shards (fathom1/2/3), 1.58M / 1.68M / 1.82M queries — 7,168
+tenant shards, **5.08M queries, spread 1.15×** (the consistent hash stays even out to 4096 keys).
 
-## What made 1024-from-one-process work
+## What made it work
 
-1. **One BEAM process per client, no GIL.** The BEAM holds 1024 lightweight processes each owning a
-   Mint socket at ~KB of state — no thread-per-client memory, no GIL serialization. The
+1. **One BEAM process per client, no GIL.** The BEAM holds thousands of lightweight processes each
+   owning a Mint socket at ~KB of state — no thread-per-client memory, no GIL serialization. The
    ≤128-clients-per-process rule and the multi-process requirement were both Python artifacts; the
    Elixir driver has neither. The solo-256 point that was reproducibly pathological for one Python
    process (18.3% stale-keepalive churn, 10 s p95 stalls) ran clean here.
 2. **In-network container.** Driving from a container on the compose network (LB as `http://lb`)
    sidesteps colima's host port-forwarder, which dies ~1k conns. `TPC_NET=container` shells out to
    `docker compose run --rm driver …`.
-3. **Raised container `nofile`.** One held socket per client, so past ~1000 clients the driver hits
-   the container's default 1024 fd cap (EMFILE). The `driver` service sets nofile 65536/524288
-   (matching the nodes) — without it, the 1024 step would fault at the fd limit, not on anything
-   fathom does.
-4. **Shared wire codec.** The driver rides `Filo.Client`, which reuses the server's own
-   `Filo.Value` / `Filo.StmtResult` codec — no second Hrana implementation to drift. Stale-keepalive
-   and transient errors reconnect-and-retry like a real SDK (0 needed here).
+3. **Raised container `nofile`.** One held socket per client, so at 4096 clients the driver needs far
+   more than the default 1024 fds. The `driver` service sets nofile 65536/524288 (matching the
+   nodes); without it a multi-thousand-client run would fault at the fd limit.
+4. **Connect stagger + retry (the fix that unlocked 2048/4096).** Each worker jitters its initial
+   connect over ~N ms and retries connect+seed with backoff — see below.
+5. **Shared wire codec.** The driver rides `Filo.Client`, which reuses the server's own
+   `Filo.Value` / `Filo.StmtResult` codec — no second Hrana implementation to drift.
+
+## The 2048/4096 crash — a driver bug, root-caused and fixed
+
+The first 2048/4096 attempt returned **blank throughput** while the per-node counters showed the
+fleet had processed **2.27M queries, evenly split** — the classic signature of a *driver-side*
+crash, not a fleet failure. The sweep swallowed driver stderr (`2>/dev/null`); rerunning the exact
+config with stderr visible gave the real exception:
+
+```
+** (RuntimeError) tpc exec failed (CREATE TABLE IF NOT EXISTS history ...):
+   {:transport, %Mint.HTTPError{reason: :closed}}
+   tpc_driver.exs: Tpc.tpcb_seed/2 → Tpc.seed_with_retry/3 → Tpc.worker/2
+```
+
+- **It was during *seeding*, not the txn loop, and not an fd limit** (`nofile` is 65536 under
+  `compose run`, confirmed). At ≥2048 workers the connect+seed **thundering herd** — every worker
+  connecting in lockstep — plus the driver sharing the one 12-vCPU VM with all three nodes + nginx,
+  meant a worker got scheduled too slowly *between* its sequential seed statements; the server closed
+  the idle-between-statements keepalive, and the next `CREATE TABLE` failed `:closed`.
+- **The old driver couldn't cope**: `seed_with_retry` tried only 3 times (all hitting the same herd),
+  then **reraised** → the worker task crashed → `mode_tpcb`'s `{:ok, r}`-only `async_stream` map hit
+  an `{:exit, _}` it didn't handle → the *whole run* crashed before printing any JSON.
+- **Fix** (fathom `f2f02e5`): stagger each worker's initial connect over ~N ms (a real fleet never
+  connects in lockstep — the key fix), retry connect+seed together with backoff (8 attempts; the seed
+  statements are idempotent so a fresh-connection re-seed is safe), make the worker return an errored
+  result instead of raising, and make `mode_tpcb` tolerate crashed workers / empty results.
+- **After the fix**: 1024/2048/4096 all complete with **0 errors** (table above). The stagger alone
+  removed the closes — it was a thundering-herd bug in the driver, not starvation and not a fathom
+  limit.
 
 ## What it means
 
-- **The single-process 1024 barrier was the driver, not fathom.** What the Python driver needed
-  4 × 256 processes to reach, one Elixir container does alone, error-free. The driving-validity
-  envelope for the Elixir driver is simply "one container, raise its nofile" — no per-process client
-  cap, no multi-process orchestration.
-- **Throughput plateaus ~3.8–4k tps on the one 12-vCPU VM**, CPU-bound, with the load partitioned
-  evenly across all three nodes (spread ≤1.14× across the whole sweep). As always, the absolute
-  txn/s is single-host-bound; the horizontal "millions" axis is the even per-node split, not the
-  one-box aggregate. Still no intra-shard convoy — each tenant is its own single-writer file.
-- **fathom/filo held every contract at every step**: zero server-side failures and zero client
-  errors across 200,000 txns, 16→1024 tenants.
+- **Every "ceiling" in this whole line of work has been the driver, not fathom.** Python needed
+  4 × 256 processes for 1024; the Elixir driver does 4096 from one container. The two crashes en
+  route (the Python solo-256 pathology, the Elixir 2048 herd) were both driver bugs — the fleet
+  processed every query at every attempt, zero server-side failures, ~5M queries at the top.
+- **Throughput plateaus ~3.4–4k tps on the one 12-vCPU VM**, CPU-bound, load partitioned evenly
+  across all three nodes (spread ≤1.15× the whole way to 4096). Absolute txn/s is single-host-bound;
+  the horizontal "millions" axis is the even per-node split, not the one-box aggregate. Still no
+  intra-shard convoy — each tenant is its own single-writer file.
+- **The driving envelope for the Elixir driver**: one in-network container, raised `nofile`, staggered
+  connects — no per-process client cap, no multi-process orchestration, out to at least 4096.
 
 ## Methodology / caveats
 
 - **Not a controlled A/B vs the Python addendum.** This run used `per_client=100, accounts=200`; the
-  2026-07-23 uniform sweep used different parameters (and larger account tables), so the ~3.8–4k tps
+  2026-07-23 uniform sweep used different parameters (and larger account tables), so the ~3.4–4k tps
   here is **not** a head-to-head throughput win over the Python 4-proc 2,661 tps — it is its own
-  datapoint in the same CPU-bound single-VM regime. The claim this run supports is about **driver
-  shape and robustness** (one process, zero errors, no client cap), not a tps delta. A parameter-
-  matched A/B is the follow-up if a tps comparison is wanted.
+  datapoint in the same CPU-bound single-VM regime. The claim is about **driver shape and robustness**
+  (one process, zero errors to 4096, no client cap), not a tps delta.
+- **Single-host contention is real but not what crashed it.** The driver co-located with the nodes on
+  one VM is why the herd could induce closes at all; on separate hosts (as in prod, where the driver
+  is not the DB) the margin is wider. The fix makes the driver robust regardless.
 - **Relative rig.** One 12-vCPU colima VM hosts all three nodes + LB + MinIO over loopback; absolute
   numbers are relative, per the standing rig caveat.
 - Reproduce: `./chaos.sh build-driver` then
-  `TPC_NET=container TPC_DRIVER=elixir ./chaos.sh tpc-fleet "16,64,128,256" 100 200` and
-  `… tpc-fleet "512,1024" 100 200`.
+  `TPC_NET=container TPC_DRIVER=elixir ./chaos.sh tpc-fleet "16,64,128,256" 100 200`,
+  `… "512,1024" 100 200`, and `… "1024,2048,4096" 100 200`.
 
 ## Provenance
 
 - `Filo.Client` (filo `39a909f`) — the Hrana client mirroring the server codec.
-- `deploy/chaos/tpc_driver.exs` (fathom `7fbd211`) — the thin Elixir driver over `Filo.Client`.
+- `deploy/chaos/tpc_driver.exs` (fathom `7fbd211`) — the thin Elixir driver over `Filo.Client`;
+  hardened for 2048/4096 (stagger + retry + crash-proof) in fathom `f2f02e5`.
 - `chaos.sh` `TPC_DRIVER` / `TPC_NET` wiring (fathom `ae48c73`).
 - `Dockerfile.driver` + `driver` compose service (fathom `74e6b22`); container `nofile` raise
   (fathom `25ff39c`).
