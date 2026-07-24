@@ -240,3 +240,10 @@ services:
     build:
       context: ../../..
       dockerfile: fathom/deploy/chaos/Dockerfile.driver
+    # One held socket per client, so driving thousands of concurrent streams needs fd headroom past
+    # the default 1024 (same reason the nodes raise it for served density). Without this the driver
+    # hits EMFILE around ~1000 clients.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
