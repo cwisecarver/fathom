@@ -29,6 +29,34 @@ Cross-LB warm `SELECT 1` RTT p50 ~200 µs (the per-statement network floor). Per
 1024→4096 legs: 2,233 / 2,366 / 2,569 shards (fathom1/2/3), 1.58M / 1.68M / 1.82M queries — 7,168
 tenant shards, **5.08M queries, spread 1.15×** (the consistent hash stays even out to 4096 keys).
 
+## Parameter-matched A/B vs the Python driver
+
+The controlled comparison: **both** drivers, **identical parameters** (`per_client=100, accounts=200`),
+both on the host over the same LB, one process each, on **distinct fresh shard namespaces**,
+interleaved per level so rig state is matched for each pair. Capped at 256 — the Python driver's
+clean single-process envelope.
+
+| clients | python txn/s | python p50 | python errs | elixir txn/s | elixir p50 | elixir errs |
+|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 1,069 | 14.5 ms | 0 | **1,712** | 8.8 ms | 0 |
+| 64 | 1,050 | 58.1 ms | 0 | **2,904** | 18.2 ms | 0 |
+| 128 | 117 ⚠ | 114.0 ms | 632 ⚠ | **2,954** | 30.9 ms | 0 |
+| 256 | 202 ⚠ | 235.3 ms | 1,213 ⚠ | **3,063** | 65.5 ms | 0 |
+
+- **Elixir wins on throughput even inside Python's clean range**: 1.6× at 16 clients, 2.8× at 64 —
+  both error-free. The BEAM drives more txn/s per process than GIL-serialized Python threads, and its
+  p50 is 2–3× lower at matched load.
+- **A single Python process collapses at ≥128** (the known ≤128-clients/proc ceiling): 117 tps with
+  632 transient reconnects at 128, 202 tps / 1,213 at 256 — GIL thrash + stale-keepalive churn. Elixir
+  at the same points is 2,954 / 3,063 tps with **zero errors**.
+- So the win is **both** dimensions — higher throughput per process *and* robustness. One Elixir
+  process scales clean through the range where one Python process falls apart, which is exactly why
+  Python needed 4 × 256 processes for 1024 while Elixir needs one for 4096.
+
+(These host single-process numbers run a touch below the in-network container sweep above — same
+driver, the host-forwarder path — but the head-to-head shape is identical. Reproduce by running both
+`tpcb` modes at matched `--clients`/`--txns`/`--accounts` on distinct `--shard` prefixes.)
+
 ## What made it work
 
 1. **One BEAM process per client, no GIL.** The BEAM holds thousands of lightweight processes each
@@ -91,11 +119,11 @@ config with stderr visible gave the real exception:
 
 ## Methodology / caveats
 
-- **Not a controlled A/B vs the Python addendum.** This run used `per_client=100, accounts=200`; the
-  2026-07-23 uniform sweep used different parameters (and larger account tables), so the ~3.4–4k tps
-  here is **not** a head-to-head throughput win over the Python 4-proc 2,661 tps — it is its own
-  datapoint in the same CPU-bound single-VM regime. The claim is about **driver shape and robustness**
-  (one process, zero errors to 4096, no client cap), not a tps delta.
+- **The head-to-head is now controlled** — see the A/B section above: matched params, same host, one
+  process each, fresh namespaces. Elixir is 1.6–2.8× faster inside Python's clean range and error-free
+  where a single Python process collapses (≥128 clients). Note the in-network *sweep* numbers
+  (~3.4–4k tps) are still not directly comparable to the Python 4-proc 2,661 (different params and
+  network position); the controlled comparison is the A/B table, not the sweep.
 - **Single-host contention is real but not what crashed it.** The driver co-located with the nodes on
   one VM is why the herd could induce closes at all; on separate hosts (as in prod, where the driver
   is not the DB) the margin is wider. The fix makes the driver robust regardless.
