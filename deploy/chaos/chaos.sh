@@ -4,6 +4,7 @@
 # this rig measures latency and demonstrates the failure modes end to end).
 #
 #   ./chaos.sh build              build the fathom release image
+#   ./chaos.sh build-driver       build the in-network elixir tpc-driver image (for TPC_NET=container)
 #   ./chaos.sh up | down | logs [svc]
 #   ./chaos.sh smoke              write+read a few tenants through the LB; check isolation
 #   ./chaos.sh owner <shard>      which node holds the shard file
@@ -36,6 +37,9 @@
 #                                 (tpc_driver.exs): one process per client instead of python's
 #                                 thread-per-client, so one box models far more concurrent clients.
 #                                 Covers rtt/tpcb; tpcc always uses the python driver.
+#   TPC_NET=container TPC_DRIVER=elixir ./chaos.sh tpcb|tpc-fleet  run that driver IN-NETWORK
+#                                 (compose run driver → LB as http://lb), past the host forwarder's
+#                                 ~1k-conn ceiling. Build it once: `./chaos.sh build-driver`.
 #   ./chaos.sh density [shards workers]  mint N novel shards through the LB; read per node
 #                                 the coordinators held (the partition) + BEAM/RSS per shard
 #                                 (the cost) — the fathom counterpart to turso_density.sh
@@ -126,6 +130,8 @@ seed() { # seed <shard>: kv table exists
 
 # -- commands -------------------------------------------------------------------
 cmd_build() { compose build migrate; }
+# The in-network elixir driver image (deploy/chaos/Dockerfile.driver), used by TPC_NET=container.
+cmd_build_driver() { compose build driver; }
 cmd_up()    { compose up -d --wait --wait-timeout 180; compose ps; }
 cmd_down()  { compose down -v --remove-orphans; }
 cmd_logs()  { compose logs -f "${1:-}"; }
@@ -508,24 +514,38 @@ cmd_rebalance() {
 # so one box models far more concurrent clients). Elixir covers rtt/tpcb; tpcc always uses python.
 TPC_DRIVER=${TPC_DRIVER:-python}
 
+# Where the elixir driver runs: `host` (default) or `container` — in-network via `compose run
+# driver`, so one driver holds far more concurrent streams than the host port-forwarder allows
+# (colima's forwarder dies ~1k conns). Build the image first: `chaos.sh build-driver`. In-network
+# the LB is a service name, so the container drives $LB_NET (http://lb), not the host's $LB.
+TPC_NET=${TPC_NET:-host}
+LB_NET=${LB_NET:-http://lb}
+
 # Compile the elixir driver's Mix.install deps once, before any captured run (Mix.install prints
 # compile logs to stdout on a cold cache — warming here keeps the captures below clean). The compile
-# happens even if the LB is down, since it precedes the connect. No-op unless TPC_DRIVER=elixir.
+# happens even if the LB is down, since it precedes the connect. Host-elixir only — the container
+# image is prewarmed at build.
 tpc_prewarm() {
-  [ "$TPC_DRIVER" = elixir ] || return 0
+  { [ "$TPC_DRIVER" = elixir ] && [ "$TPC_NET" != container ]; } || return 0
   echo "  compiling the elixir tpc driver (Mix.install, first run only) ..." >&2
   elixir tpc_driver.exs rtt --lb "$LB" --domain "$DOMAIN" --shard prewarm --samples 1 >/dev/null 2>&1 || true
 }
 
-# Dispatch one driver invocation. tpcc falls back to python (no elixir tpcc yet). For elixir, keep
-# only the final JSON line — insurance against any Mix.install chatter on stdout if the cache was cold.
-tpc_run() { # tpc_run <mode> [args...]
+# Dispatch one driver run. tpc_run OWNS the --lb (the host $LB, or the in-network service name for a
+# containerized driver), so callers pass only the mode + workload flags. tpcc always uses python.
+# For elixir, keep only the final JSON line — insurance against Mix.install / compose chatter on a
+# cold cache.
+tpc_run() { # tpc_run <mode> [flags...]
   local mode=$1
   shift
   if [ "$TPC_DRIVER" = elixir ] && [ "$mode" != tpcc ]; then
-    elixir tpc_driver.exs "$mode" "$@" | grep -E '^\{.*\}$' | tail -1
+    if [ "$TPC_NET" = container ]; then
+      compose run --rm -T driver "$mode" --lb "$LB_NET" "$@" | grep -E '^\{.*\}$' | tail -1
+    else
+      elixir tpc_driver.exs "$mode" --lb "$LB" "$@" | grep -E '^\{.*\}$' | tail -1
+    fi
   else
-    python3 tpc_driver.py "$mode" "$@"
+    python3 tpc_driver.py "$mode" --lb "$LB" "$@"
   fi
 }
 
@@ -533,15 +553,15 @@ cmd_tpcb() {
   local shards=${1:-8} txns=${2:-4000} accounts=${3:-10000}
   echo "tpcb: RTT probe + $shards tenant shards × TPC-B writes through the LB (remote client, $TPC_DRIVER driver)" >&2
   tpc_prewarm
-  tpc_run rtt --lb "$LB" --domain "$DOMAIN" --shard tpcb_rtt --samples 200
-  tpc_run tpcb --lb "$LB" --domain "$DOMAIN" --shard tpcb \
+  tpc_run rtt --domain "$DOMAIN" --shard tpcb_rtt --samples 200
+  tpc_run tpcb --domain "$DOMAIN" --shard tpcb \
     --txns "$txns" --clients "$shards" --accounts "$accounts"
 }
 
 cmd_tpcc() {
   local max_w=${1:-5} threads=${2:-8} txns=${3:-2000} scale=${4:-0.02}
   echo "tpcc: W=1..$max_w sweep, $threads threads, $txns txns/W, scale $scale — remote client through the LB" >&2
-  tpc_run tpcc --lb "$LB" --domain "$DOMAIN" \
+  tpc_run tpcc --domain "$DOMAIN" \
     --max-w "$max_w" --threads "$threads" --txns "$txns" --scale "$scale"
 }
 
@@ -894,7 +914,7 @@ cmd_tpc_fleet() {
   tpc_prewarm
 
   # The cross-LB warm-read floor every statement of every txn pays (context for the per-txn numbers).
-  local rtt; rtt=$(tpc_run rtt --lb "$LB" --domain "$DOMAIN" --shard rttprobe --samples 200 2>/dev/null | jq -r '.rtt_p50_us // 0')
+  local rtt; rtt=$(tpc_run rtt --domain "$DOMAIN" --shard rttprobe --samples 200 2>/dev/null | jq -r '.rtt_p50_us // 0')
   echo "" >&2
   echo "  cross-LB warm SELECT 1 RTT p50: $(awk -v x="$rtt" 'BEGIN{printf "%.0f", x}')µs (the per-statement network floor)"
   echo ""
@@ -906,7 +926,7 @@ cmd_tpc_fleet() {
   unset IFS
   for c in "$@"; do
     txns=$(( per_client * c ))
-    json=$(tpc_run tpcb --lb "$LB" --domain "$DOMAIN" --shard "tfleet$c" \
+    json=$(tpc_run tpcb --domain "$DOMAIN" --shard "tfleet$c" \
       --txns "$txns" --clients "$c" --accounts "$accounts" 2>/dev/null)
     tps=$(printf '%s' "$json" | jq -r '.tpcb_tps // 0')
     p50=$(printf '%s' "$json" | jq -r '.tpcb_p50_us // 0')
@@ -1065,6 +1085,7 @@ PY
 
 case "${1:-}" in
   build)       cmd_build ;;
+  build-driver) cmd_build_driver ;;
   failover-herd) shift; cmd_failover_herd "$@" ;;
   deploy)      shift; cmd_deploy "$@" ;;
   tpcb)        shift; cmd_tpcb "$@" ;;

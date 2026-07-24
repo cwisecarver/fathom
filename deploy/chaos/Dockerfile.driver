@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1
+# Elixir Hrana load-driver image for the chaos rig (deploy/chaos/tpc_driver.exs).
+#
+# Purpose: run the driver IN-NETWORK (on the compose network, hitting the LB as `http://lb`) so one
+# driver process can hold thousands of concurrent Hrana streams — one lightweight BEAM process per
+# client, past the host port-forwarder ceiling (colima's forwarder dies ~1k conns). This is the
+# whole reason the Elixir driver exists next to tpc_driver.py.
+#
+# BUILD CONTEXT IS THE PARENT OF BOTH REPOS (like the node Dockerfile), because the driver depends
+# on filo as a path dep. docker-compose.yml sets `context: ../../..` + this dockerfile; the
+# Dockerfile.driver.dockerignore next to it whitelists only what the build needs.
+#
+# No build-essential: the driver's deps are pure Elixir/Erlang (mint, jason, plug, filo) — it never
+# pulls exqlite's SQLite NIF (that is filo's test-only dep), so this image stays slim.
+
+ARG BUILDER_IMAGE=hexpm/elixir:1.19.5-erlang-27.3.4.14-debian-bookworm-20260623-slim
+FROM ${BUILDER_IMAGE}
+
+RUN apt-get update -y && apt-get install -y git \
+  && apt-get clean && rm -f /var/lib/apt/lists/*_*
+
+RUN mix local.hex --force && mix local.rebar --force
+
+# Deterministic Mix.install cache, prewarmed at build so runtime invocations are a cache hit (no
+# per-run compile). FILO_PATH points the driver at the filo copied below (the tpc_driver.exs default
+# resolves filo relative to its own dir, which is a different layout inside the image).
+ENV MIX_INSTALL_DIR=/opt/mix-install
+ENV FILO_PATH=/opt/filo
+
+# filo sits next to fathom in the build context.
+COPY filo/ /opt/filo/
+
+WORKDIR /driver
+COPY fathom/deploy/chaos/tpc_driver.exs ./
+
+# Compile filo + mint + jason into the image now. The bogus connect fails *after* Mix.install has
+# fetched+compiled everything (Mix.install runs before main), which is exactly the cache we want.
+RUN elixir tpc_driver.exs rtt --lb http://127.0.0.1:1 --samples 1 >/dev/null 2>&1 || true
+
+# `docker compose run driver <mode> <flags...>` → `elixir tpc_driver.exs <mode> <flags...>`.
+ENTRYPOINT ["elixir", "tpc_driver.exs"]

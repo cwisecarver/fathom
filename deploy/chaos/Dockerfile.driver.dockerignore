@@ -1,0 +1,9 @@
+# BuildKit per-Dockerfile ignore. Context is the PARENT of fathom/ and filo/ (see Dockerfile.driver)
+# — the driver build needs only the filo source and the one driver script.
+*
+!filo
+filo/_build
+filo/deps
+filo/.git
+filo/erl_crash.dump
+!fathom/deploy/chaos/tpc_driver.exs

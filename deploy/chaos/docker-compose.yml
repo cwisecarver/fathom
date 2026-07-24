@@ -227,3 +227,16 @@ services:
           fi
           sleep 1
         done
+
+  # One-shot Elixir Hrana load driver (deploy/chaos/tpc_driver.exs). Run IN-NETWORK so it can hold
+  # far more concurrent streams than the host port-forwarder allows — one BEAM process per client.
+  # Not started by `up` (the `tools` profile keeps it out); build it with `chaos.sh build-driver`
+  # and invoke it via `TPC_NET=container ./chaos.sh tpcb|tpc-fleet` (which shells out to
+  # `compose run --rm driver <mode> ...`, hitting the LB as http://lb). Entrypoint is the driver, so
+  # `compose run driver tpcb --lb http://lb ...` just works.
+  driver:
+    image: fathom-chaos-driver:latest
+    profiles: ["tools"]
+    build:
+      context: ../../..
+      dockerfile: fathom/deploy/chaos/Dockerfile.driver
