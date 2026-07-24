@@ -17,7 +17,7 @@
 # (~KB of state, no GIL), so one BEAM node models thousands of concurrent clients on one box.
 # (It does NOT exercise django-libsql itself; keep the Python path for that.)
 #
-# Run (standalone; Mix.install compiles Filo from ../filo on first run):
+# Run (standalone; Mix.install compiles Filo — resolved beside this repo, or $FILO_PATH — on first run):
 #   elixir deploy/chaos/tpc_driver.exs tpcb --lb http://localhost:8080 --domain fathom.test \
 #     --shard tpc --txns 20000 --clients 256 --accounts 100000
 #   elixir deploy/chaos/tpc_driver.exs rtt  --lb http://localhost:8080 --domain fathom.test --shard tpc
@@ -25,7 +25,10 @@
 # Prints a human summary to stderr and a single JSON result object to stdout (so chaos.sh can tee
 # it into a docs/reviews report), matching tpc_driver.py's contract.
 
-Mix.install([{:filo, path: "../filo"}, {:mint, "~> 1.6"}, {:jason, "~> 1.4"}])
+# Filo sits beside the fathom repo; resolve it from THIS script's location so cwd doesn't matter
+# (chaos.sh runs from deploy/chaos). $FILO_PATH overrides for other layouts / containers.
+filo_path = System.get_env("FILO_PATH") || Path.expand("../../../filo", __DIR__)
+Mix.install([{:filo, path: filo_path}, {:mint, "~> 1.6"}, {:jason, "~> 1.4"}])
 
 defmodule Tpc do
   @moduledoc "TPC workloads + one-BEAM-process-per-client orchestration over Filo.Client."

@@ -32,6 +32,10 @@
 #   ./chaos.sh tpc-fleet [tenants_csv per_client accounts]  multi-tenant TPC-B THROUGHPUT across the
 #                                 fleet: sweep the tenant count (one single-writer shard each), read
 #                                 aggregate txn/s + the per-node load split — the throughput-across-nodes run
+#   TPC_DRIVER=elixir ./chaos.sh tpcb|tpc-fleet  drive with the Filo.Client BEAM driver
+#                                 (tpc_driver.exs): one process per client instead of python's
+#                                 thread-per-client, so one box models far more concurrent clients.
+#                                 Covers rtt/tpcb; tpcc always uses the python driver.
 #   ./chaos.sh density [shards workers]  mint N novel shards through the LB; read per node
 #                                 the coordinators held (the partition) + BEAM/RSS per shard
 #                                 (the cost) — the fathom counterpart to turso_density.sh
@@ -493,23 +497,51 @@ cmd_rebalance() {
 
 # -- tpcb / tpcc: remote-client TPC over the real network through the LB --------
 # The realism layer for the TPC benchmarks (docs/tpc-benchmark-plan.md Phase 4): a real
-# libSQL/Hrana client (tpc_driver.py, dep-free stdlib) drives the workload statement-by-statement
+# libSQL/Hrana client (tpc_driver.py stdlib, or the Filo.Client tpc_driver.exs via TPC_DRIVER=elixir)
+# drives the workload statement-by-statement
 # on held streams through the LB — the true remote-client path the in-process loopback gate
 # (mix fathom.wire_bench / mix fathom.tpcc) cannot reach. Recorded-only; results go to
 # docs/reviews/. NOTE: the rig is single-host, so client→LB is loopback — the realism is the real
 # nginx LB hop + prod-release node (Bandit/Filo) + S3(MinIO)-backed storage, not a WAN RTT.
+# Driver selection: `python` (default; dep-free stdlib; the only one with a tpcc mode) or `elixir`
+# (the Filo.Client driver — one lightweight BEAM process per client instead of one python OS thread,
+# so one box models far more concurrent clients). Elixir covers rtt/tpcb; tpcc always uses python.
+TPC_DRIVER=${TPC_DRIVER:-python}
+
+# Compile the elixir driver's Mix.install deps once, before any captured run (Mix.install prints
+# compile logs to stdout on a cold cache — warming here keeps the captures below clean). The compile
+# happens even if the LB is down, since it precedes the connect. No-op unless TPC_DRIVER=elixir.
+tpc_prewarm() {
+  [ "$TPC_DRIVER" = elixir ] || return 0
+  echo "  compiling the elixir tpc driver (Mix.install, first run only) ..." >&2
+  elixir tpc_driver.exs rtt --lb "$LB" --domain "$DOMAIN" --shard prewarm --samples 1 >/dev/null 2>&1 || true
+}
+
+# Dispatch one driver invocation. tpcc falls back to python (no elixir tpcc yet). For elixir, keep
+# only the final JSON line — insurance against any Mix.install chatter on stdout if the cache was cold.
+tpc_run() { # tpc_run <mode> [args...]
+  local mode=$1
+  shift
+  if [ "$TPC_DRIVER" = elixir ] && [ "$mode" != tpcc ]; then
+    elixir tpc_driver.exs "$mode" "$@" | grep -E '^\{.*\}$' | tail -1
+  else
+    python3 tpc_driver.py "$mode" "$@"
+  fi
+}
+
 cmd_tpcb() {
   local shards=${1:-8} txns=${2:-4000} accounts=${3:-10000}
-  echo "tpcb: RTT probe + $shards tenant shards × TPC-B writes through the LB (remote client)" >&2
-  python3 tpc_driver.py rtt --lb "$LB" --domain "$DOMAIN" --shard tpcb_rtt --samples 200
-  python3 tpc_driver.py tpcb --lb "$LB" --domain "$DOMAIN" --shard tpcb \
+  echo "tpcb: RTT probe + $shards tenant shards × TPC-B writes through the LB (remote client, $TPC_DRIVER driver)" >&2
+  tpc_prewarm
+  tpc_run rtt --lb "$LB" --domain "$DOMAIN" --shard tpcb_rtt --samples 200
+  tpc_run tpcb --lb "$LB" --domain "$DOMAIN" --shard tpcb \
     --txns "$txns" --clients "$shards" --accounts "$accounts"
 }
 
 cmd_tpcc() {
   local max_w=${1:-5} threads=${2:-8} txns=${3:-2000} scale=${4:-0.02}
   echo "tpcc: W=1..$max_w sweep, $threads threads, $txns txns/W, scale $scale — remote client through the LB" >&2
-  python3 tpc_driver.py tpcc --lb "$LB" --domain "$DOMAIN" \
+  tpc_run tpcc --lb "$LB" --domain "$DOMAIN" \
     --max-w "$max_w" --threads "$threads" --txns "$txns" --scale "$scale"
 }
 
@@ -859,8 +891,10 @@ cmd_tpc_fleet() {
     rpc "$n" 'Application.put_env(:fathom, :rebalancer_enabled, false); Application.put_env(:fathom, :shard_idle_ms, 900_000); Fathom.ShardLoad.reset()' >/dev/null
   done
 
+  tpc_prewarm
+
   # The cross-LB warm-read floor every statement of every txn pays (context for the per-txn numbers).
-  local rtt; rtt=$(python3 tpc_driver.py rtt --lb "$LB" --domain "$DOMAIN" --shard rttprobe --samples 200 2>/dev/null | jq -r '.rtt_p50_us // 0')
+  local rtt; rtt=$(tpc_run rtt --lb "$LB" --domain "$DOMAIN" --shard rttprobe --samples 200 2>/dev/null | jq -r '.rtt_p50_us // 0')
   echo "" >&2
   echo "  cross-LB warm SELECT 1 RTT p50: $(awk -v x="$rtt" 'BEGIN{printf "%.0f", x}')µs (the per-statement network floor)"
   echo ""
@@ -872,7 +906,7 @@ cmd_tpc_fleet() {
   unset IFS
   for c in "$@"; do
     txns=$(( per_client * c ))
-    json=$(python3 tpc_driver.py tpcb --lb "$LB" --domain "$DOMAIN" --shard "tfleet$c" \
+    json=$(tpc_run tpcb --lb "$LB" --domain "$DOMAIN" --shard "tfleet$c" \
       --txns "$txns" --clients "$c" --accounts "$accounts" 2>/dev/null)
     tps=$(printf '%s' "$json" | jq -r '.tpcb_tps // 0')
     p50=$(printf '%s' "$json" | jq -r '.tpcb_p50_us // 0')
