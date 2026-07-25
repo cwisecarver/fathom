@@ -346,6 +346,51 @@ defmodule Fathom.DirectoryTest do
     end
   end
 
+  # Expert review 2026-07-24 #12: the only status indexes were partial on `status = 'active'`, and
+  # Postgres cannot derive `status = 'active'` from `status = 'deleted'` — so every non-active
+  # status predicate sequentially scanned the whole table, twice per node every 5 minutes for
+  # Tombstones + Suspensions alone.
+  #
+  # A partial index is only worth anything if its PREDICATE MATCHES the query — an index whose
+  # predicate the planner can't imply is dead weight at any scale, and that mismatch is invisible
+  # on a small table because a seq scan wins anyway. `enable_seqscan = off` forces the planner to
+  # reveal whether it *can* use the index, which is exactly the property under test. (Volume-based
+  # plan verification belongs in scripts/directory_scale.exs, not the unit suite.)
+  describe "non-active status partial indexes (#12)" do
+    for {status, index} <- [
+          {"deleted", "shards_deleted_index"},
+          {"suspended", "shards_suspended_index"},
+          {"migration_failed", "shards_migration_failed_index"}
+        ] do
+      test "a status = '#{status}' predicate can use #{index}" do
+        status = unquote(status)
+        index = unquote(index)
+
+        %{rows: [[exists]]} =
+          Fathom.Repo.query!(
+            "SELECT count(*) FROM pg_indexes WHERE tablename = 'shards' AND indexname = $1",
+            [index]
+          )
+
+        assert exists == 1, "#{index} is missing — the migration did not apply"
+
+        Fathom.Repo.query!("SET LOCAL enable_seqscan = off")
+
+        %{rows: rows} =
+          Fathom.Repo.query!(
+            "EXPLAIN SELECT s0.shard_id FROM shards AS s0 WHERE s0.status = $1",
+            [status]
+          )
+
+        plan = rows |> List.flatten() |> Enum.join("\n")
+
+        assert plan =~ index,
+               "the status = '#{status}' predicate does not match #{index}'s predicate, so the " <>
+                 "index can never serve it. Plan:\n#{plan}"
+      end
+    end
+  end
+
   describe "flush accounting (#28)" do
     test "record_flush_batch sets last_flushed_at and leaves last_active_at alone" do
       {:ok, row} = Directory.resolve("fa")
