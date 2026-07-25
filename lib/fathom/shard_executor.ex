@@ -162,8 +162,20 @@ defmodule Fathom.ShardExecutor do
         # reached storage. Bumping on the commit boundary re-dirties the shard so the next flush
         # re-snapshots the now-committed data. Over-counting is the safe direction (an extra flush,
         # never lost data).
-        if wrote?(result, sql) or ends_transaction?(sql),
+        # Expert review 2026-07-24 #3: the commit-boundary bump used to be UNCONDITIONAL, so a
+        # transaction in which nothing wrote still dirtied the shard. Django's ATOMIC_REQUESTS (and
+        # any transaction.atomic() around a read view) wraps reads in BEGIN…COMMIT, so a purely
+        # read-only tenant was dirty at every tick and paid a full VACUUM INTO + full-object PUT
+        # every :shard_flush_interval_ms — defeating the write-gated flush ("PUTs track writes, not
+        # open-shard count"). Gate it on whether this connection actually wrote since BEGIN. The
+        # race the unconditional bump existed for is untouched: it needs an in-flight write, which
+        # sets the flag. A transaction with no write has nothing uncommitted to lose.
+        wrote? = wrote?(result, sql)
+
+        if wrote? or (commit_boundary?(sql) and txn_wrote?(conn)),
           do: Fathom.Shard.WriteCounter.bump(shard_id)
+
+        track_txn_write(conn, sql, wrote?)
 
         # On the reserved template shard, feed each successful statement to the
         # migration capture so a Django migrate becomes a fleet version.
@@ -226,18 +238,65 @@ defmodule Fathom.ShardExecutor do
   # 0 changes) or transaction/PRAGMA control — treat control as read and everything else
   # (DDL) as a write so DDL is never dropped from durability.
   #
-  # sqlite3_changes() is not reset by a SELECT, so a read following a write on the same
-  # connection can inherit that write's change count and be over-marked dirty. That's the
-  # safe direction (an extra flush, never lost data) and the shard is already dirty from
-  # the write, so it costs nothing in practice.
+  # sqlite3_changes() is not reset by a SELECT, a BEGIN, a COMMIT or a ROLLBACK, so a statement
+  # following a write on the same connection inherits that write's change count. For a *data*
+  # statement that over-marks dirty, which is the safe direction and costs nothing (the shard is
+  # already dirty from the write).
+  #
+  # For a CONTROL statement it was actively harmful (expert review 2026-07-24 #3), which is why
+  # `control_statement?` is now tested BEFORE `changes`: a COMMIT on a long-lived connection that
+  # once wrote inherited changes()>0 and classified as a write forever after, so every read-only
+  # transaction re-dirtied the shard and paid a full VACUUM INTO + full-object PUT. That is the
+  # primary production topology — Django's recommended CONN_MAX_AGE keeps connections alive across
+  # requests — so the finding's win exists only with this ordering. No control statement can itself
+  # set sqlite3_changes, so the reorder removes inherited noise and nothing else. The commit
+  # boundary is instead governed by the per-transaction write flag below, which tracks actual
+  # writes precisely (including the `exec` script path).
+  #
+  # The RETURNING rationale is untouched: `INSERT ... RETURNING` returns columns *and* mutates
+  # rows, and is not control-prefixed, so it still reaches `changes > 0` and classifies as a write.
+  # Durable PRAGMA assignments (`user_version`) are likewise not control — `control_statement?`
+  # returns false for them — so they still classify as writes via the DDL fallthrough.
   defp wrote?(%{columns: cols, num_changes: changes}, sql) do
     cond do
+      control_statement?(sql) -> false
+      cols != [] and read_verb?(sql) -> false
       changes > 0 -> true
       cols != [] -> false
-      control_statement?(sql) -> false
       true -> true
     end
   end
+
+  # Statements whose leading verb is PROVABLY incapable of mutating the database file, so their
+  # result may ignore the inherited `sqlite3_changes()` (review 2026-07-24 #3). Without this, the
+  # first plain SELECT after any write on a long-lived connection re-classified as a write —
+  # re-dirtying the shard on every read of a Django CONN_MAX_AGE connection, which is the topology
+  # the finding is about.
+  #
+  # This is a WHITELIST, and it must stay one. The tempting inverse — "returns columns and is not
+  # `dml?` ⇒ read" — LOSES DATA: `dml?/1` is leading-keyword only and its own comment documents
+  # that a CTE-prefixed `WITH x AS (...) INSERT INTO t ... RETURNING id` is not detected, so the
+  # only thing classifying that statement as a write today is the `changes > 0` branch below.
+  # Blacklisting would make it a read, leave the shard clean, and let drop_clean delete the
+  # committed rows. **Never add `with` here.**
+  #
+  # Why the set is closed: no top-level SELECT can mutate the file (triggers fire only on
+  # INSERT/UPDATE/DELETE, SQLite has no writing table-valued functions, and `Fathom.Shard.
+  # Connection` registers no UDFs and loads no extensions — a future writing UDF would break this
+  # invariant); VALUES is a pure row constructor; EXPLAIN [QUERY PLAN] compiles and reports, it
+  # does not execute the inner statement's effects.
+  #
+  # Anything unrecognized — a leading comment, an unusual verb — simply misses the whitelist and
+  # falls through to the conservative path. The failure direction is always an extra flush, never
+  # a lost write.
+  @read_verbs ~w(select values explain)
+
+  defp read_verb?(sql) when is_binary(sql) do
+    head = sql |> String.trim_leading() |> String.slice(0, 7) |> String.downcase()
+    Enum.any?(@read_verbs, &String.starts_with?(head, &1))
+  end
+
+  defp read_verb?(_sql), do: false
 
   @control_prefixes ~w(begin commit end rollback savepoint release pragma)
 
@@ -284,6 +343,88 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp ends_transaction?(_sql), do: false
+
+  # --- per-transaction write tracking (expert review 2026-07-24 #3) -------------------------
+  #
+  # Did this connection write since its transaction opened? Lives in the OWNING process's
+  # dictionary keyed by the conn ref — the same idiom (and the same race-freedom argument) as the
+  # prepared-statement cache and the deadline watchdog: a connection is single-owner by design,
+  # one per Hrana stream, used only by that stream process.
+  #
+  # Deliberately NOT derived from the shared WriteCounter ETS value across the BEGIN/COMMIT pair:
+  # a concurrent stream writing to the same shard would bump that counter and spuriously re-dirty
+  # us on commit — safe, but common on a hot shard, which is exactly the case this finding is
+  # trying to make cheap.
+  @txn_wrote_key :txn_wrote
+
+  defp txn_wrote?(conn), do: Process.get({__MODULE__, @txn_wrote_key, conn}, false)
+
+  # BEGIN opens a fresh transaction ⇒ nothing written yet. COMMIT/END/ROLLBACK close it ⇒ reset,
+  # so a subsequent read-only transaction can't inherit this one's dirtiness. Any write sets it.
+  # Order matters: a write is recorded even on a statement that also ends a transaction (there is
+  # no such statement in SQLite today, but the ordering makes the flag's meaning unambiguous).
+  defp track_txn_write(conn, sql, wrote?) do
+    key = {__MODULE__, @txn_wrote_key, conn}
+
+    cond do
+      # BEGIN first, deliberately: a BEGIN cannot itself write, so it always opens a clean
+      # transaction regardless of how the classifier scored it.
+      begins_transaction?(sql) -> Process.put(key, false)
+      wrote? -> Process.put(key, true)
+      # Only a statement that actually ENDS the transaction may clear the flag. Notably absent:
+      # RELEASE (an inner savepoint release commits nothing — the outer COMMIT must still re-bump
+      # if a flush straddles it) and `ROLLBACK TO <savepoint>` (see rolls_back?/1).
+      ends_transaction?(sql) or rolls_back?(sql) -> Process.delete(key)
+      true -> :ok
+    end
+
+    :ok
+  end
+
+  # Mark the connection as having written, without a statement to classify — the `exec` script
+  # path, which presumes a write and bumps unconditionally. Without this, a BEGIN (query path) →
+  # write (exec path) → COMMIT (query path) sequence would find the flag false at COMMIT and skip
+  # the boundary re-bump, reopening the mid-transaction watermark race for scripts.
+  defp mark_txn_write(conn), do: Process.put({__MODULE__, @txn_wrote_key, conn}, true)
+
+  defp forget_txn_write(conn), do: Process.delete({__MODULE__, @txn_wrote_key, conn})
+
+  defp begins_transaction?(sql) when is_binary(sql) do
+    head = sql |> String.trim_leading() |> String.slice(0, 5) |> String.downcase()
+    String.starts_with?(head, "begin")
+  end
+
+  defp begins_transaction?(_sql), do: false
+
+  # Statements at which in-flight writes become durable-able and the shard must be re-dirtied if
+  # the transaction wrote: COMMIT/END, plus RELEASE. RELEASE matters because `ends_transaction?`
+  # matches only commit/end, while a client using savepoints alone (`SAVEPOINT a; …; RELEASE a`)
+  # never issues a COMMIT — so without this a flush straddling the savepoint would advance the
+  # watermark past the uncommitted rows and the idle drop would lose them. Django opens nested
+  # `atomic()` blocks as savepoints, so this is a live shape. An inner RELEASE that commits nothing
+  # costs at most one spurious bump (over-dirty, the safe direction).
+  defp commit_boundary?(sql), do: ends_transaction?(sql) or releases_savepoint?(sql)
+
+  defp releases_savepoint?(sql) when is_binary(sql) do
+    head = sql |> String.trim_leading() |> String.slice(0, 7) |> String.downcase()
+    String.starts_with?(head, "release")
+  end
+
+  defp releases_savepoint?(_sql), do: false
+
+  # A plain `ROLLBACK` [TRANSACTION] discards the whole transaction — nothing is left to flush, so
+  # the flag resets. `ROLLBACK [TRANSACTION] TO [SAVEPOINT] name` does NOT end the transaction: it
+  # rewinds to a savepoint, leaving every pre-savepoint write live and uncommitted. Clearing the
+  # flag there would drop that write's re-bump at the eventual COMMIT and lose it on idle drop —
+  # exactly Django's nested-atomic-raises-then-outer-commit shape. When in doubt, KEEP the flag:
+  # keeping over-bumps (safe), clearing loses data.
+  defp rolls_back?(sql) when is_binary(sql) do
+    lead = sql |> String.trim_leading() |> String.slice(0, 40) |> String.downcase()
+
+    String.starts_with?(lead, "rollback") and not String.contains?(lead, " to ")
+  end
+
+  defp rolls_back?(_sql), do: false
 
   # The assignment form (`pragma [db.]name = value`) of a header-writing pragma; the
   # bare read form (`pragma user_version`) has no `=` and stays a read.
@@ -343,6 +484,10 @@ defmodule Fathom.ShardExecutor do
             # script's writes (same class as the RETURNING bug). A script is presumed to write, so
             # bump unconditionally.
             Fathom.Shard.WriteCounter.bump(shard_id)
+
+            # …and record it against the open transaction, so a BEGIN (query) → write (exec) →
+            # COMMIT (query) sequence still re-bumps at the commit boundary (review 2026-07-24 #3).
+            mark_txn_write(conn)
             # On the template shard, a script is (part of) a migration — feed it to capture.
             capture(opts.template?, conn, sql)
             :ok
@@ -377,6 +522,7 @@ defmodule Fathom.ShardExecutor do
   def close({pid, ref, conn, _shard_id, _scope, opts}) do
     Connection.close(conn)
     Shard.checkin(pid, ref)
+    forget_txn_write(conn)
     if opts.template?, do: Capture.forget(conn)
     :ok
   end

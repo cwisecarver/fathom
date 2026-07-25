@@ -198,6 +198,223 @@ defmodule Fathom.ShardDurabilityTest do
     ShardExecutor.close(conn2)
   end
 
+  # Expert review 2026-07-24 #3: the commit-boundary bump above used to be UNCONDITIONAL, so a
+  # transaction in which NOTHING wrote still dirtied the shard. Django's ATOMIC_REQUESTS (and any
+  # transaction.atomic() around a read view) wraps plain reads in BEGIN…COMMIT, so a purely
+  # read-only tenant was dirty at every tick and paid a full VACUUM INTO + full-object PUT every
+  # :shard_flush_interval_ms — defeating the write-gated flush whose whole point is that
+  # "durability PUTs track WRITES, not open-shard count". Pins the read-only half of the boundary
+  # rule; the test directly above pins the write half, and both must hold.
+  test "a read-only transaction does not dirty the shard", %{shard: shard} do
+    {:ok, setup_conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(setup_conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(setup_conn, stmt("INSERT INTO kv VALUES (1, 'alice')"))
+    :ok = ShardExecutor.close(setup_conn)
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    # Clean baseline: flush the seed so flushed_through == count.
+    flush_now(coordinator)
+    refute dirty?(shard)
+
+    before = Fathom.Shard.WriteCounter.count(shard)
+
+    # A fresh connection, so sqlite3_changes() starts at 0 and BEGIN cannot inherit the seed's
+    # change count. This is the exact shape Django emits for a read view under ATOMIC_REQUESTS.
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("BEGIN"))
+
+    assert {:ok, %StmtResult{rows: [["alice"]]}} =
+             ShardExecutor.execute(conn, stmt("SELECT v FROM kv WHERE k = 1"))
+
+    {:ok, _} = ShardExecutor.execute(conn, stmt("COMMIT"))
+
+    assert Fathom.Shard.WriteCounter.count(shard) == before,
+           "a BEGIN/SELECT/COMMIT wrote nothing, so the COMMIT must not bump the write counter"
+
+    refute dirty?(shard),
+           "a read-only transaction must leave the shard clean — otherwise every read-only tenant " <>
+             "pays a full-file VACUUM + object PUT every flush interval"
+
+    :ok = ShardExecutor.close(conn)
+  end
+
+  # The finding's REAL acceptance test: the same shape on a PERSISTENT connection that already
+  # wrote — Django's recommended CONN_MAX_AGE keeps connections alive across requests, so this,
+  # not the fresh-connection case, is the primary production topology. sqlite3_changes() is not
+  # reset by SELECT/BEGIN/COMMIT/ROLLBACK, so before the classifier reorder the COMMIT inherited
+  # changes()>0 from the earlier write and classified as a write forever after — every subsequent
+  # read-only transaction re-dirtied the shard. Fails pre-reorder.
+  test "a read-only transaction on a connection that already wrote does not dirty the shard", %{
+    shard: shard
+  } do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("BEGIN"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (1, 'alice')"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("COMMIT"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    flush_now(coordinator)
+    refute dirty?(shard)
+
+    before = Fathom.Shard.WriteCounter.count(shard)
+
+    # Same long-lived connection, now serving a read view.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("BEGIN"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("SELECT v FROM kv WHERE k = 1"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("COMMIT"))
+
+    assert Fathom.Shard.WriteCounter.count(shard) == before,
+           "a read-only transaction on a persistent connection must not inherit the earlier " <>
+             "write's sqlite3_changes() and re-dirty the shard"
+
+    refute dirty?(shard)
+    :ok = ShardExecutor.close(conn)
+  end
+
+  # THE GUARD ON THE READ-VERB WHITELIST. `wrote?/2` ignores the inherited sqlite3_changes() for a
+  # column-returning statement only when its leading verb is whitelisted (select/values/explain).
+  # This test exists to fail if anyone ever "simplifies" that whitelist into the inverse blacklist
+  # ("returns columns and is not dml? ⇒ read"): `dml?/1` is leading-keyword only and explicitly
+  # does NOT detect a CTE-prefixed write, so under a blacklist this statement would classify as a
+  # read, the shard would stay clean, and drop_clean would delete the committed rows. The only
+  # thing classifying it as a write is the `changes > 0` branch. NEVER add `with` to @read_verbs.
+  test "a CTE-prefixed INSERT ... RETURNING dirties the shard and survives an idle drop", %{
+    shard: shard
+  } do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    {:ok, _} =
+      ShardExecutor.execute(conn, stmt("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    flush_now(coordinator)
+    refute dirty?(shard)
+
+    # Leading keyword is WITH, so dml?/1 does not see it — only changes>0 marks it a write.
+    {:ok, _} =
+      ShardExecutor.execute(
+        conn,
+        stmt("WITH x AS (SELECT 7 AS v) INSERT INTO t (v) SELECT v FROM x RETURNING id")
+      )
+
+    assert dirty?(shard), "a CTE-prefixed write must dirty the shard"
+
+    close_and_stop(shard, conn)
+    refute File.exists?(local_db(shard)), "idle drop removed the local copy"
+
+    {:ok, conn2} = ShardExecutor.open(shard)
+
+    assert {:ok, %StmtResult{rows: [[7]]}} =
+             ShardExecutor.execute(conn2, stmt("SELECT v FROM t")),
+           "the CTE-prefixed write must survive the idle drop"
+
+    ShardExecutor.close(conn2)
+  end
+
+  # The whitelist members themselves must stay clean on a connection that already wrote.
+  test "whitelisted read verbs leave a written-on connection clean", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (1, 'alice')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    flush_now(coordinator)
+    refute dirty?(shard)
+
+    before = Fathom.Shard.WriteCounter.count(shard)
+
+    # Each of these inherits the INSERT's sqlite3_changes()=1 and must still classify as a read.
+    for sql <- ["SELECT v FROM kv", "VALUES (1)", "EXPLAIN SELECT v FROM kv"] do
+      {:ok, _} = ShardExecutor.execute(conn, stmt(sql))
+
+      assert Fathom.Shard.WriteCounter.count(shard) == before,
+             "#{sql} must not inherit the earlier write's change count"
+    end
+
+    refute dirty?(shard)
+    :ok = ShardExecutor.close(conn)
+  end
+
+  # Savepoint-only commit boundary. A client using savepoints alone never issues a COMMIT, and
+  # `ends_transaction?` matches only commit/end — so a flush straddling `SAVEPOINT a; INSERT;
+  # <0-row UPDATE>; RELEASE a` advanced the watermark past the uncommitted INSERT with nothing to
+  # re-dirty the shard, and the idle drop deleted it. RELEASE is now a commit boundary. Same
+  # end-to-end probe as the 0-row-straddle test above: drop, cold-pull, assert the row survived.
+  test "a savepoint released across a flush is not lost on drop", %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    flush_now(coordinator)
+    refute dirty?(shard)
+
+    {:ok, _} = ShardExecutor.execute(conn, stmt("SAVEPOINT a"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (1, 'alice')"))
+    # Resets sqlite3_changes() to 0 so the RELEASE cannot ride inherited changes.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("UPDATE kv SET v = 'x' WHERE 1 = 0"))
+
+    flush_now(coordinator)
+
+    refute dirty?(shard),
+           "the mid-savepoint flush advances the watermark past the uncommitted row"
+
+    {:ok, _} = ShardExecutor.execute(conn, stmt("RELEASE a"))
+
+    close_and_stop(shard, conn)
+    refute File.exists?(local_db(shard)), "idle drop removed the local copy"
+
+    {:ok, conn2} = ShardExecutor.open(shard)
+
+    assert {:ok, %StmtResult{rows: [["alice"]]}} =
+             ShardExecutor.execute(conn2, stmt("SELECT v FROM kv WHERE k = 1")),
+           "the released savepoint's row must survive the flush-straddle + idle drop"
+
+    ShardExecutor.close(conn2)
+  end
+
+  # `ROLLBACK TO <savepoint>` does NOT end the transaction — it rewinds to the savepoint, leaving
+  # every pre-savepoint write live and uncommitted. Treating it as a plain ROLLBACK cleared the
+  # per-transaction write flag, so the eventual COMMIT skipped its boundary re-bump and a
+  # straddling flush lost the pre-savepoint INSERT. This is Django's nested-atomic-block-raises,
+  # outer-block-commits shape.
+  test "a rollback to savepoint does not discard the outer transaction's write", %{shard: shard} do
+    Application.put_env(:fathom, :shard_idle_ms, 50)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    flush_now(coordinator)
+    refute dirty?(shard)
+
+    {:ok, _} = ShardExecutor.execute(conn, stmt("BEGIN"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (1, 'alice')"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("SAVEPOINT s"))
+    # The inner block's work, then it "raises" — rewound, and it zeroes sqlite3_changes() so the
+    # COMMIT cannot ride inherited changes.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("UPDATE kv SET v = 'x' WHERE 1 = 0"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("ROLLBACK TO s"))
+
+    flush_now(coordinator)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("COMMIT"))
+
+    close_and_stop(shard, conn)
+    refute File.exists?(local_db(shard)), "idle drop removed the local copy"
+
+    {:ok, conn2} = ShardExecutor.open(shard)
+
+    assert {:ok, %StmtResult{rows: [["alice"]]}} =
+             ShardExecutor.execute(conn2, stmt("SELECT v FROM kv WHERE k = 1")),
+           "the outer transaction's row must survive a ROLLBACK TO savepoint"
+
+    ShardExecutor.close(conn2)
+  end
+
   # Expert review 2026-07-14 #14: a stream holding a checked-out connection can be killed in the
   # window between a write's SQLite commit (fsynced to the local WAL) and its post-hoc
   # WriteCounter.bump — leaving a committed write durable-on-disk but UN-counted. The coordinator
