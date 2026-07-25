@@ -315,7 +315,8 @@ defmodule Tpc do
         "rtt" -> mode_rtt(a)
         "tpcb" -> mode_tpcb(a)
         "tpcc" -> Tpcc.run(a)
-        other -> raise "unknown mode #{other} (rtt|tpcb|tpcc)"
+        "tpcc-fleet" -> Tpcc.fleet(a)
+        other -> raise "unknown mode #{other} (rtt|tpcb|tpcc|tpcc-fleet)"
       end
 
     IO.puts(Jason.encode!(out))
@@ -445,6 +446,130 @@ defmodule Tpcc do
         Map.put(row, "tpcc_#{txn_name(t)}_#{k}", v)
       end)
     end)
+  end
+
+  # --- tenant fleet: N concurrent tenants, each a shard running a 1-warehouse TPC-C ------------
+  # The multi-tenant analog of the W-sweep. `run/1` drives `threads` workers at ONE shard (the
+  # single-warehouse lock convoy); `fleet/1` drives ONE worker at each of `clients` shards, so the
+  # TPC-C load partitions across the fleet like tpc-fleet's TPC-B — but with the heavier value-fed mix.
+  def fleet(args) do
+    a = Map.put(args, :per_client, max(1, div(args.txns, args.clients)))
+
+    raw =
+      Task.async_stream(0..(a.clients - 1), fn cid -> fleet_worker(cid, a) end,
+        max_concurrency: a.clients,
+        timeout: :infinity,
+        ordered: false
+      )
+      |> Enum.to_list()
+
+    results = for {:ok, r} <- raw, do: r
+    crashed = length(raw) - length(results)
+
+    lat = Enum.flat_map(results, & &1.lat)
+    new_order = Enum.sum(Enum.map(results, & &1.new_order))
+    errors = Enum.sum(Enum.map(results, & &1.errors)) + crashed * a.per_client
+    spans = Enum.map(results, & &1.span)
+
+    window_us =
+      case spans do
+        [] ->
+          0
+
+        _ ->
+          Enum.max(Enum.map(spans, fn {_t0, t1} -> t1 end)) -
+            Enum.min(Enum.map(spans, fn {t0, _t1} -> t0 end))
+      end
+
+    tps = if window_us > 0, do: Float.round(length(lat) / (window_us / 1_000_000), 1), else: 0.0
+    tpmc = if window_us > 0, do: Float.round(new_order / (window_us / 60_000_000), 1), else: 0.0
+    p = Tpc.pctls(lat)
+
+    IO.puts(
+      :stderr,
+      "  tpcc-fleet: #{length(lat)} TPC-C txns across #{a.clients} tenants, tpmC=#{tpmc} " <>
+        "tps=#{tps} (#{errors} errs) — p50=#{p["p50_us"]}µs p95=#{p["p95_us"]}µs p99=#{p["p99_us"]}µs"
+    )
+
+    %{
+      "mode" => "tpcc_fleet",
+      "tenant_shards" => a.clients,
+      "txns" => length(lat),
+      "errors" => errors,
+      "tpcc_fleet_tpmc" => tpmc,
+      "tpcc_fleet_tps" => tps
+    }
+    |> Map.merge(for {k, v} <- p, into: %{}, do: {"tpcc_fleet_#{k}", v})
+  end
+
+  # One tenant = one shard = one BEAM process running a 1-warehouse TPC-C on a held stream.
+  defp fleet_worker(cid, a) do
+    :rand.seed(:exsss, {(cid + 1) * 7919, 104_729, 15_485_863})
+    # Stagger the connect burst (a fleet never connects in lockstep).
+    Process.sleep(:rand.uniform(max(1, a.clients)))
+    shard = if a.clients > 1, do: "#{a.shard}_#{cid}", else: a.shard
+    auth = "#{shard}.#{a.domain}"
+    ctx = %{w_count: 1, card: cardinalities(a.scale)}
+
+    case establish_fleet(a, auth, 8) do
+      {:ok, c} -> run_fleet_txns(c, ctx, a.per_client)
+      :error -> errored_fleet(a.per_client)
+    end
+  rescue
+    _ -> errored_fleet(a.per_client)
+  end
+
+  defp errored_fleet(per_client) do
+    t = System.monotonic_time(:microsecond)
+    %{lat: [], new_order: 0, errors: per_client, span: {t, t}}
+  end
+
+  # Connect + seed a 1-warehouse TPC-C, retried through a transient connect/seed failure.
+  defp establish_fleet(a, auth, attempts) do
+    with {:ok, c} <- Client.connect(a.lb, authority: auth),
+         {:ok, c} <- fleet_seed(c, a.scale) do
+      {:ok, c}
+    else
+      _ ->
+        if attempts <= 1 do
+          :error
+        else
+          Process.sleep(50 + :rand.uniform(200))
+          establish_fleet(a, auth, attempts - 1)
+        end
+    end
+  end
+
+  defp fleet_seed(c, scale) do
+    {:ok, Enum.reduce(schema_ddl() ++ seed_sql(1, scale), c, fn stmt, c -> x!(c, stmt) end)}
+  rescue
+    _ ->
+      Client.close(c)
+      :error
+  end
+
+  # Run per_client TPC-C txns on the held stream; flat latency list + new-order count.
+  defp run_fleet_txns(c, ctx, per_client) do
+    t0 = System.monotonic_time(:microsecond)
+
+    {lat, no, errs, c} =
+      Enum.reduce(1..per_client, {[], 0, 0, c}, fn _, {lat, no, e, c} ->
+        typ = random_type()
+        start = System.monotonic_time(:microsecond)
+
+        try do
+          {c, status} = run_txn(typ, c, ctx)
+          l = System.monotonic_time(:microsecond) - start
+          counted = typ == :new_order and status in [:committed, :rolled_back]
+          {[l | lat], no + if(counted, do: 1, else: 0), e, c}
+        rescue
+          _ -> {lat, no, e + 1, reconnect(c)}
+        end
+      end)
+
+    t1 = System.monotonic_time(:microsecond)
+    Client.close(c)
+    %{lat: lat, new_order: no, errors: errs, span: {t0, t1}}
   end
 
   # Crash-proof: a thread that can't connect/warm returns an all-errored result, never an exception.

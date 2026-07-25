@@ -33,6 +33,9 @@
 #   ./chaos.sh tpc-fleet [tenants_csv per_client accounts]  multi-tenant TPC-B THROUGHPUT across the
 #                                 fleet: sweep the tenant count (one single-writer shard each), read
 #                                 aggregate txn/s + the per-node load split — the throughput-across-nodes run
+#   TPC_NET=container ./chaos.sh tpcc-fleet [tenants_csv per_client scale]  the TPC-C analog: sweep the
+#                                 tenant count with a 1-warehouse TPC-C per tenant; aggregate tpmC +
+#                                 per-node split (elixir driver only)
 #   TPC_DRIVER=elixir ./chaos.sh tpcb|tpc-fleet  drive with the Filo.Client BEAM driver
 #                                 (tpc_driver.exs): one process per client instead of python's
 #                                 thread-per-client, so one box models far more concurrent clients.
@@ -966,6 +969,77 @@ cmd_tpc_fleet() {
   done
 }
 
+# tpcc-fleet: the TPC-C analog of tpc-fleet — N concurrent TENANTS, each its own shard running a
+# 1-warehouse TPC-C mix (heavier: value-fed, multi-statement, held streams), swept by tenant count.
+# Reads aggregate tpmC + txn/s and the per-node split, like tpc-fleet. This is the multi-tenant path
+# (partition across the fleet), NOT the single-shard convoy that `tpcc` (the W-sweep) exercises.
+# ELIXIR-ONLY (the python driver has no tpcc-fleet mode), so it forces TPC_DRIVER=elixir; combine
+# with TPC_NET=container to drive in-network. Small default --scale keeps each tenant's seed light
+# at thousands of shards.
+cmd_tpcc_fleet() {
+  local clients_csv=${1:-"8,16,32,64"} per_client=${2:-100} scale=${3:-0.005}
+  local ncount=${#NODES[@]}
+  local TPC_DRIVER=elixir
+  echo "tpcc-fleet: multi-tenant TPC-C across $ncount nodes (one 1-warehouse TPC-C shard per tenant, $TPC_NET driver)" >&2
+  echo "  sweep tenants=$clients_csv, $per_client txns/tenant, scale $scale — aggregate tpmC + per-node split" >&2
+
+  local n
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :rebalancer_enabled, false); Application.put_env(:fathom, :shard_idle_ms, 900_000); Fathom.ShardLoad.reset()' >/dev/null
+  done
+
+  tpc_prewarm
+
+  local rtt; rtt=$(tpc_run rtt --domain "$DOMAIN" --shard rttprobe --samples 200 2>/dev/null | jq -r '.rtt_p50_us // 0')
+  echo "" >&2
+  echo "  cross-LB warm SELECT 1 RTT p50: $(awk -v x="$rtt" 'BEGIN{printf "%.0f", x}')µs (the per-statement network floor)"
+  echo ""
+  echo "  --- TPC-C throughput vs tenant concurrency (one 1-wh TPC-C per tenant, no cross-tenant contention) ---"
+  printf "  %-9s %9s %10s %10s %9s %9s %6s\n" tenants txns "tpmC" "txn/s" "p50 ms" "p99 ms" errs
+  local c txns json tpmc tps p50 p99 errs
+  local IFS=,
+  set -f; set -- $clients_csv; set +f
+  unset IFS
+  for c in "$@"; do
+    txns=$(( per_client * c ))
+    json=$(tpc_run tpcc-fleet --domain "$DOMAIN" --shard "tcfleet$c" \
+      --txns "$txns" --clients "$c" --scale "$scale" 2>/dev/null)
+    tpmc=$(printf '%s' "$json" | jq -r '.tpcc_fleet_tpmc // 0')
+    tps=$(printf '%s' "$json" | jq -r '.tpcc_fleet_tps // 0')
+    p50=$(printf '%s' "$json" | jq -r '.tpcc_fleet_p50_us // 0')
+    p99=$(printf '%s' "$json" | jq -r '.tpcc_fleet_p99_us // 0')
+    errs=$(printf '%s' "$json" | jq -r '.errors // 0')
+    printf "  %-9s %9s %10s %10s %9s %9s %6s\n" "$c" "$txns" "$tpmc" "$tps" \
+      "$(awk -v x="$p50" 'BEGIN{printf "%.2f", x/1000}')" \
+      "$(awk -v x="$p99" 'BEGIN{printf "%.2f", x/1000}')" "$errs"
+  done
+
+  echo ""
+  echo "  --- per-node distribution (the LB keyspace-partition carrying the TPC-C load) ---"
+  printf "  %-9s %10s %12s\n" node "shards" "queries"
+  local dist; dist=$(mktemp)
+  local total_shards=0 total_q=0 sh q
+  for n in "${NODES[@]}"; do
+    read -r sh q <<< "$(rpc "$n" 'ms = Enum.filter(Fathom.ShardLoad.snapshot(), fn m -> String.starts_with?(m.shard_id, "tcfleet") end); IO.puts("#{length(ms)} #{Enum.reduce(ms, 0, fn m, a -> a + m.queries end)}")')"
+    sh=${sh:-0}; q=${q:-0}
+    printf "  %-9s %10s %12s\n" "$n" "$sh" "$q"
+    total_shards=$(( total_shards + sh )); total_q=$(( total_q + q ))
+    echo "$sh" >> "$dist"
+  done
+  echo ""
+  local minh maxh; minh=$(sort -n "$dist" | head -1); maxh=$(sort -n "$dist" | tail -1)
+  echo "  fleet:  $total_shards TPC-C tenant shards over $ncount nodes ($total_q queries recorded), spread $(awk -v a="$maxh" -v b="$minh" 'BEGIN{printf "%.2f", (b>0)?a/b:0}')x (1.00 = perfect)."
+  echo "          Each tenant is its own 1-warehouse TPC-C file on the node the LB hashed it to, so the"
+  echo "          value-fed multi-statement load partitions across the fleet — the multi-tenant path, not"
+  echo "          the single-shard convoy that \`tpcc\` (the W-sweep) exercises. Absolute is CPU-bound by"
+  echo "          this one 12-vCPU VM; on N machines the partitioned work is ~N×."
+  rm -f "$dist"
+
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :rebalancer_enabled, true); Application.put_env(:fathom, :shard_idle_ms, 20_000)' >/dev/null
+  done
+}
+
 # cmd_deploy — the clean-shutdown (rolling-deploy) verification: the herd analog of `failover`.
 # `failover` SIGKILLs a node and measures the loss window; `deploy` SIGTERMs a node holding a HIGH
 # open-shard count and proves the graceful path flushes EVERY open shard (zero loss) — the property
@@ -1095,6 +1169,7 @@ case "${1:-}" in
   served-data) shift; cmd_served_data "$@" ;;
   latency-cost) shift; cmd_latency_cost "$@" ;;
   tpc-fleet)   shift; cmd_tpc_fleet "$@" ;;
+  tpcc-fleet)  shift; cmd_tpcc_fleet "$@" ;;
   rebalance)   shift; cmd_rebalance "$@" ;;
   hotspots)    shift; cmd_hotspots "$@" ;;
   up)          cmd_up ;;
