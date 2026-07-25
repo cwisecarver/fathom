@@ -597,6 +597,29 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  Every shard whose Hrana token floor has ever been raised, as `{shard_id, version, bumped_at}`.
+
+  `token_version` defaults to 1 and only `revoke/1`, `rotate/1`, and the reconcile sweep's
+  `raise_token_version/2` raise it, so this set is normally a tiny fraction of the fleet — one
+  bounded query replaces the per-shard TTL read-through that scaled with SHARD COUNT rather than
+  with revocation events (expert review 2026-07-24 #5). Served by
+  `shards_revoked_token_version_index`.
+
+  Absence from this set is NOT proof a shard is unrevoked — a Postgres PITR can lower
+  `token_version`, and only the durable per-shard storage floor catches that. See
+  `Fathom.HranaAuth.Revocations`: a shard with no cached entry always takes the full read-through,
+  including the storage-floor union.
+  """
+  @spec revoked_floors() :: [{String.t(), non_neg_integer(), DateTime.t() | nil}]
+  def revoked_floors do
+    Repo.all(
+      from s in Shard,
+        where: s.token_version > 1,
+        select: {s.shard_id, s.token_version, s.token_version_bumped_at}
+    )
+  end
+
+  @doc """
   Graceful zero-downtime rotation (#24): raises `token_version` (so a new token mints one higher)
   and stamps `token_version_bumped_at` = now, so `HranaAuth` keeps accepting the PREVIOUS version
   for the rotation grace window — mint-new → deploy → the old auto-hardens out. Returns

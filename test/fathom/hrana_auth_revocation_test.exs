@@ -258,4 +258,96 @@ defmodule Fathom.HranaAuthRevocationTest do
     assert {:error, %Filo.Error{status: 401}} = HranaAuth.authorize(shard, token),
            "a token below the storage-backed floor stays revoked despite the directory rollback"
   end
+
+  # Expert review 2026-07-24 #5. The per-shard TTL read-through scaled with SHARD COUNT rather than
+  # revocation events, so it was replaced with one bulk query per node per interval plus a freshness
+  # marker. These pin the safety property that makes that swap legitimate.
+  describe "bulk refresh (#5)" do
+    # THE BYPASS REGRESSION. The marker may extend freshness for an entry that EXISTS; it must never
+    # answer a miss. Absence from the bulk set proves only what the directory says, and a Postgres
+    # PITR can lower token_version — so a genuinely-revoked shard can read as unrevoked there. Only
+    # the durable storage floor catches it, and only the cold-miss read_through consults it. If
+    # anyone ever lets a fresh marker short-circuit a miss, this fails and a revoked token is
+    # accepted.
+    test "a fresh bulk marker does not answer a cache miss" do
+      shard = uniq()
+      {:ok, _} = Directory.resolve(shard)
+
+      # Directory says unrevoked (as it would after a PITR); durable storage says otherwise.
+      :ok = Fathom.Shard.Storage.put_token_floor(shard, 5)
+
+      # A completed, current bulk refresh — and no entry for this shard, exactly as a bulk load
+      # that (correctly) did not include an unrevoked shard would leave things.
+      :ets.delete(Revocations, shard)
+      :ets.insert(Revocations, {:__bulk_ok__, System.monotonic_time(:millisecond)})
+
+      assert Revocations.floor(shard) == 5,
+             "a miss must take the full read-through including the storage-floor union, even with " <>
+               "a fresh bulk marker — otherwise the marker is an auth bypass after a PITR"
+    end
+
+    test "a fresh bulk marker serves an entry whose own TTL has lapsed" do
+      shard = uniq()
+      {:ok, _} = Directory.resolve(shard)
+
+      # An entry that exists but is past its TTL: expires_at in the past.
+      :ets.insert(Revocations, {shard, 4, nil, System.monotonic_time(:millisecond) - 1})
+      :ets.insert(Revocations, {:__bulk_ok__, System.monotonic_time(:millisecond)})
+
+      assert Revocations.floor(shard) == 4,
+             "a recent bulk refresh has already reconciled every revoked shard, so a lapsed entry " <>
+               "needs no per-shard re-read"
+    end
+
+    test "a stale bulk marker leaves a lapsed entry to the normal read-through" do
+      shard = uniq()
+      {:ok, _} = Directory.resolve(shard)
+      {:ok, _} = Directory.bump_token_version(shard)
+
+      # Entry lapsed AND the marker is old ⇒ must re-read, picking up the directory's version.
+      :ets.insert(Revocations, {shard, 1, nil, System.monotonic_time(:millisecond) - 1})
+
+      :ets.insert(
+        Revocations,
+        {:__bulk_ok__, System.monotonic_time(:millisecond) - 10 * 60_000}
+      )
+
+      assert Revocations.floor(shard) == 2,
+             "with no fresh bulk refresh to vouch for it, a lapsed entry must read through"
+    end
+
+    # The monotonic guard still wins over the bulk path: a PITR-lowered directory can never lower a
+    # floor this node already knows, whether the value arrives per-shard or in bulk.
+    test "a bulk row cannot lower a floor this node already cached" do
+      shard = uniq()
+      {:ok, _} = Directory.resolve(shard)
+
+      Revocations.put(shard, 7)
+      # A bulk row carrying a LOWER version (the PITR case) applied the same way the refresh does.
+      send(
+        Revocations,
+        {:notification, :fathom_revocations, %{"shard_id" => shard, "version" => 2}}
+      )
+
+      _ = :sys.get_state(Revocations)
+
+      assert Revocations.floor(shard) == 7,
+             "versions only rise — a lower bulk/notify value must not un-revoke"
+    end
+
+    test "revoked_floors returns only shards whose floor was raised" do
+      raised = uniq()
+      untouched = uniq()
+      {:ok, _} = Directory.resolve(raised)
+      {:ok, _} = Directory.resolve(untouched)
+      {:ok, _} = Directory.bump_token_version(raised)
+
+      ids = Directory.revoked_floors() |> Enum.map(fn {id, _v, _b} -> id end)
+
+      assert raised in ids
+
+      refute untouched in ids,
+             "token_version defaults to 1, so an untouched shard stays out of the set"
+    end
+  end
 end

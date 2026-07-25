@@ -22,6 +22,27 @@ defmodule Fathom.HranaAuth.Revocations do
 
   `put/2` (revoke) and `put/3` (rotate) are called on the acting node so it sees the change
   immediately; other nodes converge within the TTL (or instantly via the notifier push).
+
+  ## Bulk refresh (expert review 2026-07-24 #5)
+
+  Per-shard TTL expiry made the read rate scale with **shard count** rather than with revocation
+  events — `distinct_shards_per_node / ttl`, i.e. thousands of Postgres point-reads per second at
+  fleet scale, each taking a repo connection from a stream process. Instead, one bounded query per
+  node per interval (`Fathom.Directory.revoked_floors/0`, served by a partial index; `token_version`
+  defaults to 1, so the set is normally a tiny fraction of the fleet) applies every revoked floor
+  through `put_max/3` and then writes a freshness marker **last**.
+
+  A lapsed entry is served while that marker is fresh. **The marker extends freshness for entries
+  that already exist — never for an absent one.** That asymmetry is load-bearing: absence from the
+  bulk set proves only what the *directory* says, and a Postgres PITR can lower `token_version`, so
+  a genuinely-revoked shard can read as unrevoked there. Only the durable per-shard storage floor
+  catches that, and only the cold-miss `read_through` consults it. Answering a miss from bulk
+  completeness would be an **auth bypass**, not merely a staleness widening — so a miss always takes
+  the full read-through, exactly as before.
+
+  If the bulk query fails the marker is simply not advanced, entries expire on their own TTLs, and
+  the module degrades to precisely its previous per-shard behaviour (including the stale-serve
+  fallback). Fail-safe by construction: no path here can lower a floor or answer a miss.
   """
   use GenServer
 
@@ -31,6 +52,7 @@ defmodule Fathom.HranaAuth.Revocations do
 
   @table __MODULE__
   @default_ttl_ms 30_000
+  @bulk_marker :__bulk_ok__
 
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -80,10 +102,46 @@ defmodule Fathom.HranaAuth.Revocations do
     # LISTEN/NOTIFY. Best-effort: without it (Oban down, bench harness) the TTL is the backstop.
     listen_for_revocations()
 
+    send(self(), :bulk_refresh)
     {:ok, %{}}
   end
 
   @impl true
+  # One bounded query per node per interval replaces the per-shard TTL read-through, whose rate
+  # scaled with SHARD COUNT rather than with revocation events (expert review 2026-07-24 #5). Rows
+  # go through `put_max/3`, which is already monotonic and grace-preserving, and the freshness
+  # marker is written LAST so it can never vouch for data that has not been applied.
+  #
+  # On failure the marker is simply not advanced: entries expire on their own TTLs and the module
+  # degrades to exactly its previous per-shard behaviour, including the stale-serve fallback.
+  # Fail-safe by construction — no path here can lower a floor or answer a miss.
+  def handle_info(:bulk_refresh, state) do
+    try do
+      rows = Directory.revoked_floors()
+
+      Enum.each(rows, fn {shard_id, version, bumped_at} ->
+        put_max(shard_id, version, bumped_at)
+      end)
+
+      :ets.insert(@table, {@bulk_marker, System.monotonic_time(:millisecond)})
+
+      :telemetry.execute([:fathom, :hrana, :revocation, :bulk], %{revoked: length(rows)}, %{
+        outcome: :ok
+      })
+    rescue
+      e ->
+        Logger.warning("revocation bulk refresh failed: #{Exception.message(e)}")
+        bulk_degraded()
+    catch
+      :exit, reason ->
+        Logger.warning("revocation bulk refresh failed: #{inspect(reason)}")
+        bulk_degraded()
+    end
+
+    Process.send_after(self(), :bulk_refresh, ttl_ms())
+    {:noreply, state}
+  end
+
   def handle_info(
         {:notification, :fathom_revocations,
          %{"shard_id" => shard_id, "version" => version} = msg},
@@ -96,10 +154,24 @@ defmodule Fathom.HranaAuth.Revocations do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
+  # An entry is fresh if its own TTL is unexpired OR the last bulk refresh is recent (expert review
+  # 2026-07-24 #5). The marker extends freshness for ENTRIES THAT ALREADY EXIST — never for an
+  # absent one, which still misses and takes the full `read_through/2` including the storage union.
+  #
+  # That asymmetry is the whole safety argument, not an optimization detail: absence from the bulk
+  # set proves only what the DIRECTORY says, and a Postgres PITR can lower `token_version` so a
+  # genuinely-revoked shard reads as unrevoked there. Only the durable per-shard storage floor
+  # catches that, and only `read_through/2` consults it. Answering a miss from bulk completeness
+  # would be an AUTH BYPASS, not merely a staleness widening.
   defp lookup(shard_id, now) do
     case :ets.lookup(@table, shard_id) do
       [{^shard_id, version, bumped_at, expires_at}] when now < expires_at ->
         {:hit, {version, bumped_at}}
+
+      [{^shard_id, version, bumped_at, _expires_at}] ->
+        # TTL lapsed, but a recent bulk refresh already reconciled every revoked shard against the
+        # directory, so this entry is as current as a per-shard re-read would make it.
+        if bulk_fresh?(now), do: {:hit, {version, bumped_at}}, else: :miss
 
       _ ->
         :miss
@@ -219,6 +291,21 @@ defmodule Fathom.HranaAuth.Revocations do
     _ -> :ok
   catch
     :exit, _ -> :ok
+  end
+
+  defp bulk_degraded do
+    :telemetry.execute([:fathom, :hrana, :revocation, :bulk], %{revoked: 0}, %{outcome: :degraded})
+  end
+
+  # The bulk-refresh freshness marker. An atom key, so it can never collide with a shard id (always
+  # a binary) and `lookup/2` can never mistake it for an entry.
+  defp bulk_fresh?(now) do
+    case :ets.lookup(@table, @bulk_marker) do
+      [{@bulk_marker, at}] -> now < at + ttl_ms()
+      _ -> false
+    end
+  rescue
+    ArgumentError -> false
   end
 
   defp ttl_ms, do: Application.get_env(:fathom, :hrana_revocation_ttl_ms, @default_ttl_ms)
