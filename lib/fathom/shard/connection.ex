@@ -50,6 +50,7 @@ defmodule Fathom.Shard.Connection do
          # keeps a backstop at ~4× the default.
          :ok <- Sqlite3.execute(conn, "PRAGMA wal_autocheckpoint=4000"),
          :ok <- maybe_foreign_keys(conn),
+         :ok <- maybe_cache_size(conn),
          :ok <- maybe_max_page_count(conn) do
       {:ok, conn}
     end
@@ -76,6 +77,31 @@ defmodule Fathom.Shard.Connection do
   # is per-connection (not persisted), so set it on every open from `:shard_max_page_count` (pages;
   # size = pages × page_size, default 4096B). A write past the cap fails `SQLITE_FULL` (mapped to the
   # `SQLITE_FULL` Hrana code) — exactly the brake a platform wants. Unset ⇒ unlimited (no cap).
+  # Make the per-connection page cache an explicit, tunable ceiling (expert review 2026-07-24 #29).
+  # SQLite's default is -2000, i.e. "up to ~2 MiB of page cache PER CONNECTION", and fathom holds one
+  # connection per Hrana stream for the stream's life. The measured density regimes (~16 KiB idle,
+  # ~220 KiB served, ~640 KiB served-with-data) are all workloads whose touched page set is small,
+  # so none of them ever approached that ceiling — which means those figures are a sample of a
+  # distribution whose tail is 2 MiB per held stream, not a bound. At 30k held streams that tail is
+  # ~60 GB.
+  #
+  # Every other resource here has an explicit cap for exactly this reason — :max_open_shards,
+  # :max_checkouts_per_shard, :query_max_rows, :shard_max_page_count, :query_timeout_ms. Page cache
+  # was the one that was missed: one tenant scanning on 50 held streams silently claims 100 MB and
+  # nothing observes or bounds it.
+  #
+  # The DEFAULT IS 2000 — exactly SQLite's effective default — so this ships as a no-op and changes
+  # no measured number. It is a knob and a declared ceiling, not a reduction: lowering it trades RAM
+  # for page re-reads on scan-heavy tenants, which is a deployment-shaped decision, not one to make
+  # blind. Negative value = KiB (SQLite's own convention); a positive value would mean *pages*, so
+  # the sign is forced here rather than left to the operator.
+  defp maybe_cache_size(conn) do
+    case Application.get_env(:fathom, :shard_cache_size_kb, 2000) do
+      kb when is_integer(kb) and kb > 0 -> Sqlite3.execute(conn, "PRAGMA cache_size=-#{kb}")
+      _ -> :ok
+    end
+  end
+
   defp maybe_max_page_count(conn) do
     case Application.get_env(:fathom, :shard_max_page_count) do
       n when is_integer(n) and n > 0 -> Sqlite3.execute(conn, "PRAGMA max_page_count=#{n}")

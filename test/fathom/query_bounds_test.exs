@@ -16,7 +16,12 @@ defmodule Fathom.QueryBoundsTest do
     shard = "qb_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      for key <- [:query_timeout_ms, :query_max_rows, :max_checkouts_per_shard],
+      for key <- [
+            :query_timeout_ms,
+            :query_max_rows,
+            :max_checkouts_per_shard,
+            :shard_cache_size_kb
+          ],
           do: Application.delete_env(:fathom, key)
 
       Shards.drain(shard, 2_000)
@@ -216,6 +221,34 @@ defmodule Fathom.QueryBoundsTest do
            "a read must not surface the previous write's rowid"
 
     :ok = ShardExecutor.close(h)
+  end
+
+  # Expert review 2026-07-24 #29: the per-connection page cache was the one resource with no
+  # declared ceiling. SQLite defaults to -2000 (~2 MiB PER CONNECTION) and fathom holds one
+  # connection per Hrana stream for the stream's life, so at 30k held streams the tail is ~60 GB —
+  # and none of the measured density regimes ever approached it, because their touched page set is
+  # small. Those figures were a sample, not a bound.
+  #
+  # The default is deliberately SQLite's own value, so this is a knob and a declared ceiling rather
+  # than a reduction — lowering it trades RAM for page re-reads on scan-heavy tenants, which is a
+  # deployment decision.
+  test "the page cache is declared at SQLite's default and is tunable", %{shard: shard} do
+    {:ok, h} = ShardExecutor.open(shard)
+
+    assert {:ok, %{rows: [[-2000]]}} = ShardExecutor.execute(h, stmt("PRAGMA cache_size")),
+           "the shipped default must be byte-identical to SQLite's, so this changes no measurement"
+
+    :ok = ShardExecutor.close(h)
+
+    Application.put_env(:fathom, :shard_cache_size_kb, 500)
+    {:ok, h2} = ShardExecutor.open(shard)
+
+    # Negative = KiB in SQLite's convention. The sign is forced by the code, not the operator, so a
+    # value can never be misread as a page count.
+    assert {:ok, %{rows: [[-500]]}} = ShardExecutor.execute(h2, stmt("PRAGMA cache_size"))
+
+    :ok = ShardExecutor.close(h2)
+    Application.delete_env(:fathom, :shard_cache_size_kb)
   end
 
   test "a normal query is unaffected by a generous timeout", %{shard: shard} do
