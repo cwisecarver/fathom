@@ -124,6 +124,27 @@ all share it, so p99 climbs to ~4 s while errors stay 0 (contention, not failure
 absolute is one-box-bound; the even per-node partition is the horizontal "millions" axis. The heavier
 value-fed TPC-C mix partitions exactly like TPC-B (contrast `tpc-fleet`'s 1.10–1.15× spreads).
 
+### Single-node baseline (what the partition actually buys on one VM)
+
+Controlled same-session A/B — the same tenant counts driven through the LB (3 nodes) vs direct at one
+node (`fathom1:8080`, so it holds *every* tenant):
+
+| tenants | fleet tpmC | fleet errs | 1-node tpmC | 1-node errs | fleet/1-node |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 25,777 | 0 | 23,715 | 0 | 1.09× |
+| 256 | 24,366 | 0 | 22,756 | 0 | 1.07× |
+| 1024 | 22,659 | 0 | 20,120 | 0 | 1.13× |
+| 4096 | 19,146 | 0 | 12,232 | **8,700** | 1.57× |
+
+At 64–1024 the fleet is only **~1.1×** a single node — both are CPU-bound by the same 12-vCPU VM, and
+one BEAM node already uses all cores, so spreading across three node-processes barely moves throughput
+(the "one box, not three machines" caveat, made concrete). But at **4096 the single node hits a
+per-node wall**: holding all 4,096 active TPC-C tenants (shards + connections + WAL fds + schedulers,
+while contending with the driver) it throws **8,700 errors** and falls to 12.2k tpmC, while the
+three-node split stays **0 errors** at 19.1k. So on one box the partition's value is **capacity, not
+speed**: each node carries only its 1/N of the active tenants, so no single node reaches the
+concurrent-tenant ceiling. Raw ~N× throughput still needs N separate machines (CPU here is shared).
+
 ## Provenance
 
 - `Filo.Client` transparent stream-resume on a dropped connection — filo `3adbcd9`.
