@@ -28,6 +28,19 @@ defmodule Fathom.Rebalancer.LbMap do
   alias Fathom.Rebalancer
   alias Fathom.Rebalancer.Overrides
 
+  # Expert review 2026-07-24 #7. A shard reaches a pin-upstream precisely because
+  # Rebalancer.Policy found it HOT, so sizing its connection pool BELOW the general hash pool
+  # (this was 16 against the main config's 64, now 512) inverted the intent of the B1 handoff:
+  # the moment a tenant became the hottest thing on the fleet, its upstream connection reuse was
+  # cut 4x and it started paying a fresh handshake per evicted connection.
+  #
+  # Keep in step with `keepalive` in deploy/lb/fathom.nginx.conf and deploy/chaos/nginx.conf.
+  @pin_keepalive 512
+  # nginx's default of 1000 recycles a pooled connection roughly once a minute at measured rates,
+  # re-opening the FIN race that keepalive_timeout closed for the idle case (the 2026-07-23 502 fix
+  # addressed the idle half only).
+  @pin_keepalive_requests 100_000
+
   @doc """
   Renders the current exception table (from `Overrides.all/0`, `Rebalancer.lb_backends/0`,
   and `:shard_base_domain`) into the nginx snippet.
@@ -71,7 +84,7 @@ defmodule Fathom.Rebalancer.LbMap do
           |> Enum.reject(fn {n, _addr} -> n == node end)
           |> Enum.map_join("", fn {_n, addr} -> "\n    server #{addr} backup;" end)
 
-        "upstream #{upstream_name(node)} {\n    server #{addr} max_fails=2 fail_timeout=10s;#{backups}\n    keepalive 16;\n    keepalive_timeout 30s;\n}"
+        "upstream #{upstream_name(node)} {\n    server #{addr} max_fails=2 fail_timeout=10s;#{backups}\n    keepalive #{@pin_keepalive};\n    keepalive_timeout 30s;\n    keepalive_requests #{@pin_keepalive_requests};\n}"
       end)
 
     map_body = if entries == "", do: "", else: "\n" <> entries

@@ -36,11 +36,11 @@ defmodule Fathom.Rebalancer.LbMapTest do
 
     # fathom1's pin: fathom1 primary, fathom2 as backup.
     assert out =~
-             ~r/upstream fathom_pin_fathom1 \{\n    server fathom1:8080 max_fails=2 fail_timeout=10s;\n    server fathom2:8080 backup;\n    keepalive 16;\n    keepalive_timeout 30s;\n\}/
+             ~r/upstream fathom_pin_fathom1 \{\n    server fathom1:8080 max_fails=2 fail_timeout=10s;\n    server fathom2:8080 backup;\n    keepalive 512;\n    keepalive_timeout 30s;\n    keepalive_requests 100000;\n\}/
 
     # fathom2's pin: fathom2 primary, fathom1 as backup.
     assert out =~
-             ~r/upstream fathom_pin_fathom2 \{\n    server fathom2:8080 max_fails=2 fail_timeout=10s;\n    server fathom1:8080 backup;\n    keepalive 16;\n    keepalive_timeout 30s;\n\}/
+             ~r/upstream fathom_pin_fathom2 \{\n    server fathom2:8080 max_fails=2 fail_timeout=10s;\n    server fathom1:8080 backup;\n    keepalive 512;\n    keepalive_timeout 30s;\n    keepalive_requests 100000;\n\}/
   end
 
   test "a single-node fleet renders a pin upstream with no backup server" do
@@ -48,7 +48,7 @@ defmodule Fathom.Rebalancer.LbMapTest do
     out = LbMap.render([], %{"solo" => "solo:8080"}, "fathom.test")
 
     assert out =~
-             "upstream fathom_pin_solo {\n    server solo:8080 max_fails=2 fail_timeout=10s;\n    keepalive 16;\n    keepalive_timeout 30s;\n}"
+             "upstream fathom_pin_solo {\n    server solo:8080 max_fails=2 fail_timeout=10s;\n    keepalive 512;\n    keepalive_timeout 30s;\n    keepalive_requests 100000;\n}"
 
     refute out =~ "backup;"
   end
@@ -115,5 +115,24 @@ defmodule Fathom.Rebalancer.LbMapTest do
 
     assert out =~ "hot_1.acme.example fathom_pin_10_0_0_12;"
     assert out =~ "upstream fathom_pin_10_0_0_12 {"
+  end
+
+  # Expert review 2026-07-24 #7: the pin upstream shipped `keepalive 16` against the main config's
+  # 64 — so the moment Policy identified a shard as the hottest thing on the fleet and pinned it,
+  # that tenant's upstream connection reuse was cut 4x and it began paying a fresh handshake per
+  # evicted connection. Exactly backwards. A pin serves the hot minority and must never be sized
+  # below the general hash pool.
+  test "a pin upstream is not sized below the general hash pool (#7)" do
+    out = LbMap.render([], %{"n1" => "n1:8080"}, "acme.example")
+
+    [_, pool] = Regex.run(~r/keepalive (\d+);/, out)
+
+    assert String.to_integer(pool) >= 512,
+           "the pin pool (#{pool}) must be at least the main config's `keepalive 512` — a pinned " <>
+             "shard is by definition one of the hottest on the fleet"
+
+    assert out =~ "keepalive_requests 100000;",
+           "without this nginx recycles a pooled conn every 1000 requests, re-opening the FIN " <>
+             "race that keepalive_timeout closed only for the idle case"
   end
 end
