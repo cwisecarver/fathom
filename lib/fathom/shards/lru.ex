@@ -47,6 +47,11 @@ defmodule Fathom.Shards.Lru do
   # no longer matches is stale and lazily deleted during the walk.
   @order_table __MODULE__.Order
 
+  # How stale a recency stamp may be before touch/1 rewrites it (native units). 1s is far finer
+  # than any eviction decision needs — the cold end of the LRU is separated by minutes — while
+  # collapsing a shard doing 1000 checkouts/s from ~4000 ETS ops/s to ~1000 cheap lookups.
+  @stamp_granularity System.convert_time_unit(1, :second, :native)
+
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
@@ -70,13 +75,30 @@ defmodule Fathom.Shards.Lru do
       # Replace the previous order key so the order table stays ~one key per shard rather than
       # growing per checkout. Two concurrent touches of one shard can each delete the same old
       # key and insert their own — the loser's key goes stale and the probe walk cleans it.
+      #
+      # COARSENED (expert review 2026-07-24 #24): re-stamp only when the existing stamp is older
+      # than @stamp_granularity. The write side used to run 4 ETS ops on EVERY checkout — and three
+      # of them hit @order_table, an :ordered_set with write_concurrency, which on OTP 25+ selects
+      # the contention-adapting CA tree, so a delete+insert pair rewrote a CA-tree key per checkout
+      # at exactly the rate this architecture is optimized for. (The 2026-07-23 audit's #14 fixed
+      # the READ side, the at-capacity probe; this is the write side.)
+      #
+      # Safe because recency is explicitly a HINT — see the moduledoc: `record_conns/2` is
+      # best-effort and `evict/2` remains the atomic evict-if-idle arbiter, re-checking idleness
+      # under the coordinator. So a stamp up to one granularity window stale can at worst pick a
+      # slightly-less-cold victim, which costs one cold re-open of a bottomless-backed idle shard.
+      # It can never evict a busy shard.
       case :ets.lookup(@table, shard_id) do
-        [{^shard_id, prev}] -> :ets.delete(@order_table, {prev, shard_id})
-        _ -> :ok
-      end
+        [{^shard_id, prev}] when stamp - prev < @stamp_granularity ->
+          :ok
 
-      :ets.insert(@table, {shard_id, stamp})
-      :ets.insert(@order_table, {{stamp, shard_id}})
+        [{^shard_id, prev}] ->
+          :ets.delete(@order_table, {prev, shard_id})
+          write_stamp(shard_id, stamp)
+
+        _ ->
+          write_stamp(shard_id, stamp)
+      end
     end
 
     :ok
@@ -84,6 +106,12 @@ defmodule Fathom.Shards.Lru do
     # The tables only exist once this process has started; a checkout during boot
     # (or in a test that didn't start it) must not crash the open path.
     ArgumentError -> :ok
+  end
+
+  defp write_stamp(shard_id, stamp) do
+    :ets.insert(@table, {shard_id, stamp})
+    :ets.insert(@order_table, {{stamp, shard_id}})
+    :ok
   end
 
   @doc """

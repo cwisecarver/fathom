@@ -152,6 +152,36 @@ defmodule Fathom.Shards.LruEvictionTest do
       assert :ets.info(Fathom.Shards.Lru.Order, :size) == 4
     end
 
+    # Expert review 2026-07-24 #24: the WRITE side of the LRU ran 4 ETS ops on every checkout, three
+    # of them against @order_table — an :ordered_set with write_concurrency, which on OTP 25+ selects
+    # the contention-adapting CA tree, so a delete+insert pair rewrote a CA-tree key at exactly the
+    # rate the architecture is optimized for. (#14 fixed the READ side; this is the write side.)
+    #
+    # Repeated touches inside the granularity window must now leave the stamp alone. Safe because
+    # recency is a HINT — evict/2 remains the atomic evict-if-idle arbiter and re-checks idleness —
+    # so a stamp up to one window stale can at worst pick a slightly-less-cold victim, never a busy
+    # one.
+    test "repeated touches inside the granularity window do not rewrite the order key (#24)" do
+      Application.put_env(:fathom, :max_open_shards, 100)
+      Lru.reset()
+
+      Lru.touch("warm")
+      [{"warm", first}] = :ets.lookup(Fathom.Shards.Lru, "warm")
+
+      for _ <- 1..200, do: Lru.touch("warm")
+
+      assert [{"warm", ^first}] = :ets.lookup(Fathom.Shards.Lru, "warm"),
+             "a touch inside the window must not re-stamp — that is the CA-tree rewrite being " <>
+               "avoided on every checkout"
+
+      assert :ets.info(Fathom.Shards.Lru.Order, :size) == 1,
+             "and the order table must still hold exactly one key for the shard"
+
+      # Recency is still tracked across the window: a shard touched later sorts later.
+      Lru.touch("later")
+      assert Lru.lru_order(10) == ["warm", "later"]
+    end
+
     test "touch is a no-op when eviction is unreachable (no finite cap)" do
       Application.put_env(:fathom, :max_open_shards, :infinity)
       Lru.reset()
