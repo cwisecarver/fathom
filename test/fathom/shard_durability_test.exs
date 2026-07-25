@@ -636,6 +636,56 @@ defmodule Fathom.ShardDurabilityTest do
     assert FlushGate.in_flight() == 0, "the admitted flush released its slot when it settled"
   end
 
+  # Expert review 2026-07-24 #4: nothing truncated the WAL in steady state except SQLite's
+  # autocheckpoint, which runs INLINE inside a committing tenant statement — a latency spike billed
+  # to an arbitrary client query. Worse, the durability snapshot's VACUUM INTO is a long-lived
+  # reader that holds that passive checkpoint back, so the WAL kept growing. The coordinator now
+  # checkpoints PASSIVE after each snapshot, where no client is waiting. Observable: the WAL shrinks
+  # across a flush rather than only growing.
+  test "the durability flush checkpoints the WAL instead of leaving it to a tenant query", %{
+    shard: shard
+  } do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
+
+    # Enough writes to grow a WAL worth checkpointing, without tripping the 4000-frame backstop
+    # (which would prove nothing — the point is that the COORDINATOR truncates it, not SQLite).
+    for i <- 1..400 do
+      {:ok, _} =
+        ShardExecutor.execute(
+          conn,
+          stmt("INSERT INTO kv VALUES (?, ?)", [i, String.duplicate("x", 400)])
+        )
+    end
+
+    wal = local_db(shard) <> "-wal"
+    grown = File.stat!(wal).size
+    assert grown > 0, "precondition: the writes produced a WAL"
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    flush_now(coordinator)
+
+    # A PASSIVE checkpoint does not TRUNCATE the file — SQLite resets the write position and reuses
+    # the space — so the observable is not that the WAL shrinks, it is that it STOPS GROWING: the
+    # next batch of writes overwrites from the start instead of appending.
+    for i <- 401..800 do
+      {:ok, _} =
+        ShardExecutor.execute(
+          conn,
+          stmt("INSERT INTO kv VALUES (?, ?)", [i, String.duplicate("x", 400)])
+        )
+    end
+
+    reused = File.stat!(wal).size
+
+    assert reused <= grown,
+           "the WAL grew #{grown} -> #{reused} bytes across a flush, so the coordinator did not " <>
+             "checkpoint — leaving it to whichever tenant query crosses the autocheckpoint " <>
+             "threshold, inline and with a main-db fsync under synchronous=FULL"
+
+    :ok = ShardExecutor.close(conn)
+  end
+
   # Expert review 2026-07-24 #10: an idle AND clean coordinator used to re-arm the ~5s durability
   # timer forever — ~6,000 pure no-op wakeups/s at 30k coordinators/node, and (the bigger cost) it
   # made hibernate_after unusable at any value because a message always arrived within one interval.

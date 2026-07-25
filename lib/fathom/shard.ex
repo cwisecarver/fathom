@@ -2117,6 +2117,24 @@ defmodule Fathom.Shard do
   defp snapshot(path, dest) do
     with {:ok, conn} <- Connection.open(path) do
       result = Connection.query(conn, "VACUUM INTO '#{String.replace(dest, "'", "''")}'", [])
+
+      # Checkpoint here, where nobody is waiting (expert review 2026-07-24 #4). Without this the
+      # only thing truncating the WAL in steady state was SQLite's autocheckpoint, which runs
+      # INLINE INSIDE A COMMITTING TENANT STATEMENT on whichever connection happens to cross the
+      # threshold — a periodic multi-ms-to-tens-of-ms spike billed to an arbitrary client query,
+      # and under synchronous=FULL it fsyncs the main database too. Worse, the VACUUM INTO above
+      # is a long-lived reader that HOLDS BACK that passive checkpoint (docs/durability.md notes
+      # the same interaction from the other side), so the WAL kept growing past the threshold and
+      # the tenant that eventually won the race paid a larger checkpoint than the default implies.
+      #
+      # PASSIVE specifically: it never blocks writers and never waits on readers — it moves what it
+      # can and returns — so it cannot add latency to a concurrent tenant. A `busy` result is the
+      # normal "readers active" outcome and is ignored; the next interval retries. Runs only after
+      # a successful snapshot, i.e. after this connection's read transaction has ended, which is
+      # what unblocks the checkpointer in the first place.
+      if match?({:ok, _}, result),
+        do: Connection.query(conn, "PRAGMA wal_checkpoint(PASSIVE)", [])
+
       Connection.close(conn)
 
       case result do

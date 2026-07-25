@@ -39,6 +39,16 @@ defmodule Fathom.Shard.Connection do
          # exqlite's handler walks the SAME delay ladder as SQLite's default, so the wait timing
          # is unchanged; it just also polls the cancel flag and the caller's liveness.
          :ok <- Sqlite3.set_busy_timeout(conn, 5000),
+         # Raise the autocheckpoint threshold well above SQLite's 1000-frame (~4 MB) default
+         # (expert review 2026-07-24 #4). An autocheckpoint runs INLINE inside the committing
+         # tenant statement that crosses it — a p99/p999 spike billed to an arbitrary client query,
+         # with a main-database fsync under synchronous=FULL. The coordinator now checkpoints
+         # PASSIVE after each durability snapshot (see Fathom.Shard.snapshot/2), where no client is
+         # waiting, so in steady state it wins the race and no tenant query ever checkpoints.
+         #
+         # Raised, NOT disabled: at 0 a wedged coordinator would let the WAL grow unbounded. This
+         # keeps a backstop at ~4× the default.
+         :ok <- Sqlite3.execute(conn, "PRAGMA wal_autocheckpoint=4000"),
          :ok <- maybe_foreign_keys(conn),
          :ok <- maybe_max_page_count(conn) do
       {:ok, conn}
