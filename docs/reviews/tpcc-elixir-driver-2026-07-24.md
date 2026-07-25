@@ -98,11 +98,38 @@ lock convoy** (contrast tpcb's one-writer-per-tenant, no convoy), not a driver a
   (and its locks). Real SDKs resume by baton — now Filo.Client does too.
 - Ruling a hypothesis out **live** (and recording it) is worth as much as confirming the real one.
 
+## TPC-C tenant fleet — the multi-tenant sweep
+
+`tpcc` (the W-sweep) is the *single-shard* convoy: many workers on one warehouse. **`tpcc-fleet`** is
+the multi-tenant analog of `tpc-fleet` — each **tenant** is its own shard running a 1-warehouse TPC-C
+mix, swept by tenant count, so the heavier value-fed load partitions across the nodes. Live in-network
+sweep (per_client=20, scale 0.005):
+
+| tenants | tpmC | txn/s | p99 | errs |
+|---:|---:|---:|---:|---:|
+| 16 | 20,093 | 719 | 47 ms | 0 |
+| 64 | **25,612** | 937 | 152 ms | 0 |
+| 128 | 24,512 | 886 | 344 ms | 0 |
+| 256 | 22,894 | 830 | 504 ms | 0 |
+| 512 | 23,401 | 862 | 529 ms | 0 |
+| 1024 | 22,233 | 813 | 654 ms | 0 |
+| 2048 | 19,661 | 719 | 1,170 ms | 0 |
+| 4096 | 11,831 | 437 | 4,099 ms | 0 |
+
+**8,144 TPC-C tenant shards, ~5M queries, spread 1.12×** across the 3 nodes — **zero errors at every
+step, to 4096 concurrent held-stream tenants** (the resume fix holds under the multi-tenant load too).
+Aggregate tpmC peaks ~25.6k at 64 tenants and holds ~22–25k through 1024, then declines (19.7k @ 2048,
+11.8k @ 4096) as the one 12-vCPU VM saturates — driver + 3 nodes + nginx + the full-TPC-C seed burst
+all share it, so p99 climbs to ~4 s while errors stay 0 (contention, not failure). As always, the
+absolute is one-box-bound; the even per-node partition is the horizontal "millions" axis. The heavier
+value-fed TPC-C mix partitions exactly like TPC-B (contrast `tpc-fleet`'s 1.10–1.15× spreads).
+
 ## Provenance
 
 - `Filo.Client` transparent stream-resume on a dropped connection — filo `3adbcd9`.
 - TPC-C in `deploy/chaos/tpc_driver.exs` (all five value-feeding txns + W-sweep; `--max-w/--threads/
   --scale`); `chaos.sh` `tpc_run` no longer forces python for tpcc — fathom `98a32a3`.
-- Reproduce: `TPC_DRIVER=elixir ./chaos.sh tpcc [max_w threads txns scale]`
-  (or `TPC_NET=container` in-network). Direct-to-node baseline:
-  `elixir tpc_driver.exs tpcc --lb http://localhost:18081 …`.
+- `tpcc-fleet` mode + `chaos.sh` command (multi-tenant TPC-C sweep) — fathom `793f0da`.
+- Reproduce: `TPC_DRIVER=elixir ./chaos.sh tpcc [max_w threads txns scale]` (single-shard convoy)
+  or `TPC_NET=container ./chaos.sh tpcc-fleet [tenants_csv per_client scale]` (tenant fleet);
+  direct-to-node baseline: `elixir tpc_driver.exs tpcc --lb http://localhost:18081 …`.
