@@ -131,10 +131,42 @@ defmodule Fathom.Directory.Recorder do
       )
   end
 
+  # Drain and upsert in bounded chunks (expert review 2026-07-24 #23) rather than materializing the
+  # whole buffer. At 30k active shards the old shape allocated, every second: a full `tab2list`
+  # copy, a second full copy from the per-key `take`, and a `DateTime` per row — ~8-15 MB of
+  # transient heap in a process with `fullsweep_after: 65535` and no post-flush GC, so it grew to
+  # its worst-ever batch size and stayed there. It also did not scale: at 300k active shards the
+  # peak batch is ~100 MB in one process heap.
+  #
+  # Chunking is strictly SAFER than the old shape, not just cheaper: a failed upsert now re-buffers
+  # one chunk instead of the entire drain, and the un-drained remainder was never removed from ETS
+  # in the first place.
+  @drain_chunk 2_000
+
   defp flush_table(table, upsert, event) do
-    case drain(table) do
+    flush_chunks(table, upsert, event, 0)
+  end
+
+  # STOPS on a failed chunk. `restore/2` re-buffers the failed rows into the same table, so
+  # continuing would immediately re-drain them and loop forever. Halting leaves them for the next
+  # flush cycle, which is exactly the pre-chunking behaviour.
+  defp flush_chunks(table, upsert, event, acc) do
+    case drain_chunk(table) do
       [] ->
-        0
+        acc
+
+      rows ->
+        case flush_rows(table, rows, upsert, event) do
+          {:ok, n} -> flush_chunks(table, upsert, event, acc + n)
+          :failed -> acc
+        end
+    end
+  end
+
+  defp flush_rows(table, rows, upsert, event) do
+    case rows do
+      [] ->
+        {:ok, 0}
 
       rows ->
         try do
@@ -147,17 +179,17 @@ defmodule Fathom.Directory.Recorder do
             )
 
           if n > 0, do: :telemetry.execute(event, %{count: n}, %{})
-          n
+          {:ok, n}
         rescue
           e ->
             Logger.warning("Directory.Recorder flush failed: #{inspect(e)}")
             restore(table, rows)
-            0
+            :failed
         catch
           :exit, reason ->
             Logger.warning("Directory.Recorder flush exited: #{inspect(reason)}")
             restore(table, rows)
-            0
+            :failed
         end
     end
   end
@@ -179,9 +211,17 @@ defmodule Fathom.Directory.Recorder do
   # Atomically take each buffered key (`:ets.take` reads + deletes in one op), so a
   # touch arriving mid-flush is either captured with its freshest value or left in
   # the table for the next cycle — never silently lost.
-  defp drain(table) do
-    table
-    |> :ets.tab2list()
-    |> Enum.flat_map(fn {shard_id, _ts} -> :ets.take(table, shard_id) end)
+  #
+  # `:ets.select/3` with a limit walks the keys without copying the whole table first, so peak heap
+  # is O(@drain_chunk) rather than O(active shards). The per-key `take` is unchanged and still the
+  # thing that makes each row's removal atomic.
+  defp drain_chunk(table) do
+    case :ets.select(table, [{{:"$1", :_}, [], [:"$1"]}], @drain_chunk) do
+      {ids, _cont} -> Enum.flat_map(ids, &:ets.take(table, &1))
+      :"$end_of_table" -> []
+    end
+  rescue
+    # Table gone (teardown).
+    ArgumentError -> []
   end
 end

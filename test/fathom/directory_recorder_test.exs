@@ -127,4 +127,33 @@ defmodule Fathom.Directory.RecorderTest do
     # see dir_resolve_p50_us) could never land under this ceiling.
     assert us < 50
   end
+
+  # Expert review 2026-07-24 #23: the drain used to `tab2list` the whole buffer and then re-read
+  # every row with `take` — two full copies plus a DateTime per row, ~8-15 MB of transient heap per
+  # second at 30k active shards, in a process that never sheds it. It is now chunked, so peak heap
+  # is O(chunk) rather than O(active shards).
+  #
+  # The load-bearing property is that chunking must not change what gets written: every buffered
+  # touch still lands exactly once, across as many chunks as it takes.
+  test "a buffer larger than one drain chunk is flushed completely and exactly once" do
+    # @drain_chunk is 2_000, so this spans several chunks.
+    ids = for i <- 1..4_500, do: "chunk_#{i}"
+    for id <- ids, do: :ok = Recorder.record(id)
+
+    written = Recorder.flush()
+
+    assert written == length(ids),
+           "every buffered touch must be written, across chunk boundaries"
+
+    # The buffer is empty afterwards — nothing stranded by the chunk loop.
+    assert Recorder.flush() == 0
+
+    # And each one really reached Postgres.
+    sample = ["chunk_1", "chunk_2000", "chunk_2001", "chunk_4500"]
+
+    for id <- sample do
+      assert {:ok, %{shard_id: ^id}} = Fathom.Directory.get(id),
+             "#{id} was buffered but never written"
+    end
+  end
 end
