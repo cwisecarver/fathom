@@ -84,4 +84,38 @@ defmodule Fathom.Shard.Storage.PullIfChangedTest do
     assert {:ok, :absent} = Storage.pull_if_changed(shard, dst, "some-stale-etag")
     refute File.exists?(dst)
   end
+
+  # Expert review 2026-07-24 #25: the Local backend read whole shard files into binaries and hashed
+  # them in memory — a fenced flush held TWO shard-sized binaries at once (local + remote) plus two
+  # full hash passes, and `pull_if_changed/3` read and hashed the entire object just to conclude
+  # nothing had changed (the S3 backend does a bodiless 304). Both now stream.
+  #
+  # The etag is the emulated If-Match fence, so the streamed digest MUST equal the whole-body one
+  # or every fence comparison silently breaks. Chosen larger than the 256 KiB hash chunk so the
+  # streaming path genuinely spans multiple chunks.
+  test "the streamed etag equals the whole-body digest across chunk boundaries", %{
+    dir: dir,
+    shard: shard
+  } do
+    body = :crypto.strong_rand_bytes(700 * 1024)
+    src = Path.join(dir, "#{shard}.src")
+    File.mkdir_p!(dir)
+    File.write!(src, body)
+
+    :ok = Storage.flush(shard, src)
+
+    # Round-trip through the fence: the etag the flush reports must match what a fresh read sees,
+    # and must equal a plain in-memory digest of the same bytes.
+    expected = Base.encode16(:crypto.hash(:sha256, body), case: :lower)
+
+    dst = Path.join(dir, "#{shard}.dst")
+    assert {:ok, {:written, etag}} = Storage.pull_if_changed(shard, dst, "no-match")
+
+    assert etag == expected,
+           "the streamed digest diverged from the whole-body digest — every If-Match comparison " <>
+             "in the Local fence double would silently break"
+
+    assert File.read!(dst) == body, "the streamed copy must be byte-identical"
+    assert {:ok, :unchanged} = Storage.pull_if_changed(shard, dst, etag)
+  end
 end

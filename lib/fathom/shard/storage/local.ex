@@ -51,24 +51,25 @@ defmodule Fathom.Shard.Storage.Local do
     # (last-write-wins) — a split-brain the fence exists to prevent, invisible to any test
     # driven through this backend. #38 mutexed the LOCK ops but not this DATA flush.
     with_lock_mutex(shard_id, fn ->
-      with {:ok, body} <- File.read(local_path) do
-        current =
-          case File.read(remote_path(shard_id)) do
-            {:ok, remote_body} -> content_etag(remote_body)
-            {:error, :enoent} -> nil
-            {:error, reason} -> throw({:error, reason})
-          end
-
-        cond do
-          expected_etag != current ->
-            {:error, :superseded}
-
-          true ->
-            case Storage.atomic_write(remote_path(shard_id), body) do
-              :ok -> {:ok, content_etag(body)}
-              err -> err
-            end
+      current =
+        case file_etag(remote_path(shard_id)) do
+          {:ok, etag} -> etag
+          {:error, :enoent} -> nil
+          {:error, reason} -> throw({:error, reason})
         end
+
+      cond do
+        expected_etag != current ->
+          {:error, :superseded}
+
+        true ->
+          # atomic_copy streams (File.cp) and carries the same fsync-before-rename crash contract
+          # as atomic_write, so the durability shape is unchanged — it just never materializes the
+          # shard as a binary.
+          with :ok <- Storage.atomic_copy(local_path, remote_path(shard_id)),
+               {:ok, etag} <- file_etag(local_path) do
+            {:ok, etag}
+          end
       end
     end)
   catch
@@ -89,18 +90,19 @@ defmodule Fathom.Shard.Storage.Local do
   # skips the body; the Local double reads it to hash, which is fine on local disk.)
   @impl true
   def pull_if_changed(shard_id, local_path, etag) do
-    case File.read(remote_path(shard_id)) do
-      {:ok, body} ->
-        current = content_etag(body)
+    # The warm-follower revalidation loop calls this for every cached shard on every poll, and it
+    # used to read AND fully hash the entire object just to conclude nothing changed — O(cached ×
+    # shard bytes) of disk read and hashing per poll, where the S3 backend does a bodiless 304
+    # (expert review 2026-07-24 #25).
+    case file_etag(remote_path(shard_id)) do
+      {:ok, current} when current == etag ->
+        {:ok, :unchanged}
 
-        if etag == current do
-          {:ok, :unchanged}
-        else
-          # Atomic so a warm-cache rewrite can't be read half-old/half-new by a promotion (#24).
-          case Storage.atomic_write(local_path, body) do
-            :ok -> {:ok, {:written, current}}
-            err -> err
-          end
+      {:ok, current} ->
+        # Atomic so a warm-cache rewrite can't be read half-old/half-new by a promotion (#24).
+        case Storage.atomic_copy(remote_path(shard_id), local_path) do
+          :ok -> {:ok, {:written, current}}
+          err -> err
         end
 
       {:error, :enoent} ->
@@ -112,6 +114,25 @@ defmodule Fathom.Shard.Storage.Local do
   end
 
   defp content_etag(body), do: Base.encode16(:crypto.hash(:sha256, body), case: :lower)
+
+  # The same digest, computed by STREAMING the file rather than reading it whole into a binary
+  # (expert review 2026-07-24 #25). SHARD_STORAGE=local is a supported production selection and
+  # local-NVMe is a stated deployment, so a fenced flush used to hold two shard-sized binaries at
+  # once (the local body and the remote body) plus two full hash passes — `2 * N * shard_bytes` of
+  # transient binary heap at N concurrent flushes. Byte-identical output, so the emulated If-Match
+  # fence is unchanged; this is the shape S3.stat_and_md5/1 already uses.
+  @hash_chunk 256 * 1024
+
+  defp file_etag(path) do
+    path
+    |> File.stream!(@hash_chunk)
+    |> Enum.reduce(:crypto.hash_init(:sha256), &:crypto.hash_update(&2, &1))
+    |> :crypto.hash_final()
+    |> Base.encode16(case: :lower)
+    |> then(&{:ok, &1})
+  rescue
+    e in File.Error -> {:error, e.reason}
+  end
 
   # --- versioned copies (blue/green migration) ---
 
