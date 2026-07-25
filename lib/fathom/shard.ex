@@ -1638,25 +1638,25 @@ defmodule Fathom.Shard do
   # drop_local/1 is about to delete, so fall back to a VACUUM INTO snapshot, which
   # captures WAL content regardless.
   defp upload_for_drop(state) do
-    case checkpoint(state.path) do
+    # checkpoint_and_verify/1 runs BOTH on one connection (review 2026-07-24 #31) and reports which
+    # stage failed, because the two failures need opposite handling: a corrupt local db must refuse
+    # the flush, while a merely-busy checkpoint must fall back to the snapshot path.
+    case checkpoint_and_verify(state.path) do
       :ok ->
-        # Verify SQLite page-level integrity BEFORE the raw-file upload (expert review 2026-07-14
-        # #4). The checkpoint-then-raw-upload fast path uploads the bytes as-is, so a locally
-        # corrupted db (disk/fs/memory fault, exqlite/OS bug) would be flushed with a valid
-        # If-Match by the legitimate owner — the fence can't help, it's not a steal — clobbering
-        # the last good stored object permanently. On failure: refuse the flush (the good object
-        # stays authoritative), quarantine the corrupt copy for forensics, and alarm. (The
-        # snapshot_and_upload fallback below runs VACUUM INTO, which reads every page and so fails
-        # on corruption already — only this raw path was blind.)
-        case verify_integrity(state.path) do
-          :ok ->
-            Storage.flush(state.id, state.path, state.etag)
+        Storage.flush(state.id, state.path, state.etag)
 
-          {:error, reason} ->
-            quarantine_corrupt!(state, reason)
-            {:error, {:corrupt_local, reason}}
-        end
+      # Integrity failed (expert review 2026-07-14 #4). The checkpoint-then-raw-upload fast path
+      # uploads the bytes as-is, so a locally corrupted db (disk/fs/memory fault, exqlite/OS bug)
+      # would be flushed with a valid If-Match by the legitimate owner — the fence can't help, it's
+      # not a steal — permanently clobbering the last good stored object. Refuse the flush (the good
+      # object stays authoritative), quarantine the corrupt copy for forensics, and alarm.
+      {:error, {kind, _} = reason} when kind in [:quick_check, :quick_check_failed] ->
+        quarantine_corrupt!(state, reason)
+        {:error, {:corrupt_local, reason}}
 
+      # Checkpoint incomplete (typically busy). Fall back to snapshot_and_upload, whose VACUUM INTO
+      # captures WAL content regardless — and which reads every page, so it fails on corruption on
+      # its own. quick_check is deliberately NOT run on this branch, matching the pre-fold ordering.
       {:error, reason} ->
         Logger.warning(
           "shard #{state.id}: pre-drop checkpoint incomplete (#{inspect(reason)}); snapshot-flushing instead"
@@ -1740,25 +1740,56 @@ defmodule Fathom.Shard do
   # counts as success. The busy wait is shortened below: on a blocked checkpoint
   # the caller snapshot-flushes instead, so burning the shutdown budget waiting on
   # a zombie reader buys nothing.
-  defp checkpoint(path) do
+  # Checkpoint and integrity-check on ONE connection (expert review 2026-07-24 #31). These ran as
+  # two separate Connection.open → work → close cycles back to back, and each open costs a
+  # File.mkdir_p!, an sqlite3_open, and several pragma round-trips. Worse, in WAL mode the close of
+  # the LAST connection triggers SQLite's close-time checkpoint and unlinks -wal/-shm, so the second
+  # open immediately recreated the WAL index files the first close had just deleted — pure churn, on
+  # the path every idle drop and every rolling-deploy teardown traverses (tens of thousands of
+  # cycles per full turnover at 10k-30k shards/node).
+  #
+  # Ordering is preserved exactly: quick_check still runs AFTER the checkpoint and BEFORE the raw
+  # upload — it is the 2026-07-14 #4 corruption gate, and the only guard on the
+  # checkpoint-then-raw-upload fast path. A busy checkpoint still short-circuits WITHOUT running
+  # quick_check, falling through to snapshot_and_upload (whose VACUUM INTO reads every page and so
+  # fails on corruption anyway).
+  #
+  # This connection keeps synchronous=FULL: #11's relaxation is scoped to the snapshot connection,
+  # and a checkpoint at synchronous=OFF can corrupt the main database on power loss.
+  defp checkpoint_and_verify(path) do
     case Connection.open(path) do
       {:ok, conn} ->
-        # set_busy_timeout, not the pragma (expert review 2026-07-24 #1) — the pragma would swap
-        # exqlite's cancellable busy handler back out for SQLite's uninterruptible one on this
-        # connection, re-opening the uncancellable-lock-wait hole on the drop path.
         Connection.set_busy_timeout(conn, 1000)
-        result = Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", [])
-        Connection.close(conn)
+        cp = Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", [])
 
-        case result do
-          {:ok, %{rows: [[0, _log, _checkpointed]]}} -> :ok
-          {:ok, %{rows: [[busy, _log, _checkpointed]]}} -> {:error, {:checkpoint_busy, busy}}
-          {:ok, other} -> {:error, {:checkpoint_unexpected, other}}
-          {:error, reason} -> {:error, {:checkpoint_failed, reason}}
-        end
+        result =
+          case classify_checkpoint(cp) do
+            :ok -> classify_quick_check(Connection.query(conn, "PRAGMA quick_check", []))
+            err -> err
+          end
+
+        Connection.close(conn)
+        result
 
       other ->
         {:error, {:checkpoint_open_failed, other}}
+    end
+  end
+
+  defp classify_checkpoint(result) do
+    case result do
+      {:ok, %{rows: [[0, _log, _checkpointed]]}} -> :ok
+      {:ok, %{rows: [[busy, _log, _checkpointed]]}} -> {:error, {:checkpoint_busy, busy}}
+      {:ok, other} -> {:error, {:checkpoint_unexpected, other}}
+      {:error, reason} -> {:error, {:checkpoint_failed, reason}}
+    end
+  end
+
+  defp classify_quick_check(result) do
+    case result do
+      {:ok, %{rows: [["ok"]]}} -> :ok
+      {:ok, %{rows: rows}} -> {:error, {:quick_check, rows}}
+      {:error, reason} -> {:error, {:quick_check_failed, reason}}
     end
   end
 
