@@ -174,10 +174,46 @@ defmodule Fathom.Rebalancer.Reporter do
   defp publish([]), do: :ok
   defp publish(rows), do: Repo.insert_all(LoadSample, rows)
 
+  # Prune THIS node's own rows every window, and sweep the fleet only occasionally (expert review
+  # 2026-07-24 #27). The old shape deleted the whole expired set from every node every window, so a
+  # 20-node fleet issued 20 deletes of the same rows per window: one useful, nineteen acquiring row
+  # locks, blocking, re-checking and deleting zero — after each had done the full index range scan.
+  # The waste grew linearly with node count, which is the opposite of the horizontal additivity the
+  # density work established.
+  #
+  # Node-scoped deletes are disjoint per node, so there is no cross-node lock contention at all.
+  # The rare fleet-wide sweep still reclaims a DEPARTED node's rows — scoping alone would strand
+  # those forever — and uses a much older cutoff so it can never race a live node's fresh rows.
+  #
+  # Safe by nature of the data: `shard_load_samples` is observational (a rolling window the
+  # rebalancer reads with its own anti-flap and confirm windows), so which node deletes an expired
+  # row is unobservable. No lifecycle state, tombstone, suspension, or last_flushed_at record is
+  # involved.
+  @fleet_sweep_odds 30
+  @fleet_sweep_age_multiplier 3
+
   defp prune do
-    cutoff = DateTime.add(DateTime.utc_now(), -retention_ms(), :millisecond)
-    Repo.delete_all(from s in LoadSample, where: s.sampled_at < ^cutoff)
+    now = DateTime.utc_now()
+    cutoff = DateTime.add(now, -retention_ms(), :millisecond)
+    key = Rebalancer.node_key()
+
+    Repo.delete_all(from s in LoadSample, where: s.node_key == ^key and s.sampled_at < ^cutoff)
+
+    if sweep_now?() do
+      stale = DateTime.add(now, -(retention_ms() * @fleet_sweep_age_multiplier), :millisecond)
+      Repo.delete_all(from s in LoadSample, where: s.sampled_at < ^stale)
+    end
+
     :ok
+  end
+
+  # See WarmLocations.prune/1 — same seam, so both sweeps are forceable in a test.
+  defp sweep_now? do
+    case Application.get_env(:fathom, :rebalancer_fleet_sweep_odds, @fleet_sweep_odds) do
+      1 -> true
+      n when is_integer(n) and n > 1 -> :rand.uniform(n) == 1
+      _ -> false
+    end
   end
 
   # Advertise the fleet-hot shards this node has warm-cached (affinity-aware target, #C). The

@@ -63,8 +63,35 @@ defmodule Fathom.Rebalancer.WarmLocations do
   @doc "Deletes rows not refreshed within `older_than_ms` (dead-node leftovers). Returns count."
   @spec prune(non_neg_integer()) :: non_neg_integer()
   def prune(older_than_ms) do
-    cutoff = DateTime.add(DateTime.utc_now(), -older_than_ms, :millisecond)
-    {n, _} = Repo.delete_all(from w in WarmLocation, where: w.updated_at < ^cutoff)
+    # Same node-scoped shape as Rebalancer.Reporter's sample prune (expert review 2026-07-24 #27):
+    # every node used to delete the whole expired set every window, so N-1 of N nodes did a full
+    # index range scan and then blocked on row locks to delete nothing. Node-scoped deletes are
+    # disjoint; the rare fleet sweep still reclaims a departed node's rows, with a much older cutoff
+    # so it cannot race a live node's fresh ones.
+    now = DateTime.utc_now()
+    cutoff = DateTime.add(now, -older_than_ms, :millisecond)
+    key = Fathom.Rebalancer.node_key()
+
+    {n, _} =
+      Repo.delete_all(
+        from w in WarmLocation, where: w.node_key == ^key and w.updated_at < ^cutoff
+      )
+
+    if sweep_now?() do
+      stale = DateTime.add(now, -(older_than_ms * 3), :millisecond)
+      Repo.delete_all(from w in WarmLocation, where: w.updated_at < ^stale)
+    end
+
     n
+  end
+
+  # 1-in-N per call by default. `:rebalancer_fleet_sweep_odds` of 1 forces it every call, which is
+  # how the departed-node reclaim is tested deterministically rather than by retrying a coin flip.
+  defp sweep_now? do
+    case Application.get_env(:fathom, :rebalancer_fleet_sweep_odds, 30) do
+      1 -> true
+      n when is_integer(n) and n > 1 -> :rand.uniform(n) == 1
+      _ -> false
+    end
   end
 end

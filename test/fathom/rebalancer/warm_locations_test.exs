@@ -57,17 +57,51 @@ defmodule Fathom.Rebalancer.WarmLocationsTest do
     assert WarmLocations.warm_nodes(60_000) == %{}
   end
 
-  test "warm_nodes ignores stale rows; prune deletes them" do
-    :ok = WarmLocations.publish("n1", ["a"])
+  # Expert review 2026-07-24 #27: prune is now NODE-SCOPED (every node used to delete the whole
+  # expired set every window, so N-1 of N nodes scanned and then blocked on row locks to delete
+  # nothing), with a rare fleet-wide sweep that still reclaims a DEPARTED node's rows — scoping
+  # alone would strand those forever. These pin both halves.
+  test "warm_nodes ignores stale rows; a node prunes its own" do
+    key = Fathom.Rebalancer.node_key()
+    :ok = WarmLocations.publish(key, ["a"])
 
-    from(w in WarmLocation, where: w.node_key == "n1")
+    from(w in WarmLocation, where: w.node_key == ^key)
     |> Repo.update_all(
       set: [updated_at: DateTime.add(DateTime.utc_now(), -120_000, :millisecond)]
     )
 
-    # A dead node's unrefreshed row falls out of the read window.
+    # An unrefreshed row falls out of the read window.
     assert WarmLocations.warm_nodes(60_000) == %{}
     assert WarmLocations.prune(60_000) == 1
     assert WarmLocations.warm_nodes(600_000) == %{}
+  end
+
+  test "a departed node's rows are reclaimed by the fleet sweep, not by the per-node prune" do
+    prev = Application.get_env(:fathom, :rebalancer_fleet_sweep_odds)
+
+    on_exit(fn ->
+      if is_nil(prev),
+        do: Application.delete_env(:fathom, :rebalancer_fleet_sweep_odds),
+        else: Application.put_env(:fathom, :rebalancer_fleet_sweep_odds, prev)
+    end)
+
+    # A node that is not this one, i.e. one that has departed the fleet.
+    :ok = WarmLocations.publish("departed_node", ["a"])
+
+    from(w in WarmLocation, where: w.node_key == "departed_node")
+    |> Repo.update_all(
+      set: [updated_at: DateTime.add(DateTime.utc_now(), -600_000, :millisecond)]
+    )
+
+    # Sweep off: the node-scoped prune must NOT touch another node's rows — that disjointness is
+    # the whole point, since it is what removes the cross-node lock contention.
+    Application.put_env(:fathom, :rebalancer_fleet_sweep_odds, 0)
+    assert WarmLocations.prune(60_000) == 0
+    assert WarmLocations.warm_nodes(3_600_000) != %{}, "another node's row must survive"
+
+    # Sweep on: the departed node's rows are reclaimed, so scoping cannot strand them forever.
+    Application.put_env(:fathom, :rebalancer_fleet_sweep_odds, 1)
+    _ = WarmLocations.prune(60_000)
+    assert WarmLocations.warm_nodes(3_600_000) == %{}
   end
 end
