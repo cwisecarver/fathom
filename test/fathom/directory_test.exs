@@ -420,9 +420,14 @@ defmodule Fathom.DirectoryTest do
 
         plan = rows |> List.flatten() |> Enum.join("\n")
 
-        assert plan =~ index,
-               "the status = '#{status}' predicate does not match #{index}'s predicate, so the " <>
-                 "index can never serve it. Plan:\n#{plan}"
+        # Assert an INDEX is used, not which one. #30 added shards_deleted_updated_at_index, which
+        # is also valid for this predicate (partial on the same status, with shard_id INCLUDEd), so
+        # the planner may legitimately prefer either. The property under test is that the predicate
+        # can be served by an index at all rather than falling back to a scan — pinning a specific
+        # index name made this brittle against any future index on the same rows.
+        assert plan =~ "Index" and not (plan =~ "Seq Scan"),
+               "the status = '#{status}' predicate is not served by any index, so it still scans " <>
+                 "the whole table. Expected #{index} or an equivalent. Plan:\n#{plan}"
       end
     end
   end
