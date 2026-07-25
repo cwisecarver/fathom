@@ -425,6 +425,29 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  Tombstoned ids whose row changed at or after `since` — the incremental half of the tombstone
+  refresh (expert review 2026-07-24 #30).
+
+  `deleted_shard_ids/0` returns EVERY id ever deleted, and the periodic refresh ran it on every
+  node every 5 minutes, so both the Postgres read and the receiving process's heap scaled with
+  cumulative lifetime deletions rather than with anything current.
+
+  Safe as an incremental key because `tombstone/1` always stamps `updated_at`, so a newly-deleted
+  row is never missed; and because the in-memory set is append-only with idempotent inserts, a row
+  returned twice costs nothing. Callers should still pass an overlap (query slightly before their
+  last refresh) so a transaction that started earlier but committed later cannot slip below the
+  high-water mark. Served by `shards_deleted_updated_at_index`.
+  """
+  @spec deleted_shard_ids_since(DateTime.t()) :: [String.t()]
+  def deleted_shard_ids_since(%DateTime{} = since) do
+    Repo.all(
+      from s in Shard,
+        where: s.status == "deleted" and s.updated_at >= ^since,
+        select: s.shard_id
+    )
+  end
+
+  @doc """
   Suspends a shard — flips its directory row to `suspended` (administrative offline, #20). A
   suspended tenant is denied at admission (via the `Fathom.Tenants.Suspensions` gate) until
   `resume/1`. Refuses `:not_found`, or `:deleted` (a tombstoned tenant is gone, not suspendable).

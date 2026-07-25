@@ -75,6 +75,7 @@ defmodule Fathom.Tenants.Tombstones do
     # uses the module defaults. `:retry_ms` overrides the first fast-retry delay per-instance.
     table = Keyword.get(opts, :table, @table)
     loader = Keyword.get(opts, :loader, &Directory.deleted_shard_ids/0)
+    since_loader = Keyword.get(opts, :since_loader, &Directory.deleted_shard_ids_since/1)
     retry_ms = Keyword.get(opts, :retry_ms, DenyList.initial_retry_ms())
 
     # public read_concurrency: admission reads directly from the caller process.
@@ -90,12 +91,21 @@ defmodule Fathom.Tenants.Tombstones do
     # deny coverage) during a Postgres outage that fails the directory load below.
     load_from_storage(table)
 
-    state = %{table: table, loader: loader, retry_ms: retry_ms}
+    state = %{
+      table: table,
+      loader: loader,
+      since_loader: since_loader,
+      retry_ms: retry_ms,
+      tick: 0,
+      since: nil
+    }
 
     case load_from_directory(state) do
       :ok ->
         schedule_refresh()
-        {:ok, Map.put(state, :loaded, true)}
+        # Seed the incremental cursor from the successful FULL boot load, so the very first
+        # periodic refresh is already incremental (review 2026-07-24 #30).
+        {:ok, state |> Map.put(:loaded, true) |> Map.put(:since, now_minus_overlap())}
 
       # Expert review #33: a FAILED boot load must not wait the full refresh interval — that
       # leaves the re-mint guard empty (410 contract broken) for up to 5 min during a Postgres
@@ -122,7 +132,11 @@ defmodule Fathom.Tenants.Tombstones do
   def handle_info(:refresh, state) do
     # Steady-state refresh: the set is already loaded and append-only, so a failure here just
     # logs — the last-known set stands. Only the BOOT-unloaded path (below) fast-retries.
-    load_from_directory(state)
+    #
+    # INCREMENTAL by default (expert review 2026-07-24 #30): the old shape re-read every id ever
+    # deleted, on every node, every 5 minutes, so both the Postgres read and this process's heap
+    # scaled with cumulative LIFETIME deletions rather than with anything current.
+    state = refresh_from_directory(state)
     schedule_refresh()
     {:noreply, state}
   end
@@ -135,7 +149,7 @@ defmodule Fathom.Tenants.Tombstones do
         load_from_storage(state.table)
         DenyList.recovered(:tombstones)
         schedule_refresh()
-        {:noreply, %{state | loaded: true}}
+        {:noreply, %{state | loaded: true, since: now_minus_overlap()}}
 
       {:error, reason} ->
         DenyList.degraded(:tombstones, reason)
@@ -165,6 +179,44 @@ defmodule Fathom.Tenants.Tombstones do
   # narrower refresh) can't un-tombstone an id this node already knows. Returns `:ok` on a
   # successful directory read, `{:error, reason}` on a failure so init/retry can fast-retry
   # (expert review #33) instead of silently waiting the full refresh interval.
+  # A full reload every @full_reload_every refreshes bounds any drift the incremental key could
+  # theoretically accumulate; otherwise load only rows changed since the last refresh, minus an
+  # overlap so a transaction that began earlier but committed later cannot slip below the
+  # high-water mark. Re-reading a row is free — the set is append-only and inserts are idempotent.
+  @full_reload_every 12
+  @overlap_ms 60_000
+
+  defp refresh_from_directory(state) do
+    tick = Map.get(state, :tick, 0) + 1
+    since = Map.get(state, :since)
+
+    result =
+      cond do
+        is_nil(since) or rem(tick, @full_reload_every) == 0 -> load_from_directory(state)
+        true -> load_since(state, since)
+      end
+
+    case result do
+      :ok -> state |> Map.put(:tick, tick) |> Map.put(:since, now_minus_overlap())
+      _ -> Map.put(state, :tick, tick)
+    end
+  end
+
+  defp now_minus_overlap, do: DateTime.add(DateTime.utc_now(), -@overlap_ms, :millisecond)
+
+  defp load_since(%{table: table, since_loader: loader}, since) do
+    for id <- loader.(since), do: insert(table, id)
+    :ok
+  rescue
+    e ->
+      Logger.warning("tombstone incremental refresh failed: #{Exception.message(e)}")
+      {:error, e}
+  catch
+    :exit, reason ->
+      Logger.warning("tombstone incremental refresh failed: #{inspect(reason)}")
+      {:error, reason}
+  end
+
   defp load_from_directory(%{table: table, loader: loader}) do
     for id <- loader.(), do: insert(table, id)
     :ok
