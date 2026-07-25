@@ -1,17 +1,18 @@
 defmodule FathomWeb.AdminOverviewLive do
   @moduledoc """
-  The dashboard centerpiece: this node's realtime metrics (via `Fathom.Admin.MetricsCollector`
-  over PubSub) alongside the fleet roll-up (via `Fathom.Admin.Fleet`, loaded with `assign_async`
-  so a Postgres round-trip never blocks the connected paint).
+  The dashboard centerpiece: this node's realtime metrics (via `Fathom.Admin.MetricsCollector`)
+  alongside the fleet roll-up (via `Fathom.Admin.FleetCollector`), both delivered over PubSub.
+
+  Neither is polled per-viewer: one collector per node does the work and broadcasts, so the
+  control-plane cost is independent of how many dashboard tabs are open (expert review
+  2026-07-24 #13). The only query this LiveView can issue is a single fallback load at connected
+  mount, when the collector has no snapshot yet or isn't running.
   """
   use FathomWeb, :live_view
 
   import FathomWeb.AdminComponents
 
-  alias Fathom.Admin.{Fleet, MetricsCollector}
-
-  # Fleet (Postgres) roll-ups refresh on this cadence — slow, and off the realtime 1s tick.
-  @fleet_refresh_ms 5_000
+  alias Fathom.Admin.{Fleet, FleetCollector, MetricsCollector}
 
   @impl true
   def mount(_params, _session, socket) do
@@ -19,7 +20,11 @@ defmodule FathomWeb.AdminOverviewLive do
 
     if connected do
       Phoenix.PubSub.subscribe(Fathom.PubSub, MetricsCollector.topic())
-      Process.send_after(self(), :refresh_fleet, @fleet_refresh_ms)
+      # The fleet roll-up is polled ONCE PER NODE by Fathom.Admin.FleetCollector and broadcast
+      # (expert review 2026-07-24 #13). Each tab used to run its own start_async on its own 5 s
+      # timer, so the directory-scale reads behind Fleet.overview/0 multiplied by open tabs —
+      # worst exactly during an incident, when several operators have the dashboard up.
+      Phoenix.PubSub.subscribe(Fathom.PubSub, FleetCollector.topic())
     end
 
     snap = MetricsCollector.snapshot()
@@ -30,16 +35,10 @@ defmodule FathomWeb.AdminOverviewLive do
       |> assign(:node_key, Fathom.Rebalancer.node_key())
       |> assign(:metrics, snap.current)
       |> assign(:history, snap.history)
-      |> assign(:fleet, nil)
-      |> load_fleet(connected)
+      |> assign(:fleet, initial_fleet(connected))
 
     {:ok, socket}
   end
-
-  # Fetch the fleet roll-up off-process (no DB in the disconnected mount); handle_async assigns it.
-  # start_async keeps the previous @fleet visible while a refresh runs (no skeleton flicker).
-  defp load_fleet(socket, false), do: socket
-  defp load_fleet(socket, true), do: start_async(socket, :fleet, fn -> Fleet.overview() end)
 
   @impl true
   def handle_info({:metrics, m}, socket) do
@@ -72,16 +71,34 @@ defmodule FathomWeb.AdminOverviewLive do
     {:noreply, socket}
   end
 
-  def handle_info(:refresh_fleet, socket) do
-    Process.send_after(self(), :refresh_fleet, @fleet_refresh_ms)
-    {:noreply, load_fleet(socket, true)}
+  # Broadcast by this node's FleetCollector. A failed poll simply doesn't broadcast, so the last
+  # good roll-up stays on screen — a Postgres blip must not blank the panels.
+  def handle_info({:fleet, fleet}, socket), do: {:noreply, assign(socket, :fleet, fleet)}
+
+  # No DB in the disconnected mount. Connected: take the collector's snapshot if it has one,
+  # otherwise fall back to a SINGLE load so the first paint isn't blank.
+  #
+  # The fallback is what keeps this correct when the collector isn't running at all (it is gated on
+  # Fathom.Admin.enabled?, which is false in test) or hasn't finished its first poll — without it
+  # those cases render permanently-empty panels. It is bounded: one query per tab at mount, versus
+  # the old one per tab every 5 s forever. The O(viewers) amplification #13 is about was the
+  # recurring poll, and that is gone either way.
+  defp initial_fleet(false), do: nil
+
+  defp initial_fleet(true) do
+    case FleetCollector.snapshot() do
+      nil -> safe_overview()
+      fleet -> fleet
+    end
   end
 
-  @impl true
-  def handle_async(:fleet, {:ok, fleet}, socket), do: {:noreply, assign(socket, :fleet, fleet)}
-
-  # Keep the last-good fleet data if a refresh crashes — a Postgres blip shouldn't blank the panels.
-  def handle_async(:fleet, {:exit, _reason}, socket), do: {:noreply, socket}
+  defp safe_overview do
+    Fleet.overview()
+  rescue
+    _ -> nil
+  catch
+    :exit, _ -> nil
+  end
 
   @impl true
   def render(assigns) do

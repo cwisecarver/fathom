@@ -24,12 +24,18 @@ defmodule Fathom.Admin.Fleet do
   def overview do
     head = Migrator.head()
 
+    # One group-by, three numbers (expert review 2026-07-24 #13). `count/0`, `count_by_status/0`
+    # and `count_failed/0` were three separate passes over `shards` — at 1M rows that is three
+    # scans of ~155 MB every refresh, per connected viewer. `status` is NOT NULL with a default,
+    # so the group-by's counts sum to the exact total and carry the migration_failed count too.
+    by_status = Directory.count_by_status()
+
     %{
-      total_shards: Directory.count(),
-      by_status: Directory.count_by_status(),
+      total_shards: by_status |> Map.values() |> Enum.sum(),
+      by_status: by_status,
       head_version: head,
       laggards: Directory.count_laggards(head),
-      failed: Directory.count_failed(),
+      failed: Map.get(by_status, "migration_failed", 0),
       nodes: node_roster(),
       node_load: LoadSamples.node_load(@load_window_ms),
       pins: Overrides.all(),
@@ -79,10 +85,28 @@ defmodule Fathom.Admin.Fleet do
     |> Enum.take(50)
   end
 
-  @doc "Oban job counts grouped by `{queue, state}` — the background-jobs panel (Pruner-bounded)."
+  # The job states an operator can act on. `completed` is deliberately EXCLUDED (expert review
+  # 2026-07-24 #13): the Pruner retains completed jobs for 7 days, so after a fleet rollout that is
+  # millions of rows, and counting them meant a multi-hundred-MB group-by over the whole
+  # `oban_jobs` table on every dashboard refresh, per connected viewer. The remaining states are
+  # served by Oban's own `state`-leading index. This does change the panel: a "completed" badge no
+  # longer appears. That count was "how many jobs ran this week", not a health signal — the
+  # actionable states are all still shown.
+  @oban_live_states ~w(available scheduled executing retryable discarded cancelled)
+
+  @doc """
+  Oban job counts grouped by `{queue, state}` for the background-jobs panel.
+
+  Bounded to the actionable states (`#{inspect(@oban_live_states)}`) — see the note above on why
+  `completed` is excluded.
+  """
   @spec oban_counts() :: [%{queue: String.t(), state: String.t(), count: non_neg_integer()}]
   def oban_counts do
-    from(j in Oban.Job, group_by: [j.queue, j.state], select: {j.queue, j.state, count(j.id)})
+    from(j in Oban.Job,
+      where: j.state in ^@oban_live_states,
+      group_by: [j.queue, j.state],
+      select: {j.queue, j.state, count(j.id)}
+    )
     |> Repo.all()
     |> Enum.map(fn {queue, state, count} -> %{queue: queue, state: state, count: count} end)
     |> Enum.sort_by(&{&1.queue, &1.state})

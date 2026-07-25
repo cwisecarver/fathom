@@ -436,7 +436,9 @@ defmodule Fathom.Application do
   # reach it; the collector itself stays gated.
   defp metrics_collector_children do
     [{Task.Supervisor, name: Fathom.Admin.TaskSupervisor}] ++
-      if Fathom.Admin.enabled?(), do: [Fathom.Admin.MetricsCollector], else: []
+      if Fathom.Admin.enabled?(),
+        do: [Fathom.Admin.MetricsCollector, Fathom.Admin.FleetCollector],
+        else: []
   end
 
   # Tell Phoenix to update the endpoint configuration
