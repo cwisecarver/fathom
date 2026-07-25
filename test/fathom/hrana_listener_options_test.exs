@@ -45,6 +45,45 @@ defmodule Fathom.HranaListenerOptionsTest do
     :gen_tcp.close(sock)
   end
 
+  # Expert review 2026-07-24 #16: Bandit defaults `compress: true`, so any client advertising
+  # accept-encoding (reqwest, undici/fetch, requests/httpx — all by default) made every Hrana
+  # pipeline response pay a full zlib context cycle, init-dominated at kilobyte JSON sizes, for what
+  # is usually a datacenter LAN hop to the LB.
+  #
+  # This cost is absent from every measurement in the repo: Filo.Client sends only `content-type`,
+  # so neither chaos driver ever advertised an encoding and the whole tpc-fleet / hotspots corpus
+  # measured the UNCOMPRESSED path. Asking for gzip explicitly is the only way to see it.
+  test "the listener does not compress, even when the client asks for it" do
+    port = 49_600 + :erlang.phash2(self(), 300)
+
+    start_supervised!(
+      {Bandit,
+       [
+         plug: EchoPlug,
+         scheme: :http,
+         port: port,
+         ip: {127, 0, 0, 1},
+         thousand_island_options: Fathom.Application.hrana_transport_options(),
+         http_options: Fathom.Application.hrana_http_options()
+       ]}
+    )
+
+    assert {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false], 2_000)
+
+    :ok =
+      :gen_tcp.send(
+        sock,
+        "GET / HTTP/1.1\r\nHost: localhost\r\naccept-encoding: gzip\r\n\r\n"
+      )
+
+    assert {:ok, resp} = :gen_tcp.recv(sock, 0, 2_000)
+    :gen_tcp.close(sock)
+
+    refute String.downcase(resp) =~ "content-encoding: gzip",
+           "the node compressed a response despite compress: false — compression belongs on the " <>
+             "LB, where gzip_min_length can skip the small replies Bandit has no knob for"
+  end
+
   test "setting :hrana_listen_sockets to 1 drops reuseport for platforms that refuse it" do
     prev = Application.get_env(:fathom, :hrana_listen_sockets)
     Application.put_env(:fathom, :hrana_listen_sockets, 1)

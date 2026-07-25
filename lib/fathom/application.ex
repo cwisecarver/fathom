@@ -505,7 +505,20 @@ defmodule Fathom.Application do
          scheme: :http,
          port: hrana_port(),
          ip: hrana_bind_ip(),
-         thousand_island_options: hrana_transport_options()
+         thousand_island_options: hrana_transport_options(),
+         # Compression belongs on the LB, not here (expert review 2026-07-24 #16). Bandit defaults
+         # `compress: true`, so any client advertising `accept-encoding: gzip` — reqwest (the Rust
+         # libSQL SDK), undici/fetch (JS), Python requests/httpx, all by default — made every
+         # /v2|v3/pipeline response pay a full open→deflateInit→deflate→deflateEnd→close cycle,
+         # init-dominated at kilobyte JSON sizes, for a hop that is usually a datacenter LAN.
+         #
+         # This cost is absent from every measurement in the repo: Filo.Client sends only
+         # `content-type`, so neither chaos driver ever advertises an encoding and the whole
+         # tpc-fleet / hotspots corpus measured the UNCOMPRESSED path. Real SDK traffic did not.
+         #
+         # nginx now does it once, where `gzip_min_length` can skip the small responses Bandit has
+         # no knob for. The client still receives `content-encoding: gzip` — wire-transparent.
+         http_options: hrana_http_options()
        ]},
       id: :fathom_hrana_listener
     )
@@ -533,6 +546,11 @@ defmodule Fathom.Application do
   #
   # Note a backlog above the OS `somaxconn` is silently clamped, so raising net.core.somaxconn is a
   # node-provisioning step, not something this can do for you.
+  @doc false
+  # Public for the same reason as hrana_transport_options/0: a test boots a real listener with
+  # these and asserts an `accept-encoding: gzip` request comes back UNcompressed.
+  def hrana_http_options, do: [compress: false]
+
   @doc false
   # Public only so a test can boot a listener with exactly these options — ThousandIsland fails
   # startup on an unsupported one (notably `reuseport`), which is precisely what needs proving.
