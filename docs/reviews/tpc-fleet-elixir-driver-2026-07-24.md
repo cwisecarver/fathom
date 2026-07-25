@@ -117,6 +117,27 @@ config with stderr visible gave the real exception:
 - **The driving envelope for the Elixir driver**: one in-network container, raised `nofile`, staggered
   connects — no per-process client cap, no multi-process orchestration, out to at least 4096.
 
+## Single-node baseline (light tenants pack on one node)
+
+Controlled same-session A/B — the same tenant counts driven through the LB (3 nodes) vs direct at one
+node (`fathom1:8080`, holding *every* tenant), per_client=50:
+
+| tenants | fleet txn/s | fleet errs | 1-node txn/s | 1-node errs | fleet/1-node |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 4,165 | 0 | 4,038 | 0 | 1.03× |
+| 256 | 3,844 | 0 | 3,555 | 0 | 1.08× |
+| 1024 | 3,834 | 0 | 3,535 | 0 | 1.08× |
+| 4096 | 3,137 | 0 | 2,600 | 0 | 1.21× |
+
+**TPC-B stays clean on one node all the way to 4,096** (0 errors, throughput edge only 1.03→1.21×) —
+the exact opposite of the **TPC-C** single-node baseline, where 4,096 tenants on one node broke with
+**8,700 errors** (`docs/reviews/tpcc-elixir-driver-2026-07-24.md`). So the per-node wall is a function
+of **per-tenant weight**, not tenant count: TPC-B is light (7 statements/txn, tiny seed, quick-released
+writes) so one node packs 4,096 fine; TPC-C is heavy (~30 statements/txn, a full 9-table seed, longer-
+held write streams) so the same count exhausts one node's connections/fds/scheduler. On one VM the
+fleet's *throughput* edge is always modest (CPU-shared); its *capacity* benefit — no node hitting the
+per-node ceiling — only bites for heavy tenants. Raw ~N× throughput still needs N machines.
+
 ## Methodology / caveats
 
 - **The head-to-head is now controlled** — see the A/B section above: matched params, same host, one
