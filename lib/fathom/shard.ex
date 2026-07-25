@@ -121,8 +121,32 @@ defmodule Fathom.Shard do
   # flush), so a slow-but-normal cold open never trips the caller's checkout timeout.
   @default_checkout_timeout @pull_timeout + 15_000
 
+  # Per-coordinator memory policy (expert review 2026-07-24 #9). At 30k coordinators/node, retained
+  # heap dominates per-shard cost — this file's own `init` already relies on that: dropping its
+  # one-shot `:erlang.garbage_collect()` measured +53% fanout_kb_per_shard (16.99 → 26.06 KiB). But
+  # that shrink was one-time; afterwards ERTS defaults (`fullsweep_after: 65535`, effectively never)
+  # let everything surviving two minor collections sit in the old heap for the process's life —
+  # flush-cycle terms, Task/monitor bookkeeping, lease churn, Logger metadata. The measured gap
+  # between an idle coordinator that never served (~16 KiB) and one that did (~43 KiB) is that
+  # unreclaimable residue: ~810 MB/node at 30k.
+  #
+  # `fullsweep_after: 0` — a coordinator's live set is a small map, so every collection is cheap and
+  # a full sweep is the only thing that reclaims the old heap AND returns pages.
+  # `hibernate_after` — only useful because #10 stopped the idle 5 s tick; before that a message
+  # always arrived first, so any value above the interval never fired and any value below it cost a
+  # hibernate/wake pair per tick.
+  #
+  # `max_heap_size` is deliberately ABSENT and must stay absent: a coordinator killed at the heap
+  # limit mid-`terminate/2` skips the final fence + checkpoint + PUT + lease release — a durability
+  # regression that can also strand a lease.
+  @hibernate_after_ms 30_000
+
   def start_link(shard_id) do
-    GenServer.start_link(__MODULE__, shard_id, name: via(shard_id))
+    GenServer.start_link(__MODULE__, shard_id,
+      name: via(shard_id),
+      spawn_opt: [fullsweep_after: 0],
+      hibernate_after: @hibernate_after_ms
+    )
   end
 
   @doc "Registry `:via` tuple addressing the coordinator for `shard_id`."
