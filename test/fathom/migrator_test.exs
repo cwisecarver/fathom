@@ -73,4 +73,46 @@ defmodule Fathom.MigratorTest do
       assert Migrator.head() == 2
     end
   end
+
+  # Expert review 2026-07-24 #20: four hand-written queries filter Oban jobs by the shard id inside
+  # `args`, and none could use an index — Oban's own GIN index on `args` is jsonb_ops, which serves
+  # containment (@>) but NOT the `->>` extraction these use, and there was no index on `worker`
+  # either. During a rollout the live job set is hundreds of thousands of rows, and
+  # `enqueue_unique_chunk/1` runs this once per 5,000-shard chunk.
+  #
+  # A partial expression index is only worth anything if the planner can actually match it, and on a
+  # small table a seq scan wins regardless — so force the choice and read the plan, exactly as the
+  # shards status indexes are pinned.
+  describe "oban_jobs shard-id index (#20)" do
+    test "the per-shard job dedup query can use the expression index" do
+      %{rows: [[exists]]} =
+        Fathom.Repo.query!(
+          "SELECT count(*) FROM pg_indexes WHERE tablename = 'oban_jobs' AND indexname = $1",
+          ["oban_jobs_worker_shard_id_live_index"]
+        )
+
+      assert exists == 1, "the index is missing — the migration did not apply"
+
+      Fathom.Repo.query!("SET LOCAL enable_seqscan = off")
+
+      %{rows: rows} =
+        Fathom.Repo.query!(
+          """
+          EXPLAIN SELECT j0.args->>'shard_id' FROM oban_jobs AS j0
+          WHERE j0.worker = $1 AND j0.state = ANY($2) AND (j0.args->>'shard_id') = ANY($3)
+          """,
+          [
+            "Fathom.Migrator.ShardMigrationJob",
+            ~w(scheduled available executing retryable suspended),
+            ["acme"]
+          ]
+        )
+
+      plan = rows |> List.flatten() |> Enum.join("\n")
+
+      assert plan =~ "oban_jobs_worker_shard_id_live_index",
+             "the dedup query cannot use the index, so it still scans every live job row " <>
+               "per rollout chunk. Plan:\n#{plan}"
+    end
+  end
 end
