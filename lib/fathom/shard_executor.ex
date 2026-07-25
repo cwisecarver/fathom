@@ -149,7 +149,7 @@ defmodule Fathom.ShardExecutor do
        ) do
     started = System.monotonic_time()
 
-    case Connection.query(conn, sql, args) do
+    case Connection.query(conn, sql, args, dml?: dml?) do
       {:ok, result} ->
         # A write bumps the shard's write counter so the periodic durability flush knows local
         # holds un-flushed changes; a read-only shard stays clean and skips the upload (the

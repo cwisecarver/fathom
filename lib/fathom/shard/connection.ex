@@ -87,27 +87,29 @@ defmodule Fathom.Shard.Connection do
   Runs `sql` (with native-value `args`) on `conn`, returning native Elixir values
   in `{:ok, %{columns, rows, num_changes, last_insert_rowid}}` or `{:error, _}`.
   """
-  @spec query(reference(), String.t(), list()) :: {:ok, map()} | {:error, term()}
-  def query(conn, sql, args) do
+  @spec query(reference(), String.t(), list(), keyword()) :: {:ok, map()} | {:error, term()}
+  def query(conn, sql, args, opts \\ []) do
+    dml? = Keyword.get(opts, :dml?, true)
+
     # Statement deadline (expert review 2026-07-14 #26): when `:query_timeout_ms` is set, a runaway
     # query (missing-index full scan) is interrupted so it can't pin memory and keep the shard busy
     # (blocking eviction/drain/handoff). Only armed when configured — unset ⇒ no watchdog, no
     # overhead (the default, matching fathom's other protective knobs).
     case timeout_ms() do
       nil ->
-        do_query(conn, sql, args)
+        do_query(conn, sql, args, dml?)
 
       ms when is_integer(ms) and ms > 0 ->
-        with_deadline(conn, ms, fn -> do_query(conn, sql, args) end)
+        with_deadline(conn, ms, fn -> do_query(conn, sql, args, dml?) end)
 
       _ ->
-        do_query(conn, sql, args)
+        do_query(conn, sql, args, dml?)
     end
   rescue
     e in ArgumentError -> {:error, Exception.message(e)}
   end
 
-  defp do_query(conn, sql, args) do
+  defp do_query(conn, sql, args, dml?) do
     with {:ok, stmt, columns} <- cached_stmt(conn, sql) do
       # The statement is owned by this connection's cache — reset it (not release) when done,
       # including on a bind/collect error or a row-cap abort. sqlite3_reset ends the statement's
@@ -122,7 +124,18 @@ defmodule Fathom.Shard.Connection do
              rows: rows,
              row_count: row_count,
              num_changes: changes(conn),
-             last_insert_rowid: last_rowid(conn)
+             # Only fetch the rowid when the caller can actually use it (expert review
+             # 2026-07-24 #18). Sqlite3.last_insert_rowid/1 is ERL_NIF_DIRTY_JOB_IO_BOUND — a full
+             # dirty-scheduler dispatch — and ShardExecutor.to_stmt_result/2 discards it for every
+             # read-only statement, which is the dominant path. Removing it cuts ~25% of the
+             # dirty-IO dispatches on a plain SELECT, against the +SDio pool #2 resized.
+             #
+             # The predicate is exactly to_stmt_result's own `not read_only?`
+             # (`read_only? = cols != [] and not dml?`), so what the caller sees is byte-identical.
+             #
+             # num_changes stays UNCONDITIONAL: wrote?/2 checks `changes > 0` first, and the
+             # durability classifier's deliberate over-dirtying depends on it.
+             last_insert_rowid: if(dml? or columns == [], do: last_rowid(conn))
            }}
         end
       after

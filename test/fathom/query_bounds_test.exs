@@ -191,6 +191,33 @@ defmodule Fathom.QueryBoundsTest do
     :ok = ShardExecutor.close(h)
   end
 
+  # Expert review 2026-07-24 #18: last_insert_rowid was fetched on EVERY statement and then
+  # discarded for every read-only one. It is ERL_NIF_DIRTY_JOB_IO_BOUND — a full dirty-scheduler
+  # dispatch — so on a plain SELECT that was ~25% of the query's dirty-IO traffic spent on a value
+  # nobody reads. The gate must not change what a client sees, which is what this pins: a write
+  # still reports its rowid, and a read still reports none.
+  test "the rowid is reported for writes and omitted for reads", %{shard: shard} do
+    {:ok, h} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(h, stmt("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"))
+
+    assert {:ok, %{last_insert_rowid: rowid}} =
+             ShardExecutor.execute(h, stmt("INSERT INTO t (v) VALUES ('a')"))
+
+    assert is_integer(rowid) and rowid > 0, "an INSERT must still report its rowid"
+
+    # RETURNING has columns AND mutates, so it must keep reporting a rowid too.
+    assert {:ok, %{last_insert_rowid: r2}} =
+             ShardExecutor.execute(h, stmt("INSERT INTO t (v) VALUES ('b') RETURNING id"))
+
+    assert is_integer(r2) and r2 > rowid
+
+    # A read on the same connection, where sqlite3_last_insert_rowid still holds the write's value.
+    assert {:ok, %{last_insert_rowid: nil}} = ShardExecutor.execute(h, stmt("SELECT v FROM t")),
+           "a read must not surface the previous write's rowid"
+
+    :ok = ShardExecutor.close(h)
+  end
+
   test "a normal query is unaffected by a generous timeout", %{shard: shard} do
     Application.put_env(:fathom, :query_timeout_ms, 30_000)
     seed!(shard, ["CREATE TABLE t (v INTEGER)", "INSERT INTO t VALUES (1), (2)"])
