@@ -499,9 +499,56 @@ defmodule Fathom.Application do
     ]
 
     Supervisor.child_spec(
-      {Bandit, plug: {Filo.Plug, opts}, scheme: :http, port: hrana_port(), ip: hrana_bind_ip()},
+      {Bandit,
+       [
+         plug: {Filo.Plug, opts},
+         scheme: :http,
+         port: hrana_port(),
+         ip: hrana_bind_ip(),
+         thousand_island_options: hrana_transport_options()
+       ]},
       id: :fathom_hrana_listener
     )
+  end
+
+  # Accept-path sizing for the Hrana listener (expert review 2026-07-24 #6). The listener shipped
+  # with NO transport options, so ThousandIsland's defaults applied: all 100 acceptors contending on
+  # ONE listen socket with ONE kernel accept queue capped at 1024.
+  #
+  # That is the structural version of the ListenOverflows the 4096-shed report measured and
+  # correctly dismissed as not the primary cause: a 4096-wide connect burst offers ~4096 SYNs to a
+  # 1024-slot queue, overflow drops the SYN, the client retransmits after ~1 s, and that feeds
+  # straight into the 15 s Filo.Client timeout that IS the shed's cause. Deeper queues do not hide a
+  # failure here — they stop discarding connections the node has the CPU and fds to serve (max_fd
+  # measured 17–21k against a 65,536 limit).
+  #
+  # `num_listen_sockets` + `reuseport` is ThousandIsland's documented multi-queue path: N
+  # independent listen sockets, each with its own kernel queue, spread by the kernel. Safe here
+  # because all of them belong to one BEAM node started together — the classic "SO_REUSEPORT
+  # rebalance drops connections across independent processes" hazard needs separate processes.
+  #
+  # CONFIG-GATED, deliberately: ThousandIsland FAILS STARTUP if `reuseport` is unsupported, so a
+  # hardcoded value would be a boot-fail hazard on an exotic kernel. Set :hrana_listen_sockets to 1
+  # to fall back to a single socket with no reuseport.
+  #
+  # Note a backlog above the OS `somaxconn` is silently clamped, so raising net.core.somaxconn is a
+  # node-provisioning step, not something this can do for you.
+  @doc false
+  # Public only so a test can boot a listener with exactly these options — ThousandIsland fails
+  # startup on an unsupported one (notably `reuseport`), which is precisely what needs proving.
+  def hrana_transport_options do
+    sockets = Application.get_env(:fathom, :hrana_listen_sockets, 4)
+    backlog = Application.get_env(:fathom, :hrana_backlog, 4096)
+
+    transport =
+      if is_integer(sockets) and sockets > 1,
+        do: [backlog: backlog, reuseport: true],
+        else: [backlog: backlog]
+
+    [
+      num_listen_sockets: max(sockets, 1),
+      transport_options: transport
+    ]
   end
 
   defp hrana_port, do: Application.get_env(:fathom, :hrana_port, 8080)
