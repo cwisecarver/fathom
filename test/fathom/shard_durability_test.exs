@@ -636,6 +636,40 @@ defmodule Fathom.ShardDurabilityTest do
     assert FlushGate.in_flight() == 0, "the admitted flush released its slot when it settled"
   end
 
+  # Expert review 2026-07-24 #11: the durability snapshot's temp file inherits its connection's
+  # safety_level, so at synchronous=FULL every flush force-fsynced a full shard-sized file that is
+  # unlinked seconds later. The relaxation is scoped to the snapshot connection ONLY. This pins the
+  # blast radius: a SERVING connection must still be FULL (that is the per-commit local RPO), and a
+  # flush must not change that. Guards against anyone "simplifying" by hoisting the pragma into
+  # Connection.open/1 or onto the checkpoint connection, where it could corrupt on power loss.
+  test "the snapshot's synchronous relaxation does not leak to serving connections", %{
+    shard: shard
+  } do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (1)"))
+
+    # 2 == FULL. This is the live shard's per-commit durability guarantee.
+    assert {:ok, %StmtResult{rows: [[2]]}} =
+             ShardExecutor.execute(conn, stmt("PRAGMA synchronous"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    flush_now(coordinator)
+
+    assert {:ok, %StmtResult{rows: [[2]]}} =
+             ShardExecutor.execute(conn, stmt("PRAGMA synchronous")),
+           "a durability flush must leave serving connections at synchronous=FULL"
+
+    # A freshly opened connection too — the default itself must be unchanged.
+    {:ok, conn2} = ShardExecutor.open(shard)
+
+    assert {:ok, %StmtResult{rows: [[2]]}} =
+             ShardExecutor.execute(conn2, stmt("PRAGMA synchronous"))
+
+    :ok = ShardExecutor.close(conn2)
+    :ok = ShardExecutor.close(conn)
+  end
+
   # Expert review 2026-07-24 #4: nothing truncated the WAL in steady state except SQLite's
   # autocheckpoint, which runs INLINE inside a committing tenant statement — a latency spike billed
   # to an arbitrary client query. Worse, the durability snapshot's VACUUM INTO is a long-lived

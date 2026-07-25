@@ -2116,6 +2116,22 @@ defmodule Fathom.Shard do
   # escaped defensively.
   defp snapshot(path, dest) do
     with {:ok, conn} <- Connection.open(path) do
+      # The snapshot temp inherits this connection's safety_level (SQLite's sqlite3RunVacuum:
+      # `pgflags = db->aDb[iDb].safety_level | ...`), so at synchronous=FULL every periodic flush
+      # force-fsynced a full shard-sized file that `snapshot_and_upload/1` unlinks seconds later
+      # (expert review 2026-07-24 #11). At ~640 KiB/shard × 1,000 write-active shards that is
+      # ~128 MB per interval of pure-waste synchronous device writes, plus the SSD endurance.
+      #
+      # The temp has NO durability requirement: it is read back in-process for the Content-MD5 and
+      # the PUT, and a crash mid-snapshot just leaves the shard dirty to be re-snapshotted next
+      # interval. The durable artifact is the S3 object, still gated by content-md5 over these same
+      # bytes. VACUUM INTO takes only a READ transaction on the source, so the live shard's WAL +
+      # per-commit synchronous=FULL is untouched — the RPO contract's local layer is unaffected.
+      #
+      # Scoped to this connection only. Emphatically NOT for `checkpoint/1`: a checkpoint at
+      # synchronous=OFF can corrupt the main database on power loss.
+      Connection.exec(conn, "PRAGMA synchronous=OFF")
+
       result = Connection.query(conn, "VACUUM INTO '#{String.replace(dest, "'", "''")}'", [])
 
       # Checkpoint here, where nobody is waiting (expert review 2026-07-24 #4). Without this the
