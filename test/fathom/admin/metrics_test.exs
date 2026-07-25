@@ -148,6 +148,26 @@ defmodule Fathom.Admin.MetricsTest do
     Shards.drain(id)
   end
 
+  # Expert review 2026-07-24 #2: +P and +Q exhaustion are hard availability cliffs (spawn throws
+  # system_limit ⇒ refused checkouts; accept returns system_limit ⇒ the listener stops accepting),
+  # and production materializes 3–4 processes and 1 port per served shard. rel/vm.args.eex raises
+  # both, and this gauge is what makes the approach alertable instead of an outage.
+  test "vm_limits emits process/port headroom as usable ratios" do
+    attach([:fathom, :node, :vm_limits])
+    :ok = Fathom.Admin.Measurements.vm_limits()
+
+    assert_receive {:telemetry, [:fathom, :node, :vm_limits], m, %{}}
+
+    assert m.processes > 0
+    assert m.process_limit >= m.processes
+    assert m.ports > 0
+    assert m.port_limit >= m.ports
+
+    # The ratio is the alertable signal — a fraction in (0, 1], never a raw count.
+    assert m.process_used_ratio > 0.0 and m.process_used_ratio <= 1.0
+    assert m.port_used_ratio > 0.0 and m.port_used_ratio <= 1.0
+  end
+
   test "an open shard publishes a watermark; draining forgets it" do
     Application.put_env(:fathom, :shard_idle_ms, 50)
     id = uniq("wmshard")

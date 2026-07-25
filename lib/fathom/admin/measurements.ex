@@ -22,6 +22,40 @@ defmodule Fathom.Admin.Measurements do
   end
 
   @doc """
+  Process- and port-table headroom for this node.
+
+  Expert review 2026-07-24 #2: neither limit degrades gracefully. Exhausting `+P` makes `spawn`
+  throw `system_limit` (a supervisor start failure — i.e. refused checkouts); exhausting `+Q` makes
+  `gen_tcp:accept` return `{:error, :system_limit}` and the listener stops accepting. Both are hard
+  availability cliffs, and production materializes 3–4 processes and 1 port per served shard, so at
+  the demonstrated densities they are reachable. `rel/vm.args.eex` raises both well clear, and these
+  gauges make the approach visible so it can be alerted on rather than discovered as an outage.
+  """
+  @spec vm_limits() :: :ok
+  def vm_limits do
+    processes = :erlang.system_info(:process_count)
+    process_limit = :erlang.system_info(:process_limit)
+    ports = :erlang.system_info(:port_count)
+    port_limit = :erlang.system_info(:port_limit)
+
+    :telemetry.execute(
+      [:fathom, :node, :vm_limits],
+      %{
+        processes: processes,
+        process_limit: process_limit,
+        process_used_ratio: safe_ratio(processes, process_limit),
+        ports: ports,
+        port_limit: port_limit,
+        port_used_ratio: safe_ratio(ports, port_limit)
+      },
+      %{}
+    )
+  end
+
+  defp safe_ratio(_used, limit) when not is_integer(limit) or limit <= 0, do: 0.0
+  defp safe_ratio(used, limit), do: used / limit
+
+  @doc """
   Durability / RPO gauge: how many open shards hold un-flushed writes, and the oldest such
   shard's RPO age (ms). Derives dirtiness from the published flush watermark exactly as
   `Fathom.Shard.unflushed?/1` does — a `WriteCounter` generation mismatch or a write count past

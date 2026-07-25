@@ -37,6 +37,7 @@ defmodule Fathom.Telemetry do
          measurements: [
            {__MODULE__, :measure_active_shards, []},
            {Fathom.Admin.Measurements, :node_memory, []},
+           {Fathom.Admin.Measurements, :vm_limits, []},
            {Fathom.Admin.Measurements, :durability, []}
          ],
          period: 10_000,
@@ -229,6 +230,30 @@ defmodule Fathom.Telemetry do
         measurement: :total,
         unit: :byte,
         description: "BEAM total memory on this node"
+      ),
+      # Approach-to-limit, not just current usage: both tables are hard cliffs (+P exhaustion makes
+      # spawn throw system_limit ⇒ refused checkouts; +Q exhaustion makes accept return
+      # system_limit ⇒ the listener stops accepting), and production materializes 3–4 processes and
+      # 1 port per served shard. Alert on the ratios (expert review 2026-07-24 #2).
+      last_value("fathom.node.processes",
+        event_name: [:fathom, :node, :vm_limits],
+        measurement: :processes,
+        description: "Live BEAM processes on this node"
+      ),
+      last_value("fathom.node.process_used_ratio",
+        event_name: [:fathom, :node, :vm_limits],
+        measurement: :process_used_ratio,
+        description: "Live processes as a fraction of +P (1.0 ⇒ spawn fails with system_limit)"
+      ),
+      last_value("fathom.node.ports",
+        event_name: [:fathom, :node, :vm_limits],
+        measurement: :ports,
+        description: "Open BEAM ports (sockets/fds) on this node"
+      ),
+      last_value("fathom.node.port_used_ratio",
+        event_name: [:fathom, :node, :vm_limits],
+        measurement: :port_used_ratio,
+        description: "Open ports as a fraction of +Q (1.0 ⇒ the listener stops accepting)"
       ),
       last_value("fathom.durability.dirty_shards",
         event_name: [:fathom, :durability, :rpo],

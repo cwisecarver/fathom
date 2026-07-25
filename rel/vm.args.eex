@@ -1,0 +1,77 @@
+## Customize flags given to the VM: https://www.erlang.org/doc/man/erl.html
+## -mode/-name/-sname/-setcookie are configured via env vars, do not set them here
+
+## Expert review 2026-07-24 #2. Before this file existed the release shipped pure ERTS defaults —
+## no rel/, no vm.args, no ERL_FLAGS anywhere in config/, deploy/, or the Dockerfiles. Every value
+## below was therefore load-bearing at its default, and three of them are sized for a general-
+## purpose BEAM app rather than for fathom's shape (a SQLite-per-shard database server holding tens
+## of thousands of connections per node).
+##
+## These are capacity and scheduling knobs: none of them change data paths, durability guarantees,
+## or ordering. They are documented individually because they should be A/B'd individually on the
+## chaos rig (chaos.sh tpc-fleet / served-data) rather than accepted as a block.
+
+## --- Dirty IO schedulers -----------------------------------------------------------------------
+## THE IMPORTANT ONE. Every exqlite NIF is ERL_NIF_DIRTY_JOB_IO_BOUND (open, prepare, step,
+## multi_step, columns, changes, last_insert_rowid, ...), so ALL SQLite work on the node — every
+## tenant, every shard — runs on this thread pool. The ERTS default is 10, independent of core
+## count, which makes 10 the node-wide ceiling on concurrent SQLite operations.
+##
+## Two fathom properties make those threads BLOCK rather than just execute:
+##   * PRAGMA synchronous=FULL fsyncs the WAL inside multi_step, so a commit pins a thread for the
+##     fsync duration (~0.1 ms local NVMe, ~0.5-1 ms on cloud block storage).
+##   * A contended write parks in the busy handler for up to the busy timeout.
+## A read query costs >=4 dirty-IO dispatches, so at the measured ~27k q/s/node that is ~135k
+## dirty-IO jobs/s across (by default) ten threads.
+##
+## The "clean CPU plateau" reported in docs/reviews/tpc-fleet-elixir-driver-2026-07-24.md has never
+## been tested against this hypothesis. Sweep 10 / 64 / 256 and watch aggregate tps; a standing
+## non-zero :erlang.system_info(:dirty_io_run_queue) during a run is the direct proof.
+##
+## Dirty-IO threads sleep when idle; the cost is thread stacks (~1 MB RSS per 32 threads).
+## Do NOT raise +SDcpu — it defaults to schedulers_online, which is correct here.
++SDio 64
+
+## --- Process and port tables -------------------------------------------------------------------
+## Production materializes 3-4 processes and 1 port per SERVED shard (Bandit connection handler,
+## Filo.Stream, the Fathom.Shard coordinator, plus a watchdog when :query_timeout_ms is set).
+## chaos.sh served-data reached 105k shards held (~35k/node) and extrapolates to ~50k/node.
+##
+## The defaults are +P 262144 and +Q 65536. deploy/chaos/docker-compose.yml already raises nofile to
+## 65536 specifically so fds stop binding — but +Q caps ports regardless of nofile, so that fd
+## headroom was unreachable past ~65k concurrent connections.
+##
+## Neither limit degrades gracefully: +P exhaustion makes spawn throw system_limit (a supervisor
+## start failure, i.e. refused checkouts) and +Q exhaustion makes gen_tcp:accept return
+## {:error, :system_limit} (the listener stops accepting). Both are hard availability cliffs, and
+## they sat an order of magnitude below the fd limit the compose file was raised to reach.
+##
+## Cost is the preallocated pointer tables: ~8 MB for +P, ~2 MB for +Q. Trivial against the ~6 GB
+## a served-data node already uses.
++P 1048576
++Q 262144
+
+## --- IO poll threads ---------------------------------------------------------------------------
+## Defaults are +IOp 1 / +IOt 1: ONE OS thread dispatching socket readiness for every socket on the
+## node — Hrana connections, the health listener, the Phoenix endpoint, and every Finch connection
+## to S3. ThousandIsland's sockets are {active, false}, which does not bypass the pollset.
+##
+## chaos.sh served measured 30k held connections (10k/node) and served-data was pushed to 105k, so
+## the documented working set is two orders of magnitude above what one poll thread is provisioned
+## for. UNMEASURED here — no number is being claimed. Attribute it with :msacc (start/print via
+## bin/fathom rpc), which reports time by thread type including `poll`.
++IOt 4
++IOp 2
+
+## --- Scheduler busy-wait (NOT enabled; needs measurement) --------------------------------------
+## `+sbwt none +sbwtdcpu none` stops schedulers spinning before they sleep, which is a standard win
+## for IO-bound BEAM services and would matter on a co-tenanted VM (the chaos rig is exactly that).
+## Left commented deliberately: unlike the knobs above it can REDUCE throughput on latency-sensitive
+## workloads by adding wake-up latency, and there is no way to tell which way it goes for fathom
+## without running it on the rig. Enable only behind an A/B.
+##+sbwt none
+##+sbwtdcpu none
+
+## Enable deployment without epmd
+## (requires changing both vm.args and remote.vm.args)
+##-start_epmd false -erl_epmd_port 6789
