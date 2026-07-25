@@ -495,7 +495,28 @@ defmodule Fathom.Application do
       # In-app bearer-token auth (Fathom.HranaAuth). The callback is always wired;
       # whether it checks anything is the runtime :hrana_auth mode (:disabled default,
       # HRANA_AUTH=required in prod), so flipping the mode needs no listener restart.
-      authorize: &Fathom.HranaAuth.authorize/2
+      authorize: &Fathom.HranaAuth.authorize/2,
+      # Expert review 2026-07-24 #22. Filo's default is 10s and fathom passed nothing, so there was
+      # no way to change it on a deployed release. This is NOT about hiding the 4096-tenant shed —
+      # that is a rig artifact and widening a timeout to mask it would be a regression. It is that
+      # 10s of CLIENT THINK TIME should not silently roll back an open transaction: a stream holds
+      # live transaction state, and expiring it mid-transaction discards acked work and surfaces as
+      # an opaque STREAM_NOT_FOUND. A Django request doing BEGIN; SELECT; <app logic>; UPDATE;
+      # COMMIT under load can plausibly exceed 10s between statements.
+      #
+      # The cost is bounded and explicit: each held stream is one shard checkout plus ~3 fds, and
+      # :max_checkouts_per_shard already caps per-tenant exposure. Do NOT set this to :infinity.
+      idle_timeout: Application.get_env(:fathom, :hrana_stream_idle_ms, 30_000),
+      # A stream is idle-dominant by construction (a django-libsql WebSocket stream lives for hours
+      # between requests) while holding the exqlite handle, its statement cache, and a heap grown to
+      # the largest result set it ever materialized — a large part of the measured ~220 KiB (empty)
+      # / ~640 KiB (with data) per served shard. Reclaim it the same way #9 does for coordinators.
+      #
+      # max_heap_size is deliberately absent here too: Filo.Executor.close/1 → Shard.checkin runs in
+      # terminate/2, which a heap-limit kill skips, leaking a checkout until the coordinator's
+      # monitor fires.
+      hibernate_after: Application.get_env(:fathom, :hrana_stream_hibernate_ms, 5_000),
+      spawn_opt: [fullsweep_after: 10]
     ]
 
     Supervisor.child_spec(

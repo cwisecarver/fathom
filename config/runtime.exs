@@ -105,6 +105,23 @@ case System.get_env("SHARD_STORAGE") do
     raise "SHARD_STORAGE must be \"s3\" or \"local\", got: #{inspect(other)}"
 end
 
+# Per-stream Hrana idle timeout (ms). Filo's default is 10s and fathom used to pass nothing, so
+# this was unreachable on a deployed release (expert review 2026-07-24 #22). It bounds CLIENT THINK
+# TIME inside an open transaction, not the server: a stream holds live transaction state, and
+# expiring it mid-transaction discards acked work as an opaque STREAM_NOT_FOUND. Each held stream
+# costs one shard checkout and ~3 fds, and :max_checkouts_per_shard caps per-tenant exposure.
+# Do NOT set this to a value that never expires.
+if ms = env_int.("HRANA_STREAM_IDLE_MS") do
+  config :fathom, :hrana_stream_idle_ms, ms
+end
+
+# How long an idle stream process waits before hibernating (ms). A WebSocket stream lives for hours
+# between requests while holding its heap; hibernation gives that back. Raise it if a workload is
+# burst-heavy enough that the hibernate/wake pair costs more than the heap it reclaims.
+if ms = env_int.("HRANA_STREAM_HIBERNATE_MS") do
+  config :fathom, :hrana_stream_hibernate_ms, ms
+end
+
 # Where shard files live locally while a shard is open (default: System.tmp_dir!/fathom_shards).
 # Point it at the node's fast local disk in a real deployment.
 if dir = System.get_env("SHARD_DATA_DIR") do
