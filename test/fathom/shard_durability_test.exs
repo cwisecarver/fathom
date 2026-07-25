@@ -636,6 +636,63 @@ defmodule Fathom.ShardDurabilityTest do
     assert FlushGate.in_flight() == 0, "the admitted flush released its slot when it settled"
   end
 
+  # Expert review 2026-07-24 #10: an idle AND clean coordinator used to re-arm the ~5s durability
+  # timer forever — ~6,000 pure no-op wakeups/s at 30k coordinators/node, and (the bigger cost) it
+  # made hibernate_after unusable at any value because a message always arrived within one interval.
+  # Such a coordinator is provably unwritable: WriteCounter.bump/1 is reachable only from paths that
+  # require a checked-out connection. Pins both halves — disarmed when idle+clean, re-armed on the
+  # checkout grant (not on checkin, so the timer is live for the whole window a connection can write).
+  test "an idle, clean coordinator carries no flush timer and re-arms on checkout", %{
+    shard: shard
+  } do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER)"))
+
+    {:ok, pid} = Shards.ensure(shard)
+    flush_now(pid)
+    refute dirty?(shard)
+
+    # Still busy (a connection is checked out) ⇒ the timer stays armed.
+    assert :sys.get_state(pid).flush_timer != nil,
+           "a coordinator with a live checkout must keep its flush timer"
+
+    :ok = ShardExecutor.close(conn)
+
+    # The disarm happens on the next tick, not at checkin: the already-armed timer fires once,
+    # observes idle+clean, and declines to re-arm. So a coordinator self-quiesces after at most one
+    # extra wakeup rather than paying one every interval forever.
+    flush_now(pid)
+
+    assert :sys.get_state(pid).flush_timer == nil,
+           "an idle, clean coordinator must not burn a timer — it cannot become dirty until the " <>
+             "next checkout"
+
+    # The other half: a new checkout must bring the timer back, or the shard could write with no
+    # scheduled flush.
+    {:ok, conn2} = ShardExecutor.open(shard)
+
+    assert :sys.get_state(pid).flush_timer != nil,
+           "the checkout grant must re-arm the durability timer"
+
+    :ok = ShardExecutor.close(conn2)
+  end
+
+  # The dirty counterpart: an idle-but-DIRTY coordinator must keep ticking, or its un-flushed
+  # writes would sit unflushed until something else happened to wake it.
+  test "an idle but dirty coordinator keeps its flush timer", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER)"))
+    :ok = ShardExecutor.close(conn)
+
+    {:ok, pid} = Shards.ensure(shard)
+    _ = :sys.get_state(pid)
+
+    assert dirty?(shard), "the CREATE TABLE left the shard dirty"
+
+    assert :sys.get_state(pid).flush_timer != nil,
+           "an idle but DIRTY coordinator must keep ticking so its writes still reach storage"
+  end
+
   # Expert review #17: the flush timer is jittered so a mass re-home's phase-aligned timers drift
   # apart instead of firing in lockstep. Pin that a scheduled delay stays within ±ratio of the
   # interval (bounded, never 0/negative) and actually varies across coordinators.
@@ -658,6 +715,17 @@ defmodule Fathom.ShardDurabilityTest do
           suffix <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock"],
           do: File.rm(Path.join(@local_dir, id <> suffix))
     end)
+
+    # Hold a connection on each: an idle+clean coordinator deliberately carries NO flush timer
+    # (review 2026-07-24 #10), and the jitter this test is about only matters for shards that can
+    # actually flush. Opening a stream is also what re-arms the timer, so this covers that path.
+    conns =
+      for id <- ids do
+        {:ok, conn} = ShardExecutor.open(id)
+        conn
+      end
+
+    on_exit(fn -> for c <- conns, do: ShardExecutor.close(c) end)
 
     remaining =
       for id <- ids do

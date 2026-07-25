@@ -855,6 +855,12 @@ defmodule Fathom.Shard do
         # cancel_timer + send_after pair per stream cycle (review 2026-07-23 #17).
         state = %{state | conns: Map.put(state.conns, ref, {caller, op}), idle_since: nil}
 
+        # Re-arm the durability timer if the idle+clean state disarmed it (review 2026-07-24 #10).
+        # Deliberately on the GRANT, not on checkin: the timer must be live for the whole window in
+        # which this connection can write. Cheap — only when there is no timer, i.e. once per
+        # idle→busy transition, never per stream cycle.
+        state = if state.flush_timer == nil, do: do_schedule_flush(state), else: state
+
         # Publish the busy count so the at-capacity eviction probe skips this shard while it serves
         # (expert review #14) — otherwise a long-lived held stream ages to the LRU front but can't be
         # evicted, starving admission. A best-effort hint, no-op unless eviction is enabled.
@@ -2220,9 +2226,27 @@ defmodule Fathom.Shard do
     %{state | renew_timer: nil}
   end
 
+  # Idle AND clean ⇒ provably unwritable until the next checkout, so don't burn a timer
+  # (expert review 2026-07-24 #10). WriteCounter.bump/1 is reachable only from
+  # ShardExecutor.run_statement/3 and the abnormal-stream-death path, both of which require a
+  # checked-out connection — so a coordinator with zero conns and nothing unflushed cannot become
+  # dirty before `:checkout` re-arms it. At 30k coordinators/node the old unconditional re-arm was
+  # ~6,000 wakeups/s of pure no-op (timer insert + :rand + send + dispatch + an ETS lookup + a heap
+  # touch that defeats page-out), and — the bigger cost — it made `hibernate_after` unusable at any
+  # value, since a message always arrived within one interval.
+  #
+  # RPO is unchanged: the contract bounds loss of *acknowledged writes*, and this state has none
+  # and can acquire none. A DIRTY coordinator keeps ticking exactly as before. Writes that bypass
+  # the Hrana path (the migrator, `mix fathom.shard`) were already invisible to WriteCounter.
+  defp schedule_flush(%{conns: conns} = state) when map_size(conns) == 0 do
+    if unflushed?(state), do: do_schedule_flush(state), else: cancel_flush(state)
+  end
+
+  defp schedule_flush(state), do: do_schedule_flush(state)
+
   # Arm the periodic durability flush. A non-positive interval disables it
   # (idle-only durability).
-  defp schedule_flush(state) do
+  defp do_schedule_flush(state) do
     state = cancel_flush(state)
 
     case flush_interval_ms() do
