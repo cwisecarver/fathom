@@ -597,6 +597,46 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  Every directory row as a keyset-paginated stream, ordered by `shard_id`.
+
+  `all/0` materializes the whole table; at fleet scale that is hundreds of MB of structs in one
+  process — an OOM, not a slow query (expert review 2026-07-24 #15). Use this for any sweep that
+  walks the directory. Served by `shards_shard_id_index`, so each page is a bounded index read and
+  peak memory is `O(page_size)` rather than `O(fleet)`.
+
+  Not a snapshot: rows inserted below the cursor after the walk passes are missed, and a row updated
+  mid-walk is seen in whichever state the page read finds it. That is the right trade for the
+  janitorial sweeps that use it — each row is reconciled independently, and the next run picks up
+  anything missed.
+  """
+  @spec all_paged(pos_integer()) :: Enumerable.t()
+  def all_paged(page_size \\ 5_000) do
+    Stream.resource(
+      fn -> "" end,
+      fn
+        :done ->
+          {:halt, :done}
+
+        cursor ->
+          rows =
+            Repo.all(
+              from s in Shard,
+                where: s.shard_id > ^cursor,
+                order_by: [asc: s.shard_id],
+                limit: ^page_size
+            )
+
+          case rows do
+            [] -> {:halt, :done}
+            _ when length(rows) < page_size -> {rows, :done}
+            _ -> {rows, List.last(rows).shard_id}
+          end
+      end,
+      fn _ -> :ok end
+    )
+  end
+
+  @doc """
   Every shard whose Hrana token floor has ever been raised, as `{shard_id, version, bumped_at}`.
 
   `token_version` defaults to 1 and only `revoke/1`, `rotate/1`, and the reconcile sweep's

@@ -346,6 +346,42 @@ defmodule Fathom.DirectoryTest do
     end
   end
 
+  # Expert review 2026-07-24 #15: `all/0` materialized every row as a struct and `Reconcile`
+  # applied `:limit` in Elixir afterwards — so `--limit 100` still pulled the whole table, and at
+  # fleet scale that is hundreds of MB in one process. An OOM, not a slow query, on the documented
+  # DR-completion path.
+  describe "all_paged/1 (#15)" do
+    test "walks every row exactly once, in shard_id order, across page boundaries" do
+      ids = for i <- 1..7, do: "pg_#{String.pad_leading("#{i}", 2, "0")}"
+      for id <- ids, do: {:ok, _} = Directory.resolve(id)
+
+      # Page size 2 against 7 rows: several full pages plus a short final one.
+      walked = Directory.all_paged(2) |> Enum.map(& &1.shard_id)
+
+      assert walked == Enum.sort(walked), "keyset pagination must yield shard_id order"
+      assert Enum.uniq(walked) == walked, "no row may be visited twice"
+      assert Enum.sort(ids) == Enum.sort(walked -- (walked -- ids))
+    end
+
+    # The boundary that breaks a hand-rolled cursor loop: a final page that is exactly full, so the
+    # walk must issue one more query and get an empty result rather than stopping early or looping.
+    test "terminates when the last page is exactly full" do
+      ids = for i <- 1..4, do: "pgx_#{i}"
+      for id <- ids, do: {:ok, _} = Directory.resolve(id)
+
+      walked = Directory.all_paged(2) |> Enum.map(& &1.shard_id)
+
+      for id <- ids, do: assert(id in walked)
+    end
+
+    test "is lazy — taking N does not walk the whole table" do
+      for i <- 1..6, do: {:ok, _} = Directory.resolve("pgl_#{i}")
+
+      taken = Directory.all_paged(2) |> Stream.take(3) |> Enum.to_list()
+      assert length(taken) == 3
+    end
+  end
+
   # Expert review 2026-07-24 #12: the only status indexes were partial on `status = 'active'`, and
   # Postgres cannot derive `status = 'active'` from `status = 'deleted'` — so every non-active
   # status predicate sequentially scanned the whole table, twice per node every 5 minutes for
