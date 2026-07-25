@@ -72,6 +72,10 @@ config :fathom, :hrana_auth, :disabled
 # live-state uniqueness the migrator/handoff jobs rely on is unaffected.
 config :fathom, Oban,
   repo: Fathom.Repo,
+  # Every executing job holds a Fathom.Repo connection for its Postgres work, so this sum (21) is a
+  # floor on repo pool demand before the endpoint, the pollers, and the near-hot-path
+  # HranaAuth.Revocations reads are counted. RAISING THESE MEANS RAISING `POOL_SIZE` in
+  # config/runtime.exs, which is sized against them (expert review 2026-07-24 #21).
   queues: [migrations: 10, retirement: 5, rebalance: 3, tenants: 3],
   plugins: [
     {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7},

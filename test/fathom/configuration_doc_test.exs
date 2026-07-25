@@ -23,8 +23,12 @@ defmodule Fathom.ConfigurationDocTest do
       # Skip comment lines — the phx.gen scaffolding (SSL/Mailgun examples) is commented out and
       # is not an active fathom knob.
       |> Enum.reject(fn line -> String.trim_leading(line) |> String.starts_with?("#") end)
-      # Only lines that actually read an env var.
-      |> Enum.filter(&(&1 =~ ~r/System\.(get_env|fetch_env!)/))
+      # Only lines that actually read an env var. `env_int.("X")` is included deliberately: the
+      # scan used to match `System.get_env` alone, so the typed-helper form introduced by expert
+      # review 2026-07-24 #14 read three real knobs (S3_POOL_SIZE / S3_POOL_COUNT /
+      # S3_CONN_MAX_IDLE_MS) that this guard could not see — undocumented AND invisible. Any future
+      # helper of this shape must be added here too, or it reopens the same blind spot.
+      |> Enum.filter(&(&1 =~ ~r/(System\.(get_env|fetch_env!)|env_int\.\()/))
       # Pull the UPPER_SNAKE literal(s) off each such line (the "" default / lowercase values
       # never match). Handles both System.get_env("X") and the "X" |> System.get_env("") form.
       |> Enum.flat_map(fn line ->

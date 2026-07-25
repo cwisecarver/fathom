@@ -40,6 +40,9 @@ config; diff from it.
 | `S3_ENDPOINT` | unset (AWS) | Override for S3-compatible stores (MinIO/R2/Tigris). | — |
 | `S3_PATH_STYLE` | `false` | Path-style addressing (needed by MinIO/R2). | — |
 | `S3_PREFIX` | `""` | Key prefix for all shard objects. | Use to share a bucket; a wrong prefix silently reads/writes the wrong keyspace. |
+| `S3_POOL_SIZE` | `200` | Finch connections per pool for the S3 backend. | The default is the measured knee on the LOCALHOST MinIO rig, not a real-S3 number — tune per deployment. Too small serializes cold-open/flush; too large can trip store-side connection limits. |
+| `S3_POOL_COUNT` | `1` | Number of Finch pools. | Only shows a win against real S3 (localhost MinIO saturates first). |
+| `S3_CONN_MAX_IDLE_MS` | `15000` | Retire an idle pooled connection after this long. | **Must stay under the store's idle close (~20s on S3)** so fathom is the closing side. Higher (or Finch's `:infinity` default) puts a stale-connection race on the flush PUT, which nothing retries — a raced `:closed` aborts the idle drop and extends that tenant's RPO window. |
 | `AWS_ACCESS_KEY_ID` | unset | S3 credential. | Use least-privilege creds scoped to the bucket/prefix (`docs/durability.md`). |
 | `AWS_SECRET_ACCESS_KEY` | unset | S3 credential. | As above; keep out of images/logs. |
 | `AWS_SESSION_TOKEN` | unset | Optional STS session token. | — |
@@ -103,7 +106,9 @@ config; diff from it.
 | `NODE_KEY` | `node()` | Stable per-node key (heartbeat object, LB backend reference, load samples). | **Must be unique per node.** A collision makes two nodes share one heartbeat and corrupts liveness (`docs/runbooks/operations.md` heartbeat). |
 | `DNS_CLUSTER_QUERY` | unset | DNS-based BEAM clustering query (not required — fathom coordinates via S3, not BEAM). | — |
 | `ECTO_IPV6` | unset | Use IPv6 for the Postgres socket. | — |
-| `POOL_SIZE` | `10` | Postgres connection pool size. | Too small starves the control plane under load; size to cores/Postgres limits. |
+| `POOL_SIZE` | `25` | Postgres connection pool size. | Sized against a demand floor of ~21 from Oban's `queues:` alone (each executing job holds a connection), plus the endpoint, the pollers, and the near-hot-path `HranaAuth.Revocations` reads. **Raising `queues:` in `config/config.exs` means raising this.** Too small starves the control plane. |
+| `POOL_QUEUE_TARGET_MS` | `50` | DBConnection queue target. | With `POOL_QUEUE_INTERVAL_MS`, bounds how long a checkout waits before the pool starts DROPPING them. A dropped checkout on the stream-open path pins a Hrana stream. |
+| `POOL_QUEUE_INTERVAL_MS` | `1000` | DBConnection queue interval. | See `POOL_QUEUE_TARGET_MS`. |
 
 ## Rebalancer (Phase-2 B1 — all off by default)
 

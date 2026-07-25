@@ -318,7 +318,24 @@ if config_env() == :prod do
   config :fathom, Fathom.Repo,
     # ssl: true,
     url: database_url,
-    pool_size: String.to_integer(System.get_env("POOL_SIZE") || "10"),
+    # Expert review 2026-07-24 #21. The phx.new default of 10 sat under a demand floor of ~21 from
+    # Oban ALONE (`queues: [migrations: 10, retirement: 5, rebalance: 3, tenants: 3]`, config.exs),
+    # each executing job holding a connection — and ShardMigrationJob's cutover runs `Oban.insert`
+    # inside a transaction, holding one for its full duration. On top of that: the Oban
+    # Cron/Pruner/Peer plugins, the endpoint and every admin LiveView, Directory.Recorder,
+    # Migrator.HeadCache, HranaAuth.Revocations, Tenants.Tombstones/Suspensions,
+    # Rebalancer.Reporter, CommandPoller, and Shard.WarmFollower.
+    #
+    # Size it as sum(queue concurrency) + web concurrency + headroom for the pollers. RAISING
+    # `queues:` MEANS RAISING THIS.
+    pool_size: String.to_integer(System.get_env("POOL_SIZE") || "25"),
+    # DBConnection's defaults (50/1000) were already in force implicitly; they are stated here
+    # because they are load-bearing. Past `queue_interval` of saturation, checkouts are DROPPED
+    # rather than queued — and the module that most needs them, HranaAuth.Revocations, sits on the
+    # stream-open path, where a queued caller pins its Hrana stream. That is the pressure #5 removed
+    # from the common case; this bounds what happens when the pool saturates anyway.
+    queue_target: String.to_integer(System.get_env("POOL_QUEUE_TARGET_MS") || "50"),
+    queue_interval: String.to_integer(System.get_env("POOL_QUEUE_INTERVAL_MS") || "1000"),
     # For machines with several cores, consider starting multiple pools of `pool_size`
     # pool_count: 4,
     socket_options: maybe_ipv6
