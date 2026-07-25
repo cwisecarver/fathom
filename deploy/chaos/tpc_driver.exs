@@ -30,6 +30,82 @@
 filo_path = System.get_env("FILO_PATH") || Path.expand("../../../filo", __DIR__)
 Mix.install([{:filo, path: filo_path}, {:mint, "~> 1.6"}, {:jason, "~> 1.4"}])
 
+# --- error-reason tally -----------------------------------------------------------------------
+# WHY: the single-node TPC-C fleet at ~4096 tenants sheds ~11% of connections on ~40% of runs, but
+# every catch site used to swallow the reason (`rescue _ -> e + 1`), so a shed run never said WHICH
+# resource gave out. This tallies the reason of every shed connection/txn into a lock-free public
+# ETS histogram (written from every worker process), so a shed run prints e.g. `econnrefused=8200`
+# (accept-backlog / listen-queue overflow) vs `timeout=8200` (CPU/scheduler starvation) vs
+# `emfile=8200` (fd exhaustion). Keys are strings (no String.to_atom on error text — cardinality is
+# bounded anyway: digits are collapsed and length capped in the `other:` fallback).
+defmodule ErrTally do
+  @tab :tpc_err_reasons
+
+  def start do
+    :ets.new(@tab, [:public, :named_table, {:write_concurrency, true}])
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  # Bucket a failure (an exception, an {:error, reason} tuple, or a bare term) by the resource its
+  # reason names, then bump the counter. Never let instrumentation crash a worker.
+  def note(term) do
+    k = bucket(term)
+    :ets.update_counter(@tab, k, {2, 1}, {k, 0})
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  def dump do
+    @tab |> :ets.tab2list() |> Map.new()
+  rescue
+    _ -> %{}
+  end
+
+  def report do
+    d = dump()
+
+    if map_size(d) > 0 do
+      line =
+        d
+        |> Enum.sort_by(fn {_k, n} -> -n end)
+        |> Enum.map_join("  ", fn {k, n} -> "#{k}=#{n}" end)
+
+      IO.puts(:stderr, "  err reasons: #{line}")
+    end
+
+    d
+  end
+
+  # Classify by substring of the reason text — robust to Mint/Filo error shapes we don't enumerate.
+  defp bucket(term) do
+    s = term |> text() |> String.downcase()
+
+    cond do
+      String.contains?(s, "econnrefused") -> "econnrefused"
+      String.contains?(s, "emfile") -> "emfile"
+      String.contains?(s, "enfile") -> "enfile"
+      String.contains?(s, "system_limit") -> "system_limit"
+      String.contains?(s, "timeout") -> "timeout"
+      String.contains?(s, "econnreset") -> "econnreset"
+      String.contains?(s, "closed") -> "closed"
+      String.contains?(s, "nxdomain") -> "nxdomain"
+      String.contains?(s, "ehostunreach") -> "ehostunreach"
+      true -> "other:" <> (s |> String.replace(~r/\d+/, "N") |> String.slice(0, 48))
+    end
+  end
+
+  defp text(term) do
+    cond do
+      is_exception(term) -> Exception.message(term)
+      is_binary(term) -> term
+      true -> inspect(term)
+    end
+  end
+end
+
 defmodule Tpc do
   @moduledoc "TPC workloads + one-BEAM-process-per-client orchestration over Filo.Client."
 
@@ -309,6 +385,7 @@ defmodule Tpc do
     }
 
     a = parse_opts(rest, defaults)
+    ErrTally.start()
 
     out =
       case mode do
@@ -319,6 +396,7 @@ defmodule Tpc do
         other -> raise "unknown mode #{other} (rtt|tpcb|tpcc|tpcc-fleet)"
       end
 
+    out = Map.put(out, "err_reasons", ErrTally.report())
     IO.puts(Jason.encode!(out))
   end
 
@@ -516,7 +594,9 @@ defmodule Tpcc do
       :error -> errored_fleet(a.per_client)
     end
   rescue
-    _ -> errored_fleet(a.per_client)
+    exc ->
+      ErrTally.note(exc)
+      errored_fleet(a.per_client)
   end
 
   defp errored_fleet(per_client) do
@@ -530,7 +610,11 @@ defmodule Tpcc do
          {:ok, c} <- fleet_seed(c, a.scale) do
       {:ok, c}
     else
-      _ ->
+      other ->
+        # `other` is {:error, reason} from Client.connect (accept-backlog/timeout/closed) or
+        # {:error, exc} from fleet_seed (a mid-seed failure) — either carries the reason text.
+        ErrTally.note(other)
+
         if attempts <= 1 do
           :error
         else
@@ -543,9 +627,9 @@ defmodule Tpcc do
   defp fleet_seed(c, scale) do
     {:ok, Enum.reduce(schema_ddl() ++ seed_sql(1, scale), c, fn stmt, c -> x!(c, stmt) end)}
   rescue
-    _ ->
+    exc ->
       Client.close(c)
-      :error
+      {:error, exc}
   end
 
   # Run per_client TPC-C txns on the held stream; flat latency list + new-order count.
@@ -563,7 +647,9 @@ defmodule Tpcc do
           counted = typ == :new_order and status in [:committed, :rolled_back]
           {[l | lat], no + if(counted, do: 1, else: 0), e, c}
         rescue
-          _ -> {lat, no, e + 1, reconnect(c)}
+          exc ->
+            ErrTally.note(exc)
+            {lat, no, e + 1, reconnect(c)}
         end
       end)
 
