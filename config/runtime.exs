@@ -51,6 +51,24 @@ end
 # deploy/chaos rig). Unset ⇒ the compile-time defaults (Local storage under System.tmp_dir!),
 # so dev/test are unaffected.
 
+# An optional integer env var: unset (or unparseable) ⇒ nil, so the reading module falls back to
+# its own default rather than to 0.
+env_int = fn name ->
+  case System.get_env(name) do
+    nil ->
+      nil
+
+    "" ->
+      nil
+
+    v ->
+      case Integer.parse(v) do
+        {n, _} when n > 0 -> n
+        _ -> nil
+      end
+  end
+end
+
 # Storage backend for shard files. SHARD_STORAGE=s3 selects the S3 backend and reads its
 # connection settings; the boot fence probe (Fathom.Application.check_storage_fence!) then
 # verifies the store enforces conditional writes before serving a byte.
@@ -74,7 +92,14 @@ case System.get_env("SHARD_STORAGE") do
       prefix: System.get_env("S3_PREFIX", ""),
       access_key_id: System.get_env("AWS_ACCESS_KEY_ID"),
       secret_access_key: System.get_env("AWS_SECRET_ACCESS_KEY"),
-      token: System.get_env("AWS_SESSION_TOKEN")
+      token: System.get_env("AWS_SESSION_TOKEN"),
+      # Finch pool sizing (expert review 2026-07-24 #14). The defaults (200/1) are the measured
+      # knee on the LOCALHOST MinIO rig — past ~200 connections that server saturates, so
+      # `pool_count` can only show a win against real S3. Without these env vars that
+      # localhost-derived number was baked into every release with no way to tune a deployment.
+      pool_size: env_int.("S3_POOL_SIZE"),
+      pool_count: env_int.("S3_POOL_COUNT"),
+      conn_max_idle_time: env_int.("S3_CONN_MAX_IDLE_MS")
 
   other ->
     raise "SHARD_STORAGE must be \"s3\" or \"local\", got: #{inspect(other)}"

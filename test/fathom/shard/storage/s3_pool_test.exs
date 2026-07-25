@@ -32,4 +32,42 @@ defmodule Fathom.Shard.Storage.S3PoolTest do
     assert opts[:pools][:default][:size] == 32
     assert opts[:pools][:default][:count] == 4
   end
+
+  # Expert review 2026-07-24 #14: Finch defaults conn_max_idle_time to :infinity, so a pooled
+  # connection was never proactively retired and the SERVER became the closing side. A checkout
+  # landing ahead of the server's FIN then hands out a dead socket.
+  #
+  # The failure is asymmetric, which is why it mattered: Req's default :safe_transient retries
+  # GET/HEAD only, download/4 rolls its own retries, and the FLUSH PUT is retried by nobody — so a
+  # raced :closed aborts the idle drop, the coordinator keeps the local file AND the lease, and the
+  # tenant's RPO window extends by a whole backoff interval.
+  test "the pool retires idle connections before S3 does" do
+    {Finch, opts} = S3.finch_child_spec()
+    default = opts[:pools][:default]
+
+    idle = Keyword.fetch!(default, :conn_max_idle_time)
+
+    assert is_integer(idle) and idle > 0,
+           "conn_max_idle_time must be set — at :infinity, S3 is the closing side and the stale " <>
+             "connection race lands on the unretried flush PUT"
+
+    assert idle < 20_000,
+           "must be under S3's ~20s idle close, or fathom still is not the closing side"
+
+    assert Keyword.fetch!(default, :conn_opts)[:transport_opts][:timeout] > 0,
+           "a hung connect otherwise sits for the library default before anything reacts"
+  end
+
+  test "retry backoff is scaled to a same-region object store, not a public API" do
+    delays = Enum.map(0..3, &S3.retry_delay/1)
+    [first | _] = delays
+
+    assert first < 1_000,
+           "Req's exp_backoff starts at 1000ms, sized for public-internet APIs. Against a " <>
+             "same-region S3 whose whole cold-open budget is ~1 RTT (~26ms at 10ms one-way), that " <>
+             "made one transient blip a ~40x p99 spike"
+
+    assert delays == Enum.sort(delays), "backoff must be non-decreasing"
+    assert Enum.all?(delays, &(&1 > 0))
+  end
 end

@@ -52,6 +52,10 @@ defmodule Fathom.Shard.Storage.S3 do
   @finch __MODULE__.Finch
   @default_pool_size 200
   @default_pool_count 1
+  # Under S3's ~20s idle close, so fathom is always the side that retires a pooled connection
+  # (expert review 2026-07-24 #14).
+  @default_conn_max_idle_time :timer.seconds(15)
+  @default_connect_timeout 3_000
 
   # Streaming transfer tuning (expert review #20): bodies are streamed in chunks in
   # both directions instead of materialized whole in the BEAM, and a single PUT is
@@ -79,6 +83,9 @@ defmodule Fathom.Shard.Storage.S3 do
 
     * `pool_size` (default #{@default_pool_size}) — connections per nimble_pool.
     * `pool_count` (default #{@default_pool_count}) — number of pools.
+    * `conn_max_idle_time` (default #{@default_conn_max_idle_time}ms) — retire an idle pooled
+      connection before S3 does, so a checkout never races the server's FIN.
+    * `connect_timeout` (default #{@default_connect_timeout}ms) — TCP connect budget.
 
   Total connections to the S3 host = `pool_size * pool_count`. Req's default
   ~50-conn pool caps warming throughput (many shards pulled from S3 at once on
@@ -89,11 +96,34 @@ defmodule Fathom.Shard.Storage.S3 do
   """
   @spec finch_child_spec() :: {module(), keyword()}
   def finch_child_spec do
-    {Finch, name: @finch, pools: %{default: [size: pool_size(), count: pool_count()]}}
+    {Finch,
+     name: @finch,
+     pools: %{
+       default: [
+         size: pool_size(),
+         count: pool_count(),
+         # Expert review 2026-07-24 #14. Finch defaults this to :infinity, so a pooled connection
+         # was never proactively retired and the SERVER became the closing side. A checkout that
+         # lands ahead of the server's FIN in the pool's mailbox then hands out a dead socket.
+         #
+         # That failure is asymmetric here, which is why it matters: Req's default :safe_transient
+         # retries GET/HEAD only, `download/4` deliberately rolls its own retries, and the flush PUT
+         # is retried by NOBODY — so a raced :closed aborts the idle drop, the coordinator keeps the
+         # local file AND the lease, and the tenant's RPO window extends by a whole backoff.
+         #
+         # 15s is comfortably under S3's ~20s idle close, making fathom always the closing side —
+         # the same discipline as the LB's `keepalive_timeout` vs Bandit's idle close.
+         conn_max_idle_time: conn_max_idle_time(),
+         # A hung connect otherwise sits for Finch's default before anything reacts.
+         conn_opts: [transport_opts: [timeout: connect_timeout()]]
+       ]
+     }}
   end
 
   defp pool_size, do: config()[:pool_size] || @default_pool_size
   defp pool_count, do: config()[:pool_count] || @default_pool_count
+  defp conn_max_idle_time, do: config()[:conn_max_idle_time] || @default_conn_max_idle_time
+  defp connect_timeout, do: config()[:connect_timeout] || @default_connect_timeout
 
   @doc """
   Boot-time self-test that the configured store **enforces** HTTP conditional writes
@@ -1782,11 +1812,27 @@ defmodule Fathom.Shard.Storage.S3 do
           token: config[:token],
           service: :s3,
           region: region(config)
-        ]
+        ],
+        # Req's `exp_backoff` starts at 1000 ms, sized for public-internet APIs. Against a
+        # same-region S3 whose entire cold-open budget is ~1 RTT (~26 ms at 10 ms one-way), one
+        # transient blip on a retried GET/HEAD was a ~40× p99 spike (expert review 2026-07-24 #14).
+        #
+        # This only reshapes the delay for retries Req ALREADY performs (:safe_transient ⇒
+        # GET/HEAD). It deliberately does NOT widen retry coverage: `flush/3`'s PUT stays
+        # unretried at this layer because it is `If-Match`-fenced, and a blind re-issue would
+        # replay a conditional write with a stale etag. The coordinator's own backoff is the
+        # correct retry tier for a flush.
+        retry_delay: &__MODULE__.retry_delay/1
       ] ++ finch_opt() ++ req_plug_opt(config)
     )
     |> Req.Request.append_response_steps(fathom_s3_meter: &__MODULE__.meter/1)
   end
+
+  @doc false
+  # Retry backoff for the GET/HEAD retries Req already performs, scaled to a same-region object
+  # store rather than to a public-internet API (expert review 2026-07-24 #14).
+  @spec retry_delay(non_neg_integer()) :: non_neg_integer()
+  def retry_delay(attempt), do: Enum.at([50, 200, 800], attempt, 800)
 
   @doc false
   # S3-op meter, attached as a Req response step in req/0 — the single choke point every
