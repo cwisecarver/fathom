@@ -138,19 +138,39 @@ defmodule Fathom.Shard.Connection do
   # shape unchanged. `close/1` releases the cached statements explicitly for the orderly path.
   @stmt_cache_cap 64
 
+  # Cache entries are `{canonical_sql, stmt, stamp}` (expert review 2026-07-24 #8). The key is
+  # stored alongside the statement so the HIT path can re-put under the CANONICAL binary rather
+  # than the caller's, which matters because of where the caller's binary comes from:
+  #
+  #   filo reads the whole HTTP body / WebSocket frame into one binary and Jason.decode's it.
+  #   Jason extracts strings with binary_part/3, so on a body >64 bytes (every Hrana pipeline
+  #   body) each extracted string is a SUB-BINARY holding a reference to the entire body. The
+  #   stmt map's "sql" is taken verbatim, and ERTS copies a >=64-byte sub-binary across a process
+  #   boundary as a reference, not a flatten — so stashing it as a cache key pins the whole
+  #   originating request body for as long as the entry lives.
+  #
+  # At the 64-entry cap that is up to 64 whole request bodies pinned per stream, freed only on the
+  # holder's GC. With modest 4 KiB pipeline bodies that is ~256 KiB per served shard — the same
+  # order as the entire measured ~220 KiB/shard served cost. It never showed up in the density
+  # numbers because it lands in :erlang.memory(:binary), not the process heap.
+  #
+  # :binary.copy/1 on the MISS path only, so the hot hit path pays nothing.
   defp cached_stmt(conn, sql) do
     key = {__MODULE__, :stmt_cache, conn}
     {seq, cache} = Process.get(key, {0, %{}})
 
     case cache do
-      %{^sql => {stmt, _stamp}} ->
-        Process.put(key, {seq + 1, Map.put(cache, sql, {stmt, seq + 1})})
+      %{^sql => {canonical, stmt, _stamp}} ->
+        # Re-put under `canonical`, never the incoming sub-binary: a map that has grown past a
+        # flatmap adopts the new key term, which would silently reinstate the pin.
+        Process.put(key, {seq + 1, Map.put(cache, canonical, {canonical, stmt, seq + 1})})
         {:ok, stmt}
 
       _ ->
         with {:ok, stmt} <- Sqlite3.prepare(conn, sql) do
+          canonical = :binary.copy(sql)
           cache = maybe_evict(conn, cache)
-          Process.put(key, {seq + 1, Map.put(cache, sql, {stmt, seq + 1})})
+          Process.put(key, {seq + 1, Map.put(cache, canonical, {canonical, stmt, seq + 1})})
           {:ok, stmt}
         end
     end
@@ -160,7 +180,9 @@ defmodule Fathom.Shard.Connection do
   # only on an over-cap miss — a workload cycling >64 distinct statements per stream is
   # re-preparing anyway, exactly as before the cache.
   defp maybe_evict(conn, cache) when map_size(cache) >= @stmt_cache_cap do
-    {lru_sql, {stmt, _stamp}} = Enum.min_by(cache, fn {_sql, {_stmt, stamp}} -> stamp end)
+    {lru_sql, {_canonical, stmt, _stamp}} =
+      Enum.min_by(cache, fn {_sql, {_canonical, _stmt, stamp}} -> stamp end)
+
     Sqlite3.release(conn, stmt)
     Map.delete(cache, lru_sql)
   end
@@ -169,8 +191,11 @@ defmodule Fathom.Shard.Connection do
 
   defp purge_stmt_cache(conn) do
     case Process.delete({__MODULE__, :stmt_cache, conn}) do
-      {_seq, cache} -> Enum.each(cache, fn {_sql, {stmt, _}} -> Sqlite3.release(conn, stmt) end)
-      nil -> :ok
+      {_seq, cache} ->
+        Enum.each(cache, fn {_sql, {_canonical, stmt, _}} -> Sqlite3.release(conn, stmt) end)
+
+      nil ->
+        :ok
     end
   end
 
