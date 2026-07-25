@@ -28,7 +28,17 @@ defmodule Fathom.Shard.Connection do
          # single-DB engine pays ~2–3× for the same guarantee. See
          # docs/reviews/competitive-oltp-2026-07-10.md.
          :ok <- Sqlite3.execute(conn, "PRAGMA synchronous=FULL"),
-         :ok <- Sqlite3.execute(conn, "PRAGMA busy_timeout=5000"),
+         # NOT `PRAGMA busy_timeout` (expert review 2026-07-24 #1): the pragma routes to
+         # sqlite3_busy_timeout(), which REPLACES exqlite's custom busy handler with SQLite's
+         # default — a bare sqlite3OsSleep loop observing neither the interrupt flag nor exqlite's
+         # cancel flag. That made a lock wait uninterruptible: `:query_timeout_ms` bounded VDBE
+         # execution only, so a query blocked on the write lock slept the full 5s pinning a
+         # dirty-IO scheduler thread (all SQLite NIFs are DIRTY_JOB_IO_BOUND, and the pool is
+         # +SDio-sized), starving every co-located tenant. set_busy_timeout/2 updates the value the
+         # CUSTOM handler reads, keeping the wait cancellable (see with_deadline's Sqlite3.cancel).
+         # exqlite's handler walks the SAME delay ladder as SQLite's default, so the wait timing
+         # is unchanged; it just also polls the cancel flag and the caller's liveness.
+         :ok <- Sqlite3.set_busy_timeout(conn, 5000),
          :ok <- maybe_foreign_keys(conn),
          :ok <- maybe_max_page_count(conn) do
       {:ok, conn}
@@ -254,7 +264,14 @@ defmodule Fathom.Shard.Connection do
             exit(:normal)
         after
           ms ->
-            Sqlite3.interrupt(conn)
+            # cancel/1, not interrupt/1 (expert review 2026-07-24 #1): interrupt only aborts VDBE
+            # execution, so a statement parked in the busy handler waiting for the write lock
+            # ignored it and slept out the full busy timeout. cancel/1 is a superset — it sets the
+            # flag the busy handler polls AND calls sqlite3_interrupt — so the deadline now bounds
+            # lock waits too. It is a non-dirty NIF that deliberately avoids the connection mutex,
+            # so it cannot block behind the running query. A spurious late cancel is still a no-op:
+            # exqlite resets `cancelled` at the top of every subsequent db op.
+            Sqlite3.cancel(conn)
             send(parent, {:timed_out, ref})
 
             # Consume the guaranteed late {:done, ref} before the next arm (the interrupt
@@ -293,6 +310,17 @@ defmodule Fathom.Shard.Connection do
   """
   @spec exec(reference(), String.t()) :: :ok | {:error, term()}
   def exec(conn, sql), do: Sqlite3.execute(conn, sql)
+
+  @doc """
+  Sets how long a statement waits on a contended lock before failing `SQLITE_BUSY`.
+
+  Always use this over `PRAGMA busy_timeout` (expert review 2026-07-24 #1): the pragma calls
+  `sqlite3_busy_timeout()`, which swaps exqlite's cancellable busy handler out for SQLite's
+  default `sqlite3OsSleep` loop — making the wait uninterruptible, so `:query_timeout_ms` can no
+  longer bound it and a blocked statement pins a dirty-IO scheduler thread for the full timeout.
+  """
+  @spec set_busy_timeout(reference(), non_neg_integer()) :: :ok | {:error, term()}
+  def set_busy_timeout(conn, ms), do: Sqlite3.set_busy_timeout(conn, ms)
 
   @doc """
   Introspects a statement WITHOUT running it (the Hrana `describe` request, #34): returns its result

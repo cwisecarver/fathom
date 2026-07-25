@@ -77,6 +77,41 @@ defmodule Fathom.QueryBoundsTest do
     :ok = ShardExecutor.close(h)
   end
 
+  # Expert review 2026-07-24 #1: `PRAGMA busy_timeout=N` routes to sqlite3_busy_timeout(), which
+  # REPLACES exqlite's custom busy handler with SQLite's default — a bare sqlite3OsSleep loop that
+  # observes neither the interrupt flag nor exqlite's cancel flag. So a query blocked on the write
+  # lock could not be cut short by the watchdog's Sqlite3.interrupt: it slept the FULL busy timeout
+  # (5s) pinning a dirty-IO scheduler thread, then returned SQLITE_BUSY — never FILO_QUERY_TIMEOUT.
+  # The invariant pinned here: :query_timeout_ms bounds LOCK WAITS, not just VDBE execution.
+  # Pre-fix this takes ~5s and returns a SQLITE_BUSY-shaped error; post-fix ~200ms and a timeout.
+  test "a query blocked on another stream's write lock honors the statement timeout", %{
+    shard: shard
+  } do
+    seed!(shard, ["CREATE TABLE t (v INTEGER)"])
+
+    # Holder: a second stream on the same shard takes the write lock and keeps it.
+    {:ok, holder} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(holder, stmt("BEGIN IMMEDIATE"))
+    {:ok, _} = ShardExecutor.execute(holder, stmt("INSERT INTO t VALUES (1)"))
+
+    Application.put_env(:fathom, :query_timeout_ms, 200)
+    {:ok, blocked} = ShardExecutor.open(shard)
+
+    {elapsed_us, result} =
+      :timer.tc(fn -> ShardExecutor.execute(blocked, stmt("INSERT INTO t VALUES (2)")) end)
+
+    assert {:error, %Filo.Error{status: 503, code: "FILO_QUERY_TIMEOUT"}} = result
+
+    # The load-bearing half: it must give up at the DEADLINE, not at the 5s busy timeout.
+    assert elapsed_us < 2_000_000,
+           "blocked write took #{div(elapsed_us, 1000)}ms; the 200ms deadline did not cut the " <>
+             "busy wait short (busy handler is not cancellable)"
+
+    {:ok, _} = ShardExecutor.execute(holder, stmt("ROLLBACK"))
+    :ok = ShardExecutor.close(blocked)
+    :ok = ShardExecutor.close(holder)
+  end
+
   test "a normal query is unaffected by a generous timeout", %{shard: shard} do
     Application.put_env(:fathom, :query_timeout_ms, 30_000)
     seed!(shard, ["CREATE TABLE t (v INTEGER)", "INSERT INTO t VALUES (1), (2)"])

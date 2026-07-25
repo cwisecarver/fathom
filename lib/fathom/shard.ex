@@ -1713,7 +1713,10 @@ defmodule Fathom.Shard do
   defp checkpoint(path) do
     case Connection.open(path) do
       {:ok, conn} ->
-        Connection.exec(conn, "PRAGMA busy_timeout=1000")
+        # set_busy_timeout, not the pragma (expert review 2026-07-24 #1) — the pragma would swap
+        # exqlite's cancellable busy handler back out for SQLite's uninterruptible one on this
+        # connection, re-opening the uncancellable-lock-wait hole on the drop path.
+        Connection.set_busy_timeout(conn, 1000)
         result = Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", [])
         Connection.close(conn)
 
