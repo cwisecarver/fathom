@@ -159,6 +159,13 @@ statements per node — intermittently exceeding one node's headroom.
 tenants, so the fleet never approaches that edge (0 errors at every step of every sweep), while the
 throughput gain itself is small (CPU is shared). Raw ~N× throughput still needs N separate machines.
 
+**The edge is now root-caused** (`tpcc-4096-shed-root-cause-2026-07-24.md`, 2026-07-24): it is
+**client request timeouts** (Filo.Client's 15 s per-request + Filo.Stream's 10 s idle) crossed by
+cold-open latency under the 4096-wide storm — **not** fds (max_fd ~17–21k ≪ 65,536), **not** the
+accept backlog (overflows only as a minor secondary symptom), **not** a BEAM limit (logs clean). The
+magnitude swings 95 → 35,789 errors across six runs — a noisy single-VM edge, contaminated by the
+co-located driver sharing the 12 vCPUs, not a fathom wall.
+
 ## Provenance
 
 - `Filo.Client` transparent stream-resume on a dropped connection — filo `3adbcd9`.
