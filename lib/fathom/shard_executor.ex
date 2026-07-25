@@ -92,7 +92,8 @@ defmodule Fathom.ShardExecutor do
     # Classify the statement ONCE — dml?/ddl? each slice+downcase the statement head, and the old
     # shape recomputed them up to 3× per statement (twice in this cond, again in to_stmt_result).
     dml? = dml?(sql)
-    write? = dml? or ddl?(sql)
+    ddl? = ddl?(sql)
+    write? = dml? or ddl?
 
     cond do
       # A read-only token (#24) may only read: refuse any write (DML or DDL) with a distinct 403 so
@@ -125,7 +126,7 @@ defmodule Fathom.ShardExecutor do
       # template + migration engine, never a direct tenant migrate. The template (the capture source)
       # is exempt, and the engine's own replay uses `Connection` directly (not this Hrana path), so
       # neither is affected. Off by default (`:block_tenant_ddl`); enable in prod to enforce the model.
-      opts.block_ddl? and not opts.template? and ddl?(sql) ->
+      opts.block_ddl? and not opts.template? and ddl? ->
         {:error,
          %Error{
            message:
@@ -136,14 +137,15 @@ defmodule Fathom.ShardExecutor do
          }}
 
       true ->
-        run_statement(handle, stmt, dml?)
+        run_statement(handle, stmt, dml?, ddl?)
     end
   end
 
   defp run_statement(
          {_pid, _ref, conn, shard_id, _scope, opts},
          %Stmt{sql: sql, args: args},
-         dml?
+         dml?,
+         ddl?
        ) do
     started = System.monotonic_time()
 
@@ -179,6 +181,13 @@ defmodule Fathom.ShardExecutor do
 
         # On the reserved template shard, feed each successful statement to the
         # migration capture so a Django migrate becomes a fleet version.
+        # prepare_v2 recompiles a cached statement on a schema change, so the STATEMENT stays
+        # valid — but the column list now cached beside it does not (review 2026-07-24 #17). Drop
+        # the cache on DDL so a later `SELECT *` cannot report pre-ALTER columns for post-ALTER
+        # rows. Off the hot path: only DDL pays it, and fathom blocks client DDL on tenant shards
+        # entirely when :block_tenant_ddl is on.
+        if ddl?, do: Connection.purge_statements(conn)
+
         capture(opts.template?, conn, sql)
         stmt_result = to_stmt_result(result, dml?)
         latency = System.monotonic_time() - started
@@ -488,6 +497,9 @@ defmodule Fathom.ShardExecutor do
             # …and record it against the open transaction, so a BEGIN (query) → write (exec) →
             # COMMIT (query) sequence still re-bumps at the commit boundary (review 2026-07-24 #3).
             mark_txn_write(conn)
+            # A script is opaque and may contain DDL, so drop the statement cache unconditionally
+            # (review 2026-07-24 #17). Scripts are migration-rare; the cost is irrelevant here.
+            Connection.purge_statements(conn)
             # On the template shard, a script is (part of) a migration — feed it to capture.
             capture(opts.template?, conn, sql)
             :ok

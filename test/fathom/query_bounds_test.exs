@@ -165,6 +165,32 @@ defmodule Fathom.QueryBoundsTest do
     File.rm(path)
   end
 
+  # Expert review 2026-07-24 #17: column names are now cached alongside the prepared statement, so
+  # they are read once at prepare instead of once per execution (Sqlite3.columns/2 is a dirty-IO
+  # NIF dispatch plus a fresh binary per column, every time).
+  #
+  # THE HAZARD that makes this need invalidation: prepare_v2 transparently recompiles a cached
+  # statement on a schema change, so the STATEMENT stays valid — but the cached column list does
+  # not. Without the DDL purge, `SELECT *` after `ALTER TABLE ... ADD COLUMN` would report the
+  # pre-ALTER columns while returning post-ALTER rows: a silently wrong result shape, which is
+  # worse than the per-query cost being saved.
+  test "a cached SELECT * reflects a column added by later DDL", %{shard: shard} do
+    {:ok, h} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(h, stmt("CREATE TABLE t (a INTEGER)"))
+    {:ok, _} = ShardExecutor.execute(h, stmt("INSERT INTO t VALUES (1)"))
+
+    # Prime the cache: this exact SQL now has its columns memoized.
+    assert {:ok, %{cols: ["a"]}} = ShardExecutor.execute(h, stmt("SELECT * FROM t"))
+
+    {:ok, _} = ShardExecutor.execute(h, stmt("ALTER TABLE t ADD COLUMN b TEXT"))
+
+    assert {:ok, %{cols: ["a", "b"]}} = ShardExecutor.execute(h, stmt("SELECT * FROM t")),
+           "the cached column list went stale across DDL — rows carry the new column but the " <>
+             "reported shape does not"
+
+    :ok = ShardExecutor.close(h)
+  end
+
   test "a normal query is unaffected by a generous timeout", %{shard: shard} do
     Application.put_env(:fathom, :query_timeout_ms, 30_000)
     seed!(shard, ["CREATE TABLE t (v INTEGER)", "INSERT INTO t VALUES (1), (2)"])

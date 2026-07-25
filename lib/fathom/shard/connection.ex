@@ -108,14 +108,13 @@ defmodule Fathom.Shard.Connection do
   end
 
   defp do_query(conn, sql, args) do
-    with {:ok, stmt} <- cached_stmt(conn, sql) do
+    with {:ok, stmt, columns} <- cached_stmt(conn, sql) do
       # The statement is owned by this connection's cache — reset it (not release) when done,
       # including on a bind/collect error or a row-cap abort. sqlite3_reset ends the statement's
       # execution (releasing its locks / read-transaction hold, which release/finalize used to
       # do) while keeping the compiled plan for the next execution of the same SQL.
       try do
         with :ok <- Sqlite3.bind(stmt, args),
-             {:ok, columns} <- Sqlite3.columns(conn, stmt),
              {:ok, rows, row_count} <- collect(conn, stmt, row_cap()) do
           {:ok,
            %{
@@ -170,18 +169,19 @@ defmodule Fathom.Shard.Connection do
     {seq, cache} = Process.get(key, {0, %{}})
 
     case cache do
-      %{^sql => {canonical, stmt, _stamp}} ->
+      %{^sql => {canonical, stmt, cols, _stamp}} ->
         # Re-put under `canonical`, never the incoming sub-binary: a map that has grown past a
         # flatmap adopts the new key term, which would silently reinstate the pin.
-        Process.put(key, {seq + 1, Map.put(cache, canonical, {canonical, stmt, seq + 1})})
-        {:ok, stmt}
+        Process.put(key, {seq + 1, Map.put(cache, canonical, {canonical, stmt, cols, seq + 1})})
+        {:ok, stmt, cols}
 
       _ ->
-        with {:ok, stmt} <- Sqlite3.prepare(conn, sql) do
+        with {:ok, stmt} <- Sqlite3.prepare(conn, sql),
+             {:ok, cols} <- Sqlite3.columns(conn, stmt) do
           canonical = :binary.copy(sql)
           cache = maybe_evict(conn, cache)
-          Process.put(key, {seq + 1, Map.put(cache, canonical, {canonical, stmt, seq + 1})})
-          {:ok, stmt}
+          Process.put(key, {seq + 1, Map.put(cache, canonical, {canonical, stmt, cols, seq + 1})})
+          {:ok, stmt, cols}
         end
     end
   end
@@ -190,8 +190,8 @@ defmodule Fathom.Shard.Connection do
   # only on an over-cap miss — a workload cycling >64 distinct statements per stream is
   # re-preparing anyway, exactly as before the cache.
   defp maybe_evict(conn, cache) when map_size(cache) >= @stmt_cache_cap do
-    {lru_sql, {_canonical, stmt, _stamp}} =
-      Enum.min_by(cache, fn {_sql, {_canonical, _stmt, stamp}} -> stamp end)
+    {lru_sql, {_canonical, stmt, _cols, _stamp}} =
+      Enum.min_by(cache, fn {_sql, {_canonical, _stmt, _cols, stamp}} -> stamp end)
 
     Sqlite3.release(conn, stmt)
     Map.delete(cache, lru_sql)
@@ -199,10 +199,23 @@ defmodule Fathom.Shard.Connection do
 
   defp maybe_evict(_conn, cache), do: cache
 
+  @doc """
+  Drops this connection's cached prepared statements (and their cached column lists).
+
+  Must be called after DDL on the connection (expert review 2026-07-24 #17): `prepare_v2`
+  transparently recompiles a statement on a schema change, so the STATEMENT stays valid — but the
+  column list cached alongside it does not. After `ALTER TABLE t ADD COLUMN c`, a cached
+  `SELECT * FROM t` would keep reporting the pre-ALTER columns while returning post-ALTER rows.
+  """
+  @spec purge_statements(reference()) :: :ok
+  def purge_statements(conn), do: purge_stmt_cache(conn)
+
   defp purge_stmt_cache(conn) do
     case Process.delete({__MODULE__, :stmt_cache, conn}) do
       {_seq, cache} ->
-        Enum.each(cache, fn {_sql, {_canonical, stmt, _}} -> Sqlite3.release(conn, stmt) end)
+        Enum.each(cache, fn {_sql, {_canonical, stmt, _cols, _}} ->
+          Sqlite3.release(conn, stmt)
+        end)
 
       nil ->
         :ok
