@@ -12,6 +12,8 @@ of those driver ceilings: **6→4096 concurrent tenants from a single container,
 step**, including the 256 point that broke the solo Python process. (Getting past 1024 took one
 driver bugfix — see "The 2048/4096 crash" below; the fleet was never the limit.)
 
+**Charts:** the scaling story across all `tpc-*` benchmarks is in [`tpc-scaling-2026-07-24.md`](tpc-scaling-2026-07-24.md).
+
 ## Results (in-network, one `fathom-chaos-driver` container, 100 txns/tenant, 200 accounts/tenant)
 
 | tenants | txns | agg txn/s | p50 ms | p95 ms | p99 ms | errs |
@@ -129,14 +131,17 @@ node (`fathom1:8080`, holding *every* tenant), per_client=50:
 | 1024 | 3,834 | 0 | 3,535 | 0 | 1.08× |
 | 4096 | 3,137 | 0 | 2,600 | 0 | 1.21× |
 
-**TPC-B stays clean on one node all the way to 4,096** (0 errors, throughput edge only 1.03→1.21×) —
-the exact opposite of the **TPC-C** single-node baseline, where 4,096 tenants on one node broke with
-**8,700 errors** (`docs/reviews/tpcc-elixir-driver-2026-07-24.md`). So the per-node wall is a function
-of **per-tenant weight**, not tenant count: TPC-B is light (7 statements/txn, tiny seed, quick-released
-writes) so one node packs 4,096 fine; TPC-C is heavy (~30 statements/txn, a full 9-table seed, longer-
-held write streams) so the same count exhausts one node's connections/fds/scheduler. On one VM the
-fleet's *throughput* edge is always modest (CPU-shared); its *capacity* benefit — no node hitting the
-per-node ceiling — only bites for heavy tenants. Raw ~N× throughput still needs N machines.
+**TPC-B stays clean on one node all the way to 4,096** — 0 errors across three single-node runs at
+4,096, throughput edge only 1.03→1.21×. TPC-C is different: at 4,096 single-node it *intermittently*
+sheds ~11% of connections — five runs gave `0, 0, 0, 8.7k, 9.2k` errors, a non-deterministic **edge,
+not a wall** (`docs/reviews/tpcc-elixir-driver-2026-07-24.md`; an earlier draft here overstated it as a
+deterministic break). And it is **transaction complexity, not per-tenant weight** — a control with
+TPC-B seeded to ~4,000 rows/tenant (matching TPC-C's data footprint) but keeping its simple 7-statement
+txns stays 0 errors, so the same data + connection count is fine; it's TPC-C's held-stream complexity
+(more concurrent open write-transactions per node) that occasionally exceeds one node's headroom. On
+one VM the fleet's *throughput* edge is always modest (~1.0–1.2×, CPU-shared); its value is **headroom**
+— each node carries ~1/N of the tenants, so the fleet never approaches that edge. Raw ~N× throughput
+still needs N machines.
 
 ## Methodology / caveats
 

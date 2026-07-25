@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 440" width="760" height="440" role="img" font-family="system-ui,-apple-system,'Segoe UI',sans-serif">
+<rect x="0" y="0" width="760" height="440" rx="14" fill="#191b20"/>
+<text x="70" y="34" fill="#f2f2ef" font-size="20" font-weight="600">Fleet throughput vs tenant count — the one-VM plateau</text>
+<text x="70" y="56" fill="#b7b6ad" font-size="13">% of each workload&#x27;s own peak (TPC-B txn/s, TPC-C tpmC); in-network, 3 nodes, 0 errors</text>
+<rect x="694" y="30" width="18" height="4" rx="2" fill="#d95926"/>
+<text x="718" y="38" fill="#b7b6ad" font-size="13">TPC-C</text>
+<rect x="634" y="30" width="18" height="4" rx="2" fill="#3987e5"/>
+<text x="658" y="38" fill="#b7b6ad" font-size="13">TPC-B</text>
+<line x1="74" y1="380.0" x2="628" y2="380.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="64" y="384.0" fill="#8f8e88" font-size="12" text-anchor="end" font-variant-numeric="tabular-nums">0%</text>
+<line x1="74" y1="308.0" x2="628" y2="308.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="64" y="312.0" fill="#8f8e88" font-size="12" text-anchor="end" font-variant-numeric="tabular-nums">25%</text>
+<line x1="74" y1="236.0" x2="628" y2="236.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="64" y="240.0" fill="#8f8e88" font-size="12" text-anchor="end" font-variant-numeric="tabular-nums">50%</text>
+<line x1="74" y1="164.0" x2="628" y2="164.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="64" y="168.0" fill="#8f8e88" font-size="12" text-anchor="end" font-variant-numeric="tabular-nums">75%</text>
+<line x1="74" y1="92.0" x2="628" y2="92.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="64" y="96.0" fill="#8f8e88" font-size="12" text-anchor="end" font-variant-numeric="tabular-nums">100%</text>
+<line x1="74" y1="380" x2="628" y2="380" stroke="#3a3a37" stroke-width="1.5"/>
+<text x="74.0" y="402" fill="#8f8e88" font-size="12" text-anchor="middle" font-variant-numeric="tabular-nums">16</text>
+<text x="153.1" y="402" fill="#8f8e88" font-size="12" text-anchor="middle" font-variant-numeric="tabular-nums">64</text>
+<text x="232.3" y="402" fill="#8f8e88" font-size="12" text-anchor="middle" font-variant-numeric="tabular-nums">128</text>
+<text x="311.4" y="402" fill="#8f8e88" font-size="12" text-anchor="middle" font-variant-numeric="tabular-nums">256</text>
+<text x="390.6" y="402" fill="#8f8e88" font-size="12" text-anchor="middle" font-variant-numeric="tabular-nums">512</text>
+<text x="469.7" y="402" fill="#8f8e88" font-size="12" text-anchor="middle" font-variant-numeric="tabular-nums">1k</text>
+<text x="548.9" y="402" fill="#8f8e88" font-size="12" text-anchor="middle" font-variant-numeric="tabular-nums">2k</text>
+<text x="628.0" y="402" fill="#8f8e88" font-size="12" text-anchor="middle" font-variant-numeric="tabular-nums">4k</text>
+<text x="351.0" y="430" fill="#b7b6ad" font-size="12" text-anchor="middle">tenants / clients</text>
+<text x="20" y="236.0" fill="#b7b6ad" font-size="12" text-anchor="middle" transform="rotate(-90 20 236.0)">% of peak</text>
+<polyline points="74.0,170.0 153.1,92.0 232.3,111.6 311.4,107.6 390.6,109.9 469.7,118.8 548.9,124.3 628.0,147.0" fill="none" stroke="#3987e5" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="74.0" cy="170.0" r="4" fill="#191b20" stroke="#3987e5" stroke-width="2"/>
+<circle cx="153.1" cy="92.0" r="4" fill="#191b20" stroke="#3987e5" stroke-width="2"/>
+<circle cx="232.3" cy="111.6" r="4" fill="#191b20" stroke="#3987e5" stroke-width="2"/>
+<circle cx="311.4" cy="107.6" r="4" fill="#191b20" stroke="#3987e5" stroke-width="2"/>
+<circle cx="390.6" cy="109.9" r="4" fill="#191b20" stroke="#3987e5" stroke-width="2"/>
+<circle cx="469.7" cy="118.8" r="4" fill="#191b20" stroke="#3987e5" stroke-width="2"/>
+<circle cx="548.9" cy="124.3" r="4" fill="#191b20" stroke="#3987e5" stroke-width="2"/>
+<circle cx="628.0" cy="147.0" r="4" fill="#191b20" stroke="#3987e5" stroke-width="2"/>
+<text x="640.0" y="151.0" fill="#3987e5" font-size="13" font-weight="600">TPC-B</text>
+<polyline points="74.0,153.9 153.1,92.0 232.3,104.4 311.4,122.5 390.6,116.8 469.7,130.0 548.9,158.8 628.0,246.9" fill="none" stroke="#d95926" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="74.0" cy="153.9" r="4" fill="#191b20" stroke="#d95926" stroke-width="2"/>
+<circle cx="153.1" cy="92.0" r="4" fill="#191b20" stroke="#d95926" stroke-width="2"/>
+<circle cx="232.3" cy="104.4" r="4" fill="#191b20" stroke="#d95926" stroke-width="2"/>
+<circle cx="311.4" cy="122.5" r="4" fill="#191b20" stroke="#d95926" stroke-width="2"/>
+<circle cx="390.6" cy="116.8" r="4" fill="#191b20" stroke="#d95926" stroke-width="2"/>
+<circle cx="469.7" cy="130.0" r="4" fill="#191b20" stroke="#d95926" stroke-width="2"/>
+<circle cx="548.9" cy="158.8" r="4" fill="#191b20" stroke="#d95926" stroke-width="2"/>
+<circle cx="628.0" cy="246.9" r="4" fill="#191b20" stroke="#d95926" stroke-width="2"/>
+<text x="640.0" y="250.9" fill="#d95926" font-size="13" font-weight="600">TPC-C</text>
+</svg>

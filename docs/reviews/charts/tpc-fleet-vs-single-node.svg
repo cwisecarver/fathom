@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 440" width="760" height="440" role="img" font-family="system-ui,-apple-system,'Segoe UI',sans-serif">
+<rect x="0" y="0" width="760" height="440" rx="14" fill="#191b20"/>
+<text x="70" y="34" fill="#f2f2ef" font-size="20" font-weight="600">3-node fleet vs one node: throughput barely moves</text>
+<text x="70" y="56" fill="#b7b6ad" font-size="13">throughput ratio (fleet / 1 node), one 12-vCPU VM — CPU is shared, so the gain is small for both</text>
+<rect x="694" y="30" width="18" height="4" rx="2" fill="#d95926"/>
+<text x="718" y="38" fill="#b7b6ad" font-size="13">TPC-C</text>
+<rect x="634" y="30" width="18" height="4" rx="2" fill="#3987e5"/>
+<text x="658" y="38" fill="#b7b6ad" font-size="13">TPC-B</text>
+<line x1="74" y1="380.0" x2="628" y2="380.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="64" y="384.0" fill="#8f8e88" font-size="12" text-anchor="end" font-variant-numeric="tabular-nums">1.00x</text>
+<line x1="74" y1="284.0" x2="628" y2="284.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="64" y="288.0" fill="#8f8e88" font-size="12" text-anchor="end" font-variant-numeric="tabular-nums">1.10x</text>
+<line x1="74" y1="188.0" x2="628" y2="188.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="64" y="192.0" fill="#8f8e88" font-size="12" text-anchor="end" font-variant-numeric="tabular-nums">1.20x</text>
+<line x1="74" y1="92.0" x2="628" y2="92.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="64" y="96.0" fill="#8f8e88" font-size="12" text-anchor="end" font-variant-numeric="tabular-nums">1.30x</text>
+<line x1="74" y1="380" x2="628" y2="380" stroke="#3a3a37" stroke-width="1.5"/>
+<text x="74.0" y="402" fill="#8f8e88" font-size="12" text-anchor="middle" font-variant-numeric="tabular-nums">64</text>
+<text x="258.7" y="402" fill="#8f8e88" font-size="12" text-anchor="middle" font-variant-numeric="tabular-nums">256</text>
+<text x="443.3" y="402" fill="#8f8e88" font-size="12" text-anchor="middle" font-variant-numeric="tabular-nums">1024</text>
+<text x="628.0" y="402" fill="#8f8e88" font-size="12" text-anchor="middle" font-variant-numeric="tabular-nums">4096</text>
+<text x="351.0" y="430" fill="#b7b6ad" font-size="12" text-anchor="middle">tenants / clients</text>
+<text x="20" y="236.0" fill="#b7b6ad" font-size="12" text-anchor="middle" transform="rotate(-90 20 236.0)">fleet / 1 node</text>
+<polyline points="74.0,351.2 258.7,303.2 443.3,303.2 628.0,178.4" fill="none" stroke="#3987e5" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="74.0" cy="351.2" r="4" fill="#191b20" stroke="#3987e5" stroke-width="2"/>
+<circle cx="258.7" cy="303.2" r="4" fill="#191b20" stroke="#3987e5" stroke-width="2"/>
+<circle cx="443.3" cy="303.2" r="4" fill="#191b20" stroke="#3987e5" stroke-width="2"/>
+<circle cx="628.0" cy="178.4" r="4" fill="#191b20" stroke="#3987e5" stroke-width="2"/>
+<text x="640.0" y="182.4" fill="#3987e5" font-size="13" font-weight="600">TPC-B</text>
+<polyline points="74.0,293.6 258.7,312.8 443.3,255.2 628.0,216.8" fill="none" stroke="#d95926" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="74.0" cy="293.6" r="4" fill="#191b20" stroke="#d95926" stroke-width="2"/>
+<circle cx="258.7" cy="312.8" r="4" fill="#191b20" stroke="#d95926" stroke-width="2"/>
+<circle cx="443.3" cy="255.2" r="4" fill="#191b20" stroke="#d95926" stroke-width="2"/>
+<circle cx="628.0" cy="216.8" r="4" fill="#191b20" stroke="#d95926" stroke-width="2"/>
+<text x="640.0" y="220.8" fill="#d95926" font-size="13" font-weight="600">TPC-C</text>
+</svg>
