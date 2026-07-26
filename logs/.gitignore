@@ -5,3 +5,5 @@ test-*.log
 precommit*.log
 bench-*.log
 server-*.log
+# Ad-hoc suite runs (e.g. the --include s3 repeat runs used to chase a flake).
+s3-*.log
