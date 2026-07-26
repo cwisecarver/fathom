@@ -787,12 +787,25 @@ defmodule Fathom.Directory do
   A page of directory rows for the admin browser (expert review 2026-07-14 #22).
   Filters by `:status` (exact) and `:q` (shard_id substring, case-insensitive),
   ordered by `shard_id`, paginated by `:limit` (default #{@default_page}, capped at
-  #{@max_page}) / `:offset`. Returns `%{rows:, total:, limit:, offset:}` — `total`
-  is the full matching count so the UI can page.
+  #{@max_page}) / `:offset`.
+
+  Returns `%{rows:, has_more?:, total:, limit:, offset:}`.
+
+  `has_more?` comes free: the query fetches `limit + 1` rows and reports whether the
+  extra one existed. That is all a prev/next UI needs.
+
+  `total` is the exact matching count and costs a **second whole-table aggregate**
+  (`COUNT(*)`, unfiltered when no filter is set). Pass `count: false` to skip it and get
+  `total: nil` — expert review 2026-07-24 #32: `AdminDirectoryLive` re-runs this on every
+  keystroke of the filter box, so at a million shards an 8-character tenant name used to
+  cost 8 full-table counts on top of 8 scans. It defaults to `true` because
+  `FathomWeb.Api.TenantController` publishes `total` in its JSON list response, and
+  silently turning that into `null` would be a breaking API change.
   """
   @spec list_page(keyword()) :: %{
           rows: [Shard.t()],
-          total: non_neg_integer(),
+          has_more?: boolean(),
+          total: non_neg_integer() | nil,
           limit: pos_integer(),
           offset: non_neg_integer()
         }
@@ -801,14 +814,24 @@ defmodule Fathom.Directory do
     offset = max(Keyword.get(opts, :offset, 0), 0)
     query = admin_filter(opts)
 
-    rows =
+    # limit + 1: the extra row is the has_more? signal, and it is cheaper than any count.
+    fetched =
       query
       |> order_by([s], asc: s.shard_id)
-      |> limit(^limit)
+      |> limit(^(limit + 1))
       |> offset(^offset)
       |> Repo.all()
 
-    %{rows: rows, total: Repo.aggregate(query, :count, :id), limit: limit, offset: offset}
+    total =
+      if Keyword.get(opts, :count, true), do: Repo.aggregate(query, :count, :id)
+
+    %{
+      rows: Enum.take(fetched, limit),
+      has_more?: length(fetched) > limit,
+      total: total,
+      limit: limit,
+      offset: offset
+    }
   end
 
   defp admin_filter(opts) do

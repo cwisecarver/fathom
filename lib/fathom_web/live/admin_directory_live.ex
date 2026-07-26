@@ -22,18 +22,27 @@ defmodule FathomWeb.AdminDirectoryLive do
 
   @impl true
   def mount(_params, _session, socket) do
-    {:ok,
-     socket
-     |> assign(:page_title, "Directory")
-     |> assign(:node_key, Fathom.Rebalancer.node_key())
-     |> assign(:statuses, Shard.statuses())
-     |> assign(:editable_statuses, Shard.admin_editable_statuses())
-     |> assign(:filter, %{"status" => "", "q" => ""})
-     |> assign(:offset, 0)
-     |> assign(:editing, nil)
-     |> assign(:edit_error, nil)
-     |> load()}
+    socket =
+      socket
+      |> assign(:page_title, "Directory")
+      |> assign(:node_key, Fathom.Rebalancer.node_key())
+      |> assign(:statuses, Shard.statuses())
+      |> assign(:editable_statuses, Shard.admin_editable_statuses())
+      |> assign(:filter, %{"status" => "", "q" => ""})
+      |> assign(:offset, 0)
+      |> assign(:editing, nil)
+      |> assign(:edit_error, nil)
+      |> assign(:page, empty_page())
+
+    # Only query on the connected mount (expert review 2026-07-24 #32). `mount/3` runs twice —
+    # once for the static render, once over the socket — so loading unconditionally ran the
+    # directory page query twice per page load AND blocked first paint on it. AdminOverviewLive
+    # already does this; this one didn't.
+    {:ok, if(connected?(socket), do: load(socket), else: socket)}
   end
+
+  defp empty_page,
+    do: %{rows: [], has_more?: false, total: nil, limit: @page_size, offset: 0}
 
   @impl true
   def handle_event("filter", %{"f" => %{"status" => status, "q" => q}}, socket) do
@@ -47,8 +56,16 @@ defmodule FathomWeb.AdminDirectoryLive do
 
   def handle_event("page", %{"dir" => dir}, socket) do
     %{offset: offset, page: page} = socket.assigns
-    step = if dir == "next", do: page.limit, else: -page.limit
-    new_offset = offset |> Kernel.+(step) |> clamp_offset(page.total, page.limit)
+
+    # Bounded by has_more? rather than by an exact total, so paging no longer depends on a
+    # whole-table COUNT (#32). "next" past the last page is a no-op instead of being clamped
+    # against a count we no longer pay for.
+    new_offset =
+      case dir do
+        "next" -> if page.has_more?, do: offset + page.limit, else: offset
+        _ -> max(offset - page.limit, 0)
+      end
+
     {:noreply, socket |> assign(:offset, new_offset) |> assign(:editing, nil) |> load()}
   end
 
@@ -160,7 +177,10 @@ defmodule FathomWeb.AdminDirectoryLive do
         status: filter["status"],
         q: filter["q"],
         limit: @page_size,
-        offset: offset
+        offset: offset,
+        # No exact count (#32): this runs on every keystroke of the filter box, and the
+        # count is an unfiltered whole-table aggregate. has_more? drives prev/next.
+        count: false
       )
 
     assign(socket, :page, page)
@@ -173,11 +193,6 @@ defmodule FathomWeb.AdminDirectoryLive do
       {:ok, dt, _offset} -> {:ok, dt}
       {:error, _} -> :error
     end
-  end
-
-  defp clamp_offset(offset, total, limit) do
-    max_offset = if total <= 0, do: 0, else: div(max(total - 1, 0), limit) * limit
-    offset |> max(0) |> min(max_offset)
   end
 
   defp changeset_message(%Ecto.Changeset{} = cs) do
@@ -217,7 +232,7 @@ defmodule FathomWeb.AdminDirectoryLive do
               />
             </div>
             <div class="text-xs text-base-content/50">
-              {@page.total} row(s)
+              {length(@page.rows)}{if @page.has_more?, do: "+"} row(s)
             </div>
           </form>
 
@@ -359,9 +374,13 @@ defmodule FathomWeb.AdminDirectoryLive do
           </div>
 
           <div class="mt-4 flex items-center justify-between text-xs text-base-content/60">
-            <span>
-              {@offset + 1}–{min(@offset + @page.limit, @page.total)} of {@page.total}
+            <%!-- No "of N": the exact total was an unfiltered whole-table COUNT on every
+            keystroke (#32). The visible range plus a "+" when more pages follow is what
+            prev/next actually needs. --%>
+            <span :if={@page.rows != []}>
+              {@offset + 1}–{@offset + length(@page.rows)}{if @page.has_more?, do: "+"}
             </span>
+            <span :if={@page.rows == []}></span>
             <div class="flex gap-2">
               <button
                 type="button"
@@ -376,7 +395,7 @@ defmodule FathomWeb.AdminDirectoryLive do
                 type="button"
                 phx-click="page"
                 phx-value-dir="next"
-                disabled={@offset + @page.limit >= @page.total}
+                disabled={not @page.has_more?}
                 class="btn btn-ghost btn-xs"
               >
                 Next

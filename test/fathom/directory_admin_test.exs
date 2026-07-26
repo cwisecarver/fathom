@@ -131,5 +131,39 @@ defmodule Fathom.DirectoryAdminTest do
       assert p2.total == 3
       assert Enum.map(p2.rows, & &1.shard_id) == ["lp_gamma"]
     end
+
+    # Review #32. AdminDirectoryLive re-runs this on every keystroke of the filter box, and
+    # `total` is a second, unfiltered whole-table COUNT — at a million shards an 8-character
+    # tenant name cost 8 full-table counts on top of 8 scans. `count: false` skips it.
+    test "count: false skips the total but still pages correctly" do
+      page = Directory.list_page(count: false)
+
+      assert page.total == nil, "count: false must not pay for the aggregate"
+      assert length(page.rows) == 3
+      assert Enum.map(page.rows, & &1.shard_id) == ["lp_alpha", "lp_beta", "lp_gamma"]
+    end
+
+    # has_more? is what prev/next actually needs, and it rides the page query itself
+    # (limit + 1) rather than a count.
+    test "has_more? reports another page without counting" do
+      assert %{has_more?: true, rows: rows} = Directory.list_page(limit: 2, count: false)
+      assert Enum.map(rows, & &1.shard_id) == ["lp_alpha", "lp_beta"]
+
+      # The extra row must never leak into the page itself.
+      assert length(rows) == 2
+
+      assert %{has_more?: false, rows: [%{shard_id: "lp_gamma"}]} =
+               Directory.list_page(limit: 2, offset: 2, count: false)
+
+      # Exactly-a-full-page is the boundary that an off-by-one gets wrong: 3 rows, limit 3.
+      assert %{has_more?: false} = Directory.list_page(limit: 3, count: false)
+    end
+
+    # The JSON API publishes `total`, so the default must stay counted — turning it into
+    # null would be a silent breaking change for API clients.
+    test "total is still counted by default (the API contract)" do
+      assert %{total: 3} = Directory.list_page([])
+      assert %{total: 2} = Directory.list_page(status: "active")
+    end
   end
 end

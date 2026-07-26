@@ -38,6 +38,37 @@ defmodule FathomWeb.AdminDirectoryLiveTest do
     assert has_element?(view, "#dir-row-ui_beta")
   end
 
+  # Review #32: mount/3 runs twice — once for the static render, once over the socket — and this
+  # LiveView loaded unconditionally, so every page load ran the directory query twice and first
+  # paint blocked on it. The disconnected render must show the shell, not the rows.
+  test "the disconnected mount does not query; the connected one does", %{conn: conn} do
+    put_shard(%{shard_id: "ui_deferred", status: "active"})
+
+    # `get/2` is the static render only — no socket, so no load/1.
+    html = conn |> auth() |> get("/admin/directory") |> html_response(200)
+
+    refute html =~ "dir-row-ui_deferred",
+           "the disconnected mount must not run the directory query (#32)"
+
+    # The connected mount fills it in.
+    {:ok, view, _html} = conn |> auth() |> live("/admin/directory")
+    assert has_element?(view, "#dir-row-ui_deferred")
+  end
+
+  # Paging is driven by has_more? now, not by an exact whole-table COUNT (#32).
+  test "next is disabled on a single page and pages when there is more", %{conn: conn} do
+    {:ok, view, _html} = conn |> auth() |> live("/admin/directory")
+
+    # Two seeded rows, page size 50 — one page, so there is nothing to advance to.
+    put_shard(%{shard_id: "ui_page_a", status: "active"})
+    put_shard(%{shard_id: "ui_page_b", status: "active"})
+
+    view |> element("#directory-filter") |> render_change(%{"f" => %{"status" => "", "q" => ""}})
+
+    assert has_element?(view, "button[phx-value-dir='next'][disabled]"),
+           "a single page must disable next without needing a total"
+  end
+
   test "filters by status", %{conn: conn} do
     put_shard(%{shard_id: "ui_active", status: "active"})
     put_shard(%{shard_id: "ui_retired", status: "retired"})
