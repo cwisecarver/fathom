@@ -432,6 +432,45 @@ defmodule Fathom.DirectoryTest do
     end
   end
 
+  # Review #35: the non-partial (schema_version, last_active_at) index from 20260628001559 was
+  # superseded by the `WHERE status = 'active'` partial one from 20260702011500, because every
+  # schema_version predicate in lib/ also filters status = 'active'. It was serving no read while
+  # still taking a write on every Recorder flush — `last_active_at` is in three of the indexes on
+  # this table, so HOT updates are already impossible and every flush writes an entry to EVERY
+  # index. Dropping it is ~20% fewer index-entry writes on the directory's hottest write path.
+  describe "redundant schema_version index (#35)" do
+    test "the non-partial index is gone" do
+      %{rows: [[exists]]} =
+        Fathom.Repo.query!(
+          "SELECT count(*) FROM pg_indexes WHERE tablename = 'shards' AND indexname = $1",
+          ["shards_schema_version_last_active_at_index"]
+        )
+
+      assert exists == 0,
+             "the redundant non-partial index is still present — the drop migration did not apply"
+    end
+
+    # The point of the drop is that it costs no read. Same technique as the #12 tests above:
+    # force the planner to reveal whether an index CAN serve the predicate.
+    test "the laggard predicate is still served by an index, not a seq scan" do
+      Fathom.Repo.query!("SET LOCAL enable_seqscan = off")
+
+      %{rows: rows} =
+        Fathom.Repo.query!(
+          "EXPLAIN SELECT s0.shard_id FROM shards AS s0 " <>
+            "WHERE s0.schema_version < $1 AND s0.status = 'active' " <>
+            "ORDER BY s0.last_active_at DESC",
+          [5]
+        )
+
+      plan = rows |> List.flatten() |> Enum.join("\n")
+
+      assert plan =~ "Index" and not (plan =~ "Seq Scan"),
+             "dropping the non-partial index cost a read path — the schema_version + active " <>
+               "predicate now scans. The partial index should still serve it. Plan:\n#{plan}"
+    end
+  end
+
   describe "flush accounting (#28)" do
     test "record_flush_batch sets last_flushed_at and leaves last_active_at alone" do
       {:ok, row} = Directory.resolve("fa")
