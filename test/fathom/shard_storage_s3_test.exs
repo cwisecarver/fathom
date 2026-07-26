@@ -50,16 +50,34 @@ defmodule Fathom.ShardStorageS3Test do
         else: Application.delete_env(:fathom, S3)
     end)
 
-    %{endpoint: endpoint, bucket: bucket, access_key: access_key, secret_key: secret_key}
+    %{
+      endpoint: endpoint,
+      bucket: bucket,
+      access_key: access_key,
+      secret_key: secret_key,
+      # Scopes every shard id to THIS run — see the setup below.
+      run_token: Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)
+    }
   end
 
   setup ctx do
-    shard = "s3_#{System.unique_integer([:positive])}"
+    # The run token is NOT decoration. `System.unique_integer/1` restarts every VM, and its values
+    # land in overlapping ranges across runs (measured: three fresh VMs opened at 11907, 7877 and
+    # 4103, all stepping by 64). Against a bucket that PERSISTS between runs — which is every real
+    # store, and `scripts/minio_test.sh --keep` — two runs can therefore mint the same shard id.
+    # A stale object left by an earlier run then belongs to a later run's test, and the tests that
+    # assert an object is ABSENT are the ones that break. Scoping the id to the run makes that
+    # collision impossible rather than unlikely.
+    shard = "s3_#{ctx.run_token}_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      # Best-effort cleanup of the shard's objects.
-      req = signed_req(ctx)
-      for suffix <- [".db", ".lock"], do: Req.delete(req, url: object_url(ctx, shard <> suffix))
+      # purge_shard/1 rather than deleting `.db` + `.lock` by hand: the retain and snapshot tests
+      # also create `@<version>` and `@snap-<id>` objects, which the old cleanup never touched, so
+      # the bucket accumulated them forever. This is the same erase the tenant-delete path uses,
+      # and its id-delimiter matching means purging `s3_ab12_64` can't touch `s3_ab12_640`.
+      # (setup_all's on_exit restores the S3 app env only when the MODULE finishes, so the
+      # backend is still configured here.)
+      S3.purge_shard(shard)
     end)
 
     Map.put(ctx, :shard, shard)
@@ -222,11 +240,26 @@ defmodule Fathom.ShardStorageS3Test do
     assert File.read!(dst) == "v2\n"
   end
 
-  test "pull_if_changed on a missing object returns :absent", %{shard: shard} do
+  # This test failed ONCE in a full `--include s3` run (2026-07-25) and never reproduced across
+  # ~10 further full runs and 16 seed-swept runs. It was not root-caused. The most plausible
+  # mechanism was cross-run shard-id collision against a persistent bucket, which the run-token in
+  # `setup` now makes impossible — but that is a removed HAZARD, not a proven fix, so the
+  # assertions carry what they actually saw. If this fires again the message alone should identify
+  # whether an object was really there, and whose.
+  test "pull_if_changed on a missing object returns :absent", %{shard: shard} = ctx do
     dst = tmp_path("#{shard}-dst")
-    assert {:ok, :absent} = S3.pull_if_changed(shard, dst, nil)
-    assert {:ok, :absent} = S3.pull_if_changed(shard, dst, "\"stale\"")
-    refute File.exists?(dst)
+
+    first = S3.pull_if_changed(shard, dst, nil)
+
+    assert {:ok, :absent} = first,
+           "expected no object at #{@prefix}#{shard}.db, got #{inspect(first)}. " <>
+             "If this is {:ok, {:written, _}} the bucket held a stale object for this id — " <>
+             "check for a leaked key from an earlier run (run_token=#{ctx.run_token})."
+
+    stale = S3.pull_if_changed(shard, dst, "\"stale\"")
+    assert {:ok, :absent} = stale, "a stale etag against a missing object: got #{inspect(stale)}"
+
+    refute File.exists?(dst), "a pull of a missing object must write no local file"
   end
 
   # ── lease ──
