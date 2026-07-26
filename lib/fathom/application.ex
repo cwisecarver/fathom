@@ -539,10 +539,30 @@ defmodule Fathom.Application do
          #
          # nginx now does it once, where `gzip_min_length` can skip the small responses Bandit has
          # no knob for. The client still receives `content-encoding: gzip` — wire-transparent.
-         http_options: hrana_http_options()
+         http_options: hrana_http_options(),
+         http_1_options: hrana_http_1_options()
        ]},
       id: :fathom_hrana_listener
     )
+  end
+
+  @doc false
+  # HTTP/1-specific listener options (expert review 2026-07-24 #40).
+  #
+  # `gc_every_n_keepalive_requests` defaults to 5 in Bandit, and Bandit's own docs call the option
+  # "currently experimental". That default suits a web app whose connection serves a handful of
+  # requests; fathom's HTTP Hrana path is a long-lived LB-pooled connection (nginx `keepalive 512`,
+  # `keepalive_requests 100000`) serving thousands of small round-trips, so it forces a full sweep
+  # of the connection heap every 5 of them.
+  #
+  # Left AT Bandit's default and made configurable rather than raised, deliberately. The review's
+  # ~5% -of-one-core figure is its own estimate, explicitly not a fathom measurement, and the
+  # tradeoff runs the other way on the metric fathom actually sells: fewer forced collections means
+  # each connection process holds more garbage between them, multiplied by 30k held connections per
+  # node. Raise it only behind an A/B that shows BOTH sides — `chaos.sh tpc-fleet` for the
+  # throughput claim and `chaos.sh served` for RSS/shard, which must not move.
+  def hrana_http_1_options do
+    [gc_every_n_keepalive_requests: Application.get_env(:fathom, :hrana_gc_every_n, 5)]
   end
 
   # Accept-path sizing for the Hrana listener (expert review 2026-07-24 #6). The listener shipped

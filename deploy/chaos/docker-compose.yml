@@ -65,6 +65,8 @@ x-fathom-env: &fathom-env
   # default 1024 backlog; the fix is 4 sockets (reuseport) + 4096. Each half sweeps independently.
   HRANA_LISTEN_SOCKETS: "${HRANA_LISTEN_SOCKETS:-4}"
   HRANA_BACKLOG: "${HRANA_BACKLOG:-4096}"
+  # #40's A/B seam: Bandit's forced connection-process GC interval.
+  HRANA_GC_EVERY_N: "${HRANA_GC_EVERY_N:-5}"
   PHX_SERVER: "1"
   ADMIN_USER: admin
   ADMIN_PASS: admin

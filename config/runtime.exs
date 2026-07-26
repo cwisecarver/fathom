@@ -139,6 +139,15 @@ if n = env_int.("HRANA_BACKLOG") do
   config :fathom, :hrana_backlog, n
 end
 
+# How often Bandit runs a forced full GC on an HTTP/1 connection process, in requests (expert
+# review 2026-07-24 #40). Bandit's default is 5, which suits a connection serving a handful of
+# requests; fathom's is LB-pooled and serves thousands. Raising it trades connection-process
+# memory (× 30k held connections) for fewer forced sweeps — measure BOTH before moving it:
+# `chaos.sh tpc-fleet` for throughput and `chaos.sh served` for RSS/shard.
+if n = env_int.("HRANA_GC_EVERY_N") do
+  config :fathom, :hrana_gc_every_n, n
+end
+
 # Where shard files live locally while a shard is open (default: System.tmp_dir!/fathom_shards).
 # Point it at the node's fast local disk in a real deployment.
 if dir = System.get_env("SHARD_DATA_DIR") do
