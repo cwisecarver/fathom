@@ -45,7 +45,21 @@ defmodule Fathom.Directory.Recorder do
     # struct allocation ran on EVERY checkout (review 2026-07-23 #24). The flush converts once
     # per distinct buffered shard (coalescing means far fewer conversions than checkouts) —
     # and the integer is a smaller ETS object too.
-    :ets.insert(@table, {shard_id, System.system_time(:microsecond)})
+    #
+    # `System.os_time/1`, NOT `System.system_time/1`. Both are cheap integer BIFs, so #24's
+    # optimization is unaffected — but they are DIFFERENT CLOCKS. `System.system_time` is Erlang
+    # system time (monotonic + a continuously-slewed offset); `DateTime.utc_now/0` is
+    # `System.os_time`. Every other directory timestamp — `cutover_at`, `migrating_since`,
+    # `inserted_at` — comes from `DateTime.utc_now/0`, and the revert write-age guard compares
+    # this stamp against `cutover_at` with a strict `DateTime.compare(...) == :gt`.
+    #
+    # Under `multi_time_warp` those clocks drift apart by microseconds to milliseconds, and on the
+    # machine this was found on Erlang system time ran 2-10 µs BEHIND OS time: a touch recorded
+    # AFTER a cutover compared as BEFORE it in 4994 of 5000 samples. When the gap between the
+    # cutover and the touch is smaller than the skew, the guard fails to refuse an unforced revert
+    # and DISCARDS committed post-cutover tenant writes — exactly the loss the guard exists to
+    # prevent. It surfaced as an intermittent failure in ShardMigrationTest.
+    :ets.insert(@table, {shard_id, System.os_time(:microsecond)})
     :ok
   rescue
     # Table not up yet (boot/teardown). Best-effort: a dropped touch is harmless,
@@ -61,7 +75,10 @@ defmodule Fathom.Directory.Recorder do
   """
   @spec record_flush(String.t()) :: :ok
   def record_flush(shard_id) do
-    :ets.insert(@flush_table, {shard_id, System.system_time(:microsecond)})
+    # `System.os_time`, for the same reason as `record/1` above: `last_flushed_at` is compared
+    # against `last_active_at` to compute each tenant's loss window, so it must be on the same
+    # clock or the window is off by the skew — in the direction that UNDER-reports loss.
+    :ets.insert(@flush_table, {shard_id, System.os_time(:microsecond)})
     :ok
   rescue
     ArgumentError -> :ok

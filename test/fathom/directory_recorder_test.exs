@@ -156,4 +156,72 @@ defmodule Fathom.Directory.RecorderTest do
              "#{id} was buffered but never written"
     end
   end
+
+  # Regression: the recorder stamped `last_active_at` from `System.system_time/1` (Erlang system
+  # time) while every other directory timestamp — `cutover_at`, `migrating_since`, `inserted_at` —
+  # comes from `DateTime.utc_now/0`, which is `System.os_time/1`. Two clocks.
+  #
+  # `Fathom.Migrator.ShardMigration`'s revert write-age guard compares them directly
+  # (`DateTime.compare(last_active, cutover_at) == :gt`). Under `multi_time_warp` the offset
+  # between them is continuously slewed; on the machine this was found Erlang system time ran
+  # 2-10 µs BEHIND OS time, so a touch recorded AFTER a cutover compared as BEFORE it in 4994 of
+  # 5000 samples. Whenever the skew exceeds the real gap between the cutover and the touch, the
+  # guard fails to refuse an unforced revert and DISCARDS committed post-cutover tenant writes.
+  #
+  # It surfaced as an intermittent `Fathom.Migrator.ShardMigrationTest` failure — that test puts a
+  # touch a few hundred µs after the cutover, which is close enough to the skew to flip. It is a
+  # real correctness bug, not a test bug; the test was just the narrowest gap in the suite.
+  #
+  # Many samples deliberately: one sample discriminates ~99.9% of the time, so ALL of N must hold
+  # for the assertion to be effectively deterministic rather than merely likely.
+  test "record/1 stamps on DateTime.utc_now/0's clock, so it orders against cutover_at" do
+    samples =
+      for _ <- 1..50 do
+        id = uniq()
+        before = DateTime.utc_now()
+        :ok = Recorder.record(id)
+        {id, before, DateTime.utc_now()}
+      end
+
+    Recorder.flush()
+
+    for {id, before, later} <- samples do
+      {:ok, row} = Directory.get(id)
+
+      assert DateTime.compare(row.last_active_at, before) != :lt,
+             "last_active_at (#{inspect(row.last_active_at)}) landed BEFORE a DateTime.utc_now/0 " <>
+               "taken before the touch (#{inspect(before)}) — the recorder is on a different " <>
+               "clock from cutover_at, so the revert write-age guard can discard real writes"
+
+      assert DateTime.compare(row.last_active_at, later) != :gt,
+             "last_active_at (#{inspect(row.last_active_at)}) landed AFTER a DateTime.utc_now/0 " <>
+               "taken after the touch (#{inspect(later)})"
+    end
+  end
+
+  # Same invariant for the flush buffer: `last_flushed_at` is subtracted from `last_active_at` to
+  # report each tenant's loss window, so a cross-clock stamp skews that window — in the direction
+  # that UNDER-reports how much a node loss cost.
+  test "record_flush/1 stamps on DateTime.utc_now/0's clock too" do
+    samples =
+      for _ <- 1..50 do
+        id = uniq()
+        {:ok, _} = Directory.resolve(id)
+        before = DateTime.utc_now()
+        :ok = Recorder.record_flush(id)
+        {id, before, DateTime.utc_now()}
+      end
+
+    Recorder.flush()
+
+    for {id, before, later} <- samples do
+      {:ok, row} = Directory.get(id)
+
+      assert DateTime.compare(row.last_flushed_at, before) != :lt,
+             "last_flushed_at landed before a prior DateTime.utc_now/0 — cross-clock stamp"
+
+      assert DateTime.compare(row.last_flushed_at, later) != :gt,
+             "last_flushed_at landed after a later DateTime.utc_now/0 — cross-clock stamp"
+    end
+  end
 end
