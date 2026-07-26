@@ -84,6 +84,17 @@ Complements the framework **Test guidelines** below (`start_supervised!`, no `Pr
   find logs/ -name "test-*.log" -mtime +1 -delete 2>/dev/null
   ls -t logs/test-*.log | head -1 | xargs cat   # read latest
   ```
+- **On a failure, DON'T re-run first — name it.** A flake you can't name is a flake you can't fix.
+  Two intermittent failures (2026-07-25) lost their identity permanently because the run was piped
+  through `tail` and the next run overwrote ExUnit's manifest; ~30 later full-suite runs and 25
+  seed-swept runs never reproduced either. In order: read the full output you already have, then
+  `mix test --failed` (names + reruns only the failures, but the NEXT run overwrites the manifest),
+  then `mix test --seed <N>` from the run header — `--seed` fixes test ORDER, which is the only way
+  an order-dependent flake reproduces deterministically. **Never pipe a possibly-failing suite run
+  through `tail`/`head`** — the failure block is exactly what gets truncated.
+  `Fathom.FailureCaptureFormatter` (wired in `test/test_helper.exs`) is the backstop: any failure
+  writes `logs/test-failures-<ts>.log` with the seed, the test's location, and a paste-ready rerun
+  command. It writes nothing on a green run.
 - **Every bug fix ships with a regression test in the same commit.** It must (1) **reproduce deterministically** — fail pre-fix, pass post-fix; if you can't make it fail without the fix you haven't isolated the bug, keep investigating — and (2) **pin the violated invariant**, not just the reproduction steps. Comment the symptom so future readers know why the test exists. Good targets: concurrency/thread-local races (test at the pure-function level), off-by-one/boundary (test at the boundary), classifier/dispatcher mismatches (test the classification), lifecycle ordering (test the sequence).
 - **Fathom-specific must-test invariants** (these are the bugs that bite a sharded multi-tenant system):
   - **Shard isolation.** A query for shard A must *never* resolve to or read shard B's data. Any change to routing — `Fathom.ShardExecutor.shard_from_conn` (request → shard), `Fathom.Shards` resolve, shard-path construction in `Fathom.Shard`, or the planned `Fathom.Directory` — ships with a test proving cross-shard isolation.

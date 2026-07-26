@@ -21,5 +21,14 @@ rescue
   ArgumentError -> :ok
 end
 
-ExUnit.start(exclude: [:s3, :bench])
+# Fathom.FailureCaptureFormatter writes any failure to logs/test-failures-<ts>.log with the seed
+# and a rerun command. Two intermittent failures (2026-07-25) lost their identity permanently
+# because the run's output was piped through `tail` and the next run overwrote ExUnit's `--failed`
+# manifest — a flake you can't name is a flake you can't fix. Alongside the CLI formatter, so
+# console output is unchanged; writes nothing on a green run.
+ExUnit.start(
+  exclude: [:s3, :bench],
+  formatters: [ExUnit.CLIFormatter, Fathom.FailureCaptureFormatter]
+)
+
 Ecto.Adapters.SQL.Sandbox.mode(Fathom.Repo, :manual)
