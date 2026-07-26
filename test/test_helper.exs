@@ -15,6 +15,24 @@ remote_dir =
 
 for sub <- ["tombstones", "tokenfloors"], do: File.rm_rf(Path.join(remote_dir, sub))
 
+# Same cause, worse symptom: STALE `.lock` OBJECTS.
+#
+# A leftover `<shard>.lock` makes `acquire_lease` report `{:held, <a previous run's owner>}`, so a
+# colliding id fails to open at all — `FILO_SHARD_OPEN` / `{:shard_held, "nonode@nohost#..."}`. And
+# it does not need the previous run to be recent in human terms: a lock reads as LIVE for
+# `shard_lease_ttl_ms + steal_margin_ms` (30s + 5s by default) after it was written, so a lock left
+# in the closing seconds of one run is still "held" when the next run starts ~15s later. That is
+# exactly the window that back-to-back runs (a `precommit` loop, a seed sweep) sit in, which is why
+# this only ever showed up in rapid successive runs and never in a re-run afterwards — by then the
+# stale lock had aged out. Diagnosed 2026-07-26 after `Fathom.ShardExecutorTest` failed on seed
+# 126081 with 2,050 leaked `test_exec_*.lock` files on disk.
+#
+# Locks and shard objects are per-run state by definition — at test_helper time no coordinator has
+# started — so clearing them is always correct, never merely convenient. `heartbeats/` is left
+# alone: the app is already booted here and the Heartbeat process owns that key for THIS run.
+for f <- Path.wildcard(Path.join(remote_dir, "*.lock")), do: File.rm(f)
+for f <- Path.wildcard(Path.join(remote_dir, "*.db")), do: File.rm(f)
+
 try do
   :ets.delete_all_objects(Fathom.Tenants.Tombstones)
 rescue
