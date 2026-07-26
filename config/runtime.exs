@@ -122,6 +122,23 @@ if ms = env_int.("HRANA_STREAM_HIBERNATE_MS") do
   config :fathom, :hrana_stream_hibernate_ms, ms
 end
 
+# How many listen sockets the Hrana listener binds (expert review 2026-07-24 #6). The default of 4
+# uses ThousandIsland's `reuseport` multi-queue path so acceptors don't all contend on one kernel
+# accept queue. `1` is the documented escape hatch — ThousandIsland FAILS STARTUP if the platform
+# refuses `reuseport`, so an operator on an exotic kernel needs a way out. That escape hatch was
+# compile-time only until now, i.e. unreachable on a release: a node that boot-looped on this could
+# not be recovered without a rebuild. It is also the A/B seam (1 vs 4) for the accept-queue claim.
+if n = env_int.("HRANA_LISTEN_SOCKETS") do
+  config :fathom, :hrana_listen_sockets, n
+end
+
+# Kernel accept-queue depth per listen socket. Pairs with HRANA_LISTEN_SOCKETS: together they are
+# the two halves of the accept-path fix, and each wants its own A/B. Silently clamped to the OS
+# `net.core.somaxconn`, so raising that is a separate node-provisioning step.
+if n = env_int.("HRANA_BACKLOG") do
+  config :fathom, :hrana_backlog, n
+end
+
 # Where shard files live locally while a shard is open (default: System.tmp_dir!/fathom_shards).
 # Point it at the node's fast local disk in a real deployment.
 if dir = System.get_env("SHARD_DATA_DIR") do

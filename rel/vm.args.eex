@@ -24,20 +24,42 @@
 ## A read query costs >=4 dirty-IO dispatches, so at the measured ~27k q/s/node that is ~135k
 ## dirty-IO jobs/s across (by default) ten threads.
 ##
-## The "clean CPU plateau" reported in docs/reviews/tpc-fleet-elixir-driver-2026-07-24.md has never
-## been tested against this hypothesis. Sweep 10 / 64 / 256 and watch aggregate tps; a standing
-## non-zero :erlang.system_info(:dirty_io_run_queue) during a run is the direct proof.
+## MEASURED 2026-07-25 (docs/reviews/vm-args-ab-2026-07-25.md) — and the hypothesis above did NOT
+## hold. Two passes, second in reverse order, tpc-fleet at 256/512/1024 tenants on the chaos rig:
+##
+##   +SDio  10 : 3903 / 3795 / 3660 tps   dirty-IO run queue mean 1.15-1.68, max 43, non-zero 34%
+##   +SDio  64 : 3725 / 3438 / 3329 tps   dirty-IO run queue mean 0.38,      max 13, non-zero 24%
+##   +SDio 256 : 3679 / 3417 / 3355 tps   dirty-IO run queue mean 0.37,      max  8, non-zero 23%
+##
+## So the queue is real and raising +SDio does drain it exactly as predicted — but draining it
+## COSTS ~9% throughput at every tenant count, and 64 -> 256 changes nothing further. The bottleneck
+## is CPU, not dirty-IO thread count: more runnable OS threads on an already-saturated box buy
+## contention, and the queue at 10 is useful backpressure rather than a stall.
+##
+## Left at the ERTS default of 10, explicitly, so the number is attached to its measurement.
+## NOT settled for every deployment: the rig is one 12-vCPU box running three nodes + the LB + the
+## driver, and its fsync is a local VM disk. The review's mechanism (threads BLOCK on fsync under
+## synchronous=FULL) scales with fsync latency, so cloud block storage at ~0.5-1 ms could invert
+## this. Re-run the sweep on the target hardware before raising it:
+##   deploy/chaos -> ERL_ZFLAGS="+SDio N" ./chaos.sh up && ./chaos.sh tpc-fleet 1024
+## and read the queue as List.last(:erlang.statistics(:run_queue_lengths_all)) — note
+## :erlang.statistics(:dirty_io_run_queue) is NOT a valid stat item and raises.
 ##
 ## Dirty-IO threads sleep when idle; the cost is thread stacks (~1 MB RSS per 32 threads).
 ## Do NOT raise +SDcpu — it defaults to schedulers_online, which is correct here.
-+SDio 64
++SDio 10
 
 ## --- Process and port tables -------------------------------------------------------------------
 ## Production materializes 3-4 processes and 1 port per SERVED shard (Bandit connection handler,
 ## Filo.Stream, the Fathom.Shard coordinator, plus a watchdog when :query_timeout_ms is set).
 ## chaos.sh served-data reached 105k shards held (~35k/node) and extrapolates to ~50k/node.
 ##
-## The defaults are +P 262144 and +Q 65536. deploy/chaos/docker-compose.yml already raises nofile to
+## MEASURED 2026-07-25: on the OTP this release builds against the live defaults read back from a
+## booted node are +P 1048576 and +Q 65536 — not the +P 262144 the review assumed from the docs.
+## So `+P 1048576` below is a NO-OP that documents the value we depend on, and `+Q` is the only
+## real change of the two. Read limits back from a booted node rather than trusting doc defaults.
+##
+## deploy/chaos/docker-compose.yml already raises nofile to
 ## 65536 specifically so fds stop binding — but +Q caps ports regardless of nofile, so that fd
 ## headroom was unreachable past ~65k concurrent connections.
 ##

@@ -47,6 +47,12 @@ RUN mix assets.setup && mix assets.deploy
 
 # Runtime config changes shouldn't bust the compile cache.
 COPY fathom/config/runtime.exs config/
+# rel/vm.args.eex carries the VM capacity flags (+SDio, +Q, +IOt/+IOp — expert review 2026-07-24
+# #2). WITHOUT this COPY `mix release` silently generates a default vm.args and every one of those
+# flags is absent from the image: the rig booted with dirty_io=10 (the ERTS default) while the
+# release was believed to be running 64. Verified by reading the limits back out of a booted node,
+# which is the only way to catch it — a rendered-template test passes either way.
+COPY fathom/rel rel
 RUN mix release
 
 FROM ${RUNNER_IMAGE}

@@ -56,6 +56,15 @@ x-fathom-env: &fathom-env
   # watchable during scenarios (published per-node as 4001/4002/4003 below → 192.168.x:400N).
   # WEB_INSECURE_LOCAL turns off the prod SSL-force + WS origin check so a browser on the LAN can
   # reach the plaintext dashboard (rig-only; never in a real deployment).
+  # A/B hook. ERTS reads ERL_ZFLAGS *after* the release's vm.args, so a flag set here wins — which
+  # lets a sweep flip ONE VM knob on the same binary with no rebuild:
+  #   ERL_ZFLAGS="+SDio 10" ./chaos.sh up && ./chaos.sh tpc-fleet 1024
+  # Unset ⇒ empty ⇒ rel/vm.args.eex stands unmodified.
+  ERL_ZFLAGS: "${ERL_ZFLAGS:-}"
+  # Same idea for the accept-queue A/B (#6). The pre-fix shape is 1 socket + ThousandIsland's
+  # default 1024 backlog; the fix is 4 sockets (reuseport) + 4096. Each half sweeps independently.
+  HRANA_LISTEN_SOCKETS: "${HRANA_LISTEN_SOCKETS:-4}"
+  HRANA_BACKLOG: "${HRANA_BACKLOG:-4096}"
   PHX_SERVER: "1"
   ADMIN_USER: admin
   ADMIN_PASS: admin
