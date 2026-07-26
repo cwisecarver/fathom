@@ -102,8 +102,32 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
+  # 1,048,576 pages × the 4096B default page size = 4 GiB, ~1 GiB under the 5 GiB S3 single-PUT
+  # ceiling (`Fathom.Shard.Storage.S3.@max_single_put`).
+  @default_max_page_count 1_048_576
+
+  # Expert review 2026-07-24 #37. This used to be UNSET by default, which made the first defence
+  # against a runaway tenant a FLUSH failure rather than a write failure — and those fail in
+  # opposite directions:
+  #
+  #   * Unset: the shard keeps accepting and ACKNOWLEDGING writes past 5 GiB, then can never upload
+  #     again. It stays permanently dirty, retries every interval forever, and its RPO becomes
+  #     unbounded — the exact failure docs/durability.md names ("this bound holds only while flushes
+  #     succeed"). The same ceiling silently disables snapshot, fork_shard and retain. There is no
+  #     operator remedy: the data is acked and cannot be made durable.
+  #   * Capped: the write is rejected with SQLITE_FULL and never acknowledged. Nothing acknowledged
+  #     goes unflushed. Strictly safer.
+  #
+  # Defaulting it is safe for a shard that is ALREADY over the cap: SQLite will not set
+  # max_page_count below a database's current page count, so an oversized shard keeps serving reads
+  # and writes within its existing size and merely stops growing — it is not bricked at open.
+  #
+  # A cap also matches the stated premise. "Limited dataset per shard" is what makes a
+  # million-shard fleet work: every whole-shard cost (a dirty flush is a full-file PUT, cold-open
+  # pulls the whole body, eviction/drain/warm-standby all copy it) is linear in shard size.
+  # Set `SHARD_MAX_PAGE_COUNT=0` to opt out and restore the unlimited behaviour.
   defp maybe_max_page_count(conn) do
-    case Application.get_env(:fathom, :shard_max_page_count) do
+    case Application.get_env(:fathom, :shard_max_page_count, @default_max_page_count) do
       n when is_integer(n) and n > 0 -> Sqlite3.execute(conn, "PRAGMA max_page_count=#{n}")
       _ -> :ok
     end

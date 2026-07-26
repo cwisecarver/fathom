@@ -2563,4 +2563,105 @@ defmodule Fathom.ShardDurabilityTest do
 
     ShardExecutor.close(conn2)
   end
+
+  # Expert review 2026-07-24 #37. Every other flush failure is transient — auth, bucket policy,
+  # reachability all recover — which is why the generic path waits for a consecutive-failure
+  # threshold before escalating. `object_too_large` is not: the object is past the 5 GiB single-PUT
+  # ceiling and every retry fails identically forever while the shard keeps acking writes it can
+  # never make durable. It needs its own event and an immediate log, not a threshold.
+  test "an over-ceiling flush emits a distinct event and escalates on the FIRST failure", %{
+    shard: shard
+  } do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    on_exit(fn ->
+      restore(:shard_storage, prev_storage)
+      Application.delete_env(:fathom, :storage_fault)
+    end)
+
+    test_pid = self()
+
+    :telemetry.attach(
+      "too-large-#{shard}",
+      [:fathom, :shard, :flush, :too_large],
+      fn _e, measurements, meta, _ -> send(test_pid, {:too_large, measurements, meta}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach("too-large-#{shard}") end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE t (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES ('x')"))
+
+    Application.put_env(:fathom, :storage_fault, :flush_too_large)
+    {:ok, pid} = Shards.ensure(shard)
+
+    # The flush runs in a Task, so its failure is reported asynchronously — the telemetry event is
+    # the sync point, and capture_log has to span the wait for it.
+    log =
+      capture_log(fn ->
+        send(pid, :durability_flush)
+        assert_receive {:too_large, %{size: 6_000_000_000}, %{shard_id: ^shard}}, 5_000
+      end)
+
+    # The FIRST failure escalates: waiting for a threshold would be waiting for something that
+    # cannot happen, and the message must name the remedy rather than "check S3 reachability".
+    assert log =~ "PERMANENTLY failing", "the first over-ceiling flush must escalate immediately"
+    assert log =~ "NEVER succeed on retry"
+
+    ShardExecutor.close(conn)
+  end
+
+  # The write-time brake that prevents ever reaching that state (#37 / #31's deferred half).
+  test "the per-shard page cap is on by DEFAULT, so the brake is at write time" do
+    refute Application.get_env(:fathom, :shard_max_page_count),
+           "this test asserts the built-in default, so the env must not be set here"
+
+    path = Path.join(System.tmp_dir!(), "fathom_cap_#{System.unique_integer([:positive])}.db")
+    on_exit(fn -> for s <- ["", "-wal", "-shm"], do: File.rm(path <> s) end)
+
+    {:ok, conn} = Connection.open(path)
+    {:ok, %{rows: [[cap]]}} = Connection.query(conn, "PRAGMA max_page_count", [])
+    :ok = Connection.close(conn)
+
+    assert cap == 1_048_576,
+           "unset used to mean UNLIMITED, which put the only brake on the flush — past 5 GiB the " <>
+             "shard acks writes it can never upload and its RPO goes unbounded with no remedy"
+  end
+
+  # The claim that makes defaulting the cap safe to roll out: SQLite will not set max_page_count
+  # below a database's current size, so a shard that is ALREADY over the cap keeps serving and
+  # merely stops growing rather than being bricked at open.
+  test "a shard already larger than the cap still opens and reads" do
+    path = Path.join(System.tmp_dir!(), "fathom_over_#{System.unique_integer([:positive])}.db")
+    on_exit(fn -> for s <- ["", "-wal", "-shm"], do: File.rm(path <> s) end)
+
+    prev = Application.get_env(:fathom, :shard_max_page_count)
+    on_exit(fn -> restore(:shard_max_page_count, prev) end)
+
+    # Grow it past a small cap first.
+    Application.put_env(:fathom, :shard_max_page_count, 200)
+    {:ok, conn} = Connection.open(path)
+    :ok = Connection.exec(conn, "CREATE TABLE t (v TEXT)")
+
+    for _ <- 1..300 do
+      Connection.query(conn, "INSERT INTO t VALUES (?)", [String.duplicate("x", 400)])
+    end
+
+    {:ok, %{rows: [[pages]]}} = Connection.query(conn, "PRAGMA page_count", [])
+    :ok = Connection.close(conn)
+    assert pages > 20, "the fixture didn't actually grow the db"
+
+    # Now re-open under a cap BELOW its current size.
+    Application.put_env(:fathom, :shard_max_page_count, 20)
+    assert {:ok, conn2} = Connection.open(path)
+
+    assert {:ok, %{rows: [[_]]}} = Connection.query(conn2, "SELECT count(*) FROM t", []),
+           "an already-oversized shard must still open and read — the cap stops growth, it does " <>
+             "not brick the tenant"
+
+    :ok = Connection.close(conn2)
+  end
 end

@@ -1978,6 +1978,31 @@ defmodule Fathom.Shard do
       shard_id: state.id
     })
 
+    # `object_too_large` is NOT transient (expert review 2026-07-24 #37). Every other flush failure
+    # — auth, bucket policy, reachability — can succeed on the next interval, which is why the
+    # generic path waits for a threshold before escalating. This one cannot: the object is over the
+    # 5 GiB single-PUT ceiling and every retry fails identically, forever, while the shard keeps
+    # acking writes it can never make durable. Escalate on the FIRST occurrence, with its own event
+    # so it can be alerted separately, and name the actual remedy — waiting does nothing.
+    case reason do
+      {:object_too_large, size} ->
+        :telemetry.execute([:fathom, :shard, :flush, :too_large], %{count: 1, size: size}, %{
+          shard_id: state.id
+        })
+
+        Logger.error(
+          "shard #{state.id}: durability flush is PERMANENTLY failing — the object is #{size} bytes, " <>
+            "past the #{Application.get_env(:fathom, :s3_max_single_put, 5 * 1024 * 1024 * 1024)}-byte " <>
+            "single-PUT ceiling. This will NEVER succeed on retry: acked writes cannot be made " <>
+            "durable, the RPO is unbounded, and snapshot/fork/retain are disabled for this shard. " <>
+            "Reduce the shard (delete rows + VACUUM) or split the tenant; :shard_max_page_count " <>
+            "is the write-time brake that prevents reaching this state."
+        )
+
+      _ ->
+        :ok
+    end
+
     if n >= flush_failure_alert_threshold() do
       Logger.error(
         "shard #{state.id}: durability flush FAILED #{n}× consecutively (#{inspect(reason)}) — RPO is " <>

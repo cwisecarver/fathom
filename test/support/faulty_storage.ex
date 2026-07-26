@@ -106,9 +106,11 @@ defmodule Fathom.Test.FaultyStorage do
   def flush(shard_id, local_path) do
     flush_delay()
 
-    if fault() == :flush,
-      do: {:error, :s3_unreachable},
-      else: Local.flush(shard_id, local_path)
+    cond do
+      fault() == :flush -> {:error, :s3_unreachable}
+      fault() == :flush_too_large -> {:error, {:object_too_large, 6_000_000_000}}
+      true -> Local.flush(shard_id, local_path)
+    end
   end
 
   @impl true
@@ -118,9 +120,14 @@ defmodule Fathom.Test.FaultyStorage do
     run_before(:flush)
     flush_delay()
 
-    if fault() == :flush,
-      do: {:error, :s3_unreachable},
-      else: Local.flush(shard_id, local_path, expected_etag)
+    cond do
+      fault() == :flush -> {:error, :s3_unreachable}
+      # The PERMANENT flush failure (#37): past the S3 single-PUT ceiling, every retry fails
+      # identically forever while the shard keeps acking writes. Staging a real 5 GiB object is
+      # not an option, so the backend reports the same error shape the S3 backend does.
+      fault() == :flush_too_large -> {:error, {:object_too_large, 6_000_000_000}}
+      true -> Local.flush(shard_id, local_path, expected_etag)
+    end
   end
 
   @impl true

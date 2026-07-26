@@ -288,6 +288,11 @@ defmodule Fathom.Telemetry do
         description:
           "Durability-flush failures (#27) — a persistent rate means flushes aren't landing and the RPO is growing silently (S3 auth / bucket-policy / reachability). The direct flush-failure signal behind the rising oldest-unflushed-age gauge"
       ),
+      counter("fathom.shard.flush.too_large.count",
+        event_name: [:fathom, :shard, :flush, :too_large],
+        description:
+          "Flushes refused because the shard object exceeds the 5 GiB single-PUT ceiling (#37) — UNLIKE every other flush failure this is PERMANENT: retries fail identically forever while the shard keeps acking writes it can never make durable, and snapshot/fork/retain are disabled for it. Any occurrence is page-worthy and needs shard reduction, not waiting. :shard_max_page_count is the write-time brake that prevents it"
+      ),
       counter("fathom.shard.corrupt_flush.count",
         event_name: [:fathom, :shard, :corrupt_flush],
         description:

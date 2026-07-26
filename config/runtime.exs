@@ -481,8 +481,14 @@ if config_env() == :prod do
 
   # Per-shard size cap (expert review 2026-07-14 #19): the max SQLite pages a single tenant's db may
   # grow to (size = pages × page_size, default 4096B; e.g. 262144 ≈ 1 GiB). A write past it fails
-  # SQLITE_FULL, so one runaway tenant can't inflate flush/cold-open/standby costs fleet-wide. Unset
-  # = unlimited. Enforces the "limited dataset per shard" premise.
+  # SQLITE_FULL, so one runaway tenant can't inflate flush/cold-open/standby costs fleet-wide.
+  # Enforces the "limited dataset per shard" premise.
+  #
+  # DEFAULTS to 1_048_576 pages ≈ 4 GiB since expert review 2026-07-24 #37 — ~1 GiB under the 5 GiB
+  # S3 single-PUT ceiling. Unset used to mean unlimited, which made the first brake a FLUSH failure:
+  # past 5 GiB the shard kept ACKNOWLEDGING writes it could never upload, retried forever, and its
+  # RPO went unbounded with no operator remedy. A write-time cap cannot lose data (SQLITE_FULL is
+  # never acked); a flush-time one already has. Set `SHARD_MAX_PAGE_COUNT=0` to opt out.
   if pages = System.get_env("SHARD_MAX_PAGE_COUNT") do
     config :fathom, :shard_max_page_count, String.to_integer(pages)
   end
