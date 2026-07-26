@@ -139,6 +139,13 @@ defmodule Fathom.Shard.WarmFollowerTest do
     seed_shard(id)
     assert Directory.record_flush_batch([{id, DateTime.utc_now()}]) >= 1
 
+    # There are TWO independent reasons to skip a cycle, and this test owns the first one
+    # (the flush signal). Disable the second — the #26 body re-pull cooldown — so cycle 4
+    # genuinely exercises "an advanced signal forces a re-check". Left at its default the
+    # cooldown would skip cycle 4 too, and this test would pass for the wrong reason.
+    # The cooldown's own behaviour is pinned by the #26 tests below.
+    put_env!(:warm_min_repull_ms, 0)
+
     prev_storage = Application.get_env(:fathom, :shard_storage)
     on_exit(fn -> restore_env(:shard_storage, prev_storage) end)
     Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
@@ -164,6 +171,104 @@ defmodule Fathom.Shard.WarmFollowerTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:fathom, key)
   defp restore_env(key, val), do: Application.put_env(:fathom, key, val)
+
+  # An id whose rolling force-check slice never lands on the cycles a test drives, so the
+  # sweep belt can't be mistaken for (or mask) the behaviour under test.
+  defp quiet_id(prefix, cycles) do
+    Enum.find(Stream.map(1..1000, &"#{prefix}_#{uniq()}_#{&1}"), fn cand ->
+      :erlang.phash2(cand, 10) not in cycles
+    end)
+  end
+
+  defp put_env!(key, value) do
+    prev = Application.get_env(:fathom, key)
+    on_exit(fn -> restore_env(key, prev) end)
+    Application.put_env(:fathom, key, value)
+  end
+
+  # Make every storage pull fail, so "did the follower touch storage this cycle?" is
+  # observable: a shard that was re-checked gets dropped, one that was skipped stays cached.
+  defp fault_pulls! do
+    put_env!(:shard_storage, Fathom.Test.FaultyStorage)
+    put_env!(:storage_fault, :pull)
+  end
+
+  # Review #26. #15 made the GET count track flushes-since-last-poll, which leaves the
+  # write-hot case unbounded: a tenant flushing faster than the poll advances its signal every
+  # cycle, so every refresh is a 200 with a full body plus an fsync — forever, to save one body
+  # transfer at a failover that may never happen. The cooldown is the bound.
+  test "a write-hot shard's body is not re-pulled inside the cooldown (#26)" do
+    id = quiet_id("warm_cooldown", [1, 2, 3, 4])
+    seed_shard(id)
+    assert Directory.record_flush_batch([{id, DateTime.utc_now()}]) >= 1
+
+    pid = start_supervised!(WarmFollower)
+    # Cycle 2: first pull — transfers a body, which starts this shard's cooldown.
+    assert id in refresh(pid)
+
+    # The owner flushes again, so the #15 skip no longer applies: the signal HAS advanced.
+    assert Directory.record_flush_batch([{id, DateTime.add(DateTime.utc_now(), 5)}]) >= 1
+    fault_pulls!()
+
+    # Cycle 3: pre-fix this re-pulled the whole body every single poll. It must now skip,
+    # because the body moved a moment ago — a staler cache costs failover RTO on this shard,
+    # never correctness, since promotion revalidates before serving.
+    assert id in refresh(pid),
+           "a shard whose body transferred inside :warm_min_repull_ms must not re-pull (#26)"
+  end
+
+  test "the cooldown expires — a flushed shard is re-checked once it lapses (#26)" do
+    id = quiet_id("warm_cdexpire", [1, 2, 3, 4])
+    seed_shard(id)
+    assert Directory.record_flush_batch([{id, DateTime.utc_now()}]) >= 1
+
+    pid = start_supervised!(WarmFollower)
+    assert id in refresh(pid)
+
+    # A zero cooldown is "no floor at all" — the skip must be the cooldown doing its job, not
+    # the follower having quietly stopped revalidating write-hot shards.
+    put_env!(:warm_min_repull_ms, 0)
+    assert Directory.record_flush_batch([{id, DateTime.add(DateTime.utc_now(), 5)}]) >= 1
+    fault_pulls!()
+
+    refute id in refresh(pid),
+           "past the cooldown a flush-advanced shard must be re-checked, not skipped forever"
+  end
+
+  test "the refresh byte budget defers work rather than starving the cache (#26)" do
+    cycles = [1, 2, 3, 4]
+    a = quiet_id("warm_budget_a", cycles)
+    b = quiet_id("warm_budget_b", cycles)
+    for id <- [a, b], do: seed_shard(id)
+
+    stamp = DateTime.utc_now()
+    assert Directory.record_flush_batch([{a, stamp}, {b, stamp}]) >= 2
+
+    # Isolate the budget from the cooldown — this test is about bytes, not frequency.
+    put_env!(:warm_min_repull_ms, 0)
+
+    pid = start_supervised!(WarmFollower)
+    cached = refresh(pid)
+    assert a in cached and b in cached
+
+    # Both owners flush, so both are due a re-check; storage then fails every pull.
+    later = DateTime.add(stamp, 5)
+    assert Directory.record_flush_batch([{a, later}, {b, later}]) >= 2
+    fault_pulls!()
+
+    # One byte per second cannot fund two whole-object bodies in one poll, so at least one
+    # shard must be deferred — and a deferred shard stays cached (it is on disk; we simply
+    # didn't spend this cycle's bytes revalidating it) rather than being dropped.
+    put_env!(:warm_refresh_bytes_per_s, 1)
+
+    survivors = refresh(pid)
+
+    # Count only OUR two shards: the follower's cached set also holds whatever else the test
+    # DB's active set contains, so a bare `length(survivors) >= 1` would pass for the wrong
+    # reason no matter what the budget did.
+    assert Enum.count([a, b], &(&1 in survivors)) >= 1,
+           "a byte budget must DEFER refreshes, not evict the shards it cannot afford"
+  end
 
   test "eviction drops the etag sidecar with the cached file" do
     a = seed_shard("warm_etagevict_#{uniq()}")

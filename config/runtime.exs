@@ -318,6 +318,24 @@ if ms = System.get_env("WARM_HOME_RETENTION_MS") do
   config :fathom, :warm_home_retention_ms, String.to_integer(ms)
 end
 
+# Floor on how often ONE cached shard's body may be re-transferred (expert review 2026-07-24 #26).
+# Defaults to 10× the poll. This is what bounds the follower's steady-state cost: a continuously
+# written tenant flushes faster than the poll, so its flush signal advances every cycle and every
+# conditional GET comes back 200-with-a-body plus a local fsync — forever, to save one body
+# transfer at a failover that may never happen. Raising this trades failover RTO on write-hot
+# shards for ingress and device writes; it never trades correctness, because the coordinator
+# revalidates before promoting a cached copy.
+if ms = env_int.("WARM_MIN_REPULL_MS") do
+  config :fathom, :warm_min_repull_ms, ms
+end
+
+# Optional hard cap on warm-refresh ingress, in bytes/second, spent lag-first (oldest-checked
+# shard first) so a budget too small for the whole set converges the cache round-robin instead of
+# starving its tail. Unset ⇒ no cap, and the budget path costs nothing.
+if n = env_int.("WARM_REFRESH_BYTES_PER_S") do
+  config :fathom, :warm_refresh_bytes_per_s, n
+end
+
 # ---- Admin dashboard (/admin + /admin/metrics) BasicAuth ----------------------------------
 # Credentials for the operator surface. The router's admin_auth plug fails closed (503) when
 # unset, so the dashboard/scrape is never anonymously reachable — set both to enable it. Read in

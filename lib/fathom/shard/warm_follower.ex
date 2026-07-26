@@ -73,6 +73,9 @@ defmodule Fathom.Shard.WarmFollower do
   # 1/@sweep_cycles slice of ids whose hash matches the cycle, so a shard whose flush
   # signal was lost is at most ~@sweep_cycles polls stale.
   @sweep_cycles 10
+  # Per-shard body re-pull cooldown, as a multiple of the poll interval (expert review
+  # 2026-07-24 #26). See `min_repull_ms/1`.
+  @default_repull_multiple 10
 
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -129,8 +132,10 @@ defmodule Fathom.Shard.WarmFollower do
     # command's shard_id, so an invalid id is skipped gracefully (best-effort warm) rather than
     # tripping cache_path/1's assertion and wedging the command.
     if Fathom.ShardId.valid?(shard_id) do
+      # `pull_one/1` also reports the bytes transferred (0 on a 304) for the refresh
+      # budget; a direct warm command ignores it — it is a one-shot, not a steady-state cost.
       case pull_one(shard_id) do
-        {:ok, ^shard_id} -> :ok
+        {:ok, ^shard_id, _bytes} -> :ok
         :skip -> {:error, :not_warmable}
       end
     else
@@ -207,6 +212,16 @@ defmodule Fathom.Shard.WarmFollower do
        # shard_id => the directory last_flushed_at observed when this shard was last
        # revalidated against storage — the skip signal (review 2026-07-23 #15).
        validated_flush: %{},
+       # shard_id => monotonic-ms of the last refresh that actually transferred a BODY for
+       # this shard. Drives the per-shard re-pull cooldown (review 2026-07-24 #26).
+       last_body: %{},
+       # shard_id => monotonic-ms of the last time this shard was checked at all (304 or
+       # 200). Orders the byte budget lag-first so the cache converges instead of thrashing.
+       last_checked: %{},
+       # Token bucket for :warm_refresh_bytes_per_s. nil budget ⇒ unused (fast path).
+       tokens: 0,
+       # Running mean body size, the cost estimate for a candidate with no local file yet.
+       mean_body_bytes: 0,
        # Monotonic refresh counter driving the rolling force-revalidation slice.
        cycle: 0,
        timer: nil
@@ -257,39 +272,164 @@ defmodule Fathom.Shard.WarmFollower do
     # unchanged, or a re-pull when the owner flushed. Keeping caches current is what makes
     # a failover promotion hit the 304 fast path instead of a full cold re-pull.
     cycle = state.cycle + 1
+    now = System.monotonic_time(:millisecond)
 
-    {skipped, to_check} =
-      Enum.split_with(targets, fn {id, lfa} -> skip_revalidation?(id, lfa, state, cycle) end)
+    {skipped, checkable} =
+      Enum.split_with(targets, fn {id, lfa} -> skip_revalidation?(id, lfa, state, cycle, now) end)
 
-    {checked, checked_stamps} = pull_all(to_check)
-    cached = MapSet.union(MapSet.new(skipped, fn {id, _} -> id end), checked)
+    {to_check, deferred, tokens} = admit(checkable, state)
 
-    validated_flush =
-      state.validated_flush
-      |> Map.take(MapSet.to_list(cached))
-      |> Map.merge(checked_stamps)
+    {checked, checked_stamps, bodies} = pull_all(to_check)
+
+    # A budget-deferred shard is still cached if we already held it — we just didn't spend
+    # this cycle's bytes revalidating it. One we don't hold yet stays uncached (correctly:
+    # there is no file), and its lag grows, so the lag-first order admits it next cycle.
+    held =
+      MapSet.union(
+        MapSet.new(skipped, fn {id, _} -> id end),
+        MapSet.intersection(state.cached, MapSet.new(deferred, fn {id, _} -> id end))
+      )
+
+    cached = MapSet.union(held, checked)
+    ids = MapSet.to_list(cached)
+    body_bytes = bodies |> Map.values() |> Enum.sum()
+
+    :telemetry.execute(
+      [:fathom, :shard, :warm, :refresh],
+      %{
+        cached: MapSet.size(cached),
+        checked: MapSet.size(checked),
+        skipped: length(skipped),
+        deferred: length(deferred),
+        bodies: map_size(bodies),
+        body_bytes: body_bytes
+      },
+      %{}
+    )
 
     schedule(%{
       state
       | cached: cached,
         recent_owned: recent_owned,
-        validated_flush: validated_flush,
+        validated_flush: state.validated_flush |> Map.take(ids) |> Map.merge(checked_stamps),
+        last_body:
+          state.last_body
+          |> Map.take(ids)
+          |> Map.merge(Map.new(bodies, fn {id, _} -> {id, now} end)),
+        last_checked:
+          state.last_checked |> Map.take(ids) |> Map.merge(Map.new(checked, &{&1, now})),
+        # Estimates gate admission; the bucket is charged the ACTUAL bytes, so a bad
+        # estimate self-corrects into the next cycle instead of compounding.
+        tokens: tokens - body_bytes,
+        mean_body_bytes: update_mean(state.mean_body_bytes, bodies),
         cycle: cycle
     })
   end
 
-  # Skip the conditional GET for a shard the directory shows unflushed since our last
-  # validation. Every condition is a belt: a nil flush signal never skips (revalidate as
-  # before), only an already-cached-and-still-on-disk copy can skip, the recorded stamp
-  # must equal the directory's current one, and the shard's rolling sweep slice
-  # force-checks it every @sweep_cycles cycles regardless.
-  defp skip_revalidation?(shard_id, last_flushed_at, state, cycle) do
-    not is_nil(last_flushed_at) and
-      MapSet.member?(state.cached, shard_id) and
-      Map.get(state.validated_flush, shard_id) == last_flushed_at and
-      :erlang.phash2(shard_id, @sweep_cycles) != rem(cycle, @sweep_cycles) and
-      File.exists?(cache_path(shard_id))
+  # Byte budget (`:warm_refresh_bytes_per_s`, review 2026-07-24 #26 (a)). Unset ⇒ admit
+  # everything and skip the ordering and the `File.stat` per candidate entirely, so the
+  # default path costs nothing.
+  #
+  # Admission is **lag-first** — the shard checked longest ago goes first — so a budget too
+  # small for the whole set converges the cache round-robin instead of spending every cycle
+  # re-pulling the same few hot shards and starving the rest.
+  #
+  # The bucket refills one poll interval's worth per cycle and is capped there: an idle
+  # follower cannot bank a burst it would spend all at once on wake.
+  defp admit(candidates, state) do
+    case refresh_bytes_per_s() do
+      nil ->
+        {candidates, [], 0}
+
+      bps ->
+        per_cycle = div(bps * state.poll_ms, 1000)
+        tokens = min(state.tokens + per_cycle, per_cycle)
+
+        {to_check, deferred, _left} =
+          candidates
+          |> Enum.sort_by(fn {id, _} -> Map.get(state.last_checked, id, 0) end)
+          |> Enum.reduce({[], [], tokens}, fn {id, _} = c, {take, defer, left} ->
+            if left > 0 do
+              {[c | take], defer, left - est_bytes(id, state.mean_body_bytes)}
+            else
+              {take, [c | defer], left}
+            end
+          end)
+
+        {to_check, deferred, tokens}
+    end
   end
+
+  # What a candidate is expected to cost: the copy we already hold is the best estimate;
+  # a shard we don't hold yet gets the running mean (0 on a cold follower, which admits the
+  # first fill — that fill is one-time and already bounded by :warm_cache_max).
+  defp est_bytes(shard_id, mean) do
+    case File.stat(cache_path(shard_id)) do
+      {:ok, %{size: size}} when size > 0 -> size
+      _ -> mean
+    end
+  end
+
+  defp update_mean(mean, bodies) when map_size(bodies) == 0, do: mean
+
+  defp update_mean(mean, bodies) do
+    observed = div(bodies |> Map.values() |> Enum.sum(), map_size(bodies))
+    if mean == 0, do: observed, else: div(mean * 3 + observed, 4)
+  end
+
+  # Skip this cycle's conditional GET. Two independent reasons, and the belts around them
+  # matter more than either: only an already-held copy can skip (never the cache fill), and
+  # the rolling sweep slice force-checks regardless, so a lost flush signal still bounds
+  # staleness at ~@sweep_cycles polls.
+  #
+  #   1. The directory shows the owner hasn't flushed since our last validation
+  #      (review 2026-07-23 #15) — a nil signal never skips, so it degrades to the old
+  #      revalidate-every-poll behaviour rather than to silence.
+  #   2. The owner DID flush, but we transferred this shard's body too recently
+  #      (review 2026-07-24 #26). This is the case #15 left unbounded: a continuously-
+  #      written tenant flushes faster than the poll, so its signal advances every cycle and
+  #      every GET is a 200 with a full body plus an fsync, forever. Skipping here costs only
+  #      failover RTO on that shard — the coordinator's promotion revalidates before serving,
+  #      so a staler cache is still correct, never wrong.
+  defp skip_revalidation?(shard_id, last_flushed_at, state, cycle, now) do
+    cond do
+      not held?(shard_id, state) -> false
+      forced?(shard_id, cycle) -> false
+      unflushed_since_validation?(shard_id, last_flushed_at, state) -> true
+      in_repull_cooldown?(shard_id, state, now) -> true
+      true -> false
+    end
+  end
+
+  defp held?(shard_id, state) do
+    MapSet.member?(state.cached, shard_id) and File.exists?(cache_path(shard_id))
+  end
+
+  defp forced?(shard_id, cycle) do
+    :erlang.phash2(shard_id, @sweep_cycles) == rem(cycle, @sweep_cycles)
+  end
+
+  defp unflushed_since_validation?(_shard_id, nil, _state), do: false
+
+  defp unflushed_since_validation?(shard_id, last_flushed_at, state) do
+    Map.get(state.validated_flush, shard_id) == last_flushed_at
+  end
+
+  defp in_repull_cooldown?(shard_id, state, now) do
+    case Map.get(state.last_body, shard_id) do
+      nil -> false
+      at -> now - at < min_repull_ms(state.poll_ms)
+    end
+  end
+
+  # Floor on how often one shard's BODY may be re-transferred, defaulting to
+  # @default_repull_multiple × the poll. This is what bounds steady-state cost: worst case
+  # ingress is Σ(cached sizes) / this, instead of Σ(write-active sizes) / :warm_poll_ms.
+  defp min_repull_ms(poll_ms) do
+    Application.get_env(:fathom, :warm_min_repull_ms, poll_ms * @default_repull_multiple)
+  end
+
+  defp refresh_bytes_per_s, do: Application.get_env(:fathom, :warm_refresh_bytes_per_s)
 
   # Re-stamp currently-owned shards to now, then drop entries last owned longer ago
   # than the retention window. The result's keys are the shards this node is (still
@@ -337,9 +477,10 @@ defmodule Fathom.Shard.WarmFollower do
       on_timeout: :kill_task,
       ordered: false
     )
-    |> Enum.reduce({MapSet.new(), %{}}, fn
-      {:ok, {{:ok, shard_id}, lfa}}, {set, stamps} ->
-        {MapSet.put(set, shard_id), Map.put(stamps, shard_id, lfa)}
+    |> Enum.reduce({MapSet.new(), %{}, %{}}, fn
+      {:ok, {{:ok, shard_id, bytes}, lfa}}, {set, stamps, bodies} ->
+        bodies = if bytes > 0, do: Map.put(bodies, shard_id, bytes), else: bodies
+        {MapSet.put(set, shard_id), Map.put(stamps, shard_id, lfa), bodies}
 
       _other, acc ->
         acc
@@ -357,15 +498,27 @@ defmodule Fathom.Shard.WarmFollower do
 
     case Storage.pull_if_changed(shard_id, path, etag) do
       # Object unchanged since our last pull — cache stays warm, no body transferred.
+      # 0 bytes: a 304 costs no ingress and no fsync, so it never charges the budget and
+      # never starts the re-pull cooldown.
       {:ok, :unchanged} ->
-        {:ok, shard_id}
+        {:ok, shard_id, 0}
 
       # Fresh bytes: record the new etag so the next cycle (and a failover promotion)
       # can validate against it.
       {:ok, {:written, new_etag}} ->
         write_etag(shard_id, new_etag)
-        :telemetry.execute([:fathom, :shard, :warm, :pulled], %{count: 1}, %{shard_id: shard_id})
-        {:ok, shard_id}
+
+        bytes =
+          case File.stat(path) do
+            {:ok, %{size: size}} -> size
+            _ -> 0
+          end
+
+        :telemetry.execute([:fathom, :shard, :warm, :pulled], %{count: 1, bytes: bytes}, %{
+          shard_id: shard_id
+        })
+
+        {:ok, shard_id, bytes}
 
       # No object yet (never flushed) or it vanished — make sure we aren't caching it.
       {:ok, :absent} ->
