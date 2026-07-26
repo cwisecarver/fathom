@@ -23,6 +23,15 @@ defmodule Fathom.Bench.WireTest do
     assert us < 100_000.0, "cold_open_wire p50 #{us}µs exceeded the 100ms smoke ceiling"
   end
 
+  # :bench, unlike its neighbours, because this is the one assertion here that a margin cannot
+  # rescue. The others bound a single measurement on one side and can be given generous headroom;
+  # this asserts the SIGN OF A DIFFERENCE between two independently noisy timings. Under machine
+  # load the raw leg can lose the race to the wire leg outright — observed 2026-07-26 at
+  # -51,610µs, i.e. the delta inverted by 51ms — and no ceiling fixes a sign flip. Per AGENTS.md,
+  # a comparative microbench belongs behind :bench, where the host is expected quiet.
+  #
+  # Its real gate is `mix fathom.wire_bench`; this was only ever a smoke check.
+  @tag :bench
   test "tpcb_wire_overhead is a positive per-txn delta (wire costs more than raw exqlite)" do
     # The wire leg sends 7 statements as 7 round-trips vs raw local calls, so the delta is
     # positive and dominated by the round-trips. Small txn count for a smoke check.

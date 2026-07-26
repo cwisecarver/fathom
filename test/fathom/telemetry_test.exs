@@ -76,11 +76,20 @@ defmodule Fathom.TelemetryTest do
       # which can slip past the assert_receive window under heavy machine load.
       send(coordinator, :renew_lease)
 
+      # Wait on the DOWN FIRST, then check the telemetry — not the other way round.
+      #
+      # Both orderings assert the same two facts, but they synchronize on different things. Waiting
+      # on the telemetry first means racing a bare timeout against "the coordinator got scheduled,
+      # did a storage read, and emitted" — which is what timed out under load on 2026-07-26 (seed
+      # 918571, mailbox empty after 2s). The DOWN is a definitive lifecycle event and the
+      # monitor-and-assert-on-DOWN pattern AGENTS.md prescribes instead of sleeping. And because
+      # the coordinator emits :superseded BEFORE it stops, once the DOWN has landed the telemetry
+      # is already queued — so the second assertion is a check, not a race.
+      assert_receive {:DOWN, ^ref, :process, ^coordinator, {:shutdown, :lease_lost}}, 5_000
+
       assert_receive {:telemetry, [:fathom, :shard, :lease, :superseded], %{count: 1},
                       %{shard_id: ^shard}},
-                     2_000
-
-      assert_receive {:DOWN, ^ref, :process, ^coordinator, {:shutdown, :lease_lost}}, 2_000
+                     1_000
     end)
   end
 
