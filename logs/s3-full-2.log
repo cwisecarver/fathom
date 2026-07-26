@@ -1,0 +1,434 @@
+Running ExUnit with seed: 30261, max_cases: 36
+Excluding tags: [:bench]
+Including tags: [:s3]
+
+...........................................23:28:31.218 [error] failed to record captured version: cannot find ownership process for #PID<0.1124.0> (:cap_guard_1352)
+(Fathom.Repo) using mode :manual.
+(Note that a connection's mode reverts to :manual if its owner
+terminates.)
+
+When using ownership, you must manage connections in one
+of the four ways:
+
+* By explicitly checking out a connection
+* By explicitly allowing a spawned process
+* By running the pool in shared mode
+* By using :caller option with allowed process
+
+The first two options require every new process to explicitly
+check a connection out or be allowed by calling checkout or
+allow respectively.
+
+The third option requires a {:shared, pid} mode to be set.
+If using shared mode in tests, make sure your tests are not
+async.
+
+The fourth option requires [caller: pid] to be used when
+checking out a connection from the pool. The caller process
+should already be allowed on a connection.
+
+If you are reading this error, it means you have not done one
+of the steps above or that the owner process has crashed.
+
+See Ecto.Adapters.SQL.Sandbox docs for more information.
+..................................................................................................23:28:31.326 [warning] Migrator.HeadCache refresh failed: %DBConnection.OwnershipError{message: "cannot find ownership process for #PID<0.636.0> (Fathom.Migrator.HeadCache)\n(Fathom.Repo) using mode :manual.\n(Note that a connection's mode reverts to :manual if its owner\nterminates.)\n\nWhen using ownership, you must manage connections in one\nof the four ways:\n\n* By explicitly checking out a connection\n* By explicitly allowing a spawned process\n* By running the pool in shared mode\n* By using :caller option with allowed process\n\nThe first two options require every new process to explicitly\ncheck a connection out or be allowed by calling checkout or\nallow respectively.\n\nThe third option requires a {:shared, pid} mode to be set.\nIf using shared mode in tests, make sure your tests are not\nasync.\n\nThe fourth option requires [caller: pid] to be used when\nchecking out a connection from the pool. The caller process\nshould already be allowed on a connection.\n\nIf you are reading this error, it means you have not done one\nof the steps above or that the owner process has crashed.\n\nSee Ecto.Adapters.SQL.Sandbox docs for more information."}
+........................................................................................................................23:28:32.752 [error] shard corrupt_22146: local db failed quick_check ({:quick_check_failed, "database disk image is malformed"}); REFUSING flush so the last good stored object stays authoritative; quarantined corrupt copy to /var/folders/1k/dbfk_l695x17w4pkn0kkg7d00000gn/T/fathom_shards/corrupt_22146.db.corrupt.1785036512
+.....23:28:42.683 [error] shard wire_6661: lease superseded by another node; self-fencing (stop without flush)
+...................23:28:47.313 [warning] heartbeat restarted for node_5315@test (generation 1); coordinators will revalidate
+..23:28:47.318 [warning] heartbeat restarted for nonode@nohost#0d65f2cc (generation 1); coordinators will revalidate
+...23:28:47.323 [warning] heartbeat restarted for nonode@nohost#0d65f2cc (generation 2); coordinators will revalidate
+.............23:28:47.342 [warning] tombstone incremental refresh failed: boom
+.........................................23:28:47.695 [warning] command poller: batch task died (:killed) without completing; recovered 1 leaked in-flight command(s)
+....23:28:48.215 [error] Handler "crash-11779" has failed and has been detached. Class=:error
+Reason=%RuntimeError{message: "handler boom"}
+Stacktrace=[
+  {Fathom.Rebalancer.CommandPollerTest,
+   :"-test a crashing telemetry handler never wedges a command's completion (#8)/1-fun-0-",
+   4,
+   [
+     file: ~c"test/fathom/rebalancer/command_poller_test.exs",
+     line: 110,
+     error_info: %{module: Exception}
+   ]},
+  {:telemetry, :do_execute, 4,
+   [
+     file: ~c"/Users/cwisecarver/NotWork/fathom/deps/telemetry/src/telemetry.erl",
+     line: 202
+   ]},
+  {Fathom.Rebalancer.CommandPoller, :complete, 3,
+   [file: ~c"lib/fathom/rebalancer/command_poller.ex", line: 289]},
+  {Task.Supervised, :invoke_mfa, 2,
+   [file: ~c"lib/task/supervised.ex", line: 105]},
+  {Task.Supervised, :reply, 4, [file: ~c"lib/task/supervised.ex", line: 40]}
+]
+
+....23:28:48.269 [warning] rebalance: kept pin recon_held_35394 — ghost isn't beating but S3 lease held by ghost; reporter/data-plane divergence, not unpinning (fail-safe)
+.......23:28:48.325 [warning] rebalance: unpinned hot_1 — dead_node not live (S3 lease free); re-homing
+..23:28:48.337 [warning] rebalance: unpinned stale_36354 — dead_node not live (S3 lease free); re-homing
+............23:28:48.764 [warning] rebalancer: LB reload `false` exited 1: 
+23:28:48.778 [warning] rebalancer: LB reload `false` exited 1: 
+23:28:48.778 [warning] rebalance: handoff handoff_12483 failed ({:reload_failed, 1}); reverted to nonode@nohost
+..23:28:49.913 [warning] rebalance: handoff handoff_40002 failed (:drain_timeout); reverted to nonode@nohost
+..23:28:49.930 [warning] rebalance: handoff evil; } server { # failed ({:invalid_pin, [shard_id: {"is not a valid shard id", []}]}); reverted to nonode@nohost
+............................................................................................................23:28:52.151 [warning] shard warmpromo_51394: warm file has no provenance sidecar (legacy); adopting current etag
+...................23:28:56.411 [warning] shard mig_55426: reverted v2 -> v1; writes on v2 since cutover are DISCARDED from live but recoverable at mig_55426@2 for the retention window (last_active_at ~U[2026-07-26 03:28:56.385372Z])
+...23:28:56.514 [warning] shard mig_8965: reverted v2 -> v1; writes on v2 since cutover are DISCARDED from live but recoverable at mig_8965@2 for the retention window (last_active_at ~U[2026-07-26 03:28:56.499798Z])
+....23:28:56.605 [warning] shard mig_9285: reverted v2 -> v1; writes on v2 since cutover are DISCARDED from live but recoverable at mig_9285@2 for the retention window (last_active_at ~U[2026-07-26 03:28:56.594396Z])
+...23:28:56.655 [warning] shard mig_26051: reverted v2 -> v1; writes on v2 since cutover are DISCARDED from live but recoverable at mig_26051@2 for the retention window (last_active_at ~U[2026-07-26 03:28:56.646480Z])
+......23:28:56.758 [warning] shard mig_29123: reverted v2 -> v1; writes on v2 since cutover are DISCARDED from live but recoverable at mig_29123@2 for the retention window (last_active_at ~U[2026-07-26 03:28:56.752516Z])
+.23:28:56.781 [warning] shard mig_30019: reverted v2 -> v1; writes on v2 since cutover are DISCARDED from live but recoverable at mig_30019@2 for the retention window (last_active_at ~U[2026-07-26 03:28:56.773078Z])
+.23:28:56.803 [warning] shard mig_31299: reverted v2 -> v1; writes on v2 since cutover are DISCARDED from live but recoverable at mig_31299@2 for the retention window (last_active_at ~U[2026-07-26 03:28:56.797890Z])
+.....23:28:56.854 [warning] tombstone load failed: cannot find ownership process for #PID<0.6399.0> (Fathom.Tenants.Tombstones)
+(Fathom.Repo) using mode :manual.
+(Note that a connection's mode reverts to :manual if its owner
+terminates.)
+
+When using ownership, you must manage connections in one
+of the four ways:
+
+* By explicitly checking out a connection
+* By explicitly allowing a spawned process
+* By running the pool in shared mode
+* By using :caller option with allowed process
+
+The first two options require every new process to explicitly
+check a connection out or be allowed by calling checkout or
+allow respectively.
+
+The third option requires a {:shared, pid} mode to be set.
+If using shared mode in tests, make sure your tests are not
+async.
+
+The fourth option requires [caller: pid] to be used when
+checking out a connection from the pool. The caller process
+should already be allowed on a connection.
+
+If you are reading this error, it means you have not done one
+of the steps above or that the owner process has crashed.
+
+See Ecto.Adapters.SQL.Sandbox docs for more information.
+............................23:28:57.297 [error] shard adm_25474: lease superseded by another node; self-fencing (stop without flush)
+23:28:57.297 [error] shard adm_25474: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+.23:28:57.303 [error] shard adm_4931: lease superseded by another node; self-fencing (stop without flush)
+23:28:57.303 [error] shard adm_4931: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+........23:28:57.573 [error] shard template_10883: lease superseded by another node; self-fencing (stop without flush)
+23:28:57.573 [error] shard template_10883: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+23:28:57.575 [error] shard tenant_11011: lease superseded by another node; self-fencing (stop without flush)
+23:28:57.575 [error] shard tenant_11011: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+.......23:28:58.300 [warning] reconcile: enqueued reverts for 1 shard(s) stranded on yanked versions
+.....23:28:58.336 [warning] shard revert_72194: reverted v2 -> v1; writes on v2 since cutover are DISCARDED from live but recoverable at revert_72194@2 for the retention window (last_active_at ~U[2026-07-26 03:28:58.328933Z])
+.................23:28:58.400 [error] restore drill: 1 shard(s) FAILED verification (%{corrupt: 1})
+..23:28:58.409 [warning] restore drill: drill_74050 schema mismatch (object user_version=0 vs directory schema_version=5)
+23:28:58.409 [error] restore drill: 1 shard(s) FAILED verification (%{schema_mismatch: 1})
+......23:28:58.430 [warning] rebalance: unpinned hot_1 — dead_node not live (S3 lease free); re-homing
+...23:28:59.250 [warning] rebalance: handoff tel_ho_75266 failed (:drain_timeout); reverted to nonode@nohost
+......23:28:59.296 [warning] shard novel_warm_75906: warm file has no provenance sidecar (legacy); adopting current etag
+...............................23:28:59.339 [warning] rebalancer: LB reload `false` exited 1: 
+...23:28:59.356 [warning] rebalancer: LB reload `false` exited 1: 
+.23:28:59.561 [error] rebalancer: LB map not promoted ({:config_test_timeout, 200}); kept last-good /var/folders/1k/dbfk_l695x17w4pkn0kkg7d00000gn/T/fathom_lbapply_77634.conf
+.23:28:59.768 [warning] rebalancer: LB reload `sleep 30` timed out (200ms)
+..23:28:59.799 [error] rebalancer: LB map not promoted ({:config_test_failed, 1, ""}); kept last-good /var/folders/1k/dbfk_l695x17w4pkn0kkg7d00000gn/T/fathom_lbapply_78018.conf
+.............23:29:00.527 [error] shard drain_14147: lease superseded by another node; self-fencing (stop without flush)
+23:29:00.647 [error] shard drain_14787: lease superseded by another node; self-fencing (stop without flush)
+23:29:00.648 [error] shard drain_14787: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+23:29:01.009 [warning] revocation bulk refresh failed: cannot find ownership process for #PID<0.637.0> (Fathom.HranaAuth.Revocations)
+(Fathom.Repo) using mode :manual.
+(Note that a connection's mode reverts to :manual if its owner
+terminates.)
+
+When using ownership, you must manage connections in one
+of the four ways:
+
+* By explicitly checking out a connection
+* By explicitly allowing a spawned process
+* By running the pool in shared mode
+* By using :caller option with allowed process
+
+The first two options require every new process to explicitly
+check a connection out or be allowed by calling checkout or
+allow respectively.
+
+The third option requires a {:shared, pid} mode to be set.
+If using shared mode in tests, make sure your tests are not
+async.
+
+The fourth option requires [caller: pid] to be used when
+checking out a connection from the pool. The caller process
+should already be allowed on a connection.
+
+If you are reading this error, it means you have not done one
+of the steps above or that the owner process has crashed.
+
+See Ecto.Adapters.SQL.Sandbox docs for more information.
+23:29:01.842 [error] shard lazy_20611: lease superseded by another node; self-fencing (stop without flush)
+23:29:01.864 [error] shard lazy_20803: lease superseded by another node; self-fencing (stop without flush)
+23:29:01.879 [error] shard lazy_47938: lease superseded by another node; self-fencing (stop without flush)
+23:29:01.899 [error] shard lazy_21187: lease superseded by another node; self-fencing (stop without flush)
+23:29:01.909 [error] shard lazy_48386: lease superseded by another node; self-fencing (stop without flush)
+23:29:02.994 [error] shard lru_53250: lease superseded by another node; self-fencing (stop without flush)
+23:29:02.994 [error] shard lru_53250: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+23:29:03.023 [error] shard lru_53762: lease superseded by another node; self-fencing (stop without flush)
+23:29:03.023 [error] shard lru_53634: lease superseded by another node; self-fencing (stop without flush)
+23:29:03.023 [error] shard lru_53762: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+23:29:03.023 [error] shard lru_53634: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+23:29:03.030 [error] shard lru_53954: lease superseded by another node; self-fencing (stop without flush)
+23:29:03.030 [error] shard lru_54082: lease superseded by another node; self-fencing (stop without flush)
+23:29:03.030 [error] shard lru_54082: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+23:29:03.031 [error] shard lru_54210: lease superseded by another node; self-fencing (stop without flush)
+23:29:03.031 [error] shard lru_54210: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+.....................................23:29:05.475 [warning] tombstone load failed: directory unreachable
+.23:29:05.527 [warning] suspension reconcile failed: directory unreachable
+...................................23:29:05.918 [warning] heartbeat restarted for nonode@nohost#0d65f2cc (generation 3); coordinators will revalidate
+.23:29:05.926 [warning] heartbeat restarted for nonode@nohost#0d65f2cc (generation 4); coordinators will revalidate
+.23:29:05.983 [warning] heartbeat restarted for nonode@nohost#0d65f2cc (generation 5); coordinators will revalidate
+.23:29:06.048 [warning] heartbeat restarted for nonode@nohost#0d65f2cc (generation 6); coordinators will revalidate
+.23:29:06.118 [warning] heartbeat restarted for nonode@nohost#0d65f2cc (generation 8); coordinators will revalidate
+.23:29:07.374 [warning] heartbeat restarted for nonode@nohost#0d65f2cc (generation 10); coordinators will revalidate
+..23:29:07.481 [error] shard object at /fathom-shards-test/leasetest/s3_50436.db is stored with an encoding this node cannot decode ({:unknown_object_encoding, "zstd-v9"}); refusing the pull rather than serving undecodable bytes as a database. Upgrade this node to a build that supports it.
+..................................23:29:08.054 [warning] shard orphan_82946: warm file has no provenance sidecar (legacy); adopting current etag
+...........23:29:08.093 [warning] revocation floor read failed for test_auth_6025: cannot find ownership process for #PID<0.14344.0> ({Fathom.HranaAuthTest, :"test through the real Hrana pipeline a request with the shard's token runs SQL"})
+(Fathom.Repo) using mode :manual.
+(Note that a connection's mode reverts to :manual if its owner
+terminates.)
+
+When using ownership, you must manage connections in one
+of the four ways:
+
+* By explicitly checking out a connection
+* By explicitly allowing a spawned process
+* By running the pool in shared mode
+* By using :caller option with allowed process
+
+The first two options require every new process to explicitly
+check a connection out or be allowed by calling checkout or
+allow respectively.
+
+The third option requires a {:shared, pid} mode to be set.
+If using shared mode in tests, make sure your tests are not
+async.
+
+The fourth option requires [caller: pid] to be used when
+checking out a connection from the pool. The caller process
+should already be allowed on a connection.
+
+If you are reading this error, it means you have not done one
+of the steps above or that the owner process has crashed.
+
+See Ecto.Adapters.SQL.Sandbox docs for more information.
+.23:29:08.095 [warning] revocation floor read failed for acme: cannot find ownership process for #PID<0.14355.0> ({Fathom.HranaAuthTest, :"test grant matching is case-canonical: a token minted for ACME authorizes acme (#19)"})
+(Fathom.Repo) using mode :manual.
+(Note that a connection's mode reverts to :manual if its owner
+terminates.)
+
+When using ownership, you must manage connections in one
+of the four ways:
+
+* By explicitly checking out a connection
+* By explicitly allowing a spawned process
+* By running the pool in shared mode
+* By using :caller option with allowed process
+
+The first two options require every new process to explicitly
+check a connection out or be allowed by calling checkout or
+allow respectively.
+
+The third option requires a {:shared, pid} mode to be set.
+If using shared mode in tests, make sure your tests are not
+async.
+
+The fourth option requires [caller: pid] to be used when
+checking out a connection from the pool. The caller process
+should already be allowed on a connection.
+
+If you are reading this error, it means you have not done one
+of the steps above or that the owner process has crashed.
+
+See Ecto.Adapters.SQL.Sandbox docs for more information.
+23:29:08.095 [warning] revocation floor read failed for acme: cannot find ownership process for #PID<0.14355.0> ({Fathom.HranaAuthTest, :"test grant matching is case-canonical: a token minted for ACME authorizes acme (#19)"})
+(Fathom.Repo) using mode :manual.
+(Note that a connection's mode reverts to :manual if its owner
+terminates.)
+
+When using ownership, you must manage connections in one
+of the four ways:
+
+* By explicitly checking out a connection
+* By explicitly allowing a spawned process
+* By running the pool in shared mode
+* By using :caller option with allowed process
+
+The first two options require every new process to explicitly
+check a connection out or be allowed by calling checkout or
+allow respectively.
+
+The third option requires a {:shared, pid} mode to be set.
+If using shared mode in tests, make sure your tests are not
+async.
+
+The fourth option requires [caller: pid] to be used when
+checking out a connection from the pool. The caller process
+should already be allowed on a connection.
+
+If you are reading this error, it means you have not done one
+of the steps above or that the owner process has crashed.
+
+See Ecto.Adapters.SQL.Sandbox docs for more information.
+..23:29:08.095 [warning] hrana_auth is :required with no :hrana_token_secret — tokens are signing with the web secret_key_base, so rotating it will invalidate EVERY Hrana token. Set HRANA_TOKEN_SECRET to decouple the data path from web sessions.
+.23:29:08.095 [warning] hrana_auth is :required but :hrana_token_max_age is unset (tokens NEVER expire). Set HRANA_TOKEN_MAX_AGE (seconds) to bound credential-leak exposure — rotation is now zero-downtime (HranaAuth.rotate/1), so a finite expiry is safe.
+...23:29:08.095 [warning] revocation floor read failed for acme: cannot find ownership process for #PID<0.14372.0> ({Fathom.HranaAuthTest, :"test :required accepts a token minted for the same shard"})
+(Fathom.Repo) using mode :manual.
+(Note that a connection's mode reverts to :manual if its owner
+terminates.)
+
+When using ownership, you must manage connections in one
+of the four ways:
+
+* By explicitly checking out a connection
+* By explicitly allowing a spawned process
+* By running the pool in shared mode
+* By using :caller option with allowed process
+
+The first two options require every new process to explicitly
+check a connection out or be allowed by calling checkout or
+allow respectively.
+
+The third option requires a {:shared, pid} mode to be set.
+If using shared mode in tests, make sure your tests are not
+async.
+
+The fourth option requires [caller: pid] to be used when
+checking out a connection from the pool. The caller process
+should already be allowed on a connection.
+
+If you are reading this error, it means you have not done one
+of the steps above or that the owner process has crashed.
+
+See Ecto.Adapters.SQL.Sandbox docs for more information.
+..23:29:08.095 [warning] revocation floor read failed for acme: cannot find ownership process for #PID<0.14376.0> ({Fathom.HranaAuthTest, :"test an expired token is refused when :hrana_token_max_age is set"})
+(Fathom.Repo) using mode :manual.
+(Note that a connection's mode reverts to :manual if its owner
+terminates.)
+
+When using ownership, you must manage connections in one
+of the four ways:
+
+* By explicitly checking out a connection
+* By explicitly allowing a spawned process
+* By running the pool in shared mode
+* By using :caller option with allowed process
+
+The first two options require every new process to explicitly
+check a connection out or be allowed by calling checkout or
+allow respectively.
+
+The third option requires a {:shared, pid} mode to be set.
+If using shared mode in tests, make sure your tests are not
+async.
+
+The fourth option requires [caller: pid] to be used when
+checking out a connection from the pool. The caller process
+should already be allowed on a connection.
+
+If you are reading this error, it means you have not done one
+of the steps above or that the owner process has crashed.
+
+See Ecto.Adapters.SQL.Sandbox docs for more information.
+.......23:29:08.096 [warning] revocation floor read failed for test_auth_84034: cannot find ownership process for #PID<0.14412.0> ({Fathom.HranaAuthTest, :"test through the real Hrana pipeline WebSocket hello authenticates via the jwt field (django-libsql's path)"})
+(Fathom.Repo) using mode :manual.
+(Note that a connection's mode reverts to :manual if its owner
+terminates.)
+
+When using ownership, you must manage connections in one
+of the four ways:
+
+* By explicitly checking out a connection
+* By explicitly allowing a spawned process
+* By running the pool in shared mode
+* By using :caller option with allowed process
+
+The first two options require every new process to explicitly
+check a connection out or be allowed by calling checkout or
+allow respectively.
+
+The third option requires a {:shared, pid} mode to be set.
+If using shared mode in tests, make sure your tests are not
+async.
+
+The fourth option requires [caller: pid] to be used when
+checking out a connection from the pool. The caller process
+should already be allowed on a connection.
+
+If you are reading this error, it means you have not done one
+of the steps above or that the owner process has crashed.
+
+See Ecto.Adapters.SQL.Sandbox docs for more information.
+.................................23:29:10.392 [warning] shard job_6089: reverted v2 -> v1; writes on v2 since cutover are DISCARDED from live but recoverable at job_6089@2 for the retention window (last_active_at ~U[2026-07-26 03:29:10.381671Z])
+.......23:29:10.504 [warning] shard job_7113: reverted v2 -> v1; writes on v2 since cutover are DISCARDED from live but recoverable at job_7113@2 for the retention window (last_active_at ~U[2026-07-26 03:29:10.494880Z])
+...23:29:10.551 [warning] shard job_60548: reverted v2 -> v1; writes on v2 since cutover are DISCARDED from live but recoverable at job_60548@2 for the retention window (last_active_at ~U[2026-07-26 03:29:10.543959Z])
+.........23:29:10.646 [warning] heartbeat restarted for nonode@nohost#0d65f2cc (generation 11); coordinators will revalidate
+.........................23:29:10.689 [warning] shard test_exec_10824 execute raised: no function clause matching in Exqlite.Sqlite3.bind/2
+..................................................................23:29:13.507 [warning] shard dur_68548: warm file has no provenance sidecar (legacy); adopting current etag
+................23:29:14.463 [error] shard dur_95042: lease superseded during durability flush; self-fencing
+23:29:14.464 [error] shard dur_95042: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+......................23:29:22.629 [error] shard dur_93378: lease superseded by another node; self-fencing (stop without flush)
+23:29:22.653 [error] shard dur_93506: lease superseded by another node; self-fencing (stop without flush)
+23:29:22.654 [error] shard dur_93506: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+23:29:22.856 [error] shard dur_67140: lease superseded by another node; self-fencing (stop without flush)
+23:29:22.856 [error] shard dur_67140: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+23:29:22.871 [error] shard dur_67396: lease superseded by another node; self-fencing (stop without flush)
+23:29:22.955 [error] shard dur_68036: lease superseded by another node; self-fencing (stop without flush)
+23:29:22.955 [error] shard dur_68036: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+23:29:22.962 [error] shard dur_68164: lease superseded by another node; self-fencing (stop without flush)
+23:29:23.510 [error] shard dur_68548: lease superseded by another node; self-fencing (stop without flush)
+23:29:23.511 [error] shard dur_68548: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+23:29:23.819 [error] shard dur_94146: lease superseded by another node; self-fencing (stop without flush)
+23:29:23.820 [error] shard dur_94146: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+23:29:24.192 [error] shard dur_96962: lease superseded by another node; self-fencing (stop without flush)
+23:29:24.192 [error] shard dur_96962: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+23:29:24.424 [error] shard dur_97218: lease superseded by another node; self-fencing (stop without flush)
+23:29:24.424 [error] shard dur_97218: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+23:29:24.596 [error] shard dur_40003: lease superseded by another node; self-fencing (stop without flush)
+23:29:24.731 [error] shard dur_41027: lease superseded by another node; self-fencing (stop without flush)
+23:29:24.976 [error] shard dur_98882: lease superseded by another node; self-fencing (stop without flush)
+23:29:24.977 [error] shard dur_98882: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+23:29:24.989 [error] shard dur_99138: lease superseded by another node; self-fencing (stop without flush)
+23:29:24.989 [error] shard dur_99138: fence quarantine FAILED ({:error, :enoent}); dropping local copy
+23:29:25.001 [error] shard dur_99458: lease superseded by another node; self-fencing (stop without flush)
+23:29:25.007 [error] shard dur_99586: lease superseded by another node; self-fencing (stop without flush)
+23:29:25.023 [error] shard dur_99714: lease superseded by another node; self-fencing (stop without flush)
+23:29:25.036 [error] shard dur_99778: lease superseded by another node; self-fencing (stop without flush)
+23:29:25.474 [error] shard dur_100162: lease superseded by another node; self-fencing (stop without flush)
+23:29:31.010 [warning] revocation bulk refresh failed: cannot find ownership process for #PID<0.637.0> (Fathom.HranaAuth.Revocations)
+(Fathom.Repo) using mode :manual.
+(Note that a connection's mode reverts to :manual if its owner
+terminates.)
+
+When using ownership, you must manage connections in one
+of the four ways:
+
+* By explicitly checking out a connection
+* By explicitly allowing a spawned process
+* By running the pool in shared mode
+* By using :caller option with allowed process
+
+The first two options require every new process to explicitly
+check a connection out or be allowed by calling checkout or
+allow respectively.
+
+The third option requires a {:shared, pid} mode to be set.
+If using shared mode in tests, make sure your tests are not
+async.
+
+The fourth option requires [caller: pid] to be used when
+checking out a connection from the pool. The caller process
+should already be allowed on a connection.
+
+If you are reading this error, it means you have not done one
+of the steps above or that the owner process has crashed.
+
+See Ecto.Adapters.SQL.Sandbox docs for more information.
+........23:29:36.091 [warning] WriteCounter restarted with a fresh table; forcing open coordinators dirty (unknown ⇒ flush)
+....
+Finished in 65.3 seconds (0.5s async, 64.7s sync)
+
+Result: 995 passed, 16 excluded

@@ -148,6 +148,28 @@ if n = env_int.("HRANA_GC_EVERY_N") do
   config :fathom, :hrana_gc_every_n, n
 end
 
+# Compression for stored shard objects (expert review 2026-07-24 #38). Default `none`.
+#
+# DECODING IS ALWAYS ON regardless of this setting — a node reads any marked object — so the flag
+# rolls forward and back without a flag day and mixed-version nodes interoperate. This only
+# controls what this node WRITES.
+#
+# It does NOT speed up single-shard cold-open: that path is RTT-bound at fathom's shard sizes
+# (~1 RTT with the body essentially free). It pays on aggregate-bandwidth-bound work — mass
+# warming/failover, steady-state PUT volume for write-hot shards, cross-region, storage cost — and
+# it spends CPU, which is the contended resource on a loaded node. Measure `warm_s3_shards_per_s`
+# under `S3_FAKE_RATE_KBPS` before enabling it fleet-wide.
+#
+# Applies to the S3 backend; `Storage.Local` (dev/test) stores raw bytes either way. Not
+# `String.to_atom` — an unknown value must not mint an atom or silently mean "none".
+case System.get_env("SHARD_OBJECT_ENCODING") do
+  nil -> :ok
+  "" -> :ok
+  "none" -> config(:fathom, :shard_object_encoding, :none)
+  "zlib" -> config(:fathom, :shard_object_encoding, :zlib)
+  other -> raise ~s(SHARD_OBJECT_ENCODING must be "none" or "zlib", got: #{inspect(other)})
+end
+
 # Where shard files live locally while a shard is open (default: System.tmp_dir!/fathom_shards).
 # Point it at the node's fast local disk in a real deployment.
 if dir = System.get_env("SHARD_DATA_DIR") do

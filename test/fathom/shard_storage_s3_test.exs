@@ -69,7 +69,7 @@ defmodule Fathom.ShardStorageS3Test do
 
   test "pull on a missing object returns :ok and writes no file", %{shard: shard} do
     local = tmp_path(shard)
-    assert :ok = S3.pull(shard, local)
+    assert {:ok, _} = S3.pull(shard, local)
     refute File.exists?(local)
   end
 
@@ -79,8 +79,120 @@ defmodule Fathom.ShardStorageS3Test do
     File.write!(src, "the quick brown fox\n")
 
     assert :ok = S3.flush(shard, src)
-    assert :ok = S3.pull(shard, dst)
+    assert {:ok, _} = S3.pull(shard, dst)
     assert File.read!(dst) == "the quick brown fox\n"
+  end
+
+  # ── stored-object compression (expert review 2026-07-24 #38) ──
+
+  defp with_encoding(value, fun) do
+    prev = Application.get_env(:fathom, :shard_object_encoding)
+    Application.put_env(:fathom, :shard_object_encoding, value)
+
+    try do
+      fun.()
+    after
+      if is_nil(prev),
+        do: Application.delete_env(:fathom, :shard_object_encoding),
+        else: Application.put_env(:fathom, :shard_object_encoding, prev)
+    end
+  end
+
+  # Compressible, and big enough that the ratio is unambiguous.
+  defp compressible, do: String.duplicate("SQLite format 3 page of repetitive row data. ", 20_000)
+
+  test "a zlib-encoded object round-trips and is stored smaller", %{shard: shard} = ctx do
+    src = tmp_path("#{shard}-src")
+    dst = tmp_path("#{shard}-dst")
+    body = compressible()
+    File.write!(src, body)
+
+    with_encoding(:zlib, fn -> assert :ok = S3.flush(shard, src) end)
+
+    # The STORED bytes are compressed — read the object raw, bypassing the backend's decode.
+    %{status: 200} = raw = Req.get!(signed_req(ctx), url: object_url(ctx, shard <> ".db"))
+
+    assert byte_size(raw.body) < byte_size(body) / 2,
+           "the object wasn't actually compressed on the wire/at rest"
+
+    assert {:ok, _etag} = S3.pull(shard, dst)
+    assert File.read!(dst) == body, "the pull must inflate back to the exact database bytes"
+  end
+
+  # DECODE-ALWAYS. This is what lets a fleet roll the flag back: an object written while encoding
+  # was on must stay readable by a node that has since turned it off. Without this the flag is a
+  # one-way door and a rollback orphans every object written in between.
+  test "an object written with encoding ON is readable by a node with it OFF", %{shard: shard} do
+    src = tmp_path("#{shard}-src")
+    dst = tmp_path("#{shard}-dst")
+    body = compressible()
+    File.write!(src, body)
+
+    with_encoding(:zlib, fn -> assert :ok = S3.flush(shard, src) end)
+    with_encoding(:none, fn -> assert {:ok, _} = S3.pull(shard, dst) end)
+
+    assert File.read!(dst) == body
+  end
+
+  # And the other direction: turning encoding ON must not break reading the raw objects already
+  # in the bucket.
+  test "an unmarked (raw) object is still readable by a node with encoding ON", %{shard: shard} do
+    src = tmp_path("#{shard}-src")
+    dst = tmp_path("#{shard}-dst")
+    File.write!(src, "plain bytes, no marker\n")
+
+    with_encoding(:none, fn -> assert :ok = S3.flush(shard, src) end)
+    with_encoding(:zlib, fn -> assert {:ok, _} = S3.pull(shard, dst) end)
+
+    assert File.read!(dst) == "plain bytes, no marker\n"
+  end
+
+  # THE safety property. An object marked with an encoding this build cannot perform must FAIL THE
+  # PULL. Writing those bytes to the local path would hand SQLite something that is not a
+  # database — silent corruption of a tenant, which is far worse than a refused open.
+  test "an object marked with an unknown encoding fails the pull closed", %{shard: shard} = ctx do
+    dst = tmp_path("#{shard}-dst")
+
+    # Write the object directly with a marker no build understands.
+    %{status: status} =
+      Req.put!(signed_req(ctx),
+        url: object_url(ctx, shard <> ".db"),
+        body: "definitely not a sqlite file",
+        headers: [{Fathom.Shard.Storage.Codec.meta_header(), "zstd-v9"}]
+      )
+
+    assert status in 200..299
+
+    assert {:error, {:unknown_object_encoding, "zstd-v9"}} = S3.pull(shard, dst)
+
+    refute File.exists?(dst),
+           "a pull that cannot decode the object must leave NO local file — a partially written " <>
+             "or undecoded file is what SQLite would later be handed as a database"
+  end
+
+  # The integrity metadata must keep meaning "this database's hash" regardless of storage form,
+  # or verify_integrity/3 would have to know about encodings.
+  test "the integrity metadata is the UNCOMPRESSED hash", %{shard: shard} = ctx do
+    src = tmp_path("#{shard}-src")
+    body = compressible()
+    File.write!(src, body)
+
+    with_encoding(:zlib, fn -> assert :ok = S3.flush(shard, src) end)
+
+    %{status: 200, headers: headers} =
+      Req.head!(signed_req(ctx), url: object_url(ctx, shard <> ".db"))
+
+    meta =
+      case headers["x-amz-meta-fathom-md5"] do
+        [v | _] -> v
+        v -> v
+      end
+
+    plaintext_md5 = :crypto.hash(:md5, body) |> Base.encode16(case: :lower)
+
+    assert meta == plaintext_md5,
+           "x-amz-meta-fathom-md5 must hash the DATABASE, not the compressed body, so an " <>
+             "object's identity doesn't depend on how it happened to be stored"
   end
 
   # ── conditional pull (warm-standby freshness) ──
@@ -135,7 +247,14 @@ defmodule Fathom.ShardStorageS3Test do
   end
 
   test "an expired lease is stolen and the epoch bumps", %{shard: shard} = ctx do
-    put_raw_lock(ctx, shard, "a@node", 5, now_ms() - 1_000)
+    # Expired by more than the STEAL MARGIN. `owner_live?/3` falls back to the lock's own TTL when
+    # the owner runs no heartbeat (this test writes a raw lock and no heartbeat), and that fallback
+    # is margin-aware: a peer steals only once the lock is expired by MORE than the margin, so a
+    # wrongful steal needs clock skew greater than the remaining life plus the margin. This test
+    # predates the margin and expired the lock by 1s, which is inside it — so the owner still read
+    # as live and the steal was correctly refused.
+    stale_by = Fathom.Shard.Storage.steal_margin_ms() + 5_000
+    put_raw_lock(ctx, shard, "a@node", 5, now_ms() - stale_by)
     assert {:ok, %{owner: "b@node", epoch: 6}} = S3.acquire_lease(shard, "b@node", 60_000)
   end
 
@@ -190,7 +309,7 @@ defmodule Fathom.ShardStorageS3Test do
     assert :ok = S3.restore(shard, 1)
 
     dst = tmp_path("#{shard}-dst")
-    assert :ok = S3.pull(shard, dst)
+    assert {:ok, _} = S3.pull(shard, dst)
     assert File.read!(dst) == "v1"
   end
 
@@ -211,7 +330,7 @@ defmodule Fathom.ShardStorageS3Test do
 
     assert :ok = S3.restore_snapshot(shard, "test1")
     dst = tmp_path("#{shard}-dst")
-    assert :ok = S3.pull(shard, dst)
+    assert {:ok, _} = S3.pull(shard, dst)
     assert File.read!(dst) == "v1"
 
     assert :ok = S3.drop_snapshot(shard, "test1")
@@ -237,7 +356,7 @@ defmodule Fathom.ShardStorageS3Test do
     assert {:error, :superseded} = S3.restore(shard, 1, ~s("stale-etag"))
 
     still = tmp_path("#{shard}-still-v2")
-    assert :ok = S3.pull(shard, still)
+    assert {:ok, _} = S3.pull(shard, still)
     assert File.read!(still) == "v2"
 
     # The live object's current etag restores v1 over live.
@@ -245,7 +364,7 @@ defmodule Fathom.ShardStorageS3Test do
     assert :ok = S3.restore(shard, 1, live_etag)
 
     back = tmp_path("#{shard}-back-to-v1")
-    assert :ok = S3.pull(shard, back)
+    assert {:ok, _} = S3.pull(shard, back)
     assert File.read!(back) == "v1"
   end
 

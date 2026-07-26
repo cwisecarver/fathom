@@ -38,7 +38,10 @@ defmodule Fathom.Shard.Storage.S3 do
   """
   @behaviour Fathom.Shard.Storage
 
+  require Logger
+
   alias Fathom.Shard.Storage
+  alias Fathom.Shard.Storage.Codec
 
   # Dedicated Finch pool for all S3 traffic. Warming (node startup / failover)
   # pulls many shards from S3 at once; Req's default pool tops out near 50
@@ -223,20 +226,24 @@ defmodule Fathom.Shard.Storage.S3 do
 
   @impl true
   def flush(shard_id, local_path) do
-    with {:ok, size, md5, md5_hex} <- stat_and_md5(local_path),
-         {:ok, %{status: status}} <-
-           Req.put(req(),
-             url: object_path(shard_id),
-             body: File.stream!(local_path, @stream_chunk),
-             headers: [
-               {"content-length", Integer.to_string(size)},
-               {"content-md5", md5},
-               # Etag-form-independent integrity hash (expert review 2026-07-14 #17).
-               {@md5_meta, md5_hex}
-             ]
-           ) do
-      if status in 200..299, do: :ok, else: {:error, {:s3_put_status, status}}
-    end
+    with_body(local_path, fn body_path, size, md5, md5_hex, enc_headers ->
+      with {:ok, %{status: status}} <-
+             Req.put(req(),
+               url: object_path(shard_id),
+               body: File.stream!(body_path, @stream_chunk),
+               headers:
+                 [
+                   {"content-length", Integer.to_string(size)},
+                   {"content-md5", md5},
+                   # Etag-form-independent integrity hash (expert review 2026-07-14 #17). Always
+                   # the UNCOMPRESSED database's hash, so an object's identity doesn't depend on
+                   # how it was stored (#38).
+                   {@md5_meta, md5_hex}
+                 ] ++ enc_headers
+             ) do
+        if status in 200..299, do: :ok, else: {:error, {:s3_put_status, status}}
+      end
+    end)
   end
 
   @impl true
@@ -248,24 +255,74 @@ defmodule Fathom.Shard.Storage.S3 do
     cond_headers =
       if expected_etag, do: [{"if-match", expected_etag}], else: [{"if-none-match", "*"}]
 
-    with {:ok, size, md5, md5_hex} <- stat_and_md5(local_path),
-         {:ok, resp} <-
-           Req.put(req(),
-             url: object_path(shard_id),
-             body: File.stream!(local_path, @stream_chunk),
-             headers: [
-               {"content-length", Integer.to_string(size)},
-               {"content-md5", md5},
-               # Etag-form-independent integrity hash (expert review 2026-07-14 #17).
-               {@md5_meta, md5_hex} | cond_headers
-             ]
-           ) do
-      case resp.status do
-        s when s in 200..299 -> {:ok, etag(resp.headers)}
-        412 -> {:error, :superseded}
-        s -> {:error, {:s3_put_status, s}}
+    with_body(local_path, fn body_path, size, md5, md5_hex, enc_headers ->
+      with {:ok, resp} <-
+             Req.put(req(),
+               url: object_path(shard_id),
+               body: File.stream!(body_path, @stream_chunk),
+               headers:
+                 [
+                   {"content-length", Integer.to_string(size)},
+                   {"content-md5", md5},
+                   # Etag-form-independent integrity hash (expert review 2026-07-14 #17), over the
+                   # UNCOMPRESSED bytes (#38).
+                   {@md5_meta, md5_hex} | cond_headers
+                 ] ++ enc_headers
+             ) do
+        case resp.status do
+          s when s in 200..299 -> {:ok, etag(resp.headers)}
+          412 -> {:error, :superseded}
+          s -> {:error, {:s3_put_status, s}}
+        end
       end
+    end)
+  end
+
+  # Prepares the PUT body for `local_path`, honouring `:shard_object_encoding` (#38), and hands
+  # the callback everything the upload needs. Cleans up the compressed temp on every path.
+  #
+  # The two hashes are deliberately over DIFFERENT bytes:
+  #   * `content-md5` (the wire body)  -> the bytes actually being PUT, compressed or not.
+  #   * `@md5_meta`   (the identity)   -> ALWAYS the uncompressed database. That is what makes
+  #     `verify_integrity/3` work unchanged and keeps an object's identity independent of how it
+  #     happened to be stored.
+  #
+  # The 5 GiB single-PUT ceiling (#37) is checked against the body actually uploaded, which is the
+  # compressed size when encoding is on — compression genuinely raises that ceiling.
+  defp with_body(local_path, fun) do
+    case Codec.encoding() do
+      :none ->
+        with {:ok, size, md5, md5_hex} <- stat_and_md5(local_path) do
+          fun.(local_path, size, md5, md5_hex, [])
+        end
+
+      :zlib ->
+        # The plaintext hash must NOT go through stat_and_md5: that applies the single-PUT
+        # ceiling, and the plaintext is not what gets PUT.
+        with {:ok, plain_hex} <- file_md5_hex(local_path),
+             {:ok, tmp} <- Codec.compress_to_temp(local_path) do
+          try do
+            with {:ok, size, md5, _} <- stat_and_md5(tmp) do
+              fun.(tmp, size, md5, plain_hex, Codec.upload_headers(:zlib))
+            end
+          after
+            File.rm(tmp)
+          end
+        end
     end
+  end
+
+  # The file's MD5 in hex, with no size ceiling applied (see with_body/2).
+  defp file_md5_hex(path) do
+    digest =
+      path
+      |> File.stream!(@stream_chunk)
+      |> Enum.reduce(:crypto.hash_init(:md5), &:crypto.hash_update(&2, &1))
+      |> :crypto.hash_final()
+
+    {:ok, Base.encode16(digest, case: :lower)}
+  rescue
+    e in File.Error -> {:error, e.reason}
   end
 
   # Steal-time data-object etag invalidation (expert review #3, fixed for real
@@ -715,6 +772,11 @@ defmodule Fathom.Shard.Storage.S3 do
     # rm is a harmless enoent. (An external brutal kill still can't unwind — the
     # age-gated temp reaper at coordinator open / follower refresh covers that.)
     try do
+      # The inflate context (#38) lives in the process dictionary alongside the fd, for the same
+      # reason: the after-block must be able to release it on ANY exit, including a transport
+      # error that returns no response to carry it.
+      z_key = {__MODULE__, :dl_z, tmp}
+
       into = fn {:data, chunk}, {req, resp} ->
         if resp.status == 200 do
           fd =
@@ -728,10 +790,37 @@ defmodule Fathom.Shard.Storage.S3 do
                 fd
             end
 
-          :ok = IO.binwrite(fd, chunk)
-          md5 = resp.private[:fathom_md5] || :crypto.hash_init(:md5)
-          resp = Req.Response.put_private(resp, :fathom_md5, :crypto.hash_update(md5, chunk))
-          {:cont, {req, resp}}
+          # Decode-always (#38): the object's own marker decides, never this node's setting, so a
+          # fleet can roll the encoding flag back without orphaning objects. An unrecognised
+          # marker resolves to an error and is caught below — we must never write bytes we can't
+          # interpret into a file SQLite will be handed.
+          decoded =
+            case Process.get(z_key, :unset) do
+              :unset ->
+                d = Codec.decoder(meta_enc(resp.headers))
+                Process.put(z_key, decode_state(d))
+                Process.get(z_key)
+
+              state ->
+                state
+            end
+
+          case decoded do
+            {:error, _} = err ->
+              {:halt, {req, Req.Response.put_private(resp, :fathom_enc_error, err)}}
+
+            z ->
+              plain = Codec.inflate(z, chunk)
+              :ok = IO.binwrite(fd, plain)
+              # The digest is over the DECODED bytes, so it still means "this database's hash"
+              # and matches @md5_meta whether or not the object was compressed.
+              md5 = resp.private[:fathom_md5] || :crypto.hash_init(:md5)
+
+              resp =
+                Req.Response.put_private(resp, :fathom_md5, :crypto.hash_update(md5, plain))
+
+              {:cont, {req, resp}}
+          end
         else
           {:cont, {req, resp}}
         end
@@ -745,6 +834,19 @@ defmodule Fathom.Shard.Storage.S3 do
       end
 
       case result do
+        # An object marked with an encoding this node cannot perform (#38). FAIL THE PULL — the
+        # temp holds nothing usable and handing raw bytes to SQLite as a database is precisely
+        # the correctness incident the marker exists to prevent. Not retryable: the marker will
+        # be the same next time. Upgrade the node instead.
+        {:ok, %{private: %{fathom_enc_error: {:error, reason}}}} ->
+          Logger.error(
+            "shard object at #{url} is stored with an encoding this node cannot decode " <>
+              "(#{inspect(reason)}); refusing the pull rather than serving undecodable bytes " <>
+              "as a database. Upgrade this node to a build that supports it."
+          )
+
+          {:error, reason}
+
         {:ok, %{status: 200} = resp} ->
           cond do
             # A brand-new steal sentinel (round-2 #7): not shard bytes — never
@@ -796,7 +898,27 @@ defmodule Fathom.Shard.Storage.S3 do
         fd -> _ = File.close(fd)
       end
 
+      # Release the inflate context on every exit path, exactly like the fd (#38).
+      case Process.delete({__MODULE__, :dl_z, tmp}) do
+        z when is_reference(z) -> Codec.finish(z)
+        _ -> :ok
+      end
+
       File.rm(tmp)
+    end
+  end
+
+  # `nil` for the raw path, an inflate context for a decodable encoding, or the error tuple
+  # itself so the `into` fun can halt on it.
+  defp decode_state({:ok, encoding}), do: Codec.init(encoding)
+  defp decode_state({:error, _} = error), do: error
+
+  # The object's encoding marker off a GET/HEAD response (list- or bare-valued), or nil.
+  defp meta_enc(headers) do
+    case headers[Codec.meta_header()] do
+      [v | _] when is_binary(v) -> v
+      v when is_binary(v) -> v
+      _ -> nil
     end
   end
 
