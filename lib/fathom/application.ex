@@ -540,11 +540,31 @@ defmodule Fathom.Application do
          # nginx now does it once, where `gzip_min_length` can skip the small responses Bandit has
          # no knob for. The client still receives `content-encoding: gzip` — wire-transparent.
          http_options: hrana_http_options(),
-         http_1_options: hrana_http_1_options()
+         http_1_options: hrana_http_1_options(),
+         websocket_options: hrana_websocket_options()
        ]},
       id: :fathom_hrana_listener
     )
   end
+
+  @doc false
+  # WebSocket listener options (expert review 2026-07-24 #34).
+  #
+  # `validate_text_frames` defaults to true, and Bandit's own doc says it "can be an expensive
+  # operation and one that may be safely skipped in some situations". Every Hrana-over-WS request
+  # frame — django-libsql, the PRIMARY production client path — got a full `String.valid?/1` byte
+  # walk, immediately followed by `Jason.decode/1` walking the same bytes. One extra full pass per
+  # request frame, scaling with statement size (a fat `INSERT … VALUES` batch is tens of KB). This
+  # is the inbound mirror of the 2026-07-23 audit's #8, which removed a `String.valid?` pre-scan on
+  # the OUTBOUND path for exactly this reason; the inbound one lives in Bandit's config rather than
+  # filo's code, so it was never touched.
+  #
+  # Invalid UTF-8 is still rejected: `Jason.decode/1` cannot parse it and filo closes the
+  # connection. The only thing the pre-scan contributed was the close CODE — RFC 6455 §7.4.1 wants
+  # 1007 — so this is paired with filo emitting 1007 from its decode-failure path (filo 7796a91+,
+  # `Filo.Socket.handle_in/2`). With that pair in place the change is conformance-neutral, not a
+  # spec deviation. Do NOT disable this without that filo version.
+  def hrana_websocket_options, do: [validate_text_frames: false]
 
   @doc false
   # HTTP/1-specific listener options (expert review 2026-07-24 #40).

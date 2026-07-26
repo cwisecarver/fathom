@@ -56,17 +56,21 @@ defmodule Fathom.HranaListenerOptionsTest do
   test "the listener does not compress, even when the client asks for it" do
     port = 49_600 + :erlang.phash2(self(), 300)
 
-    start_supervised!(
-      {Bandit,
-       [
-         plug: EchoPlug,
-         scheme: :http,
-         port: port,
-         ip: {127, 0, 0, 1},
-         thousand_island_options: Fathom.Application.hrana_transport_options(),
-         http_options: Fathom.Application.hrana_http_options()
-       ]}
-    )
+    start_supervised!({Bandit,
+     [
+       plug: EchoPlug,
+       scheme: :http,
+       port: port,
+       ip: {127, 0, 0, 1},
+       thousand_island_options: Fathom.Application.hrana_transport_options(),
+       http_options: Fathom.Application.hrana_http_options(),
+       # Boot with EVERY option group the real listener passes, not just the one under test.
+       # Bandit validates option keys at startup, so an unknown or misspelled key is a boot
+       # failure — which a keyword-list assertion would never catch (the #6 lesson: only a real
+       # bind proves the platform accepts the configuration).
+       http_1_options: Fathom.Application.hrana_http_1_options(),
+       websocket_options: Fathom.Application.hrana_websocket_options()
+     ]})
 
     assert {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false], 2_000)
 
@@ -82,6 +86,32 @@ defmodule Fathom.HranaListenerOptionsTest do
     refute String.downcase(resp) =~ "content-encoding: gzip",
            "the node compressed a response despite compress: false — compression belongs on the " <>
              "LB, where gzip_min_length can skip the small replies Bandit has no knob for"
+  end
+
+  # Expert review 2026-07-24 #34. Bandit's `validate_text_frames` walks every inbound text frame's
+  # bytes with String.valid?/1, immediately before Jason.decode/1 walks the same bytes again — one
+  # duplicated full pass per WS request frame, on django-libsql, the primary production path.
+  #
+  # This is safe to turn off ONLY because filo emits the RFC 6455 §7.4.1 close code (1007) from its
+  # own decode-failure path; Bandit's pre-scan was the only thing producing it before. Without that
+  # filo version, disabling this silently downgrades every malformed-frame close to 1000.
+  test "inbound text frames are not double-scanned, and filo supplies the 1007 close" do
+    assert Fathom.Application.hrana_websocket_options()[:validate_text_frames] == false
+
+    # The pairing, asserted against the dependency rather than assumed: filo must close 1007 on a
+    # decode failure. If this ever regresses, re-enable validate_text_frames in the same change.
+    state = %{
+      streams: %{},
+      encoding: :json,
+      hello: false,
+      executor: nil,
+      open_arg: nil,
+      authorize: nil,
+      header_token: nil
+    }
+
+    assert {:stop, :normal, {1007, _}, _} =
+             Filo.Socket.handle_in({"{not json", [opcode: :text]}, state)
   end
 
   test "setting :hrana_listen_sockets to 1 drops reuseport for platforms that refuse it" do
