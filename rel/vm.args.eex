@@ -32,9 +32,27 @@
 ##   +SDio 256 : 3679 / 3417 / 3355 tps   dirty-IO run queue mean 0.37,      max  8, non-zero 23%
 ##
 ## So the queue is real and raising +SDio does drain it exactly as predicted — but draining it
-## COSTS ~9% throughput at every tenant count, and 64 -> 256 changes nothing further. The bottleneck
-## is CPU, not dirty-IO thread count: more runnable OS threads on an already-saturated box buy
-## contention, and the queue at 10 is useful backpressure rather than a stall.
+## COSTS ~9% throughput at every tenant count, and 64 -> 256 changes nothing further.
+##
+## WHY, measured (this was originally asserted, then actually probed — same file, second pass):
+##
+##                          +SDio 10        +SDio 64
+##   dirty-IO utilization   26.2-27.9%      3.7-4.0%     <- 10 x 27% ~= 64 x 4% ~= 2.6 THREADS of work
+##   normal sched util      68.0-69.9%      71.3-75.3%
+##   normal RUN QUEUE       18.5-19.3       19.9-21.3    <- runnable procs waiting on 12 schedulers
+##   normal RQ non-zero     76-78%          77-80%
+##   host CPU, all ctrs     ~1140%          ~1109%       <- of 1200% on 12 vCPUs
+##
+## The node is saturated on NORMAL schedulers, not dirty-IO. Total dirty-IO work is ~2.6 thread-
+## equivalents either way, so 10 threads was already ~4x more capacity than the workload asks for;
+## the queue at 10 is brief bursty queuing, not capacity starvation. Meanwhile ~20 processes stand
+## runnable on 12 normal schedulers ~77% of the time and the box runs at ~95% of its 12 vCPUs. The
+## extra 54 dirty-IO threads add scheduling overhead against that, which is why throughput falls.
+##
+## (Read the utilization percentages as "had work to do" — ERTS scheduler_wall_time counts a
+## scheduler that is runnable-but-descheduled by the OS as active, and 3 nodes x 12 schedulers on
+## 12 vCPUs is exactly that case. The run-queue depth and the host CPU figure are the saturation
+## evidence; the utilization split is what attributes it to normal vs dirty-IO.)
 ##
 ## Left at the ERTS default of 10, explicitly, so the number is attached to its measurement.
 ## NOT settled for every deployment: the rig is one 12-vCPU box running three nodes + the LB + the
