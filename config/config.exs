@@ -79,6 +79,28 @@ config :fathom, Oban,
   queues: [migrations: 10, retirement: 5, rebalance: 3, tenants: 3],
   plugins: [
     {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7},
+    # Rescue jobs stranded in `executing` by a node that died mid-run (expert review 2026-07-24
+    # #33). Nothing else transitions them: the Pruner only touches terminal states, so the row
+    # sits in `executing` forever. Every per-shard worker is `unique` over states INCLUDING
+    # `:executing` — ShardMigrationJob, RevertJob, DeleteJob and HandoffJob — so one stranded row
+    # means that shard can never have another migration, revert, delete or handoff enqueued: the
+    # lazy path, the hourly ReconcileJob and the rollout sweep all dedup against a ghost.
+    # HandoffJob is worst, with `period: :infinity` making the block permanent and
+    # RebalanceJob.handoff_in_flight?/1 counting `executing`, so the dead-pin reconciler skips
+    # that shard forever and it stays pinned to a node that no longer exists. The symptom is
+    # "this tenant never migrates / can't be deleted / stays pinned" with no error anywhere.
+    #
+    # 60 minutes, matching @default_migration_stale_seconds. rescue_after MUST exceed the longest
+    # real job runtime, or Lifeline rescues a job that is still running on a live node and you get
+    # two concurrent runs. The long pole is the migration copy, which benches at ~7.8M rows/s, so
+    # even a 5 GB shard finishes orders of magnitude inside this window.
+    #
+    # Re-running a rescued job is safe: DeleteJob and ReconcileJob document idempotency
+    # explicitly, the migration/revert/handoff jobs are re-entrant by construction (each step
+    # tolerates already-done state), and the S3 lease + epoch fence independently prevents a stale
+    # actor from double-writing regardless of what Oban does. Against that, the status quo is a
+    # permanent wedge.
+    {Oban.Plugins.Lifeline, rescue_after: :timer.minutes(60)},
     {Oban.Plugins.Cron,
      crontab: [
        {"0 * * * *", Fathom.Migrator.ReconcileJob},
