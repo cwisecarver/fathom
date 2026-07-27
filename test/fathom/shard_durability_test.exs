@@ -820,29 +820,41 @@ defmodule Fathom.ShardDurabilityTest do
     # Hold a connection on each: an idle+clean coordinator deliberately carries NO flush timer
     # (review 2026-07-24 #10), and the jitter this test is about only matters for shards that can
     # actually flush. Opening a stream is also what re-arms the timer, so this covers that path.
-    conns =
+    # Stamp when each timer was ARMED (opening the stream re-arms it), because `read_timer`
+    # reports what is LEFT, not what was drawn. The old lower bound of 1_800 silently assumed
+    # under 200ms passes between arming and reading — fine on an idle box, but this opens six
+    # shards first, and under load that easily exceeds 200ms, at which point a perfectly in-band
+    # delay reads as out-of-band. Elapsed time is not the invariant; the DRAWN delay is.
+    opened =
       for id <- ids do
         {:ok, conn} = ShardExecutor.open(id)
-        conn
+        {id, conn, System.monotonic_time(:millisecond)}
       end
 
+    conns = Enum.map(opened, fn {_id, conn, _t} -> conn end)
     on_exit(fn -> for c <- conns, do: ShardExecutor.close(c) end)
 
-    remaining =
-      for id <- ids do
+    # {remaining_ms, elapsed_since_arm} per shard.
+    samples =
+      for {id, _conn, armed_at} <- opened do
         {:ok, pid} = Shards.ensure(id)
-        # read_timer returns ms left on the armed flush timer (< the jittered delay by the tiny
-        # elapsed time since open) — the observable of the jittered schedule.
-        Process.read_timer(:sys.get_state(pid).flush_timer)
+        ms = Process.read_timer(:sys.get_state(pid).flush_timer)
+        {ms, System.monotonic_time(:millisecond) - armed_at}
       end
 
-    # Bounded: within [interval*(1-ratio), interval*(1+ratio)] = [2000, 6000], minus a little for
-    # elapsed time — and never 0/negative.
-    for ms <- remaining do
+    remaining = Enum.map(samples, fn {ms, _elapsed} -> ms end)
+
+    # The drawn delay was `ms + elapsed`, and it must land in
+    # [interval*(1-ratio), interval*(1+ratio)] = [2000, 6000]. Reconstructing it makes the check
+    # independent of how slow the machine is, instead of encoding a guess about it.
+    for {ms, elapsed} <- samples do
       assert is_integer(ms) and ms > 0,
              "a jittered delay must be positive (never fire immediately)"
 
-      assert ms >= 1_800 and ms <= 6_000, "delay #{ms} outside the ±50% jitter band"
+      drawn = ms + elapsed
+
+      assert drawn >= 2_000 and drawn <= 6_000,
+             "drawn delay #{drawn}ms (#{ms} left + #{elapsed} elapsed) outside the ±50% band"
     end
 
     assert Enum.uniq(remaining) |> length() >= 2,

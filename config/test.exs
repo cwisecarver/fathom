@@ -13,7 +13,17 @@ config :fathom, Fathom.Repo,
   hostname: System.get_env("PGHOST") || "localhost",
   database: "fathom_test#{System.get_env("MIX_TEST_PARTITION")}",
   pool: Ecto.Adapters.SQL.Sandbox,
-  pool_size: System.schedulers_online() * 2
+  pool_size: System.schedulers_online() * 2,
+  # DBConnection SHEDS LOAD by design: past `queue_target` it starts dropping queued checkouts
+  # (default 50ms target / 1000ms interval). That is correct for a production data plane — a
+  # dropped checkout is better than an unbounded queue — but it is never what you want in a test
+  # run, where the sandbox deliberately funnels many processes through one shared connection.
+  # Under machine load the pool dropped a request after 119ms and a passing test failed with
+  # "connection not available and request was dropped from queue" (2026-07-27,
+  # Fathom.Rebalancer.HandoffJobTest at load average ~58), which says nothing about the code.
+  # Test-env only; production sizing lives in config/runtime.exs (POOL_QUEUE_TARGET_MS).
+  queue_target: 5_000,
+  queue_interval: 10_000
 
 # We don't run a server during test. If one is required,
 # you can enable the server option below.
