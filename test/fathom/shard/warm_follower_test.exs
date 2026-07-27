@@ -10,9 +10,6 @@ defmodule Fathom.Shard.WarmFollowerTest do
   alias Fathom.Directory
   alias Fathom.Shard.{Connection, Storage, WarmFollower}
 
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-
   setup do
     cache_dir =
       Path.join(System.tmp_dir!(), "fathom_warm_test_#{System.unique_integer([:positive])}")
@@ -49,7 +46,7 @@ defmodule Fathom.Shard.WarmFollowerTest do
     end
 
     on_exit(fn ->
-      for dir <- [@remote_dir, @local_dir],
+      for dir <- [remote_dir(), local_dir()],
           s <- [".db", ".db-wal", ".db-shm", ".lock"],
           do: File.rm(Path.join(dir, id <> s))
     end)
@@ -444,4 +441,7 @@ defmodule Fathom.Shard.WarmFollowerTest do
     assert Process.alive?(pid)
     refute_received {:DOWN, ^ref, :process, ^pid, _}
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

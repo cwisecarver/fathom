@@ -10,16 +10,13 @@ defmodule Fathom.SequenceDescribeTest do
   alias Fathom.{Directory, HranaAuth, ShardExecutor, Shards}
   alias Filo.Stmt
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     shard = "seq_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
       Shards.drain(shard, 2_000)
 
-      for dir <- [@local_dir, @remote_dir],
+      for dir <- [local_dir(), remote_dir()],
           path <- Path.wildcard(Path.join(dir, "#{shard}*")),
           do: File.rm(path)
     end)
@@ -112,4 +109,7 @@ defmodule Fathom.SequenceDescribeTest do
 
     :ok = ShardExecutor.close(h)
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

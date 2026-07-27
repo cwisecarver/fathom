@@ -72,6 +72,14 @@ config :fathom, :admin_auth, username: "admin", password: "secret"
 config :fathom, Fathom.Shard.Storage.Local,
   dir: Path.join(System.tmp_dir!(), "fathom_remote_test")
 
+# ...and the same for the LOCAL shard dir, which until now shared `fathom_shards` with dev.
+# Two problems with sharing it: a dev shard file can hold un-flushed writes, so the suite could
+# never safely wipe the directory, and it therefore accumulated (5,047 files, oldest 5 days, as of
+# 2026-07-27). A test-owned dir is per-run state by definition, so `test_helper.exs` clears it at
+# the start of every run. Tests must reach it via `Fathom.Shard.data_dir/0`, never by rebuilding
+# the path — that duplication is what let the two drift.
+config :fathom, :shard_data_dir, Path.join(System.tmp_dir!(), "fathom_shards_test")
+
 # Don't touch the Postgres directory from the shard data path by default in test
 # (the shard/storage/lease tests aren't sandbox-checked-out). The directory
 # wiring test flips this on explicitly.

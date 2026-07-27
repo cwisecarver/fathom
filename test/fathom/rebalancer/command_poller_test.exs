@@ -13,8 +13,9 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     shard = "poll_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      for dir <- ["fathom_shards", "fathom_remote_test"], suffix <- ["", "-wal", "-shm"] do
-        File.rm(Path.join([System.tmp_dir!(), dir, "#{shard}.db"]) <> suffix)
+      for dir <- [Fathom.Shard.data_dir(), Fathom.Shard.Storage.Local.dir()],
+          suffix <- ["", "-wal", "-shm"] do
+        File.rm(Path.join([dir, "#{shard}.db"]) <> suffix)
       end
     end)
 
@@ -175,9 +176,9 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
       restore(:command_drain_ms, prev_drain)
 
       for id <- [drain_shard, warm_shard],
-          dir <- ["fathom_shards", "fathom_remote_test"],
+          dir <- [Fathom.Shard.data_dir(), Fathom.Shard.Storage.Local.dir()],
           s <- ["", "-wal", "-shm"] do
-        File.rm(Path.join([System.tmp_dir!(), dir, "#{id}.db"]) <> s)
+        File.rm(Path.join([dir, "#{id}.db"]) <> s)
       end
     end)
 
@@ -242,8 +243,9 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
       restore(:command_poll_ms, prev_poll)
       restore(:command_drain_ms, prev_drain)
 
-      for dir <- ["fathom_shards", "fathom_remote_test"], s <- ["", "-wal", "-shm"] do
-        File.rm(Path.join([System.tmp_dir!(), dir, "#{drain_shard}.db"]) <> s)
+      for dir <- [Fathom.Shard.data_dir(), Fathom.Shard.Storage.Local.dir()],
+          s <- ["", "-wal", "-shm"] do
+        File.rm(Path.join([dir, "#{drain_shard}.db"]) <> s)
       end
     end)
 

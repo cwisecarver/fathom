@@ -20,7 +20,7 @@ defmodule FathomWeb.AdminTenantControllerTest do
       Shards.drain(id, 2_000)
       Storage.purge_shard(id)
 
-      for p <- Path.wildcard(Path.join([System.tmp_dir!(), "fathom_shards", "#{id}*"])),
+      for p <- Path.wildcard(Path.join([Fathom.Shard.data_dir(), "#{id}*"])),
           do: File.rm(p)
 
       for p <- Path.wildcard(Path.join(System.tmp_dir!(), "fathom_export_#{id}_*")),

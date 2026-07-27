@@ -9,8 +9,6 @@ defmodule Fathom.LazyMigrateTest do
   alias Fathom.Shard.{Connection, Storage}
   alias Filo.{Stmt, StmtResult}
 
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   @v2_statements [
     "ALTER TABLE app_thing ADD COLUMN created_at TEXT",
     "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0002', 'now')"
@@ -30,9 +28,9 @@ defmodule Fathom.LazyMigrateTest do
         do: Application.delete_env(:fathom, :migrate_on_touch),
         else: Application.put_env(:fathom, :migrate_on_touch, prev_mode)
 
-      for path <- Path.wildcard(Path.join(@remote_dir, "#{shard}*")), do: File.rm(path)
+      for path <- Path.wildcard(Path.join(remote_dir(), "#{shard}*")), do: File.rm(path)
 
-      for path <- Path.wildcard(Path.join([System.tmp_dir!(), "fathom_shards", "#{shard}*"])),
+      for path <- Path.wildcard(Path.join([Fathom.Shard.data_dir(), "#{shard}*"])),
           do: File.rm(path)
     end)
 
@@ -165,4 +163,6 @@ defmodule Fathom.LazyMigrateTest do
     refute_enqueued(worker: ShardMigrationJob, args: %{shard_id: shard})
     ShardExecutor.close(conn)
   end
+
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

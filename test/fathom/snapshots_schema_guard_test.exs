@@ -13,8 +13,6 @@ defmodule Fathom.SnapshotsSchemaGuardTest do
   alias Fathom.{Directory, Snapshots}
   alias Fathom.Shard.{Connection, Storage}
 
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   defp uniq, do: "snapguard_#{System.unique_integer([:positive])}"
 
   # Push a real SQLite file at `user_version` as the shard's live stored object (no coordinator).
@@ -30,9 +28,9 @@ defmodule Fathom.SnapshotsSchemaGuardTest do
 
   defp cleanup(shard) do
     for s <- [".db", ".db-wal", ".db-shm", ".lock"],
-        do: File.rm(Path.join(@remote_dir, shard <> s))
+        do: File.rm(Path.join(remote_dir(), shard <> s))
 
-    for snap <- Path.wildcard(Path.join(@remote_dir, "#{shard}@snap-*.db")), do: File.rm(snap)
+    for snap <- Path.wildcard(Path.join(remote_dir(), "#{shard}@snap-*.db")), do: File.rm(snap)
   end
 
   test "a cross-version restore is refused without force, and with force reconciles the directory (#7)" do
@@ -79,4 +77,6 @@ defmodule Fathom.SnapshotsSchemaGuardTest do
 
     assert {:error, :snapshot_not_found} = Snapshots.restore(shard, "20260101T000000Z-0000")
   end
+
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

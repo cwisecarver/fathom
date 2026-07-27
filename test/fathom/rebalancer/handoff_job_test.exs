@@ -38,8 +38,9 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
       restore(:lb_backends, prev_backends)
       File.rm(map_path)
 
-      for dir <- ["fathom_shards", "fathom_remote_test"], suffix <- ["", "-wal", "-shm"] do
-        File.rm(Path.join([System.tmp_dir!(), dir, "#{shard}.db"]) <> suffix)
+      for dir <- [Fathom.Shard.data_dir(), Fathom.Shard.Storage.Local.dir()],
+          suffix <- ["", "-wal", "-shm"] do
+        File.rm(Path.join([dir, "#{shard}.db"]) <> suffix)
       end
     end)
 

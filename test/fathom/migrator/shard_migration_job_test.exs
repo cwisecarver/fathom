@@ -9,8 +9,6 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Directory
 
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   @v2_statements [
     "ALTER TABLE app_thing ADD COLUMN created_at TEXT",
     "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0002', 'now')"
@@ -20,12 +18,12 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     shard = "job_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      for path <- Path.wildcard(Path.join(@remote_dir, "#{shard}*")), do: File.rm(path)
+      for path <- Path.wildcard(Path.join(remote_dir(), "#{shard}*")), do: File.rm(path)
 
-      for path <- Path.wildcard(Path.join([System.tmp_dir!(), "fathom_shards", "#{shard}*"])),
+      for path <- Path.wildcard(Path.join([Fathom.Shard.data_dir(), "#{shard}*"])),
           do: File.rm(path)
 
-      File.rm(Path.join([@remote_dir, "heartbeats", URI.encode_www_form("thief@node")]))
+      File.rm(Path.join([remote_dir(), "heartbeats", URI.encode_www_form("thief@node")]))
     end)
 
     %{shard: shard}
@@ -64,17 +62,17 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
   end
 
   defp put_foreign_lock(shard) do
-    File.mkdir_p!(@remote_dir)
+    File.mkdir_p!(remote_dir())
     exp = System.system_time(:millisecond) + 60_000
 
     File.write!(
-      Path.join(@remote_dir, "#{shard}.lock"),
+      Path.join(remote_dir(), "#{shard}.lock"),
       Jason.encode!(%{"owner" => "thief@node", "epoch" => 1, "expires_at_ms" => exp})
     )
 
     # Liveness is the per-node heartbeat now: a held lock needs a live owner, else
     # the migrator would just steal it instead of snoozing.
-    hb_dir = Path.join(@remote_dir, "heartbeats")
+    hb_dir = Path.join(remote_dir(), "heartbeats")
     File.mkdir_p!(hb_dir)
 
     File.write!(
@@ -87,10 +85,10 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
   # heartbeat — so the #11 lock-TTL fallback keeps it live. Post-fix a new operation's owner
   # `migrator@<node>@<job.id>` is foreign to this, so it can't reclaim it (finding #9).
   defp put_migrator_lock(shard) do
-    File.mkdir_p!(@remote_dir)
+    File.mkdir_p!(remote_dir())
 
     File.write!(
-      Path.join(@remote_dir, "#{shard}.lock"),
+      Path.join(remote_dir(), "#{shard}.lock"),
       Jason.encode!(%{
         "owner" => "migrator@#{node()}",
         "epoch" => 1,
@@ -114,10 +112,10 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     :ok = Storage.retain(shard, 1)
     # The retained version is genuinely OLD (live has moved past it) — the normal case.
     {:ok, _} = Directory.cutover(shard, 2)
-    assert File.exists?(Path.join(@remote_dir, "#{shard}@1.db"))
+    assert File.exists?(Path.join(remote_dir(), "#{shard}@1.db"))
 
     assert :ok = perform_job(RetirementJob, %{"shard_id" => shard, "version" => 1})
-    refute File.exists?(Path.join(@remote_dir, "#{shard}@1.db"))
+    refute File.exists?(Path.join(remote_dir(), "#{shard}@1.db"))
   end
 
   # Expert review #22: the drop must skip a version the directory shows LIVE — a revert
@@ -130,7 +128,7 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     assert {:cancel, :version_live} =
              perform_job(RetirementJob, %{"shard_id" => shard, "version" => 1})
 
-    assert File.exists?(Path.join(@remote_dir, "#{shard}@1.db")),
+    assert File.exists?(Path.join(remote_dir(), "#{shard}@1.db")),
            "the live version's retained copy must not be dropped"
   end
 
@@ -153,7 +151,7 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     assert {:cancel, :revert_in_flight} =
              perform_job(RetirementJob, %{"shard_id" => shard, "version" => 1})
 
-    assert File.exists?(Path.join(@remote_dir, "#{shard}@1.db")),
+    assert File.exists?(Path.join(remote_dir(), "#{shard}@1.db")),
            "an in-flight revert's restore source must not be dropped"
   end
 
@@ -170,7 +168,7 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
 
     # The live object is gone, so the revert's retain-backup step FAILS after the
     # cancel — pre-fix the cancel lived in the :ok branch and never ran on this path.
-    File.rm!(Path.join(@remote_dir, "#{shard}.db"))
+    File.rm!(Path.join(remote_dir(), "#{shard}.db"))
 
     capture_log(fn ->
       assert {:error, _} =
@@ -190,7 +188,7 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     # The completed revert's end state: directory AND live file both at v1 ...
     seed_v1!(shard)
     # ... and a retained @1 backup whose bytes must survive the retry.
-    backup = Path.join(@remote_dir, "#{shard}@1.db")
+    backup = Path.join(remote_dir(), "#{shard}@1.db")
     File.write!(backup, "the-retained-backup-bytes")
     on_exit(fn -> File.rm(backup) end)
 
@@ -282,7 +280,7 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
 
     assert :ok = perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 1})
 
-    assert File.exists?(Path.join(@remote_dir, "#{shard}@2.db")),
+    assert File.exists?(Path.join(remote_dir(), "#{shard}@2.db")),
            "the live v2 object is backed up"
 
     assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 2})
@@ -390,4 +388,6 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
       assert {:snooze, 1} = RevertJob.perform(%{job | args: stale_args})
     end)
   end
+
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

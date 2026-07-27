@@ -8,9 +8,6 @@ defmodule Fathom.ShardsDrainAllTest do
 
   alias Fathom.{HealthPlug, ShardExecutor, Shards}
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     prev_idle = Application.get_env(:fathom, :shard_idle_ms)
     # High idle so a just-opened coordinator doesn't idle-stop before drain_all runs.
@@ -24,7 +21,7 @@ defmodule Fathom.ShardsDrainAllTest do
       for id <- ids, do: Shards.drain(id, 2_000)
 
       for id <- ids,
-          dir <- [@local_dir, @remote_dir],
+          dir <- [local_dir(), remote_dir()],
           s <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock"],
           do: File.rm(Path.join(dir, id <> s))
     end)
@@ -89,4 +86,7 @@ defmodule Fathom.ShardsDrainAllTest do
     conn = HealthPlug.call(Plug.Test.conn(:get, "/health"), [])
     {conn.status, conn.resp_body}
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

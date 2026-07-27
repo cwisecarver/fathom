@@ -165,8 +165,8 @@ defmodule Fathom.HranaAuthTest do
       start_supervised!({Filo.Streams, name: @streams})
 
       on_exit(fn ->
-        local = Path.join([System.tmp_dir!(), "fathom_shards", "#{shard}.db"])
-        remote = Path.join([System.tmp_dir!(), "fathom_remote_test", "#{shard}.db"])
+        local = Path.join([Fathom.Shard.data_dir(), "#{shard}.db"])
+        remote = Path.join([Fathom.Shard.Storage.Local.dir(), "#{shard}.db"])
         for base <- [local, remote], suffix <- ["", "-wal", "-shm"], do: File.rm(base <> suffix)
       end)
 
@@ -211,7 +211,7 @@ defmodule Fathom.HranaAuthTest do
 
       assert conn.status == 401
       # The refusal happened before the executor: no shard file was created.
-      refute File.exists?(Path.join([System.tmp_dir!(), "fathom_shards", "#{shard}.db"]))
+      refute File.exists?(Path.join([Fathom.Shard.data_dir(), "#{shard}.db"]))
     end
 
     test "a token for another shard is refused 401 (isolation gate, end to end)",
@@ -219,7 +219,7 @@ defmodule Fathom.HranaAuthTest do
       conn = pipeline(opts, shard, [{"authorization", "Bearer #{token!("acme")}"}])
 
       assert conn.status == 401
-      refute File.exists?(Path.join([System.tmp_dir!(), "fathom_shards", "#{shard}.db"]))
+      refute File.exists?(Path.join([Fathom.Shard.data_dir(), "#{shard}.db"]))
     end
 
     test "WebSocket hello authenticates via the jwt field (django-libsql's path)",

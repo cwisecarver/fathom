@@ -9,9 +9,6 @@ defmodule Fathom.QueryBoundsTest do
   alias Fathom.{ShardExecutor, Shards}
   alias Filo.Stmt
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     shard = "qb_#{System.unique_integer([:positive])}"
 
@@ -26,7 +23,7 @@ defmodule Fathom.QueryBoundsTest do
 
       Shards.drain(shard, 2_000)
 
-      for dir <- [@local_dir, @remote_dir],
+      for dir <- [local_dir(), remote_dir()],
           path <- Path.wildcard(Path.join(dir, "#{shard}*")),
           do: File.rm(path)
     end)
@@ -129,8 +126,8 @@ defmodule Fathom.QueryBoundsTest do
   # Reproduced at the Connection level (the Hrana stack above it only supplies the sub-binary).
   # Pre-fix the 1 MiB parent stays referenced after GC; post-fix only the small copy survives.
   test "the statement cache does not pin the binary its SQL was sliced from", %{shard: shard} do
-    path = Path.join(@local_dir, "#{shard}.db")
-    File.mkdir_p!(@local_dir)
+    path = Path.join(local_dir(), "#{shard}.db")
+    File.mkdir_p!(local_dir())
     {:ok, conn} = Fathom.Shard.Connection.open(path)
 
     # Must be >=64 bytes or ERTS copies the slice onto the process heap instead of making a
@@ -293,4 +290,7 @@ defmodule Fathom.QueryBoundsTest do
     assert {:ok, h2} = ShardExecutor.open(shard)
     :ok = ShardExecutor.close(h2)
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

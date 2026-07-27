@@ -7,9 +7,6 @@ defmodule Fathom.TemplateCaptureTest do
   alias Fathom.{Migrator, ShardExecutor}
   alias Filo.Stmt
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     shard = "template_#{System.unique_integer([:positive])}"
     prev = Application.get_env(:fathom, :template_shard_id)
@@ -20,7 +17,7 @@ defmodule Fathom.TemplateCaptureTest do
         do: Application.put_env(:fathom, :template_shard_id, prev),
         else: Application.delete_env(:fathom, :template_shard_id)
 
-      for dir <- [@local_dir, @remote_dir],
+      for dir <- [local_dir(), remote_dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".lock"],
           do: File.rm(Path.join(dir, shard <> suffix))
     end)
@@ -71,9 +68,9 @@ defmodule Fathom.TemplateCaptureTest do
     # local `<other>.db` from a prior run would be treated as an authoritative warm
     # restart (present local copy wins) and its existing `django_migrations` table
     # would fail this test's CREATE with "table already exists". The template on_exit
-    # already cleans both dirs; this one previously cleaned only @remote_dir.
+    # already cleans both dirs; this one previously cleaned only remote_dir().
     on_exit(fn ->
-      for dir <- [@local_dir, @remote_dir],
+      for dir <- [local_dir(), remote_dir()],
           s <- [".db", ".db-wal", ".db-shm", ".lock"],
           do: File.rm(Path.join(dir, other <> s))
     end)
@@ -94,4 +91,7 @@ defmodule Fathom.TemplateCaptureTest do
 
     ShardExecutor.close(conn)
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

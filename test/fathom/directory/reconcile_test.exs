@@ -12,8 +12,6 @@ defmodule Fathom.Directory.ReconcileTest do
   alias Fathom.Directory.Reconcile
   alias Fathom.Shard.{Connection, Storage}
 
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   defp uniq, do: "recon_#{System.unique_integer([:positive])}"
 
   # Build a real SQLite file at `user_version` and push it as the shard's stored object (no
@@ -30,10 +28,10 @@ defmodule Fathom.Directory.ReconcileTest do
 
   defp cleanup(shard) do
     for s <- [".db", ".db-wal", ".db-shm", ".lock"],
-        do: File.rm(Path.join(@remote_dir, shard <> s))
+        do: File.rm(Path.join(remote_dir(), shard <> s))
 
-    File.rm(Path.join([@remote_dir, "tokenfloors", shard]))
-    File.rm(Path.join([@remote_dir, "tombstones", shard]))
+    File.rm(Path.join([remote_dir(), "tokenfloors", shard]))
+    File.rm(Path.join([remote_dir(), "tombstones", shard]))
   end
 
   test "aligns directory schema_version to the file's user_version; dry run reports, --fix applies (#6)" do
@@ -88,4 +86,6 @@ defmodule Fathom.Directory.ReconcileTest do
     _ = Reconcile.run(fix: true)
     assert {:ok, %{status: "deleted"}} = Directory.get(shard)
   end
+
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

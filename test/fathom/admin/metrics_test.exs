@@ -30,9 +30,6 @@ defmodule Fathom.Admin.MetricsTest do
   alias Fathom.{ShardExecutor, Shards}
   alias Filo.Stmt
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     prev = Application.get_env(:fathom, :metrics_collector)
     prev_idle = Application.get_env(:fathom, :shard_idle_ms)
@@ -56,11 +53,11 @@ defmodule Fathom.Admin.MetricsTest do
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
 
   defp clean_shard(id) do
-    for base <- [Path.join(@local_dir, "#{id}.db"), Path.join(@remote_dir, "#{id}.db")],
+    for base <- [Path.join(local_dir(), "#{id}.db"), Path.join(remote_dir(), "#{id}.db")],
         suffix <- ["", "-wal", "-shm"],
         do: File.rm(base <> suffix)
 
-    File.rm(Path.join(@remote_dir, "#{id}.lock"))
+    File.rm(Path.join(remote_dir(), "#{id}.lock"))
   end
 
   # Named-function telemetry handler (no anonymous-fun perf warning) forwarding to the test pid.
@@ -363,4 +360,7 @@ defmodule Fathom.Admin.MetricsTest do
     assert_receive {:usage_poll_started, task_pid2}, 1_000
     send(task_pid2, :release)
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

@@ -12,16 +12,14 @@ defmodule Fathom.Tenants.TombstonesDrTest do
   alias Fathom.Shard.Storage
   alias Fathom.Tenants.Tombstones
 
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     id = "tomb_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      File.rm(Path.join([@remote_dir, "tombstones", id]))
+      File.rm(Path.join([remote_dir(), "tombstones", id]))
 
       for s <- [".db", ".db-wal", ".db-shm", ".lock"],
-          do: File.rm(Path.join(@remote_dir, id <> s))
+          do: File.rm(Path.join(remote_dir(), id <> s))
     end)
 
     %{id: id}
@@ -34,9 +32,9 @@ defmodule Fathom.Tenants.TombstonesDrTest do
 
     # A full erasure of the tenant must NOT sweep the tombstone marker — it lives in a distinct
     # `tombstones/` namespace, so a delete-job retry (which re-runs purge_shard) can't erase the proof.
-    File.write!(Path.join(@remote_dir, id <> ".db"), "data")
+    File.write!(Path.join(remote_dir(), id <> ".db"), "data")
     assert :ok = Storage.purge_shard(id)
-    refute File.exists?(Path.join(@remote_dir, id <> ".db")), "purge must erase the live object"
+    refute File.exists?(Path.join(remote_dir(), id <> ".db")), "purge must erase the live object"
 
     assert {:ok, ids2} = Storage.tombstoned_ids()
     assert id in ids2, "the tombstone marker must outlive a full purge"
@@ -84,4 +82,6 @@ defmodule Fathom.Tenants.TombstonesDrTest do
         end
     end
   end
+
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

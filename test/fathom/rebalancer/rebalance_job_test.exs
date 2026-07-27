@@ -145,7 +145,7 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
     Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
 
     shard = "recon_held_#{System.unique_integer([:positive])}"
-    lock = Path.join([System.tmp_dir!(), "fathom_remote_test", shard <> ".lock"])
+    lock = Path.join([Fathom.Shard.Storage.Local.dir(), shard <> ".lock"])
     on_exit(fn -> File.rm(lock) end)
 
     # n1 beats; "ghost" does NOT beat but HOLDS the shard's S3 lease (its data plane is alive).

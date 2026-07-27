@@ -226,7 +226,7 @@ defmodule FathomWeb.Api.TenantControllerTest do
         Shards.drain(sid, 2_000)
         Storage.purge_shard(sid)
 
-        for path <- Path.wildcard(Path.join([System.tmp_dir!(), "fathom_shards", "#{sid}*"])),
+        for path <- Path.wildcard(Path.join([Fathom.Shard.data_dir(), "#{sid}*"])),
             do: File.rm(path)
       end)
 
@@ -301,7 +301,7 @@ defmodule FathomWeb.Api.TenantControllerTest do
 
       # Another node steals the lease; the force-flush of 'b' fences and errors instead of flushing.
       File.write!(
-        Path.join([System.tmp_dir!(), "fathom_remote_test", "#{sid}.lock"]),
+        Path.join([Fathom.Shard.Storage.Local.dir(), "#{sid}.lock"]),
         Jason.encode!(%{
           "owner" => "thief@node",
           "epoch" => 999,

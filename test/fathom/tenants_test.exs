@@ -13,8 +13,6 @@ defmodule Fathom.TenantsTest do
   alias Fathom.Tenants.{DeleteJob, Suspensions, Tombstones}
   alias Filo.Stmt
 
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     id = "ten_#{System.unique_integer([:positive])}"
 
@@ -25,7 +23,7 @@ defmodule Fathom.TenantsTest do
       Shards.drain(id, 2_000)
       Storage.purge_shard(id)
 
-      for path <- Path.wildcard(Path.join([System.tmp_dir!(), "fathom_shards", "#{id}*"])),
+      for path <- Path.wildcard(Path.join([Fathom.Shard.data_dir(), "#{id}*"])),
           do: File.rm(path)
     end)
 
@@ -65,8 +63,8 @@ defmodule Fathom.TenantsTest do
 
       assert {:ok, nil} == Storage.object_etag(id)
       assert {:ok, []} == Snapshots.list(id)
-      refute File.exists?(Path.join(@remote_dir, "#{id}@1.db"))
-      refute File.exists?(Path.join(@remote_dir, "#{id}.lock"))
+      refute File.exists?(Path.join(remote_dir(), "#{id}@1.db"))
+      refute File.exists?(Path.join(remote_dir(), "#{id}.lock"))
     end
 
     # The regression: purging a shard that is ACTIVELY SERVED must force-stop its coordinator
@@ -149,8 +147,8 @@ defmodule Fathom.TenantsTest do
 
     # #22: a corrupt stored object must never be handed to the tenant as a "complete" export.
     test "refuses to export a corrupt stored object (integrity check)", %{id: id} do
-      File.mkdir_p!(@remote_dir)
-      File.write!(Path.join(@remote_dir, "#{id}.db"), "definitely not a sqlite database")
+      File.mkdir_p!(remote_dir())
+      File.write!(Path.join(remote_dir(), "#{id}.db"), "definitely not a sqlite database")
 
       assert {:error, {:corrupt_export, _}} = Tenants.export(id, flush: false)
     end
@@ -193,7 +191,7 @@ defmodule Fathom.TenantsTest do
         Shards.drain(dst, 2_000)
         Storage.purge_shard(dst)
 
-        for path <- Path.wildcard(Path.join([System.tmp_dir!(), "fathom_shards", "#{dst}*"])),
+        for path <- Path.wildcard(Path.join([Fathom.Shard.data_dir(), "#{dst}*"])),
             do: File.rm(path)
       end)
 
@@ -296,7 +294,7 @@ defmodule Fathom.TenantsTest do
         Shards.drain(dst, 2_000)
         Storage.purge_shard(dst)
 
-        for path <- Path.wildcard(Path.join([System.tmp_dir!(), "fathom_shards", "#{dst}*"])),
+        for path <- Path.wildcard(Path.join([Fathom.Shard.data_dir(), "#{dst}*"])),
             do: File.rm(path)
       end)
 
@@ -496,4 +494,6 @@ defmodule Fathom.TenantsTest do
       :done -> Enum.reverse(acc)
     end
   end
+
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

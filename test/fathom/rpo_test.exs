@@ -17,9 +17,6 @@ defmodule Fathom.RpoTest do
   alias Fathom.Shard.{Connection, Storage}
   alias Filo.Stmt
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     shard = "rpo_#{System.unique_integer([:positive])}"
     prev_flush = Application.get_env(:fathom, :shard_flush_interval_ms)
@@ -29,11 +26,11 @@ defmodule Fathom.RpoTest do
       restore(:shard_flush_interval_ms, prev_flush)
       restore(:shard_idle_ms, prev_idle)
 
-      for dir <- [@local_dir, @remote_dir],
+      for dir <- [local_dir(), remote_dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".lock"],
           do: File.rm(Path.join(dir, shard <> suffix))
 
-      for f <- Path.wildcard(Path.join(@local_dir, "#{shard}.db.*")), do: File.rm(f)
+      for f <- Path.wildcard(Path.join(local_dir(), "#{shard}.db.*")), do: File.rm(f)
     end)
 
     %{shard: shard}
@@ -171,4 +168,7 @@ defmodule Fathom.RpoTest do
     _ = Shards.drain(shard, 5_000)
     :ok
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

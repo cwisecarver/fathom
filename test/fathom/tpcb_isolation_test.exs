@@ -164,8 +164,9 @@ defmodule Fathom.TpcbIsolationTest do
   end
 
   defp rm_shard(id) do
-    for dir <- ["fathom_shards", "fathom_remote_test"], s <- ["", "-wal", "-shm"] do
-      File.rm(Path.join([System.tmp_dir!(), dir, "#{id}.db"]) <> s)
+    for dir <- [Fathom.Shard.data_dir(), Fathom.Shard.Storage.Local.dir()],
+        s <- ["", "-wal", "-shm"] do
+      File.rm(Path.join([dir, "#{id}.db"]) <> s)
     end
   end
 end

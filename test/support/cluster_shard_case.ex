@@ -19,9 +19,6 @@ defmodule Fathom.ClusterShardCase do
   alias Fathom.Shard.Storage
   alias Filo.{Stmt, StmtResult}
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   using do
     quote do
       import Fathom.ClusterShardCase
@@ -54,7 +51,7 @@ defmodule Fathom.ClusterShardCase do
     shard = "cluster_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      for dir <- [@local_dir, @remote_dir],
+      for dir <- [local_dir(), remote_dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".lock"],
           do: File.rm(Path.join(dir, shard <> suffix))
     end)
@@ -80,13 +77,13 @@ defmodule Fathom.ClusterShardCase do
   def stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
 
   def now_ms, do: System.system_time(:millisecond)
-  def local_db(shard), do: Path.join(@local_dir, "#{shard}.db")
-  def remote_db(shard), do: Path.join(@remote_dir, "#{shard}.db")
-  def lock_file(shard), do: Path.join(@remote_dir, "#{shard}.lock")
+  def local_db(shard), do: Path.join(local_dir(), "#{shard}.db")
+  def remote_db(shard), do: Path.join(remote_dir(), "#{shard}.db")
+  def lock_file(shard), do: Path.join(remote_dir(), "#{shard}.lock")
 
   @doc "Write a lock file directly to simulate another node's lease (live or expired)."
   def put_raw_lock(shard, owner, epoch, expires_at_ms) do
-    File.mkdir_p!(@remote_dir)
+    File.mkdir_p!(remote_dir())
 
     File.write!(
       lock_file(shard),
@@ -121,4 +118,7 @@ defmodule Fathom.ClusterShardCase do
     assert_receive {:DOWN, ^ref, :process, ^coordinator, :normal}, 2_000
     result
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

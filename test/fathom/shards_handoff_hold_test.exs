@@ -17,9 +17,6 @@ defmodule Fathom.ShardsHandoffHoldTest do
   alias Fathom.Shard.Storage
   alias Filo.Stmt
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     shard = "handoff_#{System.unique_integer([:positive])}"
     prev_idle = Application.get_env(:fathom, :shard_idle_ms)
@@ -39,7 +36,7 @@ defmodule Fathom.ShardsHandoffHoldTest do
       Storage.clear_heartbeat("dead@node#1")
       Storage.clear_heartbeat("live@node#1")
 
-      for dir <- [@local_dir, @remote_dir],
+      for dir <- [local_dir(), remote_dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock"],
           do: File.rm(Path.join(dir, shard <> suffix))
     end)
@@ -51,11 +48,11 @@ defmodule Fathom.ShardsHandoffHoldTest do
   defp restore(k, v), do: Application.put_env(:fathom, k, v)
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
-  defp lock_file(shard), do: Path.join(@remote_dir, "#{shard}.lock")
+  defp lock_file(shard), do: Path.join(remote_dir(), "#{shard}.lock")
   defp now_ms, do: System.system_time(:millisecond)
 
   defp put_live_foreign_lock(shard, owner) do
-    File.mkdir_p!(@remote_dir)
+    File.mkdir_p!(remote_dir())
 
     File.write!(
       lock_file(shard),
@@ -177,4 +174,7 @@ defmodule Fathom.ShardsHandoffHoldTest do
     assert {:error, {:shard_held, "live@node#1"}} = result
     assert us < 2_000_000, "a live holder must not enter the crash-hold budget (#{us} us)"
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

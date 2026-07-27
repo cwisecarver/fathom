@@ -29,8 +29,6 @@ defmodule Fathom.Shard.StealTouchWarmStandbyTest do
   alias Fathom.Test.S3EtagStore
   alias Filo.{Stmt, StmtResult}
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-
   setup do
     shard = "steal_warm_#{System.unique_integer([:positive])}"
     prev_storage = Application.get_env(:fathom, :shard_storage)
@@ -45,7 +43,7 @@ defmodule Fathom.Shard.StealTouchWarmStandbyTest do
         do: Application.put_env(:fathom, S3, prev_s3),
         else: Application.delete_env(:fathom, S3)
 
-      for f <- Path.wildcard(Path.join(@local_dir, "#{shard}*")), do: File.rm_rf(f)
+      for f <- Path.wildcard(Path.join(local_dir(), "#{shard}*")), do: File.rm_rf(f)
     end)
 
     %{shard: shard}
@@ -168,7 +166,7 @@ defmodule Fathom.Shard.StealTouchWarmStandbyTest do
       # The provenance sidecar is stamped to the post-touch etag, so a later warm
       # restart fences with the store's real etag instead of self-fencing on its first
       # flush (or needlessly quarantining + re-pulling).
-      assert File.read!(Path.join(@local_dir, "#{shard}.db.etag")) == post_etag,
+      assert File.read!(Path.join(local_dir(), "#{shard}.db.etag")) == post_etag,
              "the adopted post-touch etag must be persisted as the local provenance"
 
       {:ok, coordinator} = Shards.ensure(shard)
@@ -183,4 +181,6 @@ defmodule Fathom.Shard.StealTouchWarmStandbyTest do
       end
     end)
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
 end

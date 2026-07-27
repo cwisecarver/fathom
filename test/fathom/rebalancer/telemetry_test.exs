@@ -142,7 +142,7 @@ defmodule Fathom.Rebalancer.TelemetryTest do
 
     on_exit(fn ->
       for suffix <- ["", "-wal", "-shm"] do
-        File.rm(Path.join([System.tmp_dir!(), "fathom_shards", "#{shard}.db"]) <> suffix)
+        File.rm(Path.join([Fathom.Shard.data_dir(), "#{shard}.db"]) <> suffix)
       end
     end)
 

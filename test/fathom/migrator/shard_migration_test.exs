@@ -9,8 +9,6 @@ defmodule Fathom.Migrator.ShardMigrationTest do
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.{Directory, Migrator}
 
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   @v2_statements [
     "ALTER TABLE app_thing ADD COLUMN created_at TEXT",
     "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0002_add_created_at', 'now')"
@@ -20,9 +18,9 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     shard = "mig_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      for path <- Path.wildcard(Path.join(@remote_dir, "#{shard}*")), do: File.rm(path)
+      for path <- Path.wildcard(Path.join(remote_dir(), "#{shard}*")), do: File.rm(path)
 
-      for path <- Path.wildcard(Path.join([System.tmp_dir!(), "fathom_shards", "#{shard}*"])),
+      for path <- Path.wildcard(Path.join([Fathom.Shard.data_dir(), "#{shard}*"])),
           do: File.rm(path)
     end)
 
@@ -72,7 +70,7 @@ defmodule Fathom.Migrator.ShardMigrationTest do
   end
 
   defp retained?(shard, version),
-    do: File.exists?(Path.join(@remote_dir, "#{shard}@#{version}.db"))
+    do: File.exists?(Path.join(remote_dir(), "#{shard}@#{version}.db"))
 
   # Apply `sql` to the live object and flush it back — simulate a tenant write on the live version.
   defp write_live!(shard, sql) do
@@ -89,7 +87,7 @@ defmodule Fathom.Migrator.ShardMigrationTest do
 
   # Query a retained version object (`<shard>@<version>.db`) via a throwaway copy.
   defp query_version!(shard, version, sql) do
-    src = Path.join(@remote_dir, "#{shard}@#{version}.db")
+    src = Path.join(remote_dir(), "#{shard}@#{version}.db")
 
     tmp =
       Path.join(
@@ -481,7 +479,7 @@ defmodule Fathom.Migrator.ShardMigrationTest do
 
     # A new owner flushes different bytes to the live object during the migrator's flush,
     # after its lock-fence passed — changing the object etag but NOT the lock.
-    overwrite = fn -> File.write!(Path.join(@remote_dir, "#{shard}.db"), "new-owner-bytes") end
+    overwrite = fn -> File.write!(Path.join(remote_dir(), "#{shard}.db"), "new-owner-bytes") end
     Application.put_env(:fathom, :faulty_before, {:flush, overwrite})
 
     on_exit(fn ->
@@ -495,7 +493,7 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     # Pre-fix: the unconditional PUT clobbered the object with the migrated v2.
     assert {:error, :superseded} = ShardMigration.run(shard, 2)
 
-    assert File.read!(Path.join(@remote_dir, "#{shard}.db")) == "new-owner-bytes",
+    assert File.read!(Path.join(remote_dir(), "#{shard}.db")) == "new-owner-bytes",
            "the migrator must not clobber the new owner's object"
   end
 
@@ -520,7 +518,7 @@ defmodule Fathom.Migrator.ShardMigrationTest do
 
     # A new owner flushes different bytes to the live object during the migrator's restore, after
     # its lock-fence (and the retain backup) passed — changing the object etag but NOT the lock.
-    overwrite = fn -> File.write!(Path.join(@remote_dir, "#{shard}.db"), "new-owner-bytes") end
+    overwrite = fn -> File.write!(Path.join(remote_dir(), "#{shard}.db"), "new-owner-bytes") end
     Application.put_env(:fathom, :faulty_before, {:restore, overwrite})
 
     on_exit(fn ->
@@ -536,7 +534,7 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert {:error, :superseded} =
              ShardMigration.revert(shard, 1, "revert-fence-token", force: true)
 
-    assert File.read!(Path.join(@remote_dir, "#{shard}.db")) == "new-owner-bytes",
+    assert File.read!(Path.join(remote_dir(), "#{shard}.db")) == "new-owner-bytes",
            "the migrator must not clobber the new owner's object on revert"
   end
 
@@ -569,10 +567,10 @@ defmodule Fathom.Migrator.ShardMigrationTest do
   # migrator's check_lease reports :superseded. No heartbeat needed — check_lease compares the
   # lock, not liveness.
   defp write_thief_lock(shard) do
-    File.mkdir_p!(@remote_dir)
+    File.mkdir_p!(remote_dir())
 
     File.write!(
-      Path.join(@remote_dir, "#{shard}.lock"),
+      Path.join(remote_dir(), "#{shard}.lock"),
       Jason.encode!(%{
         "owner" => "thief@node",
         "epoch" => 999,
@@ -580,4 +578,6 @@ defmodule Fathom.Migrator.ShardMigrationTest do
       })
     )
   end
+
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

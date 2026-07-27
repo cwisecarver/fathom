@@ -8,14 +8,11 @@ defmodule Fathom.ShardDrainTest do
   alias Fathom.Shard.Connection
   alias Filo.{Error, Stmt}
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     shard = "drain_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      for dir <- [@local_dir, @remote_dir],
+      for dir <- [local_dir(), remote_dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".lock"],
           do: File.rm(Path.join(dir, shard <> suffix))
     end)
@@ -24,9 +21,9 @@ defmodule Fathom.ShardDrainTest do
   end
 
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
-  defp local_db(shard), do: Path.join(@local_dir, "#{shard}.db")
-  defp remote_db(shard), do: Path.join(@remote_dir, "#{shard}.db")
-  defp lock_file(shard), do: Path.join(@remote_dir, "#{shard}.lock")
+  defp local_db(shard), do: Path.join(local_dir(), "#{shard}.db")
+  defp remote_db(shard), do: Path.join(remote_dir(), "#{shard}.db")
+  defp lock_file(shard), do: Path.join(remote_dir(), "#{shard}.lock")
 
   test "drain on a shard with no coordinator is a no-op", %{shard: shard} do
     assert Shards.drain(shard) == :ok
@@ -204,4 +201,7 @@ defmodule Fathom.ShardDrainTest do
 
     ShardExecutor.close(conn)
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

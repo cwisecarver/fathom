@@ -51,7 +51,7 @@ defmodule Fathom.BenchTest do
     on_exit(fn ->
       Fathom.Shards.drain(shard, 2_000)
 
-      for p <- Path.wildcard(Path.join(System.tmp_dir!(), "fathom_shards/#{shard}*")),
+      for p <- Path.wildcard(Path.join(Fathom.Shard.data_dir(), "#{shard}*")),
           do: File.rm(p)
     end)
 

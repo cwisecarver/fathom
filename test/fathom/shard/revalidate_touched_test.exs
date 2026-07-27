@@ -50,8 +50,6 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
   alias Fathom.Test.S3EtagStore
   alias Filo.{Stmt, StmtResult}
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-
   setup do
     shard = "reval_touched_#{System.unique_integer([:positive])}"
     prev_storage = Application.get_env(:fathom, :shard_storage)
@@ -73,7 +71,7 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
       restore(:shard_flush_interval_ms, prev_flush)
       restore(:shard_idle_ms, prev_idle)
 
-      for f <- Path.wildcard(Path.join(@local_dir, "#{shard}*")), do: File.rm_rf(f)
+      for f <- Path.wildcard(Path.join(local_dir(), "#{shard}*")), do: File.rm_rf(f)
     end)
 
     %{shard: shard}
@@ -117,7 +115,7 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
     path
   end
 
-  defp local_path(shard), do: Path.join(@local_dir, "#{shard}.db")
+  defp local_path(shard), do: Path.join(local_dir(), "#{shard}.db")
   defp sidecar_path(shard), do: local_path(shard) <> ".etag"
   defp forked_files(shard), do: Path.wildcard(local_path(shard) <> ".forked.*")
 
@@ -579,4 +577,6 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
       drain(shard)
     end)
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
 end

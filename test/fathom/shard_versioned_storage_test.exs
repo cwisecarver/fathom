@@ -5,21 +5,19 @@ defmodule Fathom.ShardVersionedStorageTest do
 
   alias Fathom.Shard.Storage
 
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     shard = "ver_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
       File.rm(live(shard))
-      for path <- Path.wildcard(Path.join(@remote_dir, "#{shard}@*.db")), do: File.rm(path)
+      for path <- Path.wildcard(Path.join(remote_dir(), "#{shard}@*.db")), do: File.rm(path)
     end)
 
     %{shard: shard}
   end
 
-  defp live(shard), do: Path.join(@remote_dir, "#{shard}.db")
-  defp versioned(shard, v), do: Path.join(@remote_dir, "#{shard}@#{v}.db")
+  defp live(shard), do: Path.join(remote_dir(), "#{shard}.db")
+  defp versioned(shard, v), do: Path.join(remote_dir(), "#{shard}@#{v}.db")
 
   defp write_remote!(path, content) do
     File.mkdir_p!(Path.dirname(path))
@@ -58,4 +56,6 @@ defmodule Fathom.ShardVersionedStorageTest do
 
     assert File.read!(live(shard)) == "old"
   end
+
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

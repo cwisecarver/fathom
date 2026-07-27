@@ -16,9 +16,6 @@ defmodule Fathom.Shards.LruEvictionTest do
   alias Fathom.Test.FaultyStorage
   alias Filo.Stmt
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     prev_cap = Application.get_env(:fathom, :max_open_shards)
     prev_evict = Application.get_env(:fathom, :evict_idle_at_capacity)
@@ -29,7 +26,7 @@ defmodule Fathom.Shards.LruEvictionTest do
       restore(:evict_idle_at_capacity, prev_evict)
       Lru.reset()
 
-      for dir <- [@local_dir, @remote_dir],
+      for dir <- [local_dir(), remote_dir()],
           path <- Path.wildcard(Path.join(dir, "lru_*")),
           do: File.rm(path)
     end)
@@ -293,4 +290,7 @@ defmodule Fathom.Shards.LruEvictionTest do
     _ = :sys.get_state(pid)
     pid
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

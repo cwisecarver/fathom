@@ -7,8 +7,6 @@ defmodule Fathom.Migrator.RolloutTest do
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Directory
 
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   describe "rollout/1" do
     test "enqueues a migration job for each active shard behind HEAD" do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
@@ -425,7 +423,7 @@ defmodule Fathom.Migrator.RolloutTest do
       shard = "revert_#{System.unique_integer([:positive])}"
 
       on_exit(fn ->
-        for p <- Path.wildcard(Path.join(@remote_dir, "#{shard}*")), do: File.rm(p)
+        for p <- Path.wildcard(Path.join(remote_dir(), "#{shard}*")), do: File.rm(p)
       end)
 
       seed_v1!(shard)
@@ -456,4 +454,6 @@ defmodule Fathom.Migrator.RolloutTest do
     {:ok, _} = Directory.cutover(shard, 1)
     :ok
   end
+
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

@@ -24,8 +24,6 @@ defmodule Fathom.Shard.WarmTakeoverLineageTest do
 
   import ExUnit.CaptureLog
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-
   setup do
     shard = "lineage_#{System.unique_integer([:positive])}"
     prev_storage = Application.get_env(:fathom, :shard_storage)
@@ -46,7 +44,7 @@ defmodule Fathom.Shard.WarmTakeoverLineageTest do
         do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
         else: Application.delete_env(:fathom, :shard_idle_ms)
 
-      for f <- Path.wildcard(Path.join(@local_dir, "#{shard}*")), do: File.rm_rf(f)
+      for f <- Path.wildcard(Path.join(local_dir(), "#{shard}*")), do: File.rm_rf(f)
     end)
 
     %{shard: shard}
@@ -126,8 +124,8 @@ defmodule Fathom.Shard.WarmTakeoverLineageTest do
 
     # This node's warm local file: a DIVERGED lineage (its own un-flushed write)
     # whose provenance sidecar honestly says it derives from the base object.
-    local = Path.join(@local_dir, "#{shard}.db")
-    File.mkdir_p!(@local_dir)
+    local = Path.join(local_dir(), "#{shard}.db")
+    File.mkdir_p!(local_dir())
     File.write!(local, base_bytes)
     {:ok, lc} = Connection.open(local)
     :ok = Connection.exec(lc, "INSERT INTO kv VALUES ('a-fork')")
@@ -170,4 +168,6 @@ defmodule Fathom.Shard.WarmTakeoverLineageTest do
   end
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
+
+  defp local_dir, do: Fathom.Shard.data_dir()
 end

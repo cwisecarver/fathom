@@ -30,8 +30,8 @@ defmodule Fathom.OrphanStreamTest do
       )
 
     on_exit(fn ->
-      local = Path.join([System.tmp_dir!(), "fathom_shards", "#{shard}.db"])
-      remote = Path.join([System.tmp_dir!(), "fathom_remote_test", "#{shard}.db"])
+      local = Path.join([Fathom.Shard.data_dir(), "#{shard}.db"])
+      remote = Path.join([Fathom.Shard.Storage.Local.dir(), "#{shard}.db"])
       for base <- [local, remote], suffix <- ["", "-wal", "-shm"], do: File.rm(base <> suffix)
     end)
 

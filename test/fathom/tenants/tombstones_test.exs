@@ -11,9 +11,6 @@ defmodule Fathom.Tenants.TombstonesTest do
   alias Fathom.Tenants
   alias Fathom.Tenants.Tombstones
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     id = "tomb_#{System.unique_integer([:positive])}"
 
@@ -23,7 +20,7 @@ defmodule Fathom.Tenants.TombstonesTest do
       :ets.delete(Tombstones, id)
       Shards.drain(id, 2_000)
 
-      for dir <- [@local_dir, @remote_dir],
+      for dir <- [local_dir(), remote_dir()],
           path <- Path.wildcard(Path.join(dir, "#{id}*")),
           do: File.rm(path)
     end)
@@ -57,4 +54,7 @@ defmodule Fathom.Tenants.TombstonesTest do
     assert Tenants.tombstoned?(id)
     assert {:error, :shard_tombstoned} = Shards.checkout(id)
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

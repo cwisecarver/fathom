@@ -90,12 +90,12 @@ defmodule Fathom.Shard.StoragePurgeTest do
 
   defp flush!(shard), do: :ok = Shards.drain(shard, 5_000)
 
-  defp remote_dir, do: Application.get_env(:fathom, Fathom.Shard.Storage.Local)[:dir]
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
   defp remote(id, suffix), do: Path.join(remote_dir(), "#{id}#{suffix}")
 
   defp rm_local(id) do
     for suffix <- ["", "-wal", "-shm"] do
-      File.rm(Path.join([System.tmp_dir!(), "fathom_shards", "#{id}.db"]) <> suffix)
+      File.rm(Path.join([Fathom.Shard.data_dir(), "#{id}.db"]) <> suffix)
     end
   end
 end

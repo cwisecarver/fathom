@@ -11,9 +11,6 @@ defmodule Fathom.ShardLeaseTest do
   alias Fathom.Shard.Storage
   alias Filo.Stmt
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     shard = "lease_#{System.unique_integer([:positive])}"
 
@@ -24,14 +21,14 @@ defmodule Fathom.ShardLeaseTest do
       restore(:shard_idle_ms, prev_idle)
       restore(:shard_lease_ttl_ms, prev_ttl)
 
-      for dir <- [@local_dir, @remote_dir],
+      for dir <- [local_dir(), remote_dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".lock"],
           do: File.rm(Path.join(dir, shard <> suffix))
 
       # Heartbeats are keyed by owner (not shard); drop the simulated foreign nodes'.
       # Owner is percent-encoded in the path (round-2 #3).
       for owner <- ["a@node", "b@node", "thief@node"],
-          do: File.rm(Path.join([@remote_dir, "heartbeats", URI.encode_www_form(owner)]))
+          do: File.rm(Path.join([remote_dir(), "heartbeats", URI.encode_www_form(owner)]))
     end)
 
     %{shard: shard}
@@ -43,13 +40,13 @@ defmodule Fathom.ShardLeaseTest do
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
 
   defp now_ms, do: System.system_time(:millisecond)
-  defp local_db(shard), do: Path.join(@local_dir, "#{shard}.db")
-  defp remote_db(shard), do: Path.join(@remote_dir, "#{shard}.db")
-  defp lock_file(shard), do: Path.join(@remote_dir, "#{shard}.lock")
+  defp local_db(shard), do: Path.join(local_dir(), "#{shard}.db")
+  defp remote_db(shard), do: Path.join(remote_dir(), "#{shard}.db")
+  defp lock_file(shard), do: Path.join(remote_dir(), "#{shard}.lock")
 
   # Write a lock file directly to simulate another node's lease.
   defp put_raw_lock(shard, owner, epoch, expires_at_ms) do
-    File.mkdir_p!(@remote_dir)
+    File.mkdir_p!(remote_dir())
 
     File.write!(
       lock_file(shard),
@@ -60,7 +57,7 @@ defmodule Fathom.ShardLeaseTest do
   # Write a heartbeat directly to simulate another node being alive (liveness is the
   # per-node heartbeat now, not the lock's TTL).
   defp put_raw_heartbeat(owner, expires_at_ms) do
-    dir = Path.join(@remote_dir, "heartbeats")
+    dir = Path.join(remote_dir(), "heartbeats")
     File.mkdir_p!(dir)
 
     # Encode the owner to match the backend's heartbeat_path (round-2 #3).
@@ -86,7 +83,7 @@ defmodule Fathom.ShardLeaseTest do
     assert {:held, "a@node"} = Storage.lease_holder(shard)
 
     # An expired lock past the steal margin with no fresh heartbeat → dead → free (stealable).
-    File.rm(Path.join([@remote_dir, "heartbeats", URI.encode_www_form("a@node")]))
+    File.rm(Path.join([remote_dir(), "heartbeats", URI.encode_www_form("a@node")]))
     put_raw_lock(shard, "a@node", 1, now_ms() - 60_000)
     assert Storage.lease_holder(shard) == :free
 
@@ -156,7 +153,7 @@ defmodule Fathom.ShardLeaseTest do
     # init overlaps the lease acquire with the pull (into a temp file). With an
     # object in storage AND a foreign live lease, the refused start must leave NO
     # local copy or temp — a stale local file would wrongly win on a later open.
-    File.mkdir_p!(@remote_dir)
+    File.mkdir_p!(remote_dir())
     File.write!(remote_db(shard), "sqlite-ish bytes")
     put_raw_lock(shard, "thief@node", 3, now_ms() + 60_000)
     put_raw_heartbeat("thief@node", now_ms() + 60_000)
@@ -286,4 +283,7 @@ defmodule Fathom.ShardLeaseTest do
     refute File.exists?(remote_db(shard)),
            "the deferred revalidation must still self-fence without flushing"
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

@@ -700,7 +700,11 @@ defmodule Fathom.Shard.Storage.Local do
   # URI fragment there).
   defp heartbeat_path(owner), do: Path.join([dir(), "heartbeats", URI.encode_www_form(owner)])
 
-  defp dir do
+  # Public (@doc false) for the same reason as `Fathom.Shard.data_dir/0`: the test suite and
+  # `test_helper.exs` sweep the same directory this backend writes into, and duplicating the
+  # config/default at each of those sites is how they drift apart.
+  @doc false
+  def dir do
     Application.get_env(:fathom, __MODULE__, [])[:dir] ||
       Path.join(System.tmp_dir!(), "fathom_remote")
   end

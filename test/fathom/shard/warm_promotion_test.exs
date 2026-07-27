@@ -19,9 +19,6 @@ defmodule Fathom.Shard.WarmPromotionTest do
   alias Fathom.Shard.{Connection, Storage, WarmFollower}
   alias Filo.{Stmt, StmtResult}
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     prev_idle = Application.get_env(:fathom, :shard_idle_ms)
     prev_flush = Application.get_env(:fathom, :shard_flush_interval_ms)
@@ -43,11 +40,11 @@ defmodule Fathom.Shard.WarmPromotionTest do
       restore(:warm_cache_dir, prev_cache)
       File.rm_rf!(cache_dir)
 
-      for base <- [Path.join(@local_dir, "#{shard}.db"), Path.join(@remote_dir, "#{shard}.db")],
+      for base <- [Path.join(local_dir(), "#{shard}.db"), Path.join(remote_dir(), "#{shard}.db")],
           suffix <- ["", "-wal", "-shm"],
           do: File.rm(base <> suffix)
 
-      File.rm(Path.join(@remote_dir, "#{shard}.lock"))
+      File.rm(Path.join(remote_dir(), "#{shard}.lock"))
     end)
 
     %{shard: shard}
@@ -86,7 +83,7 @@ defmodule Fathom.Shard.WarmPromotionTest do
   # Seed a valid db directly in the LIVE data dir (stands in for this node's own
   # un-flushed writes from a prior boot — a warm *restart*, authoritative).
   defp seed_live(shard, value) do
-    path = Path.join(@local_dir, "#{shard}.db")
+    path = Path.join(local_dir(), "#{shard}.db")
     File.mkdir_p!(Path.dirname(path))
     {:ok, c} = Connection.open(path)
     :ok = Connection.exec(c, "CREATE TABLE IF NOT EXISTS kv (v TEXT)")
@@ -212,7 +209,7 @@ defmodule Fathom.Shard.WarmPromotionTest do
 
     # The acknowledged write must be durable — pre-fix the idle flush fenced with the
     # stale pre-swap etag, 412'd, and dropped the local copy without uploading.
-    {:ok, ro} = Connection.open(Path.join(@remote_dir, "#{shard}.db"))
+    {:ok, ro} = Connection.open(Path.join(remote_dir(), "#{shard}.db"))
 
     assert {:ok, %{rows: [["mine"]]}} =
              Connection.query(ro, "SELECT v FROM kv WHERE v = 'mine'", []),
@@ -234,4 +231,7 @@ defmodule Fathom.Shard.WarmPromotionTest do
     assert serve_value(shard) == "restart"
     refute_receive {:warm_promoted, _}, 300
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

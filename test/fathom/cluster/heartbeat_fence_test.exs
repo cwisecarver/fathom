@@ -11,8 +11,6 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
   alias Fathom.Shard.Heartbeat
   alias Fathom.Shard.WriteFence
 
-  @hb_file Path.join([System.tmp_dir!(), "fathom_remote_test", "heartbeats", to_string(node())])
-
   setup %{shard: shard} do
     # Idle-stop fast so the flush path runs during the test.
     Application.put_env(:fathom, :shard_idle_ms, 50)
@@ -20,7 +18,7 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
     # heartbeat mode. Long TTL so it never lapses on its own; tests force a lapse.
     hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
     _ = :sys.get_state(hb)
-    on_exit(fn -> File.rm(@hb_file) end)
+    on_exit(fn -> File.rm(hb_file()) end)
     %{shard: shard, hb: hb}
   end
 
@@ -242,4 +240,7 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
       :ok = ShardExecutor.close(conn)
     end)
   end
+
+  defp hb_file,
+    do: Path.join([Fathom.Shard.Storage.Local.dir(), "heartbeats", to_string(node())])
 end

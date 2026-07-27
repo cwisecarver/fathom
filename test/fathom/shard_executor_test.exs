@@ -12,8 +12,8 @@ defmodule Fathom.ShardExecutorTest do
     shard = "test_exec_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      local = Path.join([System.tmp_dir!(), "fathom_shards", "#{shard}.db"])
-      remote = Path.join([System.tmp_dir!(), "fathom_remote_test", "#{shard}.db"])
+      local = Path.join([Fathom.Shard.data_dir(), "#{shard}.db"])
+      remote = Path.join([Fathom.Shard.Storage.Local.dir(), "#{shard}.db"])
 
       for base <- [local, remote], suffix <- ["", "-wal", "-shm"], do: File.rm(base <> suffix)
     end)
@@ -25,8 +25,8 @@ defmodule Fathom.ShardExecutorTest do
 
   defp rm_shard_files(id) do
     for base <- [
-          Path.join([System.tmp_dir!(), "fathom_shards", "#{id}.db"]),
-          Path.join([System.tmp_dir!(), "fathom_remote_test", "#{id}.db"])
+          Path.join([Fathom.Shard.data_dir(), "#{id}.db"]),
+          Path.join([Fathom.Shard.Storage.Local.dir(), "#{id}.db"])
         ],
         suffix <- ["", "-wal", "-shm"] do
       File.rm(base <> suffix)

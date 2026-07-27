@@ -6,9 +6,6 @@ defmodule Fathom.ShardStorageTest do
   alias Fathom.{ShardExecutor, Shards}
   alias Filo.{Stmt, StmtResult}
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     prev_idle = Application.get_env(:fathom, :shard_idle_ms)
     Application.put_env(:fathom, :shard_idle_ms, 50)
@@ -20,7 +17,7 @@ defmodule Fathom.ShardStorageTest do
         do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
         else: Application.delete_env(:fathom, :shard_idle_ms)
 
-      for base <- [Path.join(@local_dir, "#{shard}.db"), Path.join(@remote_dir, "#{shard}.db")],
+      for base <- [Path.join(local_dir(), "#{shard}.db"), Path.join(remote_dir(), "#{shard}.db")],
           suffix <- ["", "-wal", "-shm"],
           do: File.rm(base <> suffix)
     end)
@@ -42,12 +39,12 @@ defmodule Fathom.ShardStorageTest do
     :ok = ShardExecutor.close(conn)
     assert_receive {:DOWN, ^ref, :process, ^coordinator, :normal}, 1000
 
-    assert File.exists?(Path.join(@remote_dir, "#{shard}.db"))
-    refute File.exists?(Path.join(@local_dir, "#{shard}.db"))
+    assert File.exists?(Path.join(remote_dir(), "#{shard}.db"))
+    refute File.exists?(Path.join(local_dir(), "#{shard}.db"))
 
     # Next wake pulls the file back from storage and the data is there.
     {:ok, conn2} = ShardExecutor.open(shard)
-    assert File.exists?(Path.join(@local_dir, "#{shard}.db"))
+    assert File.exists?(Path.join(local_dir(), "#{shard}.db"))
 
     assert {:ok, %StmtResult{rows: [["alice"]]}} =
              ShardExecutor.execute(conn2, stmt("SELECT v FROM kv WHERE k = 1"))
@@ -74,4 +71,7 @@ defmodule Fathom.ShardStorageTest do
     :ok = ShardExecutor.close(b)
     assert_receive {:DOWN, ^ref, :process, ^coordinator, :normal}, 1000
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

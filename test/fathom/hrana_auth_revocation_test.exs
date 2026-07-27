@@ -228,7 +228,7 @@ defmodule Fathom.HranaAuthRevocationTest do
     {:ok, _} = Directory.resolve(shard)
 
     on_exit(fn ->
-      File.rm(Path.join([System.tmp_dir!(), "fathom_remote_test", "tokenfloors", shard]))
+      File.rm(Path.join([Fathom.Shard.Storage.Local.dir(), "tokenfloors", shard]))
     end)
 
     assert {:ok, version} = HranaAuth.revoke(shard)
@@ -240,7 +240,7 @@ defmodule Fathom.HranaAuthRevocationTest do
     {:ok, _} = Directory.resolve(shard)
 
     on_exit(fn ->
-      File.rm(Path.join([System.tmp_dir!(), "fathom_remote_test", "tokenfloors", shard]))
+      File.rm(Path.join([Fathom.Shard.Storage.Local.dir(), "tokenfloors", shard]))
     end)
 
     {:ok, token} = HranaAuth.token_for(shard)

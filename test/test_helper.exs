@@ -9,9 +9,7 @@
 # `tombstones/ten_<N>` from a previous run collides with a fresh `ten_<N>` this run, and the
 # boot-time storage-union then falsely tombstones an unrelated test's tenant. Clean the dirs and drop
 # the entries the app's boot already unioned in, so every run starts from a clean re-mint gate.
-remote_dir =
-  Application.get_env(:fathom, Fathom.Shard.Storage.Local, [])[:dir] ||
-    Path.join(System.tmp_dir!(), "fathom_remote_test")
+remote_dir = Fathom.Shard.Storage.Local.dir()
 
 for sub <- ["tombstones", "tokenfloors"], do: File.rm_rf(Path.join(remote_dir, sub))
 
@@ -32,6 +30,19 @@ for sub <- ["tombstones", "tokenfloors"], do: File.rm_rf(Path.join(remote_dir, s
 # alone: the app is already booted here and the Heartbeat process owns that key for THIS run.
 for f <- Path.wildcard(Path.join(remote_dir, "*.lock")), do: File.rm(f)
 for f <- Path.wildcard(Path.join(remote_dir, "*.db")), do: File.rm(f)
+
+# The LOCAL shard dir has the same "per-run state by definition" property, and the same failure
+# mode one step earlier: a leftover `<shard>.db` is treated as an authoritative un-flushed local
+# copy (`Fathom.Shard` pulls only on cold start), so a colliding id from a previous run serves that
+# file's contents instead of cold-opening from storage. It went unswept until now only because the
+# dir was shared with dev, where deleting a file could discard real un-flushed writes; as of
+# 2026-07-27 it is test-owned (`config/test.exs` :shard_data_dir), so clearing it is always
+# correct. It had accumulated 5,047 files.
+#
+# Whole-dir rm_rf rather than a wildcard sweep: the coordinator also writes `-wal`/`-shm`
+# sidecars, `*.tmp.*` pull temps, and `.db.{fenced,forked,corrupt}.*` quarantine files, and a
+# sweep that enumerates kinds is one new kind away from leaking again.
+File.rm_rf(Fathom.Shard.data_dir())
 
 try do
   :ets.delete_all_objects(Fathom.Tenants.Tombstones)

@@ -11,7 +11,7 @@ defmodule Fathom.Bench.HranaClientTest do
 
   defp rm_shard(id) do
     for s <- ["", "-wal", "-shm"] do
-      File.rm(Path.join([System.tmp_dir!(), "fathom_shards", "#{id}.db"]) <> s)
+      File.rm(Path.join([Fathom.Shard.data_dir(), "#{id}.db"]) <> s)
     end
   end
 

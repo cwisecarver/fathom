@@ -30,7 +30,6 @@ defmodule Fathom.ReadOnlyScopeTest do
   alias Fathom.{Directory, HranaAuth, Shards, ShardExecutor}
   alias Filo.Stmt
 
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
   @streams __MODULE__.Streams
 
   setup do
@@ -43,7 +42,7 @@ defmodule Fathom.ReadOnlyScopeTest do
       Application.put_env(:fathom, :hrana_auth, prev_mode)
       Shards.drain(shard, 2_000)
 
-      for dir <- [@remote_dir, Path.join(System.tmp_dir!(), "fathom_shards")],
+      for dir <- [remote_dir(), Fathom.Shard.data_dir()],
           path <- Path.wildcard(Path.join(dir, "#{shard}*")),
           do: File.rm(path)
     end)
@@ -219,4 +218,6 @@ defmodule Fathom.ReadOnlyScopeTest do
   end
 
   defp req(id, request), do: %{"type" => "request", "request_id" => id, "request" => request}
+
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

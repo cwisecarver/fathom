@@ -6,9 +6,6 @@ defmodule Fathom.DirectoryWiringTest do
   alias Fathom.{Directory, Shards}
   alias Fathom.Directory.Recorder
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     prev = Application.get_env(:fathom, :directory_touch)
     Application.put_env(:fathom, :directory_touch, true)
@@ -19,7 +16,7 @@ defmodule Fathom.DirectoryWiringTest do
         do: Application.delete_env(:fathom, :directory_touch),
         else: Application.put_env(:fathom, :directory_touch, prev)
 
-      for dir <- [@local_dir, @remote_dir],
+      for dir <- [local_dir(), remote_dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".lock"],
           do: File.rm(Path.join(dir, shard <> suffix))
     end)
@@ -49,4 +46,7 @@ defmodule Fathom.DirectoryWiringTest do
 
     Fathom.Shard.checkin(pid, ref)
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

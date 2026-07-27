@@ -79,7 +79,7 @@ defmodule Fathom.ShardCorruptFlushTest do
     shard: shard
   } do
     path = Shard.db_path(shard)
-    remote = Path.join([System.tmp_dir!(), "fathom_remote_test", "#{shard}.db"])
+    remote = Path.join([Fathom.Shard.Storage.Local.dir(), "#{shard}.db"])
 
     # 1. Seed 500 good rows and flush them to storage → the stored object is good.
     write_and_checkpoint(shard, ["CREATE TABLE t (v TEXT)", @seed_insert])
@@ -110,11 +110,12 @@ defmodule Fathom.ShardCorruptFlushTest do
   defp rm_file(path), do: for(s <- ["", "-wal", "-shm"], do: File.rm(path <> s))
 
   defp rm_shard(id) do
-    for dir <- ["fathom_shards", "fathom_remote_test"], s <- ["", "-wal", "-shm"] do
-      File.rm(Path.join([System.tmp_dir!(), dir, "#{id}.db"]) <> s)
+    for dir <- [Fathom.Shard.data_dir(), Fathom.Shard.Storage.Local.dir()],
+        s <- ["", "-wal", "-shm"] do
+      File.rm(Path.join([dir, "#{id}.db"]) <> s)
     end
 
-    for f <- Path.wildcard(Path.join([System.tmp_dir!(), "fathom_shards", "#{id}.db.corrupt.*"])),
+    for f <- Path.wildcard(Path.join([Fathom.Shard.data_dir(), "#{id}.db.corrupt.*"])),
         do: File.rm(f)
   end
 end

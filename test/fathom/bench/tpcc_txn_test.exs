@@ -22,8 +22,9 @@ defmodule Fathom.Bench.TpccTxnTest do
     on_exit(fn ->
       Shards.drain(id, 5_000)
 
-      for dir <- ["fathom_shards", "fathom_remote_test"], s <- ["", "-wal", "-shm"] do
-        File.rm(Path.join([System.tmp_dir!(), dir, "#{id}.db"]) <> s)
+      for dir <- [Fathom.Shard.data_dir(), Fathom.Shard.Storage.Local.dir()],
+          s <- ["", "-wal", "-shm"] do
+        File.rm(Path.join([dir, "#{id}.db"]) <> s)
       end
 
       HranaClient.stop_listener(sup)

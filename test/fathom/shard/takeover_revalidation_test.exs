@@ -15,9 +15,6 @@ defmodule Fathom.Shard.TakeoverRevalidationTest do
   alias Fathom.Shard.{Connection, Storage}
   alias Filo.{Stmt, StmtResult}
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     shard = "takeover_#{System.unique_integer([:positive])}"
     prev_storage = Application.get_env(:fathom, :shard_storage)
@@ -29,7 +26,7 @@ defmodule Fathom.Shard.TakeoverRevalidationTest do
         do: Application.put_env(:fathom, :shard_storage, prev_storage),
         else: Application.delete_env(:fathom, :shard_storage)
 
-      for dir <- [@local_dir, @remote_dir],
+      for dir <- [local_dir(), remote_dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock"],
           do: File.rm(Path.join(dir, shard <> suffix))
     end)
@@ -56,10 +53,10 @@ defmodule Fathom.Shard.TakeoverRevalidationTest do
     seed_remote!(shard, "stale-pre-flush")
 
     # A dead foreign owner's lock (no heartbeat, stale TTL) forces the STEAL branch.
-    File.mkdir_p!(@remote_dir)
+    File.mkdir_p!(remote_dir())
 
     File.write!(
-      Path.join(@remote_dir, "#{shard}.lock"),
+      Path.join(remote_dir(), "#{shard}.lock"),
       Jason.encode!(%{
         "owner" => "dead@node#oldinc",
         "epoch" => 5,
@@ -74,7 +71,7 @@ defmodule Fathom.Shard.TakeoverRevalidationTest do
     Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
 
     test_pid = self()
-    temp = Path.join(@local_dir, "#{shard}.db.pull")
+    temp = Path.join(local_dir(), "#{shard}.db.pull")
 
     zombie_flush = fn ->
       wait_for = fn wait_for, tries ->
@@ -114,4 +111,7 @@ defmodule Fathom.Shard.TakeoverRevalidationTest do
       end
     end)
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

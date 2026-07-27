@@ -7,9 +7,6 @@ defmodule Fathom.ShardAdmissionTest do
 
   alias Fathom.Shards
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     prev = Application.get_env(:fathom, :max_open_shards)
     prev_evict = Application.get_env(:fathom, :evict_idle_at_capacity)
@@ -25,7 +22,7 @@ defmodule Fathom.ShardAdmissionTest do
 
       # This test's shards all share the "adm_" prefix, so a glob cleans them without
       # tracking each one (an ETS table owned by the test process dies before on_exit).
-      for dir <- [@local_dir, @remote_dir],
+      for dir <- [local_dir(), remote_dir()],
           path <- Path.wildcard(Path.join(dir, "adm_*")),
           do: File.rm(path)
     end)
@@ -68,4 +65,7 @@ defmodule Fathom.ShardAdmissionTest do
     assert is_integer(cap) and cap > 0,
            "an unbounded default lets arbitrary Host ids exhaust the node's fds (got #{inspect(cap)})"
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

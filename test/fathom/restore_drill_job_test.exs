@@ -12,8 +12,6 @@ defmodule Fathom.RestoreDrillJobTest do
   alias Fathom.Directory.Shard, as: DirShard
   alias Filo.Stmt
 
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     id = "drill_#{System.unique_integer([:positive])}"
     prev_sample = Application.get_env(:fathom, :restore_drill_sample)
@@ -22,7 +20,7 @@ defmodule Fathom.RestoreDrillJobTest do
       restore(:restore_drill_sample, prev_sample)
       Shards.drain(id, 2_000)
 
-      for dir <- [@remote_dir, Path.join(System.tmp_dir!(), "fathom_shards")],
+      for dir <- [remote_dir(), Fathom.Shard.data_dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock"],
           do: File.rm(Path.join(dir, id <> suffix))
     end)
@@ -73,7 +71,7 @@ defmodule Fathom.RestoreDrillJobTest do
 
   test "a corrupt stored object is flagged :corrupt", %{id: id} do
     seed(id, ["CREATE TABLE t (v TEXT)"])
-    File.write!(Path.join(@remote_dir, "#{id}.db"), "definitely not a sqlite database")
+    File.write!(Path.join(remote_dir(), "#{id}.db"), "definitely not a sqlite database")
 
     ref = attach()
     assert {:ok, summary} = RestoreDrillJob.run_drill(10)
@@ -139,4 +137,6 @@ defmodule Fathom.RestoreDrillJobTest do
     {1, _} =
       Repo.update_all(from(s in DirShard, where: s.shard_id == ^id), set: [last_verified_at: at])
   end
+
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

@@ -192,10 +192,10 @@ defmodule Fathom.SnapshotsTest do
   end
 
   defp rm_shard(id) do
-    remote_dir = Path.join(System.tmp_dir!(), "fathom_remote_test")
+    remote_dir = Fathom.Shard.Storage.Local.dir()
 
     for base <- [
-          Path.join([System.tmp_dir!(), "fathom_shards", "#{id}.db"]),
+          Path.join([Fathom.Shard.data_dir(), "#{id}.db"]),
           Path.join([remote_dir, "#{id}.db"])
         ],
         suffix <- ["", "-wal", "-shm"] do

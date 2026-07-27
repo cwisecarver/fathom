@@ -12,9 +12,6 @@ defmodule Fathom.Migrator.ForkTest do
   alias Fathom.ShardExecutor
   alias Filo.{Error, Stmt, StmtResult}
 
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-
   setup do
     template = "tmplfork#{System.unique_integer([:positive])}"
     prev = Application.get_env(:fathom, :template_shard_id)
@@ -74,13 +71,13 @@ defmodule Fathom.Migrator.ForkTest do
     # local file + sidecars, stored object, retained @version copies, lock.
     _ = Fathom.Shards.drain(id, 1_000)
 
-    for base <- [Path.join(@local_dir, "#{id}.db"), Path.join(@remote_dir, "#{id}.db")],
+    for base <- [Path.join(local_dir(), "#{id}.db"), Path.join(remote_dir(), "#{id}.db")],
         suffix <- ["", "-wal", "-shm", ".etag"] do
       File.rm(base <> suffix)
     end
 
-    for p <- Path.wildcard(Path.join(@remote_dir, "#{id}@*")), do: File.rm(p)
-    File.rm(Path.join(@remote_dir, "#{id}.lock"))
+    for p <- Path.wildcard(Path.join(remote_dir(), "#{id}@*")), do: File.rm(p)
+    File.rm(Path.join(remote_dir(), "#{id}.lock"))
     :ok
   end
 
@@ -88,7 +85,7 @@ defmodule Fathom.Migrator.ForkTest do
   # mutates the "remote" object (opening SQLite in WAL mode rewrites the header).
   defp stored_version(id) do
     copy = Path.join(System.tmp_dir!(), "storedv_#{id}_#{System.unique_integer([:positive])}.db")
-    File.cp!(Path.join(@remote_dir, "#{id}.db"), copy)
+    File.cp!(Path.join(remote_dir(), "#{id}.db"), copy)
     {:ok, conn} = Connection.open(copy)
     {:ok, %{rows: [[version]]}} = Connection.query(conn, "PRAGMA user_version", [])
     Connection.close(conn)
@@ -96,7 +93,7 @@ defmodule Fathom.Migrator.ForkTest do
     version
   end
 
-  defp remote_object(id), do: Path.join(@remote_dir, "#{id}.db")
+  defp remote_object(id), do: Path.join(remote_dir(), "#{id}.db")
 
   defp count!(conn, table) do
     {:ok, %StmtResult{rows: [[n]]}} =
@@ -113,7 +110,7 @@ defmodule Fathom.Migrator.ForkTest do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
 
       assert {:ok, 2} = Migrator.retain_template_head()
-      assert File.exists?(Path.join(@remote_dir, "#{template}@2.db"))
+      assert File.exists?(Path.join(remote_dir(), "#{template}@2.db"))
     end
 
     test "returns :no_template when no template shard is configured" do
@@ -131,7 +128,7 @@ defmodule Fathom.Migrator.ForkTest do
       {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
 
       assert {:error, :no_template_object} = Migrator.retain_template_head()
-      refute File.exists?(Path.join(@remote_dir, "#{template}@1.db"))
+      refute File.exists?(Path.join(remote_dir(), "#{template}@1.db"))
     end
   end
 
@@ -385,4 +382,7 @@ defmodule Fathom.Migrator.ForkTest do
       assert :error = Directory.get(tenant), "no directory row is force-registered"
     end
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

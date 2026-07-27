@@ -11,9 +11,6 @@ defmodule Fathom.ShardDurabilityTest do
   alias Fathom.Shard.{Connection, FlushGate, Storage}
   alias Filo.{Stmt, StmtResult}
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     shard = "dur_#{System.unique_integer([:positive])}"
     prev_flush = Application.get_env(:fathom, :shard_flush_interval_ms)
@@ -23,12 +20,12 @@ defmodule Fathom.ShardDurabilityTest do
       restore(:shard_flush_interval_ms, prev_flush)
       restore(:shard_idle_ms, prev_idle)
 
-      for dir <- [@local_dir, @remote_dir],
+      for dir <- [local_dir(), remote_dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".lock"],
           do: File.rm(Path.join(dir, shard <> suffix))
 
-      for snap <- Path.wildcard(Path.join(@local_dir, "#{shard}.db.snap.*")), do: File.rm(snap)
-      for f <- Path.wildcard(Path.join(@local_dir, "#{shard}.db.fenced.*")), do: File.rm(f)
+      for snap <- Path.wildcard(Path.join(local_dir(), "#{shard}.db.snap.*")), do: File.rm(snap)
+      for f <- Path.wildcard(Path.join(local_dir(), "#{shard}.db.fenced.*")), do: File.rm(f)
     end)
 
     %{shard: shard}
@@ -56,8 +53,8 @@ defmodule Fathom.ShardDurabilityTest do
 
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
   defp now_ms, do: System.system_time(:millisecond)
-  defp local_db(shard), do: Path.join(@local_dir, "#{shard}.db")
-  defp remote_db(shard), do: Path.join(@remote_dir, "#{shard}.db")
+  defp local_db(shard), do: Path.join(local_dir(), "#{shard}.db")
+  defp remote_db(shard), do: Path.join(remote_dir(), "#{shard}.db")
 
   # Pull the shard's stored object to a fresh path and assert it is a valid, quick_check-clean
   # SQLite db holding `expected_rows` rows of table `t` (expert review #41).
@@ -87,10 +84,10 @@ defmodule Fathom.ShardDurabilityTest do
   end
 
   defp put_raw_lock(shard, owner, epoch, expires_at_ms) do
-    File.mkdir_p!(@remote_dir)
+    File.mkdir_p!(remote_dir())
 
     File.write!(
-      Path.join(@remote_dir, "#{shard}.lock"),
+      Path.join(remote_dir(), "#{shard}.lock"),
       Jason.encode!(%{"owner" => owner, "epoch" => epoch, "expires_at_ms" => expires_at_ms})
     )
   end
@@ -814,7 +811,7 @@ defmodule Fathom.ShardDurabilityTest do
 
       for id <- ids,
           suffix <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock"],
-          do: File.rm(Path.join(@local_dir, id <> suffix))
+          do: File.rm(Path.join(local_dir(), id <> suffix))
     end)
 
     # Hold a connection on each: an idle+clean coordinator deliberately carries NO flush timer
@@ -1838,7 +1835,7 @@ defmodule Fathom.ShardDurabilityTest do
     Connection.close(cb)
     :ok = Storage.flush(shard, b)
     for s <- ["", "-wal", "-shm"], do: File.rm(b <> s)
-    File.rm(Path.join(@remote_dir, "#{shard}.lock"))
+    File.rm(Path.join(remote_dir(), "#{shard}.lock"))
 
     # "A" returns: the warm open must detect the fork, quarantine A's copy, and serve
     # B's lineage — pre-fix it adopted B's etag and later flushed A's fork over it.
@@ -1901,7 +1898,7 @@ defmodule Fathom.ShardDurabilityTest do
     Connection.close(cb)
     :ok = Storage.flush(shard, b)
     for s <- ["", "-wal", "-shm"], do: File.rm(b <> s)
-    File.rm(Path.join(@remote_dir, "#{shard}.lock"))
+    File.rm(Path.join(remote_dir(), "#{shard}.lock"))
 
     # The crash tore A's sidecar to EMPTY (O_TRUNC + power loss).
     File.write!(local_db(shard) <> ".etag", "")
@@ -2045,7 +2042,7 @@ defmodule Fathom.ShardDurabilityTest do
       Connection.close(c2)
       :ok = Fathom.Shard.Storage.Local.flush(shard, e2_seed)
       for s <- ["", "-wal", "-shm"], do: File.rm(e2_seed <> s)
-      File.rm(Path.join(@remote_dir, "#{shard}.lock"))
+      File.rm(Path.join(remote_dir(), "#{shard}.lock"))
     end
 
     Application.put_env(:fathom, :faulty_before, {:acquire, cycle})
@@ -2703,4 +2700,7 @@ defmodule Fathom.ShardDurabilityTest do
 
     :ok = Connection.close(conn2)
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

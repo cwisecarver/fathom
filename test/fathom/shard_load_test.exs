@@ -9,9 +9,6 @@ defmodule Fathom.ShardLoadTest do
   alias Fathom.{ShardExecutor, ShardLoad, Shards}
   alias Filo.Stmt
 
-  @local_dir Path.join(System.tmp_dir!(), "fathom_shards")
-  @remote_dir Path.join(System.tmp_dir!(), "fathom_remote_test")
-
   setup do
     prev = Application.get_env(:fathom, :shard_load)
     prev_idle = Application.get_env(:fathom, :shard_idle_ms)
@@ -34,11 +31,11 @@ defmodule Fathom.ShardLoadTest do
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
 
   defp clean_shard(id) do
-    for base <- [Path.join(@local_dir, "#{id}.db"), Path.join(@remote_dir, "#{id}.db")],
+    for base <- [Path.join(local_dir(), "#{id}.db"), Path.join(remote_dir(), "#{id}.db")],
         suffix <- ["", "-wal", "-shm"],
         do: File.rm(base <> suffix)
 
-    File.rm(Path.join(@remote_dir, "#{id}.lock"))
+    File.rm(Path.join(remote_dir(), "#{id}.lock"))
   end
 
   # ── the counter API ──
@@ -129,4 +126,7 @@ defmodule Fathom.ShardLoadTest do
     assert ShardLoad.get(id) == nil
     Shards.drain(id)
   end
+
+  defp local_dir, do: Fathom.Shard.data_dir()
+  defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end
