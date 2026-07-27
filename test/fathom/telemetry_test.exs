@@ -62,9 +62,19 @@ defmodule Fathom.TelemetryTest do
 
   test "a lease stolen out from under a live coordinator emits :superseded", %{shard: shard} do
     attach([[:fathom, :shard, :lease, :superseded]])
-    # Short TTL so the renewal fires fast and detects the steal (idle stays long).
-    Application.put_env(:fathom, :shard_lease_ttl_ms, 60)
 
+    # NO short-TTL override here, deliberately (2026-07-26). It used to set 60ms "so the renewal
+    # fires fast", which became actively harmful once the test started driving the renewal itself:
+    # `schedule_renew/1` re-arms at `ttl/3`, so a 60ms TTL makes the coordinator queue a
+    # `:renew_lease` every ~20ms, each doing storage I/O. Under load that backlog grows faster than
+    # it drains and the message this test sends waits behind it — the coordinator self-fenced
+    # correctly, just later than the assertion window (observed at load average 28: the
+    # "superseded; self-fencing" log arrived AFTER the 5s timeout).
+    #
+    # The short TTL bought nothing anyway: `do_renew_lease/3` detects supersession by comparing the
+    # stored lock's owner/epoch against ours, which is TTL-independent. At the default TTL the
+    # coordinator's own timer fires far outside this test, so the only `:renew_lease` it handles is
+    # the one sent below — no storm, nothing to queue behind.
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, coordinator} = Shards.ensure(shard)
     ref = Process.monitor(coordinator)

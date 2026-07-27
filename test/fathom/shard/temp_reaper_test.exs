@@ -13,6 +13,31 @@ defmodule Fathom.Shard.TempReaperTest do
   alias Fathom.Shard.TempReaper
 
   setup do
+    # A data dir THIS TEST OWNS, not the shared one (2026-07-26).
+    #
+    # The sweep is `Path.wildcard` over `Shard.data_dir()`, and the assertion below is an exact
+    # count, so both were hostage to whatever else happened to be in the shared dir. That dir
+    # accumulates across runs — 5,047 files, the oldest 5 days old, when this was diagnosed —
+    # because `System.unique_integer/1` restarts every VM and per-test cleanup misses some. The
+    # drain sweep on line ~40 then had to stat and delete THOUSANDS of other runs' orphans, which
+    # under load blew past `GenServer.call/2`'s default 5s timeout and exited the test.
+    #
+    # `Shard.data_dir/0` reads `:shard_data_dir` per call, so pointing it at a private dir makes
+    # the sweep O(this test's files): the drain is instant, the exact count is exact by
+    # construction, and the test neither suffers from nor contributes to the shared pile.
+    prev = Application.get_env(:fathom, :shard_data_dir)
+    dir = Path.join(System.tmp_dir!(), "fathom_reaper_test_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    Application.put_env(:fathom, :shard_data_dir, dir)
+
+    on_exit(fn ->
+      if is_nil(prev),
+        do: Application.delete_env(:fathom, :shard_data_dir),
+        else: Application.put_env(:fathom, :shard_data_dir, prev)
+
+      File.rm_rf(dir)
+    end)
+
     # Unique shard id so this test's temps never collide with a co-resident file.
     shard = "reaper_#{System.unique_integer([:positive])}"
     path = Shard.db_path(shard)
