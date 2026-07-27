@@ -200,10 +200,19 @@ defmodule Fathom.ShardLeaseTest do
 
   test "renewal self-fences: losing the lease stops the coordinator without flushing",
        %{shard: shard} do
-    # Short TTL so renewal fires fast; leave idle at its (long) default so the
-    # renewal path — not the idle path — is what stops the coordinator.
-    Application.put_env(:fathom, :shard_lease_ttl_ms, 60)
-
+    # Idle stays at its (long) default so the renewal path — not the idle path — is what stops
+    # the coordinator.
+    #
+    # NO short-TTL override, deliberately (2026-07-26): `schedule_renew/1` re-arms at ttl/3, so
+    # the 60ms this used to set made the coordinator queue a `:renew_lease` every ~20ms, each
+    # doing storage I/O. Under load that backlog outgrows its drain and the message sent below
+    # waits behind it — the coordinator self-fences correctly, just past the window. It was also
+    # vestigial: it predates this test driving the renewal itself, and supersession is detected by
+    # comparing the stored lock's owner/epoch against ours, which is TTL-independent.
+    #
+    # (test/fathom/cluster/partition_test.exs KEEPS its 60ms — that one deliberately relies on the
+    # periodic timer firing several times inside a refute_receive window, so the storm is the
+    # point there.)
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
@@ -221,7 +230,10 @@ defmodule Fathom.ShardLeaseTest do
       # which can slip past the assert_receive window under heavy machine load.
       send(coordinator, :renew_lease)
 
-      assert_receive {:DOWN, ^ref, :process, ^coordinator, {:shutdown, :lease_lost}}, 1_000
+      # 5s, matching telemetry_test's equivalent assertion. The number is not a bound this test
+      # chose to assert — the DOWN is a definitive lifecycle event, and 1s was tight enough that
+      # a busy scheduler alone could miss it.
+      assert_receive {:DOWN, ^ref, :process, ^coordinator, {:shutdown, :lease_lost}}, 5_000
     end)
 
     refute File.exists?(remote_db(shard)), "self-fenced coordinator must not flush"
