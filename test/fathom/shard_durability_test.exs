@@ -37,6 +37,23 @@ defmodule Fathom.ShardDurabilityTest do
   defp restore(key, nil), do: Application.delete_env(:fathom, key)
   defp restore(key, value), do: Application.put_env(:fathom, key, value)
 
+  # Block until the Registry has processed the monitor DOWNs it owes, so `Registry.lookup/2` no
+  # longer reports a process that has already died.
+  #
+  # A `Registry` unregisters asynchronously: its PID-partition processes monitor every registered
+  # pid and remove the entry when they handle the `:DOWN`. That is the `:sys.get_state/1`
+  # "ensure the process has handled prior messages" idiom from AGENTS.md — it just has to be
+  # applied to the processes that actually do the work, which are neither the caller nor the
+  # supervisor. Partition count scales with schedulers, so they're discovered rather than assumed.
+  defp await_registry_cleanup do
+    for name <- Process.registered(),
+        Atom.to_string(name) =~ ~r/^Elixir\.Fathom\.ShardRegistry\.(PID)?Partition\d+$/ do
+      _ = :sys.get_state(name)
+    end
+
+    :ok
+  end
+
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
   defp now_ms, do: System.system_time(:millisecond)
   defp local_db(shard), do: Path.join(@local_dir, "#{shard}.db")
@@ -2548,6 +2565,16 @@ defmodule Fathom.ShardDurabilityTest do
     # Flush the supervisor's mailbox so its (non-)restart decision has been made, then assert no
     # phantom coordinator was restarted. Under :transient this returns the auto-restarted pid.
     _ = :sys.get_state(Fathom.ShardSupervisor)
+
+    # ...and flush the REGISTRY too, which is a different process (2026-07-26).
+    #
+    # `Registry.lookup/2` only stops reporting the dead coordinator once the Registry's own
+    # PID-partition process has handled its `:DOWN` and unregistered the entry. The supervisor
+    # flush above proves the SUPERVISOR decided not to restart; it says nothing about the
+    # Registry's cleanup, which is asynchronous and owned by an unrelated process. On an idle box
+    # that cleanup has invariably already happened, so the gap was invisible — under load it is
+    # not, and the assertion reports a "phantom restart" that never occurred.
+    await_registry_cleanup()
 
     assert Registry.lookup(Fathom.ShardRegistry, shard) == [],
            "a :temporary coordinator must not be auto-restarted after a crash"
