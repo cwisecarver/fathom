@@ -323,7 +323,10 @@ defmodule Fathom.Shard do
     # sequentially after the acquire instead of overlapped — the common warm path drops to
     # 2 RTTs (the post-lease re-check stays: it is the release-in-gap authority, round-2 #19).
     file? = File.exists?(path)
-    fork_task = if file?, do: Task.async(fn -> quarantined_fork?(shard_id, path) end)
+    # Gathers evidence only — the verdict is `resolve_fork/4`, after the lease is held. See
+    # `fork_evidence/2`: this HEAD races the steal-touch that `acquire_lease` performs, so a
+    # decision made here can mistake our own touch for a fork.
+    fork_task = if file?, do: Task.async(fn -> fork_evidence(shard_id, path) end)
     pull_task = if file?, do: nil, else: start_pull(shard_id, path)
 
     # Sample the heartbeat generation BEFORE acquire_lease. The fence's invariant is
@@ -342,7 +345,12 @@ defmodule Fathom.Shard do
         # sequential check used. :infinity mirrors the old inline call (the HEAD carries the
         # storage layer's own timeouts). A diverged local copy was quarantined by the task,
         # so this open proceeds cold with a (late, rare-path) pull.
-        warm? = file? and not Task.await(fork_task, :infinity)
+        # The verdict is taken HERE, with the lease in hand, so `touch_pre_etag`/`touch_post_etag`
+        # can distinguish our own steal-touch from a genuine fork. Same consumption point as
+        # before (before any serving decision) — only the decision moved.
+        warm? =
+          file? and not resolve_fork(Task.await(fork_task, :infinity), shard_id, path, lease)
+
         pull_task = pull_task || if warm?, do: nil, else: start_pull(shard_id, path)
         result = open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen)
         maybe_emit_cold_open(result, shard_id, warm?, open_started)
@@ -478,7 +486,7 @@ defmodule Fathom.Shard do
   defp revalidate_takeover(shard_id, path, lease, etag, warm?) do
     cond do
       # Round-2 #19 (merged M15): a NON-takeover warm open must ALSO re-check its
-      # provenance AFTER the lease is held. quarantined_fork?'s HEAD runs before
+      # provenance AFTER the lease is held. fork_evidence/2's HEAD runs before
       # the acquire, and in that gap another owner can do a full
       # acquire→flush→release cycle — release deletes the lock, so our acquire is
       # a fresh epoch-1 create with no took_over, and the un-revalidated warm file
@@ -571,7 +579,7 @@ defmodule Fathom.Shard do
       # round-2 #29). Returning the stale pulled etag made the first flush
       # deterministically self-fence (If-Match against a gone object never
       # succeeds), dropping every write accepted in that cycle. Adopt the
-      # brand-new contract instead — same stance as quarantined_fork?'s
+      # brand-new contract instead — same stance as fork_evidence/2's
       # deliberately-deleted-object case: serve the pulled copy and fence with
       # nil, so the first flush RECREATES the object via If-None-Match:* (never a
       # clobber). Drop the now-wrong provenance sidecar so a crash before that
@@ -739,7 +747,7 @@ defmodule Fathom.Shard do
     # Warm restart: fence with the local copy's PROVENANCE etag (the sidecar written
     # at pull/flush time), never "whatever the store holds now" (expert review #1) —
     # adopting the current etag let a stale fork flush over a newer lineage with a
-    # valid If-Match. quarantined_fork?/2 already re-pulled a mismatched copy when the
+    # valid If-Match. fork_evidence/2 + resolve_fork/4 already re-pulled a mismatched copy when the
     # store was reachable, so this normally equals the current etag; when the store
     # was unreachable at open, fencing with the provenance etag makes a forked flush
     # 412 (self-fence) instead of clobbering. A missing sidecar is a legacy warm file
@@ -748,7 +756,7 @@ defmodule Fathom.Shard do
       {:ok, etag} ->
         {:ok, etag}
 
-      # Normally unreachable — quarantined_fork?/2 already quarantined a corrupt
+      # Normally unreachable — resolve_fork/4 already quarantined a corrupt
       # sidecar before warm? could hold — but if it ever surfaces (the quarantine's
       # sidecar rm failed), NEVER adopt-current off unknown provenance (expert
       # review #12); fail the open instead.
@@ -806,7 +814,7 @@ defmodule Fathom.Shard do
       # Establish provenance BEFORE the pulled file becomes authoritative (expert
       # review 2026-07-14 #5). Writing the sidecar AFTER the rename left a crash
       # window: an authoritative warm `.db` with NO sidecar. The next warm open reads
-      # `:missing` (quarantined_fork? → false, await_pull(nil) → adopt the store's
+      # `:missing` (fork_evidence → :no_sidecar ⇒ warm, await_pull(nil) → adopt the store's
       # CURRENT etag), so if another node stole+wrote+released the shard in between
       # (reachable on a persisted/remounted `:shard_data_dir`), the stale local copy
       # is served and fenced with the NEW lineage's etag — its first flush If-Matches
@@ -1883,37 +1891,80 @@ defmodule Fathom.Shard do
   # pulling the store's current lineage. An unreachable store falls back to serving
   # warm fenced by the provenance etag (a forked flush then 412s and self-fences
   # instead of clobbering).
-  defp quarantined_fork?(shard_id, path) do
+  # OBSERVE ONLY — decides nothing and has no side effects (2026-07-26).
+  #
+  # This runs CONCURRENTLY with `acquire_lease` (review 2026-07-23 #22, for the latency win), and
+  # `acquire_lease` STEAL-TOUCHES the data object to rotate its etag. So this HEAD races that
+  # touch, and it used to quarantine the moment the store's etag differed from the sidecar — which
+  # on a lost race means quarantining a perfectly good warm copy because it saw OUR OWN touch.
+  #
+  # Consequence, reproduced under load on 2026-07-26 (`RevalidateTouchedTest` B1, 3 failures in 8
+  # runs at load average 19): a spurious `.forked.<ts>` file — a signal that is supposed to mean
+  # preserved acked-but-unflushed writes and to be investigated — plus a full-body re-pull on
+  # exactly the failover path the warm follower exists to make cheap. It degrades when the machine
+  # is busy, which is when failovers happen. No data loss; the re-pull is correct.
+  #
+  # The verdict now belongs to `resolve_fork/4`, which runs AFTER the lease is held and can tell
+  # our own touch from a real fork because it has `touch_pre_etag`/`touch_post_etag`. The HEAD
+  # stays overlapped, so the latency win is unchanged.
+  defp fork_evidence(shard_id, path) do
     case read_etag_sidecar(path) do
       :missing ->
-        false
+        :no_sidecar
 
-      # Torn/unreadable sidecar (expert review #12): the local copy's provenance is
-      # unknown, so it cannot be trusted to continue the stored lineage — quarantine
-      # it and re-pull, exactly as a detected fork. A FAILED quarantine (the rename
-      # never moved the copy) must not report quarantined, or the cold-open's
-      # promote_pull would overwrite the un-moved recovery copy (expert review #14).
+      # Torn/unreadable sidecar (expert review #12): provenance unknown, so the copy cannot be
+      # trusted to continue the stored lineage. Unrelated to the touch race — but the quarantine
+      # itself still moves to resolve_fork/4 so this task stays side-effect free.
       :corrupt ->
-        quarantine_fork!(shard_id, path, :corrupt_sidecar) == :ok
+        :corrupt
 
       {:ok, sidecar_etag} ->
         case Storage.object_etag(shard_id) do
           {:ok, ^sidecar_etag} ->
-            false
+            :match
 
           # The object is GONE but we have provenance from one — treat as fork-adjacent?
           # No: a deliberately deleted object with a live local copy is the un-flushed
           # brand-new case; serve warm and let the fenced flush recreate it.
           {:ok, nil} ->
-            false
+            :absent
 
-          # Same failed-quarantine rule as :corrupt above (expert review #14).
-          {:ok, _newer} ->
-            quarantine_fork!(shard_id, path, :diverged) == :ok
+          {:ok, store_etag} ->
+            {:diverged, sidecar_etag, store_etag}
 
           {:error, _unreachable} ->
-            false
+            :unreachable
         end
+    end
+  end
+
+  # The post-lease verdict. Returns true when the local copy is a fork that was successfully moved
+  # aside (so the caller opens COLD); false means keep it and open warm.
+  #
+  # A FAILED quarantine (the rename never moved the copy) must NOT report quarantined, or the
+  # cold-open's promote_pull would overwrite the un-moved recovery copy (expert review #14) —
+  # hence `== :ok` on every quarantine branch, exactly as before.
+  defp resolve_fork(:no_sidecar, _shard_id, _path, _lease), do: false
+  defp resolve_fork(:match, _shard_id, _path, _lease), do: false
+  defp resolve_fork(:absent, _shard_id, _path, _lease), do: false
+  defp resolve_fork(:unreachable, _shard_id, _path, _lease), do: false
+
+  defp resolve_fork(:corrupt, shard_id, path, _lease),
+    do: quarantine_fork!(shard_id, path, :corrupt_sidecar) == :ok
+
+  defp resolve_fork({:diverged, sidecar, store}, shard_id, path, lease) do
+    # OUR OWN steal-touch, not a fork. Both halves are required: the touch SOURCED this file's
+    # provenance (`pre == sidecar`, so the local bytes are the lineage the touch copied) and the
+    # store now holds exactly that touch's output (`post == store`). A self-copy moves no bytes, so
+    # the warm copy is still correct — this is the same argument `revalidate_touched/5`'s warm
+    # branch already makes before adopting `post`.
+    #
+    # Anything else is a real fork. In particular the zombie-flush race (B2) is NOT captured here:
+    # there the touch sources the ZOMBIE's etag, so `pre != sidecar` and we still quarantine.
+    if lease[:touch_pre_etag] == sidecar and lease[:touch_post_etag] == store do
+      false
+    else
+      quarantine_fork!(shard_id, path, :diverged) == :ok
     end
   end
 

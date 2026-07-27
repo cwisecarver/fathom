@@ -364,7 +364,23 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
       assert value == "zombie-write",
              "the zombie's acknowledged writes are the surviving lineage — re-pulled, not the local copy"
 
-      assert body_gets(cnt) == 1, "a diverged provenance forces exactly one re-pull"
+      # One re-pull when the fork-check HEAD wins the race against the steal-touch, TWO when it
+      # loses — and the second is correct, not waste to be asserted away. `fork_evidence/2` runs
+      # concurrently with `acquire_lease` (review 2026-07-23 #22), so on a loss the evidence is
+      # already the zombie's etag: resolve_fork/4 still quarantines (`pre` is the zombie, our
+      # sidecar is `base`, so the provenance genuinely diverged), but the open proceeds COLD, and a
+      # cold takeover's speculative pull can hold bytes from before the touch — which
+      # revalidate_takeover is designed to detect and re-pull (shard.ex "a cold pull that
+      # mismatches is re-pulled").
+      #
+      # So the count is a property of who won a race, and pinning it to 1 pinned the race. What is
+      # actually guaranteed — and is asserted here and below — is that the surviving lineage is
+      # served, exactly one copy is quarantined, and its bytes are preserved. Verified under load
+      # 2026-07-26: body_gets=2, value="zombie-write", forked=1.
+      assert body_gets(cnt) in 1..2,
+             "a diverged provenance must re-pull (1 if the fork check beat the steal-touch, 2 if " <>
+               "it lost and the cold path re-pulled pre-touch bytes) — got #{body_gets(cnt)}"
+
       assert_received {:forked, _}, "the diverged local copy must be quarantined, not discarded"
 
       [forked] = forked_files(shard)
