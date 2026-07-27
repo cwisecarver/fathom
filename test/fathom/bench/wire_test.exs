@@ -1,6 +1,20 @@
 defmodule Fathom.Bench.WireTest do
-  @moduledoc "Smoke-checks the wire benches (Phase 1). Not async — starts a Filo listener."
+  @moduledoc """
+  Smoke-checks the wire benches (Phase 1). Not async — starts a Filo listener.
+
+  **:bench, i.e. excluded from the default suite.** Every assertion here bounds a real measured
+  latency, so the whole module is a microbench and AGENTS.md puts those behind `:bench` — the
+  default suite should fail on broken behaviour, not on a busy host. Two of them were observed
+  failing purely from machine load on 2026-07-26: `tpcb_wire_overhead`'s delta inverted by 51ms
+  (a sign flip no margin can rescue), and `cold_open_wire` exceeded its 100ms ceiling at load
+  average 30-60.
+
+  These still run — `mix test --include bench`, and `mix fathom.wire_bench` is the real gate.
+  Run them on a quiet host, which is the only place a latency number means anything.
+  """
   use ExUnit.Case, async: false
+
+  @moduletag :bench
 
   alias Fathom.Bench.Wire
 
@@ -23,15 +37,10 @@ defmodule Fathom.Bench.WireTest do
     assert us < 100_000.0, "cold_open_wire p50 #{us}µs exceeded the 100ms smoke ceiling"
   end
 
-  # :bench, unlike its neighbours, because this is the one assertion here that a margin cannot
-  # rescue. The others bound a single measurement on one side and can be given generous headroom;
-  # this asserts the SIGN OF A DIFFERENCE between two independently noisy timings. Under machine
-  # load the raw leg can lose the race to the wire leg outright — observed 2026-07-26 at
-  # -51,610µs, i.e. the delta inverted by 51ms — and no ceiling fixes a sign flip. Per AGENTS.md,
-  # a comparative microbench belongs behind :bench, where the host is expected quiet.
-  #
-  # Its real gate is `mix fathom.wire_bench`; this was only ever a smoke check.
-  @tag :bench
+  # The most load-fragile assertion in the module: unlike its neighbours, which bound a single
+  # measurement on one side, this asserts the SIGN OF A DIFFERENCE between two independently noisy
+  # timings. Under load the raw leg can lose the race to the wire leg outright (observed at
+  # -51,610µs), and no ceiling fixes a sign flip.
   test "tpcb_wire_overhead is a positive per-txn delta (wire costs more than raw exqlite)" do
     # The wire leg sends 7 statements as 7 round-trips vs raw local calls, so the delta is
     # positive and dominated by the round-trips. Small txn count for a smoke check.

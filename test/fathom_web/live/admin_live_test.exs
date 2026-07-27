@@ -87,7 +87,11 @@ defmodule FathomWeb.AdminLiveTest do
       assert has_element?(view, "#latency-chart")
 
       # The fleet panel loads async (Postgres) — wait for it, then assert directory data.
-      html = render_async(view)
+      # An explicit timeout: `render_async/1` defaults to 100ms, which is not a bound this test
+      # chose to assert, it is an accidental latency assertion smuggled into a functional test.
+      # A Postgres round-trip on a busy machine exceeds it easily. What is under test is that the
+      # async assign COMPLETES and renders, not how fast. Matches admin_query_live_test.exs.
+      html = render_async(view, 5_000)
       assert html =~ "Total shards"
       assert html =~ "Storage (S3)"
     end
@@ -157,7 +161,10 @@ defmodule FathomWeb.AdminLiveTest do
 
     test "migrations page mounts and loads fleet state", %{conn: conn} do
       {:ok, view, _html} = conn |> auth() |> live("/admin/migrations")
-      html = render_async(view)
+      # Explicit timeout for the same reason as the overview panel above — this was the most
+      # frequent load-induced failure in the suite (6 of 7 full runs at load average 30-60 on
+      # 2026-07-26), purely because render_async/1's default is 100ms.
+      html = render_async(view, 5_000)
       assert html =~ "Fleet HEAD"
       assert html =~ "Release history"
     end
