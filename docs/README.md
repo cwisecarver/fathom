@@ -133,13 +133,38 @@ noted).
   mechanism the single-node density work left as architectural).
 - **[reviews/tpc-run-2026-07-10.md](reviews/tpc-run-2026-07-10.md)** — the remote-client TPC run over
   the chaos rig (true cross-LB latency) + the loopback spec-scale TPC-C comparability numbers.
-- **[reviews/latency-cost-2026-07-11.md](reviews/latency-cost-2026-07-11.md)** — what an injected S3
-  RTT costs the two round-trip-bound paths (`chaos.sh latency-cost`): cold-open ≈ 1 RTT (matches the
-  in-process sweep), flush ≈ 3.5 RTT (the drain/release path is *not* overlapped — the tuning target).
-- **[reviews/tpc-fleet-2026-07-11.md](reviews/tpc-fleet-2026-07-11.md)** — multi-tenant TPC-B across
-  the fleet (`chaos.sh tpc-fleet`): the throughput analog of density — one single-writer shard per
-  tenant, load partitions across the nodes (query load follows shards), per-txn p50 stays flat as
-  tenants scale (no convoy); absolute txn/s is single-host-bound, horizontal is the real axis.
+- **[reviews/latency-cost-2026-07-23.md](reviews/latency-cost-2026-07-23.md)** — what an injected S3
+  RTT costs the two round-trip-bound paths (`chaos.sh latency-cost`): cold-open ≈ **1 RTT** (26 / 70 /
+  133 ms at 10 / 30 / 60 ms one-way — the `Shard.init` acquire∥pull overlap), flush/drain ≈ **2.3×
+  RTT**, down from ~3.5× after the drain fix; the remaining PUT→DELETE ordering is irreducible.
+  *(Supersedes `latency-cost-2026-07-11.md`, whose ~3.5× number predates the fix and whose
+  attribution of the third round-trip to the etag sidecar was wrong — the sidecar is a local file.)*
+- **[reviews/tpc-fleet-elixir-driver-2026-07-24.md](reviews/tpc-fleet-elixir-driver-2026-07-24.md)** —
+  the current multi-tenant throughput result: **4,096 concurrent tenant shards, 3,414 txn/s, zero
+  errors**, driven from one process; 7,168 tenant shards over the sweep, 5.08M queries, consistent-hash
+  spread **1.15×**. Load follows the shard partition, so the horizontal axis is the even per-node
+  split — absolute txn/s is single-host-bound.
+- **[reviews/tpc-fleet-2026-07-23.md](reviews/tpc-fleet-2026-07-23.md)** — the 6→1024-tenant sweep
+  behind that result (and an honest null: it reports its own `tpcb_tps` metric as smoke-level only).
+  **[reviews/tpc-fleet-highconc-2026-07-23.md](reviews/tpc-fleet-highconc-2026-07-23.md)** finds the
+  *driver's* ceilings rather than fathom's; **[reviews/tpc-scaling-2026-07-24.md](reviews/tpc-scaling-2026-07-24.md)**
+  charts the whole story; **[reviews/tpcc-elixir-driver-2026-07-24.md](reviews/tpcc-elixir-driver-2026-07-24.md)**
+  covers TPC-C (and the Hrana stream-resume bug it surfaced);
+  **[reviews/tpcc-4096-shed-root-cause-2026-07-24.md](reviews/tpcc-4096-shed-root-cause-2026-07-24.md)**
+  root-causes the single-node 4096 shed to client request timeouts, not a fathom resource.
+  ⚠️ **`reviews/tpc-fleet-2026-07-11.md` is superseded — its absolute txn/s is invalid** (~95%
+  LB-502 reconnect overhead; see **[reviews/lb-502-fix-2026-07-23.md](reviews/lb-502-fix-2026-07-23.md)**).
+- **[reviews/rpo-sweep-2026-07-18.md](reviews/rpo-sweep-2026-07-18.md)** — the measured node-loss
+  window that justified the 5 s flush default (452 rows p50 / 800 p99 at 200 writes/s), the evidence
+  behind [`durability.md`](durability.md)'s bounded-loss contract.
+- **[reviews/served-data-2026-07-23.md](reviews/served-data-2026-07-23.md)** (density re-check with
+  real data per shard) and **[reviews/chaos-failover-2026-07-23.md](reviews/chaos-failover-2026-07-23.md)**
+  (kill-failover revalidation) — both post perf-iteration and post LB-502 fix.
+- **[reviews/s3-latency-ab-2026-07-23.md](reviews/s3-latency-ab-2026-07-23.md)** and
+  **[reviews/hotspots-ab-2026-07-23.md](reviews/hotspots-ab-2026-07-23.md)** — the A/B pair for the
+  2026-07-23 perf iteration (RTT-path wins; per-query wins).
+  **[reviews/vm-args-ab-2026-07-25.md](reviews/vm-args-ab-2026-07-25.md)** measures the BEAM-flag
+  follow-ups — and refutes two of them, including one this project had already shipped.
 - **reviews/chaos-run-2026-07-0{5,8,9}.md** — chaos-rig run reports (failover, pause-fence, hotspots,
   rebalance handoff — the live proofs referenced by the built-engine docs).
 - **reviews/expert-review-2026-07-0\*.md** — expert-panel review passes (each with a `.progress.md`
