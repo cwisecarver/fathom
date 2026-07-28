@@ -1,5 +1,72 @@
 # Fathom
 
+**Multi-tenant databases usually mean a shared table with a `tenant_id` column and a
+prayer.** One forgotten `WHERE` clause is a cross-tenant leak. One noisy tenant is
+everyone's outage. "Delete my data" is a query you hope was right.
+
+**Fathom gives every tenant its own physically separate SQLite database** — served over
+the network to *unchanged* libSQL clients, backed by object storage, with one writer per
+tenant enforced by a lease. Isolation is a **file boundary**, not a query convention.
+Deleting a tenant deletes a file. Forking one is a copy.
+
+```
+   libSQL client (django-libsql / WebSocket, libsql-experimental / HTTP)
+                         │  Hrana, shard = Host subdomain
+                         ▼
+   Filo.Plug / Filo.Socket  (Hrana HTTP v1/v2/v3 + WebSocket hrana1/2/3)
+                         │  Filo.Executor callback
+                         ▼
+   Fathom.ShardExecutor → Fathom.Shards.checkout/1 (find-or-start → file path)
+                         ▼
+   Fathom.Shard.Connection (one exqlite conn per stream) → SQLite file
+                         ▲ pull on cold start / checkpoint+flush+drop on idle
+   Fathom.Shard (coordinator: tracks conns, dirty flag, idle)
+                         │
+                         ├── Fathom.Shard.Storage (Local | S3 via Req sigv4)
+                         └── Fathom.Shard.Heartbeat (per-node liveness, O(nodes))
+
+   Fathom.Directory (Postgres) ← Fathom.Directory.Recorder (ETS buffer, off hot path)
+   Fathom.Migrator + Oban jobs  (blue/green migration, reconcile, retire, revert)
+   Fathom.HealthPlug (:8081)    (LB probe)
+   Fathom.Telemetry + OTel      (metrics + trace spans)
+```
+
+*One SQLite file per tenant, one writer at a time, S3 underneath. Everything else is bookkeeping.*
+
+## Why this is different
+
+- **Isolation is a file boundary.** No `tenant_id`, no `WHERE` clause standing between
+  tenants. A leak requires opening the wrong *file*, not forgetting a filter.
+- **Delete and export are file operations.** GDPR erasure is a purge of every stored
+  object, not a `deleted_at` flag you hope nothing else reads. Portability is a download.
+- **Forking a tenant is a copy.** Clone production into staging in one object copy —
+  measured ~21× faster than migrating a fresh shard.
+- **One writer per tenant, enforced by a lease.** Cross-node safety through S3, with no
+  consensus system to operate.
+- **Density is the business model.** ~16 KiB of RAM per idle tenant, and a stored-but-idle
+  tenant costs object storage rather than memory — so a long tail of small tenants is cheap.
+
+## Proof points
+
+Every number below is a dated run, not an estimate. Where something is unmeasured, the
+docs say so.
+
+| Claim | Measured | Evidence |
+|---|---|---|
+| Tenant density | **30,000 shards across 3 nodes**, ~16 KiB RSS each idle, spread 1.22×; stress-pushed to 105k held | [`fleet-density-2026-07-10.md`](docs/reviews/fleet-density-2026-07-10.md), [`served-data-2026-07-23.md`](docs/reviews/served-data-2026-07-23.md) |
+| Throughput | **4,096 concurrent tenants, 3,414 txn/s, zero errors**; load follows the shard partition | [`tpc-fleet-elixir-driver-2026-07-24.md`](docs/reviews/tpc-fleet-elixir-driver-2026-07-24.md) |
+| Autonomous rebalancing | A hot shard detected and moved node→node with **no human in the loop** | [`chaos-run-2026-07-08.md`](docs/reviews/chaos-run-2026-07-08.md) |
+| Durability (RPO) | Bounded and **measured**: 452 rows p50 / 800 p99 lost at the 5 s default under 200 writes/s | [`durability.md`](docs/durability.md) |
+| Cold-open latency | **~1 S3 round-trip** — 26 / 70 / 133 ms at 10 / 30 / 60 ms one-way | [`latency-cost-2026-07-23.md`](docs/reviews/latency-cost-2026-07-23.md) |
+| vs. Turso's own server | **On par per-DB** against `sqld` on the same box and wire — while carrying the lease fence and multi-tenant routing | [`turso-headtohead-2026-07-10.md`](docs/reviews/turso-headtohead-2026-07-10.md) |
+
+**See it running:** [djathom](https://github.com/cwisecarver/djathom) is a complete Django
+personal-finance app — one SQLite database per household — that comes up with
+`docker compose up`. The whole tenancy story costs **564 lines** of fathom-specific code;
+the domain models need zero fathom imports.
+
+## How it works
+
 Fathom is a multi-tenant sharded data platform built on Phoenix: **one SQLite database per shard** (targeting millions), served to unchanged libSQL clients — e.g. an unchanged Django app via `django-libsql` — over the [Hrana wire protocol](https://github.com/libsql/hrana-client-ts/blob/main/HRANA_3_SPEC.md) via the [Filo](https://github.com/cwisecarver/filo) library.
 
 Filo speaks HTTP Hrana v1/v2/v3 (including cursor) and WebSocket hrana1/2/3. The Hrana listener runs on port 8080 (separate from the Phoenix dashboard on 4000). The target shard is derived from the `Host` subdomain (`acme.fathom.example` → shard `acme`), with `?db=` and `x-fathom-shard` as **dev-only** fallbacks (gated by `:allow_shard_override`, off in prod). Per-shard bearer-token auth (`Phoenix.Token`, presented as libSQL's `authToken`) is available via `HRANA_AUTH=required`; with it disabled (the default) the trust boundary is the network — the port must be LB-only-reachable (see [`docs/deploy-cluster.md`](docs/deploy-cluster.md)).
@@ -129,29 +196,6 @@ A JSON control plane under `/api` (on `:4000`, separate from the Hrana data port
 
 See [`docs/benchmark-plan.md`](docs/benchmark-plan.md) for the full harness description. Other operator tasks: `mix fathom.shard` (pull/inspect/fork), `mix fathom.snapshot` (PITR snapshots), `mix fathom.directory` (cross-store DR reconcile).
 
-## Architecture (current data path)
-
-```
-   libSQL client (django-libsql / WebSocket, libsql-experimental / HTTP)
-                         │  Hrana, shard = Host subdomain
-                         ▼
-   Filo.Plug / Filo.Socket  (Hrana HTTP v1/v2/v3 + WebSocket hrana1/2/3)
-                         │  Filo.Executor callback
-                         ▼
-   Fathom.ShardExecutor → Fathom.Shards.checkout/1 (find-or-start → file path)
-                         ▼
-   Fathom.Shard.Connection (one exqlite conn per stream) → SQLite file
-                         ▲ pull on cold start / checkpoint+flush+drop on idle
-   Fathom.Shard (coordinator: tracks conns, dirty flag, idle)
-                         │
-                         ├── Fathom.Shard.Storage (Local | S3 via Req sigv4)
-                         └── Fathom.Shard.Heartbeat (per-node liveness, O(nodes))
-
-   Fathom.Directory (Postgres) ← Fathom.Directory.Recorder (ETS buffer, off hot path)
-   Fathom.Migrator + Oban jobs  (blue/green migration, reconcile, retire, revert)
-   Fathom.HealthPlug (:8081)    (LB probe)
-   Fathom.Telemetry + OTel      (metrics + trace spans)
-```
 
 ## What's next
 
