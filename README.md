@@ -165,7 +165,8 @@ Setup, the local dev loop, the `mix precommit` gate, the hot-path bench gate, te
 
 ## Examples
 
-- **[django-fathom-example](https://github.com/cwisecarver/django-fathom-example)** — a companion Django app demonstrating invisible per-tenant shard routing: a `shard_id` in ordinary queryset parameters routes every query to the tenant's own shard (custom QuerySet + database router, fail-closed). The connection walkthrough (no helper package required) is [`docs/quickstart-django.md`](docs/quickstart-django.md).
+- **[djathom](https://github.com/cwisecarver/djathom) — start here if you want to see the product.** A complete Django personal-finance app where every household is its own SQLite database, running unmodified on fathom: `docker compose up` brings the whole stack to a working UI. It ships a presenter's walkthrough ([`DEMO.md`](https://github.com/cwisecarver/djathom/blob/main/DEMO.md)) covering physical isolation, read-only delegated access enforced by fathom rather than app code, GDPR export/delete, point-in-time restore, fork-based provisioning, and multi-node failover. The whole tenancy story costs **564 lines** of fathom-specific plumbing; the domain code needs zero fathom imports.
+- **[django-fathom-example](https://github.com/cwisecarver/django-fathom-example)** — the minimal version: a companion Django app demonstrating invisible per-tenant shard routing, where a `shard_id` in ordinary queryset parameters routes every query to the tenant's own shard (custom QuerySet + database router, fail-closed). Read this one to learn the mechanism; it also carries the tenant-churn density harness (20,000 tenants against a 1,000-shard cap). The connection walkthrough (no helper package required) is [`docs/quickstart-django.md`](docs/quickstart-django.md).
 
 ## Further reading
 

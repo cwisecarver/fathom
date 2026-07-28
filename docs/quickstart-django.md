@@ -8,6 +8,12 @@ the single-tenant-per-Django-process pattern, which is the common shape and the 
 Pairs with the eval stack ([`deploy/compose/README.md`](../deploy/compose/README.md)) and the proven
 validation harness (`test/django_validation/`).
 
+**Want a complete worked application instead of a walkthrough?**
+[**djathom**](https://github.com/cwisecarver/djathom) is a full personal-finance app with one
+SQLite database per household, multi-tenant per-request routing included, running unmodified on
+fathom — `docker compose up` and it's live. The routing package it uses is also vendored in
+[django-fathom-example](https://github.com/cwisecarver/django-fathom-example).
+
 ## 0. Bring up fathom
 
 Use the eval stack (`cd deploy/compose && docker compose up --build`) or `iex -S mix phx.server` in
