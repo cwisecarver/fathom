@@ -126,8 +126,9 @@ request pays a cold-open. Owning this number up front is the difference between 
 | **Cold** (first request to an idle/dropped tenant) | lease acquire + object pull, **≈ 1 S3 round-trip** + body transfer (scales with shard size × bandwidth), done *inline* in that first query | see below |
 
 **The cold-open contract.** Cold-open is optimized to ~1 S3 RTT (the lease acquire and the pull
-overlap). Measured on the fleet (`docs/reviews/latency-cost-2026-07-11.md`): at **10 / 30 / 60 ms**
-one-way S3 RTT, cold-open ≈ **24 / 77 / 137 ms** — roughly `~2× one-way RTT + a few ms`, plus body
+overlap). Measured on the fleet ([`reviews/latency-cost-2026-07-23.md`](reviews/latency-cost-2026-07-23.md)):
+at **10 / 30 / 60 ms** one-way S3 RTT, cold-open ≈ **26 / 70 / 133 ms** — roughly `~2× one-way RTT
++ a few ms`, plus body
 transfer for a large shard. So a p99 first-request contract is *your S3 region RTT × ~2 + shard-size
 term*; steady-state (warm) requests are not on this curve at all. A 100–300 ms first-request tail is
 **expected and bounded**, not pathological — it's the bottomless design, priced.

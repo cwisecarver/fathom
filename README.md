@@ -10,7 +10,7 @@ Filo speaks HTTP Hrana v1/v2/v3 (including cursor) and WebSocket hrana1/2/3. The
 
 ### Fast path — Docker (recommended for a first look)
 
-One `docker compose up` brings up fathom + PostgreSQL + MinIO (as S3) + nginx with safe defaults and walks you from an empty system to a served, isolated tenant in under 30 minutes — no Elixir toolchain required. See **[`deploy/compose/README.md`](deploy/compose/README.md)**.
+One `docker compose up` brings up fathom + PostgreSQL + MinIO (as S3) + nginx with safe defaults and walks you from an empty system to a served, isolated tenant in a single sitting — no Elixir toolchain required. (The first build compiles a prod release, so it's a few minutes of build before anything is up.) See **[`deploy/compose/README.md`](deploy/compose/README.md)**.
 
 ### Native dev
 
@@ -180,3 +180,5 @@ Setup, the local dev loop, the `mix precommit` gate, the hot-path bench gate, te
 | [docs/cluster-architecture.md](docs/cluster-architecture.md) | Cluster architecture decision (LB-partition + S3 lease, why not the alternatives) + phase status |
 | [docs/deploy-cluster.md](docs/deploy-cluster.md) | Cluster deployment, LB config, chaos rig, phase status |
 | [deploy/compose/README.md](deploy/compose/README.md) | The one-command Docker eval stack (fathom + Postgres + MinIO + nginx) |
+| [docs/reviews/turso-headtohead-2026-07-10.md](docs/reviews/turso-headtohead-2026-07-10.md) | **"Why not just use Turso?"** — head-to-head against libSQL's own server (`sqld`) on the same box, same wire, same driver, so the only variable is the server implementation |
+| [docs/reviews/competitive-oltp-2026-07-10.md](docs/reviews/competitive-oltp-2026-07-10.md) | **"Why not just use Postgres?"** — fathom vs raw SQLite vs Postgres on the same box, both durability modes |
