@@ -82,12 +82,26 @@ single-big-table workload is the anti-fathom shard. **Adding ClickBench is low v
 per-tenant analytics ever matters, the question is a columnar path per shard (DuckDB attach), not
 SQLite-on-ClickBench. (No leaderboard figures cited here — not measured on this box.)
 
-## Turso / libSQL — the peer that actually matters (not run)
+## Turso / libSQL — the peer that actually matters ✅ RUN, same day
+
+> **This section originally read "not run" and proposed the head-to-head as the next
+> benchmark to build. It was built 38 minutes later** and lives in
+> [`turso-headtohead-2026-07-10.md`](turso-headtohead-2026-07-10.md). The structural
+> prediction below is preserved because the measurement **confirmed** it — but read the
+> numbers there, not the reasoning here.
 
 libSQL is a SQLite fork + a Hrana server layer, and fathom literally speaks that Hrana protocol
 (via Filo). So per-DB the two should land in the same place; the real comparison is the
-orchestration/placement/density layer, not single-DB TPS. A head-to-head on a multi-tenant
-workload is the competitive benchmark worth building next. Structural reasoning only — not run here.
+orchestration/placement/density layer, not single-DB TPS.
+
+**Measured result:** on par per-DB — within a few percent on every metric, fathom marginally
+ahead on most, `sqld` ahead on RTT tail (TPC-B 344 vs 333 tps; TPC-C 2,138 vs 2,017 tpmC;
+RTT p50 418 vs 434 µs), reproduced across two runs. Same box, same Hrana wire, same driver,
+so the only variable is the server implementation. fathom matches the reference Rust
+implementation **while carrying machinery `sqld` doesn't** — the S3 lease/epoch fence, the
+per-shard coordinator, multi-tenant routing — because that machinery is off the per-request
+hot path. Per-txn cost on both is dominated by Hrana round-trips × wire RTT, so at this
+workload the protocol is the bottleneck, not either server's language.
 
 ## Caveats
 
