@@ -78,9 +78,18 @@ more** shards than it could ever hold open at once.
 The warm path is **not purely local** — it still pays **one S3 round-trip** (the 304 conditional
 GET, plus the lease/freshness round-trips). The win is the object **body transfer avoided**, so it
 scales with **shard size × bandwidth-delay** and is **marginal for a tiny shard on a fat pipe**
-(both paths pay ~1 S3 RTT regardless). Measured (dev build, MinIO + toxiproxy, relative): at
-**1 MB / 30 ms one-way / 100 Mbps → cold ~162 ms vs warm ~72 ms (~2.3×)**. The warm floor is those
-lease + freshness round-trips, not ~2 ms — so don't oversell it for small shards.
+(both paths pay ~1 S3 RTT regardless). Measured **2026-07-01** (dev build, MinIO + toxiproxy,
+relative): at **1 MB / 30 ms one-way / 100 Mbps cap → cold ~162 ms vs warm ~72 ms (~2.3×)**. The
+warm floor is those lease + freshness round-trips, not ~2 ms — so don't oversell it for small shards.
+
+**The condition is load-bearing, not a footnote.** Re-measured **2026-07-23** on the same rig with
+**no bandwidth cap** ([`reviews/s3-latency-ab-2026-07-23.md`](reviews/s3-latency-ab-2026-07-23.md)):
+at 30 ms one-way, **cold 607 ms vs warm 619 ms** — the win disappears entirely, because the 1 MB
+body the warm path avoids transfers for ~free on loopback. Both runs are correct; they measure
+different bandwidth-delay products. Quote the 2.3× only with its `100 Mbps` condition attached.
+(Those absolutes also predate the steal-touch takeover machinery, which moved both paths, so
+cross-date absolute comparisons are invalid — see AGENTS.md. The durable claim is the **shape**:
+warm wins in proportion to shard size × bandwidth-delay, and approaches zero as the pipe fattens.)
 
 ## How it connects
 
