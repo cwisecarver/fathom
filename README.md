@@ -53,17 +53,18 @@ docs say so.
 
 | Claim | Measured | Evidence |
 |---|---|---|
-| Tenant density | **30,000 shards across 3 nodes**, ~16 KiB RSS each idle, spread 1.22×; stress-pushed to 105k held | [`fleet-density-2026-07-10.md`](docs/reviews/fleet-density-2026-07-10.md), [`served-data-2026-07-23.md`](docs/reviews/served-data-2026-07-23.md) |
+| Tenant density | **29,956 shards held across 3 nodes** (of 30,000 minted — 0.15% drops), ~16 KiB RSS each idle, spread 1.22×; stress-pushed to 105,530 held | [`fleet-density-2026-07-10.md`](docs/reviews/fleet-density-2026-07-10.md), [`served-data-2026-07-23.md`](docs/reviews/served-data-2026-07-23.md) |
 | Throughput | **4,096 concurrent tenants, 3,414 txn/s, zero errors**; load follows the shard partition | [`tpc-fleet-elixir-driver-2026-07-24.md`](docs/reviews/tpc-fleet-elixir-driver-2026-07-24.md) |
-| Autonomous rebalancing | A hot shard detected and moved node→node with **no human in the loop** | [`chaos-run-2026-07-08.md`](docs/reviews/chaos-run-2026-07-08.md) |
+| Autonomous rebalancing | Against a genuine imbalance, the policy proposed a move and the control loop ran the handoff **autonomously** (warm → pin → LB flip → drain), isolation intact | [`chaos-run-2026-07-09.md`](docs/reviews/chaos-run-2026-07-09.md) |
 | Durability (RPO) | Bounded and **measured**: 452 rows p50 / 800 p99 lost at the 5 s default under 200 writes/s | [`durability.md`](docs/durability.md) |
 | Cold-open latency | **~1 S3 round-trip** — 26 / 70 / 133 ms at 10 / 30 / 60 ms one-way | [`latency-cost-2026-07-23.md`](docs/reviews/latency-cost-2026-07-23.md) |
 | vs. Turso's own server | **On par per-DB** against `sqld` on the same box and wire — while carrying the lease fence and multi-tenant routing | [`turso-headtohead-2026-07-10.md`](docs/reviews/turso-headtohead-2026-07-10.md) |
 
 **See it running:** [djathom](https://github.com/cwisecarver/djathom) is a complete Django
 personal-finance app — one SQLite database per household — that comes up with
-`docker compose up`. The whole tenancy story costs **564 lines** of fathom-specific code;
-the domain models need zero fathom imports.
+`docker compose up`. The whole tenancy story costs **307 lines of fathom-specific code**
+(754 including comments); the domain models need zero fathom imports beyond one manager
+and a `shard_id=` queryset kwarg.
 
 ## How it works
 
@@ -209,7 +210,7 @@ Setup, the local dev loop, the `mix precommit` gate, the hot-path bench gate, te
 
 ## Examples
 
-- **[djathom](https://github.com/cwisecarver/djathom) — start here if you want to see the product.** A complete Django personal-finance app where every household is its own SQLite database, running unmodified on fathom: `docker compose up` brings the whole stack to a working UI. It ships a presenter's walkthrough ([`DEMO.md`](https://github.com/cwisecarver/djathom/blob/main/DEMO.md)) covering physical isolation, read-only delegated access enforced by fathom rather than app code, GDPR export/delete, point-in-time restore, fork-based provisioning, and multi-node failover. The whole tenancy story costs **564 lines** of fathom-specific plumbing; the domain code needs zero fathom imports.
+- **[djathom](https://github.com/cwisecarver/djathom) — start here if you want to see the product.** A complete Django personal-finance app where every household is its own SQLite database, running unmodified on fathom: `docker compose up` brings the whole stack to a working UI. It ships a presenter's walkthrough ([`DEMO.md`](https://github.com/cwisecarver/djathom/blob/main/DEMO.md)) covering physical isolation, read-only delegated access enforced by fathom rather than app code, GDPR export/delete, point-in-time restore, fork-based provisioning, and multi-node failover. The whole tenancy story costs **307 lines of fathom-specific code**; the domain code needs zero fathom imports.
 - **[django-fathom-example](https://github.com/cwisecarver/django-fathom-example)** — the minimal version: a companion Django app demonstrating invisible per-tenant shard routing, where a `shard_id` in ordinary queryset parameters routes every query to the tenant's own shard (custom QuerySet + database router, fail-closed). Read this one to learn the mechanism; it also carries the tenant-churn density harness (20,000 tenants against a 1,000-shard cap). The connection walkthrough (no helper package required) is [`docs/quickstart-django.md`](docs/quickstart-django.md).
 
 ## Further reading
