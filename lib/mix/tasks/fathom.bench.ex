@@ -31,18 +31,28 @@ defmodule Mix.Tasks.Fathom.Bench do
 
   Benchmarks are only meaningful in isolation — a second run (this repo or a sibling
   sharing the host) contends for CPU/disk and skews both. So the task takes a host-wide
-  lock file (`/tmp/fathom_bench.lock`) for the duration of the run: it refuses to start
-  if the lock already exists (another run is in progress, or a crashed run left it behind —
-  `rm` it), and creates + removes it otherwise (removed even if the bench fails). The
-  create is atomic (`O_EXCL`), so two simultaneous starts can't both win.
+  lock file for the duration of the run: it refuses to start if the lock already exists
+  (another run is in progress, or a crashed run left it behind — `rm` it), and creates +
+  removes it otherwise (removed even if the bench fails). The create is atomic (`O_EXCL`),
+  so two simultaneous starts can't both win.
+
+  The path defaults to `/tmp/fathom_bench.lock` and is overridable with the
+  `FATHOM_BENCH_LOCK` environment variable. Point several projects at the *same* path to
+  interlock their benchmarks across a shared host:
+
+      FATHOM_BENCH_LOCK=/tmp/shared_bench.lock mix fathom.bench
   """
   @shortdoc "Run fathom hot-path benchmarks, emit a perf-history JSON line"
 
   use Mix.Task
 
   # Host-wide benchmark lock — one benchmark at a time across everything sharing this host,
-  # so no run measures under another run's load.
-  @lock_file "/tmp/fathom_bench.lock"
+  # so no run measures under another run's load. Env-overridable (rather than hardcoded to
+  # one project's name) so co-tenant projects can agree on a shared path without either
+  # repo carrying the other's name.
+  @default_lock_file "/tmp/fathom_bench.lock"
+
+  defp lock_file, do: System.get_env("FATHOM_BENCH_LOCK", @default_lock_file)
 
   # Load config + compile without starting the app — Fathom.Bench starts the
   # minimal subset it needs itself (no Oban, no Hrana port, no endpoint).
@@ -77,7 +87,7 @@ defmodule Mix.Tasks.Fathom.Bench do
     Logger.configure(level: :warning)
     {opts, _, _} = OptionParser.parse(argv, strict: @switches)
 
-    with_lock(@lock_file, fn -> do_run(opts) end)
+    with_lock(lock_file(), fn -> do_run(opts) end)
   end
 
   # Runs `fun` while holding the host-wide benchmark lock at `path`, refusing (via `Mix.raise`)

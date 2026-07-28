@@ -2,8 +2,8 @@ defmodule Mix.Tasks.Fathom.BenchLockTest do
   @moduledoc """
   The host-wide benchmark lock: `mix fathom.bench` refuses to run while the lock exists, and
   otherwise creates it for the duration and removes it (even on failure). Tests exercise the
-  `with_lock/2` seam against a unique temp path (never the real /tmp/fathom_bench.lock, so
-  a real benchmark on this host isn't disturbed).
+  `with_lock/2` seam against a unique temp path — never the real lock path (the
+  `FATHOM_BENCH_LOCK` default), so a real benchmark running on this host isn't disturbed.
   """
   use ExUnit.Case, async: true
 

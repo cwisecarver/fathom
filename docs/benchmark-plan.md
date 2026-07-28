@@ -91,6 +91,23 @@ checkout) before trusting a BLOCK. A same-run A/B (stash, bench parent, unstash,
 bench working tree) would remove drift entirely but doubles bench time; deferred
 until drift proves a problem in practice.
 
+### The host-wide bench lock
+
+Benchmarks are only meaningful in isolation, so `mix fathom.bench` takes a host-wide lock
+file for the run: it refuses to start if the lock exists (another run in progress, or a
+crashed run left it — `rm` it), and creates + removes it otherwise, even on failure. The
+create is atomic (`O_EXCL`), so two simultaneous starts can't both win.
+
+The path defaults to `/tmp/fathom_bench.lock` and is overridable with **`FATHOM_BENCH_LOCK`**.
+Point several projects at the *same* path to interlock benchmarks across a shared host:
+
+```bash
+FATHOM_BENCH_LOCK=/tmp/shared_bench.lock mix fathom.bench
+```
+
+That's the reason it's an env var rather than a constant: co-tenant projects can agree on a
+shared lock without either repo hardcoding the other's name.
+
 ## The harness (this is what B1/B2 build)
 
 Three pieces, split as inner measurement vs. orchestration:

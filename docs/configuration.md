@@ -147,3 +147,9 @@ tenant-controllable signal, so it presumes the Hrana trust boundary is enforced.
 | `WARM_HOME_RETENTION_MS` | code default | How long after last owning a shard the follower still treats it as "home" and won't re-warm. | Outlast a routine idle→reopen gap; a real LB remap lapses it. |
 | `WARM_MIN_REPULL_MS` | 10 × `WARM_POLL_MS` | Floor on how often ONE cached shard's body may be re-transferred. | **This is what bounds the follower's steady-state cost.** A continuously-written tenant flushes faster than the poll, so without it every refresh is a full body + fsync, forever. Worst-case ingress is Σ(cached sizes) ÷ this. Raising it trades failover RTO on write-hot shards for bandwidth and device writes — never correctness, since promotion revalidates before serving. |
 | `WARM_REFRESH_BYTES_PER_S` | unset (uncapped) | Hard cap on warm-refresh ingress, spent lag-first. | Bounds the aggregate independently of cache size — set it to what the node's NIC/disk can spare. Too small doesn't break the cache, it just converges it more slowly (oldest-checked shard first, so the tail is never starved). |
+
+## Development tooling
+
+| Variable | Default | What it does | Notes |
+|---|---|---|---|
+| `FATHOM_BENCH_LOCK` | `/tmp/fathom_bench.lock` | Path to the host-wide lock `mix fathom.bench` takes for a run, so no benchmark measures under another's load. | Dev-only; nothing in the server reads it. Point co-tenant projects sharing a host at the **same** path to interlock their benchmarks — that's why it's a variable rather than a constant. See [`benchmark-plan.md`](benchmark-plan.md). |
