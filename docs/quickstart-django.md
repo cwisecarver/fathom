@@ -1,9 +1,14 @@
 # Quickstart — Django on fathom
 
-Get an unchanged Django app talking to a fathom-served tenant over `django-libsql`. The fathom side
-is complete today; the **multi-tenant per-request routing helper** (choosing a tenant's shard per
-request) is the planned `fathom-django` companion package (review #16) — until it ships, this covers
-the single-tenant-per-Django-process pattern, which is the common shape and the building block.
+Get an unchanged Django app talking to a fathom-served tenant over `django-libsql`. This page covers
+the **single-tenant-per-Django-process** pattern — the simplest shape, and the building block for
+everything else.
+
+**Multi-tenant per-request routing is built**, just not yet packaged. The `django_fathom` package
+(runtime shard-alias registration with an LRU bound, a fail-closed database router, and a
+`shard_id=` queryset kwarg) picks a tenant's shard **per request** and is proven in two working
+apps — see below. What remains open from review #16 is *distribution*: publishing it as an
+installable `fathom-django` rather than a directory each app vendors.
 
 Pairs with the eval stack ([`deploy/compose/README.md`](../deploy/compose/README.md)) and the proven
 validation harness (`test/django_validation/`).

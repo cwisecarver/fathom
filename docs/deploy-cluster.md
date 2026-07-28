@@ -187,9 +187,12 @@ granularity). Implemented in `Fathom.HealthPlug` + a Bandit listener in `Fathom.
   subdomains remap; each remapped shard is migrated lazily — on its next request the new node
   cold-opens it from S3 and steals the lease. No coordinated migration, no downtime for
   unaffected subdomains.
-- **Remove a node (planned):** drain by removing its `server` line and reloading; its
-  subdomains remap to survivors and cold-open on next touch. (Graceful drain of in-flight
-  streams is the node's own idle/flush path.)
+- **Remove a node:** drain by removing its `server` line and reloading; its subdomains remap
+  to survivors and cold-open on next touch. The graceful drain is built and proven, not
+  incidental: `SIGTERM` runs the supervision tree down in reverse order so every coordinator
+  flushes and **releases its lease** before exit (`Fathom.Shards.drain_all/1`, budgeted by
+  `:drain_all_budget_ms`), which means survivors take over without waiting out a lease TTL.
+  Full procedure and the live proof: [`runbooks/deploy.md`](runbooks/deploy.md).
 - **Distribution skew (real caveat, from the S1 spike):** consistent hashing balances load
   only *in expectation*. With few nodes and few subdomains it can be lumpy (the spike saw
   3/8/1 across three nodes for twelve keys), and a single hot tenant always pins to one node

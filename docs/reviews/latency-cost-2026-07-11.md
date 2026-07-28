@@ -1,5 +1,21 @@
 # What an injected S3 RTT costs cold-open and flush — measured on the fleet
 
+> ## ⚠️ SUPERSEDED in part — the flush/drain analysis below is wrong
+>
+> Two corrections, both from [`latency-cost-2026-07-23.md`](latency-cost-2026-07-23.md):
+>
+> 1. **The drain path is no longer ~3.5× RTT — it's ~2.3×.** Perf review 2026-07-23 #6 removed a
+>    redundant lock GET (the lease now carries the lock etag from our own PUT response, so release
+>    is one conditional DELETE). The remaining data-PUT→lock-DELETE ordering is irreducible.
+> 2. **This report's attribution of the third round-trip to the `.db.etag` sidecar upload was
+>    WRONG** — the sidecar is a local file and never crosses the network. Don't carry that
+>    reasoning forward.
+>
+> **What still holds:** the cold-open finding. ~1 RTT, confirming the `Shard.init` acquire∥pull
+> overlap, and the 07-23 re-run measured it unchanged (26 / 70 / 133 ms vs this report's
+> 24 / 77 / 137 ms — within noise). Cite this report for cold-open history; cite 07-23 for
+> anything about flush or drain.
+
 **2026-07-11, Apple M5 Max (18 cores), macOS 27.0.** The 3-node chaos rig (`fathom1/2/3`
 behind nginx + MinIO + per-node toxiproxy, all in one colima VM — 12 vCPU / 94 GB, prod-release
 nodes). This is the **TPC Phase-4 follow-on** the [fleet-density run](fleet-density-2026-07-10.md)
