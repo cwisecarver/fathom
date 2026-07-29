@@ -14,6 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       MIX_ENV: test
+      # config/test.exs: PGUSER || USER || "postgres". Pin it so the suite doesn't depend
+      # on the runner's OS user matching the Postgres role.
+      PGUSER: postgres
+      PGHOST: localhost
 
     strategy:
       # Elixir stays at 1.20.1 (filo requires ~> 1.20); we vary OTP to catch VM-version issues.
@@ -26,14 +30,17 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          # config/test.exs connects to Fathom.Repo as "cwisecarver" with no password on
-          # localhost, so stand up a matching superuser with trust auth (it CREATEs fathom_test).
-          POSTGRES_USER: cwisecarver
+          # config/test.exs resolves the role as PGUSER || USER || "postgres". On a runner
+          # USER is "runner", so this used to hardcode a developer's local username here to
+          # make them match -- which broke the moment CI ran anywhere else. Instead: a
+          # conventional "postgres" role, and PGUSER pinned in the job env below so the
+          # resolution is deterministic rather than dependent on who the runner is.
+          POSTGRES_USER: postgres
           POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U cwisecarver"
+          --health-cmd "pg_isready -U postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5

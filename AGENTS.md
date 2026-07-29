@@ -125,15 +125,15 @@ Complements the framework **Test guidelines** below (`start_supervised!`, no `Pr
 
 A "gate" is a check that must pass *before* a commit lands — not after.
 
-- **GitHub Actions CI is DISABLED, and cannot usefully be re-enabled until the repos go public.**
-  The account is **out of Actions minutes for private repos**, so a run fails in ~12 s having
-  executed zero steps — a red X that says nothing about the code. Verified 2026-07-28 across
-  fathom and filo (and the sibling demo repos): identical 12 s zero-step failures. (It was briefly re-enabled that day
-  and immediately reverted for this reason.) **Public repos get unlimited free Actions**, so flip
-  it on at the OSS launch and not before:
-  `gh api -X PUT repos/cwisecarver/fathom/actions/permissions -F enabled=true`.
-  Until then there is **no server-side safety net** — the *local* gates below are the only
-  enforcement. Never lean on CI to catch a break; run `mix precommit` yourself before every commit.
+- **GitHub Actions CI runs again** (2026-07-29). It was off while the repo was private — the
+  account is out of Actions minutes for private repos, and a run would fail in ~12 s having
+  executed zero steps. Going public restored free minutes. The first real run immediately caught
+  a bug the outage had been hiding: the workflow hardcoded a developer's local username as the
+  Postgres role, so `config/test.exs` (which resolves `PGUSER || USER || "postgres"`) asked for
+  role `runner` on a runner. `PGUSER`/`PGHOST` are now pinned in the job env.
+  **CI is the second opinion, not the first** — `mix precommit` is still the gate that has to pass
+  before a commit lands. Disable with
+  `gh api -X PUT repos/cwisecarver/fathom/actions/permissions -F enabled=false`.
 - **`mix precommit` is the commit gate** (defined in `mix.exs`): `compile --warnings-as-errors`, `deps.unlock --unused`, `format`, `test`. **Never commit if it fails.** Run it when you're done with all changes and fix everything it surfaces.
 - **Migration gate.** A schema migration must not ship without: (a) a forward copy+transform test, (b) a revert-flip test, (c) a cross-version-tolerance check. A migration that can't be reverted by pointer-flip within the retention window, or that the running app can't tolerate mid-rollout, is not done.
 - **Shard-isolation gate.** Any change to shard routing (`Fathom.ShardExecutor.shard_from_conn`, `Fathom.Shards`, shard-path construction, or the planned `Fathom.Directory` resolve) must have a test proving shard A never resolves to shard B. Treat a cross-tenant leak as a release blocker, not a finding.
