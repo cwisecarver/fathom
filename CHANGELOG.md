@@ -9,9 +9,28 @@ records the Filo version it was built against. Pin both repos to the listed pair
 
 | fathom | Filo | Notes |
 |---|---|---|
-| 0.3.0 | **0.2.0** | Requires Filo 0.2.0 or later: fathom uses `Filo.Client` (the chaos-rig driver) and the `:authorize` seam (`Fathom.HranaAuth`), neither of which exists in Filo 0.1.0. |
+| unreleased | **0.2.0** (from Hex) | Filo is a Hex dep now, so Mix enforces this pairing instead of the table. |
+| 0.3.0 | **0.2.0** (path dep) | Requires Filo 0.2.0 or later: fathom uses `Filo.Client` (the chaos-rig driver) and the `:authorize` seam (`Fathom.HranaAuth`), neither of which exists in Filo 0.1.0. |
 | 0.2.0 | 0.1.0 | Filo path dep; HTTP v1/v2/v3 (+cursor) + WebSocket hrana1/2/3. |
 | 0.1.0 | 0.1.0 | Initial working slice. |
+
+## [Unreleased]
+
+### Changed
+
+- **Filo now comes from Hex** (`{:filo, "~> 0.2.0"}`) instead of a `path: "../filo"`
+  dep. A clone of fathom no longer needs filo checked out as a sibling — `mix deps.get`
+  is enough. Pinned to the patch range, not `~> 0.2`: filo is pre-1.0, where the minor
+  number carries breaking changes.
+
+  Co-developing both repos still works without editing `mix.exs` — set `FILO_PATH`:
+
+      FILO_PATH=../filo mix test
+
+- **CI dropped the sibling-checkout scaffolding.** It used to check fathom out into a
+  `fathom/` subdirectory solely so it could clone the private filo repo alongside it
+  via a `FILO_ACCESS_TOKEN` PAT. Now a plain root checkout with no second repo and no
+  PAT. **That secret can be deleted from the repo settings.**
 
 ## [0.3.0] - 2026-07-28
 
