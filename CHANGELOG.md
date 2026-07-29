@@ -102,6 +102,12 @@ rebalancer and a sustained performance iteration. 231 commits: 32 features, 35 f
 - **`rel/` is shipped into the release images** (it was silently absent, so every
   `vm.args` flag was too).
 
+### Notes
+
+- **CI stays disabled** until the repos go public. The account is out of Actions minutes
+  for private repos, so a run fails in ~12 s having executed zero steps. `mix precommit`
+  is the only enforcement until launch. See `AGENTS.md`.
+
 ### Performance
 
 Measured, with the reports in `docs/reviews/`. Highlights: the drain path dropped
