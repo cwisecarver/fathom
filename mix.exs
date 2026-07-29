@@ -93,14 +93,30 @@ defmodule Fathom.MixProject do
       {:dns_cluster, "~> 0.2.0"},
       {:bandit, "~> 1.5"},
       {:exqlite, "~> 0.27"},
-      # The Hrana (libSQL) protocol server — Fathom serves shards through it.
-      {:filo, path: "../filo"},
+      # The Hrana (libSQL) protocol server AND client — fathom serves shards through it.
+      # On Hex as of filo 0.2.0, so a clone of fathom no longer needs filo as a sibling.
+      #
+      # "~> 0.2.0" and not "~> 0.2": filo is pre-1.0, and its CONTRIBUTING states that
+      # below 1.0.0 the MINOR number carries breaking changes. So this must not float
+      # to 0.3.0 on its own.
+      #
+      # Co-developing both repos? Point FILO_PATH at your checkout — no mix.exs edit,
+      # so the path dep can never be committed by accident:
+      #     FILO_PATH=../filo mix test
+      {:filo, filo_dep()},
       # In-process Hrana WebSocket *client*, dev/test only — the loopback client the
       # wire benches use to exercise the full Filo.Socket path (Phase 1,
       # docs/tpc-benchmark-plan.md). `mint` + `castore` are already transitive (Finch/Req),
       # so this adds only the thin WS layer, and never ships in a prod release.
       {:mint_web_socket, "~> 1.0", only: [:dev, :test]}
     ]
+  end
+
+  defp filo_dep do
+    case System.get_env("FILO_PATH") do
+      nil -> "~> 0.2.0"
+      path -> [path: path, override: true]
+    end
   end
 
   # Aliases are shortcuts or tasks specific to the current project.

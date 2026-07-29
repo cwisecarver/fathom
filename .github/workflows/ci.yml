@@ -39,23 +39,11 @@ jobs:
           --health-retries 5
 
     steps:
-      - name: Checkout fathom
-        uses: actions/checkout@v4
-        with:
-          path: fathom
-
-      # Fathom depends on Filo via a local path dep ({:filo, path: "../filo"}), so Filo must sit
-      # next to it in the workspace ($WORKSPACE/filo == ../filo from $WORKSPACE/fathom). Filo is a
-      # PRIVATE repo, so the default GITHUB_TOKEN (scoped to this repo) can't read it — provide a
-      # token with read access to cwisecarver/filo in the FILO_ACCESS_TOKEN secret (a fine-grained
-      # PAT with Contents: read on filo). CI pairs this branch against filo's main.
-      - name: Checkout filo (path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: cwisecarver/filo
-          ref: main
-          token: ${{ secrets.FILO_ACCESS_TOKEN }}
-          path: filo
+      # Filo comes from Hex as of fathom 0.3.0, so this is a plain single-repo checkout.
+      # It used to check fathom out into a fathom/ subdirectory and clone the PRIVATE filo
+      # repo alongside it (via a FILO_ACCESS_TOKEN PAT) to satisfy a `path: "../filo"` dep.
+      # None of that is needed now — the secret can be deleted from the repo settings.
+      - uses: actions/checkout@v4
 
       - name: Set up Elixir/OTP
         uses: erlef/setup-beam@v1
@@ -68,28 +56,23 @@ jobs:
         with:
           # _build artifacts are OTP-specific, so key the cache on the OTP version too.
           path: |
-            fathom/deps
-            fathom/_build
-          key: ${{ runner.os }}-otp${{ matrix.otp }}-mix-${{ hashFiles('fathom/mix.lock') }}
+            deps
+            _build
+          key: ${{ runner.os }}-otp${{ matrix.otp }}-mix-${{ hashFiles('mix.lock') }}
           restore-keys: |
             ${{ runner.os }}-otp${{ matrix.otp }}-mix-
 
       - name: Install dependencies
-        working-directory: fathom
         run: mix deps.get
 
       - name: Check formatting
-        working-directory: fathom
         run: mix format --check-formatted
 
-      # exqlite / lazy_html compile a C NIF (gnu toolchain is preinstalled); ecto_libsql pulls a
-      # precompiled Rust NIF via rustler_precompiled (no Rust toolchain needed).
+      # exqlite / lazy_html compile a C NIF; the gnu toolchain is preinstalled on the runner.
       - name: Compile (warnings as errors)
-        working-directory: fathom
         run: mix compile --warnings-as-errors
 
       # The `mix test` alias creates + migrates the test Postgres DB, then runs the suite. :s3
       # (live MinIO) and :bench tests are excluded by test/test_helper.exs.
       - name: Run tests
-        working-directory: fathom
         run: mix test
