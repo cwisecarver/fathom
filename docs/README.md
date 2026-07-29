@@ -13,11 +13,6 @@ Each doc says whether it describes **built** behavior or a **plan**.
 "Getting started" (Docker eval stack + native dev); [`../CONTRIBUTING.md`](../CONTRIBUTING.md) is the
 set-up-and-land-a-change guide for developers.
 
-**Want to see it working before reading about it?**
-[**djathom**](https://github.com/cwisecarver/djathom) is a complete Django app on fathom — one
-SQLite database per household — that comes up with `docker compose up` and ships a guided
-walkthrough. That's the fastest path from "what is this" to "oh, I see."
-
 ## How it works — built-engine stories
 
 The "how it actually works" narratives for the major built subsystems. A good learning order is

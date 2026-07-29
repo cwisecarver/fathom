@@ -128,7 +128,7 @@ A "gate" is a check that must pass *before* a commit lands — not after.
 - **GitHub Actions CI is DISABLED, and cannot usefully be re-enabled until the repos go public.**
   The account is **out of Actions minutes for private repos**, so a run fails in ~12 s having
   executed zero steps — a red X that says nothing about the code. Verified 2026-07-28 across
-  fathom, filo and djathom: identical 12 s zero-step failures. (It was briefly re-enabled that day
+  fathom and filo (and the sibling demo repos): identical 12 s zero-step failures. (It was briefly re-enabled that day
   and immediately reverted for this reason.) **Public repos get unlimited free Actions**, so flip
   it on at the OSS launch and not before:
   `gh api -X PUT repos/cwisecarver/fathom/actions/permissions -F enabled=true`.

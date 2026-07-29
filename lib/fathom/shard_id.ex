@@ -22,7 +22,7 @@ defmodule Fathom.ShardId do
   Underscore ids still work on the plaintext path and would only be reachable over TLS via
   a per-name (non-wildcard) cert. This is a naming guideline, not enforced here — the gate
   stays permissive so the constraint lives with the deployment's TLS choice, not the id
-  validator. See the djathom demo, which mints hyphenated ids for exactly this reason.
+  validator. Mint hyphenated ids (never underscores) if you serve shards under a wildcard cert.
   """
 
   # Alphanumerics, underscore, hyphen; 1..64 chars. No dot (blocks `..` traversal and

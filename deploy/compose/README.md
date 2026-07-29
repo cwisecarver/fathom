@@ -121,8 +121,8 @@ data plane as **`wss` on `:8443`** and the admin/control-plane API as **`https` 
 (→ `fathom:4000`), while fathom keeps speaking plain HTTP on `:8080`/`:4000` behind it — same
 posture as the production LB. Mount it in place of `nginx.conf` and mount a wildcard cert +
 key at `/etc/nginx/certs/{fullchain,privkey}.pem`, then point clients at `wss://<shard>.<zone>:8443`
-and the API at `https://<name>.<zone>:4443`. The [djathom demo stack](https://github.com/cwisecarver/djathom)
-wires this end to end — it generates a throwaway CA + `*.fathom.local` wildcard at compose-up and
-makes its client trust the CA, so no per-shard token ever rides plaintext.
+and the API at `https://<name>.<zone>:4443`. For local eval, generate a throwaway CA + a
+`*.<zone>` wildcard at compose-up and make the client trust that CA — that keeps per-shard
+tokens off plaintext without needing a real trust anchor.
 
 Tear down: `docker compose down -v`.

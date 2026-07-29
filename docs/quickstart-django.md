@@ -6,18 +6,12 @@ everything else.
 
 **Multi-tenant per-request routing is built**, just not yet packaged. The `django_fathom` package
 (runtime shard-alias registration with an LRU bound, a fail-closed database router, and a
-`shard_id=` queryset kwarg) picks a tenant's shard **per request** and is proven in two working
-apps — see below. What remains open from review #16 is *distribution*: publishing it as an
+`shard_id=` queryset kwarg) picks a tenant's shard **per request**, and is exercised end to end
+against a real fathom. What remains open from review #16 is *distribution*: publishing it as an
 installable `fathom-django` rather than a directory each app vendors.
 
 Pairs with the eval stack ([`deploy/compose/README.md`](../deploy/compose/README.md)) and the proven
 validation harness (`test/django_validation/`).
-
-**Want a complete worked application instead of a walkthrough?**
-[**djathom**](https://github.com/cwisecarver/djathom) is a full personal-finance app with one
-SQLite database per household, multi-tenant per-request routing included, running unmodified on
-fathom — `docker compose up` and it's live. The routing package it uses is also vendored in
-[django-fathom-example](https://github.com/cwisecarver/django-fathom-example).
 
 ## 0. Bring up fathom
 
