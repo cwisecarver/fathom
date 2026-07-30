@@ -107,6 +107,98 @@ defmodule Fathom.Migrator.CaptureTest do
       refute log =~ "DATA-MIGRATION"
     end
 
+    # Django's SQLite backend cannot ALTER most things in place, so it REBUILDS the table
+    # (`_remake_table`) — and the copy step is an INSERT, which this lint flagged as a
+    # template-literal data migration. Consequence: the release was held requires_review, which
+    # CAPS the fleet HEAD below it, so the unattended rollout stopped dead on almost every real
+    # Django migration (AlterField, AddField-with-default, unique_together, index changes all take
+    # the rebuild path). The engine's primary use case was effectively unusable.
+    #
+    # It was invisible because every existing test above writes SQL by hand. These statements are
+    # the VERBATIM capture of a real `manage.py migrate` of a Django 5.0 app whose 0001_initial
+    # declares `Meta.indexes` (djathom's finance app, captured live 2026-07-30) — a plain initial
+    # migration with no data migration anywhere in it.
+    #
+    # The invariant: an INSERT whose rows come from a SELECT is a SHARD-LOCAL row copy (a shard is
+    # one SQLite file, never ATTACHed to another), so it carries no template values and replays
+    # safely. Pre-fix this test fails on the requires_review assertion.
+    test "does not flag Django's SQLite table-rebuild copy (INSERT ... SELECT is shard-local)" do
+      import ExUnit.CaptureLog
+
+      conn = make_ref()
+      Capture.begin(conn, 0)
+
+      Capture.append(
+        conn,
+        ~s|CREATE TABLE "finance_transaction" ("id" integer NOT NULL PRIMARY KEY AUTOINCREMENT, "date" date NOT NULL)|
+      )
+
+      Capture.append(
+        conn,
+        ~s|CREATE TABLE "new__finance_transaction" ("id" integer NOT NULL PRIMARY KEY AUTOINCREMENT, "date" date NOT NULL, "account_id" bigint NOT NULL REFERENCES "finance_account" ("id") DEFERRABLE INITIALLY DEFERRED)|
+      )
+
+      Capture.append(
+        conn,
+        ~s|INSERT INTO "new__finance_transaction" ("id", "date", "account_id") SELECT "id", "date", NULL FROM "finance_transaction"|
+      )
+
+      Capture.append(conn, ~s|DROP TABLE "finance_transaction"|)
+
+      Capture.append(
+        conn,
+        ~s|ALTER TABLE "new__finance_transaction" RENAME TO "finance_transaction"|
+      )
+
+      Capture.append(
+        conn,
+        ~s|CREATE INDEX "finance_tra_date_f21d66_idx" ON "finance_transaction" ("date")|
+      )
+
+      Capture.append(
+        conn,
+        ~s|INSERT INTO "django_migrations" ("app", "name", "applied") VALUES (?, ?, ?) RETURNING "django_migrations"."id"|
+      )
+
+      {result, log} = with_log(fn -> Capture.commit(conn, 1) end)
+      assert {:recorded, version} = result
+      refute log =~ "DATA-MIGRATION"
+
+      assert [%{version: ^version, requires_review: false}] = Migrator.list()
+      assert Migrator.pending_review() == []
+
+      assert Migrator.head() == version,
+             "an ordinary Django migration must become HEAD — a rebuild copy is not a data migration"
+    end
+
+    # The exemption must not become a hole: a RunPython backfill that happens to read a table is
+    # still template data crossing the wire, and anything with a VALUES row-source stays flagged.
+    test "still flags real DML: VALUES inserts, UPDATE, and DELETE on tenant tables" do
+      import ExUnit.CaptureLog
+
+      for dml <- [
+            ~s|INSERT INTO "app_thing" ("slug") VALUES ('from-template')|,
+            ~s|INSERT INTO "app_thing" ("slug") VALUES ((SELECT "slug" FROM "app_other"))|,
+            ~s|UPDATE "app_thing" SET "slug" = 'from-template' WHERE "id" = 1|,
+            ~s|DELETE FROM "app_thing" WHERE "id" = 1|,
+            ~s|REPLACE INTO "app_thing" ("id", "slug") VALUES (1, 'x')|
+          ] do
+        conn = make_ref()
+        Capture.begin(conn, 0)
+        Capture.append(conn, ~s|CREATE TABLE "app_thing" ("id" integer PRIMARY KEY, "slug" text)|)
+        Capture.append(conn, dml)
+        Capture.append(conn, ~s|INSERT INTO django_migrations (app, name) VALUES ('app', '0002')|)
+
+        {result, log} = with_log(fn -> Capture.commit(conn, 1) end)
+        assert {:recorded, version} = result
+
+        assert log =~ "DATA-MIGRATION", "expected #{dml} to be flagged"
+
+        assert version in Enum.map(Migrator.pending_review(), & &1.version),
+               "expected #{dml} to be held for review"
+      end
+    end
+
     # Expert review #6: a non-atomic (`atomic = False`) migration runs autocommit — no tracked
     # BEGIN/COMMIT — so capture never sees it, the template schema moves, and the fleet never hears.
     # Caught at the NEXT capture: its pre-transaction count exceeds the last captured count (the gap).

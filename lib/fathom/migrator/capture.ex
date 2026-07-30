@@ -300,10 +300,35 @@ defmodule Fathom.Migrator.Capture do
   defp data_migration_statements(statements) do
     Enum.filter(statements, fn sql ->
       lead = sql |> String.trim_leading() |> String.slice(0, 12) |> String.downcase()
+      down = String.downcase(sql)
 
       Enum.any?(@dml_leads, &String.starts_with?(lead, &1)) and
-        not String.contains?(String.downcase(sql), "django_migrations")
+        not String.contains?(down, "django_migrations") and
+        not shard_local_row_copy?(lead, down)
     end)
+  end
+
+  # Django's SQLite backend cannot ALTER most things in place, so it REBUILDS the table
+  # (`_remake_table`): CREATE TABLE new__x → INSERT INTO new__x (cols) SELECT cols FROM x →
+  # DROP TABLE x → ALTER TABLE new__x RENAME TO x. That INSERT is DML, and flagging it froze the
+  # fleet HEAD below almost every real Django migration on SQLite — AlterField, AddField with a
+  # default, unique_together, index changes all take the rebuild path — so the unattended rollout
+  # this engine exists for could essentially never proceed. Found by running an actual Django
+  # `migrate` through capture (a real `0001_initial` with `Meta.indexes` rebuilds), which the
+  # hand-written toy SQL in the tests never exercised.
+  #
+  # The exemption is narrow and safe by construction: the INSERT's rows come from a SELECT over a
+  # table in the SAME file (a shard is one SQLite database and fathom never ATTACHes another), so
+  # replaying it onto another tenant copies THAT tenant's rows. There are no template values in it
+  # to leak. That is precisely the opposite of the RunPython-backfill shape this lint exists to
+  # catch, where the template's own row values ride along in the statement.
+  #
+  # Fails closed: only an INSERT drawing from a SELECT with NO `values` row-source is exempt.
+  # Anything carrying VALUES (including `INSERT ... VALUES ((SELECT …))`) stays flagged, as does
+  # every UPDATE/DELETE/REPLACE — the rebuild path never emits those.
+  defp shard_local_row_copy?(lead, down) do
+    String.starts_with?(lead, "insert") and String.contains?(down, "select") and
+      not String.contains?(down, "values")
   end
 
   # The version is computed per attempt (next_version() under the unique index as

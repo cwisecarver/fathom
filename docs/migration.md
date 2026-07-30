@@ -61,6 +61,18 @@ clears the flag after the operator confirms it's safe (or supplies a real per-sh
 hook), and HEAD then advances. A flagged version blocks everything above it too (the linear graph
 has no skip).
 
+**One DML shape is exempt: Django's SQLite table rebuild.** SQLite can't `ALTER` most things in
+place, so Django's backend rebuilds the table (`_remake_table`): `CREATE TABLE new__x` →
+`INSERT INTO new__x (cols) SELECT cols FROM x` → `DROP TABLE x` → `RENAME`. That INSERT is DML, but
+its rows come from a `SELECT` over a table in the **same file** (a shard is one SQLite database and
+fathom never `ATTACH`es another), so replaying it onto another tenant copies *that* tenant's rows and
+carries no template values. Flagging it froze HEAD below almost every real Django migration —
+`AlterField`, `AddField` with a default, `unique_together`, index changes all take the rebuild path —
+which made the unattended rollout unusable for the exact stack this engine targets. So an `INSERT`
+drawing from a `SELECT` with no `VALUES` row-source is not treated as a data migration. The check
+fails closed: anything carrying `VALUES` (including `INSERT … VALUES ((SELECT …))`) stays flagged, as
+does every `UPDATE`/`DELETE`/`REPLACE`, which is the RunPython shape the lint exists for.
+
 ### Uncaptured template moves are detected (backwards + non-atomic)
 
 Capture's boundary detection is "the template's `django_migrations` count rose inside a tracked
