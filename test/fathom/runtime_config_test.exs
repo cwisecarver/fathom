@@ -64,4 +64,35 @@ defmodule Fathom.RuntimeConfigTest do
              "fathom2" => "fathom2:8080"
            }
   end
+
+  # The migration engine's entry point (`Fathom.Migrator.Capture`) only fires for the shard named
+  # by :template_shard_id, and that key had NO env wiring — it was set only in config/dev.exs, so a
+  # RELEASE could not turn capture on at all without editing config and rebuilding. Worse, the
+  # `mix fathom.snapshot template-head` error message already told operators to "set
+  # TEMPLATE_SHARD_ID", a variable nothing read. Pre-fix these first two tests fail: the key is
+  # never written.
+  test "TEMPLATE_SHARD_ID sets :template_shard_id (the release-reachable capture knob)" do
+    assert Keyword.get(fathom_config(%{"TEMPLATE_SHARD_ID" => "keystone"}), :template_shard_id) ==
+             "keystone"
+  end
+
+  test "TEMPLATE_SHARD_ID is cast, so a mixed-case value normalizes (finding #19)" do
+    # Must be the CANONICAL id: Fathom.ShardExecutor compares the request's normalized shard id
+    # against this value, so an un-normalized "KEYSTONE" here would leave capture silently off
+    # while the template looked configured.
+    assert Keyword.get(fathom_config(%{"TEMPLATE_SHARD_ID" => "KEYSTONE"}), :template_shard_id) ==
+             "keystone"
+  end
+
+  test "TEMPLATE_SHARD_ID unset leaves the key unwritten (compiled default survives)" do
+    refute Keyword.has_key?(fathom_config(%{}), :template_shard_id)
+  end
+
+  test "TEMPLATE_SHARD_ID that ShardId rejects fails the boot instead of disabling capture" do
+    for bad <- ["bad/id", "has space", "dotted.id", ""] do
+      assert_raise RuntimeError, ~r/TEMPLATE_SHARD_ID is not a valid shard id/, fn ->
+        fathom_config(%{"TEMPLATE_SHARD_ID" => bad})
+      end
+    end
+  end
 end

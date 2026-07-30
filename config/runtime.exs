@@ -228,6 +228,32 @@ case System.get_env("MIGRATE_ON_TOUCH") do
     raise "MIGRATE_ON_TOUCH must be \"off\", \"async\", or \"inline\", got: #{inspect(other)}"
 end
 
+# The reserved capture template (`Fathom.Migrator.Capture`): the one shard Django migrates
+# directly, whose transaction SQL is recorded as the next fleet version and replayed onto every
+# other shard. This had NO env wiring — it was set only in `config/dev.exs` ("demo"), so a
+# release could not reach the migration engine's entry point at all without editing config and
+# rebuilding, while `mix fathom.snapshot template-head` errored telling the operator to
+# "set TEMPLATE_SHARD_ID" — a knob nothing read.
+#
+# Top-level (not prod-only) so dev/test can override the compiled default too. The two prod boot
+# guards already cover a set template: `Fathom.Application.check_template_default!` refuses
+# :default_shard == the template (finding #17 — anonymous default traffic would drive fleet-wide
+# capture) and `check_template_auth!` refuses a prod template with :hrana_auth disabled (expert
+# review #9 — an anonymously reachable template is a fleet-wide poisoning vector).
+#
+# Cast rather than trust the string: an id that ShardId rejects (or that normalizes to a
+# different id than the operator typed) would silently never match the template branch in
+# `Fathom.ShardExecutor`, so capture would stay off with the template *looking* configured.
+if template = System.get_env("TEMPLATE_SHARD_ID") do
+  case Fathom.ShardId.cast(template) do
+    {:ok, id} ->
+      config :fathom, :template_shard_id, id
+
+    :error ->
+      raise "TEMPLATE_SHARD_ID is not a valid shard id: #{inspect(template)}"
+  end
+end
+
 # --- Phase-2 B1 dynamic rebalancing (all off by default) ---------------------------
 # A stable per-node key the LB addresses this node as (the exception table / backend set
 # reference it). Default node(); set per node in a fleet (e.g. NODE_KEY=fathom1).
