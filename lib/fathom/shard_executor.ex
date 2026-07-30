@@ -556,10 +556,28 @@ defmodule Fathom.ShardExecutor do
 
   defp observe(conn, sql) do
     case Capture.classify(sql) do
-      :begin -> Capture.begin(conn, migrations_count(conn))
-      :commit -> Capture.commit(conn, migrations_count(conn))
-      :rollback -> Capture.rollback(conn)
-      :other -> Capture.append(conn, sql)
+      :begin ->
+        Capture.begin(conn, migrations_count(conn))
+
+      :commit ->
+        Capture.commit(conn, migrations_count(conn))
+
+      :rollback ->
+        Capture.rollback(conn)
+
+      :other ->
+        # Django's `INSERT INTO django_migrations` bookkeeping row is what marks a migration applied,
+        # and its SQLite backend sometimes emits it AFTER the COMMIT (it has to commit before it can
+        # re-enable FK checks). Route it to Capture.bookkeeping/4 so a buffer parked awaiting that row
+        # is recorded — otherwise the count-rose boundary test reads the whole migration as a no-op
+        # and the fleet silently never receives the version. Costs one count query on that single
+        # statement; every other statement still takes the plain append. Note capture runs AFTER the
+        # statement succeeded, so the count here already includes this INSERT.
+        if Capture.bookkeeping?(sql) do
+          Capture.bookkeeping(conn, sql, migrations_count(conn))
+        else
+          Capture.append(conn, sql)
+        end
     end
 
     :ok

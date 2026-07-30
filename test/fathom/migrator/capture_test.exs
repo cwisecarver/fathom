@@ -171,6 +171,123 @@ defmodule Fathom.Migrator.CaptureTest do
              "an ordinary Django migration must become HEAD — a rebuild copy is not a data migration"
     end
 
+    # Django's SQLite backend must COMMIT before it can re-enable FK checks, so for a migration that
+    # disables them — a CreateModel carrying a ForeignKey, for instance — it records the
+    # `django_migrations` row AFTER the transaction:
+    #
+    #   BEGIN / CREATE TABLE ... / CREATE INDEX ... / COMMIT / PRAGMA foreign_keys = ON /
+    #   INSERT INTO django_migrations ...
+    #
+    # The count-rose-by-COMMIT boundary test therefore saw NO rise and returned :noop, so the version
+    # was NEVER recorded: the template's schema advanced, the fleet silently never heard, and nothing
+    # alarmed — the exact template↔fleet fork this engine exists to prevent, on an ordinary migration
+    # (not an `atomic = False` one). The #6 gap detector does not save it: that only fires on a LATER
+    # capture, and there may not be one.
+    #
+    # Found live 2026-07-30 by running a real `manage.py migrate` (djathom finance.0002_budget)
+    # through capture — the template ended with both migrations applied while Migrator.list() held
+    # only v1. Statements below are that run's shape. Pre-fix this test fails: nothing is recorded.
+    test "records a migration whose django_migrations row lands AFTER the commit" do
+      import ExUnit.CaptureLog
+
+      conn = make_ref()
+      Capture.begin(conn, 0)
+
+      Capture.append(
+        conn,
+        ~s|CREATE TABLE "finance_budget" ("id" integer NOT NULL PRIMARY KEY AUTOINCREMENT, "category_id" bigint NOT NULL REFERENCES "finance_category" ("id"))|
+      )
+
+      Capture.append(
+        conn,
+        ~s|CREATE INDEX "finance_budget_category_id_3ead498a" ON "finance_budget" ("category_id")|
+      )
+
+      # The count has NOT risen yet — Django has not written the bookkeeping row.
+      assert Capture.commit(conn, 0) == :noop
+      assert Migrator.list() == [], "nothing is recorded until the migration is marked applied"
+
+      insert = ~s|INSERT INTO "django_migrations" ("app", "name", "applied") VALUES (?, ?, ?)|
+
+      {result, log} =
+        with_log(fn -> Capture.bookkeeping(conn, insert, 1) end)
+
+      assert {:recorded, version} = result
+      refute log =~ "DATA-MIGRATION"
+
+      # The bookkeeping INSERT is part of the recorded version, so a replayed shard gets its own
+      # django_migrations row — the same shape the in-transaction path produces.
+      assert Migrator.statements(version) == [
+               ~s|CREATE TABLE "finance_budget" ("id" integer NOT NULL PRIMARY KEY AUTOINCREMENT, "category_id" bigint NOT NULL REFERENCES "finance_category" ("id"))|,
+               ~s|CREATE INDEX "finance_budget_category_id_3ead498a" ON "finance_budget" ("category_id")|,
+               insert
+             ]
+
+      assert Migrator.head() == version
+      assert Migrator.pending_review() == []
+    end
+
+    test "statements between the commit and the bookkeeping row are not captured" do
+      conn = make_ref()
+      Capture.begin(conn, 0)
+      Capture.append(conn, ~s|CREATE TABLE "t" ("id" integer PRIMARY KEY)|)
+      assert Capture.commit(conn, 0) == :noop
+
+      # Django sends this between the COMMIT and the bookkeeping row. It is not part of the
+      # migration, and replaying it onto every tenant would be noise in the fleet version.
+      Capture.append(conn, "PRAGMA foreign_keys = ON")
+
+      insert = ~s|INSERT INTO "django_migrations" ("app", "name") VALUES (?, ?)|
+      assert {:recorded, version} = Capture.bookkeeping(conn, insert, 1)
+
+      statements = Migrator.statements(version)
+      refute Enum.any?(statements, &(&1 =~ "foreign_keys"))
+      assert statements == [~s|CREATE TABLE "t" ("id" integer PRIMARY KEY)|, insert]
+    end
+
+    test "a genuinely empty transaction is still a no-op, not a phantom version" do
+      # The awaiting-bookkeeping buffer must not turn every no-rise commit into a release. A new
+      # BEGIN supersedes it (the previous transaction never marked a migration applied).
+      c1 = make_ref()
+      Capture.begin(c1, 0)
+      Capture.append(c1, "SELECT 1")
+      assert Capture.commit(c1, 0) == :noop
+
+      Capture.begin(c1, 0)
+      Capture.append(c1, "SELECT 2")
+      assert Capture.commit(c1, 0) == :noop
+
+      assert Migrator.list() == []
+      assert Migrator.head() == 0
+    end
+
+    test "a second bookkeeping row does not re-record the same version" do
+      conn = make_ref()
+      Capture.begin(conn, 0)
+      Capture.append(conn, ~s|CREATE TABLE "t" ("id" integer PRIMARY KEY)|)
+      assert Capture.commit(conn, 0) == :noop
+
+      insert = ~s|INSERT INTO "django_migrations" ("app", "name") VALUES (?, ?)|
+      assert {:recorded, _} = Capture.bookkeeping(conn, insert, 1)
+
+      # The buffer is consumed; a repeat (or Django's follow-up SELECT-then-INSERT) records nothing.
+      assert Capture.bookkeeping(conn, insert, 2) == :noop
+
+      assert length(Migrator.list()) == 1
+    end
+
+    test "bookkeeping?/1 matches Django's applied-migration INSERT only" do
+      assert Capture.bookkeeping?(~s|INSERT INTO "django_migrations" ("app") VALUES (?)|)
+      assert Capture.bookkeeping?("insert into django_migrations (app) values (?)")
+
+      # A backwards migrate DELETEs the row — commit/3's shrink branch alarms on that; it must not
+      # be mistaken for a migration being applied.
+      refute Capture.bookkeeping?(~s|DELETE FROM "django_migrations" WHERE "id" = 1|)
+      refute Capture.bookkeeping?(~s|INSERT INTO "finance_budget" ("id") VALUES (1)|)
+      refute Capture.bookkeeping?(~s|SELECT * FROM "django_migrations"|)
+      refute Capture.bookkeeping?(nil)
+    end
+
     # The exemption must not become a hole: a RunPython backfill that happens to read a table is
     # still template data crossing the wire, and anything with a VALUES row-source stays flagged.
     test "still flags real DML: VALUES inserts, UPDATE, and DELETE on tenant tables" do

@@ -73,6 +73,24 @@ drawing from a `SELECT` with no `VALUES` row-source is not treated as a data mig
 fails closed: anything carrying `VALUES` (including `INSERT … VALUES ((SELECT …))`) stays flagged, as
 does every `UPDATE`/`DELETE`/`REPLACE`, which is the RunPython shape the lint exists for.
 
+### The migration boundary is not always the `COMMIT`
+
+Capture's boundary is "the template's `django_migrations` count rose", but Django's SQLite backend
+must commit before it can re-enable foreign-key checks, so for any migration that disables them (a
+`CreateModel` carrying a ForeignKey, say) it records the migration *after* the transaction:
+
+```
+BEGIN / CREATE TABLE … / CREATE INDEX … / COMMIT / PRAGMA foreign_keys = ON / INSERT INTO django_migrations …
+```
+
+At `COMMIT` the count has not moved. So a no-rise commit **parks** its buffer awaiting bookkeeping,
+and the version is recorded when the `django_migrations` INSERT arrives (`Capture.bookkeeping/4`);
+statements in between (that `PRAGMA`) are not part of the migration and are dropped. An awaiting
+buffer that never gets its row is discarded on the next `BEGIN` or on stream close, so an empty
+transaction is still a no-op. Before this, such a migration read as a no-op: the version was never
+recorded and the template silently advanced past the fleet **with no alarm** — the fork this whole
+section exists to prevent, reached through an ordinary migration rather than an `atomic = False` one.
+
 ### Uncaptured template moves are detected (backwards + non-atomic)
 
 Capture's boundary detection is "the template's `django_migrations` count rose inside a tracked

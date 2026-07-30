@@ -14,6 +14,20 @@ defmodule Fathom.Migrator.Capture do
   Boundary detection is the row-count rise, not SQL parsing; only transaction-
   control verbs are classified (`classify/1`). Statements outside a tracked
   transaction (autocommit) are ignored — see the engine plan's limitations.
+
+  **The count does not always rise by `COMMIT`.** Django's SQLite backend has to commit before it
+  can re-enable foreign-key checks, so for any migration that disables them — a `CreateModel`
+  carrying a ForeignKey, for instance — it writes the `django_migrations` row *after* the
+  transaction:
+
+      BEGIN / CREATE TABLE … / CREATE INDEX … / COMMIT / PRAGMA foreign_keys = ON /
+      INSERT INTO django_migrations …
+
+  A commit with no rise therefore parks its buffer **awaiting bookkeeping** instead of discarding
+  it, and `bookkeeping/4` records the version when that row lands (`bookkeeping?/1` recognizes it).
+  An awaiting buffer that never gets confirmed is dropped on the next `BEGIN` or on stream close, so
+  a genuinely empty transaction is still a no-op. Without this the migration read as a no-op, the
+  version was never recorded, and the template silently advanced past the fleet with no alarm.
   """
   use GenServer
 
@@ -35,9 +49,45 @@ defmodule Fathom.Migrator.Capture do
   @doc """
   Closes `conn_id`'s transaction: if `migrations_count` rose, records the buffered
   SQL as the next version. Returns `{:recorded, version}`, `:noop`, or `{:error, _}`.
+
+  A commit whose count did NOT rise keeps its buffer *awaiting bookkeeping* rather than
+  discarding it — see `bookkeeping/4`.
   """
   def commit(conn_id, migrations_count, server \\ __MODULE__),
     do: GenServer.call(server, {:commit, conn_id, migrations_count})
+
+  @doc """
+  Whether `sql` is Django's own `INSERT INTO django_migrations` bookkeeping row — the statement
+  that marks a migration as applied. Deliberately does not match a `DELETE` (a backwards migrate,
+  which `commit/3`'s shrink branch alarms on).
+  """
+  @spec bookkeeping?(String.t()) :: boolean()
+  def bookkeeping?(sql) when is_binary(sql) do
+    norm = sql |> String.trim() |> String.upcase()
+    String.starts_with?(norm, "INSERT") and String.contains?(norm, "DJANGO_MIGRATIONS")
+  end
+
+  def bookkeeping?(_), do: false
+
+  @doc """
+  Feeds Django's `INSERT INTO django_migrations` bookkeeping row for `conn_id`, with the
+  template's post-statement `migrations_count`.
+
+  Two shapes reach here, and both must work:
+
+  - **Inside the transaction** (the common case, e.g. a plain `0001_initial`): a buffer is open, so
+    this behaves exactly like `append/3` and `commit/3` records the version as before.
+  - **After the transaction** (`COMMIT` then the bookkeeping row): Django's SQLite backend disables
+    FK checks around some DDL — a `CreateModel` carrying a ForeignKey, for instance — which forces
+    it to commit the DDL *before* recording the migration. The count has not risen at `COMMIT`, so
+    the count-rose boundary test alone reads the migration as a no-op and the version is **never
+    recorded**: the template advances and the fleet silently never hears (found live 2026-07-30).
+    `commit/3` therefore parks such a buffer *awaiting bookkeeping*, and this call is what closes it.
+
+  Returns `{:recorded, version}`, `:noop`, or `{:error, _}` (same contract as `commit/3`).
+  """
+  def bookkeeping(conn_id, sql, migrations_count, server \\ __MODULE__),
+    do: GenServer.call(server, {:bookkeeping, conn_id, sql, migrations_count})
 
   @doc "Discards `conn_id`'s buffered transaction (ROLLBACK)."
   def rollback(conn_id, server \\ __MODULE__),
@@ -83,13 +133,24 @@ defmodule Fathom.Migrator.Capture do
 
   @impl true
   def handle_cast({:begin, conn_id, count}, state) do
-    {:noreply, Map.put(state, conn_id, %{buffer: [], count_at_begin: count})}
+    # A new transaction supersedes any buffer awaiting bookkeeping: that one never got its
+    # `django_migrations` row, so it really was a no-op transaction (the pre-fix behavior).
+    {:noreply, Map.put(state, conn_id, %{buffer: [], count_at_begin: count, awaiting?: false})}
   end
 
   def handle_cast({:append, conn_id, sql}, state) do
     case Map.get(state, conn_id) do
-      nil -> {:noreply, state}
-      entry -> {:noreply, Map.put(state, conn_id, %{entry | buffer: [sql | entry.buffer]})}
+      nil ->
+        {:noreply, state}
+
+      # Awaiting bookkeeping = the transaction is CLOSED. Statements after the COMMIT (Django sends
+      # `PRAGMA foreign_keys = ON` there) are not part of the migration and must not pollute the
+      # version. Only the bookkeeping row itself is accepted, via bookkeeping/4.
+      %{awaiting?: true} ->
+        {:noreply, state}
+
+      entry ->
+        {:noreply, Map.put(state, conn_id, %{entry | buffer: [sql | entry.buffer]})}
     end
   end
 
@@ -137,9 +198,48 @@ defmodule Fathom.Migrator.Capture do
             alarm_backwards(before, count)
             {:reply, :noop, state}
 
+          # The count did NOT rise, but we buffered DDL. Django's SQLite backend commits the DDL
+          # BEFORE writing the `django_migrations` row whenever it has to disable FK checks, so this
+          # is not necessarily a no-op transaction — the bookkeeping row may be one statement away.
+          # Park the buffer AWAITING BOOKKEEPING instead of dropping it (see bookkeeping/4); an entry
+          # that never gets confirmed is discarded on the next BEGIN or on stream close, which is
+          # exactly the old no-op behavior.
+          buffer != [] ->
+            {:reply, :noop, Map.put(state, conn_id, awaiting(buffer, before))}
+
           true ->
             {:reply, :noop, state}
         end
+    end
+  end
+
+  def handle_call({:bookkeeping, conn_id, sql, count}, _from, state) do
+    case Map.get(state, conn_id) do
+      # An OPEN transaction: this is the ordinary in-transaction bookkeeping row. Buffer it and let
+      # commit/3 do the recording, byte-for-byte as before.
+      %{awaiting?: false} = entry ->
+        {:reply, :noop, Map.put(state, conn_id, %{entry | buffer: [sql | entry.buffer]})}
+
+      # A committed-but-unrecorded buffer, and the row Django was missing just landed. The recorded
+      # statements INCLUDE this INSERT, so a replayed shard gets its own bookkeeping row — the same
+      # shape the in-transaction path produces.
+      %{awaiting?: true, buffer: buffer, count_at_begin: before} when count > before ->
+        {entry, state} = Map.pop(state, conn_id)
+        _ = entry
+        statements = Enum.reverse([sql | buffer])
+
+        case record(statements, count, before) do
+          {:recorded, _} = recorded ->
+            {:reply, recorded, state}
+
+          # Same durability rule as commit/3: the migration has ALREADY committed on the template,
+          # so re-running `manage.py migrate` is a no-op. Keep the statements and retry.
+          {:error, _} = error ->
+            {:reply, error, stash_pending(state, statements, count, before)}
+        end
+
+      _ ->
+        {:reply, :noop, state}
     end
   end
 
@@ -290,6 +390,10 @@ defmodule Fathom.Migrator.Capture do
       %{version: version}
     )
   end
+
+  # A committed-but-unrecorded buffer: the DDL landed, the `django_migrations` row has not (yet).
+  defp awaiting(buffer, count_at_begin),
+    do: %{buffer: buffer, count_at_begin: count_at_begin, awaiting?: true}
 
   @dml_leads ~w(insert update delete replace)
 
