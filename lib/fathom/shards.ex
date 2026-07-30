@@ -299,10 +299,35 @@ defmodule Fathom.Shards do
   end
 
   defp behind?(shard_id, head) do
-    case Fathom.Directory.get(shard_id) do
-      {:ok, %{schema_version: v}} -> v < head
-      # Not yet in the directory (brand-new): nothing to migrate — the shard is born
-      # empty (or at HEAD via the gated fork-from-template, which registers its row).
+    # NEVER migrate-on-touch the reserved capture template. Django migrates it directly, so its
+    # directory stamp never advances and it perpetually reads as a laggard — but replaying its OWN
+    # captured DDL back onto itself is "already exists", and a drain racing an in-flight
+    # `manage.py migrate` can drop the capture buffer and fork the fleet from the template.
+    #
+    # `Fathom.Directory.laggard_query/1` already excludes it for the reconcile/rollout sweep (expert
+    # review 2026-07-14 #8). Migrate-on-touch (expert review #40) added a SECOND, independent
+    # "is this shard behind HEAD?" path and did not inherit that exclusion, which reopened the same
+    # bug through a different door: with `:inline`, every connection Django opens to migrate the
+    # template first blocks on a doomed self-migration (capture then never sees the real migration —
+    # the fleet silently stops receiving versions); with `:async` it enqueues a ShardMigrationJob per
+    # touch that retries into `migration_failed` quarantine. Either way, turning on the documented
+    # convergence knob broke the migration engine's own entry point.
+    if capture_template?(shard_id) do
+      false
+    else
+      case Fathom.Directory.get(shard_id) do
+        {:ok, %{schema_version: v}} -> v < head
+        # Not yet in the directory (brand-new): nothing to migrate — the shard is born
+        # empty (or at HEAD via the gated fork-from-template, which registers its row).
+        :error -> false
+      end
+    end
+  end
+
+  # Compare NORMALIZED ids (finding #19), so a mixed-case :template_shard_id still matches.
+  defp capture_template?(shard_id) do
+    case Fathom.ShardId.cast(Application.get_env(:fathom, :template_shard_id)) do
+      {:ok, id} -> id == shard_id
       :error -> false
     end
   end

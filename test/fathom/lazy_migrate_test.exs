@@ -164,5 +164,77 @@ defmodule Fathom.LazyMigrateTest do
     ShardExecutor.close(conn)
   end
 
+  # The reserved capture template must NEVER be migrate-on-touched. Django migrates it directly, so
+  # its directory stamp never advances and it always reads as a laggard — but replaying its own
+  # captured DDL back onto itself is "already exists", and a drain racing an in-flight
+  # `manage.py migrate` can drop the capture buffer and fork the fleet from the template.
+  #
+  # `Directory.laggard_query/1` already excluded it from the reconcile/rollout sweep (expert review
+  # 2026-07-14 #8), but migrate-on-touch (#40) added a SECOND independent behind-HEAD check that
+  # never inherited the exclusion — reopening the same bug through a different door. Caught by
+  # running a real `manage.py migrate` against a stack with MIGRATE_ON_TOUCH=inline: the template's
+  # own migration silently stopped being captured, so the fleet stopped receiving versions.
+  #
+  # Both modes are pinned because they take different branches (:inline migrates in-band, :async
+  # enqueues a job), and both were broken.
+  defp as_template(shard) do
+    prev = Application.get_env(:fathom, :template_shard_id)
+    Application.put_env(:fathom, :template_shard_id, shard)
+
+    on_exit(fn ->
+      if prev == nil,
+        do: Application.delete_env(:fathom, :template_shard_id),
+        else: Application.put_env(:fathom, :template_shard_id, prev)
+    end)
+  end
+
+  test "migrate_on_touch: :inline never migrates the capture template", %{shard: shard} do
+    Application.put_env(:fathom, :migrate_on_touch, :inline)
+    as_template(shard)
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    Migrator.HeadCache.refresh()
+
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    # Untouched at v1: Django owns this shard's schema, not the rollout.
+    assert {:ok, %{schema_version: 1}} = Directory.get(shard)
+
+    assert {:ok, %StmtResult{cols: ["id", "name"]}} = exec(conn, "SELECT * FROM app_thing"),
+           "the capture template must not have HEAD's DDL replayed onto itself"
+
+    ShardExecutor.close(conn)
+  end
+
+  test "migrate_on_touch: :async never enqueues a migration for the capture template",
+       %{shard: shard} do
+    Application.put_env(:fathom, :migrate_on_touch, :async)
+    as_template(shard)
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    Migrator.HeadCache.refresh()
+
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    refute_enqueued(worker: ShardMigrationJob, args: %{shard_id: shard})
+    assert {:ok, %{schema_version: 1}} = Directory.get(shard)
+
+    ShardExecutor.close(conn)
+  end
+
+  # Normalization (finding #19): a mixed-case :template_shard_id must still match the canonical id,
+  # or the exclusion silently misses and the bug is back for anyone who typed capitals.
+  test "the template exclusion compares normalized ids", %{shard: shard} do
+    Application.put_env(:fathom, :migrate_on_touch, :async)
+    as_template(String.upcase(shard))
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    Migrator.HeadCache.refresh()
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    refute_enqueued(worker: ShardMigrationJob, args: %{shard_id: shard})
+    ShardExecutor.close(conn)
+  end
+
   defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end
