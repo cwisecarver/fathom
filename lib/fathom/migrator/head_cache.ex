@@ -87,9 +87,19 @@ defmodule Fathom.Migrator.HeadCache do
 
   defp schedule(ttl), do: Process.send_after(self(), :refresh, ttl)
 
-  # Background poll only when lazy_migrate is on — nothing reads the cache otherwise.
+  # Background poll only when migrate-on-touch is enabled — nothing reads the cache otherwise.
+  #
+  # This gated on the LEGACY `:lazy_migrate` boolean, so setting the current `:migrate_on_touch`
+  # (`:async` | `:inline`, expert review #40) enabled the cache's only consumer without enabling the
+  # poll that fills it: `get/0` returned its initial 0 forever, `Fathom.Shards`' `head > 0` guard was
+  # never true, and migrate-on-touch silently did NOTHING in either mode — the documented
+  # convergence knob was a no-op. Found live 2026-07-30 with MIGRATE_ON_TOUCH=inline set and a
+  # released HEAD of 2, while HeadCache.get/0 still read 0.
+  #
+  # Deliberately calls `Fathom.Shards.migrate_on_touch_mode/0` rather than re-deriving the mode here:
+  # duplicating that resolution is exactly what let the two drift.
   defp maybe_refresh do
-    if Application.get_env(:fathom, :lazy_migrate, false), do: do_refresh()
+    if Fathom.Shards.migrate_on_touch_mode() != :off, do: do_refresh()
   end
 
   # Best-effort: a Postgres blip keeps the last cached value. HEAD is monotonic, so a

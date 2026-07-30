@@ -59,9 +59,12 @@ iex -S mix phx.server   # start app (dashboard :4000)
 
 Plan mode for non-trivial tasks (3+ steps or an architectural decision). Stop and re-plan when something goes wrong. Use subagents for research/exploration/parallel work — one task each. When the parent model is Fable, use your own judgement about which model each subagent should run on (match the model to the subtask's difficulty rather than defaulting to the parent's).
 
-**Implementation cycle:** implement → compile → test → (bench if hot path) → `mix precommit` → commit → **push**. Test after every change; fix failures before proceeding. Commit in logical units matching plan phases.
+**Implementation cycle:** implement → compile → test → (bench if hot path) → `mix precommit` → commit → **push once the work is viable**. Test after every change; fix failures before proceeding. Commit in logical units matching plan phases.
 
-- **ALWAYS `git push` immediately after every commit.** The gate lives at the *commit* — there is no separate gate at push, and push is never something to wait to be asked for. An unpushed commit is unbacked-up work; never batch local commits. (This rule exists because a full night's work was once lost to local-only commits.)
+- **Commit early and often locally; push when the work is VIABLE end to end.** "Viable" means more than a green `mix precommit` — it means the thing the commits exist to enable actually works when run, not merely that the suite passes. A fix whose companion change hasn't landed, or a demo/harness that doesn't yet run, stays local until it does; then push the batch.
+  - **Why the push waits now:** the repo is **public** (since 2026-07-29). `main` is the project's face, anyone can be watching it, and history is no longer safely rewritable once others may have cloned. A half-finished intermediate state is a worse cost than a delayed push.
+  - **Why commits still don't wait:** local commits are the checkpoint that makes a bad step cheap to undo. Batching *commits* is still wrong — batching the *push* is the point. (The old rule said to push immediately because a full night's work was once lost to local-only commits; keep that risk in mind and don't sit on a large unpushed pile for days.)
+  - Superseded the previous "ALWAYS push immediately after every commit" rule, which was written while the repo was private.
 - **NEVER commit** with compiler warnings, build errors, or failing tests. `mix precommit` is the gate (see Gates).
 - **Never use `sed`/`awk`/`head`/`tail`/`echo` to read or edit files** — use Read (offset/limit), Grep, Edit/Write. Shell text tools are only for things the standard tools genuinely can't do. Piping command output is fine.
 - Track plans in `tasks/todo.md`. Record corrections/lessons in `tasks/lessons.md`.

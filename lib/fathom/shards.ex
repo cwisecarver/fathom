@@ -240,7 +240,17 @@ defmodule Fathom.Shards do
     end
   end
 
-  defp migrate_on_touch_mode do
+  @doc """
+  The resolved migrate-on-touch mode: `:off` | `:async` | `:inline`.
+
+  Public because `Fathom.Migrator.HeadCache` has to gate its background poll on the SAME answer.
+  It used to read `:lazy_migrate` directly, so turning on the current `:migrate_on_touch` knob
+  enabled the cache's only consumer without enabling the poll that fills it — the cache stayed at
+  its initial 0, `head > 0` was never true, and migrate-on-touch silently did nothing in either
+  mode. One predicate, one place, so the two cannot drift again.
+  """
+  @spec migrate_on_touch_mode() :: :off | :async | :inline
+  def migrate_on_touch_mode do
     case Application.get_env(:fathom, :migrate_on_touch) do
       mode when mode in [:off, :async, :inline] ->
         mode
