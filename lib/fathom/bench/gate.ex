@@ -27,7 +27,14 @@ defmodule Fathom.Bench.Gate do
     # against entries after it, instead of one series with an unexplained cliff that reads like
     # a code regression forever. Any future harness change to this bench should rename again.
     {:copy_keystone_rows_per_s, :lower_worse},
-    {:fanout_kb_per_shard, :higher_worse}
+    {:fanout_kb_per_shard, :higher_worse},
+    # The wire, gated from 2026-07-31. Before this the gate ran no Filo code at all, which is
+    # how a 200x regression in row encoding stayed invisible: every other metric is SQLite,
+    # storage, Postgres or BEAM memory. `hrana_rt_us` covers per-REQUEST overhead;
+    # `wire_rows_per_s` covers per-CELL encoding over keystone rows (blobs included) and is
+    # the one that would have caught it.
+    {:hrana_rt_us, :higher_worse},
+    {:wire_rows_per_s, :lower_worse}
   ]
 
   @doc "The gated metrics and their regression direction."

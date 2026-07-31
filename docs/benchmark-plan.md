@@ -9,7 +9,7 @@
 > coordinator-only). The gate
 > (`scripts/commit_with_bench.sh` + `Fathom.Bench.Gate`) is built and verified
 > end-to-end, and `AGENTS.md` now documents it as real (B4). Only optional
-> follow-ons remain (`hrana_rt_us` once remote shards land; true RSS-per-shard for
+> follow-ons remain (true RSS-per-shard for
 > fan-out). This plan
 > built the harness the way `AGENTS.md` §Benchmarking has specified all along ("the
 > discipline to hold and the harness to build").
@@ -49,10 +49,23 @@ measured prod-compiled against a clean data dir.
 | `cold_open_s3_p50_us` | `Fathom.Shards.checkout/1` (S3 backend) | **Cold-from-S3 cold-open** — the production cold path. Same as above but the backend is `Storage.S3`: each sample seeds a shard object to S3, drops local, then times the checkout (pull from S3) + open + first query. **Opt-in:** `nil` unless `FATHOM_S3_TEST_*` env is set (so the default gate stays S3-free). Against MinIO-on-localhost this is the S3 *protocol* + loopback (~6 ms observed); point the endpoint at S3/R2 in-region for the real TTFB/RTT-bound number. | higher |
 | `dir_resolve_p50_us` | `Fathom.Directory.resolve/1` | Warm steady state (the on-conflict update path that runs on *every* request): pre-resolve once, then time N resolves of the same id. p50. Needs real Postgres. | higher |
 | `copy_keystone_rows_per_s` | `Fathom.Migrator.Copy.migrate/4` | Seed a source shard with R **`Fathom.Keystone`** rows (every SQLite storage class and affinity, deterministically fuzzed); replay an `ALTER ADD COLUMN` **and a `CREATE INDEX`** as the captured statements (the index scans every row, so the transform does real O(rows) work — an O(1) ALTER alone would leave the metric measuring little more than a page-cache-warm `File.cp`). `R ÷ wall`. The real prod `migrate/4` (one end-of-copy checkpoint, fsync-light). | lower |
+| `hrana_rt_us` | `Filo.Client` → `Filo.Plug` → `Fathom.ShardExecutor` | **Per-REQUEST wire cost.** Median µs of a warm-stream `SELECT 1` round trip through a real Hrana listener on loopback. One cell out, no fsync, so it is dominated by fixed cost: framing, stream lookup, routing, `Request.handle`. Loopback **software** cost, not a network RTT (µs link, no bandwidth-delay/TLS/LB hop — the chaos rig measures the real thing). HTTP rather than WebSocket because `mint_web_socket` is dev/test-only and the gate compiles prod. | higher |
+| `wire_rows_per_s` | same, over a `Fathom.Keystone` | **Per-CELL wire cost.** Rows/sec for `SELECT * FROM ks_scalars` on a keystone of R rows, so every storage class — **including BLOB** — crosses `Filo.Value`'s encoder on every run. This is the metric that catches an encoder regression; `hrana_rt_us` cannot, because one integer cell does not exercise per-cell cost. | lower |
 | `fanout_kb_per_shard` | `Fathom.Shards.checkout/1` × N | Open N shard **coordinators** concurrently (an open-but-idle shard is just the `Fathom.Shard` GenServer — it holds no connection; connections are per-stream and transient). `Δ:erlang.memory(:total) ÷ N`. The node-density number. Deliberately does NOT hold a connection per shard: that would burn ~3 fds each (db + `-wal` + `-shm`) and exhaust the OS fd limit (default 256 on macOS) well before N is interesting. | higher |
 
-`hrana_rt_us` is a **placeholder column, recorded `null`** until remote shards land
-(`AGENTS.md`: "once remote shards land"). We do not fake it.
+**`hrana_rt_us` stopped being a placeholder on 2026-07-31**, and the reason is worth keeping.
+Until then it was a recorded `null`, which meant **no gated metric executed a single line of
+`Filo`** — `cold_open` and `copy_keystone_rows_per_s` are SQLite and storage, `dir_resolve` is
+Postgres, `fanout_kb_per_shard` is BEAM memory. That blind spot let a **200x** regression sit in
+row encoding: `Filo.Value.encode_json/1` raised and rescued an exception per BLOB cell (32.84 µs
+against 0.16 µs for text), and nothing in the gate could see it. It was found by hand, not by
+the harness.
+
+Both wire metrics were verified to **discriminate** before being gated — run once with the fix
+reverted, per the "prove the benchmark discriminates" rule: `wire_rows_per_s` fell 60,650 →
+37,880 rows/s (**-37.5%**, past the 20% block threshold), while `hrana_rt_us` moved 128 → 119 µs,
+i.e. noise. That is precisely why there are two: a `SELECT 1` round trip would **not** have
+caught it.
 
 **Known limitation, recorded not hidden:** `fanout_kb_per_shard` measures BEAM-side
 memory (`:erlang.memory(:total)`), which excludes SQLite's off-heap page cache.
@@ -70,7 +83,8 @@ cross-platform noise.
  "dirty":false,"host":"darwin","mix_env":"prod",
  "cold_open_p50_us":1234.5,"dir_resolve_p50_us":210.0,
  "copy_keystone_rows_per_s":85000.0,"fanout_kb_per_shard":48.0,
- "hrana_rt_us":null,"trials":5,"log":"logs/bench-20260628-….log"}
+ "hrana_rt_us":128.0,"wire_rows_per_s":60650.17,
+ "trials":5,"log":"logs/bench-20260628-….log"}
 ```
 
 **Series break, 2026-07-31 — `copy_rows_per_s` → `copy_keystone_rows_per_s`.** The copy bench
@@ -179,7 +193,7 @@ gate.
   benching so the parent baseline and the same-SHA pre-commit line stay distinct.
 - **B4 — wire it in (done).** `AGENTS.md` §Benchmarking and §Gates now document the
   harness + gate as real (was "aspirational"), including the host-gating policy.
-  Remaining optional: `hrana_rt_us` once remote shards land; true RSS-per-shard
+  Remaining optional: true RSS-per-shard
   for fan-out.
 
 ## Decisions (locked 2026-06-28)

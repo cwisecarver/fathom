@@ -12,6 +12,32 @@ defmodule Fathom.Bench do
     * `dir_resolve/1`   — `dir_resolve_p50_us`   — `Fathom.Directory.resolve/1` (needs Postgres)
     * `copy_throughput/1` — `copy_keystone_rows_per_s` — `Fathom.Migrator.Copy.migrate/4`
     * `fanout/1`        — `fanout_kb_per_shard`  — BEAM memory per concurrently-open shard
+    * `hrana_rt/1`      — `hrana_rt_us`          — one `SELECT 1` round trip over real Hrana
+    * `wire_rows/1`     — `wire_rows_per_s`      — result-set encode throughput over real Hrana
+
+  ## Why there are two wire metrics
+
+  Until 2026-07-31 `hrana_rt_us` was a recorded `null` placeholder and **nothing in the gate
+  executed a line of `Filo`**. That is how a 200x regression sat in row encoding unnoticed:
+  `Filo.Value.encode_json/1` raised and rescued an exception per BLOB cell (32.84 µs/value
+  against 0.16 µs for text), and no gated metric could see it — `cold_open` and
+  `copy_keystone_rows_per_s` are SQLite and storage, `dir_resolve` is Postgres, and
+  `fanout_kb_per_shard` is BEAM memory.
+
+  `hrana_rt_us` alone would **not** have caught it: a `SELECT 1` returns one integer cell, and
+  the bug was per-cell on blobs. So the wire is gated by two metrics with different jobs:
+
+    * `hrana_rt_us` — per-request overhead. Framing, routing, stream lookup, `Request.handle`.
+      One tiny result, so it is dominated by fixed cost.
+    * `wire_rows_per_s` — per-CELL cost at volume, over a `Fathom.Keystone` table, so every
+      storage class including BLOB crosses the encoder. This is the one that catches an
+      encoder regression.
+
+  Both are **loopback software cost**, not a network RTT: a µs link, no bandwidth-delay, no
+  TLS, no LB hop. The chaos rig measures real network cost (`docs/deploy-cluster.md`). They
+  run over HTTP (`Filo.Client`, on the transitive `:mint`) rather than WebSocket, because
+  `mint_web_socket` is a dev/test-only dependency and the gate compiles `MIX_ENV=prod`. Row
+  encoding is shared by both JSON transports, so the HTTP path covers it.
 
   Each returns a number (or `nil` when a bench can't run, e.g. no Postgres for the
   directory bench). `all/1` runs the requested set and returns the perf-history
@@ -41,8 +67,20 @@ defmodule Fathom.Bench do
   @fanout_n 200
   @warm_shards 200
   @warm_size_kb 256
+  @hrana_rt_samples 200
+  @wire_rows 1_000
 
-  @all_metrics [:cold_open, :cold_open_s3, :warm_s3, :failover_rto, :dir_resolve, :copy, :fanout]
+  @all_metrics [
+    :cold_open,
+    :cold_open_s3,
+    :warm_s3,
+    :failover_rto,
+    :dir_resolve,
+    :copy,
+    :fanout,
+    :hrana_rt,
+    :wire_rows
+  ]
 
   @doc """
   Runs the requested benches and returns the perf-history metric map. Opts:
@@ -71,8 +109,9 @@ defmodule Fathom.Bench do
       dir_resolve_p50_us: run_if(only, :dir_resolve, fn -> dir_resolve(opts) end),
       copy_keystone_rows_per_s: run_if(only, :copy, fn -> copy_throughput(opts) end),
       fanout_kb_per_shard: run_if(only, :fanout, fn -> fanout(opts) end),
-      # Placeholder until remote shards land — measured, never faked.
-      hrana_rt_us: nil
+      # No longer a placeholder (2026-07-31). Loopback wire software cost, not a network RTT.
+      hrana_rt_us: run_if(only, :hrana_rt, fn -> hrana_rt(opts) end),
+      wire_rows_per_s: run_if(only, :wire_rows, fn -> wire_rows(opts) end)
     }
   end
 
@@ -462,6 +501,144 @@ defmodule Fathom.Bench do
       rows / (us / 1_000_000)
     end)
     |> median()
+  end
+
+  # --- the wire (real Hrana, loopback) --------------------------------------
+
+  @doc """
+  `hrana_rt_us` — median µs of a warm-stream `SELECT 1` round trip through a real Hrana
+  listener: `Filo.Client` → HTTP → `Filo.Plug` → `Fathom.ShardExecutor` → the shard → back.
+
+  A read that issues no fsync and returns one cell, so it isolates **per-request** wire
+  overhead (framing, stream lookup, routing, `Request.handle`) from storage noise. Per-cell
+  encoding cost is `wire_rows/1`'s job, not this one.
+  """
+  @spec hrana_rt(keyword()) :: float() | nil
+  def hrana_rt(opts \\ []) do
+    samples = Keyword.get(opts, :hrana_rt_samples, @hrana_rt_samples)
+
+    with_wire(opts, "benchrt", fn client ->
+      # Warm: opens the shard and primes the stream. Never timed — a cold open here would
+      # measure storage, which cold_open/1 already owns.
+      {:ok, _, client} = Filo.Client.execute(client, "SELECT 1")
+
+      {_client, us} =
+        Enum.reduce(1..samples, {client, []}, fn _, {c, acc} ->
+          {t, result} = :timer.tc(fn -> Filo.Client.execute(c, "SELECT 1") end)
+          {:ok, _, c} = result
+          {c, [t | acc]}
+        end)
+
+      p50(us)
+    end)
+  end
+
+  @doc """
+  `wire_rows_per_s` — rows/sec the server can read, encode and ship for a whole result set,
+  over a real Hrana listener.
+
+  The source is a `Fathom.Keystone` (`:wire_rows` rows, default #{@wire_rows}), so every SQLite
+  storage class — **including BLOB** — crosses `Filo.Value`'s encoder on every run. That is
+  deliberate and is the whole point of the metric: the encoder bug this metric exists to catch
+  cost 32.84 µs per blob cell and was invisible to every other gated number, because every other
+  workload fathom benchmarks (TPC-B, TPC-C, `hrana_rt`) is INTEGER, REAL and TEXT only.
+
+  Reported as rows/sec rather than cells/sec because the keystone's column count is fixed; a
+  schema change there moves this metric, which is correct — it is a different measurement.
+  """
+  @spec wire_rows(keyword()) :: float() | nil
+  def wire_rows(opts \\ []) do
+    rows = Keyword.get(opts, :wire_rows, @wire_rows)
+    trials = Keyword.get(opts, :trials, @default_trials)
+
+    with_wire(opts, "benchwire", fn client ->
+      # Seed through the shard's own file, then let the coordinator serve it: the client is
+      # measuring the READ path, so the write must not be inside the timed window.
+      path = Fathom.Shard.db_path("benchwire")
+      drop_db(path)
+      {:ok, _} = Fathom.Keystone.build!(path, rows: rows)
+
+      {:ok, _, client} = Filo.Client.execute(client, "SELECT count(*) FROM ks_scalars")
+
+      {_client, samples} =
+        Enum.reduce(1..trials, {client, []}, fn _, {c, acc} ->
+          {us, result} = :timer.tc(fn -> Filo.Client.execute(c, "SELECT * FROM ks_scalars") end)
+          {:ok, _, c} = result
+          {c, [rows / (us / 1_000_000) | acc]}
+        end)
+
+      median(samples)
+    end)
+  end
+
+  # Starts a real Filo listener on a loopback port, opens one client stream routed to `shard`
+  # by Host subdomain, runs `fun`, and tears the whole thing down. Returns nil (metric skipped,
+  # never faked) if the listener or the client cannot start.
+  defp with_wire(opts, shard, fun) do
+    setup(opts)
+    # Route by Host subdomain exactly as the LB does. Pinned rather than inherited so the
+    # metric does not depend on whatever SHARD_BASE_DOMAIN happens to be set in the shell.
+    Application.put_env(:fathom, :shard_base_domain, nil)
+    Application.put_env(:fathom, :default_shard, nil)
+
+    {:ok, _} = Application.ensure_all_started(:bandit)
+    {:ok, _} = Application.ensure_all_started(:mint)
+
+    case start_listener() do
+      {:ok, sup, port} ->
+        try do
+          case Filo.Client.connect("http://127.0.0.1:#{port}", authority: "#{shard}.local") do
+            {:ok, client} ->
+              try do
+                fun.(client)
+              after
+                Filo.Client.close(client)
+              end
+
+            {:error, reason} ->
+              Logger.warning("wire bench: client connect failed (#{inspect(reason)}); skipping")
+              nil
+          end
+        after
+          if Process.alive?(sup), do: Supervisor.stop(sup)
+          Fathom.Shards.drain(shard, 5_000)
+        end
+
+      {:error, reason} ->
+        Logger.warning("wire bench: listener failed to start (#{inspect(reason)}); skipping")
+        nil
+    end
+  end
+
+  defp start_listener do
+    port = free_port()
+
+    plug_opts = [
+      executor: Fathom.ShardExecutor,
+      streams: Fathom.Bench.WireStreams,
+      key: Filo.Baton.new_key(),
+      open_arg: &Fathom.ShardExecutor.shard_from_conn/1
+      # No :authorize — the bench runs with Hrana auth disabled.
+    ]
+
+    children = [
+      {Filo.Streams, name: Fathom.Bench.WireStreams},
+      {Bandit, plug: {Filo.Plug, plug_opts}, scheme: :http, ip: {127, 0, 0, 1}, port: port}
+    ]
+
+    case Supervisor.start_link(children, strategy: :one_for_one) do
+      {:ok, sup} -> {:ok, sup, port}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # Ask the OS for a free port and immediately release it. Racy in principle; in a serialized
+  # bench run (the host-wide lock in mix fathom.bench) nothing else is claiming ports.
+  defp free_port do
+    {:ok, socket} = :gen_tcp.listen(0, [])
+    {:ok, port} = :inet.port(socket)
+    :gen_tcp.close(socket)
+    port
   end
 
   # --- concurrent fan-out --------------------------------------------------

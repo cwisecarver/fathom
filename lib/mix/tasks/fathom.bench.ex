@@ -58,7 +58,17 @@ defmodule Mix.Tasks.Fathom.Bench do
   # minimal subset it needs itself (no Oban, no Hrana port, no endpoint).
   @requirements ["app.config"]
 
-  @all_metrics [:cold_open, :cold_open_s3, :warm_s3, :failover_rto, :dir_resolve, :copy, :fanout]
+  @all_metrics [
+    :cold_open,
+    :cold_open_s3,
+    :warm_s3,
+    :failover_rto,
+    :dir_resolve,
+    :copy,
+    :fanout,
+    :hrana_rt,
+    :wire_rows
+  ]
 
   @switches [
     only: :string,
@@ -77,7 +87,9 @@ defmodule Mix.Tasks.Fathom.Bench do
     warm_size_kb: :integer,
     resolve_samples: :integer,
     copy_rows: :integer,
-    fanout_n: :integer
+    fanout_n: :integer,
+    hrana_rt_samples: :integer,
+    wire_rows: :integer
   ]
 
   @impl true
@@ -134,6 +146,8 @@ defmodule Mix.Tasks.Fathom.Bench do
       |> put_opt(opts, :resolve_samples)
       |> put_opt(opts, :copy_rows)
       |> put_opt(opts, :fanout_n)
+      |> put_opt(opts, :hrana_rt_samples)
+      |> put_opt(opts, :wire_rows)
 
     metrics = Fathom.Bench.all(bench_opts)
     line = build_line(metrics, opts, bench_opts)
@@ -168,7 +182,8 @@ defmodule Mix.Tasks.Fathom.Bench do
       dir_resolve_p50_us: round2(metrics.dir_resolve_p50_us),
       copy_keystone_rows_per_s: round2(metrics.copy_keystone_rows_per_s),
       fanout_kb_per_shard: round2(metrics.fanout_kb_per_shard),
-      hrana_rt_us: metrics.hrana_rt_us,
+      hrana_rt_us: round2(metrics.hrana_rt_us),
+      wire_rows_per_s: round2(metrics.wire_rows_per_s),
       log: Keyword.get(opts, :log)
     }
   end
@@ -187,7 +202,10 @@ defmodule Mix.Tasks.Fathom.Bench do
       {"dir_resolve_p50_us", metrics.dir_resolve_p50_us, "µs   (directory resolve, warm)"},
       {"copy_keystone_rows_per_s", metrics.copy_keystone_rows_per_s,
        "rows/s (migration copy throughput, keystone rows)"},
-      {"fanout_kb_per_shard", metrics.fanout_kb_per_shard, "KiB/shard (node density)"}
+      {"fanout_kb_per_shard", metrics.fanout_kb_per_shard, "KiB/shard (node density)"},
+      {"hrana_rt_us", metrics.hrana_rt_us, "\u00b5s   (Hrana round trip, loopback)"},
+      {"wire_rows_per_s", metrics.wire_rows_per_s,
+       "rows/s (result-set encode over the wire, keystone rows)"}
     ]
 
     dirty = if line.dirty, do: "-dirty", else: ""
