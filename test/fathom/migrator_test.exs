@@ -1,11 +1,79 @@
 defmodule Fathom.MigratorTest do
   use Fathom.DataCase, async: true
 
+  # These build fixtures by releasing versions with a capture template configured, which is
+  # exactly the configuration `Migrator.release/6` warns about (novel tenants born empty).
+  # The warning is correct here and not what these tests are about, so capture it: ExUnit
+  # still prints captured logs when a test FAILS, so this hides noise without hiding signal.
+  @moduletag :capture_log
+
   alias Fathom.Migrator
 
   describe "release/2 and head/0" do
     test "head is 0 before anything is released" do
       assert Migrator.head() == 0
+    end
+
+    # Releasing a version means new tenants need a schema, and fork-from-template is the only
+    # thing that supplies one. With the flag off a novel tenant is born EMPTY and the rollout
+    # cannot heal it (replay onto an empty file dies on `no such table: django_migrations`).
+    # `Shards.fork_novel/1` alarms only when the flag is ON, so the flag-OFF case — the actual
+    # misconfiguration — used to be completely silent. Release is where it gets caught.
+    test "releasing with :fork_from_template OFF warns that novel tenants are born empty" do
+      with_template(fn ->
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert {:ok, _} = Migrator.release(1, "initial schema")
+          end)
+
+        assert log =~ "fork_from_template is OFF"
+        assert log =~ "born EMPTY"
+        assert log =~ "FORK_FROM_TEMPLATE=true"
+      end)
+    end
+
+    # Without a capture template there is nothing to fork FROM, so the flag could not help even
+    # if it were on. Warning there would fire on every release in every such deployment and train
+    # operators to ignore it.
+    test "releasing with NO capture template is silent, flag or not" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, _} = Migrator.release(1, "initial schema")
+        end)
+
+      refute log =~ "born EMPTY"
+    end
+
+    test "releasing with :fork_from_template ON is silent" do
+      Application.put_env(:fathom, :fork_from_template, true)
+      on_exit(fn -> Application.put_env(:fathom, :fork_from_template, false) end)
+
+      # The warning names a real misconfiguration. Firing it on a correctly-configured fleet
+      # would train operators to ignore it, which is worse than not warning at all. A template IS
+      # configured here, so this asserts the FLAG silenced it — not the absence of a template.
+      with_template(fn ->
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert {:ok, _} = Migrator.release(1, "initial schema")
+          end)
+
+        refute log =~ "born EMPTY"
+      end)
+    end
+
+    test "a REJECTED release does not warn" do
+      {:ok, _} = Migrator.release(1, "initial")
+
+      # No version was released, so nothing changed about how tenants are born. Warning here
+      # would be noise attached to an operation that did not happen.
+      with_template(fn ->
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert {:error, _} = Migrator.release(1, "duplicate")
+          end)
+
+        refute log =~ "born EMPTY"
+      end)
     end
 
     test "release records a version and head tracks the max" do
@@ -113,6 +181,21 @@ defmodule Fathom.MigratorTest do
       assert plan =~ "oban_jobs_worker_shard_id_live_index",
              "the dedup query cannot use the index, so it still scans every live job row " <>
                "per rollout chunk. Plan:\n#{plan}"
+    end
+  end
+
+  # The born-empty warning only fires for a fleet that HAS a capture template, so every test
+  # about it must configure one or it passes for the wrong reason.
+  defp with_template(fun) do
+    prev = Application.get_env(:fathom, :template_shard_id)
+    Application.put_env(:fathom, :template_shard_id, "tmpl_warn_test")
+
+    try do
+      fun.()
+    after
+      if prev,
+        do: Application.put_env(:fathom, :template_shard_id, prev),
+        else: Application.delete_env(:fathom, :template_shard_id)
     end
   end
 end

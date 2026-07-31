@@ -48,16 +48,62 @@ defmodule Fathom.Migrator do
         requires_review \\ false,
         statement_args \\ nil
       ) do
-    %Release{}
-    |> Release.changeset(%{
-      version: version,
-      name: name,
-      statements: statements,
-      template_migration_count: template_migration_count,
-      requires_review: requires_review,
-      statement_args: encode_args(statement_args)
-    })
-    |> Repo.insert()
+    result =
+      %Release{}
+      |> Release.changeset(%{
+        version: version,
+        name: name,
+        statements: statements,
+        template_migration_count: template_migration_count,
+        requires_review: requires_review,
+        statement_args: encode_args(statement_args)
+      })
+      |> Repo.insert()
+
+    with {:ok, released} <- result do
+      warn_if_births_are_empty(released.version)
+      {:ok, released}
+    end
+  end
+
+  # A released version means new tenants need a schema, and fork-from-template is the only thing
+  # that gives them one. With `:fork_from_template` OFF, a novel tenant is born EMPTY: its first
+  # ORM query fails, and the rollout cannot rescue it either — `django_migrations` is created by
+  # Django's recorder in autocommit, so it belongs to no captured version and replaying v1 onto an
+  # empty file dies on `no such table: django_migrations` (pinned in django_replay_test.exs).
+  #
+  # `Fathom.Shards.fork_novel/1` already alarms on a fork that FAILS, but it only runs when the
+  # flag is on — so the flag-off case, which is the actual misconfiguration, was completely
+  # silent. This is the one moment it can be caught cheaply: releasing is a deliberate operator
+  # action, HEAD is right here, and it happens once per release rather than once per checkout. A
+  # boot guard cannot do it — `Fathom.Application`'s guards run before `Fathom.Repo` is up, so
+  # there is no HEAD to read.
+  #
+  # Gated on a capture template being configured, and that is not test hygiene — it is the
+  # condition under which the warning is actionable at all. `fork_from_template/1` forks from the
+  # retained `template@HEAD` snapshot, so with no `:template_shard_id` there is nothing to fork
+  # FROM and the flag could not help even if it were on. A fleet in that state is hand-authoring
+  # releases and provisioning tenants some other way. Warning there would fire on every release
+  # in every such deployment (and on every `Migrator.release` in the test suite), which is how a
+  # real warning gets trained into background noise.
+  #
+  # Warn, never refuse: a fleet may legitimately release versions while provisioning every tenant
+  # explicitly through `Fathom.Tenants.provision/1`, which forks on its own path.
+  defp warn_if_births_are_empty(version) do
+    template? = Application.get_env(:fathom, :template_shard_id) not in [nil, ""]
+
+    if template? and not Application.get_env(:fathom, :fork_from_template, false) do
+      Logger.warning(
+        "released schema v#{version}, but :fork_from_template is OFF — a novel tenant minted by " <>
+          "traffic is born EMPTY at v0, its first ORM query fails, and the rollout CANNOT heal it " <>
+          "(replay onto an empty file dies on `no such table: django_migrations`). Set " <>
+          "FORK_FROM_TEMPLATE=true and run `mix fathom.snapshot template-head` so new tenants are " <>
+          "born at HEAD. Ignore this if every tenant is provisioned explicitly via the " <>
+          "/api/tenants control plane."
+      )
+    end
+
+    :ok
   end
 
   # Store bind values in Filo's tagged Hrana encoding (`%{"type" => "text", "value" => …}`,

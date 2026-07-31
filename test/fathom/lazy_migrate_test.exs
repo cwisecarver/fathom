@@ -2,6 +2,12 @@ defmodule Fathom.LazyMigrateTest do
   # Migrate-then-serve on checkout: a behind-HEAD shard is migrated inline before
   # it serves. Real shard machinery + storage + directory; not async.
   use Fathom.DataCase, async: false
+
+  # These build fixtures by releasing versions with a capture template configured, which is
+  # exactly the configuration `Migrator.release/6` warns about (novel tenants born empty).
+  # The warning is correct here and not what these tests are about, so capture it: ExUnit
+  # still prints captured logs when a test FAILS, so this hides noise without hiding signal.
+  @moduletag :capture_log
   use Oban.Testing, repo: Fathom.Repo
 
   alias Fathom.{Directory, Migrator, ShardExecutor}

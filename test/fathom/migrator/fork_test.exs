@@ -6,6 +6,12 @@ defmodule Fathom.Migrator.ForkTest do
   # (:template_shard_id, :fork_from_template, :shard_storage).
   use Fathom.DataCase, async: false
 
+  # These build fixtures by releasing versions with a capture template configured, which is
+  # exactly the configuration `Migrator.release/6` warns about (novel tenants born empty).
+  # The warning is correct here and not what these tests are about, so capture it: ExUnit
+  # still prints captured logs when a test FAILS, so this hides noise without hiding signal.
+  @moduletag :capture_log
+
   alias Fathom.Directory
   alias Fathom.Migrator
   alias Fathom.Shard.{Connection, Storage}
