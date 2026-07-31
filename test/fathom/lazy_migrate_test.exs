@@ -236,5 +236,53 @@ defmodule Fathom.LazyMigrateTest do
     ShardExecutor.close(conn)
   end
 
+  # A FAILING inline migration must not take the tenant offline.
+  #
+  # Reported live 2026-07-31: a demo fleet whose tenants had been provisioned by a direct per-shard
+  # `manage.py migrate` — so each shard's schema was ahead of fathom's version stamp — had every one
+  # of its pages fail with an opaque `STREAM_NOT_FOUND` the moment a version was released. The
+  # replay hit "table already exists", `lazy_migrate` returned that error, and it failed the
+  # CHECKOUT. Every subsequent request retried the same doomed multi-second copy, so the tenant was
+  # permanently down with no useful error.
+  #
+  # The shard is intact at its current version, and serving vN-1 is safe by the same expand-contract
+  # argument that makes `:off` and `:async` correct modes — `{:unknown_version, _}` above already
+  # reasons exactly this way. So a failure degrades to `:async` behavior: hand the shard to the
+  # rollout (which owns retry and quarantine) and serve it now.
+  test "an inline migration that FAILS still serves the shard, and hands it to the rollout",
+       %{shard: shard} do
+    Application.put_env(:fathom, :migrate_on_touch, :inline)
+    seed_v1!(shard)
+
+    # A version whose replay cannot succeed against this shard: `app_thing` already exists, which is
+    # exactly the shape a directly-migrated tenant produces.
+    {:ok, _} =
+      Migrator.release(2, "v2", [
+        "CREATE TABLE app_thing (id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0002', 'now')"
+      ])
+
+    Migrator.HeadCache.refresh()
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, conn} = ShardExecutor.open(shard),
+               "a failed migration must not fail the checkout — that takes the tenant offline"
+
+        # Served at its EXISTING version, with its data intact.
+        assert {:ok, %StmtResult{rows: [[1, "alice"]]}} =
+                 exec(conn, "SELECT id, name FROM app_thing")
+
+        ShardExecutor.close(conn)
+      end)
+
+    # Loud, not silent: an operator has to be able to find this.
+    assert log =~ "inline migrate-on-touch"
+
+    # Still at v1, and handed to the async rollout rather than retried on the next request.
+    assert {:ok, %{schema_version: 1}} = Directory.get(shard)
+    assert_enqueued(worker: ShardMigrationJob, args: %{shard_id: shard, target: 2})
+  end
+
   defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end
