@@ -188,7 +188,7 @@ defmodule Fathom.ShardExecutor do
         # entirely when :block_tenant_ddl is on.
         if ddl?, do: Connection.purge_statements(conn)
 
-        capture(opts.template?, conn, sql)
+        capture(opts.template?, conn, sql, args)
         stmt_result = to_stmt_result(result, dml?)
         latency = System.monotonic_time() - started
 
@@ -501,7 +501,10 @@ defmodule Fathom.ShardExecutor do
             # (review 2026-07-24 #17). Scripts are migration-rare; the cost is irrelevant here.
             Connection.purge_statements(conn)
             # On the template shard, a script is (part of) a migration — feed it to capture.
-            capture(opts.template?, conn, sql)
+            # A Hrana `sequence` is opaque SQL text with no bind parameters, so there are no args
+            # to record for it (unlike the `execute` path, where Django's parameterized statements
+            # carry their values separately and must be stored to replay).
+            capture(opts.template?, conn, sql, [])
             :ok
 
           {:error, reason} ->
@@ -551,10 +554,10 @@ defmodule Fathom.ShardExecutor do
   # --- migration capture (template shard only) ---
 
   # First arg is the handle's precomputed `template?` boolean (see stream_opts/1).
-  defp capture(true, conn, sql) when is_binary(sql), do: observe(conn, sql)
-  defp capture(_template?, _conn, _sql), do: :ok
+  defp capture(true, conn, sql, args) when is_binary(sql), do: observe(conn, sql, args)
+  defp capture(_template?, _conn, _sql, _args), do: :ok
 
-  defp observe(conn, sql) do
+  defp observe(conn, sql, args) do
     case Capture.classify(sql) do
       :begin ->
         Capture.begin(conn, migrations_count(conn))
@@ -574,9 +577,9 @@ defmodule Fathom.ShardExecutor do
         # statement; every other statement still takes the plain append. Note capture runs AFTER the
         # statement succeeded, so the count here already includes this INSERT.
         if Capture.bookkeeping?(sql) do
-          Capture.bookkeeping(conn, sql, migrations_count(conn))
+          Capture.bookkeeping(conn, sql, args, migrations_count(conn))
         else
-          Capture.append(conn, sql)
+          Capture.append(conn, sql, args)
         end
     end
 

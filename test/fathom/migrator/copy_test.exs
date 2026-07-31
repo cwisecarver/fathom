@@ -49,8 +49,9 @@ defmodule Fathom.Migrator.CopyTest do
     seed_v0!(source)
 
     statements = [
-      "ALTER TABLE app_thing ADD COLUMN created_at TEXT",
-      "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0002_add_created_at', '2026-02-01')"
+      {"ALTER TABLE app_thing ADD COLUMN created_at TEXT", []},
+      {"INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0002_add_created_at', '2026-02-01')",
+       []}
     ]
 
     assert :ok = Copy.migrate(source, dest, 2, statements)
@@ -73,8 +74,8 @@ defmodule Fathom.Migrator.CopyTest do
     seed_v0!(source)
 
     statements = [
-      "ALTER TABLE app_thing ADD COLUMN created_at TEXT",
-      "INSERT INTO does_not_exist (x) VALUES (1)"
+      {"ALTER TABLE app_thing ADD COLUMN created_at TEXT", []},
+      {"INSERT INTO does_not_exist (x) VALUES (1)", []}
     ]
 
     assert {:error, _} = Copy.migrate(source, dest, 2, statements)
@@ -82,5 +83,58 @@ defmodule Fathom.Migrator.CopyTest do
     # The ALTER rolled back: the copy is still the old schema, version unchanged.
     assert %{columns: ["id", "name"]} = query!(dest, "SELECT * FROM app_thing")
     assert %{rows: [[0]]} = query!(dest, "PRAGMA user_version")
+  end
+
+  # THE bug that made the whole forward rollout non-functional against real Django. Django sends
+  # PARAMETERIZED SQL — its bookkeeping row is `INSERT INTO django_migrations … VALUES (?, ?, ?)`
+  # with the values carried alongside — and replay ran the statement TEXT with no args, so SQLite
+  # bound NULL and died on `NOT NULL constraint failed: django_migrations.app`, rolling back the
+  # entire copy. Every Django migration ends with that row, so NO captured migration could be
+  # replayed onto any tenant. Measured live 2026-07-30 before the fix:
+  #
+  #     ShardMigration.run("mig-0003", 2)
+  #     => {:error, "NOT NULL constraint failed: django_migrations.app"}
+  #
+  # Invisible to this suite because every test above writes its values inline as literal SQL, which
+  # real Django never does. Values are BOUND, never interpolated into the statement — a migration
+  # name is attacker-influenceable (it is a filename) and one apostrophe would be enough.
+  test "binds parameters instead of leaving placeholders unbound (real Django shape)",
+       %{source: source, dest: dest} do
+    seed_v0!(source)
+
+    statements = [
+      {"ALTER TABLE app_thing ADD COLUMN created_at TEXT", []},
+      {~s|INSERT INTO "django_migrations" ("app", "name", "applied") VALUES (?, ?, ?)|,
+       ["finance", "0002_budget", "2026-07-30T00:00:00"]}
+    ]
+
+    assert :ok = Copy.migrate(source, dest, 2, statements)
+
+    assert %{rows: [["finance", "0002_budget"]]} =
+             query!(dest, "SELECT app, name FROM django_migrations WHERE name = '0002_budget'")
+
+    assert %{rows: [[2]]} = query!(dest, "PRAGMA user_version")
+  end
+
+  # A value that would break string interpolation, and one that JSON cannot carry raw. Args ride as
+  # bind values through `Filo.Value`'s tagged encoding, so neither is a special case.
+  test "binds values that would break interpolation (quotes, blobs, nil)",
+       %{source: source, dest: dest} do
+    seed_v0!(source)
+
+    statements = [
+      {"ALTER TABLE app_thing ADD COLUMN note TEXT", []},
+      {"ALTER TABLE app_thing ADD COLUMN payload BLOB", []},
+      {"INSERT INTO app_thing (id, name, note, payload) VALUES (?, ?, ?, ?)",
+       [2, "o'brien; DROP TABLE app_thing; --", nil, {:blob, <<0, 255, 10>>}]}
+    ]
+
+    assert :ok = Copy.migrate(source, dest, 2, statements)
+
+    assert %{rows: [["o'brien; DROP TABLE app_thing; --", nil, <<0, 255, 10>>]]} =
+             query!(dest, "SELECT name, note, payload FROM app_thing WHERE id = 2")
+
+    # The table the injected fragment tried to drop is still there, with both rows.
+    assert %{rows: [[2]]} = query!(dest, "SELECT count(*) FROM app_thing")
   end
 end

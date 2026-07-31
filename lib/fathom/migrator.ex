@@ -31,14 +31,22 @@ defmodule Fathom.Migrator do
   (expert review #32) is the template's django_migrations count at capture time, used by
   `template_drift/0`; `nil` when unknown (a hand-authored release).
   """
-  @spec release(pos_integer(), String.t(), [String.t()], non_neg_integer() | nil, boolean()) ::
+  @spec release(
+          pos_integer(),
+          String.t(),
+          [String.t()],
+          non_neg_integer() | nil,
+          boolean(),
+          [[term()]] | nil
+        ) ::
           {:ok, Release.t()} | {:error, Ecto.Changeset.t()}
   def release(
         version,
         name,
         statements \\ [],
         template_migration_count \\ nil,
-        requires_review \\ false
+        requires_review \\ false,
+        statement_args \\ nil
       ) do
     %Release{}
     |> Release.changeset(%{
@@ -46,10 +54,20 @@ defmodule Fathom.Migrator do
       name: name,
       statements: statements,
       template_migration_count: template_migration_count,
-      requires_review: requires_review
+      requires_review: requires_review,
+      statement_args: encode_args(statement_args)
     })
     |> Repo.insert()
   end
+
+  # Store bind values in Filo's tagged Hrana encoding (`%{"type" => "text", "value" => …}`,
+  # `%{"type" => "blob", "base64" => …}`, …) so a binary blob survives the jsonb round-trip and we
+  # invent no new serialization. `nil` (a caller with no args to record) stays nil, which replays
+  # with no args — the pre-feature behavior.
+  defp encode_args(nil), do: nil
+
+  defp encode_args(per_statement) when is_list(per_statement),
+    do: Enum.map(per_statement, &%{"args" => Enum.map(&1, fn v -> Filo.Value.encode(v) end)})
 
   @doc """
   The captured SQL statements for `version`, or `nil` if it isn't released — or if it is
@@ -66,12 +84,54 @@ defmodule Fathom.Migrator do
   """
   @spec statements(pos_integer()) :: [String.t()] | nil
   def statements(version) do
+    case fetch_appliable(version) do
+      nil -> nil
+      release -> release.statements
+    end
+  end
+
+  @doc """
+  The replay-facing form of `statements/1`: `[{sql, args}]`, ready to bind.
+
+  Django sends parameterized SQL — its `INSERT INTO django_migrations … VALUES (?, ?, ?)` carries
+  the values separately — so replaying statement TEXT alone bound NULL and died on
+  `django_migrations.app NOT NULL`, aborting the copy. The values are BOUND, never substituted into
+  the SQL (see `Fathom.Migrator.Release`). A release captured before `statement_args` existed yields
+  empty args, which is exactly how it replayed before. Same gates as `statements/1`: `nil` for an
+  unreleased, yanked, or `requires_review` version.
+  """
+  @spec statement_pairs(pos_integer()) :: [{String.t(), [term()]}] | nil
+  def statement_pairs(version) do
+    case fetch_appliable(version) do
+      nil -> nil
+      release -> zip_args(release.statements, release.statement_args)
+    end
+  end
+
+  defp fetch_appliable(version) do
     case Repo.get_by(Release, version: version) do
       nil -> nil
       %{yanked: true} -> nil
       %{requires_review: true} -> nil
-      release -> release.statements
+      release -> release
     end
+  end
+
+  defp zip_args(statements, nil), do: Enum.map(statements, &{&1, []})
+
+  defp zip_args(statements, args) do
+    # The changeset refuses a length mismatch, so this zip is total for anything stored; a shorter
+    # list from a hand-edited row degrades to no-args rather than misaligning values onto the wrong
+    # statement, which would be the dangerous direction.
+    Enum.with_index(statements, fn sql, i ->
+      decoded =
+        case Enum.at(args, i) do
+          %{"args" => list} when is_list(list) -> Enum.map(list, &Filo.Value.decode/1)
+          _ -> []
+        end
+
+      {sql, decoded}
+    end)
   end
 
   @doc """

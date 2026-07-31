@@ -514,9 +514,11 @@ defmodule Fathom.Migrator.ShardMigration do
 
   defp statement_chain(current, target) do
     Enum.reduce_while((current + 1)..target//1, {:ok, []}, fn v, {:ok, acc} ->
-      case Migrator.statements(v) do
+      # statement_pairs/1, not statements/1: the replay has to BIND Django's parameter values, which
+      # statements/1 (text only) discards. Same nil gates (unreleased / yanked / requires_review).
+      case Migrator.statement_pairs(v) do
         nil -> {:halt, {:error, {:unknown_version, v}}}
-        statements -> {:cont, {:ok, [{v, statements} | acc]}}
+        pairs -> {:cont, {:ok, [{v, pairs} | acc]}}
       end
     end)
     |> case do

@@ -24,8 +24,8 @@ defmodule Fathom.Migrator.CaptureTest do
     test "records a version when the migration count rises on commit" do
       conn = make_ref()
       Capture.begin(conn, 0)
-      Capture.append(conn, "CREATE TABLE app_thing (id INTEGER PRIMARY KEY)")
-      Capture.append(conn, "INSERT INTO django_migrations (app, name) VALUES ('app', '0001')")
+      Capture.append(conn, "CREATE TABLE app_thing (id INTEGER PRIMARY KEY)", [])
+      Capture.append(conn, "INSERT INTO django_migrations (app, name) VALUES ('app', '0001')", [])
 
       assert {:recorded, 1} = Capture.commit(conn, 1)
       assert Migrator.head() == 1
@@ -48,7 +48,7 @@ defmodule Fathom.Migrator.CaptureTest do
 
       conn = make_ref()
       Capture.begin(conn, 0)
-      Capture.append(conn, "CREATE TABLE app_kept (id INTEGER PRIMARY KEY)")
+      Capture.append(conn, "CREATE TABLE app_kept (id INTEGER PRIMARY KEY)", [])
 
       # The outage: cut the Capture process off from Postgres for the commit.
       Ecto.Adapters.SQL.Sandbox.mode(Fathom.Repo, :manual)
@@ -77,9 +77,9 @@ defmodule Fathom.Migrator.CaptureTest do
 
       conn = make_ref()
       Capture.begin(conn, 0)
-      Capture.append(conn, "CREATE TABLE app_thing (id INTEGER PRIMARY KEY, slug TEXT)")
-      Capture.append(conn, "UPDATE app_thing SET slug = 'from-template' WHERE id = 1")
-      Capture.append(conn, "INSERT INTO django_migrations (app, name) VALUES ('app', '0002')")
+      Capture.append(conn, "CREATE TABLE app_thing (id INTEGER PRIMARY KEY, slug TEXT)", [])
+      Capture.append(conn, "UPDATE app_thing SET slug = 'from-template' WHERE id = 1", [])
+      Capture.append(conn, "INSERT INTO django_migrations (app, name) VALUES ('app', '0002')", [])
 
       {result, log} = with_log(fn -> Capture.commit(conn, 1) end)
       assert {:recorded, version} = result
@@ -100,8 +100,8 @@ defmodule Fathom.Migrator.CaptureTest do
 
       conn = make_ref()
       Capture.begin(conn, 0)
-      Capture.append(conn, "CREATE TABLE app_plain (id INTEGER PRIMARY KEY)")
-      Capture.append(conn, "INSERT INTO django_migrations (app, name) VALUES ('app', '0003')")
+      Capture.append(conn, "CREATE TABLE app_plain (id INTEGER PRIMARY KEY)", [])
+      Capture.append(conn, "INSERT INTO django_migrations (app, name) VALUES ('app', '0003')", [])
 
       log = capture_log(fn -> assert {:recorded, _} = Capture.commit(conn, 1) end)
       refute log =~ "DATA-MIGRATION"
@@ -130,34 +130,40 @@ defmodule Fathom.Migrator.CaptureTest do
 
       Capture.append(
         conn,
-        ~s|CREATE TABLE "finance_transaction" ("id" integer NOT NULL PRIMARY KEY AUTOINCREMENT, "date" date NOT NULL)|
+        ~s|CREATE TABLE "finance_transaction" ("id" integer NOT NULL PRIMARY KEY AUTOINCREMENT, "date" date NOT NULL)|,
+        []
       )
 
       Capture.append(
         conn,
-        ~s|CREATE TABLE "new__finance_transaction" ("id" integer NOT NULL PRIMARY KEY AUTOINCREMENT, "date" date NOT NULL, "account_id" bigint NOT NULL REFERENCES "finance_account" ("id") DEFERRABLE INITIALLY DEFERRED)|
+        ~s|CREATE TABLE "new__finance_transaction" ("id" integer NOT NULL PRIMARY KEY AUTOINCREMENT, "date" date NOT NULL, "account_id" bigint NOT NULL REFERENCES "finance_account" ("id") DEFERRABLE INITIALLY DEFERRED)|,
+        []
       )
 
       Capture.append(
         conn,
-        ~s|INSERT INTO "new__finance_transaction" ("id", "date", "account_id") SELECT "id", "date", NULL FROM "finance_transaction"|
+        ~s|INSERT INTO "new__finance_transaction" ("id", "date", "account_id") SELECT "id", "date", NULL FROM "finance_transaction"|,
+        []
       )
 
-      Capture.append(conn, ~s|DROP TABLE "finance_transaction"|)
+      Capture.append(conn, ~s|DROP TABLE "finance_transaction"|, [])
 
       Capture.append(
         conn,
-        ~s|ALTER TABLE "new__finance_transaction" RENAME TO "finance_transaction"|
-      )
-
-      Capture.append(
-        conn,
-        ~s|CREATE INDEX "finance_tra_date_f21d66_idx" ON "finance_transaction" ("date")|
+        ~s|ALTER TABLE "new__finance_transaction" RENAME TO "finance_transaction"|,
+        []
       )
 
       Capture.append(
         conn,
-        ~s|INSERT INTO "django_migrations" ("app", "name", "applied") VALUES (?, ?, ?) RETURNING "django_migrations"."id"|
+        ~s|CREATE INDEX "finance_tra_date_f21d66_idx" ON "finance_transaction" ("date")|,
+        []
+      )
+
+      Capture.append(
+        conn,
+        ~s|INSERT INTO "django_migrations" ("app", "name", "applied") VALUES (?, ?, ?) RETURNING "django_migrations"."id"|,
+        []
       )
 
       {result, log} = with_log(fn -> Capture.commit(conn, 1) end)
@@ -195,12 +201,14 @@ defmodule Fathom.Migrator.CaptureTest do
 
       Capture.append(
         conn,
-        ~s|CREATE TABLE "finance_budget" ("id" integer NOT NULL PRIMARY KEY AUTOINCREMENT, "category_id" bigint NOT NULL REFERENCES "finance_category" ("id"))|
+        ~s|CREATE TABLE "finance_budget" ("id" integer NOT NULL PRIMARY KEY AUTOINCREMENT, "category_id" bigint NOT NULL REFERENCES "finance_category" ("id"))|,
+        []
       )
 
       Capture.append(
         conn,
-        ~s|CREATE INDEX "finance_budget_category_id_3ead498a" ON "finance_budget" ("category_id")|
+        ~s|CREATE INDEX "finance_budget_category_id_3ead498a" ON "finance_budget" ("category_id")|,
+        []
       )
 
       # The count has NOT risen yet — Django has not written the bookkeeping row.
@@ -210,7 +218,7 @@ defmodule Fathom.Migrator.CaptureTest do
       insert = ~s|INSERT INTO "django_migrations" ("app", "name", "applied") VALUES (?, ?, ?)|
 
       {result, log} =
-        with_log(fn -> Capture.bookkeeping(conn, insert, 1) end)
+        with_log(fn -> Capture.bookkeeping(conn, insert, [], 1) end)
 
       assert {:recorded, version} = result
       refute log =~ "DATA-MIGRATION"
@@ -230,15 +238,15 @@ defmodule Fathom.Migrator.CaptureTest do
     test "statements between the commit and the bookkeeping row are not captured" do
       conn = make_ref()
       Capture.begin(conn, 0)
-      Capture.append(conn, ~s|CREATE TABLE "t" ("id" integer PRIMARY KEY)|)
+      Capture.append(conn, ~s|CREATE TABLE "t" ("id" integer PRIMARY KEY)|, [])
       assert Capture.commit(conn, 0) == :noop
 
       # Django sends this between the COMMIT and the bookkeeping row. It is not part of the
       # migration, and replaying it onto every tenant would be noise in the fleet version.
-      Capture.append(conn, "PRAGMA foreign_keys = ON")
+      Capture.append(conn, "PRAGMA foreign_keys = ON", [])
 
       insert = ~s|INSERT INTO "django_migrations" ("app", "name") VALUES (?, ?)|
-      assert {:recorded, version} = Capture.bookkeeping(conn, insert, 1)
+      assert {:recorded, version} = Capture.bookkeeping(conn, insert, [], 1)
 
       statements = Migrator.statements(version)
       refute Enum.any?(statements, &(&1 =~ "foreign_keys"))
@@ -250,11 +258,11 @@ defmodule Fathom.Migrator.CaptureTest do
       # BEGIN supersedes it (the previous transaction never marked a migration applied).
       c1 = make_ref()
       Capture.begin(c1, 0)
-      Capture.append(c1, "SELECT 1")
+      Capture.append(c1, "SELECT 1", [])
       assert Capture.commit(c1, 0) == :noop
 
       Capture.begin(c1, 0)
-      Capture.append(c1, "SELECT 2")
+      Capture.append(c1, "SELECT 2", [])
       assert Capture.commit(c1, 0) == :noop
 
       assert Migrator.list() == []
@@ -264,16 +272,56 @@ defmodule Fathom.Migrator.CaptureTest do
     test "a second bookkeeping row does not re-record the same version" do
       conn = make_ref()
       Capture.begin(conn, 0)
-      Capture.append(conn, ~s|CREATE TABLE "t" ("id" integer PRIMARY KEY)|)
+      Capture.append(conn, ~s|CREATE TABLE "t" ("id" integer PRIMARY KEY)|, [])
       assert Capture.commit(conn, 0) == :noop
 
       insert = ~s|INSERT INTO "django_migrations" ("app", "name") VALUES (?, ?)|
-      assert {:recorded, _} = Capture.bookkeeping(conn, insert, 1)
+      assert {:recorded, _} = Capture.bookkeeping(conn, insert, [], 1)
 
       # The buffer is consumed; a repeat (or Django's follow-up SELECT-then-INSERT) records nothing.
-      assert Capture.bookkeeping(conn, insert, 2) == :noop
+      assert Capture.bookkeeping(conn, insert, [], 2) == :noop
 
       assert length(Migrator.list()) == 1
+    end
+
+    # Django sends parameterized SQL, and capture used to record the statement TEXT only — so the
+    # values were dropped on the floor and replay bound NULL, killing every rollout (see
+    # Fathom.Migrator.CopyTest). Pin the whole round trip: args survive capture → jsonb → decode,
+    # including a blob (which plain JSON cannot carry) and a nil.
+    test "captured bind values round-trip through storage" do
+      conn = make_ref()
+      Capture.begin(conn, 0)
+      Capture.append(conn, "CREATE TABLE app_thing (id INTEGER PRIMARY KEY, blob BLOB)", [])
+
+      Capture.append(conn, "INSERT INTO app_thing (id, blob) SELECT ?, ? FROM app_thing", [
+        7,
+        {:blob, <<0, 255>>}
+      ])
+
+      insert = ~s|INSERT INTO "django_migrations" ("app", "name", "applied") VALUES (?, ?, ?)|
+      args = ["finance", "0002_budget", nil]
+
+      # In-transaction shape: the bookkeeping row is buffered and the COMMIT records the version.
+      assert Capture.bookkeeping(conn, insert, args, 1) == :noop
+      assert {:recorded, version} = Capture.commit(conn, 1)
+
+      pairs = Migrator.statement_pairs(version)
+
+      assert [
+               {"CREATE TABLE app_thing (id INTEGER PRIMARY KEY, blob BLOB)", []},
+               {"INSERT INTO app_thing (id, blob) SELECT ?, ? FROM app_thing",
+                [7, {:blob, <<0, 255>>}]},
+               {^insert, ["finance", "0002_budget", nil]}
+             ] = pairs
+
+      # statements/1 keeps its old text-only contract for callers that only want the SQL.
+      assert Migrator.statements(version) == Enum.map(pairs, &elem(&1, 0))
+    end
+
+    test "a release stored without args replays with none (pre-feature rows keep working)" do
+      {:ok, _} = Migrator.release(3, "hand-authored", ["CREATE TABLE t (id INTEGER)"])
+
+      assert Migrator.statement_pairs(3) == [{"CREATE TABLE t (id INTEGER)", []}]
     end
 
     test "bookkeeping?/1 matches Django's applied-migration INSERT only" do
@@ -302,9 +350,20 @@ defmodule Fathom.Migrator.CaptureTest do
           ] do
         conn = make_ref()
         Capture.begin(conn, 0)
-        Capture.append(conn, ~s|CREATE TABLE "app_thing" ("id" integer PRIMARY KEY, "slug" text)|)
-        Capture.append(conn, dml)
-        Capture.append(conn, ~s|INSERT INTO django_migrations (app, name) VALUES ('app', '0002')|)
+
+        Capture.append(
+          conn,
+          ~s|CREATE TABLE "app_thing" ("id" integer PRIMARY KEY, "slug" text)|,
+          []
+        )
+
+        Capture.append(conn, dml, [])
+
+        Capture.append(
+          conn,
+          ~s|INSERT INTO django_migrations (app, name) VALUES ('app', '0002')|,
+          []
+        )
 
         {result, log} = with_log(fn -> Capture.commit(conn, 1) end)
         assert {:recorded, version} = result
@@ -327,16 +386,16 @@ defmodule Fathom.Migrator.CaptureTest do
       # First capture: the template goes 14 → 15, recorded as v1 (count 15), pure DDL.
       c1 = make_ref()
       Capture.begin(c1, 14)
-      Capture.append(c1, "CREATE TABLE t1 (id INTEGER PRIMARY KEY)")
-      Capture.append(c1, "INSERT INTO django_migrations (app, name) VALUES ('app', '0001')")
+      Capture.append(c1, "CREATE TABLE t1 (id INTEGER PRIMARY KEY)", [])
+      Capture.append(c1, "INSERT INTO django_migrations (app, name) VALUES ('app', '0001')", [])
       assert {:recorded, 1} = Capture.commit(c1, 15)
 
       # An `atomic = False` migration ran on the template OUTSIDE a tracked transaction (count is
       # now 16, uncaptured). The NEXT captured migration begins at 16 (> the last captured 15).
       c2 = make_ref()
       Capture.begin(c2, 16)
-      Capture.append(c2, "CREATE TABLE t2 (id INTEGER PRIMARY KEY)")
-      Capture.append(c2, "INSERT INTO django_migrations (app, name) VALUES ('app', '0003')")
+      Capture.append(c2, "CREATE TABLE t2 (id INTEGER PRIMARY KEY)", [])
+      Capture.append(c2, "INSERT INTO django_migrations (app, name) VALUES ('app', '0003')", [])
 
       test_pid = self()
       handler = "gap-#{System.unique_integer([:positive])}"
@@ -369,7 +428,13 @@ defmodule Fathom.Migrator.CaptureTest do
       cap = start_supervised!({Capture, name: :"cap_back_#{System.unique_integer([:positive])}"})
       conn = make_ref()
       Capture.begin(conn, 1, cap)
-      Capture.append(conn, "DELETE FROM django_migrations WHERE app='app' AND name='0002'", cap)
+
+      Capture.append(
+        conn,
+        "DELETE FROM django_migrations WHERE app='app' AND name='0002'",
+        [],
+        cap
+      )
 
       log = capture_log(fn -> assert :noop = Capture.commit(conn, 0, cap) end)
       assert log =~ "BACKWARDS"
@@ -378,7 +443,7 @@ defmodule Fathom.Migrator.CaptureTest do
     test "records nothing when the count doesn't rise" do
       conn = make_ref()
       Capture.begin(conn, 5)
-      Capture.append(conn, "SELECT 1")
+      Capture.append(conn, "SELECT 1", [])
 
       assert Capture.commit(conn, 5) == :noop
       assert Migrator.head() == 0
@@ -387,7 +452,7 @@ defmodule Fathom.Migrator.CaptureTest do
     test "rollback discards the buffered transaction" do
       conn = make_ref()
       Capture.begin(conn, 0)
-      Capture.append(conn, "CREATE TABLE oops (x)")
+      Capture.append(conn, "CREATE TABLE oops (x)", [])
       Capture.rollback(conn)
 
       assert Capture.commit(conn, 1) == :noop
@@ -398,11 +463,11 @@ defmodule Fathom.Migrator.CaptureTest do
       conn = make_ref()
 
       Capture.begin(conn, 0)
-      Capture.append(conn, "stmt-a")
+      Capture.append(conn, "stmt-a", [])
       assert {:recorded, 1} = Capture.commit(conn, 1)
 
       Capture.begin(conn, 1)
-      Capture.append(conn, "stmt-b")
+      Capture.append(conn, "stmt-b", [])
       assert {:recorded, 2} = Capture.commit(conn, 2)
 
       assert Migrator.head() == 2
@@ -425,14 +490,14 @@ defmodule Fathom.Migrator.CaptureTest do
     test "capture after a yank allocates past the yanked version, not onto it" do
       conn = make_ref()
       Capture.begin(conn, 0)
-      Capture.append(conn, "stmt-v1")
+      Capture.append(conn, "stmt-v1", [])
       assert {:recorded, 1} = Capture.commit(conn, 1)
 
       assert :ok = Migrator.yank(1)
       assert Migrator.head() == 0, "yank must drop the version from HEAD"
 
       Capture.begin(conn, 1)
-      Capture.append(conn, "stmt-v2")
+      Capture.append(conn, "stmt-v2", [])
       assert {:recorded, 2} = Capture.commit(conn, 2)
 
       assert Migrator.head() == 2

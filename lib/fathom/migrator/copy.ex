@@ -73,9 +73,20 @@ defmodule Fathom.Migrator.Copy do
     end
   end
 
+  # Statements arrive as `{sql, args}`. Django sends PARAMETERIZED SQL — its bookkeeping row is
+  # `INSERT INTO django_migrations … VALUES (?, ?, ?)` with the values carried separately — so
+  # running the text alone through `Connection.exec/2` bound NULL and every replay died on
+  # `NOT NULL constraint failed: django_migrations.app`, rolling back the whole copy. Since every
+  # Django migration ends with that row, NO captured migration could be replayed onto a tenant.
+  #
+  # The values are BOUND, never substituted into the SQL: interpolating them would be the
+  # injection/quoting hazard AGENTS.md forbids, and a migration name is attacker-influenceable (it
+  # is a filename). `Connection.query/4` binds; a release captured before args were stored yields
+  # `[]`, which behaves exactly as before.
   defp replay_each(conn, statements) do
-    Enum.reduce_while(statements, :ok, fn sql, :ok ->
-      case Connection.exec(conn, sql) do
+    Enum.reduce_while(statements, :ok, fn {sql, args}, :ok ->
+      case Connection.query(conn, sql, args) do
+        {:ok, _result} -> {:cont, :ok}
         :ok -> {:cont, :ok}
         {:error, _} = error -> {:halt, error}
       end

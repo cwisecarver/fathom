@@ -24,8 +24,14 @@ defmodule Fathom.Migrator.CaptureGuardTest do
 
     conn = make_ref()
     Capture.begin(conn, 0, cap)
-    Capture.append(conn, "CREATE TABLE t (v TEXT)", cap)
-    Capture.append(conn, "INSERT INTO django_migrations (app, name) VALUES ('app', '0001')", cap)
+    Capture.append(conn, "CREATE TABLE t (v TEXT)", [], cap)
+
+    Capture.append(
+      conn,
+      "INSERT INTO django_migrations (app, name) VALUES ('app', '0001')",
+      [],
+      cap
+    )
 
     # record/3 raises (no Repo access) → the capture is stashed pending, NOT lost.
     assert {:error, _} = Capture.commit(conn, 1, cap)

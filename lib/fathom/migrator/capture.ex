@@ -42,9 +42,16 @@ defmodule Fathom.Migrator.Capture do
   def begin(conn_id, migrations_count, server \\ __MODULE__),
     do: GenServer.cast(server, {:begin, conn_id, migrations_count})
 
-  @doc "Buffers a statement for `conn_id` (no-op outside a tracked transaction)."
-  def append(conn_id, sql, server \\ __MODULE__),
-    do: GenServer.cast(server, {:append, conn_id, sql})
+  @doc """
+  Buffers a statement and its bind values for `conn_id` (no-op outside a tracked transaction).
+
+  `args` is REQUIRED and guarded as a list on purpose. It used to default to `[]`, which made the
+  older 3-arity `append(conn, sql, server)` call shape silently bind the SERVER as `args` and cast
+  to the default server instead — a test appended to the wrong process and the failure showed up as
+  an unrelated `:noop`. Guarding turns that into an immediate FunctionClauseError.
+  """
+  def append(conn_id, sql, args, server \\ __MODULE__) when is_list(args),
+    do: GenServer.cast(server, {:append, conn_id, sql, args})
 
   @doc """
   Closes `conn_id`'s transaction: if `migrations_count` rose, records the buffered
@@ -86,8 +93,8 @@ defmodule Fathom.Migrator.Capture do
 
   Returns `{:recorded, version}`, `:noop`, or `{:error, _}` (same contract as `commit/3`).
   """
-  def bookkeeping(conn_id, sql, migrations_count, server \\ __MODULE__),
-    do: GenServer.call(server, {:bookkeeping, conn_id, sql, migrations_count})
+  def bookkeeping(conn_id, sql, args, migrations_count, server \\ __MODULE__),
+    do: GenServer.call(server, {:bookkeeping, conn_id, sql, args, migrations_count})
 
   @doc "Discards `conn_id`'s buffered transaction (ROLLBACK)."
   def rollback(conn_id, server \\ __MODULE__),
@@ -138,7 +145,7 @@ defmodule Fathom.Migrator.Capture do
     {:noreply, Map.put(state, conn_id, %{buffer: [], count_at_begin: count, awaiting?: false})}
   end
 
-  def handle_cast({:append, conn_id, sql}, state) do
+  def handle_cast({:append, conn_id, sql, args}, state) do
     case Map.get(state, conn_id) do
       nil ->
         {:noreply, state}
@@ -150,7 +157,7 @@ defmodule Fathom.Migrator.Capture do
         {:noreply, state}
 
       entry ->
-        {:noreply, Map.put(state, conn_id, %{entry | buffer: [sql | entry.buffer]})}
+        {:noreply, Map.put(state, conn_id, %{entry | buffer: [{sql, args} | entry.buffer]})}
     end
   end
 
@@ -213,12 +220,12 @@ defmodule Fathom.Migrator.Capture do
     end
   end
 
-  def handle_call({:bookkeeping, conn_id, sql, count}, _from, state) do
+  def handle_call({:bookkeeping, conn_id, sql, args, count}, _from, state) do
     case Map.get(state, conn_id) do
       # An OPEN transaction: this is the ordinary in-transaction bookkeeping row. Buffer it and let
       # commit/3 do the recording, byte-for-byte as before.
       %{awaiting?: false} = entry ->
-        {:reply, :noop, Map.put(state, conn_id, %{entry | buffer: [sql | entry.buffer]})}
+        {:reply, :noop, Map.put(state, conn_id, %{entry | buffer: [{sql, args} | entry.buffer]})}
 
       # A committed-but-unrecorded buffer, and the row Django was missing just landed. The recorded
       # statements INCLUDE this INSERT, so a replayed shard gets its own bookkeeping row — the same
@@ -226,7 +233,7 @@ defmodule Fathom.Migrator.Capture do
       %{awaiting?: true, buffer: buffer, count_at_begin: before} when count > before ->
         {entry, state} = Map.pop(state, conn_id)
         _ = entry
-        statements = Enum.reverse([sql | buffer])
+        statements = Enum.reverse([{sql, args} | buffer])
 
         case record(statements, count, before) do
           {:recorded, _} = recorded ->
@@ -442,8 +449,15 @@ defmodule Fathom.Migrator.Capture do
   # Postgres outage RAISES from Repo (it doesn't return an error tuple), and a
   # crash here would take the whole capture state — including every pending
   # buffer this path exists to preserve — down with it.
-  defp record(statements, count, before) do
+  defp record(pairs, count, before) do
     version = Migrator.next_version()
+
+    # The buffer holds `{sql, args}` because Django sends PARAMETERIZED SQL — its bookkeeping row is
+    # `INSERT INTO django_migrations … VALUES (?, ?, ?)` with the values carried alongside. Storing
+    # the text alone made every replay bind NULL and die on `django_migrations.app NOT NULL`. The
+    # two are stored as parallel lists and BOUND at replay, never substituted into the statement.
+    statements = Enum.map(pairs, &elem(&1, 0))
+    statement_args = Enum.map(pairs, &elem(&1, 1))
 
     # Expert review #6: a NON-ATOMIC migration (`atomic = False`) runs autocommit — no tracked
     # BEGIN/COMMIT — so capture never sees it, the template schema moves, and the fleet never hears.
@@ -460,7 +474,14 @@ defmodule Fathom.Migrator.Capture do
     # the rollout, not the capture.
     requires_review = data_migration_statements(statements) != [] or gap != nil
 
-    case Migrator.release(version, "auto-captured", statements, count, requires_review) do
+    case Migrator.release(
+           version,
+           "auto-captured",
+           statements,
+           count,
+           requires_review,
+           statement_args
+         ) do
       {:ok, _} ->
         if gap, do: alarm_gap(version, gap)
         alarm_on_data_migration(version, statements)
