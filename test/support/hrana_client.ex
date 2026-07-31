@@ -220,19 +220,23 @@ defmodule Fathom.Bench.HranaClient do
   end
 
   # Hrana value encoding: native Elixir → Hrana value (integers travel as strings).
-  defp encode_value(nil), do: %{"type" => "null"}
+  # Delegated to `Filo.Value` — the SERVER's own codec — rather than reimplemented here.
+  # The hand-rolled pair this replaces could neither send nor receive a BLOB:
+  #
+  #   * `decode_value` used `Base.decode64!/1`, the PADDED decoder, while Hrana (and
+  #     `Filo.Value.encode_json/1`) emits **unpadded** base64. Any blob whose length was not a
+  #     multiple of 3 crashed the client with `ArgumentError: incorrect padding`.
+  #   * `encode_value` had no `{:blob, _}` clause at all, so binding a blob argument raised
+  #     `FunctionClauseError`.
+  #
+  # Both survived because every wire benchmark is TPC-B or TPC-C — INTEGER, REAL and TEXT only —
+  # so no bench ever put a blob on the wire. Delegating removes the whole drift class: the
+  # client cannot disagree with the server about the encoding if it uses the server's encoder.
+  # Behavior is unchanged for null/integer/float/text; blobs decode to `{:blob, binary}`, the
+  # same tagged shape `Fathom.Shard.Connection` uses.
+  defp encode_value(v), do: Filo.Value.encode(v)
 
-  defp encode_value(v) when is_integer(v),
-    do: %{"type" => "integer", "value" => Integer.to_string(v)}
-
-  defp encode_value(v) when is_float(v), do: %{"type" => "float", "value" => v}
-  defp encode_value(v) when is_binary(v), do: %{"type" => "text", "value" => v}
-
-  defp decode_value(%{"type" => "null"}), do: nil
-  defp decode_value(%{"type" => "integer", "value" => v}), do: String.to_integer(v)
-  defp decode_value(%{"type" => "float", "value" => v}), do: v
-  defp decode_value(%{"type" => "text", "value" => v}), do: v
-  defp decode_value(%{"type" => "blob", "base64" => v}), do: Base.decode64!(v)
+  defp decode_value(v), do: Filo.Value.decode(v)
 
   defp free_port do
     {:ok, socket} = :gen_tcp.listen(0, [])
