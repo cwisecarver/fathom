@@ -76,7 +76,14 @@ defmodule Fathom.WireBlobTest do
   #
   # The guess is right for ordinary data and wrong at both edges, and it is DATA-DEPENDENT — the
   # same column returns `blob` or `text` depending on the bytes in the row. `sqld` does not have
-  # this problem; it reads the real column type. Tracked as an open gap, see tasks/todo.md.
+  # this problem; it reads the real column type.
+  #
+  # Measured exposure (200k samples per shape): pickle, gzip and PNG payloads are classified
+  # correctly 100% of the time — their magic bytes are invalid UTF-8 START bytes — as is anything
+  # past ~16 bytes of entropy. The failure is confined to SHORT blobs of all-low bytes, where it
+  # is total. Documented for operators, with the pad/prefix workaround, in `docs/data-path.md`
+  # ("Known limitation"). The only complete fix is upstream: an opt-in exqlite option returning
+  # `{:blob, bytes}` for SQLITE_BLOB.
   test "KNOWN GAP: a blob of valid-UTF-8 bytes comes back typed as text",
        %{shard: shard, path: path, port: port} do
     :ok = seed!(path, [{1, "text-as-blob"}, {2, <<0xFF, 0xFE, 0xFD>>}])

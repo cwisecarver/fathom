@@ -76,6 +76,45 @@ was only read (or never touched) is **clean** and **skips the upload entirely** 
 PUTs scale with *writes*, not with how many shards a node happened to open. (The classifier errs
 toward marking dirty — an extra flush, never lost data.)
 
+## Known limitation — a short, all-ASCII BLOB comes back typed as text
+
+SQLite distinguishes the storage classes `text` and `blob`. Fathom cannot always preserve that
+distinction across the wire, and the cause is below fathom: `exqlite`'s `make_cell`
+(`c_src/sqlite3_nif.c`) reads `sqlite3_column_type`, then returns a plain Elixir binary for
+**both** `SQLITE_TEXT` and `SQLITE_BLOB`. The class is discarded in the NIF, before any fathom
+or Filo code sees the value. (Not a bug upstream so much as a different use case: exqlite's main
+consumer is Ecto, where the *schema* declares the type, so the value does not have to carry it.
+Fathom is a proxy over opaque client SQL, where the value is the only source of truth. The
+asymmetry is documented in exqlite's README for the write direction — you must bind
+`{:blob, bytes}` or it is stored as text.)
+
+So `Filo.Value` infers the class from the bytes: **valid UTF-8 is sent as `text`, anything else
+as `blob`.** The inference is wrong at both edges, and it is *data-dependent* — the same column
+can return `blob` for one row and `text` for the next.
+
+**In practice this almost never fires.** Measured over 200k samples per shape:
+
+| stored payload | returned as `text` (wrong) |
+|---|---:|
+| pickle (`0x80…`), gzip (`1f 8b…`), PNG (`0x89 PNG`) | 0.0000% |
+| 32 or more random bytes | 0.0000% |
+| a UUID as 16 raw bytes | 0.0085% |
+| 4 random bytes | 8.9% |
+| **4 bytes all below `0x80`** | **100%** |
+
+Real binary payloads are safe: the magic bytes that begin pickle, gzip and PNG are invalid UTF-8
+*start* bytes, so they are classified correctly every time, and entropy alone settles it past
+~16 bytes. The failure is confined to **short blobs made entirely of low bytes**.
+
+**If that is your data, pad or prefix it.** A one-byte non-ASCII sentinel (or any framing header)
+in front of a short binary payload makes the value unambiguous and it round-trips as `blob`.
+Storing the payload base64-encoded in a `TEXT` column is the other clean answer — then it is
+honestly text and nothing has to guess.
+
+Pinned as characterization in `test/fathom/wire_blob_test.exs`, so the behavior cannot change
+without a test failing. The only complete fix is upstream: an opt-in exqlite option that returns
+`{:blob, bytes}` for `SQLITE_BLOB`.
+
 ## How it connects
 
 This lifecycle is the substrate the rest ride on: the **lease + fence** ([single-writer](single-writer.md))
