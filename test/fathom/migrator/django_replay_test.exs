@@ -229,11 +229,18 @@ defmodule Fathom.Migrator.DjangoReplayTest do
 
   # A tenant born EMPTY cannot be migrated from 0, because `django_migrations` is not part of any
   # captured migration — Django's recorder creates it in autocommit, before migrations run. fathom
-  # normally births a tenant by forking the template (which carries the table), but it falls back to
+  # births a tenant by forking the template (which carries the table), but it falls back to
   # born-empty on ANY fork failure and never fails a checkout for it, so this state is reachable in
   # production. Pinned as CHARACTERIZATION, not approval: the valuable half is that the failure is
   # clean — the copy transaction rolls back, so the shard is left untouched rather than half-built.
-  # Tracked as an open gap; see tasks/todo.md.
+  #
+  # RESOLVED 2026-07-31 — this stays characterization ON PURPOSE. The call (user's): fork-from-
+  # template IS the intended birth path, so a born-empty tenant is a FAILED birth, not a state the
+  # rollout should quietly heal. Teaching replay to create `django_migrations` would make an
+  # already-broken tenant (no schema, first ORM query fails) look recoverable and hide the real
+  # fault. So the fix went the other way: `Fathom.Shards.fork_novel/1` no longer swallows the fork
+  # outcome — it logs loudly and emits `[:fathom, :migrator, :fork_fallback]`, so a born-empty
+  # tenant is alertable instead of silent. See test/fathom/migrator/fork_test.exs.
   test "replay onto a database with no django_migrations fails cleanly and leaves nothing behind",
        %{capture: [v1, _]} do
     :ok = release!(v1)

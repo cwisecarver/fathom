@@ -684,14 +684,74 @@ defmodule Fathom.Shards do
   # Postgres trouble, a concurrent forker holding the lease) falls back to today's
   # born-empty behavior — a checkout is NEVER failed for the fork. Flag off ⇒ one get_env
   # on the (already cold) novel-open path, nothing on the hot path.
+  #
+  # The fallback is LOUD (2026-07-31). With the flag on, the fork IS the birth path: a tenant
+  # that falls back is born with no schema, so its first ORM query fails, and the rollout
+  # cannot rescue it either — `django_migrations` is created by Django's recorder in
+  # autocommit BEFORE any migration, so it belongs to no captured version and replaying v1
+  # onto an empty file dies on `no such table: django_migrations` (pinned as characterization
+  # in test/fathom/migrator/django_replay_test.exs). Silently swallowing the outcome made that
+  # tenant indistinguishable from a healthy one. It still never fails the checkout — a fleet
+  # whose object store blips must not stop minting tenants — but it is now alertable.
   defp fork_novel(shard_id) do
-    _ = Fathom.Migrator.fork_from_template(shard_id)
-    :ok
-  rescue
-    _ -> :ok
-  catch
-    :exit, _ -> :ok
+    # The rescue wraps ONLY the fork, so the reporter below can never re-enter it. A raise
+    # inside the rescue clause is no longer caught, and this runs on the checkout path.
+    outcome =
+      try do
+        Fathom.Migrator.fork_from_template(shard_id)
+      rescue
+        e -> {:error, {:exception, e}}
+      catch
+        :exit, reason -> {:error, {:exit, reason}}
+      end
+
+    report_fork(outcome, shard_id)
   end
+
+  # Born at HEAD — the intended path, no noise.
+  defp report_fork({:ok, _}, _shard_id), do: :ok
+
+  # The reserved capture template opening itself. Django migrates it directly and it is
+  # excluded from every rollout sweep; refusing to fork it onto itself is correct, not a
+  # fallback worth alarming on.
+  defp report_fork({:error, :template_shard}, _shard_id), do: :ok
+
+  # A stored object already exists for this id (a flushed-then-forgotten shard whose
+  # directory row is gone). The fork correctly refuses to clobber it, and the shard is NOT
+  # born empty — it cold-opens onto its own data. Not a fallback.
+  defp report_fork({:error, :dst_exists}, _shard_id), do: :ok
+
+  defp report_fork(outcome, shard_id) do
+    reason = fork_failure_reason(outcome)
+
+    Logger.error(
+      "shard #{shard_id}: :fork_from_template is ON but the fork FAILED " <>
+        "(#{inspect(outcome)}); the tenant is born EMPTY and serving with NO schema. Its " <>
+        "first ORM query will fail, and the rollout cannot heal it (replay onto an empty " <>
+        "file dies on `no such table: django_migrations`). If this reason is " <>
+        ":no_template_snapshot, the prerequisite never ran — release a version and then " <>
+        "`mix fathom.snapshot template-head`. Delete the tenant and re-mint it once the " <>
+        "fork works; do not leave it serving."
+    )
+
+    :telemetry.execute(
+      [:fathom, :migrator, :fork_fallback],
+      %{count: 1},
+      %{shard_id: shard_id, reason: reason}
+    )
+
+    :ok
+  end
+
+  # Metadata rides into Telemetry.Metrics tags, so the reason must be a BOUNDED atom set —
+  # a `{:retry, term}` carrying an arbitrary storage error would be unbounded cardinality.
+  # The full outcome stays in the log line above.
+  defp fork_failure_reason({:error, reason}) when is_atom(reason), do: reason
+  defp fork_failure_reason({:error, {:exception, _}}), do: :exception
+  defp fork_failure_reason({:error, {:exit, _}}), do: :exit
+  defp fork_failure_reason({:error, _}), do: :error
+  defp fork_failure_reason({:retry, _}), do: :retry
+  defp fork_failure_reason(_), do: :unknown
 
   # Novel = nothing knows the shard: no local file (a present file is an authoritative
   # un-flushed copy) and no directory row — the same definition novel_refused?/1 uses.

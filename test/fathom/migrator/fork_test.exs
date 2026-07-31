@@ -346,20 +346,96 @@ defmodule Fathom.Migrator.ForkTest do
       seed_template!(template)
 
       tenant = new_tenant()
+
+      # This IS a fork fallback (HEAD 0 ⇒ nothing to fork from), so it now logs loudly.
+      # Captured to keep it out of the suite's output; the alarm itself is asserted below.
+      ExUnit.CaptureLog.capture_log(fn ->
+        {:ok, conn} = ShardExecutor.open(tenant)
+
+        # Born empty: no template schema…
+        assert {:error, %Error{}} =
+                 ShardExecutor.execute(conn, stmt("SELECT count(*) FROM app_user"))
+
+        # …but serving works (no crash, a usable empty shard — today's behavior).
+        assert {:ok, %StmtResult{}} =
+                 ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER PRIMARY KEY)"))
+
+        assert {:ok, %StmtResult{affected_row_count: 1}} =
+                 ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (1)"))
+
+        :ok = ShardExecutor.close(conn)
+      end)
+    end
+
+    # With :fork_from_template ON the fork IS the birth path, so a fallback is not a
+    # harmless degrade: the tenant serves with NO schema, its first ORM query fails, and the
+    # rollout cannot rescue it either (replaying v1 onto an empty file dies on `no such table:
+    # django_migrations` — see django_replay_test.exs). Before this, `fork_novel/1` discarded
+    # the outcome entirely, so a born-empty tenant was indistinguishable from a healthy one.
+    # The invariant: every fallback under an enabled flag is observable, and a healthy birth
+    # is never noise.
+    test "a fork fallback emits [:fathom, :migrator, :fork_fallback] and still serves",
+         %{template: template} do
+      Application.put_env(:fathom, :fork_from_template, true)
+      on_exit(fn -> Application.put_env(:fathom, :fork_from_template, false) end)
+
+      seed_template!(template)
+      # No release ⇒ HEAD 0 ⇒ no `template@HEAD` snapshot to fork from. This is the
+      # misconfiguration an operator hits by enabling the flag without ever running
+      # `mix fathom.snapshot template-head`.
+      attach_fork_fallback!()
+
+      tenant = new_tenant()
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          {:ok, conn} = ShardExecutor.open(tenant)
+
+          # Born empty and still SERVING — the checkout is never failed for a fork.
+          assert {:error, %Error{}} =
+                   ShardExecutor.execute(conn, stmt("SELECT count(*) FROM app_user"))
+
+          :ok = ShardExecutor.close(conn)
+        end)
+
+      assert_receive {:fork_fallback, %{shard_id: ^tenant, reason: :no_template_snapshot}}
+      assert log =~ "born EMPTY"
+      assert log =~ "mix fathom.snapshot template-head"
+    end
+
+    test "a SUCCESSFUL fork is silent — no fallback alarm on the healthy path",
+         %{template: template} do
+      Application.put_env(:fathom, :fork_from_template, true)
+      on_exit(fn -> Application.put_env(:fathom, :fork_from_template, false) end)
+
+      seed_template!(template)
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
+      {:ok, 1} = Migrator.retain_template_head()
+      attach_fork_fallback!()
+
+      tenant = new_tenant()
       {:ok, conn} = ShardExecutor.open(tenant)
-
-      # Born empty: no template schema…
-      assert {:error, %Error{}} =
-               ShardExecutor.execute(conn, stmt("SELECT count(*) FROM app_user"))
-
-      # …but serving works (no crash, a usable empty shard — today's behavior).
-      assert {:ok, %StmtResult{}} =
-               ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER PRIMARY KEY)"))
-
-      assert {:ok, %StmtResult{affected_row_count: 1}} =
-               ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (1)"))
-
+      assert count!(conn, "app_user") == 0
       :ok = ShardExecutor.close(conn)
+
+      refute_receive {:fork_fallback, _}, 200
+    end
+
+    test "with the flag OFF, born-empty is the configured behavior and does NOT alarm",
+         %{template: template} do
+      seed_template!(template)
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
+      {:ok, 1} = Migrator.retain_template_head()
+      attach_fork_fallback!()
+
+      tenant = new_tenant()
+      {:ok, conn} = ShardExecutor.open(tenant)
+      :ok = ShardExecutor.close(conn)
+
+      # The alarm means "the fork was supposed to birth this tenant and did not". With the
+      # flag off nothing was supposed to, so firing here would be pure noise on the default
+      # configuration.
+      refute_receive {:fork_fallback, _}, 200
     end
 
     test "with the flag OFF (default), a novel shard is born empty even with a snapshot ready",
@@ -381,6 +457,22 @@ defmodule Fathom.Migrator.ForkTest do
       :ok = ShardExecutor.close(conn)
       assert :error = Directory.get(tenant), "no directory row is force-registered"
     end
+  end
+
+  # Forwards [:fathom, :migrator, :fork_fallback] to the test process. Detached on exit so a
+  # non-async test that follows never receives another test's event.
+  defp attach_fork_fallback! do
+    test_pid = self()
+    handler = "fork-fallback-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :migrator, :fork_fallback],
+      fn _e, _m, meta, _ -> send(test_pid, {:fork_fallback, meta}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
   end
 
   defp local_dir, do: Fathom.Shard.data_dir()
