@@ -421,13 +421,18 @@ defmodule Fathom.Bench do
     drop_db(src)
     seed_copy_source(src, rows)
 
+    # `{sql, args}` pairs — the shape `Copy.replay_each/2` binds. Bare strings crash it with a
+    # FunctionClauseError. This caller went stale when statement args landed (`beff929`), which
+    # updated copy_test.exs but not the bench: `mix fathom.bench` is not part of `mix test`, so a
+    # green suite hid a broken gate for three commits. Any change to Copy's statement shape must
+    # grep its callers here too.
     statements = [
-      "ALTER TABLE bench_rows ADD COLUMN added_col TEXT",
+      {"ALTER TABLE bench_rows ADD COLUMN added_col TEXT", []},
       # CREATE INDEX scans every row, so the replay does work proportional to row
       # count — representative of a real Django migration's per-row cost and far
       # more sensitive to a replay regression than an O(1) ADD COLUMN, which would
       # leave the metric measuring little more than a page-cache-warm File.cp.
-      "CREATE INDEX bench_added_idx ON bench_rows (b)"
+      {"CREATE INDEX bench_added_idx ON bench_rows (b)", []}
     ]
 
     trials
