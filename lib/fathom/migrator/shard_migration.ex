@@ -546,6 +546,20 @@ defmodule Fathom.Migrator.ShardMigration do
          {:ok, _} <- cutover_with_retirement(shard_id, target, prev) do
       Logger.info("shard #{shard_id}: migrated v#{prev} -> v#{target}")
       {:ok, %{from: prev, to: target}}
+    else
+      # `mark_migrating/1` runs just before this chain and had no counterpart, so a failure anywhere
+      # in it left the row `migrating` forever. Every laggard/reconcile query filters
+      # `status == "active"`, so the shard went invisible to every sweep until the hourly
+      # `reclaim_stuck_migrating` picked it up — it self-healed an hour late instead of immediately.
+      # Observed as `home-00001: v=0 status=migrating` after a replay hit "table already exists".
+      #
+      # Nothing was applied (the copy is to a temp file and the replay is one transaction), so the
+      # shard really is back at its previous version and `active` is the truthful status.
+      # `unmark_migrating/1` is conditional on the row still being `migrating`, so this cannot
+      # resurrect a tenant deleted mid-copy or clobber a `migration_failed` quarantine.
+      error ->
+        _ = Directory.unmark_migrating(shard_id)
+        error
     end
   end
 

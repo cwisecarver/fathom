@@ -279,6 +279,32 @@ defmodule Fathom.Directory do
   def mark_migrating(shard_id),
     do: update_shard(shard_id, %{status: "migrating", migrating_since: DateTime.utc_now()})
 
+  @doc """
+  Restores a shard from `migrating` back to `active` after a migration failed — the counterpart to
+  `mark_migrating/1`, which had none.
+
+  Without it a failed copy left the row `migrating` forever, and since every laggard/reconcile query
+  filters `status == "active"`, the shard was invisible to every sweep until the hourly
+  `reclaim_stuck_migrating/1` noticed. It self-healed, just an hour later than it should have.
+  Restoring here does not interfere with the failed job's own retry: that job carries an explicit
+  target and does not go through a sweep, and `ShardMigrationJob` is unique per shard so a sweep
+  that does re-enqueue in the meantime is deduped.
+
+  **Conditional on the row still being `migrating`**, so it can never resurrect a tenant that was
+  deleted or suspended during the copy window, nor overwrite a `migration_failed` quarantine written
+  after attempts were exhausted. Returns the number of rows touched (1 = restored, 0 = left alone).
+  """
+  @spec unmark_migrating(String.t()) :: non_neg_integer()
+  def unmark_migrating(shard_id) do
+    {count, _} =
+      from(s in Shard, where: s.shard_id == ^shard_id and s.status == "migrating")
+      |> Repo.update_all(
+        set: [status: "active", migrating_since: nil, updated_at: DateTime.utc_now()]
+      )
+
+    count
+  end
+
   @doc "Every directory row — the DR reconcile sweep (#6). Operator tooling, not a hot path."
   @spec all() :: [Shard.t()]
   def all, do: Repo.all(Shard)

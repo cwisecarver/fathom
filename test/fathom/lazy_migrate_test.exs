@@ -284,5 +284,36 @@ defmodule Fathom.LazyMigrateTest do
     assert_enqueued(worker: ShardMigrationJob, args: %{shard_id: shard, target: 2})
   end
 
+  # `mark_migrating/1` runs just before the copy and had no counterpart, so a failed migration left
+  # the row `migrating` forever. Every laggard/reconcile query filters `status == "active"`, so the
+  # shard went invisible to every sweep until the hourly `reclaim_stuck_migrating` — it self-healed
+  # an hour late instead of immediately. Observed live as `home-00001: v=0 status=migrating` after a
+  # replay hit "table already exists".
+  test "a failed migration restores the shard to active instead of wedging it in migrating",
+       %{shard: shard} do
+    seed_v1!(shard)
+
+    # A version whose replay cannot succeed against this shard.
+    {:ok, _} =
+      Migrator.release(2, "v2", ["CREATE TABLE app_thing (id INTEGER PRIMARY KEY, name TEXT)"])
+
+    assert {:error, _} = Fathom.Migrator.ShardMigration.run(shard, 2)
+
+    # Untouched at v1 — nothing was applied (the copy is to a temp file, the replay is one
+    # transaction) — and visible to the sweeps again rather than stuck.
+    assert {:ok, %{schema_version: 1, status: "active", migrating_since: nil}} =
+             Directory.get(shard)
+  end
+
+  test "the restore never resurrects a tenant that was deleted mid-copy", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Directory.mark_migrating(shard)
+    # Whatever else happened to the row during the copy window wins — unmark is conditional.
+    {:ok, _} = Directory.tombstone(shard)
+
+    assert Directory.unmark_migrating(shard) == 0
+    assert {:ok, %{status: "deleted"}} = Directory.get(shard)
+  end
+
   defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end
