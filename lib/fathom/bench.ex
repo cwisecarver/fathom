@@ -10,7 +10,7 @@ defmodule Fathom.Bench do
     * `cold_open/1`     — `cold_open_p50_us`     — `Fathom.Shards.checkout/1` + first query (warm/local pull)
     * `cold_open_s3/1`  — `cold_open_s3_p50_us`  — same, pulling from S3 (opt-in: `FATHOM_S3_TEST_*` env)
     * `dir_resolve/1`   — `dir_resolve_p50_us`   — `Fathom.Directory.resolve/1` (needs Postgres)
-    * `copy_throughput/1` — `copy_rows_per_s`    — `Fathom.Migrator.Copy.migrate/4`
+    * `copy_throughput/1` — `copy_keystone_rows_per_s` — `Fathom.Migrator.Copy.migrate/4`
     * `fanout/1`        — `fanout_kb_per_shard`  — BEAM memory per concurrently-open shard
 
   Each returns a number (or `nil` when a bench can't run, e.g. no Postgres for the
@@ -69,7 +69,7 @@ defmodule Fathom.Bench do
       failover_cold_s3_p50_us: rto && rto.cold_us,
       failover_warm_s3_p50_us: rto && rto.warm_us,
       dir_resolve_p50_us: run_if(only, :dir_resolve, fn -> dir_resolve(opts) end),
-      copy_rows_per_s: run_if(only, :copy, fn -> copy_throughput(opts) end),
+      copy_keystone_rows_per_s: run_if(only, :copy, fn -> copy_throughput(opts) end),
       fanout_kb_per_shard: run_if(only, :fanout, fn -> fanout(opts) end),
       # Placeholder until remote shards land — measured, never faked.
       hrana_rt_us: nil
@@ -407,10 +407,25 @@ defmodule Fathom.Bench do
   # --- migration copy throughput ------------------------------------------
 
   @doc """
-  Median rows/sec for `Fathom.Migrator.Copy.migrate/4`: copy a source shard seeded
-  with `:copy_rows` rows, replay one representative `ALTER`, stamp + checkpoint.
-  Fsync-light by construction — the real `migrate/4` issues a single end-of-copy
-  checkpoint, not a per-row fsync, so the number isn't APFS-dominated.
+  Median rows/sec for `Fathom.Migrator.Copy.migrate/4`: copy a `Fathom.Keystone` seeded with
+  `:copy_rows` rows, replay one representative `ALTER` plus an index build, stamp + checkpoint.
+  Fsync-light by construction — the real `migrate/4` issues a single end-of-copy checkpoint, not
+  a per-row fsync, so the number isn't APFS-dominated.
+
+  **The source is the keystone, not a toy.** This measured a three-column
+  `(INTEGER, TEXT, INTEGER)` table until 2026-07-31, which made "migration copy throughput"
+  mostly a measurement of `File.cp` over unusually narrow rows: no BLOBs, no NULLs, no wide
+  rows, nothing that reaches SQLite's overflow pages. Real tenant rows do. The keystone carries
+  every storage class and affinity, so bytes-per-row is realistic and so is the number.
+
+  Reported as **`copy_keystone_rows_per_s`**, deliberately a different metric name from the old
+  `copy_rows_per_s`. Rows got much wider, so rows/second dropped by construction; comparing
+  across that switch would read a fixture change as a code regression. The rename starts a new
+  series (see `Fathom.Bench.Gate`).
+
+  Not comparable to the TPC-B / TPC-C numbers either, and not meant to be: those are
+  externally-specified schemas whose value is comparability with `sqld` and published results
+  (`docs/tpc-benchmark-plan.md`). This one is fathom-internal.
   """
   @spec copy_throughput(keyword()) :: float()
   def copy_throughput(opts \\ []) do
@@ -419,7 +434,10 @@ defmodule Fathom.Bench do
     trials = Keyword.get(opts, :trials, @default_trials)
     src = Path.join(tmp_dir(), "bench_copy_src.db")
     drop_db(src)
-    seed_copy_source(src, rows)
+
+    # A fixed seed: the fixture must not move between runs, or the benchmark measures the
+    # fixture instead of the code.
+    {:ok, _} = Fathom.Keystone.build!(src, rows: rows)
 
     # `{sql, args}` pairs — the shape `Copy.replay_each/2` binds. Bare strings crash it with a
     # FunctionClauseError. This caller went stale when statement args landed (`beff929`), which
@@ -427,12 +445,12 @@ defmodule Fathom.Bench do
     # green suite hid a broken gate for three commits. Any change to Copy's statement shape must
     # grep its callers here too.
     statements = [
-      {"ALTER TABLE bench_rows ADD COLUMN added_col TEXT", []},
+      {"ALTER TABLE ks_scalars ADD COLUMN added_col TEXT", []},
       # CREATE INDEX scans every row, so the replay does work proportional to row
       # count — representative of a real Django migration's per-row cost and far
       # more sensitive to a replay regression than an O(1) ADD COLUMN, which would
       # leave the metric measuring little more than a page-cache-warm File.cp.
-      {"CREATE INDEX bench_added_idx ON bench_rows (b)", []}
+      {"CREATE INDEX ks_added_idx ON ks_scalars (added_col)", []}
     ]
 
     trials
@@ -616,23 +634,6 @@ defmodule Fathom.Bench do
     {:ok, conn} = Connection.open(path)
     Connection.exec(conn, "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT)")
     Connection.exec(conn, "INSERT INTO t (v) VALUES ('seed')")
-    Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
-    Connection.close(conn)
-  end
-
-  # `rows` is a harness-controlled integer (never user input), so inlining it into
-  # the recursive-CTE seed is safe and far faster than a per-row insert loop.
-  defp seed_copy_source(path, rows) do
-    {:ok, conn} = Connection.open(path)
-    Connection.exec(conn, "CREATE TABLE bench_rows (id INTEGER PRIMARY KEY, a TEXT, b INTEGER)")
-    Connection.exec(conn, "BEGIN")
-
-    Connection.exec(conn, """
-    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < #{rows})
-    INSERT INTO bench_rows (a, b) SELECT 'row_' || x, x FROM c
-    """)
-
-    Connection.exec(conn, "COMMIT")
     Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
     Connection.close(conn)
   end

@@ -262,7 +262,12 @@ defmodule Fathom.Keystone do
       :ok = Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
       {:ok, count}
     after
-      if prev, do: :rand.seed(prev)
+      # `export_seed/0` returns the atom `:undefined` in a process that has never used :rand —
+      # and `:undefined` is TRUTHY in Elixir, so a bare `if prev` fed it straight to
+      # `:rand.seed/1`, which died in `:rand.mk_alg/1`. Invisible to the suite, because ExUnit
+      # has already seeded every test process; the benchmark runs in a fresh one and hit it on
+      # the first try.
+      if prev != :undefined, do: :rand.seed(prev)
       Connection.close(conn)
     end
   end

@@ -20,7 +20,13 @@ defmodule Fathom.Bench.Gate do
     {:cold_open_s3_p50_us, :higher_worse},
     {:warm_s3_shards_per_s, :lower_worse},
     {:dir_resolve_p50_us, :higher_worse},
-    {:copy_rows_per_s, :lower_worse},
+    # Renamed from `copy_rows_per_s` on 2026-07-31, when the copy bench moved from a
+    # three-column toy table to `Fathom.Keystone`. Rows are far wider now, so the two numbers
+    # measure different work and the old series is not comparable. A NEW NAME is the honest way
+    # to say that: entries before the switch keep `copy_rows_per_s` and are never compared
+    # against entries after it, instead of one series with an unexplained cliff that reads like
+    # a code regression forever. Any future harness change to this bench should rename again.
+    {:copy_keystone_rows_per_s, :lower_worse},
     {:fanout_kb_per_shard, :higher_worse}
   ]
 

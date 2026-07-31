@@ -166,7 +166,7 @@ defmodule Mix.Tasks.Fathom.Bench do
       failover_cold_s3_p50_us: round2(metrics.failover_cold_s3_p50_us),
       failover_warm_s3_p50_us: round2(metrics.failover_warm_s3_p50_us),
       dir_resolve_p50_us: round2(metrics.dir_resolve_p50_us),
-      copy_rows_per_s: round2(metrics.copy_rows_per_s),
+      copy_keystone_rows_per_s: round2(metrics.copy_keystone_rows_per_s),
       fanout_kb_per_shard: round2(metrics.fanout_kb_per_shard),
       hrana_rt_us: metrics.hrana_rt_us,
       log: Keyword.get(opts, :log)
@@ -185,7 +185,8 @@ defmodule Mix.Tasks.Fathom.Bench do
       {"failover_warm_s3_p50_us", metrics.failover_warm_s3_p50_us,
        "µs   (failover open, warm 304-promote; opt-in)#{rto_speedup(metrics)}"},
       {"dir_resolve_p50_us", metrics.dir_resolve_p50_us, "µs   (directory resolve, warm)"},
-      {"copy_rows_per_s", metrics.copy_rows_per_s, "rows/s (migration copy throughput)"},
+      {"copy_keystone_rows_per_s", metrics.copy_keystone_rows_per_s,
+       "rows/s (migration copy throughput, keystone rows)"},
       {"fanout_kb_per_shard", metrics.fanout_kb_per_shard, "KiB/shard (node density)"}
     ]
 

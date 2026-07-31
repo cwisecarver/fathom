@@ -11,7 +11,7 @@ defmodule Fathom.Bench.GateTest do
   @parent %{
     "cold_open_p50_us" => 1000.0,
     "dir_resolve_p50_us" => 150.0,
-    "copy_rows_per_s" => 8_000_000.0,
+    "copy_keystone_rows_per_s" => 8_000_000.0,
     "fanout_kb_per_shard" => 180.0,
     "hrana_rt_us" => nil,
     "host" => "darwin"
@@ -31,18 +31,18 @@ defmodule Fathom.Bench.GateTest do
   end
 
   test "throughput dropping (lower is worse) >= block blocks" do
-    new = %{@parent | "copy_rows_per_s" => 6_000_000.0}
+    new = %{@parent | "copy_keystone_rows_per_s" => 6_000_000.0}
     result = Gate.compare(@parent, new)
     assert result.verdict == :block
     assert result.worst == 25.0
   end
 
   test "throughput improving is not a regression" do
-    new = %{@parent | "copy_rows_per_s" => 12_000_000.0}
+    new = %{@parent | "copy_keystone_rows_per_s" => 12_000_000.0}
     result = Gate.compare(@parent, new)
     assert result.verdict == :ok
     # Improvement reads as a negative regression percent.
-    copy = Enum.find(result.deltas, &(&1.metric == :copy_rows_per_s))
+    copy = Enum.find(result.deltas, &(&1.metric == :copy_keystone_rows_per_s))
     assert copy.pct < 0
   end
 

@@ -48,7 +48,7 @@ measured prod-compiled against a clean data dir.
 | `cold_open_p50_us` | `Fathom.Shards.checkout/1` | **Warm/local cold-open.** Pre-seed K shard DBs in Local storage. Cold-open one (no live coordinator, file pulled from local NVMe), `SELECT 1`, then `Fathom.Shards.drain/2` to flush+drop+release so the next iteration is genuinely cold. p50 of the timed `checkout/1` window. This is the node-restart / NVMe-hit path. | higher |
 | `cold_open_s3_p50_us` | `Fathom.Shards.checkout/1` (S3 backend) | **Cold-from-S3 cold-open** — the production cold path. Same as above but the backend is `Storage.S3`: each sample seeds a shard object to S3, drops local, then times the checkout (pull from S3) + open + first query. **Opt-in:** `nil` unless `FATHOM_S3_TEST_*` env is set (so the default gate stays S3-free). Against MinIO-on-localhost this is the S3 *protocol* + loopback (~6 ms observed); point the endpoint at S3/R2 in-region for the real TTFB/RTT-bound number. | higher |
 | `dir_resolve_p50_us` | `Fathom.Directory.resolve/1` | Warm steady state (the on-conflict update path that runs on *every* request): pre-resolve once, then time N resolves of the same id. p50. Needs real Postgres. | higher |
-| `copy_rows_per_s` | `Fathom.Migrator.Copy.migrate/4` | Seed a source shard with R rows; replay an `ALTER ADD COLUMN` **and a `CREATE INDEX`** as the captured statements (the index scans every row, so the transform does real O(rows) work — an O(1) ALTER alone would leave the metric measuring little more than a page-cache-warm `File.cp`). `R ÷ wall`. The real prod `migrate/4` (one end-of-copy checkpoint, fsync-light). | lower |
+| `copy_keystone_rows_per_s` | `Fathom.Migrator.Copy.migrate/4` | Seed a source shard with R **`Fathom.Keystone`** rows (every SQLite storage class and affinity, deterministically fuzzed); replay an `ALTER ADD COLUMN` **and a `CREATE INDEX`** as the captured statements (the index scans every row, so the transform does real O(rows) work — an O(1) ALTER alone would leave the metric measuring little more than a page-cache-warm `File.cp`). `R ÷ wall`. The real prod `migrate/4` (one end-of-copy checkpoint, fsync-light). | lower |
 | `fanout_kb_per_shard` | `Fathom.Shards.checkout/1` × N | Open N shard **coordinators** concurrently (an open-but-idle shard is just the `Fathom.Shard` GenServer — it holds no connection; connections are per-stream and transient). `Δ:erlang.memory(:total) ÷ N`. The node-density number. Deliberately does NOT hold a connection per shard: that would burn ~3 fds each (db + `-wal` + `-shm`) and exhaust the OS fd limit (default 256 on macOS) well before N is interesting. | higher |
 
 `hrana_rt_us` is a **placeholder column, recorded `null`** until remote shards land
@@ -69,9 +69,18 @@ cross-platform noise.
 {"ts":"2026-06-28T…Z","commit":"e26b655","commit_full":"…","branch":"main",
  "dirty":false,"host":"darwin","mix_env":"prod",
  "cold_open_p50_us":1234.5,"dir_resolve_p50_us":210.0,
- "copy_rows_per_s":85000.0,"fanout_kb_per_shard":48.0,
+ "copy_keystone_rows_per_s":85000.0,"fanout_kb_per_shard":48.0,
  "hrana_rt_us":null,"trials":5,"log":"logs/bench-20260628-….log"}
 ```
+
+**Series break, 2026-07-31 — `copy_rows_per_s` → `copy_keystone_rows_per_s`.** The copy bench
+moved from a three-column `(INTEGER, TEXT, INTEGER)` table to `Fathom.Keystone`, which carries
+every SQLite storage class and affinity. Rows are far wider, so rows/second dropped by
+construction. That is a fixture change, not a code regression, and `AGENTS.md` is explicit that a
+harness change ends the comparable series — so the metric was **renamed** rather than quietly
+redefined. Entries before this date keep `copy_rows_per_s` and are never compared against entries
+after it (a metric absent from the parent is skipped, not treated as flat). Rename again on any
+future harness change to this bench.
 
 The `host` **and `mix_env`** fields pin the comparison topology: the
 gate compares only same-host, same-env baselines, so a macOS number never gates a

@@ -212,6 +212,20 @@ defmodule Fathom.KeystoneTest do
       refute Keystone.dump(a) == Keystone.dump(b)
     end
 
+    test "building works in a process that has never touched :rand", %{path: path} do
+      # Regression: `:rand.export_seed/0` returns the ATOM `:undefined` in a never-seeded
+      # process, and `:undefined` is truthy in Elixir, so the restore fed it to `:rand.seed/1`
+      # and died in `:rand.mk_alg/1`. Every ExUnit test process is already seeded, so the whole
+      # suite passed while `mix fathom.bench` — a fresh process — crashed on its first run.
+      task =
+        Task.async(fn ->
+          assert :undefined == :rand.export_seed(), "this process must start unseeded"
+          Keystone.build!(path, rows: 8)
+        end)
+
+      assert {:ok, _} = Task.await(task, 30_000)
+    end
+
     test "building does not disturb the caller's :rand state", %{path: path} do
       :rand.seed(:exsss, {1, 2, 3})
       expected = for _ <- 1..5, do: :rand.uniform(1_000_000)
