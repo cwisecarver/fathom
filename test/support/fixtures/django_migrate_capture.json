@@ -1,0 +1,175 @@
+[
+  {
+    "requires_review": false,
+    "statement_args": [
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": [
+          {
+            "type": "text",
+            "value": "finance"
+          },
+          {
+            "type": "text",
+            "value": "0001_initial"
+          },
+          {
+            "type": "text",
+            "value": "2026-07-31 01:03:50.031092"
+          }
+        ]
+      },
+      {
+        "args": [
+          {
+            "type": "text",
+            "value": "finance"
+          },
+          {
+            "type": "text",
+            "value": "0001_initial"
+          },
+          {
+            "type": "text",
+            "value": "2026-07-31 01:03:50.031092"
+          }
+        ]
+      },
+      {
+        "args": []
+      }
+    ],
+    "statements": [
+      "CREATE TABLE \"finance_account\" (\"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"name\" varchar(120) NOT NULL, \"type\" varchar(16) NOT NULL, \"institution\" varchar(120) NOT NULL, \"currency\" varchar(3) NOT NULL, \"opening_balance_cents\" bigint NOT NULL, \"archived\" bool NOT NULL)",
+      "CREATE TABLE \"finance_tag\" (\"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"name\" varchar(80) NOT NULL, \"color\" varchar(16) NOT NULL, \"seeded\" bool NOT NULL)",
+      "CREATE TABLE \"finance_category\" (\"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"name\" varchar(120) NOT NULL, \"group\" varchar(120) NOT NULL, \"kind\" varchar(16) NOT NULL, \"color\" varchar(16) NOT NULL, \"icon\" varchar(64) NOT NULL, \"seeded\" bool NOT NULL, \"parent_id\" bigint NULL REFERENCES \"finance_category\" (\"id\") DEFERRABLE INITIALLY DEFERRED)",
+      "CREATE TABLE \"finance_merchant\" (\"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"name\" varchar(200) NOT NULL, \"notes\" varchar(500) NOT NULL, \"seeded\" bool NOT NULL, \"default_category_id\" bigint NULL REFERENCES \"finance_category\" (\"id\") DEFERRABLE INITIALLY DEFERRED)",
+      "CREATE TABLE \"finance_transaction\" (\"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"date\" date NOT NULL, \"amount_cents\" bigint NOT NULL, \"description\" varchar(500) NOT NULL, \"cleared\" bool NOT NULL, \"pending\" bool NOT NULL, \"created_by\" integer NULL, \"created_at\" datetime NOT NULL, \"account_id\" bigint NOT NULL REFERENCES \"finance_account\" (\"id\") DEFERRABLE INITIALLY DEFERRED, \"category_id\" bigint NULL REFERENCES \"finance_category\" (\"id\") DEFERRABLE INITIALLY DEFERRED, \"merchant_id\" bigint NULL REFERENCES \"finance_merchant\" (\"id\") DEFERRABLE INITIALLY DEFERRED)",
+      "CREATE TABLE \"finance_transactiontag\" (\"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"tag_id\" bigint NOT NULL REFERENCES \"finance_tag\" (\"id\") DEFERRABLE INITIALLY DEFERRED, \"transaction_id\" bigint NOT NULL REFERENCES \"finance_transaction\" (\"id\") DEFERRABLE INITIALLY DEFERRED)",
+      "CREATE TABLE \"new__finance_transaction\" (\"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"date\" date NOT NULL, \"amount_cents\" bigint NOT NULL, \"description\" varchar(500) NOT NULL, \"cleared\" bool NOT NULL, \"pending\" bool NOT NULL, \"created_by\" integer NULL, \"created_at\" datetime NOT NULL, \"account_id\" bigint NOT NULL REFERENCES \"finance_account\" (\"id\") DEFERRABLE INITIALLY DEFERRED, \"category_id\" bigint NULL REFERENCES \"finance_category\" (\"id\") DEFERRABLE INITIALLY DEFERRED, \"merchant_id\" bigint NULL REFERENCES \"finance_merchant\" (\"id\") DEFERRABLE INITIALLY DEFERRED)",
+      "INSERT INTO \"new__finance_transaction\" (\"id\", \"date\", \"amount_cents\", \"description\", \"cleared\", \"pending\", \"created_by\", \"created_at\", \"account_id\", \"category_id\", \"merchant_id\") SELECT \"id\", \"date\", \"amount_cents\", \"description\", \"cleared\", \"pending\", \"created_by\", \"created_at\", \"account_id\", \"category_id\", \"merchant_id\" FROM \"finance_transaction\"",
+      "DROP TABLE \"finance_transaction\"",
+      "ALTER TABLE \"new__finance_transaction\" RENAME TO \"finance_transaction\"",
+      "CREATE INDEX \"finance_category_parent_id_add26bac\" ON \"finance_category\" (\"parent_id\")",
+      "CREATE INDEX \"finance_merchant_default_category_id_db4d5f96\" ON \"finance_merchant\" (\"default_category_id\")",
+      "CREATE UNIQUE INDEX \"finance_transactiontag_transaction_id_tag_id_7e9afa3c_uniq\" ON \"finance_transactiontag\" (\"transaction_id\", \"tag_id\")",
+      "CREATE INDEX \"finance_transactiontag_tag_id_a87ecd49\" ON \"finance_transactiontag\" (\"tag_id\")",
+      "CREATE INDEX \"finance_transactiontag_transaction_id_57b1af7a\" ON \"finance_transactiontag\" (\"transaction_id\")",
+      "CREATE INDEX \"finance_transaction_account_id_fb4d3f0f\" ON \"finance_transaction\" (\"account_id\")",
+      "CREATE INDEX \"finance_transaction_category_id_f48294d6\" ON \"finance_transaction\" (\"category_id\")",
+      "CREATE INDEX \"finance_transaction_merchant_id_4882517f\" ON \"finance_transaction\" (\"merchant_id\")",
+      "CREATE INDEX \"finance_tra_date_f21d66_idx\" ON \"finance_transaction\" (\"date\")",
+      "CREATE INDEX \"finance_tra_categor_bbdf49_idx\" ON \"finance_transaction\" (\"category_id\")",
+      "\n            SELECT name, type FROM sqlite_master\n            WHERE type in ('table', 'view') AND NOT name='sqlite_sequence'\n            ORDER BY name",
+      "INSERT INTO \"django_migrations\" (\"app\", \"name\", \"applied\") VALUES (?, ?, ?) RETURNING \"django_migrations\".\"id\"",
+      "SELECT QUOTE(?), QUOTE(?), QUOTE(?)",
+      "PRAGMA foreign_key_check"
+    ],
+    "template_migration_count": 1,
+    "version": 1
+  },
+  {
+    "requires_review": false,
+    "statement_args": [
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": []
+      },
+      {
+        "args": [
+          {
+            "type": "text",
+            "value": "finance"
+          },
+          {
+            "type": "text",
+            "value": "0002_budget"
+          },
+          {
+            "type": "text",
+            "value": "2026-07-31 01:03:51.352125"
+          }
+        ]
+      }
+    ],
+    "statements": [
+      "CREATE TABLE \"finance_budget\" (\"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"period\" varchar(7) NOT NULL, \"limit_cents\" bigint NOT NULL, \"rollover\" bool NOT NULL, \"category_id\" bigint NOT NULL REFERENCES \"finance_category\" (\"id\") DEFERRABLE INITIALLY DEFERRED)",
+      "PRAGMA foreign_key_check",
+      "CREATE UNIQUE INDEX \"finance_budget_category_id_period_4cce12b3_uniq\" ON \"finance_budget\" (\"category_id\", \"period\")",
+      "CREATE INDEX \"finance_budget_category_id_3ead498a\" ON \"finance_budget\" (\"category_id\")",
+      "INSERT INTO \"django_migrations\" (\"app\", \"name\", \"applied\") VALUES (?, ?, ?) RETURNING \"django_migrations\".\"id\""
+    ],
+    "template_migration_count": 2,
+    "version": 2
+  }
+]
