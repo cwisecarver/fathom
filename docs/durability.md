@@ -74,10 +74,37 @@ reports the flushes (each a **VACUUM INTO** snapshot + **full-object PUT**) and 
 duration. At **100 writes/s** over a 60 s window (dev, Local storage — the VACUUM + local-copy cost;
 real-S3 PUT cost is the `FATHOM_S3_TEST_*` / chaos-rig complement):
 
-| `:shard_flush_interval_ms` | flushes / 60 s | flush µs (p50 / p99) |
-|---|---|---|
-| 5 000 (default) | 12 | 6.0 ms / 7.7 ms |
-| 30 000 | 2 | 5.1 ms / 5.1 ms |
+| `:shard_flush_interval_ms` | flushes / 60 s | flush µs (p50 / p99) | $ / M writes¹ |
+|---|---|---|---|
+| 5 000 (default) | 12 | 6.0 ms / 7.7 ms | $0.010 |
+| 30 000 | 2 | 5.1 ms / 5.1 ms | $0.0017 |
+
+¹ **Derived, not measured.** The flush *counts* are measured; the dollars are list-price arithmetic
+at S3-standard **PUT ~$5.00 / M**, the same convention [deploy-cluster](deploy-cluster.md) uses to
+price the other request paths. Byte transfer is free on ingress and a flush overwrites **one** key,
+so a tighter interval buys RPO with **request count only** — not storage, not bandwidth. R2/Tigris
+differ; re-derive against your store's price sheet.
+
+**Cost per write is set by writes-per-flush, not by write count.** A flush uploads the whole object
+no matter how many writes accumulated behind it, so the per-write cost is purely amortization:
+
+    $ per million writes  =  5 / (write_rate_per_s × interval_s)
+
+That reproduces both rows above (100 w/s × 5 s ⇒ $5/500 ⇒ $0.010) and shows where the money
+actually is — the **ceiling at one write per interval**, where every write pays a full PUT:
+**$5.00 / M writes**, 500× the 100 w/s cell. Per *shard*, a continuously-write-active shard costs
+`2.592e6 / interval_s` PUTs per month — **~$2.59/shard/month at 5 s, ~$12.96 at 1 s**. Both are
+ceilings that require a write in *every* window, 24/7; a bursty tenant pays for the dirty windows
+it actually touches, which is typically orders of magnitude fewer.
+
+**What that does to the cost story vs a provisioned database.** Fathom's saving over
+one-Postgres-per-tenant (or a shared instance sized for peak) comes from the **idle tail** — a quiet
+tenant costs object storage and nothing else, because the flush is write-gated and a clean shard
+never PUTs. The interval does not touch that; it prices only the write-active fraction. Where it
+*does* bite is the continuously-hot shard: at 1 s the ~$12.96/month PUT bill lands in the same range
+as a small provisioned instance, so **sub-second RPO is the point where per-shard request cost stops
+being free** and wants pricing against that tenant's plan. At the 5 s default it is ~$2.59/month at
+the ceiling and effectively nothing for bursty tenants.
 
 The flush **rate scales ~1/interval** (12 vs 2 — ~6× for 5 s vs 30 s) at **~constant per-flush cost**
 (~5–8 ms on Local, dominated by the VACUUM INTO snapshot, which is also the long-lived reader that

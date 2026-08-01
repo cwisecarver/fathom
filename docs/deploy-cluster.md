@@ -230,6 +230,11 @@ intra-region and billed on egress):
 - **Heartbeats:** 1 PUT/node every `ttl/3` (default 10s) ≈ 8.6k PUT/day/node ≈ **$0.04/day/node**. Negligible — that's the whole point of the F1 heartbeat replacing per-shard renewal.
 - **Durability flushes:** 1 PUT per *dirty* shard per `:shard_flush_interval_ms`
   (write-gated — clean shards skip it). Cost tracks write volume, not open-shard count.
+  Ceiling for a *continuously*-write-active shard is `2.592e6 / interval_s` PUT/month ≈
+  **$2.59/shard/month at the 5 s default** (~$12.96 at 1 s); amortized per write it is
+  `$5 / (rate × interval)` per million, so a busy shard is ~a cent per million writes and the
+  worst case — one write per interval — is the full $5.00/M. Breakdown in
+  [durability](durability.md), "Cost — the flush rate the interval buys".
 - **Failover steal-storm:** rerouting a dead node's *S* shards ≈ `S × (4 acquire + 1 pull)`
   requests, one-time, bounded by the dedicated S3 Finch pool (`warm_s3_shards_per_s`).
 
