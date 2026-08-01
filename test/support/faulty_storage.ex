@@ -121,12 +121,27 @@ defmodule Fathom.Test.FaultyStorage do
     flush_delay()
 
     cond do
-      fault() == :flush -> {:error, :s3_unreachable}
+      fault() == :flush ->
+        {:error, :s3_unreachable}
+
       # The PERMANENT flush failure (#37): past the S3 single-PUT ceiling, every retry fails
       # identically forever while the shard keeps acking writes. Staging a real 5 GiB object is
       # not an option, so the backend reports the same error shape the S3 backend does.
-      fault() == :flush_too_large -> {:error, {:object_too_large, 6_000_000_000}}
-      true -> Local.flush(shard_id, local_path, expected_etag)
+      fault() == :flush_too_large ->
+        {:error, {:object_too_large, 6_000_000_000}}
+
+      # THE LOST RESPONSE (expert review 2026-08-01 #4). The PUT lands server-side and the
+      # response never gets back — a documented real case on the S3 path
+      # (Mint.TransportError{reason: :closed}). The object advances; the coordinator believes
+      # the flush failed and keeps its old fence etag. The NEXT flush then 412s against our
+      # own earlier write, and the "lock still ours" reconcile used to conclude the object was
+      # current and mark the shard clean, discarding everything written in between.
+      fault() == :flush_lands_then_errors ->
+        _ = Local.flush(shard_id, local_path, expected_etag)
+        {:error, :s3_unreachable}
+
+      true ->
+        Local.flush(shard_id, local_path, expected_etag)
     end
   end
 

@@ -996,66 +996,26 @@ defmodule Fathom.Shard do
         # clears the fence here on its next flush.
         state = clear_write_fence(Map.merge(state, updates))
 
-        case flush_result do
-          # Uploaded; advance the fence etag, the provenance sidecar, and the flushed
-          # watermark captured when the task started (clears dirty up to that point).
-          {:ok, new_etag} ->
-            write_etag_sidecar(state.path, new_etag)
+        # The verdict fold is SHARED with the terminate path's settle_flush_task/1
+        # (expert review 2026-08-01 #3): the two used to be separate `case`s and drifted —
+        # settle matched a reply shape this task stopped producing at f8ecf63, so every
+        # graceful stop silently discarded the flush result. One function, two callers.
+        case apply_flush_verdict(state, flush_result) do
+          {:flushed, state} ->
+            {:noreply, schedule_flush(settle_waiters(state, :flushed))}
 
-            state = %{
-              state
-              | flushed_through: state.flush_pending,
-                counter_gen: state.flush_pending_gen,
-                etag: new_etag
-            }
-
-            # Advance the published watermark (clears dirty up to flush_pending for the RPO reader).
-            FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
-            # Persist the durable-flush time so it survives node death (#28) — off the hot path.
-            Fathom.Directory.Recorder.record_flush(state.id)
-            {:noreply, schedule_flush(settle_waiters(clear_flush_failures(state), :flushed))}
-
-          # The data PUT's If-Match failed (412) but the task's lock re-check found the lock
-          # STILL OURS (expert review #2): a 412 is NOT proof of a steal — our own PUT can
-          # land server-side while its response is lost (Req retries the idempotent PUT, and
-          # the retry 412s against our first attempt's own write). The object is our own
-          # durable bytes, so resync the fence etag to the object's current value and advance
-          # the watermark; keep serving.
-          {:reconciled, object_etag} when not is_nil(object_etag) ->
-            write_etag_sidecar(state.path, object_etag)
-
-            state = %{
-              state
-              | etag: object_etag,
-                flushed_through: state.flush_pending,
-                counter_gen: state.flush_pending_gen
-            }
-
-            FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
-            # Our bytes are durably the live object (#28) — record the flush time.
-            Fathom.Directory.Recorder.record_flush(state.id)
-            {:noreply, schedule_flush(settle_waiters(clear_flush_failures(state), :flushed))}
-
-          # 412 + lock ours, but the object's etag came back nil/unreadable: keep serving with
-          # no etag resync (mirrors the old reconcile's `_ -> {:ok, state}`); stays dirty and
-          # retries next interval.
-          {:reconciled, nil} ->
-            # Still dirty — re-kick for any flush_now waiter (else it waits a whole flush interval).
+          # Still dirty — re-kick for any flush_now waiter (else it waits a whole flush interval).
+          {:dirty, state} ->
             {:noreply, schedule_flush(settle_waiters(state, :flushed))}
 
           # 412 AND the task's lock re-check found the lock SUPERSEDED — a real steal. Never
           # clobber the new owner: self-fence (stop without flushing). Fail any flush_now waiters.
-          :superseded ->
+          {:superseded, state} ->
             {:stop, {:shutdown, :lease_lost},
              settle_waiters(%{state | lease_lost: true}, {:error, :lease_lost})}
 
-          # Snapshot/PUT (or the reconcile's lock read) failed transiently: don't advance the
-          # watermark, so it stays dirty and the next interval retries — and a later idle-drop
-          # flushes before dropping instead of deleting un-stored writes. A synchronous flush_now
-          # caller gets the error (it can retry) rather than blocking to its call timeout.
-          {:error, reason} ->
-            {:noreply,
-             schedule_flush(settle_waiters(record_flush_failure(state, reason), {:error, reason}))}
+          {{:error, reason}, state} ->
+            {:noreply, schedule_flush(settle_waiters(state, {:error, reason}))}
         end
 
       # The pre-flush fence found a real steal (lock superseded) — self-fence, never clobber the new
@@ -1454,6 +1414,15 @@ defmodule Fathom.Shard do
 
   # --- flush ---
 
+  # A settled flush task can report the lock SUPERSEDED after terminate/2 has already
+  # dispatched past its `lease_lost: true` clause (expert review 2026-08-01 #3). Honour it
+  # here rather than uploading over the node that took the shard: quarantine a dirty local for
+  # recovery, exactly as that clause does.
+  defp flush_and_drop(%{lease_lost: true} = state) do
+    if unflushed?(state), do: quarantine_fenced!(state), else: drop_local(state.path)
+    :ok
+  end
+
   defp flush_and_drop(state) do
     if unflushed?(state), do: flush_then_drop(state), else: drop_clean(state)
   end
@@ -1509,12 +1478,7 @@ defmodule Fathom.Shard do
             {:error, :superseded} ->
               case Storage.check_lease(state.id, state.lease) do
                 :ok ->
-                  Logger.info(
-                    "shard #{state.id}: flush 412 but lock still ours; object is durable, dropping"
-                  )
-
-                  drop_local(state.path)
-                  Storage.release_lease(state.id, state.lease)
+                  retry_drop_upload(state)
 
                 _ ->
                   Logger.warning(
@@ -1635,6 +1599,39 @@ defmodule Fathom.Shard do
 
       {:error, _transient} = error ->
         error
+    end
+  end
+
+  # A 412 on the DROP flush, with the lock still ours (expert review 2026-08-01 #4). This used
+  # to log "object is durable, dropping" and `drop_local` — which is only sound if the object
+  # holds THIS attempt's bytes. It need not: a previous interval's PUT can have landed with its
+  # response lost, after which the tenant committed more writes; the object then holds the
+  # OLDER snapshot and dropping unlinks everything since. And because finding #3 made the
+  # terminate path reach this branch deterministically on a rolling deploy, "need not" was in
+  # practice "usually does not".
+  #
+  # A 412 is proof the object moved, nothing more — so re-fence to where it actually is and
+  # upload again. Success ⇒ our bytes really are durable ⇒ drop + release. Failure ⇒ KEEP the
+  # local copy: the next open's provenance check arbitrates recoverably, which is always
+  # better than an unrecoverable unlink.
+  defp retry_drop_upload(state) do
+    with {:ok, etag} when not is_nil(etag) <- Storage.object_etag(state.id),
+         {:ok, new_etag} <- upload_for_drop(%{state | etag: etag}) do
+      Logger.info(
+        "shard #{state.id}: flush 412 with lock ours; re-fenced to the object and re-uploaded"
+      )
+
+      write_etag_sidecar(state.path, new_etag)
+      Fathom.Directory.Recorder.record_flush(state.id)
+      drop_local(state.path)
+      Storage.release_lease(state.id, state.lease)
+    else
+      other ->
+        Logger.error(
+          "shard #{state.id}: flush 412 with lock ours, but the re-fenced upload failed " <>
+            "(#{inspect(other)}); KEEPING the local copy — it holds acked writes the stored " <>
+            "object may not"
+        )
     end
   end
 
@@ -2183,28 +2180,99 @@ defmodule Fathom.Shard do
   # (expert review #27) — used on the terminate path so the final drop-flush never
   # races the task's conditional PUT. A task error/timeout leaves the state as-is
   # (still dirty ⇒ the drop-flush uploads everything itself).
+  #
+  # THE SHAPE MATTERS (expert review 2026-08-01 #3). This used to match `{:ok, {:ok, etag}}`,
+  # which `fenced_flush/2` stopped producing at f8ecf63 ("run the periodic-flush fence
+  # off-process, audit #18") — that commit changed the reply to `{:fenced, verdict, updates}`
+  # and updated handle_info/2 but not this function. The match was therefore UNREACHABLE and
+  # every terminate fell to the `_` clause, proceeding with a stale `state.etag` and stale
+  # `flushed_through`. The drop-flush then PUT with the pre-task etag against an object the
+  # task had already advanced ⇒ deterministic 412 ⇒ the "lock still ours, object is durable"
+  # branch ⇒ `drop_local` of every write committed after the task's snapshot. Silent,
+  # unrecoverable, on the ordinary rolling-deploy path, under a log line asserting durability.
+  #
+  # The fold is now shared with handle_info/2 so the two cannot drift again.
   defp settle_flush_task(%{flush_task: nil} = state), do: state
 
   defp settle_flush_task(%{flush_task: task} = state) do
     settled =
       case Task.yield(task, settle_yield_ms()) || Task.shutdown(task) do
-        {:ok, {:ok, new_etag}} ->
-          write_etag_sidecar(state.path, new_etag)
+        {:ok, {:fenced, flush_result, updates}} ->
+          {status, state} =
+            state |> Map.merge(updates) |> apply_flush_verdict(flush_result)
 
-          %{
-            state
-            | flush_task: nil,
-              flushed_through: state.flush_pending,
-              counter_gen: state.flush_pending_gen,
-              etag: new_etag
-          }
+          # A superseded verdict means a peer owns the shard now. Carry that into the state so
+          # flush_and_drop/1 quarantines instead of clobbering the new owner — terminate/2 has
+          # already dispatched, so the `lease_lost: true` clause can no longer catch it.
+          %{state | flush_task: nil, lease_lost: status == :superseded or state.lease_lost}
 
+        # Task crashed, timed out, or was shut down: leave the flush state untouched. Still
+        # dirty ⇒ the drop-flush uploads everything itself.
         _ ->
           %{state | flush_task: nil}
       end
 
     release_flush_slot(settled)
   end
+
+  # Fold a completed flush task's verdict into local state. Pure w.r.t. the fence — all the
+  # Storage I/O already ran in the task — so both the live handler and the terminate-path
+  # settle can call it. Returns `{status, state}`.
+  defp apply_flush_verdict(state, {:ok, new_etag}) do
+    # Uploaded; advance the fence etag, the provenance sidecar, and the flushed watermark
+    # captured when the task started (clears dirty up to that point).
+    write_etag_sidecar(state.path, new_etag)
+
+    state = %{
+      state
+      | flushed_through: state.flush_pending,
+        counter_gen: state.flush_pending_gen,
+        etag: new_etag
+    }
+
+    # Advance the published watermark (clears dirty up to flush_pending for the RPO reader).
+    FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
+    # Persist the durable-flush time so it survives node death (#28) — off the hot path.
+    Fathom.Directory.Recorder.record_flush(state.id)
+    {:flushed, clear_flush_failures(state)}
+  end
+
+  # The data PUT's If-Match failed (412) and the task's lock re-check found the lock STILL
+  # OURS. That tells us the object CHANGED — it does NOT tell us the object holds THIS
+  # attempt's bytes (expert review 2026-08-01 #4). The benign reading (our own PUT landed and
+  # its response was lost) and the lossy one are indistinguishable from here:
+  #
+  #   t0  flush A PUTs If-Match E0. It LANDS; the response is lost (a documented real case on
+  #       this path — see storage/s3.ex's transport-error handling). Shard stays dirty,
+  #       state.etag stays E0.
+  #   t1  the tenant commits more writes.
+  #   t2  flush B PUTs If-Match E0 ⇒ 412 (object is at E1) ⇒ lock still ours ⇒ "reconciled".
+  #
+  # Advancing `flushed_through` here — which is what this branch used to do — marks the shard
+  # CLEAN while the object holds only t0's bytes, and the next idle `drop_clean` unlinks the
+  # rest. So: resync the fence etag ONLY and stay dirty. The next interval re-flushes with the
+  # correct etag. Cost in the benign case is one extra PUT; cost of the old behaviour in the
+  # lossy case was silent, unrecoverable loss that `loss-report` reported as safe.
+  #
+  # The sidecar IS advanced: we are the single writer, so our local copy is a descendant of
+  # whatever the object currently holds — same lineage, plus more writes. That is exactly what
+  # the provenance check needs to not false-quarantine a fork.
+  defp apply_flush_verdict(state, {:reconciled, object_etag}) when not is_nil(object_etag) do
+    write_etag_sidecar(state.path, object_etag)
+    {:dirty, clear_flush_failures(%{state | etag: object_etag})}
+  end
+
+  # 412 + lock ours, but the object's etag came back nil/unreadable: keep serving with no etag
+  # resync; stays dirty and retries next interval.
+  defp apply_flush_verdict(state, {:reconciled, nil}), do: {:dirty, state}
+
+  defp apply_flush_verdict(state, :superseded), do: {:superseded, state}
+
+  # Snapshot/PUT (or the reconcile's lock read) failed transiently: don't advance the
+  # watermark, so it stays dirty and the next interval retries — and a later idle-drop
+  # flushes before dropping instead of deleting un-stored writes.
+  defp apply_flush_verdict(state, {:error, reason}),
+    do: {{:error, reason}, record_flush_failure(state, reason)}
 
   # Release the FlushGate slot this flush reserved, exactly once (expert review #17). Called at
   # every site that clears flush_task — completion, task crash, and terminate — so the node-wide
