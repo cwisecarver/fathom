@@ -763,14 +763,38 @@ defmodule Fathom.Shard do
       :corrupt ->
         {:error, :sidecar_corrupt}
 
-      :missing ->
-        Logger.warning(
-          "shard #{shard_id}: warm file has no provenance sidecar (legacy); adopting current etag"
-        )
+      # Born here against no stored object (2026-08-01 #2). Fence with nil, which the storage
+      # layer renders as `If-None-Match: *`: the first flush can only CREATE. If a peer created
+      # the object in the meantime, that flush 412s and self-fences instead of overwriting it.
+      # resolve_fork/4 has already quarantined this case when the store was reachable; this is
+      # the fence for when it was not.
+      :no_object ->
+        {:ok, nil}
 
-        case Storage.object_etag(shard_id) do
-          {:ok, etag} -> {:ok, etag}
-          {:error, reason} -> {:error, {:etag_unavailable, reason}}
+      # No sidecar ⇒ unknown provenance. resolve_fork/4 normally quarantined this and the open
+      # came through the COLD path, so reaching here means the quarantine rename FAILED (or
+      # :adopt_unprovenanced_warm is on). Adopting the store's current etag is what let a
+      # planted or stale file flush over a live lineage with a valid If-Match, so only do it
+      # when explicitly configured; otherwise fail the open and leave the copy untouched for
+      # an operator.
+      :missing ->
+        if adopt_unprovenanced_warm?() do
+          Logger.warning(
+            "shard #{shard_id}: warm file has no provenance sidecar; adopting current etag " <>
+              "(:adopt_unprovenanced_warm)"
+          )
+
+          case Storage.object_etag(shard_id) do
+            {:ok, etag} -> {:ok, etag}
+            {:error, reason} -> {:error, {:etag_unavailable, reason}}
+          end
+        else
+          Logger.error(
+            "shard #{shard_id}: warm file has no provenance sidecar and could not be " <>
+              "quarantined; refusing to open rather than adopt an unknown lineage"
+          )
+
+          {:error, :no_provenance}
         end
     end
   end
@@ -793,6 +817,9 @@ defmodule Fathom.Shard do
         {:error, {:pull_crashed, reason}}
     end
   end
+
+  defp adopt_unprovenanced_warm?,
+    do: Application.get_env(:fathom, :adopt_unprovenanced_warm, false)
 
   # A new shard has no object, so the pull wrote no temp — leave the path absent (the first
   # connection creates it empty). Otherwise move the temp into place. Carries the object etag
@@ -834,8 +861,22 @@ defmodule Fathom.Shard do
           err
       end
     else
-      # Brand-new shard: no object, no local file — no provenance either.
-      File.rm(etag_sidecar(path))
+      # Brand-new shard: no object, so the pull wrote no temp. This used to `File.rm` the
+      # sidecar, which left every born-empty shard with NO PROVENANCE BY CONSTRUCTION — and
+      # "absent sidecar" was then read as "legacy file, adopt whatever etag the store holds
+      # now". That is the clobber the sidecar exists to prevent, reachable with no attacker at
+      # all (expert review 2026-08-01 #2):
+      #
+      #   node A opens a new shard and takes writes, dying before its first flush. The LB
+      #   reroutes to B, which serves, flushes (the object now EXISTS), idles and releases
+      #   cleanly. A comes back on a persisted :shard_data_dir, sees its local `.db`, reads
+      #   `:missing`, opens WARM, adopts the store's current etag — and its first flush
+      #   If-Matches successfully, destroying every write B acknowledged.
+      #
+      # So record the absence EXPLICITLY. `@no_object_sentinel` means "this file was created
+      # locally against no stored object", which is a provenance claim the open path can check
+      # (see fork_evidence/2) rather than an absence it has to guess about.
+      write_no_object_sidecar(path)
       {:ok, etag}
     end
   end
@@ -1671,6 +1712,30 @@ defmodule Fathom.Shard do
     end
   end
 
+  @doc """
+  Stamp provenance on a shard file that was placed in the live data dir out-of-band.
+
+  Cold-open refuses to serve a local `.db` with no provenance sidecar — it cannot tell a
+  legitimate copy from one planted by a tenant or left behind by a node whose shard has since
+  been taken over (expert review 2026-08-01 #2). Everything fathom writes there normally gets a
+  sidecar automatically (`promote_pull/2` on a pull, `write_etag_sidecar/2` on a flush).
+
+  Harnesses and fixtures that build a shard file directly must therefore declare what it
+  derives from. This records the stored object's current etag when one exists, or the
+  "no stored object" sentinel when it does not — the same two claims the real paths make.
+  """
+  @spec stamp_local_provenance(String.t()) :: :ok
+  def stamp_local_provenance(shard_id) do
+    path = db_path(shard_id)
+
+    case Storage.object_etag(shard_id) do
+      {:ok, etag} when not is_nil(etag) -> write_etag_sidecar(path, etag)
+      _ -> write_no_object_sidecar(path)
+    end
+
+    :ok
+  end
+
   # Run `PRAGMA quick_check` on the file at `path`; `:ok` iff SQLite reports the single row "ok".
   # Cheap (shards are small by premise). `@doc false` public so the corrupt-flush guard is
   # testable directly (expert review 2026-07-14 #4).
@@ -1852,6 +1917,13 @@ defmodule Fathom.Shard do
 
   defp etag_sidecar(path), do: path <> ".etag"
 
+  # "Derived from: no stored object." A real etag is a hex content hash, so this can never
+  # collide with one. Written when a brand-new shard is born locally, so that "no object" is a
+  # POSITIVE provenance claim rather than an absent sidecar (expert review 2026-08-01 #2).
+  @no_object_sentinel "-"
+
+  defp write_no_object_sidecar(path), do: write_etag_sidecar(path, @no_object_sentinel)
+
   defp write_etag_sidecar(_path, nil), do: :ok
 
   defp write_etag_sidecar(path, etag) do
@@ -1875,8 +1947,14 @@ defmodule Fathom.Shard do
       # branch — the exact clobber the sidecar exists to prevent. Corrupt routes to
       # quarantine instead (spurious but recoverable, the safe direction).
       {:ok, ""} -> :corrupt
+      # An explicit "born locally against no stored object" claim (2026-08-01 #2) — distinct
+      # from an absent sidecar, which means unknown provenance.
+      {:ok, @no_object_sentinel} -> :no_object
       {:ok, etag} -> {:ok, etag}
-      # Only a truly ABSENT sidecar is legacy (pre-provenance warm file).
+      # A truly ABSENT sidecar is now UNKNOWN provenance, not "legacy, trust it". Every file
+      # this node creates carries a sidecar — a pulled object gets the object's etag, a
+      # born-empty shard gets the sentinel — so an absent one is a file fathom did not write
+      # here: a pre-provenance legacy copy, or a planted one.
       {:error, :enoent} -> :missing
       # Unreadable (eacces/eio/...) is unknown provenance, same safe direction.
       {:error, _} -> :corrupt
@@ -1908,6 +1986,18 @@ defmodule Fathom.Shard do
     case read_etag_sidecar(path) do
       :missing ->
         :no_sidecar
+
+      # We recorded "born here against no stored object". If the store still has no object,
+      # that claim holds and the copy is ours to serve. If an object now EXISTS, somebody else
+      # created it while we were away — our copy is a fork of a lineage we never saw, and
+      # serving or flushing it would destroy their writes (expert review 2026-08-01 #2,
+      # trigger B: die before the first flush, peer takes over, serves, flushes, releases).
+      :no_object ->
+        case Storage.object_etag(shard_id) do
+          {:ok, nil} -> :no_object_confirmed
+          {:ok, store_etag} -> {:orphaned, store_etag}
+          {:error, _unreachable} -> :unreachable
+        end
 
       # Torn/unreadable sidecar (expert review #12): provenance unknown, so the copy cannot be
       # trusted to continue the stored lineage. Unrelated to the touch race — but the quarantine
@@ -1941,7 +2031,40 @@ defmodule Fathom.Shard do
   # A FAILED quarantine (the rename never moved the copy) must NOT report quarantined, or the
   # cold-open's promote_pull would overwrite the un-moved recovery copy (expert review #14) —
   # hence `== :ok` on every quarantine branch, exactly as before.
-  defp resolve_fork(:no_sidecar, _shard_id, _path, _lease), do: false
+  # An absent sidecar is UNKNOWN provenance and now fails closed (expert review 2026-08-01 #2).
+  # This used to return false — "keep it, open warm" — which is what made both triggers work:
+  # a file planted by a tenant (via ATTACH or VACUUM INTO, before 286b530 closed those) was
+  # adopted as authoritative for a shard that had never been opened, and a legitimate
+  # born-empty shard that failed over and back clobbered the peer that took it.
+  #
+  # Quarantining is recoverable — the copy is preserved as `<path>.forked.<ts>` and the open
+  # proceeds cold from the stored object. Adopting was not: it destroyed the other lineage
+  # with a valid If-Match and looked like an ordinary flush.
+  #
+  # `:adopt_unprovenanced_warm` restores the old behaviour for an operator carrying
+  # pre-provenance files they would rather adopt than re-pull. Default OFF.
+  defp resolve_fork(:no_sidecar, shard_id, path, _lease) do
+    if adopt_unprovenanced_warm?() do
+      Logger.warning(
+        "shard #{shard_id}: warm file has no provenance sidecar; adopting it because " <>
+          ":adopt_unprovenanced_warm is on. This cannot distinguish a legacy file from a " <>
+          "planted or forked one."
+      )
+
+      false
+    else
+      quarantine_fork!(shard_id, path, :no_sidecar) == :ok
+    end
+  end
+
+  # Provenance says "no stored object" and the store agrees — our own brand-new shard.
+  defp resolve_fork(:no_object_confirmed, _shard_id, _path, _lease), do: false
+
+  # Provenance says "no stored object" but one exists: a peer created the lineage while we
+  # were down. Never serve or flush over it.
+  defp resolve_fork({:orphaned, _store_etag}, shard_id, path, _lease),
+    do: quarantine_fork!(shard_id, path, :orphaned) == :ok
+
   defp resolve_fork(:match, _shard_id, _path, _lease), do: false
   defp resolve_fork(:absent, _shard_id, _path, _lease), do: false
   defp resolve_fork(:unreachable, _shard_id, _path, _lease), do: false
@@ -1992,6 +2115,15 @@ defmodule Fathom.Shard do
 
             :diverged ->
               "another node wrote and released while this one was down (expert review #1)"
+
+            :no_sidecar ->
+              "no provenance sidecar — this node did not create this file, so its lineage is " <>
+                "unknown: a pre-provenance legacy copy, or one planted by a tenant " <>
+                "(expert review 2026-08-01 #2). Set :adopt_unprovenanced_warm to adopt instead."
+
+            :orphaned ->
+              "recorded as born against NO stored object, but an object now exists — a peer " <>
+                "created the lineage while this node was down (expert review 2026-08-01 #2)"
           end
 
         Logger.error(

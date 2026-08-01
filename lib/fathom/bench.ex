@@ -557,6 +557,9 @@ defmodule Fathom.Bench do
       path = Fathom.Shard.db_path("benchwire")
       drop_db(path)
       {:ok, _} = Fathom.Keystone.build!(path, rows: rows)
+      # A file built straight into the live dir has no provenance, and cold-open now refuses
+      # to serve an unprovenanced copy (expert review 2026-08-01 #2). Declare it.
+      :ok = Fathom.Shard.stamp_local_provenance("benchwire")
 
       {:ok, _, client} = Filo.Client.execute(client, "SELECT count(*) FROM ks_scalars")
 

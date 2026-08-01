@@ -42,6 +42,12 @@ defmodule Fathom.WireBlobTest do
 
     :ok = Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
     Connection.close(conn)
+
+    # Stamp the "born against no stored object" provenance a real local file always carries
+    # (expert review 2026-08-01 #2). There is no stored object in this fixture, so the sentinel
+    # is what fathom itself would have written. Without it the open now quarantines the file as
+    # an unknown lineage — which is the point of the fix, but not what this test is measuring.
+    File.write!(path <> ".etag", "-")
     :ok
   end
 

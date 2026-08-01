@@ -82,6 +82,16 @@ defmodule Fathom.Shard.WarmPromotionTest do
 
   # Seed a valid db directly in the LIVE data dir (stands in for this node's own
   # un-flushed writes from a prior boot — a warm *restart*, authoritative).
+  # A live-dir copy this node owns, carrying the provenance a real one always has: every file
+  # fathom lands in the live dir gets a sidecar — the object's etag when pulled, or the
+  # "no stored object" sentinel when born empty (expert review 2026-08-01 #2). Stamping the
+  # CURRENT object etag models the real warm-restart shape this test is about: we pulled the
+  # stored lineage, wrote on top of it, and went down before flushing. Same lineage, newer
+  # bytes — so our copy is authoritative.
+  #
+  # Without the sidecar this fixture is indistinguishable from a file planted by a tenant or
+  # left by a node whose shard was since taken over, and the open now (correctly) quarantines
+  # it rather than serving unknown bytes.
   defp seed_live(shard, value) do
     path = Path.join(local_dir(), "#{shard}.db")
     File.mkdir_p!(Path.dirname(path))
@@ -90,6 +100,14 @@ defmodule Fathom.Shard.WarmPromotionTest do
     :ok = Connection.exec(c, "INSERT INTO kv VALUES ('#{value}')")
     :ok = Connection.exec(c, "PRAGMA wal_checkpoint(TRUNCATE)")
     Connection.close(c)
+
+    provenance =
+      case Fathom.Shard.Storage.object_etag(shard) do
+        {:ok, etag} when not is_nil(etag) -> etag
+        _ -> "-"
+      end
+
+    File.write!(path <> ".etag", provenance)
     :ok
   end
 
@@ -223,9 +241,12 @@ defmodule Fathom.Shard.WarmPromotionTest do
     # This node's own un-flushed local copy says "restart"; the follower cache and the
     # storage object both say something else. The restart copy must win untouched — we
     # must not freshness-check (and possibly clobber) our own un-flushed writes.
-    seed_live(shard, "restart")
+    # Order matters: the object and the follower cache exist first, then this node pulls that
+    # lineage and writes "restart" on top of it without flushing. seed_live/2 stamps the
+    # object's etag as provenance, so the copy is a legitimate descendant — not a fork.
     seed_remote(shard, "remote")
     warm_cache_from_remote(shard)
+    seed_live(shard, "restart")
     attach_promoted_telemetry(shard)
 
     assert serve_value(shard) == "restart"

@@ -2516,9 +2516,13 @@ defmodule Fathom.ShardDurabilityTest do
 
   test "a warm restart (local file present) opens dirty", %{shard: shard} do
     Application.put_env(:fathom, :shard_idle_ms, 50)
-    # A valid empty local db stands in for un-flushed local state from a prior boot.
+    # A valid empty local db stands in for un-flushed local state from a prior boot. It carries
+    # the "born against no stored object" sentinel, which is what a real brand-new shard's
+    # local file has (expert review 2026-08-01 #2) — there is no stored object here. Without
+    # provenance the open now quarantines it as an unknown lineage rather than serving it.
     {:ok, c} = Connection.open(local_db(shard))
     Connection.close(c)
+    File.write!(local_db(shard) <> ".etag", "-")
 
     capture_log(fn ->
       {:ok, pid, ref, _path} = Shards.checkout(shard)
