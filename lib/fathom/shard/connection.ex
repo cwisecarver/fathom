@@ -13,13 +13,99 @@ defmodule Fathom.Shard.Connection do
   @doc """
   Opens a connection to the shard file at `path` (WAL, synchronous=FULL, 5s busy
   timeout, and — unless `config :fathom, :foreign_keys` is false — foreign keys ON).
+
+  ## Options
+
+    * `:tenant?` — this handle will execute **client-supplied** SQL, so deny
+      `ATTACH`/`DETACH` at the SQLite authorizer (expert review 2026-08-01 #1).
+      Defaults to `false`: fathom's own callers (the coordinator's durability
+      snapshot, the migration engine's replay, the bench/scale harnesses) are
+      trusted and MUST NOT get the authorizer — see `maybe_authorizer/2`.
+    * `:scope` — `:rw` (default) or `:ro`. A `:ro` handle is opened
+      `mode: :readonly` so SQLite itself refuses every write (#7).
+
+  Only `Fathom.ShardExecutor` passes `tenant?: true`; it is the one path that
+  runs SQL fathom did not author.
   """
-  @spec open(Path.t()) :: {:ok, reference()} | {:error, term()}
-  def open(path) do
+  @spec open(Path.t(), keyword()) :: {:ok, reference()} | {:error, term()}
+  def open(path, opts \\ []) do
     File.mkdir_p!(Path.dirname(path))
 
-    with {:ok, conn} <- Sqlite3.open(path),
-         :ok <- Sqlite3.execute(conn, "PRAGMA journal_mode=WAL"),
+    tenant? = Keyword.get(opts, :tenant?, false)
+    scope = Keyword.get(opts, :scope, :rw)
+
+    case open_handle(path, scope) do
+      {:ok, conn, :readonly} -> configure_readonly(conn, tenant?)
+      {:ok, conn, :readwrite} -> configure_readwrite(conn, tenant?, scope)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # A `:ro` stream gets a genuinely read-only SQLite handle: the scope check in
+  # ShardExecutor is a leading-keyword heuristic and was bypassable by a `/* */` prefix, a
+  # CTE-prefixed DML, or a durable `PRAGMA` assignment (expert review 2026-08-01 #7).
+  # SQLite's own enforcement has no such holes.
+  #
+  # `PRAGMA query_only=ON` is NOT used as the primary mechanism: it is connection-local and
+  # the tenant can simply send `PRAGMA query_only=OFF` (verified). It is only the fallback
+  # for the narrow case where a read-only open cannot proceed — a database whose `-wal`
+  # needs recovery, which requires write access. That fallback is still safe because
+  # `ShardExecutor` refuses `query_only` as a pragma assignment.
+  defp open_handle(path, :ro) do
+    case Sqlite3.open(path, mode: :readonly) do
+      {:ok, conn} -> {:ok, conn, :readonly}
+      {:error, _} -> with {:ok, conn} <- Sqlite3.open(path), do: {:ok, conn, :readwrite}
+    end
+  end
+
+  defp open_handle(path, _scope) do
+    with {:ok, conn} <- Sqlite3.open(path), do: {:ok, conn, :readwrite}
+  end
+
+  # A read-only handle takes only the connection-local pragmas. The file-level ones
+  # (`journal_mode`, `wal_autocheckpoint`) describe writes this handle cannot perform, and
+  # `max_page_count` is a growth cap on a connection that cannot grow the file.
+  defp configure_readonly(conn, tenant?) do
+    with :ok <- Sqlite3.set_busy_timeout(conn, 5000),
+         :ok <- maybe_foreign_keys(conn),
+         :ok <- maybe_cache_size(conn),
+         :ok <- maybe_authorizer(conn, tenant?) do
+      {:ok, conn}
+    end
+  end
+
+  defp configure_readwrite(conn, tenant?, scope) do
+    with :ok <- configure(conn),
+         :ok <- maybe_authorizer(conn, tenant?),
+         :ok <- maybe_query_only(conn, scope) do
+      {:ok, conn}
+    end
+  end
+
+  # Deny ATTACH/DETACH on any handle that runs client SQL. Without this, one statement —
+  # `ATTACH DATABASE '<data_dir>/<victim>.db' AS v` — gave a tenant full read AND write
+  # access to every co-resident tenant's shard file, bypassing the `:ro` scope, the write
+  # fence, `:block_tenant_ddl`, and the single-writer lease (expert review 2026-08-01 #1,
+  # found independently by two panels and verified by execution). The victim's path is not
+  # even guessed: `PRAGMA database_list` returns the attacker's own absolute path and every
+  # shard is a sibling in one flat directory.
+  #
+  # SCOPED TO TENANT HANDLES ON PURPOSE. SQLite implements `VACUUM INTO` as an internal
+  # ATTACH, so denying `:attach` also denies `VACUUM INTO` ("authorization denied", verified)
+  # — and `Fathom.Shard.snapshot/2` is a `VACUUM INTO` on a `Connection`. Setting the
+  # authorizer unconditionally in `open/1` would therefore have broken EVERY durability
+  # flush. That is a happy accident on the tenant side: it also closes the `VACUUM INTO
+  # '<any path>'` arbitrary-file-write primitive (#8) at the engine, not just at the
+  # statement gate.
+  defp maybe_authorizer(_conn, false), do: :ok
+  defp maybe_authorizer(conn, true), do: Sqlite3.set_authorizer(conn, [:attach, :detach])
+
+  # Fallback belt for a `:ro` scope that could not get a read-only handle (see open_handle/2).
+  defp maybe_query_only(conn, :ro), do: Sqlite3.execute(conn, "PRAGMA query_only=ON")
+  defp maybe_query_only(_conn, _scope), do: :ok
+
+  defp configure(conn) do
+    with :ok <- Sqlite3.execute(conn, "PRAGMA journal_mode=WAL"),
          # synchronous=FULL fsyncs the WAL on every commit, so a committed write survives a node
          # crash (per-commit local durability, tightening the local RPO below the S3 flush
          # interval). It is ~free for fathom's sharded model: throughput is wire/executor-bound,
@@ -52,7 +138,7 @@ defmodule Fathom.Shard.Connection do
          :ok <- maybe_foreign_keys(conn),
          :ok <- maybe_cache_size(conn),
          :ok <- maybe_max_page_count(conn) do
-      {:ok, conn}
+      :ok
     end
   end
 

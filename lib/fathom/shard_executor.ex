@@ -56,7 +56,13 @@ defmodule Fathom.ShardExecutor do
   defp do_open(shard_id, scope) do
     case Shards.checkout(shard_id) do
       {:ok, pid, ref, path} ->
-        case Connection.open(path) do
+        # THE one connection in fathom that runs SQL fathom did not author, so it is the one
+        # that gets the restricted handle: ATTACH/DETACH denied at the SQLite authorizer, and a
+        # genuinely read-only handle for a `:ro` token (expert review 2026-08-01 #1, #7).
+        # Everything else — the coordinator's VACUUM INTO snapshot, the migration replay, the
+        # harnesses — opens unrestricted, which is required: the authorizer also blocks
+        # VACUUM INTO. See Fathom.Shard.Connection.maybe_authorizer/2.
+        case Connection.open(path, tenant?: true, scope: scope) do
           {:ok, conn} ->
             # The scope rides the handle so execute/2 can enforce read-only across baton-resumes
             # and every stream on the connection.
@@ -96,9 +102,22 @@ defmodule Fathom.ShardExecutor do
     write? = dml? or ddl?
 
     cond do
+      # Statements no tenant may run, regardless of scope or config (expert review 2026-08-01
+      # #1/#8). Checked first so it cannot be reached around. The SQLite authorizer on the
+      # tenant handle is the real enforcement — this branch exists to return a *diagnosable*
+      # error code instead of a bare "not authorized"/"authorization denied" from the engine,
+      # and to cover the pragma names the authorizer cannot express per-name.
+      blocked = blocked_statement(sql) ->
+        {:error, blocked}
+
       # A read-only token (#24) may only read: refuse any write (DML or DDL) with a distinct 403 so
       # export/analytics/BI credentials can't mutate a tenant. Checked before DDL-block/run so a `ro`
       # token is refused even where a full token would be allowed.
+      #
+      # This is now DEFENCE IN DEPTH, not the enforcement: a `:ro` stream's handle is opened
+      # `mode: :readonly`, so SQLite refuses the write even when this leading-keyword test
+      # misses it (a `/* */` prefix, a CTE-prefixed DML, a durable PRAGMA — all verified
+      # bypasses before #7).
       scope == :ro and write? ->
         {:error,
          %Error{message: "read-only token cannot write", code: "FILO_READONLY", status: 403}}
@@ -808,21 +827,152 @@ defmodule Fathom.ShardExecutor do
   defp dml?(sql) when is_binary(sql) do
     # Only the leading keyword matters — slice + downcase a few chars rather than the whole
     # statement, since this runs on every query result.
-    head = sql |> String.trim_leading() |> String.slice(0, 7) |> String.downcase()
-    Enum.any?(@dml_prefixes, &String.starts_with?(head, &1))
+    Enum.any?(@dml_prefixes, &String.starts_with?(lead(sql, 7), &1))
   end
 
   defp dml?(_), do: false
+
+  # --- statement gate (expert review 2026-08-01 #1, #7, #8) ---------------------------------
+  #
+  # `String.trim_leading/1` removes whitespace, NOT SQL comments, so every leading-keyword
+  # classifier here was defeated by a `/* c */` or `-- c\n` prefix. That was only a
+  # *durability* miss for the whitelists (an unrecognized head falls through to the
+  # conservative "assume it wrote" path), but for the two AUTHORIZATION gates riding
+  # `dml?/ddl?` — the `:ro` refusal and `:block_tenant_ddl` — it was a bypass:
+  # `/* c */ INSERT …` classified as a read.
+  #
+  # Hot path: this runs on every statement, so the common case (a statement starting with a
+  # letter) costs one extra 2-byte match over the previous `trim_leading`. Only a statement
+  # that actually opens with a comment pays the scan.
+  defp lead(sql, n), do: sql |> strip_lead_comments() |> String.slice(0, n) |> String.downcase()
+
+  defp strip_lead_comments(sql) do
+    case String.trim_leading(sql) do
+      "/*" <> rest -> rest |> after_delim("*/") |> strip_lead_comments()
+      "--" <> rest -> rest |> after_delim("\n") |> strip_lead_comments()
+      other -> other
+    end
+  end
+
+  # An unterminated comment leaves no statement behind — "" classifies as nothing and falls to
+  # the conservative path, which is the safe direction for every caller here.
+  defp after_delim(bin, delim) do
+    case :binary.match(bin, delim) do
+      {i, len} -> binary_part(bin, i + len, byte_size(bin) - i - len)
+      :nomatch -> ""
+    end
+  end
+
+  # Verbs a tenant may never run. `attach`/`detach` are the cross-tenant read+write breach
+  # (#1); `vacuum` covers `VACUUM INTO '<any path>'`, an arbitrary-file-write primitive that a
+  # read-only handle does NOT stop (#8). All three are already denied by the authorizer on the
+  # tenant handle — this list exists so the client gets a code it can act on.
+  @blocked_verbs ~w(attach detach vacuum)
+
+  # Pragma ASSIGNMENTS a tenant may set. An allow-list, not a deny-list: the pragmas that
+  # matter are fathom's own safety mechanisms, and every one of them was re-settable by
+  # client SQL (verified — `max_page_count=999999999` defeated the size cap,
+  # `synchronous=OFF` defeated per-commit durability, and `journal_mode=DELETE` is a DURABLE,
+  # database-level change that `control_statement?/1` classified as clean, so an idle
+  # `drop_clean` discarded the local copy without flushing).
+  #
+  # These are the connection-local pragmas a real client legitimately sets: Django's SQLite
+  # backend issues `foreign_keys` and, during migrations, `legacy_alter_table` and
+  # `defer_foreign_keys`. READ forms (`PRAGMA synchronous`, `PRAGMA table_info(t)`) are
+  # always allowed — only assignment is gated. Widen with `:tenant_pragma_allow` rather than
+  # editing this list, so a client that needs one more knob does not need a fathom release.
+  # `user_version`/`application_id`/`schema_version` are deliberately ALLOWED for a `:rw`
+  # stream. They are fathom's own three-place version stamp, and stamping them through the
+  # data path is a documented, tested capability — expert review #15 fixed the opposite bug
+  # (the stamp being classified as clean and then LOST on an idle drop), and
+  # shard_durability_test.exs pins the round trip. The hole finding #7 actually named is a
+  # READ-ONLY credential rewriting the gate, and that is closed at the engine: a `:ro` stream
+  # gets a `mode: :readonly` handle, so SQLite refuses the write outright. `:block_tenant_ddl`
+  # remains the lever for "schema evolution goes through the migration engine, not the tenant".
+  #
+  # `wal_checkpoint` is a maintenance operation, not a safety defeat — it is the same
+  # checkpoint the coordinator runs after each snapshot, and fathom's own durability tests
+  # drive it through this path.
+  @tenant_pragma_allow ~w(foreign_keys defer_foreign_keys legacy_alter_table busy_timeout
+                          cache_size temp_store recursive_triggers ignore_check_constraints
+                          case_sensitive_like automatic_index reverse_unordered_selects
+                          analysis_limit threads user_version application_id schema_version
+                          wal_checkpoint incremental_vacuum shrink_memory)
+
+  # SQLite spells an argument-taking READ the same way it spells a setter — `PRAGMA
+  # table_info(t)` and `PRAGMA journal_mode(delete)` are syntactically identical — so the
+  # gate cannot classify assignment-vs-read from the shape alone. These are the
+  # introspection pragmas, which take an argument but mutate nothing; a client (Django's
+  # schema editor and introspection layer especially) needs them.
+  #
+  # A BARE pragma (`PRAGMA journal_mode`, no argument) is a read and is never gated — it
+  # discloses only this connection's own configuration.
+  @tenant_pragma_introspect ~w(table_info table_xinfo table_list foreign_key_list index_list
+                               index_info index_xinfo database_list collation_list
+                               function_list module_list pragma_list compile_options
+                               freelist_count page_count quick_check integrity_check
+                               foreign_key_check stats optimize)
+
+  defp blocked_statement(sql) when is_binary(sql) do
+    head = lead(sql, 7)
+
+    cond do
+      Enum.any?(@blocked_verbs, &String.starts_with?(head, &1)) ->
+        %Error{
+          message: "statement not permitted on a tenant shard",
+          code: "FILO_STATEMENT_BLOCKED",
+          status: 403
+        }
+
+      String.starts_with?(head, "pragma") ->
+        blocked_pragma(sql)
+
+      true ->
+        nil
+    end
+  end
+
+  defp blocked_statement(_sql), do: nil
+
+  # `PRAGMA [schema.]name = value` / `PRAGMA [schema.]name(value)` is an assignment;
+  # `PRAGMA [schema.]name` alone is a read. SQLite accepts both setter forms, so both are
+  # gated. The schema qualifier is stripped — `PRAGMA main.journal_mode=delete` sets the same
+  # thing as `PRAGMA journal_mode=delete`.
+  defp blocked_pragma(sql) do
+    body = sql |> strip_lead_comments() |> String.slice(6, 200) |> String.downcase()
+
+    case String.split(body, ["=", "("], parts: 2) do
+      # No `=` and no `(` — a bare read.
+      [_only] ->
+        nil
+
+      [name_part, _value] ->
+        name = name_part |> String.trim() |> String.split(".") |> List.last()
+
+        if name in @tenant_pragma_allow or name in @tenant_pragma_introspect or
+             name in extra_pragma_allow() do
+          nil
+        else
+          %Error{
+            message: "PRAGMA #{name} cannot be set on a tenant shard",
+            code: "FILO_PRAGMA_BLOCKED",
+            status: 403
+          }
+        end
+    end
+  end
+
+  defp extra_pragma_allow, do: Application.get_env(:fathom, :tenant_pragma_allow, [])
 
   defp block_tenant_ddl?, do: Application.get_env(:fathom, :block_tenant_ddl, false)
 
   @ddl_leads ~w(create alter drop)
 
   # Leading-keyword schema-DDL detection (CREATE/ALTER/DROP — table/index/view/trigger). Cheap
-  # slice, since this runs on every statement when strict mode is on.
+  # slice, since this runs on every statement when strict mode is on. Comment-stripped: this
+  # gates `:block_tenant_ddl`, which a `/* c */ CREATE TABLE` prefix defeated (#7).
   defp ddl?(sql) when is_binary(sql) do
-    lead = sql |> String.trim_leading() |> String.slice(0, 6) |> String.downcase()
-    Enum.any?(@ddl_leads, &String.starts_with?(lead, &1))
+    Enum.any?(@ddl_leads, &String.starts_with?(lead(sql, 6), &1))
   end
 
   defp ddl?(_), do: false
