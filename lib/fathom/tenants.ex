@@ -261,7 +261,10 @@ defmodule Fathom.Tenants do
         )
 
       case Storage.pull(id, tmp) do
-        {:ok, nil} ->
+        # No bytes written: no object, or a steal sentinel (expert review 2026-08-01 #24).
+        # Previously a sentinel arrived as `{:ok, <etag>}` and fell through to the success
+        # branch, so export returned a fabricated EMPTY database as the tenant's data.
+        {:absent, _} ->
           File.rm(tmp)
           {:error, :not_stored}
 

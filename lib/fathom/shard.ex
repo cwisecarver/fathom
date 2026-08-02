@@ -660,7 +660,12 @@ defmodule Fathom.Shard do
 
   defp repull(shard_id, path) do
     case Storage.pull(shard_id, pull_temp(path)) do
+      # `promote_pull/2` already distinguishes the two by checking whether the temp exists, so
+      # both shapes route through it: bytes ⇒ promote + stamp the object's etag as provenance;
+      # no bytes ⇒ the born-empty branch, which stamps the "no object" sentinel sidecar. The
+      # fence etag is carried through either way (expert review 2026-08-01 #24).
       {:ok, new_etag} -> promote_pull(path, new_etag)
+      {:absent, new_etag} -> promote_pull(path, new_etag)
       {:error, reason} -> {:error, {:revalidate_failed, reason}}
     end
   end
@@ -860,6 +865,13 @@ defmodule Fathom.Shard do
   defp await_pull(task, path, _shard_id) do
     case Task.yield(task, @pull_timeout) || Task.shutdown(task) do
       {:ok, {:ok, etag}} ->
+        promote_pull(path, etag)
+
+      # No bytes written — a brand-new shard, or a steal sentinel (expert review 2026-08-01
+      # #24). `promote_pull/2`'s else branch is exactly this case: it stamps the "derived from
+      # no object" sentinel sidecar and carries the fence etag, so the first flush is a
+      # conditional create rather than a blind overwrite.
+      {:ok, {:absent, etag}} ->
         promote_pull(path, etag)
 
       {:ok, {:error, _} = error} ->

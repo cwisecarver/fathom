@@ -128,7 +128,10 @@ defmodule Fathom.Directory.Reconcile do
 
     try do
       case Storage.pull(shard_id, tmp) do
-        {:ok, nil} -> :missing
+        # `{:absent, _}` covers both no-object and a steal sentinel (expert review
+        # 2026-08-01 #24). A sentinel previously read as a real pull, so `user_version` came
+        # back 0 from a fabricated empty db and `--fix` wrote that 0 into the directory.
+        {:absent, _} -> :missing
         {:ok, _etag} -> read_user_version(tmp)
         {:error, reason} -> {:error, reason}
       end

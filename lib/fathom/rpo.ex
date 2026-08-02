@@ -256,6 +256,7 @@ defmodule Fathom.Rpo do
     result =
       case Storage.pull(shard, dst) do
         {:ok, _etag} -> peek(dst) || {0, t0}
+        # No bytes written (no object / steal sentinel) — nothing to measure (#24).
         _ -> {0, t0}
       end
 

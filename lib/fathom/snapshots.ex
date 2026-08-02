@@ -150,7 +150,9 @@ defmodule Fathom.Snapshots do
 
     try do
       case Storage.pull_snapshot(id, snapshot_id, tmp) do
-        {:ok, nil} -> {:error, :snapshot_not_found}
+        # `{:absent, _}` = no bytes written, incl. a steal sentinel (expert review
+        # 2026-08-01 #24) — previously a sentinel read as a real snapshot of an empty db.
+        {:absent, _} -> {:error, :snapshot_not_found}
         {:ok, _etag} -> read_user_version(tmp)
         {:error, reason} -> {:error, reason}
       end

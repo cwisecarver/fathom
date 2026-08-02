@@ -214,13 +214,26 @@ defmodule Fathom.Shard.Storage.S3 do
     # MD5-shaped etag as it streams (expert review #37), then fsynced and renamed
     # into place atomically (#24/#17).
     case download(object_path(shard_id), local_path) do
-      {:ok, etag} -> {:ok, etag}
-      # A steal-time brand-new sentinel (round-2 #7): the shard is brand-new — no
-      # local file is written — but the first flush must fence with the SENTINEL's
-      # etag (If-Match replaces it; the zombie's If-None-Match:* create 412s).
-      {:sentinel, etag} -> {:ok, etag}
-      {:error, _} = error -> error
-      :absent -> {:ok, nil}
+      {:ok, etag} ->
+        {:ok, etag}
+
+      # A steal-time brand-new sentinel (round-2 #7): the shard is brand-new — no local file
+      # is written — but the first flush must still fence with the SENTINEL's etag (If-Match
+      # replaces it; the zombie's If-None-Match:* create then 412s).
+      #
+      # `{:absent, etag}`, NOT `{:ok, etag}` (expert review 2026-08-01 #24). Collapsing it to
+      # `{:ok, _}` told every caller "bytes are at local_path" when none were, and the
+      # pull-then-open consumers duly opened the missing path — which CREATES an empty
+      # database. The fence etag is preserved, so round-2 #7's property is unchanged; only the
+      # "were bytes written" answer becomes honest.
+      {:sentinel, etag} ->
+        {:absent, etag}
+
+      {:error, _} = error ->
+        error
+
+      :absent ->
+        {:absent, nil}
     end
   end
 
@@ -1075,8 +1088,10 @@ defmodule Fathom.Shard.Storage.S3 do
   def pull_snapshot(shard_id, snapshot_id, local_path) do
     case download(url_path(snapshot_key(shard_id, snapshot_id)), local_path) do
       {:ok, etag} -> {:ok, etag}
-      {:sentinel, etag} -> {:ok, etag}
-      :absent -> {:ok, nil}
+      # Same contract as pull/2 — never claim bytes were written when none were
+      # (expert review 2026-08-01 #24).
+      {:sentinel, etag} -> {:absent, etag}
+      :absent -> {:absent, nil}
       {:error, _} = error -> error
     end
   end

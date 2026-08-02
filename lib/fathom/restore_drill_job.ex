@@ -83,8 +83,10 @@ defmodule Fathom.RestoreDrillJob do
 
     try do
       case Storage.pull(id, tmp) do
-        # No stored object — a never-flushed brand-new tenant, or a lost object.
-        {:ok, nil} ->
+        # No bytes written — a never-flushed brand-new tenant, a lost object, or a steal
+        # sentinel (expert review 2026-08-01 #24; a sentinel used to read as a healthy pull
+        # of an empty database, so the drill passed on nothing).
+        {:absent, _} ->
           :absent
 
         {:ok, _etag} ->

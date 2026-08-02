@@ -23,9 +23,11 @@ defmodule Fathom.Shard.Storage.Local do
           err -> err
         end
 
-      # Brand-new shard — no object, nothing written, no etag yet.
+      # Brand-new shard — no object, nothing written, no etag yet. `{:absent, nil}` rather
+      # than `{:ok, nil}` so the "were bytes written" answer is explicit for every caller
+      # (expert review 2026-08-01 #24); see the `pull/2` callback doc.
       {:error, :enoent} ->
-        {:ok, nil}
+        {:absent, nil}
 
       {:error, reason} ->
         {:error, reason}
@@ -264,8 +266,9 @@ defmodule Fathom.Shard.Storage.Local do
           err -> err
         end
 
+      # `{:absent, nil}`, matching pull/2 (expert review 2026-08-01 #24).
       {:error, :enoent} ->
-        {:ok, nil}
+        {:absent, nil}
 
       {:error, reason} ->
         {:error, reason}

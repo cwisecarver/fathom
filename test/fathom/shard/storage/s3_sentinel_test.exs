@@ -84,9 +84,16 @@ defmodule Fathom.Shard.Storage.S3SentinelTest do
     dest = Path.join(System.tmp_dir!(), "sentpull_#{System.unique_integer([:positive])}.db")
     on_exit(fn -> File.rm(dest) end)
 
-    # Brand-new semantics: NO local file materializes (the sentinel is not shard
-    # bytes) — but the sentinel's etag comes back as the first flush's fence.
-    assert {:ok, sentinel_etag} = S3.pull(@shard, dest)
+    # Brand-new semantics: NO local file materializes (the sentinel is not shard bytes) —
+    # but the sentinel's etag comes back as the first flush's fence.
+    #
+    # `{:absent, etag}`, not `{:ok, etag}` (expert review 2026-08-01 #24). This test already
+    # asserted `refute File.exists?(dest)` below, i.e. it always KNEW no bytes were written —
+    # while the return value said otherwise, and every pull-then-open consumer believed the
+    # return value and opened the missing path, which CREATES an empty database. The fencing
+    # property this test exists for is unchanged: the sentinel's etag still comes back and the
+    # first real flush still replaces it via If-Match.
+    assert {:absent, sentinel_etag} = S3.pull(@shard, dest)
     assert sentinel_etag == S3EtagStore.etag_of(store, @data_key)
     refute File.exists?(dest), "the sentinel placeholder must never be promoted as shard bytes"
 

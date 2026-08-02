@@ -601,7 +601,10 @@ defmodule Fathom.Migrator.ShardMigration do
     # Keep the object etag (round-2 expert review #5): the forward flush If-Matches it so
     # a steal that lands between pull and flush is caught instead of clobbered.
     case Storage.pull(shard_id, path) do
+      # The File.exists? guard already made this site safe against the #24 sentinel; the
+      # explicit `{:absent, _}` now says so in the contract rather than by accident.
       {:ok, etag} -> if File.exists?(path), do: {:ok, etag}, else: {:error, :no_live_object}
+      {:absent, _} -> {:error, :no_live_object}
       error -> error
     end
   end

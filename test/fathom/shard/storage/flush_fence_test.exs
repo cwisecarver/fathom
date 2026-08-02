@@ -36,7 +36,9 @@ defmodule Fathom.Shard.Storage.FlushFenceTest do
       shard: shard,
       local: local
     } do
-      assert {:ok, nil} = Storage.pull(shard, local)
+      # `{:absent, nil}` — nothing stored, so nothing written (expert review 2026-08-01 #24).
+      # `object_etag/1` is a pure query and keeps its `{:ok, nil}`.
+      assert {:absent, nil} = Storage.pull(shard, local)
       assert {:ok, nil} = Storage.object_etag(shard)
 
       File.write!(local, "v1")

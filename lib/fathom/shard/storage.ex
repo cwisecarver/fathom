@@ -69,11 +69,26 @@ defmodule Fathom.Shard.Storage do
   """
   @type heartbeat :: %{owner: String.t(), expires_at_ms: integer()}
 
-  # Pull the stored object to `local_path`, returning its current etag (or `nil` for a
-  # brand-new shard with no object — nothing is written). The etag lets the coordinator fence
-  # its first flush without a second round-trip (finding #15).
+  # Pull the stored object to `local_path`.
+  #
+  #   * `{:ok, etag}`     — BYTES WERE WRITTEN to `local_path`; `etag` fences the first flush.
+  #   * `{:absent, etag}` — NOTHING was written (no object, or only a steal sentinel). `etag`
+  #     is still the fence for a first flush (nil when there is no object at all).
+  #
+  # The two are separated because a caller cannot tell them apart from the return value
+  # otherwise, and `{:ok, _}` invites `Connection.open/1` on a path that does not exist —
+  # which CREATES a valid, quick_check-clean, EMPTY database and hands it back as if it were
+  # the tenant's data (expert review 2026-08-01 #24).
+  #
+  # That is not theoretical: on the chaos rig it left three tenants serving an empty database
+  # with `no such table`, their real rows preserved only in `.forked.*` quarantine files. The
+  # S3 backend previously collapsed its steal sentinel to `{:ok, etag}` while writing no file,
+  # so every "pull to a temp, then open it" consumer — reconcile, snapshots, export, the
+  # restore drill, `mix fathom.shard` — fabricated an empty database from it.
+  #
+  # A backend must NEVER return `{:ok, _}` without having written bytes.
   @callback pull(shard_id :: String.t(), local_path :: Path.t()) ::
-              {:ok, String.t() | nil} | {:error, term()}
+              {:ok, String.t()} | {:absent, String.t() | nil} | {:error, term()}
 
   # Unconditional write of `local_path` to the shard's object. For callers that don't fence
   # the live object (migration version copies, benchmarks); the coordinator uses `flush/3`.

@@ -81,7 +81,7 @@ defmodule Mix.Tasks.Fathom.Shard do
     storage_deps!()
 
     case Storage.pull(shard, path) do
-      {:ok, nil} -> Mix.raise("no stored object for #{shard} (never flushed, or deleted)")
+      {:absent, _} -> Mix.raise("no stored object for #{shard} (never flushed, or deleted)")
       {:ok, etag} -> Mix.shell().info("pulled #{shard} -> #{path} (etag #{inspect(etag)})")
       {:error, reason} -> Mix.raise("pull failed: #{inspect(reason)}")
     end
@@ -93,7 +93,7 @@ defmodule Mix.Tasks.Fathom.Shard do
 
     try do
       case Storage.pull(shard, tmp) do
-        {:ok, nil} ->
+        {:absent, _} ->
           Mix.raise("no stored object for #{shard}")
 
         {:ok, _etag} ->
@@ -237,7 +237,7 @@ defmodule Mix.Tasks.Fathom.Shard do
 
     try do
       case Storage.pull(shard, ltmp) do
-        {:ok, nil} ->
+        {:absent, _} ->
           Mix.raise("no stored object for #{shard} to diff against")
 
         {:ok, _etag} ->
