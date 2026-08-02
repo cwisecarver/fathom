@@ -297,6 +297,80 @@ defmodule Fathom.ShardStorageS3Test do
     assert {:ok, %{epoch: 1}} = S3.acquire_lease(shard, "b@node", 60_000)
   end
 
+  # Expert review 2026-08-01 #12. `owner_live?/3` was asymmetric: NO heartbeat object fell back
+  # to the lock's own TTL (correct for a legacy-mode owner renewing per-shard), but a
+  # PRESENT-BUT-EXPIRED one returned :dead outright and never consulted the lock at all.
+  #
+  # That is reachable by design, not by misconfiguration: when the Heartbeat GenServer dies
+  # abnormally it deliberately LEAVES its object behind and coordinators degrade to the legacy
+  # per-shard renew fence. So a node that is healthy, serving, and renewing every lock it holds
+  # had its ENTIRE keyspace slice become instantly stealable — per-shard loss up to a flush
+  # interval and a `.fenced.<ts>` quarantine each, while it kept serving. A stale-but-present
+  # heartbeat was strictly WORSE than an absent one.
+  test "a stale heartbeat does NOT make a still-renewed lock stealable", %{shard: shard} = ctx do
+    margin = Fathom.Shard.Storage.steal_margin_ms()
+
+    # The owner's heartbeat lapsed well past the margin (its Heartbeat process died) ...
+    put_raw_heartbeat(ctx, "a@node", now_ms() - (margin + 30_000))
+    # ... but its lock is fresh, because legacy mode renews per-shard.
+    put_raw_lock(ctx, shard, "a@node", 3, now_ms() + 60_000)
+
+    assert {:error, {:held, "a@node"}} = S3.acquire_lease(shard, "b@node", 60_000),
+           "a healthy node that is still renewing its locks was stolen from"
+  end
+
+  test "an owner is stealable once BOTH its heartbeat and its lock have lapsed",
+       %{shard: shard} = ctx do
+    margin = Fathom.Shard.Storage.steal_margin_ms()
+    stale = margin + 30_000
+
+    put_raw_heartbeat(ctx, "a@node", now_ms() - stale)
+    put_raw_lock(ctx, shard, "a@node", 3, now_ms() - stale)
+
+    assert {:ok, %{owner: "b@node", epoch: 4}} = S3.acquire_lease(shard, "b@node", 60_000),
+           "a genuinely dead owner must still be stealable — the fix must not wedge failover"
+  end
+
+  # Expert review 2026-08-01 #10. When a steal's lock PUT landed but the follow-up
+  # `touch_object/1` failed, the code wrote the DEAD OWNER'S ORIGINAL LOCK CONTENT back — moving
+  # the fencing epoch N → N+1 → N. The epoch's monotonicity is the one invariant the whole
+  # single-writer design rests on, and rolling it back let the zombie's `check_lease/2` start
+  # matching again, i.e. conclude it was still the owner.
+  #
+  # The lock is now DELETED instead (conditional on our own write), so the next acquire is a
+  # fresh conditional create and a zombie reads `:not_found ⇒ :superseded`.
+  #
+  # THESE TWO DO NOT DISCRIMINATE and pass against the unfixed code: reaching the rollback
+  # requires `touch_object/1` to fail AFTER its lock PUT has landed, which needs fault injection
+  # this backend has no seam for. They are invariant guards — the epoch never regresses, a
+  # superseded owner never re-validates — so a future change that reintroduces a rollback on any
+  # reachable path is caught. The fix itself rests on the monotonicity argument. (#12's two
+  # tests above DO discriminate: the first fails on the parent commit.)
+  test "a failed takeover never leaves a lower epoch than was already visible",
+       %{shard: shard} = ctx do
+    margin = Fathom.Shard.Storage.steal_margin_ms()
+    put_raw_lock(ctx, shard, "a@node", 7, now_ms() - (margin + 30_000))
+
+    # A successful steal publishes epoch 8.
+    assert {:ok, %{owner: "b@node", epoch: 8}} = S3.acquire_lease(shard, "b@node", 60_000)
+
+    # Whatever happens next, no observer may ever see the epoch go backwards.
+    assert {:ok, %{epoch: epoch}} = read_lock_or_free(ctx, shard)
+    assert epoch >= 8, "the fencing epoch moved backward to #{epoch}"
+  end
+
+  test "after a takeover the superseded owner's lease no longer validates",
+       %{shard: shard} = ctx do
+    margin = Fathom.Shard.Storage.steal_margin_ms()
+    put_raw_lock(ctx, shard, "a@node", 7, now_ms() - (margin + 30_000))
+    stale_lease = %{owner: "a@node", epoch: 7, expires_at_ms: now_ms() + 60_000}
+
+    assert {:ok, _} = S3.acquire_lease(shard, "b@node", 60_000)
+
+    assert {:error, :superseded} = S3.check_lease(shard, stale_lease),
+           "the superseded owner must never re-validate as the holder"
+  end
+
   # ── the fence depends on this: the store must enforce conditional writes ──
 
   test "the store enforces If-None-Match and If-Match conditional PUTs", ctx do
@@ -431,6 +505,26 @@ defmodule Fathom.ShardStorageS3Test do
         region: "us-east-1"
       ]
     )
+  end
+
+  # Write a heartbeat object directly, to stage an owner whose Heartbeat process died and left
+  # its (now stale) object behind — the #12 scenario.
+  defp put_raw_heartbeat(ctx, owner, expires_at_ms) do
+    body = Storage.encode_heartbeat(%{owner: owner, expires_at_ms: expires_at_ms})
+    key = "heartbeats/" <> URI.encode_www_form(owner)
+
+    {:ok, %{status: status}} = Req.put(signed_req(ctx), url: object_url(ctx, key), body: body)
+
+    assert status in 200..299
+  end
+
+  # The lock as an observer sees it: `{:ok, lease}`, or `:free` when no lock object exists.
+  defp read_lock_or_free(ctx, shard) do
+    case Req.get(signed_req(ctx), url: object_url(ctx, "#{shard}.lock")) do
+      {:ok, %{status: 200, body: body}} -> Storage.decode_lease(body)
+      {:ok, %{status: 404}} -> :free
+      other -> flunk("unexpected lock read: #{inspect(other)}")
+    end
   end
 
   # Write a lock object directly (unconditional) to simulate another node's lease.

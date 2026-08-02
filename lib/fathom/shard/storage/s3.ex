@@ -1429,15 +1429,36 @@ defmodule Fathom.Shard.Storage.S3 do
                   # lock write already LANDED, and leaving it would let our own next
                   # checkout RECLAIM it (same owner + epoch) with no `took_over`:
                   # the zombie fence and the takeover revalidation both skipped for a
-                  # takeover that was never fenced (expert review round-2 #20). Roll
-                  # the lock back to the dead owner's original content (conditional —
-                  # a genuinely newer writer is never clobbered) so the retry redoes
-                  # the FULL steal + touch. Best-effort: if the rollback itself
-                  # fails, the etag data-fence still backstops a clobber.
+                  # takeover that was never fenced (expert review round-2 #20).
+                  #
+                  # Roll back to the dead owner's identity but at epoch + 2, NEVER back to
+                  # `epoch` (expert review 2026-08-01 #10). The old rollback wrote `epoch`
+                  # after `epoch + 1` had been durably visible — moving the fencing token
+                  # BACKWARD, and the epoch's monotonicity is the single invariant the
+                  # whole single-writer design rests on. Concretely it let the zombie's
+                  # lease `{other, epoch}` match `check_lease/2` again, so it could
+                  # conclude it was still the owner; and `touch_object` can fail AFTER its
+                  # rotation copy landed (the confirm-rotation HEAD erroring transiently),
+                  # leaving the data object's etag rotated — fencing the zombie's If-Match
+                  # — while the lock said the zombie still owned it.
+                  #
+                  # NOT a delete, though that is the tidier-looking fix and what the review
+                  # first proposed: with no lock object the next `acquire_lease` takes the
+                  # `:not_found` branch, which is a fresh `create_lock` at **epoch 1**. That
+                  # is both a bigger backward jump and a takeover with NO steal-touch —
+                  # exactly the unfenced reclaim round-2 #20 added this rollback to prevent
+                  # (`S3StealTouchRollbackTest` pins it).
+                  #
+                  # `epoch + 2` satisfies both at once: strictly greater than anything an
+                  # observer saw, so monotonic; a foreign owner, so our retry re-enters the
+                  # FULL steal path (epoch bump + touch) instead of the same-owner reclaim;
+                  # and `{other, epoch}` no longer matches, so the zombie reads superseded.
+                  # Best-effort — if the rollback itself fails, the etag data-fence still
+                  # backstops a clobber.
                   {:error, reason} ->
                     restore_lock(shard_id, stolen, %{
                       owner: other,
-                      epoch: epoch,
+                      epoch: epoch + 2,
                       expires_at_ms: lock_exp
                     })
 
@@ -1490,7 +1511,33 @@ defmodule Fathom.Shard.Storage.S3 do
         # wrong — is unaddressed here; the frozen-vs-advancing double-read is the follow-up for it.)
         maybe_emit_skew(other, now, s3_now)
         ref_now = s3_now || now
-        if ref_now <= exp + margin, do: :live, else: :dead
+
+        cond do
+          ref_now <= exp + margin ->
+            :live
+
+          # The heartbeat lapsed — but that alone does not make the OWNER dead (expert review
+          # 2026-08-01 #12). This branch used to return :dead unconditionally, never consulting
+          # the lock's TTL even if the owner had renewed it seconds ago. That is exactly
+          # backwards from the `:not_found` branch below, which DOES fall back to the lock TTL.
+          #
+          # And the asymmetry is reachable by design: when the Heartbeat GenServer dies
+          # abnormally it deliberately LEAVES its object behind, and coordinators degrade to the
+          # legacy per-shard renew fence — a node that is healthy, serving, and renewing every
+          # lock it holds. Under the old logic a single process failure (or a
+          # `heartbeat_server: false` config migration) made that node's ENTIRE keyspace slice
+          # instantly stealable, with per-shard loss up to a flush interval and a `.fenced.<ts>`
+          # quarantine each, while it kept serving. A stale-but-present object was strictly
+          # WORSE than an absent one.
+          #
+          # An owner is dead only when BOTH its heartbeat and its lock TTL have lapsed. Free:
+          # the lock was already read.
+          (s3_now || now) <= lock_expires_at_ms + margin ->
+            :live
+
+          true ->
+            :dead
+        end
 
       # A heartbeat object that isn't `other`'s — treat as no signal and fall back to the
       # lock's own TTL, same as :not_found.
@@ -1802,10 +1849,13 @@ defmodule Fathom.Shard.Storage.S3 do
   # epoch bump + data-object touch — instead of RECLAIMING an unfenced takeover.
   # Conditional on the lock still being exactly our failed-steal write; any
   # concurrent change wins and the rollback no-ops.
-  defp restore_lock(shard_id, ours, original) do
+  # Conditionally rewrite a lock WE wrote, only while it is still ours. The caller supplies the
+  # replacement content; see the `touch_failed` branch for why it is the previous owner at
+  # `epoch + 2` rather than at `epoch` (monotonicity) or absent (an unfenced epoch-1 reclaim).
+  defp restore_lock(shard_id, ours, replacement) do
     case get_lock(shard_id) do
       {:ok, %{owner: o, epoch: e}, etag} when o == ours.owner and e == ours.epoch ->
-        _ = put_lock(shard_id, original, if_match: etag)
+        _ = put_lock(shard_id, replacement, if_match: etag)
         :ok
 
       _ ->

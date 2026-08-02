@@ -2344,7 +2344,10 @@ defmodule Fathom.Shard do
     temp = "#{state.path}.snap.#{System.unique_integer([:positive])}"
 
     try do
-      with :ok <- snapshot(state.path, temp),
+      # Integrity BEFORE the snapshot: quarantine_corrupt!/2 renames the live path, so checking
+      # after would spend a full VACUUM on a file we are about to refuse and move aside.
+      with :ok <- verify_snapshot(state, temp),
+           :ok <- snapshot(state.path, temp),
            {:ok, new_etag} <- Storage.flush(state.id, temp, state.etag) do
         {:ok, new_etag}
       else
@@ -2362,6 +2365,62 @@ defmodule Fathom.Shard do
       Enum.each(["", "-wal", "-shm"], &File.rm(temp <> &1))
     end
   end
+
+  # Integrity-gate the PERIODIC flush (expert review 2026-08-01 #14).
+  #
+  # Review 2026-07-14 #4 added a `quick_check` gate so a locally-corrupted database is never
+  # flushed over the last good stored object — but it lived in exactly one place: the
+  # checkpoint-then-raw-upload fast path of `upload_for_drop/1`, which runs only on the
+  # idle/terminate drop. The periodic flush, which is the DOMINANT producer of the durable
+  # object, went straight to the PUT with no check at all.
+  #
+  # The old justification was that `VACUUM INTO` reads every page so it fails on corruption by
+  # itself. Only partly true, and wrong in the direction that matters: `VACUUM INTO` REBUILDS
+  # indexes from table content, so the classic index/table divergence `quick_check` exists to
+  # catch is silently NORMALISED AWAY rather than detected — and the normalised file is then
+  # uploaded, correctly If-Match-fenced by the legitimate owner, as the new durable truth.
+  #
+  # Check the SNAPSHOT TEMP, not the live file: it is the artifact about to become the durable
+  # object, and it is about to be fully read for the Content-MD5 anyway, so the page reads are
+  # already paid for. Reuses the drop path's quarantine + refuse-the-flush behaviour, so the
+  # last good stored object stays authoritative.
+  # CHECKS THE LIVE FILE, NOT THE SNAPSHOT TEMP — and that distinction is the whole point.
+  #
+  # The review recommended checking the temp, on the reasoning that it is about to be read for
+  # the Content-MD5 anyway so the pages are free. Measured before implementing, that is wrong:
+  # `VACUUM INTO` REBUILDS indexes from table content, so it *repairs* index/table divergence on
+  # the way out. Probe on a database with a deliberately corrupted index root page:
+  #
+  #     quick_check on the live db   -> "Tree 3 page 3 cell 199: Offset 23130 out of range …"
+  #     VACUUM INTO                  -> OK
+  #     quick_check on the VACUUMed copy -> "ok"      (200 rows intact)
+  #
+  # So the temp is clean by construction for exactly the corruption class `quick_check` exists
+  # to catch, and checking it would have shipped a gate that never fires — while the divergence
+  # is silently normalised away and uploaded, correctly If-Match-fenced, as the new durable
+  # truth. The live file is the only place the evidence still exists.
+  #
+  # Cost is one full page scan per periodic flush, on a path that already reads the whole file
+  # (VACUUM INTO) and the whole temp (MD5 + PUT). Shards are small by fathom's premise, which is
+  # what makes that acceptable; `:verify_flush_integrity` turns it off for a deployment that
+  # disagrees.
+  defp verify_snapshot(state, _temp) do
+    if verify_flush_integrity?() do
+      case verify_integrity(state.path) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          quarantine_corrupt!(state, reason)
+          {:error, {:corrupt_local, reason}}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp verify_flush_integrity?,
+    do: Application.get_env(:fathom, :verify_flush_integrity, true)
 
   # Wait out an in-flight durability-flush task and fold its result into the state
   # (expert review #27) — used on the terminate path so the final drop-flush never
@@ -2495,6 +2554,22 @@ defmodule Fathom.Shard do
       Connection.exec(conn, "PRAGMA synchronous=OFF")
 
       result = Connection.query(conn, "VACUUM INTO '#{String.replace(dest, "'", "''")}'", [])
+
+      # RESTORE IT BEFORE ANYTHING ELSE TOUCHES THIS CONNECTION (expert review 2026-08-01 #5).
+      # The relaxation above is for the throwaway VACUUM temp only, but it stayed in effect for
+      # the checkpoint and the close below — violating the rule the comment right above states.
+      #
+      # `synchronous` is a pager property and SQLite derives checkpoint sync flags from it
+      # (`pPager->walSyncFlags`), so at OFF a checkpoint neither fsyncs the WAL before backfill
+      # nor fsyncs the main database after. TWO checkpoints ran that way: the explicit PASSIVE,
+      # and SQLite's close-time checkpoint — which, on the last connection to a WAL database,
+      # also UNLINKS `-wal`/`-shm`. And this is frequently the last connection: the periodic
+      # flush fires on any dirty shard, which is routinely one with zero checked-out streams.
+      #
+      # Main-database pages written without fsync, followed by deletion of the only recovery
+      # source, is a torn database on power loss — silent, unrecoverable, and then uploaded as
+      # the durable object.
+      Connection.exec(conn, "PRAGMA synchronous=FULL")
 
       # Checkpoint here, where nobody is waiting (expert review 2026-07-24 #4). Without this the
       # only thing truncating the WAL in steady state was SQLite's autocheckpoint, which runs

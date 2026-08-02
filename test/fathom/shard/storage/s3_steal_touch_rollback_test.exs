@@ -7,8 +7,17 @@ defmodule Fathom.Shard.Storage.S3StealTouchRollbackTest do
   and no re-touch: the zombie fence and the takeover revalidation were both skipped
   for a takeover that was never fenced (stale reads + accepted-write loss; the etag
   data-fence backstops the outright clobber). The invariant: a failed steal-touch
-  rolls the lock back to the dead owner's content, so the retry redoes the FULL
+  rolls the lock back to the dead owner's IDENTITY, so the retry redoes the FULL
   steal + touch.
+
+  Expert review 2026-08-01 #10 refined it: the rollback must not restore the dead owner's
+  ORIGINAL EPOCH either. `epoch + 1` was durably visible to any observer that read the lock, so
+  writing `epoch` back moves the fencing token backward — and the zombie's `{old, epoch}` lease
+  then matches `check_lease/2` again and re-validates it as the owner. Deleting the lock is not
+  the answer either: the next `acquire_lease` would take the `:not_found` branch, a fresh
+  `create_lock` at **epoch 1**, which is a bigger regression AND an unfenced takeover with no
+  steal-touch — the very thing this test was written to prevent. The rollback therefore keeps
+  the foreign owner at `epoch + 2`, which is monotonic and still forces the full steal path.
 
   Driven against a stateful req_plug standing in for the S3 store (the Local double
   has no steal-touch — this is an S3-only protocol path).
@@ -71,15 +80,27 @@ defmodule Fathom.Shard.Storage.S3StealTouchRollbackTest do
     assert {:error, {:transient_lookup, {:touch_failed, _}}} =
              S3.acquire_lease(@shard, "new@node", 30_000)
 
-    # The failed steal's lock write must be rolled back to the dead owner's content —
+    # The failed steal's lock write must be rolled back to the dead owner's IDENTITY —
     # pre-fix it stayed {new@node, 4}, and the next acquire RECLAIMED it unfenced.
     lock = Agent.get(store, & &1.lock)
     assert lock != nil, "the lock must not be deleted (that would skip the steal entirely)"
-    assert %{"owner" => @old_owner, "epoch" => 3} = Jason.decode!(lock.body)
+    decoded = Jason.decode!(lock.body)
+    assert %{"owner" => @old_owner} = decoded
+
+    # ...but NEVER back to the dead owner's original epoch (expert review 2026-08-01 #10).
+    # Epoch 4 was durably visible to any observer that read the lock, so writing 3 moves the
+    # fencing token BACKWARD — and it makes the zombie's `{old@node, 3}` lease start matching
+    # `check_lease/2` again, i.e. re-validate as the owner. The rollback keeps the foreign
+    # owner (so the retry cannot take the same-owner reclaim path) at a STRICTLY HIGHER epoch.
+    assert decoded["epoch"] > 4,
+           "the fencing epoch regressed to #{decoded["epoch"]} after 4 was visible"
 
     # The retry re-enters the FULL steal path: epoch bump AND a (now successful)
     # touch — so the lease carries took_over and the takeover gets revalidated.
-    assert {:ok, %{took_over: true, epoch: 4}} = S3.acquire_lease(@shard, "new@node", 30_000)
+    assert {:ok, %{took_over: true, epoch: retry_epoch}} =
+             S3.acquire_lease(@shard, "new@node", 30_000)
+
+    assert retry_epoch > decoded["epoch"], "the retry's steal must keep the epoch monotonic"
 
     assert Agent.get(store, & &1.touches) == 2,
            "the retry must redo the data-object touch, not skip it via reclaim"
