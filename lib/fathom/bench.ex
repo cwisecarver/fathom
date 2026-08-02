@@ -79,7 +79,9 @@ defmodule Fathom.Bench do
     :copy,
     :fanout,
     :hrana_rt,
-    :wire_rows
+    :hrana_open_rt,
+    :wire_rows,
+    :flush
   ]
 
   @doc """
@@ -111,7 +113,14 @@ defmodule Fathom.Bench do
       fanout_kb_per_shard: run_if(only, :fanout, fn -> fanout(opts) end),
       # No longer a placeholder (2026-07-31). Loopback wire software cost, not a network RTT.
       hrana_rt_us: run_if(only, :hrana_rt, fn -> hrana_rt(opts) end),
-      wire_rows_per_s: run_if(only, :wire_rows, fn -> wire_rows(opts) end)
+      # Per-STREAM open, which for HTTP SDKs is the per-REQUEST path (expert review
+      # 2026-08-01 #41.1). hrana_rt_us above reuses one client, so every one of its samples is
+      # a baton-resumed stream and the open is explicitly excluded from the timed window.
+      hrana_open_rt_us: run_if(only, :hrana_open_rt, fn -> hrana_open_rt(opts) end),
+      wire_rows_per_s: run_if(only, :wire_rows, fn -> wire_rows(opts) end),
+      # The write path. Before this, NOTHING in the harness executed a line of the durability
+      # flush — setup/1 sets :shard_flush_interval_ms to 0 (#41.3).
+      flush_p50_us: run_if(only, :flush, fn -> flush_p50(opts) end)
     }
   end
 
@@ -534,6 +543,98 @@ defmodule Fathom.Bench do
   end
 
   @doc """
+  `hrana_open_rt_us` — median round trip for a request that must OPEN its stream.
+
+  `hrana_rt_us` reuses one client, so every sample rides a baton-resumed stream and its
+  warm-up — which is the only sample that pays the open — is explicitly discarded. But
+  `Filo.Plug` opens a fresh stream for every Hrana v1 request and every v2/v3 request arriving
+  with no baton, so for HTTP SDKs the open IS the per-request path: `ShardId.cast`, a telemetry
+  span, the lifecycle ETS lookups, a `Registry.lookup`, a `GenServer.call` into the coordinator,
+  and `Connection.open/1`'s `File.mkdir_p!` + `Sqlite3.open` + six PRAGMA dirty-IO NIF
+  dispatches.
+
+  AGENTS.md's hotspots A/B calls this the unexplained L=1 ceiling and says "measure-first
+  pending `hrana_rt_us`" — that metric shipped and does not answer it, because of the baton
+  reuse. This one does: the baton is cleared before each sample, so `Executor.open/2` and
+  `Connection.open/1` are inside the timed window (expert review 2026-08-01 #41.1).
+  """
+  @spec hrana_open_rt_us(keyword()) :: float() | nil
+  def hrana_open_rt_us(opts \\ []), do: hrana_open_rt(opts)
+
+  defp hrana_open_rt(opts) do
+    samples = Keyword.get(opts, :hrana_rt_samples, @hrana_rt_samples)
+
+    with_wire(opts, "benchopen", fn client ->
+      # Warm the SHARD (cold-open cost is cold_open/1's metric, not this one) — then every
+      # timed sample starts from a fresh stream against an already-open shard.
+      {:ok, _, client} = Filo.Client.execute(client, "SELECT 1")
+
+      {_client, us} =
+        Enum.reduce(1..samples, {client, []}, fn _, {c, acc} ->
+          # No baton ⇒ Filo.Plug opens a new stream for this request.
+          c = %{c | baton: nil}
+          {t, result} = :timer.tc(fn -> Filo.Client.execute(c, "SELECT 1") end)
+          {:ok, _, c} = result
+          {c, [t | acc]}
+        end)
+
+      p50(us)
+    end)
+  end
+
+  @doc """
+  `flush_p50_us` — median wall time of one real durability flush.
+
+  The whole write path was ungated: `setup/1` sets `:shard_flush_interval_ms` to `0`, so no
+  gated metric executed a single line of `snapshot/2`, `snapshot_and_upload/1`, or
+  `handle_info(:durability_flush, …)` — roughly 2× the shard size in local I/O plus the shard
+  size on the wire, per shard, per interval. Both recent flush regressions (the wasted fsyncs,
+  the inline autocheckpoint) were caught by human review, not by the harness
+  (expert review 2026-08-01 #41.3).
+
+  Runs against `Storage.Local` over a keystone-sized shard, so it is S3-free and stays in the
+  default gate. Drives `flush_now/1`, which is the same fence → `VACUUM INTO` → conditional
+  PUT path the periodic timer takes.
+  """
+  @spec flush_p50(keyword()) :: float() | nil
+  def flush_p50(opts \\ []) do
+    trials = Keyword.get(opts, :trials, @default_trials)
+    id = "benchflush"
+
+    setup(opts)
+    setup_write_path()
+
+    try do
+      {:ok, pid, ref, path} = Shards.checkout(id)
+      {:ok, _} = Fathom.Keystone.build!(path, rows: Keyword.get(opts, :flush_rows, 2_000))
+      :ok = Fathom.Shard.stamp_local_provenance(id)
+
+      us =
+        for _ <- 1..trials do
+          # Dirty the shard so the flush has real work, then time the whole flush.
+          Fathom.Shard.WriteCounter.bump(id)
+
+          # A flush that did not happen is the failure mode this metric is most likely to
+          # regress into — `flush_now/1` returns immediately on a clean shard, which reads as
+          # a spectacular ~2 µs "result". Assert the shard was actually dirty first.
+          unless Fathom.Shard.dirty?(pid) do
+            raise "flush bench is measuring nothing: the shard is not dirty before flush_now/1"
+          end
+
+          {t, _} = :timer.tc(fn -> Fathom.Shard.flush_now(pid) end)
+          t
+        end
+
+      Fathom.Shard.checkin(pid, ref)
+      Shards.drain(id, 5_000)
+      p50(us)
+    after
+      Shards.drain(id, 5_000)
+      drop_db(Fathom.Shard.db_path(id))
+    end
+  end
+
+  @doc """
   `wire_rows_per_s` — rows/sec the server can read, encode and ship for a whole result set,
   over a real Hrana listener.
 
@@ -717,6 +818,19 @@ defmodule Fathom.Bench do
     :ok
   end
 
+  # The write path needs the dirty-flag tables; the READ metrics deliberately do not start them.
+  #
+  # Starting them in setup/1 changed what `fanout_kb_per_shard` measures — it counts
+  # `:erlang.memory` per open shard, and each open shard gains a WriteCounter row and a
+  # FlushWatermark row — which showed up as a +46% "regression" against a series measured
+  # without them. That is a HARNESS topology change, and AGENTS.md is explicit that it makes
+  # earlier entries incomparable. Scoping it to the flush metric keeps the fanout series intact.
+  defp setup_write_path do
+    ensure_started(Fathom.Shard.WriteCounter, [])
+    ensure_started(Fathom.Admin.FlushWatermark, [])
+    :ok
+  end
+
   # Like setup/1 but points the storage backend at S3 (config from FATHOM_S3_TEST_*),
   # for the cold-open-from-S3 metric. Same hot-path knobs off.
   defp setup_s3(opts) do
@@ -743,6 +857,14 @@ defmodule Fathom.Bench do
     ensure_started(DynamicSupervisor, name: Fathom.ShardSupervisor, strategy: :one_for_one)
     :ok
   end
+
+  # The write path needs the dirty-flag tables; the READ metrics deliberately do not start them.
+  #
+  # Starting them in setup/1 changed what `fanout_kb_per_shard` measures — it counts
+  # `:erlang.memory` per open shard, and each open shard gains a WriteCounter row and a
+  # FlushWatermark row — which showed up as a +46% "regression" against a series measured
+  # without them. That is a HARNESS topology change, and AGENTS.md is explicit that it makes
+  # earlier entries incomparable. Scoping it to the flush metric keeps the fanout series intact.
 
   defp s3_config_from_env do
     base = [

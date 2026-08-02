@@ -93,6 +93,10 @@ defmodule Fathom.Shard do
   # for. Bounded (not :infinity) so a hung storage call can't wedge the deploy; the
   # in-flight PUT it may still cut off is etag-conditional, so never torn. When
   # tuning `:shard_shutdown_ms`, size it to cover settle + drop-flush together.
+  # How much slower a clean-but-served shard polls, given the writer now signals the
+  # clean→dirty edge. The safety net for a lost signal (see schedule_flush/1).
+  @clean_poll_multiplier 10
+
   @default_shutdown_ms 60_000
 
   # Overrides `use GenServer`'s generated child_spec to attach the shutdown budget
@@ -228,6 +232,17 @@ defmodule Fathom.Shard do
   # primitive), so the per-call env read is negligible.
   defp flush_now_timeout,
     do: Application.get_env(:fathom, :flush_now_timeout_ms, @flush_now_timeout)
+
+  @doc """
+  Tell the coordinator this shard has gone clean → dirty (expert review 2026-08-01 #42).
+
+  A served-but-clean shard polls its durability flush at a reduced cadence, since a coordinator
+  cannot otherwise learn that a stream wrote. `Fathom.ShardExecutor` sends this once per
+  checkout, on the first write, which restores the full flush rate. Fire-and-forget: the
+  reduced cadence is itself the safety net, so a lost signal costs RPO, never data.
+  """
+  @spec signal_dirty(pid()) :: :ok
+  def signal_dirty(pid) when is_pid(pid), do: GenServer.cast(pid, :became_dirty)
 
   @doc """
   Asks the coordinator to stand down: refuse new checkouts, let in-flight
@@ -1020,6 +1035,11 @@ defmodule Fathom.Shard do
     refs = for {ref, {pid, tag}} <- state.conns, pid == caller and tag == op, do: ref
     stop_when_drained(Enum.reduce(refs, state, &release(&2, &1)))
   end
+
+  # A stream wrote for the first time on its checkout (expert review 2026-08-01 #42). A clean
+  # served shard polls at a reduced cadence, so this is the edge that restores full-rate
+  # flushing. Idempotent and cheap: the executor sends it at most once per checkout.
+  def handle_cast(:became_dirty, state), do: {:noreply, schedule_flush(state)}
 
   # Begin standing down. With no connections we stop immediately (terminate
   # flushes + releases). Otherwise wait for the drain, bounded by a timer.
@@ -2846,18 +2866,42 @@ defmodule Fathom.Shard do
     if unflushed?(state), do: do_schedule_flush(state), else: cancel_flush(state)
   end
 
-  defp schedule_flush(state), do: do_schedule_flush(state)
+  # BUSY BUT CLEAN — a held stream doing only reads (expert review 2026-08-01 #42). The
+  # argument review 2026-07-24 #10 made for the idle case applies verbatim, and the
+  # served-density ceiling is where it bites: ~2,000 no-op wakeups/s per node at 10k served
+  # shards, every one of those coordinators pinned out of `hibernate_after` with its heap
+  # resident.
+  #
+  # A clean busy shard can become dirty only via a write, and `ShardExecutor` casts
+  # `:became_dirty` on the FIRST write of a checkout — at most one message per stream, strictly
+  # fewer than today for read-heavy traffic — which re-arms the timer. The poll is now
+  # edge-triggered rather than periodic.
+  #
+  # The SAFETY NET matters more than the optimisation: this is the durability timer, and a lost
+  # signal would mean un-flushed acknowledged writes. So a clean busy shard does not disarm
+  # outright, it re-arms at a much slower cadence. A missed signal then costs up to
+  # @clean_poll_multiplier intervals of extra RPO, never unbounded loss.
+  defp schedule_flush(state) do
+    if unflushed?(state),
+      do: do_schedule_flush(state),
+      else: do_schedule_flush(state, @clean_poll_multiplier)
+  end
 
   # Arm the periodic durability flush. A non-positive interval disables it
   # (idle-only durability).
-  defp do_schedule_flush(state) do
+  defp do_schedule_flush(state, multiplier \\ 1) do
     state = cancel_flush(state)
 
     case flush_interval_ms() do
       interval when is_integer(interval) and interval > 0 ->
         %{
           state
-          | flush_timer: Process.send_after(self(), :durability_flush, jitter_interval(interval))
+          | flush_timer:
+              Process.send_after(
+                self(),
+                :durability_flush,
+                jitter_interval(interval * multiplier)
+              )
         }
 
       _ ->

@@ -65,7 +65,7 @@ defmodule Fathom.Admin.MetricsCollector do
   def init(_opts) do
     state = %{
       node_key: Fathom.Rebalancer.node_key(),
-      prev_load: load_map(),
+      prev_load: %{},
       prev_mono: mono_ms(),
       prev_query_buckets: [],
       prev_counters: %{},
@@ -171,15 +171,18 @@ defmodule Fathom.Admin.MetricsCollector do
     now = mono_ms()
     window_s = max((now - state.prev_mono) / 1000, 0.001)
 
-    load = load_map()
-    rates = shard_rates(load, state.prev_load, window_s)
-    node_qps = rates |> Enum.map(& &1.q_per_s) |> Enum.sum()
-
-    hot =
-      rates
-      |> Enum.reject(&(&1.q_per_s <= 0.0))
-      |> Enum.sort_by(& &1.q_per_s, :desc)
-      |> Enum.take(@hot_n)
+    # BOUNDED selection, not tab2list -> map-per-row -> full sort -> take(20) (expert review
+    # 2026-08-01 #31). This runs EVERY SECOND, on by default, and is O(resident shards) with a
+    # 5-key map allocated per row plus an O(N log N) sort to keep 20 of them — a fixed node-level
+    # tax growing on exactly the axis fathom scales on. The identical O(N) walk in
+    # `Measurements.durability/0` was already recognised as a density hazard and moved behind a
+    # 10-second poller (review 2026-07-23 #30); this ran the same walk 10x more often and did
+    # strictly more on top.
+    #
+    # One fold over the raw tuples now computes the node-wide rate sum AND keeps only the top-N,
+    # so maps are built for ~20 survivors instead of N, and the retained between-tick baseline is
+    # a 3-tuple per shard rather than a 5-key map.
+    {node_qps, hot, load} = hot_shards(state.prev_load, window_s)
 
     # Per-shard tail latency for the top-N hot shards only (cardinality-bounded: read cost never
     # scales with resident-shard count). WINDOWED against last tick (see window_latency/2), so it
@@ -296,18 +299,64 @@ defmodule Fathom.Admin.MetricsCollector do
     }
   end
 
-  defp shard_rates(load, prev, window_s) do
-    Enum.map(load, fn {id, c} ->
-      p = Map.get(prev, id, %{queries: 0, rows_read: 0, rows_written: 0, checkouts: 0})
+  # One pass over the raw ShardLoad tuples: sum the node-wide query rate, keep the top-@hot_n
+  # by rate, and carry forward ONLY the shards that moved as the next tick's baseline.
+  #
+  # Returns `{node_qps, hot_maps, next_prev}`. Maps are allocated for the survivors only —
+  # `prev` is `%{shard_id => {queries, rows_read, rows_written}}`, a 3-tuple rather than the
+  # 5-key map the old `load_map/0` retained for every resident shard.
+  defp hot_shards(prev, window_s) do
+    {qps, heap, next_prev} =
+      Enum.reduce(ShardLoad.snapshot_tuples(), {0.0, [], %{}}, fn
+        {id, _checkouts, queries, rows_read, rows_written}, {qps, heap, next} ->
+          {pq, prr, prw} = Map.get(prev, id, {0, 0, 0})
+          q_per_s = rate(queries, pq, window_s)
 
-      %{
-        shard_id: id,
-        q_per_s: rate(c.queries, p.queries, window_s),
-        rows_read_per_s: rate(c.rows_read, p.rows_read, window_s),
-        rows_written_per_s: rate(c.rows_written, p.rows_written, window_s),
-        queries: c.queries
-      }
-    end)
+          # EVERY resident shard keeps a baseline, including one that did not move. Dropping
+          # unmoved shards (which is the memory reduction the review suggested) is incorrect:
+          # next tick `Map.get(prev, id, {0, 0, 0})` would return zeros and the rate would
+          # compute as `queries / window` — a large spurious rate for an idle shard, which is
+          # exactly the hot-shard signal this feeds. The allocation win is the 3-tuple in place
+          # of the old 5-key map, which is per-row and does not depend on the filter.
+          next = Map.put(next, id, {queries, rows_read, rows_written})
+
+          heap =
+            if q_per_s > 0.0 do
+              keep_top(
+                heap,
+                {q_per_s, id, queries, rate(rows_read, prr, window_s),
+                 rate(rows_written, prw, window_s)}
+              )
+            else
+              heap
+            end
+
+          {qps + q_per_s, heap, next}
+      end)
+
+    hot =
+      heap
+      |> Enum.sort_by(fn {q, _, _, _, _} -> q end, :desc)
+      |> Enum.map(fn {q, id, queries, rr, rw} ->
+        %{
+          shard_id: id,
+          q_per_s: q,
+          rows_read_per_s: rr,
+          rows_written_per_s: rw,
+          queries: queries
+        }
+      end)
+
+    {qps, hot, next_prev}
+  end
+
+  # A bounded "keep the N largest" list. At most @hot_n elements are ever retained, so the
+  # sort at the end is over 20 items rather than the whole resident set.
+  defp keep_top(heap, entry) when length(heap) < @hot_n, do: [entry | heap]
+
+  defp keep_top(heap, {q, _, _, _, _} = entry) do
+    {min_q, _, _, _, _} = min = Enum.min_by(heap, fn {hq, _, _, _, _} -> hq end)
+    if q > min_q, do: [entry | List.delete(heap, min)], else: heap
   end
 
   # Diff the tracked cumulative counters (S3 ops/bytes by method, checkout counts by outcome) into
@@ -364,8 +413,6 @@ defmodule Fathom.Admin.MetricsCollector do
   # `curr/window` (not 0), same as Fathom.Rebalancer.Reporter, so a churny hot shard isn't dropped.
   defp rate(curr, prev, window_s) when curr < prev, do: curr / window_s
   defp rate(curr, prev, window_s), do: (curr - prev) / window_s
-
-  defp load_map, do: ShardLoad.snapshot() |> Map.new(&{&1.shard_id, &1})
 
   defp safe_scrape do
     @reporter |> TelemetryMetricsPrometheus.Core.scrape() |> IO.iodata_to_binary()

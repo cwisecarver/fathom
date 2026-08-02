@@ -67,7 +67,9 @@ defmodule Mix.Tasks.Fathom.Bench do
     :copy,
     :fanout,
     :hrana_rt,
-    :wire_rows
+    :hrana_open_rt,
+    :wire_rows,
+    :flush
   ]
 
   @switches [
@@ -183,7 +185,9 @@ defmodule Mix.Tasks.Fathom.Bench do
       copy_keystone_rows_per_s: round2(metrics.copy_keystone_rows_per_s),
       fanout_kb_per_shard: round2(metrics.fanout_kb_per_shard),
       hrana_rt_us: round2(metrics.hrana_rt_us),
+      hrana_open_rt_us: round2(metrics.hrana_open_rt_us),
       wire_rows_per_s: round2(metrics.wire_rows_per_s),
+      flush_p50_us: round2(metrics.flush_p50_us),
       log: Keyword.get(opts, :log)
     }
   end
@@ -204,6 +208,9 @@ defmodule Mix.Tasks.Fathom.Bench do
        "rows/s (migration copy throughput, keystone rows)"},
       {"fanout_kb_per_shard", metrics.fanout_kb_per_shard, "KiB/shard (node density)"},
       {"hrana_rt_us", metrics.hrana_rt_us, "\u00b5s   (Hrana round trip, loopback)"},
+      {"hrana_open_rt_us", metrics.hrana_open_rt_us,
+       "\u00b5s   (Hrana round trip INCLUDING stream open)"},
+      {"flush_p50_us", metrics.flush_p50_us, "\u00b5s   (one durability flush, local storage)"},
       {"wire_rows_per_s", metrics.wire_rows_per_s,
        "rows/s (result-set encode over the wire, keystone rows)"}
     ]

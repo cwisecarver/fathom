@@ -161,7 +161,7 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp run_statement(
-         {_pid, _ref, conn, shard_id, _scope, opts},
+         {pid, _ref, conn, shard_id, _scope, opts},
          %Stmt{sql: sql, args: args},
          dml?,
          ddl?
@@ -193,8 +193,15 @@ defmodule Fathom.ShardExecutor do
         # sets the flag. A transaction with no write has nothing uncommitted to lose.
         wrote? = wrote?(result, sql)
 
-        if wrote? or (commit_boundary?(sql) and txn_wrote?(conn)),
-          do: Fathom.Shard.WriteCounter.bump(shard_id)
+        if wrote? or (commit_boundary?(sql) and txn_wrote?(conn)) do
+          Fathom.Shard.WriteCounter.bump(shard_id)
+          # Tell the coordinator once per checkout that this stream has written (expert review
+          # 2026-08-01 #42). A served-but-clean shard polls at a reduced flush cadence; this is
+          # the clean→dirty edge that restores the full rate. Guarded by a process-dictionary
+          # flag — the same single-owner-connection idiom as the statement cache — so a
+          # write-heavy stream sends exactly one message, not one per statement.
+          signal_dirty_once(pid, conn)
+        end
 
         track_txn_write(conn, sql, wrote?)
 
@@ -383,6 +390,23 @@ defmodule Fathom.ShardExecutor do
   # a concurrent stream writing to the same shard would bump that counter and spuriously re-dirty
   # us on commit — safe, but common on a hot shard, which is exactly the case this finding is
   # trying to make cheap.
+  # One `:became_dirty` cast per checkout (expert review 2026-08-01 #42). Keyed by the
+  # connection ref in the owning process's dictionary — the same single-owner idiom as the
+  # statement cache and the txn-write flag — so it dies with the stream and a write-heavy
+  # stream costs exactly one message rather than one per statement.
+  @dirty_signalled_key :dirty_signalled
+
+  defp signal_dirty_once(pid, conn) do
+    key = {__MODULE__, @dirty_signalled_key, conn}
+
+    unless Process.get(key, false) do
+      Process.put(key, true)
+      Fathom.Shard.signal_dirty(pid)
+    end
+
+    :ok
+  end
+
   @txn_wrote_key :txn_wrote
 
   defp txn_wrote?(conn), do: Process.get({__MODULE__, @txn_wrote_key, conn}, false)
