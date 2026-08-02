@@ -56,3 +56,7 @@ npm-debug.log
 # `--check` compares only same-host rows, and the TPC-C rows are a recorded-only trend. Commit a
 # clean-tree (dirty:false) run to update a host's baseline; append freely otherwise.
 .gstack/
+
+# Runtime state written by Fathom.Rebalancer.LbApply after a successful nginx reload
+# (expert review 2026-08-01 #23) — a content hash, regenerated per reload, machine-local.
+deploy/chaos/lb-runtime/*.applied
