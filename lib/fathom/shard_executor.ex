@@ -676,6 +676,25 @@ defmodule Fathom.ShardExecutor do
   defp open_error(:shard_tombstoned),
     do: %Error{message: "tenant deleted", code: "FILO_TENANT_DELETED", status: 410}
 
+  # Another node currently owns the lease (expert review 2026-08-01 #15). This is the SAME
+  # class of routine, short-lived state as `:draining` above, and it fell through the catch-all
+  # into a status-less error, which Filo's plug renders as a 500.
+  #
+  # The single largest producer is the migration engine: `ShardMigration.run/3` holds a
+  # `migrator@<node>` lease for the whole drain → retain → pull → copy → replay → PUT →
+  # cutover sequence. The holder is a LIVE node, so no steal-soon retry path applies. That made
+  # every fleet schema rollout — the project's headline capability — a user-facing 500 in each
+  # tenant's migration window, rather than a retry the client SDK backs off on.
+  #
+  # The owner is deliberately NOT in the message: it named the holding node, leaking internal
+  # topology to a tenant.
+  defp open_error({:shard_held, _owner}),
+    do: %Error{
+      message: "shard temporarily owned by another node; retry",
+      code: "FILO_SHARD_HELD",
+      status: 503
+    }
+
   defp open_error(reason),
     do: %Error{message: "cannot open shard: #{inspect(reason)}", code: "FILO_SHARD_OPEN"}
 

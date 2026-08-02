@@ -113,6 +113,26 @@ defmodule Fathom.Shard.Heartbeat do
     end
   end
 
+  @doc """
+  The safety margin `valid_for_write?/1` applies, in ms.
+
+  This is how early a renewal deadline is treated as already unsafe, so it is also how long
+  BEFORE a shard becomes stealable that a coordinator first sees `:not_valid`. The write
+  circuit-breaker needs that offset to arm at the right moment rather than a whole TTL late
+  (expert review 2026-08-01 #13). Falls back to the configured value when the heartbeat is
+  down, which is the same `max(div(ttl, 3), 1)` the process itself computes.
+  """
+  @spec margin_ms() :: pos_integer()
+  def margin_ms do
+    case status() do
+      {_gen, _deadline, margin} ->
+        margin
+
+      :down ->
+        max(div(Application.get_env(:fathom, :shard_lease_ttl_ms, @default_ttl_ms), 3), 1)
+    end
+  end
+
   defp status do
     case :ets.lookup(@status_table, :status) do
       [{:status, gen, deadline, margin}] -> {gen, deadline, margin}

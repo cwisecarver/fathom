@@ -468,8 +468,18 @@ defmodule Fathom.Shard.Connection do
             # lock waits too. It is a non-dirty NIF that deliberately avoids the connection mutex,
             # so it cannot block behind the running query. A spurious late cancel is still a no-op:
             # exqlite resets `cancelled` at the top of every subsequent db op.
-            Sqlite3.cancel(conn)
+            # Tell the owner BEFORE cancelling (expert review 2026-08-01 #46). Cancelling first
+            # opens a window: the query can finish naturally between `cancel/1` and this send,
+            # in which case the owner's `after 0` peek for `{:timed_out, ref}` already ran and
+            # found nothing, and the message lands in a long-lived stream process's mailbox
+            # where nothing will ever match it again (the next call uses a fresh `make_ref/0`).
+            #
+            # Sending first makes the ordering structural: the message is in the mailbox before
+            # the cancel can let `fun.()` return, so the peek either sees it or the query was
+            # never cancelled at all. A spurious late cancel is already a no-op — exqlite resets
+            # `cancelled` at the top of every subsequent db op.
             send(parent, {:timed_out, ref})
+            Sqlite3.cancel(conn)
 
             # Consume the guaranteed late {:done, ref} before the next arm (the interrupt
             # errors the running step, so the executing after-clause always sends it) —

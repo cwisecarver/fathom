@@ -66,6 +66,19 @@ defmodule Fathom.QueryConsole do
   """
   @spec run(String.t(), String.t(), keyword()) :: {:ok, result()} | {:error, error()}
   def run(shard_id, sql, opts \\ []) when is_binary(shard_id) and is_binary(sql) do
+    # Validate HERE, not only in the LiveView (expert review 2026-08-01 #47). Expert review
+    # 2026-07-18 #16 fixed "a dotted id routes to the wrong tenant" by adding `ShardId.valid?`
+    # at the call site — but `run/3` is a public, documented API that splices `shard_id` into a
+    # `Host` header and into `HranaAuth.token_for/1`, so the guard sat one layer above the
+    # function that needs it and any second caller reopens the bug. AGENTS.md: route every
+    # shard resolution through one place.
+    case Fathom.ShardId.cast(shard_id) do
+      {:ok, id} -> do_run(id, sql, opts)
+      :error -> {:error, %{code: "INPUT", message: "invalid shard id", latency_ms: 0.0}}
+    end
+  end
+
+  defp do_run(shard_id, sql, opts) do
     endpoint = Keyword.get(opts, :endpoint) || default_endpoint()
     host = Keyword.get(opts, :host) || host_for(shard_id)
     max_rows = Keyword.get(opts, :max_rows, @max_rows)

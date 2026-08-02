@@ -645,18 +645,18 @@ defmodule Fathom.ShardExecutorTest do
 
     # An anchored zone boots fine.
     Application.put_env(:fathom, :shard_base_domain, "fathom.example")
-    assert Fathom.Application.check_shard_base_domain!() == nil
+    assert Fathom.Application.check_shard_base_domain!() == :ok
 
     # The explicit ack lets an unanchored deploy boot even with the zone unset.
     Application.delete_env(:fathom, :shard_base_domain)
     Application.put_env(:fathom, :allow_unanchored_routing, true)
-    assert Fathom.Application.check_shard_base_domain!() == nil
+    assert Fathom.Application.check_shard_base_domain!() == :ok
 
     # With the data plane NOT exposed (no fleet, Hrana server off), the zone may be unset.
     Application.delete_env(:fathom, :allow_unanchored_routing)
     Application.delete_env(:fathom, :lb_backends)
     Application.put_env(:fathom, :hrana_server, false)
-    assert Fathom.Application.check_shard_base_domain!() == nil
+    assert Fathom.Application.check_shard_base_domain!() == :ok
 
     # The Hrana listener being enabled ALSO counts as exposed (refused with the zone unset).
     Application.put_env(:fathom, :hrana_server, true)
@@ -816,7 +816,7 @@ defmodule Fathom.ShardExecutorTest do
 
     # No raise from the RAISE guards…
     assert Fathom.Application.check_local_storage_fleet!() == nil
-    assert Fathom.Application.check_shard_base_domain!() == nil
+    assert Fathom.Application.check_shard_base_domain!() == :ok
     assert Fathom.Application.check_shard_override!() == nil
 
     # …and no warning from the WARN guards.

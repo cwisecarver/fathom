@@ -158,8 +158,7 @@ defmodule Fathom.Application do
   @doc false
   def check_shard_base_domain! do
     exposed? =
-      map_size(Application.get_env(:fathom, :lb_backends, %{})) > 0 or
-        Application.get_env(:fathom, :hrana_server, false)
+      map_size(Application.get_env(:fathom, :lb_backends, %{})) > 0 or hrana_enabled?()
 
     if Application.get_env(:fathom, :env) == :prod and
          blank?(Application.get_env(:fathom, :shard_base_domain)) and exposed? and
@@ -170,6 +169,8 @@ defmodule Fathom.Application do
               "routing, or ALLOW_UNANCHORED_ROUTING=true to acknowledge unanchored routing " <>
               "(expert review 2026-07-14 #6)."
     end
+
+    :ok
   end
 
   # Expert review 2026-07-14 #15: the ?db= / x-fathom-shard override (finding #4) is an
@@ -213,8 +214,7 @@ defmodule Fathom.Application do
   def check_hrana_exposure! do
     wildcard_binds = [{0, 0, 0, 0}, {0, 0, 0, 0, 0, 0, 0, 0}]
 
-    if Application.get_env(:fathom, :env) == :prod and
-         Application.get_env(:fathom, :hrana_server, false) and
+    if Application.get_env(:fathom, :env) == :prod and hrana_enabled?() and
          Application.get_env(:fathom, :hrana_auth, :disabled) == :disabled and
          Application.get_env(:fathom, :hrana_bind_ip, {0, 0, 0, 0}) in wildcard_binds do
       Logger.warning(
@@ -477,10 +477,29 @@ defmodule Fathom.Application do
       else: []
   end
 
+  @doc """
+  Whether this node serves the Hrana data plane.
+
+  ONE reader for `:hrana_server`, because the default drifted and silently disarmed two prod
+  boot guards (expert review 2026-08-01 #6). The listener defaulted the key to `true` while
+  `check_shard_base_domain!/0` and `check_hrana_exposure!/0` defaulted it to `false`, and no
+  config file sets it outside test — so the most likely prod topology (one node, no
+  `LB_BACKENDS`) booted SERVING Hrana while both guards read "not exposed" and passed.
+
+  That is precisely the release blocker the first guard exists for: with `:shard_base_domain`
+  unset, `zone_matches?/1` returns true unconditionally and any attacker-controlled `Host`
+  first-label selects any shard — and with the shipped `:hrana_auth :disabled` default, no
+  credential is needed. Both guards were inert in exactly that configuration.
+
+  `true` is the correct default: it is what the listener does, so the guards now describe the
+  node's actual behaviour.
+  """
+  def hrana_enabled?, do: Application.get_env(:fathom, :hrana_server, true)
+
   # The Hrana listener binds a real port, so (like the Phoenix endpoint's
   # `server`) it is gated by config and off in test.
   defp hrana_listeners do
-    if Application.get_env(:fathom, :hrana_server, true), do: [hrana_listener()], else: []
+    if hrana_enabled?(), do: [hrana_listener()], else: []
   end
 
   # A Bandit listener running Filo.Plug (Hrana over HTTP + the WebSocket upgrade).

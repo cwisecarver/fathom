@@ -23,22 +23,61 @@ defmodule Fathom.Test.FaultyStorage do
     end
   end
 
+  # --- lock-etag semantics (expert review 2026-08-01 #9) -------------------------------------
+  #
+  # `Local` identifies a lock by `{owner, epoch}` only. The S3 backend also carries
+  # `:lock_etag` — the etag of the lock object WE last wrote — and its release fast path is a
+  # conditional `DELETE … If-Match: <that etag>`, where a 412 is a no-op ("the lock is not the
+  # one I wrote").
+  #
+  # That difference makes a whole bug class INVISIBLE to `mix test`: any path that releases with
+  # a lease whose `lock_etag` is stale succeeds against `Local` and silently leaks the lock
+  # object against S3. Finding #9 was exactly that, on the drain path. So model the contract
+  # here: stamp a fresh etag on every acquire/renew, and make release conditional on it.
+  #
+  # `:lock_etag_strict` gates it (default ON for this backend) so a test that predates the
+  # contract can opt out rather than be rewritten.
+  # :persistent_term, not ETS — an ETS table is owned by the process that created it, and the
+  # first creator here is a shard coordinator, so the table died with it mid-test.
+  defp bump_lock_etag(shard_id) do
+    etag = "lock-#{System.unique_integer([:positive])}"
+    :persistent_term.put({__MODULE__, :lock_etag, shard_id}, etag)
+    etag
+  end
+
+  defp current_lock_etag(shard_id),
+    do: :persistent_term.get({__MODULE__, :lock_etag, shard_id}, nil)
+
+  defp strict_lock_etag?, do: Application.get_env(:fathom, :lock_etag_strict, true)
+
   @impl true
   def acquire_lease(shard_id, owner, ttl_ms) do
     run_before(:acquire)
 
-    if fault() == :acquire,
-      do: {:error, {:transient_lookup, :s3_unreachable}},
-      else: Local.acquire_lease(shard_id, owner, ttl_ms)
+    if fault() == :acquire do
+      {:error, {:transient_lookup, :s3_unreachable}}
+    else
+      case Local.acquire_lease(shard_id, owner, ttl_ms) do
+        {:ok, lease} -> {:ok, Map.put(lease, :lock_etag, bump_lock_etag(shard_id))}
+        other -> other
+      end
+    end
   end
 
   @impl true
   def renew_lease(shard_id, lease, ttl_ms) do
     renew_delay()
 
-    if fault() == :renew,
-      do: {:error, {:transient, :s3_unreachable}},
-      else: Local.renew_lease(shard_id, lease, ttl_ms)
+    if fault() == :renew do
+      {:error, {:transient, :s3_unreachable}}
+    else
+      case Local.renew_lease(shard_id, lease, ttl_ms) do
+        # A renew REWRITES the lock object, so its etag rotates — the detail that made #9's
+        # stale-lease release a silent no-op against real S3.
+        {:ok, renewed} -> {:ok, Map.put(renewed, :lock_etag, bump_lock_etag(shard_id))}
+        other -> other
+      end
+    end
   end
 
   # Optional artificial lease-renew latency (ms) so a test can make the legacy-mode flush fence's
@@ -148,7 +187,18 @@ defmodule Fathom.Test.FaultyStorage do
   @impl true
   def object_etag(shard_id), do: Local.object_etag(shard_id)
 
+  # Mirrors S3's conditional release: If-Match the etag WE last wrote. A mismatch is a 412,
+  # which S3 treats as a no-op — the lock stays. Releasing with a lease whose lock_etag has
+  # since rotated (a legacy-mode renew) therefore LEAKS the lock, which is finding #9.
   @impl true
+  def release_lease(shard_id, %{lock_etag: etag} = lease) when is_binary(etag) do
+    if strict_lock_etag?() and current_lock_etag(shard_id) != etag do
+      :ok
+    else
+      Local.release_lease(shard_id, lease)
+    end
+  end
+
   def release_lease(shard_id, lease), do: Local.release_lease(shard_id, lease)
 
   @impl true

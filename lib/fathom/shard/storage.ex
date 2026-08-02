@@ -669,7 +669,14 @@ defmodule Fathom.Shard.Storage do
   def reap_stale_temps(base, older_than_ms) do
     cutoff = System.system_time(:second) - div(older_than_ms, 1000)
 
-    for tmp <- Path.wildcard(base <> ".{dl,snap,tmp,pull}*"),
+    # `z` is the compressed-upload temp (`Codec.compress_to_temp/1` writes
+    # `<local_path>.z.<n>`) — expert review 2026-08-01 #45. Its own `after File.rm` covers an
+    # exception but not an external kill, and the flush task IS killed externally on the
+    # terminate path. For a periodic flush `local_path` is `<path>.snap.<n>`, so the temp was
+    # already caught by the `snap` glob; for `upload_for_drop/1` it is the LIVE db path, so the
+    # temp is `<path>.z.<n>` and matched nothing here — one shard-sized orphan per killed
+    # drop-flush, forever.
+    for tmp <- Path.wildcard(base <> ".{dl,snap,tmp,pull,z}*"),
         stale_file?(tmp, cutoff),
         reduce: 0 do
       acc ->

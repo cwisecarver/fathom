@@ -1490,7 +1490,22 @@ defmodule Fathom.Shard do
       # lease lost between acquire and now can't clobber a newer owner. See
       # Fathom.Shard.Fence.
       case Fence.check(fence_ctx(state)) do
-        {:ok, _updates} ->
+        {:ok, updates} ->
+          # MERGE the refreshed lease (expert review 2026-08-01 #9). In legacy mode
+          # (acquire_gen == nil) Fence.check performs a renew_lease PUT, which ROTATES the
+          # lock's etag. release_lease's fast path is a conditional
+          # `DELETE … If-Match: lease.lock_etag`, so releasing with the pre-fence lease
+          # If-Matched an etag that no longer exists ⇒ 412 ⇒ release_lease reported :ok and
+          # THE LOCK OBJECT SURVIVED THE DROP.
+          #
+          # The leaked lock names this node, and while its Heartbeat is running `owner_live?`
+          # reports :live forever — so every peer gets {:error, {:held, us}} indefinitely and
+          # the shard is unopenable by any survivor. The rebalancer handoff breaks identically:
+          # its step-3 drain lands here, so the target the LB was already flipped to is refused.
+          #
+          # Every other release site already threads the refreshed lease back; this one did not.
+          state = Map.merge(state, updates)
+
           case upload_for_drop(state) do
             {:ok, new_etag} ->
               # Stamp the new etag into the provenance sidecar BEFORE dropping (expert
@@ -1554,6 +1569,33 @@ defmodule Fathom.Shard do
             "shard #{state.id}: ownership unconfirmed before flush; keeping local copy"
           )
       end
+    else
+      # Dirty, but there is no local file to flush (expert review 2026-08-01 #11). This whole
+      # function used to be one `if File.exists?`, so this case fell out the bottom having done
+      # NOTHING: no upload (correct — there is nothing to upload), but also no lease release, no
+      # log, and no telemetry. `drop_clean/1` had exactly this hole fixed on the clean side by
+      # review 2026-07-23 #19.
+      #
+      # It needs no exotic input: a `WriteCounter` restart broadcasts `:write_counter_reset`,
+      # which sets `flushed_through: -1` and so marks EVERY open coordinator dirty at once —
+      # including ones that never created a file (a checkout abandoned before any connection
+      # opened on a brand-new shard). Each then idle-stops through here and strands its lock,
+      # and a peer sees {:held, us} for as long as this node keeps beating.
+      #
+      # Holding the lock buys nothing: the local copy cannot be recovered because it does not
+      # exist. Release it, and make the event alertable rather than silent.
+      Logger.error(
+        "shard #{state.id}: marked dirty but the local file is GONE; nothing to flush, " <>
+          "releasing the lease so the shard is not stranded"
+      )
+
+      :telemetry.execute(
+        [:fathom, :shard, :flush, :failed],
+        %{count: 1},
+        %{shard_id: state.id, reason: :local_file_missing}
+      )
+
+      if is_map(state.lease), do: Storage.release_lease(state.id, state.lease)
     end
 
     :ok
@@ -2236,7 +2278,20 @@ defmodule Fathom.Shard do
     %{state | not_valid_since: nil}
   end
 
-  defp stealable_after_ms(state), do: state.ttl_ms + Storage.steal_margin_ms()
+  # How long after the FIRST `:not_valid` a peer may legitimately have stolen the shard.
+  #
+  # This used to be `ttl + steal_margin`, which double-counts (expert review 2026-08-01 #13).
+  # The clock here starts when `valid_for_write?/1` first returns `:not_valid`, and that fires
+  # EARLY by design — at `now + margin >= deadline`, i.e. at `last_renew + ttl - margin`, where
+  # margin is `ttl/3`. So waiting another full `ttl + steal_margin` from that point put the
+  # fence at roughly `last_renew + 2·ttl`, while a peer may steal at
+  # `last_renew + ttl + steal_margin`. At the defaults (ttl 30s, steal margin 5s) that is ~20s
+  # of continued write ACKs after another node could already own the shard — every one of them
+  # quarantined on partition-heal, and outside the RPO docs/single-writer.md advertises.
+  #
+  # The remaining distance from the first `:not_valid` to stealable is exactly the margin that
+  # made it fire early, plus the steal margin.
+  defp stealable_after_ms(_state), do: Heartbeat.margin_ms() + Storage.steal_margin_ms()
 
   defp fence_writes_when_stealable?,
     do: Application.get_env(:fathom, :fence_writes_when_stealable, false)
