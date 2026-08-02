@@ -101,6 +101,7 @@ defmodule Fathom.Rebalancer.LbApply do
       {:changed, :ok} ->
         case reload() do
           :ok ->
+            mark_applied(path)
             emit(:applied)
             :ok
 
@@ -109,9 +110,32 @@ defmodule Fathom.Rebalancer.LbApply do
             err
         end
 
+      # The file on disk already matches the render. That is NOT the same as the RUNNING LB
+      # having it (expert review 2026-08-01 #23), and the two diverge exactly when a reload
+      # failed: attempt 1 promotes the file and `reload/0` errors — `HandoffJob` correctly
+      # skips the drain — then attempt 2 renders byte-identically, short-circuits to `:ok`,
+      # and the handoff believes the flip is live and DRAINS THE SOURCE while nginx still
+      # routes every request for that shard to it. The same short-circuit made the documented
+      # per-tick self-heal a no-op, so a failed reload was permanent.
+      #
+      # The marker is written only after `reload/0` returns `:ok`, so "file matches but marker
+      # does not" means "promoted, never loaded" — reload again.
       {:unchanged, :ok} ->
-        emit(:noop)
-        :ok
+        if applied?(path) do
+          emit(:noop)
+          :ok
+        else
+          case reload() do
+            :ok ->
+              mark_applied(path)
+              emit(:applied)
+              :ok
+
+            {:error, _} = err ->
+              emit(reload_outcome(err))
+              err
+          end
+        end
 
       {:error, reason} ->
         emit(promote_error_outcome(reason))
@@ -182,6 +206,34 @@ defmodule Fathom.Rebalancer.LbApply do
       end
     end
   end
+
+  # The last content the RUNNING LB was successfully reloaded with (expert review #23), as a
+  # hash beside the map file. Written only after `reload/0` succeeds.
+  defp applied_marker(path), do: path <> ".applied"
+
+  defp mark_applied(path) do
+    case File.read(path) do
+      {:ok, content} ->
+        File.write(applied_marker(path), content_hash(content))
+
+      _ ->
+        :ok
+    end
+  end
+
+  # Does the running LB already have the file that is on disk? Unreadable/missing marker ⇒
+  # assume not, which costs one extra reload — the safe direction, since the alternative is a
+  # handoff draining a source the LB still routes to.
+  defp applied?(path) do
+    with {:ok, content} <- File.read(path),
+         {:ok, marker} <- File.read(applied_marker(path)) do
+      marker == content_hash(content)
+    else
+      _ -> false
+    end
+  end
+
+  defp content_hash(content), do: :crypto.hash(:sha256, content) |> Base.encode16(case: :lower)
 
   defp read_existing(path) do
     case File.read(path) do

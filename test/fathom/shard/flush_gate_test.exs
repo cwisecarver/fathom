@@ -22,9 +22,24 @@ defmodule Fathom.Shard.FlushGateTest do
     :ok
   end
 
-  test "unbounded by default: try_acquire returns :disabled and never counts" do
+  # This test used to assert the OPPOSITE — "unbounded by default" — which is exactly the
+  # defect expert review 2026-08-01 #16 found: the gate's whole purpose is bounding the flush
+  # storm its own moduledoc describes, and it shipped inert on every deployment that had not
+  # explicitly set the key. The default is now derived from the Finch pool it protects.
+  test "BOUNDED by default: an unconfigured node still reserves and counts slots" do
     Application.delete_env(:fathom, :shard_flush_max_concurrency)
 
+    assert is_integer(FlushGate.cap()) and FlushGate.cap() > 0
+    assert FlushGate.try_acquire() == :ok
+    assert FlushGate.in_flight() == 1
+    FlushGate.release()
+  end
+
+  # The escape hatch the old default provided is still reachable, explicitly.
+  test "explicitly unbounded: try_acquire returns :disabled and never counts" do
+    Application.put_env(:fathom, :shard_flush_max_concurrency, 0)
+
+    assert FlushGate.cap() == nil
     assert FlushGate.try_acquire() == :disabled
     assert FlushGate.try_acquire() == :disabled
     assert FlushGate.in_flight() == 0, "with no cap the counter is never touched (zero-cost off)"

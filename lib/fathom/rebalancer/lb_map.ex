@@ -76,13 +76,27 @@ defmodule Fathom.Rebalancer.LbMap do
 
     upstreams =
       Enum.map_join(sorted, "\n\n", fn {node, addr} ->
-        # The pinned node is primary; every other backend is a `backup` so nginx fails a
-        # dead pin over to a survivor (which steals the stale lease). Backups sorted for a
-        # byte-identical re-render.
-        backups =
-          sorted
-          |> Enum.reject(fn {n, _addr} -> n == node end)
-          |> Enum.map_join("", fn {_n, addr} -> "\n    server #{addr} backup;" end)
+        # The pinned node is primary, with exactly ONE `backup` so a dead pin fails over
+        # deterministically (expert review 2026-08-01 #17).
+        #
+        # This used to emit EVERY other backend as a backup — and this upstream, unlike the
+        # main pool, carries no `hash $host consistent`, so nginx load-balanced the backups
+        # ROUND-ROBIN. With a pinned node down, successive requests for one pinned host
+        # alternated between survivors: both cold-open the shard, one wins `acquire_lease`, the
+        # other gets `{:held, winner}` against a fresh heartbeat and errors immediately. On a
+        # 3-node fleet that is roughly half of a pinned shard's requests failing for the whole
+        # outage, with the two survivors thrashing the lease/pull path — and pinned shards are
+        # by definition the fleet's hottest tenants.
+        #
+        # One backup makes the fallback a pure function of the pinned node, so every request
+        # for that host lands on the same survivor and exactly one lease acquire happens. Chosen
+        # as the successor in sorted order (wrapping), which also spreads different nodes' pins
+        # across different survivors instead of piling them all onto one.
+        #
+        # NOT `hash $host consistent` in this upstream: nginx rejects `hash` combined with
+        # `backup` before 1.27.3, and requiring that version is a deployment constraint this
+        # fix does not need to impose.
+        backups = deterministic_backup(sorted, node)
 
         "upstream #{upstream_name(node)} {\n    server #{addr} max_fails=2 fail_timeout=10s;#{backups}\n    keepalive #{@pin_keepalive};\n    keepalive_timeout 30s;\n    keepalive_requests #{@pin_keepalive_requests};\n}"
       end)
@@ -104,6 +118,23 @@ defmodule Fathom.Rebalancer.LbMap do
   # An nginx upstream name for a node_key: [a-zA-Z0-9_] only (an IP like 10.0.0.12 → a
   # legal identifier), so the same key always renders to the same upstream name.
   @doc false
+  # The single deterministic failover target for `node`'s pin upstream: its successor in
+  # sorted key order, wrapping. A pure function of the node and the backend set, so the
+  # rendered map stays byte-identical across re-renders (which `LbApply`'s no-op check
+  # depends on). Empty when there is no other backend — a single-node fleet has nowhere to
+  # fail over to, and an empty string renders the upstream with just its primary.
+  defp deterministic_backup(sorted, node) do
+    case Enum.reject(sorted, fn {n, _addr} -> n == node end) do
+      [] ->
+        ""
+
+      others ->
+        index = Enum.find_index(sorted, fn {n, _addr} -> n == node end) || 0
+        {_n, addr} = Enum.at(others, rem(index, length(others)))
+        "\n    server #{addr} backup;"
+    end
+  end
+
   @spec upstream_name(String.t()) :: String.t()
   def upstream_name(node_key) do
     "fathom_pin_" <> String.replace(node_key, ~r/[^a-zA-Z0-9_]/, "_")

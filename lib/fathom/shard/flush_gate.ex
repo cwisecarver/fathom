@@ -28,8 +28,35 @@ defmodule Fathom.Shard.FlushGate do
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
-  @doc "The configured node-wide concurrent-flush cap, or nil (unbounded)."
-  def cap, do: Application.get_env(:fathom, :shard_flush_max_concurrency)
+  @doc """
+  The node-wide concurrent-flush cap. `nil` only if explicitly configured off.
+
+  SHIPS BOUNDED (expert review 2026-08-01 #16). This used to default to `nil` — unbounded —
+  so the cascade the moduledoc above describes had no active mitigation at all beyond the
+  ±25% timer jitter, which decorrelates phase but not sustained rate. At the measured density
+  and the default 5s interval that is thousands of full-object PUTs per second per node
+  through one 200-connection Finch pool that also carries cold-open pulls, lease and heartbeat
+  ops, and warm-follower revalidation — on exactly the survivor absorbing a failover.
+  #
+  The default is derived from the pool rather than fixed, so raising `pool_size` raises the
+  cap with it: a quarter of the pool for bulk background writes, floored at the dirty-IO
+  scheduler count (each flush's `VACUUM INTO` occupies one) and never below 4. Set
+  `:shard_flush_max_concurrency` to an integer to pin it, or to `0`/`false` to restore the
+  old unbounded behaviour.
+  """
+  def cap do
+    case Application.get_env(:fathom, :shard_flush_max_concurrency, :default) do
+      :default -> default_cap()
+      n when is_integer(n) and n > 0 -> n
+      _ -> nil
+    end
+  end
+
+  defp default_cap do
+    pool_size = get_in(Application.get_env(:fathom, Fathom.Shard.Storage.S3, []), [:pool_size])
+    quarter_pool = div(pool_size || 200, 4)
+    max(min(quarter_pool, System.schedulers_online()), 4)
+  end
 
   @doc """
   Reserve a flush slot. Returns `:ok` (slot reserved — the caller MUST `release/0` when the flush

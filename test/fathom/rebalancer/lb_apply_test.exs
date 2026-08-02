@@ -112,19 +112,50 @@ defmodule Fathom.Rebalancer.LbApplyTest do
            "candidate not promoted on config-test timeout"
   end
 
-  test "a byte-identical re-render is a no-op: no rewrite, no reload (#10)", %{map_path: map_path} do
-    # Regression for #10: the leader re-renders every tick, so an unchanged render must skip
-    # the write + reload. `false` would fail the reload if invoked.
+  test "a byte-identical re-render after a SUCCESSFUL reload is a no-op (#10)", %{
+    map_path: map_path
+  } do
+    # Regression for #10: the leader re-renders every tick, so an unchanged render whose
+    # content the LB already has must skip the write + reload.
+    Application.put_env(:fathom, :lb_reload_cmd, "true")
+    {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
+
+    assert LbApply.apply!() == :ok
+    mtime = File.stat!(map_path).mtime
+
+    # Identical render, and the running LB already has it → genuine no-op.
+    Application.put_env(:fathom, :lb_reload_cmd, "false")
+    assert LbApply.apply!() == :ok
+    assert File.stat!(map_path).mtime == mtime
+  end
+
+  test "a byte-identical re-render after a FAILED reload retries the reload (#23)", %{
+    map_path: map_path
+  } do
+    # The counterpart #10 did not anticipate (expert review 2026-08-01 #23). The no-op test
+    # compares the render to the FILE; what matters is whether the RUNNING LB has that content.
+    # Those diverge exactly here: the file was promoted, the reload failed, and a byte-identical
+    # retry then reported :ok — so HandoffJob believed the flip was live and drained the source
+    # while nginx still routed every request for that shard to it. It also made the documented
+    # per-tick self-heal permanent-no-op, so a failed reload never recovered.
     Application.put_env(:fathom, :lb_reload_cmd, "false")
     {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
 
-    # First apply changes the file → reload runs → fails (surfaced).
+    # First apply promotes the file; the reload fails and is surfaced.
     assert {:error, {:reload_failed, _}} = LbApply.apply!()
-    mtime = File.stat!(map_path).mtime
+    assert File.read!(map_path) =~ "hot_1."
 
-    # Second apply: identical render → no-op → reload NOT invoked → :ok, file untouched.
+    # Identical render, but the LB never loaded it: must NOT report success.
+    assert {:error, {:reload_failed, _}} = LbApply.apply!(),
+           "a promoted-but-never-loaded map was reported as applied"
+
+    # And once the reload can succeed, the self-heal actually heals.
+    Application.put_env(:fathom, :lb_reload_cmd, "true")
     assert LbApply.apply!() == :ok
-    assert File.stat!(map_path).mtime == mtime
+
+    # Now it is genuinely applied, so further ticks are no-ops again.
+    Application.put_env(:fathom, :lb_reload_cmd, "false")
+    assert LbApply.apply!() == :ok
   end
 
   test "a reload-command failure surfaces {:error, {:reload_failed, _}} but still promotes (#11)",

@@ -44,18 +44,93 @@ defmodule Fathom.Application do
 
     # Top is :one_for_one so the planes restart independently — a data-plane restart
     # never disturbs the edge listeners, and vice versa.
-    opts = [strategy: :one_for_one, name: Fathom.Supervisor]
+    opts =
+      [strategy: :one_for_one, name: Fathom.Supervisor] ++ restart_budget(:top)
+
     Supervisor.start_link(children, opts)
+  end
+
+  # Run the BOUNDED drain before the supervision tree comes down (expert review 2026-08-01 #16).
+  #
+  # `Fathom.Shards.drain_all/1` already caps drain concurrency and gives each coordinator a slice
+  # of a total budget — but it was reachable only as an opt-in release pre-stop rpc. A bare
+  # SIGTERM (`docker stop`, a crash-adjacent restart, a plane-supervisor restart per #22) skipped
+  # it entirely and took the unbounded path: `DynamicSupervisor` terminates every child
+  # simultaneously under ONE wall-clock timer, so every open coordinator ran its
+  # checkpoint/snapshot + full-object PUT at once, saturating both the dirty-IO scheduler pool
+  # and the Finch pool. Whatever had not finished when the shutdown budget expired was killed
+  # mid-flush — and because the timer is shared by the whole group, the loss is not random, it is
+  # systematically whichever shards the pool served last.
+  #
+  # `prep_stop/1` runs before the tree is torn down, so this is the same bounded path the rpc
+  # takes, now on by default. The rpc remains useful as the EARLIER step: it deregisters from the
+  # LB first, so traffic stops arriving before the drain begins.
+  @impl true
+  def prep_stop(state) do
+    if Application.get_env(:fathom, :drain_on_shutdown, true) do
+      outcome = Fathom.Shards.drain_all()
+      Logger.info("prep_stop: drained shards #{inspect(outcome)}")
+    end
+
+    state
+  rescue
+    # Never let a drain failure prevent shutdown — the supervisor teardown still flushes what it
+    # can, and a raise here would skip that too.
+    e ->
+      Logger.error("prep_stop: drain_all failed (#{Exception.message(e)}); continuing shutdown")
+      state
   end
 
   # A named sub-supervisor grouping one plane's children with its own :one_for_one
   # restart budget.
   defp plane(name, children) do
+    opts = [strategy: :one_for_one, name: name] ++ restart_budget(:plane)
+
     %{
       id: name,
       type: :supervisor,
-      start: {Supervisor, :start_link, [children, [strategy: :one_for_one, name: name]]}
+      start: {Supervisor, :start_link, [children, opts]}
     }
+  end
+
+  # Restart budgets for the plane supervisors and the top supervisor (expert review
+  # 2026-08-01 #22). Both used to inherit OTP's default 3-in-5s.
+  #
+  # Finding #16 recognised this hazard one level down and deliberately sized
+  # `Fathom.ShardSupervisor` to 100-in-10s, with the comment that a smaller budget "would
+  # exceed 3-in-5s and terminate the supervisor, killing every co-resident shard and risking a
+  # DataPlane -> top cascade." The plane supervisors were added later and never got the same
+  # treatment — so the cascade that comment describes was reachable from ABOVE.
+  #
+  # `Fathom.DataPlane.Supervisor` holds the Registry and ShardSupervisor alongside a dozen
+  # always-on siblings, several of which do real I/O in callbacks and can raise repeatably
+  # (`Heartbeat.do_renew/1` and its clear-previous-incarnation handler call `Storage.*` inline;
+  # `WarmFollower.handle_continue(:refresh)` does a directory read plus S3 pulls;
+  # `TempReaper.handle_continue(:sweep)` does a fleet-sized `Path.wildcard` with no rescue).
+  # Four crashes of any one of those in five seconds took EVERY OPEN SHARD down at once — the
+  # worst possible input to #16's own budget — while the Edge plane kept running, so live Hrana
+  # streams held connections to files the terminating coordinators were about to unlink. That
+  # inverts the stated architecture, where a wobble in one plane cannot restart another.
+  @default_plane_max_restarts 30
+  @default_plane_max_seconds 10
+
+  @doc false
+  def restart_budget(:plane) do
+    [
+      max_restarts:
+        Application.get_env(:fathom, :plane_max_restarts, @default_plane_max_restarts),
+      max_seconds: Application.get_env(:fathom, :plane_max_seconds, @default_plane_max_seconds)
+    ]
+  end
+
+  @doc false
+  def restart_budget(:top) do
+    [
+      max_restarts:
+        Application.get_env(:fathom, :supervisor_max_restarts, @default_plane_max_restarts),
+      max_seconds:
+        Application.get_env(:fathom, :supervisor_max_seconds, @default_plane_max_seconds)
+    ]
   end
 
   # Finding #17: template-shard capture replays a shard's SQL fleet-wide. If prod's fallback default
@@ -372,6 +447,12 @@ defmodule Fathom.Application do
         # Shards.retry_checkout? papers over. Lookups are caller-side ETS either way.
         {Registry,
          keys: :unique, name: Fathom.ShardRegistry, partitions: System.schedulers_online()},
+        # Short-lived data-plane probes that must NOT run in the caller's process (expert
+        # review 2026-08-01 #34). The at-capacity eviction probe is the first user: it waits on
+        # a coordinator that may reply after the wait gave up, and running it inline let that
+        # stray reply accumulate in the admitting Hrana stream process, which lives for hours.
+        # A task's mailbox dies with the task.
+        {Task.Supervisor, name: Fathom.TaskSupervisor},
         {DynamicSupervisor, shard_supervisor_opts()}
       ] ++ warm_follower_children()
   end

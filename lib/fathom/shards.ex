@@ -831,15 +831,47 @@ defmodule Fathom.Shards do
   # full checkpoint + flush + drop + release (durability/lease untouched); admission just
   # stops waiting. Monitor/mailbox cleanup is shared with drain/2 via await_coordinator_exit
   # (expert review #41), so a bounded wait never leaks a monitor or a stale abort.
+  # Slack over the probe's own budget so the ordinary path is resolved by the probe's timeout
+  # rather than by the caller shutting it down.
+  @evict_probe_grace_ms 250
+
   defp evict(shard_id, budget_ms) do
     case Registry.lookup(@registry, shard_id) do
       [] ->
         :ok
 
       [{pid, _}] ->
-        ref = Process.monitor(pid)
-        Fathom.Shard.request_drain(pid, 0, self())
-        await_coordinator_exit(pid, ref, budget_ms)
+        # Probe from a SHORT-LIVED process, not the caller (expert review 2026-08-01 #34).
+        #
+        # `await_coordinator_exit/3`'s timeout branch peeks for a counterpart
+        # `{:drain_aborted, pid}` with `after 0`, which can only consume one that has ALREADY
+        # arrived. On the `:exit_timeout` branch the coordinator is by definition still alive
+        # and has not yet acted on the drain cast, so the abort lands *after* the peek and is
+        # never matched again — a later probe pins a different pid.
+        #
+        # That matters because of WHO calls this: `evicted_for_room?/0` runs eviction probing
+        # inline in the admitting Filo stream process, with a 2s budget over up to 16
+        # candidates, and a django-libsql WebSocket stream lives for hours. A coordinator
+        # blocked in a legacy-mode renew PUT, a cold pull, or a settling flush will not dequeue
+        # in 2s — so at-capacity nodes, where probing is the designed steady state, slowly
+        # accumulated unmatched messages in exactly their longest-lived processes, invisible to
+        # every metric.
+        #
+        # Running the monitor + wait in a task means the mailbox that can leak dies with the
+        # probe. `Task.yield` + `shutdown` keeps the caller's own wait bounded, and the task is
+        # unlinked so a probe crash cannot take the stream down with it.
+        task =
+          Task.Supervisor.async_nolink(Fathom.TaskSupervisor, fn ->
+            ref = Process.monitor(pid)
+            Fathom.Shard.request_drain(pid, 0, self())
+            await_coordinator_exit(pid, ref, budget_ms)
+          end)
+
+        case Task.yield(task, budget_ms + @evict_probe_grace_ms) ||
+               Task.shutdown(task, :brutal_kill) do
+          {:ok, outcome} -> outcome
+          _ -> {:error, :exit_timeout}
+        end
     end
   end
 

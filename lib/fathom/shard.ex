@@ -326,7 +326,24 @@ defmodule Fathom.Shard do
     # Gathers evidence only — the verdict is `resolve_fork/4`, after the lease is held. See
     # `fork_evidence/2`: this HEAD races the steal-touch that `acquire_lease` performs, so a
     # decision made here can mistake our own touch for a fork.
-    fork_task = if file?, do: Task.async(fn -> fork_evidence(shard_id, path) end)
+    # Rescued like start_pull/2 (expert review 2026-08-01 #33). fork_evidence/2 does a storage
+    # HEAD; unrescued, a raise there became an exit in the awaiting coordinator — and since
+    # handle_continue exits with a NON-{:shutdown, _} reason, release_lease never ran and
+    # terminate/2 fell to the pre-open clause that has no lease to release. The lock survived,
+    # and while this node's heartbeat stayed fresh every peer read {:held, us}.
+    fork_task =
+      if file? do
+        Task.async(fn ->
+          try do
+            fork_evidence(shard_id, path)
+          rescue
+            _ -> :unreachable
+          catch
+            :exit, _ -> :unreachable
+          end
+        end)
+      end
+
     pull_task = if file?, do: nil, else: start_pull(shard_id, path)
 
     # Sample the heartbeat generation BEFORE acquire_lease. The fence's invariant is
@@ -348,8 +365,19 @@ defmodule Fathom.Shard do
         # The verdict is taken HERE, with the lease in hand, so `touch_pre_etag`/`touch_post_etag`
         # can distinguish our own steal-touch from a genuine fork. Same consumption point as
         # before (before any serving decision) — only the decision moved.
+        # BOUNDED (expert review 2026-08-01 #33). This was `Task.await(fork_task, :infinity)` —
+        # the one unbounded wait in the open path, while every other blocking step here is
+        # bounded (the pull is a `Task.yield(_, @pull_timeout)`, `:checkout` has its own
+        # timeout). The task does a storage HEAD, and the S3 backend sets no explicit
+        # receive/pool timeout, so the ceiling was a library default rather than a bound fathom
+        # owns — and a hung HEAD held the lease open indefinitely.
+        #
+        # A timeout maps to `:unreachable`, which `resolve_fork/4` already treats as the
+        # fail-safe: keep the local copy and serve warm, fenced by the provenance etag, so a
+        # forked flush 412s and self-fences rather than clobbering.
         warm? =
-          file? and not resolve_fork(Task.await(fork_task, :infinity), shard_id, path, lease)
+          file? and
+            not resolve_fork(await_fork_evidence(fork_task), shard_id, path, lease)
 
         pull_task = pull_task || if warm?, do: nil, else: start_pull(shard_id, path)
         result = open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen)
@@ -377,6 +405,15 @@ defmodule Fathom.Shard do
   # before a refused acquire, so completing or aborting mid-flight are both safe.
   defp abandon_fork_check(nil), do: :ok
   defp abandon_fork_check(task), do: Task.shutdown(task, :brutal_kill)
+
+  # Bounded consumption of the overlapped fork-evidence HEAD (expert review 2026-08-01 #33).
+  # Anything other than a clean, timely verdict is `:unreachable` — resolve_fork/4's fail-safe.
+  defp await_fork_evidence(task) do
+    case Task.yield(task, @pull_timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, verdict} -> verdict
+      _ -> :unreachable
+    end
+  end
 
   defp open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen) do
     with {:ok, etag0} <- await_pull(pull_task, path, shard_id),
@@ -442,6 +479,12 @@ defmodule Fathom.Shard do
         # each waits until the shard is durably clean. Replied to (and cleared) when a flush
         # task lands the shard clean, or with `{:error, _}` on a flush error / lease steal.
         flush_waiters: [],
+        # Consecutive re-kicks of a still-dirty flush that has waiters (expert review
+        # 2026-08-01 #32). Bounds what used to be an unthrottled fence→VACUUM→PUT loop.
+        flush_rekicks: 0,
+        # The in-flight legacy-mode lease-renewal task (expert review 2026-08-01 #29), so the
+        # renew PUT no longer blocks the coordinator mailbox every ttl/3.
+        renew_task: nil,
         # Consecutive durability-flush failures (expert review #27): a persistent S3 failure
         # (auth/bucket-policy change) would otherwise only Logger.warning per interval and let the
         # RPO grow unbounded and silently. We count consecutive failures, emit
@@ -1069,13 +1112,33 @@ defmodule Fathom.Shard do
 
       # Ownership unconfirmed (transient store error / heartbeat not valid): keep dirty, retry next
       # interval, feeding the RPO-alerting counter (#8) — the loss window grows like a PUT failure.
+      # Ownership unconfirmed (a transient store error, or the heartbeat not valid). Settle any
+      # flush_now waiter with an explicit error (expert review 2026-08-01 #32): this branch
+      # never called settle_waiters at all, so during a storage partition a caller blocked the
+      # full 60s @flush_now_timeout instead of getting a retryable answer immediately.
       :fence_skip ->
         {:noreply,
-         schedule_flush(record_flush_failure(note_not_valid(state), :ownership_unconfirmed))}
+         schedule_flush(
+           settle_waiters(
+             record_flush_failure(note_not_valid(state), :ownership_unconfirmed),
+             {:error, :ownership_unconfirmed}
+           )
+         )}
     end
   end
 
   # The flush task crashed before replying: treat like a transient flush failure.
+  def handle_info({ref, result}, %{renew_task: %Task{ref: ref}} = state) do
+    Process.demonitor(ref, [:flush])
+    apply_renew_result(result, %{state | renew_task: nil})
+  end
+
+  # The renewal task crashed: treat as transient and retry on the next tick.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{renew_task: %Task{ref: ref}} = state) do
+    Logger.warning("shard #{state.id}: lease renewal task crashed (#{inspect(reason)}); retrying")
+    {:noreply, schedule_renew(%{state | renew_task: nil})}
+  end
+
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{flush_task: %Task{ref: ref}} = state) do
     Logger.warning("shard #{state.id}: durability flush task crashed (#{inspect(reason)})")
 
@@ -1206,34 +1269,29 @@ defmodule Fathom.Shard do
     end
   end
 
-  def handle_info(:renew_lease, state) do
-    case Storage.renew_lease(state.id, state.lease, state.ttl_ms) do
-      {:ok, lease} ->
-        emit_lease(:renewed, state.id)
-        {:noreply, schedule_renew(clear_write_fence(%{state | lease: lease}))}
-
-      # Another node took the lease — self-fence: stop without flushing so we
-      # never clobber the new owner's copy.
-      {:error, :superseded} ->
-        emit_lease(:superseded, state.id)
-
-        Logger.error(
-          "shard #{state.id}: lease superseded by another node; self-fencing (stop without flush)"
-        )
-
-        {:stop, {:shutdown, :lease_lost}, %{state | lease_lost: true}}
-
-      # Transient store error — a blip is not loss of ownership; keep serving and
-      # retry. If it persists past the TTL another node will steal and the next
-      # renewal will come back :superseded.
-      {:error, reason} ->
-        Logger.warning(
-          "shard #{state.id}: lease renewal transient error (#{inspect(reason)}); retrying"
-        )
-
-        {:noreply, schedule_renew(state)}
-    end
+  # Legacy-mode periodic lease renewal, run OFF-PROCESS (expert review 2026-08-01 #29).
+  #
+  # `f8ecf63` moved `Fence.check` off-process precisely because in legacy mode it does a
+  # renew PUT that blocked the coordinator mailbox — but this timer, which does the SAME PUT
+  # every `ttl/3` (10s at defaults), was left inline. So the coordinator went unresponsive for
+  # a storage RTT (plus Req's retry ladder on a blip) every 10 seconds: `:checkout` queued,
+  # adding a full RTT to p99 cold-open; `:checkin` was delayed, so idle detection and eviction
+  # lagged; and the eviction probe's 2s budget could expire against a merely-blocked
+  # coordinator, which is #34's leak trigger.
+  #
+  # Same monitored-task shape the flush already uses. The renewal is a plain PUT with no local
+  # state to protect, so there is nothing to serialise against.
+  def handle_info(:renew_lease, %{renew_task: nil} = state) do
+    id = state.id
+    lease = state.lease
+    ttl = state.ttl_ms
+    task = Task.async(fn -> Storage.renew_lease(id, lease, ttl) end)
+    {:noreply, %{state | renew_task: task}}
   end
+
+  # A renewal is still in flight — the store is slower than the renew interval. Skip this tick
+  # rather than stacking PUTs; the in-flight one will reschedule when it lands.
+  def handle_info(:renew_lease, state), do: {:noreply, state}
 
   # Periodic durability flush: snapshot + upload the live shard without dropping
   # it, so a busy shard's data-loss window is bounded to the flush interval rather
@@ -2305,13 +2363,35 @@ defmodule Fathom.Shard do
   defp settle_waiters(state, _outcome) when not is_map_key(state, :flush_waiters), do: state
   defp settle_waiters(%{flush_waiters: []} = state, _outcome), do: state
 
+  # How many times a flush_now waiter may re-kick a still-dirty flush before it is failed.
+  # Each iteration is a fence (a lock GET, or a renew PUT in legacy mode) + a whole-file
+  # VACUUM INTO + a full-object PUT, so an unbounded loop is expensive for every co-tenant.
+  @max_flush_rekicks 8
+
   defp settle_waiters(state, :flushed) do
-    if unflushed?(state) do
-      send(self(), :durability_flush)
-      state
-    else
-      for w <- state.flush_waiters, do: GenServer.reply(w, :ok)
-      %{state | flush_waiters: []}
+    cond do
+      not unflushed?(state) ->
+        for w <- state.flush_waiters, do: GenServer.reply(w, :ok)
+        %{state | flush_waiters: [], flush_rekicks: 0}
+
+      # Still dirty after a flush that had waiters. Re-kick, but BACKED OFF and BOUNDED
+      # (expert review 2026-08-01 #32).
+      #
+      # This used to be a bare `send(self(), :durability_flush)` — no backoff, no jitter,
+      # bypassing schedule_flush_backoff/1 — and two of the three paths that reach it are
+      # FAILURE paths where the shard is dirty by construction (a `{:reconciled, nil}` verdict
+      # and the flush-task `:DOWN` clause). So a failing store span the loop as fast as the
+      # BEAM could spawn tasks: fence, VACUUM the whole file, PUT it, fail, immediately again,
+      # for up to the 60s flush_now timeout. A crash-looping flush task was the sharpest
+      # version — spawn, crash, :DOWN, respawn, with no delay at all.
+      state.flush_rekicks < @max_flush_rekicks ->
+        schedule_flush_backoff(%{state | flush_rekicks: state.flush_rekicks + 1})
+
+      # Not converging. Tell the caller so it can retry deliberately, rather than holding it to
+      # the full timeout while the node burns I/O on its behalf.
+      true ->
+        for w <- state.flush_waiters, do: GenServer.reply(w, {:error, :flush_not_converging})
+        %{state | flush_waiters: [], flush_rekicks: 0}
     end
   end
 
@@ -2708,6 +2788,35 @@ defmodule Fathom.Shard do
 
   # Renew well inside the TTL (every third) so a couple of transient failures
   # don't lapse the lease.
+  defp apply_renew_result(result, state) do
+    case result do
+      {:ok, lease} ->
+        emit_lease(:renewed, state.id)
+        {:noreply, schedule_renew(clear_write_fence(%{state | lease: lease}))}
+
+      # Another node took the lease — self-fence: stop without flushing so we
+      # never clobber the new owner's copy.
+      {:error, :superseded} ->
+        emit_lease(:superseded, state.id)
+
+        Logger.error(
+          "shard #{state.id}: lease superseded by another node; self-fencing (stop without flush)"
+        )
+
+        {:stop, {:shutdown, :lease_lost}, %{state | lease_lost: true}}
+
+      # Transient store error — a blip is not loss of ownership; keep serving and
+      # retry. If it persists past the TTL another node will steal and the next
+      # renewal will come back :superseded.
+      {:error, reason} ->
+        Logger.warning(
+          "shard #{state.id}: lease renewal transient error (#{inspect(reason)}); retrying"
+        )
+
+        {:noreply, schedule_renew(state)}
+    end
+  end
+
   defp schedule_renew(state) do
     state = cancel_renew(state)
     interval = max(div(state.ttl_ms, 3), 1)

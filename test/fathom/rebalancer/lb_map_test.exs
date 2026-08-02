@@ -43,6 +43,58 @@ defmodule Fathom.Rebalancer.LbMapTest do
              ~r/upstream fathom_pin_fathom2 \{\n    server fathom2:8080 max_fails=2 fail_timeout=10s;\n    server fathom1:8080 backup;\n    keepalive 512;\n    keepalive_timeout 30s;\n    keepalive_requests 100000;\n\}/
   end
 
+  test "a pin upstream has exactly ONE backup, so a dead pin fails over deterministically (#17)" do
+    # Expert review 2026-08-01 #17. This upstream carries no `hash $host consistent` (the main
+    # pool does), so nginx load-balances multiple `backup` servers ROUND-ROBIN. With every
+    # other backend listed, successive requests for ONE pinned host alternated between
+    # survivors: both cold-open the shard, one wins acquire_lease, the other gets {:held,
+    # winner} against a fresh heartbeat and errors immediately. On a 3-node fleet that is
+    # roughly half of a pinned shard's requests failing for the whole outage — and pinned
+    # shards are by definition the hottest tenants.
+    three = %{
+      "fathom1" => "fathom1:8080",
+      "fathom2" => "fathom2:8080",
+      "fathom3" => "fathom3:8080"
+    }
+
+    out = LbMap.render([], three, "fathom.test")
+
+    for node <- ~w(fathom1 fathom2 fathom3) do
+      block = upstream_block(out, "fathom_pin_#{node}")
+
+      assert length(Regex.scan(~r/ backup;/, block)) == 1,
+             "#{node}'s pin upstream must have exactly one backup, got:\n#{block}"
+    end
+  end
+
+  test "the deterministic backup is stable across re-renders and spreads across survivors (#17)" do
+    three = %{
+      "fathom1" => "fathom1:8080",
+      "fathom2" => "fathom2:8080",
+      "fathom3" => "fathom3:8080"
+    }
+
+    a = LbMap.render([], three, "fathom.test")
+    b = LbMap.render([], three, "fathom.test")
+    assert a == b, "the render must stay byte-identical — LbApply's no-op check depends on it"
+
+    backups =
+      for node <- ~w(fathom1 fathom2 fathom3) do
+        [_, addr] = Regex.run(~r/server (\S+) backup;/, upstream_block(a, "fathom_pin_#{node}"))
+        addr
+      end
+
+    assert length(Enum.uniq(backups)) > 1,
+           "every pin failing over to the SAME survivor would concentrate the whole fleet's " <>
+             "pinned load on one node: #{inspect(backups)}"
+  end
+
+  # The text of one `upstream <name> { ... }` block.
+  defp upstream_block(rendered, name) do
+    [block] = Regex.run(~r/upstream #{name} \{[^}]*\}/, rendered)
+    block
+  end
+
   test "a single-node fleet renders a pin upstream with no backup server" do
     # No other backend to fail over to; just the primary (matches pre-#1 behavior).
     out = LbMap.render([], %{"solo" => "solo:8080"}, "fathom.test")
