@@ -48,6 +48,11 @@ mix precommit      # the gate: compile --warnings-as-errors, deps.unlock --unuse
 iex -S mix phx.server   # start app (dashboard :4000)
 ```
 
+- **`--warnings-as-errors` enforces placement, not just correctness.** Three that cost a compile round trip each, every session, and are invisible until you build:
+  - A `@module_attribute` must be **defined above every use**. Adding one next to the function that reads it fails when that function sits earlier in the file.
+  - **Clauses of the same name/arity must be contiguous.** Inserting a new `handle_info/2` clause after an unrelated function splits the group. A private helper defined *between* two clauses splits it too — put the helper after the whole group.
+  - A new clause must go **above the catch-all**, not merely near it. `def handle_info({:DOWN, ref, …}, %{renew_task: …})` placed after the generic `{:DOWN, …}` clause is unreachable, and the compiler says so.
+  - When scripting a bulk edit with `python3`, a `str.replace` with no count replaces **every** occurrence — a duplicated function definition is the usual result. Pass a count, then `grep -c` to confirm.
 - **Shell is zsh — stop re-learning this.** These bite every session; internalize them:
   - Backticks and `$(...)` run command substitution even inside double quotes — a backtick or unescaped `$(` in a `git commit -m "..."` body gets executed and silently mangles the message. Don't wrap identifiers in backticks inside `-m`; use `git commit -F <file>` for any non-trivial message.
   - **zsh parameter-expansion patterns glob.** `${var#pat}` / `${var%pat}` treat `(`, `[`, `]`, `#`, `?`, `*` as pattern metacharacters, so `${m#](}` dies with `bad pattern: ](`. Don't hand-strip brackets/parens with `${...#...}` — use `grep -oE`, or just do the text munging in `python3`.
@@ -72,6 +77,48 @@ Plan mode for non-trivial tasks (3+ steps or an architectural decision). Stop an
 ### Stop-after-2-failures rule
 
 If a script or command (test/build/migration/sweep) fails **twice with a similar error**, stop. Print the exact command, the exact error, and a one-paragraph root-cause hypothesis, then wait. Don't loop on infra failures (missing dep, DB-not-created, port conflict, libSQL file-lock) — diagnose them. Same rule for scope blowups: a refactor producing **>50 compile errors** or running **>60 min past estimate** → stop and report. Never paper over flaky tests or build failures with sleeps, retries, or timeout bumps.
+
+### A review's recommended fix is a hypothesis, not a spec
+
+A finding from `/expert-audit`, `/review`, or any panel has **two separable claims**: *this is broken*
+(usually right — panels verify by reading, sometimes by execution) and *fix it this way* (frequently
+wrong, because the recommender did not run it). **Verify the mechanism of the fix before building
+it**, with the cheapest experiment that would falsify it.
+
+Measured on the 2026-08-01 panel, where 4 of ~31 recommended fixes were wrong in ways the finding
+itself was not:
+
+- "Set the SQLite authorizer in `Connection.open/1`" — would have broken **every durability flush**,
+  because `VACUUM INTO` is implemented as an internal ATTACH. A 30-second probe caught it.
+- "`quick_check` the snapshot temp" — the temp is the post-`VACUUM INTO` file, and VACUUM *rebuilds
+  indexes from table content*, so it repairs exactly the corruption class the gate exists to catch.
+  The gate would have shipped and never fired.
+- "Delete the lock instead of rolling it back" — makes the next `acquire_lease` a fresh create at
+  **epoch 1**, a larger backward jump than the bug being fixed.
+- "Reduce `prev_load` to the shards that moved" — an unmoved shard still needs its baseline, or the
+  next tick reports a huge spurious rate for an *idle* shard.
+
+So: implement the finding, not the prescription. When the prescription turns out wrong, **record why
+in the code comment and the progress file** — the next reader needs to know the obvious-looking fix
+was tried and is wrong, or they will "simplify" it back.
+
+### An existing test that blocks your fix may be right
+
+When a fix breaks an existing test, decide **which of the two encodes the intended behaviour** before
+touching either. Three outcomes, all seen in one session:
+
+1. **The test pinned the defect** (`flush_gate_test` asserted "unbounded by default"; `lb_apply_test`
+   asserted a byte-identical re-render after a *failed* reload returns `:ok`). Update the test, and
+   say in the test itself that it previously asserted the opposite and why.
+2. **The fixture was unrealistic** — it fabricated a state production cannot produce (a shard `.db`
+   with no provenance sidecar; a 1-row table whose index page is mostly free space, so the corruption
+   fixture corrupted nothing). Make the fixture realistic, and comment what makes it so.
+3. **The test was right and the finding was wrong.** `S3StealTouchRollbackTest` caught that deleting
+   the lock reintroduces an unfenced takeover — a hazard a prior review had added that rollback to
+   prevent. The test saved the fix.
+
+A test that fails because of a deliberate, documented constraint is case 3. Read the comment above it
+before assuming case 1.
 
 ## Testing
 
@@ -99,6 +146,12 @@ Complements the framework **Test guidelines** below (`start_supervised!`, no `Pr
   writes `logs/test-failures-<ts>.log` with the seed, the test's location, and a paste-ready rerun
   command. It writes nothing on a green run.
 - **Every bug fix ships with a regression test in the same commit.** It must (1) **reproduce deterministically** — fail pre-fix, pass post-fix; if you can't make it fail without the fix you haven't isolated the bug, keep investigating — and (2) **pin the violated invariant**, not just the reproduction steps. Comment the symptom so future readers know why the test exists. Good targets: concurrency/thread-local races (test at the pure-function level), off-by-one/boundary (test at the boundary), classifier/dispatcher mismatches (test the classification), lifecycle ordering (test the sequence).
+- **ALWAYS run the new test against the unfixed code.** Stash the `lib/` change, run, confirm it fails, restore. Do this every time, not when it feels uncertain — a test that passes both ways is the default outcome of a plausible-looking test, not a rare one. In one session this caught four separate tests that were measuring nothing.
+- **When a regression test passes pre-fix, suspect the harness before concluding "unreproducible".** In order:
+  1. **The test double can't express the bug.** `Storage.Local` identified a lock by `{owner, epoch}` while the S3 backend fences with `If-Match: lock_etag`, so an entire class of stale-lease bugs was *structurally invisible* to `mix test` — the regression test for one of them passed against the unfixed code. The fix was to teach `Fathom.Test.FaultyStorage` the real contract, which made the bug class visible for good. **A gap between a double and the real backend's contract silently exempts every bug in that contract; closing it is worth more than the one fix that exposed it.**
+  2. **The fixture doesn't create the state.** A corruption fixture that scribbles a *nearly-empty* b-tree page corrupts only free space, so `quick_check` still passes and the test proves nothing. Assert the precondition inside the test (`assert {:error, _} = verify_integrity(path), "the fixture did not actually corrupt anything"`).
+  3. **The environment already has the property.** `config/test.exs` sets `heartbeat_server: false`, so every coordinator in the suite is already in legacy mode — a setup block "forcing" it was a no-op that made the test look more specific than it was.
+- **If a test genuinely cannot discriminate, say so in its moduledoc.** Some real bugs need a microsecond race or a fault the live backend has no seam for. Keep the test as an invariant guard, but write "these do NOT reproduce the race, and here is what the fix rests on instead" — plainly, in the file. Never let a non-discriminating test read as a regression test; the next person will trust it.
 - **Fathom-specific must-test invariants** (these are the bugs that bite a sharded multi-tenant system):
   - **Shard isolation.** A query for shard A must *never* resolve to or read shard B's data. Any change to routing — `Fathom.ShardExecutor.shard_from_conn` (request → shard), `Fathom.Shards` resolve, shard-path construction in `Fathom.Shard`, or the planned `Fathom.Directory` — ships with a test proving cross-shard isolation.
   - **Migrations are tested both ways.** Every schema migration ships with a test that runs the forward copy+transform on a seeded `vN-1` shard and validates `vN` (row counts / checksums), **and** a test for the revert pointer-flip back to `vN-1`. See the migration gate.
@@ -121,6 +174,10 @@ Complements the framework **Test guidelines** below (`start_supervised!`, no `Pr
 - **Run clean and in prod mode.** Compile in `MIX_ENV=prod` (and the Rust NIF in release, slow) for any bench run; start from a clean DB/data state; don't bench a dev build.
 - **Tiered regression response:** **<20%** — ignore (noise). **≥20%** — assume real: rerun once to rule out noise; if confirmed, **revert first**, then reproduce minimally on a branch. Never stack fix attempts on top of a known-regressed commit.
 - **Phantom-regression rule.** Declaring an observed regression "phantom" (numbers wrong, not the code) requires (a) the same regression measured by a *second* tool/environment, (b) an explicit explanation of why the original measurement was wrong, and (c) a cooling-off before closing. Don't declare phantom-regressions the same day they're observed — broken instrumentation is not evidence of a fixed regression.
+- **A suspiciously GOOD number is a broken measurement until proven otherwise** — and it is the easier one to bank by accident, because the gate says OK and nobody looks. Two from one session: a first-draft `flush_p50_us` read **2 µs** for a full `VACUUM INTO` + upload (the bench's minimal tree has no `WriteCounter`, so `bump/1` rescued to `:ok`, the shard read clean, and `flush_now/1` returned having done nothing); and `fanout_kb_per_shard` reported a **−29% "win"** against a tight 3.77–4.07 historical band on a commit that could not plausibly have caused it (a re-bench of the same HEAD returned 3.77). **Check any metric that moves outside its own historical band in EITHER direction, and re-bench HEAD to leave a corrected baseline** — the real damage from an outlier low is the *next* commit being gated against it, where an ordinary reading becomes a false ≥20% regression and blocks clean work.
+- **A new bench metric must assert its own preconditions.** The failure mode is not a wrong number, it's a number for work that never happened. Put the guard inside the harness (`unless dirty?(pid), do: raise "flush bench is measuring nothing"`), so the metric fails loudly instead of reporting a spectacular result.
+- **Bench-gate baseline workflow.** `commit_with_bench.sh` compares against the parent's **clean-tree** entry, and committing does not leave one (the pre-commit run is recorded `dirty: true`). So each successive gated commit needs: `git stash push -- lib/ test/` → `scripts/benchmark.sh` → `git stash pop` → gate. Skipping it yields `no baseline for parent <sha>`, and the gate then reaches back to an older, possibly-outlying entry. Same trap the `[skip-bench]` note below describes, reached a different way.
+- **Never change the shared bench `setup/1` to serve one metric.** Starting `WriteCounter`/`FlushWatermark` there so the flush metric would work changed what `fanout_kb_per_shard` measures (every open shard gains ETS rows) — the gate correctly blocked at **+46.5%**. That is a *harness topology* change, and per the same-topology rule it invalidates the historical series. Scope new dependencies to the metric that needs them.
 - **Scale test (built).** `mix fathom.scale [--shards N] [--shard-size-mb S]` (`Fathom.Scale`) provisions N realistically-sized shards and measures cold-open latency at size + **fan-out node density** (BEAM + RSS per open shard, open throughput). `--ramp [--max N]` opens empty shards until the fd ceiling to find the node-density limit cheaply; `--warm-density` per the bullet above; `--lease-rps` shows per-shard lease renewals collapsed to one node heartbeat (flat regardless of shard count). Raise `ulimit -n` first (~3 fds per live connection). Measured 2026-06-29: 1000 × 4MB → ~196 KiB RSS/shard, warm cold-open ~2.6 ms p50; ramp held 50k linearly → fd ceiling ~82k. (The ramp's per-open slowdown at high N is a one-process test artifact, not fathom — production spreads shards across per-stream processes.)
   - **Hot-spot detectability (`--hotspots`, the Phase-2 §B rebalancing unblock).** `mix fathom.scale --hotspots [--shards N] [--zipf s] [--queries Q] [--workers W] [--stream-len L]` (`Fathom.Scale.hotspots/1`) is the **first reader of `Fathom.ShardLoad`**: it turns on `:shard_load`, drives a Zipf(s)-skewed load over N shards through the real recording path (`Shards.checkout` → `ShardExecutor.execute`), then reads the counters the way a rebalancer would — diff two `snapshot/0`s over a window into per-shard rates. **Load unit is a Hrana stream** (`--stream-len L`): each stream checks out + opens a connection once, bursts L queries on the held connection, then checkins — the real per-stream model. `L=1` (default) is one query per stream (the per-query lower bound, finest detection sampling); raise L to measure realistic throughput, scaling `--queries` so `Q/L` (the stream count) stays ≫ N. Reports the rate distribution (p50/p90/p99/max), two separations (max/median and tail-robust max/p99), **three threshold-family sweeps** (`>Kx median`, `>Kx p99`, and an absolute q/s floor isolating the top-N — each with a Zipf-recall check), a `median_collapsed` flag (shape-based: `>10x-median` flags ≫ `>10x-p99` ⇒ median-relative over-flags), a scale-robust anti-flap signal (top-20-by-rate set overlap across two windows), and whether `ShardLoad.top(20)` recovers the Zipf head. **Detection finding (prod, 10k shards, s=1.1 — synthetic/one-host-relative):** clean (`ShardLoad.top(20)` recall **1.0**, top-20 Jaccard **0.9**, sharp head hot_1 188 q/s → …), but the long cold tail makes **`>Kx-median` over-flag (751/421/216) — key hot-detection on `>Kx-p99` (>20×p99 → 5 shards, recall 1.0) or an absolute q/s floor.** **Throughput finding (prod, 1000 shards, ~20k streams; 2026-07-23):** persistent streams remove the per-query coordinator bottleneck — L=1 **~3.3k q/s** → L=16 **~27k** → L=64 **~54–55k q/s** per node (hottest shard ~600 → ~4.9k → ~9.5k q/s), detection quality flat across all L. So the earlier ~1.2k q/s was the per-query artifact, not a fathom limit. The held-stream numbers are **+13–16% over the pre-2026-07-23-iteration code** (same-day A/B — the per-connection statement cache: at L=64, 63 of 64 queries skip `sqlite3_prepare_v2`), while L=1 is flat — a one-query stream never hits the cache and is per-stream-open-bound, which is the connection-pool question, measure-first pending `hrana_rt_us` (`docs/reviews/hotspots-ab-2026-07-23.md`). **Non-synthetic confirmation — DONE** (`deploy/chaos/chaos.sh hotspots`, 2026-07-06): 17.5k real Hrana requests through the LB over 3 nodes recovered the Zipf head at top-20 recall 0.95, with the hot set spread across nodes (a rebalancer reads `ShardLoad` per node and merges). Enable on a deployed node with `SHARD_LOAD=true` (`config/runtime.exs`).
 
