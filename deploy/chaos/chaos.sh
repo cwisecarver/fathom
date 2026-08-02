@@ -126,6 +126,9 @@ other_node() { local not=$1 n; for n in "${NODES[@]}"; do [ "$n" != "$not" ] && 
 reload_lb() { compose exec -T lb nginx -s reload; }
 sql_direct() { local node=$1; shift; hrana "http://localhost:$(direct_port "$node")" "$@"; }
 val() { jq -r '.results[0].response.result.rows[0][0].value'; } # first row/col
+# `val` yields the literal "null" on an error/empty response. Guard every arithmetic use:
+# bash arithmetic treats a bare word as a variable name, so `$(( n + null ))` aborts under set -u.
+is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
 seed() { # seed <shard>: kv table exists
   sql "$1" "CREATE TABLE IF NOT EXISTS kv (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT, seq INTEGER)" >/dev/null
@@ -315,17 +318,33 @@ cmd_soak() {
   echo "soak load done; letting flushes settle..."
   sleep 10
 
-  local total_acked=0 total_stored=0 leaks=0
+  local total_acked=0 total_stored=0 leaks=0 unreadable=0
   for t in "${tenants[@]}"; do
     local acked stored foreign
     acked=$(wc -l < "$ack_dir/$t" | tr -d ' ')
+    # `val` emits the literal string "null" when the response carries no row — which happens
+    # here whenever a tenant's shard is mid-failover at verdict time (the churn loop kills a
+    # node 8s before it restarts it, and the last kill can land right before this readback).
+    # `$(( x + null ))` then treats `null` as a variable NAME, so `set -u` killed the whole
+    # summary before it printed the verdict — the isolation check the soak actually asserts.
+    # Retry once, then report the tenant as UNREADABLE rather than silently counting it as 0:
+    # "could not read t6" is a result, not a zero.
     stored=$(sql "$t" "SELECT count(*) FROM kv WHERE seq > 0" | val)
+    is_num "$stored" || { sleep 5; stored=$(sql "$t" "SELECT count(*) FROM kv WHERE seq > 0" | val); }
     foreign=$(sql "$t" "SELECT count(*) FROM kv WHERE tenant <> '$t'" | val)
-    total_acked=$((total_acked + acked)); total_stored=$((total_stored + stored))
-    [ "$foreign" != "0" ] && { leaks=$((leaks + 1)); echo "  *** ISOLATION LEAK in $t: $foreign foreign rows"; }
-    printf "  %-4s acked=%-6s stored=%-6s foreign=%s\n" "$t" "$acked" "$stored" "$foreign"
+
+    if is_num "$stored" && is_num "$foreign"; then
+      total_acked=$((total_acked + acked)); total_stored=$((total_stored + stored))
+      [ "$foreign" != "0" ] && { leaks=$((leaks + 1)); echo "  *** ISOLATION LEAK in $t: $foreign foreign rows"; }
+      printf "  %-4s acked=%-6s stored=%-6s foreign=%s\n" "$t" "$acked" "$stored" "$foreign"
+    else
+      unreadable=$((unreadable + 1))
+      printf "  %-4s acked=%-6s stored=%-6s foreign=%-6s  *** UNREADABLE at verdict time\n" \
+        "$t" "$acked" "${stored:-?}" "${foreign:-?}"
+    fi
   done
-  echo "RESULT soak: acked=$total_acked stored=$total_stored lost=$((total_acked - total_stored)) (RPO: committed-but-unflushed at each kill), leaks=$leaks (MUST be 0)"
+  echo "RESULT soak: acked=$total_acked stored=$total_stored lost=$((total_acked - total_stored)) (RPO: committed-but-unflushed at each kill), leaks=$leaks (MUST be 0), unreadable=$unreadable"
+  [ "$unreadable" -gt 0 ] && echo "  NOTE: $unreadable tenant(s) unreadable at verdict time — their rows are NOT in the totals above"
   [ $leaks -eq 0 ]
 }
 
