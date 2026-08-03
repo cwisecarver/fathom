@@ -519,6 +519,24 @@ defmodule Fathom.Shard.Connection do
   def exec(conn, sql), do: Sqlite3.execute(conn, sql)
 
   @doc """
+  Reads a scalar `PRAGMA` off this connection — `pragma(conn, "synchronous")` ⇒ `{:ok, 2}`.
+
+  A READ helper, deliberately separate from `exec/2`: pragma state is per-connection and
+  invisible from the outside, so invariants about it (the durability snapshot's `synchronous`
+  relaxation being scoped and restored — expert review 2026-08-01 #5 / #30 item 7) had no way to
+  be asserted at all. `name` is interpolated, so it must be a literal from this codebase, never
+  client input; the pragma grammar takes no bound parameters.
+  """
+  @spec pragma(reference(), String.t()) :: {:ok, term()} | {:error, term()}
+  def pragma(conn, name) do
+    case query(conn, "PRAGMA #{name}", []) do
+      {:ok, %{rows: [[value] | _]}} -> {:ok, value}
+      {:ok, %{rows: []}} -> {:ok, nil}
+      {:error, _} = error -> error
+    end
+  end
+
+  @doc """
   Sets how long a statement waits on a contended lock before failing `SQLITE_BUSY`.
 
   Always use this over `PRAGMA busy_timeout` (expert review 2026-07-24 #1): the pragma calls

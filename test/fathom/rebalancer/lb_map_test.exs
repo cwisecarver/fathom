@@ -8,6 +8,119 @@ defmodule Fathom.Rebalancer.LbMapTest do
 
   defp override(shard, node), do: %{shard_id: shard, pinned_node: node}
 
+  describe "the ROUTING property (#30 item 6)" do
+    # Every test above asserts CONTENT — that some substring appears for a hand-written input.
+    # None asserts the property the map exists to have, which is what actually keeps a tenant's
+    # traffic on one node: a shard resolves to exactly one upstream, and it is its pin. A content
+    # assertion cannot see a duplicate key (nginx silently takes the first, so a shard would route
+    # to a stale node forever) or a pin that renders under the wrong host.
+    #
+    # Not a `StreamData` property — the interesting inputs here are structural (duplicates,
+    # invalid ids, unknown backends, sort order), so they are enumerated directly.
+
+    # Parse the rendered `map` block back into %{host => upstream}, failing loudly on a duplicate
+    # key rather than silently keeping one — the duplicate is the bug this exists to catch.
+    defp routing_table(out) do
+      [_, block] = String.split(out, "map $host $fathom_target {", parts: 2)
+      [block, _] = String.split(block, "\n}", parts: 2)
+
+      block
+      |> String.split("\n", trim: true)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == "" or String.starts_with?(&1, "#")))
+      |> Enum.map(fn line -> line |> String.trim_trailing(";") |> String.split(~r/\s+/) end)
+      |> Enum.reduce(%{}, fn [host, upstream], acc ->
+        refute Map.has_key?(acc, host),
+               "#{host} rendered TWICE — nginx keeps the first, so this shard routes to a stale " <>
+                 "node until the duplicate is noticed"
+
+        Map.put(acc, host, upstream)
+      end)
+    end
+
+    test "every pinned shard resolves to exactly one upstream, and it is its pin" do
+      pins = [
+        override("alpha", "fathom1"),
+        override("bravo", "fathom2"),
+        override("charlie", "fathom1"),
+        override("delta", "fathom2")
+      ]
+
+      table = routing_table(LbMap.render(pins, @backends, "fathom.test"))
+
+      for %{shard_id: id, pinned_node: node} <- pins do
+        assert table["#{id}.fathom.test"] == "fathom_pin_#{node}",
+               "#{id} does not route to its pinned node #{node}"
+      end
+
+      # Plus the catch-all, and nothing else: an entry nobody asked for is a misroute.
+      assert table["default"] == "fathom_hrana"
+      assert map_size(table) == length(pins) + 1
+    end
+
+    test "the renderer does NOT dedupe — uniqueness is the unique index's job, not its own" do
+      # Written first as "a shard pinned twice renders one entry", which FAILED: `render/3` emits
+      # both, and nginx keeps the first, so the shard would route to a stale node.
+      #
+      # That is not a bug, because the input is impossible: `shard_overrides` carries
+      # `unique_index(:shard_overrides, [:shard_id])`
+      # (priv/repo/migrations/20260707030520_create_shard_overrides_and_node_key.exs:25), so the
+      # rebalancer cannot produce two rows for one shard. The fixture was unrealistic — case 2 of
+      # AGENTS.md's "an existing test that blocks your fix may be right".
+      #
+      # Pinned as the renderer's DEPENDENCY rather than deleted: this is the one place the map's
+      # one-entry-per-shard property comes from somewhere else. Drop that index and the map
+      # silently misroutes, with nothing in this file to catch it.
+      out =
+        LbMap.render(
+          [override("alpha", "fathom1"), override("alpha", "fathom2")],
+          @backends,
+          "fathom.test"
+        )
+
+      assert out =~ "alpha.fathom.test fathom_pin_fathom1;"
+      assert out =~ "alpha.fathom.test fathom_pin_fathom2;"
+    end
+
+    test "unroutable rows contribute NO entry rather than a broken one" do
+      # An unknown backend, an invalid shard id, and a failed row: each must vanish, not render a
+      # key pointing at an upstream that does not exist (nginx refuses to load the whole config).
+      table =
+        routing_table(
+          LbMap.render(
+            [
+              override("good", "fathom1"),
+              override("orphan", "fathom_gone"),
+              override("bad id", "fathom1"),
+              Map.put(override("reverted", "fathom2"), :failed_at, DateTime.utc_now())
+            ],
+            @backends,
+            "fathom.test"
+          )
+        )
+
+      assert table["good.fathom.test"] == "fathom_pin_fathom1"
+      assert map_size(table) == 2, "only the routable pin and the default: #{inspect(table)}"
+    end
+
+    test "every upstream a map entry names is actually defined in the same render" do
+      # The property that makes the config LOADABLE: a dangling upstream reference is a hard
+      # nginx start failure, which takes the whole LB down rather than misrouting one tenant.
+      out =
+        LbMap.render(
+          [override("alpha", "fathom1"), override("bravo", "fathom2")],
+          @backends,
+          "fathom.test"
+        )
+
+      for {_host, upstream} <- routing_table(out), upstream != "fathom_hrana" do
+        assert out =~ "upstream #{upstream} {",
+               "the map points at #{upstream}, which this render never defines — nginx would " <>
+                 "refuse to load the config"
+      end
+    end
+  end
+
   test "empty override set: pure-hash default plus the static pin-upstreams" do
     out = LbMap.render([], @backends, "fathom.test")
 
