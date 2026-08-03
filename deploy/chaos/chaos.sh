@@ -126,6 +126,44 @@ other_node() { local not=$1 n; for n in "${NODES[@]}"; do [ "$n" != "$not" ] && 
 reload_lb() { compose exec -T lb nginx -s reload; }
 sql_direct() { local node=$1; shift; hrana "http://localhost:$(direct_port "$node")" "$@"; }
 val() { jq -r '.results[0].response.result.rows[0][0].value'; } # first row/col
+vals() { jq -r '.results[0].response.result.rows[]?[0].value'; } # every row, first col
+
+# recoverable_seqs <tenant>: every `seq` an operator could still recover on ANY node, one per
+# line — across all three places an acked row legitimately survives a kill.
+#
+# A shard whose owner is SIGKILLed mid-write keeps its un-flushed rows in that node's local file.
+# From there the row can end up in any of:
+#
+#   <shard>.db           the node's plain local copy, when it has NOT re-opened the shard since
+#                        restarting — nothing has run the fork check yet, so the rows just sit
+#                        there. Easy to forget because this file is invisible through the LB,
+#                        which serves whichever node currently owns the lease.
+#   <shard>.db.forked.*  quarantined on re-open, once the node sees a peer advanced the lineage.
+#   <shard>.db.fenced.*  quarantined when the lease was superseded with un-flushed writes
+#                        ("acked writes preserved for recovery" — a DIFFERENT suffix, and the
+#                        first version of this helper globbed only `.forked.*` and missed it).
+#
+# Scanning fewer than all three under-counts, and soak then reports recoverable rows as DESTROYED.
+recoverable_seqs() {
+  local t=$1 n
+  for n in "${NODES[@]}"; do
+    rpc "$n" "
+      ([\"/data/shards/$t.db\"] ++ Path.wildcard(\"/data/shards/$t.db.forked.*\") ++
+         Path.wildcard(\"/data/shards/$t.db.fenced.*\"))
+      |> Enum.filter(&File.exists?/1)
+      |> Enum.each(fn f ->
+        case Fathom.Shard.Connection.open(f) do
+          {:ok, c} ->
+            case Fathom.Shard.Connection.query(c, \"SELECT seq FROM kv\", []) do
+              {:ok, %{rows: rows}} -> Enum.each(rows, fn [s] -> IO.puts(s) end)
+              _ -> :ok
+            end
+            Fathom.Shard.Connection.close(c)
+          _ -> :ok
+        end
+      end)"
+  done
+}
 # `val` yields the literal "null" on an error/empty response. Guard every arithmetic use:
 # bash arithmetic treats a bare word as a variable name, so `$(( n + null ))` aborts under set -u.
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
@@ -149,6 +187,32 @@ is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 seed() {
   sql "$1" "CREATE TABLE IF NOT EXISTS kv (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT, seq INTEGER)" >/dev/null
   sql "$1" "DELETE FROM kv" >/dev/null 2>&1 || true
+
+  # Quarantine copies are durable too, and truncating only the LIVE table left them behind.
+  # `soak` now reconciles acks against `.forked.*` (see forked_seqs), so a previous run's
+  # quarantine files counted as this run's recoverable rows: the first run with the new verdict
+  # printed DESTROYED=-656, negative because `recoverable` (1125, carrying seqs up to 1809 from
+  # the prior run) exceeded `acked` (469). Exactly the shape of the `lost=-575` contamination
+  # this function's DELETE was written for — a second surface of the same bug.
+  #
+  # `.fenced.*` and `.corrupt.*` are swept for the same reason: they are per-shard forensic
+  # copies a later run must not inherit.
+  local n
+  for n in "${NODES[@]}"; do
+    compose exec -T "$n" sh -lc \
+      "rm -f /data/shards/$1.db.forked.* /data/shards/$1.db.fenced.* /data/shards/$1.db.corrupt.*" \
+      >/dev/null 2>&1 || true
+  done
+
+  # Make the empty state DURABLE before the run starts. The DELETE above only lands in the
+  # owner's local file; if a churn kill hits before the next periodic flush, a survivor
+  # cold-opens the last STORED object — which still holds the previous run's rows. That is how
+  # a 90s soak came back with `t6 acked=49 stored=152`: 152 was mostly last run's data restored
+  # from S3, and it dragged `needs-operator-recovery` negative. Same "every run starts fresh"
+  # contract as the DELETE; it just has to reach storage to hold across a kill.
+  for n in "${NODES[@]}"; do
+    rpc "$n" "Fathom.Shards.flush(\"$1\")" >/dev/null 2>&1 || true
+  done
 }
 
 # -- commands -------------------------------------------------------------------
@@ -336,10 +400,9 @@ cmd_soak() {
   echo "soak load done; letting flushes settle..."
   sleep 10
 
-  local total_acked=0 total_stored=0 leaks=0 unreadable=0
+  local total_acked=0 total_stored=0 leaks=0 unreadable=0 total_recovered=0
   for t in "${tenants[@]}"; do
-    local acked stored foreign
-    acked=$(wc -l < "$ack_dir/$t" | tr -d ' ')
+    local acked stored foreign recovered
     # `val` emits the literal string "null" when the response carries no row — which happens
     # here whenever a tenant's shard is mid-failover at verdict time (the churn loop kills a
     # node 8s before it restarts it, and the last kill can land right before this readback).
@@ -351,19 +414,53 @@ cmd_soak() {
     is_num "$stored" || { sleep 5; stored=$(sql "$t" "SELECT count(*) FROM kv WHERE seq > 0" | val); }
     foreign=$(sql "$t" "SELECT count(*) FROM kv WHERE tenant <> '$t'" | val)
 
+    # RECOVERABLE, not lost: seqs present in the live shard OR anywhere recoverable_seqs looks.
+    # A tenant unreadable live still counts those rows, which is the whole point — t6 in the
+    # first 2026-08-03 run was unreadable with all 68 of its acks sitting in quarantine.
+    #
+    # SET intersection, not a count difference. The first version subtracted cardinalities and
+    # went NEGATIVE (`DESTROYED=-8`), because a shard can hold rows that were never acked: the
+    # write committed server-side and the ACK was lost when churn killed the node mid-response.
+    # That is a normal distributed outcome, not a surplus — so "destroyed" has to mean
+    # "acked seqs present NOWHERE", which only a set difference answers.
+    local all_seqs acks_sorted
+    all_seqs=$(mktemp); acks_sorted=$(mktemp)
+    { sql "$t" "SELECT seq FROM kv" | vals; recoverable_seqs "$t"; } \
+      | grep -E '^[0-9]+$' | sort -u > "$all_seqs"
+    sort -u "$ack_dir/$t" > "$acks_sorted"
+    acked=$(wc -l < "$acks_sorted" | tr -d ' ')
+    recovered=$(comm -12 "$acks_sorted" "$all_seqs" | wc -l | tr -d ' ')
+    rm -f "$all_seqs" "$acks_sorted"
+    total_acked=$((total_acked + acked)); total_recovered=$((total_recovered + recovered))
+
     if is_num "$stored" && is_num "$foreign"; then
-      total_acked=$((total_acked + acked)); total_stored=$((total_stored + stored))
+      total_stored=$((total_stored + stored))
       [ "$foreign" != "0" ] && { leaks=$((leaks + 1)); echo "  *** ISOLATION LEAK in $t: $foreign foreign rows"; }
-      printf "  %-4s acked=%-6s stored=%-6s foreign=%s\n" "$t" "$acked" "$stored" "$foreign"
+      printf "  %-4s acked=%-6s stored=%-6s recoverable=%-6s destroyed=%-4s foreign=%s\n" \
+        "$t" "$acked" "$stored" "$recovered" "$((acked - recovered))" "$foreign"
     else
       unreadable=$((unreadable + 1))
-      printf "  %-4s acked=%-6s stored=%-6s foreign=%-6s  *** UNREADABLE at verdict time\n" \
-        "$t" "$acked" "${stored:-?}" "${foreign:-?}"
+      printf "  %-4s acked=%-6s stored=%-6s recoverable=%-6s destroyed=%-4s foreign=%-6s  *** UNREADABLE live\n" \
+        "$t" "$acked" "${stored:-?}" "$recovered" "$((acked - recovered))" "${foreign:-?}"
     fi
   done
-  echo "RESULT soak: acked=$total_acked stored=$total_stored lost=$((total_acked - total_stored)) (RPO: committed-but-unflushed at each kill), leaks=$leaks (MUST be 0), unreadable=$unreadable"
-  [ "$unreadable" -gt 0 ] && echo "  NOTE: $unreadable tenant(s) unreadable at verdict time — their rows are NOT in the totals above"
-  [ $leaks -eq 0 ]
+
+  # DESTROYED is the number that matters, and it is NOT `acked - stored`.
+  #
+  # The old headline was `lost=acked-stored`, counting only the LIVE shard — so it reported every
+  # quarantined row as lost. The 2026-08-03 run printed `lost=498` and looked like a serious
+  # regression; reconciling the acks against the `.forked.*` copies showed all 1349 acked rows
+  # present, 0 destroyed. The system was doing exactly what single-writer promises and the metric
+  # was lying about it, in the alarming direction (#24 was the same lesson pointing the other way:
+  # a metric that reads healthy while data is gone).
+  #
+  # `stored` is kept because the gap IS the operator's recovery workload — rows that need a
+  # `.forked.*` merge rather than being served — but it is no longer the pass/fail number.
+  local destroyed=$((total_acked - total_recovered))
+  echo "RESULT soak: acked=$total_acked stored=$total_stored recoverable=$total_recovered DESTROYED=$destroyed (MUST be 0), leaks=$leaks (MUST be 0), unreadable=$unreadable"
+  echo "  needs-operator-recovery: $((total_acked - total_stored)) row(s) live only in .forked.* quarantine copies (RPO: committed-but-unflushed at a kill)"
+  [ "$unreadable" -gt 0 ] && echo "  NOTE: $unreadable tenant(s) unreadable live — their quarantined rows ARE counted in recoverable"
+  [ $leaks -eq 0 ] && [ $destroyed -eq 0 ]
 }
 
 # A shard's HOME node (the LB-hash target that serves it) must NOT warm its own
