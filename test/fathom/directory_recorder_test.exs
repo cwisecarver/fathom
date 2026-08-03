@@ -224,4 +224,71 @@ defmodule Fathom.Directory.RecorderTest do
              "last_flushed_at landed after a later DateTime.utc_now/0 — cross-clock stamp"
     end
   end
+
+  describe "#38 — the shutdown flush is budgeted and says so when it gives up" do
+    # This buffer holds a `last_flushed_at` row for every shard the node just flushed, and
+    # terminate/2 is the only chance to persist them. Shutdown order is
+    # Edge -> DataPlane -> ControlPlane -> Infra, so EVERY coordinator's terminate-flush has
+    # already run by then; under `use GenServer`'s default 5s the drain could be cut off, and it
+    # was SILENT. A truncated flush makes `flush_lag_report/1` and `mix fathom.shard loss-report`
+    # show those shards as flushed LONGER AGO than they were — under-reading loss on exactly the
+    # node that just went down.
+
+    setup do
+      prev = Application.get_env(:fathom, :directory_recorder_shutdown_budget_ms)
+
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:fathom, :directory_recorder_shutdown_budget_ms, prev),
+          else: Application.delete_env(:fathom, :directory_recorder_shutdown_budget_ms)
+
+        Recorder.flush()
+      end)
+
+      :ok
+    end
+
+    test "the supervised child has an explicit 30s shutdown, not the 5s default" do
+      # Asserted against the LIVE tree, not a function's return value: the default only bites if
+      # the running spec actually carries it.
+      assert {:ok, spec} =
+               :supervisor.get_childspec(
+                 Fathom.ControlPlane.Supervisor,
+                 Fathom.Directory.Recorder
+               )
+
+      assert spec.shutdown >= 30_000,
+             "the Recorder still stops on a budget shorter than the data plane's flush burst"
+
+      refute spec.shutdown == 5_000
+    end
+
+    test "an exhausted budget gives up loudly and leaves the rows buffered" do
+      import ExUnit.CaptureLog
+
+      Application.put_env(:fathom, :directory_recorder_shutdown_budget_ms, 0)
+      assert :ok = Recorder.record_flush(uniq())
+      assert :ok = Recorder.record_flush(uniq())
+
+      log = capture_log(fn -> assert :ok = Recorder.terminate(:shutdown, nil) end)
+
+      assert log =~ "shutdown flush gave up",
+             "a truncated shutdown flush must not be silent — it corrupts loss-report in the " <>
+               "misleading direction"
+
+      assert log =~ "buffered row(s) undrained"
+    end
+
+    test "a sufficient budget drains everything and logs nothing" do
+      import ExUnit.CaptureLog
+
+      Application.put_env(:fathom, :directory_recorder_shutdown_budget_ms, 25_000)
+      id = uniq()
+      assert :ok = Recorder.record_flush(id)
+
+      log = capture_log(fn -> assert :ok = Recorder.terminate(:shutdown, nil) end)
+
+      refute log =~ "gave up", "the happy path must stay quiet"
+    end
+  end
 end

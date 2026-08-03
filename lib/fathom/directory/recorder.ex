@@ -133,18 +133,62 @@ defmodule Fathom.Directory.Recorder do
   @impl true
   def terminate(_reason, _state) do
     # Don't lose the last window of touches on a graceful stop (e.g. a deploy).
-    do_flush()
-    :ok
+    #
+    # DEADLINE-AWARE, and it has an explicit `shutdown:` in the supervision tree (expert review
+    # 2026-08-01 #38). This ran under `use GenServer`'s default 5 s at the worst possible moment:
+    # shutdown order is Edge → DataPlane → ControlPlane → Infra, so EVERY coordinator's
+    # terminate-flush has already run and each successful upload called `record_flush/1`. The
+    # `@flush_table` therefore holds a `last_flushed_at` row for every shard the node just
+    # flushed, and this is the only chance to persist them before the process is `:kill`ed.
+    #
+    # A truncated flush is SILENT and wrong in the misleading direction: `flush_lag_report/1` and
+    # `mix fathom.shard loss-report` then show those shards as flushed LONGER AGO than they were,
+    # so an operator assessing post-incident loss under-reads it — on exactly the node that just
+    # went down. Bound it, and say so when it gives up.
+    deadline = System.monotonic_time(:millisecond) + shutdown_budget_ms()
+    _ = do_flush(deadline)
+
+    case pending() do
+      0 ->
+        :ok
+
+      n ->
+        Logger.error(
+          "Directory.Recorder: shutdown flush gave up with #{n} buffered row(s) undrained " <>
+            "after #{shutdown_budget_ms()}ms — flush_lag_report/loss-report will under-report " <>
+            "how recently these shards flushed. Raise the Recorder's :shutdown budget."
+        )
+
+        :ok
+    end
   end
+
+  defp pending, do: table_size(@table) + table_size(@flush_table)
+
+  defp table_size(table) do
+    case :ets.info(table, :size) do
+      n when is_integer(n) -> n
+      _ -> 0
+    end
+  end
+
+  # Under the 30_000 child `shutdown:` in `Fathom.Application.control_plane_children/0`, leaving
+  # room for the log above — the supervisor's timer is a hard `:kill`, so overshooting it means
+  # losing the very message that says data was lost.
+  defp shutdown_budget_ms,
+    do: Application.get_env(:fathom, :directory_recorder_shutdown_budget_ms, 25_000)
 
   defp schedule(ms), do: Process.send_after(self(), :flush, ms)
 
-  defp do_flush do
-    flush_table(@table, &Directory.record_batch/1, [:fathom, :directory, :flush]) +
+  # `deadline` is a monotonic-ms instant to stop draining at, or `:infinity` for the periodic
+  # path (which has a whole interval and re-runs a second later anyway).
+  defp do_flush(deadline \\ :infinity) do
+    flush_table(@table, &Directory.record_batch/1, [:fathom, :directory, :flush], deadline) +
       flush_table(
         @flush_table,
         &Directory.record_flush_batch/1,
-        [:fathom, :directory, :flush_recorded]
+        [:fathom, :directory, :flush_recorded],
+        deadline
       )
   end
 
@@ -160,25 +204,32 @@ defmodule Fathom.Directory.Recorder do
   # in the first place.
   @drain_chunk 2_000
 
-  defp flush_table(table, upsert, event) do
-    flush_chunks(table, upsert, event, 0)
+  defp flush_table(table, upsert, event, deadline) do
+    flush_chunks(table, upsert, event, 0, deadline)
   end
 
   # STOPS on a failed chunk. `restore/2` re-buffers the failed rows into the same table, so
   # continuing would immediately re-drain them and loop forever. Halting leaves them for the next
   # flush cycle, which is exactly the pre-chunking behaviour.
-  defp flush_chunks(table, upsert, event, acc) do
-    case drain_chunk(table) do
-      [] ->
-        acc
+  defp flush_chunks(table, upsert, event, acc, deadline) do
+    if past?(deadline) do
+      acc
+    else
+      case drain_chunk(table) do
+        [] ->
+          acc
 
-      rows ->
-        case flush_rows(table, rows, upsert, event) do
-          {:ok, n} -> flush_chunks(table, upsert, event, acc + n)
-          :failed -> acc
-        end
+        rows ->
+          case flush_rows(table, rows, upsert, event) do
+            {:ok, n} -> flush_chunks(table, upsert, event, acc + n, deadline)
+            :failed -> acc
+          end
+      end
     end
   end
+
+  defp past?(:infinity), do: false
+  defp past?(deadline), do: System.monotonic_time(:millisecond) >= deadline
 
   defp flush_rows(table, rows, upsert, event) do
     case rows do

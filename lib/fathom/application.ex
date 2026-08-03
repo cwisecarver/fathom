@@ -337,7 +337,16 @@ defmodule Fathom.Application do
     [
       # Coalesces per-checkout directory accesses off the data path and batch-flushes
       # them to Postgres.
-      Fathom.Directory.Recorder,
+      #
+      # Explicit 30 s shutdown, not `use GenServer`'s default 5 s (expert review 2026-08-01 #38).
+      # Planes stop Edge → DataPlane → ControlPlane → Infra, so by the time this terminates every
+      # coordinator's terminate-flush has already run and each one called `record_flush/1`. Its
+      # buffer therefore holds a `last_flushed_at` row for every shard the node just flushed, and
+      # `terminate/2` is the only chance to persist them. A control-plane process holding node-wide
+      # durability metadata has to outlive the data plane's flush burst — truncating it makes
+      # `loss-report` under-read the loss on exactly the node that just went down. The child's own
+      # budget (`:directory_recorder_shutdown_budget_ms`, 25 s) gives up inside this and logs.
+      Supervisor.child_spec(Fathom.Directory.Recorder, shutdown: 30_000),
       # TTL-cached fleet HEAD so the lazy-migrate checkout path never runs a
       # per-checkout `max(version)` on Postgres. Cheap when unused (polls only while
       # :lazy_migrate is on).
