@@ -95,6 +95,90 @@ defmodule FathomWeb.ThrottleTest do
     assert conn |> get("/api/tenants") |> Map.get(:status) == 429
   end
 
+  describe "#35 — the buckets are per CLIENT, not per proxy" do
+    # Both throttles are documented as PER-IP and are on by default in prod, but they keyed on
+    # conn.remote_ip — the PROXY behind any proxy, and config/prod.exs's
+    # `force_ssl: [rewrite_on: [:x_forwarded_proto]]` says a proxy is expected. So every client
+    # shared one bucket: ONE attacker's failed logins locked out EVERY operator, and the lockout
+    # is checked before credentials are verified, so no valid password gets anyone back in.
+    #
+    # These drive the real router, so they fail on the pre-fix client_ip/1.
+    setup do
+      prev = Application.get_env(:fathom, :trusted_proxies)
+
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:fathom, :trusted_proxies, prev),
+          else: Application.delete_env(:fathom, :trusted_proxies)
+      end)
+
+      # ConnTest dispatches with remote_ip {127,0,0,1}; trust it so the header is honoured.
+      Application.put_env(:fathom, :trusted_proxies, ["127.0.0.1"])
+      :ok
+    end
+
+    defp via_proxy(conn, client),
+      do: Plug.Conn.put_req_header(conn, "x-forwarded-for", client)
+
+    test "one client's lockout does not lock out another behind the same proxy", %{conn: conn} do
+      Application.put_env(:fathom, :admin_auth_max_failures, 3)
+
+      for _ <- 1..3 do
+        assert conn
+               |> via_proxy("203.0.113.9")
+               |> basic("admin", "wrong")
+               |> get("/admin/metrics")
+               |> Map.get(:status) == 401
+      end
+
+      assert conn
+             |> via_proxy("203.0.113.9")
+             |> basic("admin", "wrong")
+             |> get("/admin/metrics")
+             |> Map.get(:status) == 429,
+             "the attacker must still be locked out"
+
+      # The operator, a different client through the same proxy, is unaffected. Pre-fix both
+      # keyed on {127,0,0,1} and this was a 429 — the operator DoS the finding describes.
+      assert conn
+             |> via_proxy("198.51.100.20")
+             |> basic("admin", "secret")
+             |> get("/admin/metrics")
+             |> Map.get(:status) != 429,
+             "an unrelated operator was locked out by someone else's failures"
+    end
+
+    test "the /api limit is per client, not a fleet-wide cap", %{conn: conn} do
+      Application.put_env(:fathom, :api_rate_limit, 3)
+
+      for _ <- 1..3 do
+        assert conn |> via_proxy("203.0.113.9") |> get("/api/tenants") |> Map.get(:status) == 401
+      end
+
+      assert conn |> via_proxy("203.0.113.9") |> get("/api/tenants") |> Map.get(:status) == 429
+
+      # A different client still has its full budget. Pre-fix this was 429: the limit was a
+      # global cap that legitimate control-plane traffic collided with, limiting no attacker.
+      assert conn |> via_proxy("198.51.100.20") |> get("/api/tenants") |> Map.get(:status) == 401,
+             "a second client inherited the first's rate-limit bucket"
+    end
+
+    test "a spoofed header from an UNTRUSTED peer cannot escape the bucket", %{conn: conn} do
+      # With the proxy list not covering the peer, the header is ignored — otherwise an attacker
+      # would simply rotate X-Forwarded-For to get an unlimited number of fresh budgets.
+      Application.delete_env(:fathom, :trusted_proxies)
+      Application.put_env(:fathom, :api_rate_limit, 3)
+
+      for i <- 1..3 do
+        assert conn |> via_proxy("203.0.113.#{i}") |> get("/api/tenants") |> Map.get(:status) ==
+                 401
+      end
+
+      assert conn |> via_proxy("203.0.113.99") |> get("/api/tenants") |> Map.get(:status) == 429,
+             "rotating a spoofed X-Forwarded-For bought a fresh rate-limit budget"
+    end
+  end
+
   test "with the throttles unconfigured (default), repeated failures never lock out", %{
     conn: conn
   } do

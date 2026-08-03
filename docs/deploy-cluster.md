@@ -116,6 +116,7 @@ per-IP throttles via `Fathom.RateLimiter`, on by default in prod (`=0` disables)
 **lockout** on the shared admin BasicAuth and a **rate limit** on `/api` so a hostile/buggy client
 can't hammer expensive ops (list/export/fork).
 
+    TRUSTED_PROXIES=10.0.0.0/8   # REQUIRED for the two below to be per-IP if :4000 is proxied
     ADMIN_AUTH_MAX_FAILURES=20   # lock out an IP with 429 after N failed admin auths / window
     ADMIN_AUTH_WINDOW_MS=300000  # the failure window (default 5 min)
     API_RATE_LIMIT=120           # per-IP /api requests per window before 429 (runs before auth)
@@ -123,6 +124,14 @@ can't hammer expensive ops (list/export/fork).
 
 The Hrana token path is HMAC-verified (not brute-forceable), so these guard the one shared admin
 password and the `/api` surface — see [configuration](configuration.md).
+
+**`TRUSTED_PROXIES` is what makes "per-IP" true** (expert review 2026-08-01 #35). `conn.remote_ip`
+behind a proxy is the PROXY, so without it both throttles collapse to one shared bucket: a single
+attacker's failed logins lock out **every** operator — the lockout is checked *before* credentials
+are verified, so a correct password doesn't get anyone back in — and the `/api` cap becomes
+fleet-global while limiting no attacker. Unset is fail-closed (the header is ignored), and a
+forwarded address is honoured only when the peer is in the list, because `X-Forwarded-For` is
+otherwise just something the attacker types.
 
 ## Running a node
 

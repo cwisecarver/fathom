@@ -573,6 +573,26 @@ if config_env() == :prod do
     config :fathom, :api_rate_window_ms, String.to_integer(window)
   end
 
+  # Which peers may speak for a client via `X-Forwarded-For` (expert review 2026-08-01 #35).
+  # Comma-separated addresses or CIDR, IPv4 or IPv6.
+  #
+  # Both throttles above are documented as PER-IP, but `conn.remote_ip` behind a proxy is the
+  # PROXY — so unset, they degrade to ONE shared bucket for the whole fleet: one attacker's failed
+  # logins lock out every operator (the lockout is checked before credentials are verified), and
+  # the /api limit becomes a global cap that limits no attacker. Set this to the addresses of
+  # whatever terminates TLS in front of `:4000` — the same thing `force_ssl: rewrite_on:
+  # [:x_forwarded_proto]` in prod.exs already assumes exists.
+  #
+  # UNSET IS FAIL-CLOSED, not fail-open: the header is ignored entirely and behaviour is exactly
+  # what it was. Never set this to a range you do not control — a peer inside it can name any
+  # client it likes, which would let an attacker both evade their own limit and pin a real
+  # operator into the lockout.
+  if proxies = System.get_env("TRUSTED_PROXIES") do
+    config :fathom,
+           :trusted_proxies,
+           proxies |> String.split(",", trim: true) |> Enum.map(&String.trim/1)
+  end
+
   # Wildcard-TLS serving (#35): set when the deployment terminates TLS with a `*.<zone>` wildcard
   # cert, which CANNOT serve an id that isn't a DNS-safe label (an underscore id — RFC 6125). With
   # this on, `Tenants.provision`/`fork` REFUSE such an id (422) instead of handing back an un-servable

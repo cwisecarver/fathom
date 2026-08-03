@@ -222,7 +222,18 @@ defmodule FathomWeb.Router do
   defp admin_fail_window, do: Application.get_env(:fathom, :admin_auth_window_ms, 300_000)
   defp api_rate_limit_config, do: Application.get_env(:fathom, :api_rate_limit)
   defp api_rate_window, do: Application.get_env(:fathom, :api_rate_window_ms, 60_000)
-  defp client_ip(conn), do: conn.remote_ip
+  # The throttles above are documented as PER-IP and are on by default in prod. Behind a proxy
+  # `conn.remote_ip` is the proxy, so every client shared one bucket and one attacker's failed
+  # logins locked out every operator (expert review 2026-08-01 #35). Honours `X-Forwarded-For`
+  # only when the peer is a configured trusted proxy — see FathomWeb.ClientIp for why that
+  # condition is mandatory rather than a refinement. Unset `:trusted_proxies` keeps today's
+  # behaviour exactly.
+  #
+  # NOT also keyed on the username, which the review suggested. `:admin_auth` is ONE shared
+  # credential, so a username adds no partition — it only lets an attacker vary the username field
+  # to get a fresh failure budget per made-up name, multiplying the attempts the lockout allows.
+  # That weakens the exact brute-force protection the finding is about.
+  defp client_ip(conn), do: FathomWeb.ClientIp.resolve(conn)
 
   # The Hrana (libSQL) endpoint is served by Filo on its own listener (see
   # Fathom.Application.hrana_listener/0), not through this router.
