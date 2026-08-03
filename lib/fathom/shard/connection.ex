@@ -394,6 +394,25 @@ defmodule Fathom.Shard.Connection do
   # connection; it lives in the owner's process dictionary beside the statement cache and dies
   # with the owner (it monitors it) or at close/1.
   defp with_deadline(conn, ms, fun) do
+    # Sweep residue from an EARLIER deadline before arming this one (expert review 2026-08-01
+    # #46's residual race, which its own tests said they did not close).
+    #
+    # The peek below is `after 0` — non-blocking — so it misses a `{:timed_out, ref}` the watchdog
+    # sent in the instant between the query finishing and that peek running. The ref is unique per
+    # call, so no later peek can ever match it either: the message sits in the stream process's
+    # mailbox forever, one per near-miss, growing without bound.
+    #
+    # CI found it, not reading: `connection_watchdog_test` drives 400 queries at a 1 ms deadline
+    # specifically to sit on that boundary, and a loaded 2–4 core runner widens the window enough
+    # that it fires. It passed on an 18-core dev box for the same reason the other two CI-only
+    # failures did.
+    #
+    # Swept at ARM rather than acknowledged at disarm: a synchronous disarm handshake would close
+    # the window completely but costs a round trip on every guarded query. Anything still in the
+    # mailbox at this point is necessarily stale — `ref` does not exist yet — so this is exact,
+    # and it is O(residue): normally the mailbox is empty and the receive returns immediately.
+    drain_stale_timeouts()
+
     ref = make_ref()
     watchdog = ensure_watchdog(conn)
     send(watchdog, {:arm, ref, ms, self()})
@@ -420,6 +439,14 @@ defmodule Fathom.Shard.Connection do
     case {timed_out?, result} do
       {true, {:error, _}} -> {:error, :query_timeout}
       _ -> result
+    end
+  end
+
+  defp drain_stale_timeouts do
+    receive do
+      {:timed_out, _stale} -> drain_stale_timeouts()
+    after
+      0 -> :ok
     end
   end
 

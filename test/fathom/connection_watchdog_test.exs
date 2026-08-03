@@ -12,18 +12,24 @@ defmodule Fathom.ConnectionWatchdogTest do
   A stream holds its connection for the stream's life, and the watchdog is per-connection, so
   the residue accumulates in exactly the longest-lived processes.
 
-  ## These tests do NOT reproduce the race, and that is stated deliberately
+  ## The reorder narrowed the race; it did not close it — CI proved that
 
-  The window is the few microseconds between `Sqlite3.cancel/1` and the `send/2` that followed
-  it, and hitting it requires a query to complete inside that gap. These tests pass against the
-  unfixed code. They are the INVARIANT guard, not a reproduction: they pin "no `{:timed_out,
-  _}` residue ever accumulates in the owner's mailbox", which is what a future change widening
-  the window would violate.
+  #46's fix (send before cancel) makes the message provably present before the cancel can let
+  the statement return, which covers a query the watchdog actually interrupts. It does NOT cover
+  a query that finishes on its own in the instant after the watchdog committed to firing: the
+  `after 0` peek runs first, finds nothing, and the message lands afterwards in a mailbox where
+  no later peek can match it (every call uses a fresh `make_ref/0`).
 
-  The fix itself is a structural reorder — sending before cancelling makes the message
-  provably present before the cancel can let the statement return — so its correctness rests
-  on the ordering argument, not on a failing test. Recorded honestly rather than dressed up as
-  a regression test that discriminates.
+  That is not theoretical. `"a long run of fast queries under a deadline"` below drives 400
+  queries at a **1 ms** deadline precisely to sit on that boundary, and it FAILED on CI (OTP 29,
+  2026-08-03) — a 2–4 core runner widens the window enough to hit it, while an 18-core dev box
+  does not. The original version of this moduledoc said these tests pass against the unfixed
+  code; on a slow enough machine, one of them does not.
+
+  `with_deadline/3` now sweeps stale `{:timed_out, _}` at ARM, before the fresh ref exists, so
+  anything found is necessarily residue. `"a stale timeout message is swept"` pins that
+  deterministically — it injects the residue rather than racing for it, and fails without the
+  sweep.
 
   Not async: drives real SQLite connections and flips `:query_timeout_ms`.
   """
@@ -66,6 +72,42 @@ defmodule Fathom.ConnectionWatchdogTest do
 
     assert mailbox_size() == 0,
            "the watchdog leaked {:timed_out, ref} into the owner's mailbox"
+  end
+
+  test "a stale timeout message is swept by the next guarded query", %{conn: conn} do
+    # Deterministic where the race is not: inject exactly the residue the race produces, then run
+    # one ordinary guarded query and assert the mailbox came back clean. Fails without the sweep.
+    Application.put_env(:fathom, :query_timeout_ms, 5_000)
+    :ok = Connection.exec(conn, "CREATE TABLE t (a INTEGER)")
+
+    send(self(), {:timed_out, make_ref()})
+    send(self(), {:timed_out, make_ref()})
+    assert mailbox_size() == 2, "the fixture did not plant the residue it is about to check for"
+
+    assert {:ok, _} = Connection.query(conn, "SELECT 1", [])
+
+    assert mailbox_size() == 0,
+           "residue from an earlier deadline survives into a long-lived stream's mailbox, one " <>
+             "message per near-miss, with nothing that can ever match it"
+  end
+
+  test "the sweep does not eat the CURRENT query's timeout", %{conn: conn} do
+    # The sweep runs before `ref` exists, so it cannot consume this call's own message — but that
+    # is the obvious way to break it, so pin it: a genuine timeout must still be reported.
+    Application.put_env(:fathom, :query_timeout_ms, 5)
+    :ok = Connection.exec(conn, "CREATE TABLE big (a INTEGER)")
+    send(self(), {:timed_out, make_ref()})
+
+    result =
+      Connection.query(
+        conn,
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 90000000) " <>
+          "SELECT count(*) FROM c",
+        []
+      )
+
+    assert {:error, :query_timeout} = result
+    assert mailbox_size() == 0
   end
 
   test "a genuine timeout is still reported", %{conn: conn} do
