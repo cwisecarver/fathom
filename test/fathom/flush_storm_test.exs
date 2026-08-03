@@ -51,25 +51,40 @@ defmodule Fathom.FlushStormTest do
              "the gate shipped inert: nil cap means try_acquire/0 always returns :disabled"
     end
 
-    test "the default is derived from the Finch pool, so tuning the pool tunes the cap" do
+    # Asserts the DERIVATION, with the scheduler count passed in.
+    #
+    # This test previously drove `FlushGate.cap/0` and asserted `big > small` after swapping
+    # :pool_size 4000 → 40. That is machine-dependent and it was WRONG: the cap is
+    # min(pool/4, schedulers) floored at 4, so the pool only moves it while pool/4 is the
+    # binding term. On an 18-scheduler dev box (18 vs 10) it is; on a 2–4 core CI runner
+    # `schedulers` binds at both pool sizes and the cap is a flat 4, so `big > small` is
+    # false. It passed locally and failed on all three OTP versions in CI from `dc3d2a3`
+    # until the derivation was extracted. Keep this driven by the pure function.
+    test "the default derives from the Finch pool, capped by schedulers and floored at 4" do
+      # The pool is the binding term: a quarter of it, and raising it raises the cap.
+      assert FlushGate.default_cap(40, 64) == 10
+      assert FlushGate.default_cap(4000, 64) == 64, "capped by schedulers, not a quarter of 4000"
+
+      assert FlushGate.default_cap(400, 64) > FlushGate.default_cap(40, 64),
+             "while pool/4 is the binding term, tuning the pool tunes the cap"
+
+      # The scheduler count is the binding term — a big pool cannot oversubscribe the
+      # dirty-IO schedulers each in-flight VACUUM INTO occupies.
+      assert FlushGate.default_cap(4000, 8) == 8
+
+      # The floor holds regardless of how small either input gets.
+      assert FlushGate.default_cap(4, 64) == 4, "never serialise every flush"
+      assert FlushGate.default_cap(4000, 2) == 4, "floor wins over a low scheduler count too"
+    end
+
+    test "cap/0 applies that derivation to the configured pool" do
       Application.delete_env(:fathom, :shard_flush_max_concurrency)
       prev_s3 = Application.get_env(:fathom, Fathom.Shard.Storage.S3, [])
 
       on_exit(fn -> Application.put_env(:fathom, Fathom.Shard.Storage.S3, prev_s3) end)
-
-      Application.put_env(
-        :fathom,
-        Fathom.Shard.Storage.S3,
-        Keyword.put(prev_s3, :pool_size, 4000)
-      )
-
-      big = FlushGate.cap()
-
       Application.put_env(:fathom, Fathom.Shard.Storage.S3, Keyword.put(prev_s3, :pool_size, 40))
-      small = FlushGate.cap()
 
-      assert big > small, "the cap must track the pool it is protecting"
-      assert small >= 4, "but never collapse to something that serialises every flush"
+      assert FlushGate.cap() == FlushGate.default_cap(40, System.schedulers_online())
     end
 
     test "an explicit integer still wins" do

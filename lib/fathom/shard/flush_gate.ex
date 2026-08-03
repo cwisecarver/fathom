@@ -54,8 +54,24 @@ defmodule Fathom.Shard.FlushGate do
 
   defp default_cap do
     pool_size = get_in(Application.get_env(:fathom, Fathom.Shard.Storage.S3, []), [:pool_size])
-    quarter_pool = div(pool_size || 200, 4)
-    max(min(quarter_pool, System.schedulers_online()), 4)
+    default_cap(pool_size || 200, System.schedulers_online())
+  end
+
+  @doc """
+  The pure derivation behind `cap/0`: a quarter of the Finch pool, capped at the scheduler
+  count (each in-flight flush's `VACUUM INTO` occupies one) and never below 4.
+
+  Public and pure ONLY so it is testable on any machine. Driving it through
+  `System.schedulers_online/0` is not: on a small-core box `schedulers` is the binding term
+  at *every* pool size, so the cap is a flat 4 and "raising the pool raises the cap" is
+  unobservable — not because the derivation is wrong, but because that machine has no band
+  in which the pool is the binding term. That is exactly how `flush_storm_test`'s
+  `assert big > small` passed on an 18-scheduler dev box and failed on every CI runner from
+  `dc3d2a3` until this commit. Assert the derivation here, not through the live scheduler count.
+  """
+  @spec default_cap(pos_integer(), pos_integer()) :: pos_integer()
+  def default_cap(pool_size, schedulers) do
+    max(min(div(pool_size, 4), schedulers), 4)
   end
 
   @doc """
