@@ -19,6 +19,12 @@ defmodule Fathom.Bench.Gate do
     {:cold_open_p50_us, :higher_worse},
     {:cold_open_s3_p50_us, :higher_worse},
     {:warm_s3_shards_per_s, :lower_worse},
+    # The failover RTO pair. Opt-in like the two S3 metrics above (nil ⇒ skipped), and ungated for
+    # the same non-reason they were: nobody added them. Gating an opt-in metric costs nothing when
+    # it is unset and compares it when it is not, which is exactly how `cold_open_s3_p50_us` is
+    # already treated — there was no argument for splitting them.
+    {:failover_cold_s3_p50_us, :higher_worse},
+    {:failover_warm_s3_p50_us, :higher_worse},
     {:dir_resolve_p50_us, :higher_worse},
     # Renamed from `copy_rows_per_s` on 2026-07-31, when the copy bench moved from a
     # three-column toy table to `Fathom.Keystone`. Rows are far wider now, so the two numbers
@@ -34,7 +40,23 @@ defmodule Fathom.Bench.Gate do
     # `wire_rows_per_s` covers per-CELL encoding over keystone rows (blobs included) and is
     # the one that would have caught it.
     {:hrana_rt_us, :higher_worse},
-    {:wire_rows_per_s, :lower_worse}
+    {:wire_rows_per_s, :lower_worse},
+    # The write path and per-stream open, gated from 2026-08-02. Both were ADDED to the bench by
+    # review #41.1/#41.3 and verified to discriminate — but were never added HERE, so for a day
+    # they were measured, printed, written to perf_history.jsonl, and never compared. A metric the
+    # gate does not read cannot block anything; #41 is about the gate's blind spots, and recording
+    # a number is not closing one.
+    #
+    # Measured variance before gating, 9 same-host samples each (2026-08-02):
+    #   hrana_open_rt_us  380–413, 8.7% spread — TIGHTER than hrana_rt_us (11.7%), already gated.
+    #   flush_p50_us      8971–10456, 16.6% spread, but heavy-tailed rather than broadly noisy:
+    #                     7 of 9 sit within 3.3% (8971–9263) and two excursions reach ~+16%.
+    # Both therefore clear the project's 20% block threshold on observed range, flush_p50_us with
+    # the least headroom of any gated metric. If it starts false-blocking, the fix is MORE TRIALS
+    # to tighten the p50 (and a fresh series, per the same-topology rule) — not a looser threshold,
+    # which would just re-blind the write path.
+    {:hrana_open_rt_us, :higher_worse},
+    {:flush_p50_us, :higher_worse}
   ]
 
   @doc "The gated metrics and their regression direction."
