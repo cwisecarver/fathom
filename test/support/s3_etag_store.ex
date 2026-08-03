@@ -92,6 +92,13 @@ defmodule Fathom.Test.S3EtagStore do
       conn.method == "HEAD" ->
         head(conn, agent, key)
 
+      # ListObjectsV2, which `purge_shard/1` pages through. Without it the whole erase path was
+      # unreachable against this double, so the delimiter rule that stops purging `acme` from
+      # destroying `acme2` could only ever be asserted for Local — exactly the one-backend blind
+      # spot expert review 2026-08-01 #30 is about.
+      conn.method == "GET" and Map.get(query, "list-type") == "2" ->
+        list_objects(conn, agent, query)
+
       conn.method == "GET" ->
         get(conn, agent, key)
 
@@ -141,17 +148,40 @@ defmodule Fathom.Test.S3EtagStore do
 
   defp get(conn, agent, key) do
     conn = put_date(conn, agent)
+    if_none_match = Plug.Conn.get_req_header(conn, "if-none-match")
 
     case Agent.get(agent, &Map.get(&1.objects, key)) do
       nil ->
         Plug.Conn.send_resp(conn, 404, "")
 
       obj ->
-        conn
-        |> Plug.Conn.put_resp_header("etag", etag(obj))
-        |> put_meta_headers(obj)
-        |> Plug.Conn.send_resp(200, obj.body)
+        # Conditional GET. This double had no If-None-Match handling at all, so `pull_if_changed/3`
+        # — the warm-standby freshness check, and the entire reason a failover can promote a warm
+        # copy instead of re-transferring the body — could never take its 304 path here. Its S3
+        # coverage lived only behind `@tag :s3` (MinIO), which the default suite EXCLUDES, so the
+        # S3 side of that primitive was unreachable from `mix test`. Found by the shared storage
+        # contract; it is the same one-backend blind spot as expert review 2026-08-01 #30.
+        cond do
+          if_none_match == ["*"] ->
+            not_modified(conn, obj)
+
+          if_none_match != [] and hd(if_none_match) == etag(obj) ->
+            not_modified(conn, obj)
+
+          true ->
+            conn
+            |> Plug.Conn.put_resp_header("etag", etag(obj))
+            |> put_meta_headers(obj)
+            |> Plug.Conn.send_resp(200, obj.body)
+        end
     end
+  end
+
+  # A 304 carries the etag but NO body, which is the byte-transfer saving the warm path exists for.
+  defp not_modified(conn, obj) do
+    conn
+    |> Plug.Conn.put_resp_header("etag", etag(obj))
+    |> Plug.Conn.send_resp(304, "")
   end
 
   # The store's `Date` header (its own clock), when configured — models clock skew for #13.
@@ -347,6 +377,37 @@ defmodule Fathom.Test.S3EtagStore do
   defp delete_object(conn, agent, key) do
     Agent.update(agent, &%{&1 | objects: Map.delete(&1.objects, key)})
     Plug.Conn.send_resp(conn, 204, "")
+  end
+
+  # ListObjectsV2. Only `prefix` and the paging pair are modelled — that is all `purge_shard/1`
+  # and `stored_usage/0` send. Keys are returned SORTED so paging is deterministic; the page size
+  # is small on purpose so the continuation-token loop is actually exercised rather than always
+  # completing in one shot (a one-page fake would leave `next_token/1` untested forever).
+  @page_size 3
+
+  defp list_objects(conn, agent, query) do
+    prefix = Map.get(query, "prefix", "")
+    after_key = Map.get(query, "continuation-token")
+
+    keys =
+      agent
+      |> Agent.get(& &1.objects)
+      |> Map.keys()
+      |> Enum.filter(&String.starts_with?(&1, prefix))
+      |> Enum.sort()
+      |> then(fn ks -> if after_key, do: Enum.filter(ks, &(&1 > after_key)), else: ks end)
+
+    {page, rest} = Enum.split(keys, @page_size)
+
+    contents = Enum.map_join(page, "", fn k -> "<Contents><Key>#{k}</Key></Contents>" end)
+
+    next =
+      case {rest, List.last(page)} do
+        {[], _} -> ""
+        {_, last} -> "<NextContinuationToken>#{last}</NextContinuationToken>"
+      end
+
+    Plug.Conn.send_resp(conn, 200, "<ListBucketResult>#{contents}#{next}</ListBucketResult>")
   end
 
   # --- etag math (the point of this double) ---
