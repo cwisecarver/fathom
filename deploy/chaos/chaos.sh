@@ -130,8 +130,25 @@ val() { jq -r '.results[0].response.result.rows[0][0].value'; } # first row/col
 # bash arithmetic treats a bare word as a variable name, so `$(( n + null ))` aborts under set -u.
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
-seed() { # seed <shard>: kv table exists
+# seed <shard>: kv table exists AND is EMPTY.
+#
+# Every run starts fresh. This used to be `CREATE TABLE IF NOT EXISTS` alone, so a shard kept
+# whatever earlier runs left in it — and since the rig reuses shard files and the object store
+# across runs, that state is durable and silently carried forward.
+#
+# It is not cosmetic: `soak` compares rows it ACKED this run against rows STORED in the shard,
+# so a previous run's survivors counted as stored but never as acked and the headline came out
+# as NEGATIVE loss (`acked=1233 stored=1808 lost=-575`). Diagnosed by grouping on `seq`: every
+# value appeared exactly twice and never three times — one copy per run. `smoke` drifted the
+# same way, reporting rows=2, then 3, then 5 across successive runs.
+#
+# Truncating here rather than in each command means every caller (smoke, failover, pause-fence,
+# soak, warm-home, rebalance) gets a clean baseline by construction, and a command added later
+# cannot forget to. Every current caller seeds once at setup, never between steps, so this
+# cannot clear data a run is still relying on.
+seed() {
   sql "$1" "CREATE TABLE IF NOT EXISTS kv (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT, seq INTEGER)" >/dev/null
+  sql "$1" "DELETE FROM kv" >/dev/null 2>&1 || true
 }
 
 # -- commands -------------------------------------------------------------------
@@ -297,6 +314,7 @@ cmd_soak() {
   local secs=${1:-120} tenants=(t1 t2 t3 t4 t5 t6) t
   local ack_dir; ack_dir=$(mktemp -d)
   echo "soak: ${secs}s of writes across ${#tenants[@]} tenants with node churn (acks in $ack_dir)"
+  # seed/1 truncates, so acked (this run) and stored are directly comparable. See seed/1.
   for t in "${tenants[@]}"; do seed "$t"; : > "$ack_dir/$t"; done
 
   local stop_at=$(( $(now_ms) / 1000 + secs )) seq=0 churn_at=$(( $(now_ms) / 1000 + 20 ))
