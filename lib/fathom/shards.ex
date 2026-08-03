@@ -132,7 +132,8 @@ defmodule Fathom.Shards do
       # budget, so the steal is imminent. Hold the TAIL of the TTL window as latency instead of a
       # 503. A LIVE holder keeps renewing (its expiry stays ~ttl ahead > budget), so this never
       # holds for one.
-      crash_failover_hold_ms() > 0 and holder_stealable_soon?(owner, crash_failover_hold_ms()) ->
+      crash_failover_hold_ms() > 0 and
+          holder_stealable_soon?(shard_id, owner, crash_failover_hold_ms()) ->
         start_held_retry(shard_id, attempts, crash_failover_hold_ms(), :crash_wait, err)
 
       true ->
@@ -149,20 +150,31 @@ defmodule Fathom.Shards do
     backoff_held(shard_id, attempts, deadline, @initial_held_backoff_ms, err)
   end
 
-  # Whether the foreign holder's lease will become stealable within `budget` — its heartbeat expires
-  # (past the steal margin) inside the window. A crashed holder's heartbeat is frozen at crash+ttl,
-  # so as it ages this crosses into the budget (the crash-window TAIL); a LIVE holder keeps renewing,
-  # so its expiry stays ~ttl ahead of now and this is false (we never hold for a live owner). No
-  # heartbeat (legacy mode / cleared) ⇒ false: we can't cheaply tell dead-legacy from live-legacy, so
-  # surface the error rather than risk holding for a live legacy owner. Local clock is fine here — a
-  # skew just shifts the tail; the STEAL itself is fenced by acquire_lease's S3-Date check (#13).
-  defp holder_stealable_soon?(owner, budget) do
-    case Fathom.Shard.Storage.read_heartbeat(owner) do
-      {:ok, %{expires_at_ms: exp}} ->
-        exp + Fathom.Shard.Storage.steal_margin_ms() - System.system_time(:millisecond) <= budget
-
-      _ ->
-        false
+  # Whether the foreign holder's lease will become stealable within `budget`. A crashed holder's
+  # signals are frozen at crash+ttl, so as they age this crosses into the budget (the crash-window
+  # TAIL); a LIVE holder keeps renewing, so its stealable instant stays ~ttl ahead of now and this
+  # is false — we never hold for a live owner.
+  #
+  # ASKS THE BACKEND rather than re-deriving the rule. This used to read the heartbeat itself and
+  # compare `hb_exp + steal_margin` against the budget. Then #12 changed the rule under it: an
+  # owner is dead only when BOTH its heartbeat and its lock TTL have lapsed. The predictor and the
+  # performer disagreed from that point on, so a checkout whose holder had a lapsing heartbeat but
+  # a still-fresh lock would hold and retry for the WHOLE budget waiting for a steal that could
+  # not happen yet, then return the same error it would have returned immediately — the tenant
+  # pays `crash_failover_hold_ms` of latency for nothing. Bounded, and never wrong in the unsafe
+  # direction, but pure waste on an already-failing request.
+  #
+  # `lease_stealable_at/1` and `owner_live?/3` are derived from ONE function inside each backend,
+  # so this class of drift cannot recur: whatever teaches the steal a new condition teaches the
+  # prediction the same one.
+  #
+  # A different owner than the one our `acquire_lease` raced against ⇒ don't hold: the lock moved
+  # while we were asking, so the error we already have is the fresher answer. `:free` likewise —
+  # it is stealable NOW, so retrying immediately (the normal retry path) is right, not a hold.
+  defp holder_stealable_soon?(shard_id, owner, budget) do
+    case Fathom.Shard.Storage.lease_stealable_at(shard_id) do
+      {:held, ^owner, at} -> at - System.system_time(:millisecond) <= budget
+      _ -> false
     end
   rescue
     _ -> false

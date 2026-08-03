@@ -157,6 +157,18 @@ defmodule Fathom.Shard.Storage do
   @callback lease_holder(shard_id :: String.t()) ::
               {:held, String.t()} | :free | {:error, term()}
 
+  # Same read as `lease_holder/1`, but returns WHEN the hold becomes stealable rather than only
+  # whether it already is: `{:held, owner, stealable_at_ms}` on this caller's clock.
+  #
+  # Exists so a caller that wants to WAIT for an imminent steal can ask the backend that owns the
+  # liveness rule instead of re-deriving it. `Shards.holder_stealable_soon?/2` did re-derive it,
+  # from the heartbeat alone, and #12 then made `acquire_lease` require BOTH the heartbeat and the
+  # lock TTL to lapse — so the predictor and the performer disagreed, and a checkout could hold and
+  # retry its whole crash-failover budget waiting for a steal that could not happen yet. Both
+  # backends derive this and `owner_live?/3` from one function, so they cannot drift apart again.
+  @callback lease_stealable_at(shard_id :: String.t()) ::
+              {:held, String.t(), integer()} | :free | {:error, term()}
+
   # Per-node liveness heartbeat (one object per node, not per shard).
   @callback renew_heartbeat(owner :: String.t(), ttl_ms :: pos_integer()) ::
               {:ok, heartbeat()} | {:error, term()}
@@ -367,6 +379,13 @@ defmodule Fathom.Shard.Storage do
   """
   @spec lease_holder(String.t()) :: {:held, String.t()} | :free | {:error, term()}
   def lease_holder(shard_id), do: backend().lease_holder(shard_id)
+
+  @doc """
+  When `shard_id`'s current hold becomes stealable, in `now_ms/0` terms. See the callback.
+  """
+  @spec lease_stealable_at(String.t()) ::
+          {:held, String.t(), integer()} | :free | {:error, term()}
+  def lease_stealable_at(shard_id), do: backend().lease_stealable_at(shard_id)
 
   @doc """
   Renews this node's liveness heartbeat (`owner`), extending its expiry by `ttl_ms`.

@@ -477,52 +477,65 @@ defmodule Fathom.Shard.Storage.Local do
   # steal_margin absorbs inter-node clock skew (see Storage.steal_margin_ms/0): only
   # steal once the heartbeat is expired by more than the margin.
   defp owner_live?(other, now, lock_expires_at_ms) do
+    case stealable_at(other, lock_expires_at_ms) do
+      {:ok, at} -> if now <= at, do: :live, else: :dead
+      {:error, _} = error -> error
+    end
+  end
+
+  # The instant `other`'s hold becomes stealable. THE single source of the liveness rule — both
+  # `owner_live?/3` (is now past it) and `lease_stealable_at/1` (how long until it) derive from
+  # this, so a caller predicting a steal can never disagree with the code performing it.
+  #
+  # That divergence was a real bug: `Shards.holder_stealable_soon?/2` predicted from the heartbeat
+  # ALONE while `acquire_lease` required both signals lapsed (#12), so a checkout could hold and
+  # retry its whole crash-failover budget waiting for a steal that could not happen yet.
+  defp stealable_at(other, lock_expires_at_ms) do
     margin = Storage.steal_margin_ms()
 
     case Storage.read_heartbeat(other) do
       # Owner-match verification (expert review round-2 #3), mirroring the S3 backend.
+      #
+      # `max/2` is #12: a lapsed heartbeat alone does NOT make the owner dead, its lock TTL still
+      # counts. Taking only the heartbeat here was exactly backwards from the `:not_found` branch
+      # below, which DOES fall back to the lock TTL — a stale-but-present heartbeat was strictly
+      # WORSE than an absent one. Fixed in S3 (`s3.ex`) and missed here until #30's legacy-mode
+      # test found it; `SHARD_STORAGE=local` is a supported production selection.
       {:ok, %{owner: ^other, expires_at_ms: exp}} ->
-        cond do
-          now <= exp + margin ->
-            :live
+        {:ok, max(exp, lock_expires_at_ms) + margin}
 
-          # A lapsed heartbeat alone does NOT make the owner dead — its lock TTL still counts
-          # (expert review 2026-08-01 #12). This branch returned `:dead` unconditionally, which
-          # is exactly backwards from the `:not_found` branch below, which DOES fall back to the
-          # lock TTL: a stale-but-present heartbeat was strictly WORSE than an absent one.
-          #
-          # #12 was fixed in the S3 backend (`s3.ex:1602`) and MISSED here, so the two backends
-          # disagreed about when an owner is dead. `SHARD_STORAGE=local` is a supported
-          # production selection (see `file_etag/1` above re local-NVMe), so this was live, not
-          # merely a test-double divergence: one Heartbeat process crash — which deliberately
-          # leaves its object behind — made this node's entire keyspace slice instantly stealable
-          # while it was healthy, serving, and renewing every lock it held.
-          #
-          # Found by the legacy-mode end-to-end test written for #30 item (3), which is precisely
-          # the "one backend's bug is invisible to mix test" gap #30 is about.
-          now <= lock_expires_at_ms + margin ->
-            :live
-
-          true ->
-            :dead
-        end
-
+      # A heartbeat that isn't `other`'s is no signal — fall back to the lock, same as :not_found.
       {:ok, _mismatch} ->
-        if now <= lock_expires_at_ms + margin, do: :live, else: :dead
+        {:ok, lock_expires_at_ms + margin}
 
       # No heartbeat object at all (`heartbeat_server: false` legacy mode, or the owner's
       # heartbeat was cleared): fall back to the lock's OWN TTL for liveness (finding #11), so
       # a live owner renewing its lock per-shard isn't instantly stolen. Heartbeat stays primary.
       :not_found ->
-        cond do
-          # This node's PROVEN-DEAD previous incarnation (round-2 #34: heartbeat
-          # verified stale/frozen and cleared — see Fathom.Shard.Heartbeat): its
-          # recently-renewed locks would otherwise block the restarted node for
-          # TTL+margin through the fallback below. Exact owner match only.
-          Storage.incarnation_dead?(other) -> :dead
-          now <= lock_expires_at_ms + margin -> :live
-          true -> :dead
+        # This node's PROVEN-DEAD previous incarnation (round-2 #34: heartbeat verified
+        # stale/frozen and cleared — see Fathom.Shard.Heartbeat): its recently-renewed locks
+        # would otherwise block the restarted node for TTL+margin. Exact owner match only.
+        # Stealable at 0 ⇒ stealable now, and `soon?` reads it as such.
+        if Storage.incarnation_dead?(other),
+          do: {:ok, 0},
+          else: {:ok, lock_expires_at_ms + margin}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @impl true
+  def lease_stealable_at(shard_id) do
+    case read_lock(shard_id) do
+      {:ok, %{owner: other, expires_at_ms: lock_exp}} ->
+        case stealable_at(other, lock_exp) do
+          {:ok, at} -> {:held, other, at}
+          {:error, reason} -> {:error, reason}
         end
+
+      :enoent ->
+        :free
 
       {:error, reason} ->
         {:error, reason}

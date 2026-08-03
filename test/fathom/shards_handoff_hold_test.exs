@@ -189,6 +189,81 @@ defmodule Fathom.ShardsHandoffHoldTest do
     assert us < 2_000_000, "a live holder must not enter the crash-hold budget (#{us} us)"
   end
 
+  # The crash-hold prediction must agree with what acquire_lease will actually DO.
+  #
+  # `holder_stealable_soon?` used to read the heartbeat by itself and compare
+  # `hb_exp + steal_margin` against the budget. #12 then made a steal require BOTH the heartbeat
+  # and the lock TTL to have lapsed, and nothing updated the predictor — so for a holder with a
+  # lapsing heartbeat but a still-fresh lock, the two disagreed: the checkout held and retried for
+  # the WHOLE budget waiting for a steal that could not happen, then returned the same error it
+  # would have returned immediately. Bounded, never unsafe, and pure latency on a failing request.
+  #
+  # The discriminator is the `:crash_wait` telemetry event, which `start_held_retry/5` emits only
+  # when it decides to hold — cleaner than timing, and it says WHY the wait happened.
+  test "a holder whose heartbeat lapses but whose lock TTL does not is NOT waited for",
+       %{shard: shard} do
+    Application.put_env(:fathom, :crash_failover_hold_ms, 5_000)
+    Application.put_env(:fathom, :steal_margin_ms, 100)
+    seed_durable(shard)
+
+    test_pid = self()
+    handler = "crashwait-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shards, :crash_wait],
+      fn _e, _m, meta, _ -> send(test_pid, {:crash_wait, meta}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    # Heartbeat expiring in ~200ms — well inside the 5s budget, so the OLD predictor says
+    # "stealable soon". The LOCK runs 60s out, so under #12 the owner is not dead until then and
+    # acquire_lease will refuse for the whole window.
+    put_foreign_lock(shard, "halfdead@node#1", 60_000)
+    Storage.renew_heartbeat("halfdead@node#1", 200)
+
+    {us, result} = :timer.tc(fn -> Shards.checkout(shard) end)
+
+    assert {:error, {:shard_held, "halfdead@node#1"}} = result
+
+    refute_receive {:crash_wait, %{shard_id: ^shard}}, 100
+
+    assert us < 2_000_000,
+           "held for #{div(us, 1000)}ms waiting on a steal the lock TTL forbids for another 60s"
+  end
+
+  test "a holder with BOTH signals lapsing soon is still waited for", %{shard: shard} do
+    # The other side: the fix must not have turned the crash-hold off entirely. This is the same
+    # shape as the #21 test above, asserted through the telemetry event so the two are directly
+    # comparable.
+    Application.put_env(:fathom, :crash_failover_hold_ms, 5_000)
+    Application.put_env(:fathom, :steal_margin_ms, 100)
+    seed_durable(shard)
+
+    test_pid = self()
+    handler = "crashwait2-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shards, :crash_wait],
+      fn _e, _m, meta, _ -> send(test_pid, {:crash_wait, meta}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    put_foreign_lock(shard, "dead@node#2", 200)
+    Storage.renew_heartbeat("dead@node#2", 200)
+
+    assert {:ok, pid, ref, _path} = Shards.checkout(shard)
+    assert_received {:crash_wait, %{shard_id: ^shard}}
+
+    Fathom.Shard.checkin(pid, ref)
+    drain_and_wait(shard)
+  end
+
   defp local_dir, do: Fathom.Shard.data_dir()
   defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

@@ -1432,6 +1432,29 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   @impl true
+  def lease_stealable_at(shard_id) do
+    now = Storage.now_ms()
+
+    case get_lock(shard_id) do
+      {:ok, %{owner: other, expires_at_ms: lock_exp}, _etag} ->
+        case stealable_at(other, now, lock_exp) do
+          # Normalise onto the CALLER's clock. `stealable_at/3` compares against S3's Date when
+          # the store sends one (#13), so the instant it returns is on that clock — handing it
+          # back raw would have the caller diff it against `System.system_time/1` and bake the
+          # skew straight into the answer, which is the thing #13 exists to keep out.
+          {:ok, at, ref_now} -> {:held, other, at + (now - ref_now)}
+          {:error, reason} -> {:error, reason}
+        end
+
+      :not_found ->
+        :free
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @impl true
   def acquire_lease(shard_id, owner, ttl_ms) do
     now = Storage.now_ms()
 
@@ -1562,6 +1585,23 @@ defmodule Fathom.Shard.Storage.S3 do
   # steal_margin absorbs inter-node clock skew (see Storage.steal_margin_ms/0): only
   # steal once the heartbeat is expired by more than the margin.
   defp owner_live?(other, now, lock_expires_at_ms) do
+    case stealable_at(other, now, lock_expires_at_ms) do
+      {:ok, at, ref_now} -> if ref_now <= at, do: :live, else: :dead
+      {:error, _} = error -> error
+    end
+  end
+
+  # The instant `other`'s hold becomes stealable, plus the reference clock it should be compared
+  # against (S3's own Date when the store sent one — see the skew reasoning below). THE single
+  # source of the liveness rule: both `owner_live?/3` (is ref_now past it) and
+  # `lease_stealable_at/1` (how long until it) derive from this, so a caller PREDICTING a steal
+  # cannot disagree with the code PERFORMING it.
+  #
+  # That divergence was a real bug: `Shards.holder_stealable_soon?/2` predicted from the heartbeat
+  # ALONE while this required both signals lapsed (#12), so a checkout could hold and retry its
+  # whole crash-failover budget waiting for a steal that could not happen yet, then return the
+  # error it would have returned immediately.
+  defp stealable_at(other, now, lock_expires_at_ms) do
     margin = Storage.steal_margin_ms()
 
     case cached_read_heartbeat_dated(other) do
@@ -1577,39 +1617,26 @@ defmodule Fathom.Shard.Storage.S3 do
         # `now` only when the store returned no Date. (Owner-clock skew — the owner stamping `exp`
         # wrong — is unaddressed here; the frozen-vs-advancing double-read is the follow-up for it.)
         maybe_emit_skew(other, now, s3_now)
-        ref_now = s3_now || now
 
-        cond do
-          ref_now <= exp + margin ->
-            :live
-
-          # The heartbeat lapsed — but that alone does not make the OWNER dead (expert review
-          # 2026-08-01 #12). This branch used to return :dead unconditionally, never consulting
-          # the lock's TTL even if the owner had renewed it seconds ago. That is exactly
-          # backwards from the `:not_found` branch below, which DOES fall back to the lock TTL.
-          #
-          # And the asymmetry is reachable by design: when the Heartbeat GenServer dies
-          # abnormally it deliberately LEAVES its object behind, and coordinators degrade to the
-          # legacy per-shard renew fence — a node that is healthy, serving, and renewing every
-          # lock it holds. Under the old logic a single process failure (or a
-          # `heartbeat_server: false` config migration) made that node's ENTIRE keyspace slice
-          # instantly stealable, with per-shard loss up to a flush interval and a `.fenced.<ts>`
-          # quarantine each, while it kept serving. A stale-but-present object was strictly
-          # WORSE than an absent one.
-          #
-          # An owner is dead only when BOTH its heartbeat and its lock TTL have lapsed. Free:
-          # the lock was already read.
-          (s3_now || now) <= lock_expires_at_ms + margin ->
-            :live
-
-          true ->
-            :dead
-        end
+        # `max/2` is #12: the heartbeat lapsing alone does not make the OWNER dead, never
+        # consulting the lock's TTL even if the owner renewed it seconds ago. That was exactly
+        # backwards from the `:not_found` branch below, which DOES fall back to the lock TTL.
+        #
+        # And the asymmetry is reachable by design: when the Heartbeat GenServer dies abnormally
+        # it deliberately LEAVES its object behind, and coordinators degrade to the legacy
+        # per-shard renew fence — a node that is healthy, serving, and renewing every lock it
+        # holds. Under the old logic a single process failure (or a `heartbeat_server: false`
+        # config migration) made that node's ENTIRE keyspace slice instantly stealable, with
+        # per-shard loss up to a flush interval and a `.fenced.<ts>` quarantine each, while it
+        # kept serving. A stale-but-present object was strictly WORSE than an absent one.
+        #
+        # An owner is dead only when BOTH its heartbeat and its lock TTL have lapsed.
+        {:ok, max(exp, lock_expires_at_ms) + margin, s3_now || now}
 
       # A heartbeat object that isn't `other`'s — treat as no signal and fall back to the
       # lock's own TTL, same as :not_found.
       {:ok, _mismatch, s3_now} ->
-        if (s3_now || now) <= lock_expires_at_ms + margin, do: :live, else: :dead
+        {:ok, lock_expires_at_ms + margin, s3_now || now}
 
       # No heartbeat object at all (`heartbeat_server: false` legacy mode, or the owner's
       # heartbeat was cleared): fall back to the lock's OWN TTL for liveness (finding #11).
@@ -1618,13 +1645,11 @@ defmodule Fathom.Shard.Storage.S3 do
       # pre-heartbeat lease-TTL fence, applied only when there is no heartbeat to consult.
       # Exception (round-2 #34): this node's PROVEN-DEAD previous incarnation (heartbeat
       # verified stale/frozen and cleared) — its recently-renewed locks must not block
-      # the restarted node for TTL+margin. Exact owner match only.
+      # the restarted node for TTL+margin. Exact owner match only. Stealable at 0 ⇒ now.
       {:not_found, s3_now} ->
-        cond do
-          Storage.incarnation_dead?(other) -> :dead
-          (s3_now || now) <= lock_expires_at_ms + margin -> :live
-          true -> :dead
-        end
+        if Storage.incarnation_dead?(other),
+          do: {:ok, 0, s3_now || now},
+          else: {:ok, lock_expires_at_ms + margin, s3_now || now}
 
       {:error, reason} ->
         {:error, reason}

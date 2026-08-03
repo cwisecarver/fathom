@@ -219,6 +219,8 @@ defmodule Fathom.Test.FaultyStorage do
   @impl true
   def lease_holder(shard_id), do: Local.lease_holder(shard_id)
   @impl true
+  def lease_stealable_at(shard_id), do: Local.lease_stealable_at(shard_id)
+  @impl true
   def renew_heartbeat(owner, ttl_ms), do: Local.renew_heartbeat(owner, ttl_ms)
   @impl true
   def clear_heartbeat(owner), do: Local.clear_heartbeat(owner)

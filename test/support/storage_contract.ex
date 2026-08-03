@@ -205,6 +205,44 @@ defmodule Fathom.Test.StorageContract do
           assert {:error, {:held, "a@node#1"}} = @backend.acquire_lease(id, "b@node#2", 30_000)
         end
 
+        test "lease_stealable_at agrees with lease_holder, in both directions" do
+          # THE invariant that stops the class of drift this callback was added for: a caller
+          # PREDICTING a steal must not disagree with the code PERFORMING it. `lease_holder/1`
+          # says "stealable now"; `lease_stealable_at/1` says "stealable at T". They are the same
+          # question, so held ⇔ T is still in the future — for every backend, by construction.
+          id = sid("agree")
+
+          assert :free = @backend.lease_holder(id)
+          assert :free = @backend.lease_stealable_at(id)
+
+          {:ok, lease} = @backend.acquire_lease(id, "a@node#1", 30_000)
+
+          assert {:held, "a@node#1"} = @backend.lease_holder(id)
+          assert {:held, "a@node#1", at} = @backend.lease_stealable_at(id)
+
+          assert at > System.system_time(:millisecond),
+                 "lease_holder reports the shard HELD while lease_stealable_at puts the steal " <>
+                   "in the past — a caller would hold for a steal that has already happened, " <>
+                   "or refuse one that is available"
+
+          :ok = @backend.release_lease(id, lease)
+
+          assert :free = @backend.lease_holder(id)
+          assert :free = @backend.lease_stealable_at(id)
+        end
+
+        test "a live owner's stealable instant is at least its lease TTL out" do
+          # Sanity on the VALUE, not just its sign: a fresh 30s lease cannot be stealable in the
+          # next second, or the crash-hold would wait for every healthy owner.
+          id = sid("horizon")
+          {:ok, _} = @backend.acquire_lease(id, "a@node#1", 30_000)
+
+          assert {:held, _owner, at} = @backend.lease_stealable_at(id)
+
+          assert at - System.system_time(:millisecond) > 25_000,
+                 "a freshly-leased shard reads as stealable far too soon"
+        end
+
         test "check_lease is :ok while held and :superseded once the epoch moves" do
           id = sid("fenced")
           {:ok, lease} = @backend.acquire_lease(id, "a@node#1", 30_000)
