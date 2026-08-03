@@ -51,12 +51,18 @@ defmodule Fathom.ShardsHandoffHoldTest do
   defp lock_file(shard), do: Path.join(remote_dir(), "#{shard}.lock")
   defp now_ms, do: System.system_time(:millisecond)
 
-  defp put_live_foreign_lock(shard, owner) do
+  defp put_live_foreign_lock(shard, owner), do: put_foreign_lock(shard, owner, 60_000)
+
+  defp put_foreign_lock(shard, owner, expires_in_ms) do
     File.mkdir_p!(remote_dir())
 
     File.write!(
       lock_file(shard),
-      Jason.encode!(%{"owner" => owner, "epoch" => 7, "expires_at_ms" => now_ms() + 60_000})
+      Jason.encode!(%{
+        "owner" => owner,
+        "epoch" => 7,
+        "expires_at_ms" => now_ms() + expires_in_ms
+      })
     )
   end
 
@@ -147,7 +153,15 @@ defmodule Fathom.ShardsHandoffHoldTest do
 
     # A hard-crashed owner: its heartbeat OBJECT survives (not cleared) but is frozen, expiring in
     # ~200ms — so the steal becomes possible ~300ms out (exp + margin), inside the 5s budget.
-    put_live_foreign_lock(shard, "dead@node#1")
+    #
+    # Its LOCK expires on the same horizon, because an owner is dead only when BOTH have lapsed
+    # (expert review 2026-08-01 #12). This used to write a 60s lock and still expect the steal,
+    # which only worked because #12 was unfixed in the Local backend. 60s was never realistic
+    # anyway: in heartbeat mode coordinators do NO per-shard renewal, so a crashed owner's lock
+    # simply runs out `shard_lease_ttl_ms` after ITS acquire — for any shard open longer than the
+    # TTL the lock has already lapsed and the heartbeat is the binding signal, which is the case
+    # this test is about.
+    put_foreign_lock(shard, "dead@node#1", 200)
     Storage.renew_heartbeat("dead@node#1", 200)
 
     # Pre-#21 this errored immediately (retry_checkout? excludes :held). Now it HOLDS + retries and

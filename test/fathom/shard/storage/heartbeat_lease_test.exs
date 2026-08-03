@@ -1,10 +1,20 @@
 defmodule Fathom.Shard.Storage.HeartbeatLeaseTest do
   @moduledoc """
-  Storage-level semantics for the node-heartbeat liveness model (the F1 fix): a
-  shard's owner is live iff its per-node *heartbeat* is fresh — NOT the lock's own
-  TTL. So `acquire_lease/3` consults the current owner's heartbeat to decide
-  held-vs-steal, and fails closed when it can't read it. Exercised against the
-  Local backend (the faithful double for the S3 fence).
+  Storage-level semantics for the node-heartbeat liveness model (the F1 fix): the per-node
+  *heartbeat* is the PRIMARY liveness signal, so `acquire_lease/3` consults the current owner's
+  heartbeat to decide held-vs-steal, and fails closed when it can't read it. Exercised against
+  the Local backend (the faithful double for the S3 fence).
+
+  This moduledoc used to say the owner is live iff the heartbeat is fresh, "NOT the lock's own
+  TTL". That is no longer true and was the bug: an owner is dead only when **both** its heartbeat
+  and its lock TTL have lapsed (expert review 2026-08-01 #12). A stale-but-present heartbeat was
+  otherwise strictly WORSE than an absent one — the `:not_found` branch already fell back to the
+  lock TTL — so one Heartbeat process crash, which deliberately leaves its object behind, made a
+  healthy node's entire keyspace slice instantly stealable while it kept serving.
+
+  #12 was fixed in the S3 backend and MISSED in Local; the tests below pinned the Local defect,
+  which is how it survived. They now expire the lock alongside the heartbeat where they mean
+  "genuinely dead", and the `#12` describe block pins the invariant itself.
   """
   use ExUnit.Case, async: false
 
@@ -125,18 +135,70 @@ defmodule Fathom.Shard.Storage.HeartbeatLeaseTest do
     assert Local.check_lease(shard, %{owner: a, epoch: 1}) == :ok
   end
 
-  test "a heartbeat expired past the steal margin is stealable", %{
+  test "a heartbeat AND lock TTL both expired past the steal margin is stealable", %{
     shard: shard,
     dir: dir,
     a: a,
     b: b
   } do
     assert {:ok, %{epoch: 1}} = Local.acquire_lease(shard, a, @ttl)
-    # a's heartbeat lapsed well PAST the clock-skew steal margin — genuinely dead.
+    # a is genuinely dead: BOTH signals lapsed well past the clock-skew steal margin.
+    #
+    # This test previously expired only the heartbeat and still asserted a steal — it pinned the
+    # pre-#12 Local behaviour, where a lapsed heartbeat alone was enough. Expiring the lock too
+    # is what "genuinely dead" means now; the #12 block below pins the half that must NOT steal.
     past = System.system_time(:millisecond) - Storage.steal_margin_ms() - 1_000
     write_heartbeat(dir, a, past)
+    write_lock(dir, shard, a, 1, past)
 
     assert {:ok, %{owner: ^b, epoch: 2}} = Local.acquire_lease(shard, b, @ttl)
+  end
+
+  describe "#12 — a lapsed heartbeat alone is not death" do
+    test "stale heartbeat + fresh lock TTL is HELD, not stolen", %{
+      shard: shard,
+      dir: dir,
+      a: a,
+      b: b
+    } do
+      # The reachable-by-design case: the Heartbeat GenServer died abnormally and deliberately
+      # left its object behind, while the node is healthy and renewing every lock it holds.
+      past = System.system_time(:millisecond) - Storage.steal_margin_ms() - 1_000
+      write_heartbeat(dir, a, past)
+      write_lock(dir, shard, a, 3, System.system_time(:millisecond) + @ttl)
+
+      assert {:error, {:held, ^a}} = Local.acquire_lease(shard, b, @ttl),
+             "a stale heartbeat alone made a lock-renewing owner stealable — one process crash " <>
+               "would hand away that node's entire keyspace slice while it kept serving"
+
+      # And nothing moved: a still holds {a, 3}.
+      assert Local.check_lease(shard, %{owner: a, epoch: 3}) == :ok
+    end
+
+    test "a stale-but-present heartbeat is no worse than an absent one", %{
+      shard: shard,
+      dir: dir,
+      a: a,
+      b: b
+    } do
+      # The asymmetry that made #12 a bug: the `:not_found` branch already fell back to the lock
+      # TTL, so a node was SAFER having no heartbeat object than a stale one. Pin that the two
+      # now agree.
+      fresh = System.system_time(:millisecond) + @ttl
+      write_lock(dir, shard, a, 1, fresh)
+
+      assert Local.read_heartbeat(a) == :not_found
+      assert {:error, {:held, ^a}} = Local.acquire_lease(shard, b, @ttl)
+
+      write_heartbeat(
+        dir,
+        a,
+        System.system_time(:millisecond) - Storage.steal_margin_ms() - 1_000
+      )
+
+      assert {:error, {:held, ^a}} = Local.acquire_lease(shard, b, @ttl),
+             "adding a stale heartbeat made a protected owner stealable"
+    end
   end
 
   test "a heartbeat expired WITHIN the steal margin is not stolen (clock-skew guard)",
@@ -170,10 +232,13 @@ defmodule Fathom.Shard.Storage.HeartbeatLeaseTest do
     # The new boot is a foreign owner — the live zombie's lock is NOT reclaimable.
     assert {:error, {:held, ^inc1}} = Local.acquire_lease(shard, inc2, @ttl)
 
-    # The zombie dies (heartbeat stale past the margin): the new incarnation STEALS,
-    # bumping the epoch — pre-fix this was a silent same-epoch reclaim at epoch 3.
+    # The zombie dies — BOTH its heartbeat and its lock TTL lapse (#12; this previously staled
+    # only the heartbeat, pinning the pre-#12 Local behaviour). The point of this test is the
+    # EPOCH BUMP, which is unchanged: the new incarnation steals at 4, never a silent
+    # same-epoch reclaim at 3.
     past = System.system_time(:millisecond) - Storage.steal_margin_ms() - 1_000
     write_heartbeat(dir, inc1, past)
+    write_lock(dir, shard, inc1, 3, past)
 
     assert {:ok, %{owner: ^inc2, epoch: 4}} = Local.acquire_lease(shard, inc2, @ttl)
   end

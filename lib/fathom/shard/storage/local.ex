@@ -482,7 +482,30 @@ defmodule Fathom.Shard.Storage.Local do
     case Storage.read_heartbeat(other) do
       # Owner-match verification (expert review round-2 #3), mirroring the S3 backend.
       {:ok, %{owner: ^other, expires_at_ms: exp}} ->
-        if now <= exp + margin, do: :live, else: :dead
+        cond do
+          now <= exp + margin ->
+            :live
+
+          # A lapsed heartbeat alone does NOT make the owner dead — its lock TTL still counts
+          # (expert review 2026-08-01 #12). This branch returned `:dead` unconditionally, which
+          # is exactly backwards from the `:not_found` branch below, which DOES fall back to the
+          # lock TTL: a stale-but-present heartbeat was strictly WORSE than an absent one.
+          #
+          # #12 was fixed in the S3 backend (`s3.ex:1602`) and MISSED here, so the two backends
+          # disagreed about when an owner is dead. `SHARD_STORAGE=local` is a supported
+          # production selection (see `file_etag/1` above re local-NVMe), so this was live, not
+          # merely a test-double divergence: one Heartbeat process crash — which deliberately
+          # leaves its object behind — made this node's entire keyspace slice instantly stealable
+          # while it was healthy, serving, and renewing every lock it held.
+          #
+          # Found by the legacy-mode end-to-end test written for #30 item (3), which is precisely
+          # the "one backend's bug is invisible to mix test" gap #30 is about.
+          now <= lock_expires_at_ms + margin ->
+            :live
+
+          true ->
+            :dead
+        end
 
       {:ok, _mismatch} ->
         if now <= lock_expires_at_ms + margin, do: :live, else: :dead

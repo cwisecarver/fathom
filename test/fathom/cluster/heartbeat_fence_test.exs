@@ -171,7 +171,8 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
   # write path consulted that, so the coordinator kept ACKing writes that are quarantined on
   # partition-heal (loss window = the partition duration, not the flush interval the RPO contract
   # advertises). The coordinator now publishes a write-fence once its heartbeat has been not-valid
-  # for ttl + steal_margin ("provably stealable"); ShardExecutor refuses writes with 503
+  # for margin + steal_margin ("provably stealable" — #13 corrected this from ttl + steal_margin,
+  # which double-counted the margin; the describe block at the bottom pins the value); ShardExecutor refuses writes with 503
   # FILO_STALE_LEASE while READS still serve from the local copy, and a reconfirmed fence lifts it.
   test "a provably-stealable node fences writes (reads continue) and lifts it on recovery (#3)",
        %{shard: shard, hb: hb} do
@@ -236,6 +237,99 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
 
       # And a write is accepted again.
       assert {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('c')"))
+
+      :ok = ShardExecutor.close(conn)
+    end)
+  end
+
+  # WHEN the fence trips, not just that it does (expert review 2026-08-01 #30 item 5).
+  #
+  # The test above presets `not_valid_since` an HOUR back, so it fires under any plausible
+  # threshold — #13's bug (waiting `ttl + steal_margin` from a clock that already started early)
+  # passed it unchanged. #13's whole content is the threshold value, so it needs an assertion
+  # that can tell the two apart.
+  #
+  # At the defaults that is: margin = ttl/3 = 10s, steal_margin = 5s.
+  #   correct  margin + steal = 15s
+  #   #13 bug  ttl    + steal = 35s
+  # An age of 20s sits between them: fenced under the fix, NOT fenced under the bug.
+  describe "#13 — the write fence trips at margin + steal_margin, not ttl + steal_margin" do
+    test "the threshold is strictly tighter than the pre-#13 one" do
+      # Pure, and the cheapest statement of the bug: the clock that feeds this already started
+      # early by exactly `margin`, so adding a full `ttl` double-counts it.
+      # margin is ttl/3 by construction (heartbeat.ex:219), so ttl is 3 * margin — derived rather
+      # than hardcoded, so this keeps meaning the same thing if the ratio is ever retuned.
+      margin = Heartbeat.margin_ms()
+      correct = margin + Fathom.Shard.Storage.steal_margin_ms()
+      pre_13 = margin * 3 + Fathom.Shard.Storage.steal_margin_ms()
+
+      assert correct < pre_13,
+             "the fence would publish after a peer may already have stolen the shard"
+    end
+
+    test "an age between the two thresholds fences", %{shard: shard, hb: hb} do
+      assert_fence_at(shard, hb, 20_000, :fenced)
+    end
+
+    test "an age below the correct threshold does NOT fence", %{shard: shard, hb: hb} do
+      # The other side of the boundary — without this, "fence immediately, always" would pass.
+      assert_fence_at(shard, hb, 5_000, :not_fenced)
+    end
+  end
+
+  # Open a shard, force the heartbeat not-valid, backdate `not_valid_since` by `age_ms`, run one
+  # fence verdict, and report whether the write-fence published.
+  #
+  # The verdict is ASYNC: `:durability_flush` spawns the flush task, and `note_not_valid/1` runs
+  # when its `:fence_skip` result comes back through `handle_info({ref, result}, %{flush_task:
+  # ...})`. So a `:sys.get_state` right after the send syncs only the spawn, not the decision —
+  # the telemetry event is the real signal, which is why the test above uses it too.
+  defp assert_fence_at(shard, hb, age_ms, expected) do
+    Application.put_env(:fathom, :fence_writes_when_stealable, true)
+    on_exit(fn -> Application.delete_env(:fathom, :fence_writes_when_stealable) end)
+
+    test_pid = self()
+    handler = "fencetiming-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shard, :write_fenced],
+      fn _e, _m, meta, _ -> send(test_pid, {:write_fenced, meta}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    capture_log(fn ->
+      {:ok, conn} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('a')"))
+      {:ok, coordinator} = Shards.ensure(shard)
+
+      :sys.replace_state(hb, fn s ->
+        forged = %{s | mono_deadline_ms: System.monotonic_time(:millisecond) - 1_000}
+        Heartbeat.publish_status(forged)
+        forged
+      end)
+
+      :sys.replace_state(coordinator, fn s ->
+        %{s | not_valid_since: System.monotonic_time(:millisecond) - age_ms}
+      end)
+
+      send(coordinator, :durability_flush)
+
+      case expected do
+        :fenced ->
+          assert_receive {:write_fenced, %{shard_id: ^shard}}, 2_000
+          assert WriteFence.fenced?(shard)
+
+        :not_fenced ->
+          refute_receive {:write_fenced, %{shard_id: ^shard}}, 1_000
+
+          refute WriteFence.fenced?(shard),
+                 "fenced #{age_ms}ms in, before the shard is provably stealable — writes are " <>
+                   "being refused while this node is still the legitimate owner"
+      end
 
       :ok = ShardExecutor.close(conn)
     end)

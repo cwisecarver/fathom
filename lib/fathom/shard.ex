@@ -2329,10 +2329,10 @@ defmodule Fathom.Shard do
   # --- write-fence circuit-breaker (expert review 2026-07-19 #3) ---
 
   # The periodic fence came back not-valid (heartbeat stale — the cut-from-storage symptom). Record
-  # WHEN that started; once it has held for ttl + steal_margin — the point past which a peer may
+  # WHEN that started; once it has held for `stealable_after_ms/1` — the point past which a peer may
   # legitimately have stolen the shard — publish the write-fence so ShardExecutor refuses NEW writes
   # (reads keep serving from the local copy). This collapses the loss window from the whole partition
-  # duration to ~ttl + steal_margin: without it the coordinator keeps ACKing writes for the entire
+  # duration to ~ttl + steal_margin measured from the last renewal: without it the coordinator keeps ACKing writes for the entire
   # partition, then self-fences on heal and quarantines every one of them. Gated by
   # `:fence_writes_when_stealable` (default: prod) — off, the flag is never set, so the executor's
   # lock-free read is always false and nothing is refused.
@@ -2347,7 +2347,7 @@ defmodule Fathom.Shard do
         :telemetry.execute([:fathom, :shard, :write_fenced], %{count: 1}, %{shard_id: state.id})
 
         Logger.warning(
-          "shard #{state.id}: heartbeat not valid for > ttl+steal_margin — fencing writes (node " <>
+          "shard #{state.id}: heartbeat not valid for > margin+steal_margin — fencing writes (node " <>
             "provably stealable); reads still serve. Writes 503 FILO_STALE_LEASE until ownership " <>
             "is reconfirmed."
         )
