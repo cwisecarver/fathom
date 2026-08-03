@@ -975,14 +975,44 @@ defmodule Fathom.Shard.Storage.S3 do
 
   # --- versioned copies (blue/green migration) ---
 
+  # Refuse a server-side copy whose SOURCE is a steal sentinel (expert review 2026-08-01 #25).
+  #
+  # `touch_object/2` plants a sentinel AT THE DATA KEY on a steal of a never-flushed shard, and
+  # CopyObject's default metadata directive is COPY — so every copy primitive would duplicate the
+  # placeholder verbatim and report `:ok`. That is the same root cause as #24 (a sentinel read as
+  # real bytes) on a different set of consumers, and #24's rating is why this one was deferred:
+  # the panel called the trigger "Low likelihood (needs a steal of a never-flushed shard)" and the
+  # chaos rig hit exactly that state THREE TIMES in one 180s soak.
+  #
+  # The sharpest case is `retain/2`, which is the migration's PRE-MIGRATION BACKUP
+  # (`Migrator.ShardMigration`): a sentinel source meant retain copied nothing, returned `:ok`, and
+  # the migration proceeded believing it had a rollback.
+  #
+  # Only the sentinel is intercepted. A genuinely MISSING source (404) still falls through to the
+  # copy and keeps its existing error shape, because that shape is load-bearing —
+  # `ShardMigration.classify_fork_error/1` maps `{:s3_copy_status, 404}` to `:no_template_snapshot`.
+  #
+  # NOT the review's recommended fix. It proposed, as the "simplest robust alternative", moving the
+  # sentinel off the data key entirely (e.g. `<shard>.newlock`). That would reintroduce the bug
+  # round-2 #7 added the sentinel to close: the zombie's stalled first flush is a create-only
+  # `PUT If-None-Match:*` AT THE DATA KEY, which succeeds precisely when no object exists there. The
+  # sentinel only fences it by occupying that key. Moving it is not an alternative; it is a revert.
+  defp copy_unless_sentinel_source(src_key, dst_key) do
+    case head_object(src_key) do
+      {:ok, _etag, true, _} -> {:error, :no_source}
+      {:ok, _etag, _not_sentinel, _} -> copy_object(src_key, dst_key)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @impl true
   def retain(shard_id, version) do
-    copy_object(db_key(shard_id), version_key(shard_id, version))
+    copy_unless_sentinel_source(db_key(shard_id), version_key(shard_id, version))
   end
 
   @impl true
   def restore(shard_id, version) do
-    copy_object(version_key(shard_id, version), db_key(shard_id))
+    copy_unless_sentinel_source(version_key(shard_id, version), db_key(shard_id))
   end
 
   @impl true
@@ -1040,7 +1070,10 @@ defmodule Fathom.Shard.Storage.S3 do
     # `<template>@<version>` snapshot to the new tenant's live object — same
     # CopyObject as retain/restore (a missing snapshot is a 404 copy status the
     # caller classifies as :no_template_snapshot).
-    copy_object(version_key(template_id, version), db_key(dst_shard_id))
+    #
+    # A version key can only hold a sentinel if a pre-#25 `retain/2` put one there; guarding
+    # anyway, because that state is already durable in any bucket this ran against.
+    copy_unless_sentinel_source(version_key(template_id, version), db_key(dst_shard_id))
   end
 
   @impl true
@@ -1057,17 +1090,34 @@ defmodule Fathom.Shard.Storage.S3 do
     # Fork a live shard to a new id (#14): HEAD the dst first (never clobber a tenant), then HEAD the
     # src, then CopyObject src.db → dst.db. Two heads + a copy is fine — a fork is a rare operator/API
     # action, not a hot path.
-    case head_etag(db_key(dst_id)) do
-      {:ok, _} -> {:error, :dst_exists}
-      {:error, {:s3_head_status, 404}} -> fork_after_dst_check(src_id, dst_id)
+    # The dst HEAD is sentinel-aware (expert review 2026-08-01 #25). `head_etag/1` returns a plain
+    # `{:ok, etag}` for ANY 200, so a dst holding only a steal sentinel read as "destination taken"
+    # and returned `:dst_exists` FOREVER — permanently poisoning that tenant id, recoverable only by
+    # an operator who knows to purge it. `Tenants.fork/3` could inflict this on itself: its
+    # `fork_into_leased_dst/2` acquires the dst lease first, and a stale dst lock routes through the
+    # steal path whose `touch_object` plants the sentinel, so the very next `fork_shard/2` in the
+    # same function failed on a placeholder it had just created.
+    #
+    # A sentinel dst is treated as ABSENT and overwritten. That is safe for the property the
+    # sentinel exists to hold (round-2 #7): a zombie's create-only `PUT If-None-Match:*` still 412s
+    # against the forked bytes exactly as it did against the placeholder — the key stays occupied.
+    # And the caller already holds the dst lease while this runs.
+    case head_object(db_key(dst_id)) do
+      {:ok, nil, _, _} -> fork_after_dst_check(src_id, dst_id)
+      {:ok, _etag, true, _} -> fork_after_dst_check(src_id, dst_id)
+      {:ok, _etag, _not_sentinel, _} -> {:error, :dst_exists}
       {:error, reason} -> {:error, reason}
     end
   end
 
   defp fork_after_dst_check(src_id, dst_id) do
-    case head_etag(db_key(src_id)) do
-      {:ok, _} -> copy_object(db_key(src_id), db_key(dst_id))
-      {:error, {:s3_head_status, 404}} -> {:error, :no_source}
+    # `copy_unless_sentinel_source/2` HEADs the src and refuses a sentinel; a 404 there returns
+    # `{:ok, nil, false, nil}`, which would fall through to a copy that 404s — so keep the explicit
+    # absent branch and its `:no_source`, which is the documented contract callers match on.
+    case head_object(db_key(src_id)) do
+      {:ok, nil, _, _} -> {:error, :no_source}
+      {:ok, _etag, true, _} -> {:error, :no_source}
+      {:ok, _etag, _not_sentinel, _} -> copy_object(db_key(src_id), db_key(dst_id))
       {:error, reason} -> {:error, reason}
     end
   end
@@ -1076,12 +1126,14 @@ defmodule Fathom.Shard.Storage.S3 do
 
   @impl true
   def snapshot(shard_id, snapshot_id) do
-    copy_object(db_key(shard_id), snapshot_key(shard_id, snapshot_id))
+    # A sentinel live object is not snapshottable bytes (#25) — a "successful" snapshot of a
+    # placeholder is worse than a failed one, because the operator stops looking.
+    copy_unless_sentinel_source(db_key(shard_id), snapshot_key(shard_id, snapshot_id))
   end
 
   @impl true
   def restore_snapshot(shard_id, snapshot_id) do
-    copy_object(snapshot_key(shard_id, snapshot_id), db_key(shard_id))
+    copy_unless_sentinel_source(snapshot_key(shard_id, snapshot_id), db_key(shard_id))
   end
 
   @impl true

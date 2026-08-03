@@ -337,6 +337,10 @@ defmodule Fathom.Migrator.ShardMigration do
   # template@head snapshot" — the caller births the shard empty.
   defp classify_fork_error(:enoent), do: {:error, :no_template_snapshot}
   defp classify_fork_error({:s3_copy_status, 404}), do: {:error, :no_template_snapshot}
+  # A retained version holding only a steal sentinel is a placeholder, not template bytes
+  # (expert review 2026-08-01 #25) — same outcome as no snapshot at all: birth the shard empty
+  # rather than fork a fabricated database.
+  defp classify_fork_error(:no_source), do: {:error, :no_template_snapshot}
   defp classify_fork_error(reason), do: {:error, reason}
 
   # --- lease orchestration ---

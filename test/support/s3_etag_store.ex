@@ -64,6 +64,25 @@ defmodule Fathom.Test.S3EtagStore do
     end)
   end
 
+  @doc """
+  Copy `src` to `dst` **including metadata**, the way S3's CopyObject does by default
+  (metadata directive `COPY`).
+
+  Unlike `set_body/3`, this preserves `x-amz-meta-*` — which is the whole point for expert
+  review 2026-08-01 #25: it is how a steal sentinel came to sit at a `@version` / `@snap-` key
+  in the first place, and a test for the guard has to be able to stage that already-durable
+  state. Returns `:ok`, or raises if `src` is absent (a silent no-op here would produce a test
+  that asserts against an object that was never created).
+  """
+  def copy(agent, src, dst) do
+    Agent.update(agent, fn s ->
+      case Map.get(s.objects, src) do
+        nil -> raise ArgumentError, "S3EtagStore.copy/3: no object at #{inspect(src)}"
+        obj -> %{s | objects: Map.put(s.objects, dst, obj)}
+      end
+    end)
+  end
+
   def serve(%Plug.Conn{} = conn, agent) do
     {:ok, body, conn} = Plug.Conn.read_body(conn)
     key = strip_bucket(conn.request_path)
