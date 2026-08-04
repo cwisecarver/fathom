@@ -344,7 +344,13 @@ defmodule Fathom.ShardExecutor do
   # Whitelist (not "any pragma with ="): connection-local assignments like
   # busy_timeout must stay clean, or per-connection setup pragmas would re-dirty
   # read-only shards into needless durability uploads.
-  @durable_pragmas ~w(user_version application_id schema_version)
+  # `page_size` and `journal_mode` added 2026-08-03 (expert review #21): both rewrite the database
+  # HEADER, so a client setting either changes bytes that must reach storage. Classifying them as
+  # control ⇒ read meant such a statement did not even mark the shard dirty. `page_size` matters
+  # beyond dirtiness — it is the unit the size cap is denominated in (see
+  # `Connection.maybe_max_page_count/1`), so a shard whose page size changes underneath a
+  # page-denominated cap silently changes its own byte ceiling.
+  @durable_pragmas ~w(user_version application_id schema_version page_size journal_mode)
 
   # Slice + downcase a few head chars rather than the whole statement — this runs on every
   # no-column/no-change result, and the full-statement downcase was an O(len) binary copy per

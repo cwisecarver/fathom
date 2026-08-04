@@ -187,4 +187,76 @@ defmodule FathomWeb.ThrottleTest do
       assert conn |> basic("admin", "wrong") |> get("/admin/metrics") |> Map.get(:status) == 401
     end
   end
+
+  describe "#27 — /api mutations are not CSRF-able through the BasicAuth fallback" do
+    # /api takes either a Bearer API key (never auto-attached by a browser) or the shared admin
+    # BasicAuth mapped to a full `destroy` actor. Browsers cache Basic credentials per ORIGIN and
+    # re-send them on cross-site form submissions — SameSite governs cookies, not the HTTP auth
+    # cache — and `pipeline :api` has no protect_from_forgery. `plug :accepts, ["json"]` inspects
+    # ACCEPT (a browser sends */*), not content-type, so it stopped nothing.
+    #
+    # An auto-submitted <form method=POST action=".../api/tenants/<victim>/suspend"> therefore
+    # needed no token, no body and no attacker credential. suspend takes a tenant offline
+    # fleet-wide; token/rotate and restore are equally reachable.
+
+    test "a form-shaped POST with valid Basic credentials is refused", %{conn: conn} do
+      # The exact CSRF shape: urlencoded, which is all a cross-origin <form> can send.
+      res =
+        conn
+        |> basic("admin", "secret")
+        |> Plug.Conn.put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> post("/api/tenants/victim/suspend", "")
+
+      assert res.status == 403,
+             "a cross-site form post with cached Basic credentials suspended a tenant"
+    end
+
+    test "a POST with NO content-type at all is refused", %{conn: conn} do
+      res = conn |> basic("admin", "secret") |> post("/api/tenants/victim/suspend")
+      assert res.status == 403
+    end
+
+    test "Sec-Fetch-Site: cross-site is refused even when it claims JSON", %{conn: conn} do
+      # Defence in depth for browsers that send it. Not a substitute for the content-type rule —
+      # a non-browser client simply omits the header — which is why both exist.
+      res =
+        conn
+        |> basic("admin", "secret")
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+        |> Plug.Conn.put_req_header("sec-fetch-site", "cross-site")
+        |> post("/api/tenants/victim/suspend", "{}")
+
+      assert res.status == 403
+    end
+
+    test "a legitimate JSON call still works", %{conn: conn} do
+      # The guard must not break the actual control plane: 404 (unknown tenant) proves the
+      # request reached the controller rather than being refused at the gate.
+      res =
+        conn
+        |> basic("admin", "secret")
+        |> Plug.Conn.put_req_header("content-type", "application/json")
+        |> post("/api/tenants/victim/suspend", "{}")
+
+      refute res.status == 403, "a legitimate JSON mutation was blocked as CSRF"
+    end
+
+    test "GET is unaffected — it changes nothing", %{conn: conn} do
+      res = conn |> basic("admin", "secret") |> get("/api/tenants")
+      refute res.status == 403
+    end
+
+    test "an API-key request is exempt: a browser never auto-attaches a Bearer token", %{
+      conn: conn
+    } do
+      # Exempt on the AUTH SHAPE, not on validity — an invalid key must still 401 rather than
+      # 403, or the guard would be masking the auth layer.
+      res =
+        conn
+        |> Plug.Conn.put_req_header("authorization", "Bearer not-a-real-key")
+        |> post("/api/tenants/victim/suspend")
+
+      assert res.status == 401
+    end
+  end
 end

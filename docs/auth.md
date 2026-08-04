@@ -108,6 +108,30 @@ firewall / security group / private subnet and pin the interface with `HRANA_BIN
 binds a public one. A client that can reach the port can open any shard; the whole security model in
 this mode is "only the LB can reach the port."
 
+## `/api` CSRF: state-changing calls must declare JSON
+
+`/api` accepts either a Bearer API key or the shared admin BasicAuth. Browsers cache Basic
+credentials per **origin** and re-send them on cross-site form submissions — `SameSite` governs
+cookies, not the HTTP auth cache — so an auto-submitted
+`<form method=POST action="https://<node>:4000/api/tenants/<victim>/suspend">` was authenticated,
+needed no token and no attacker credential (expert review 2026-08-01 #27).
+
+State-changing `/api` requests on the **BasicAuth fallback** must therefore send
+`Content-Type: application/json`, and a request carrying `Sec-Fetch-Site: cross-site` is refused
+outright. Both return **403**.
+
+This closes form-driven CSRF rather than merely making it harder: an HTML form can only send
+`application/x-www-form-urlencoded`, `multipart/form-data` or `text/plain`. Sending JSON
+cross-origin requires fetch/XHR, which triggers a CORS preflight this endpoint answers no headers
+for.
+
+**Bearer API keys are exempt** — a browser never auto-attaches one, so the whole attack shape does
+not exist for them. `GET`/`HEAD`/`OPTIONS` are unaffected.
+
+If you drive `/api` with BasicAuth from curl or a script, add
+`-H 'content-type: application/json'`. Using an API key instead is the better fix and needs no
+header.
+
 ## One-line summary
 
 Auth is a per-shard `Phoenix.Token` presented as libSQL's native `authToken` (Bearer over HTTP,

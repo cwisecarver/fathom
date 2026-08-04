@@ -104,6 +104,26 @@ defmodule Fathom.Shard.Connection do
   defp maybe_query_only(conn, :ro), do: Sqlite3.execute(conn, "PRAGMA query_only=ON")
   defp maybe_query_only(_conn, _scope), do: :ok
 
+  # This file's actual page size. Falls back to SQLite's default rather than raising: an
+  # unreadable pragma must not stop a shard opening, and 4096 is the value that reproduces the
+  # pre-#21 behaviour — the safe direction is to keep capping, not to skip the cap.
+  #
+  # `prepare` + `fetch_all`, NOT `Sqlite3.execute/2`, which returns a bare `:ok` and discards
+  # result rows. Written with `execute` first: it compiled, ran, and silently took the 4096
+  # fallback on EVERY open — the fix would have shipped as a no-op at exactly the non-default
+  # page sizes it exists for. Probed rather than assumed.
+  #
+  # Not `query/3` either: this runs inside `configure/1` during `open/2`, before the statement
+  # cache and deadline machinery that path expects are meaningful.
+  defp page_size(conn) do
+    with {:ok, stmt} <- Sqlite3.prepare(conn, "PRAGMA page_size"),
+         {:ok, [[n]]} when is_integer(n) and n > 0 <- Sqlite3.fetch_all(conn, stmt) do
+      n
+    else
+      _ -> 4096
+    end
+  end
+
   defp configure(conn) do
     with :ok <- Sqlite3.execute(conn, "PRAGMA journal_mode=WAL"),
          # synchronous=FULL fsyncs the WAL on every commit, so a committed write survives a node
@@ -188,9 +208,11 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
-  # 1,048,576 pages × the 4096B default page size = 4 GiB, ~1 GiB under the 5 GiB S3 single-PUT
-  # ceiling (`Fathom.Shard.Storage.S3.@max_single_put`).
-  @default_max_page_count 1_048_576
+  # 4 GiB — ~1 GiB under the 5 GiB S3 single-PUT ceiling
+  # (`Fathom.Shard.Storage.S3.@max_single_put`), which is the limit this cap exists to stay under.
+  # Identical to the previous 1,048,576-page default at SQLite's 4096-byte page, so this is a
+  # no-op at default config and correct at every other page size.
+  @default_max_bytes 4 * 1024 * 1024 * 1024
 
   # Expert review 2026-07-24 #37. This used to be UNSET by default, which made the first defence
   # against a runaway tenant a FLUSH failure rather than a write failure — and those fail in
@@ -211,11 +233,39 @@ defmodule Fathom.Shard.Connection do
   # A cap also matches the stated premise. "Limited dataset per shard" is what makes a
   # million-shard fleet work: every whole-shard cost (a dirty flush is a full-file PUT, cold-open
   # pulls the whole body, eviction/drain/warm-standby all copy it) is linear in shard size.
-  # Set `SHARD_MAX_PAGE_COUNT=0` to opt out and restore the unlimited behaviour.
+  # Set `SHARD_MAX_BYTES=0` (or `SHARD_MAX_PAGE_COUNT=0`) to opt out and restore the unlimited
+  # behaviour.
+  #
+  # DENOMINATED IN BYTES, derived per-file from the actual `PRAGMA page_size` (expert review
+  # 2026-08-01 #21). The cap was a fixed page COUNT while the ceiling it protects — S3's 5 GiB
+  # single-PUT limit — is in BYTES, and the two coincide only at SQLite's default 4096-byte page.
+  # At 16 KiB the same 1,048,576 pages is 16 GiB and at 64 KiB it is 64 GiB, which re-enters
+  # exactly the state review 2026-07-24 #37 closed: a shard that keeps ACKing writes past the
+  # ceiling and can then never upload again, with no operator remedy because the data is already
+  # acknowledged.
+  #
+  # Page size is a per-FILE property that arrives with the database rather than being chosen here:
+  # `Tenants.fork`, `Migrator.fork_from_template`, or an operator-seeded template can all bring a
+  # non-default one, and it is not something the cap can assume.
+  #
+  # `:shard_max_page_count` still wins when set explicitly — an operator who configured pages meant
+  # pages, and silently reinterpreting their number as bytes would be its own bug.
   defp maybe_max_page_count(conn) do
-    case Application.get_env(:fathom, :shard_max_page_count, @default_max_page_count) do
-      n when is_integer(n) and n > 0 -> Sqlite3.execute(conn, "PRAGMA max_page_count=#{n}")
-      _ -> :ok
+    case {Application.get_env(:fathom, :shard_max_page_count),
+          Application.get_env(:fathom, :shard_max_bytes, @default_max_bytes)} do
+      {n, _} when is_integer(n) and n > 0 ->
+        Sqlite3.execute(conn, "PRAGMA max_page_count=#{n}")
+
+      {n, _} when is_integer(n) ->
+        # Explicit 0/negative: the documented opt-out.
+        :ok
+
+      {_, bytes} when is_integer(bytes) and bytes > 0 ->
+        pages = max(div(bytes, page_size(conn)), 1)
+        Sqlite3.execute(conn, "PRAGMA max_page_count=#{pages}")
+
+      _ ->
+        :ok
     end
   end
 

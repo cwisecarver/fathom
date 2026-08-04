@@ -94,10 +94,31 @@ defmodule Fathom.Bench.Gate do
     #
     # These reduce the SAME samples the p50s do (`cold_open_stats/1`, `hrana_rt_stats/1`), so they
     # cost nothing to collect and cannot disagree with their own p50 about which run they describe.
-    # A tail is noisier than a median by construction — if either starts false-blocking, raise the
-    # sample count to tighten it, do not loosen the threshold.
-    {:cold_open_p99_us, :higher_worse},
-    {:hrana_rt_p99_us, :higher_worse}
+    #
+    # BLOCK AT 50%, NOT THE GLOBAL 20% — and this corrects what this comment said when they were
+    # added on 2026-08-03 ("if either starts false-blocking, raise the sample count, do not loosen
+    # the threshold"). That was written before there was variance data. There now is, 13 same-host
+    # runs each:
+    #
+    #   hrana_rt_p99_us   168–230   36.9% spread
+    #   cold_open_p99_us  2233–3058 36.9% spread
+    #
+    # Both span well past 20%, and `hrana_rt_p99_us` duly blocked a commit at +22.73% with its own
+    # p50 dead flat. A threshold below a metric's noise floor does not gate anything — it reports
+    # noise as regression, and the predictable end of that is someone passing --skip habitually,
+    # which is worse than not gating the tail at all.
+    #
+    # Raising the sample count was the other option and is the WRONG one here: p99 of 200 hrana
+    # samples is the 2nd-worst, and p99 of 50 cold opens is essentially the max, so both would need
+    # to grow a lot — and `@cold_open_samples` is shared with `cold_open_p50_us`, whose series is
+    # 335 entries long. Changing it is a harness-topology change that invalidates that history, for
+    # a metric that is not the problem. Per-metric thresholds keep the p50 series intact.
+    #
+    # 50% still catches what the tail is FOR: the failure this exists to see is p50 flat while p99
+    # DOUBLES (+100%) — a blocking Storage call back in the coordinator mailbox, which has happened
+    # twice. That clears 50% with room to spare.
+    {:cold_open_p99_us, :higher_worse, 50},
+    {:hrana_rt_p99_us, :higher_worse, 50}
   ]
 
   @doc "The gated metrics and their regression direction."
@@ -115,23 +136,34 @@ defmodule Fathom.Bench.Gate do
   @spec compare(map(), map(), number(), number()) :: map()
   def compare(parent, new, block \\ 20, warn \\ 20) do
     deltas =
-      Enum.map(@metrics, fn {metric, dir} ->
-        delta(metric, dir, value(parent, metric), value(new, metric))
+      Enum.map(@metrics, fn entry ->
+        {metric, dir, metric_block} = normalize(entry, block)
+
+        metric
+        |> delta(dir, value(parent, metric), value(new, metric))
+        |> Map.put(:block, metric_block)
       end)
 
     comparable = Enum.reject(deltas, & &1.skipped)
     worst = comparable |> Enum.map(& &1.pct) |> max_or(0.0)
+    blocked = Enum.filter(comparable, &(&1.pct >= &1.block))
 
     verdict =
       cond do
         comparable == [] -> :no_data
-        worst >= block -> :block
+        blocked != [] -> :block
         worst > warn -> :warn
         true -> :ok
       end
 
-    %{verdict: verdict, worst: worst, deltas: deltas}
+    %{verdict: verdict, worst: worst, deltas: deltas, blocked: Enum.map(blocked, & &1.metric)}
   end
+
+  # A metric may carry its OWN block threshold. Not a loophole — a threshold has to sit above the
+  # metric's measured noise floor or it reports noise as regression, and 20% was chosen for
+  # single-threaded p50s. See the tail entries in @metrics for the measured basis.
+  defp normalize({metric, dir}, default_block), do: {metric, dir, default_block}
+  defp normalize({metric, dir, block}, _default_block), do: {metric, dir, block}
 
   @doc "A human-readable multi-line report of a `compare/3` result."
   @spec format(map(), String.t(), number(), number()) :: String.t()
@@ -145,7 +177,11 @@ defmodule Fathom.Bench.Gate do
         if d.skipped do
           "  #{name} skipped (#{d.reason})"
         else
-          "  #{name} #{fmt(d.parent)} -> #{fmt(d.new)}   #{signed(d.pct)}%   #{tag(d.pct, block, warn)}"
+          own = Map.get(d, :block, block)
+          note = if own != block, do: " (block >=#{own}%)", else: ""
+
+          "  #{name} #{fmt(d.parent)} -> #{fmt(d.new)}   #{signed(d.pct)}%   " <>
+            "#{tag(d.pct, own, warn)}#{note}"
         end
       end)
 

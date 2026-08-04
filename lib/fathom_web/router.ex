@@ -55,7 +55,7 @@ defmodule FathomWeb.Router do
   # BasicAuth. On :4000, separate from the Hrana data port. `:api_rate_limit` (expert review #34)
   # runs BEFORE auth so an unauthenticated flood is throttled too.
   scope "/api", FathomWeb.Api do
-    pipe_through [:api, :api_rate_limit, :api_auth]
+    pipe_through [:api, :api_rate_limit, :api_auth, :api_csrf_guard]
 
     post "/tenants", TenantController, :create
     get "/tenants", TenantController, :index
@@ -105,6 +105,61 @@ defmodule FathomWeb.Router do
           else:
             Plug.Conn.assign(conn, :api_actor, %{name: "admin (basic-auth)", scope: "destroy"})
     end
+  end
+
+  # CSRF guard for state-changing `/api` calls authenticated by the BasicAuth fallback
+  # (expert review 2026-08-01 #27).
+  #
+  # `/api` accepts either a Bearer API key — never auto-attached by a browser, so inherently
+  # safe — or the shared admin BasicAuth mapped to a full `destroy` actor. Browsers cache HTTP
+  # Basic credentials per ORIGIN and re-send them on any later request to that origin, INCLUDING
+  # a cross-site form submission; `SameSite` governs cookies and does not apply to the HTTP auth
+  # cache. `pipeline :api` has no `protect_from_forgery`, and `plug :accepts, ["json"]` inspects
+  # ACCEPT (a browser sends `*/*`), not content-type — so an auto-submitted
+  # `<form method=POST action=".../api/tenants/<victim>/suspend">` needed no token, no body, and
+  # no attacker credential. `suspend` takes a tenant offline fleet-wide; `token/rotate` and
+  # `restore` are equally reachable.
+  #
+  # The content-type check is the load-bearing one, not a heuristic: an HTML form can only send
+  # `application/x-www-form-urlencoded`, `multipart/form-data` or `text/plain`. Sending
+  # `application/json` cross-origin requires fetch/XHR, which triggers a CORS preflight this
+  # endpoint answers no headers for. So requiring JSON on mutations closes form-driven CSRF
+  # outright. `Sec-Fetch-Site` is defence in depth for browsers that send it, and is only
+  # consulted when present — it is not a substitute.
+  #
+  # NOT the review's preferred fix, which was to drop the BasicAuth fallback for mutating actions
+  # entirely. `api_auth/2` exists precisely so existing deployments keep working while they
+  # migrate to keys, and removing it is a breaking change to the control plane rather than a
+  # security fix — this closes the hole while leaving that migration on its own schedule. The
+  # cost is one header for BasicAuth clients, documented in docs/configuration.md.
+  defp api_csrf_guard(conn, _opts) do
+    cond do
+      conn.method in ["GET", "HEAD", "OPTIONS"] -> conn
+      match?({:ok, _}, bearer_token(conn)) -> conn
+      cross_site?(conn) -> reject_csrf(conn, "cross-site request")
+      json_content_type?(conn) -> conn
+      true -> reject_csrf(conn, "state-changing /api requests must send application/json")
+    end
+  end
+
+  defp cross_site?(conn) do
+    Plug.Conn.get_req_header(conn, "sec-fetch-site") == ["cross-site"]
+  end
+
+  defp json_content_type?(conn) do
+    case Plug.Conn.get_req_header(conn, "content-type") do
+      [ct | _] -> ct |> String.downcase() |> String.starts_with?("application/json")
+      [] -> false
+    end
+  end
+
+  defp reject_csrf(conn, why) do
+    :telemetry.execute([:fathom, :api, :csrf_blocked], %{count: 1}, %{})
+
+    conn
+    |> Plug.Conn.put_resp_content_type("application/json")
+    |> Plug.Conn.send_resp(403, ~s({"error":"forbidden","message":"#{why}"}))
+    |> Plug.Conn.halt()
   end
 
   defp bearer_token(conn) do

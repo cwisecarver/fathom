@@ -19,6 +19,13 @@ defmodule FathomWeb.Api.TenantControllerTest do
     conn
     |> Plug.Conn.put_req_header("authorization", @auth)
     |> Plug.Conn.put_req_header("accept", "application/json")
+    # A state-changing /api call on the BasicAuth fallback must declare JSON (expert review
+    # 2026-08-01 #27). Browsers re-send cached Basic credentials on cross-site form posts, and a
+    # form can only send urlencoded/multipart/text-plain — so requiring JSON is what makes an
+    # auto-submitted `<form action=".../suspend">` impossible. These tests previously sent
+    # mutations with no content-type, i.e. exactly the shape that is now refused; a real JSON API
+    # client sends this header anyway.
+    |> Plug.Conn.put_req_header("content-type", "application/json")
   end
 
   defp put_shard(id, status \\ "active") do

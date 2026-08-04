@@ -96,6 +96,46 @@ defmodule Fathom.Bench.GateTest do
     assert report =~ "BLOCK"
   end
 
+  describe "per-metric block thresholds" do
+    # A threshold has to sit above the metric's measured noise floor or it reports noise as
+    # regression. 20% was chosen for single-threaded p50s; the two p99 tails span ~37% across
+    # their same-host history, and one duly blocked a commit at +22.73% with its own p50 flat.
+    # The predictable end of a gate that cries wolf is somebody passing --skip by reflex.
+    test "a metric with its own threshold does not block below it" do
+      # 30% would BLOCK any default-threshold metric and must not block a 50% one. It still
+      # WARNS — warn is global and deliberately left alone, so a tail drifting stays visible
+      # in the report instead of being silently normalised away.
+      parent = %{"cold_open_p99_us" => 1000.0, "host" => "darwin"}
+      new = %{"cold_open_p99_us" => 1300.0, "host" => "darwin"}
+
+      assert %{verdict: :warn, blocked: []} = Gate.compare(parent, new)
+    end
+
+    test "it still blocks past its own threshold" do
+      # The failure the tail exists to catch is p50 flat while p99 DOUBLES; 50% leaves room.
+      parent = %{"cold_open_p99_us" => 1000.0, "host" => "darwin"}
+      new = %{"cold_open_p99_us" => 2000.0, "host" => "darwin"}
+
+      assert %{verdict: :block, blocked: [:cold_open_p99_us]} = Gate.compare(parent, new)
+    end
+
+    test "a default-threshold metric still blocks at 20%" do
+      # The relaxation must be scoped to the metrics that declare it, not global.
+      parent = %{"cold_open_p50_us" => 1000.0, "host" => "darwin"}
+      new = %{"cold_open_p50_us" => 1250.0, "host" => "darwin"}
+
+      assert %{verdict: :block, blocked: [:cold_open_p50_us]} = Gate.compare(parent, new)
+    end
+
+    test "the report names the metric's own threshold so it is not invisible" do
+      parent = %{"cold_open_p99_us" => 1000.0, "host" => "darwin"}
+      new = %{"cold_open_p99_us" => 1300.0, "host" => "darwin"}
+
+      report = parent |> Gate.compare(new) |> Gate.format("abc1234")
+      assert report =~ "block >=50%", "a non-default threshold must be visible in the report"
+    end
+  end
+
   describe "every measured metric is gated" do
     # THE GAP THIS CLOSES. Review #41.1 and #41.3 added `hrana_open_rt_us` and `flush_p50_us` to
     # the bench and verified they discriminate — but never added them to `@metrics`. For a day
@@ -116,7 +156,9 @@ defmodule Fathom.Bench.GateTest do
         |> Kernel.--(@bookkeeping)
         |> MapSet.new()
 
-      gated = Gate.metrics() |> Enum.map(fn {m, _dir} -> to_string(m) end) |> MapSet.new()
+      # Entries are {metric, dir} or {metric, dir, block} — a metric may carry its own
+      # threshold, so take the name positionally rather than pattern-matching an arity.
+      gated = Gate.metrics() |> Enum.map(&(&1 |> elem(0) |> to_string())) |> MapSet.new()
 
       assert MapSet.difference(measured, gated) |> MapSet.to_list() == [],
              "the bench emits metrics the gate never compares — a regression in one of these " <>
