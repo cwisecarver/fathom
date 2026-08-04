@@ -2486,6 +2486,7 @@ defmodule Fathom.Shard do
       # after would spend a full VACUUM on a file we are about to refuse and move aside.
       with :ok <- verify_snapshot(state, temp),
            :ok <- snapshot(state.path, temp),
+           :ok <- recheck_before_put(state),
            {:ok, new_etag} <- Storage.flush(state.id, temp, state.etag) do
         {:ok, new_etag}
       else
@@ -2503,6 +2504,48 @@ defmodule Fathom.Shard do
       Enum.each(["", "-wal", "-shm"], &File.rm(temp <> &1))
     end
   end
+
+  # Re-check ownership between the SNAPSHOT and the PUT (expert review 2026-08-01 #28).
+  #
+  # `Fence.check` runs once, before this whole sequence, and `valid_for_write?`'s contract is
+  # "valid WITH MARGIN … it won't expire mid-write". The margin is a hardcoded `ttl/3` (10 s at
+  # the default 30 s TTL) and is not derived from the write it covers — which is
+  # `verify_snapshot` (a full `quick_check` page scan, added by #14) + `VACUUM INTO` + a
+  # full-object PUT. Measured on this codebase against `Storage.Local`, no network at all:
+  #
+  #     1.4 MB      8.9 ms          71 MB     265 ms
+  #     13.8 MB    55.4 ms         284 MB   1,070 ms
+  #
+  # Dead linear at ~3.8 ms/MB, so the LOCAL half alone reaches the 10 s margin around 2.6 GB —
+  # under the 4 GiB size cap `Connection` enforces, and before a single byte goes over the wire.
+  # The promise is not deliverable for a large shard, and it fails in a biased direction: big
+  # shards take the `:superseded` self-fence path and quarantine an interval of acked writes,
+  # small ones never do.
+  #
+  # Re-checking here means the margin only has to cover the PUT rather than scan + VACUUM + PUT.
+  # It does not make the promise true at every size — nothing cheap does, and a lease renewal
+  # that outlives the upload is a different design — but it removes the part of the exposure that
+  # is pure local CPU and I/O, which at 284 MB is already a full second.
+  #
+  # HEARTBEAT MODE ONLY, and that is the point. `Heartbeat.valid_for_write?/1` is a lock-free ETS
+  # read (`heartbeat.ex`), so this costs nothing. In LEGACY mode the equivalent check is a renew
+  # PUT — a store round trip per flush — so it is skipped there rather than paying network to
+  # shorten a network-bound window. (An earlier reading of this finding dismissed the whole fix as
+  # "a round trip per flush"; that is true only of the legacy path.)
+  defp recheck_before_put(%{acquire_gen: gen}) when is_integer(gen) do
+    case Heartbeat.valid_for_write?(gen) do
+      :ok ->
+        :ok
+
+      _ ->
+        # Do NOT upload: our liveness went unconfirmed while we were building the snapshot, so a
+        # peer may be taking over. Staying dirty and retrying is the safe direction — the same
+        # verdict `Fence.check` produces for :not_valid, reached one step later.
+        {:error, :ownership_unconfirmed_before_put}
+    end
+  end
+
+  defp recheck_before_put(_state), do: :ok
 
   # Integrity-gate the PERIODIC flush (expert review 2026-08-01 #14).
   #

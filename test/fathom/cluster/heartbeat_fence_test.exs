@@ -242,6 +242,101 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
     end)
   end
 
+  # #28 — the margin covers the START of a write whose duration it does not know.
+  #
+  # Fence.check runs ONCE, before quick_check + VACUUM INTO + the PUT. `valid_for_write?`'s
+  # margin is a hardcoded ttl/3 (10s at the default TTL) and is not derived from that work.
+  # Measured against Storage.Local with no network, the flush is dead linear at ~3.8 ms/MB
+  # (1.4 MB → 8.9 ms; 284 MB → 1,070 ms), so the LOCAL half alone reaches the margin around
+  # 2.6 GB — under the 4 GiB per-shard cap. So the coordinator re-checks immediately before the
+  # PUT, and the margin then only has to cover the upload.
+  #
+  # This is a LOSS bias, not a clobber: the conditional PUT's etag is what actually prevents a
+  # double-write. Shards whose flush outruns the margin self-fence and quarantine an interval of
+  # acked writes; small ones never do.
+  describe "#28 — ownership is re-checked between the snapshot and the PUT" do
+    test "a heartbeat that lapses DURING the snapshot aborts before uploading",
+         %{shard: shard, hb: hb} do
+      # The window this fix exists for is AFTER Fence.check passed and BEFORE the PUT. Forging
+      # the heartbeat before driving the flush does not test it — Fence.check catches that case
+      # already, and such a test passes against the unfixed code (it did).
+      #
+      # So widen the window with SIZE, which is the same lever that makes the finding real: a
+      # keystone big enough that quick_check + VACUUM INTO take ~100ms, then invalidate the
+      # heartbeat partway through. Process.sleep here is STAGING a race, not synchronising on
+      # one — there is no event to wait for between the snapshot and the PUT, which is precisely
+      # why the exposure existed.
+      capture_log(fn ->
+        {:ok, pid, ref, path} = Shards.checkout(shard)
+        {:ok, _} = Fathom.Keystone.build!(path, rows: 50_000)
+        :ok = Fathom.Shard.stamp_local_provenance(shard)
+        Fathom.Shard.checkin(pid, ref)
+
+        {:ok, conn} = ShardExecutor.open(shard)
+        {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+        {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('a')"))
+
+        # One clean flush first, so there is a stored object whose etag we can watch.
+        :ok = Fathom.Shards.flush(shard)
+        {:ok, before_etag} = Fathom.Shard.Storage.object_etag(shard)
+
+        {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('b')"))
+
+        # Fence.check passes (heartbeat healthy), then the snapshot runs for ~100ms; this lands
+        # inside it.
+        test_hb = hb
+
+        spawn(fn ->
+          Process.sleep(25)
+
+          :sys.replace_state(test_hb, fn s ->
+            forged = %{s | mono_deadline_ms: System.monotonic_time(:millisecond) - 1_000}
+            Heartbeat.publish_status(forged)
+            forged
+          end)
+        end)
+
+        _ = Fathom.Shards.flush(shard)
+
+        assert {:ok, ^before_etag} = Fathom.Shard.Storage.object_etag(shard),
+               "the shard uploaded after its liveness went unconfirmed mid-snapshot — the " <>
+                 "margin only covered the START of a write it does not know the length of"
+
+        :ok = ShardExecutor.close(conn)
+      end)
+    end
+
+    test "recheck_before_put is skipped in legacy mode, where it would cost a PUT" do
+      # In legacy mode (acquire_gen nil) the equivalent check is a renew PUT — a store round trip
+      # per flush. Paying network to shorten a network-bound window is the wrong trade, so the
+      # re-check is heartbeat-mode only. Pinned because "just check everywhere" is the obvious
+      # simplification and it is wrong.
+      #
+      # config/test.exs runs heartbeat_server: false, so a coordinator opened WITHOUT the
+      # heartbeat above is genuinely in legacy mode — no forcing needed (AGENTS.md).
+      id = "legacy_recheck_#{System.unique_integer([:positive])}"
+
+      on_exit(fn ->
+        Shards.drain(id, 5_000)
+
+        for s <- ["", "-wal", "-shm", ".etag", ".lock"],
+            do: File.rm(Path.join(Fathom.Shard.data_dir(), "#{id}.db#{s}"))
+      end)
+
+      capture_log(fn ->
+        {:ok, conn} = ShardExecutor.open(id)
+        {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+        {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('x')"))
+        :ok = ShardExecutor.close(conn)
+
+        # A legacy-mode flush must still succeed end to end.
+        assert :ok = Fathom.Shards.flush(id)
+        assert {:ok, etag} = Fathom.Shard.Storage.object_etag(id)
+        assert is_binary(etag), "the legacy-mode flush did not produce a stored object"
+      end)
+    end
+  end
+
   # WHEN the fence trips, not just that it does (expert review 2026-08-01 #30 item 5).
   #
   # The test above presets `not_valid_since` an HOUR back, so it fires under any plausible

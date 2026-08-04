@@ -16,12 +16,39 @@ defmodule Fathom.Shard.Heartbeat do
   flush:
 
     * `:ok` — heartbeat valid with margin AND no lapse since acquire ⇒ we still own
-      it, and it won't expire mid-write ⇒ the write is safe with no per-shard I/O.
+      it ⇒ the write is safe to START, with no per-shard I/O.
     * `:revalidate` — valid, but the heartbeat lapsed since acquire ⇒ a steal *may*
       have happened during the gap ⇒ re-check the shard lock (`Storage.check_lease/2`)
       before writing, and self-fence if it was stolen.
     * `:not_valid` — heartbeat not comfortably valid ⇒ do NOT write (retry later);
       writing without confirmed liveness could race a steal.
+
+  ## What the margin does and does not promise (expert review 2026-08-01 #28)
+
+  This documentation used to say `:ok` meant the lease "won't expire mid-write". **It cannot
+  promise that**, and the wording mattered because it is what stopped anyone asking how long a
+  write takes. The margin is `max(div(ttl, 3), 1)` — 10 s at the default 30 s TTL — and is not
+  derived from the write it is supposed to cover. That write is a full `quick_check` page scan
+  plus `VACUUM INTO` plus a whole-object PUT. Measured against `Storage.Local`, no network:
+
+      1.4 MB   8.9 ms        71 MB    265 ms
+      13.8 MB  55.4 ms      284 MB  1,070 ms
+
+  Dead linear at ~3.8 ms/MB, so the LOCAL half alone reaches the margin around 2.6 GB — under the
+  4 GiB per-shard cap `Fathom.Shard.Connection` enforces, and before anything goes over the wire.
+
+  What `:ok` does mean: the lease was valid with margin at the instant the write STARTED. The
+  fence that actually prevents a clobber is the conditional PUT's etag (`If-Match`), not this —
+  so an over-long write is not a correctness hole, it is a LOSS bias: shards whose flush outruns
+  the margin take the `:superseded` self-fence path and quarantine an interval of acked writes,
+  and small shards never do. That bias correlates with load, which is when failovers happen.
+
+  `Fathom.Shard.snapshot_and_upload/1` re-checks this immediately before the PUT so the margin
+  only has to cover the upload rather than scan + VACUUM + upload. It is cheap to do (this
+  function is a lock-free ETS read in heartbeat mode) and it removes the purely-local part of the
+  exposure, but it does not make the original promise true at every shard size. Sizing the TTL
+  against the real flush distribution is the open question; `flush_p50_us` in the bench gate is
+  the measurement that makes it answerable.
 
   A "lapse" is detected when a renewal tick finds the heartbeat already expired (a
   GC pause / partition let it lapse, during which another node could have stolen our
