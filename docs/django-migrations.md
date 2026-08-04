@@ -129,9 +129,10 @@ Per-node throughput is the `[:fathom, :migrator, :shard_migrated]` telemetry eve
 
 **If a shard sits behind with `failed: 0` and never moves**, its migration is snoozing on a held
 lease, not erroring — the Oban job stays `scheduled` with an empty `errors` array, so nothing is
-logged above `[info]`. A client request to that tenant clears it (the coordinator reclaims and then
-releases the lease). See the stuck-lease finding in
-[`reviews/fleet-rollout-2026-08-04.md`](reviews/fleet-rollout-2026-08-04.md#the-bug-this-run-found).
+logged above `[info]`. The lock leak that caused this in practice is fixed (a drop that couldn't
+flush used to keep the lock as well as the local copy), but the snooze itself is still unbounded and
+silent, so this remains the shape to recognise. A client request to that tenant clears a stale
+same-node lock. See [`reviews/fleet-rollout-2026-08-04.md`](reviews/fleet-rollout-2026-08-04.md#the-bug-this-run-found).
 
 ## 4. Revert — if a migration is bad
 

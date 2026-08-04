@@ -137,7 +137,8 @@ noted).
   evidence base review 2026-08-01 #43 asked for, plus the `rate_per_hour`/`eta_seconds` fields
   tracking a real rollout. Also finds a **reproducible stuck-lease bug** (~1 in 300): a coordinator
   lease that outlives its coordinator on a live node is never stealable, so that tenant serves fine
-  but can never migrate — open, not fixed there.
+  but can never migrate — root-caused to `flush_then_drop/1` keeping the lock alongside the local
+  copy, and **fixed** (third/fourth instance of the #9/#11 class).
 - **[reviews/tpc-run-2026-07-10.md](reviews/tpc-run-2026-07-10.md)** — the remote-client TPC run over
   the chaos rig (true cross-LB latency) + the loopback spec-scale TPC-C comparability numbers.
 - **[reviews/latency-cost-2026-07-23.md](reviews/latency-cost-2026-07-23.md)** — what an injected S3

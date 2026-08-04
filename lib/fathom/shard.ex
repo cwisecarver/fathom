@@ -1639,9 +1639,7 @@ defmodule Fathom.Shard do
               Storage.release_lease(state.id, state.lease)
 
             {:error, reason} ->
-              Logger.warning(
-                "shard #{state.id}: flush failed, keeping local copy (#{inspect(reason)})"
-              )
+              keep_local_release_lease(state, "flush failed", reason)
           end
 
         :superseded ->
@@ -1655,9 +1653,7 @@ defmodule Fathom.Shard do
           quarantine_fenced!(state)
 
         :skip ->
-          Logger.warning(
-            "shard #{state.id}: ownership unconfirmed before flush; keeping local copy"
-          )
+          keep_local_release_lease(state, "ownership unconfirmed before flush", :fence_skip)
       end
     else
       # Dirty, but there is no local file to flush (expert review 2026-08-01 #11). This whole
@@ -1688,6 +1684,45 @@ defmodule Fathom.Shard do
       if is_map(state.lease), do: Storage.release_lease(state.id, state.lease)
     end
 
+    :ok
+  end
+
+  # The drop path could not flush, but we may still hold the lock. KEEP the local copy — it holds
+  # acked-but-unflushed writes — and GIVE UP the lock. The two are separable, and only the copy is
+  # load-bearing for recovery.
+  #
+  # Found by `chaos.sh rollout` on 2026-08-04 (docs/reviews/fleet-rollout-2026-08-04.md), the third
+  # instance of the leaked-lock class after #9 and #11: a 300-tenant rollout stranded exactly one
+  # tenant, twice, a different shard each time. Both call sites below previously logged and returned,
+  # holding the lock. A lock naming a LIVE node is never stealable — `owner_live?` reads this node's
+  # fresh heartbeat forever — so the shard became permanently unmigratable and unfailoverable while
+  # continuing to serve normally (its own node re-acquires silently at the same incarnation, which is
+  # exactly why the damage is so quiet). The migration that then cannot drain it snoozes forever: a
+  # snooze burns no attempt, so the Oban job sits in `scheduled` with an EMPTY errors array,
+  # `failed: 0`, no quarantine, and nothing logged above `[info]`.
+  #
+  # Releasing costs nothing we were actually keeping. The conditional `DELETE … If-Match` no-ops if
+  # the lock is no longer ours, so the `:skip` (ownership-unconfirmed) case is safe by construction.
+  # If a peer then opens the shard it pulls the last durable object, and OUR divergent copy is
+  # arbitrated on this node's next open by the provenance sidecar (#1) — quarantined recoverably as
+  # `.forked.<ts>`, the same path a node crash with un-flushed writes already takes. Holding the lock
+  # instead does not make the un-flushed writes durable; it only makes the tenant unmovable.
+  #
+  # Telemetry (not just a log) so the un-flushed-writes-still-on-local state is alertable, matching
+  # what #11 established for the sibling branch.
+  defp keep_local_release_lease(state, what, reason) do
+    Logger.warning(
+      "shard #{state.id}: #{what} (#{inspect(reason)}); keeping local copy for recovery and " <>
+        "releasing the lease so the shard is not stranded"
+    )
+
+    :telemetry.execute(
+      [:fathom, :shard, :flush, :failed],
+      %{count: 1},
+      %{shard_id: state.id, reason: reason}
+    )
+
+    if is_map(state.lease), do: Storage.release_lease(state.id, state.lease)
     :ok
   end
 

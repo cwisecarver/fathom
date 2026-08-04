@@ -138,17 +138,44 @@ So the failure mode bites **precisely the shards the cold-tail sweep exists for*
 self-heals on its next request, an idle one never does. And it stalls the deploy gate — a CI job
 polling for `converged == true` waits forever on a fleet that is otherwise 100% done.
 
-This is **not fixed here.** It is a lease-lifecycle defect, not a rollout-telemetry one, and the
-right fix (why does a coordinator lease outlive its coordinator, and should a migrator be able to
-reclaim a lock whose coordinator is provably gone?) deserves its own investigation rather than
-being folded into a measurement change. What this run did was make it *findable*: the step now
-names every straggler with its lease holder and explains the shape, so the next person does not
-have to hand-write an Ecto query against `oban_jobs` to discover that a `scheduled` job with no
-errors is a held lease.
+### Root cause and fix (same day)
 
-Related open thread: **the snooze is unbounded and silent.** `max_attempts` climbs with each snooze,
-so the job never exhausts, never quarantines, and never surfaces. A shard that cannot acquire its
-lease for hours is indistinguishable from one that is about to.
+Reproduced deterministically at the unit level rather than diagnosed from the rig, because
+`down -v` had already taken the node logs. `flush_then_drop/1` has two branches that keep the local
+copy — a **transient flush error** and a **fence that could not confirm ownership** — and both also
+kept the **lock**. Keeping the copy is correct: it holds acked-but-unflushed writes. Keeping the
+lock was not, and the two are separable.
+
+`Shards.drain/2` cannot compensate, because it returns `:ok` immediately when the registry lookup
+is empty — which is exactly this state. And the migrator acquires as `migrator@<node>@<token>`, a
+different owner string from the coordinator's `<node>#<incarnation>`, so there is no same-owner
+silent reclaim to save it either.
+
+Both branches now release the lease through one shared helper, with a warning log and the alertable
+flush-failure telemetry that finding #11 established for the sibling branch. Releasing costs nothing
+that was actually being kept: `release_lease` is a conditional `DELETE … If-Match` the etag we last
+wrote, so the ownership-unconfirmed case is safe **by construction** — either we still hold the lock
+(release, correct) or we do not (no-op on someone else's lock, correct). If a peer then opens the
+shard it pulls the last durable object, and our divergent copy is arbitrated on this node's next
+open by the provenance sidecar (#1), quarantined recoverably as `.forked.<ts>` — the same path a
+node crash with un-flushed writes already takes. Holding the lock never made those writes durable.
+
+This is the **third and fourth instance of the same class** after review 2026-08-01 #9 and #11, so
+the regression tests joined their file (`test/fathom/shard_lease_release_test.exs`, now "four ways a
+coordinator stopped without releasing its lease"). The three discriminating tests assert the
+**foreign-owner** view and all fail against the unfixed code. The same-node re-open assertion passes
+either way — a coordinator silently reclaims its own node's lock — and is labelled in the file as a
+value guard rather than a regression test, since that is precisely the property that made the
+production symptom so quiet.
+
+**Still open, and deliberately separate: the snooze is unbounded and silent.** `max_attempts` climbs
+with each snooze, so the job never exhausts, never quarantines, and never surfaces. A shard that
+cannot acquire its lease for hours is indistinguishable from one that is about to. The lock leak
+that motivated it is fixed, but any *other* cause of a long-held lease would still be invisible.
+
+What the rig contributed beyond the bug itself: the step now names every straggler with its lease
+holder and explains the shape, so nobody repeats the hand-written Ecto query against `oban_jobs` it
+took to learn that a `scheduled` job with an empty `errors` array means a held lease.
 
 ## What this changes
 
