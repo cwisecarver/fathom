@@ -163,15 +163,30 @@ That rules out all three of the paths that were suspected in turn: the drop path
 ownership-unconfirmed branches (fixed anyway — see below), and an exception between `acquire_lease`
 and the built state (guard added anyway — it closes a hazard the code's own comments describe).
 
-**The most likely reason it resists reproduction, and the next thing to try.** An in-process
-harness that opens and drains 300 shards concurrently does **not** leak a lock. The suite cannot
-currently express this bug at all, because `config/test.exs` sets `heartbeat_server: false` — so
-every coordinator in every test runs in **legacy mode**, while the rig runs **heartbeat mode**.
-Those are different fence, renewal and liveness paths. This is the same shape as the lesson already
-recorded for `Storage.Local` vs the S3 lock-etag contract: a gap between the test environment and
-production silently exempts every bug that lives on the other side of it. Closing that gap
-(heartbeat-mode coverage in the suite) is worth more than the one fix it would expose, and should
-come before another guess.
+**The most likely reason it resists reproduction.** An in-process harness that opens and drains 300
+shards concurrently does **not** leak a lock. The suite could not express this bug class at all,
+because `config/test.exs` sets `heartbeat_server: false` — so every coordinator in every test ran
+in **legacy mode**, while the rig runs **heartbeat mode**. Those are different fence, renewal and
+liveness paths. Same shape as the lesson already recorded for `Storage.Local` vs the S3 lock-etag
+contract: a gap between the test environment and production silently exempts every bug on the other
+side of it.
+
+**That gap is now closed** (`test/fathom/shard_lease_release_test.exs`): every mode-agnostic leak
+scenario is generated for both modes, each test asserts the mode actually took rather than trusting
+the setup, and the mode-specific ones say which and why. It paid for itself immediately — the drop
+path's **ownership-unconfirmed leak existed in heartbeat mode too**, and only the legacy version had
+ever been tested. Six of the fifteen tests fail against pre-fix code, across both modes.
+
+It did **not** surface the rig straggler. Two things worth knowing for whoever picks this up:
+
+- The first heartbeat fixture for the `:skip` branch was wrong in a way that passed quietly: killing
+  the `Heartbeat` process does not produce `:not_valid`, because a DOWN heartbeat **degrades to the
+  legacy renew fence** and succeeds. The real state is the process alive with its renewal deadline
+  not comfortably ahead. That degrade path is now pinned separately, and labelled as the
+  non-regression test it is.
+- So heartbeat mode is no longer a blind spot for the *drop* and *open* paths — which means the
+  straggler is likely somewhere those tests still do not reach: concurrency between a coordinator
+  and the migrator's `Shards.drain` across nodes, or a path only the real S3 backend takes.
 
 ### Two leak paths found and fixed on the way (neither is the straggler)
 
