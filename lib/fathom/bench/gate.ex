@@ -26,6 +26,11 @@ defmodule Fathom.Bench.Gate do
     {:failover_cold_s3_p50_us, :higher_worse},
     {:failover_warm_s3_p50_us, :higher_worse},
     {:dir_resolve_p50_us, :higher_worse},
+    # The LIVE directory path, gated from 2026-08-03 (#41.6). `dir_resolve_p50_us` above is
+    # control-plane only (provision/fork/migrate) and stopped being the per-request path when the
+    # Recorder landed — it was standing in for a cost it no longer represents. This is what
+    # per-checkout directory work actually costs, and unlike resolve it scales with DENSITY.
+    {:dir_recorder_flush_rows_per_s, :lower_worse},
     # Renamed from `copy_rows_per_s` on 2026-07-31, when the copy bench moved from a
     # three-column toy table to `Fathom.Keystone`. Rows are far wider now, so the two numbers
     # measure different work and the old series is not comparable. A NEW NAME is the honest way
@@ -55,6 +60,14 @@ defmodule Fathom.Bench.Gate do
     # the one that would have caught it.
     {:hrana_rt_us, :higher_worse},
     {:wire_rows_per_s, :lower_worse},
+    # The OTHER encoder, gated from 2026-08-03 (#41.7). `Filo.Value` has TWO encoders and the
+    # gate only ran one: `wire_rows_per_s` drives `encode_json/1`, while `encode/1` — the
+    # tagged-map builder whose own moduledoc says that layer "roughly doubled" per-cell cost — is
+    # what `Cursor.entries/2` and `Protobuf.encode_value/1` reach, i.e. exactly when result sets
+    # are large. Gated at the FUNCTION, not through the cursor HTTP transport: Filo.Client does
+    # not do cursors, and `encode/1` is the code both transports share and the whole of the
+    # per-cell risk. Transport framing stays ungated — a stated limit, not an oversight.
+    {:wire_encode_rows_per_s, :lower_worse},
     # The write path and per-stream open, gated from 2026-08-02. Both were ADDED to the bench by
     # review #41.1/#41.3 and verified to discriminate — but were never added HERE, so for a day
     # they were measured, printed, written to perf_history.jsonl, and never compared. A metric the

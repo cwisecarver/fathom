@@ -71,6 +71,7 @@ defmodule Fathom.Bench do
   @served_rows 200
   @concurrent_shards 64
   @concurrent_ms 1_000
+  @recorder_rows 2_000
   @warm_shards 200
   @warm_size_kb 256
   @hrana_rt_samples 200
@@ -82,6 +83,7 @@ defmodule Fathom.Bench do
     :warm_s3,
     :failover_rto,
     :dir_resolve,
+    :dir_recorder,
     :copy,
     :fanout,
     :served,
@@ -89,6 +91,7 @@ defmodule Fathom.Bench do
     :hrana_rt,
     :hrana_open_rt,
     :wire_rows,
+    :wire_encode,
     :flush
   ]
 
@@ -128,6 +131,11 @@ defmodule Fathom.Bench do
       failover_cold_s3_p50_us: rto && rto.cold_us,
       failover_warm_s3_p50_us: rto && rto.warm_us,
       dir_resolve_p50_us: run_if(only, :dir_resolve, fn -> dir_resolve(opts) end),
+      # The path per-checkout directory work ACTUALLY takes since the Recorder landed (#41.6);
+      # dir_resolve above is control-plane only and was standing in for a per-request cost it no
+      # longer represents.
+      dir_recorder_flush_rows_per_s:
+        run_if(only, :dir_recorder, fn -> dir_recorder_flush(opts) end),
       copy_keystone_rows_per_s: run_if(only, :copy, fn -> copy_throughput(opts) end),
       fanout_kb_per_shard: run_if(only, :fanout, fn -> fanout(opts) end),
       # The SERVED regime (#41.2). fanout above holds NO connections, so it only ever measured
@@ -148,6 +156,10 @@ defmodule Fathom.Bench do
       # a baton-resumed stream and the open is explicitly excluded from the timed window.
       hrana_open_rt_us: run_if(only, :hrana_open_rt, fn -> hrana_open_rt(opts) end),
       wire_rows_per_s: run_if(only, :wire_rows, fn -> wire_rows(opts) end),
+      # The OTHER encoder (#41.7). wire_rows_per_s drives encode_json/1; this drives encode/1,
+      # the tagged-map builder Cursor and Protobuf reach, whose own moduledoc says the tagged-map
+      # layer "roughly doubled" per-cell cost.
+      wire_encode_rows_per_s: run_if(only, :wire_encode, fn -> wire_encode_rows(opts) end),
       # The write path. Before this, NOTHING in the harness executed a line of the durability
       # flush — setup/1 sets :shard_flush_interval_ms to 0 (#41.3).
       flush_p50_us: run_if(only, :flush, fn -> flush_p50(opts) end)
@@ -503,6 +515,63 @@ defmodule Fathom.Bench do
     end
   end
 
+  @doc """
+  `dir_recorder_flush_rows_per_s` — rows/sec through `Fathom.Directory.Recorder.flush/0`
+  (expert review 2026-08-01 #41.6).
+
+  **`dir_resolve_p50_us` is not the request path and has not been since the Recorder landed.**
+  `Directory.resolve/1`'s live callers are `Fathom.Tenants` (provision, fork) and
+  `Migrator.ShardMigration` — provisioning and migration, all control-plane. It stays gated
+  because it still guards that reader, but it was standing in for a per-request cost it no
+  longer represents, and `docs/benchmark-plan.md` said so in as many words until this commit.
+
+  What per-checkout directory work actually costs now is THIS: touches coalesce into ETS and are
+  batch-flushed, so the live cost is an `:ets.select` walk plus one `:ets.take` per touched
+  shard, then `insert_all` in 1,000-row chunks — and it scales with DENSITY. At 30k active
+  shards that is ~30k ETS takes and ~30 multi-row upserts every second against a `pool_size` of
+  25, which is the shape that falls over quietly.
+  """
+  @spec dir_recorder_flush(keyword()) :: float() | nil
+  def dir_recorder_flush(opts \\ []) do
+    setup(opts)
+    n = Keyword.get(opts, :recorder_rows, @recorder_rows)
+    trials = Keyword.get(opts, :trials, @default_trials)
+
+    with :ok <- ensure_repo(),
+         true <- directory_ready?(),
+         :ok <- ensure_started(Fathom.Directory.Recorder, []) do
+      # Drain anything buffered before timing, so the first trial is not credited with a
+      # neighbour's rows.
+      _ = Fathom.Directory.Recorder.flush()
+
+      ids =
+        Enum.map(1..n, fn i -> "bench_rec_#{System.unique_integer([:positive])}_#{i}" end)
+
+      result =
+        trials
+        |> times(fn _ ->
+          Enum.each(ids, &Fathom.Directory.Recorder.record/1)
+          {us, flushed} = :timer.tc(fn -> Fathom.Directory.Recorder.flush() end)
+
+          # The whole point is the batch upsert; a flush that drained nothing would report an
+          # enormous rows/sec for work that never happened.
+          if flushed < n do
+            raise "recorder flush drained #{flushed}/#{n} rows — measuring nothing"
+          end
+
+          flushed / (us / 1_000_000)
+        end)
+        |> median()
+
+      Enum.each(ids, &cleanup_resolve_row/1)
+      result
+    else
+      _ ->
+        Logger.warning("dir_recorder_flush bench skipped: Postgres/shards table unavailable")
+        nil
+    end
+  end
+
   # --- migration copy throughput ------------------------------------------
 
   @doc """
@@ -737,6 +806,75 @@ defmodule Fathom.Bench do
 
       median(samples)
     end)
+  end
+
+  @doc """
+  `wire_encode_rows_per_s` — rows/sec through `Filo.Value.encode/1`, the OTHER encoder
+  (expert review 2026-08-01 #41.7).
+
+  `Filo.Value` has two encoding PATHS and the gate only ever ran one. `wire_rows_per_s` drives
+  `encode_json/1`, which emits JSON directly. The other path builds tagged maps with `encode/1`
+  and then serialises them, and `Filo.Value`'s own moduledoc records that the tagged-map layer
+  "roughly doubled" per-cell cost. `Cursor.entries/2` takes it for `rows: :maps`, and
+  `Protobuf.encode_value/1` consumes the same maps — i.e. exactly when result sets are large.
+
+  **This times `encode/1` FOLLOWED BY the JSON serialisation, not `encode/1` alone**, and the
+  first draft got that wrong. Measured per cell on keystone rows:
+
+      encode/1 alone          0.053 µs   <- FASTER than encode_json/1; times half the work
+      encode_json/1           0.111 µs
+      encode/1 + Jason        0.269 µs   <- 2.42x, the doubling the moduledoc describes
+
+  Timing `encode/1` by itself made the "slower encoder" look 0.41x the cost of the fast one,
+  because building a map is cheap and the expense is serialising it afterwards. A metric that
+  reads *better* than its comparison is the tell that it is measuring the wrong span.
+
+  **NOT driven through the cursor HTTP transport**, which is what the review proposed.
+  `Filo.Client` states outright that cursors are outside its scope, so that shape would mean new
+  HTTP plumbing to cover a path the finding itself calls "no live bug today — coverage only".
+  This is the per-cell cost, which is the whole of the risk; cursor/protobuf FRAMING stays
+  ungated, and that is a deliberate, stated limit rather than an oversight.
+
+  Same keystone source as `wire_rows_per_s`, so every SQLite storage class — including the BLOB
+  that carried the 200x regression — crosses this path too.
+  """
+  @spec wire_encode_rows(keyword()) :: float() | nil
+  def wire_encode_rows(opts \\ []) do
+    setup(opts)
+    rows = Keyword.get(opts, :wire_rows, @wire_rows)
+    trials = Keyword.get(opts, :trials, @default_trials)
+
+    path = Fathom.Shard.db_path("benchencode")
+    drop_db(path)
+    {:ok, _} = Fathom.Keystone.build!(path, rows: rows)
+    {:ok, conn} = Connection.open(path)
+
+    try do
+      {:ok, %{rows: fetched}} = Connection.query(conn, "SELECT * FROM ks_scalars", [])
+
+      # Assert the fixture before timing it: encoding zero rows would report a spectacular
+      # rows/sec for work that never happened (the `flush_p50_us` 2 µs lesson).
+      if fetched == [], do: raise("wire_encode bench read 0 rows — measuring nothing")
+
+      cells = length(fetched) * length(hd(fetched))
+      if cells == 0, do: raise("wire_encode bench found 0 cells — measuring nothing")
+
+      trials
+      |> times(fn _ ->
+        {us, _} =
+          :timer.tc(fn ->
+            Enum.each(fetched, fn row ->
+              row |> Enum.map(&Filo.Value.encode/1) |> Jason.encode!()
+            end)
+          end)
+
+        length(fetched) / (us / 1_000_000)
+      end)
+      |> median()
+    after
+      Connection.close(conn)
+      drop_db(path)
+    end
   end
 
   # Starts a real Filo listener on a loopback port, opens one client stream routed to `shard`
