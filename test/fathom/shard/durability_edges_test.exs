@@ -13,6 +13,46 @@ defmodule Fathom.Shard.DurabilityEdgesTest do
   alias Fathom.Shard.Storage.Local
   alias Fathom.Shard.WriteCounter
 
+  describe "a closed connection leaves the main .db complete" do
+    # `Migrator.Copy.migrate_chain/3` does a plain `File.cp` of the main file — no `-wal` — so it
+    # depends on `Connection.close/1` having folded the WAL in. SQLite skips the close-time
+    # checkpoint while statements are still open, so ANY unreleased prepare in `Connection` breaks
+    # a module that never touches `Connection` directly.
+    #
+    # That is not hypothetical: reading `PRAGMA page_size` for #21 prepared a statement and did not
+    # release it, and CI came back with three `copy_test` failures — all
+    # `{:error, "no such table: app_thing"}`, i.e. the copy was missing a table the source had
+    # committed. Green on the parent commit, red on all three OTP versions after.
+    #
+    # THIS TEST DOES NOT REPRODUCE THAT LOCALLY. It passed against the unfixed code here, and so
+    # did the full suite, twice — the statement's resource NIF is evidently collected before close
+    # often enough on this machine. It is kept because it pins the CROSS-MODULE invariant in the
+    # place that owns it, and because CI is a real oracle for it even when this box is not.
+    test "a plain File.cp of the main file carries committed rows" do
+      src = Path.join(System.tmp_dir!(), "walfold_#{System.unique_integer([:positive])}.db")
+      cp = src <> ".copy"
+
+      on_exit(fn ->
+        for s <- ["", "-wal", "-shm"], do: File.rm(src <> s)
+        for s <- ["", "-wal", "-shm"], do: File.rm(cp <> s)
+      end)
+
+      {:ok, c} = Fathom.Shard.Connection.open(src)
+      :ok = Fathom.Shard.Connection.exec(c, "CREATE TABLE app_thing (id INTEGER, name TEXT)")
+      :ok = Fathom.Shard.Connection.exec(c, "INSERT INTO app_thing VALUES (1, 'alice')")
+      Fathom.Shard.Connection.close(c)
+
+      File.cp!(src, cp)
+      {:ok, c2} = Fathom.Shard.Connection.open(cp)
+      result = Fathom.Shard.Connection.query(c2, "SELECT name FROM app_thing", [])
+      Fathom.Shard.Connection.close(c2)
+
+      assert {:ok, %{rows: [["alice"]]}} = result,
+             "close/1 did not fold the WAL into the main file — a copy of it is incomplete, " <>
+               "which is what Migrator.Copy silently receives"
+    end
+  end
+
   describe "#39 — the dirtiness seed fails DIRTY when the counter table is gone" do
     test "bump_strict/1 raises where bump/1 rescues" do
       # bump/1's rescue is correct for a per-write bump ("the next write re-dirties") and WRONG

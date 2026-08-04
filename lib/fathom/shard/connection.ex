@@ -115,12 +115,24 @@ defmodule Fathom.Shard.Connection do
   #
   # Not `query/3` either: this runs inside `configure/1` during `open/2`, before the statement
   # cache and deadline machinery that path expects are meaningful.
+  # RELEASES the statement. Leaving it open kept a schema snapshot alive on the connection for the
+  # rest of its life, and the failure showed up nowhere near here: `Copy.migrate/4` came back
+  # `{:error, "no such table: app_thing"}` because the destination connection could not see a
+  # table created after this pragma was read. Every other prepare in this module releases; this one
+  # did not, and a full local suite passed anyway — CI on other OTP versions is what caught it.
   defp page_size(conn) do
-    with {:ok, stmt} <- Sqlite3.prepare(conn, "PRAGMA page_size"),
-         {:ok, [[n]]} when is_integer(n) and n > 0 <- Sqlite3.fetch_all(conn, stmt) do
-      n
-    else
-      _ -> 4096
+    case Sqlite3.prepare(conn, "PRAGMA page_size") do
+      {:ok, stmt} ->
+        result = Sqlite3.fetch_all(conn, stmt)
+        Sqlite3.release(conn, stmt)
+
+        case result do
+          {:ok, [[n]]} when is_integer(n) and n > 0 -> n
+          _ -> 4096
+        end
+
+      _ ->
+        4096
     end
   end
 
