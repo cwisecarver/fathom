@@ -25,6 +25,12 @@ defmodule Fathom.Migrator do
   # sweeps below filter candidates against jobs already in these states before inserting.
   @unique_states ~w(scheduled available executing retryable suspended)
 
+  # The trailing window `status/0` measures the rollout rate over (expert review 2026-08-01 #43).
+  # One hour because that is `ReconcileJob`'s own cron period: a shorter window reads zero for
+  # most of every hour (the sweep enqueues in one burst then goes quiet), which would render the
+  # ETA meaningless exactly when an operator is watching a cold-tail rollout crawl.
+  @rate_window_seconds 3600
+
   @doc """
   Records a released shard-schema `version` (HEAD becomes its max), carrying the
   captured SQL `statements` the rollout replays per shard. `template_migration_count`
@@ -353,26 +359,71 @@ defmodule Fathom.Migrator do
   app version" signal; `failed` surfaces quarantined shards to triage; `pending_review` lists
   versions held below HEAD awaiting operator sign-off (#1/#6). Exposed over HTTP at
   `GET /api/migrations/status`.
+
+  **Rate and ETA (expert review 2026-08-01 #43).** `ReconcileJob` converges the cold tail at
+  `:reconcile_batch_size` shards per hourly cron — 100/hour by default, i.e. months for a deep
+  fleet — and until now an operator had nothing to raise that knob *from*. `rate_per_hour` is
+  shards that reached HEAD in the trailing hour; `eta_seconds` is `laggards / rate` projected at
+  that rate. Both are `nil` when there is nothing to project: `eta_seconds` is `nil` while the
+  rate is 0 (a stalled or not-yet-started rollout has no finish time — reporting a huge number
+  would read as progress) and `0` when already converged.
+
+  The rate is measured, not assumed, so it prices in whatever the real ceiling is — batch size,
+  the `migrations` queue concurrency, per-shard S3 round trips, or drain contention with live
+  traffic. Raising `:reconcile_batch_size` and watching `rate_per_hour` fail to follow is the
+  signal that the bottleneck is somewhere else.
   """
   @spec status() :: %{
           head: non_neg_integer(),
           laggards: non_neg_integer(),
           failed: non_neg_integer(),
           converged: boolean(),
-          pending_review: [pos_integer()]
+          pending_review: [pos_integer()],
+          rate_per_hour: non_neg_integer(),
+          eta_seconds: non_neg_integer() | nil
         }
   def status do
     head = head()
     laggards = Directory.count_laggards(head)
+    rate = rollout_rate(head)
 
     %{
       head: head,
       laggards: laggards,
       failed: Directory.count_failed(),
       converged: laggards == 0,
-      pending_review: Enum.map(pending_review(), & &1.version)
+      pending_review: Enum.map(pending_review(), & &1.version),
+      rate_per_hour: rate,
+      eta_seconds: eta_seconds(laggards, rate)
     }
   end
+
+  @doc """
+  Shards that reached `head_version` in the trailing hour — the fleet rollout rate in shards/hour
+  (expert review 2026-08-01 #43). `head_version` defaults to the current HEAD.
+
+  Zero HEAD (no release yet) short-circuits to 0 without a query — there is no rollout to rate.
+  (The query would also return 0, since a shard at the v0 default has never cut over and so has a
+  NULL `cutover_at`; this is a saved round trip on every `status/0` before the first release, not
+  a correctness guard.)
+  """
+  @spec rollout_rate(non_neg_integer() | nil) :: non_neg_integer()
+  def rollout_rate(head_version \\ nil) do
+    case head_version || head() do
+      0 ->
+        0
+
+      v ->
+        since = DateTime.add(DateTime.utc_now(), -@rate_window_seconds)
+        Directory.count_cutovers_since(v, since)
+    end
+  end
+
+  # nil, not :infinity or a huge integer — a stalled rollout has no finish time, and any number
+  # here renders on a dashboard as if the rollout were moving.
+  defp eta_seconds(0, _rate), do: 0
+  defp eta_seconds(_laggards, 0), do: nil
+  defp eta_seconds(laggards, rate), do: ceil(laggards / rate * @rate_window_seconds)
 
   @doc """
   Post-revert template drift check (expert review #32). After a fleet revert yanks version vN and

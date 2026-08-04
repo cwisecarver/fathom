@@ -528,6 +528,39 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  How many active shards reached `head_version` at or after `since` — the numerator of the fleet
+  rollout rate (expert review 2026-08-01 #43).
+
+  **Why Postgres and not the `[:fathom, :migrator, :shard_migrated]` counter the finding proposes:**
+  a telemetry counter is node-local and dies with the node, but `Migrator.status/0` is the
+  *fleet* deploy gate — a rate assembled from one node's counter under-reports the rollout by
+  however many nodes are running, and reads zero after any node restart mid-rollout. `cutover_at`
+  is already stamped fleet-wide by `cutover/2` and survives both. The counter still ships, for
+  per-node dashboards; this is what the gate reads.
+
+  Scoped to `schema_version == head_version` so a **revert** is not counted as rollout progress:
+  `cutover/2` stamps `cutover_at` on the way back down too, and a reverted shard lands below head.
+
+  **The `last_active_at` predicate is deliberately redundant** — do not "simplify" it away. There
+  is no index on `cutover_at` (and `shards` is the system's hottest write table, where
+  `20260726023618` deleted an index precisely to stop paying for one), but
+  `shards_active_schema_version_last_active_at_index` covers `(schema_version, last_active_at)
+  WHERE status = 'active'`. `cutover/2` stamps both columns with the same instant and
+  `last_active_at` only ever moves forward (`record_batch/1` merges with GREATEST), so
+  `cutover_at >= since` **implies** `last_active_at >= since`. Stating the implied half lets the
+  planner range-scan the existing index instead of filtering every shard at head on the heap.
+  """
+  @spec count_cutovers_since(non_neg_integer(), DateTime.t()) :: non_neg_integer()
+  def count_cutovers_since(head_version, %DateTime{} = since) do
+    from(s in Shard,
+      where:
+        s.schema_version == ^head_version and s.status == "active" and
+          s.cutover_at >= ^since and s.last_active_at >= ^since
+    )
+    |> Repo.aggregate(:count)
+  end
+
+  @doc """
   Active shards currently at `version` — the set a fleet revert flips back.
 
   Materializes the WHOLE set as full structs, so at fleet scale (millions at a version) this is a

@@ -92,7 +92,8 @@ JSON endpoint your CI/CD can poll (behind the admin BasicAuth, on `:4000`):
 
 ```bash
 curl -su "$ADMIN_USER:$ADMIN_PASS" https://admin.fathom.example/api/migrations/status
-# {"head":7,"laggards":0,"failed":0,"converged":true,"pending_review":[]}
+# {"head":7,"laggards":0,"failed":0,"converged":true,"pending_review":[],
+#  "rate_per_hour":0,"eta_seconds":0}
 ```
 
 - `converged: true` (⇔ `laggards == 0`) — every active shard is at HEAD; safe to ship the new app
@@ -102,8 +103,24 @@ curl -su "$ADMIN_USER:$ADMIN_PASS" https://admin.fathom.example/api/migrations/s
 - `pending_review: [v]` — a captured version is **held** for operator review (a data migration or a
   gap); HEAD won't advance to it until you `approve_review`.
 - `failed: N` — N shards are **quarantined** (`migration_failed`) — see triage below.
+- `rate_per_hour: N` — shards that reached HEAD in the trailing hour (measured from the directory's
+  `cutover_at`, so it is fleet-wide, not per-node). A **revert** is not counted as progress.
+- `eta_seconds: N` — `laggards / rate` at the current rate. **`null` means the rollout is not
+  moving** (rate 0) — a stall, not a long wait. `0` once converged.
 
 A CI gate is just: poll until `converged == true` and `pending_review == []`, then deploy.
+
+### Sizing the rollout
+
+`ReconcileJob` sweeps `:reconcile_batch_size` shards (default 100) on an hourly cron, so the cold
+tail converges at ~2,400/day out of the box — months for a deep fleet. `rate_per_hour` is what you
+raise `RECONCILE_BATCH_SIZE` *against*: raise it, watch the rate, and stop when the rate stops
+following. That plateau tells you the ceiling has moved somewhere else — the `migrations` queue
+concurrency, the per-shard S3 round trips, or drain contention with live traffic — and raising the
+batch size further only adds latency pressure on live tenants without converging faster.
+
+Per-node throughput is the `[:fathom, :migrator, :shard_migrated]` telemetry event
+(`%{count: 1}`, metadata `%{shard_id, from, to}`), emitted once per shard that actually moved.
 
 ## 4. Revert — if a migration is bad
 

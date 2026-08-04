@@ -39,7 +39,19 @@ defmodule Fathom.Migrator.ShardMigrationJob do
       # retirement outbox, expert review 2026-07-18 #5), so a Postgres blip can't leave a cut-over
       # shard without a scheduled retirement — and this job's crash-forward retry (bare `:ok` above)
       # doesn't need to re-enqueue.
-      {:ok, %{from: _from}} ->
+      {:ok, %{from: from}} ->
+        # Expert review 2026-08-01 #43: one event per shard that actually moved, for a per-node
+        # rollout-throughput dashboard. Emitted HERE and not on the bare `:ok` above, which is the
+        # crash-forward retry of a shard some earlier attempt already cut over — counting it would
+        # inflate the rate by the retry rate. The fleet-wide rate `Migrator.status/0` reports is
+        # derived from `cutover_at` in Postgres instead, because a counter is node-local and dies
+        # with the node (see `Fathom.Directory.count_cutovers_since/2`).
+        :telemetry.execute(
+          [:fathom, :migrator, :shard_migrated],
+          %{count: 1},
+          %{shard_id: shard_id, from: from, to: target}
+        )
+
         :ok
 
       {:retry, reason} ->

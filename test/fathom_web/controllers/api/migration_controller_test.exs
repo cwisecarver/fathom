@@ -58,4 +58,17 @@ defmodule FathomWeb.Api.MigrationControllerTest do
     assert body["failed"] == 1
     assert body["pending_review"] == [2]
   end
+
+  # Expert review 2026-08-01 #43: the rate/ETA has to reach the operator over HTTP, not just from
+  # iex — the point of the finding is that whoever tunes :reconcile_batch_size is reading this
+  # endpoint. `put_shard/3` writes no cutover_at (it is not the cutover path), so this fleet has a
+  # laggard and no measured rate: eta must serialize as JSON null, not as a number.
+  test "carries the rollout rate and ETA", %{conn: conn} do
+    {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
+    put_shard("rate_behind", 0)
+
+    body = conn |> auth() |> get("/api/migrations/status") |> json_response(200)
+    assert body["rate_per_hour"] == 0
+    assert body["eta_seconds"] == nil
+  end
 end

@@ -107,6 +107,35 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1})
   end
 
+  # Expert review 2026-08-01 #43. The event is the per-node rollout-throughput signal, so it must
+  # fire exactly once per shard that ACTUALLY moved. The second perform_job here is the
+  # crash-forward retry (ShardMigration.run returns bare :ok — the directory is already at target);
+  # counting it would inflate a node's reported rate by its retry rate, which is precisely wrong
+  # since retries spike when the rollout is struggling.
+  test "emits shard_migrated once per real migration, not on the crash-forward retry",
+       %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+
+    handler = "shard-migrated-#{System.unique_integer([:positive])}"
+    parent = self()
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :migrator, :shard_migrated],
+      fn _e, measurements, meta, _ -> send(parent, {:migrated, measurements, meta}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+    assert_receive {:migrated, %{count: 1}, %{shard_id: ^shard, from: 1, to: 2}}
+
+    assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+    refute_receive {:migrated, _, _}
+  end
+
   test "RetirementJob drops the retained version", %{shard: shard} do
     seed_v1!(shard)
     :ok = Storage.retain(shard, 1)
