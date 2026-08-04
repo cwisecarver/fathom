@@ -65,6 +65,12 @@ defmodule Fathom.Bench do
   @resolve_samples 200
   @copy_rows 100_000
   @fanout_n 200
+  # Small on purpose: each held connection is ~3 fds (db + -wal + -shm), so the served bench is
+  # fd-bound long before it is interesting to push. It measures the per-shard SLOPE, not a ceiling.
+  @served_n 64
+  @served_rows 200
+  @concurrent_shards 64
+  @concurrent_ms 1_000
   @warm_shards 200
   @warm_size_kb 256
   @hrana_rt_samples 200
@@ -78,6 +84,8 @@ defmodule Fathom.Bench do
     :dir_resolve,
     :copy,
     :fanout,
+    :served,
+    :concurrent,
     :hrana_rt,
     :hrana_open_rt,
     :wire_rows,
@@ -99,8 +107,19 @@ defmodule Fathom.Bench do
     # run it once and split into the two perf-history metrics. Opt-in: nil without S3.
     rto = run_if(only, :failover_rto, fn -> failover_rto(opts) end)
 
+    # Same one-run-two-metrics split as `rto` above: p50 and p99 must describe the SAME sample
+    # set, or the gate compares two independent runs of a noisy bench and calls the difference a
+    # regression (expert review 2026-08-01 #41.5).
+    served = run_if(only, :served, fn -> served(opts) end)
+    conc = run_if(only, :concurrent, fn -> concurrent_checkout(opts) end)
+    cold = run_if(only, :cold_open, fn -> cold_open_stats(opts) end)
+    rt = run_if(only, :hrana_rt, fn -> hrana_rt_stats(opts) end)
+
     %{
-      cold_open_p50_us: run_if(only, :cold_open, fn -> cold_open(opts) end),
+      cold_open_p50_us: cold && cold.p50_us,
+      # The TAIL. Every other latency metric is a p50, so a change that leaves p50 flat and
+      # doubles p99 — a blocking call back into the coordinator mailbox, twice now — scored ~0%.
+      cold_open_p99_us: cold && cold.p99_us,
       # The cold-S3 path — nil unless an S3 endpoint is configured (opt-in).
       cold_open_s3_p50_us: run_if(only, :cold_open_s3, fn -> cold_open_s3(opts) end),
       # Aggregate warming rate (shards/s) pulling many shards from S3 at once — opt-in.
@@ -111,8 +130,19 @@ defmodule Fathom.Bench do
       dir_resolve_p50_us: run_if(only, :dir_resolve, fn -> dir_resolve(opts) end),
       copy_keystone_rows_per_s: run_if(only, :copy, fn -> copy_throughput(opts) end),
       fanout_kb_per_shard: run_if(only, :fanout, fn -> fanout(opts) end),
+      # The SERVED regime (#41.2). fanout above holds NO connections, so it only ever measured
+      # the ~16 KiB idle cost; this is the ~220 KiB one that actually binds a deployment.
+      # `:binary` is split out because the statement cache's sub-binary pin lands there and not
+      # in the process heap — one combined number would hide that whole class of regression.
+      served_kb_per_shard: served && served.total_kb,
+      served_binary_kb_per_shard: served && served.binary_kb,
+      # CONTENTION (#41.4). Every other metric here is serial, so a change that serialises the
+      # ETS counters, the LRU, or the coordinator GenServer.call left all of them flat.
+      concurrent_checkout_per_s: conc && conc.spread_per_s,
+      same_shard_checkout_per_s: conc && conc.same_shard_per_s,
       # No longer a placeholder (2026-07-31). Loopback wire software cost, not a network RTT.
-      hrana_rt_us: run_if(only, :hrana_rt, fn -> hrana_rt(opts) end),
+      hrana_rt_us: rt && rt.p50_us,
+      hrana_rt_p99_us: rt && rt.p99_us,
       # Per-STREAM open, which for HTTP SDKs is the per-REQUEST path (expert review
       # 2026-08-01 #41.1). hrana_rt_us above reuses one client, so every one of its samples is
       # a baton-resumed stream and the open is explicitly excluded from the timed window.
@@ -135,7 +165,29 @@ defmodule Fathom.Bench do
   cold (pulled from storage), matching production's pull-on-wake.
   """
   @spec cold_open(keyword()) :: float()
-  def cold_open(opts \\ []) do
+  def cold_open(opts \\ []), do: cold_open_stats(opts).p50_us
+
+  @doc """
+  `cold_open/1`'s samples reduced to BOTH p50 and p99 (expert review 2026-08-01 #41.5).
+
+  The gate was a pure ratio of p50s against the parent, which AGENTS.md forbids in as many
+  words: "Assert an absolute floor, not only a ratio… The ratio holds while throughput
+  collapses." A change that leaves p50 flat and doubles p99 — reintroducing a blocking Storage
+  call into the coordinator mailbox, which has happened twice — produces a ~0% delta and sails
+  through. `docs/benchmark-plan.md` records that moving the flush off-process was done for
+  "recurring **p99** checkout spikes", so the tail is the thing the harness most needed to see
+  and was the one thing it never reduced for.
+
+  One run, two reducers: no extra work, and the two numbers are guaranteed to describe the same
+  sample set rather than two separate runs of a noisy bench.
+  """
+  @spec cold_open_stats(keyword()) :: %{p50_us: float(), p99_us: float()}
+  def cold_open_stats(opts \\ []) do
+    samples = cold_open_samples(opts)
+    %{p50_us: p50(samples), p99_us: percentile(samples, 99)}
+  end
+
+  defp cold_open_samples(opts) do
     setup(opts)
     samples = Keyword.get(opts, :cold_open_samples, @cold_open_samples)
 
@@ -156,7 +208,6 @@ defmodule Fathom.Bench do
       teardown_open(id, handle)
       us
     end)
-    |> p50()
   end
 
   @doc """
@@ -524,6 +575,19 @@ defmodule Fathom.Bench do
   """
   @spec hrana_rt(keyword()) :: float() | nil
   def hrana_rt(opts \\ []) do
+    case hrana_rt_stats(opts) do
+      nil -> nil
+      stats -> stats.p50_us
+    end
+  end
+
+  @doc """
+  `hrana_rt/1`'s samples reduced to BOTH p50 and p99 — see `cold_open_stats/1` for why the tail
+  is gated at all (expert review 2026-08-01 #41.5). This is the wire's tail: a request-path
+  change that adds an occasional stall shows up here and nowhere else in the gate.
+  """
+  @spec hrana_rt_stats(keyword()) :: %{p50_us: float(), p99_us: float()} | nil
+  def hrana_rt_stats(opts \\ []) do
     samples = Keyword.get(opts, :hrana_rt_samples, @hrana_rt_samples)
 
     with_wire(opts, "benchrt", fn client ->
@@ -538,7 +602,7 @@ defmodule Fathom.Bench do
           {c, [t | acc]}
         end)
 
-      p50(us)
+      %{p50_us: p50(us), p99_us: percentile(us, 99)}
     end)
   end
 
@@ -785,6 +849,194 @@ defmodule Fathom.Bench do
     id = "bench_fanout_#{t}_#{i}"
     {:ok, pid, ref, _path} = Shards.checkout(id)
     {id, pid, ref}
+  end
+
+  # --- the SERVED regime ----------------------------------------------------
+
+  @doc """
+  `served_kb_per_shard` — BEAM memory (KiB) per shard held under a LIVE connection that has run a
+  query, reported as `{total, binary}` per shard (expert review 2026-08-01 #41.2).
+
+  `fanout/1` deliberately holds no connections, so it measures only the ~16 KiB **idle** regime.
+  The regime that actually binds a deployment is the ~220 KiB **served** one, and every
+  per-connection resource decision was invisible to the gate:
+
+    * `:shard_cache_size_kb` (`connection.ex`, default 2000 ⇒ up to 2 MiB of SQLite page cache
+      per held stream), and
+    * the statement cache's sub-binary pin, whose own fix comment says outright: "**It never
+      showed up in the density numbers because it lands in `:erlang.memory(:binary)`, not the
+      process heap.**"
+
+  Which is why `:binary` is reported separately rather than folded into the total — a regression
+  that pins sub-binaries moves `:binary` and leaves `:total` almost flat, so one number would
+  have hidden exactly the class of bug this metric exists for.
+
+  N is small (default #{@served_n}) on purpose: each held connection costs ~3 file descriptors
+  (db + `-wal` + `-shm`), so this is fd-bound long before it is interesting to push. It measures
+  the per-shard SLOPE, not a density ceiling — `mix fathom.scale` owns the ceiling.
+  """
+  @spec served(keyword()) :: %{total_kb: float(), binary_kb: float()}
+  def served(opts \\ []) do
+    setup(opts)
+    n = Keyword.get(opts, :served_n, @served_n)
+    trials = Keyword.get(opts, :trials, @default_trials)
+    rows = Keyword.get(opts, :served_rows, @served_rows)
+
+    results =
+      times(trials, fn t ->
+        collect_all()
+        before_total = :erlang.memory(:total)
+        before_bin = :erlang.memory(:binary)
+
+        handles = Enum.map(1..n, fn i -> open_served_shard(t, i, rows) end)
+
+        # Assert the precondition rather than trust it (the `flush_p50_us` 2 µs lesson: a metric
+        # whose work silently did not happen reports a spectacular number and the gate says OK).
+        # A held connection that never ran a query would measure the idle regime under a new name.
+        unless length(handles) == n do
+          raise "served bench opened #{length(handles)}/#{n} shards — measuring nothing"
+        end
+
+        collect_all()
+        total = :erlang.memory(:total) - before_total
+        bin = :erlang.memory(:binary) - before_bin
+
+        Enum.each(handles, &close_served_shard/1)
+        {total / n / 1024, bin / n / 1024}
+      end)
+
+    %{
+      total_kb: results |> Enum.map(&elem(&1, 0)) |> median(),
+      binary_kb: results |> Enum.map(&elem(&1, 1)) |> median()
+    }
+  end
+
+  defp open_served_shard(t, i, rows) do
+    id = "bench_served_#{t}_#{i}"
+    {:ok, pid, ref, path} = Shards.checkout(id)
+    {:ok, _} = Fathom.Keystone.build!(path, rows: rows)
+    {:ok, conn} = Connection.open(path)
+
+    # One real query per shard: primes the statement cache and the page cache, which is the whole
+    # difference between "a connection exists" and "a connection is serving".
+    {:ok, %{rows: got}} = Connection.query(conn, "SELECT * FROM ks_scalars LIMIT 50", [])
+
+    # The query has to actually RETURN rows, or this measures a connection that was opened and
+    # never used — the idle regime under a new name. (`SELECT * FROM keystone` silently failed
+    # this way in the first draft: wrong table, and the match on `{:ok, _}` would have accepted
+    # an empty result had the table merely been empty.)
+    if got == [], do: raise("served bench read 0 rows — the page/statement caches are cold")
+
+    {id, pid, ref, conn}
+  end
+
+  # --- contention -----------------------------------------------------------
+
+  @doc """
+  `concurrent_checkout_per_s` — checkout+checkin throughput with
+  `System.schedulers_online() * 4` processes hammering `#{@concurrent_shards}` warm shards for
+  `:concurrent_ms` (default #{@concurrent_ms}) (expert review 2026-08-01 #41.4).
+
+  **Nothing in the gate could see contention.** `cold_open`, `copy`, `fanout`, `hrana_rt` and
+  `wire_rows` are all serial; the only concurrent bench was `warm_all/1`, inside the opt-in S3
+  path. Yet the things most likely to regress under load are all concurrency-tuned:
+  `write_concurrency` + `decentralized_counters` on `ShardLoad`/`ShardLatency`/`WriteCounter`, the
+  `Lru` CA-tree coarsening, `+SDio 10`, and the per-shard coordinator `GenServer.call`. A change
+  that serialises any of them leaves every serial p50 flat.
+
+  `spread` is the fleet shape — many shards, so the ETS counters and the LRU are the contended
+  resources. `same_shard` points every worker at ONE coordinator, which bounds its head-of-line
+  throughput: that `GenServer.call` is the single lock every stream on a hot shard queues behind,
+  and it is invisible to any spread measurement.
+  """
+  @spec concurrent_checkout(keyword()) :: %{spread_per_s: float(), same_shard_per_s: float()}
+  def concurrent_checkout(opts \\ []) do
+    setup(opts)
+    ms = Keyword.get(opts, :concurrent_ms, @concurrent_ms)
+    n = Keyword.get(opts, :concurrent_shards, @concurrent_shards)
+    workers = Keyword.get(opts, :concurrent_workers, System.schedulers_online() * 4)
+    trials = Keyword.get(opts, :trials, @default_trials)
+
+    spread_ids = Enum.map(1..n, fn i -> "bench_conc_#{i}" end)
+    all_ids = ["bench_conc_hot" | spread_ids]
+    Enum.each(all_ids, &warm_checkout_shard/1)
+
+    try do
+      %{
+        spread_per_s: median(times(trials, fn _ -> churn(spread_ids, workers, ms) end)),
+        same_shard_per_s:
+          median(times(trials, fn _ -> churn(["bench_conc_hot"], workers, ms) end))
+      }
+    after
+      # DRAIN, or this bench changes what every LATER bench measures. `all/1` runs them in one
+      # BEAM, and leaving 65 coordinators resident made `fanout_kb_per_shard` read 4.09 against a
+      # 3.77–4.09 band while the clean-tree baseline read 2.69 — the gate blocked at +52%. That is
+      # precisely the harness-topology hazard AGENTS.md records from the last time
+      # (`WriteCounter`/`FlushWatermark` in the shared `setup/1`, blocked at +46.5%): a new metric
+      # must not silently redefine an existing series. Scope the residue to the metric that made it.
+      Enum.each(all_ids, &Shards.drain(&1, 5_000))
+    end
+  end
+
+  # Open once so the timed window measures CHECKOUT contention, not cold-open storage cost — the
+  # thing cold_open/1 already owns and which would otherwise dominate and mask it.
+  defp warm_checkout_shard(id) do
+    {:ok, pid, ref, _path} = Shards.checkout(id)
+    Fathom.Shard.checkin(pid, ref)
+    id
+  end
+
+  defp churn(ids, workers, ms) do
+    deadline = System.monotonic_time(:millisecond) + ms
+    parent = self()
+
+    pids =
+      Enum.map(1..workers, fn w ->
+        spawn_link(fn -> send(parent, {:done, self(), churn_loop(ids, w, deadline, 0)}) end)
+      end)
+
+    total =
+      Enum.reduce(pids, 0, fn pid, acc ->
+        receive do
+          {:done, ^pid, count} -> acc + count
+        after
+          # Generous: the loop is deadline-bounded, so overshooting this means a worker WEDGED —
+          # which is itself the regression this metric is for, and must not read as a fast zero.
+          ms * 10 + 5_000 -> raise "concurrent checkout worker did not finish — wedged?"
+        end
+      end)
+
+    if total == 0, do: raise("concurrent checkout completed 0 operations — measuring nothing")
+
+    total * 1000 / ms
+  end
+
+  defp churn_loop(ids, w, deadline, count) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      count
+    else
+      id = Enum.at(ids, rem(count + w, length(ids)))
+      {:ok, pid, ref, _path} = Shards.checkout(id)
+      Fathom.Shard.checkin(pid, ref)
+      churn_loop(ids, w, deadline, count + 1)
+    end
+  end
+
+  # GC EVERY process, not just this one. `:erlang.garbage_collect/0` collects the caller, which is
+  # enough for a `:total` delta dominated by the caller's own heap — but refcounted binaries are
+  # released only when the process HOLDING them collects, and here that is 64 coordinators and 64
+  # connections. Measured self-GC-only, `:erlang.memory(:binary)` came back at **-2.6 KiB/shard**:
+  # not a small number, a meaningless one, and a metric that can go negative makes the gate's
+  # ratio nonsense (a move from -2.6 to -1 is a 62% "regression"). A metric this cheap to get
+  # wrong is exactly the kind AGENTS.md says to distrust until it is proven to measure something.
+  defp collect_all do
+    Enum.each(Process.list(), &:erlang.garbage_collect/1)
+  end
+
+  defp close_served_shard({id, pid, ref, conn}) do
+    Connection.close(conn)
+    Fathom.Shard.checkin(pid, ref)
+    Shards.drain(id, 5_000)
   end
 
   defp close_fanout_shard({id, pid, ref}) do

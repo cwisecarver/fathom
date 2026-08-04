@@ -34,6 +34,20 @@ defmodule Fathom.Bench.Gate do
     # a code regression forever. Any future harness change to this bench should rename again.
     {:copy_keystone_rows_per_s, :lower_worse},
     {:fanout_kb_per_shard, :higher_worse},
+    # The SERVED regime, gated from 2026-08-03 (#41.2). `fanout_kb_per_shard` holds no
+    # connections, so every per-connection resource decision — `:shard_cache_size_kb`'s up-to-2 MiB
+    # page cache per held stream, the statement cache's sub-binary pin — was outside the gate.
+    # `:binary` is a SEPARATE metric because the pin lands there and leaves the total nearly flat;
+    # folding them would hide exactly the regression this is for.
+    {:served_kb_per_shard, :higher_worse},
+    {:served_binary_kb_per_shard, :higher_worse},
+    # CONTENTION, gated from 2026-08-03 (#41.4). Every other gated metric is single-threaded, so
+    # the concurrency-tuned machinery (write_concurrency + decentralized_counters on the ETS
+    # counters, the Lru CA-tree, +SDio, the per-shard coordinator GenServer.call) had no gate at
+    # all. `same_shard` is separate on purpose: it bounds ONE coordinator's head-of-line
+    # throughput, which a spread measurement averages away.
+    {:concurrent_checkout_per_s, :lower_worse},
+    {:same_shard_checkout_per_s, :lower_worse},
     # The wire, gated from 2026-07-31. Before this the gate ran no Filo code at all, which is
     # how a 200x regression in row encoding stayed invisible: every other metric is SQLite,
     # storage, Postgres or BEAM memory. `hrana_rt_us` covers per-REQUEST overhead;
@@ -56,7 +70,21 @@ defmodule Fathom.Bench.Gate do
     # to tighten the p50 (and a fresh series, per the same-topology rule) — not a looser threshold,
     # which would just re-blind the write path.
     {:hrana_open_rt_us, :higher_worse},
-    {:flush_p50_us, :higher_worse}
+    {:flush_p50_us, :higher_worse},
+    # THE TAIL, gated from 2026-08-03 (expert review #41.5). Every metric above is a p50, and
+    # `delta/4` is a pure ratio — which AGENTS.md forbids in as many words ("Assert an absolute
+    # floor, not only a ratio… The ratio holds while throughput collapses"). A change that leaves
+    # p50 flat and doubles p99 — a blocking Storage call back in the coordinator mailbox, which
+    # has happened twice — scored ~0% and sailed through. `docs/benchmark-plan.md` records that
+    # moving the flush off-process was done for "recurring p99 checkout spikes", so the tail was
+    # both the reason for the work and the one thing the gate never looked at.
+    #
+    # These reduce the SAME samples the p50s do (`cold_open_stats/1`, `hrana_rt_stats/1`), so they
+    # cost nothing to collect and cannot disagree with their own p50 about which run they describe.
+    # A tail is noisier than a median by construction — if either starts false-blocking, raise the
+    # sample count to tighten it, do not loosen the threshold.
+    {:cold_open_p99_us, :higher_worse},
+    {:hrana_rt_p99_us, :higher_worse}
   ]
 
   @doc "The gated metrics and their regression direction."

@@ -24,6 +24,36 @@ defmodule Fathom.BenchTest do
     assert us < 50_000, "cold-open p50 #{us}µs exceeded the 50ms ceiling"
   end
 
+  # ABSOLUTE ceilings, which the gate structurally cannot provide (expert review 2026-08-01
+  # #41.5). `Gate.delta/4` is a ratio against the parent on an uncontrolled host, so a slow drift
+  # that moves every commit a few percent never trips it, and a uniform collapse that moves parent
+  # and child together is invisible by construction — AGENTS.md: "The ratio holds while throughput
+  # collapses." These are the floor under the ratio. Deliberately generous (a dev build is slower
+  # than MIX_ENV=prod): they exist to catch an order-of-magnitude break, not to police noise.
+  test "the wire metrics clear their absolute bounds" do
+    rt = Fathom.Bench.hrana_rt(hrana_rt_samples: 30)
+    assert is_float(rt), "the loopback listener did not come up — this measured nothing"
+    assert rt < 20_000, "hrana round trip #{rt}µs exceeded the 20ms ceiling"
+
+    rows_per_s = Fathom.Bench.wire_rows(wire_rows: 200)
+    assert is_float(rows_per_s)
+
+    assert rows_per_s > 1_000,
+           "wire encode #{rows_per_s} rows/s fell under the 1k floor — the 200x row-encoding " <>
+             "regression this metric exists for was exactly this shape"
+  end
+
+  test "the p99 metrics describe the same run as their p50, and bound it" do
+    # One run, two reducers. If these ever came from separate runs the gate would compare two
+    # samples of a noisy bench and call the difference a regression.
+    stats = Fathom.Bench.cold_open_stats(cold_open_samples: 5)
+
+    assert stats.p99_us >= stats.p50_us,
+           "p99 #{stats.p99_us}µs below p50 #{stats.p50_us}µs — these are not the same samples"
+
+    assert stats.p99_us < 100_000, "cold-open p99 #{stats.p99_us}µs exceeded the 100ms ceiling"
+  end
+
   test "migration copy clears the throughput floor" do
     rows_per_s = Fathom.Bench.copy_throughput(copy_rows: 2_000, trials: 2)
     assert is_float(rows_per_s)
