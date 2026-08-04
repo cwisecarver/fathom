@@ -184,8 +184,17 @@ defmodule Fathom.Test.FaultyStorage do
     end
   end
 
+  # `run_before(:object_etag)` is what lets a test RAISE from a storage call that the coordinator
+  # makes DIRECTLY (not inside a rescued Task) while it already holds the lease — the warm open's
+  # `post_lease_warm_check/3`. Every other fault mode here returns an `{:error, _}` tuple, and a
+  # tuple takes the open's ordinary failure path, which already released. The un-covered class was
+  # an EXCEPTION (a `Req.TransportError` raised out of a HEAD under load), which skipped the
+  # release entirely and stranded the lock. See the guard in `Fathom.Shard.handle_continue/2`.
   @impl true
-  def object_etag(shard_id), do: Local.object_etag(shard_id)
+  def object_etag(shard_id) do
+    run_before(:object_etag)
+    Local.object_etag(shard_id)
+  end
 
   # Mirrors S3's conditional release: If-Match the etag WE last wrote. A mismatch is a 412,
   # which S3 treats as a no-op — the lock stays. Releasing with a lease whose lock_etag has

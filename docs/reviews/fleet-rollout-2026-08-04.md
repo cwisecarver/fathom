@@ -138,7 +138,42 @@ So the failure mode bites **precisely the shards the cold-tail sweep exists for*
 self-heals on its next request, an idle one never does. And it stalls the deploy gate — a CI job
 polling for `converged == true` waits forever on a fleet that is otherwise 100% done.
 
-### Root cause and fix (same day)
+### Status: two leak paths closed, the rig straggler STILL REPRODUCES
+
+Read this section before the next one. Two genuine lock-leak paths were found and fixed the same
+day, each with a test that fails against the unfixed code — and **neither was this bug**. A rebuilt
+rig reproduced the straggler both times (`roll8`, then `roll64`), so the fixes below are real but
+not sufficient. Recorded this way deliberately: a fix that is verified by tests and still does not
+close the field report is exactly the case that gets written up as "fixed" and quietly isn't.
+
+**What is now known, and what it rules out.** On the last run, with the fleet otherwise fully
+converged:
+
+- `roll64.lock` was the **only** lock object left in the entire bucket — 299 shards acquired and
+  released cleanly through the same code paths.
+- Its owner string is byte-identical to the owning node's **current** `Heartbeat.owner/0`
+  (`fathom@<node>#<incarnation>`), so it is a coordinator lock from the live incarnation, not a
+  leftover from a previous boot. `stealable_at` tracks the node's heartbeat, so it never expires.
+- No coordinator in that node's registry, no local `.db`, no `.forked.*`/`.fenced.*` quarantine.
+  The shard's `.db` object in storage is intact.
+- **Nothing was logged for that shard except `migration deferred`.** No exception (the new
+  post-acquire guard's error log fired zero times fleet-wide), no `self-fencing`, no flush failure.
+
+That rules out all three of the paths that were suspected in turn: the drop path's flush-error and
+ownership-unconfirmed branches (fixed anyway — see below), and an exception between `acquire_lease`
+and the built state (guard added anyway — it closes a hazard the code's own comments describe).
+
+**The most likely reason it resists reproduction, and the next thing to try.** An in-process
+harness that opens and drains 300 shards concurrently does **not** leak a lock. The suite cannot
+currently express this bug at all, because `config/test.exs` sets `heartbeat_server: false` — so
+every coordinator in every test runs in **legacy mode**, while the rig runs **heartbeat mode**.
+Those are different fence, renewal and liveness paths. This is the same shape as the lesson already
+recorded for `Storage.Local` vs the S3 lock-etag contract: a gap between the test environment and
+production silently exempts every bug that lives on the other side of it. Closing that gap
+(heartbeat-mode coverage in the suite) is worth more than the one fix it would expose, and should
+come before another guess.
+
+### Two leak paths found and fixed on the way (neither is the straggler)
 
 Reproduced deterministically at the unit level rather than diagnosed from the rig, because
 `down -v` had already taken the node logs. `flush_then_drop/1` has two branches that keep the local
@@ -160,13 +195,26 @@ shard it pulls the last durable object, and our divergent copy is arbitrated on 
 open by the provenance sidecar (#1), quarantined recoverably as `.forked.<ts>` — the same path a
 node crash with un-flushed writes already takes. Holding the lock never made those writes durable.
 
-This is the **third and fourth instance of the same class** after review 2026-08-01 #9 and #11, so
-the regression tests joined their file (`test/fathom/shard_lease_release_test.exs`, now "four ways a
-coordinator stopped without releasing its lease"). The three discriminating tests assert the
-**foreign-owner** view and all fail against the unfixed code. The same-node re-open assertion passes
-either way — a coordinator silently reclaims its own node's lock — and is labelled in the file as a
-value guard rather than a regression test, since that is precisely the property that made the
-production symptom so quiet.
+A third fix went in alongside them: an **exception between `acquire_lease` and the built state**.
+Every failure that path anticipated is an `{:error, _}` tuple, which reaches `open_with_lease/8`'s
+else branch and releases; an exception does not, because `handle_continue` never returns, so the
+GenServer still holds the pre-open `%{id: shard_id}` state and `terminate/2` falls to the catch-all
+clause with no lease to release. The code's own comments describe this hazard, and review
+2026-08-01 #33 had fixed exactly one instance of it (a raise inside `fork_evidence/2`) while
+`resolve_fork/4`, `revalidate_takeover/5` and `promote_pull/2` still ran storage and File calls
+directly in the coordinator. The whole post-acquire region is now guarded: release, then stop with
+`{:shutdown, _}` like every other open failure, loudly.
+
+These are the **third through fifth instances of the same class** after review 2026-08-01 #9 and
+#11, so the regression tests joined their file (`test/fathom/shard_lease_release_test.exs`). Each
+discriminating test asserts the **foreign-owner** view and fails against the unfixed code; the
+same-node re-open assertion passes either way — a coordinator silently reclaims its own node's lock
+— and is labelled in the file as a value guard rather than a regression test, since that property is
+precisely what made the production symptom so quiet.
+
+**None of the three stopped the rig straggler.** The post-acquire guard's error log fired **zero**
+times across the whole fleet on the run that still stranded `roll64`, which is what rules the
+exception path out rather than merely leaving it unproven.
 
 **Still open, and deliberately separate: the snooze is unbounded and silent.** `max_attempts` climbs
 with each snooze, so the job never exhausts, never quarantines, and never surfaces. A shard that

@@ -295,6 +295,81 @@ defmodule Fathom.ShardLeaseReleaseTest do
     end
   end
 
+  describe "an EXCEPTION after the lease is acquired but before the open completes" do
+    # The one the rig actually kept hitting, and the reason a same-day fix to `flush_then_drop/1`
+    # did NOT stop it — verified by re-running `chaos.sh rollout` against a rebuilt image and
+    # finding `roll8` stranded with the identical signature.
+    #
+    # `handle_continue(:open, …)` holds the lock from `acquire_lease` until it RETURNS the built
+    # state. Every failure the code anticipated is an `{:error, _}` TUPLE, which reaches
+    # `open_with_lease/8`'s else branch and releases. An EXCEPTION does not: `handle_continue` never
+    # returns, so the GenServer still holds the pre-open `%{id: shard_id}` state, `terminate/2`
+    # falls to the catch-all clause that has no lease to release, and the lock survives naming a
+    # LIVE node — permanently unstealable.
+    #
+    # `start_pull/2` was already rescued and review 2026-08-01 #33 rescued `fork_evidence/2`, but
+    # `resolve_fork/4`, `revalidate_takeover/5` and `promote_pull/2` all run storage/File calls
+    # directly in the coordinator. The rig's trigger was `Req.TransportError socket closed` out of a
+    # HEAD under load; this raises from `post_lease_warm_check/3`'s `object_etag/1`, which is that
+    # same HEAD.
+    #
+    # The fixture must be a WARM open (local file present), because that is the path that makes a
+    # post-lease storage call at all — hence the brutal kill, which is also how the file survives in
+    # production (a coordinator that dies without terminate/2).
+    test "the lease is released rather than stranded", %{shard: shard} do
+      {:ok, conn} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('warm')"))
+      :ok = ShardExecutor.close(conn)
+
+      # Flush so a provenance sidecar exists and the next open takes the warm (not cold) path.
+      :ok = Shards.flush(shard)
+
+      {:ok, coordinator} = Shards.ensure(shard)
+      ref = Process.monitor(coordinator)
+      # Brutal kill: terminate/2 never runs, so the local file (and the lock) survive — the warm
+      # restart this test needs, and a real crash's leftovers.
+      Process.exit(coordinator, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^coordinator, :killed}, 5_000
+
+      path = Path.join(Shard.data_dir(), "#{shard}.db")
+
+      assert File.exists?(path),
+             "the fixture needs a warm local copy or the open takes a cold path"
+
+      # Raise from the coordinator's own post-lease HEAD.
+      Application.put_env(
+        :fathom,
+        :faulty_before,
+        {:object_etag, fn -> raise Req.TransportError, reason: :closed end}
+      )
+
+      on_exit(fn -> Application.delete_env(:fathom, :faulty_before) end)
+
+      log =
+        capture_log(fn ->
+          # The open must FAIL (we refuse to serve a shard we could not open) — the point is what
+          # it leaves behind, not that it succeeds.
+          assert {:error, _} = ShardExecutor.open(shard)
+        end)
+
+      Application.delete_env(:fathom, :faulty_before)
+
+      # The INVARIANT first, so a pre-fix run fails on the lock rather than on a log string —
+      # the log is a nice-to-have, the released lock is the contract.
+      assert Storage.lease_holder(shard) == :free,
+             "an exception after acquire stranded the lock: the shard still serves from its own " <>
+               "node but no foreign owner (failover, migrator) can ever take it"
+
+      assert log =~ "open FAILED after the lease was acquired",
+             "the abandoned open must be loud — it was previously silent"
+
+      # And the shard is genuinely usable again, by anyone.
+      assert {:ok, lease} = Storage.acquire_lease(shard, "migrator@test@#{shard}", 30_000)
+      :ok = Storage.release_lease(shard, lease)
+    end
+  end
+
   describe "#11 — dirty, but the local file is gone" do
     test "the lease is released rather than stranded", %{shard: shard} do
       {:ok, conn} = ShardExecutor.open(shard)

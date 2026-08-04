@@ -373,31 +373,44 @@ defmodule Fathom.Shard do
     case Storage.acquire_lease(shard_id, owner, ttl) do
       {:ok, lease} ->
         emit_lease(:acquired, shard_id, %{epoch: lease.epoch})
-        # Consume the overlapped fork-check verdict here — the same pre-serving point the
-        # sequential check used. :infinity mirrors the old inline call (the HEAD carries the
-        # storage layer's own timeouts). A diverged local copy was quarantined by the task,
-        # so this open proceeds cold with a (late, rare-path) pull.
-        # The verdict is taken HERE, with the lease in hand, so `touch_pre_etag`/`touch_post_etag`
-        # can distinguish our own steal-touch from a genuine fork. Same consumption point as
-        # before (before any serving decision) — only the decision moved.
-        # BOUNDED (expert review 2026-08-01 #33). This was `Task.await(fork_task, :infinity)` —
-        # the one unbounded wait in the open path, while every other blocking step here is
-        # bounded (the pull is a `Task.yield(_, @pull_timeout)`, `:checkout` has its own
-        # timeout). The task does a storage HEAD, and the S3 backend sets no explicit
-        # receive/pool timeout, so the ceiling was a library default rather than a bound fathom
-        # owns — and a hung HEAD held the lease open indefinitely.
+        # EVERYTHING from here to the built state runs while we HOLD the lock, so any abnormal
+        # exit in between strands it. The comment on `fork_task` above describes this hazard
+        # precisely and review 2026-08-01 #33 fixed ONE instance of it (a raise inside
+        # `fork_evidence/2`) by rescuing inside that Task. The class survived: `resolve_fork/4`,
+        # `revalidate_takeover/5` and `promote_pull/2` all run storage/File calls DIRECTLY in this
+        # process, unrescued. `start_pull/2` is rescued and returns `{:error, _}`, which reaches
+        # the `else` branch of `open_with_lease/8` and releases — but a raise from the coordinator's
+        # own HEAD (`Req.TransportError` under load is the realistic trigger) does not.
         #
-        # A timeout maps to `:unreachable`, which `resolve_fork/4` already treats as the
-        # fail-safe: keep the local copy and serve warm, fenced by the provenance etag, so a
-        # forked flush 412s and self-fences rather than clobbering.
-        warm? =
-          file? and
-            not resolve_fork(await_fork_evidence(fork_task), shard_id, path, lease)
-
-        pull_task = pull_task || if warm?, do: nil, else: start_pull(shard_id, path)
-        result = open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen)
-        maybe_emit_cold_open(result, shard_id, warm?, open_started)
-        result
+        # Found on the rig 2026-08-04: a 300-tenant rollout stranded `roll8` with NO local file, NO
+        # coordinator, NO quarantine copy, and the lock held by its own node — the signature of an
+        # open that died after the acquire — with `Req.TransportError socket closed` warnings in
+        # the same window. `terminate/2` cannot save it: `handle_continue` has not returned, so the
+        # GenServer still holds the pre-open `%{id: shard_id}` state and the catch-all clause has
+        # no lease to release.
+        #
+        # So guard the whole region rather than each call: release, then stop with `{:shutdown, _}`
+        # like every other open failure (a `:transient` child is NOT restarted, and `checkout/1`
+        # maps the exit to `{:error, _}`), instead of crashing into a restart loop that would
+        # re-acquire and re-strand.
+        try do
+          open_after_acquire(
+            shard_id,
+            path,
+            owner,
+            ttl,
+            lease,
+            pull_task,
+            fork_task,
+            file?,
+            acquire_gen,
+            open_started
+          )
+        rescue
+          e -> abandon_open(shard_id, lease, state, e, __STACKTRACE__)
+        catch
+          :exit, reason -> abandon_open(shard_id, lease, state, {:exit, reason}, __STACKTRACE__)
+        end
 
       # `{:shutdown, _}` (not a bare reason) so the `:transient` child is NOT
       # restarted — a held shard must stay down, not restart-loop.
@@ -413,6 +426,80 @@ defmodule Fathom.Shard do
         abandon_pull(pull_task, path)
         {:stop, {:shutdown, {:lease_unavailable, reason}}, state}
     end
+  end
+
+  # The post-acquire half of the open, extracted so the whole lease-holding region sits inside one
+  # try/rescue above. Unchanged logic — only the enclosing scope moved.
+  defp open_after_acquire(
+         shard_id,
+         path,
+         owner,
+         ttl,
+         lease,
+         pull_task,
+         fork_task,
+         file?,
+         acquire_gen,
+         open_started
+       ) do
+    # Consume the overlapped fork-check verdict here — the same pre-serving point the
+    # sequential check used. :infinity mirrors the old inline call (the HEAD carries the
+    # storage layer's own timeouts). A diverged local copy was quarantined by the task,
+    # so this open proceeds cold with a (late, rare-path) pull.
+    # The verdict is taken HERE, with the lease in hand, so `touch_pre_etag`/`touch_post_etag`
+    # can distinguish our own steal-touch from a genuine fork. Same consumption point as
+    # before (before any serving decision) — only the decision moved.
+    # BOUNDED (expert review 2026-08-01 #33). This was `Task.await(fork_task, :infinity)` —
+    # the one unbounded wait in the open path, while every other blocking step here is
+    # bounded (the pull is a `Task.yield(_, @pull_timeout)`, `:checkout` has its own
+    # timeout). The task does a storage HEAD, and the S3 backend sets no explicit
+    # receive/pool timeout, so the ceiling was a library default rather than a bound fathom
+    # owns — and a hung HEAD held the lease open indefinitely.
+    #
+    # A timeout maps to `:unreachable`, which `resolve_fork/4` already treats as the
+    # fail-safe: keep the local copy and serve warm, fenced by the provenance etag, so a
+    # forked flush 412s and self-fences rather than clobbering.
+    warm? =
+      file? and
+        not resolve_fork(await_fork_evidence(fork_task), shard_id, path, lease)
+
+    pull_task = pull_task || if warm?, do: nil, else: start_pull(shard_id, path)
+    result = open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen)
+    maybe_emit_cold_open(result, shard_id, warm?, open_started)
+    result
+  end
+
+  # The lock is ours and the open died before the coordinator could ever hold it in state. Give it
+  # back, loudly. Without this the lock names a LIVE node forever (`owner_live?` reads our own fresh
+  # heartbeat), so the shard serves — our own next open reclaims at the same incarnation — but no
+  # FOREIGN owner can ever take it: no failover, and no migration (the migrator acquires as
+  # `migrator@<node>@<token>`, a different owner string even on this same node).
+  #
+  # `release_lease` is itself a storage call and this path exists BECAUSE storage is misbehaving, so
+  # its own failure must not mask the original error. Log at error either way: an open that crashed
+  # after taking the lock is never routine.
+  defp abandon_open(shard_id, lease, state, reason, stacktrace) do
+    released =
+      try do
+        Storage.release_lease(shard_id, lease)
+      rescue
+        e -> {:error, e}
+      catch
+        :exit, r -> {:error, {:exit, r}}
+      end
+
+    Logger.error(
+      "shard #{shard_id}: open FAILED after the lease was acquired (#{inspect(reason)}); " <>
+        "lease release: #{inspect(released)}\n" <> Exception.format_stacktrace(stacktrace)
+    )
+
+    :telemetry.execute(
+      [:fathom, :shard, :open, :failed],
+      %{count: 1},
+      %{shard_id: shard_id, reason: reason, released: released}
+    )
+
+    {:stop, {:shutdown, {:open_failed, reason}}, state}
   end
 
   # Stop an in-flight overlapped fork check on the no-open paths. Its only side effect
