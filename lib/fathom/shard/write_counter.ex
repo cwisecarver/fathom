@@ -50,6 +50,27 @@ defmodule Fathom.Shard.WriteCounter do
     ArgumentError -> :ok
   end
 
+  @doc """
+  Like `bump/1` but RAISES when the table is absent, instead of rescuing to `:ok`.
+
+  `bump/1`'s rescue is justified by its moduledoc — "a dropped bump can't lose data, the next
+  write re-dirties" — and that is true for a per-write bump. It is **false for the dirtiness
+  SEED** (expert review 2026-08-01 #39): `Fathom.Shard.init_flushed_through/2` bumps a warm
+  shard one past its watermark to mark it dirty, and there is no "next write" to re-dirty it.
+  A rescued no-op there leaves a warm shard with un-flushed local writes reading CLEAN, so idle
+  or shutdown takes `drop_clean/1` and deletes them without uploading.
+
+  The window is real, not hypothetical: `WriteCounter.init/1` bumps the persistent_term
+  generation BEFORE creating the table (deliberately, per audit 2026-07-18 #7), so a coordinator
+  opening a warm shard in that gap reads the new generation, `count/1` → 0 rescued, `bump/1` →
+  no-op rescued. Callers that need "unknown ⇒ dirty" must use this and fail closed.
+  """
+  @spec bump_strict(String.t()) :: :ok
+  def bump_strict(shard_id) do
+    :ets.update_counter(@table, shard_id, {@pos_count, 1}, default_row(shard_id))
+    :ok
+  end
+
   @doc "The current write count for `shard_id` (0 if it has none / the table isn't up)."
   @spec count(String.t()) :: non_neg_integer()
   def count(shard_id) do

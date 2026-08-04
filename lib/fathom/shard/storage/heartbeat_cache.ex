@@ -9,12 +9,24 @@ defmodule Fathom.Shard.Storage.HeartbeatCache do
   raw heartbeat read per owner for a sub-second TTL, collapsing that to ~one GET per
   owner per second.
 
-  Safety: the verdict a stale read can flip is bounded by the cache TTL, which must stay
-  well inside `Storage.steal_margin_ms/0` (default 5000 ms) — the margin exists to absorb
-  exactly this class of skew. Errors are never cached (the fail-closed no-steal-on-blip
-  behavior stays per-call). The table is a public ETS set owned here; readers fall back
-  to a plain miss when the table isn't up (boot/tests), so the S3 backend never depends
-  on this process.
+  Safety: the verdict a stale read can flip is bounded by the cache TTL, which must stay well
+  inside `Storage.steal_margin_ms/0` (default 5000 ms) — the margin exists to absorb exactly this
+  class of skew.
+
+  That condition used to be stated HERE and enforced NOWHERE, against an operator-tunable margin
+  (expert review 2026-08-01 #40). The caller now DERIVES the TTL as `min(1000, margin / 5)`
+  (`Fathom.Shard.Storage.hb_cache_ttl_ms/0`), so it is structural rather than a documented hope —
+  turn the margin down and the memo window shrinks with it. The TTL is passed in per call rather
+  than owned here precisely so that derivation lives next to the margin it depends on.
+
+  What the memo actually costs, stated plainly: a cached entry holds the heartbeat AND the store's
+  clock sample together, so a hit REPLAYS a self-consistent verdict up to the TTL old. An owner
+  that recovers inside that window can still be stolen from on a cached `:dead`. That is the
+  bounded price of collapsing ~1,000 GETs into one, and it is why the bound moves with the margin.
+
+  Errors are never cached (the fail-closed no-steal-on-blip behavior stays per-call). The table is
+  a public ETS set owned here; readers fall back to a plain miss when the table isn't up
+  (boot/tests), so the S3 backend never depends on this process.
   """
   use GenServer
 

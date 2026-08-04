@@ -690,7 +690,7 @@ defmodule Fathom.Shard.Storage.S3 do
   # base64 form (the Content-MD5 header wire format) and the base16 hex form (the
   # metadata + download-comparison form).
   defp stat_and_md5(path) do
-    with {:ok, %{size: size}} <- File.stat(path) do
+    with {:ok, %{size: size, mtime: mtime}} <- File.stat(path) do
       if size > Application.get_env(:fathom, :s3_max_single_put, @max_single_put) do
         {:error, {:object_too_large, size}}
       else
@@ -700,7 +700,26 @@ defmodule Fathom.Shard.Storage.S3 do
           |> Enum.reduce(:crypto.hash_init(:md5), &:crypto.hash_update(&2, &1))
           |> :crypto.hash_final()
 
-        {:ok, size, Base.encode64(digest), Base.encode16(digest, case: :lower)}
+        # The upload reads this file a SECOND time to stream the body, and the two reads were
+        # treated as identical (expert review 2026-08-01 #44). Re-stat and refuse if the file
+        # moved underneath us: `content-length` and `content-md5` are computed here and describe
+        # the FIRST read, so a changed file means the PUT declares one thing and sends another.
+        #
+        # S3 does reject that (BadDigest), so this is not a correctness backstop — it is an
+        # honest error. `{:source_changed_during_upload, path}` says the flush source was written
+        # while being uploaded; a BadDigest from the store says the credentials or the proxy are
+        # broken. Those need completely different operator responses, and the window is real on
+        # `upload_for_drop/1`, where the source is the LIVE database rather than a VACUUM temp.
+        case File.stat(path) do
+          {:ok, %{size: ^size, mtime: ^mtime}} ->
+            {:ok, size, Base.encode64(digest), Base.encode16(digest, case: :lower)}
+
+          {:ok, _changed} ->
+            {:error, {:source_changed_during_upload, path}}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
       end
     end
   rescue
@@ -1821,10 +1840,38 @@ defmodule Fathom.Shard.Storage.S3 do
   # clock sample) is at most the TTL old, which must stay well inside steal_margin_ms
   # (default 5000 ms) — the margin absorbs exactly this class of skew. Errors are never
   # cached, so the fail-closed no-steal-on-blip behavior stays per-call.
-  @hb_cache_ttl_ms 1_000
+  # DERIVED from the steal margin, not a hardcoded 1000 (expert review 2026-08-01 #40). The
+  # safety condition — "the TTL must stay well inside `steal_margin_ms`" — was stated in the
+  # HeartbeatCache moduledoc and enforced nowhere, while `steal_margin_ms` is operator-tunable
+  # and can be set to 500 ms or 0. Deriving it makes the condition STRUCTURAL: ttl is always
+  # margin/5, so it cannot be violated by config and the boot assertion the review asked for
+  # would be dead code. Capped at the original 1 s so the default behaviour is unchanged.
+  #
+  # NOT the review's "cheaper still" alternative — cache only the raw read and re-stamp `ref_now`
+  # with a fresh local clock. That is BACKWARDS, and in the dangerous direction. The cached value
+  # is `{hb, s3_now}` TOGETHER, so a hit replays a self-consistent comparison. Re-stamping a fresh
+  # `now` against a STALE `exp` makes `ref_now <= exp + margin` progressively more likely to be
+  # FALSE as the entry ages — so an owner that was alive at read time and has renewed since would
+  # be declared dead and stolen from. That is a wrongful steal of a live node, which is precisely
+  # what #13's whole store-clock apparatus exists to prevent; the review's claim that a stale
+  # entry "can only ever produce a more conservative (`:live`) verdict" has the sign inverted.
+  #
+  # The residual behaviour the finding correctly names — a cached `:dead` can be replayed for an
+  # owner that recovered inside the window — is bounded by this TTL, which is the reason to shrink
+  # it with the margin rather than to re-stamp it.
+  @doc false
+  # Public (@doc false) only so the derivation itself is testable: the property that matters is
+  # the RELATIONSHIP to the margin, and a test that re-derives the formula locally would pass no
+  # matter what this does.
+  def hb_cache_ttl_ms do
+    case Storage.steal_margin_ms() do
+      margin when is_integer(margin) and margin > 0 -> min(1_000, div(margin, 5))
+      _ -> 0
+    end
+  end
 
   defp cached_read_heartbeat_dated(owner) do
-    case Fathom.Shard.Storage.HeartbeatCache.get(owner, @hb_cache_ttl_ms) do
+    case Fathom.Shard.Storage.HeartbeatCache.get(owner, hb_cache_ttl_ms()) do
       {:hit, value} ->
         value
 

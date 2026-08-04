@@ -68,8 +68,20 @@ defmodule Fathom.Shard.Storage.Local do
           # atomic_copy streams (File.cp) and carries the same fsync-before-rename crash contract
           # as atomic_write, so the durability shape is unchanged — it just never materializes the
           # shard as a binary.
+          #
+          # Hash the DESTINATION, not the source (expert review 2026-08-01 #44). The returned etag
+          # is what the coordinator fences its NEXT flush with, so it has to describe the object
+          # that is now stored. Hashing `local_path` after the copy describes a file that can have
+          # changed since — the two are only guaranteed identical when the source is quiescent.
+          #
+          # The window is real where the flush source is the LIVE database rather than a VACUUM
+          # temp (`upload_for_drop/1`). The rolling-deploy path terminates the Edge plane before
+          # the DataPlane, which is load-bearing and is what kept this Low — but `Shards.stop/1`'s
+          # force-stop terminates a coordinator while its streams are live, and that path has no
+          # such ordering. A fence etag that does not describe the stored object makes the next
+          # flush 412 and the shard self-fence away acknowledged writes.
           with :ok <- Storage.atomic_copy(local_path, remote_path(shard_id)),
-               {:ok, etag} <- file_etag(local_path) do
+               {:ok, etag} <- file_etag(remote_path(shard_id)) do
             {:ok, etag}
           end
       end

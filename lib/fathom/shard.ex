@@ -1930,10 +1930,36 @@ defmodule Fathom.Shard do
   # the ETS row survived) ⇒ bump the counter one ahead of the seeded watermark ⇒ dirty (matches the
   # old `dirty: warm?`). The bump runs only from this coordinator during init, before any stream is
   # checked out, so it can't race a real write.
+  # FAILS DIRTY (expert review 2026-08-01 #39). Both `count/1` and `bump/1` rescue `ArgumentError`
+  # when the table is absent, so in the window where `WriteCounter.init/1` has bumped the
+  # persistent_term generation but not yet created the table, a WARM shard seeded
+  # `flushed_through = 0` from a rescued count and its dirtying bump silently no-opped. Once the
+  # fresh table existed, `unflushed?/1` then read CLEAN and idle/shutdown took `drop_clean/1` —
+  # deleting the local `.db`/`-wal`/`-shm` with un-flushed acked writes still in them.
+  #
+  # `bump/1`'s rescue is fine for a per-write bump ("the next write re-dirties"); it is wrong for
+  # the dirtiness SEED, where there is no next write. `-1` is the existing "unknown ⇒ dirty"
+  # sentinel — the same value `:write_counter_reset` sets (see `handle_info/2`) — so it needs no
+  # new convention: `unflushed?/1` compares `count > flushed_through` and any count beats -1.
   defp init_flushed_through(shard_id, warm?) do
     n = WriteCounter.count(shard_id)
-    if warm?, do: WriteCounter.bump(shard_id)
-    n
+
+    if warm? do
+      try do
+        WriteCounter.bump_strict(shard_id)
+        n
+      rescue
+        ArgumentError ->
+          Logger.warning(
+            "shard #{shard_id}: WriteCounter table absent while seeding a warm open — " <>
+              "failing DIRTY so un-flushed local writes are not dropped as clean"
+          )
+
+          -1
+      end
+    else
+      n
+    end
   end
 
   # Fold the WAL into the main file so a single object captures the whole shard.
