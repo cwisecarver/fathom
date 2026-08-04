@@ -43,6 +43,10 @@
 #   TPC_NET=container TPC_DRIVER=elixir ./chaos.sh tpcb|tpc-fleet  run that driver IN-NETWORK
 #                                 (compose run driver → LB as http://lb), past the host forwarder's
 #                                 ~1k-conn ceiling. Build it once: `./chaos.sh build-driver`.
+#   ./chaos.sh rollout [tenants limit timeout_s]  fleet SCHEMA-MIGRATION throughput: seed N tenants
+#                                 at v1, release v2, run the sweep, measure shards/s + the rate/ETA
+#                                 status/0 reports + the per-node split from shard_migrated telemetry
+#                                 — the evidence base for :reconcile_batch_size (review 2026-08-01 #43)
 #   ./chaos.sh density [shards workers]  mint N novel shards through the LB; read per node
 #                                 the coordinators held (the partition) + BEAM/RSS per shard
 #                                 (the cost) — the fathom counterpart to turso_density.sh
@@ -1174,6 +1178,277 @@ cmd_tpcc_fleet() {
   done
 }
 
+# -- rollout: fleet SCHEMA-MIGRATION throughput — the second half of expert review 2026-08-01 #43.
+#
+# The first half put `rate_per_hour` + `eta_seconds` on `Migrator.status/0` so an operator can SEE
+# the rollout move. This is the half that gives `:reconcile_batch_size` an evidence base: seed N
+# tenants at v1, release v2, run the sweep, and measure what the engine actually converges at —
+# shards/s wall-clock, the rate the gate reports, and which node did the work.
+#
+# Why this cannot be an in-process benchmark: `copy_keystone_rows_per_s` measures ONE shard's copy
+# loop. Fleet rollout throughput is a different quantity — Oban's `migrations: 10` per node × 3
+# nodes contending on one Postgres, each job doing its own S3 pull + replay + fenced flush + cutover.
+# Only the rig has all of that at once.
+#
+# The per-node split is read from `[:fathom, :migrator, :shard_migrated]`, this run's other subject:
+# the rig is the event's first real consumer, and summing it against the shards that actually moved
+# is what proves it fires once per migration rather than once per ATTEMPT (a retry-inflated counter
+# would read as throughput the fleet never had — the exact failure the telemetry half exists to
+# avoid). Cross-checked against the directory, which is the independent witness.
+cmd_rollout() {
+  local tenants=${1:-200} limit=${2:-0} timeout_s=${3:-600}
+  [ "$limit" -gt 0 ] 2>/dev/null || limit=$tenants
+  local ncount=${#NODES[@]} n i t
+
+  echo "rollout: fleet schema-migration throughput — $tenants tenants across $ncount nodes"
+  echo ""
+
+  # -- 0. Preflight: prove THIS image carries the code under test ---------------------------------
+  # `./chaos.sh up` does NOT build (cmd_up is `compose up -d`), so the rig will happily run a
+  # weeks-old image and report a confident number for code that is not the code under test. On
+  # 2026-08-02 both `smoke` and `deploy` passed that way. Assert the change's own observable before
+  # anything else: no rate_per_hour ⇒ the image predates the first half and every number below
+  # would be meaningless.
+  local probe
+  probe=$(rpc fathom1 'IO.puts(if Map.has_key?(Fathom.Migrator.status(), :rate_per_hour), do: "yes", else: "no")' | head -1)
+  if [ "$probe" != "yes" ]; then
+    echo "ABORT: Migrator.status/0 has no :rate_per_hour on this image."
+    echo "       That means the image predates the change under test. 'up' does not build:"
+    echo "         ./chaos.sh build && ./chaos.sh up"
+    return 1
+  fi
+  echo "preflight: status/0 carries rate_per_hour + eta_seconds on this image ✓"
+
+  # -- 1. Quiet everything that would migrate a shard the sweep did not enqueue -------------------
+  # migrate-on-touch defaults :off, but the rig is a shared box and an env var can turn it on;
+  # forcing it makes this run's numbers attributable to the sweep alone. The rebalancer would move
+  # a shard mid-migration (safe — the lease fences it — but it blurs the per-node split we read).
+  # Idle-drop stays at rig default: a migration drains the coordinator anyway.
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :migrate_on_touch, :off); Application.put_env(:fathom, :rebalancer_enabled, false)' >/dev/null
+  done
+
+  # -- 1b. Clear OTHER steps' shards out of the directory -----------------------------------------
+  # `Migrator.rollout/1` sweeps every active shard below HEAD, so `smoke`'s five tenants (and any
+  # other step's leftovers) get enqueued alongside ours — and they have no `app_thing` table, so
+  # they fail the replay and quarantine. Five bogus `migration_failed` rows in the output of a
+  # throughput run is noise that reads like a real failure.
+  #
+  # They also never converge, which puts a permanent floor under `status/0`: the first trial run of
+  # this step sat at `laggards=5` and `eta=1500s` forever, and its wall-clock "throughput" was the
+  # timeout rather than the work. That is `status/0` reporting correctly on a fleet that genuinely
+  # has five shards nothing will ever migrate; it is the RIG that is wrong, not the gate.
+  #
+  # Deleting the row is rig hygiene, the same contract as `seed()` truncating `kv`: every run starts
+  # fresh. It is safe here and ONLY here — a directory row is re-created at v0 by `resolve/1` on the
+  # next touch, and the shard FILE is untouched. Do not copy this into production tooling; the
+  # supported way to remove a tenant is `Fathom.Tenants.delete/1`, which tombstones.
+  #
+  # ALL rows, including this step's own from a previous run. The first version excluded `roll%` to
+  # keep "our" tenants, which was backwards: a prior run's tenants sit at ITS target, one version
+  # below the new HEAD, so they are laggards too — the run started at `laggards=24` for 12 tenants
+  # and the progress query could have counted them. Seeding re-registers every tenant we need.
+  local cleared
+  cleared=$(rpc fathom1 'IO.puts(elem(Fathom.Repo.delete_all(Fathom.Directory.Shard), 0))' | head -1)
+  is_num "$cleared" || cleared=0
+  echo "rig hygiene: cleared $cleared directory rows (leftovers are laggards, get swept in, and quarantine)"
+
+  # -- 2. Per-node counter on the event under test ------------------------------------------------
+  # :counters in :persistent_term, not ETS: the handler outlives the `rpc` process that attached it
+  # (an ETS table owned by that process would vanish the moment rpc returns, and the run would
+  # report zero migrations on every node).
+  for n in "${NODES[@]}"; do
+    rpc "$n" '
+      :telemetry.detach("rig-rollout")
+      ref = :counters.new(1, [:write_concurrency])
+      :persistent_term.put(:rig_rollout_ctr, ref)
+      :telemetry.attach("rig-rollout", [:fathom, :migrator, :shard_migrated],
+        fn _e, _m, _meta, _c -> :counters.add(ref, 1, 1) end, nil)' >/dev/null
+  done
+
+  # -- 3. Seed N tenants at the CURRENT head ------------------------------------------------------
+  # Version numbers are computed, never hardcoded: the release table is durable across rig runs, so
+  # a second `release(2, ...)` collides on the unique version, HEAD stays put, and the sweep enqueues
+  # nothing — a run that looks instant and measured nothing. Seed at HEAD, release HEAD+1.
+  local base; base=$(rpc fathom1 'IO.puts(Fathom.Migrator.head())' | head -1)
+  is_num "$base" || base=0
+  local target=$(( base + 1 ))
+
+  # Through the LB, so each tenant is born on the node the consistent hash gives it — the same
+  # partition the rollout then has to work across. `PRAGMA user_version` is the shard file's own
+  # stamp (one of the three the migration engine keeps in agreement); the directory's copy is set
+  # by cutover below. Ids carry no underscore: `_` is a single-character wildcard in SQL LIKE, and
+  # the progress query below matches on `roll%`.
+  echo "seeding $tenants tenants at v$base through the LB (target v$target) ..."
+  local seed_start; seed_start=$(now_ms)
+  local workers=12 w
+  for w in $(seq 1 "$workers"); do
+    ( local j=$w
+      while [ "$j" -le "$tenants" ]; do
+        t="roll$j"
+        sql "$t" "CREATE TABLE IF NOT EXISTS app_thing (id INTEGER PRIMARY KEY, name TEXT)" >/dev/null 2>&1
+        sql "$t" "CREATE TABLE IF NOT EXISTS django_migrations (id INTEGER PRIMARY KEY, app TEXT, name TEXT, applied TEXT)" >/dev/null 2>&1
+        sql "$t" "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0001', 'now')" >/dev/null 2>&1
+        sql "$t" "PRAGMA user_version = $base" >/dev/null 2>&1
+        j=$(( j + workers ))
+      done ) &
+  done
+  wait
+  echo "  seeded in $(( ($(now_ms) - seed_start) / 1000 ))s"
+
+  # The migration pulls each shard's LIVE OBJECT from MinIO, not the owner's local file, so the
+  # seeded bytes have to reach storage before the sweep starts. Flush on every node: the non-owners
+  # no-op. Without this the copy replays onto a stale file and every shard quarantines.
+  echo "flushing v$base to storage ..."
+  for n in "${NODES[@]}"; do
+    rpc "$n" "Enum.each(1..$tenants, fn i -> Fathom.Shards.flush(\"roll#{i}\") end)" >/dev/null 2>&1 || true
+  done
+
+  # Directory to match the file. cutover/2 is the same call the engine uses.
+  rpc fathom1 "Enum.each(1..$tenants, fn i -> Fathom.Directory.cutover(\"roll#{i}\", $base) end)" >/dev/null
+
+  # -- 4. Release HEAD+1 and take the pre-rollout reading -----------------------------------------
+  # The added column is version-scoped: rerunning the step on the same rig replays a DIFFERENT
+  # ALTER, so a second run cannot die on "duplicate column name".
+  rpc fathom1 "Fathom.Migrator.release($target, \"rig_v$target\", [\"ALTER TABLE app_thing ADD COLUMN c_v$target TEXT\", \"INSERT INTO django_migrations (app, name, applied) VALUES ('app', 'rig_$target', 'now')\"])" >/dev/null
+
+  # Roll-set progress, the run's own clock. Separate from status/0's fleet-wide laggards on purpose:
+  # this counts only the tenants THIS run seeded, so the throughput number is the work we asked for.
+  _rdone() {
+    rpc fathom1 "
+      import Ecto.Query
+      IO.puts(Fathom.Repo.aggregate(from(s in Fathom.Directory.Shard,
+        where: s.status == \"active\" and s.schema_version == $target and like(s.shard_id, \"roll%\")), :count))" | head -1
+  }
+  echo ""
+  _rstatus() {
+    rpc fathom1 's = Fathom.Migrator.status(); IO.puts("#{s.head} #{s.laggards} #{s.failed} #{s.rate_per_hour} #{s.eta_seconds || -1}")' | head -1
+  }
+  local h0 l0 f0 r0 e0
+  read -r h0 l0 f0 r0 e0 <<< "$(_rstatus)"
+  echo "  pre-rollout:  head=$h0 laggards=$l0 failed=$f0 rate=$r0/h eta=$( [ "$e0" = "-1" ] && echo null || echo "${e0}s" )"
+
+  # -- 5. Sweep ------------------------------------------------------------------------------------
+  local start_ms; start_ms=$(now_ms)
+  local enq; enq=$(rpc fathom1 "{:ok, c} = Fathom.Migrator.rollout($limit); IO.puts(c)" | head -1)
+  is_num "$enq" || enq=0
+  echo "  enqueued $enq migration jobs (Oban migrations queue, 10/node × $ncount nodes)"
+  echo ""
+  printf "  %8s %10s %9s %8s %11s %10s\n" "t+s" "done/$tenants" laggards failed "rate/h" "eta"
+
+  # `work_ms` is the clock that matters: time from the sweep to the LAST shard that actually moved,
+  # not the loop's total runtime. Dividing by the loop instead turned a real 13 shards/s into a
+  # reported 0.3 — one straggler (a shard with an orphaned lock, see the straggler dump below) held
+  # the loop to its 900s timeout while 299 of 300 had finished in 23s. A number that bad is a broken
+  # measurement just as surely as a number that good.
+  local elapsed_ms=0 h l f r e d converged=0 deadline_ms=$(( timeout_s * 1000 ))
+  local last_d=0 work_ms=1
+  while [ "$elapsed_ms" -lt "$deadline_ms" ]; do
+    sleep 3
+    elapsed_ms=$(( $(now_ms) - start_ms ))
+    d=$(_rdone); is_num "$d" || continue
+    read -r h l f r e <<< "$(_rstatus)"
+    is_num "$l" || l=0
+    printf "  %8s %10s %9s %8s %11s %10s\n" "$(( elapsed_ms / 1000 ))" "$d" "$l" "$f" "$r" \
+      "$( [ "$e" = "-1" ] && echo "null" || echo "${e}s" )"
+    if [ "$d" -gt "$last_d" ]; then last_d=$d; work_ms=$elapsed_ms; fi
+    if [ "$d" -ge "$tenants" ]; then converged=1; break; fi
+  done
+  local total_ms=$(( $(now_ms) - start_ms )); [ "$total_ms" -gt 0 ] || total_ms=1
+  [ "$work_ms" -gt 0 ] || work_ms=1
+
+  # -- 6. Read back: throughput, the per-node split, and the two independent witnesses -------------
+  echo ""
+  local migrated; migrated=$(_rdone)
+  is_num "$migrated" || migrated=0
+
+  printf "  %-9s %12s\n" node "shard_migrated"
+  local dist; dist=$(mktemp)
+  local evt_total=0 c
+  for n in "${NODES[@]}"; do
+    c=$(rpc "$n" 'IO.puts(:counters.get(:persistent_term.get(:rig_rollout_ctr), 1))' | head -1)
+    is_num "$c" || c=0
+    printf "  %-9s %12s\n" "$n" "$c"
+    evt_total=$(( evt_total + c ))
+    echo "$c" >> "$dist"
+  done
+  local minc maxc; minc=$(sort -n "$dist" | head -1); maxc=$(sort -n "$dist" | tail -1)
+  rm -f "$dist"
+
+  echo ""
+  echo "  throughput: $migrated shards migrated in $(awk -v x="$work_ms" 'BEGIN{printf "%.1f", x/1000}')s of work"
+  echo "              = $(awk -v s="$migrated" -v m="$work_ms" 'BEGIN{printf "%.1f", s*1000/m}') shards/s"
+  echo "              = ~$(awk -v s="$migrated" -v m="$work_ms" 'BEGIN{printf "%.0f", s*3600000/m}') shards/hour sustained"
+  echo "              (vs :reconcile_batch_size default 100/hour — the cron throttle, not the engine)"
+  [ "$work_ms" -lt "$total_ms" ] && \
+    echo "              [loop ran $(awk -v x="$total_ms" 'BEGIN{printf "%.0f", x/1000}')s total; the tail was idle — see stragglers]"
+  # Spread only reads as a number when every node did some work. An idle node is not a broken
+  # partition here: migration work is drawn from ONE Oban queue in Postgres, not routed by the LB
+  # hash, so with few jobs and 10 slots per node one node can legitimately take them all. That is a
+  # different distribution mechanism from `density`/`tpc-fleet`, where the LB hash IS the split.
+  if [ "$minc" -gt 0 ]; then
+    echo "  split:      $evt_total events across $ncount nodes, min $minc / max $maxc (spread $(awk -v a="$maxc" -v b="$minc" 'BEGIN{printf "%.2f", a/b}')x, 1.00 = perfect)"
+  else
+    echo "  split:      $evt_total events across $ncount nodes, min $minc / max $maxc — a node drew no jobs"
+    echo "              (Oban queue draw, not LB hash: $(( 10 * ncount )) slots fleet-wide, so a small batch can land on one node)"
+  fi
+
+  # The event's contract, checked rather than assumed: one per shard that MOVED. A retry-inflated
+  # counter reads as throughput the fleet never had, so evt > migrated is a real failure here.
+  if [ "$evt_total" -eq "$migrated" ] && [ "$migrated" -gt 0 ]; then
+    echo "  telemetry:  PASS — shard_migrated fired exactly once per migrated shard ($evt_total = $migrated)"
+  else
+    echo "  telemetry:  MISMATCH — $evt_total events vs $migrated shards at v2 (expected equal)"
+  fi
+
+  # -- 7. Prove the schema actually changed. The whole run is worthless if the shards did not move;
+  # a directory that says v2 over a file that never got the column is precisely the silent
+  # corruption the three-place version stamp exists to prevent.
+  local ok=0 bad=0
+  for i in 1 3 7; do
+    [ "$i" -le "$tenants" ] || continue
+    if sql "roll$i" "SELECT c_v$target FROM app_thing" >/dev/null 2>&1 &&
+       [ "$(sql "roll$i" "PRAGMA user_version" 2>/dev/null | val)" = "$target" ]; then
+      ok=$(( ok + 1 ))
+    else
+      bad=$(( bad + 1 ))
+    fi
+  done
+  echo "  schema:     $ok/$(( ok + bad )) sampled shards serve the v$target column at user_version=$target"
+
+  if [ "$converged" -eq 1 ]; then
+    echo "  verdict:    CONVERGED — all $tenants tenants reached v$target, failed=${f:-0}"
+  else
+    echo "  verdict:    TIMEOUT after ${timeout_s}s — $migrated/$tenants at v$target, failed=${f:-?}"
+    echo ""
+    # Name the stragglers AND their lock holder. Without this the operator sees "1 laggard, 0
+    # failed" and has nothing to go on: the job is `scheduled`, not `retryable`, because a held
+    # lease returns {:retry, _} -> {:snooze, 5}, which does not burn an attempt and never surfaces
+    # as an error. The 2026-08-04 run needed a hand-written Ecto query to learn that one shard's
+    # lease was held by a coordinator that no longer existed — that diagnosis belongs in the tool.
+    echo "  stragglers (shard, directory version, lease holder):"
+    rpc fathom1 "
+      import Ecto.Query
+      from(s in Fathom.Directory.Shard,
+        where: s.status == \"active\" and s.schema_version < $target and like(s.shard_id, \"roll%\"),
+        select: {s.shard_id, s.schema_version}, limit: 10)
+      |> Fathom.Repo.all()
+      |> Enum.each(fn {id, v} ->
+        IO.puts(\"    #{id}  v#{v}  #{inspect(Fathom.Shard.Storage.lease_holder(id))}\")
+      end)"
+    echo "  note: a lease held by a LIVE node's coordinator never expires (liveness is the node's"
+    echo "        heartbeat), so if that coordinator is already gone the migration snoozes forever."
+    echo "        A client touch on the owning node reclaims + releases it and the next retry lands."
+  fi
+
+  # -- 8. Restore rig defaults --------------------------------------------------------------------
+  for n in "${NODES[@]}"; do
+    rpc "$n" ':telemetry.detach("rig-rollout"); Application.put_env(:fathom, :rebalancer_enabled, true)' >/dev/null
+  done
+  unset -f _rstatus _rdone
+  [ "$converged" -eq 1 ]
+}
+
 # cmd_deploy — the clean-shutdown (rolling-deploy) verification: the herd analog of `failover`.
 # `failover` SIGKILLs a node and measures the loss window; `deploy` SIGTERMs a node holding a HIGH
 # open-shard count and proves the graceful path flushes EVERY open shard (zero loss) — the property
@@ -1298,6 +1573,7 @@ case "${1:-}" in
   deploy)      shift; cmd_deploy "$@" ;;
   tpcb)        shift; cmd_tpcb "$@" ;;
   tpcc)        shift; cmd_tpcc "$@" ;;
+  rollout)     shift; cmd_rollout "$@" ;;
   density)     shift; cmd_density "$@" ;;
   served)      shift; cmd_served "$@" ;;
   served-data) shift; cmd_served_data "$@" ;;

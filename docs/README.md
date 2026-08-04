@@ -131,6 +131,13 @@ noted).
   fleet density run (`chaos.sh density`): the LB keyspace-partition spreads N shards evenly across
   the nodes at the single-node per-shard cost, so capacity is horizontally additive (the "millions"
   mechanism the single-node density work left as architectural).
+- **[reviews/fleet-rollout-2026-08-04.md](reviews/fleet-rollout-2026-08-04.md)** — fleet
+  schema-migration throughput (`chaos.sh rollout`): **~46,000 shards/hour** across 3 nodes against a
+  100/hour `:reconcile_batch_size` default, so the knob throttles ~460× below the engine — the
+  evidence base review 2026-08-01 #43 asked for, plus the `rate_per_hour`/`eta_seconds` fields
+  tracking a real rollout. Also finds a **reproducible stuck-lease bug** (~1 in 300): a coordinator
+  lease that outlives its coordinator on a live node is never stealable, so that tenant serves fine
+  but can never migrate — open, not fixed there.
 - **[reviews/tpc-run-2026-07-10.md](reviews/tpc-run-2026-07-10.md)** — the remote-client TPC run over
   the chaos rig (true cross-LB latency) + the loopback spec-scale TPC-C comparability numbers.
 - **[reviews/latency-cost-2026-07-23.md](reviews/latency-cost-2026-07-23.md)** — what an injected S3

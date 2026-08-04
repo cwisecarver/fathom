@@ -119,8 +119,19 @@ following. That plateau tells you the ceiling has moved somewhere else — the `
 concurrency, the per-shard S3 round trips, or drain contention with live traffic — and raising the
 batch size further only adds latency pressure on live tenants without converging faster.
 
+Measured on the 3-node chaos rig 2026-08-04 (`chaos.sh rollout`, 300 tenants): **~46,000
+shards/hour**, i.e. the 100/hour default throttles ~460× below what the engine sustains, so the
+first several raises are free. Full run + limits:
+[`reviews/fleet-rollout-2026-08-04.md`](reviews/fleet-rollout-2026-08-04.md).
+
 Per-node throughput is the `[:fathom, :migrator, :shard_migrated]` telemetry event
 (`%{count: 1}`, metadata `%{shard_id, from, to}`), emitted once per shard that actually moved.
+
+**If a shard sits behind with `failed: 0` and never moves**, its migration is snoozing on a held
+lease, not erroring — the Oban job stays `scheduled` with an empty `errors` array, so nothing is
+logged above `[info]`. A client request to that tenant clears it (the coordinator reclaims and then
+releases the lease). See the stuck-lease finding in
+[`reviews/fleet-rollout-2026-08-04.md`](reviews/fleet-rollout-2026-08-04.md#the-bug-this-run-found).
 
 ## 4. Revert — if a migration is bad
 
