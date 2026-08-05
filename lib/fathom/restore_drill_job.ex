@@ -48,6 +48,16 @@ defmodule Fathom.RestoreDrillJob do
       n when is_integer(n) and n > 0 -> run_drill(n)
       _ -> :ok
     end
+
+    # The FULL drill (#48) runs after, and on its own much smaller sample: it forks each shard to a
+    # scratch tenant, so it costs a real object copy per sample where the read-only drill costs a
+    # GET. Separately gated so raising read-only coverage never silently multiplies storage I/O.
+    case full_sample_size() do
+      n when is_integer(n) and n > 0 -> run_full_drill(n)
+      _ -> :ok
+    end
+
+    :ok
   end
 
   @doc """
@@ -74,6 +84,81 @@ defmodule Fathom.RestoreDrillJob do
     status = verify(id, schema_version)
     Directory.record_verification(id, Atom.to_string(status))
     :telemetry.execute([:fathom, :restore_drill, :result], %{count: 1}, %{status: status})
+    verify_snapshots(id)
+    status
+  end
+
+  # Snapshots had NO health signal at all (expert review 2026-08-01 #48). `sample_for_drill/1`
+  # samples directory rows, and a snapshot is a storage object (`@snap-<id>`) with no row — so the
+  # one class of stored data an operator would reach for during a point-in-time recovery was the
+  # one class nothing ever checked. A corrupt snapshot would be discovered at exactly the moment it
+  # was needed, which is the worst possible discovery time and the reason the drill exists at all.
+  #
+  # Verified alongside the shard that owns them rather than through a separate sampler: they share
+  # the shard's rotation, so coverage follows the same least-recently-verified order for free, and a
+  # shard with no snapshots costs one LIST.
+  defp verify_snapshots(id) do
+    # `list_snapshots/1` returns `{:ok, [%{id: ..., bytes: ...}]}`. An earlier draft matched a bare
+    # list, so the clause never fired and snapshot verification silently did nothing — the exact
+    # shape of bug this whole finding is about, caught only because the test corrupts a snapshot and
+    # demands the drill notice.
+    case Storage.list_snapshots(id) do
+      {:ok, snapshots} when is_list(snapshots) ->
+        Enum.each(snapshots, fn %{id: snapshot_id} -> verify_snapshot(id, snapshot_id) end)
+
+      _ ->
+        :ok
+    end
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  defp verify_snapshot(id, snapshot_id) do
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "fathom_snapdrill_#{id}_#{System.unique_integer([:positive])}.db"
+      )
+
+    status =
+      try do
+        case Storage.pull_snapshot(id, snapshot_id, tmp) do
+          {:ok, _} ->
+            if File.exists?(tmp) do
+              case Shard.verify_integrity(tmp) do
+                :ok -> :ok
+                {:error, _} -> :corrupt
+              end
+            else
+              :absent
+            end
+
+          _ ->
+            :error
+        end
+      rescue
+        _ -> :error
+      catch
+        :exit, _ -> :error
+      after
+        for suffix <- ["", "-wal", "-shm"], do: File.rm(tmp <> suffix)
+      end
+
+    if status != :ok do
+      Logger.error(
+        "restore drill: SNAPSHOT #{snapshot_id} of #{id} is #{status} — a point-in-time recovery " <>
+          "that reached for it would fail"
+      )
+    end
+
+    :telemetry.execute(
+      [:fathom, :restore_drill, :snapshot_result],
+      %{count: 1},
+      %{status: status, shard_id: id, snapshot_id: snapshot_id}
+    )
+
     status
   end
 
@@ -147,4 +232,167 @@ defmodule Fathom.RestoreDrillJob do
   end
 
   defp sample_size, do: Application.get_env(:fathom, :restore_drill_sample)
+
+  defp full_sample_size, do: Application.get_env(:fathom, :restore_drill_full_sample)
+
+  @doc """
+  Drill the **procedure**, not just the object (expert review 2026-08-01 #48).
+
+  `verify/2` above pulls, `quick_check`s, and compares `user_version` — that is the whole drill, and
+  it proves the stored bytes are readable. What it never did was RESTORE: it does not invoke
+  `Tenants.fork/2`, does not cold-open a coordinator from the pulled bytes, and does not touch the
+  directory reconcile. So the multi-step chain an operator actually runs under maximum pressure —
+  fork to a scratch id, verify it, drop it — had only ever executed in unit tests against
+  `Storage.Local`, never against the real backend a real incident would use.
+
+  "A backup you haven't restored is a hypothesis" was the moduledoc's own framing; this closes the
+  gap between verifying a file and rehearsing the recovery.
+
+  Each sampled shard is forked to a **throwaway id**, the fork is opened and row-counted against the
+  source, and then deleted. Deliberately small and off by default (`:restore_drill_full_sample`): a
+  fork is a full object copy plus a directory row, so this costs real storage I/O per sample in a way
+  the read-only drill does not.
+
+  Failure classes are distinct from `verify/2`'s on purpose — `:fork_failed` and `:restored_mismatch`
+  say the RECOVERY PATH is broken, which is a different alarm from "this stored object is corrupt"
+  and wants a different response.
+  """
+  @spec run_full_drill(pos_integer()) :: {:ok, map()}
+  def run_full_drill(n) when is_integer(n) and n > 0 do
+    results = Enum.map(Directory.sample_for_drill(n), &restore_one/1)
+    summary = Enum.frequencies(results)
+    fails = Enum.count(results, &(&1 != :ok))
+
+    Logger.info("restore drill (FULL): #{length(results)} shard(s): #{inspect(summary)}")
+
+    if fails > 0 do
+      Logger.error(
+        "restore drill (FULL): #{fails} shard(s) could not be RESTORED (#{inspect(summary)}) — " <>
+          "the stored bytes may be fine; it is the recovery procedure that is broken"
+      )
+    end
+
+    {:ok, summary}
+  end
+
+  defp restore_one(%{shard_id: id}) do
+    scratch = "restoredrill#{System.unique_integer([:positive])}"
+    status = restore_and_compare(id, scratch)
+
+    :telemetry.execute(
+      [:fathom, :restore_drill, :full_result],
+      %{count: 1},
+      %{status: status, shard_id: id}
+    )
+
+    status
+  end
+
+  defp restore_and_compare(id, scratch) do
+    case Fathom.Tenants.fork(id, scratch) do
+      {:ok, _} ->
+        compare_then_drop(id, scratch)
+
+      {:error, reason} ->
+        Logger.warning(
+          "restore drill (FULL): fork of #{id} -> #{scratch} failed: #{inspect(reason)}"
+        )
+
+        :fork_failed
+    end
+  rescue
+    e ->
+      Logger.warning("restore drill (FULL): #{id} raised (#{inspect(e)})")
+      :fork_failed
+  catch
+    :exit, reason ->
+      Logger.warning("restore drill (FULL): #{id} exited (#{inspect(reason)})")
+      :fork_failed
+  end
+
+  # The comparison that makes the rehearsal mean something: a fork that produced an EMPTY database
+  # would pass `quick_check` and prove nothing. Compare the restored copy's user table row counts to
+  # the source's — if they disagree, the recovery path silently loses data, which is the failure
+  # this drill exists to catch before an incident does.
+  defp compare_then_drop(id, scratch) do
+    try do
+      case {table_counts(id), table_counts(scratch)} do
+        {{:ok, src}, {:ok, dst}} when src == dst -> :ok
+        {{:ok, _src}, {:ok, _dst}} -> :restored_mismatch
+        _ -> :fork_failed
+      end
+    after
+      drop_scratch(scratch)
+    end
+  end
+
+  # {table_name => row_count} for the shard's USER tables, read through a normal checkout so the
+  # read goes down the same path a tenant's would. `sqlite_%` is excluded: internal tables differ
+  # between a freshly-written copy and a long-lived original for reasons that are not data loss.
+  defp table_counts(shard_id) do
+    with {:ok, pid, ref, path} <- Fathom.Shards.checkout(shard_id) do
+      try do
+        {:ok, conn} = Connection.open(path)
+
+        try do
+          {:ok, %{rows: rows}} =
+            Connection.query(
+              conn,
+              "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+              []
+            )
+
+          counts =
+            Map.new(rows, fn [table] ->
+              {:ok, %{rows: [[n]]}} = Connection.query(conn, count_sql(table), [])
+              {table, n}
+            end)
+
+          {:ok, counts}
+        after
+          Connection.close(conn)
+        end
+      after
+        Fathom.Shard.checkin(pid, ref)
+      end
+    end
+  rescue
+    _ -> :error
+  catch
+    :exit, _ -> :error
+  end
+
+  # Clean up the scratch tenant. Deliberately NOT `Tenants.delete/1`, which is the supported way to
+  # remove a real tenant and therefore TOMBSTONES: a permanent row plus an entry in the public
+  # `Fathom.Tenants.Tombstones` ETS set that admission checks on every checkout. One tombstone per
+  # sample per drill run would grow that set without bound, so the routine that exists to prove
+  # recovery works would slowly degrade the admission path — a self-inflicted version of exactly
+  # the kind of unbounded growth #36 was about.
+  #
+  # A drill fork was never a tenant: nothing was ever routed to it and no client ever held a token
+  # for it, so there is nothing to tombstone AGAINST. Stop the coordinator, purge the objects, drop
+  # the directory row. Best-effort — a leaked scratch is a tidiness problem, and raising here would
+  # turn a successful rehearsal into a reported failure.
+  defp drop_scratch(scratch) do
+    _ = Fathom.Shards.stop(scratch)
+    _ = Storage.purge_shard(scratch)
+    _ = Directory.hard_delete(scratch)
+    :ok
+  rescue
+    e ->
+      Logger.warning("restore drill (FULL): scratch cleanup of #{scratch} failed: #{inspect(e)}")
+  catch
+    :exit, r ->
+      Logger.warning("restore drill (FULL): scratch cleanup of #{scratch} exited: #{inspect(r)}")
+  end
+
+  # A table NAME cannot be a bound parameter in SQLite, so this is the one place the drill builds
+  # SQL by interpolation. The name comes from `sqlite_master` (not from a client), and it is quoted
+  # as an IDENTIFIER with embedded quotes doubled — the standard escape — so an exotic-but-legal
+  # table name cannot terminate the quoting early. AGENTS.md's rule is about never interpolating
+  # VALUES; identifiers have no parameter form.
+  defp count_sql(table) do
+    quoted = String.replace(table, "\"", "\"\"")
+    "SELECT count(*) FROM \"" <> quoted <> "\""
+  end
 end

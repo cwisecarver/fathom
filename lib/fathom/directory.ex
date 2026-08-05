@@ -633,6 +633,26 @@ defmodule Fathom.Directory do
     Repo.all(from s in Shard, where: s.status == "migration_failed")
   end
 
+  @doc """
+  HARD-delete a directory row, leaving no tombstone (expert review 2026-08-01 #48).
+
+  Not for tenants. `Fathom.Tenants.delete/1` is the supported tenant removal and it tombstones on
+  purpose: a deleted subdomain must be refused rather than silently re-minted as an empty shard, so
+  the row persists and the id joins the public `Tombstones` ETS set that admission consults on every
+  checkout.
+
+  This exists for rows that were never a tenant — the restore drill's scratch forks, which nothing
+  ever routed to and no client ever held a token for. There is nothing to tombstone against, and a
+  tombstone per drill sample per run would grow that admission-path set without bound.
+
+  Returns the number of rows removed (0 if it was already gone).
+  """
+  @spec hard_delete(String.t()) :: non_neg_integer()
+  def hard_delete(shard_id) do
+    {count, _} = Repo.delete_all(from(s in Shard, where: s.shard_id == ^shard_id))
+    count
+  end
+
   @doc "Total shard rows in the directory across all statuses (the fleet's known-shard count)."
   @spec count() :: non_neg_integer()
   def count, do: Repo.aggregate(Shard, :count)

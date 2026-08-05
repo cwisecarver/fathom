@@ -5,6 +5,7 @@ defmodule Fathom.RestoreDrillJobTest do
   # tenant's cold tail is caught by a drill instead of when the tenant returns. Directory rows are
   # Postgres (DataCase sandbox); the durable objects are the Local storage backend. Not async.
   use Fathom.DataCase, async: false
+  use Oban.Testing, repo: Fathom.Repo
 
   import Ecto.Query
 
@@ -40,6 +41,122 @@ defmodule Fathom.RestoreDrillJobTest do
     for s <- sqls, do: {:ok, _} = ShardExecutor.execute(conn, stmt(s))
     :ok = ShardExecutor.close(conn)
     :ok = Shards.drain(id, 5_000)
+  end
+
+  describe "the FULL restore drill (#48) — rehearsing the procedure, not just the object" do
+    # verify/2 pulls, quick_checks and compares user_version — it proves the stored BYTES are
+    # readable. It never invoked Tenants.fork/2, never cold-opened a coordinator from those bytes,
+    # and never touched the directory reconcile, so the chain an operator actually runs under
+    # maximum pressure had only ever executed in unit tests. "A backup you haven't restored is a
+    # hypothesis" was the drill's own framing; this closes the gap between verifying a file and
+    # rehearsing the recovery.
+    setup do
+      prev = Application.get_env(:fathom, :restore_drill_full_sample)
+      on_exit(fn -> restore(:restore_drill_full_sample, prev) end)
+      :ok
+    end
+
+    test "restores a sampled shard to a scratch tenant and matches its row counts", %{id: id} do
+      seed(id, [
+        "CREATE TABLE kv (v TEXT)",
+        "INSERT INTO kv VALUES ('a')",
+        "INSERT INTO kv VALUES ('b')"
+      ])
+
+      assert {:ok, summary} = RestoreDrillJob.run_full_drill(5)
+      assert summary[:ok] >= 1, "the restore rehearsal failed: #{inspect(summary)}"
+    end
+
+    # The assertion that makes the rehearsal worth running. A fork that produced an EMPTY database
+    # would pass quick_check and prove nothing, so the drill compares row counts against the source
+    # — that is the difference between "the file opens" and "the data is there".
+    test "a restored copy carries the source's rows, not merely a valid file", %{id: id} do
+      seed(id, [
+        "CREATE TABLE kv (v TEXT)",
+        "INSERT INTO kv VALUES ('a')",
+        "INSERT INTO kv VALUES ('b')",
+        "INSERT INTO kv VALUES ('c')"
+      ])
+
+      scratch = "restoredrillcmp#{System.unique_integer([:positive])}"
+      on_exit(fn -> Fathom.Tenants.delete(scratch) end)
+
+      assert {:ok, _} = Fathom.Tenants.fork(id, scratch)
+
+      {:ok, conn} = ShardExecutor.open(scratch)
+      {:ok, result} = ShardExecutor.execute(conn, stmt("SELECT count(*) FROM kv"))
+      :ok = ShardExecutor.close(conn)
+
+      assert [[3]] = result.rows,
+             "the fork did not carry the source's rows — a restore that loses data would still " <>
+               "pass a quick_check-only drill"
+    end
+
+    # Scratch tenants must not accumulate: one per sample per run would grow the directory and the
+    # object store without bound.
+    test "the scratch tenant is cleaned up", %{id: id} do
+      seed(id, ["CREATE TABLE kv (v TEXT)", "INSERT INTO kv VALUES ('a')"])
+
+      before = drill_scratch_rows()
+      assert {:ok, _} = RestoreDrillJob.run_full_drill(5)
+
+      assert drill_scratch_rows() == before,
+             "a drill fork was left behind; repeated runs would grow the directory unbounded"
+    end
+
+    # Off by default: a fork is a full object copy, so this costs real storage I/O per sample where
+    # the read-only drill costs a GET. Raising read-only coverage must not silently multiply that.
+    test "it is inert unless :restore_drill_full_sample is set", %{id: id} do
+      seed(id, ["CREATE TABLE kv (v TEXT)"])
+      Application.delete_env(:fathom, :restore_drill_full_sample)
+
+      before = drill_scratch_rows()
+      assert :ok = perform_job(RestoreDrillJob, %{})
+      assert drill_scratch_rows() == before, "the full drill ran without being enabled"
+    end
+  end
+
+  # Counts scratch forks only. The prefix is distinct from this file's own `drill_<n>` source ids,
+  # and counts ALL statuses on purpose: if cleanup ever regressed to `Tenants.delete/1` the row
+  # would survive as a tombstone, which is precisely the unbounded growth this asserts against.
+  describe "snapshot health (#48)" do
+    # Snapshots had NO health signal at all: `sample_for_drill/1` samples directory ROWS, and a
+    # snapshot is a storage object with no row. So the one class of stored data an operator reaches
+    # for during a point-in-time recovery was the one class nothing ever checked — discovered
+    # corrupt at exactly the moment it was needed.
+    test "a corrupt snapshot is reported, not silently passed over", %{id: id} do
+      seed(id, ["CREATE TABLE kv (v TEXT)", "INSERT INTO kv VALUES ('a')"])
+      :ok = Fathom.Shard.Storage.snapshot(id, "snap1")
+
+      test_pid = self()
+      handler = "snapdrill-#{id}"
+
+      :telemetry.attach(
+        handler,
+        [:fathom, :restore_drill, :snapshot_result],
+        fn _e, _m, meta, _ -> send(test_pid, {:snapshot, meta.status, meta.snapshot_id}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      assert {:ok, _} = RestoreDrillJob.run_drill(5)
+      assert_receive {:snapshot, :ok, "snap1"}, 2_000
+
+      # Now corrupt the stored snapshot and prove the drill NOTICES. Without this the test would
+      # only show the happy path, which any no-op implementation also passes.
+      snap_path = Path.join(remote_dir(), "#{id}@snap-snap1.db")
+      assert File.exists?(snap_path), "fixture: the snapshot object is not where expected"
+      File.write!(snap_path, String.duplicate("garbage", 500))
+
+      assert {:ok, _} = RestoreDrillJob.run_drill(5)
+      assert_receive {:snapshot, status, "snap1"}, 2_000
+      assert status in [:corrupt, :error], "a corrupt snapshot passed the drill as #{status}"
+    end
+  end
+
+  defp drill_scratch_rows do
+    Fathom.Repo.aggregate(from(s in DirShard, where: like(s.shard_id, "restoredrill%")), :count)
   end
 
   defp attach do

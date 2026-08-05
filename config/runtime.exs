@@ -197,6 +197,14 @@ if n = System.get_env("RECONCILE_BATCH_SIZE") do
   config :fathom, :reconcile_batch_size, String.to_integer(n)
 end
 
+# Full restore drill (expert review 2026-08-01 #48): per-run sample size for the drill that
+# actually RESTORES — forks each sampled shard to a scratch tenant, compares row counts, drops it.
+# Separate from RESTORE_DRILL_SAMPLE and much smaller: a fork is a full object copy, so this costs
+# real storage I/O per sample where the read-only drill costs a GET. Unset ⇒ off.
+if n = System.get_env("RESTORE_DRILL_FULL_SAMPLE") do
+  config :fathom, :restore_drill_full_sample, String.to_integer(n)
+end
+
 # Warm-cache DISK back-pressure (expert review 2026-08-01 #36). `:warm_cache_max` bounds the
 # standby cache in shard COUNT, which says nothing about bytes — 500 shards is 8 MB or 2 TB — and
 # the cache shares a filesystem with the live shard data, so filling it fails every cold-open pull
