@@ -112,6 +112,44 @@ client stack:
 The end-to-end proof (an unchanged Django project migrating + doing ORM CRUD over fathom, with the
 migrations auto-captured) is `test/django_validation/` — run it as the reference integration.
 
+### Lookups that do NOT work yet (Django's SQLite UDFs) — expert review #19
+
+Django's SQLite backend registers ~20 Python functions on every **client** connection. Under
+`django-libsql` the SQL crosses the wire and is compiled by **fathom's** SQLite, where they do not
+exist. Basic CRUD is unaffected, which is exactly what makes this easy to miss: it breaks on the
+first date/regex lookup, and the error reads like a client bug.
+
+**Symptom:** `OperationalError: no such function: django_date_extract` (or `django_date_trunc`,
+`regexp`, …).
+
+**Affected, verified against a real shard connection** (`test/fathom/django_udf_compat_test.exs`
+is the tracked list and fails when any of these starts working):
+
+| Django code | Missing function |
+|---|---|
+| `.filter(created__year=…)`, `__month`, `__day`, `__hour`, `__week_day` | `django_date_extract`, `django_datetime_extract` |
+| `.filter(created__date=…)`, `__time` | `django_datetime_cast_date`, `django_datetime_cast_time` |
+| `TruncMonth/TruncDay/TruncDate(...)` — every time-series chart | `django_date_trunc`, `django_datetime_trunc`, `django_time_trunc` |
+| `.filter(field__regex=…)`, `__iregex` | `regexp` |
+| `F()` arithmetic on a `DurationField` | `django_format_dtdelta`, `django_timestamp_diff`, `django_time_diff` |
+| `**` / `Power()` | `django_power` |
+| `LPad`, `RPad`, `Repeat` | `LPAD`, `RPAD`, `REPEAT` |
+| `StdDev`, `Variance` | `STDDEV_POP`, `VAR_POP` |
+
+**Workarounds today:** express the lookup in SQL fathom's SQLite does have — `strftime` covers most
+of the date-extract/truncate cases (`.annotate(y=Func("created", Value("%Y"), function="strftime"))`),
+`LIKE`/`GLOB` covers many `__regex` uses, and duration arithmetic can be done in Python. Do the
+aggregation in the app for `StdDev`/`Variance`.
+
+**Why it is not simply fixed:** the obvious answer — register the functions on
+`Fathom.Shard.Connection.open/1` — needs a user-defined-function API that **exqlite 0.37.0 does not
+have**. There is no `create_function` or scalar/aggregate registration in `Exqlite.Sqlite3` or
+`Exqlite.Sqlite3NIF`. The real options are an upstream exqlite contribution, the planned
+`fathom_native` NIF, or a loadable SQLite extension via the `enable_load_extension/2` NIF that does
+exist (which means shipping a compiled artifact per platform). Rewriting the SQL server-side is
+**not** an option — `AGENTS.md` forbids hand-rolling SQL parsing, and these calls are nested inside
+arbitrary client queries. That decision is tracked in `tasks/todo.md`.
+
 ## Request latency & keeping tenants warm
 
 fathom is bottomless: a tenant that's been idle is flushed to S3 and dropped, so its **first**
