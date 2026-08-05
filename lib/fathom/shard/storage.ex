@@ -362,6 +362,61 @@ defmodule Fathom.Shard.Storage do
   def release_lease(shard_id, lease), do: backend().release_lease(shard_id, lease)
 
   @doc """
+  The shared policy half of a **conditional** lease release that came back "not the object I
+  wrote" (S3's `412 Precondition Failed`). Lives here, not in a backend, because it is a decision
+  every etag-carrying backend has to make identically — and because putting it here is what lets
+  the default test suite exercise it (the suite's backend is `Fathom.Test.FaultyStorage`, so a
+  policy implemented inside each backend would be tested only against the double).
+
+  A 412 is **two** situations, and reporting `:ok` for both is how a lock gets stranded silently:
+
+    * the lock is now **someone else's** — a correct no-op. Deleting it would remove a live
+      owner's lock, which is finding #22 and the reason the delete is conditional at all.
+
+    * the lock is **still ours at a different etag** — a leak reported as success. Our own etag
+      rotates under us: a same-owner reclaim rewrites the lock (`S3.acquire_existing/4`, same
+      epoch, new etag) and so does a legacy-mode `renew_lease/3`. The stranded lock then names a
+      LIVE node with no coordinator behind it, `owner_live?` reads that node's fresh heartbeat
+      forever, and no peer, failover or migrator can ever take the shard — while it keeps serving,
+      because its own node reclaims at the same incarnation. That combination is why this survived
+      #9 and #11: both fixed CALLERS that released with a stale lease, so any rotation whose result
+      the caller did not receive still leaked.
+
+  `read_owner` returns `{:ours, handle}` / `:not_ours` / `{:error, reason}`, where `handle` is
+  whatever the backend needs to condition the retry on what it just read (the fresh etag, for S3).
+  `delete_current` receives that handle. Threading it through the return value rather than stashing
+  it keeps the two closures independent — an earlier draft passed it via the process dictionary and
+  the `Process.put(...) && :ours` idiom silently returned `nil`, because `Process.put/2` returns the
+  PREVIOUS value.
+
+  One extra round trip, only on the 412 path, which a healthy release never takes.
+  """
+  @spec resolve_stale_release(
+          String.t(),
+          lease(),
+          (-> {:ours, term()} | :not_ours | {:error, term()}),
+          (term() -> :ok | {:error, term()})
+        ) :: :ok | {:error, term()}
+  def resolve_stale_release(shard_id, lease, read_owner, delete_current) do
+    case read_owner.() do
+      {:ours, handle} ->
+        :telemetry.execute(
+          [:fathom, :shard, :lease, :release_retried],
+          %{count: 1},
+          %{shard_id: shard_id, owner: Map.get(lease, :owner)}
+        )
+
+        delete_current.(handle)
+
+      :not_ours ->
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
   Read-only fence: returns `:ok` if `lease` is still the live lock for `shard_id`
   (same owner + epoch), `{:error, :superseded}` if another owner/epoch has taken it,
   or `{:error, reason}` on a transient store error. Unlike `renew_lease/3` this does

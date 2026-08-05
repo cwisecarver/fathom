@@ -48,6 +48,34 @@ defmodule Fathom.Test.FaultyStorage do
   defp current_lock_etag(shard_id),
     do: :persistent_term.get({__MODULE__, :lock_etag, shard_id}, nil)
 
+  @doc """
+  Rotate the lock's etag WITHOUT changing its owner or epoch — what `S3.acquire_existing/4` does
+  to the lock object on a same-owner reclaim, and what `renew_lease/3` does in legacy mode. The
+  holder's cached `lock_etag` is now stale, so its conditional release 412s.
+  """
+  def rotate_lock_etag(shard_id), do: bump_lock_etag(shard_id)
+
+  @doc """
+  Hand the lock to a different owner, so a holder's release must be a genuine no-op rather than
+  deleting a live owner's lock (finding #22). Rotates the etag too, since the new owner wrote it.
+  """
+  def replace_lock_owner(shard_id, new_owner) do
+    # Written RAW, not via acquire_lease/3 — the lock is held by a live owner, so a legitimate
+    # acquire correctly refuses. A takeover by another node is exactly a lock object that says
+    # someone else, which is what we stage here.
+    File.mkdir_p!(Local.dir())
+
+    File.write!(
+      Path.join(Local.dir(), "#{shard_id}.lock"),
+      Jason.encode!(%{"owner" => new_owner, "epoch" => 99, "expires_at_ms" => now_ms() + 60_000})
+    )
+
+    bump_lock_etag(shard_id)
+    :ok
+  end
+
+  defp now_ms, do: System.system_time(:millisecond)
+
   defp strict_lock_etag?, do: Application.get_env(:fathom, :lock_etag_strict, true)
 
   @impl true
@@ -197,18 +225,51 @@ defmodule Fathom.Test.FaultyStorage do
   end
 
   # Mirrors S3's conditional release: If-Match the etag WE last wrote. A mismatch is a 412,
-  # which S3 treats as a no-op — the lock stays. Releasing with a lease whose lock_etag has
-  # since rotated (a legacy-mode renew) therefore LEAKS the lock, which is finding #9.
+  # which the STORE treats as a no-op — the lock stays. Releasing with a lease whose lock_etag has
+  # since rotated (a legacy-mode renew, or a same-owner reclaim rewriting the lock) therefore
+  # leaks the lock unless the backend resolves the 412, which is finding #9's mechanism.
+  #
+  # This models the S3 BACKEND MODULE, not just the store, so it mirrors
+  # `S3.resolve_412_release/2` too: on a mismatch, re-read the holder and tell the two cases
+  # apart. Still ours at a different etag ⇒ finish the release (the leak the retry closes).
+  # Someone else's ⇒ genuine no-op, never delete a live owner's lock (finding #22).
+  #
+  # Without this the double would report the FIXED backend's behaviour as a leak and the fix
+  # would be untestable — the same reason the lock-etag contract was modelled here at all.
   @impl true
   def release_lease(shard_id, %{lock_etag: etag} = lease) when is_binary(etag) do
     if strict_lock_etag?() and current_lock_etag(shard_id) != etag do
-      :ok
+      resolve_412_release(shard_id, lease)
     else
       Local.release_lease(shard_id, lease)
     end
   end
 
   def release_lease(shard_id, lease), do: Local.release_lease(shard_id, lease)
+
+  # Reports the FACT and performs the retry; the DECISION is
+  # `Fathom.Shard.Storage.resolve_stale_release/4`, exactly as the S3 backend does it. Keeping the
+  # policy in lib/ is what makes the fix testable at all: the default suite runs THIS module as its
+  # backend, so a policy implemented privately in each backend would only ever be tested against
+  # the double.
+  #
+  # `check_lease/2` (owner + epoch, liveness-independent) rather than `lease_holder/1`, which is
+  # gated on the owner being live — the leak case is precisely a LIVE owner, but the question here
+  # is "is this lock still mine", not "is its owner alive". A same-owner reclaim rewrites the lock
+  # at the SAME epoch, so owner+epoch still match and the retry fires.
+  defp resolve_412_release(shard_id, lease) do
+    Fathom.Shard.Storage.resolve_stale_release(
+      shard_id,
+      lease,
+      fn ->
+        case Local.check_lease(shard_id, lease) do
+          :ok -> {:ours, current_lock_etag(shard_id)}
+          _ -> :not_ours
+        end
+      end,
+      fn _fresh -> Local.release_lease(shard_id, lease) end
+    )
+  end
 
   @impl true
   def check_lease(shard_id, lease) do

@@ -1770,10 +1770,12 @@ defmodule Fathom.Shard.Storage.S3 do
   # GET below existed only to re-learn an etag the lock PUT had already returned). The fence
   # semantics are identical: If-Match our own write, and a 412 means the lock is no longer
   # ours (a stealer wrote in the gap — finding #22) so leave it and no-op.
-  def release_lease(shard_id, %{lock_etag: etag}) when is_binary(etag) do
+  def release_lease(shard_id, %{lock_etag: etag} = lease) when is_binary(etag) do
     case Req.delete(req(), url: lock_path(shard_id), headers: [{"if-match", etag}]) do
       {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
-      {:ok, %{status: 412}} -> :ok
+      # A 412 means "the lock is not the object I wrote". That is TWO different situations and
+      # collapsing them to :ok is how a lock gets stranded silently — see resolve_412_release/2.
+      {:ok, %{status: 412}} -> resolve_412_release(shard_id, lease)
       {:ok, %{status: status}} -> {:error, {:s3_delete_status, status}}
       {:error, reason} -> {:error, reason}
     end
@@ -1796,6 +1798,35 @@ defmodule Fathom.Shard.Storage.S3 do
       _ ->
         :ok
     end
+  end
+
+  # The backend half of the conditional-release 412: report the FACT (is the lock still ours, at
+  # what etag) and perform the retry delete. The DECISION lives in
+  # `Fathom.Shard.Storage.resolve_stale_release/4` so every etag-carrying backend makes it
+  # identically and the default test suite can exercise it — see that function for why a 412 is
+  # two different situations.
+  defp resolve_412_release(shard_id, %{owner: owner} = lease) do
+    Storage.resolve_stale_release(
+      shard_id,
+      lease,
+      fn ->
+        case get_lock(shard_id) do
+          {:ok, %{owner: ^owner}, etag} -> {:ours, etag}
+          {:ok, _other, _etag} -> :not_ours
+          :not_found -> :not_ours
+          {:error, reason} -> {:error, reason}
+        end
+      end,
+      fn fresh_etag ->
+        case Req.delete(req(), url: lock_path(shard_id), headers: [{"if-match", fresh_etag}]) do
+          {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
+          # Raced again — someone took it between the read and this delete. Theirs now; leave it.
+          {:ok, %{status: 412}} -> :ok
+          {:ok, %{status: status}} -> {:error, {:s3_delete_status, status}}
+          {:error, reason} -> {:error, reason}
+        end
+      end
+    )
   end
 
   @impl true

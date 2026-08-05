@@ -137,9 +137,10 @@ noted).
   evidence base review 2026-08-01 #43 asked for, plus the `rate_per_hour`/`eta_seconds` fields
   tracking a real rollout. Also finds a **reproducible stuck-lease bug** (~1 in 300): a coordinator
   lease that outlives its coordinator on a live node is never stealable, so that tenant serves fine
-  but can never migrate — **still open**, and the report records three real lock-leak paths that
-  were fixed chasing it, none of which was the cause (the suite runs coordinators in legacy mode
-  while the rig runs heartbeat mode, which is the likely blind spot).
+  but can never migrate — **root-caused and fixed**: `release_lease` reported a `412` as success,
+  collapsing "someone else's lock" with "still ours at a rotated etag". Heartbeat-mode-only, which
+  is why the legacy-only suite never saw it. Three other real lock-leak paths were found and fixed
+  en route, none of them the cause.
 - **[reviews/tpc-run-2026-07-10.md](reviews/tpc-run-2026-07-10.md)** — the remote-client TPC run over
   the chaos rig (true cross-LB latency) + the loopback spec-scale TPC-C comparability numbers.
 - **[reviews/latency-cost-2026-07-23.md](reviews/latency-cost-2026-07-23.md)** — what an injected S3

@@ -138,7 +138,53 @@ So the failure mode bites **precisely the shards the cold-tail sweep exists for*
 self-heals on its next request, an idle one never does. And it stalls the deploy gate — a CI job
 polling for `converged == true` waits forever on a fleet that is otherwise 100% done.
 
-### Status: two leak paths closed, the rig straggler STILL REPRODUCES
+### FIXED and confirmed on the rig
+
+| run | before the fix | after |
+|---|---|---|
+| 1 | 299 / 300 (`roll131`) | **300 / 300** |
+| 2 | 299 / 300 (`roll33`) | **300 / 300** |
+| 3 | 299 / 300 (`roll8`) | |
+| 4 | 299 / 300 (`roll64`) | |
+
+Four runs before, each stranding exactly one tenant on a different shard; two runs after, both
+fully converged with `failed=0`. Throughput is unchanged where it is comparable (12.8 shards/s on
+the first post-fix run, matching the pre-fix runs) — the fix adds one round trip only on the 412
+path, which a healthy release never takes. The second post-fix run reads 8.1 shards/s, which is
+back-to-back-run VM contention on the shared colima box (the same-topology rule), not the fix.
+
+### Root cause: the release itself, not any of its callers
+
+`release_lease` is a conditional `DELETE … If-Match: <the etag we last wrote>`, and a `412` was
+reported as `:ok`. A 412 is **two** situations:
+
+- the lock is now **someone else's** — a correct no-op (finding #22: an unconditional delete would
+  remove a live owner's lock);
+- the lock is **still ours at a different etag** — a leak, reported as success.
+
+Our own etag rotates under us. `S3.acquire_existing/4` **rewrites the lock** on a same-owner
+reclaim (same owner, same epoch, new etag), and `renew_lease/3` rewrites it in legacy mode. So the
+release silently no-op'd and left a lock naming a **live** node with no coordinator behind it —
+`owner_live?` reads that node's fresh heartbeat forever, so no peer, no failover and no migrator can
+take the shard, while it keeps serving because its own node reclaims at the same incarnation.
+
+**This is why #9 and #11 did not close it.** Both fixed *callers* that released with a stale lease.
+Any rotation whose result the caller never received still leaked, because the bug was in the release.
+
+**And this is why it was heartbeat-mode-only.** Simulating the pre-fix policy (412 ⇒ `:ok`) fails
+the heartbeat test and *passes* the legacy one: legacy's `Fence.check` performs a `renew_lease` PUT
+on the way into the drop, and #9's fix threads that refreshed lease — carrying the current etag —
+back to the caller, so legacy accidentally self-heals a rotation from any source. Heartbeat mode does
+no renew at all and carries the stale etag straight into the release. The suite ran legacy-only until
+the previous commit, so it could not see this; the rig runs heartbeat mode, so it hit it every run.
+
+The fix re-reads the lock on a 412 and finishes the delete when it is still ours. The decision lives
+in `Fathom.Shard.Storage.resolve_stale_release/4` rather than inside a backend — both because every
+etag-carrying backend must make it identically, and because the default suite's backend is
+`Fathom.Test.FaultyStorage`, so a policy implemented privately per backend would only ever be tested
+against the double.
+
+### History: two leak paths closed before this, and why they were not it
 
 Read this section before the next one. Two genuine lock-leak paths were found and fixed the same
 day, each with a test that fails against the unfixed code — and **neither was this bug**. A rebuilt

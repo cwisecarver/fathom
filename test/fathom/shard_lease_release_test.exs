@@ -334,6 +334,76 @@ defmodule Fathom.ShardLeaseReleaseTest do
     end
   end
 
+  for mode <- @modes do
+    describe "#{mode} mode — the lock's etag rotated under a live holder" do
+      setup do: set_mode!(unquote(mode))
+
+      # The LAST variant of the leaked-lock class, and the one that survived #9, #11 and the
+      # 2026-08-04 drop-path fixes: it is not in any CALLER, it is in `release_lease` itself.
+      #
+      # The release is a conditional `DELETE … If-Match: <the etag we last wrote>`, and a 412 was
+      # reported as `:ok`. But a 412 is two different situations:
+      #
+      #   * the lock is now SOMEONE ELSE'S — correct no-op (finding #22: an unconditional delete
+      #     would remove a live owner's lock).
+      #   * the lock is STILL OURS at a different etag — a LEAK, reported as success.
+      #
+      # Our own etag rotates without us: `S3.acquire_existing/4` REWRITES the lock on a same-owner
+      # reclaim (same epoch, new etag), and `renew_lease/3` rewrites it in legacy mode. So any
+      # source of rotation stranded the lock, and #9's fix — thread the refreshed lease back to the
+      # caller — only closed the rotations whose result the caller happened to receive.
+      #
+      # This fixture rotates the etag directly, which is what a same-owner reclaim does to the
+      # bytes, then drops the shard normally. Pre-fix the release 412s, reports `:ok`, and the lock
+      # survives naming a live node with no coordinator — the rig straggler's exact signature.
+      #
+      # **It only leaks in HEARTBEAT mode, and that is the point.** Simulating the pre-fix policy
+      # (412 ⇒ `:ok`) fails the heartbeat case and PASSES the legacy one, because legacy's
+      # `Fence.check` performs a `renew_lease` PUT on the way into the drop, and #9's fix threads
+      # that refreshed lease — with the current etag — back to the caller. So legacy accidentally
+      # self-heals a rotation from any source; heartbeat mode, which does no renew at all, carries
+      # the stale etag straight into the release. That is why the rig (heartbeat) hit this and the
+      # suite (legacy-only until the previous commit) could not. The legacy case is kept anyway:
+      # it pins that the self-healing is real rather than assumed, and it would catch a future
+      # change that stopped merging the fence's lease.
+      test "a normal drop still frees the lock", %{shard: shard} do
+        seed!(shard, "rotated")
+        {:ok, coordinator} = Shards.ensure(shard)
+        assert_mode!(coordinator, unquote(mode))
+
+        # Rotate the lock's etag behind the coordinator, exactly as a same-owner re-acquire does.
+        # The lease the coordinator holds now carries a stale lock_etag.
+        Fathom.Test.FaultyStorage.rotate_lock_etag(shard)
+
+        drain_and_wait!(shard, coordinator)
+
+        assert_foreign_owner_can_acquire!(
+          shard,
+          "the release 412'd on its own rotated etag, reported :ok, and stranded the lock"
+        )
+      end
+
+      # The other half of the 412, and the reason the fix cannot simply delete unconditionally:
+      # when the lock genuinely belongs to someone else, releasing ours must NOT remove theirs.
+      # Finding #22 exists because an unconditional delete did exactly that.
+      test "a release whose lock was TAKEN OVER leaves the new owner's lock alone", %{
+        shard: shard
+      } do
+        seed!(shard, "stolen")
+        {:ok, coordinator} = Shards.ensure(shard)
+        assert_mode!(coordinator, unquote(mode))
+
+        # A different owner now holds the lock. Our release must be a no-op.
+        Fathom.Test.FaultyStorage.replace_lock_owner(shard, "thief@othernode#deadbeef")
+
+        drain_and_wait!(shard, coordinator)
+
+        assert {:held, "thief@othernode#deadbeef"} = Storage.lease_holder(shard),
+               "the drop deleted another live owner's lock (finding #22)"
+      end
+    end
+  end
+
   describe "legacy mode — #9, the fence-refreshed lease must reach release_lease" do
     # LEGACY ONLY, and not an oversight: `Fence.check` performs a `renew_lease` PUT in legacy mode,
     # and that PUT is what rotates the lock's etag and made releasing with the pre-fence lease a
