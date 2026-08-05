@@ -416,7 +416,7 @@ defmodule Fathom.Tenants do
   end
 
   defp mint_token(id) do
-    case HranaAuth.token_for(id) do
+    case HranaAuth.token_for(id, actor: "Tenants.provision") do
       {:ok, token} -> token
       _ -> nil
     end

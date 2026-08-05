@@ -316,7 +316,7 @@ defmodule FathomWeb.Api.TenantController do
   def mint_token(conn, %{"id" => id} = params) do
     scope = scope_param(params)
 
-    case HranaAuth.token_for(id, scope: scope) do
+    case HranaAuth.token_for(id, scope: scope, actor: "api:/api/tenants/:id/token") do
       {:ok, token} -> json(conn, %{shard_id: id, auth_token: token, scope: to_string(scope)})
       {:error, :invalid_shard_id} -> error(conn, :bad_request, "invalid shard id")
     end

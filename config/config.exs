@@ -76,7 +76,7 @@ config :fathom, Oban,
   # floor on repo pool demand before the endpoint, the pollers, and the near-hot-path
   # HranaAuth.Revocations reads are counted. RAISING THESE MEANS RAISING `POOL_SIZE` in
   # config/runtime.exs, which is sized against them (expert review 2026-07-24 #21).
-  queues: [migrations: 10, retirement: 5, rebalance: 3, tenants: 3],
+  queues: [migrations: 10, retirement: 5, rebalance: 3, tenants: 3, tokens: 3],
   plugins: [
     {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7},
     # Rescue jobs stranded in `executing` by a node that died mid-run (expert review 2026-07-24

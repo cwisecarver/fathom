@@ -46,7 +46,7 @@ defmodule Fathom.HranaAuth do
   require Logger
 
   alias Fathom.{Directory, ShardId}
-  alias Fathom.HranaAuth.Revocations
+  alias Fathom.HranaAuth.{Ledger, Revocations}
 
   @salt "fathom hrana shard"
 
@@ -141,7 +141,11 @@ defmodule Fathom.HranaAuth do
   @spec token_for(term(), keyword()) :: {:ok, String.t()} | {:error, :invalid_shard_id}
   def token_for(shard_id, opts \\ []) do
     # `:scope` (`:rw` default | `:ro`, #24) is consumed here; the rest pass to Phoenix.Token.sign.
-    {scope, sign_opts} = Keyword.pop(opts, :scope, :rw)
+    {scope, opts} = Keyword.pop(opts, :scope, :rw)
+
+    # Provenance for the ledger (#37) — who asked for this credential. Never authenticated and never
+    # consulted for authorization; a breadcrumb for whoever reads the audit later.
+    {actor, sign_opts} = Keyword.pop(opts, :actor)
 
     case ShardId.cast(shard_id) do
       {:ok, canonical} ->
@@ -152,6 +156,13 @@ defmodule Fathom.HranaAuth do
         # a v1 token works until a revoke actually bumps the floor above 1.
         version = current_token_version(canonical)
         payload = put_scope(%{"s" => canonical, "v" => version}, scope)
+
+        # Issuance ledger (#37). Best-effort and AFTER the claims are settled: the mint is the
+        # authoritative act and a ledger outage must never fail it (`mix fathom.token` runs with no
+        # Repo at all). An incomplete ledger under-reports what is outstanding, which is the safe
+        # direction for `revoke_issued_before/2` — it revokes less than it might, never more.
+        Ledger.record(shard_id: canonical, token_version: version, scope: scope, actor: actor)
+
         {:ok, Phoenix.Token.sign(secret!(), @salt, payload, sign_opts)}
 
       :error ->
@@ -193,6 +204,59 @@ defmodule Fathom.HranaAuth do
       :error ->
         {:error, :invalid_shard_id}
     end
+  end
+
+  @doc """
+  Revoke every token minted before `cutoff`, fleet-wide (expert review 2026-08-01 #37).
+
+  The gap this closes: revocation was per-shard, and the only fleet-wide lever was rotating
+  `secret_key_base` — which invalidates every tenant's token simultaneously. That is an outage, not
+  a revocation, so in the ordinary shape of a month-one incident ("a laptop with tokens on it was
+  lost last Tuesday") the available responses were "revoke one shard at a time from a list nobody
+  kept" or "take the fleet down".
+
+  Bumps the `token_version` floor on every shard the ledger shows with an outstanding token issued
+  before `cutoff`. **Idempotent**: `Ledger.shards_issued_before/1` only returns shards whose floor
+  has not already moved past the issuance, so re-running the same cutoff is a no-op rather than a
+  second round of disconnects.
+
+  Options:
+
+    * `:async` (default `true`) — enqueue `Fathom.HranaAuth.RevokeJob` per shard so a large fleet is
+      paced through Oban's `tokens` queue instead of hammering Postgres and the notify channel in
+      one synchronous burst. `false` revokes inline, which is what a test or a small fleet wants.
+    * `:limit` — cap how many shards this call touches. A blast-radius brake for an operator who
+      wants to confirm the selection before committing to the rest.
+
+  Returns `{:ok, count}` where count is shards revoked (or enqueued).
+
+  **Deliberately depends on the ledger, and therefore under-revokes when the ledger is incomplete.**
+  A mint that failed to record (Postgres down, `mix fathom.token` with no Repo) is invisible here.
+  The alternative — revoking every shard regardless — is the `secret_key_base` outage this exists to
+  avoid. An operator who needs the nuclear option still has it; this is the scalpel, and a scalpel
+  that silently widened its own incision would be worse than none.
+  """
+  @spec revoke_issued_before(DateTime.t(), keyword()) :: {:ok, non_neg_integer()}
+  def revoke_issued_before(%DateTime{} = cutoff, opts \\ []) do
+    async? = Keyword.get(opts, :async, true)
+    limit = Keyword.get(opts, :limit)
+
+    shards =
+      cutoff
+      |> Ledger.shards_issued_before()
+      |> then(fn ids -> if limit, do: Enum.take(ids, limit), else: ids end)
+
+    Enum.each(shards, fn id ->
+      if async?, do: enqueue_revoke(id), else: revoke(id)
+    end)
+
+    {:ok, length(shards)}
+  end
+
+  defp enqueue_revoke(shard_id) do
+    %{shard_id: shard_id}
+    |> Fathom.HranaAuth.RevokeJob.new()
+    |> Oban.insert()
   end
 
   @doc """
@@ -300,15 +364,36 @@ defmodule Fathom.HranaAuth do
       )
     end
 
-    # No default expiry (#24): a bearer token minted with no max_age lives forever, so a leaked
-    # credential's exposure grows unbounded. Warn loudly at boot; with graceful rotation
-    # (`HranaAuth.rotate/1`) a finite max_age no longer means a rotation outage.
+    # No default expiry (#24 warned; #37 REFUSES in prod): a bearer token minted with no max_age
+    # lives forever, so a leaked credential's exposure grows unbounded and no amount of after-the-
+    # fact tooling recovers a token you did not know existed. A warning was the right first step
+    # while rotation still meant an outage; it no longer does (`rotate/1` is zero-downtime with a
+    # grace window), so there is no longer a good reason to run `:required` with immortal tokens.
+    #
+    # Refuse in PROD only, matching `Fathom.Application.check_template_default!`. Dev and test mint
+    # freely, and a deployment that genuinely wants immortal tokens sets HRANA_TOKEN_MAX_AGE to a
+    # very large number — an explicit choice recorded in config rather than an unnoticed default.
     if configured == :required and max_age() == :infinity do
-      Logger.warning(
-        "hrana_auth is :required but :hrana_token_max_age is unset (tokens NEVER expire). " <>
-          "Set HRANA_TOKEN_MAX_AGE (seconds) to bound credential-leak exposure — rotation is " <>
-          "now zero-downtime (HranaAuth.rotate/1), so a finite expiry is safe."
-      )
+      if Application.get_env(:fathom, :env) == :prod do
+        raise """
+        hrana_auth is :required but :hrana_token_max_age is unset, so tokens NEVER expire.
+
+        A leaked Hrana token would be valid forever, and until expert review #37 there was no
+        record of which tokens had been issued at all — so "revoke what leaked" had no input.
+
+        Set HRANA_TOKEN_MAX_AGE (seconds). Rotation is zero-downtime (HranaAuth.rotate/1 keeps the
+        previous version valid for :hrana_rotation_grace_ms), so a finite expiry does not mean a
+        rotation outage. To deliberately keep long-lived tokens, set a large value explicitly —
+        that is a choice in your config rather than an unnoticed default.
+        """
+      else
+        Logger.warning(
+          "hrana_auth is :required but :hrana_token_max_age is unset (tokens NEVER expire). " <>
+            "Set HRANA_TOKEN_MAX_AGE (seconds) to bound credential-leak exposure — rotation is " <>
+            "zero-downtime (HranaAuth.rotate/1), so a finite expiry is safe. This is a REFUSAL " <>
+            "in prod (expert review #37)."
+        )
+      end
     end
 
     :ok

@@ -31,7 +31,7 @@ defmodule Mix.Tasks.Fathom.Token do
         start_repo!()
         check_floor_readable!(shard_id)
 
-        case Fathom.HranaAuth.token_for(shard_id) do
+        case Fathom.HranaAuth.token_for(shard_id, actor: "mix fathom.token") do
           {:ok, token} -> Mix.shell().info(token)
           {:error, :invalid_shard_id} -> Mix.raise("invalid shard id: #{inspect(shard_id)}")
         end

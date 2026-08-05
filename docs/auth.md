@@ -89,6 +89,58 @@ Mint, rotate, and revoke are exposed programmatically on the control-plane API: 
 falling back to the shared admin BasicAuth for backward compatibility (see
 [tenant-lifecycle.md](tenant-lifecycle.md)); token routes require the `manage` scope.
 
+## Issuance ledger & fleet-wide revocation (#37)
+
+Everything above covers **one shard**. What was missing was the layer above it, which is the shape
+an ordinary month-one incident actually takes: *"a laptop with tokens on it was lost last Tuesday."*
+Tokens are stateless `Phoenix.Token`s and only a per-shard `token_version` **floor** was persisted,
+so there was no record of which tokens had ever been issued — not who minted one, when, for which
+tenant, or with what scope. The only fleet-wide lever was rotating `secret_key_base`, which
+invalidates every tenant's token simultaneously: an outage, not a revocation.
+
+**The ledger** (`hrana_token_issuances`, `Fathom.HranaAuth.Ledger`) records one row per mint —
+shard, `token_version`, scope, actor, `minted_at`. It stores the **claims, never the secret**:
+a Hrana token is verified by signature, not by lookup, so persisting anything derived from the
+secret would add a credential to steal while answering no question the claims cannot. (That is
+stricter than `api_keys`, which keeps a SHA-256 hash *because* those are looked up.)
+
+Rows are append-only. A revoke does not delete history, it moves the floor — so
+`Ledger.outstanding/1` reinterprets the same rows against the current floor, and
+`Ledger.history/1` keeps the audit trail intact.
+
+**Recording never fails a mint.** `mix fathom.token` runs with config only and no `Repo`, and a
+Postgres blip must not stop an operator issuing a credential. A skipped write logs a warning. The
+consequence is that an incomplete ledger **under-reports** what is outstanding — which is the safe
+direction, because the bulk revoke below then revokes less than it might, never more.
+
+**Time-scoped bulk revoke:**
+
+```elixir
+# Everything minted before the incident window, paced through Oban's :tokens queue.
+Fathom.HranaAuth.revoke_issued_before(~U[2026-08-01 00:00:00Z])
+
+# Confirm the blast radius first, or revoke inline on a small fleet.
+Fathom.HranaAuth.revoke_issued_before(cutoff, limit: 10)
+Fathom.HranaAuth.revoke_issued_before(cutoff, async: false)
+```
+
+It bumps the floor on every shard the ledger shows with an **outstanding** token issued before the
+cutoff, and is **idempotent** — re-running the same cutoff is a no-op rather than a second round of
+client disconnects, which is what makes it safe to retry or run from a cron.
+
+It deliberately depends on the ledger, so a mint that failed to record is invisible to it. The
+alternative — revoking every shard regardless — is the `secret_key_base` outage this exists to
+avoid. That nuclear option still exists; this is the scalpel, and a scalpel that silently widened
+its own incision would be worse than none.
+
+**Tokens now have to expire in prod.** `:hrana_token_max_age` unset with `:hrana_auth` `:required`
+used to warn; it now **refuses to boot** in prod, matching `check_template_default!`. The warning
+was right while rotation still meant an outage — it no longer does (`rotate/1` keeps the previous
+version valid for `:hrana_rotation_grace_ms`), so there is no longer a good reason to run
+`:required` with immortal tokens. To keep long-lived tokens deliberately, set a large
+`HRANA_TOKEN_MAX_AGE` — an explicit choice in config rather than an unnoticed default. Dev and test
+still only warn.
+
 ## Control-plane auth throttle (#34)
 
 The shared admin BasicAuth (`ADMIN_USER` / `ADMIN_PASS`) is the one password on the platform, so

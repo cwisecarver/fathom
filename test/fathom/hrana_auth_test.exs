@@ -6,6 +6,12 @@ defmodule Fathom.HranaAuthTest do
   # app env, and the end-to-end tests open real shard files.
   use ExUnit.Case, async: false
 
+  # These tests mint tokens from processes the Ecto sandbox does not own (the real Hrana pipeline
+  # spawns its own), so the #37 issuance ledger correctly reports it could not record those mints —
+  # once per mint. That warning is right in production and pure noise here, and ExUnit still prints
+  # captured logs for a test that FAILS, so this hides the noise without hiding the signal.
+  @moduletag :capture_log
+
   import Plug.Test
   import Plug.Conn
 
