@@ -31,6 +31,35 @@ defmodule Fathom.Shard.Storage.TwoStealerTest do
     %{dir: dir}
   end
 
+  # This test failed ONCE under full-suite load on 2026-08-02 (seed 783965) with BOTH stealers
+  # winning — A at epoch 2, B at epoch 3 — and has never reproduced: 14 runs then, plus the
+  # elimination pass on 2026-08-05. Attribution stalled because the failure message showed only
+  # `results`, and the interesting state is what the LOSER saw.
+  #
+  # For B to steal A's 30-second-fresh lock, `Local.owner_live?/3` must have returned `:dead`, and
+  # `stealable_at/2` has exactly one branch that can do that for a fresh lock: heartbeat
+  # `:not_found` AND `Storage.incarnation_dead?(owner)` true, which returns "stealable at 0". That
+  # set is a process-global `:persistent_term` that is NEVER cleared between tests and only grows,
+  # so it is the one piece of cross-test state that could reach in here — even though its entries
+  # are `nonode@nohost#<nonce>` and cannot string-match these owners today. The other branches all
+  # derive from the lock's own TTL.
+  #
+  # So capture that, plus the lock as it stands, at failure time. Cheap (only on failure) and it
+  # turns "seen once, cause unknown" into an attributable report next time.
+  defp diagnostics(dir, shard) do
+    lock = Path.join(dir, "#{shard}.lock")
+
+    owners = ["stealer_a@n#a1", "stealer_b@n#b1", "dead@node#gone"]
+
+    """
+      --- diagnostics (why did the loser think the winner was dead?) ---
+      lock file: #{inspect(File.read(lock))}
+      now_ms: #{System.system_time(:millisecond)}  steal_margin_ms: #{Storage.steal_margin_ms()}
+      dead_incarnations hits: #{inspect(Enum.filter(owners, &Storage.incarnation_dead?/1))}
+      heartbeats: #{inspect(Map.new(owners, &{&1, Storage.read_heartbeat(&1)}))}
+    """
+  end
+
   defp write_dead_lock(dir, shard) do
     File.mkdir_p!(dir)
 
@@ -66,7 +95,8 @@ defmodule Fathom.Shard.Storage.TwoStealerTest do
       held = for {:error, {:held, holder}} <- results, do: holder
 
       assert length(winners) == 1,
-             "round #{round}: exactly one stealer must win, got #{inspect(results)}"
+             "round #{round}: exactly one stealer must win, got #{inspect(results)}\n" <>
+               diagnostics(dir, shard)
 
       [winner] = winners
       assert winner.epoch == 2, "the steal must bump the epoch exactly once"

@@ -131,7 +131,8 @@ Complements the framework **Test guidelines** below (`start_supervised!`, no `Pr
 - **Save test output to timestamped logs** so results are readable without rerunning, then prune logs older than a day and read the latest instead of rerunning:
   ```bash
   mix test 2>&1 | tee "logs/test-$(date +%Y%m%d-%H%M%S).log"
-  find logs/ -name "test-*.log" -mtime +1 -delete 2>/dev/null
+  # NEVER prune test-failures-*.log — see below. `test-*.log` matches it.
+  find logs/ -name "test-*.log" ! -name "test-failures-*.log" -mtime +1 -delete 2>/dev/null
   ls -t logs/test-*.log | head -1 | xargs cat   # read latest
   ```
 - **On a failure, DON'T re-run first — name it.** A flake you can't name is a flake you can't fix.
@@ -145,6 +146,12 @@ Complements the framework **Test guidelines** below (`start_supervised!`, no `Pr
   `Fathom.FailureCaptureFormatter` (wired in `test/test_helper.exs`) is the backstop: any failure
   writes `logs/test-failures-<ts>.log` with the seed, the test's location, and a paste-ready rerun
   command. It writes nothing on a green run.
+  **Never prune those.** The documented cleanup above used to be `-name "test-*.log"`, which
+  **matches `test-failures-*.log`** — so the one artifact that survives an unreproducible flake was
+  being deleted a day later by the very command meant to tidy up after it. That is why
+  `lb_apply_test:132` is still unattributed on 2026-08-05: the mechanism was in a log the prune had
+  already removed, and an intermittent that recurs a week later has no history to compare against.
+  A failure log is evidence, not clutter; it costs kilobytes.
 - **Every bug fix ships with a regression test in the same commit.** It must (1) **reproduce deterministically** — fail pre-fix, pass post-fix; if you can't make it fail without the fix you haven't isolated the bug, keep investigating — and (2) **pin the violated invariant**, not just the reproduction steps. Comment the symptom so future readers know why the test exists. Good targets: concurrency/thread-local races (test at the pure-function level), off-by-one/boundary (test at the boundary), classifier/dispatcher mismatches (test the classification), lifecycle ordering (test the sequence).
 - **ALWAYS run the new test against the unfixed code.** Stash the `lib/` change, run, confirm it fails, restore. Do this every time, not when it feels uncertain — a test that passes both ways is the default outcome of a plausible-looking test, not a rare one. In one session this caught four separate tests that were measuring nothing.
 - **When a regression test passes pre-fix, suspect the harness before concluding "unreproducible".** In order:

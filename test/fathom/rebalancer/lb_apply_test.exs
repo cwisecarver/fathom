@@ -9,8 +9,21 @@ defmodule Fathom.Rebalancer.LbApplyTest do
   alias Fathom.Rebalancer.{LbApply, Overrides}
 
   setup do
-    map_path =
-      Path.join(System.tmp_dir!(), "fathom_lbapply_#{System.unique_integer([:positive])}.conf")
+    # A per-test DIRECTORY, removed whole, rather than a bare file path with a hand-maintained
+    # list of suffixes to delete. The old cleanup removed the map and `.tmp.*` but not the
+    # `.applied` marker `mark_applied/1` writes beside it, which had leaked **173 files** into
+    # `System.tmp_dir!()` by 2026-08-05. `System.unique_integer/1` is unique within one BEAM run
+    # and starts fresh on the next, so those paths are re-drawn across runs — leaked state next to
+    # a re-used path is cross-RUN contamination, the same "every run starts fresh" contract
+    # `chaos.sh`'s `seed()` exists for.
+    #
+    # A directory also means the next sidecar `LbApply` learns to write is cleaned automatically
+    # instead of leaking until someone notices.
+    dir =
+      Path.join(System.tmp_dir!(), "fathom_lbapply_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(dir)
+    map_path = Path.join(dir, "map.conf")
 
     prev = %{
       map: Application.get_env(:fathom, :lb_map_path),
@@ -29,9 +42,9 @@ defmodule Fathom.Rebalancer.LbApplyTest do
       restore(:lb_test_cmd, prev.test)
       restore(:lb_reload_cmd, prev.reload)
       restore(:lb_backends, prev.backends)
-      File.rm(map_path)
-      # Any stray temp candidates from an aborted promotion.
-      for f <- Path.wildcard(map_path <> ".tmp.*"), do: File.rm(f)
+      # The whole directory: the map, the `.applied` marker, and any stray `.tmp.*` candidate
+      # from an aborted promotion.
+      File.rm_rf(dir)
     end)
 
     %{map_path: map_path}
