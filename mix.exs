@@ -11,7 +11,16 @@ defmodule Fathom.MixProject do
       aliases: aliases(),
       deps: deps(),
       releases: releases(),
-      compilers: [:phoenix_live_view] ++ Mix.compilers(),
+      # :fathom_udf builds native/fathom_udf (the Django-compatibility SQLite extension) into
+      # priv/sqlite_ext/. It SKIPS rather than fails when cargo is absent — see
+      # Mix.Tasks.Compile.FathomUdf for why a Rust toolchain is not made a hard requirement.
+      #
+      # It runs AFTER Mix.compilers() on purpose: the compiler task is defined in this project
+      # (lib/mix/tasks/compile.fathom_udf.ex), so :elixir has to compile it before Mix can resolve
+      # it. Placing it first gives `The task "compile.fathom_udf" could not be found` on a clean
+      # build. Nothing at compile time depends on the artifact — only the running node loads it —
+      # so last is also the correct place semantically.
+      compilers: [:phoenix_live_view] ++ Mix.compilers() ++ [:fathom_udf],
       listeners: [Phoenix.CodeReloader]
     ]
   end

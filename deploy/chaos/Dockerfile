@@ -16,6 +16,16 @@ FROM ${BUILDER_IMAGE} AS builder
 RUN apt-get update -y && apt-get install -y build-essential git curl \
   && apt-get clean && rm -f /var/lib/apt/lists/*_*
 
+# Rust, for native/fathom_udf — the loadable SQLite extension supplying Django's UDFs
+# (expert review 2026-08-01 #19). Without it `mix compile.fathom_udf` SKIPS (by design, so a
+# contributor without Rust can still build fathom) and the rig would come up silently lacking
+# django_date_extract / Trunc* / regexp — a difference between the rig and production that the
+# rig exists to NOT have.
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+  | sh -s -- -y --profile minimal --default-toolchain stable \
+  && rustc --version && cargo --version
+
 ENV MIX_ENV=prod
 RUN mix local.hex --force && mix local.rebar --force
 
@@ -33,6 +43,9 @@ RUN mix deps.compile
 COPY fathom/priv priv
 COPY fathom/lib lib
 COPY fathom/assets assets
+# The Rust crate `mix compile.fathom_udf` builds into priv/sqlite_ext/. Copied AFTER deps.compile
+# so a crate edit does not bust the dependency layer cache.
+COPY fathom/native native
 # Rig-only: compile the web endpoint for plaintext LAN access (SSL-force + WS origin check off),
 # so each node's admin dashboard is reachable from another host over http. force_ssl is a
 # compile-time config key, so this must be a BUILD-time env (see config/prod.exs). Never real prod.

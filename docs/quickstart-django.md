@@ -112,78 +112,91 @@ client stack:
 The end-to-end proof (an unchanged Django project migrating + doing ORM CRUD over fathom, with the
 migrations auto-captured) is `test/django_validation/` — run it as the reference integration.
 
-### Lookups that do NOT work yet (Django's SQLite UDFs) — expert review #19
+### Django's SQLite UDFs — supplied by `fathom_udf` (expert review #19)
 
 Django's SQLite backend registers **54** Python functions on every **client** connection. Under
-`django-libsql` the SQL crosses the wire and is compiled by **fathom's** SQLite, where they do not
-exist. Basic CRUD is unaffected, which is exactly what makes this easy to miss: it breaks on the
-first date/regex lookup, and the error reads like a client bug.
+`django-libsql` the SQL crosses the wire and is compiled by **fathom's** SQLite, so for a long time
+they did not exist there: basic CRUD worked and the first date/regex lookup raised
+`OperationalError: no such function: django_date_extract`, an error that reads like a client bug.
 
-**Symptom:** `OperationalError: no such function: django_date_extract` (or `django_date_trunc`,
-`regexp`, …).
+**As of 2026-08-05 all 54 resolve.** 19 come from SQLite itself (the 18 math functions, because this
+build sets `SQLITE_ENABLE_MATH_FUNCTIONS`, plus `SIGN`). The other **35 are supplied by
+`fathom_udf`**, a loadable SQLite extension built from `native/fathom_udf` and loaded onto every
+shard connection.
 
-**Scope, probed against a real shard connection 2026-08-05** — Django registers **54** functions;
-**19 already resolve** (all 18 math functions, because this SQLite is built with
-`SQLITE_ENABLE_MATH_FUNCTIONS`, plus `SIGN`) and **35 are missing**.
-`test/fathom/django_udf_compat_test.exs` is the tracked list and fails when any of them moves.
+Nothing to configure — an unchanged Django app gets them. `__year`, `__date`, `TruncMonth`,
+`__regex`, `DurationField` arithmetic, `StdDev`/`Variance` all work.
 
-The 35 split by what supplying them would take — **24 easy** (padding, hashes, `regexp`, bit ops,
-uuid, the `STDDEV`/`VAR`/`BIT_*` aggregates), **5 moderate** (date arithmetic, no timezone), and
-**6 timezone-dependent**. The last six are the real project: they take `tzname`/`conn_tzname` and
-need a timezone database server-side. They are also the ones ordinary apps hit first, so the cheap
-29 do not buy off the headline breakage.
+| Django code | Function | Supplied by |
+|---|---|---|
+| `.filter(created__year=…)`, `__month`, `__day`, `__hour`, `__week_day` | `django_date_extract`, `django_datetime_extract` | extension |
+| `.filter(created__date=…)`, `__time` | `django_datetime_cast_date`, `django_datetime_cast_time` | extension |
+| `TruncMonth/TruncDay/TruncDate(...)` — every time-series chart | `django_date_trunc`, `django_datetime_trunc`, `django_time_trunc` | extension |
+| `.filter(field__regex=…)`, `__iregex` | `regexp` | extension |
+| `F()` arithmetic on a `DurationField` | `django_format_dtdelta`, `django_timestamp_diff`, `django_time_diff` | extension |
+| `LPad`, `RPad`, `Repeat`, `Reverse` | `LPAD`, `RPAD`, `REPEAT`, `REVERSE` | extension |
+| `MD5`, `SHA1`…`SHA512` | same names | extension |
+| `StdDev`, `Variance` | `STDDEV_POP/SAMP`, `VAR_POP/SAMP` | extension |
+| `BitAnd`, `BitOr`, `BitXor`, `ANY_VALUE` | `BIT_AND`, `BIT_OR`, `BIT_XOR`, `ANY_VALUE` | extension |
+| `UUIDV4()`, `UUIDV7()`, `Random()` | `UUIDV4`, `UUIDV7`, `RAND` | extension |
+| `**` / `Power()`, `Log`, trig | `POWER`, `LOG`, … | SQLite build |
 
-**When the timezone argument is actually NULL (verified 2026-08-05).** Django computes it as:
+#### Timezones work, including DST
 
-```python
-def _convert_tznames_to_sql(self, tzname):
-    if tzname and settings.USE_TZ:
-        return tzname, self.connection.timezone_name
-    return None, None
-```
+The six `tzname`-taking functions need a timezone **database** server-side, and they are the ones
+ordinary apps hit first — `USE_TZ` has defaulted to `True` since Django 5.0, the version
+`django-libsql` pins. `fathom_udf` bundles the IANA database (via `chrono-tz`), so there is no
+`/usr/share/zoneinfo` dependency and a slim container behaves like a dev box.
 
-and `_sqlite_datetime_parse` skips `zoneinfo` entirely when both are `None` — so with a NULL
-timezone the six collapse to plain date arithmetic and need **no tzdata**.
+Verified against Django's own behaviour: zone conversion happens *before* truncation (so
+`TruncDay` on a UTC timestamp near midnight gives the tenant's local day), half-hour and
+quarter-hour offsets are exact, the ambiguous hour when DST ends takes the first occurrence
+(Python's `fold=0`), and the nonexistent hour when DST starts resolves rather than erroring.
 
-That is a narrower escape hatch than it first appears: `USE_TZ` defaults to **True** as of Django
-5.0 — the very version `django-libsql` pins — and `startproject` has written `USE_TZ = True` since
-Django 1.4. So it does *not* cover the default app. What it does cover is any app that sets
-`USE_TZ = False`, and (by the `if tzname` guard, which is independent of `USE_TZ`) lookups with no
-timezone to apply, such as `DateField` rather than `DateTimeField`. **Unverified:** exactly which
-ORM lookups supply a tzname — settle it against `test/django_validation/` before planning around it.
+#### How it is loaded, and why that is safe
 
-**Consequence for implementation order:** a first pass can supply all 35 with correct NULL-timezone
-behaviour and raise an explicit "timezone-aware truncation not supported yet" when a tzname *is*
-passed. That is strictly better than today — a precise, actionable failure on six functions instead
-of `no such function` across thirty-five — and it makes tzdata a follow-on that upgrades those six
-rather than a prerequisite for starting.
+Loading requires SQLite's extension mechanism, which is **arbitrary code execution** if left
+enabled — one `SELECT load_extension('/tmp/evil.so')` from a tenant would be below every guard
+fathom has. So `Fathom.Shard.Extension` **enables it, loads exactly this file, and disables it
+again** before the connection is used, on every handle including read-only ones. A failure to
+re-disable fails the open rather than degrading. `test/fathom/shard/extension_test.exs` asserts the
+tenant-side outcome (`not authorized`) rather than trusting the sequence.
 
-**Affected lookups:**
+Every function in the extension is pure: no filesystem, no network, no process state.
 
-| Django code | Missing function |
+#### Configuration
+
+| `SQLITE_EXTENSION` | Effect |
 |---|---|
-| `.filter(created__year=…)`, `__month`, `__day`, `__hour`, `__week_day` | `django_date_extract`, `django_datetime_extract` |
-| `.filter(created__date=…)`, `__time` | `django_datetime_cast_date`, `django_datetime_cast_time` |
-| `TruncMonth/TruncDay/TruncDate(...)` — every time-series chart | `django_date_trunc`, `django_datetime_trunc`, `django_time_trunc` |
-| `.filter(field__regex=…)`, `__iregex` | `regexp` |
-| `F()` arithmetic on a `DurationField` | `django_format_dtdelta`, `django_timestamp_diff`, `django_time_diff` |
-| `**` / `Power()` | `django_power` |
-| `LPad`, `RPad`, `Repeat` | `LPAD`, `RPAD`, `REPEAT` |
-| `StdDev`, `Variance` | `STDDEV_POP`, `VAR_POP` |
+| unset (default) | load `priv/sqlite_ext/` if the artifact is there |
+| `false` | disable — restores the pre-#19 `no such function` behaviour |
+| a path | load that file instead |
 
-**Workarounds today:** express the lookup in SQL fathom's SQLite does have — `strftime` covers most
-of the date-extract/truncate cases (`.annotate(y=Func("created", Value("%Y"), function="strftime"))`),
-`LIKE`/`GLOB` covers many `__regex` uses, and duration arithmetic can be done in Python. Do the
-aggregation in the app for `StdDev`/`Variance`.
+The artifact is built by `mix compile` (via `mix compile.fathom_udf`) and needs a Rust toolchain.
+**Without cargo the build SKIPS rather than fails** — fathom still compiles and runs, Django's UDFs
+are just absent. It prints a line saying so; a silent skip is how "works on my machine" starts.
 
-**Why it is not simply fixed:** the obvious answer — register the functions on
-`Fathom.Shard.Connection.open/1` — needs a user-defined-function API that **exqlite 0.37.0 does not
-have**. There is no `create_function` or scalar/aggregate registration in `Exqlite.Sqlite3` or
-`Exqlite.Sqlite3NIF`. The real options are an upstream exqlite contribution, the planned
-`fathom_native` NIF, or a loadable SQLite extension via the `enable_load_extension/2` NIF that does
-exist (which means shipping a compiled artifact per platform). Rewriting the SQL server-side is
-**not** an option — `AGENTS.md` forbids hand-rolling SQL parsing, and these calls are nested inside
-arbitrary client queries. That decision is tracked in `tasks/todo.md`.
+#### Cost
+
+Measured 2026-08-05 (same tree, extension on vs off, back to back): **+39 µs on stream open**
+(374 → 413 µs, the `dlopen` plus 35 function registrations) and **no change to per-query latency**
+(`hrana_rt_us` 90 → 91 µs, noise). Since a stream serves many queries, the amortized cost is
+negligible. Memory per served shard rises ~4%.
+
+#### Fidelity
+
+`native/fathom_udf/tests/oracle.rs` replays **12,501 cases whose expected values were produced by
+running Django's own `_sqlite_*` functions** (`tests/oracle/generate_cases.py`, which vendors the
+reference implementation with provenance). That found seven real bugs that hand-written
+expectations had missed — including `django_format_dtdelta` returning text where Django returns a
+number, and `date - timedelta` moving the date a day when Python does not.
+
+Two deliberate divergences, both toward safety and both documented in
+`native/fathom_udf/src/aggregates.rs`: aggregates **skip NULLs** (Django's `list.append` step feeds
+`None` to `statistics.pstdev`, which raises — so a `STDDEV` over a nullable column would error the
+tenant's query), and a **degenerate group returns NULL** rather than raising, matching PostgreSQL.
+One known limit: `regexp` uses Rust's `regex` crate, which has no backreferences or lookaround and
+rejects such a pattern rather than mismatching.
 
 ## Request latency & keeping tenants warm
 

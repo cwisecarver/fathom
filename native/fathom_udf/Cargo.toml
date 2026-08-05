@@ -1,0 +1,48 @@
+[package]
+name = "fathom_udf"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "SQLite loadable extension supplying the user-defined functions Django's SQLite backend registers client-side"
+
+[lib]
+# `cdylib` is the loadable extension SQLite dlopen()s. `rlib` is ALSO built so the
+# in-crate unit tests can link the pure logic directly — a cdylib alone cannot be
+# unit-tested, and the Python-compatible formatting/parsing is exactly the part that
+# needs table-driven tests against Django's own expectations.
+crate-type = ["cdylib", "rlib"]
+name = "fathom_udf"
+
+[dependencies]
+# `loadable_extension` makes libsqlite3-sys resolve SQLite symbols through the
+# extension API pointer at load time instead of linking libsqlite3 — the host process
+# (the BEAM, with exqlite's SQLite already loaded) provides them. Deliberately NOT
+# `bundled`: a second copy of SQLite statically linked into the extension would be a
+# different library than the one running the query.
+rusqlite = { version = "0.40", features = ["loadable_extension", "functions", "window"] }
+
+# Bundled IANA timezone database. This is the whole reason #19 chose Rust: the six
+# tz-dependent Django UDFs need real zone rules server-side, and chrono-tz compiles
+# tzdata INTO the binary — no system /usr/share/zoneinfo dependency, so a slim
+# distroless runner image and a macOS dev box behave identically.
+chrono = { version = "0.4", default-features = false, features = ["std", "alloc"] }
+chrono-tz = "0.10"
+
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+regex = "1"
+uuid = { version = "1", features = ["v4", "v7"] }
+rand = "0.8"
+
+[dev-dependencies]
+# Only for reading tests/oracle/cases.jsonl — the differential table generated from Django's own
+# code. Deliberately a dev-dependency: nothing in the shipped extension parses JSON.
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
+# Keep panics from unwinding across the C FFI boundary into SQLite. Every function
+# body is written to return an error rather than panic, but `abort` makes a bug a
+# crash instead of undefined behaviour.
+panic = "abort"

@@ -69,6 +69,7 @@ defmodule Fathom.Shard.Connection do
     with :ok <- Sqlite3.set_busy_timeout(conn, 5000),
          :ok <- maybe_foreign_keys(conn),
          :ok <- maybe_cache_size(conn),
+         :ok <- load_extension(conn),
          :ok <- maybe_authorizer(conn, tenant?) do
       {:ok, conn}
     end
@@ -76,9 +77,35 @@ defmodule Fathom.Shard.Connection do
 
   defp configure_readwrite(conn, tenant?, scope) do
     with :ok <- configure(conn),
+         :ok <- load_extension(conn),
          :ok <- maybe_authorizer(conn, tenant?),
          :ok <- maybe_query_only(conn, scope) do
       {:ok, conn}
+    end
+  end
+
+  # Register Django's user-defined functions on this connection (expert review 2026-08-01 #19).
+  #
+  # ORDERING MATTERS in two directions, and both are load-bearing:
+  #
+  #   * BEFORE `maybe_authorizer/2`. The authorizer denies `:attach`, and SQLite implements
+  #     `sqlite3_load_extension` as a privileged operation the authorizer can also refuse. Loading
+  #     first keeps the extension available on tenant handles — which is the entire point, since
+  #     tenant handles are the ones running Django's SQL — while the authorizer still governs
+  #     everything the tenant subsequently sends.
+  #   * On EVERY handle, read-only ones included. A `:ro` stream runs the same Django SELECTs
+  #     (`__year`, `Trunc*`), and a read replica that silently lacked the functions would fail
+  #     exactly the queries a read scope exists to serve.
+  #
+  # `Fathom.Shard.Extension` re-disables extension loading before returning, so a tenant cannot
+  # load one of its own; see its moduledoc for that contract. A failure to re-disable fails the
+  # OPEN rather than degrading, because the alternative is handing a tenant a connection with
+  # arbitrary code loading enabled.
+  defp load_extension(conn) do
+    case Fathom.Shard.Extension.load(conn) do
+      :ok -> :ok
+      :skipped -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 

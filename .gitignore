@@ -60,3 +60,7 @@ npm-debug.log
 # Runtime state written by Fathom.Rebalancer.LbApply after a successful nginx reload
 # (expert review 2026-08-01 #23) — a content hash, regenerated per reload, machine-local.
 deploy/chaos/lb-runtime/*.applied
+
+# Built by mix compile.fathom_udf from native/fathom_udf — a platform-specific
+# shared library, never committed.
+/priv/sqlite_ext/

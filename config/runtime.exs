@@ -115,6 +115,23 @@ if ms = env_int.("HRANA_STREAM_IDLE_MS") do
   config :fathom, :hrana_stream_idle_ms, ms
 end
 
+# The Django-compatibility SQLite extension (expert review 2026-08-01 #19). Unset means "load
+# priv/sqlite_ext/ if the artifact is there", which is what makes an unchanged Django app work
+# without an operator having to discover a flag.
+#
+#   SQLITE_EXTENSION=false          disable — Django's ~35 UDFs become unavailable and its
+#                                   __year / __date / Trunc* / __regex lookups raise
+#                                   OperationalError, i.e. fathom's pre-#19 behaviour.
+#   SQLITE_EXTENSION=/path/to.so    load that file instead of the bundled one.
+#
+# Loading requires briefly enabling SQLite's extension mechanism; `Fathom.Shard.Extension` closes
+# it again before the connection is used, and a failure to close fails the open. See its moduledoc.
+case System.get_env("SQLITE_EXTENSION") do
+  nil -> :ok
+  "false" -> config :fathom, :sqlite_extension, false
+  path -> config :fathom, :sqlite_extension, path
+end
+
 # How long an idle stream process waits before hibernating (ms). A WebSocket stream lives for hours
 # between requests while holding its heap; hibernation gives that back. Raise it if a workload is
 # burst-heavy enough that the hibernate/wake pair costs more than the heap it reclaims.
