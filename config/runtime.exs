@@ -197,6 +197,18 @@ if n = System.get_env("RECONCILE_BATCH_SIZE") do
   config :fathom, :reconcile_batch_size, String.to_integer(n)
 end
 
+# Warm-cache DISK back-pressure (expert review 2026-08-01 #36). `:warm_cache_max` bounds the
+# standby cache in shard COUNT, which says nothing about bytes — 500 shards is 8 MB or 2 TB — and
+# the cache shares a filesystem with the live shard data, so filling it fails every cold-open pull
+# AND every VACUUM INTO while writes keep being acked.
+if b = System.get_env("WARM_DISK_FREE_FLOOR_BYTES") do
+  config :fathom, :warm_disk_free_floor_bytes, String.to_integer(b)
+end
+
+if b = System.get_env("WARM_CACHE_MAX_BYTES") do
+  config :fathom, :warm_cache_max_bytes, String.to_integer(b)
+end
+
 # How long a migration job may keep DEFERRING before it is reported as stalled (2026-08-04).
 # A `{:retry, _}` (shard busy / lease held) snoozes, and an Oban snooze raises max_attempts
 # alongside attempt — so the job never exhausts, never quarantines, and never reaches `failed`.

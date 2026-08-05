@@ -171,3 +171,22 @@ config :opentelemetry,
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
 import_config "#{config_env()}.exs"
+
+# os_mon is pulled in ONLY for `:disksup`, which is the sole OTP-provided way to read filesystem
+# free space (expert review 2026-08-01 #36 — there is no pure-BEAM statvfs). Configure it down to
+# just that:
+#
+#   * memsup/cpu_sup off — we already publish BEAM memory (`fathom.node.memory`) and cpu_sup spawns
+#     a port program per node for a number nothing consumes.
+#   * `disk_almost_full_threshold: 1.0` disables os_mon's OWN alarm_handler alarms. It alarms per
+#     MOUNT, including mounts fathom has nothing to do with (on a dev mac that means every
+#     CoreSimulator volume), and fathom emits its own `fathom.node.disk.used_ratio` gauge for the
+#     two directories it actually writes to. One signal, scoped correctly, beats two.
+#   * a long poll period because `disksup`'s own periodic sweep shells out across every mount;
+#     `Fathom.Admin.Measurements.disk/0` reads the paths it needs on the 10 s telemetry poller.
+config :os_mon,
+  start_memsup: false,
+  start_cpu_sup: false,
+  start_disksup: true,
+  disk_almost_full_threshold: 1.0,
+  disk_space_check_interval: 30

@@ -258,3 +258,41 @@ groups:
           summary: "Rebalancer LB-map apply failed on {{ $labels.node }} (routing at risk)"
           description: "The exception map couldn't be written/tested/reloaded. Investigate immediately — routing may be stale."
           runbook: docs/runbooks/rebalancer.md
+
+  # ---------------------------------------------------------------------------------------------
+  # Local disk (expert review 2026-08-01 #36). These matter more than an ordinary capacity alert:
+  # when the volume fills, every cold-open `pull` AND every dirty shard's `VACUUM INTO` fails, so
+  # writes keep being ACKED and can never be made durable — the RPO contract goes unbounded. The
+  # symptoms that surface (flush.failed climbing, durability.oldest_age_ms growing) are identical
+  # to an S3 credential/reachability problem, so without these the diagnosis points the wrong way.
+  - name: fathom-disk
+    rules:
+      - alert: FathomDiskFillingUp
+        expr: fathom_node_disk_used_ratio > 0.85
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Disk {{ $labels.dir }} on {{ $labels.node }} is {{ $value | humanizePercentage }} full"
+          description: "The volume holding fathom's {{ $labels.dir }} directory is filling. At 100% every cold-open pull and every VACUUM INTO fails while writes keep being acked — durability stops silently. With the warm follower on, `:warm_cache_max` bounds the cache in shard COUNT, not bytes; consider :warm_cache_max_bytes / :warm_disk_free_floor_bytes."
+          runbook: docs/runbooks/operations.md#runbook-node-disk-full-shard_data_dir
+
+      - alert: FathomDiskCritical
+        expr: fathom_node_disk_used_ratio > 0.95
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: "Disk {{ $labels.dir }} on {{ $labels.node }} is critically full ({{ $value | humanizePercentage }})"
+          description: "Durability is about to stop on this node: pulls and VACUUM INTO will fail while writes are still acked. Free space or drain the node NOW."
+          runbook: docs/runbooks/operations.md#runbook-node-disk-full-shard_data_dir
+
+      - alert: FathomWarmCacheDiskPressure
+        # The follower declined to warm new shards because the volume is below the free floor.
+        # Not itself an outage — failover readiness is degrading, and the disk is the cause.
+        expr: increase(fathom_warm_follower_disk_pressure_declined[15m]) > 0
+        for: 15m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Warm follower on {{ $labels.node }} is refusing new shards (disk floor)"
+          description: "Free space is below :warm_disk_free_floor_bytes, so the standby cache has stopped taking on shards. Already-cached shards are retained; failover for everything else falls back to a full cold pull."
+          runbook: docs/runbooks/operations.md#runbook-node-disk-full-shard_data_dir
+

@@ -258,7 +258,33 @@ defmodule Fathom.Shard.WarmFollower do
     recent_owned = refresh_home(state.recent_owned, state.home_retention_ms)
     home = MapSet.new(Map.keys(recent_owned))
 
+    # Disk back-pressure (expert review #36). `:warm_cache_max` bounds the cache in shard COUNT,
+    # which says nothing about bytes — and this cache shares a filesystem with the live shard data,
+    # so filling it fails every cold-open `pull` AND every dirty shard's `VACUUM INTO`: writes keep
+    # being acked and can never be made durable.
+    #
+    # Under pressure, narrow the target to what is ALREADY cached rather than emptying it. Warming
+    # is the thing to stop; evicting would throw away failover readiness we have already paid for,
+    # and would not free the space that actually matters (the live data dir) any faster than the
+    # ordinary count-based eviction does. Held shards therefore stay held and stay revalidated —
+    # they just stop being joined by new ones.
     targets = target_rows(state.cache_max, home)
+
+    targets =
+      if disk_headroom?() do
+        targets
+      else
+        kept = Enum.filter(targets, fn {id, _lfa} -> MapSet.member?(state.cached, id) end)
+
+        :telemetry.execute(
+          [:fathom, :warm_follower, :disk_pressure],
+          %{held: length(kept), declined: length(targets) - length(kept)},
+          %{cache_dir: cache_dir()}
+        )
+
+        kept
+      end
+
     target = MapSet.new(targets, fn {id, _lfa} -> id end)
     to_evict = MapSet.difference(state.cached, target)
 
@@ -553,8 +579,97 @@ defmodule Fathom.Shard.WarmFollower do
     %{state | timer: Process.send_after(self(), :refresh, state.poll_ms)}
   end
 
-  defp cache_dir do
+  @doc """
+  Where this node's warm cache lives. Public (`@doc false`-ish in spirit) so the disk gauge can
+  measure the volume it sits on without duplicating the config/default pair — the same reason
+  `Fathom.Shard.data_dir/0` is public. Duplicating it is how the two drift apart and the gauge ends
+  up measuring a directory nothing writes to.
+  """
+  @spec cache_dir() :: String.t()
+  def cache_dir do
     Application.get_env(:fathom, :warm_cache_dir) ||
       Path.join(System.tmp_dir!(), "fathom_warm_cache")
+  end
+
+  @doc "Whether this node opted into the standby role (`:warm_follower`)."
+  @spec enabled?() :: boolean()
+  def enabled?, do: Application.get_env(:fathom, :warm_follower, false)
+
+  @doc """
+  Whether the warm cache may take on another shard, given local disk (expert review #36).
+
+  `:warm_cache_max` bounds the cache in shard **COUNT**, which is the wrong unit for a disk-bound
+  component: 500 shards is 8 MB or 2 TB depending on tenant size, reconciled against nothing. Two
+  byte-aware brakes sit alongside it:
+
+    * `:warm_cache_max_bytes` — a cap on what the cache itself may occupy. `nil` (default) leaves
+      the count as the only bound, i.e. exactly today's behaviour, so enabling this is opt-in.
+    * `:warm_disk_free_floor_bytes` — stop warming when the VOLUME drops below this much free,
+      whatever the cache's own size. This is the one that matters, because the warm cache shares a
+      filesystem with the live shard data: filling it fails every cold-open `pull` AND every dirty
+      shard's `VACUUM INTO`, so writes keep being acked and can never be made durable. Default
+      1 GiB.
+
+  Fails **open** when disk cannot be read (`:disksup` absent, path unreadable): warming is an
+  optimisation, and refusing to warm on an unreadable stat would silently disable standby on any
+  node where os_mon is trimmed out of the release. The floor exists to stop a *known* shortage, not
+  to guess at one.
+  """
+  @spec disk_headroom?() :: boolean()
+  def disk_headroom? do
+    headroom?(
+      Fathom.Admin.Measurements.disk_info(cache_dir()),
+      Application.get_env(:fathom, :warm_disk_free_floor_bytes, 1024 * 1024 * 1024),
+      Application.get_env(:fathom, :warm_cache_max_bytes),
+      &cache_bytes/0
+    )
+  end
+
+  @doc """
+  The back-pressure decision, as a pure function of its inputs.
+
+  Split out from `disk_headroom?/0` so the `:error` branch is testable at all: after
+  `Measurements.disk_info/1` learned to resolve a not-yet-created directory to its nearest existing
+  ancestor, essentially every path on a healthy node reads successfully — which is correct
+  behaviour and makes the fail-open case unreachable from the outside without removing `os_mon`
+  from the release. An untestable safety branch is one that quietly rots.
+
+  `cache_size` is a thunk so the (directory-walking) byte count is only paid when a byte budget is
+  actually configured.
+  """
+  @spec headroom?(
+          {:ok, %{free_bytes: integer()}} | :error,
+          non_neg_integer(),
+          non_neg_integer() | nil,
+          (-> non_neg_integer())
+        ) :: boolean()
+  # Fails OPEN: warming is an optimisation, and refusing it on an unreadable stat would silently
+  # disable standby on any node whose release trimmed os_mon. The floor exists to stop a KNOWN
+  # shortage, not to guess at one.
+  def headroom?(:error, _floor, _max_bytes, _cache_size), do: true
+
+  def headroom?({:ok, %{free_bytes: free}}, floor, max_bytes, cache_size) do
+    free >= floor and within_byte_budget?(max_bytes, cache_size)
+  end
+
+  defp within_byte_budget?(nil, _cache_size), do: true
+
+  defp within_byte_budget?(max_bytes, cache_size) when is_integer(max_bytes),
+    do: cache_size.() < max_bytes
+
+  defp within_byte_budget?(_, _cache_size), do: true
+
+  @doc "Bytes currently occupied by the warm cache directory (0 when it does not exist yet)."
+  @spec cache_bytes() :: non_neg_integer()
+  def cache_bytes do
+    cache_dir()
+    |> Path.join("*")
+    |> Path.wildcard()
+    |> Enum.reduce(0, fn f, acc ->
+      case File.stat(f) do
+        {:ok, %{size: size}} -> acc + size
+        _ -> acc
+      end
+    end)
   end
 end

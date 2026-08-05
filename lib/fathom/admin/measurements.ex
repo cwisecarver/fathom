@@ -56,6 +56,93 @@ defmodule Fathom.Admin.Measurements do
   defp safe_ratio(used, limit), do: used / limit
 
   @doc """
+  Local-disk headroom for the two directories fathom writes to (expert review 2026-08-01 #36).
+
+  Nothing in the metrics layer read the filesystem before this: `fathom.storage.bytes` is *S3*
+  usage, and the warm-follower cache — the one component deliberately sized to fill disk — is
+  budgeted in shard **count** (`:warm_cache_max`, default 500), which is 8 MB or 2 TB depending on
+  tenant size. `docs/runbooks/operations.md` ranks disk-full a top-four incident and its prevention
+  step is "alert on disk %", a signal fathom did not emit.
+
+  **Why it matters more than an ordinary capacity gauge:** when the volume fills, every cold-open
+  `pull` fails AND every dirty shard's `VACUUM INTO` fails, so writes keep being **acked** and can
+  never be made durable — the RPO contract goes unbounded. The symptoms that surface
+  (`fathom.shard.flush.failed` climbing, `fathom.durability.oldest_age_ms` growing) are the same
+  ones an S3 credential or reachability problem produces, so without this gauge the diagnostic path
+  points away from the actual cause.
+
+  Emits per directory (`data` = `SHARD_DATA_DIR`, `warm` = the follower cache), tagged so a fleet
+  dashboard can break them out: `free_bytes`, `total_bytes`, `used_ratio` — the last matching the
+  `process_used_ratio` / `port_used_ratio` convention above.
+
+  Best-effort: a path that does not exist yet (no warm cache configured, first boot before the data
+  dir is created) is skipped rather than reported as 0 free, which would read as a full disk.
+  """
+  @spec disk() :: :ok
+  def disk do
+    for {label, path} <- [{"data", Fathom.Shard.data_dir()}, {"warm", warm_cache_dir()}],
+        is_binary(path),
+        {:ok, %{total_bytes: total, free_bytes: free}} <- [disk_info(path)] do
+      :telemetry.execute(
+        [:fathom, :node, :disk],
+        %{
+          free_bytes: free,
+          total_bytes: total,
+          used_ratio: safe_ratio(total - free, total)
+        },
+        %{dir: label}
+      )
+    end
+
+    :ok
+  end
+
+  @doc """
+  Free/total bytes for the filesystem holding `path`, or `:error` if it cannot be read.
+
+  `:disksup.get_disk_info/1` reports the mount containing the path as
+  `[{mount, total_kb, available_kb, capacity_percent}]`. KB there is 1024-byte blocks. Returns
+  `:error` rather than raising or guessing: this feeds a gauge and a back-pressure decision, and a
+  fabricated number in either is worse than an absent one — a wrong "plenty free" disables the
+  brake, a wrong "full" stops warming on a healthy node.
+  """
+  @spec disk_info(String.t()) :: {:ok, %{total_bytes: integer(), free_bytes: integer()}} | :error
+  def disk_info(path) do
+    # Resolve to the nearest EXISTING ancestor first. `SHARD_DATA_DIR` and the warm cache are
+    # created lazily — the data dir does not exist until the first shard opens — and `disksup`
+    # returns nothing for a path that is not there. Without this the gauge is blind on exactly the
+    # node state where disk headroom is most worth knowing: a freshly booted node about to pull its
+    # working set. The ancestor sits on the same filesystem, which is the quantity being measured.
+    case :disksup.get_disk_info(to_charlist(existing_ancestor(path))) do
+      [{_mount, total_kb, avail_kb, _pct} | _] when is_integer(total_kb) and total_kb > 0 ->
+        {:ok, %{total_bytes: total_kb * 1024, free_bytes: avail_kb * 1024}}
+
+      _ ->
+        :error
+    end
+  rescue
+    # os_mon not started (a release that trimmed it, or a test env), or the path is unreadable.
+    _ -> :error
+  catch
+    :exit, _ -> :error
+  end
+
+  defp warm_cache_dir do
+    if Fathom.Shard.WarmFollower.enabled?(), do: Fathom.Shard.WarmFollower.cache_dir()
+  end
+
+  # Walk up until something exists. Bounded by construction: each step drops one path component and
+  # `Path.dirname/1` is a fixed point at the root, so the recursion terminates there even for a
+  # path that shares no ancestor with anything real.
+  defp existing_ancestor(path) do
+    cond do
+      File.exists?(path) -> path
+      Path.dirname(path) == path -> path
+      true -> existing_ancestor(Path.dirname(path))
+    end
+  end
+
+  @doc """
   Durability / RPO gauge: how many open shards hold un-flushed writes, and the oldest such
   shard's RPO age (ms). Derives dirtiness from the published flush watermark exactly as
   `Fathom.Shard.unflushed?/1` does — a `WriteCounter` generation mismatch or a write count past

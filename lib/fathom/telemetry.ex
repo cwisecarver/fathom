@@ -38,7 +38,8 @@ defmodule Fathom.Telemetry do
            {__MODULE__, :measure_active_shards, []},
            {Fathom.Admin.Measurements, :node_memory, []},
            {Fathom.Admin.Measurements, :vm_limits, []},
-           {Fathom.Admin.Measurements, :durability, []}
+           {Fathom.Admin.Measurements, :durability, []},
+           {Fathom.Admin.Measurements, :disk, []}
          ],
          period: 10_000,
          name: Fathom.ShardPoller}
@@ -254,6 +255,32 @@ defmodule Fathom.Telemetry do
         event_name: [:fathom, :node, :vm_limits],
         measurement: :port_used_ratio,
         description: "Open ports as a fraction of +Q (1.0 ⇒ the listener stops accepting)"
+      ),
+      sum("fathom.warm_follower.disk_pressure.declined",
+        event_name: [:fathom, :warm_follower, :disk_pressure],
+        measurement: :declined,
+        description:
+          "Shards the warm follower REFUSED to warm because the volume is below " <>
+            ":warm_disk_free_floor_bytes. Failover readiness is degrading and disk is the cause"
+      ),
+      last_value("fathom.warm_follower.disk_pressure.held",
+        event_name: [:fathom, :warm_follower, :disk_pressure],
+        measurement: :held,
+        description: "Shards still cached while under disk pressure (retained, not evicted)"
+      ),
+      last_value("fathom.node.disk.free_bytes",
+        event_name: [:fathom, :node, :disk],
+        measurement: :free_bytes,
+        tags: [:dir],
+        description:
+          "Free bytes on the volume holding this directory (dir=data|warm). A full volume fails " <>
+            "every cold-open pull AND every VACUUM INTO, so writes stay acked and never durable"
+      ),
+      last_value("fathom.node.disk.used_ratio",
+        event_name: [:fathom, :node, :disk],
+        measurement: :used_ratio,
+        tags: [:dir],
+        description: "Used fraction of the volume holding this directory (1.0 = full)"
       ),
       last_value("fathom.durability.dirty_shards",
         event_name: [:fathom, :durability, :rpo],
