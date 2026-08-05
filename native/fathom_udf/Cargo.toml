@@ -31,7 +31,11 @@ chrono-tz = "0.10"
 md-5 = "0.10"
 sha1 = "0.10"
 sha2 = "0.10"
-regex = "1"
+# `fancy-regex`, not `regex`. Django's `__regex`/`__iregex` run through Python's `re`, which has
+# lookaround and backreferences; the `regex` crate rejects both at compile time, so those lookups
+# reached a tenant as an error where Django would have answered. fancy-regex layers a backtracking
+# engine over `regex` and supports them.
+fancy-regex = "0.19"
 uuid = { version = "1", features = ["v4", "v7"] }
 rand = "0.8"
 

@@ -43,13 +43,13 @@
 
 use std::os::raw::{c_char, c_int};
 
-use regex::Regex;
 use rusqlite::functions::{Aggregate, Context, FunctionFlags};
 use rusqlite::types::{Type, Value, ValueRef};
 use rusqlite::{ffi, Connection, Error, Result};
 
 pub mod aggregates;
 pub mod datetime;
+pub mod pyre;
 pub mod pytypes;
 pub mod scalars;
 
@@ -332,24 +332,22 @@ fn register_misc(db: &Connection, det: FunctionFlags, nondet: FunctionFlags) -> 
     // Django registers. Getting these backwards produces a function that "works" on symmetric
     // test data and is wrong everywhere else.
     //
-    // The compiled pattern is cached per argument slot via SQLite's auxdata, so a constant
-    // pattern (the overwhelmingly common shape: `WHERE col REGEXP '^a'`) compiles once per
-    // statement rather than once per row.
+    // Matching goes through `pyre`, which reproduces Python's `re.search` — see that module for
+    // the two classes of difference it closes, including Python's `$` also matching before a
+    // trailing newline (which compiled fine under the `regex` crate and quietly returned the
+    // opposite answer).
     //
-    // NOTE: this is the Rust `regex` crate, not Python's `re`. It has no backreferences and no
-    // lookaround, and rejects such a pattern rather than silently mismatching. Documented in
-    // docs/quickstart-django.md.
+    // Compiled patterns are cached inside `pyre` rather than via SQLite's auxdata: auxdata only
+    // covers a CONSTANT argument, and a Django queryset binds the pattern as a PARAMETER
+    // (`WHERE col REGEXP ?`), which would otherwise recompile per row.
     db.create_scalar_function("regexp", 2, det, |ctx| {
-        // The pattern itself is read through `get_or_create_aux` below; this binding only
-        // establishes that neither argument is NULL, which Django checks before matching.
-        let (Some(_pattern), Some(text)) = (opt_text(ctx, 0)?, opt_text(ctx, 1)?) else {
+        let (Some(pattern), Some(text)) = (opt_text(ctx, 0)?, opt_text(ctx, 1)?) else {
             return Ok(None);
         };
-        let re: std::sync::Arc<Regex> = ctx.get_or_create_aux(0, |vr| -> Result<Regex> {
-            let src = vr.as_str()?;
-            Regex::new(src).map_err(|e| Error::UserFunctionError(Box::new(e)))
-        })?;
-        Ok(Some(re.is_match(text)))
+
+        pyre::search(pattern, text)
+            .map(Some)
+            .map_err(|e| Error::UserFunctionError(Box::new(e)))
     })?;
 
     db.create_scalar_function("BITXOR", 2, det, |ctx| {
