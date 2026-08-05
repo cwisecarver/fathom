@@ -520,9 +520,11 @@ defmodule Fathom.Migrator.ShardMigration do
     Enum.reduce_while((current + 1)..target//1, {:ok, []}, fn v, {:ok, acc} ->
       # statement_pairs/1, not statements/1: the replay has to BIND Django's parameter values, which
       # statements/1 (text only) discards. Same nil gates (unreleased / yanked / requires_review).
-      case Migrator.statement_pairs(v) do
+      # statement_step/1, not statement_pairs/1: a version's per-shard transform (#26) has to
+      # travel with its DDL so `Copy.migrate_chain/4` can run it in the same transaction.
+      case Migrator.statement_step(v) do
         nil -> {:halt, {:error, {:unknown_version, v}}}
-        pairs -> {:cont, {:ok, [{v, pairs} | acc]}}
+        {pairs, transform} -> {:cont, {:ok, [{v, pairs, transform} | acc]}}
       end
     end)
     |> case do
@@ -535,7 +537,10 @@ defmodule Fathom.Migrator.ShardMigration do
     prev = current_version(shard_id)
 
     with :ok <- Storage.retain(shard_id, prev),
-         :ok <- Copy.migrate_chain(old, new, chain),
+         # shard_id is threaded so a version's per-shard transform (#26) knows whose data it is
+         # backfilling. Passed for every migration, not only transform-carrying ones — the chain is
+         # built from release rows, so which steps carry a transform is not knowable here.
+         :ok <- Copy.migrate_chain(old, new, chain, shard_id: shard_id),
          # Self-fence right before the clobbering flush: if we were superseded during the (long)
          # copy, abort instead of overwriting the new owner's object (finding #7).
          :ok <- fence(shard_id, lease),

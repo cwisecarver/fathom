@@ -139,6 +139,107 @@ Per-node throughput is the `[:fathom, :migrator, :shard_migrated]` telemetry eve
 (`%{count: 1}`, metadata `%{shard_id, from, to}`), emitted once per shard that actually moved.
 
 
+## Data migrations (`RunPython`) — expert review #26
+
+The engine's model is "record the SQL Django sent to the template, replay it verbatim on every
+tenant". That is exactly right for DDL and exactly wrong for a `RunPython` backfill: the ORM's
+writes cross the wire as literal `INSERT`/`UPDATE`/`DELETE` carrying **the template's row values**.
+Replaying those onto every tenant would overwrite each tenant's data with the template's.
+
+So `Capture` detects that shape and sets `requires_review`, capping HEAD below the version.
+`AddField` + `RunPython` is the most common two-step Django migration, so you will hit this.
+
+### What you see
+
+`GET /api/migrations/status` reports the version in `pending_review` **and** a `review_blocks`
+entry saying why it is held and what your options are:
+
+```json
+{
+  "converged": false,
+  "pending_review": [7],
+  "review_blocks": [
+    {
+      "version": 7,
+      "reason": "data_migration",
+      "detail": { "statements": ["UPDATE app_order SET total = 42"] },
+      "options": [
+        { "action": "attach_transform", "how": "...", "effect": "..." },
+        { "action": "approve_review",   "how": "...", "effect": "..." }
+      ]
+    }
+  ]
+}
+```
+
+### The three ways out
+
+**1. Attach a transform (the usual answer).** Split the migration: keep the DDL in Django, remove
+the `RunPython`, and express the backfill as a server-side module that runs **per tenant, inside
+the same transaction as the DDL**.
+
+```elixir
+defmodule MyApp.Backfills.V7Totals do
+  @behaviour Fathom.Migrator.Transform
+
+  @impl true
+  def run(conn, _shard_id) do
+    case Fathom.Shard.Connection.query(conn, "UPDATE orders SET total = qty * price", []) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+end
+```
+
+```elixir
+# config/config.exs — the ALLOWLIST. A release row is data written by the capture path, so
+# resolving an arbitrary module name from it would be fleet-wide remote code execution.
+config :fathom, :migration_transforms, [MyApp.Backfills.V7Totals]
+```
+
+```elixir
+Fathom.Migrator.attach_transform(7, MyApp.Backfills.V7Totals)
+```
+
+That clears the block and the rollout proceeds. If the transform returns `{:error, _}` or raises,
+the whole step **rolls back** — the shard stays at its previous version rather than gaining a
+column with no data in it.
+
+`attach_transform/2` refuses if the release still carries the flagged DML (otherwise the version
+would run both the template's literals *and* your transform), if the module is not on the
+allowlist, or if the module does not export `run/2`.
+
+**Make it idempotent where you can.** A shard whose migration job retried after a transient failure
+runs the transform again from the pre-transaction state.
+
+**2. Approve it.** `Fathom.Migrator.approve_review(7)` replays the template's literal rows onto
+every tenant. Correct **only** when those rows are genuinely identical for all tenants — seeding a
+lookup/reference table. Wrong for anything computed from tenant data.
+
+**3. Revert the template migration** and re-plan it as an expand/contract pair.
+
+## `atomic = False` — check before you migrate
+
+A migration with `atomic = False` runs in **autocommit**, outside any tracked `BEGIN…COMMIT`, so
+capture **cannot see it by construction**. There is no transaction to hook. The template's schema
+moves and the fleet never hears about it; the gap detector catches the consequence at the *next*
+capture, by which point the template is already ahead and that next version is flagged too.
+
+`atomic = False` is the standard idiom for exactly the long-running migrations a large fleet most
+needs to roll carefully, so check for it before anything touches the template:
+
+```bash
+mix fathom.check_migrations path/to/django/project
+```
+
+Exits non-zero on `atomic = False` (error) and warns on `RunPython` / `RunSQL` so you learn a
+version will need a transform *before* the fleet freezes. Wire it into CI ahead of the
+`manage.py migrate` that runs against the template.
+
+If you genuinely need a non-atomic migration, it is out of band: apply it to every shard yourself
+and reconcile the directory, rather than routing it through capture.
+
 ## 4. Revert — if a migration is bad
 
 `docs/migration.md` → "Reverting a bad Django migration" has the full loop: `Migrator.revert(vN, vN-1)`

@@ -37,6 +37,23 @@ defmodule Fathom.Migrator.Release do
     # AGENTS.md forbids, and a migration name is attacker-influenceable (it is a filename).
     field :statement_args, {:array, :map}
 
+    # WHY this version is held (expert review 2026-08-01 #26). `requires_review` was one boolean set
+    # by `data_migration_statements(statements) != [] or gap != nil`, so the status API could say
+    # `pending_review: [7]` and nothing more — an operator had no way to learn what tripped it or
+    # what their options were, while every later migration stacked behind it.
+    # One of "data_migration" / "migration_gap" / "data_migration_and_gap"; NULL if never flagged.
+    field :review_reason, :string
+
+    # The evidence: the flagged statements, or the gap's counts. Shown by `Migrator.status/0` so the
+    # operator sees what capture actually saw.
+    field :review_detail, :map
+
+    # Name of a module implementing `Fathom.Migrator.Transform` — the per-shard data-migration seam
+    # (#26). Resolved against an ALLOWLIST at execution time, never `String.to_atom`'d: a release row
+    # is data written by the capture path, whose source template is a documented fleet-wide
+    # poisoning vector.
+    field :transform, :string
+
     timestamps(type: :utc_datetime_usec, updated_at: false)
   end
 

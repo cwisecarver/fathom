@@ -16,7 +16,7 @@ defmodule Fathom.Migrator do
   require Logger
 
   alias Fathom.Directory
-  alias Fathom.Migrator.{Release, RevertJob, ShardMigrationJob}
+  alias Fathom.Migrator.{Capture, Release, RevertJob, ShardMigrationJob, Transform}
   alias Fathom.Repo
   alias Oban.Job
 
@@ -160,6 +160,98 @@ defmodule Fathom.Migrator do
     end
   end
 
+  @doc """
+  A rollout chain step for `version`: `{statement_pairs, transform}`, or `nil` if the version is
+  unreleased / yanked / still `requires_review` (expert review 2026-08-01 #26).
+
+  Separate from `statement_pairs/1` rather than replacing it because the bench harness and several
+  tests build chains from statements alone; this is the shape `Migrator.ShardMigration` needs so a
+  version's per-shard transform travels with its DDL.
+  """
+  @spec statement_step(non_neg_integer()) :: {list(), String.t() | nil} | nil
+  def statement_step(version) do
+    case fetch_appliable(version) do
+      nil -> nil
+      release -> {zip_args(release.statements, release.statement_args), release.transform}
+    end
+  end
+
+  @doc """
+  Attaches a per-shard `transform` module to `version` and clears its review flag (#26).
+
+  This is the **third path** for a captured data migration. Previously an operator could only
+  approve the version — replaying the TEMPLATE's row values onto every tenant, the corruption the
+  flag exists to prevent — or never advance.
+
+  Refuses when:
+
+    * the module is not in `config :fathom, :migration_transforms` (`{:error, :not_allowed}`), or
+      does not export `run/2` (`{:error, :invalid_transform}`). The allowlist is the security
+      boundary: a release row is data, so resolving an arbitrary name would be fleet-wide RCE.
+    * the release still carries flagged template-literal DML (`{:error, {:data_statements_present,
+      statements}}`). Otherwise the version would run BOTH — the template's literals and the
+      transform. The operator's move is to remove the `RunPython` from the template migration (so
+      capture records DDL only) and express the backfill here.
+    * the version was flagged for a **migration gap** rather than a data migration
+      (`{:error, :gap_requires_reconcile}`). A gap means the template ran an `atomic = False`
+      migration the fleet never saw; a transform cannot conjure the DDL that was missed, so
+      approving it with one would hide a real divergence.
+  """
+  @spec attach_transform(non_neg_integer(), module() | String.t()) ::
+          :ok | {:error, term()}
+  def attach_transform(version, module) do
+    with {:ok, release} <- fetch_release(version),
+         {:ok, resolved} <- resolve_transform(module),
+         :ok <- refuse_if_data_statements(release),
+         :ok <- refuse_if_gap(release) do
+      {:ok, _} =
+        release
+        |> Ecto.Changeset.change(
+          transform: to_string(resolved),
+          requires_review: false,
+          review_reason: nil
+        )
+        |> Repo.update()
+
+      refresh_head_cache()
+      :ok
+    end
+  end
+
+  defp fetch_release(version) do
+    case Repo.get_by(Release, version: version) do
+      nil -> {:error, :unknown_version}
+      release -> {:ok, release}
+    end
+  end
+
+  defp resolve_transform(module) when is_atom(module) do
+    if Transform.valid?(module), do: {:ok, module}, else: {:error, transform_error(module)}
+  end
+
+  defp resolve_transform(name) when is_binary(name) do
+    with {:ok, module} <- Transform.resolve(name) do
+      if Transform.valid?(module), do: {:ok, module}, else: {:error, :invalid_transform}
+    end
+  end
+
+  defp transform_error(module) do
+    if module in Transform.allowlist(), do: :invalid_transform, else: :not_allowed
+  end
+
+  defp refuse_if_data_statements(release) do
+    case Capture.data_migration_statements(release.statements) do
+      [] -> :ok
+      flagged -> {:error, {:data_statements_present, flagged}}
+    end
+  end
+
+  defp refuse_if_gap(%{review_reason: reason}) when is_binary(reason) do
+    if String.contains?(reason, "gap"), do: {:error, :gap_requires_reconcile}, else: :ok
+  end
+
+  defp refuse_if_gap(_), do: :ok
+
   defp fetch_appliable(version) do
     case Repo.get_by(Release, version: version) do
       nil -> nil
@@ -222,6 +314,108 @@ defmodule Fathom.Migrator do
     Repo.all(
       from(r in Release, where: r.requires_review and not r.yanked, order_by: [asc: r.version])
     )
+  end
+
+  @doc """
+  Records WHY `version` was flagged (expert review #26 part 1).
+
+  A separate call rather than two more positional parameters on `release/6`, which already takes
+  six. Best-effort by design: if this write fails the release row still carries `requires_review`,
+  and `review_block/1` re-derives the reason from the statements — so the block is never *lost*,
+  only less detailed. Making it part of the release insert would mean a reason-write failure could
+  fail the capture itself, which is strictly worse (refusing to record a captured version forks the
+  template from the fleet, the #19 invariant).
+  """
+  @spec set_review_reason(non_neg_integer(), String.t(), map()) :: :ok
+  def set_review_reason(version, reason, detail) do
+    from(r in Release, where: r.version == ^version)
+    |> Repo.update_all(set: [review_reason: reason, review_detail: detail])
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  @doc """
+  Why a held version is held, and what the operator can do about it (expert review #26 part 1).
+
+  `status/0` used to report `pending_review: [7]` and nothing else, so an operator saw
+  `converged: false` with every later migration stacked behind it and no way to learn what tripped
+  the flag or what their options were. This is the legible form.
+
+  `options` is the actual decision, spelled out, because the difference between them is a
+  fleet-wide data-corruption question and nobody should have to reconstruct it from the source:
+
+    * `approve_review` replays the TEMPLATE's row values onto every tenant — right only when the
+      DML is genuinely tenant-independent (seeding a lookup table with identical rows everywhere).
+    * `attach_transform` runs a per-tenant backfill computed from that tenant's own rows.
+    * for a gap, neither: reconcile the template against the fleet first.
+  """
+  @spec review_block(Release.t()) :: map()
+  def review_block(%Release{} = r) do
+    reason = r.review_reason || inferred_reason(r)
+
+    %{
+      version: r.version,
+      name: r.name,
+      reason: reason,
+      detail: r.review_detail || inferred_detail(r, reason),
+      options: options_for(reason)
+    }
+  end
+
+  # Releases captured before #26 have no stored reason. Re-derive it from the statements rather than
+  # reporting `nil`, so an existing frozen fleet gets the legible form on upgrade instead of only
+  # versions captured from here on.
+  defp inferred_reason(r) do
+    case Capture.data_migration_statements(r.statements) do
+      [] -> "migration_gap"
+      _ -> "data_migration"
+    end
+  end
+
+  defp inferred_detail(r, "data_migration"),
+    do: %{"statements" => Capture.data_migration_statements(r.statements)}
+
+  defp inferred_detail(_r, _reason), do: %{}
+
+  defp options_for(reason) do
+    data = [
+      %{
+        action: "attach_transform",
+        how: "Fathom.Migrator.attach_transform(version, MyApp.Backfills.Something)",
+        effect:
+          "runs a per-shard module inside the migration transaction, computing the backfill " <>
+            "from THAT tenant's rows. Requires the module in :migration_transforms and the " <>
+            "template-literal DML removed from the release."
+      },
+      %{
+        action: "approve_review",
+        how: "Fathom.Migrator.approve_review(version)",
+        effect:
+          "replays the TEMPLATE's literal row values onto every tenant. Correct ONLY when the " <>
+            "rows are genuinely identical for all tenants (a seeded lookup table); otherwise this " <>
+            "is the fleet-wide corruption the flag exists to prevent."
+      }
+    ]
+
+    gap = [
+      %{
+        action: "reconcile_template",
+        how: "compare the template's django_migrations against the fleet, then re-capture",
+        effect:
+          "a gap means the template ran a migration capture never saw (typically atomic = False, " <>
+            "which runs outside any tracked transaction). The fleet is missing DDL, so neither " <>
+            "approving nor a transform is safe until the template and fleet agree."
+      }
+    ]
+
+    case reason do
+      "data_migration" -> data
+      "migration_gap" -> gap
+      "data_migration_and_gap" -> gap ++ data
+      _ -> []
+    end
   end
 
   @doc """
@@ -393,7 +587,12 @@ defmodule Fathom.Migrator do
       laggards: laggards,
       failed: Directory.count_failed(),
       converged: laggards == 0,
+      # `pending_review` stays a list of VERSION NUMBERS. Changing it to the block objects broke
+      # `migration_controller_test` immediately, which is the API's own consumers telling you the
+      # same thing: this is a published control-plane endpoint and a field changing type is a
+      # break for anyone reading it. The legible form (#26) is additive, in `review_blocks`.
       pending_review: Enum.map(pending_review(), & &1.version),
+      review_blocks: Enum.map(pending_review(), &review_block/1),
       rate_per_hour: rate,
       eta_seconds: eta_seconds(laggards, rate),
       stalled: stalled_count()

@@ -408,7 +408,30 @@ defmodule Fathom.Migrator.Capture do
   # `django_migrations` — Django's own bookkeeping `INSERT INTO django_migrations` is the one benign
   # DML in a migration transaction. A heuristic, not a SQL parser: it flags the RunPython-backfill
   # case; a data migration that references django_migrations in a WHERE clause (rare) would be missed.
-  defp data_migration_statements(statements) do
+  defp record_review_reason(version, statements, gap) do
+    data = data_migration_statements(statements)
+
+    {reason, detail} =
+      case {data, gap} do
+        {[], nil} -> {nil, %{}}
+        {[], gap} -> {"migration_gap", %{"gap" => inspect(gap)}}
+        {data, nil} -> {"data_migration", %{"statements" => data}}
+        {data, gap} -> {"data_migration_and_gap", %{"statements" => data, "gap" => inspect(gap)}}
+      end
+
+    if reason, do: Migrator.set_review_reason(version, reason, detail)
+  end
+
+  @doc """
+  The template-literal DATA statements in `statements` — the shape that makes a captured version
+  unsafe to replay fleet-wide.
+
+  Public since expert review 2026-08-01 #26: `Migrator.review_block/1` shows an operator exactly
+  which statements tripped the flag, and `attach_transform/2` refuses a release that still carries
+  them. Both need the same definition, and a second copy would drift from this one.
+  """
+  @spec data_migration_statements([String.t()]) :: [String.t()]
+  def data_migration_statements(statements) do
     Enum.filter(statements, fn sql ->
       lead = sql |> String.trim_leading() |> String.slice(0, 12) |> String.downcase()
       down = String.downcase(sql)
@@ -483,6 +506,9 @@ defmodule Fathom.Migrator.Capture do
            statement_args
          ) do
       {:ok, _} ->
+        # Record WHY, so `GET /api/migrations/status` can tell an operator what tripped the flag and
+        # what their options are (#26) instead of just `pending_review: [7]`.
+        if requires_review, do: record_review_reason(version, statements, gap)
         if gap, do: alarm_gap(version, gap)
         alarm_on_data_migration(version, statements)
         {:recorded, version}
