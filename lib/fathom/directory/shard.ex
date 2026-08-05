@@ -60,6 +60,12 @@ defmodule Fathom.Directory.Shard do
     field :last_verified_at, :utc_datetime_usec
     field :last_verify_status, :string
 
+    # When `Fathom.Snapshots.ScheduleJob` last took a point-in-time snapshot of this shard (#18).
+    # NULL = never. Two jobs read it: the scheduler samples least-recently-snapshotted first
+    # (ASC NULLS FIRST) and skips shards whose `last_flushed_at` has not moved since, so a cold
+    # tenant is never re-snapshotted for bytes that did not change.
+    field :last_snapshot_at, :utc_datetime_usec
+
     timestamps(type: :utc_datetime_usec)
   end
 

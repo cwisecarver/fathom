@@ -108,7 +108,18 @@ config :fathom, Oban,
        # Automated sampled restore drill (#24): a fleet singleton (peer leadership) that verifies the
        # least-recently-verified shards' durable objects daily. INERT unless `:restore_drill_sample`
        # is set — it inserts+completes a no-op job/day until then (bounded by the Pruner).
-       {"0 6 * * *", Fathom.RestoreDrillJob}
+       {"0 6 * * *", Fathom.RestoreDrillJob},
+       # Scheduled point-in-time snapshots + their expiry (#18). Both fleet singletons and both
+       # INERT by default (`:snapshot_schedule_sample` / `:snapshot_retention` +
+       # `:snapshot_retention_sample` unset), so they insert+complete a no-op job per tick until an
+       # operator sizes them.
+       #
+       # Hourly is the cadence the default retention policy is written for; it is the cron entry,
+       # not the policy, that decides how often a snapshot can be taken, so raising retention
+       # granularity past this does nothing. Retention runs 30 minutes offset so a sweep never
+       # races the scheduler it is expiring behind.
+       {"0 * * * *", Fathom.Snapshots.ScheduleJob},
+       {"30 * * * *", Fathom.Snapshots.RetentionJob}
      ]}
   ]
 

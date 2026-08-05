@@ -115,6 +115,39 @@ if ms = env_int.("HRANA_STREAM_IDLE_MS") do
   config :fathom, :hrana_stream_idle_ms, ms
 end
 
+# Scheduled point-in-time snapshots (expert review 2026-08-01 #18). Both jobs are fleet singletons
+# on the Oban crontab and INERT until sized here.
+#
+# The live durable object is overwritten every :shard_flush_interval_ms (default 5 s), so without
+# these the last-good state for a LOGICAL corruption — the more common incident — is gone within
+# seconds. Snapshots are the only answer to "restore tenant acme to 09:00".
+if n = env_int.("SNAPSHOT_SCHEDULE_SAMPLE") do
+  config :fathom, :snapshot_schedule_sample, n
+end
+
+if n = env_int.("SNAPSHOT_RETENTION_SAMPLE") do
+  config :fathom, :snapshot_retention_sample, n
+end
+
+# Grandfather-father-son policy, e.g. "24h,7d,4w" ⇒ keep the newest snapshot in each of the last
+# 24 populated hours, 7 populated days and 4 populated ISO weeks. Only snapshots the scheduler
+# created (labelled `auto`) are ever eligible; a manual one is never expired.
+if spec = System.get_env("SNAPSHOT_RETENTION") do
+  policy =
+    spec
+    |> String.split(",", trim: true)
+    |> Enum.reduce(%{}, fn part, acc ->
+      case Integer.parse(String.trim(part)) do
+        {n, "h"} -> Map.put(acc, :hourly, n)
+        {n, "d"} -> Map.put(acc, :daily, n)
+        {n, "w"} -> Map.put(acc, :weekly, n)
+        _ -> raise "SNAPSHOT_RETENTION: expected e.g. \"24h,7d,4w\", got #{inspect(part)}"
+      end
+    end)
+
+  config :fathom, :snapshot_retention, policy
+end
+
 # The Django-compatibility SQLite extension (expert review 2026-08-01 #19). Unset means "load
 # priv/sqlite_ext/ if the artifact is there", which is what makes an unchanged Django app work
 # without an operator having to discover a flag.

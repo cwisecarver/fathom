@@ -168,6 +168,51 @@ or copy-on-write page server (expert review 2026-07-14 #12).
 Snapshots are backend-uniform (Local + S3), so the whole path is testable without a real object
 store (`test/fathom/snapshots_test.exs`).
 
+### On a schedule (expert review 2026-08-01 #18)
+
+Until 2026-08-05 the primitives above were the whole story, and **nothing ever called them on a
+schedule** — which meant the paragraph you just read described a capability no fleet actually had.
+For logical corruption the practical recovery capability was zero: the live object is overwritten
+every flush interval, so the last good state was gone within seconds and "restore tenant acme to
+09:00" had no answer. That was the largest gap between fathom and the Postgres-on-RDS baseline it
+replaces.
+
+Two fleet-singleton Oban crons now close it, **both off by default**:
+
+- **`Fathom.Snapshots.ScheduleJob`** (hourly) snapshots up to `SNAPSHOT_SCHEDULE_SAMPLE` shards per
+  run, selecting **active shards that have flushed since their last snapshot**,
+  least-recently-snapshotted first (`Directory.sample_for_snapshot/1`, keyed off the
+  `last_snapshot_at` column). That predicate is the design: a snapshot is a server-side object
+  COPY, so cost tracks **writes**, not tenant count — a million cold tenants that have not flushed
+  cost nothing. `last_snapshot_at` is stamped only on success, so a failed snapshot stays at the
+  head of the rotation instead of being marked done for a full cycle.
+- **`Fathom.Snapshots.RetentionJob`** (hourly, offset 30 min) applies a grandfather-father-son
+  policy (`SNAPSHOT_RETENTION`, e.g. `24h,7d,4w`). Before this, nothing ever dropped a
+  `@snap-<id>` object — `RetirementJob` expires `@<version>` objects only — so enabling snapshots
+  without retention grows storage without bound. The classification is a pure function
+  (`Fathom.Snapshots.Retention.plan/3`), tested exhaustively without an object store.
+
+**The safety property to know:** retention will only ever delete snapshots the *scheduler* created.
+`ScheduleJob` labels every one of its snapshots `auto`, and `plan/3` refuses to consider anything
+else — so an operator's deliberate `Snapshots.create(id, label: "pre-migration")` is invisible to
+the automatic policy and lives until someone drops it by hand. Automatic creation and automatic
+deletion are the same set on purpose; expiring a manual snapshot on a schedule would delete exactly
+the backup someone took because they were worried.
+
+Two smaller guards worth knowing: retention counts **populated** periods rather than wall-clock
+ones (so a week of downtime does not expire the history it exists to protect), and a future-dated
+snapshot — reachable through clock skew between nodes — is kept rather than dropped.
+
+**Resulting RPO for logical corruption** is the *snapshot* cadence, not the flush interval: with
+the default hourly cron, up to one hour of writes for a shard that was written in that window.
+Tighten it by raising the cron frequency and `SNAPSHOT_SCHEDULE_SAMPLE` together — the cron bounds
+how often a snapshot *can* be taken, so a finer retention granularity than the cron cadence buys
+nothing.
+
+Rehearse a policy before enabling it:
+`Fathom.Snapshots.RetentionJob.run(100, %{hourly: 24, daily: 7}, dry_run: true)` reports exactly
+what it would delete and deletes nothing.
+
 ## Harden the bucket (defense-in-depth beneath snapshots)
 
 One object per shard in one bucket is the durability floor, and S3's 11-nines protects against

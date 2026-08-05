@@ -223,6 +223,65 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  Active shards that need a scheduled snapshot (#18), least-recently-snapshotted first.
+
+  "Need" means **the durable object has changed since we last snapshotted it** — `last_flushed_at`
+  is ahead of `last_snapshot_at`, or the shard has never been snapshotted. That predicate is what
+  keeps the cost proportional to writes rather than to fleet size: a million cold tenants that have
+  not flushed since their last snapshot cost nothing, which matters because every selected shard is
+  a server-side object COPY.
+
+  `last_flushed_at` being NULL means the shard has never flushed — there is no durable object to
+  copy — so those are excluded rather than snapshotted into an error.
+  """
+  @spec sample_for_snapshot(pos_integer()) :: [%{shard_id: String.t()}]
+  def sample_for_snapshot(n) when is_integer(n) and n > 0 do
+    from(s in Shard,
+      where: s.status == "active",
+      where: not is_nil(s.last_flushed_at),
+      where: is_nil(s.last_snapshot_at) or s.last_flushed_at > s.last_snapshot_at,
+      order_by: [asc_nulls_first: s.last_snapshot_at],
+      limit: ^n,
+      select: %{shard_id: s.shard_id}
+    )
+    |> Repo.all()
+  end
+
+  @doc """
+  Stamps `last_snapshot_at` after a scheduled snapshot (#18). Returns rows updated (0 if gone).
+
+  Stamped only on SUCCESS by the caller: a failed snapshot must leave the shard at the head of the
+  rotation so the next run retries it, rather than marking it done and waiting a full cycle.
+  """
+  @spec record_snapshot(String.t(), DateTime.t()) :: non_neg_integer()
+  def record_snapshot(shard_id, at \\ DateTime.utc_now()) do
+    {count, _} =
+      from(s in Shard, where: s.shard_id == ^shard_id)
+      |> Repo.update_all(set: [last_snapshot_at: at, updated_at: at])
+
+    count
+  end
+
+  @doc """
+  Active shards that have been snapshotted at least once, least-recently-*expired* first (#18).
+
+  The retention sweep's rotation. Keyed off `last_snapshot_at` rather than a separate column
+  because a shard that is being snapshotted is exactly the one accumulating snapshots to expire,
+  and a second timestamp would be one more thing to keep consistent for no gain.
+  """
+  @spec sample_for_retention(pos_integer()) :: [%{shard_id: String.t()}]
+  def sample_for_retention(n) when is_integer(n) and n > 0 do
+    from(s in Shard,
+      where: s.status == "active",
+      where: not is_nil(s.last_snapshot_at),
+      order_by: [asc: s.last_snapshot_at],
+      limit: ^n,
+      select: %{shard_id: s.shard_id}
+    )
+    |> Repo.all()
+  end
+
+  @doc """
   Records a restore-drill outcome (#24) on the shard's row: stamps `last_verified_at` (drives the
   sampling weight) and `last_verify_status` (queryable durably). Returns how many rows were updated
   (0 if the shard is gone). Best-effort — never raises the caller.
