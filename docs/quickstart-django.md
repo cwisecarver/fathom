@@ -114,7 +114,7 @@ migrations auto-captured) is `test/django_validation/` — run it as the referen
 
 ### Lookups that do NOT work yet (Django's SQLite UDFs) — expert review #19
 
-Django's SQLite backend registers ~20 Python functions on every **client** connection. Under
+Django's SQLite backend registers **54** Python functions on every **client** connection. Under
 `django-libsql` the SQL crosses the wire and is compiled by **fathom's** SQLite, where they do not
 exist. Basic CRUD is unaffected, which is exactly what makes this easy to miss: it breaks on the
 first date/regex lookup, and the error reads like a client bug.
@@ -122,8 +122,18 @@ first date/regex lookup, and the error reads like a client bug.
 **Symptom:** `OperationalError: no such function: django_date_extract` (or `django_date_trunc`,
 `regexp`, …).
 
-**Affected, verified against a real shard connection** (`test/fathom/django_udf_compat_test.exs`
-is the tracked list and fails when any of these starts working):
+**Scope, probed against a real shard connection 2026-08-05** — Django registers **54** functions;
+**19 already resolve** (all 18 math functions, because this SQLite is built with
+`SQLITE_ENABLE_MATH_FUNCTIONS`, plus `SIGN`) and **35 are missing**.
+`test/fathom/django_udf_compat_test.exs` is the tracked list and fails when any of them moves.
+
+The 35 split by what supplying them would take — **24 easy** (padding, hashes, `regexp`, bit ops,
+uuid, the `STDDEV`/`VAR`/`BIT_*` aggregates), **5 moderate** (date arithmetic, no timezone), and
+**6 timezone-dependent**. The last six are the real project: they take `tzname`/`conn_tzname` and
+need a timezone database server-side. They are also the ones ordinary apps hit first, so the cheap
+29 do not buy off the headline breakage.
+
+**Affected lookups:**
 
 | Django code | Missing function |
 |---|---|
