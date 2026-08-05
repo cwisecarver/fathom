@@ -93,7 +93,7 @@ JSON endpoint your CI/CD can poll (behind the admin BasicAuth, on `:4000`):
 ```bash
 curl -su "$ADMIN_USER:$ADMIN_PASS" https://admin.fathom.example/api/migrations/status
 # {"head":7,"laggards":0,"failed":0,"converged":true,"pending_review":[],
-#  "rate_per_hour":0,"eta_seconds":0}
+#  "rate_per_hour":0,"eta_seconds":0,"stalled":0}
 ```
 
 - `converged: true` (⇔ `laggards == 0`) — every active shard is at HEAD; safe to ship the new app
@@ -107,6 +107,17 @@ curl -su "$ADMIN_USER:$ADMIN_PASS" https://admin.fathom.example/api/migrations/s
   `cutover_at`, so it is fleet-wide, not per-node). A **revert** is not counted as progress.
 - `eta_seconds: N` — `laggards / rate` at the current rate. **`null` means the rollout is not
   moving** (rate 0) — a stall, not a long wait. `0` once converged.
+- `stalled: N` — N migration jobs have been pending longer than `:migration_stall_after_ms`
+  (default 10 min). **This is the field that tells you `eta_seconds` is fiction.** A shard whose
+  migration cannot acquire its lease snoozes, and an Oban snooze raises `max_attempts` alongside
+  `attempt` — so the job never exhausts, never quarantines, and never reaches `failed`. The fleet
+  then reports a small, confident ETA that never arrives. `stalled > 0` with a flat `laggards` is
+  the signature; the job also logs at `[warning]` and emits
+  `[:fathom, :migrator, :migration_stalled]` once past the threshold.
+
+  To triage one: check whether its lease is held by a coordinator that no longer exists —
+  `Fathom.Shard.Storage.lease_holder("<shard>")`. A client request to that tenant clears a stale
+  same-node lock. See [`reviews/fleet-rollout-2026-08-04.md`](reviews/fleet-rollout-2026-08-04.md).
 
 A CI gate is just: poll until `converged == true` and `pending_review == []`, then deploy.
 
@@ -127,12 +138,6 @@ first several raises are free. Full run + limits:
 Per-node throughput is the `[:fathom, :migrator, :shard_migrated]` telemetry event
 (`%{count: 1}`, metadata `%{shard_id, from, to}`), emitted once per shard that actually moved.
 
-**If a shard sits behind with `failed: 0` and never moves**, its migration is snoozing on a held
-lease, not erroring — the Oban job stays `scheduled` with an empty `errors` array, so nothing is
-logged above `[info]`. The lock leak that caused this in practice is fixed (a drop that couldn't
-flush used to keep the lock as well as the local copy), but the snooze itself is still unbounded and
-silent, so this remains the shape to recognise. A client request to that tenant clears a stale
-same-node lock. See [`reviews/fleet-rollout-2026-08-04.md`](reviews/fleet-rollout-2026-08-04.md#the-bug-this-run-found).
 
 ## 4. Revert — if a migration is bad
 

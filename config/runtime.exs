@@ -197,6 +197,15 @@ if n = System.get_env("RECONCILE_BATCH_SIZE") do
   config :fathom, :reconcile_batch_size, String.to_integer(n)
 end
 
+# How long a migration job may keep DEFERRING before it is reported as stalled (2026-08-04).
+# A `{:retry, _}` (shard busy / lease held) snoozes, and an Oban snooze raises max_attempts
+# alongside attempt — so the job never exhausts, never quarantines, and never reaches `failed`.
+# Past this window it logs at [warning], emits [:fathom, :migrator, :migration_stalled], and
+# counts in `Migrator.status/0`'s `stalled`. Default 10 minutes.
+if ms = System.get_env("MIGRATION_STALL_AFTER_MS") do
+  config :fathom, :migration_stall_after_ms, String.to_integer(ms)
+end
+
 # Per-shard load counters (`Fathom.ShardLoad`) — the Phase-2 rebalancing input. Off by
 # default so the hot path doesn't pay for an unread counter; a node/deployment opts in
 # (the "turn on :shard_load on a deployed node" knob a rebalancer / hot-spot measurement

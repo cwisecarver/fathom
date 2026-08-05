@@ -26,6 +26,21 @@ defmodule Fathom.Migrator.ShardMigrationJob do
   alias Fathom.Migrator.ShardMigration
   @snooze_seconds 5
 
+  # A snooze does NOT burn an attempt — Oban raises `max_attempts` alongside `attempt` — so a job
+  # that can never acquire its lease retries forever in `scheduled` with an EMPTY `errors` array,
+  # `failed: 0`, no quarantine, and nothing logged above `[info]`. Observed at attempt 122/127 while
+  # a tenant sat permanently unmigratable (the 2026-08-04 rig straggler): the shard that could not
+  # make progress for twenty minutes was indistinguishable from one about to succeed on its next
+  # tick, and the deploy gate simply never converged with no explanation anywhere.
+  #
+  # Retrying forever is the RIGHT behaviour and is deliberately kept: `{:retry, _}` means busy or
+  # lease-held, both of which legitimately clear, and cancelling would leave the shard behind
+  # permanently even after the cause went away. What was wrong is that it was silent and unpaced.
+  # So: back the interval off, and escalate past a stall threshold — the same shape as the
+  # coordinator's consecutive-flush-failure escalation (`Fathom.Shard`'s `flush_failures`).
+  @max_snooze_seconds 60
+  @default_stall_after_ms :timer.minutes(10)
+
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"shard_id" => shard_id, "target" => target}, id: id} = job) do
     # Pass the Oban job id as the migration-lease operation token: it's stable across this job's
@@ -55,8 +70,7 @@ defmodule Fathom.Migrator.ShardMigrationJob do
         :ok
 
       {:retry, reason} ->
-        Logger.info("shard #{shard_id}: migration deferred (#{inspect(reason)})")
-        {:snooze, @snooze_seconds}
+        handle_retry(job, shard_id, target, reason)
 
       # The target is unknown or YANKED (round-2 #23) — deterministic: the version
       # will never exist again, so retrying burns attempts against nothing, and
@@ -76,6 +90,57 @@ defmodule Fathom.Migrator.ShardMigrationJob do
         handle_error(job, shard_id, reason)
     end
   end
+
+  # A deferral: the shard is busy or its lease is held. Keep retrying — both clear on their own —
+  # but pace it and make a STALL visible.
+  #
+  # `inserted_at`, not the attempt count, is the operator-meaningful clock: "this shard has not been
+  # able to migrate for 20 minutes" is actionable, "attempt 122" is not, and the attempt number also
+  # moves for genuine errors. Past `:migration_stall_after_ms` the log goes to `[warning]` and
+  # `[:fathom, :migrator, :migration_stalled]` fires every tick, so the condition is alertable and
+  # `Migrator.status/0` can count it (see `stalled_shards/0`).
+  defp handle_retry(
+         %Oban.Job{attempt: attempt, inserted_at: inserted_at},
+         shard_id,
+         target,
+         reason
+       ) do
+    stalled_for_ms = DateTime.diff(DateTime.utc_now(), inserted_at, :millisecond)
+    snooze = snooze_seconds(attempt)
+
+    if stalled_for_ms >= stall_after_ms() do
+      Logger.warning(
+        "shard #{shard_id}: migration to v#{target} STALLED — deferred for " <>
+          "#{div(stalled_for_ms, 1000)}s over #{attempt} attempts (#{inspect(reason)}). The job " <>
+          "keeps retrying (a snooze burns no attempt), so this will not surface as a failure: the " <>
+          "shard serves normally and simply never converges. Check whether its lease is held by a " <>
+          "coordinator that no longer exists (`Fathom.Shard.Storage.lease_holder/1`)."
+      )
+
+      :telemetry.execute(
+        [:fathom, :migrator, :migration_stalled],
+        %{stalled_for_ms: stalled_for_ms, attempt: attempt},
+        %{shard_id: shard_id, target: target, reason: reason}
+      )
+    else
+      Logger.info("shard #{shard_id}: migration deferred (#{inspect(reason)})")
+    end
+
+    {:snooze, snooze}
+  end
+
+  # Exponential, capped. A fleet-wide stall used to mean every stuck shard re-polling storage every
+  # 5s forever; at the 300-tenant rig scale that is pure load against a condition that is not going
+  # to clear on this tick. Capped rather than unbounded so a shard whose lease DOES free up is still
+  # picked up promptly.
+  defp snooze_seconds(attempt) when attempt <= 1, do: @snooze_seconds
+
+  defp snooze_seconds(attempt) do
+    min(@snooze_seconds * Integer.pow(2, min(attempt - 1, 8)), @max_snooze_seconds)
+  end
+
+  defp stall_after_ms,
+    do: Application.get_env(:fathom, :migration_stall_after_ms, @default_stall_after_ms)
 
   defp handle_error(%Oban.Job{attempt: attempt, max_attempts: max}, shard_id, reason)
        when attempt >= max do

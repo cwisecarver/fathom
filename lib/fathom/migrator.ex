@@ -380,7 +380,8 @@ defmodule Fathom.Migrator do
           converged: boolean(),
           pending_review: [pos_integer()],
           rate_per_hour: non_neg_integer(),
-          eta_seconds: non_neg_integer() | nil
+          eta_seconds: non_neg_integer() | nil,
+          stalled: non_neg_integer()
         }
   def status do
     head = head()
@@ -394,9 +395,40 @@ defmodule Fathom.Migrator do
       converged: laggards == 0,
       pending_review: Enum.map(pending_review(), & &1.version),
       rate_per_hour: rate,
-      eta_seconds: eta_seconds(laggards, rate)
+      eta_seconds: eta_seconds(laggards, rate),
+      stalled: stalled_count()
     }
   end
+
+  @doc """
+  Migration jobs that have been pending longer than `:migration_stall_after_ms` (default 10 min) —
+  the shards that are **not making progress and will not say so**.
+
+  A `{:retry, _}` from `ShardMigration.run/3` (shard busy, lease held) snoozes, and an Oban snooze
+  raises `max_attempts` alongside `attempt`, so such a job never exhausts, never quarantines, and
+  never appears in `failed`. Observed at attempt 122/127 on the 2026-08-04 rig with an EMPTY
+  `errors` array while its tenant was permanently unmigratable. Retrying forever is correct — busy
+  and lease-held both clear on their own — but before this the ONLY way to tell "stuck for twenty
+  minutes" from "about to succeed" was to hand-write an Ecto query against `oban_jobs`.
+
+  This is what `eta_seconds` cannot tell you on its own: a fleet with one permanently stuck shard
+  reports a small, confident ETA that never comes true (`laggards / rate` is honest arithmetic on a
+  rate that is real but backward-looking). `stalled > 0` is the signal that the ETA is fiction.
+  """
+  @spec stalled_count() :: non_neg_integer()
+  def stalled_count do
+    cutoff = DateTime.add(DateTime.utc_now(), -stall_after_ms(), :millisecond)
+
+    from(j in Job,
+      where: j.worker == "Fathom.Migrator.ShardMigrationJob",
+      where: j.state in ["scheduled", "available", "retryable", "executing"],
+      where: j.inserted_at < ^cutoff
+    )
+    |> Repo.aggregate(:count)
+  end
+
+  defp stall_after_ms,
+    do: Application.get_env(:fathom, :migration_stall_after_ms, :timer.minutes(10))
 
   @doc """
   Shards that reached `head_version` in the trailing hour — the fleet rollout rate in shards/hour

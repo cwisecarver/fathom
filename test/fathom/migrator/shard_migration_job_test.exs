@@ -237,6 +237,91 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     assert {:snooze, _} = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
   end
 
+  describe "a deferral that never clears" do
+    # An Oban snooze raises `max_attempts` alongside `attempt`, so a job that can never acquire its
+    # lease retries FOREVER: state `scheduled`, EMPTY `errors`, `failed: 0`, no quarantine, and
+    # nothing logged above `[info]`. On the 2026-08-04 rig one sat at attempt 122/127 while its
+    # tenant was permanently unmigratable and the deploy gate never converged, with no explanation
+    # anywhere. Retrying is correct — busy and lease-held both clear on their own — so the fix is
+    # visibility and pacing, not cancellation.
+    setup %{shard: shard} do
+      {:ok, _} = Directory.resolve(shard)
+      put_foreign_lock(shard)
+      {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+      :ok
+    end
+
+    # NOT a regression test — pre-fix nothing ever logged STALLED, so this passed anyway. It is the
+    # false-positive guard for its sibling below: an escalation that fires on every ordinary
+    # deferral is worse than no escalation, because it trains the warning into background noise.
+    test "below the stall threshold it stays quiet at [info]", %{shard: shard} do
+      log =
+        capture_log(fn ->
+          assert {:snooze, _} =
+                   perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2},
+                     attempt: 1,
+                     inserted_at: DateTime.utc_now()
+                   )
+        end)
+
+      refute log =~ "STALLED", "an ordinary short deferral must not cry wolf"
+    end
+
+    test "past the threshold it escalates to [warning] and emits telemetry", %{shard: shard} do
+      test_pid = self()
+      handler = "stalled-#{shard}"
+
+      :telemetry.attach(
+        handler,
+        [:fathom, :migrator, :migration_stalled],
+        fn _e, meas, meta, _ -> send(test_pid, {:stalled, meas, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      log =
+        capture_log(fn ->
+          assert {:snooze, _} =
+                   perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2},
+                     attempt: 40,
+                     inserted_at:
+                       DateTime.add(DateTime.utc_now(), -:timer.minutes(30), :millisecond)
+                   )
+        end)
+
+      assert log =~ "STALLED",
+             "a shard deferring for 30 minutes must be alertable, not [info]"
+
+      assert_receive {:stalled, %{attempt: 40}, %{shard_id: ^shard, target: 2}}, 2_000
+    end
+
+    # Before this, a fleet-wide stall meant every stuck shard re-polling storage every 5s forever.
+    # The cap keeps a shard whose lease DOES free up from waiting minutes to notice.
+    test "the snooze backs off with attempts and stays capped", %{shard: shard} do
+      snooze = fn attempt ->
+        result =
+          with_log(fn ->
+            perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2},
+              attempt: attempt,
+              inserted_at: DateTime.utc_now()
+            )
+          end)
+
+        {{:snooze, seconds}, _log} = result
+        seconds
+      end
+
+      first = snooze.(1)
+      later = snooze.(4)
+      far = snooze.(50)
+
+      assert first == 5, "the first deferral should retry promptly"
+      assert later > first, "repeated deferrals must back off"
+      assert far <= 60, "and stay capped so a freed lease is still picked up quickly"
+    end
+  end
+
   # Finding #9: forward and revert jobs must not merge via the same-owner lease reclaim. Each
   # operation now owns `migrator@<node>@<job.id>`, so a lock held under the OLD shared owner
   # `migrator@<node>` is foreign to a new job — it snoozes (serialize-and-retry) instead of

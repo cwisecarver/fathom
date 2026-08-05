@@ -138,6 +138,95 @@ defmodule Fathom.Migrator.RolloutRateTest do
     end
   end
 
+  describe "status/0 stall reporting" do
+    # A `{:retry, _}` snooze does not burn an attempt — Oban raises `max_attempts` alongside
+    # `attempt` — so a job that can never acquire its lease stays `scheduled` forever with an EMPTY
+    # errors array, never quarantines, and never reaches `failed`. On the 2026-08-04 rig one sat at
+    # attempt 122/127 while its tenant was permanently unmigratable, and nothing in `status/0` said
+    # so. `stalled` is the signal that makes "stuck for twenty minutes" distinguishable from "about
+    # to succeed on the next tick".
+    defp insert_migration_job!(shard_id, inserted_at, state \\ "scheduled") do
+      %Oban.Job{}
+      |> Ecto.Changeset.change(%{
+        worker: "Fathom.Migrator.ShardMigrationJob",
+        queue: "migrations",
+        args: %{"shard_id" => shard_id, "target" => 1},
+        state: state,
+        inserted_at: inserted_at,
+        scheduled_at: inserted_at
+      })
+      |> Repo.insert!()
+    end
+
+    test "a freshly enqueued migration is not stalled" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
+      insert_migration_job!("stall_fresh", DateTime.utc_now())
+
+      assert Migrator.status().stalled == 0
+    end
+
+    test "a migration pending past the threshold is reported as stalled" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
+      old = DateTime.add(DateTime.utc_now(), -:timer.minutes(30), :millisecond)
+      insert_migration_job!("stall_stuck", old)
+
+      assert Migrator.status().stalled == 1
+    end
+
+    # The whole point of the field: a fleet with a permanently stuck shard reports a small,
+    # confident ETA that never comes true, because `laggards / rate` is honest arithmetic on a rate
+    # that is real but backward-looking. `stalled > 0` is what tells the operator the ETA is fiction.
+    test "a stalled shard coexists with a confident-looking ETA", %{} do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
+      # One shard migrated recently (so the rate is non-zero) and one still behind.
+      shard_at_head!("stall_done", 1)
+      {:ok, _} = Directory.resolve("stall_behind")
+
+      insert_migration_job!(
+        "stall_behind",
+        DateTime.add(DateTime.utc_now(), -:timer.minutes(30), :millisecond)
+      )
+
+      status = Migrator.status()
+
+      assert status.laggards == 1
+      assert status.rate_per_hour == 1
+      assert status.eta_seconds == 3600, "the ETA reads as if it will finish within the hour"
+      assert status.stalled == 1, "and `stalled` is what says that ETA will not come true"
+    end
+
+    test "a COMPLETED job past the threshold is not stalled" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
+      old = DateTime.add(DateTime.utc_now(), -:timer.minutes(30), :millisecond)
+      insert_migration_job!("stall_done_job", old, "completed")
+
+      assert Migrator.status().stalled == 0,
+             "a job that finished long ago is history, not a stall"
+    end
+
+    test "the threshold is configurable" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
+
+      insert_migration_job!(
+        "stall_cfg",
+        DateTime.add(DateTime.utc_now(), -:timer.minutes(2), :millisecond)
+      )
+
+      assert Migrator.status().stalled == 0
+
+      prev = Application.get_env(:fathom, :migration_stall_after_ms)
+      Application.put_env(:fathom, :migration_stall_after_ms, :timer.minutes(1))
+
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:fathom, :migration_stall_after_ms, prev),
+          else: Application.delete_env(:fathom, :migration_stall_after_ms)
+      end)
+
+      assert Migrator.status().stalled == 1
+    end
+  end
+
   describe "Directory.count_cutovers_since/2" do
     # The query carries a redundant `last_active_at >= since` predicate so it can range-scan the
     # existing `(schema_version, last_active_at) WHERE status = 'active'` partial index instead of
