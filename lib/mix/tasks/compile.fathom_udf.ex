@@ -83,7 +83,7 @@ defmodule Mix.Tasks.Compile.FathomUdf do
       # Copy only when the bytes actually changed. `mix compile` runs on every `mix test`, and
       # rewriting the file each time would churn its mtime for no reason.
       if stale?(built, dest) do
-        File.cp!(built, dest)
+        atomic_install!(built, dest)
         Mix.shell().info([:green, "fathom_udf: installed #{dest}"])
       end
 
@@ -95,6 +95,43 @@ defmodule Mix.Tasks.Compile.FathomUdf do
 
   defp stale?(src, dest) do
     not File.exists?(dest) or File.read!(src) != File.read!(dest)
+  end
+
+  # Write to a temp file in the SAME directory, then rename over the destination.
+  #
+  # `File.cp!/2` truncates and rewrites the existing inode, which on macOS/arm64 is a way to get
+  # your process SIGKILLed. Every Mach-O gets an ad-hoc code signature at link time, and the kernel
+  # validates each page against it lazily, on fault. Rewriting the file in place leaves pages
+  # already cached from the OLD image being checked against the NEW signature, and the kernel kills
+  # whoever faults on one:
+  #
+  #     signal:      SIGKILL (Code Signature Invalid)
+  #     termination: namespace CODESIGNING, indicator "Invalid Page"
+  #
+  # That is what it looks like from the outside: `mix test` dies partway through with exit 137, no
+  # ExUnit output, no error — because the BEAM is killed by the kernel, not by anything in the
+  # program. It reproduces only after a REBUILD of the extension, so it looks intermittent and
+  # unrelated to whatever you were actually working on. (Observed 2026-08-05; the crash report in
+  # ~/Library/Logs/DiagnosticReports is the only thing that names it.)
+  #
+  # `rename(2)` is atomic and gives the destination a NEW inode, so a process that already mapped
+  # the old file keeps a coherent view of it and every new `dlopen` gets a file whose pages and
+  # signature agree. The temp file must be in the same directory to guarantee the rename is a
+  # same-filesystem move rather than a copy.
+  #
+  # Deliberately NOT fixed by re-signing the artifact: `codesign` alters trust on the machine and is
+  # not this task's business. The bug is the in-place write.
+  defp atomic_install!(src, dest) do
+    tmp = "#{dest}.tmp.#{System.unique_integer([:positive])}"
+
+    try do
+      File.cp!(src, tmp)
+      File.rename!(tmp, dest)
+    rescue
+      e ->
+        File.rm(tmp)
+        reraise e, __STACKTRACE__
+    end
   end
 
   @doc """
