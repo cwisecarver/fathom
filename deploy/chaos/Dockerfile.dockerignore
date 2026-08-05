@@ -10,6 +10,14 @@
 # The release's vm.args template. Omitting it does not fail the build — `mix release` just
 # generates a default vm.args — so the VM flags vanish silently. Keep this whitelisted.
 !fathom/rel
+# The Rust crate for the Django-compatibility SQLite extension. Unlike rel/, omitting this is a
+# HARD build failure (`COPY fathom/native native` cannot resolve), which is the better direction:
+# a silent omission would produce a rig whose nodes lack django_date_extract while every test
+# passed, i.e. a rig that differs from production in exactly the way a rig exists to rule out.
+!fathom/native
+# ...but never its build output: a macOS target/ dir would be copied into a Linux image and is
+# ~1 GB of cache the builder rebuilds anyway.
+fathom/native/*/target
 !filo
 filo/_build
 filo/deps
