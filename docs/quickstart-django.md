@@ -133,6 +133,31 @@ uuid, the `STDDEV`/`VAR`/`BIT_*` aggregates), **5 moderate** (date arithmetic, n
 need a timezone database server-side. They are also the ones ordinary apps hit first, so the cheap
 29 do not buy off the headline breakage.
 
+**When the timezone argument is actually NULL (verified 2026-08-05).** Django computes it as:
+
+```python
+def _convert_tznames_to_sql(self, tzname):
+    if tzname and settings.USE_TZ:
+        return tzname, self.connection.timezone_name
+    return None, None
+```
+
+and `_sqlite_datetime_parse` skips `zoneinfo` entirely when both are `None` — so with a NULL
+timezone the six collapse to plain date arithmetic and need **no tzdata**.
+
+That is a narrower escape hatch than it first appears: `USE_TZ` defaults to **True** as of Django
+5.0 — the very version `django-libsql` pins — and `startproject` has written `USE_TZ = True` since
+Django 1.4. So it does *not* cover the default app. What it does cover is any app that sets
+`USE_TZ = False`, and (by the `if tzname` guard, which is independent of `USE_TZ`) lookups with no
+timezone to apply, such as `DateField` rather than `DateTimeField`. **Unverified:** exactly which
+ORM lookups supply a tzname — settle it against `test/django_validation/` before planning around it.
+
+**Consequence for implementation order:** a first pass can supply all 35 with correct NULL-timezone
+behaviour and raise an explicit "timezone-aware truncation not supported yet" when a tzname *is*
+passed. That is strictly better than today — a precise, actionable failure on six functions instead
+of `no such function` across thirty-five — and it makes tzdata a follow-on that upgrades those six
+rather than a prerequisite for starting.
+
 **Affected lookups:**
 
 | Django code | Missing function |
