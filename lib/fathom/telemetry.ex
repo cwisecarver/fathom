@@ -366,6 +366,259 @@ defmodule Fathom.Telemetry do
           "Novel tenants born EMPTY because fork-from-template failed while :fork_from_template was ON — the tenant is serving with NO schema, every ORM query fails, and the rollout CANNOT heal it. Any occurrence needs an operator to delete and re-mint that tenant; :no_template_snapshot means the `mix fathom.snapshot template-head` prerequisite never ran"
       ),
 
+      # --- The rest of the emitted-but-unexported sweep (2026-08-06) --------------------------
+      # `fork_fallback` above was not a one-off. A diff of every `:telemetry.execute` in lib/
+      # against this list found 13 events that emitted into the void — no metric, no Prometheus
+      # series, no alert, nothing on the dashboard. Several were written with an explicit
+      # intention of being alerted on (`check_template_drift/0`'s own docstring says "so a
+      # post-revert wedge is alertable"), which is the failure mode: emitting is the cheap half,
+      # and nothing fails when the other half is missing.
+      #
+      # Same cardinality rule throughout: tag by bounded sets (outcome/kind/dry_run) and NEVER by
+      # shard_id — it rides event metadata for the log line. That is also why several of these
+      # carry no tags at all despite metadata being available.
+
+      # Data divergence — acked writes that are no longer on the lineage. Both need a human.
+      counter("fathom.shard.forked.count",
+        event_name: [:fathom, :shard, :forked],
+        description:
+          "Local shard copies found FORKED from the stored lineage and quarantined to a .forked.<ts> file (#2) — a peer advanced the object while this node held divergent writes. The forked writes survive in that file but are NOT in the tenant's database; recovery is manual. Any occurrence is page-worthy"
+      ),
+      counter("fathom.shard.write_fenced.count",
+        event_name: [:fathom, :shard, :write_fenced],
+        description:
+          "Shards whose WRITES were refused because the node's heartbeat went stale past the steal margin (:fence_writes_when_stealable, ON in prod). Deliberate — it collapses the loss window from the whole partition to ~ttl+margin — but it is a tenant-visible WRITE OUTAGE while it lasts, and reads keep succeeding so nothing else looks wrong"
+      ),
+
+      # Migration wedge — the template diverged from the fleet and no rollout can proceed.
+      counter("fathom.migrator.template_drift.count",
+        event_name: [:fathom, :migrator, :template_drift],
+        description:
+          "Template/fleet migration drift detected at a revert — the template still carries a version the fleet pointer-flipped away from, so the next `makemigrations` builds on DDL the fleet does not have. Untagged on purpose: the metadata carries version NUMBERS, which are unbounded as labels"
+      ),
+
+      # Token revocation — degrades to a STALE floor, so a revoked token may still be accepted.
+      counter("fathom.hrana.revocation.floor_error.count",
+        event_name: [:fathom, :hrana, :revocation, :floor_error],
+        description:
+          "Revocation-floor reads that failed and fell back to the last-known-good (STALE) floor — a revoke issued after that value was cached is not being enforced on this node. Serving stale beats failing closed on every request, but sustained > 0 means the revocation contract is degraded"
+      ),
+      counter("fathom.hrana.revocation.bulk.count",
+        event_name: [:fathom, :hrana, :revocation, :bulk],
+        measurement: :revoked,
+        tags: [:outcome],
+        description:
+          "Fleet-wide revocation refreshes by outcome (#37). `degraded` means the refresh raised and the node is running on whatever floors it already had — pair with floor_error"
+      ),
+      sum("fathom.hrana.revocation.bulk.revoked",
+        event_name: [:fathom, :hrana, :revocation, :bulk],
+        measurement: :revoked,
+        tags: [:outcome],
+        description: "Token floors moved by bulk revocation refreshes (#37)"
+      ),
+
+      # Snapshots — the job that DELETES backups. `dropped` is the destructive number.
+      sum("fathom.snapshots.retention.dropped",
+        event_name: [:fathom, :snapshots, :retention],
+        measurement: :dropped,
+        tags: [:dry_run],
+        description:
+          "Snapshots DELETED by the GFS retention sweep (#18), tagged by dry_run so a rehearsal is never mistaken for a real sweep. This is the one automatic path that destroys a backup — it only ever touches `auto`-labelled snapshots, and an unexplained jump means the policy or the clock moved"
+      ),
+      sum("fathom.snapshots.retention.errors",
+        event_name: [:fathom, :snapshots, :retention],
+        measurement: :errors,
+        tags: [:dry_run],
+        description:
+          "Per-shard failures during the retention sweep (#18) — the sweep continues past them, so without this the only signal is a Logger.warning"
+      ),
+      sum("fathom.snapshots.retention.kept",
+        event_name: [:fathom, :snapshots, :retention],
+        measurement: :kept,
+        tags: [:dry_run],
+        description: "Snapshots retained by the GFS policy (#18) — the denominator for `dropped`"
+      ),
+
+      # Control plane / directory — buffered writes that did not land.
+      sum("fathom.directory.flush_retry.count",
+        event_name: [:fathom, :directory, :flush_retry],
+        description:
+          "Directory rows RE-BUFFERED after a failed batch flush — the recorder is deliberately off the hot path and never fails a checkout, so a Postgres problem shows up only here. Summed rather than counted: one event carries a whole batch"
+      ),
+
+      # Security — the control-plane refusals that aren't auth failures.
+      counter("fathom.api.csrf_blocked.count",
+        event_name: [:fathom, :api, :csrf_blocked],
+        description:
+          "Control-plane (/api) requests refused as cross-site (#27) — browsers re-send cached admin BasicAuth on cross-site submissions, so this is the signal an operator with /admin open visited a hostile page"
+      ),
+
+      # Tenant lifecycle — irreversible, and cross-node erase relies on a self-fence.
+      counter("fathom.tenants.deleted.count",
+        event_name: [:fathom, :tenants, :deleted],
+        description:
+          "Tenant deletions completed (#15) — irreversible erase of every stored object. Also audited to Postgres; this is the RATE view, where a runaway script shows up as a spike"
+      ),
+      counter("fathom.tenants.purge_while_held.count",
+        event_name: [:fathom, :tenants, :purge_while_held],
+        description:
+          "Purges that deleted a live object while a REMOTE node still held the lease — correct by design (that node self-fences on its next fenced flush rather than resurrecting the object), but it makes a cross-node erase observable instead of silent. Untagged: the owner is another node's key, and the shard_id stays in the log"
+      ),
+
+      # Warm standby — the failover-readiness cache's actual throughput (A1).
+      counter("fathom.shard.warm.pulled.count",
+        event_name: [:fathom, :shard, :warm, :pulled],
+        description:
+          "Shards pre-pulled into the warm-follower cache — the failover-readiness fill rate. `warm.promoted` already showed the PAYOFF at failover; this is what pays for it"
+      ),
+      sum("fathom.shard.warm.pulled.bytes",
+        event_name: [:fathom, :shard, :warm, :pulled],
+        measurement: :bytes,
+        description:
+          "Bytes pulled into the warm-follower cache — the disk and bandwidth the standby is spending, and the input to :warm_cache_max_bytes / the disk-pressure floor (#36)"
+      ),
+      counter("fathom.shard.warm.evicted.count",
+        event_name: [:fathom, :shard, :warm, :evicted],
+        description:
+          "Shards LRU-evicted from the warm-follower cache — sustained eviction against a steady fleet means :warm_cache_max is too small and failover readiness is churning rather than accumulating"
+      ),
+
+      # Rebalancer — a fail-safe deferral, so silence here can mean 'working' or 'wedged'.
+      counter("fathom.rebalancer.reconcile.skipped.count",
+        event_name: [:fathom, :rebalancer, :reconcile, :skipped],
+        description:
+          "Stale pins the reconcile sweep declined to unpin because a handoff is still in its grace window — fail-safe and expected during a move, but a sustained rate means pins are never being reclaimed. Logged at :info only, so this was the sole way to see it"
+      ),
+
+      # Rollout / migration engine — progress, and the three ways it wedges.
+      counter("fathom.migrator.shard_migrated.count",
+        event_name: [:fathom, :migrator, :shard_migrated],
+        description:
+          "Shards that MOVED to a new version (once per shard that migrated, not once per attempt — the contract `chaos.sh rollout` asserts). Integrated, this is the rollout burndown; differentiated, it is the shards/s the deploy gate's ETA is computed from"
+      ),
+      counter("fathom.migrator.migration_stalled.count",
+        event_name: [:fathom, :migrator, :migration_stalled],
+        measurement: :attempt,
+        description:
+          "Per-shard migrations still snoozing past :migration_stall_after_ms. Retrying forever is correct (busy and lease-held both clear on their own), so this is the visibility half of the 2026-08-04 fix for a job that sat in `scheduled` at attempt 122/127 with an EMPTY errors array, failed: 0, no quarantine, and nothing above [info]. Untagged: the metadata `reason` is a passed-through error term, not a bounded set"
+      ),
+      counter("fathom.migrator.inline_migrate_failed.count",
+        event_name: [:fathom, :migrator, :inline_migrate_failed],
+        description:
+          "Inline migrate-on-touch failures — the shard is served at its OLD version and handed to the async rollout rather than failing the checkout. Sustained ⇒ the shard's schema is ahead of its fathom stamp (a direct `manage.py migrate` against a tenant does that) and the rollout will never converge it"
+      ),
+      counter("fathom.migrator.revert.count",
+        event_name: [:fathom, :migrator, :revert],
+        description:
+          "Per-shard reverts to a previous version — a fleet pointer-flip backwards. Expected in a burst during a deliberate revert; unexpected at any other time. Untagged: from/to are version NUMBERS"
+      ),
+
+      # Capture — the template/fleet contract, and the two ways it silently diverges.
+      counter("fathom.migrator.migration_gap.count",
+        event_name: [:fathom, :migrator, :migration_gap],
+        description:
+          "Captures whose template `django_migrations` count jumped — migrations ran OUTSIDE capture (the `atomic = False` idiom runs autocommit and is invisible to it), so the fleet is missing DDL that this version and everything above it assume. `mix fathom.check_migrations` is the pre-flight gate; this is the late backstop firing"
+      ),
+      sum("fathom.migrator.migration_gap.gap",
+        event_name: [:fathom, :migrator, :migration_gap],
+        measurement: :gap,
+        description: "How many template migrations capture never saw — the size of the divergence"
+      ),
+      counter("fathom.migrator.backwards_migrate.count",
+        event_name: [:fathom, :migrator, :backwards_migrate],
+        measurement: :count,
+        description:
+          "Backwards `manage.py migrate` runs detected on the capture template (#6) — the template moved DOWN while the fleet stayed up. Fleet undo is a fathom revert, never a Django backwards migrate; any occurrence means the two are diverging"
+      ),
+      sum("fathom.migrator.data_migration_captured.count",
+        event_name: [:fathom, :migrator, :data_migration_captured],
+        description:
+          "Template-literal DML statements captured into a version (#26) — the shape that caps HEAD and freezes the rollout until an operator attaches a transform or approves it. Untagged: metadata carries the version NUMBER. Pairs with the review-block panel on /admin/migrations"
+      ),
+      sum("fathom.migrator.capture_pending_on_shutdown.count",
+        event_name: [:fathom, :migrator, :capture_pending_on_shutdown],
+        description:
+          "Captured-but-unrecorded migrations still buffered when capture shut down — the template has advanced and the fleet has no version for it, which is the same divergence `migration_gap` catches later and more expensively"
+      ),
+
+      # Durability — flush LATENCY (the failure counter above only sees flushes that error).
+      distribution("fathom.shard.flush.duration",
+        event_name: [:fathom, :shard, :flush],
+        measurement: :duration,
+        unit: {:native, :millisecond},
+        tags: [:outcome],
+        reporter_options: [buckets: [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000]],
+        description:
+          "Durability-flush latency by outcome (uploaded / reconciled / skipped / error). Flushes that SUCCEED but crawl grow the RPO exactly like flushes that fail, and nothing measured that — `flush.failed` only counts the ones that error out"
+      ),
+      counter("fathom.shard.open.failed.count",
+        event_name: [:fathom, :shard, :open, :failed],
+        description:
+          "Coordinator opens that failed (lease lost, pull failed, corrupt object) — the coordinator stops with {:shutdown, _} and the checkout maps it to an error, so this is a tenant-visible open failure. Untagged: the metadata `reason` is a passed-through storage error"
+      ),
+
+      # Single-writer plumbing — the two events that prove the fence is working, not just failing.
+      counter("fathom.shard.heartbeat.renewed.count",
+        event_name: [:fathom, :shard, :heartbeat, :renewed],
+        description:
+          "Node-heartbeat renewals — liveness is O(nodes), so this is a flat, predictable rate and its ABSENCE is the signal. `heartbeat.lapsed` catches the lapse; this is the denominator that shows renewals stopped rather than the node going quiet"
+      ),
+      counter("fathom.shard.lease.release_retried.count",
+        event_name: [:fathom, :shard, :lease, :release_retried],
+        description:
+          "Lease releases that hit a 412 and re-read to find the lock STILL OURS at a rotated etag, then finished the delete (the 2026-08-04 stuck-lease fix). Every one of these would previously have leaked a lock that no live node could ever steal — a tenant that serves normally but can NEVER migrate, snoozing forever with failed: 0"
+      ),
+
+      # Warm standby — the revalidation sweep's actual shape (A1).
+      last_value("fathom.shard.warm.refresh.cached",
+        event_name: [:fathom, :shard, :warm, :refresh],
+        measurement: :cached,
+        description:
+          "Shards held in the warm-follower cache after a revalidation sweep — the standing failover-readiness gauge, bounded by :warm_cache_max and the disk-free floor (#36)"
+      ),
+      sum("fathom.shard.warm.refresh.body_bytes",
+        event_name: [:fathom, :shard, :warm, :refresh],
+        measurement: :body_bytes,
+        description:
+          "Bytes re-downloaded during warm revalidation — the sweep is designed to land on the 304 fast path, so a rising number means cached copies are going stale faster than they are being refreshed"
+      ),
+
+      # Snapshots — the scheduler half (the retention/deletion half is above).
+      sum("fathom.snapshots.scheduled.ok",
+        event_name: [:fathom, :snapshots, :scheduled],
+        measurement: :ok,
+        description:
+          "Snapshots taken by the hourly scheduler (#18) — the RPO for LOGICAL corruption is this cadence, not the 5s flush interval, so a stalled scheduler silently lengthens the only window that answers 'restore tenant acme to 09:00'"
+      ),
+      sum("fathom.snapshots.scheduled.error",
+        event_name: [:fathom, :snapshots, :scheduled],
+        measurement: :error,
+        description:
+          "Per-shard snapshot failures in the scheduled sweep (#18). `last_snapshot_at` is stamped only on SUCCESS, so a failing shard stays at the head of the rotation rather than being marked done — this is what says it is retrying, not converging"
+      ),
+
+      # Restore drill — the other two result streams (#48); `restore_drill.result` is above.
+      counter("fathom.restore_drill.full_result.count",
+        event_name: [:fathom, :restore_drill, :full_result],
+        tags: [:status],
+        description:
+          "Full restore-drill outcomes (#48) — this one exercises the recovery PROCEDURE (fork → row-count compare → drop), not just whether the stored bytes read back. `fork_failed` means the recovery path itself is broken; `restored_mismatch` means it produced a database that is not the source"
+      ),
+      counter("fathom.restore_drill.snapshot_result.count",
+        event_name: [:fathom, :restore_drill, :snapshot_result],
+        tags: [:status],
+        description:
+          "Snapshot verification outcomes (#48). Snapshots are storage objects with no directory row, so the shard sampler never saw them — the one class of data a point-in-time recovery reaches for was the one class nothing checked"
+      ),
+
+      # Lifecycle deny-set — the recovery half of the degraded counter above (#33).
+      counter("fathom.tenants.denylist.recovered.count",
+        event_name: [:fathom, :tenants, :denylist, :recovered],
+        tags: [:kind],
+        description:
+          "A lifecycle deny set (tombstones/suspensions) finished loading after a degraded start (#33) — pairs with denylist.degraded so an alert can clear rather than needing a human to confirm recovery"
+      ),
+
       # Capacity / admission — the tenant-visible refusals.
       counter("fathom.shards.novel_rate_limited.count",
         event_name: [:fathom, :shards, :novel_rate_limited],

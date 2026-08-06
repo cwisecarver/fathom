@@ -7,7 +7,7 @@ into their backend. Everything here reads the in-process Prometheus scrape each 
 | File | What it is |
 |---|---|
 | `prometheus.yml` | Scrape config: one target per node's `/admin/metrics`, BasicAuth, relabel to a `node` label, loads the rules. |
-| `alert-rules.yml` | 15 Prometheus alerting rules (durability, capacity, ownership, control-plane, rebalancer), each linking its runbook. |
+| `alert-rules.yml` | 32 Prometheus alerting rules (durability, capacity, ownership, control-plane, rebalancer, disk), each linking its runbook. |
 | `fathom-dashboard.json` | Grafana dashboard: node health, RPO exposure, lease churn, capacity/admission, S3 ops. Import and pick your Prometheus datasource. |
 
 ## Wire it up
@@ -30,6 +30,23 @@ Exported names are the underscore form of `Fathom.Telemetry.metrics/0` (the
 Distributions export `<name>_bucket{le}` / `<name>_sum` / `<name>_count`. Examples:
 `fathom_shards_active` (gauge), `fathom_shard_lease_superseded_count` (counter),
 `fathom_shard_cold_open_duration_bucket{warm="false",le=...}` (histogram).
+
+### Coverage is enforced, in both directions
+
+`test/fathom/telemetry_coverage_test.exs` fails the build when either half of the chain is missing:
+
+* **An emitted event with no metric.** Emitting is the cheap half and nothing fails without the
+  other half, so the gap is invisible by construction — the code looks instrumented and the metric
+  simply does not exist. A sweep on 2026-08-06 found **30** events in that state, three of them
+  written with an explicit intention to alert (`check_template_drift/0`'s own docstring says it
+  emits "so a post-revert wedge is alertable"). Adding an event now either exports it or records
+  why not.
+* **A rule referencing a series nothing produces.** That is not an error anywhere: Prometheus
+  evaluates it forever against no data and never fires, which is indistinguishable from the
+  condition never happening. The test resolves every `fathom_*` name in `alert-rules.yml` against
+  `metrics/0` — a one-character typo fails it.
+
+It also refuses any metric tagged by `shard_id`, per the cardinality rule below.
 
 **Fleet-merge is by the `node` label**, relabeled from the scrape target. fathom is an
 LB-keyspace partition — a shard's signal lives on exactly one node — so you `sum`/aggregate across

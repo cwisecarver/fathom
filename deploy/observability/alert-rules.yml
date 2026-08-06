@@ -62,6 +62,45 @@ groups:
           description: "The sampled restore drill classified a shard's durable object as {{ $labels.status }} — a cold-tail tenant's only copy is bad or unreachable. Find it via last_verify_status in the directory; recover from a snapshot/version if available (#12) before the tenant returns."
           runbook: docs/runbooks/operations.md#runbook-postgres-directory--control-plane-is-down
 
+      - alert: FathomShardForked
+        # The local copy diverged from the stored lineage — a peer advanced the object while this
+        # node held writes against the old one. Those writes were ACKED to a client and are now in
+        # a .forked.<ts> file, NOT in the tenant's database. The tenant reads consistently and
+        # nothing looks wrong to it; only this says data was acked and then set aside. Recovery is
+        # manual, so any occurrence pages.
+        expr: increase(fathom_shard_forked_count[10m]) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "Shard forked from its stored lineage on {{ $labels.node }}"
+          description: "A local shard copy diverged from the stored object and was quarantined to .forked.<ts>; the writes in that file were acked to a client and are not in the tenant's database. Enumerate with `mix fathom.shard quarantines` and decide per shard whether to merge or discard."
+          runbook: docs/runbooks/operations.md#runbook-restore-a-shard-from-s3-disaster-recovery-drill
+
+      - alert: FathomRestoreDrillProcedureBroken
+        # Distinct from FathomRestoreDrillFailure, which says "this stored object is bad". This
+        # says the RECOVERY PATH itself is broken (#48): the fork failed, or it produced a database
+        # whose row counts do not match the source. A corrupt object is one tenant; a broken
+        # recovery path is every tenant, discovered at the worst possible moment.
+        expr: sum by (status) (increase(fathom_restore_drill_full_result_count{status=~"fork_failed|restored_mismatch"}[1d])) > 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "Restore PROCEDURE is broken ({{ $labels.status }})"
+          description: "The full restore drill could not recover a shard by the documented path — fork_failed means the recovery mechanism is broken, restored_mismatch means it produced a database that is not the source. This is the procedure an operator runs under maximum pressure; fix it before the next incident needs it."
+          runbook: docs/runbooks/operations.md#runbook-restore-a-shard-from-s3-disaster-recovery-drill
+
+      - alert: FathomSnapshotSweepFailing
+        # The RPO for LOGICAL corruption (a bad deploy, a bad backfill) is the snapshot cadence,
+        # not the 5s flush interval — the live object is overwritten every flush, so snapshots are
+        # the only thing that answers "restore tenant acme to 09:00". A failing scheduler
+        # lengthens that window silently; a failing retention sweep leaves storage growing.
+        expr: increase(fathom_snapshots_scheduled_error[2h]) > 0 or increase(fathom_snapshots_retention_errors[2h]) > 0
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Scheduled snapshot / retention sweep is erroring"
+          description: "Snapshot creation or GFS retention is failing for some shards. Point-in-time recovery for logical corruption degrades to the last successful snapshot. last_snapshot_at is stamped only on success, so failing shards stay at the head of the rotation — check storage reachability and the :snapshot_retention policy."
+          runbook: docs/durability.md
+
       - alert: FathomUnflushedAgeHigh
         # The RPO exposure gauge. Rising oldest-unflushed age = flushes are failing silently (S3
         # trouble or a stuck coordinator). This is the "flush failure rate" signal the RPO gauge
@@ -151,6 +190,19 @@ groups:
           description: "The {owner,epoch} fence keeps stopping losers — data is safe, but ownership is thrashing. Check for two LBs / stale config, flapping health checks, or clock skew (NTP)."
           runbook: docs/runbooks/operations.md#runbook-dual-lb--stale-lb-config-double-routing
 
+      - alert: FathomWritesFenced
+        # The consequence of a lapse that FathomHeartbeatLapse only warns is coming. Past the steal
+        # margin the coordinator stops acking writes (:fence_writes_when_stealable, ON in prod) so
+        # the loss window collapses from the whole partition to ~ttl+margin. Correct, and a
+        # tenant-visible WRITE OUTAGE while it lasts — reads keep serving from the local copy, so
+        # the tenant sees a half-working database and no other signal moves.
+        expr: increase(fathom_shard_write_fenced_count[10m]) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "Writes fenced on {{ $labels.node }} — shards are read-only until the lease is renewed"
+          description: "This node's heartbeat went stale past the steal margin, so it stopped acking writes to protect against a split-brain double-write. Reads still serve. Restore S3 reachability (or let the shard move) — the fence clears when the lease is valid again."
+          runbook: docs/runbooks/operations.md#runbook-heartbeat-object-lost-or-deleted
+
       - alert: FathomHeartbeatLapse
         # A node heartbeat lapsed — its shards become stealable. The mass-self-fence precursor.
         expr: increase(fathom_shard_heartbeat_lapsed_count[10m]) > 0
@@ -206,6 +258,56 @@ groups:
           summary: "Tenant born with NO schema — fork-from-template failed ({{ $labels.reason }})"
           description: "A novel tenant was born empty because the template fork failed; it is serving and every ORM query against it fails, and the rollout cannot heal it. Grep the node for 'born EMPTY' to get the shard_id, then delete and re-mint that tenant. If reason=no_template_snapshot, run `mix fathom.snapshot template-head` after releasing a version."
           runbook: docs/runbooks/operations.md#runbook-a-tenant-was-born-with-no-schema-fork-fallback
+
+      - alert: FathomMigrationStalled
+        # The 2026-08-04 finding, made visible. A per-shard migration that cannot proceed snoozes
+        # forever — correct, since "busy" and "lease-held" both clear on their own — but it did so
+        # with an EMPTY errors array, failed: 0, no quarantine and nothing above [info]. The tenant
+        # serves normally and can never migrate, so the deploy gate never converges and
+        # `eta_seconds` reports a small confident number that never arrives.
+        expr: increase(fathom_migrator_migration_stalled_count[1h]) > 0
+        for: 15m
+        labels: {severity: ticket}
+        annotations:
+          summary: "A per-shard migration has been snoozing past the stall threshold"
+          description: "One or more shards cannot migrate and are retrying indefinitely. Read `stalled` in /api/migrations/status — while it is non-zero, eta_seconds is fiction. Grep the node for the shard_id; a lease held by a coordinator that no longer exists is the known cause and a client touch on the owning node clears it."
+          runbook: docs/runbooks/operations.md#runbook-postgres-directory--control-plane-is-down
+
+      - alert: FathomMigrationGap
+        # The fleet is missing DDL. Capture cannot see an `atomic = False` migration by
+        # construction (autocommit, no transaction to hook), so the template silently moves ahead
+        # and this version — and everything above it — assumes schema the fleet never received.
+        # `mix fathom.check_migrations` is the pre-flight gate; this firing means it was skipped.
+        expr: increase(fathom_migrator_migration_gap_count[1d]) > 0
+        labels: {severity: ticket}
+        annotations:
+          summary: "Template/fleet migration gap — the fleet is missing DDL"
+          description: "A capture began with a higher django_migrations count than the last one recorded, so migrations ran outside capture (typically `atomic = False`). HEAD is frozen below that version. Reconcile the template against the fleet before approving anything; a transform cannot conjure DDL that was missed."
+          runbook: docs/django-migrations.md
+
+      - alert: FathomTemplateDrift
+        # A revert moved the fleet pointer back but the template still carries the yanked version,
+        # so the next `makemigrations` builds on DDL the fleet does not have. Discovered otherwise
+        # at the next fleet-wide migration, which is the worst time to find out.
+        expr: increase(fathom_migrator_template_drift_count[1d]) > 0
+        labels: {severity: ticket}
+        annotations:
+          summary: "Capture template drifted from the fleet after a revert"
+          description: "The template still has a version the fleet reverted away from. Bring the template back in line (or re-release) before the next makemigrations, which would otherwise build on DDL the fleet never received."
+          runbook: docs/django-migrations.md
+
+      - alert: FathomRevocationFloorStale
+        # Token revocation degrades OPEN by design: a floor read that fails serves the last-known
+        # good value rather than failing every request. Correct, and it means a revoke issued after
+        # that value was cached is NOT being enforced on this node. Silent by construction — the
+        # tokens keep working, which is exactly what a working system looks like.
+        expr: sum by (node) (increase(fathom_hrana_revocation_floor_error_count[15m])) > 0
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Revocation floors are stale on {{ $labels.node }} — revoked tokens may still work"
+          description: "Floor reads are failing and the node is serving cached values, so tokens revoked since then are still accepted there. Check Postgres reachability from this node. If a revocation was security-driven, treat it as not yet effective fleet-wide until this clears."
+          runbook: docs/auth.md
 
       - alert: FathomObanJobFailures
         # Oban failures = a stalling control plane (migrations, reconcile, rebalancer, retirement,
