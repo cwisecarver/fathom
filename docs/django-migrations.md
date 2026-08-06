@@ -172,6 +172,19 @@ entry saying why it is held and what your options are:
 }
 ```
 
+The **admin dashboard** shows the same thing, for the operator who is watching the rollout rather
+than scripting against it: `/admin/migrations` carries a **Held for review** tile and, when
+anything is held, a *"Rollout held — operator review required"* panel above the burndown listing
+each held version with its reason, the exact statements that tripped the flag, and both options
+with their runnable commands and consequences. Without it the page read "Fleet HEAD v1" next to a
+laggard count that would never reach zero, and nothing explained why.
+
+The panel is **read-only on purpose**. `attach_transform` cannot be a button (it needs a module
+written, deployed and allowlisted), and `approve_review` replays the template's literal rows onto
+every tenant — the corruption the flag exists to prevent, and not a call the UI can help you make
+correctly. A panel offering only the dangerous half of the decision would push you toward it. So it
+prints the commands and you run the one you mean.
+
 ### The three ways out
 
 **1. Attach a transform (the usual answer).** Split the migration: keep the DDL in Django, remove

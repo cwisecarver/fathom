@@ -62,7 +62,19 @@ defmodule Fathom.Admin.Fleet do
     |> Enum.sort_by(& &1.node_key)
   end
 
-  @doc "The migrations page: fleet HEAD, release history, rollout laggards, and quarantined shards."
+  @doc """
+  The migrations page: fleet HEAD, release history, rollout laggards, quarantined shards, and the
+  legible review blocks holding HEAD down.
+
+  `review_blocks` is the dashboard half of expert review 2026-08-01 #26 — the API half
+  (`GET /api/migrations/status`) shipped first because that is what CI reads, but the operator
+  watching `laggards` never converge is looking at THIS page, and a bare "Fleet HEAD v1" with no
+  explanation is exactly the illegibility the finding is about.
+
+  Derived through `Migrator.pending_review/0` rather than filtered out of `releases` in memory: the
+  "held" predicate (`requires_review and not yanked`) lives in the migrator, and a second copy here
+  would drift the moment either flag's meaning changes.
+  """
   @spec migrations() :: map()
   def migrations do
     head = Migrator.head()
@@ -70,6 +82,7 @@ defmodule Fathom.Admin.Fleet do
     %{
       head: head,
       releases: Migrator.list(),
+      review_blocks: Enum.map(Migrator.pending_review(), &Migrator.review_block/1),
       laggard_count: Directory.count_laggards(head),
       laggards: Directory.laggards(head, 50),
       failed_shards: Directory.failed_shards()

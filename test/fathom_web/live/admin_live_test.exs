@@ -6,6 +6,7 @@ defmodule FathomWeb.AdminLiveTest do
 
   alias Fathom.Admin.MetricsCollector
   alias Fathom.Directory
+  alias Fathom.Migrator
 
   # config/test.exs sets admin_auth to admin/secret.
   @auth "Basic " <> Base.encode64("admin:secret")
@@ -167,6 +168,117 @@ defmodule FathomWeb.AdminLiveTest do
       html = render_async(view, 5_000)
       assert html =~ "Fleet HEAD"
       assert html =~ "Release history"
+    end
+  end
+
+  # Expert review 2026-08-01 #26, dashboard half. The API half (`/api/migrations/status`) already
+  # reports `review_blocks`; this is the surface the human watching a frozen burndown actually
+  # looks at. Before this the page rendered "Fleet HEAD v1" with no hint that v2 was held, so the
+  # operator saw laggards that never converged and nothing explaining why.
+  describe "migrations page — review blocks" do
+    defp migrations_html(conn) do
+      {:ok, view, _html} = conn |> auth() |> live("/admin/migrations")
+
+      # Same 5s render_async timeout as the mount test above (load-induced flake, not a real wait).
+      {view, render_async(view, 5_000)}
+    end
+
+    test "no held versions ⇒ no review panel, and the tile reads zero", %{conn: conn} do
+      {:ok, _} = Migrator.release(1, "v1", ["CREATE TABLE app (id integer)"])
+
+      {_view, html} = migrations_html(conn)
+
+      assert html =~ "Held for review"
+      refute html =~ "Rollout held"
+      refute html =~ "attach_transform"
+    end
+
+    test "a held data migration shows why it is held and BOTH options", %{conn: conn} do
+      {:ok, _} = Migrator.release(1, "v1", ["CREATE TABLE app (id integer)"])
+
+      {:ok, _} =
+        Migrator.release(2, "0002_backfill", ["UPDATE app SET tier = 'gold'"], nil, true)
+
+      Migrator.set_review_reason(2, "data_migration", %{
+        "statements" => ["UPDATE app SET tier = 'gold'"]
+      })
+
+      {_view, html} = migrations_html(conn)
+
+      # HEAD is capped below the held version — the state the panel exists to explain.
+      assert html =~ "v1"
+      assert html =~ "Rollout held"
+      assert html =~ "0002_backfill"
+      assert html =~ "data_migration"
+
+      # The statement that tripped the flag, verbatim. "which statements" is the first thing an
+      # operator needs and the one thing the old `pending_review: [2]` could never tell them.
+      assert html =~ "UPDATE app SET tier"
+
+      # Both options, each with its runnable command. The panel is the decision, spelled out.
+      assert html =~ "attach_transform"
+      assert html =~ "Fathom.Migrator.attach_transform"
+      assert html =~ "approve_review"
+      assert html =~ "Fathom.Migrator.approve_review"
+    end
+
+    # A gap means the fleet is MISSING DDL, so `approve_review` is never the right move — advancing
+    # HEAD past it hides a real template/fleet divergence. `Migrator.options_for/1` already refuses
+    # to offer it; this pins that the panel does not reintroduce it in the rendering.
+    test "a migration gap offers reconcile ONLY — never approve", %{conn: conn} do
+      {:ok, _} = Migrator.release(1, "v1", ["CREATE TABLE app (id integer)"])
+
+      {:ok, _} =
+        Migrator.release(2, "0002_nonatomic", ["ALTER TABLE app ADD COLUMN t text"], nil, true)
+
+      Migrator.set_review_reason(2, "migration_gap", %{"gap" => "%{before: 9, last: 7}"})
+
+      {_view, html} = migrations_html(conn)
+
+      assert html =~ "Rollout held"
+      assert html =~ "migration_gap"
+      assert html =~ "reconcile_template"
+      assert html =~ "atomic = False"
+      # The gap detail itself, so the operator can see how far the template ran ahead.
+      assert html =~ "before: 9"
+
+      refute html =~ "approve_review"
+      refute html =~ "attach_transform"
+    end
+
+    # The upgrade path: releases captured BEFORE #26 added the reason columns carry
+    # `review_reason: nil`. `Migrator.review_block/1` re-derives the reason from the statements, so
+    # an already-frozen fleet gets the explanation the moment it upgrades — not only versions
+    # captured from here on. Without that, the operator whose fleet is ALREADY stuck (the one who
+    # most needs this panel) would still see a bare version number.
+    test "a release flagged before #26 (no stored reason) still renders a legible block", %{
+      conn: conn
+    } do
+      {:ok, _} = Migrator.release(1, "v1", ["CREATE TABLE app (id integer)"])
+      # No set_review_reason/3 call — review_reason stays nil, exactly as a pre-#26 row.
+      {:ok, _} = Migrator.release(2, "0002_legacy", ["INSERT INTO app VALUES (1)"], nil, true)
+
+      {_view, html} = migrations_html(conn)
+
+      assert html =~ "Rollout held"
+      assert html =~ "data_migration"
+      assert html =~ "INSERT INTO app VALUES (1)"
+      assert html =~ "Fathom.Migrator.approve_review"
+    end
+
+    # The panel is deliberately READ-ONLY (see the LiveView's moduledoc). `attach_transform` cannot
+    # be a button at all, and `approve_review` replays the template's literal rows onto every
+    # tenant — offering only the dangerous half of the decision would bias an operator toward it.
+    # This fails the moment someone adds a click handler here, which is the point: the reasoning
+    # lives in the moduledoc and this is the tripwire that sends them to read it.
+    test "the review panel exposes no clickable action", %{conn: conn} do
+      {:ok, _} = Migrator.release(1, "v1", ["CREATE TABLE app (id integer)"])
+      {:ok, _} = Migrator.release(2, "0002_backfill", ["UPDATE app SET tier = 'gold'"], nil, true)
+
+      {view, html} = migrations_html(conn)
+
+      assert html =~ "Rollout held"
+      refute has_element?(view, "#review-blocks [phx-click]")
     end
   end
 end
