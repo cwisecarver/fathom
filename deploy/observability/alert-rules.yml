@@ -187,6 +187,26 @@ groups:
   # ---------------------------------------------------------------------------------------------
   - name: fathom-control-plane
     rules:
+      - alert: FathomTenantBornEmpty
+        # A novel tenant was minted while :fork_from_template was ON, but the fork FAILED, so the
+        # tenant is serving with NO SCHEMA. It cannot self-heal: every ORM query fails, and the
+        # rollout can't rescue it either (`django_migrations` is created by Django's recorder in
+        # autocommit, so it belongs to no captured version — replaying v1 onto an empty file dies
+        # on `no such table: django_migrations`). That is deliberate: a born-empty tenant is a
+        # FAILED BIRTH, not a state the rollout should quietly heal.
+        #
+        # So this is a HARD OUTAGE for one tenant that produces no 5xx rate anywhere — the checkout
+        # deliberately succeeds. Nothing else will ever tell you. Any occurrence pages, and the
+        # remedy is manual: find the shard_id in the node's logs, delete the tenant, re-mint it once
+        # the fork works. `reason=no_template_snapshot` is the common one and means the prerequisite
+        # never ran — release a version, then `mix fathom.snapshot template-head`.
+        expr: sum by (reason) (increase(fathom_migrator_fork_fallback_count[1h])) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "Tenant born with NO schema — fork-from-template failed ({{ $labels.reason }})"
+          description: "A novel tenant was born empty because the template fork failed; it is serving and every ORM query against it fails, and the rollout cannot heal it. Grep the node for 'born EMPTY' to get the shard_id, then delete and re-mint that tenant. If reason=no_template_snapshot, run `mix fathom.snapshot template-head` after releasing a version."
+          runbook: docs/runbooks/operations.md#runbook-a-tenant-was-born-with-no-schema-fork-fallback
+
       - alert: FathomObanJobFailures
         # Oban failures = a stalling control plane (migrations, reconcile, rebalancer, retirement,
         # tenant delete/suspend). Often a Postgres incident.

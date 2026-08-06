@@ -179,6 +179,61 @@ config" rule.
 
 ---
 
+## Runbook: a tenant was born with no schema (fork fallback)
+
+**Symptom / trigger:** `FathomTenantBornEmpty` fires
+(`increase(fathom_migrator_fork_fallback_count[1h]) > 0`). One tenant's every request fails with a
+SQL error naming a table that does not exist — while the shard itself opens fine, the LB routes
+normally, and **no 5xx rate moves anywhere**. Node logs carry `born EMPTY`.
+
+**Background:** with `:fork_from_template` ON, a novel tenant is born by copying the retained
+`template@HEAD` snapshot. The fork is best-effort in every direction — **it never fails the
+checkout**, because a fleet whose object store blips must not stop minting tenants. So on any fork
+failure the tenant is born as an empty SQLite file and starts serving with **no schema at all**.
+
+**It cannot self-heal, and that is deliberate.** `django_migrations` is created by Django's
+migration *recorder* in autocommit, before any migration runs, so it belongs to no captured version
+— replaying v1 onto an empty file dies on `no such table: django_migrations`. Teaching replay to
+create that table was considered and **rejected** (2026-07-31): it would make an already-broken
+tenant look recoverable and hide the real fault. A born-empty tenant is a **failed birth**, not a
+rollout laggard. See `test/fathom/migrator/django_replay_test.exs`.
+
+**Diagnose:**
+1. Get the tenant id — the alert cannot carry it (`shard_id` as a Prometheus label is unbounded
+   cardinality at a million tenants), so grep the node: `born EMPTY`. The log line names the shard
+   and the failure reason.
+2. Read the `reason` label / log reason:
+   - **`no_template_snapshot`** — the common one, and a *configuration* fault rather than an
+     incident. It covers three states that all mean "there is no `template@HEAD` to fork from":
+     `:template_shard_id` is unset or not a valid shard id, HEAD is 0 (nothing captured yet), or a
+     version is released but `mix fathom.snapshot template-head` never ran. Check them in that
+     order.
+   - **`retry`, `exception`, `exit`, `error`** — a storage/Postgres problem, or a concurrent forker
+     held the lease. Transient; check the object store before re-minting.
+
+   Two outcomes deliberately do **not** alarm and will never appear here: `template_shard` (the
+   capture template opening itself — refusing to fork it onto itself is correct) and `dst_exists`
+   (a stored object already exists, so the fork correctly declined to clobber it and the shard is
+   **not** born empty — it cold-opens onto its own data).
+3. Confirm the tenant is actually empty rather than merely behind:
+   `mix fathom.shard inspect <shard_id>` (row counts). Empty ⇒ failed birth. Populated ⇒ this is a
+   *migration* problem, not a birth one — go to the rollout path instead.
+
+**Respond:**
+- **Fix the cause first, or the next tenant is born empty too.** For `no_template_snapshot`: release
+  a version, then `mix fathom.snapshot template-head`. For a storage reason: restore the object
+  store, then verify a fresh mint forks cleanly before proceeding.
+- **Then delete and re-mint the affected tenant** — `DELETE /api/tenants/:id` (or the Delete action
+  on `/admin/directory`), then let it re-mint on next traffic, or provision it explicitly with
+  `POST /api/tenants`. Deleting is safe here precisely because the tenant holds no data.
+- **Do not leave it serving.** It looks healthy to the LB, to the directory, and to the migration
+  burndown; only its own clients see the failure.
+- **If the flag is OFF**, born-empty is the *configured* behavior and does not alarm — tenants are
+  expected to be provisioned some other way. Turning `:fork_from_template` on without running
+  `mix fathom.snapshot template-head` is the misconfiguration this alert exists to catch.
+
+---
+
 ## Runbook: restore a shard from S3 (disaster-recovery drill)
 
 **Symptom / trigger:** a node was lost with un-flushed writes and you need to inspect the last

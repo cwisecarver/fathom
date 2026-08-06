@@ -343,6 +343,29 @@ defmodule Fathom.Telemetry do
           "Automated restore-drill outcomes by status (#24): ok / corrupt / schema_mismatch / sentinel / absent / error. A durable object is fathom's only copy of a cold-tail tenant — corrupt/schema_mismatch/error means it's bad or unreachable and would surface only when the tenant returns; alert on those"
       ),
 
+      # Birth failure — the tenant that exists but has NO SCHEMA.
+      #
+      # `Fathom.Shards.fork_novel/1` births a novel tenant by forking `template@HEAD`, and falls
+      # back to born-empty on ANY fork failure because a checkout must never fail over an object-
+      # store blip. A tenant that takes that fallback is BROKEN and cannot self-heal: its first ORM
+      # query fails, and the rollout can't rescue it either — `django_migrations` is created by
+      # Django's recorder in autocommit, so it belongs to no captured version and replaying v1 onto
+      # an empty file dies on `no such table: django_migrations`. That is a deliberate constraint,
+      # not a bug (a born-empty tenant is a FAILED BIRTH, and teaching replay to paper over it would
+      # make an already-broken tenant look recoverable) — which is exactly why the state has to be
+      # visible instead of healed. Only remedy is an operator deleting and re-minting it.
+      #
+      # 2026-07-31 made the fallback log loudly and emit this event; nothing ever consumed it, so
+      # "alertable" stopped one step short of an actual alert. `:reason` is a deliberately BOUNDED
+      # atom set (`Shards.fork_failure_reason/1`) — the shard_id rides event metadata for the log
+      # line and must never become a tag.
+      counter("fathom.migrator.fork_fallback.count",
+        event_name: [:fathom, :migrator, :fork_fallback],
+        tags: [:reason],
+        description:
+          "Novel tenants born EMPTY because fork-from-template failed while :fork_from_template was ON — the tenant is serving with NO schema, every ORM query fails, and the rollout CANNOT heal it. Any occurrence needs an operator to delete and re-mint that tenant; :no_template_snapshot means the `mix fathom.snapshot template-head` prerequisite never ran"
+      ),
+
       # Capacity / admission — the tenant-visible refusals.
       counter("fathom.shards.novel_rate_limited.count",
         event_name: [:fathom, :shards, :novel_rate_limited],

@@ -139,10 +139,44 @@ defmodule Fathom.TelemetryTest do
           [:fathom, :durability, :dirty_shards],
           [:fathom, :durability, :oldest_age_ms],
           # control-plane stall
-          [:fathom, :oban, :job, :exception, :count]
+          [:fathom, :oban, :job, :exception, :count],
+          # birth failure — a tenant serving with no schema (FathomTenantBornEmpty)
+          [:fathom, :migrator, :fork_fallback, :count]
         ] do
       assert name in names, "alert-rule metric #{inspect(name)} is not exported by metrics/0"
     end
+  end
+
+  # A novel tenant whose template fork fails is born EMPTY: it serves, and every ORM query against
+  # it fails, and the rollout cannot heal it (that last part is deliberate — see
+  # django_replay_test.exs). The checkout deliberately SUCCEEDS, so this hard per-tenant outage
+  # produces no 5xx rate anywhere and nothing else will ever surface it.
+  #
+  # `Shards.fork_novel/1` has logged loudly and emitted this event since 2026-07-31, but nothing
+  # consumed it — no metric, no alert rule — so "alertable" stopped one step short of an alert.
+  # These pin the whole chain: the event Shards actually emits, the tag the alert groups by, and
+  # the bounded-cardinality rule that keeps shard_id OUT of the tags.
+  describe "fork_fallback (born-empty tenant)" do
+    test "the metric is tagged by reason only — shard_id must never become a tag" do
+      [metric] =
+        Enum.filter(
+          Fathom.Telemetry.metrics(),
+          &(&1.name == [:fathom, :migrator, :fork_fallback, :count])
+        )
+
+      # One series per failure reason. `Shards.fork_failure_reason/1` exists precisely to keep this
+      # a bounded atom set: a `{:retry, <storage error>}` carrying an arbitrary term would be
+      # unbounded cardinality, and shard_id at a million tenants is cardinality death.
+      assert metric.tags == [:reason]
+      refute :shard_id in metric.tags
+      assert metric.event_name == [:fathom, :migrator, :fork_fallback]
+    end
+
+    # Deliberately NOT re-executing the event by hand here: that would only prove the shape this
+    # test file writes, and would keep passing if `Shards` renamed the key tomorrow. The
+    # metric↔emission contract is asserted where the REAL path runs — fork_test.exs drives an
+    # actual failed birth through `ShardExecutor.open/1` and checks the emitted metadata against
+    # `metrics/0`'s declared tags.
   end
 
   test "the Oban failure metric is tagged by queue (low-cardinality) and fires on a real event" do

@@ -404,9 +404,30 @@ defmodule Fathom.Migrator.ForkTest do
           :ok = ShardExecutor.close(conn)
         end)
 
-      assert_receive {:fork_fallback, %{shard_id: ^tenant, reason: :no_template_snapshot}}
+      assert_receive {:fork_fallback, %{shard_id: ^tenant, reason: :no_template_snapshot} = meta}
       assert log =~ "born EMPTY"
       assert log =~ "mix fathom.snapshot template-head"
+
+      # The metric↔emission contract (2026-08-06). This event carried the whole "a tenant is
+      # serving with NO schema" signal for five days while NOTHING consumed it — no
+      # `Telemetry.Metrics` definition, no Prometheus series, no alert rule — so it was loud in a
+      # log nobody tails and invisible everywhere else. `fathom.migrator.fork_fallback.count` +
+      # `FathomTenantBornEmpty` close that, and this is the seam where they can silently come
+      # apart again: `Telemetry.Metrics` does not validate tags against emissions, so renaming
+      # `:reason` here would leave the metric defined, the alert rule intact, and every series
+      # tagless — an alert that groups `by (reason)` and reports nothing. Asserted against the
+      # REAL emission, not a hand-executed one.
+      [metric] =
+        Enum.filter(
+          Fathom.Telemetry.metrics(),
+          &(&1.name == [:fathom, :migrator, :fork_fallback, :count])
+        )
+
+      for tag <- metric.tags do
+        assert Map.has_key?(meta, tag),
+               "metrics/0 tags fork_fallback by #{inspect(tag)}, but the real emission's metadata " <>
+                 "is #{inspect(Map.keys(meta))} — the Prometheus series would be tagless"
+      end
     end
 
     test "a SUCCESSFUL fork is silent — no fallback alarm on the healthy path",
