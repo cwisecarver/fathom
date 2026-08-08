@@ -97,9 +97,34 @@ them. Follower copies are cheap on the axis that matters — a warm-cached shard
 commit ships frames to N nodes. N is therefore a *network* decision, not a storage one, and it
 should be configurable per deployment rather than hardcoded to Waterpark's 4.
 
-**Recommended default: `N = 4, Q = 2`** where the node count allows it, falling back to `N = 2,
-Q = 1` on a 3-node cluster. Both configurable; **Q must be validated `< N`** at boot, so nobody can
-configure away the fault tolerance by accident.
+### Matching Waterpark exactly means FIVE nodes, not four
+
+Easy off-by-one, and it costs half the fault tolerance. Waterpark runs **1 primary + 4 read-only
+followers per actor** — "one read-only follower process at each data center", four DCs, and the ack
+rule quotes "two of its **four** read-only followers". `N` counts **followers**, so `N = 4` needs
+**5 nodes to hold one shard**, on a cluster of 8.
+
+A 4-node cluster is therefore `N = 3, Q = 2`, which tolerates **1** follower loss where Waterpark
+tolerates **2**.
+
+| Cluster nodes | N (followers) | Q | Tolerates | Waterpark parity |
+|---|---|---|---|---|
+| 3 | 2 | 1 | 1 loss | no |
+| 4 | 3 | 2 | 1 loss | no — one follower short |
+| **5** | **4** | **2** | **2 losses** | **yes** |
+| 8 | 4 | 2 | 2 losses | yes (Waterpark's own size) |
+
+**Placement is the actual spec, more than the count.** Waterpark's guarantee is not "4 followers",
+it is *one follower per failure domain* — that is what makes a 2-of-4 ack survive losing a whole
+data centre. Four followers packed into one AZ satisfy `N = 4` and give **nothing** against AZ loss,
+which is precisely the failure S3 was covering before A2. So placement must be a **spread
+constraint over failure domains**, not a free choice of any 4 peers, and a deployment that cannot
+satisfy the spread should say so loudly at boot rather than silently degrade to co-located replicas.
+
+**Defaults: `N = 4, Q = 2`, minimum cluster size 5**, one follower per failure domain. Fall back to
+`N = 2, Q = 1` only on a 3-node cluster, and treat that as a development topology, not a production
+one. Boot must validate **`Q < N`** (else the fault tolerance is configured away) and
+**`cluster_size ≥ N + 1`** (else the shard cannot place its followers at all).
 
 ## The fathom mapping
 
