@@ -270,13 +270,20 @@ only cross-node coordination" rule is lifted; see
 [cluster-architecture](cluster-architecture.md#amendment-2026-08-08--the-s3-only-rule-is-lifted-for-a2).
 Two gates remain, in order:
 
-1. **A frame seam is proven to exist** — reading and applying a single committed frame between two
-   processes. Cheapest experiment that kills the premise, and the one that decides which option is
-   even available. **Partially cleared 2026-08-08**: the seam exists on the link surface (option 1
-   above — `sqlite3_wal_hook` is reachable from the loadable extension fathom already ships). What
-   remains is the runtime half — register the hook in `fathom_udf`, drive a tenant commit through
-   `Fathom.Shard.Connection`, and assert the callback fired with the expected page count. Until
-   that assertion runs, the seam is *plausible*, not proven.
+1. ~~A frame seam is proven to exist.~~ **CLEARED 2026-08-08 — the hook fires.**
+   `native/fathom_udf/src/wal.rs` registers `sqlite3_wal_hook` from the loadable extension, and
+   `test/fathom/shard/wal_hook_test.exs` drives a real commit through `Fathom.Shard.Connection` and
+   asserts the callback ran with a non-zero page count. Option 1 is the one that was available, and
+   it needed no NIF, no exqlite fork, and no new build step.
+
+   It also produced the constraint above: the hook **takes over checkpointing**, verified to
+   discriminate (with the takeover disabled the main database is 4096 bytes after 25 MB of writes —
+   every page still in the WAL). Notify-plus-checkpoint-control is therefore the actual shape of the
+   seam, and shipping frames still has to read the `-wal` file itself.
+
+   What is NOT yet proven, and is the next piece of work: *applying* a frame on a follower. The hook
+   proves frames can be observed and their truncation controlled at the source; the receiving half
+   has its own seam question.
 2. **The ack-latency cost is measured** against the current per-request round trip (`hrana_rt_us`),
    because a quorum ack puts a network hop on the write path that does not exist today.
 
