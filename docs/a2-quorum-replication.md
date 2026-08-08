@@ -70,24 +70,51 @@ another node's shard and never serves. A2 is the same component with the data pa
 | failover pulls the object, loses the tail | failover promotes a follower, loses nothing |
 | no effect on ack latency | commit waits for **≥2 follower acks** |
 
-## The blocker
+## The blocker — and why it is much smaller than it looked
 
 **`exqlite` 0.37.0 exposes no WAL-frame API.** Verified 2026-08-08 against `deps/exqlite/lib/`: the
 only WAL-related surface in the entire library is `Exqlite.Pragma.wal_auto_check_point/1`, a
-configuration pragma. There is no `sqlite3_wal_hook`, no frame read/apply, no backup API, no session
-hook. **There is no seam to ship a frame from.**
+configuration pragma. No hook, no frame read/apply, no backup API.
 
-This is the same class of gap as the UDF work (expert review #19), where the finding's recommended
-`create_function` did not exist either and the fix was a loadable extension via
-`enable_load_extension/2`. Establish the seam exists **before** designing against it.
+**That framing was wrong, though — exqlite does not have to expose it.** Same day, same reasoning as
+the UDF work (expert review #19): exqlite had no `create_function` either, and the fix was to stop
+asking exqlite and use a **loadable extension**. Fathom already ships one (`native/fathom_udf`,
+loaded per connection by `Fathom.Shard.Extension`), and an extension receives a live
+`rusqlite::Connection` wrapping the host's `sqlite3*`.
+
+Verified against the vendored sources:
+
+- **`sqlite3_wal_hook` is in `sqlite3_api_routines`** — the loadable-extension pointer table, not
+  just the normal link surface (`libsqlite3-sys-0.38.1/bindgen-bindings/bindgen_3.34.1_ext.rs:2325`,
+  resolved at `:6813` via `if let Some(fun) = (*p_api).wal_hook`). So it is reachable from an
+  extension, which is the only place fathom can reach SQLite's C API today.
+- **rusqlite wraps it safely** — `Connection::wal_hook(Option<fn(&Wal, c_int) -> Result<()>>)`
+  (`rusqlite-0.40.1/src/hooks/mod.rs:398`), behind feature **`hooks = []`** — no additional
+  dependencies, a one-line `Cargo.toml` change.
+- **`Wal` carries `db` + `db_name` and can `checkpoint`/`checkpoint_v2`**, so the hook can also
+  control when the WAL is truncated — which the shipper must, or frames vanish before they ship.
+
+**What the hook gives and does not give.** It is a *notification*: "a commit landed; the WAL now
+holds N pages." It does **not** hand over frame bytes. The shipper reads the `-wal` file from its
+last shipped offset, which is how litestream works, and is sufficient — but it means the design
+must own WAL-truncation ordering, because a checkpoint that runs before frames ship loses them.
+
+**Still unverified — this is gate 1, below.** That the hook actually *fires at runtime* through the
+SQLite that exqlite bundles, with the extension loaded the way `Shard.Extension` loads it. The
+evidence above is link-surface evidence, not a running callback. Treat a promising-looking seam the
+same way AGENTS.md says to treat a suspiciously good benchmark: unproven until it runs.
 
 ### Options for clearing it
 
 Effort labels are estimates, not measurements.
 
-1. **Write the NIF ourselves** (`fathom_native`, or patch exqlite). Register `sqlite3_wal_hook`,
-   read committed frames out of the `-wal` file, apply them on the follower. Most control, most
-   work; puts fathom on a forked or extended DB driver. **Large.**
+1. **Register the hook from the existing loadable extension** — `native/fathom_udf` + feature
+   `hooks`, then read committed frames out of the `-wal` file and apply them on the follower.
+   **This is now the leading option and it is NOT large**: no NIF, no exqlite fork, no new build
+   step, and the load/enable/disable security sequence `Shard.Extension` already performs is
+   unchanged. Was scoped as "write the NIF ourselves / patch exqlite, **Large**" before the
+   extension route was checked — recorded because the obvious-looking answer (fork the driver) is
+   the expensive one and someone will propose it again.
 2. **Adopt libSQL's engine for replication.** libSQL already does frame-level replication.
    `Fathom.Shard.Connection` is documented as the single swap-point for exactly this
    (see AGENTS.md). Trades "write it" for "inherit it", but it is an engine swap on the data path
@@ -104,15 +131,23 @@ Effort labels are estimates, not measurements.
 
 ## The architectural cost
 
-A2 puts tenant **data** on a node-to-node path. Fathom's cluster model is deliberately
+A2 puts tenant **data** on a node-to-node path. Fathom's cluster model was deliberately
 LB-keyspace-partition plus an S3 lease, with **S3 as the only cross-node coordination** — no BEAM
-cluster, no ring, no mailroom (see [cluster-architecture](cluster-architecture.md)). A quorum ack
-needs cluster membership, follower liveness, and a promote protocol. That is a reversal of the
-central decision, not an addition to it.
+cluster, no ring, no mailroom. A quorum ack needs cluster membership, follower liveness, and a
+promote protocol: a reversal of the central decision, not an addition to it.
 
-So the honest framing of the decision is **not** "should we add WAL streaming" but **"should fathom
-become a BEAM cluster."** Waterpark is the evidence that the clustered answer works at scale in a
-domain where losing a write is unacceptable.
+**That reversal was accepted on 2026-08-08** — see
+[cluster-architecture](cluster-architecture.md#amendment-2026-08-08--the-s3-only-rule-is-lifted-for-a2).
+The framing was never "should we add WAL streaming" but **"should fathom become a BEAM cluster,"**
+and the answer is now yes, because the S3-only rule made node-loss RPO irreducible and Waterpark is
+the evidence the clustered answer works at scale where losing a write is unacceptable.
+
+The cost is accepted, not eliminated. It is still the largest single change to fathom's model, and
+it is not cheaply reversible — which is why the gates below survive the decision.
+
+**Explicitly still rejected:** the BEAM-forwarding *mailroom* and the `base_url` *redirect*
+(cluster-architecture "Why not the alternatives"). Those fail on Filo's entry-node-local stream
+batons, not on the S3 rule. A2 replicates **committed data**; it does not move **streams**.
 
 ## What it would and would not improve
 
@@ -126,13 +161,21 @@ domain where losing a write is unacceptable.
 
 ## Decision gate
 
-Do not start until, in order:
+~~3. The BEAM-cluster reversal is accepted explicitly.~~ **Accepted 2026-08-08** — the "S3 is the
+only cross-node coordination" rule is lifted; see
+[cluster-architecture](cluster-architecture.md#amendment-2026-08-08--the-s3-only-rule-is-lifted-for-a2).
+Two gates remain, in order:
 
-1. **A frame seam is proven to exist** — option 1, 2 or 3 demonstrated on a branch, reading and
-   applying one committed frame between two processes. Cheapest experiment that kills the premise.
-2. **The ack-latency cost is measured** against the current per-request round trip.
-3. **The BEAM-cluster reversal is accepted explicitly**, because everything downstream depends on
-   it and it is not reversible cheaply.
+1. **A frame seam is proven to exist** — reading and applying a single committed frame between two
+   processes. Cheapest experiment that kills the premise, and the one that decides which option is
+   even available. **Partially cleared 2026-08-08**: the seam exists on the link surface (option 1
+   above — `sqlite3_wal_hook` is reachable from the loadable extension fathom already ships). What
+   remains is the runtime half — register the hook in `fathom_udf`, drive a tenant commit through
+   `Fathom.Shard.Connection`, and assert the callback fired with the expected page count. Until
+   that assertion runs, the seam is *plausible*, not proven.
+2. **The ack-latency cost is measured** against the current per-request round trip (`hrana_rt_us`),
+   because a quorum ack puts a network hop on the write path that does not exist today.
 
-Until then the position is: EBS covers reboot, S3 covers hardware and AZ loss, the 300 s interval
-bounds the exposure between them, and the quarantine keeps a diverged copy recoverable.
+Until both clear, the standing position holds: EBS covers reboot, S3 covers hardware and AZ loss,
+the 300 s interval bounds the exposure between them, and the quarantine keeps a diverged copy
+recoverable.
