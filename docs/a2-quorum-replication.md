@@ -172,6 +172,42 @@ SQLite that exqlite bundles, with the extension loaded the way `Shard.Extension`
 evidence above is link-surface evidence, not a running callback. Treat a promising-looking seam the
 same way AGENTS.md says to treat a suspiciously good benchmark: unproven until it runs.
 
+### The trap: registering the hook DISABLES `wal_autocheckpoint`
+
+`sqlite3_wal_hook` and `wal_autocheckpoint` are **the same slot**. rusqlite says so directly
+(`rusqlite-0.40.1/src/hooks/mod.rs:396`): *"the `sqlite3_wal_autocheckpoint()` interface and the
+`wal_autocheckpoint` pragma both invoke `sqlite3_wal_hook()` and will overwrite any prior
+`sqlite3_wal_hook()` settings."* Auto-checkpointing **is** a built-in WAL hook; registering ours
+evicts it.
+
+Both orderings are wrong, and fathom is currently in the worse one:
+
+- **Pragma after hook** → the pragma silently evicts our hook. A2 quietly ships nothing; the shard
+  looks replicated and is not.
+- **Hook after pragma** → our hook evicts auto-checkpointing. **The WAL grows without bound.**
+
+`Fathom.Shard.Connection.configure_readwrite/3` runs `configure/1` first
+(`lib/fathom/shard/connection.ex:79`, which sets `PRAGMA wal_autocheckpoint=4000` at `:196`) and
+`load_extension/1` second (`:80`). So a hook registered naïvely from `fathom_udf` lands in the
+**second** case — unbounded WAL growth on every tenant connection, presenting as the disk-fill
+failure that expert review #36 built `FathomDiskFillingUp` for, with the diagnostic pointing at
+storage rather than at this.
+
+That threshold is not a default to be casually displaced: it was deliberately raised from SQLite's
+1000 frames to 4000 by expert review 2026-07-24 #4, because an autocheckpoint runs **inline inside
+the committing tenant's query**.
+
+**So the A2 hook must take over checkpointing, not merely observe.** This is why
+`Wal::checkpoint_v2(CheckpointMode)` is handed to the callback — the design falls out of the
+constraint. And it is load-bearing for A2 beyond replacing what it displaced: a checkpoint
+**truncates the WAL**, so checkpointing before frames ship destroys exactly the data being
+replicated. The hook's real rule is therefore *checkpoint only what has already been acked by the
+write quorum*, which makes WAL truncation a **downstream consequence of replication progress**
+rather than an independent timer.
+
+Anyone implementing this must also assert the negative: a test that the WAL still gets checkpointed
+with the hook installed. The failure is silent, slow, and looks like someone else's bug.
+
 ### Options for clearing it
 
 Effort labels are estimates, not measurements.
