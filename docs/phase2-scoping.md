@@ -86,6 +86,10 @@ cold-open-from-S3. The fork is how warm:
   tensions "S3 is the only coordination." High infra risk, big. Its only win over A1 is
   RPO (per-frame vs per-flush) — and RPO is already tunable via the flush interval. **Not
   worth the risk/model-change now.**
+  **Scoped in full 2026-08-08 → [a2-quorum-replication](a2-quorum-replication.md)**: the
+  Waterpark quorum shape (ack after ≥2 follower confirms), why CRDT/OT is the wrong tool here,
+  and the **verified blocker** — exqlite 0.37.0 exposes no WAL-frame API at all, so there is no
+  seam to ship a frame from. Blocked on a dependency, not on effort.
 
 **Verdict:** A1 is the highest value-per-risk Phase-2 item — a real RTO win, additive,
 model-consistent, tractable, reusing infra already built.

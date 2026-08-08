@@ -92,6 +92,9 @@ what actually shipped (some plan assumptions were superseded).
   *Plan.*
 - **[phase2-scoping.md](phase2-scoping.md)** — Phase 2 scoping: warm standby (A), rebalancing (B),
   locality/affinity (C). *Scoping.*
+- **[a2-quorum-replication.md](a2-quorum-replication.md)** — Phase 2 A2 in full: replicate-before-ack
+  (the Waterpark quorum shape) as the answer to node-loss RPO, why CRDT/OT cannot work over opaque
+  tenant SQL, and the verified blocker (exqlite exposes no WAL-frame API). *Design only — NOT built.*
 
 ## Benchmarking
 

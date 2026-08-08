@@ -237,6 +237,67 @@ These are not reproduced faithfully on purpose. They are Python-library behaviou
 intended Django semantics, and matching them would mean shipping a crash. If you need bit-exact
 parity including the crashes, note it — it is a change to `aggregates.rs`, not a redesign.
 
+## Write chattiness — what actually costs you money
+
+A flush uploads the **whole** shard object, but it is **write-gated**: a clean shard never PUTs.
+So your S3 bill tracks *how many distinct flush windows contain at least one write*, not query
+volume and not shard count. Bytes are free (S3 ingress), so a 20 MB shard and a 20 KB shard cost
+the same per flush.
+
+**Measured against real Django 5.0.6** with the stock `startproject` middleware, counting rows
+actually changed per request (the same `sqlite3_changes() > 0` signal fathom uses — see
+`Fathom.ShardExecutor.wrote?/2`):
+
+| Request | Dirties the shard? |
+|---|---|
+| Anonymous page view | no — issues **no queries at all** |
+| Login | **yes** — 3 rows (session insert, `last_login`, session update) |
+| Authenticated page view (×10) | **no — 0 of 10** |
+| A POST that writes your own model | yes — 1 row |
+| A view that assigns to `request.session[...]` | yes — 1 row |
+| Logout | yes — 1 row |
+
+**The headline: a logged-in user reading pages writes nothing.** They can browse for an hour and
+the shard never uploads. So the default configuration is already cheap, and the cost questions are
+entirely about which *extra* writes an app adds.
+
+Three things flip it from cheap to expensive:
+
+- **`SESSION_SAVE_EVERY_REQUEST = True`** — measured **10 of 10** page views dirty the shard. This
+  single flag is the difference between quiet and chatty; it is ~2.6× the PUT bill for nothing.
+- **Touching `last_login` (or any per-user timestamp) on every request.** Django itself only writes
+  it at login. An app that refreshes it per request makes *every* page view a write — an 8-byte
+  timestamp that triggers a full-object upload, a **~2.6 million×** write amplification on a 20 MB
+  shard. Throttle it:
+
+  ```python
+  # Only refresh a per-request timestamp when it is actually stale. One `if` here is worth
+  # more than any amount of flush-interval tuning: fathom's cost is per dirty WINDOW, and an
+  # unthrottled timestamp guarantees every window is dirty.
+  from django.utils import timezone
+  from datetime import timedelta
+
+  STALE_AFTER = timedelta(minutes=10)
+
+  def touch_last_login(user):
+      if user.last_login is None or timezone.now() - user.last_login > STALE_AFTER:
+          user.last_login = timezone.now()
+          user.save(update_fields=["last_login"])
+  ```
+
+  If your shard is one user (or one household), consider dropping the column entirely and reading
+  `last_active_at` from fathom's own directory instead — `Fathom.Directory.Recorder` already
+  records it per checkout, coalesced in ETS and batch-upserted off the hot path, so it costs you
+  nothing. See [directory](directory.md).
+- **Moving sessions out of the tenant DB** (`SESSION_ENGINE` = `signed_cookies` or `cache`) drops
+  logout and session-touching views to **zero** writes; only login and genuine app writes remain.
+
+**Do NOT reach for the flush interval first.** Once per-request writes are throttled, an app's
+writes are sparse enough that each one lands in its own window regardless of cadence — 5 s, 30 s
+and 60 s all cost the same. The interval only starts saving money once it approaches a session's
+length, which is why the deployment default is 300 s. Details in
+[durability](durability.md), "Cost — the flush rate the interval buys".
+
 ## Request latency & keeping tenants warm
 
 fathom is bottomless: a tenant that's been idle is flushed to S3 and dropped, so its **first**

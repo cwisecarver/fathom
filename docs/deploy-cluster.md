@@ -155,6 +155,45 @@ Nodes are stateless beyond their **local scratch** (the pulled shard files under
 `:shard_data_dir`) and the **shared S3 bucket**. A node can be added, killed, or replaced at
 will; correctness is held by S3 (durability) + the lease (single-writer).
 
+### Node disk (AWS): put `:shard_data_dir` on EBS, not instance store
+
+The local file is not merely scratch — it is **authoritative on wake**. A coordinator that finds a
+present local copy skips the S3 pull entirely and treats it as holding un-flushed writes
+(`lib/fathom/shard.ex:7`, `:324`). So whether a restart loses data is decided by whether the disk
+survived it.
+
+- **Use an EBS-backed family** — `m7i`, `c7i`, `r7i`, `m7g`, `t4g` and friends. Put
+  `:shard_data_dir` on a `gp3` data volume with **`DeleteOnTermination=false`**.
+- **Avoid instance store for `:shard_data_dir`.** Families with a `d` in the name (`m7gd`,
+  `c6id`, `i4i`) carry ephemeral NVMe: it survives a reboot but is **destroyed on stop/start and
+  on terminate**. It is fine for the warm-follower cache (which is re-pullable by construction),
+  not for the live data dir.
+
+**What this buys:** a reboot, an OS patch, or a redeploy becomes **lossless** — the returning node
+re-adopts its own file and flushes the un-flushed tail up. This holds *regardless of
+`:shard_flush_interval_ms`*, which is why the 300 s deployment default is not as exposed as it
+sounds: the interval only governs the case where the shard comes back up **somewhere else**.
+
+**The catch:** the local copy is authoritative only if its lineage still matches the stored object.
+If the node was down long enough for a survivor to steal the lease and write, the returning node's
+file is a stale fork — fathom **quarantines** it and re-pulls (`lib/fathom/shard.ex:326`, `:685`).
+So the reboot has to finish before the LB re-homes the shard; tune nginx's failover window against
+your measured reboot time, not against a guess.
+
+**What EBS does NOT buy, and why S3 stays the durability substrate:**
+
+- EBS is **single-attach and AZ-locked**. The survivor that picks up the shard is usually in a
+  different AZ and can never mount that volume. Durable-but-unreachable costs you the same as lost.
+- Re-attach orchestration (detect death → force-detach → attach → mount) takes minutes and pins
+  every shard to one AZ, fighting the consistent-hash placement the whole design rests on.
+- **`gp3` is 99.8–99.9% annual durability** (1–2 volumes lost per thousand per year) against S3's
+  eleven nines. EBS is not a durability substrate on its own.
+- An AZ failure takes EBS with it. Only S3 survives that.
+
+Two dead ends, named so nobody spends a week on them: **io2 Multi-Attach** allows 16 attachments
+but requires a cluster-aware filesystem — SQLite on shared block storage corrupts. **EFS/NFS**
+cannot host a WAL-mode SQLite file safely (`-shm` shared memory + NFS locking).
+
 ## The load balancer
 
 Start from [`deploy/lb/fathom.nginx.conf`](../deploy/lb/fathom.nginx.conf). The
@@ -240,7 +279,8 @@ intra-region and billed on egress):
 - **Durability flushes:** 1 PUT per *dirty* shard per `:shard_flush_interval_ms`
   (write-gated — clean shards skip it). Cost tracks write volume, not open-shard count.
   Ceiling for a *continuously*-write-active shard is `2.592e6 / interval_s` PUT/month ≈
-  **$2.59/shard/month at the 5 s default** (~$12.96 at 1 s); amortized per write it is
+  **$0.04/shard/month at the 300 s deployment default**, $2.59 at the 5 s library default
+  (~$12.96 at 1 s); amortized per write it is
   `$5 / (rate × interval)` per million, so a busy shard is ~a cent per million writes and the
   worst case — one write per interval — is the full $5.00/M. Breakdown in
   [durability](durability.md), "Cost — the flush rate the interval buys".

@@ -233,8 +233,31 @@ if ttl = System.get_env("SHARD_LEASE_TTL_MS") do
 end
 
 # Periodic durability-flush cadence and idle (flush+drop+stop) threshold, ms.
-if ms = System.get_env("SHARD_FLUSH_INTERVAL_MS") do
-  config :fathom, :shard_flush_interval_ms, String.to_integer(ms)
+#
+# The DEPLOYMENT default is 300 s, deliberately 60× looser than the library default
+# (`Fathom.Shard.@default_flush_interval_ms`, 5 s). Cost analysis 2026-08-07: PUT count is
+# driven by how OFTEN a dirty shard uploads, not by how much it uploads (S3 ingress bytes are
+# free), and a shard's writes are sparse enough that 5 s / 30 s / 60 s all cost the SAME —
+# each write lands in its own flush window regardless. The interval only starts saving money
+# once it approaches the session length, so 300 s is the first setting that actually reduces
+# the bill (measured ~3× fewer PUTs; ~$1,200/mo at 1M DAU).
+#
+# 300 s and NOT 0 (`idle-only`), which costs exactly the same: with the periodic flush disabled
+# a CONTINUOUSLY ACTIVE shard never flushes at all, so the busiest tenants get an unbounded
+# loss window — the worst durability for the most valuable data. 300 s keeps it bounded.
+#
+# The library default stays 5 s: this repo is public, and a stranger embedding Fathom should
+# get the safe RPO, not this deployment's cost tradeoff. Prod-gated for the same reason the
+# test suite must keep the tight default — several tests drive a real flush and would other-
+# wise wait 5 minutes for it.
+if config_env() == :prod do
+  config :fathom,
+         :shard_flush_interval_ms,
+         String.to_integer(System.get_env("SHARD_FLUSH_INTERVAL_MS") || "300000")
+else
+  if ms = System.get_env("SHARD_FLUSH_INTERVAL_MS") do
+    config :fathom, :shard_flush_interval_ms, String.to_integer(ms)
+  end
 end
 
 if ms = System.get_env("SHARD_IDLE_MS") do

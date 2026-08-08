@@ -234,12 +234,16 @@ the bucket underneath the fathom-managed snapshots above:
 - **`synchronous`** — `FULL` (default): per-commit fsync, local durability to a process crash.
   `NORMAL` trades that for fewer fsyncs (was the old default; FULL is ~free here, so there's little
   reason to weaken it).
-- **`:shard_flush_interval_ms`** — the RPO knob for hot shards (default **5 s** ⇒ ~5 s node-loss
-  window for busy shards). Smaller = tighter loss window, more PUTs. `0` = idle-only (unbounded
-  window for a never-idle shard). **Keep the alert thresholds coupled:** `FathomUnflushedAgeHigh`
-  (~6×) and `FathomManyDirtyShards` (~12×) in [`alert-rules.yml`](../deploy/observability/alert-rules.yml)
-  are sized to this default — change one, retune the others, or a real S3 outage blows the intended
-  RPO by that multiple before paging.
+- **`:shard_flush_interval_ms`** — the RPO knob for hot shards. **Library default 5 s; deployment
+  default 300 s** (`config/runtime.exs`, prod-gated) ⇒ ~300 s node-loss window for busy shards.
+  Smaller = tighter loss window, more PUTs. `0` = idle-only (unbounded window for a never-idle
+  shard) — **never worth choosing over 300 s, which costs the same** and bounds the loss; see the
+  cost section above. **Keep the alert thresholds coupled:** `FathomUnflushedAgeHigh` (~2×) and
+  `FathomManyDirtyShards` (~4×) in [`alert-rules.yml`](../deploy/observability/alert-rules.yml)
+  are sized to the **deployment** interval — change one, retune the others, or a real S3 outage
+  blows the intended RPO by that multiple before paging. (Both bars sat below one normal 300 s
+  cadence until 2026-08-08 and would have fired continuously; the multiple dropped from 6×/12×
+  because it exists to clear a flush's own ~6 ms jitter, which did not grow with the interval.)
 - **write-gating is automatic** — clean shards never flush, so tightening the interval costs PUTs
   only on shards actually being written.
 
