@@ -321,10 +321,47 @@ Consequences A2 must carry:
    | all four healthy, ack after `fdatasync` | **398 µs** | 469 µs |
    | **two of four stragglers (+5 ms each)**, ack from RAM | **185 µs** | **5 994 µs** |
 
-   **These are a FLOOR — loopback, no inter-node latency.** Deployment cost is
-   `floor + one RTT to the 2nd-fastest follower` (same-AZ ~0.1–0.25 ms, cross-AZ ~0.5–1.5 ms).
-   Sweep that term on the rig with toxiproxy the way `chaos.sh latency-cost` already does for S3;
-   do not guess it.
+   **RTT sweep — done 2026-08-08, toxiproxy, real TCP.** The loopback floor above plus injected
+   one-way latency. (Toxiproxy itself adds ~450 µs of proxy hop: the 0 ms cell reads ~550 µs where
+   in-process loopback read 96 µs, so read the RTT-proportional part, not the absolute.)
+
+   **Uniform placement — all four followers at the same latency:**
+
+   | one-way | RTT | 2-of-4 | 4-of-4 |
+   |---|---|---|---|
+   | 0 ms | 0 | 557 µs | 586 µs |
+   | 10 ms | 20 ms | 26.1 ms | 25.5 ms |
+   | 30 ms | 60 ms | 73.2 ms | 73.4 ms |
+   | 60 ms | 120 ms | 131.7 ms | 131.4 ms |
+
+   **2-of-4 buys nothing here — it tracks 4-of-4 at every latency.** Same finding as the loopback
+   straggler result, in its other form: a quorum skips the *slowest* replicas, so when every replica
+   is equally slow there is nothing to skip. Spreading four followers evenly across equidistant
+   failure domains gets you redundancy and **no latency benefit at all**.
+
+   **Asymmetric placement — two near, two far:**
+
+   | near | far | 2-of-4 | 4-of-4 | cost of `Q=N` |
+   |---|---|---|---|---|
+   | 0 ms | 0 ms | 520 µs | 549 µs | 1.06× |
+   | 0 ms | 30 ms | **1.5 ms** | 72.4 ms | **49×** |
+   | 0 ms | 60 ms | **1.6 ms** | 134.0 ms | **82×** |
+   | 10 ms | 60 ms | 26.1 ms | 131.0 ms | 5.0× |
+
+   **This is the result that should drive placement.** With two near followers, a commit acks in
+   ~1.5 ms while the far pair — 60 ms away — catch up asynchronously, and the shard still holds
+   five copies across distant failure domains. Force `Q = N` on the same topology and every commit
+   pays 134 ms instead: **82× worse for the same replicas.**
+
+   **The placement rule, which "one follower per failure domain" alone does not give you:** a
+   **quorum's worth of followers must be near the primary**, or the quorum has no latency benefit
+   and only buys failure tolerance. With `Q = 2` that means **two near followers, not one**.
+
+   **And the tension to resolve deliberately:** near-for-latency pulls against spread-for-failure.
+   If both near followers sit in the *primary's own* AZ, one AZ failure takes 3 of the 5 copies and
+   leaves exactly `Q` behind with zero slack. The shape that satisfies both is **two followers in a
+   nearby but different AZ (~0.5–1.5 ms) and two in another region** — sub-2 ms acks that still
+   survive losing any single AZ, including the primary's.
 
    Three results, in order of how much they should change the design:
 
