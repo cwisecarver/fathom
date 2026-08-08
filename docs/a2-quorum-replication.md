@@ -281,9 +281,37 @@ Two gates remain, in order:
    every page still in the WAL). Notify-plus-checkpoint-control is therefore the actual shape of the
    seam, and shipping frames still has to read the `-wal` file itself.
 
-   What is NOT yet proven, and is the next piece of work: *applying* a frame on a follower. The hook
-   proves frames can be observed and their truncation controlled at the source; the receiving half
-   has its own seam question.
+   **The receive half is cleared too (same day).** `test/fathom/shard/wal_apply_test.exs` ships two
+   successive commits to a follower as **byte-range deltas appended to its `-wal`** and the follower
+   reads all three rows. **Incremental WAL shipping works on stock SQLite** — no
+   `libsql_wal_insert_frame`, no engine swap, no NIF. The shipper is literally "read `-wal` from the
+   last shipped offset, send the bytes, append them on the follower"; nothing rewrites headers or
+   recomputes checksums. Verified to discriminate: with the append suppressed the follower sees only
+   `[["first"]]`. The follower's main `.db` is asserted byte-identical to the base copy throughout,
+   so every row after the first demonstrably arrived as WAL bytes and not through the file copy.
+
+   **So options 2 and 3 below are no longer needed for the seam.** Option 1 covers both directions.
+
+### A follower must not casually open and close its database
+
+Discovered while building the receive test, and it is a design constraint rather than a test
+artifact. A **clean close checkpoints**: measured, one open-and-close of the follower moved its
+`.db` from **4096 → 8192 bytes** and **deleted** its `-wal`. The next delta then landed on a file
+whose lineage no longer matched the offsets it was computed against, and the test failed with a
+message confidently blaming stock SQLite — the wrong conclusion, whose action would have been
+"adopt libSQL".
+
+Consequences A2 must carry:
+
+- A follower is a **passive recipient of bytes** until promotion. It does not hold an open
+  connection to the shard it is following, and any tooling that peeks at a follower's database
+  (a health check, an operator running `sqlite3` on it, a restore drill) **desynchronizes it** and
+  forces a full re-seed.
+- **Promotion** is the first legitimate open, and its first clean close will checkpoint — so the
+  promote path must treat that as expected and re-establish offsets rather than assume continuity.
+- The follower's WAL and the primary's are a **byte-offset relationship**. Anything that rewrites
+  either side independently breaks it, which is the same reason the primary may only checkpoint
+  what the quorum has acked.
 2. **The ack-latency cost is measured** against the current per-request round trip (`hrana_rt_us`),
    because a quorum ack puts a network hop on the write path that does not exist today.
 
