@@ -91,8 +91,9 @@ per-node heartbeat; ~100k PUT/s/node at 1M shards → ~0.1) and the **durability
 storm** (a write-gated `dirty` flag, so PUTs track writes not open-shard count).
 
 The **failover-time-and-loss-window measurement** layer that S6 deferred to a real
-deployment is now built and exercised: the `deploy/chaos/` Docker rig (3 prod-release
-nodes behind nginx + MinIO + per-node toxiproxy), run 2026-07-05 and 2026-07-06 — all
+deployment is now built and exercised: the `deploy/chaos/` Docker rig (**5** prod-release
+nodes behind nginx + MinIO + per-node toxiproxy; 3 when the runs below were recorded, raised
+2026-08-08 for A2's 1-primary-plus-4-follower replica set), run 2026-07-05 and 2026-07-06 — all
 scenarios pass (failover TTL+steal-margin bounded, pause-fence zombie self-fences with
 no split-brain, node↔S3 partition fail-closed + recovers, soak zero-loss / zero-leak
 through node churn, warm-standby 304-promote observed). See
