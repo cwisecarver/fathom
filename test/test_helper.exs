@@ -2,6 +2,14 @@
 # Run them with: mix test --include s3  (see test/fathom/shard_storage_s3_test.exs).
 # :bench tests are hot-path floor/ceiling guards (seconds of setup each) and are
 # excluded by default. Run with: mix test --include bench  (see test/fathom/bench_test.exs).
+#
+# :wal_probe tests need the FATHOM_WAL_PROBE=1 read-back functions, which the loadable extension
+# registers from OS env — and `System.put_env` CANNOT turn them on, because it updates the BEAM's
+# internal environment table, not the C `environ` that Rust's `std::env::var` reads. So the flag
+# must be set before the VM starts and cannot be set from inside a test:
+#     FATHOM_WAL_PROBE=1 mix test --include wal_probe
+# CI does exactly that (.github/workflows/ci.yml), so these do not rot. See
+# test/fathom/shard/wal_hook_test.exs.
 
 # Clear stale storage DR artifacts from prior runs (#6). Deleted-tenant tests write durable
 # `tombstones/<id>` (and token tests `tokenfloors/<id>`) markers that are, by design, never swept —
@@ -56,7 +64,7 @@ end
 # manifest — a flake you can't name is a flake you can't fix. Alongside the CLI formatter, so
 # console output is unchanged; writes nothing on a green run.
 ExUnit.start(
-  exclude: [:s3, :bench],
+  exclude: [:s3, :bench, :wal_probe],
   formatters: [ExUnit.CLIFormatter, Fathom.FailureCaptureFormatter]
 )
 
