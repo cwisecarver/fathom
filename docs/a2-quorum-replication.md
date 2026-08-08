@@ -312,8 +312,40 @@ Consequences A2 must carry:
 - The follower's WAL and the primary's are a **byte-offset relationship**. Anything that rewrites
   either side independently breaks it, which is the same reason the primary may only checkpoint
   what the quorum has acked.
-2. **The ack-latency cost is measured** against the current per-request round trip (`hrana_rt_us`),
-   because a quorum ack puts a network hop on the write path that does not exist today.
+2. ~~The ack-latency cost is measured.~~ **CLEARED 2026-08-08** — `test/fathom/shard/wal_quorum_bench_test.exs`
+   (`:bench`-tagged). Measured on loopback against the prod baseline `hrana_rt_us` **127 µs**:
+
+   | scenario | 2-of-4 | 4-of-4 |
+   |---|---|---|
+   | all four followers healthy, ack from RAM | **96 µs** | 74 µs |
+   | all four healthy, ack after `fdatasync` | **398 µs** | 469 µs |
+   | **two of four stragglers (+5 ms each)**, ack from RAM | **185 µs** | **5 994 µs** |
+
+   **These are a FLOOR — loopback, no inter-node latency.** Deployment cost is
+   `floor + one RTT to the 2nd-fastest follower` (same-AZ ~0.1–0.25 ms, cross-AZ ~0.5–1.5 ms).
+   Sweep that term on the rig with toxiproxy the way `chaos.sh latency-cost` already does for S3;
+   do not guess it.
+
+   Three results, in order of how much they should change the design:
+
+   - **`Q = N` is catastrophic under a straggler: 5 994 µs vs 185 µs, a 32× difference.** The
+     `Q < N` argument above is now measured, not argued. All-N waits for the slowest replica by
+     definition, and one degraded follower stalls every commit on that shard.
+   - **A quorum barely notices the stragglers** — 185 µs against 96 µs healthy. Two fast followers
+     answer while two slow ones are still working. This is what the redundancy is *for*, and it is
+     the entire reason Waterpark acks at 2-of-4.
+   - **`fdatasync` on the follower is the expensive choice: 398 µs vs 96 µs**, i.e. ~300 µs added,
+     **2.4× fathom's whole current request round trip**. Waterpark acks from RAM and takes its
+     durability from replica count instead. Fathom can afford to be stricter — it also has the S3
+     object underneath — but this is the cost, and it should be a config knob with the number
+     attached rather than an unexamined default.
+
+   **A methodology note worth keeping.** The first version of this measurement compared 2-of-4 and
+   4-of-4 with four *identical* healthy followers, and 4-of-4 came out **faster** (74 µs vs 96 µs) —
+   which is impossible for an order statistic and tripped the harness's own guard. The cause is not
+   a bug but the finding itself: with every replica equally fast the acks land within noise and the
+   quorum is unresolvable. **Quorum buys nothing when replicas are uniform and everything when one
+   is not**, so any future measurement here must inject a straggler or it is measuring noise.
 
 Until both clear, the standing position holds: EBS covers reboot, S3 covers hardware and AZ loss,
 the 300 s interval bounds the exposure between them, and the quarantine keeps a diverged copy
