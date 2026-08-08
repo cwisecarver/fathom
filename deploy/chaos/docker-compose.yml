@@ -1,16 +1,7 @@
-# Fathom chaos rig: 5 independent fathom nodes behind an nginx L7 LB
+# Fathom chaos rig: 3 independent fathom nodes behind an nginx L7 LB
 # (hash-on-Host), sharing one MinIO bucket (the S3 lease store + bottomless
 # backend) through per-node toxiproxy proxies (fault injection: latency,
 # bandwidth, partition) and one Postgres (the directory / control plane).
-#
-# WHY FIVE and not three: Phase-2 A2 adopts Project Waterpark's quorum-replication
-# shape — 1 primary + 4 read-only followers per shard, acking at 2-of-4 — so FIVE
-# nodes is the MINIMUM that can hold a single shard's replica set. A 3-node rig can
-# no longer exercise the target topology at all (it cannot even place the followers),
-# and a scenario that silently ran on a 3-of-5 stand-in would report a quorum result
-# for a quorum that never existed. See docs/a2-quorum-replication.md.
-# Everything else about the rig is unchanged: the extra two nodes are ordinary peers
-# (same image, same env, their own toxiproxy S3 path and their own port block).
 #
 #   driver: ./chaos.sh   docs: README.md + docs/deploy-cluster.md "Chaos testing"
 #
@@ -53,7 +44,7 @@ x-fathom-env: &fathom-env
   LOAD_REPORTER: "true"
   COMMAND_POLLER: "true"
   REBALANCER_ENABLED: "true"
-  LB_BACKENDS: "fathom1=fathom1:8080,fathom2=fathom2:8080,fathom3=fathom3:8080,fathom4=fathom4:8080,fathom5=fathom5:8080"
+  LB_BACKENDS: "fathom1=fathom1:8080,fathom2=fathom2:8080,fathom3=fathom3:8080"
   LB_MAP_PATH: /etc/nginx/lb/exceptions.conf
   # Fast, deterministic demo: report every 3s, confirm a hotspot over 2 windows, short
   # cooldown, and an absolute q/s floor tuned to the rig's per-shard rates.
@@ -62,7 +53,7 @@ x-fathom-env: &fathom-env
   REBALANCE_COOLDOWN_MS: "15000"
   REBALANCE_HOT_QPS_FLOOR: "10.0"
   # Serve the Phoenix endpoint (:4000) + BasicAuth so each node's live admin dashboard is
-  # watchable during scenarios (published per-node as 4001..4005 below → 192.168.x:400N).
+  # watchable during scenarios (published per-node as 4001/4002/4003 below → 192.168.x:400N).
   # WEB_INSECURE_LOCAL turns off the prod SSL-force + WS origin check so a browser on the LAN can
   # reach the plaintext dashboard (rig-only; never in a real deployment).
   # A/B hook. ERTS reads ERL_ZFLAGS *after* the release's vm.args, so a flag set here wins — which
@@ -199,32 +190,6 @@ services:
       - "18093:8081"
       - "4003:4000" # admin dashboard
 
-  # fathom4/fathom5 exist so the fleet can hold a full A2 replica set (1 primary +
-  # 4 followers). Ordinary peers in every other respect — each keeps its OWN
-  # toxiproxy S3 path (21004/21005), which is what makes `partition <node>` a
-  # single-node cut rather than a fleet-wide one.
-  fathom4:
-    <<: *fathom-node
-    environment:
-      <<: *fathom-env
-      S3_ENDPOINT: http://toxiproxy:21004
-      NODE_KEY: fathom4
-    ports:
-      - "18084:8080"
-      - "18094:8081"
-      - "4004:4000" # admin dashboard
-
-  fathom5:
-    <<: *fathom-node
-    environment:
-      <<: *fathom-env
-      S3_ENDPOINT: http://toxiproxy:21005
-      NODE_KEY: fathom5
-    ports:
-      - "18085:8080"
-      - "18095:8081"
-      - "4005:4000" # admin dashboard
-
   lb:
     image: nginx:1.27-alpine
     volumes:
@@ -236,8 +201,6 @@ services:
       - fathom1
       - fathom2
       - fathom3
-      - fathom4
-      - fathom5
 
   # Reloader sidecar: reloads nginx whenever the rebalancer rewrites the exception map,
   # so a handoff's LB flip applies with NO host bridge. Shares the lb container's PID

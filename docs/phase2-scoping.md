@@ -84,18 +84,12 @@ cold-open-from-S3. The fork is how warm:
   no WAL-frame stream, so this needs a WAL-shipping layer or adopting libSQL
   replication — and WAL frames crossing nodes is a **cross-node data path**, which
   tensions "S3 is the only coordination." High infra risk, big. Its only win over A1 is
-  RPO (per-frame vs per-flush) — and RPO is already tunable via the flush interval. ~~**Not
-  worth the risk/model-change now.**~~
-  **REOPENED 2026-08-08 → [a2-quorum-replication](a2-quorum-replication.md).** The deferral above
-  rested on two claims that no longer hold. (a) "RPO is tunable via the flush interval" — true only
-  down to the interval; the *floor* is irreducible, because failover reads S3 and never the dead
-  node's disk, so a node loss always costs the un-flushed tail. (b) "tensions S3-is-the-only-
-  coordination" — that rule was **lifted** the same day
-  ([cluster-architecture](cluster-architecture.md#amendment-2026-08-08--the-s3-only-rule-is-lifted-for-a2)),
-  so it is a cost now, not a veto. The doc carries the Waterpark quorum shape (ack after ≥2
-  follower confirms), why CRDT/OT cannot work over opaque tenant SQL, and the **verified blocker**:
-  exqlite 0.37.0 exposes no WAL-frame API at all. Blocked on a dependency, not on effort — the
-  open question is which seam exists, not whether to want one.
+  RPO (per-frame vs per-flush) — and RPO is already tunable via the flush interval. **Not
+  worth the risk/model-change now.**
+  **Scoped in full 2026-08-08 → [a2-quorum-replication](a2-quorum-replication.md)**: the
+  Waterpark quorum shape (ack after ≥2 follower confirms), why CRDT/OT is the wrong tool here,
+  and the **verified blocker** — exqlite 0.37.0 exposes no WAL-frame API at all, so there is no
+  seam to ship a frame from. Blocked on a dependency, not on effort.
 
 **Verdict:** A1 is the highest value-per-risk Phase-2 item — a real RTO win, additive,
 model-consistent, tractable, reusing infra already built.

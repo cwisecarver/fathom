@@ -19,15 +19,7 @@ name = "fathom_udf"
 # (the BEAM, with exqlite's SQLite already loaded) provides them. Deliberately NOT
 # `bundled`: a second copy of SQLite statically linked into the extension would be a
 # different library than the one running the query.
-# `hooks` adds Connection::wal_hook — the Phase 2 A2 frame seam (see src/wal.rs and
-# docs/a2-quorum-replication.md). It is `hooks = []` upstream: a pure feature gate with no
-# additional dependencies, so it costs nothing but the code it unlocks.
-rusqlite = { version = "0.40", features = [
-    "loadable_extension",
-    "functions",
-    "window",
-    "hooks",
-] }
+rusqlite = { version = "0.40", features = ["loadable_extension", "functions", "window"] }
 
 # Bundled IANA timezone database. This is the whole reason #19 chose Rust: the six
 # tz-dependent Django UDFs need real zone rules server-side, and chrono-tz compiles

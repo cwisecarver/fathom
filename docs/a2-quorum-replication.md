@@ -58,74 +58,6 @@ The shape is *replicate before ack*, never *merge after diverge*. Note that Wate
 data if all replicas die together; fathom keeping S3 underneath would be strictly safer on that
 axis — quorum replication **and** a cold object.
 
-## Replication factor (N) vs ack threshold (Q) — do NOT set Q = N
-
-The single most tempting mistake here is "more confirmations = safer, so confirm to **all** N before
-acking." It is the opposite of Waterpark's spec and it is worse on every axis that matters.
-
-`N` = how many followers hold the shard. `Q` = how many must ack before the primary commits. They
-are independent knobs and they trade in opposite directions.
-
-| N | Q | Tolerates (writes keep working) | Commit waits for | Notes |
-|---|---|---|---|---|
-| 2 | 1 | 1 follower down | fastest of 2 | viable on a 3-node cluster |
-| 4 | **2** | **2 followers down** | **2nd fastest of 4** | **Waterpark's actual spec** |
-| 4 | 3 | 1 follower down | 3rd fastest of 4 | |
-| 4 | 4 | **0 followers down** | **slowest of 4** | every write blocks on the worst link |
-
-**Q = N tolerates zero failures.** One slow or dead follower stops every write to that shard — so
-`N=4, Q=4` is *less* available than `N=4, Q=2`, despite holding the same four copies. Raising Q
-converts spare replicas from redundancy into liabilities.
-
-**Q = N also inherits the worst tail latency.** With Q=2 the primary waits for the 2nd of 4 acks, so
-one straggler is invisible. With Q=4 it waits for the max of 4 draws: by order statistics the
-*median* commit then lands near a single follower's **p84**, against roughly its **p31** at Q=2.
-Every commit pays the worst cross-DC link, on a write path that today has no network hop at all.
-
-**And it buys almost no durability.** At `N=4, Q=2` you must lose the primary *and* both acking
-followers simultaneously to lose a write — and fathom, unlike Waterpark, still has the S3 object
-underneath. Waterpark is RAM-only with no backstop and still chose 2-of-4; fathom at Q=2 is
-therefore **strictly safer than the reference architecture**, not less safe.
-
-**If you want more safety, raise N, not Q.** `N=6, Q=2` is simultaneously more durable *and* more
-available than `N=4, Q=4`. That is the whole reason quorum replication exists.
-
-**What this costs at fathom's scale, which Waterpark did not pay.** A Waterpark actor is one
-patient's message log; fathom's unit is an entire SQLite database, and the thesis is millions of
-them. Follower copies are cheap on the axis that matters — a warm-cached shard is disk-bound with
-~0 BEAM/fd overhead (see [warm-standby](warm-standby.md)) — but **write fanout is not**: every
-commit ships frames to N nodes. N is therefore a *network* decision, not a storage one, and it
-should be configurable per deployment rather than hardcoded to Waterpark's 4.
-
-### Matching Waterpark exactly means FIVE nodes, not four
-
-Easy off-by-one, and it costs half the fault tolerance. Waterpark runs **1 primary + 4 read-only
-followers per actor** — "one read-only follower process at each data center", four DCs, and the ack
-rule quotes "two of its **four** read-only followers". `N` counts **followers**, so `N = 4` needs
-**5 nodes to hold one shard**, on a cluster of 8.
-
-A 4-node cluster is therefore `N = 3, Q = 2`, which tolerates **1** follower loss where Waterpark
-tolerates **2**.
-
-| Cluster nodes | N (followers) | Q | Tolerates | Waterpark parity |
-|---|---|---|---|---|
-| 3 | 2 | 1 | 1 loss | no |
-| 4 | 3 | 2 | 1 loss | no — one follower short |
-| **5** | **4** | **2** | **2 losses** | **yes** |
-| 8 | 4 | 2 | 2 losses | yes (Waterpark's own size) |
-
-**Placement is the actual spec, more than the count.** Waterpark's guarantee is not "4 followers",
-it is *one follower per failure domain* — that is what makes a 2-of-4 ack survive losing a whole
-data centre. Four followers packed into one AZ satisfy `N = 4` and give **nothing** against AZ loss,
-which is precisely the failure S3 was covering before A2. So placement must be a **spread
-constraint over failure domains**, not a free choice of any 4 peers, and a deployment that cannot
-satisfy the spread should say so loudly at boot rather than silently degrade to co-located replicas.
-
-**Defaults: `N = 4, Q = 2`, minimum cluster size 5**, one follower per failure domain. Fall back to
-`N = 2, Q = 1` only on a 3-node cluster, and treat that as a development topology, not a production
-one. Boot must validate **`Q < N`** (else the fault tolerance is configured away) and
-**`cluster_size ≥ N + 1`** (else the shard cannot place its followers at all).
-
 ## The fathom mapping
 
 The component already exists. `Fathom.Shard.WarmFollower` (A1, built) holds a lease-less copy of
@@ -138,87 +70,24 @@ another node's shard and never serves. A2 is the same component with the data pa
 | failover pulls the object, loses the tail | failover promotes a follower, loses nothing |
 | no effect on ack latency | commit waits for **≥2 follower acks** |
 
-## The blocker — and why it is much smaller than it looked
+## The blocker
 
 **`exqlite` 0.37.0 exposes no WAL-frame API.** Verified 2026-08-08 against `deps/exqlite/lib/`: the
 only WAL-related surface in the entire library is `Exqlite.Pragma.wal_auto_check_point/1`, a
-configuration pragma. No hook, no frame read/apply, no backup API.
+configuration pragma. There is no `sqlite3_wal_hook`, no frame read/apply, no backup API, no session
+hook. **There is no seam to ship a frame from.**
 
-**That framing was wrong, though — exqlite does not have to expose it.** Same day, same reasoning as
-the UDF work (expert review #19): exqlite had no `create_function` either, and the fix was to stop
-asking exqlite and use a **loadable extension**. Fathom already ships one (`native/fathom_udf`,
-loaded per connection by `Fathom.Shard.Extension`), and an extension receives a live
-`rusqlite::Connection` wrapping the host's `sqlite3*`.
-
-Verified against the vendored sources:
-
-- **`sqlite3_wal_hook` is in `sqlite3_api_routines`** — the loadable-extension pointer table, not
-  just the normal link surface (`libsqlite3-sys-0.38.1/bindgen-bindings/bindgen_3.34.1_ext.rs:2325`,
-  resolved at `:6813` via `if let Some(fun) = (*p_api).wal_hook`). So it is reachable from an
-  extension, which is the only place fathom can reach SQLite's C API today.
-- **rusqlite wraps it safely** — `Connection::wal_hook(Option<fn(&Wal, c_int) -> Result<()>>)`
-  (`rusqlite-0.40.1/src/hooks/mod.rs:398`), behind feature **`hooks = []`** — no additional
-  dependencies, a one-line `Cargo.toml` change.
-- **`Wal` carries `db` + `db_name` and can `checkpoint`/`checkpoint_v2`**, so the hook can also
-  control when the WAL is truncated — which the shipper must, or frames vanish before they ship.
-
-**What the hook gives and does not give.** It is a *notification*: "a commit landed; the WAL now
-holds N pages." It does **not** hand over frame bytes. The shipper reads the `-wal` file from its
-last shipped offset, which is how litestream works, and is sufficient — but it means the design
-must own WAL-truncation ordering, because a checkpoint that runs before frames ship loses them.
-
-**Still unverified — this is gate 1, below.** That the hook actually *fires at runtime* through the
-SQLite that exqlite bundles, with the extension loaded the way `Shard.Extension` loads it. The
-evidence above is link-surface evidence, not a running callback. Treat a promising-looking seam the
-same way AGENTS.md says to treat a suspiciously good benchmark: unproven until it runs.
-
-### The trap: registering the hook DISABLES `wal_autocheckpoint`
-
-`sqlite3_wal_hook` and `wal_autocheckpoint` are **the same slot**. rusqlite says so directly
-(`rusqlite-0.40.1/src/hooks/mod.rs:396`): *"the `sqlite3_wal_autocheckpoint()` interface and the
-`wal_autocheckpoint` pragma both invoke `sqlite3_wal_hook()` and will overwrite any prior
-`sqlite3_wal_hook()` settings."* Auto-checkpointing **is** a built-in WAL hook; registering ours
-evicts it.
-
-Both orderings are wrong, and fathom is currently in the worse one:
-
-- **Pragma after hook** → the pragma silently evicts our hook. A2 quietly ships nothing; the shard
-  looks replicated and is not.
-- **Hook after pragma** → our hook evicts auto-checkpointing. **The WAL grows without bound.**
-
-`Fathom.Shard.Connection.configure_readwrite/3` runs `configure/1` first
-(`lib/fathom/shard/connection.ex:79`, which sets `PRAGMA wal_autocheckpoint=4000` at `:196`) and
-`load_extension/1` second (`:80`). So a hook registered naïvely from `fathom_udf` lands in the
-**second** case — unbounded WAL growth on every tenant connection, presenting as the disk-fill
-failure that expert review #36 built `FathomDiskFillingUp` for, with the diagnostic pointing at
-storage rather than at this.
-
-That threshold is not a default to be casually displaced: it was deliberately raised from SQLite's
-1000 frames to 4000 by expert review 2026-07-24 #4, because an autocheckpoint runs **inline inside
-the committing tenant's query**.
-
-**So the A2 hook must take over checkpointing, not merely observe.** This is why
-`Wal::checkpoint_v2(CheckpointMode)` is handed to the callback — the design falls out of the
-constraint. And it is load-bearing for A2 beyond replacing what it displaced: a checkpoint
-**truncates the WAL**, so checkpointing before frames ship destroys exactly the data being
-replicated. The hook's real rule is therefore *checkpoint only what has already been acked by the
-write quorum*, which makes WAL truncation a **downstream consequence of replication progress**
-rather than an independent timer.
-
-Anyone implementing this must also assert the negative: a test that the WAL still gets checkpointed
-with the hook installed. The failure is silent, slow, and looks like someone else's bug.
+This is the same class of gap as the UDF work (expert review #19), where the finding's recommended
+`create_function` did not exist either and the fix was a loadable extension via
+`enable_load_extension/2`. Establish the seam exists **before** designing against it.
 
 ### Options for clearing it
 
 Effort labels are estimates, not measurements.
 
-1. **Register the hook from the existing loadable extension** — `native/fathom_udf` + feature
-   `hooks`, then read committed frames out of the `-wal` file and apply them on the follower.
-   **This is now the leading option and it is NOT large**: no NIF, no exqlite fork, no new build
-   step, and the load/enable/disable security sequence `Shard.Extension` already performs is
-   unchanged. Was scoped as "write the NIF ourselves / patch exqlite, **Large**" before the
-   extension route was checked — recorded because the obvious-looking answer (fork the driver) is
-   the expensive one and someone will propose it again.
+1. **Write the NIF ourselves** (`fathom_native`, or patch exqlite). Register `sqlite3_wal_hook`,
+   read committed frames out of the `-wal` file, apply them on the follower. Most control, most
+   work; puts fathom on a forked or extended DB driver. **Large.**
 2. **Adopt libSQL's engine for replication.** libSQL already does frame-level replication.
    `Fathom.Shard.Connection` is documented as the single swap-point for exactly this
    (see AGENTS.md). Trades "write it" for "inherit it", but it is an engine swap on the data path
@@ -235,23 +104,15 @@ Effort labels are estimates, not measurements.
 
 ## The architectural cost
 
-A2 puts tenant **data** on a node-to-node path. Fathom's cluster model was deliberately
+A2 puts tenant **data** on a node-to-node path. Fathom's cluster model is deliberately
 LB-keyspace-partition plus an S3 lease, with **S3 as the only cross-node coordination** — no BEAM
-cluster, no ring, no mailroom. A quorum ack needs cluster membership, follower liveness, and a
-promote protocol: a reversal of the central decision, not an addition to it.
+cluster, no ring, no mailroom (see [cluster-architecture](cluster-architecture.md)). A quorum ack
+needs cluster membership, follower liveness, and a promote protocol. That is a reversal of the
+central decision, not an addition to it.
 
-**That reversal was accepted on 2026-08-08** — see
-[cluster-architecture](cluster-architecture.md#amendment-2026-08-08--the-s3-only-rule-is-lifted-for-a2).
-The framing was never "should we add WAL streaming" but **"should fathom become a BEAM cluster,"**
-and the answer is now yes, because the S3-only rule made node-loss RPO irreducible and Waterpark is
-the evidence the clustered answer works at scale where losing a write is unacceptable.
-
-The cost is accepted, not eliminated. It is still the largest single change to fathom's model, and
-it is not cheaply reversible — which is why the gates below survive the decision.
-
-**Explicitly still rejected:** the BEAM-forwarding *mailroom* and the `base_url` *redirect*
-(cluster-architecture "Why not the alternatives"). Those fail on Filo's entry-node-local stream
-batons, not on the S3 rule. A2 replicates **committed data**; it does not move **streams**.
+So the honest framing of the decision is **not** "should we add WAL streaming" but **"should fathom
+become a BEAM cluster."** Waterpark is the evidence that the clustered answer works at scale in a
+domain where losing a write is unacceptable.
 
 ## What it would and would not improve
 
@@ -265,88 +126,13 @@ batons, not on the S3 rule. A2 replicates **committed data**; it does not move *
 
 ## Decision gate
 
-~~3. The BEAM-cluster reversal is accepted explicitly.~~ **Accepted 2026-08-08** — the "S3 is the
-only cross-node coordination" rule is lifted; see
-[cluster-architecture](cluster-architecture.md#amendment-2026-08-08--the-s3-only-rule-is-lifted-for-a2).
-Two gates remain, in order:
+Do not start until, in order:
 
-1. ~~A frame seam is proven to exist.~~ **CLEARED 2026-08-08 — the hook fires.**
-   `native/fathom_udf/src/wal.rs` registers `sqlite3_wal_hook` from the loadable extension, and
-   `test/fathom/shard/wal_hook_test.exs` drives a real commit through `Fathom.Shard.Connection` and
-   asserts the callback ran with a non-zero page count. Option 1 is the one that was available, and
-   it needed no NIF, no exqlite fork, and no new build step.
+1. **A frame seam is proven to exist** — option 1, 2 or 3 demonstrated on a branch, reading and
+   applying one committed frame between two processes. Cheapest experiment that kills the premise.
+2. **The ack-latency cost is measured** against the current per-request round trip.
+3. **The BEAM-cluster reversal is accepted explicitly**, because everything downstream depends on
+   it and it is not reversible cheaply.
 
-   It also produced the constraint above: the hook **takes over checkpointing**, verified to
-   discriminate (with the takeover disabled the main database is 4096 bytes after 25 MB of writes —
-   every page still in the WAL). Notify-plus-checkpoint-control is therefore the actual shape of the
-   seam, and shipping frames still has to read the `-wal` file itself.
-
-   **The receive half is cleared too (same day).** `test/fathom/shard/wal_apply_test.exs` ships two
-   successive commits to a follower as **byte-range deltas appended to its `-wal`** and the follower
-   reads all three rows. **Incremental WAL shipping works on stock SQLite** — no
-   `libsql_wal_insert_frame`, no engine swap, no NIF. The shipper is literally "read `-wal` from the
-   last shipped offset, send the bytes, append them on the follower"; nothing rewrites headers or
-   recomputes checksums. Verified to discriminate: with the append suppressed the follower sees only
-   `[["first"]]`. The follower's main `.db` is asserted byte-identical to the base copy throughout,
-   so every row after the first demonstrably arrived as WAL bytes and not through the file copy.
-
-   **So options 2 and 3 below are no longer needed for the seam.** Option 1 covers both directions.
-
-### A follower must not casually open and close its database
-
-Discovered while building the receive test, and it is a design constraint rather than a test
-artifact. A **clean close checkpoints**: measured, one open-and-close of the follower moved its
-`.db` from **4096 → 8192 bytes** and **deleted** its `-wal`. The next delta then landed on a file
-whose lineage no longer matched the offsets it was computed against, and the test failed with a
-message confidently blaming stock SQLite — the wrong conclusion, whose action would have been
-"adopt libSQL".
-
-Consequences A2 must carry:
-
-- A follower is a **passive recipient of bytes** until promotion. It does not hold an open
-  connection to the shard it is following, and any tooling that peeks at a follower's database
-  (a health check, an operator running `sqlite3` on it, a restore drill) **desynchronizes it** and
-  forces a full re-seed.
-- **Promotion** is the first legitimate open, and its first clean close will checkpoint — so the
-  promote path must treat that as expected and re-establish offsets rather than assume continuity.
-- The follower's WAL and the primary's are a **byte-offset relationship**. Anything that rewrites
-  either side independently breaks it, which is the same reason the primary may only checkpoint
-  what the quorum has acked.
-2. ~~The ack-latency cost is measured.~~ **CLEARED 2026-08-08** — `test/fathom/shard/wal_quorum_bench_test.exs`
-   (`:bench`-tagged). Measured on loopback against the prod baseline `hrana_rt_us` **127 µs**:
-
-   | scenario | 2-of-4 | 4-of-4 |
-   |---|---|---|
-   | all four followers healthy, ack from RAM | **96 µs** | 74 µs |
-   | all four healthy, ack after `fdatasync` | **398 µs** | 469 µs |
-   | **two of four stragglers (+5 ms each)**, ack from RAM | **185 µs** | **5 994 µs** |
-
-   **These are a FLOOR — loopback, no inter-node latency.** Deployment cost is
-   `floor + one RTT to the 2nd-fastest follower` (same-AZ ~0.1–0.25 ms, cross-AZ ~0.5–1.5 ms).
-   Sweep that term on the rig with toxiproxy the way `chaos.sh latency-cost` already does for S3;
-   do not guess it.
-
-   Three results, in order of how much they should change the design:
-
-   - **`Q = N` is catastrophic under a straggler: 5 994 µs vs 185 µs, a 32× difference.** The
-     `Q < N` argument above is now measured, not argued. All-N waits for the slowest replica by
-     definition, and one degraded follower stalls every commit on that shard.
-   - **A quorum barely notices the stragglers** — 185 µs against 96 µs healthy. Two fast followers
-     answer while two slow ones are still working. This is what the redundancy is *for*, and it is
-     the entire reason Waterpark acks at 2-of-4.
-   - **`fdatasync` on the follower is the expensive choice: 398 µs vs 96 µs**, i.e. ~300 µs added,
-     **2.4× fathom's whole current request round trip**. Waterpark acks from RAM and takes its
-     durability from replica count instead. Fathom can afford to be stricter — it also has the S3
-     object underneath — but this is the cost, and it should be a config knob with the number
-     attached rather than an unexamined default.
-
-   **A methodology note worth keeping.** The first version of this measurement compared 2-of-4 and
-   4-of-4 with four *identical* healthy followers, and 4-of-4 came out **faster** (74 µs vs 96 µs) —
-   which is impossible for an order statistic and tripped the harness's own guard. The cause is not
-   a bug but the finding itself: with every replica equally fast the acks land within noise and the
-   quorum is unresolvable. **Quorum buys nothing when replicas are uniform and everything when one
-   is not**, so any future measurement here must inject a straggler or it is measuring noise.
-
-Until both clear, the standing position holds: EBS covers reboot, S3 covers hardware and AZ loss,
-the 300 s interval bounds the exposure between them, and the quarantine keeps a diverged copy
-recoverable.
+Until then the position is: EBS covers reboot, S3 covers hardware and AZ loss, the 300 s interval
+bounds the exposure between them, and the quarantine keeps a diverged copy recoverable.

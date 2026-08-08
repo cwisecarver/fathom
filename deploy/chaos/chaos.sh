@@ -73,13 +73,7 @@ TTL_MS=10000
 # (the clock-skew guard, Fathom.Shard.Storage.steal_margin_ms, default 5000 and
 # not overridden in the rig). Scenarios that force a steal must wait past both.
 STEAL_MARGIN_MS=5000
-# FIVE nodes since Phase-2 A2 (docs/a2-quorum-replication.md): a shard's replica set is
-# 1 primary + 4 read-only followers acking at 2-of-4, so five is the MINIMUM fleet that can
-# hold one. Every scenario below reads this array rather than naming nodes, so growing the
-# fleet is this one line plus the port map — the exceptions are noted where they exist
-# (`deploy`/`failover-herd` target fathom1 by default, and the control-plane rpc calls in
-# `rebalance`/`rollout` go to fathom1 because Postgres is fleet-shared, not per-node).
-NODES=(fathom1 fathom2 fathom3 fathom4 fathom5)
+NODES=(fathom1 fathom2 fathom3)
 # direct (LB-bypassing) Hrana port per node, for forced-steal experiments.
 # A function (not an associative array) so the script runs on macOS's bash 3.2.
 direct_port() {
@@ -87,8 +81,6 @@ direct_port() {
     fathom1) echo 18081 ;;
     fathom2) echo 18082 ;;
     fathom3) echo 18083 ;;
-    fathom4) echo 18084 ;;
-    fathom5) echo 18085 ;;
     *) echo "unknown node: $1" >&2; return 1 ;;
   esac
 }
@@ -243,23 +235,17 @@ cmd_owner() {
   return 1
 }
 
-# One toxiproxy per node's S3 path, named `s3-<node>` (see toxiproxy.json) — the same
-# convention `partition <node>` uses. Derived from NODES rather than spelled out, so a
-# fleet-size change can't leave a node's S3 path un-injected: a scenario would then time
-# a "latency" run in which one node was silently still on the loopback floor.
 cmd_latency() {
-  local p n
+  local p
   if [ "${1:-}" = "clear" ]; then
-    for n in "${NODES[@]}"; do
-      p="s3-$n"
+    for p in s3-fathom1 s3-fathom2 s3-fathom3; do
       curl -sS -X DELETE "$TOXI/proxies/$p/toxics/lat_down" >/dev/null 2>&1
       curl -sS -X DELETE "$TOXI/proxies/$p/toxics/lat_up" >/dev/null 2>&1
     done
     echo "latency cleared"
   else
     local ms=${1:?usage: latency <ms>|clear}
-    for n in "${NODES[@]}"; do
-      p="s3-$n"
+    for p in s3-fathom1 s3-fathom2 s3-fathom3; do
       curl -sS -X POST "$TOXI/proxies/$p/toxics" -d \
         "{\"name\":\"lat_down\",\"type\":\"latency\",\"stream\":\"downstream\",\"attributes\":{\"latency\":$ms}}" >/dev/null
       curl -sS -X POST "$TOXI/proxies/$p/toxics" -d \
@@ -829,7 +815,7 @@ cmd_served() {
 
   # Per node: open `per` node-scoped shards each holding a live connection until (op or the fd wall),
   # GC, sample RSS/fds, run one query pass over all held connections (throughput), then release. The
-  # id prefix is the sanitised node name so no two nodes ever contend for the same lease.
+  # id prefix is the sanitised node name so the three nodes never contend for the same lease.
   local expr
 expr=$(cat <<'ELIXIR'
 base_rss = (File.read!("/proc/self/status") |> then(fn s -> [x] = Regex.run(~r/VmRSS:\s+(\d+)/, s, capture: :all_but_first); String.to_integer(x) end)); base_fds = length(File.ls!("/proc/self/fd")); pref = "srv" <> String.replace(Atom.to_string(node()), ~r/[^a-z0-9]/, "") <> "_"; {open_us, {op, hs}} = :timer.tc(fn -> Enum.reduce_while(1..__PER__, {0, []}, fn i, {c, a} -> id = pref <> Integer.to_string(i); r = (try do (with {:ok, p, rf, pa} <- Fathom.Shards.checkout(id), {:ok, cn} <- Fathom.Shard.Connection.open(pa), {:ok, _} <- Fathom.Shard.Connection.query(cn, "SELECT 1", []), do: {:ok, {p, rf, cn}}) rescue e -> {:error, e} catch :exit, x -> {:error, x} end); case r do {:ok, h} -> {:cont, {c + 1, [h | a]}}; _ -> {:halt, {c, a}} end end) end); open_rate = if open_us > 0, do: round(op * 1_000_000 / open_us), else: 0; :erlang.garbage_collect(); rss = (File.read!("/proc/self/status") |> then(fn s -> [x] = Regex.run(~r/VmRSS:\s+(\d+)/, s, capture: :all_but_first); String.to_integer(x) end)); fds = length(File.ls!("/proc/self/fd")); {qus, _} = :timer.tc(fn -> Enum.each(hs, fn {_, _, cn} -> Fathom.Shard.Connection.query(cn, "SELECT 1", []) end) end); Enum.each(hs, fn {p, rf, cn} -> Fathom.Shard.Connection.close(cn); Fathom.Shard.checkin(p, rf) end); qps = if qus > 0, do: round(op * 1_000_000 / qus), else: 0; IO.puts("opened=#{op} open_rate=#{open_rate} rss_per_shard_kb=#{div(rss - base_rss, max(op, 1))} fds_per_shard=#{Float.round((fds - base_fds) / max(op, 1), 2)} qps=#{qps}")
@@ -888,7 +874,7 @@ cmd_served_data() {
 
   # Per node: open `per` node-scoped shards, DROP+CREATE a table, seed `rows` blobs, scan (warms the
   # page cache), hold the connection; then sample RSS/fds, run a scan pass (throughput on real data),
-  # release. Node-scoped id prefix so no two nodes ever contend for the same lease.
+  # release. Node-scoped id prefix so the three nodes never contend for the same lease.
   local expr
 expr=$(cat <<'ELIXIR'
 base_rss = (File.read!("/proc/self/status") |> then(fn s -> [x] = Regex.run(~r/VmRSS:\s+(\d+)/, s, capture: :all_but_first); String.to_integer(x) end)); base_fds = length(File.ls!("/proc/self/fd")); pref = "srvd" <> String.replace(Atom.to_string(node()), ~r/[^a-z0-9]/, "") <> "_"; seed_ddl = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < __ROWS__) INSERT INTO t (b) SELECT randomblob(__BLOB__) FROM c"; scan = "SELECT count(*), sum(length(b)) FROM t"; {open_us, {op, hs}} = :timer.tc(fn -> Enum.reduce_while(1..__PER__, {0, []}, fn i, {c, a} -> id = pref <> Integer.to_string(i); r = (try do (with {:ok, p, rf, pa} <- Fathom.Shards.checkout(id), {:ok, cn} <- Fathom.Shard.Connection.open(pa), :ok <- Fathom.Shard.Connection.exec(cn, "DROP TABLE IF EXISTS t"), :ok <- Fathom.Shard.Connection.exec(cn, "CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB)"), :ok <- Fathom.Shard.Connection.exec(cn, seed_ddl), {:ok, _} <- Fathom.Shard.Connection.query(cn, scan, []), do: {:ok, {p, rf, cn}}) rescue e -> {:error, e} catch :exit, x -> {:error, x} end); case r do {:ok, h} -> {:cont, {c + 1, [h | a]}}; _ -> {:halt, {c, a}} end end) end); open_rate = if open_us > 0, do: round(op * 1_000_000 / open_us), else: 0; :erlang.garbage_collect(); rss = (File.read!("/proc/self/status") |> then(fn s -> [x] = Regex.run(~r/VmRSS:\s+(\d+)/, s, capture: :all_but_first); String.to_integer(x) end)); fds = length(File.ls!("/proc/self/fd")); {qus, _} = :timer.tc(fn -> Enum.each(hs, fn {_, _, cn} -> Fathom.Shard.Connection.query(cn, scan, []) end) end); Enum.each(hs, fn {p, rf, cn} -> Fathom.Shard.Connection.close(cn); Fathom.Shard.checkin(p, rf) end); qps = if qus > 0, do: round(op * 1_000_000 / qus), else: 0; IO.puts("opened=#{op} open_rate=#{open_rate} rss_per_shard_kb=#{div(rss - base_rss, max(op, 1))} fds_per_shard=#{Float.round((fds - base_fds) / max(op, 1), 2)} qps=#{qps}")
@@ -938,7 +924,7 @@ ELIXIR
 # injected one-way RTT, so the delta isolates the S3 cost from the local work. This is the TPC Phase-4
 # follow-on carried in docs/reviews/fleet-density-2026-07-10.md's Remaining Work.
 #
-# Method per node (node-scoped ids, so no two nodes ever contend for one lease; driven via rpc
+# Method per node (node-scoped ids, so the three nodes never contend for one lease; driven via rpc
 # LOCALLY, bypassing the LB — cold-open/flush are per-node properties, not partition ones):
 #   setup  : seed `samples` small shards (rows×blob) and drain each → bytes live in MinIO, local dropped.
 #   measure: for each, TIME checkout (a genuine cold pull, blocks until the open completes), then a
@@ -1047,7 +1033,7 @@ ELIXIR
 # the real LB so they partition across the nodes, sweep the tenant count, and read back BOTH the aggregate
 # txn/s (throughput vs concurrency) AND the per-node distribution (the keyspace-partition carrying the
 # load). It is to throughput what `chaos.sh density` is to capacity: density proved the fleet holds ~N
-# shards ~N/nodes each; this proves the *work* partitions the same way. Honest ceiling: all five nodes
+# shards ~N/nodes each; this proves the *work* partitions the same way. Honest ceiling: all three nodes
 # share ONE 12-vCPU colima VM, so the absolute txn/s is CPU-bound by one box — the horizontal-scaling
 # claim is carried by the even per-node split (on N real machines the work is ~N× additive), not by the
 # single-host aggregate. Needs SHARD_LOAD on (docker-compose sets it). Each step uses its own shard
@@ -1200,7 +1186,7 @@ cmd_tpcc_fleet() {
 # shards/s wall-clock, the rate the gate reports, and which node did the work.
 #
 # Why this cannot be an in-process benchmark: `copy_keystone_rows_per_s` measures ONE shard's copy
-# loop. Fleet rollout throughput is a different quantity — Oban's `migrations: 10` per node × 5
+# loop. Fleet rollout throughput is a different quantity — Oban's `migrations: 10` per node × 3
 # nodes contending on one Postgres, each job doing its own S3 pull + replay + fenced flush + cutover.
 # Only the rig has all of that at once.
 #
