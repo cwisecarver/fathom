@@ -85,9 +85,18 @@ defmodule Fathom.Shard.Replication.Protocol do
   detect divergence without a separate round trip: an ack for an offset the primary did not expect
   means the two sides disagree about the follower's state, which is the same class of bug the
   `offset` field exists to prevent.
+
+  It also carries the `shard_id`, which is what lets **one connection per follower node** serve
+  every shard that node follows. Without it the primary could not tell which push an ack belonged
+  to, forcing a socket per shard per follower — at fathom's stated scale of millions of shards
+  that is millions of sockets, so this field is the difference between a workable transport and an
+  unworkable one. Correlating on `shard_id` alone is sufficient because a shard has exactly one
+  writer (the lease), so there is never more than one push in flight for it.
   """
-  @spec encode_ack(non_neg_integer()) :: iodata()
-  def encode_ack(next_offset), do: <<@version::8, @ack::8, next_offset::64>>
+  @spec encode_ack(String.t(), non_neg_integer()) :: iodata()
+  def encode_ack(shard_id, next_offset) do
+    [<<@version::8, @ack::8, byte_size(shard_id)::16, next_offset::64>>, shard_id]
+  end
 
   @doc """
   Refuse a push, and say where the follower actually is.
@@ -95,9 +104,13 @@ defmodule Fathom.Shard.Replication.Protocol do
   `expected_offset` lets the primary rewind and re-send rather than tear the follower down and
   re-seed it from S3 — a full re-seed is the expensive recovery, and a gap is the cheap one.
   """
-  @spec encode_reject(atom(), non_neg_integer()) :: iodata()
-  def encode_reject(reason, expected_offset) when is_map_key(@reason_codes, reason) do
-    <<@version::8, @reject::8, @reason_codes[reason]::8, expected_offset::64>>
+  @spec encode_reject(String.t(), atom(), non_neg_integer()) :: iodata()
+  def encode_reject(shard_id, reason, expected_offset) when is_map_key(@reason_codes, reason) do
+    [
+      <<@version::8, @reject::8, @reason_codes[reason]::8, byte_size(shard_id)::16,
+        expected_offset::64>>,
+      shard_id
+    ]
   end
 
   @doc """
@@ -107,8 +120,8 @@ defmodule Fathom.Shard.Replication.Protocol do
   """
   @spec decode(binary()) ::
           {:ok, Push.t()}
-          | {:ok, {:ack, non_neg_integer()}}
-          | {:ok, {:reject, atom(), non_neg_integer()}}
+          | {:ok, {:ack, String.t(), non_neg_integer()}}
+          | {:ok, {:reject, String.t(), atom(), non_neg_integer()}}
           | {:error, :malformed | :unsupported_version}
   def decode(<<@version::8, @push::8, slen::16, epoch::64, gen::64, off::64, rest::binary>>)
       when byte_size(rest) >= slen do
@@ -117,11 +130,13 @@ defmodule Fathom.Shard.Replication.Protocol do
     {:ok, %Push{shard_id: shard, epoch: epoch, wal_gen: gen, offset: off, payload: payload}}
   end
 
-  def decode(<<@version::8, @ack::8, next::64>>), do: {:ok, {:ack, next}}
+  def decode(<<@version::8, @ack::8, slen::16, next::64, shard::binary-size(slen)>>) do
+    {:ok, {:ack, shard, next}}
+  end
 
-  def decode(<<@version::8, @reject::8, code::8, expected::64>>)
+  def decode(<<@version::8, @reject::8, code::8, slen::16, exp::64, shard::binary-size(slen)>>)
       when is_map_key(@reasons, code) do
-    {:ok, {:reject, @reasons[code], expected}}
+    {:ok, {:reject, shard, @reasons[code], exp}}
   end
 
   # A version mismatch is worth distinguishing from garbage: it is the signal for a rolling

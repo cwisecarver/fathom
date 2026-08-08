@@ -45,13 +45,16 @@ defmodule Fathom.Shard.ReplicationTest do
       assert {:ok, ^p} = p |> Protocol.encode_push() |> IO.iodata_to_binary() |> Protocol.decode()
     end
 
-    test "ack and reject round-trip" do
-      assert {:ok, {:ack, 8240}} =
-               8240 |> Protocol.encode_ack() |> IO.iodata_to_binary() |> Protocol.decode()
+    test "ack and reject round-trip, and both name their shard" do
+      # The shard id on the REPLY is what lets one socket per follower node serve every shard:
+      # without it the primary cannot tell which push an ack belongs to, forcing a connection per
+      # shard per follower — millions of sockets at fathom's stated scale.
+      assert {:ok, {:ack, "acme", 8240}} =
+               "acme" |> Protocol.encode_ack(8240) |> IO.iodata_to_binary() |> Protocol.decode()
 
-      assert {:ok, {:reject, :offset_mismatch, 4120}} =
-               :offset_mismatch
-               |> Protocol.encode_reject(4120)
+      assert {:ok, {:reject, "beta", :offset_mismatch, 4120}} =
+               "beta"
+               |> Protocol.encode_reject(:offset_mismatch, 4120)
                |> IO.iodata_to_binary()
                |> Protocol.decode()
     end
