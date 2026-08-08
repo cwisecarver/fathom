@@ -58,6 +58,49 @@ The shape is *replicate before ack*, never *merge after diverge*. Note that Wate
 data if all replicas die together; fathom keeping S3 underneath would be strictly safer on that
 axis — quorum replication **and** a cold object.
 
+## Replication factor (N) vs ack threshold (Q) — do NOT set Q = N
+
+The single most tempting mistake here is "more confirmations = safer, so confirm to **all** N before
+acking." It is the opposite of Waterpark's spec and it is worse on every axis that matters.
+
+`N` = how many followers hold the shard. `Q` = how many must ack before the primary commits. They
+are independent knobs and they trade in opposite directions.
+
+| N | Q | Tolerates (writes keep working) | Commit waits for | Notes |
+|---|---|---|---|---|
+| 2 | 1 | 1 follower down | fastest of 2 | viable on a 3-node cluster |
+| 4 | **2** | **2 followers down** | **2nd fastest of 4** | **Waterpark's actual spec** |
+| 4 | 3 | 1 follower down | 3rd fastest of 4 | |
+| 4 | 4 | **0 followers down** | **slowest of 4** | every write blocks on the worst link |
+
+**Q = N tolerates zero failures.** One slow or dead follower stops every write to that shard — so
+`N=4, Q=4` is *less* available than `N=4, Q=2`, despite holding the same four copies. Raising Q
+converts spare replicas from redundancy into liabilities.
+
+**Q = N also inherits the worst tail latency.** With Q=2 the primary waits for the 2nd of 4 acks, so
+one straggler is invisible. With Q=4 it waits for the max of 4 draws: by order statistics the
+*median* commit then lands near a single follower's **p84**, against roughly its **p31** at Q=2.
+Every commit pays the worst cross-DC link, on a write path that today has no network hop at all.
+
+**And it buys almost no durability.** At `N=4, Q=2` you must lose the primary *and* both acking
+followers simultaneously to lose a write — and fathom, unlike Waterpark, still has the S3 object
+underneath. Waterpark is RAM-only with no backstop and still chose 2-of-4; fathom at Q=2 is
+therefore **strictly safer than the reference architecture**, not less safe.
+
+**If you want more safety, raise N, not Q.** `N=6, Q=2` is simultaneously more durable *and* more
+available than `N=4, Q=4`. That is the whole reason quorum replication exists.
+
+**What this costs at fathom's scale, which Waterpark did not pay.** A Waterpark actor is one
+patient's message log; fathom's unit is an entire SQLite database, and the thesis is millions of
+them. Follower copies are cheap on the axis that matters — a warm-cached shard is disk-bound with
+~0 BEAM/fd overhead (see [warm-standby](warm-standby.md)) — but **write fanout is not**: every
+commit ships frames to N nodes. N is therefore a *network* decision, not a storage one, and it
+should be configurable per deployment rather than hardcoded to Waterpark's 4.
+
+**Recommended default: `N = 4, Q = 2`** where the node count allows it, falling back to `N = 2,
+Q = 1` on a 3-node cluster. Both configurable; **Q must be validated `< N`** at boot, so nobody can
+configure away the fault tolerance by accident.
+
 ## The fathom mapping
 
 The component already exists. `Fathom.Shard.WarmFollower` (A1, built) holds a lease-less copy of
