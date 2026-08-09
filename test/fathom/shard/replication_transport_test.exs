@@ -59,6 +59,11 @@ defmodule Fathom.Shard.ReplicationTransportTest do
     pid
   end
 
+  # Every follower at the same position — the steady-state case. `ship_quorum/3` takes a
+  # per-follower push so a laggard can be sent a different (larger) delta; this helper is the
+  # common case where they all get the same one.
+  defp fanout(shippers, push), do: for(s <- shippers, do: {s, push})
+
   defp push(shard, opts \\ []) do
     %Push{
       shard_id: shard,
@@ -154,13 +159,17 @@ defmodule Fathom.Shard.ReplicationTransportTest do
     end
 
     test "returns as soon as Q have acked", %{ships: ships} do
-      assert :ok = Replication.ship_quorum(ships, push("acme"), 2, 2_000)
+      # Returns WHO acked, not just that the quorum was met: the caller must advance only those
+      # followers, since advancing a rejecter would leave the primary believing it holds bytes it
+      # refused.
+      assert {:ok, acked, []} = Replication.ship_quorum(fanout(ships, push("acme")), 2, 2_000)
+      assert length(acked) >= 2
     end
 
     test "Q = N is refused at the call, not at a timeout", %{ships: ships} do
-      # Same guard as Quorum.new/3, reached through the public entry point.
+      # Same guard as Quorum.new/2, reached through the public entry point.
       assert_raise ArgumentError, ~r/must be < 4 followers/, fn ->
-        Replication.ship_quorum(ships, push("acme"), 4, 500)
+        Replication.ship_quorum(fanout(ships, push("acme")), 4, 500)
       end
     end
 
@@ -181,7 +190,11 @@ defmodule Fathom.Shard.ReplicationTransportTest do
                 id: :"ds#{i}"
               )
 
-      assert :ok = Replication.ship_quorum(live ++ dead, push("acme"), 2, 2_000)
+      assert {:ok, acked, rejects} =
+               Replication.ship_quorum(fanout(live ++ dead, push("acme")), 2, 2_000)
+
+      assert length(acked) == 2, "only the live followers should be counted as acked"
+      assert Enum.all?(rejects, fn {_s, r, _at} -> r == :disconnected end)
     end
 
     test "reports :impossible rather than burning the timeout when too few can ack" do
@@ -200,8 +213,12 @@ defmodule Fathom.Shard.ReplicationTransportTest do
 
       started = System.monotonic_time(:millisecond)
 
-      assert {:error, {:no_quorum, :impossible}} =
-               Replication.ship_quorum([live | dead], push("acme"), 2, 5_000)
+      # The third element is the per-follower reject list, which Session turns into seeds.
+      assert {:error, {:no_quorum, :impossible, rejects}} =
+               Replication.ship_quorum(fanout([live | dead], push("acme")), 2, 5_000)
+
+      assert length(rejects) == 3,
+             "every unreachable follower should be reported, got #{inspect(rejects)}"
 
       elapsed = System.monotonic_time(:millisecond) - started
 

@@ -62,6 +62,38 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     end
   end
 
+  # A commit returns at the Q-th ack, so the follower that did NOT make the quorum can still be
+  # writing when it does. Asserting on all N immediately asserts a guarantee A2 deliberately does
+  # not make — stopping at Q is the entire measured value of a quorum (2-of-4 at 1.6 ms against
+  # 4-of-4 at 134 ms). Written that way this test failed about half its runs, and the diagnosis
+  # looked exactly like a replication bug: one follower short by one delta.
+  #
+  # So the two real promises are asserted separately: **a quorum's worth hold the bytes when the
+  # commit returns**, and **every follower converges** shortly after.
+  defp holders(followers, id, expected) do
+    Enum.count(followers, fn {name, _} ->
+      File.read(Follower.wal_path(name, id)) == {:ok, expected}
+    end)
+  end
+
+  defp await_wal(name, id, expected, timeout \\ 5_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    Stream.repeatedly(fn ->
+      if File.read(Follower.wal_path(name, id)) == {:ok, expected},
+        do: :converged,
+        else: Process.sleep(10)
+    end)
+    |> Enum.find(fn
+      :converged -> true
+      _ -> System.monotonic_time(:millisecond) > deadline
+    end)
+    |> case do
+      :converged -> :ok
+      _ -> flunk("follower #{name} never converged on the primary's WAL")
+    end
+  end
+
   test "a committed write reaches a follower quorum, byte-identical", ctx do
     %{id: id, root: root} = ctx
 
@@ -98,10 +130,10 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     primary_bytes = File.read!(wal)
     assert byte_size(primary_bytes) > 0, "the primary wrote no WAL — this test measured nothing"
 
-    for {name, _} <- followers do
-      assert File.read!(Follower.wal_path(name, id)) == primary_bytes,
-             "follower #{name} does not hold byte-identical WAL content"
-    end
+    assert holders(followers, id, primary_bytes) >= 2,
+           "the commit returned without a quorum's worth of followers holding the bytes"
+
+    for {name, _} <- followers, do: await_wal(name, id, primary_bytes)
 
     # A second commit ships only the delta, and the files stay identical.
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2, 'world')", [])
@@ -110,9 +142,9 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     grown = File.read!(wal)
     assert byte_size(grown) > byte_size(primary_bytes), "the second commit appended nothing"
 
-    for {name, _} <- followers do
-      assert File.read!(Follower.wal_path(name, id)) == grown
-    end
+    assert holders(followers, id, grown) >= 2
+
+    for {name, _} <- followers, do: await_wal(name, id, grown)
   end
 
   test "committing with nothing new ships nothing and still succeeds", ctx do

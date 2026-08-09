@@ -60,6 +60,13 @@ defmodule Fathom.Shard.Replication.Shipper do
   @spec push(GenServer.server(), Protocol.Push.t()) :: :ok
   def push(shipper, %Protocol.Push{} = p), do: GenServer.cast(shipper, {:push, p, self()})
 
+  @doc """
+  Send a base copy of a shard. Replies arrive exactly like `push/2`'s — same correlation, same
+  `{:repl_reply, shipper, result}` shape, since a seed is answered by an ack at the seeded offset.
+  """
+  @spec seed(GenServer.server(), Protocol.Seed.t()) :: :ok
+  def seed(shipper, %Protocol.Seed{} = s), do: GenServer.cast(shipper, {:push, s, self()})
+
   @doc "Whether the underlying socket is currently up. For tests and health reporting."
   @spec connected?(GenServer.server()) :: boolean()
   def connected?(shipper), do: GenServer.call(shipper, :connected?)
@@ -101,7 +108,7 @@ defmodule Fathom.Shard.Replication.Shipper do
       send(from, {:repl_reply, self(), {:reject, p.shard_id, :already_in_flight, 0}})
       {:noreply, state}
     else
-      case :gen_tcp.send(state.sock, Protocol.encode_push(p)) do
+      case :gen_tcp.send(state.sock, encode(p)) do
         :ok ->
           {:noreply, %{state | waiters: Map.put(state.waiters, p.shard_id, from)}}
 
@@ -178,6 +185,10 @@ defmodule Fathom.Shard.Replication.Shipper do
     Process.send_after(self(), :reconnect, @reconnect_backoff_ms)
     %{state | sock: nil, waiters: %{}}
   end
+
+  # A seed and a push are the same thing to this module: bytes for one shard, answered once.
+  defp encode(%Protocol.Push{} = p), do: Protocol.encode_push(p)
+  defp encode(%Protocol.Seed{} = s), do: Protocol.encode_seed(s)
 
   defp reply_to(state, shard, msg) do
     case Map.pop(state.waiters, shard) do

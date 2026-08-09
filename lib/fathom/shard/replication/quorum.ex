@@ -27,13 +27,12 @@ defmodule Fathom.Shard.Replication.Quorum do
   surface as an error rather than as latency.
   """
 
-  @enforce_keys [:n, :q, :offset]
-  defstruct [:n, :q, :offset, acked: MapSet.new(), rejected: MapSet.new()]
+  @enforce_keys [:n, :q]
+  defstruct [:n, :q, acked: MapSet.new(), rejected: MapSet.new()]
 
   @type t :: %__MODULE__{
           n: pos_integer(),
           q: pos_integer(),
-          offset: non_neg_integer(),
           acked: MapSet.t(),
           rejected: MapSet.t()
         }
@@ -44,14 +43,19 @@ defmodule Fathom.Shard.Replication.Quorum do
           | {:impossible, t()}
 
   @doc """
-  Start tracking a push to `n` followers needing `q` acks, expecting them at `offset`.
+  Start tracking a push to `n` followers needing `q` acks.
+
+  **Offset-free.** It used to carry a single expected offset, which quietly assumed every follower
+  was at the same position — true only until one falls behind and needs a catch-up delta. The
+  expectation is now per-follower and lives in `Fathom.Shard.Replication`, which knows what it sent
+  to whom; this module counts.
 
   Raises on `q >= n` or `q < 1`. This is a boot/config error, and the design doc's central measured
   finding is that `Q = N` silently converts every follower from redundancy into a liability — so it
   must be impossible to construct, not merely discouraged in a comment.
   """
-  @spec new(pos_integer(), pos_integer(), non_neg_integer()) :: t()
-  def new(n, q, offset) when is_integer(n) and is_integer(q) do
+  @spec new(pos_integer(), pos_integer()) :: t()
+  def new(n, q) when is_integer(n) and is_integer(q) do
     cond do
       q < 1 ->
         raise ArgumentError, "write quorum must be at least 1, got #{q}"
@@ -63,25 +67,20 @@ defmodule Fathom.Shard.Replication.Quorum do
                 "docs/a2-quorum-replication.md)"
 
       true ->
-        %__MODULE__{n: n, q: q, offset: offset}
+        %__MODULE__{n: n, q: q}
     end
   end
 
   @doc """
-  Record an ack from `follower` for `next_offset`.
+  Record an ack from `follower`.
 
-  An ack for an offset other than the one this push produces is treated as a **rejection**, not an
-  ack. The two sides disagreeing about the follower's position is exactly the divergence the
-  offset field exists to catch, and counting it toward the quorum would let a follower that is
-  writing the wrong bytes satisfy a commit.
+  The caller must already have checked that the acked offset is the one it expected from THAT
+  follower — an ack for a different position means the two sides disagree about where the follower
+  is, and counting it would let a replica holding the wrong bytes satisfy a commit. See
+  `Fathom.Shard.Replication.collect/4`, which rejects instead of acking in that case.
   """
-  @spec ack(t(), term(), non_neg_integer()) :: outcome()
-  def ack(%__MODULE__{offset: expected} = state, follower, next_offset)
-      when next_offset != expected do
-    reject(state, follower, :offset_mismatch, next_offset)
-  end
-
-  def ack(%__MODULE__{} = state, follower, _next_offset) do
+  @spec ack(t(), term()) :: outcome()
+  def ack(%__MODULE__{} = state, follower) do
     # Idempotent: a duplicate ack from the same follower must not count twice, or a single chatty
     # follower could satisfy a quorum by itself.
     state = %{state | acked: MapSet.put(state.acked, follower)}
@@ -91,11 +90,11 @@ defmodule Fathom.Shard.Replication.Quorum do
   @doc """
   Record a refusal (or a dead connection) from `follower`.
 
-  `_expected` is accepted and ignored here on purpose: rewinding and re-sending is the shipper's
-  job, and threading it through the counter would make this module care about retransmission.
+  Why it refused is not this module's business: rewinding, catching up and re-seeding are all the
+  caller's job, and threading a reason through the counter would make it care about retransmission.
   """
-  @spec reject(t(), term(), atom(), non_neg_integer()) :: outcome()
-  def reject(%__MODULE__{} = state, follower, _reason, _expected) do
+  @spec reject(t(), term()) :: outcome()
+  def reject(%__MODULE__{} = state, follower) do
     state = %{state | rejected: MapSet.put(state.rejected, follower)}
     settle(state)
   end

@@ -149,55 +149,56 @@ defmodule Fathom.Shard.ReplicationTest do
     test "Q = N is impossible to construct" do
       # The measured finding the design rests on: Q=N tolerates zero follower failures and inherits
       # the slowest replica (32-82x worse). It must not be reachable by config.
-      assert_raise ArgumentError, ~r/must be < 4 followers/, fn -> Quorum.new(4, 4, 0) end
-      assert_raise ArgumentError, ~r/must be < 4 followers/, fn -> Quorum.new(4, 5, 0) end
-      assert_raise ArgumentError, ~r/at least 1/, fn -> Quorum.new(4, 0, 0) end
+      assert_raise ArgumentError, ~r/must be < 4 followers/, fn -> Quorum.new(4, 4) end
+      assert_raise ArgumentError, ~r/must be < 4 followers/, fn -> Quorum.new(4, 5) end
+      assert_raise ArgumentError, ~r/at least 1/, fn -> Quorum.new(4, 0) end
     end
 
     test "reaches at exactly Q acks, not before" do
-      q = Quorum.new(4, 2, 100)
+      q = Quorum.new(4, 2)
 
-      assert {:pending, q} = Quorum.ack(q, :f1, 100)
+      assert {:pending, q} = Quorum.ack(q, :f1)
       assert Quorum.remaining(q) == 1
-      assert {:reached, q} = Quorum.ack(q, :f2, 100)
+      assert {:reached, q} = Quorum.ack(q, :f2)
       assert Quorum.remaining(q) == 0
     end
 
     test "one chatty follower cannot satisfy a quorum by itself" do
-      q = Quorum.new(4, 2, 100)
+      q = Quorum.new(4, 2)
 
-      assert {:pending, q} = Quorum.ack(q, :f1, 100)
-      assert {:pending, q} = Quorum.ack(q, :f1, 100)
-      assert {:pending, _} = Quorum.ack(q, :f1, 100)
+      assert {:pending, q} = Quorum.ack(q, :f1)
+      assert {:pending, q} = Quorum.ack(q, :f1)
+      assert {:pending, _} = Quorum.ack(q, :f1)
     end
 
-    test "an ack for the wrong offset counts AGAINST the quorum, not toward it" do
-      # A follower that is writing at a different position is diverged, not in step. Counting it
-      # would let a follower with the wrong bytes satisfy a commit.
-      q = Quorum.new(4, 2, 100)
+    test "a rejected follower does not count toward the quorum" do
+      # The offset check itself now lives in Replication.collect/5, which knows what it sent to
+      # WHOM — a single expected offset in here assumed every follower was at the same position,
+      # which is exactly the assumption that made catch-up impossible.
+      q = Quorum.new(4, 2)
 
-      assert {:pending, q} = Quorum.ack(q, :f1, 999)
+      assert {:pending, q} = Quorum.reject(q, :f1)
       assert Quorum.remaining(q) == 2
-      assert {:pending, q} = Quorum.ack(q, :f2, 100)
-      assert {:reached, _} = Quorum.ack(q, :f3, 100)
+      assert {:pending, q} = Quorum.ack(q, :f2)
+      assert {:reached, _} = Quorum.ack(q, :f3)
     end
 
     test "fails fast once the quorum has become unreachable" do
       # 4 followers, need 2: after 3 rejections only one can still ack, so waiting is an outage
       # dressed up as latency.
-      q = Quorum.new(4, 2, 100)
+      q = Quorum.new(4, 2)
 
-      assert {:pending, q} = Quorum.reject(q, :f1, :offset_mismatch, 0)
-      assert {:pending, q} = Quorum.reject(q, :f2, :stale_epoch, 0)
-      assert {:impossible, _} = Quorum.reject(q, :f3, :internal, 0)
+      assert {:pending, q} = Quorum.reject(q, :f1)
+      assert {:pending, q} = Quorum.reject(q, :f2)
+      assert {:impossible, _} = Quorum.reject(q, :f3)
     end
 
     test "a reached quorum is not undone by a later rejection" do
       # The stragglers' fate does not change a commit that has already been acknowledged.
-      q = Quorum.new(4, 2, 100)
-      assert {:pending, q} = Quorum.ack(q, :f1, 100)
-      assert {:reached, q} = Quorum.ack(q, :f2, 100)
-      assert {:reached, _} = Quorum.reject(q, :f3, :internal, 0)
+      q = Quorum.new(4, 2)
+      assert {:pending, q} = Quorum.ack(q, :f1)
+      assert {:reached, q} = Quorum.ack(q, :f2)
+      assert {:reached, _} = Quorum.reject(q, :f3)
     end
   end
 end

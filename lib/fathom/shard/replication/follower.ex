@@ -110,6 +110,9 @@ defmodule Fathom.Shard.Replication.Follower do
   @doc false
   def wal_path(name \\ __MODULE__, shard_id), do: Path.join(dir(name), shard_id <> ".db-wal")
 
+  @doc false
+  def db_path(name \\ __MODULE__, shard_id), do: Path.join(dir(name), shard_id <> ".db")
+
   # ------------------------------------------------------------------------------------------
   # server
   # ------------------------------------------------------------------------------------------
@@ -188,6 +191,11 @@ defmodule Fathom.Shard.Replication.Follower do
             :ok = :gen_tcp.send(sock, reply)
             serve(sock, name)
 
+          {:ok, %Protocol.Seed{} = seed} ->
+            reply = handle_seed(name, seed)
+            :ok = :gen_tcp.send(sock, reply)
+            serve(sock, name)
+
           {:ok, other} ->
             # A follower receiving an ack means someone pointed a primary at a primary.
             Logger.warning("replication follower got a non-push message: #{inspect(other)}")
@@ -203,6 +211,41 @@ defmodule Fathom.Shard.Replication.Follower do
       {:error, _} ->
         :gen_tcp.close(sock)
     end
+  end
+
+  # Install a fresh base copy of a shard: both files replaced, state set to whatever the primary
+  # says those bytes leave us at.
+  #
+  # Unconditional by design — a seed is the primary asserting "discard whatever you have". It is
+  # sent when a follower is new, and again when one has fallen far enough behind that a delta
+  # cannot close the gap, so refusing it because we already hold something would make the
+  # unrecoverable case unrecoverable.
+  #
+  # `.db` is written BEFORE `-wal`: a crash between the two leaves a database with no WAL, which
+  # SQLite reads as a valid (if stale) file. The other order leaves a WAL whose salts do not match
+  # the database, which is the corrupt-looking state.
+  defp handle_seed(name, %Protocol.Seed{} = seed) do
+    with :ok <- File.write(db_path(name, seed.shard_id), seed.db),
+         :ok <- File.write(wal_path(name, seed.shard_id), seed.wal) do
+      :ets.insert(
+        table(name),
+        {seed.shard_id, FollowerLog.seeded(seed.epoch, seed.wal_gen, seed.wal_offset)}
+      )
+
+      Logger.info(
+        "replication seeded #{seed.shard_id}: #{byte_size(seed.db)}B db + " <>
+          "#{byte_size(seed.wal)}B wal at gen #{seed.wal_gen} offset #{seed.wal_offset}"
+      )
+
+      Protocol.encode_ack(seed.shard_id, seed.wal_offset)
+    else
+      {:error, reason} ->
+        Logger.error("replication seed failed for #{seed.shard_id}: #{inspect(reason)}")
+        Protocol.encode_reject(seed.shard_id, :internal, 0)
+    end
+  rescue
+    ArgumentError ->
+      Protocol.encode_reject(seed.shard_id, :internal, 0)
   end
 
   # Returns the iodata to send back. All the judgement is in FollowerLog; this only performs it.

@@ -39,6 +39,7 @@ defmodule Fathom.Shard.Replication.Protocol do
   @push 1
   @ack 2
   @reject 3
+  @seed 4
 
   # Reject reasons. Integers on the wire — see the moduledoc on not minting atoms from bytes.
   @reasons %{
@@ -49,6 +50,31 @@ defmodule Fathom.Shard.Replication.Protocol do
     5 => :internal
   }
   @reason_codes Map.new(@reasons, fn {k, v} -> {v, k} end)
+
+  defmodule Seed do
+    @moduledoc """
+    A follower's initial copy of a shard: the live `.db` bytes plus the `-wal` bytes, and the
+    replication state they leave the follower in.
+
+    **The bytes come from the primary's LIVE file, never from S3.** Fathom's durable object is a
+    `VACUUM INTO` snapshot — a rebuilt, defragmented database whose page layout differs from the
+    live file (measured: 65,536 bytes against 118,784 live for the same data). WAL frames reference
+    page numbers in the *primary's* layout, so appending them to a VACUUM'd copy applies the right
+    frames to the wrong pages. Silent corruption, and "just pull it from S3 like `WarmFollower`
+    does" is the obvious-looking answer that causes it.
+    """
+    @enforce_keys [:shard_id, :epoch, :wal_gen, :wal_offset, :db, :wal]
+    defstruct [:shard_id, :epoch, :wal_gen, :wal_offset, :db, :wal]
+
+    @type t :: %__MODULE__{
+            shard_id: String.t(),
+            epoch: non_neg_integer(),
+            wal_gen: non_neg_integer(),
+            wal_offset: non_neg_integer(),
+            db: binary(),
+            wal: binary()
+          }
+  end
 
   defmodule Push do
     @moduledoc "A primary's frame delta for one shard."
@@ -75,6 +101,24 @@ defmodule Fathom.Shard.Replication.Protocol do
       <<@version::8, @push::8, byte_size(shard)::16, p.epoch::64, p.wal_gen::64, p.offset::64>>,
       shard,
       p.payload
+    ]
+  end
+
+  @doc """
+  Encode a seed. Returns iodata — neither blob is copied.
+
+  The whole database travels in one frame. That is fine for the shard sizes fathom targets and
+  deliberately simple, but it does mean both sides hold the file in memory: chunking is the
+  obvious next step for large tenants and is not done here.
+  """
+  @spec encode_seed(Seed.t()) :: iodata()
+  def encode_seed(%Seed{} = s) do
+    [
+      <<@version::8, @seed::8, byte_size(s.shard_id)::16, s.epoch::64, s.wal_gen::64,
+        s.wal_offset::64, byte_size(s.db)::64>>,
+      s.shard_id,
+      s.db,
+      s.wal
     ]
   end
 
@@ -120,6 +164,7 @@ defmodule Fathom.Shard.Replication.Protocol do
   """
   @spec decode(binary()) ::
           {:ok, Push.t()}
+          | {:ok, Seed.t()}
           | {:ok, {:ack, String.t(), non_neg_integer()}}
           | {:ok, {:reject, String.t(), atom(), non_neg_integer()}}
           | {:error, :malformed | :unsupported_version}
@@ -128,6 +173,15 @@ defmodule Fathom.Shard.Replication.Protocol do
     <<shard::binary-size(^slen), payload::binary>> = rest
 
     {:ok, %Push{shard_id: shard, epoch: epoch, wal_gen: gen, offset: off, payload: payload}}
+  end
+
+  def decode(
+        <<@version::8, @seed::8, slen::16, epoch::64, gen::64, off::64, dblen::64, rest::binary>>
+      )
+      when byte_size(rest) >= slen + dblen do
+    <<shard::binary-size(^slen), db::binary-size(^dblen), wal::binary>> = rest
+
+    {:ok, %Seed{shard_id: shard, epoch: epoch, wal_gen: gen, wal_offset: off, db: db, wal: wal}}
   end
 
   def decode(<<@version::8, @ack::8, slen::16, next::64, shard::binary-size(slen)>>) do
