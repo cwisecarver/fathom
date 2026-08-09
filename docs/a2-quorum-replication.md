@@ -253,6 +253,34 @@ it is not cheaply reversible — which is why the gates below survive the decisi
 (cluster-architecture "Why not the alternatives"). Those fail on Filo's entry-node-local stream
 batons, not on the S3 rule. A2 replicates **committed data**; it does not move **streams**.
 
+## What a replicated write actually costs (measured 2026-08-09)
+
+Gate 2 measured the quorum ack on raw sockets; the bench gate measured the hot path with
+replication **off**. Neither says what a real fathom write costs with it **on**, because the
+composition adds work neither touched: a WAL header read, a `pread` of the delta, a `GenServer`
+hop into the per-shard `Session`, and the encode.
+
+`test/fathom/shard/replication_cost_test.exs` (`:bench`) measures the same write both ways.
+N=3, Q=2, loopback followers, RAM ack, p50 of 200 samples:
+
+| | p50 |
+|---|---|
+| write only (replication off) | **74 µs** |
+| write + replication | **299 µs** |
+| **added by replication** | **225 µs (4.04×)** |
+
+Read alongside the two numbers that bracket it: gate 2's raw-socket 2-of-4 floor was ~96 µs, so
+roughly **130 µs of the 225 is fathom's own overhead** rather than the transport. And fathom's whole
+per-request round trip (`hrana_rt_us`) is ~127 µs, so a replicated write costs about **two extra
+request round trips of local work** before any network is involved.
+
+**With replication OFF the cost is noise** — the gate check is one `Application.get_env` per write,
+and the bench gate measured `hrana_rt_us` 127 → 130 µs across the integration commit.
+
+**Deployment cost is this plus one RTT to the 2nd-fastest follower**, which dominates it: same-AZ
+~0.1–0.25 ms, cross-AZ ~0.5–1.5 ms. That is why placement, not replica count, is the decision — see
+the RTT sweep above.
+
 ## What it would and would not improve
 
 - **Would:** node-loss RPO from ~300 s to ~0. This is the entire benefit.
