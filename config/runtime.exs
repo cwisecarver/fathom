@@ -495,6 +495,66 @@ if n = env_int.("WARM_REFRESH_BYTES_PER_S") do
   config :fathom, :warm_refresh_bytes_per_s, n
 end
 
+# ---- Quorum replication (Phase 2 A2) ------------------------------------------------------
+# Off by default, like every other Phase 2 component. Until this section existed A2 had NO
+# runtime gate at all — every knob was reachable only from `Application.put_env` in tests, so the
+# feature was unshippable regardless of how finished the code was.
+#
+# READ docs/a2-quorum-replication.md BEFORE enabling. Turning this on puts a network round trip
+# inside every tenant COMMIT, and the measured cost is dominated by WHERE the followers are, not
+# how many: with two near and two far, a quorum acks in ~1.6 ms while all-N pays 134 ms on the
+# same replicas. Placement is the decision; replica count is not.
+if System.get_env("REPLICATION_ENABLED") in ~w(true 1) do
+  config :fathom, :replication_enabled, true
+end
+
+# The follower set, as `node_key@host:port` pairs, e.g.
+# REPLICATION_FOLLOWERS="fathom2@10.0.1.2:9100,fathom3@10.0.2.3:9100".
+#
+# `node_key` matches `Fathom.Rebalancer.node_key/0` (NODE_KEY) so a follower is identifiable in
+# logs, telemetry and `Fleet.health/0` rather than an anonymous address.
+#
+# ORDER AND LOCALITY ARE A LATENCY DECISION. A quorum skips the SLOWEST replicas, so it buys
+# nothing unless a quorum's worth are near: measured 2-of-4 tracked 4-of-4 exactly at every
+# latency when all four sat at the same distance. With Q=2 that means TWO near followers, and
+# they should be in a nearby but DIFFERENT AZ — two in the primary's own AZ means one AZ failure
+# takes three of five copies and leaves exactly Q with no slack.
+if spec = System.get_env("REPLICATION_FOLLOWERS") do
+  config :fathom, :replication_followers, Fathom.Shard.Replication.Fleet.parse_followers!(spec)
+end
+
+# Acks required before a tenant's commit returns. MUST be < the follower count, and
+# `Fleet.validate_quorum!/0` refuses to boot otherwise: Q=N tolerates zero follower failures and
+# inherits the slowest replica's latency — measured 32× worse with one straggler on loopback and
+# 82× worse with two far followers.
+if n = env_int.("REPLICATION_QUORUM") do
+  config :fathom, :replication_quorum, n
+end
+
+# Whether a follower fdatasyncs before acking. Off matches Waterpark, which acks from RAM and
+# takes durability from replica count. Measured cost of turning it on: ~398 µs against a ~96 µs
+# floor, i.e. ~2.4× fathom's whole current request round trip. Off is never WORSE than today
+# either — if every replica holding an un-synced frame dies at once, the shard falls back to its
+# S3 object, which is exactly the pre-A2 behaviour.
+if System.get_env("REPLICATION_FSYNC") in ~w(true 1) do
+  config :fathom, :replication_fsync, true
+end
+
+# How long a commit waits for its quorum before failing with 503 FILO_NO_QUORUM. This is a
+# ceiling on tenant write latency when followers are unreachable, not a target — the quorum
+# reports :impossible and returns early as soon as too few followers remain, so this only binds
+# when a follower is silent rather than refusing.
+if ms = env_int.("REPLICATION_TIMEOUT_MS") do
+  config :fathom, :replication_timeout_ms, ms
+end
+
+# Bytes per frame when seeding a follower's base copy. Bounds MEMORY on both sides (a seed is a
+# whole database); it does not bound head-of-line blocking, since one socket per follower node
+# carries every shard. Default 4 MiB.
+if n = env_int.("REPLICATION_SEED_CHUNK_BYTES") do
+  config :fathom, :replication_seed_chunk_bytes, n
+end
+
 # ---- Admin dashboard (/admin + /admin/metrics) BasicAuth ----------------------------------
 # Credentials for the operator surface. The router's admin_auth plug fails closed (503) when
 # unset, so the dashboard/scrape is never anonymously reachable — set both to enable it. Read in

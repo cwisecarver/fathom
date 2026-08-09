@@ -271,6 +271,49 @@ defmodule Fathom.Admin.Measurements do
     end
   end
 
+  @doc """
+  Quorum-replication follower state (Phase 2 A2).
+
+  Emits `[:fathom, :replication, :followers]` with `configured`, `connected`, `quorum` and
+  `slack` (`connected - quorum`).
+
+  **`slack` is the number this exists for.** A commit needs `quorum` acks, so a fleet with exactly
+  `quorum` followers connected still succeeds on every write — and is one loss away from every
+  write failing. That state is invisible from the outside: latency is normal, no error rate moves,
+  and the shard reports healthy right up until it does not. The pre-A2 gauges cannot show it
+  either, because they measure S3 and disk.
+
+  A separate `[:fathom, :replication, :degraded]` event was written first and removed:
+  `TelemetryCoverageTest` caught that nothing exported it, and it was redundant anyway — `slack`
+  is a number, and `== 0` / `< 0` are the two alert conditions
+  (`deploy/observability/alert-rules.yml`). A second event carrying strictly less information is
+  not a signal, it is a thing to keep in sync. Do not re-add it.
+
+  A no-op when replication is off, so a node that never enabled A2 emits nothing rather than a
+  permanently-degraded zero.
+
+  Uses `Fleet.connection_status/0`, **not** `Fleet.health/0`: this rides the 10 s poller, which
+  this module's own contract keeps Postgres-free (only the 30 s Oban poller may query the DB). The
+  roster's liveness view is the dashboard's, not this gauge's.
+  """
+  @spec replication() :: :ok
+  def replication do
+    if Fathom.Shard.Replication.Session.enabled?() do
+      status = Fathom.Shard.Replication.Fleet.connection_status()
+      quorum = Application.get_env(:fathom, :replication_quorum, 2)
+      connected = Enum.count(status, fn {_key, up?} -> up? end)
+      slack = connected - quorum
+
+      :telemetry.execute(
+        [:fathom, :replication, :followers],
+        %{configured: length(status), connected: connected, quorum: quorum, slack: slack},
+        %{}
+      )
+    end
+
+    :ok
+  end
+
   defp configured_queues do
     :fathom
     |> Application.get_env(Oban, [])

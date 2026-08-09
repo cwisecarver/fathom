@@ -30,6 +30,11 @@ defmodule Fathom.Shard.Replication.Fleet do
   @registry Fathom.Shard.Replication.SessionRegistry
   @sessions Fathom.Shard.Replication.SessionSupervisor
   @shippers_key {__MODULE__, :shippers}
+  @running_key {__MODULE__, :running}
+
+  # How recently a node must have beaten in Postgres to count as live. Generous on purpose: this
+  # feeds an operator gauge, and a false "dead" on a slow beat is worse than a stale "alive".
+  @alive_window_ms 60_000
 
   def start_link(opts), do: Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
 
@@ -43,25 +48,169 @@ defmodule Fathom.Shard.Replication.Fleet do
   @spec shippers() :: [pid() | atom()]
   def shippers, do: :persistent_term.get(@shippers_key, [])
 
-  @doc "Configured followers as `{host, port}` tuples."
-  @spec followers() :: [{String.t() | charlist(), :inet.port_number()}]
+  @doc """
+  Configured followers, in either accepted shape.
+
+  `{node_key, host, port}` is what `REPLICATION_FOLLOWERS` produces. `{host, port}` is the older
+  anonymous form and still works — it is what the test suite passes, and a config shape change is
+  not a reason to churn every test. Use `endpoints/0` to get one normalised shape.
+  """
+  @spec followers() :: [
+          {String.t() | charlist(), :inet.port_number()}
+          | {String.t(), String.t() | charlist(), :inet.port_number()}
+        ]
   def followers, do: Application.get_env(:fathom, :replication_followers, [])
+
+  @doc """
+  Configured followers normalised to `{node_key, host, port}`.
+
+  An anonymous `{host, port}` gets `"host:port"` as its key. That is only an identifier for logs,
+  telemetry and `health/0` — nothing routes on it — so a synthesized one is honest rather than
+  forcing every caller to supply a name it does not have.
+  """
+  @spec endpoints() :: [{String.t(), String.t() | charlist(), :inet.port_number()}]
+  def endpoints, do: Enum.map(followers(), &normalise/1)
+
+  defp normalise({node_key, host, port}), do: {to_string(node_key), host, port}
+  defp normalise({host, port}), do: {"#{to_string(host)}:#{port}", host, port}
+
+  @doc """
+  Parse `REPLICATION_FOLLOWERS` — `node_key@host:port` pairs, comma separated.
+
+  The `node_key@` prefix is optional. Raises on anything it cannot parse, because the alternative
+  is a node booting with a silently shorter follower list than the operator wrote: replication
+  would run, the quorum would pass, and the shard would be under-replicated with no error anywhere.
+  A boot failure is the correct direction for a malformed replica set.
+  """
+  @spec parse_followers!(String.t()) :: [{String.t(), String.t(), :inet.port_number()}]
+  def parse_followers!(spec) when is_binary(spec) do
+    spec
+    |> String.split(",", trim: true)
+    |> Enum.map(&parse_follower!(String.trim(&1), spec))
+  end
+
+  defp parse_follower!(entry, spec) do
+    {node_key, address} =
+      case String.split(entry, "@", parts: 2) do
+        [key, addr] -> {String.trim(key), String.trim(addr)}
+        [addr] -> {nil, String.trim(addr)}
+      end
+
+    # Exactly two colon-separated parts. An IPv6 literal has more and is rejected rather than
+    # truncated at its first colon into a plausible-looking host that would connect somewhere else.
+    with [host, port_str] <- String.split(address, ":"),
+         {port, ""} <- Integer.parse(String.trim(port_str)),
+         true <- host != "" and port in 1..65_535 do
+      {node_key || "#{host}:#{port}", host, port}
+    else
+      _ -> raise ArgumentError, bad_follower(entry, spec)
+    end
+  end
+
+  defp bad_follower(entry, spec) do
+    "REPLICATION_FOLLOWERS entry #{inspect(entry)} is not `node_key@host:port` with a port in " <>
+      "1..65535 (full value: #{inspect(spec)}). IPv6 literals are not supported. Refusing to " <>
+      "boot rather than start with a shorter follower list than was configured — that would " <>
+      "under-replicate every shard while the quorum still passed."
+  end
+
+  @doc """
+  Per-follower operational state, for the dashboard and the periodic gauge.
+
+  `connected?` is the socket. `alive?` is whether that `node_key` has beaten into the Postgres
+  roster recently (`Fathom.Rebalancer.Nodes.alive/1`), or `:unknown` when the roster cannot be read
+  or the follower has no registered key.
+
+  **This is observability, and deliberately nothing more.** Liveness must never filter the
+  per-commit push set: shrinking `n` is exactly how `q >= n` starts raising inside a tenant's
+  commit, and a disconnected follower already costs nothing — `Shipper` refuses it without a socket
+  write and `Quorum` reports `:impossible` as soon as too few remain. A remote, flappable signal
+  cannot improve on that and can only add a way to break writes. It is also why this is called on a
+  timer and never from `Session.commit/3`: it touches Postgres, and a Postgres outage must not
+  reach the write path.
+  """
+  @spec health() :: [
+          %{
+            node_key: String.t(),
+            host: String.t(),
+            port: :inet.port_number(),
+            connected?: boolean(),
+            alive?: boolean() | :unknown
+          }
+        ]
+  def health do
+    live = live_node_keys()
+
+    for {node_key, host, port, name} <- running() do
+      %{
+        node_key: node_key,
+        host: to_string(host),
+        port: port,
+        connected?: connected?(name),
+        alive?: alive?(live, node_key)
+      }
+    end
+  end
+
+  @doc """
+  Socket state per follower, as `{node_key, connected?}` — and **nothing that touches Postgres**.
+
+  Split out from `health/0` for one reason: the 10 s telemetry poller is documented as
+  Postgres-free (`Fathom.Telemetry.init/1`, where only the 30 s Oban poller may query the DB), and
+  the signal an operator needs paged on — how many followers can actually ack right now — is
+  socket state alone. The roster's `alive?` is dashboard colour and belongs on the slower,
+  DB-aware path.
+  """
+  @spec connection_status() :: [{String.t(), boolean()}]
+  def connection_status do
+    for {node_key, _host, _port, name} <- running(), do: {node_key, connected?(name)}
+  end
+
+  @doc "The followers actually supervised right now, as `{node_key, host, port, shipper_name}`."
+  @spec running() :: [{String.t(), String.t() | charlist(), :inet.port_number(), atom()}]
+  def running, do: :persistent_term.get(@running_key, [])
+
+  defp connected?(name) do
+    Fathom.Shard.Replication.Shipper.connected?(name)
+  catch
+    # A shipper mid-restart is not connected; it is not a reason to crash the caller's poller.
+    :exit, _ -> false
+  end
+
+  defp alive?(:unknown, _node_key), do: :unknown
+  defp alive?(live, node_key), do: MapSet.member?(live, node_key)
+
+  # Fails open to `:unknown` rather than to `false`: reporting every follower dead because Postgres
+  # blinked would page an operator toward the wrong system entirely.
+  defp live_node_keys do
+    Fathom.Rebalancer.Nodes.alive(@alive_window_ms)
+  rescue
+    _ -> :unknown
+  catch
+    _, _ -> :unknown
+  end
 
   @impl true
   def init(_opts) do
     validate_quorum!()
 
-    names =
-      followers()
+    running =
+      endpoints()
       |> Enum.with_index()
-      |> Enum.map(fn {{_h, _p}, i} -> Module.concat(__MODULE__, :"Shipper#{i}") end)
+      |> Enum.map(fn {{node_key, host, port}, i} ->
+        {node_key, host, port, Module.concat(__MODULE__, :"Shipper#{i}")}
+      end)
 
+    names = Enum.map(running, fn {_k, _h, _p, name} -> name end)
+
+    # Two terms rather than one: `shippers/0` is read on the commit path and must stay a bare list
+    # of names, while `running/0` carries the identity `health/0` reports. Keeping the hot read
+    # free of the operator metadata is the same reasoning that put this in `:persistent_term`.
     :persistent_term.put(@shippers_key, names)
+    :persistent_term.put(@running_key, running)
 
     shipper_specs =
-      followers()
-      |> Enum.zip(names)
-      |> Enum.map(fn {{host, port}, name} ->
+      Enum.map(running, fn {_node_key, host, port, name} ->
         Supervisor.child_spec(
           {Fathom.Shard.Replication.Shipper, name: name, host: host, port: port},
           id: name

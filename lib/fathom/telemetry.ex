@@ -39,7 +39,8 @@ defmodule Fathom.Telemetry do
            {Fathom.Admin.Measurements, :node_memory, []},
            {Fathom.Admin.Measurements, :vm_limits, []},
            {Fathom.Admin.Measurements, :durability, []},
-           {Fathom.Admin.Measurements, :disk, []}
+           {Fathom.Admin.Measurements, :disk, []},
+           {Fathom.Admin.Measurements, :replication, []}
          ],
          period: 10_000,
          name: Fathom.ShardPoller}
@@ -281,6 +282,26 @@ defmodule Fathom.Telemetry do
         measurement: :used_ratio,
         tags: [:dir],
         description: "Used fraction of the volume holding this directory (1.0 = full)"
+      ),
+      last_value("fathom.replication.followers.connected",
+        event_name: [:fathom, :replication, :followers],
+        measurement: :connected,
+        description: "Followers whose replication socket is up right now (A2)"
+      ),
+      last_value("fathom.replication.followers.configured",
+        event_name: [:fathom, :replication, :followers],
+        measurement: :configured,
+        description: "Followers in :replication_followers (A2)"
+      ),
+      # The one to alert on. A commit needs `quorum` acks, so slack=0 means every write still
+      # succeeds and the next follower loss fails all of them — a state with no other symptom:
+      # latency is normal, no error rate moves, and the shard reports healthy until it doesn't.
+      last_value("fathom.replication.followers.slack",
+        event_name: [:fathom, :replication, :followers],
+        measurement: :slack,
+        description:
+          "Connected followers minus the write quorum. 0 = every write succeeds and one more " <>
+            "follower loss fails all of them; negative = writes are already failing FILO_NO_QUORUM"
       ),
       last_value("fathom.durability.dirty_shards",
         event_name: [:fathom, :durability, :rpo],

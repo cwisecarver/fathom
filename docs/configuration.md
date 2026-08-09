@@ -161,6 +161,31 @@ tenant-controllable signal, so it presumes the Hrana trust boundary is enforced.
 | `WARM_MIN_REPULL_MS` | 10 × `WARM_POLL_MS` | Floor on how often ONE cached shard's body may be re-transferred. | **This is what bounds the follower's steady-state cost.** A continuously-written tenant flushes faster than the poll, so without it every refresh is a full body + fsync, forever. Worst-case ingress is Σ(cached sizes) ÷ this. Raising it trades failover RTO on write-hot shards for bandwidth and device writes — never correctness, since promotion revalidates before serving. |
 | `WARM_REFRESH_BYTES_PER_S` | unset (uncapped) | Hard cap on warm-refresh ingress, spent lag-first. | Bounds the aggregate independently of cache size — set it to what the node's NIC/disk can spare. Too small doesn't break the cache, it just converges it more slowly (oldest-checked shard first, so the tail is never starved). |
 
+## Quorum replication (Phase-2 A2 — off by default)
+
+Ships WAL frames to follower nodes and gates a tenant's commit on `REPLICATION_QUORUM` acks.
+Closes node-loss RPO from ~300 s to ~0, and it is the only thing that does. Read
+[`docs/a2-quorum-replication.md`](a2-quorum-replication.md) before enabling: this puts a network
+round trip inside every COMMIT.
+
+**Placement is the decision, not replica count.** A quorum skips the *slowest* replicas, so it buys
+nothing unless a quorum's worth are near: with all four followers equidistant, 2-of-4 tracked 4-of-4
+exactly at every latency measured. With two near and two far, 2-of-4 acks in ~1.6 ms where 4-of-4
+pays 134 ms — same replicas, 82×.
+
+| Var | Default | What it does | Safety consequence |
+|---|---|---|---|
+| `REPLICATION_ENABLED` | off | Gate a tenant's commit on follower acks. | Adds a network round trip to every write. Measured +225 µs on loopback (74 → 299 µs); the real number is set by follower distance. |
+| `REPLICATION_FOLLOWERS` | unset | Follower set as `node_key@host:port`, comma separated. `node_key@` optional. | **Order and locality are a latency decision** (see above). With `Q=2`, two followers must be near — and in a *different* AZ, or one AZ failure takes 3 of 5 copies and leaves exactly `Q` with no slack. A malformed entry **refuses to boot** rather than silently shortening the replica set. |
+| `REPLICATION_QUORUM` | `2` | Acks required before a commit returns. | **Must be < the follower count**; the boot check refuses `Q=N`. Q=N tolerates zero follower failures and inherits the slowest replica — measured 32× worse with one straggler, 82× with two far. |
+| `REPLICATION_FSYNC` | off | Follower `fdatasync`s before acking. | On costs ~398 µs against a ~96 µs floor — ~2.4× fathom's whole request round trip. Off matches Waterpark (ack from RAM, durability from replica count) and is never *worse* than today: if every replica holding an un-synced frame dies at once, the shard falls back to its S3 object, i.e. pre-A2 behaviour. |
+| `REPLICATION_TIMEOUT_MS` | `5000` | How long a commit waits for its quorum before 503 `FILO_NO_QUORUM`. | A ceiling, not a target — the quorum returns early with `:impossible` as soon as too few followers remain, so this only binds when a follower is *silent* rather than refusing. |
+| `REPLICATION_SEED_CHUNK_BYTES` | `4194304` | Frame size when seeding a follower's base copy. | Bounds **memory** on both sides (a seed is a whole database). Does **not** bound head-of-line blocking: one socket per follower node carries every shard, so a large seed still delays other shards on that link. |
+
+Watch `fathom_replication_followers_slack` (connected followers minus the quorum). `0` means every
+write still succeeds and one more follower loss fails all of them — a state with no other symptom.
+Alert rules for both `0` and negative are in `deploy/observability/alert-rules.yml`.
+
 ## Development tooling
 
 | Variable | Default | What it does | Notes |
