@@ -38,7 +38,7 @@ defmodule Fathom.Shard.Replication.Session do
   alias Fathom.Shard.Replication
   alias Fathom.Shard.Replication.Primary
   alias Fathom.Shard.Replication.Protocol.Push
-  alias Fathom.Shard.Replication.Protocol.Seed
+  alias Fathom.Shard.Replication.Protocol.SeedBegin
   alias Fathom.Shard.Replication.Shipper
   alias Fathom.Shard.Replication.Wal
 
@@ -524,44 +524,123 @@ defmodule Fathom.Shard.Replication.Session do
     end)
   end
 
-  # Read a CONSISTENT base copy and send it.
+  # Stream a CONSISTENT base copy.
   #
   # In WAL mode the `.db` file is only rewritten by a checkpoint, so reading it alongside the `-wal`
   # is safe as long as no checkpoint intervenes. The generation is read before AND after: if it
   # moved, a checkpoint rebuilt the `.db` under us and the two halves are from different points in
   # time — which would hand the follower a database and a WAL whose salts do not match. Retrying is
   # correct and cheap; shipping the inconsistent pair is neither.
+  #
+  # Streaming widens that window (the copy now takes as long as the transfer rather than as long as
+  # a `File.read`), which is exactly why the check moved to AFTER the last chunk and gained an
+  # explicit `seed_abort`: the follower must be told to drop what it has, and the sender must not
+  # then sit on its own timeout.
+  #
+  # Nothing here holds the database in memory — `:file.pread` walks it a chunk at a time. That is
+  # the point of the change: the old path did `File.read(db_path)`, so a 2 GB tenant was 2 GB
+  # resident on the primary and again on the follower.
   defp do_seed(shipper, shard_id, db_path, wal_path, epoch) do
     with {:ok, before} <- Wal.read(wal_path),
-         {:ok, db} <- File.read(db_path),
-         {:ok, wal} <- read_wal_bytes(wal_path, before),
+         {:ok, db_size} <- file_size(db_path),
+         wal_size = wal_size_of(before),
+         :ok <- open_seed(shipper, shard_id, epoch, before, db_size, wal_size),
+         :ok <- stream_part(shipper, shard_id, :db, db_path, db_size),
+         :ok <- stream_part(shipper, shard_id, :wal, wal_path, wal_size),
          {:ok, after_} <- Wal.read(wal_path),
          :ok <- stable?(before, after_) do
-      seed = %Seed{
-        shard_id: shard_id,
-        epoch: epoch,
-        wal_gen: gen_of(before),
-        wal_offset: byte_size(wal),
-        db: db,
-        wal: wal
-      }
+      Shipper.seed_end(shipper, shard_id)
+      await_seed_reply(shipper, shard_id, before, wal_size)
+    else
+      {:error, :checkpoint_during_seed} = err ->
+        # The halves stopped belonging together mid-stream. Tell the follower to discard, then
+        # consume the reply that abort produces so it cannot be mistaken for an answer to a later
+        # push on this shard.
+        Shipper.seed_abort(shipper, shard_id)
+        _ = await_seed_reply(shipper, shard_id, nil, 0)
+        err
 
-      Shipper.seed(shipper, seed)
-
-      receive do
-        {:repl_reply, ^shipper, {:ack, ^shard_id, _}} ->
-          {:ok, %{wal_gen: gen_of(before), salt1: salt_of(before), offset: byte_size(wal)}}
-
-        {:repl_reply, ^shipper, {:reject, ^shard_id, r, _}} ->
-          {:error, r}
-      after
-        30_000 -> {:error, :seed_timeout}
-      end
+      other ->
+        other
     end
   end
 
-  defp read_wal_bytes(_path, :empty), do: {:ok, <<>>}
-  defp read_wal_bytes(path, %{size: size}), do: Wal.read_delta(path, 0, size)
+  defp open_seed(shipper, shard_id, epoch, before, db_size, wal_size) do
+    Shipper.seed_begin(shipper, %SeedBegin{
+      shard_id: shard_id,
+      epoch: epoch,
+      wal_gen: gen_of(before),
+      wal_offset: wal_size,
+      db_size: db_size,
+      wal_size: wal_size
+    })
+  end
+
+  defp await_seed_reply(shipper, shard_id, before, wal_size) do
+    receive do
+      {:repl_reply, ^shipper, {:ack, ^shard_id, _}} ->
+        {:ok, %{wal_gen: gen_of(before), salt1: salt_of(before), offset: wal_size}}
+
+      {:repl_reply, ^shipper, {:reject, ^shard_id, r, _}} ->
+        {:error, r}
+    after
+      30_000 -> {:error, :seed_timeout}
+    end
+  end
+
+  # Walks the file with `pread` rather than reading it whole. A short read means the file shrank
+  # under us (a checkpoint racing the copy); stop rather than send fewer bytes than declared, which
+  # the follower would refuse anyway — better to fail here and let the `stable?` check name it.
+  defp stream_part(_shipper, _shard_id, _part, _path, 0), do: :ok
+
+  defp stream_part(shipper, shard_id, part, path, size) do
+    case :file.open(path, [:read, :raw, :binary]) do
+      {:ok, fd} ->
+        try do
+          stream_chunks(shipper, shard_id, part, fd, 0, 0, size)
+        after
+          :file.close(fd)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp stream_chunks(_shipper, _shard_id, _part, _fd, offset, _seq, size) when offset >= size,
+    do: :ok
+
+  defp stream_chunks(shipper, shard_id, part, fd, offset, seq, size) do
+    len = min(chunk_bytes(), size - offset)
+
+    case :file.pread(fd, offset, len) do
+      {:ok, bin} when byte_size(bin) == len ->
+        Shipper.seed_chunk(shipper, shard_id, part, seq, bin)
+        stream_chunks(shipper, shard_id, part, fd, offset + len, seq + 1, size)
+
+      {:ok, _short} ->
+        {:error, :short_read}
+
+      :eof ->
+        {:error, :short_read}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp file_size(path) do
+    case File.stat(path) do
+      {:ok, %{size: size}} -> {:ok, size}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp wal_size_of(:empty), do: 0
+  defp wal_size_of(%{size: size}), do: size
+
+  defp chunk_bytes,
+    do: Application.get_env(:fathom, :replication_seed_chunk_bytes, 4 * 1024 * 1024)
 
   defp gen_of(:empty), do: 0
   defp gen_of(%{ckpt_seq: seq}), do: seq

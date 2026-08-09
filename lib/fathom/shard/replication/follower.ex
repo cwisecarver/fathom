@@ -182,71 +182,247 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
-  defp serve(sock, name) do
+  # `seeds` holds the partial seeds in flight ON THIS CONNECTION, keyed by shard id. Connection-
+  # scoped rather than in the ETS table on purpose: a partial seed belongs to the primary that
+  # started it, so a dropped connection must abandon it, and `discard_seeds/2` on the way out makes
+  # that automatic rather than something a later reconnect has to clean up.
+  defp serve(sock, name, seeds \\ %{}) do
     case :gen_tcp.recv(sock, 0) do
       {:ok, bytes} ->
         case Protocol.decode(bytes) do
           {:ok, %Protocol.Push{} = push} ->
             reply = handle_push(name, push)
             :ok = :gen_tcp.send(sock, reply)
-            serve(sock, name)
+            serve(sock, name, seeds)
 
-          {:ok, %Protocol.Seed{} = seed} ->
-            reply = handle_seed(name, seed)
+          {:ok, %Protocol.SeedBegin{} = begin} ->
+            serve(sock, name, begin_seed(name, seeds, begin))
+
+          {:ok, {:seed_chunk, shard, part, seq, chunk}} ->
+            serve(sock, name, write_chunk(seeds, shard, part, seq, chunk))
+
+          {:ok, {:seed_end, shard}} ->
+            {reply, seeds} = finish_seed(name, seeds, shard)
             :ok = :gen_tcp.send(sock, reply)
-            serve(sock, name)
+            serve(sock, name, seeds)
+
+          {:ok, {:seed_abort, shard}} ->
+            # The primary found its two halves no longer belong together. Drop the partial files
+            # and answer, so the sender is not left waiting out its seed timeout.
+            seeds = discard_seed(seeds, shard)
+            :ok = :gen_tcp.send(sock, Protocol.encode_reject(shard, :internal, 0))
+            serve(sock, name, seeds)
 
           {:ok, other} ->
             # A follower receiving an ack means someone pointed a primary at a primary.
             Logger.warning("replication follower got a non-push message: #{inspect(other)}")
-            serve(sock, name)
+            serve(sock, name, seeds)
 
           {:error, reason} ->
             # Do not keep reading a stream we cannot parse — the framing may be out of sync, and
             # every further read would be garbage interpreted as a push.
             Logger.error("replication follower closing connection: #{inspect(reason)}")
+            discard_seeds(seeds)
             :gen_tcp.close(sock)
         end
 
       {:error, _} ->
+        discard_seeds(seeds)
         :gen_tcp.close(sock)
     end
   end
 
-  # Install a fresh base copy of a shard: both files replaced, state set to whatever the primary
-  # says those bytes leave us at.
+  # ------------------------------------------------------------------------------------------
+  # streamed seeding
+  # ------------------------------------------------------------------------------------------
   #
-  # Unconditional by design — a seed is the primary asserting "discard whatever you have". It is
-  # sent when a follower is new, and again when one has fallen far enough behind that a delta
-  # cannot close the gap, so refusing it because we already hold something would make the
-  # unrecoverable case unrecoverable.
+  # A seed is a whole database, so it arrives as `seed_begin` + N `seed_chunk`s + `seed_end`
+  # rather than one frame. Bytes land in `.seeding` temp files and are installed by rename **only**
+  # on `seed_end`.
   #
-  # `.db` is written BEFORE `-wal`: a crash between the two leaves a database with no WAL, which
-  # SQLite reads as a valid (if stale) file. The other order leaves a WAL whose salts do not match
-  # the database, which is the corrupt-looking state.
-  defp handle_seed(name, %Protocol.Seed{} = seed) do
-    with :ok <- File.write(db_path(name, seed.shard_id), seed.db),
-         :ok <- File.write(wal_path(name, seed.shard_id), seed.wal) do
+  # That deferral is the property worth having, and it is not just about memory. A seed interrupted
+  # half-way — dropped connection, aborted by the primary, a chunk that never arrived — leaves the
+  # follower with NO state for the shard, so the next push is refused `:unknown_shard` and it is
+  # seeded again. The alternative is a database missing pages that opens cleanly and reads as
+  # valid, which is the failure mode this whole module is built to avoid.
+  #
+  # Nothing is acked until the install succeeds, so the primary never records a follower as holding
+  # bytes it does not have.
+
+  defp begin_seed(name, seeds, %Protocol.SeedBegin{} = b) do
+    # A second `seed_begin` for a shard already streaming means the previous one will never
+    # complete; drop its files rather than leak them.
+    seeds = discard_seed(seeds, b.shard_id)
+
+    with {:ok, db_fd} <-
+           :file.open(seeding_path(db_path(name, b.shard_id)), [:write, :raw, :binary]),
+         {:ok, wal_fd} <-
+           :file.open(seeding_path(wal_path(name, b.shard_id)), [:write, :raw, :binary]) do
+      Map.put(seeds, b.shard_id, %{
+        name: name,
+        epoch: b.epoch,
+        wal_gen: b.wal_gen,
+        wal_offset: b.wal_offset,
+        db_size: b.db_size,
+        wal_size: b.wal_size,
+        db_fd: db_fd,
+        wal_fd: wal_fd,
+        db_written: 0,
+        wal_written: 0,
+        db_seq: 0,
+        wal_seq: 0,
+        failed: false
+      })
+    else
+      {:error, reason} ->
+        Logger.error(
+          "replication seed could not open temps for #{b.shard_id}: #{inspect(reason)}"
+        )
+
+        # Recorded as failed rather than absent so `seed_end` has something to refuse — an absent
+        # entry and a broken one must not be told apart by the primary, but they must both reject.
+        Map.put(seeds, b.shard_id, %{name: name, failed: true})
+    end
+  rescue
+    ArgumentError -> Map.put(seeds, b.shard_id, %{name: name, failed: true})
+  end
+
+  defp write_chunk(seeds, shard_id, part, seq, bytes) do
+    case Map.get(seeds, shard_id) do
+      nil -> seeds
+      %{failed: true} -> seeds
+      state -> Map.put(seeds, shard_id, accept_chunk(state, part, seq, bytes))
+    end
+  end
+
+  # Every refusal here marks the seed failed rather than raising: chunks carry no reply, so the
+  # only way to report is to let `seed_end` reject. Silently accepting any of them would install a
+  # database with a hole in it.
+  defp accept_chunk(state, part, seq, bytes) do
+    {seq_key, written_key, size_key, fd_key} = part_keys(part)
+
+    cond do
+      # Out of order or duplicated. TCP does not reorder, but a bug on either side can, and a
+      # seed that loses a chunk silently is exactly what the sequence number exists to catch.
+      seq != state[seq_key] ->
+        fail(state, "chunk #{seq} out of order (expected #{state[seq_key]})")
+
+      # The WAL must not start until the database is whole, or the two halves interleave and
+      # `db_written` stops meaning what `seed_end` checks it against.
+      part == :wal and state.db_written != state.db_size ->
+        fail(state, "wal chunk before the database was complete")
+
+      state[written_key] + byte_size(bytes) > state[size_key] ->
+        fail(state, "#{part} overran its declared size")
+
+      true ->
+        case :file.write(state[fd_key], bytes) do
+          :ok ->
+            state
+            |> Map.put(seq_key, seq + 1)
+            |> Map.put(written_key, state[written_key] + byte_size(bytes))
+
+          {:error, reason} ->
+            fail(state, "write failed: #{inspect(reason)}")
+        end
+    end
+  end
+
+  defp part_keys(:db), do: {:db_seq, :db_written, :db_size, :db_fd}
+  defp part_keys(:wal), do: {:wal_seq, :wal_written, :wal_size, :wal_fd}
+
+  defp fail(state, why) do
+    Logger.error("replication seed failed: #{why}")
+    Map.put(state, :failed, true)
+  end
+
+  defp finish_seed(name, seeds, shard_id) do
+    case Map.get(seeds, shard_id) do
+      nil ->
+        {Protocol.encode_reject(shard_id, :internal, 0), seeds}
+
+      %{failed: true} ->
+        {Protocol.encode_reject(shard_id, :internal, 0), discard_seed(seeds, shard_id)}
+
+      %{db_written: db, db_size: db, wal_written: wal, wal_size: wal} = state ->
+        {install(name, shard_id, state), Map.delete(seeds, shard_id)}
+
+      _short ->
+        # Declared sizes not met. The stream ended early — refuse rather than install a truncated
+        # database, which would open cleanly and be missing pages.
+        Logger.error("replication seed for #{shard_id} ended short of its declared size")
+        {Protocol.encode_reject(shard_id, :internal, 0), discard_seed(seeds, shard_id)}
+    end
+  end
+
+  # Install by rename, `-wal` cleared first.
+  #
+  # Ordering is the same reasoning the monolithic version carried: an interruption must never leave
+  # a WAL whose salts disagree with the database beside it. Removing the old `-wal` before renaming
+  # the new `.db` means every intermediate state is either the old pair, a database with no WAL
+  # (which SQLite reads as valid if stale), or the new pair.
+  #
+  # ETS goes last: until it is written the follower reports `:unknown_shard` and gets re-seeded, so
+  # a failure anywhere above costs a re-seed rather than a corrupt shard.
+  defp install(name, shard_id, state) do
+    db = db_path(name, shard_id)
+    wal = wal_path(name, shard_id)
+
+    :file.close(state.db_fd)
+    :file.close(state.wal_fd)
+
+    with :ok <- rm_if_present(wal),
+         :ok <- File.rename(seeding_path(db), db),
+         :ok <- File.rename(seeding_path(wal), wal) do
       :ets.insert(
         table(name),
-        {seed.shard_id, FollowerLog.seeded(seed.epoch, seed.wal_gen, seed.wal_offset)}
+        {shard_id, FollowerLog.seeded(state.epoch, state.wal_gen, state.wal_offset)}
       )
 
       Logger.info(
-        "replication seeded #{seed.shard_id}: #{byte_size(seed.db)}B db + " <>
-          "#{byte_size(seed.wal)}B wal at gen #{seed.wal_gen} offset #{seed.wal_offset}"
+        "replication seeded #{shard_id}: #{state.db_size}B db + #{state.wal_size}B wal " <>
+          "at gen #{state.wal_gen} offset #{state.wal_offset}"
       )
 
-      Protocol.encode_ack(seed.shard_id, seed.wal_offset)
+      Protocol.encode_ack(shard_id, state.wal_offset)
     else
       {:error, reason} ->
-        Logger.error("replication seed failed for #{seed.shard_id}: #{inspect(reason)}")
-        Protocol.encode_reject(seed.shard_id, :internal, 0)
+        Logger.error("replication seed install failed for #{shard_id}: #{inspect(reason)}")
+        Protocol.encode_reject(shard_id, :internal, 0)
     end
   rescue
-    ArgumentError ->
-      Protocol.encode_reject(seed.shard_id, :internal, 0)
+    ArgumentError -> Protocol.encode_reject(shard_id, :internal, 0)
   end
+
+  defp discard_seeds(seeds), do: Enum.reduce(Map.keys(seeds), seeds, &discard_seed(&2, &1))
+
+  defp discard_seed(seeds, shard_id) do
+    case Map.pop(seeds, shard_id) do
+      {nil, seeds} ->
+        seeds
+
+      {state, rest} ->
+        if state[:db_fd], do: :file.close(state.db_fd)
+        if state[:wal_fd], do: :file.close(state.wal_fd)
+
+        if name = state[:name] do
+          File.rm(seeding_path(db_path(name, shard_id)))
+          File.rm(seeding_path(wal_path(name, shard_id)))
+        end
+
+        rest
+    end
+  end
+
+  defp rm_if_present(path) do
+    case File.rm(path) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      other -> other
+    end
+  end
+
+  defp seeding_path(path), do: path <> ".seeding"
 
   # Returns the iodata to send back. All the judgement is in FollowerLog; this only performs it.
   #

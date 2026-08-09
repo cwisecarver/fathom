@@ -25,6 +25,14 @@ defmodule Fathom.Shard.Replication.Shipper do
   and the shard id is a sufficient correlation key. A second push for a shard already awaiting a
   reply is a bug in the caller, and is refused rather than silently replacing the waiter.
 
+  ## Seeding streams; it does not interleave
+
+  A seed is sent as `seed_begin` + N chunks + `seed_end`, which bounds MEMORY on both sides — a
+  whole tenant database is never resident. It does **not** bound head-of-line blocking: one socket
+  per follower *node* carries every shard, so a large seed still delays other shards' pushes on
+  that link for its duration. Interleaving would need per-shard framing and a scheduler on top of
+  this socket, and is deliberately not here. Do not read "chunked" as "concurrent".
+
   ## Disconnection is a rejection, not a crash
 
   If the socket drops, every in-flight waiter is told `:disconnected` immediately. A follower that
@@ -61,11 +69,36 @@ defmodule Fathom.Shard.Replication.Shipper do
   def push(shipper, %Protocol.Push{} = p), do: GenServer.cast(shipper, {:push, p, self()})
 
   @doc """
-  Send a base copy of a shard. Replies arrive exactly like `push/2`'s — same correlation, same
-  `{:repl_reply, shipper, result}` shape, since a seed is answered by an ack at the seeded offset.
+  Open a streamed base copy. Registers the waiter for the WHOLE seed, not for this frame.
+
+  A seed is many frames and exactly one reply, so the waiter is claimed here and released by the
+  follower's answer to `seed_end/1` (or by a disconnect). Holding it across the stream is also what
+  keeps the `already_in_flight` guard meaningful during a multi-second transfer: a `push/2` for the
+  same shard mid-seed is refused rather than overwriting the seeder's waiter and stranding it.
   """
-  @spec seed(GenServer.server(), Protocol.Seed.t()) :: :ok
-  def seed(shipper, %Protocol.Seed{} = s), do: GenServer.cast(shipper, {:push, s, self()})
+  @spec seed_begin(GenServer.server(), Protocol.SeedBegin.t()) :: :ok
+  def seed_begin(shipper, %Protocol.SeedBegin{} = s),
+    do: GenServer.cast(shipper, {:seed_begin, s, self()})
+
+  @doc """
+  Send one chunk. No reply, and no waiter bookkeeping — `seed_begin/2` already claimed it.
+
+  A send failure here does not go unnoticed: it drops the socket, which fails every waiter
+  including this seed's, so the sender learns immediately instead of waiting out its timeout.
+  """
+  @spec seed_chunk(GenServer.server(), String.t(), :db | :wal, non_neg_integer(), binary()) :: :ok
+  def seed_chunk(shipper, shard_id, part, seq, bytes),
+    do: GenServer.cast(shipper, {:seed_frame, shard_id, {:chunk, part, seq, bytes}})
+
+  @doc "Commit the streamed seed. This is the frame the follower answers."
+  @spec seed_end(GenServer.server(), String.t()) :: :ok
+  def seed_end(shipper, shard_id),
+    do: GenServer.cast(shipper, {:seed_frame, shard_id, :end})
+
+  @doc "Abandon a partial seed — the follower drops it and answers, releasing the waiter."
+  @spec seed_abort(GenServer.server(), String.t()) :: :ok
+  def seed_abort(shipper, shard_id),
+    do: GenServer.cast(shipper, {:seed_frame, shard_id, :abort})
 
   @doc "Whether the underlying socket is currently up. For tests and health reporting."
   @spec connected?(GenServer.server()) :: boolean()
@@ -118,6 +151,46 @@ defmodule Fathom.Shard.Replication.Shipper do
       end
     end
   end
+
+  # Same shape as a push: claims the shard's single waiter, but holds it for the whole stream.
+  def handle_cast({:seed_begin, s, from}, %{sock: nil} = state) do
+    send(from, {:repl_reply, self(), {:reject, s.shard_id, :disconnected, 0}})
+    {:noreply, state}
+  end
+
+  def handle_cast({:seed_begin, s, from}, state) do
+    if Map.has_key?(state.waiters, s.shard_id) do
+      send(from, {:repl_reply, self(), {:reject, s.shard_id, :already_in_flight, 0}})
+      {:noreply, state}
+    else
+      case :gen_tcp.send(state.sock, Protocol.encode_seed_begin(s)) do
+        :ok ->
+          {:noreply, %{state | waiters: Map.put(state.waiters, s.shard_id, from)}}
+
+        {:error, reason} ->
+          send(from, {:repl_reply, self(), {:reject, s.shard_id, :disconnected, 0}})
+          {:noreply, drop(state, reason)}
+      end
+    end
+  end
+
+  # Chunks, end and abort all ride the waiter `seed_begin` claimed, so none of them registers or
+  # answers anything. A failure drops the socket, and `drop/2` fails that waiter with
+  # `:disconnected` — so the seeder is told, once, through the channel it is already listening on.
+  def handle_cast({:seed_frame, _shard_id, _frame}, %{sock: nil} = state), do: {:noreply, state}
+
+  def handle_cast({:seed_frame, shard_id, frame}, state) do
+    case :gen_tcp.send(state.sock, seed_frame(shard_id, frame)) do
+      :ok -> {:noreply, state}
+      {:error, reason} -> {:noreply, drop(state, reason)}
+    end
+  end
+
+  defp seed_frame(shard_id, {:chunk, part, seq, bytes}),
+    do: Protocol.encode_seed_chunk(shard_id, part, seq, bytes)
+
+  defp seed_frame(shard_id, :end), do: Protocol.encode_seed_end(shard_id)
+  defp seed_frame(shard_id, :abort), do: Protocol.encode_seed_abort(shard_id)
 
   @impl true
   def handle_info({:tcp, _sock, bytes}, state) do
@@ -186,9 +259,7 @@ defmodule Fathom.Shard.Replication.Shipper do
     %{state | sock: nil, waiters: %{}}
   end
 
-  # A seed and a push are the same thing to this module: bytes for one shard, answered once.
   defp encode(%Protocol.Push{} = p), do: Protocol.encode_push(p)
-  defp encode(%Protocol.Seed{} = s), do: Protocol.encode_seed(s)
 
   defp reply_to(state, shard, msg) do
     case Map.pop(state.waiters, shard) do

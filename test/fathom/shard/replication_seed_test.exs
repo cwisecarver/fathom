@@ -36,7 +36,8 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     prev = %{
       enabled: Application.get_env(:fathom, :replication_enabled),
       followers: Application.get_env(:fathom, :replication_followers),
-      quorum: Application.get_env(:fathom, :replication_quorum)
+      quorum: Application.get_env(:fathom, :replication_quorum),
+      chunk: Application.get_env(:fathom, :replication_seed_chunk_bytes)
     }
 
     on_exit(fn ->
@@ -45,7 +46,8 @@ defmodule Fathom.Shard.ReplicationSeedTest do
       for {k, v} <- [
             replication_enabled: prev.enabled,
             replication_followers: prev.followers,
-            replication_quorum: prev.quorum
+            replication_quorum: prev.quorum,
+            replication_seed_chunk_bytes: prev.chunk
           ] do
         if is_nil(v),
           do: Application.delete_env(:fathom, k),
@@ -331,6 +333,71 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     assert :ok = Session.commit(id, wal, coordinator)
 
     await_wal(laggard, id, File.read!(wal))
+  end
+
+  # The wire-level guarantees are pinned in `replication_seed_chunk_test.exs`, which drives the
+  # protocol directly. This one covers what that cannot: the SENDING half — `Session.do_seed/5`
+  # walking a real shard file with `pread` a chunk at a time, in the right part order, and the
+  # consistency check now sitting after the last chunk rather than after a `File.read`.
+  #
+  # The chunk size is set well below the database size so a seed here is genuinely many frames;
+  # at the 4 MiB default every test shard is one chunk and the streaming loop never runs past its
+  # first iteration.
+  test "a real shard seeds across many chunks and lands byte-identical", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+    Application.put_env(:fathom, :replication_seed_chunk_bytes, 4_096)
+    enable!(followers, 2)
+
+    {coordinator, conn, path} = open_shard!(id)
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)", [])
+
+    for i <- 1..500 do
+      {:ok, _} =
+        Connection.query(conn, "INSERT INTO t VALUES (?1, ?2)", [i, String.duplicate("x", 400)])
+    end
+
+    # Checkpoint, or this fixture proves nothing: in WAL mode every row above is still IN the
+    # `-wal` and the `.db` is a 4 KB stub, so the database half would be a single chunk. The
+    # TRUNCATE moves it all into the main file, and the inserts after it leave a small live WAL —
+    # which is also the realistic shape, a large base plus a short tail.
+    {:ok, _} = Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", [])
+
+    for i <- 501..505 do
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?1, ?2)", [i, "tail"])
+    end
+
+    wal = path <> "-wal"
+
+    assert File.stat!(path).size > 8 * 4_096,
+           "the fixture is too small to span chunks — this test would prove nothing"
+
+    assert File.stat!(wal).size > 0, "the WAL half of the seed is empty; only the db is covered"
+
+    assert {:error, {:no_quorum, _}} = Session.commit(id, wal, coordinator)
+
+    for {name, _} <- followers,
+        do: await_seeded(name, id, fn -> Session.commit(id, wal, coordinator) end)
+
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    primary_db = File.read!(path)
+    primary_wal = File.read!(wal)
+
+    for {name, _} <- followers do
+      assert File.read!(Follower.db_path(name, id)) == primary_db,
+             "#{name}'s database did not survive a multi-chunk seed intact"
+
+      assert File.read!(Follower.wal_path(name, id)) == primary_wal
+    end
+
+    # No `.seeding` temp should outlive a successful seed on any follower.
+    for {name, _} <- followers do
+      leftovers =
+        Follower.dir(name) |> File.ls!() |> Enum.filter(&String.ends_with?(&1, ".seeding"))
+
+      assert leftovers == [], "#{name} leaked seed temps: #{inspect(leftovers)}"
+    end
   end
 
   test "seeds from LIVE bytes, not a VACUUM INTO snapshot", ctx do
