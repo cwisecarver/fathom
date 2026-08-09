@@ -1,9 +1,32 @@
-# A2 — Quorum replication (design, NOT built)
+# A2 — Quorum replication
 
-**Status: design only. Blocked on a dependency, not on effort — see [The blocker](#the-blocker).**
-Scoped 2026-08-08. Supersedes the one-paragraph deferral in
-[phase2-scoping](phase2-scoping.md) §A2 with an actual mechanism, a verified blocker, and the
-options for clearing it.
+**Status: BUILT on branch `a2-quorum-replication`, off by default, not on `main`.** Scoped
+2026-08-08; both decision gates cleared the same day; the transport, commit path, seeding and
+promotion built 2026-08-08/09. Supersedes the one-paragraph deferral in
+[phase2-scoping](phase2-scoping.md) §A2.
+
+The blocker section below is kept as written, because the thing it describes as blocking is exactly
+what turned out not to — see the gate-1 note in [Decision gate](#decision-gate). The header used to
+read "design only, blocked on a dependency"; it was wrong, and re-reading why is more useful than
+deleting it.
+
+## What exists
+
+| Piece | Module | Note |
+|---|---|---|
+| Wire format | `Replication.Protocol` | Explicit binary; no `binary_to_term` on socket bytes. |
+| Accept/reject | `Replication.FollowerLog` | Pure. Every way a follower can corrupt a shard is a branch here. |
+| Quorum counting | `Replication.Quorum` | Pure. `Q < N` enforced at construction AND at boot. |
+| Transport | `Replication.Shipper` / `Follower` | One socket per follower **node**, not per shard. |
+| Commit path | `Replication.Session` | Per-shard serialization point; per-follower offsets. |
+| Seeding | `Protocol` + `Follower` | Streamed; a partial seed is never installed. |
+| Promotion | `Replication.Promote` | Standalone — **not** wired into cold open. |
+| Membership | `Replication.Fleet` | Static config list + liveness reporting. |
+
+**Not built:** automatic promotion on failover (the cold-open seam validates a local copy by
+proving it EQUALS the stored object, and a replica is deliberately fresher — see the `Promote`
+moduledoc), per-shard follower sets, and zone-aware placement. Operator config is
+[configuration.md](configuration.md#quorum-replication-phase-2-a2--off-by-default).
 
 ## The gap this closes
 

@@ -77,6 +77,26 @@ defmodule Fathom.Shard.Replication.Follower do
     :ok
   end
 
+  @doc """
+  Stop following a shard: drop its replication state and its local files.
+
+  Used by promotion, once the replica has become this node's primary. Keeping the row would leave
+  the node believing it is still a replica of a shard it now serves, so the next push from a
+  *deposed* primary would be measured against a position that no longer describes anything.
+
+  Dropping the state is the safe direction by construction — the next push for this shard is
+  refused `:unknown_shard`, which asks for a re-seed rather than guessing a resume point.
+  """
+  @spec forget(atom(), String.t()) :: :ok
+  def forget(name \\ __MODULE__, shard_id) do
+    :ets.delete(table(name), shard_id)
+    File.rm(db_path(name, shard_id))
+    File.rm(wal_path(name, shard_id))
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
   @doc "Current replication state for a shard, or nil if it was never seeded."
   @spec state_of(atom(), String.t()) :: FollowerLog.t() | nil
   def state_of(name \\ __MODULE__, shard_id) do
