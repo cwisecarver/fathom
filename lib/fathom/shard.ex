@@ -220,6 +220,16 @@ defmodule Fathom.Shard do
   def dirty?(pid) when is_pid(pid), do: GenServer.call(pid, :dirty?)
 
   @doc """
+  This coordinator's lease epoch — A2 replication's fencing token.
+
+  `{:error, :no_lease}` when the shard is not currently held, which a replication session must
+  treat as "do not ship": frames from a node without a lease are exactly what the follower's epoch
+  check exists to refuse.
+  """
+  @spec epoch(pid()) :: {:ok, non_neg_integer()} | {:error, :no_lease}
+  def epoch(pid) when is_pid(pid), do: GenServer.call(pid, :epoch)
+
+  @doc """
   Force-flushes the coordinator's current on-disk state to storage WITHOUT dropping or stopping
   it (it keeps serving) — the flush-before-fork primitive. Blocks until the shard is durably
   clean; returns `:ok`, or `{:error, reason}` on a flush error / lease steal. See
@@ -1100,6 +1110,16 @@ defmodule Fathom.Shard do
   end
 
   def handle_call(:dirty?, _from, state), do: {:reply, unflushed?(state), state}
+
+  # The lease epoch, for A2 replication's fence (`Fathom.Shard.Replication`). Read ONCE per
+  # replication session and cached there, not per commit — a GenServer hop on every write would
+  # put this coordinator's mailbox in front of the shard's write path, which is the cost
+  # WriteCounter's lock-free ETS exists to avoid. The session monitors this process and stops when
+  # it does, so a cached epoch can never outlive the ownership it describes.
+  def handle_call(:epoch, _from, %{lease: %{epoch: epoch}} = state),
+    do: {:reply, {:ok, epoch}, state}
+
+  def handle_call(:epoch, _from, state), do: {:reply, {:error, :no_lease}, state}
 
   # Synchronous force-flush (the flush-before-fork primitive): make the current on-disk state
   # durable WITHOUT dropping/stopping — the coordinator keeps serving. Replies :ok once the

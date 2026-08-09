@@ -463,7 +463,7 @@ defmodule Fathom.Application do
         # A task's mailbox dies with the task.
         {Task.Supervisor, name: Fathom.TaskSupervisor},
         {DynamicSupervisor, shard_supervisor_opts()}
-      ] ++ warm_follower_children()
+      ] ++ warm_follower_children() ++ Fathom.Shard.Replication.Fleet.children()
   end
 
   # Default DynamicSupervisor restart intensity is 3 restarts / 5 s — sized for a small

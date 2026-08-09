@@ -206,7 +206,21 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   # Returns the iodata to send back. All the judgement is in FollowerLog; this only performs it.
+  #
+  # The rescue covers a real shutdown race, not just a noisy test: if this follower stops while a
+  # push is in flight, its ETS table is gone and every `:ets` call raises, taking down the handler
+  # Task with an unhandled exit. A primary is waiting on a reply, so the right answer is to refuse
+  # the push — which subtracts from its quorum immediately — rather than to die silently and make
+  # it wait out the timeout.
   defp handle_push(name, %Protocol.Push{} = push) do
+    do_handle_push(name, push)
+  rescue
+    ArgumentError ->
+      Logger.warning("replication follower is shutting down; refusing #{push.shard_id}")
+      Protocol.encode_reject(push.shard_id, :internal, 0)
+  end
+
+  defp do_handle_push(name, %Protocol.Push{} = push) do
     case FollowerLog.decide(state_of(name, push.shard_id), push) do
       {:append, new_state} ->
         apply_write(name, push, new_state, :append)

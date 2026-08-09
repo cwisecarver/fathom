@@ -17,6 +17,7 @@ defmodule Fathom.ShardExecutor do
   alias Fathom.Migrator.Capture
   alias Fathom.Shard
   alias Fathom.Shard.Connection
+  alias Fathom.Shard.Replication.Session
   alias Fathom.Shard.WriteFence
   alias Fathom.Shards
   alias Filo.{Describe, Error, Stmt, StmtResult}
@@ -203,6 +204,10 @@ defmodule Fathom.ShardExecutor do
           signal_dirty_once(pid, conn)
         end
 
+        # A2 quorum replication (off unless :replication_enabled). Computed BEFORE
+        # track_txn_write/3, which clears the in-transaction flag this decision reads.
+        repl = maybe_replicate(shard_id, pid, conn, sql, wrote?)
+
         track_txn_write(conn, sql, wrote?)
 
         # On the reserved template shard, feed each successful statement to the
@@ -239,7 +244,15 @@ defmodule Fathom.ShardExecutor do
         # matching the cold_open convention. A no-op when no reporter is attached.
         :telemetry.execute([:fathom, :shard, :query], %{duration: latency}, %{})
 
-        {:ok, stmt_result}
+        # The client's success is gated on the follower quorum. The local commit ALREADY happened
+        # — SQLite committed before the WAL could be read and there is no un-commit — so this
+        # reports an error for a write that is durable locally and will still reach S3. That is
+        # deliberate: the client asked for a quorum-durable write and did not get one. See
+        # Fathom.Shard.Replication.Session on the at-least-once hazard that follows.
+        case repl do
+          :ok -> {:ok, stmt_result}
+          {:error, reason} -> {:error, no_quorum_error(reason)}
+        end
 
       # Per-query resource bounds (expert review 2026-07-14 #26) — distinct, non-SQLITE codes so a
       # client can tell "my query was too expensive" from an ordinary SQL error.
@@ -446,6 +459,46 @@ defmodule Fathom.ShardExecutor do
   defp mark_txn_write(conn), do: Process.put({__MODULE__, @txn_wrote_key, conn}, true)
 
   defp forget_txn_write(conn), do: Process.delete({__MODULE__, @txn_wrote_key, conn})
+
+  # ---------------------------------------------------------------------------------------------
+  # A2 quorum replication (expert-reviewed design in docs/a2-quorum-replication.md)
+  # ---------------------------------------------------------------------------------------------
+
+  # Ship this shard's newly committed WAL frames and wait for a follower quorum. Entirely inert
+  # unless `:replication_enabled` — the gate is checked before anything else, so a node with the
+  # feature off pays one `Application.get_env` per write and nothing more.
+  defp maybe_replicate(shard_id, pid, conn, sql, wrote?) do
+    if Session.enabled?() and ships_now?(conn, sql, wrote?) do
+      Session.commit(shard_id, Shard.db_path(shard_id) <> "-wal", pid)
+    else
+      :ok
+    end
+  end
+
+  # Only where the frames are actually COMMITTED: an autocommit write, or a commit boundary closing
+  # a transaction that wrote. Shipping on every write statement inside a transaction would pay a
+  # network round trip per statement, for frames SQLite has not committed and a follower would
+  # ignore until the commit frame arrives anyway.
+  #
+  # `Process.get/1` WITHOUT a default is what separates the two states `txn_wrote?/1` collapses
+  # into `false`: `begins_transaction?` puts an explicit `false`, so a MISSING key means no explicit
+  # transaction is open. Hence `wrote? and is_nil(...)` is precisely "an autocommit write".
+  defp ships_now?(conn, sql, wrote?) do
+    in_txn? = Process.get({__MODULE__, @txn_wrote_key, conn}) != nil
+
+    (wrote? and not in_txn?) or (commit_boundary?(sql) and txn_wrote?(conn))
+  end
+
+  # Distinct from a SQLite error, and a 503 rather than a 400: nothing is wrong with the statement,
+  # the node could not reach enough followers. A client should retry — accepting the at-least-once
+  # hazard the Session moduledoc describes — not rewrite its SQL.
+  defp no_quorum_error(reason) do
+    %Error{
+      message: "write not replicated to a follower quorum (#{inspect(reason)})",
+      code: "FILO_NO_QUORUM",
+      status: 503
+    }
+  end
 
   defp begins_transaction?(sql) when is_binary(sql) do
     head = sql |> String.trim_leading() |> String.slice(0, 5) |> String.downcase()
