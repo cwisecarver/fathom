@@ -11,7 +11,10 @@ defmodule Mix.Tasks.Fathom.Bench do
 
   ## Options
 
-    * `--only m1,m2`     — subset of `cold_open,cold_open_s3,dir_resolve,copy,fanout` (default all)
+    * `--only m1,m2`     — subset of this module's `@all_metrics` (default all). That list is
+      pinned against `Fathom.Bench.known_metrics/0` in `gate_test.exs`: an unmirrored name
+      RAISES rather than degrading, so the two must not drift. Not interpolated here because
+      the attribute is defined below this moduledoc.
     * `--trials N`       — median trials for throughput/memory benches (default 5)
     * `--cold-open-s3-samples N` — samples for the S3 cold-open bench (opt-in; needs
       `FATHOM_S3_TEST_*` env, else skipped)
@@ -58,19 +61,33 @@ defmodule Mix.Tasks.Fathom.Bench do
   # minimal subset it needs itself (no Oban, no Hrana port, no endpoint).
   @requirements ["app.config"]
 
+  # Must stay in sync with `Fathom.Bench`'s own @all_metrics: `--only` resolves through
+  # `String.to_existing_atom/1`, so a name missing here does not fall through to Bench — it
+  # raises `not an already existing atom` before the run starts. Found 2026-08-10, when
+  # `--only served` crashed while investigating a fanout block; :served, :dir_recorder,
+  # :concurrent and :wire_encode had all been added to Bench and never mirrored here.
   @all_metrics [
     :cold_open,
     :cold_open_s3,
     :warm_s3,
     :failover_rto,
     :dir_resolve,
+    :dir_recorder,
     :copy,
     :fanout,
+    :fanout_gc,
+    :served,
+    :concurrent,
     :hrana_rt,
     :hrana_open_rt,
     :wire_rows,
+    :wire_encode,
     :flush
   ]
+
+  @doc false
+  # Public only so `bench_test` can pin it against `Fathom.Bench.known_metrics/0`.
+  def known_metrics, do: @all_metrics
 
   @switches [
     only: :string,
@@ -218,6 +235,8 @@ defmodule Mix.Tasks.Fathom.Bench do
       {"copy_keystone_rows_per_s", metrics.copy_keystone_rows_per_s,
        "rows/s (migration copy throughput, keystone rows)"},
       {"fanout_kb_per_shard", metrics.fanout_kb_per_shard, "KiB/shard (node density)"},
+      {"fanout_gc_kb_per_shard", metrics.fanout_gc_kb_per_shard,
+       "KiB/shard (node density, coordinators GC'd — the steady-state floor)"},
       {"served_kb_per_shard", metrics.served_kb_per_shard,
        "KiB/shard (SERVED: held connection + one query)"},
       {"served_binary_kb_per_shard", metrics.served_binary_kb_per_shard,

@@ -11,6 +11,22 @@ defmodule Fathom.Bench.GateTest do
   # Keys a history line carries that are provenance, not measurements.
   @bookkeeping ~w(log dirty host branch commit commit_full trials mix_env ts)
 
+  # Lives here, not in bench_test.exs, because that whole module is @moduletag :bench and excluded
+  # from the default suite — which is how this drift survived unnoticed. This needs no bench run.
+  #
+  # `mix fathom.bench --only <name>` resolves through String.to_existing_atom/1 against the TASK's
+  # own @all_metrics literal, a second copy of Fathom.Bench's. A name added to Bench and not
+  # mirrored there does not degrade gracefully: it raises "not an already existing atom" before the
+  # run starts. Found 2026-08-10 when `--only served` crashed mid-investigation; :served,
+  # :dir_recorder, :concurrent and :wire_encode had all drifted.
+  test "the Mix task's --only allowlist covers every metric Fathom.Bench knows" do
+    missing = Fathom.Bench.known_metrics() -- Mix.Tasks.Fathom.Bench.known_metrics()
+
+    assert missing == [],
+           "these metrics exist in Fathom.Bench but are unreachable via --only: " <>
+             "#{inspect(missing)} — add them to Mix.Tasks.Fathom.Bench's @all_metrics"
+  end
+
   @parent %{
     "cold_open_p50_us" => 1000.0,
     "dir_resolve_p50_us" => 150.0,

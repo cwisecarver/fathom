@@ -86,6 +86,7 @@ defmodule Fathom.Bench do
     :dir_recorder,
     :copy,
     :fanout,
+    :fanout_gc,
     :served,
     :concurrent,
     :hrana_rt,
@@ -94,6 +95,11 @@ defmodule Fathom.Bench do
     :wire_encode,
     :flush
   ]
+
+  @doc false
+  # Public only so `mix fathom.bench` can be pinned against it — its `--only` allowlist is a
+  # separate literal that silently drifted out of sync (see that module's @all_metrics).
+  def known_metrics, do: @all_metrics
 
   @doc """
   Runs the requested benches and returns the perf-history metric map. Opts:
@@ -138,6 +144,10 @@ defmodule Fathom.Bench do
         run_if(only, :dir_recorder, fn -> dir_recorder_flush(opts) end),
       copy_keystone_rows_per_s: run_if(only, :copy, fn -> copy_throughput(opts) end),
       fanout_kb_per_shard: run_if(only, :fanout, fn -> fanout(opts) end),
+      # The same sample with the coordinators collected. Paired with the line above it says WHICH
+      # kind of change moved fanout: churn/size-class tip (this stays flat) vs a real retained-heap
+      # regression (this moves too). Added 2026-08-10 after fanout false-blocked for two sessions.
+      fanout_gc_kb_per_shard: run_if(only, :fanout_gc, fn -> fanout_gc(opts) end),
       # The SERVED regime (#41.2). fanout above holds NO connections, so it only ever measured
       # the ~16 KiB idle cost; this is the ~220 KiB one that actually binds a deployment.
       # `:binary` is split out because the statement cache's sub-binary pin lands there and not
@@ -961,9 +971,63 @@ defmodule Fathom.Bench do
   (db + `-wal` + `-shm`) and exhaust the OS fd limit well before N is interesting.
   BEAM-side cost only; SQLite's off-heap page cache (held by active-stream
   connections, not the coordinator) is not counted (see `docs/benchmark-plan.md`).
+
+  ## This deliberately does NOT collect the coordinators — read `fanout_gc/1` before "fixing" it
+
+  Only the CALLING process is collected, so the N coordinator heaps are sampled holding whatever
+  the open path just allocated. That is intentional (expert review 2026-07-24 #9): coordinators run
+  `fullsweep_after: 0`, and this is the metric that measures whether that policy actually reclaims
+  retained heap — the cost that dominates at 30k shards/node. Forcing a sweep here would measure
+  the same figure with or without the policy and silently blind the gate to it, which is exactly
+  what `bench_test.exs`'s coordinator-GC-policy test says in its comment.
+
+  The price is precision. Retained heap includes open-path churn, BEAM heaps grow in geometric size
+  classes, and N heaps tip a class together — so this number moves ~30% in EITHER direction on
+  changes that cannot affect steady-state footprint, and it has a 12× lifetime spread. **It is a
+  poor threshold to gate on and a good signal to watch.** When it blocks a commit, read
+  `fanout_gc_kb_per_shard` (the same sample with the coordinators collected) and
+  `served_kb_per_shard` before believing it — see `fanout_gc/1` for the 2026-08-10 measurements
+  that established this.
   """
   @spec fanout(keyword()) :: float()
   def fanout(opts \\ []) do
+    fanout_sample(opts, false)
+  end
+
+  @doc """
+  `fanout_gc_kb_per_shard` — `fanout/1`'s sample with the N coordinators force-collected first.
+
+  The steady-state floor: what an open-but-idle shard costs once its heap has been swept, with the
+  open path's transient garbage removed. `fanout/1` minus this is churn.
+
+  **Why it exists.** `fanout_kb_per_shard` blocked `promote-on-open` at +38% for two sessions.
+  Splitting `:erlang.memory/1` by bucket on both branches showed the entire delta was `:processes`
+  — `:code`, `:ets`, `:binary` and `:system` identical, so never fixed bytecode wrongly divided by
+  N. Then force-collecting the coordinators **inverted** the verdict: parent 4.412, change 4.112
+  KiB/shard. The phantom also reproduced on demand — the PARENT's own reading moved 3.893 → 4.958
+  (+27%) between two probe builds differing only in code that ran strictly AFTER the sample point.
+  The buckets do not even reconcile with `:total` to better than ~1 KiB/shard, which is the size of
+  the whole disputed 1.4 KiB/shard effect: at N=200 the precision WAS the effect.
+  `served_kb_per_shard` agreed throughout (+0.06% against its own ±0.6 KiB band over 61 samples).
+
+  How noisy `fanout/1` is at small N is worth stating outright: writing the `fanout_gc <= fanout`
+  guard for `bench_test.exs` produced a run where `fanout/1` read **-5.75 KiB/shard** — a sweep
+  between its own two samples freed more than the coordinators allocated. It is an unsigned
+  quantity that can come back negative. Gate on it accordingly.
+
+  So this is not a replacement for `fanout/1` — it is the second reading that tells you which kind
+  of change you are looking at:
+
+    * `fanout` up, `fanout_gc` flat ⇒ open-path churn or a heap size-class tip. Not a footprint
+      regression.
+    * both up ⇒ retained heap really grew. Take it seriously; that is #9's signal firing.
+  """
+  @spec fanout_gc(keyword()) :: float()
+  def fanout_gc(opts \\ []) do
+    fanout_sample(opts, true)
+  end
+
+  defp fanout_sample(opts, gc_coordinators?) do
     setup(opts)
     n = Keyword.get(opts, :fanout_n, @fanout_n)
     trials = Keyword.get(opts, :trials, @default_trials)
@@ -975,6 +1039,11 @@ defmodule Fathom.Bench do
       :erlang.garbage_collect()
       before = :erlang.memory(:total)
       handles = Enum.map(1..n, fn i -> open_fanout_shard(t, i) end)
+
+      if gc_coordinators? do
+        Enum.each(handles, fn {_id, pid, _ref} -> :erlang.garbage_collect(pid) end)
+      end
+
       :erlang.garbage_collect()
       used = :erlang.memory(:total) - before
       Enum.each(handles, &close_fanout_shard/1)
