@@ -47,6 +47,25 @@ x-fathom-env: &fathom-env
   WARM_FOLLOWER: "true"
   WARM_CACHE_DIR: /data/warm
   WARM_POLL_MS: "2000"
+  # Phase-2 A2 quorum replication. LISTENING IS ON EVERYWHERE, SHIPPING IS NOT — that is the
+  # documented rollout order (docs/configuration.md), and the rig should demonstrate the order it
+  # tells operators to use. A shipper whose followers are not listening 503s every tenant write.
+  #
+  # Until 2026-08-10 the rig had no replication env at all, so A2 had never run multi-node outside
+  # a single BEAM despite fathom4/fathom5 having been added specifically to hold a full replica set.
+  REPLICATION_LISTEN: "true"
+  REPLICATION_LISTEN_PORT: "9100"
+  REPLICATION_DIR: /data/replicas
+  # REPLICATION_BIND_IP is deliberately unset: inside the compose network there is no public
+  # interface to hide from, and each node's IP is assigned at runtime. Expect the boot line to name
+  # 0.0.0.0 and say so — that warning firing IS the check that the knob is wired.
+  #
+  # Shipping is per-scenario: empty by default so the rig runs exactly as before, and flipped for
+  # a run with `REPLICATION_ENABLED=true ./chaos.sh replication`. REPLICATION_FOLLOWERS is set
+  # PER NODE below (each node's four peers, never itself) — a shared list would have every node
+  # shipping its own shards to its own listener, which works but muddies every result.
+  REPLICATION_ENABLED: "${REPLICATION_ENABLED:-}"
+  REPLICATION_QUORUM: "${REPLICATION_QUORUM:-2}"
   # Phase-2 B1 dynamic rebalancing: every node reports its load, acts on handoff
   # commands, and runs the (singleton) control loop; the LB backend set + where the
   # rendered exception map is written. NODE_KEY is per-node (set on each service below).
@@ -110,6 +129,20 @@ x-fathom-node: &fathom-node
 services:
   postgres:
     image: postgres:16-alpine
+    # max_connections=300, because the default 100 cannot serve this rig and has not been able to
+    # since it went 3 -> 5 nodes on 2026-08-08 (for A2's replica set). Each node opens POOL_SIZE
+    # Repo connections, default 25 (config/runtime.exs), plus Oban's notifier/peer/queues:
+    # 3 x 25 = 75 fit under 100, 5 x 25 = 125 do not.
+    #
+    # The symptom is NOT a clear "out of connections" at the edge — writes just fail, and the node
+    # logs fill with Oban.Peer/Stager crashes and warm-follower directory-read timeouts, all of
+    # which read like application bugs. `smoke` failed identically with replication on and off,
+    # which is what identified it as infrastructure.
+    #
+    # Raised rather than lowering POOL_SIZE per node: the pool size is what a production node
+    # actually runs, and shrinking it would make every throughput scenario measure a topology
+    # nobody deploys.
+    command: ["postgres", "-c", "max_connections=300"]
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -172,6 +205,7 @@ services:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21001
       NODE_KEY: fathom1
+      REPLICATION_FOLLOWERS: "fathom2@fathom2:9100,fathom3@fathom3:9100,fathom4@fathom4:9100,fathom5@fathom5:9100"
     ports:
       - "18081:8080" # direct Hrana (bypasses the LB; zombie/steal experiments)
       - "18091:8081" # direct health
@@ -183,6 +217,7 @@ services:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21002
       NODE_KEY: fathom2
+      REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom3@fathom3:9100,fathom4@fathom4:9100,fathom5@fathom5:9100"
     ports:
       - "18082:8080"
       - "18092:8081"
@@ -194,6 +229,7 @@ services:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21003
       NODE_KEY: fathom3
+      REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom2@fathom2:9100,fathom4@fathom4:9100,fathom5@fathom5:9100"
     ports:
       - "18083:8080"
       - "18093:8081"
@@ -209,6 +245,7 @@ services:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21004
       NODE_KEY: fathom4
+      REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom2@fathom2:9100,fathom3@fathom3:9100,fathom5@fathom5:9100"
     ports:
       - "18084:8080"
       - "18094:8081"
@@ -220,6 +257,7 @@ services:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21005
       NODE_KEY: fathom5
+      REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom2@fathom2:9100,fathom3@fathom3:9100,fathom4@fathom4:9100"
     ports:
       - "18085:8080"
       - "18095:8081"

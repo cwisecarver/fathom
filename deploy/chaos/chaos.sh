@@ -26,6 +26,10 @@
 #                                 per node — the non-synthetic Phase-2 §B hot-spot run
 #   ./chaos.sh rebalance [shard secs]  the Phase-2 B1 handoff live: detect a hot shard,
 #                                 pin it + reload the LB, drain the source, prove it moved
+#   ./chaos.sh replication [shard]  Phase-2 A2: prove every node's follower listener accepts
+#                                 from its peers (the half that was never started outside tests).
+#                                 Add REPLICATION_ENABLED=true — to `up` AND to this — to also
+#                                 ship a write and check followers hold a replica.
 #   ./chaos.sh tpcb [shards txns accounts]  remote TPC-B: RTT probe + N tenant shards driven
 #                                 through the LB by a real libSQL client (the Phase-4 realism run)
 #   ./chaos.sh tpcc [max_w threads txns scale]  remote TPC-C: W=1..max_w sweep through the LB
@@ -517,6 +521,91 @@ cmd_warm_home() {
   sleep 18
   echo "--- after idle-drop, within home-retention (the fix's window) ---"
   check_warm_placement "$shard" "$home"
+}
+
+# -- replication: A2 quorum replication, multi-node for the first time ---------
+# Two halves, and the FIRST one is the point.
+#
+# Until 2026-08-10 `Replication.Follower` — the listener that accepts frames — was started only by
+# the test suite, never by the application. So `REPLICATION_ENABLED` on a real node shipped every
+# commit into a closed port and 503'd every tenant write. The rig had no replication env at all, so
+# nothing here could have caught it, despite fathom4/fathom5 having been added specifically to hold
+# a full replica set.
+#
+# AGENTS.md's rig rule is to assert the fix's OWN observable before trusting anything else, so
+# `listeners` runs first and independently: if the listeners are not up, no later number means
+# anything. It needs no shipping, so it is also the check that the documented rollout order
+# (listen fleet-wide, THEN ship) is actually satisfiable.
+#
+#   ./chaos.sh replication                              # listeners only
+#   REPLICATION_ENABLED=true ./chaos.sh up && \
+#     REPLICATION_ENABLED=true ./chaos.sh replication acme   # + the shipping half
+cmd_replication() {
+  local shard=${1:-acme}
+  local n peer probe ok=0 fail=0
+
+  echo "=== 1. every node is LISTENING (the fix's own observable) ==="
+  for n in "${NODES[@]}"; do
+    peer=$(other_node "$n")
+    # Dial peer:9100 FROM another node, so this proves reachability over the same network path a
+    # shipper uses — not just that a socket exists inside one container.
+    probe=$(rpc "$n" 'IO.puts(case :gen_tcp.connect(~c"'"$peer"'", 9100, [:binary], 2000) do {:ok, s} -> :gen_tcp.close(s); "OPEN"; {:error, e} -> "FAIL #{inspect(e)}" end)')
+    case "$probe" in
+      *OPEN*) echo "  $n -> $peer:9100  OPEN"; ok=$((ok + 1)) ;;
+      *)      echo "  $n -> $peer:9100  $probe"; fail=$((fail + 1)) ;;
+    esac
+  done
+
+  if [ "$fail" -ne 0 ]; then
+    echo "FAIL: $fail/$((ok + fail)) probes could not reach a follower listener."
+    echo "  The image may predate the listener (./chaos.sh build), or REPLICATION_LISTEN is unset."
+    return 1
+  fi
+  echo "  all $ok probes OPEN"
+
+  echo
+  echo "=== 2. the replica directory is reported to the disk gauge ==="
+  for n in "${NODES[@]}"; do
+    printf '  %s replica dir: %s\n' "$n" \
+      "$(rpc "$n" 'IO.puts(Fathom.Shard.Replication.Follower.default_dir())')"
+  done
+
+  if [ "${REPLICATION_ENABLED:-}" != "true" ]; then
+    echo
+    echo "shipping is OFF (REPLICATION_ENABLED unset) — listeners proven, stopping here."
+    echo "for the shipping half:  REPLICATION_ENABLED=true ./chaos.sh up && REPLICATION_ENABLED=true ./chaos.sh replication $shard"
+    return 0
+  fi
+
+  echo
+  echo "=== 3. a write reaches followers (shard=$shard) ==="
+  seed "$shard"
+  local home; home=$(cmd_owner "$shard") || { echo "no home found"; return 1; }
+  echo "  home=$home"
+
+  sql "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', 1)" >/dev/null
+  sql "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', 2)" >/dev/null
+  sleep 3
+
+  local holders=0
+  for n in "${NODES[@]}"; do
+    [ "$n" = "$home" ] && continue
+    probe=$(rpc "$n" 'IO.puts(if File.exists?(Fathom.Shard.Replication.Follower.db_path(Fathom.Shard.Replication.Follower, "'"$shard"'")), do: "HOLDS", else: "-")')
+    case "$probe" in
+      *HOLDS*) echo "  $n  HOLDS a replica of $shard"; holders=$((holders + 1)) ;;
+      *)       echo "  $n  no replica" ;;
+    esac
+  done
+
+  echo
+  # Q=2 is the rig default, so at least two non-home nodes must hold bytes for the commit that
+  # returned to have been legitimately acked.
+  if [ "$holders" -ge 2 ]; then
+    echo "PASS: $holders followers hold a replica (quorum ${REPLICATION_QUORUM:-2})"
+  else
+    echo "FAIL: only $holders followers hold a replica — below the quorum the commit claimed"
+    return 1
+  fi
 }
 
 # -- hotspots: real-traffic hot-spot detection (Phase-2 §B) --------------------
@@ -1596,6 +1685,7 @@ case "${1:-}" in
   tpcc-fleet)  shift; cmd_tpcc_fleet "$@" ;;
   rebalance)   shift; cmd_rebalance "$@" ;;
   hotspots)    shift; cmd_hotspots "$@" ;;
+  replication) shift; cmd_replication "$@" ;;
   up)          cmd_up ;;
   down)        cmd_down ;;
   logs)        shift; cmd_logs "$@" ;;
