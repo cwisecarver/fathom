@@ -201,7 +201,7 @@ See [`docs/benchmark-plan.md`](docs/benchmark-plan.md) for the full harness desc
 
 Phase 2 is scoped in [`docs/phase2-scoping.md`](docs/phase2-scoping.md). Warm standby (A1) and dynamic rebalancing (B1) are **built** (see above), as is the affinity-aware placement piece of locality (C) — all gated off by default.
 
-Not yet built: **live WAL streaming** (A2, deferred by decision — the RPO/cost binding constraint), the remaining locality work (**C1** rendezvous/bounded-load hashing, **C2** multi-region affinity), a **`fathom_native`** Rust NIF, and a **cached / PubSub-invalidated directory resolve** on the request path.
+Not on `main`: **live WAL streaming** (A2 — no longer deferred; **built on the `a2-quorum-replication` branch** and not merged here. The blocker, "exqlite exposes no WAL seam," was disproved 2026-08-09: a loadable extension reaches `sqlite3_wal_hook`, the same move as the Django UDFs. Node-loss RPO ~300 s → ~0, at +225 µs per write when on and noise when off), the remaining locality work (**C1** rendezvous/bounded-load hashing, **C2** multi-region affinity), a **`fathom_native`** Rust NIF, and a **cached / PubSub-invalidated directory resolve** on the request path.
 
 ## Contributing
 

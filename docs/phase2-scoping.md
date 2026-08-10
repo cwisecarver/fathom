@@ -83,7 +83,15 @@ cold-open-from-S3. The fork is how warm:
   for near-zero RPO + instant promotion (LiteFS/litestream territory). exqlite exposes
   no WAL-frame stream, so this needs a WAL-shipping layer or adopting libSQL
   replication — and WAL frames crossing nodes is a **cross-node data path**, which
-  tensions "S3 is the only coordination." High infra risk, big. Its only win over A1 is
+  tensions "S3 is the only coordination." High infra risk, big.
+  **UPDATE 2026-08-09 — two of those three premises were wrong, and A2 is built on the
+  `a2-quorum-replication` branch (not merged here).** exqlite's surface was never the boundary: a
+  loadable extension gets a live `sqlite3*`, and `sqlite3_wal_hook` is in the extension pointer
+  table — same move as the Django UDFs. No libSQL swap, no forked driver. And it needed no BEAM
+  cluster: frames go over A2's own socket protocol, so S3 stays the only cross-node *coordination*.
+  What survives is the third premise — a cross-node data path is genuinely new surface, and
+  membership is still a static config list. Measured cost: **+225 µs per write (4.04×)** with it
+  on, noise with it off. See [a2-quorum-replication](a2-quorum-replication.md). Its only win over A1 is
   RPO (per-frame vs per-flush) — and RPO is already tunable via the flush interval. **Not
   worth the risk/model-change now.**
   **Scoped in full 2026-08-08 → [a2-quorum-replication](a2-quorum-replication.md)**: the

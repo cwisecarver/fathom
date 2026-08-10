@@ -1,9 +1,14 @@
-# A2 — Quorum replication (design, NOT built)
+# A2 — Quorum replication (design; not on `main`)
 
-**Status: design only. Blocked on a dependency, not on effort — see [The blocker](#the-blocker).**
-Scoped 2026-08-08. Supersedes the one-paragraph deferral in
-[phase2-scoping](phase2-scoping.md) §A2 with an actual mechanism, a verified blocker, and the
-options for clearing it.
+**Status: the blocker below was WRONG and is cleared. A2 is built on the
+`a2-quorum-replication` branch, not on `main`.** Scoped 2026-08-08; blocker disproved 2026-08-09.
+Supersedes the one-paragraph deferral in [phase2-scoping](phase2-scoping.md) §A2.
+
+This copy is kept deliberately as the *scoping* document — the mechanism, the cost, and the
+decision gates. The branch carries the implementation record, which is roughly three times longer
+and does not belong on a `main` that has no A2 code. **Read [The blocker](#the-blocker) with its
+correction before quoting anything here**: the sentence "there is no seam to ship a frame from" is
+preserved for the record and is false.
 
 ## The gap this closes
 
@@ -72,6 +77,10 @@ another node's shard and never serves. A2 is the same component with the data pa
 
 ## The blocker
 
+> **CORRECTED 2026-08-09 — the conclusion below is wrong, and the paragraph after it says why.**
+> The original text is kept verbatim rather than rewritten, because the mistake is the useful part:
+> the answer was sitting in this document's own next sentence.
+
 **`exqlite` 0.37.0 exposes no WAL-frame API.** Verified 2026-08-08 against `deps/exqlite/lib/`: the
 only WAL-related surface in the entire library is `Exqlite.Pragma.wal_auto_check_point/1`, a
 configuration pragma. There is no `sqlite3_wal_hook`, no frame read/apply, no backup API, no session
@@ -81,13 +90,60 @@ This is the same class of gap as the UDF work (expert review #19), where the fin
 `create_function` did not exist either and the fix was a loadable extension via
 `enable_load_extension/2`. Establish the seam exists **before** designing against it.
 
-### Options for clearing it
+### The seam exists. exqlite never had to expose it
 
-Effort labels are estimates, not measurements.
+The first sentence of that paragraph named the fix and the conclusion ignored it. exqlite's surface
+is irrelevant, because fathom already ships a **loadable extension** (`native/fathom_udf`, loaded
+per connection by `Fathom.Shard.Extension`), and an extension is handed a live `sqlite3*`.
+
+- **`sqlite3_wal_hook` is in `sqlite3_api_routines`** — the extension pointer table, not merely the
+  normal link surface. So it is reachable from exactly the one place fathom can already reach
+  SQLite's C API.
+- **rusqlite wraps it safely** as `Connection::wal_hook/1`, behind feature `hooks = []` — no new
+  dependencies, a one-line `Cargo.toml` change.
+
+**Proven at runtime, not just on the link surface** (`test/fathom/shard/wal_hook_test.exs`): the
+hook fires on a real commit through `Fathom.Shard.Connection`, with the extension loaded the way
+production loads it. The test is tagged `:wal_probe` and needs `FATHOM_WAL_PROBE=1` **in the real
+OS environment** — `System.put_env` updates the BEAM's table, not C `environ`, so it cannot reach
+native code. CI sets it; a local `mix test --include wal_probe` without it fails on a missing
+`fathom_wal_commits`, which is a missing env var and not a regression.
+
+**The trap, which nearly shipped as a disk-fill incident.** `sqlite3_wal_hook` and
+`wal_autocheckpoint` are **the same slot** — auto-checkpointing *is* a built-in WAL hook, so
+registering ours **evicts** it. `Connection.configure_readwrite/3` sets the pragma first and loads
+the extension second, so a hook that merely observed would have silently disabled checkpointing on
+**every tenant connection** and grown the WAL without bound — surfacing as the disk-fill alert
+expert review #36 built, with the diagnostic pointing at storage rather than here. The hook
+therefore re-implements what it displaced (PASSIVE checkpoint at the same threshold), and the test
+asserts the **negative** — that the WAL still truncates — because a test that only proved the hook
+fired would pass either way.
+
+**What the hook gives and does not give.** It is a *notification* ("a commit landed; the WAL holds
+N pages"), not frame bytes. The shipper reads the `-wal` from its last shipped offset, which is how
+litestream works. That means the design owns WAL-truncation ordering: a checkpoint that runs before
+frames ship destroys them, so the rule is *checkpoint only what the write quorum has already
+acked*.
+
+The lesson generalizes past this document: **a dependency's public API is not the boundary of what
+is reachable.** Twice now — UDFs, then the WAL hook — the blocker was "exqlite does not expose it"
+and the answer was "so do not ask exqlite."
+
+### Options for clearing it — resolved, option 1 without its cost
+
+**Option 1 won, and the "Large" estimate was wrong by a lot.** It assumed a NIF or a patched
+exqlite; the extension already existed, so registering the hook was a feature flag and a `wal.rs`.
+None of options 2–4 were needed and none were pursued. They are kept below as the record of what
+was considered, not as open choices.
+
+Effort labels are estimates, not measurements — and option 1's is a demonstration of how far off an
+estimate can be when it costs the wrong mechanism.
 
 1. **Write the NIF ourselves** (`fathom_native`, or patch exqlite). Register `sqlite3_wal_hook`,
    read committed frames out of the `-wal` file, apply them on the follower. Most control, most
-   work; puts fathom on a forked or extended DB driver. **Large.**
+   work; puts fathom on a forked or extended DB driver. **Large.** — **TAKEN, but via the existing
+   loadable extension rather than a NIF or a fork, which is where the estimate went wrong. No
+   forked driver, no new dependency.**
 2. **Adopt libSQL's engine for replication.** libSQL already does frame-level replication.
    `Fathom.Shard.Connection` is documented as the single swap-point for exactly this
    (see AGENTS.md). Trades "write it" for "inherit it", but it is an engine swap on the data path
@@ -114,6 +170,13 @@ So the honest framing of the decision is **not** "should we add WAL streaming" b
 become a BEAM cluster."** Waterpark is the evidence that the clustered answer works at scale in a
 domain where losing a write is unacceptable.
 
+> **CORRECTED 2026-08-09.** That framing was a false dichotomy. A2 as built ships frames over its
+> own socket protocol with **no BEAM distribution** — S3 stays the only cross-node *coordination*
+> (lease, fence, cold open), and replication is a separate data path beside it rather than a
+> replacement for it. Membership is a static config list, which is precisely the piece a BEAM
+> cluster would have supplied and the honest cost of not having one. See
+> [Decision gate](#decision-gate--cleared).
+
 ## What it would and would not improve
 
 - **Would:** node-loss RPO from ~300 s to ~0. This is the entire benefit.
@@ -123,16 +186,34 @@ domain where losing a write is unacceptable.
 - **Would NOT:** remove the need for S3. It stays the cold backstop and the cold-open source.
 - **Cost added:** every commit waits for ≥2 follower acks — a network round trip on the write path
   that does not exist today. Must be measured against `hrana_rt_us` before committing to it.
+  **Measured 2026-08-09: +225 µs, 4.04× on the write, and ~130 µs of that is fathom's own overhead
+  rather than the network.** Off by default, where the cost is one `Application.get_env` per write.
+  Numbers and method in [Decision gate](#decision-gate--cleared).
 
-## Decision gate
+## Decision gate — cleared
 
-Do not start until, in order:
+Both gates passed on `a2-quorum-replication`. Gate 3 did not apply, for a reason worth recording.
 
-1. **A frame seam is proven to exist** — option 1, 2 or 3 demonstrated on a branch, reading and
-   applying one committed frame between two processes. Cheapest experiment that kills the premise.
-2. **The ack-latency cost is measured** against the current per-request round trip.
-3. **The BEAM-cluster reversal is accepted explicitly**, because everything downstream depends on
-   it and it is not reversible cheaply.
+1. **A frame seam is proven to exist.** ✅ `test/fathom/shard/wal_hook_test.exs` — the hook fires
+   on a real commit through `Fathom.Shard.Connection`, extension loaded as production loads it.
+2. **The ack-latency cost is measured** against the current per-request round trip. ✅
+   `test/fathom/shard/replication_cost_test.exs`, N=3 Q=2, loopback, p50 of 200: write only
+   **74 µs**, write + replication **299 µs** — **+225 µs, 4.04×**. About **130 µs of that is
+   fathom's own overhead**, not the transport (the raw-socket 2-of-4 floor was ~96 µs), i.e. a
+   replicated write costs roughly two extra `hrana_rt_us` round trips of *local* work before any
+   network. **With replication off the cost is noise**: one `Application.get_env` per write, and
+   `hrana_rt_us` moved 127 → 130 µs across the integration commit.
+3. **The BEAM-cluster reversal is accepted explicitly.** ❌ **Never arose — the premise was wrong.**
+   "The architectural cost" above frames the real question as *"should fathom become a BEAM
+   cluster."* It did not have to. A2 ships frames over its own socket protocol
+   (`lib/fathom/shard/replication/`: `protocol`, `shipper`, `session`, `quorum`), with **no
+   `Node.connect`, no distribution, no libcluster** — so the "reversal of the central decision"
+   that section warns about did not happen. S3 remains the lease/fence authority. Membership is
+   still a static config list, which is the honest limitation and the reason this is not a cluster
+   in disguise.
 
-Until then the position is: EBS covers reboot, S3 covers hardware and AZ loss, the 300 s interval
-bounds the exposure between them, and the quarantine keeps a diverged copy recoverable.
+**Until it is merged to `main`, the `main` position is unchanged**: EBS covers reboot, S3 covers
+hardware and AZ loss, the 300 s interval bounds the exposure between them, and the quarantine keeps
+a diverged copy recoverable. A2 is off by default on the branch too — `REPLICATION_ENABLED` and,
+separately, `REPLICATION_PROMOTE_ON_OPEN`, so frames can ship and earn ordering stamps before
+anything changes what a cold open serves.
