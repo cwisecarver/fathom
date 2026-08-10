@@ -41,7 +41,7 @@ defmodule Fathom.Shard.Storage.Local do
   end
 
   @impl true
-  def flush(shard_id, local_path, expected_etag) do
+  def flush(shard_id, local_path, expected_etag, position \\ nil) do
     # Model S3's If-Match / If-None-Match:* fence with the content-hash etag: only write if the
     # remote's current etag still matches what the coordinator last saw (or, for a brand-new
     # shard, only if no object exists). A mismatch means a stealer flushed in the window since
@@ -81,6 +81,7 @@ defmodule Fathom.Shard.Storage.Local do
           # such ordering. A fence etag that does not describe the stored object makes the next
           # flush 412 and the shard self-fence away acknowledged writes.
           with :ok <- Storage.atomic_copy(local_path, remote_path(shard_id)),
+               :ok <- write_position(shard_id, position),
                {:ok, etag} <- file_etag(remote_path(shard_id)) do
             {:ok, etag}
           end
@@ -88,6 +89,42 @@ defmodule Fathom.Shard.Storage.Local do
     end)
   catch
     {:error, _} = err -> err
+  end
+
+  # The position stamp S3 carries as object metadata. A companion file here, written AFTER the
+  # object so a crash between the two leaves a stamp-less object rather than a stamp describing
+  # bytes that were never stored — the first reads as "unknown" (never overridable), the second
+  # would be a lie a replica could act on.
+  #
+  # A flush with no position REMOVES any previous stamp rather than leaving it: a stale stamp
+  # describing older bytes is exactly the over-claim-in-reverse that loses writes.
+  defp write_position(shard_id, nil), do: rm_ok(position_path(shard_id))
+
+  defp write_position(shard_id, position) do
+    Storage.atomic_write(position_path(shard_id), Storage.encode_position(position))
+  end
+
+  @impl true
+  def object_position(shard_id) do
+    # Gated on the OBJECT existing, not the stamp: a leftover stamp beside a deleted object would
+    # otherwise describe bytes that are gone.
+    if File.exists?(remote_path(shard_id)) do
+      case File.read(position_path(shard_id)) do
+        {:ok, raw} -> {:ok, Storage.parse_position(String.trim(raw))}
+        {:error, :enoent} -> {:ok, nil}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp rm_ok(path) do
+    case File.rm(path) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      other -> other
+    end
   end
 
   @impl true
@@ -207,6 +244,11 @@ defmodule Fathom.Shard.Storage.Local do
 
   @impl true
   def drop_live(shard_id) do
+    # The stamp goes with the object. `object_position/1` already gates on the object existing, so
+    # a dangling stamp could not be acted on — but leaving residue that only one reader knows to
+    # ignore is how the next reader gets it wrong.
+    _ = rm_ok(position_path(shard_id))
+
     case File.rm(remote_path(shard_id)) do
       :ok -> :ok
       {:error, :enoent} -> :ok
@@ -726,6 +768,7 @@ defmodule Fathom.Shard.Storage.Local do
   end
 
   defp remote_path(shard_id), do: Path.join(dir(), "#{shard_id}.db")
+  defp position_path(shard_id), do: Path.join(dir(), "#{shard_id}.db.pos")
   defp version_path(shard_id, version), do: Path.join(dir(), "#{shard_id}@#{version}.db")
 
   defp snapshot_path(shard_id, snapshot_id),

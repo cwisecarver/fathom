@@ -73,6 +73,13 @@ defmodule Fathom.Shard.Storage.S3 do
   # verify_integrity/3.
   @md5_meta "x-amz-meta-fathom-md5"
 
+  # How much of the shard's history the object's bytes contain (Phase 2 A2 promote-on-open).
+  # User metadata on the SAME PUT — S3 charges per request and ingress is free, so a stamp that
+  # cost its own request would make every durability flush more expensive to buy a failover-only
+  # benefit. Absent on any object written before stamping existed, which readers must treat as
+  # "unknown" (⇒ never overridable), never as "empty".
+  @pos_meta "x-amz-meta-fathom-pos"
+
   @doc """
   Name of the dedicated Finch pool that carries all S3 traffic.
   """
@@ -260,7 +267,7 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   @impl true
-  def flush(shard_id, local_path, expected_etag) do
+  def flush(shard_id, local_path, expected_etag, position \\ nil) do
     # If-Match the etag we last saw (or If-None-Match:* for a brand-new shard), so the PUT
     # only lands if the object hasn't changed under us. A 412 means a stealer flushed in the
     # window since our fence check → superseded, don't clobber (finding #15). Return the new
@@ -280,7 +287,7 @@ defmodule Fathom.Shard.Storage.S3 do
                    # Etag-form-independent integrity hash (expert review 2026-07-14 #17), over the
                    # UNCOMPRESSED bytes (#38).
                    {@md5_meta, md5_hex} | cond_headers
-                 ] ++ enc_headers
+                 ] ++ enc_headers ++ pos_meta_header(position)
              ) do
         case resp.status do
           s when s in 200..299 -> {:ok, etag(resp.headers)}
@@ -745,12 +752,19 @@ defmodule Fathom.Shard.Storage.S3 do
 
   # The x-amz-meta-fathom-md5 value off a GET/HEAD response (list- or bare-valued), or nil.
   defp meta_md5(headers) do
-    case headers[@md5_meta] do
+    header_value(headers, @md5_meta)
+  end
+
+  defp header_value(headers, key) do
+    case headers[key] do
       [v | _] when is_binary(v) -> v
       v when is_binary(v) -> v
       _ -> nil
     end
   end
+
+  defp pos_meta_header(nil), do: []
+  defp pos_meta_header(pos), do: [{@pos_meta, Storage.encode_position(pos)}]
 
   defp verify_md5(_digest, nil), do: :ok
 
@@ -969,6 +983,25 @@ defmodule Fathom.Shard.Storage.S3 do
       {:ok, %{status: 404}} -> {:ok, nil}
       {:ok, %{status: status}} -> {:error, {:s3_head_status, status}}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # Same HEAD shape as object_etag/1. A 404 is `{:ok, nil}` — no object means no position, which
+  # reads identically to an unstamped one and lands on the same safe answer.
+  @impl true
+  def object_position(shard_id) do
+    case Req.head(req(), url: object_path(shard_id)) do
+      {:ok, %{status: 200, headers: h}} ->
+        {:ok, Storage.parse_position(header_value(h, @pos_meta))}
+
+      {:ok, %{status: 404}} ->
+        {:ok, nil}
+
+      {:ok, %{status: status}} ->
+        {:error, {:s3_head_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

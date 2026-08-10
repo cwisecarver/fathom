@@ -67,6 +67,39 @@ defmodule Fathom.Shard.Replication.Promote do
         }
 
   @doc """
+  Is this node's replica strictly ahead of what the stored object contains?
+
+  **Pure**, like `FollowerLog.decide/2` and `Quorum.settle/1`, and for the same reason: this is the
+  decision that picks one of two lineages of a tenant's database and discards the other. Getting it
+  wrong in one direction costs a failover's worth of RPO; in the other it silently drops
+  acknowledged writes. It needs to be reachable from a plain unit test, not only from a failover.
+
+  Both arguments are `nil`-tolerant and every uncertain case answers `false`:
+
+    * no replica — nothing to promote;
+    * **no stamp** — the object predates position stamping, or was written by a caller that passed
+      none. Unknown is not "empty": an unstamped object is never overridable, which is what makes
+      this feature inert (rather than dangerous) until a shard's next flush.
+
+  The comparison is lexicographic on `{epoch, wal_gen, offset}` — see `t:Storage.position/0` for
+  why that is a total order on how far along a copy is. `>` and not `>=`: equal positions mean the
+  two hold the same history, and the stored object is then the one with provenance.
+  """
+  @spec fresher?(map() | nil, Storage.position() | nil) :: boolean()
+  def fresher?(nil, _stamp), do: false
+  def fresher?(_replica, nil), do: false
+
+  def fresher?(%{epoch: e1, wal_gen: g1, next_offset: o1}, %{
+        epoch: e2,
+        wal_gen: g2,
+        offset: o2
+      }) do
+    {e1, g1, o1} > {e2, g2, o2}
+  end
+
+  def fresher?(_replica, _stamp), do: false
+
+  @doc """
   Promote this node's replica of `shard_id` to be the live shard.
 
   Options:

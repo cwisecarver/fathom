@@ -1963,7 +1963,9 @@ defmodule Fathom.Shard do
     # the flush, while a merely-busy checkpoint must fall back to the snapshot path.
     case checkpoint_and_verify(state.path) do
       :ok ->
-        Storage.flush(state.id, state.path, state.etag)
+        # Read after the checkpoint, same reasoning as `snapshot_and_upload/1`: the WAL has just
+        # been folded into the database, so the position describes bytes that are genuinely here.
+        Storage.flush(state.id, state.path, state.etag, flush_position(state))
 
       # Integrity failed (expert review 2026-07-14 #4). The checkpoint-then-raw-upload fast path
       # uploads the bytes as-is, so a locally corrupted db (disk/fs/memory fault, exqlite/OS bug)
@@ -2620,6 +2622,36 @@ defmodule Fathom.Shard do
   # land, `{:error, :superseded}` when the object changed under us (a stealer flushed — the
   # caller self-fences), or `{:error, reason}` on a transient failure (the caller keeps the
   # shard dirty so the write isn't lost on a later idle-drop).
+  # How much of this shard's history the bytes being flushed contain — Phase 2 A2. Lets a failover
+  # order this object against a node's local REPLICA, which nothing else can do (an etag is a
+  # content hash with no ordering; the lock carries the holder's epoch, not the object's).
+  #
+  # READ AFTER THE SNAPSHOT, DELIBERATELY, AND REVERSING THIS LOSES WRITES. The snapshot is a
+  # consistent read taken at some instant; writes can land while it runs. Reading the WAL
+  # afterwards therefore reports a position at or beyond what the snapshot captured — the object
+  # claims at least as much as it holds. That direction is safe: a replica is promoted only when it
+  # is strictly ahead of the claim, so an over-claim costs at most one flush interval of RPO.
+  #
+  # Reading BEFORE the snapshot would under-claim, and a replica sitting between the claim and the
+  # truth would be judged fresher and promoted — silently dropping exactly the writes that landed
+  # during the snapshot. `FlushWatermark`'s own count is captured before snapshotting for the
+  # opposite reason (a missed write must leave the shard dirty), which is why it cannot be reused
+  # here however similar it looks.
+  #
+  # `nil` when the WAL is unreadable or there is no lease: an absent stamp reads as "unknown" and
+  # makes the object un-overridable, which is the same safe answer.
+  defp flush_position(%{lease: %{epoch: epoch}} = state) when is_integer(epoch) do
+    case Fathom.Shard.Replication.Wal.read(state.path <> "-wal") do
+      {:ok, %{ckpt_seq: gen, size: size}} -> %{epoch: epoch, wal_gen: gen, offset: size}
+      # No WAL yet: nothing has been written through one, so the object contains everything
+      # there is at this epoch's generation 0.
+      {:ok, :empty} -> %{epoch: epoch, wal_gen: 0, offset: 0}
+      {:error, _} -> nil
+    end
+  end
+
+  defp flush_position(_state), do: nil
+
   defp snapshot_and_upload(state) do
     temp = "#{state.path}.snap.#{System.unique_integer([:positive])}"
 
@@ -2629,7 +2661,7 @@ defmodule Fathom.Shard do
       with :ok <- verify_snapshot(state, temp),
            :ok <- snapshot(state.path, temp),
            :ok <- recheck_before_put(state),
-           {:ok, new_etag} <- Storage.flush(state.id, temp, state.etag) do
+           {:ok, new_etag} <- Storage.flush(state.id, temp, state.etag, flush_position(state)) do
         {:ok, new_etag}
       else
         {:error, :superseded} = superseded ->
