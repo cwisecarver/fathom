@@ -173,9 +173,30 @@ nothing unless a quorum's worth are near: with all four followers equidistant, 2
 exactly at every latency measured. With two near and two far, 2-of-4 acks in ~1.6 ms where 4-of-4
 pays 134 ms — same replicas, 82×.
 
+### Rollout order: listening comes first, fleet-wide
+
+Shipping and receiving are **separate gates**, and enabling them in the wrong order is an outage.
+`REPLICATION_ENABLED` makes a node *ship*; `REPLICATION_LISTEN` makes a node *receive*. A shipper
+whose followers are not listening collects no acks and returns **503 `FILO_NO_QUORUM` on every
+tenant write**.
+
+1. Set `REPLICATION_LISTEN=true` (plus `REPLICATION_BIND_IP`, `REPLICATION_DIR`) **everywhere**, and
+   confirm each node logged `replication follower listening on <ip>:<port>`.
+2. Only then set `REPLICATION_ENABLED` + `REPLICATION_FOLLOWERS` on the nodes that should ship.
+3. `REPLICATION_PROMOTE_ON_OPEN` last, after flushes have been stamping positions for a while.
+
+> Before 2026-08-10 there was no step 1: the listener existed but was never started outside the
+> test suite, so `REPLICATION_FOLLOWERS` pointed at a port fathom never opened and enabling
+> replication broke every write on the node. If you are reading an older runbook, this is the step
+> it is missing.
+
 | Var | Default | What it does | Safety consequence |
 |---|---|---|---|
-| `REPLICATION_ENABLED` | off | Gate a tenant's commit on follower acks. | Adds a network round trip to every write. Measured +225 µs on loopback (74 → 299 µs); the real number is set by follower distance. |
+| `REPLICATION_LISTEN` | off | Accept frames as somebody's follower. **Turn on fleet-wide before any node ships.** | Opens an **unauthenticated** TCP port carrying raw tenant database bytes. Pin it with `REPLICATION_BIND_IP` and firewall it — the network is the trust boundary, same posture as `HRANA_AUTH` disabled. |
+| `REPLICATION_LISTEN_PORT` | `9100` | Port the follower binds. | Must be reachable from every shipping node and from nowhere else. Clear of `HRANA_PORT` 8080 and `HEALTH_PORT` 8081. |
+| `REPLICATION_BIND_IP` | unset (**all interfaces**) | Interface the follower binds. | **A security control, not tuning.** Unset means every interface, which on a cloud host is the public one — and anyone who reaches the port can write into any shard this node follows. Invalid value refuses to boot. The follower logs the interface it bound; read that line. |
+| `REPLICATION_DIR` | `$TMPDIR/fathom_replication` | Where received replicas are stored. | Holds a **full copy of every shard this node follows** and grows from *other* nodes' write traffic. The default is under `$TMPDIR` — point it at real local disk. Reported as `dir=replica` by `fathom.node.disk`. |
+| `REPLICATION_ENABLED` | off | Gate a tenant's commit on follower acks. | Adds a network round trip to every write. Measured +225 µs on loopback (74 → 299 µs); the real number is set by follower distance. **Requires the followers to be listening already** — see the rollout order above. |
 | `REPLICATION_FOLLOWERS` | unset | Follower set as `node_key@host:port`, comma separated. `node_key@` optional. | **Order and locality are a latency decision** (see above). With `Q=2`, two followers must be near — and in a *different* AZ, or one AZ failure takes 3 of 5 copies and leaves exactly `Q` with no slack. A malformed entry **refuses to boot** rather than silently shortening the replica set. |
 | `REPLICATION_QUORUM` | `2` | Acks required before a commit returns. | **Must be < the follower count**; the boot check refuses `Q=N`. Q=N tolerates zero follower failures and inherits the slowest replica — measured 32× worse with one straggler, 82× with two far. |
 | `REPLICATION_FSYNC` | off | Follower `fdatasync`s before acking. | On costs ~398 µs against a ~96 µs floor — ~2.4× fathom's whole request round trip. Off matches Waterpark (ack from RAM, durability from replica count) and is never *worse* than today: if every replica holding an un-synced frame dies at once, the shard falls back to its S3 object, i.e. pre-A2 behaviour. |

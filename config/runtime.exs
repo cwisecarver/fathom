@@ -571,6 +571,48 @@ if n = env_int.("REPLICATION_SEED_CHUNK_BYTES") do
   config :fathom, :replication_seed_chunk_bytes, n
 end
 
+# ---- The RECEIVE half: this node acts as somebody's follower --------------------------------
+# SEPARATE GATE FROM REPLICATION_ENABLED, and the reason is a real gap this closes (2026-08-10):
+# the `Follower` listener was only ever started by the test suite, so a node with replication on
+# shipped every commit to addresses where nothing listened, got no acks, and 503'd
+# `FILO_NO_QUORUM` on every tenant write — while REPLICATION_FOLLOWERS below documented a port
+# fathom never opened.
+#
+# ROLLOUT ORDER: turn this on FLEET-WIDE FIRST, confirm every node is listening, and only then
+# enable REPLICATION_ENABLED anywhere. A node can host others' replicas without replicating its
+# own shards, which is exactly why these are two flags and not one.
+if System.get_env("REPLICATION_LISTEN") in ~w(true 1) do
+  config :fathom, :replication_listen, true
+end
+
+# Port the follower listener binds. Default 9100 — the port this file's REPLICATION_FOLLOWERS
+# example has always shown, and clear of :hrana_port 8080 and :health_port 8081.
+if n = env_int.("REPLICATION_LISTEN_PORT") do
+  config :fathom, :replication_listen_port, n
+end
+
+# WHICH INTERFACE THE REPLICATION PORT BINDS. This is a security control, not tuning.
+#
+# The replication protocol has NO AUTHENTICATION: whoever can reach this port can push WAL frames
+# into any shard this node follows. Unset, `:gen_tcp` binds EVERY interface, which on a cloud host
+# means the public one. The trust boundary is the network — the same posture as `hrana_auth:
+# :disabled` — so pin it to a private address and firewall it, exactly as HRANA_BIND_IP does for
+# the data plane. The follower logs which interface it bound at boot; read that line.
+if bind = System.get_env("REPLICATION_BIND_IP") do
+  case :inet.parse_address(String.to_charlist(bind)) do
+    {:ok, ip} -> config :fathom, :replication_bind_ip, ip
+    {:error, _} -> raise "REPLICATION_BIND_IP is not a valid IP address: #{inspect(bind)}"
+  end
+end
+
+# Where a follower keeps the replicas it receives. Defaults under System.tmp_dir!/ like
+# SHARD_DATA_DIR and WARM_CACHE_DIR — fine for dev, wrong for a node that is somebody's durability
+# guarantee. Point it at real local disk; it holds a full copy of every shard this node follows,
+# and `fathom.node.disk` reports it as `dir=replica`.
+if dir = System.get_env("REPLICATION_DIR") do
+  config :fathom, :replication_dir, dir
+end
+
 # ---- Admin dashboard (/admin + /admin/metrics) BasicAuth ----------------------------------
 # Credentials for the operator surface. The router's admin_auth plug fails closed (503) when
 # unset, so the dashboard/scrape is never anonymously reachable — set both to enable it. Read in

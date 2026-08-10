@@ -127,6 +127,16 @@ defmodule Fathom.Shard.Replication.Follower do
       Path.join(System.tmp_dir!(), "fathom_replication")
   end
 
+  # The bound interface, for the boot log only. "0.0.0.0" is spelled out rather than left blank
+  # because "listening on :9100" reads like a local detail while "listening on 0.0.0.0:9100" reads
+  # like the exposure it is — and this port is unauthenticated.
+  defp bind_label(opts) do
+    case Keyword.get(opts, :ip) do
+      nil -> "0.0.0.0 (ALL interfaces — set REPLICATION_BIND_IP)"
+      ip -> ip |> :inet.ntoa() |> to_string()
+    end
+  end
+
   @doc false
   def wal_path(name \\ __MODULE__, shard_id), do: Path.join(dir(name), shard_id <> ".db-wal")
 
@@ -156,18 +166,24 @@ defmodule Fathom.Shard.Replication.Follower do
 
     :ets.insert(tab, {:__dir__, dir})
 
-    {:ok, lsock} =
-      :gen_tcp.listen(Keyword.get(opts, :port, 0), [
-        :binary,
-        packet: 4,
-        active: false,
-        reuseaddr: true,
-        nodelay: true,
-        backlog: 128
-      ])
+    # `ip:` is a security control, not tuning. This socket takes raw WAL frames for a tenant's
+    # database and the protocol has NO authentication — whoever reaches the port can write into
+    # any shard this node follows. Without `ip:` `:gen_tcp` binds every interface, which on a
+    # cloud host means the public one. Same trust posture as `hrana_auth: :disabled` (the network
+    # IS the boundary), so it gets the same knob: `REPLICATION_BIND_IP`.
+    listen_opts =
+      [:binary, packet: 4, active: false, reuseaddr: true, nodelay: true, backlog: 128]
+      |> then(fn base ->
+        case Keyword.get(opts, :ip) do
+          nil -> base
+          ip -> [{:ip, ip} | base]
+        end
+      end)
+
+    {:ok, lsock} = :gen_tcp.listen(Keyword.get(opts, :port, 0), listen_opts)
 
     {:ok, port} = :inet.port(lsock)
-    Logger.info("replication follower listening on #{port}")
+    Logger.info("replication follower listening on #{bind_label(opts)}:#{port} (dir #{dir})")
 
     {:ok, %{lsock: lsock, port: port, name: name}, {:continue, :accept}}
   end

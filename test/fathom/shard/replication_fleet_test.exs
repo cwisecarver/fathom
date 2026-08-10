@@ -25,14 +25,22 @@ defmodule Fathom.Shard.ReplicationFleetTest do
     prev = %{
       enabled: Application.get_env(:fathom, :replication_enabled),
       followers: Application.get_env(:fathom, :replication_followers),
-      quorum: Application.get_env(:fathom, :replication_quorum)
+      quorum: Application.get_env(:fathom, :replication_quorum),
+      listen: Application.get_env(:fathom, :replication_listen),
+      listen_port: Application.get_env(:fathom, :replication_listen_port),
+      bind_ip: Application.get_env(:fathom, :replication_bind_ip),
+      dir: Application.get_env(:fathom, :replication_dir)
     }
 
     on_exit(fn ->
       for {k, v} <- [
             replication_enabled: prev.enabled,
             replication_followers: prev.followers,
-            replication_quorum: prev.quorum
+            replication_quorum: prev.quorum,
+            replication_listen: prev.listen,
+            replication_listen_port: prev.listen_port,
+            replication_bind_ip: prev.bind_ip,
+            replication_dir: prev.dir
           ] do
         if is_nil(v),
           do: Application.delete_env(:fathom, k),
@@ -217,6 +225,101 @@ defmodule Fathom.Shard.ReplicationFleetTest do
       # would page whoever owns the alert.
       refute_receive {^ref, _}, 100
     end
+  end
+
+  # THE RECEIVE HALF. Until 2026-08-10 `Follower` was started only by tests, so a deployment with
+  # replication on shipped to addresses where nothing listened and 503'd every tenant write. These
+  # pin that `Fleet` supervises it, and that the two roles are independently gated — a node must be
+  # able to listen WITHOUT shipping, which is what makes a safe rollout order expressible.
+  describe "the receive half (:replication_listen)" do
+    setup do
+      dir = Path.join(System.tmp_dir!(), "fleet_listen_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(dir) end)
+      Application.put_env(:fathom, :replication_dir, dir)
+      %{dir: dir, port: free_port()}
+    end
+
+    test "a listening node supervises a Follower that accepts a connection", %{port: port} do
+      Application.put_env(:fathom, :replication_listen, true)
+      Application.put_env(:fathom, :replication_listen_port, port)
+
+      start_supervised!(Fleet)
+
+      assert {:ok, sock} = connect(port),
+             "nothing accepted on #{port} — the Follower listener is not supervised, which is " <>
+               "the exact gap that made A2 undeployable"
+
+      :gen_tcp.close(sock)
+    end
+
+    # The discriminating half: without this, "it listens" could just be a port something else
+    # opened, and the rollout-order argument for two flags would be untestable.
+    test "a node that does not listen opens no port", %{port: port} do
+      Application.put_env(:fathom, :replication_listen, false)
+      Application.put_env(:fathom, :replication_listen_port, port)
+      Application.put_env(:fathom, :replication_enabled, false)
+
+      # children/0 returns [] here, so start Fleet directly to prove init/1 also declines.
+      start_supervised!(Fleet)
+
+      assert {:error, :econnrefused} = connect(port)
+    end
+
+    test "listening does not require shipping, and starts no shippers", %{port: port} do
+      Application.put_env(:fathom, :replication_listen, true)
+      Application.put_env(:fathom, :replication_listen_port, port)
+      Application.put_env(:fathom, :replication_enabled, false)
+      Application.delete_env(:fathom, :replication_followers)
+
+      # A listen-only node has no follower list. Before the split, init/1 called
+      # validate_quorum!/0 unconditionally and this raised "there is nothing to replicate to" —
+      # i.e. a node could not be a pure follower at all.
+      start_supervised!(Fleet)
+
+      assert Fleet.shippers() == []
+      assert {:ok, sock} = connect(port)
+      :gen_tcp.close(sock)
+    end
+
+    test "children/0 is empty only when BOTH roles are off" do
+      Application.put_env(:fathom, :replication_enabled, false)
+      Application.put_env(:fathom, :replication_listen, false)
+      assert Fleet.children() == []
+
+      Application.put_env(:fathom, :replication_listen, true)
+      assert Fleet.children() == [Fleet]
+
+      Application.put_env(:fathom, :replication_listen, false)
+      Application.put_env(:fathom, :replication_enabled, true)
+      assert Fleet.children() == [Fleet]
+    end
+
+    # Proves the `ip:` option is threaded through to :gen_tcp.listen and accepted. It does NOT
+    # prove interface isolation — that needs a multi-homed host, and asserting it on loopback
+    # would pass whether or not the option took. The security claim rests on :gen_tcp's own
+    # semantics; what is checkable here is that the value reaches the socket at all, which is
+    # where a config-plumbing bug would land.
+    test "a bind IP is honoured by the listener", %{port: port} do
+      Application.put_env(:fathom, :replication_listen, true)
+      Application.put_env(:fathom, :replication_listen_port, port)
+      Application.put_env(:fathom, :replication_bind_ip, {127, 0, 0, 1})
+
+      start_supervised!(Fleet)
+
+      assert {:ok, sock} = connect(port)
+      :gen_tcp.close(sock)
+    end
+  end
+
+  defp connect(port) do
+    :gen_tcp.connect(~c"127.0.0.1", port, [:binary, packet: 4, active: false], 1_000)
+  end
+
+  defp free_port do
+    {:ok, s} = :gen_tcp.listen(0, [])
+    {:ok, p} = :inet.port(s)
+    :gen_tcp.close(s)
+    p
   end
 
   # Not a behavioural test — a structural one, and deliberately so. The rule it protects

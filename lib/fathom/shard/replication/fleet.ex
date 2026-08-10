@@ -4,13 +4,27 @@ defmodule Fathom.Shard.Replication.Fleet do
 
   Starts, under one supervisor:
 
-    * one `Shipper` per configured follower **node** (not per shard — see `Shipper`)
+    * one `Shipper` per configured follower **node** (not per shard — see `Shipper`) — the
+      PRIMARY half, gated by `:replication_enabled`
+    * the `Follower` listener — the RECEIVE half, gated separately by `:replication_listen`
     * a `Registry` + `DynamicSupervisor` for the per-shard `Session` processes
 
-  Entirely inert unless `:replication_enabled`, matching every other Phase 2 component
+  Entirely inert unless one of those gates is on, matching every other Phase 2 component
   (`:shard_load`, `:warm_follower`, `:rebalancer_enabled`): a feature that changes the commit path
   must be something an operator turns on deliberately, after reading the runbook, not something
   that arrives with a deploy.
+
+  ## Two gates, because shipping and receiving are different roles
+
+  `:replication_listen` was added 2026-08-10 to fix a gap that made A2 undeployable: the `Follower`
+  listener existed, was well tested, and **was never started outside the test suite**. A node with
+  `:replication_enabled` shipped every commit to addresses where nothing was listening, collected
+  no acks, and returned 503 `FILO_NO_QUORUM` for every tenant write — while the operator docs
+  instructed setting `REPLICATION_FOLLOWERS` to a port fathom never opened.
+
+  Keeping them separate is not just caution about a past bug. A node can hold other nodes' replicas
+  without replicating its own shards, and a safe rollout turns listening on **fleet-wide first**,
+  then enables shipping — an ordering a single flag cannot express.
 
   ## Followers come from config, for now
 
@@ -35,6 +49,11 @@ defmodule Fathom.Shard.Replication.Fleet do
   # How recently a node must have beaten in Postgres to count as live. Generous on purpose: this
   # feeds an operator gauge, and a false "dead" on a slow beat is worse than a stale "alive".
   @alive_window_ms 60_000
+
+  # 9100 because that is the port `config/runtime.exs`'s REPLICATION_FOLLOWERS example has always
+  # shown, and operators have read that comment. It also stays clear of the two ports fathom
+  # already binds — `:hrana_port` 8080 and `:health_port` 8081.
+  @default_listen_port 9100
 
   def start_link(opts), do: Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
 
@@ -192,14 +211,18 @@ defmodule Fathom.Shard.Replication.Fleet do
 
   @impl true
   def init(_opts) do
-    validate_quorum!()
+    if replicating?(), do: validate_quorum!()
 
     running =
-      endpoints()
-      |> Enum.with_index()
-      |> Enum.map(fn {{node_key, host, port}, i} ->
-        {node_key, host, port, Module.concat(__MODULE__, :"Shipper#{i}")}
-      end)
+      if replicating?() do
+        endpoints()
+        |> Enum.with_index()
+        |> Enum.map(fn {{node_key, host, port}, i} ->
+          {node_key, host, port, Module.concat(__MODULE__, :"Shipper#{i}")}
+        end)
+      else
+        []
+      end
 
     names = Enum.map(running, fn {_k, _h, _p, name} -> name end)
 
@@ -221,20 +244,68 @@ defmodule Fathom.Shard.Replication.Fleet do
       [
         {Registry, keys: :unique, name: @registry},
         {DynamicSupervisor, name: @sessions, strategy: :one_for_one}
-      ] ++ shipper_specs
+      ] ++ follower_children() ++ shipper_specs
 
     Supervisor.init(children, strategy: :one_for_one)
   end
 
   @doc """
-  The child spec to place in the application tree — `[]` when replication is off.
+  The child spec to place in the application tree — `[]` when this node neither ships nor listens.
 
   Returning a list rather than a spec keeps `application.ex` free of a conditional: it splices in
   nothing when the feature is off.
   """
   @spec children() :: [Supervisor.child_spec() | {module(), term()}]
   def children do
-    if Application.get_env(:fathom, :replication_enabled, false), do: [__MODULE__], else: []
+    if replicating?() or listening?(), do: [__MODULE__], else: []
+  end
+
+  @doc "Is this node shipping its own shards' frames to followers? (`:replication_enabled`)"
+  @spec replicating?() :: boolean()
+  def replicating?, do: Application.get_env(:fathom, :replication_enabled, false) == true
+
+  @doc "Is this node accepting frames as somebody's follower? (`:replication_listen`)"
+  @spec listening?() :: boolean()
+  def listening?, do: Application.get_env(:fathom, :replication_listen, false) == true
+
+  # SHIPPING AND RECEIVING ARE SEPARATE ROLES, hence separate gates.
+  #
+  # Until this existed the `Follower` listener was started only by tests: `children/0` keyed off
+  # `:replication_enabled` and `init/1` supervised a Registry, a DynamicSupervisor and the
+  # Shippers — the PRIMARY half, all of it. So a deployment with replication on shipped every
+  # commit to addresses where nothing listened, took no acks, and 503'd `FILO_NO_QUORUM` on every
+  # tenant write. `docs/configuration.md` meanwhile told operators to point REPLICATION_FOLLOWERS
+  # at a port fathom never opened.
+  #
+  # They stay independent rather than becoming one flag because the roles genuinely differ: a node
+  # can hold others' replicas without replicating its own shards, and a rollout MUST turn listening
+  # on fleet-wide BEFORE any node starts shipping — one flag makes that ordering unexpressible.
+  defp follower_children do
+    if listening?() do
+      opts =
+        [port: listen_port(), dir: Fathom.Shard.Replication.Follower.default_dir()]
+        |> then(fn base ->
+          case Application.get_env(:fathom, :replication_bind_ip) do
+            nil -> base
+            ip -> Keyword.put(base, :ip, ip)
+          end
+        end)
+
+      [{Fathom.Shard.Replication.Follower, opts}]
+    else
+      []
+    end
+  end
+
+  @doc """
+  The port the follower listener binds. `:replication_listen_port`, default #{@default_listen_port}.
+
+  Deliberately not 0 (which `Follower` reads as "pick any"): an ephemeral port is right for a test
+  and useless in production, where peers must be told where to connect.
+  """
+  @spec listen_port() :: :inet.port_number()
+  def listen_port do
+    Application.get_env(:fathom, :replication_listen_port, @default_listen_port)
   end
 
   # A quorum that cannot be satisfied by the configured follower count must fail the BOOT, not the
