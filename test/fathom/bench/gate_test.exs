@@ -72,11 +72,25 @@ defmodule Fathom.Bench.GateTest do
     assert result.worst == 15.0
   end
 
+  # The vehicle used to be `fanout_kb_per_shard` at +27.8%. That stopped demonstrating anything on
+  # 2026-08-10, when fanout was moved to a 50% band (it is fat-tailed — see Gate's @metrics), so
+  # +27.8% became a legitimate :warn and this read as a behaviour change when it is a threshold
+  # change. Switched to `cold_open_p50_us`, which is still gated at the default 20%: the claim
+  # under test is that the WORST metric drives the verdict, not anything about which metric it is.
   test "worst regression across metrics drives the verdict" do
-    new = %{@parent | "dir_resolve_p50_us" => 160.0, "fanout_kb_per_shard" => 230.0}
+    new = %{@parent | "dir_resolve_p50_us" => 160.0, "cold_open_p50_us" => 1278.0}
     result = Gate.compare(@parent, new)
-    # fanout +27.8% dominates dir_resolve +6.7%.
+    # cold_open +27.8% dominates dir_resolve +6.7%.
     assert result.verdict == :block
+    assert result.worst > 27.0
+  end
+
+  # Pins the per-metric override itself, which nothing covered: the same +27.8% that blocks on a
+  # default-band metric above must only WARN on fanout, or the widened band is not in effect.
+  test "a metric with its own wider band uses it, not the default" do
+    new = %{@parent | "fanout_kb_per_shard" => 230.0}
+    result = Gate.compare(@parent, new)
+    assert result.verdict == :warn, "fanout carries a 50% block band; +27.8% must not block"
     assert result.worst > 27.0
   end
 
