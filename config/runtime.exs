@@ -548,6 +548,22 @@ if ms = env_int.("REPLICATION_TIMEOUT_MS") do
   config :fathom, :replication_timeout_ms, ms
 end
 
+# Let a cold open serve a local REPLICA when it is provably newer than the stored object — the
+# failover half of A2, and the only thing that actually turns node-loss RPO from ~300 s into ~0.
+#
+# DELIBERATELY SEPARATE FROM REPLICATION_ENABLED. Shipping frames is safe and measurable on its
+# own; this changes what a cold open SERVES, on the code path that owns the lease fence and the
+# provenance sidecar. Run replication first — every flush then stamps its position, so by the time
+# this is flipped the comparison data already exists fleet-wide and can be sanity-checked.
+#
+# Safe by construction in three ways, all of which fail toward the stored object: the object's
+# stamp over-claims (it is read after the snapshot), promotion needs the replica STRICTLY ahead,
+# and an object with no stamp is never overridable at all. The last one means this is inert for a
+# shard until its next flush after upgrading.
+if System.get_env("REPLICATION_PROMOTE_ON_OPEN") in ~w(true 1) do
+  config :fathom, :replication_promote_on_open, true
+end
+
 # Bytes per frame when seeding a follower's base copy. Bounds MEMORY on both sides (a seed is a
 # whole database); it does not bound head-of-line blocking, since one socket per follower node
 # carries every shard. Default 4 MiB.

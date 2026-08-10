@@ -37,7 +37,15 @@ defmodule Fathom.Shard.Storage.Local do
   @impl true
   def flush(shard_id, local_path) do
     # Atomic (temp + rename) so a crash mid-copy can't leave a torn "durable" object (#28).
-    Storage.atomic_copy(local_path, remote_path(shard_id))
+    #
+    # Clears the position stamp, because a PUT on S3 replaces ALL user metadata and an unstamped
+    # object is what this unfenced path produces there. Leaving the old stamp here would be a
+    # backend disagreement in the dangerous direction: it would describe bytes that are no longer
+    # stored — a migration copy or a benchmark write — and a replica past that position would be
+    # promoted over them.
+    with :ok <- Storage.atomic_copy(local_path, remote_path(shard_id)) do
+      rm_ok(position_path(shard_id))
+    end
   end
 
   @impl true

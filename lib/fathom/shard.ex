@@ -66,6 +66,9 @@ defmodule Fathom.Shard do
     WriteCounter
   }
 
+  alias Fathom.Shard.Replication.Follower
+  alias Fathom.Shard.Replication.Promote
+
   @default_idle_ms 60_000
   @default_lease_ttl_ms 30_000
   # 5s node-loss RPO for busy shards (write-gated — clean shards skip the PUT). Was 30s;
@@ -529,7 +532,18 @@ defmodule Fathom.Shard do
 
   defp open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen) do
     with {:ok, etag0} <- await_pull(pull_task, path, shard_id),
-         {:ok, etag} <- revalidate_takeover(shard_id, path, lease, etag0, warm?) do
+         {:ok, etag1} <- revalidate_takeover(shard_id, path, lease, etag0, warm?) do
+      # NOT a `with` clause, and returning a bare etag rather than `{:ok, etag}`. Both are for the
+      # same measured reason: `handle_continue/2` garbage-collects this coordinator early to shrink
+      # its init high-water mark, so ANY allocation after that point stays resident for the shard's
+      # life. Wrapping this in a tuple per open cost +36% fanout_kb_per_shard (3.93 → 5.45 KiB) and
+      # the bench gate refused the commit. With the gate off this is now one `Application.get_env`
+      # and the binding we already had.
+      #
+      # It cannot fail the open either, which is why it needs no error channel: a promotion that
+      # does not happen leaves the ordinary path, and the ordinary path is correct.
+      etag = maybe_promote_replica(shard_id, path, lease, etag1)
+
       # No idle timer yet: a coordinator is always checked out right after it
       # starts, and the timer is (re)armed only when the last connection checks
       # back in. This avoids a start-vs-checkout idle race. The lease renewal
@@ -2205,6 +2219,136 @@ defmodule Fathom.Shard do
 
         drop_local(state.path)
         error
+    end
+  end
+
+  # --- A2 promote-on-open ---------------------------------------------------------------
+  #
+  # A survivor may hold a REPLICA of this shard that is newer than the stored object — that is the
+  # entire point of A2, and until this ran the replica sat on disk while the open served the last
+  # flush. Runs here, after `revalidate_takeover/5`, because this decides WHICH BYTES ARE SERVED
+  # and must not happen before the lease and the fork verdict are settled.
+  #
+  # Every branch that is not a proven win returns the caller's etag unchanged, so the ordinary open
+  # path is bit-for-bit what it was. That includes every error: a failed promotion attempt must not
+  # fail an open, because the ordinary path is still correct — it just recovers less.
+  #
+  # `Promote.fresher?/2` is what makes this safe. The replica is promoted only when it is STRICTLY
+  # ahead of what the object claims, the object's claim is an over-claim by construction
+  # (`flush_position/1`), and an unstamped object is never overridable at all — so an object
+  # written before stamping existed, or by a node that has not been upgraded, is left alone.
+  defp maybe_promote_replica(shard_id, path, lease, etag) do
+    # The gate is checked FIRST and returns the caller's own binding, so a node that has not
+    # enabled this allocates nothing at all on its open path. See the note at the call site.
+    if promote_on_open?() do
+      try_promote(shard_id, path, lease, etag)
+    else
+      etag
+    end
+  end
+
+  defp try_promote(shard_id, path, lease, etag) do
+    with replica when replica != nil <- replica_state(shard_id),
+         {:ok, stamp} <- Storage.object_position(shard_id),
+         true <- Promote.fresher?(replica, stamp) do
+      promote_replica(shard_id, path, lease, etag, replica, stamp)
+    else
+      _ -> etag
+    end
+  end
+
+  defp promote_on_open?, do: Application.get_env(:fathom, :replication_promote_on_open, false)
+
+  defp replica_state(shard_id) do
+    Follower.state_of(Follower, shard_id)
+  rescue
+    # No follower running on this node: there is no replica, which is not an error.
+    ArgumentError -> nil
+  end
+
+  # Ordering here is the whole risk, so it is worth stating:
+  #
+  #   1. SNAPSHOT the stored object first. This is the least reversible thing A2 does — it declares
+  #      one of two lineages the winner and overwrites the other, on the strength of a comparison
+  #      that is new code. A server-side copy costs no body transfer and is the difference between
+  #      a bad hour and permanent loss if the comparison is ever wrong.
+  #   2. STAGE into a temp and verify it there. Nothing touches the live path until the replica has
+  #      been checkpointed into a standalone database and passed `quick_check`.
+  #   3. PUBLISH from the temp, FENCED with the etag we hold. A 412 means someone wrote the object
+  #      since our pull, so the replica is no longer provably newer — abandon and serve the
+  #      ordinary path.
+  #   4. Only then move the temp onto the live path and stamp the new etag as its provenance.
+  #
+  # A failure at 1–3 leaves the shard exactly as the ordinary open left it. A failure at 4 is the
+  # one that cannot be shrugged off — the object is now the replica while the local file is not —
+  # so it fails the open, which releases the lease and lets a clean open pull the bytes we just
+  # published.
+  defp promote_replica(shard_id, path, lease, etag, replica, stamp) do
+    temp = "#{path}.promote.#{System.unique_integer([:positive])}"
+    follower = Follower
+
+    try do
+      with :ok <- snapshot_before_promotion(shard_id),
+           :ok <- Promote.stage(follower, shard_id, temp),
+           {:ok, new_etag} <-
+             Storage.flush(shard_id, temp, etag, flush_position(%{lease: lease, path: temp})) do
+        case File.rename(temp, path) do
+          :ok ->
+            Enum.each(["-wal", "-shm"], &File.rm(path <> &1))
+            write_etag_sidecar(path, new_etag)
+            Follower.forget(follower, shard_id)
+
+            Logger.warning(
+              "shard #{shard_id}: PROMOTED a local replica over the stored object " <>
+                "(replica #{inspect(replica)} > object #{inspect(stamp)}); " <>
+                "pre-promotion state snapshotted"
+            )
+
+            :telemetry.execute(
+              [:fathom, :shard, :replica_promoted],
+              %{count: 1},
+              %{shard_id: shard_id, epoch: lease.epoch}
+            )
+
+            new_etag
+
+          {:error, reason} ->
+            # The ONE failure here that cannot be shrugged off: the object is now the replica while
+            # the live path is not, so serving on would serve a lineage the store disagrees with.
+            # Raising routes to `abandon_open/5`, which releases the lease and stops the
+            # coordinator — a clean re-open then pulls exactly what was just published.
+            raise "shard #{shard_id}: promoted object published but the local rename failed " <>
+                    "(#{inspect(reason)}); refusing to serve a diverged local copy"
+        end
+      else
+        {:error, reason} ->
+          Logger.warning(
+            "shard #{shard_id}: replica promotion declined (#{inspect(reason)}); " <>
+              "opening from the stored object"
+          )
+
+          etag
+      end
+    after
+      Enum.each(["", "-wal", "-shm"], &File.rm(temp <> &1))
+    end
+  end
+
+  # Best-effort, and deliberately not fatal: a shard with no stored object yet has nothing to
+  # snapshot, and a snapshot backend hiccup should not block a recovery that is otherwise sound.
+  # It is attempted first precisely because it is the cheap insurance on the irreversible step.
+  defp snapshot_before_promotion(shard_id) do
+    case Fathom.Snapshots.create(shard_id, label: "pre-promotion") do
+      {:ok, _snapshot_id} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "shard #{shard_id}: could not snapshot before promoting a replica " <>
+            "(#{inspect(reason)}); proceeding"
+        )
+
+        :ok
     end
   end
 

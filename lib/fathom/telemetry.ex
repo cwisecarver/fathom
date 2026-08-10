@@ -106,6 +106,17 @@ defmodule Fathom.Telemetry do
       counter("fathom.shard.lease.held.count",
         description: "Starts refused against a live foreign lease"
       ),
+      # Rare and consequential: a cold open served a local replica INSTEAD of the stored object,
+      # because the replica was provably ahead of what the object claimed. That is the A2 RPO win
+      # actually happening, and it is also the moment a lineage was overwritten — so it wants to be
+      # visible per shard in the log line and countable on the dashboard. Zero on a healthy fleet;
+      # a rising rate means failovers, not a problem with this path.
+      counter("fathom.shard.replica_promoted.count",
+        event_name: [:fathom, :shard, :replica_promoted],
+        description:
+          "Cold opens that promoted a newer local replica over the stored object (A2). Each one " <>
+            "recovered writes the last flush did not have, and snapshotted what it replaced"
+      ),
       counter("fathom.shards.at_capacity.count",
         event_name: [:fathom, :shards, :at_capacity],
         description:

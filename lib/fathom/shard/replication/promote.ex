@@ -141,23 +141,54 @@ defmodule Fathom.Shard.Replication.Promote do
     end
   end
 
+  @doc """
+  Build a standalone, verified database from this node's replica at `temp`.
+
+  Split out so the **coordinator's cold open can reuse it while already holding the lease** —
+  `promote/2` acquires one, and acquiring a second under the same owner would silently reclaim
+  rather than fence, which is not a check at all.
+
+  Staged into a temp rather than straight onto the live path, and that is not tidiness: a failure
+  half-way through the copy or the checkpoint would otherwise leave the shard's live file holding
+  replica bytes while its provenance sidecar still names the stored object. The coordinator would
+  then serve one lineage and fence with another's etag. The same temp-then-promote discipline the
+  pull path uses, for the same reason.
+  """
+  @spec stage(atom(), String.t(), Path.t()) :: :ok | {:error, term()}
+  def stage(follower, shard_id, temp) do
+    with :ok <- install(follower, shard_id, temp),
+         :ok <- checkpoint_and_verify(temp) do
+      :ok
+    end
+  end
+
   defp install_and_publish(follower, shard_id, lease) do
     path = Shard.db_path(shard_id)
+    temp = "#{path}.promote.#{System.unique_integer([:positive])}"
 
-    with :ok <- install(follower, shard_id, path),
-         :ok <- checkpoint_and_verify(path),
-         :ok <- Storage.flush(shard_id, path),
-         {:ok, etag} <- Storage.object_etag(shard_id) do
-      # Only now does the follower stop being a replica of this shard. Doing it earlier would mean
-      # a failure above left the node holding neither a replica nor a primary.
-      Follower.forget(follower, shard_id)
+    try do
+      # The rename is the last step that can leave the live path holding replica bytes, so it comes
+      # only after staging has verified them. Publishing follows, because a local file the store
+      # does not know about is the fork the provenance sidecar exists to catch.
+      with :ok <- stage(follower, shard_id, temp),
+           :ok <- File.rename(temp, path),
+           :ok <- Storage.flush(shard_id, path),
+           {:ok, etag} <- Storage.object_etag(shard_id) do
+        # Only now does the follower stop being a replica of this shard. Doing it earlier would
+        # mean a failure above left the node holding neither a replica nor a primary.
+        Follower.forget(follower, shard_id)
 
-      Logger.info(
-        "promoted #{shard_id} from a local replica at epoch #{lease.epoch} " <>
-          "(#{File.stat!(path).size}B, etag #{inspect(etag)})"
-      )
+        bytes = File.stat!(path).size
 
-      {:ok, %{shard_id: shard_id, epoch: lease.epoch, etag: etag, bytes: File.stat!(path).size}}
+        Logger.info(
+          "promoted #{shard_id} from a local replica at epoch #{lease.epoch} " <>
+            "(#{bytes}B, etag #{inspect(etag)})"
+        )
+
+        {:ok, %{shard_id: shard_id, epoch: lease.epoch, etag: etag, bytes: bytes}}
+      end
+    after
+      Enum.each(["", "-wal", "-shm"], &File.rm(temp <> &1))
     end
   end
 
