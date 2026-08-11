@@ -32,6 +32,20 @@ defmodule Fathom.FlushStormTest do
     setup do
       prev = Application.fetch_env(:fathom, :shard_flush_max_concurrency)
 
+      # RESET THE GLOBAL COUNTER. `FlushGate` is one ETS counter for the whole node, and the
+      # enforcement test below asserts ABSOLUTE occupancy — it acquires from zero and expects the
+      # (cap+1)th to be refused. Nothing here owned that precondition, so any flush still in flight
+      # from another test left a slot held and the first `try_acquire()` came back `:full`.
+      #
+      # It went red on CI (OTP 29, seed 616439, 2026-08-10) and passed locally at the same seed on
+      # the same OTP, which is the signature of shared state plus timing rather than test order.
+      # Reproduced deliberately by acquiring one slot before the test: identical failure.
+      #
+      # Resetting in setup rather than releasing in on_exit because the leak can come from a test
+      # in a DIFFERENT module — this makes the precondition this module depends on explicit instead
+      # of assumed (AGENTS.md: assert the precondition inside the test).
+      FlushGate.reset()
+
       on_exit(fn ->
         case prev do
           {:ok, v} -> Application.put_env(:fathom, :shard_flush_max_concurrency, v)
@@ -100,7 +114,6 @@ defmodule Fathom.FlushStormTest do
 
     test "the cap is actually enforced — the (cap + 1)th concurrent flush is refused" do
       Application.put_env(:fathom, :shard_flush_max_concurrency, 3)
-
       # Reserve up to the cap.
       assert FlushGate.try_acquire() == :ok
       assert FlushGate.try_acquire() == :ok
