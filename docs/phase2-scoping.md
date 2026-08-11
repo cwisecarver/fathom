@@ -84,14 +84,21 @@ cold-open-from-S3. The fork is how warm:
   no WAL-frame stream, so this needs a WAL-shipping layer or adopting libSQL
   replication — and WAL frames crossing nodes is a **cross-node data path**, which
   tensions "S3 is the only coordination." High infra risk, big.
-  **UPDATE 2026-08-09 — two of those three premises were wrong, and A2 is built on the
+  **UPDATE 2026-08-09 — two of those three premises were wrong, and A2 now WORKS on the
   `a2-quorum-replication` branch (not merged here).** exqlite's surface was never the boundary: a
   loadable extension gets a live `sqlite3*`, and `sqlite3_wal_hook` is in the extension pointer
   table — same move as the Django UDFs. No libSQL swap, no forked driver. And it needed no BEAM
   cluster: frames go over A2's own socket protocol, so S3 stays the only cross-node *coordination*.
-  What survives is the third premise — a cross-node data path is genuinely new surface, and
-  membership is still a static config list. Measured cost: **+225 µs per write (4.04×)** with it
-  on, noise with it off. See [a2-quorum-replication](a2-quorum-replication.md). Its only win over A1 is
+  Membership is roster-derived now rather than a hand-kept list. Measured cost: **+225 µs per write
+  (4.04×)** with it on, noise with it off; proven end to end on the chaos rig 2026-08-11.
+
+  What survives is the third premise, and running it multi-node is what showed the shape of that
+  cost: a cross-node data path is genuinely new surface, and **none of the three defects that made
+  it non-functional were visible to any unit test** — the follower listener was never started
+  outside tests, a recreated WAL read as a rewind (`ckpt_seq` restarts at 0 on last-connection
+  close, so `salt1` has to cross the wire), and a tenant's first write always failed. Every
+  replication test held one connection; each rig statement is its own stream. See
+  [a2-quorum-replication](a2-quorum-replication.md). Its only win over A1 is
   RPO (per-frame vs per-flush) — and RPO is already tunable via the flush interval. **Not
   worth the risk/model-change now.**
   **Scoped in full 2026-08-08 → [a2-quorum-replication](a2-quorum-replication.md)**: the

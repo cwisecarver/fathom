@@ -1,14 +1,68 @@
 # A2 — Quorum replication (design; not on `main`)
 
-**Status: the blocker below was WRONG and is cleared. A2 is built on the
-`a2-quorum-replication` branch, not on `main`.** Scoped 2026-08-08; blocker disproved 2026-08-09.
-Supersedes the one-paragraph deferral in [phase2-scoping](phase2-scoping.md) §A2.
+**Status: WORKING on the `a2-quorum-replication` branch, off by default, not merged to `main`.**
+Scoped 2026-08-08; the blocker below disproved 2026-08-09; replication proven end to end on the
+chaos rig 2026-08-11 (`chaos.sh smoke` passes with `REPLICATION_ENABLED=true` — five tenants, every
+write quorum-replicated, cross-shard isolation intact). Supersedes the one-paragraph deferral in
+[phase2-scoping](phase2-scoping.md) §A2.
 
 This copy is kept deliberately as the *scoping* document — the mechanism, the cost, and the
-decision gates. The branch carries the implementation record, which is roughly three times longer
-and does not belong on a `main` that has no A2 code. **Read [The blocker](#the-blocker) with its
+decision gates. The branch carries the implementation record, which is several times longer and
+does not belong on a `main` that has no A2 code. **Read [The blocker](#the-blocker) with its
 correction before quoting anything here**: the sentence "there is no seam to ship a frame from" is
 preserved for the record and is false.
+
+## What running it multi-node found
+
+Three defects, none of which any unit test could see, and the first two of which made the feature
+non-functional rather than merely imperfect. Recorded here because each one is a *class* of thing
+to check when this merges, not just a bug that got fixed.
+
+**1. The receive half was never started.** `Replication.Follower` — the listener that accepts
+frames — existed, was well tested, and was referenced outside tests by nothing. `Fleet` supervised
+the Registry, the session supervisor and the Shippers: the primary half, all of it. So
+`REPLICATION_ENABLED=true` on a real node shipped every commit into a closed port and returned 503
+`FILO_NO_QUORUM` for every tenant write, while `configuration.md` told operators to point
+`REPLICATION_FOLLOWERS` at a port fathom never opened. Shipping and receiving are now separate
+gates (`REPLICATION_ENABLED` / `REPLICATION_LISTEN`) because a rollout must turn listening on
+fleet-wide *first*, and one flag cannot express that order.
+
+**2. A recreated WAL read as a rewind, so no replicated write ever succeeded.** `ckpt_seq` counts
+checkpoints *within* one WAL file; SQLite deletes the `-wal` when the last connection to a shard
+closes — after every Hrana stream on a quiet shard — and the next one starts fresh with new salts
+and `ckpt_seq` back at **0**. `Primary.plan/2` had always keyed on the salt and shipped
+`{:reset, 0, _}`; `FollowerLog.decide/2` compared only `wal_gen`, saw the same generation, and
+demanded its old offset. The primary would send only 0, the follower would accept only its offset,
+forever. `salt1` now crosses the wire (protocol `@version 2`).
+
+**3. A tenant's first write always failed.** The seed was started out of band and the triggering
+commit failed by design, on the reasoning that a write is the worst place for a multi-megabyte
+transfer. Sound, but the consequence — an `OperationalError` on an unchanged Django app's first
+INSERT, once per tenant — had never been measured. The commit now waits for the seed, bounded by
+its own deadline.
+
+**The common thread is the test environment, not the code.** Every replication test held ONE
+connection for its whole run, so the WAL was never recreated; each rig statement is its own stream.
+Both gaps are now closed with tests rather than left to the rig. Anything else that only shows up
+across a stream boundary is still unguarded, and that is the shape to look for.
+
+## Membership
+
+`REPLICATION_MEMBERSHIP=roster` derives the follower set from addresses nodes publish to
+`rebalancer_nodes` (`REPLICATION_ADVERTISE_HOST`), instead of a list every operator maintains on
+every node. `static` remains the default and stays the floor: whenever the roster cannot supply
+`quorum+1` candidates — fresh fleet, rolling upgrade, Postgres outage — membership falls back to it.
+
+A set below `quorum+1` is **refused** and the previous set stays live. That is not caution, it is
+the replacement for a guarantee that stopped holding: `Session.ship_planned/4` derives `n` from the
+shipper list on every commit and `Quorum.new/2` raises when `q >= n`, *inside a tenant's write*.
+Checking `q < n` once at boot was sound only while the set could never change.
+
+Liveness still never filters the push set — the roster's staleness window is a *candidacy* filter
+applied on a timer. A merely-down follower stays a member and costs nothing.
+
+Still not built: per-shard follower sets and zone-aware placement. The RTT sweep makes placement an
+82× lever, which makes it operator intent rather than something to infer.
 
 ## The gap this closes
 

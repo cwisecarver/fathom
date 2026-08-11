@@ -84,8 +84,8 @@ hot policy with anti-flap, an nginx exception-table (`map $host $fathom_target`)
 on the hash, and an Oban cron + handoff (warm → flip the LB → drain the source → target
 acquires; the lease blocks any double-write). Proven live on the chaos rig
 (`chaos.sh rebalance`). All gated off by default. Remaining: **C** (shard locality /
-affinity), **A2** (active-shard WAL follower — **built on the `a2-quorum-replication` branch, not
-merged here**; the "exqlite exposes no WAL seam" blocker was disproved 2026-08-09, and it ships
+affinity), **A2** (active-shard WAL follower — **working on the `a2-quorum-replication` branch, not
+merged here** (proven end to end on the rig 2026-08-11); the "exqlite exposes no WAL seam" blocker was disproved 2026-08-09, and it ships
 frames over its own socket protocol with **no BEAM distribution**, so S3 remains the only cross-node
 *coordination*. See [a2-quorum-replication](a2-quorum-replication.md)).
 
