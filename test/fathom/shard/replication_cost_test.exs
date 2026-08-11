@@ -150,7 +150,7 @@ defmodule Fathom.Shard.ReplicationCostTest do
 
     # Seed at offset 0 so the first push carries the whole WAL and the followers accept it; the
     # steady-state deltas that follow are what is being timed.
-    for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0)
+    for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0, 0)
 
     assert :ok = Session.commit(id, wal, coordinator),
            "replication is not working; nothing to time"

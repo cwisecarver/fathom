@@ -71,9 +71,16 @@ defmodule Fathom.Shard.Replication.Follower do
   Must be called before any push for that shard, or the push is refused — see `FollowerLog.decide/2`
   on why "never seen" is deliberately distinct from "at offset 0".
   """
-  @spec seed(atom(), String.t(), non_neg_integer(), non_neg_integer(), non_neg_integer()) :: :ok
-  def seed(name \\ __MODULE__, shard_id, epoch, wal_gen, wal_bytes) do
-    :ets.insert(table(name), {shard_id, FollowerLog.seeded(epoch, wal_gen, wal_bytes)})
+  @spec seed(
+          atom(),
+          String.t(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) :: :ok
+  def seed(name \\ __MODULE__, shard_id, epoch, wal_gen, salt1, wal_bytes) do
+    :ets.insert(table(name), {shard_id, FollowerLog.seeded(epoch, wal_gen, salt1, wal_bytes)})
     :ok
   end
 
@@ -298,6 +305,7 @@ defmodule Fathom.Shard.Replication.Follower do
         name: name,
         epoch: b.epoch,
         wal_gen: b.wal_gen,
+        salt1: b.salt1,
         wal_offset: b.wal_offset,
         db_size: b.db_size,
         wal_size: b.wal_size,
@@ -412,7 +420,7 @@ defmodule Fathom.Shard.Replication.Follower do
          :ok <- File.rename(seeding_path(wal), wal) do
       :ets.insert(
         table(name),
-        {shard_id, FollowerLog.seeded(state.epoch, state.wal_gen, state.wal_offset)}
+        {shard_id, FollowerLog.seeded(state.epoch, state.wal_gen, state.salt1, state.wal_offset)}
       )
 
       Logger.info(

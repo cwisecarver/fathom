@@ -50,6 +50,7 @@ defmodule Fathom.Shard.ReplicationSeedChunkTest do
 
   defp begin_frame(id, db_size, wal_size) do
     Protocol.encode_seed_begin(%SeedBegin{
+      salt1: 0,
       shard_id: id,
       epoch: 7,
       wal_gen: 3,

@@ -91,7 +91,7 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
         File.write!(Follower.wal_path(Follower, id), "")
     end
 
-    Follower.seed(Follower, id, position.epoch, position.wal_gen, position.offset)
+    Follower.seed(Follower, id, position.epoch, position.wal_gen, 0, position.offset)
   end
 
   defp open_and_read(id) do

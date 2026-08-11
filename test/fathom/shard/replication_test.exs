@@ -20,6 +20,7 @@ defmodule Fathom.Shard.ReplicationTest do
 
   defp push(opts \\ []) do
     %Push{
+      salt1: Keyword.get(opts, :salt1, 0),
       shard_id: Keyword.get(opts, :shard_id, "acme"),
       epoch: Keyword.get(opts, :epoch, 7),
       wal_gen: Keyword.get(opts, :wal_gen, 3),
@@ -61,7 +62,11 @@ defmodule Fathom.Shard.ReplicationTest do
 
     test "garbage and truncated frames are errors, never crashes" do
       assert {:error, :malformed} = Protocol.decode(<<>>)
-      assert {:error, :malformed} = Protocol.decode(<<1, 1, 0>>)
+
+      # Version byte from `version/0`, never a literal: this used to be `<<1, 1, 0>>` and started
+      # returning :unsupported_version the moment the protocol went to 2 (the salt1 field), which
+      # made a framing test silently become a version test.
+      assert {:error, :malformed} = Protocol.decode(<<Protocol.version()::8, 1, 0>>)
 
       # Correct version byte, garbage after it. NOT `strong_rand_bytes(7)` on its own — a random
       # first byte is almost never a valid version, so that lands in :unsupported_version and the
@@ -71,7 +76,9 @@ defmodule Fathom.Shard.ReplicationTest do
 
       # A push claiming a longer shard id than it carries must not decode.
       assert {:error, :malformed} =
-               Protocol.decode(<<1, 1, 99::16, 0::64, 0::64, 0::64, "short">>)
+               Protocol.decode(
+                 <<Protocol.version()::8, 1, 99::16, 0::64, 0::64, 0::64, 0::64, "short">>
+               )
     end
 
     test "a different protocol version is distinguishable from garbage" do
@@ -86,12 +93,12 @@ defmodule Fathom.Shard.ReplicationTest do
     end
 
     test "a deposed primary cannot land writes on the new owner" do
-      state = FollowerLog.seeded(7, 3, 4120)
+      state = FollowerLog.seeded(7, 3, 0, 4120)
       assert {:reject, :stale_epoch, 0} = FollowerLog.decide(state, push(epoch: 6))
     end
 
     test "a new epoch resets, and only from the start of its WAL" do
-      state = FollowerLog.seeded(7, 3, 4120)
+      state = FollowerLog.seeded(7, 3, 0, 4120)
 
       assert {:reset_then_append, new} =
                FollowerLog.decide(state, push(epoch: 8, wal_gen: 1, offset: 0, payload: "abc"))
@@ -104,12 +111,12 @@ defmodule Fathom.Shard.ReplicationTest do
     end
 
     test "frames from before a checkpoint we already applied are dropped" do
-      state = FollowerLog.seeded(7, 3, 4120)
+      state = FollowerLog.seeded(7, 3, 0, 4120)
       assert {:reject, :stale_wal_gen, 0} = FollowerLog.decide(state, push(wal_gen: 2))
     end
 
     test "a checkpoint seam forces a reset instead of appending across it" do
-      state = FollowerLog.seeded(7, 3, 4120)
+      state = FollowerLog.seeded(7, 3, 0, 4120)
 
       # THE corruption case. After the primary checkpoints, its WAL restarts with fresh salts, so
       # byte offset 4120 in generation 4 is unrelated to byte offset 4120 in generation 3.
@@ -123,8 +130,41 @@ defmodule Fathom.Shard.ReplicationTest do
                FollowerLog.decide(state, push(wal_gen: 4, offset: 4120))
     end
 
+    # THE DEADLOCK THIS FIELD EXISTS TO PREVENT (2026-08-11). `ckpt_seq` counts checkpoints WITHIN
+    # one WAL file, so it restarts at 0 when SQLite deletes and recreates the file — which happens
+    # the moment the last connection to a shard closes, i.e. after every Hrana stream on a quiet
+    # shard. The generation then repeats or goes backwards while the bytes are a brand-new lineage.
+    #
+    # `Primary.plan/2` has always keyed on the salt (`when seq != gen or s != salt`) and shipped
+    # `{:reset, 0, _}`. Until `salt1` crossed the wire the follower saw only the generation, read
+    # "same generation", and demanded its old offset — so the primary would send ONLY 0 and the
+    # follower would accept ONLY 4120, forever. On the chaos rig that was every write after the
+    # first failing `{:no_quorum, :impossible}` at a fixed offset, with no log line naming a cause.
+    test "a NEW WAL with the same generation is a new lineage, not a rewind" do
+      state = FollowerLog.seeded(7, 3, 1111, 4120)
+
+      # Same wal_gen, different salt: the WAL was recreated, so old offsets mean nothing.
+      assert {:reset_then_append, new} =
+               FollowerLog.decide(state, push(wal_gen: 3, salt1: 2222, offset: 0, payload: "xy"))
+
+      assert new.salt1 == 2222 and new.wal_gen == 3 and new.next_offset == 2
+
+      # And it must NOT accept a mid-stream offset from the new lineage — that is the splice the
+      # whole guard exists to refuse.
+      assert {:reject, :offset_mismatch, 0} =
+               FollowerLog.decide(state, push(wal_gen: 3, salt1: 2222, offset: 4120))
+
+      # Same salt AND same generation still appends in order, so the new clause has not swallowed
+      # the ordinary path.
+      assert {:append, _} =
+               FollowerLog.decide(
+                 state,
+                 push(wal_gen: 3, salt1: 1111, offset: 4120, payload: "z")
+               )
+    end
+
     test "an in-order delta appends and advances by exactly the payload size" do
-      state = FollowerLog.seeded(7, 3, 4120)
+      state = FollowerLog.seeded(7, 3, 0, 4120)
 
       assert {:append, new} =
                FollowerLog.decide(state, push(offset: 4120, payload: :binary.copy(<<1>>, 500)))
@@ -134,7 +174,7 @@ defmodule Fathom.Shard.ReplicationTest do
     end
 
     test "a gap is retryable — the reject says where the follower actually is" do
-      state = FollowerLog.seeded(7, 3, 4120)
+      state = FollowerLog.seeded(7, 3, 0, 4120)
 
       # A push that skips ahead. Silently accepting this is the corruption; the expected offset is
       # what lets the primary rewind instead of re-seeding the whole shard from S3.

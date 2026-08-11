@@ -355,6 +355,10 @@ defmodule Fathom.Shard.Replication.Session do
             shard_id: state.shard_id,
             epoch: epoch,
             wal_gen: header.ckpt_seq,
+            # The WAL's identity, not just its generation. `ckpt_seq` restarts at 0 when SQLite
+            # recreates a deleted WAL, so the generation alone cannot tell the follower that a new
+            # lineage began — see the @version 2 note in `Protocol`.
+            salt1: header.salt1,
             # A reset must arrive at offset 0 or FollowerLog refuses it — the follower has to
             # discard its old generation rather than splice across the seam.
             offset: if(kind == :reset, do: 0, else: off),
@@ -682,6 +686,7 @@ defmodule Fathom.Shard.Replication.Session do
       shard_id: shard_id,
       epoch: epoch,
       wal_gen: gen_of(before),
+      salt1: salt_of(before),
       wal_offset: wal_size,
       db_size: db_size,
       wal_size: wal_size

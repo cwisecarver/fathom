@@ -66,6 +66,7 @@ defmodule Fathom.Shard.ReplicationTransportTest do
 
   defp push(shard, opts \\ []) do
     %Push{
+      salt1: 0,
       shard_id: shard,
       epoch: Keyword.get(opts, :epoch, 1),
       wal_gen: Keyword.get(opts, :wal_gen, 1),
@@ -78,7 +79,7 @@ defmodule Fathom.Shard.ReplicationTransportTest do
     test "a push crosses the wire, lands in the WAL, and is acked" do
       port = start_follower_named!(:f_solo)
       ship = start_shipper!(:s_solo, port)
-      Follower.seed(:f_solo, "acme", 1, 1, 0)
+      Follower.seed(:f_solo, "acme", 1, 1, 0, 0)
 
       Shipper.push(ship, push("acme"))
 
@@ -90,7 +91,7 @@ defmodule Fathom.Shard.ReplicationTransportTest do
     test "successive deltas append in order" do
       port = start_follower_named!(:f_seq)
       ship = start_shipper!(:s_seq, port)
-      Follower.seed(:f_seq, "acme", 1, 1, 0)
+      Follower.seed(:f_seq, "acme", 1, 1, 0, 0)
 
       Shipper.push(ship, push("acme", offset: 0, payload: "aaa"))
       assert_receive {:repl_reply, ^ship, {:ack, "acme", 3}}, 2_000
@@ -104,7 +105,7 @@ defmodule Fathom.Shard.ReplicationTransportTest do
     test "a gap is refused with the follower's real offset, and nothing is written" do
       port = start_follower_named!(:f_gap)
       ship = start_shipper!(:s_gap, port)
-      Follower.seed(:f_gap, "acme", 1, 1, 0)
+      Follower.seed(:f_gap, "acme", 1, 1, 0, 0)
 
       Shipper.push(ship, push("acme", offset: 0, payload: "aaa"))
       assert_receive {:repl_reply, ^ship, {:ack, "acme", 3}}, 2_000
@@ -129,8 +130,8 @@ defmodule Fathom.Shard.ReplicationTransportTest do
     test "one connection carries several shards" do
       port = start_follower_named!(:f_multi)
       ship = start_shipper!(:s_multi, port)
-      Follower.seed(:f_multi, "acme", 1, 1, 0)
-      Follower.seed(:f_multi, "beta", 1, 1, 0)
+      Follower.seed(:f_multi, "acme", 1, 1, 0, 0)
+      Follower.seed(:f_multi, "beta", 1, 1, 0, 0)
 
       Shipper.push(ship, push("acme", payload: "AAAA"))
       Shipper.push(ship, push("beta", payload: "BB"))
@@ -151,7 +152,7 @@ defmodule Fathom.Shard.ReplicationTransportTest do
           {_f, port} = start_follower!(:"qf#{i}")
           # Seeded per follower: each has its own ETS table and its own directory, exactly as four
           # real nodes would.
-          Follower.seed(:"qf#{i}", "acme", 1, 1, 0)
+          Follower.seed(:"qf#{i}", "acme", 1, 1, 0, 0)
           start_shipper!(:"qs#{i}", port)
         end
 
@@ -179,7 +180,7 @@ defmodule Fathom.Shard.ReplicationTransportTest do
       live =
         for i <- 5..6 do
           {_f, port} = start_follower!(:"lf#{i}")
-          Follower.seed(:"lf#{i}", "acme", 1, 1, 0)
+          Follower.seed(:"lf#{i}", "acme", 1, 1, 0, 0)
           start_shipper!(:"ls#{i}", port)
         end
 
@@ -201,7 +202,7 @@ defmodule Fathom.Shard.ReplicationTransportTest do
       # Three of four cannot be reached, so a quorum of 2 can never form. The measured point of
       # failing fast: a commit blocked on an unreachable quorum is an outage wearing latency.
       {_f, port} = start_follower!(:if1)
-      Follower.seed(:if1, "acme", 1, 1, 0)
+      Follower.seed(:if1, "acme", 1, 1, 0, 0)
       live = start_shipper!(:is1, port)
 
       dead =

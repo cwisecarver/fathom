@@ -189,6 +189,106 @@ defmodule Fathom.Shard.ReplicationSeedTest do
              "a quorum that was not actually met"
   end
 
+  # THE RIG BUG, REPRODUCED LOCALLY (2026-08-11). On the chaos rig every commit after the first
+  # failed `{:no_quorum, :impossible}` — so no replicated WRITE had ever succeeded multi-node,
+  # while this suite was green.
+  #
+  # The environment gap is a CHECKPOINT BETWEEN COMMITS. Every test here holds one connection for
+  # its whole run, so the WAL grows monotonically and the generation never moves. On the rig each
+  # statement is its own Hrana stream: the connection closes, the WAL is checkpointed, and the next
+  # commit ships from a new generation with fresh salts. `Primary.plan/2` and `FollowerLog.decide/2`
+  # both have a case for exactly that, and neither had ever been exercised END TO END through a
+  # commit — only as pure-function unit tests.
+  #
+  # Per AGENTS.md: an environment that cannot express the topology cannot catch bugs in it. This
+  # closes that gap for good, so the class stays visible without a Docker rig.
+  test "commits keep replicating ACROSS a WAL checkpoint, not just within one generation", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+    enable!(followers, 2)
+
+    {coordinator, conn, path} = open_shard!(id)
+    wal = path <> "-wal"
+
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    gen_before = Wal.read(wal) |> then(fn {:ok, h} -> h.ckpt_seq end)
+
+    # The seam. TRUNCATE rewrites the WAL with fresh salts and bumps the checkpoint sequence, which
+    # is exactly what a stream close does on the rig.
+    {:ok, _} = Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", [])
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
+
+    gen_after = Wal.read(wal) |> then(fn {:ok, h} -> h.ckpt_seq end)
+
+    assert gen_after != gen_before,
+           "the checkpoint did not move the generation — this test would prove nothing"
+
+    assert :ok = Session.commit(id, wal, coordinator),
+           "a commit after a WAL checkpoint was not replicated. This is the rig failure: every " <>
+             "write after the first returned FILO_NO_QUORUM because each Hrana stream close " <>
+             "checkpoints, so every commit crosses a generation boundary"
+
+    # And a third, to prove it keeps working rather than alternating.
+    {:ok, _} = Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", [])
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (3)", [])
+    assert :ok = Session.commit(id, wal, coordinator)
+  end
+
+  # THE RIG BLOCKER, REPRODUCED (2026-08-11). On the chaos rig every commit after the first failed
+  # `{:no_quorum, :impossible}`, forever, with all four followers answering
+  # `offset_mismatch: 8272` — the same number every time, so a deadlock rather than a lost frame.
+  #
+  # The environment gap is CONNECTION CLOSE, not the checkpoint the test above covers. Every test
+  # in this file holds one connection for its whole run. On the rig each statement is its own Hrana
+  # stream, and when the last connection to a shard closes SQLite DELETES the `-wal`; the next
+  # stream creates a fresh one with new random salts and `ckpt_seq` back at ZERO.
+  #
+  # That is the one transition where the two sides disagree. `Primary.plan/2` treats a salt change
+  # as a new generation (`when seq != gen or s != salt`) and ships `{:reset, 0, size}`.
+  # `FollowerLog.decide/2` compares only `wal_gen` — the wire has no `salt1` at all — so it sees
+  # the same generation, demands its own `next_offset`, and rejects offset 0. Neither side can
+  # move: the primary will only send 0, the follower will only accept 8272.
+  #
+  # A checkpoint does NOT reproduce it, which is why the test above passes: TRUNCATE bumps
+  # `ckpt_seq` too, so both sides agree a generation boundary happened.
+  test "replication survives the WAL being RECREATED when all connections close", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+    enable!(followers, 2)
+
+    {coordinator, conn, path} = open_shard!(id)
+    wal = path <> "-wal"
+
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    {:ok, before} = Wal.read(wal)
+
+    # The seam: drop every connection, so SQLite removes the WAL, then open a fresh one.
+    :ok = Connection.close(conn)
+    {:ok, conn2} = Connection.open(path)
+    on_exit(fn -> Connection.close(conn2) end)
+
+    {:ok, _} = Connection.query(conn2, "INSERT INTO t VALUES (2)", [])
+    {:ok, now} = Wal.read(wal)
+
+    assert now.salt1 != before.salt1,
+           "the WAL was not recreated with fresh salts — this test would prove nothing"
+
+    assert :ok = Session.commit(id, wal, coordinator),
+           "a commit after the WAL was recreated was not replicated. Primary and follower " <>
+             "disagree about whether a new WAL lineage began: the primary ships from 0 on a salt " <>
+             "change, the follower only compares wal_gen and demands its old offset. Deadlock."
+
+    # It must keep working, not alternate.
+    {:ok, _} = Connection.query(conn2, "INSERT INTO t VALUES (3)", [])
+    assert :ok = Session.commit(id, wal, coordinator)
+  end
+
   test "an unseeded follower is seeded automatically, then replicates", ctx do
     %{id: id, root: root} = ctx
     followers = start_followers!(root, 3)
@@ -264,7 +364,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     # at whatever size it had reached by then — BEHIND a and b, who keep committing meanwhile. One
     # delta cannot be correct for both positions, which is the whole reason offsets are per-follower.
     [{a, _}, {b, _}, {laggard, _}] = followers
-    for name <- [a, b], do: Follower.seed(name, id, 0, 0, 0)
+    for name <- [a, b], do: Follower.seed(name, id, 0, 0, 0, 0)
 
     for n <- 1..25 do
       {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?1)", [n])
@@ -305,7 +405,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     wal = path <> "-wal"
 
     [{_a, _}, {_b, _}, {laggard, _}] = followers
-    for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0)
+    for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0, 0)
 
     sizes =
       for n <- 1..5 do
@@ -324,7 +424,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     {:ok, epoch} = Fathom.Shard.epoch(coordinator)
     {:ok, %{ckpt_seq: gen}} = Wal.read(wal)
     File.write!(Follower.wal_path(laggard, id), binary_part(converged, 0, early))
-    Follower.seed(laggard, id, epoch, gen, early)
+    Follower.seed(laggard, id, epoch, gen, 0, early)
 
     # The primary still believes the laggard is current, and that is the point: this push lands at
     # the offset a and b are at, which the laggard refuses — reporting where it actually is. a and b
@@ -362,7 +462,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     wal = path <> "-wal"
 
     [{_a, _}, {_b, _}, {laggard, _}] = followers
-    for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0)
+    for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0, 0)
 
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
     assert :ok = Session.commit(id, wal, coordinator)
@@ -379,7 +479,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     File.write!(Follower.wal_path(laggard, id), binary_part(converged, 0, early))
     {:ok, epoch} = Fathom.Shard.epoch(coordinator)
     {:ok, %{ckpt_seq: gen}} = Wal.read(wal)
-    Follower.seed(laggard, id, epoch, gen, early)
+    Follower.seed(laggard, id, epoch, gen, 0, early)
 
     # One write, so the primary learns from the laggard's refusal where it actually is.
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (5)", [])

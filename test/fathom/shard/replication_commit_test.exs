@@ -123,7 +123,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     wal = path <> "-wal"
     # Every follower must be seeded before frames mean anything — the deliberate distinction
     # between "never seen this shard" and "at offset 0".
-    for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0)
+    for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0, 0)
 
     assert :ok = Session.commit(id, wal, coordinator)
 
@@ -169,7 +169,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
 
     wal = path <> "-wal"
-    for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0)
+    for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0, 0)
 
     assert :ok = Session.commit(id, wal, coordinator)
     # No write in between: a no-op commit must not cost a round trip, and must not error.
@@ -198,7 +198,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     on_exit(fn -> Connection.close(conn) end)
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
 
-    Follower.seed(name, id, 0, 0, 0)
+    Follower.seed(name, id, 0, 0, 0, 0)
 
     assert {:error, {:no_quorum, :impossible}} =
              Session.commit(id, path <> "-wal", coordinator)

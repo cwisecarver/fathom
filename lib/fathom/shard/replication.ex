@@ -147,8 +147,25 @@ defmodule Fathom.Shard.Replication do
   defp settle({:reached, _}, _shard, _deadline, {acked, rejects}, _expected),
     do: {:ok, acked, rejects}
 
-  defp settle({:impossible, _}, _shard, _deadline, {_acked, rejects}, _expected),
-    do: {:error, {:no_quorum, :impossible, rejects}}
+  # A LOST QUORUM ALWAYS LOGS ITS REASONS, even when the individual rejects are the quiet ones.
+  #
+  # `log_reject/2` deliberately says nothing for `:offset_mismatch` and `:unknown_shard`, because
+  # per-reject they are routine and self-correcting. But when they are what COST the quorum, the
+  # commit fails, the tenant gets a 503, and — until this line — nothing anywhere named a cause.
+  # That is how a total replication failure stayed invisible on the chaos rig (2026-08-11): every
+  # write returned FILO_NO_QUORUM while the node logs showed only successful seeds, so the
+  # investigation had to reach for the release RPC to learn something the failure itself knew.
+  #
+  # Routine per-event, alarming in aggregate: exactly the shape that belongs at the decision point
+  # rather than at the event.
+  defp settle({:impossible, _}, shard, _deadline, {_acked, rejects}, _expected) do
+    Logger.warning(
+      "replication quorum IMPOSSIBLE for #{shard}: " <>
+        inspect(Enum.map(rejects, fn {_from, reason, at} -> {reason, at} end))
+    )
+
+    {:error, {:no_quorum, :impossible, rejects}}
+  end
 
   defp settle({:pending, q}, shard, deadline, tally, expected),
     do: collect(q, shard, deadline, tally, expected)

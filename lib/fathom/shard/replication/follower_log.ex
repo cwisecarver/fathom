@@ -27,6 +27,7 @@ defmodule Fathom.Shard.Replication.FollowerLog do
   @type t :: %{
           epoch: non_neg_integer(),
           wal_gen: non_neg_integer(),
+          salt1: non_neg_integer(),
           next_offset: non_neg_integer()
         }
 
@@ -71,6 +72,22 @@ defmodule Fathom.Shard.Replication.FollowerLog do
     decide_fresh(%{state | wal_gen: pushed}, push)
   end
 
+  # A DIFFERENT WAL, NOT A LATER ONE. `ckpt_seq` counts checkpoints within one WAL file, so it
+  # restarts at 0 when SQLite deletes and recreates the file — which it does the moment the last
+  # connection to the shard closes, i.e. after every Hrana stream on a quiet shard. The generation
+  # then goes BACKWARDS or stays equal while the bytes are from a completely new lineage, and every
+  # comparison above reads it as "same or older".
+  #
+  # `salt1` is the WAL's identity and is what `Primary.plan/2` has always keyed on
+  # (`when seq != gen or s != salt`). Until it crossed the wire the two sides disagreed
+  # permanently: the primary shipped `{:reset, 0, _}` on the salt change, the follower saw the same
+  # generation and demanded its old offset, and NO commit could ever satisfy both. That deadlock
+  # was every write after the first failing `{:no_quorum, :impossible}` on the chaos rig, at a
+  # fixed offset, forever.
+  def decide(%{salt1: salt} = state, %Push{salt1: pushed} = push) when pushed != salt do
+    decide_fresh(%{state | salt1: pushed}, push)
+  end
+
   def decide(%{next_offset: next} = state, %Push{offset: off} = push) when off == next do
     {:append, %{state | next_offset: next + byte_size(push.payload)}}
   end
@@ -84,7 +101,13 @@ defmodule Fathom.Shard.Replication.FollowerLog do
   # A new epoch or a new WAL generation both mean "your offsets are meaningless now". The only
   # payload we can accept is one that starts at the beginning of the new generation.
   defp decide_fresh(state, %Push{offset: 0} = push) do
-    {:reset_then_append, %{state | wal_gen: push.wal_gen, next_offset: byte_size(push.payload)}}
+    {:reset_then_append,
+     %{
+       state
+       | wal_gen: push.wal_gen,
+         salt1: push.salt1,
+         next_offset: byte_size(push.payload)
+     }}
   end
 
   defp decide_fresh(_state, %Push{}), do: {:reject, :offset_mismatch, 0}
@@ -96,8 +119,8 @@ defmodule Fathom.Shard.Replication.FollowerLog do
   AND its current `-wal`, so the follower already holds bytes and the first delta it can accept
   continues from there.
   """
-  @spec seeded(non_neg_integer(), non_neg_integer(), non_neg_integer()) :: t()
-  def seeded(epoch, wal_gen, wal_bytes) do
-    %{epoch: epoch, wal_gen: wal_gen, next_offset: wal_bytes}
+  @spec seeded(non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()) :: t()
+  def seeded(epoch, wal_gen, salt1, wal_bytes) do
+    %{epoch: epoch, wal_gen: wal_gen, salt1: salt1, next_offset: wal_bytes}
   end
 end

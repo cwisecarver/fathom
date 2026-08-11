@@ -34,7 +34,13 @@ defmodule Fathom.Shard.Replication.Protocol do
   ranges arrive over a network that can drop, reorder and duplicate.
   """
 
-  @version 1
+  # 2 (2026-08-11): `Push` and `SeedBegin` gained `salt1`. The follower could not previously see
+  # a WAL LINEAGE change — only `wal_gen` crossed the wire — while the primary treated a salt
+  # change as a new generation. When SQLite recreates a deleted WAL, `ckpt_seq` restarts at 0 with
+  # fresh salts, so the two sides disagreed permanently: the primary would only ship offset 0, the
+  # follower would only accept its old offset, and every commit failed. `decode/1` rejects a
+  # version mismatch outright, so a mixed-version fleet fails loudly instead of misparsing.
+  @version 2
 
   @push 1
   @ack 2
@@ -79,13 +85,14 @@ defmodule Fathom.Shard.Replication.Protocol do
     arrive whole, rather than installing a truncated database that opens cleanly and is missing
     pages.
     """
-    @enforce_keys [:shard_id, :epoch, :wal_gen, :wal_offset, :db_size, :wal_size]
-    defstruct [:shard_id, :epoch, :wal_gen, :wal_offset, :db_size, :wal_size]
+    @enforce_keys [:shard_id, :epoch, :wal_gen, :salt1, :wal_offset, :db_size, :wal_size]
+    defstruct [:shard_id, :epoch, :wal_gen, :salt1, :wal_offset, :db_size, :wal_size]
 
     @type t :: %__MODULE__{
             shard_id: String.t(),
             epoch: non_neg_integer(),
             wal_gen: non_neg_integer(),
+            salt1: non_neg_integer(),
             wal_offset: non_neg_integer(),
             db_size: non_neg_integer(),
             wal_size: non_neg_integer()
@@ -94,13 +101,14 @@ defmodule Fathom.Shard.Replication.Protocol do
 
   defmodule Push do
     @moduledoc "A primary's frame delta for one shard."
-    @enforce_keys [:shard_id, :epoch, :wal_gen, :offset, :payload]
-    defstruct [:shard_id, :epoch, :wal_gen, :offset, :payload]
+    @enforce_keys [:shard_id, :epoch, :wal_gen, :salt1, :offset, :payload]
+    defstruct [:shard_id, :epoch, :wal_gen, :salt1, :offset, :payload]
 
     @type t :: %__MODULE__{
             shard_id: String.t(),
             epoch: non_neg_integer(),
             wal_gen: non_neg_integer(),
+            salt1: non_neg_integer(),
             offset: non_neg_integer(),
             payload: binary()
           }
@@ -114,7 +122,8 @@ defmodule Fathom.Shard.Replication.Protocol do
     shard = p.shard_id
 
     [
-      <<@version::8, @push::8, byte_size(shard)::16, p.epoch::64, p.wal_gen::64, p.offset::64>>,
+      <<@version::8, @push::8, byte_size(shard)::16, p.epoch::64, p.wal_gen::64, p.salt1::64,
+        p.offset::64>>,
       shard,
       p.payload
     ]
@@ -127,7 +136,7 @@ defmodule Fathom.Shard.Replication.Protocol do
   def encode_seed_begin(%SeedBegin{} = s) do
     [
       <<@version::8, @seed_begin::8, byte_size(s.shard_id)::16, s.epoch::64, s.wal_gen::64,
-        s.wal_offset::64, s.db_size::64, s.wal_size::64>>,
+        s.salt1::64, s.wal_offset::64, s.db_size::64, s.wal_size::64>>,
       s.shard_id
     ]
   end
@@ -219,15 +228,25 @@ defmodule Fathom.Shard.Replication.Protocol do
           | {:ok, {:ack, String.t(), non_neg_integer()}}
           | {:ok, {:reject, String.t(), atom(), non_neg_integer()}}
           | {:error, :malformed | :unsupported_version}
-  def decode(<<@version::8, @push::8, slen::16, epoch::64, gen::64, off::64, rest::binary>>)
+  def decode(
+        <<@version::8, @push::8, slen::16, epoch::64, gen::64, salt::64, off::64, rest::binary>>
+      )
       when byte_size(rest) >= slen do
     <<shard::binary-size(^slen), payload::binary>> = rest
 
-    {:ok, %Push{shard_id: shard, epoch: epoch, wal_gen: gen, offset: off, payload: payload}}
+    {:ok,
+     %Push{
+       shard_id: shard,
+       epoch: epoch,
+       wal_gen: gen,
+       salt1: salt,
+       offset: off,
+       payload: payload
+     }}
   end
 
   def decode(
-        <<@version::8, @seed_begin::8, slen::16, epoch::64, gen::64, off::64, dblen::64,
+        <<@version::8, @seed_begin::8, slen::16, epoch::64, gen::64, salt::64, off::64, dblen::64,
           wallen::64, shard::binary-size(slen)>>
       ) do
     {:ok,
@@ -235,6 +254,7 @@ defmodule Fathom.Shard.Replication.Protocol do
        shard_id: shard,
        epoch: epoch,
        wal_gen: gen,
+       salt1: salt,
        wal_offset: off,
        db_size: dblen,
        wal_size: wallen
