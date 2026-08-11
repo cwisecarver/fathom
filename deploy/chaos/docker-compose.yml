@@ -269,7 +269,13 @@ services:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - ./lb-runtime:/etc/nginx/lb:ro
     ports:
-      - "8080:80"
+      # Overridable because 8080 is a popular port and Docker does NOT fail when it is already
+      # taken — it publishes anyway and the earlier listener keeps winning, so every request
+      # through the LB reaches whatever is squatting instead of nginx. Measured 2026-08-10: an
+      # ssh -L forward held :8080, `curl localhost:8080` returned a bare "Not Found", nginx logged
+      # nothing at all, and it read exactly like an application 404. `LB_PORT=18080 ./chaos.sh up`
+      # is the escape hatch; `chaos.sh up` now checks for the squat and says so.
+      - "${LB_PORT:-8080}:80"
     depends_on:
       - fathom1
       - fathom2

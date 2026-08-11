@@ -69,7 +69,8 @@
 set -u -o pipefail
 cd "$(dirname "$0")"
 
-LB=${LB:-http://localhost:8080}
+LB_PORT=${LB_PORT:-8080}
+LB=${LB:-http://localhost:$LB_PORT}
 TOXI=${TOXI:-http://localhost:8474}
 DOMAIN=fathom.test
 TTL_MS=10000
@@ -235,7 +236,32 @@ seed() {
 cmd_build() { compose build migrate; }
 # The in-network elixir driver image (deploy/chaos/Dockerfile.driver), used by TPC_NET=container.
 cmd_build_driver() { compose build driver; }
-cmd_up()    { compose up -d --wait --wait-timeout 180; compose ps; }
+cmd_up()    { compose up -d --wait --wait-timeout 180; compose ps; check_lb_port; }
+
+# Is the LB port actually OURS? Docker does not fail when the host port is already taken — it
+# publishes anyway and the earlier listener keeps winning, so every request through $LB reaches
+# the squatter. Cost 2026-08-10: an `mlx_lm server` had held :8080 for six days, `smoke` failed
+# every write, the reply was a bare "Not Found", and nginx logged NOTHING — which reads exactly
+# like a fathom 404. The tell is the Server header: nginx sets one, squatters generally do not.
+#
+# A warning, not a failure: the rig is still fine over the compose network, and a scenario that
+# refused to run because of an unrelated host process would be worse than one that says why.
+check_lb_port() {
+  local server
+  server=$(curl -s -m 3 -D- -o /dev/null "$LB/" -H "Host: probe.$DOMAIN" 2>/dev/null \
+             | tr -d '\r' | grep -i '^server:' | head -1 | cut -d' ' -f2-)
+
+  case "$server" in
+    *nginx*) return 0 ;;
+  esac
+
+  echo
+  echo "WARNING: $LB is not answering as nginx (Server: ${server:-none})."
+  echo "  Something else holds host port $LB_PORT, and Docker published over it silently."
+  echo "  Every LB-routed scenario will fail with confusing 404s. Find it with:"
+  echo "      lsof -nP -iTCP:$LB_PORT -sTCP:LISTEN"
+  echo "  Then free the port, or re-run on another one:  LB_PORT=18080 ./chaos.sh up"
+}
 cmd_down()  { compose down -v --remove-orphans; }
 cmd_logs()  { compose logs -f "${1:-}"; }
 
