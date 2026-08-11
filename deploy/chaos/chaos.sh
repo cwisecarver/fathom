@@ -609,8 +609,20 @@ cmd_replication() {
   local home; home=$(cmd_owner "$shard") || { echo "no home found"; return 1; }
   echo "  home=$home"
 
-  sql "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', 1)" >/dev/null
-  sql "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', 2)" >/dev/null
+  # CHECK THE WRITE. The first version of this piped both INSERTs to /dev/null with no `||`, so a
+  # write rejected by the quorum passed silently and the check below still found replica files —
+  # which the SEED had created. It reported PASS while every replicated write was failing
+  # FILO_NO_QUORUM. A replication scenario that does not assert the commit succeeded is asserting
+  # that seeding works, which is a different and much weaker claim.
+  local w
+  for w in 1 2; do
+    sql "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', $w)" >/dev/null || {
+      echo "FAIL: write $w to $shard was not replicated to a quorum (FILO_NO_QUORUM)"
+      echo "  The followers hold bytes from the SEED, so the replica check below would still"
+      echo "  pass — that is exactly why this is checked separately."
+      return 1
+    }
+  done
   sleep 3
 
   local holders=0

@@ -66,6 +66,16 @@ x-fathom-env: &fathom-env
   # shipping its own shards to its own listener, which works but muddies every result.
   REPLICATION_ENABLED: "${REPLICATION_ENABLED:-}"
   REPLICATION_QUORUM: "${REPLICATION_QUORUM:-2}"
+  # Membership source (Layer 3). `static` by default so the per-node lists below stay in charge;
+  # `REPLICATION_MEMBERSHIP=roster` switches to endpoints nodes publish to `rebalancer_nodes`.
+  #
+  # Roster mode needs an advertise host, and WITHOUT one it silently falls back to the static list
+  # — which would make a roster run look like it worked while proving nothing. Each node advertises
+  # its own compose service name (set per-node below), which is exactly what peers dial here.
+  # LOAD_REPORTER is already on above, and the beat that publishes the address rides its tick.
+  REPLICATION_MEMBERSHIP: "${REPLICATION_MEMBERSHIP:-static}"
+  # Fast enough that a scenario can watch a swap happen rather than waiting out the 30s default.
+  REPLICATION_MEMBERSHIP_POLL_MS: "${REPLICATION_MEMBERSHIP_POLL_MS:-5000}"
   # Phase-2 B1 dynamic rebalancing: every node reports its load, acts on handoff
   # commands, and runs the (singleton) control loop; the LB backend set + where the
   # rendered exception map is written. NODE_KEY is per-node (set on each service below).
@@ -205,6 +215,7 @@ services:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21001
       NODE_KEY: fathom1
+      REPLICATION_ADVERTISE_HOST: fathom1
       REPLICATION_FOLLOWERS: "fathom2@fathom2:9100,fathom3@fathom3:9100,fathom4@fathom4:9100,fathom5@fathom5:9100"
     ports:
       - "18081:8080" # direct Hrana (bypasses the LB; zombie/steal experiments)
@@ -217,6 +228,7 @@ services:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21002
       NODE_KEY: fathom2
+      REPLICATION_ADVERTISE_HOST: fathom2
       REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom3@fathom3:9100,fathom4@fathom4:9100,fathom5@fathom5:9100"
     ports:
       - "18082:8080"
@@ -229,6 +241,7 @@ services:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21003
       NODE_KEY: fathom3
+      REPLICATION_ADVERTISE_HOST: fathom3
       REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom2@fathom2:9100,fathom4@fathom4:9100,fathom5@fathom5:9100"
     ports:
       - "18083:8080"
@@ -245,6 +258,7 @@ services:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21004
       NODE_KEY: fathom4
+      REPLICATION_ADVERTISE_HOST: fathom4
       REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom2@fathom2:9100,fathom3@fathom3:9100,fathom5@fathom5:9100"
     ports:
       - "18084:8080"
@@ -257,6 +271,7 @@ services:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21005
       NODE_KEY: fathom5
+      REPLICATION_ADVERTISE_HOST: fathom5
       REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom2@fathom2:9100,fathom3@fathom3:9100,fathom4@fathom4:9100"
     ports:
       - "18085:8080"
