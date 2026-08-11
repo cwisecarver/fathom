@@ -308,6 +308,33 @@ defmodule Fathom.Shard.Replication.Fleet do
     Application.get_env(:fathom, :replication_listen_port, @default_listen_port)
   end
 
+  @doc """
+  What this node publishes to the fleet roster as its replication endpoint — `"host:port"`, or
+  `nil` when it has nothing to advertise.
+
+  `nil` in two cases, and both are the safe direction because membership reads `nil` as "not a
+  candidate" rather than as an endpoint:
+
+    * the node is not listening, so there is genuinely nowhere to send frames;
+    * `:replication_advertise_host` is unset.
+
+  **The host is explicit and is never guessed.** A node cannot reliably know which of its
+  addresses a peer can reach — `:inet.gethostname/0` is frequently a container id, the first
+  non-loopback interface is frequently the wrong one, and either mistake publishes an endpoint
+  that every shipper will fail to connect to while the roster reports the node present. Guessing
+  wrong is worse than not advertising: a nil node simply is not chosen. So this is
+  `REPLICATION_ADVERTISE_HOST`, and roster-derived membership is only as good as the operator
+  setting it.
+  """
+  @spec advertised_address() :: String.t() | nil
+  def advertised_address do
+    host = Application.get_env(:fathom, :replication_advertise_host)
+
+    if listening?() and is_binary(host) and host != "" do
+      "#{host}:#{listen_port()}"
+    end
+  end
+
   # A quorum that cannot be satisfied by the configured follower count must fail the BOOT, not the
   # first write. `Quorum.new/3` raises on `q >= n` by design, but reaching that raise from inside a
   # commit means the misconfiguration presents as every tenant write failing under load — the

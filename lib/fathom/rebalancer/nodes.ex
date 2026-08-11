@@ -15,7 +15,8 @@ defmodule Fathom.Rebalancer.Nodes do
 
   @doc """
   Records `node_key` as alive now, and optionally this window's full-distribution stats
-  (`:q_p99`, `:sample_count`, `:q_hist` — findings #2/#4). Upsert on node_key. Returns `:ok`.
+  (`:q_p99`, `:sample_count`, `:q_hist` — findings #2/#4) and `:replication_address`.
+  Upsert on node_key. Returns `:ok`.
   """
   @spec beat(String.t(), keyword()) :: :ok
   def beat(node_key, opts \\ []) do
@@ -24,7 +25,11 @@ defmodule Fathom.Rebalancer.Nodes do
     # q_p99/sample_count/q_hist (review 2026-07-09 #5): a plain beat with an unconditional
     # `set: [q_hist: nil, ...]` would NULL them and drop the node from the fleet-p99 bar.
     # Include the stats in the upsert ONLY when supplied.
-    stats = Keyword.take(opts, [:q_p99, :sample_count, :q_hist])
+    #
+    # `:replication_address` joins that list for a sharper version of the same reason: NULLing it
+    # does not just lose a gauge, it withdraws the node from A2's membership candidates. A beat
+    # that forgot to carry it would silently shrink every shipper's follower set.
+    stats = Keyword.take(opts, [:q_p99, :sample_count, :q_hist, :replication_address])
 
     Repo.insert!(
       struct(%NodeBeat{node_key: node_key, last_seen_at: now}, stats),
@@ -38,6 +43,33 @@ defmodule Fathom.Rebalancer.Nodes do
   @doc "Every node beat row — the raw fleet roster (node_key, last_seen_at, q_p99, sample_count). O(nodes)."
   @spec all() :: [NodeBeat.t()]
   def all, do: Repo.all(NodeBeat)
+
+  @doc """
+  Replication endpoints published by nodes seen within `within_ms`, as `{node_key, address}`
+  ordered by node_key — A2's membership candidates.
+
+  Rows with a NULL `replication_address` are excluded: a node that does not listen, or runs a
+  release predating the column, is not a candidate rather than an endpoint that would refuse.
+
+  **Ordered, and the order is deterministic on purpose.** Every node computes its own follower set
+  from this same list, and an unordered result would give each node a different set on each read —
+  so a shard's replica set would drift with query planning rather than with the fleet. `node_key`
+  is the stable identity the LB, the rebalancer and `Fleet.health/0` already key on.
+
+  The staleness window is the caller's, and it is a *candidacy* filter applied when membership is
+  recomputed — never a per-commit liveness filter. See `Fathom.Shard.Replication.Fleet`.
+  """
+  @spec replication_endpoints(non_neg_integer()) :: [{String.t(), String.t()}]
+  def replication_endpoints(within_ms) do
+    cutoff = DateTime.add(DateTime.utc_now(), -within_ms, :millisecond)
+
+    from(n in NodeBeat,
+      where: n.last_seen_at >= ^cutoff and not is_nil(n.replication_address),
+      order_by: n.node_key,
+      select: {n.node_key, n.replication_address}
+    )
+    |> Repo.all()
+  end
 
   @doc "The set of node_keys seen within `within_ms` ago (the live fleet)."
   @spec alive(non_neg_integer()) :: MapSet.t()

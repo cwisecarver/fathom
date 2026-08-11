@@ -605,6 +605,19 @@ if bind = System.get_env("REPLICATION_BIND_IP") do
   end
 end
 
+# The host peers should use to reach THIS node's replication port, published to the fleet roster
+# (`rebalancer_nodes.replication_address`) so membership can be derived instead of hand-listed.
+#
+# EXPLICIT, never guessed. A node cannot reliably know which of its addresses a peer can reach —
+# the hostname is often a container id and the first non-loopback interface is often the wrong
+# one — and publishing an unreachable endpoint is worse than publishing none, because the roster
+# then reports the node present while every shipper fails to connect. Unset ⇒ this node is not a
+# membership candidate. Set it to the private DNS name or IP peers dial (the same one you would
+# have written into REPLICATION_FOLLOWERS by hand).
+if host = System.get_env("REPLICATION_ADVERTISE_HOST") do
+  config :fathom, :replication_advertise_host, host
+end
+
 # Where a follower keeps the replicas it receives. Defaults under System.tmp_dir!/ like
 # SHARD_DATA_DIR and WARM_CACHE_DIR — fine for dev, wrong for a node that is somebody's durability
 # guarantee. Point it at real local disk; it holds a full copy of every shard this node follows,

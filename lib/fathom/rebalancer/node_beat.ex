@@ -35,5 +35,9 @@ defmodule Fathom.Rebalancer.NodeBeat do
     # summed across nodes into the TRUE pooled-distribution p99 — the sound fleet hot bar that
     # replaced the count-weighted mean of per-node p99s (finding #4).
     field :q_hist, {:array, :integer}
+    # Where this node accepts A2 replication frames, `host:port`, or nil when it does not listen
+    # or runs a release that predates the column. `Fathom.Shard.Replication.Fleet` resolves
+    # candidates from these; nil means "not a candidate" rather than an endpoint that would refuse.
+    field :replication_address, :string
   end
 end

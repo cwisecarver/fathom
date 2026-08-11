@@ -29,7 +29,8 @@ defmodule Fathom.Shard.ReplicationFleetTest do
       listen: Application.get_env(:fathom, :replication_listen),
       listen_port: Application.get_env(:fathom, :replication_listen_port),
       bind_ip: Application.get_env(:fathom, :replication_bind_ip),
-      dir: Application.get_env(:fathom, :replication_dir)
+      dir: Application.get_env(:fathom, :replication_dir),
+      advertise_host: Application.get_env(:fathom, :replication_advertise_host)
     }
 
     on_exit(fn ->
@@ -40,7 +41,8 @@ defmodule Fathom.Shard.ReplicationFleetTest do
             replication_listen: prev.listen,
             replication_listen_port: prev.listen_port,
             replication_bind_ip: prev.bind_ip,
-            replication_dir: prev.dir
+            replication_dir: prev.dir,
+            replication_advertise_host: prev.advertise_host
           ] do
         if is_nil(v),
           do: Application.delete_env(:fathom, k),
@@ -308,6 +310,51 @@ defmodule Fathom.Shard.ReplicationFleetTest do
 
       assert {:ok, sock} = connect(port)
       :gen_tcp.close(sock)
+    end
+  end
+
+  # What this node publishes to the roster. Every branch here fails toward nil, and nil means
+  # "not a membership candidate" — which is strictly safer than publishing an endpoint peers
+  # cannot reach, because a nil node is simply not chosen while a wrong address makes the roster
+  # report a node present that every shipper then fails to connect to.
+  describe "advertised_address/0" do
+    test "is nil when this node does not listen, even with a host configured" do
+      Application.put_env(:fathom, :replication_listen, false)
+      Application.put_env(:fathom, :replication_advertise_host, "10.0.0.1")
+
+      refute Fleet.advertised_address()
+    end
+
+    test "is nil when listening but no host is configured — never guessed" do
+      Application.put_env(:fathom, :replication_listen, true)
+      Application.delete_env(:fathom, :replication_advertise_host)
+
+      refute Fleet.advertised_address()
+    end
+
+    test "is nil for an empty host, not the bare port" do
+      Application.put_env(:fathom, :replication_listen, true)
+      Application.put_env(:fathom, :replication_advertise_host, "")
+
+      refute Fleet.advertised_address()
+    end
+
+    test "is host:port when listening and configured" do
+      Application.put_env(:fathom, :replication_listen, true)
+      Application.put_env(:fathom, :replication_advertise_host, "10.0.0.7")
+      Application.put_env(:fathom, :replication_listen_port, 9100)
+
+      assert Fleet.advertised_address() == "10.0.0.7:9100"
+    end
+
+    # The published port must track the port actually bound, or peers dial somewhere nothing
+    # listens while both values look individually reasonable.
+    test "the advertised port follows the configured listen port" do
+      Application.put_env(:fathom, :replication_listen, true)
+      Application.put_env(:fathom, :replication_advertise_host, "h")
+      Application.put_env(:fathom, :replication_listen_port, 9999)
+
+      assert Fleet.advertised_address() == "h:9999"
     end
   end
 
