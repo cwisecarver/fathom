@@ -140,6 +140,55 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     end
   end
 
+  # THE FIRST WRITE IS THE ONE THAT MATTERS, and nothing pinned it until the chaos rig found it
+  # failing on 2026-08-11. Every other seed test here reaches its interesting state THROUGH the
+  # first commit, so all of them passed while that commit returned an error to the tenant — the
+  # suite proved seeding worked and said nothing about what the client saw.
+  #
+  # A tenant's very first INSERT is the most visible request fathom serves: it is what an unchanged
+  # Django app does on its first save for a new tenant, and returning FILO_NO_QUORUM there is a
+  # crash in the application, once per tenant, forever.
+  test "the FIRST commit to a shard succeeds, rather than failing while the seed runs", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+    enable!(followers, 2)
+
+    {coordinator, conn, path} = open_shard!(id)
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER, b TEXT)", [])
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1, 'first')", [])
+
+    wal = path <> "-wal"
+
+    # No follower has ever heard of this shard. Assert that precondition, or a seeded fixture would
+    # make this pass without exercising the path at all.
+    for {name, _} <- followers do
+      refute Follower.state_of(name, id),
+             "#{name} already knows #{id}; this test cannot observe the first-commit path"
+    end
+
+    assert :ok = Session.commit(id, wal, coordinator),
+           "the first commit to a shard returned an error while its seed ran — this is a " <>
+             "tenant's first INSERT failing, once per tenant"
+
+    # And it really did replicate, rather than reporting success on an empty quorum.
+    #
+    # A QUORUM's worth, not all three — and the difference is the design, not slack in the test.
+    # `ship_quorum/3` returns at the Q-th ack and stragglers catch up asynchronously (the whole
+    # reason Q=N is refused), so the third follower may still be seeding when the commit returns.
+    # Asserting all three passed only because an earlier draft waited for every seed; that would
+    # have quietly made the first write pay for the SLOWEST replica, which is exactly the cost
+    # quorum replication exists to avoid.
+    holders =
+      Enum.count(followers, fn {name, _} ->
+        File.exists?(Follower.db_path(name, id)) and
+          File.read!(Follower.db_path(name, id)) == File.read!(path)
+      end)
+
+    assert holders >= 2,
+           "only #{holders} follower(s) hold the primary's bytes; the commit reported success on " <>
+             "a quorum that was not actually met"
+  end
+
   test "an unseeded follower is seeded automatically, then replicates", ctx do
     %{id: id, root: root} = ctx
     followers = start_followers!(root, 3)
@@ -151,9 +200,16 @@ defmodule Fathom.Shard.ReplicationSeedTest do
 
     wal = path <> "-wal"
 
-    # NOTHING is seeded. Every follower answers :unknown_shard, so the quorum genuinely fails —
-    # and the failure is reported honestly rather than swallowed.
-    assert {:error, {:no_quorum, _}} = Session.commit(id, wal, coordinator)
+    # NOTHING is seeded. Every follower answers :unknown_shard, the commit starts a seed for each,
+    # WAITS for them inside the call, and then succeeds.
+    #
+    # THIS ASSERTION USED TO BE `{:error, {:no_quorum, _}}` — the seed was started out of band and
+    # the triggering commit failed, on the reasoning that a tenant's write is the worst place to
+    # put a multi-megabyte transfer. The chaos rig measured the consequence (2026-08-11): the FIRST
+    # write to every shard returned FILO_NO_QUORUM, i.e. an OperationalError on an unchanged Django
+    # app's first INSERT for that tenant, once per tenant. The wait is bounded by the caller's own
+    # deadline, so a shard too large to seed inside it still fails exactly as before.
+    assert :ok = Session.commit(id, wal, coordinator)
 
     # ...but that reject started a seed for each follower, out of band.
     for {name, _} <- followers,
@@ -374,7 +430,9 @@ defmodule Fathom.Shard.ReplicationSeedTest do
 
     assert File.stat!(wal).size > 0, "the WAL half of the seed is empty; only the db is covered"
 
-    assert {:error, {:no_quorum, _}} = Session.commit(id, wal, coordinator)
+    # Previously `{:error, {:no_quorum, _}}`: the commit that triggers a seed now waits for it.
+    # See the note at the top of this file's first seed test.
+    assert :ok = Session.commit(id, wal, coordinator)
 
     for {name, _} <- followers,
         do: await_seeded(name, id, fn -> Session.commit(id, wal, coordinator) end)
@@ -420,7 +478,9 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (99999, 'after')", [])
 
     wal = path <> "-wal"
-    assert {:error, {:no_quorum, _}} = Session.commit(id, wal, coordinator)
+    # Previously `{:error, {:no_quorum, _}}`: the commit that triggers a seed now waits for it.
+    # See the note at the top of this file's first seed test.
+    assert :ok = Session.commit(id, wal, coordinator)
 
     for {name, _} <- followers,
         do: await_seeded(name, id, fn -> Session.commit(id, wal, coordinator) end)

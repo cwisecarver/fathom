@@ -173,6 +173,12 @@ defmodule Fathom.Shard.Replication.Session do
   # were never seeded. Nesting keeps the epoch-bearing state in scope where it is used.
   @impl true
   def handle_call({:commit, wal_path}, _from, state) do
+    # One deadline for the whole call, taken before any work: a seed wait that reset the clock
+    # could outlive the caller's `GenServer.call` timeout, and a reply nobody is waiting for is
+    # worse than a late failure — the caller has already given up and the tenant already has an
+    # error, while this process is still holding the shard's serialization point.
+    deadline = System.monotonic_time(:millisecond) + timeout()
+
     case with_epoch(state) do
       {:error, reason} ->
         {:reply, {:error, reason}, state}
@@ -195,12 +201,32 @@ defmodule Fathom.Shard.Replication.Session do
           # the next commit plans a catch-up delta from where each actually is.
           #
           # A follower answering :unknown_shard has never been seeded, which is not a fault to
-          # alert on but the signal to send it a base copy — started OUT OF BAND. A seed can be a
-          # whole database and this commit is a tenant waiting on a write, so blocking it on a
-          # multi-megabyte transfer would be the worst possible place to put that cost. The commit
-          # still fails honestly, and the next one finds the follower ready.
+          # alert on but the signal to send it a base copy.
+          #
+          # This USED TO fail the commit outright and seed out of band, on the reasoning that a
+          # seed can be a whole database and blocking a tenant's write on a multi-megabyte transfer
+          # is the worst place to put that cost. The reasoning was sound; the consequence was not
+          # measured until the chaos rig ran it (2026-08-11): the FIRST write to every shard came
+          # back `FILO_NO_QUORUM`, i.e. an `OperationalError` on an unchanged Django app's first
+          # INSERT for that tenant, once per tenant, forever. Trading a guaranteed error for a
+          # bounded wait is the better side of that deal — and for the small shards fathom's whole
+          # thesis is about, the wait is milliseconds.
+          #
+          # Still bounded, and still fails honestly: `await_seeds/3` waits only for seeds THIS
+          # commit started, only until the caller's own deadline, and a shard too large to seed
+          # inside it fails exactly as it did before, having spent time it was going to spend
+          # anyway. Seeding remains write-gated — nothing seeds a shard nobody writes to, which is
+          # the storm the durability `dirty` flag exists to prevent.
           {:error, {:no_quorum, why}, new_state, rejects} ->
-            {:reply, {:error, {:no_quorum, why}}, start_seeds(new_state, wal_path, rejects)}
+            seeded_state = start_seeds(new_state, wal_path, rejects)
+
+            case await_seeds(seeded_state, deadline, wal_path) do
+              {:ok, ready_state} ->
+                retry_after_seed(ready_state, wal_path, why)
+
+              {:timeout, waited_state} ->
+                {:reply, {:error, {:no_quorum, why}}, waited_state}
+            end
 
           {:error, reason} ->
             {:reply, {:error, reason}, state}
@@ -208,34 +234,20 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
+  # A seed that lands while the session is IDLE — the path for any seed the commit that started it
+  # did not wait out (a big shard, or one started by a late `:repl_reply` reject). The bookkeeping
+  # lives in `apply_seed_result/3` so this and the in-call wait cannot drift:
+  #
+  #   * record where the seed left THIS follower, or the primary's next delta starts from wherever
+  #     it last thought the follower was — nowhere, for a fresh one — and it rejects every frame
+  #     while holding perfectly good bytes. Per-follower, because seeds land at different times and
+  #     therefore different offsets;
+  #   * drop any outstanding expectation for it, because a seed replaces everything the follower
+  #     held and a push in flight when it started describes a position that no longer exists.
+  #     Letting that reply land afterwards would overwrite the seed with a stale position.
   @impl true
   def handle_info({:seeded, shipper, result}, state) do
-    state = %{state | seeding: MapSet.delete(state.seeding, shipper)}
-
-    case result do
-      {:ok, at} ->
-        # Record where the seed left THIS follower. Without it the primary's next delta for this
-        # follower starts from wherever it last thought it was — nowhere, for a fresh one — and the
-        # follower rejects every frame while holding perfectly good bytes. Per-follower precisely
-        # because seeds land at different times and therefore different offsets.
-        Logger.info("replication seeded a follower for #{state.shard_id} at #{inspect(at)}")
-        key = resolve(shipper)
-
-        # Drop any outstanding expectation for this follower along with it. A seed replaces
-        # everything the follower held, so a push that was in flight when it started describes a
-        # position that no longer exists; letting its reply land afterwards would overwrite the seed
-        # with a stale one.
-        {:noreply,
-         %{
-           state
-           | followers: Map.put(state.followers, key, at),
-             inflight: Map.delete(state.inflight, key)
-         }}
-
-      {:error, r} ->
-        Logger.warning("replication seed failed for #{state.shard_id}: #{inspect(r)}")
-        {:noreply, state}
-    end
+    {:noreply, apply_seed_result(state, shipper, result)}
   end
 
   # A follower's reply that arrives while the session is IDLE — which is where almost all of them
@@ -500,6 +512,106 @@ defmodule Fathom.Shard.Replication.Session do
     case Map.get(state.inflight, resolve(shipper)) do
       %{offset: ^next} -> advance(state, shipper)
       _ -> state
+    end
+  end
+
+  # Wait for the seeds THIS commit started, until `deadline`. Returns `{:ok, state}` once none are
+  # outstanding, `{:timeout, state}` otherwise — in both cases with every result that did arrive
+  # applied, so a partial wait still advances the followers it heard about.
+  #
+  # Consumed with `receive` rather than left to `handle_info/2` for the same reason
+  # `drain_late_replies/2` does it: we are inside the `handle_call`, so nothing else is reading this
+  # mailbox, and a `{:seeded, ...}` left sitting would be applied only after the reply had gone.
+  #
+  # `{:repl_reply, ...}` is drained alongside it. A straggler's answer to the push that just failed
+  # arrives during exactly this window, and leaving it queued would let the retry's `collect/4`
+  # mistake it for an answer to the retry.
+  defp await_seeds(%{seeding: seeding} = state, deadline, wal_path) do
+    if MapSet.size(seeding) == 0 do
+      {:ok, state}
+    else
+      remaining = deadline - System.monotonic_time(:millisecond)
+
+      if remaining <= 0 do
+        {:timeout, state}
+      else
+        receive do
+          {:seeded, shipper, result} ->
+            state
+            |> apply_seed_result(shipper, result)
+            |> await_seeds(deadline, wal_path)
+
+          {:repl_reply, from, {:ack, _shard, next}} ->
+            state
+            |> settle_late_ack(from, next)
+            |> await_seeds(deadline, wal_path)
+
+          # A REJECT MUST BE RECONCILED, NOT DROPPED. The first draft of this fell through to the
+          # catch-all and threw rejects away, and the rig showed exactly what this module's own
+          # moduledoc predicts: the follower stayed pinned at the position we THOUGHT it had, the
+          # retry planned a delta from there, it refused, and every subsequent commit failed
+          # `:impossible` — having fixed the first commit and broken all the rest.
+          #
+          # These are answers to the push that just failed, so reconciling them before the retry is
+          # the whole point: the retry plans from where each follower actually is.
+          {:repl_reply, from, {:reject, _shard, reason, follower_offset}} ->
+            rejects = [{from, reason, follower_offset}]
+
+            state
+            |> reconcile(rejects)
+            |> start_seeds(wal_path, rejects)
+            |> await_seeds(deadline, wal_path)
+
+          {:repl_reply, _from, _other} ->
+            await_seeds(state, deadline, wal_path)
+        after
+          remaining -> {:timeout, state}
+        end
+      end
+    end
+  end
+
+  # Re-ship after a seed landed. ONE attempt, never a loop: a follower that rejects a delta built
+  # from the position its own seed just reported is not going to accept a third, and retrying would
+  # convert a bounded failure into a call that spins until the caller's timeout. `why` is the
+  # ORIGINAL failure — reporting the retry's reason would blame the seed for a quorum that was
+  # already short.
+  defp retry_after_seed(state, wal_path, why) do
+    case ship(state, wal_path, state.epoch) do
+      {:ok, new_state, rejects} ->
+        {:reply, :ok, drain_late_replies(start_seeds(new_state, wal_path, rejects), wal_path)}
+
+      :nothing ->
+        {:reply, :ok, state}
+
+      {:error, {:no_quorum, _retry_why}, new_state, rejects} ->
+        {:reply, {:error, {:no_quorum, why}}, start_seeds(new_state, wal_path, rejects)}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  # The bookkeeping `handle_info({:seeded, ...})` does, factored out so the in-call wait applies a
+  # seed result identically. Divergence between the two would be invisible until a seed happened to
+  # land on the path with the older logic.
+  defp apply_seed_result(state, shipper, result) do
+    state = %{state | seeding: MapSet.delete(state.seeding, shipper)}
+
+    case result do
+      {:ok, at} ->
+        Logger.info("replication seeded a follower for #{state.shard_id} at #{inspect(at)}")
+        key = resolve(shipper)
+
+        %{
+          state
+          | followers: Map.put(state.followers, key, at),
+            inflight: Map.delete(state.inflight, key)
+        }
+
+      {:error, r} ->
+        Logger.warning("replication seed failed for #{state.shard_id}: #{inspect(r)}")
+        state
     end
   end
 

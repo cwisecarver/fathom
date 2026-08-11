@@ -124,7 +124,9 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
 
     # Seed everyone first, so the rows below are replicated as WAL deltas rather than swept up in
     # a base copy. Otherwise this test could pass with delta shipping completely broken.
-    assert {:error, {:no_quorum, _}} = Session.commit(id, wal, coordinator)
+    # Previously `{:error, {:no_quorum, _}}`: the commit that triggers a seed now waits for it.
+    # See the note at the top of this file's first seed test.
+    assert :ok = Session.commit(id, wal, coordinator)
 
     for {name, _} <- followers,
         do: await_seeded(name, id, fn -> Session.commit(id, wal, coordinator) end)
