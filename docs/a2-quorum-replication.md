@@ -20,13 +20,59 @@ deleting it.
 | Transport | `Replication.Shipper` / `Follower` | One socket per follower **node**, not per shard. |
 | Commit path | `Replication.Session` | Per-shard serialization point; per-follower offsets. |
 | Seeding | `Protocol` + `Follower` | Streamed; a partial seed is never installed. |
-| Promotion | `Replication.Promote` | Standalone — **not** wired into cold open. |
-| Membership | `Replication.Fleet` | Static config list + liveness reporting. |
+| Promotion | `Replication.Promote` | Wired into cold open behind `REPLICATION_PROMOTE_ON_OPEN`. |
+| Receive half | `Replication.Follower` | Supervised by `Fleet` behind `REPLICATION_LISTEN`. |
+| Membership | `Replication.Membership` | Static list **or** the fleet roster, behind one guarded swap. |
 
-**Not built:** automatic promotion on failover (the cold-open seam validates a local copy by
-proving it EQUALS the stored object, and a replica is deliberately fresher — see the `Promote`
-moduledoc), per-shard follower sets, and zone-aware placement. Operator config is
+**Not built:** per-shard follower sets, and zone-aware placement. The RTT sweep makes placement an
+82× lever, which makes it an operator-intent decision rather than one to infer — see
+[Replication factor](#replication-factor-n-vs-ack-threshold-q--do-not-set-q--n). Operator config is
 [configuration.md](configuration.md#quorum-replication-phase-2-a2--off-by-default).
+
+### The receive half was missing entirely until 2026-08-10
+
+Worth recording, because it made every other row in that table untrue in practice and nothing said
+so. `Replication.Follower` — the listener that accepts frames, applies them and acks — **was never
+started outside the test suite.** `Fleet` supervised a Registry, a DynamicSupervisor and the
+Shippers: the primary half, all of it.
+
+So `REPLICATION_ENABLED=true` on a real node shipped every commit into a closed port, collected no
+acks, and returned 503 `FILO_NO_QUORUM` for every tenant write — while `configuration.md`
+instructed operators to point `REPLICATION_FOLLOWERS` at `node_key@host:port` for a port fathom
+never opened. It was not on this doc's "Not built" list either, so it read as finished.
+
+Found while starting the membership work, which would otherwise have automated the discovery of
+endpoints that cannot answer. Two consequences kept:
+
+- **Shipping and receiving are separate gates** (`REPLICATION_ENABLED` / `REPLICATION_LISTEN`). A
+  node can hold others' replicas without replicating its own shards, and a safe rollout turns
+  listening on fleet-wide *first*. One flag cannot express that order.
+- **The replication port is unauthenticated**, so `REPLICATION_BIND_IP` is a security control
+  rather than tuning: unset, `:gen_tcp` binds every interface. The boot line names the interface it
+  bound and says so when it is `0.0.0.0`.
+
+Proven multi-node on the chaos rig (`./chaos.sh replication`): all five nodes accept from their
+peers, and with shipping on, a write to `acme` on its home node lands as a replica on all four
+others. That run also found the rig itself had been broken since 2026-08-08 — five nodes at
+`POOL_SIZE=25` exceed Postgres's default `max_connections=100`, and no scenario had run since the
+node count was raised.
+
+### Membership: the static list is now a floor, not the only option
+
+`REPLICATION_MEMBERSHIP=roster` derives the follower set from addresses nodes publish to
+`rebalancer_nodes` (`REPLICATION_ADVERTISE_HOST`), so adding or replacing a node stops meaning
+"edit every other node's config". `static` remains the default.
+
+The guarantee that had to be rebuilt: `Session.ship_planned/4` derives `n` from `Fleet.shippers/0`
+on **every commit**, and `Quorum.new/2` raises when `q >= n` — inside a tenant's write. Checking
+`q < n` once at boot was sound only while the set could never change. So every swap re-establishes
+it: a set below `quorum+1` is **refused** and the previous set stays live, an unreadable roster
+keeps the previous set, and the roster falls back to `REPLICATION_FOLLOWERS` whenever it cannot
+supply `quorum+1`. Liveness still never filters the push set — the staleness window is a
+*candidacy* filter applied on a timer.
+
+A membership change is not free: a newly added follower holds no base copy, so its first push
+rejects and triggers a seed **per shard**, over the one socket that also carries every other shard.
 
 ## The gap this closes
 
