@@ -76,6 +76,11 @@ x-fathom-env: &fathom-env
   REPLICATION_MEMBERSHIP: "${REPLICATION_MEMBERSHIP:-static}"
   # Fast enough that a scenario can watch a swap happen rather than waiting out the 30s default.
   REPLICATION_MEMBERSHIP_POLL_MS: "${REPLICATION_MEMBERSHIP_POLL_MS:-5000}"
+  # The failover half: a cold open serves a local REPLICA when it is provably newer than the stored
+  # object. This is the switch that turns node-loss RPO from ~300 s into ~0 — without it the frames
+  # ship and nobody ever reads them, so a kill BEFORE the flush still loses the tail.
+  # Off by default here like everything else; `chaos.sh failover` with it on is the RPO test.
+  REPLICATION_PROMOTE_ON_OPEN: "${REPLICATION_PROMOTE_ON_OPEN:-}"
   # Phase-2 B1 dynamic rebalancing: every node reports its load, acts on handoff
   # commands, and runs the (singleton) control loop; the LB backend set + where the
   # rendered exception map is written. NODE_KEY is per-node (set on each service below).
