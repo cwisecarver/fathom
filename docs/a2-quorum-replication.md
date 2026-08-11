@@ -1,8 +1,10 @@
 # A2 — Quorum replication
 
-**Status: BUILT on branch `a2-quorum-replication`, off by default, not on `main`.** Scoped
+**Status: WORKING on branch `a2-quorum-replication`, off by default, not on `main`.** Scoped
 2026-08-08; both decision gates cleared the same day; the transport, commit path, seeding and
-promotion built 2026-08-08/09. Supersedes the one-paragraph deferral in
+promotion built 2026-08-08/09; **proven end to end multi-node 2026-08-11** — `chaos.sh smoke`
+passes with `REPLICATION_ENABLED=true` (five tenants, every write quorum-replicated, cross-shard
+isolation intact). Supersedes the one-paragraph deferral in
 [phase2-scoping](phase2-scoping.md) §A2.
 
 The blocker section below is kept as written, because the thing it describes as blocking is exactly
@@ -56,6 +58,35 @@ peers, and with shipping on, a write to `acme` on its home node lands as a repli
 others. That run also found the rig itself had been broken since 2026-08-08 — five nodes at
 `POOL_SIZE=25` exceed Postgres's default `max_connections=100`, and no scenario had run since the
 node count was raised.
+
+### No replicated write succeeded until 2026-08-11, and the wire was why
+
+The second thing running it multi-node found, after the missing listener. Every commit past the
+first failed `{:no_quorum, :impossible}` with all four followers answering `offset_mismatch` at the
+SAME offset — a deadlock, not a lost frame.
+
+`ckpt_seq` counts checkpoints **within one WAL file**. SQLite deletes the `-wal` when the last
+connection to a shard closes — after every Hrana stream on a quiet shard — and the next stream
+creates a fresh one with new salts and `ckpt_seq` back at **0**. `Primary.plan/2` had always keyed
+on the salt (`when seq != gen or s != salt`) and correctly shipped `{:reset, 0, _}`;
+`FollowerLog.decide/2` compared only `wal_gen`, saw the same generation, and demanded its old
+offset. The primary would send only 0; the follower would accept only its offset. Forever.
+
+`salt1` now crosses the wire — protocol **`@version 2`**. `decode/1` already refuses a version
+mismatch, so a mixed-version fleet fails loudly rather than misparsing a frame.
+
+**A checkpoint does not reproduce it**: `TRUNCATE` bumps `ckpt_seq` too, so both sides agree a
+boundary happened. Only a *recreated* WAL diverges, which is why a suite that held one connection
+per test could never see it. Both gaps now have tests — one integration test drops all connections
+mid-run, one pure-function test asserts a same-generation/different-salt push is a new lineage.
+
+### A tenant's first write used to fail
+
+Third one. The seed was started out of band and the triggering commit failed by design, so that a
+write never blocked on a multi-megabyte transfer. Sound reasoning, unmeasured consequence: an
+`OperationalError` on an unchanged Django app's first INSERT, once per tenant, forever. The commit
+now waits for the seeds it started, bounded by its own deadline — and waits for a **quorum**, not
+all N, or the first write would pay for the slowest replica.
 
 ### Membership: the static list is now a floor, not the only option
 
