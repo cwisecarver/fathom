@@ -605,6 +605,29 @@ if bind = System.get_env("REPLICATION_BIND_IP") do
   end
 end
 
+# Where the follower set comes from. `static` (default) is the hand-maintained
+# REPLICATION_FOLLOWERS list; `roster` derives it from the addresses nodes publish to
+# `rebalancer_nodes`, refreshed on a timer, so adding or replacing a node stops meaning "edit every
+# other node's config".
+#
+# THE STATIC LIST REMAINS THE FLOOR in roster mode. Whenever the roster cannot supply
+# REPLICATION_QUORUM+1 candidates — a fresh fleet, a rolling upgrade where peers publish no
+# address, a Postgres outage — membership falls back to it rather than to nothing. And a set
+# smaller than quorum+1 is REFUSED outright, keeping the previous one live: `n` shrinking below `q`
+# is how `q >= n` starts raising inside a tenant's commit.
+#
+# Roster mode needs REPLICATION_ADVERTISE_HOST set on the nodes that should be candidates, and
+# LOAD_REPORTER on (the beat that publishes the address rides that tick).
+if System.get_env("REPLICATION_MEMBERSHIP") == "roster" do
+  config :fathom, :replication_membership, :roster
+end
+
+# How often roster membership is recomputed. Deliberately slow: this is a control-plane read, not
+# a liveness signal, and every membership CHANGE costs a seed per shard on the added follower.
+if ms = env_int.("REPLICATION_MEMBERSHIP_POLL_MS") do
+  config :fathom, :replication_membership_poll_ms, ms
+end
+
 # The host peers should use to reach THIS node's replication port, published to the fleet roster
 # (`rebalancer_nodes.replication_address`) so membership can be derived instead of hand-listed.
 #

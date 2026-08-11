@@ -43,6 +43,7 @@ defmodule Fathom.Shard.Replication.Fleet do
 
   @registry Fathom.Shard.Replication.SessionRegistry
   @sessions Fathom.Shard.Replication.SessionSupervisor
+  @shippers_sup Fathom.Shard.Replication.ShipperSupervisor
   @shippers_key {__MODULE__, :shippers}
   @running_key {__MODULE__, :running}
 
@@ -213,40 +214,76 @@ defmodule Fathom.Shard.Replication.Fleet do
   def init(_opts) do
     if replicating?(), do: validate_quorum!()
 
-    running =
-      if replicating?() do
-        endpoints()
-        |> Enum.with_index()
-        |> Enum.map(fn {{node_key, host, port}, i} ->
-          {node_key, host, port, Module.concat(__MODULE__, :"Shipper#{i}")}
-        end)
-      else
-        []
-      end
-
-    names = Enum.map(running, fn {_k, _h, _p, name} -> name end)
-
-    # Two terms rather than one: `shippers/0` is read on the commit path and must stay a bare list
-    # of names, while `running/0` carries the identity `health/0` reports. Keeping the hot read
-    # free of the operator metadata is the same reasoning that put this in `:persistent_term`.
-    :persistent_term.put(@shippers_key, names)
-    :persistent_term.put(@running_key, running)
-
-    shipper_specs =
-      Enum.map(running, fn {_node_key, host, port, name} ->
-        Supervisor.child_spec(
-          {Fathom.Shard.Replication.Shipper, name: name, host: host, port: port},
-          id: name
-        )
-      end)
+    # Start from empty and let `Membership` publish the first real set inside its own `init/1`.
+    # Cleared rather than left alone because `:persistent_term` outlives the supervisor: a Fleet
+    # restart that inherited the previous incarnation's names would hand the commit path shipper
+    # processes that no longer exist.
+    publish([])
 
     children =
       [
         {Registry, keys: :unique, name: @registry},
-        {DynamicSupervisor, name: @sessions, strategy: :one_for_one}
-      ] ++ follower_children() ++ shipper_specs
+        {DynamicSupervisor, name: @sessions, strategy: :one_for_one},
+        # Shippers moved OFF the static child list (2026-08-10) so membership can change without a
+        # restart. `Membership` starts them, and starts the first set inside its own `init/1` — so
+        # by the time this supervisor reports started, the shippers a commit will read already
+        # exist. Ordering matters: the DynamicSupervisor must precede Membership.
+        {DynamicSupervisor, name: @shippers_sup, strategy: :one_for_one}
+      ] ++ follower_children() ++ membership_children()
 
     Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  defp membership_children do
+    if replicating?(), do: [Fathom.Shard.Replication.Membership], else: []
+  end
+
+  @doc """
+  Start one shipper under the dynamic supervisor. Raises on failure — the only caller is
+  `Membership`, which either does this during boot (where failing is correct) or during a swap
+  (where a shipper that will not start must not be published as if it had).
+  """
+  @spec start_shipper!(atom(), String.t() | charlist(), :inet.port_number()) :: pid()
+  def start_shipper!(name, host, port) do
+    spec = {Fathom.Shard.Replication.Shipper, name: name, host: host, port: port}
+
+    case DynamicSupervisor.start_child(@shippers_sup, spec) do
+      {:ok, pid} -> pid
+      {:ok, pid, _info} -> pid
+      # Already there: a swap that re-adds a node whose shipper never went away is a no-op, not an
+      # error. Returning the existing pid keeps the caller's start/publish/stop order intact.
+      {:error, {:already_started, pid}} -> pid
+      {:error, reason} -> raise "could not start replication shipper #{name}: #{inspect(reason)}"
+    end
+  end
+
+  @doc """
+  Stop a departed follower's shipper. Best-effort by design: it is called AFTER the new set is
+  published, so the process is already unreachable from the commit path and a failure to terminate
+  it is a leak rather than a correctness problem.
+  """
+  @spec stop_shipper(atom()) :: :ok
+  def stop_shipper(name) do
+    case Process.whereis(name) do
+      nil -> :ok
+      pid -> DynamicSupervisor.terminate_child(@shippers_sup, pid)
+    end
+
+    :ok
+  end
+
+  @doc """
+  Publish the live set as `[{node_key, host, port, shipper_name}]`.
+
+  Two `:persistent_term` writes, and the split is deliberate: `shippers/0` is read on the commit
+  path and stays a bare list of names, while `running/0` carries the identity `health/0` reports.
+  The names go LAST so a reader that sees a new name can always resolve its metadata.
+  """
+  @spec publish([{String.t(), String.t() | charlist(), :inet.port_number(), atom()}]) :: :ok
+  def publish(running) do
+    :persistent_term.put(@running_key, running)
+    :persistent_term.put(@shippers_key, Enum.map(running, fn {_k, _h, _p, name} -> name end))
+    :ok
   end
 
   @doc """

@@ -314,6 +314,32 @@ defmodule Fathom.Telemetry do
           "Connected followers minus the write quorum. 0 = every write succeeds and one more " <>
             "follower loss fails all of them; negative = writes are already failing FILO_NO_QUORUM"
       ),
+      # Membership swaps (A2 Layer 3). Tagged by `source` and `reason`, both bounded sets — never
+      # by node_key, which grows with the fleet.
+      counter("fathom.replication.membership_changed.count",
+        event_name: [:fathom, :replication, :membership_changed],
+        measurement: :size,
+        tags: [:source],
+        description: "Follower-set swaps applied (A2 membership)"
+      ),
+      last_value("fathom.replication.membership_changed.size",
+        event_name: [:fathom, :replication, :membership_changed],
+        measurement: :size,
+        tags: [:source],
+        description: "Followers in the set after the most recent swap (A2 membership)"
+      ),
+      # THE ONE TO ALERT ON, and it is quiet by construction. A refusal means a computed set was
+      # below quorum+1 and the PREVIOUS set is still live — so writes keep succeeding and nothing
+      # else moves, while the node is pinned to a membership the fleet has moved on from. Left
+      # alone it ends as a set of followers that no longer exist.
+      counter("fathom.replication.membership_refused.count",
+        event_name: [:fathom, :replication, :membership_refused],
+        measurement: :kept,
+        tags: [:source, :reason],
+        description:
+          "Follower-set swaps REFUSED for being below quorum+1. Sustained non-zero means " <>
+            "membership is stuck on a stale set while writes still look healthy"
+      ),
       last_value("fathom.durability.dirty_shards",
         event_name: [:fathom, :durability, :rpo],
         measurement: :dirty_shards,
