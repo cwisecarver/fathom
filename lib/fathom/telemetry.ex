@@ -128,6 +128,21 @@ defmodule Fathom.Telemetry do
             "survivor selection). Each one is a failover where the LB picked a node without a " <>
             "replica and the write tail was recovered anyway — the RPO claim doing its job"
       ),
+      # The counterpart to the above, and the one that is otherwise invisible: a recovery that got
+      # all the way through the transfer and was then abandoned because the stored object had moved.
+      # `recovered_from_peer` fires on the PULL, which did happen, so a raced promotion looks like a
+      # success there. Tagged by `reason` (a bounded set of atoms — `:object_moved`,
+      # `:object_advanced`, `:object_head_unreadable`) and never by shard_id.
+      #
+      # A steady trickle is healthy contention. A sustained rate means whole databases are crossing
+      # the network and being discarded, which is bandwidth spent to recover nothing.
+      counter("fathom.replication.promotion_raced.count",
+        event_name: [:fathom, :replication, :promotion_raced],
+        tags: [:reason],
+        description:
+          "Replica promotions abandoned after the pull because the stored object changed while " <>
+            "we were recovering — a whole-database transfer that recovered nothing"
+      ),
       counter("fathom.shards.at_capacity.count",
         event_name: [:fathom, :shards, :at_capacity],
         description:

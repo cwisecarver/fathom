@@ -33,6 +33,9 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     File.mkdir_p!(dir)
 
     prev = Application.get_env(:fathom, :replication_promote_on_open)
+    prev_recover = Application.get_env(:fathom, :replication_recover_from_peers)
+    prev_fault = Application.get_env(:fathom, :storage_fault)
+    prev_backend = Application.get_env(:fathom, :shard_storage)
 
     on_exit(fn ->
       Shards.stop(id)
@@ -40,6 +43,18 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
       if is_nil(prev),
         do: Application.delete_env(:fathom, :replication_promote_on_open),
         else: Application.put_env(:fathom, :replication_promote_on_open, prev)
+
+      if is_nil(prev_recover),
+        do: Application.delete_env(:fathom, :replication_recover_from_peers),
+        else: Application.put_env(:fathom, :replication_recover_from_peers, prev_recover)
+
+      if is_nil(prev_fault),
+        do: Application.delete_env(:fathom, :storage_fault),
+        else: Application.put_env(:fathom, :storage_fault, prev_fault)
+
+      if is_nil(prev_backend),
+        do: Application.delete_env(:fathom, :shard_storage),
+        else: Application.put_env(:fathom, :shard_storage, prev_backend)
 
       File.rm_rf(dir)
       for s <- ["", "-wal", "-shm", ".etag"], do: File.rm(Fathom.Shard.db_path(id) <> s)
@@ -254,5 +269,59 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     assert {:ok, nil} = Storage.object_position(id)
 
     assert open_and_read(id) == [1, 2, 3]
+  end
+
+  # The fleet path reads the object's head, then spends seconds on the network — a peer query and,
+  # when a peer wins, a whole-database transfer — and only then decides to overwrite the object.
+  # Anything flushed in that window makes the comparison a claim about a version that no longer
+  # exists. The fenced publish already 412s, so this was never a way to LOSE data; what it cost was
+  # the transfer, the pre-promotion snapshot, and a log line asserting the object was behind when by
+  # then it was ahead.
+  #
+  # `:object_head_moves` reports a different etag on the RE-read only, which is the one thing a
+  # single-node test cannot stage for real: it needs another node to flush at a precise instant.
+  #
+  # There are no peers here, so `Recovery.best_replica/3` short-circuits on the local replica and
+  # returns without a socket — the fleet DECISION path runs end to end while the wire does not,
+  # which is what this test is about.
+  test "a promotion is abandoned when the stored object moves during recovery", ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+    Application.put_env(:fathom, :replication_recover_from_peers, true)
+    # The default backend is `Local`, which has no seam for this; the double is opt-in per test.
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    {conn, coordinator} = build_shard(id, 10, 3)
+    assert {:ok, stamp} = Storage.object_position(id)
+    install_replica(id, %{epoch: stamp.epoch, wal_gen: stamp.wal_gen, offset: stamp.offset + 1})
+    tear_down_primary(id, conn, coordinator)
+
+    Application.put_env(:fathom, :storage_fault, :object_head_moves)
+
+    # Without the re-read this promotes and returns all ten: the object did not REALLY move, so the
+    # etag we fence with is still good and the publish lands. That is exactly the blind spot — the
+    # publish succeeding is not evidence the decision was still true.
+    assert open_and_read(id) == [1, 2, 3]
+
+    # And the expensive part was skipped, not merely undone.
+    assert {:ok, snaps} = Storage.list_snapshots(id)
+
+    refute Enum.any?(snaps, &String.contains?(snapshot_id(&1), "pre-promotion")),
+           "the promotion was abandoned but the pre-promotion snapshot was still taken"
+  end
+
+  # The other direction, and the one that keeps the re-read from being a way to never recover: with
+  # the object genuinely still, the fleet path promotes exactly as the local path does.
+  test "an unmoved object still promotes through the fleet path", ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+    Application.put_env(:fathom, :replication_recover_from_peers, true)
+
+    {conn, coordinator} = build_shard(id, 10, 3)
+    assert {:ok, stamp} = Storage.object_position(id)
+    install_replica(id, %{epoch: stamp.epoch, wal_gen: stamp.wal_gen, offset: stamp.offset + 1})
+    tear_down_primary(id, conn, coordinator)
+
+    assert open_and_read(id) == Enum.to_list(1..10)
   end
 end

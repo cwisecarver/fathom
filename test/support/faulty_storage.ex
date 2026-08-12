@@ -223,6 +223,32 @@ defmodule Fathom.Test.FaultyStorage do
       else: Local.object_position(shard_id)
   end
 
+  # Same reasoning as `object_position/1` above, plus one fault mode this double exists for:
+  # `:object_head_moves` makes the SECOND and later reads report a different etag, which is the
+  # only way to stage "another node flushed while we were pulling a replica" without a second live
+  # node and a real race. A2's recovery re-reads this head after the transfer precisely to catch
+  # that, and a check that no test can drive is a check nobody knows is wired up.
+  @impl true
+  def object_head(shard_id) do
+    case Local.object_head(shard_id) do
+      {:ok, head} when is_map(head) ->
+        if fault() == :object_head_moves and bump_head_reads() > 1,
+          do: {:ok, %{head | etag: head.etag <> "-moved"}},
+          else: {:ok, head}
+
+      other ->
+        other
+    end
+  end
+
+  # Counts calls so the fault can fire on the RE-read rather than the first one — the first read
+  # is what the promote decision is made against, so moving it would test nothing.
+  defp bump_head_reads do
+    n = (Process.get(:faulty_storage_head_reads) || 0) + 1
+    Process.put(:faulty_storage_head_reads, n)
+    n
+  end
+
   # `run_before(:object_etag)` is what lets a test RAISE from a storage call that the coordinator
   # makes DIRECTLY (not inside a rescued Task) while it already holds the lease — the warm open's
   # `post_lease_warm_check/3`. Every other fault mode here returns an `{:error, _}` tuple, and a

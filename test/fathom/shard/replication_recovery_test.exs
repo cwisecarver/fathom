@@ -126,6 +126,65 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
   end
 
   # ------------------------------------------------------------------------------------------
+  # recheck/3 — the decision is made BEFORE the transfer and acted on AFTER it
+  # ------------------------------------------------------------------------------------------
+
+  describe "recheck/3 — is the choice still true once the pull is done" do
+    defp head(etag, position), do: %{etag: etag, position: position}
+
+    test "an unchanged object leaves the promotion standing" do
+      before = head("v1", stamp(9, 3, 4_120))
+      assert :ok = Recovery.recheck(before, before, at(9, 3, 8_240))
+    end
+
+    test "an object that moved is refused, and says what it was and is" do
+      # The ordinary race: another node flushed while we were querying peers and transferring a
+      # database. The etag we would fence the publish with is stale, so the publish could not land
+      # anyway — the point of catching it here is to not have done the snapshot, and to not log
+      # "the stored object was behind it" about an object that has since moved ahead.
+      before = head("v1", stamp(9, 3, 4_120))
+      now = head("v2", stamp(9, 3, 9_000))
+
+      assert {:error, {:object_moved, "v1", "v2"}} =
+               Recovery.recheck(before, now, at(9, 3, 8_240))
+    end
+
+    test "an object DELETED mid-recovery is refused rather than read as unstamped" do
+      before = head("v1", stamp(9, 3, 4_120))
+      assert {:error, {:object_moved, "v1", nil}} = Recovery.recheck(before, nil, at(9, 3, 8_240))
+    end
+
+    # THE CASE ETAGS ALONE CANNOT SEE, and the reason `recheck/3` compares the position rather than
+    # trusting etag equality to imply it. On S3 the etag hashes the BODY while the position is user
+    # metadata, so a re-flush of byte-identical bytes carrying an advanced position keeps the etag.
+    # An etag-only check would call this "unchanged" and promote a replica over a newer claim.
+    test "a same-etag object whose STAMP advanced past the replica is refused" do
+      before = head("v1", stamp(9, 3, 4_120))
+      now = head("v1", stamp(9, 3, 9_999))
+
+      assert {:error, {:object_advanced, %{offset: 9_999}}} =
+               Recovery.recheck(before, now, at(9, 3, 8_240))
+    end
+
+    test "a stamp that advanced but is STILL behind the replica keeps the promotion" do
+      # The other half of the above: refusing on any movement at all would abandon transfers that
+      # are still correct wins, which is the same over-caution as never recovering.
+      before = head("v1", stamp(9, 3, 4_120))
+      now = head("v1", stamp(9, 3, 6_000))
+
+      assert :ok = Recovery.recheck(before, now, at(9, 3, 8_240))
+    end
+
+    test "an object that became UNSTAMPED is refused, because unknown is never overridable" do
+      # Same rule `choose/3` follows: a stamp we cannot read is not a stamp at position zero.
+      before = head("v1", stamp(9, 3, 4_120))
+
+      assert {:error, {:object_advanced, nil}} =
+               Recovery.recheck(before, head("v1", nil), at(9, 3, 8_240))
+    end
+  end
+
+  # ------------------------------------------------------------------------------------------
   # the wire
   # ------------------------------------------------------------------------------------------
 

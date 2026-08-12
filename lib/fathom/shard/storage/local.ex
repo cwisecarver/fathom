@@ -144,6 +144,27 @@ defmodule Fathom.Shard.Storage.Local do
     end
   end
 
+  # NOT atomic here, and worth saying plainly rather than letting a reader assume the double
+  # matches S3: the etag is a hash of the object file and the stamp is a companion file, so this is
+  # two reads where S3 is one HEAD. A writer landing between them yields a MIXED head.
+  #
+  # That is the SAFE direction and cannot hide a bug. The recovery path uses this head to answer
+  # "is the object still the one I compared against", and a mixed head can only ever disagree with
+  # the earlier read — declining a promotion that might have been fine. It can never agree
+  # falsely, which is the answer that would matter. The single-writer lease makes the window
+  # unreachable in practice anyway; this is a dev/test backend and the note is for whoever ports
+  # the next one.
+  @impl true
+  def object_head(shard_id) do
+    with {:ok, etag} when not is_nil(etag) <- object_etag(shard_id),
+         {:ok, position} <- object_position(shard_id) do
+      {:ok, %{etag: etag, position: position}}
+    else
+      {:ok, nil} -> {:ok, nil}
+      {:error, _} = error -> error
+    end
+  end
+
   # A content hash stands in for S3's opaque etag: it changes iff the bytes change,
   # which is exactly the freshness signal `pull_if_changed/3` needs. (S3's real 304
   # skips the body; the Local double reads it to hash, which is fine on local disk.)

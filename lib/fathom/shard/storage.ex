@@ -152,6 +152,24 @@ defmodule Fathom.Shard.Storage do
   # fenced flush must match.
   @callback object_etag(shard_id :: String.t()) :: {:ok, String.t() | nil} | {:error, term()}
 
+  # BOTH of the above, from ONE read — the object's identity and its claim, as of a single moment.
+  #
+  # Not a convenience wrapper. A2's peer recovery compares a replica against the object's position
+  # and then publishes fenced on the object's etag, and those two facts have to describe the SAME
+  # version of the object or the comparison is not about the thing being overwritten. Read
+  # separately they are two requests with a window in between, and the window is on the far side of
+  # a multi-second peer query and a whole-database transfer.
+  #
+  # Note especially that an etag CANNOT stand in for the position on S3: the etag hashes the BODY
+  # and the stamp is user metadata, so a re-flush of byte-identical bytes carrying an advanced
+  # position keeps the same etag. Comparing etags alone would call that "unchanged".
+  #
+  # `{:ok, nil}` when no object exists — distinct from `{:ok, %{etag: nil, position: nil}}`, which
+  # no backend returns; absence is one answer, not a head full of nils.
+  @callback object_head(shard_id :: String.t()) ::
+              {:ok, %{etag: String.t() | nil, position: position() | nil} | nil}
+              | {:error, term()}
+
   # Conditional pull, keyed on the caller's currently-held `etag` (an opaque store
   # value captured from a prior pull). The warm-standby freshness check: a warm cache
   # may lag the owner's latest flush, so before serving it we confirm it equals the
@@ -402,6 +420,11 @@ defmodule Fathom.Shard.Storage do
   @doc "The stored object's current etag (`nil` if absent) without transferring the body."
   @spec object_etag(String.t()) :: {:ok, String.t() | nil} | {:error, term()}
   def object_etag(shard_id), do: backend().object_etag(shard_id)
+
+  @doc "The object's etag and position stamp from ONE read. See the callback."
+  @spec object_head(String.t()) ::
+          {:ok, %{etag: String.t() | nil, position: position() | nil} | nil} | {:error, term()}
+  def object_head(shard_id), do: backend().object_head(shard_id)
 
   @doc """
   Conditional pull keyed on the caller's held `etag` — the warm-standby freshness

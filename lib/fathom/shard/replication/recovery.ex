@@ -140,6 +140,57 @@ defmodule Fathom.Shard.Replication.Recovery do
 
   defp rank(%{epoch: e, wal_gen: g, next_offset: o}), do: {e, g, o}
 
+  @typedoc "One read of the stored object: what it is, and what it claims. `nil` means no object."
+  @type head :: %{etag: String.t() | nil, position: map() | nil} | nil
+
+  @doc """
+  Is the promotion decision still true, now that the transfer is finished?
+
+  `choose/3` is answered against a head read BEFORE the peer query and the pull, and those two
+  phases are bounded by `:replication_recovery_timeout_ms` and
+  `:replication_recovery_pull_timeout_ms` — seconds, and on a large shard the pull is however long
+  the database takes to cross the network. Any flush landing in that window makes the comparison a
+  statement about a version of the object that no longer exists.
+
+  Nothing was ever UNSAFE about that: the publish is `If-Match`-fenced on the etag we hold, so a
+  moved object turns into a 412 and the promotion is abandoned. What it cost was everything before
+  the 412 — a whole-database transfer, a pre-promotion snapshot, and a log line reading "pulled a
+  replica … the stored object was behind it" about an object that had since moved ahead of it.
+
+  **Pure**, like `choose/3` and `Promote.fresher?/2`, and for the same reason: it decides whether a
+  tenant's stored database gets overwritten, so it has to be reachable from a plain unit test
+  rather than only from a failover with a concurrent writer.
+
+  Two distinct failures, because they are two different facts going stale:
+
+    * `{:error, {:object_moved, was, now}}` — the object is not the version we compared against, so
+      the etag we would fence with is stale and the publish could not land anyway.
+    * `{:error, {:object_advanced, position}}` — the object is the same version by etag but its
+      stamp is no longer behind the replica. **This is reachable, not a paranoid branch:** S3's
+      etag hashes the BODY and the stamp is user metadata, so a re-flush of byte-identical bytes
+      carrying an advanced position keeps the etag. Etag equality alone would call that unchanged
+      and promote over a newer claim.
+  """
+  @spec recheck(head(), head(), position() | nil) :: :ok | {:error, term()}
+  def recheck(before, now, replica) do
+    cond do
+      etag_of(now) != etag_of(before) ->
+        {:error, {:object_moved, etag_of(before), etag_of(now)}}
+
+      not Promote.fresher?(replica, position_of(now)) ->
+        {:error, {:object_advanced, position_of(now)}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp etag_of(nil), do: nil
+  defp etag_of(%{etag: etag}), do: etag
+
+  defp position_of(nil), do: nil
+  defp position_of(%{position: position}), do: position
+
   @doc """
   Find and install the freshest replica of `shard_id` available anywhere in the fleet.
 

@@ -1032,6 +1032,26 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  # The same HEAD again, read for BOTH facts at once. `object_etag/1` and `object_position/1` were
+  # always the identical request; issuing it twice is what let the etag and the stamp describe two
+  # different versions of the object, with a peer query and a database transfer in between.
+  @impl true
+  def object_head(shard_id) do
+    case Req.head(req(), url: object_path(shard_id)) do
+      {:ok, %{status: 200, headers: h}} ->
+        {:ok, %{etag: etag(h), position: Storage.parse_position(header_value(h, @pos_meta))}}
+
+      {:ok, %{status: 404}} ->
+        {:ok, nil}
+
+      {:ok, %{status: status}} ->
+        {:error, {:s3_head_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   # Conditional GET with `If-None-Match: <etag>` — the warm-standby freshness check. A
   # `304` means the cached copy still equals the current object (no body transferred);
   # a `200` carries the fresh bytes; a `404` is a brand-new shard. A `nil` etag omits

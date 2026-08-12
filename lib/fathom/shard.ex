@@ -2285,15 +2285,75 @@ defmodule Fathom.Shard do
   # passed it. It is one comparison on a path that ends in overwriting a tenant's stored database,
   # and the alternative is trusting a promise made by a different module about bytes that arrived
   # over an unauthenticated socket.
+  #
+  # `object_head/1` rather than `object_position/1` because the decision needs the object's stamp
+  # AND the etag it will be fenced with to describe the SAME version — see the callback. The head
+  # is then RE-READ after the transfer and compared (`Recovery.recheck/3`): everything between the
+  # two reads is network, bounded in seconds by the peer query and in database-size by the pull,
+  # and a flush landing in there left the promote decision resting on a version that no longer
+  # exists. That was never unsafe — the fenced publish 412s — but the cost was a whole transfer, a
+  # snapshot, and a log line claiming the object was behind when by then it was not.
   defp try_promote_from_fleet(shard_id, path, lease, etag) do
-    with {:ok, stamp} <- Storage.object_position(shard_id),
-         {:ok, replica} <- Recovery.best_replica(shard_id, stamp),
-         true <- Promote.fresher?(replica, stamp) do
-      promote_replica(shard_id, path, lease, etag, replica, stamp)
+    started = System.monotonic_time(:millisecond)
+
+    with {:ok, head} <- Storage.object_head(shard_id),
+         {:ok, replica} <- Recovery.best_replica(shard_id, position_of(head)),
+         true <- Promote.fresher?(replica, position_of(head)),
+         :ok <- recheck_object(shard_id, head, replica, started) do
+      promote_replica(shard_id, path, lease, etag, replica, position_of(head))
     else
       _ -> etag
     end
   end
+
+  defp position_of(nil), do: nil
+  defp position_of(%{position: position}), do: position
+
+  # The re-read. A failure to READ is treated as "moved" — declining is the conservative answer and
+  # this whole path is an optimization over opening from the stored object, so an unreadable store
+  # is a reason to take the ordinary path rather than to promote on a comparison we can no longer
+  # confirm.
+  defp recheck_object(shard_id, before, replica, started) do
+    now =
+      case Storage.object_head(shard_id) do
+        {:ok, head} -> head
+        {:error, reason} -> {:unreadable, reason}
+      end
+
+    case now do
+      {:unreadable, reason} ->
+        decline_promotion(shard_id, {:object_head_unreadable, reason}, started)
+
+      head ->
+        case Recovery.recheck(before, head, replica) do
+          :ok -> :ok
+          {:error, reason} -> decline_promotion(shard_id, reason, started)
+        end
+    end
+  end
+
+  # Counted, not just logged. A promotion abandoned here means a database was transferred across
+  # the network for nothing, and that is invisible in the success telemetry by construction —
+  # `recovered_from_peer` fires on the pull, which DID happen.
+  defp decline_promotion(shard_id, reason, started) do
+    elapsed = System.monotonic_time(:millisecond) - started
+
+    Logger.warning(
+      "shard #{shard_id}: abandoning replica promotion after #{elapsed}ms — the stored object " <>
+        "changed while we were recovering (#{inspect(reason)}); opening from the stored object"
+    )
+
+    :telemetry.execute(
+      [:fathom, :replication, :promotion_raced],
+      %{count: 1, duration_ms: elapsed},
+      %{shard_id: shard_id, reason: elem_reason(reason)}
+    )
+
+    {:error, reason}
+  end
+
+  defp elem_reason(reason) when is_tuple(reason), do: elem(reason, 0)
+  defp elem_reason(reason), do: reason
 
   defp promote_on_open?, do: Application.get_env(:fathom, :replication_promote_on_open, false)
 
