@@ -9,10 +9,8 @@ claim hold when the LB fails over to a node holding no replica — until then it
 survivor happened to have one, and the rig measured an acked write lost while three peers held it.
 Supersedes the one-paragraph deferral in [phase2-scoping](phase2-scoping.md) §A2.
 
-**Not yet proven on the rig.** The suite covers the decision and the wire; the scenario that would
-demonstrate it end to end has to kill a node with **no flush interval in between**, which
-`chaos.sh failover` deliberately does not do (it waits one flush, so the write it checks is already
-in S3). Designing that scenario is the open work — see [tasks/todo.md](../tasks/todo.md).
+**PROVEN ON THE RIG 2026-08-12** — `chaos.sh rpo`, two runs, and it found a bug that made the whole
+thing inert in production (see [The touch erased the stamp](#the-touch-erased-the-stamp-and-that-is-why-nothing-was-ever-promoted)).
 
 The blocker section below is kept as written, because the thing it describes as blocking is exactly
 what turned out not to — see the gate-1 note in [Decision gate](#decision-gate). The header used to
@@ -33,6 +31,7 @@ deleting it.
 | Receive half | `Replication.Follower` | Supervised by `Fleet` behind `REPLICATION_LISTEN`. |
 | Membership | `Replication.Membership` | Static list **or** the fleet roster, behind one guarded swap. |
 | Survivor selection | `Replication.Recovery` | Ask peers → choose → pull, behind `REPLICATION_RECOVER_FROM_PEERS`. |
+| RPO proof | `chaos.sh rpo` | Kills with NO flush in between; runs both arms, so a run that proves nothing says so. |
 
 **Not built:** per-shard follower sets, and zone-aware placement. The RTT sweep makes placement an
 82× lever, which makes it an operator-intent decision rather than one to infer — see
@@ -98,6 +97,42 @@ treats as "no offer". Both are loud; only one also breaks replication.
 **Still conditional on one thing:** the recovering node must have `REPLICATION_LISTEN` on, since the
 pull installs through its local replica directory. That matches the documented rollout order, and a
 node that cannot hold a replica could not be a useful survivor for anyone else either.
+
+### The touch erased the stamp, and that is why nothing was ever promoted
+
+The bug `chaos.sh rpo` found the first time it ran, and the reason building the scenario was worth
+more than the feature it was written to check.
+
+A takeover **touches** the shard object — a server-side self-copy that rotates its etag, which is
+what fences the deposed node's `If-Match` flush. S3 requires the `REPLACE` metadata directive for a
+self-copy, and REPLACE **drops every user metadata key unless it is sent again**. The touch re-sent
+one: the integrity md5 (#12/#17). `x-amz-meta-fathom-pos` — the position stamp — was added later
+for A2 and nobody added it to that list.
+
+So **every takeover erased the stamp.** And an unstamped object is deliberately never overridable
+(the rule that makes promotion inert rather than dangerous on an un-upgraded fleet). The two
+features meet at exactly the wrong moment: the stamp is destroyed by the same operation that
+creates the only situation where it is ever read.
+
+Consequences worth being blunt about:
+
+- **promote-on-open has never worked on a real failover**, since it shipped. Not "worked
+  sometimes" — the object it compares against is unstamped by the time it looks.
+- Nothing failed and nothing logged. The shard recovered to its last flush, which is the pre-A2
+  behaviour, which is exactly what a reader would expect to see if A2 were merely disabled.
+- The measurement was unambiguous once the scenario printed both inputs at the moment of
+  comparison: stamp `%{epoch: 1, wal_gen: 0, offset: 0}` before the kill, `nil` after, with a peer
+  sitting at offset 8272.
+
+**The unit suite could not have caught it.** `Storage.Local` and `Fathom.Test.FaultyStorage` keep
+their metadata in place across a touch, so "REPLACE drops user metadata" is a property only the
+real backend has — the same class of gap AGENTS.md records for the lock-etag contract, where a
+double that could not express the bug silently exempted an entire class of them.
+
+The fix is **carry every user metadata key**, not "carry this second one": the failure mode is an
+omission from a list, and a list that has been wrong once will be wrong again the next time a key
+is added. `S3.carry_meta/1` is public and directly tested for that reason, because the behaviour it
+protects cannot be reproduced against either double.
 
 ### The receive half was missing entirely until 2026-08-10
 

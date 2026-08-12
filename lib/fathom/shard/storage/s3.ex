@@ -175,7 +175,7 @@ defmodule Fathom.Shard.Storage.S3 do
     # self-test of the STORE, so it must not trust the copy response's claimed etag the
     # way the steal path now does — review 2026-07-23 #13).
     with {:ok, etag} when not is_nil(etag) <- head_etag(key),
-         {:ok, _claimed} <- rotate_etag(key, etag, nil),
+         {:ok, _claimed} <- rotate_etag(key, etag, []),
          {:ok, new_etag} when not is_nil(new_etag) and new_etag != etag <- head_etag(key) do
       :ok
     else
@@ -442,17 +442,47 @@ defmodule Fathom.Shard.Storage.S3 do
 
   defp resolved_post(shard_id, old_etag, _unproven), do: confirm_rotation(shard_id, old_etag)
 
-  # HEAD with sentinel awareness: {:ok, etag_or_nil, sentinel?}.
-  # HEAD, also returning the object's x-amz-meta-fathom-md5 (#17) so the touch can carry it forward:
-  # a self-copy/multipart-copy with REPLACE drops all user metadata unless re-sent, which would leave
-  # the post-touch object with no integrity metadata for the stealing node's first pull (#12).
+  # HEAD with sentinel awareness: {:ok, etag_or_nil, sentinel?, carry_headers}.
+  #
+  # The fourth element is EVERY user metadata header the touch must re-send, because a
+  # self-copy/multipart-copy with the REPLACE directive drops all of it unless it is sent again.
+  #
+  # IT IS A LIST, NOT ONE HAND-PICKED KEY, and that is the actual fix rather than a detail. It
+  # used to be the integrity md5 alone (#12/#17). `x-amz-meta-fathom-pos` — the position stamp A2
+  # compares a replica against — was added later and nobody added it here, so **every steal-touch
+  # silently erased it**. An unstamped object is never overridable by design, so promote-on-open
+  # and survivor selection both went inert at precisely the moment they exist for: a takeover.
+  # Nothing failed, nothing logged, and the shard just recovered to the last flush.
+  #
+  # Found on the rig 2026-08-12 by `chaos.sh rpo`, which measured the stamp present before the kill
+  # and gone after. The unit suite could not see it: `Storage.Local` and `Fathom.Test.FaultyStorage`
+  # keep a lock/metadata map in place across a touch, so "REPLACE drops user metadata" is a
+  # property only the real backend has.
   defp head_object(key) do
     case Req.head(req(), url: url_path(key)) do
-      {:ok, %{status: 200, headers: h}} -> {:ok, etag(h), sentinel_response?(h), meta_md5(h)}
-      {:ok, %{status: 404}} -> {:ok, nil, false, nil}
+      {:ok, %{status: 200, headers: h}} -> {:ok, etag(h), sentinel_response?(h), carry_meta(h)}
+      {:ok, %{status: 404}} -> {:ok, nil, false, []}
       {:ok, %{status: s}} -> {:error, {:s3_head_status, s}}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  @doc """
+  The user metadata headers a REPLACE copy must re-send, taken off a GET/HEAD response.
+
+  Public so it can be tested directly. The bug this closes was an omission from a list, and the
+  only cheap way to catch the next omission is to assert the list's contents — the behaviour it
+  protects (S3 dropping metadata on a self-copy) is not something either test double reproduces.
+
+  Absent keys are skipped rather than sent empty: a legacy object with no md5 must not gain a
+  fabricated one, and an object with no position must stay unstamped rather than acquire a stamp
+  that claims an ordering nobody established.
+  """
+  @spec carry_meta(map() | keyword()) :: [{String.t(), String.t()}]
+  def carry_meta(headers) do
+    for key <- [@md5_meta, @pos_meta],
+        value = header_value(headers, key),
+        do: {key, value}
   end
 
   # The fence is only real if the etag actually moved (round-2 #4): a store whose
@@ -468,24 +498,20 @@ defmodule Fathom.Shard.Storage.S3 do
 
   defp multipart_etag_form?(etag), do: etag |> String.trim(~s(")) |> String.contains?("-")
 
-  defp rotate_etag(key, etag, md5) do
+  defp rotate_etag(key, etag, carry) do
     if multipart_etag_form?(etag),
-      do: single_copy_touch(key, etag, md5),
-      else: multipart_copy_touch(key, etag, md5)
+      do: single_copy_touch(key, etag, carry),
+      else: multipart_copy_touch(key, etag, carry)
   end
-
-  # The x-amz-meta-fathom-md5 header to carry across a REPLACE copy (#12) — `[]` when the source had
-  # no such metadata (a legacy object), so we never fabricate one.
-  defp md5_meta_header(nil), do: []
-  defp md5_meta_header(md5) when is_binary(md5), do: [{@md5_meta, md5}]
 
   # Plain server-side self-copy: produces a single-form (MD5) etag. Used when the
   # object currently carries a multipart-form etag, so the form flip IS the
   # rotation. S3 requires the REPLACE metadata directive for a self-copy — which drops ALL user
-  # metadata, so re-send the object's integrity md5 (#12) or the post-touch object verifies nothing.
+  # metadata, so `carry` re-sends every key the object had. Sending back only the integrity md5 is
+  # what silently erased A2's position stamp on every takeover — see `head_object/1`.
   # Returns `{:ok, new_etag_or_nil}` — the CopyObjectResult body carries the new etag
   # (nil if unparseable; the caller then confirms via HEAD).
-  defp single_copy_touch(key, etag, md5) do
+  defp single_copy_touch(key, etag, carry) do
     source = "/" <> fetch!(config(), :bucket) <> "/" <> key
 
     case Req.put(req(),
@@ -495,7 +521,7 @@ defmodule Fathom.Shard.Storage.S3 do
                {"x-amz-copy-source", source},
                {"x-amz-metadata-directive", "REPLACE"},
                {"x-amz-copy-source-if-match", etag}
-             ] ++ md5_meta_header(md5)
+             ] ++ carry
          ) do
       {:ok, %{status: s, body: body}} when s in 200..299 ->
         body = to_string(body)
@@ -527,10 +553,10 @@ defmodule Fathom.Shard.Storage.S3 do
   # One-part multipart self-copy: Complete's etag is md5(part-md5s)-1 — never the
   # single MD5 form, so it rotates even for identical bytes. A single-part
   # multipart upload has no minimum part size, so this works for any shard.
-  defp multipart_copy_touch(key, etag, md5) do
+  defp multipart_copy_touch(key, etag, carry) do
     source = "/" <> fetch!(config(), :bucket) <> "/" <> key
 
-    case create_multipart(key, md5) do
+    case create_multipart(key, carry) do
       {:ok, upload_id} ->
         with {:ok, part_etag} <- upload_part_copy(key, upload_id, source, etag),
              {:ok, post} <- complete_multipart(key, upload_id, part_etag) do
@@ -547,12 +573,13 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   # CreateMultipartUpload is where a multipart object's user metadata is set (parts carry none), so
-  # thread the integrity md5 here (#12) — the completed object then HEADs with x-amz-meta-fathom-md5.
-  defp create_multipart(key, md5) do
+  # the whole `carry` list is threaded here — the completed object then HEADs with every key the
+  # source had, integrity md5 AND position stamp.
+  defp create_multipart(key, carry) do
     case Req.post(req(),
            url: url_path(key) <> "?uploads",
            body: "",
-           headers: md5_meta_header(md5)
+           headers: carry
          ) do
       {:ok, %{status: s, body: body}} when s in 200..299 ->
         case Regex.run(~r|<UploadId>([^<]+)</UploadId>|, to_string(body)) do

@@ -30,6 +30,11 @@
 #                                 from its peers (the half that was never started outside tests).
 #                                 Add REPLICATION_ENABLED=true — to `up` AND to this — to also
 #                                 ship a write and check followers hold a replica.
+#   ./chaos.sh rpo [shard]        Phase-2 A2: kill a node with NO flush in between and prove an
+#                                 acked, replicated write survives on a survivor that holds no
+#                                 replica of its own. Runs BOTH arms — gate off must LOSE the row,
+#                                 gate on must KEEP it — so a run that proves nothing says so.
+#                                 Needs REPLICATION_ENABLED=true on `up`.
 #   ./chaos.sh tpcb [shards txns accounts]  remote TPC-B: RTT probe + N tenant shards driven
 #                                 through the LB by a real libSQL client (the Phase-4 realism run)
 #   ./chaos.sh tpcc [max_w threads txns scale]  remote TPC-C: W=1..max_w sweep through the LB
@@ -644,6 +649,262 @@ cmd_replication() {
     echo "FAIL: only $holders followers hold a replica — below the quorum the commit claimed"
     return 1
   fi
+}
+
+# -- rpo: the node-loss RPO claim, killed with NO flush in between --------------
+#
+# WHY `failover` COULD NOT PROVE THIS. It sleeps one flush interval before killing, so the write it
+# checks is already in S3 and survives whatever recovery does. That was the right check for the
+# lease/steal contract it was written for, and it is structurally blind to A2: the whole claim is
+# about the writes that are NOT in the object yet.
+#
+# WHY THE OBVIOUS VERSION OF THIS PROVES NOTHING EITHER. Every node in this rig follows every other,
+# so after a replicated write ANY survivor holds a replica and promote-on-open alone recovers the
+# row. A scenario that kills the home and reads back would pass with survivor selection switched
+# off — which is exactly the shape AGENTS.md warns about, a benchmark that passes with the
+# optimisation disabled and therefore measures nothing.
+#
+# So the scenario ENGINEERS the state the rig actually measured on 2026-08-11: the node that ends up
+# serving the shard holds **no replica of it**, while a peer does. It erases one follower's replica,
+# kills the home, and forces that follower to take the shard over. Without survivor selection it
+# cold-opens from S3 and the row is gone; with it, it asks its peers, finds the keeper, and pulls.
+#
+# BOTH ARMS RUN, EVERY TIME. Arm 1 (gate off) must LOSE the row and arm 2 (gate on) must KEEP it.
+# A run where arm 1 also keeps it is reported as NOT DISCRIMINATING and fails, because at that point
+# the pass in arm 2 is not evidence of anything.
+#
+# Two knobs are set through `rpc` rather than the environment, deliberately:
+#
+#   * the flush interval goes to 10 minutes, so "no flush in between" is a fact rather than a race
+#     against a 5 s timer with three round trips to fit inside it. Durability is then forced
+#     explicitly with `Fathom.Shards.flush/1` wherever the scenario genuinely wants an object.
+#   * the promote/recover gates, so one `up` can run both arms. `Recovery.enabled?/0` and
+#     `promote_on_open?/0` both read `Application.get_env` at call time.
+#
+# `REPLICATION_ENABLED` cannot be one of them — the shipping half is a supervision tree built at
+# boot — so it is checked and named instead of silently producing a run that proves nothing.
+cmd_rpo() {
+  local shard=${1:-rpo1}
+  local off on
+
+  echo "=== preconditions ==="
+  # THE VARIABLE MUST BE ON THIS COMMAND, not just on `up`. Between the two arms this scenario
+  # revives the node it killed with `compose up -d <node>`, and compose reads
+  # `REPLICATION_ENABLED: "${REPLICATION_ENABLED:-}"` from the environment of whoever invoked it —
+  # so a revived node comes back with shipping OFF unless the variable is set here too.
+  #
+  # Found by running it: arm 1 passed, then arm 2 reported "only 0 follower(s) hold a replica"
+  # because the revived home was no longer shipping to anyone. Checked rather than documented,
+  # because the symptom points at replication being broken rather than at a missing variable.
+  if [ "${REPLICATION_ENABLED:-}" != "true" ]; then
+    echo "FAIL: REPLICATION_ENABLED is not set on THIS command."
+    echo "  It is needed here as well as on \`up\`: arm 2 revives the node arm 1 killed, and"
+    echo "  compose rebuilds that container from this shell's environment."
+    echo "      REPLICATION_ENABLED=true ./chaos.sh rpo $shard"
+    return 1
+  fi
+
+  if [ "$(rpc fathom1 'IO.puts(Fathom.Shard.Replication.Fleet.replicating?())')" != "true" ]; then
+    echo "FAIL: shipping is off on fathom1."
+    echo "  This scenario needs frames actually leaving the home node, which is a boot-time tree:"
+    echo "      REPLICATION_ENABLED=true ./chaos.sh up"
+    echo "      ./chaos.sh rpo $shard"
+    return 1
+  fi
+  echo "  shipping ON, quorum ${REPLICATION_QUORUM:-2}"
+
+  # THE IMAGE CHECK, before anything expensive. `up` does not build, so a rig validating a code
+  # change can be running a release from weeks ago — and "it passed" then reads as validation.
+  # A node that cannot resolve the module is running a build from before survivor selection.
+  if ! rpc fathom1 'IO.puts(Code.ensure_loaded?(Fathom.Shard.Replication.Recovery))' | grep -q true
+  then
+    echo "FAIL: this image has no Fathom.Shard.Replication.Recovery — it predates survivor selection."
+    echo "      ./chaos.sh build && REPLICATION_ENABLED=true ./chaos.sh up"
+    return 1
+  fi
+  echo "  image HAS Recovery"
+
+  echo
+  echo "=== ARM 1: survivor selection OFF (the row MUST be lost) ==="
+  off=$(rpo_trial false "$shard")
+  echo "$off" | sed 's/^/  /'
+  off=$(echo "$off" | tail -1)
+
+  echo
+  echo "=== ARM 2: survivor selection ON (the row MUST survive) ==="
+  on=$(rpo_trial true "$shard")
+  echo "$on" | sed 's/^/  /'
+  on=$(echo "$on" | tail -1)
+
+  echo
+  echo "RESULT rpo:"
+  echo "  gate OFF -> seq=999 rows found on the survivor: $off   (must be 0)"
+  echo "  gate ON  -> seq=999 rows found on the survivor: $on    (must be 1)"
+
+  if [ "$off" = "INVALID" ] || [ "$on" = "INVALID" ]; then
+    echo "  *** TRIAL INVALID — a precondition did not hold; the counts above mean nothing."
+    return 1
+  fi
+
+  if [ "$off" = "0" ] && [ "$on" = "1" ]; then
+    echo "  PASS: an acked write that never reached S3 survived node loss ONLY because the"
+    echo "        survivor pulled it from a peer. Node-loss RPO ~0, demonstrated rather than argued."
+    return 0
+  fi
+
+  if [ "$off" = "1" ]; then
+    echo "  *** NOT DISCRIMINATING: the row survived with the gate OFF, so this run proves nothing"
+    echo "      about survivor selection. Most likely the survivor still held a replica of its own —"
+    echo "      check the 'erased' line above."
+  else
+    echo "  *** FAIL: the gate is on and the acked write was still lost."
+  fi
+  return 1
+}
+
+# One trial. Prints its narrative on stdout and the survivor's seq=999 count as the LAST line, so
+# the caller can read a verdict without parsing the rest.
+rpo_trial() {
+  local gate=$1 shard=$2
+  local n home keeper victim count holders=()
+
+  # Every node starts from the stored object: a previous arm left the victim owning the shard, and
+  # a local file surviving into the next arm would let it serve rows the object does not have —
+  # which is indistinguishable from the thing being measured.
+  for n in "${NODES[@]}"; do
+    rpc "$n" "Fathom.Shards.stop(\"$shard\")" >/dev/null 2>&1
+    rpc "$n" "Fathom.Shard.Replication.Follower.forget(Fathom.Shard.Replication.Follower, \"$shard\")" >/dev/null 2>&1
+    compose exec -T "$n" sh -lc "rm -f /data/shards/$shard.db*" >/dev/null 2>&1
+    # 10 minutes: long enough that no periodic flush can fire inside this trial. Read on every
+    # re-arm, so it takes effect after the timer currently in flight.
+    rpc "$n" 'Application.put_env(:fathom, :shard_flush_interval_ms, 600_000)' >/dev/null 2>&1
+  done
+  sleep 7
+
+  # A base state that IS durable, forced rather than waited for. Without it the survivor opens a
+  # shard with no `kv` table and the read fails on missing SQL, which looks nothing like the loss
+  # being measured but fails the trial just the same.
+  seed "$shard" >/dev/null 2>&1
+  sql "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', 1)" >/dev/null || {
+    echo "base write failed"; echo INVALID; return; }
+  for n in "${NODES[@]}"; do rpc "$n" "Fathom.Shards.flush(\"$shard\")" >/dev/null 2>&1; done
+
+  if [ "$(rpo_object_count "$shard" fathom1 1)" != "1" ]; then
+    echo "the base row is not in the stored object — durability itself is broken, not this feature"
+    echo INVALID; return
+  fi
+  echo "base row durable in S3"
+
+  # THE ROW THE WHOLE FEATURE IS ABOUT: acked to a quorum of replicas, never flushed.
+  sql "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', 999)" >/dev/null || {
+    echo "the seq=999 write was refused (FILO_NO_QUORUM) — nothing to recover"; echo INVALID; return; }
+
+  count=$(rpo_object_count "$shard" fathom1 999)
+  if [ "$count" != "0" ]; then
+    echo "seq=999 is ALREADY in the stored object (count=$count) — a flush raced the trial, so"
+    echo "surviving it would prove nothing"
+    echo INVALID; return
+  fi
+  echo "seq=999 acked and NOT in S3 — this is the write the RPO claim is about"
+
+  home=$(cmd_owner "$shard") || { echo "no home node"; echo INVALID; return; }
+
+  # The backstop for the same trap the top-level check guards: it is THIS node that has to ship,
+  # and it may be one revived by a previous arm.
+  if [ "$(rpc "$home" 'IO.puts(Fathom.Shard.Replication.Fleet.replicating?())')" != "true" ]; then
+    echo "$home holds the shard but is NOT shipping — it was revived without REPLICATION_ENABLED"
+    echo INVALID; return
+  fi
+
+  for n in "${NODES[@]}"; do
+    [ "$n" = "$home" ] && continue
+    if rpc "$n" "IO.puts(File.exists?(Fathom.Shard.Replication.Follower.db_path(Fathom.Shard.Replication.Follower, \"$shard\")))" | grep -q true
+    then holders+=("$n"); fi
+  done
+
+  if [ "${#holders[@]}" -lt 2 ]; then
+    echo "only ${#holders[@]} follower(s) hold a replica — need one to keep and one to erase"
+    echo INVALID; return
+  fi
+  keeper=${holders[0]}
+  victim=${holders[1]}
+  echo "home=$home keeper=$keeper victim=$victim (holders: ${holders[*]})"
+
+  # The engineered state: the node about to take the shard over holds nothing for it, exactly as
+  # when the LB's consistent hash lands on a node that was never this shard's follower.
+  rpc "$victim" "Fathom.Shard.Replication.Follower.forget(Fathom.Shard.Replication.Follower, \"$shard\")" >/dev/null 2>&1
+  if rpc "$victim" "IO.puts(File.exists?(Fathom.Shard.Replication.Follower.db_path(Fathom.Shard.Replication.Follower, \"$shard\")))" | grep -q true
+  then echo "could not erase $victim's replica"; echo INVALID; return; fi
+  echo "erased $victim's replica — it now holds NO copy of $shard"
+
+  # THE COMPARISON'S TWO INPUTS, printed side by side at the moment they will be compared.
+  #
+  # Added after a run where both arms lost the row and the counts alone could not say why. An
+  # object with NO position stamp is never overridable BY DESIGN, so a shard in that state makes
+  # survivor selection inert and the symptom is identical to the feature being broken. Reading it
+  # after the run is not the same measurement — by then the survivor has flushed its own object.
+  local stamp keeper_pos
+  stamp=$(rpc "$keeper" "IO.inspect(Fathom.Shard.Storage.object_position(\"$shard\"))")
+  keeper_pos=$(rpc "$keeper" "IO.inspect(Fathom.Shard.Replication.Follower.state_of(Fathom.Shard.Replication.Follower, \"$shard\"))")
+  echo "object stamp : $stamp"
+  echo "keeper replica: $keeper_pos"
+
+  case "$stamp" in
+    *nil*)
+      echo "the stored object carries NO position stamp, so nothing can ever be judged fresher than"
+      echo "it — that is a stamping/durability problem, not a survivor-selection one"
+      echo INVALID; return ;;
+  esac
+
+  rpc "$victim" 'Application.put_env(:fathom, :replication_promote_on_open, true)' >/dev/null 2>&1
+  rpc "$victim" "Application.put_env(:fathom, :replication_recover_from_peers, $gate)" >/dev/null 2>&1
+  echo "gates on $victim: promote_on_open=true recover_from_peers=$gate"
+
+  silent_kill "$home"
+  local wait_s=$(( (TTL_MS + STEAL_MARGIN_MS) / 1000 + 6 ))
+  echo "killed $home; waiting ${wait_s}s past the lease TTL so $victim can steal"
+  sleep "$wait_s"
+
+  # Direct to the victim, not through the LB: which node nginx re-hashes to is not something this
+  # scenario should be at the mercy of, and the claim under test is about a specific node that
+  # holds no replica taking the shard over.
+  count=$(sql_direct "$victim" "$shard" "SELECT count(*) FROM kv WHERE seq = 999" | val)
+  echo "$victim opened $shard and reports seq=999 rows: $count"
+  compose logs --since 2m "$victim" 2>/dev/null |
+    grep -Ei "pulled a replica|PROMOTED|recover" | tail -3 | sed 's/^/log: /'
+
+  revive "$home"
+  sleep 10
+
+  is_num "$count" || { echo INVALID; return; }
+  echo "$count"
+}
+
+# Rows matching <seq> in the shard's DURABLE OBJECT (not any node's local file). `-1` on any
+# failure to determine, so "could not read it" can never be mistaken for "the row is not there" —
+# which is the answer the whole scenario turns on.
+rpo_object_count() {
+  local shard=$1 node=$2 seq=$3
+  rpc "$node" "
+    tmp = \"/tmp/rpo_probe_\" <> Integer.to_string(:erlang.unique_integer([:positive])) <> \".db\"
+    out =
+      case Fathom.Shard.Storage.pull(\"$shard\", tmp) do
+        {:ok, _} ->
+          case Fathom.Shard.Connection.open(tmp) do
+            {:ok, c} ->
+              r = case Fathom.Shard.Connection.query(c, \"SELECT count(*) FROM kv WHERE seq = $seq\", []) do
+                    {:ok, %{rows: [[n]]}} -> n
+                    _ -> -1
+                  end
+              Fathom.Shard.Connection.close(c)
+              r
+            _ -> -1
+          end
+        {:absent, _} -> 0
+        _ -> -1
+      end
+    Enum.each([\"\", \"-wal\", \"-shm\"], fn s -> File.rm(tmp <> s) end)
+    IO.puts(out)"
 }
 
 # -- hotspots: real-traffic hot-spot detection (Phase-2 §B) --------------------
@@ -1724,6 +1985,7 @@ case "${1:-}" in
   rebalance)   shift; cmd_rebalance "$@" ;;
   hotspots)    shift; cmd_hotspots "$@" ;;
   replication) shift; cmd_replication "$@" ;;
+  rpo)         shift; cmd_rpo "$@" ;;
   up)          cmd_up ;;
   down)        cmd_down ;;
   logs)        shift; cmd_logs "$@" ;;
