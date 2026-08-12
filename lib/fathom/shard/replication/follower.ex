@@ -247,8 +247,19 @@ defmodule Fathom.Shard.Replication.Follower do
             serve(sock, name, write_chunk(seeds, shard, part, seq, chunk))
 
           {:ok, {:seed_end, shard}} ->
-            {reply, seeds} = finish_seed(name, seeds, shard)
-            :ok = :gen_tcp.send(sock, reply)
+            {result, seeds} = finish_seed(name, seeds, shard)
+            :ok = :gen_tcp.send(sock, encode_seed_result(shard, result))
+            serve(sock, name, seeds)
+
+          {:ok, {:position_query, shard}} ->
+            # How far along our replica is, so a node taking over the shard can decide whether we
+            # are worth pulling from. Read-only and cheap on purpose: this is asked of every peer
+            # on a cold open, so it must never touch the database or the object store.
+            :ok = :gen_tcp.send(sock, Protocol.encode_position(shard, state_of(name, shard)))
+            serve(sock, name, seeds)
+
+          {:ok, {:replica_request, shard}} ->
+            :ok = send_replica(sock, name, shard)
             serve(sock, name, seeds)
 
           {:ok, {:seed_abort, shard}} ->
@@ -278,6 +289,139 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   # ------------------------------------------------------------------------------------------
+  # serving a pull — the survivor-selection direction
+  # ------------------------------------------------------------------------------------------
+  #
+  # Answering `replica_request` streams OUR replica back to the asker, using the same
+  # `seed_begin` / chunks / `seed_end` frames a primary uses to seed us. Nothing new is invented on
+  # either side: the asker drives this module's own sink, so a pulled copy is indistinguishable
+  # from a pushed one and `Promote` needs no new case.
+  #
+  # THE FILES ARE THE SOURCE OF TRUTH for generation, salt and offset — the same rule `recover/3`
+  # follows, and for the same reason. Only `epoch` comes from ETS, because it is the primary's
+  # lease epoch and appears nowhere on disk.
+  #
+  # What can move under us while we read, and what catches it:
+  #
+  #   * a PUSH APPENDS to the `-wal`. Harmless: we declared a byte count up front and stream that
+  #     prefix. The extra bytes are simply not ours to send.
+  #   * a PUSH RESETS the `-wal` (new epoch or new generation — `apply_write` truncates). The
+  #     header's generation and salt both move, which is what the before/after check reads.
+  #   * a full RE-SEED renames a new `.db` into place. The `-wal` is rewritten with it, so the same
+  #     check fires. A re-seed that landed on byte-identical generation AND salt would slip
+  #     through, and that is accepted: it means the two copies agree on lineage and position, and
+  #     the asker still runs `quick_check` before serving a byte of it.
+  defp send_replica(sock, name, shard_id) do
+    case replica_offer(name, shard_id) do
+      {:ok, offer} -> stream_replica(sock, name, shard_id, offer)
+      :none -> :gen_tcp.send(sock, Protocol.encode_reject(shard_id, :unknown_shard, 0))
+      {:error, _} -> :gen_tcp.send(sock, Protocol.encode_reject(shard_id, :internal, 0))
+    end
+  end
+
+  defp replica_offer(name, shard_id) do
+    with state when state != nil <- state_of(name, shard_id),
+         {:ok, header} <- Wal.read(wal_path(name, shard_id)),
+         {:ok, %{size: db_size}} <- File.stat(db_path(name, shard_id)) do
+      {:ok,
+       %{
+         epoch: state.epoch,
+         wal_gen: gen_of(header),
+         salt1: salt_of(header),
+         wal_size: size_of(header),
+         db_size: db_size,
+         header: header
+       }}
+    else
+      nil -> :none
+      {:error, :enoent} -> :none
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    ArgumentError -> :none
+  end
+
+  defp stream_replica(sock, name, shard_id, offer) do
+    begin = %Protocol.SeedBegin{
+      shard_id: shard_id,
+      epoch: offer.epoch,
+      wal_gen: offer.wal_gen,
+      salt1: offer.salt1,
+      wal_offset: offer.wal_size,
+      db_size: offer.db_size,
+      wal_size: offer.wal_size
+    }
+
+    with :ok <- :gen_tcp.send(sock, Protocol.encode_seed_begin(begin)),
+         :ok <- send_part(sock, shard_id, :db, db_path(name, shard_id), offer.db_size),
+         :ok <- send_part(sock, shard_id, :wal, wal_path(name, shard_id), offer.wal_size),
+         {:ok, after_} <- Wal.read(wal_path(name, shard_id)),
+         :ok <- stable?(offer.header, after_) do
+      :gen_tcp.send(sock, Protocol.encode_seed_end(shard_id))
+    else
+      other ->
+        Logger.warning("replication pull of #{shard_id} aborted: #{inspect(other)}")
+        # The asker is mid-stream, so the honest answer is the abort frame it already understands
+        # rather than silence — it drops the partial files and falls back to the stored object.
+        _ = :gen_tcp.send(sock, Protocol.encode_seed_abort(shard_id))
+        :ok
+    end
+  end
+
+  defp send_part(_sock, _shard_id, _part, _path, 0), do: :ok
+
+  defp send_part(sock, shard_id, part, path, size) do
+    case :file.open(path, [:read, :raw, :binary]) do
+      {:ok, fd} ->
+        try do
+          send_chunks(sock, shard_id, part, fd, 0, 0, size)
+        after
+          :file.close(fd)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp send_chunks(_sock, _shard_id, _part, _fd, offset, _seq, size) when offset >= size, do: :ok
+
+  defp send_chunks(sock, shard_id, part, fd, offset, seq, size) do
+    len = min(chunk_bytes(), size - offset)
+
+    case :file.pread(fd, offset, len) do
+      {:ok, bin} when byte_size(bin) == len ->
+        case :gen_tcp.send(sock, Protocol.encode_seed_chunk(shard_id, part, seq, bin)) do
+          :ok -> send_chunks(sock, shard_id, part, fd, offset + len, seq + 1, size)
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:ok, _short} ->
+        {:error, :short_read}
+
+      :eof ->
+        {:error, :short_read}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp chunk_bytes,
+    do: Application.get_env(:fathom, :replication_seed_chunk_bytes, 4 * 1024 * 1024)
+
+  defp gen_of(:empty), do: 0
+  defp gen_of(%{ckpt_seq: seq}), do: seq
+  defp salt_of(:empty), do: 0
+  defp salt_of(%{salt1: s}), do: s
+  defp size_of(:empty), do: 0
+  defp size_of(%{size: s}), do: s
+
+  defp stable?(:empty, :empty), do: :ok
+  defp stable?(%{ckpt_seq: g, salt1: s}, %{ckpt_seq: g, salt1: s}), do: :ok
+  defp stable?(_, _), do: {:error, :changed_during_pull}
+
+  # ------------------------------------------------------------------------------------------
   # streamed seeding
   # ------------------------------------------------------------------------------------------
   #
@@ -294,7 +438,9 @@ defmodule Fathom.Shard.Replication.Follower do
   # Nothing is acked until the install succeeds, so the primary never records a follower as holding
   # bytes it does not have.
 
-  defp begin_seed(name, seeds, %Protocol.SeedBegin{} = b) do
+  @doc false
+  @spec begin_seed(atom(), map(), Protocol.SeedBegin.t()) :: map()
+  def begin_seed(name, seeds, %Protocol.SeedBegin{} = b) do
     # A second `seed_begin` for a shard already streaming means the previous one will never
     # complete; drop its files rather than leak them.
     seeds = discard_seed(seeds, b.shard_id)
@@ -333,7 +479,9 @@ defmodule Fathom.Shard.Replication.Follower do
     ArgumentError -> Map.put(seeds, b.shard_id, %{name: name, failed: true})
   end
 
-  defp write_chunk(seeds, shard_id, part, seq, bytes) do
+  @doc false
+  @spec write_chunk(map(), String.t(), :db | :wal, non_neg_integer(), binary()) :: map()
+  def write_chunk(seeds, shard_id, part, seq, bytes) do
     case Map.get(seeds, shard_id) do
       nil -> seeds
       %{failed: true} -> seeds
@@ -382,13 +530,24 @@ defmodule Fathom.Shard.Replication.Follower do
     Map.put(state, :failed, true)
   end
 
-  defp finish_seed(name, seeds, shard_id) do
+  @doc """
+  Commit the seed accumulated for `shard_id`, returning `{result, seeds}`.
+
+  `{:ok, wal_offset}` or `{:error, reason}` rather than the encoded reply it used to return, so the
+  **pull** side can drive this same sink without a socket to answer on
+  (`Fathom.Shard.Replication.Recovery`). The install path is where a partial or transposed stream
+  turns into a corrupt tenant database, and a second copy of it written for the pull direction is
+  the kind of duplicate that stays subtly out of step until it matters.
+  """
+  @spec finish_seed(atom(), map(), String.t()) ::
+          {{:ok, non_neg_integer()} | {:error, term()}, map()}
+  def finish_seed(name, seeds, shard_id) do
     case Map.get(seeds, shard_id) do
       nil ->
-        {Protocol.encode_reject(shard_id, :internal, 0), seeds}
+        {{:error, :no_seed_in_flight}, seeds}
 
       %{failed: true} ->
-        {Protocol.encode_reject(shard_id, :internal, 0), discard_seed(seeds, shard_id)}
+        {{:error, :seed_failed}, discard_seed(seeds, shard_id)}
 
       %{db_written: db, db_size: db, wal_written: wal, wal_size: wal} = state ->
         {install(name, shard_id, state), Map.delete(seeds, shard_id)}
@@ -397,9 +556,17 @@ defmodule Fathom.Shard.Replication.Follower do
         # Declared sizes not met. The stream ended early — refuse rather than install a truncated
         # database, which would open cleanly and be missing pages.
         Logger.error("replication seed for #{shard_id} ended short of its declared size")
-        {Protocol.encode_reject(shard_id, :internal, 0), discard_seed(seeds, shard_id)}
+        {{:error, :short_stream}, discard_seed(seeds, shard_id)}
     end
   end
+
+  # The wire answer is unchanged: every failure above is still one opaque `:internal` reject. The
+  # sender cannot act differently on any of them — all of them mean "re-seed" — and naming the
+  # internal reason on the wire would only tell an unauthenticated peer about our filesystem.
+  defp encode_seed_result(shard_id, {:ok, offset}), do: Protocol.encode_ack(shard_id, offset)
+
+  defp encode_seed_result(shard_id, {:error, _}),
+    do: Protocol.encode_reject(shard_id, :internal, 0)
 
   # Install by rename, `-wal` cleared first.
   #
@@ -430,19 +597,23 @@ defmodule Fathom.Shard.Replication.Follower do
           "at gen #{state.wal_gen} offset #{state.wal_offset}"
       )
 
-      Protocol.encode_ack(shard_id, state.wal_offset)
+      {:ok, state.wal_offset}
     else
       {:error, reason} ->
         Logger.error("replication seed install failed for #{shard_id}: #{inspect(reason)}")
-        Protocol.encode_reject(shard_id, :internal, 0)
+        {:error, reason}
     end
   rescue
-    ArgumentError -> Protocol.encode_reject(shard_id, :internal, 0)
+    ArgumentError -> {:error, :follower_stopped}
   end
 
-  defp discard_seeds(seeds), do: Enum.reduce(Map.keys(seeds), seeds, &discard_seed(&2, &1))
+  @doc false
+  @spec discard_seeds(map()) :: map()
+  def discard_seeds(seeds), do: Enum.reduce(Map.keys(seeds), seeds, &discard_seed(&2, &1))
 
-  defp discard_seed(seeds, shard_id) do
+  @doc false
+  @spec discard_seed(map(), String.t()) :: map()
+  def discard_seed(seeds, shard_id) do
     case Map.pop(seeds, shard_id) do
       {nil, seeds} ->
         seeds

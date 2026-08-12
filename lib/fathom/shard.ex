@@ -68,6 +68,7 @@ defmodule Fathom.Shard do
 
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Promote
+  alias Fathom.Shard.Replication.Recovery
 
   @default_idle_ms 60_000
   @default_lease_ttl_ms 30_000
@@ -2247,9 +2248,46 @@ defmodule Fathom.Shard do
     end
   end
 
+  # TWO PATHS, and the split is about what a cold open is allowed to pay for.
+  #
+  # The local-only path checks ETS first and reaches the object store ONLY when this node actually
+  # holds a replica — so a node with promote-on-open enabled pays nothing extra on the vast
+  # majority of opens, which is why it was written that way and why it is kept bit-for-bit.
+  #
+  # The fleet path cannot be that lazy: deciding whether a PEER is worth asking requires the
+  # object's position first, so it costs one stamp read on every promote-eligible open plus a
+  # concurrent round trip to each peer. That is the price of closing the RPO gap on a failover the
+  # LB routed to a node holding no replica, and it is why `Recovery` is a separate gate rather than
+  # part of `:replication_promote_on_open`.
   defp try_promote(shard_id, path, lease, etag) do
+    if Recovery.enabled?() do
+      try_promote_from_fleet(shard_id, path, lease, etag)
+    else
+      try_promote_local(shard_id, path, lease, etag)
+    end
+  end
+
+  defp try_promote_local(shard_id, path, lease, etag) do
     with replica when replica != nil <- replica_state(shard_id),
          {:ok, stamp} <- Storage.object_position(shard_id),
+         true <- Promote.fresher?(replica, stamp) do
+      promote_replica(shard_id, path, lease, etag, replica, stamp)
+    else
+      _ -> etag
+    end
+  end
+
+  # `Recovery.best_replica/3` re-checks this node's own replica and short-circuits the network when
+  # it already wins, so there is one call here rather than a local branch and a fleet branch that
+  # could drift apart on what "fresher" means.
+  #
+  # `fresher?` is asserted again afterwards even though `Recovery` only ever returns a replica that
+  # passed it. It is one comparison on a path that ends in overwriting a tenant's stored database,
+  # and the alternative is trusting a promise made by a different module about bytes that arrived
+  # over an unauthenticated socket.
+  defp try_promote_from_fleet(shard_id, path, lease, etag) do
+    with {:ok, stamp} <- Storage.object_position(shard_id),
+         {:ok, replica} <- Recovery.best_replica(shard_id, stamp),
          true <- Promote.fresher?(replica, stamp) do
       promote_replica(shard_id, path, lease, etag, replica, stamp)
     else

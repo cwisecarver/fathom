@@ -85,6 +85,50 @@ defmodule Fathom.Shard.ReplicationTest do
       bad = <<Protocol.version() + 1::8, 1::8, 0::16, 0::64, 0::64, 0::64>>
       assert {:error, :unsupported_version} = Protocol.decode(bad)
     end
+
+    test "a position query and its answer round-trip" do
+      assert {:ok, {:position_query, "acme"}} =
+               "acme"
+               |> Protocol.encode_position_query()
+               |> IO.iodata_to_binary()
+               |> Protocol.decode()
+
+      pos = %{epoch: 9, wal_gen: 4, salt1: 123_456, next_offset: 8240}
+
+      assert {:ok, {:position, "acme", ^pos}} =
+               "acme"
+               |> Protocol.encode_position(pos)
+               |> IO.iodata_to_binary()
+               |> Protocol.decode()
+    end
+
+    test "'I hold nothing' is distinguishable from 'I am at the beginning'" do
+      # THE WHOLE REASON `have` IS A FLAG BYTE. A follower recovered from its files reports epoch 0
+      # by design, and a freshly seeded shard with an empty WAL sits at offset 0 — so {0,0,0} is a
+      # real position a real node can hold. Collapsing "nothing" into it would let a node with no
+      # copy at all win a comparison and be pulled from.
+      assert {:ok, {:position, "acme", nil}} =
+               "acme"
+               |> Protocol.encode_position(nil)
+               |> IO.iodata_to_binary()
+               |> Protocol.decode()
+
+      zero = %{epoch: 0, wal_gen: 0, salt1: 0, next_offset: 0}
+
+      assert {:ok, {:position, "acme", ^zero}} =
+               "acme"
+               |> Protocol.encode_position(zero)
+               |> IO.iodata_to_binary()
+               |> Protocol.decode()
+    end
+
+    test "a replica request round-trips" do
+      assert {:ok, {:replica_request, "acme"}} =
+               "acme"
+               |> Protocol.encode_replica_request()
+               |> IO.iodata_to_binary()
+               |> Protocol.decode()
+    end
   end
 
   describe "FollowerLog — the corruption guards" do

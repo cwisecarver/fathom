@@ -53,6 +53,24 @@ defmodule Fathom.Shard.Replication.Protocol do
   @seed_end 7
   @seed_abort 8
 
+  # SURVIVOR SELECTION (2026-08-12). The three above move bytes from a primary to its followers;
+  # these two run in the opposite direction, from a node that is *becoming* a primary back to the
+  # nodes that were following the dead one. See `Fathom.Shard.Replication.Recovery`.
+  #
+  # DELIBERATELY ADDED AT `@version 2` RATHER THAN BUMPING TO 3. They are purely additive — new
+  # type codes, no existing frame's layout changes — and the cost of the two options is not
+  # symmetric. A version bump makes `decode/1` refuse EVERY frame from a node one deploy behind,
+  # which takes the commit path down fleet-wide for the length of a rolling upgrade. Leaving the
+  # version alone means an old peer answers a `position_query` with `{:error, :malformed}` and
+  # closes that one socket — and `Recovery` already treats an unanswered query as "no offer" and
+  # falls back to the stored object, which is the behaviour it promises anyway. The querier always
+  # dials its own short-lived connection rather than borrowing a `Shipper`'s, so that close costs
+  # nothing else. Loud-versus-quiet was the reason v2 bumped; here both options are loud and only
+  # one of them also breaks replication.
+  @position_query 9
+  @position 10
+  @replica_request 11
+
   # Which file a chunk belongs to. Explicit rather than splitting one byte stream at `db_size`,
   # so a chunk never straddles the boundary and the follower can assert it received exactly the
   # promised number of database bytes before the first WAL byte.
@@ -216,6 +234,59 @@ defmodule Fathom.Shard.Replication.Protocol do
   end
 
   @doc """
+  Ask a peer how far along its replica of `shard_id` is.
+
+  The question a failover cannot otherwise answer. The LB picks a survivor by consistent hash, not
+  by who holds the freshest copy, so the node that takes the shard may hold no replica at all while
+  three of its peers hold a current one. Answering it needs no BEAM cluster and no new transport —
+  it is one request/response on the port A2 already opened.
+  """
+  @spec encode_position_query(String.t()) :: iodata()
+  def encode_position_query(shard_id) do
+    [<<@version::8, @position_query::8, byte_size(shard_id)::16>>, shard_id]
+  end
+
+  @doc """
+  Answer with `{epoch, wal_gen, offset}`, or with "I hold nothing for that shard".
+
+  The `have` flag is a byte rather than an all-zeros position, because a replica legitimately sits
+  at `{0, 0, 0}` — a follower recovered from its files reports epoch 0 by design
+  (`Follower.recover/3`) and a freshly-seeded shard with an empty WAL sits at offset 0. Collapsing
+  "nothing" into "the beginning" would let a node with no copy at all win a comparison against an
+  unstamped object.
+  """
+  @spec encode_position(String.t(), map() | nil) :: iodata()
+  def encode_position(shard_id, nil) do
+    [
+      <<@version::8, @position::8, 0::8, byte_size(shard_id)::16, 0::64, 0::64, 0::64, 0::64>>,
+      shard_id
+    ]
+  end
+
+  def encode_position(shard_id, %{} = pos) do
+    [
+      <<@version::8, @position::8, 1::8, byte_size(shard_id)::16, pos.epoch::64, pos.wal_gen::64,
+        pos.salt1::64, pos.next_offset::64>>,
+      shard_id
+    ]
+  end
+
+  @doc """
+  Ask a peer to stream its replica of `shard_id` back.
+
+  The reply is the ordinary streamed seed — `seed_begin` + chunks + `seed_end` — sent in the
+  direction opposite to the one it was designed for, which is the whole trick. Nothing new has to
+  learn how to install a base copy: the receiver drives `Follower`'s existing sink, so a pulled
+  replica lands in exactly the state a pushed one would, and `Promote` cannot tell them apart.
+
+  A peer holding nothing answers `reject(shard_id, :unknown_shard, 0)`.
+  """
+  @spec encode_replica_request(String.t()) :: iodata()
+  def encode_replica_request(shard_id) do
+    [<<@version::8, @replica_request::8, byte_size(shard_id)::16>>, shard_id]
+  end
+
+  @doc """
   Decode any message. Returns `{:error, :malformed}` rather than raising: bytes arriving on a
   socket are the one input that is never under our control, and a crash here would take down a
   connection the supervisor would then rebuild into the same crash.
@@ -227,6 +298,8 @@ defmodule Fathom.Shard.Replication.Protocol do
           | {:ok, {:seed_end | :seed_abort, String.t()}}
           | {:ok, {:ack, String.t(), non_neg_integer()}}
           | {:ok, {:reject, String.t(), atom(), non_neg_integer()}}
+          | {:ok, {:position_query | :replica_request, String.t()}}
+          | {:ok, {:position, String.t(), map() | nil}}
           | {:error, :malformed | :unsupported_version}
   def decode(
         <<@version::8, @push::8, slen::16, epoch::64, gen::64, salt::64, off::64, rest::binary>>
@@ -282,6 +355,28 @@ defmodule Fathom.Shard.Replication.Protocol do
   def decode(<<@version::8, @reject::8, code::8, slen::16, exp::64, shard::binary-size(slen)>>)
       when is_map_key(@reasons, code) do
     {:ok, {:reject, shard, @reasons[code], exp}}
+  end
+
+  def decode(<<@version::8, @position_query::8, slen::16, shard::binary-size(slen)>>) do
+    {:ok, {:position_query, shard}}
+  end
+
+  def decode(
+        <<@version::8, @position::8, 1::8, slen::16, epoch::64, gen::64, salt::64, off::64,
+          shard::binary-size(slen)>>
+      ) do
+    {:ok, {:position, shard, %{epoch: epoch, wal_gen: gen, salt1: salt, next_offset: off}}}
+  end
+
+  def decode(
+        <<@version::8, @position::8, 0::8, slen::16, _e::64, _g::64, _s::64, _o::64,
+          shard::binary-size(slen)>>
+      ) do
+    {:ok, {:position, shard, nil}}
+  end
+
+  def decode(<<@version::8, @replica_request::8, slen::16, shard::binary-size(slen)>>) do
+    {:ok, {:replica_request, shard}}
   end
 
   # A version mismatch is worth distinguishing from garbage: it is the signal for a rolling

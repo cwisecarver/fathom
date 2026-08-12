@@ -117,6 +117,17 @@ defmodule Fathom.Telemetry do
           "Cold opens that promoted a newer local replica over the stored object (A2). Each one " <>
             "recovered writes the last flush did not have, and snapshotted what it replaced"
       ),
+      # NO `source` TAG, though the event carries one. A node_key is bounded by fleet size today
+      # and would be a legitimate label — but the number an operator acts on is "did any shard have
+      # to reach across the fleet to recover", and splitting it by source only makes the alert
+      # threshold depend on which node died. The source rides the event metadata and the log line.
+      counter("fathom.replication.recovered_from_peer.count",
+        event_name: [:fathom, :replication, :recovered_from_peer],
+        description:
+          "Cold opens that pulled a fresher replica from a PEER because this node held none (A2 " <>
+            "survivor selection). Each one is a failover where the LB picked a node without a " <>
+            "replica and the write tail was recovered anyway — the RPO claim doing its job"
+      ),
       counter("fathom.shards.at_capacity.count",
         event_name: [:fathom, :shards, :at_capacity],
         description:

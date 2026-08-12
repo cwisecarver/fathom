@@ -4,8 +4,15 @@
 2026-08-08; both decision gates cleared the same day; the transport, commit path, seeding and
 promotion built 2026-08-08/09; **proven end to end multi-node 2026-08-11** — `chaos.sh smoke`
 passes with `REPLICATION_ENABLED=true` (five tenants, every write quorum-replicated, cross-shard
-isolation intact). Supersedes the one-paragraph deferral in
-[phase2-scoping](phase2-scoping.md) §A2.
+isolation intact); **survivor selection built 2026-08-12**, which is what makes the node-loss RPO
+claim hold when the LB fails over to a node holding no replica — until then it held only when the
+survivor happened to have one, and the rig measured an acked write lost while three peers held it.
+Supersedes the one-paragraph deferral in [phase2-scoping](phase2-scoping.md) §A2.
+
+**Not yet proven on the rig.** The suite covers the decision and the wire; the scenario that would
+demonstrate it end to end has to kill a node with **no flush interval in between**, which
+`chaos.sh failover` deliberately does not do (it waits one flush, so the write it checks is already
+in S3). Designing that scenario is the open work — see [tasks/todo.md](../tasks/todo.md).
 
 The blocker section below is kept as written, because the thing it describes as blocking is exactly
 what turned out not to — see the gate-1 note in [Decision gate](#decision-gate). The header used to
@@ -25,11 +32,72 @@ deleting it.
 | Promotion | `Replication.Promote` | Wired into cold open behind `REPLICATION_PROMOTE_ON_OPEN`. |
 | Receive half | `Replication.Follower` | Supervised by `Fleet` behind `REPLICATION_LISTEN`. |
 | Membership | `Replication.Membership` | Static list **or** the fleet roster, behind one guarded swap. |
+| Survivor selection | `Replication.Recovery` | Ask peers → choose → pull, behind `REPLICATION_RECOVER_FROM_PEERS`. |
 
 **Not built:** per-shard follower sets, and zone-aware placement. The RTT sweep makes placement an
 82× lever, which makes it an operator-intent decision rather than one to infer — see
 [Replication factor](#replication-factor-n-vs-ack-threshold-q--do-not-set-q--n). Operator config is
 [configuration.md](configuration.md#quorum-replication-phase-2-a2--off-by-default).
+
+### The RPO claim was conditional until 2026-08-12, and survivor selection is why
+
+Recorded before the mechanism, because the shape of this miss is the useful part: **every component
+worked and the guarantee still did not hold.** Frames shipped, quorums acked, promotion promoted.
+What was missing was a single edge in the graph — nothing connected *which node holds a current
+replica* to *which node the LB fails over to*.
+
+The LB partitions the keyspace by consistent hash on the Host subdomain
+([cluster-architecture](cluster-architecture.md)). That function knows about subdomains and node
+counts; it knows nothing about replication. So the survivor it picks holds a current replica only by
+coincidence — and when it does not, promote-on-open finds nothing local, the shard cold-opens from
+S3, and the tail is gone. Measured on the rig 2026-08-11: an acked, quorum-replicated write **lost
+while three other nodes held it**. Replication was not broken. Recovery was reading the wrong copy.
+
+The fix is the one Waterpark already describes — *the replacement asks the followers and adopts the
+state of the best reader* — and it needs **no BEAM cluster and no mailroom**. That rejection (see
+[The architectural cost](#the-architectural-cost)) was about moving *streams*, because Hrana batons
+are entry-node-local; this moves *bytes*, over the socket A2 already opened.
+
+Four steps, and only one of them is new:
+
+| step | mechanism |
+|---|---|
+| **Ask** every peer where its replica sits | `position_query` / `position` — new frames |
+| **Choose** the best copy | `Promote.fresher?/2`, unchanged |
+| **Pull** it | `seed_begin`/`seed_chunk`/`seed_end`, **in reverse** |
+| **Publish** it | `Fathom.Shard`'s promote path, unchanged |
+
+The pulled bytes are installed through `Follower`'s **own seed sink**, so they land in the replica
+directory and the ETS row exactly as a pushed seed would. That is what lets the promote path stay
+untouched: it cannot tell a pulled replica from one this node had been following all along, so there
+is no second provenance story to get wrong.
+
+**Safer than Waterpark's version in the one direction that matters.** Waterpark is RAM-only, so the
+best reader is the *only* copy and is adopted whatever it says. Fathom has the stored object
+underneath, so a peer is adopted only when it is **provably ahead of that object** — the same
+`fresher?` test, with the same rules (`>` not `>=`; an unstamped object is never overridable; every
+uncertain answer is `false`). When no peer can prove it, the open degrades to exactly the pre-A2
+behaviour. There is no state in which this serves older bytes than leaving it off.
+
+Two things it costs, both deliberate, which is why it is a **separate gate** rather than part of
+`REPLICATION_PROMOTE_ON_OPEN`:
+
+- one object-position read on every promote-eligible open (the local-only path reaches the object
+  store only when this node actually holds a replica, and is kept bit-for-bit for that reason);
+- one round trip to each peer, **concurrent** so it is one round trip and not N, bounded by
+  `REPLICATION_RECOVERY_TIMEOUT_MS`. A node already holding the freshest copy short-circuits before
+  opening a socket.
+
+**The new frames were added at `@version 2` rather than bumping to 3**, which reverses the reasoning
+the salt1 change used. They are purely additive, and the two options are not symmetric: a bump makes
+`decode/1` refuse *every* frame from a node one deploy behind, taking the commit path down
+fleet-wide for the length of a rolling upgrade. Leaving the version alone means an old peer answers
+a query with `{:error, :malformed}` and closes that one short-lived socket, which `Recovery` already
+treats as "no offer". Both are loud; only one also breaks replication.
+
+**Still conditional on one thing:** the recovering node must have `REPLICATION_LISTEN` on, since the
+pull installs through its local replica directory. That matches the documented rollout order, and a
+node that cannot hold a replica could not be a useful survivor for anyone else either.
 
 ### The receive half was missing entirely until 2026-08-10
 
@@ -119,6 +187,11 @@ reads the dead node's disk; there is no re-attach path. So every write since the
 Putting `:shard_data_dir` on EBS (see [deploy-cluster](deploy-cluster.md#node-disk-aws)) removes the
 *common* case: a reboot re-adopts its own local file and loses nothing. It cannot remove this one,
 because the volume is single-attach and AZ-locked and the survivor is elsewhere.
+
+Note the shape of that sentence — *"the survivor is elsewhere."* Replicating the frames is only half
+an answer to it, because the survivor being elsewhere is also why it may hold no replica of its own.
+Closing the gap takes **both** `REPLICATION_PROMOTE_ON_OPEN` and `REPLICATION_RECOVER_FROM_PEERS`;
+see [survivor selection](#the-rpo-claim-was-conditional-until-2026-08-12-and-survivor-selection-is-why).
 
 ## Why not resolve the conflict instead (CRDT / OT)
 

@@ -564,6 +564,42 @@ if System.get_env("REPLICATION_PROMOTE_ON_OPEN") in ~w(true 1) do
   config :fathom, :replication_promote_on_open, true
 end
 
+# SURVIVOR SELECTION. Requires REPLICATION_PROMOTE_ON_OPEN, and completes it.
+#
+# Promote-on-open serves a fresher replica when the node taking the shard over happens to hold one.
+# The LB fails over by consistent hash on the Host subdomain, which knows nothing about
+# replication, so "happens to" is doing real work there: measured on the rig, an acked
+# quorum-replicated write was LOST while three other nodes held it. With this on, a cold open asks
+# every peer where its replica sits, adopts the best one that is provably ahead of the stored
+# object, and pulls it over A2's own socket.
+#
+# COSTS ON THE COLD-OPEN PATH, which is why it is separate from the gate above: one object-position
+# read on every promote-eligible open plus one concurrent round trip to each peer (bounded by
+# REPLICATION_RECOVERY_TIMEOUT_MS), and a whole-database transfer when a peer wins. A node that
+# already holds the freshest copy short-circuits before touching the network.
+#
+# Fails toward the stored object in every uncertain case — an unreachable fleet, a peer one deploy
+# behind, an unstamped object — so there is no state in which it serves older bytes than leaving it
+# off would. It also needs REPLICATION_LISTEN on this node: the pull installs through the local
+# follower's replica directory.
+if System.get_env("REPLICATION_RECOVER_FROM_PEERS") in ~w(true 1) do
+  config :fathom, :replication_recover_from_peers, true
+end
+
+# How long a cold open waits for peers to answer "where is your replica?". All peers are asked at
+# once, so this is one round trip's budget, not N. Default 2000 ms — deliberately short: a peer
+# that cannot answer in that time is one whose replica we would rather not wait to transfer either,
+# and the fallback is the stored object.
+if ms = env_int.("REPLICATION_RECOVERY_TIMEOUT_MS") do
+  config :fathom, :replication_recovery_timeout_ms, ms
+end
+
+# Budget for transferring a winning peer's replica. Default 60000 ms. This one is a whole tenant
+# database over the network, so it is sized like a seed rather than like a query.
+if ms = env_int.("REPLICATION_RECOVERY_PULL_TIMEOUT_MS") do
+  config :fathom, :replication_recovery_pull_timeout_ms, ms
+end
+
 # Bytes per frame when seeding a follower's base copy. Bounds MEMORY on both sides (a seed is a
 # whole database); it does not bound head-of-line blocking, since one socket per follower node
 # carries every shard. Default 4 MiB.
