@@ -289,6 +289,48 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     assert :ok = Session.commit(id, wal, coordinator)
   end
 
+  # A RESTARTED FOLLOWER MUST NOT RE-SEED. Its per-shard state is ETS and dies with the process;
+  # the replicas on disk do not. Before boot recovery, a node that restarted held a full copy of
+  # every shard it followed and did not know it — `state_of/2` returned nil, so every push was
+  # refused `:unknown_shard` and the primary re-sent an entire DATABASE per shard. At any real
+  # follower count that is a re-seed storm after every deploy, and `Promote` would not promote from
+  # bytes sitting right there (it checks `state_of/2` first), which is how a survivor that had
+  # restarted lost an acked write on the chaos rig.
+  test "a follower that restarts recovers its position from the files, without a re-seed", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 2)
+    [{name, _port} | _] = followers
+    dir = Path.join(root, to_string(name))
+    enable!(followers, 1)
+
+    # Drive one real seed + commit so the follower holds genuine bytes.
+    {coordinator, conn, path} = open_shard!(id)
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+    Session.commit(id, path <> "-wal", coordinator)
+    await_seeded(name, id, fn -> Session.commit(id, path <> "-wal", coordinator) end)
+
+    before = Follower.state_of(name, id)
+    assert before, "the fixture never seeded; this test would prove nothing"
+
+    # Restart it on the SAME directory — a deploy, not a fresh node.
+    stop_supervised!(name)
+    pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: :"#{name}_again")
+    _ = :sys.get_state(pid)
+
+    after_restart = Follower.state_of(name, id)
+
+    assert after_restart,
+           "the follower forgot #{id} across a restart while still holding its files — every " <>
+             "push will be refused :unknown_shard and re-seed a whole database"
+
+    # Position must match the FILES, which is what makes it safe to trust.
+    {:ok, hdr} = Wal.read(Follower.wal_path(name, id))
+    assert after_restart.next_offset == hdr.size
+    assert after_restart.wal_gen == hdr.ckpt_seq
+    assert after_restart.salt1 == hdr.salt1
+  end
+
   test "an unseeded follower is seeded automatically, then replicates", ctx do
     %{id: id, root: root} = ctx
     followers = start_followers!(root, 3)

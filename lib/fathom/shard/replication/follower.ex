@@ -40,6 +40,7 @@ defmodule Fathom.Shard.Replication.Follower do
   require Logger
 
   alias Fathom.Shard.Replication.FollowerLog
+  alias Fathom.Shard.Replication.Wal
   alias Fathom.Shard.Replication.Protocol
 
   # ------------------------------------------------------------------------------------------
@@ -172,6 +173,7 @@ defmodule Fathom.Shard.Replication.Follower do
       ])
 
     :ets.insert(tab, {:__dir__, dir})
+    recover(tab, name, dir)
 
     # `ip:` is a security control, not tuning. This socket takes raw WAL frames for a tenant's
     # database and the protocol has NO authentication — whoever reaches the port can write into
@@ -481,6 +483,58 @@ defmodule Fathom.Shard.Replication.Follower do
     ArgumentError ->
       Logger.warning("replication follower is shutting down; refusing #{push.shard_id}")
       Protocol.encode_reject(push.shard_id, :internal, 0)
+  end
+
+  # REBUILD THE PER-SHARD STATE FROM THE FILES ON BOOT.
+  #
+  # This table is ETS, so it dies with the process while the replicas on disk do not. A restarted
+  # node therefore held a full copy of every shard it followed and did not know it: `state_of/2`
+  # returned nil, so every push was refused `:unknown_shard` and the primary re-sent an entire
+  # DATABASE per shard, and `Promote` — which checks `state_of/2` first — would not promote from
+  # bytes sitting right there. At any real follower count that is a re-seed storm after every
+  # deploy.
+  #
+  # THE FILES ARE THE SOURCE OF TRUTH, deliberately, rather than a sidecar counter. Frames are
+  # applied with `:file.write` in APPEND mode, so a persisted offset that lagged the file by even
+  # one frame would make the primary re-send a range the follower then appends a SECOND time —
+  # silent duplication inside the WAL. A WAL header cannot disagree with its own file that way:
+  # `Wal.read/1` reports `ckpt_seq`, `salt1` and `size`, which are exactly `wal_gen`, `salt1` and
+  # `next_offset`.
+  #
+  # EPOCH IS RECOVERED AS 0, deliberately low. It is the primary's lease epoch and appears nowhere
+  # on disk. Guessing high would make this node reject the real primary as `:stale_epoch` and stall
+  # the shard until the epoch caught up; guessing low costs exactly one round trip — the first push
+  # is `pushed > epoch`, which routes to `decide_fresh`, which rejects a non-zero offset asking for
+  # 0, and the primary answers with `{:reset, 0, _}`. That re-sends the current WAL, not the
+  # database, and is what "cheap and self-correcting" looks like next to a full re-seed.
+  #
+  # A shard whose WAL cannot be read is simply not recovered: it stays unknown and gets a normal
+  # seed. Skipping is always safe here; claiming bytes we cannot verify is not.
+  defp recover(tab, name, dir) do
+    recovered =
+      dir
+      |> File.ls()
+      |> case do
+        {:ok, entries} -> entries
+        {:error, _} -> []
+      end
+      |> Enum.filter(&String.ends_with?(&1, ".db"))
+      |> Enum.map(&String.replace_suffix(&1, ".db", ""))
+      |> Enum.count(fn shard_id -> recover_shard(tab, name, shard_id) end)
+
+    if recovered > 0 do
+      Logger.info("replication follower recovered #{recovered} shard(s) from #{dir}")
+    end
+  end
+
+  defp recover_shard(tab, name, shard_id) do
+    with {:ok, %{ckpt_seq: gen, salt1: salt, size: size}} <- Wal.read(wal_path(name, shard_id)),
+         true <- File.exists?(db_path(name, shard_id)) do
+      :ets.insert(tab, {shard_id, FollowerLog.seeded(0, gen, salt, size)})
+      true
+    else
+      _ -> false
+    end
   end
 
   defp do_handle_push(name, %Protocol.Push{} = push) do
