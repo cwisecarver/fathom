@@ -85,9 +85,14 @@ defmodule Fathom.ShardStorageS3Test do
 
   # ── pull / flush ──
 
-  test "pull on a missing object returns :ok and writes no file", %{shard: shard} do
+  # This asserted `{:ok, _}` until 2026-08-12. Expert review 2026-08-01 #24 deliberately split
+  # `{:absent, etag}` out of `{:ok, etag}`, because collapsing them told every caller "bytes are at
+  # local_path" when none were, and the pull-then-open consumers duly opened the missing path —
+  # which CREATES an empty database. The test kept the old contract for eleven days because the
+  # `:s3` suite is excluded from `mix test` AND from CI, so nothing ever ran it.
+  test "pull on a missing object returns :absent and writes no file", %{shard: shard} do
     local = tmp_path(shard)
-    assert {:ok, _} = S3.pull(shard, local)
+    assert {:absent, nil} = S3.pull(shard, local)
     refute File.exists?(local)
   end
 
@@ -371,6 +376,90 @@ defmodule Fathom.ShardStorageS3Test do
            "the superseded owner must never re-validate as the holder"
   end
 
+  # ── the position stamp must survive a REAL takeover touch ──
+
+  # THE bug found on the rig 2026-08-12, and the only place it can be pinned.
+  #
+  # A steal touches the data object (server-side self-copy) to rotate its etag, which fences the
+  # deposed node's `If-Match` flush. S3 requires the REPLACE metadata directive for that copy, and
+  # **REPLACE drops every user metadata header unless the copy re-sends it.** The touch re-sent one
+  # key (the integrity md5); `x-amz-meta-fathom-pos` was added later for A2 and never added to the
+  # list, so every takeover silently ERASED the position stamp — and an unstamped object is never
+  # overridable by design. promote-on-open and survivor selection therefore went inert at exactly
+  # the moment they exist for, with no error and no log line.
+  #
+  # `shard_storage_touch_meta_test.exs` pins the LIST `carry_meta/1` returns. It cannot pin the
+  # BEHAVIOUR, because "REPLACE drops user metadata" is a property only a real store has:
+  # `Storage.Local` and `Fathom.Test.FaultyStorage` both keep their metadata map across a touch,
+  # which is why the default suite could never have seen this. That is what this test is for.
+  #
+  # It drives the PRODUCTION path — `acquire_lease` on an expired lock — not `touch_object` directly,
+  # so it also proves the steal actually reaches the touch.
+  test "the position stamp survives a takeover touch, in BOTH etag-rotation forms",
+       %{shard: shard} = ctx do
+    src = tmp_path("#{shard}-src")
+    File.write!(src, "the tenant's bytes\n")
+
+    position = %{epoch: 3, wal_gen: 1, offset: 8272}
+    assert {:ok, etag0} = S3.flush(shard, src, nil, position)
+
+    # Precondition: the stamp is really on the object before any steal. Without this the whole
+    # test could pass by never having written a stamp at all.
+    assert {:ok, ^position} = S3.object_position(shard),
+           "the fixture never stamped the object, so it can prove nothing about the touch"
+
+    refute multipart_form?(etag0), "a plain PUT should yield a single-form (MD5) etag"
+
+    # ── steal 1: single-form etag ⇒ rotate_etag takes the MULTIPART copy branch.
+    md5_before = meta_header(ctx, shard, "x-amz-meta-fathom-md5")
+    assert {:ok, %{owner: "b@node", epoch: 6}} = steal(ctx, shard, "a@node", 5, "b@node")
+
+    {:ok, etag1} = S3.object_etag(shard)
+    assert etag1 != etag0, "the touch did not rotate the etag — the steal never reached it"
+    assert multipart_form?(etag1), "expected the multipart-copy branch to have run"
+
+    assert {:ok, ^position} = S3.object_position(shard),
+           "the takeover ERASED the position stamp — every A2 recovery path is inert"
+
+    assert meta_header(ctx, shard, "x-amz-meta-fathom-md5") == md5_before,
+           "the touch dropped the integrity md5 as well"
+
+    # ── steal 2: the object now carries a multipart-form etag ⇒ the SINGLE-copy branch, which is
+    # a separate REPLACE call with its own headers list and can regress independently.
+    assert {:ok, %{owner: "c@node", epoch: 8}} = steal(ctx, shard, "b@node", 7, "c@node")
+
+    {:ok, etag2} = S3.object_etag(shard)
+    assert etag2 != etag1, "the second touch did not rotate the etag"
+    refute multipart_form?(etag2), "expected the single-copy branch to have run"
+
+    assert {:ok, ^position} = S3.object_position(shard),
+           "the single-copy touch ERASED the position stamp"
+
+    assert meta_header(ctx, shard, "x-amz-meta-fathom-md5") == md5_before
+
+    # A touch is a self-copy: the tenant's bytes must be untouched by all of it.
+    dst = tmp_path("#{shard}-dst")
+    assert {:ok, _} = S3.pull(shard, dst)
+    assert File.read!(dst) == "the tenant's bytes\n"
+  end
+
+  # An object flushed before A2 shipped carries no stamp, and a touch must NOT fabricate one:
+  # a stamp claims an ordering, and inventing "0:0:0" would let any replica claim to be ahead of
+  # an object nobody ever positioned.
+  test "a takeover touch does not invent a position stamp on an unstamped object",
+       %{shard: shard} = ctx do
+    src = tmp_path("#{shard}-src")
+    File.write!(src, "legacy object, no stamp\n")
+
+    assert :ok = S3.flush(shard, src)
+    assert {:ok, nil} = S3.object_position(shard)
+
+    assert {:ok, %{owner: "b@node"}} = steal(ctx, shard, "a@node", 2, "b@node")
+
+    assert {:ok, nil} = S3.object_position(shard),
+           "the touch fabricated a position stamp for an object that never had one"
+  end
+
   # ── the fence depends on this: the store must enforce conditional writes ──
 
   test "the store enforces If-None-Match and If-Match conditional PUTs", ctx do
@@ -541,6 +630,30 @@ defmodule Fathom.ShardStorageS3Test do
     case headers["etag"] do
       [value | _] -> value
       value when is_binary(value) -> value
+    end
+  end
+
+  # Stage `dead_owner`'s lock as expired past the steal margin, then take it as `new_owner` —
+  # the production takeover path, whose steal branch is what invokes the object touch.
+  defp steal(ctx, shard, dead_owner, epoch, new_owner) do
+    stale_by = Fathom.Shard.Storage.steal_margin_ms() + 5_000
+    put_raw_lock(ctx, shard, dead_owner, epoch, now_ms() - stale_by)
+    S3.acquire_lease(shard, new_owner, 60_000)
+  end
+
+  # `rotate_etag/3` branches on this: a multipart-form etag (`<hash>-<n>`) takes the single-copy
+  # touch, a single-form one takes the multipart-copy touch. Reading it here is how the test knows
+  # WHICH branch it just exercised, rather than assuming.
+  defp multipart_form?(etag), do: etag |> String.trim(~s(")) |> String.contains?("-")
+
+  # One user metadata header off a live HEAD of the shard's data object.
+  defp meta_header(ctx, shard, name) do
+    %{status: 200, headers: headers} =
+      Req.head!(signed_req(ctx), url: object_url(ctx, shard <> ".db"))
+
+    case headers[name] do
+      [v | _] -> v
+      v -> v
     end
   end
 end
