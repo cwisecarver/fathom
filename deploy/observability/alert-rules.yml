@@ -415,6 +415,33 @@ groups:
           description: "Durability is about to stop on this node: pulls and VACUUM INTO will fail while writes are still acked. Free space or drain the node NOW."
           runbook: docs/runbooks/operations.md#runbook-node-disk-full-shard_data_dir
 
+      - alert: FathomReplicationNoQuorumSlack
+        # Phase 2 A2. Connected followers == the write quorum exactly: every commit still
+        # succeeds, and losing one more follower fails every write on this node with
+        # 503 FILO_NO_QUORUM. Deliberately a page rather than a ticket, because the state has no
+        # other symptom — latency is normal, no error rate moves, and nothing degrades until it
+        # all does at once. Inert unless REPLICATION_ENABLED (the gauge is not emitted otherwise).
+        expr: fathom_replication_followers_slack == 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "Replication on {{ $labels.node }} has zero quorum slack"
+          description: "Connected followers equals :replication_quorum. Writes succeed now; one more follower loss fails all of them. Check fathom_replication_followers_connected against _configured and bring the missing follower back before anything else."
+          runbook: docs/a2-quorum-replication.md
+
+      - alert: FathomReplicationWritesFailing
+        # Slack is negative: fewer followers connected than the quorum needs, so commits are
+        # already returning 503 FILO_NO_QUORUM. The write is durable locally and will reach S3 on
+        # the next flush — the tenant is being told the truth, that it did not get the
+        # quorum-durable write it asked for.
+        expr: fathom_replication_followers_slack < 0
+        for: 1m
+        labels: {severity: page}
+        annotations:
+          summary: "Replication quorum unreachable on {{ $labels.node }} — writes failing"
+          description: "Fewer followers connected than :replication_quorum, so tenant commits are failing with FILO_NO_QUORUM. Writes that did land are durable locally and reach S3 on the next flush; the RPO~0 guarantee is what is lost."
+          runbook: docs/a2-quorum-replication.md
+
       - alert: FathomWarmCacheDiskPressure
         # The follower declined to warm new shards because the volume is below the free floor.
         # Not itself an outage — failover readiness is degrading, and the disk is the cause.

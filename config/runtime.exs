@@ -495,6 +495,196 @@ if n = env_int.("WARM_REFRESH_BYTES_PER_S") do
   config :fathom, :warm_refresh_bytes_per_s, n
 end
 
+# ---- Quorum replication (Phase 2 A2) ------------------------------------------------------
+# Off by default, like every other Phase 2 component. Until this section existed A2 had NO
+# runtime gate at all — every knob was reachable only from `Application.put_env` in tests, so the
+# feature was unshippable regardless of how finished the code was.
+#
+# READ docs/a2-quorum-replication.md BEFORE enabling. Turning this on puts a network round trip
+# inside every tenant COMMIT, and the measured cost is dominated by WHERE the followers are, not
+# how many: with two near and two far, a quorum acks in ~1.6 ms while all-N pays 134 ms on the
+# same replicas. Placement is the decision; replica count is not.
+if System.get_env("REPLICATION_ENABLED") in ~w(true 1) do
+  config :fathom, :replication_enabled, true
+end
+
+# The follower set, as `node_key@host:port` pairs, e.g.
+# REPLICATION_FOLLOWERS="fathom2@10.0.1.2:9100,fathom3@10.0.2.3:9100".
+#
+# `node_key` matches `Fathom.Rebalancer.node_key/0` (NODE_KEY) so a follower is identifiable in
+# logs, telemetry and `Fleet.health/0` rather than an anonymous address.
+#
+# ORDER AND LOCALITY ARE A LATENCY DECISION. A quorum skips the SLOWEST replicas, so it buys
+# nothing unless a quorum's worth are near: measured 2-of-4 tracked 4-of-4 exactly at every
+# latency when all four sat at the same distance. With Q=2 that means TWO near followers, and
+# they should be in a nearby but DIFFERENT AZ — two in the primary's own AZ means one AZ failure
+# takes three of five copies and leaves exactly Q with no slack.
+if spec = System.get_env("REPLICATION_FOLLOWERS") do
+  config :fathom, :replication_followers, Fathom.Shard.Replication.Fleet.parse_followers!(spec)
+end
+
+# Acks required before a tenant's commit returns. MUST be < the follower count, and
+# `Fleet.validate_quorum!/0` refuses to boot otherwise: Q=N tolerates zero follower failures and
+# inherits the slowest replica's latency — measured 32× worse with one straggler on loopback and
+# 82× worse with two far followers.
+if n = env_int.("REPLICATION_QUORUM") do
+  config :fathom, :replication_quorum, n
+end
+
+# Whether a follower fdatasyncs before acking. Off matches Waterpark, which acks from RAM and
+# takes durability from replica count. Measured cost of turning it on: ~398 µs against a ~96 µs
+# floor, i.e. ~2.4× fathom's whole current request round trip. Off is never WORSE than today
+# either — if every replica holding an un-synced frame dies at once, the shard falls back to its
+# S3 object, which is exactly the pre-A2 behaviour.
+if System.get_env("REPLICATION_FSYNC") in ~w(true 1) do
+  config :fathom, :replication_fsync, true
+end
+
+# How long a commit waits for its quorum before failing with 503 FILO_NO_QUORUM. This is a
+# ceiling on tenant write latency when followers are unreachable, not a target — the quorum
+# reports :impossible and returns early as soon as too few followers remain, so this only binds
+# when a follower is silent rather than refusing.
+if ms = env_int.("REPLICATION_TIMEOUT_MS") do
+  config :fathom, :replication_timeout_ms, ms
+end
+
+# Let a cold open serve a local REPLICA when it is provably newer than the stored object — the
+# failover half of A2, and the only thing that actually turns node-loss RPO from ~300 s into ~0.
+#
+# DELIBERATELY SEPARATE FROM REPLICATION_ENABLED. Shipping frames is safe and measurable on its
+# own; this changes what a cold open SERVES, on the code path that owns the lease fence and the
+# provenance sidecar. Run replication first — every flush then stamps its position, so by the time
+# this is flipped the comparison data already exists fleet-wide and can be sanity-checked.
+#
+# Safe by construction in three ways, all of which fail toward the stored object: the object's
+# stamp over-claims (it is read after the snapshot), promotion needs the replica STRICTLY ahead,
+# and an object with no stamp is never overridable at all. The last one means this is inert for a
+# shard until its next flush after upgrading.
+if System.get_env("REPLICATION_PROMOTE_ON_OPEN") in ~w(true 1) do
+  config :fathom, :replication_promote_on_open, true
+end
+
+# SURVIVOR SELECTION. Requires REPLICATION_PROMOTE_ON_OPEN, and completes it.
+#
+# Promote-on-open serves a fresher replica when the node taking the shard over happens to hold one.
+# The LB fails over by consistent hash on the Host subdomain, which knows nothing about
+# replication, so "happens to" is doing real work there: measured on the rig, an acked
+# quorum-replicated write was LOST while three other nodes held it. With this on, a cold open asks
+# every peer where its replica sits, adopts the best one that is provably ahead of the stored
+# object, and pulls it over A2's own socket.
+#
+# COSTS ON THE COLD-OPEN PATH, which is why it is separate from the gate above: one object-position
+# read on every promote-eligible open plus one concurrent round trip to each peer (bounded by
+# REPLICATION_RECOVERY_TIMEOUT_MS), and a whole-database transfer when a peer wins. A node that
+# already holds the freshest copy short-circuits before touching the network.
+#
+# Fails toward the stored object in every uncertain case — an unreachable fleet, a peer one deploy
+# behind, an unstamped object — so there is no state in which it serves older bytes than leaving it
+# off would. It also needs REPLICATION_LISTEN on this node: the pull installs through the local
+# follower's replica directory.
+if System.get_env("REPLICATION_RECOVER_FROM_PEERS") in ~w(true 1) do
+  config :fathom, :replication_recover_from_peers, true
+end
+
+# How long a cold open waits for peers to answer "where is your replica?". All peers are asked at
+# once, so this is one round trip's budget, not N. Default 2000 ms — deliberately short: a peer
+# that cannot answer in that time is one whose replica we would rather not wait to transfer either,
+# and the fallback is the stored object.
+if ms = env_int.("REPLICATION_RECOVERY_TIMEOUT_MS") do
+  config :fathom, :replication_recovery_timeout_ms, ms
+end
+
+# Budget for transferring a winning peer's replica. Default 60000 ms. This one is a whole tenant
+# database over the network, so it is sized like a seed rather than like a query.
+if ms = env_int.("REPLICATION_RECOVERY_PULL_TIMEOUT_MS") do
+  config :fathom, :replication_recovery_pull_timeout_ms, ms
+end
+
+# Bytes per frame when seeding a follower's base copy. Bounds MEMORY on both sides (a seed is a
+# whole database); it does not bound head-of-line blocking, since one socket per follower node
+# carries every shard. Default 4 MiB.
+if n = env_int.("REPLICATION_SEED_CHUNK_BYTES") do
+  config :fathom, :replication_seed_chunk_bytes, n
+end
+
+# ---- The RECEIVE half: this node acts as somebody's follower --------------------------------
+# SEPARATE GATE FROM REPLICATION_ENABLED, and the reason is a real gap this closes (2026-08-10):
+# the `Follower` listener was only ever started by the test suite, so a node with replication on
+# shipped every commit to addresses where nothing listened, got no acks, and 503'd
+# `FILO_NO_QUORUM` on every tenant write — while REPLICATION_FOLLOWERS below documented a port
+# fathom never opened.
+#
+# ROLLOUT ORDER: turn this on FLEET-WIDE FIRST, confirm every node is listening, and only then
+# enable REPLICATION_ENABLED anywhere. A node can host others' replicas without replicating its
+# own shards, which is exactly why these are two flags and not one.
+if System.get_env("REPLICATION_LISTEN") in ~w(true 1) do
+  config :fathom, :replication_listen, true
+end
+
+# Port the follower listener binds. Default 9100 — the port this file's REPLICATION_FOLLOWERS
+# example has always shown, and clear of :hrana_port 8080 and :health_port 8081.
+if n = env_int.("REPLICATION_LISTEN_PORT") do
+  config :fathom, :replication_listen_port, n
+end
+
+# WHICH INTERFACE THE REPLICATION PORT BINDS. This is a security control, not tuning.
+#
+# The replication protocol has NO AUTHENTICATION: whoever can reach this port can push WAL frames
+# into any shard this node follows. Unset, `:gen_tcp` binds EVERY interface, which on a cloud host
+# means the public one. The trust boundary is the network — the same posture as `hrana_auth:
+# :disabled` — so pin it to a private address and firewall it, exactly as HRANA_BIND_IP does for
+# the data plane. The follower logs which interface it bound at boot; read that line.
+if bind = System.get_env("REPLICATION_BIND_IP") do
+  case :inet.parse_address(String.to_charlist(bind)) do
+    {:ok, ip} -> config :fathom, :replication_bind_ip, ip
+    {:error, _} -> raise "REPLICATION_BIND_IP is not a valid IP address: #{inspect(bind)}"
+  end
+end
+
+# Where the follower set comes from. `static` (default) is the hand-maintained
+# REPLICATION_FOLLOWERS list; `roster` derives it from the addresses nodes publish to
+# `rebalancer_nodes`, refreshed on a timer, so adding or replacing a node stops meaning "edit every
+# other node's config".
+#
+# THE STATIC LIST REMAINS THE FLOOR in roster mode. Whenever the roster cannot supply
+# REPLICATION_QUORUM+1 candidates — a fresh fleet, a rolling upgrade where peers publish no
+# address, a Postgres outage — membership falls back to it rather than to nothing. And a set
+# smaller than quorum+1 is REFUSED outright, keeping the previous one live: `n` shrinking below `q`
+# is how `q >= n` starts raising inside a tenant's commit.
+#
+# Roster mode needs REPLICATION_ADVERTISE_HOST set on the nodes that should be candidates, and
+# LOAD_REPORTER on (the beat that publishes the address rides that tick).
+if System.get_env("REPLICATION_MEMBERSHIP") == "roster" do
+  config :fathom, :replication_membership, :roster
+end
+
+# How often roster membership is recomputed. Deliberately slow: this is a control-plane read, not
+# a liveness signal, and every membership CHANGE costs a seed per shard on the added follower.
+if ms = env_int.("REPLICATION_MEMBERSHIP_POLL_MS") do
+  config :fathom, :replication_membership_poll_ms, ms
+end
+
+# The host peers should use to reach THIS node's replication port, published to the fleet roster
+# (`rebalancer_nodes.replication_address`) so membership can be derived instead of hand-listed.
+#
+# EXPLICIT, never guessed. A node cannot reliably know which of its addresses a peer can reach —
+# the hostname is often a container id and the first non-loopback interface is often the wrong
+# one — and publishing an unreachable endpoint is worse than publishing none, because the roster
+# then reports the node present while every shipper fails to connect. Unset ⇒ this node is not a
+# membership candidate. Set it to the private DNS name or IP peers dial (the same one you would
+# have written into REPLICATION_FOLLOWERS by hand).
+if host = System.get_env("REPLICATION_ADVERTISE_HOST") do
+  config :fathom, :replication_advertise_host, host
+end
+
+# Where a follower keeps the replicas it receives. Defaults under System.tmp_dir!/ like
+# SHARD_DATA_DIR and WARM_CACHE_DIR — fine for dev, wrong for a node that is somebody's durability
+# guarantee. Point it at real local disk; it holds a full copy of every shard this node follows,
+# and `fathom.node.disk` reports it as `dir=replica`.
+if dir = System.get_env("REPLICATION_DIR") do
+  config :fathom, :replication_dir, dir
+end
+
 # ---- Admin dashboard (/admin + /admin/metrics) BasicAuth ----------------------------------
 # Credentials for the operator surface. The router's admin_auth plug fails closed (503) when
 # unset, so the dashboard/scrape is never anonymously reachable — set both to enable it. Read in

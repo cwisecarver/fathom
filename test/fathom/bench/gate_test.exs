@@ -11,6 +11,22 @@ defmodule Fathom.Bench.GateTest do
   # Keys a history line carries that are provenance, not measurements.
   @bookkeeping ~w(log dirty host branch commit commit_full trials mix_env ts)
 
+  # Lives here, not in bench_test.exs, because that whole module is @moduletag :bench and excluded
+  # from the default suite — which is how this drift survived unnoticed. This needs no bench run.
+  #
+  # `mix fathom.bench --only <name>` resolves through String.to_existing_atom/1 against the TASK's
+  # own @all_metrics literal, a second copy of Fathom.Bench's. A name added to Bench and not
+  # mirrored there does not degrade gracefully: it raises "not an already existing atom" before the
+  # run starts. Found 2026-08-10 when `--only served` crashed mid-investigation; :served,
+  # :dir_recorder, :concurrent and :wire_encode had all drifted.
+  test "the Mix task's --only allowlist covers every metric Fathom.Bench knows" do
+    missing = Fathom.Bench.known_metrics() -- Mix.Tasks.Fathom.Bench.known_metrics()
+
+    assert missing == [],
+           "these metrics exist in Fathom.Bench but are unreachable via --only: " <>
+             "#{inspect(missing)} — add them to Mix.Tasks.Fathom.Bench's @all_metrics"
+  end
+
   @parent %{
     "cold_open_p50_us" => 1000.0,
     "dir_resolve_p50_us" => 150.0,
@@ -56,11 +72,25 @@ defmodule Fathom.Bench.GateTest do
     assert result.worst == 15.0
   end
 
+  # The vehicle used to be `fanout_kb_per_shard` at +27.8%. That stopped demonstrating anything on
+  # 2026-08-10, when fanout was moved to a 50% band (it is fat-tailed — see Gate's @metrics), so
+  # +27.8% became a legitimate :warn and this read as a behaviour change when it is a threshold
+  # change. Switched to `cold_open_p50_us`, which is still gated at the default 20%: the claim
+  # under test is that the WORST metric drives the verdict, not anything about which metric it is.
   test "worst regression across metrics drives the verdict" do
-    new = %{@parent | "dir_resolve_p50_us" => 160.0, "fanout_kb_per_shard" => 230.0}
+    new = %{@parent | "dir_resolve_p50_us" => 160.0, "cold_open_p50_us" => 1278.0}
     result = Gate.compare(@parent, new)
-    # fanout +27.8% dominates dir_resolve +6.7%.
+    # cold_open +27.8% dominates dir_resolve +6.7%.
     assert result.verdict == :block
+    assert result.worst > 27.0
+  end
+
+  # Pins the per-metric override itself, which nothing covered: the same +27.8% that blocks on a
+  # default-band metric above must only WARN on fanout, or the widened band is not in effect.
+  test "a metric with its own wider band uses it, not the default" do
+    new = %{@parent | "fanout_kb_per_shard" => 230.0}
+    result = Gate.compare(@parent, new)
+    assert result.verdict == :warn, "fanout carries a 50% block band; +27.8% must not block"
     assert result.worst > 27.0
   end
 

@@ -1,13 +1,21 @@
 # Fathom chaos rig
 
 The "failover time + loss window" layer of `docs/deploy-cluster.md` § Chaos testing,
-as a one-host Docker Compose stack: **3 independent fathom nodes** (prod `mix release`
+as a one-host Docker Compose stack: **5 independent fathom nodes** (prod `mix release`
 images) behind **nginx** (`hash $host consistent` — the real LB mechanism), sharing one
 **MinIO** bucket (lease store + bottomless backend) through **per-node toxiproxy
 proxies** (latency / bandwidth / partition injection), plus one **Postgres**
 (directory / control plane). The in-process suite (`test/fathom/cluster/`) pins the
 safety invariants deterministically; this rig measures latency and demonstrates the
 failure modes end to end.
+
+**Why five nodes.** Phase-2 A2 (`docs/a2-quorum-replication.md`) gives each shard a
+replica set of 1 primary + 4 read-only followers, acking at 2-of-4 — so five is the
+**minimum** fleet that can hold a single shard's replica set, and a 3-node rig cannot
+exercise the target topology at all. The earlier 3-node runs recorded in `docs/reviews/`
+were measured on that smaller fleet; per the same-topology rule they are not directly
+comparable to runs on this one (the LB partition, per-node shard counts, and Oban queue
+draw all change with node count). Start a new series rather than extending the old one.
 
 Docker is sufficient here because fathom nodes coordinate **only through S3** — no
 BEAM clustering — and node identity is `node()#<boot-nonce>`, so containers are real
@@ -36,7 +44,8 @@ cd deploy/chaos
 
 Tenant = Host subdomain (`acme.fathom.test`); the driver speaks Hrana v2
 `POST /v2/pipeline` through the LB on `localhost:8080`. Per-node direct ports
-(18081–3) bypass the LB for forced-steal experiments; toxiproxy's API is on `:8474`.
+(18081–5) bypass the LB for forced-steal experiments; per-node health is 18091–5 and
+each node's admin dashboard is 4001–5. toxiproxy's API is on `:8474`.
 
 ## Rig-specific tuning (docker-compose.yml)
 
@@ -60,7 +69,7 @@ enforcing conditional writes, nodes refuse to serve (that's the point).
   per-tenant foreign-row isolation audit (must be zero).
 - **warm-home** — the warm follower should warm a shard only on the *survivor* nodes,
   never on its LB home (a shard fails over away from its home, so the home warming its
-  own is wasted cache budget). Checks placement across all three nodes both while the
+  own is wasted cache budget). Checks placement across all five nodes both while the
   home serves the shard (live-coordinator exclusion) and after it idle-drops (the
   `:warm_home_retention_ms` window — the case the home-set fix targets). Home must read
   `warm=no`, survivors `warm=yes`, at both points.

@@ -66,6 +66,10 @@ defmodule Fathom.Shard do
     WriteCounter
   }
 
+  alias Fathom.Shard.Replication.Follower
+  alias Fathom.Shard.Replication.Promote
+  alias Fathom.Shard.Replication.Recovery
+
   @default_idle_ms 60_000
   @default_lease_ttl_ms 30_000
   # 5s node-loss RPO for busy shards (write-gated — clean shards skip the PUT). Was 30s;
@@ -218,6 +222,16 @@ defmodule Fathom.Shard do
   internally on each flush decision. Finding #27 replaced a per-write cast with this ETS signal.
   """
   def dirty?(pid) when is_pid(pid), do: GenServer.call(pid, :dirty?)
+
+  @doc """
+  This coordinator's lease epoch — A2 replication's fencing token.
+
+  `{:error, :no_lease}` when the shard is not currently held, which a replication session must
+  treat as "do not ship": frames from a node without a lease are exactly what the follower's epoch
+  check exists to refuse.
+  """
+  @spec epoch(pid()) :: {:ok, non_neg_integer()} | {:error, :no_lease}
+  def epoch(pid) when is_pid(pid), do: GenServer.call(pid, :epoch)
 
   @doc """
   Force-flushes the coordinator's current on-disk state to storage WITHOUT dropping or stopping
@@ -519,7 +533,18 @@ defmodule Fathom.Shard do
 
   defp open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen) do
     with {:ok, etag0} <- await_pull(pull_task, path, shard_id),
-         {:ok, etag} <- revalidate_takeover(shard_id, path, lease, etag0, warm?) do
+         {:ok, etag1} <- revalidate_takeover(shard_id, path, lease, etag0, warm?) do
+      # NOT a `with` clause, and returning a bare etag rather than `{:ok, etag}`. Both are for the
+      # same measured reason: `handle_continue/2` garbage-collects this coordinator early to shrink
+      # its init high-water mark, so ANY allocation after that point stays resident for the shard's
+      # life. Wrapping this in a tuple per open cost +36% fanout_kb_per_shard (3.93 → 5.45 KiB) and
+      # the bench gate refused the commit. With the gate off this is now one `Application.get_env`
+      # and the binding we already had.
+      #
+      # It cannot fail the open either, which is why it needs no error channel: a promotion that
+      # does not happen leaves the ordinary path, and the ordinary path is correct.
+      etag = maybe_promote_replica(shard_id, path, lease, etag1)
+
       # No idle timer yet: a coordinator is always checked out right after it
       # starts, and the timer is (re)armed only when the last connection checks
       # back in. This avoids a start-vs-checkout idle race. The lease renewal
@@ -1100,6 +1125,16 @@ defmodule Fathom.Shard do
   end
 
   def handle_call(:dirty?, _from, state), do: {:reply, unflushed?(state), state}
+
+  # The lease epoch, for A2 replication's fence (`Fathom.Shard.Replication`). Read ONCE per
+  # replication session and cached there, not per commit — a GenServer hop on every write would
+  # put this coordinator's mailbox in front of the shard's write path, which is the cost
+  # WriteCounter's lock-free ETS exists to avoid. The session monitors this process and stops when
+  # it does, so a cached epoch can never outlive the ownership it describes.
+  def handle_call(:epoch, _from, %{lease: %{epoch: epoch}} = state),
+    do: {:reply, {:ok, epoch}, state}
+
+  def handle_call(:epoch, _from, state), do: {:reply, {:error, :no_lease}, state}
 
   # Synchronous force-flush (the flush-before-fork primitive): make the current on-disk state
   # durable WITHOUT dropping/stopping — the coordinator keeps serving. Replies :ok once the
@@ -1943,7 +1978,9 @@ defmodule Fathom.Shard do
     # the flush, while a merely-busy checkpoint must fall back to the snapshot path.
     case checkpoint_and_verify(state.path) do
       :ok ->
-        Storage.flush(state.id, state.path, state.etag)
+        # Read after the checkpoint, same reasoning as `snapshot_and_upload/1`: the WAL has just
+        # been folded into the database, so the position describes bytes that are genuinely here.
+        Storage.flush(state.id, state.path, state.etag, flush_position(state))
 
       # Integrity failed (expert review 2026-07-14 #4). The checkpoint-then-raw-upload fast path
       # uploads the bytes as-is, so a locally corrupted db (disk/fs/memory fault, exqlite/OS bug)
@@ -2183,6 +2220,173 @@ defmodule Fathom.Shard do
 
         drop_local(state.path)
         error
+    end
+  end
+
+  # --- A2 promote-on-open ---------------------------------------------------------------
+  #
+  # A survivor may hold a REPLICA of this shard that is newer than the stored object — that is the
+  # entire point of A2, and until this ran the replica sat on disk while the open served the last
+  # flush. Runs here, after `revalidate_takeover/5`, because this decides WHICH BYTES ARE SERVED
+  # and must not happen before the lease and the fork verdict are settled.
+  #
+  # Every branch that is not a proven win returns the caller's etag unchanged, so the ordinary open
+  # path is bit-for-bit what it was. That includes every error: a failed promotion attempt must not
+  # fail an open, because the ordinary path is still correct — it just recovers less.
+  #
+  # `Promote.fresher?/2` is what makes this safe. The replica is promoted only when it is STRICTLY
+  # ahead of what the object claims, the object's claim is an over-claim by construction
+  # (`flush_position/1`), and an unstamped object is never overridable at all — so an object
+  # written before stamping existed, or by a node that has not been upgraded, is left alone.
+  defp maybe_promote_replica(shard_id, path, lease, etag) do
+    # The gate is checked FIRST and returns the caller's own binding, so a node that has not
+    # enabled this allocates nothing at all on its open path. See the note at the call site.
+    if promote_on_open?() do
+      try_promote(shard_id, path, lease, etag)
+    else
+      etag
+    end
+  end
+
+  # TWO PATHS, and the split is about what a cold open is allowed to pay for.
+  #
+  # The local-only path checks ETS first and reaches the object store ONLY when this node actually
+  # holds a replica — so a node with promote-on-open enabled pays nothing extra on the vast
+  # majority of opens, which is why it was written that way and why it is kept bit-for-bit.
+  #
+  # The fleet path cannot be that lazy: deciding whether a PEER is worth asking requires the
+  # object's position first, so it costs one stamp read on every promote-eligible open plus a
+  # concurrent round trip to each peer. That is the price of closing the RPO gap on a failover the
+  # LB routed to a node holding no replica, and it is why `Recovery` is a separate gate rather than
+  # part of `:replication_promote_on_open`.
+  defp try_promote(shard_id, path, lease, etag) do
+    if Recovery.enabled?() do
+      try_promote_from_fleet(shard_id, path, lease, etag)
+    else
+      try_promote_local(shard_id, path, lease, etag)
+    end
+  end
+
+  defp try_promote_local(shard_id, path, lease, etag) do
+    with replica when replica != nil <- replica_state(shard_id),
+         {:ok, stamp} <- Storage.object_position(shard_id),
+         true <- Promote.fresher?(replica, stamp) do
+      promote_replica(shard_id, path, lease, etag, replica, stamp)
+    else
+      _ -> etag
+    end
+  end
+
+  # `Recovery.best_replica/3` re-checks this node's own replica and short-circuits the network when
+  # it already wins, so there is one call here rather than a local branch and a fleet branch that
+  # could drift apart on what "fresher" means.
+  #
+  # `fresher?` is asserted again afterwards even though `Recovery` only ever returns a replica that
+  # passed it. It is one comparison on a path that ends in overwriting a tenant's stored database,
+  # and the alternative is trusting a promise made by a different module about bytes that arrived
+  # over an unauthenticated socket.
+  defp try_promote_from_fleet(shard_id, path, lease, etag) do
+    with {:ok, stamp} <- Storage.object_position(shard_id),
+         {:ok, replica} <- Recovery.best_replica(shard_id, stamp),
+         true <- Promote.fresher?(replica, stamp) do
+      promote_replica(shard_id, path, lease, etag, replica, stamp)
+    else
+      _ -> etag
+    end
+  end
+
+  defp promote_on_open?, do: Application.get_env(:fathom, :replication_promote_on_open, false)
+
+  defp replica_state(shard_id) do
+    Follower.state_of(Follower, shard_id)
+  rescue
+    # No follower running on this node: there is no replica, which is not an error.
+    ArgumentError -> nil
+  end
+
+  # Ordering here is the whole risk, so it is worth stating:
+  #
+  #   1. SNAPSHOT the stored object first. This is the least reversible thing A2 does — it declares
+  #      one of two lineages the winner and overwrites the other, on the strength of a comparison
+  #      that is new code. A server-side copy costs no body transfer and is the difference between
+  #      a bad hour and permanent loss if the comparison is ever wrong.
+  #   2. STAGE into a temp and verify it there. Nothing touches the live path until the replica has
+  #      been checkpointed into a standalone database and passed `quick_check`.
+  #   3. PUBLISH from the temp, FENCED with the etag we hold. A 412 means someone wrote the object
+  #      since our pull, so the replica is no longer provably newer — abandon and serve the
+  #      ordinary path.
+  #   4. Only then move the temp onto the live path and stamp the new etag as its provenance.
+  #
+  # A failure at 1–3 leaves the shard exactly as the ordinary open left it. A failure at 4 is the
+  # one that cannot be shrugged off — the object is now the replica while the local file is not —
+  # so it fails the open, which releases the lease and lets a clean open pull the bytes we just
+  # published.
+  defp promote_replica(shard_id, path, lease, etag, replica, stamp) do
+    temp = "#{path}.promote.#{System.unique_integer([:positive])}"
+    follower = Follower
+
+    try do
+      with :ok <- snapshot_before_promotion(shard_id),
+           :ok <- Promote.stage(follower, shard_id, temp),
+           {:ok, new_etag} <-
+             Storage.flush(shard_id, temp, etag, flush_position(%{lease: lease, path: temp})) do
+        case File.rename(temp, path) do
+          :ok ->
+            Enum.each(["-wal", "-shm"], &File.rm(path <> &1))
+            write_etag_sidecar(path, new_etag)
+            Follower.forget(follower, shard_id)
+
+            Logger.warning(
+              "shard #{shard_id}: PROMOTED a local replica over the stored object " <>
+                "(replica #{inspect(replica)} > object #{inspect(stamp)}); " <>
+                "pre-promotion state snapshotted"
+            )
+
+            :telemetry.execute(
+              [:fathom, :shard, :replica_promoted],
+              %{count: 1},
+              %{shard_id: shard_id, epoch: lease.epoch}
+            )
+
+            new_etag
+
+          {:error, reason} ->
+            # The ONE failure here that cannot be shrugged off: the object is now the replica while
+            # the live path is not, so serving on would serve a lineage the store disagrees with.
+            # Raising routes to `abandon_open/5`, which releases the lease and stops the
+            # coordinator — a clean re-open then pulls exactly what was just published.
+            raise "shard #{shard_id}: promoted object published but the local rename failed " <>
+                    "(#{inspect(reason)}); refusing to serve a diverged local copy"
+        end
+      else
+        {:error, reason} ->
+          Logger.warning(
+            "shard #{shard_id}: replica promotion declined (#{inspect(reason)}); " <>
+              "opening from the stored object"
+          )
+
+          etag
+      end
+    after
+      Enum.each(["", "-wal", "-shm"], &File.rm(temp <> &1))
+    end
+  end
+
+  # Best-effort, and deliberately not fatal: a shard with no stored object yet has nothing to
+  # snapshot, and a snapshot backend hiccup should not block a recovery that is otherwise sound.
+  # It is attempted first precisely because it is the cheap insurance on the irreversible step.
+  defp snapshot_before_promotion(shard_id) do
+    case Fathom.Snapshots.create(shard_id, label: "pre-promotion") do
+      {:ok, _snapshot_id} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "shard #{shard_id}: could not snapshot before promoting a replica " <>
+            "(#{inspect(reason)}); proceeding"
+        )
+
+        :ok
     end
   end
 
@@ -2600,6 +2804,36 @@ defmodule Fathom.Shard do
   # land, `{:error, :superseded}` when the object changed under us (a stealer flushed — the
   # caller self-fences), or `{:error, reason}` on a transient failure (the caller keeps the
   # shard dirty so the write isn't lost on a later idle-drop).
+  # How much of this shard's history the bytes being flushed contain — Phase 2 A2. Lets a failover
+  # order this object against a node's local REPLICA, which nothing else can do (an etag is a
+  # content hash with no ordering; the lock carries the holder's epoch, not the object's).
+  #
+  # READ AFTER THE SNAPSHOT, DELIBERATELY, AND REVERSING THIS LOSES WRITES. The snapshot is a
+  # consistent read taken at some instant; writes can land while it runs. Reading the WAL
+  # afterwards therefore reports a position at or beyond what the snapshot captured — the object
+  # claims at least as much as it holds. That direction is safe: a replica is promoted only when it
+  # is strictly ahead of the claim, so an over-claim costs at most one flush interval of RPO.
+  #
+  # Reading BEFORE the snapshot would under-claim, and a replica sitting between the claim and the
+  # truth would be judged fresher and promoted — silently dropping exactly the writes that landed
+  # during the snapshot. `FlushWatermark`'s own count is captured before snapshotting for the
+  # opposite reason (a missed write must leave the shard dirty), which is why it cannot be reused
+  # here however similar it looks.
+  #
+  # `nil` when the WAL is unreadable or there is no lease: an absent stamp reads as "unknown" and
+  # makes the object un-overridable, which is the same safe answer.
+  defp flush_position(%{lease: %{epoch: epoch}} = state) when is_integer(epoch) do
+    case Fathom.Shard.Replication.Wal.read(state.path <> "-wal") do
+      {:ok, %{ckpt_seq: gen, size: size}} -> %{epoch: epoch, wal_gen: gen, offset: size}
+      # No WAL yet: nothing has been written through one, so the object contains everything
+      # there is at this epoch's generation 0.
+      {:ok, :empty} -> %{epoch: epoch, wal_gen: 0, offset: 0}
+      {:error, _} -> nil
+    end
+  end
+
+  defp flush_position(_state), do: nil
+
   defp snapshot_and_upload(state) do
     temp = "#{state.path}.snap.#{System.unique_integer([:positive])}"
 
@@ -2609,7 +2843,7 @@ defmodule Fathom.Shard do
       with :ok <- verify_snapshot(state, temp),
            :ok <- snapshot(state.path, temp),
            :ok <- recheck_before_put(state),
-           {:ok, new_etag} <- Storage.flush(state.id, temp, state.etag) do
+           {:ok, new_etag} <- Storage.flush(state.id, temp, state.etag, flush_position(state)) do
         {:ok, new_etag}
       else
         {:error, :superseded} = superseded ->

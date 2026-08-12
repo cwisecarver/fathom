@@ -111,5 +111,14 @@ jobs:
 
       # The `mix test` alias creates + migrates the test Postgres DB, then runs the suite. :s3
       # (live MinIO) and :bench tests are excluded by test/test_helper.exs.
+      #
+      # :wal_probe is included HERE rather than left to a developer's shell, because it is the only
+      # proof that the Phase 2 A2 frame seam (sqlite3_wal_hook via the loadable extension) actually
+      # fires — and it cannot run under a plain `mix test`: the extension reads FATHOM_WAL_PROBE
+      # from the OS environment, and `System.put_env` cannot set that for native code (it updates
+      # the BEAM's own table, not C `environ`). Without this line the test would be permanently
+      # skipped, which is the same as deleting it.
       - name: Run tests
-        run: mix test
+        env:
+          FATHOM_WAL_PROBE: "1"
+        run: mix test --include wal_probe

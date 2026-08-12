@@ -181,7 +181,7 @@ defmodule Fathom.Test.FaultyStorage do
   end
 
   @impl true
-  def flush(shard_id, local_path, expected_etag) do
+  def flush(shard_id, local_path, expected_etag, position \\ nil) do
     # run_before(:flush) lets a test steal the shard (overwrite the object) in the window
     # between the coordinator's fence check and this write, exercising the fenced flush (#15).
     run_before(:flush)
@@ -204,12 +204,23 @@ defmodule Fathom.Test.FaultyStorage do
       # own earlier write, and the "lock still ours" reconcile used to conclude the object was
       # current and mark the shard clean, discarding everything written in between.
       fault() == :flush_lands_then_errors ->
-        _ = Local.flush(shard_id, local_path, expected_etag)
+        _ = Local.flush(shard_id, local_path, expected_etag, position)
         {:error, :s3_unreachable}
 
       true ->
-        Local.flush(shard_id, local_path, expected_etag)
+        Local.flush(shard_id, local_path, expected_etag, position)
     end
+  end
+
+  # The position stamp must exist on the DOUBLE, not just the real backends. This suite's default
+  # backend is this module, so a contract implemented only in `Local`/`S3` would be a contract no
+  # test ever exercises — the same gap that once made an entire class of stale-lease bugs
+  # structurally invisible to `mix test` (AGENTS.md).
+  @impl true
+  def object_position(shard_id) do
+    if fault() == :object_position,
+      do: {:error, :s3_unreachable},
+      else: Local.object_position(shard_id)
   end
 
   # `run_before(:object_etag)` is what lets a test RAISE from a storage call that the coordinator

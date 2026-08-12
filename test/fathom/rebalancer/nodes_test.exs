@@ -92,4 +92,50 @@ defmodule Fathom.Rebalancer.NodesTest do
     p99 = Nodes.fleet_p99(60_000, 50)
     assert p99 > 5.0 and p99 < 10.0
   end
+
+  # A2 membership candidates (2026-08-10). These are the roster half of replacing the
+  # hand-maintained REPLICATION_FOLLOWERS list.
+  describe "replication_endpoints/1" do
+    test "returns only nodes that published an address, ordered by node_key" do
+      Nodes.beat("n3", replication_address: "10.0.0.3:9100")
+      Nodes.beat("n1", replication_address: "10.0.0.1:9100")
+      # Listening-but-silent is not a thing; a node with no address is simply not a candidate.
+      Nodes.beat("n2")
+
+      assert [{"n1", "10.0.0.1:9100"}, {"n3", "10.0.0.3:9100"}] =
+               Nodes.replication_endpoints(60_000)
+    end
+
+    # The ordering claim is load-bearing, not cosmetic: every node derives its own follower set
+    # from this list, so an unordered result would hand each node a different set on each read and
+    # a shard's replica set would drift with query planning.
+    test "the order is by node_key regardless of insertion order" do
+      for k <- ~w(n9 n2 n7 n1), do: Nodes.beat(k, replication_address: "#{k}:9100")
+
+      assert ~w(n1 n2 n7 n9) ==
+               Nodes.replication_endpoints(60_000) |> Enum.map(&elem(&1, 0))
+    end
+
+    test "a node stale past the window is not a candidate" do
+      Nodes.beat("fresh", replication_address: "10.0.0.1:9100")
+      Nodes.beat("stale2", replication_address: "10.0.0.2:9100")
+
+      from(n in NodeBeat, where: n.node_key == "stale2")
+      |> Repo.update_all(
+        set: [last_seen_at: DateTime.add(DateTime.utc_now(), -120_000, :millisecond)]
+      )
+
+      assert [{"fresh", _}] = Nodes.replication_endpoints(60_000)
+    end
+
+    # Same hazard as #5 above, with a sharper consequence: NULLing this does not lose a gauge, it
+    # withdraws the node from membership — so a beat that forgot to carry it would silently shrink
+    # every shipper's follower set.
+    test "a liveness-only beat preserves the published replication_address" do
+      Nodes.beat("n1", replication_address: "10.0.0.1:9100")
+      assert :ok = Nodes.beat("n1")
+
+      assert [{"n1", "10.0.0.1:9100"}] = Nodes.replication_endpoints(60_000)
+    end
+  end
 end

@@ -38,7 +38,24 @@ defmodule Fathom.Bench.Gate do
     # against entries after it, instead of one series with an unexplained cliff that reads like
     # a code regression forever. Any future harness change to this bench should rename again.
     {:copy_keystone_rows_per_s, :lower_worse},
-    {:fanout_kb_per_shard, :higher_worse},
+    # Gated at 50%, not the default 20% — the same treatment `cold_open_p99_us` gets below, and
+    # for the same reason: this is a fat-tailed number, not a precise one. It divides an
+    # `:erlang.memory(:total)` delta across 200 idle coordinators WITHOUT collecting them first
+    # (deliberately — see `Fathom.Bench.fanout/1`; it is the only thing that measures whether the
+    # coordinators' `fullsweep_after: 0` actually reclaims retained heap). The cost is precision:
+    # measured 2026-08-10, it moves ~30% in EITHER direction on changes that cannot affect
+    # footprint, reproduced on demand by adding code that runs strictly after its own sample; it
+    # has a 12× lifetime spread; and it can return NEGATIVE. At 20% it spent two sessions blocking
+    # a change that was later proven to cost nothing, which is worse than not gating it at all.
+    # 50% still catches a genuine density collapse. The tight per-shard bound is the pair below.
+    {:fanout_kb_per_shard, :higher_worse, 50},
+    # The steady-state floor — `fanout` with the coordinators collected, so open-path churn is out
+    # of it. Gated at the default 20% because this is the reading meant to be believed: `fanout`
+    # up with this flat is churn, both up is a real retained-heap regression. Early and on few
+    # samples, but it read 3.64/3.65 across runs where `fanout` read 5.37 through 5.74. If that
+    # stability does not hold, widen this — do not widen it pre-emptively, or the pair gates
+    # nothing between them.
+    {:fanout_gc_kb_per_shard, :higher_worse},
     # The SERVED regime, gated from 2026-08-03 (#41.2). `fanout_kb_per_shard` holds no
     # connections, so every per-connection resource decision — `:shard_cache_size_kb`'s up-to-2 MiB
     # page cache per held stream, the statement cache's sub-binary pin — was outside the gate.

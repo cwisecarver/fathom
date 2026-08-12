@@ -26,6 +26,30 @@ subdomain, the new node steals the lease once the old owner's heartbeat lapses
 redirect/relay.** Tenant data rides standard client→LB→node TLS; it never crosses a
 BEAM mesh.
 
+### Amendment 2026-08-08 — the "S3 only" rule is LIFTED for A2
+
+**Everything above still describes the code as it stands**, and stays true until A2 ships. What
+changed is its *status*: "S3 is the only cross-node coordination" was a **design rule** that
+foreclosed a whole class of solutions, and it is no longer one. Cross-node coordination of tenant
+data is now an allowed design, subject to the gates in
+[a2-quorum-replication](a2-quorum-replication.md).
+
+**Why it was lifted.** The rule made node-loss RPO irreducible. A committed write is fsynced
+locally (`synchronous=FULL`), so a *process* crash loses nothing — but failover reads the last
+flushed object from **S3**, never the dead node's disk, so every write since the last flush is
+gone. EBS removes the reboot case; it cannot remove this one (single-attach, AZ-locked). The only
+remaining fix is **replicate-before-ack**, which by definition requires a cross-node data path.
+Conflict resolution after the fact (CRDT/OT) was evaluated and rejected — see the A2 doc.
+
+**What is NOT lifted.** The two rejected designs in "Why not the alternatives" below stay rejected:
+they fail on *Filo* constraints (entry-node-local stream batons), not on the S3 rule, and lifting
+one says nothing about the other. A2 replicates **committed data**, it does not move **streams**.
+
+**What this costs.** Cluster membership, follower liveness, and a promote protocol — the machinery
+this design was built to avoid, and the reason the rule existed. That is now an accepted cost
+rather than a blocker. It is not cheaply reversible, which is why the A2 doc still gates the work
+behind proving a frame seam exists and measuring the added ack latency first.
+
 ## Why not the alternatives
 
 Two cross-node designs were shaped and rejected. Both fail on **durable Filo
@@ -67,8 +91,9 @@ per-node heartbeat; ~100k PUT/s/node at 1M shards → ~0.1) and the **durability
 storm** (a write-gated `dirty` flag, so PUTs track writes not open-shard count).
 
 The **failover-time-and-loss-window measurement** layer that S6 deferred to a real
-deployment is now built and exercised: the `deploy/chaos/` Docker rig (3 prod-release
-nodes behind nginx + MinIO + per-node toxiproxy), run 2026-07-05 and 2026-07-06 — all
+deployment is now built and exercised: the `deploy/chaos/` Docker rig (**5** prod-release
+nodes behind nginx + MinIO + per-node toxiproxy; 3 when the runs below were recorded, raised
+2026-08-08 for A2's 1-primary-plus-4-follower replica set), run 2026-07-05 and 2026-07-06 — all
 scenarios pass (failover TTL+steal-margin bounded, pause-fence zombie self-fences with
 no split-brain, node↔S3 partition fail-closed + recovers, soak zero-loss / zero-leak
 through node churn, warm-standby 304-promote observed). See

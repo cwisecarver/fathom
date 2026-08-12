@@ -1,7 +1,16 @@
-# Fathom chaos rig: 3 independent fathom nodes behind an nginx L7 LB
+# Fathom chaos rig: 5 independent fathom nodes behind an nginx L7 LB
 # (hash-on-Host), sharing one MinIO bucket (the S3 lease store + bottomless
 # backend) through per-node toxiproxy proxies (fault injection: latency,
 # bandwidth, partition) and one Postgres (the directory / control plane).
+#
+# WHY FIVE and not three: Phase-2 A2 adopts Project Waterpark's quorum-replication
+# shape — 1 primary + 4 read-only followers per shard, acking at 2-of-4 — so FIVE
+# nodes is the MINIMUM that can hold a single shard's replica set. A 3-node rig can
+# no longer exercise the target topology at all (it cannot even place the followers),
+# and a scenario that silently ran on a 3-of-5 stand-in would report a quorum result
+# for a quorum that never existed. See docs/a2-quorum-replication.md.
+# Everything else about the rig is unchanged: the extra two nodes are ordinary peers
+# (same image, same env, their own toxiproxy S3 path and their own port block).
 #
 #   driver: ./chaos.sh   docs: README.md + docs/deploy-cluster.md "Chaos testing"
 #
@@ -38,13 +47,47 @@ x-fathom-env: &fathom-env
   WARM_FOLLOWER: "true"
   WARM_CACHE_DIR: /data/warm
   WARM_POLL_MS: "2000"
+  # Phase-2 A2 quorum replication. LISTENING IS ON EVERYWHERE, SHIPPING IS NOT — that is the
+  # documented rollout order (docs/configuration.md), and the rig should demonstrate the order it
+  # tells operators to use. A shipper whose followers are not listening 503s every tenant write.
+  #
+  # Until 2026-08-10 the rig had no replication env at all, so A2 had never run multi-node outside
+  # a single BEAM despite fathom4/fathom5 having been added specifically to hold a full replica set.
+  REPLICATION_LISTEN: "true"
+  REPLICATION_LISTEN_PORT: "9100"
+  REPLICATION_DIR: /data/replicas
+  # REPLICATION_BIND_IP is deliberately unset: inside the compose network there is no public
+  # interface to hide from, and each node's IP is assigned at runtime. Expect the boot line to name
+  # 0.0.0.0 and say so — that warning firing IS the check that the knob is wired.
+  #
+  # Shipping is per-scenario: empty by default so the rig runs exactly as before, and flipped for
+  # a run with `REPLICATION_ENABLED=true ./chaos.sh replication`. REPLICATION_FOLLOWERS is set
+  # PER NODE below (each node's four peers, never itself) — a shared list would have every node
+  # shipping its own shards to its own listener, which works but muddies every result.
+  REPLICATION_ENABLED: "${REPLICATION_ENABLED:-}"
+  REPLICATION_QUORUM: "${REPLICATION_QUORUM:-2}"
+  # Membership source (Layer 3). `static` by default so the per-node lists below stay in charge;
+  # `REPLICATION_MEMBERSHIP=roster` switches to endpoints nodes publish to `rebalancer_nodes`.
+  #
+  # Roster mode needs an advertise host, and WITHOUT one it silently falls back to the static list
+  # — which would make a roster run look like it worked while proving nothing. Each node advertises
+  # its own compose service name (set per-node below), which is exactly what peers dial here.
+  # LOAD_REPORTER is already on above, and the beat that publishes the address rides its tick.
+  REPLICATION_MEMBERSHIP: "${REPLICATION_MEMBERSHIP:-static}"
+  # Fast enough that a scenario can watch a swap happen rather than waiting out the 30s default.
+  REPLICATION_MEMBERSHIP_POLL_MS: "${REPLICATION_MEMBERSHIP_POLL_MS:-5000}"
+  # The failover half: a cold open serves a local REPLICA when it is provably newer than the stored
+  # object. This is the switch that turns node-loss RPO from ~300 s into ~0 — without it the frames
+  # ship and nobody ever reads them, so a kill BEFORE the flush still loses the tail.
+  # Off by default here like everything else; `chaos.sh failover` with it on is the RPO test.
+  REPLICATION_PROMOTE_ON_OPEN: "${REPLICATION_PROMOTE_ON_OPEN:-}"
   # Phase-2 B1 dynamic rebalancing: every node reports its load, acts on handoff
   # commands, and runs the (singleton) control loop; the LB backend set + where the
   # rendered exception map is written. NODE_KEY is per-node (set on each service below).
   LOAD_REPORTER: "true"
   COMMAND_POLLER: "true"
   REBALANCER_ENABLED: "true"
-  LB_BACKENDS: "fathom1=fathom1:8080,fathom2=fathom2:8080,fathom3=fathom3:8080"
+  LB_BACKENDS: "fathom1=fathom1:8080,fathom2=fathom2:8080,fathom3=fathom3:8080,fathom4=fathom4:8080,fathom5=fathom5:8080"
   LB_MAP_PATH: /etc/nginx/lb/exceptions.conf
   # Fast, deterministic demo: report every 3s, confirm a hotspot over 2 windows, short
   # cooldown, and an absolute q/s floor tuned to the rig's per-shard rates.
@@ -53,7 +96,7 @@ x-fathom-env: &fathom-env
   REBALANCE_COOLDOWN_MS: "15000"
   REBALANCE_HOT_QPS_FLOOR: "10.0"
   # Serve the Phoenix endpoint (:4000) + BasicAuth so each node's live admin dashboard is
-  # watchable during scenarios (published per-node as 4001/4002/4003 below → 192.168.x:400N).
+  # watchable during scenarios (published per-node as 4001..4005 below → 192.168.x:400N).
   # WEB_INSECURE_LOCAL turns off the prod SSL-force + WS origin check so a browser on the LAN can
   # reach the plaintext dashboard (rig-only; never in a real deployment).
   # A/B hook. ERTS reads ERL_ZFLAGS *after* the release's vm.args, so a flag set here wins — which
@@ -101,6 +144,20 @@ x-fathom-node: &fathom-node
 services:
   postgres:
     image: postgres:16-alpine
+    # max_connections=300, because the default 100 cannot serve this rig and has not been able to
+    # since it went 3 -> 5 nodes on 2026-08-08 (for A2's replica set). Each node opens POOL_SIZE
+    # Repo connections, default 25 (config/runtime.exs), plus Oban's notifier/peer/queues:
+    # 3 x 25 = 75 fit under 100, 5 x 25 = 125 do not.
+    #
+    # The symptom is NOT a clear "out of connections" at the edge — writes just fail, and the node
+    # logs fill with Oban.Peer/Stager crashes and warm-follower directory-read timeouts, all of
+    # which read like application bugs. `smoke` failed identically with replication on and off,
+    # which is what identified it as infrastructure.
+    #
+    # Raised rather than lowering POOL_SIZE per node: the pool size is what a production node
+    # actually runs, and shrinking it would make every throughput scenario measure a topology
+    # nobody deploys.
+    command: ["postgres", "-c", "max_connections=300"]
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -163,6 +220,8 @@ services:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21001
       NODE_KEY: fathom1
+      REPLICATION_ADVERTISE_HOST: fathom1
+      REPLICATION_FOLLOWERS: "fathom2@fathom2:9100,fathom3@fathom3:9100,fathom4@fathom4:9100,fathom5@fathom5:9100"
     ports:
       - "18081:8080" # direct Hrana (bypasses the LB; zombie/steal experiments)
       - "18091:8081" # direct health
@@ -174,6 +233,8 @@ services:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21002
       NODE_KEY: fathom2
+      REPLICATION_ADVERTISE_HOST: fathom2
+      REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom3@fathom3:9100,fathom4@fathom4:9100,fathom5@fathom5:9100"
     ports:
       - "18082:8080"
       - "18092:8081"
@@ -185,10 +246,42 @@ services:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21003
       NODE_KEY: fathom3
+      REPLICATION_ADVERTISE_HOST: fathom3
+      REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom2@fathom2:9100,fathom4@fathom4:9100,fathom5@fathom5:9100"
     ports:
       - "18083:8080"
       - "18093:8081"
       - "4003:4000" # admin dashboard
+
+  # fathom4/fathom5 exist so the fleet can hold a full A2 replica set (1 primary +
+  # 4 followers). Ordinary peers in every other respect — each keeps its OWN
+  # toxiproxy S3 path (21004/21005), which is what makes `partition <node>` a
+  # single-node cut rather than a fleet-wide one.
+  fathom4:
+    <<: *fathom-node
+    environment:
+      <<: *fathom-env
+      S3_ENDPOINT: http://toxiproxy:21004
+      NODE_KEY: fathom4
+      REPLICATION_ADVERTISE_HOST: fathom4
+      REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom2@fathom2:9100,fathom3@fathom3:9100,fathom5@fathom5:9100"
+    ports:
+      - "18084:8080"
+      - "18094:8081"
+      - "4004:4000" # admin dashboard
+
+  fathom5:
+    <<: *fathom-node
+    environment:
+      <<: *fathom-env
+      S3_ENDPOINT: http://toxiproxy:21005
+      NODE_KEY: fathom5
+      REPLICATION_ADVERTISE_HOST: fathom5
+      REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom2@fathom2:9100,fathom3@fathom3:9100,fathom4@fathom4:9100"
+    ports:
+      - "18085:8080"
+      - "18095:8081"
+      - "4005:4000" # admin dashboard
 
   lb:
     image: nginx:1.27-alpine
@@ -196,11 +289,19 @@ services:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - ./lb-runtime:/etc/nginx/lb:ro
     ports:
-      - "8080:80"
+      # Overridable because 8080 is a popular port and Docker does NOT fail when it is already
+      # taken — it publishes anyway and the earlier listener keeps winning, so every request
+      # through the LB reaches whatever is squatting instead of nginx. Measured 2026-08-10: an
+      # ssh -L forward held :8080, `curl localhost:8080` returned a bare "Not Found", nginx logged
+      # nothing at all, and it read exactly like an application 404. `LB_PORT=18080 ./chaos.sh up`
+      # is the escape hatch; `chaos.sh up` now checks for the squat and says so.
+      - "${LB_PORT:-8080}:80"
     depends_on:
       - fathom1
       - fathom2
       - fathom3
+      - fathom4
+      - fathom5
 
   # Reloader sidecar: reloads nginx whenever the rebalancer rewrites the exception map,
   # so a handoff's LB flip applies with NO host bridge. Shares the lb container's PID

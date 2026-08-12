@@ -104,10 +104,14 @@ defmodule Fathom.Rebalancer.Reporter do
       # Liveness beat for the dead-node reconciler (#1b) — rides this tick so a serving node is
       # a beating node — carrying this node's full-distribution p99 + sample count (observability)
       # and a q/s histogram the orchestrator merges into the TRUE pooled fleet p99 (#4).
+      # `replication_address` rides the same tick (A2 membership, 2026-08-10): this is already the
+      # once-per-node fleet write, and a second writer racing the same row would only invent ways
+      # for the two to disagree. nil when this node does not listen — see `advertised_address/0`.
       Nodes.beat(Rebalancer.node_key(),
         q_p99: Stats.percentile(qps, 99),
         sample_count: length(rows),
-        q_hist: Stats.histogram(qps)
+        q_hist: Stats.histogram(qps),
+        replication_address: Fathom.Shard.Replication.Fleet.advertised_address()
       )
 
       publish(Enum.take(rows, top_n()))

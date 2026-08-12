@@ -63,6 +63,25 @@ defmodule Fathom.Shard.Storage do
   @type lease :: %{owner: String.t(), epoch: non_neg_integer(), expires_at_ms: integer()}
 
   @typedoc """
+  How much of a shard's history a copy of it contains — Phase 2 A2.
+
+  Ordered lexicographically by `{epoch, wal_gen, offset}`, which is a total order on "how far
+  along" a copy is: the lease `epoch` increases monotonically per shard (it is already the fencing
+  token), `wal_gen` increases on every checkpoint, and `offset` advances within a generation.
+
+  Exists so a failover can order a node's local **replica** against the **stored object**, which
+  nothing else can do — an etag is a content hash with no ordering, the lock carries the holder's
+  epoch rather than the object's, and comparing wall-clock across nodes is unsound. The two are
+  independent lineages of the same shard, and picking the older one silently loses acknowledged
+  writes.
+  """
+  @type position :: %{
+          epoch: non_neg_integer(),
+          wal_gen: non_neg_integer(),
+          offset: non_neg_integer()
+        }
+
+  @typedoc """
   A node's liveness heartbeat. `owner` identifies the node, `expires_at_ms` is the
   wall-clock expiry in `System.system_time(:millisecond)`. A shard whose lock names
   `owner` is live iff `owner`'s heartbeat is fresh.
@@ -106,6 +125,26 @@ defmodule Fathom.Shard.Storage do
               expected_etag :: String.t() | nil
             ) ::
               {:ok, String.t()} | {:error, :superseded} | {:error, term()}
+
+  # Fenced flush that also records HOW MUCH of the shard's history these bytes contain, so a
+  # replica can be ordered against the stored object (Phase 2 A2 promote-on-open). `nil` writes no
+  # stamp, which is what every caller outside the coordinator's flush paths wants.
+  #
+  # A backend must carry the stamp WITHOUT a second request — on S3 it is user metadata on the
+  # same PUT. PUT *count* is the S3 bill (ingress bytes are free), so a stamp that cost an extra
+  # request would make durability more expensive to buy a failover-only benefit.
+  @callback flush(
+              shard_id :: String.t(),
+              local_path :: Path.t(),
+              expected_etag :: String.t() | nil,
+              position :: position() | nil
+            ) ::
+              {:ok, String.t()} | {:error, :superseded} | {:error, term()}
+
+  # The stored object's position stamp, or `nil` when it has none — an object flushed before
+  # stamping existed, or by a caller that passed `nil`. `nil` must be read as "unknown", never as
+  # "empty": an unknown stamp means the object can NEVER be overridden by a replica.
+  @callback object_position(shard_id :: String.t()) :: {:ok, position() | nil} | {:error, term()}
 
   # The stored object's current etag WITHOUT transferring the body (an S3 HEAD; the Local
   # double hashes the file). `{:ok, nil}` when no object exists. Used on a warm restart — where
@@ -314,7 +353,51 @@ defmodule Fathom.Shard.Storage do
   @spec flush(String.t(), Path.t(), String.t() | nil) ::
           {:ok, String.t()} | {:error, :superseded} | {:error, term()}
   def flush(shard_id, local_path, expected_etag),
-    do: backend().flush(shard_id, local_path, expected_etag)
+    do: backend().flush(shard_id, local_path, expected_etag, nil)
+
+  @doc "Fenced flush carrying a position stamp. See the `c:flush/4` callback."
+  @spec flush(String.t(), Path.t(), String.t() | nil, position() | nil) ::
+          {:ok, String.t()} | {:error, :superseded} | {:error, term()}
+  def flush(shard_id, local_path, expected_etag, position),
+    do: backend().flush(shard_id, local_path, expected_etag, position)
+
+  @doc "The stored object's position stamp, or `nil` if it carries none. See the callback."
+  @spec object_position(String.t()) :: {:ok, position() | nil} | {:error, term()}
+  def object_position(shard_id), do: backend().object_position(shard_id)
+
+  @doc """
+  Serialize a position stamp for transport. `"<epoch>:<wal_gen>:<offset>"`.
+
+  Deliberately a fixed three-integer shape rather than a map format: this crosses a network and
+  comes back from an object a tenant's node wrote, so `parse_position/1` must be able to refuse
+  anything unexpected without inventing a value. Shared here so every backend encodes it
+  identically — a per-backend format would be a contract only the double ever tested.
+  """
+  @spec encode_position(position()) :: String.t()
+  def encode_position(%{epoch: e, wal_gen: g, offset: o}), do: "#{e}:#{g}:#{o}"
+
+  @doc """
+  Parse a position stamp, or `nil` for anything that is not exactly one.
+
+  Every failure returns `nil` — absent, malformed, negative, extra fields. `nil` means "unknown",
+  and the only thing that consumes a position treats unknown as "never override the stored
+  object", so garbage degrades to the safe answer instead of a fabricated ordering.
+  """
+  @spec parse_position(String.t() | nil) :: position() | nil
+  def parse_position(nil), do: nil
+
+  def parse_position(raw) when is_binary(raw) do
+    with [e, g, o] <- String.split(raw, ":"),
+         {epoch, ""} when epoch >= 0 <- Integer.parse(e),
+         {gen, ""} when gen >= 0 <- Integer.parse(g),
+         {off, ""} when off >= 0 <- Integer.parse(o) do
+      %{epoch: epoch, wal_gen: gen, offset: off}
+    else
+      _ -> nil
+    end
+  end
+
+  def parse_position(_), do: nil
 
   @doc "The stored object's current etag (`nil` if absent) without transferring the body."
   @spec object_etag(String.t()) :: {:ok, String.t() | nil} | {:error, term()}

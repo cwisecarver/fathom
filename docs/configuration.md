@@ -161,6 +161,61 @@ tenant-controllable signal, so it presumes the Hrana trust boundary is enforced.
 | `WARM_MIN_REPULL_MS` | 10 × `WARM_POLL_MS` | Floor on how often ONE cached shard's body may be re-transferred. | **This is what bounds the follower's steady-state cost.** A continuously-written tenant flushes faster than the poll, so without it every refresh is a full body + fsync, forever. Worst-case ingress is Σ(cached sizes) ÷ this. Raising it trades failover RTO on write-hot shards for bandwidth and device writes — never correctness, since promotion revalidates before serving. |
 | `WARM_REFRESH_BYTES_PER_S` | unset (uncapped) | Hard cap on warm-refresh ingress, spent lag-first. | Bounds the aggregate independently of cache size — set it to what the node's NIC/disk can spare. Too small doesn't break the cache, it just converges it more slowly (oldest-checked shard first, so the tail is never starved). |
 
+## Quorum replication (Phase-2 A2 — off by default)
+
+Ships WAL frames to follower nodes and gates a tenant's commit on `REPLICATION_QUORUM` acks.
+Closes node-loss RPO from ~300 s to ~0, and it is the only thing that does. Read
+[`docs/a2-quorum-replication.md`](a2-quorum-replication.md) before enabling: this puts a network
+round trip inside every COMMIT.
+
+**Placement is the decision, not replica count.** A quorum skips the *slowest* replicas, so it buys
+nothing unless a quorum's worth are near: with all four followers equidistant, 2-of-4 tracked 4-of-4
+exactly at every latency measured. With two near and two far, 2-of-4 acks in ~1.6 ms where 4-of-4
+pays 134 ms — same replicas, 82×.
+
+### Rollout order: listening comes first, fleet-wide
+
+Shipping and receiving are **separate gates**, and enabling them in the wrong order is an outage.
+`REPLICATION_ENABLED` makes a node *ship*; `REPLICATION_LISTEN` makes a node *receive*. A shipper
+whose followers are not listening collects no acks and returns **503 `FILO_NO_QUORUM` on every
+tenant write**.
+
+1. Set `REPLICATION_LISTEN=true` (plus `REPLICATION_BIND_IP`, `REPLICATION_DIR`) **everywhere**, and
+   confirm each node logged `replication follower listening on <ip>:<port>`.
+2. Only then set `REPLICATION_ENABLED` + `REPLICATION_FOLLOWERS` on the nodes that should ship.
+3. `REPLICATION_PROMOTE_ON_OPEN` next, after flushes have been stamping positions for a while.
+4. `REPLICATION_RECOVER_FROM_PEERS` last. Step 3 only helps when the survivor happens to be holding
+   a replica; this is what makes the RPO claim hold when it is not.
+
+> Before 2026-08-10 there was no step 1: the listener existed but was never started outside the
+> test suite, so `REPLICATION_FOLLOWERS` pointed at a port fathom never opened and enabling
+> replication broke every write on the node. If you are reading an older runbook, this is the step
+> it is missing.
+
+| Var | Default | What it does | Safety consequence |
+|---|---|---|---|
+| `REPLICATION_LISTEN` | off | Accept frames as somebody's follower. **Turn on fleet-wide before any node ships.** | Opens an **unauthenticated** TCP port carrying raw tenant database bytes. Pin it with `REPLICATION_BIND_IP` and firewall it — the network is the trust boundary, same posture as `HRANA_AUTH` disabled. |
+| `REPLICATION_LISTEN_PORT` | `9100` | Port the follower binds. | Must be reachable from every shipping node and from nowhere else. Clear of `HRANA_PORT` 8080 and `HEALTH_PORT` 8081. |
+| `REPLICATION_BIND_IP` | unset (**all interfaces**) | Interface the follower binds. | **A security control, not tuning.** Unset means every interface, which on a cloud host is the public one — and anyone who reaches the port can write into any shard this node follows. Invalid value refuses to boot. The follower logs the interface it bound; read that line. |
+| `REPLICATION_DIR` | `$TMPDIR/fathom_replication` | Where received replicas are stored. | Holds a **full copy of every shard this node follows** and grows from *other* nodes' write traffic. The default is under `$TMPDIR` — point it at real local disk. Reported as `dir=replica` by `fathom.node.disk`. |
+| `REPLICATION_ADVERTISE_HOST` | unset | The host **peers** should dial to reach this node's replication port. Published to the fleet roster so membership can be derived instead of hand-listed. | **Never guessed** — a node cannot know which of its addresses a peer can reach, and publishing an unreachable one is worse than publishing none (the roster reports the node present while every shipper fails to connect). Unset ⇒ this node is not a membership candidate. Use the same address you would have written into `REPLICATION_FOLLOWERS` by hand. |
+| `REPLICATION_MEMBERSHIP` | `static` | Where the follower set comes from: `static` (the `REPLICATION_FOLLOWERS` list) or `roster` (addresses nodes publish to `rebalancer_nodes`). | **The static list stays the floor in `roster` mode** — whenever the roster cannot supply `REPLICATION_QUORUM+1` candidates (fresh fleet, rolling upgrade, Postgres outage) membership falls back to it rather than to nothing. A set below `quorum+1` is **refused** and the previous one stays live: `n` dropping below `q` is how `q >= n` starts raising inside a tenant's commit. Requires `REPLICATION_ADVERTISE_HOST` on candidate nodes and `LOAD_REPORTER` on (the beat rides that tick). |
+| `REPLICATION_MEMBERSHIP_POLL_MS` | `30000` | How often `roster` membership is recomputed. | Deliberately slow — a control-plane read, not a liveness signal. **Every membership change costs a seed per shard** on the added follower, over the one socket that also carries every other shard. Liveness never filters the per-commit push set; a merely-down follower stays a member and costs nothing. |
+| `REPLICATION_ENABLED` | off | Gate a tenant's commit on follower acks. | Adds a network round trip to every write. Measured +225 µs on loopback (74 → 299 µs); the real number is set by follower distance. **Requires the followers to be listening already** — see the rollout order above. |
+| `REPLICATION_FOLLOWERS` | unset | Follower set as `node_key@host:port`, comma separated. `node_key@` optional. | **Order and locality are a latency decision** (see above). With `Q=2`, two followers must be near — and in a *different* AZ, or one AZ failure takes 3 of 5 copies and leaves exactly `Q` with no slack. A malformed entry **refuses to boot** rather than silently shortening the replica set. |
+| `REPLICATION_QUORUM` | `2` | Acks required before a commit returns. | **Must be < the follower count**; the boot check refuses `Q=N`. Q=N tolerates zero follower failures and inherits the slowest replica — measured 32× worse with one straggler, 82× with two far. |
+| `REPLICATION_FSYNC` | off | Follower `fdatasync`s before acking. | On costs ~398 µs against a ~96 µs floor — ~2.4× fathom's whole request round trip. Off matches Waterpark (ack from RAM, durability from replica count) and is never *worse* than today: if every replica holding an un-synced frame dies at once, the shard falls back to its S3 object, i.e. pre-A2 behaviour. |
+| `REPLICATION_TIMEOUT_MS` | `5000` | How long a commit waits for its quorum before 503 `FILO_NO_QUORUM`. | A ceiling, not a target — the quorum returns early with `:impossible` as soon as too few followers remain, so this only binds when a follower is *silent* rather than refusing. |
+| `REPLICATION_SEED_CHUNK_BYTES` | `4194304` | Frame size when seeding a follower's base copy. | Bounds **memory** on both sides (a seed is a whole database). Does **not** bound head-of-line blocking: one socket per follower node carries every shard, so a large seed still delays other shards on that link. |
+| `REPLICATION_PROMOTE_ON_OPEN` | off | A cold open serves a **local** replica when it is provably newer than the stored object. Necessary for the RPO claim; see the row below for why it is not sufficient. | Changes what a cold open **serves**, on the code path owning the lease fence and provenance. Enable `REPLICATION_ENABLED` first and leave it running: every flush stamps its position, so the comparison data exists fleet-wide before this is flipped. Fails toward the stored object three ways — the stamp over-claims, the replica must be **strictly** ahead, and an **unstamped object is never overridden** (so it is inert per shard until that shard's next flush after upgrade). Each promotion snapshots what it replaced and emits `fathom_shard_replica_promoted_count`. |
+| `REPLICATION_RECOVER_FROM_PEERS` | off | A cold open **asks every peer** where its replica sits, adopts the best one that is provably ahead of the stored object, and pulls it over A2's own socket. **This is what makes node-loss RPO ~0 rather than ~0-if-lucky.** | The row above only fires when the node the LB failed over to happens to hold a replica, and the LB picks by consistent hash on the Host subdomain — it knows nothing about replication. Measured on the rig 2026-08-11: an acked, quorum-replicated write **lost** while three other nodes held it. Costs one object-position read per promote-eligible open plus one *concurrent* round trip to each peer; a node already holding the freshest copy short-circuits before touching the network. Requires `REPLICATION_LISTEN` on **this** node (the pull installs through the local replica directory). Every uncertain case — unreachable fleet, peer one deploy behind, unstamped object — falls back to the stored object, so it is never worse than leaving it off. Emits `fathom_replication_recovered_from_peer_count`. |
+| `REPLICATION_RECOVERY_TIMEOUT_MS` | `2000` | How long a cold open waits for peers to answer "where is your replica?". | One round trip's budget, not N — every peer is asked at once. Deliberately short: a peer too slow to answer is one whose replica we would rather not wait to transfer either, and the fallback is the stored object. |
+| `REPLICATION_RECOVERY_PULL_TIMEOUT_MS` | `60000` | Budget for transferring a winning peer's replica. | A whole tenant database over the network, so sized like a seed rather than like a query. A timeout leaves nothing installed and the shard opens from the stored object. |
+
+Watch `fathom_replication_followers_slack` (connected followers minus the quorum). `0` means every
+write still succeeds and one more follower loss fails all of them — a state with no other symptom.
+Alert rules for both `0` and negative are in `deploy/observability/alert-rules.yml`.
+
 ## Development tooling
 
 | Variable | Default | What it does | Notes |

@@ -52,6 +52,7 @@ pub mod datetime;
 pub mod pyre;
 pub mod pytypes;
 pub mod scalars;
+pub mod wal;
 
 use aggregates::{BitAgg, BitOp, Variance};
 use datetime::UdfError;
@@ -90,6 +91,12 @@ fn register_all(db: Connection) -> Result<bool> {
     register_hashes(&db, det)?;
     register_misc(&db, det, nondet)?;
     register_aggregates(&db)?;
+
+    // The Phase 2 A2 frame seam. NOT a UDF — it installs a commit hook, and because
+    // `sqlite3_wal_hook` and `wal_autocheckpoint` share one slot, it also takes over the
+    // checkpointing it displaces. See src/wal.rs; removing this line silently disables BOTH the
+    // hook and (harmlessly) restores SQLite's own autocheckpoint.
+    wal::install(&db)?;
 
     Ok(false)
 }

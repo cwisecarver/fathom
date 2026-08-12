@@ -66,6 +66,26 @@ defmodule Fathom.BenchTest do
     assert kb < 5_000, "fan-out #{kb} KiB/shard exceeded the 5 MiB ceiling"
   end
 
+  # Ceiling guard for the GC'd companion to fanout, same shape as its neighbour above.
+  #
+  # It deliberately does NOT assert `fanout_gc <= fanout`, which is the invariant you would
+  # reach for first. That assertion was written, and it FAILED here — not because collecting
+  # added heap, but because at these guard-sized parameters `fanout/1` read **-5.75 KiB/shard**:
+  # a sweep between its two samples freed more than 20 coordinators allocated. A metric that
+  # returns negative numbers has no usable ordering, and any slack term wide enough to absorb
+  # that is wide enough to assert nothing. (That it can go negative at all is recorded in
+  # `fanout_gc/1`'s @doc as evidence about the metric, which is where it earns its keep.)
+  #
+  # Nor does this prove the collection happened: if `fanout_gc/1` silently stopped collecting it
+  # would equal `fanout/1` and still pass. Proving the sweep needs coordinators holding known
+  # garbage on demand and there is no seam for that. The evidence the sweep works is the
+  # measurement in `fanout_gc/1`'s @doc. This is a smoke + order-of-magnitude guard, nothing more.
+  test "the GC'd fan-out floor is within the ceiling" do
+    kb = Fathom.Bench.fanout_gc(fanout_n: 20, trials: 2)
+    assert is_float(kb)
+    assert kb < 5_000, "GC'd fan-out #{kb} KiB/shard exceeded the 5 MiB ceiling"
+  end
+
   # Expert review 2026-07-24 #9. Pins the coordinator's memory POLICY, not a post-GC byte count:
   # a test that forces `:erlang.garbage_collect/1` measures the same figure with or without the
   # policy (verified on this change — 2 KiB vs 3 KiB), because forcing a sweep is precisely what

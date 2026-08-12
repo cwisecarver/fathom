@@ -39,7 +39,8 @@ defmodule Fathom.Telemetry do
            {Fathom.Admin.Measurements, :node_memory, []},
            {Fathom.Admin.Measurements, :vm_limits, []},
            {Fathom.Admin.Measurements, :durability, []},
-           {Fathom.Admin.Measurements, :disk, []}
+           {Fathom.Admin.Measurements, :disk, []},
+           {Fathom.Admin.Measurements, :replication, []}
          ],
          period: 10_000,
          name: Fathom.ShardPoller}
@@ -104,6 +105,28 @@ defmodule Fathom.Telemetry do
       ),
       counter("fathom.shard.lease.held.count",
         description: "Starts refused against a live foreign lease"
+      ),
+      # Rare and consequential: a cold open served a local replica INSTEAD of the stored object,
+      # because the replica was provably ahead of what the object claimed. That is the A2 RPO win
+      # actually happening, and it is also the moment a lineage was overwritten — so it wants to be
+      # visible per shard in the log line and countable on the dashboard. Zero on a healthy fleet;
+      # a rising rate means failovers, not a problem with this path.
+      counter("fathom.shard.replica_promoted.count",
+        event_name: [:fathom, :shard, :replica_promoted],
+        description:
+          "Cold opens that promoted a newer local replica over the stored object (A2). Each one " <>
+            "recovered writes the last flush did not have, and snapshotted what it replaced"
+      ),
+      # NO `source` TAG, though the event carries one. A node_key is bounded by fleet size today
+      # and would be a legitimate label — but the number an operator acts on is "did any shard have
+      # to reach across the fleet to recover", and splitting it by source only makes the alert
+      # threshold depend on which node died. The source rides the event metadata and the log line.
+      counter("fathom.replication.recovered_from_peer.count",
+        event_name: [:fathom, :replication, :recovered_from_peer],
+        description:
+          "Cold opens that pulled a fresher replica from a PEER because this node held none (A2 " <>
+            "survivor selection). Each one is a failover where the LB picked a node without a " <>
+            "replica and the write tail was recovered anyway — the RPO claim doing its job"
       ),
       counter("fathom.shards.at_capacity.count",
         event_name: [:fathom, :shards, :at_capacity],
@@ -281,6 +304,52 @@ defmodule Fathom.Telemetry do
         measurement: :used_ratio,
         tags: [:dir],
         description: "Used fraction of the volume holding this directory (1.0 = full)"
+      ),
+      last_value("fathom.replication.followers.connected",
+        event_name: [:fathom, :replication, :followers],
+        measurement: :connected,
+        description: "Followers whose replication socket is up right now (A2)"
+      ),
+      last_value("fathom.replication.followers.configured",
+        event_name: [:fathom, :replication, :followers],
+        measurement: :configured,
+        description: "Followers in :replication_followers (A2)"
+      ),
+      # The one to alert on. A commit needs `quorum` acks, so slack=0 means every write still
+      # succeeds and the next follower loss fails all of them — a state with no other symptom:
+      # latency is normal, no error rate moves, and the shard reports healthy until it doesn't.
+      last_value("fathom.replication.followers.slack",
+        event_name: [:fathom, :replication, :followers],
+        measurement: :slack,
+        description:
+          "Connected followers minus the write quorum. 0 = every write succeeds and one more " <>
+            "follower loss fails all of them; negative = writes are already failing FILO_NO_QUORUM"
+      ),
+      # Membership swaps (A2 Layer 3). Tagged by `source` and `reason`, both bounded sets — never
+      # by node_key, which grows with the fleet.
+      counter("fathom.replication.membership_changed.count",
+        event_name: [:fathom, :replication, :membership_changed],
+        measurement: :size,
+        tags: [:source],
+        description: "Follower-set swaps applied (A2 membership)"
+      ),
+      last_value("fathom.replication.membership_changed.size",
+        event_name: [:fathom, :replication, :membership_changed],
+        measurement: :size,
+        tags: [:source],
+        description: "Followers in the set after the most recent swap (A2 membership)"
+      ),
+      # THE ONE TO ALERT ON, and it is quiet by construction. A refusal means a computed set was
+      # below quorum+1 and the PREVIOUS set is still live — so writes keep succeeding and nothing
+      # else moves, while the node is pinned to a membership the fleet has moved on from. Left
+      # alone it ends as a set of followers that no longer exist.
+      counter("fathom.replication.membership_refused.count",
+        event_name: [:fathom, :replication, :membership_refused],
+        measurement: :kept,
+        tags: [:source, :reason],
+        description:
+          "Follower-set swaps REFUSED for being below quorum+1. Sustained non-zero means " <>
+            "membership is stuck on a stale set while writes still look healthy"
       ),
       last_value("fathom.durability.dirty_shards",
         event_name: [:fathom, :durability, :rpo],

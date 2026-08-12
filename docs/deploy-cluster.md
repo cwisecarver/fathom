@@ -336,7 +336,11 @@ Two layers, deliberately split:
     via `Fathom.Test.FaultyStorage`).
 - **Failover time + loss window — the real rig (`deploy/chaos/`, built 2026-07-05).** Time-to-serve
   and the committed-but-unflushed loss window are *measurements*, not pass/fail invariants, and they
-  need a real deployment. The rig is a one-host Docker Compose stack — 3 prod-release fathom nodes
+  need a real deployment. The rig is a one-host Docker Compose stack — **5** prod-release fathom
+  nodes (raised from 3 on 2026-08-08: Phase 2 A2 replicates each shard to 1 primary + 4 followers,
+  so five is the minimum that can hold one replica set — see
+  [a2-quorum-replication](a2-quorum-replication.md). **Runs from the 3-node rig are a different
+  topology and are not comparable**; start a new series rather than diffing against them.) —
   behind nginx (`hash $host consistent`), one MinIO bucket reached through per-node **toxiproxy**
   proxies (latency/bandwidth/partition injection), one Postgres — driven by `deploy/chaos/chaos.sh`:
   `failover` (silent-kill an owner, time the LB reroute + lease steal on a survivor), `pause-fence`
