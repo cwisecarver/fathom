@@ -1097,7 +1097,12 @@ cmd_quorum_loss() {
   local a1_ok=$QL_OK a1_fail=$QL_FAIL a1_ms=$QL_MAX_MS
   echo "  ok=$a1_ok/5 failed=$a1_fail slowest=${a1_ms}ms (baseline ${base_ms}ms)"
   ql_revive "${victims[@]}"
-  ql_wait_writable "$shard" || { echo "FAIL: the fleet never recovered after arm 1."; rm -f "$ack_file"; return 1; }
+  # WHOLE, not merely writable. The first version of this waited for a successful write, which
+  # `writable again after 0s` immediately exposed as no check at all: with two survivors and q=2
+  # the shard commits happily while both victims are still booting — so arm 2 would then kill one
+  # live node plus two corpses and report it as a simultaneous three-node loss. The precondition
+  # arm 2 actually needs is that the HOME holds a live connection to every follower.
+  ql_wait_connected "$home" "$nf" || { echo "FAIL: the fleet never came back after arm 1."; rm -f "$ack_file"; return 1; }
 
   echo
   echo "=== ARM 2: $fatal follower(s) die at once — writes MUST fail closed, and FAST ==="
@@ -1113,10 +1118,10 @@ cmd_quorum_loss() {
   echo
   echo "=== RECOVERY: the fleet is whole again ==="
   local recovered=no
-  ql_wait_writable "$shard" && recovered=yes
+  ql_wait_connected "$home" "$nf" && ql_wait_writable "$shard" && recovered=yes
   ql_burst "$shard" 5 400 "$ack_file"
   local r_ok=$QL_OK
-  echo "  writable=$recovered  ok=$r_ok/5 failed=$QL_FAIL slowest=${QL_MAX_MS}ms"
+  echo "  whole=$recovered  ok=$r_ok/5 failed=$QL_FAIL slowest=${QL_MAX_MS}ms"
 
   echo
   echo "=== DATA: every acked row must still exist somewhere ==="
@@ -1167,7 +1172,7 @@ cmd_quorum_loss() {
   fi
 
   if [ "$recovered" != "yes" ] || [ "$r_ok" -ne 5 ]; then
-    echo "  *** FAIL: the fleet did not return to committing after the nodes came back."
+    echo "  *** FAIL: the fleet did not return to whole-and-committing after the nodes came back."
     rc=1
   fi
 
@@ -1204,9 +1209,27 @@ ql_revive() {
   for v in "$@"; do compose up -d "$v" >/dev/null 2>&1; done
 }
 
-# Poll until the shard commits again. Polling rather than sleeping: a revived node has to boot,
-# start listening, and be reconnected to by the home's shipper, and how long that takes is exactly
-# the thing a fixed sleep guesses wrong.
+# Poll until the HOME holds a live connection to all `want` followers.
+#
+# This is the arms' real precondition and a successful write is not a substitute for it: with q=2
+# of 4, the shard commits while two followers are still down, so "it wrote" cannot distinguish a
+# whole fleet from a half one. Asking the primary how many of its shippers are connected does.
+#
+# Polling rather than sleeping: a revived node has to boot, start listening, and be reconnected to
+# on the shipper's 500 ms backoff, and how long that takes is exactly what a fixed sleep gets
+# wrong.
+ql_wait_connected() {
+  local node=$1 want=$2 tries=0 have
+  while :; do
+    have=$(rpc "$node" 'IO.puts(Enum.count(Fathom.Shard.Replication.Fleet.shippers(), &Fathom.Shard.Replication.Shipper.connected?/1))')
+    is_num "$have" && [ "$have" -ge "$want" ] && { echo "  $node connected to $have/$want followers after ${tries}s"; return 0; }
+    tries=$((tries + 1))
+    [ "$tries" -gt 180 ] && { echo "  *** $node still connected to only ${have:-?}/$want followers after ${tries}s"; return 1; }
+    sleep 1
+  done
+}
+
+# Poll until the shard commits again — service restored, as distinct from the fleet being whole.
 ql_wait_writable() {
   local shard=$1 tries=0
   until sql "$shard" "SELECT 1" >/dev/null 2>&1 &&
