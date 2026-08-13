@@ -35,6 +35,11 @@
 #                                 replica of its own. Runs BOTH arms — gate off must LOSE the row,
 #                                 gate on must KEEP it — so a run that proves nothing says so.
 #                                 Needs REPLICATION_ENABLED=true on `up`.
+#   ./chaos.sh quorum-loss [shard]  Phase-2 A2: kill several followers at the SAME INSTANT — the
+#                                 boundary `soak` cannot reach, since it kills one at a time. Runs
+#                                 BOTH arms: n-q dead must keep committing, n-q+1 dead must fail
+#                                 closed AND fast (Quorum's :impossible branch, not the 5s ship
+#                                 timeout). Needs REPLICATION_ENABLED=true on `up` AND here.
 #   ./chaos.sh tpcb [shards txns accounts]  remote TPC-B: RTT probe + N tenant shards driven
 #                                 through the LB by a real libSQL client (the Phase-4 realism run)
 #   ./chaos.sh tpcc [max_w threads txns scale]  remote TPC-C: W=1..max_w sweep through the LB
@@ -990,6 +995,249 @@ rpo_trial() {
 
   is_num "$count" || { echo INVALID; return; }
   echo "$count"
+}
+
+# -- quorum-loss: several followers dying at the SAME INSTANT ------------------
+#
+# WHY `soak` COULD NOT PROVE THIS. It kills one node at a time on a 25 s timer. Each node ships to
+# its four peers and needs `REPLICATION_QUORUM` (2) acks, so one dead follower always left three
+# and the quorum was reachable in every run this rig has ever done. The boundary — the loss that
+# takes the quorum below what it needs — had never been crossed on real containers.
+#
+# The two arms are chosen from the configuration, not hardcoded: with n followers and quorum q,
+# `n - q` is the largest survivable simultaneous loss and `n - q + 1` is the smallest fatal one.
+# Reading them from `REPLICATION_QUORUM` means a run with a different quorum still tests the
+# boundary rather than silently testing the wrong side of it.
+#
+# BOTH ARMS RUN, EVERY TIME, and they discriminate each other. Arm 1 must keep committing and arm 2
+# must fail closed. A run where arm 2 also succeeds is reported NOT DISCRIMINATING and fails,
+# because at that point arm 1's pass is not evidence of anything — the same rule `rpo` follows.
+#
+# ARM 2 ASSERTS LATENCY, NOT ONLY FAILURE, and that is the assertion worth having. A 503 after 5 s
+# and a 503 after 50 ms are both "fail closed", but only the second one means `Quorum.settle/1`'s
+# `:impossible` branch fired: `n - rejected < q` is provable the moment the rejects land, and the
+# whole reason that branch exists is that a commit blocked on an unreachable quorum is an outage
+# wearing latency. Reaching it needs the dead followers to reject PROMPTLY, which needs
+# `tcp_closed` to arrive from a SIGKILLed container — exactly the thing no in-process test can
+# stand in for. `replication_transport_test.exs` proves the mechanism against sockets we control;
+# this proves it against containers we do not.
+#
+# The home node stays ALIVE in both arms. Killing it too would fold failover into the result, and a
+# failure could then be quorum, or failover, or their interaction; `failover` and `rpo` already own
+# that axis.
+#
+#   REPLICATION_ENABLED=true ./chaos.sh up
+#   REPLICATION_ENABLED=true ./chaos.sh quorum-loss
+cmd_quorum_loss() {
+  local shard=${1:-ql1}
+  local n victims=() followers=() home
+  local q=${REPLICATION_QUORUM:-2}
+  local ack_file; ack_file=$(mktemp)
+
+  echo "=== preconditions ==="
+  # Needed on THIS command and not only on `up`: the arms revive killed nodes with `compose up -d`,
+  # and compose rebuilds those containers from the invoking shell's environment. A revived node
+  # would otherwise come back with shipping OFF. Same trap `rpo` documents.
+  if [ "${REPLICATION_ENABLED:-}" != "true" ]; then
+    echo "FAIL: REPLICATION_ENABLED is not set on THIS command."
+    echo "  It is needed here as well as on \`up\`: both arms revive nodes they killed, and"
+    echo "  compose rebuilds those containers from this shell's environment."
+    echo "      REPLICATION_ENABLED=true ./chaos.sh quorum-loss $shard"
+    rm -f "$ack_file"; return 1
+  fi
+
+  if [ "$(rpc fathom1 'IO.puts(Fathom.Shard.Replication.Fleet.replicating?())')" != "true" ]; then
+    echo "FAIL: shipping is off on fathom1 — a boot-time supervision tree, so it needs:"
+    echo "      REPLICATION_ENABLED=true ./chaos.sh up"
+    rm -f "$ack_file"; return 1
+  fi
+
+  # `up` does not build. A pass against an image that predates the code under test reads as
+  # validation, which is the most expensive way to be wrong.
+  if ! rpc fathom1 'IO.puts(Code.ensure_loaded?(Fathom.Shard.Replication.Quorum))' | grep -q true
+  then
+    echo "FAIL: this image has no Fathom.Shard.Replication.Quorum — rebuild it."
+    echo "      ./chaos.sh build && REPLICATION_ENABLED=true ./chaos.sh up"
+    rm -f "$ack_file"; return 1
+  fi
+
+  ensure_nodes_up || { rm -f "$ack_file"; return 1; }
+
+  seed "$shard"
+  home=$(cmd_owner "$shard") || { echo "no home found"; rm -f "$ack_file"; return 1; }
+  for n in "${NODES[@]}"; do [ "$n" != "$home" ] && followers+=("$n"); done
+
+  local nf=${#followers[@]} survivable fatal
+  survivable=$(( nf - q ))
+  fatal=$(( nf - q + 1 ))
+
+  echo "  shipping ON, home=$home, followers=${followers[*]}"
+  echo "  n=$nf q=$q  ->  survivable simultaneous loss = $survivable, fatal = $fatal"
+
+  if [ "$survivable" -lt 1 ]; then
+    echo "FAIL: n=$nf q=$q leaves no survivable loss to test — this scenario has nothing to say."
+    rm -f "$ack_file"; return 1
+  fi
+
+  echo
+  echo "=== baseline: the whole fleet up ==="
+  ql_burst "$shard" 5 100 "$ack_file"
+  local base_ok=$QL_OK base_ms=$QL_MAX_MS
+  echo "  ok=$base_ok/5 failed=$QL_FAIL slowest=${base_ms}ms"
+  if [ "$base_ok" -ne 5 ]; then
+    echo "FAIL: the fleet cannot commit with every node up — nothing below would mean anything."
+    rm -f "$ack_file"; return 1
+  fi
+
+  echo
+  echo "=== ARM 1: $survivable follower(s) die at once — writes MUST keep committing ==="
+  victims=("${followers[@]:0:$survivable}")
+  ql_kill "${victims[@]}"
+  ql_burst "$shard" 5 200 "$ack_file"
+  local a1_ok=$QL_OK a1_fail=$QL_FAIL a1_ms=$QL_MAX_MS
+  echo "  ok=$a1_ok/5 failed=$a1_fail slowest=${a1_ms}ms (baseline ${base_ms}ms)"
+  ql_revive "${victims[@]}"
+  ql_wait_writable "$shard" || { echo "FAIL: the fleet never recovered after arm 1."; rm -f "$ack_file"; return 1; }
+
+  echo
+  echo "=== ARM 2: $fatal follower(s) die at once — writes MUST fail closed, and FAST ==="
+  victims=("${followers[@]:0:$fatal}")
+  ql_kill "${victims[@]}"
+  ql_burst "$shard" 5 300 "$ack_file"
+  local a2_ok=$QL_OK a2_fail=$QL_FAIL a2_ms=$QL_MAX_MS
+  echo "  ok=$a2_ok/5 failed=$a2_fail slowest=${a2_ms}ms"
+  compose logs --since 2m "$home" 2>/dev/null |
+    grep -Ei "quorum IMPOSSIBLE|no_quorum|replication rejected" | tail -3 | sed 's/^/  log: /'
+  ql_revive "${victims[@]}"
+
+  echo
+  echo "=== RECOVERY: the fleet is whole again ==="
+  local recovered=no
+  ql_wait_writable "$shard" && recovered=yes
+  ql_burst "$shard" 5 400 "$ack_file"
+  local r_ok=$QL_OK
+  echo "  writable=$recovered  ok=$r_ok/5 failed=$QL_FAIL slowest=${QL_MAX_MS}ms"
+
+  echo
+  echo "=== DATA: every acked row must still exist somewhere ==="
+  # Set intersection, not a count difference — a shard legitimately holds rows that were never
+  # acked (the write committed and the ack was lost), so subtracting cardinalities goes negative.
+  # See the note above `soak`'s verdict, which was written after a run printed DESTROYED=-8.
+  local all_seqs acks_sorted acked recoverable foreign
+  all_seqs=$(mktemp); acks_sorted=$(mktemp)
+  { sql "$shard" "SELECT seq FROM kv" | vals; recoverable_seqs "$shard"; } \
+    | grep -E '^[0-9]+$' | sort -u > "$all_seqs"
+  sort -u "$ack_file" > "$acks_sorted"
+  acked=$(wc -l < "$acks_sorted" | tr -d ' ')
+  recoverable=$(comm -12 "$acks_sorted" "$all_seqs" | wc -l | tr -d ' ')
+  foreign=$(sql "$shard" "SELECT count(*) FROM kv WHERE tenant <> '$shard'" | val)
+  rm -f "$all_seqs" "$acks_sorted" "$ack_file"
+
+  local destroyed=$(( acked - recoverable ))
+  echo "  acked=$acked recoverable=$recoverable DESTROYED=$destroyed (MUST be 0) foreign=$foreign"
+
+  echo
+  echo "RESULT quorum-loss:"
+  echo "  arm 1 ($survivable dead, quorum reachable):   $a1_ok ok / $a1_fail failed, slowest ${a1_ms}ms"
+  echo "  arm 2 ($fatal dead, quorum unreachable):      $a2_ok ok / $a2_fail failed, slowest ${a2_ms}ms"
+  echo "  recovery: $r_ok/5 ok    data: DESTROYED=$destroyed foreign=$foreign"
+
+  local rc=0
+
+  if [ "$a2_ok" -ne 0 ]; then
+    echo "  *** NOT DISCRIMINATING: $a2_ok write(s) committed with the quorum unreachable."
+    echo "      Either the loss was not simultaneous, or the commit is not counting the dead"
+    echo "      followers — and arm 1's pass then proves nothing."
+    rc=1
+  fi
+
+  if [ "$a1_ok" -ne 5 ]; then
+    echo "  *** FAIL: losing $survivable of $nf followers at once broke a quorum of $q that was"
+    echo "      still reachable. A survivable loss must not stop writes."
+    rc=1
+  fi
+
+  # The design claim, not just the safety one. 5000ms is :replication_timeout_ms; a fail that took
+  # that long did NOT come from Quorum's :impossible branch.
+  if [ "$a2_ms" -ge 4000 ]; then
+    echo "  *** FAIL: arm 2 failed closed but took ${a2_ms}ms — it burned the ship timeout instead"
+    echo "      of proving the quorum unreachable. Either the dead followers never rejected (no"
+    echo "      tcp_closed from a SIGKILLed container) or :impossible is not being reached."
+    rc=1
+  fi
+
+  if [ "$recovered" != "yes" ] || [ "$r_ok" -ne 5 ]; then
+    echo "  *** FAIL: the fleet did not return to committing after the nodes came back."
+    rc=1
+  fi
+
+  if ! is_num "$foreign" || [ "$foreign" != "0" ]; then
+    echo "  *** ISOLATION LEAK: $foreign foreign row(s)."
+    rc=1
+  fi
+
+  if [ "$destroyed" -ne 0 ]; then
+    echo "  *** FAIL: $destroyed acked row(s) exist nowhere on the fleet."
+    rc=1
+  fi
+
+  if [ "$rc" -eq 0 ]; then
+    echo "  PASS: losing $survivable of $nf followers at the same instant keeps committing; losing"
+    echo "        $fatal fails closed in ${a2_ms}ms — Quorum's :impossible branch, not the 5000ms ship"
+    echo "        timeout — and the fleet recovered with no acked row destroyed."
+  fi
+  return $rc
+}
+
+# All victims in ONE `docker kill`, because simultaneity is the entire property under test — a
+# loop with a shell round trip between kills is the staggered case `soak` already covers.
+ql_kill() {
+  local v names=()
+  for v in "$@"; do names+=("$(cname "$v")"); done
+  echo "  killing at once: $*"
+  "$DOCKER" kill "${names[@]}" >/dev/null 2>&1
+}
+
+ql_revive() {
+  local v
+  echo "  reviving: $*"
+  for v in "$@"; do compose up -d "$v" >/dev/null 2>&1; done
+}
+
+# Poll until the shard commits again. Polling rather than sleeping: a revived node has to boot,
+# start listening, and be reconnected to by the home's shipper, and how long that takes is exactly
+# the thing a fixed sleep guesses wrong.
+ql_wait_writable() {
+  local shard=$1 tries=0
+  until sql "$shard" "SELECT 1" >/dev/null 2>&1 &&
+        sql "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', 0)" >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    [ "$tries" -gt 120 ] && { echo "  still not writable after $tries tries"; return 1; }
+    sleep 1
+  done
+  echo "  writable again after ${tries}s"
+}
+
+# `count` writes, timed, appending the seqs that were ACKED to `ack_file`. Sets QL_OK / QL_FAIL /
+# QL_MAX_MS. Classification is `sql`'s, which checks the HTTP status AND the per-statement result —
+# a FILO_NO_QUORUM must never be scored as a success because only one of the two was read.
+ql_burst() {
+  local shard=$1 count=$2 first=$3 ack_file=$4
+  local i seq t0 t1 ms
+  QL_OK=0; QL_FAIL=0; QL_MAX_MS=0
+  for i in $(seq 0 $((count - 1))); do
+    seq=$(( first + i ))
+    t0=$(now_ms)
+    if sql "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', $seq)" >/dev/null 2>&1; then
+      t1=$(now_ms)
+      QL_OK=$((QL_OK + 1)); echo "$seq" >> "$ack_file"
+    else
+      t1=$(now_ms)
+      QL_FAIL=$((QL_FAIL + 1))
+    fi
+    ms=$(( t1 - t0 ))
+    [ "$ms" -gt "$QL_MAX_MS" ] && QL_MAX_MS=$ms
+  done
 }
 
 # Rows matching <seq> in the shard's DURABLE OBJECT (not any node's local file). `-1` on any
@@ -2141,6 +2389,7 @@ case "${1:-}" in
   hotspots)    shift; cmd_hotspots "$@" ;;
   replication) shift; cmd_replication "$@" ;;
   rpo)         shift; cmd_rpo "$@" ;;
+  quorum-loss) shift; cmd_quorum_loss "$@" ;;
   up)          cmd_up ;;
   down)        cmd_down ;;
   logs)        shift; cmd_logs "$@" ;;
