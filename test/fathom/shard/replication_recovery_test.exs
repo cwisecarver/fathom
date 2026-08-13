@@ -118,6 +118,34 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
       assert {:pull, {"n2", _, _}, _} = Recovery.choose(at(9, 3, 100), stamp(9, 3, 4_120), offers)
     end
 
+    # The 2026-08-12 rig bug, at the decision layer. A torn replica's offset is a true statement
+    # about a WAL and a false one about a copy of the shard: its `.db` is a generation behind, so
+    # the pair does not compose into a database. It read as strictly ahead of the object and was
+    # promoted, and the tenant got an EMPTY database over a working one.
+    # See docs/reviews/a2-checkpoint-torn-replica-2026-08-12.md.
+    test "a TORN replica is never chosen — not locally, not from a peer" do
+      torn = Map.put(at(99, 99, 99_999_999), :torn, true)
+
+      # however far ahead it claims to be
+      assert :none = Recovery.choose(torn, stamp(9, 3, 4_120), [])
+      assert :none = Recovery.choose(nil, stamp(9, 3, 4_120), [{peer("n2"), torn}])
+      assert :none = Recovery.choose(torn, stamp(9, 3, 4_120), [{peer("n2"), torn}])
+
+      # and a whole peer holding one must not beat a WHOLE local replica that is behind it
+      assert :local =
+               Recovery.choose(at(9, 3, 8_000), stamp(9, 3, 4_120), [{peer("n2"), torn}])
+    end
+
+    test "a whole replica is still chosen alongside a torn one" do
+      # Keeps the flag from being a way to never recover: the torn peer is skipped, the whole one
+      # still wins.
+      torn = Map.put(at(99, 99, 99_999_999), :torn, true)
+      whole = at(9, 3, 8_240)
+
+      assert {:pull, {"n3", _, _}, %{next_offset: 8_240}} =
+               Recovery.choose(nil, stamp(9, 3, 4_120), [{peer("n2"), torn}, {peer("n3"), whole}])
+    end
+
     test "ties between peers break deterministically, so two survivors choose alike" do
       offers = [{peer("n2"), at(9, 3, 8_240)}, {peer("n3"), at(9, 3, 8_240)}]
       assert {:pull, {"n3", _, _}, _} = Recovery.choose(nil, stamp(9, 3, 0), offers)

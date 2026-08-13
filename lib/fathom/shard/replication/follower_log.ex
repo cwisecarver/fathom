@@ -23,12 +23,31 @@ defmodule Fathom.Shard.Replication.FollowerLog do
   must be *seeded* (the base `.db` + `-wal` copied, as `Storage.pull/2` already does) before frames
   mean anything, and accepting a mid-stream delta into an empty directory would fabricate a
   database out of a fragment.
+
+  `torn` means **the `.db` this follower holds is a generation behind its `-wal`**, so the two no
+  longer compose into a database. It is set by every `decide_fresh/2` route and cleared only by a
+  seed, and it exists because of a rig failure on 2026-08-12 where a promotion served a tenant an
+  EMPTY database over a working stored object
+  (`docs/reviews/a2-checkpoint-torn-replica-2026-08-12.md`).
+
+  The sequence is ordinary, not exotic: a follower is seeded with the primary's `.db` AND its
+  current `-wal`; the primary then checkpoints — which every durability flush does, so every
+  `:shard_flush_interval_ms` — moving pages into ITS `.db` and restarting the WAL with fresh salts.
+  We truncate our WAL to match the new generation and our `.db` stays where it was, so every page
+  the checkpoint moved is now in NEITHER of our two files.
+
+  Nothing in the position marked that. `wal_gen` is the field that should have — `t:Storage.
+  position/0` says it "increases on every checkpoint" — but `ckpt_seq` restarts when SQLite
+  recreates the WAL file, which is exactly why the `salt1` clause below had to exist underneath it.
+  So the seam is invisible to a `{epoch, wal_gen, offset}` comparison, and `Promote.fresher?/2`
+  ranked a torn replica as strictly ahead of the object and promoted it.
   """
   @type t :: %{
           epoch: non_neg_integer(),
           wal_gen: non_neg_integer(),
           salt1: non_neg_integer(),
-          next_offset: non_neg_integer()
+          next_offset: non_neg_integer(),
+          torn: boolean()
         }
 
   @type decision ::
@@ -106,7 +125,18 @@ defmodule Fathom.Shard.Replication.FollowerLog do
        state
        | wal_gen: push.wal_gen,
          salt1: push.salt1,
-         next_offset: byte_size(push.payload)
+         next_offset: byte_size(push.payload),
+         # TORN. Every route here means "your offsets are meaningless now", and the reason they are
+         # meaningless is that the primary's `.db` moved on without us: a checkpoint drained pages
+         # into it, or a new primary brought its own. We can make our WAL match the new generation
+         # — `apply_write(_, :truncate)` does — but we cannot conjure the pages that left the old
+         # one, and they are not in our `.db` either.
+         #
+         # So the replica keeps REPLICATING (this is not a reject; the alternative deadlocks the
+         # commit path, which is why the salt clause exists) but stops being a COPY of anything
+         # until a seed rebuilds the pair. `Promote.fresher?/2` refuses it while this is set, which
+         # is the whole fix: promotion falls back to the stored object, which is always correct.
+         torn: true
      }}
   end
 
@@ -121,6 +151,8 @@ defmodule Fathom.Shard.Replication.FollowerLog do
   """
   @spec seeded(non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()) :: t()
   def seeded(epoch, wal_gen, salt1, wal_bytes) do
-    %{epoch: epoch, wal_gen: wal_gen, salt1: salt1, next_offset: wal_bytes}
+    # `torn: false` — a seed is the ONE event that rebuilds `.db` and `-wal` together, so it is the
+    # only thing that can clear it. See the `torn` note on `t:t/0`.
+    %{epoch: epoch, wal_gen: wal_gen, salt1: salt1, next_offset: wal_bytes, torn: false}
   end
 end

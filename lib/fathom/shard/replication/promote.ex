@@ -89,6 +89,22 @@ defmodule Fathom.Shard.Replication.Promote do
   def fresher?(nil, _stamp), do: false
   def fresher?(_replica, nil), do: false
 
+  # A TORN replica is never fresher than anything, however far ahead its offset reads.
+  #
+  # Its `.db` is a generation behind its `-wal` (see `FollowerLog`'s `t:t/0`), so the two do not
+  # compose into a database at all — the position is a true statement about a WAL and a false one
+  # about a copy of the shard. This clause is the fix for the 2026-08-12 rig failure where exactly
+  # that pair was promoted and the tenant was served an EMPTY database over a working stored object
+  # (`docs/reviews/a2-checkpoint-torn-replica-2026-08-12.md`).
+  #
+  # It lives HERE rather than at the promote call sites because `fresher?/2` is also what
+  # `Recovery.choose/3` filters peer offers with — so one clause keeps a torn replica from being
+  # promoted locally AND from being pulled across the fleet, instead of two rules that can drift.
+  #
+  # ABOVE the position comparison, because that clause matches any map with the three keys and
+  # would otherwise win.
+  def fresher?(%{torn: true}, _stamp), do: false
+
   def fresher?(%{epoch: e1, wal_gen: g1, next_offset: o1}, %{
         epoch: e2,
         wal_gen: g2,

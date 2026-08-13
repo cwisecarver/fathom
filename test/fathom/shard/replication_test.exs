@@ -159,6 +159,60 @@ defmodule Fathom.Shard.ReplicationTest do
       assert {:reject, :stale_wal_gen, 0} = FollowerLog.decide(state, push(wal_gen: 2))
     end
 
+    # THE 2026-08-12 RIG BUG. A reset makes our WAL match the primary's new generation and leaves
+    # our `.db` in the old one, so every page the checkpoint drained into the primary's `.db` is in
+    # NEITHER of our files. Replication is still correct — this is not a reject, and making it one
+    # deadlocks the commit path, which is why the salt clause exists — but the pair on disk has
+    # stopped being a copy of the shard, and nothing said so. It was promoted, and a tenant was
+    # served an empty database over a working stored object.
+    # See docs/reviews/a2-checkpoint-torn-replica-2026-08-12.md.
+    test "EVERY reset marks the replica torn, because our .db is now a generation behind" do
+      state = FollowerLog.seeded(7, 3, 11, 4120)
+      refute state.torn, "a freshly seeded replica is whole"
+
+      # a checkpoint, seen as a new generation
+      assert {:reset_then_append, gen} =
+               FollowerLog.decide(state, push(wal_gen: 4, offset: 0, payload: "xy"))
+
+      assert gen.torn
+
+      # a checkpoint SQLite recreated the file for, so ckpt_seq restarted and only salt1 moved —
+      # the case wal_gen structurally cannot see, and the one the rig actually hit
+      assert {:reset_then_append, salt} =
+               FollowerLog.decide(state, push(wal_gen: 3, salt1: 99, offset: 0, payload: "xy"))
+
+      assert salt.torn
+
+      # a new primary: its `.db` is its own
+      assert {:reset_then_append, ep} =
+               FollowerLog.decide(state, push(epoch: 8, wal_gen: 1, offset: 0, payload: "abc"))
+
+      assert ep.torn
+    end
+
+    test "an ordinary append does NOT mark a whole replica torn" do
+      # The other direction, and what keeps the flag from being a way to never promote: streaming
+      # frames onto a seeded replica leaves the two files in step.
+      state = FollowerLog.seeded(7, 3, 11, 4120)
+
+      assert {:append, appended} =
+               FollowerLog.decide(state, push(wal_gen: 3, salt1: 11, offset: 4120, payload: "z"))
+
+      refute appended.torn
+      assert appended.next_offset == 4121
+    end
+
+    test "a seed is the one thing that clears torn, because it rebuilds BOTH files" do
+      assert {:reset_then_append, torn} =
+               FollowerLog.decide(
+                 FollowerLog.seeded(7, 3, 11, 4120),
+                 push(wal_gen: 3, salt1: 99, offset: 0, payload: "xy")
+               )
+
+      assert torn.torn
+      refute FollowerLog.seeded(7, 3, 99, 4120).torn
+    end
+
     test "a checkpoint seam forces a reset instead of appending across it" do
       state = FollowerLog.seeded(7, 3, 0, 4120)
 

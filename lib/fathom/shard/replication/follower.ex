@@ -115,6 +115,23 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   @doc """
+  The replica we are willing to OFFER a peer — `state_of/2`, or `nil` when it is torn.
+
+  Separate from `state_of/2` on purpose. `state_of/2` answers "what is our replication state",
+  which the shipper and the local promote path both need to see truthfully including the torn
+  flag; this answers the narrower "do we hold a copy worth pulling", where torn and never-seeded
+  are the same answer. Collapsing the two would mean either lying to the shipper or offering a
+  peer an incoherent `.db`/`-wal` pair.
+  """
+  @spec offerable(atom(), String.t()) :: FollowerLog.t() | nil
+  def offerable(name \\ __MODULE__, shard_id) do
+    case state_of(name, shard_id) do
+      %{torn: true} -> nil
+      other -> other
+    end
+  end
+
+  @doc """
   Where this follower keeps the WAL files it receives.
 
   Per-instance, not global. Four followers sharing one directory would all write the SAME file for
@@ -255,7 +272,13 @@ defmodule Fathom.Shard.Replication.Follower do
             # How far along our replica is, so a node taking over the shard can decide whether we
             # are worth pulling from. Read-only and cheap on purpose: this is asked of every peer
             # on a cold open, so it must never touch the database or the object store.
-            :ok = :gen_tcp.send(sock, Protocol.encode_position(shard, state_of(name, shard)))
+            #
+            # A TORN replica offers NOTHING rather than its position — same answer as never having
+            # seen the shard. `Promote.fresher?/2` would refuse it on arrival anyway, but a peer
+            # would first pay a whole database transfer to be told so, and the bytes it pulled
+            # would be the incoherent `.db`/`-wal` pair. Answering "nothing" is both cheaper and
+            # honest: we do not hold a copy of this shard right now.
+            :ok = :gen_tcp.send(sock, Protocol.encode_position(shard, offerable(name, shard)))
             serve(sock, name, seeds)
 
           {:ok, {:replica_request, shard}} ->
