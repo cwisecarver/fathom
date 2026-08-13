@@ -147,6 +147,18 @@ other_node() { local not=$1 n; for n in "${NODES[@]}"; do [ "$n" != "$not" ] && 
 # reload_lb: apply the rendered exception map (nginx re-reads the included file).
 reload_lb() { compose exec -T lb nginx -s reload; }
 sql_direct() { local node=$1; shift; hrana "http://localhost:$(direct_port "$node")" "$@"; }
+
+# The HTTP status of one statement through the LB, and nothing else. For checks that need to know
+# WHETHER a request succeeded rather than what it returned — `hrana` prints the body and its exit
+# code collapses several failure kinds, so a caller that only wants "did this work" ends up
+# redirecting the body away and losing the status with it.
+hrana_status() {
+  local shard=$1 sql=$2
+  curl -sS --max-time 20 -o /dev/null -w '%{http_code}' -X POST "$LB/v2/pipeline" \
+    -H "Host: $shard.$DOMAIN" -H "Content-Type: application/json" \
+    -d "{\"requests\":[{\"type\":\"execute\",\"stmt\":{\"sql\":$(jq -Rn --arg s "$sql" '$s')}},{\"type\":\"close\"}]}" \
+    2>/dev/null || echo "ERR"
+}
 val() { jq -r '.results[0].response.result.rows[0][0].value'; } # first row/col
 vals() { jq -r '.results[0].response.result.rows[]?[0].value'; } # every row, first col
 
@@ -241,7 +253,58 @@ seed() {
 cmd_build() { compose build migrate; }
 # The in-network elixir driver image (deploy/chaos/Dockerfile.driver), used by TPC_NET=container.
 cmd_build_driver() { compose build driver; }
-cmd_up()    { compose up -d --wait --wait-timeout 180; compose ps; check_lb_port; }
+# `ensure_nodes_up` runs LAST so its status is the function's status. A shell function returns the
+# exit code of its final command, so ordering it before `compose ps`/`check_lb_port` — both of which
+# succeed — silently swallowed the failure and `up` returned 0 with a node dead, which is the exact
+# thing this check exists to stop.
+cmd_up()    { compose up -d --wait --wait-timeout 180 || true; compose ps; check_lb_port; ensure_nodes_up; }
+
+# EVERY fathom node must be up, or say so loudly.
+#
+# A node that loses the startup race with MinIO fails CLOSED — `shard storage fence self-test
+# unreachable (If-None-Match enforcement)` — and refusing to boot on an unverified fence is correct
+# (expert review #16). What is not correct is the rig continuing as if nothing happened: `compose up
+# -d --wait` returns non-zero, `cmd_up`'s output is routinely redirected to /dev/null by scenarios
+# and by the operator, and `compose ps` scrolls past. The fleet then serves on 4 of 5 nodes and
+# every scenario still "runs".
+#
+# That is not hypothetical. On 2026-08-13 a whole session — smoke, pause-fence, rpo, soak,
+# tpc-fleet, rebalance — ran with fathom1 dead and restarted out of band ten minutes later, and two
+# rebalance failures were attributed to the code under test before the fleet was even checked. A rig
+# that reports a result while a node is missing produces evidence that has to be thrown away.
+#
+# Retry a FEW times, then FAIL rather than warn: an incomplete fleet invalidates the run, so
+# continuing is worse than stopping.
+#
+# Two attempts is not enough, measured: a node whose object store only just came back needs a beat
+# before it can pass the fence self-test, so the first restart can still lose and a second `up`
+# by hand then succeeds. A check that needs the operator to run it twice is the same "reports a
+# result while the fleet is wrong" failure in a smaller costume. Three attempts with a pause
+# between still fails fast on a genuinely broken node (~15 s), which is nothing next to a scenario.
+ensure_nodes_up() {
+  local n down=() attempt
+  for attempt in 1 2 3; do
+    down=()
+    for n in "${NODES[@]}"; do
+      [ "$(compose ps -a --status running --services 2>/dev/null | grep -cx "$n")" = "1" ] || down+=("$n")
+    done
+
+    [ ${#down[@]} -eq 0 ] && return 0
+
+    if [ "$attempt" -lt 3 ]; then
+      echo "  !! not running after up: ${down[*]} — restart attempt $attempt (likely the MinIO startup race)"
+      compose up -d --wait --wait-timeout 120 "${down[@]}" >/dev/null 2>&1 || true
+      sleep 3
+    fi
+  done
+
+  echo "*** FLEET INCOMPLETE: ${down[*]} did not start."
+  echo "    Every scenario below would run on a partial fleet and produce results worth nothing."
+  echo "    Look for 'fence self-test unreachable' (lost the race with MinIO) in:"
+  local d
+  for d in "${down[@]}"; do echo "      compose logs --since 5m $d"; done
+  return 1
+}
 
 # Is the LB port actually OURS? Docker does not fail when the host port is already taken — it
 # publishes anyway and the earlier listener keeps winning, so every request through $LB reaches
@@ -1078,17 +1141,60 @@ cmd_rebalance() {
   rpc "$from" "Fathom.Shards.drain(\"$shard\", 10_000) |> inspect() |> IO.puts()" | sed 's/^/    drain: /'
 
   # 4. A request now routes to the target, which acquires the freed lease and serves.
-  sql "$shard" "SELECT 1" >/dev/null 2>&1
-  sleep 1
-  local now_owner; now_owner=$(cmd_owner "$shard" || echo "?")
+  #
+  # POLLED WITH A DEADLINE, and the request's outcome is KEPT. This used to be one `sql ...
+  # >/dev/null 2>&1`, a `sleep 1`, and a single `cmd_owner` read — so any slowdown in the target's
+  # cold open read as a failed handoff whether or not the move landed a second later, and the one
+  # fact that would tell those apart (did the request even succeed?) was discarded.
+  #
+  # That cost real time on 2026-08-13: two failures were attributed to the A2 promote/recover gates
+  # — which do add an object HEAD, a peer-query round and possibly a pull to the target's open —
+  # and the follow-up could not reproduce it in 12 further runs. "Moved late" and "never moved" have
+  # to be distinguishable from the output, or the next person re-runs that investigation.
+  local now_owner="?" http="" waited=0
+  while [ "$waited" -lt 20 ]; do
+    http=$(hrana_status "$shard" "SELECT 1")
+    now_owner=$(cmd_owner "$shard" || echo "?")
+    [ "$now_owner" = "$to" ] && break
+    sleep 2
+    waited=$(( waited + 2 ))
+  done
+
+  echo "  handoff observed after ${waited}s (last request: HTTP ${http:-none})"
   # Isolation must still hold after the move.
   local foreign; foreign=$(sql "$shard" "SELECT count(*) FROM kv WHERE tenant <> '$shard'" | val 2>/dev/null)
 
   echo "  '$shard' now served by: $now_owner (was $from, pinned to $to)"
   if [ "$now_owner" = "$to" ] && [ "${foreign:-0}" = "0" ]; then
     echo "rebalance: OK — $shard moved $from → $to, isolation intact"
+  elif [ "$now_owner" != "$to" ]; then
+    # Say WHICH failure this is. The request's status separates the two, and they want different
+    # investigations: a 200 means the fleet is healthy and the shard simply is not where the pin
+    # says, while a non-200 or ERR means the target could not serve at all and the handoff is a
+    # symptom rather than the cause.
+    echo "rebalance: owner=$now_owner (expected $to) after ${waited}s, last request HTTP ${http:-none}"
+
+    if [ "$http" = "200" ]; then
+      # A 200 does NOT mean the pin was honoured. nginx fails over passively, so a DEAD target
+      # yields a healthy 200 from some other backend and the shard simply never moves — which is
+      # what this branch printed when the case was first tested, while pointing at the LB map.
+      # Check the target is alive BEFORE reading anything into the exception map.
+      echo "  the fleet SERVED the shard, but from $now_owner rather than the pinned $to."
+      if [ "$(compose ps -a --status running --services 2>/dev/null | grep -cx "$to")" = "1" ]; then
+        echo "  $to is running, so the pin or the drain did not take:"
+        echo "    rpc fathom1 'Fathom.Rebalancer.LbMap.current() |> IO.puts()'   + the lb-reloader"
+      else
+        echo "  *** $to IS NOT RUNNING — nginx failed over to $now_owner and returned 200 anyway."
+        echo "      That is the whole failure; the handoff never had a target. compose logs $to"
+      fi
+    else
+      echo "  the target never served it. Check that $to is actually running (./chaos.sh up now"
+      echo "  fails on an incomplete fleet) and: compose logs --since 5m $to"
+    fi
+
+    return 1
   else
-    echo "rebalance: owner=$now_owner (expected $to), foreign=$foreign"
+    echo "rebalance: owner=$now_owner, but ISOLATION LEAKED: foreign=$foreign"
     return 1
   fi
 }
