@@ -597,17 +597,39 @@ defmodule Fathom.Bench.Tpcc do
   end
 
   # execute-and-thread: `exec` discards the result (writes/DDL/COMMIT); `step` keeps it (reads).
-  # Both raise on any wire error — fail-loud for the bench (busy is near-impossible under
-  # BEGIN IMMEDIATE at bench scale; the ~1% New-Order rollback rides the empty-rows path, not an
-  # error).
+  #
+  # Still fail-loud on any wire error, with ONE exception: `SQLITE_BUSY` is thrown as a tagged
+  # value for `attempt/4` to retry, rather than crashing the driver thread.
+  #
+  # This used to say "busy is near-impossible under BEGIN IMMEDIATE at bench scale", and CI
+  # disproved it on 2026-08-13 — `tpcc_sweep_test` died on a BUSY from `BEGIN IMMEDIATE` itself
+  # with only 2 threads on a contended runner. Reproduced locally at 16 threads on one warehouse.
+  #
+  # The mechanism is NOT a long-held lock, which is what makes retrying the right answer rather
+  # than a papered-over flake: at 8 threads the same run completes 320 transactions in ~930 ms, so
+  # lock holds are sub-millisecond and nothing is stalling for the 5 s `busy_timeout`. SQLite's
+  # busy handling is not FIFO, so under enough contenders one waiter can be starved past its
+  # timeout while the others keep making progress. That is documented SQLite behaviour on a
+  # single-writer file, and TPC-C's own spec has the driver resubmit a rolled-back transaction —
+  # so a driver that treats it as a crash is simply wrong about its own workload.
+  #
+  # The retries are COUNTED and reported (`tpcc_busy_retries`), which is the part that keeps this
+  # honest: a genuine convoy regression shows up as a rising number instead of being silently
+  # absorbed, and exhausting the retry budget still fails loudly.
   defp exec(c, sql, args \\ []) do
-    {:ok, c, _} = HranaClient.execute(c, sql, args)
-    c
+    case HranaClient.execute(c, sql, args) do
+      {:ok, c, _} -> c
+      {:error, {:hrana_error, %{"code" => "SQLITE_BUSY"}}} -> throw({:tpcc_busy, c})
+      other -> raise "tpcc exec failed (#{sql}): #{inspect(other)}"
+    end
   end
 
   defp step(c, sql, args \\ []) do
-    {:ok, c, res} = HranaClient.execute(c, sql, args)
-    {c, res}
+    case HranaClient.execute(c, sql, args) do
+      {:ok, c, res} -> {c, res}
+      {:error, {:hrana_error, %{"code" => "SQLITE_BUSY"}}} -> throw({:tpcc_busy, c})
+      other -> raise "tpcc step failed (#{sql}): #{inspect(other)}"
+    end
   end
 
   defp rand_w(%{w_count: w}), do: :rand.uniform(w)
@@ -677,17 +699,53 @@ defmodule Fathom.Bench.Tpcc do
     {:ok, c} = HranaClient.connect(port, id)
     t0 = System.monotonic_time(:microsecond)
 
-    {c, samples, no_count} =
-      Enum.reduce(1..n, {c, [], 0}, fn _, {c, acc, no} ->
+    {c, samples, no_count, busy} =
+      Enum.reduce(1..n, {c, [], 0, 0}, fn _, {c, acc, no, busy} ->
         type = random_type()
-        {us, {c, status}} = :timer.tc(fn -> run(type, c, ctx) end)
+        {us, {c, status, retried}} = :timer.tc(fn -> attempt(type, c, ctx, 0) end)
         no2 = if type == :new_order and status in [:committed, :rolled_back], do: no + 1, else: no
-        {c, [{type, us} | acc], no2}
+        {c, [{type, us} | acc], no2, busy + retried}
       end)
 
     t1 = System.monotonic_time(:microsecond)
     HranaClient.close(c)
-    %{samples: samples, no_count: no_count, t0: t0, t1: t1}
+    %{samples: samples, no_count: no_count, t0: t0, t1: t1, busy_retries: busy}
+  end
+
+  # How many times one transaction may be resubmitted after SQLITE_BUSY before the run fails.
+  # Bounded on purpose: a lock genuinely held forever must still surface, and an unbounded retry
+  # would turn a wedged shard into a hang, which is a worse failure than a crash.
+  @busy_retries 5
+
+  # Resubmit the WHOLE transaction, which is the only correct unit — a BUSY on `BEGIN IMMEDIATE`
+  # means no transaction ever started, and a BUSY partway through means the one that did is dead.
+  # The elapsed time of the retries stays inside the caller's `:timer.tc`, so a run that had to
+  # retry reports its true latency rather than a flattering one.
+  defp attempt(type, c, ctx, tries) do
+    {c, status} = run(type, c, ctx)
+    {c, status, tries}
+  catch
+    {:tpcc_busy, busy_c} ->
+      if tries < @busy_retries do
+        attempt(type, rollback(busy_c), ctx, tries + 1)
+      else
+        raise "tpcc: #{type} still SQLITE_BUSY after #{@busy_retries} retries, i.e. roughly " <>
+                "#{@busy_retries + 1} × the 5 s busy_timeout of waiting. A retry loop cannot fix " <>
+                "that — each attempt re-enters the same queue — so this is sustained starvation " <>
+                "on the shard's write lock, not the isolated unlucky wait retrying is for. " <>
+                "Reproducible locally at ~16 threads on ONE warehouse; see tpcc_busy_retries and " <>
+                "the single-shard convoy note in AGENTS.md. Cause not established."
+      end
+  end
+
+  # Best-effort. After a BUSY there may or may not be an open transaction (BEGIN IMMEDIATE itself
+  # is the usual victim, in which case there is none and SQLite says so), and either way the next
+  # attempt starts with its own BEGIN — so a failed ROLLBACK is not interesting.
+  defp rollback(c) do
+    case HranaClient.execute(c, "ROLLBACK", []) do
+      {:ok, c, _} -> c
+      _ -> c
+    end
   end
 
   # tpmC = New-Orders / minute over the concurrent window (max end − min start across threads);
@@ -702,7 +760,17 @@ defmodule Fathom.Bench.Tpcc do
       |> Enum.flat_map(& &1.samples)
       |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
 
-    base = %{"warehouses" => w, "threads" => threads, "tpcc_tpmc" => Float.round(tpmc, 1)}
+    # REPORTED, not just tolerated. Retrying a BUSY keeps the driver honest about TPC-C's own
+    # rules; hiding the count would turn a real convoy into a silently slower run. Zero on a
+    # healthy single-writer shard at moderate concurrency; a number that climbs with thread count
+    # is the shard's write lock becoming the bottleneck, which is a finding rather than a fault.
+    base = %{
+      "warehouses" => w,
+      "threads" => threads,
+      "tpcc_tpmc" => Float.round(tpmc, 1),
+      "tpcc_busy_retries" => Enum.sum(Enum.map(results, &Map.get(&1, :busy_retries, 0)))
+    }
+
     Enum.reduce(@txn_types, base, fn type, acc -> Map.merge(acc, pctl_keys(type, by_type)) end)
   end
 
