@@ -39,6 +39,7 @@ defmodule Fathom.Shard.Replication.Follower do
 
   require Logger
 
+  alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.FollowerLog
   alias Fathom.Shard.Replication.Wal
   alias Fathom.Shard.Replication.Protocol
@@ -738,11 +739,86 @@ defmodule Fathom.Shard.Replication.Follower do
 
       {:reset_then_append, new_state} ->
         # A new epoch or a checkpointed WAL: our bytes are meaningless now, so the file is replaced
-        # rather than extended.
-        apply_write(name, push, new_state, :truncate)
+        # rather than extended — but the pages in the WAL we are about to throw away are NOT
+        # meaningless, and absorbing them first is what keeps this replica whole.
+        apply_write(name, push, absorb_before_reset(name, push.shard_id, new_state), :truncate)
 
       {:reject, reason, expected} ->
         Protocol.encode_reject(push.shard_id, reason, expected)
+    end
+  end
+
+  # Absorb our own WAL into our own `.db` before the reset discards it.
+  #
+  # THE POINT. A reset means the primary checkpointed: it drained its WAL into ITS `.db` and started
+  # a new generation. We hold the same pages — they are in the WAL we received — so we can perform
+  # the identical move locally. Nothing is fetched from a peer and nothing is fetched from S3; the
+  # cost is one local checkpoint, proportional to WRITE VOLUME (a WAL bounded by one flush interval)
+  # rather than to database size, which is what makes it affordable per shard per flush.
+  #
+  # Without it the reset orphans the `.db` in the old generation and every page the checkpoint moved
+  # is in NEITHER file — the 2026-08-12 rig failure, where a promotion served a tenant an EMPTY
+  # database over a working stored object
+  # (`docs/reviews/a2-checkpoint-torn-replica-2026-08-12.md`).
+  #
+  # `Follower` otherwise NEVER opens the database, deliberately: opening checkpoints it, which
+  # breaks the byte-offset alignment with the primary. This is the one moment that reasoning does
+  # not apply — the alignment is being discarded by this very reset — which is exactly why the
+  # exception is safe here and nowhere else.
+  #
+  # FAIL-SAFE: any failure leaves `torn: true` (what `FollowerLog.decide_fresh/2` set) and today's
+  # behaviour. The replica keeps replicating and is simply not promotable until a seed rebuilds it,
+  # which is strictly better than serving a torn pair. Success clears the flag, because the two
+  # files are now back in step.
+  defp absorb_before_reset(name, shard_id, new_state) do
+    db = db_path(name, shard_id)
+    wal = wal_path(name, shard_id)
+
+    # Nothing to absorb: a shard we hold no files for (the reset IS the first frame) is not torn,
+    # it is simply new — `apply_write` is about to lay down a whole generation from offset 0.
+    if File.exists?(db) and wal_bytes(wal) > 0 do
+      case checkpoint_into_db(db) do
+        :ok ->
+          %{new_state | torn: false}
+
+        {:error, reason} ->
+          Logger.warning(
+            "shard #{shard_id}: could not absorb the WAL before a reset (#{inspect(reason)}); " <>
+              "the replica stays torn and will not be promoted until it is re-seeded"
+          )
+
+          new_state
+      end
+    else
+      %{new_state | torn: false}
+    end
+  end
+
+  defp wal_bytes(path) do
+    case File.stat(path) do
+      {:ok, %{size: size}} -> size
+      _ -> 0
+    end
+  end
+
+  # `TRUNCATE` rather than PASSIVE so the WAL is actually emptied and cannot be re-applied on top of
+  # the new generation we are about to write into the same file. The `-shm` goes with it: a stale
+  # shared-memory index describes a WAL that no longer exists, and SQLite trusts it.
+  defp checkpoint_into_db(db) do
+    case Connection.open(db) do
+      {:ok, conn} ->
+        try do
+          case Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", []) do
+            {:ok, _} -> :ok
+            {:error, reason} -> {:error, {:checkpoint_failed, reason}}
+          end
+        after
+          Connection.close(conn)
+          File.rm(db <> "-shm")
+        end
+
+      {:error, reason} ->
+        {:error, {:open_failed, reason}}
     end
   end
 

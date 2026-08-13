@@ -407,11 +407,60 @@ cmd_pause_fence() {
     tail -6 | sed 's/^/  /'
   local live; live=$(sql_direct "$survivor" "$shard" "SELECT count(*) FROM kv WHERE seq = 400" | val)
   local zombie; zombie=$(sql_direct "$survivor" "$shard" "SELECT count(*) FROM kv WHERE seq = 300" | val)
+  # THE VERDICT IS CONFIGURATION-DEPENDENT, and it has to be, because seq=300 means two different
+  # things depending on whether A2 was carrying it.
+  #
+  # The non-negotiable in BOTH modes is seq=400: the survivor's post-steal write. Losing that is
+  # split-brain — it means the zombie's flush landed on top of the new owner.
+  #
+  # seq=300 is the zombie's dirty, never-flushed write:
+  #
+  #   promote OFF  it existed ONLY on the frozen node's local disk. Losing it is correct and within
+  #                RPO; RESURRECTING it means the zombie's flush won, so it must be 0.
+  #   promote ON   it was acked to the client AND replicated to a quorum before the freeze, so A2's
+  #                contract says it must SURVIVE. Recovering it is the feature working, not a fault.
+  #
+  # Asserting 0 in both modes is what made a correct run report SPLIT-BRAIN on 2026-08-12, which is
+  # worse than no check at all. So in promote mode the question becomes WHERE it came from: a
+  # promotion on the survivor (correct), or the zombie's flush (split-brain). The self-fence log
+  # line settles it, and is required rather than assumed.
   echo "RESULT pause-fence:"
   echo "  survivor's post-steal write (seq=400) present = $live   (MUST be 1)"
-  echo "  zombie's dirty write (seq=300) resurrected     = $zombie   (MUST be 0 — self-fence held)"
-  [ "$live" = "1" ] && [ "$zombie" = "0" ] && echo "  PASS: single-writer held across the zombie's flush" \
-    || echo "  *** SPLIT-BRAIN — the zombie overwrote the survivor"
+
+  # ASK THE NODE, never the invoking shell. `REPLICATION_PROMOTE_ON_OPEN` is read at boot, so the
+  # running fleet's setting is whatever `up` was given — setting it on THIS command changes nothing
+  # about behaviour and only misleads the verdict. That is exactly how the first version of this
+  # check reported SPLIT-BRAIN on a healthy fleet: the shell said off, the nodes were on, and the
+  # promotion it then called a fault was the feature. Same lesson `cmd_rpo` records for
+  # REPLICATION_ENABLED.
+  local promote_on
+  promote_on=$(rpc "$survivor" \
+    'IO.puts(to_string(Application.get_env(:fathom, :replication_promote_on_open) == true))' |
+    tr -d '[:space:]')
+  echo "  (promote-on-open on $survivor: ${promote_on:-unknown})"
+
+  if [ "$promote_on" = "true" ]; then
+    local fenced
+    fenced=$(compose logs --since 3m "$owner" 2>/dev/null |
+      grep -ci "shard $shard: ownership unconfirmed before flush" || true)
+    echo "  zombie's quorum-acked write (seq=300) recovered = $zombie   (SHOULD be 1 — A2 replicated it)"
+    echo "  zombie self-fenced instead of flushing          = $fenced   (MUST be >=1)"
+
+    if [ "$live" = "1" ] && [ "$fenced" -ge 1 ]; then
+      if [ "$zombie" = "1" ]; then
+        echo "  PASS: the fence held AND A2 recovered the acked write the fence discarded"
+      else
+        echo "  PASS (fence held), but seq=300 was LOST — it was acked and quorum-replicated, so"
+        echo "        promote-on-open did not recover it. Check for 'PROMOTED a local replica'."
+      fi
+    else
+      echo "  *** SPLIT-BRAIN — the zombie overwrote the survivor"
+    fi
+  else
+    echo "  zombie's dirty write (seq=300) resurrected     = $zombie   (MUST be 0 — self-fence held)"
+    [ "$live" = "1" ] && [ "$zombie" = "0" ] && echo "  PASS: single-writer held across the zombie's flush" \
+      || echo "  *** SPLIT-BRAIN — the zombie overwrote the survivor"
+  fi
 }
 
 cmd_partition() {

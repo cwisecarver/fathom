@@ -237,6 +237,62 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     assert :ok = Session.commit(id, wal, coordinator)
   end
 
+  # FIX B for the 2026-08-12 rig failure, and the DATA claim rather than the flag claim.
+  #
+  # The test above proves commits keep FLOWING across a checkpoint. It says nothing about whether
+  # what the follower holds is still a database — and it was not. A reset truncated the follower's
+  # WAL to the new generation and left its `.db` in the old one, so every page the primary's
+  # checkpoint drained into ITS `.db` was in NEITHER of the follower's files. Promotion then served
+  # a tenant an EMPTY database over a working stored object.
+  #
+  # The fix is that the follower absorbs its own WAL into its own `.db` before the reset discards
+  # it. It already HAS those pages — they are the frames it received — so this is a local
+  # checkpoint, not a re-seed: no peer transfer, no S3 request, and a cost proportional to write
+  # volume rather than to database size.
+  #
+  # `docs/reviews/a2-checkpoint-torn-replica-2026-08-12.md`.
+  test "a follower ABSORBS its WAL at a reset, so the replica is still a database", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+    enable!(followers, 2)
+
+    {coordinator, conn, path} = open_shard!(id)
+    wal = path <> "-wal"
+    {name, _port} = hd(followers)
+
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
+    assert :ok = Session.commit(id, wal, coordinator)
+    await_seeded(name, id, fn -> Session.commit(id, wal, coordinator) end)
+
+    # PRECONDITION, asserted on file size rather than by querying: the schema and both rows are in
+    # the follower's WAL and NOT yet in its `.db`. Opening the replica to check would checkpoint it,
+    # which is the very thing under test. One page means an empty database — and that is exactly
+    # what the rig promoted.
+    assert File.stat!(Follower.db_path(name, id)).size <= 4096,
+           "the follower's .db already holds the rows, so a lost checkpoint would prove nothing"
+
+    # The seam: TRUNCATE rewrites the WAL with fresh salts, so the next commit ships a reset.
+    {:ok, _} = Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", [])
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (3)", [])
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    # THE ASSERTION, and it is checked BEFORE the flag so a regression reports the data loss rather
+    # than the bookkeeping. Open the replica the way promotion does: 1 and 2 come back out of the
+    # WAL we absorbed, 3 out of the generation that replaced it.
+    {:ok, r} = Connection.open(Follower.db_path(name, id))
+    rows = Connection.query(r, "SELECT a FROM t ORDER BY a", [])
+    :ok = Connection.close(r)
+
+    assert {:ok, %{rows: [[1], [2], [3]]}} = rows,
+           "the replica lost the rows the primary's checkpoint moved into its own .db — got " <>
+             inspect(rows)
+
+    refute Follower.state_of(name, id).torn,
+           "the rows survived but the replica is still flagged torn, so nothing will promote it"
+  end
+
   # THE RIG BLOCKER, REPRODUCED (2026-08-11). On the chaos rig every commit after the first failed
   # `{:no_quorum, :impossible}`, forever, with all four followers answering
   # `offset_mismatch: 8272` — the same number every time, so a deadlock rather than a lost frame.
