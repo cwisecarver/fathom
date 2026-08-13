@@ -81,6 +81,16 @@ x-fathom-env: &fathom-env
   # ship and nobody ever reads them, so a kill BEFORE the flush still loses the tail.
   # Off by default here like everything else; `chaos.sh failover` with it on is the RPO test.
   REPLICATION_PROMOTE_ON_OPEN: "${REPLICATION_PROMOTE_ON_OPEN:-}"
+  # Survivor selection: when this node's own replica is NOT ahead of the stored object, ask every
+  # peer whether one of theirs is, and pull it. The half that closes the RPO gap when the LB fails
+  # a shard over to a node holding no replica of it — which is the common case, since the LB hashes
+  # the Host subdomain and knows nothing about replication.
+  #
+  # Was missing here entirely until 2026-08-12 while every other A2 gate was plumbed, so it could
+  # only be reached by `put_env` through `bin/fathom rpc` inside `cmd_rpo`. That made it invisible
+  # to every other scenario, and made the compose file disagree with config/runtime.exs about
+  # whether the feature exists on the rig at all.
+  REPLICATION_RECOVER_FROM_PEERS: "${REPLICATION_RECOVER_FROM_PEERS:-}"
   # Phase-2 B1 dynamic rebalancing: every node reports its load, acts on handoff
   # commands, and runs the (singleton) control loop; the LB backend set + where the
   # rendered exception map is written. NODE_KEY is per-node (set on each service below).
