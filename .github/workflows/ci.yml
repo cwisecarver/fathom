@@ -122,3 +122,54 @@ jobs:
         env:
           FATHOM_WAL_PROBE: "1"
         run: mix test --include wal_probe
+
+      # The :s3 suite — the live-store contract, and until now the one thing NOTHING ran.
+      #
+      # It is excluded from `mix test` by design (it needs a real store), so it was excluded
+      # everywhere: not in the default suite, not in CI, not in `mix precommit`. It duly rotted —
+      # on 2026-08-12 `pull on a missing object` was still asserting the `{:ok, _}` contract that
+      # expert review 2026-08-01 #24 had deliberately replaced with `{:absent, _}` eleven days
+      # earlier, and nobody could have known. This is the suite an operator reaches for during an
+      # incident; it is the worst one to discover is stale.
+      #
+      # It runs `scripts/minio_test.sh` rather than a hand-written CI-only sequence, so the thing
+      # CI proves and the thing a developer runs locally cannot drift apart. That script starts
+      # MinIO, creates the bucket, runs the suite and tears down. It is NOT a `services:` container
+      # because `minio/minio` needs the `server /data` subcommand and service containers cannot
+      # override a command.
+      #
+      # In the matrix, so the S3 backend is covered on all three OTP versions — it is ~24 fast
+      # tests, and the conditional-write fence it proves is the load-bearing part of the
+      # single-writer design.
+      - name: Run the :s3 suite against MinIO
+        # `shell: bash` is load-bearing, not decoration. GitHub's DEFAULT run shell is `bash -e`
+        # WITHOUT pipefail; naming bash explicitly gets `bash --noprofile --norc -eo pipefail`.
+        # Without it, `minio_test.sh | tee` returns TEE's status, so a suite that failed every
+        # single test would report success — the step would exist purely to look green.
+        shell: bash
+        run: |
+          scripts/minio_test.sh 2>&1 | tee /tmp/s3-suite.log
+
+          # ANTI-ROT GUARD, and the actual point of this step.
+          #
+          # A green ":s3" step that ran ZERO tests is exactly the state this whole job exists to
+          # end, and it is reachable without anyone noticing: rename the file, change the tag,
+          # mistype the path in the script. `mix test` exits 0 having run nothing, and the step
+          # passes forever while proving nothing.
+          #
+          # The floor is deliberately well under the current count (24) — it is here to catch
+          # "ran nothing", not to pin a number that legitimate churn would break.
+          ran=$(grep -oE '^Result: [0-9]+ passed' /tmp/s3-suite.log | grep -oE '[0-9]+' | tail -1)
+          if [ -z "$ran" ]; then
+            # Fall back to ExUnit's older summary shape, so an Elixir upgrade that changes the
+            # wording degrades to a missed guard rather than a false failure.
+            ran=$(grep -oE '[0-9]+ tests?, [0-9]+ failure' /tmp/s3-suite.log | grep -oE '^[0-9]+' | tail -1)
+          fi
+
+          if [ "${ran:-0}" -lt 15 ]; then
+            echo "::error::the :s3 suite reported ${ran:-no} tests — it ran (almost) nothing."
+            echo "A passing step that executes no tests is how this suite went stale for eleven"
+            echo "days. Check the --include tag and the file path in scripts/minio_test.sh."
+            exit 1
+          fi
+          echo ":s3 suite ran $ran tests against a live MinIO."
