@@ -1404,7 +1404,12 @@ defmodule Fathom.ShardDurabilityTest do
     # Storage recovers: a durable flush RESETS the counter and emits NO failure event.
     Application.delete_env(:fathom, :storage_fault)
     flush_now(coordinator)
-    refute_receive {:flush_failed, _, _}, 100
+    # Pin the shard. The handler above is attached to the GLOBAL event, so a bare
+    # `refute_receive {:flush_failed, _, _}` also matches a CONCURRENT test's shard — which is
+    # exactly how this failed in CI on 2026-08-14 (run 31757415032, OTP 29, seed 711283:
+    # "Unexpectedly received ... shard_id: \"cluster_182178\"", a shard this test never opened).
+    # The assertions above already pin `^shard`; this one was the only one that did not.
+    refute_receive {:flush_failed, _, %{shard_id: ^shard}}, 100
 
     # A fresh write + failure starts the count over at 1 — proving the reset.
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('bob')"))
