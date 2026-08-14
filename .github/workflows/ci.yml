@@ -109,6 +109,26 @@ jobs:
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
 
+      # The typing gate, same one `mix precommit` runs. Keyed on mix.lock AND the OTP version
+      # because a PLT is specific to both; a miss costs ~10-20 min to rebuild, a hit ~2 s to check.
+      - name: Cache dialyzer PLTs
+        uses: actions/cache@v4
+        with:
+          path: priv/plts
+          key: ${{ runner.os }}-otp${{ matrix.otp }}-plt-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-otp${{ matrix.otp }}-plt-
+
+      # MIX_ENV=dev is the SCOPE, not a detail: :test also compiles test/support, whose benchmark
+      # drivers re-introduce the mint_web_socket opaque-type cascade documented in mix.exs. This
+      # analyzes lib/ only, exactly as the precommit step does.
+      #
+      # Runs in the matrix so a typing difference between OTP 27/28/29 surfaces here rather than on
+      # someone's machine — precommit only ever exercises whichever OTP the developer has.
+      - name: Dialyzer (typing gate)
+        env:
+          MIX_ENV: dev
+        run: mix dialyzer
+
       # The `mix test` alias creates + migrates the test Postgres DB, then runs the suite. :s3
       # (live MinIO) and :bench tests are excluded by test/test_helper.exs.
       #

@@ -217,11 +217,62 @@ A "gate" is a check that must pass *before* a commit lands — not after.
   **CI is the second opinion, not the first** — `mix precommit` is still the gate that has to pass
   before a commit lands. Disable with
   `gh api -X PUT repos/cwisecarver/fathom/actions/permissions -F enabled=false`.
-- **`mix precommit` is the commit gate** (defined in `mix.exs`): `compile --warnings-as-errors`, `deps.unlock --unused`, `format`, `test`. **Never commit if it fails.** Run it when you're done with all changes and fix everything it surfaces.
+- **`mix precommit` is the commit gate** (defined in `mix.exs`): `compile --warnings-as-errors`, `deps.unlock --unused`, `format`, `dialyzer`, `test`. **Never commit if it fails.** Run it when you're done with all changes and fix everything it surfaces.
+- **Typing gate — Dialyzer (added 2026-08-14).** Runs inside `precommit` after `format` and before `test` (deterministic, reuses the fresh beams, ~2 s warm — much cheaper than the suite, so failing fast there is the right order), and in CI across OTP 27/28/29 so a typing difference between VM versions surfaces there rather than on one developer's machine. Manual run is **`MIX_ENV=dev mix dialyzer`**. **The env is the SCOPE, not a detail**: `elixirc_paths/1` compiles `test/support` only in `:test`, so `:dev` analyzes `lib/` alone — which is the plan's stated scope, and which keeps the benchmark drivers' `mint_web_socket` opaque-type cascade (21 findings from one dependency issue, see `mix.exs`) out of the gate. Inside `precommit` it is `cmd env MIX_ENV=dev mix dialyzer`, and the `env` is required — `mix cmd` does not use a shell, so a bare `VAR=value` prefix is taken as the executable and dies with `:enoent`. **First run after `mix deps.get` or a dependency bump pays a partial PLT update (minutes, once); a first-ever build is ~10–20 min.** PLTs live in `priv/plts` (gitignored) so `rm -rf _build` doesn't discard them, and CI caches them keyed on `mix.lock` + OTP version. Suppressions go in `.dialyzer_ignore.exs`, which documents the only two legitimate reasons to be in it and requires a comment per entry; `list_unused_filters: true` fails the run on a filter that stopped matching. **The gate was verified to bite** before being trusted (a deliberately wrong return type on `Shards.migrate_on_touch_mode/0` exits 1 at the dialyzer step without reaching the tests) — see § Typing for the style rules and what it actually caught.
 - **Migration gate.** A schema migration must not ship without: (a) a forward copy+transform test, (b) a revert-flip test, (c) a cross-version-tolerance check. A migration that can't be reverted by pointer-flip within the retention window, or that the running app can't tolerate mid-rollout, is not done.
 - **Shard-isolation gate.** Any change to shard routing (`Fathom.ShardExecutor.shard_from_conn`, `Fathom.Shards`, shard-path construction, or the planned `Fathom.Directory` resolve) must have a test proving shard A never resolves to shard B. Treat a cross-tenant leak as a release blocker, not a finding.
 - **NIF-contract guard (when `fathom_native` lands).** Elixir is dynamically typed, so a NIF signature change (arity, **return shape**, param types) silently breaks Elixir callers at *runtime* — the Rust compiler can't catch it. After any NIF signature change, run the integration tests that exercise it and `grep -rn "Fathom.Native.<fn>"` for every caller. Don't rely on the unit suite to catch a contract break.
 - **Bench-then-commit gate** (built). Any change touching a hot path (shard routing/open, directory resolve, migration copy, the shard coordinator) goes through `scripts/commit_with_bench.sh -m "<msg>"`: it benches the working tree and refuses the commit on a ≥20% regression in any metric vs the parent's entry in `scripts/perf_history.jsonl` (override `PERF_REGRESS_BLOCK`). Pure docs/test/comment-only changes skip it — `git commit` directly with a `[skip-bench]` token, or `--skip`. See Benchmarking and `docs/benchmark-plan.md`.
+
+## Typing
+
+Dialyzer-enforced `@spec` coverage. The gate is in § Gates; this is how to write for it.
+
+**The defect it actually finds, over and over.** Fathom had 309 `@spec`s and nothing had ever
+verified one. The 2026-08-14 baseline was 115 findings, and the dominant shape was not a wrong
+type — it was a **stale** one: someone adds a field or a return case to the code and to every
+caller, and never to the declaration. Seven instances, all on paths that matter, all silent:
+
+| stale declaration | what it omitted |
+|---|---|
+| `Recovery.position` ("the same shape as `FollowerLog.t()`") | `torn` — the field deciding whether a replica may be promoted at all |
+| `Storage.lease()` (a CLOSED three-key map) | `lock_etag` — the fencing token release is conditional on |
+| `Storage.pull/2`'s `@spec` (its `@callback` was right) | `{:absent, _}` |
+| `pull_snapshot/3`'s `@callback` AND `@spec` | `{:absent, _}` |
+| `Migrator.status/0` | `review_blocks` — a published control-plane field |
+| `Copy.migrate/4` | that statements are `{sql, args}` pairs, not strings |
+
+None broke anything at runtime. Three had a worse consequence than a bad doc: dialyzer concluded
+whole paths were **unreachable** — A2 cross-fleet promotion and its mid-flight object re-check read
+as dead code because `Recovery.position` lacked one field. **When a type and its callers disagree,
+suspect the type**, and prefer aliasing the owning type (`@type position :: FollowerLog.t()`) over
+restating its shape, so the drift cannot recur.
+
+**Style rules.**
+
+1. **Skip behaviour callback implementations** — GenServer/LiveView/Plug/Oban/Mix.Task/
+   `Filo.Executor`/`Fathom.Shard.Storage` impls. The contract lives once, on the `@callback`.
+2. **Spec the client API of GenServers**, not the server callbacks.
+3. **Reuse owned types**: `Fathom.ShardId.t()`, `Storage.lease()`, `Ecto.Changeset.t()`. Never
+   re-inline a shape that has a name — that is how the table above happened.
+4. **Ecto schemas get `@type t :: %__MODULE__{}`.** Three were missing it while six specs named it.
+5. **A function that always raises is `no_return()`**, not an ignore entry (`mix fathom.token`).
+6. **No defensive typing**: no guards added to satisfy a spec, no `term()`/`any()` escape hatches.
+   State the bound you can prove — `Migrator.status/0`'s `eta_seconds` is `integer()`, not
+   `non_neg_integer()`, because that is what is provable.
+
+**Two things learned the hard way, worth not rediscovering.**
+
+- **Dialyzer uses SUCCESS TYPINGS, not contracts, when analyzing callers.** So a `@spec` on a
+  helper — however accurate, including a polymorphic `when result: var` — cannot widen or narrow
+  what its callers see. Measured twice on 2026-08-14 (`Bench.with_wire/3`, `HranaClient.await_upgrade/2`).
+  An accurate spec on a *public* function still helps: fixing `HranaClient.execute/3` cleared 21
+  downstream findings at once.
+- **A dependency's `@opaque` type can make a whole subsystem read as dead.** `Mint.WebSocket.t()`
+  is opaque, so dialyzer cannot see the `{:ok, conn, t()}` branch of `new/4` and decides the
+  handshake never succeeds. Confirm that class in ISOLATION with a probe module that does nothing
+  but call the dependency — it separates "our code confuses dialyzer" from "the dependency's
+  typings are wrong" in about a minute.
 
 ## Principles
 

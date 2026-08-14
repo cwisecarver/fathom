@@ -56,7 +56,9 @@ defmodule Fathom.Admin.PrometheusScrape do
     end
   end
 
-  defp parse_labels(nil), do: %{}
+  # No `nil` clause: `labels` only ever arrives from the `[_, name, labels, value]` destructuring
+  # of `Regex.run/2`, so it is always a binary — a non-participating group would shorten the list
+  # and fail that match outright rather than bind nil. `"{}"` is the real empty case.
   defp parse_labels("{}"), do: %{}
 
   defp parse_labels(braces) do

@@ -26,23 +26,42 @@ defmodule Fathom.MixProject do
     ]
   end
 
-  # Dialyzer, phase 0 of the typing plan (`tasks/todo.md`). The gate is NOT wired into `precommit`
-  # yet — it would fail on every commit until the baseline is green, and a gate that has to be
-  # bypassed is not a gate.
+  # Dialyzer — the typing gate (`tasks/todo.md`). Wired into `precommit` (see `aliases/0`) only
+  # once the `lib/` baseline was green, because a gate that fails on every commit is a gate people
+  # learn to bypass. Verified to BITE before being trusted: a deliberately wrong return type on
+  # `Shards.migrate_on_touch_mode/0` made `mix precommit` exit 1 at this step with
+  # `invalid_contract`, without reaching the test run.
   #
-  # Canonical manual run is `MIX_ENV=test mix dialyzer`, and the env matters twice over. `precommit`
-  # runs in `:test` (see `cli/0`), and `:test` is the only env where `elixirc_paths/1` compiles
-  # `test/support` — so a dev-env run analyzes a different set of beams AND writes a second PLT.
-  # Bare `mix dialyzer` silently builds that dev PLT and pays the ~10-20 minute first build again.
+  # Canonical manual run is **`MIX_ENV=dev mix dialyzer`**, and the env is the SCOPE knob rather
+  # than a detail. `elixirc_paths/1` compiles `test/support` only in `:test`, so a `:test` run
+  # analyzes the benchmark drivers and test doubles alongside `lib/`, and a `:dev` run analyzes
+  # `lib/` alone — which is the stated scope of the typing plan ("all public functions in lib/").
+  #
+  # Scoped to `lib/` deliberately, measured on the 2026-08-14 baseline: of the 40 findings left
+  # after the first three Phase 1 passes, 22 were in `test/support` and 21 of those were a SINGLE
+  # dependency issue fanning out — `Mint.WebSocket.t()` is `@opaque`, so dialyzer cannot see the
+  # `{:ok, conn, t()}` branch of `Mint.WebSocket.new/4` from outside Mint and concludes the
+  # handshake can never succeed, which makes every bench holding a client read as dead code.
+  # Confirmed in isolation with a probe module that did nothing but call `new/4`; three fixes were
+  # tried and none worked (an accurate spec on the public caller, one on the private helper, and
+  # mint_web_socket 1.0.5 -> 1.0.6). Suppressing it would mean ~21 line-pinned ignore entries in
+  # actively-edited bench files, regrown on every edit, permanently — noise that would hide the
+  # real findings this tool exists to surface.
+  #
+  # What that costs: `test/support` is no longer type-checked. It is worth being honest that the
+  # `:test`-scoped baseline DID find a real bug there — `HranaClient.execute/3` was spec'd as a
+  # two-tuple while returning a three-tuple — which is fixed in b9fb7de and stays fixed. The
+  # judgement is that a gate protecting production code beats a gate carrying 21 permanent
+  # suppressions for benchmark scaffolding, not that the scaffolding does not matter.
   defp dialyzer do
     [
       # priv/plts rather than _build: a PLT costs ~10-20 minutes to build and `rm -rf _build` is a
       # routine move here. Filenames are env-suffixed, so dev and test PLTs coexist.
       plt_local_path: "priv/plts",
       plt_core_path: "priv/plts",
-      # :mix for the 11 Mix.Task modules in lib/mix/tasks/; :ex_unit because :test compiles
-      # test/support (the CaseTemplates) into the analyzed ebin.
-      plt_add_apps: [:mix, :ex_unit],
+      # :mix for the 11 Mix.Task modules in lib/mix/tasks/. No :ex_unit — that was here for the
+      # CaseTemplates in test/support, which a :dev-scoped run does not analyze.
+      plt_add_apps: [:mix],
       # These two check a @spec against the success typing — the whole point, since fathom's 309
       # existing specs have never been verified by anything. Deliberately NOT enabled:
       # :unmatched_returns (100+ findings across GenServer/Oban code, a separate tightening
@@ -182,7 +201,29 @@ defmodule Fathom.MixProject do
         "esbuild fathom --minify",
         "phx.digest"
       ],
-      precommit: ["compile --warnings-as-errors", "deps.unlock --unused", "format", "test"]
+      # `dialyzer` sits after `format` and before `test`: it is deterministic, reuses the beams the
+      # compile step just produced, and runs in ~2 s warm — far cheaper than the suite (ecto setup
+      # plus the shard/cluster integration tests), so failing fast there is the right order.
+      #
+      # Running it in `:dev` is load-bearing, not incidental. `precommit` runs in `:test` (see
+      # `cli/0`), and `:test` is the env where `elixirc_paths/1` also compiles `test/support` — so
+      # a `:test` dialyzer run would analyze the benchmark drivers and re-introduce the whole
+      # mint_web_socket opaque-type cascade the `dialyzer/0` comment describes.
+      #
+      # It has to be `cmd env MIX_ENV=dev ...` rather than `cmd MIX_ENV=dev ...`: `mix cmd` does
+      # NOT go through a shell, so a leading `VAR=value` is taken as the executable name and the
+      # step dies with `(ErlangError) :enoent` — which still fails the gate, but for a reason that
+      # has nothing to do with types. `/usr/bin/env` is the portable way to set it.
+      #
+      # First run after `mix deps.get` (or a dependency bump) pays a partial PLT update — minutes,
+      # once. That is expected, not a hang.
+      precommit: [
+        "compile --warnings-as-errors",
+        "deps.unlock --unused",
+        "format",
+        "cmd env MIX_ENV=dev mix dialyzer",
+        "test"
+      ]
     ]
   end
 end
