@@ -18,7 +18,20 @@ defmodule Fathom.Migrator.Copy do
   stamps `PRAGMA user_version = version`. Returns `:ok` or `{:error, reason}`
   (leaving `dest_path` at the old schema on a replay error).
   """
-  @spec migrate(Path.t(), Path.t(), non_neg_integer(), [String.t()]) :: :ok | {:error, term()}
+  @typedoc """
+  One replayable statement: the SQL and the values to BIND to it, never interpolated.
+
+  The pair is the whole point. Django sends parameterized SQL — its bookkeeping row is
+  `INSERT INTO django_migrations … VALUES (?, ?, ?)` — and storing the text alone made every
+  replay bind NULL and die on `django_migrations.app NOT NULL`, so no captured migration could be
+  replayed onto a tenant at all (fixed in `beff929`). That fix changed `replay_each/2`, the
+  capture, the release row and every caller — but not this spec, which still said `[String.t()]`.
+  Dialyzer caught it from `Fathom.Bench`, which passes pairs and was therefore reported as a call
+  that "will not succeed".
+  """
+  @type statement :: {String.t(), [term()]}
+
+  @spec migrate(Path.t(), Path.t(), non_neg_integer(), [statement()]) :: :ok | {:error, term()}
   def migrate(source_path, dest_path, version, statements),
     do: migrate_chain(source_path, dest_path, [{version, statements}])
 
@@ -166,9 +179,10 @@ defmodule Fathom.Migrator.Copy do
   # `[]`, which behaves exactly as before.
   defp replay_each(conn, statements) do
     Enum.reduce_while(statements, :ok, fn {sql, args}, :ok ->
+      # No bare `:ok` clause: `Connection.query/4` is `{:ok, map()} | {:error, term()}` and never
+      # returns one. (`Connection.exec/2` does, which is where the habit came from.)
       case Connection.query(conn, sql, args) do
         {:ok, _result} -> {:cont, :ok}
-        :ok -> {:cont, :ok}
         {:error, _} = error -> {:halt, error}
       end
     end)

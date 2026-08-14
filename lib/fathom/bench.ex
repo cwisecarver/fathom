@@ -739,7 +739,10 @@ defmodule Fathom.Bench do
   default gate. Drives `flush_now/1`, which is the same fence → `VACUUM INTO` → conditional
   PUT path the periodic timer takes.
   """
-  @spec flush_p50(keyword()) :: float() | nil
+  # No `| nil`, unlike the wire metrics: those return nil when the listener or client cannot start
+  # (the metric is skipped, never faked), but this one is S3-free and local — there is nothing for
+  # it to skip, and it ends in `p50(us)` unconditionally.
+  @spec flush_p50(keyword()) :: float()
   def flush_p50(opts \\ []) do
     trials = Keyword.get(opts, :trials, @default_trials)
     id = "benchflush"
@@ -890,6 +893,20 @@ defmodule Fathom.Bench do
   # Starts a real Filo listener on a loopback port, opens one client stream routed to `shard`
   # by Host subdomain, runs `fun`, and tears the whole thing down. Returns nil (metric skipped,
   # never faked) if the listener or the client cannot start.
+  #
+  # The spec is polymorphic because that is what the helper honestly promises: it returns whatever
+  # `fun` returned, or nil.
+  #
+  # It does NOT silence the four dialyzer findings on the metrics that call this, and that is worth
+  # knowing before someone tries it again. Four callbacks return different shapes — a
+  # `%{p50_us, p99_us}` map from `hrana_rt_stats/1`, a bare float from the other three — so
+  # dialyzer computes ONE success typing for this helper that unions all of them and hands that
+  # union to every caller, which is why `hrana_rt_stats/1` reads as "missing float()". A type
+  # variable does not change that: dialyzer uses SUCCESS TYPINGS, not contracts, when analyzing
+  # callers, so a spec here constrains nothing downstream. (Measured twice on 2026-08-14 — the same
+  # attempt on `HranaClient.await_upgrade/2` also changed nothing.) Those four are recorded in
+  # `.dialyzer_ignore.exs` as the dialyzer limitation they are.
+  @spec with_wire(keyword(), String.t(), (term() -> result)) :: result | nil when result: var
   defp with_wire(opts, shard, fun) do
     setup(opts)
     # Route by Host subdomain exactly as the LB does. Pinned rather than inherited so the

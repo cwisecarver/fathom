@@ -292,7 +292,9 @@ defmodule Fathom.Shard.Replication.Fleet do
   Returning a list rather than a spec keeps `application.ex` free of a conditional: it splices in
   nothing when the feature is off.
   """
-  @spec children() :: [Supervisor.child_spec() | {module(), term()}]
+  # `module()` belongs in the union: this returns `[__MODULE__]`, the bare-module child-spec form,
+  # which is neither a `Supervisor.child_spec()` map nor the `{module, arg}` tuple the spec listed.
+  @spec children() :: [Supervisor.child_spec() | {module(), term()} | module()]
   def children do
     if replicating?() or listening?(), do: [__MODULE__], else: []
   end

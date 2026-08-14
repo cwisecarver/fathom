@@ -231,11 +231,11 @@ defmodule Fathom.Directory.Recorder do
   defp past?(:infinity), do: false
   defp past?(deadline), do: System.monotonic_time(:millisecond) >= deadline
 
+  # No empty-list branch: `flush_chunks/5` is the only caller and already returns on `drain_chunk`
+  # giving `[]`, so `rows` is always non-empty here. The check used to live in both places and was
+  # left behind when chunking moved it up.
   defp flush_rows(table, rows, upsert, event) do
     case rows do
-      [] ->
-        {:ok, 0}
-
       rows ->
         try do
           # The buffer holds integer microsecond stamps (see record/1); Directory's batch API

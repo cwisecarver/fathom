@@ -567,14 +567,24 @@ defmodule Fathom.Migrator do
   traffic. Raising `:reconcile_batch_size` and watching `rate_per_hour` fail to follow is the
   signal that the bottleneck is somewhere else.
   """
+  # `review_blocks` was missing here: expert review 2026-08-01 #26 added it to the returned map
+  # deliberately as a NEW field (rather than changing `pending_review`'s type, which would have
+  # been a consumer break on a published control-plane endpoint) — and the spec was not updated
+  # with it, so the declaration described the pre-#26 response.
+  #
+  # `eta_seconds` is `integer()` rather than `non_neg_integer()` because that is what dialyzer can
+  # prove: it is a division of two counts and nothing in the type system rules out a negative,
+  # even though the values feeding it cannot produce one. Stating the provable bound beats stating
+  # an intent the compiler cannot check.
   @spec status() :: %{
           head: non_neg_integer(),
           laggards: non_neg_integer(),
           failed: non_neg_integer(),
           converged: boolean(),
           pending_review: [pos_integer()],
+          review_blocks: [map()],
           rate_per_hour: non_neg_integer(),
-          eta_seconds: non_neg_integer() | nil,
+          eta_seconds: integer() | nil,
           stalled: non_neg_integer()
         }
   def status do

@@ -69,6 +69,9 @@ defmodule Mix.Tasks.Fathom.Token do
     :exit, reason -> refuse(reason)
   end
 
+  # `no_return()` rather than an ignore entry: this always raises, and saying so is the accurate
+  # contract — it also lets dialyzer see that its callers' rescue/catch arms do not fall through.
+  @spec refuse(term()) :: no_return()
   defp refuse(reason) do
     Mix.raise(
       "cannot read the shard's revocation floor (Postgres unreachable: " <>
