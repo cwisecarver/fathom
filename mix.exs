@@ -21,7 +21,37 @@ defmodule Fathom.MixProject do
       # build. Nothing at compile time depends on the artifact — only the running node loads it —
       # so last is also the correct place semantically.
       compilers: [:phoenix_live_view] ++ Mix.compilers() ++ [:fathom_udf],
-      listeners: [Phoenix.CodeReloader]
+      listeners: [Phoenix.CodeReloader],
+      dialyzer: dialyzer()
+    ]
+  end
+
+  # Dialyzer, phase 0 of the typing plan (`tasks/todo.md`). The gate is NOT wired into `precommit`
+  # yet — it would fail on every commit until the baseline is green, and a gate that has to be
+  # bypassed is not a gate.
+  #
+  # Canonical manual run is `MIX_ENV=test mix dialyzer`, and the env matters twice over. `precommit`
+  # runs in `:test` (see `cli/0`), and `:test` is the only env where `elixirc_paths/1` compiles
+  # `test/support` — so a dev-env run analyzes a different set of beams AND writes a second PLT.
+  # Bare `mix dialyzer` silently builds that dev PLT and pays the ~10-20 minute first build again.
+  defp dialyzer do
+    [
+      # priv/plts rather than _build: a PLT costs ~10-20 minutes to build and `rm -rf _build` is a
+      # routine move here. Filenames are env-suffixed, so dev and test PLTs coexist.
+      plt_local_path: "priv/plts",
+      plt_core_path: "priv/plts",
+      # :mix for the 11 Mix.Task modules in lib/mix/tasks/; :ex_unit because :test compiles
+      # test/support (the CaseTemplates) into the analyzed ebin.
+      plt_add_apps: [:mix, :ex_unit],
+      # These two check a @spec against the success typing — the whole point, since fathom's 309
+      # existing specs have never been verified by anything. Deliberately NOT enabled:
+      # :unmatched_returns (100+ findings across GenServer/Oban code, a separate tightening
+      # decision) and :underspecs/:overspecs (false-positive-prone on this codebase's shapes).
+      flags: [:missing_return, :extra_return],
+      ignore_warnings: ".dialyzer_ignore.exs",
+      # Fails loudly on a filter that no longer matches anything, so the ignore file cannot quietly
+      # accumulate entries that stopped being true.
+      list_unused_filters: true
     ]
   end
 
@@ -117,7 +147,12 @@ defmodule Fathom.MixProject do
       # wire benches use to exercise the full Filo.Socket path (Phase 1,
       # docs/tpc-benchmark-plan.md). `mint` + `castore` are already transitive (Finch/Req),
       # so this adds only the thin WS layer, and never ships in a prod release.
-      {:mint_web_socket, "~> 1.0", only: [:dev, :test]}
+      {:mint_web_socket, "~> 1.0", only: [:dev, :test]},
+      # Dialyzer. `:test` is required as well as `:dev`, not optional: `precommit` runs in :test
+      # (see `cli/0`), so a :dev-only dep would leave `mix dialyzer` unavailable in the exact env
+      # the gate will run in. `runtime: false` keeps it out of every release — the prod images
+      # never compile it.
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
     ]
   end
 
