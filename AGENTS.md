@@ -252,7 +252,19 @@ restating its shape, so the drift cannot recur.
 
 1. **Skip behaviour callback implementations** — GenServer/LiveView/Plug/Oban/Mix.Task/
    `Filo.Executor`/`Fathom.Shard.Storage` impls. The contract lives once, on the `@callback`.
-2. **Spec the client API of GenServers**, not the server callbacks.
+2. **Spec the client API of GenServers**, not the server callbacks — but know what that buys.
+   **A `@spec` on a GenServer client wrapper is DOCUMENTATION ONLY; dialyzer cannot check it.**
+   Measured 2026-08-14: `@spec dirty?(pid()) :: :definitely_not_what_it_returns` on
+   `Fathom.Shard.dirty?/1` — whose body is one `GenServer.call/3` — passes the gate, because
+   `GenServer.call/3` returns `term()` and nothing contradicts it. The discriminating pair is
+   `Shards.migrate_on_touch_mode/0`, a pure config read, where the same deliberate break IS caught
+   as `invalid_contract`.
+   **The rule this generalizes to, and the one worth planning around: a spec is CHECKED only where
+   dialyzer can compute a success typing from the body that contradicts it.** Pure functions, data
+   transformations and anything whose shape flows between modules are checked. Wrappers over
+   `GenServer.call`, `:ets`, dynamic dispatch (`backend().pull(...)`) and NIFs are not. Write them
+   anyway for legibility — but do not count them as coverage, and spend effort on the data
+   contracts first, since every defect found on 2026-08-14 lived in one.
 3. **Reuse owned types**: `Fathom.ShardId.t()`, `Storage.lease()`, `Ecto.Changeset.t()`. Never
    re-inline a shape that has a name — that is how the table above happened.
 4. **Ecto schemas get `@type t :: %__MODULE__{}`.** Three were missing it while six specs named it.

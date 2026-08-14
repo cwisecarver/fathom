@@ -149,6 +149,7 @@ defmodule Fathom.Shard do
   # regression that can also strand a lease.
   @hibernate_after_ms 30_000
 
+  @spec start_link(Fathom.ShardId.t()) :: GenServer.on_start()
   def start_link(shard_id) do
     GenServer.start_link(__MODULE__, shard_id,
       name: via(shard_id),
@@ -158,6 +159,7 @@ defmodule Fathom.Shard do
   end
 
   @doc "Registry `:via` tuple addressing the coordinator for `shard_id`."
+  @spec via(Fathom.ShardId.t()) :: {:via, module(), {module(), Fathom.ShardId.t()}}
   def via(shard_id) do
     {:via, Registry, {Fathom.ShardRegistry, shard_id}}
   end
@@ -168,6 +170,7 @@ defmodule Fathom.Shard do
   while it is in use), and returns `{:ok, ref, path}`. Pass `ref` to `checkin/2`
   when the connection closes.
   """
+  @spec checkout(pid()) :: {:ok, reference(), Path.t()} | {:error, term()}
   def checkout(pid) when is_pid(pid) do
     # The op tag makes a later abandon PRECISE (expert review round-2 #33): it names
     # exactly this call's grant, so abandoning a timed-out checkout can never drop a
@@ -213,6 +216,7 @@ defmodule Fathom.Shard do
   end
 
   @doc "Releases a connection previously checked out with `checkout/1`."
+  @spec checkin(pid(), reference()) :: :ok
   def checkin(pid, ref) when is_pid(pid), do: GenServer.cast(pid, {:checkin, ref})
 
   @doc """
@@ -221,6 +225,7 @@ defmodule Fathom.Shard do
   the coordinator's `flushed_through` watermark. Used by tests; the coordinator itself checks this
   internally on each flush decision. Finding #27 replaced a per-write cast with this ETS signal.
   """
+  @spec dirty?(pid()) :: boolean()
   def dirty?(pid) when is_pid(pid), do: GenServer.call(pid, :dirty?)
 
   @doc """
@@ -239,6 +244,7 @@ defmodule Fathom.Shard do
   clean; returns `:ok`, or `{:error, reason}` on a flush error / lease steal. See
   `Fathom.Shards.flush/1` for the by-id, registry-resolving wrapper.
   """
+  @spec flush_now(pid()) :: :ok | {:error, term()}
   def flush_now(pid) when is_pid(pid), do: GenServer.call(pid, :flush_now, flush_now_timeout())
 
   # Configurable so a test can exercise the timeout path without a 60s wait (expert review #14);
@@ -265,6 +271,7 @@ defmodule Fathom.Shard do
   `{:drain_aborted, pid}`. Fire-and-forget; `Fathom.Shards.drain/2` watches for the
   process to exit (success) or the abort message (still busy).
   """
+  @spec request_drain(pid(), non_neg_integer(), pid()) :: :ok
   def request_drain(pid, drain_timeout, reply_to) when is_pid(pid),
     do: GenServer.cast(pid, {:drain, drain_timeout, reply_to})
 
@@ -3207,6 +3214,7 @@ defmodule Fathom.Shard do
   # Public for Fathom.Shards' novel-shard check (a present local file means the shard
   # exists — an authoritative un-flushed copy — so it is never "novel").
   @doc false
+  @spec db_path(Fathom.ShardId.t()) :: Path.t()
   def db_path(id), do: Path.join(data_dir(), "#{id}.db")
 
   # Public (@doc false) so Fathom.Shard.TempReaper sweeps the same directory this

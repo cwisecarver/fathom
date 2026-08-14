@@ -50,12 +50,24 @@ defmodule Fathom.Shards do
   # a voluntary handoff have different natures and an operator may want to tune them apart.
   @default_crash_hold_ms 5_000
 
+  @typedoc """
+  A held checkout: the coordinator, the ref that identifies THIS checkout, and the local file path.
+
+  The `ref` is not decoration — `Fathom.Shard.checkin/2` takes it, and the coordinator monitors the
+  checking-out process against it, so a stream that dies without checking in is still released.
+  """
+  @type checkout :: {:ok, pid(), reference(), Path.t()}
+
   @doc """
   Ensures `shard_id`'s coordinator is running and checks out the shard for the
   caller, returning `{:ok, coordinator_pid, ref, path}` (or `{:error, reason}` for
   an invalid id / start failure). The caller opens its own connection at `path`
   and passes `ref` back via `Fathom.Shard.checkin/2` when it closes.
   """
+  # `term()` in, not `ShardId.t()`: this is a TRUST BOUNDARY. It is called with request-derived
+  # values and its first act is `ShardId.cast/1`, so promising a validated id here would describe
+  # the opposite of what it does.
+  @spec checkout(term()) :: checkout() | {:error, term()}
   def checkout(shard_id) do
     # Normalize (validate + downcase) at this trust boundary so the whole checkout — telemetry
     # tag, ensure, record_use, ShardLoad — and every downstream key uses the one canonical id
@@ -223,6 +235,7 @@ defmodule Fathom.Shards do
   #     Idle stops are routine at scale, so without this a steady trickle of checkouts a 1 ms
   #     retry would have fixed surfaced as spurious `{:error, :normal}` to the client.
   @doc false
+  @spec retry_checkout?(term()) :: boolean()
   def retry_checkout?(reason), do: reason in [:unavailable, :normal]
 
   defp checkout_outcome({:ok, _, _, _}), do: :ok
@@ -415,6 +428,11 @@ defmodule Fathom.Shards do
   `{:error, :busy}` if connections didn't drain in time — the coordinator keeps
   serving and the caller should retry later. Blocks until the coordinator exits.
   """
+  # `ShardId.t()`, not `term()`: unlike `checkout/1` this is an INTERNAL caller's entry point
+  # (eviction, the rebalancer handoff, tenant delete), and every one of them already holds a cast
+  # id. It looks the shard up in the registry rather than casting, so an uncast id would silently
+  # miss instead of being rejected.
+  @spec drain(Fathom.ShardId.t(), non_neg_integer()) :: :ok | {:error, term()}
   def drain(shard_id, drain_timeout \\ @default_drain_ms) do
     case Registry.lookup(@registry, shard_id) do
       [] ->
@@ -509,7 +527,7 @@ defmodule Fathom.Shards do
   would quarantine the tenant's data to a `.fenced.<ts>` file the caller would then have to
   hunt down. Caller purges storage AFTER this returns. Returns `:ok` (stopped or already cold).
   """
-  @spec stop(String.t()) :: :ok
+  @spec stop(Fathom.ShardId.t()) :: :ok
   def stop(shard_id) do
     case Registry.lookup(@registry, shard_id) do
       [] ->
@@ -536,7 +554,7 @@ defmodule Fathom.Shards do
   command channel (the production generalization, the same cross-node-coordinator follow-up as
   `Fathom.Tenants.purge`'s drain). The single-home / single-node case needs neither.
   """
-  @spec flush(String.t()) :: :ok | {:error, term()}
+  @spec flush(Fathom.ShardId.t()) :: :ok | {:error, term()}
   def flush(shard_id) do
     case Registry.lookup(@registry, shard_id) do
       [] ->
@@ -617,10 +635,12 @@ defmodule Fathom.Shards do
   # window between the Registry lookup and our monitor, so it is already cold. Both are `:ok`;
   # only a genuinely abnormal exit is a drain failure.
   @doc false
+  @spec drain_down_result(term()) :: :ok | {:error, {:drain_failed, term()}}
   def drain_down_result(reason) when reason in [:normal, :noproc], do: :ok
   def drain_down_result(reason), do: {:error, {:drain_failed, reason}}
 
   @doc "Returns `{:ok, pid}` for `shard_id`, starting the coordinator if needed."
+  @spec ensure(Fathom.ShardId.t()) :: {:ok, pid()} | {:error, term()}
   def ensure(shard_id) when is_binary(shard_id) do
     cond do
       not Fathom.ShardId.valid?(shard_id) ->

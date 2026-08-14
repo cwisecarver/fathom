@@ -25,6 +25,18 @@ defmodule Fathom.ShardId do
   validator. Mint hyphenated ids (never underscores) if you serve shards under a wildcard cert.
   """
 
+  @typedoc """
+  A **validated, canonical** shard id — what `cast/1` returns, not any string that happens to name
+  a shard.
+
+  It is `String.t()` to dialyzer, so this buys no checking; it is here to make the boundary legible
+  at a glance. A spec saying `String.t()` says "some text", and every path-traversal and
+  cross-tenant question in fathom turns on whether a particular string went through `cast/1` first.
+  Use `t()` where a value HAS been cast and `String.t()` where it has not — `valid?/1` and `cast/1`
+  take `term()` precisely because their whole job is receiving the untrusted kind.
+  """
+  @type t :: String.t()
+
   # Alphanumerics, underscore, hyphen; 1..64 chars. No dot (blocks `..` traversal and
   # dotted-subdomain ambiguity), no slash, no whitespace, no control chars. NOTE: `_` is
   # admitted but is not a valid DNS label char — see the wildcard-TLS caveat in @moduledoc.
@@ -64,7 +76,7 @@ defmodule Fathom.ShardId do
   every downstream use — registry key, file path, S3 key, directory row, coordinator handle — sees
   the one canonical value.
   """
-  @spec cast(term()) :: {:ok, String.t()} | :error
+  @spec cast(term()) :: {:ok, t()} | :error
   def cast(id) when is_binary(id) do
     if valid?(id), do: {:ok, String.downcase(id, :ascii)}, else: :error
   end
