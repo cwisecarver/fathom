@@ -75,7 +75,7 @@ defmodule Fathom.Shard.Replication.Recovery do
 
   require Logger
 
-  alias Fathom.Shard.Replication.{Fleet, Follower, Promote, Protocol}
+  alias Fathom.Shard.Replication.{Fleet, Follower, FollowerLog, Promote, Protocol}
 
   @connect_timeout 2_000
   @query_timeout_ms 2_000
@@ -84,13 +84,17 @@ defmodule Fathom.Shard.Replication.Recovery do
   @typedoc "A peer to ask: `{node_key, host, port}`, the shape `Fleet` publishes."
   @type endpoint :: {String.t(), String.t() | charlist(), :inet.port_number()}
 
-  @typedoc "What a peer says about its replica — the same shape as `FollowerLog.t()`."
-  @type position :: %{
-          epoch: non_neg_integer(),
-          wal_gen: non_neg_integer(),
-          salt1: non_neg_integer(),
-          next_offset: non_neg_integer()
-        }
+  @typedoc """
+  What a peer says about its replica — `FollowerLog.t()` itself, not a restatement of it.
+
+  It used to spell out the four positional fields under a comment claiming "the same shape as
+  `FollowerLog.t()`", and then drifted: the 2026-08-12 torn-replica fix added `torn` to
+  `FollowerLog.t()` and never added it here. So the type asserted equivalence while omitting the
+  one field that decides whether a replica may be promoted AT ALL — a torn replica is never
+  fresher than anything (`Promote.fresher?/2`), which is exactly the rule that stopped a tenant
+  being served an empty database. Aliasing rather than copying makes that drift impossible.
+  """
+  @type position :: FollowerLog.t()
 
   @doc """
   Is peer recovery switched on? (`:replication_recover_from_peers`, default `false`.)

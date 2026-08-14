@@ -7,6 +7,8 @@ defmodule Fathom.Audit.Event do
   use Ecto.Schema
   import Ecto.Changeset
 
+  @type t :: %__MODULE__{}
+
   schema "audit_events" do
     field :actor, :string
     field :action, :string

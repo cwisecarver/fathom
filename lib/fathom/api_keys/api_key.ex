@@ -8,6 +8,8 @@ defmodule Fathom.ApiKeys.ApiKey do
 
   @scopes ~w(read manage destroy)
 
+  @type t :: %__MODULE__{}
+
   schema "api_keys" do
     field :name, :string
     field :scope, :string, default: "read"

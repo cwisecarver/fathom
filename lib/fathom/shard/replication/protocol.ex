@@ -133,9 +133,14 @@ defmodule Fathom.Shard.Replication.Protocol do
   end
 
   @doc """
-  Encode a frame delta. Returns iodata — the payload is not copied.
+  Encode a frame delta. Returns an iolist — the payload is not copied.
+
+  Every `encode_*` here is `iolist()` rather than the more familiar `iodata()`, and the difference
+  is real: `iodata()` also admits a bare binary, and none of these ever return one — the header and
+  the body always travel as a list so the payload is never copied into a new binary. `iodata()`
+  said "possibly a single flat binary", which is precisely the behaviour these avoid.
   """
-  @spec encode_push(Push.t()) :: iodata()
+  @spec encode_push(Push.t()) :: iolist()
   def encode_push(%Push{} = p) do
     shard = p.shard_id
 
@@ -150,7 +155,7 @@ defmodule Fathom.Shard.Replication.Protocol do
   @doc """
   Open a streamed seed. Declares the sizes the chunks must add up to.
   """
-  @spec encode_seed_begin(SeedBegin.t()) :: iodata()
+  @spec encode_seed_begin(SeedBegin.t()) :: iolist()
   def encode_seed_begin(%SeedBegin{} = s) do
     [
       <<@version::8, @seed_begin::8, byte_size(s.shard_id)::16, s.epoch::64, s.wal_gen::64,
@@ -166,7 +171,7 @@ defmodule Fathom.Shard.Replication.Protocol do
   chunk *detectable* rather than silently producing a database with a hole in it — the same reason
   a `Push` carries its offset instead of trusting the stream.
   """
-  @spec encode_seed_chunk(String.t(), :db | :wal, non_neg_integer(), binary()) :: iodata()
+  @spec encode_seed_chunk(String.t(), :db | :wal, non_neg_integer(), binary()) :: iolist()
   def encode_seed_chunk(shard_id, part, seq, bytes) do
     [
       <<@version::8, @seed_chunk::8, part_code(part)::8, byte_size(shard_id)::16, seq::32>>,
@@ -176,7 +181,7 @@ defmodule Fathom.Shard.Replication.Protocol do
   end
 
   @doc "Commit a streamed seed: install it and start following the shard."
-  @spec encode_seed_end(String.t()) :: iodata()
+  @spec encode_seed_end(String.t()) :: iolist()
   def encode_seed_end(shard_id) do
     [<<@version::8, @seed_end::8, byte_size(shard_id)::16>>, shard_id]
   end
@@ -190,7 +195,7 @@ defmodule Fathom.Shard.Replication.Protocol do
   partial files and the primary would block until the seed timeout, so this both frees the follower
   and unblocks the sender.
   """
-  @spec encode_seed_abort(String.t()) :: iodata()
+  @spec encode_seed_abort(String.t()) :: iolist()
   def encode_seed_abort(shard_id) do
     [<<@version::8, @seed_abort::8, byte_size(shard_id)::16>>, shard_id]
   end
@@ -213,7 +218,7 @@ defmodule Fathom.Shard.Replication.Protocol do
   unworkable one. Correlating on `shard_id` alone is sufficient because a shard has exactly one
   writer (the lease), so there is never more than one push in flight for it.
   """
-  @spec encode_ack(String.t(), non_neg_integer()) :: iodata()
+  @spec encode_ack(String.t(), non_neg_integer()) :: iolist()
   def encode_ack(shard_id, next_offset) do
     [<<@version::8, @ack::8, byte_size(shard_id)::16, next_offset::64>>, shard_id]
   end
@@ -224,7 +229,7 @@ defmodule Fathom.Shard.Replication.Protocol do
   `expected_offset` lets the primary rewind and re-send rather than tear the follower down and
   re-seed it from S3 — a full re-seed is the expensive recovery, and a gap is the cheap one.
   """
-  @spec encode_reject(String.t(), atom(), non_neg_integer()) :: iodata()
+  @spec encode_reject(String.t(), atom(), non_neg_integer()) :: iolist()
   def encode_reject(shard_id, reason, expected_offset) when is_map_key(@reason_codes, reason) do
     [
       <<@version::8, @reject::8, @reason_codes[reason]::8, byte_size(shard_id)::16,
@@ -241,7 +246,7 @@ defmodule Fathom.Shard.Replication.Protocol do
   three of its peers hold a current one. Answering it needs no BEAM cluster and no new transport —
   it is one request/response on the port A2 already opened.
   """
-  @spec encode_position_query(String.t()) :: iodata()
+  @spec encode_position_query(String.t()) :: iolist()
   def encode_position_query(shard_id) do
     [<<@version::8, @position_query::8, byte_size(shard_id)::16>>, shard_id]
   end
@@ -255,7 +260,7 @@ defmodule Fathom.Shard.Replication.Protocol do
   "nothing" into "the beginning" would let a node with no copy at all win a comparison against an
   unstamped object.
   """
-  @spec encode_position(String.t(), map() | nil) :: iodata()
+  @spec encode_position(String.t(), map() | nil) :: iolist()
   def encode_position(shard_id, nil) do
     [
       <<@version::8, @position::8, 0::8, byte_size(shard_id)::16, 0::64, 0::64, 0::64, 0::64>>,
@@ -281,7 +286,7 @@ defmodule Fathom.Shard.Replication.Protocol do
 
   A peer holding nothing answers `reject(shard_id, :unknown_shard, 0)`.
   """
-  @spec encode_replica_request(String.t()) :: iodata()
+  @spec encode_replica_request(String.t()) :: iolist()
   def encode_replica_request(shard_id) do
     [<<@version::8, @replica_request::8, byte_size(shard_id)::16>>, shard_id]
   end

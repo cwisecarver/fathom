@@ -2352,8 +2352,16 @@ defmodule Fathom.Shard do
     {:error, reason}
   end
 
-  defp elem_reason(reason) when is_tuple(reason), do: elem(reason, 0)
-  defp elem_reason(reason), do: reason
+  # Every reason that reaches here today IS a tagged tuple (`Recovery.recheck/3` returns
+  # `{:object_moved, _, _}` / `{:object_advanced, _}`, and the other caller passes
+  # `{:object_head_unreadable, _}`), which dialyzer proves — a second `defp` clause for the bare
+  # case was reported as unreachable. It is written as ONE total clause rather than deleted,
+  # because this runs inside `decline_promotion/3` on the shard-open path: a future reason that is
+  # a plain atom would otherwise raise FunctionClauseError from a telemetry label and fail an open
+  # that the ordinary stored-object path would have served fine.
+  defp elem_reason(reason) do
+    if is_tuple(reason) and tuple_size(reason) > 0, do: elem(reason, 0), else: reason
+  end
 
   defp promote_on_open?, do: Application.get_env(:fathom, :replication_promote_on_open, false)
 

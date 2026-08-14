@@ -19,15 +19,23 @@ defmodule Fathom.Bench.HranaClient do
 
       {:ok, sup, port} = HranaClient.start_listener()
       {:ok, c} = HranaClient.connect(port, "acme")
-      {:ok, %{rows: [[1]]}} = HranaClient.execute(c, "SELECT 1")
+      {:ok, c, %{rows: [[1]]}} = HranaClient.execute(c, "SELECT 1")
       :ok = HranaClient.close(c)
       HranaClient.stop_listener(sup)
+
+  `execute/3` returns the CLIENT alongside the result and the caller must thread it through —
+  every request bumps `next_id` and the Mint conn/websocket carry their own state. The example
+  above said `{:ok, result}` until 2026-08-14, matching an `@spec` that was equally wrong; every
+  real caller had always used the three-tuple. Nothing had ever checked either.
   """
 
   alias Fathom.ShardExecutor
 
   @enforce_keys [:conn, :ref, :websocket, :stream_id]
   defstruct [:conn, :ref, :websocket, :stream_id, next_id: 0]
+
+  @typedoc "One connected client: the Mint conn, its request ref, the websocket, and the stream."
+  @type t :: %__MODULE__{}
 
   @recv_timeout 15_000
 
@@ -78,7 +86,7 @@ defmodule Fathom.Bench.HranaClient do
   Connects to the loopback listener, upgrades to WS (`hrana3`, `Host: <shard>.local`),
   handshakes `hello`, and opens one stream. Returns `{:ok, client}`.
   """
-  @spec connect(pos_integer(), String.t(), keyword()) :: {:ok, %__MODULE__{}} | {:error, term()}
+  @spec connect(pos_integer(), String.t(), keyword()) :: {:ok, t()} | {:error, term()}
   def connect(port, shard, _opts \\ []) do
     host = "#{shard}.local"
 
@@ -97,9 +105,10 @@ defmodule Fathom.Bench.HranaClient do
 
   @doc """
   Runs `sql` (with native `args`) on the client's stream through the wire. Returns
-  `{:ok, %{rows: rows, cols: cols, affected_row_count: n}}` with rows as native Elixir values.
+  `{:ok, client, %{rows: rows, cols: cols, affected_row_count: n}}` with rows as native Elixir
+  values — the client comes back because `next_id` and the Mint conn advance on every request.
   """
-  @spec execute(%__MODULE__{}, String.t(), list()) :: {:ok, map()} | {:error, term()}
+  @spec execute(t(), String.t(), list()) :: {:ok, t(), map()} | {:error, term()}
   def execute(client, sql, args \\ []) do
     stmt = %{"sql" => sql, "args" => Enum.map(args, &encode_value/1)}
 
@@ -119,7 +128,7 @@ defmodule Fathom.Bench.HranaClient do
   end
 
   @doc "Closes the stream and the socket."
-  @spec close(%__MODULE__{}) :: :ok
+  @spec close(t()) :: :ok
   def close(client) do
     {:ok, client, _} =
       request(client, %{"type" => "close_stream", "stream_id" => client.stream_id})
@@ -197,6 +206,21 @@ defmodule Fathom.Bench.HranaClient do
   end
 
   # Consume the 101 upgrade response and build the websocket.
+  #
+  # The @spec is load-bearing rather than documentation. `Mint.WebSocket.t()` is `@opaque`, and
+  # dialyzer cannot see the `{:ok, conn, t()}` branch of `Mint.WebSocket.new/4` from outside Mint —
+  # it infers the call as ERROR-ONLY. Verified in isolation on 2026-08-14 with a five-line probe
+  # module that did nothing but call `new/4` and match both branches: the `{:ok, _, _}` clause was
+  # reported unreachable there too, with no fathom code involved.
+  #
+  # Left alone, that conclusion propagates: `connect/3` "never succeeds", so every bench that holds
+  # a client is dead code, and 45 of the 115 baseline findings were that one inference fanning out
+  # across bench_tpcc, bench_wire and bench.ex. Suppressing them would have meant ~45 ignore
+  # entries that regrow whenever a bench changes — hiding real findings in the noise.
+  @spec await_upgrade(Mint.HTTP.t(), Mint.Types.request_ref()) ::
+          {:ok, Mint.HTTP.t(), Mint.WebSocket.t()}
+          | {:error, term()}
+          | {:error, Mint.HTTP.t(), term()}
   defp await_upgrade(conn, ref) do
     receive do
       message ->

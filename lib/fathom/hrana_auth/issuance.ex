@@ -16,6 +16,8 @@ defmodule Fathom.HranaAuth.Issuance do
 
   @scopes ~w(rw ro)
 
+  @type t :: %__MODULE__{}
+
   schema "hrana_token_issuances" do
     field :shard_id, :string
     field :token_version, :integer
