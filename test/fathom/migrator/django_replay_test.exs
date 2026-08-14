@@ -18,7 +18,10 @@ defmodule Fathom.Migrator.DjangoReplayTest do
       editor
     * the SQLite **table-rebuild** (`CREATE TABLE new__x` / `INSERT … SELECT` / `DROP` / `RENAME`)
       that the data-migration lint used to flag, freezing the fleet below almost every real migration
-    * `PRAGMA foreign_key_check` inside the replay transaction
+    * `PRAGMA foreign_key_check` inside the replay transaction — kept in the fixture because it is a
+      verbatim record of what Django sent in July. Capture STRIPS it now (`Capture.pure_read?/1`),
+      so a version captured today would not carry it; "dropping Django's introspection leaves the
+      replayed database identical" below is the evidence that the two are equivalent.
 
   If Django changes what it emits, re-capture the fixture rather than hand-editing it — the point of
   this file is that nothing in it was written by us.
@@ -26,7 +29,7 @@ defmodule Fathom.Migrator.DjangoReplayTest do
   use Fathom.DataCase, async: false
 
   alias Fathom.Migrator
-  alias Fathom.Migrator.{Copy, ShardMigration}
+  alias Fathom.Migrator.{Capture, Copy, ShardMigration}
   alias Fathom.Shard.{Connection, Storage}
 
   @fixture "test/support/fixtures/django_migrate_capture.json"
@@ -255,5 +258,46 @@ defmodule Fathom.Migrator.DjangoReplayTest do
              query!(dest, "SELECT name FROM sqlite_master WHERE type='table'")
 
     assert %{rows: [[0]]} = query!(dest, "PRAGMA user_version")
+  end
+
+  # The fixture is the capture as it was RECORDED in July, so it still carries Django's schema-editor
+  # introspection: `SELECT … sqlite_master`, `SELECT QUOTE(?)…` and `PRAGMA foreign_key_check`.
+  # Capture now drops those (`Capture.pure_read?/1`). This is the evidence that doing so is safe —
+  # replaying the fixture with them and without them must produce the same database, or the
+  # optimization is a schema change wearing a performance change's clothes.
+  #
+  # It has to run on the REAL capture rather than hand-written SQL for the reason this whole file
+  # exists: the reads only appear in what Django actually sends.
+  test "dropping Django's introspection leaves the replayed database identical",
+       %{capture: [v1, v2]} do
+    :ok = release!(v1)
+    :ok = release!(v2)
+
+    verbatim = replay_chain!([{v1.version, pairs(v1)}, {v2.version, pairs(v2)}])
+
+    stripped =
+      replay_chain!([
+        {v1.version, Enum.reject(pairs(v1), &Capture.pure_read?(elem(&1, 0)))},
+        {v2.version, Enum.reject(pairs(v2), &Capture.pure_read?(elem(&1, 0)))}
+      ])
+
+    # The filter must actually have removed something, or this test passes by doing nothing — the
+    # failure mode AGENTS.md calls "a number for work that never happened".
+    assert length(pairs(v1)) + length(pairs(v2)) == 29
+    assert Enum.count(pairs(v1) ++ pairs(v2), &Capture.pure_read?(elem(&1, 0))) == 4
+
+    assert verbatim == stripped
+  end
+
+  # Every object in sqlite_master, both version stamps, and Django's ledger — the whole observable
+  # result of a migration chain.
+  defp replay_chain!(steps) do
+    source = fresh_django_db!("chain_src")
+    dest = fresh_django_db!("chain_dst")
+    assert :ok = Copy.migrate_chain(source, dest, steps)
+
+    {query!(dest, "SELECT type, name, sql FROM sqlite_master ORDER BY type, name").rows,
+     query!(dest, "PRAGMA user_version").rows,
+     query!(dest, "SELECT app, name FROM django_migrations ORDER BY name").rows}
   end
 end

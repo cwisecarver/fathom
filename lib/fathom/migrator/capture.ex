@@ -15,6 +15,12 @@ defmodule Fathom.Migrator.Capture do
   control verbs are classified (`classify/1`). Statements outside a tracked
   transaction (autocommit) are ignored — see the engine plan's limitations.
 
+  **Django's own introspection is stripped before recording** (`pure_read?/1`). Its schema editor
+  interleaves `SELECT … sqlite_master`, `SELECT QUOTE(?)…` and `PRAGMA foreign_key_check` with the
+  DDL, and recording them made every tenant re-run the lot — roughly doubling each replay step on a
+  tenant with data, once per version in the chain, to produce a result `Copy` discards. Only
+  provable reads are dropped, via an allowlist.
+
   **The count does not always rise by `COMMIT`.** Django's SQLite backend has to commit before it
   can re-enable foreign-key checks, so for any migration that disables them — a `CreateModel`
   carrying a ForeignKey, for instance — it writes the `django_migrations` row *after* the
@@ -404,6 +410,25 @@ defmodule Fathom.Migrator.Capture do
 
   @dml_leads ~w(insert update delete replace)
 
+  # Read-only PRAGMAs, as an ALLOWLIST — the list is what makes `pure_read?/1` safe. A PRAGMA is
+  # only a read when it is one of these AND carries no assignment; everything else (`foreign_keys =
+  # OFF`, `legacy_alter_table = ON`, `user_version = N`, `optimize`, `wal_checkpoint`, anything
+  # unrecognized) is kept. Dropping a statement that turns out to matter loses DDL permanently,
+  # while keeping one that does not costs a replay a few milliseconds — so the failure directions
+  # are wildly asymmetric and this fails closed on purpose.
+  #
+  # These are the introspection calls Django's SQLite backend makes (`django/db/backends/sqlite3/
+  # introspection.py` and `schema.py`'s `check_constraints`); `foreign_key_check` is the one that
+  # actually shows up inside a captured transaction.
+  @read_only_pragmas ~w(
+    foreign_key_check foreign_key_list
+    table_info table_xinfo table_list
+    index_list index_info index_xinfo
+    database_list collation_list compile_options
+    integrity_check quick_check
+    function_list module_list pragma_list
+  )
+
   # A statement is a (template-literal) data migration if it's DML and doesn't touch
   # `django_migrations` — Django's own bookkeeping `INSERT INTO django_migrations` is the one benign
   # DML in a migration transaction. A heuristic, not a SQL parser: it flags the RunPython-backfill
@@ -442,6 +467,71 @@ defmodule Fathom.Migrator.Capture do
     end)
   end
 
+  @doc """
+  Whether `sql` is a statement that only READS — Django's schema-editor introspection, which rides
+  along in a captured transaction but is not part of the migration.
+
+  A real `manage.py migrate` capture carries these (verbatim, from
+  `test/support/fixtures/django_migrate_capture.json`):
+
+      SELECT name, type FROM sqlite_master WHERE type in ('table', 'view') AND NOT name='sq…'
+      SELECT QUOTE(?), QUOTE(?), QUOTE(?)
+      PRAGMA foreign_key_check
+
+  Recording them made a version's statement list a mix of "what this migration does" and "what
+  Django looked at while doing it", and every tenant then re-ran the lot. **Measured 2026-08-14:**
+  replaying `0002_budget` onto a tenant costs 6 → 13 → 29 → 109 ms at 4 / 19 / 40 / 160 MB with the
+  reads, and 4 → 7 → 17 → 57 ms without — the reads are ~33–48% of the step, and the gap grows with
+  tenant size because `PRAGMA foreign_key_check` scans every FK'd table. On the empty template that
+  is free; on a tenant it is not, and it is paid once per version in the chain. It also proves
+  nothing: `Copy.replay_each/2` discards the result, so a violation it found would be ignored.
+
+  Verified inert before being acted on: replaying the real fixture's v1+v2 with these removed
+  produces a byte-identical `sqlite_master`, `user_version` and `django_migrations`.
+
+  `SELECT` is safe to drop unconditionally — no `SELECT` mutates in SQLite, and fathom's one
+  extension (`fathom_udf`) is pure. `WITH` is deliberately NOT matched: `WITH … INSERT` is valid
+  SQLite and would be a data migration wearing a read's clothes. PRAGMAs go through the
+  `@read_only_pragmas` allowlist.
+  """
+  @spec pure_read?(String.t()) :: boolean()
+  def pure_read?(sql) when is_binary(sql) do
+    trimmed = String.trim_leading(sql)
+    lead = trimmed |> String.slice(0, 6) |> String.downcase()
+
+    cond do
+      lead == "select" -> true
+      lead == "pragma" -> read_only_pragma?(trimmed)
+      true -> false
+    end
+  end
+
+  def pure_read?(_), do: false
+
+  # `PRAGMA foreign_key_check` and `PRAGMA schema.table_info(x)` are reads; `PRAGMA foreign_keys =
+  # OFF` is not.
+  #
+  # BOTH conditions below are load-bearing, and getting there took a second look. The first version
+  # tested `String.contains?(body, "=")` against the WHOLE body and then looked up the remainder,
+  # which left the `=` guard unreachable — `"foreign_keys = OFF"` is not in the allowlist as a
+  # string, so the allowlist alone already rejected it and a probe that broke the `=` guard changed
+  # nothing. Extracting the NAME first is what separates them: an allowlisted name can now carry an
+  # assignment (`PRAGMA quick_check = 1`) and the `=` guard is the only thing that catches it.
+  defp read_only_pragma?(trimmed) do
+    body = trimmed |> String.slice(6..-1//1) |> String.trim() |> String.trim_trailing(";")
+
+    name =
+      body
+      |> String.split(["=", "(", " ", "\t", "\n"], parts: 2)
+      |> hd()
+      |> String.trim()
+      |> String.split(".")
+      |> List.last()
+      |> String.downcase()
+
+    name in @read_only_pragmas and not String.contains?(body, "=")
+  end
+
   # Django's SQLite backend cannot ALTER most things in place, so it REBUILDS the table
   # (`_remake_table`): CREATE TABLE new__x → INSERT INTO new__x (cols) SELECT cols FROM x →
   # DROP TABLE x → ALTER TABLE new__x RENAME TO x. That INSERT is DML, and flagging it froze the
@@ -474,6 +564,13 @@ defmodule Fathom.Migrator.Capture do
   # buffer this path exists to preserve — down with it.
   defp record(pairs, count, before) do
     version = Migrator.next_version()
+
+    # Drop Django's schema-editor introspection before recording — see `pure_read?/1`. Filtering the
+    # PAIRS rather than the two lists is the point: statements and args are stored in PARALLEL and
+    # zipped at replay, so filtering them separately (or filtering only the statements) would shift
+    # every later statement onto the wrong args. That is exactly the bug `beff929` fixed, and this
+    # is the one place that could reintroduce it.
+    pairs = Enum.reject(pairs, fn {sql, _args} -> pure_read?(sql) end)
 
     # The buffer holds `{sql, args}` because Django sends PARAMETERIZED SQL — its bookkeeping row is
     # `INSERT INTO django_migrations … VALUES (?, ?, ?)` with the values carried alongside. Storing

@@ -20,6 +20,73 @@ defmodule Fathom.Migrator.CaptureTest do
     end
   end
 
+  # Django's schema editor sends introspection along with the DDL, and capture recorded it as if it
+  # were part of the migration. The allowlist is what keeps this safe: dropping a statement that
+  # turns out to matter loses DDL permanently, so anything not provably a read is KEPT.
+  describe "pure_read?/1" do
+    test "the reads a real Django migrate actually sends" do
+      # Verbatim from test/support/fixtures/django_migrate_capture.json.
+      assert Capture.pure_read?("""
+                 SELECT name, type FROM sqlite_master
+                 WHERE type in ('table', 'view') AND NOT name='sqlite_sequence'
+             """)
+
+      assert Capture.pure_read?("SELECT QUOTE(?), QUOTE(?), QUOTE(?)")
+      assert Capture.pure_read?("PRAGMA foreign_key_check")
+    end
+
+    test "case and leading whitespace do not matter" do
+      assert Capture.pure_read?("  \n\t select 1")
+      assert Capture.pure_read?("pragma FOREIGN_KEY_CHECK")
+      assert Capture.pure_read?("PRAGMA main.table_info(\"finance_account\")")
+      assert Capture.pure_read?("PRAGMA quick_check;")
+    end
+
+    # The half that matters. Every one of these CHANGES something, and dropping any of them would
+    # silently alter what a replayed tenant ends up with.
+    test "a PRAGMA that assigns is never a read" do
+      refute Capture.pure_read?("PRAGMA foreign_keys = OFF")
+      refute Capture.pure_read?("PRAGMA foreign_keys=ON")
+      refute Capture.pure_read?("PRAGMA legacy_alter_table = ON")
+      refute Capture.pure_read?("PRAGMA user_version = 7")
+      refute Capture.pure_read?("PRAGMA journal_mode = WAL")
+    end
+
+    # These are the cases where the ALLOWLIST alone is not enough: the name IS allowlisted, and only
+    # the assignment check keeps them. The first version of this code tested for `=` before pulling
+    # the name out, which made that check unreachable — the allowlist had already rejected
+    # `"foreign_keys = OFF"` as a whole string. Breaking the check changed no test, which is how the
+    # dead branch was found.
+    test "an assignment disqualifies even an allowlisted pragma name" do
+      refute Capture.pure_read?("PRAGMA quick_check = 1")
+      refute Capture.pure_read?("PRAGMA main.integrity_check = 0")
+      refute Capture.pure_read?("PRAGMA table_info = x")
+    end
+
+    test "an unrecognized PRAGMA is kept, even with no assignment" do
+      # Fails closed: `optimize` runs ANALYZE and `wal_checkpoint` moves the WAL. Neither is in the
+      # allowlist, so neither is dropped — and neither would be if Django started sending something
+      # new tomorrow.
+      refute Capture.pure_read?("PRAGMA optimize")
+      refute Capture.pure_read?("PRAGMA wal_checkpoint(TRUNCATE)")
+      refute Capture.pure_read?("PRAGMA shrink_memory")
+    end
+
+    test "DDL and DML are never reads" do
+      refute Capture.pure_read?("CREATE TABLE t (x)")
+      refute Capture.pure_read?("INSERT INTO django_migrations (app) VALUES (?)")
+      refute Capture.pure_read?("DROP TABLE t")
+      refute Capture.pure_read?("ALTER TABLE new__t RENAME TO t")
+    end
+
+    # `WITH … INSERT` is valid SQLite, so a `WITH` lead is a data migration wearing a read's
+    # clothes. Matching on it would drop real writes.
+    test "a WITH lead is not treated as a read" do
+      refute Capture.pure_read?("WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x")
+      refute Capture.pure_read?("WITH x AS (SELECT 1) SELECT * FROM x")
+    end
+  end
+
   describe "recording" do
     test "records a version when the migration count rises on commit" do
       conn = make_ref()
@@ -33,6 +100,66 @@ defmodule Fathom.Migrator.CaptureTest do
       assert Migrator.statements(1) == [
                "CREATE TABLE app_thing (id INTEGER PRIMARY KEY)",
                "INSERT INTO django_migrations (app, name) VALUES ('app', '0001')"
+             ]
+    end
+
+    # Django's schema editor interleaves introspection with the DDL, so a captured version used to
+    # carry `SELECT … sqlite_master`, `SELECT QUOTE(?)…` and `PRAGMA foreign_key_check` as if they
+    # were migration steps — and every tenant re-ran them. `foreign_key_check` scans every FK'd
+    # table, which is free on the empty template and roughly DOUBLES the replay step on a tenant
+    # with data (measured 6→13→29→109 ms at 4/19/40/160 MB, vs 4→7→17→57 ms without).
+    test "Django's introspection is dropped, and the args stay lined up with what is left" do
+      conn = make_ref()
+      Capture.begin(conn, 0)
+      Capture.append(conn, "CREATE TABLE app_reads (id INTEGER PRIMARY KEY)", [])
+      Capture.append(conn, "SELECT name, type FROM sqlite_master WHERE type='table'", [])
+      Capture.append(conn, "PRAGMA foreign_key_check", [])
+      Capture.append(conn, "SELECT QUOTE(?), QUOTE(?)", ["q1", "q2"])
+      Capture.append(conn, "CREATE INDEX app_reads_id ON app_reads (id)", [])
+
+      Capture.append(
+        conn,
+        "INSERT INTO django_migrations (app, name, applied) VALUES (?, ?, ?)",
+        ["app", "0001_initial", "2026-08-14"]
+      )
+
+      assert {:recorded, 1} = Capture.commit(conn, 1)
+
+      assert Migrator.statements(1) == [
+               "CREATE TABLE app_reads (id INTEGER PRIMARY KEY)",
+               "CREATE INDEX app_reads_id ON app_reads (id)",
+               "INSERT INTO django_migrations (app, name, applied) VALUES (?, ?, ?)"
+             ]
+
+      # THE invariant. Statements and args are stored as PARALLEL lists and zipped at replay, so
+      # filtering the statements without filtering the args in lockstep would hand the bookkeeping
+      # INSERT the dropped SELECT's `["q1", "q2"]` — reviving the NULL-binding class of bug that
+      # `beff929` fixed, but silently and only for migrations that contain a parameterized read.
+      assert Migrator.statement_pairs(1) == [
+               {"CREATE TABLE app_reads (id INTEGER PRIMARY KEY)", []},
+               {"CREATE INDEX app_reads_id ON app_reads (id)", []},
+               {"INSERT INTO django_migrations (app, name, applied) VALUES (?, ?, ?)",
+                ["app", "0001_initial", "2026-08-14"]}
+             ]
+    end
+
+    # A PRAGMA that assigns is a real step: Django wraps table rebuilds in `legacy_alter_table`, and
+    # dropping that would change what the rebuild produces on a tenant.
+    test "a mutating PRAGMA survives capture" do
+      conn = make_ref()
+      Capture.begin(conn, 0)
+      Capture.append(conn, "PRAGMA legacy_alter_table = ON", [])
+      Capture.append(conn, "ALTER TABLE app_old RENAME TO app_new", [])
+      Capture.append(conn, "PRAGMA legacy_alter_table = OFF", [])
+      Capture.append(conn, "INSERT INTO django_migrations (app) VALUES ('a')", [])
+
+      assert {:recorded, 1} = Capture.commit(conn, 1)
+
+      assert Migrator.statements(1) == [
+               "PRAGMA legacy_alter_table = ON",
+               "ALTER TABLE app_old RENAME TO app_new",
+               "PRAGMA legacy_alter_table = OFF",
+               "INSERT INTO django_migrations (app) VALUES ('a')"
              ]
     end
 
