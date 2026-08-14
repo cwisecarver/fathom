@@ -459,14 +459,16 @@ defmodule Fathom.Shard.Storage.Local do
     end
   end
 
+  # Only ever fed `File.read/1`'s `{:ok, body}`, so `body` is always a binary — a
+  # `parse_token_floor(_), do: nil` catch-all here was unreachable and is gone. The guard stays
+  # because it documents the input; the `_ -> nil` INSIDE handles unparseable content, which is the
+  # case that actually happens.
   defp parse_token_floor(body) when is_binary(body) do
     case Integer.parse(String.trim(body)) do
       {n, _} when n >= 0 -> n
       _ -> nil
     end
   end
-
-  defp parse_token_floor(_), do: nil
 
   # A stored file belongs to `shard_id` iff the character AFTER the id is `.` (the
   # live `.db`, the `.lock`, an atomic-write `.db.tmp…` temp) or `@` (a `@<version>`

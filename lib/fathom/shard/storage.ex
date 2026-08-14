@@ -59,8 +59,27 @@ defmodule Fathom.Shard.Storage do
   A shard lease. `owner` identifies the holding node, `epoch` is the monotonic
   fencing token (bumped each time an expired lease is stolen), and `expires_at_ms`
   is the wall-clock expiry in `System.system_time(:millisecond)`.
+
+  `lock_etag` is **optional and backend-carried**: the S3 backend stamps every lease it returns
+  with the etag of the lock object it just wrote (`put_lock_etag/2`), because release is a
+  conditional `DELETE … If-Match: <that etag>` and `resolve_stale_release/4` — which lives here
+  rather than in a backend precisely so every etag-carrying backend decides identically — reads it.
+  `Storage.Local` does not set it.
+
+  It was **missing from this type entirely** until 2026-08-14, which made the declaration a CLOSED
+  three-key map that every lease from the production backend violated: dialyzer reported the call
+  into `resolve_stale_release/4` as one that "breaks the contract" and `S3.resolve_412_release/2`
+  as a function that can never return. Nothing was broken at runtime — the maps carry the key
+  regardless — but the declared shape omitted the fencing token that the 2026-08-04 stuck-lease fix
+  is built on, so the type was actively misleading about the one field that matters most on the
+  release path.
   """
-  @type lease :: %{owner: String.t(), epoch: non_neg_integer(), expires_at_ms: integer()}
+  @type lease :: %{
+          :owner => String.t(),
+          :epoch => non_neg_integer(),
+          :expires_at_ms => integer(),
+          optional(:lock_etag) => String.t()
+        }
 
   @typedoc """
   How much of a shard's history a copy of it contains — Phase 2 A2.
@@ -319,7 +338,8 @@ defmodule Fathom.Shard.Storage do
               shard_id :: String.t(),
               snapshot_id :: String.t(),
               local_path :: Path.t()
-            ) :: {:ok, String.t() | nil} | {:error, term()}
+            ) ::
+              {:ok, String.t() | nil} | {:absent, String.t() | nil} | {:error, term()}
 
   # Full tenant erasure (expert review 2026-07-14 #15): delete EVERY stored object
   # belonging to `shard_id` — the live `.db`, the `.lock`, every retained
@@ -360,7 +380,14 @@ defmodule Fathom.Shard.Storage do
               {:ok, non_neg_integer() | nil} | {:error, term()}
 
   @doc "Pulls the shard's stored file to `local_path`, returning its etag (`nil` if absent)."
-  @spec pull(String.t(), Path.t()) :: {:ok, String.t() | nil} | {:error, term()}
+  # `{:absent, _}` was missing here while the `@callback` above has carried it since expert review
+  # 2026-08-01 #24 — the delegating spec contradicted the contract it delegates to, and callers
+  # matching the absent case (`Fathom.Shard.revalidate_takeover/2`, `mix fathom.shard`) therefore
+  # read as dead code. That case is not incidental: it is how "no object, or a steal sentinel"
+  # is told apart from "a real object", which #24 introduced precisely because a sentinel used to
+  # read as a genuine snapshot of an empty database.
+  @spec pull(String.t(), Path.t()) ::
+          {:ok, String.t()} | {:absent, String.t() | nil} | {:error, term()}
   def pull(shard_id, local_path), do: backend().pull(shard_id, local_path)
 
   @doc "Unconditional flush of `local_path` (unfenced — see `flush/3` for the coordinator)."
@@ -646,8 +673,10 @@ defmodule Fathom.Shard.Storage do
   def drop_snapshot(shard_id, snapshot_id), do: backend().drop_snapshot(shard_id, snapshot_id)
 
   @doc "Downloads a snapshot's bytes to `local_path` (`{:ok, nil}` if absent). See the callback (#7)."
+  # Both backends return `{:absent, _}` — S3 for a missing object AND for a steal sentinel,
+  # Local for a missing file — and neither this spec nor the `@callback` said so.
   @spec pull_snapshot(String.t(), String.t(), Path.t()) ::
-          {:ok, String.t() | nil} | {:error, term()}
+          {:ok, String.t() | nil} | {:absent, String.t() | nil} | {:error, term()}
   def pull_snapshot(shard_id, snapshot_id, local_path),
     do: backend().pull_snapshot(shard_id, snapshot_id, local_path)
 

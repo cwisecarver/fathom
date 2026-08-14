@@ -339,12 +339,19 @@ defmodule Fathom.ShardExecutor do
   # a lost write.
   @read_verbs ~w(select values explain)
 
+  # The six classifiers below each used to carry a `defp foo?(_sql), do: false` catch-all. Dialyzer
+  # proves every one unreachable: they are only reached from `wrote?/2` and the transaction tracker,
+  # both of which run AFTER a statement has executed, so SQLite already compiled the string and it
+  # is necessarily a binary. None of the catch-alls was commented, and the documented safety
+  # property they look like they serve — "anything unrecognized falls through to the conservative
+  # path, so the failure direction is an extra flush, never a lost write" — is carried by the
+  # `is_binary` clause itself, which returns false for an unknown verb. The catch-alls only ever
+  # answered the non-binary case, which cannot occur. A future caller that broke that now fails at
+  # the dialyzer gate rather than silently classifying a write as a read.
   defp read_verb?(sql) when is_binary(sql) do
     head = sql |> String.trim_leading() |> String.slice(0, 7) |> String.downcase()
     Enum.any?(@read_verbs, &String.starts_with?(head, &1))
   end
-
-  defp read_verb?(_sql), do: false
 
   @control_prefixes ~w(begin commit end rollback savepoint release pragma)
 
@@ -382,8 +389,6 @@ defmodule Fathom.ShardExecutor do
     end
   end
 
-  defp control_statement?(_sql), do: false
-
   # A transaction-committing statement (COMMIT / END — SQLite treats END as a COMMIT synonym).
   # This is the durability boundary where in-flight INSERTs become committed; see the bump site
   # in do_execute/2 for why the commit must re-dirty the shard. ROLLBACK is deliberately excluded
@@ -395,8 +400,6 @@ defmodule Fathom.ShardExecutor do
     head = sql |> String.trim_leading() |> String.slice(0, 6) |> String.downcase()
     String.starts_with?(head, "commit") or String.starts_with?(head, "end")
   end
-
-  defp ends_transaction?(_sql), do: false
 
   # --- per-transaction write tracking (expert review 2026-07-24 #3) -------------------------
   #
@@ -505,8 +508,6 @@ defmodule Fathom.ShardExecutor do
     String.starts_with?(head, "begin")
   end
 
-  defp begins_transaction?(_sql), do: false
-
   # Statements at which in-flight writes become durable-able and the shard must be re-dirtied if
   # the transaction wrote: COMMIT/END, plus RELEASE. RELEASE matters because `ends_transaction?`
   # matches only commit/end, while a client using savepoints alone (`SAVEPOINT a; …; RELEASE a`)
@@ -521,8 +522,6 @@ defmodule Fathom.ShardExecutor do
     String.starts_with?(head, "release")
   end
 
-  defp releases_savepoint?(_sql), do: false
-
   # A plain `ROLLBACK` [TRANSACTION] discards the whole transaction — nothing is left to flush, so
   # the flag resets. `ROLLBACK [TRANSACTION] TO [SAVEPOINT] name` does NOT end the transaction: it
   # rewinds to a savepoint, leaving every pre-savepoint write live and uncommitted. Clearing the
@@ -534,8 +533,6 @@ defmodule Fathom.ShardExecutor do
 
     String.starts_with?(lead, "rollback") and not String.contains?(lead, " to ")
   end
-
-  defp rolls_back?(_sql), do: false
 
   # The assignment form (`pragma [db.]name = value`) of a header-writing pragma; the
   # bare read form (`pragma user_version`) has no `=` and stays a read.
