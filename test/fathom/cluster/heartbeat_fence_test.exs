@@ -316,7 +316,21 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
       # heartbeat above is genuinely in legacy mode — no forcing needed (AGENTS.md).
       id = "legacy_recheck_#{System.unique_integer([:positive])}"
 
+      # This test RACED the file-wide `shard_idle_ms: 50` and failed in CI on 2026-08-14 (run
+      # 31770…, OTP 29, seed 80394) with `{:error, :coordinator_stopped}` from the flush below:
+      # `ShardExecutor.close/1` checks the connection in, and 50 ms later the coordinator
+      # idle-stops on its own — so on a contended runner it was gone before `Shards.flush/1`
+      # resolved it. The 50 ms exists for the tests in this file that exercise the IDLE flush path;
+      # this one is about the legacy-mode flush and does not care when idle fires. Pin it long
+      # enough that only the explicit flush can happen, and restore for the rest of the file.
+      prev_idle = Application.get_env(:fathom, :shard_idle_ms)
+      Application.put_env(:fathom, :shard_idle_ms, 600_000)
+
       on_exit(fn ->
+        if prev_idle,
+          do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
+          else: Application.delete_env(:fathom, :shard_idle_ms)
+
         Shards.drain(id, 5_000)
 
         for s <- ["", "-wal", "-shm", ".etag", ".lock"],
