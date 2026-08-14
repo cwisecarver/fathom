@@ -55,8 +55,29 @@ defmodule Fathom.Shard.Replication.Shipper do
   # api
   # ------------------------------------------------------------------------------------------
 
+  # `fullsweep_after: 0`, for the same reason `Fathom.Shard` carries it (expert review 2026-07-24
+  # #9) and with more force: this process handles WAL-frame PAYLOADS, and a binary over 64 bytes
+  # lives off-heap, refcounted, freed only when the referencing process garbage-collects. A shipper's
+  # own live set is tiny — a socket and a waiters map — so ERTS's default `fullsweep_after: 65535`
+  # means it essentially never full-sweeps, and every frame it has ever forwarded stays reachable.
+  #
+  # MEASURED ON THE RIG, 2026-08-14, and this is why the option is here rather than a tidy-up: a
+  # `tpc-fleet` sweep with replication on OOM-KILLED a node (fathom2, exit 137, `OOMKilled=true`)
+  # about two minutes in, on a 94 GiB VM with no per-container limit. The survivors were carrying
+  # 7–18 GiB each, of which `:erlang.memory()[:binary]` was 17,859 MB out of 18,034 MB on the worst
+  # — against 71 MB of total PROCESS memory. Nothing was leaked: a full GC took that node from
+  # 17,867 MB to 14 MB, and garbage-collecting ONLY the five shipper processes on another node
+  # freed 8,105 MB → 3,995 MB. So the binaries were always releasable and simply never collected,
+  # which is precisely what this flag fixes.
+  #
+  # No `max_heap_size`, deliberately, matching `Fathom.Shard`: killing a shipper at a heap limit
+  # would fail every in-flight quorum wait on that peer rather than shed load.
   def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
+    GenServer.start_link(
+      __MODULE__,
+      opts,
+      Keyword.take(opts, [:name]) ++ [spawn_opt: [fullsweep_after: 0]]
+    )
   end
 
   @doc """
