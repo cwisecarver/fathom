@@ -309,6 +309,101 @@ defmodule Fathom.Shard.ReplicationTransportTest do
     end
   end
 
+  # `push/2` is a cast, so nothing structurally bounds a shipper's mailbox: one socket per peer node
+  # carries every shard, and if writes arrive faster than that socket drains, the queue grows and
+  # every queued message holds a WAL-frame payload.
+  #
+  # This is not hypothetical. Sampling DURING a 1024-tenant rig ramp on 2026-08-15 caught a node at
+  # total=45,409 MB with binary=44,541 MB against 111 MB of process memory, with this exact process
+  # holding **25,866 queued messages**; across the run the deepest queue was a shipper in 109 of 143
+  # samples, and binary memory tracked queue depth at 0.8–1.8 MB per message. The mailbox WAS the
+  # memory, which is why `fullsweep_after: 0` reduced the OOM without preventing it — those binaries
+  # are live, not garbage.
+  describe "a saturated link refuses instead of queueing without bound" do
+    test "a push past :replication_max_queue is rejected as :overloaded, not buffered" do
+      # A peer that accepts the connection and then reads nothing, so the shipper's socket buffer
+      # fills and its mailbox is the only place work can accumulate — the rig's condition, minus
+      # the rig.
+      {port, hole} = black_hole!(self())
+      ship = start_shipper!(:overload_ship, port)
+
+      # Bound it hard so the test states its own precondition rather than shipping megabytes.
+      prev = Application.get_env(:fathom, :replication_max_queue)
+      Application.put_env(:fathom, :replication_max_queue, 5)
+      on_exit(fn -> restore_max_queue(prev) end)
+
+      # Suspend the shipper so casts pile up in its mailbox deterministically — this is the
+      # producer-outpaces-consumer state, made explicit instead of raced for.
+      :erlang.suspend_process(ship)
+      for i <- 1..40, do: Shipper.push(ship, push_for("ovl_#{i}"))
+      :erlang.resume_process(ship)
+
+      replies = drain_replies(40, 2_000)
+      overloaded = for {:reject, id, :overloaded, _} <- replies, do: id
+
+      assert overloaded != [],
+             "a mailbox past the cap must reject as :overloaded; got #{inspect(Enum.uniq(Enum.map(replies, fn {_, _, r, _} -> r end)))}"
+
+      # The bound has to be EFFECTIVE, not merely present: nearly all of the burst is refused, and
+      # only a handful are accepted onto the wire. Those few stay pending on purpose — the black
+      # hole never answers — which is exactly why "every push got a reply" is the wrong assertion
+      # here and this one is the right one.
+      assert length(overloaded) >= 30,
+             "the bound must shed most of a burst, not a token few; overloaded=#{length(overloaded)}/40"
+
+      send(hole, :die)
+    end
+
+    # The other direction: with the bound disabled, the same burst is absorbed silently. This is
+    # what the rig hit — nothing refuses, the mailbox grows, and the memory goes with it.
+    test "with :replication_max_queue 0 the same burst is absorbed, refusing nothing" do
+      {port, hole} = black_hole!(self())
+      ship = start_shipper!(:noovl_ship, port)
+
+      prev = Application.get_env(:fathom, :replication_max_queue)
+      Application.put_env(:fathom, :replication_max_queue, 0)
+      on_exit(fn -> restore_max_queue(prev) end)
+
+      :erlang.suspend_process(ship)
+      for i <- 1..40, do: Shipper.push(ship, push_for("noovl_#{i}"))
+      :erlang.resume_process(ship)
+
+      replies = drain_replies(40, 1_000)
+      overloaded = for {:reject, id, :overloaded, _} <- replies, do: id
+
+      assert overloaded == [],
+             "with the bound off nothing may be refused as :overloaded — that is the unbounded " <>
+               "behaviour this cap exists to end, and it must stay reachable to reproduce it"
+
+      send(hole, :die)
+    end
+  end
+
+  defp restore_max_queue(nil), do: Application.delete_env(:fathom, :replication_max_queue)
+  defp restore_max_queue(v), do: Application.put_env(:fathom, :replication_max_queue, v)
+
+  defp push_for(shard_id) do
+    %Push{
+      shard_id: shard_id,
+      epoch: 1,
+      wal_gen: 1,
+      salt1: 0,
+      offset: 0,
+      payload: :binary.copy(<<0>>, 256)
+    }
+  end
+
+  defp drain_replies(n, timeout), do: drain_replies(n, timeout, [])
+  defp drain_replies(0, _timeout, acc), do: Enum.reverse(acc)
+
+  defp drain_replies(n, timeout, acc) do
+    receive do
+      {:repl_reply, _ship, reply} -> drain_replies(n - 1, timeout, [reply | acc])
+    after
+      timeout -> Enum.reverse(acc)
+    end
+  end
+
   describe "several connected followers dying at once" do
     # WHY THIS IS SEPARATE FROM THE DEAD-FOLLOWER TESTS ABOVE. Those build their dead followers as
     # shippers pointed at `port: 1` — nothing ever listened there, so `state.sock` is `nil` and

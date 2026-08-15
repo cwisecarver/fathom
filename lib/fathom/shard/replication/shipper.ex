@@ -156,20 +156,46 @@ defmodule Fathom.Shard.Replication.Shipper do
   end
 
   def handle_cast({:push, p, from}, state) do
-    if Map.has_key?(state.waiters, p.shard_id) do
-      # One writer per shard means one push in flight. Two is a caller bug, and overwriting the
-      # waiter would strand the first commit forever.
-      send(from, {:repl_reply, self(), {:reject, p.shard_id, :already_in_flight, 0}})
-      {:noreply, state}
-    else
-      case :gen_tcp.send(state.sock, encode(p)) do
-        :ok ->
-          {:noreply, %{state | waiters: Map.put(state.waiters, p.shard_id, from)}}
+    cond do
+      # OVERLOADED: more work queued than this link can drain. Reject NOW, for exactly the reason
+      # the `sock: nil` clause above rejects — a follower that cannot take the work must subtract
+      # from the quorum immediately, not absorb it. `push/2` is a cast with no backpressure (it has
+      # to be: a quorum waits on several followers at once and stops at the Q-th, so a blocking
+      # call would structurally couple every commit to the slowest peer), and one socket per peer
+      # node carries every shard — so if the aggregate write rate exceeds what that socket drains,
+      # nothing bounds this mailbox.
+      #
+      # MEASURED ON THE RIG, 2026-08-15, sampling DURING the ramp rather than post-mortem: at 1024
+      # tenants a node reached total=45,409 MB with binary=44,541 MB against 111 MB of process
+      # memory, and the deepest message queue was this shipper at **25,866 messages**. Across the
+      # run the top queue was a shipper in 109 of 143 samples, and binary memory tracked queue
+      # depth at 0.8–1.8 MB per queued message — i.e. the mailbox WAS the memory. That is why
+      # `fullsweep_after: 0` (e0fda94) reduced the OOM without preventing it: it collects binaries
+      # that are garbage, and these are live, referenced by messages not yet handled.
+      #
+      # Rejecting is cheap, so under overload the shipper becomes a fast rejector instead of a slow
+      # accumulator, and the mailbox drains rather than grows. The cost is honest: writes fail with
+      # FILO_NO_QUORUM while a link is saturated. That is strictly better than the alternative
+      # measured here, which is the node dying and taking every shard it homed with it.
+      overloaded?(state) ->
+        send(from, {:repl_reply, self(), {:reject, p.shard_id, :overloaded, 0}})
+        {:noreply, state}
 
-        {:error, reason} ->
-          send(from, {:repl_reply, self(), {:reject, p.shard_id, :disconnected, 0}})
-          {:noreply, drop(state, reason)}
-      end
+      Map.has_key?(state.waiters, p.shard_id) ->
+        # One writer per shard means one push in flight. Two is a caller bug, and overwriting the
+        # waiter would strand the first commit forever.
+        send(from, {:repl_reply, self(), {:reject, p.shard_id, :already_in_flight, 0}})
+        {:noreply, state}
+
+      true ->
+        case :gen_tcp.send(state.sock, encode(p)) do
+          :ok ->
+            {:noreply, %{state | waiters: Map.put(state.waiters, p.shard_id, from)}}
+
+          {:error, reason} ->
+            send(from, {:repl_reply, self(), {:reject, p.shard_id, :disconnected, 0}})
+            {:noreply, drop(state, reason)}
+        end
     end
   end
 
@@ -247,7 +273,24 @@ defmodule Fathom.Shard.Replication.Shipper do
   defp connect(state) do
     host = if is_binary(state.host), do: String.to_charlist(state.host), else: state.host
 
-    opts = [:binary, packet: 4, active: true, nodelay: true]
+    # `send_timeout` is what makes the mailbox bound in `overloaded?/1` actually hold. Without it
+    # `:gen_tcp.send/2` blocks INDEFINITELY once the peer's receive window fills, and a shipper
+    # blocked inside `send` dequeues nothing — so it cannot reject either, and the queue grows past
+    # any cap regardless. Measured on the rig 2026-08-15: with the cap alone the queue still reached
+    # 5,957 (peak 23 GB), because the cap is only consulted when a message is DEQUEUED.
+    #
+    # `send_timeout_close: true` because `packet: 4` framing makes a partially-sent frame
+    # unrecoverable — the stream would resync mid-length-prefix. Closing routes into the existing
+    # `{:error, reason} -> drop/2` path, which fails every waiter with `:disconnected` (the quorum
+    # subtracts now, as the moduledoc requires) and schedules the ordinary reconnect.
+    opts = [
+      :binary,
+      packet: 4,
+      active: true,
+      nodelay: true,
+      send_timeout: send_timeout(),
+      send_timeout_close: true
+    ]
 
     case :gen_tcp.connect(host, state.port, opts, @connect_timeout) do
       {:ok, sock} ->
@@ -265,6 +308,62 @@ defmodule Fathom.Shard.Replication.Shipper do
 
   # Tear the socket down and fail every waiter NOW. See the moduledoc: a departed follower must
   # subtract from the quorum immediately so an unreachable quorum surfaces as an error, not a wait.
+  # The mailbox bound. Counted in MESSAGES because that is what ERTS makes cheap to read
+  # (`:message_queue_len` is O(1)); the number that actually matters is bytes, and the conversion
+  # measured on the rig was **0.8–1.8 MB per queued push**, so the default 1024 bounds a saturated
+  # link at roughly 1–2 GB rather than the 44 GB observed. Tune with `:replication_max_queue`.
+  #
+  # THE DEFAULT IS DERIVED FROM MEASUREMENT, NOT INTUITION, and the first guess was wrong in a way
+  # worth recording: 1024 seemed generous ("steady state should be near-empty — one push in flight
+  # per shard, duplicates refused") and it was not. Sampling the rig showed a HEALTHY 256-tenant
+  # step legitimately reaching queue depth **4,967**, because the cap is only consulted when a
+  # message is dequeued and a burst outruns that. Capping at 1024 therefore shed load in a range
+  # that had been clean, turning 3,505 txn/s / 0 errors into 1,580 / 5,333.
+  #
+  # So the bound has a floor and a ceiling, both observed on 2026-08-15:
+  #   * floor   — above the deepest queue a healthy range produces (4,967 at 256 tenants)
+  #   * ceiling — well below the depth that killed a node (25,866, at ~45 GB)
+  # 8192 sits ~65% above the floor and ~3x below the ceiling, bounding a saturated link at roughly
+  # 8192 x 1-2 MB rather than unbounded.
+  #
+  # Set to 0 to disable the bound — which restores the unbounded behaviour that OOM-killed nodes,
+  # so only do that to reproduce it.
+  defp overloaded?(_state) do
+    case max_queue() do
+      0 ->
+        false
+
+      cap ->
+        case Process.info(self(), :message_queue_len) do
+          {:message_queue_len, n} -> n > cap
+          # No info means the process is dying; do not add work to it.
+          nil -> true
+        end
+    end
+  end
+
+  defp max_queue, do: Application.get_env(:fathom, :replication_max_queue, 8192)
+
+  # How long a single frame may block in `:gen_tcp.send/2` before the link is declared BROKEN.
+  #
+  # This is a stuck-link detector, NOT a backpressure knob, and the difference was measured the
+  # hard way. `send_timeout_close: true` tears down the socket and fails every waiter on it, so a
+  # value low enough to fire on a merely-BUSY link converts ordinary burstiness into a storm of
+  # `:disconnected` rejects plus reconnect churn. At 1 s that regressed a range that had been
+  # clean: 256 tenants went from 3,505 txn/s / 0 errors to 1,748 txn/s / 2,309 errors on the rig
+  # 2026-08-15. The mailbox bound in `overloaded?/1` is what handles a busy link; this only has to
+  # stop an indefinitely-blocked send from pinning the process forever.
+  #
+  # Defaulted to the ship timeout, so it can never be the thing that fails a commit first — by the
+  # time it fires the quorum has already given up on this peer on its own terms.
+  defp send_timeout do
+    Application.get_env(
+      :fathom,
+      :replication_send_timeout_ms,
+      Application.get_env(:fathom, :replication_timeout_ms, 5_000)
+    )
+  end
+
   defp drop(state, reason) do
     if state.sock, do: :gen_tcp.close(state.sock)
 
