@@ -165,18 +165,32 @@ defmodule Fathom.Shard.Replication.Shipper do
       # node carries every shard — so if the aggregate write rate exceeds what that socket drains,
       # nothing bounds this mailbox.
       #
-      # MEASURED ON THE RIG, 2026-08-15, sampling DURING the ramp rather than post-mortem: at 1024
-      # tenants a node reached total=45,409 MB with binary=44,541 MB against 111 MB of process
-      # memory, and the deepest message queue was this shipper at **25,866 messages**. Across the
-      # run the top queue was a shipper in 109 of 143 samples, and binary memory tracked queue
-      # depth at 0.8–1.8 MB per queued message — i.e. the mailbox WAS the memory. That is why
-      # `fullsweep_after: 0` (e0fda94) reduced the OOM without preventing it: it collects binaries
-      # that are garbage, and these are live, referenced by messages not yet handled.
+      # WHAT THIS BOUND IS FOR, AND WHAT IT IS NOT. Read this before extending it.
+      #
+      # It was added believing the mailbox was THE cause of the 1024-tenant OOM. It is not. A
+      # clean re-run on 2026-08-16 still OOM-killed two nodes at a peak of 44,959 MB — essentially
+      # unchanged from the 45,409 MB before it — and a SURVIVING node was observed holding
+      # 43,005 MB of binary while its deepest message queue was **1**. A mailbox of one cannot be
+      # 43 GB, so the memory lives somewhere this bound does not reach. The cause is OPEN.
+      #
+      # Why the mailbox looked like the answer: sampling caught a shipper at 25,866 queued messages
+      # with binary memory tracking queue depth at 0.8–1.8 MB per message, in 109 of 143 samples.
+      # That was real and it was incidental. The instrument is what misled — `Process.info(pid,
+      # :memory)` does NOT include an off-heap refc binary's payload, only the small reference, so
+      # "top process by memory" is structurally blind to whoever holds these. The mailbox was
+      # visible precisely because a queued message is the ONE place the payload gets counted.
+      # Anything looking for the real holder needs per-binary attribution, which nothing here has.
+      #
+      # The bound is kept because it is independently correct and costs nothing measurable: 256
+      # tenants runs at 3,689 txn/s with ZERO errors with it in place (against 3,505 before), so an
+      # unbounded mailbox is still a hazard worth refusing. It is a guard, not the fix.
+      #
+      # Also note the cap is soft by construction: it is consulted when a message is DEQUEUED, so a
+      # burst outruns it — the 2026-08-16 run reached 12,828 against a cap of 8,192. Do not read it
+      # as a hard ceiling on memory.
       #
       # Rejecting is cheap, so under overload the shipper becomes a fast rejector instead of a slow
-      # accumulator, and the mailbox drains rather than grows. The cost is honest: writes fail with
-      # FILO_NO_QUORUM while a link is saturated. That is strictly better than the alternative
-      # measured here, which is the node dying and taking every shard it homed with it.
+      # accumulator. The cost is honest: writes fail with FILO_NO_QUORUM while a link is saturated.
       overloaded?(state) ->
         send(from, {:repl_reply, self(), {:reject, p.shard_id, :overloaded, 0}})
         {:noreply, state}
@@ -311,7 +325,11 @@ defmodule Fathom.Shard.Replication.Shipper do
   # The mailbox bound. Counted in MESSAGES because that is what ERTS makes cheap to read
   # (`:message_queue_len` is O(1)); the number that actually matters is bytes, and the conversion
   # measured on the rig was **0.8–1.8 MB per queued push**, so the default 1024 bounds a saturated
-  # link at roughly 1–2 GB rather than the 44 GB observed. Tune with `:replication_max_queue`.
+  # link at roughly 1–2 GB. Tune with `:replication_max_queue`.
+  #
+  # It does NOT bound total node memory, and the 44 GB peak is not what it prevents — see the long
+  # note on the `overloaded?` branch in `handle_cast/2`: a node was later seen holding 43 GB with a
+  # queue of 1, so most of that memory is held somewhere this never sees.
   #
   # THE DEFAULT IS DERIVED FROM MEASUREMENT, NOT INTUITION, and the first guess was wrong in a way
   # worth recording: 1024 seemed generous ("steady state should be near-empty — one push in flight
@@ -322,12 +340,16 @@ defmodule Fathom.Shard.Replication.Shipper do
   #
   # So the bound has a floor and a ceiling, both observed on 2026-08-15:
   #   * floor   — above the deepest queue a healthy range produces (4,967 at 256 tenants)
-  #   * ceiling — well below the depth that killed a node (25,866, at ~45 GB)
-  # 8192 sits ~65% above the floor and ~3x below the ceiling, bounding a saturated link at roughly
-  # 8192 x 1-2 MB rather than unbounded.
+  #   * ceiling — below the deepest queue seen while a node was dying (25,866)
+  # 8192 sits ~65% above the floor, and the clean 256 run at 3,689 txn/s / 0 errors confirms it
+  # does not shed in a healthy range.
   #
-  # Set to 0 to disable the bound — which restores the unbounded behaviour that OOM-killed nodes,
-  # so only do that to reproduce it.
+  # The ceiling half of that reasoning is WEAKER than it reads: the 2026-08-16 re-run reached
+  # 12,828 with this cap at 8,192 and still lost two nodes, so 25,866 was never a threshold this
+  # could hold under. The cap is consulted on DEQUEUE, so a burst outruns it by construction.
+  #
+  # Set to 0 to disable the bound. That restores an unbounded mailbox, which is a hazard on its own
+  # terms — but it does NOT restore "the" OOM, because this was not its cause.
   defp overloaded?(_state) do
     case max_queue() do
       0 ->
