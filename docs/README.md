@@ -144,6 +144,18 @@ noted).
   collapsing "someone else's lock" with "still ours at a rotated etag". Heartbeat-mode-only, which
   is why the legacy-only suite never saw it. Three other real lock-leak paths were found and fixed
   en route, none of them the cause.
+- **[reviews/a2-shipper-feedback-loop-2026-08-16.md](reviews/a2-shipper-feedback-loop-2026-08-16.md)**
+  — why A2 OOM-killed nodes at 1024 tenants: a **positive feedback loop**, not a leak. A push carries
+  the WAL since the follower's last ack, so delay makes the next payload bigger, which makes more
+  delay. The measurement that settles it — queued messages FLAT while binary held DOUBLED — is also
+  why **queue depth is the wrong signal** and why three message-count fixes missed.
+- **[reviews/a2-feedback-loop-fixed-2026-08-17.md](reviews/a2-feedback-loop-fixed-2026-08-17.md)** —
+  the fix and, just as importantly, what it did **not** buy. The loop is closed (`largest` payload
+  pinned at the 1 MiB cap to the byte, node binary 32–922 MB and falling vs 7–18 GiB climbing, nodes
+  alive 2 h vs dead in minutes) and a same-rig A/B shows the cap is **free** (12.7% fewer errors at
+  512). But **the tenant ceiling did not move**: 256 clean, 512 degraded, 1024 still no result — now
+  by throughput collapse rather than by dying. Carries the two open leads (the budget's
+  all-or-nothing cliff, and `:already_in_flight` as the dominant reject — pre-existing, not the loop).
 - **[reviews/tpc-run-2026-07-10.md](reviews/tpc-run-2026-07-10.md)** — the remote-client TPC run over
   the chaos rig (true cross-LB latency) + the loopback spec-scale TPC-C comparability numbers.
 - **[reviews/latency-cost-2026-07-23.md](reviews/latency-cost-2026-07-23.md)** — what an injected S3

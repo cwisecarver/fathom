@@ -66,6 +66,16 @@ x-fathom-env: &fathom-env
   # shipping its own shards to its own listener, which works but muddies every result.
   REPLICATION_ENABLED: "${REPLICATION_ENABLED:-}"
   REPLICATION_QUORUM: "${REPLICATION_QUORUM:-2}"
+  # THE TWO BOUNDS THAT CLOSE THE 1024-TENANT OOM. Left EMPTY so a run exercises the shipped
+  # defaults (1 MiB per push, 1 GiB queued per node) — the rig's job is to test what production
+  # gets, not a rig-only tuning. Set either to sweep; 0 disables one, which is how you reproduce
+  # the OOM on purpose.
+  #
+  # The number to watch when either moves is the MEAN PAYLOAD from `bin_sizes.sh`, not the queue
+  # depth: queue depth was FLAT (8,265 -> 8,195) across a doubling of held memory
+  # (6,893 -> 15,798 MB) and would have reported success.
+  REPLICATION_MAX_PUSH_BYTES: "${REPLICATION_MAX_PUSH_BYTES:-}"
+  REPLICATION_MAX_QUEUE_BYTES: "${REPLICATION_MAX_QUEUE_BYTES:-}"
   # Membership source (Layer 3). `static` by default so the per-node lists below stay in charge;
   # `REPLICATION_MEMBERSHIP=roster` switches to endpoints nodes publish to `rebalancer_nodes`.
   #
