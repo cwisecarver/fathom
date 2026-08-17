@@ -44,12 +44,13 @@ defmodule Fathom.Shard.Replication.Shipper do
 
   require Logger
 
+  alias Fathom.Shard.Replication.Budget
   alias Fathom.Shard.Replication.Protocol
 
   @connect_timeout 5_000
   @reconnect_backoff_ms 500
 
-  defstruct [:host, :port, :sock, :id, waiters: %{}]
+  defstruct [:host, :port, :sock, :id, :name, waiters: %{}]
 
   # ------------------------------------------------------------------------------------------
   # api
@@ -85,9 +86,30 @@ defmodule Fathom.Shard.Replication.Shipper do
 
       {:repl_reply, shipper_pid, {:ack, shard_id, next_offset}}
       {:repl_reply, shipper_pid, {:reject, shard_id, reason, expected_offset}}
+
+  ## The node's byte budget is claimed HERE, in the caller
+
+  `Fathom.Shard.Replication.Budget` is consulted before the payload is handed to a mailbox, and a
+  refusal answers on the same reply channel without enqueueing anything. That placement IS the fix:
+  `overloaded?/1` below checks a cap on DEQUEUE, which a burst outruns (one run reached a queue of
+  12,828 against a cap of 8,192), and no dequeue-time check can bound a mailbox a cast can fill
+  faster than the process drains it. The reservation is returned to the shipper in the cast so it
+  can release exactly what was claimed.
   """
   @spec push(GenServer.server(), Protocol.Push.t()) :: :ok
-  def push(shipper, %Protocol.Push{} = p), do: GenServer.cast(shipper, {:push, p, self()})
+  def push(shipper, %Protocol.Push{} = p) do
+    case Budget.reserve(shipper, byte_size(p.payload)) do
+      {:ok, reserved} ->
+        GenServer.cast(shipper, {:push, p, self(), reserved})
+
+      :rejected ->
+        # Same answer, and for the same reason, as the `overloaded?` branch: a follower that cannot
+        # take the work must subtract from the quorum NOW rather than absorb it. Reported as
+        # `:overloaded` so the two paths are indistinguishable to `Quorum` and to the operator.
+        send(self(), {:repl_reply, resolve(shipper), {:reject, p.shard_id, :overloaded, 0}})
+        :ok
+    end
+  end
 
   @doc """
   Open a streamed base copy. Registers the waiter for the WHOLE seed, not for this frame.
@@ -131,10 +153,20 @@ defmodule Fathom.Shard.Replication.Shipper do
 
   @impl true
   def init(opts) do
+    name = Keyword.get(opts, :name)
+
+    # A FRESH counter per incarnation, and that is the point rather than initialisation hygiene.
+    # A shipper killed with a full mailbox never runs the `Budget.release/2` calls its queued
+    # messages owed; with one long-lived counter those bytes would be charged to the node forever
+    # and replication would eventually refuse everything. Publishing a new ref here makes a
+    # stranded count die with the process that stranded it.
+    Budget.install(name)
+
     state = %__MODULE__{
       host: Keyword.fetch!(opts, :host),
       port: Keyword.fetch!(opts, :port),
-      id: Keyword.get(opts, :id, Keyword.get(opts, :name, self()))
+      name: name,
+      id: Keyword.get(opts, :id, name || self())
     }
 
     {:ok, state, {:continue, :connect}}
@@ -147,15 +179,21 @@ defmodule Fathom.Shard.Replication.Shipper do
   def handle_call(:connected?, _from, state), do: {:reply, state.sock != nil, state}
 
   @impl true
-  def handle_cast({:push, p, from}, %{sock: nil} = state) do
+  def handle_cast({:push, p, from, reserved}, %{sock: nil} = state) do
     # Not connected. Fail the push immediately rather than buffering: a queued frame delta is a
     # commit the tenant is still waiting on, and silently holding it converts a follower outage
     # into unbounded write latency.
+    Budget.release(state.name, reserved)
     send(from, {:repl_reply, self(), {:reject, p.shard_id, :disconnected, 0}})
     {:noreply, state}
   end
 
-  def handle_cast({:push, p, from}, state) do
+  def handle_cast({:push, p, from, reserved}, state) do
+    # Released the moment the payload leaves the mailbox, on EVERY branch below — the budget bounds
+    # what is queued, not what is in flight. Doing it here rather than per-branch is what keeps each
+    # `Budget.reserve/2` matched by exactly one release.
+    Budget.release(state.name, reserved)
+
     cond do
       # OVERLOADED: more work queued than this link can drain. Reject NOW, for exactly the reason
       # the `sock: nil` clause above rejects — a follower that cannot take the work must subtract
@@ -185,10 +223,13 @@ defmodule Fathom.Shard.Replication.Shipper do
       # a HEALTHY range (256 tenants legitimately queues 4,967; capping there turned 3,505 txn/s /
       # 0 errors into 1,580 / 5,333), while 8,192 permits 32 GB. The two constraints do not
       # overlap. A real bound has to be **in bytes and aggregated per node**, not messages per
-      # shipper. Until that exists this is a guard, not the fix, and the OOM is open.
+      # shipper.
       #
-      # It is also soft by construction: consulted on DEQUEUE, so a burst outruns it — one run
-      # reached 12,828 against a cap of 8,192.
+      # THAT BOUND NOW EXISTS and is `Fathom.Shard.Replication.Budget`, claimed in `push/2` inside
+      # the CALLER. Which is also why this one stays soft and stays: it is consulted on DEQUEUE, so
+      # a burst outruns it — one run reached 12,828 against a cap of 8,192 — and a dequeue-time
+      # check structurally cannot bound a mailbox a cast fills faster than the process drains it.
+      # Keep it as the cheap message-count guard it is; the byte ceiling is enforced elsewhere.
       #
       # TWO WRONG READINGS ARE RECORDED HERE ON PURPOSE, because both are easy to reach again:
       #
@@ -292,8 +333,14 @@ defmodule Fathom.Shard.Replication.Shipper do
   def handle_info(_, state), do: {:noreply, state}
 
   @impl true
-  def terminate(_reason, %{sock: sock}) when sock != nil, do: :gen_tcp.close(sock)
-  def terminate(_, _), do: :ok
+  def terminate(_reason, state) do
+    # Best-effort, and correctness does not rest on it: a replacement's `Budget.install/1`
+    # supersedes this ref anyway, and `Budget.queued/0` only sums the shippers `Fleet` currently
+    # publishes. This just keeps a departed follower's entry from outliving it in `:persistent_term`.
+    Budget.forget(state.name)
+    if state.sock, do: :gen_tcp.close(state.sock)
+    :ok
+  end
 
   # ------------------------------------------------------------------------------------------
 
@@ -365,7 +412,9 @@ defmodule Fathom.Shard.Replication.Shipper do
   #
   # No value works. 1,024 throttles a healthy range (256 tenants legitimately reaches 4,967);
   # 8,192 permits 32 GB. A correct bound must be in BYTES and aggregated PER NODE, not messages per
-  # shipper — that is the open work, not another number here.
+  # shipper — which is `Fathom.Shard.Replication.Budget`, claimed in `push/2` before the cast, and
+  # is where the memory ceiling actually lives. Do not retune THIS number to chase memory; it
+  # cannot get there, and two of the three failed fixes were exactly that attempt.
   #
   # Set to 0 to disable the bound. That restores an unbounded mailbox, which is a hazard on its own
   # terms.
@@ -419,6 +468,11 @@ defmodule Fathom.Shard.Replication.Shipper do
     Process.send_after(self(), :reconnect, @reconnect_backoff_ms)
     %{state | sock: nil, waiters: %{}}
   end
+
+  # The reply must name the shipper the way every other reply does, or `ship_quorum/4`'s expectation
+  # map and `Quorum`'s tally key on different things and the reject is counted against nobody.
+  defp resolve(pid) when is_pid(pid), do: pid
+  defp resolve(name), do: Process.whereis(name) || name
 
   defp encode(%Protocol.Push{} = p), do: Protocol.encode_push(p)
 

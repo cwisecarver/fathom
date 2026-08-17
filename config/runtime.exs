@@ -69,6 +69,25 @@ env_int = fn name ->
   end
 end
 
+# Same, but 0 is a VALUE rather than a rejection. For knobs where zero means "disable this bound"
+# (the replication byte caps), `env_int` above would silently ignore the one setting an operator
+# reaches for in an incident — it returns nil for 0, which leaves the default in place.
+env_nonneg_int = fn name ->
+  case System.get_env(name) do
+    nil ->
+      nil
+
+    "" ->
+      nil
+
+    v ->
+      case Integer.parse(v) do
+        {n, _} when n >= 0 -> n
+        _ -> nil
+      end
+  end
+end
+
 # Storage backend for shard files. SHARD_STORAGE=s3 selects the S3 backend and reads its
 # connection settings; the boot fence probe (Fathom.Application.check_storage_fence!) then
 # verifies the store enforces conditional writes before serving a byte.
@@ -546,6 +565,35 @@ end
 # when a follower is silent rather than refusing.
 if ms = env_int.("REPLICATION_TIMEOUT_MS") do
   config :fathom, :replication_timeout_ms, ms
+end
+
+# THE TWO BOUNDS THAT CLOSE THE 1024-TENANT OOM. See
+# `docs/reviews/a2-shipper-feedback-loop-2026-08-16.md` — the failure is a positive feedback loop,
+# not a leak: a push carries the WAL since the follower's last ACK, so a delayed send makes the
+# next payload bigger, which delays it further. Measured on one shipper 40 s apart, the queued
+# MESSAGE count fell while the binary held DOUBLED. That is why neither of these is a message count
+# and why retuning `REPLICATION_MAX_QUEUE` cannot reach it.
+#
+# The most WAL a single push may carry (default 1 MiB). This is the one that breaks the loop: a
+# capped delta cannot grow without limit no matter how far behind a follower falls. `Session` ships
+# in bounded rounds until the follower is current, so the commit still only acks once the quorum
+# holds every byte — capping costs latency under lag, never durability.
+if n = env_nonneg_int.("REPLICATION_MAX_PUSH_BYTES") do
+  config :fathom, :replication_max_push_bytes, n
+end
+
+# Total queued WAL bytes this NODE may hold across all its shippers (default 1 GiB). The safety net
+# under the cap above, claimed in the committing process before the payload reaches any mailbox —
+# a dequeue-time check cannot bound a mailbox a cast fills faster than the process drains it.
+#
+# It should never bite in health; if it does, that is a signal to look at the link, not to raise it.
+# Shedding load in a clean range is how the message-count cap failed: 1,024 turned a clean
+# 256-tenant step from 3,505 txn/s / 0 errors into 1,580 / 5,333.
+#
+# Either may be set to 0 to disable, matching REPLICATION_MAX_QUEUE. Both zeroed restores the
+# pre-fix behaviour, OOM included.
+if n = env_nonneg_int.("REPLICATION_MAX_QUEUE_BYTES") do
+  config :fathom, :replication_max_queue_bytes, n
 end
 
 # Let a cold open serve a local REPLICA when it is provably newer than the stored object — the

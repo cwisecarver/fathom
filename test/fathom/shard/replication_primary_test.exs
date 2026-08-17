@@ -138,4 +138,72 @@ defmodule Fathom.Shard.ReplicationPrimaryTest do
       assert %{wal_gen: 3, salt1: 55, offset: 8272} = Primary.advance(h, {:append, 4152, 4120})
     end
   end
+
+  describe "Primary.plan/3 — the per-push byte cap" do
+    # WHY THIS EXISTS: the 1024-tenant OOM is a positive feedback loop, not a leak. A push carries
+    # the WAL since the follower's last ACK, so a delayed send makes the next payload bigger, which
+    # delays it further. Measured on one shipper 40 s apart, the queued MESSAGE count fell
+    # (8,265 -> 8,195) while the binary held DOUBLED (6,893 -> 15,798 MB) and the mean payload went
+    # 832 KB -> 1,593 KB. Capping the count cannot touch that; capping the DELTA does.
+    # See `docs/reviews/a2-shipper-feedback-loop-2026-08-16.md`.
+
+    test "a delta under the cap is untouched" do
+      assert {:append, 4152, 4120} = Primary.plan(state(1, 9, 4152), header(1, 9, 8272), 8192)
+    end
+
+    test "a delta exactly at the cap is untouched — the boundary is inclusive" do
+      assert {:append, 4152, 4120} = Primary.plan(state(1, 9, 4152), header(1, 9, 8272), 4120)
+    end
+
+    test "a delta over the cap is truncated to the cap" do
+      assert {:append, 4152, 1024} = Primary.plan(state(1, 9, 4152), header(1, 9, 8272), 1024)
+    end
+
+    test "a reset is capped too, and still starts at offset 0" do
+      # The offset matters as much as the length: `FollowerLog.decide_fresh/2` accepts a generation
+      # change ONLY at offset 0, so a capped reset that moved its start would be refused forever.
+      assert {:reset, 0, 1024} = Primary.plan(nil, header(1, 9, 9000), 1024)
+      assert {:reset, 0, 1024} = Primary.plan(state(1, 9, 4152), header(2, 77, 9000), 1024)
+    end
+
+    test "a capped plan resumes exactly where it stopped, and converges" do
+      # THE property the catch-up loop rests on. A truncated ship must leave the follower at a
+      # position the NEXT plan continues from — an off-by-one here would either skip bytes (silent
+      # divergence) or resend them (a permanent `:offset_mismatch` loop).
+      h = header(1, 9, 10_000)
+      cap = 4096
+
+      offsets =
+        Stream.iterate(state(1, 9, 0), fn s ->
+          case Primary.plan(s, h, cap) do
+            :nothing -> s
+            {_kind, _off, _len} = plan -> Primary.advance(h, plan)
+          end
+        end)
+        |> Enum.take(5)
+        |> Enum.map(& &1.offset)
+
+      assert offsets == [0, 4096, 8192, 10_000, 10_000]
+      assert :nothing = Primary.plan(state(1, 9, 10_000), h, cap)
+    end
+
+    test "no cap is spelled three ways and all mean the same thing" do
+      s = state(1, 9, 4152)
+      h = header(1, 9, 8272)
+      full = {:append, 4152, 4120}
+
+      assert ^full = Primary.plan(s, h, :infinity)
+      # 0 is the documented off switch, matching `:replication_max_queue`.
+      assert ^full = Primary.plan(s, h, 0)
+
+      # plan/2 must stay exactly plan/3 with no cap, or every existing pure test above is testing a
+      # different function from the one the commit path calls.
+      assert Primary.plan(s, h) == Primary.plan(s, h, :infinity)
+    end
+
+    test "an empty WAL still ships nothing, cap or no cap" do
+      assert :nothing = Primary.plan(nil, :empty, 1024)
+      assert :nothing = Primary.plan(state(1, 9, 100), :empty, 1024)
+    end
+  end
 end

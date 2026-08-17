@@ -203,4 +203,88 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     assert {:error, {:no_quorum, :impossible}} =
              Session.commit(id, path <> "-wal", coordinator)
   end
+
+  # REGRESSION — the 1024-tenant OOM. See `docs/reviews/a2-shipper-feedback-loop-2026-08-16.md`.
+  #
+  # THE SYMPTOM: nodes OOM-killed (exit 137) about two minutes into a 1024-tenant `tpc-fleet` run
+  # with replication on, on a 94 GiB VM. The cause is a positive feedback loop, not a leak — a push
+  # carries the WAL since the follower's last ACK, so a delayed send makes the next payload bigger,
+  # which delays it further. `Primary.plan/3` caps the delta, which breaks the loop but means one
+  # round no longer necessarily hands a follower everything.
+  #
+  # THE INVARIANT THIS PINS is the one that cap could plausibly have broken: a commit must not ack
+  # until the quorum holds every byte through the commit point. `Session.ship/4` therefore ships in
+  # bounded ROUNDS until the followers are current. Delete that loop and this test fails — the
+  # commit returns `:ok` having shipped only the first `@small_cap` bytes, and the follower WALs
+  # differ from the primary's forever after.
+  @small_cap 4096
+
+  test "a WAL far larger than the per-push cap still converges byte-identically", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+
+    prev_cap = Application.get_env(:fathom, :replication_max_push_bytes)
+    Application.put_env(:fathom, :replication_max_push_bytes, @small_cap)
+
+    on_exit(fn ->
+      if prev_cap,
+        do: Application.put_env(:fathom, :replication_max_push_bytes, prev_cap),
+        else: Application.delete_env(:fathom, :replication_max_push_bytes)
+    end)
+
+    Application.put_env(:fathom, :replication_enabled, true)
+    Application.put_env(:fathom, :replication_quorum, 2)
+
+    Application.put_env(
+      :fathom,
+      :replication_followers,
+      for({_n, port} <- followers, do: {~c"127.0.0.1", port})
+    )
+
+    start_supervised!(Fleet)
+
+    {:ok, coordinator, ref, path} = Shards.checkout(id)
+    on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+    {:ok, conn} = Connection.open(path)
+    on_exit(fn -> Connection.close(conn) end)
+
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER, b TEXT)", [])
+    blob = String.duplicate("x", 1024)
+
+    for i <- 1..120 do
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?, ?)", [i, blob])
+    end
+
+    wal = path <> "-wal"
+    primary_bytes = File.read!(wal)
+
+    # PRECONDITION. Without this the test can silently degenerate into the ordinary one-round case
+    # — a WAL under the cap ships whole, the loop never runs a second round, and a deleted loop
+    # would pass. Asserted rather than assumed, because that is exactly the shape of the "test
+    # passes both ways" failure this project keeps finding.
+    assert byte_size(primary_bytes) > @small_cap * 3,
+           "the WAL is #{byte_size(primary_bytes)}B against a #{@small_cap}B cap — this test " <>
+             "needs a delta big enough to force several rounds, or it measures nothing"
+
+    for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0, 0)
+
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    assert holders(followers, id, primary_bytes) >= 2,
+           "the commit returned before a quorum held the whole WAL — the catch-up loop stopped " <>
+             "short, so the ack claims durability the followers do not have"
+
+    for {name, _} <- followers, do: await_wal(name, id, primary_bytes)
+
+    # And it keeps working once caught up: the next commit is an ordinary small append, planned
+    # from the position the capped rounds left behind. An off-by-one in the resume arithmetic
+    # shows up here as a permanent `:offset_mismatch` rather than at the seam above.
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (999, 'tail')", [])
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    grown = File.read!(wal)
+    assert byte_size(grown) > byte_size(primary_bytes), "the follow-up commit appended nothing"
+    assert holders(followers, id, grown) >= 2
+    for {name, _} <- followers, do: await_wal(name, id, grown)
+  end
 end
