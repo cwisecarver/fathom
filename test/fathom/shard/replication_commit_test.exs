@@ -246,12 +246,33 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     assert {:error, {:no_quorum, _}} = Session.commit(id, path <> "-wal", coordinator)
 
     [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
-    inflight = :sys.get_state(session).inflight
+
+    # POLL, do not sample once. `ship_quorum/4` returns the instant the outcome is decided — here as
+    # soon as the quorum is `:impossible` — so a straggler's `:disconnected` can still be on the
+    # wire when the call returns. It is cleared by `handle_info/2` a moment later. Reading the state
+    # exactly once made this test fail about one run in twenty (seed 12244).
+    #
+    # This still discriminates: WITHOUT the fix the entries are never cleared for any reason but
+    # `:offset_mismatch`, so the poll exhausts its deadline and fails rather than converging.
+    inflight = await_empty_inflight(session)
 
     assert inflight == %{},
            "followers that already answered are still recorded as mid-flight: " <>
              "#{inspect(Map.keys(inflight))}. `settle_inflight/3` will wait out the full " <>
              "deadline on them, and a skip-the-busy optimisation would never ship to them again."
+  end
+
+  defp await_empty_inflight(session, timeout \\ 2_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    Stream.repeatedly(fn ->
+      inflight = :sys.get_state(session).inflight
+
+      if inflight == %{} or System.monotonic_time(:millisecond) > deadline,
+        do: inflight,
+        else: nil
+    end)
+    |> Enum.find(&(&1 != nil))
   end
 
   # REGRESSION — the 1024-tenant OOM. See `docs/reviews/a2-shipper-feedback-loop-2026-08-16.md`.

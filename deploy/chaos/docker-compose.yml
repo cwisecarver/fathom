@@ -37,7 +37,13 @@ x-fathom-env: &fathom-env
   SHARD_LEASE_TTL_MS: "10000"
   # Fast flush cadence so scenarios observe durability PUTs within seconds, and a
   # short idle threshold so flush-and-drop happens inside a scenario's window.
-  SHARD_FLUSH_INTERVAL_MS: "5000"
+  # Overridable so a run can sweep it. The 5 s default exists to make failover scenarios observable
+  # inside a scenario's window, NOT because it is realistic — production is 30 s+. That matters for
+  # replication: a durability flush CHECKPOINTS the WAL, and a checkpoint landing under an in-flight
+  # push is exactly what produces `:stale_wal_gen` — 14,149 rejects on one node at 512 tenants
+  # (docs/reviews/a2-feedback-loop-fixed-2026-08-17.md). So an artificially fast flush may be
+  # manufacturing part of the measured error rate.
+  SHARD_FLUSH_INTERVAL_MS: "${SHARD_FLUSH_INTERVAL_MS:-5000}"
   SHARD_IDLE_MS: "20000"
   # Per-shard load counters on, so `chaos.sh hotspots` can read Fathom.ShardLoad.top
   # per node — the real-traffic hot-spot measurement (Phase-2 §B).
