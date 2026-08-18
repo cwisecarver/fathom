@@ -93,8 +93,12 @@ what actually shipped (some plan assumptions were superseded).
 - **[phase2-scoping.md](phase2-scoping.md)** — Phase 2 scoping: warm standby (A), rebalancing (B),
   locality/affinity (C). *Scoping.*
 - **[a2-quorum-replication.md](a2-quorum-replication.md)** — Phase 2 A2 in full: replicate-before-ack
-  (the Waterpark quorum shape) as the answer to node-loss RPO, why CRDT/OT cannot work over opaque
-  tenant SQL, and the verified blocker (exqlite exposes no WAL-frame API). *Design only — NOT built.*
+  (the Waterpark quorum shape) as the answer to node-loss RPO, and why CRDT/OT cannot work over
+  opaque tenant SQL. **Built and on `main`, off by default** (`REPLICATION_ENABLED` /
+  `REPLICATION_LISTEN`). The doc's stated blocker — "exqlite exposes no WAL-frame API" — was
+  **disproved 2026-08-09**: a loadable extension gets a live `sqlite3*` and `sqlite3_wal_hook` is in
+  the extension pointer table, so exqlite's surface was never the boundary. Current scale limit and
+  the fixed OOM: [reviews/a2-feedback-loop-fixed-2026-08-17.md](reviews/a2-feedback-loop-fixed-2026-08-17.md).
 
 ## Benchmarking
 
@@ -102,6 +106,12 @@ what actually shipped (some plan assumptions were superseded).
   the multi-metric regression gate, `mix fathom.scale`, and what each metric means. *Built.*
 - **[tpc-benchmark-plan.md](tpc-benchmark-plan.md)** — the wire-true TPC-B + TPC-C benchmark plan
   (loopback WS gate metrics + the recorded-only TPC-C sweep). *Built (rev 7, complete).*
+- **[a2-bare-metal-plan.md](a2-bare-metal-plan.md)** — how to measure A2 replication on three
+  SEPARATE machines, and why it is the next thing worth doing: every A2 number to date comes from
+  five nodes sharing one VM over loopback, so nothing so far can separate "fathom saturates" from
+  "the box saturates". Carries the measured **17.3 KB of WAL per TPC-B commit** that the network
+  arithmetic rests on, the wired-vs-Wi-Fi ceiling (Wi-Fi is a shared medium and would bind before
+  the CPUs did), and the pass conditions. *Planned, not run.*
 
 ## Runbooks
 
