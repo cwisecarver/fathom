@@ -1888,7 +1888,10 @@ cmd_tpc_fleet() {
   echo "  cross-LB warm SELECT 1 RTT p50: $(awk -v x="$rtt" 'BEGIN{printf "%.0f", x}')µs (the per-statement network floor)"
   echo ""
   echo "  --- throughput vs tenant concurrency (one writer per tenant, no intra-shard convoy) ---"
-  printf "  %-9s %9s %11s %9s %9s %9s %6s\n" tenants txns "txn/s" "p50 ms" "p95 ms" "p99 ms" errs
+  # `shed` is tenants the driver KILLED at its worker backstop, not transactions that failed. It is
+  # a separate column because it folds into `errs` at `per_client` errors apiece, so a handful of
+  # wedged clients dominates the error count and reads as a fleet problem when it is a client one.
+  printf "  %-9s %9s %11s %9s %9s %9s %6s %5s\n" tenants txns "txn/s" "p50 ms" "p95 ms" "p99 ms" errs shed
   local c txns json tps p50 p95 p99 errs
   local IFS=,
   set -f; set -- $clients_csv; set +f   # split the CSV on commas (bash 3.2 safe)
@@ -1902,10 +1905,11 @@ cmd_tpc_fleet() {
     p95=$(printf '%s' "$json" | jq -r '.tpcb_p95_us // 0')
     p99=$(printf '%s' "$json" | jq -r '.tpcb_p99_us // 0')
     errs=$(printf '%s' "$json" | jq -r '.errors // 0')
-    printf "  %-9s %9s %11s %9s %9s %9s %6s\n" "$c" "$txns" "$tps" \
+    shed=$(printf '%s' "$json" | jq -r '.shed_tenants // 0')
+    printf "  %-9s %9s %11s %9s %9s %9s %6s %5s\n" "$c" "$txns" "$tps" \
       "$(awk -v x="$p50" 'BEGIN{printf "%.2f", x/1000}')" \
       "$(awk -v x="$p95" 'BEGIN{printf "%.2f", x/1000}')" \
-      "$(awk -v x="$p99" 'BEGIN{printf "%.2f", x/1000}')" "$errs"
+      "$(awk -v x="$p99" 'BEGIN{printf "%.2f", x/1000}')" "$errs" "$shed"
   done
 
   # Per-node distribution: how many tenant shards each node held + total query load it absorbed.

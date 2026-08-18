@@ -1,4 +1,8 @@
-# The 512-tenant replication error rate was the rig's flush interval — 2026-08-18
+# The rig was the bottleneck twice: the flush interval, then the load driver — 2026-08-18
+
+**Two harness defects, one day, both of which had been recorded as fathom limits.** Fixing the
+first took 512 from 22,599 errors to 4; fixing the second answered the 1024-tenant question that
+had been open since 2026-08-14, at **2,776 txn/s with zero tenants shed**.
 
 A single-variable A/B, same image, rig restarted between arms. Changing
 `SHARD_FLUSH_INTERVAL_MS` from the rig's 5,000 to a realistic 30,000 took the 512-tenant
@@ -57,7 +61,57 @@ So the straggler class is real (`replication_transport_test.exs` now pins it) an
 throughput lever. The 2026-08-17 report's suggestion that it was "probably where the next real
 availability win is" is **wrong**, and this is the measurement that says so.
 
-## 1024 still produces no result — and it is the DRIVER, provably
+## 1024 ANSWERED: 2,776 txn/s, zero tenants shed
+
+**Resolved the same day.** The hang was the load driver, and with it fixed 1024 replicating tenants
+run to completion on this rig:
+
+    1024   409600 txns   2775.9 txn/s   p50 163ms  p95 405ms  p99 1838ms   12042 errs   shed 0
+
+`shed 0` means **every one of the 1024 tenants completed all 400 of its transactions** — the 12,042
+errors (2.9%) are per-transaction retries, not abandoned work. All 1024 shards placed across the
+five nodes (197/200/186/222/219), node binary memory **30–33 MB**.
+
+So the answer to the question this rig could not previously ask is: **yes, at ~2,776 txn/s.**
+
+### The driver bug
+
+`Task.async_stream(timeout: :infinity)`. Every layer beneath it was already bounded — the Mint
+transport recv at 15 s, `establish/3` at 8 attempts, a per-transaction `rescue` — and `:infinity` at
+the top undid all of it. ONE wedged tenant out of 1024 hung the entire sweep and produced **no
+result at all**, not even a partial one. The accounting for a shed tenant already existed
+(`crashed * per_client`); the `:infinity` simply guaranteed it could never fire.
+
+Fixed in two layers, because they catch different things:
+
+* **Graceful** — a worker past `--worker-timeout` (default 300 s) stops issuing new transactions and
+  returns the latencies it already collected. A killed task returns *nothing*, so without this a run
+  with a few slow tenants would silently discard their samples and report an aggregate describing
+  only the fast ones.
+* **Backstop** — the `async_stream` timeout, 30 s above that, for a worker blocked *inside* a single
+  call, which never reaches the graceful check.
+
+And **`shed_tenants` is now reported as its own column**, because the first completing run reported
+17,287 errors and working out that ~43 were killed tenants rather than 17,287 bad transactions took
+arithmetic on the ratio. A harness should not make a reader infer that.
+
+### Two runs that were NOT the fleet, and how they were told apart
+
+The shed column paid for itself immediately. A second 1024 run read **304.8 txn/s with 818 tenants
+shed** — an apparent catastrophic regression. It was the rig: three heavy runs back to back with no
+restart, which is exactly the contamination signature AGENTS.md describes (run 1 healthy, runs 2–3
+collapse). A full `down`/`up` and the same command gave 2,775.9 txn/s with **0** shed. Without the
+column that run would have looked like a fathom collapse rather than a dirty rig.
+
+## What the 1024 numbers still say is saturating
+
+`:already_in_flight` 20,079 / 27,959 and `:overloaded` 8,419 / 9,294 per node. The byte budget IS
+firing at 1024 where it was silent at 512, so the replication links are genuinely saturated on this
+one VM — the nodes are healthy and bounded (30–33 MB), they simply cannot ship faster. That is the
+honest ceiling of a single 12-vCPU box running five nodes, a load driver, MinIO, Postgres and nginx,
+and it is the thing three separate machines would answer (`docs/a2-bare-metal-plan.md`).
+
+## Superseded: the earlier reading that 1024 was unanswerable
 
 The same flush=30,000 configuration run at 1024 tenants again produced no throughput number. This
 time the cause was isolated rather than assumed:
@@ -76,15 +130,16 @@ limitation at 1024 concurrent clients under the ~4x per-write latency replicatio
 belongs with the driving rules already recorded in `tpc-fleet-highconc-2026-07-23.md` rather than
 with fathom's scaling story.
 
-**It is still unproven that fathom handles 1024 replicating tenants.** What is now proven is that
-the rig cannot currently ask it the question.
+**That was true when written and was resolved the same day** — see the 1024 section above. The rig
+could not ask the question; it can now, and the answer is 2,776 txn/s with nothing shed.
 
 ## What this changes
 
 * **512 with replication on is CLEAN** (3,340 txn/s, 4 errors) at a realistic flush interval. The
   previously recorded "512 completes degraded, 4.6% errors" was measuring the harness.
-* The **"replication on is a <=256-tenant configuration"** line is superseded: <=512 is clean and
-  measured.
+* The **"replication on is a <=256-tenant configuration"** line is superseded twice over: 512 is
+  clean, and **1024 completes at 2,776 txn/s with 0 tenants shed** once the load driver stops
+  hanging on its own `:infinity` timeout.
 * Any future replication throughput run **must** set a realistic `SHARD_FLUSH_INTERVAL_MS`, or it is
   measuring checkpoint churn. `docker-compose.yml` now takes it from the environment for exactly
   this reason.

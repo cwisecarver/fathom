@@ -22,6 +22,12 @@
 #     --shard tpc --txns 20000 --clients 256 --accounts 100000
 #   elixir deploy/chaos/tpc_driver.exs rtt  --lb http://localhost:8080 --domain fathom.test --shard tpc
 #
+# `--worker-timeout <ms>` (default 300000) bounds each tenant's wall clock. A worker past it stops
+# issuing new transactions and returns what it collected, counting the rest as errors; a worker
+# wedged inside a single call is killed by a backstop 30 s above that. Before this the top-level
+# `Task.async_stream` was `timeout: :infinity`, so ONE stuck tenant hung the whole sweep and it
+# produced no result at all — which is how the 1024-tenant replication question went unanswered.
+#
 # Prints a human summary to stderr and a single JSON result object to stdout (so chaos.sh can tee
 # it into a docs/reviews report), matching tpc_driver.py's contract.
 
@@ -53,6 +59,17 @@ defmodule ErrTally do
   def note(term) do
     k = bucket(term)
     :ets.update_counter(@tab, k, {2, 1}, {k, 0})
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  # Count a named condition directly, rather than bucketing it out of an error term. Used for
+  # `worker_deadline`, which is not an exception at all — it is the driver deciding to stop — and so
+  # has no reason string for `bucket/1` to classify. It shows up in the same `err reasons:` line, so
+  # a run that shed work says so where every other failure class already says so.
+  def bump(key) do
+    :ets.update_counter(@tab, key, {2, 1}, {key, 0})
     :ok
   rescue
     _ -> :ok
@@ -183,7 +200,12 @@ defmodule Tpc do
     raw =
       Task.async_stream(0..(a.clients - 1), fn cid -> worker(cid, a) end,
         max_concurrency: a.clients,
-        timeout: :infinity,
+        # A backstop ABOVE the worker's own deadline, so the graceful path (a worker noticing it is
+        # out of time and returning what it has) wins whenever it can, and this only fires for a
+        # worker wedged inside a single call. `Enum.to_list/1` keeps the `{:exit, :timeout}` entries
+        # rather than raising, and they are already counted below as fully-errored tenants.
+        timeout: a.worker_timeout + 30_000,
+        on_timeout: :kill_task,
         ordered: false
       )
       |> Enum.to_list()
@@ -217,12 +239,32 @@ defmodule Tpc do
         "p99=#{p["p99_us"]}µs"
     )
 
+    # REPORT SHED TENANTS SEPARATELY, always, even at zero.
+    #
+    # `errs` folds two very different things into one number: individual transactions that failed
+    # and were retried, and WHOLE TENANTS killed by the `async_stream` backstop (each contributing
+    # `per_client` errors at once). The first 1024-tenant run to complete reported 17,287 errors,
+    # and working out that ~43 of those were killed tenants rather than 17,287 bad transactions
+    # took arithmetic on the ratio — which is exactly the kind of inference a harness should not
+    # make a reader do. A run that silently discarded 4% of its tenants must say so in its own
+    # output.
+    if crashed > 0 do
+      IO.puts(
+        :stderr,
+        "  SHED: #{crashed} of #{a.clients} tenants were killed by the worker backstop " <>
+          "(#{crashed * a.per_client} of the #{errs} errors). Those clients wedged inside a " <>
+          "single call — raise --worker-timeout only if you believe they would have finished."
+      )
+    end
+
     %{
       "mode" => "tpcb",
       "shard" => a.shard,
       "tenant_shards" => a.clients,
       "txns" => length(lat),
       "errors" => errs,
+      "shed_tenants" => crashed,
+      "shed_errors" => crashed * a.per_client,
       "tpcb_tps" => tps
     }
     |> Map.merge(for {k, v} <- p, into: %{}, do: {"tpcb_#{k}", v})
@@ -251,24 +293,44 @@ defmodule Tpc do
     end
   end
 
+  # THE GRACEFUL DEADLINE. A worker that runs out of budget stops issuing NEW transactions and
+  # returns the latencies it did collect, counting the rest as errors. That is strictly better than
+  # letting `async_stream`'s backstop kill it: a killed task returns nothing, so a run where a
+  # handful of tenants are slow would throw away every sample those tenants had already produced,
+  # and the aggregate would silently describe only the fast ones.
+  #
+  # The shed transactions ARE counted as errors rather than quietly dropped from the denominator —
+  # a sweep that reports 3,000 txn/s while having abandoned a third of its work is the kind of
+  # suspiciously-good number this project has been burned by before.
   defp run_txns(c, a) do
     t0 = System.monotonic_time(:microsecond)
+    deadline = t0 + a.worker_timeout * 1000
 
-    {lat, errs, c} =
-      Enum.reduce(1..a.per_client, {[], 0, c}, fn _, {lat, e, c} ->
+    {lat, errs, c, done} =
+      Enum.reduce(1..a.per_client, {[], 0, c, 0}, fn _, {lat, e, c, done} ->
         start = System.monotonic_time(:microsecond)
 
-        try do
-          c = tpcb_txn(c, a.accounts)
-          {[System.monotonic_time(:microsecond) - start | lat], e, c}
-        rescue
-          # Transient: a Hrana-level error (rebalancer flip) OR a stale keepalive the server
-          # closed between requests. Real SDKs retry both; reconnect and count as a transient err.
-          _ -> {lat, e + 1, reconnect(c)}
+        if start > deadline do
+          # Out of time. Stop working, but keep reducing (cheap) so the count stays exact.
+          {lat, e + 1, c, done}
+        else
+          try do
+            c = tpcb_txn(c, a.accounts)
+            {[System.monotonic_time(:microsecond) - start | lat], e, c, done + 1}
+          rescue
+            # Transient: a Hrana-level error (rebalancer flip) OR a stale keepalive the server
+            # closed between requests. Real SDKs retry both; reconnect and count as a transient err.
+            _ -> {lat, e + 1, reconnect(c), done}
+          end
         end
       end)
 
     t1 = System.monotonic_time(:microsecond)
+
+    if done < a.per_client do
+      ErrTally.bump("worker_deadline")
+    end
+
     Client.close(c)
     {lat, {t0, t1}, errs}
   end
@@ -378,6 +440,17 @@ defmodule Tpc do
       samples: 200,
       txns: 2000,
       clients: 8,
+      # PER-WORKER WALL-CLOCK BUDGET, and the reason it exists rather than `:infinity`.
+      #
+      # A 1024-tenant run with replication ON hung indefinitely and produced NO result at all —
+      # not a partial one, nothing — while the fleet was provably healthy (it answered a cold open
+      # through the LB in 4.9 ms with the driver at 0.00% CPU). One worker that never returns takes
+      # `Task.async_stream(timeout: :infinity)` with it, and the whole sweep with that.
+      #
+      # Every layer below this already had a bound: the Mint transport recv is 15 s, `establish/3`
+      # gives up after 8 attempts, and `run_txns/2` rescues per txn. `:infinity` at the TOP undid
+      # all of it. See docs/reviews/a2-flush-interval-2026-08-18.md.
+      worker_timeout: 300_000,
       accounts: 100_000,
       max_w: 5,
       threads: 8,
@@ -400,7 +473,7 @@ defmodule Tpc do
     IO.puts(Jason.encode!(out))
   end
 
-  @ints [:samples, :txns, :clients, :accounts, :threads, :max_w]
+  @ints [:samples, :txns, :clients, :accounts, :threads, :max_w, :worker_timeout]
   @floats [:scale]
 
   defp parse_opts([], acc), do: acc
@@ -488,7 +561,8 @@ defmodule Tpcc do
         0..(a.threads - 1),
         fn tid -> worker(tid, a, w, auth, ctx, per_thread) end,
         max_concurrency: a.threads,
-        timeout: :infinity,
+        timeout: a.worker_timeout + 30_000,
+        on_timeout: :kill_task,
         ordered: false
       )
       |> Enum.flat_map(fn
@@ -536,7 +610,8 @@ defmodule Tpcc do
     raw =
       Task.async_stream(0..(a.clients - 1), fn cid -> fleet_worker(cid, a) end,
         max_concurrency: a.clients,
-        timeout: :infinity,
+        timeout: a.worker_timeout + 30_000,
+        on_timeout: :kill_task,
         ordered: false
       )
       |> Enum.to_list()

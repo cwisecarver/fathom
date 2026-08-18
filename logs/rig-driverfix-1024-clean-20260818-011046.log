@@ -1,0 +1,22 @@
+tpc-fleet: multi-tenant TPC-B throughput across 5 nodes (one single-writer shard per tenant)
+  sweep tenants=1024, 400 txns/tenant, 1000 accounts/tenant — aggregate txn/s + per-node split
+
+  cross-LB warm SELECT 1 RTT p50: 208µs (the per-statement network floor)
+
+  --- throughput vs tenant concurrency (one writer per tenant, no intra-shard convoy) ---
+  tenants        txns       txn/s    p50 ms    p95 ms    p99 ms   errs  shed
+  1024         409600      2775.9    162.86    404.64   1837.79  12042     0
+
+  --- per-node distribution (the LB keyspace-partition carrying the throughput) ---
+  node          shards      queries
+  fathom1          197       553039
+  fathom2          200       561315
+  fathom3          186       522144
+  fathom4          222       623371
+  fathom5          219       614911
+
+  fleet:  1024 tenant shards over 5 nodes (2874780 queries recorded), spread 1.19x (1.00 = perfect).
+          Each tenant is one single-writer file on the node the LB hashed it to, so throughput
+          partitions across the fleet with no cross-tenant contention (contrast the single-shard
+          convoy in docs/reviews/tpc-run-2026-07-10.md). Absolute txn/s is CPU-bound by this one
+          12-vCPU VM; on N separate machines the partitioned work is ~N× (the 'millions' angle).

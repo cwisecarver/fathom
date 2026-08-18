@@ -166,13 +166,16 @@ noted).
   512). But **the tenant ceiling did not move**: 256 clean, 512 degraded, 1024 still no result — now
   by throughput collapse rather than by dying. Carries the two open leads (the budget's
   all-or-nothing cliff, and `:already_in_flight` as the dominant reject — pre-existing, not the loop).
-- **[reviews/a2-flush-interval-2026-08-18.md](reviews/a2-flush-interval-2026-08-18.md)** — the
-  512-tenant replication error rate was **the rig's flush interval**, not fathom. One variable, same
+- **[reviews/a2-flush-interval-2026-08-18.md](reviews/a2-flush-interval-2026-08-18.md)** — **the rig
+  was the bottleneck twice, and both had been recorded as fathom limits.** The 512-tenant
+  replication error rate was **the rig's flush interval**, not fathom; One variable, same
   image: `SHARD_FLUSH_INTERVAL_MS` 5,000 → 30,000 took it from **22,599 errors to 4** (+49%
   throughput), with `:stale_wal_gen` and `:overloaded` both to zero — because a checkpoint starts a
   new WAL generation and `Primary.plan/3` then ships the WHOLE WAL rather than a delta. Also settles
-  that `:already_in_flight`, the top reject, is **harmless**, and isolates the 1024 hang to the load
-  driver (the fleet answered a cold open in 4.9 ms while the driver sat at 0% CPU).
+  that `:already_in_flight`, the top reject, is **harmless**. Then the 1024 hang turned out to be
+  `Task.async_stream(timeout: :infinity)` in the LOAD DRIVER — one wedged tenant out of 1024 hung
+  the whole sweep — and with that bounded, **1024 replicating tenants run clean at 2,776 txn/s with
+  0 tenants shed**, answering the question open since 2026-08-14.
 - **[reviews/tpc-run-2026-07-10.md](reviews/tpc-run-2026-07-10.md)** — the remote-client TPC run over
   the chaos rig (true cross-LB latency) + the loopback spec-scale TPC-C comparability numbers.
 - **[reviews/latency-cost-2026-07-23.md](reviews/latency-cost-2026-07-23.md)** — what an injected S3
