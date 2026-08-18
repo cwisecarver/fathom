@@ -560,8 +560,16 @@ defmodule Fathom.Shard.Replication.Session do
             %{acc | followers: Map.put(acc.followers, key, %{pos | offset: at}), inflight: rest}
         end
 
-      _other, acc ->
-        acc
+      # EVERY OTHER REASON STILL ENDS THE WAIT. `inflight` means "this follower still owes us a
+      # reply", and `:disconnected` / `:already_in_flight` / `:stale_wal_gen` / `:overloaded` are
+      # all replies. Leaving the entry made the map claim a follower was mid-flight forever, which
+      # `settle_inflight/3` then burns a deadline on, and which any future "skip the busy
+      # followers" logic would read as permanently busy.
+      #
+      # Only `:offset_mismatch` above CONSUMES the entry (it needs the recorded generation and salt
+      # to build the correction); the rest merely drop it.
+      {shipper, _reason, _at}, acc ->
+        %{acc | inflight: Map.delete(acc.inflight, resolve(shipper))}
     end)
   end
 
@@ -604,6 +612,7 @@ defmodule Fathom.Shard.Replication.Session do
       {:repl_reply, from, {:ack, _shard, next}} ->
         state
         |> settle_late_ack(from, next)
+        |> forget_inflight(from)
         |> drain_late_replies(wal_path)
 
       {:repl_reply, from, {:reject, _shard, reason, follower_offset}} ->
@@ -626,7 +635,7 @@ defmodule Fathom.Shard.Replication.Session do
   # Only used BETWEEN catch-up rounds — see the call site in `ship/5` for why the quorum's early
   # return is the wrong stopping point there. `state.inflight` is already exactly "who we are
   # waiting on an answer from": `deliver/5` records an entry per push, `advance/2` removes it on an
-  # ack, and `forget_inflight/2` below removes it on any refusal. So "settled" is simply an empty
+  # ack, and `reconcile/2` removes it on any refusal. So "settled" is simply an empty
   # map, and a follower whose socket has dropped does not pin this — `Shipper.drop/2` fails its
   # waiter with `:disconnected` immediately, which is an answer.
   #
@@ -652,10 +661,11 @@ defmodule Fathom.Shard.Replication.Session do
           {:repl_reply, from, {:reject, _shard, reason, follower_offset}} ->
             rejects = [{from, reason, follower_offset}]
 
+            # No `forget_inflight/2` here: `reconcile/2` now clears the entry for every reject
+            # reason, which is what makes this loop terminate on a follower that refused.
             state
             |> reconcile(rejects)
             |> start_seeds(wal_path, rejects)
-            |> forget_inflight(from)
             |> settle_inflight(wal_path, deadline)
 
           {:seeded, shipper, result} ->
@@ -669,12 +679,10 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
-  # An answer of ANY kind ends the wait for that follower. `reconcile/2` already drops the
-  # expectation for `:offset_mismatch` (it consumes it to compute the corrected position) and
-  # `advance/2` drops it on an ack; this covers `:disconnected`, `:already_in_flight`,
-  # `:overloaded`, `:stale_epoch` and the rest, which otherwise leave an entry nothing ever removes
-  # and would make `settle_inflight/3` burn the whole deadline on a follower that has already
-  # spoken.
+  # An ACK that `settle_late_ack/3` declined to act on still ends the wait. It declines when the
+  # acked position is not the one we recorded — believing it would advance the primary past bytes
+  # the follower does not hold — but the follower HAS answered, so the expectation must go either
+  # way. Refusals are handled by `reconcile/2`, which owns clearing for every reject reason.
   defp forget_inflight(state, from),
     do: %{state | inflight: Map.delete(state.inflight, resolve(from))}
 

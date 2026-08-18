@@ -204,6 +204,56 @@ defmodule Fathom.Shard.ReplicationCommitTest do
              Session.commit(id, path <> "-wal", coordinator)
   end
 
+  # REGRESSION — `state.inflight` retained followers that had already answered.
+  #
+  # `inflight` means "this follower still owes us a reply to the push we sent it". `advance/2`
+  # cleared it on an ack and `reconcile/2` consumed it for `:offset_mismatch`, but EVERY other
+  # reject reason — `:disconnected`, `:already_in_flight`, `:stale_wal_gen`, `:overloaded`, all of
+  # which the 2026-08-17 rig runs produced in the thousands — left the entry behind forever.
+  #
+  # Two consequences, both quiet. `settle_inflight/3` (the catch-up loop's between-round wait)
+  # burns the caller's whole deadline waiting on a follower that already spoke. And any future
+  # "skip the followers that are busy" optimisation reads a permanently-stale map and skips a
+  # follower that is in fact free — silently under-replicating it.
+  test "a follower that rejects is no longer recorded as owing a reply", ctx do
+    %{id: id, root: root} = ctx
+    [{name, port} | _] = start_followers!(root, 1)
+
+    Application.put_env(:fathom, :replication_enabled, true)
+    Application.put_env(:fathom, :replication_quorum, 2)
+
+    # Two live followers would both ack and clear their own entries via `advance/2`, proving
+    # nothing. The closed ports reject `:disconnected` — a reason `reconcile/2` used to ignore.
+    Application.put_env(:fathom, :replication_followers, [
+      {~c"127.0.0.1", port},
+      {~c"127.0.0.1", 1},
+      {~c"127.0.0.1", 2}
+    ])
+
+    start_supervised!(Fleet)
+
+    {:ok, coordinator, ref, path} = Shards.checkout(id)
+    on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+    {:ok, conn} = Connection.open(path)
+    on_exit(fn -> Connection.close(conn) end)
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
+
+    Follower.seed(name, id, 0, 0, 0, 0)
+
+    # The quorum cannot form (2 of the 3 are closed ports), which is not what is under test — it is
+    # simply the cheapest way to make two followers reject for a reason that is not
+    # `:offset_mismatch`.
+    assert {:error, {:no_quorum, _}} = Session.commit(id, path <> "-wal", coordinator)
+
+    [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+    inflight = :sys.get_state(session).inflight
+
+    assert inflight == %{},
+           "followers that already answered are still recorded as mid-flight: " <>
+             "#{inspect(Map.keys(inflight))}. `settle_inflight/3` will wait out the full " <>
+             "deadline on them, and a skip-the-busy optimisation would never ship to them again."
+  end
+
   # REGRESSION — the 1024-tenant OOM. See `docs/reviews/a2-shipper-feedback-loop-2026-08-16.md`.
   #
   # THE SYMPTOM: nodes OOM-killed (exit 137) about two minutes into a 1024-tenant `tpc-fleet` run

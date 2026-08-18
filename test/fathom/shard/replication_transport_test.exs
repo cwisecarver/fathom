@@ -64,6 +64,89 @@ defmodule Fathom.Shard.ReplicationTransportTest do
   # common case where they all get the same one.
   defp fanout(shippers, push), do: for(s <- shippers, do: {s, push})
 
+  # THE STRAGGLER CLASS. `:already_in_flight` was the TOP reject on the 2026-08-17 rig runs —
+  # 8,781 and 18,226 on two nodes at 512 tenants — and NOTHING covered it. It is also
+  # pre-existing rather than a side effect of the catch-up loop: the same runs with the per-push
+  # cap disabled produced 21,442 and 9,175, so the loop is not the cause.
+  # See `docs/reviews/a2-feedback-loop-fixed-2026-08-17.md`.
+  #
+  # The mechanism this pins: `ship_quorum/4` deliberately returns at the Q-th ack — that early
+  # return is A2's entire measured value (2-of-4 at 1.6 ms against 4-of-4 at 134 ms). But the
+  # straggler's push is STILL OUTSTANDING in its shipper, which holds exactly one waiter per
+  # shard, so the very next commit for that shard is refused before it reaches the socket.
+  #
+  # `Shipper`'s moduledoc justifies that refusal with "a shard has exactly one writer, so there is
+  # never more than one push in flight for it... a second push is a bug in the caller." That
+  # premise is FALSE in the presence of an early quorum return: the session is correctly
+  # serialized per shard and still produces a second push while the first is unanswered. The
+  # refusal is not catching a caller bug, it is reporting a straggler.
+  describe "a straggler left behind by the early quorum return" do
+    test "is refused :already_in_flight on the next commit, before its push reaches the socket" do
+      # 2 followers that ack + 1 black hole that never will. q=2, so the quorum is satisfied by
+      # the two live ones and the black hole is left mid-flight — the exact production shape.
+      {shippers, _holes} = mixed_fleet!("aif", 2, 1)
+      [live1, live2, straggler] = shippers
+
+      push1 = %Push{
+        shard_id: "acme",
+        epoch: 1,
+        wal_gen: 1,
+        salt1: 1,
+        offset: 0,
+        payload: @payload
+      }
+
+      assert {:ok, acked, []} = Replication.ship_quorum(fanout(shippers, push1), 2, 2_000)
+
+      assert length(acked) == 2, "the quorum should have been carried by the two live followers"
+      refute straggler in acked, "the black hole cannot have acked — the fixture is wrong"
+
+      # The straggler received the bytes; it simply has not answered. Assert that rather than
+      # assume it, or a fixture that never delivered would produce the same reject for the wrong
+      # reason and this test would prove nothing.
+      assert_receive {:black_hole_push, _}, 2_000
+
+      # The next commit for the SAME shard, exactly as a hammering tenant produces it.
+      push2 = %Push{push1 | offset: byte_size(@payload)}
+
+      assert {:ok, _acked2, rejects} =
+               Replication.ship_quorum(fanout(shippers, push2), 2, 2_000)
+
+      # `start_shipper!` hands back a pid, and `ship_quorum/4` keys replies by pid too.
+      assert {^straggler, :already_in_flight, 0} =
+               Enum.find(rejects, fn {from, _r, _at} -> from == straggler end),
+             "expected the straggler to be refused :already_in_flight, got #{inspect(rejects)}"
+
+      # AND THE COST, which is the reason this matters rather than being cosmetic: the refusal is
+      # a `Quorum.reject`, so it counts against the commit. Here q=2 of n=3 survives on the two
+      # live followers — but one more reject from any real cause (`:disconnected`,
+      # `:stale_wal_gen`, both present in volume on the same rig runs) makes it `:impossible`.
+      assert length(rejects) == 1
+      assert live1 != nil and live2 != nil
+    end
+
+    test "the straggler's push never reached the socket, so the work building it was wasted" do
+      # The refusal happens on DEQUEUE in the shipper, after the session has already read the
+      # delta off disk, encoded it and queued it. So a refused push is not free: it is a
+      # `Wal.read_delta` plus an encode plus a mailbox slot, spent to be thrown away — and under
+      # the 2026-08-17 numbers that happened ~18k times in one run on one node.
+      {shippers, _holes} = mixed_fleet!("aif2", 2, 1)
+      [_l1, _l2, straggler] = shippers
+
+      p = %Push{shard_id: "acme", epoch: 1, wal_gen: 1, salt1: 1, offset: 0, payload: @payload}
+
+      assert {:ok, _, []} = Replication.ship_quorum(fanout(shippers, p), 2, 2_000)
+      assert_receive {:black_hole_push, _}, 2_000
+
+      # Second push to the straggler alone: it must be refused without another frame crossing the
+      # wire. If the black hole reports a push here, the guard let it through and the mechanism is
+      # not what this test claims.
+      Shipper.push(straggler, %Push{p | offset: byte_size(@payload)})
+      assert_receive {:repl_reply, _, {:reject, "acme", :already_in_flight, 0}}, 2_000
+      refute_receive {:black_hole_push, _}, 300
+    end
+  end
+
   # A peer that accepts a connection, answers NOTHING ever, and whose death is a real socket death.
   #
   # THIS IS NOT A CONVENIENCE, IT IS THE ONLY WAY TO REACH THE PATH. A node dying has to reach
