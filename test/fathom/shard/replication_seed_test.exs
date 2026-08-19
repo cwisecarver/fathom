@@ -589,6 +589,111 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     await_wal(laggard, id, File.read!(wal))
   end
 
+  # DETERMINISTIC REPRODUCTION of the CI flake in the test above
+  # ("a quiet shard catches a laggard up without waiting on it", OTP 28, seed 212274, open since
+  # 2026-08-14 and never reproducible on demand).
+  #
+  # The flake is neither of the two candidates originally recorded (a stalled catch-up, or too tight
+  # a deadline). It is a straggler race, and it needed a follower that RECEIVES a push and withholds
+  # its reply — impossible before `Fathom.Test.PausablePeer`, because `Follower` answers from an
+  # unlinked `Task` that `:sys.suspend/1` cannot stop.
+  #
+  # The mechanism, forced here rather than waited for:
+  #   1. a and b ack the catch-up commit; the laggard's reply is HELD by the peer.
+  #   2. The next commit has NO write, so a and b plan `:nothing`, the quorum is already satisfied
+  #      by them, and `deliver/5` takes the fire-and-forget `ship_async/1` branch with the laggard
+  #      as the whole push list.
+  #   3. The laggard's shipper still holds that shard's single waiter, so the push is refused
+  #      `:already_in_flight` BEFORE the socket — and nothing retries it
+  #      (`handle_info/2`'s reject path only re-seeds on `:unknown_shard`).
+  #
+  # On loopback the held reply normally arrives in microseconds, which is why this passes locally
+  # and only bit a contended CI runner.
+  test "a held laggard reply strands it on a quiet shard until the next write", ctx do
+    %{id: id, root: root} = ctx
+    [{a, pa}, {b, pb}, {laggard, plag}] = start_followers!(root, 3)
+
+    # Only the laggard is proxied; a and b answer directly, exactly as in the flaky test.
+    peer = start_supervised!({Fathom.Test.PausablePeer, upstream_port: plag, notify: self()})
+    enable!([{a, pa}, {b, pb}, {laggard, Fathom.Test.PausablePeer.port(peer)}], 2)
+
+    {coordinator, conn, path} = open_shard!(id)
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+    wal = path <> "-wal"
+
+    for n <- [a, b, laggard], do: Follower.seed(n, id, 0, 0, 0, 0)
+
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+    assert :ok = Session.commit(id, wal, coordinator)
+    early = byte_size(File.read!(wal))
+
+    for n <- 2..4 do
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?1)", [n])
+      assert :ok = Session.commit(id, wal, coordinator)
+    end
+
+    converged = File.read!(wal)
+    for n <- [a, b, laggard], do: await_wal(n, id, converged)
+
+    # Rewind the laggard, exactly as the flaky test does.
+    File.write!(Follower.wal_path(laggard, id), binary_part(converged, 0, early))
+    {:ok, epoch} = Fathom.Shard.epoch(coordinator)
+    {:ok, %{ckpt_seq: gen}} = Wal.read(wal)
+    Follower.seed(laggard, id, epoch, gen, 0, early)
+
+    # HOLD the laggard's answer to the next commit. a and b carry the quorum, so the commit still
+    # succeeds — which is precisely the trap: nothing about the tenant's write looks wrong.
+    :ok = Fathom.Test.PausablePeer.pause(peer)
+
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (5)", [])
+    assert :ok = Session.commit(id, wal, coordinator)
+    assert_receive {:peer_frame, :to_primary, _}, 2_000, "the laggard never answered at all"
+    assert Fathom.Test.PausablePeer.held(peer) >= 1
+
+    # NO write before this one — the `ship_async/1` path, with the laggard as the whole push list.
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    {:ok, _} = Fathom.Test.PausablePeer.release(peer)
+    target = File.read!(wal)
+
+    # PINS CURRENT BEHAVIOUR, and it is a gap rather than a correctness bug: the laggard holds a
+    # PREFIX of the primary's WAL (never wrong bytes), it is simply behind. On a shard that keeps
+    # writing this self-heals on the next commit; on a QUIET one — the premise of the test above —
+    # it stays behind for as long as the shard stays quiet, which is an RPO window nobody is told
+    # about.
+    #
+    # WHEN THIS GAP IS FIXED this assertion flips: delete the `refute` and assert convergence
+    # instead. It is written as a `refute` on purpose so the fix cannot land silently.
+    refute await_wal_quiet(laggard, id, target, 1_500),
+           "the laggard converged on its own — the strand is fixed, so flip this assertion to " <>
+             "assert convergence and delete the follow-up write below"
+
+    assert File.read!(Follower.wal_path(laggard, id)) ==
+             binary_part(target, 0, byte_size(File.read!(Follower.wal_path(laggard, id)))),
+           "the laggard holds bytes that are not a prefix of the primary's WAL — that would be " <>
+             "divergence, which is a different and much worse bug than being behind"
+
+    # And the bound: one more write on the shard catches it up, so the strand is not permanent.
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (6)", [])
+    assert :ok = Session.commit(id, wal, coordinator)
+    await_wal(laggard, id, File.read!(wal))
+  end
+
+  # `await_wal/4` flunks on timeout; this reports instead, so a test can assert NON-convergence
+  # without the failure being the thing it is measuring.
+  defp await_wal_quiet(name, id, expected, timeout) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    Stream.repeatedly(fn ->
+      cond do
+        File.read(Follower.wal_path(name, id)) == {:ok, expected} -> true
+        System.monotonic_time(:millisecond) > deadline -> false
+        true -> Process.sleep(25) && nil
+      end
+    end)
+    |> Enum.find(&is_boolean/1)
+  end
+
   # The wire-level guarantees are pinned in `replication_seed_chunk_test.exs`, which drives the
   # protocol directly. This one covers what that cannot: the SENDING half — `Session.do_seed/5`
   # walking a real shard file with `pread` a chunk at a time, in the right part order, and the

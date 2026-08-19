@@ -147,6 +147,67 @@ defmodule Fathom.Shard.ReplicationTransportTest do
     end
   end
 
+  # THE FIXTURE THIS CLASS ALWAYS LACKED — see `Fathom.Test.PausablePeer`.
+  #
+  # `black_hole!/1` above models a peer that is GONE. A straggler is a peer that is LATE, and until
+  # now nothing could express one: `Follower` answers from an unlinked `Task`, so it cannot be
+  # suspended. That gap is why `replication_seed_test.exs:553` ("a quiet shard catches a laggard up
+  # without waiting on it") has been an unreproducible CI flake since 2026-08-14 — the diagnosis
+  # needed a follower that receives a push and withholds its reply.
+  describe "a LATE follower (pausable peer)" do
+    test "holds its reply, so the next push for that shard is refused before it reaches the wire" do
+      port = start_follower_named!(:pp_follower)
+      peer = start_supervised!({Fathom.Test.PausablePeer, upstream_port: port, notify: self()})
+      Follower.seed(:pp_follower, "acme", 1, 1, 0, 0)
+
+      ship = start_shipper!(:pp_ship, Fathom.Test.PausablePeer.port(peer))
+
+      p1 = %Push{shard_id: "acme", epoch: 1, wal_gen: 1, salt1: 1, offset: 0, payload: @payload}
+
+      # PAUSED: the follower still RECEIVES and applies the bytes — only the answer is withheld.
+      # That is the whole difference from a black hole, and it is what makes this a straggler.
+      :ok = Fathom.Test.PausablePeer.pause(peer)
+      Shipper.push(ship, p1)
+
+      assert_receive {:peer_frame, :to_follower, _}, 2_000
+      assert_receive {:peer_frame, :to_primary, _}, 2_000, "the follower never answered at all"
+      assert Fathom.Test.PausablePeer.held(peer) == 1, "the reply should be held, not delivered"
+
+      # The primary has had no answer, so the shipper still holds this shard's single waiter.
+      Shipper.push(ship, %Push{p1 | offset: byte_size(@payload)})
+      assert_receive {:repl_reply, _, {:reject, "acme", :already_in_flight, 0}}, 2_000
+
+      # And it was refused BEFORE the socket — nothing new crossed to the follower.
+      refute_receive {:peer_frame, :to_follower, _}, 300
+
+      # Releasing settles the first push normally, proving the peer is a real follower throughout
+      # and that the fixture is not simply eating traffic.
+      assert {:ok, 1} = Fathom.Test.PausablePeer.release(peer)
+      assert_receive {:repl_reply, _, {:ack, "acme", next}}, 2_000
+      assert next == byte_size(@payload)
+    end
+
+    test "once released, the shard accepts pushes again — the fixture is not a one-way trapdoor" do
+      port = start_follower_named!(:pp2_follower)
+      peer = start_supervised!({Fathom.Test.PausablePeer, upstream_port: port, notify: self()})
+      Follower.seed(:pp2_follower, "acme", 1, 1, 0, 0)
+      ship = start_shipper!(:pp2_ship, Fathom.Test.PausablePeer.port(peer))
+
+      p = %Push{shard_id: "acme", epoch: 1, wal_gen: 1, salt1: 1, offset: 0, payload: @payload}
+
+      :ok = Fathom.Test.PausablePeer.pause(peer)
+      Shipper.push(ship, p)
+      assert_receive {:peer_frame, :to_primary, _}, 2_000
+      assert {:ok, 1} = Fathom.Test.PausablePeer.release(peer)
+      assert_receive {:repl_reply, _, {:ack, "acme", _}}, 2_000
+
+      # A second, contiguous push now behaves exactly as against a direct follower.
+      Shipper.push(ship, %Push{p | offset: byte_size(@payload)})
+      assert_receive {:repl_reply, _, {:ack, "acme", next}}, 2_000
+      assert next == byte_size(@payload) * 2
+    end
+  end
+
   # A peer that accepts a connection, answers NOTHING ever, and whose death is a real socket death.
   #
   # THIS IS NOT A CONVENIENCE, IT IS THE ONLY WAY TO REACH THE PATH. A node dying has to reach

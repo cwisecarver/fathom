@@ -44,6 +44,23 @@ defmodule Fathom.Shard.Replication.Session do
 
   @registry Fathom.Shard.Replication.SessionRegistry
 
+  # Reject reasons after which NO reply is outstanding from that follower, so its `inflight`
+  # expectation can be dropped. Everything here is either the follower's own answer
+  # (`:stale_wal_gen`, `:stale_epoch`, `:unknown_shard`, `:internal`) or a dead socket
+  # (`:disconnected`, where `Shipper.drop/2` has already failed every waiter on it).
+  #
+  # DELIBERATELY ABSENT: `:already_in_flight` and `:overloaded`. Both are generated LOCALLY by our
+  # own `Shipper` — the frame never reached the follower, which is therefore still on the hook for
+  # an EARLIER push. Clearing on those discards the expectation that the earlier reply needs, and
+  # `reconcile/2`'s `:offset_mismatch` branch then finds nothing and throws the correction away, so
+  # the primary never learns where the follower actually is and re-plans from a position it has
+  # already been told is wrong — a laggard stranded permanently rather than for one round.
+  #
+  # Found by `replication_seed_test.exs`'s "a held laggard reply strands it" once
+  # `Fathom.Test.PausablePeer` made the race deterministic; it is a regression this list narrows
+  # from the first draft of `3a6c6a3`, which cleared on every reason.
+  @settled_rejects [:disconnected, :stale_wal_gen, :stale_epoch, :unknown_shard, :internal]
+
   # ------------------------------------------------------------------------------------------
   # api
   # ------------------------------------------------------------------------------------------
@@ -560,16 +577,21 @@ defmodule Fathom.Shard.Replication.Session do
             %{acc | followers: Map.put(acc.followers, key, %{pos | offset: at}), inflight: rest}
         end
 
-      # EVERY OTHER REASON STILL ENDS THE WAIT. `inflight` means "this follower still owes us a
-      # reply", and `:disconnected` / `:already_in_flight` / `:stale_wal_gen` / `:overloaded` are
-      # all replies. Leaving the entry made the map claim a follower was mid-flight forever, which
-      # `settle_inflight/3` then burns a deadline on, and which any future "skip the busy
-      # followers" logic would read as permanently busy.
+      # A reason after which nothing is outstanding ENDS THE WAIT. `inflight` means "this follower
+      # still owes us a reply", and leaving these behind made the map claim a follower was mid-flight
+      # forever — which `settle_inflight/3` then burns a whole deadline on.
       #
       # Only `:offset_mismatch` above CONSUMES the entry (it needs the recorded generation and salt
-      # to build the correction); the rest merely drop it.
-      {shipper, _reason, _at}, acc ->
+      # to build the correction); these merely drop it. `:already_in_flight` and `:overloaded` fall
+      # through to the catch-all and KEEP it — see `@settled_rejects` for why that distinction is
+      # load-bearing rather than tidy.
+      {shipper, reason, _at}, acc when reason in @settled_rejects ->
         %{acc | inflight: Map.delete(acc.inflight, resolve(shipper))}
+
+      # Our own shipper refused locally; the follower never saw this frame and still owes a reply to
+      # an earlier one. Keep the expectation so that reply can still be reconciled.
+      _local_refusal, acc ->
+        acc
     end)
   end
 
