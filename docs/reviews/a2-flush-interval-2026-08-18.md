@@ -144,6 +144,41 @@ None of this separates "fathom saturates" from "this box saturates": five nodes,
 MinIO, Postgres and nginx share 12 vCPUs, and every write ships to four peers. That is exactly the
 question `docs/a2-bare-metal-plan.md` exists to answer.
 
+## The flush interval matters at 1024 too — 5.6x throughput, 21x errors
+
+The earlier version of this report said the flush interval's role at 1024 was **confounded**: it was
+changed between two runs that both produced no result, so it had only ever been isolated at 512.
+Closed with the missing cell — same image, same fixed driver, same 300 s worker budget, both arms on
+a freshly restarted rig, only the flush differs:
+
+| 1024 tenants | flush = 5,000 | flush = 30,000 |
+|---|---|---|
+| txn/s | **500.0** | **2,775.9** (5.6x) |
+| errors | 253,081 (62%) | 12,042 (2.9%) |
+| shed | **0** | **0** |
+| `:overloaded` | **66,441 / 69,270** | 8,419 / 9,294 |
+| `:already_in_flight` | 6,173 / 4,204 | 20,079 / 27,959 |
+| node binary | 32 / 23 MB | 30 / 33 MB |
+
+Same mechanism as at 512 and even more pronounced: `:overloaded` explodes ~8x and dominates every
+other reject, because a checkpoint every 5 s means shards periodically re-ship their WHOLE WAL and
+that is what fills the per-node byte budget. Note `:already_in_flight` runs *lower* in the bad arm —
+fewer pushes even get attempted, because the budget refuses them first. Memory stays bounded and low
+in both arms (23–32 MB), so the budget is working hard and correctly.
+
+### The clean decomposition this finally allows
+
+**`shed 0` in BOTH arms** is the load-bearing detail. It means the driver fix is independent of the
+flush setting, and the three contributions separate cleanly:
+
+| change | what it determines |
+|---|---|
+| the feedback-loop cap + byte budget (`ca5f377`) | **whether the nodes survive at all** |
+| the driver's `timeout: :infinity` (`b516ada`) | **whether you get a result at all** |
+| `SHARD_FLUSH_INTERVAL_MS` | **whether that result is good** (2,776 txn/s / 2.9%) or bad (500 / 62%) |
+
+All three were required. Only the first was fathom's product code.
+
 ## What the 1024 numbers still say is saturating
 
 `:already_in_flight` 20,079 / 27,959 and `:overloaded` 8,419 / 9,294 per node. The byte budget IS
@@ -187,7 +222,9 @@ could not ask the question; it can now, and the answer is 2,776 txn/s with nothi
 
 ## An open confound, recorded rather than hidden
 
-The flush=5,000 arm above (22,599 errors) is worse than the 2026-08-17 run at the same setting
+**Partly closed:** the flush interval's effect at 1024 is no longer confounded — see the 1024 A/B
+above (5.6x throughput, 21x errors). What remains open is a different, narrower thing:
+the flush=5,000 arm at 512 (22,599 errors) is worse than the 2026-08-17 run at the same setting
 (9,480 errors). Those are **different images** — this one carries the `inflight` retention fix
 (`3a6c6a3`) — so the two are not comparable and the difference is unattributed. Two candidates: the
 fix lets the catch-up loop stop waiting on followers that already answered, so it may now re-ship
