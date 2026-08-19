@@ -1489,7 +1489,12 @@ defmodule Fathom.ShardDurabilityTest do
     assert :sys.get_state(coordinator).flush_failures == 0,
            "a durable flush must reset the consecutive-failure counter (recovery contract)"
 
-    refute_received {:flush_failed, _, _}
+    # PIN THE SHARD. This event is GLOBAL (`[:fathom, :shard, :flush, :failed]`), so an unpinned
+    # `refute_received` fails whenever any CONCURRENT test's shard happens to emit one — it caught
+    # `dur_26054` while this test never opens that shard. Identical to the bug already fixed at the
+    # top of this file for the escalating-telemetry test; the pattern survived in this one because
+    # every OTHER assertion here pins the shard and only the refute did not.
+    refute_received {:flush_failed, _, %{shard_id: ^shard}}
 
     ShardExecutor.close(conn)
   end

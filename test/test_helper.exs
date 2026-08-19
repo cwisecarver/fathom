@@ -3,6 +3,11 @@
 # :bench tests are hot-path floor/ceiling guards (seconds of setup each) and are
 # excluded by default. Run with: mix test --include bench  (see test/fathom/bench_test.exs).
 #
+# :flaky is a scenario that reproduces a real behaviour but not RELIABLY, and is excluded so it
+# cannot become the unattributable CI failure it is meant to explain. It is not a parking space for
+# tests nobody wants to fix: each one must say, in the test itself, what it reproduces, at what
+# rate, and what would have to be understood to un-tag it. Run with: mix test --include flaky.
+#
 # :wal_probe tests need the FATHOM_WAL_PROBE=1 read-back functions, which the loadable extension
 # registers from OS env — and `System.put_env` CANNOT turn them on, because it updates the BEAM's
 # internal environment table, not the C `environ` that Rust's `std::env::var` reads. So the flag
@@ -64,7 +69,7 @@ end
 # manifest — a flake you can't name is a flake you can't fix. Alongside the CLI formatter, so
 # console output is unchanged; writes nothing on a green run.
 ExUnit.start(
-  exclude: [:s3, :bench, :wal_probe],
+  exclude: [:s3, :bench, :wal_probe, :flaky],
   formatters: [ExUnit.CLIFormatter, Fathom.FailureCaptureFormatter]
 )
 

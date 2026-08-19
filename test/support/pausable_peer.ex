@@ -49,7 +49,7 @@ defmodule Fathom.Test.PausablePeer do
   # across the pause boundary and deliver half a reply.
   @sockopts [:binary, packet: 4, active: true, reuseaddr: true, nodelay: true]
 
-  defstruct [:lsock, :down, :up, :upstream_port, :notify, paused: false, held: []]
+  defstruct [:lsock, :down, :up, :upstream_port, :notify, paused: false, held: [], pending: []]
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
@@ -76,15 +76,7 @@ defmodule Fathom.Test.PausablePeer do
   @impl true
   def init(opts) do
     {:ok, lsock} = :gen_tcp.listen(0, @sockopts)
-    me = self()
-
-    # Accept in a linked helper, then hand the socket to THIS process so every subsequent
-    # `{:tcp, _, _}` lands in `handle_info/2` and dies with the GenServer.
-    spawn_link(fn ->
-      {:ok, sock} = :gen_tcp.accept(lsock)
-      :ok = :gen_tcp.controlling_process(sock, me)
-      send(me, {:accepted, sock})
-    end)
+    accept_next(lsock, self())
 
     {:ok,
      %__MODULE__{
@@ -110,11 +102,42 @@ defmodule Fathom.Test.PausablePeer do
     {:reply, {:ok, length(state.held)}, %{state | paused: false, held: []}}
   end
 
+  # DATA CAN BEAT THE ACCEPT NOTIFICATION. The acceptor calls `controlling_process/2` and THEN sends
+  # `{:accepted, sock}`, but once ownership transfers the kernel may deliver buffered `{:tcp, _, _}`
+  # straight to this process — and those two messages are not ordered relative to each other. Before
+  # this clause such a frame matched neither the `down:` nor the `up:` clause, fell through the
+  # catch-all and was silently DROPPED, which presented as the first push after connect vanishing.
+  #
+  # Buffer instead: `handle_info({:accepted, _}, _)` flushes these the moment the upstream leg is up.
   @impl true
+  def handle_info({:tcp, sock, frame}, %{up: nil} = state) do
+    {:noreply, %{state | down: sock, pending: [frame | state.pending]}}
+  end
+
   def handle_info({:accepted, sock}, state) do
+    # ACCEPT REPEATEDLY, not once. A `Shipper` reconnects 500 ms after ANY socket error, and the
+    # first version of this module accepted exactly one connection — so a reconnect completed the
+    # TCP handshake against the listen backlog and then sat there with nobody accepting it, and
+    # every frame after that vanished. It presented as the proxied follower simply never converging,
+    # intermittently, which is indistinguishable from the product bug this fixture exists to study.
+    #
+    # A fixture that cannot survive an ordinary reconnect cannot be trusted to report one, which is
+    # the same lesson that motivated the module in the first place — arrived at the hard way, from
+    # the inside.
+    for old <- [state.down, state.up], old != nil, do: :gen_tcp.close(old)
+    accept_next(state.lsock, self())
+
     # Connect upstream only once a client has arrived, so a peer that is never used opens nothing.
     {:ok, up} = :gen_tcp.connect(~c"127.0.0.1", state.upstream_port, @sockopts, 5_000)
-    {:noreply, %{state | down: sock, up: up}}
+
+    # A reconnect means the primary abandoned whatever it was waiting for, so held frames belong to
+    # a socket that no longer exists. Dropping them is correct; delivering them down the NEW socket
+    # would be the fixture inventing a reply.
+    # Oldest first — these are frames that arrived before the upstream leg existed.
+    for frame <- Enum.reverse(state.pending), do: :gen_tcp.send(up, frame)
+    for _ <- state.pending, do: notify(state, :to_follower)
+
+    {:noreply, %{state | down: sock, up: up, held: [], pending: []}}
   end
 
   # Primary -> follower. ALWAYS forwarded, even while paused: the follower must genuinely receive and
@@ -149,6 +172,23 @@ defmodule Fathom.Test.PausablePeer do
 
   defp send_down(%{down: down}, frame) when down != nil, do: :gen_tcp.send(down, frame)
   defp send_down(_state, _frame), do: :ok
+
+  # One acceptor at a time, handing the socket to the GenServer so every `{:tcp, _, _}` lands in
+  # `handle_info/2` and dies with it. Re-armed on each accept, so reconnects are served.
+  defp accept_next(lsock, owner) do
+    spawn_link(fn ->
+      case :gen_tcp.accept(lsock) do
+        {:ok, sock} ->
+          :ok = :gen_tcp.controlling_process(sock, owner)
+          send(owner, {:accepted, sock})
+
+        # The listener closed because the peer is shutting down. Exiting quietly keeps teardown from
+        # logging a spurious crash for a linked process doing exactly what it should.
+        {:error, :closed} ->
+          :ok
+      end
+    end)
+  end
 
   # Lets a test synchronise on frames actually crossing the wire instead of sleeping — the same
   # reason `black_hole!/1` reports `{:black_hole_push, _}`.

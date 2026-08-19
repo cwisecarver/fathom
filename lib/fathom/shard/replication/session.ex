@@ -291,7 +291,17 @@ defmodule Fathom.Shard.Replication.Session do
   # correct, and thrown away.
   @impl true
   def handle_info({:repl_reply, from, {:ack, _shard, next}}, state) do
-    {:noreply, settle_late_ack(state, from, next)}
+    # `forget_inflight/2` for the same reason `drain_late_replies/2` and `settle_inflight/3` do it:
+    # `settle_late_ack/3` deliberately declines to advance an ack for a position we did not record
+    # (believing it would move the primary past bytes the follower does not hold) — but the follower
+    # HAS answered, so the expectation must go either way. Without this the entry survived a
+    # mismatched late ack and `inflight` claimed that follower was still mid-flight forever.
+    #
+    # This clause was the one place the rule was not applied, which is exactly the shape of gap a
+    # rule spread across three call sites produces. Found as a full-suite flake in
+    # `replication_commit_test.exs`'s "a follower that rejects is no longer recorded as owing a
+    # reply", not by reading.
+    {:noreply, state |> settle_late_ack(from, next) |> forget_inflight(from)}
   end
 
   def handle_info({:repl_reply, from, {:reject, _shard, reason, follower_offset}}, state) do
