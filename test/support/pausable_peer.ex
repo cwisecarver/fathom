@@ -160,6 +160,15 @@ defmodule Fathom.Test.PausablePeer do
     end
   end
 
+  # The FOLLOWER closed. Mirror it onto the client, which is what a direct connection would show,
+  # rather than leaving the primary talking into a proxy whose far end is gone. Surfaced through
+  # `notify/2` so a test can tell this apart from a frame simply being slow.
+  def handle_info({:tcp_closed, sock}, %{up: sock} = state) do
+    if state.down, do: :gen_tcp.close(state.down)
+    notify(state, :upstream_closed)
+    {:noreply, %{state | down: nil, up: nil, held: [], pending: []}}
+  end
+
   def handle_info({:tcp_closed, _}, state), do: {:noreply, state}
   def handle_info({:tcp_error, _, _}, state), do: {:noreply, state}
   def handle_info(_, state), do: {:noreply, state}
@@ -176,16 +185,23 @@ defmodule Fathom.Test.PausablePeer do
   # One acceptor at a time, handing the socket to the GenServer so every `{:tcp, _, _}` lands in
   # `handle_info/2` and dies with it. Re-armed on each accept, so reconnects are served.
   defp accept_next(lsock, owner) do
+    # `spawn_link`, so the acceptor dies with the peer — but that link cuts BOTH ways, and an
+    # abnormal exit here takes the peer down with it, closing both sockets. The primary then sees
+    # `:disconnected` out of nowhere, which is indistinguishable from the transport failure this
+    # fixture is used to study. It was diagnosed exactly that way: a test asserting an ack got
+    # `{:reject, "acme", :disconnected, 0}` instead.
+    #
+    # So every failure path here exits NORMALLY. `accept/1` can return errors other than `:closed`
+    # during teardown, and `controlling_process/2` fails outright if the socket died between accept
+    # and transfer — as a bare `:ok = ...` match that was a `MatchError`, i.e. an abnormal exit.
     spawn_link(fn ->
-      case :gen_tcp.accept(lsock) do
-        {:ok, sock} ->
-          :ok = :gen_tcp.controlling_process(sock, owner)
-          send(owner, {:accepted, sock})
-
-        # The listener closed because the peer is shutting down. Exiting quietly keeps teardown from
-        # logging a spurious crash for a linked process doing exactly what it should.
-        {:error, :closed} ->
-          :ok
+      with {:ok, sock} <- :gen_tcp.accept(lsock),
+           :ok <- :gen_tcp.controlling_process(sock, owner) do
+        send(owner, {:accepted, sock})
+      else
+        # Includes the ordinary teardown case (the listener closed), which must not look like a
+        # crash: a linked process doing exactly what it should should not log one.
+        _ -> :ok
       end
     end)
   end
