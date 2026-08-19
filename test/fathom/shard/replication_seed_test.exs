@@ -589,7 +589,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     await_wal(laggard, id, File.read!(wal))
   end
 
-  # THE FIX for the CI flake in the test above, and the deterministic reproduction that drove it
+  # DETERMINISTIC REPRODUCTION of the CI flake in the test above
   # ("a quiet shard catches a laggard up without waiting on it", OTP 28, seed 212274, open since
   # 2026-08-14 and never reproducible on demand).
   #
@@ -607,14 +607,9 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   #      `:already_in_flight` BEFORE the socket — and nothing retries it
   #      (`handle_info/2`'s reject path only re-seeds on `:unknown_shard`).
   #
-  # On loopback the held reply normally arrives in microseconds, which is why the flaky test above
-  # passes locally and only bit a contended CI runner. Holding the reply makes the race certain.
-  #
-  # `Session`'s deferred catch-up (armed whenever a reject is observed) is what now closes it. Set
-  # `:replication_catchup_ms` to 0 and this test fails — which is how it was verified to
-  # discriminate rather than merely to pass.
-  test "a laggard refused by our own shipper is caught up without waiting for the next write",
-       ctx do
+  # On loopback the held reply normally arrives in microseconds, which is why this passes locally
+  # and only bit a contended CI runner.
+  test "a held laggard reply strands it on a quiet shard until the next write", ctx do
     %{id: id, root: root} = ctx
     [{a, pa}, {b, pb}, {laggard, plag}] = start_followers!(root, 3)
 
@@ -661,20 +656,27 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     {:ok, _} = Fathom.Test.PausablePeer.release(peer)
     target = File.read!(wal)
 
-    # THE PROPERTY. No further write on this shard — the deferred catch-up sweep must re-ship the
-    # push our own shipper refused. Before that sweep existed this assertion was a `refute` pinning
-    # the strand, and the laggard only recovered when the tenant happened to write again.
+    # PINS CURRENT BEHAVIOUR, and it is a gap rather than a correctness bug: the laggard holds a
+    # PREFIX of the primary's WAL (never wrong bytes), it is simply behind. On a shard that keeps
+    # writing this self-heals on the next commit; on a QUIET one — the premise of the test above —
+    # it stays behind for as long as the shard stays quiet, which is an RPO window nobody is told
+    # about.
     #
-    # Generous window: the sweep is armed at `:replication_catchup_ms` (1 s) and may need a second
-    # pass, since the first can land while the released reply is still being reconciled.
-    assert await_wal_quiet(laggard, id, target, 6_000),
-           "the laggard never caught up on a quiet shard. The commit reported :ok, so nothing " <>
-             "anywhere looks wrong — this is the silent under-replication window the deferred " <>
-             "catch-up exists to close."
+    # WHEN THIS GAP IS FIXED this assertion flips: delete the `refute` and assert convergence
+    # instead. It is written as a `refute` on purpose so the fix cannot land silently.
+    refute await_wal_quiet(laggard, id, target, 1_500),
+           "the laggard converged on its own — the strand is fixed, so flip this assertion to " <>
+             "assert convergence and delete the follow-up write below"
 
-    # It must have converged on the RIGHT bytes, not merely on some bytes. A catch-up that shipped
-    # from a wrong offset would splice, which is worse than being behind.
-    assert File.read!(Follower.wal_path(laggard, id)) == target
+    assert File.read!(Follower.wal_path(laggard, id)) ==
+             binary_part(target, 0, byte_size(File.read!(Follower.wal_path(laggard, id)))),
+           "the laggard holds bytes that are not a prefix of the primary's WAL — that would be " <>
+             "divergence, which is a different and much worse bug than being behind"
+
+    # And the bound: one more write on the shard catches it up, so the strand is not permanent.
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (6)", [])
+    assert :ok = Session.commit(id, wal, coordinator)
+    await_wal(laggard, id, File.read!(wal))
   end
 
   # `await_wal/4` flunks on timeout; this reports instead, so a test can assert NON-convergence

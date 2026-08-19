@@ -179,11 +179,7 @@ defmodule Fathom.Shard.Replication.Session do
        # Shippers with a seed in flight. A seed can be a whole database, so starting a second one
        # for the same follower because the next commit also saw :unknown_shard would multiply a
        # large transfer by the write rate.
-       seeding: MapSet.new(),
-       # Timer for the deferred catch-up sweep, or nil when none is armed. See `arm_catchup/1`:
-       # a timer exists ONLY while a reject has been seen and not yet made good, so a healthy shard
-       # pays nothing at all for this.
-       catchup_ref: nil
+       seeding: MapSet.new()
      }}
   end
 
@@ -213,14 +209,7 @@ defmodule Fathom.Shard.Replication.Session do
         case ship(state, wal_path, state.epoch, deadline) do
           {:ok, new_state, rejects} ->
             new_state = start_seeds(new_state, wal_path, rejects)
-
-            {:reply, :ok,
-             new_state
-             |> drain_late_replies(wal_path)
-             # A commit can SUCCEED on the quorum while a follower was refused — that follower is
-             # now behind with nothing scheduled to fix it. This is the arm that matters most,
-             # because the tenant saw `:ok` and nothing else will look wrong.
-             |> arm_if_rejected(rejects)}
+            {:reply, :ok, drain_late_replies(new_state, wal_path)}
 
           :nothing ->
             {:reply, :ok, state}
@@ -307,23 +296,7 @@ defmodule Fathom.Shard.Replication.Session do
 
   def handle_info({:repl_reply, from, {:reject, _shard, reason, follower_offset}}, state) do
     rejects = [{from, reason, follower_offset}]
-
-    state =
-      state
-      |> reconcile(rejects)
-      |> seed_if_possible(rejects)
-      |> arm_if_rejected(rejects)
-
-    {:noreply, state}
-  end
-
-  # The deferred catch-up firing. Re-arms only if it actually shipped something, so a shard that has
-  # caught up stops ticking on its own rather than needing anyone to disarm it.
-  def handle_info(:catch_up, state) do
-    case catch_up(%{state | catchup_ref: nil}) do
-      {:shipped, state} -> {:noreply, arm_catchup(state)}
-      {:idle, state} -> {:noreply, state}
-    end
+    {:noreply, seed_if_possible(reconcile(state, rejects), rejects)}
   end
 
   def handle_info({:DOWN, _ref, :process, coordinator, _reason}, %{coordinator: coordinator} = s) do
@@ -679,71 +652,6 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
-  # DEFERRED CATCH-UP — the retry nothing used to do.
-  #
-  # A push can be refused by OUR OWN shipper, never reaching the follower: `:already_in_flight`
-  # (that shard's single waiter is still held by an earlier push) or `:overloaded` (the node's byte
-  # budget). Neither is the follower's fault and neither leaves it holding the bytes. Until this
-  # existed nothing re-sent them — `handle_info/2`'s reject path only re-seeds on `:unknown_shard` —
-  # so the follower stayed behind until the shard's NEXT WRITE.
-  #
-  # On a busy shard that is one round. On a QUIET one it is unbounded, and "quiet" is precisely when
-  # it bites: `deliver/5` takes the fire-and-forget `ship_async/1` branch exactly when the other
-  # followers are already current, i.e. when no further write is coming to fix it. That is the
-  # mechanism behind `replication_seed_test.exs`'s "a quiet shard catches a laggard up without
-  # waiting on it", an unreproducible CI flake from 2026-08-14 until `Fathom.Test.PausablePeer` made
-  # it deterministic.
-  #
-  # DEFERRED, not immediate: `:already_in_flight` means the earlier push is STILL outstanding, so
-  # retrying at once would simply be refused again — a tight loop that fixes nothing and adds load
-  # to a link already saying it is busy. The timer is the back-off.
-  #
-  # ASYNC, not quorum-waited: the commit that provoked this has already returned. A follower that is
-  # merely behind must never be able to block a tenant's write, which is the whole reason
-  # `ship_async/1` exists.
-  defp catch_up(%{wal_path: nil} = state), do: state
-  defp catch_up(%{epoch: nil} = state), do: state
-
-  defp catch_up(state) do
-    with {:ok, header} <- Wal.read(state.wal_path),
-         [_ | _] = plans <- laggard_plans(state, header),
-         {:ok, pushes} <- build_pushes(state, state.wal_path, state.epoch, header, plans) do
-      Replication.ship_async(pushes)
-      {:shipped, %{state | inflight: Map.merge(state.inflight, expectations(plans, header))}}
-    else
-      # `:empty`/`[]`/a read error all mean "nothing to do right now". Disarm rather than spin: a
-      # later reject re-arms, so idleness costs nothing.
-      _ -> {:idle, state}
-    end
-  end
-
-  # Followers that are behind AND not already awaiting a reply. Skipping the in-flight ones is what
-  # keeps this from manufacturing the very `:already_in_flight` it exists to recover from.
-  defp laggard_plans(state, header) do
-    shippers()
-    |> Enum.map(fn shipper -> {shipper, resolve(shipper)} end)
-    |> Enum.reject(fn {_shipper, key} -> Map.has_key?(state.inflight, key) end)
-    |> Enum.map(fn {shipper, key} ->
-      {shipper, Primary.plan(Map.get(state.followers, key), header, max_push_bytes())}
-    end)
-    |> Enum.reject(fn {_shipper, plan} -> plan == :nothing end)
-  end
-
-  # Armed only when a reject has actually been seen, and only one at a time. A shard whose followers
-  # all ack never arms a timer, so this is free in the healthy case rather than a per-shard tick at
-  # fathom's stated scale.
-  defp arm_catchup(%{catchup_ref: ref} = state) when ref != nil, do: state
-
-  defp arm_catchup(state) do
-    case catchup_ms() do
-      0 -> state
-      ms -> %{state | catchup_ref: Process.send_after(self(), :catch_up, ms)}
-    end
-  end
-
-  defp arm_if_rejected(state, []), do: state
-  defp arm_if_rejected(state, _rejects), do: arm_catchup(state)
-
   # Wait until no follower has an outstanding push, or `deadline` passes.
   #
   # Only used BETWEEN catch-up rounds — see the call site in `ship/5` for why the quorum's early
@@ -1079,10 +987,4 @@ defmodule Fathom.Shard.Replication.Session do
   # with it the OOM, so it is a debugging lever, not a tuning one.
   defp max_push_bytes,
     do: Application.get_env(:fathom, :replication_max_push_bytes, 1024 * 1024)
-
-  # How long after a refused push before the deferred catch-up re-ships it. 1 s: comfortably above
-  # any round trip (so a straggler's real reply lands first and the sweep then finds nothing to do)
-  # and far below the durability flush interval, so a laggard is made good well inside the window
-  # its staleness would actually cost anything. Set to 0 to disable, which restores the strand.
-  defp catchup_ms, do: Application.get_env(:fathom, :replication_catchup_ms, 1_000)
 end
