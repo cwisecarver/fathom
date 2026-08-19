@@ -2,7 +2,9 @@
 
 **Two harness defects, one day, both of which had been recorded as fathom limits.** Fixing the
 first took 512 from 22,599 errors to 4; fixing the second answered the 1024-tenant question that
-had been open since 2026-08-14, at **2,776 txn/s with zero tenants shed**.
+had been open since 2026-08-14, at **2,776 txn/s with zero tenants shed**. With a harness that
+finally reports honestly, the ceiling is now bracketed: **1024 clean, 2048 collapsed, nodes alive
+throughout.**
 
 A single-variable A/B, same image, rig restarted between arms. Changing
 `SHARD_FLUSH_INTERVAL_MS` from the rig's 5,000 to a realistic 30,000 took the 512-tenant
@@ -102,6 +104,45 @@ shed** — an apparent catastrophic regression. It was the rig: three heavy runs
 restart, which is exactly the contamination signature AGENTS.md describes (run 1 healthy, runs 2–3
 collapse). A full `down`/`up` and the same command gave 2,775.9 txn/s with **0** shed. Without the
 column that run would have looked like a fathom collapse rather than a dirty rig.
+
+## 2048 is past the ceiling, and the cliff is sharp
+
+Run on a freshly restarted rig with a 20-minute per-worker budget, so the driver's own deadline
+could not be what was measured:
+
+    2048   819200 txns   257.7 txn/s   p50 124ms  p95 1376ms  p99 4939ms   506196 errs   shed 814
+
+* **257.7 txn/s against 2,775.9 at 1024** — a 10.8x collapse for a 2x load increase.
+* **814 of 2048 tenants shed** (40%): they did not finish 400 transactions inside 20 minutes.
+  Shed work is **64%** of the error count, which is precisely why it is reported separately —
+  read as raw errors this looks like half a million failed transactions rather than 814 tenants
+  that ran out of clock.
+* Sampled mid-run the fleet was moving **32-38 queries/sec per node**, against ~3,900 at 1024.
+
+**All five nodes survived, healthy, with memory bounded** (707 MB and 183 MB against the 1 GiB
+budget). That is the whole point of the byte bound and it is the difference from 2026-08-14, when
+**1024 alone** OOM-killed nodes on a 94 GiB VM. Thoroughly overloaded, fathom now refuses writes
+instead of dying.
+
+`:overloaded` tracks the saturation cleanly across the sweep — **0 at 512, 8,419/9,294 at 1024,
+16,807/12,879 at 2048** — which is the signal to trust when sizing, rather than the raw error count.
+
+### The bracket, and why the shape matters
+
+| tenants | result |
+|---|---|
+| 256 | clean |
+| 512 | clean — 3,340 txn/s, 4 errors |
+| 1024 | **clean — 2,776 txn/s, 0 shed** |
+| 2048 | collapsed — 258 txn/s, 40% shed, nodes alive |
+
+**On this one box ~1024 is the working limit.** Between 1024 and 2048 is a **cliff, not a slope** —
+worth stating because a slope would let an operator run near the edge and read the degradation
+coming. This does not. Whatever headroom signal is used, it cannot be throughput.
+
+None of this separates "fathom saturates" from "this box saturates": five nodes, a load driver,
+MinIO, Postgres and nginx share 12 vCPUs, and every write ships to four peers. That is exactly the
+question `docs/a2-bare-metal-plan.md` exists to answer.
 
 ## What the 1024 numbers still say is saturating
 

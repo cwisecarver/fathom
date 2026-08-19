@@ -175,7 +175,9 @@ noted).
   that `:already_in_flight`, the top reject, is **harmless**. Then the 1024 hang turned out to be
   `Task.async_stream(timeout: :infinity)` in the LOAD DRIVER — one wedged tenant out of 1024 hung
   the whole sweep — and with that bounded, **1024 replicating tenants run clean at 2,776 txn/s with
-  0 tenants shed**, answering the question open since 2026-08-14.
+  0 tenants shed**, answering the question open since 2026-08-14. Brackets the ceiling: **2048
+  collapses** (258 txn/s, 40% of tenants shed) while every node stays healthy and bounded, so
+  1024→2048 is a **cliff, not a slope**.
 - **[reviews/tpc-run-2026-07-10.md](reviews/tpc-run-2026-07-10.md)** — the remote-client TPC run over
   the chaos rig (true cross-LB latency) + the loopback spec-scale TPC-C comparability numbers.
 - **[reviews/latency-cost-2026-07-23.md](reviews/latency-cost-2026-07-23.md)** — what an injected S3

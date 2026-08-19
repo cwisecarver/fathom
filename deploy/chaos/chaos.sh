@@ -1898,7 +1898,13 @@ cmd_tpc_fleet() {
   unset IFS
   for c in "$@"; do
     txns=$(( per_client * c ))
+    # Per-worker wall-clock budget. MUST scale with the sweep: each worker runs `per_client` txns
+    # serially, so at N tenants sharing a fixed fleet throughput the per-worker wall clock grows
+    # LINEARLY with N. Leaving the driver's 300 s default in place at 2048 would shed workers that
+    # were making perfectly good progress, and the run would be measuring the timeout rather than
+    # the fleet. Override with TPC_WORKER_TIMEOUT (ms).
     json=$(tpc_run tpcb --domain "$DOMAIN" --shard "tfleet$c" \
+      --worker-timeout "${TPC_WORKER_TIMEOUT:-300000}" \
       --txns "$txns" --clients "$c" --accounts "$accounts" 2>/dev/null)
     tps=$(printf '%s' "$json" | jq -r '.tpcb_tps // 0')
     p50=$(printf '%s' "$json" | jq -r '.tpcb_p50_us // 0')
