@@ -198,7 +198,24 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
       assert log =~ "quick_check", "the corrupt flush must be refused loudly"
     end
 
-    test "the corrupt local copy is quarantined for recovery", %{shard: shard} do
+    # THIS TEST PREVIOUSLY ASSERTED THE OPPOSITE — that the periodic flush renames the live file to
+    # `<path>.corrupt.<ts>` — and that mechanism is the data-loss defect expert review 2026-08-20 #2
+    # closed. On the periodic path the coordinator keeps running and keeps handing `state.path` to
+    # new checkouts, so renaming it means the next connection creates a brand-new EMPTY database at
+    # that path; the following flush then snapshots the empty file and PUTs it over the good stored
+    # object under a perfectly valid If-Match, destroying the only good copy.
+    #
+    # The old version never caught that because it closes its connection before corrupting, so
+    # nothing re-opened the path. The rename is unsafe regardless of who happens to be connected:
+    # the coordinator is still alive and registered, so a checkout can land the instant after the
+    # rename. Quarantining is correct only on the DROP path, where the coordinator is terminating —
+    # `Fathom.ShardCorruptFlushTest` still pins it there.
+    #
+    # The INVARIANT this test exists for is unchanged and still asserted: the corrupt bytes must be
+    # preserved for forensics, not silently discarded. They now survive in place.
+    test "the corrupt local copy is preserved in place while the shard is still served", %{
+      shard: shard
+    } do
       Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
 
       {:ok, conn} = ShardExecutor.open(shard)
@@ -213,14 +230,21 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
       :ok = flush_now(coordinator)
       :ok = ShardExecutor.close(conn)
 
-      corrupt_index!(db_path(shard))
+      path = db_path(shard)
+      corrupt_index!(path)
       send(coordinator, :write_counter_reset)
       _ = :sys.get_state(coordinator)
 
       capture_log(fn -> flush_now(coordinator) end)
 
-      assert Path.wildcard(db_path(shard) <> ".corrupt.*") != [],
-             "the corrupt copy must be preserved, not silently discarded"
+      assert File.exists?(path),
+             "the live shard file was moved aside while its coordinator was still serving"
+
+      assert Path.wildcard(path <> ".corrupt.*") == [],
+             "the serving path must not rename the live db — a new checkout would recreate it empty"
+
+      assert {:error, _} = Shard.verify_integrity(path),
+             "the corrupt copy must be preserved, not silently discarded or repaired"
     end
 
     test "corrupt-flush telemetry fires from the periodic path too", %{shard: shard} do

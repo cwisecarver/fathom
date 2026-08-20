@@ -1994,21 +1994,69 @@ defmodule Fathom.Shard do
       # would be flushed with a valid If-Match by the legitimate owner — the fence can't help, it's
       # not a steal — permanently clobbering the last good stored object. Refuse the flush (the good
       # object stays authoritative), quarantine the corrupt copy for forensics, and alarm.
-      {:error, {kind, _} = reason} when kind in [:quick_check, :quick_check_failed] ->
-        quarantine_corrupt!(state, reason)
-        {:error, {:corrupt_local, reason}}
-
-      # Checkpoint incomplete (typically busy). Fall back to snapshot_and_upload, whose VACUUM INTO
-      # captures WAL content regardless — and which reads every page, so it fails on corruption on
-      # its own. quick_check is deliberately NOT run on this branch, matching the pre-fold ordering.
+      # This used to key off the tuple tag (`kind in [:quick_check, :quick_check_failed]`), which is
+      # wrong in BOTH directions — see classify_integrity_failure/1 (expert review 2026-08-20 #2).
+      # A transient `:busy` quarantined a healthy local copy along with its unflushed acked writes;
+      # and had the tag list been narrowed to `:quick_check` alone (the reviewer's own suggestion),
+      # a genuinely malformed file would have stopped being quarantined at all, because SQLite
+      # reports bad bytes through the ERROR channel, not as rows.
       {:error, reason} ->
-        Logger.warning(
-          "shard #{state.id}: pre-drop checkpoint incomplete (#{inspect(reason)}); snapshot-flushing instead"
-        )
+        if classify_integrity_failure(reason) == :corrupt do
+          # Integrity failed (expert review 2026-07-14 #4). The checkpoint-then-raw-upload fast path
+          # uploads the bytes as-is, so a locally corrupted db (disk/fs/memory fault, exqlite/OS bug)
+          # would be flushed with a valid If-Match by the legitimate owner — the fence can't help,
+          # it's not a steal — permanently clobbering the last good stored object. Refuse the flush
+          # (the good object stays authoritative), quarantine the corrupt copy, and alarm. Safe here
+          # and only here: the coordinator is terminating and releases the lease.
+          quarantine_corrupt!(state, reason)
+          {:error, {:corrupt_local, reason}}
+        else
+          # Checkpoint incomplete (typically busy), or integrity indeterminate. Fall back to
+          # snapshot_and_upload, whose VACUUM INTO captures WAL content regardless — and which reads
+          # every page, so it fails on corruption on its own.
+          Logger.warning(
+            "shard #{state.id}: pre-drop checkpoint incomplete (#{inspect(reason)}); snapshot-flushing instead"
+          )
 
-        snapshot_and_upload(state)
+          snapshot_and_upload(state)
+        end
     end
   end
+
+  # SQLite reports "these bytes are bad" through TWO different channels, and the difference is not
+  # the tuple tag (expert review 2026-08-20 #2, corrected against a really-corrupted file rather
+  # than against the finding's prescription). A mildly damaged db returns rows describing the
+  # damage — `{:quick_check, rows}`. A badly damaged one makes the query itself ERROR, arriving as
+  # `{:quick_check_failed, "database disk image is malformed"}` — the same shape a plain `:busy`
+  # produces. Measured: overwriting one b-tree page with garbage yields the ERROR form, not rows.
+  #
+  # So classify on the REASON, not the tag. Defaulting to :unknown is the safe direction: both
+  # verdicts refuse the flush, so the stored object is protected either way, and the only cost of
+  # guessing :unknown is a retry — whereas guessing :corrupt discards a healthy local copy on the
+  # drop path, including its unflushed acked writes.
+  @corrupt_messages [
+    "database disk image is malformed",
+    "file is not a database",
+    "malformed database schema",
+    "database corruption"
+  ]
+
+  defp classify_integrity_failure({:quick_check, _}), do: :corrupt
+  defp classify_integrity_failure({:quick_check_failed, reason}), do: corrupt_reason(reason)
+  defp classify_integrity_failure({:quick_check_open_failed, reason}), do: corrupt_reason(reason)
+  defp classify_integrity_failure(_), do: :unknown
+
+  defp corrupt_reason(reason) when is_binary(reason) do
+    down = String.downcase(reason)
+    if Enum.any?(@corrupt_messages, &String.contains?(down, &1)), do: :corrupt, else: :unknown
+  end
+
+  defp corrupt_reason(reason) when is_atom(reason) do
+    if reason in [:corrupt, :not_a_db], do: :corrupt, else: :unknown
+  end
+
+  defp corrupt_reason({_, reason}), do: corrupt_reason(reason)
+  defp corrupt_reason(_), do: :unknown
 
   @doc """
   Stamp provenance on a shard file that was placed in the live data dir out-of-band.
@@ -2059,6 +2107,15 @@ defmodule Fathom.Shard do
   # A local db failed quick_check: move it aside (preserve for forensics) and drop its now-stale
   # WAL/SHM so the next open pulls the last-good stored object instead of adopting the corrupt
   # local copy. Loud error + telemetry so an operator sees it (the good object is still safe).
+  #
+  # ONLY SAFE WHERE THE SHARD IS PROVABLY NOT BEING SERVED — i.e. the drop path, where the
+  # coordinator is terminating and releases the lease (expert review 2026-08-20 #2). Calling this
+  # while streams are checked out renames the live path out from under them AND unlinks the -shm,
+  # so the next connection to open `state.path` creates a BRAND-NEW EMPTY DATABASE: two sets of
+  # connections to one tenant, one seeing data and one seeing nothing. Worse, the shard is still
+  # dirty with an unchanged `state.etag`, so the next periodic flush snapshots that empty file and
+  # PUTs it over the good stored object with a valid If-Match — destroying the only good copy.
+  # The serving path therefore refuses the flush and leaves the file alone; see verify_snapshot/2.
   defp quarantine_corrupt!(state, reason) do
     dest = "#{state.path}.corrupt.#{System.system_time(:second)}"
     _ = File.rename(state.path, dest)
@@ -3022,9 +3079,22 @@ defmodule Fathom.Shard do
         :ok ->
           :ok
 
+        # "I could not check it" is not "it is corrupt" (expert review 2026-08-20 #2). An
+        # Sqlite3.open failure under fd pressure (EMFILE — on a node whose density is the design
+        # premise), a :busy from a concurrent writer, or a :query_timeout on a large quick_check all
+        # used to take the corruption branch. Both verdicts REFUSE the flush, so the good stored
+        # object stays authoritative either way; what differs is the alarm — :corrupt_local is
+        # permanent and escalates on the first occurrence, :integrity_unknown is transient and just
+        # retries next interval.
+        #
+        # NEITHER branch quarantines. This path runs while the shard is being SERVED, and
+        # quarantine_corrupt!/2 renames the live file and unlinks its -shm; see the hazard note on
+        # that function. That rename is what made this a data-loss path rather than a refused flush.
         {:error, reason} ->
-          quarantine_corrupt!(state, reason)
-          {:error, {:corrupt_local, reason}}
+          case classify_integrity_failure(reason) do
+            :corrupt -> {:error, {:corrupt_local, reason}}
+            :unknown -> {:error, {:integrity_unknown, reason}}
+          end
       end
     else
       :ok
@@ -3125,6 +3195,37 @@ defmodule Fathom.Shard do
   defp apply_flush_verdict(state, {:reconciled, nil}), do: {:dirty, state}
 
   defp apply_flush_verdict(state, :superseded), do: {:superseded, state}
+
+  # The LIVE db failed quick_check while we are serving it (expert review 2026-08-20 #2).
+  #
+  # Escalate on the FIRST occurrence instead of waiting for `flush_failure_alert_threshold/0`, for
+  # the same reason `object_too_large` does in record_flush_failure/2: retrying cannot fix it, so a
+  # threshold only delays the alarm while the RPO grows. Keep serving, stay dirty — the good stored
+  # object is untouched and stays authoritative for the next open. The `corrupt_flush` event is the
+  # same one quarantine_corrupt!/2 emits on the drop path, so the existing alert keeps firing.
+  #
+  # DELIBERATELY NOT stopping the coordinator, though the finding recommended it — recorded here so
+  # the next reader does not "simplify" it back. The catastrophic chain is rename-the-live-file →
+  # a new connection creates an EMPTY db at that path → the next flush PUTs the empty db over the
+  # good object under a valid If-Match. Not renaming breaks that at step one, so stopping buys
+  # nothing for the data-loss property it was proposed to fix. Meanwhile the codebase already has a
+  # settled policy for "this flush can never succeed" — `object_too_large` alarms loudly and keeps
+  # serving — and stopping here would be a second, inconsistent policy carrying a new failure mode
+  # of its own (a restart loop whenever the check false-positives).
+  defp apply_flush_verdict(state, {:error, {:corrupt_local, _} = reason}) do
+    :telemetry.execute([:fathom, :shard, :corrupt_flush], %{count: 1}, %{shard_id: state.id})
+
+    Logger.error(
+      "shard #{state.id}: the LIVE local db failed quick_check (#{inspect(reason)}) while serving. " <>
+        "REFUSING every flush so the last good stored object stays authoritative — which means this " <>
+        "shard's acked writes are NOT being made durable and its RPO is growing without bound. The " <>
+        "local file is left in place on purpose (renaming it under live streams is the data-loss " <>
+        "path review #2 closed). Drain the shard: the drop path quarantines it safely and the next " <>
+        "open cold-pulls the good object."
+    )
+
+    {{:error, reason}, record_flush_failure(state, reason)}
+  end
 
   # Snapshot/PUT (or the reconcile's lock read) failed transiently: don't advance the
   # watermark, so it stays dirty and the next interval retries — and a later idle-drop

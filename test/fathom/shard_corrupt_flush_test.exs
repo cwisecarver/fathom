@@ -104,6 +104,55 @@ defmodule Fathom.ShardCorruptFlushTest do
     assert Path.wildcard(path <> ".corrupt.*") != []
   end
 
+  # THE SERVING PATH (expert review 2026-08-20 #2). Everything above drives `Shards.drain/2` — the
+  # DROP path, where quarantining is correct because the coordinator is terminating. The PERIODIC
+  # path, which runs while the coordinator stays alive and keeps handing `state.path` to new
+  # checkouts, had never been driven. It used to call the same quarantine_corrupt!/2, which renamed
+  # the live file and unlinked its -shm, so the next connection created a brand-new EMPTY database
+  # at that path — and the next flush PUT that empty db over the good stored object under a valid
+  # If-Match, destroying the only good copy.
+  #
+  # Discriminates: against the unfixed lib/ this fails at the very first assertion (the live file
+  # is renamed to .corrupt.<ts>), and if that were somehow tolerated it fails again on the empty-db
+  # and clobbered-object assertions.
+  test "a corrupt live db is REFUSED but left in place while the shard is still being served", %{
+    shard: shard
+  } do
+    path = Shard.db_path(shard)
+    remote = Path.join([Fathom.Shard.Storage.Local.dir(), "#{shard}.db"])
+
+    # 1. Seed and flush → the stored object is good.
+    write_and_checkpoint(shard, ["CREATE TABLE t (v TEXT)", @seed_insert])
+    :ok = Shards.drain(shard, 10_000)
+    good_bytes = File.read!(remote)
+
+    # 2. Re-open (cold-pull), write, fold into the main .db. The coordinator stays up from here on.
+    write_and_checkpoint(shard, ["INSERT INTO t VALUES ('more')"])
+    size_before = File.stat!(path).size
+
+    # 3. Corrupt a data page of the LIVE db.
+    corrupt_page!(path)
+
+    # 4. Flush through the SERVING path (Shards.flush/1 → :flush_now → :durability_flush), twice.
+    #    The second call is the one that used to upload the empty database.
+    _ = Shards.flush(shard)
+    _ = Shards.flush(shard)
+
+    # 5. The live file was NOT moved aside. This is the assertion that fails pre-fix.
+    assert Path.wildcard(path <> ".corrupt.*") == [],
+           "the serving path quarantined the live db out from under its own checkouts"
+
+    # 6. No brand-new empty database was created at the live path.
+    assert File.exists?(path), "the live shard file disappeared while the shard was being served"
+
+    assert File.stat!(path).size == size_before,
+           "the live path holds a different (empty) database than the one we corrupted"
+
+    # 7. The good stored object was never clobbered.
+    assert File.read!(remote) == good_bytes
+    assert :ok = Shard.verify_integrity(remote)
+  end
+
   defp tmp_db,
     do: Path.join(System.tmp_dir!(), "fathom_qc_#{System.unique_integer([:positive])}.db")
 
