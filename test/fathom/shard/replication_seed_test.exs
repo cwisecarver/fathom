@@ -23,6 +23,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.Fleet
   alias Fathom.Shard.Replication.Follower
+  alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shard.Replication.Shipper
   alias Fathom.Shard.Replication.Wal
@@ -845,5 +846,106 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     refute File.read!(vacuumed) == live,
            "the VACUUM'd snapshot matched the live file byte-for-byte, so this fixture no longer " <>
              "demonstrates the layout difference the seed design depends on"
+  end
+
+  # THE ISOLATION GATE (expert review 2026-08-20 #1, and the test gap #37 named).
+  #
+  # Every other test in this file drives the receive path through a real primary, which only ever
+  # sends legitimate shard ids. Nothing drove it with a HOSTILE one — and the listener is
+  # unauthenticated, so a hostile id is exactly what an attacker supplies. The follower built every
+  # filesystem path straight from `shard_id`, so `seed_begin(shard_id: "../fathom_shards/victim")`
+  # + chunks + `seed_end` had `install/3` File.rename an attacker-supplied database over another
+  # tenant's LIVE file. AGENTS.md's shard-isolation gate calls a cross-tenant leak a release
+  # blocker, so this is pinned at the wire, not at the helper.
+  #
+  # Asserts on a DIRECTORY LISTING rather than on the absence of one path: a traversal that lands
+  # somewhere unanticipated must fail this too.
+  describe "the receive path validates shard ids off the wire (#1)" do
+    # `../victim_data/escaped` is the load-bearing one: it aims the traversal squarely at the
+    # neighbouring directory's file, so the "another tenant's database was overwritten" assertion
+    # below is the one that fires when the gate is removed — not merely "stray files appeared".
+    @hostile [
+      "../victim_data/escaped",
+      "../escaped",
+      "../../escaped",
+      "a/b",
+      "..",
+      ".",
+      "has space",
+      "acme.evil",
+      <<"nul", 0, "byte">>,
+      "",
+      String.duplicate("a", 5_000)
+    ]
+
+    test "a hostile shard_id creates nothing and closes the connection", %{root: root} do
+      dir = Path.join(root, "gate_follower")
+      name = :"gate_f#{System.unique_integer([:positive])}"
+      pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
+      {:ok, port} = Follower.port(pid)
+
+      # A neighbouring directory standing in for the live shard data dir. Under the DEFAULTS these
+      # are literal siblings (System.tmp_dir!()/fathom_replication and .../fathom_shards), which is
+      # what makes a single `../` reach a tenant database.
+      victim_dir = Path.join(root, "victim_data")
+      File.mkdir_p!(victim_dir)
+      victim = Path.join(victim_dir, "escaped.db")
+      File.write!(victim, "REAL TENANT BYTES")
+
+      before_repl = File.ls!(dir) |> Enum.sort()
+
+      for bad <- @hostile do
+        {:ok, sock} =
+          :gen_tcp.connect(~c"127.0.0.1", port, [:binary, packet: 4, active: false], 2_000)
+
+        begin = %Protocol.SeedBegin{
+          shard_id: bad,
+          epoch: 1,
+          wal_gen: 0,
+          salt1: 0,
+          wal_offset: 0,
+          db_size: byte_size("ATTACKER"),
+          wal_size: 0
+        }
+
+        :ok = :gen_tcp.send(sock, Protocol.encode_seed_begin(begin))
+        _ = :gen_tcp.send(sock, Protocol.encode_seed_chunk(bad, :db, 0, "ATTACKER"))
+        _ = :gen_tcp.send(sock, Protocol.encode_seed_end(bad))
+
+        # The gate treats a bad identifier as a framing failure, so the connection is closed. The
+        # sends above may therefore fail — that is the point, not an error.
+        _ = :gen_tcp.recv(sock, 0, 500)
+        :gen_tcp.close(sock)
+      end
+
+      assert File.read!(victim) == "REAL TENANT BYTES",
+             "a hostile shard_id off the replication wire overwrote another tenant's live database"
+
+      assert File.ls!(victim_dir) |> Enum.sort() == ["escaped.db"],
+             "a hostile shard_id created files in a directory outside the follower's"
+
+      assert File.ls!(dir) |> Enum.sort() == before_repl,
+             "a hostile shard_id created files inside the follower dir"
+
+      refute File.exists?(Path.join(root, "escaped.db")),
+             "a hostile shard_id escaped one level out of the follower dir"
+
+      # The listener is still alive and serving — a rejected frame must not take it down.
+      assert {:ok, _} = Follower.port(pid)
+    end
+
+    test "the path builders themselves fail closed", %{root: root} do
+      dir = Path.join(root, "gate_paths")
+      name = :"gate_p#{System.unique_integer([:positive])}"
+      start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
+
+      for bad <- @hostile do
+        assert_raise ArgumentError, fn -> Follower.db_path(name, bad) end
+        assert_raise ArgumentError, fn -> Follower.wal_path(name, bad) end
+      end
+
+      # A legitimate id still resolves inside the follower dir.
+      assert Follower.db_path(name, "acme") == Path.join(dir, "acme.db")
+    end
   end
 end

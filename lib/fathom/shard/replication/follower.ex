@@ -163,11 +163,30 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
+  # Path-traversal / isolation gate (expert review 2026-08-20 #1), the same fail-closed assertion
+  # `Fathom.Shard.WarmFollower.cache_path/1` carries and for the same reason: shard_id becomes a
+  # FILE NAME here, so a `..` or `/` id escapes dir/1. `Path.join/2` neutralizes a leading `/` but
+  # NOT `..` — `Path.join("/a/b", "../c")` is `/a/b/../c`, which the OS resolves.
+  #
+  # The real gate is `decode_validated/1` at the frame boundary, which refuses the id before any
+  # handler sees it. This raise is the backstop for a caller that bypasses it, and should never
+  # fire on a validated id.
   @doc false
-  def wal_path(name \\ __MODULE__, shard_id), do: Path.join(dir(name), shard_id <> ".db-wal")
+  def wal_path(name \\ __MODULE__, shard_id) do
+    assert_valid_shard_id!(shard_id)
+    Path.join(dir(name), shard_id <> ".db-wal")
+  end
 
   @doc false
-  def db_path(name \\ __MODULE__, shard_id), do: Path.join(dir(name), shard_id <> ".db")
+  def db_path(name \\ __MODULE__, shard_id) do
+    assert_valid_shard_id!(shard_id)
+    Path.join(dir(name), shard_id <> ".db")
+  end
+
+  defp assert_valid_shard_id!(shard_id) do
+    Fathom.ShardId.valid?(shard_id) ||
+      raise(ArgumentError, "invalid shard id: #{inspect(shard_id)}")
+  end
 
   # ------------------------------------------------------------------------------------------
   # server
@@ -271,7 +290,7 @@ defmodule Fathom.Shard.Replication.Follower do
   defp serve(sock, name, seeds \\ %{}) do
     case :gen_tcp.recv(sock, 0) do
       {:ok, bytes} ->
-        case Protocol.decode(bytes) do
+        case decode_validated(bytes) do
           {:ok, %Protocol.Push{} = push} ->
             reply = handle_push(name, push)
             :ok = :gen_tcp.send(sock, reply)
@@ -330,6 +349,51 @@ defmodule Fathom.Shard.Replication.Follower do
         :gen_tcp.close(sock)
     end
   end
+
+  # THE ISOLATION GATE (expert review 2026-08-20 #1).
+  #
+  # `Protocol.decode/1` extracts `shard_id` as an arbitrary length-prefixed binary — any bytes at
+  # all, including `..`, `/` and NUL — and every handler below turns it straight into a filesystem
+  # path via wal_path/2 or db_path/2. Unauthenticated: this listener accepts any connection, and
+  # the rollout runbook (`config/runtime.exs`) tells operators to enable REPLICATION_LISTEN
+  # fleet-wide BEFORE any node ships, so on an A2 fleet it is live on every node.
+  #
+  # A `seed_begin(shard_id: "../fathom_shards/victim")` + chunks + `seed_end` had `install/3`
+  # File.rename an attacker-supplied SQLite file over another tenant's LIVE database — and the
+  # defaults make that a single `../`, since Follower.default_dir/0 and Shard.data_dir/0 are
+  # literal siblings under System.tmp_dir!(). `forget/2` gave the same primitive for File.rm/1 and
+  # `apply_write/4` for arbitrary append.
+  #
+  # Validating here rather than in each handler is deliberate: the frame boundary is the ONE place
+  # every path flows through, and `Fathom.ShardId.valid?/1` is the allowlist the rest of the
+  # codebase already enforces at exactly this boundary (`WarmFollower.cache_path/1`,
+  # `Snapshots`' id pattern, `Recovery`'s pinned `^shard_id`). Deliberately NOT `Path.expand` +
+  # prefix comparison: a second mechanism would drift from the first.
+  #
+  # An unparseable IDENTIFIER is as much a framing failure as an unparseable frame, so this returns
+  # the shape the existing `{:error, reason}` clause already handles — log, discard partial seeds,
+  # close. Reading on would mean trusting the rest of a stream a hostile or desynced peer produced.
+  defp decode_validated(bytes) do
+    case Protocol.decode(bytes) do
+      {:ok, frame} = ok ->
+        case frame_shard_id(frame) do
+          nil -> ok
+          id -> if Fathom.ShardId.valid?(id), do: ok, else: {:error, {:invalid_shard_id, id}}
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp frame_shard_id(%Protocol.Push{shard_id: id}), do: id
+  defp frame_shard_id(%Protocol.SeedBegin{shard_id: id}), do: id
+  defp frame_shard_id({:seed_chunk, id, _part, _seq, _chunk}), do: id
+  defp frame_shard_id({:seed_end, id}), do: id
+  defp frame_shard_id({:position_query, id}), do: id
+  defp frame_shard_id({:replica_request, id}), do: id
+  defp frame_shard_id({:seed_abort, id}), do: id
+  defp frame_shard_id(_), do: nil
 
   # ------------------------------------------------------------------------------------------
   # serving a pull — the survivor-selection direction
