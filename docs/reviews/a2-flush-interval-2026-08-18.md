@@ -179,6 +179,32 @@ flush setting, and the three contributions separate cleanly:
 
 All three were required. Only the first was fathom's product code.
 
+## The deferred retry, validated at both scales (2026-08-19)
+
+`Session` now retries a push its OWN shipper refused (`:already_in_flight` / `:overloaded` — neither
+ever reached the follower) by RE-ENTERING `handle_call({:commit, ...})`, skipping when a commit has
+landed since it was armed. Same-image A/B, `REPLICATION_CATCHUP_MS=0` as the control, fresh rig for
+every arm:
+
+| | retry ON | retry OFF |
+|---|---|---|
+| 512 txn/s | **3,438.7** | 3,420.5 |
+| 512 errors | **29** | 68 |
+| 1024 txn/s | **2,785.6** | 2,759.3 |
+| 1024 errors | **16,848** | 17,790 |
+| 1024 p99 | 1,735 ms | 1,849 ms |
+| shed (both) | 0 | 0 |
+
+**It costs nothing at either scale and the error count is LOWER in both arms.** Worth stating
+because an earlier design — the same feature, planning and shipping in parallel rather than
+re-entering the commit path — measured **2,697 txn/s / 2,486 errors at 512**, i.e. -15% throughput
+and 35x the errors. The difference is entirely in routing through the existing serialization instead
+of alongside it (`docs/../tasks/todo.md` carries the four-attempt history).
+
+One trap it also settles: 1024's error count varies run to run at saturation (12,042 on 2026-08-18,
+16,848 and 17,790 here). **Do not read a single 1024 error count as a regression** — the control arm
+had MORE errors than the change being tested. Only a same-session A/B discriminates at this scale.
+
 ## What the 1024 numbers still say is saturating
 
 `:already_in_flight` 20,079 / 27,959 and `:overloaded` 8,419 / 9,294 per node. The byte budget IS
