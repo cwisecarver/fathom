@@ -358,6 +358,44 @@ defmodule Fathom.Telemetry do
       # below quorum+1 and the PREVIOUS set is still live — so writes keep succeeding and nothing
       # else moves, while the node is pinned to a membership the fleet has moved on from. Left
       # alone it ends as a set of followers that no longer exist.
+      # SATURATION, leading then lagging. Replication does not degrade gracefully as tenant count
+      # rises — 512 -> 1024 -> 2048 measured 3,340 -> 2,776 -> 258 txn/s, a 10.8x collapse for the
+      # last doubling — and throughput looks healthy right up to the cliff, so it cannot be the
+      # headroom signal (`docs/reviews/a2-flush-interval-2026-08-18.md`).
+      #
+      # `used_ratio` is the LEADING one: how full the per-node byte budget is now, which climbs
+      # before anything is refused. `reject.count` by reason is the LAGGING confirmation — by the
+      # time `:overloaded` appears the node is already refusing tenant writes. Alert on the ratio,
+      # diagnose with the reasons.
+      last_value("fathom.replication.budget.used_ratio",
+        event_name: [:fathom, :replication, :budget],
+        measurement: :used_ratio,
+        description:
+          "Per-node replication byte budget in use, 0.0-1.0 (A2). THE headroom signal: " <>
+            "throughput gives no warning before the saturation cliff, this does."
+      ),
+      last_value("fathom.replication.budget.used_bytes",
+        event_name: [:fathom, :replication, :budget],
+        measurement: :used_bytes,
+        unit: :byte,
+        description: "Replication payload bytes queued across this node's shippers (A2)"
+      ),
+      last_value("fathom.replication.budget.max_bytes",
+        event_name: [:fathom, :replication, :budget],
+        measurement: :max_bytes,
+        unit: :byte,
+        description: "The per-node replication byte budget, 0 when the bound is disabled (A2)"
+      ),
+      # Tagged by REASON only, never by shard — a per-shard tag at fathom's scale is cardinality
+      # death, the same reason `Fathom.ShardLoad` is a read API rather than a metric.
+      counter("fathom.replication.reject.count",
+        event_name: [:fathom, :replication, :reject],
+        tags: [:reason],
+        description:
+          "Pushes this node's own shipper refused, by reason (A2). `overloaded` = the byte " <>
+            "budget; `already_in_flight` = a straggler still holds that shard's waiter, which is " <>
+            "routine and absorbed by the quorum."
+      ),
       counter("fathom.replication.membership_refused.count",
         event_name: [:fathom, :replication, :membership_refused],
         measurement: :kept,

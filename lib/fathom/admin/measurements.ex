@@ -329,9 +329,43 @@ defmodule Fathom.Admin.Measurements do
         %{configured: length(status), connected: connected, quorum: quorum, slack: slack},
         %{}
       )
+
+      replication_budget()
     end
 
     :ok
+  end
+
+  # THE LEADING SATURATION SIGNAL, and the reason it exists rather than only a reject counter.
+  #
+  # Replication does not degrade gracefully as tenant count rises — measured on the rig, 512 -> 1024
+  # -> 2048 tenants went 3,340 -> 2,776 -> 258 txn/s, i.e. a 10.8x collapse for the last doubling.
+  # An operator cannot see that coming from throughput, because throughput looks fine right up to
+  # the cliff (`docs/reviews/a2-flush-interval-2026-08-18.md`).
+  #
+  # `:overloaded` rejects DO track it cleanly — 0 at 512, ~9k at 1024, ~17k at 2048 — but a reject
+  # is a LAGGING signal: by the time it fires the node is already refusing tenant writes. This gauge
+  # is the same quantity one step earlier: how full the per-node byte budget is RIGHT NOW, which
+  # climbs before anything is refused.
+  #
+  # Node-level, never per shard. A per-shard tag at fathom's stated scale is cardinality death — the
+  # same reasoning that keeps `Fathom.ShardLoad` a read API rather than a metric.
+  defp replication_budget do
+    alias Fathom.Shard.Replication.Budget
+
+    max = Budget.max_bytes()
+    used = Budget.queued()
+
+    # `max` of 0 means the bound is disabled, and a ratio against it is meaningless rather than
+    # infinite — report the bytes and leave the ratio at 0 so a dashboard shows "no bound" instead
+    # of a division error or a fake 100%.
+    ratio = if max > 0, do: used / max, else: 0.0
+
+    :telemetry.execute(
+      [:fathom, :replication, :budget],
+      %{used_bytes: used, max_bytes: max, used_ratio: ratio},
+      %{}
+    )
   end
 
   defp configured_queues do

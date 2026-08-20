@@ -106,6 +106,7 @@ defmodule Fathom.Shard.Replication.Shipper do
         # Same answer, and for the same reason, as the `overloaded?` branch: a follower that cannot
         # take the work must subtract from the quorum NOW rather than absorb it. Reported as
         # `:overloaded` so the two paths are indistinguishable to `Quorum` and to the operator.
+        count_reject(:overloaded)
         send(self(), {:repl_reply, resolve(shipper), {:reject, p.shard_id, :overloaded, 0}})
         :ok
     end
@@ -246,12 +247,14 @@ defmodule Fathom.Shard.Replication.Shipper do
       # Rejecting is cheap, so under overload the shipper becomes a fast rejector instead of a slow
       # accumulator. The cost is honest: writes fail with FILO_NO_QUORUM while a link is saturated.
       overloaded?(state) ->
+        count_reject(:overloaded)
         send(from, {:repl_reply, self(), {:reject, p.shard_id, :overloaded, 0}})
         {:noreply, state}
 
       Map.has_key?(state.waiters, p.shard_id) ->
         # One writer per shard means one push in flight. Two is a caller bug, and overwriting the
         # waiter would strand the first commit forever.
+        count_reject(:already_in_flight)
         send(from, {:repl_reply, self(), {:reject, p.shard_id, :already_in_flight, 0}})
         {:noreply, state}
 
@@ -473,6 +476,19 @@ defmodule Fathom.Shard.Replication.Shipper do
   # map and `Quorum`'s tally key on different things and the reject is counted against nobody.
   defp resolve(pid) when is_pid(pid), do: pid
   defp resolve(name), do: Process.whereis(name) || name
+
+  # ONE EVENT PER REFUSED PUSH, tagged by REASON only.
+  #
+  # Deliberately NOT tagged by shard: a per-shard tag at fathom's stated scale is cardinality death,
+  # the same reason `Fathom.ShardLoad` is a read API rather than a metric. The reason atom set is
+  # small and fixed, so this is a handful of series per node.
+  #
+  # Until this existed the only trace of a refusal was a `Logger.warning`, which meant the signal
+  # that tracks saturation most cleanly across the whole sweep — `:overloaded` at 0 / ~9k / ~17k for
+  # 512 / 1024 / 2048 tenants — was only reachable by grepping container logs after the fact.
+  defp count_reject(reason) do
+    :telemetry.execute([:fathom, :replication, :reject], %{count: 1}, %{reason: reason})
+  end
 
   defp encode(%Protocol.Push{} = p), do: Protocol.encode_push(p)
 

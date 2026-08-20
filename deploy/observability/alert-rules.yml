@@ -442,6 +442,34 @@ groups:
           description: "Fewer followers connected than :replication_quorum, so tenant commits are failing with FILO_NO_QUORUM. Writes that did land are durable locally and reach S3 on the next flush; the RPO~0 guarantee is what is lost."
           runbook: docs/a2-quorum-replication.md
 
+      # A2 SATURATION. The thresholds are picked from a measured sweep rather than from taste:
+      # 512 -> 1024 -> 2048 tenants gave 3,340 -> 2,776 -> 258 txn/s, so the last doubling is a
+      # 10.8x COLLAPSE, not a slope. Throughput looks healthy right up to it, which is exactly why
+      # the alert is on budget utilisation and not on tps.
+      # docs/reviews/a2-flush-interval-2026-08-18.md
+      - alert: FathomReplicationBudgetHigh
+        # Leading indicator: the byte budget is filling but nothing is being refused yet.
+        expr: fathom_replication_budget_used_ratio > 0.5
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Replication byte budget on {{ $labels.node }} is {{ $value | humanizePercentage }} full"
+          description: "This node's shippers are holding a growing share of :replication_max_queue_bytes. Nothing is failing yet — this is the warning throughput does not give, because A2 falls off a cliff rather than degrading. Shed tenants from this node, or raise the bound only after checking the link is not simply saturated."
+          runbook: docs/runbooks/cluster.md
+
+      - alert: FathomReplicationOverloaded
+        # Lagging confirmation: the budget is now REFUSING pushes, so tenant writes are failing
+        # FILO_NO_QUORUM on this node. `already_in_flight` is deliberately NOT alerted on — it is
+        # the top reject by count and measured harmless (unchanged across a same-image A/B whose
+        # good arm had 4 errors), so alerting on it would page for normal straggler traffic.
+        expr: increase(fathom_replication_reject_count{reason="overloaded"}[5m]) > 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "Replication on {{ $labels.node }} is refusing pushes (byte budget)"
+          description: "The per-node replication byte budget is full and pushes are being rejected, so commits are failing their quorum and tenants are seeing 503 FILO_NO_QUORUM. The budget refuses EVERY push once over cap, including small ones for healthy shards, so one saturated node can become a node-wide write outage — see the known limitation in tasks/todo.md."
+          runbook: docs/runbooks/cluster.md
+
       - alert: FathomWarmCacheDiskPressure
         # The follower declined to warm new shards because the volume is below the free floor.
         # Not itself an outage — failover readiness is degrading, and the disk is the cause.
