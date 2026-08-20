@@ -242,6 +242,94 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
     end)
   end
 
+  # #6 — the fence must not outlive the coordinator that published it.
+  #
+  # WriteFence rows are node-global ETS, and every WriteFence.forget/1 call site is inside
+  # Fathom.Shard.terminate/2 — which is NOT guaranteed to run. The terminate clause that would run
+  # for a fenced shard does a fence + checkpoint + full-object PUT against the object store, and
+  # that state is reached precisely when the object store is unreachable: the case most likely to
+  # blow the :shard_shutdown_ms budget and be brutally killed. The row then survived, and no
+  # successor could clear it either — fresh coordinator state starts `not_valid_since: nil`, and
+  # clear_write_fence/1 short-circuits on exactly that. The tenant read fine and every write 503'd
+  # forever, across coordinator restarts and across the partition healing.
+  #
+  # The test above cannot see this: it fences and unfences within ONE coordinator's lifetime. This
+  # one kills the coordinator while fenced (`restart: :temporary`, so nothing revives it), asserts
+  # the row genuinely survived — otherwise the rest measures nothing — and then proves a fresh
+  # coordinator lifts it. Fails against unfixed lib/ at the final write.
+  test "a write fence left behind by a killed coordinator is lifted by the next open (#6)",
+       %{shard: shard, hb: hb} do
+    Application.put_env(:fathom, :fence_writes_when_stealable, true)
+    on_exit(fn -> Application.delete_env(:fathom, :fence_writes_when_stealable) end)
+
+    # The fence is published from the flush verdict, which arrives from an off-process Task — so
+    # :sys.get_state on the coordinator is NOT a sync point for it (the first draft used one and
+    # the precondition assert below caught it). Wait on the telemetry event, as the #3 test does.
+    test_pid = self()
+    handler = "writefence-kill-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shard, :write_fenced],
+      fn _e, _m, meta, _ -> send(test_pid, {:write_fenced, meta}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    capture_log(fn ->
+      {:ok, conn} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('a')"))
+      {:ok, coordinator} = Shards.ensure(shard)
+
+      # Same forging as the test above: heartbeat not comfortably valid, not-valid clock preset an
+      # hour back, so the next fence verdict is already past margin + steal_margin.
+      :sys.replace_state(hb, fn s ->
+        forged = %{s | mono_deadline_ms: System.monotonic_time(:millisecond) - 1_000}
+        Heartbeat.publish_status(forged)
+        forged
+      end)
+
+      :sys.replace_state(coordinator, fn s ->
+        %{s | not_valid_since: System.monotonic_time(:millisecond) - 3_600_000}
+      end)
+
+      send(coordinator, :durability_flush)
+      assert_receive {:write_fenced, %{shard_id: ^shard}}, 2_000
+      assert WriteFence.fenced?(shard), "the fixture never published a write fence"
+
+      # Brutal kill: terminate/2 does NOT run, so WriteFence.forget/1 never fires.
+      ref = Process.monitor(coordinator)
+      Process.exit(coordinator, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^coordinator, :killed}, 2_000
+
+      # THE PRECONDITION. If the row did not survive the kill, everything below is vacuous.
+      assert WriteFence.fenced?(shard),
+             "the fixture did not reproduce a leaked fence — the row was cleared by the kill"
+
+      # The partition heals: the heartbeat is comfortably valid again.
+      :sys.replace_state(hb, fn s ->
+        forged = %{s | mono_deadline_ms: System.monotonic_time(:millisecond) + 60_000}
+        Heartbeat.publish_status(forged)
+        forged
+      end)
+
+      # A fresh coordinator opens the shard. It holds a valid lease, so it is not stealable and
+      # must lift the stale fence.
+      {:ok, conn2} = ShardExecutor.open(shard)
+      {:ok, _} = Shards.ensure(shard)
+
+      refute WriteFence.fenced?(shard),
+             "a successor coordinator holding a valid lease left the stale write fence in place"
+
+      assert {:ok, _} = ShardExecutor.execute(conn2, stmt("INSERT INTO kv VALUES ('b')")),
+             "writes are still fenced after the shard was re-opened by a healthy coordinator"
+
+      :ok = ShardExecutor.close(conn2)
+    end)
+  end
+
   # #28 — the margin covers the START of a write whose duration it does not know.
   #
   # Fence.check runs ONCE, before quick_check + VACUUM INTO + the PUT. `valid_for_write?`'s

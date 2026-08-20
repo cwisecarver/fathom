@@ -641,6 +641,25 @@ defmodule Fathom.Shard do
       # Publish the initial flush watermark so the metrics layer can derive RPO/dirtiness for
       # this shard without a per-coordinator GenServer call (Fathom.Admin.FlushWatermark).
       FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
+
+      # Lift any write fence a PREVIOUS coordinator for this shard left behind (expert review
+      # 2026-08-20 #6). The fence is a node-global ETS row published by note_not_valid/1, and every
+      # WriteFence.forget/1 call site is inside terminate/2 — which is not guaranteed to run. The
+      # clause that would run for a fenced shard does a fence + checkpoint + full-object PUT against
+      # the object store, and that state is reached precisely when the object store is UNREACHABLE:
+      # the case most likely to blow the :shard_shutdown_ms budget and be brutally killed. The row
+      # then survived, and no successor could clear it either, because fresh state starts
+      # `not_valid_since: nil` and clear_write_fence/1 short-circuits on exactly that. Result: the
+      # tenant read fine and every write 503'd FILO_STALE_LEASE forever, across coordinator
+      # restarts and across the partition healing, recoverable only by restarting the node — a
+      # permanent outage produced by the circuit breaker that exists to BOUND loss.
+      #
+      # Unconditional and idempotent by design: we are here only because acquire_lease succeeded,
+      # so this coordinator holds a valid lease and is by definition not stealable. Clearing is
+      # always correct at this point, which is why it needs no state to consult — consulting state
+      # is what failed.
+      Fathom.Shard.WriteFence.unfence(state.id)
+
       {:noreply, schedule_flush(state)}
     else
       {:error, reason} ->
