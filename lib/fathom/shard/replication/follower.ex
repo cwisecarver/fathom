@@ -227,6 +227,25 @@ defmodule Fathom.Shard.Replication.Follower do
   @impl true
   def terminate(_reason, %{lsock: lsock}), do: :gen_tcp.close(lsock)
 
+  # NO `fullsweep_after: 0` HERE, and that is a measured decision rather than an oversight.
+  #
+  # `Fathom.Shard.Replication.Shipper` carries it because a GenServer holding WAL-frame payloads in
+  # its mailbox retained 7-18 GiB per node (expert review 2026-07-24 #9, then `e0fda94`), and the
+  # obvious next question was whether the RECEIVE side does the same. It does not, and the reason is
+  # structural: `serve/3` below is a tail-recursive `:gen_tcp.recv` loop, so it holds ONE frame at a
+  # time, decodes it, writes it straight to disk (seed chunks stream to an fd — see `accept_chunk`,
+  # nothing is buffered) and drops it on the tail call. There is no mailbox to accumulate in, and
+  # one process per PEER rather than per shard.
+  #
+  # MEASURED on the rig 2026-08-19, 1024 replicating tenants, sampled twice during the run with
+  # `deploy/chaos/follower_mem.sh` (which classifies binary holders by role):
+  #
+  #     shipper        1,031 MB / 1,078 MB across 4 procs
+  #     follower_task      3 MB /     2 MB across 5 procs
+  #
+  # The receive side held ~0.2% of the send side's binary memory and stayed flat (1 -> 3 MB) while
+  # the shippers went 0 -> 1,031 MB. Adding the flag here would be optimizing from analogy against a
+  # measurement that says there is nothing to collect.
   defp accept_loop(lsock, name) do
     case :gen_tcp.accept(lsock) do
       {:ok, sock} ->
