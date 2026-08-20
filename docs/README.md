@@ -91,7 +91,8 @@ what actually shipped (some plan assumptions were superseded).
 - **[migration-engine-plan.md](migration-engine-plan.md)** — earlier migration-engine design notes.
   *Plan.*
 - **[phase2-scoping.md](phase2-scoping.md)** — Phase 2 scoping: warm standby (A), rebalancing (B),
-  locality/affinity (C). *Scoping.*
+  locality/affinity (C). *Scoping — but A1, A2 and B1 have all since been BUILT; read the inline
+  "BUILT" notes on each bullet before treating anything here as future work.*
 - **[a2-quorum-replication.md](a2-quorum-replication.md)** — Phase 2 A2 in full: replicate-before-ack
   (the Waterpark quorum shape) as the answer to node-loss RPO, and why CRDT/OT cannot work over
   opaque tenant SQL. **Built and on `main`, off by default** (`REPLICATION_ENABLED` /

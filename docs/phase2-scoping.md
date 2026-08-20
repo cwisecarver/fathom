@@ -79,7 +79,7 @@ cold-open-from-S3. The fork is how warm:
     round-trip (a 304, no body), so the warm win is the object **body transfer avoided** — measured
     ~2.3× (162→72 ms) at 1 MB / 30 ms / 100 Mbps, marginal for tiny shards on a fat pipe. Warm
     density is disk-bound (~0 BEAM/fd per cached shard). See AGENTS.md Benchmarking.
-- **A2 — Live WAL streaming (heavyweight, defer).** Ship WAL frames primary→follower
+- **A2 — Live WAL streaming.** ~~heavyweight, defer~~ — **BUILT 2026-08-12, see the end of this bullet.** Ship WAL frames primary→follower
   for near-zero RPO + instant promotion (LiteFS/litestream territory). exqlite exposes
   no WAL-frame stream, so this needs a WAL-shipping layer or adopting libSQL
   replication — and WAL frames crossing nodes is a **cross-node data path**, which
@@ -96,6 +96,16 @@ cold-open-from-S3. The fork is how warm:
   follower confirms), why CRDT/OT cannot work over opaque tenant SQL, and the **verified blocker**:
   exqlite 0.37.0 exposes no WAL-frame API at all. Blocked on a dependency, not on effort — the
   open question is which seam exists, not whether to want one.
+  **BUILT AND MERGED 2026-08-12 — A2 is no longer scoping, it is shipped code (off by default).**
+  The "verified blocker" above was wrong within 24 hours, and how it fell is worth keeping: a
+  **loadable SQLite extension** gets a live `sqlite3*` and `sqlite3_wal_hook` is in the extension
+  pointer table, so exqlite's API surface was never the boundary — the same move that had already
+  solved the Django UDFs (`native/fathom_udf`). Twice now the answer to "we need a new dependency
+  seam" was the extension already in the tree. It also needed **no BEAM cluster**: frames go over
+  A2's own socket protocol, so S3 remains the only cross-node *coordination*.
+  Gates are `REPLICATION_ENABLED` (ship) and `REPLICATION_LISTEN` (receive) — separate, and
+  listening must be on fleet-wide before any node ships. Measured scale, traps, and the current
+  ceiling: `AGENTS.md` and `docs/reviews/a2-flush-interval-2026-08-18.md`.
 
 **Verdict:** A1 is the highest value-per-risk Phase-2 item — a real RTO win, additive,
 model-consistent, tractable, reusing infra already built.
