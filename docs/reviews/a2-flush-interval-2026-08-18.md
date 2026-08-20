@@ -246,7 +246,35 @@ could not ask the question; it can now, and the answer is 2,776 txn/s with nothi
   measuring checkpoint churn. `docker-compose.yml` now takes it from the environment for exactly
   this reason.
 
-## An open confound, recorded rather than hidden
+## The confound is CLOSED — flush=5,000 at 512 varies ~9x run to run (2026-08-19)
+
+The section below recorded an unattributed gap: the flush=5,000 arm measured 22,599 errors on
+2026-08-18 against 9,480 on 2026-08-17, on different images. Settled by asking a different question
+— not "which image", but "how much does this configuration vary at all". Three runs, ONE image,
+identical config, fresh rig each:
+
+| run | txn/s | errors |
+|---|---|---|
+| 1 | 2,766.1 | 6,683 |
+| 2 | 2,938.4 | 3,420 |
+| 3 | 2,091.8 | **30,774** |
+
+**A 9x spread with nothing changed.** Both historical numbers sit inside it, so there was never an
+image difference to attribute — the gap was the regime's own variance.
+
+**Why this configuration in particular is unstable** (consistent with the numbers, not separately
+instrumented): flush=5,000 sits right at the saturation boundary. Every checkpoint makes
+`Primary.plan/3` re-ship a whole WAL rather than a delta, which sometimes fits inside the per-node
+byte budget and sometimes tips it — and once `:overloaded` starts firing it cascades. Run 3's
+profile fits that: the WORST error count came with the LOWEST p50 (69.9 ms against 112/114 ms),
+which is the shape of many requests failing fast rather than everything running slow.
+
+**The operational reading:** a single error count from a saturated arm is not a measurement. This is
+the third time tonight the same trap appeared — the 818-shed run, the 1024 error counts, and now
+this — and each time the cheap resolution was to run the control rather than reason about mechanism.
+Compare same-session A/B arms, or a spread, never two numbers from different sittings.
+
+## Superseded: the earlier open confound
 
 **Partly closed:** the flush interval's effect at 1024 is no longer confounded — see the 1024 A/B
 above (5.6x throughput, 21x errors). What remains open is a different, narrower thing:
