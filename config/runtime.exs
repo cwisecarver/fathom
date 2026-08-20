@@ -596,6 +596,25 @@ if n = env_nonneg_int.("REPLICATION_MAX_QUEUE_BYTES") do
   config :fathom, :replication_max_queue_bytes, n
 end
 
+# How long after a push OUR OWN shipper refused before the session retries it (default 1000 ms).
+#
+# A push can be refused locally without ever reaching the follower — `:already_in_flight` (that
+# shard's single waiter is still held by an earlier push) or `:overloaded` (the node byte budget
+# above). Neither is the follower's fault and neither leaves it holding the bytes, and nothing else
+# re-sends them: the follower stays behind until the shard's NEXT WRITE. On a busy shard that is one
+# round; on a QUIET one it is unbounded — and quiet is exactly when it bites, because the
+# fire-and-forget ship path is taken precisely when the other followers are already current, i.e.
+# when no further write is coming to fix it. The commit returns :ok, so nothing looks wrong.
+#
+# The retry RE-ENTERS the normal commit path rather than shipping alongside it, and skips entirely
+# when a commit has landed since it was armed (that commit already re-planned for every follower).
+# An earlier design that shipped in parallel cost -15% throughput and 35x the errors at 512 tenants.
+#
+# Set to 0 to disable, restoring the stale-replica window.
+if ms = env_nonneg_int.("REPLICATION_CATCHUP_MS") do
+  config :fathom, :replication_catchup_ms, ms
+end
+
 # Let a cold open serve a local REPLICA when it is provably newer than the stored object — the
 # failover half of A2, and the only thing that actually turns node-loss RPO from ~300 s into ~0.
 #

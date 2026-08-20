@@ -613,7 +613,8 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # three-way convergence, before the strand is even arranged) and all three causes turned out to be
   # in `PausablePeer` or this scenario's setup, not the product — see the note in
   # `replication_transport_test.exs`. Un-tagged at 0 failures in 28 runs.
-  test "a held laggard reply strands it on a quiet shard until the next write", ctx do
+  test "a laggard refused by our own shipper is caught up without waiting for the next write",
+       ctx do
     %{id: id, root: root} = ctx
     [{a, pa}, {b, pb}, {laggard, plag}] = start_followers!(root, 3)
 
@@ -673,27 +674,26 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     {:ok, _} = Fathom.Test.PausablePeer.release(peer)
     target = File.read!(wal)
 
-    # PINS CURRENT BEHAVIOUR, and it is a gap rather than a correctness bug: the laggard holds a
-    # PREFIX of the primary's WAL (never wrong bytes), it is simply behind. On a shard that keeps
-    # writing this self-heals on the next commit; on a QUIET one — the premise of the test above —
-    # it stays behind for as long as the shard stays quiet, which is an RPO window nobody is told
-    # about.
+    # THE PROPERTY. NO further write on this shard — the deferred retry must re-enter the commit
+    # path and re-ship what our own shipper refused. Verified to discriminate by setting
+    # `:replication_catchup_ms` to 0, which fails here.
     #
-    # WHEN THIS GAP IS FIXED this assertion flips: delete the `refute` and assert convergence
-    # instead. It is written as a `refute` on purpose so the fix cannot land silently.
-    refute await_wal_quiet(laggard, id, target, 1_500),
-           "the laggard converged on its own — the strand is fixed, so flip this assertion to " <>
-             "assert convergence and delete the follow-up write below"
+    # Generous window: the retry is armed at 1 s and may need a second pass, because the first can
+    # land while the released reply is still being reconciled.
+    # THE PROPERTY. NO further write on this shard — the deferred retry must re-enter the commit
+    # path and re-ship what our own shipper refused. Verified to discriminate by setting
+    # `:replication_catchup_ms` to 0, which fails here.
+    #
+    # Generous window: the retry is armed at 1 s and may need a second pass, because the first can
+    # land while the released reply is still being reconciled.
+    assert await_wal_quiet(laggard, id, target, 8_000),
+           "the laggard never caught up on a quiet shard. The commit reported :ok, so nothing " <>
+             "anywhere looks wrong — this is the silent under-replication window the deferred " <>
+             "retry exists to close."
 
-    assert File.read!(Follower.wal_path(laggard, id)) ==
-             binary_part(target, 0, byte_size(File.read!(Follower.wal_path(laggard, id)))),
-           "the laggard holds bytes that are not a prefix of the primary's WAL — that would be " <>
-             "divergence, which is a different and much worse bug than being behind"
-
-    # And the bound: one more write on the shard catches it up, so the strand is not permanent.
-    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (6)", [])
-    assert :ok = Session.commit(id, wal, coordinator)
-    await_wal(laggard, id, File.read!(wal))
+    # Converged on the RIGHT bytes, not merely on some bytes: a retry shipping from a wrong offset
+    # would splice, which is far worse than being behind.
+    assert File.read!(Follower.wal_path(laggard, id)) == target
   end
 
   # Commit until every follower holds the primary's WAL, or give up loudly. Bounded, and each round

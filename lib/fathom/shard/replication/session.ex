@@ -179,7 +179,13 @@ defmodule Fathom.Shard.Replication.Session do
        # Shippers with a seed in flight. A seed can be a whole database, so starting a second one
        # for the same follower because the next commit also saw :unknown_shard would multiply a
        # large transfer by the write rate.
-       seeding: MapSet.new()
+       seeding: MapSet.new(),
+       # Deferred-retry bookkeeping. `catchup_ref` is the armed timer (nil when none); `commits`
+       # counts commit cycles and `catchup_at` records the count at arm time, so the retry can tell
+       # a QUIET shard from a busy one. See `handle_info(:catch_up, ...)`.
+       catchup_ref: nil,
+       commits: 0,
+       catchup_at: 0
      }}
   end
 
@@ -196,6 +202,8 @@ defmodule Fathom.Shard.Replication.Session do
     # error, while this process is still holding the shard's serialization point.
     deadline = System.monotonic_time(:millisecond) + timeout()
 
+    state = %{state | commits: state.commits + 1}
+
     case with_epoch(state) do
       {:error, reason} ->
         {:reply, {:error, reason}, state}
@@ -209,7 +217,14 @@ defmodule Fathom.Shard.Replication.Session do
         case ship(state, wal_path, state.epoch, deadline) do
           {:ok, new_state, rejects} ->
             new_state = start_seeds(new_state, wal_path, rejects)
-            {:reply, :ok, drain_late_replies(new_state, wal_path)}
+
+            {:reply, :ok,
+             new_state
+             |> drain_late_replies(wal_path)
+             # A commit can SUCCEED on the quorum while a follower was refused by OUR OWN shipper.
+             # That follower is now behind with nothing scheduled to fix it, and the tenant saw
+             # `:ok` — so nothing anywhere looks wrong. This is the arm that matters.
+             |> arm_if_rejected(rejects)}
 
           :nothing ->
             {:reply, :ok, state}
@@ -306,7 +321,51 @@ defmodule Fathom.Shard.Replication.Session do
 
   def handle_info({:repl_reply, from, {:reject, _shard, reason, follower_offset}}, state) do
     rejects = [{from, reason, follower_offset}]
-    {:noreply, seed_if_possible(reconcile(state, rejects), rejects)}
+
+    {:noreply,
+     state
+     |> reconcile(rejects)
+     |> seed_if_possible(rejects)
+     |> arm_if_rejected(rejects)}
+  end
+
+  # DEFERRED RETRY for a push OUR OWN shipper refused — `:already_in_flight` (that shard's single
+  # waiter is still held by an earlier push) or `:overloaded` (the node byte budget). Neither reached
+  # the follower, and nothing else re-sends them, so without this the follower stays behind until the
+  # shard's NEXT WRITE. On a busy shard that is one round; on a QUIET one it is unbounded — and quiet
+  # is exactly when it bites, because `deliver/5` takes the fire-and-forget `ship_async/1` branch
+  # precisely when the other followers are already current, i.e. when no further write is coming.
+  #
+  # IT RE-ENTERS `handle_call/3` RATHER THAN SHIPPING ITSELF, and that is the whole design.
+  #
+  # The first attempt (2026-08-19) was a parallel `catch_up/1` that planned and shipped on its own.
+  # It cost **-15% throughput and 35x the errors** at 512 tenants, and after being guarded it still
+  # flaked — because it was a SECOND WRITER of `inflight`, and in particular it skipped the
+  # `drain_late_replies/2` that `handle_call/3` runs FIRST for exactly this reason: a straggler's
+  # reply that has not yet reached `handle_info/2` would otherwise be mistaken for an answer to the
+  # push about to be sent. Reusing the commit path inherits that drain, `settle_inflight/3` between
+  # rounds, the seeding and the reconciliation — every ordering rule the path already encodes —
+  # instead of re-deriving them alongside it.
+  #
+  # A fake `from` is safe: the clause ignores it (`_from`). Blocking here is fine because this only
+  # runs on a shard with no traffic, and anything that does arrive queues behind it — which IS the
+  # serialization this is staying inside rather than routing around.
+  def handle_info(:catch_up, %{wal_path: nil} = state),
+    do: {:noreply, %{state | catchup_ref: nil}}
+
+  def handle_info(:catch_up, %{commits: n, catchup_at: n} = state) do
+    {:reply, _discarded, state} =
+      handle_call({:commit, state.wal_path}, {self(), make_ref()}, %{state | catchup_ref: nil})
+
+    {:noreply, state}
+  end
+
+  def handle_info(:catch_up, state) do
+    # A commit landed while this was pending, and a commit already re-plans for EVERY follower, so
+    # the laggard has been re-shipped. Drop the timer rather than duplicate that work: if that commit
+    # refused a follower too, its own reject arms a fresh one. This is what keeps the retry free on a
+    # busy shard — the first attempt fired regardless, and that alone cost 15% throughput.
+    {:noreply, %{state | catchup_ref: nil}}
   end
 
   def handle_info({:DOWN, _ref, :process, coordinator, _reason}, %{coordinator: coordinator} = s) do
@@ -997,4 +1056,42 @@ defmodule Fathom.Shard.Replication.Session do
   # with it the OOM, so it is a debugging lever, not a tuning one.
   defp max_push_bytes,
     do: Application.get_env(:fathom, :replication_max_push_bytes, 1024 * 1024)
+
+  # Armed only when a reject was actually seen, and only one timer at a time, so a shard whose
+  # followers all ack never arms one and pays nothing.
+  #
+  # A reject arriving while a timer is ALREADY armed refreshes `catchup_at` rather than being
+  # ignored, and that is load-bearing rather than tidy. The timer means "retry shortly after the
+  # MOST RECENT reject"; `catchup_at` is the commit count as of that reject. Leaving it stale was a
+  # real bug: armed at commit 2, four more commits each refused the laggard and each was swallowed
+  # by this guard, so when the timer finally fired it compared 6 against 2, took the "a commit
+  # landed, skip" branch, and DROPPED itself. The shard then went quiet with nothing armed and the
+  # laggard stayed behind — the exact strand this retry exists to prevent, reintroduced by the
+  # guard meant to keep it cheap. Caught by instrumenting the failure (`commits=6 catchup_at=2
+  # ref=nil`) rather than by reading.
+  defp arm_catchup(%{catchup_ref: ref} = state) when ref != nil,
+    do: %{state | catchup_at: state.commits}
+
+  defp arm_catchup(state) do
+    case catchup_ms() do
+      0 ->
+        state
+
+      ms ->
+        %{
+          state
+          | catchup_ref: Process.send_after(self(), :catch_up, ms),
+            catchup_at: state.commits
+        }
+    end
+  end
+
+  defp arm_if_rejected(state, []), do: state
+  defp arm_if_rejected(state, _rejects), do: arm_catchup(state)
+
+  # How long after a locally-refused push before the retry re-enters the commit path. 1 s: above any
+  # round trip, so a straggler's real reply lands first and the retry then finds nothing to do; and
+  # far below the durability flush interval, so a laggard is made good well inside the window its
+  # staleness would cost anything. 0 disables, restoring the stale-replica window.
+  defp catchup_ms, do: Application.get_env(:fathom, :replication_catchup_ms, 1_000)
 end
