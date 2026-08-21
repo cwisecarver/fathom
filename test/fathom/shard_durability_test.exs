@@ -1641,7 +1641,54 @@ defmodule Fathom.ShardDurabilityTest do
     Connection.close(ro)
   end
 
-  # The other intent of the same clause: a BUSY tenant delete (`Tenants.purge` → `Shards.stop`
+  # Expert review 2026-08-20 #9. The clause above proves the busy stop FLUSHES. This proves it does
+  # not then UNLINK the file out from under the streams that are still holding it.
+  #
+  # Stream teardown is asynchronous: `Filo.Stream` learns only via its monitor on this coordinator,
+  # and that `:DOWN` cannot fire until terminate/2 RETURNS. So for the whole duration of
+  # checkpoint + VACUUM INTO + a full-object PUT — up to :shard_shutdown_ms, seconds at real S3
+  # latency — live streams keep committing into a file the old code deleted on the way out. Those
+  # writes were ACKED, and they vanished with no quarantine file, no event and no log line.
+  #
+  # The sibling `lease_lost` clause already reasons about exactly this hazard and RENAMES for it;
+  # this path was added later and unlinked instead.
+  test "a busy stop must NOT unlink the shard file under its live streams (#9)", %{shard: shard} do
+    Application.put_env(:fathom, :shard_flush_interval_ms, 0)
+    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    _ = :sys.get_state(coordinator)
+
+    assert map_size(:sys.get_state(coordinator).conns) > 0,
+           "the connection must still be checked out, or this exercises the idle path instead"
+
+    local = local_db(shard)
+    assert File.exists?(local), "no local file to begin with; the fixture proves nothing"
+
+    ref = Process.monitor(coordinator)
+    :ok = DynamicSupervisor.terminate_child(Fathom.ShardSupervisor, coordinator)
+    assert_receive {:DOWN, ^ref, :process, ^coordinator, _}, 5_000
+
+    # It still flushed — the #2 behaviour is unchanged.
+    assert File.exists?(remote_db(shard)), "the busy stop must still flush"
+
+    # THE ONE THAT FAILS PRE-FIX. The local copy survives, so writes acked during the shutdown
+    # window are still on disk for the next warm open to adopt rather than unlinked.
+    assert File.exists?(local),
+           "terminate/2 unlinked the shard file while streams were still checked out — every " <>
+             "write acked during the shutdown window is gone, silently"
+
+    # And the sidecar went with it, so that next open is a clean warm restart rather than a
+    # false fork quarantine.
+    assert File.exists?(local <> ".etag"),
+           "the provenance sidecar was dropped, so the kept local copy will read as a fork"
+  end
+
+  # The other intent of the same clause: a BUSY tenant delete (`Tenants.purge` → `Shards.stop`  # The other intent of the same clause: a BUSY tenant delete (`Tenants.purge` → `Shards.stop`
   # force-terminates with conns > 0, landing here). The id is tombstoned before the stop, so the
   # flush must be SKIPPED — the object is about to be purged, and re-uploading it is wasted work.
   # Pins that the #2 flush is gated on the tombstone so the delete path is unchanged.

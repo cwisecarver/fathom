@@ -111,6 +111,21 @@ defmodule Fathom.Telemetry do
       # actually happening, and it is also the moment a lineage was overwritten — so it wants to be
       # visible per shard in the log line and countable on the dashboard. Zero on a healthy fleet;
       # a rising rate means failovers, not a problem with this path.
+      # A coordinator stopped while streams were still checked out, so the local copy was KEPT
+      # rather than unlinked (expert review 2026-08-20 #9). Not an error: it is the shutdown path
+      # declining to delete a file its own live streams are still writing through. Worth counting
+      # because a RISING rate means coordinators are being stopped under load — a restart storm, a
+      # rolling deploy whose Edge plane is not draining first, or force-stops from tenant deletes —
+      # and because each one leaves a local file behind for the next warm open to adopt.
+      #
+      # NO shard_id tag: at a million tenants that label is cardinality death. It rides the event
+      # metadata for the log line instead.
+      counter("fathom.shard.drop_deferred.count",
+        event_name: [:fathom, :shard, :drop_deferred],
+        description:
+          "Coordinator shutdowns that kept the local shard copy because connections were still " <>
+            "checked out, instead of unlinking it under the streams still using it"
+      ),
       counter("fathom.shard.replica_promoted.count",
         event_name: [:fathom, :shard, :replica_promoted],
         description:

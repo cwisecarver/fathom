@@ -1621,6 +1621,17 @@ defmodule Fathom.Shard do
   # so a shutdown-ordering edge (Tombstones dies first) fails toward flushing — the safe direction.
   def terminate(_reason, %{conns: conns, lease: lease} = state)
       when map_size(conns) > 0 and not is_nil(lease) do
+    # Refuse NEW writes for the duration of the shutdown (expert review 2026-08-20 #9). Streams do
+    # not learn this coordinator is going away until its `:DOWN` fires, which is after terminate/2
+    # returns — so without this they keep committing through a checkpoint + VACUUM INTO + PUT that
+    # has already snapshotted past them. Fencing turns "acked, then not in the object" into a
+    # retryable 503, which is the difference between losing a write and asking for it again.
+    #
+    # Safe to publish unconditionally now: expert review #6 made `open_with_lease/8` clear the
+    # fence on every successful lease acquire, so a row left behind by a coordinator that never
+    # reached its own cleanup is lifted by the next open rather than stranding the tenant.
+    Fathom.Shard.WriteFence.fence(state.id)
+
     state = settle_flush_task(state)
     state = settle_waiters(state, {:error, :coordinator_stopped})
     Fathom.ShardLoad.forget(state.id)
@@ -1709,7 +1720,7 @@ defmodule Fathom.Shard do
   defp drop_clean(state) do
     # Clean: local == storage. Drop the local copy without re-uploading (nothing to
     # flush, no clobber possible) and release the lease for a clean handoff.
-    if File.exists?(state.path), do: drop_local(state.path)
+    if File.exists?(state.path), do: drop_local_unless_serving(state)
 
     # Release regardless of the local file (review 2026-07-23 #19): a coordinator can stop
     # clean with NO local file at all — a checkout abandoned before any connection opened on
@@ -1761,7 +1772,7 @@ defmodule Fathom.Shard do
               # Record the durable-flush time before we drop + release (#28): the shard's writes
               # reached storage, so it's NOT dirty-at-loss even though its coordinator is gone.
               Fathom.Directory.Recorder.record_flush(state.id)
-              drop_local(state.path)
+              drop_local_unless_serving(state)
               Storage.release_lease(state.id, state.lease)
 
             # A data-PUT 412 (expert review #2): re-check the lock before treating it as
@@ -1979,7 +1990,7 @@ defmodule Fathom.Shard do
 
       write_etag_sidecar(state.path, new_etag)
       Fathom.Directory.Recorder.record_flush(state.id)
-      drop_local(state.path)
+      drop_local_unless_serving(state)
       Storage.release_lease(state.id, state.lease)
     else
       other ->
@@ -2270,6 +2281,37 @@ defmodule Fathom.Shard do
       {:error, reason} -> {:error, {:quick_check_failed, reason}}
     end
   end
+
+  # Unlink the local copy — UNLESS streams are still holding it (expert review 2026-08-20 #9).
+  #
+  # `terminate/2`'s `conns > 0` clause runs on the rolling-deploy / SIGTERM / force-stop path, and
+  # the stream-side teardown is ASYNCHRONOUS: `Filo.Stream` learns only via its monitor on this
+  # coordinator, and that `:DOWN` cannot fire until terminate/2 RETURNS. So for the whole duration
+  # of checkpoint + VACUUM INTO + a full-object PUT — budgeted up to :shard_shutdown_ms, and
+  # seconds at real S3 latency — live streams keep committing writes that are neither in the
+  # snapshot we just uploaded nor, after an unlink, anywhere at all. Those writes were ACKED.
+  #
+  # The sibling `lease_lost` clause already reasons about exactly this and RENAMES for it
+  # ("safe while streams hold the file open — Unix keeps the fd on the renamed inode"). This path
+  # was added later and unlinked instead.
+  #
+  # KEEPING the file beats renaming it here. We stamped the sidecar with the etag we just uploaded,
+  # so a later warm open on this node reads sidecar == object, adopts the local copy, and RECOVERS
+  # the terminate-window writes. A rename would preserve them for forensics only. If another node
+  # takes over in between, the object's etag moves, the sidecar no longer matches, and the existing
+  # fork detection quarantines it — the designed behaviour, unchanged.
+  defp drop_local_unless_serving(%{conns: conns} = state) when map_size(conns) > 0 do
+    Logger.warning(
+      "shard #{state.id}: stopped with #{map_size(conns)} connection(s) still checked out; " <>
+        "KEEPING the local copy so writes acked during shutdown are not unlinked out from " <>
+        "under the streams that made them (the next warm open adopts it)"
+    )
+
+    :telemetry.execute([:fathom, :shard, :drop_deferred], %{count: 1}, %{shard_id: state.id})
+    :ok
+  end
+
+  defp drop_local_unless_serving(state), do: drop_local(state.path)
 
   defp drop_local(path), do: Enum.each(["", "-wal", "-shm", ".etag"], &File.rm(path <> &1))
 
