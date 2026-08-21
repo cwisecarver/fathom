@@ -109,6 +109,21 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     Follower.seed(Follower, id, position.epoch, position.wal_gen, 0, position.offset)
   end
 
+  # The byte half of install_replica/2, callable while the live files still exist. The graceful
+  # drop deletes them, so a test that stops the shard first has nothing left to copy.
+  defp copy_replica_bytes(id) do
+    path = Fathom.Shard.db_path(id)
+    File.cp!(path, Follower.db_path(Follower, id))
+
+    case File.stat(path <> "-wal") do
+      {:ok, %{size: size}} when size > 0 ->
+        File.cp!(path <> "-wal", Follower.wal_path(Follower, id))
+
+      _ ->
+        File.write!(Follower.wal_path(Follower, id), "")
+    end
+  end
+
   defp open_and_read(id) do
     {:ok, conn} = ShardExecutor.open(id)
     result = rows(conn)
@@ -220,6 +235,98 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     # Nothing was overwritten, so nothing needed preserving.
     assert {:ok, snapshots} = Storage.list_snapshots(id)
     refute Enum.any?(snapshots, &String.contains?(snapshot_id(&1), "pre-promotion"))
+  end
+
+  # THE GRACEFUL-DROP PATH, which every other test here deliberately avoids (see
+  # tear_down_primary/3's comment: using Shards.stop/1 "would leave the stored object holding all
+  # the rows and make every test here vacuous"). That avoidance is exactly why expert review
+  # 2026-08-20 #4 survived — the one path where the object's STAMP is wrong was the one path the
+  # suite routed around.
+  #
+  # `upload_for_drop/1` checkpoints with TRUNCATE and closes the connection, both of which destroy
+  # the WAL the stamp is read from. `Wal.read/1` answers `{:ok, :empty}` for an absent file exactly
+  # as for a never-written one, so the object went out stamped `{epoch, 0, 0}` — the MINIMUM for
+  # its epoch — while holding every row. Any replica with a non-zero position then outranked it.
+  #
+  # This is the ordinary lifecycle, not a failure: every idle drop past `:shard_idle_ms`, every
+  # graceful drain, every rebalance handoff.
+  test "a lagging replica is not promoted over a GRACEFULLY dropped object (#4)", ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+
+    # Flush at row 3, then write 7 more, so the shard is DIRTY at stop time and the graceful drop
+    # actually runs upload_for_drop/1. Flushing at the last row leaves it clean, Shards.stop/1
+    # takes the drop-clean path, and the stamp under test is never written — the first draft did
+    # exactly that and the precondition below caught it.
+    {conn, _coordinator} = build_shard(id, 10, 3)
+
+    # Copy the replica's BYTES now, while the live files still exist — the graceful drop deletes
+    # them. The position it advertises is seeded after the stop.
+    copy_replica_bytes(id)
+    :ok = ShardExecutor.close(conn)
+
+    # The graceful drain — drop-flush uploads everything and releases the lease.
+    :ok = Shards.stop(id)
+
+    assert {:ok, stamp} = Storage.object_position(id)
+
+    # THE PRECONDITION, and the assertion that fails pre-fix. Two outcomes are correct here and
+    # both are safe: `nil` (the WAL was already unlinked by the last stream close, so the
+    # generation is unknowable and the object is un-overridable) or `{epoch, gen + 1, 0}` (the
+    # checkpoint folded generation `gen` in). What must NEVER happen is `{epoch, 0, 0}` — the
+    # LOWEST position for the epoch, stamped on an object holding every row, which is what the
+    # old read-after-the-checkpoint produced and what let any lagging replica outrank it.
+    refute match?(%{wal_gen: 0, offset: 0}, stamp),
+           "the drop-flush stamped a complete object at the minimum position for its epoch " <>
+             "(#{inspect(stamp)}); every lagging replica now outranks it"
+
+    # A replica that is BEHIND: generation 0, but far along in it. Strictly greater than the buggy
+    # {epoch, 0, 0} and strictly less than either correct answer, so this fixture discriminates
+    # rather than merely passing.
+    Follower.seed(Follower, id, 1, 0, 0, 999_999)
+
+    assert open_and_read(id) == Enum.to_list(1..10),
+           "a lagging replica was promoted over a complete, gracefully-flushed object"
+
+    assert {:ok, snapshots} = Storage.list_snapshots(id)
+
+    refute Enum.any?(snapshots, &String.contains?(snapshot_id(&1), "pre-promotion")),
+           "a promotion ran over a complete, gracefully-flushed object"
+  end
+
+  # The other branch of the same fix: the WAL is still PRESENT when the drop runs, because a stream
+  # is still checked out and Shards.stop/1 force-stops the coordinator under it. Here the stamp is
+  # the positive claim `{epoch, gen + 1, 0}` rather than `nil`, and it must still beat a replica
+  # sitting anywhere in generation `gen`.
+  test "a drop with the WAL still present claims the NEXT generation (#4)", ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+
+    {conn, _coordinator} = build_shard(id, 10, 3)
+    copy_replica_bytes(id)
+
+    # NOT closing the connection: the coordinator terminates with conns > 0, so its flush_and_drop
+    # runs while the WAL is still on disk.
+    :ok = Shards.stop(id)
+
+    _ =
+      try do
+        ShardExecutor.close(conn)
+      catch
+        :exit, _ -> :ok
+      end
+
+    assert {:ok, stamp} = Storage.object_position(id)
+    refute is_nil(stamp), "no stamp was written, so the comparison below proves nothing"
+
+    refute match?(%{wal_gen: 0, offset: 0}, stamp),
+           "the drop-flush stamped a complete object at the minimum position for its epoch " <>
+             "(#{inspect(stamp)})"
+
+    Follower.seed(Follower, id, stamp.epoch, max(stamp.wal_gen - 1, 0), 0, 999_999)
+
+    refute Promote.fresher?(Follower.state_of(Follower, id), stamp),
+           "a replica one generation behind outranks the object that folded that generation in"
   end
 
   test "an equal replica is not promoted", ctx do

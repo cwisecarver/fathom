@@ -203,13 +203,49 @@ defmodule Fathom.Shard.FlushPositionTest do
       [body, _] = String.split(body, "\n  defp ", parts: 2)
 
       snapshot_at = :binary.match(body, "snapshot(state.path, temp)") |> elem(0)
-      position_at = :binary.match(body, "flush_position(state)") |> elem(0)
+      position_at = :binary.match(body, "flush_position(state, pre)") |> elem(0)
 
       assert position_at > snapshot_at,
-             "flush_position/1 is read BEFORE the snapshot in snapshot_and_upload/1. That makes " <>
+             "flush_position is read BEFORE the snapshot in snapshot_and_upload/1. That makes " <>
                "the stamp UNDER-claim: the object then contains more than it says, and a replica " <>
                "sitting between the claim and the truth is judged fresher and promoted over it — " <>
                "silently dropping the writes that landed during the snapshot. Read it after."
+
+      # The OTHER half of the same invariant (expert review 2026-08-20 #4). The live read above
+      # must stay after the snapshot; the `pre` header it falls back to must be captured BEFORE
+      # anything mutates the WAL, or the fallback is measuring the same destroyed file the live
+      # read already failed on.
+      pre_at = :binary.match(body, "pre = Fathom.Shard.Replication.Wal.read") |> elem(0)
+
+      assert pre_at < snapshot_at,
+             "the `pre` WAL header is captured AFTER the snapshot in snapshot_and_upload/1. " <>
+               "snapshot/2 is frequently the last connection and its close unlinks -wal, so a " <>
+               "late capture reads :empty and the stamp collapses to {epoch, 0, 0} — the lowest " <>
+               "position for the epoch, on a complete object. Capture it first."
+    end
+
+    # The drop path is where this bug was DETERMINISTIC, and it had no guard at all — the one
+    # above was scoped to snapshot_and_upload/1 by a string split on that function name, so the
+    # path that stamps every clean idle-drop, graceful drain and rebalance handoff was unwatched.
+    test "captures_the_generation_before_the_checkpoint_on_the_drop_path" do
+      source = File.read!("lib/fathom/shard.ex")
+
+      [_, body] = String.split(source, "defp upload_for_drop(state) do", parts: 2)
+      [body, _] = String.split(body, "\n  defp ", parts: 2)
+
+      pre_at = :binary.match(body, "pre = Fathom.Shard.Replication.Wal.read") |> elem(0)
+      checkpoint_at = :binary.match(body, "checkpoint_and_verify(state.path)") |> elem(0)
+      position_at = :binary.match(body, "flush_position(state, pre)") |> elem(0)
+
+      assert pre_at < checkpoint_at,
+             "upload_for_drop/1 reads the WAL header AFTER checkpoint_and_verify/1, which runs " <>
+               "wal_checkpoint(TRUNCATE) and closes the connection (unlinking -wal on the last " <>
+               "one). The header is gone by then, the stamp collapses to {epoch, 0, 0}, and every " <>
+               "lagging replica outranks a complete object."
+
+      assert position_at > checkpoint_at,
+             "upload_for_drop/1 computes the position BEFORE the checkpoint, which under-claims " <>
+               "for the same reason the snapshot path must not."
     end
 
     test "an object flushed without a stamp reports none", ctx do

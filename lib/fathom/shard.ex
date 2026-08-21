@@ -1999,14 +1999,22 @@ defmodule Fathom.Shard do
   # drop_local/1 is about to delete, so fall back to a VACUUM INTO snapshot, which
   # captures WAL content regardless.
   defp upload_for_drop(state) do
+    # THE GENERATION MUST BE CAPTURED HERE, BEFORE THE CHECKPOINT (expert review 2026-08-20 #4).
+    # checkpoint_and_verify/1 runs `wal_checkpoint(TRUNCATE)` and then closes the connection, which
+    # on the last one unlinks `-wal`/`-shm` — so reading the WAL afterwards finds nothing and, on
+    # the old code, stamped this object `{epoch, 0, 0}`: the LOWEST position for the epoch, on the
+    # most complete copy of the shard that will ever exist. Every clean idle-drop, graceful drain
+    # and rebalance handoff went out that way, and any lagging replica then outranked it.
+    pre = Fathom.Shard.Replication.Wal.read(state.path <> "-wal")
+
     # checkpoint_and_verify/1 runs BOTH on one connection (review 2026-07-24 #31) and reports which
     # stage failed, because the two failures need opposite handling: a corrupt local db must refuse
     # the flush, while a merely-busy checkpoint must fall back to the snapshot path.
     case checkpoint_and_verify(state.path) do
       :ok ->
-        # Read after the checkpoint, same reasoning as `snapshot_and_upload/1`: the WAL has just
-        # been folded into the database, so the position describes bytes that are genuinely here.
-        Storage.flush(state.id, state.path, state.etag, flush_position(state))
+        # The WAL has just been folded into the database, so the object holds everything through
+        # the end of `pre`'s generation — see flush_position/2 for why that is claimed as gen + 1.
+        Storage.flush(state.id, state.path, state.etag, flush_position(state, pre))
 
       # Integrity failed (expert review 2026-07-14 #4). The checkpoint-then-raw-upload fast path
       # uploads the bytes as-is, so a locally corrupted db (disk/fs/memory fault, exqlite/OS bug)
@@ -2973,20 +2981,60 @@ defmodule Fathom.Shard do
   #
   # `nil` when the WAL is unreadable or there is no lease: an absent stamp reads as "unknown" and
   # makes the object un-overridable, which is the same safe answer.
-  defp flush_position(%{lease: %{epoch: epoch}} = state) when is_integer(epoch) do
+  #
+  # `pre` IS THE WAL HEADER READ BEFORE THE FLUSH MUTATED ANYTHING, and it exists because the
+  # read-after rule above breaks in one case (expert review 2026-08-20 #4). The flush can DESTROY
+  # the WAL it is about to be measured from: `upload_for_drop/1` runs `wal_checkpoint(TRUNCATE)`
+  # and `snapshot/2` is frequently the LAST connection, whose close unlinks `-wal`/`-shm`.
+  # `Wal.read/1` answers `{:ok, :empty}` for an absent or sub-header file exactly as it does for a
+  # never-written one, so the read-after landed on the `:empty` branch and stamped `{epoch, 0, 0}`
+  # — THE MINIMUM FOR THE EPOCH — onto the most complete copy of the shard that will ever exist.
+  # Every lagging replica then outranks it in `Promote.fresher?/2` and is promoted over it.
+  #
+  # So: over-claim from `pre` instead. A checkpoint FOLDS the WAL into the database, so an object
+  # written after one holds everything through the end of generation `gen`; stamping `gen + 1`
+  # with offset 0 is strictly greater than any replica at `{epoch, gen, ≤N}` and keeps the
+  # over-claim direction the comment above requires. This is not "read before the snapshot" — the
+  # live read still happens after, and still wins whenever the WAL survives.
+  defp flush_position(state), do: flush_position(state, {:ok, :empty})
+
+  defp flush_position(%{lease: %{epoch: epoch}} = state, pre) when is_integer(epoch) do
     case Fathom.Shard.Replication.Wal.read(state.path <> "-wal") do
       {:ok, %{ckpt_seq: gen, size: size}} -> %{epoch: epoch, wal_gen: gen, offset: size}
-      # No WAL yet: nothing has been written through one, so the object contains everything
-      # there is at this epoch's generation 0.
-      {:ok, :empty} -> %{epoch: epoch, wal_gen: 0, offset: 0}
+      {:ok, :empty} -> position_after_checkpoint(epoch, pre)
       {:error, _} -> nil
     end
   end
 
-  defp flush_position(_state), do: nil
+  defp flush_position(_state, _pre), do: nil
+
+  # The WAL is empty or gone AFTER the flush. What that means depends entirely on what was there
+  # BEFORE, and the two cases are opposite.
+  #
+  # Known generation ⇒ the checkpoint folded it in ⇒ claim the next generation at offset 0.
+  defp position_after_checkpoint(epoch, {:ok, %{ckpt_seq: gen}}),
+    do: %{epoch: epoch, wal_gen: gen + 1, offset: 0}
+
+  # Empty before AND after is AMBIGUOUS, and `nil` is the only safe answer. It reads like "a brand
+  # new shard at generation 0" — which is one of the two situations — but it is equally a shard
+  # whose WAL was truncated and unlinked by an EARLIER cycle, which may sit at any generation with
+  # replicas holding frames from it. `{epoch, 0, 0}` would lose to every one of them. `nil` means
+  # "unknown", making the object un-overridable, and that costs nothing real: an empty WAL at flush
+  # time means there are no un-folded writes, so the object IS complete and preferring it over any
+  # replica is correct. The price is that promote-on-open will not fire for this shard — i.e. the
+  # pre-A2 behaviour, which AGENTS.md already calls "never worse than off".
+  defp position_after_checkpoint(_epoch, _pre), do: nil
 
   defp snapshot_and_upload(state) do
     temp = "#{state.path}.snap.#{System.unique_integer([:positive])}"
+
+    # The generation, captured before anything mutates the WAL (expert review 2026-08-20 #4).
+    # `snapshot/2` is FREQUENTLY the last connection — its own comment says the periodic flush
+    # "fires on any dirty shard, which is routinely one with zero checked-out streams" — and the
+    # last close unlinks `-wal`/`-shm`. Only consulted when the post-snapshot read finds nothing;
+    # the live read still happens after the snapshot and still wins whenever the WAL survives, so
+    # the over-claim rule below is unchanged.
+    pre = Fathom.Shard.Replication.Wal.read(state.path <> "-wal")
 
     try do
       # Integrity BEFORE the snapshot: quarantine_corrupt!/2 renames the live path, so checking
@@ -2994,7 +3042,8 @@ defmodule Fathom.Shard do
       with :ok <- verify_snapshot(state, temp),
            :ok <- snapshot(state.path, temp),
            :ok <- recheck_before_put(state),
-           {:ok, new_etag} <- Storage.flush(state.id, temp, state.etag, flush_position(state)) do
+           {:ok, new_etag} <-
+             Storage.flush(state.id, temp, state.etag, flush_position(state, pre)) do
         {:ok, new_etag}
       else
         {:error, :superseded} = superseded ->
