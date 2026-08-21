@@ -29,6 +29,7 @@ defmodule Fathom.Application do
     check_shard_override!()
     check_default_shard!()
     check_hrana_exposure!()
+    check_replication_exposure!()
 
     # Grouped into plane sub-supervisors (each with its own restart budget) rather than
     # one flat list, so a control-plane restart-storm (e.g. Repo) is contained to its
@@ -285,6 +286,36 @@ defmodule Fathom.Application do
   # wildcard interface, the data plane is unauthenticated and reachable on every interface — the
   # ONLY tenant-isolation control is an external firewall/security-group. This is the documented
   # network-trust posture (docs/auth.md), so WARN rather than raise. Prod-only.
+  # Expert review 2026-08-20 #3: the replication listener has NO authentication of any kind — no
+  # credential in the protocol, no peer allowlist — and `Fleet.follower_children/0` omits `:ip`
+  # when `:replication_bind_ip` is unset, so `:gen_tcp.listen` binds every interface. Until #3's
+  # tier 2/3 land (peer allowlist, frame HMAC), a reachable replication port is equivalent to
+  # WRITE ACCESS TO EVERY SHARD ON THE NODE: a seed installs a replica with an attacker-chosen
+  # epoch, `Promote.fresher?/2` is a bare tuple compare, and the promote path publishes it to S3
+  # as the tenant's durable object.
+  #
+  # RAISES where check_hrana_exposure!/0 only warns, and the asymmetry is the point: the Hrana
+  # port has an auth mode to fall back on (HRANA_AUTH=required), so an operator who leaves it
+  # unauthenticated has made a choice the warning names. This port has no such mode — the network
+  # IS the only boundary, so a wildcard bind is not a posture, it is an unguarded door. Prod-only,
+  # and only when listening is actually on, so dev/test/rig configs are unaffected.
+  @doc false
+  def check_replication_exposure! do
+    wildcard_binds = [{0, 0, 0, 0}, {0, 0, 0, 0, 0, 0, 0, 0}]
+    bind = Application.get_env(:fathom, :replication_bind_ip)
+
+    if Application.get_env(:fathom, :env) == :prod and
+         Application.get_env(:fathom, :replication_listen, false) == true and
+         (is_nil(bind) or bind in wildcard_binds) do
+      raise "config error: the replication listener is enabled and bound to ALL interfaces " <>
+              "(:replication_bind_ip #{inspect(bind)}). That port is UNAUTHENTICATED — anyone " <>
+              "who can reach it can seed a forged replica for any shard and have it promoted " <>
+              "over the tenant's durable object (expert review 2026-08-20 #3). Pin " <>
+              "REPLICATION_BIND_IP to the private interface the fleet reaches, or turn " <>
+              "REPLICATION_LISTEN off."
+    end
+  end
+
   @doc false
   def check_hrana_exposure! do
     wildcard_binds = [{0, 0, 0, 0}, {0, 0, 0, 0, 0, 0, 0, 0}]

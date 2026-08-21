@@ -776,6 +776,55 @@ defmodule Fathom.ShardExecutorTest do
            end) =~ "firewall"
   end
 
+  # Expert review 2026-08-20 #3. RAISES where the Hrana guard above only warns, and the asymmetry
+  # is the property under test: the Hrana port has an auth mode to fall back on, so leaving it
+  # open is a posture a warning can name. The replication port has NO authentication at all — no
+  # credential in the protocol, no peer allowlist — so a wildcard bind is an unguarded door to
+  # write access on every shard the node holds.
+  test "the replication listener refuses to boot in prod bound to all interfaces" do
+    prev_env = Application.get_env(:fathom, :env)
+    prev_listen = Application.get_env(:fathom, :replication_listen)
+    prev_bind = Application.get_env(:fathom, :replication_bind_ip)
+
+    on_exit(fn ->
+      Application.put_env(:fathom, :env, prev_env)
+      restore_env(:replication_listen, prev_listen)
+      restore_env(:replication_bind_ip, prev_bind)
+    end)
+
+    Application.put_env(:fathom, :env, :prod)
+    Application.put_env(:fathom, :replication_listen, true)
+    Application.delete_env(:fathom, :replication_bind_ip)
+
+    # Unset bind = wildcard, because Fleet.follower_children/0 simply omits :ip.
+    assert_raise RuntimeError, ~r/UNAUTHENTICATED/, fn ->
+      Fathom.Application.check_replication_exposure!()
+    end
+
+    # Both wildcard forms, spelled out.
+    for wildcard <- [{0, 0, 0, 0}, {0, 0, 0, 0, 0, 0, 0, 0}] do
+      Application.put_env(:fathom, :replication_bind_ip, wildcard)
+
+      assert_raise RuntimeError, ~r/REPLICATION_BIND_IP/, fn ->
+        Fathom.Application.check_replication_exposure!()
+      end
+    end
+
+    # A pinned interface is the fix, and passes.
+    Application.put_env(:fathom, :replication_bind_ip, {10, 0, 0, 7})
+    assert Fathom.Application.check_replication_exposure!() == nil
+
+    # Not listening at all is fine however it is bound — the guard is about an OPEN port.
+    Application.put_env(:fathom, :replication_listen, false)
+    Application.delete_env(:fathom, :replication_bind_ip)
+    assert Fathom.Application.check_replication_exposure!() == nil
+
+    # And it is prod-only, like every sibling guard.
+    Application.put_env(:fathom, :env, :dev)
+    Application.put_env(:fathom, :replication_listen, true)
+    assert Fathom.Application.check_replication_exposure!() == nil
+  end
+
   # All five 2026-07-14 config guards are prod-only: with env != :prod (the dev/test default),
   # every one is inert regardless of the risky config, so they never fire outside prod.
   test "all 2026-07-14 config guards are inert when env is not prod" do
