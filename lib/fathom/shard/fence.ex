@@ -84,7 +84,27 @@ defmodule Fathom.Shard.Fence do
     # check_lease returning :ok and the generation read would otherwise be folded into the new
     # baseline and hidden, so every later flush would pass the fence unconditionally (finding
     # #5). Capturing it first means any lapse after this point re-trips :revalidate.
-    gen = generation(deps)
+    # KEEP THE OLD GENERATION WHEN THE HEARTBEAT IS UNREADABLE (expert review 2026-08-20 #30).
+    #
+    # `generation/1` maps a heartbeat-process exit to `nil`, and every caller merges this result
+    # straight into coordinator state. A `nil` `acquire_gen` permanently routes that coordinator to
+    # `legacy/2` — the correct DEGRADATION, except the per-shard renewal timer is armed only ONCE,
+    # at open (`shard.ex`: `if acquire_gen == nil, do: schedule_renew(state)`). `schedule_renew/1`
+    # is otherwise reachable only from a timer that is already running, so a coordinator downgraded
+    # mid-life renews its lock only when `check/2` happens to run — and `check/2` runs only on a
+    # FLUSH, which only happens while the shard is DIRTY.
+    #
+    # A read-only or lightly-written shard in that state therefore never renews. Its
+    # `expires_at_ms` was set once at acquire, so after `ttl + steal_margin` a peer legitimately
+    # steals the lease while this node is still serving: a double-serve window with no partition
+    # and no heartbeat failure required, and any write accepted in it is quarantined at the next
+    # fence.
+    #
+    # Preserving `ctx.acquire_gen` costs nothing and keeps the degradation PER FLUSH: the next
+    # `check/2` calls `heartbeat_valid/2`, which catches the same exit and returns `:legacy`, which
+    # renews. `check/2`'s own `:legacy` branch already preserves `ctx.acquire_gen` for exactly this
+    # reason — that contrast is what shows the `nil` here was unintended rather than a decision.
+    gen = generation(deps) || ctx.acquire_gen
 
     case deps.check_lease.(ctx.id, ctx.lease) do
       :ok -> {:ok, %{lease: ctx.lease, acquire_gen: gen}}

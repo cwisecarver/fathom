@@ -50,6 +50,45 @@ defmodule Fathom.Shard.FenceTest do
       assert {:ok, %{lease: @lease, acquire_gen: 9}} = Fence.check(ctx(), d)
     end
 
+    # A HEARTBEAT-PROCESS EXIT DURING REVALIDATE MUST NOT NULL THE GENERATION
+    # (expert review 2026-08-20 #30).
+    #
+    # `generation/1` maps the exit to nil, and every caller merges this result straight into
+    # coordinator state. A nil `acquire_gen` permanently routes that coordinator to `legacy/2` --
+    # the correct DEGRADATION, except the per-shard renewal timer is armed only ONCE, at open.
+    # `schedule_renew/1` is otherwise reachable only from a timer already running, so a
+    # coordinator downgraded mid-life renews its lock only when `check/2` runs -- and `check/2`
+    # runs only on a FLUSH, which only happens while the shard is DIRTY.
+    #
+    # A read-only or lightly-written shard in that state never renews. Its `expires_at_ms` was set
+    # once at acquire, so after ttl + steal_margin a peer legitimately steals the lease while this
+    # node is still serving: a double-serve window with no partition and no heartbeat failure.
+    test ":revalidate with the heartbeat process GONE keeps the old generation" do
+      d =
+        deps(%{
+          valid_for_write: fn _ -> :revalidate end,
+          check_lease: fn "shard_a", _lease -> :ok end,
+          generation: fn -> exit(:noproc) end
+        })
+
+      assert {:ok, %{lease: @lease, acquire_gen: 5}} = Fence.check(ctx(), d),
+             "a momentary heartbeat exit nulled acquire_gen, permanently downgrading this " <>
+               "coordinator to legacy mode WITHOUT arming its renewal timer -- so a quiet shard " <>
+               "stops renewing its lock and is legitimately stolen while still serving"
+    end
+
+    # The contrast that shows the nil above was unintended rather than a decision: `check/2`'s own
+    # `:legacy` branch has always preserved `ctx.acquire_gen`.
+    test ":legacy preserves the generation, so the heartbeat is used again when it returns" do
+      d =
+        deps(%{
+          valid_for_write: fn _ -> exit(:noproc) end,
+          renew_lease: fn "shard_a", lease, 30_000 -> {:ok, %{lease | epoch: 3}} end
+        })
+
+      assert {:ok, %{acquire_gen: 5}} = Fence.check(ctx(), d)
+    end
+
     test ":revalidate + superseded => :superseded (self-fence, no {:ok,_})" do
       # generation is sampled before check_lease (finding #5), so it's read even on this path.
       d =
