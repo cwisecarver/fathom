@@ -185,7 +185,10 @@ defmodule Fathom.Shard.Replication.Session do
        # a QUIET shard from a busy one. See `handle_info(:catch_up, ...)`.
        catchup_ref: nil,
        commits: 0,
-       catchup_at: 0
+       catchup_at: 0,
+       # Consecutive catch-up rounds that were ALSO refused. Drives the backoff in
+       # `retry_delay_ms/2`; reset by any commit that comes back with no rejects.
+       catchup_fails: 0
      }}
   end
 
@@ -1096,11 +1099,11 @@ defmodule Fathom.Shard.Replication.Session do
   # laggard stayed behind — the exact strand this retry exists to prevent, reintroduced by the
   # guard meant to keep it cheap. Caught by instrumenting the failure (`commits=6 catchup_at=2
   # ref=nil`) rather than by reading.
-  defp arm_catchup(%{catchup_ref: ref} = state) when ref != nil,
+  defp arm_catchup(%{catchup_ref: ref} = state, _rejects) when ref != nil,
     do: %{state | catchup_at: state.commits}
 
-  defp arm_catchup(state) do
-    case catchup_ms() do
+  defp arm_catchup(state, rejects) do
+    case retry_delay_ms(state.catchup_fails, rejects) do
       0 ->
         state
 
@@ -1113,8 +1116,65 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
-  defp arm_if_rejected(state, []), do: state
-  defp arm_if_rejected(state, _rejects), do: arm_catchup(state)
+  # A CLEAN commit is the only thing that clears the failure count. Not tidiness: without it a
+  # shard that recovers stays at the backed-off delay forever, so the next genuine straggler waits
+  # a whole flush interval to be made good instead of the 1 s the retry was tuned for.
+  defp arm_if_rejected(state, []), do: %{state | catchup_fails: 0}
+
+  defp arm_if_rejected(state, rejects),
+    do: arm_catchup(%{state | catchup_fails: state.catchup_fails + 1}, rejects)
+
+  # BACKOFF, AND WHY THE FLAT 1 Hz RETRY WAS A CASCADING FAILURE (expert review 2026-08-20 #25).
+  #
+  # `arm_if_rejected/2` fires on ANY non-empty reject list, and `:disconnected` is in that list —
+  # `Shipper` produces one for every push to a follower whose socket is down, and `drop/2` produces
+  # one for every waiter when a link fails. There was no backoff, no attempt limit and no "this
+  # follower is not coming back" condition, so with one peer down every Session on the node ran a
+  # full `Wal.read` + `Primary.plan` + `Wal.read_delta` + budget-reserve + ship cycle once per
+  # second, indefinitely, on shards with ZERO tenant traffic. At the ~200 shards/node the rig holds
+  # at 1024 tenants that is ~200 pointless plan-and-read cycles per second, each of which also
+  # blocks its session for up to `replication_timeout_ms` (5 s) inside `handle_info`, so real client
+  # commits queue behind a retry for a peer that is not coming back.
+  #
+  # AGENTS.md measures the retry as free. That measurement was taken with all peers UP, which is
+  # precisely the case where it never arms.
+  #
+  # Two rules, and the split matters:
+  #
+  #   * ALL rejects `:disconnected` ⇒ go straight to the cap. There is no socket, so no amount of
+  #     retrying sooner can help. Read off the REASON rather than probing `Shipper.connected?/1`,
+  #     which would put a `GenServer.call` on the commit path to learn something the reject
+  #     already says.
+  #   * otherwise exponential from `catchup_ms()`, capped. `:already_in_flight` and `:overloaded`
+  #     are transient and local, and the first retry at 1 s is what makes a quiet shard's laggard
+  #     good — so the fast first attempt is preserved and only a REPEATEDLY refused shard slows.
+  #
+  # The cap is `:shard_flush_interval_ms` because that is the window past which staleness starts to
+  # cost something: the durability flush checkpoints the WAL, and a follower still behind at that
+  # point forces `Primary.plan/3` to `{:reset, 0, size}` — the whole WAL rather than a delta, which
+  # AGENTS.md's 2026-08-18 A/B measures as the difference between 4 errors and 22,599.
+  @doc false
+  @spec retry_delay_ms(non_neg_integer(), [{term(), atom(), non_neg_integer()}]) ::
+          non_neg_integer()
+  def retry_delay_ms(fails, rejects) do
+    case catchup_ms() do
+      0 ->
+        0
+
+      base ->
+        cap = max(base, flush_interval_ms())
+
+        if rejects != [] and
+             Enum.all?(rejects, fn {_s, reason, _at} -> reason == :disconnected end) do
+          cap
+        else
+          min(base * Integer.pow(2, min(max(fails - 1, 0), 16)), cap)
+        end
+    end
+  end
+
+  defp flush_interval_ms,
+    do: Application.get_env(:fathom, :shard_flush_interval_ms, 5_000)
 
   # How long after a locally-refused push before the retry re-enters the commit path. 1 s: above any
   # round trip, so a straggler's real reply lands first and the retry then finds nothing to do; and

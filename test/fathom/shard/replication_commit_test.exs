@@ -444,4 +444,132 @@ defmodule Fathom.Shard.ReplicationCommitTest do
                "already acked as quorum-durable."
     end
   end
+
+  # CATCH-UP BACKOFF (expert review 2026-08-20 #25).
+  #
+  # `arm_if_rejected/2` fires on ANY non-empty reject list, and `:disconnected` is in that list --
+  # `Shipper` produces one for every push to a follower whose socket is down, and `drop/2` produces
+  # one for every waiter when a link fails. There was no backoff, no attempt cap and no "this peer
+  # is not coming back" condition, so with one peer down EVERY session on the node re-entered the
+  # full plan-and-read commit path once per second, indefinitely, on shards with zero tenant
+  # traffic. At the ~200 shards/node the rig holds at 1024 tenants that is ~200 pointless cycles a
+  # second, each blocking its session for up to 5 s inside `handle_info`, so real client commits
+  # queue behind a retry for a peer that is not coming back.
+  #
+  # Tested at the pure-function level because the defect is arithmetic and the alternative --
+  # observing wall-clock timer intervals -- is the flaky shape AGENTS.md warns about.
+  describe "the catch-up retry backs off (#25)" do
+    setup do
+      prev_catchup = Application.get_env(:fathom, :replication_catchup_ms)
+      prev_flush = Application.get_env(:fathom, :shard_flush_interval_ms)
+      Application.put_env(:fathom, :replication_catchup_ms, 1_000)
+      Application.put_env(:fathom, :shard_flush_interval_ms, 30_000)
+
+      on_exit(fn ->
+        restore = fn k, v ->
+          if is_nil(v),
+            do: Application.delete_env(:fathom, k),
+            else: Application.put_env(:fathom, k, v)
+        end
+
+        restore.(:replication_catchup_ms, prev_catchup)
+        restore.(:shard_flush_interval_ms, prev_flush)
+      end)
+
+      :ok
+    end
+
+    defp transient(n), do: for(i <- 1..n, do: {:"s#{i}", :already_in_flight, 0})
+    defp gone(n), do: for(i <- 1..n, do: {:"s#{i}", :disconnected, 0})
+
+    test "the FIRST refusal still retries fast -- that is what makes a quiet shard's laggard good" do
+      assert Session.retry_delay_ms(1, transient(1)) == 1_000
+    end
+
+    test "consecutive refusals double, and stop at the flush interval" do
+      assert Session.retry_delay_ms(2, transient(1)) == 2_000
+      assert Session.retry_delay_ms(3, transient(1)) == 4_000
+      assert Session.retry_delay_ms(4, transient(1)) == 8_000
+      assert Session.retry_delay_ms(5, transient(1)) == 16_000
+
+      # Capped at :shard_flush_interval_ms, and it STAYS capped -- Integer.pow with an uncapped
+      # exponent would overflow into an absurd timer rather than converge.
+      assert Session.retry_delay_ms(6, transient(1)) == 30_000
+      assert Session.retry_delay_ms(50, transient(1)) == 30_000
+      assert Session.retry_delay_ms(5_000, transient(1)) == 30_000
+    end
+
+    test "a peer with no socket goes straight to the cap -- retrying sooner cannot help" do
+      assert Session.retry_delay_ms(1, gone(1)) == 30_000
+      assert Session.retry_delay_ms(1, gone(3)) == 30_000
+    end
+
+    test "a MIXED list is treated as transient, because part of it can still be made good" do
+      mixed = gone(1) ++ transient(1)
+      assert Session.retry_delay_ms(1, mixed) == 1_000
+    end
+
+    test "catchup_ms 0 still disables the retry entirely" do
+      Application.put_env(:fathom, :replication_catchup_ms, 0)
+      assert Session.retry_delay_ms(1, transient(1)) == 0
+      assert Session.retry_delay_ms(9, gone(1)) == 0
+    end
+
+    test "a flush interval BELOW the base delay never shortens the first retry" do
+      # The rig defaults the flush interval 60x tighter than production (AGENTS.md #33). A cap
+      # under the base would otherwise make the backoff a speed-up.
+      Application.put_env(:fathom, :shard_flush_interval_ms, 200)
+      assert Session.retry_delay_ms(1, transient(1)) == 1_000
+      assert Session.retry_delay_ms(9, transient(1)) == 1_000
+      assert Session.retry_delay_ms(1, gone(1)) == 1_000
+    end
+
+    # The COUNTER half, on a real session. The arithmetic above is only useful if something
+    # actually drives `catchup_fails`, and the reset is what stops a shard that recovered from
+    # sitting at the capped delay forever.
+    test "the failure count climbs on rejects and is cleared by a clean commit", ctx do
+      %{id: id, root: root} = ctx
+      # Three live followers, quorum one, and only TWO of them seeded. The quorum then SUCCEEDS
+      # while the third refuses `:unknown_shard` — which is the branch that matters and the one
+      # the sibling arms describe: `{:ok, _, rejects}`, tenant sees `:ok`, one follower silently
+      # behind. A commit whose quorum FAILS seeds and retries synchronously instead, so it never
+      # reaches the deferred retry at all.
+      followers = start_followers!(root, 3)
+
+      Application.put_env(:fathom, :replication_enabled, true)
+      Application.put_env(:fathom, :replication_quorum, 1)
+
+      Application.put_env(
+        :fathom,
+        :replication_followers,
+        for({_n, p} <- followers, do: {~c"127.0.0.1", p})
+      )
+
+      start_supervised!(Fleet)
+
+      {:ok, coordinator, ref, path} = Shards.checkout(id)
+      on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+      {:ok, conn} = Connection.open(path)
+      on_exit(fn -> Connection.close(conn) end)
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
+
+      for {n, _} <- Enum.take(followers, 2), do: Follower.seed(n, id, 0, 0, 0, 0)
+
+      # The third is deliberately left unseeded: it answers `:unknown_shard`, which is a reject,
+      # which is what arms the deferred retry in the first place.
+      _ = Session.commit(id, path <> "-wal", coordinator)
+      [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+      assert :sys.get_state(session).catchup_fails > 0
+
+      # The first commit started the seed; once it lands the follower answers cleanly and the
+      # count must go back to zero, or the next genuine straggler waits a whole flush interval
+      # to be made good instead of the 1 s the retry was tuned for.
+      expected = File.read!(path <> "-wal")
+      for {n, _} <- followers, do: await_wal(n, id, expected)
+
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+      assert :ok = Session.commit(id, path <> "-wal", coordinator)
+      assert :sys.get_state(session).catchup_fails == 0
+    end
+  end
 end
