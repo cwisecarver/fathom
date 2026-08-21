@@ -34,7 +34,12 @@ defmodule FathomWeb.Router do
     # Tenant data export (#15): a file download, so a plain controller (not a LiveView).
     get "/tenants/:id/export", AdminTenantController, :export
 
-    live_session :admin do
+    # The operator behind the BasicAuth, handed to the LiveViews (expert review 2026-08-20 #32).
+    # `AdminQueryLive` mints a tenant credential on every execution and those mints land in the
+    # issuance ledger, so an unattributed one is both credential sprawl and a poisoned input to
+    # the fleet-wide revoke. Mirrors `AdminTenantController.admin_actor/1`, with a distinct
+    # `console:` prefix so console mints stay separable from export attribution.
+    live_session :admin, session: {__MODULE__, :admin_live_session, []} do
       live "/", AdminOverviewLive, :index
       live "/shards", AdminShardsLive, :index
       live "/directory", AdminDirectoryLive, :index
@@ -175,6 +180,17 @@ defmodule FathomWeb.Router do
   # `:admin_auth_max_failures`, off by default) locks out an IP with 429 after too many failures in
   # the window, so the one shared admin password (#8) isn't online-brute-forceable. Baked in here so
   # BOTH the `:admin_auth` pipeline and the `api_auth` BasicAuth fallback are covered.
+  @doc false
+  def admin_live_session(conn) do
+    actor =
+      case Plug.BasicAuth.parse_basic_auth(conn) do
+        {user, _pass} -> "console:#{user}"
+        _ -> "console"
+      end
+
+    %{"admin_actor" => actor}
+  end
+
   defp require_admin_auth(conn, _opts) do
     creds = Application.get_env(:fathom, :admin_auth, [])
     user = creds[:username]

@@ -37,6 +37,10 @@ defmodule Fathom.QueryConsole do
   alias Fathom.HranaAuth
 
   @max_rows 1_000
+
+  # How long a console-minted tenant token may live. Seconds, because the console mints one per
+  # execution and uses it immediately over loopback (expert review 2026-08-20 #32).
+  @token_ttl_s 60
   @receive_timeout 30_000
 
   @type result :: %{
@@ -60,6 +64,7 @@ defmodule Fathom.QueryConsole do
     * `:endpoint` — base URL of the Hrana listener. Defaults to
       `:query_console_endpoint` config, else `http://127.0.0.1:<hrana_port>`.
     * `:host` — override the `Host` header (defaults to `<shard>.<base-domain>`).
+    * `:actor` — who is running this, for the issuance ledger (e.g. `"console:alice"`);
     * `:max_rows` — cap the rows returned to the caller (default #{@max_rows});
       the full result still transfers, but only this many are kept (with
       `:truncated` set) so a huge scan can't balloon the LiveView.
@@ -91,7 +96,7 @@ defmodule Fathom.QueryConsole do
       ]
     }
 
-    headers = [{"host", host}] ++ auth_header(shard_id)
+    headers = [{"host", host}] ++ auth_header(shard_id, sql, opts)
     started = System.monotonic_time()
 
     result =
@@ -206,17 +211,61 @@ defmodule Fathom.QueryConsole do
     "#{shard_id}.#{base}"
   end
 
-  defp auth_header(shard_id) do
+  # SCOPED, ATTRIBUTED AND SHORT-LIVED (expert review 2026-08-20 #32).
+  #
+  # This used to be a bare `HranaAuth.token_for(shard_id)`: `scope` defaulted to `:rw` even for a
+  # `SELECT`, `actor` defaulted to `nil`, and the token was valid for the whole
+  # `:hrana_token_max_age`. Two consequences, and the second is the one that bites.
+  #
+  # CREDENTIAL SPRAWL. An operator triaging ten tenants left ten live full-access tenant
+  # credentials, each valid for the configured max-age, with nothing tying them to a person.
+  # `AdminTenantController.export` was given per-operator attribution precisely because it touches
+  # tenant data; the console mints credentials TO tenant data and had none.
+  #
+  # IT CORRUPTED THE INPUT TO THE FLEET-WIDE REVOKE. `revoke_issued_before/2` bumps the floor on
+  # every shard the ledger shows with an outstanding token issued before the cutoff. After a week
+  # of console use that set is every tenant an operator ever looked at — so an incident-response
+  # sweep scoped to one leaked laptop would disconnect a large, arbitrary slice of the fleet. The
+  # ledger's careful "under-reports, which is the safe direction" reasoning is defeated by a writer
+  # that OVER-reports. The `console:` actor prefix is deliberately distinct from the controller's
+  # `admin:` so a future `shards_issued_before/1` can exclude console mints outright.
+  defp auth_header(shard_id, sql, opts) do
     case Application.get_env(:fathom, :hrana_auth, :disabled) do
       :disabled ->
         []
 
       _ ->
-        case HranaAuth.token_for(shard_id) do
+        mint =
+          HranaAuth.token_for(shard_id,
+            scope: scope_for(sql),
+            actor: Keyword.get(opts, :actor) || "console",
+            ttl: @token_ttl_s
+          )
+
+        case mint do
           {:ok, token} -> [{"authorization", "Bearer " <> token}]
           _ -> []
         end
     end
+  end
+
+  # `:ro` ONLY WHEN WE ARE SURE, and the asymmetry is the whole design. Misreading a write as a
+  # read costs a 403 `FILO_READONLY` — visible, immediate, harmless. Misreading a read as a write
+  # mints a full-access credential, which is the status quo being fixed. So this is a keyword
+  # check, not a parser, and everything it does not recognise stays `:rw`.
+  #
+  # `WITH` is deliberately NOT matched, for the reason `Migrator.Capture` records: `WITH … INSERT`
+  # is valid SQLite. Same reasoning, same answer.
+  defp scope_for(sql) do
+    first =
+      sql
+      |> String.trim_leading()
+      |> String.split(~r/\s/, parts: 2)
+      |> List.first()
+      |> to_string()
+      |> String.upcase()
+
+    if first in ["SELECT", "EXPLAIN"], do: :ro, else: :rw
   end
 
   defp elapsed_ms(started) do

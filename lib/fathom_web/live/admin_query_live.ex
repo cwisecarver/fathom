@@ -20,9 +20,13 @@ defmodule FathomWeb.AdminQueryLive do
   alias Fathom.{QueryConsole, ShardId}
 
   @impl true
-  def mount(_params, _session, socket) do
+  def mount(_params, session, socket) do
     {:ok,
      socket
+     # Who is at the keyboard, for the issuance ledger (expert review 2026-08-20 #32). Put in the
+     # session by the router's `admin_live_session/1`; a LiveView cannot read the BasicAuth header
+     # itself, and an unattributed mint is what poisons the fleet-wide revoke.
+     |> assign(:admin_actor, Map.get(session, "admin_actor", "console"))
      |> assign(:page_title, "Query")
      |> assign(:node_key, Fathom.Rebalancer.node_key())
      |> assign(:form, to_form(%{"shard" => "", "sql" => ""}, as: :q))
@@ -62,13 +66,19 @@ defmodule FathomWeb.AdminQueryLive do
          )}
 
       true ->
+        # Bound OUTSIDE the closure: `start_async/3` runs in a separate process and referencing
+        # `socket` there captures the whole struct.
+        actor = socket.assigns.admin_actor
+
         {:noreply,
          socket
          |> assign(:running, true)
          |> assign(:error, nil)
          |> assign(:result, nil)
          |> assign(:form, to_form(%{"shard" => shard, "sql" => sql}, as: :q))
-         |> start_async(:query, fn -> QueryConsole.run(shard, sql) end)}
+         |> start_async(:query, fn ->
+           QueryConsole.run(shard, sql, actor: actor)
+         end)}
     end
   end
 

@@ -189,6 +189,17 @@ defmodule Fathom.HranaAuth do
     # consulted for authorization; a breadcrumb for whoever reads the audit later.
     {actor, sign_opts} = Keyword.pop(opts, :actor)
 
+    # A PER-TOKEN LIFETIME, for callers that mint a credential to use immediately (expert review
+    # 2026-08-20 #32 — the admin query console). `Phoenix.Token` has no per-token expiry: `max_age`
+    # is a VERIFY-side option and this module applies one global value, so the only way to make a
+    # single token shorter-lived is to back-date its `signed_at` so it starts life partly spent.
+    #
+    # A no-op when `:hrana_token_max_age` is `:infinity` (nothing expires, so nothing can be made
+    # to expire sooner) or already shorter than the requested ttl. Prod under `:required` REFUSES
+    # TO BOOT without a finite max_age (#37), which is exactly where this matters.
+    {ttl, sign_opts} = Keyword.pop(sign_opts, :ttl)
+    sign_opts = backdate(sign_opts, ttl)
+
     case ShardId.cast(shard_id) do
       {:ok, canonical} ->
         # Embed the shard's current revocation version (expert review #31); a later
@@ -209,6 +220,18 @@ defmodule Fathom.HranaAuth do
 
       :error ->
         {:error, :invalid_shard_id}
+    end
+  end
+
+  defp backdate(sign_opts, nil), do: sign_opts
+
+  defp backdate(sign_opts, ttl) when is_integer(ttl) and ttl >= 0 do
+    case max_age() do
+      age when is_integer(age) and age > ttl ->
+        Keyword.put_new(sign_opts, :signed_at, System.system_time(:second) - (age - ttl))
+
+      _ ->
+        sign_opts
     end
   end
 
