@@ -825,6 +825,59 @@ defmodule Fathom.ShardExecutorTest do
     assert Fathom.Application.check_replication_exposure!() == nil
   end
 
+  # Expert review 2026-08-20 #23. The replica store holds a full copy of every shard this node
+  # FOLLOWS, grows from other nodes' write traffic, and has no retention — and both it and the live
+  # shard data dir default under System.tmp_dir!(), so the unsafe arrangement is the DEFAULT one.
+  # Sharing a volume means a peer's write rate can fill the disk this node's own durability flushes
+  # and cold-open pulls depend on, which is the unbounded-RPO failure AGENTS.md documents: writes
+  # keep being acked and can never be made durable.
+  #
+  # WARNS rather than raises, unlike the #3 guard directly above: a single-volume box is a
+  # legitimate small deployment, and `Follower`'s free-space floor bounds the damage. The asymmetry
+  # is deliberate and is the property under test.
+  test "a prod follower sharing a volume with the live shard data dir is warned about" do
+    import ExUnit.CaptureLog
+
+    prev_env = Application.get_env(:fathom, :env)
+    prev_listen = Application.get_env(:fathom, :replication_listen)
+    prev_repl_dir = Application.get_env(:fathom, :replication_dir)
+    prev_data_dir = Application.get_env(:fathom, :shard_data_dir)
+
+    on_exit(fn ->
+      Application.put_env(:fathom, :env, prev_env)
+      restore_env(:replication_listen, prev_listen)
+      restore_env(:replication_dir, prev_repl_dir)
+      restore_env(:shard_data_dir, prev_data_dir)
+    end)
+
+    root = Path.join(System.tmp_dir!(), "replvol_#{System.unique_integer([:positive])}")
+    shared_a = Path.join(root, "replica")
+    shared_b = Path.join(root, "data")
+    File.mkdir_p!(shared_a)
+    File.mkdir_p!(shared_b)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    Application.put_env(:fathom, :env, :prod)
+    Application.put_env(:fathom, :replication_listen, true)
+    Application.put_env(:fathom, :replication_dir, shared_a)
+    Application.put_env(:fathom, :shard_data_dir, shared_b)
+
+    # Two directories under one tmpdir are the same mount, which is exactly the DEFAULT shape.
+    assert capture_log(fn ->
+             assert Fathom.Application.check_replication_disk!() == nil
+           end) =~ "SAME volume"
+
+    # Not listening: this node is nobody's follower, so the replica store never grows and the
+    # arrangement is irrelevant however the directories are laid out.
+    Application.put_env(:fathom, :replication_listen, false)
+    assert capture_log(fn -> Fathom.Application.check_replication_disk!() end) == ""
+
+    # And prod-only, like every sibling guard.
+    Application.put_env(:fathom, :replication_listen, true)
+    Application.put_env(:fathom, :env, :dev)
+    assert capture_log(fn -> Fathom.Application.check_replication_disk!() end) == ""
+  end
+
   # All five 2026-07-14 config guards are prod-only: with env != :prod (the dev/test default),
   # every one is inert regardless of the risky config, so they never fire outside prod.
   test "all 2026-07-14 config guards are inert when env is not prod" do

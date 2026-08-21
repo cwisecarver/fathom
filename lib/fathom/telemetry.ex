@@ -336,6 +336,17 @@ defmodule Fathom.Telemetry do
         measurement: :cap,
         description: "Node-wide concurrent-flush cap; in_flight pinned here means nothing flushes"
       ),
+      # A follower refused to seed a shard because its replica volume is below the free-space
+      # floor (expert review 2026-08-20 #23). Not an error: that shard's RPO stays at its stored
+      # object, which is the pre-A2 behaviour. But a RISING rate means the replica store — which
+      # grows from other nodes' traffic and has no retention — is squeezing the disk this node's
+      # own durability flushes depend on, and that ends in acked writes that can never be made
+      # durable. The counterpart of [:fathom, :warm_follower, :disk_pressure].
+      counter("fathom.replication.disk_pressure.count",
+        event_name: [:fathom, :replication, :disk_pressure],
+        description:
+          "Replica seeds refused because the replication volume is below its free-space floor"
+      ),
       counter("fathom.shard.flush_gate.reclaimed.count",
         event_name: [:fathom, :shard, :flush_gate, :reclaimed],
         description:

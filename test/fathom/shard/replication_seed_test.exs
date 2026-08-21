@@ -1024,4 +1024,120 @@ defmodule Fathom.Shard.ReplicationSeedTest do
       assert Follower.db_path(name, "acme") == Path.join(dir, "acme.db")
     end
   end
+
+  # DISK BACK-PRESSURE ON THE REPLICA STORE (expert review 2026-08-20 #23).
+  #
+  # A follower holds a full .db + -wal copy of EVERY shard it follows, with no count cap, no byte
+  # cap, no free-space floor and no retention — and it grows from OTHER NODES' write traffic. Both
+  # it and the live shard data dir default under System.tmp_dir!(), so out of the box they share a
+  # volume, and a peer's write rate can fill the disk this node's own durability flushes and
+  # cold-open pulls depend on. That is the unbounded-RPO failure AGENTS.md documents: SQLite's small
+  # WAL appends keep succeeding while every flush fails, so writes are acked and never made durable.
+  #
+  # Refusing a NEW seed is the unambiguous half: that shard's RPO simply stays at its stored object,
+  # which is the pre-A2 behaviour and always correct. What to SHED once already full is a policy
+  # question and is deliberately parked.
+  describe "the replica store refuses to grow past its free-space floor (#23)" do
+    setup do
+      prev = Application.get_env(:fathom, :replication_disk_free_floor_bytes)
+
+      on_exit(fn ->
+        if is_nil(prev),
+          do: Application.delete_env(:fathom, :replication_disk_free_floor_bytes),
+          else: Application.put_env(:fathom, :replication_disk_free_floor_bytes, prev)
+      end)
+
+      :ok
+    end
+
+    test "a seed is refused when the volume is below the floor, and the listener stays up", ctx do
+      %{root: root} = ctx
+      dir = Path.join(root, "pressure")
+      name = :"press_f#{System.unique_integer([:positive])}"
+      pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
+      {:ok, port} = Follower.port(pid)
+
+      # A floor no real volume can clear. This is the same shape as the warm cache's
+      # :warm_disk_free_floor_bytes, which is the bound this store never had.
+      Application.put_env(:fathom, :replication_disk_free_floor_bytes, 1_000_000_000_000_000)
+
+      {:ok, sock} =
+        :gen_tcp.connect(~c"127.0.0.1", port, [:binary, packet: 4, active: false], 2_000)
+
+      begin = %Protocol.SeedBegin{
+        shard_id: "pressured",
+        epoch: 1,
+        wal_gen: 0,
+        salt1: 0,
+        wal_offset: 0,
+        db_size: 4096,
+        wal_size: 0
+      }
+
+      :ok = :gen_tcp.send(sock, Protocol.encode_seed_begin(begin))
+
+      _ =
+        :gen_tcp.send(
+          sock,
+          Protocol.encode_seed_chunk("pressured", :db, 0, :binary.copy(<<0>>, 4096))
+        )
+
+      :ok = :gen_tcp.send(sock, Protocol.encode_seed_end("pressured"))
+      _ = :gen_tcp.recv(sock, 0, 1_000)
+      :gen_tcp.close(sock)
+
+      refute File.exists?(Follower.db_path(name, "pressured")),
+             "the follower installed a replica while its volume was below the free-space floor — " <>
+               "this store grows from other nodes' traffic and has no retention, so it fills the " <>
+               "disk THIS node's flushes need"
+
+      refute Follower.state_of(name, "pressured"),
+             "the follower recorded replication state for a shard it refused to seed"
+
+      # Back-pressure is not a crash: the listener is still serving.
+      assert {:ok, ^port} = Follower.port(pid)
+    end
+
+    test "with headroom the same seed is accepted", ctx do
+      %{root: root} = ctx
+      dir = Path.join(root, "headroom")
+      name = :"head_f#{System.unique_integer([:positive])}"
+      pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
+      {:ok, port} = Follower.port(pid)
+
+      # One byte: any real volume clears it. Proves the refusal above is the FLOOR talking and not
+      # the seed path being broken.
+      Application.put_env(:fathom, :replication_disk_free_floor_bytes, 1)
+
+      {:ok, sock} =
+        :gen_tcp.connect(~c"127.0.0.1", port, [:binary, packet: 4, active: false], 2_000)
+
+      begin = %Protocol.SeedBegin{
+        shard_id: "roomy",
+        epoch: 1,
+        wal_gen: 0,
+        salt1: 0,
+        wal_offset: 0,
+        db_size: 4096,
+        wal_size: 0
+      }
+
+      :ok = :gen_tcp.send(sock, Protocol.encode_seed_begin(begin))
+
+      :ok =
+        :gen_tcp.send(
+          sock,
+          Protocol.encode_seed_chunk("roomy", :db, 0, :binary.copy(<<0>>, 4096))
+        )
+
+      :ok = :gen_tcp.send(sock, Protocol.encode_seed_end("roomy"))
+      assert {:ok, _} = :gen_tcp.recv(sock, 0, 2_000)
+      :gen_tcp.close(sock)
+
+      assert File.exists?(Follower.db_path(name, "roomy")),
+             "the floor refused a seed on a volume with room, which would stop replication entirely"
+
+      assert {:ok, ^port} = Follower.port(pid)
+    end
+  end
 end

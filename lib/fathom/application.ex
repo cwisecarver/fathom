@@ -30,6 +30,7 @@ defmodule Fathom.Application do
     check_default_shard!()
     check_hrana_exposure!()
     check_replication_exposure!()
+    check_replication_disk!()
 
     # Grouped into plane sub-supervisors (each with its own restart budget) rather than
     # one flat list, so a control-plane restart-storm (e.g. Repo) is contained to its
@@ -299,6 +300,46 @@ defmodule Fathom.Application do
   # unauthenticated has made a choice the warning names. This port has no such mode — the network
   # IS the only boundary, so a wildcard bind is not a posture, it is an unguarded door. Prod-only,
   # and only when listening is actually on, so dev/test/rig configs are unaffected.
+  # The replica store grows from OTHER NODES' write traffic and has no retention (expert review
+  # 2026-08-20 #23). Sharing a volume with the live shard data dir means somebody else's write rate
+  # can fill the disk that THIS node's durability flushes and cold-open pulls depend on — and the
+  # symptom is the unbounded-RPO one AGENTS.md documents, where writes keep being acked and can
+  # never be made durable. Both default under System.tmp_dir!(), so the unsafe arrangement is the
+  # DEFAULT one. WARN rather than raise: a single-volume box is a legitimate small deployment, and
+  # the back-pressure floor in `Follower` bounds the damage.
+  @doc false
+  def check_replication_disk! do
+    if Application.get_env(:fathom, :env) == :prod and
+         Application.get_env(:fathom, :replication_listen, false) == true do
+      replica = Fathom.Shard.Replication.Follower.default_dir()
+      data = Fathom.Shard.data_dir()
+
+      if same_volume?(replica, data) do
+        Logger.warning(
+          "config warning: the replication replica store (#{replica}) and the live shard data " <>
+            "dir (#{data}) are on the SAME volume. The replica store holds a full copy of every " <>
+            "shard this node follows and grows from other nodes' write traffic with no retention " <>
+            "— so a peer's write rate can fill the disk this node's own flushes and cold-open " <>
+            "pulls need, and acked writes then become permanently undurable. Give REPLICATION_DIR " <>
+            "its own volume (expert review 2026-08-20 #23)."
+        )
+      end
+    end
+
+    nil
+  end
+
+  # Compare the MOUNT, not the size. Two independent volumes of the same size are indistinguishable
+  # by `total_bytes`, and a false warning about a correctly-separated deployment is how a real one
+  # gets ignored. Unreadable on either side means no warning at all: this is advisory, and a
+  # stat failure is not evidence of a shared volume.
+  defp same_volume?(a, b) do
+    case {Fathom.Admin.Measurements.disk_info(a), Fathom.Admin.Measurements.disk_info(b)} do
+      {{:ok, %{mount: m}}, {:ok, %{mount: m}}} -> true
+      _ -> false
+    end
+  end
+
   @doc false
   def check_replication_exposure! do
     wildcard_binds = [{0, 0, 0, 0}, {0, 0, 0, 0, 0, 0, 0, 0}]

@@ -147,7 +147,8 @@ defmodule Fathom.Admin.Measurements do
   fabricated number in either is worse than an absent one — a wrong "plenty free" disables the
   brake, a wrong "full" stops warming on a healthy node.
   """
-  @spec disk_info(String.t()) :: {:ok, %{total_bytes: integer(), free_bytes: integer()}} | :error
+  @spec disk_info(String.t()) ::
+          {:ok, %{mount: String.t(), total_bytes: integer(), free_bytes: integer()}} | :error
   def disk_info(path) do
     # Resolve to the nearest EXISTING ancestor first. `SHARD_DATA_DIR` and the warm cache are
     # created lazily — the data dir does not exist until the first shard opens — and `disksup`
@@ -155,8 +156,17 @@ defmodule Fathom.Admin.Measurements do
     # node state where disk headroom is most worth knowing: a freshly booted node about to pull its
     # working set. The ancestor sits on the same filesystem, which is the quantity being measured.
     case :disksup.get_disk_info(to_charlist(existing_ancestor(path))) do
-      [{_mount, total_kb, avail_kb, _pct} | _] when is_integer(total_kb) and total_kb > 0 ->
-        {:ok, %{total_bytes: total_kb * 1024, free_bytes: avail_kb * 1024}}
+      [{mount, total_kb, avail_kb, _pct} | _] when is_integer(total_kb) and total_kb > 0 ->
+        # `mount` identifies the FILESYSTEM, not the path — two directories reporting the same
+        # mount share a volume, and therefore share a free-space budget. That is the question
+        # `Application.check_replication_disk!/0` asks, and comparing sizes cannot answer it: two
+        # separate volumes of the same size look identical.
+        {:ok,
+         %{
+           mount: List.to_string(mount),
+           total_bytes: total_kb * 1024,
+           free_bytes: avail_kb * 1024
+         }}
 
       _ ->
         :error

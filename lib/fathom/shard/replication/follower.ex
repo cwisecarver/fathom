@@ -612,6 +612,69 @@ defmodule Fathom.Shard.Replication.Follower do
     # complete; drop its files rather than leak them.
     seeds = discard_seed(seeds, b.shard_id)
 
+    if headroom?(name, b) do
+      open_seed_temps(name, seeds, b)
+    else
+      refuse_seed(name, seeds, b)
+    end
+  end
+
+  # DISK BACK-PRESSURE ON THE REPLICA STORE (expert review 2026-08-20 #23).
+  #
+  # A node acting as a follower stores a full `.db` + `-wal` copy of EVERY shard it follows, and
+  # this store had no bound of any kind: no count cap, no byte cap, no free-space floor, no
+  # retention. `forget/2` is called from exactly two places, both promotions. It grows monotonically
+  # from OTHER NODES' write traffic, and both directories default under `System.tmp_dir!()`, so out
+  # of the box the replica store and the live shard data dir SHARE A VOLUME.
+  #
+  # The asymmetry with the warm cache is the tell. That cache holds a READ copy whose loss costs
+  # only failover latency, and it has three independent bounds plus a disk_pressure event. This one
+  # holds acked, quorum-durable writes and had a gauge and an alert rule.
+  #
+  # What a full volume does here is the unbounded-RPO failure AGENTS.md already documents: every
+  # cold-open `pull` and every dirty shard's `VACUUM INTO` fails, while SQLite's own small WAL
+  # appends keep succeeding — so this node's OWN tenants keep being ACKED writes that can never be
+  # made durable, caused by its role as somebody else's follower, with no local signal.
+  #
+  # Refusing a NEW seed is the half that is unambiguous: a shard we do not yet hold is one whose
+  # RPO simply stays at the stored object, which is the pre-A2 behaviour and always correct. What
+  # to SHED once already full is a policy question (which replica, and what it does to the quorum's
+  # effective redundancy) and is deliberately not decided here.
+  defp headroom?(name, %Protocol.SeedBegin{} = b) do
+    floor = disk_free_floor_bytes()
+    incoming = (b.db_size || 0) + (b.wal_size || 0)
+
+    case Fathom.Admin.Measurements.disk_info(dir(name)) do
+      # Cannot read the volume — fail OPEN, exactly as WarmFollower.headroom?/4 does. Refusing to
+      # replicate because a stat failed would turn an observability gap into a durability one.
+      :error ->
+        true
+
+      {:ok, %{free_bytes: free}} ->
+        free - incoming >= floor
+    end
+  end
+
+  defp refuse_seed(name, seeds, %Protocol.SeedBegin{} = b) do
+    Logger.warning(
+      "replication follower REFUSING to seed #{b.shard_id}: the replica volume (#{dir(name)}) is " <>
+        "below its free-space floor. That shard's RPO stays at its stored object — the pre-A2 " <>
+        "behaviour — which is correct; a full volume would instead break THIS node's own tenants, " <>
+        "whose flushes and cold-open pulls all need the same disk. Raise " <>
+        "REPLICATION_DISK_FREE_FLOOR_BYTES, give REPLICATION_DIR its own volume, or add space."
+    )
+
+    :telemetry.execute([:fathom, :replication, :disk_pressure], %{count: 1}, %{
+      shard_id: b.shard_id
+    })
+
+    seeds
+  end
+
+  defp disk_free_floor_bytes,
+    do: Application.get_env(:fathom, :replication_disk_free_floor_bytes, 1024 * 1024 * 1024)
+
+  defp open_seed_temps(name, seeds, %Protocol.SeedBegin{} = b) do
     with {:ok, db_fd} <-
            :file.open(seeding_path(db_path(name, b.shard_id)), [:write, :raw, :binary]),
          {:ok, wal_fd} <-
