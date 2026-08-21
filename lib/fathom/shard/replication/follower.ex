@@ -82,7 +82,7 @@ defmodule Fathom.Shard.Replication.Follower do
           non_neg_integer()
         ) :: :ok
   def seed(name \\ __MODULE__, shard_id, epoch, wal_gen, salt1, wal_bytes) do
-    :ets.insert(table(name), {shard_id, FollowerLog.seeded(epoch, wal_gen, salt1, wal_bytes)})
+    put_state(name, shard_id, FollowerLog.seeded(epoch, wal_gen, salt1, wal_bytes))
     :ok
   end
 
@@ -101,6 +101,9 @@ defmodule Fathom.Shard.Replication.Follower do
     :ets.delete(table(name), shard_id)
     File.rm(db_path(name, shard_id))
     File.rm(wal_path(name, shard_id))
+    # And the torn marker (expert review 2026-08-20 #11b), or a promoted-then-re-followed shard
+    # inherits a quarantine flag from a replica that no longer exists.
+    File.rm(torn_path(name, shard_id))
     :ok
   rescue
     ArgumentError -> :ok
@@ -181,6 +184,12 @@ defmodule Fathom.Shard.Replication.Follower do
   def db_path(name \\ __MODULE__, shard_id) do
     assert_valid_shard_id!(shard_id)
     Path.join(dir(name), shard_id <> ".db")
+  end
+
+  @doc false
+  def torn_path(name \\ __MODULE__, shard_id) do
+    assert_valid_shard_id!(shard_id)
+    Path.join(dir(name), shard_id <> ".db.torn")
   end
 
   defp assert_valid_shard_id!(shard_id) do
@@ -684,6 +693,53 @@ defmodule Fathom.Shard.Replication.Follower do
   #
   # ETS goes last: until it is written the follower reports `:unknown_shard` and gets re-seeded, so
   # a failure anywhere above costs a re-seed rather than a corrupt shard.
+  # DURABLE `torn` (expert review 2026-08-20 #11b).
+  #
+  # `torn` lived only in ETS, which dies with this GenServer. `recover/3` deliberately rebuilds
+  # state from the files on boot — the right fix for the re-seed storm it documents — but torn
+  # CANNOT be derived from the files: nothing on disk records that the `.db` and `-wal` are a
+  # generation apart, and the `-shm` that would hint at it is deleted by `apply_write`. So every
+  # recovered shard came back `torn: false`, and a node restart — a deploy, a crash, an OOM-kill,
+  # all documented as routine — laundered every quarantined replica on that node into a promotable
+  # one. `Promote.fresher?/2` then lets it through and `offerable/2` offers it to the whole fleet.
+  #
+  # The moduledoc reasons that losing ETS is safe because "the next push is refused with
+  # `:unknown_shard`". `recover/3` removed exactly that safety; this restores it for the one bit
+  # that mattered.
+  #
+  # A zero-byte marker beside the replica, written before the ETS row so a crash between the two
+  # leaves the SAFE state (marker present, replica treated as torn) rather than the unsafe one.
+  # ONLY TOUCHES THE FILE WHEN `torn` ACTUALLY CHANGES. This runs on EVERY push, and the ordinary
+  # push is an `:append` that carries the previous torn value forward — so an unconditional
+  # write/rm here would add a syscall to the replication hot path for no state change. It did, in
+  # the first draft, and the pausable-peer transport test started intermittently reporting
+  # `:disconnected` where it expects `:already_in_flight`. An `:ets.lookup` on a
+  # `read_concurrency` table is strictly cheaper than the syscall it replaces.
+  defp put_state(name, shard_id, state) do
+    tab = table(name)
+
+    was_torn? =
+      case :ets.lookup(tab, shard_id) do
+        [{^shard_id, %{torn: t}}] -> t
+        _ -> false
+      end
+
+    # Marker BEFORE the ETS row, so a crash between the two leaves the SAFE state: the marker
+    # present and the replica treated as torn, never the reverse.
+    if was_torn? != state.torn, do: sync_torn_marker(name, shard_id, state)
+    :ets.insert(tab, {shard_id, state})
+    state
+  end
+
+  defp sync_torn_marker(name, shard_id, %{torn: true}) do
+    File.write(torn_path(name, shard_id), "")
+  end
+
+  defp sync_torn_marker(name, shard_id, _state) do
+    File.rm(torn_path(name, shard_id))
+    :ok
+  end
+
   defp install(name, shard_id, state) do
     db = db_path(name, shard_id)
     wal = wal_path(name, shard_id)
@@ -694,9 +750,10 @@ defmodule Fathom.Shard.Replication.Follower do
     with :ok <- rm_if_present(wal),
          :ok <- File.rename(seeding_path(db), db),
          :ok <- File.rename(seeding_path(wal), wal) do
-      :ets.insert(
-        table(name),
-        {shard_id, FollowerLog.seeded(state.epoch, state.wal_gen, state.salt1, state.wal_offset)}
+      put_state(
+        name,
+        shard_id,
+        FollowerLog.seeded(state.epoch, state.wal_gen, state.salt1, state.wal_offset)
       )
 
       Logger.info(
@@ -808,7 +865,12 @@ defmodule Fathom.Shard.Replication.Follower do
   defp recover_shard(tab, name, shard_id) do
     with {:ok, %{ckpt_seq: gen, salt1: salt, size: size}} <- Wal.read(wal_path(name, shard_id)),
          true <- File.exists?(db_path(name, shard_id)) do
-      :ets.insert(tab, {shard_id, FollowerLog.seeded(0, gen, salt, size)})
+      # Carry `torn` across the restart (expert review 2026-08-20 #11b). `FollowerLog.seeded/4`
+      # stamps `torn: false` because a real SEED is the one event that rebuilds both files
+      # together — but this is not a seed, it is a recovery, and the marker on disk is the only
+      # thing that remembers the two files were a generation apart when we went down.
+      torn? = File.exists?(torn_path(name, shard_id))
+      :ets.insert(tab, {shard_id, %{FollowerLog.seeded(0, gen, salt, size) | torn: torn?}})
       true
     else
       _ -> false
@@ -915,7 +977,7 @@ defmodule Fathom.Shard.Replication.Follower do
          :ok <- :file.close(fd) do
       # State advances ONLY after the bytes are down. Advancing first and failing the write would
       # leave the follower claiming an offset it does not hold, which the primary would believe.
-      :ets.insert(table(name), {push.shard_id, new_state})
+      put_state(name, push.shard_id, new_state)
       Protocol.encode_ack(push.shard_id, new_state.next_offset)
     else
       {:error, reason} ->

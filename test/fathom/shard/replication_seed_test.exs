@@ -388,6 +388,82 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     assert after_restart.salt1 == hdr.salt1
   end
 
+  # THE QUARANTINE MUST SURVIVE A RESTART (expert review 2026-08-20 #11b).
+  #
+  # The test above proves a restart RECOVERS position from the files, which is the fix for a
+  # re-seed storm. But `torn` cannot be derived from the files — nothing on disk records that the
+  # `.db` and `-wal` are a generation apart, and the `-shm` that would hint at it is deleted by
+  # apply_write. So recovery stamped `torn: false` for every shard, and a node restart (a deploy,
+  # a crash, an OOM-kill — all routine) laundered every quarantined replica on that node into a
+  # promotable one. `Promote.fresher?/2` then lets it through and `offerable/2` offers it fleet-wide.
+  #
+  # That is the 2026-08-12 rig failure — a tenant served an EMPTY database over a working stored
+  # object — with its guard silently removed by an unrelated fix.
+  test "a torn replica is STILL torn after the follower restarts", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 2)
+    [{name, _port} | _] = followers
+    dir = Path.join(root, to_string(name))
+    enable!(followers, 1)
+
+    {coordinator, conn, path} = open_shard!(id)
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+    Session.commit(id, path <> "-wal", coordinator)
+    await_seeded(name, id, fn -> Session.commit(id, path <> "-wal", coordinator) end)
+
+    # Mark it torn the way a generation change does, through the public seam.
+    torn = %{Follower.state_of(name, id) | torn: true}
+    Follower.seed(name, id, torn.epoch, torn.wal_gen, torn.salt1, torn.next_offset)
+    :ets.insert(Follower.table(name), {id, torn})
+    File.write!(Follower.torn_path(name, id), "")
+
+    assert Follower.state_of(name, id).torn, "the fixture did not actually mark the replica torn"
+    refute Follower.offerable(name, id), "a torn replica must not be offered to peers"
+
+    stop_supervised!(name)
+    pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: :"#{name}_torn_again")
+    _ = :sys.get_state(pid)
+
+    after_restart = Follower.state_of(name, id)
+    assert after_restart, "the follower forgot the shard entirely across the restart"
+
+    assert after_restart.torn,
+           "a restart laundered a TORN replica into a promotable one — its .db is a generation " <>
+             "behind its -wal, and Promote.fresher?/2 will now let it be served"
+
+    refute Follower.offerable(name, id),
+           "a replica that was torn before the restart is being offered to peers after it"
+  end
+
+  # The other direction: a HEALTHY replica must not come back torn, or every restart would force a
+  # full re-seed of every shard the node follows.
+  test "a healthy replica is still promotable after the follower restarts", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 2)
+    [{name, _port} | _] = followers
+    dir = Path.join(root, to_string(name))
+    enable!(followers, 1)
+
+    {coordinator, conn, path} = open_shard!(id)
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+    Session.commit(id, path <> "-wal", coordinator)
+    await_seeded(name, id, fn -> Session.commit(id, path <> "-wal", coordinator) end)
+
+    refute Follower.state_of(name, id).torn, "the fixture started torn; it proves nothing"
+    refute File.exists?(Follower.torn_path(name, id)), "a healthy seed left a torn marker behind"
+
+    stop_supervised!(name)
+    pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: :"#{name}_ok_again")
+    _ = :sys.get_state(pid)
+
+    refute Follower.state_of(name, id).torn,
+           "a healthy replica came back torn, which forces a needless full re-seed"
+
+    assert Follower.offerable(name, id)
+  end
+
   test "an unseeded follower is seeded automatically, then replicates", ctx do
     %{id: id, root: root} = ctx
     followers = start_followers!(root, 3)
