@@ -170,4 +170,63 @@ defmodule Fathom.Shard.ReplicationBudgetTest do
       assert {:ok, @cap} = Budget.reserve(a, @cap)
     end
   end
+
+  # WHERE THE PER-INCARNATION REFS LIVE (expert review 2026-08-20 #36).
+  #
+  # `install/1` was a `:persistent_term.put` and `forget/1` an `erase` -- ONCE PER SHIPPER
+  # INCARNATION. Each schedules a literal-area cleanup that must scan every process on the node,
+  # which at the 10k-30k shard processes fathom targets is not free, and it fired hardest during a
+  # shipper restart STORM: the documented `shipper connection lost: :timeout` under saturation,
+  # where `send_timeout_close: true` tears sockets down. The cost landed exactly where there was no
+  # headroom.
+  #
+  # The per-incarnation ref is the RIGHT design and did not change (a single node-wide counter
+  # would drift: a shipper killed with a full mailbox never runs the releases its queued messages
+  # owed). Only the publication mechanism moved, to an ETS table `Fleet`'s supervisor owns.
+  describe "publication does not churn the literal area (#36)" do
+    test "a shipper's counter costs no persistent term, on install OR on forget" do
+      names = for i <- 1..20, do: :"pt_budget_#{System.unique_integer([:positive])}_#{i}"
+
+      before = :persistent_term.info()[:count]
+
+      for n <- names, do: Budget.install(n)
+
+      assert :persistent_term.info()[:count] == before,
+             "installing shipper counters wrote persistent terms. Each one schedules a global " <>
+               "literal-area cleanup that scans every process on the node, and this fires once " <>
+               "per shipper INCARNATION -- i.e. hardest during a restart storm on an already " <>
+               "overloaded node."
+
+      # PRECONDITION: the counters really were installed. A no-op install would satisfy the
+      # assertion above while proving nothing.
+      Enum.each(names, fn n ->
+        assert {:ok, 10} = Budget.reserve(n, 10)
+        assert Budget.queued(n) == 10
+      end)
+
+      for n <- names, do: Budget.forget(n)
+
+      assert :persistent_term.info()[:count] == before,
+             "forgetting a departed shipper's counter erased a persistent term"
+
+      # And forgetting really forgot: no ref, so no budget, which is the documented answer for a
+      # shipper with no counter.
+      Enum.each(names, fn n -> assert Budget.queued(n) == 0 end)
+    end
+
+    test "a fresh install still supersedes the previous incarnation's counter" do
+      n = :"pt_supersede_#{System.unique_integer([:positive])}"
+      Budget.install(n)
+      on_exit(fn -> Budget.forget(n) end)
+
+      {:ok, 500} = Budget.reserve(n, 500)
+      assert Budget.queued(n) == 500
+
+      # The whole reason for a ref per incarnation: a shipper killed with a full mailbox never runs
+      # the release/2 calls its queued messages owed, and those bytes must die with it rather than
+      # be charged to the node forever.
+      Budget.install(n)
+      assert Budget.queued(n) == 0
+    end
+  end
 end

@@ -220,6 +220,14 @@ defmodule Fathom.Shard.Replication.Fleet do
     # processes that no longer exist.
     publish([])
 
+    # The shipper byte-budget counters live in an ETS table this supervisor OWNS (expert review
+    # 2026-08-20 #36) — they used to be one `:persistent_term.put`/`erase` per shipper incarnation,
+    # each scheduling a literal-area cleanup that scans every process on the node, fired hardest
+    # during exactly the restart storms that saturation produces. Created here, before the shipper
+    # DynamicSupervisor, so `Shipper.init/1` always finds it; dies with a Fleet restart, so
+    # stranded refs go with it for the same reason `publish([])` above clears the name list.
+    Fathom.Shard.Replication.Budget.init_table()
+
     children =
       [
         {Registry, keys: :unique, name: @registry},

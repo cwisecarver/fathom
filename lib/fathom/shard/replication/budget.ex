@@ -46,6 +46,48 @@ defmodule Fathom.Shard.Replication.Budget do
   # One counter per ref. `:write_concurrency` because every commit on the node touches this.
   @slot 1
 
+  # WHERE THE PER-INCARNATION REFS LIVE, AND WHY NOT `:persistent_term` (expert review 2026-08-20
+  # #36).
+  #
+  # This was a `:persistent_term.put` in `Shipper.init/1` and an `erase` in its `terminate/2` —
+  # ONCE PER SHIPPER INCARNATION. Each of those schedules a literal-area cleanup that must scan
+  # every process on the node, which at the 10k–30k shard processes fathom targets is not free.
+  #
+  # The cost lands exactly where there is no headroom: a shipper restart STORM is the documented
+  # `shipper connection lost: :timeout` under saturation, where `send_timeout_close: true` tears
+  # sockets down. So an overloaded node paid repeated global GC passes for the privilege of
+  # tracking why it was overloaded.
+  #
+  # The per-incarnation ref itself is the RIGHT design and is unchanged — see "Why a ref per
+  # shipper incarnation" above. Only the publication mechanism moved.
+  #
+  # `Fleet`'s supervisor owns the table (created in its `init/1`, beside `publish([])`), so it dies
+  # with a Fleet restart and stranded refs go with it — the same reasoning that clears the
+  # published shipper list there rather than inheriting the previous incarnation's.
+  #
+  # `Fleet.publish/1`'s own two `:persistent_term` writes are deliberately LEFT ALONE: they fire on
+  # a membership swap, which is rare, and `shippers/0` is read on the commit path where
+  # `:persistent_term` is the right structure.
+  @table __MODULE__.Refs
+
+  @doc false
+  @spec init_table() :: :ok
+  def init_table do
+    :ets.new(@table, [
+      :named_table,
+      :public,
+      :set,
+      read_concurrency: true,
+      write_concurrency: true
+    ])
+
+    :ok
+  rescue
+    # Already there. In production `Fleet.init/1` is the only creator and runs before any shipper,
+    # so this is the test path (`Budget.install/1` with no Fleet supervisor running).
+    ArgumentError -> :ok
+  end
+
   @doc """
   Publish a fresh counter for `name`. Called by `Shipper.init/1`, once per incarnation.
 
@@ -55,7 +97,9 @@ defmodule Fathom.Shard.Replication.Budget do
   """
   @spec install(atom() | nil) :: :ok
   def install(name) when is_atom(name) and not is_nil(name) do
-    :persistent_term.put(key(name), :counters.new(1, [:write_concurrency]))
+    init_table()
+    :ets.insert(@table, {name, :counters.new(1, [:write_concurrency])})
+    :ok
   end
 
   def install(_name), do: :ok
@@ -63,8 +107,11 @@ defmodule Fathom.Shard.Replication.Budget do
   @doc "Drop a departed follower's counter. Best-effort — a fresh `install/1` also supersedes it."
   @spec forget(atom() | nil) :: :ok
   def forget(name) when is_atom(name) and not is_nil(name) do
-    _ = :persistent_term.erase(key(name))
+    :ets.delete(@table, name)
     :ok
+  rescue
+    # No table: nothing to forget.
+    ArgumentError -> :ok
   end
 
   def forget(_name), do: :ok
@@ -149,7 +196,16 @@ defmodule Fathom.Shard.Replication.Budget do
   # names), so the atom clause is the hot one. The pid clause exists for tests and for any caller
   # holding a pid, and resolves to the same key so a reserve and its release cannot land on
   # different counters.
-  defp ref(name) when is_atom(name), do: :persistent_term.get(key(name), nil)
+  defp ref(name) when is_atom(name) do
+    case :ets.lookup(@table, name) do
+      [{^name, ref}] -> ref
+      _ -> nil
+    end
+  rescue
+    # No table — replication is off, or this is a bare unit test. No budget applies, which is the
+    # same answer an unregistered shipper already got.
+    ArgumentError -> nil
+  end
 
   defp ref(pid) when is_pid(pid) do
     case Process.info(pid, :registered_name) do
@@ -159,6 +215,4 @@ defmodule Fathom.Shard.Replication.Budget do
   end
 
   defp ref(_other), do: nil
-
-  defp key(name), do: {__MODULE__, name}
 end
