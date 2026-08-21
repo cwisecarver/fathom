@@ -224,6 +224,32 @@ defmodule Fathom.Shard.FlushPositionTest do
                "position for the epoch, on a complete object. Capture it first."
     end
 
+    # THE SAME GUARD ON THE OTHER PATH (expert review 2026-08-20 #38). The one above scoped itself
+    # to `snapshot_and_upload/1`, so it could not see `upload_for_drop/1` at all — and the drop
+    # path is where #4 bit hardest: `checkpoint_and_verify/1` runs `wal_checkpoint(TRUNCATE)` and
+    # then closes the connection, which on the LAST one unlinks `-wal`, so a late read finds
+    # nothing and stamps `{epoch, 0, 0}` on the most complete copy of the shard that will ever
+    # exist. Every clean idle-drop, graceful drain and rebalance handoff went out that way.
+    #
+    # Structural for the same reason as its sibling: the runtime difference needs a write landing
+    # inside the checkpoint, and hoisting the read is a one-line change that looks equivalent.
+    test "the drop path captures the WAL header before the checkpoint destroys it" do
+      source = File.read!("lib/fathom/shard.ex")
+
+      [_, body] = String.split(source, "defp upload_for_drop(state) do", parts: 2)
+      [body, _] = String.split(body, "\n  defp ", parts: 2)
+
+      pre_at = :binary.match(body, "pre = Fathom.Shard.Replication.Wal.read") |> elem(0)
+      checkpoint_at = :binary.match(body, "checkpoint_and_verify(state.path)") |> elem(0)
+
+      assert pre_at < checkpoint_at,
+             "upload_for_drop/1 reads the WAL header AFTER checkpoint_and_verify/1. The " <>
+               "checkpoint truncates the WAL and the connection close unlinks it, so the read " <>
+               "finds :empty and the object is stamped {epoch, 0, 0} — the LOWEST position for " <>
+               "its epoch, on the most complete copy of the shard. Any lagging replica then " <>
+               "outranks it and is promoted over it."
+    end
+
     # The drop path is where this bug was DETERMINISTIC, and it had no guard at all — the one
     # above was scoped to snapshot_and_upload/1 by a string split on that function name, so the
     # path that stamps every clean idle-drop, graceful drain and rebalance handoff was unwatched.

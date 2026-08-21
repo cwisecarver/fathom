@@ -118,6 +118,16 @@ defmodule Fathom.ShardIsolationAttachTest do
       :ok = ShardExecutor.close(v)
     end
 
+    # THIS TEST PASSES FOR A REASON OTHER THAN THE ONE IT NAMES, and that is worth saying out loud
+    # (expert review 2026-08-20 #37). It was the ONLY isolation assertion on `execute_sequence/2`,
+    # and its green comes from the SQLite AUTHORIZER refusing the ATTACH, not from the statement
+    # gate -- which #18 then showed `execute_sequence/2` never called at all. A test whose green
+    # depends on a mechanism other than the one it appears to cover is worse than no test: it is
+    # exactly why the `sequence` bypass survived a review pass that explicitly hardened this path.
+    #
+    # Kept, because "ATTACH must be refused on the sequence path" is a real invariant however it is
+    # enforced. The GATE's own coverage of that path is the describe block below, whose cases were
+    # confirmed to fail against the pre-#18 code.
     test "ATTACH is blocked inside a multi-statement script (the execute_sequence path)", ctx do
       {:ok, a} = ShardExecutor.open(ctx.attacker)
 
