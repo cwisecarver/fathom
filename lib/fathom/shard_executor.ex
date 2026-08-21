@@ -573,42 +573,159 @@ defmodule Fathom.ShardExecutor do
            status: 403
          }}
 
-      opts.block_ddl? and not opts.template? and ddl?(sql) ->
-        {:error,
-         %Error{
-           message:
-             "schema changes must go through the migration engine on the template shard, not a " <>
-               "direct script on tenant \"#{shard_id}\"",
-           code: "FILO_DDL_BLOCKED",
-           status: 400
-         }}
-
       true ->
-        case Connection.exec(conn, sql) do
-          :ok ->
-            # THE DURABILITY TRAP (#34): `exec` bypasses the `wrote?`-based WriteCounter bump in the
-            # single-statement path, so a script-only session would leave the shard CLEAN and its
-            # write-gated idle flush would drop the local copy WITHOUT uploading — silently losing the
-            # script's writes (same class as the RETURNING bug). A script is presumed to write, so
-            # bump unconditionally.
-            Fathom.Shard.WriteCounter.bump(shard_id)
+        # EVERY STATEMENT IN THE SCRIPT GOES THROUGH THE SAME GATE AS `execute/2` (expert review
+        # 2026-08-20 #18, verified by execution against this project's own exqlite 0.37.0).
+        #
+        # This clause used to call Connection.exec/2 directly, checking only `ddl?(sql)` — and
+        # `ddl?/1` is a LEADING-keyword test, so on a multi-statement script it inspected the first
+        # statement and nothing else. `blocked_statement/1` was not called at all. Measured:
+        #
+        #     "SELECT 1; PRAGMA synchronous=OFF; PRAGMA max_page_count=777; CREATE TABLE evil(a);"
+        #     #=> :ok — synchronous 0, max_page_count 777, table `evil` created
+        #
+        # ATTACH/DETACH/VACUUM survived because the SQLite AUTHORIZER enforces them at the engine,
+        # which is the correct second layer — but `blocked_statement/1`'s own moduledoc says it
+        # exists in part "to cover the pragma names the authorizer cannot express per-name", and
+        # exqlite's authorizer is an action deny-list with no per-name granularity. So the half of
+        # the gate with no engine backstop was exactly the half `sequence` skipped.
+        #
+        # Checked BEFORE anything runs, and one bad statement refuses the WHOLE script: a script
+        # is the tenant's unit of intent, and half-applying it is worse than refusing it.
+        case refuse_script(sql, opts, shard_id) do
+          %Error{} = err ->
+            {:error, err}
 
-            # …and record it against the open transaction, so a BEGIN (query) → write (exec) →
-            # COMMIT (query) sequence still re-bumps at the commit boundary (review 2026-07-24 #3).
-            mark_txn_write(conn)
-            # A script is opaque and may contain DDL, so drop the statement cache unconditionally
-            # (review 2026-07-24 #17). Scripts are migration-rare; the cost is irrelevant here.
-            Connection.purge_statements(conn)
-            # On the template shard, a script is (part of) a migration — feed it to capture.
-            # A Hrana `sequence` is opaque SQL text with no bind parameters, so there are no args
-            # to record for it (unlike the `execute` path, where Django's parameterized statements
-            # carry their values separately and must be stored to replay).
-            capture(opts.template?, conn, sql, [])
-            :ok
-
-          {:error, reason} ->
-            {:error, %Error{message: reason_to_string(reason), code: sqlite_code(reason)}}
+          nil ->
+            run_script(conn, sql, shard_id, opts)
         end
+    end
+  end
+
+  defp run_script(conn, sql, shard_id, opts) do
+    case Connection.exec(conn, sql) do
+      :ok ->
+        # THE DURABILITY TRAP (#34): `exec` bypasses the `wrote?`-based WriteCounter bump in the
+        # single-statement path, so a script-only session would leave the shard CLEAN and its
+        # write-gated idle flush would drop the local copy WITHOUT uploading — silently losing the
+        # script's writes (same class as the RETURNING bug). A script is presumed to write, so
+        # bump unconditionally.
+        Fathom.Shard.WriteCounter.bump(shard_id)
+
+        # …and record it against the open transaction, so a BEGIN (query) → write (exec) →
+        # COMMIT (query) sequence still re-bumps at the commit boundary (review 2026-07-24 #3).
+        mark_txn_write(conn)
+        # A script is opaque and may contain DDL, so drop the statement cache unconditionally
+        # (review 2026-07-24 #17). Scripts are migration-rare; the cost is irrelevant here.
+        Connection.purge_statements(conn)
+        # On the template shard, a script is (part of) a migration — feed it to capture.
+        # A Hrana `sequence` is opaque SQL text with no bind parameters, so there are no args
+        # to record for it (unlike the `execute` path, where Django's parameterized statements
+        # carry their values separately and must be stored to replay).
+        capture(opts.template?, conn, sql, [])
+        :ok
+
+      {:error, reason} ->
+        {:error, %Error{message: reason_to_string(reason), code: sqlite_code(reason)}}
+    end
+  end
+
+  # The per-statement gate for a script. Returns the first `%Error{}` any statement trips, or nil.
+  defp refuse_script(sql, opts, shard_id) do
+    sql
+    |> split_statements()
+    |> Enum.find_value(fn stmt ->
+      cond do
+        opts.block_ddl? and not opts.template? and ddl?(stmt) ->
+          %Error{
+            message:
+              "schema changes must go through the migration engine on the template shard, not a " <>
+                "direct script on tenant \"#{shard_id}\"",
+            code: "FILO_DDL_BLOCKED",
+            status: 400
+          }
+
+        true ->
+          blocked_statement(stmt)
+      end
+    end)
+  end
+
+  # A statement splitter for SQLite, hand-written because there is nothing to delegate to.
+  # exqlite's `prepare/2` discards the tail SQLite's own `sqlite3_prepare_v2` returns, and the
+  # authorizer is an action deny-list with no per-name granularity — so neither the binding nor
+  # the engine can answer "where does this statement end". AGENTS.md's bar for hand-rolling a
+  # grammar is exactly that sentence, and it is met here; the code is small and lives in one place.
+  #
+  # THE SAFETY DIRECTION IS DELIBERATE. Over-splitting is harmless: an extra fragment is checked
+  # against the same allowlist and a legitimate one passes. UNDER-splitting is the bypass — it
+  # happens only if the scanner believes it is inside a quoted region when it is not, so every
+  # quoting form SQLite has is tracked, including the doubling escapes (`'it''s'`), the bracket and
+  # backtick identifier forms, and both comment styles. `split_statements_test` pins each one.
+  @doc false
+  def split_statements(sql) when is_binary(sql), do: do_split(sql, "", [])
+
+  defp do_split(<<>>, acc, out), do: Enum.reverse(emit(acc, out))
+
+  defp do_split(<<?;, rest::binary>>, acc, out), do: do_split(rest, "", emit(acc, out))
+
+  # Quoted regions: consume to the matching close, keeping the bytes so the fragment stays runnable.
+  defp do_split(<<?\', rest::binary>>, acc, out) do
+    {chunk, rest} = quoted(rest, ?\', "")
+    do_split(rest, acc <> "\'" <> chunk, out)
+  end
+
+  defp do_split(<<?\", rest::binary>>, acc, out) do
+    {chunk, rest} = quoted(rest, ?\", "")
+    do_split(rest, acc <> "\"" <> chunk, out)
+  end
+
+  defp do_split(<<?`, rest::binary>>, acc, out) do
+    {chunk, rest} = quoted(rest, ?`, "")
+    do_split(rest, acc <> "`" <> chunk, out)
+  end
+
+  # `[...]` has no doubling escape in SQLite: the first `]` closes it.
+  defp do_split(<<?[, rest::binary>>, acc, out) do
+    {chunk, rest} = until(rest, "]", "")
+    do_split(rest, acc <> "[" <> chunk, out)
+  end
+
+  defp do_split(<<"--", rest::binary>>, acc, out) do
+    {chunk, rest} = until(rest, "\n", "")
+    do_split(rest, acc <> "--" <> chunk, out)
+  end
+
+  defp do_split(<<"/*", rest::binary>>, acc, out) do
+    {chunk, rest} = until(rest, "*/", "")
+    do_split(rest, acc <> "/*" <> chunk, out)
+  end
+
+  defp do_split(<<c::utf8, rest::binary>>, acc, out),
+    do: do_split(rest, acc <> <<c::utf8>>, out)
+
+  # A doubled quote character is an escaped literal, not a close — the one case that, gotten wrong,
+  # leaves the scanner inside-out for the rest of the script and hides every later statement.
+  defp quoted(<<q, q, rest::binary>>, q, acc), do: quoted(rest, q, acc <> <<q, q>>)
+  defp quoted(<<q, rest::binary>>, q, acc), do: {acc <> <<q>>, rest}
+  defp quoted(<<c::utf8, rest::binary>>, q, acc), do: quoted(rest, q, acc <> <<c::utf8>>)
+  # Unterminated: return what we have. The fragment is still gated, and SQLite will reject it.
+  defp quoted(<<>>, _q, acc), do: {acc, <<>>}
+
+  defp until(bin, delim, acc) do
+    case :binary.match(bin, delim) do
+      {at, len} ->
+        {binary_part(bin, 0, at + len), binary_part(bin, at + len, byte_size(bin) - at - len)}
+
+      :nomatch ->
+        {bin <> acc, <<>>}
+    end
+  end
+
+  defp emit(acc, out) do
+    case String.trim(acc) do
+      "" -> out
+      stmt -> [stmt | out]
     end
   end
 
@@ -1037,27 +1154,69 @@ defmodule Fathom.ShardExecutor do
   # `PRAGMA [schema.]name` alone is a read. SQLite accepts both setter forms, so both are
   # gated. The schema qualifier is stripped — `PRAGMA main.journal_mode=delete` sets the same
   # thing as `PRAGMA journal_mode=delete`.
+  # THE NAME IS EXTRACTED STRUCTURALLY, NOT FROM A FIXED WINDOW (expert review 2026-08-20 #19).
+  #
+  # This used to be `String.slice(6, 200)` followed by `String.split(body, ["=", "("], parts: 2)`,
+  # with a single-element result read as "no `=` and no `(` — a bare read". Insignificant
+  # whitespace between PRAGMA and the name pushes the `=` past 200 characters, the split returns
+  # one element, and the gate concludes "bare read" and executes the assignment.
+  #
+  # Verified against this project's own exqlite 0.37.0 with the tenant authorizer set:
+  #
+  #     "PRAGMA" <> String.duplicate(" ", 210) <> "max_page_count=12345"
+  #     #=> gate: NOT BLOCKED; engine: PRAGMA max_page_count -> 12345
+  #
+  # Every protective pragma was settable that way: `max_page_count` defeats :shard_max_bytes (a
+  # shard that keeps ACKNOWLEDGING writes past the cap and can never upload again — unbounded RPO
+  # for that tenant AND a node-wide disk-fill outage for every co-tenant), `synchronous=OFF`
+  # defeats per-commit durability, `wal_autocheckpoint=0` and `locking_mode=EXCLUSIVE` are
+  # noisy-neighbour levers against the coordinator's flush path.
+  #
+  # Scanning to the first delimiter is also CHEAPER than the old slice: O(name) rather than
+  # O(200), on a path that runs for every statement.
   defp blocked_pragma(sql) do
-    body = sql |> strip_lead_comments() |> String.slice(6, 200) |> String.downcase()
+    rest =
+      sql
+      |> strip_lead_comments()
+      |> String.slice(6..-1//1)
+      |> String.trim_leading()
 
-    case String.split(body, ["=", "("], parts: 2) do
-      # No `=` and no `(` — a bare read.
-      [_only] ->
+    {name_raw, tail} = split_at_pragma_delim(rest, "")
+    name = name_raw |> String.downcase() |> String.split(".") |> List.last()
+
+    cond do
+      # Nothing after the name but whitespace or a terminator: a bare read, always allowed.
+      not pragma_assignment?(tail) ->
         nil
 
-      [name_part, _value] ->
-        name = name_part |> String.trim() |> String.split(".") |> List.last()
+      name in @tenant_pragma_allow or name in @tenant_pragma_introspect or
+          name in extra_pragma_allow() ->
+        nil
 
-        if name in @tenant_pragma_allow or name in @tenant_pragma_introspect or
-             name in extra_pragma_allow() do
-          nil
-        else
-          %Error{
-            message: "PRAGMA #{name} cannot be set on a tenant shard",
-            code: "FILO_PRAGMA_BLOCKED",
-            status: 403
-          }
-        end
+      true ->
+        %Error{
+          message: "PRAGMA #{name} cannot be set on a tenant shard",
+          code: "FILO_PRAGMA_BLOCKED",
+          status: 403
+        }
+    end
+  end
+
+  # The pragma name runs to the first `=`, `(`, `;` or whitespace. Everything after is the tail.
+  defp split_at_pragma_delim(<<c::utf8, rest::binary>>, acc)
+       when c not in [?=, ?(, ?;, ?\s, ?\t, ?\n, ?\r],
+       do: split_at_pragma_delim(rest, acc <> <<c::utf8>>)
+
+  defp split_at_pragma_delim(tail, acc), do: {acc, tail}
+
+  # An assignment is `= value` or `(value)`. Anything else — end of statement, a bare `;`, trailing
+  # whitespace — is a read. Leading whitespace is skipped so `PRAGMA foo   =   1` is still an
+  # assignment; that gap is exactly what the old windowed parse lost.
+  defp pragma_assignment?(tail) do
+    case String.trim_leading(tail) do
+      "=" <> _ -> true
+      "(" <> _ -> true
+      _ -> false
     end
   end
 

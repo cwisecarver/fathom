@@ -176,6 +176,78 @@ defmodule Fathom.ShardIsolationAttachTest do
     end
   end
 
+  # THE `sequence` PATH SKIPPED THE GATE ENTIRELY (expert review 2026-08-20 #18, verified by
+  # execution against this project's own exqlite 0.37.0). execute_sequence/2 checked only
+  # `ddl?(sql)` — a LEADING-keyword test, so on a multi-statement script it inspected the first
+  # statement and nothing else — and never called `blocked_statement/1` at all. Measured:
+  #
+  #     "SELECT 1; PRAGMA synchronous=OFF; PRAGMA max_page_count=777; CREATE TABLE evil(a);"
+  #     #=> :ok — synchronous 0, max_page_count 777, table `evil` created
+  #
+  # The existing isolation test on this path asserts only that ATTACH is refused inside a script,
+  # which the SQLite AUTHORIZER provides, not the gate — so it reads as coverage of a gate it
+  # never exercises. Pragmas have no engine backstop, which is why the half with no second layer
+  # was exactly the half `sequence` skipped.
+  describe "a script is gated statement by statement (#18)" do
+    test "a protective pragma hidden after a harmless first statement is refused", ctx do
+      {:ok, a} = ShardExecutor.open(ctx.attacker)
+
+      for script <- [
+            "SELECT 1; PRAGMA synchronous=OFF",
+            "SELECT 1; PRAGMA max_page_count=777",
+            "SELECT 1;\nPRAGMA wal_autocheckpoint=0;\nSELECT 2",
+            "/* lead */ SELECT 1; PRAGMA journal_mode=DELETE"
+          ] do
+        assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
+                 ShardExecutor.execute_sequence(a, script),
+               "#{inspect(script)} was NOT refused — every protective pragma is settable through " <>
+                 "executescript()"
+      end
+
+      # And the durability setting really did survive.
+      assert {:ok, %{rows: [[2]]}} = ShardExecutor.execute(a, stmt("PRAGMA synchronous"))
+
+      :ok = ShardExecutor.close(a)
+    end
+
+    test "a semicolon inside a string literal does not hide the statement after it", ctx do
+      {:ok, a} = ShardExecutor.open(ctx.attacker)
+      {:ok, _} = ShardExecutor.execute(a, stmt("CREATE TABLE s (v TEXT)"))
+
+      assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
+               ShardExecutor.execute_sequence(
+                 a,
+                 "INSERT INTO s VALUES ('a;b'); PRAGMA synchronous=OFF"
+               ),
+             "a ';' inside a string literal made the scanner miss the statement after it"
+
+      # The doubling escape, which is the one that turns a scanner inside-out for the whole script.
+      assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
+               ShardExecutor.execute_sequence(
+                 a,
+                 "INSERT INTO s VALUES ('it''s; fine'); PRAGMA max_page_count=1"
+               )
+
+      :ok = ShardExecutor.close(a)
+    end
+
+    test "an ordinary multi-statement script still runs", ctx do
+      {:ok, a} = ShardExecutor.open(ctx.attacker)
+
+      assert :ok =
+               ShardExecutor.execute_sequence(
+                 a,
+                 "CREATE TABLE ok1 (v TEXT); INSERT INTO ok1 VALUES ('x;y'); INSERT INTO ok1 VALUES ('z')"
+               ),
+             "the gate over-refused a legitimate script — including one whose data contains a " <>
+               "semicolon, which is the cost of getting the splitter wrong in the safe direction"
+
+      assert {:ok, %{rows: [[2]]}} = ShardExecutor.execute(a, stmt("SELECT count(*) FROM ok1"))
+
+      :ok = ShardExecutor.close(a)
+    end
+  end
+
   describe "PRAGMA — fathom's own safety mechanisms are not tenant-settable" do
     test "the protective pragmas are refused", ctx do
       {:ok, a} = ShardExecutor.open(ctx.attacker)
@@ -197,6 +269,49 @@ defmodule Fathom.ShardIsolationAttachTest do
         assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
                  ShardExecutor.execute(a, stmt(sql)),
                "#{inspect(sql)} was not refused"
+      end
+
+      :ok = ShardExecutor.close(a)
+    end
+
+    # THE PADDED FORMS (expert review 2026-08-20 #19, verified by execution against this project's
+    # own exqlite 0.37.0 with the tenant authorizer set). The gate used to parse a fixed
+    # `String.slice(6, 200)` window and read "no `=` and no `(`" as a bare read — so insignificant
+    # whitespace between PRAGMA and the name pushed the `=` past the window and the assignment
+    # executed. The list above pins every one of these strings UNPADDED, which is why the suite
+    # reported full coverage of a gate with a hole in it.
+    test "padding cannot push the assignment out of view", ctx do
+      {:ok, a} = ShardExecutor.open(ctx.attacker)
+
+      names = [
+        "synchronous",
+        "max_page_count",
+        "wal_autocheckpoint",
+        "journal_mode",
+        "locking_mode",
+        "query_only",
+        "writable_schema"
+      ]
+
+      # 210 is just past the old 200-char window; 5_000 is well past any window at all. Tabs and
+      # newlines count as whitespace to SQLite exactly as spaces do.
+      for name <- names, pad <- [210, 5_000], ws <- [" ", "\t", "\n"] do
+        sql = "PRAGMA" <> String.duplicate(ws, pad) <> "#{name}=1"
+
+        assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
+                 ShardExecutor.execute(a, stmt(sql)),
+               "PRAGMA padded with #{pad} #{inspect(ws)} before #{name} was NOT refused — the " <>
+                 "protective pragma is settable by any tenant with a :rw token"
+      end
+
+      # And a bare READ of the same names is still allowed, padded or not: the allowlist governs
+      # SETTING, and over-refusing reads would break Django's introspection.
+      for name <- ["table_info", "foreign_key_list", "synchronous"], pad <- [1, 210] do
+        refute match?(
+                 {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}},
+                 ShardExecutor.execute(a, stmt("PRAGMA" <> String.duplicate(" ", pad) <> name))
+               ),
+               "a bare PRAGMA read of #{name} was refused; the gate governs assignment only"
       end
 
       :ok = ShardExecutor.close(a)
