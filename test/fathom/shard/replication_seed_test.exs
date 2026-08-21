@@ -773,6 +773,102 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     assert File.read!(Follower.wal_path(laggard, id)) == target
   end
 
+  # AN OUTSTANDING EXPECTATION IS NOT OVERWRITTEN (expert review 2026-08-20 #27).
+  #
+  # `@settled_rejects` deliberately EXCLUDES `:already_in_flight` and `:overloaded` so
+  # `reconcile/2` keeps the entry "so that reply can still be reconciled" — its own comment says
+  # clearing it strands a laggard permanently. But `deliver/5` did
+  # `Map.merge(state.inflight, expectations(...))` BEFORE the pushes were sent, and `Map.merge/2`
+  # lets the new map win — so the earlier push's expectation, the one the pending reply needs, was
+  # already destroyed by the time the local refusal happened.
+  #
+  # The genuine ack for the earlier push then failed `settle_late_ack/3`'s offset check (it was
+  # compared against the NEWER expectation), declined to advance, and `forget_inflight/2` dropped
+  # the entry anyway. So a follower that acked bytes it really holds was not advanced, the next
+  # commit planned a delta from a stale position, and only that follower's `:offset_mismatch`
+  # corrected the record: the exact symptom the `@settled_rejects` narrowing was written to
+  # eliminate, so the fix was believed to be in place when it was not.
+  #
+  # `:replication_catchup_ms` is 0 for this test ON PURPOSE. The deferred retry (#25) would also
+  # repair the position a second later, which would make this pass either way — the point here is
+  # that the ACK ITSELF is enough, with no extra round trip.
+  test "a held ack still advances the follower after our own shipper refused a later push", ctx do
+    %{id: id, root: root} = ctx
+    [{a, pa}, {b, pb}, {laggard, plag}] = start_followers!(root, 3)
+
+    prev_catchup = Application.get_env(:fathom, :replication_catchup_ms)
+    Application.put_env(:fathom, :replication_catchup_ms, 0)
+
+    on_exit(fn ->
+      if is_nil(prev_catchup),
+        do: Application.delete_env(:fathom, :replication_catchup_ms),
+        else: Application.put_env(:fathom, :replication_catchup_ms, prev_catchup)
+    end)
+
+    peer = start_supervised!({Fathom.Test.PausablePeer, upstream_port: plag, notify: self()})
+    enable!([{a, pa}, {b, pb}, {laggard, Fathom.Test.PausablePeer.port(peer)}], 2)
+
+    {coordinator, conn, path} = open_shard!(id)
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+    wal = path <> "-wal"
+
+    for n <- [a, b, laggard], do: Follower.seed(n, id, 0, 0, 0, 0)
+
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+    assert :ok = Session.commit(id, wal, coordinator)
+    _ = drive_until_converged(conn, wal, coordinator, id, [a, b, laggard])
+
+    [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+    shippers = Fleet.shippers()
+    lag_shipper = List.last(shippers)
+
+    # HOLD the laggard's answer. a and b carry the quorum, so the tenant sees :ok — which is
+    # precisely what makes this invisible in production.
+    :ok = Fathom.Test.PausablePeer.pause(peer)
+
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
+    assert :ok = Session.commit(id, wal, coordinator)
+    assert_receive {:peer_frame, :to_primary, _}, 2_000, "the laggard never answered at all"
+
+    # The position the HELD ack describes. Read from the session's own record so the test does not
+    # re-derive the planner's arithmetic.
+    first = :sys.get_state(session).inflight[lag_shipper]
+    assert first, "the first push left no expectation, so there is nothing to overwrite"
+
+    # A SECOND commit while the first reply is still held. The laggard's shipper is holding this
+    # shard's single waiter, so this push is refused `:already_in_flight` before the socket — and
+    # it is that refusal path whose expectation must not have been clobbered.
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (3)", [])
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    assert :sys.get_state(session).inflight[lag_shipper] == first,
+           "the second push overwrote the outstanding expectation the held reply needs"
+
+    {:ok, _} = Fathom.Test.PausablePeer.release(peer)
+
+    # THE PROPERTY: the released ack, on its own, moves the primary's record of the laggard to the
+    # position it really holds. With the expectation clobbered this never happens — the ack is
+    # compared against the newer offset, declined, and dropped.
+    deadline = System.monotonic_time(:millisecond) + 3_000
+
+    advanced =
+      Stream.repeatedly(fn ->
+        if :sys.get_state(session).followers[lag_shipper] == first,
+          do: :advanced,
+          else: Process.sleep(10)
+      end)
+      |> Enum.find(fn
+        :advanced -> true
+        _ -> System.monotonic_time(:millisecond) > deadline
+      end)
+
+    assert advanced == :advanced,
+           "the laggard acked bytes it really holds and the primary did not record them. The " <>
+             "next commit then plans from a stale position, the follower rejects " <>
+             ":offset_mismatch, and only THEN is the record corrected — one wasted round trip " <>
+             "and one wasted payload, at the ~10k :already_in_flight per node AGENTS.md records."
+  end
+
   # Commit until every follower holds the primary's WAL, or give up loudly. Bounded, and each round
   # is a real write — the same thing that makes a strand self-heal in production.
   defp drive_until_converged(conn, wal, coordinator, id, followers, rounds \\ 12) do

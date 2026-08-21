@@ -656,7 +656,28 @@ defmodule Fathom.Shard.Replication.Session do
   defp deliver(state, header, plans, pushes, current) do
     # Recorded BEFORE anything is sent, because a reply can be observed by a later commit's drain
     # with no plan in scope. See the `inflight` note in `init/1`.
-    state = %{state | inflight: Map.merge(state.inflight, expectations(plans, header))}
+    #
+    # AN OUTSTANDING EXPECTATION IS NEVER OVERWRITTEN (expert review 2026-08-20 #27). The argument
+    # order is the fix and it is easy to "tidy" back, so: `Map.merge/2` lets the SECOND map win,
+    # and this used to be `merge(state.inflight, expectations(...))` — so the earlier push's
+    # expectation, the one a pending reply still needs, was destroyed before the pushes were even
+    # sent.
+    #
+    # That defeated `@settled_rejects` exactly where it was written to help. It deliberately
+    # EXCLUDES `:already_in_flight` and `:overloaded` so `reconcile/2` keeps the entry "so that
+    # reply can still be reconciled" — but by the time the local refusal happened the entry it
+    # kept was the NEW one. The genuine ack for the earlier push then failed
+    # `settle_late_ack/3`'s offset check, declined to advance, and `forget_inflight/2` dropped it
+    # anyway: a follower that acked bytes it really holds was not advanced, the next commit planned
+    # from a stale position, and the follower rejected `:offset_mismatch` before the record was
+    # corrected. One wasted round trip and one wasted (up to 1 MiB) payload per occurrence, at the
+    # ~10k `:already_in_flight` per node AGENTS.md records at 512 tenants.
+    #
+    # Old-wins is correct rather than merely safer, because a `Shipper` holds exactly ONE waiter
+    # per shard and a `Session` is per-shard: if `inflight` already has an entry for a shipper,
+    # that shipper is still holding this shard's waiter, so the push about to be sent WILL be
+    # refused locally and has no expectation to record.
+    state = %{state | inflight: Map.merge(expectations(plans, header), state.inflight)}
 
     case max(quorum() - current, 0) do
       # Followers that are already current carry the quorum on their own. The laggards still get
