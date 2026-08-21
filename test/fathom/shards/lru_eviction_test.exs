@@ -37,7 +37,20 @@ defmodule Fathom.Shards.LruEvictionTest do
   defp restore(key, nil), do: Application.delete_env(:fathom, key)
   defp restore(key, val), do: Application.put_env(:fathom, key, val)
 
+  # These table-level tests use SYNTHETIC ids with no coordinator behind them, so the default
+  # liveness predicate would (correctly) classify every row as a ghost. Pinning it keeps them
+  # testing what they were written to test — stamp ordering, the granularity window, the probe
+  # bound — while the ghost behaviour itself gets its own test below, against the real registry.
+  defp all_live, do: fn _id -> true end
+
   defp uniq, do: "lru_#{System.unique_integer([:positive])}"
+
+  # The Lru is keyed by shard id, and `open_idle/1` hands back a pid. Read the id back out of the
+  # registry rather than threading it through, so the helpers above stay unchanged.
+  defp shard_id_of(pid) do
+    [{id, _}] = Registry.keys(Fathom.ShardRegistry, pid) |> Enum.map(&{&1, nil})
+    id
+  end
 
   # Open a shard, release its connection, and confirm it's idle (0 conns). Returns the
   # coordinator pid. Touched into the Lru table at checkout.
@@ -82,6 +95,73 @@ defmodule Fathom.Shards.LruEvictionTest do
     assert Process.alive?(newer)
   end
 
+  # GHOST ROWS (expert review 2026-08-20 #29).
+  #
+  # Every Lru row is released only from `Fathom.Shard.terminate/2` — the same "release only from
+  # terminate" class as the write fence (#6) and the flush gate (#15). A coordinator that skips
+  # terminate leaves `{id, stamp}` behind forever.
+  #
+  # The walk's self-cleaning fired only on a stamp MISMATCH, and a ghost's stamp matches exactly.
+  # It is not busy either, so it was returned as a live candidate and SPENT ONE OF THE 16 PROBE
+  # SLOTS; `evicted_for_room?/0` then filtered it out with its own registry check, after the limit
+  # was already gone. A ghost's stamp never advances, so it sits permanently at the cold end where
+  # the walk starts.
+  #
+  # ~16 of them therefore make `lru_order/1` return nothing evictable and every novel open on a
+  # full node 503 `FILO_AT_CAPACITY`, while idle evictable shards sit just past the probe window:
+  # the soft cap degrading into a hard cap, which is the exact failure the busy table was written
+  # to prevent, reintroduced through a different door.
+  describe "ghost rows (#29)" do
+    test "ghosts at the cold end do not consume the bounded probe" do
+      # 20 > the caller's 16-probe budget, all colder than the real shard opened after them.
+      ghosts = for _ <- 1..20, do: uniq()
+      for g <- ghosts, do: Lru.touch(g)
+
+      # PRECONDITION: they really are in the table, and really have no coordinator. A fixture that
+      # failed to record them would make this test pass while reaching nothing.
+      assert Enum.all?(ghosts, &(Lru.lru_order(100, all_live()) |> Enum.member?(&1))),
+             "the fixture never recorded the ghost rows"
+
+      idle = open_idle(uniq())
+      idle_id = shard_id_of(idle)
+
+      # The real, evictable shard must be found INSIDE the probe budget the caller uses.
+      assert idle_id in Lru.lru_order(16),
+             "20 ghost rows at the cold end exhausted the bounded eviction probe, so an idle, " <>
+               "evictable shard was invisible to it — the soft cap degraded into a hard cap"
+
+      # And they are gone for good, not skipped every walk.
+      assert Lru.lru_order(100, all_live()) == [idle_id]
+    end
+
+    test "at capacity behind a wall of ghosts, a novel open still evicts instead of 503ing" do
+      # RECORDED FIRST, so they are genuinely COLDER than the real shards — which is where a real
+      # ghost sits, because its stamp never advances again. Recording them afterwards would put
+      # them behind the idle shard in the walk, and the test would pass without the wall ever
+      # being in front of anything. (Re-touching the idle shard to reorder does not work: `touch/1`
+      # is a no-op inside the 1 s granularity window, so it would silently change nothing.)
+      ghosts = for _ <- 1..20, do: uniq()
+      for g <- ghosts, do: Lru.touch(g)
+
+      idle = open_idle(uniq())
+      _busy = open_held(uniq())
+
+      # PRECONDITION: the wall really is in front of the idle shard.
+      assert Enum.take(Lru.lru_order(100, all_live()), 20) == ghosts,
+             "the ghost wall is not at the cold end, so the probe never reaches it first"
+
+      Application.put_env(:fathom, :max_open_shards, 1)
+
+      ref = Process.monitor(idle)
+
+      assert {:ok, _pid, _r, _p} = Shards.checkout(uniq()),
+             "the node refused a novel open while an idle, evictable shard was available — the " <>
+               "probe was spent on rows whose coordinators are long gone"
+
+      assert_receive {:DOWN, ^ref, :process, ^idle, _}, 2_000
+    end
+  end
+
   test "a busy shard is never evicted — all-busy at capacity still refuses" do
     busy = open_held(uniq())
     Application.put_env(:fathom, :max_open_shards, 1)
@@ -124,12 +204,12 @@ defmodule Fathom.Shards.LruEvictionTest do
       Lru.reset()
       for i <- 1..5, do: Lru.touch("t#{i}")
 
-      assert length(Lru.lru_order(3)) == 3
-      assert length(Lru.lru_order(100)) == 5
+      assert length(Lru.lru_order(3, all_live())) == 3
+      assert length(Lru.lru_order(100, all_live())) == 5
 
       Lru.forget("t3")
-      refute "t3" in Lru.lru_order(100)
-      assert length(Lru.lru_order(100)) == 4
+      refute "t3" in Lru.lru_order(100, all_live())
+      assert length(Lru.lru_order(100, all_live())) == 4
     end
 
     # Review 2026-07-23 #14: lru_order was tab2list |> sort — O(N log N) + a full-table copy
@@ -145,7 +225,7 @@ defmodule Fathom.Shards.LruEvictionTest do
       for i <- 1..3, do: Lru.touch("s#{i}")
 
       # "hot" was touched last before s1..s3, so it is the coldest; s1..s3 follow in order.
-      assert Lru.lru_order(10) == ["hot", "s1", "s2", "s3"]
+      assert Lru.lru_order(10, all_live()) == ["hot", "s1", "s2", "s3"]
       assert :ets.info(Fathom.Shards.Lru.Order, :size) == 4
     end
 
@@ -176,14 +256,14 @@ defmodule Fathom.Shards.LruEvictionTest do
 
       # Recency is still tracked across the window: a shard touched later sorts later.
       Lru.touch("later")
-      assert Lru.lru_order(10) == ["warm", "later"]
+      assert Lru.lru_order(10, all_live()) == ["warm", "later"]
     end
 
     test "touch is a no-op when eviction is unreachable (no finite cap)" do
       Application.put_env(:fathom, :max_open_shards, :infinity)
       Lru.reset()
       Lru.touch("ghost")
-      assert Lru.lru_order(10) == []
+      assert Lru.lru_order(10, all_live()) == []
       refute Lru.enabled?()
     end
 
@@ -206,8 +286,8 @@ defmodule Fathom.Shards.LruEvictionTest do
 
       # Pre-#14, lru_order(2) returned the 2 coldest (both busy) and the idle was hidden past the
       # window. Now the busy front is filtered out, so even a tight probe reaches the idle tail.
-      assert Lru.lru_order(2) == ["idle"]
-      assert Lru.lru_order(100) == ["idle"]
+      assert Lru.lru_order(2, all_live()) == ["idle"]
+      assert Lru.lru_order(100, all_live()) == ["idle"]
     end
   end
 

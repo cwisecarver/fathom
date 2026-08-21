@@ -47,6 +47,10 @@ defmodule Fathom.Shards.Lru do
   # no longer matches is stale and lazily deleted during the walk.
   @order_table __MODULE__.Order
 
+  # The authority on whether a shard is actually OPEN. `lru_order/1` consults it because the ETS
+  # rows here are released only from `Fathom.Shard.terminate/2` — see `ghost?/1`.
+  @registry Fathom.ShardRegistry
+
   # How stale a recency stamp may be before touch/1 rewrites it (native units). 1s is far finer
   # than any eviction decision needs — the cold end of the LRU is separated by minutes — while
   # collapsing a shard doing 1000 checkouts/s from ~4000 ETS ops/s to ~1000 cheap lookups.
@@ -165,31 +169,77 @@ defmodule Fathom.Shards.Lru do
   Stale keys met along the way are deleted (self-cleaning), so each is visited at most once.
   """
   @spec lru_order(pos_integer()) :: [String.t()]
-  def lru_order(limit) when is_integer(limit) and limit > 0 do
-    collect_idle(:ets.first(@order_table), limit, [])
+  def lru_order(limit), do: lru_order(limit, &open?/1)
+
+  @doc """
+  As `lru_order/1`, with the liveness predicate injected.
+
+  Exists so the table's own ordering/bounding properties can be exercised without standing up a
+  coordinator per row — `open?/1` reads `Fathom.ShardRegistry`, which those tests have no reason
+  to populate. Production always uses the default; see `ghost?/2`.
+  """
+  @spec lru_order(pos_integer(), (String.t() -> boolean())) :: [String.t()]
+  def lru_order(limit, live?) when is_integer(limit) and limit > 0 and is_function(live?, 1) do
+    collect_idle(:ets.first(@order_table), limit, [], live?)
   rescue
     ArgumentError -> []
   end
 
-  defp collect_idle(_key, 0, acc), do: Enum.reverse(acc)
-  defp collect_idle(:"$end_of_table", _limit, acc), do: Enum.reverse(acc)
+  defp collect_idle(_key, 0, acc, _live?), do: Enum.reverse(acc)
+  defp collect_idle(:"$end_of_table", _limit, acc, _live?), do: Enum.reverse(acc)
 
-  defp collect_idle({stamp, id} = key, limit, acc) do
+  defp collect_idle({stamp, id} = key, limit, acc, live?) do
     next = :ets.next(@order_table, key)
 
     case :ets.lookup(@table, id) do
       [{^id, ^stamp}] ->
-        # Current — a real candidate unless busy (busy keeps its key: still valid recency).
-        if busy?(id),
-          do: collect_idle(next, limit, acc),
-          else: collect_idle(next, limit - 1, [id | acc])
+        cond do
+          # A GHOST: current stamp, no coordinator (expert review 2026-08-20 #29). See `ghost?/2`.
+          # Forgotten entirely and NOT counted against `limit` — it was never a candidate, and
+          # spending a probe slot on it is the whole defect.
+          ghost?(id, live?) ->
+            forget(id)
+            collect_idle(next, limit, acc, live?)
+
+          # Busy keeps its key: still valid recency.
+          busy?(id) ->
+            collect_idle(next, limit, acc, live?)
+
+          true ->
+            collect_idle(next, limit - 1, [id | acc], live?)
+        end
 
       _ ->
         # Superseded stamp or forgotten shard — self-clean and keep walking.
         :ets.delete(@order_table, key)
-        collect_idle(next, limit, acc)
+        collect_idle(next, limit, acc, live?)
     end
   end
+
+  # A ROW WHOSE COORDINATOR IS GONE (expert review 2026-08-20 #29).
+  #
+  # Every row here is released only from `Fathom.Shard.terminate/2` — the same "release only from
+  # terminate" class as the write fence (#6) and the flush gate (#15) — so a coordinator that
+  # skips terminate leaves `{id, stamp}` in `@table`, its key in `@order_table` and its last
+  # `{id, 0}` in `@busy_table` behind forever.
+  #
+  # The walk's self-cleaning only fired on a stamp MISMATCH, and a ghost's stamp matches exactly.
+  # It is not busy either, so it was returned as a live candidate and spent one of the 16 probe
+  # slots; `evicted_for_room?/0` then filtered it out with its own registry check — AFTER the
+  # limit was already gone. And because a ghost's stamp never advances it sits permanently at the
+  # cold end, which is precisely where the walk starts.
+  #
+  # So ~16 accumulated ghosts make `lru_order/16` return nothing evictable, `evicted_for_room?/0`
+  # return false, and every novel open on a full node 503 `FILO_AT_CAPACITY` — while idle,
+  # evictable shards sit just past the probe window. That is the soft cap degrading into a hard
+  # cap, the exact failure the busy-table above was written to prevent, reintroduced through a
+  # different door.
+  #
+  # Checked HERE rather than only in the caller because the cost of a ghost is the probe slot, and
+  # only the walk can decline to spend one. `Registry.lookup/2` is an ETS read on a bounded walk.
+  defp ghost?(id, live?), do: not live?.(id)
+
+  defp open?(id), do: Registry.lookup(@registry, id) != []
 
   @doc false
   def reset do
