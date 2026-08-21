@@ -38,6 +38,23 @@ Fathom is a multi-tenant sharded data platform built on Phoenix: one SQLite data
 
 - **Sequenced directives** ("do X then Y", "review then execute") → execute directly. Don't pause to re-confirm the sequence or ask which item to start with. If genuinely ambiguous, name your default and proceed; stop only if the ambiguity risks irreversible harm.
 - **"Go ahead" / "continue" / "proceed"** = continue the *most recently scoped* task. Never authorization to escalate review→implementation or jump phases. Asked for a review → deliver only the review.
+- **A work QUEUE is one task, not N tasks.** A findings list, a migration sweep, a rollout, a
+  batch of files to convert: the "continue" was granted when the queue was accepted. **Never end
+  a turn asking whether to keep going** — "want me to do the next one?" is not a checkpoint, it
+  is an abandoned queue, and it reads as completion to whoever left you running. Work it until
+  every item has a terminal status, or until a documented stop condition fires (stop-after-2, a
+  >50-error scope blowup, >60 min past estimate).
+  - **An item you cannot decide alone gets PARKED, not waited on.** Write down the decision and
+    its options, ship any part of the fix that stands independently, and move to the next item.
+    One open question must never stall the rest of the queue.
+  - **Ask the question out loud, then keep working.** State it in prose in the turn's text and
+    carry on; if the user is present they answer mid-turn and the message arrives with your next
+    tool result, so you un-park it and implement. Never block on `AskUserQuestion` inside a queue
+    run — it has no timeout, so "ask and wait a bit" cannot be expressed with it. Asking in prose
+    costs nothing and gets answered just as often.
+  - Measured 2026-08-20: a 39-finding `/iterate` run stopped at 3 because the turn ended with
+    "Want me to keep going?". The skill said to *wait for approval* on architectural items, which
+    would have stalled it anyway. Both are now fixed — but the general rule is the one above.
 - **Locating things:** one targeted Read/Grep/Glob, not a fan-out of speculative `find`/`ls`. If the first lookup fails, widen the query.
 - **Don't narrate intentions** ("let me check…", "I'll now…"). State results.
 
