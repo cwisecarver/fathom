@@ -309,4 +309,91 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
     assert {:ok, lease} = Storage.acquire_lease(id, "verifier#1", 10_000)
     Storage.release_lease(id, lease)
   end
+
+  # THE THREE DEFECTS IN ONE FUNCTION (expert review 2026-08-20 #17). promote/2 is operator-invoked
+  # only, but it is the tool reached for DURING an incident, and it left the shard in the one state
+  # cold-open treats as hostile.
+  describe "publishing a promotion safely (#17)" do
+    test "(a) the promoted file carries a provenance sidecar", ctx do
+      %{id: id, root: root} = ctx
+      followers = start_followers!(root, 3)
+      enable!(followers, 2)
+      :ok = replicate_then_abandon_primary(id, followers, 5)
+      [{name, _} | _] = followers
+
+      assert {:ok, _} = Promote.promote(id, follower: name)
+
+      sidecar = Fathom.Shard.db_path(id) <> ".etag"
+
+      assert File.exists?(sidecar),
+             "the promoted database has no provenance sidecar, so the next cold open reads " <>
+               ":missing, QUARANTINES it as a planted fork (.forked.<ts>, an ERROR log naming a " <>
+               "fork that did not happen) and re-pulls the stale object"
+
+      # And it must agree with the store, or the next open reads it as a fork anyway.
+      assert {:ok, etag} = Storage.object_etag(id)
+      assert String.trim(File.read!(sidecar)) == etag
+    end
+
+    test "(b) the publish is FENCED — an object that moved under it refuses the promotion", ctx do
+      %{id: id, root: root} = ctx
+      followers = start_followers!(root, 3)
+      enable!(followers, 2)
+      :ok = replicate_then_abandon_primary(id, followers, 5)
+      [{name, _} | _] = followers
+
+      # Something else publishes to this shard in the window between our etag read and our PUT.
+      # FaultyStorage's run_before(:flush) hook exists for exactly this ("lets a test steal the
+      # shard — overwrite the object — in the window").
+      usurper = Path.join(root, "usurper.db")
+      {:ok, c} = Fathom.Shard.Connection.open(usurper)
+      {:ok, _} = Fathom.Shard.Connection.query(c, "CREATE TABLE usurper (x)", [])
+      :ok = Fathom.Shard.Connection.close(c)
+
+      prev_backend = Application.get_env(:fathom, :shard_storage)
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+      Application.put_env(
+        :fathom,
+        :faulty_before,
+        {:flush,
+         fn ->
+           Application.delete_env(:fathom, :faulty_before)
+           Fathom.Test.FaultyStorage.flush(id, usurper)
+         end}
+      )
+
+      on_exit(fn ->
+        Application.delete_env(:fathom, :faulty_before)
+
+        if is_nil(prev_backend),
+          do: Application.delete_env(:fathom, :shard_storage),
+          else: Application.put_env(:fathom, :shard_storage, prev_backend)
+      end)
+
+      assert {:error, _} = Promote.promote(id, follower: name),
+             "the promotion published UNCONDITIONALLY over an object that changed under it — " <>
+               "the 2-arity Storage.flush/2 was the only production caller of the unfenced PUT"
+    end
+
+    test "(c) the lease is taken under a DISTINCT owner, so a coordinator is fenced not reclaimed",
+         ctx do
+      %{id: id, root: root} = ctx
+      followers = start_followers!(root, 3)
+      enable!(followers, 2)
+      :ok = replicate_then_abandon_primary(id, followers, 5)
+      [{name, _} | _] = followers
+
+      # A coordinator's own owner string. Pre-fix promote/2 acquired under exactly this, so
+      # acquire_existing took the same-owner RECLAIM branch and fenced nothing — this module's own
+      # moduledoc calls that "not a check at all".
+      {:ok, held} = Storage.acquire_lease(id, Fathom.Shard.Heartbeat.owner(), 30_000)
+
+      assert {:error, {:lease_held, _}} = Promote.promote(id, follower: name),
+             "promote/2 took a lease a coordinator already holds; under the same owner string " <>
+               "that is a silent reclaim, and both writers then hold a valid lease on one file"
+
+      :ok = Storage.release_lease(id, held)
+    end
+  end
 end

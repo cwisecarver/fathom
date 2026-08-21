@@ -186,10 +186,22 @@ defmodule Fathom.Shard.Replication.Promote do
       # The rename is the last step that can leave the live path holding replica bytes, so it comes
       # only after staging has verified them. Publishing follows, because a local file the store
       # does not know about is the fork the provenance sidecar exists to catch.
+      # FENCED publish, and the sidecar stamped from the etag it returns (expert review
+      # 2026-08-20 #17).
+      #
+      # This used to be the 2-arity `Storage.flush/2` — the UNCONDITIONAL PUT, and the only
+      # production caller of it. The moduledoc argues the replica is ahead of the object so we must
+      # not fence on an etag WE wrote, which is true and is not an argument for fencing on nothing:
+      # reading the object's CURRENT etag and requiring it to still be there costs one HEAD and
+      # turns a blind clobber into a refusal.
+      #
+      # A `nil` etag (no stored object at all) is a legitimate first publish and the 3-arity
+      # accepts it, so a brand-new shard is unaffected.
       with :ok <- stage(follower, shard_id, temp),
+           {:ok, expected} <- current_object_etag(shard_id),
            :ok <- File.rename(temp, path),
-           :ok <- Storage.flush(shard_id, path),
-           {:ok, etag} <- Storage.object_etag(shard_id) do
+           {:ok, etag} <- Storage.flush(shard_id, path, expected),
+           :ok <- stamp_provenance(shard_id) do
         # Only now does the follower stop being a replica of this shard. Doing it earlier would
         # mean a failure above left the node holding neither a replica nor a primary.
         Follower.forget(follower, shard_id)
@@ -294,11 +306,70 @@ defmodule Fathom.Shard.Replication.Promote do
 
   defp acquire(shard_id) do
     case Storage.acquire_lease(shard_id, owner(), @lease_ttl_ms) do
-      {:ok, lease} -> {:ok, lease}
-      {:error, {:held, other}} -> {:error, {:lease_held, other}}
-      {:error, reason} -> {:error, reason}
+      {:ok, lease} ->
+        # RE-CHECK AFTER THE ACQUIRE (expert review 2026-08-20 #17). ensure_no_coordinator/1 runs
+        # before this, and nothing stopped a checkout from starting a coordinator in between —
+        # which, under the old same-owner string, the acquire could not detect either. Now the
+        # owner is distinct so the acquire genuinely fences a coordinator's lease, and this closes
+        # the remaining window where one appeared between the two.
+        case ensure_no_coordinator(shard_id) do
+          :ok ->
+            {:ok, lease}
+
+          {:error, _} = err ->
+            Storage.release_lease(shard_id, lease)
+            err
+        end
+
+      {:error, {:held, other}} ->
+        {:error, {:lease_held, other}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
-  defp owner, do: Fathom.Shard.Heartbeat.owner()
+  # A DISTINCT owner string, never `Heartbeat.owner()` (expert review 2026-08-20 #17). This module's
+  # own moduledoc names the hazard: a second acquire under the SAME owner takes
+  # `acquire_existing`'s same-owner RECLAIM branch, "which is not a check at all". Mirrors the
+  # migrator's `migrator@<node>@<token>`, so a coordinator's lease is genuinely fenced rather than
+  # silently reclaimed out from under a live writer.
+  defp owner, do: "promote@" <> Fathom.Shard.Heartbeat.owner()
+
+  # The object's CURRENT etag, to fence the publish on. `:absent`/no object is a legitimate first
+  # publish, so it fences on nil rather than refusing.
+  defp current_object_etag(shard_id) do
+    case Storage.object_etag(shard_id) do
+      {:ok, etag} -> {:ok, etag}
+      {:error, :not_found} -> {:ok, nil}
+      {:error, _} = err -> err
+    end
+  end
+
+  # The live path was written OUT OF BAND — this module renamed a file onto it without going
+  # through a coordinator — so nothing stamped `<path>.etag` (expert review 2026-08-20 #17). Every
+  # other writer of that path does: promote_pull/2, apply_flush_verdict/2, promote_replica/6.
+  #
+  # Without it, the next cold open reads `:missing` provenance, `resolve_fork/4` QUARANTINES the
+  # promoted database as a planted file (`.forked.<ts>`, an ERROR log naming a fork that did not
+  # happen) and re-pulls the stale object. When the publish above succeeded that is a spurious
+  # alarm plus a full body transfer; when it FAILED, the lease is released anyway and the only copy
+  # of the recovered writes is quarantined while the stale object is served. With
+  # `:adopt_unprovenanced_warm` on it is worse: the file is adopted with the store's current etag,
+  # which is exactly the clobber `shard.ex` documents.
+  defp stamp_provenance(shard_id) do
+    # `stamp_local_provenance/1` is the public seam that exists for exactly this — an out-of-band
+    # writer of the live path — and it re-reads the object's etag itself, so it cannot record one
+    # that disagrees with the store.
+    Fathom.Shard.stamp_local_provenance(shard_id)
+    :ok
+  rescue
+    e ->
+      Logger.warning(
+        "promoted #{shard_id} but could not stamp its provenance sidecar (#{inspect(e)}); the " <>
+          "next cold open will treat the promoted file as a fork and re-pull the stored object"
+      )
+
+      :ok
+  end
 end
