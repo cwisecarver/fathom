@@ -363,6 +363,10 @@ defmodule Fathom.Shard.Replication.Shipper do
     opts = [
       :binary,
       packet: 4,
+      # See Protocol.max_frame_bytes/0: `packet: 4` allocates the DECLARED length before any body
+      # arrives, and packet_size is the only bound. Applies to this direction too, because a
+      # follower's reply frame is parsed the same way.
+      packet_size: Fathom.Shard.Replication.Protocol.max_frame_bytes(),
       active: true,
       nodelay: true,
       send_timeout: send_timeout(),

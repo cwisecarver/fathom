@@ -231,7 +231,18 @@ defmodule Fathom.Shard.Replication.Fleet do
         {DynamicSupervisor, name: @shippers_sup, strategy: :one_for_one}
       ] ++ follower_children() ++ membership_children()
 
-    Supervisor.init(children, strategy: :one_for_one)
+    # AN EXPLICIT RESTART BUDGET (expert review 2026-08-20 #21). This defaulted to OTP's 3-in-5s,
+    # and the `Follower` listener is restartable from the network: before the accept loop's bare
+    # `=` matches were rescued, four peer resets in five seconds terminated this supervisor — and
+    # it is a child of `Fathom.DataPlane.Supervisor`, so that escalated into every open shard
+    # coordinator on the node going down. The matches are fixed, but the budget should not have
+    # been the only thing standing between an ordinary TCP event and a plane restart. Mirrors the
+    # plane budget in `Fathom.Application`.
+    Supervisor.init(children,
+      strategy: :one_for_one,
+      max_restarts: Application.get_env(:fathom, :replication_max_restarts, 30),
+      max_seconds: Application.get_env(:fathom, :replication_max_seconds, 10)
+    )
   end
 
   defp membership_children do

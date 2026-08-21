@@ -440,7 +440,15 @@ defmodule Fathom.Shard.Replication.Recovery do
     :gen_tcp.connect(
       charlist,
       port,
-      [:binary, packet: 4, active: false, nodelay: true],
+      [
+        :binary,
+        packet: 4,
+        # A peer answering a position query during a failover is not automatically trustworthy;
+        # bound what its declared length can make us allocate. See Protocol.max_frame_bytes/0.
+        packet_size: Fathom.Shard.Replication.Protocol.max_frame_bytes(),
+        active: false,
+        nodelay: true
+      ],
       @connect_timeout
     )
   end

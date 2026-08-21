@@ -669,4 +669,98 @@ defmodule Fathom.Shard.ReplicationTransportTest do
              "a clean stop should refuse, not disconnect, got #{inspect(rejects)}"
     end
   end
+
+  # #20 and #21 — the replication listener's exposure to ordinary and hostile network events. The
+  # port is unauthenticated by design and binds every interface unless REPLICATION_BIND_IP is set.
+  describe "the listener bounds what a peer can make it allocate (#20)" do
+    # THE FINDING'S NUMBER WAS WRONG AND ITS DIRECTION WAS RIGHT, which is worth recording because
+    # the obvious probe passes either way. It claimed `<<0xFFFFFFFF::32>>` forces a ~4 GiB
+    # allocation. Measured on this OTP against a bare `packet: 4` listener, that exact value is
+    # ALREADY refused with :emsgsize — the driver has its own sanity bound near the 32-bit ceiling.
+    #
+    #     declared     no packet_size    packet_size: 5MB
+    #     8 MiB        accepted (waits)  :emsgsize
+    #     1 GiB        accepted (waits)  :emsgsize
+    #     4 GiB        :emsgsize         :emsgsize
+    #
+    # So the hazard is real but sits BELOW that ceiling: a peer declaring 1 GiB is accepted and the
+    # driver waits, buffering toward it. Testing with 0xFFFFFFFF would have passed against the
+    # unfixed code and proved nothing.
+    test "a declared length far above any real frame is refused, not buffered" do
+      dir = Path.join(System.tmp_dir!(), "pkt_#{System.unique_integer([:positive])}")
+      name = :"pkt_f#{System.unique_integer([:positive])}"
+      pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
+      {:ok, port} = Follower.port(pid)
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      # 64 MiB: above our derived cap (max(seed chunk, max push) + slack ≈ 4 MiB) and well below
+      # the driver's own ceiling, so this is exactly the band packet_size adds.
+      {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false], 2_000)
+      :ok = :gen_tcp.send(sock, <<64 * 1024 * 1024::32>>)
+      :ok = :gen_tcp.send(sock, "dribble")
+
+      # A bounded listener refuses the frame and closes the connection (serve/3's {:error, _}
+      # branch). An unbounded one sits waiting for 64 MiB of body that never comes.
+      assert {:error, :closed} = :gen_tcp.recv(sock, 0, 2_000),
+             "the listener accepted a 64 MiB declared frame and is buffering toward it — " <>
+               "packet_size is the only bound on what `packet: 4` allocates before any body byte " <>
+               "arrives, and it is a security control on an unauthenticated port"
+
+      :gen_tcp.close(sock)
+
+      # Still alive, and a legitimate frame still works — the bound did not break real traffic.
+      assert {:ok, ^port} = Follower.port(pid)
+
+      {:ok, s2} =
+        :gen_tcp.connect(~c"127.0.0.1", port, [:binary, packet: 4, active: false], 2_000)
+
+      :ok = :gen_tcp.send(s2, Fathom.Shard.Replication.Protocol.encode_position_query("acme"))
+      assert {:ok, _} = :gen_tcp.recv(s2, 0, 2_000)
+      :gen_tcp.close(s2)
+    end
+  end
+
+  # #21 — OTP hygiene in the accept path.
+  #
+  # HONESTY ABOUT COVERAGE. The specific trigger the finding names — `controlling_process/2`
+  # answering {:error, :closed} because the peer reset between accept and handoff — needs a race
+  # this suite cannot force: connecting and aborting with SO_LINGER 0 does NOT reliably produce it,
+  # and a test that passes either way is worse than none. So the bare `=` match is rescued on the
+  # argument (an ordinary peer reset must not be a MatchError in a spawn_link'ed loop whose owner
+  # does not trap exits), and what IS pinned here is the second half: with trap_exit set, the
+  # listener no longer dies silently when its accept loop does.
+  describe "the accept loop's exit is handled, not fatal-by-default (#21)" do
+    test "a dead accept loop stops the listener cleanly instead of leaving a bound port" do
+      dir = Path.join(System.tmp_dir!(), "exit_#{System.unique_integer([:positive])}")
+      name = :"exit_f#{System.unique_integer([:positive])}"
+      pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
+      {:ok, port} = Follower.port(pid)
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      # The accept loop is the process blocked in :gen_tcp.accept on this listener's socket.
+      loop =
+        Process.info(pid, :links)
+        |> elem(1)
+        |> Enum.find(fn p ->
+          is_pid(p) and
+            match?({:current_function, {:prim_inet, _, _}}, Process.info(p, :current_function))
+        end)
+
+      assert is_pid(loop), "could not find the accept loop; the fixture proves nothing"
+
+      ref = Process.monitor(pid)
+      Process.exit(loop, :kill)
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, reason}, 2_000
+
+      assert match?({:accept_loop_exited, _}, reason) or match?({:shutdown, _}, reason),
+             "the listener died from the linked exit rather than handling it, so terminate/2 " <>
+               "never ran and the listen socket was left bound with nothing accepting " <>
+               "(got #{inspect(reason)})"
+
+      # The port is genuinely released — terminate/2 ran.
+      assert {:ok, l} = :gen_tcp.listen(port, [:binary, reuseaddr: true, active: false])
+      :gen_tcp.close(l)
+    end
+  end
 end

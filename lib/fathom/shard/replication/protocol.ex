@@ -396,4 +396,68 @@ defmodule Fathom.Shard.Replication.Protocol do
   @doc "The protocol version this node speaks."
   @spec version() :: pos_integer()
   def version, do: @version
+
+  # Slack for the frame header, the shard id and the fixed fields, on top of the payload.
+  @frame_overhead 64 * 1024
+
+  # When the per-push cap is switched off (`REPLICATION_MAX_PUSH_BYTES=0`, which AGENTS.md records
+  # being used as an A/B control), a legitimate push can be large — but "large" must still be
+  # FINITE, or the socket is unbounded again. 64 MiB is far above any real frame and far below a
+  # number that hurts a node.
+  @unbounded_push_frame 64 * 1024 * 1024
+
+  @doc """
+  The largest legitimate frame, for `:gen_tcp`'s `packet_size`.
+
+  **THIS IS A SECURITY CONTROL, not a tuning knob** (expert review 2026-08-20 #20). `packet: 4`
+  parses a 32-bit big-endian length prefix and `inet_drv` expands its receive buffer to the
+  DECLARED length before any body byte arrives; `packet_size` is the only thing that bounds it, and
+  its default is 0, meaning no limit. So eight bytes — `<<0xFFFFFFFF::32>>` — cause an immediate
+  ~4 GiB allocation, which either aborts the emulator or gets the container OOM-killed.
+
+  `Protocol.decode/1` is total and defensive, and never runs: the allocation happens in the driver,
+  below it. The listener is unauthenticated and binds every interface unless `REPLICATION_BIND_IP`
+  is set, so this is remote and pre-authentication — and it is reachable WITHOUT a hostile peer,
+  because the code anticipates framing desync itself and a desynced stream reads payload bytes as
+  a length prefix.
+
+  Applied to the outbound sockets too: `Recovery.connect/2` asks a PEER for a position during a
+  failover, so a corrupt or malicious peer could otherwise kill the node that is trying to recover
+  — precisely when the fleet can least absorb it.
+
+  An oversized header now surfaces as `{:error, :emsgsize}`, which every one of those call sites
+  already handles.
+  """
+  @spec max_frame_bytes() :: pos_integer()
+  def max_frame_bytes do
+    case Application.get_env(:fathom, :replication_max_frame_bytes) do
+      n when is_integer(n) and n > 0 ->
+        n
+
+      _ ->
+        # Both reads are VALIDATED, not just defaulted. `Application.get_env/3` is untyped, and a
+        # float here would reach `:gen_tcp`'s packet_size, which requires an integer — dialyzer
+        # caught exactly that (`missing_range`: float() not in pos_integer()). Same shape as
+        # `FlushGate.cap/0`: a misconfigured value falls back rather than propagating.
+        chunk = positive_int(:replication_seed_chunk_bytes, 4 * 1024 * 1024)
+
+        # A non-positive push cap means "unbounded" (REPLICATION_MAX_PUSH_BYTES=0, which AGENTS.md
+        # records as an A/B control), so the frame bound falls back to a large but FINITE number
+        # rather than to no bound at all.
+        push =
+          case Application.get_env(:fathom, :replication_max_push_bytes, 1024 * 1024) do
+            n when is_integer(n) and n > 0 -> n
+            _ -> @unbounded_push_frame
+          end
+
+        max(chunk, push) + @frame_overhead
+    end
+  end
+
+  defp positive_int(key, default) do
+    case Application.get_env(:fathom, key, default) do
+      n when is_integer(n) and n > 0 -> n
+      _ -> default
+    end
+  end
 end

@@ -203,6 +203,10 @@ defmodule Fathom.Shard.Replication.Follower do
 
   @impl true
   def init(opts) do
+    # Without this, an exit signal from the linked accept loop kills this GenServer OUTRIGHT and
+    # `terminate/2` — which closes the listen socket — never runs (expert review 2026-08-20 #21).
+    Process.flag(:trap_exit, true)
+
     name = Keyword.get(opts, :name, __MODULE__)
     dir = Keyword.get(opts, :dir) || default_dir()
     File.mkdir_p!(dir)
@@ -227,7 +231,17 @@ defmodule Fathom.Shard.Replication.Follower do
     # cloud host means the public one. Same trust posture as `hrana_auth: :disabled` (the network
     # IS the boundary), so it gets the same knob: `REPLICATION_BIND_IP`.
     listen_opts =
-      [:binary, packet: 4, active: false, reuseaddr: true, nodelay: true, backlog: 128]
+      [
+        :binary,
+        packet: 4,
+        # Bounds the pre-body allocation `packet: 4` would otherwise make from an attacker-
+        # declared length. See Protocol.max_frame_bytes/0 — this is a security control.
+        packet_size: Protocol.max_frame_bytes(),
+        active: false,
+        reuseaddr: true,
+        nodelay: true,
+        backlog: 128
+      ]
       |> then(fn base ->
         case Keyword.get(opts, :ip) do
           nil -> base
@@ -251,6 +265,24 @@ defmodule Fathom.Shard.Replication.Follower do
 
   @impl true
   def handle_call(:port, _from, state), do: {:reply, {:ok, state.port}, state}
+
+  # With `trap_exit` set, the linked accept loop's exit arrives here instead of killing us. A
+  # normal exit is the listen socket closing during shutdown; anything else means the loop died and
+  # nothing is accepting, so stop and let the supervisor start a fresh listener rather than sit
+  # there with an open port and no acceptor (expert review 2026-08-20 #21).
+  @impl true
+  def handle_info({:EXIT, _pid, :normal}, state), do: {:noreply, state}
+
+  def handle_info({:EXIT, _pid, reason}, state) do
+    Logger.error(
+      "replication accept loop exited (#{inspect(reason)}); stopping the listener so it is " <>
+        "restarted with a fresh socket rather than left bound with nothing accepting"
+    )
+
+    {:stop, {:accept_loop_exited, reason}, state}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
   def terminate(_reason, %{lsock: lsock}), do: :gen_tcp.close(lsock)
@@ -277,10 +309,29 @@ defmodule Fathom.Shard.Replication.Follower do
   defp accept_loop(lsock, name) do
     case :gen_tcp.accept(lsock) do
       {:ok, sock} ->
-        # Unlinked: one primary dropping its connection must not take down the listener, and a
-        # malformed frame from one peer must not affect another's shards.
+        # NEITHER OF THESE MAY BE A BARE `=` MATCH (expert review 2026-08-20 #21).
+        #
+        # `:gen_tcp.controlling_process/2` returns `{:error, :closed}` when the accepted socket has
+        # already been reset by the peer — an ORDINARY event, no attacker required. As a MatchError
+        # inside this `spawn_link`ed loop, whose owner does not trap exits, it killed the entire
+        # listener GenServer and took its ETS table with it: every follower connection dropped and
+        # every replicated shard on the node needed a full DATABASE re-seed. Four peer resets in
+        # five seconds then exhausted the supervisor's restart budget and terminated `Fleet` itself.
+        #
+        # Unlinked handler, deliberately: one primary dropping its connection must not take down
+        # the listener, and a malformed frame from one peer must not affect another's shards.
         {:ok, pid} = Task.start(fn -> serve(sock, name) end)
-        :ok = :gen_tcp.controlling_process(sock, pid)
+
+        case :gen_tcp.controlling_process(sock, pid) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            # The peer is already gone. Close our end and let the handler find a dead socket.
+            Logger.debug("replication accept: handing off socket failed (#{inspect(reason)})")
+            :gen_tcp.close(sock)
+        end
+
         accept_loop(lsock, name)
 
       {:error, :closed} ->
