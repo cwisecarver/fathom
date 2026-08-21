@@ -40,7 +40,8 @@ defmodule Fathom.Telemetry do
            {Fathom.Admin.Measurements, :vm_limits, []},
            {Fathom.Admin.Measurements, :durability, []},
            {Fathom.Admin.Measurements, :disk, []},
-           {Fathom.Admin.Measurements, :replication, []}
+           {Fathom.Admin.Measurements, :replication, []},
+           {Fathom.Admin.Measurements, :flush_gate, []}
          ],
          period: 10_000,
          name: Fathom.ShardPoller}
@@ -320,6 +321,26 @@ defmodule Fathom.Telemetry do
         event_name: [:fathom, :warm_follower, :disk_pressure],
         measurement: :held,
         description: "Shards still cached while under disk pressure (retained, not evicted)"
+      ),
+      # The flush gate had no observability at all (expert review 2026-08-20 #15). A leaked slot is
+      # permanent without the sweep, the cap is single digits, and a node whose gate is full simply
+      # stops flushing — quietly, because the failure counter only moves for flushes that RAN.
+      # `in_flight` at or above `cap` sustained is the alertable condition.
+      last_value("fathom.shard.flush_gate.in_flight",
+        event_name: [:fathom, :shard, :flush_gate],
+        measurement: :in_flight,
+        description: "Durability flushes currently in flight on this node"
+      ),
+      last_value("fathom.shard.flush_gate.cap",
+        event_name: [:fathom, :shard, :flush_gate],
+        measurement: :cap,
+        description: "Node-wide concurrent-flush cap; in_flight pinned here means nothing flushes"
+      ),
+      counter("fathom.shard.flush_gate.reclaimed.count",
+        event_name: [:fathom, :shard, :flush_gate, :reclaimed],
+        description:
+          "Flush-gate slots reclaimed from dead holders. Non-zero means coordinators are being " <>
+            "killed mid-flush; left unreclaimed these accumulate until no shard can flush"
       ),
       last_value("fathom.node.disk.free_bytes",
         event_name: [:fathom, :node, :disk],

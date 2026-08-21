@@ -22,6 +22,8 @@ defmodule Fathom.Shard.FlushGate do
   """
   use GenServer
 
+  require Logger
+
   @table __MODULE__
   @counter :in_flight
 
@@ -86,6 +88,10 @@ defmodule Fathom.Shard.FlushGate do
         n = :ets.update_counter(@table, @counter, {2, 1}, {@counter, 0})
 
         if n <= cap do
+          # Record WHO holds it, so a slot can be reclaimed from a process that died without
+          # releasing (expert review 2026-08-20 #15). Still lock-free and still no GenServer hop:
+          # one extra ETS insert on a `write_concurrency` table. See `sweep/0`.
+          :ets.insert(@table, {{:holder, self()}, System.monotonic_time(:millisecond)})
           :ok
         else
           # Roll back our own increment (clamped at 0) — we didn't get a slot.
@@ -105,10 +111,49 @@ defmodule Fathom.Shard.FlushGate do
   @doc "Release a slot reserved by `try_acquire/0`. Clamped at 0 so a stray release can't underflow."
   @spec release() :: :ok
   def release do
+    :ets.delete(@table, {:holder, self()})
     :ets.update_counter(@table, @counter, {2, -1, 0, 0}, {@counter, 0})
     :ok
   rescue
     ArgumentError -> :ok
+  end
+
+  @doc """
+  Reclaim slots held by processes that are no longer alive. Returns how many it freed.
+
+  THE LEAK THIS EXISTS FOR (expert review 2026-08-20 #15). The counter is node-global and outlives
+  any coordinator, while `release/0` was reachable only from coordinator callbacks — so a
+  coordinator brutally killed mid-flush (shutdown-budget expiry, `DynamicSupervisor.terminate_child`
+  from `Shards.stop/1`), or one that raised between `try_acquire/0` and recording
+  `flush_slot_held:` in its state, leaked a slot permanently.
+
+  The default cap is `max(min(pool_size / 4, schedulers), 4)` — 8 on an 8-core box, 4 at the floor.
+  Leaking that few makes `try_acquire/0` answer `:full` FOREVER, so every dirty shard on the node
+  reschedules at the 250 ms backoff and never flushes again. The RPO goes unbounded with no
+  telemetry: `[:fathom, :shard, :flush, :failed]` only fires for a flush that actually RAN.
+
+  Runs on a timer rather than via monitors so the acquire path keeps its "no GenServer hop"
+  property — a leak is rare, and correcting it within one sweep interval is enough.
+  """
+  @spec sweep() :: non_neg_integer()
+  def sweep do
+    @table
+    |> :ets.match({{:holder, :"$1"}, :_})
+    |> List.flatten()
+    |> Enum.reject(&Process.alive?/1)
+    |> Enum.reduce(0, fn dead, freed ->
+      # `:ets.take/2` so two concurrent sweeps cannot both free the same slot.
+      case :ets.take(@table, {:holder, dead}) do
+        [] ->
+          freed
+
+        [_ | _] ->
+          :ets.update_counter(@table, @counter, {2, -1, 0, 0}, {@counter, 0})
+          freed + 1
+      end
+    end)
+  rescue
+    ArgumentError -> 0
   end
 
   @doc "Current in-flight flush count (for tests / observability)."
@@ -123,7 +168,34 @@ defmodule Fathom.Shard.FlushGate do
   end
 
   @doc false
-  def reset, do: :ets.insert(@table, {@counter, 0})
+  def reset do
+    :ets.match_delete(@table, {{:holder, :_}, :_})
+    :ets.insert(@table, {@counter, 0})
+  end
+
+  @sweep_interval_ms 30_000
+
+  @impl true
+  def handle_info(:sweep, state) do
+    case sweep() do
+      0 ->
+        :ok
+
+      freed ->
+        Logger.warning(
+          "flush gate reclaimed #{freed} slot(s) from dead holders — a coordinator was killed " <>
+            "mid-flush. Left unreclaimed these accumulate and eventually refuse EVERY flush on " <>
+            "this node, which makes the RPO unbounded with no other signal."
+        )
+
+        :telemetry.execute([:fathom, :shard, :flush_gate, :reclaimed], %{count: freed}, %{})
+    end
+
+    schedule_sweep()
+    {:noreply, state}
+  end
+
+  defp schedule_sweep, do: Process.send_after(self(), :sweep, @sweep_interval_ms)
 
   @impl true
   def init(_opts) do
@@ -136,6 +208,7 @@ defmodule Fathom.Shard.FlushGate do
     ])
 
     :ets.insert(@table, {@counter, 0})
+    schedule_sweep()
     {:ok, %{}}
   end
 end

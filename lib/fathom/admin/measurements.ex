@@ -56,6 +56,36 @@ defmodule Fathom.Admin.Measurements do
   defp safe_ratio(used, limit), do: used / limit
 
   @doc """
+  The node-wide concurrent-flush gate: how many slots are in flight, and the cap.
+
+  Added because the gate had NO observability at all (expert review 2026-08-20 #15). A leaked slot
+  — a coordinator killed mid-flush — is permanent without `FlushGate.sweep/0`, and the cap is
+  single digits, so a handful of leaks makes `try_acquire/0` answer `:full` forever and every dirty
+  shard on the node stops flushing. Nothing else surfaces that: `[:fathom, :shard, :flush, :failed]`
+  only fires for a flush that actually RAN, so the node goes quiet rather than loud, and the RPO
+  grows unbounded behind the silence.
+
+  `in_flight` at or above `cap` for a sustained period is the alertable condition.
+  """
+  @spec flush_gate() :: :ok
+  def flush_gate do
+    case Fathom.Shard.FlushGate.cap() do
+      cap when is_integer(cap) ->
+        :telemetry.execute(
+          [:fathom, :shard, :flush_gate],
+          %{in_flight: Fathom.Shard.FlushGate.in_flight(), cap: cap},
+          %{}
+        )
+
+      _ ->
+        # No cap configured: the gate is off and the counter is never touched.
+        :ok
+    end
+
+    :ok
+  end
+
+  @doc """
   Local-disk headroom for the directories fathom writes to (expert review 2026-08-01 #36).
 
   Nothing in the metrics layer read the filesystem before this: `fathom.storage.bytes` is *S3*

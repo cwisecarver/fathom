@@ -1531,7 +1531,30 @@ defmodule Fathom.Shard do
             # snapshot_state what flush_and_reconcile needs.
             fence_ctx = fence_ctx(state)
             snapshot_state = Map.take(state, [:id, :path, :etag, :lease])
-            task = Task.async(fn -> fenced_flush(fence_ctx, snapshot_state) end)
+
+            # THE SLOT IS RESERVED BEFORE THE STATE THAT OWNS ITS RELEASE EXISTS (expert review
+            # 2026-08-20 #15) — the same class AGENTS.md records for `acquire_lease` → built state.
+            # `Task.async/1` calls `spawn_link`, which RAISES `:system_limit` when the process table
+            # is full: the density regime fathom explicitly targets, 30k coordinators plus one
+            # process per held stream. A raise here leaked the node-global slot AND crashed the
+            # coordinator into a terminate/2 whose state still said `flush_slot_held: false`, so
+            # nothing released it there either. The cap is single digits, so a handful of those
+            # answer `:full` forever and every dirty shard on the node stops flushing.
+            #
+            # `FlushGate.sweep/0` reclaims a slot from a dead holder within one sweep interval; this
+            # closes the window immediately for the one failure that is synchronous and local.
+            task =
+              try do
+                Task.async(fn -> fenced_flush(fence_ctx, snapshot_state) end)
+              rescue
+                e ->
+                  if gate == :ok, do: FlushGate.release()
+                  reraise e, __STACKTRACE__
+              catch
+                kind, reason ->
+                  if gate == :ok, do: FlushGate.release()
+                  :erlang.raise(kind, reason, __STACKTRACE__)
+              end
 
             {:noreply,
              %{
