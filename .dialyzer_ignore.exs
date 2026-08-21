@@ -90,12 +90,12 @@
   {"lib/fathom/shard/connection.ex", :pattern_match_cov},
   {"lib/fathom/shard/connection.ex", :guard_fail},
 
-  # `Shards.fork_failure_reason/1`'s `_ -> :unknown`. The comment above it is the reason: telemetry
-  # metadata rides into Telemetry.Metrics TAGS, so the reason must be a bounded atom set or a
-  # `{:retry, term}` carrying an arbitrary storage error becomes unbounded cardinality. The
-  # catch-all is that bound. It is unreachable for today's outcome shapes and must survive the next
-  # one.
-  {"lib/fathom/shards.ex", :pattern_match_cov},
+  # REMOVED 2026-08-21 (expert review #35). This covered `Shards.fork_failure_reason/1`'s
+  # `_ -> :unknown`, which dialyzer called unreachable because every caller of `report_fork/2` was
+  # inside this module and the outcome shapes were therefore statically known. `report_fork/2` is
+  # now `@doc false` PUBLIC so its classification can be tested directly, so its input is no longer
+  # knowable and the catch-all is genuinely reachable. `list_unused_filters: true` caught the stale
+  # entry, which is the whole reason that option is on.
 
   # `Shard.flush_position/1`'s no-lease clause. It is guarded `when is_integer(epoch)` on a
   # destructured `%{lease: %{epoch: epoch}}`, and every state dialyzer can see has one — but the

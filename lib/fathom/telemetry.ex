@@ -537,6 +537,16 @@ defmodule Fathom.Telemetry do
       # "alertable" stopped one step short of an actual alert. `:reason` is a deliberately BOUNDED
       # atom set (`Shards.fork_failure_reason/1`) — the shard_id rides event metadata for the log
       # line and must never become a tag.
+      # Two opens of the same NOVEL id raced and one deferred to the other (expert review
+      # 2026-08-20 #35). Deliberately NOT `fork_fallback`, which pages on any occurrence because a
+      # born-empty tenant is a silent hard outage — here the winner's fork SUCCEEDED and the tenant
+      # has its schema, so routing an ordinary signup race there told an operator to delete a
+      # healthy tenant. Worth counting anyway: the loser has already spent a `NovelLimiter` token,
+      # so a rising rate means one novel id is repeatedly consuming two.
+      counter("fathom.migrator.fork_retry.count",
+        event_name: [:fathom, :migrator, :fork_retry],
+        description: "Novel-shard opens that deferred their fork to a concurrent forker"
+      ),
       counter("fathom.migrator.fork_fallback.count",
         event_name: [:fathom, :migrator, :fork_fallback],
         tags: [:reason],

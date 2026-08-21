@@ -740,20 +740,58 @@ defmodule Fathom.Shards do
     report_fork(outcome, shard_id)
   end
 
+  # Public (`@doc false`) so the CLASSIFICATION can be tested directly. Which outcomes are benign
+  # and which page is the whole content of this function — expert review 2026-08-20 #35 was a
+  # misclassification, not a logic error — and reaching every branch through a real fork race would
+  # need a concurrent lease holder per case.
+  @doc false
   # Born at HEAD — the intended path, no noise.
-  defp report_fork({:ok, _}, _shard_id), do: :ok
+  def report_fork({:ok, _}, _shard_id), do: :ok
 
   # The reserved capture template opening itself. Django migrates it directly and it is
   # excluded from every rollout sweep; refusing to fork it onto itself is correct, not a
   # fallback worth alarming on.
-  defp report_fork({:error, :template_shard}, _shard_id), do: :ok
+  def report_fork({:error, :template_shard}, _shard_id), do: :ok
 
   # A stored object already exists for this id (a flushed-then-forgotten shard whose
   # directory row is gone). The fork correctly refuses to clobber it, and the shard is NOT
   # born empty — it cold-opens onto its own data. Not a fallback.
-  defp report_fork({:error, :dst_exists}, _shard_id), do: :ok
+  def report_fork({:error, :dst_exists}, _shard_id), do: :ok
 
-  defp report_fork(outcome, shard_id) do
+  # A CONCURRENT FORKER WON, WHICH MEANS THE FORK SUCCEEDED (expert review 2026-08-20 #35).
+  #
+  # `ensure/1` is a find-or-start with a genuine race: two callers can both see
+  # `Registry.lookup == []` and both enter `start_if_capacity/1`, and with `:fork_from_template`
+  # on both call `fork_novel/1`. The loser gets `{:retry, reason}` — a DECLARED return of
+  # `Migrator.fork_from_template/1`, and the comment above `fork_novel/1` already names "a
+  # concurrent forker holding the lease" as expected.
+  #
+  # It fell through to the generic clause, which logs at ERROR that "the tenant is born EMPTY and
+  # serving with NO schema … Delete the tenant and re-mint it", and pages via
+  # `[:fathom, :migrator, :fork_fallback]` on ANY occurrence. All of that is FALSE here: the other
+  # caller's fork succeeded and the tenant has its schema. An ordinary signup race produced a
+  # page-worthy alarm instructing an operator to delete a healthy tenant.
+  #
+  # Still reported, on a DISTINCT event, because it is not nothing: it means two opens raced, and
+  # the loser has already spent a `NovelLimiter` token, so one novel id can consume two. Keeping it
+  # on `fork_fallback` would defeat the point — that alert pages on any occurrence precisely
+  # because a born-empty tenant is a silent hard outage.
+  def report_fork({:retry, reason}, shard_id) do
+    Logger.info(
+      "shard #{shard_id}: fork-from-template deferred to a concurrent forker " <>
+        "(#{inspect(reason)}); the winner births the tenant at HEAD. Not a fallback."
+    )
+
+    :telemetry.execute(
+      [:fathom, :migrator, :fork_retry],
+      %{count: 1},
+      %{shard_id: shard_id}
+    )
+
+    :ok
+  end
+
+  def report_fork(outcome, shard_id) do
     reason = fork_failure_reason(outcome)
 
     Logger.error(
@@ -782,7 +820,9 @@ defmodule Fathom.Shards do
   defp fork_failure_reason({:error, {:exception, _}}), do: :exception
   defp fork_failure_reason({:error, {:exit, _}}), do: :exit
   defp fork_failure_reason({:error, _}), do: :error
-  defp fork_failure_reason({:retry, _}), do: :retry
+  # `{:retry, _}` no longer reaches here — it is handled as the benign concurrent-forker case
+  # above (expert review 2026-08-20 #35) — so there is deliberately no clause for it. The
+  # catch-all below still covers any shape a future `fork_from_template/1` return adds.
   defp fork_failure_reason(_), do: :unknown
 
   # Novel = nothing knows the shard: no local file (a present file is an authoritative

@@ -236,6 +236,64 @@ defmodule Fathom.Shard.WarmPromotionTest do
     Connection.close(ro)
   end
 
+  # Expert review 2026-08-20 #34: the cold-pull FALLBACK inside `promote_warm_cache/4` can
+  # legitimately find no object at all, and the caller had no clause for it.
+  #
+  # `Storage.pull/2`'s documented return set is `{:ok, etag} | {:absent, etag_or_nil} |
+  # {:error, term}`, and `{:absent, _}` exists SPECIFICALLY because review 2026-08-01 #24 found
+  # that collapsing it into `{:ok, _}` fabricated empty databases. The `case` around
+  # `promote_warm_cache/4` matched only `:ok`, `{:ok, _}` and `{:error, _}`, so `{:absent, nil}`
+  # raised `CaseClauseError`, was swallowed by `start_pull/2`'s rescue as
+  # `{:error, {:pull_exception, _}}`, and `open_with_lease/8` released the lease and failed the
+  # checkout -- a benign brand-new-shard state turned into an error and a spurious
+  # `[:fathom, :shard, :open, :failed]`.
+  #
+  # Dialyzer cannot reach this class: `Storage.pull/2` dispatches through `backend().pull(...)`,
+  # so its success typing is `term()` -- the "wrappers over dynamic dispatch are not checked" case
+  # AGENTS.md's Typing section records. Only a test can.
+  test "a warm 304 whose cache AND object both vanish still opens the shard", %{shard: shard} do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    seed_remote(shard, "v1")
+    _e1 = warm_cache_from_remote(shard)
+    cache = WarmFollower.cache_path(shard)
+
+    # Fires between the 304 and the promotion copy. The follower evicts the cached shard AND the
+    # stored object is gone -- an eviction racing a tenant delete. The fallback cold pull then
+    # answers `{:absent, nil}`, which is the truth: there is nothing to pull.
+    vanish = fn ->
+      File.rm(cache)
+      File.rm(cache <> ".etag")
+      File.rm(Path.join(remote_dir(), "#{shard}.db"))
+    end
+
+    Application.put_env(:fathom, :faulty_before, {:promote, vanish})
+
+    # PRECONDITION: the warm path is what runs. Without a cached etag this is an ordinary cold
+    # pull and the test would prove nothing about the branch under test.
+    assert WarmFollower.cached_etag(shard), "the fixture never warmed the cache"
+
+    assert {:ok, conn} = ShardExecutor.open(shard),
+           "a brand-new (objectless) shard behind a warm 304 failed to open. The fallback pull " <>
+             "answered {:absent, _}, which matched no clause, and the CaseClauseError was " <>
+             "swallowed into {:error, {:pull_exception, _}} -- the lease released and the " <>
+             "checkout failed on a state that is simply an empty tenant."
+
+    # And it really is an empty, working shard: the object was deleted, so there is nothing to
+    # restore, and the coordinator must serve a fresh database rather than stale bytes.
+    assert {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE fresh (a)"))
+    :ok = ShardExecutor.close(conn)
+  end
+
   test "a live-dir warm restart wins over the follower cache (own writes authoritative)",
        %{shard: shard} do
     # This node's own un-flushed local copy says "restart"; the follower cache and the

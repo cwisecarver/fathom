@@ -888,9 +888,36 @@ defmodule Fathom.Shard do
             emit_warm(shard_id, :hit)
             # 304 ⇒ the cache equals storage's current object, so `etag` IS the current etag.
             case promote_warm_cache(shard_id, temp, etag, pre_stat) do
-              :ok -> {:ok, etag}
-              {:ok, _} = ok -> ok
-              {:error, _} = error -> error
+              :ok ->
+                {:ok, etag}
+
+              {:ok, _} = ok ->
+                ok
+
+              # THE COLD-PULL FALLBACK CAN LEGITIMATELY FIND NO OBJECT (expert review 2026-08-20
+              # #34). `promote_warm_cache/4` falls back to `Storage.pull/2` on any doubt about the
+              # cache, and that function's documented return set includes `{:absent, etag_or_nil}`
+              # — the shape review 2026-08-01 #24 introduced SPECIFICALLY because collapsing it
+              # into `{:ok, _}` fabricated empty databases. This case matched only `:ok`,
+              # `{:ok, _}` and `{:error, _}`, so `{:absent, nil}` raised `CaseClauseError`, was
+              # caught by `start_pull/2`'s rescue as `{:error, {:pull_exception, _}}`, and
+              # `open_with_lease/8` released the lease and failed the checkout — turning a benign
+              # brand-new-shard state into an error and a spurious `[:fathom, :shard, :open,
+              # :failed]`.
+              #
+              # PASSED THROUGH rather than folded to `{:ok, nil}`: `await_pull/3` has its own
+              # `{:absent, etag}` clause, and folding would hide the distinction from
+              # `promote_pull/2`, which uses it to stamp the "derived from no object" sentinel
+              # sidecar so the first flush is a conditional CREATE rather than a blind overwrite.
+              #
+              # Dialyzer cannot see this class: `Storage.pull/2` dispatches through
+              # `backend().pull(...)`, so its success typing is `term()` — the "wrappers over
+              # dynamic dispatch are not checked" case AGENTS.md § Typing records.
+              {:absent, _} = absent ->
+                absent
+
+              {:error, _} = error ->
+                error
             end
 
           {:ok, {:written, new_etag}} ->
