@@ -543,6 +543,14 @@ end
 # inside every tenant COMMIT, and the measured cost is dominated by WHERE the followers are, not
 # how many: with two near and two far, a quorum acks in ~1.6 ms while all-N pays 134 ms on the
 # same replicas. Placement is the decision; replica count is not.
+#
+# ALSO READ `SHARD_FLUSH_INTERVAL_MS` BEFORE ENABLING (expert review 2026-08-20 #33). It lives in
+# the durability section above and reads like a pure RPO knob, but with replication on it is the
+# largest throughput dial there is: a durability flush CHECKPOINTS the WAL, a checkpoint starts a
+# new generation, and `Primary.plan/3` then correctly ships the ENTIRE WAL rather than a delta. One
+# variable, same image, 512 tenants (2026-08-18): 5,000 -> 30,000 ms took the run from 22,599
+# errors to 4 and +49% throughput, with `:stale_wal_gen` and `:overloaded` both going to ZERO.
+# `Fathom.Application.check_replication_flush_interval!/0` warns at boot when the two disagree.
 if System.get_env("REPLICATION_ENABLED") in ~w(true 1) do
   config :fathom, :replication_enabled, true
 end

@@ -399,8 +399,39 @@ revive() {
   compose up -d "$node" >/dev/null 2>&1
 }
 
+# The rig's SHARD_FLUSH_INTERVAL_MS default is now 300000, matching production (expert review
+# 2026-08-20 #33) -- it used to be 5000, 60x tighter, so every replication number this rig produced
+# was taken at a setting production never uses. See docs/reviews/a2-flush-interval-2026-08-18.md.
+#
+# Three scenarios genuinely need a fast flush: they must observe a durability PUT inside their own
+# window, and at 300 s they would sit there proving nothing. The interval is baked into the
+# containers at boot, so a scenario cannot change it -- CHECK AND NAME IT, the same way cmd_rpo
+# checks REPLICATION_ENABLED, rather than silently producing a run that means nothing.
+require_fast_flush() {
+  local scenario=$1 want=${2:-10000}
+  local actual
+  actual=$(rpc fathom1 'IO.puts(Application.get_env(:fathom, :shard_flush_interval_ms))' | tr -d '\r\n ')
+  case "$actual" in
+    ''|*[!0-9]*)
+      echo "WARN: could not read :shard_flush_interval_ms from fathom1 (got '$actual'); continuing."
+      return 0
+      ;;
+  esac
+
+  if [ "$actual" -gt "$want" ]; then
+    echo "FAIL: this rig's flush interval is ${actual} ms; \`$scenario\` needs <= ${want} ms."
+    echo "  It has to observe a durability PUT inside its own window. The rig now defaults to"
+    echo "  production's 300000 ms, so ask for a fast flush explicitly when you bring it up:"
+    echo "      SHARD_FLUSH_INTERVAL_MS=5000 ./chaos.sh up"
+    echo "      ./chaos.sh $scenario"
+    return 1
+  fi
+  echo "  flush interval ${actual} ms (fast enough for $scenario)"
+}
+
 cmd_failover() {
   local shard=${1:?usage: failover <shard>}
+  require_fast_flush failover || return 1
   seed "$shard"
   sql "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', 100)" >/dev/null
   echo "waiting one flush interval so the write is durable in S3..."
@@ -546,6 +577,7 @@ cmd_partition() {
 
 cmd_soak() {
   local secs=${1:-120} tenants=(t1 t2 t3 t4 t5 t6) t
+  require_fast_flush soak || return 1
   local ack_dir; ack_dir=$(mktemp -d)
   echo "soak: ${secs}s of writes across ${#tenants[@]} tenants with node churn (acks in $ack_dir)"
   # seed/1 truncates, so acked (this run) and stored are directly comparable. See seed/1.
@@ -829,6 +861,11 @@ cmd_rpo() {
     return 1
   fi
   echo "  shipping ON, quorum ${REPLICATION_QUORUM:-2}"
+
+  # `rpo` kills with NO flush in between, which is the whole point -- but both arms still need the
+  # SHARD to have been flushed at least once before the kill, and arm 1 must be able to LOSE the
+  # row to the last flushed object. At 300 s neither arm means anything.
+  require_fast_flush "rpo $shard" || return 1
 
   # THE IMAGE CHECK, before anything expensive. `up` does not build, so a rig validating a code
   # change can be running a release from weeks ago — and "it passed" then reads as validation.

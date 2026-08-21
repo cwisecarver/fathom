@@ -31,6 +31,7 @@ defmodule Fathom.Application do
     check_hrana_exposure!()
     check_replication_exposure!()
     check_replication_disk!()
+    check_replication_flush_interval!()
 
     # Grouped into plane sub-supervisors (each with its own restart budget) rather than
     # one flat list, so a control-plane restart-storm (e.g. Repo) is contained to its
@@ -113,6 +114,11 @@ defmodule Fathom.Application do
   # worst possible input to #16's own budget — while the Edge plane kept running, so live Hrana
   # streams held connections to files the terminating coordinators were about to unlink. That
   # inverts the stated architecture, where a wobble in one plane cannot restart another.
+  # Below this, a replicating fleet is re-shipping whole WALs (see
+  # `check_replication_flush_interval!/0`). 30 s is the value the 2026-08-18 A/B measured as clean
+  # at 512 tenants, not a round number.
+  @replication_flush_floor_ms 30_000
+
   @default_plane_max_restarts 30
   @default_plane_max_seconds 10
 
@@ -338,6 +344,45 @@ defmodule Fathom.Application do
       {{:ok, %{mount: m}}, {:ok, %{mount: m}}} -> true
       _ -> false
     end
+  end
+
+  # THE FLUSH INTERVAL IS ALSO A REPLICATION THROUGHPUT SETTING (expert review 2026-08-20 #33).
+  #
+  # A durability flush CHECKPOINTS the WAL; a checkpoint starts a new GENERATION; and
+  # `Primary.plan/3` then correctly answers `{:reset, 0, size}` — the ENTIRE WAL, not a delta. So a
+  # tight interval makes every write-active shard periodically re-ship its whole WAL.
+  #
+  # Measured on the chaos rig, one variable, same image, 512 tenants (2026-08-18):
+  # `SHARD_FLUSH_INTERVAL_MS` 5,000 → 30,000 took the run from 22,599 errors to 4 and +49%
+  # throughput, with `:stale_wal_gen` and `:overloaded` both going to ZERO.
+  #
+  # Nothing anywhere connected the two: not `docs/durability.md`, which presented the interval as a
+  # pure RPO-vs-PUT-cost tradeoff, not the replication config block in `runtime.exs`, and not this
+  # guard list. An operator who followed the RPO advice and tightened the interval would degrade a
+  # replicating fleet with no signal saying so.
+  #
+  # WARNS rather than raises, and prod-only like every sibling: a tight interval is a legitimate
+  # deliberate choice (RPO can matter more than throughput), and refusing to boot over a tuning
+  # decision would be worse than the confusion this removes.
+  @doc false
+  def check_replication_flush_interval! do
+    interval = Application.get_env(:fathom, :shard_flush_interval_ms, 5_000)
+
+    if Application.get_env(:fathom, :env) == :prod and
+         Application.get_env(:fathom, :replication_enabled, false) == true and
+         is_integer(interval) and interval > 0 and interval < @replication_flush_floor_ms do
+      Logger.warning(
+        "config warning: replication is ON with :shard_flush_interval_ms = #{interval} ms. A " <>
+          "durability flush CHECKPOINTS the WAL, which starts a new generation, which makes the " <>
+          "next push ship the ENTIRE WAL rather than a delta — so a tight interval is a " <>
+          "throughput setting, not only an RPO one. Measured at 512 tenants: 5,000 vs 30,000 ms " <>
+          "was 22,599 errors vs 4, and +49% throughput. Raise it to at least " <>
+          "#{@replication_flush_floor_ms} ms unless you are deliberately buying RPO with " <>
+          "throughput (expert review 2026-08-20 #33)."
+      )
+    end
+
+    nil
   end
 
   @doc false

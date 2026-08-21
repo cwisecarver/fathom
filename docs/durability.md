@@ -32,8 +32,19 @@ durability PUTs track *writes*, not open-shard count. Two things trigger a flush
    **consistent snapshot** of the live database (via SQLite's online backup — writers stay active)
    and uploads it, **without** dropping the local copy or releasing the lease. This is what **bounds
    the RPO** for hot shards. Set the interval to `0` for idle-only. (It's a **full-file** snapshot
-   each interval; incremental WAL streaming — A2 — is future work, and is what would push the RPO
-   toward zero for a continuously-hot shard.)
+   each interval. **Incremental WAL streaming — A2 — is BUILT and on `main`**, off by default; it
+   is what pushes the RPO toward zero for a continuously-hot shard. See
+   [`a2-quorum-replication.md`](a2-quorum-replication.md).)
+
+   **If A2 is on, this interval is also a throughput setting, and that is not obvious.** A
+   durability flush **checkpoints the WAL**; a checkpoint **starts a new generation**; and
+   `Primary.plan/3` then correctly answers `{:reset, 0, size}` — **the entire WAL, not a delta**.
+   So a tight interval makes every write-active shard periodically re-ship its whole WAL. Measured
+   on the chaos rig, one variable, same image, 512 tenants (2026-08-18): `SHARD_FLUSH_INTERVAL_MS`
+   5,000 → 30,000 took the run from **22,599 errors to 4** and **+49% throughput** (2,241 →
+   3,340 txn/s), with `:stale_wal_gen` and `:overloaded` both going to **zero**. Tightening the
+   interval to buy RPO therefore *costs* a replicating fleet throughput, and there is no signal in
+   the RPO numbers that says so.
 
 So the RPO of a hot shard is `:shard_flush_interval_ms` *plus the flush's own duration* — the
 watermark that clears "dirty" is captured when the flush task **starts**, and the interval timer
@@ -238,7 +249,13 @@ the bucket underneath the fathom-managed snapshots above:
   default 300 s** (`config/runtime.exs`, prod-gated) ⇒ ~300 s node-loss window for busy shards.
   Smaller = tighter loss window, more PUTs. `0` = idle-only (unbounded window for a never-idle
   shard) — **never worth choosing over 300 s, which costs the same** and bounds the loss; see the
-  cost section above. **Keep the alert thresholds coupled:** `FathomUnflushedAgeHigh` (~2×) and
+  cost section above.
+  **With A2 replication on it is ALSO the biggest throughput dial**, for the checkpoint →
+  generation-reset → full-WAL-reship reason spelled out under "Periodic durability flush" above:
+  5,000 ms vs 30,000 ms measured as 22,599 errors vs 4, and +49% throughput, at 512 tenants. A
+  boot warning (`Fathom.Application.check_replication_flush_interval!/0`) names this when
+  replication is enabled and the interval is tight. Do not tune it for RPO alone on a replicating
+  fleet, and do not compare replication numbers taken at different intervals. **Keep the alert thresholds coupled:** `FathomUnflushedAgeHigh` (~2×) and
   `FathomManyDirtyShards` (~4×) in [`alert-rules.yml`](../deploy/observability/alert-rules.yml)
   are sized to the **deployment** interval — change one, retune the others, or a real S3 outage
   blows the intended RPO by that multiple before paging. (Both bars sat below one normal 300 s

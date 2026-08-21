@@ -37,13 +37,21 @@ x-fathom-env: &fathom-env
   SHARD_LEASE_TTL_MS: "10000"
   # Fast flush cadence so scenarios observe durability PUTs within seconds, and a
   # short idle threshold so flush-and-drop happens inside a scenario's window.
-  # Overridable so a run can sweep it. The 5 s default exists to make failover scenarios observable
-  # inside a scenario's window, NOT because it is realistic — production is 30 s+. That matters for
-  # replication: a durability flush CHECKPOINTS the WAL, and a checkpoint landing under an in-flight
-  # push is exactly what produces `:stale_wal_gen` — 14,149 rejects on one node at 512 tenants
-  # (docs/reviews/a2-feedback-loop-fixed-2026-08-17.md). So an artificially fast flush may be
-  # manufacturing part of the measured error rate.
-  SHARD_FLUSH_INTERVAL_MS: "${SHARD_FLUSH_INTERVAL_MS:-5000}"
+  # MATCHES PRODUCTION BY DEFAULT (expert review 2026-08-20 #33). This used to default to 5,000 --
+  # 60x tighter than `runtime.exs`'s prod default of 300,000 -- so the rig that validates
+  # replication was measuring a setting production never uses, and a regression that only appears
+  # at 300 s was equally unmeasurable.
+  #
+  # It is not a cosmetic default. A durability flush CHECKPOINTS the WAL, a checkpoint starts a new
+  # generation, and `Primary.plan/3` then correctly ships `{:reset, 0, size}` -- the ENTIRE WAL
+  # rather than a delta. One variable, same image, 512 tenants (2026-08-18): 5,000 -> 30,000 took
+  # the run from 22,599 errors to 4 and +49% throughput, with `:stale_wal_gen` and `:overloaded`
+  # both going to zero. See docs/reviews/a2-flush-interval-2026-08-18.md.
+  #
+  # The scenarios that genuinely need a fast flush -- `failover`, `rpo`, `soak`, which must observe
+  # a durability PUT inside their own window -- set it explicitly in chaos.sh rather than relying
+  # on a global default that silently taxes every other run.
+  SHARD_FLUSH_INTERVAL_MS: "${SHARD_FLUSH_INTERVAL_MS:-300000}"
   SHARD_IDLE_MS: "20000"
   # Per-shard load counters on, so `chaos.sh hotspots` can read Fathom.ShardLoad.top
   # per node — the real-traffic hot-spot measurement (Phase-2 §B).

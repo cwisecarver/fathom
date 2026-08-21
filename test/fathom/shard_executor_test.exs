@@ -825,6 +825,60 @@ defmodule Fathom.ShardExecutorTest do
     assert Fathom.Application.check_replication_exposure!() == nil
   end
 
+  # Expert review 2026-08-20 #33. The flush interval reads like a pure RPO knob -- docs/durability.md
+  # presented it as exactly that -- but with replication on it is the largest throughput dial there
+  # is: a durability flush CHECKPOINTS the WAL, a checkpoint starts a new generation, and
+  # Primary.plan/3 then correctly ships the ENTIRE WAL rather than a delta.
+  #
+  # One variable, same image, 512 tenants (2026-08-18): 5,000 -> 30,000 ms took the run from 22,599
+  # errors to 4 and +49% throughput. Nothing connected the two -- not the doc, not the replication
+  # config block, not this guard list -- so an operator tightening the interval to buy RPO degraded
+  # a replicating fleet with no signal saying so.
+  #
+  # WARNS rather than raises: a tight interval is a legitimate deliberate choice (RPO can matter
+  # more than throughput), and refusing to boot over a tuning decision would be worse than the
+  # confusion this removes.
+  test "a prod node replicating with a tight flush interval is warned about" do
+    import ExUnit.CaptureLog
+
+    prev_env = Application.get_env(:fathom, :env)
+    prev_repl = Application.get_env(:fathom, :replication_enabled)
+    prev_ms = Application.get_env(:fathom, :shard_flush_interval_ms)
+
+    on_exit(fn ->
+      Application.put_env(:fathom, :env, prev_env)
+      restore_env(:replication_enabled, prev_repl)
+      restore_env(:shard_flush_interval_ms, prev_ms)
+    end)
+
+    Application.put_env(:fathom, :env, :prod)
+    Application.put_env(:fathom, :replication_enabled, true)
+    Application.put_env(:fathom, :shard_flush_interval_ms, 5_000)
+
+    assert capture_log(fn ->
+             assert Fathom.Application.check_replication_flush_interval!() == nil
+           end) =~ "ENTIRE WAL"
+
+    # At or above the floor the A/B measured as clean, silence.
+    Application.put_env(:fathom, :shard_flush_interval_ms, 30_000)
+    assert capture_log(fn -> Fathom.Application.check_replication_flush_interval!() end) == ""
+
+    # 0 is idle-only flushing -- no periodic checkpoint at all, so no generation churn. It has its
+    # own (unbounded-RPO) problem, which is not this guard's business.
+    Application.put_env(:fathom, :shard_flush_interval_ms, 0)
+    assert capture_log(fn -> Fathom.Application.check_replication_flush_interval!() end) == ""
+
+    # Not replicating: the interval is a pure RPO knob again and a tight one is unremarkable.
+    Application.put_env(:fathom, :shard_flush_interval_ms, 5_000)
+    Application.put_env(:fathom, :replication_enabled, false)
+    assert capture_log(fn -> Fathom.Application.check_replication_flush_interval!() end) == ""
+
+    # And prod-only, like every sibling guard.
+    Application.put_env(:fathom, :replication_enabled, true)
+    Application.put_env(:fathom, :env, :dev)
+    assert capture_log(fn -> Fathom.Application.check_replication_flush_interval!() end) == ""
+  end
+
   # Expert review 2026-08-20 #23. The replica store holds a full copy of every shard this node
   # FOLLOWS, grows from other nodes' write traffic, and has no retention — and both it and the live
   # shard data dir default under System.tmp_dir!(), so the unsafe arrangement is the DEFAULT one.
