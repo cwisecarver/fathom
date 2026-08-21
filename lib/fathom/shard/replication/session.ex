@@ -546,7 +546,32 @@ defmodule Fathom.Shard.Replication.Session do
         end
       end)
 
-    with {:ok, by_range} <- payloads do
+    # RE-READ THE HEADER AND CONFIRM IT DID NOT MOVE (expert review 2026-08-20 #16).
+    #
+    # The header above came from a `Wal.read/1` in `ship/5`; the payloads come from separate
+    # `open`+`pread` pairs here. Nothing serialises the two against the coordinator's flush task,
+    # which runs OFF-PROCESS by design — `shard.ex` does not reference this module at all — and
+    # `native/fathom_udf/src/wal.rs` gives the tenant's OWN commit thread a second uncoordinated
+    # source of the same generation change at 4000 frames.
+    #
+    # `read_delta/3`'s `byte_size(bin) == len` guard only fires if the file SHRANK. A checkpoint
+    # that restarts the log without shrinking it — a PASSIVE checkpoint followed by a write, which
+    # `Wal`'s own moduledoc says need not shrink the file — leaves the requested range perfectly
+    # readable, so the pread succeeds and returns bytes from the NEW generation stamped with the
+    # OLD generation's ckpt_seq and salt1.
+    #
+    # The follower then records our generation while holding frames whose per-frame salts differ,
+    # so SQLite's checksums make them read as a torn tail rather than as corruption: silently
+    # dropped frames on a replica we already acked to the tenant as quorum-durable. Worse, the
+    # follower's boot recovery re-derives generation and salt FROM THE FILE, erasing the
+    # discrepancy instead of surfacing it.
+    #
+    # `stable?/2` is the same check the SEED path already runs one function away, for the same
+    # reason. Failing here re-plans on the next round, which is correct and cheap; shipping
+    # mis-stamped bytes is neither.
+    with {:ok, by_range} <- payloads,
+         {:ok, after_} <- Wal.read(wal_path),
+         :ok <- stable?(header, after_, :checkpoint_during_push) do
       {:ok,
        for {shipper, {kind, off, len}} <- plans do
          {shipper,
@@ -1036,9 +1061,14 @@ defmodule Fathom.Shard.Replication.Session do
 
   # `:empty` on both sides is stable (a shard with no WAL yet). Anything else must match on both
   # the generation and the salt, the same pair `Primary.plan/2` corroborates.
-  defp stable?(:empty, :empty), do: :ok
-  defp stable?(%{ckpt_seq: g, salt1: s}, %{ckpt_seq: g, salt1: s}), do: :ok
-  defp stable?(_, _), do: {:error, :checkpoint_during_seed}
+  # The reason is a parameter because both callers need the same COMPARISON and different
+  # handling: a seed that loses its two halves mid-stream must tell the follower to discard
+  # (`seed_abort`), while a push that loses its header just re-plans on the next round. Sharing
+  # one reason name would make a push-path failure log as "during seed".
+  defp stable?(before, after_, reason \\ :checkpoint_during_seed)
+  defp stable?(:empty, :empty, _reason), do: :ok
+  defp stable?(%{ckpt_seq: g, salt1: s}, %{ckpt_seq: g, salt1: s}, _reason), do: :ok
+  defp stable?(_, _, reason), do: {:error, reason}
 
   defp shippers, do: Fathom.Shard.Replication.Fleet.shippers()
   defp quorum, do: Application.get_env(:fathom, :replication_quorum, 2)

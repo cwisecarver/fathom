@@ -358,4 +358,90 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     assert holders(followers, id, grown) >= 2
     for {name, _} <- followers, do: await_wal(name, id, grown)
   end
+
+  # THE PUSH PATH'S TWO READS (expert review 2026-08-20 #16).
+  #
+  # `ship/5` reads the WAL header, `Primary.plan/3` decides a range from it, and `build_pushes/5`
+  # then opens the file AGAIN to read the bytes — while stamping the push with the FIRST read's
+  # ckpt_seq and salt1. Nothing serialises that against the coordinator's flush task, which runs
+  # off-process by design, or against the tenant's own commit thread, which `fathom_udf` lets
+  # checkpoint at 4000 frames.
+  #
+  # HONESTY ABOUT WHAT THESE TWO TESTS DO. Forcing a checkpoint to land BETWEEN the two reads needs
+  # a hook inside `Session` that does not exist, and a probabilistic guard on a data-correctness
+  # path is worse than an honest one. So this follows the precedent `flush_position_test` set for
+  # the same shape of problem: pin the PREMISE behaviourally (the hazard is real and the existing
+  # guard cannot see it) and pin the FIX structurally (the re-read is where it has to be).
+  describe "the header must still describe the bytes when they ship (#16)" do
+    test "PREMISE: a checkpoint moves the header while the byte range stays readable" do
+      path = Path.join(System.tmp_dir!(), "wal16_#{System.unique_integer([:positive])}.db")
+      wal = path <> "-wal"
+      on_exit(fn -> for sfx <- ["", "-wal", "-shm"], do: File.rm(path <> sfx) end)
+
+      {:ok, conn} = Connection.open(path)
+      {:ok, _} = Connection.query(conn, "PRAGMA wal_autocheckpoint=0", [])
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER, b TEXT)", [])
+
+      for i <- 1..50 do
+        {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?1, ?2)", [i, "row#{i}"])
+      end
+
+      {:ok, before} = Fathom.Shard.Replication.Wal.read(wal)
+
+      # A range the primary would legitimately plan from `before`.
+      off = Fathom.Shard.Replication.Wal.header_bytes()
+      len = before.commit_extent - off
+      assert len > 0, "the fixture wrote no frames"
+
+      # PASSIVE checkpoint, then a write — the sequence Wal's own moduledoc says need not shrink
+      # the file. This is what the periodic durability flush does, off-process, on any dirty shard.
+      {:ok, _} = Connection.query(conn, "PRAGMA wal_checkpoint(PASSIVE)", [])
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (999, 'after')", [])
+
+      {:ok, after_} = Fathom.Shard.Replication.Wal.read(wal)
+
+      assert {after_.ckpt_seq, after_.salt1} != {before.ckpt_seq, before.salt1},
+             "the checkpoint did not change the WAL's identity, so this fixture demonstrates " <>
+               "nothing — check whether PASSIVE still restarts the log"
+
+      # AND THE EXISTING GUARD CANNOT SEE IT. read_delta/3 only fails on a SHORT read, so the same
+      # range reads back fine and would have shipped stamped with `before`'s identity.
+      assert {:ok, bin} = Fathom.Shard.Replication.Wal.read_delta(wal, off, len)
+
+      assert byte_size(bin) == len,
+             "read_delta refused the range, which would mean the file shrank — the dangerous " <>
+               "case is precisely the one where it does not"
+
+      :ok = Connection.close(conn)
+    end
+
+    test "FIX: build_pushes re-reads the header and checks it after reading the payloads" do
+      source = File.read!("lib/fathom/shard/replication/session.ex")
+
+      [_, body] =
+        String.split(source, "defp build_pushes(state, wal_path, epoch, header, plans) do",
+          parts: 2
+        )
+
+      [body, _] = String.split(body, "\n  defp ", parts: 2)
+
+      payload_at = :binary.match(body, "Wal.read_delta(wal_path, off, len)") |> elem(0)
+      reread_at = :binary.match(body, "Wal.read(wal_path)") |> elem(0)
+
+      check_at =
+        :binary.match(body, "stable?(header, after_, :checkpoint_during_push)") |> elem(0)
+
+      assert reread_at > payload_at,
+             "build_pushes/5 re-reads the WAL header BEFORE reading the payloads, which proves " <>
+               "nothing: the whole point is that the header may move while the bytes are read."
+
+      assert check_at > reread_at,
+             "build_pushes/5 does not compare the re-read header against the one the push is " <>
+               "stamped with. Without that, a checkpoint landing between the two reads ships " <>
+               "new-generation bytes under the old generation's identity — the follower records " <>
+               "our salt while holding frames whose per-frame salts differ, SQLite's checksums " <>
+               "read them as a torn tail, and the frames are silently dropped on a replica we " <>
+               "already acked as quorum-durable."
+    end
+  end
 end
