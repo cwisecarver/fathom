@@ -14,6 +14,7 @@ defmodule Fathom.ShardExecutor do
 
   require Logger
 
+  alias Fathom.HranaAuth
   alias Fathom.Migrator.Capture
   alias Fathom.Shard
   alias Fathom.Shard.Connection
@@ -43,18 +44,28 @@ defmodule Fathom.ShardExecutor do
     # write counter, template-capture check, and load counters — matches the registry key / file /
     # S3 key that Shards.checkout uses (finding #19). Build the handle from the canonical id.
     case Fathom.ShardId.cast(shard_id) do
-      {:ok, id} -> do_open(id, scope_of(context))
-      :error -> {:error, open_error(:invalid_shard_id)}
+      {:ok, id} ->
+        {scope, token_version} = context_of(context)
+        do_open(id, scope, token_version)
+
+      :error ->
+        {:error, open_error(:invalid_shard_id)}
     end
   end
 
   # The authorize context is HranaAuth's scope atom. Anything else — nil (a bare `:ok` / no
   # authorize callback) or an unexpected term — is the safe default: full access is only granted
   # by the absence of a restriction, and `:ro` is the only restriction, only ever set explicitly.
+  # The context is `{scope, token_version}` from HranaAuth.authorize/2 (expert review 2026-08-20
+  # #22 added the version). Older shapes — a bare scope atom, `nil` from a plain `:ok`, an internal
+  # caller with no auth context — degrade to full access with no version, i.e. no floor re-check.
+  defp context_of({scope, version}), do: {scope_of(scope), version}
+  defp context_of(other), do: {scope_of(other), nil}
+
   defp scope_of(:ro), do: :ro
   defp scope_of(_), do: :rw
 
-  defp do_open(shard_id, scope) do
+  defp do_open(shard_id, scope, token_version) do
     case Shards.checkout(shard_id) do
       {:ok, pid, ref, path} ->
         # THE one connection in fathom that runs SQL fathom did not author, so it is the one
@@ -67,7 +78,7 @@ defmodule Fathom.ShardExecutor do
           {:ok, conn} ->
             # The scope rides the handle so execute/2 can enforce read-only across baton-resumes
             # and every stream on the connection.
-            {:ok, {pid, ref, conn, shard_id, scope, stream_opts(shard_id)}}
+            {:ok, {pid, ref, conn, shard_id, scope, token_version, stream_opts(shard_id)}}
 
           {:error, reason} ->
             Shard.checkin(pid, ref)
@@ -80,7 +91,7 @@ defmodule Fathom.ShardExecutor do
   end
 
   @impl true
-  def execute({_pid, _ref, _conn, shard_id, _scope, _opts} = handle, %Stmt{} = stmt) do
+  def execute({_pid, _ref, _conn, shard_id, _scope, _ver, _opts} = handle, %Stmt{} = stmt) do
     do_execute(handle, stmt)
   rescue
     # A statement must never crash the Hrana stream: exqlite/bind/result-mapping can raise
@@ -95,7 +106,10 @@ defmodule Fathom.ShardExecutor do
       {:error, %Error{message: "shard connection unavailable", code: "SQLITE_ERROR"}}
   end
 
-  defp do_execute({_pid, _ref, _conn, shard_id, scope, opts} = handle, %Stmt{sql: sql} = stmt) do
+  defp do_execute(
+         {_pid, _ref, _conn, shard_id, scope, token_version, opts} = handle,
+         %Stmt{sql: sql} = stmt
+       ) do
     # Classify the statement ONCE — dml?/ddl? each slice+downcase the statement head, and the old
     # shape recomputed them up to 3× per statement (twice in this cond, again in to_stmt_result).
     dml? = dml?(sql)
@@ -129,6 +143,29 @@ defmodule Fathom.ShardExecutor do
       # 503 while READS still serve from the local copy (the flag is set only for provably-stealable
       # shards, and only when :fence_writes_when_stealable is on — default prod). Lock-free ETS read,
       # only on writes.
+      # THE TOKEN'S REVOCATION FLOOR, RE-CHECKED PER STATEMENT (expert review 2026-08-20 #22).
+      #
+      # `HranaAuth.authorize/2` runs exactly ONCE per Hrana WebSocket, at `hello`. Every later
+      # `open_stream` reuses the stashed context, `Filo.Socket` has no idle timeout and no maximum
+      # connection lifetime, and a django-libsql stream lives for hours between requests. So a
+      # revoke — the compromise-response path, documented as IMMEDIATE — stopped only NEW
+      # connections: an attacker holding a stolen token's socket kept reading and writing
+      # indefinitely while every dashboard and ledger row said the credential was revoked. It also
+      # defeated `:hrana_token_max_age`, which prod refuses to boot without: that bounds how long a
+      # stolen token can START a session, never how long one runs.
+      #
+      # Reads AND writes, because a revoked credential must not keep reading a tenant's data
+      # either — unlike the write fence below, which is about durability and deliberately lets
+      # reads through. Cache-only, so this never reaches Postgres; an unknown floor allows, since
+      # `authorize/2` already did the authoritative check when the connection opened.
+      not HranaAuth.version_current?(shard_id, token_version) ->
+        {:error,
+         %Error{
+           message: "the token for shard \"#{shard_id}\" has been revoked",
+           code: "FILO_UNAUTHORIZED",
+           status: 401
+         }}
+
       write? and WriteFence.fenced?(shard_id) ->
         {:error,
          %Error{
@@ -162,7 +199,7 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp run_statement(
-         {pid, _ref, conn, shard_id, _scope, opts},
+         {pid, _ref, conn, shard_id, _scope, _ver, opts},
          %Stmt{sql: sql, args: args},
          dml?,
          ddl?
@@ -547,7 +584,8 @@ defmodule Fathom.ShardExecutor do
   # steps mid-transaction — leaving an open transaction dangling on the connection, holding the WAL
   # write lock until stream teardown. exqlite exposes `transaction_status`, so answer truthfully.
   @impl true
-  def autocommit?({_pid, _ref, conn, _shard_id, _scope, _opts}), do: Connection.autocommit?(conn)
+  def autocommit?({_pid, _ref, conn, _shard_id, _scope, _ver, _opts}),
+    do: Connection.autocommit?(conn)
 
   # The coordinator is the connection's owner (Filo's owner seam): the stream holding this
   # handle monitors it and tears down — closing the exqlite connection — if it dies. Without
@@ -557,14 +595,24 @@ defmodule Fathom.ShardExecutor do
   # frames and unlinks the db/wal/shm under it — the orphan's writes land in unlinked inodes
   # and vanish (finding #8, the residual orphan-writer race).
   @impl true
-  def owner({pid, _ref, _conn, _shard_id, _scope, _opts}), do: pid
+  def owner({pid, _ref, _conn, _shard_id, _scope, _ver, _opts}), do: pid
 
   # Runs a SQL script (the Hrana `sequence` request — libSQL's `executescript()`, #34): one or more
   # statements for side effects, no rows. A read-only token can't run one (a script writes), and the
   # tenant-DDL block applies to its leading statement.
   @impl true
-  def execute_sequence({_pid, _ref, conn, shard_id, scope, opts}, sql) when is_binary(sql) do
+  def execute_sequence({_pid, _ref, conn, shard_id, scope, token_version, opts}, sql)
+      when is_binary(sql) do
     cond do
+      # Same per-statement revocation re-check as execute/2 — a script is not a loophole.
+      not HranaAuth.version_current?(shard_id, token_version) ->
+        {:error,
+         %Error{
+           message: "the token for shard \"#{shard_id}\" has been revoked",
+           code: "FILO_UNAUTHORIZED",
+           status: 401
+         }}
+
       scope == :ro ->
         {:error,
          %Error{
@@ -733,7 +781,7 @@ defmodule Fathom.ShardExecutor do
   # result columns, and whether it's an EXPLAIN / read-only. `is_readonly` is the leading-keyword
   # classification (a SELECT/PRAGMA read vs a DML/DDL write) — the hint a libSQL client wants.
   @impl true
-  def describe({_pid, _ref, conn, _shard_id, _scope, _opts}, sql) when is_binary(sql) do
+  def describe({_pid, _ref, conn, _shard_id, _scope, _ver, _opts}, sql) when is_binary(sql) do
     case Connection.describe(conn, sql) do
       {:ok, %{params: params, cols: cols}} ->
         {:ok,
@@ -750,7 +798,7 @@ defmodule Fathom.ShardExecutor do
   end
 
   @impl true
-  def close({pid, ref, conn, _shard_id, _scope, opts}) do
+  def close({pid, ref, conn, _shard_id, _scope, _ver, opts}) do
     Connection.close(conn)
     Shard.checkin(pid, ref)
     forget_txn_write(conn)

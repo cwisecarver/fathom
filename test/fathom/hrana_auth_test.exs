@@ -40,13 +40,13 @@ defmodule Fathom.HranaAuthTest do
 
   test ":disabled (the default) accepts everything, token or not" do
     Application.put_env(:fathom, :hrana_auth, :disabled)
-    assert {:ok, :rw} = HranaAuth.authorize("demo", nil)
-    assert {:ok, :rw} = HranaAuth.authorize("demo", "garbage")
+    assert {:ok, {:rw, _}} = HranaAuth.authorize("demo", nil)
+    assert {:ok, {:rw, _}} = HranaAuth.authorize("demo", "garbage")
   end
 
   test ":required accepts a token minted for the same shard" do
     require_auth!()
-    assert {:ok, :rw} = HranaAuth.authorize("acme", token!("acme"))
+    assert {:ok, {:rw, _}} = HranaAuth.authorize("acme", token!("acme"))
   end
 
   test ":required refuses a missing token with 401" do
@@ -69,8 +69,8 @@ defmodule Fathom.HranaAuthTest do
   test "grant matching is case-canonical: a token minted for ACME authorizes acme (#19)" do
     require_auth!()
     token = token!("ACME")
-    assert {:ok, :rw} = HranaAuth.authorize("acme", token)
-    assert {:ok, :rw} = HranaAuth.authorize("ACME", token)
+    assert {:ok, {:rw, _}} = HranaAuth.authorize("acme", token)
+    assert {:ok, {:rw, _}} = HranaAuth.authorize("ACME", token)
   end
 
   test "an expired token is refused when :hrana_token_max_age is set" do
@@ -80,13 +80,13 @@ defmodule Fathom.HranaAuthTest do
 
     assert {:error, %Filo.Error{status: 401}} = HranaAuth.authorize("acme", stale)
     # A fresh token under the same max_age still passes.
-    assert {:ok, :rw} = HranaAuth.authorize("acme", token!("acme"))
+    assert {:ok, {:rw, _}} = HranaAuth.authorize("acme", token!("acme"))
   end
 
   test "a nil shard passes through so open(nil) keeps its fail-closed 400 (#26)" do
     require_auth!()
     # {:ok, :rw} — the scope is moot; open(nil, _) refuses with a 400 regardless.
-    assert {:ok, :rw} = HranaAuth.authorize(nil, nil)
+    assert {:ok, {:rw, _}} = HranaAuth.authorize(nil, nil)
   end
 
   test "an invalid shard id is refused even with a well-signed token (defense-in-depth)" do
@@ -249,6 +249,107 @@ defmodule Fathom.HranaAuthTest do
 
       assert {:stop, :normal, {1008, _}, [{:text, err_json}], _} = hello.(token!("acme"))
       assert %{"type" => "hello_error"} = Jason.decode!(err_json)
+    end
+  end
+
+  # REVOCATION MUST REACH AN ALREADY-OPEN CONNECTION (expert review 2026-08-20 #22).
+  #
+  # `authorize/2` runs exactly ONCE per Hrana WebSocket, at `hello`. Every later `open_stream`
+  # reuses the stashed context; `Filo.Socket` has no idle timeout and no maximum connection
+  # lifetime; and AGENTS.md records that a django-libsql stream "lives for hours between requests".
+  # So `revoke/1` — documented as IMMEDIATE, the compromise-response path — stopped only NEW
+  # connections. An attacker holding a stolen token's socket kept reading and writing indefinitely
+  # while every dashboard and ledger row said the credential was revoked.
+  #
+  # These drive the EXECUTOR handle directly rather than the socket, because that is where the
+  # stashed context lives and where the re-check had to go. `Fathom.Shards.ensure/1` already
+  # re-checks the tombstone and suspension gates on every checkout, so those two lifecycle denies
+  # already reached a live connection; this closes the third.
+  describe "a revoked token stops working on a connection that is already open (#22)" do
+    setup do
+      require_auth!()
+      shard = "revoke_live_#{System.unique_integer([:positive])}"
+
+      on_exit(fn ->
+        Fathom.Shards.drain(shard, 5_000)
+
+        for dir <- [Fathom.Shard.data_dir(), Fathom.Shard.Storage.Local.dir()],
+            suffix <- ["", "-wal", "-shm", ".etag"] do
+          File.rm(Path.join(dir, "#{shard}.db") <> suffix)
+        end
+      end)
+
+      %{shard: shard}
+    end
+
+    test "reads and writes are refused after a revoke, on the SAME handle", %{shard: shard} do
+      {:ok, token} = HranaAuth.token_for(shard)
+      {:ok, {scope, version}} = HranaAuth.authorize(shard, token)
+      assert is_integer(version), "the token carried no version; the re-check cannot run"
+
+      {:ok, handle} = Fathom.ShardExecutor.open(shard, {scope, version})
+
+      # Working normally before the revoke.
+      assert {:ok, _} =
+               Fathom.ShardExecutor.execute(handle, %Filo.Stmt{
+                 sql: "CREATE TABLE t (v TEXT)",
+                 args: []
+               })
+
+      assert {:ok, _} =
+               Fathom.ShardExecutor.execute(handle, %Filo.Stmt{sql: "SELECT 1", args: []})
+
+      # `revoke/1` bumps the DIRECTORY (Postgres) and then raises this cache floor. This module has
+      # no Repo sandbox, and the directory half is already covered by the revoke tests above — so
+      # raise the floor directly, which is exactly what revoke/1 does internally and is the only
+      # part the executor's re-check consults.
+      Fathom.HranaAuth.Revocations.put(shard, version + 1, nil)
+
+      # THE ASSERTION. Same handle, same connection, no re-authorization anywhere.
+      assert {:error, %Filo.Error{status: 401}} =
+               Fathom.ShardExecutor.execute(handle, %Filo.Stmt{
+                 sql: "INSERT INTO t VALUES ('x')",
+                 args: []
+               }),
+             "a WRITE succeeded on a revoked token's open connection"
+
+      # Reads too: unlike the write fence, which is about durability and deliberately lets reads
+      # through, a revoked CREDENTIAL must not keep reading a tenant's data either.
+      assert {:error, %Filo.Error{status: 401}} =
+               Fathom.ShardExecutor.execute(handle, %Filo.Stmt{sql: "SELECT 1", args: []}),
+             "a READ succeeded on a revoked token's open connection"
+
+      # And a script is not a loophole.
+      assert {:error, %Filo.Error{status: 401}} =
+               Fathom.ShardExecutor.execute_sequence(handle, "SELECT 1; SELECT 2")
+
+      :ok = Fathom.ShardExecutor.close(handle)
+    end
+
+    test "the floor denies BELOW it, not everything", %{shard: shard} do
+      # Opened with explicit versions rather than minted tokens: `token_for/2` reads the DIRECTORY
+      # for its version and this module has no Repo sandbox, so a "fresh" mint would carry version
+      # 1 and the test would prove the opposite of what it claims. The property under test is the
+      # floor COMPARISON, and these are the two sides of it.
+      floor = 7
+      Fathom.HranaAuth.Revocations.put(shard, floor, nil)
+
+      {:ok, stale} = Fathom.ShardExecutor.open(shard, {:rw, floor - 1})
+      {:ok, current} = Fathom.ShardExecutor.open(shard, {:rw, floor})
+      {:ok, newer} = Fathom.ShardExecutor.open(shard, {:rw, floor + 1})
+
+      assert {:error, %Filo.Error{status: 401}} =
+               Fathom.ShardExecutor.execute(stale, %Filo.Stmt{sql: "SELECT 1", args: []})
+
+      for {label, handle} <- [{"at the floor", current}, {"above the floor", newer}] do
+        assert {:ok, _} =
+                 Fathom.ShardExecutor.execute(handle, %Filo.Stmt{sql: "SELECT 1", args: []}),
+               "a token #{label} was refused — the re-check is reading the floor as " <>
+                 "'deny everything' rather than 'deny below the floor', which would take every " <>
+                 "tenant down on the first revoke"
+      end
+
+      for h <- [stale, current, newer], do: :ok = Fathom.ShardExecutor.close(h)
     end
   end
 end

@@ -81,6 +81,30 @@ defmodule Fathom.HranaAuth.Revocations do
     end
   end
 
+  @doc """
+  The cached floor for `shard_id`, WITHOUT the Postgres read-through — `:unknown` on a miss.
+
+  For the per-statement revocation re-check (expert review 2026-08-20 #22), which runs on the hot
+  path and must never reach the database. `floor_info/1` falls through to `Directory` on a cold or
+  TTL-lapsed entry; that is right at `hello`, where one read per CONNECTION is nothing, and wrong
+  per statement.
+
+  A miss answers `:unknown` and the caller ALLOWS. That is deliberate: `authorize/2` already did
+  the authoritative check when the connection opened and warmed this entry, and the bulk refresh
+  keeps it current, so a miss means "no opinion", not "revoked". Failing closed here would refuse
+  live tenant traffic during a Postgres blip — strictly worse than the status quo this fix
+  improves on, which was never re-checking at all.
+  """
+  @spec cached_floor(String.t()) :: {non_neg_integer(), DateTime.t() | nil} | :unknown
+  def cached_floor(shard_id) do
+    case lookup(shard_id, System.monotonic_time(:millisecond)) do
+      {:hit, info} -> info
+      :miss -> :unknown
+    end
+  rescue
+    ArgumentError -> :unknown
+  end
+
   @doc "Caches a freshly-revoked floor for `shard_id` (no rotation grace — the previous version dies now)."
   @spec put(String.t(), non_neg_integer()) :: :ok
   def put(shard_id, version), do: put(shard_id, version, nil)

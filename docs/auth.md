@@ -65,8 +65,23 @@ Tokens **don't expire by default**; set `:hrana_token_max_age` to bound their li
 A token embeds the shard's **version** (`v`), and `verify` accepts it while `v` clears the shard's
 revocation **floor**. That floor is the lever for two distinct operations:
 
-- **`HranaAuth.revoke/1` — immediate.** Raises the floor; every outstanding token below it stops
-  verifying at once. The compromise-response path.
+- **`HranaAuth.revoke/1` — immediate, including on connections that are already open.** Raises the
+  floor; every outstanding token below it stops verifying at once. The compromise-response path.
+
+  **This was not true until expert review 2026-08-20 #22, and the gap was the whole point of the
+  feature.** `authorize/2` runs exactly ONCE per Hrana WebSocket, at `hello`; every later
+  `open_stream` reuses the stashed context; `Filo.Socket` has no idle timeout and no maximum
+  connection lifetime; and a django-libsql stream lives for hours between requests. So a revoke
+  stopped only NEW connections — an attacker holding a stolen token's socket kept reading and
+  writing indefinitely while every dashboard and ledger row said the credential was revoked. It
+  also defeated `:hrana_token_max_age`, which prod refuses to boot without: that bounds how long a
+  stolen token can START a session, never how long one runs.
+
+  The token's version now rides the authorize context alongside its scope, and
+  `Fathom.ShardExecutor` re-checks it against the cached floor on **every statement**, reads
+  included — a revoked credential must not keep reading a tenant's data either. The check is
+  cache-only, so it never reaches Postgres; an unknown floor allows, because `authorize/2` already
+  did the authoritative check when the connection opened.
 - **`HranaAuth.rotate/1` — zero-downtime.** Raises the version and mints a **new** token, but stamps
   `token_version_bumped_at`, and `verify` keeps accepting the **previous** version for a grace window
   (`:hrana_rotation_grace_ms`, default 1h): mint-new → deploy → the old auto-hardens out. This is the

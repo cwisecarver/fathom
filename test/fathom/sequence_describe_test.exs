@@ -101,7 +101,7 @@ defmodule Fathom.SequenceDescribeTest do
 
     # authorize returns the token's scope; Filo threads it to open as the connection context
     # (Filo.Executor.open/2), and the executor rides it in the handle.
-    assert {:ok, :ro} = HranaAuth.authorize(shard, ro)
+    assert {:ok, {:ro, _}} = HranaAuth.authorize(shard, ro)
     {:ok, h} = ShardExecutor.open(shard, :ro)
 
     assert {:error, %Filo.Error{status: 403, code: "FILO_READONLY"}} =

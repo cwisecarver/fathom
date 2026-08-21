@@ -68,20 +68,29 @@ defmodule Fathom.HranaAuth do
   result). On success returns `{:ok, scope}` — the token's `:rw`/`:ro` scope
   (#24) — which Filo threads to `Fathom.ShardExecutor.open/2` as the connection's
   authenticated context (see `Filo.Executor.open/2`), so the executor can enforce
-  read-only per statement without a per-process side-channel. Auth-disabled or a
-  nil shard yields `{:ok, :rw}` (full access; the trust boundary is the network).
-  A refusal is `{:error, %Filo.Error{status: 401}}`.
+  read-only per statement without a per-process side-channel.
+
+  The context is `{scope, token_version}` (expert review 2026-08-20 #22). The VERSION rides along
+  so the executor can re-check the revocation floor on every statement: this function runs exactly
+  once per Hrana WebSocket, at `hello`, and a django-libsql connection lives for hours — so
+  without it a revoke stopped only NEW connections. See `version_current?/2`.
+
+  Auth-disabled or a nil shard yields `{:ok, {:rw, nil}}` — full access, no version, no re-check
+  (the trust boundary is the network). A refusal is `{:error, %Filo.Error{status: 401}}`.
+
+  Filo treats the context as OPAQUE at all four of its call sites, so widening it from an atom to
+  a tuple is not a wire or API change for it.
   """
   @spec authorize(String.t() | nil, String.t() | nil) ::
-          {:ok, :rw | :ro} | {:error, Filo.Error.t()}
+          {:ok, {:rw | :ro, integer() | nil}} | {:error, Filo.Error.t()}
   # No shard resolved: authorize as :rw so `ShardExecutor.open(nil, _)` refuses with its
   # clearer 400 (the fail-closed posture, finding #26) instead of a misleading 401 —
   # nothing can open on a nil shard regardless, so the scope here is moot.
-  def authorize(nil, _token), do: {:ok, :rw}
+  def authorize(nil, _token), do: {:ok, {:rw, nil}}
 
   def authorize(shard_id, token) do
     case mode() do
-      :disabled -> {:ok, :rw}
+      :disabled -> {:ok, {:rw, nil}}
       :required -> verify(shard_id, token)
     end
   end
@@ -96,7 +105,11 @@ defmodule Fathom.HranaAuth do
       # The token's scope flows to the stream open as Filo's authorize context (#24) — no
       # process-dict side-channel, so it survives the HTTP request→stream process hop and
       # applies to every WS stream on the connection. Missing claim ⇒ :rw.
-      {:ok, decode_scope(Map.get(payload, "sc"))}
+      # The token's VERSION rides with the scope (expert review 2026-08-20 #22). Both flow to the
+      # stream open as Filo's authorize context, so the executor can re-check the revocation floor
+      # per statement — `authorize/2` runs exactly ONCE per WebSocket connection, at `hello`, and
+      # a django-libsql connection lives for hours.
+      {:ok, {decode_scope(Map.get(payload, "sc")), version}}
     else
       # Bad signature/expiry, a token for a different shard, a revoked (stale-version)
       # token, or an id that doesn't cast (defense-in-depth). One opaque refusal for
@@ -106,6 +119,35 @@ defmodule Fathom.HranaAuth do
   end
 
   defp verify(_shard_id, _token), do: {:error, @unauthorized}
+
+  @doc """
+  Does a token version still clear `shard_id`'s revocation floor? The per-statement re-check.
+
+  REVOCATION USED TO STOP ONLY *NEW* CONNECTIONS (expert review 2026-08-20 #22). `authorize/2` is
+  called exactly once per Hrana WebSocket, at `hello`; every later `open_stream` reuses the stashed
+  context, `Filo.Socket` has no idle timeout and no maximum connection lifetime, and AGENTS.md
+  records that a django-libsql stream "lives for hours between requests". So an attacker holding a
+  stolen token's socket kept reading and writing indefinitely while every dashboard and ledger row
+  said the credential was revoked — and `:hrana_token_max_age`, which prod now REFUSES TO BOOT
+  without, bounded only how long a stolen token could START a session, never how long one ran.
+
+  `Fathom.Shards.ensure/1` already re-checks the tombstone and suspension gates on every checkout,
+  so those two lifecycle denies did reach a live connection. This closes the third.
+
+  Cache-only (`Revocations.cached_floor/1`): never touches Postgres, and an unknown floor allows,
+  because `authorize/2` already did the authoritative check at `hello`.
+  """
+  @spec version_current?(String.t(), integer() | nil) :: boolean()
+  def version_current?(_shard_id, nil), do: true
+
+  def version_current?(shard_id, version) when is_integer(version) do
+    case Revocations.cached_floor(shard_id) do
+      :unknown -> true
+      floor_info -> version_ok?(version, floor_info)
+    end
+  end
+
+  def version_current?(_shard_id, _version), do: true
 
   # Whether a token's embedded `version` clears the shard's revocation floor, honoring the
   # graceful-rotation grace window (#24): the CURRENT floor always verifies, and the PREVIOUS
@@ -182,6 +224,11 @@ defmodule Fathom.HranaAuth do
   LISTEN/NOTIFY (round-2 #24 — no BEAM cluster, so PubSub can't cross nodes; a
   lost notify still converges within the cache TTL). Returns the new version, or
   `{:error, :invalid_shard_id}`.
+
+  Reaches connections that are ALREADY OPEN (expert review 2026-08-20 #22). The floor rises here,
+  and `Fathom.ShardExecutor` re-checks each statement's token version against it — `authorize/2`
+  runs once per WebSocket, at `hello`, so before this a revoke stopped only NEW connections while
+  an attacker holding the socket kept working indefinitely.
   """
   @spec revoke(term()) :: {:ok, pos_integer()} | {:error, :invalid_shard_id}
   def revoke(shard_id) do
