@@ -78,6 +78,34 @@ defmodule Fathom.Shard.Replication.FollowerLog do
     decide_fresh(%{state | epoch: pushed}, push)
   end
 
+  # A DIFFERENT WAL, NOT A LATER ONE — AND THIS MUST OUTRANK BOTH `wal_gen` COMPARISONS BELOW.
+  # `ckpt_seq` counts checkpoints within one WAL file, so it restarts at 0 when SQLite deletes and
+  # recreates the file — which it does the moment the last connection to the shard closes, i.e.
+  # after every Hrana stream on a quiet shard. The generation then goes BACKWARDS or stays equal
+  # while the bytes are from a completely new lineage.
+  #
+  # `salt1` is the WAL's identity and is what `Primary.plan/3` has always keyed on
+  # (`when seq != gen or s != salt`). Until it crossed the wire the two sides disagreed
+  # permanently: the primary shipped `{:reset, 0, _}` on the salt change, the follower saw the same
+  # generation and demanded its old offset, and NO commit could ever satisfy both. That deadlock
+  # was every write after the first failing `{:no_quorum, :impossible}` on the chaos rig, at a
+  # fixed offset, forever.
+  #
+  # THIS CLAUSE USED TO SIT BELOW THE TWO `wal_gen` CLAUSES, which made it reachable only when the
+  # generations were EQUAL — so the comment above described a hazard the code handled in only one
+  # of its two directions (expert review 2026-08-20 #7). The backwards direction is the ordinary
+  # one: a PASSIVE checkpoint takes ckpt_seq to 1, the last stream closes, SQLite unlinks and
+  # recreates the WAL at ckpt_seq 0 with a fresh salt, and 1 → 0 was answered `:stale_wal_gen`.
+  # That reject is in `Session`'s `@settled_rejects`, so the primary's per-follower record was
+  # never corrected and the next plan re-derived the same reset — forever, for every follower at
+  # once, i.e. FILO_NO_QUORUM on every write to that tenant until the Follower process restarted.
+  #
+  # Ordering rule: the epoch clauses stay ABOVE this one. A deposed primary must be fenced whatever
+  # its salt says; salt only identifies which WAL, never who owns the shard.
+  def decide(%{salt1: salt} = state, %Push{salt1: pushed} = push) when pushed != salt do
+    decide_fresh(%{state | salt1: pushed}, push)
+  end
+
   def decide(%{wal_gen: gen}, %Push{wal_gen: pushed}) when pushed < gen do
     # Frames from before a checkpoint we have already applied. Dropping them is correct and safe:
     # the data they carry is already in our main database file.
@@ -89,22 +117,6 @@ defmodule Fathom.Shard.Replication.FollowerLog do
     # offsets restart and are NOT comparable to ours. Appending across that seam is the corruption
     # this field exists to prevent — discard and start the new generation from its beginning.
     decide_fresh(%{state | wal_gen: pushed}, push)
-  end
-
-  # A DIFFERENT WAL, NOT A LATER ONE. `ckpt_seq` counts checkpoints within one WAL file, so it
-  # restarts at 0 when SQLite deletes and recreates the file — which it does the moment the last
-  # connection to the shard closes, i.e. after every Hrana stream on a quiet shard. The generation
-  # then goes BACKWARDS or stays equal while the bytes are from a completely new lineage, and every
-  # comparison above reads it as "same or older".
-  #
-  # `salt1` is the WAL's identity and is what `Primary.plan/2` has always keyed on
-  # (`when seq != gen or s != salt`). Until it crossed the wire the two sides disagreed
-  # permanently: the primary shipped `{:reset, 0, _}` on the salt change, the follower saw the same
-  # generation and demanded its old offset, and NO commit could ever satisfy both. That deadlock
-  # was every write after the first failing `{:no_quorum, :impossible}` on the chaos rig, at a
-  # fixed offset, forever.
-  def decide(%{salt1: salt} = state, %Push{salt1: pushed} = push) when pushed != salt do
-    decide_fresh(%{state | salt1: pushed}, push)
   end
 
   def decide(%{next_offset: next} = state, %Push{offset: off} = push) when off == next do

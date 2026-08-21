@@ -261,6 +261,32 @@ defmodule Fathom.Shard.ReplicationTest do
                )
     end
 
+    # THE OTHER HALF OF THE SAME HAZARD (expert review 2026-08-20 #7). The comment on the salt
+    # clause says the generation "goes BACKWARDS or stays equal" — but the clause used to sit BELOW
+    # both wal_gen comparisons, so `pushed < gen` was answered `:stale_wal_gen` and only the
+    # "stays equal" direction ever reached it. The code and its own comment disagreed.
+    #
+    # Backwards is the ORDINARY direction: a PASSIVE checkpoint takes ckpt_seq to 1, the last
+    # Hrana stream closes, SQLite unlinks and recreates the WAL at ckpt_seq 0 with a fresh salt.
+    # 1 → 0 was rejected, `:stale_wal_gen` is in Session's @settled_rejects so the primary's record
+    # was never corrected, and the next plan re-derived the same reset — forever, for every
+    # follower simultaneously. FILO_NO_QUORUM on every write to that tenant.
+    test "a BACKWARDS generation with a new salt is a new lineage, not a stale reject" do
+      state = FollowerLog.seeded(7, 3, 1111, 4120)
+
+      assert {:reset_then_append, new} =
+               FollowerLog.decide(state, push(wal_gen: 0, salt1: 2222, offset: 0, payload: "xy")),
+             "a recreated WAL whose ckpt_seq restarted at 0 was rejected as stale"
+
+      assert new.wal_gen == 0 and new.salt1 == 2222 and new.next_offset == 2
+      assert new.torn, "a reset replica must be marked torn — its .db is a generation behind"
+
+      # The SAME-salt backwards case is still correctly dropped: those frames really are already in
+      # our main database. Hoisting the salt clause must not swallow it.
+      assert {:reject, :stale_wal_gen, 0} =
+               FollowerLog.decide(state, push(wal_gen: 2, salt1: 1111))
+    end
+
     test "an in-order delta appends and advances by exactly the payload size" do
       state = FollowerLog.seeded(7, 3, 0, 4120)
 
