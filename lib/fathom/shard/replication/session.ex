@@ -61,6 +61,14 @@ defmodule Fathom.Shard.Replication.Session do
   # from the first draft of `3a6c6a3`, which cleared on every reason.
   @settled_rejects [:disconnected, :stale_wal_gen, :stale_epoch, :unknown_shard, :internal]
 
+  # How long a seed may be OUTSTANDING before `start_seeds/3` treats its entry as stale, kills the
+  # task and allows a fresh one (expert review 2026-08-20 #26). A monitor covers a task that died;
+  # this covers one that is alive and wedged, which a socket stream can be. Comfortably past
+  # `await_seed_reply/4`'s own 30 s wait plus a large transfer, so a seed that is merely slow is
+  # never cut off — the entry only has to expire before the follower gives up asking, and it asks
+  # again on every commit. Configurable so it can be exercised without a two-minute test.
+  @default_seed_expiry_ms 120_000
+
   # ------------------------------------------------------------------------------------------
   # api
   # ------------------------------------------------------------------------------------------
@@ -179,7 +187,16 @@ defmodule Fathom.Shard.Replication.Session do
        # Shippers with a seed in flight. A seed can be a whole database, so starting a second one
        # for the same follower because the next commit also saw :unknown_shard would multiply a
        # large transfer by the write rate.
-       seeding: MapSet.new(),
+       # %{shipper => %{ref: monitor_ref, pid: pid, started_at: monotonic_ms}}.
+       #
+       # Was a bare `MapSet` of shippers, which made a lost seed task PERMANENT (expert review
+       # 2026-08-20 #26): the only thing that removed an entry was a `{:seeded, ...}` message from
+       # the task itself, and the guard in `start_seeds/3` then refused to start another. A task
+       # killed under memory pressure, an unforeseen raise inside `do_seed/5`, or a reap therefore
+       # left that `{shard, follower}` pair unseedable for the life of the Session, with every
+       # subsequent `:unknown_shard` from that follower silently swallowed — silent, permanent
+       # under-replication of one shard while the quorum reports healthy.
+       seeding: %{},
        # Deferred-retry bookkeeping. `catchup_ref` is the armed timer (nil when none); `commits`
        # counts commit cycles and `catchup_at` records the count at arm time, so the retry can tell
        # a QUIET shard from a busy one. See `handle_info(:catch_up, ...)`.
@@ -376,7 +393,48 @@ defmodule Fathom.Shard.Replication.Session do
     {:stop, :normal, s}
   end
 
+  # A SEED TASK DIED WITHOUT ANSWERING (expert review 2026-08-20 #26).
+  #
+  # `{:seeded, ...}` used to be the only thing that cleared an entry, so a task killed under memory
+  # pressure, an unforeseen raise inside `do_seed/5`, or a reap left that `{shard, follower}` pair
+  # unseedable for the life of the Session — and `start_seeds/3` then swallowed every subsequent
+  # `:unknown_shard` from that follower. Silent, permanent under-replication of one shard WHILE THE
+  # QUORUM REPORTS HEALTHY, which is the same failure class the late-reply drain was built to
+  # eliminate, reached by a different route.
+  #
+  # `:normal` is the ordinary end of a task that already sent its result and whose entry is
+  # therefore gone, so this clause only ever finds something on the failure path.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+    case Enum.find(state.seeding, fn {_shipper, e} -> e.ref == ref end) do
+      nil ->
+        {:noreply, state}
+
+      {shipper, _entry} ->
+        Logger.warning(
+          "replication seed task for #{state.shard_id} died without answering " <>
+            "(#{inspect(reason)}); the follower may ask again"
+        )
+
+        {:noreply, %{state | seeding: forget_seed(state.seeding, shipper)}}
+    end
+  end
+
   def handle_info(_, state), do: {:noreply, state}
+
+  # A STOPPED SESSION MUST NOT LEAVE A SEED STREAMING (expert review 2026-08-20 #26).
+  #
+  # The Session stops when its coordinator goes DOWN — the shard moved or drained — and an
+  # unsupervised task started before that would go on streaming an entire tenant database to a
+  # follower for a shard this node no longer owns, stamped with an epoch it no longer holds.
+  # `spawn_monitor` deliberately does not link (a raise inside `do_seed/5` must not take down the
+  # shard's serialization point), so the cancellation is explicit here instead.
+  @impl true
+  def terminate(_reason, %{seeding: seeding}) do
+    for {_shipper, %{pid: pid}} <- seeding, do: Process.exit(pid, :kill)
+    :ok
+  end
+
+  def terminate(_reason, _state), do: :ok
 
   # A reply cannot exist before the commit that provoked it, so `wal_path` is always set by the time
   # this runs. Matching on it anyway keeps a reply that somehow arrived first from crashing the
@@ -825,7 +883,7 @@ defmodule Fathom.Shard.Replication.Session do
   # arrives during exactly this window, and leaving it queued would let the retry's `collect/4`
   # mistake it for an answer to the retry.
   defp await_seeds(%{seeding: seeding} = state, deadline, wal_path) do
-    if MapSet.size(seeding) == 0 do
+    if map_size(seeding) == 0 do
       {:ok, state}
     else
       remaining = deadline - System.monotonic_time(:millisecond)
@@ -894,7 +952,7 @@ defmodule Fathom.Shard.Replication.Session do
   # seed result identically. Divergence between the two would be invisible until a seed happened to
   # land on the path with the older logic.
   defp apply_seed_result(state, shipper, result) do
-    state = %{state | seeding: MapSet.delete(state.seeding, shipper)}
+    state = %{state | seeding: forget_seed(state.seeding, shipper)}
 
     case result do
       {:ok, at} ->
@@ -914,23 +972,75 @@ defmodule Fathom.Shard.Replication.Session do
   end
 
   defp start_seeds(state, wal_path, rejects) do
+    # EXPIRE FIRST. A monitor covers a task that DIED; it does not cover one that is alive and
+    # wedged — `do_seed/5` streams over a socket, and nothing below it is guaranteed to return.
+    # Sweeping here rather than on a timer is deliberate: this is the one moment the stale entry
+    # does damage (it refuses a seed the follower is asking for), so it is the one moment worth
+    # checking. The expiry is well past `await_seed_reply`'s own 30 s wait, so a seed that
+    # is merely slow is never cut off by it.
+    state = expire_seeds(state)
+
     needs =
       for {shipper, :unknown_shard, _at} <- rejects,
-          not MapSet.member?(state.seeding, shipper),
+          not Map.has_key?(state.seeding, shipper),
           do: shipper
 
     Enum.reduce(needs, state, fn shipper, acc ->
       session = self()
       db_path = String.replace_suffix(wal_path, "-wal", "")
 
-      Task.start(fn ->
-        send(
-          session,
-          {:seeded, shipper, do_seed(shipper, acc.shard_id, db_path, wal_path, acc.epoch)}
-        )
-      end)
+      # `spawn_monitor`, not `Task.start`: monitoring has to be ATOMIC with the spawn, or a task
+      # that dies in the gap leaves an entry nothing will ever remove — which is the bug being
+      # fixed, reintroduced in a smaller window. Not linked: a raise inside `do_seed/5` must not
+      # take down the Session, which holds the shard's serialization point. The `terminate/2`
+      # sweep below is what covers the other half the finding asked for (a stopped Session must
+      # not leave a task streaming a whole tenant database for a shard this node no longer owns).
+      {pid, ref} =
+        spawn_monitor(fn ->
+          send(
+            session,
+            {:seeded, shipper, do_seed(shipper, acc.shard_id, db_path, wal_path, acc.epoch)}
+          )
+        end)
 
-      %{acc | seeding: MapSet.put(acc.seeding, shipper)}
+      entry = %{ref: ref, pid: pid, started_at: System.monotonic_time(:millisecond)}
+      %{acc | seeding: Map.put(acc.seeding, shipper, entry)}
+    end)
+  end
+
+  # Drop one shipper's entry and stop watching its task. `demonitor(flush: true)` removes any DOWN
+  # already sitting in the mailbox, so a completed seed never also arrives as a phantom failure.
+  defp forget_seed(seeding, shipper) do
+    case Map.pop(seeding, shipper) do
+      {nil, rest} ->
+        rest
+
+      {%{ref: ref}, rest} ->
+        Process.demonitor(ref, [:flush])
+        rest
+    end
+  end
+
+  defp seed_expiry_ms,
+    do: Application.get_env(:fathom, :replication_seed_expiry_ms, @default_seed_expiry_ms)
+
+  defp expire_seeds(%{seeding: seeding} = state) when map_size(seeding) == 0, do: state
+
+  defp expire_seeds(state) do
+    now = System.monotonic_time(:millisecond)
+
+    Enum.reduce(state.seeding, state, fn {shipper, entry}, acc ->
+      if now - entry.started_at >= seed_expiry_ms() do
+        Logger.warning(
+          "replication seed for #{acc.shard_id} to #{inspect(shipper)} expired after " <>
+            "#{now - entry.started_at} ms; killing it and allowing a fresh one"
+        )
+
+        Process.exit(entry.pid, :kill)
+        %{acc | seeding: forget_seed(acc.seeding, shipper)}
+      else
+        acc
+      end
     end)
   end
 

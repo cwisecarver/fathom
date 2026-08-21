@@ -572,4 +572,241 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       assert :sys.get_state(session).catchup_fails == 0
     end
   end
+
+  # A LOST SEED TASK MUST NOT BE PERMANENT (expert review 2026-08-20 #26).
+  #
+  # `start_seeds/3` recorded the shipper in `state.seeding` and spawned the transfer with a bare
+  # `Task.start/1` — unlinked, unmonitored, no timeout. The ONLY thing that removed the entry was a
+  # `{:seeded, ...}` message from that task, and the guard then refused to start another. So a task
+  # killed under memory pressure, an unforeseen raise inside `do_seed/5`, or a reap left that
+  # `{shard, follower}` pair unseedable for the life of the Session, with every subsequent
+  # `:unknown_shard` from that follower silently swallowed: silent, PERMANENT under-replication of
+  # one shard while the quorum reports healthy.
+  #
+  # The seed is made slow by pointing one shipper at a black hole — a listener that accepts and
+  # never answers — so `do_seed/5` blocks in `await_seed_reply/4` and the entry is genuinely
+  # in flight while the test operates on it. Nothing here sleeps or races.
+  describe "a seed task that dies does not block re-seeding (#26)" do
+    defp seed_black_hole! do
+      me = self()
+
+      pid =
+        spawn(fn ->
+          {:ok, listen} = :gen_tcp.listen(0, [:binary, packet: 4, active: true, reuseaddr: true])
+          {:ok, port} = :inet.port(listen)
+          send(me, {:bh_port, self(), port})
+          {:ok, sock} = :gen_tcp.accept(listen)
+          bh_loop(sock, listen)
+        end)
+
+      assert_receive {:bh_port, ^pid, port}, 2_000
+      on_exit(fn -> Process.exit(pid, :kill) end)
+      port
+    end
+
+    defp bh_loop(sock, listen) do
+      receive do
+        {:tcp, ^sock, _} -> bh_loop(sock, listen)
+        _ -> :ok
+      end
+    end
+
+    defp await_seeding(session, fun, msg, timeout \\ 3_000) do
+      deadline = System.monotonic_time(:millisecond) + timeout
+
+      Stream.repeatedly(fn ->
+        seeding = :sys.get_state(session).seeding
+        if fun.(seeding), do: {:ok, seeding}, else: Process.sleep(10)
+      end)
+      |> Enum.find(fn
+        {:ok, _} -> true
+        _ -> System.monotonic_time(:millisecond) > deadline
+      end)
+      |> case do
+        {:ok, seeding} -> seeding
+        _ -> flunk(msg)
+      end
+    end
+
+    test "a killed seed task is forgotten, and the next request seeds again", ctx do
+      %{id: id, root: root} = ctx
+
+      live = start_followers!(root, 2)
+      bh_port = seed_black_hole!()
+
+      Application.put_env(:fathom, :replication_enabled, true)
+      Application.put_env(:fathom, :replication_quorum, 1)
+
+      Application.put_env(
+        :fathom,
+        :replication_followers,
+        for({_n, p} <- live, do: {~c"127.0.0.1", p}) ++ [{~c"127.0.0.1", bh_port}]
+      )
+
+      start_supervised!(Fleet)
+
+      {:ok, coordinator, ref, path} = Shards.checkout(id)
+      on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+      {:ok, conn} = Connection.open(path)
+      on_exit(fn -> Connection.close(conn) end)
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
+
+      # The two live followers are pre-seeded so the quorum forms without them; the black hole is
+      # the one whose seed will hang.
+      for {n, _} <- live, do: Follower.seed(n, id, 0, 0, 0, 0)
+
+      assert :ok = Session.commit(id, path <> "-wal", coordinator)
+      [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+
+      # The black-hole shipper is the last one Fleet published.
+      bh = List.last(Fleet.shippers())
+
+      # Drive the seed directly with the reject a never-seeded follower sends. This is the exact
+      # message `handle_info/2` receives from a real follower; it just does not depend on the
+      # black hole being able to produce one.
+      send(session, {:repl_reply, bh, {:reject, id, :unknown_shard, 0}})
+
+      seeding =
+        await_seeding(session, &(map_size(&1) == 1), "the reject never started a seed at all")
+
+      %{pid: task} = Map.fetch!(seeding, bh)
+
+      assert Process.alive?(task),
+             "the seed task finished; the black hole answered, which it must not"
+
+      # THE BUG: kill it without letting it answer.
+      Process.exit(task, :kill)
+
+      await_seeding(
+        session,
+        &(map_size(&1) == 0),
+        "a seed task died without answering and its entry was never cleared — that follower " <>
+          "could never be seeded again for the life of this Session, silently, while the " <>
+          "quorum kept reporting healthy"
+      )
+
+      # And the pair is genuinely usable again, not merely tidy.
+      send(session, {:repl_reply, bh, {:reject, id, :unknown_shard, 0}})
+
+      seeding2 =
+        await_seeding(
+          session,
+          &(map_size(&1) == 1),
+          "a follower whose seed task died was never re-seeded"
+        )
+
+      %{pid: task2} = Map.fetch!(seeding2, bh)
+      assert task2 != task, "the same dead task was recorded again"
+      assert Process.alive?(task2)
+    end
+
+    test "a seed that is alive but WEDGED expires, so the pair is not stuck forever either",
+         ctx do
+      # The monitor covers a task that DIED. It does not cover one that is alive and stuck --
+      # `do_seed/5` streams over a socket and nothing below it is guaranteed to return, which is
+      # precisely what a black hole models. Without the sweep that pair is unseedable for the life
+      # of the Session just as surely as with a dead task, only with no DOWN to notice it by.
+      %{id: id, root: root} = ctx
+
+      prev = Application.get_env(:fathom, :replication_seed_expiry_ms)
+
+      on_exit(fn ->
+        if is_nil(prev),
+          do: Application.delete_env(:fathom, :replication_seed_expiry_ms),
+          else: Application.put_env(:fathom, :replication_seed_expiry_ms, prev)
+      end)
+
+      live = start_followers!(root, 2)
+      bh_port = seed_black_hole!()
+
+      Application.put_env(:fathom, :replication_enabled, true)
+      Application.put_env(:fathom, :replication_quorum, 1)
+
+      Application.put_env(
+        :fathom,
+        :replication_followers,
+        for({_n, p} <- live, do: {~c"127.0.0.1", p}) ++ [{~c"127.0.0.1", bh_port}]
+      )
+
+      start_supervised!(Fleet)
+
+      {:ok, coordinator, ref, path} = Shards.checkout(id)
+      on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+      {:ok, conn} = Connection.open(path)
+      on_exit(fn -> Connection.close(conn) end)
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
+      for {n, _} <- live, do: Follower.seed(n, id, 0, 0, 0, 0)
+
+      assert :ok = Session.commit(id, path <> "-wal", coordinator)
+      [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+      bh = List.last(Fleet.shippers())
+
+      send(session, {:repl_reply, bh, {:reject, id, :unknown_shard, 0}})
+      seeding = await_seeding(session, &(map_size(&1) == 1), "the reject never started a seed")
+      %{pid: task} = Map.fetch!(seeding, bh)
+      assert Process.alive?(task), "the black hole answered, which it must not"
+
+      # Anything already outstanding is now past its expiry. Nothing about the task changed --
+      # it is still alive and still stuck, which is the whole point.
+      Application.put_env(:fathom, :replication_seed_expiry_ms, 0)
+
+      send(session, {:repl_reply, bh, {:reject, id, :unknown_shard, 0}})
+
+      seeding2 =
+        await_seeding(
+          session,
+          fn m -> match?(%{pid: p} when p != task, Map.get(m, bh, %{})) end,
+          "a seed task that hung forever was never expired, so that follower could never be " <>
+            "seeded again -- silently, while the quorum kept reporting healthy"
+        )
+
+      refute Process.alive?(task), "the expired task was forgotten but left running"
+      assert Process.alive?(Map.fetch!(seeding2, bh).pid)
+    end
+
+    test "a stopped session does not leave a seed streaming for a shard it no longer owns", ctx do
+      %{id: id, root: root} = ctx
+
+      live = start_followers!(root, 2)
+      bh_port = seed_black_hole!()
+
+      Application.put_env(:fathom, :replication_enabled, true)
+      Application.put_env(:fathom, :replication_quorum, 1)
+
+      Application.put_env(
+        :fathom,
+        :replication_followers,
+        for({_n, p} <- live, do: {~c"127.0.0.1", p}) ++ [{~c"127.0.0.1", bh_port}]
+      )
+
+      start_supervised!(Fleet)
+
+      {:ok, coordinator, ref, path} = Shards.checkout(id)
+      on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+      {:ok, conn} = Connection.open(path)
+      on_exit(fn -> Connection.close(conn) end)
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
+      for {n, _} <- live, do: Follower.seed(n, id, 0, 0, 0, 0)
+
+      assert :ok = Session.commit(id, path <> "-wal", coordinator)
+      [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+      bh = List.last(Fleet.shippers())
+      send(session, {:repl_reply, bh, {:reject, id, :unknown_shard, 0}})
+
+      seeding = await_seeding(session, &(map_size(&1) == 1), "the reject never started a seed")
+      %{pid: task} = Map.fetch!(seeding, bh)
+      task_ref = Process.monitor(task)
+
+      # The shard moved or drained. An unsupervised task would go on streaming an entire tenant
+      # database to a follower for a shard this node no longer owns, stamped with an epoch it no
+      # longer holds.
+      Session.stop(id)
+
+      # The REASON matters: `:killed` is `terminate/2` cancelling it. Any other reason means the
+      # task ended on its own and this test would pass with the cancellation removed.
+      assert_receive {:DOWN, ^task_ref, :process, ^task, :killed},
+                     3_000,
+                     "the Session stopped and left its seed task streaming"
+    end
+  end
 end
