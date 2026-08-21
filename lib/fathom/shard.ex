@@ -3000,9 +3000,18 @@ defmodule Fathom.Shard do
 
   defp flush_position(%{lease: %{epoch: epoch}} = state, pre) when is_integer(epoch) do
     case Fathom.Shard.Replication.Wal.read(state.path <> "-wal") do
-      {:ok, %{ckpt_seq: gen, size: size}} -> %{epoch: epoch, wal_gen: gen, offset: size}
-      {:ok, :empty} -> position_after_checkpoint(epoch, pre)
-      {:error, _} -> nil
+      # commit_extent, not `size` (expert review 2026-08-20 #5): the file length is a high-water
+      # mark that can include frames from a rolled-back transaction. A follower's position is
+      # now the committed extent, so the object's stamp has to be on the same scale or the two
+      # are not comparable and the object would always look ahead.
+      {:ok, %{ckpt_seq: gen, commit_extent: extent}} ->
+        %{epoch: epoch, wal_gen: gen, offset: extent}
+
+      {:ok, :empty} ->
+        position_after_checkpoint(epoch, pre)
+
+      {:error, _} ->
+        nil
     end
   end
 

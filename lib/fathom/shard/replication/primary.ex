@@ -29,6 +29,10 @@ defmodule Fathom.Shard.Replication.Primary do
 
   alias Fathom.Shard.Replication.Wal
 
+  # A WAL holding only its header has nothing committed. Needed as an attribute rather than a call
+  # because it is used in a guard.
+  @header_bytes Wal.header_bytes()
+
   @type state :: %{
           wal_gen: non_neg_integer(),
           salt1: non_neg_integer(),
@@ -87,19 +91,20 @@ defmodule Fathom.Shard.Replication.Primary do
   def plan(_state, :empty, _max), do: :nothing
 
   # Never shipped this shard. Everything the WAL currently holds is new to the follower.
-  def plan(nil, %{size: size}, max) when size > 0, do: {:reset, 0, cap(size, max)}
+  def plan(nil, %{commit_extent: size}, max) when size > @header_bytes,
+    do: {:reset, 0, cap(size, max)}
 
-  def plan(%{wal_gen: gen, salt1: salt}, %{ckpt_seq: seq, salt1: s, size: size}, max)
+  def plan(%{wal_gen: gen, salt1: salt}, %{ckpt_seq: seq, salt1: s, commit_extent: size}, max)
       when seq != gen or s != salt do
     # Case 2: the WAL was reset. Offsets from the old generation mean nothing now.
     {:reset, 0, cap(size, max)}
   end
 
-  def plan(%{offset: offset}, %{size: size}, max) when size > offset do
+  def plan(%{offset: offset}, %{commit_extent: size}, max) when size > offset do
     {:append, offset, cap(size - offset, max)}
   end
 
-  def plan(%{offset: offset}, %{size: size}, max) when size < offset do
+  def plan(%{offset: offset}, %{commit_extent: size}, max) when size < offset do
     # The WAL shrank without the generation moving. SQLite should not do this, so we do not know
     # what we are looking at — re-ship everything rather than compute a range from an assumption
     # that has already proven false.

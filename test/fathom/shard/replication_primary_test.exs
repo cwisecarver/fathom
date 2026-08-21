@@ -95,7 +95,12 @@ defmodule Fathom.Shard.ReplicationPrimaryTest do
   end
 
   describe "Primary.plan/2" do
-    defp header(seq, salt, size), do: %{ckpt_seq: seq, salt1: salt, size: size}
+    # `commit_extent` defaults to `size` here because these cases predate the distinction and
+    # are about plan/3's ORDERING, not about rollback: with no abandoned frames the two are
+    # equal, which the "with no rollback" test above pins against a real WAL.
+    defp header(seq, salt, size, extent \\ nil),
+      do: %{ckpt_seq: seq, salt1: salt, size: size, commit_extent: extent || size}
+
     defp state(gen, salt, offset), do: %{wal_gen: gen, salt1: salt, offset: offset}
 
     test "an empty WAL ships nothing" do
@@ -204,6 +209,95 @@ defmodule Fathom.Shard.ReplicationPrimaryTest do
     test "an empty WAL still ships nothing, cap or no cap" do
       assert :nothing = Primary.plan(nil, :empty, 1024)
       assert :nothing = Primary.plan(state(1, 9, 100), :empty, 1024)
+    end
+  end
+
+  # THE COMMITTED EXTENT IS NOT THE FILE SIZE (expert review 2026-08-20 #5).
+  #
+  # SQLite does not shorten the WAL on ROLLBACK — it rewinds mxFrame in the wal-index and lets the
+  # next transaction overwrite the abandoned slots in place. So the file length is a HIGH-WATER
+  # MARK, and a primary keyed on it ships megabytes of abandoned frames once, records that as the
+  # follower's position, and then plans :nothing for every subsequent commit while replying :ok to
+  # the tenant. Acknowledged writes that no follower holds.
+  #
+  # This is an empirical claim about SQLite's on-disk behaviour, exactly like the ckpt_seq claim
+  # this file already pins, so it is asserted against a real WAL rather than taken on faith.
+  describe "the committed extent vs the file's high-water mark" do
+    # Big enough to spill past the page cache, which is what makes the abandoned frames hit disk.
+    defp rollback_a_big_transaction(conn) do
+      :ok = Sqlite3.execute(conn, "BEGIN")
+
+      for i <- 100..40_000 do
+        :ok =
+          Sqlite3.execute(
+            conn,
+            "INSERT INTO t VALUES (#{i}, '#{String.duplicate("x", 200)}')"
+          )
+      end
+
+      :ok = Sqlite3.execute(conn, "ROLLBACK")
+    end
+
+    test "a rollback leaves the file grown but the extent where it was", ctx do
+      %{path: path, wal: wal} = ctx
+      {:ok, conn} = Connection.open(path)
+      :ok = Sqlite3.execute(conn, "PRAGMA wal_autocheckpoint=0")
+      :ok = Sqlite3.execute(conn, "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+      :ok = Sqlite3.execute(conn, "INSERT INTO t VALUES (1, 'one')")
+
+      assert {:ok, before} = Wal.read(wal)
+
+      assert before.commit_extent == before.size,
+             "with no rollback in flight the extent IS the file size; the fixture is not baseline"
+
+      rollback_a_big_transaction(conn)
+      assert {:ok, rolled} = Wal.read(wal)
+
+      # The fixture must actually have spilled, or the rest measures nothing.
+      assert rolled.size > before.size * 10,
+             "the rolled-back transaction never spilled to disk (#{before.size} -> #{rolled.size})"
+
+      assert rolled.commit_extent == before.commit_extent,
+             "the extent moved for a transaction that was ROLLED BACK"
+
+      # THE ONE THAT MATTERS. The next real commit does not change the file size, so a primary
+      # keyed on size plans :nothing and acks a write no follower received.
+      :ok = Sqlite3.execute(conn, "INSERT INTO t VALUES (2, 'two')")
+      assert {:ok, after_commit} = Wal.read(wal)
+
+      assert after_commit.size == rolled.size,
+             "the file size moved, so this fixture no longer demonstrates the high-water mark"
+
+      assert after_commit.commit_extent > rolled.commit_extent,
+             "the committed extent did not advance across a real COMMIT — the tenant would be " <>
+               "told the write is quorum-durable while zero bytes shipped"
+
+      # And the plan the primary would actually make is a real append, not :nothing.
+      state = %{wal_gen: rolled.ckpt_seq, salt1: rolled.salt1, offset: rolled.commit_extent}
+
+      assert {:append, offset, len} = Primary.plan(state, after_commit, 0)
+      assert offset == rolled.commit_extent
+      assert len == after_commit.commit_extent - rolled.commit_extent
+
+      :ok = Connection.close(conn)
+    end
+
+    test "with no rollback the extent tracks the file exactly", ctx do
+      %{path: path, wal: wal} = ctx
+      {:ok, conn} = Connection.open(path)
+      :ok = Sqlite3.execute(conn, "PRAGMA wal_autocheckpoint=0")
+      :ok = Sqlite3.execute(conn, "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+
+      for i <- 1..50 do
+        :ok = Sqlite3.execute(conn, "INSERT INTO t VALUES (#{i}, 'row')")
+        assert {:ok, h} = Wal.read(wal)
+
+        assert h.commit_extent == h.size,
+               "the extent diverged from the file size with no rollback in play — every frame " <>
+                 "here ends in a commit, so the last frame IS a commit frame"
+      end
+
+      :ok = Connection.close(conn)
     end
   end
 end
