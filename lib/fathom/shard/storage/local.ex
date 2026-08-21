@@ -10,6 +10,8 @@ defmodule Fathom.Shard.Storage.Local do
   """
   @behaviour Fathom.Shard.Storage
 
+  require Logger
+
   alias Fathom.Shard.Storage
 
   @impl true
@@ -551,6 +553,44 @@ defmodule Fathom.Shard.Storage.Local do
       :enoent ->
         create_lock(shard_id, %{owner: owner, epoch: 1, expires_at_ms: now + ttl_ms})
 
+      # A CORRUPT LOCK IS NOT A FENCE, SO IT MUST NOT BE ONE (expert review 2026-08-20 #31).
+      #
+      # `:corrupt_lock` had two producers (here and in the S3 backend) and NOT ONE consumer: it
+      # propagated out of `acquire_lease` → `handle_continue` →
+      # `{:stop, {:shutdown, {:lease_unavailable, :corrupt_lock}}}` → `{:error, _}` at checkout,
+      # and the tenant was down permanently with no operator remedy short of deleting a file by
+      # hand. The likeliest way to get one was `create_lock/2` above silently succeeding over a
+      # zero-length file on a full disk.
+      #
+      # An undecodable lock carries no owner and no epoch, so it CANNOT be fencing anything —
+      # nobody can be holding a lease it describes, and no `check_lease`/`renew_lease` can match
+      # it. Treating it as absent is therefore safe in the direction that matters, and it is the
+      # only reading that lets the tenant come back.
+      #
+      # Deliberately confined to ACQUIRE. `check_lease/2` and `do_renew_lease/3` still fail closed
+      # on it: those run while a lease is believed HELD, and repairing under a holder would be a
+      # silent takeover rather than a recovery. Loud, because a corrupt lock means a disk problem
+      # that will produce others.
+      {:error, :corrupt_lock} ->
+        Logger.error(
+          "shard #{shard_id}: lock file is undecodable (a full or failing disk is the usual " <>
+            "cause). It names no owner and no epoch, so it fences nothing — recreating it. " <>
+            "Check the volume backing #{lock_path(shard_id)}."
+        )
+
+        :telemetry.execute([:fathom, :storage, :lock_repaired], %{count: 1}, %{shard_id: shard_id})
+
+        case File.rm(lock_path(shard_id)) do
+          ok when ok == :ok ->
+            create_lock(shard_id, %{owner: owner, epoch: 1, expires_at_ms: now + ttl_ms})
+
+          {:error, :enoent} ->
+            create_lock(shard_id, %{owner: owner, epoch: 1, expires_at_ms: now + ttl_ms})
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
       {:error, reason} ->
         {:error, reason}
     end
@@ -740,12 +780,25 @@ defmodule Fathom.Shard.Storage.Local do
   # the lock while it is still OURS — under the mutex, a stealer's fresh lock can
   # never be deleted by a stale owner's release racing it.
   defp do_release_lease(shard_id, %{owner: owner, epoch: epoch}) do
+    # REPORT THE REMOVAL (expert review 2026-08-20 #31). This used to discard `File.rm/1`'s result
+    # and return `:ok` unconditionally — the Local twin of the S3 bug AGENTS.md records at length,
+    # where "a 412 was reported as `:ok`, collapsing two opposite situations". Here the two are
+    # "the lock is someone else's" (a correct no-op, finding #22) and "the lock is ours and the
+    # unlink FAILED" (a leak reported as success). Because this backend is the default for the
+    # whole suite, reporting them identically also hid the class from `mix test`.
+    #
+    # `:enoent` is `:ok`: the lock being already gone is the outcome this asked for.
     case read_lock(shard_id) do
-      {:ok, %{owner: ^owner, epoch: ^epoch}} -> File.rm(lock_path(shard_id))
-      _ -> :ok
-    end
+      {:ok, %{owner: ^owner, epoch: ^epoch}} ->
+        case File.rm(lock_path(shard_id)) do
+          :ok -> :ok
+          {:error, :enoent} -> :ok
+          {:error, reason} -> {:error, reason}
+        end
 
-    :ok
+      _ ->
+        :ok
+    end
   end
 
   defp create_lock(shard_id, lease) do
@@ -754,9 +807,29 @@ defmodule Fathom.Shard.Storage.Local do
 
     case File.open(path, [:write, :exclusive]) do
       {:ok, io} ->
-        IO.binwrite(io, Storage.encode_lease(lease))
-        File.close(io)
-        {:ok, lease}
+        # CHECK BOTH RESULTS (expert review 2026-08-20 #31). `IO.binwrite/2` returns
+        # `{:error, :enospc}` / `{:error, :eio}`, and `File.close/1` is where a BUFFERED write's
+        # error actually surfaces. Both were dropped and `{:ok, lease}` returned unconditionally,
+        # so on a full or failing disk the caller believed it held a lease over a ZERO-LENGTH lock
+        # file — which then reads as `:corrupt_lock` for the rest of that tenant's life.
+        #
+        # `write_lock/2` immediately below already carries the comment naming this exact hazard and
+        # routes through `Storage.atomic_write/2`; `create_lock/2` was never given the same
+        # treatment. It cannot simply reuse it: the `:exclusive` open IS the create race (this
+        # backend's equivalent of S3's `PUT If-None-Match: *`), and a temp+rename would clobber a
+        # winner instead of losing to it.
+        #
+        # The partial file is removed on failure so the next acquire takes the clean `:enoent`
+        # path rather than the repair path below.
+        with :ok <- IO.binwrite(io, Storage.encode_lease(lease)),
+             :ok <- File.close(io) do
+          {:ok, lease}
+        else
+          {:error, reason} ->
+            _ = File.close(io)
+            _ = File.rm(path)
+            {:error, reason}
+        end
 
       # Lost the create race — whoever won holds it.
       {:error, :eexist} ->

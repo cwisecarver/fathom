@@ -342,6 +342,15 @@ defmodule Fathom.Telemetry do
       # grows from other nodes' traffic and has no retention — is squeezing the disk this node's
       # own durability flushes depend on, and that ends in acked writes that can never be made
       # durable. The counterpart of [:fathom, :warm_follower, :disk_pressure].
+      # A lock file that existed but decoded to nothing, recreated at acquire (expert review
+      # 2026-08-20 #31). Not routine: an undecodable lock means a full or failing disk, and it
+      # used to take that tenant permanently offline because `:corrupt_lock` had two producers and
+      # no consumer anywhere. ANY occurrence is worth an operator look, so this is a counter
+      # rather than a gauge — the shard is in the log line beside it.
+      counter("fathom.storage.lock_repaired.count",
+        event_name: [:fathom, :storage, :lock_repaired],
+        description: "Undecodable lock files recreated at acquire (investigate the volume)"
+      ),
       counter("fathom.replication.disk_pressure.count",
         event_name: [:fathom, :replication, :disk_pressure],
         description:
