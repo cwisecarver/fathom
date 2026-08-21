@@ -164,6 +164,26 @@ if spec = System.get_env("SNAPSHOT_RETENTION") do
       end
     end)
 
+  # AN EMPTY POLICY IS "KEEP NOTHING", NOT "NOT CONFIGURED" (expert review 2026-08-20 #13).
+  # `String.split("", ",", trim: true)` is `[]`, so the reduce returns its `%{}` accumulator and the
+  # raise above — which lives inside the per-part branch — never runs. `RetentionJob.policy/0` then
+  # matched `%{} = policy` (any map, including the empty one) and `Retention.plan/3` evaluated
+  # `Map.get(policy, granularity, 0)` for all three buckets. Every automatic snapshot of every
+  # tenant deleted on the next hourly tick, with a normal success log.
+  #
+  # `""` is not exotic: `System.get_env/1` returns it for a set-but-empty variable, and
+  # `SNAPSHOT_RETENTION: "${SNAPSHOT_RETENTION:-}"` is the exact passthrough shape this repo
+  # already uses for a dozen variables in `deploy/chaos/docker-compose.yml`. So the act that
+  # triggers it is the act of enabling the feature.
+  #
+  # A policy that would delete 100% of every shard's snapshots refuses to boot rather than running.
+  if policy == %{} or Enum.all?(policy, fn {_k, n} -> n == 0 end) do
+    raise "SNAPSHOT_RETENTION=#{inspect(spec)} parses to a policy that keeps NOTHING " <>
+            "(#{inspect(policy)}) — every automatic snapshot of every tenant would be deleted on " <>
+            "the next hourly tick. Give it a real policy (e.g. \"24h,7d,4w\") or UNSET the " <>
+            "variable to leave retention off."
+  end
+
   config :fathom, :snapshot_retention, policy
 end
 

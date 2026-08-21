@@ -218,4 +218,28 @@ defmodule Fathom.Snapshots.RetentionTest do
       assert length(plan.drop) == 4
     end
   end
+
+  # #13 — an empty policy is "keep nothing", and it was reachable from a set-but-empty env var.
+  # Pure half only: this is what the empty policy actually COMPUTED. The guards that stop it being
+  # treated as configured live in config/runtime.exs and RetentionJob.policy/0, and are covered in
+  # the storage-backed suite.
+  describe "an empty policy computes total deletion (#13)" do
+    test "plan/3 over %{} marks every automatic snapshot for deletion" do
+      snaps = for h <- 0..5, do: id(hours_ago(h))
+      plan = Retention.plan(snaps, %{}, now())
+
+      assert plan.keep == [],
+             "an empty policy is 'delete every automatic snapshot' — which is exactly what a " <>
+               "set-but-empty SNAPSHOT_RETENTION parsed to, with a normal success log"
+
+      assert length(plan.drop) == length(snaps)
+    end
+
+    test "plan/3 over an all-zero policy does the same" do
+      snaps = for h <- 0..5, do: id(hours_ago(h))
+      plan = Retention.plan(snaps, %{hourly: 0, daily: 0, weekly: 0}, now())
+      assert plan.keep == []
+      assert length(plan.drop) == length(snaps)
+    end
+  end
 end

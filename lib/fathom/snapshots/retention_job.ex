@@ -128,12 +128,24 @@ defmodule Fathom.Snapshots.RetentionJob do
     end
   end
 
+  # `%{}` matches ANY map, including the empty one — which is how an empty SNAPSHOT_RETENTION
+  # became a valid "keep zero in every bucket" policy (expert review 2026-08-20 #13). The config
+  # layer now refuses that at boot; this is the second line of defence, because `:snapshot_retention`
+  # is also settable directly from code and test setup. An all-zero policy is the same thing spelled
+  # differently, so it is rejected too: retention deleting everything is never what "configured"
+  # should mean.
   defp policy do
     case Application.get_env(:fathom, :snapshot_retention) do
-      %{} = policy -> policy
-      policy when is_list(policy) -> Map.new(policy)
+      %{} = policy -> keeps_something(policy)
+      policy when is_list(policy) -> policy |> Map.new() |> keeps_something()
       _ -> nil
     end
+  end
+
+  defp keeps_something(policy) do
+    if map_size(policy) > 0 and Enum.any?(policy, fn {_k, n} -> is_integer(n) and n > 0 end),
+      do: policy,
+      else: nil
   end
 
   defp sample_size, do: Application.get_env(:fathom, :snapshot_retention_sample)

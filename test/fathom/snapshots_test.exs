@@ -204,4 +204,76 @@ defmodule Fathom.SnapshotsTest do
 
     for snap <- Path.wildcard(Path.join(remote_dir, "#{id}@snap-*.db")), do: File.rm(snap)
   end
+
+  # #14 — the automatic retention policy must only ever be able to delete snapshots the SCHEDULER
+  # created. `docs/durability.md` states that as absolute: "an operator's deliberate
+  # `Snapshots.create(id, label: \"pre-migration\")` is invisible to the automatic policy."
+  #
+  # It was not. `Retention.auto?/1` matches a trailing `-auto` on the id, and the id was built from
+  # the operator's own label — so the marker was forgeable, including BY TRUNCATION: sanitize_label
+  # slices to 40 characters, and "manual snapshot taken by ops before automatic cleanup" sanitizes
+  # to 52 chars whose first 40 end exactly on "-before-auto". The truncation manufactures the
+  # marker out of a label whose meaning was the opposite, and retention then deletes the snapshot
+  # someone took BECAUSE they were worried, logging a normal deletion.
+  describe "the reserved auto marker (#14)" do
+    alias Fathom.Snapshots.Retention
+
+    test "no operator label can forge it", %{shard: shard} do
+      write!(shard, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
+      flush!(shard)
+
+      for label <- [
+            "auto",
+            "AUTO",
+            "pre-migration auto",
+            "manual snapshot taken by ops before automatic cleanup",
+            "keep this auto",
+            "auto auto",
+            "  auto  "
+          ] do
+        {:ok, id} = Snapshots.create(shard, label: label)
+
+        refute Retention.auto?(id),
+               "label #{inspect(label)} produced #{inspect(id)}, which the automatic policy will " <>
+                 "delete — this is the operator snapshot taken because someone was worried"
+      end
+    end
+
+    test "the truncation case specifically, with its arithmetic", %{shard: shard} do
+      write!(shard, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
+      flush!(shard)
+
+      label = "manual snapshot taken by ops before automatic cleanup"
+
+      # Pin the property that makes this reachable, so a change to sanitize_label's width does not
+      # silently retire the case: sanitized to 52 chars, and the first 40 end on the marker.
+      sanitized = label |> String.downcase() |> String.replace(~r/[^a-z0-9-]+/, "-")
+
+      # 53 characters, not the 52 the finding computed — it dropped the trim step. The COUNT is
+      # incidental; the property is that the 40-char slice lands on the marker, which is what makes
+      # the truncation manufacture provenance out of a label that says the opposite.
+      assert String.length(sanitized) == 53
+
+      assert String.slice(sanitized, 0, 40) |> String.ends_with?("-auto"),
+             "the label no longer truncates onto the marker, so this case has retired — check " <>
+               "whether sanitize_label's width changed before deleting it"
+
+      {:ok, id} = Snapshots.create(shard, label: label)
+      refute Retention.auto?(id)
+    end
+
+    test "the scheduler's own snapshots ARE auto, labelled or not", %{shard: shard} do
+      write!(shard, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
+      flush!(shard)
+
+      {:ok, plain} = Snapshots.create(shard, auto: true)
+
+      assert Retention.auto?(plain),
+             "retention can no longer see the snapshots it exists to expire"
+
+      {:ok, labelled} = Snapshots.create(shard, auto: true, label: "hourly")
+      assert Retention.auto?(labelled)
+      assert labelled =~ "hourly"
+    end
+  end
 end

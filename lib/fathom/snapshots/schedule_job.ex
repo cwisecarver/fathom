@@ -43,7 +43,6 @@ defmodule Fathom.Snapshots.ScheduleJob do
 
   alias Fathom.Directory
   alias Fathom.Snapshots
-  alias Fathom.Snapshots.Retention
 
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
@@ -88,7 +87,10 @@ defmodule Fathom.Snapshots.ScheduleJob do
   end
 
   defp snapshot_one(shard_id) do
-    case Snapshots.create(shard_id, label: Retention.auto_label()) do
+    # `auto: true`, not `label: "auto"` (expert review 2026-08-20 #14). The marker is provenance,
+    # and routing it through the operator-supplied label field is what let a manual snapshot forge
+    # it — including by 40-char truncation.
+    case Snapshots.create(shard_id, auto: true) do
       {:ok, _snapshot_id} ->
         # Stamped ONLY on success. A failed snapshot must leave the shard at the head of the
         # rotation so the next run retries it — stamping regardless would mark a tenant "backed up"

@@ -33,6 +33,7 @@ defmodule Fathom.Snapshots do
   alias Fathom.Shard.Storage
   alias Fathom.ShardId
   alias Fathom.Shards
+  alias Fathom.Snapshots.Retention
 
   @drain_timeout 30_000
 
@@ -51,11 +52,16 @@ defmodule Fathom.Snapshots do
   Snapshots `shard_id`'s current stored object. `opts[:label]` adds a
   human-readable suffix to the generated (timestamp-based) id. Returns
   `{:ok, snapshot_id}`.
+
+  `opts[:auto]` marks the snapshot as SCHEDULER-CREATED, which is the only thing the automatic
+  retention policy will ever delete. It is a separate flag rather than a label because a label is
+  operator-supplied and could otherwise forge the marker — see `new_snapshot_id/2`.
   """
   @spec create(String.t(), keyword()) :: {:ok, String.t()} | {:error, term()}
   def create(shard_id, opts \\ []) do
     with {:ok, id} <- cast(shard_id) do
-      snapshot_id = new_snapshot_id(Keyword.get(opts, :label))
+      snapshot_id =
+        new_snapshot_id(Keyword.get(opts, :label), Keyword.get(opts, :auto, false) == true)
 
       case Storage.snapshot(id, snapshot_id) do
         :ok -> {:ok, snapshot_id}
@@ -277,15 +283,37 @@ defmodule Fathom.Snapshots do
 
   # A sortable, filename-safe id: compact UTC timestamp + a short uniquifier (so two
   # snapshots in the same second don't collide) + an optional sanitized label.
-  defp new_snapshot_id(label) do
+  # `auto?` is the SCHEDULER's provenance, and it is deliberately NOT a label (expert review
+  # 2026-08-20 #14). `Retention.auto?/1` decides what the automatic policy may delete by matching
+  # a trailing `-auto` on the id — and that id used to be built from a user-supplied label, so an
+  # operator could produce the reserved marker three ways:
+  #
+  #     "auto" / "AUTO"                                        -> "auto"
+  #     "pre-migration auto"                                   -> "pre-migration-auto"
+  #     "manual snapshot taken by ops before automatic cleanup" -> "...-before-auto"
+  #
+  # The third is the dangerous one: the sanitized string is 52 characters and the `slice(0, 40)`
+  # lands exactly on `-before-auto`, so the TRUNCATION CREATES the marker out of a label whose
+  # meaning was the opposite. `docs/durability.md` states the property as absolute — "an
+  # operator's deliberate create is invisible to the automatic policy" — and the snapshot someone
+  # took *because they were worried* was the one retention deleted, silently.
+  #
+  # The suffix FORMAT is unchanged, because snapshots already in storage carry it and
+  # `Retention.auto?/1` must keep matching them. What changed is that only this flag can produce it.
+  defp new_snapshot_id(label, auto?) do
     ts = DateTime.utc_now() |> Calendar.strftime("%Y%m%dT%H%M%SZ")
     uniq = System.unique_integer([:positive, :monotonic]) |> Integer.to_string()
     base = "#{ts}-#{String.slice(uniq, -4, 4)}"
 
-    case sanitize_label(label) do
-      "" -> base
-      lbl -> "#{base}-#{lbl}"
-    end
+    suffix =
+      case {sanitize_label(label), auto?} do
+        {"", true} -> "-" <> Retention.auto_label()
+        {"", false} -> ""
+        {lbl, true} -> "-#{lbl}-" <> Retention.auto_label()
+        {lbl, false} -> "-#{lbl}"
+      end
+
+    base <> suffix
   end
 
   defp sanitize_label(nil), do: ""
@@ -296,5 +324,26 @@ defmodule Fathom.Snapshots do
     |> String.replace(~r/[^a-z0-9-]+/, "-")
     |> String.trim("-")
     |> String.slice(0, 40)
+    |> String.trim("-")
+    |> strip_reserved_suffix()
+  end
+
+  # Drop a trailing reserved marker a user label produced — including one the 40-char slice
+  # created. Repeated, because "...-auto-auto" truncates to "...-auto" just as readily. Dropping
+  # the word is lossless in the way that matters: it removes a token that would otherwise assert
+  # provenance the snapshot does not have, and the rest of the operator's label survives.
+  defp strip_reserved_suffix(lbl) do
+    marker = Retention.auto_label()
+
+    cond do
+      lbl == marker ->
+        ""
+
+      String.ends_with?(lbl, "-" <> marker) ->
+        lbl |> String.replace_suffix("-" <> marker, "") |> strip_reserved_suffix()
+
+      true ->
+        lbl
+    end
   end
 end
