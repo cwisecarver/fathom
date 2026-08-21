@@ -33,6 +33,89 @@ defmodule Fathom.SnapshotsSchemaGuardTest do
     for snap <- Path.wildcard(Path.join(remote_dir(), "#{shard}@snap-*.db")), do: File.rm(snap)
   end
 
+  # HOLDING the lease, not merely probing it (expert review 2026-08-20 #12).
+  #
+  # restore/3 used to read `lease_holder/1` and proceed on `:free`. A request landing on another
+  # node between that probe and the copy-back cold-opens, acquires the freed lease, pulls the
+  # object at etag E and starts serving. Our If-Match: E copy-back then SUCCEEDS, and that node's
+  # next flush 412s, re-checks the lock, finds it still its own, resyncs to the new etag and
+  # re-uploads its PRE-RESTORE bytes. The restore is silently undone within one flush interval —
+  # at maximum operator pressure, with :ok already reported.
+  #
+  # THE PROPERTY IS THE WINDOW, not the refusal. A probe-only implementation ALSO returns
+  # {:error, {:held, _}} when someone already holds the lease, so asserting that discriminates
+  # nothing — the first draft of this test did exactly that and passed against the bug. What has
+  # to be pinned is that no one can ACQUIRE mid-restore, so this injects a competing acquire into
+  # the window itself, through FaultyStorage's `run_before(:object_etag)` hook, which fires
+  # between the lease decision and the copy-back.
+  test "no one can acquire the lease mid-restore (#12)" do
+    shard = uniq()
+    on_exit(fn -> cleanup(shard) end)
+    {:ok, _} = Directory.resolve(shard)
+    seed_object(shard, 0)
+    {:ok, snap} = Snapshots.create(shard)
+
+    prev_backend = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    test_pid = self()
+
+    Application.put_env(
+      :fathom,
+      :faulty_before,
+      {:object_etag,
+       fn ->
+         # Exactly what a cold open on another node does in this window.
+         send(
+           test_pid,
+           {:mid_restore_acquire, Storage.acquire_lease(shard, "intruder@node", 30_000)}
+         )
+
+         :ok
+       end}
+    )
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if is_nil(prev_backend),
+        do: Application.delete_env(:fathom, :shard_storage),
+        else: Application.put_env(:fathom, :shard_storage, prev_backend)
+    end)
+
+    result = Snapshots.restore(shard, snap)
+
+    assert_receive {:mid_restore_acquire, acquired},
+                   2_000,
+                   "the hook never fired, so the window was never opened and this proves nothing"
+
+    # THE ASSERTION. Pre-fix the restore only PROBED, so the lease was free in this window and the
+    # intruder gets it — then serves the shard and re-uploads pre-restore bytes over the snapshot.
+    assert match?({:error, _}, acquired),
+           "another owner acquired the lease DURING the restore (#{inspect(acquired)}); its next " <>
+             "flush will 412, reconcile to the restored etag, and re-upload its pre-restore bytes"
+
+    assert result == :ok
+
+    assert Storage.lease_holder(shard) == :free,
+           "restore/3 held the lease and never released it — the shard is now unopenable"
+  end
+
+  # The ordinary refusal still holds: a lease already held by someone else is not stolen.
+  test "a restore refuses while another owner holds the lease (#12)" do
+    shard = uniq()
+    on_exit(fn -> cleanup(shard) end)
+    {:ok, _} = Directory.resolve(shard)
+    seed_object(shard, 0)
+    {:ok, snap} = Snapshots.create(shard)
+
+    {:ok, other} = Storage.acquire_lease(shard, "someone-else@node", 30_000)
+    assert {:error, {:held, _}} = Snapshots.restore(shard, snap)
+    :ok = Storage.release_lease(shard, other)
+
+    assert :ok = Snapshots.restore(shard, snap)
+    assert Storage.lease_holder(shard) == :free
+  end
+
   test "a cross-version restore is refused without force, and with force reconciles the directory (#7)" do
     shard = uniq()
     on_exit(fn -> cleanup(shard) end)

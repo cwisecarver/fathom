@@ -102,30 +102,55 @@ defmodule Fathom.Snapshots do
          :ok <- check_schema_boundary(id, snap_version, force?) do
       case Shards.drain(id, Keyword.get(opts, :drain_timeout, @drain_timeout)) do
         :ok ->
-          case Storage.lease_holder(id) do
-            :free ->
-              # Capture the live etag at the lease-free instant and restore under an If-Match fence
-              # (expert review 2026-07-18 #2): a fresh checkout that acquires the freed lease and
-              # flushes between here and the copy-back moves the etag, so the restore aborts with
-              # {:error, :superseded} instead of silently clobbering those acked writes.
-              case Storage.object_etag(id) do
-                {:ok, etag} ->
-                  case Storage.restore_snapshot(id, snapshot_id, etag) do
-                    :ok ->
-                      # Align the directory to the restored file's version so it never lies about the
-                      # schema (#7); a below-head version lets the laggard sweep converge it forward.
-                      reconcile_directory_schema(id, snap_version)
-                      :ok
+          # HOLD the lease across the whole restore, do not merely PROBE it (expert review
+          # 2026-08-20 #12). This used to read `Storage.lease_holder(id)` and proceed on `:free`,
+          # which leaves a window nothing closes:
+          #
+          #   1. the probe says :free and `object_etag/1` returns E;
+          #   2. a request lands on ANOTHER node, which cold-opens, acquires the freed lease, pulls
+          #      the object at E and starts serving — it has not flushed, so its `state.etag` is E;
+          #   3. our If-Match: E copy-back SUCCEEDS; the object is now E' (the snapshot's bytes);
+          #   4. that node's next flush PUTs If-Match: E → 412 → `reconcile_superseded/1` re-checks
+          #      the LOCK, finds it still its own, resyncs the fence to E' and stays dirty;
+          #   5. the interval after that PUTs its PRE-RESTORE bytes with If-Match: E' — which
+          #      succeeds. The restore is silently undone.
+          #
+          # Every one of those steps is a path implemented deliberately and correctly on its own.
+          # The If-Match fence closes the FIRST-order race (a flush between the etag read and the
+          # copy-back aborts with :superseded) and is kept; holding the lease is what stops a new
+          # owner from appearing at all. `Fathom.Tenants.fork_into_leased_dst/2` already does this
+          # for the fork path — same shape, same reason.
+          #
+          # DISTINCT owner string, not a coordinator's: `acquire_existing` treats a same-owner
+          # acquire as a silent RECLAIM rather than a fence, which is not a check at all (the
+          # hazard `Promote.acquire/1` carries in its own moduledoc).
+          owner = restore_owner()
 
-                    other ->
-                      other
-                  end
+          case Storage.acquire_lease(id, owner, restore_lease_ttl()) do
+            {:ok, lease} ->
+              try do
+                case Storage.object_etag(id) do
+                  {:ok, etag} ->
+                    case Storage.restore_snapshot(id, snapshot_id, etag) do
+                      :ok ->
+                        # Align the directory to the restored file's version so it never lies about
+                        # the schema (#7); a below-head version lets the laggard sweep converge it
+                        # forward. Inside the lease, so it lands before anyone can re-open.
+                        reconcile_directory_schema(id, snap_version)
+                        :ok
 
-                {:error, reason} ->
-                  {:error, reason}
+                      other ->
+                        other
+                    end
+
+                  {:error, reason} ->
+                    {:error, reason}
+                end
+              after
+                Storage.release_lease(id, lease)
               end
 
-            {:held, owner} ->
+            {:error, {:held, owner}} ->
               {:error, {:held, owner}}
 
             {:error, reason} ->
@@ -191,6 +216,11 @@ defmodule Fathom.Snapshots do
         :ok
     end
   end
+
+  # Never a coordinator's owner string — see the acquire above.
+  defp restore_owner, do: "snapshot-restore@#{node()}@#{System.unique_integer([:positive])}"
+
+  defp restore_lease_ttl, do: Application.get_env(:fathom, :shard_lease_ttl_ms, 30_000)
 
   defp reconcile_directory_schema(id, snap_version) do
     case directory_schema_version(id) do
