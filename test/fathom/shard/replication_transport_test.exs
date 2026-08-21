@@ -763,4 +763,131 @@ defmodule Fathom.Shard.ReplicationTransportTest do
       :gen_tcp.close(l)
     end
   end
+
+  # SHIPPER IDENTITY (expert review 2026-08-20 #24).
+  #
+  # A caller records what it expects back keyed by the term it used to ADDRESS a shipper. Every
+  # reply must therefore name that same term. Before this fix replies always carried `self()` and
+  # the three primary-side modules normalised names with `Process.whereis(name) || name` — which
+  # returns `nil` for a shipper mid-restart under the DynamicSupervisor or a node mid-`Membership`
+  # swap, both of which AGENTS.md records as routine under load. The expectation was then filed
+  # under the ATOM while the ack arrived under the PID: a good ack scored as `:offset_mismatch`,
+  # and with N=3/Q=2 two of those drive `Quorum.settle/1` to `:impossible` and fail the tenant's
+  # write with `FILO_NO_QUORUM` for no reason.
+  describe "a shipper answers under the identity its caller addresses it by (#24)" do
+    test "a named shipper's ack names the NAME, not its pid", ctx do
+      %{root: _} = ctx
+      port = start_follower_named!(:idf1)
+      name = :"id_ship_#{System.unique_integer([:positive])}"
+
+      pid =
+        start_supervised!(
+          {Shipper, name: name, id: name, host: ~c"127.0.0.1", port: port},
+          id: name
+        )
+
+      assert Shipper.connected?(pid)
+
+      p = %Push{
+        shard_id: "acme",
+        epoch: 1,
+        wal_gen: 0,
+        salt1: 0,
+        offset: 0,
+        payload: @payload
+      }
+
+      # Addressed by NAME — which is how `Fleet.shippers/0` publishes them, and therefore how
+      # every real commit addresses them.
+      Shipper.push(name, p)
+
+      # The VERDICT is beside the point (this follower has never been seeded, so it is a
+      # deterministic `:unknown_shard`); the IDENTITY is the whole test.
+      assert_receive {:repl_reply, ^name, {:reject, "acme", :unknown_shard, 0}},
+                     2_000,
+                     "the reply did not name the shipper the way the caller addressed it; the " <>
+                       "primary's expectation map and the answer would key on different things"
+    end
+
+    test "a locally refused push is reported under the same identity as a real reply" do
+      # The budget refusal is produced in the CALLER's process, not the shipper's, so it is the
+      # one reply path that cannot read `state.id`. It must still name the caller's own term or
+      # the refusal is counted against nobody and the quorum waits out its deadline.
+      prev = Application.get_env(:fathom, :replication_max_queue_bytes)
+
+      on_exit(fn ->
+        if is_nil(prev),
+          do: Application.delete_env(:fathom, :replication_max_queue_bytes),
+          else: Application.put_env(:fathom, :replication_max_queue_bytes, prev)
+      end)
+
+      port = start_follower_named!(:idf2)
+      name = :"id_full_#{System.unique_integer([:positive])}"
+
+      pid =
+        start_supervised!(
+          {Shipper, name: name, id: name, host: ~c"127.0.0.1", port: port},
+          id: name
+        )
+
+      assert Shipper.connected?(pid)
+
+      # `Budget.queued/0` sums over the shippers Fleet publishes, so the fleet view is part of
+      # what makes the refusal reachable at all.
+      Fathom.Shard.Replication.Fleet.publish([{to_string(name), "127.0.0.1", port, name}])
+      on_exit(fn -> Fathom.Shard.Replication.Fleet.publish([]) end)
+
+      # A cap of one byte: any payload is over budget, so `push/2` takes the local-refusal path.
+      Application.put_env(:fathom, :replication_max_queue_bytes, 1)
+
+      Shipper.push(name, %Push{
+        shard_id: "acme",
+        epoch: 1,
+        wal_gen: 0,
+        salt1: 0,
+        offset: 0,
+        payload: @payload
+      })
+
+      assert_receive {:repl_reply, ^name, {:reject, "acme", :overloaded, 0}}, 2_000
+    end
+  end
+
+  # The primary half of the same contract, and the half that cannot be reached with a real
+  # `Shipper` — it is now the side that was fixed, so it always answers correctly. See
+  # `Fathom.Test.IdentityShipper`.
+  describe "ship_quorum keys expectations on the caller's term (#24)" do
+    test "an ack that names the term the caller used is counted" do
+      [a, b] = start_identity_shippers([:name, :name])
+
+      assert {:ok, acked, []} = Replication.ship_quorum(fanout([a, b], identity_push()), 1, 1_000)
+      assert acked != []
+      assert Enum.all?(acked, &(&1 in [a, b])), "the quorum tallied an identity nobody addressed"
+    end
+
+    test "an ack that names its PID while addressed by NAME is NOT counted" do
+      # This is the pre-fix world reproduced deliberately: the shipper answers by pid while the
+      # caller addressed it by name. It must NOT satisfy the quorum — an identity the primary
+      # cannot match is an unanswered push, and silently accepting it would let any process that
+      # can guess a shard id vote in a quorum.
+      [a, b] = start_identity_shippers([:pid, :pid])
+
+      assert {:error, {:no_quorum, _, _}} =
+               Replication.ship_quorum(fanout([a, b], identity_push()), 1, 300)
+    end
+  end
+
+  defp start_identity_shippers(modes) do
+    for {mode, i} <- Enum.with_index(modes) do
+      name = :"iq_#{System.unique_integer([:positive])}_#{i}"
+      reply_as = if mode == :pid, do: :pid, else: name
+      pid = Fathom.Test.IdentityShipper.start(name, reply_as)
+      on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :kill) end)
+      name
+    end
+  end
+
+  defp identity_push do
+    %Push{shard_id: "acme", epoch: 1, wal_gen: 0, salt1: 0, offset: 0, payload: @payload}
+  end
 end

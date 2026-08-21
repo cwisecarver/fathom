@@ -485,7 +485,7 @@ defmodule Fathom.Shard.Replication.Session do
 
   defp merge_rejects(seen, rejects) do
     Enum.reduce(rejects, seen, fn {shipper, _reason, _at} = r, acc ->
-      Map.put(acc, resolve(shipper), r)
+      Map.put(acc, shipper, r)
     end)
   end
 
@@ -505,7 +505,7 @@ defmodule Fathom.Shard.Replication.Session do
   defp ship_planned(state, wal_path, epoch, header) do
     {plans, current} =
       Enum.reduce(shippers(), {[], 0}, fn shipper, {plans, current} ->
-        case Primary.plan(Map.get(state.followers, resolve(shipper)), header, max_push_bytes()) do
+        case Primary.plan(Map.get(state.followers, shipper), header, max_push_bytes()) do
           :nothing -> {plans, current + 1}
           plan -> {[{shipper, plan} | plans], current}
         end
@@ -632,14 +632,14 @@ defmodule Fathom.Shard.Replication.Session do
   end
 
   defp expectations(plans, header) do
-    Map.new(plans, fn {shipper, plan} -> {resolve(shipper), Primary.advance(header, plan)} end)
+    Map.new(plans, fn {shipper, plan} -> {shipper, Primary.advance(header, plan)} end)
   end
 
   # `collect/4` has already checked that this follower reported exactly the position we shipped it,
   # so the recorded expectation IS its new state and there is nothing left to verify. Late acks go
   # through `settle_late_ack/3`, which does that check itself.
   defp advance(state, shipper) do
-    key = resolve(shipper)
+    key = shipper
 
     case Map.pop(state.inflight, key) do
       {nil, _} -> state
@@ -661,7 +661,7 @@ defmodule Fathom.Shard.Replication.Session do
   defp reconcile(state, rejects) do
     Enum.reduce(rejects, state, fn
       {shipper, :offset_mismatch, at}, acc ->
-        key = resolve(shipper)
+        key = shipper
 
         case Map.pop(acc.inflight, key) do
           {nil, _} ->
@@ -680,7 +680,7 @@ defmodule Fathom.Shard.Replication.Session do
       # through to the catch-all and KEEP it — see `@settled_rejects` for why that distinction is
       # load-bearing rather than tidy.
       {shipper, reason, _at}, acc when reason in @settled_rejects ->
-        %{acc | inflight: Map.delete(acc.inflight, resolve(shipper))}
+        %{acc | inflight: Map.delete(acc.inflight, shipper)}
 
       # Our own shipper refused locally; the follower never saw this frame and still owes a reply to
       # an earlier one. Keep the expectation so that reply can still be reconciled.
@@ -693,9 +693,6 @@ defmodule Fathom.Shard.Replication.Session do
     Logger.warning("replication read failed for #{state.shard_id}: #{inspect(reason)}")
     {:error, reason}
   end
-
-  defp resolve(pid) when is_pid(pid), do: pid
-  defp resolve(name), do: Process.whereis(name) || name
 
   # ------------------------------------------------------------------------------------------
   # seeding
@@ -800,14 +797,14 @@ defmodule Fathom.Shard.Replication.Session do
   # the follower does not hold — but the follower HAS answered, so the expectation must go either
   # way. Refusals are handled by `reconcile/2`, which owns clearing for every reject reason.
   defp forget_inflight(state, from),
-    do: %{state | inflight: Map.delete(state.inflight, resolve(from))}
+    do: %{state | inflight: Map.delete(state.inflight, from)}
 
   # Unlike the in-quorum path, nothing has vetted this ack yet: `collect/4` compares against what it
   # sent, and it is long gone. So the position is checked against the outstanding expectation here.
   # An ack for anywhere else means the two sides disagree, and believing it would advance the
   # primary past bytes the follower does not hold.
   defp settle_late_ack(state, shipper, next) do
-    case Map.get(state.inflight, resolve(shipper)) do
+    case Map.get(state.inflight, shipper) do
       %{offset: ^next} -> advance(state, shipper)
       _ -> state
     end
@@ -899,7 +896,7 @@ defmodule Fathom.Shard.Replication.Session do
     case result do
       {:ok, at} ->
         Logger.info("replication seeded a follower for #{state.shard_id} at #{inspect(at)}")
-        key = resolve(shipper)
+        key = shipper
 
         %{
           state

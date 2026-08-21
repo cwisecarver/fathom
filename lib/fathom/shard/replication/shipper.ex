@@ -107,7 +107,7 @@ defmodule Fathom.Shard.Replication.Shipper do
         # take the work must subtract from the quorum NOW rather than absorb it. Reported as
         # `:overloaded` so the two paths are indistinguishable to `Quorum` and to the operator.
         count_reject(:overloaded)
-        send(self(), {:repl_reply, resolve(shipper), {:reject, p.shard_id, :overloaded, 0}})
+        send(self(), {:repl_reply, shipper, {:reject, p.shard_id, :overloaded, 0}})
         :ok
     end
   end
@@ -167,7 +167,21 @@ defmodule Fathom.Shard.Replication.Shipper do
       host: Keyword.fetch!(opts, :host),
       port: Keyword.fetch!(opts, :port),
       name: name,
-      id: Keyword.get(opts, :id, name || self())
+      # THE IDENTITY EVERY REPLY CARRIES (expert review 2026-08-20 #24).
+      #
+      # A caller records what it expects back keyed by the term it used to ADDRESS this shipper;
+      # every reply must therefore name that same term, or the expectation map and the answer key
+      # on different things and a perfectly good ack is scored as a mismatch. `Fleet` passes
+      # `id: name` because `Fleet.shippers/0` publishes names. The default is `self()`, which is
+      # correct for anyone holding a bare pid.
+      #
+      # This replaced a `Process.whereis(name) || name` normalisation on the PRIMARY side, which
+      # is wrong precisely when it matters: `whereis/1` returns `nil` for a shipper mid-restart
+      # under the DynamicSupervisor or a node mid-`Membership` swap, so the expectation was filed
+      # under the ATOM while the reply arrived under the PID. With N=3/Q=2 two such misses drive
+      # `Quorum.settle/1` to `:impossible` and the tenant's write fails `FILO_NO_QUORUM` for no
+      # reason, on a window that recurs on every restart and every roster swap.
+      id: Keyword.get(opts, :id, self())
     }
 
     {:ok, state, {:continue, :connect}}
@@ -185,7 +199,7 @@ defmodule Fathom.Shard.Replication.Shipper do
     # commit the tenant is still waiting on, and silently holding it converts a follower outage
     # into unbounded write latency.
     Budget.release(state.name, reserved)
-    send(from, {:repl_reply, self(), {:reject, p.shard_id, :disconnected, 0}})
+    send(from, {:repl_reply, state.id, {:reject, p.shard_id, :disconnected, 0}})
     {:noreply, state}
   end
 
@@ -248,14 +262,14 @@ defmodule Fathom.Shard.Replication.Shipper do
       # accumulator. The cost is honest: writes fail with FILO_NO_QUORUM while a link is saturated.
       overloaded?(state) ->
         count_reject(:overloaded)
-        send(from, {:repl_reply, self(), {:reject, p.shard_id, :overloaded, 0}})
+        send(from, {:repl_reply, state.id, {:reject, p.shard_id, :overloaded, 0}})
         {:noreply, state}
 
       Map.has_key?(state.waiters, p.shard_id) ->
         # One writer per shard means one push in flight. Two is a caller bug, and overwriting the
         # waiter would strand the first commit forever.
         count_reject(:already_in_flight)
-        send(from, {:repl_reply, self(), {:reject, p.shard_id, :already_in_flight, 0}})
+        send(from, {:repl_reply, state.id, {:reject, p.shard_id, :already_in_flight, 0}})
         {:noreply, state}
 
       true ->
@@ -264,7 +278,7 @@ defmodule Fathom.Shard.Replication.Shipper do
             {:noreply, %{state | waiters: Map.put(state.waiters, p.shard_id, from)}}
 
           {:error, reason} ->
-            send(from, {:repl_reply, self(), {:reject, p.shard_id, :disconnected, 0}})
+            send(from, {:repl_reply, state.id, {:reject, p.shard_id, :disconnected, 0}})
             {:noreply, drop(state, reason)}
         end
     end
@@ -272,13 +286,13 @@ defmodule Fathom.Shard.Replication.Shipper do
 
   # Same shape as a push: claims the shard's single waiter, but holds it for the whole stream.
   def handle_cast({:seed_begin, s, from}, %{sock: nil} = state) do
-    send(from, {:repl_reply, self(), {:reject, s.shard_id, :disconnected, 0}})
+    send(from, {:repl_reply, state.id, {:reject, s.shard_id, :disconnected, 0}})
     {:noreply, state}
   end
 
   def handle_cast({:seed_begin, s, from}, state) do
     if Map.has_key?(state.waiters, s.shard_id) do
-      send(from, {:repl_reply, self(), {:reject, s.shard_id, :already_in_flight, 0}})
+      send(from, {:repl_reply, state.id, {:reject, s.shard_id, :already_in_flight, 0}})
       {:noreply, state}
     else
       case :gen_tcp.send(state.sock, Protocol.encode_seed_begin(s)) do
@@ -286,7 +300,7 @@ defmodule Fathom.Shard.Replication.Shipper do
           {:noreply, %{state | waiters: Map.put(state.waiters, s.shard_id, from)}}
 
         {:error, reason} ->
-          send(from, {:repl_reply, self(), {:reject, s.shard_id, :disconnected, 0}})
+          send(from, {:repl_reply, state.id, {:reject, s.shard_id, :disconnected, 0}})
           {:noreply, drop(state, reason)}
       end
     end
@@ -465,7 +479,7 @@ defmodule Fathom.Shard.Replication.Shipper do
     if state.sock, do: :gen_tcp.close(state.sock)
 
     for {shard, from} <- state.waiters do
-      send(from, {:repl_reply, self(), {:reject, shard, :disconnected, 0}})
+      send(from, {:repl_reply, state.id, {:reject, shard, :disconnected, 0}})
     end
 
     if reason != :closed do
@@ -475,11 +489,6 @@ defmodule Fathom.Shard.Replication.Shipper do
     Process.send_after(self(), :reconnect, @reconnect_backoff_ms)
     %{state | sock: nil, waiters: %{}}
   end
-
-  # The reply must name the shipper the way every other reply does, or `ship_quorum/4`'s expectation
-  # map and `Quorum`'s tally key on different things and the reject is counted against nobody.
-  defp resolve(pid) when is_pid(pid), do: pid
-  defp resolve(name), do: Process.whereis(name) || name
 
   # ONE EVENT PER REFUSED PUSH, tagged by REASON only.
   #
@@ -504,7 +513,7 @@ defmodule Fathom.Shard.Replication.Shipper do
         state
 
       {from, waiters} ->
-        send(from, {:repl_reply, self(), msg})
+        send(from, {:repl_reply, state.id, msg})
         %{state | waiters: waiters}
     end
   end

@@ -81,7 +81,7 @@ defmodule Fathom.Shard.Replication do
     # a single expected offset was the assumption that made catch-up impossible.
     expected =
       Map.new(pushes, fn {shipper, p} ->
-        {resolve(shipper), p.offset + byte_size(p.payload)}
+        {shipper, p.offset + byte_size(p.payload)}
       end)
 
     shard_id = pushes |> hd() |> elem(1) |> Map.fetch!(:shard_id)
@@ -90,11 +90,6 @@ defmodule Fathom.Shard.Replication do
     deadline = System.monotonic_time(:millisecond) + timeout
     collect(quorum, shard_id, deadline, {[], []}, expected)
   end
-
-  # Replies identify their sender by pid; callers may pass names. Normalise so the expectation map
-  # can be keyed the same way the replies arrive.
-  defp resolve(pid) when is_pid(pid), do: pid
-  defp resolve(name), do: Process.whereis(name) || name
 
   # `rejects` accumulates {shipper, reason} so the caller can act on WHY a follower refused rather
   # than only on the fact that the quorum failed. The one that matters is `:unknown_shard`, which

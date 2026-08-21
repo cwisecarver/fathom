@@ -256,7 +256,15 @@ defmodule Fathom.Shard.Replication.Fleet do
   """
   @spec start_shipper!(atom(), String.t() | charlist(), :inet.port_number()) :: pid()
   def start_shipper!(name, host, port) do
-    spec = {Fathom.Shard.Replication.Shipper, name: name, host: host, port: port}
+    # `id: name` is REQUIRED, not decoration (expert review 2026-08-20 #24). Every reply a shipper
+    # sends names itself by its `id`, and `shippers/0` publishes NAMES — so the identity the
+    # commit path keys its expectation map on and the identity the answer arrives under have to
+    # be the same term. Before this the reply carried `self()` and the primary normalised names
+    # with `Process.whereis/1`, which returns `nil` for a shipper mid-restart or mid-swap: the
+    # expectation was then filed under the ATOM while the ack came back under the PID, and a good
+    # ack was scored as a mismatch.
+    spec =
+      {Fathom.Shard.Replication.Shipper, name: name, id: name, host: host, port: port}
 
     case DynamicSupervisor.start_child(@shippers_sup, spec) do
       {:ok, pid} -> pid
