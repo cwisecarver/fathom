@@ -195,4 +195,104 @@ defmodule Fathom.FlushStormTest do
 
   defp restore(key, nil), do: Application.delete_env(:fathom, key)
   defp restore(key, value), do: Application.put_env(:fathom, key, value)
+
+  # A `:flush_now` WAITER IS ALWAYS ANSWERED (expert review 2026-08-20 #28).
+  #
+  # `handle_call(:flush_now, ...)` parks the caller in `flush_waiters` and self-sends
+  # `:durability_flush`. Two branches of that handler returned `{:noreply, schedule_flush(state)}`
+  # without ever calling `settle_waiters/2`, so the caller blocked the full 60 s
+  # `@flush_now_timeout` and `Fathom.Shards.flush/1` reported `{:error, :flush_timeout}`.
+  #
+  # `flush/1` is the flush-before-fork primitive, so `Tenants.fork(flush_source: true)`, the
+  # `/api/tenants/:id` flush endpoint and export all failed spuriously — while pinning a web or
+  # Oban process for a minute. Review 2026-08-01 #32 fixed exactly this shape for `:fence_skip`
+  # and #11 fixed it in `flush_then_drop/1`; these two branches were missed.
+  describe "#28 — a flush_now waiter is never abandoned" do
+    setup do
+      prev = [
+        timeout: Application.get_env(:fathom, :flush_now_timeout_ms),
+        backoff: Application.get_env(:fathom, :shard_flush_backoff_ms),
+        cap: Application.get_env(:fathom, :shard_flush_max_concurrency)
+      ]
+
+      # Short, so an UNFIXED run fails as a timeout in a second rather than in a minute. Still far
+      # longer than the whole bounded backoff below, so a fixed run is never cut off by it.
+      Application.put_env(:fathom, :flush_now_timeout_ms, 3_000)
+      Application.put_env(:fathom, :shard_flush_backoff_ms, 20)
+      FlushGate.reset()
+
+      on_exit(fn ->
+        FlushGate.reset()
+
+        for {k, v} <- [
+              flush_now_timeout_ms: prev[:timeout],
+              shard_flush_backoff_ms: prev[:backoff],
+              shard_flush_max_concurrency: prev[:cap]
+            ] do
+          if is_nil(v),
+            do: Application.delete_env(:fathom, k),
+            else: Application.put_env(:fathom, k, v)
+        end
+      end)
+
+      :ok
+    end
+
+    test "a dirty coordinator with NO local file answers instead of timing out" do
+      id = "flushnofile_#{System.unique_integer([:positive])}"
+      {:ok, coordinator, ref, path} = Fathom.Shards.checkout(id)
+      on_exit(fn -> for e <- ["", "-wal", "-shm"], do: File.rm(path <> e) end)
+
+      # PRECONDITION, asserted rather than assumed: nothing has been written, so there is no file
+      # for a flush to upload. A fixture that quietly created one would make this test pass by
+      # never reaching the branch under test.
+      refute File.exists?(path),
+             "the fixture created a file; this test never reaches the no-file branch"
+
+      # The documented way this state is reached in production: a `WriteCounter` restart
+      # broadcasts `:write_counter_reset`, which marks EVERY open coordinator dirty at once —
+      # including ones that never created a file.
+      send(coordinator, :write_counter_reset)
+      _ = :sys.get_state(coordinator)
+      assert Fathom.Shard.dirty?(coordinator), "the reset did not mark this coordinator dirty"
+
+      assert Fathom.Shards.flush(id) == :ok,
+             "a flush_now waiter on a fileless coordinator was never settled. The re-armed timer " <>
+               "hits the same branch every interval, so it blocks the full timeout and every " <>
+               "flush-before-fork caller fails on a shard with provably nothing to make durable."
+
+      Fathom.Shard.checkin(coordinator, ref)
+    end
+
+    test "a saturated flush gate answers the waiter instead of backing off forever" do
+      Application.put_env(:fathom, :shard_flush_max_concurrency, 1)
+      FlushGate.reset()
+
+      id = "flushgatefull_#{System.unique_integer([:positive])}"
+      {:ok, coordinator, ref, path} = Fathom.Shards.checkout(id)
+      on_exit(fn -> for e <- ["", "-wal", "-shm"], do: File.rm(path <> e) end)
+
+      {:ok, conn} = Fathom.Shard.Connection.open(path)
+      {:ok, _} = Fathom.Shard.Connection.query(conn, "CREATE TABLE t (a)", [])
+      Fathom.Shard.Connection.close(conn)
+      send(coordinator, :write_counter_reset)
+      _ = :sys.get_state(coordinator)
+
+      assert File.exists?(path), "the fixture wrote no file, so the gate branch is not reached"
+      assert Fathom.Shard.dirty?(coordinator)
+
+      # Hold the only slot from the TEST process, so every acquire the coordinator attempts is
+      # refused for the whole call.
+      assert :ok = FlushGate.try_acquire()
+
+      # A definite, retryable answer — not `:flush_timeout`, which says nothing about why.
+      assert Fathom.Shards.flush(id) == {:error, :flush_gate_full},
+             "a flush_now waiter backed off against a full gate forever. Combined with a leaked " <>
+               "gate slot (#15) it never converges at all: the caller burns the whole timeout " <>
+               "while the coordinator is, correctly, doing nothing."
+
+      FlushGate.release()
+      Fathom.Shard.checkin(coordinator, ref)
+    end
+  end
 end

@@ -1501,8 +1501,23 @@ defmodule Fathom.Shard do
         {:noreply, schedule_flush(state)}
 
       # Nothing written to disk yet (brand-new shard).
+      #
+      # SETTLE THE WAITERS (expert review 2026-08-20 #28). This branch is not merely the
+      # brand-new-shard case it was written for: `flush_then_drop/1`'s own comment records that a
+      # `WriteCounter` restart broadcasts `:write_counter_reset`, which sets `flushed_through: -1`
+      # and marks EVERY open coordinator dirty at once — including ones that never created a file.
+      # A `:flush_now` caller parked in `flush_waiters` then hit this branch every interval and was
+      # never answered, blocking the full 60 s `@flush_now_timeout` before `Fathom.Shards.flush/1`
+      # mapped the exit to `{:error, :flush_timeout}`. That is the flush-before-fork primitive, so
+      # `Tenants.fork(flush_source: true)`, the `/api/tenants/:id` flush endpoint and export all
+      # failed spuriously — on a shard where there is provably nothing to make durable — while
+      # pinning a web or Oban process for a minute.
+      #
+      # `:ok` rather than an error, and it is sound: every write goes through SQLite to
+      # `state.path`, so no file means no writes landed. The dirty flag here is a conservative
+      # UNKNOWN, not evidence of anything to upload.
       not File.exists?(state.path) ->
-        {:noreply, schedule_flush(state)}
+        {:noreply, schedule_flush(settle_waiters(state, :nothing_to_flush))}
 
       true ->
         # Node-wide concurrent-flush cap (expert review #17): over the cap, reschedule with a short
@@ -1511,7 +1526,7 @@ defmodule Fathom.Shard do
         # :disabled (no cap configured — the default) and :ok (slot reserved) both proceed to flush.
         case FlushGate.try_acquire() do
           :full ->
-            {:noreply, schedule_flush_backoff(state)}
+            {:noreply, gate_full(state)}
 
           gate ->
             # Capture the write count BEFORE snapshotting: a write landing during the snapshot/upload
@@ -3003,9 +3018,40 @@ defmodule Fathom.Shard do
     end
   end
 
+  # There is no local file, so there is nothing this node could upload and nothing the caller's
+  # completed writes are waiting on. Distinct from `:flushed` because that clause re-kicks while
+  # `unflushed?/1` is true — and a `WriteCounter` reset leaves a fileless coordinator marked dirty
+  # forever, so `:flushed` here would rekick to `:flush_not_converging` and report a failure for a
+  # shard that has nothing to fail at. See the `not File.exists?` branch of `:durability_flush`.
+  defp settle_waiters(state, :nothing_to_flush) do
+    for w <- state.flush_waiters, do: GenServer.reply(w, :ok)
+    %{state | flush_waiters: [], flush_rekicks: 0}
+  end
+
   defp settle_waiters(state, {:error, _reason} = err) do
     for w <- state.flush_waiters, do: GenServer.reply(w, err)
     %{state | flush_waiters: []}
+  end
+
+  # The node-wide flush cap is full (expert review 2026-08-20 #28). With no waiter this is the
+  # original behaviour: back off and try again, staying dirty, which is the safe direction.
+  #
+  # With a waiter it is not, because the wait was unbounded. Backing off forever answered nobody,
+  # and combined with a leaked gate slot (#15) it never converged at all — the caller burned the
+  # whole 60 s timeout while the coordinator was, correctly, doing nothing. So a waiter's patience
+  # is spent against the SAME `@max_flush_rekicks` budget a still-dirty flush uses, and then it is
+  # told plainly. `{:error, :flush_gate_full}` rather than `:flush_timeout` because the two ask for
+  # different responses: this one says the node is saturated and the call is worth retrying, where
+  # a timeout says nothing at all.
+  defp gate_full(%{flush_waiters: []} = state), do: schedule_flush_backoff(state)
+
+  defp gate_full(state) do
+    if state.flush_rekicks < @max_flush_rekicks do
+      schedule_flush_backoff(%{state | flush_rekicks: state.flush_rekicks + 1})
+    else
+      for w <- state.flush_waiters, do: GenServer.reply(w, {:error, :flush_gate_full})
+      schedule_flush_backoff(%{state | flush_waiters: [], flush_rekicks: 0})
+    end
   end
 
   # Reset the consecutive-failure counter on any durable flush. No-op (and silent) on the happy
