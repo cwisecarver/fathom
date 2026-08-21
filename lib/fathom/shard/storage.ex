@@ -84,15 +84,37 @@ defmodule Fathom.Shard.Storage do
   @typedoc """
   How much of a shard's history a copy of it contains — Phase 2 A2.
 
-  Ordered lexicographically by `{epoch, wal_gen, offset}`, which is a total order on "how far
-  along" a copy is: the lease `epoch` increases monotonically per shard (it is already the fencing
-  token), `wal_gen` increases on every checkpoint, and `offset` advances within a generation.
+  Ordered lexicographically by `{epoch, wal_gen, offset}`: `wal_gen` increases on every checkpoint
+  and `offset` advances within a generation.
 
   Exists so a failover can order a node's local **replica** against the **stored object**, which
   nothing else can do — an etag is a content hash with no ordering, the lock carries the holder's
   epoch rather than the object's, and comparing wall-clock across nodes is unsound. The two are
   independent lineages of the same shard, and picking the older one silently loses acknowledged
   writes.
+
+  ## `epoch` IS NOT MONOTONIC ACROSS A RELEASE, and this doc used to claim it was
+
+  This said "the lease `epoch` increases monotonically per shard (it is already the fencing
+  token)". That is false, and expert review 2026-08-20 #8 traced two live consequences to it. The
+  epoch is a **lock generation**, meaningful only while the lock object exists: `release_lease`
+  DELETES that object, and the next `acquire_lease` takes the optimistic `create_lock` path, which
+  starts at **1**. So the epoch climbs on crash-steals and falls back to 1 on the next clean
+  idle-drop, drain or rebalance handoff.
+
+  What that breaks, given two consumers read it as a shard-history counter spanning a release:
+
+    * `FollowerLog.decide/2` rejects `pushed < epoch` as `:stale_epoch` — permanently, because
+      that reason is in `Session`'s `@settled_rejects` and `start_seeds/3` only seeds on
+      `:unknown_shard`. Steal to epoch 2, idle out, re-open at epoch 1, and every follower refuses
+      every push for that tenant until its `Follower` process restarts.
+    * `Promote.fresher?/2` can pick a replica stranded at a HIGHER epoch from a previous ownership
+      generation over an object flushed under a lower post-reset one — the older lineage.
+
+  **Not yet fixed** — the candidate fixes trade against cold-open latency and the storage contract,
+  so the decision is written up in the review's progress file rather than guessed at. Until then:
+  treat `epoch` as ordering-within-one-ownership-generation only, and do not add a third consumer
+  that assumes it counts a shard's history.
   """
   @type position :: %{
           epoch: non_neg_integer(),
