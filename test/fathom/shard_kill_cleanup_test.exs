@@ -48,6 +48,32 @@ defmodule Fathom.ShardKillCleanupTest do
     mon = Process.monitor(pid)
     Process.exit(pid, :kill)
     assert_receive {:DOWN, ^mon, :process, ^pid, :killed}, 2_000
+
+    # AND WAIT FOR THE REGISTRY TO NOTICE. `Registry` unregisters by monitoring, so our DOWN and
+    # its DOWN are two independent messages — the entry can still resolve for a moment after the
+    # process is gone. Idle, that window is microseconds; under a full-suite load it is long
+    # enough that `Lru`'s liveness check reads the shard as still open and the ghost assertion
+    # below fails. (Went red on CI at OTP 28 while 27 and 29 passed, which is the signature of a
+    # timing assumption rather than a real difference.)
+    #
+    # Harmless in production for the same reason it is invisible here: the walk simply spends one
+    # probe slot and the next walk cleans the row.
+    deadline = System.monotonic_time(:millisecond) + 2_000
+
+    Stream.repeatedly(fn ->
+      if Registry.lookup(Fathom.ShardRegistry, id) == [],
+        do: :gone,
+        else: Process.sleep(5)
+    end)
+    |> Enum.find(fn
+      :gone -> true
+      _ -> System.monotonic_time(:millisecond) > deadline
+    end)
+    |> case do
+      :gone -> :ok
+      _ -> flunk("the registry still resolves #{id} after its coordinator died")
+    end
+
     path
   end
 
@@ -107,7 +133,11 @@ defmodule Fathom.ShardKillCleanupTest do
     assert id in Lru.lru_order(100, fn _ -> true end),
            "the fixture never stamped an Lru row for this shard"
 
-    assert Lru.lru_order(100) == [],
+    # Asserted on THIS SHARD, not on the list being empty. A coordinator another test left alive is
+    # a legitimate eviction candidate and has nothing to do with this invariant — the empty-list
+    # form went red on CI (OTP 28, 2026-08-22) for exactly that reason while OTP 27 and 29 passed,
+    # which is the signature of a shared-state assumption rather than a real difference.
+    refute id in Lru.lru_order(100),
            "a dead coordinator's Lru row was returned as an eviction candidate. It costs one of " <>
              "16 probe slots forever, so ~16 of them make a full node refuse every novel open " <>
              "while idle, evictable shards sit just past the probe window."

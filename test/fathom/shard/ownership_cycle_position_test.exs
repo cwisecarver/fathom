@@ -96,6 +96,55 @@ defmodule Fathom.Shard.OwnershipCyclePositionTest do
            "expected legacy mode (nil acquire_gen) — something started the heartbeat"
   end
 
+  # Shippers connect in `handle_continue`, so without this the first commit RACES the connect and
+  # every follower answers `:disconnected` — nothing ships, the follower records offset 0, and the
+  # comparison below has no replica to make. Wins the race when this file runs alone and loses it
+  # under a full-suite load, which is how it reached CI green locally and red there.
+  defp await_connected!(timeout \\ 5_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    Stream.repeatedly(fn ->
+      if Enum.all?(Fleet.shippers(), &Fathom.Shard.Replication.Shipper.connected?/1),
+        do: :connected,
+        else: Process.sleep(20)
+    end)
+    |> Enum.find(fn
+      :connected -> true
+      _ -> System.monotonic_time(:millisecond) > deadline
+    end)
+    |> case do
+      :connected -> :ok
+      _ -> flunk("shippers never connected")
+    end
+  end
+
+  # The first follower with a real recorded position, or fail loudly. Any of them proves the
+  # point: the comparison below is "did a follower that watched this shard end up outranking the
+  # object", and which follower answered first is not part of it.
+  defp await_replica!(followers, id, timeout \\ 5_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    Stream.repeatedly(fn ->
+      found =
+        Enum.find_value(followers, fn {n, _} ->
+          case Follower.state_of(n, id) do
+            %{next_offset: o} = st when o > 0 -> st
+            _ -> nil
+          end
+        end)
+
+      found || Process.sleep(20)
+    end)
+    |> Enum.find(fn
+      %{} -> true
+      _ -> System.monotonic_time(:millisecond) > deadline
+    end)
+    |> case do
+      %{} = st -> st
+      _ -> flunk("no follower ever recorded a position — nothing was actually shipped")
+    end
+  end
+
   defp start_followers!(root, n) do
     for i <- 1..n do
       name = :"oc_f#{i}_#{System.unique_integer([:positive])}"
@@ -134,6 +183,7 @@ defmodule Fathom.Shard.OwnershipCyclePositionTest do
         )
 
         start_supervised!(Fleet)
+        await_connected!()
 
         {:ok, coordinator, ref, path} = Shards.checkout(id)
         assert_mode!(coordinator, @mode)
@@ -151,9 +201,12 @@ defmodule Fathom.Shard.OwnershipCyclePositionTest do
         assert :ok = Session.commit(id, path <> "-wal", coordinator)
 
         # A real follower's real recorded position — not a hand-installed map.
-        [{fname, _} | _] = followers
-        replica = Follower.state_of(fname, id)
-        assert replica, "the follower never recorded a position; nothing was actually shipped"
+        #
+        # POLLED, and for a reason that is the whole design of A2: `ship_quorum/4` returns at the
+        # Q-th ack, so with q=1 the OTHER follower may be the one that answered and this one is
+        # still a straggler when the commit returns. Reading a fixed follower once made this pass
+        # alone and fail under a full-suite load.
+        replica = await_replica!(followers, id)
 
         Connection.close(conn)
         Fathom.Shard.checkin(coordinator, ref)
