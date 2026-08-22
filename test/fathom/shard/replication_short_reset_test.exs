@@ -203,6 +203,20 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
     assert :ok = Session.commit(id, wal, coordinator)
 
+    # QUIESCE THE REAL PRIMARY BEFORE READING STATE, and this is load-bearing rather than tidy.
+    #
+    # `ship_quorum/4` returns at the Q-th ack — here q=1 of 2 followers — so `Session.commit/3`
+    # can return having been satisfied by the OTHER follower while this one still has a push in
+    # flight. That push lands whenever it lands. If it arrives after the read below and before the
+    # crafted frame, `next_offset` has moved and the "short" case is no longer short: the test
+    # fails, intermittently, under load, in CI and never here.
+    #
+    # AGENTS.md records this exact class twice (the straggler note in the seed tests, and three of
+    # the #38/#39 tests that CI caught and the local run did not). Stopping the session makes the
+    # crafted frames the only ones the follower will ever see again, which removes the class rather
+    # than widening a window.
+    Session.stop(id)
+
     state = Follower.state_of(name, id)
 
     assert state.next_offset > 0,
