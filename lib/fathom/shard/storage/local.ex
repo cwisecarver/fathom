@@ -51,7 +51,7 @@ defmodule Fathom.Shard.Storage.Local do
   end
 
   @impl true
-  def flush(shard_id, local_path, expected_etag, position \\ nil) do
+  def flush(shard_id, local_path, expected_etag, position \\ nil, lineage \\ nil) do
     # Model S3's If-Match / If-None-Match:* fence with the content-hash etag: only write if the
     # remote's current etag still matches what the coordinator last saw (or, for a brand-new
     # shard, only if no object exists). A mismatch means a stealer flushed in the window since
@@ -92,6 +92,7 @@ defmodule Fathom.Shard.Storage.Local do
           # flush 412 and the shard self-fence away acknowledged writes.
           with :ok <- Storage.atomic_copy(local_path, remote_path(shard_id)),
                :ok <- write_position(shard_id, position),
+               :ok <- write_lineage(shard_id, lineage),
                {:ok, etag} <- file_etag(remote_path(shard_id)) do
             {:ok, etag}
           end
@@ -112,6 +113,36 @@ defmodule Fathom.Shard.Storage.Local do
 
   defp write_position(shard_id, position) do
     Storage.atomic_write(position_path(shard_id), Storage.encode_position(position))
+  end
+
+  # UNLIKE the position, a `nil` lineage LEAVES any previous value in place. The two are not
+  # symmetric: a stale POSITION describes bytes that moved and would lose writes, while the lineage
+  # describes ownership history and must only ever go up. A caller with no lineage to claim (a
+  # migration copy, a benchmark) has no business erasing the shard's history — and erasing it would
+  # reintroduce exactly the reset this key exists to prevent.
+  defp write_lineage(_shard_id, nil), do: :ok
+
+  defp write_lineage(shard_id, lineage) when is_integer(lineage) do
+    Storage.atomic_write(lineage_path(shard_id), Integer.to_string(lineage))
+  end
+
+  # Not gated on the object existing, unlike `object_position/1`. A lineage outliving its object is
+  # not a lie about bytes — it is a true statement about how many owners this shard has had, and
+  # keeping it is what stops a re-created shard reusing numbers a replica still remembers.
+  def object_lineage(shard_id) do
+    case File.read(lineage_path(shard_id)) do
+      {:ok, raw} ->
+        case Integer.parse(String.trim(raw)) do
+          {n, ""} when n >= 0 -> {:ok, n}
+          _ -> {:ok, nil}
+        end
+
+      {:error, :enoent} ->
+        {:ok, nil}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   @impl true
@@ -159,8 +190,9 @@ defmodule Fathom.Shard.Storage.Local do
   @impl true
   def object_head(shard_id) do
     with {:ok, etag} when not is_nil(etag) <- object_etag(shard_id),
-         {:ok, position} <- object_position(shard_id) do
-      {:ok, %{etag: etag, position: position}}
+         {:ok, position} <- object_position(shard_id),
+         {:ok, lineage} <- object_lineage(shard_id) do
+      {:ok, %{etag: etag, position: position, lineage: lineage}}
     else
       {:ok, nil} -> {:ok, nil}
       {:error, _} = error -> error
@@ -876,6 +908,7 @@ defmodule Fathom.Shard.Storage.Local do
 
   defp remote_path(shard_id), do: Path.join(dir(), "#{shard_id}.db")
   defp position_path(shard_id), do: Path.join(dir(), "#{shard_id}.db.pos")
+  defp lineage_path(shard_id), do: Path.join(dir(), "#{shard_id}.db.lineage")
   defp version_path(shard_id, version), do: Path.join(dir(), "#{shard_id}@#{version}.db")
 
   defp snapshot_path(shard_id, snapshot_id),

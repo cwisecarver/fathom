@@ -181,7 +181,7 @@ defmodule Fathom.Test.FaultyStorage do
   end
 
   @impl true
-  def flush(shard_id, local_path, expected_etag, position \\ nil) do
+  def flush(shard_id, local_path, expected_etag, position \\ nil, lineage \\ nil) do
     # run_before(:flush) lets a test steal the shard (overwrite the object) in the window
     # between the coordinator's fence check and this write, exercising the fenced flush (#15).
     run_before(:flush)
@@ -204,11 +204,11 @@ defmodule Fathom.Test.FaultyStorage do
       # own earlier write, and the "lock still ours" reconcile used to conclude the object was
       # current and mark the shard clean, discarding everything written in between.
       fault() == :flush_lands_then_errors ->
-        _ = Local.flush(shard_id, local_path, expected_etag, position)
+        _ = Local.flush(shard_id, local_path, expected_etag, position, lineage)
         {:error, :s3_unreachable}
 
       true ->
-        Local.flush(shard_id, local_path, expected_etag, position)
+        Local.flush(shard_id, local_path, expected_etag, position, lineage)
     end
   end
 

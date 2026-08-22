@@ -248,21 +248,26 @@ defmodule Fathom.Shard.OwnershipCyclePositionTest do
     end
   end
 
-  # CHARACTERIZATION — this pins behaviour that is WRONG and is deliberately not yet fixed.
+  # THIS WAS A CHARACTERIZATION TEST, AND IT ASSERTED THE OPPOSITE OF WHAT IT DOES NOW.
   #
-  # `release_lease` DELETES the lock object, so the next `acquire_lease` takes the optimistic
-  # create path and starts again at epoch 1. The epoch therefore climbs on crash-steals and RESETS
-  # on every clean idle-drop, drain and rebalance handoff — while `Storage.position`'s consumers
-  # treat it as the high-order component of a total order.
+  # It used to say "the lease epoch RESETS on a clean release — the ordering assumption is
+  # currently false", pinning a known defect (#8, then parked) so the next reader would not
+  # discover it by having a replica promoted over a good object. Its comment predicted "WHEN #8
+  # LANDS, THIS ASSERTION INVERTS."
   #
-  # That is expert review #8, which is PARKED: every candidate fix trades against something
-  # load-bearing (an S3 round trip on the gated `cold_open_p50_us`, or the storage contract), and
-  # the choice is a design decision rather than a bug fix. The typedoc has been corrected to state
-  # the real property; this test states it too, so the next reader does not discover it by having
-  # a replica promoted over a good object.
+  # #8 landed, and the assertion did NOT invert, because the fix that shipped is not the fix that
+  # comment anticipated. The chosen design SPLITS the two meanings that were conflated rather than
+  # making one number serve both:
   #
-  # WHEN #8 LANDS, THIS ASSERTION INVERTS. That is the point of writing it down.
-  test "the lease epoch RESETS on a clean release — the ordering assumption is currently false" do
+  #   * the LOCK epoch stays exactly as it was — a compare-and-swap fencing token, valid only
+  #     while the lock object exists, and therefore still reset by the delete-on-release. That is
+  #     correct for fencing and nothing reads it as an order any more.
+  #   * a separate LINEAGE counter, seeded from the store at open, fills the position stamp's
+  #     `epoch` slot and only ever increases.
+  #
+  # So this test keeps its original assertion, now as a statement of DESIGN rather than of defect,
+  # and the monotonicity it was standing in for is asserted directly by the test below it.
+  test "the lock epoch still resets on a clean release — by design, it is a fencing token" do
     id = "occe_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
@@ -283,11 +288,75 @@ defmodule Fathom.Shard.OwnershipCyclePositionTest do
     Fathom.Shard.checkin(c2, r2)
 
     assert second == first,
-           "the lease epoch changed across a clean release/re-acquire (#{first} -> #{second}). " <>
-             "If it now INCREASES, expert review #8 has landed and this characterization should " <>
-             "become the monotonicity assertion it is standing in for. If it DECREASED, " <>
-             "something else is wrong."
+           "the lock epoch changed across a clean release/re-acquire (#{first} -> #{second}). " <>
+             "It is a fencing token whose lifetime is the lock object's, and release_lease " <>
+             "deletes that object — so this is expected. If it now increases, something changed " <>
+             "release_lease, and the lineage test below is the one that matters."
 
     Shards.stop(id)
+  end
+
+  # THE REGRESSION TEST FOR #8, on the exact path the defect lived on.
+  #
+  # A graceful drop is where the old code was worst: it checkpoints, unlinks the WAL, and
+  # `position_after_checkpoint/2` correctly answers `nil` (ambiguous) — so THERE IS NO POSITION
+  # STAMP TO CARRY A NUMBER. That is precisely why the lineage is its own object metadata key
+  # rather than being read back out of the stamp: a lineage derived from the stamp would find
+  # nothing exactly where it is needed most, and fall back to the resetting lock epoch — the same
+  # bug, one layer down.
+  #
+  # Pre-fix this test fails at the final assertion: both cycles stamped lock epoch 1, so the
+  # lineage never moved. (Verified by reverting lib/ and re-running — it fails with 1 -> 1.)
+  test "the LINEAGE rises across a clean release/re-acquire, where the lock epoch does not" do
+    Application.put_env(:fathom, :replication_enabled, true)
+
+    id = "occl_#{System.unique_integer([:positive])}"
+
+    on_exit(fn ->
+      Shards.drain(id, 5_000)
+      for e <- ["", "-wal", "-shm"], do: File.rm(Fathom.Shard.db_path(id) <> e)
+    end)
+
+    first = ownership_cycle!(id)
+    second = ownership_cycle!(id)
+
+    # PRECONDITIONS. Without these the test passes vacuously on a shard that was never flushed:
+    # `object_head/1` answers `{:ok, nil}` for an absent object, and nil > nil is not a comparison.
+    assert is_integer(first),
+           "the first ownership wrote no lineage — nothing was flushed, so this test measured nothing"
+
+    assert is_integer(second),
+           "the second ownership wrote no lineage — nothing was flushed, so this test measured nothing"
+
+    assert second > first,
+           "the lineage did not advance across a clean release/re-acquire (#{first} -> #{second}). " <>
+             "release_lease DELETES the lock, so the next acquire starts at epoch 1 again; if the " <>
+             "stamped number tracks that, a replica holding a number from an earlier ownership " <>
+             "outranks the object and Promote.fresher?/2 serves the replica over a good database."
+  end
+
+  # One full acquire → write → flush → drop → release, returning the lineage the object was left
+  # holding. The WriteCounter bump is not decoration: flushes are write-gated, and a shard written
+  # through a raw Connection (rather than ShardExecutor) is never marked dirty — so without it the
+  # graceful stop skips the upload entirely and both cycles return nil.
+  defp ownership_cycle!(id) do
+    {:ok, coordinator, ref, path} = Shards.checkout(id)
+
+    {:ok, conn} = Connection.open(path)
+    {:ok, _} = Connection.query(conn, "CREATE TABLE IF NOT EXISTS t (a)", [])
+    for n <- 1..10, do: {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?1)", [n])
+    Connection.close(conn)
+
+    Fathom.Shard.WriteCounter.bump(id)
+    Fathom.Shard.checkin(coordinator, ref)
+
+    mon = Process.monitor(coordinator)
+    :ok = Shards.stop(id)
+    assert_receive {:DOWN, ^mon, :process, ^coordinator, _}, 10_000
+
+    case Storage.object_head(id) do
+      {:ok, %{lineage: lineage}} -> lineage
+      {:ok, nil} -> nil
+    end
   end
 end

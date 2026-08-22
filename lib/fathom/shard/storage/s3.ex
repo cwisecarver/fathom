@@ -85,6 +85,13 @@ defmodule Fathom.Shard.Storage.S3 do
   # `--warnings-as-errors` enforces definition-before-use for attributes.
   @sentinel_meta "x-amz-meta-fathom-sentinel"
 
+  # The shard's LINEAGE counter (expert review 2026-08-20 #8) — a per-shard integer that only ever
+  # increases, one step per ownership. Deliberately its own key rather than being read back out of
+  # `@pos_meta`: the position stamp is `nil` on the ordinary graceful-drop path (an empty WAL both
+  # before and after the flush is genuinely ambiguous), so a lineage derived from it would be
+  # missing exactly where it is needed.
+  @lineage_meta "x-amz-meta-fathom-lineage"
+
   @doc """
   Name of the dedicated Finch pool that carries all S3 traffic.
   """
@@ -272,7 +279,7 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   @impl true
-  def flush(shard_id, local_path, expected_etag, position \\ nil) do
+  def flush(shard_id, local_path, expected_etag, position \\ nil, lineage \\ nil) do
     # If-Match the etag we last saw (or If-None-Match:* for a brand-new shard), so the PUT
     # only lands if the object hasn't changed under us. A 412 means a stealer flushed in the
     # window since our fence check → superseded, don't clobber (finding #15). Return the new
@@ -292,7 +299,7 @@ defmodule Fathom.Shard.Storage.S3 do
                    # Etag-form-independent integrity hash (expert review 2026-07-14 #17), over the
                    # UNCOMPRESSED bytes (#38).
                    {@md5_meta, md5_hex} | cond_headers
-                 ] ++ enc_headers ++ pos_meta_header(position)
+                 ] ++ enc_headers ++ pos_meta_header(position) ++ lineage_meta_header(lineage)
              ) do
         case resp.status do
           s when s in 200..299 -> {:ok, etag(resp.headers)}
@@ -538,6 +545,18 @@ defmodule Fathom.Shard.Storage.S3 do
       {:ok, new_etag} when not is_nil(new_etag) and new_etag != old_etag -> {:ok, new_etag}
       {:ok, unmoved} -> {:error, {:touch_no_rotation, unmoved}}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # A lineage that will not parse is treated as ABSENT, never as 0. Zero is a real value meaning
+  # "nothing has been stamped", and inventing it from a corrupt header would let a fresh owner
+  # reuse a number a previous one already used.
+  defp parse_lineage(nil), do: nil
+
+  defp parse_lineage(raw) do
+    case Integer.parse(String.trim(raw)) do
+      {n, ""} when n >= 0 -> n
+      _ -> nil
     end
   end
 
@@ -837,6 +856,9 @@ defmodule Fathom.Shard.Storage.S3 do
   defp pos_meta_header(nil), do: []
   defp pos_meta_header(pos), do: [{@pos_meta, Storage.encode_position(pos)}]
 
+  defp lineage_meta_header(nil), do: []
+  defp lineage_meta_header(n) when is_integer(n), do: [{@lineage_meta, Integer.to_string(n)}]
+
   defp verify_md5(_digest, nil), do: :ok
 
   defp verify_md5(digest, etag) do
@@ -1083,7 +1105,12 @@ defmodule Fathom.Shard.Storage.S3 do
   def object_head(shard_id) do
     case Req.head(req(), url: object_path(shard_id)) do
       {:ok, %{status: 200, headers: h}} ->
-        {:ok, %{etag: etag(h), position: Storage.parse_position(header_value(h, @pos_meta))}}
+        {:ok,
+         %{
+           etag: etag(h),
+           position: Storage.parse_position(header_value(h, @pos_meta)),
+           lineage: parse_lineage(header_value(h, @lineage_meta))
+         }}
 
       {:ok, %{status: 404}} ->
         {:ok, nil}

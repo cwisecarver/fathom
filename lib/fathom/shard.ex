@@ -66,6 +66,7 @@ defmodule Fathom.Shard do
     WriteCounter
   }
 
+  alias Fathom.Shard.Replication.Fleet
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Promote
   alias Fathom.Shard.Replication.Recovery
@@ -550,7 +551,11 @@ defmodule Fathom.Shard do
       #
       # It cannot fail the open either, which is why it needs no error channel: a promotion that
       # does not happen leaves the ordinary path, and the ordinary path is correct.
-      etag = maybe_promote_replica(shard_id, path, lease, etag1)
+      # Computed BEFORE the promote, and passed into it, so that a promoted replica and every
+      # later flush of this coordinator stamp the SAME lineage — they are one ownership. See
+      # open_lineage/1 for why it is read once and never recomputed.
+      lineage = open_lineage(shard_id)
+      etag = maybe_promote_replica(shard_id, path, lease, etag1, lineage)
 
       # No idle timer yet: a coordinator is always checked out right after it
       # starts, and the timer is (re)armed only when the last connection checks
@@ -576,6 +581,10 @@ defmodule Fathom.Shard do
         ttl_ms: ttl,
         renew_timer: nil,
         acquire_gen: acquire_gen,
+        # The lineage counter every position stamp from this coordinator carries in its `epoch`
+        # slot (expert review 2026-08-20 #8). Fixed for the coordinator's life; see open_lineage/1
+        # and stamp_epoch/1. `:disabled` when replication is off, which is the no-op default.
+        lineage: lineage,
         # The current etag of the remote object (nil = brand-new / no object yet). The flush
         # fence If-Matches it so a stale PUT can't clobber a stealer (finding #15); each
         # successful flush advances it.
@@ -1572,7 +1581,15 @@ defmodule Fathom.Shard do
             # moves into it. fence_ctx carries the lease/ttl/acquire_gen the fence needs;
             # snapshot_state what flush_and_reconcile needs.
             fence_ctx = fence_ctx(state)
-            snapshot_state = Map.take(state, [:id, :path, :etag, :lease])
+
+            # `:lineage` is in this list because the flush STAMPS it (expert review 2026-08-20 #8),
+            # and leaving it out is not a subtle failure: `lineage_to_store/1` is reached through a
+            # STRICT `state.lineage`, so an omission raises inside the task and every flush stops
+            # writing a position stamp. That is deliberate. A `Map.get` default here would have
+            # made the same omission silent — a shard flushing with no stamp forever, which is the
+            # `carry_meta` failure mode (a hand-picked key list that quietly loses an entry) one
+            # layer up.
+            snapshot_state = Map.take(state, [:id, :path, :etag, :lease, :lineage])
 
             # THE SLOT IS RESERVED BEFORE THE STATE THAT OWNS ITS RELEASE EXISTS (expert review
             # 2026-08-20 #15) — the same class AGENTS.md records for `acquire_lease` → built state.
@@ -2090,7 +2107,13 @@ defmodule Fathom.Shard do
       :ok ->
         # The WAL has just been folded into the database, so the object holds everything through
         # the end of `pre`'s generation — see flush_position/2 for why that is claimed as gen + 1.
-        Storage.flush(state.id, state.path, state.etag, flush_position(state, pre))
+        Storage.flush(
+          state.id,
+          state.path,
+          state.etag,
+          flush_position(state, pre),
+          lineage_to_store(state.lineage)
+        )
 
       # Integrity failed (expert review 2026-07-14 #4). The checkpoint-then-raw-upload fast path
       # uploads the bytes as-is, so a locally corrupted db (disk/fs/memory fault, exqlite/OS bug)
@@ -2421,6 +2444,50 @@ defmodule Fathom.Shard do
     end
   end
 
+  # --- A2 lineage -----------------------------------------------------------------------
+
+  # The lineage counter this coordinator stamps for its whole life (expert review 2026-08-20 #8).
+  #
+  # WHY IT EXISTS. The position stamp's `epoch` slot used to carry the LOCK epoch, and the lock
+  # epoch is not monotonic: `release_lease` DELETES the lock object, so the next `acquire_lease`
+  # takes the optimistic create path and starts again at 1. The number therefore climbed on
+  # crash-steals and RESET on every clean idle-drop, drain and rebalance handoff — while
+  # `Promote.fresher?/2` and the replication ordering read it as the high-order component of a
+  # total order. A shard that had been dropped cleanly could be outranked by a replica holding a
+  # number from an earlier ownership.
+  #
+  # READ ONCE, NEVER RECOMPUTED. Within one ownership the order is (lineage, wal_gen, offset). A
+  # lineage that moved between two of this coordinator's own flushes would make its own stamps
+  # incomparable, which is worse than the bug being fixed.
+  #
+  # THREE ANSWERS, and each means something different downstream (see stamp_epoch/1):
+  #
+  #   `:disabled` — replication is off. The whole computation is skipped, INCLUDING the HEAD, so
+  #     an ordinary node allocates nothing and pays no extra round trip. Nothing consumes the
+  #     epoch slot as an ordering key with A2 off, so the lock epoch stays in it exactly as
+  #     before — which is what keeps the gated `cold_open_p50_us` and `fanout_kb_per_shard`
+  #     paths bit-for-bit unchanged.
+  #   integer — the lineage to stamp.
+  #   `:unknown` — replication is ON but the store could not be read. A warm open does not touch
+  #     the store for its bytes, so this is reachable while still serving correctly. There is no
+  #     lineage to claim, so nothing is stamped and the object becomes un-overridable — the same
+  #     safe direction flush_position/2 already takes for an unreadable WAL.
+  defp open_lineage(shard_id) do
+    # Gate first and return an atom, mirroring promote_on_open?/0 at the call site above: a node
+    # that has not enabled replication must not pay for a feature it does not run.
+    # `Fleet.replicating?/0`, the owned predicate, rather than a re-inlined config read: the
+    # lineage rides the SHIPPING gate, not the listen gate. A node that ships is a node whose
+    # stamps get compared against replicas; a node that only receives has no stamps of its own.
+    if Fleet.replicating?() do
+      case Storage.object_head(shard_id) do
+        {:ok, head} -> Storage.next_lineage(head)
+        {:error, _} -> :unknown
+      end
+    else
+      :disabled
+    end
+  end
+
   # --- A2 promote-on-open ---------------------------------------------------------------
   #
   # A survivor may hold a REPLICA of this shard that is newer than the stored object — that is the
@@ -2436,11 +2503,11 @@ defmodule Fathom.Shard do
   # ahead of what the object claims, the object's claim is an over-claim by construction
   # (`flush_position/1`), and an unstamped object is never overridable at all — so an object
   # written before stamping existed, or by a node that has not been upgraded, is left alone.
-  defp maybe_promote_replica(shard_id, path, lease, etag) do
+  defp maybe_promote_replica(shard_id, path, lease, etag, lineage) do
     # The gate is checked FIRST and returns the caller's own binding, so a node that has not
     # enabled this allocates nothing at all on its open path. See the note at the call site.
     if promote_on_open?() do
-      try_promote(shard_id, path, lease, etag)
+      try_promote(shard_id, path, lease, etag, lineage)
     else
       etag
     end
@@ -2457,19 +2524,19 @@ defmodule Fathom.Shard do
   # concurrent round trip to each peer. That is the price of closing the RPO gap on a failover the
   # LB routed to a node holding no replica, and it is why `Recovery` is a separate gate rather than
   # part of `:replication_promote_on_open`.
-  defp try_promote(shard_id, path, lease, etag) do
+  defp try_promote(shard_id, path, lease, etag, lineage) do
     if Recovery.enabled?() do
-      try_promote_from_fleet(shard_id, path, lease, etag)
+      try_promote_from_fleet(shard_id, path, lease, etag, lineage)
     else
-      try_promote_local(shard_id, path, lease, etag)
+      try_promote_local(shard_id, path, lease, etag, lineage)
     end
   end
 
-  defp try_promote_local(shard_id, path, lease, etag) do
+  defp try_promote_local(shard_id, path, lease, etag, lineage) do
     with replica when replica != nil <- replica_state(shard_id),
          {:ok, stamp} <- Storage.object_position(shard_id),
          true <- Promote.fresher?(replica, stamp) do
-      promote_replica(shard_id, path, lease, etag, replica, stamp)
+      promote_replica(shard_id, path, lease, etag, replica, stamp, lineage)
     else
       _ -> etag
     end
@@ -2491,14 +2558,14 @@ defmodule Fathom.Shard do
   # and a flush landing in there left the promote decision resting on a version that no longer
   # exists. That was never unsafe — the fenced publish 412s — but the cost was a whole transfer, a
   # snapshot, and a log line claiming the object was behind when by then it was not.
-  defp try_promote_from_fleet(shard_id, path, lease, etag) do
+  defp try_promote_from_fleet(shard_id, path, lease, etag, lineage) do
     started = System.monotonic_time(:millisecond)
 
     with {:ok, head} <- Storage.object_head(shard_id),
          {:ok, replica} <- Recovery.best_replica(shard_id, position_of(head)),
          true <- Promote.fresher?(replica, position_of(head)),
          :ok <- recheck_object(shard_id, head, replica, started) do
-      promote_replica(shard_id, path, lease, etag, replica, position_of(head))
+      promote_replica(shard_id, path, lease, etag, replica, position_of(head), lineage)
     else
       _ -> etag
     end
@@ -2587,7 +2654,7 @@ defmodule Fathom.Shard do
   # one that cannot be shrugged off — the object is now the replica while the local file is not —
   # so it fails the open, which releases the lease and lets a clean open pull the bytes we just
   # published.
-  defp promote_replica(shard_id, path, lease, etag, replica, stamp) do
+  defp promote_replica(shard_id, path, lease, etag, replica, stamp, lineage) do
     temp = "#{path}.promote.#{System.unique_integer([:positive])}"
     follower = Follower
 
@@ -2595,7 +2662,13 @@ defmodule Fathom.Shard do
       with :ok <- snapshot_before_promotion(shard_id),
            :ok <- Promote.stage(follower, shard_id, temp),
            {:ok, new_etag} <-
-             Storage.flush(shard_id, temp, etag, flush_position(%{lease: lease, path: temp})) do
+             Storage.flush(
+               shard_id,
+               temp,
+               etag,
+               flush_position(%{lease: lease, path: temp, lineage: lineage}),
+               lineage_to_store(lineage)
+             ) do
         case File.rename(temp, path) do
           :ok ->
             Enum.each(["-wal", "-shm"], &File.rm(path <> &1))
@@ -3136,7 +3209,42 @@ defmodule Fathom.Shard do
   # live read still happens after, and still wins whenever the WAL survives.
   defp flush_position(state), do: flush_position(state, {:ok, :empty})
 
-  defp flush_position(%{lease: %{epoch: epoch}} = state, pre) when is_integer(epoch) do
+  defp flush_position(state, pre) do
+    case stamp_epoch(state) do
+      nil -> nil
+      epoch -> flush_position(state, pre, epoch)
+    end
+  end
+
+  # What fills the position stamp's `epoch` slot (expert review 2026-08-20 #8). Three inputs, and
+  # the lease is required by ALL of them: no lease means no ownership to order, which is the
+  # pre-existing rule this keeps.
+  #
+  #   integer lineage — stamp it. Unlike the lock epoch it never resets. See open_lineage/1.
+  #   `:unknown`      — replication is on but no lineage could be read at open. Stamp NOTHING; an
+  #                     absent stamp reads as "unknown" and makes the object un-overridable, the
+  #                     same safe answer this function gives for an unreadable WAL.
+  #   `:disabled`     — replication is off. Leave the LOCK epoch in the slot exactly as before, so
+  #                     a non-replicating node is bit-for-bit unchanged. The `Map.get` default
+  #                     covers the synthetic states built by callers that carry no lineage key.
+  defp stamp_epoch(%{lease: %{epoch: lock}} = state) when is_integer(lock) do
+    case Map.get(state, :lineage, :disabled) do
+      n when is_integer(n) -> n
+      :unknown -> nil
+      :disabled -> lock
+    end
+  end
+
+  defp stamp_epoch(_state), do: nil
+
+  # What gets WRITTEN to the object's own lineage metadata key, as opposed to what fills the
+  # position stamp. Only a real integer: `:disabled` and `:unknown` both mean "this coordinator has
+  # no lineage to claim", and the backends take `nil` as leave-any-previous-value-alone. Erasing a
+  # shard's lineage would reintroduce exactly the reset the key exists to prevent.
+  defp lineage_to_store(n) when is_integer(n), do: n
+  defp lineage_to_store(_), do: nil
+
+  defp flush_position(state, pre, epoch) do
     case Fathom.Shard.Replication.Wal.read(state.path <> "-wal") do
       # commit_extent, not `size` (expert review 2026-08-20 #5): the file length is a high-water
       # mark that can include frames from a rolled-back transaction. A follower's position is
@@ -3152,8 +3260,6 @@ defmodule Fathom.Shard do
         nil
     end
   end
-
-  defp flush_position(_state, _pre), do: nil
 
   # The WAL is empty or gone AFTER the flush. What that means depends entirely on what was there
   # BEFORE, and the two cases are opposite.
@@ -3190,7 +3296,13 @@ defmodule Fathom.Shard do
            :ok <- snapshot(state.path, temp),
            :ok <- recheck_before_put(state),
            {:ok, new_etag} <-
-             Storage.flush(state.id, temp, state.etag, flush_position(state, pre)) do
+             Storage.flush(
+               state.id,
+               temp,
+               state.etag,
+               flush_position(state, pre),
+               lineage_to_store(state.lineage)
+             ) do
         {:ok, new_etag}
       else
         {:error, :superseded} = superseded ->

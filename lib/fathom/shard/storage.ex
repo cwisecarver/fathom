@@ -182,6 +182,31 @@ defmodule Fathom.Shard.Storage do
             ) ::
               {:ok, String.t()} | {:error, :superseded} | {:error, term()}
 
+  # As `c:flush/4`, plus the shard's LINEAGE counter (expert review 2026-08-20 #8).
+  #
+  # The lineage is what the position stamp's `epoch` field carries. It exists because the LOCK
+  # epoch — which used to fill that slot — is not monotonic: `release_lease` deletes the lock, so
+  # the next `acquire_lease` takes the optimistic create path and starts again at 1. The number
+  # therefore climbed on crash-steals and RESET on every clean idle-drop, drain and rebalance
+  # handoff, while two consumers treated it as the high-order component of a total order.
+  #
+  # It is a SEPARATE metadata key rather than being read back out of the position stamp, and that
+  # is load-bearing: `position_after_checkpoint/2` deliberately answers `nil` when the WAL is empty
+  # both before and after a flush, which is the ordinary graceful-drop path. Deriving the lineage
+  # from the stamp would therefore find nothing exactly where it is needed most and fall back to
+  # the resetting lock epoch — the same bug, one layer down.
+  #
+  # `nil` writes no lineage, for the same reason `nil` writes no position: a caller outside the
+  # coordinator's flush paths has no ownership history to claim.
+  @callback flush(
+              shard_id :: String.t(),
+              local_path :: Path.t(),
+              expected_etag :: String.t() | nil,
+              position :: position() | nil,
+              lineage :: non_neg_integer() | nil
+            ) ::
+              {:ok, String.t()} | {:error, :superseded} | {:error, term()}
+
   # The stored object's position stamp, or `nil` when it has none — an object flushed before
   # stamping existed, or by a caller that passed `nil`. `nil` must be read as "unknown", never as
   # "empty": an unknown stamp means the object can NEVER be overridden by a replica.
@@ -208,7 +233,13 @@ defmodule Fathom.Shard.Storage do
   # `{:ok, nil}` when no object exists — distinct from `{:ok, %{etag: nil, position: nil}}`, which
   # no backend returns; absence is one answer, not a head full of nils.
   @callback object_head(shard_id :: String.t()) ::
-              {:ok, %{etag: String.t() | nil, position: position() | nil} | nil}
+              {:ok,
+               %{
+                 etag: String.t() | nil,
+                 position: position() | nil,
+                 lineage: non_neg_integer() | nil
+               }
+               | nil}
               | {:error, term()}
 
   # Conditional pull, keyed on the caller's currently-held `etag` (an opaque store
@@ -427,6 +458,45 @@ defmodule Fathom.Shard.Storage do
           {:ok, String.t()} | {:error, :superseded} | {:error, term()}
   def flush(shard_id, local_path, expected_etag, position),
     do: backend().flush(shard_id, local_path, expected_etag, position)
+
+  @doc "Fenced flush carrying a position stamp and a lineage counter. See the `c:flush/5` callback."
+  @spec flush(String.t(), Path.t(), String.t() | nil, position() | nil, non_neg_integer() | nil) ::
+          {:ok, String.t()} | {:error, :superseded} | {:error, term()}
+  def flush(shard_id, local_path, expected_etag, position, lineage),
+    do: backend().flush(shard_id, local_path, expected_etag, position, lineage)
+
+  @doc """
+  The next lineage value for `shard_id`, given what the store currently holds.
+
+  Strictly greater than anything previously stamped for this shard, which is the whole property
+  the lock epoch failed to provide. 1 for a shard nothing has ever flushed.
+
+  **The MAX of the two stored numbers, not a preference between them**, and that is the whole
+  subtlety. During a rolling upgrade a shard's object is written alternately by nodes that stamp a
+  lineage and nodes that still stamp the LOCK epoch, and `flush/5`'s `nil` deliberately leaves an
+  existing lineage in place — so the two keys drift apart and EITHER can be the larger. Seeding
+  from the lineage alone would hand out a number below an epoch a not-yet-upgraded peer had
+  already shipped to its replicas, and that replica would then outrank the object: exactly the
+  promotion this counter exists to prevent, reintroduced by the migration to it.
+  """
+  @spec next_lineage(%{lineage: non_neg_integer() | nil, position: position() | nil} | nil) ::
+          pos_integer()
+  def next_lineage(nil), do: 1
+
+  def next_lineage(head) do
+    max(
+      non_neg(Map.get(head, :lineage)),
+      non_neg(
+        case Map.get(head, :position) do
+          %{epoch: e} -> e
+          _ -> nil
+        end
+      )
+    ) + 1
+  end
+
+  defp non_neg(n) when is_integer(n) and n >= 0, do: n
+  defp non_neg(_), do: 0
 
   @doc "The stored object's position stamp, or `nil` if it carries none. See the callback."
   @spec object_position(String.t()) :: {:ok, position() | nil} | {:error, term()}
