@@ -27,6 +27,12 @@ defmodule Fathom.ShardStorageTouchMetaTest do
   is why the fix is "carry every key" rather than "carry this second key": the failure mode is an
   omission from a list, so the list itself is the thing worth pinning.
 
+  **The list survived until 2026-08-22.** The moduledoc above described the right fix and the code
+  still enumerated `[@md5_meta, @pos_meta]`; it was found while adding a third key, which would
+  have been the third chance at the identical omission. `carry_meta/1` now carries every
+  `x-amz-meta-` header, and the first test below is the one that pins the class rather than the
+  instance.
+
   The live-store counterpart lives in `shard_storage_s3_test.exs` (tagged `:s3`), which can assert
   the stamp survives an actual touch.
   """
@@ -36,6 +42,33 @@ defmodule Fathom.ShardStorageTouchMetaTest do
 
   @md5 "x-amz-meta-fathom-md5"
   @pos "x-amz-meta-fathom-pos"
+
+  # THE CLASS, not the instance (2026-08-22). `carry_meta/1` was still a hand-picked list
+  # `[@md5_meta, @pos_meta]` — this file's own moduledoc already said the fix is "carry every key
+  # rather than carry this second key", and the code had not caught up. Found while adding the
+  # lineage key for #8, which would have been the third chance to make the identical omission.
+  #
+  # This is the assertion that closes it: a key nothing in `carry_meta/1` has ever heard of is
+  # carried anyway. It fails against any list-based implementation, however long the list.
+  test "a key the function has never heard of is carried too" do
+    assert {"x-amz-meta-fathom-invented-tomorrow", "42"} in S3.carry_meta(%{
+             "x-amz-meta-fathom-invented-tomorrow" => "42"
+           }),
+           "carry_meta/1 is enumerating a fixed list again. The failure mode is an OMISSION from " <>
+             "that list, and it has already cost this project one silent months-long outage of " <>
+             "promote-on-open and survivor selection."
+  end
+
+  test "non-user headers are not carried — this is user metadata, not a header copy" do
+    carried = S3.carry_meta(%{"content-type" => "application/octet-stream", @md5 => "abc"})
+    assert carried == [{@md5, "abc"}]
+  end
+
+  test "header names are matched case-insensitively, as RFC 9110 requires" do
+    assert {"x-amz-meta-fathom-pos", "7:2:8272"} in S3.carry_meta(%{
+             "X-Amz-Meta-Fathom-Pos" => "7:2:8272"
+           })
+  end
 
   test "the position stamp is carried across a touch" do
     # THE REGRESSION. Deleting `@pos_meta` from `carry_meta/1`'s key list fails only this

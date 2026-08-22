@@ -80,6 +80,11 @@ defmodule Fathom.Shard.Storage.S3 do
   # "unknown" (⇒ never overridable), never as "empty".
   @pos_meta "x-amz-meta-fathom-pos"
 
+  # Marks a placeholder object created by the brand-new steal path (round-2 #7). Lives up here with
+  # the other metadata keys, and ABOVE `carry_meta/1`, because that function's deny list needs it —
+  # `--warnings-as-errors` enforces definition-before-use for attributes.
+  @sentinel_meta "x-amz-meta-fathom-sentinel"
+
   @doc """
   Name of the dedicated Finch pool that carries all S3 traffic.
   """
@@ -478,12 +483,52 @@ defmodule Fathom.Shard.Storage.S3 do
   fabricated one, and an object with no position must stay unstamped rather than acquire a stamp
   that claims an ordering nobody established.
   """
+  # Markers that describe the OBJECT'S ROLE rather than its contents, and must therefore never
+  # survive a copy. Keep this list short and justify every entry: everything here is a key the
+  # carry-by-default rule below would otherwise get right.
+  @never_carried [@sentinel_meta]
+
   @spec carry_meta(map() | keyword()) :: [{String.t(), String.t()}]
   def carry_meta(headers) do
-    for key <- [@md5_meta, @pos_meta],
-        value = header_value(headers, key),
-        do: {key, value}
+    # EVERY USER KEY, NOT A LIST (expert review 2026-08-20 #8's implementation, 2026-08-22).
+    #
+    # This was `for key <- [@md5_meta, @pos_meta]`, and AGENTS.md already describes the fix as
+    # carrying "every user key rather than a hand-picked one (the failure mode is an omission from
+    # a list)" — the code had not caught up with the lesson. The list IS how the original bug
+    # happened: `x-amz-meta-fathom-pos` was added after the md5 and nobody added it here, so every
+    # steal-touch silently erased the stamp, and promote-on-open and survivor selection were both
+    # inert at exactly the moment they exist for. Nothing failed and nothing logged.
+    #
+    # Found again while adding the lineage key: a list would have made the identical omission
+    # available a third time. Enumerating instead means a key added tomorrow is carried by
+    # construction.
+    # ALLOW BY DEFAULT, with a small explicit deny list — not "carry everything", and the
+    # difference matters. `shard_storage_touch_meta_test` already pinned that the SENTINEL marker
+    # must NOT ride along: a touch that carried it would turn a real object into something the
+    # pull path reads as a placeholder. That test blocked the first version of this change and was
+    # right to.
+    #
+    # The two failure modes are not symmetric, which is why the default flipped. Forgetting to ADD
+    # a key to an allow-list is silent: the stamp just vanishes and recovery quietly stops working,
+    # for months. Forgetting to EXCLUDE one is loud: a sentinel where it does not belong breaks a
+    # pull immediately and visibly.
+    for {k, v} <- normalize_headers(headers),
+        String.starts_with?(k, "x-amz-meta-"),
+        k not in @never_carried,
+        do: {k, v}
   end
+
+  # Headers arrive as a map or a keyword list depending on the caller, and header names are
+  # case-insensitive per RFC 9110 — so downcase before matching the prefix.
+  defp normalize_headers(headers) do
+    for {k, v} <- headers do
+      key = k |> to_string() |> String.downcase()
+      {key, value_of(v)}
+    end
+  end
+
+  defp value_of([v | _]), do: to_string(v)
+  defp value_of(v), do: to_string(v)
 
   # The fence is only real if the etag actually moved (round-2 #4): a store whose
   # touch doesn't rotate would leave the zombie's If-Match valid — fail the steal
@@ -673,7 +718,6 @@ defmodule Fathom.Shard.Storage.S3 do
 
   # --- brand-new steal sentinel (round-2 #7) ---
 
-  @sentinel_meta "x-amz-meta-fathom-sentinel"
   @sentinel_body "fathom-brand-new-sentinel"
 
   defp create_sentinel(key) do
