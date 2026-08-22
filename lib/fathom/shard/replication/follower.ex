@@ -992,7 +992,12 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   defp do_handle_push(name, %Protocol.Push{} = push) do
-    case FollowerLog.decide(state_of(name, push.shard_id), push) do
+    # Read ONCE and keep it: the pre-reset state is what says how much of the OUTGOING generation
+    # this follower actually holds, and `absorb_before_reset/4` needs that to decide whether it is
+    # entitled to clear `torn` (#11a).
+    prev = state_of(name, push.shard_id)
+
+    case FollowerLog.decide(prev, push) do
       {:append, new_state} ->
         apply_write(name, push, new_state, :append)
 
@@ -1000,7 +1005,10 @@ defmodule Fathom.Shard.Replication.Follower do
         # A new epoch or a checkpointed WAL: our bytes are meaningless now, so the file is replaced
         # rather than extended — but the pages in the WAL we are about to throw away are NOT
         # meaningless, and absorbing them first is what keeps this replica whole.
-        apply_write(name, push, absorb_before_reset(name, push.shard_id, new_state), :truncate)
+        absorbed =
+          absorb_before_reset(name, push.shard_id, new_state, complete_through_reset?(prev, push))
+
+        apply_write(name, push, absorbed, :truncate)
 
       {:reject, reason, expected} ->
         Protocol.encode_reject(push.shard_id, reason, expected)
@@ -1029,7 +1037,43 @@ defmodule Fathom.Shard.Replication.Follower do
   # behaviour. The replica keeps replicating and is simply not promotable until a seed rebuilds it,
   # which is strictly better than serving a torn pair. Success clears the flag, because the two
   # files are now back in step.
-  defp absorb_before_reset(name, shard_id, new_state) do
+  # Did this follower hold the WHOLE of the generation the reset is replacing? (expert review
+  # 2026-08-20 #11a — the mechanism #11b did not fix.)
+  #
+  # `prev_extent` is the primary's last shipped extent in the OUTGOING generation. A follower short
+  # of it never received that generation's tail, so the WAL it is about to absorb is INCOMPLETE —
+  # and absorbing an incomplete WAL yields a database that opens cleanly, passes `quick_check`, and
+  # is quietly missing writes. `absorb_before_reset/4` then cleared `torn` and laundered it into a
+  # promotable replica.
+  #
+  # **The follower cannot detect this alone**, which is the entire reason the field had to cross
+  # the wire: a reset carries no statement about the generation it replaces, so "my offset is 4096"
+  # is indistinguishable from complete and from four frames short.
+  #
+  # 0 means the primary made NO STATEMENT — an un-upgraded peer that never sets the field, or a
+  # generation in which nothing was ever shipped. Both must read as "no evidence of a gap": marking
+  # a replica torn on absence would make every replica in the fleet un-promotable for the length of
+  # a rolling upgrade, which is the failure this subsystem exists to prevent, arriving by the door
+  # marked safety.
+  #
+  # The PRIMARY-side half of #11a — sending a full seed instead of a reset when a follower is known
+  # short — is deliberately NOT here. Seeds are the expensive operation A2 exists to avoid, and
+  # AGENTS.md records ~10k `:already_in_flight` rejects per node at 512 tenants; a rule that turns
+  # "behind at a generation boundary" into "ship the whole database" needs the rig's seed rate
+  # measured first or it converts a lag spike into a seed storm. The follower-side half stands
+  # alone: it refuses to CLAIM completeness it cannot prove, which is strictly safe on its own.
+  defp complete_through_reset?(_prev, %Protocol.Push{prev_extent: prev}) when prev in [0, nil],
+    do: true
+
+  defp complete_through_reset?(%{next_offset: held}, %Protocol.Push{prev_extent: prev})
+       when is_integer(held),
+       do: held >= prev
+
+  # No prior state at all: the reset IS the first frame for this shard, so there is no partial
+  # generation to be short of.
+  defp complete_through_reset?(_prev, _push), do: true
+
+  defp absorb_before_reset(name, shard_id, new_state, complete?) do
     db = db_path(name, shard_id)
     wal = wal_path(name, shard_id)
 
@@ -1037,6 +1081,18 @@ defmodule Fathom.Shard.Replication.Follower do
     # it is simply new — `apply_write` is about to lay down a whole generation from offset 0.
     if File.exists?(db) and wal_bytes(wal) > 0 do
       case checkpoint_into_db(db) do
+        :ok when not complete? ->
+          # The checkpoint SUCCEEDED and the replica is still torn, which is the whole point: the
+          # local move was fine, the INPUT to it was short. Absorbing incomplete pages produces a
+          # database that looks healthy, so the flag is the only thing standing between it and a
+          # promotion.
+          Logger.warning(
+            "shard #{shard_id}: absorbed a SHORT WAL before a reset — this replica was behind at " <>
+              "the generation boundary and stays torn; it will not be promoted until it is re-seeded"
+          )
+
+          new_state
+
         :ok ->
           %{new_state | torn: false}
 

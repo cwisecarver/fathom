@@ -152,9 +152,27 @@ endpoints that cannot answer. Two consequences kept:
 - **Shipping and receiving are separate gates** (`REPLICATION_ENABLED` / `REPLICATION_LISTEN`). A
   node can hold others' replicas without replicating its own shards, and a safe rollout turns
   listening on fleet-wide *first*. One flag cannot express that order.
-- **The replication port is unauthenticated**, so `REPLICATION_BIND_IP` is a security control
-  rather than tuning: unset, `:gen_tcp` binds every interface. The boot line names the interface it
-  bound and says so when it is `0.0.0.0`.
+- **`REPLICATION_BIND_IP` is a security control** rather than tuning: unset, `:gen_tcp` binds every
+  interface. The boot line names the interface it bound and says so when it is `0.0.0.0`. In prod,
+  listening on a wildcard now REFUSES TO BOOT.
+- **The replication port was unauthenticated until 2026-08-22**, and the posture statement the
+  2026-08-20 review asked for is this, in these words: *a reachable replication port was equivalent
+  to write access to every shard on the node.* Anyone who could open a TCP connection could seed a
+  forged replica for any shard and have it promoted over the tenant's durable object. There was no
+  credential in the protocol and no peer allowlist; network reachability was the whole control.
+
+  `REPLICATION_SIGN_FRAMES` + `REPLICATION_HMAC_REQUIRED` close that (`Fathom.Shard.Replication.FrameAuth`).
+  **Both default off**, and the rollout is ordered — deploy, then sign fleet-wide, then require —
+  for the same reason `REPLICATION_LISTEN` must precede `REPLICATION_ENABLED`. Until you have run
+  that rollout, the sentence above still describes your fleet. See
+  [`runbooks/replication-frame-auth.md`](runbooks/replication-frame-auth.md).
+
+  **What it does not do**: the signature covers the frame HEADER, not the payload. It stops an
+  unauthenticated peer from constructing an acceptable frame at all, which is the threat it is
+  sized for. It does not attest the WAL bytes against an on-path attacker who can rewrite an
+  authenticated peer's traffic — there is no TLS here. Hashing up to `REPLICATION_MAX_PUSH_BYTES`
+  of WAL on the commit path was judged too expensive for that; the trade is recorded in
+  `FrameAuth`'s moduledoc and pinned by a test that fails if payload coverage is ever added.
 
 Proven multi-node on the chaos rig (`./chaos.sh replication`): all five nodes accept from their
 peers, and with shipping on, a write to `acme` on its home node lands as a replica on all four

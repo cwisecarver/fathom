@@ -647,9 +647,43 @@ defmodule Fathom.Shard.Replication.Session do
             # A reset must arrive at offset 0 or FollowerLog refuses it — the follower has to
             # discard its old generation rather than splice across the seam.
             offset: if(kind == :reset, do: 0, else: off),
+            # How far the generation being DISCARDED got (expert review 2026-08-20 #11a). Only
+            # meaningful on a reset; 0 on an append, where the follower's own offset already says
+            # everything and 0 is the protocol's "no statement".
+            prev_extent: if(kind == :reset, do: outgoing_extent(state, shipper), else: 0),
             payload: Map.fetch!(by_range, {off, len})
           }}
        end}
+    end
+  end
+
+  # The furthest this primary is KNOWN to have shipped in the generation `shipper` is about to
+  # discard — the high-water mark across every follower still sitting in that same generation.
+  #
+  # Why a max across peers rather than the primary's own number: by the time a reset is planned the
+  # outgoing WAL has already been checkpointed away, so its final size is not readable. What IS
+  # readable is where each follower got to, and a peer that reached 8192 in a generation where this
+  # one reached 4096 is positive evidence of 4096 missing bytes.
+  #
+  # Matched on `{wal_gen, salt1}`, not `wal_gen` alone: `ckpt_seq` restarts at 0 when SQLite
+  # recreates a deleted WAL, so the generation number alone would compare two unrelated lineages
+  # and manufacture a gap out of a fresh WAL.
+  #
+  # **The honest limitation**: with a single follower the max is that follower's own offset, so this
+  # never fires and the replica is treated as complete. That is deliberate — it only ever reports a
+  # gap it has EVIDENCE for, and inventing one would mark replicas torn across the fleet. Closing
+  # that case is the primary-side seed rule, deferred pending the rig's seed-rate measurement.
+  defp outgoing_extent(state, shipper) do
+    case Map.get(state.followers, shipper) do
+      %{wal_gen: gen, salt1: salt, offset: own} when is_integer(own) ->
+        state.followers
+        |> Map.values()
+        |> Enum.filter(&match?(%{wal_gen: ^gen, salt1: ^salt, offset: o} when is_integer(o), &1))
+        |> Enum.map(& &1.offset)
+        |> Enum.max(fn -> own end)
+
+      _ ->
+        0
     end
   end
 

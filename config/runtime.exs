@@ -736,6 +736,47 @@ if bind = System.get_env("REPLICATION_BIND_IP") do
   end
 end
 
+# FRAME AUTHENTICATION (expert review 2026-08-20 #3, tier 3). Two flags, and the ORDER between
+# them is the whole safety property.
+#
+# Until this landed, the sentence above — "whoever can reach this port can push WAL frames into any
+# shard this node follows" — was the entire story, and REPLICATION_BIND_IP was the only thing
+# between a misconfigured security group and write access to every tenant on the node. An HMAC over
+# the frame header means an unauthenticated peer cannot construct a frame at all, regardless of
+# where it connects from.
+#
+# ROLLOUT, and it runs in this order or it is an outage:
+#
+#   1. Deploy the code everywhere. Nothing changes: both flags default off, frames go out in the
+#      legacy shape, and every node still accepts them.
+#   2. REPLICATION_SIGN_FRAMES=true fleet-wide. Nodes now emit signed frames (which also carry
+#      #11a's `prev_extent`). Every node already understands them from step 1, so there is no
+#      window in which a peer receives something it cannot parse.
+#   3. REPLICATION_HMAC_REQUIRED=true fleet-wide. Unsigned frames are now refused.
+#
+# Doing 3 before 2 is caught at boot. Doing 2 before 1 is finished is what the ordering above
+# prevents, and it is why signing is a flag rather than unconditional: a node that signed the
+# moment it restarted would be sending frames its not-yet-restarted peers reject, and every shard
+# across that boundary would lose quorum for the length of the deploy.
+#
+# There is deliberately NO permissive middle value. A mode that accepts what it cannot verify is
+# not a control, and the ones that ship as temporary never get turned off.
+if System.get_env("REPLICATION_SIGN_FRAMES") in ~w(true 1) do
+  config :fathom, :replication_sign_frames, true
+end
+
+if System.get_env("REPLICATION_HMAC_REQUIRED") in ~w(true 1) do
+  config :fathom, :replication_hmac_required, true
+end
+
+# The signing key. Derived (never used raw) from REPLICATION_HMAC_SECRET when set, otherwise from
+# HRANA_TOKEN_SECRET — so a fleet already distributing one shared secret does not have to
+# distribute a second, while an operator who wants them rotated independently can have that. Both
+# flags above refuse to boot without one.
+if secret = System.get_env("REPLICATION_HMAC_SECRET") do
+  config :fathom, :replication_hmac_secret, secret
+end
+
 # Where the follower set comes from. `static` (default) is the hand-maintained
 # REPLICATION_FOLLOWERS list; `roster` derives it from the addresses nodes publish to
 # `rebalancer_nodes`, refreshed on a timer, so adding or replacing a node stops meaning "edit every

@@ -30,6 +30,7 @@ defmodule Fathom.Application do
     check_default_shard!()
     check_hrana_exposure!()
     check_replication_exposure!()
+    check_replication_frame_auth!()
     check_replication_disk!()
     check_replication_flush_interval!()
 
@@ -400,6 +401,45 @@ defmodule Fathom.Application do
               "REPLICATION_BIND_IP to the private interface the fleet reaches, or turn " <>
               "REPLICATION_LISTEN off."
     end
+  end
+
+  @doc """
+  Refuse a frame-authentication config that cannot work (expert review 2026-08-20 #3, tier 3).
+
+  Two failures, and neither is survivable at runtime, which is why they are raises rather than
+  warnings — the first silently sends unsigned frames from a node that believes it is signing, and
+  the second refuses every frame the fleet sends it.
+
+  **Not prod-only.** The other exposure guards are, because they trade a real security control
+  against a developer's convenience. These two are pure misconfiguration: there is no environment
+  in which "sign, but with no key" or "require, but with no key" is a thing anyone meant.
+  """
+  @spec check_replication_frame_auth!() :: nil
+  def check_replication_frame_auth! do
+    signing? = Application.get_env(:fathom, :replication_sign_frames, false) == true
+    required? = Application.get_env(:fathom, :replication_hmac_required, false) == true
+
+    if (signing? or required?) and
+         not Fathom.Shard.Replication.FrameAuth.key_configured?() do
+      raise "config error: replication frame authentication is on " <>
+              "(:replication_sign_frames #{signing?}, :replication_hmac_required #{required?}) " <>
+              "but no key is configured. Set REPLICATION_HMAC_SECRET, or HRANA_TOKEN_SECRET which " <>
+              "it derives from. Without a key this node would send frames UNSIGNED while " <>
+              "believing it signs them, and refuse every frame that arrives."
+    end
+
+    # REQUIRING without SIGNING is the rollout run backwards. This node would refuse a peer that
+    # has not enabled signing while itself sending frames that peer will refuse once it does —
+    # the same listen-before-ship ordering A2 already documents, and the same failure mode: every
+    # shard replicated across the boundary loses quorum.
+    if required? and not signing? do
+      raise "config error: :replication_hmac_required is on but :replication_sign_frames is off. " <>
+              "Signing must be enabled fleet-wide BEFORE any node requires it, exactly as " <>
+              "REPLICATION_LISTEN must precede REPLICATION_ENABLED. Turn REPLICATION_SIGN_FRAMES " <>
+              "on everywhere first; see docs/runbooks/replication-frame-auth.md."
+    end
+
+    nil
   end
 
   @doc false

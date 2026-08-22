@@ -34,6 +34,8 @@ defmodule Fathom.Shard.Replication.Protocol do
   ranges arrive over a network that can drop, reorder and duplicate.
   """
 
+  alias Fathom.Shard.Replication.FrameAuth
+
   # 2 (2026-08-11): `Push` and `SeedBegin` gained `salt1`. The follower could not previously see
   # a WAL LINEAGE change — only `wal_gen` crossed the wire — while the primary treated a salt
   # change as a new generation. When SQLite recreates a deleted WAL, `ckpt_seq` restarts at 0 with
@@ -70,6 +72,24 @@ defmodule Fathom.Shard.Replication.Protocol do
   @position_query 9
   @position 10
   @replica_request 11
+
+  # FRAME AUTHENTICATION + `prev_extent` (expert review 2026-08-20 #3 tier 3 and #11a), shipped as
+  # ONE wire revision because both are changes to frames that travel on the commit path and each
+  # would otherwise cost its own ordered rollout.
+  #
+  # STILL `@version 2`, and that is the whole point. Both are new TYPE CODES, exactly like the
+  # recovery frames above: a peer one deploy behind never RECEIVES one, because emitting them is
+  # gated on `FrameAuth.signing?/0` and that gate is not turned on until the code is everywhere.
+  # Bumping the version instead would make `decode/1` refuse every frame from an un-upgraded node
+  # the moment the first node restarted, taking the commit path down fleet-wide for the length of
+  # the rolling upgrade — the cost AGENTS.md records for exactly this decision.
+  #
+  # `@signed` is an ENVELOPE: it carries a tag plus a complete inner frame of any other type, so
+  # one code authenticates all eleven rather than each growing its own signature field. It also
+  # means `seal/1` sits inside the `encode_*` functions and `decode/1` unwraps transparently, so
+  # not one of the ~12 send sites and 4 decode sites in Shipper/Follower/Recovery had to change.
+  @signed 12
+  @push_ext 13
 
   # Which file a chunk belongs to. Explicit rather than splitting one byte stream at `db_size`,
   # so a chunk never straddles the boundary and the follower can assert it received exactly the
@@ -120,7 +140,7 @@ defmodule Fathom.Shard.Replication.Protocol do
   defmodule Push do
     @moduledoc "A primary's frame delta for one shard."
     @enforce_keys [:shard_id, :epoch, :wal_gen, :salt1, :offset, :payload]
-    defstruct [:shard_id, :epoch, :wal_gen, :salt1, :offset, :payload]
+    defstruct [:shard_id, :epoch, :wal_gen, :salt1, :offset, :payload, prev_extent: 0]
 
     @type t :: %__MODULE__{
             shard_id: String.t(),
@@ -128,7 +148,8 @@ defmodule Fathom.Shard.Replication.Protocol do
             wal_gen: non_neg_integer(),
             salt1: non_neg_integer(),
             offset: non_neg_integer(),
-            payload: binary()
+            payload: binary(),
+            prev_extent: non_neg_integer()
           }
   end
 
@@ -144,24 +165,43 @@ defmodule Fathom.Shard.Replication.Protocol do
   def encode_push(%Push{} = p) do
     shard = p.shard_id
 
-    [
-      <<@version::8, @push::8, byte_size(shard)::16, p.epoch::64, p.wal_gen::64, p.salt1::64,
-        p.offset::64>>,
-      shard,
-      p.payload
-    ]
+    # The two shapes are chosen by the SIGNING gate, not by whether `prev_extent` happens to be
+    # set, so that "what this node emits" is one operator-visible decision rather than a per-frame
+    # property nobody can predict. #11a and #3 ride together for that reason.
+    if FrameAuth.signing?() do
+      seal([
+        <<@version::8, @push_ext::8, byte_size(shard)::16, p.epoch::64, p.wal_gen::64,
+          p.salt1::64, p.offset::64, prev_extent(p)::64>>,
+        shard,
+        p.payload
+      ])
+    else
+      [
+        <<@version::8, @push::8, byte_size(shard)::16, p.epoch::64, p.wal_gen::64, p.salt1::64,
+          p.offset::64>>,
+        shard,
+        p.payload
+      ]
+    end
   end
+
+  # 0 means "no statement about the previous generation", and it is deliberately the same value a
+  # genuine zero carries. A generation in which nothing was ever shipped has no extent a follower
+  # could be short of, so both readings lead the follower to the same (non-)action and conflating
+  # them costs a presence byte on every push for nothing.
+  defp prev_extent(%Push{prev_extent: n}) when is_integer(n) and n >= 0, do: n
+  defp prev_extent(_), do: 0
 
   @doc """
   Open a streamed seed. Declares the sizes the chunks must add up to.
   """
   @spec encode_seed_begin(SeedBegin.t()) :: iolist()
   def encode_seed_begin(%SeedBegin{} = s) do
-    [
+    seal([
       <<@version::8, @seed_begin::8, byte_size(s.shard_id)::16, s.epoch::64, s.wal_gen::64,
         s.salt1::64, s.wal_offset::64, s.db_size::64, s.wal_size::64>>,
       s.shard_id
-    ]
+    ])
   end
 
   @doc """
@@ -173,17 +213,17 @@ defmodule Fathom.Shard.Replication.Protocol do
   """
   @spec encode_seed_chunk(String.t(), :db | :wal, non_neg_integer(), binary()) :: iolist()
   def encode_seed_chunk(shard_id, part, seq, bytes) do
-    [
+    seal([
       <<@version::8, @seed_chunk::8, part_code(part)::8, byte_size(shard_id)::16, seq::32>>,
       shard_id,
       bytes
-    ]
+    ])
   end
 
   @doc "Commit a streamed seed: install it and start following the shard."
   @spec encode_seed_end(String.t()) :: iolist()
   def encode_seed_end(shard_id) do
-    [<<@version::8, @seed_end::8, byte_size(shard_id)::16>>, shard_id]
+    seal([<<@version::8, @seed_end::8, byte_size(shard_id)::16>>, shard_id])
   end
 
   @doc """
@@ -197,11 +237,67 @@ defmodule Fathom.Shard.Replication.Protocol do
   """
   @spec encode_seed_abort(String.t()) :: iolist()
   def encode_seed_abort(shard_id) do
-    [<<@version::8, @seed_abort::8, byte_size(shard_id)::16>>, shard_id]
+    seal([<<@version::8, @seed_abort::8, byte_size(shard_id)::16>>, shard_id])
   end
 
   defp part_code(:db), do: @part_db
   defp part_code(:wal), do: @part_wal
+
+  # --- frame authentication -----------------------------------------------------------------
+
+  @doc """
+  Wrap a frame in a signed envelope, or return it untouched when this node does not sign.
+
+  Every `encode_*` ends in this, which is why adding authentication changed no call site: the
+  ~12 places that build a frame and hand it to `:gen_tcp.send/2` are unchanged, and `decode/1`
+  unwraps on the other side.
+
+  A `nil` tag — signing enabled with no key configured — sends the frame UNSIGNED rather than
+  raising on the commit path. `Fathom.Application.check_replication_frame_auth!/0` refuses that
+  combination at boot, so reaching it means someone changed config at runtime; a peer that
+  requires signatures will then refuse the frame, which is the loud, correct failure.
+  """
+  @spec seal(iolist()) :: iolist()
+  def seal([header, shard | rest] = inner) do
+    if FrameAuth.signing?() do
+      case FrameAuth.sign([header, shard]) do
+        nil -> inner
+        tag -> [<<@version::8, @signed::8, byte_size(tag)::8>>, tag, header, shard | rest]
+      end
+    else
+      inner
+    end
+  end
+
+  @doc """
+  The bytes of `frame` that a signature covers: everything except a trailing opaque payload.
+
+  **The send and receive sides must agree on this exactly**, and they compute it differently —
+  `seal/1` takes the first two elements of an iolist it just built, this takes a byte prefix of a
+  flat binary off a socket. They agree by construction (every `encode_*` returns
+  `[header, shard_id | payload]`, and the lengths below are those headers), and
+  `protocol_signing_test.exs` asserts it for every frame type so the two cannot drift.
+
+  Only three frame types carry a payload; for the rest the whole frame is the header, so the
+  signature covers all of it.
+  """
+  @spec signable(binary()) :: binary()
+  def signable(<<@version::8, @push::8, slen::16, _::binary>> = frame)
+      when byte_size(frame) >= 36 + slen,
+      do: binary_part(frame, 0, 36 + slen)
+
+  def signable(<<@version::8, @push_ext::8, slen::16, _::binary>> = frame)
+      when byte_size(frame) >= 44 + slen,
+      do: binary_part(frame, 0, 44 + slen)
+
+  def signable(<<@version::8, @seed_chunk::8, _part::8, slen::16, _::binary>> = frame)
+      when byte_size(frame) >= 9 + slen,
+      do: binary_part(frame, 0, 9 + slen)
+
+  # A frame too short to hold the header it claims falls here and is signed over whole. It will
+  # fail verification and then fail `decode/1` anyway; the point is only that this never raises on
+  # bytes from a socket.
+  def signable(frame), do: frame
 
   @doc """
   Acknowledge durably holding everything up to (not including) `next_offset`.
@@ -220,7 +316,7 @@ defmodule Fathom.Shard.Replication.Protocol do
   """
   @spec encode_ack(String.t(), non_neg_integer()) :: iolist()
   def encode_ack(shard_id, next_offset) do
-    [<<@version::8, @ack::8, byte_size(shard_id)::16, next_offset::64>>, shard_id]
+    seal([<<@version::8, @ack::8, byte_size(shard_id)::16, next_offset::64>>, shard_id])
   end
 
   @doc """
@@ -231,11 +327,11 @@ defmodule Fathom.Shard.Replication.Protocol do
   """
   @spec encode_reject(String.t(), atom(), non_neg_integer()) :: iolist()
   def encode_reject(shard_id, reason, expected_offset) when is_map_key(@reason_codes, reason) do
-    [
+    seal([
       <<@version::8, @reject::8, @reason_codes[reason]::8, byte_size(shard_id)::16,
         expected_offset::64>>,
       shard_id
-    ]
+    ])
   end
 
   @doc """
@@ -248,7 +344,7 @@ defmodule Fathom.Shard.Replication.Protocol do
   """
   @spec encode_position_query(String.t()) :: iolist()
   def encode_position_query(shard_id) do
-    [<<@version::8, @position_query::8, byte_size(shard_id)::16>>, shard_id]
+    seal([<<@version::8, @position_query::8, byte_size(shard_id)::16>>, shard_id])
   end
 
   @doc """
@@ -262,18 +358,18 @@ defmodule Fathom.Shard.Replication.Protocol do
   """
   @spec encode_position(String.t(), map() | nil) :: iolist()
   def encode_position(shard_id, nil) do
-    [
+    seal([
       <<@version::8, @position::8, 0::8, byte_size(shard_id)::16, 0::64, 0::64, 0::64, 0::64>>,
       shard_id
-    ]
+    ])
   end
 
   def encode_position(shard_id, %{} = pos) do
-    [
+    seal([
       <<@version::8, @position::8, 1::8, byte_size(shard_id)::16, pos.epoch::64, pos.wal_gen::64,
         pos.salt1::64, pos.next_offset::64>>,
       shard_id
-    ]
+    ])
   end
 
   @doc """
@@ -288,7 +384,7 @@ defmodule Fathom.Shard.Replication.Protocol do
   """
   @spec encode_replica_request(String.t()) :: iolist()
   def encode_replica_request(shard_id) do
-    [<<@version::8, @replica_request::8, byte_size(shard_id)::16>>, shard_id]
+    seal([<<@version::8, @replica_request::8, byte_size(shard_id)::16>>, shard_id])
   end
 
   @doc """
@@ -305,11 +401,56 @@ defmodule Fathom.Shard.Replication.Protocol do
           | {:ok, {:reject, String.t(), atom(), non_neg_integer()}}
           | {:ok, {:position_query | :replica_request, String.t()}}
           | {:ok, {:position, String.t(), map() | nil}}
-          | {:error, :malformed | :unsupported_version}
-  def decode(
-        <<@version::8, @push::8, slen::16, epoch::64, gen::64, salt::64, off::64, rest::binary>>
-      )
-      when byte_size(rest) >= slen do
+          | {:error, :malformed | :unsupported_version | :unauthenticated}
+  def decode(<<@version::8, @signed::8, tlen::8, rest::binary>>)
+      when byte_size(rest) > tlen do
+    <<tag::binary-size(^tlen), inner::binary>> = rest
+
+    if FrameAuth.valid?(signable(inner), tag) do
+      # `decode_frame/1`, not `decode/1`: an envelope cannot contain an envelope. Recursing would
+      # let a peer nest them, and there is no reason to.
+      decode_frame(inner)
+    else
+      {:error, :unauthenticated}
+    end
+  end
+
+  def decode(bytes) do
+    # THE ENFORCEMENT POINT, and it is the only one. Everything above this line is a signed
+    # envelope that verified; everything below is a frame that arrived bare. When this node
+    # REQUIRES authentication, a bare frame is refused here regardless of how well-formed it is —
+    # there is no "verify if a signature happens to be present" path, because a checker that
+    # accepts what it cannot verify is not a control.
+    if FrameAuth.required?() do
+      {:error, :unauthenticated}
+    else
+      decode_frame(bytes)
+    end
+  end
+
+  defp decode_frame(
+         <<@version::8, @push_ext::8, slen::16, epoch::64, gen::64, salt::64, off::64, prev::64,
+           rest::binary>>
+       )
+       when byte_size(rest) >= slen do
+    <<shard::binary-size(^slen), payload::binary>> = rest
+
+    {:ok,
+     %Push{
+       shard_id: shard,
+       epoch: epoch,
+       wal_gen: gen,
+       salt1: salt,
+       offset: off,
+       payload: payload,
+       prev_extent: prev
+     }}
+  end
+
+  defp decode_frame(
+         <<@version::8, @push::8, slen::16, epoch::64, gen::64, salt::64, off::64, rest::binary>>
+       )
+       when byte_size(rest) >= slen do
     <<shard::binary-size(^slen), payload::binary>> = rest
 
     {:ok,
@@ -323,10 +464,10 @@ defmodule Fathom.Shard.Replication.Protocol do
      }}
   end
 
-  def decode(
-        <<@version::8, @seed_begin::8, slen::16, epoch::64, gen::64, salt::64, off::64, dblen::64,
-          wallen::64, shard::binary-size(slen)>>
-      ) do
+  defp decode_frame(
+         <<@version::8, @seed_begin::8, slen::16, epoch::64, gen::64, salt::64, off::64,
+           dblen::64, wallen::64, shard::binary-size(slen)>>
+       ) do
     {:ok,
      %SeedBegin{
        shard_id: shard,
@@ -339,56 +480,58 @@ defmodule Fathom.Shard.Replication.Protocol do
      }}
   end
 
-  def decode(<<@version::8, @seed_chunk::8, part::8, slen::16, seq::32, rest::binary>>)
-      when byte_size(rest) >= slen and part in [@part_db, @part_wal] do
+  defp decode_frame(<<@version::8, @seed_chunk::8, part::8, slen::16, seq::32, rest::binary>>)
+       when byte_size(rest) >= slen and part in [@part_db, @part_wal] do
     <<shard::binary-size(^slen), bytes::binary>> = rest
     {:ok, {:seed_chunk, shard, part_name(part), seq, bytes}}
   end
 
-  def decode(<<@version::8, @seed_end::8, slen::16, shard::binary-size(slen)>>) do
+  defp decode_frame(<<@version::8, @seed_end::8, slen::16, shard::binary-size(slen)>>) do
     {:ok, {:seed_end, shard}}
   end
 
-  def decode(<<@version::8, @seed_abort::8, slen::16, shard::binary-size(slen)>>) do
+  defp decode_frame(<<@version::8, @seed_abort::8, slen::16, shard::binary-size(slen)>>) do
     {:ok, {:seed_abort, shard}}
   end
 
-  def decode(<<@version::8, @ack::8, slen::16, next::64, shard::binary-size(slen)>>) do
+  defp decode_frame(<<@version::8, @ack::8, slen::16, next::64, shard::binary-size(slen)>>) do
     {:ok, {:ack, shard, next}}
   end
 
-  def decode(<<@version::8, @reject::8, code::8, slen::16, exp::64, shard::binary-size(slen)>>)
-      when is_map_key(@reasons, code) do
+  defp decode_frame(
+         <<@version::8, @reject::8, code::8, slen::16, exp::64, shard::binary-size(slen)>>
+       )
+       when is_map_key(@reasons, code) do
     {:ok, {:reject, shard, @reasons[code], exp}}
   end
 
-  def decode(<<@version::8, @position_query::8, slen::16, shard::binary-size(slen)>>) do
+  defp decode_frame(<<@version::8, @position_query::8, slen::16, shard::binary-size(slen)>>) do
     {:ok, {:position_query, shard}}
   end
 
-  def decode(
-        <<@version::8, @position::8, 1::8, slen::16, epoch::64, gen::64, salt::64, off::64,
-          shard::binary-size(slen)>>
-      ) do
+  defp decode_frame(
+         <<@version::8, @position::8, 1::8, slen::16, epoch::64, gen::64, salt::64, off::64,
+           shard::binary-size(slen)>>
+       ) do
     {:ok, {:position, shard, %{epoch: epoch, wal_gen: gen, salt1: salt, next_offset: off}}}
   end
 
-  def decode(
-        <<@version::8, @position::8, 0::8, slen::16, _e::64, _g::64, _s::64, _o::64,
-          shard::binary-size(slen)>>
-      ) do
+  defp decode_frame(
+         <<@version::8, @position::8, 0::8, slen::16, _e::64, _g::64, _s::64, _o::64,
+           shard::binary-size(slen)>>
+       ) do
     {:ok, {:position, shard, nil}}
   end
 
-  def decode(<<@version::8, @replica_request::8, slen::16, shard::binary-size(slen)>>) do
+  defp decode_frame(<<@version::8, @replica_request::8, slen::16, shard::binary-size(slen)>>) do
     {:ok, {:replica_request, shard}}
   end
 
   # A version mismatch is worth distinguishing from garbage: it is the signal for a rolling
   # deploy that has gone further than the protocol allows, and it wants a different operator
   # response (finish or roll back the deploy) than a corrupt frame does.
-  def decode(<<v::8, _::binary>>) when v != @version, do: {:error, :unsupported_version}
-  def decode(_), do: {:error, :malformed}
+  defp decode_frame(<<v::8, _::binary>>) when v != @version, do: {:error, :unsupported_version}
+  defp decode_frame(_), do: {:error, :malformed}
 
   defp part_name(@part_db), do: :db
   defp part_name(@part_wal), do: :wal
