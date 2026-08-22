@@ -526,7 +526,7 @@ defmodule Fathom.Shard.Storage.Local do
       # Someone else holds it — liveness is *their heartbeat* (with the lock's own TTL as the
       # fallback when they run no heartbeat — see owner_live?/3).
       {:ok, %{owner: other, epoch: epoch, expires_at_ms: lock_exp}} ->
-        case owner_live?(other, now, lock_exp) do
+        case owner_live?(shard_id, other, now, lock_exp) do
           :live ->
             {:error, {:held, other}}
 
@@ -601,8 +601,8 @@ defmodule Fathom.Shard.Storage.Local do
   # backend can inject a heartbeat-read failure for the fail-closed test. The
   # steal_margin absorbs inter-node clock skew (see Storage.steal_margin_ms/0): only
   # steal once the heartbeat is expired by more than the margin.
-  defp owner_live?(other, now, lock_expires_at_ms) do
-    case stealable_at(other, lock_expires_at_ms) do
+  defp owner_live?(shard_id, other, now, lock_expires_at_ms) do
+    case stealable_at(shard_id, other, lock_expires_at_ms) do
       {:ok, at} -> if now <= at, do: :live, else: :dead
       {:error, _} = error -> error
     end
@@ -615,7 +615,7 @@ defmodule Fathom.Shard.Storage.Local do
   # That divergence was a real bug: `Shards.holder_stealable_soon?/2` predicted from the heartbeat
   # ALONE while `acquire_lease` required both signals lapsed (#12), so a checkout could hold and
   # retry its whole crash-failover budget waiting for a steal that could not happen yet.
-  defp stealable_at(other, lock_expires_at_ms) do
+  defp stealable_at(shard_id, other, lock_expires_at_ms) do
     margin = Storage.steal_margin_ms()
 
     case Storage.read_heartbeat(other) do
@@ -641,7 +641,10 @@ defmodule Fathom.Shard.Storage.Local do
         # stale/frozen and cleared — see Fathom.Shard.Heartbeat): its recently-renewed locks
         # would otherwise block the restarted node for TTL+margin. Exact owner match only.
         # Stealable at 0 ⇒ stealable now, and `soon?` reads it as such.
-        if Storage.incarnation_dead?(other),
+        # NOW ALSO REQUIRES THE RENEWAL PROBE (expert review 2026-08-20 #10). A heartbeat proof
+        # says the heartbeat OBJECT stopped; it does not say the process did. See
+        # `Storage.fast_steal_ok?/4` for why the finding's own condition was rejected.
+        if Storage.fast_steal_ok?(other, shard_id, lock_expires_at_ms, Storage.now_ms()),
           do: {:ok, 0},
           else: {:ok, lock_expires_at_ms + margin}
 
@@ -654,7 +657,7 @@ defmodule Fathom.Shard.Storage.Local do
   def lease_stealable_at(shard_id) do
     case read_lock(shard_id) do
       {:ok, %{owner: other, expires_at_ms: lock_exp}} ->
-        case stealable_at(other, lock_exp) do
+        case stealable_at(shard_id, other, lock_exp) do
           {:ok, at} -> {:held, other, at}
           {:error, reason} -> {:error, reason}
         end
@@ -673,7 +676,7 @@ defmodule Fathom.Shard.Storage.Local do
 
     case read_lock(shard_id) do
       {:ok, %{owner: other, expires_at_ms: lock_exp}} ->
-        case owner_live?(other, now, lock_exp) do
+        case owner_live?(shard_id, other, now, lock_exp) do
           :live -> {:held, other}
           :dead -> :free
           {:error, reason} -> {:error, reason}

@@ -1516,7 +1516,7 @@ defmodule Fathom.Shard.Storage.S3 do
 
     case get_lock(shard_id) do
       {:ok, %{owner: other, expires_at_ms: lock_exp}, _etag} ->
-        case owner_live?(other, now, lock_exp) do
+        case owner_live?(shard_id, other, now, lock_exp) do
           :live -> {:held, other}
           :dead -> :free
           {:error, reason} -> {:error, reason}
@@ -1536,7 +1536,7 @@ defmodule Fathom.Shard.Storage.S3 do
 
     case get_lock(shard_id) do
       {:ok, %{owner: other, expires_at_ms: lock_exp}, _etag} ->
-        case stealable_at(other, now, lock_exp) do
+        case stealable_at(shard_id, other, now, lock_exp) do
           # Normalise onto the CALLER's clock. `stealable_at/3` compares against S3's Date when
           # the store sends one (#13), so the instant it returns is on that clock — handing it
           # back raw would have the caller diff it against `System.system_time/1` and bake the
@@ -1584,7 +1584,7 @@ defmodule Fathom.Shard.Storage.S3 do
       # Someone else holds it — liveness is *their heartbeat* (with the lock's own TTL as the
       # fallback when they run no heartbeat — see owner_live?/3).
       {:ok, %{owner: other, epoch: epoch, expires_at_ms: lock_exp}, etag} ->
-        case owner_live?(other, now, lock_exp) do
+        case owner_live?(shard_id, other, now, lock_exp) do
           :live ->
             {:error, {:held, other}}
 
@@ -1683,8 +1683,8 @@ defmodule Fathom.Shard.Storage.S3 do
   # backend can inject a heartbeat-read failure for the fail-closed test. The
   # steal_margin absorbs inter-node clock skew (see Storage.steal_margin_ms/0): only
   # steal once the heartbeat is expired by more than the margin.
-  defp owner_live?(other, now, lock_expires_at_ms) do
-    case stealable_at(other, now, lock_expires_at_ms) do
+  defp owner_live?(shard_id, other, now, lock_expires_at_ms) do
+    case stealable_at(shard_id, other, now, lock_expires_at_ms) do
       {:ok, at, ref_now} -> if ref_now <= at, do: :live, else: :dead
       {:error, _} = error -> error
     end
@@ -1700,7 +1700,7 @@ defmodule Fathom.Shard.Storage.S3 do
   # ALONE while this required both signals lapsed (#12), so a checkout could hold and retry its
   # whole crash-failover budget waiting for a steal that could not happen yet, then return the
   # error it would have returned immediately.
-  defp stealable_at(other, now, lock_expires_at_ms) do
+  defp stealable_at(shard_id, other, now, lock_expires_at_ms) do
     margin = Storage.steal_margin_ms()
 
     case cached_read_heartbeat_dated(other) do
@@ -1746,7 +1746,10 @@ defmodule Fathom.Shard.Storage.S3 do
       # verified stale/frozen and cleared) — its recently-renewed locks must not block
       # the restarted node for TTL+margin. Exact owner match only. Stealable at 0 ⇒ now.
       {:not_found, s3_now} ->
-        if Storage.incarnation_dead?(other),
+        # NOW ALSO REQUIRES THE RENEWAL PROBE (expert review 2026-08-20 #10). A heartbeat proof
+        # says the heartbeat OBJECT stopped; it does not say the process did. See
+        # `Storage.fast_steal_ok?/4` for why the finding's own condition was rejected.
+        if Storage.fast_steal_ok?(other, shard_id, lock_expires_at_ms, s3_now || now),
           do: {:ok, 0, s3_now || now},
           else: {:ok, lock_expires_at_ms + margin, s3_now || now}
 

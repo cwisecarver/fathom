@@ -286,10 +286,41 @@ defmodule Fathom.Shard.HeartbeatTest do
       })
     )
 
+    # UPDATED 2026-08-22 (expert review 2026-08-20 #10). This used to assert the steal succeeds on
+    # the FIRST attempt. It no longer does, and the change is deliberate rather than a regression:
+    # a cleared heartbeat proves the heartbeat OBJECT stopped, not that the PROCESS did, and a node
+    # whose Heartbeat GenServer died while it kept serving reads identically — while going on
+    # renewing every lock it holds via the legacy fence. Stealing from it is a double-serve window.
+    #
+    # So the fast path now additionally requires a two-read renewal probe (`Storage`'s
+    # `fast_steal_ok?/4`): one observation starts the clock, and a second of the SAME lock, a probe
+    # window later with an unchanged expiry, proves nobody is renewing it.
+    #
+    # #34's win is REDUCED, not removed, and that trade was made explicitly: the wait goes from
+    # `ttl + margin` (~40 s at defaults) to `ttl/2` (~15 s), and it is paid ONCE PER INCARNATION
+    # rather than once per shard — so a node holding a thousand shards pays it once.
+    assert {:error, {:held, ^prev_owner}} =
+             Storage.acquire_lease("sh34", "contender@node", 30_000),
+           "the first attempt must NOT fast-steal: one observation of a lock proves nothing " <>
+             "about whether anyone is renewing it"
+
+    # Second observation, past the probe window, expiry unchanged. Driven by moving the window to
+    # zero rather than by sleeping — the state machine takes the clock as an argument precisely so
+    # no test has to wait out a real renewal cadence.
+    prev_probe = Application.get_env(:fathom, :lease_quiescence_probe_ms)
+    Application.put_env(:fathom, :lease_quiescence_probe_ms, 0)
+
+    on_exit(fn ->
+      if is_nil(prev_probe),
+        do: Application.delete_env(:fathom, :lease_quiescence_probe_ms),
+        else: Application.put_env(:fathom, :lease_quiescence_probe_ms, prev_probe)
+    end)
+
     assert {:ok, %{epoch: 2, took_over: true}} =
              Storage.acquire_lease("sh34", "contender@node", 30_000),
-           "a proven-dead incarnation's fresh lock must be stealable immediately, " <>
-             "not after the ~35s lock-TTL fallback"
+           "once the probe has settled, a proven-dead incarnation's fresh lock must be stealable " <>
+             "without waiting out the ~40s lock-TTL fallback — that is round-2 #34's win and it " <>
+             "must survive #10"
   end
 
   # Expert review #8: the lapse generation was process-local state resetting to 0 on

@@ -898,6 +898,156 @@ defmodule Fathom.Shard.Storage do
   @spec incarnation_dead?(String.t()) :: boolean()
   def incarnation_dead?(owner), do: MapSet.member?(dead_incarnations(), owner)
 
+  # A heartbeat proof is NOT a proof that the process stopped (expert review 2026-08-20 #10).
+  #
+  # `mark_incarnation_dead/1` records that a predecessor's HEARTBEAT OBJECT stopped being renewed.
+  # A node whose `Heartbeat` GenServer died but which keeps SERVING produces exactly that reading —
+  # and it is precisely the case finding #11's `:not_found` branch exists to protect, because such a
+  # node degrades to the legacy per-shard renew fence and goes on renewing every lock it holds while
+  # its heartbeat sits frozen. Taking the fast path against it is a double-serve window.
+  #
+  # THE FINDING'S OWN FIX IS WRONG AND IS NOT IMPLEMENTED. It proposed gating on
+  # `lock_expires_at_ms <= now`. `judge_previous/1` marks a predecessor dead the moment its
+  # HEARTBEAT is stale past `steal_margin_ms` — and at that instant a genuinely crashed
+  # predecessor's LOCKS are still in the FUTURE, because they were renewed shortly before the
+  # crash. That condition is therefore false in exactly the case round-2 #34 optimizes, so it would
+  # silently revert #34 and reintroduce a per-shard stall on every fast restart.
+  #
+  # The correct discriminator is "are the locks still being RENEWED", which is what actually
+  # separates a frozen predecessor from a live legacy one. This is the same two-read protocol
+  # `judge_previous/1` already applies to heartbeats, and `heartbeat.ex` calls that the protocol
+  # that prevents fleet-wide split-brain.
+  #
+  # ONCE PER INCARNATION, NOT PER SHARD. The question is about the PROCESS — a renewal timer
+  # renews all of its locks or none — and per-shard would cost a full probe window per shard at
+  # restart, undoing #34's win on the very path it exists for. So the first shard to be asked twice,
+  # far enough apart, settles it for every lock that incarnation holds.
+  #
+  # SAMPLED OPPORTUNISTICALLY, never blocking. The first call records the lock it was asked about
+  # and answers "not proven" (so the caller falls back to the lock TTL — the safe pre-#34
+  # behaviour). A later call about the SAME shard, past the probe window, compares: an unchanged
+  # expiry means nobody is renewing. Nothing sleeps, nothing is scheduled, and a shard that is never
+  # asked twice simply never gets the fast path.
+  #
+  # The probe window is derived from OUR OWN lease TTL, and that is sound here in a way it would not
+  # be generally: this applies only to a previous incarnation of THIS node, so its renewal cadence
+  # is our configuration. `renew_lease` runs every `ttl/3`, plus the steal margin for clock skew.
+  @doc false
+  @spec fast_steal_ok?(String.t(), String.t(), integer(), integer()) :: boolean()
+  def fast_steal_ok?(owner, shard_id, lock_expires_at_ms, now_ms) do
+    incarnation_dead?(owner) and quiescent?(owner, shard_id, lock_expires_at_ms, now_ms)
+  end
+
+  # The pure half, so the state machine can be tested without a store or a clock.
+  #
+  # Returns `{verdict, next_state}` where `verdict` is whether the fast path may be taken and
+  # `next_state` is what to remember (`:keep` = unchanged).
+  @doc false
+  @spec judge_quiescence(term(), String.t(), integer(), integer(), pos_integer()) ::
+          {boolean(), term()}
+  def judge_quiescence(state, shard_id, expiry, now_ms, probe_ms)
+
+  def judge_quiescence(:quiescent, _shard_id, _expiry, _now, _probe), do: {true, :keep}
+
+  # Settled the other way. Sticky: a predecessor observed renewing is a LIVE process, and nothing
+  # short of a fresh death proof should make it stealable again — `mark_incarnation_dead/1` writing
+  # a new owner string is that fresh proof, and it gets its own entry.
+  def judge_quiescence(:renewing, _shard_id, _expiry, _now, _probe), do: {false, :keep}
+
+  def judge_quiescence(nil, shard_id, expiry, now, _probe),
+    do: {false, {:sample, shard_id, expiry, now}}
+
+  def judge_quiescence({:sample, shard_id, expiry, at}, shard_id, expiry, now, probe)
+      when now - at >= probe do
+    {true, :quiescent}
+  end
+
+  # Same shard, same window, but the expiry MOVED: something renewed it. That is a live process.
+  def judge_quiescence({:sample, shard_id, was, _at}, shard_id, expiry, _now, _probe)
+      when was != expiry do
+    {false, :renewing}
+  end
+
+  # Same shard, unchanged, but not enough time has passed for silence to mean anything yet.
+  def judge_quiescence({:sample, shard_id, _e, _at}, shard_id, _expiry, _now, _probe),
+    do: {false, :keep}
+
+  # A DIFFERENT shard. Its expiry says nothing about the sampled one, and replacing the sample
+  # would restart the clock forever on a node opening many shards — the sample must be allowed to
+  # age. Leave it alone.
+  def judge_quiescence({:sample, _other, _e, _at}, _shard_id, _expiry, _now, _probe),
+    do: {false, :keep}
+
+  defp quiescent?(owner, shard_id, expiry, now_ms) do
+    {verdict, next} =
+      judge_quiescence(quiescence_state(owner), shard_id, expiry, now_ms, probe_window_ms())
+
+    unless next == :keep, do: put_quiescence(owner, next)
+    verdict
+  end
+
+  # ETS, not `:persistent_term`: this is written on a sampling path rather than once at boot, and a
+  # persistent-term write schedules a literal-area cleanup that scans every process on the node —
+  # the cost expert review #36 removed from the shipper budget for the same reason.
+  @quiescence_table __MODULE__.Quiescence
+
+  defp quiescence_state(owner) do
+    case :ets.lookup(quiescence_table(), owner) do
+      [{^owner, state}] -> state
+      _ -> nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp put_quiescence(owner, state) do
+    :ets.insert(quiescence_table(), {owner, state})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  # `:ets.whereis/1` answers `:undefined`, not nil, when the table is absent — the `||` idiom
+  # dialyzer rejects. Created lazily and owned by whichever process asks first: this table is a
+  # CACHE of a re-derivable observation, so losing it costs one extra probe window, never
+  # correctness. That is why it does not need a supervised owner the way the shipper budget does.
+  defp quiescence_table do
+    case :ets.whereis(@quiescence_table) do
+      :undefined ->
+        :ets.new(@quiescence_table, [:named_table, :public, :set, read_concurrency: true])
+
+      _ ->
+        :ok
+    end
+
+    @quiescence_table
+  end
+
+  @doc false
+  @spec reset_quiescence() :: :ok
+  def reset_quiescence do
+    :ets.delete_all_objects(quiescence_table())
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  # How long silence has to last before it means nobody is renewing.
+  #
+  # `renew_lease` runs every `ttl/3`, so anything shorter can catch a live renewer BETWEEN
+  # renewals and call it dead. `ttl/2` gives 50% slack over that cadence while staying well under
+  # the `ttl + margin` fallback it replaces — which is the whole point, since a probe window at or
+  # above the fallback would make the fast path worthless.
+  #
+  # NO `steal_margin_ms` TERM, deliberately. That margin exists for inter-node CLOCK SKEW, and no
+  # clock comparison happens here: both observations are ours, of the same stored `expires_at_ms`
+  # field, and the only thing our clock measures is the gap between our own two reads. Adding it
+  # would be cargo-culting the neighbouring code and would halve the remaining win.
+  defp probe_window_ms do
+    ttl = Application.get_env(:fathom, :shard_lease_ttl_ms, 30_000)
+    Application.get_env(:fathom, :lease_quiescence_probe_ms, max(div(ttl, 2), 1))
+  end
+
   defp dead_incarnations,
     do: :persistent_term.get({__MODULE__, :dead_incarnations}, MapSet.new())
 
