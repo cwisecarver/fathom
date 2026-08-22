@@ -124,7 +124,42 @@ defmodule Fathom.Test.PausablePeer do
     # A fixture that cannot survive an ordinary reconnect cannot be trusted to report one, which is
     # the same lesson that motivated the module in the first place — arrived at the hard way, from
     # the inside.
-    for old <- [state.down, state.up], old != nil, do: :gen_tcp.close(old)
+    # `old != sock` IS A FOURTH FIXTURE BUG (2026-08-22), and it is the SAME
+    # data-beats-the-notification race the `up: nil` clause above exists for — reached from the
+    # other end. Captured live rather than reasoned about:
+    #
+    #     +0.00ms   buffer     sock=274, up==nil  ->  down := 274
+    #     +0.01ms   accepted   sock=274, old_down=274      <- closed the socket being accepted
+    #     +0.80ms   from_up    16 bytes, paused -> held
+    #     +501.4ms  accepted   sock=278                    <- the Shipper's 500 ms reconnect
+    #
+    # When a frame arrives before `{:accepted, sock}`, that clause has ALREADY stored the very
+    # socket being accepted as `state.down`, because it needs somewhere to put the bytes. This loop
+    # then closed it and installed the corpse as the new `down`. The `Shipper` sees the close,
+    # reconnects 500 ms later, and a reconnect deliberately clears `held: []` — so the withheld
+    # reply is DROPPED and `release/1` delivers nothing. A test awaiting that ack gets
+    # `{:reject, "acme", :disconnected, 0}` instead.
+    #
+    # Same presentation as the three bugs above: the proxied follower simply never converging,
+    # which is indistinguishable from the product bug this fixture exists to study. It is what made
+    # CI red on 2 of 3 OTP legs twice running on 2026-08-22, and it is the cause of the flake the
+    # comment on the describe block below predicted.
+    #
+    # A genuine reconnect is unaffected: there `state.down` is the PREVIOUS socket, so it still
+    # closes.
+    #
+    # TWO THINGS ABOUT DIAGNOSING THIS, both learned the expensive way:
+    #
+    #   * It reproduces at roughly 1 in 30 runs of `replication_transport_test.exs` TOGETHER WITH
+    #     `replication_commit_test.exs` under CPU load, and essentially never with the transport
+    #     file alone. A negative from the wrong combination is not evidence — this fix was
+    #     correctly diagnosed, then WRONGLY retracted on 0 hits from a 12-run single-file probe.
+    #   * Any per-event `IO.puts` here SUPPRESSES it completely (0 failures in 40 runs). The window
+    #     is a few microseconds wide. Accumulate diagnostics in the struct and dump them once, and
+    #     note that `terminate/2` will not run to do that dumping — this GenServer does not trap
+    #     exits, so a supervisor shutdown kills it outright and the cleanup in `terminate/2` below
+    #     has never executed.
+    for old <- [state.down, state.up], old != nil, old != sock, do: :gen_tcp.close(old)
     accept_next(state.lsock, self())
 
     # Connect upstream only once a client has arrived, so a peer that is never used opens nothing.
