@@ -143,6 +143,30 @@ jobs:
           FATHOM_WAL_PROBE: "1"
         run: mix test --include wal_probe
 
+      # THE FAILURE LOG IS THE ONLY EVIDENCE A CI-ONLY FLAKE EVER LEAVES, and without this step it
+      # was thrown away with the runner.
+      #
+      # `Fathom.FailureCaptureFormatter` already writes `logs/test-failures-<ts>.log` with the SEED,
+      # the failing location and a paste-ready rerun command (nothing at all on a green run). What
+      # GitHub's own log gives instead is the annotation — the test NAME and its `test` line, not the
+      # assertion that failed and not the seed. That is the gap this closes: on 2026-08-23 three
+      # different A2 replication tests went red across two runs and none of them could be attributed,
+      # because the annotation named the test and the job log needed repository ADMIN to download
+      # (`gh run view --log-failed` → HTTP 403 for a non-admin, on a PUBLIC repo).
+      #
+      # `if: failure()` so a green run uploads nothing, and `continue-on-error` so a missing file
+      # (e.g. the job died before ExUnit started) can never turn a real failure into a confusing
+      # second one.
+      - name: Capture the test failure log
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-failures-otp${{ matrix.otp }}
+          path: logs/test-failures-*.log
+          if-no-files-found: ignore
+          retention-days: 30
+
       # The :s3 suite — the live-store contract, and until now the one thing NOTHING ran.
       #
       # It is excluded from `mix test` by design (it needs a real store), so it was excluded
