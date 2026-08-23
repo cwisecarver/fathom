@@ -755,14 +755,20 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     # path and re-ship what our own shipper refused. Verified to discriminate by setting
     # `:replication_catchup_ms` to 0, which fails here.
     #
-    # Generous window: the retry is armed at 1 s and may need a second pass, because the first can
-    # land while the released reply is still being reconciled.
-    # THE PROPERTY. NO further write on this shard — the deferred retry must re-enter the commit
-    # path and re-ship what our own shipper refused. Verified to discriminate by setting
-    # `:replication_catchup_ms` to 0, which fails here.
+    # WHAT THE 8 s ACTUALLY BUYS, because the previous wording here ("armed at 1 s and may need a
+    # second pass") described a schedule the product does not have, and this test went red on CI
+    # 2026-08-23 with no way to tell whether the window was the reason.
     #
-    # Generous window: the retry is armed at 1 s and may need a second pass, because the first can
-    # land while the released reply is still being reconciled.
+    # `Session.retry_delay_ms/2` is EXPONENTIAL from `:replication_catchup_ms` (1 s), capped at
+    # `:shard_flush_interval_ms`. Neither is set by this file's `setup` or by `config/test.exs`, so
+    # the defaults apply: cap = 5 s, and successive refusals land at 1 s, 3 s, 7 s, 12 s cumulative.
+    # 8 s is therefore THREE attempts, not "one plus a spare" — and a fourth would need 12 s.
+    #
+    # Left at 8 s deliberately: on this machine the retry has never needed more than the first
+    # attempt (73 local runs, plus 4 in a 4-vCPU Ubuntu container, zero failures), so raising it
+    # would be widening a deadline to cure a failure nobody has yet attributed — exactly what
+    # AGENTS.md forbids. If CI red-lines HERE again, the uploaded failure log will say so, and the
+    # question to answer first is why a THIRD retry was refused, not what number to type.
     assert await_wal_quiet(laggard, id, target, 8_000),
            "the laggard never caught up on a quiet shard. The commit reported :ok, so nothing " <>
              "anywhere looks wrong — this is the silent under-replication window the deferred " <>
