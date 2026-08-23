@@ -13,6 +13,14 @@ Each doc says whether it describes **built** behavior or a **plan**.
 "Getting started" (Docker eval stack + native dev); [`../CONTRIBUTING.md`](../CONTRIBUTING.md) is the
 set-up-and-land-a-change guide for developers.
 
+## Component notes — the long-form record
+
+- **[component-notes.md](component-notes.md)** — the detailed per-component record that used to be
+  AGENTS.md § Project (moved 2026-08-22 when AGENTS.md hit ~21,900 words). For each component: the
+  finding that motivated it, the fix that was tried and was wrong, the measurement that settled an
+  argument, the trap that will bite the next person. **Read the entry before changing a component.**
+  AGENTS.md § Project is now the map; this is the why.
+
 ## How it works — built-engine stories
 
 The "how it actually works" narratives for the major built subsystems. A good learning order is
