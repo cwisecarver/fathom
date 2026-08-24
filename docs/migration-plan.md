@@ -1,15 +1,27 @@
 # Fathom — Shard Schema Migration Plan
 
-> Status: **DRAFT — editable.** This is the design for evolving the schema across
-> millions of per-shard libSQL shards. Decision points are marked **DECIDE**.
+> Status: **SUPERSEDED DRAFT — history, not a work list.** This was the design for
+> evolving the schema across millions of per-shard libSQL shards. **The engine it
+> describes is built**: read [`migration.md`](migration.md) for what actually ships,
+> and treat this file as the reasoning that led there.
+>
+> **Both `DECIDE` markers below are answered** (annotated in place, 2026-08-24). The
+> only question left is an operator budget call, not a design one — see the second
+> one. Nothing here is waiting on a decision.
 
-## Reality check — this plan vs. the current code (2026-06-27)
+## Reality check — this plan vs. the current code
 
-This plan predates the working spike and assumes an orchestration layer that
-**does not exist yet**: no Postgres directory, no `Fathom.Directory` resolve, no
-`Fathom.Migrator` / `ShardMigrationJob` / `Fathom.Retirement`, no Oban. The
-strategy below stands; these notes reconcile its assumptions with what is
-actually built so nobody implements against the wrong model.
+**Written 2026-06-27, and its premise has since expired.** It said the plan
+"predates the working spike and assumes an orchestration layer that **does not exist
+yet**: no Postgres directory, no `Fathom.Directory` resolve, no `Fathom.Migrator` /
+`ShardMigrationJob` / `Fathom.Retirement`, no Oban."
+
+**All of that now exists and ships** (`Fathom.Directory`, `Fathom.Migrator.*`,
+Oban-driven rollout with cold-tail reconcile and guarded revert — see the Migration
+engine row in AGENTS.md § Project). The one name that never landed is
+`Fathom.Retirement`; retirement is `Fathom.Migrator.RetirementJob`, scheduled with the
+cutover. Kept rather than deleted because the notes below still explain *why* the built
+shape differs from the plan's — which is the part a reader needs.
 
 - **Shards are local SQLite *files*, not Turso *namespaces*.** The spike is
   `Fathom.Shard` (one `exqlite` GenServer per shard, file `<shard_id>.db`) +
@@ -46,8 +58,19 @@ Per shard, to go from schema `vN-1` → `vN`:
    node's `template@vN` namespace (which already has the HEAD schema). Empty,
    correct schema, instant.
 2. **Pause** the old shard briefly — mark the shard `migrating` in the
-   directory so the app holds/queues writes for the copy window. *(See DECIDE:
-   consistency.)*
+   directory so the app holds/queues writes for the copy window.
+
+   > **DECIDE: consistency — ANSWERED, this is what shipped.**
+   > `Directory.mark_migrating/1` sets the row for the copy window and
+   > `unmark_migrating/1` clears it, conditionally on the row still being
+   > `migrating`. A crash mid-chain used to leave it stuck forever (every
+   > laggard/reconcile query filters on status), so `reclaim_stale_migrating/1`
+   > reclaims it — see `docs/migration.md`. The serialization that actually
+   > protects the copy is not the flag but the **migrator lease**: a per-operation
+   > owner plus a linked renewer holds the lock for the whole copy, and a
+   > `check_lease` self-fence aborts before the flush/restore clobber points.
+
+
 3. **Copy + transform** data from `shard@vN-1` → `shard@vN`. The migration
    defines the transform (straight copy, column adds, table splits, type changes —
    anything, because it's a fresh schema).
@@ -89,7 +112,20 @@ no longer possible — by design.
   does not remove app-level cross-version tolerance.
 - **Storage doubles for the retention window.** Every migrated shard holds
   `vN-1` + `vN` for X days. At millions of small shards that's ~2× storage for the
-  rolling window. **DECIDE:** is that within the S3 budget?
+  rolling window.
+
+  > **DECIDE: S3 budget — no longer an ARCHITECTURAL decision; it is a knob and an
+  > operator call.** The built engine does not keep two live directory rows. It
+  > retains the previous **storage object** and schedules its retirement in the same
+  > transaction as the cutover (`cutover_with_retirement/3` →
+  > `Fathom.Migrator.RetirementJob`), and `shards.retain_until` is a per-shard,
+  > operator-editable timestamp (admin directory UI, restricted changeset). So the
+  > window is set per shard rather than as a fleet constant, and the 2× is a
+  > *ceiling* during a rollout rather than a standing cost.
+  >
+  > What is genuinely still unanswered is the **number**: nobody has priced a real
+  > rollout against a real bucket. That is a measurement, and it belongs with the
+  > bare-metal run (`docs/a2-bare-metal-plan.md`), not with this design.
 
 ## Reused from the orchestration design (these still apply)
 
