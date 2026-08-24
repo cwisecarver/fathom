@@ -39,10 +39,17 @@ defmodule Fathom.Shard.Storage.TwoStealerTest do
   # For B to steal A's 30-second-fresh lock, `Local.owner_live?/3` must have returned `:dead`, and
   # `stealable_at/2` has exactly one branch that can do that for a fresh lock: heartbeat
   # `:not_found` AND `Storage.incarnation_dead?(owner)` true, which returns "stealable at 0". That
-  # set is a process-global `:persistent_term` that is NEVER cleared between tests and only grows,
-  # so it is the one piece of cross-test state that could reach in here — even though its entries
-  # are `nonode@nohost#<nonce>` and cannot string-match these owners today. The other branches all
-  # derive from the lock's own TTL.
+  # set is a process-global `:persistent_term`, so it is the one piece of cross-test state that
+  # could reach in here — though its entries are `nonode@nohost#<nonce>` and cannot string-match
+  # these owners today. The other branches all derive from the lock's own TTL.
+  #
+  # THE "NEVER CLEARED BETWEEN TESTS AND ONLY GROWS" HALF OF THAT IS FIXED (2026-08-24).
+  # `Storage.reset_incarnation_deaths/0` now exists as the twin of `reset_quiescence/0`, and
+  # `incarnation_quiescence_test.exs` — the one file that was leaking a marked owner into the whole
+  # rest of the run — resets it and asserts on exit that the set came back empty. The suspicion this
+  # comment records was correct about the hazard; it was wrong only about it being unfixable here.
+  # It is kept because the diagnostics below still print the set, and a future `:dead` verdict on a
+  # fresh lock is still best explained by looking there first.
   #
   # So capture that, plus the lock as it stands, at failure time. Cheap (only on failure) and it
   # turns "seen once, cause unknown" into an attributable report next time.

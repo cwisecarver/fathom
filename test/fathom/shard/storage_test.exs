@@ -45,6 +45,32 @@ defmodule Fathom.Shard.StorageTest do
     refute Storage.incarnation_dead?("some-other-node@xyz")
   end
 
+  # THE SET ONLY EVER GROWS, so without this there was no way for a test to put it back.
+  #
+  # `mark_incarnation_dead/1` adds and never removes — correct for production, where the point is
+  # that a fast-restarting node keeps remembering each of its own dead predecessors. In a suite it
+  # meant any test that marked an owner changed a liveness rule for every test that ran afterwards
+  # in the same BEAM. The quiescence half of `fast_steal_ok?/4` already had `reset_quiescence/0`;
+  # this is the missing twin, and `incarnation_quiescence_test.exs` is the file that needed it.
+  test "reset_incarnation_deaths/0 empties the set, so one test cannot leak into the next" do
+    x = "fathom@d#{System.unique_integer([:positive])}"
+    y = "fathom@e#{System.unique_integer([:positive])}"
+
+    :ok = Storage.mark_incarnation_dead(x)
+    :ok = Storage.mark_incarnation_dead(y)
+    assert Storage.incarnation_dead?(x)
+    assert Storage.incarnation_dead?(y)
+
+    :ok = Storage.reset_incarnation_deaths()
+
+    refute Storage.incarnation_dead?(x)
+    refute Storage.incarnation_dead?(y)
+
+    # The WHOLE set, not just the two owners named here — a reset that left anything behind would
+    # still make the next test's verdict depend on this one.
+    assert Storage.dead_incarnations() == MapSet.new()
+  end
+
   test "re-marking an already-dead incarnation is idempotent and stays reported dead" do
     owner = "fathom@c#{System.unique_integer([:positive])}"
 

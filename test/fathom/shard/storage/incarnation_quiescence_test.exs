@@ -78,9 +78,32 @@ defmodule Fathom.Shard.Storage.IncarnationQuiescenceTest do
   end
 
   describe "the composed check" do
+    # `fast_steal_ok?/4` reads TWO globals and this setup used to reset only one.
+    #
+    # The quiescence ETS table was reset; the `:persistent_term` set behind `incarnation_dead?/1`
+    # was not — and the three tests below all call `mark_incarnation_dead/1` with a FIXED owner
+    # string. So every one of them left `"nonode@nohost#deadbeef"` marked dead for the whole rest
+    # of the suite run, in a set that only ever grows. A liveness rule that depends on which tests
+    # ran before it is exactly the shape of the flakes that have been chased in this subsystem.
+    #
+    # The `on_exit` assertion is the guard, not the reset: delete the `reset_incarnation_deaths/0`
+    # call above it and this describe block fails, which is how the leak was confirmed to be real
+    # rather than theoretical. It asserts on the WHOLE set rather than on `@owner`, so a future
+    # test here that marks some other owner is caught too.
     setup do
       Storage.reset_quiescence()
-      on_exit(&Storage.reset_quiescence/0)
+      Storage.reset_incarnation_deaths()
+
+      on_exit(fn ->
+        Storage.reset_quiescence()
+        Storage.reset_incarnation_deaths()
+
+        assert Storage.dead_incarnations() == MapSet.new(),
+               "this file leaked a proven-dead incarnation into the process-global set, where " <>
+                 "every later test in the run would see it: " <>
+                 inspect(MapSet.to_list(Storage.dead_incarnations()))
+      end)
+
       :ok
     end
 

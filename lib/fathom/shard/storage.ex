@@ -1118,8 +1118,33 @@ defmodule Fathom.Shard.Storage do
     Application.get_env(:fathom, :lease_quiescence_probe_ms, max(div(ttl, 2), 1))
   end
 
-  defp dead_incarnations,
+  @doc false
+  @spec dead_incarnations() :: MapSet.t(String.t())
+  def dead_incarnations,
     do: :persistent_term.get({__MODULE__, :dead_incarnations}, MapSet.new())
+
+  # THE OTHER HALF OF `reset_quiescence/0`, and its absence was a test-isolation hole.
+  #
+  # `fast_steal_ok?/4` reads TWO globals: the quiescence ETS table, which had a reset, and this
+  # `:persistent_term` set, which did not. So a test that called `mark_incarnation_dead/1` left that
+  # owner marked dead for every test that ran after it, in the same BEAM, for the rest of the suite —
+  # and `mark_incarnation_dead/1` only ever ADDS, so the set could not shrink back on its own.
+  #
+  # That makes a liveness rule depend on TEST ORDER, which is the one thing a randomly-seeded suite
+  # guarantees will vary. `two_stealer_test.exs` had already written the hazard down in a comment
+  # ("a process-global :persistent_term that is NEVER cleared between tests and only grows") while
+  # investigating a failure it could not attribute; it survives today only because the owner strings
+  # in flight happen not to collide, which is luck rather than isolation.
+  #
+  # Test-only, hence `@doc false`: production WANTS this set to persist for the life of the node —
+  # it is how a fast-restarting node remembers that each of its own dead predecessors is stealable
+  # without waiting out the lock TTL.
+  @doc false
+  @spec reset_incarnation_deaths() :: :ok
+  def reset_incarnation_deaths do
+    :persistent_term.erase({__MODULE__, :dead_incarnations})
+    :ok
+  end
 
   @doc """
   Remove orphaned sibling temps of `base` older than `older_than_ms` (expert review
