@@ -742,8 +742,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
 
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (5)", [])
     assert :ok = Session.commit(id, wal, coordinator)
-    assert_receive {:peer_frame, :to_primary, _}, 2_000, "the laggard never answered at all"
-    assert Fathom.Test.PausablePeer.held(peer) >= 1
+    await_held!(peer, "the laggard never answered the commit that was supposed to be held")
 
     # NO write before this one — the `ship_async/1` path, with the laggard as the whole push list.
     assert :ok = Session.commit(id, wal, coordinator)
@@ -834,7 +833,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
 
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
     assert :ok = Session.commit(id, wal, coordinator)
-    assert_receive {:peer_frame, :to_primary, _}, 2_000, "the laggard never answered at all"
+    await_held!(peer, "the laggard never answered the commit that was supposed to be held")
 
     # The position the HELD ack describes. Read from the session's own record so the test does not
     # re-derive the planner's arithmetic.
@@ -899,6 +898,39 @@ defmodule Fathom.Shard.ReplicationSeedTest do
         {:cont, nil}
       end
     end)
+  end
+
+  # WAIT ON THE PEER'S STATE, NEVER ON A `{:peer_frame, _, _}` NOTIFICATION.
+  #
+  # This is the fix for the CI flake that went red on 2026-08-23 and again on 2026-08-24, on two
+  # OTP legs at once. Both times the failure was `assert PausablePeer.held(peer) >= 1` reading 0,
+  # one line after an `assert_receive {:peer_frame, :to_primary, _}` that was supposed to guarantee
+  # the reply had arrived.
+  #
+  # It never guaranteed anything. `PausablePeer` notifies on EVERY frame in both directions, and
+  # nothing in these tests consumes them, so by the time the interesting moment arrives the test
+  # process is sitting on a BACKLOG of identical messages from the setup. Measured, not guessed:
+  # instrumenting the mailbox immediately before `pause/1` found **4 stale `:to_primary`
+  # notifications** waiting. `assert_receive` matched one of those instantly and moved on, so the
+  # next line raced the laggard's real reply — which is why it passed on a fast machine (77 local
+  # runs across four environment shapes, zero failures) and failed on a contended 4-vCPU runner.
+  #
+  # A drain before arming would also work, but this is better: `held/1` is the exact property the
+  # test is about ("the reply arrived AND is being withheld"), it cannot be satisfied by history,
+  # and the peer updates `held` in the same `handle_info` that sends the notification — so there is
+  # no window where one is true and the other is not.
+  defp await_held!(peer, message, timeout \\ 2_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    Stream.repeatedly(fn ->
+      cond do
+        Fathom.Test.PausablePeer.held(peer) >= 1 -> true
+        System.monotonic_time(:millisecond) > deadline -> false
+        true -> Process.sleep(10) && nil
+      end
+    end)
+    |> Enum.find(&is_boolean/1)
+    |> assert(message)
   end
 
   # `await_wal/4` flunks on timeout; this reports instead, so a test can assert NON-convergence

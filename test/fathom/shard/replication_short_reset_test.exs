@@ -212,10 +212,24 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
     # fails, intermittently, under load, in CI and never here.
     #
     # AGENTS.md records this exact class twice (the straggler note in the seed tests, and three of
-    # the #38/#39 tests that CI caught and the local run did not). Stopping the session makes the
-    # crafted frames the only ones the follower will ever see again, which removes the class rather
-    # than widening a window.
+    # the #38/#39 tests that CI caught and the local run did not). Quiescing makes the crafted
+    # frames the only ones the follower will ever see again, which removes the class rather than
+    # widening a window.
+    #
+    # STOPPING THE SESSION IS NOT ENOUGH, and believing it was is why this test still went red on
+    # CI (2026-08-24, OTP 27, seed 111885 — `assert Follower.state_of(name, id).torn` reading
+    # false). The configuration here is q=1 with TWO followers, so `Session.commit/3` returns on the
+    # OTHER follower's ack while the push to this one is already sitting in its `Shipper`'s mailbox.
+    # `Session.stop/1` stops the session; the shippers are `Fleet`'s children and outlive it, so
+    # that queued push still lands — after the `state` read below, which is the one thing this setup
+    # exists to make stable. `next_offset` then moves, `ahead` is no longer AHEAD, the reset absorbs
+    # a WAL that really is complete, and the follower correctly clears `torn` while the test asserts
+    # it should not have.
+    #
+    # The failure therefore looked like the product losing the torn flag when it was the fixture
+    # measuring a position that had moved under it.
     Session.stop(id)
+    stop_supervised!(Fleet)
 
     state = Follower.state_of(name, id)
 
