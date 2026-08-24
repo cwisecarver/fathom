@@ -22,6 +22,18 @@ defmodule Fathom.Test.PausablePeer do
   and AGENTS.md's standing lesson is that **closing the fixture gap is worth more than the single
   fix that exposed it**. Hence a reusable module rather than a helper inside one test file.
 
+  ## This module has now been wrong FIVE times, and every time it looked like a product bug
+
+  A one-shot acceptor, a dropped frame before the first accept, a spawn_link that took the peer
+  down with it, closing the very socket being accepted, and a buffering clause that only covered
+  the first connection. All five presented identically — the proxied follower simply never
+  converging, intermittently — which is exactly what the straggler bug under study looks like. Two
+  of them turned CI red.
+
+  So it has its own tests now: `test/fathom/shard/replication_pausable_peer_test.exs`. They drive
+  the mailbox directly, because these failures are message ORDERS and no black-box test can command
+  one. Add to them before changing anything here.
+
   ## Why a PROXY and not a fake follower
 
   A hand-written fake would have to reproduce `FollowerLog`'s accept/reject decision, the WAL writes
@@ -102,16 +114,53 @@ defmodule Fathom.Test.PausablePeer do
     {:reply, {:ok, length(state.held)}, %{state | paused: false, held: []}}
   end
 
+  # THE TWO LEGS FIRST, then everything else. The clause order is the design, not an accident: a
+  # frame is routed by WHICH SOCKET it came from, and only a socket this process does not yet
+  # recognise gets buffered.
+  @impl true
+  def handle_info({:tcp, sock, frame}, %{up: sock} = state) do
+    # Follower -> primary. The only direction the pause affects.
+    notify(state, :to_primary)
+
+    if state.paused do
+      {:noreply, %{state | held: [frame | state.held]}}
+    else
+      send_down(state, frame)
+      {:noreply, state}
+    end
+  end
+
+  # Primary -> follower. ALWAYS forwarded, even while paused: the follower must genuinely receive and
+  # apply the bytes, or this would be a black hole with extra steps.
+  def handle_info({:tcp, sock, frame}, %{down: sock, up: up} = state) when up != nil do
+    :gen_tcp.send(up, frame)
+    notify(state, :to_follower)
+    {:noreply, state}
+  end
+
   # DATA CAN BEAT THE ACCEPT NOTIFICATION. The acceptor calls `controlling_process/2` and THEN sends
   # `{:accepted, sock}`, but once ownership transfers the kernel may deliver buffered `{:tcp, _, _}`
-  # straight to this process — and those two messages are not ordered relative to each other. Before
-  # this clause such a frame matched neither the `down:` nor the `up:` clause, fell through the
-  # catch-all and was silently DROPPED, which presented as the first push after connect vanishing.
+  # straight to this process — and those two messages are not ordered relative to each other. Such a
+  # frame matches neither leg above, and before there was a clause for it, it fell through the
+  # catch-all and was silently DROPPED, presenting as the first push after connect vanishing.
   #
-  # Buffer instead: `handle_info({:accepted, _}, _)` flushes these the moment the upstream leg is up.
-  @impl true
-  def handle_info({:tcp, sock, frame}, %{up: nil} = state) do
-    {:noreply, %{state | down: sock, pending: [frame | state.pending]}}
+  # A FIFTH FIXTURE BUG (2026-08-24), found by reading rather than by a failure: the clause that
+  # used to cover this was guarded on `%{up: nil}`, i.e. only on the FIRST connection. On a
+  # RECONNECT `state.up` is still the previous upstream socket, so an early frame on the new
+  # downstream socket matched nothing and went back to being dropped — the exact hole the clause was
+  # added to close, still open on the path where a `Shipper` reconnects 500 ms after any socket
+  # error. Routing on socket identity instead of on `up == nil` closes both cases with one rule.
+  #
+  # PENDING FRAMES CARRY THEIR SOCKET. A frame buffered here can belong to the socket about to be
+  # accepted OR to a predecessor that is about to be closed; flushing both upstream would replay a
+  # frame the primary has already abandoned. `{:accepted, _}` forwards only the ones whose socket it
+  # is accepting and discards the rest.
+  #
+  # NOTE it does NOT set `state.down`. The earlier version did — it needed somewhere to put the
+  # bytes — and that assignment is what made `{:accepted, _}` close the very socket it was accepting
+  # (the fourth bug, `f72fe2a`). `down` is now set in exactly one place.
+  def handle_info({:tcp, sock, frame}, state) do
+    {:noreply, %{state | pending: [{sock, frame} | state.pending]}}
   end
 
   def handle_info({:accepted, sock}, state) do
@@ -148,6 +197,13 @@ defmodule Fathom.Test.PausablePeer do
     # A genuine reconnect is unaffected: there `state.down` is the PREVIOUS socket, so it still
     # closes.
     #
+    # `old != sock` IS NOW BELT AND BRACES, and it is kept deliberately. The restructure that fixed
+    # the FIFTH bug took the `down: sock` assignment out of the buffering clause, so `state.down`
+    # can no longer BE the socket being accepted and this filter cannot fire. It stays because the
+    # assignment it defends against is the obvious way to write that clause — the fourth bug was
+    # written by someone doing exactly that — and one comparison is cheap insurance against it
+    # coming back silently. `down` is now assigned in this function and nowhere else.
+    #
     # TWO THINGS ABOUT DIAGNOSING THIS, both learned the expensive way:
     #
     #   * It reproduces at roughly 1 in 30 runs of `replication_transport_test.exs` TOGETHER WITH
@@ -168,31 +224,18 @@ defmodule Fathom.Test.PausablePeer do
     # A reconnect means the primary abandoned whatever it was waiting for, so held frames belong to
     # a socket that no longer exists. Dropping them is correct; delivering them down the NEW socket
     # would be the fixture inventing a reply.
+    #
+    # Pending frames are filtered by SOCKET for the same reason in the other direction: only the
+    # ones that arrived on the socket now being accepted are this connection's. Anything buffered
+    # from a predecessor belongs to a connection the primary has abandoned, and forwarding it would
+    # replay a push the follower's peer no longer expects to be answered.
+    #
     # Oldest first — these are frames that arrived before the upstream leg existed.
-    for frame <- Enum.reverse(state.pending), do: :gen_tcp.send(up, frame)
-    for _ <- state.pending, do: notify(state, :to_follower)
+    mine = for {s, frame} <- Enum.reverse(state.pending), s == sock, do: frame
+    for frame <- mine, do: :gen_tcp.send(up, frame)
+    for _ <- mine, do: notify(state, :to_follower)
 
     {:noreply, %{state | down: sock, up: up, held: [], pending: []}}
-  end
-
-  # Primary -> follower. ALWAYS forwarded, even while paused: the follower must genuinely receive and
-  # apply the bytes, or this would be a black hole with extra steps.
-  def handle_info({:tcp, sock, frame}, %{down: sock} = state) do
-    :gen_tcp.send(state.up, frame)
-    notify(state, :to_follower)
-    {:noreply, state}
-  end
-
-  # Follower -> primary. This is the only direction the pause affects.
-  def handle_info({:tcp, sock, frame}, %{up: sock} = state) do
-    notify(state, :to_primary)
-
-    if state.paused do
-      {:noreply, %{state | held: [frame | state.held]}}
-    else
-      send_down(state, frame)
-      {:noreply, state}
-    end
   end
 
   # The FOLLOWER closed. Mirror it onto the client, which is what a direct connection would show,
