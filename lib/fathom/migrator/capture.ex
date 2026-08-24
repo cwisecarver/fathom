@@ -41,10 +41,23 @@ defmodule Fathom.Migrator.Capture do
 
   alias Fathom.Migrator
 
+  # NOT a string, despite the name. `conn_id` is the exqlite connection HANDLE that
+  # `Fathom.Shard.Connection.open/2` returns (`{:ok, reference()}`), used here purely as a map key
+  # so each Hrana stream gets its own transaction buffer.
+  #
+  # Worth naming rather than inlining: the first `@spec` written for this API said `String.t()`,
+  # because "conn_id" reads like an id, and dialyzer rejected all six call sites in
+  # `shard_executor.ex` at once. That is AGENTS.md's rule in miniature — when a type and its
+  # callers disagree, suspect the type — and a named type means the next person cannot get it
+  # wrong six more times.
+  @type conn_id :: reference()
+
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts),
     do: GenServer.start_link(__MODULE__, %{}, name: Keyword.get(opts, :name, __MODULE__))
 
   @doc "Starts a transaction buffer for `conn_id`, recording the pre-transaction count."
+  @spec begin(conn_id(), non_neg_integer(), GenServer.server()) :: :ok
   def begin(conn_id, migrations_count, server \\ __MODULE__),
     do: GenServer.cast(server, {:begin, conn_id, migrations_count})
 
@@ -56,6 +69,7 @@ defmodule Fathom.Migrator.Capture do
   to the default server instead — a test appended to the wrong process and the failure showed up as
   an unrelated `:noop`. Guarding turns that into an immediate FunctionClauseError.
   """
+  @spec append(conn_id(), String.t(), [term()], GenServer.server()) :: :ok
   def append(conn_id, sql, args, server \\ __MODULE__) when is_list(args),
     do: GenServer.cast(server, {:append, conn_id, sql, args})
 
@@ -66,6 +80,8 @@ defmodule Fathom.Migrator.Capture do
   A commit whose count did NOT rise keeps its buffer *awaiting bookkeeping* rather than
   discarding it — see `bookkeeping/4`.
   """
+  @spec commit(conn_id(), non_neg_integer(), GenServer.server()) ::
+          {:recorded, pos_integer()} | :noop | {:error, term()}
   def commit(conn_id, migrations_count, server \\ __MODULE__),
     do: GenServer.call(server, {:commit, conn_id, migrations_count})
 
@@ -99,14 +115,18 @@ defmodule Fathom.Migrator.Capture do
 
   Returns `{:recorded, version}`, `:noop`, or `{:error, _}` (same contract as `commit/3`).
   """
+  @spec bookkeeping(conn_id(), String.t(), [term()], non_neg_integer(), GenServer.server()) ::
+          {:recorded, pos_integer()} | :noop | {:error, term()}
   def bookkeeping(conn_id, sql, args, migrations_count, server \\ __MODULE__),
     do: GenServer.call(server, {:bookkeeping, conn_id, sql, args, migrations_count})
 
   @doc "Discards `conn_id`'s buffered transaction (ROLLBACK)."
+  @spec rollback(conn_id(), GenServer.server()) :: :ok
   def rollback(conn_id, server \\ __MODULE__),
     do: GenServer.cast(server, {:rollback, conn_id})
 
   @doc "Drops any buffer for `conn_id` (connection closed)."
+  @spec forget(conn_id(), GenServer.server()) :: :ok
   def forget(conn_id, server \\ __MODULE__),
     do: GenServer.cast(server, {:forget, conn_id})
 

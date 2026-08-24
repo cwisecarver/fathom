@@ -55,6 +55,7 @@ defmodule Fathom.HranaAuth.Revocations do
   @bulk_marker :__bulk_ok__
 
   @doc false
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
   @doc """

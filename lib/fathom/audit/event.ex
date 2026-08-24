@@ -20,6 +20,7 @@ defmodule Fathom.Audit.Event do
     timestamps(type: :utc_datetime_usec, updated_at: false)
   end
 
+  @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(event, attrs) do
     event
     |> cast(attrs, [:actor, :action, :shard_id, :source_ip, :outcome, :detail])

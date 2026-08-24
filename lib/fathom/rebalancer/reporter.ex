@@ -41,6 +41,7 @@ defmodule Fathom.Rebalancer.Reporter do
   @spec enabled?() :: boolean()
   def enabled?, do: Application.get_env(:fathom, :load_reporter, false) == true
 
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
   # report_now runs the full window (beat + publish + prune + warm-location publish) inline;

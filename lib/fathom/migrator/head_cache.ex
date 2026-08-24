@@ -38,6 +38,7 @@ defmodule Fathom.Migrator.HeadCache do
   @default_ttl_ms 5_000
 
   @doc false
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
   @doc """

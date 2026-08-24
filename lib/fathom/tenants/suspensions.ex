@@ -25,6 +25,7 @@ defmodule Fathom.Tenants.Suspensions do
   @default_refresh_ms 300_000
 
   @doc false
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts),
     do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
 

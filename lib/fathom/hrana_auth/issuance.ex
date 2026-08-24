@@ -29,8 +29,10 @@ defmodule Fathom.HranaAuth.Issuance do
   end
 
   @doc "Valid scope claims: `rw` (full) and `ro` (read-only, the #24 `\"sc\"` claim)."
+  @spec scopes() :: [String.t()]
   def scopes, do: @scopes
 
+  @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(issuance, attrs) do
     issuance
     |> cast(attrs, [:shard_id, :token_version, :scope, :actor, :minted_at])

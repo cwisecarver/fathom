@@ -60,6 +60,7 @@ defmodule Fathom.Rebalancer.CommandPoller do
   @spec enabled?() :: boolean()
   def enabled?, do: Application.get_env(:fathom, :command_poller, false) == true
 
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
   @doc "Runs one poll synchronously and returns how many commands were executed (tests)."
@@ -306,6 +307,7 @@ defmodule Fathom.Rebalancer.CommandPoller do
   # Ordered above the drain worst-case (drain budget + shutdown grace) so a slow-but-succeeding
   # drain isn't killed; an explicit :command_task_timeout_ms wins (operator owns the ordering).
   @doc false
+  @spec task_timeout() :: pos_integer()
   def task_timeout do
     Application.get_env(:fathom, :command_task_timeout_ms) || drain_ms() + @task_shutdown_grace_ms
   end

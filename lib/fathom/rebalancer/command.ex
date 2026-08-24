@@ -27,6 +27,7 @@ defmodule Fathom.Rebalancer.Command do
   end
 
   @doc false
+  @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(command, attrs) do
     command
     |> cast(attrs, [:shard_id, :node, :command, :status, :detail])

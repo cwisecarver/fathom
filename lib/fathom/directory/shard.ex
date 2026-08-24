@@ -70,9 +70,11 @@ defmodule Fathom.Directory.Shard do
   end
 
   @doc "Valid lifecycle statuses for a directory entry."
+  @spec statuses() :: [String.t()]
   def statuses, do: @statuses
 
   @doc "Statuses an operator may hand-set from the admin edit UI (excludes `deleted`, #15)."
+  @spec admin_editable_statuses() :: [String.t()]
   def admin_editable_statuses, do: @admin_editable_statuses
 
   @doc """
@@ -95,6 +97,7 @@ defmodule Fathom.Directory.Shard do
   end
 
   @doc false
+  @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(shard, attrs) do
     shard
     |> cast(attrs, [

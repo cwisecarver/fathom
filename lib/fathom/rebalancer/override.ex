@@ -25,6 +25,7 @@ defmodule Fathom.Rebalancer.Override do
   end
 
   @doc false
+  @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(override, attrs) do
     override
     |> cast(attrs, [:shard_id, :pinned_node, :reason, :q_per_s_at_pin, :from_node, :failed_at])

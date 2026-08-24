@@ -29,6 +29,7 @@ defmodule Fathom.Directory.Recorder do
   @default_flush_ms 1_000
 
   @doc false
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end

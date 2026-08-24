@@ -156,6 +156,7 @@ defmodule Fathom.Rebalancer.HandoffJob do
   # :handoff_drain_timeout_ms wins (operator owns the ordering then).
   @shutdown_grace_ms 35_000
   @doc false
+  @spec drain_timeout() :: pos_integer()
   def drain_timeout do
     Application.get_env(:fathom, :handoff_drain_timeout_ms) ||
       Application.get_env(:fathom, :command_drain_ms, 10_000) + @shutdown_grace_ms

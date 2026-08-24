@@ -58,6 +58,7 @@ defmodule Fathom.Migrator.Release do
   end
 
   @doc false
+  @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(release, attrs) do
     release
     |> cast(attrs, [
