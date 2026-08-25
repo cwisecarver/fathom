@@ -1527,9 +1527,35 @@ defmodule Fathom.Shard do
 
         {:stop, {:shutdown, :lease_lost}, %{state | lease_lost: true}}
 
-      # Ownership unconfirmed (transient) — the next flush's fence remains the guard.
+      # Ownership unconfirmed (transient) — the next flush's fence remains the guard for the
+      # REFUSAL, but the CLOCK starts here (expert review 2026-08-24 #19).
+      #
+      # `note_not_valid/1` was reachable from exactly one place: the `:fence_skip` branch of the
+      # durability-flush result. `handle_info(:durability_flush, …)` short-circuits at
+      # `not unflushed?(state)` BEFORE any fence check, so on a shard that is not dirty the clock
+      # never started. A read-mostly shard on a node cut from storage therefore observed nothing:
+      # the heartbeat lapsed, `ttl + steal_margin` passed, a peer became entitled to steal — and
+      # ten minutes later the first client write was ACKed, because the fence had never armed.
+      # Only then did the clock start, from zero, and writes kept being accepted for another full
+      # `margin + steal_margin`. `docs/single-writer.md` promises the loss window collapses to
+      # ~`ttl + steal_margin`; on that path it was unbounded relative to when ownership was lost.
+      #
+      # Here is the right moment BY CONSTRUCTION, which is why this is stamped here rather than
+      # back-dated from the heartbeat's deadline as the finding proposed. Back-dating can only make
+      # the breaker arm EARLIER, and earlier on a healthy node is a tenant write outage; whether a
+      # stale `mono_deadline_ms` can survive a heartbeat restart and cause exactly that could not be
+      # settled by reading. This path cannot fire early: it runs only after `mark_lapse/1` has
+      # edge-detected a real lapse and bumped the generation, and `Fence.check/2` has then failed to
+      # reconfirm ownership against storage. Its worst case is the status quo, not an outage.
+      #
+      # STILL BOUNDED BY THE NEXT FLUSH TICK, and worth knowing: this starts the clock but does not
+      # publish the fence, because at lapse time the node is not yet provably stealable — the delay
+      # IS the semantics. So the first write after a long lapse is still accepted, and the fence
+      # arms on the flush tick that write triggers, with the elapsed time now measured from the
+      # lapse instead of from the write. Closing that last gap needs a one-shot re-check timer per
+      # lapse episode; deliberately not bundled here.
       :skip ->
-        {:noreply, state}
+        {:noreply, note_not_valid(state)}
     end
   end
 

@@ -149,6 +149,9 @@ defmodule Fathom.ShardLeaseReleaseTest do
   # The stored object's path in the Local backend's dir. Writing it changes the object's etag,
   # which is how a test reproduces "the object moved under us" — the lost-PUT-response case that
   # makes a fenced flush 412 without any peer being involved.
+  defp restore_env(key, nil), do: Application.delete_env(:fathom, key)
+  defp restore_env(key, value), do: Application.put_env(:fathom, key, value)
+
   defp remote_db(shard), do: Path.join(Fathom.Shard.Storage.Local.dir(), "#{shard}.db")
 
   defp drain_and_wait!(shard, coordinator) do
@@ -688,6 +691,108 @@ defmodule Fathom.ShardLeaseReleaseTest do
     # either. The shard stays dirty, keeps ACKing writes, and NEVER FLUSHES: unbounded RPO on a
     # node that looks healthy. A coordinator opened in heartbeat mode keeps `acquire_gen` for its
     # whole life, so it cannot grow out of this on its own.
+    # THE BREAKER'S CLOCK MUST START AT THE LAPSE, NOT AT THE FIRST WRITE (expert review
+    # 2026-08-24 #19).
+    #
+    # `note_not_valid/1` was reachable from exactly one place: the `:fence_skip` branch of the
+    # durability-flush result. `handle_info(:durability_flush, …)` short-circuits at
+    # `not unflushed?(state)` BEFORE any fence check, so on a shard that is not dirty the clock
+    # never started at all.
+    #
+    # A read-mostly shard on a node cut from storage therefore observed nothing: the heartbeat
+    # lapsed, `ttl + steal_margin` passed, a peer became entitled to steal — and ten minutes later
+    # the first client write was ACKed, because the fence had never armed. Only THEN did the clock
+    # start, from zero, and writes kept being accepted for another full `margin + steal_margin`.
+    # `docs/single-writer.md` promises the loss window collapses to ~`ttl + steal_margin`; on that
+    # path it was unbounded relative to when ownership was actually lost.
+    #
+    # The shard here is deliberately CLEAN — never written since open — which is exactly the state
+    # that used to make this invisible. The lapse is driven through the real handler, and
+    # `check_lease` is forced to a TRANSIENT error so `Fence.check/2` lands on `:skip`
+    # (`fence.ex`'s `{:error, _reason} -> :skip`), which is the cut-from-storage verdict.
+    test "the not-valid clock starts at the lapse even when the shard is CLEAN", %{shard: shard} do
+      prev_jitter = Application.get_env(:fathom, :lapse_revalidate_jitter_ms)
+      prev_fence = Application.get_env(:fathom, :fence_writes_when_stealable)
+      Application.put_env(:fathom, :lapse_revalidate_jitter_ms, 1)
+      Application.put_env(:fathom, :fence_writes_when_stealable, true)
+
+      on_exit(fn ->
+        restore_env(:lapse_revalidate_jitter_ms, prev_jitter)
+        restore_env(:fence_writes_when_stealable, prev_fence)
+        Application.delete_env(:fathom, :faulty_check_lease_result)
+      end)
+
+      seed!(shard, "read-mostly")
+      {:ok, coordinator} = Shards.ensure(shard)
+      assert_mode!(coordinator, :heartbeat)
+
+      # Drain the write the fixture made, so the shard is genuinely CLEAN — the state in which the
+      # old code could never start the clock.
+      :ok = Shards.flush(shard)
+      refute Shard.dirty?(coordinator), "the fixture is dirty; this test is about the CLEAN case"
+
+      acquire_gen = :sys.get_state(coordinator).acquire_gen
+      assert is_integer(acquire_gen)
+      refute :sys.get_state(coordinator).not_valid_since, "the clock must start unset"
+
+      # Storage is unreachable: the ownership re-check fails transiently rather than reporting a
+      # steal, which is the cut-from-storage shape.
+      Application.put_env(
+        :fathom,
+        :faulty_check_lease_result,
+        {:error, {:transient, :s3_unreachable}}
+      )
+
+      # ACTUALLY MOVE THE HEARTBEAT'S GENERATION, do not just fake the broadcast. The first draft
+      # only sent the message, and it failed: `Fence.check/2` asks
+      # `Heartbeat.valid_for_write?(acquire_gen)`, which reads the heartbeat's REAL published
+      # generation — still unmoved — so it answered `:ok` and the fence cleared instead of
+      # skipping. AGENTS.md documents exactly this trap ("reaching a specific fence verdict needs
+      # the right fixture, and the wrong one passes quietly"); here it failed loudly only because
+      # the assertion is on the clock rather than on a log line.
+      #
+      # `publish_status/1` syncs the lock-free ETS view the fence reads. A DIFFERENT generation is
+      # what routes to `:revalidate` (a past deadline at the SAME generation would be `:not_valid`,
+      # a different verdict).
+      hb = Process.whereis(Heartbeat)
+
+      :sys.replace_state(hb, fn s ->
+        Heartbeat.publish_status(%{s | generation: s.generation + 1, lapsed: true})
+      end)
+
+      # …and then the broadcast the real `mark_lapse/1` sends alongside it.
+      send(coordinator, {:heartbeat_lapsed, acquire_gen + 1})
+
+      # `:revalidate_lapse` is a JITTERED send_after, so the state change is not synchronous with
+      # the broadcast — poll to a deadline rather than spinning. A bare `:sys.get_state` loop is
+      # not enough: it completes hundreds of round trips inside the 1 ms timer and reports the
+      # clock unset, which is a fixture race and not the bug. (Same bounded-poll idiom as
+      # `shard_kill_cleanup_test.exs`'s registry wait.)
+      deadline = System.monotonic_time(:millisecond) + 2_000
+
+      started =
+        Stream.repeatedly(fn ->
+          case :sys.get_state(coordinator).not_valid_since do
+            nil ->
+              if System.monotonic_time(:millisecond) > deadline,
+                do: :timeout,
+                else: Process.sleep(1)
+
+            since ->
+              since
+          end
+        end)
+        |> Enum.find(&(&1 != :ok))
+
+      # `is_integer/1`, not a bare truthiness check: the poll answers `:timeout` on expiry, which
+      # is TRUTHY and would have made this pass vacuously.
+      assert is_integer(started),
+             "the not-valid clock never started. The shard is clean, so no flush tick runs and " <>
+               "nothing else observes the lapse — the breaker will not arm until some future " <>
+               "write dirties the shard, and it will then measure from THAT write rather than " <>
+               "from when ownership was actually lost."
+    end
+
     test "a durability flush still uploads while the Heartbeat process is down", %{shard: shard} do
       seed!(shard, "before-crash")
       {:ok, coordinator} = Shards.ensure(shard)
