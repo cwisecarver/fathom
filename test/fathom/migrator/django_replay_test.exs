@@ -289,6 +289,102 @@ defmodule Fathom.Migrator.DjangoReplayTest do
     assert verbatim == stripped
   end
 
+  # THE TRANSFORM SEAM, DRIVEN BY REAL DJANGO SQL (expert review 2026-08-24 #26).
+  #
+  # AGENTS.md's migration gate requires a forward copy+transform test, and the two halves existed in
+  # separate files that never met. This file is the only one driven by verbatim `manage.py migrate`
+  # output — real `?`-parameterized statements whose values ride in args — and it never attached a
+  # transform. Every transform test used hand-written SQL with `[]` args, which is exactly the shape
+  # AGENTS.md warns hid the NULL-bind bug for the whole life of the engine: replaying the text alone
+  # bound NULL against a NOT NULL column and aborted every copy.
+  #
+  # And `Transform`'s own `@callback` doc mandates idempotency — "a shard whose migration job
+  # retried after a transient failure will run this again" — while nothing ran a chain twice against
+  # the same destination. So the contract transform authors are told to honour was unverifiable.
+  #
+  # Both halves here: a transform attached to a step of the REAL chain, validated with
+  # `Keystone.dump/1`-style full row equality, then the same chain replayed onto the
+  # already-migrated destination to pin that its effect does not change.
+  defmodule BackfillTransform do
+    @moduledoc false
+    @behaviour Fathom.Migrator.Transform
+
+    @impl true
+    def run(conn, shard_id) do
+      # Idempotent BY CONSTRUCTION — the `WHERE` makes a second run a no-op — which is what the
+      # callback contract asks for and what the re-run below actually checks.
+      {:ok, _} =
+        Fathom.Shard.Connection.query(
+          conn,
+          "UPDATE django_migrations SET applied = ? WHERE applied IS NULL OR applied = ''",
+          ["backfilled-by-#{shard_id}"]
+        )
+
+      :ok
+    end
+  end
+
+  test "a transform runs inside a REAL Django chain, and is idempotent across a replay",
+       %{capture: [v1, v2]} do
+    :ok = release!(v1)
+    :ok = release!(v2)
+    prev = Application.get_env(:fathom, :migration_transforms)
+    Application.put_env(:fathom, :migration_transforms, [BackfillTransform])
+    on_exit(fn -> restore_transforms(prev) end)
+
+    chain = [
+      {v1.version, pairs(v1), nil},
+      # A STRING, the way a release row stores it — `Transform.resolve/1` deliberately
+      # never converts a data column to an atom, so this is the real shape.
+      {v2.version, pairs(v2), to_string(BackfillTransform)}
+    ]
+
+    source = fresh_django_db!("xform_src")
+    dest = fresh_django_db!("xform_dst")
+
+    assert :ok = Copy.migrate_chain(source, dest, chain, shard_id: "xform_tenant")
+
+    # The transform ran, on rows the REAL parameterized INSERT put there — so this covers the
+    # args-carrying path, not just the transform.
+    rows = query!(dest, "SELECT app, name, applied FROM django_migrations ORDER BY name").rows
+
+    assert rows != [],
+           "the real chain inserted no migration rows; the fixture is not being replayed"
+
+    assert Enum.all?(rows, fn [_app, _name, applied] -> applied != nil and applied != "" end),
+           "the transform did not run against the real chain's rows"
+
+    after_first = full_dump(dest)
+
+    # THE IDEMPOTENCY HALF: replay the same chain onto the ALREADY-MIGRATED destination, which is
+    # what a retried migration job does. The DDL steps will fail on an already-migrated file, so
+    # run the transform-carrying step alone — that is the part whose contract is idempotency.
+    assert :ok =
+             Copy.migrate_chain(dest, dest, [{v2.version, [], to_string(BackfillTransform)}],
+               shard_id: "xform_tenant"
+             )
+
+    assert full_dump(dest) == after_first,
+           "the transform changed the database on a second run. Transform's @callback doc requires " <>
+             "idempotency precisely because a retried job runs it again, and nothing checked it."
+  end
+
+  defp restore_transforms(nil), do: Application.delete_env(:fathom, :migration_transforms)
+  defp restore_transforms(v), do: Application.put_env(:fathom, :migration_transforms, v)
+
+  # Full value equality over every user table, the strongest comparison available here — the same
+  # shape `Keystone.dump/1` uses, which until now was applied only to a ZERO-statement copy.
+  defp full_dump(path) do
+    tables =
+      query!(path, "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").rows
+      |> Enum.map(&hd/1)
+      |> Enum.reject(&String.starts_with?(&1, "sqlite_"))
+
+    for t <- tables, into: %{} do
+      {t, query!(path, "SELECT * FROM #{t}").rows}
+    end
+  end
+
   # Every object in sqlite_master, both version stamps, and Django's ledger — the whole observable
   # result of a migration chain.
   defp replay_chain!(steps) do

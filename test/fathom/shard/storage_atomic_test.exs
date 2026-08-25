@@ -26,7 +26,21 @@ defmodule Fathom.Shard.StorageAtomicTest do
     base = Path.join(dir, "shard.db")
     old = {{2020, 1, 1}, {0, 0, 0}}
 
-    stale = [base <> ".dl.1", base <> ".snap.2", base <> ".tmp.3", base <> ".pull"]
+    # `.z.*` and `.promote.*` are here because each was ADDED to the glob after being found
+    # leaking: `z` by expert review 2026-08-01 #45 (the compressed-upload temp) and `promote` by
+    # 2026-08-24 #27 (the replica-promotion staging temp, stranded whenever the coordinator is
+    # brutally killed during promote-on-open — its `after File.rm` cannot run then). Both are full
+    # shard-sized orphans on a volume nothing else sweeps, so they belong in the pinned set rather
+    # than being re-discovered a third time.
+    stale = [
+      base <> ".dl.1",
+      base <> ".snap.2",
+      base <> ".tmp.3",
+      base <> ".pull",
+      base <> ".z.4",
+      base <> ".promote.5"
+    ]
+
     keep = [base, base <> ".etag", base <> "-wal", base <> ".forked.123-4", base <> ".dl.9"]
 
     for f <- stale ++ keep, do: File.write!(f, "x")
@@ -34,7 +48,7 @@ defmodule Fathom.Shard.StorageAtomicTest do
     # is what protects them; age the sidecars too to prove it).
     for f <- stale ++ (keep -- [base <> ".dl.9"]), do: File.touch!(f, old)
 
-    assert Storage.reap_stale_temps(base, 60_000) == 4
+    assert Storage.reap_stale_temps(base, 60_000) == 6
 
     for f <- stale, do: refute(File.exists?(f), "#{f} must be reaped")
     for f <- keep, do: assert(File.exists?(f), "#{f} must survive the reap")

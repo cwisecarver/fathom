@@ -1167,7 +1167,16 @@ defmodule Fathom.Shard.Storage do
     # already caught by the `snap` glob; for `upload_for_drop/1` it is the LIVE db path, so the
     # temp is `<path>.z.<n>` and matched nothing here — one shard-sized orphan per killed
     # drop-flush, forever.
-    for tmp <- Path.wildcard(base <> ".{dl,snap,tmp,pull,z}*"),
+    # `promote` is the replica-promotion staging temp (`<path>.promote.<n>`, written by both
+    # `Fathom.Shard`'s promote-on-open and `Replication.Promote.stage/3`) — expert review
+    # 2026-08-24 #27, the identical omission to `z` above and for the identical reason. Each site
+    # has an `after` block that removes it, which covers an exception; but `promote_replica/7` runs
+    # INLINE in the coordinator's `handle_continue(:open, …)`, and that process is brutally killed
+    # on `:shard_shutdown_ms` expiry, on `DynamicSupervisor.terminate_child` from `Shards.stop/1`,
+    # and on node death. One full shard-sized orphan (plus its `-wal`/`-shm`) per killed promotion,
+    # on a volume nothing ever swept — it eats the density budget and, via
+    # `Fathom.Admin.Measurements.disk/0`, the free-space floor the warm cache backs off against.
+    for tmp <- Path.wildcard(base <> ".{dl,snap,tmp,pull,z,promote}*"),
         stale_file?(tmp, cutoff),
         reduce: 0 do
       acc ->
