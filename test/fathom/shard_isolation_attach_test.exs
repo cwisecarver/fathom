@@ -327,6 +327,95 @@ defmodule Fathom.ShardIsolationAttachTest do
       :ok = ShardExecutor.close(a)
     end
 
+    # THE SCHEMA-QUALIFIER DOT (expert review 2026-08-24 #1, verified by execution). The parser
+    # that replaced the 200-char window scanned the name to the first `=`, `(`, `;` or whitespace
+    # and never treated `.` specially. So `PRAGMA main . writable_schema = ON` parsed as
+    # name = "main", tail = " . writable_schema = ON" — and `pragma_assignment?/1`, seeing "."
+    # rather than "=" or "(", classified it a BARE READ and let it through. Measured before the
+    # fix, on a real shard with the tenant authorizer set:
+    #
+    #     "PRAGMA writable_schema = ON"          -> FILO_PRAGMA_BLOCKED   (the baseline held)
+    #     "PRAGMA main . writable_schema = ON"   -> {:ok, _}   writable_schema became 1
+    #     "PRAGMA main . max_page_count = 9..9"  -> {:ok, _}   the size cap was defeated
+    #
+    # The list above pins `PRAGMA main.journal_mode=DELETE` UNSPACED, and the padding test pads
+    # only between PRAGMA and the name — never around the dot — which is why the suite reported
+    # full coverage of a gate with this hole in it.
+    test "whitespace and quoting around the schema qualifier cannot smuggle an assignment", ctx do
+      {:ok, a} = ShardExecutor.open(ctx.attacker)
+
+      names = ["writable_schema", "max_page_count", "synchronous", "journal_mode", "query_only"]
+
+      forms =
+        for name <- names,
+            ws <- [" ", "  ", "\t", "\n"],
+            form <- [
+              "PRAGMA main#{ws}.#{ws}#{name}#{ws}=#{ws}ON",
+              "PRAGMA main.#{ws}#{name}=ON",
+              "PRAGMA main#{ws}.#{name}=ON",
+              # Quoting is legal at every identifier position, and the unquoted name is what
+              # the allow-list must see.
+              ~s|PRAGMA "#{name}" = ON|,
+              ~s|PRAGMA [#{name}] = ON|,
+              ~s|PRAGMA `#{name}` = ON|,
+              ~s|PRAGMA "main" . "#{name}" = ON|,
+              ~s|PRAGMA main.[#{name}](ON)|
+            ],
+            do: form
+
+      for sql <- forms do
+        assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
+                 ShardExecutor.execute(a, stmt(sql)),
+               "#{inspect(sql)} was NOT refused — every protective pragma is settable by any " <>
+                 "tenant with a :rw token"
+      end
+
+      # The EFFECT, not just the error code: an attempt that returns an error but still mutated
+      # the connection would pass the assertion above and fail the gate's actual purpose.
+      assert {:ok, %StmtResult{rows: [[0]]}} =
+               ShardExecutor.execute(a, stmt("PRAGMA writable_schema"))
+
+      assert {:ok, %StmtResult{rows: [[2]]}} =
+               ShardExecutor.execute(a, stmt("PRAGMA synchronous"))
+
+      refute match?(
+               {:ok, %StmtResult{rows: [[999_999_999]]}},
+               ShardExecutor.execute(a, stmt("PRAGMA max_page_count"))
+             ),
+             "the size cap was rewritten through the qualifier bypass"
+
+      :ok = ShardExecutor.close(a)
+    end
+
+    # The other half of the same parse: a QUALIFIED pragma that IS allow-listed must still run,
+    # spaced or not. Django issues `foreign_keys`, and over-refusing it breaks an unchanged
+    # client — which is the failure mode a blunt "refuse anything with a dot" fix would have.
+    test "an allow-listed pragma still works through the schema qualifier", ctx do
+      {:ok, a} = ShardExecutor.open(ctx.attacker)
+
+      for sql <- [
+            "PRAGMA main.foreign_keys=ON",
+            "PRAGMA main . foreign_keys = ON",
+            "PRAGMA main.\tcache_size = -2000",
+            ~s(PRAGMA "main"."foreign_keys" = ON)
+          ] do
+        assert {:ok, _} = ShardExecutor.execute(a, stmt(sql)),
+               "#{inspect(sql)} was refused; the qualifier fix over-refused a real client pragma"
+      end
+
+      # A bare qualified READ stays a read, and a batched statement after a bare read must not
+      # be mistaken for that read's argument by the `argumentish_tail?/1` belt.
+      assert {:ok, %StmtResult{}} = ShardExecutor.execute(a, stmt("PRAGMA main.database_list"))
+
+      refute match?(
+               {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}},
+               ShardExecutor.execute(a, stmt("PRAGMA journal_mode"))
+             ),
+             "a bare read was refused by the argument belt"
+
+      :ok = ShardExecutor.close(a)
+    end
+
     test "the connection's durability settings actually survive the attempt", ctx do
       {:ok, a} = ShardExecutor.open(ctx.attacker)
 

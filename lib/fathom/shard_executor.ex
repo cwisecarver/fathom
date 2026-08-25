@@ -1229,16 +1229,19 @@ defmodule Fathom.ShardExecutor do
       |> String.slice(6..-1//1)
       |> String.trim_leading()
 
-    {name_raw, tail} = split_at_pragma_delim(rest, "")
-    name = name_raw |> String.downcase() |> String.split(".") |> List.last()
+    {name_raw, tail} = split_pragma_name(rest)
+    name = String.downcase(name_raw)
+
+    allowed? =
+      name in @tenant_pragma_allow or name in @tenant_pragma_introspect or
+        name in extra_pragma_allow()
 
     cond do
-      # Nothing after the name but whitespace or a terminator: a bare read, always allowed.
-      not pragma_assignment?(tail) ->
+      allowed? ->
         nil
 
-      name in @tenant_pragma_allow or name in @tenant_pragma_introspect or
-          name in extra_pragma_allow() ->
+      # Nothing after the name but whitespace or a terminator: a bare read, always allowed.
+      not pragma_assignment?(tail) and not argumentish_tail?(tail) ->
         nil
 
       true ->
@@ -1250,12 +1253,73 @@ defmodule Fathom.ShardExecutor do
     end
   end
 
-  # The pragma name runs to the first `=`, `(`, `;` or whitespace. Everything after is the tail.
+  # `PRAGMA [schema.]name` — read STRUCTURALLY, tolerating insignificant whitespace and SQLite
+  # quoting at every position an identifier may carry them. Returns {unquoted_name, tail}.
+  #
+  # THE WHITESPACE IS THE WHOLE POINT (expert review 2026-08-24 #1). The previous parser scanned
+  # the name to the first `=`, `(`, `;` or whitespace and never treated `.` specially, so
+  #
+  #     PRAGMA main . writable_schema = ON
+  #
+  # yielded name_raw = "main" and tail = " . writable_schema = ON". `pragma_assignment?/1` trims
+  # and sees "." — not "=" or "(" — concludes "bare read, always allowed", and the assignment
+  # executed. Verified against exqlite with the tenant authorizer set: `writable_schema`,
+  # `max_page_count` and `synchronous` were all settable that way, and `PRAGMA main. foo = 1`
+  # (space only AFTER the dot) plus tab/newline variants worked identically. This is the same
+  # defect class as 2026-08-20 #19 (the `String.slice(6, 200)` window), reintroduced by the
+  # parser that replaced it — hence structural parsing rather than a third delimiter tweak.
+  defp split_pragma_name(rest) do
+    {first, after_first} = read_identifier(rest)
+
+    case String.trim_leading(after_first) do
+      "." <> after_dot -> after_dot |> String.trim_leading() |> read_identifier()
+      _ -> {first, after_first}
+    end
+  end
+
+  # A SQLite identifier: bare, "double-quoted", [bracketed], or `backticked`. Doubling escapes
+  # the delimiter in the `"` and backtick forms; SQLite's `[...]` form has NO escape, so `]`
+  # always closes it. The name is returned UNQUOTED, so `PRAGMA "writable_schema" = ON` compares
+  # against the allow-list as `writable_schema`. Those quoted forms happened to fail closed
+  # before this change (the name kept its quotes and matched nothing) — but only by accident,
+  # and they would have failed OPEN the moment anyone added unquoting without fixing the parse.
+  defp read_identifier(<<?", rest::binary>>), do: read_delimited(rest, ?", true, "")
+  defp read_identifier(<<?`, rest::binary>>), do: read_delimited(rest, ?`, true, "")
+  defp read_identifier(<<?[, rest::binary>>), do: read_delimited(rest, ?], false, "")
+  defp read_identifier(bare), do: split_at_pragma_delim(bare, "")
+
+  defp read_delimited(<<c::utf8, c2::utf8, rest::binary>>, close, true, acc)
+       when c == close and c2 == close,
+       do: read_delimited(rest, close, true, acc <> <<c::utf8>>)
+
+  defp read_delimited(<<c::utf8, rest::binary>>, close, _doubling?, acc) when c == close,
+    do: {acc, rest}
+
+  defp read_delimited(<<c::utf8, rest::binary>>, close, doubling?, acc),
+    do: read_delimited(rest, close, doubling?, acc <> <<c::utf8>>)
+
+  # Unterminated quote. Return what we have: the name will not match the allow-list and the
+  # statement is refused, which is the safe direction for a malformed identifier.
+  defp read_delimited("", _close, _doubling?, acc), do: {acc, ""}
+
+  # The bare pragma name runs to the first `=`, `(`, `;`, `.` or whitespace. `.` is a delimiter
+  # so the unspaced `PRAGMA main.foreign_keys=ON` splits the same way the spaced form does —
+  # without it, the name would read as "main.foreign_keys" and Django's own pragmas would 403.
   defp split_at_pragma_delim(<<c::utf8, rest::binary>>, acc)
-       when c not in [?=, ?(, ?;, ?\s, ?\t, ?\n, ?\r],
+       when c not in [?=, ?(, ?;, ?., ?\s, ?\t, ?\n, ?\r],
        do: split_at_pragma_delim(rest, acc <> <<c::utf8>>)
 
   defp split_at_pragma_delim(tail, acc), do: {acc, tail}
+
+  # Belt, worn because the parser above is the SECOND one to be wrong here. If anything that
+  # looks like an argument survives in this statement after a name the allow-list does not
+  # cover, refuse rather than guess — over-refusal costs a 403, under-refusal costs the bypass
+  # above. Scoped to THIS statement (cut at the first `;`) so a bare read followed by unrelated
+  # batched statements is not caught: `PRAGMA journal_mode; UPDATE t SET a=1` stays a read.
+  defp argumentish_tail?(tail) do
+    [this_statement | _] = String.split(tail, ";", parts: 2)
+    String.contains?(this_statement, ["=", "("])
+  end
 
   # An assignment is `= value` or `(value)`. Anything else — end of statement, a bare `;`, trailing
   # whitespace — is a read. Leading whitespace is skipped so `PRAGMA foo   =   1` is still an
