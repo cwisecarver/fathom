@@ -695,6 +695,11 @@ defmodule Fathom.Telemetry do
         description:
           "Shards whose migration was CANCELLED because a version the chain needs is unknown or yanked. Cancelling is correct — the version will never exist again, and quarantining a healthy untouched shard would hide it from `laggards/2`, `shards_at_version/1` and a later fleet revert — but the shard is then permanently non-converging with nothing above [info] saying so, which is what this exists to surface. Non-zero after a `Migrator.yank/1` of a MIDDLE version means the release graph has a hole every shard below it must walk through, and the fix is a new release bridging it, not a retry. Untagged: `target` and `missing` are version numbers, unbounded as labels"
       ),
+      counter("fathom.migrator.revert_no_retained_version.count",
+        event_name: [:fathom, :migrator, :revert_no_retained_version],
+        description:
+          "Shards a fleet revert could not reach because they never passed through the fleet-wide to_version. A forward migration retains only the version the shard came FROM, and a cold-tail shard chain-migrates several versions in one job — so a revert to vN-1 finds no retained copy for anything that jumped over it. Non-zero means the revert PARTIALLY landed: these shards are still on the bad schema while `revert_status/1` reports remaining: 0, because it counts only active rows. The recovery is a per-shard revert to a version each shard actually retained. Untagged: to_version is a version number, unbounded as a label"
+      ),
       counter("fathom.migrator.inline_migrate_failed.count",
         event_name: [:fathom, :migrator, :inline_migrate_failed],
         description:

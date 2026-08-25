@@ -75,6 +75,58 @@ defmodule Fathom.Migrator.RevertJob do
           {:cancel, guard}
         end
 
+      # THE RETAINED VERSION WAS NEVER CREATED (expert review 2026-08-24 #16). Deterministic in
+      # exactly the way the force-guard above is: no number of retries will conjure the object.
+      #
+      # A forward migration retains exactly ONE object, `<shard>@prev`, where `prev` is the shard's
+      # version before it ran. A cold-tail shard walks `current+1 … target` in a SINGLE job, so a
+      # shard that was at v5 and migrated to HEAD=9 has only `<shard>@5`. A fleet revert, though,
+      # picks one fleet-wide `to_version` — `Migrator.revert(9, 8)`, or `head()` from
+      # `revert_stranded/0` — and asks every shard for `<shard>@8`, which the chain-jumpers never
+      # created. Both backends answer deterministically (`{:error, :enoent}` from Local,
+      # `{:error, :version_absent}` from S3) and neither had a clause here, so they fell to
+      # `handle_error/3`, burned 5 attempts, and quarantined a shard whose only problem is that the
+      # operator asked for a version it never passed through.
+      #
+      # That made a fleet revert read as LANDED while leaving those shards on the bad schema:
+      # quarantined rows drop out of `revert_status/1`'s `status == "active"` filter, so `remaining`
+      # goes to 0 and the loss shows only in the separate `failed` count. `revert_stranded/0` then
+      # re-enqueued the same doomed revert on every reconcile tick.
+      #
+      # THE QUARANTINE IS KEPT, and that is a correction to the finding. It recommended cancelling
+      # WITHOUT marking, on the grounds that the shard is healthy and quarantine hides it from a
+      # later revert. True for the chain-jump case — but "no object at `<shard>@N`" has a second
+      # cause storage cannot distinguish from it: the backup EXISTED and was legitimately retired
+      # past its retention window. Expert review #24 added the quarantine for exactly that case,
+      # `shard_migration_job_test.exs`'s "an exhausted revert quarantines the shard" pins it, and
+      # dropping it would re-open the silent partial-revert that #24 closed.
+      #
+      # So this branch changes what was genuinely wrong — five doomed retries and a generic
+      # "revert failed permanently" that named neither the cause nor the likely reason — and keeps
+      # the durable record. Whether the chain-jump case should be distinguished at all is the
+      # finding's real fix (per-shard revert targeting) and is parked; see the run's progress file.
+      {:error, absent} when absent in [:enoent, :version_absent] ->
+        Fathom.Directory.mark_failed(shard_id)
+
+        Logger.error(
+          "shard #{shard_id}: revert to v#{to_version} FAILED — no retained copy at " <>
+            "#{shard_id}@#{to_version}, and no retry can create one. Either it was retired past " <>
+            "its retention window, or this shard never passed through v#{to_version} at all: a " <>
+            "cold-tail shard chain-migrates several versions in ONE job and retains only the " <>
+            "version it came FROM, so a fleet-wide revert target does not exist for it. This " <>
+            "shard is still on its pre-revert schema. It is now quarantined, which means it also " <>
+            "drops out of revert_status/1 — so `remaining: 0` there does NOT mean the fleet " <>
+            "revert landed; check the failed count."
+        )
+
+        :telemetry.execute(
+          [:fathom, :migrator, :revert_no_retained_version],
+          %{count: 1},
+          %{shard_id: shard_id, to_version: to_version}
+        )
+
+        {:cancel, :no_retained_version}
+
       {:error, reason} ->
         handle_error(job, shard_id, reason)
     end

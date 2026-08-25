@@ -207,6 +207,58 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     refute_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1})
   end
 
+  # A FLEET REVERT TO A VERSION THIS SHARD NEVER PASSED THROUGH (expert review 2026-08-24 #16).
+  #
+  # A forward migration retains exactly ONE object, `<shard>@prev` — the version the shard came
+  # FROM. A cold-tail shard walks `current+1 … target` in a single job, so one that was at v1 and
+  # migrated to HEAD=3 has only `<shard>@1`. A fleet revert picks one fleet-wide `to_version`
+  # (`Migrator.revert(3, 2)`, or `head()` from `revert_stranded/0`) and asks every shard for
+  # `<shard>@2`, which the chain-jumpers never created.
+  #
+  # Both backends answer deterministically — `{:error, :enoent}` from Local, `:version_absent` from
+  # S3 — and RevertJob had no clause for either, so they fell to `handle_error/3` and burned five
+  # doomed retries before a generic "revert failed permanently" that named neither the cause nor
+  # the likely reason.
+  #
+  # THE QUARANTINE IS DELIBERATELY KEPT, against the finding's recommendation. It argued for
+  # cancelling without marking, since the shard is healthy and quarantine hides it from a later
+  # revert. That is right for the chain-jump case — but "no object at `<shard>@N`" has a second
+  # cause storage cannot distinguish: the backup existed and was legitimately RETIRED past its
+  # retention window. Expert review #24 added the quarantine for that case and the test above
+  # ("an exhausted revert quarantines the shard") pins it; dropping it would re-open the silent
+  # partial revert #24 closed. So this asserts the deterministic cancel and the durable record
+  # together, and the operator's discrimination comes from the log and the telemetry event.
+  #
+  # The fixture is the real shape, not a contrived one: v1 retained, live at v3, revert asked for
+  # v2. Every existing revert test reverts a shard that moved exactly ONE version, which is why
+  # this never fired.
+  test "a revert to a version the shard never retained fails deterministically, not after retries",
+       %{shard: shard} do
+    seed_v1!(shard)
+    # The chain-jump: it came from v1 (so only @1 exists) and is now at v3.
+    :ok = Storage.retain(shard, 1)
+    {:ok, _} = Directory.cutover(shard, 3)
+
+    refute File.exists?(Path.join(remote_dir(), "#{shard}@2.db")),
+           "the fixture must NOT have a @2 backup — its absence is the whole scenario"
+
+    log =
+      capture_log(fn ->
+        # attempt: 1, NOT the final attempt — the point is that it does not wait for one.
+        assert {:cancel, :no_retained_version} =
+                 perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 2}, attempt: 1)
+      end)
+
+    # The diagnosis is the deliverable here: both causes produce the same storage error, so the
+    # log is what lets an operator tell "retired past retention" from "never passed through it".
+    assert log =~ "never passed through"
+    assert log =~ "revert_status"
+
+    assert {:ok, %{status: "migration_failed"}} = Directory.get(shard),
+           "the durable record from review #24 must survive — a revert that did not land has to " <>
+             "be visible somewhere other than a log line"
+  end
+
   # Round-2 #30: a RevertJob dying between the cutover and the Oban ack retries with
   # the revert ALREADY complete — and the re-run took the destructive path again:
   # retain(current == to_version) copied live over the retained @to_version backup,
