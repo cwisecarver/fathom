@@ -85,12 +85,39 @@ defmodule Fathom.Shards.NovelLimiter do
     end
   end
 
-  # `allow/2` is only called when a rate is configured (see Fathom.Shards); a nil rate
-  # here (retuned off mid-flight) grants everything via an effectively-infinite refill.
+  @doc """
+  Whether the novel-shard rate gate is ON — i.e. `:novel_shard_rate` is a POSITIVE number.
+
+  `Fathom.Shards` used to decide this with `!= nil`, which is the bug in expert review 2026-08-24
+  #20: `NOVEL_SHARD_RATE=0` is the natural operator spelling of "disabled" (the documentation says
+  "unset = off"), `runtime.exs` passes whatever `String.to_integer/1` returns, and `0` is not nil —
+  so every novel-shard open called `allow/2`, `rate/0` had no clause for it, and the GenServer died
+  with a `CaseClauseError`. `limiter_refused?/1` catches the exit and fails closed, so every novel
+  shard 429s; but the plane supervisor restarts the process on each call and runs
+  `max_restarts: 30` in `max_seconds: 10`. Thirty-one novel-shard requests in ten seconds —
+  precisely the signup spray this limiter exists to absorb — then take the DATA PLANE DOWN,
+  turning a silent misconfiguration into a remotely-triggerable node outage.
+
+  Reading `0` as "off" rather than refusing it at boot is deliberate: `0` unambiguously means no
+  rate limiting, and a boot refusal turns a benign typo into a failed deploy.
+  """
+  @spec enabled?() :: boolean()
+  def enabled? do
+    case Application.get_env(:fathom, :novel_shard_rate) do
+      rate when is_number(rate) and rate > 0 -> true
+      _ -> false
+    end
+  end
+
+  # `allow/2` is only called when the gate is ON (see `enabled?/0` and `Fathom.Shards`); a rate
+  # that is nil or non-positive here — retuned off mid-flight, or a misconfiguration that reached
+  # this far — grants everything via an effectively-infinite refill rather than crashing the
+  # limiter. The catch-all is defence, not the path: `enabled?/0` is what keeps a zero rate from
+  # calling `allow/2` at all.
   defp rate do
     case Application.get_env(:fathom, :novel_shard_rate) do
-      nil -> 1_000_000
       rate when is_number(rate) and rate > 0 -> rate
+      _ -> 1_000_000
     end
   end
 

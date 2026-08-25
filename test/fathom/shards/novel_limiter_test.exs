@@ -173,6 +173,49 @@ defmodule Fathom.Shards.NovelLimiterTest do
       assert :ok = checkout(unique_shard("novel_off"))
     end
 
+    # ZERO IS ALSO OFF, AND IT USED TO BE A NODE OUTAGE (expert review 2026-08-24 #20).
+    #
+    # The gate was `Application.get_env(:fathom, :novel_shard_rate) != nil`, and `rate/0` was a
+    # two-clause case — `nil` and `rate > 0` — with NO catch-all. `NOVEL_SHARD_RATE=0` is the
+    # natural operator spelling of "disabled" (the documentation says "unset = off") and
+    # `runtime.exs` passes whatever `String.to_integer/1` returns, so `0` is not nil: every
+    # novel-shard open called `allow/2`, the GenServer died with a `CaseClauseError`, and
+    # `limiter_refused?/1` caught the exit and failed closed — so EVERY new tenant 429'd, with no
+    # diagnosable signal beyond a CaseClauseError in the log.
+    #
+    # Worse than the refusals: the plane supervisor restarts the limiter on each call and runs
+    # `max_restarts: 30` in `max_seconds: 10`, so 31 novel-shard requests in ten seconds — exactly
+    # the signup spray this limiter absorbs — exhaust the restart intensity and bring the DATA
+    # PLANE down. A silent misconfiguration, remotely triggerable.
+    #
+    # Rejecting `0` at boot was considered and not taken: `0` unambiguously means no rate
+    # limiting, and a boot refusal turns a benign typo into a failed deploy.
+    test "a zero rate reads as OFF, and does not kill the limiter" do
+      Application.put_env(:fathom, :novel_shard_rate, 0)
+      refute NovelLimiter.enabled?(), "0 must read as the gate being off"
+
+      limiter = Process.whereis(NovelLimiter)
+      assert is_pid(limiter), "the limiter must be running for this test to mean anything"
+
+      # Well past the supervisor's max_restarts of 30 in 10 seconds: pre-fix this is the outage.
+      for _ <- 1..35 do
+        assert :ok = checkout(unique_shard("novel_zero"))
+      end
+
+      assert Process.whereis(NovelLimiter) == limiter,
+             "the limiter process died and was restarted — 31 of these in ten seconds exhausts " <>
+               "the plane supervisor's restart intensity and takes the data plane down"
+    end
+
+    # The catch-all in `rate/0` is defence behind `enabled?/0`, so assert it directly rather than
+    # relying on a path that no longer reaches it.
+    test "a negative or non-numeric rate also reads as off" do
+      for bad <- [-1, 0, "5", :on] do
+        Application.put_env(:fathom, :novel_shard_rate, bad)
+        refute NovelLimiter.enabled?(), "#{inspect(bad)} must not enable the gate"
+      end
+    end
+
     test "the executor surfaces the refusal as 429" do
       exhaust_bucket!()
       refused = unique_shard("novel_http")

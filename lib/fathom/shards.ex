@@ -690,7 +690,13 @@ defmodule Fathom.Shards do
         {:error, :node_at_capacity}
 
       true ->
-        rate_gated? = Application.get_env(:fathom, :novel_shard_rate) != nil
+        # `NovelLimiter.enabled?/0`, NOT `!= nil` (expert review 2026-08-24 #20). The gate must be
+        # ON only for a POSITIVE rate: `NOVEL_SHARD_RATE=0` is the natural operator spelling of
+        # "disabled" — the docs say "unset = off" — and `0` is not nil, so it used to reach
+        # `allow/2`, crash the limiter on a `CaseClauseError`, and (via the plane supervisor's
+        # `max_restarts: 30` in `max_seconds: 10`) take the data plane down after 31 novel-shard
+        # requests in ten seconds. See that function for the whole sequence.
+        rate_gated? = Fathom.Shards.NovelLimiter.enabled?()
         fork_gated? = Application.get_env(:fathom, :fork_from_template, false)
         novel? = (rate_gated? or fork_gated?) and novel_shard?(shard_id)
 
