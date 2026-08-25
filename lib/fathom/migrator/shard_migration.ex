@@ -506,7 +506,7 @@ defmodule Fathom.Migrator.ShardMigration do
               # must leave the shard's status untouched (#23), and the copy window
               # is what "migrating" pauses anyway.
               Directory.mark_migrating(shard_id)
-              forward(shard_id, target, chain, old, new, lease, etag)
+              forward(shard_id, target, current, chain, old, new, lease, etag)
             end
         end
       end
@@ -533,10 +533,35 @@ defmodule Fathom.Migrator.ShardMigration do
     end
   end
 
-  defp forward(shard_id, target, chain, old, new, lease, expected_etag) do
+  defp forward(shard_id, target, current, chain, old, new, lease, expected_etag) do
+    # `current` is the FILE's version (`PRAGMA user_version`, read by `do_run/3`), which is what
+    # the bytes we are about to retain actually are. `prev` is the DIRECTORY's stamp, kept only to
+    # report a divergence (expert review 2026-08-24 #22).
+    #
+    # These used to be conflated: `Storage.retain(shard_id, prev)` copies the LIVE OBJECT — at file
+    # version `current` — to `<shard>@prev`. When the two stamps disagree the retained object is
+    # MISLABELLED, and `Storage.retain/2` overwrites any existing `<shard>@prev` unconditionally.
+    #
+    # The skew is reachable without anything exotic: a flush landing while
+    # `cutover_with_retirement/3`'s Postgres transaction failed leaves file=v2 / directory=v1, and
+    # if HEAD has since moved to v3 the next job takes THIS branch (not the crash-forward
+    # `finalize/2` one) and writes v2 bytes into `<shard>@1`. A Postgres PITR produces the same skew
+    # fleet-wide. A later `revert(3, 1)` then restores v2 bytes and stamps `schema_version = 1`, so
+    # the tenant runs a v2 schema with a v1 directory stamp and v2 rows in `django_migrations` —
+    # a three-way divergence the operator believes was undone. Silent, because the forward path
+    # self-corrects by re-reading the file.
     prev = current_version(shard_id)
 
-    with :ok <- Storage.retain(shard_id, prev),
+    if prev != current do
+      Logger.warning(
+        "shard #{shard_id}: directory says v#{prev} but the FILE is v#{current}; retaining and " <>
+          "retiring against the file, which is what the bytes are. The directory stamp is stale — " <>
+          "a failed cutover transaction or a Postgres PITR does this; run " <>
+          "`mix fathom.directory` to reconcile."
+      )
+    end
+
+    with :ok <- Storage.retain(shard_id, current),
          # shard_id is threaded so a version's per-shard transform (#26) knows whose data it is
          # backfilling. Passed for every migration, not only transform-carrying ones — the chain is
          # built from release rows, so which steps carry a transform is not knowable here.
@@ -552,9 +577,9 @@ defmodule Fathom.Migrator.ShardMigration do
          # a migrated copy of the OLD lineage, with zero error signal. If-Match turns that
          # into a 412 → :superseded, and the job retries from a fresh pull.
          {:ok, _new_etag} <- flush_fenced(shard_id, new, expected_etag),
-         {:ok, _} <- cutover_with_retirement(shard_id, target, prev) do
-      Logger.info("shard #{shard_id}: migrated v#{prev} -> v#{target}")
-      {:ok, %{from: prev, to: target}}
+         {:ok, _} <- cutover_with_retirement(shard_id, target, current) do
+      Logger.info("shard #{shard_id}: migrated v#{current} -> v#{target}")
+      {:ok, %{from: current, to: target}}
     else
       # `mark_migrating/1` runs just before this chain and had no counterpart, so a failure anywhere
       # in it left the row `migrating` forever. Every laggard/reconcile query filters

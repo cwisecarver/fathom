@@ -207,6 +207,49 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     refute_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1})
   end
 
+  # THE RETAINED BACKUP MUST BE LABELLED WITH THE BYTES IT HOLDS (expert review 2026-08-24 #22).
+  #
+  # `do_run/3` treats the FILE as authoritative — `current = live_version(old)` reads
+  # `PRAGMA user_version`. `forward/7` then computed `prev = current_version(shard_id)`, which reads
+  # `schema_version` from POSTGRES, and called `Storage.retain(shard_id, prev)` — which copies the
+  # LIVE OBJECT, at file version `current`, to `<shard>@prev`. When the two stamps disagree the
+  # retained object is mislabelled, and `Storage.retain/2` overwrites any existing `<shard>@prev`
+  # unconditionally.
+  #
+  # The skew needs nothing exotic: a flush landing while `cutover_with_retirement/3`'s Postgres
+  # transaction failed leaves file=v2 / directory=v1, and a Postgres PITR does it fleet-wide. A
+  # later `revert(3, 1)` then restores v2 bytes and stamps `schema_version = 1` — the tenant runs a
+  # v2 schema with a v1 directory stamp and v2 rows in `django_migrations`, a three-way divergence
+  # the operator believes the revert undid. Silent, because the forward path self-corrects by
+  # re-reading the file.
+  #
+  # The fixture stages exactly that skew: migrate to v2 so the FILE is v2, then roll the DIRECTORY
+  # back to v1 the way a failed cutover transaction or a PITR would, and migrate to v3.
+  test "the retained backup is named for the FILE's version, not the directory's",
+       %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    {:ok, _} = Migrator.release(3, "v3", ["ALTER TABLE app_thing ADD COLUMN note TEXT"])
+
+    assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+
+    # The divergence: the file is v2, the directory says v1.
+    {:ok, _} = Directory.cutover(shard, 1)
+    assert {:ok, %{schema_version: 1}} = Directory.get(shard)
+
+    capture_log(fn ->
+      assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 3})
+    end)
+
+    # The bytes retained are the v2 file, so the object must be @2. Pre-fix it was written to @1,
+    # where a revert to v1 would later restore v2 bytes under a v1 stamp.
+    assert File.exists?(Path.join(remote_dir(), "#{shard}@2.db")),
+           "the v2 bytes were retained under the DIRECTORY's stale version instead of their own"
+
+    # And the retirement scheduled matches what was retained, rather than naming a different object.
+    assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 2})
+  end
+
   # A FLEET REVERT TO A VERSION THIS SHARD NEVER PASSED THROUGH (expert review 2026-08-24 #16).
   #
   # A forward migration retains exactly ONE object, `<shard>@prev` — the version the shard came
