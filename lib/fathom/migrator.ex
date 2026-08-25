@@ -196,6 +196,27 @@ defmodule Fathom.Migrator do
       (`{:error, :gap_requires_reconcile}`). A gap means the template ran an `atomic = False`
       migration the fleet never saw; a transform cannot conjure the DDL that was missed, so
       approving it with one would hide a real divergence.
+    * any active shard has already **reached or passed** `version`
+      (`{:error, {:already_rolled_out, count}}`) — see below.
+
+  ## Why an already-rolled-out version is refused (expert review 2026-08-24 #14)
+
+  `Copy.migrate_chain/4` runs a step's transform only when that step is in the chain, and
+  `statement_chain/2` builds `current+1 … target` from the shard's FILE version. So once a shard's
+  `PRAGMA user_version >= version`, a transform attached to `version` can never run for it.
+  Attaching one below the rollout front therefore backfills only the shards still behind it.
+
+  The result is a silently split fleet: two tenants both reporting `schema_version: 9` hold
+  different data — the ones that migrated before the attach have an un-backfilled column, the
+  cold-tail ones that migrated after have it filled. **All three version stamps agree in both
+  cases**, so `laggards/2` reports converged and nothing detects it.
+
+  The likely path is the documented operator flow itself: `approve_review(v)` to unblock a stuck
+  rollout, some shards migrate, then `attach_transform(v, …)` on reconsidering. Refusing forces
+  the backfill to be expressed as a NEW version, which every shard will pass through.
+
+  A version that has been RELEASED but that no shard has rolled onto yet is still attachable —
+  the count, not `v <= head()`, is the discriminating predicate.
   """
   @spec attach_transform(non_neg_integer(), module() | String.t()) ::
           :ok | {:error, term()}
@@ -203,7 +224,8 @@ defmodule Fathom.Migrator do
     with {:ok, release} <- fetch_release(version),
          {:ok, resolved} <- resolve_transform(module),
          :ok <- refuse_if_data_statements(release),
-         :ok <- refuse_if_gap(release) do
+         :ok <- refuse_if_gap(release),
+         :ok <- refuse_if_rolled_out(version) do
       {:ok, _} =
         release
         |> Ecto.Changeset.change(
@@ -251,6 +273,17 @@ defmodule Fathom.Migrator do
   end
 
   defp refuse_if_gap(_), do: :ok
+
+  # See attach_transform/2's "Why an already-rolled-out version is refused". The count is the
+  # discriminating predicate rather than `version <= head()`: a version that has been released but
+  # that no shard has rolled onto yet is still safely attachable, and refusing it would block the
+  # ordinary "release, then attach the backfill before rolling" sequence.
+  defp refuse_if_rolled_out(version) do
+    case Fathom.Directory.count_at_or_above_version(version) do
+      0 -> :ok
+      count -> {:error, {:already_rolled_out, count}}
+    end
+  end
 
   defp fetch_appliable(version) do
     case Repo.get_by(Release, version: version) do

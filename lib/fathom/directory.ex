@@ -645,6 +645,33 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  How many active shards have already reached `version` or gone past it (expert review 2026-08-24
+  #14).
+
+  The predicate for "is this version still attachable". `Copy.migrate_chain/4` runs a step's
+  transform only when that step is IN the chain, and `statement_chain/2` builds `current+1 …
+  target` from the shard's file version — so once a shard's `PRAGMA user_version >= version`, a
+  transform attached to `version` can never run for it. A non-zero count here therefore means
+  attaching one now would backfill only part of the fleet.
+
+  `>=`, not `>`: a shard sitting exactly AT `version` has already applied that step.
+
+  Excludes the reserved capture template for the same reason `laggards/2` does — it is migrated
+  directly by Django and its directory stamp never advances, so it is not evidence about the
+  fleet either way.
+  """
+  @spec count_at_or_above_version(non_neg_integer()) :: non_neg_integer()
+  def count_at_or_above_version(version) do
+    base = from(s in Shard, where: s.schema_version >= ^version and s.status == "active")
+
+    case template_shard_id() do
+      nil -> base
+      id -> from(s in base, where: s.shard_id != ^id)
+    end
+    |> Repo.aggregate(:count)
+  end
+
+  @doc """
   Lazily streams the active shard_ids at `version` in keyset-paginated pages of `page_size` (#12),
   so a fleet-wide set (millions) never materializes at once and never holds one long transaction:
   each page is an independent short query ordered by `shard_id`, so the revert engine can enqueue +

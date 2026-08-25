@@ -12,6 +12,7 @@ defmodule Fathom.Migrator.ReviewBlockTest do
   """
   use Fathom.DataCase, async: false
 
+  alias Fathom.Directory
   alias Fathom.Migrator
   alias Fathom.Migrator.Release
 
@@ -175,6 +176,50 @@ defmodule Fathom.Migrator.ReviewBlockTest do
                Migrator.attach_transform(r.version, OkTransform)
 
       assert Repo.get_by(Release, version: r.version).requires_review
+    end
+
+    # THE FLEET-SPLIT GUARD (expert review 2026-08-24 #14).
+    #
+    # `attach_transform/2` checked the release, the module, the flagged DML and the gap flag — and
+    # nothing about whether the fleet had already gone past the version. `Copy.migrate_chain/4`
+    # runs a step's transform only when that step is in the chain, and `statement_chain/2` builds
+    # `current+1 … target` from the shard's FILE version, so once a shard's `PRAGMA user_version
+    # >= version` the transform can never run for it.
+    #
+    # Attaching below the rollout front therefore backfills only the shards still behind it, and
+    # the result is invisible: two tenants both reporting `schema_version: 9` hold different data,
+    # all three version stamps agree in both cases, and `laggards/2` reports converged. The likely
+    # path is the documented operator flow — `approve_review(v)`, some shards migrate, then
+    # `attach_transform(v, …)` on reconsidering.
+    test "refuses a version some shards have already reached" do
+      r = insert_release(%{requires_review: true, review_reason: "data_migration"})
+      # One shard already AT the version — it has applied that step, so the transform can never
+      # run for it. `>=`, not `>`.
+      shard = "attach_at_#{System.unique_integer([:positive])}"
+      {:ok, _} = Directory.resolve(shard)
+      {:ok, _} = Directory.cutover(shard, r.version)
+
+      assert {:error, {:already_rolled_out, 1}} =
+               Migrator.attach_transform(r.version, OkTransform)
+
+      assert Repo.get_by(Release, version: r.version).requires_review,
+             "the block must remain — the operator's move is a NEW version, not this one"
+
+      refute Repo.get_by(Release, version: r.version).transform
+    end
+
+    # …but a version that is merely RELEASED, with nothing rolled onto it yet, is still
+    # attachable. This is why the predicate is the COUNT and not `version <= head()`: the ordinary
+    # sequence is release, then attach the backfill, then roll.
+    test "allows a released version no shard has reached yet" do
+      r = insert_release(%{requires_review: true, review_reason: "data_migration"})
+
+      behind = "attach_behind_#{System.unique_integer([:positive])}"
+      {:ok, _} = Directory.resolve(behind)
+      {:ok, _} = Directory.cutover(behind, r.version - 1)
+
+      assert :ok = Migrator.attach_transform(r.version, OkTransform)
+      assert Repo.get_by(Release, version: r.version).transform == to_string(OkTransform)
     end
 
     test "refuses a version held for a migration GAP" do

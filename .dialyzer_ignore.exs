@@ -60,7 +60,7 @@
   # struct satisfies the spec. Widening the specs to `number()` would document a value the code
   # deliberately refuses to construct.
   {"lib/fathom/shard/replication/quorum.ex", :missing_range, 114},
-  {"lib/fathom/migrator.ex", :missing_range, 446},
+  {"lib/fathom/migrator.ex", :missing_range, 479},
 
   # `RateLimiter.bump/4` calls `:ets.update_counter/3` with a single `{pos, incr}` op, which returns
   # an integer; the list-of-ops form returns a list. OTP's spec is the union of both, and dialyzer
