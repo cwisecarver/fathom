@@ -314,9 +314,31 @@ defmodule Fathom.Tenants do
     with {:ok, id} <- cast(shard_id),
          {:ok, _row} <- Directory.suspend(id) do
       broadcast_suspension(id, true)
-      Shards.drain(id, @suspend_drain_ms)
+      note_suspend_drain(id, Shards.drain(id, @suspend_drain_ms))
       :ok
     end
+  end
+
+  # The drain is best-effort by design, but its result used to be DISCARDED — so a coordinator
+  # that outlived the budget left no signal at all, and the operator read `:ok` as "the tenant is
+  # off" (expert review 2026-08-24 #5). Say so instead.
+  #
+  # Deliberately NOT escalated to `Shards.stop/1` the way `purge/1` does. Suspension is
+  # documented as reversible and graceful — in-flight transactions finish — and force-stopping a
+  # busy coordinator would drop them. It is safe to leave the coordinator running now because the
+  # deny is no longer only at checkout: `Fathom.ShardExecutor` re-checks `suspended?/1` on EVERY
+  # statement, so a stream that outlives this drain is refused at its next request rather than
+  # serving until it happens to close. Note the drain is also a LOCAL Registry lookup: on a
+  # multi-node fleet it no-ops on every node but the shard's home, which is the other reason the
+  # per-statement gate, not this call, is what makes suspension real.
+  defp note_suspend_drain(_id, :ok), do: :ok
+
+  defp note_suspend_drain(id, other) do
+    Logger.warning(
+      "tenant #{id} suspended, but the coordinator did not drain within " <>
+        "#{@suspend_drain_ms}ms (#{inspect(other)}); open streams are refused per-statement " <>
+        "and the coordinator stops when they close"
+    )
   end
 
   @doc """

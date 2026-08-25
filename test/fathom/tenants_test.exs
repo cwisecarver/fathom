@@ -359,6 +359,59 @@ defmodule Fathom.TenantsTest do
       assert {:ok, _pid, _ref, _path} = Shards.checkout(id)
     end
 
+    # THE LEVER MUST REACH A STREAM THAT IS ALREADY OPEN (expert review 2026-08-24 #5).
+    #
+    # The test above asserts only `Shards.checkout(id) == {:error, :shard_suspended}` — the NEW
+    # stream path — and that is exactly the gap. Both denies lived in `Shards.ensure/1`, which
+    # runs once per CHECKOUT, and a checkout is one Hrana stream, which a django-libsql client
+    # holds for HOURS. So an attacker already holding a stream kept reading and writing after the
+    # suspend: `Tenants.suspend/1` drains with a 5 s budget, discarded the result, and a stream
+    # that outlived it left the coordinator serving. On a multi-node fleet it is worse — the
+    # drain is a LOCAL Registry lookup, so a suspend issued on any other node never touches the
+    # coordinator at all, and for a DELETED tenant its data stays readable through that stream.
+    #
+    # These levers exist for abusive or compromised clients, which is precisely the posture of a
+    # client that already has a stream open.
+    test "suspend and delete reach a stream that was ALREADY open", %{id: id} do
+      {:ok, _} = Directory.resolve(id)
+      {:ok, h} = ShardExecutor.open(id)
+
+      {:ok, _} = ShardExecutor.execute(h, %Stmt{sql: "CREATE TABLE t (v TEXT)", args: []})
+      {:ok, _} = ShardExecutor.execute(h, %Stmt{sql: "SELECT count(*) FROM t", args: []})
+
+      assert :ok = Tenants.suspend(id)
+
+      # SAME handle, same connection, no re-checkout anywhere.
+      assert {:error, %Filo.Error{status: 403, code: "FILO_TENANT_SUSPENDED"}} =
+               ShardExecutor.execute(h, %Stmt{sql: "SELECT count(*) FROM t", args: []}),
+             "a suspended tenant kept serving reads on an already-open stream"
+
+      assert {:error, %Filo.Error{status: 403}} =
+               ShardExecutor.execute(h, %Stmt{sql: "INSERT INTO t VALUES ('x')", args: []})
+
+      # A script is not a loophole, and neither is describe — a suspended tenant's schema is
+      # still its own.
+      assert {:error, %Filo.Error{status: 403}} =
+               ShardExecutor.execute_sequence(h, "SELECT 1; SELECT 2")
+
+      assert {:error, %Filo.Error{status: 403}} = ShardExecutor.describe(h, "SELECT v FROM t")
+
+      # Resume restores service on that same open stream — the deny is a live ETS read, not a
+      # latch, so it must lift as cleanly as it applied.
+      assert :ok = Tenants.resume(id)
+      assert {:ok, _} = ShardExecutor.execute(h, %Stmt{sql: "SELECT count(*) FROM t", args: []})
+
+      # And deletion is the stronger case: GDPR Article 17 erasure that a held stream can read
+      # through is not erasure. 410, not 403.
+      Tombstones.put(id)
+
+      assert {:error, %Filo.Error{status: 410, code: "FILO_TENANT_DELETED"}} =
+               ShardExecutor.execute(h, %Stmt{sql: "SELECT v FROM t", args: []}),
+             "a deleted tenant's data was still readable through an open stream"
+
+      :ok = ShardExecutor.close(h)
+    end
+
     test "refuses to suspend a deleted (tombstoned) tenant", %{id: id} do
       {:ok, _} = Directory.tombstone(id)
       assert {:error, :deleted} = Tenants.suspend(id)

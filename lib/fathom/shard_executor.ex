@@ -137,6 +137,9 @@ defmodule Fathom.ShardExecutor do
         {:error,
          %Error{message: "read-only token cannot write", code: "FILO_READONLY", status: 403}}
 
+      denied = lifecycle_denied(shard_id) ->
+        {:error, denied}
+
       # The write circuit-breaker (expert review 2026-07-19 #3): this node's heartbeat has been
       # not-valid long enough (> ttl + steal_margin) that a peer may already have stolen the shard,
       # so a write ACKed here would be quarantined on partition-heal. Refuse writes with a retryable
@@ -621,6 +624,9 @@ defmodule Fathom.ShardExecutor do
            status: 403
          }}
 
+      denied = lifecycle_denied(shard_id) ->
+        {:error, denied}
+
       true ->
         # EVERY STATEMENT IN THE SCRIPT GOES THROUGH THE SAME GATE AS `execute/2` (expert review
         # 2026-08-20 #18, verified by execution against this project's own exqlite 0.37.0).
@@ -821,8 +827,41 @@ defmodule Fathom.ShardExecutor do
       blocked = blocked_statement(sql) ->
         {:error, blocked}
 
+      denied = lifecycle_denied(shard_id) ->
+        {:error, denied}
+
       true ->
         :ok
+    end
+  end
+
+  # THE TENANT-LIFECYCLE DENIES, RE-CHECKED PER STATEMENT (expert review 2026-08-24 #5).
+  #
+  # These live in `Fathom.Shards.ensure/1`, which runs once per CHECKOUT — and a checkout is
+  # taken in `open/2` and released in `close/1`, i.e. once per Hrana stream. `HranaAuth`'s own
+  # docstring claimed that was enough ("ensure/1 already re-checks the tombstone and suspension
+  # gates on every checkout, so those two lifecycle denies did reach a live connection"). It is
+  # the same reasoning error 2026-08-20 #22 corrected for token revocation: a django-libsql
+  # stream lives for HOURS between requests, so per-checkout is per-session, not per-request.
+  #
+  # Two sequences it left open. An attacker holds a WS stream on `acme`; an operator suspends
+  # `acme`; `Tenants.suspend/1` drains with a 5 s budget and the stream outlives it, so the
+  # coordinator keeps serving and the attacker reads and writes indefinitely. And on a multi-node
+  # fleet the control-plane call lands on whichever node the LB picked, while `Shards.drain/2`
+  # and `Shards.stop/1` are local-`Registry` lookups that no-op elsewhere — so a suspend or a
+  # delete issued on node A never touches the coordinator on node B, and a DELETED tenant's data
+  # stays readable through the stream already open there.
+  #
+  # Both levers exist precisely for abusive or compromised clients, which is exactly the posture
+  # of a client that already has a stream open. Two O(1) `:ets.member` reads, never Postgres —
+  # the same cost argument that justified the revocation re-check beside it. The cross-node
+  # coordinator-stop problem is tracked separately (`rebalance_commands` in
+  # docs/component-notes.md); this makes it moot for correctness.
+  defp lifecycle_denied(shard_id) do
+    cond do
+      Fathom.Tenants.tombstoned?(shard_id) -> open_error(:shard_tombstoned)
+      Fathom.Tenants.suspended?(shard_id) -> open_error(:shard_suspended)
+      true -> nil
     end
   end
 
