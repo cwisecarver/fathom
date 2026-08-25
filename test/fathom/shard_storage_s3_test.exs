@@ -106,6 +106,54 @@ defmodule Fathom.ShardStorageS3Test do
     assert File.read!(dst) == "the quick brown fox\n"
   end
 
+  # THE `nil`-LINEAGE ASYMMETRY, ASSERTED AGAINST THE BACKEND THAT CAN ACTUALLY BREAK IT
+  # (expert review 2026-08-24 #11, found independently by two panels).
+  #
+  # `test/fathom/shard/lineage_test.exs` already pins "nil LEAVES the previous lineage in place —
+  # the asymmetry with position", but only against `Storage.Local`, where the lineage is a
+  # separate sidecar and `write_lineage(_, nil)` is a no-op. It cannot fail there. S3 stores the
+  # lineage as user metadata ON the object, and a PUT replaces the object wholesale, so `nil` DID
+  # erase it — the two backends implemented opposite behaviours for the same argument and the
+  # contract was enforced only where it could not fail. `Fathom.Test.FaultyStorage` delegates to
+  # `Local` and inherits the same blind spot, so this assertion has no home outside this file.
+  #
+  # Note this suite is excluded from `mix test` AND from CI (it needs MinIO), which is exactly how
+  # the `{:absent, _}` contract above drifted for eleven days. Run it with `scripts/minio_test.sh`
+  # when touching object metadata.
+  test "a flush with nil lineage PRESERVES the stored lineage; an integer overwrites it",
+       %{shard: shard} do
+    src = tmp_path("#{shard}-src")
+    File.write!(src, "v1\n")
+
+    # Claim lineage 7, then confirm the store really holds it.
+    assert {:ok, etag1} = S3.flush(shard, src, nil, nil, 7)
+    assert {:ok, %{lineage: 7}} = S3.object_head(shard)
+
+    # A flush with NOTHING to claim must leave it at 7. Pre-fix this dropped the header and the
+    # object came back with lineage nil, so `Storage.next_lineage/1` restarted the counter — and a
+    # peer replica stamped higher then outranked the object at the next failover.
+    File.write!(src, "v2\n")
+    assert {:ok, etag2} = S3.flush(shard, src, etag1, nil, nil)
+
+    assert {:ok, %{lineage: 7}} = S3.object_head(shard),
+           "a nil-lineage flush ERASED the shard's lineage; the counter has been reset and a " <>
+             "stale replica can now outrank this object"
+
+    # …and an integer still overwrites, so preserving is not the same as freezing.
+    File.write!(src, "v3\n")
+    assert {:ok, _} = S3.flush(shard, src, etag2, nil, 9)
+    assert {:ok, %{lineage: 9}} = S3.object_head(shard)
+  end
+
+  test "a first flush of a brand-new object carries no lineage and pays no HEAD", %{shard: shard} do
+    src = tmp_path("#{shard}-src")
+    File.write!(src, "new\n")
+
+    # `If-None-Match: *` — there is no object to inherit metadata from, so `nil` means nil.
+    assert {:ok, _} = S3.flush(shard, src, nil, nil, nil)
+    assert {:ok, %{lineage: nil}} = S3.object_head(shard)
+  end
+
   # ── stored-object compression (expert review 2026-07-24 #38) ──
 
   defp with_encoding(value, fun) do

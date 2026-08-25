@@ -299,7 +299,10 @@ defmodule Fathom.Shard.Storage.S3 do
                    # Etag-form-independent integrity hash (expert review 2026-07-14 #17), over the
                    # UNCOMPRESSED bytes (#38).
                    {@md5_meta, md5_hex} | cond_headers
-                 ] ++ enc_headers ++ pos_meta_header(position) ++ lineage_meta_header(lineage)
+                 ] ++
+                   enc_headers ++
+                   pos_meta_header(position) ++
+                   carried_lineage_header(shard_id, expected_etag, lineage)
              ) do
         case resp.status do
           s when s in 200..299 -> {:ok, etag(resp.headers)}
@@ -856,8 +859,50 @@ defmodule Fathom.Shard.Storage.S3 do
   defp pos_meta_header(nil), do: []
   defp pos_meta_header(pos), do: [{@pos_meta, Storage.encode_position(pos)}]
 
-  defp lineage_meta_header(nil), do: []
-  defp lineage_meta_header(n) when is_integer(n), do: [{@lineage_meta, Integer.to_string(n)}]
+  # `nil` LINEAGE MEANS "LEAVE THE PREVIOUS VALUE ALONE", AND A PUT CANNOT DO THAT BY ITSELF
+  # (expert review 2026-08-24 #11, found independently by two panels).
+  #
+  # The `c:flush/5` callback doc is explicit: "`nil` writes no lineage … the backends take `nil`
+  # as leave-any-previous-value-alone. Erasing a shard's lineage would reintroduce exactly the
+  # reset the key exists to prevent." `Storage.Local` honours that for free — its lineage is a
+  # separate sidecar and `write_lineage(_, nil)` is a no-op. S3 stores it as user metadata ON the
+  # object, and a `PUT Object` replaces the object wholesale: every `x-amz-meta-*` key not
+  # re-sent is gone. So the two backends implemented OPPOSITE behaviours for the same argument,
+  # and every flush passing `nil` silently reset the counter on real S3.
+  #
+  # Reachable on the default path, not an exotic one: `lineage_to_store(:disabled) -> nil` on any
+  # node with replication off, plus the `:unknown` case, `Promote.install_and_publish/3`, every
+  # per-shard schema migration and revert, and every snapshot restore. Afterwards
+  # `Storage.next_lineage/1` falls back to `position.epoch` — the LOCK epoch under `:disabled` —
+  # so a shard sitting at lineage 50 is reseeded at 2 by one drain onto a non-replicating node.
+  # A peer holding a pre-migration replica stamped higher then outranks the object in
+  # `Promote.fresher?/2`, and a later failover rolls the tenant's schema and data back.
+  #
+  # This is the same failure class `carry_meta/1` already fixed for the TOUCH path — that one was
+  # hardened to carry every user key across a copy, but a PUT still drops what it is not
+  # explicitly told to write, and the flush path never got the equivalent.
+  #
+  # COST, since the panel flagged the mechanism as open and unmeasured. The HEAD is paid only
+  # when we are overwriting an EXISTING object (`expected_etag` present) AND have no lineage of
+  # our own to write. A brand-new shard PUTs `If-None-Match: *`, has no metadata to inherit, and
+  # pays nothing — so cold open is untouched, which matters because `open_lineage/1` deliberately
+  # skips its HEAD when replication is off precisely to keep `cold_open_p50_us` unchanged. On the
+  # flush path one HEAD sits beside a checkpoint/VACUUM INTO and a full-object PUT, which dominate
+  # it. Measured through the bench gate rather than argued: see the commit.
+  #
+  # The POSITION stamp is deliberately NOT carried — erasing it is correct, and `pos_meta_header/1`
+  # keeps its own semantics.
+  defp carried_lineage_header(_shard_id, _expected_etag, n) when is_integer(n),
+    do: [{@lineage_meta, Integer.to_string(n)}]
+
+  defp carried_lineage_header(_shard_id, nil, nil), do: []
+
+  defp carried_lineage_header(shard_id, _expected_etag, nil) do
+    case object_head(shard_id) do
+      {:ok, %{lineage: n}} when is_integer(n) -> [{@lineage_meta, Integer.to_string(n)}]
+      _ -> []
+    end
+  end
 
   defp verify_md5(_digest, nil), do: :ok
 
