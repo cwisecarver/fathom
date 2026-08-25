@@ -18,6 +18,36 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
 
   The rest pin that everything uncertain falls back to the stored object: gate off, no stamp, and
   a replica level with the object.
+
+  ## WHAT THESE TESTS CANNOT SEE (expert review 2026-08-24 #12)
+
+  Read this before trusting a green run here. Every test in this file seeds the replica FROM the
+  object's own stamp — `install_replica/2` calls
+  `Follower.seed(Follower, id, position.epoch, position.wal_gen, 0, position.offset)` — so both
+  sides of `Promote.fresher?/2` come from one number and the comparison is guaranteed
+  well-founded. **In production they come from two different counters.**
+
+  The object's stamp carries the LINEAGE (`open_lineage/1` → `Storage.next_lineage/1`, monotonic
+  across a release, never reset). The replica's `epoch` comes from `Session.with_epoch/1` →
+  `Fathom.Shard.epoch/1` → `state.lease.epoch` — the LOCK epoch, which `release_lease` resets to
+  **1** on every clean idle-drop, drain and handoff. The 2026-08-20 #8 fix split one number into
+  two and only migrated the object side.
+
+  So from a shard's SECOND replicating open onward, `fresher?/2` is false for every replica no
+  matter how far ahead it is, and promote-on-open goes inert fleet-wide — silently, recovering to
+  the last flush exactly as if A2 were switched off. The unsafe direction is reachable too: on a
+  gate-toggled fleet a flush with `lineage: :disabled` stamps the LOCK epoch into the position
+  slot, so a replica stranded at a higher lock epoch from an earlier crash-steal can outrank a
+  NEWER object.
+
+  These tests pass either way. Nothing in this file — or anywhere — lets a real push-derived epoch
+  meet a real lineage stamp. `ownership_cycle_position_test.exs` is the only test driving a real
+  shipped position, and it lands on `stamp == nil` (it says so itself), so its `refute` is
+  vacuous for this question.
+
+  Fixing it properly means shipping the lineage as its own field in `Push`/`SeedBegin` — a wire
+  change — which is why it is not fixed here. Do not add a test to this file that seeds from
+  `position.epoch` and call the gap closed; the seeding IS the gap.
   """
   use ExUnit.Case, async: false
 
