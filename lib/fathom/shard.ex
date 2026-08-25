@@ -1954,9 +1954,28 @@ defmodule Fathom.Shard do
                 :ok ->
                   retry_drop_upload(state)
 
-                _ ->
+                # A GENUINE steal: the lock is someone else's, so there is nothing of ours to
+                # release and the conditional DELETE would no-op anyway.
+                {:error, :superseded} ->
                   Logger.warning(
                     "shard #{state.id}: object superseded before flush; keeping local for recovery"
+                  )
+
+                # ANYTHING ELSE IS NOT A STEAL (expert review 2026-08-24 #10). This used to be a
+                # bare `_`, conflating the steal above with a TRANSIENT store error — where we
+                # very probably still hold the lock, and returning here strands it. A stranded
+                # lock names a LIVE node: `owner_live?` reads this node's fresh heartbeat forever,
+                # so no peer, failover, migrator or rebalancer handoff can ever take the shard,
+                # while it keeps serving normally because its own node silently reclaims at the
+                # same incarnation. The migration job that then cannot drain it snoozes with
+                # `failed: 0`, an empty errors array and nothing above [info] — the exact silent
+                # signature of the 2026-08-04 rig straggler, and the THIRD instance of this
+                # lock-leak class (see `keep_local_release_lease/3`'s own note).
+                other ->
+                  keep_local_release_lease(
+                    state,
+                    "lock re-check inconclusive after a flush 412",
+                    other
                   )
               end
 
@@ -2162,11 +2181,20 @@ defmodule Fathom.Shard do
       drop_local_unless_serving(state)
       Storage.release_lease(state.id, state.lease)
     else
+      # …and RELEASE THE LOCK while keeping it (expert review 2026-08-24 #10). This branch is
+      # reached having just CONFIRMED via `check_lease/2` that the lock is still ours, so simply
+      # returning strands it on a live node — `owner_live?` reads this node's fresh heartbeat
+      # forever, so the shard becomes permanently un-handoff-able while serving normally, and the
+      # migration job that cannot drain it snoozes silently with `failed: 0`. Keeping the LOCAL
+      # COPY is right (it holds acked writes the object may not, and the next open's provenance
+      # check arbitrates recoverably); keeping the LOCK is not — holding it does not make those
+      # writes durable, it only makes the tenant unmovable. Same distinction
+      # `keep_local_release_lease/3` was extracted for.
       other ->
-        Logger.error(
-          "shard #{state.id}: flush 412 with lock ours, but the re-fenced upload failed " <>
-            "(#{inspect(other)}); KEEPING the local copy — it holds acked writes the stored " <>
-            "object may not"
+        keep_local_release_lease(
+          state,
+          "flush 412 with lock ours, but the re-fenced upload failed",
+          other
         )
     end
   end

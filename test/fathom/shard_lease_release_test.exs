@@ -146,6 +146,11 @@ defmodule Fathom.ShardLeaseReleaseTest do
     :ok
   end
 
+  # The stored object's path in the Local backend's dir. Writing it changes the object's etag,
+  # which is how a test reproduces "the object moved under us" — the lost-PUT-response case that
+  # makes a fenced flush 412 without any peer being involved.
+  defp remote_db(shard), do: Path.join(Fathom.Shard.Storage.Local.dir(), "#{shard}.db")
+
   defp drain_and_wait!(shard, coordinator) do
     ref = Process.monitor(coordinator)
 
@@ -165,6 +170,136 @@ defmodule Fathom.ShardLeaseReleaseTest do
            "a foreign owner (the migrator) could not take the lease — this is the stuck rollout"
 
     :ok = Storage.release_lease(shard, lease)
+  end
+
+  # THE DROP-PATH DATA-PUT 412, which had no case here at all (expert review 2026-08-24 #10).
+  #
+  # This file parameterizes both liveness modes over the `:skip` and generic-`{:error, _}`
+  # branches of `flush_then_drop/1`, and those are the two that were fixed on 2026-08-04. It never
+  # covered the 412 branch, and BOTH of that branch's terminal paths still did the old thing:
+  #
+  #   * `{:error, :superseded}` → `check_lease` returns something other than `:ok` → a bare `_`
+  #     clause logged "keeping local for recovery" and returned. That `_` conflates a GENUINE
+  #     steal (harmless — the lock is someone else's) with a TRANSIENT store error, where we very
+  #     probably still hold the lock.
+  #   * `retry_drop_upload/1`'s `else` → logged "KEEPING the local copy" and returned, having just
+  #     CONFIRMED via `check_lease` that the lock is still ours.
+  #
+  # Neither released. A stranded lock names a LIVE node: `owner_live?` reads this node's fresh
+  # heartbeat forever, so no peer, failover, migrator or rebalancer handoff can take that shard,
+  # while it keeps serving normally because its own node silently reclaims at the same
+  # incarnation. The migration job that then cannot drain it snoozes with `failed: 0`, an empty
+  # errors array and nothing above [info] — the 2026-08-04 rig straggler's exact signature. This
+  # is the THIRD instance of the class `keep_local_release_lease/3` was extracted for.
+  #
+  # `assert_foreign_owner_can_acquire!/2` is what pins the damage: the owning node re-opening
+  # proves nothing, because it reclaims its own lock silently.
+  for mode <- @modes do
+    describe "#{mode} mode — a data-PUT 412 on the drop path" do
+      setup do: set_mode!(unquote(mode))
+
+      test "releases the lock when the re-fenced upload fails", %{shard: shard} do
+        seed!(shard, "unflushed")
+        {:ok, coordinator} = Shards.ensure(shard)
+        assert_mode!(coordinator, unquote(mode))
+
+        assert Shard.dirty?(coordinator),
+               "the fixture must be dirty or the drop takes the clean path"
+
+        # First flush call: move the object so the fenced PUT 412s, with the LOCK left ours — so
+        # `check_lease` says `:ok` and the coordinator takes `retry_drop_upload/1`. Second call
+        # (the retry): fail it, landing on the branch under test.
+        calls = :counters.new(1, [])
+
+        hook = fn ->
+          if :counters.get(calls, 1) == 0 do
+            File.write!(remote_db(shard), "moved-by-a-lost-response")
+          else
+            Application.put_env(:fathom, :storage_fault, :flush)
+          end
+
+          :counters.add(calls, 1, 1)
+        end
+
+        Application.put_env(:fathom, :faulty_before, {:flush, hook})
+
+        on_exit(fn ->
+          Application.delete_env(:fathom, :faulty_before)
+          # The hook ARMS :storage_fault mid-run, so this test owns clearing it — leaving it set
+          # leaks a flush fault into every later test in the file.
+          Application.delete_env(:fathom, :storage_fault)
+        end)
+
+        path = Path.join(Shard.data_dir(), "#{shard}.db")
+        log = drain_and_wait!(shard, coordinator)
+
+        assert :counters.get(calls, 1) >= 1,
+               "the fixture never reached a fenced flush at all"
+
+        # Pin the exact branch rather than a call count: `retry_drop_upload/1`'s `else` is reached
+        # both when the re-upload itself fails and when `object_etag/1` comes back nil, and which
+        # of those happens differs by liveness mode. This message is emitted only from that else.
+        assert log =~ "re-fenced upload failed",
+               "the drop did not take the 412-with-lock-ours retry branch, so this test is not " <>
+                 "exercising the finding"
+
+        assert_foreign_owner_can_acquire!(
+          shard,
+          "a failed re-fenced upload after a drop-path 412 stranded the lock on a live node"
+        )
+
+        assert log =~ "keeping local copy",
+               "the local copy holds acked writes the object may not — only the LOCK is given up"
+
+        assert File.exists?(path), "the un-flushed local copy was destroyed"
+      end
+
+      test "releases the lock when the post-412 lock re-check is inconclusive", %{shard: shard} do
+        seed!(shard, "unflushed")
+        {:ok, coordinator} = Shards.ensure(shard)
+        assert_mode!(coordinator, unquote(mode))
+
+        assert Shard.dirty?(coordinator),
+               "the fixture must be dirty or the drop takes the clean path"
+
+        # Move the object so the fenced PUT 412s, then make the lock re-check fail TRANSIENTLY
+        # rather than answer "someone else holds it". Pre-fix the `_` clause swallowed this as if
+        # it were a steal and returned holding the lock.
+        hook = fn ->
+          File.write!(remote_db(shard), "moved-by-a-lost-response")
+
+          Application.put_env(
+            :fathom,
+            :faulty_check_lease_result,
+            {:error, {:transient, :s3_unreachable}}
+          )
+        end
+
+        Application.put_env(:fathom, :faulty_before, {:flush, hook})
+
+        on_exit(fn ->
+          Application.delete_env(:fathom, :faulty_before)
+          Application.delete_env(:fathom, :faulty_check_lease_result)
+        end)
+
+        path = Path.join(Shard.data_dir(), "#{shard}.db")
+        log = drain_and_wait!(shard, coordinator)
+
+        assert log =~ "lock re-check inconclusive",
+               "the drop did not take the 412 branch's inconclusive-re-check path, so this test " <>
+                 "is not exercising the finding"
+
+        assert_foreign_owner_can_acquire!(
+          shard,
+          "an inconclusive lock re-check after a drop-path 412 stranded the lock on a live node"
+        )
+
+        assert log =~ "keeping local copy",
+               "the local copy holds acked writes the object may not — only the LOCK is given up"
+
+        assert File.exists?(path), "the un-flushed local copy was destroyed"
+      end
+    end
   end
 
   for mode <- @modes do

@@ -361,7 +361,15 @@ defmodule Fathom.Test.FaultyStorage do
       _ -> :ok
     end
 
-    Local.check_lease(shard_id, lease)
+    # A forced result, so a test can make the re-check answer TRANSIENTLY rather than
+    # "someone else holds it" (expert review 2026-08-24 #10). The drop path's 412 handler used a
+    # bare `_` for everything that was not `:ok`, conflating those two — and the transient case is
+    # the one where we still hold the lock and returning strands it. `Local.check_lease/2` can
+    # only ever say ours / not-ours, so the distinction was inexpressible without this.
+    case Application.get_env(:fathom, :faulty_check_lease_result) do
+      nil -> Local.check_lease(shard_id, lease)
+      forced -> forced
+    end
   end
 
   @impl true
