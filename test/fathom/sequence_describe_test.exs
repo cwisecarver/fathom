@@ -89,6 +89,46 @@ defmodule Fathom.SequenceDescribeTest do
 
       :ok = ShardExecutor.close(h)
     end
+
+    # DESCRIBE IS NOT SIDE-EFFECT-FREE (expert review 2026-08-24 #2, verified by execution).
+    # "Introspect without running it" is true of the VDBE, not of SQLite: several pragmas are
+    # implemented outside it and take effect during `sqlite3_prepare`, with no step at all. So a
+    # describe path that skipped `blocked_statement/1` — as this one did — handed every tenant an
+    # ungated setter for fathom's own safety pragmas, and one that needed no parser trick to reach.
+    # Measured before the fix, on a real shard with the tenant authorizer set:
+    #
+    #     before:                               writable_schema = 0, synchronous = 2
+    #     describe "PRAGMA writable_schema=ON"  -> {:ok, %Describe{is_readonly: true}}
+    #     describe "PRAGMA synchronous=OFF"     -> {:ok, %Describe{is_readonly: true}}
+    #     after:                                writable_schema = 1, synchronous = 0
+    test "a blocked pragma is refused, and does not take effect at PREPARE time", %{shard: shard} do
+      {:ok, h} = ShardExecutor.open(shard)
+      :ok = ShardExecutor.execute_sequence(h, "CREATE TABLE t (a INTEGER);")
+
+      for sql <- [
+            "PRAGMA writable_schema=ON",
+            "PRAGMA synchronous=OFF",
+            "PRAGMA max_page_count=999999999",
+            # The qualifier bypass (#1) is reachable through describe too.
+            "PRAGMA main . writable_schema = ON"
+          ] do
+        assert {:error, %Filo.Error{code: "FILO_PRAGMA_BLOCKED"}} =
+                 ShardExecutor.describe(h, sql),
+               "describe #{inspect(sql)} was not refused"
+      end
+
+      # THE EFFECT, which is the whole finding: an error return that still mutated the connection
+      # would satisfy the assertions above and miss the bug entirely.
+      assert {:ok, %{rows: [[0]]}} = ShardExecutor.execute(h, stmt("PRAGMA writable_schema"))
+      assert {:ok, %{rows: [[2]]}} = ShardExecutor.execute(h, stmt("PRAGMA synchronous"))
+
+      # And describing something legitimate still works — the gate governs the statement, not the
+      # request type. A `:ro` client describing a SELECT must not be caught by this.
+      assert {:ok, %{is_readonly: true}} = ShardExecutor.describe(h, "SELECT a FROM t")
+      assert {:ok, %{}} = ShardExecutor.describe(h, "PRAGMA table_info(t)")
+
+      :ok = ShardExecutor.close(h)
+    end
   end
 
   test "a read-only token cannot run a script", %{shard: shard} do

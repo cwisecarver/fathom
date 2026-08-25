@@ -323,6 +323,14 @@ defmodule Fathom.HranaAuthTest do
       assert {:error, %Filo.Error{status: 401}} =
                Fathom.ShardExecutor.execute_sequence(handle, "SELECT 1; SELECT 2")
 
+      # Nor is `describe` (expert review 2026-08-24 #2). It ran NO gate at all — not this
+      # revocation floor and not the blocked-statement check — so a revoked credential holding a
+      # live socket kept enumerating the tenant's schema (column names, parameter counts)
+      # indefinitely, which is exactly the hole this per-statement re-check was written to close.
+      assert {:error, %Filo.Error{status: 401}} =
+               Fathom.ShardExecutor.describe(handle, "SELECT * FROM t"),
+             "a revoked token kept introspecting the tenant's schema through describe"
+
       :ok = Fathom.ShardExecutor.close(handle)
     end
 

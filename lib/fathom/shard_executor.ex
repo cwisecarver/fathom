@@ -780,8 +780,53 @@ defmodule Fathom.ShardExecutor do
   # Introspects a statement without running it (the Hrana `describe` request, #34): its parameters,
   # result columns, and whether it's an EXPLAIN / read-only. `is_readonly` is the leading-keyword
   # classification (a SELECT/PRAGMA read vs a DML/DDL write) — the hint a libSQL client wants.
+  #
+  # DESCRIBE IS A STATEMENT PATH AND CARRIES THE SAME TWO GATES AS EXECUTE (expert review
+  # 2026-08-24 #2, verified by execution). It used to run NONE of them — not the blocked-statement
+  # check, not the revocation re-check — on the assumption that preparing a statement without
+  # stepping it cannot have an effect. SQLite implements several pragmas OUTSIDE the VDBE, so they
+  # take effect during `sqlite3_prepare` with no step at all. Measured on a real shard with the
+  # tenant authorizer set:
+  #
+  #     before:                               writable_schema = 0, synchronous = 2
+  #     describe "PRAGMA writable_schema=ON"  -> {:ok, %Describe{is_readonly: true}}
+  #     describe "PRAGMA synchronous=OFF"     -> {:ok, %Describe{is_readonly: true}}
+  #     after:                                writable_schema = 1, synchronous = 0
+  #
+  # So `describe` voided the pragma gate outright, and voided 2026-08-20 #22's per-statement
+  # revocation floor — a revoked credential holding a live socket kept enumerating the tenant's
+  # schema indefinitely. `describe` is reachable on both transports (`Filo.Request.handle/4`,
+  # `%{"type" => "describe"}`).
+  #
+  # There is deliberately NO `:ro` write refusal here: a read-only client legitimately describes
+  # a SELECT, and `blocked_statement/1` is what stops the pragma for every scope.
   @impl true
-  def describe({_pid, _ref, conn, _shard_id, _scope, _ver, _opts}, sql) when is_binary(sql) do
+  def describe({_pid, _ref, conn, shard_id, _scope, token_version, _opts}, sql)
+      when is_binary(sql) do
+    with :ok <- describe_allowed(shard_id, token_version, sql) do
+      do_describe(conn, sql)
+    end
+  end
+
+  defp describe_allowed(shard_id, token_version, sql) do
+    cond do
+      not HranaAuth.version_current?(shard_id, token_version) ->
+        {:error,
+         %Error{
+           message: "the token for shard \"#{shard_id}\" has been revoked",
+           code: "FILO_UNAUTHORIZED",
+           status: 401
+         }}
+
+      blocked = blocked_statement(sql) ->
+        {:error, blocked}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp do_describe(conn, sql) do
     case Connection.describe(conn, sql) do
       {:ok, %{params: params, cols: cols}} ->
         {:ok,
