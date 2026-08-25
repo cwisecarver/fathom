@@ -3489,7 +3489,7 @@ defmodule Fathom.Shard do
   # shorten a network-bound window. (An earlier reading of this finding dismissed the whole fix as
   # "a round trip per flush"; that is true only of the legacy path.)
   defp recheck_before_put(%{acquire_gen: gen}) when is_integer(gen) do
-    case Heartbeat.valid_for_write?(gen) do
+    case heartbeat_recheck(gen) do
       :ok ->
         :ok
 
@@ -3502,6 +3502,35 @@ defmodule Fathom.Shard do
   end
 
   defp recheck_before_put(_state), do: :ok
+
+  # A DEAD HEARTBEAT PROCESS MUST DEGRADE, NOT CRASH THE FLUSH (expert review 2026-08-24 #18).
+  #
+  # Every other caller of `Heartbeat.valid_for_write?/1` wraps it so a dead heartbeat degrades
+  # gracefully — `Fence.heartbeat_valid/2` catches `:exit` and answers `:legacy`,
+  # `Fence.generation/1` catches `:exit` and answers `nil`. This one, added later by review
+  # 2026-08-01 #28, called it BARE. When the heartbeat process is down its named ETS status table
+  # dies with it, `status/0` answers `:down`, and the fallback is a `GenServer.call` that exits
+  # `:noproc`.
+  #
+  # The consequence is not a crash loop, it is a SILENT STOP TO DURABILITY. A coordinator opened in
+  # heartbeat mode keeps `acquire_gen` as an integer for its whole life (`Fence.revalidate/2`
+  # preserves it deliberately), so while the heartbeat is down `Fence.check/2` correctly degrades
+  # to `:legacy` and renews the lock — and then the flush task dies here. That lands on the
+  # `{:DOWN, …}` flush-task clause, which records a transient failure and reschedules, and never
+  # reaches `note_not_valid/1`, so the write circuit-breaker cannot arm on that path either. The
+  # shard stays dirty, keeps ACKing writes, and never flushes: unbounded RPO on a node that looks
+  # healthy. The supervisor normally restarts the heartbeat in milliseconds, which bounds it in the
+  # common case — but the entire point of the `:legacy` branch is the case where it does not.
+  #
+  # PROCEEDING is the right direction of the two safe ones. `Fence.check/2` has already run for
+  # this flush and, in the degraded mode, performed the legacy renew PUT — which IS the ownership
+  # proof in that mode. Failing closed here would stop durability for a reason the fence itself did
+  # not object to, which is the failure this finding is about.
+  defp heartbeat_recheck(gen) do
+    Heartbeat.valid_for_write?(gen)
+  catch
+    :exit, _ -> :ok
+  end
 
   # Integrity-gate the PERIODIC flush (expert review 2026-08-01 #14).
   #

@@ -674,5 +674,45 @@ defmodule Fathom.ShardLeaseReleaseTest do
         "a heartbeat-mode coordinator stranded its lock after the Heartbeat process died"
       )
     end
+
+    # THE PERIODIC FLUSH, not the drop (expert review 2026-08-24 #18). The test above covers the
+    # DROP path, where `Fence.check` degrading to legacy is enough. The flush task then runs
+    # `recheck_before_put/1` one step later, and THAT called `Heartbeat.valid_for_write?/1` bare
+    # while every other caller wraps it — `Fence.heartbeat_valid/2` catches `:exit` and answers
+    # `:legacy`, `Fence.generation/1` catches it and answers `nil`.
+    #
+    # With the Heartbeat process down its named ETS status table dies with it, `status/0` answers
+    # `:down`, and the fallback `GenServer.call` exits `:noproc` — killing the flush task. That
+    # lands on the `{:DOWN, …}` flush-task clause, which records a transient failure and
+    # reschedules, and never reaches `note_not_valid/1`, so the write circuit-breaker cannot arm
+    # either. The shard stays dirty, keeps ACKing writes, and NEVER FLUSHES: unbounded RPO on a
+    # node that looks healthy. A coordinator opened in heartbeat mode keeps `acquire_gen` for its
+    # whole life, so it cannot grow out of this on its own.
+    test "a durability flush still uploads while the Heartbeat process is down", %{shard: shard} do
+      seed!(shard, "before-crash")
+      {:ok, coordinator} = Shards.ensure(shard)
+      assert_mode!(coordinator, :heartbeat)
+
+      stop_supervised!(Heartbeat)
+      refute Heartbeat.running?()
+
+      # A write AFTER the heartbeat died — this is the data whose durability is at stake.
+      {:ok, conn} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('after-crash')"))
+      :ok = ShardExecutor.close(conn)
+
+      assert Shard.dirty?(coordinator), "the fixture must be dirty or the flush is a no-op"
+
+      capture_log(fn ->
+        assert :ok = Shards.flush(shard),
+               "the durability flush died inside recheck_before_put/1 because the Heartbeat " <>
+                 "process was gone. Fence.check had already degraded to legacy and renewed the " <>
+                 "lock — the ownership proof in that mode — so the flush had every right to " <>
+                 "proceed. Instead the shard stays dirty and never flushes for as long as the " <>
+                 "heartbeat is down."
+      end)
+
+      refute Shard.dirty?(coordinator), "the flush reported :ok but left the shard dirty"
+    end
   end
 end
