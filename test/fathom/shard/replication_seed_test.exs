@@ -436,6 +436,68 @@ defmodule Fathom.Shard.ReplicationSeedTest do
            "a replica that was torn before the restart is being offered to peers after it"
   end
 
+  # A TORN REPLICA MUST NOT BE STREAMED ON `replica_request` EITHER (expert review 2026-08-24 #13).
+  #
+  # `torn` was filtered in exactly one place on the serving side — the `position_query` handler,
+  # via `offerable/2`. `replica_request` went through `send_replica/3` → `replica_offer/2`, which
+  # read `state_of/2` and applied NO torn check. `Recovery` uses two separate TCP connections for
+  # those two frames, and a torn transition happens on every generation reset (every primary
+  # checkpoint), so a peer could answer the position query healthy and hand over the incoherent
+  # `.db`/`-wal` pair on the request.
+  #
+  # The puller cannot catch it: `torn` is not in the position frame, so `Recovery.choose/3` cannot
+  # re-derive it, and `finish_seed/3` → `FollowerLog.seeded/4` stamps `torn: false` on the
+  # reasoning that a seed rebuilds both halves together — true of a PRIMARY source, false of a
+  # follower. `Promote.stage/3`'s `quick_check` then passes, exactly as it did in the 2026-08-12
+  # rig failure, and the tenant is served an empty database over a working stored object.
+  #
+  # The test above proves `offerable/2` refuses it; this proves the OTHER frame does too, which is
+  # the half that rested on a filter the pull path never ran.
+  test "a torn replica answers unknown_shard to a replica_request", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 2)
+    [{name, port} | _] = followers
+    enable!(followers, 1)
+
+    {coordinator, conn, path} = open_shard!(id)
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+    Session.commit(id, path <> "-wal", coordinator)
+    await_seeded(name, id, fn -> Session.commit(id, path <> "-wal", coordinator) end)
+
+    # A HEALTHY replica IS streamed — the precondition, so a green run cannot come from the
+    # follower simply having nothing to offer.
+    assert %Protocol.SeedBegin{shard_id: ^id} = replica_request!(port, id)
+
+    # Mark it torn the way a generation change does, through the public seam.
+    torn = %{Follower.state_of(name, id) | torn: true}
+    Follower.seed(name, id, torn.epoch, torn.wal_gen, torn.salt1, torn.next_offset)
+    :ets.insert(Follower.table(name), {id, torn})
+    File.write!(Follower.torn_path(name, id), "")
+    assert Follower.state_of(name, id).torn, "the fixture did not actually mark the replica torn"
+
+    assert {:reject, ^id, :unknown_shard, 0} = replica_request!(port, id),
+           "a torn replica was streamed to a peer. Its .db is a generation behind its -wal, the " <>
+             "puller records it as torn: false, and quick_check will not catch it — the tenant " <>
+             "gets an empty database over a working stored object."
+  end
+
+  # Ask a follower for its replica over the real socket and return the first decoded frame.
+  defp replica_request!(port, shard_id) do
+    # `packet: 4` to match the listener — the frames are length-prefixed, and a raw socket reads
+    # the length header as body and then blocks.
+    {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false, packet: 4])
+
+    try do
+      :ok = :gen_tcp.send(sock, Protocol.encode_replica_request(shard_id))
+      {:ok, bytes} = :gen_tcp.recv(sock, 0, 5_000)
+      {:ok, frame} = Protocol.decode(bytes)
+      frame
+    after
+      :gen_tcp.close(sock)
+    end
+  end
+
   # The other direction: a HEALTHY replica must not come back torn, or every restart would force a
   # full re-seed of every shard the node follows.
   test "a healthy replica is still promotable after the follower restarts", ctx do

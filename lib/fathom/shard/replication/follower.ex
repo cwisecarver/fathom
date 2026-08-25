@@ -486,8 +486,32 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
+  # `offerable/2`, NOT `state_of/2` (expert review 2026-08-24 #13). `torn` was filtered in exactly
+  # ONE place on the serving side — the `position_query` handler — while `replica_request` came
+  # through here and applied no torn check at all. So a peer that became torn between answering
+  # the position query and receiving the replica request handed over the incoherent `.db`/`-wal`
+  # pair, and `Recovery` uses two separate TCP connections for those, with a torn transition
+  # happening on every generation reset (i.e. every primary checkpoint).
+  #
+  # The pulling node could not tell: `torn` is not a field in the position frame, so
+  # `Recovery.choose/3` cannot re-derive it, and the installer records the bytes through
+  # `Follower.finish_seed/3` → `FollowerLog.seeded/4`, which stamps `torn: false` on the reasoning
+  # that "a seed is the ONE event that rebuilds `.db` and `-wal` together" — true when the source
+  # is a PRIMARY, false when the source is a follower. `Promote.stage/3`'s `quick_check` then
+  # passes (it did in the 2026-08-12 rig failure, which is why `torn` exists at all) and the
+  # tenant is served an empty or partial database over a working stored object, which is then
+  # published to S3 under the lease fence.
+  #
+  # `Promote.fresher?/2`'s comment already claims this clause "keeps a torn replica from being
+  # promoted locally AND from being pulled across the fleet". The fleet half rested on a filter
+  # the pull path did not run; now both frames sit behind the same predicate, which is what
+  # `offerable/2` was split out of `state_of/2` for.
+  #
+  # The panel also floated carrying `torn` in `SeedBegin` so the PULLER could verify. Not done:
+  # that is a wire change, and it defends against a source that lies about itself, which is not
+  # the threat model here — peers are trusted, and the race described is closed at the source.
   defp replica_offer(name, shard_id) do
-    with state when state != nil <- state_of(name, shard_id),
+    with state when state != nil <- offerable(name, shard_id),
          {:ok, header} <- Wal.read(wal_path(name, shard_id)),
          {:ok, %{size: db_size}} <- File.stat(db_path(name, shard_id)) do
       {:ok,
