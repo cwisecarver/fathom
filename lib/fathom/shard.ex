@@ -1979,10 +1979,36 @@ defmodule Fathom.Shard do
                   )
               end
 
-            # quick_check failed (expert review #4): upload_for_drop already quarantined the corrupt
-            # local and refused the flush, so the good stored object is untouched. Release the lease
-            # so the next open pulls that good object (there's no valid local copy left to keep).
-            {:error, {:corrupt_local, _reason}} ->
+            # quick_check failed (expert review #4): the flush was refused, so the good stored
+            # object is untouched. Release the lease so the next open pulls it.
+            #
+            # THE PREMISE THAT IT WAS ALREADY QUARANTINED HOLDS FOR ONLY ONE OF THE TWO ROUTES HERE
+            # (expert review 2026-08-24 #17). `upload_for_drop/1` calls `quarantine_corrupt!/2` when
+            # `checkpoint_and_verify/1` ITSELF reports corruption. When the checkpoint merely comes
+            # back BUSY — a lingering reader, entirely ordinary — it short-circuits without running
+            # `quick_check` and falls through to `snapshot_and_upload/1`, whose `verify_snapshot/2`
+            # runs `quick_check` on the live file and returns the SAME `{:corrupt_local, reason}`
+            # deliberately WITHOUT quarantining, because that function also runs while the shard is
+            # being served (renaming the live path out from under open streams is the data-loss
+            # path review #2 closed).
+            #
+            # So on the busy route the corrupt `.db` was left at the live path with its provenance
+            # sidecar still matching the stored object, and the lease released. The next open then
+            # reads `warm? == true`, `fork_evidence` answers `:match`, and the coordinator SERVES
+            # the corrupt database instead of cold-pulling the last-good object — the opposite of
+            # what releasing the lease was meant to achieve.
+            #
+            # Quarantining here is safe for the reason `quarantine_corrupt!/2`'s own hazard note
+            # requires: this is the drop path, the coordinator is terminating. The `File.exists?`
+            # guard is what makes it idempotent — on the checkpoint route the file has already been
+            # renamed away, and a second call would emit a duplicate error and telemetry event.
+            #
+            # The panel proposed a distinct `{:corrupt_local_unquarantined, _}` tag instead. Not
+            # taken: that tag is also matched by `apply_flush_verdict/2` on the SERVING path, where
+            # not quarantining is correct and must stay, so re-tagging means changing a value two
+            # paths agree on to fix one of them. The guard is local to the path that differs.
+            {:error, {:corrupt_local, reason}} ->
+              if File.exists?(state.path), do: quarantine_corrupt!(state, reason)
               Storage.release_lease(state.id, state.lease)
 
             {:error, reason} ->

@@ -4,6 +4,38 @@ defmodule Fathom.ShardCorruptFlushTest do
   be flushed over the last-good stored object via the checkpoint-then-raw-upload fast path (the
   legitimate owner's If-Match succeeds, so the fence can't help — the corruption would become the
   permanent, only truth). Not async: real shard files + the global registry.
+
+  ## A ROUTE THESE TESTS DO NOT COVER, AND WHY (expert review 2026-08-24 #17)
+
+  `{:error, {:corrupt_local, _}}` reaches `flush_then_drop/1` two ways, and only one is exercised
+  below:
+
+    1. `checkpoint_and_verify/1` reports corruption directly. `upload_for_drop/1` quarantines, and
+       "a corrupt local db is quarantined…" drives it.
+    2. The checkpoint comes back BUSY (a lingering reader), so `upload_for_drop/1` short-circuits
+       WITHOUT running quick_check and falls through to `snapshot_and_upload/1`, whose
+       `verify_snapshot/2` finds the corruption and returns the SAME tuple — deliberately without
+       quarantining, because that function also serves the live path (the serving test below is
+       why). `flush_then_drop/1` could not tell them apart and assumed route 1, so the corrupt
+       file was left at the live path with a matching provenance sidecar and the next open SERVED
+       it.
+
+  Route 2 is fixed in `lib/` (the drop path now quarantines when the file is still there), but
+  **there is no test for it, and these tests do not accidentally cover it.** Two fixtures were
+  tried: a reader holding a read transaction over an empty WAL (the checkpoint is then a no-op and
+  succeeds), and the same with a non-empty WAL. Both took route 1, and a precondition assertion on
+  the "checkpoint incomplete" log caught each rather than letting them pass while proving nothing.
+
+  The likely reason is structural: `checkpoint_and_verify/1` runs the checkpoint AND quick_check on
+  one connection, so a page-corrupted file reports CORRUPT regardless of whether the checkpoint was
+  busy — `classify_integrity_failure/1` sees corruption and takes route 1. Reaching route 2 seems
+  to need corruption that quick_check-on-that-connection does not see while the snapshot's does, or
+  a checkpoint that fails to OPEN at all (EMFILE under real density) — neither of which this
+  fixture can stage.
+
+  So the fix rests on reading, not on a red-then-green test. If you are changing
+  `upload_for_drop/1`, `verify_snapshot/2` or that branch of `flush_then_drop/1`, note that the
+  suite will not catch a regression on route 2.
   """
   use ExUnit.Case, async: false
 
