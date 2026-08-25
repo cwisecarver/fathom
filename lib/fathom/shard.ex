@@ -1643,6 +1643,14 @@ defmodule Fathom.Shard do
     # silently stranding acked writes. quarantine_fenced!'s File.rename is safe while streams hold
     # the file open (Unix keeps the fd on the renamed inode); the streams tear down when their
     # monitor on this dying coordinator fires.
+    # PUBLISH THE WRITE FENCE FIRST (expert review 2026-08-24 #6). This clause documents just
+    # above that it covers a self-fence with connections STILL CHECKED OUT — "the *likely* case" —
+    # yet it published no fence at all. We have lost the lease, so a write ACKed here is not ours
+    # to take; worse, `quarantine_fenced!` renames the live file out from under the open fds, so
+    # such a write lands in the `.fenced.<ts>` inode and is invisible to the tenant forever. The
+    # fence turns that into a retryable 503.
+    Fathom.Shard.WriteFence.fence(state.id)
+
     state = settle_flush_task(state)
     # Reply to any pending flush_now caller before we exit (expert review 2026-07-18 #4): we
     # self-fenced WITHOUT flushing, so the on-disk state is NOT durable in storage. Without this,
@@ -1652,8 +1660,9 @@ defmodule Fathom.Shard do
     Fathom.ShardLoad.forget(state.id)
     Fathom.ShardLatency.forget(state.id)
     Fathom.Shards.Lru.forget(state.id)
-    Fathom.Shard.WriteFence.forget(state.id)
     if unflushed?(state), do: quarantine_fenced!(state), else: drop_local(state.path)
+    # …and lift it only AFTER the rename, for the same reason it was published.
+    Fathom.Shard.WriteFence.forget(state.id)
     WriteCounter.forget(state.id)
     FlushWatermark.forget(state.id)
     :ok
@@ -1719,10 +1728,20 @@ defmodule Fathom.Shard do
     Fathom.ShardLoad.forget(state.id)
     Fathom.ShardLatency.forget(state.id)
     Fathom.Shards.Lru.forget(state.id)
-    Fathom.Shard.WriteFence.forget(state.id)
     # flush_and_drop reads the write counter (unflushed?/1) to decide whether to upload, so forget
     # the counter AFTER it — forgetting first would zero the count and skip a dirty shard's flush.
     unless Fathom.Tenants.Tombstones.tombstoned?(state.id), do: flush_and_drop(state)
+    # THE FENCE COMES DOWN AFTER THE FLUSH, NOT BEFORE IT (expert review 2026-08-24 #6, found
+    # independently by three panels). This `forget` used to sit seven lines up, above
+    # `flush_and_drop` — so the fence published at the top of this clause covered only
+    # `settle_flush_task/1`, `settle_waiters/2` and three ETS deletes, and was DOWN for the entire
+    # checkpoint + VACUUM INTO + full-object PUT it was added to cover. That window is budgeted up
+    # to `:shard_shutdown_ms` and is seconds at real S3 latency, on every rolling deploy / SIGTERM
+    # / `Shards.stop` of a busy shard — i.e. the fence was off for precisely the interval named in
+    # its own comment. Clearing it here at all is belt-and-braces: `open_with_lease/8` clears it
+    # unconditionally on the next successful acquire (see the note above), which is what covers a
+    # brutal kill that never reaches this line.
+    Fathom.Shard.WriteFence.forget(state.id)
     WriteCounter.forget(state.id)
     FlushWatermark.forget(state.id)
     :ok

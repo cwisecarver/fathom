@@ -8,7 +8,7 @@ defmodule Fathom.ShardDurabilityTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Connection, FlushGate, Storage}
+  alias Fathom.Shard.{Connection, FlushGate, Storage, WriteFence}
   alias Filo.{Stmt, StmtResult}
 
   setup do
@@ -611,6 +611,63 @@ defmodule Fathom.ShardDurabilityTest do
 
     # Pre-fix: the waiter got a swallowed exit → Shards.flush returned :ok. Now: an explicit error.
     assert {:error, :coordinator_stopped} = Task.await(flush, 2_000)
+  end
+
+  # THE FENCE'S LIFETIME, NOT ITS ARMING (expert review 2026-08-24 #6, found independently by
+  # three of the five panels).
+  #
+  # The busy `terminate/2` clause publishes `WriteFence.fence/1` with a comment naming exactly the
+  # window it protects: streams do not learn the coordinator is going away until its `:DOWN` fires,
+  # which is AFTER terminate returns, so without the fence they keep committing through "a
+  # checkpoint + VACUUM INTO + PUT that has already snapshotted past them". Seven lines later the
+  # same clause called `WriteFence.forget/1` — and only THEN ran `flush_and_drop/1`. So the fence
+  # covered `settle_flush_task/1`, `settle_waiters/2` and three ETS deletes, and was DOWN for the
+  # entire upload: budgeted up to `:shard_shutdown_ms` (60 s), seconds at real S3 latency, on every
+  # rolling deploy and SIGTERM of a busy shard.
+  #
+  # Nothing could catch that. `heartbeat_fence_test.exs` asserts fence→unfence ARMING within one
+  # coordinator's life, and `shard_kill_cleanup_test.exs` asserts a stale row is eventually
+  # cleared — which passes whether the fence is lifted before the flush or after it. The
+  # discriminating question is what `fenced?/1` answers WHILE the upload is in flight, so this
+  # observes it from inside the backend's own flush call.
+  test "the write fence stays UP for the whole shutdown flush, not just the bookkeeping",
+       %{shard: shard} do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    test_pid = self()
+
+    # Fires INSIDE Storage.flush/5, i.e. at the moment a still-live stream's write would be
+    # racing the snapshot. This is the assertion.
+    probe = fn -> send(test_pid, {:fenced_during_flush, WriteFence.fenced?(shard)}) end
+
+    Application.put_env(:fathom, :faulty_before, {:flush, probe})
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+      WriteFence.unfence(shard)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('acked')"))
+    {:ok, coordinator} = Shards.ensure(shard)
+
+    # The connection is deliberately NOT closed: conns > 0 with the lease intact is the
+    # rolling-deploy / SIGTERM clause, and the only one that publishes the fence.
+    :ok = DynamicSupervisor.terminate_child(Fathom.ShardSupervisor, coordinator)
+
+    assert_receive {:fenced_during_flush, true}, 5_000
+
+    # …and it comes down afterwards. Belt-and-braces (the next `open_with_lease/8` lifts it
+    # unconditionally), but leaving it set here would be a per-tenant write outage until then.
+    refute WriteFence.fenced?(shard),
+           "the shutdown fence was never lifted; every write to this tenant 503s until the " <>
+             "next successful lease acquire"
   end
 
   # Expert review #17: after a failover/LB flip re-homes a burst of shards, their phase-aligned
