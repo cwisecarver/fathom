@@ -1190,14 +1190,36 @@ defmodule Fathom.ShardExecutor do
   # `defer_foreign_keys`. READ forms (`PRAGMA synchronous`, `PRAGMA table_info(t)`) are
   # always allowed — only assignment is gated. Widen with `:tenant_pragma_allow` rather than
   # editing this list, so a client that needs one more knob does not need a fathom release.
-  # `user_version`/`application_id`/`schema_version` are deliberately ALLOWED for a `:rw`
-  # stream. They are fathom's own three-place version stamp, and stamping them through the
-  # data path is a documented, tested capability — expert review #15 fixed the opposite bug
-  # (the stamp being classified as clean and then LOST on an idle drop), and
-  # shard_durability_test.exs pins the round trip. The hole finding #7 actually named is a
-  # READ-ONLY credential rewriting the gate, and that is closed at the engine: a `:ro` stream
-  # gets a `mode: :readonly` handle, so SQLite refuses the write outright. `:block_tenant_ddl`
-  # remains the lever for "schema evolution goes through the migration engine, not the tenant".
+  # `user_version`/`application_id` are deliberately ALLOWED for a `:rw` stream. `user_version`
+  # is fathom's own O(1) schema-version gate, and stamping it through the data path is a
+  # documented, tested capability — expert review #15 fixed the opposite bug (the stamp being
+  # classified as clean and then LOST on an idle drop), and shard_durability_test.exs pins the
+  # round trip. The hole finding #7 actually named is a READ-ONLY credential rewriting the gate,
+  # and that is closed at the engine: a `:ro` stream gets a `mode: :readonly` handle, so SQLite
+  # refuses the write outright. `:block_tenant_ddl` remains the lever for "schema evolution goes
+  # through the migration engine, not the tenant".
+  #
+  # `schema_version` WAS in this list and is NOT fathom's stamp — do not re-add it (expert review
+  # 2026-08-24 #4, verified by execution). It was admitted here on the reasoning above, but
+  # fathom's three-place stamp is `django_migrations`, `PRAGMA user_version`, and
+  # `shards.schema_version` — the last being a POSTGRES COLUMN, not a SQLite pragma. `PRAGMA
+  # schema_version` is SQLite's internal schema cookie: the engine compares it on every statement
+  # to decide whether a cached prepared statement must be recompiled, and SQLite's own
+  # documentation says "Misuse of this pragma can result in database corruption." Verified with
+  # the tenant authorizer set: `PRAGMA schema_version = 999` succeeded, persisted to the file
+  # header, and a second connection read back 999.
+  #
+  # Freezing it defeats the engine half of review 2026-07-24 #17. That fix purges the statement
+  # cache on DDL THIS executor sees; a schema change made on ANOTHER stream is caught only by
+  # `prepare_v2` recompilation, which keys on this cookie. Frozen, a cached statement keeps its
+  # pre-ALTER column list, so `SELECT *` returns pre-ALTER columns for post-ALTER rows — the same
+  # class as the recorded `Copy.migrate/4` "no such table: app_thing" incident, and reachable
+  # from the migration replay and the coordinator's snapshot connections too.
+  #
+  # Django does not need it: `test/support/fixtures/django_migrate_capture.json`, captured from a
+  # real `manage.py migrate`, contains no `PRAGMA schema_version` at all (its only pragma is
+  # `foreign_key_check`). It stays in `@durable_pragmas` on purpose — that list governs whether a
+  # pragma write DIRTIES the shard, and if this one is ever reached again it must still flush.
   #
   # `wal_checkpoint` is a maintenance operation, not a safety defeat — it is the same
   # checkpoint the coordinator runs after each snapshot, and fathom's own durability tests
@@ -1205,7 +1227,7 @@ defmodule Fathom.ShardExecutor do
   @tenant_pragma_allow ~w(foreign_keys defer_foreign_keys legacy_alter_table busy_timeout
                           cache_size temp_store recursive_triggers ignore_check_constraints
                           case_sensitive_like automatic_index reverse_unordered_selects
-                          analysis_limit threads user_version application_id schema_version
+                          analysis_limit threads user_version application_id
                           wal_checkpoint incremental_vacuum shrink_memory)
 
   # Pragmas no configuration may re-open, checked BEFORE `extra_pragma_allow()` (expert review

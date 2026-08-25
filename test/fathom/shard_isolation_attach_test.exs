@@ -465,6 +465,40 @@ defmodule Fathom.ShardIsolationAttachTest do
       :ok = ShardExecutor.close(a)
     end
 
+    # SQLite's schema COOKIE is not fathom's schema VERSION (expert review 2026-08-24 #4, verified
+    # by execution). `schema_version` sat in the allow-list beside `user_version`, admitted as
+    # "fathom's own three-place version stamp" — but that stamp's third place is the Postgres
+    # column `shards.schema_version`, not a pragma. `PRAGMA schema_version` is the cookie
+    # `prepare_v2` compares to decide whether a cached statement must be recompiled; freezing it
+    # means a schema change made on ANOTHER stream is never noticed, and a cached `SELECT *` keeps
+    # returning pre-ALTER columns for post-ALTER rows. Measured before the fix: `PRAGMA
+    # schema_version = 999` succeeded, persisted to the file header, and a second connection read
+    # back 999.
+    test "the SQLite schema cookie is not tenant-settable", ctx do
+      {:ok, a} = ShardExecutor.open(ctx.attacker)
+      {:ok, _} = ShardExecutor.execute(a, stmt("CREATE TABLE cookie_t (a INTEGER)"))
+
+      assert {:ok, %StmtResult{rows: [[before]]}} =
+               ShardExecutor.execute(a, stmt("PRAGMA schema_version"))
+
+      assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
+               ShardExecutor.execute(a, stmt("PRAGMA schema_version = 999"))
+
+      # The EFFECT: the cookie must be untouched, so recompilation still tracks real DDL.
+      assert {:ok, %StmtResult{rows: [[^before]]}} =
+               ShardExecutor.execute(a, stmt("PRAGMA schema_version")),
+             "the schema cookie was rewritten; prepare_v2 will no longer recompile on a DDL " <>
+               "made from another stream"
+
+      # `user_version` IS fathom's stamp and stays settable — the two must not be confused again.
+      assert {:ok, _} = ShardExecutor.execute(a, stmt("PRAGMA user_version = 7"))
+
+      assert {:ok, %StmtResult{rows: [[7]]}} =
+               ShardExecutor.execute(a, stmt("PRAGMA user_version"))
+
+      :ok = ShardExecutor.close(a)
+    end
+
     test ":tenant_pragma_allow widens the list without a release", ctx do
       prev = Application.get_env(:fathom, :tenant_pragma_allow, [])
       on_exit(fn -> Application.put_env(:fathom, :tenant_pragma_allow, prev) end)
