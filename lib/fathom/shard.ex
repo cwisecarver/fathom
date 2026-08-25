@@ -1350,11 +1350,11 @@ defmodule Fathom.Shard do
         # graceful stop silently discarded the flush result. One function, two callers.
         case apply_flush_verdict(state, flush_result) do
           {:flushed, state} ->
-            {:noreply, schedule_flush(settle_waiters(state, :flushed))}
+            {:noreply, settle_flushed_and_reschedule(state)}
 
           # Still dirty — re-kick for any flush_now waiter (else it waits a whole flush interval).
           {:dirty, state} ->
-            {:noreply, schedule_flush(settle_waiters(state, :flushed))}
+            {:noreply, settle_flushed_and_reschedule(state)}
 
           # 412 AND the task's lock re-check found the lock SUPERSEDED — a real steal. Never
           # clobber the new owner: self-fence (stop without flushing). Fail any flush_now waiters.
@@ -1410,7 +1410,7 @@ defmodule Fathom.Shard do
       release_flush_slot(record_flush_failure(%{state | flush_task: nil}, {:task_crash, reason}))
 
     # Dirty (the task never landed) — re-kick so a flush_now waiter retries rather than hangs.
-    {:noreply, schedule_flush(settle_waiters(state, :flushed))}
+    {:noreply, settle_flushed_and_reschedule(state)}
   end
 
   @impl true
@@ -3224,6 +3224,35 @@ defmodule Fathom.Shard do
   # durable). On an error/steal: reply the error and clear, so a caller never blocks to timeout.
   # A pre-open / minimal state (e.g. a lease-acquire failure in handle_continue, before the full
   # state is built) has no :flush_waiters key and never accreted a waiter — nothing to settle.
+  # Settle a completed flush's waiters and re-arm the periodic timer — UNLESS the settle already
+  # armed one (expert review 2026-08-24 #21).
+  #
+  # `settle_waiters(state, :flushed)`'s still-dirty branch calls `schedule_flush_backoff/1`, which
+  # arms `:durability_flush` at `flush_backoff_ms()` (250 ms, jittered). All three call sites used
+  # to wrap it as `schedule_flush(settle_waiters(state, :flushed))` — and `schedule_flush/1` on a
+  # dirty shard routes to `do_schedule_flush/2`, whose first act is `cancel_flush/1`. So the
+  # backoff was cancelled and replaced by a full `flush_interval_ms()` (5 s) on every re-kick, and
+  # review 2026-08-01 #32's "BACKED OFF and BOUNDED" re-kick was backed off 20× further than
+  # intended. `gate_full/1` is the one path that was NOT wrapped, which is what showed the wrapping
+  # was accidental rather than a decision.
+  #
+  # The `@max_flush_rekicks` bound survives either way, so there was never a runaway — but a
+  # `:flush_now` caller needing re-kicks waited ~8 × (5 s + flush duration) instead of
+  # ~8 × 250 ms + flush durations, which exceeds the 60 s `@flush_now_timeout`. So
+  # `Fathom.Shards.flush/1` returned the opaque `{:error, :flush_timeout}` rather than the
+  # actionable `{:error, :flush_not_converging}` #32 introduced, and `Tenants.fork(flush_source:
+  # true)`, the `/api/tenants/:id` flush endpoint and export failed spuriously while pinning a
+  # web/Oban process for a minute.
+  #
+  # `flush_rekicks` is the signal: it is incremented exactly when the backoff is armed, and reset
+  # to 0 on both settling branches, so a strict increase means "the re-kick branch ran".
+  defp settle_flushed_and_reschedule(state) do
+    before = state.flush_rekicks
+    settled = settle_waiters(state, :flushed)
+
+    if settled.flush_rekicks > before, do: settled, else: schedule_flush(settled)
+  end
+
   defp settle_waiters(state, _outcome) when not is_map_key(state, :flush_waiters), do: state
   defp settle_waiters(%{flush_waiters: []} = state, _outcome), do: state
 

@@ -619,6 +619,69 @@ defmodule Fathom.ShardDurabilityTest do
     assert {:error, :coordinator_stopped} = Task.await(flush, 2_000)
   end
 
+  # THE BOUNDED RE-KICK'S BACKOFF WAS DEAD CODE (expert review 2026-08-24 #21).
+  #
+  # `settle_waiters(state, :flushed)`'s still-dirty branch arms `schedule_flush_backoff/1` — 250 ms,
+  # jittered. All three call sites wrapped it as `schedule_flush(settle_waiters(state, :flushed))`,
+  # and `schedule_flush/1` on a dirty shard routes to `do_schedule_flush/2`, whose first act is
+  # `cancel_flush/1`. So the 250 ms backoff was cancelled and replaced with a full 5 s interval on
+  # every re-kick. `gate_full/1` is the one path NOT wrapped, which is what shows the wrapping was
+  # accidental.
+  #
+  # The `@max_flush_rekicks` bound survives either way, so there was never a runaway. What broke is
+  # the ANSWER a caller gets: ~8 x (5 s + flush duration) exceeds the 60 s `@flush_now_timeout`, so
+  # `Shards.flush/1` returned the opaque `{:error, :flush_timeout}` instead of the actionable
+  # `{:error, :flush_not_converging}` that review #32 introduced — and
+  # `Tenants.fork(flush_source: true)`, the `/api/tenants/:id` flush endpoint and export failed
+  # spuriously while pinning a web/Oban process for a full minute.
+  #
+  # WHICH ASSERTION ACTUALLY DISCRIMINATES, measured rather than assumed: at the DEFAULT settings
+  # the returned error is `:flush_not_converging` both before and after the fix, because 8 re-kicks
+  # × 5 s = 40 s still fits inside the 60 s `@flush_now_timeout`. It is the ELAPSED TIME that
+  # separates them — 40,141 ms against the unfixed code. The error assertion is kept as the
+  # statement of intended behaviour (and it IS what breaks once a flush is slow enough to push the
+  # total past 60 s, which is the production case), but the timing bound is the one that fails.
+  #
+  # `:shard_flush_backoff_ms` is pinned low so the post-fix path costs the suite ~0 instead of the
+  # ~12 s the default 250 ms × 8 re-kicks plus flush work took. It also widens the gap the test is
+  # measuring, since the pre-fix path ignores this knob entirely and uses the interval.
+  test "a shard that will not converge reports it, instead of timing out", %{shard: shard} do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    prev_backoff = Application.get_env(:fathom, :shard_flush_backoff_ms)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Application.put_env(:fathom, :shard_flush_backoff_ms, 5)
+    on_exit(fn -> restore_env(:shard_flush_backoff_ms, prev_backoff) end)
+
+    # Dirty the shard again from inside every flush, so `unflushed?/1` is true when the waiters are
+    # settled and the re-kick branch runs — up to @max_flush_rekicks, then it must give up.
+    never_converges = fn -> Fathom.Shard.WriteCounter.bump(shard) end
+    Application.put_env(:fathom, :faulty_before, {:flush, never_converges})
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+      restore_env(:shard_storage, prev_storage)
+    end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('a')"))
+
+    started = System.monotonic_time(:millisecond)
+    result = Shards.flush(shard)
+    elapsed = System.monotonic_time(:millisecond) - started
+
+    assert result == {:error, :flush_not_converging},
+           "expected the actionable answer; got #{inspect(result)}. :flush_timeout means the " <>
+             "re-kicks were spaced a full flush interval apart and ran out the 60s flush_now " <>
+             "budget before the bound could be reached."
+
+    assert elapsed < 30_000,
+           "the re-kicks took #{elapsed}ms — they are spaced at the full flush interval rather " <>
+             "than the 250ms backoff, so a fork/export/flush API call pins its caller for a minute"
+
+    :ok = ShardExecutor.close(conn)
+  end
+
   # THE RENEW TIMER MUST NOT RACE THE FLUSH FENCE'S OWN RENEW (expert review 2026-08-24 #8).
   #
   # In legacy mode a coordinator has TWO independent producers of renew PUTs against the same
