@@ -960,8 +960,23 @@ defmodule Fathom.Shard do
   # to still be the very inode we validated (the follower's atomic_write promotion
   # always replaces the inode) AND its sidecar to still name `etag`; any doubt falls
   # back to a fresh cold pull (spurious transfer, never wrong provenance).
+  # `Storage.atomic_copy/2`, NOT a bare `File.cp/2` (expert review 2026-08-24 #9). Every other
+  # path that materializes a shard file fsyncs before the rename, and `Storage.with_atomic_temp/2`
+  # states why: rename-without-data-fsync is atomic against a process crash but NOT against power
+  # loss — afterwards the name can exist with zero-length or partial content (guaranteed on XFS,
+  # heuristic on ext4). This 304 fast path was the one exception, and it is the WORST place for it:
+  # `promote_pull/2` then writes the provenance sidecar with the store's current etag and renames
+  # the temp onto `<id>.db`, so a power cut in that window leaves a torn file whose sidecar MATCHES
+  # the stored object. The next open reads `:match`, opens warm, and seeds dirty. A zero-length
+  # file is a valid empty SQLite database and `PRAGMA quick_check` returns `ok`, so
+  # `verify_snapshot/2`'s integrity gate never fires — the tenant is served an empty database and
+  # the next periodic flush PUTs it over the good stored object with a valid If-Match.
+  #
+  # The cold-pull fallback on the `else` branch was already fsynced (`Storage.pull/2` promotes
+  # through `promote_temp/2`), so only the warm path — the failover path the follower exists to
+  # accelerate — was exposed. The inode/etag TOCTOU re-check below is unaffected and stays.
   defp promote_warm_cache(shard_id, temp, etag, pre_stat) do
-    with :ok <- File.cp(WarmFollower.cache_path(shard_id), temp),
+    with :ok <- Storage.atomic_copy(WarmFollower.cache_path(shard_id), temp),
          true <- pre_stat != nil and warm_cache_stat(shard_id) == pre_stat,
          ^etag <- WarmFollower.cached_etag(shard_id) do
       :ok

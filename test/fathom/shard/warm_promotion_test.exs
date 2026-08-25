@@ -149,6 +149,48 @@ defmodule Fathom.Shard.WarmPromotionTest do
     assert_receive {:warm_promoted, :hit}, 2_000
   end
 
+  # THE PROMOTION COPY IS FSYNCED BEFORE ITS RENAME (expert review 2026-08-24 #9).
+  #
+  # `promote_warm_cache/4` filled the pull temp with a bare `File.cp/2`, and `promote_pull/2` then
+  # writes the provenance sidecar with the store's current etag and renames the temp onto
+  # `<id>.db` — with no fsync anywhere in between. Every other path that materializes a shard file
+  # goes through `Storage.with_atomic_temp/2`, whose own comment says why: rename-without-data-
+  # fsync is atomic against a process crash but NOT against power loss, after which the name can
+  # exist with zero-length or partial content.
+  #
+  # The consequence is unrecoverable rather than merely annoying. A torn file's sidecar MATCHES
+  # the stored object, so the next open reads `:match`, opens warm, and seeds dirty; a zero-length
+  # file is a valid empty SQLite database and `PRAGMA quick_check` returns `ok`, so
+  # `verify_snapshot/2`'s gate never fires; and the next periodic flush PUTs that empty database
+  # over the good stored object with a valid If-Match. The cold-pull fallback on the same line was
+  # already fsynced, so only the warm path — the failover path this whole subsystem exists to
+  # accelerate — was exposed.
+  #
+  # WHAT THIS TEST CAN AND CANNOT DO, plainly: ExUnit cannot observe an fsync, and it cannot cut
+  # power. It pins the two things that ARE observable and that a regression would break — the
+  # promotion still yields correct bytes, and it leaves no temp behind (the temp-and-rename shape
+  # `atomic_copy/2` introduces here is new, and a leaked sibling would be a fresh defect). The
+  # fsync itself rests on `Storage.with_atomic_temp/2`, which is shared with every other
+  # materialization path and is where that guarantee is tested. Do not read this as a
+  # power-loss reproduction.
+  test "a warm promotion leaves correct bytes and no stray temp", %{shard: shard} do
+    seed_remote(shard, "v1")
+    warm_cache_from_remote(shard)
+    attach_promoted_telemetry(shard)
+
+    assert serve_value(shard) == "v1"
+    assert_receive {:warm_promoted, :hit}, 2_000
+
+    :ok = Shards.drain(shard, 5_000)
+
+    strays =
+      Path.wildcard(Fathom.Shard.db_path(shard) <> ".*") ++
+        Path.wildcard(WarmFollower.cache_path(shard) <> ".*tmp*")
+
+    assert strays == [],
+           "the warm promotion left temp files behind: #{inspect(strays)}"
+  end
+
   test "a STALE warm cache is re-pulled fresh, never served", %{shard: shard} do
     # Cache captured at v1 ...
     seed_remote(shard, "v1")
