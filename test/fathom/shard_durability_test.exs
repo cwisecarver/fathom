@@ -619,6 +619,69 @@ defmodule Fathom.ShardDurabilityTest do
     assert {:error, :coordinator_stopped} = Task.await(flush, 2_000)
   end
 
+  # THE RENEW TIMER MUST NOT RACE THE FLUSH FENCE'S OWN RENEW (expert review 2026-08-24 #8).
+  #
+  # In legacy mode a coordinator has TWO independent producers of renew PUTs against the same
+  # cached `lock_etag`: this timer, and the durability flush task's `Fence.check`, which takes
+  # `Fence.legacy/2` and renews too. The flush fences FIRST and replies only after the whole
+  # VACUUM INTO + full-object PUT completes, so its refreshed etag is held inside the task while
+  # `state.lease` stays stale for the entire flush — seconds at real S3. A tick landing in that
+  # window PUT `If-Match: <stale etag>`, took a 412, and `renew_lease/3` mapped it to
+  # `:superseded` without comparing the owner to its own. The coordinator then treated its own
+  # write as a steal: logged "lease superseded by another node; self-fencing", stopped with
+  # `{:shutdown, :lease_lost}`, and quarantined the dirty local WITHOUT flushing it.
+  #
+  # Asserted on `renew_task`, which is the observable for "did this tick fire a PUT at all".
+  test "a :renew_lease tick during an in-flight flush does not fire a competing renew",
+       %{shard: shard} do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    test_pid = self()
+
+    blocker = fn ->
+      send(test_pid, :flush_started)
+
+      receive do
+        :release -> :ok
+      after
+        10_000 -> :ok
+      end
+    end
+
+    Application.put_env(:fathom, :faulty_before, {:flush, blocker})
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+      restore_env(:shard_storage, prev_storage)
+    end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('acked')"))
+    {:ok, pid} = Shards.ensure(shard)
+
+    flush = Task.async(fn -> Shards.flush(shard) end)
+    assert_receive :flush_started, 2_000
+
+    # The flush is parked inside Storage.flush/5 holding the refreshed lease. Fire the tick the
+    # timer would have fired.
+    send(pid, :renew_lease)
+    state = :sys.get_state(pid)
+
+    assert state.renew_task == nil,
+           "the renew timer fired a competing PUT while the flush fence already held the " <>
+             "refreshed lease; against real S3 that 412s on our own write and the coordinator " <>
+             "self-fences, quarantining every un-flushed acked write"
+
+    assert Process.alive?(pid), "the coordinator self-fenced against its own renew"
+
+    send(test_pid, :noop)
+    Application.delete_env(:fathom, :faulty_before)
+    _ = Task.await(flush, 15_000)
+    :ok = ShardExecutor.close(conn)
+  end
+
   # THE PERIODIC FLUSH MUST NOT BE STARVED BY STREAM CHURN (expert review 2026-08-24 #7).
   #
   # `handle_cast(:became_dirty, …)` called `schedule_flush/1` unconditionally, and on a shard that

@@ -1884,11 +1884,25 @@ defmodule Fathom.Shard.Storage.S3 do
     case lease do
       # Fast path (review 2026-07-23 #6): we cached the lock's etag when WE last wrote it
       # (create/put/renew all return it), so renew is one conditional PUT — 1 RTT, not the
-      # legacy GET-then-PUT's 2. A 412 means the lock changed under us, which can only be
-      # another writer: superseded, exactly what the legacy read would have concluded.
+      # legacy GET-then-PUT's 2.
+      #
+      # A 412 does NOT mean "another writer" (expert review 2026-08-24 #8). The comment here
+      # used to say it "can only be another writer", and that is false for a node racing
+      # ITSELF: in legacy mode a coordinator has two independent producers of renew PUTs
+      # against the same cached `lock_etag` — the `:renew_lease` timer, and the durability
+      # flush task's own `Fence.check`, which takes `Fence.legacy/2` and renews too. The flush
+      # fences first and replies only after the whole VACUUM INTO + PUT completes, so its
+      # refreshed etag is held inside the task while `state.lease` stays stale for the entire
+      # flush — seconds at real S3. Any timer tick landing in that window 412s against our own
+      # write, and the coordinator read `:superseded` as a steal, self-fenced, and
+      # `quarantine_fenced!`d a dirty local WITHOUT flushing it: every un-flushed acked write
+      # lost, plus a false split-brain alarm, with no peer involved.
       %{lock_etag: etag} when is_binary(etag) ->
         case put_lock(shard_id, renewed, if_match: etag) do
           {:ok, _} = ok -> ok
+          # The re-read lock names OUR OWN owner string — `owner` carries this node's boot
+          # incarnation, so this cannot be another node. Confirm the epoch and retry.
+          {:error, {:held, ^owner}} -> renew_after_own_write(shard_id, renewed, owner, epoch)
           {:error, {:held, _}} -> {:error, :superseded}
           {:error, :precondition_failed} -> {:error, :superseded}
           err -> err
@@ -1915,6 +1929,30 @@ defmodule Fathom.Shard.Storage.S3 do
           {:error, reason} ->
             {:error, reason}
         end
+    end
+  end
+
+  # A renew that 412'd against a lock still naming our own `{owner, epoch}` lost a race with
+  # OURSELVES, not with a peer — the flush fence's renew and the renew timer both write this
+  # object (expert review 2026-08-24 #8). Re-read to learn the etag our other writer just left,
+  # and re-issue the renew fenced on it, so the TTL actually advances rather than the caller
+  # being told it was superseded.
+  #
+  # SAFE AGAINST A GENUINE TAKEOVER, which is the whole question. `owner` carries this node's
+  # boot incarnation, so a different node cannot match it; and a steal always BUMPS the epoch
+  # (`acquire_lease`'s steal path), so a lock at our owner and our epoch cannot be a peer's. If
+  # either differs we fall through to `:superseded` exactly as before. Bounded: one extra
+  # GET + PUT, no loop — a second 412 here means the object really is moving under us.
+  defp renew_after_own_write(shard_id, renewed, owner, epoch) do
+    case get_lock(shard_id) do
+      {:ok, %{owner: ^owner, epoch: ^epoch}, fresh_etag} ->
+        case put_lock(shard_id, renewed, if_match: fresh_etag) do
+          {:ok, _} = ok -> ok
+          _ -> {:error, :superseded}
+        end
+
+      _ ->
+        {:error, :superseded}
     end
   end
 

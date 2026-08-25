@@ -96,15 +96,56 @@ defmodule Fathom.Test.FaultyStorage do
   def renew_lease(shard_id, lease, ttl_ms) do
     renew_delay()
 
-    if fault() == :renew do
-      {:error, {:transient, :s3_unreachable}}
-    else
-      case Local.renew_lease(shard_id, lease, ttl_ms) do
-        # A renew REWRITES the lock object, so its etag rotates — the detail that made #9's
-        # stale-lease release a silent no-op against real S3.
-        {:ok, renewed} -> {:ok, Map.put(renewed, :lock_etag, bump_lock_etag(shard_id))}
-        other -> other
-      end
+    cond do
+      fault() == :renew ->
+        {:error, {:transient, :s3_unreachable}}
+
+      # RENEW IS IF-MATCH FENCED, and this double did not model that (expert review 2026-08-24
+      # #8). It rotated the etag on every renew but never CHECKED the incoming one — it enforced
+      # If-Match on RELEASE only. `Storage.Local` is worse: it matches on `{owner, epoch}` alone,
+      # so two concurrent same-lease renews both succeed. That gap made an entire class of bugs
+      # structurally invisible to `mix test`, including #8 itself: a coordinator whose renew timer
+      # raced its own flush fence 412s against real S3, and no test could express it.
+      #
+      # The real contract has TWO halves and modelling only the first is what broke
+      # `shard_lease_release_test.exs`'s legacy case here. S3's `renew_lease/3` 412s on a stale
+      # etag, and then disambiguates: a lock still naming our own `{owner, epoch}` is our own
+      # concurrent write, so it re-reads and re-issues fenced on the fresh etag. Only a lock that
+      # moved to someone else is `:superseded`. Model both.
+      stale_lock_etag?(shard_id, lease) ->
+        renew_after_own_write(shard_id, lease, ttl_ms)
+
+      true ->
+        do_renew(shard_id, lease, ttl_ms)
+    end
+  end
+
+  # True when the caller's cached `lock_etag` is not the lock's current one. A lease with no
+  # cached etag takes S3's own legacy read-then-fence path, which cannot be stale by
+  # construction, so it is never refused here. Gated by `:lock_etag_strict` like the release
+  # fence, so a test that predates the contract can opt out rather than be rewritten.
+  defp stale_lock_etag?(shard_id, lease) do
+    case {strict_lock_etag?(), lease} do
+      {true, %{lock_etag: etag}} when is_binary(etag) -> etag != current_lock_etag(shard_id)
+      _ -> false
+    end
+  end
+
+  # The 412 recovery: still ours ⇒ our own writer rotated it, adopt and renew; anyone else ⇒
+  # genuinely superseded. Mirrors `S3.renew_after_own_write/4`.
+  defp renew_after_own_write(shard_id, lease, ttl_ms) do
+    case Local.check_lease(shard_id, lease) do
+      :ok -> do_renew(shard_id, lease, ttl_ms)
+      _ -> {:error, :superseded}
+    end
+  end
+
+  defp do_renew(shard_id, lease, ttl_ms) do
+    case Local.renew_lease(shard_id, lease, ttl_ms) do
+      # A renew REWRITES the lock object, so its etag rotates — the detail that made #9's
+      # stale-lease release a silent no-op against real S3.
+      {:ok, renewed} -> {:ok, Map.put(renewed, :lock_etag, bump_lock_etag(shard_id))}
+      other -> other
     end
   end
 

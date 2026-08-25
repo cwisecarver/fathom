@@ -1530,6 +1530,26 @@ defmodule Fathom.Shard do
   #
   # Same monitored-task shape the flush already uses. The renewal is a plain PUT with no local
   # state to protect, so there is nothing to serialise against.
+  # A DURABILITY FLUSH IS ALREADY RENEWING — do not race it (expert review 2026-08-24 #8).
+  #
+  # In legacy mode the flush task's `Fence.check` takes `Fence.legacy/2`, which renews the lease
+  # with the SAME cached `lock_etag` this timer would use. The task fences first and replies only
+  # after the whole VACUUM INTO + full-object PUT completes, so its refreshed etag lives inside
+  # the task while `state.lease` stays stale for the entire flush — seconds at real S3. A tick
+  # landing in that window PUT `If-Match: <stale etag>`, got a 412, and the coordinator read it as
+  # a steal: it logged "lease superseded by another node; self-fencing", stopped with
+  # `{:shutdown, :lease_lost}`, and quarantined the dirty local WITHOUT flushing it. Every
+  # un-flushed acked write lost, and a false split-brain alarm, with no peer involved.
+  #
+  # `S3.renew_lease/3` now disambiguates that 412 as well (a lock still naming our own
+  # `{owner, epoch}` is our own write), so this guard is the belt to that fix's braces: it stops
+  # the collision happening rather than recovering from it, and saves the extra GET + PUT.
+  # Rescheduling rather than dropping the tick, because the flush result path does not re-arm this
+  # timer — a bare `{:noreply, state}` here would end renewals for the coordinator's whole life.
+  # Deferring is safe: the flush's own fence renewed the lease at flush start.
+  def handle_info(:renew_lease, %{flush_task: flush_task} = state) when flush_task != nil,
+    do: {:noreply, schedule_renew(state)}
+
   def handle_info(:renew_lease, %{renew_task: nil} = state) do
     id = state.id
     lease = state.lease
