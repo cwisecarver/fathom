@@ -52,6 +52,12 @@ defmodule Fathom.ShardDurabilityTest do
   end
 
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
+
+  # Put a config key back exactly as it was — including "was not set at all", which
+  # `Application.put_env(k, nil)` does NOT restore (a `nil` value is not absence, and every
+  # reader here has a non-nil default that `nil` would shadow).
+  defp restore_env(key, nil), do: Application.delete_env(:fathom, key)
+  defp restore_env(key, value), do: Application.put_env(:fathom, key, value)
   defp now_ms, do: System.system_time(:millisecond)
   defp local_db(shard), do: Path.join(local_dir(), "#{shard}.db")
   defp remote_db(shard), do: Path.join(remote_dir(), "#{shard}.db")
@@ -611,6 +617,121 @@ defmodule Fathom.ShardDurabilityTest do
 
     # Pre-fix: the waiter got a swallowed exit → Shards.flush returned :ok. Now: an explicit error.
     assert {:error, :coordinator_stopped} = Task.await(flush, 2_000)
+  end
+
+  # THE PERIODIC FLUSH MUST NOT BE STARVED BY STREAM CHURN (expert review 2026-08-24 #7).
+  #
+  # `handle_cast(:became_dirty, …)` called `schedule_flush/1` unconditionally, and on a shard that
+  # is already dirty that routes to `do_schedule_flush/2`, whose first act is `cancel_flush/1` — it
+  # cancels the pending `:durability_flush` and arms a brand-new FULL interval.
+  #
+  # `ShardExecutor.signal_dirty_once/2` keys its "already signalled" flag on the CONNECTION, and
+  # each Hrana stream is its own process with its own connection, so the cast arrives once per
+  # WRITING STREAM, not once per shard. django-libsql under Django's default `CONN_MAX_AGE=0`
+  # opens a stream per request — so a tenant writing faster than `:shard_flush_interval_ms` reset
+  # the countdown before it could fire, and the periodic flush never ran at all on exactly the
+  # hottest shards. Silent: `[:fathom, :shard, :flush, :failed]` only fires for a flush that RAN,
+  # and the flush/RPO harnesses drive a shard from one process, so they never reproduce the churn.
+  #
+  # Asserted on the TIMER IDENTITY rather than on wall-clock timing, so it is deterministic: a
+  # restarted countdown is a different timer reference. The interval is set far longer than the
+  # test so a real expiry can never be what makes it pass.
+  test "repeated :became_dirty from new streams does not restart the flush countdown",
+       %{shard: shard} do
+    prev_interval = Application.get_env(:fathom, :shard_flush_interval_ms)
+    prev_jitter = Application.get_env(:fathom, :shard_flush_jitter_ratio)
+    Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+    Application.put_env(:fathom, :shard_flush_jitter_ratio, 0)
+
+    on_exit(fn ->
+      restore_env(:shard_flush_interval_ms, prev_interval)
+      restore_env(:shard_flush_jitter_ratio, prev_jitter)
+    end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('a')"))
+    {:ok, pid} = Shards.ensure(shard)
+
+    armed = :sys.get_state(pid)
+    assert armed.flush_timer != nil, "the fixture never armed a durability flush"
+    remaining = Process.read_timer(armed.flush_timer)
+
+    # Five more streams each announce their first write, as django-libsql would across five
+    # requests. None of them may touch the running countdown.
+    for _ <- 1..5 do
+      GenServer.cast(pid, :became_dirty)
+      _ = :sys.get_state(pid)
+    end
+
+    after_churn = :sys.get_state(pid)
+
+    assert after_churn.flush_timer == armed.flush_timer,
+           "a per-stream :became_dirty restarted the durability countdown. With streams turning " <>
+             "over faster than the flush interval the periodic flush never fires at all, and the " <>
+             "RPO for a busy tenant becomes the whole session instead of one interval."
+
+    assert Process.read_timer(after_churn.flush_timer) <= remaining,
+           "the countdown moved backwards"
+
+    :ok = ShardExecutor.close(conn)
+  end
+
+  # The other half of the same guard: the slow→fast transition expert review 2026-08-01 #42 added
+  # this cast FOR must still happen. A served-but-clean shard polls at @clean_poll_multiplier x the
+  # interval; its first write has to restore full-rate flushing, or #7's fix would have traded one
+  # RPO bug for another.
+  #
+  # Unlike the test above, this one does NOT reproduce a pre-existing bug — #42's behaviour was
+  # correct before #7 touched it, and against the unfixed code this fails only with a KeyError on
+  # the field #7 introduced. It is a guard on the fix, and it is worth having precisely because
+  # the obvious way to fix #7 (never re-arm on `:became_dirty`) would silently undo #42.
+  test "a clean served shard's first write still restores the full-rate flush timer",
+       %{shard: shard} do
+    prev_interval = Application.get_env(:fathom, :shard_flush_interval_ms)
+    prev_jitter = Application.get_env(:fathom, :shard_flush_jitter_ratio)
+    Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+    Application.put_env(:fathom, :shard_flush_jitter_ratio, 0)
+
+    on_exit(fn ->
+      restore_env(:shard_flush_interval_ms, prev_interval)
+      restore_env(:shard_flush_jitter_ratio, prev_jitter)
+    end)
+
+    {:ok, setup_conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(setup_conn, stmt("CREATE TABLE kv (v TEXT)"))
+    :ok = ShardExecutor.close(setup_conn)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, pid} = Shards.ensure(shard)
+
+    # Put the coordinator on the reduced-cadence timer explicitly rather than trying to arrive
+    # there through traffic. The natural route is a durability flush completing against a
+    # served-but-clean shard — `:checkout` itself arms the FULL-rate timer (it calls
+    # `do_schedule_flush/1` with the default multiplier), so opening a stream and reading does NOT
+    # produce the slow poll, which an earlier draft of this test wrongly assumed. What matters is
+    # the guard's behaviour given a slow timer, so set that state and assert on it.
+    slow = :sys.replace_state(pid, &%{&1 | flush_timer_slow?: true})
+    assert slow.flush_timer_slow?
+    slow_timer = slow.flush_timer
+
+    # A REAL first write on this connection — it bumps the WriteCounter (so the shard is genuinely
+    # dirty) and casts `:became_dirty`, which is the production sequence. Casting without writing
+    # proves nothing: `schedule_flush/1` would correctly put a still-clean shard back on the slow
+    # poll, which is what the first draft of this test actually measured.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('a')"))
+    _ = :sys.get_state(pid)
+    after_write = :sys.get_state(pid)
+
+    refute after_write.flush_timer_slow?,
+           "the write did not lift the shard off the reduced-cadence poll; #7's guard swallowed " <>
+             "the clean→dirty edge that #42 added this signal for"
+
+    refute after_write.flush_timer == slow_timer,
+           "the slow timer was left in place, so this shard keeps polling at " <>
+             "@clean_poll_multiplier x the interval while holding un-flushed writes"
+
+    :ok = ShardExecutor.close(conn)
   end
 
   # THE FENCE'S LIFETIME, NOT ITS ARMING (expert review 2026-08-24 #6, found independently by

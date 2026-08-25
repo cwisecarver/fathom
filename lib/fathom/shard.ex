@@ -607,6 +607,10 @@ defmodule Fathom.Shard do
         counter_gen: WriteCounter.generation(),
         flushed_through: init_flushed_through(shard_id, warm?),
         flush_timer: nil,
+        # Was `flush_timer` armed at the SLOW (clean-poll) cadence? Read by the `:became_dirty`
+        # handler to tell "this shard is loafing and a write should speed it up" from "a flush is
+        # already counting down and must not be restarted" (expert review 2026-08-24 #7).
+        flush_timer_slow?: false,
         # The in-flight off-process durability flush (expert review #27), the watermark
         # it will advance flushed_through to on success, and the counter generation that
         # watermark was captured under (expert review #11 — restoring a watermark from a
@@ -1235,7 +1239,36 @@ defmodule Fathom.Shard do
   # A stream wrote for the first time on its checkout (expert review 2026-08-01 #42). A clean
   # served shard polls at a reduced cadence, so this is the edge that restores full-rate
   # flushing. Idempotent and cheap: the executor sends it at most once per checkout.
-  def handle_cast(:became_dirty, state), do: {:noreply, schedule_flush(state)}
+  #
+  # AN EDGE, NOT A RESCHEDULE (expert review 2026-08-24 #7). This used to call
+  # `schedule_flush/1` unconditionally, and for a shard that is already dirty that routes to
+  # `do_schedule_flush/2`, whose first act is `cancel_flush/1` — cancelling the pending
+  # `:durability_flush` and arming a brand-new FULL interval.
+  #
+  # `ShardExecutor.signal_dirty_once/2` keys its "already signalled" flag on the CONNECTION, and
+  # every Hrana stream is its own `Filo.Stream` process with its own connection — so this cast
+  # arrives once per WRITING STREAM, not once per shard. django-libsql under Django's default
+  # `CONN_MAX_AGE=0` opens a fresh stream per request, so a tenant whose streams turn over faster
+  # than `:shard_flush_interval_ms` (5 s) restarted the countdown before it could ever fire. The
+  # periodic durability flush — the thing that bounds the loss window to the interval — therefore
+  # never ran on the hottest, most write-active shards, the ones it exists for. Those flushed only
+  # at idle-drop (60 s of ZERO streams), at drain, or at a clean terminate, so on node death the
+  # RPO for a continuously busy tenant was the whole session.
+  #
+  # The checkout path already knew this hazard: it re-arms only `if state.flush_timer == nil`,
+  # commented "never per stream cycle". This is the same guard, widened by one case so the
+  # slow→fast transition #42 exists for still happens: re-arm when there is no timer, or when the
+  # armed one is the CLEAN-POLL timer. A fast timer already counting down is left alone.
+  #
+  # Note the tempting one-liner — dropping `cancel_flush/1` from `do_schedule_flush/2` — is wrong:
+  # every other caller depends on it, and removing it leaks timers everywhere.
+  def handle_cast(:became_dirty, state) do
+    if state.flush_timer == nil or state.flush_timer_slow? do
+      {:noreply, schedule_flush(state)}
+    else
+      {:noreply, state}
+    end
+  end
 
   # Begin standing down. With no connections we stop immediately (terminate
   # flushes + releases). Otherwise wait for the drain, bounded by a timer.
@@ -3861,7 +3894,8 @@ defmodule Fathom.Shard do
                 self(),
                 :durability_flush,
                 jitter_interval(interval * multiplier)
-              )
+              ),
+            flush_timer_slow?: multiplier > 1
         }
 
       _ ->
@@ -3875,7 +3909,12 @@ defmodule Fathom.Shard do
   defp schedule_flush_backoff(state) do
     state = cancel_flush(state)
     delay = jitter_interval(flush_backoff_ms())
-    %{state | flush_timer: Process.send_after(self(), :durability_flush, delay)}
+
+    %{
+      state
+      | flush_timer: Process.send_after(self(), :durability_flush, delay),
+        flush_timer_slow?: false
+    }
   end
 
   # Decorrelate flush timers across coordinators (expert review #17): a mass re-home phase-aligns
@@ -3896,10 +3935,10 @@ defmodule Fathom.Shard do
 
   defp jitter_interval(base), do: base
 
-  defp cancel_flush(%{flush_timer: nil} = state), do: state
+  defp cancel_flush(%{flush_timer: nil} = state), do: %{state | flush_timer_slow?: false}
 
   defp cancel_flush(%{flush_timer: timer} = state) do
     Process.cancel_timer(timer)
-    %{state | flush_timer: nil}
+    %{state | flush_timer: nil, flush_timer_slow?: false}
   end
 end
