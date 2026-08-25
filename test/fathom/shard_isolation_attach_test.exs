@@ -479,6 +479,29 @@ defmodule Fathom.ShardIsolationAttachTest do
 
       :ok = ShardExecutor.close(a)
     end
+
+    # …but it cannot reach `query_only` (expert review 2026-08-24 #3). That one is not just another
+    # protective knob: on the one path where a `:ro` handle cannot be opened `mode: :readonly` — a
+    # database whose `-wal` needs recovery — `PRAGMA query_only` IS the read-only scope. An operator
+    # widening the allow-list for an unrelated pragma must not be able to turn every such stream's
+    # scope into an advisory one by naming it here.
+    test "the widening lever cannot re-open query_only", ctx do
+      prev = Application.get_env(:fathom, :tenant_pragma_allow, [])
+      on_exit(fn -> Application.put_env(:fathom, :tenant_pragma_allow, prev) end)
+
+      {:ok, a} = ShardExecutor.open(ctx.attacker)
+
+      Application.put_env(:fathom, :tenant_pragma_allow, ["query_only", "secure_delete"])
+
+      assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
+               ShardExecutor.execute(a, stmt("PRAGMA query_only=OFF")),
+             "config re-opened query_only; the :ro fallback's scope is configurable away"
+
+      # The rest of the widening still works — this is a deny-list of one, not a kill switch.
+      assert {:ok, _} = ShardExecutor.execute(a, stmt("PRAGMA secure_delete=ON"))
+
+      :ok = ShardExecutor.close(a)
+    end
   end
 
   describe ":ro scope — SQLite enforces it, not a keyword prefix" do

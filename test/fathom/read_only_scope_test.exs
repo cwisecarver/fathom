@@ -190,6 +190,45 @@ defmodule Fathom.ReadOnlyScopeTest do
     _state = assert_ro_write_refused(state, 2)
   end
 
+  # THE SCOPE MUST REST ON THE ENGINE, NOT ON A PRAGMA (expert review 2026-08-24 #3, verified by
+  # execution). `Connection.open_handle/2` falls back to a read-write handle guarded only by
+  # `PRAGMA query_only=ON` whenever a `mode: :readonly` open fails. Its comment justified that as
+  # "the narrow case where a `-wal` needs recovery" — but the far more common trigger is that the
+  # FILE DOES NOT EXIST: `Sqlite3.open(missing, mode: :readonly)` returns
+  # `{:error, :database_open_failed}` and exqlite only creates a shard file on first connection
+  # open. So every brand-new tenant, and every shard dropped clean while storage held nothing,
+  # handed a `:ro` token a read-write handle. Measured before the fix:
+  #
+  #     ShardExecutor.open(id, {:ro, nil}) on a never-opened shard -> scope :ro, query_only = 1
+  #     PRAGMA main . query_only = OFF                             -> query_only = 0
+  #     CREATE TABLE written_by_ro (x)                             -> :ok
+  #
+  # Driven at the `Connection` level ON PURPOSE. `ShardExecutor`'s leading-keyword scope check
+  # refuses a `:ro` write before SQLite ever sees it, so a test through the executor passes
+  # whether or not the handle is genuinely read-only — it cannot discriminate. This asserts the
+  # engine's own enforcement, with the defeatable pragma explicitly turned off first.
+  test "a :ro handle on a shard with NO local file is still refused by SQLite itself", %{
+    shard: shard
+  } do
+    path = Path.join(Fathom.Shard.data_dir(), "#{shard}.db")
+
+    refute File.exists?(path),
+           "the fixture must start with no local shard file — its absence IS the trigger"
+
+    {:ok, conn} = Fathom.Shard.Connection.open(path, tenant?: true, scope: :ro)
+    on_exit(fn -> Fathom.Shard.Connection.close(conn) end)
+
+    # Defeat the fallback belt the way a tenant would, then write anyway. On a genuinely
+    # read-only handle this changes nothing; on the rw-plus-query_only fallback it was the
+    # whole scope.
+    _ = Fathom.Shard.Connection.exec(conn, "PRAGMA query_only=OFF")
+
+    assert {:error, _} =
+             Fathom.Shard.Connection.query(conn, "CREATE TABLE written_by_ro (x)", [], dml?: true),
+           "a :ro handle created a table — the read-only scope rested on PRAGMA query_only, " <>
+             "which the tenant can turn off, rather than on SQLite's own enforcement"
+  end
+
   # Opens WS stream `sid`, attempts a write, asserts it is refused FILO_READONLY, returns the state.
   defp assert_ro_write_refused(state, sid) do
     {%{"response" => %{"type" => "open_stream"}}, state} =

@@ -8,6 +8,8 @@ defmodule Fathom.Shard.Connection do
   `busy_timeout`. These are plain functions — the connection is owned and used by
   the calling process throughout its life.
   """
+  require Logger
+
   alias Exqlite.Sqlite3
 
   @doc """
@@ -51,15 +53,56 @@ defmodule Fathom.Shard.Connection do
   # for the narrow case where a read-only open cannot proceed — a database whose `-wal`
   # needs recovery, which requires write access. That fallback is still safe because
   # `ShardExecutor` refuses `query_only` as a pragma assignment.
+  #
+  # THE ABSENT FILE IS NOT THAT NARROW CASE (expert review 2026-08-24 #3, verified by
+  # execution). `Sqlite3.open(missing, mode: :readonly)` returns `{:error, :database_open_failed}`,
+  # and exqlite only creates a shard file on first connection open (see the note at
+  # `Fathom.Shard`'s cold-open). So the fallback — written for WAL recovery — was in fact taken
+  # for EVERY brand-new tenant and every shard dropped clean while storage held nothing, which
+  # is the common path, not the narrow one. Measured before this change: a `:ro` handle on a
+  # never-opened shard came back with `query_only = 1`, `PRAGMA main . query_only = OFF` (the
+  # qualifier bypass, then live) set it to 0, and `CREATE TABLE written_by_ro(x)` succeeded.
+  #
+  # Materialize the empty database first and re-try the read-only open, so the scope rests on
+  # the engine rather than on a defeatable pragma. There is nothing to lose by creating it: a
+  # shard with no stored object has no data for the `:ro` caller to read either way, and the
+  # `:rw` path would have created the same file on its first open.
   defp open_handle(path, :ro) do
-    case Sqlite3.open(path, mode: :readonly) do
-      {:ok, conn} -> {:ok, conn, :readonly}
-      {:error, _} -> with {:ok, conn} <- Sqlite3.open(path), do: {:ok, conn, :readwrite}
+    case readonly_open(path) do
+      {:ok, conn} ->
+        {:ok, conn, :readonly}
+
+      {:error, reason} ->
+        # The genuine WAL-recovery case the fallback was written for. Loud, because this is the
+        # ONE place a `:ro` scope rests on `PRAGMA query_only` instead of on SQLite itself.
+        Logger.warning(
+          "#{Path.basename(path)}: a :ro handle could not be opened read-only " <>
+            "(#{inspect(reason)}); falling back to a read-write handle guarded only by " <>
+            "PRAGMA query_only"
+        )
+
+        with {:ok, conn} <- Sqlite3.open(path), do: {:ok, conn, :readwrite}
     end
   end
 
   defp open_handle(path, _scope) do
     with {:ok, conn} <- Sqlite3.open(path), do: {:ok, conn, :readwrite}
+  end
+
+  defp readonly_open(path) do
+    case Sqlite3.open(path, mode: :readonly) do
+      {:ok, conn} -> {:ok, conn}
+      {:error, _} = err -> if File.exists?(path), do: err, else: create_then_readonly(path)
+    end
+  end
+
+  # Open read-write purely to bring the file into existence, close it, and re-open read-only.
+  # A zero-length file is a valid empty SQLite database, so the second open succeeds.
+  defp create_then_readonly(path) do
+    with {:ok, conn} <- Sqlite3.open(path),
+         :ok <- Sqlite3.close(conn) do
+      Sqlite3.open(path, mode: :readonly)
+    end
   end
 
   # A read-only handle takes only the connection-local pragmas. The file-level ones

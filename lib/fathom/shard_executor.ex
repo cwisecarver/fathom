@@ -1208,6 +1208,14 @@ defmodule Fathom.ShardExecutor do
                           analysis_limit threads user_version application_id schema_version
                           wal_checkpoint incremental_vacuum shrink_memory)
 
+  # Pragmas no configuration may re-open, checked BEFORE `extra_pragma_allow()` (expert review
+  # 2026-08-24 #3). `query_only` is not merely another protective knob: on the one path where a
+  # `:ro` handle cannot be opened `mode: :readonly` — a database whose `-wal` needs recovery —
+  # it IS the read-only scope, and `Fathom.Shard.Connection` says so where it sets it. A
+  # `:tenant_pragma_allow` entry naming it would silently convert every such stream's scope into
+  # an advisory one, so the widening lever deliberately cannot reach it.
+  @tenant_pragma_deny ~w(query_only)
+
   # SQLite spells an argument-taking READ the same way it spells a setter — `PRAGMA
   # table_info(t)` and `PRAGMA journal_mode(delete)` are syntactically identical — so the
   # gate cannot classify assignment-vs-read from the shape alone. These are the
@@ -1278,8 +1286,9 @@ defmodule Fathom.ShardExecutor do
     name = String.downcase(name_raw)
 
     allowed? =
-      name in @tenant_pragma_allow or name in @tenant_pragma_introspect or
-        name in extra_pragma_allow()
+      name not in @tenant_pragma_deny and
+        (name in @tenant_pragma_allow or name in @tenant_pragma_introspect or
+           name in extra_pragma_allow())
 
     cond do
       allowed? ->
