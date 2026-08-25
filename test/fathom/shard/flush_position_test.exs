@@ -67,8 +67,14 @@ defmodule Fathom.Shard.FlushPositionTest do
   end
 
   describe "Promote.fresher?/2" do
-    defp replica(e, g, o), do: %{epoch: e, wal_gen: g, next_offset: o}
-    defp stamp(e, g, o), do: %{epoch: e, wal_gen: g, offset: o}
+    # THE FIRST FIELD IS THE LINEAGE ON BOTH SIDES (expert review 2026-08-24 #12). This helper used
+    # to build the replica with `epoch:` and it was the LOCK epoch — a counter `release_lease`
+    # resets to 1 on every clean drop — while the stamp's `epoch:` slot carries the monotonic
+    # lineage. Same field name, two different counters, and the comparison silently meant nothing
+    # from a shard's second replicating open onward. The replica now carries both: `lineage` for
+    # ranking, `epoch` for `FollowerLog.decide/2`'s fencing check, which is a different question.
+    defp replica(l, g, o), do: %{lineage: l, epoch: 1, wal_gen: g, next_offset: o}
+    defp stamp(l, g, o), do: %{epoch: l, wal_gen: g, offset: o}
 
     test "orders lexicographically on epoch, then generation, then offset" do
       assert Promote.fresher?(replica(1, 0, 100), stamp(1, 0, 50))
@@ -96,6 +102,21 @@ defmodule Fathom.Shard.FlushPositionTest do
       refute Promote.fresher?(nil, stamp(1, 0, 0))
       refute Promote.fresher?(%{epoch: 1}, stamp(1, 0, 0))
       refute Promote.fresher?(replica(1, 0, 5), %{epoch: 1})
+    end
+
+    # A replica seeded before the lineage travelled on the wire — or while
+    # `Protocol.lineage_wire?/0` is off — carries 0, meaning "not stated". It must never be ranked,
+    # in EITHER direction: the honest answer is that we do not know how it relates to the object,
+    # and falling back to the stored object is what "we do not know" means here. This is what keeps
+    # the two-step rollout inert rather than dangerous while the fleet catches up.
+    test "a replica with no stated lineage is never fresher, however far ahead it reads" do
+      refute Promote.fresher?(
+               %{lineage: 0, epoch: 9, wal_gen: 99, next_offset: 999_999},
+               stamp(1, 0, 0)
+             )
+
+      # …and the same on the object's side: an object stamped before lineages existed.
+      refute Promote.fresher?(replica(9, 99, 999_999), stamp(0, 0, 0))
     end
   end
 

@@ -91,6 +91,28 @@ defmodule Fathom.Shard.Replication.Protocol do
   @signed 12
   @push_ext 13
 
+  # THE REPLICA'S LINEAGE (expert review 2026-08-24 #12). `seed_begin` carries the primary's LOCK
+  # epoch, which `FollowerLog.decide/2` needs for its fencing check — but the lock epoch RESETS to 1
+  # on every clean idle-drop, drain and handoff, so it is useless as an ordering key against the
+  # stored object, whose position stamp carries the monotonic LINEAGE instead. Comparing the two in
+  # `Promote.fresher?/2` made promotion inert from a shard's second replicating open onward. The
+  # follower needs both numbers, so the seed has to carry both.
+  #
+  # A NEW TYPE CODE at `@version 2`, for the third time and for the same reason the two blocks above
+  # give: bumping the version makes `decode/1` refuse EVERY frame from a node one deploy behind,
+  # which takes the commit path down fleet-wide for the length of a rolling upgrade. A new code
+  # costs nothing to a peer that never receives one — and emitting it is gated on
+  # `lineage_wire?/0`, which an operator turns on only once the code is everywhere, exactly as
+  # `FrameAuth.signing?/0` gates `@signed` and `@push_ext`.
+  #
+  # ONLY THE SEED needs it, which is not obvious and is worth the sentence: a `Push` that would
+  # carry a STALE lineage — a new primary taking over an existing follower without re-seeding —
+  # always routes through `FollowerLog.decide_fresh/2`, whose only accepting clause sets
+  # `torn: true`, and a torn replica is refused by `fresher?/2` and by `offerable/2` alike. So a
+  # replica whose lineage could be wrong is already excluded from every comparison, and the seed is
+  # the one event that both rebuilds the pair and clears `torn`.
+  @seed_begin_lin 14
+
   # Which file a chunk belongs to. Explicit rather than splitting one byte stream at `db_size`,
   # so a chunk never straddles the boundary and the follower can assert it received exactly the
   # promised number of database bytes before the first WAL byte.
@@ -124,8 +146,23 @@ defmodule Fathom.Shard.Replication.Protocol do
     pages.
     """
     @enforce_keys [:shard_id, :epoch, :wal_gen, :salt1, :wal_offset, :db_size, :wal_size]
-    defstruct [:shard_id, :epoch, :wal_gen, :salt1, :wal_offset, :db_size, :wal_size]
+    defstruct [
+      :shard_id,
+      :epoch,
+      :wal_gen,
+      :salt1,
+      :wal_offset,
+      :db_size,
+      :wal_size,
+      lineage: 0
+    ]
 
+    @typedoc """
+    `epoch` is the primary's LOCK epoch — what `FollowerLog.decide/2` fences pushes against — and
+    `lineage` is the monotonic ownership counter the stored object's position stamp carries.
+    They are different scales and both are needed; see the note on `@seed_begin_lin`. `lineage: 0`
+    means "not stated", which is what a peer that predates the field sends.
+    """
     @type t :: %__MODULE__{
             shard_id: String.t(),
             epoch: non_neg_integer(),
@@ -133,7 +170,8 @@ defmodule Fathom.Shard.Replication.Protocol do
             salt1: non_neg_integer(),
             wal_offset: non_neg_integer(),
             db_size: non_neg_integer(),
-            wal_size: non_neg_integer()
+            wal_size: non_neg_integer(),
+            lineage: non_neg_integer()
           }
   end
 
@@ -197,12 +235,38 @@ defmodule Fathom.Shard.Replication.Protocol do
   """
   @spec encode_seed_begin(SeedBegin.t()) :: iolist()
   def encode_seed_begin(%SeedBegin{} = s) do
-    seal([
-      <<@version::8, @seed_begin::8, byte_size(s.shard_id)::16, s.epoch::64, s.wal_gen::64,
-        s.salt1::64, s.wal_offset::64, s.db_size::64, s.wal_size::64>>,
-      s.shard_id
-    ])
+    # The shape is chosen by the GATE, not by whether `lineage` happens to be set — the same
+    # reasoning `encode_push/1` gives for `prev_extent`: what this node emits should be one
+    # operator-visible decision rather than a per-frame property nobody can predict.
+    if lineage_wire?() do
+      seal([
+        <<@version::8, @seed_begin_lin::8, byte_size(s.shard_id)::16, s.epoch::64, s.wal_gen::64,
+          s.salt1::64, s.wal_offset::64, s.db_size::64, s.wal_size::64, s.lineage::64>>,
+        s.shard_id
+      ])
+    else
+      seal([
+        <<@version::8, @seed_begin::8, byte_size(s.shard_id)::16, s.epoch::64, s.wal_gen::64,
+          s.salt1::64, s.wal_offset::64, s.db_size::64, s.wal_size::64>>,
+        s.shard_id
+      ])
+    end
   end
+
+  @doc """
+  Whether this node emits the lineage-carrying seed frame (`config :fathom,
+  :replication_lineage_wire`, default **false**).
+
+  Off by default ON PURPOSE, and it is the second step of a two-step rollout: a peer one deploy
+  behind has no clause for `@seed_begin_lin` and answers `{:error, :malformed}`, which closes that
+  socket and stops it being seeded. Deploy everywhere first, then turn this on — the same contract
+  `FrameAuth.signing?/0` carries for `@signed` and `@push_ext`.
+
+  Until it is on, `Promote.fresher?/2` sees `lineage: 0` on every replica and refuses to compare,
+  so promotion stays inert — which is exactly what it already was, not a regression.
+  """
+  @spec lineage_wire?() :: boolean()
+  def lineage_wire?, do: Application.get_env(:fathom, :replication_lineage_wire, false) == true
 
   @doc """
   One chunk of a seed. `part` is `:db` or `:wal`; `seq` counts from 0 **within its part**.
@@ -364,13 +428,31 @@ defmodule Fathom.Shard.Replication.Protocol do
     ])
   end
 
+  # THE FIRST FIELD IS THE ORDERING KEY, and which counter fills it changed (expert review
+  # 2026-08-24 #12). It is compared against the stored object's position stamp, which carries the
+  # monotonic LINEAGE — so sending the LOCK epoch, which resets to 1 on every clean release, made
+  # every cross-fleet ranking meaningless in the same way `Promote.fresher?/2` was.
+  #
+  # Not a new type code, because the layout does not change and this field has exactly one
+  # consumer: `Recovery.choose/3`, which ranks. It is never a fencing value — that is the seed and
+  # push path, where `epoch` keeps its own meaning. So this is a change of WHICH NUMBER, not of the
+  # frame.
+  #
+  # A peer one deploy behind still sends its lock epoch and is still mis-ranked, exactly as it is
+  # today; nothing regresses. A replica with no stated lineage sends 0, and the receiving
+  # `fresher?/2` refuses to rank a 0 — so with `lineage_wire?/0` off, cross-fleet recovery is INERT
+  # rather than wrong, which is the safe half of the trade and is restored the moment the gate goes
+  # on.
   def encode_position(shard_id, %{} = pos) do
     seal([
-      <<@version::8, @position::8, 1::8, byte_size(shard_id)::16, pos.epoch::64, pos.wal_gen::64,
-        pos.salt1::64, pos.next_offset::64>>,
+      <<@version::8, @position::8, 1::8, byte_size(shard_id)::16, ordering_key(pos)::64,
+        pos.wal_gen::64, pos.salt1::64, pos.next_offset::64>>,
       shard_id
     ])
   end
+
+  defp ordering_key(%{lineage: l}) when is_integer(l), do: l
+  defp ordering_key(%{epoch: e}), do: e
 
   @doc """
   Ask a peer to stream its replica of `shard_id` back.
@@ -464,6 +546,26 @@ defmodule Fathom.Shard.Replication.Protocol do
      }}
   end
 
+  # ABOVE the plain `@seed_begin` clause and matching its own type code, so the two never
+  # compete. `lineage` is the trailing field; everything before it is byte-identical to the
+  # unextended frame, which is what makes this additive rather than a layout change.
+  defp decode_frame(
+         <<@version::8, @seed_begin_lin::8, slen::16, epoch::64, gen::64, salt::64, off::64,
+           dblen::64, wallen::64, lineage::64, shard::binary-size(slen)>>
+       ) do
+    {:ok,
+     %SeedBegin{
+       shard_id: shard,
+       epoch: epoch,
+       wal_gen: gen,
+       salt1: salt,
+       wal_offset: off,
+       db_size: dblen,
+       wal_size: wallen,
+       lineage: lineage
+     }}
+  end
+
   defp decode_frame(
          <<@version::8, @seed_begin::8, slen::16, epoch::64, gen::64, salt::64, off::64,
            dblen::64, wallen::64, shard::binary-size(slen)>>
@@ -513,7 +615,12 @@ defmodule Fathom.Shard.Replication.Protocol do
          <<@version::8, @position::8, 1::8, slen::16, epoch::64, gen::64, salt::64, off::64,
            shard::binary-size(slen)>>
        ) do
-    {:ok, {:position, shard, %{epoch: epoch, wal_gen: gen, salt1: salt, next_offset: off}}}
+    # Both keys from the one wire field: `lineage` because that is what a current peer puts there
+    # and what `Promote.fresher?/2` ranks on, and `epoch` because `Recovery` and its tests have
+    # always read it under that name. See `ordering_key/1` on the encode side.
+    {:ok,
+     {:position, shard,
+      %{epoch: epoch, lineage: epoch, wal_gen: gen, salt1: salt, next_offset: off}}}
   end
 
   defp decode_frame(

@@ -35,7 +35,13 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
   # A position as a peer reports it (the `FollowerLog.t()` shape), and as the stored object stamps
   # it (`Storage.position/0`) — deliberately different key names, which is exactly the mismatch
   # `Promote.fresher?/2` exists to bridge.
-  defp at(epoch, gen, off), do: %{epoch: epoch, wal_gen: gen, salt1: 0, next_offset: off}
+  # THE FIRST ARGUMENT IS THE LINEAGE, not the lock epoch (expert review 2026-08-24 #12). It is
+  # ranked against the stored object's position stamp, which carries the monotonic lineage; the
+  # lock epoch resets to 1 on every clean release and is pinned here to say so. A peer's offer
+  # arrives with both keys set from the one wire field — see `Protocol.ordering_key/1`.
+  defp at(lineage, gen, off),
+    do: %{lineage: lineage, epoch: 1, wal_gen: gen, salt1: 0, next_offset: off}
+
   defp stamp(epoch, gen, off), do: %{epoch: epoch, wal_gen: gen, offset: off}
 
   defp peer(key, port \\ 1), do: {key, "127.0.0.1", port}
@@ -237,14 +243,31 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
 
   # Give `name` a replica of `id` the way a completed seed would leave it: files on disk and a
   # matching ETS row.
-  defp plant_replica(name, id, epoch, gen, salt, db, wal) do
+  # The third argument is the LINEAGE — the ordering key ranked against the stored object's stamp —
+  # not the lock epoch (expert review 2026-08-24 #12). The lock epoch is pinned at 1 because that
+  # is what production resets it to on every clean release, which is exactly why it cannot be the
+  # ordering key.
+  defp plant_replica(name, id, lineage, gen, salt, db, wal) do
     File.write!(Follower.db_path(name, id), db)
     File.write!(Follower.wal_path(name, id), wal)
-    Follower.seed(name, id, epoch, gen, salt, byte_size(wal))
+    Follower.seed(name, id, 1, gen, salt, byte_size(wal), lineage)
   end
 
   setup do
     id = "recov_#{System.unique_integer([:positive])}"
+
+    # The cross-fleet path only ranks when the lineage travels, and it travels only with the wire
+    # gate on — off, a peer reports lineage 0 and `Promote.fresher?/2` refuses to rank it, so
+    # recovery is INERT rather than wrong. These tests are about the ranking, so turn it on.
+    prev_wire = Application.get_env(:fathom, :replication_lineage_wire)
+    Application.put_env(:fathom, :replication_lineage_wire, true)
+
+    on_exit(fn ->
+      if is_nil(prev_wire),
+        do: Application.delete_env(:fathom, :replication_lineage_wire),
+        else: Application.put_env(:fathom, :replication_lineage_wire, prev_wire)
+    end)
+
     %{id: id}
   end
 
@@ -276,8 +299,11 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
     # difference and needs no new case.
     assert installed == Follower.state_of(survivor, id)
 
-    assert %{epoch: 9, wal_gen: 5, salt1: 0xDEADBEEF, next_offset: byte_size(wal)} ==
-             Map.take(installed, [:epoch, :wal_gen, :salt1, :next_offset])
+    # `lineage: 9` is the ordering key the source advertised and the puller installed; `epoch: 1`
+    # is the lock epoch, which a pulled seed carries from the SERVING follower and which is not an
+    # ordering value (expert review 2026-08-24 #12).
+    assert %{lineage: 9, epoch: 1, wal_gen: 5, salt1: 0xDEADBEEF, next_offset: byte_size(wal)} ==
+             Map.take(installed, [:lineage, :epoch, :wal_gen, :salt1, :next_offset])
   end
 
   test "a survivor already holding the freshest copy asks nobody", %{id: id} do

@@ -105,12 +105,35 @@ defmodule Fathom.Shard.Replication.Promote do
   # would otherwise win.
   def fresher?(%{torn: true}, _stamp), do: false
 
-  def fresher?(%{epoch: e1, wal_gen: g1, next_offset: o1}, %{
-        epoch: e2,
+  # A replica with NO LINEAGE cannot be ranked (expert review 2026-08-24 #12). `0` means "not
+  # stated" — seeded by a peer that predates the wire field, or while `Protocol.lineage_wire?/0`
+  # was off — and the honest answer is that we do not know, which means falling back to the stored
+  # object. Above the comparison so it cannot be reached with a 0 on either side.
+  def fresher?(%{lineage: 0}, _stamp), do: false
+  def fresher?(_replica, %{epoch: 0}), do: false
+
+  # LINEAGE against LINEAGE. The replica's `epoch` is the primary's LOCK epoch, which
+  # `release_lease` resets to 1 on every clean idle-drop, drain and handoff; the object's position
+  # stamp carries the monotonic LINEAGE in its `epoch` slot (`Fathom.Shard.stamp_epoch/1` →
+  # `Storage.next_lineage/1`). The 2026-08-20 #8 fix split one number into two and migrated only
+  # the object side, so this compared a reset-to-1 counter against a never-resetting one: from a
+  # shard's SECOND replicating open onward every replica read as not-fresher, and promote-on-open
+  # plus `Recovery.best_replica/3` went inert fleet-wide — silently, recovering to the last flush
+  # exactly as if A2 were switched off.
+  #
+  # The unsafe direction was reachable too: on a gate-toggled fleet a flush with
+  # `lineage: :disabled` stamps the LOCK epoch into the position slot, so a replica stranded at a
+  # higher lock epoch from an earlier crash-steal could outrank a NEWER object.
+  #
+  # `epoch` is still carried on the replica and is still the right value for `FollowerLog.decide/2`'s
+  # fencing check — the two are not interchangeable and neither replaces the other.
+  def fresher?(%{lineage: l1, wal_gen: g1, next_offset: o1}, %{
+        epoch: l2,
         wal_gen: g2,
         offset: o2
-      }) do
-    {e1, g1, o1} > {e2, g2, o2}
+      })
+      when is_integer(l1) and is_integer(l2) do
+    {l1, g1, o1} > {l2, g2, o2}
   end
 
   def fresher?(_replica, _stamp), do: false

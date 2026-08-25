@@ -41,13 +41,26 @@ defmodule Fathom.Shard.Replication.FollowerLog do
   recreates the WAL file, which is exactly why the `salt1` clause below had to exist underneath it.
   So the seam is invisible to a `{epoch, wal_gen, offset}` comparison, and `Promote.fresher?/2`
   ranked a torn replica as strictly ahead of the object and promoted it.
+
+  `lineage` is a DIFFERENT COUNTER from `epoch`, and that distinction is the whole of expert review
+  2026-08-24 #12. `epoch` is the primary's LOCK epoch — what `decide/2` fences pushes against, and
+  what `release_lease` RESETS TO 1 on every clean idle-drop, drain and handoff. `lineage` is the
+  monotonic ownership counter the stored object's position stamp carries, which never resets.
+  `Promote.fresher?/2` compares a replica against that stamp, so it has to compare lineages:
+  comparing the lock epoch against it made promotion inert from a shard's SECOND replicating open
+  onward — silently, because a reset epoch of 1 loses to every stamp.
+
+  `0` means "not stated" — a seed from a peer that predates the wire field, or one taken while
+  `Protocol.lineage_wire?/0` was off. `fresher?/2` refuses to rank those rather than guessing,
+  which is the same inert-but-safe behaviour as before.
   """
   @type t :: %{
           epoch: non_neg_integer(),
           wal_gen: non_neg_integer(),
           salt1: non_neg_integer(),
           next_offset: non_neg_integer(),
-          torn: boolean()
+          torn: boolean(),
+          lineage: non_neg_integer()
         }
 
   @type decision ::
@@ -161,10 +174,29 @@ defmodule Fathom.Shard.Replication.FollowerLog do
   AND its current `-wal`, so the follower already holds bytes and the first delta it can accept
   continues from there.
   """
-  @spec seeded(non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()) :: t()
-  def seeded(epoch, wal_gen, salt1, wal_bytes) do
+  @spec seeded(
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) :: t()
+  def seeded(epoch, wal_gen, salt1, wal_bytes, lineage \\ 0) do
     # `torn: false` — a seed is the ONE event that rebuilds `.db` and `-wal` together, so it is the
     # only thing that can clear it. See the `torn` note on `t:t/0`.
-    %{epoch: epoch, wal_gen: wal_gen, salt1: salt1, next_offset: wal_bytes, torn: false}
+    #
+    # `lineage` rides along untouched through every `decide/2` clause — they all update named fields
+    # on the existing map — which is why only the SEED has to carry it. A push that could bring a
+    # STALE one (a new primary taking over an existing follower) routes through `decide_fresh/2`,
+    # whose only accepting clause sets `torn: true`, and a torn replica is refused by
+    # `Promote.fresher?/2` and `Follower.offerable/2` alike.
+    %{
+      epoch: epoch,
+      wal_gen: wal_gen,
+      salt1: salt1,
+      next_offset: wal_bytes,
+      torn: false,
+      lineage: lineage
+    }
   end
 end

@@ -161,6 +161,10 @@ defmodule Fathom.Shard.Replication.Session do
        shard_id: Keyword.fetch!(opts, :shard_id),
        coordinator: coordinator,
        epoch: nil,
+       # Resolved alongside `epoch` by `with_epoch/1` and cached with it. A DIFFERENT counter --
+       # see `Fathom.Shard.lineage/1`. 0 means "no claim", which is also what a coordinator with
+       # replication off reports.
+       lineage: 0,
        # The WAL this shard commits through, remembered from the last commit. A follower's reply can
        # arrive long after the call that provoked it returned, and acting on `:unknown_shard` means
        # reading the shard's files — so the handler needs the path without a caller to supply it.
@@ -448,9 +452,23 @@ defmodule Fathom.Shard.Replication.Session do
 
   defp with_epoch(state) do
     case Fathom.Shard.epoch(state.coordinator) do
-      {:ok, epoch} -> {:ok, %{state | epoch: epoch}}
+      # The LINEAGE is read alongside the lock epoch and cached the same way (expert review
+      # 2026-08-24 #12). They are different counters: the lock epoch resets to 1 on every clean
+      # release, so it cannot order a replica against the stored object, whose position stamp
+      # carries the monotonic lineage. A seed ships both. Read here rather than at seed time so it
+      # costs one call per session, on the path that already pays one.
+      {:ok, epoch} -> {:ok, %{state | epoch: epoch, lineage: lineage_of(state)}}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  # Never fails the session: a coordinator that cannot state a lineage sends 0 ("no claim"), which
+  # `Promote.fresher?/2` refuses to rank rather than guessing. Losing promotion is the correct
+  # degradation; refusing to replicate would not be.
+  defp lineage_of(state) do
+    Fathom.Shard.lineage(state.coordinator)
+  catch
+    :exit, _ -> 0
   end
 
   # SHIP UNTIL CAUGHT UP, IN BOUNDED ROUNDS.
@@ -1054,7 +1072,8 @@ defmodule Fathom.Shard.Replication.Session do
         spawn_monitor(fn ->
           send(
             session,
-            {:seeded, shipper, do_seed(shipper, acc.shard_id, db_path, wal_path, acc.epoch)}
+            {:seeded, shipper,
+             do_seed(shipper, acc.shard_id, db_path, wal_path, acc.epoch, acc.lineage)}
           )
         end)
 
@@ -1115,11 +1134,11 @@ defmodule Fathom.Shard.Replication.Session do
   # Nothing here holds the database in memory — `:file.pread` walks it a chunk at a time. That is
   # the point of the change: the old path did `File.read(db_path)`, so a 2 GB tenant was 2 GB
   # resident on the primary and again on the follower.
-  defp do_seed(shipper, shard_id, db_path, wal_path, epoch) do
+  defp do_seed(shipper, shard_id, db_path, wal_path, epoch, lineage) do
     with {:ok, before} <- Wal.read(wal_path),
          {:ok, db_size} <- file_size(db_path),
          wal_size = wal_size_of(before),
-         :ok <- open_seed(shipper, shard_id, epoch, before, db_size, wal_size),
+         :ok <- open_seed(shipper, shard_id, epoch, before, db_size, wal_size, lineage),
          :ok <- stream_part(shipper, shard_id, :db, db_path, db_size),
          :ok <- stream_part(shipper, shard_id, :wal, wal_path, wal_size),
          {:ok, after_} <- Wal.read(wal_path),
@@ -1140,7 +1159,7 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
-  defp open_seed(shipper, shard_id, epoch, before, db_size, wal_size) do
+  defp open_seed(shipper, shard_id, epoch, before, db_size, wal_size, lineage) do
     Shipper.seed_begin(shipper, %SeedBegin{
       shard_id: shard_id,
       epoch: epoch,
@@ -1148,7 +1167,8 @@ defmodule Fathom.Shard.Replication.Session do
       salt1: salt_of(before),
       wal_offset: wal_size,
       db_size: db_size,
-      wal_size: wal_size
+      wal_size: wal_size,
+      lineage: lineage
     })
   end
 

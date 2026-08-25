@@ -248,6 +248,119 @@ defmodule Fathom.Shard.OwnershipCyclePositionTest do
     end
   end
 
+  # A REAL PUSH-DERIVED REPLICA MEETING A REAL LINEAGE STAMP (expert review 2026-08-24 #12).
+  #
+  # This is the test the finding said did not exist anywhere, and the reason it did not is subtle:
+  # on a shard's FIRST open the lock epoch and the lineage are BOTH 1, so every fixture that seeded
+  # a replica at the object's own number produced two counters that agreed by accident. The bug —
+  # `fresher?/2` comparing the replica's LOCK epoch against the object's LINEAGE — is invisible
+  # until they diverge, which takes a second ownership.
+  #
+  # So this runs one full ownership cycle first, purely to push the lineage past 1 while
+  # `release_lease` resets the lock epoch back to it. Then it seeds a follower through the REAL
+  # seeding path — no `Follower.seed/7` call, the follower answers `:unknown_shard` and
+  # `Session.start_seeds/3` streams it — takes a REAL flush, and compares.
+  #
+  # `assert is_integer(stamp)`-style preconditions on both numbers, because the failure mode here
+  # is a vacuous pass: `object_position/1` answers `nil` on the graceful-drop path (see the test
+  # above), and `nil` makes every comparison trivially false.
+  #
+  # WHAT THIS TEST IS AND IS NOT, plainly. Against the unfixed code it fails on
+  # `Fathom.Shard.lineage/1` being undefined — a structural failure, not a demonstration of the
+  # bug — so it is a GUARD on the new field rather than a red-green reproduction. The behavioural
+  # discrimination lives in `flush_position_test.exs`, whose `fresher?/2` cases now compare
+  # lineage against lineage and whose "no stated lineage is never fresher" case is new.
+  #
+  # A stronger version was attempted and abandoned after three fixtures: ship, flush, ship more,
+  # then assert `Promote.fresher?/2` answers TRUE where it used to answer false. It cannot be
+  # staged this way, and the reason is worth recording so nobody tries a fourth time — a flush
+  # CHECKPOINTS, which advances the WAL generation, and `fresher?/2` orders on
+  # `{lineage, wal_gen, offset}` lexicographically. A follower shipped to after a flush is a
+  # generation BEHIND, so it loses on `wal_gen` regardless of how many bytes it holds, and one
+  # shipped to before the flush is behind on offset. There is no window in this sequence where a
+  # replica is cleanly ahead within one generation; producing one needs a primary that dies
+  # between ships without flushing, which is `promote_on_open_test.exs`'s territory and needs its
+  # hand-installed replicas.
+  test "a real seeded replica ranks on the same counter as the object's stamp", ctx do
+    %{root: root} = ctx
+    set_mode!(:heartbeat)
+
+    id = "occlin_#{System.unique_integer([:positive])}"
+
+    Application.put_env(:fathom, :replication_enabled, true)
+    Application.put_env(:fathom, :replication_quorum, 1)
+    Application.put_env(:fathom, :replication_lineage_wire, true)
+
+    on_exit(fn ->
+      Shards.drain(id, 5_000)
+      Application.delete_env(:fathom, :replication_lineage_wire)
+      for e <- ["", "-wal", "-shm"], do: File.rm(Fathom.Shard.db_path(id) <> e)
+    end)
+
+    # ONE COMPLETE OWNERSHIP FIRST. Its only job is to advance the lineage, so the second open's
+    # lineage and lock epoch are different numbers and the comparison can fail.
+    _ = ownership_cycle!(id)
+
+    # TWO followers with quorum 1: `Fleet` refuses Q == N outright ("tolerates zero follower
+    # failures and inherits the slowest replica"), so a single follower cannot be configured here.
+    followers = start_followers!(root, 2)
+
+    Application.put_env(
+      :fathom,
+      :replication_followers,
+      for({_n, p} <- followers, do: {~c"127.0.0.1", p})
+    )
+
+    start_supervised!(Fleet)
+    await_connected!()
+
+    {:ok, coordinator, ref, path} = Shards.checkout(id)
+    assert_mode!(coordinator, :heartbeat)
+
+    lineage = Fathom.Shard.lineage(coordinator)
+    {:ok, lock_epoch} = Fathom.Shard.epoch(coordinator)
+
+    # THE PRECONDITION THAT MAKES THIS DISCRIMINATE. If these were equal the test would pass
+    # against the unfixed code too, which is exactly how every existing fixture missed the bug.
+    assert lineage > lock_epoch,
+           "the lineage (#{lineage}) did not advance past the lock epoch (#{lock_epoch}), so the " <>
+             "two counters still agree and this test cannot tell them apart — the first " <>
+             "ownership cycle did not flush"
+
+    {:ok, conn} = Connection.open(path)
+    {:ok, _} = Connection.query(conn, "CREATE TABLE IF NOT EXISTS t2 (a)", [])
+    for n <- 1..20, do: {:ok, _} = Connection.query(conn, "INSERT INTO t2 VALUES (?1)", [n])
+
+    # NOT pre-seeded: the follower answers :unknown_shard and the commit drives the real seeding
+    # path, which is what carries the lineage on the wire.
+    assert :ok = Session.commit(id, path <> "-wal", coordinator)
+    assert await_replica!(followers, id).next_offset > 0, "nothing was shipped"
+
+    # A REAL FLUSH — not the graceful drop, which unlinks the WAL and deliberately stamps `nil`.
+    Fathom.Shard.WriteCounter.bump(id)
+    :ok = Shards.flush(id)
+    assert {:ok, stamp} = Storage.object_position(id)
+
+    assert is_map(stamp),
+           "the flush stamped no position, so every comparison below is vacuously false"
+
+    # THE ASSERTION: both sides carry the SAME counter, and it is the lineage.
+    replica = await_replica!(followers, id)
+
+    assert replica.lineage == stamp.epoch,
+           "the replica ranks on #{inspect(replica.lineage)} while the object's stamp carries " <>
+             "#{inspect(stamp.epoch)}. Those are different counters, and that is the bug: the " <>
+             "replica used to report its primary's LOCK epoch (#{lock_epoch} here, reset to 1 by " <>
+             "the previous ownership's clean release) against a monotonic lineage, so " <>
+             "fresher?/2 answered false for every replica however far ahead it was."
+
+    refute replica.lineage == lock_epoch,
+           "the replica is still reporting the lock epoch — the wire change did not take"
+
+    Connection.close(conn)
+    Fathom.Shard.checkin(coordinator, ref)
+  end
+
   # THIS WAS A CHARACTERIZATION TEST, AND IT ASSERTED THE OPPOSITE OF WHAT IT DOES NOW.
   #
   # It used to say "the lease epoch RESETS on a clean release — the ordering assumption is

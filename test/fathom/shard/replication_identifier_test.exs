@@ -248,9 +248,13 @@ defmodule Fathom.Shard.ReplicationIdentifierTest do
   #
   # Pinned here so the next reader does not mistake `fresher?/2` for the boundary.
   describe "what fresher?/2 does NOT protect against" do
-    test "a wire-supplied epoch outranks a stamped object, by design" do
+    # The RANKING FIELD is now `lineage`, not `epoch` (expert review 2026-08-24 #12) — the two are
+    # different counters and the comparison used to mix them. The point of this test is unchanged
+    # and so is its answer: a peer supplies the lineage on the wire exactly as it supplied the
+    # epoch, so `fresher?/2` is no more a boundary than it was.
+    test "a wire-supplied lineage outranks a stamped object, by design" do
       stamp = %{epoch: 5, wal_gen: 9, offset: 1_000_000}
-      forged = %{epoch: 9_999, wal_gen: 0, next_offset: 0, torn: false}
+      forged = %{lineage: 9_999, epoch: 1, wal_gen: 0, next_offset: 0, torn: false}
 
       assert Promote.fresher?(forged, stamp),
              "if this ever becomes false, the ordering rule changed — re-read the note above " <>

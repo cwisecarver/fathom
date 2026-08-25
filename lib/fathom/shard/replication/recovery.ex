@@ -142,6 +142,16 @@ defmodule Fathom.Shard.Replication.Recovery do
     end
   end
 
+  # RANKS ON THE LINEAGE, the same key `Promote.fresher?/2` uses (expert review 2026-08-24 #12).
+  # This used to read `epoch`, which on a replica is the primary's LOCK epoch — reset to 1 on every
+  # clean release — so peers were ordered against each other by a counter that carries no ordering.
+  # `choose/3` has already filtered these by `fresher?/2` against the object, so ranking them by a
+  # different key than the filter used was incoherent as well as wrong.
+  #
+  # Falls back to `epoch` for a map that has no lineage: a `local` read from an older follower
+  # state, or a peer one deploy behind whose offer decodes with both keys set from the one wire
+  # field. Same value in both cases, so the fallback changes nothing where it fires.
+  defp rank(%{lineage: l, wal_gen: g, next_offset: o}) when is_integer(l), do: {l, g, o}
   defp rank(%{epoch: e, wal_gen: g, next_offset: o}), do: {e, g, o}
 
   @typedoc "One read of the stored object: what it is, and what it claims. `nil` means no object."

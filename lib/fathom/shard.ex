@@ -240,6 +240,21 @@ defmodule Fathom.Shard do
   def epoch(pid) when is_pid(pid), do: GenServer.call(pid, :epoch)
 
   @doc """
+  This coordinator's LINEAGE for the wire, or `0` when it has none to state.
+
+  A different number from `epoch/1`, and the distinction is expert review 2026-08-24 #12. The lock
+  epoch resets to 1 on every clean release, so it cannot order a replica against the stored object;
+  the lineage is monotonic across a shard's whole life and is what the object's position stamp
+  carries. A seed ships both — see `Fathom.Shard.Replication.Protocol`'s `@seed_begin_lin`.
+
+  `0` for `:disabled` (replication off, so `open_lineage/1` never read one) and `:unknown` (the
+  HEAD failed). Both mean "no claim", and `Promote.fresher?/2` refuses to rank a replica carrying
+  it rather than guessing.
+  """
+  @spec lineage(pid()) :: non_neg_integer()
+  def lineage(pid) when is_pid(pid), do: GenServer.call(pid, :lineage)
+
+  @doc """
   Force-flushes the coordinator's current on-disk state to storage WITHOUT dropping or stopping
   it (it keeps serving) — the flush-before-fork primitive. Blocks until the shard is durably
   clean; returns `:ok`, or `{:error, reason}` on a flush error / lease steal. See
@@ -1216,6 +1231,12 @@ defmodule Fathom.Shard do
     do: {:reply, {:ok, epoch}, state}
 
   def handle_call(:epoch, _from, state), do: {:reply, {:error, :no_lease}, state}
+
+  # `:disabled` / `:unknown` both mean "no lineage to claim" and travel as 0 — see `lineage/1`.
+  def handle_call(:lineage, _from, %{lineage: n} = state) when is_integer(n),
+    do: {:reply, n, state}
+
+  def handle_call(:lineage, _from, state), do: {:reply, 0, state}
 
   # Synchronous force-flush (the flush-before-fork primitive): make the current on-disk state
   # durable WITHOUT dropping/stopping — the coordinator keeps serving. Replies :ok once the

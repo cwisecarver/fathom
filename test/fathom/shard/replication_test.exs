@@ -93,9 +93,14 @@ defmodule Fathom.Shard.ReplicationTest do
                |> IO.iodata_to_binary()
                |> Protocol.decode()
 
+      # The decoder sets BOTH `epoch` and `lineage` from the single ordering field (expert review
+      # 2026-08-24 #12): `lineage` is what `Promote.fresher?/2` and `Recovery.rank/1` read, `epoch`
+      # is the name every existing caller already used. A current peer puts its lineage there; one
+      # a deploy behind puts its lock epoch, and is mis-ranked exactly as it is today.
       pos = %{epoch: 9, wal_gen: 4, salt1: 123_456, next_offset: 8240}
+      decoded = %{epoch: 9, lineage: 9, wal_gen: 4, salt1: 123_456, next_offset: 8240}
 
-      assert {:ok, {:position, "acme", ^pos}} =
+      assert {:ok, {:position, "acme", ^decoded}} =
                "acme"
                |> Protocol.encode_position(pos)
                |> IO.iodata_to_binary()
@@ -114,8 +119,9 @@ defmodule Fathom.Shard.ReplicationTest do
                |> Protocol.decode()
 
       zero = %{epoch: 0, wal_gen: 0, salt1: 0, next_offset: 0}
+      zero_decoded = %{epoch: 0, lineage: 0, wal_gen: 0, salt1: 0, next_offset: 0}
 
-      assert {:ok, {:position, "acme", ^zero}} =
+      assert {:ok, {:position, "acme", ^zero_decoded}} =
                "acme"
                |> Protocol.encode_position(zero)
                |> IO.iodata_to_binary()

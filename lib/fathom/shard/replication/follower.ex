@@ -79,10 +79,11 @@ defmodule Fathom.Shard.Replication.Follower do
           non_neg_integer(),
           non_neg_integer(),
           non_neg_integer(),
+          non_neg_integer(),
           non_neg_integer()
         ) :: :ok
-  def seed(name \\ __MODULE__, shard_id, epoch, wal_gen, salt1, wal_bytes) do
-    put_state(name, shard_id, FollowerLog.seeded(epoch, wal_gen, salt1, wal_bytes))
+  def seed(name \\ __MODULE__, shard_id, epoch, wal_gen, salt1, wal_bytes, lineage \\ 0) do
+    put_state(name, shard_id, FollowerLog.seeded(epoch, wal_gen, salt1, wal_bytes, lineage))
     :ok
   end
 
@@ -517,6 +518,9 @@ defmodule Fathom.Shard.Replication.Follower do
       {:ok,
        %{
          epoch: state.epoch,
+         # Passed on rather than re-derived: a pulled replica must rank against the object the same
+         # way a pushed one does, and this node has no other source for the primary's lineage.
+         lineage: Map.get(state, :lineage, 0),
          wal_gen: gen_of(header),
          salt1: salt_of(header),
          wal_size: size_of(header),
@@ -540,7 +544,8 @@ defmodule Fathom.Shard.Replication.Follower do
       salt1: offer.salt1,
       wal_offset: offer.wal_size,
       db_size: offer.db_size,
-      wal_size: offer.wal_size
+      wal_size: offer.wal_size,
+      lineage: offer.lineage
     }
 
     with :ok <- :gen_tcp.send(sock, Protocol.encode_seed_begin(begin)),
@@ -711,6 +716,9 @@ defmodule Fathom.Shard.Replication.Follower do
         wal_offset: b.wal_offset,
         db_size: b.db_size,
         wal_size: b.wal_size,
+        # Carried through the seed so `finish_seed/3` can stamp it (expert review 2026-08-24 #12).
+        # 0 when the sender predates the wire field or had none to claim.
+        lineage: b.lineage,
         db_fd: db_fd,
         wal_fd: wal_fd,
         db_written: 0,
@@ -891,7 +899,13 @@ defmodule Fathom.Shard.Replication.Follower do
       put_state(
         name,
         shard_id,
-        FollowerLog.seeded(state.epoch, state.wal_gen, state.salt1, state.wal_offset)
+        FollowerLog.seeded(
+          state.epoch,
+          state.wal_gen,
+          state.salt1,
+          state.wal_offset,
+          Map.get(state, :lineage, 0)
+        )
       )
 
       Logger.info(

@@ -136,7 +136,11 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
         File.write!(Follower.wal_path(Follower, id), "")
     end
 
-    Follower.seed(Follower, id, position.epoch, position.wal_gen, 0, position.offset)
+    # THE LINEAGE IS THE RANKING FIELD, and it comes from the object's stamp (expert review
+    # 2026-08-24 #12). The lock `epoch` is pinned at 1 on purpose: in production it resets to 1 on
+    # every clean release, so a fixture that set it from the stamp was quietly guaranteeing the two
+    # counters agreed — which is precisely the coverage gap this file's moduledoc now describes.
+    Follower.seed(Follower, id, 1, position.wal_gen, 0, position.offset, position.epoch)
   end
 
   # The byte half of install_replica/2, callable while the live files still exist. The graceful
@@ -313,7 +317,14 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     # A replica that is BEHIND: generation 0, but far along in it. Strictly greater than the buggy
     # {epoch, 0, 0} and strictly less than either correct answer, so this fixture discriminates
     # rather than merely passing.
-    Follower.seed(Follower, id, 1, 0, 0, 999_999)
+    #
+    # The lineage is taken from the stamp WHEN THERE IS ONE, and is otherwise an arbitrary positive
+    # value. `stamp` is legitimately `nil` on this path — the WAL was already unlinked, so the
+    # generation is unknowable and the object is deliberately un-overridable — and reading
+    # `stamp.epoch` unconditionally crashed here. Either way the replica must lose: on a `nil`
+    # stamp because nothing may override it, and on a real stamp because the replica is behind.
+    lineage = if stamp, do: stamp.epoch, else: 1
+    Follower.seed(Follower, id, 1, 0, 0, 999_999, lineage)
 
     assert open_and_read(id) == Enum.to_list(1..10),
            "a lagging replica was promoted over a complete, gracefully-flushed object"
@@ -353,7 +364,7 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
            "the drop-flush stamped a complete object at the minimum position for its epoch " <>
              "(#{inspect(stamp)})"
 
-    Follower.seed(Follower, id, stamp.epoch, max(stamp.wal_gen - 1, 0), 0, 999_999)
+    Follower.seed(Follower, id, 1, max(stamp.wal_gen - 1, 0), 0, 999_999, stamp.epoch)
 
     refute Promote.fresher?(Follower.state_of(Follower, id), stamp),
            "a replica one generation behind outranks the object that folded that generation in"
