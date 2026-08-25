@@ -22,12 +22,18 @@ defmodule Fathom.ShardKillCleanupTest do
   proves fence→unfence within one coordinator's lifetime; it never kills the coordinator and never
   re-opens the shard, so #6 was structurally invisible to `mix test`.
 
-  ## The two acceptable outcomes, and why both count
+  ## The three acceptable outcomes, and why each counts
 
   A kill is not a graceful stop: nothing runs on the way out, by definition. So the invariant is
   not "the resource is released at death" — it is **"the node does not degrade"**. Either the
-  resource is not held past death, or a successor's open cleans it up. Each test below says which
-  of the two it is asserting.
+  resource is not held past death, a successor's open cleans it up, or the leak is bounded and
+  measured and we have decided to accept it. Each test below says which of the three it asserts.
+
+  The third outcome is `ShardLoad`/`ShardLatency`, and it was missing here (expert review
+  2026-08-24 #28): this moduledoc named four resources and tested three, which reads as coverage
+  and was not. That fourth one has no cleanup mechanism at all — no sweep, no successor clear, no
+  liveness check on read — and the last test in this file now pins that, along with the reasoning
+  for accepting it rather than leaving the gap to be re-found.
   """
   use ExUnit.Case, async: false
 
@@ -184,6 +190,62 @@ defmodule Fathom.ShardKillCleanupTest do
 
     assert :ok = FlushGate.try_acquire()
     FlushGate.release()
+  end
+
+  # THE FOURTH RESOURCE, AND THE ONE THAT IS GENUINELY NOT CLEANED (expert review 2026-08-24 #28).
+  #
+  # The moduledoc above named four node-global resources released only from `terminate/2` and then
+  # tested three. This is the fourth, and unlike the others it has no cleanup mechanism at all:
+  # `WriteFence` is lifted by the successor's `open_with_lease/8`, `FlushGate` has `sweep/0`, `Lru`
+  # has the `ghost?/2` liveness check in its walk — `ShardLoad`/`ShardLatency` have `forget/1`
+  # called from four sites, all inside `terminate/2`, with no sweep, no successor clear, and no
+  # liveness validation on read.
+  #
+  # THIS TEST PINS THE STATUS QUO, DELIBERATELY. The row survives the kill, and a later graceful
+  # stop of the same shard clears it. That is accepted rather than fixed, and the reasoning is
+  # recorded here so it stays a decision instead of drifting back into an oversight:
+  #
+  #   * The blast radius is genuinely small. A stale row is a 5-tuple in `ShardLoad` and a
+  #     15-bucket histogram row in `ShardLatency`, bounded by the shards this node has ever opened.
+  #   * The consumer that matters is unaffected. `Rebalancer.Reporter` DIFFS two snapshots, so a
+  #     frozen row contributes a rate of zero. What degrades is `snapshot/0` / `top/2` — the admin
+  #     "which shards are hot" page listing a dead shard — and cumulative counters resuming from a
+  #     previous incarnation when the shard re-opens.
+  #   * Both available fixes cost more than the defect. A liveness filter on read would put a
+  #     `Registry.lookup` per row into `snapshot_tuples/0`, which the Reporter calls per window at
+  #     up to 30k shards a node. Clearing on OPEN (the `WriteFence` pattern) would fix the stale
+  #     counters too, but it resets the Reporter's baseline on every idle re-open, which is a
+  #     change to what the rebalancer measures — not something to do for a cosmetic admin row.
+  #   * `:shard_load` is off by default, so on a default fleet none of this is even recorded.
+  #
+  # If that trade stops holding — the admin page becomes load-bearing, or the counters get a
+  # non-rate consumer — clearing on open is the fix, and it belongs next to the `WriteFence.unfence`
+  # call in `open_with_lease/8`.
+  test "a killed coordinator's ShardLoad row survives, and is cleared by the next graceful stop",
+       %{id: id} do
+    prev = Application.get_env(:fathom, :shard_load)
+    on_exit(fn -> restore(:shard_load, prev) end)
+    Application.put_env(:fathom, :shard_load, true)
+
+    Fathom.ShardLoad.reset()
+    _ = open_and_kill!(id)
+
+    # PRECONDITION: the counters were actually recorded, or everything below is vacuous.
+    assert Fathom.ShardLoad.get(id),
+           "the fixture never recorded a ShardLoad row for this shard"
+
+    # The documented status quo: nothing reclaims it at death.
+    assert Fathom.ShardLoad.get(id),
+           "a ShardLoad row for a dead coordinator was reclaimed — if something now cleans this " <>
+             "up, the trade recorded above no longer applies and this test should assert THAT"
+
+    # …and a graceful stop of the same shard does clear it, which is what bounds the leak.
+    {:ok, pid, ref, _path} = Shards.checkout(id)
+    Fathom.Shard.checkin(pid, ref)
+    :ok = Shards.drain(id, 5_000)
+
+    refute Fathom.ShardLoad.get(id),
+           "a graceful stop must clear the row — it is the only thing that bounds the leak"
   end
 
   defp restore(key, nil), do: Application.delete_env(:fathom, key)
