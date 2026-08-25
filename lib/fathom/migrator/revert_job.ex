@@ -9,6 +9,20 @@ defmodule Fathom.Migrator.RevertJob do
     max_attempts: 5,
     unique: [
       keys: [:shard_id],
+      # `period: :infinity` is NOT the default and its absence was a real hole (expert review
+      # 2026-08-24 #23). A keyword list here MERGES into Oban's @unique_defaults, which sets
+      # `period: 60` — only the bare `unique: true` gets `:infinity`. So dedup applied only
+      # against jobs inserted in the last SIXTY SECONDS, while every long-lived state this worker
+      # reaches is far longer: the snooze backoff caps at 60 s with jobs documented reaching
+      # attempt 122, `:migration_stall_after_ms` is 10 minutes, and Lifeline's `rescue_after` is
+      # asserted to be at least 60 MINUTES (see oban_config_test.exs) — and a row stranded in
+      # `:executing` is by definition older than that when Lifeline finds it.
+      #
+      # Safe BECAUSE `:completed` is deliberately absent from the states below: an infinite period
+      # blocks re-enqueue only while a job for that shard is genuinely pending, never forever after
+      # one finishes. The panel's caution was `:suspended` — a permanently suspended job does block
+      # indefinitely, which is the intended reading (a suspended job for that shard still exists).
+      period: :infinity,
       states: [:scheduled, :available, :executing, :retryable, :suspended]
     ]
 

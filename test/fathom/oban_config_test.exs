@@ -8,6 +8,7 @@ defmodule Fathom.ObanConfigTest do
   """
   use Fathom.DataCase, async: false
 
+  alias Fathom.Migrator.RevertJob
   alias Fathom.Migrator.ShardMigrationJob
 
   defp plugins, do: Application.get_env(:fathom, Oban)[:plugins] || []
@@ -65,4 +66,52 @@ defmodule Fathom.ObanConfigTest do
            "a job stranded in :executing must dedup a new enqueue for the same shard — that is " <>
              "exactly why the lifecycle wedges without Lifeline"
   end
+
+  # THE TEST ABOVE CANNOT SEE THE TIMESCALE IT IS ABOUT (expert review 2026-08-24 #23).
+  #
+  # It inserts both jobs microseconds apart, so it passes inside Oban's DEFAULT `period: 60` and
+  # proves nothing about the interval Lifeline actually operates on. A keyword list in `unique:`
+  # MERGES into `@unique_defaults`, which sets `period: 60` — only the bare `unique: true` gets
+  # `:infinity` — so dedup applied only against jobs inserted in the last sixty seconds.
+  #
+  # Every long-lived state these workers reach is far longer than that: the snooze backoff caps at
+  # 60 s with jobs documented reaching attempt 122, `:migration_stall_after_ms` is 10 minutes, and
+  # the `rescue_after` assertion at the top of this file requires at least 60 MINUTES — a row
+  # stranded in `:executing` is by definition older than the window when Lifeline finds it. So
+  # `ShardMigrationJob`'s moduledoc claim ("unique per shard_id, so the lazy path and the sweep
+  # never migrate the same shard twice at once") and the comment in `Fathom.Shards` were both false
+  # past a minute, and a hot laggard under `migrate_on_touch: :async` accumulated roughly one job
+  # per 60 s of traffic.
+  #
+  # Backdating `inserted_at` is what makes this discriminate: the unique query keys on that column
+  # (`timestamp: :inserted_at`), so an hour-old row is exactly the Lifeline case.
+  test "dedup survives the 60s default window — an HOUR-old stranded row still blocks" do
+    for worker <- [ShardMigrationJob, RevertJob] do
+      shard = "oban_period_#{System.unique_integer([:positive])}"
+      args = unique_args(worker, shard)
+
+      {:ok, first} = Oban.insert(worker.new(args))
+
+      # An hour old AND stranded in :executing — what a dead node leaves for Lifeline.
+      {1, _} =
+        Fathom.Repo.update_all(
+          from(j in Oban.Job, where: j.id == ^first.id),
+          set: [
+            state: "executing",
+            attempted_at: DateTime.utc_now(),
+            inserted_at: DateTime.add(DateTime.utc_now(), -3600, :second)
+          ]
+        )
+
+      {:ok, second} = Oban.insert(worker.new(args))
+
+      assert second.id == first.id and second.conflict?,
+             "#{inspect(worker)}: an hour-old stranded job stopped deduping, so a second run for " <>
+               "the same shard can be enqueued while the first is still executing. Oban's default " <>
+               "unique period is 60s; this needs period: :infinity."
+    end
+  end
+
+  defp unique_args(ShardMigrationJob, shard), do: %{"shard_id" => shard, "target" => 2}
+  defp unique_args(RevertJob, shard), do: %{"shard_id" => shard, "to_version" => 1}
 end
