@@ -690,6 +690,11 @@ defmodule Fathom.Telemetry do
         description:
           "Per-shard migrations still snoozing past :migration_stall_after_ms. Retrying forever is correct (busy and lease-held both clear on their own), so this is the visibility half of the 2026-08-04 fix for a job that sat in `scheduled` at attempt 122/127 with an EMPTY errors array, failed: 0, no quarantine, and nothing above [info]. Untagged: the metadata `reason` is a passed-through error term, not a bounded set"
       ),
+      counter("fathom.migrator.unbuildable_chain.count",
+        event_name: [:fathom, :migrator, :unbuildable_chain],
+        description:
+          "Shards whose migration was CANCELLED because a version the chain needs is unknown or yanked. Cancelling is correct — the version will never exist again, and quarantining a healthy untouched shard would hide it from `laggards/2`, `shards_at_version/1` and a later fleet revert — but the shard is then permanently non-converging with nothing above [info] saying so, which is what this exists to surface. Non-zero after a `Migrator.yank/1` of a MIDDLE version means the release graph has a hole every shard below it must walk through, and the fix is a new release bridging it, not a retry. Untagged: `target` and `missing` are version numbers, unbounded as labels"
+      ),
       counter("fathom.migrator.inline_migrate_failed.count",
         event_name: [:fathom, :migrator, :inline_migrate_failed],
         description:

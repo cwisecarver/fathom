@@ -470,6 +470,45 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
            "a healthy shard must not be quarantined for a target that no longer exists"
   end
 
+  # THE INTERMEDIATE VERSION — a GUARD, not a regression test (expert review 2026-08-24 #15, which
+  # was WRONG, and this is the record of why).
+  #
+  # The finding claimed that `{:error, {:unknown_version, target}}` is a PIN, because `target` is
+  # already bound from the job's args in the function head — so it would match only when the
+  # unavailable version WAS the job's target, and a yanked INTERMEDIATE version would fall through
+  # to `handle_error/3`, burn 5 attempts, and `Directory.mark_failed/1` the whole cold tail.
+  #
+  # That is not Elixir. A variable in a `case` pattern REBINDS; pinning requires `^target`. So the
+  # clause always matched any missing version, and the cold-tail quarantine the finding describes
+  # cannot happen. Verified by execution rather than by reading: with the fix reverted, this exact
+  # scenario returns `{:cancel, :unknown_version}` and leaves the shard `active` at v1.
+  #
+  # Kept because nothing covered the intermediate case at all — the test above yanks the job's own
+  # target, so it could not tell the two apart even though the code handles both. What DID change
+  # for #15 is the log line (it said "migration target v2" when 2 was an intermediate, which sends
+  # an operator looking at the wrong thing) and a `[:fathom, :migrator, :unbuildable_chain]` event,
+  # since the panel was right that a plain cancel leaves the shard permanently non-converging with
+  # no durable record.
+  test "yanking an INTERMEDIATE version cancels without quarantining the cold tail",
+       %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    {:ok, _} = Migrator.release(3, "v3", @v2_statements)
+
+    # v2 is yanked but v3 is not, so HEAD stays 3 and a shard at v1 needs the missing v2.
+    assert :ok = Migrator.yank(2)
+    assert Migrator.head() == 3, "the fixture must leave HEAD ABOVE the yanked version"
+
+    capture_log(fn ->
+      assert {:cancel, :unknown_version} =
+               perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 3}, attempt: 5)
+    end)
+
+    assert {:ok, %{status: "active", schema_version: 1}} = Directory.get(shard),
+           "the shard was QUARANTINED for a hole in the release graph it had nothing to do " <>
+             "with. It is healthy at v1, and quarantine also hides it from a later fleet revert."
+  end
+
   # Round-2 #21a: an EXECUTING RevertJob already deserialized its args, so the force
   # sweep's jsonb row update couldn't reach it — the execution hit the write-age
   # guard, returned {:cancel, guard} (terminal), and the operator's explicit

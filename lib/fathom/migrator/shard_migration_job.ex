@@ -72,16 +72,40 @@ defmodule Fathom.Migrator.ShardMigrationJob do
       {:retry, reason} ->
         handle_retry(job, shard_id, target, reason)
 
-      # The target is unknown or YANKED (round-2 #23) — deterministic: the version
-      # will never exist again, so retrying burns attempts against nothing, and
-      # mark_failed would QUARANTINE a shard that was never touched and is healthy
-      # at its old version (quarantine also hides it from shards_at_version, so a
-      # later revert skips it too). Cancel without marking; the shard stays a
-      # normal active citizen of whatever sweep applies next.
-      {:error, {:unknown_version, target}} ->
+      # A version this chain needs is unknown or YANKED (round-2 #23) — deterministic: it will
+      # never exist again, so retrying burns attempts against nothing, and mark_failed would
+      # QUARANTINE a shard that was never touched and is healthy at its old version (quarantine
+      # also hides it from shards_at_version, so a later revert skips it too). Cancel without
+      # marking; the shard stays a normal active citizen of whatever sweep applies next.
+      #
+      # `missing` is NOT necessarily the job's target. `head/0` is `max(version) WHERE NOT yanked`,
+      # so yanking a MIDDLE version (say v4 of v1..v9) leaves HEAD at 9, and
+      # `statement_chain(current, 9)` then needs v4 for every shard below it and answers
+      # `{:error, {:unknown_version, 4}}`. The chain, not the target, is what is unbuildable.
+      #
+      # Expert review 2026-08-24 #15 claimed this clause was a PIN — that binding `target` here,
+      # where `target` is already bound in the function head, matched only when the missing version
+      # WAS the target, sending the intermediate case to `handle_error/3` and quarantining the
+      # whole cold tail. That reading is wrong: a variable in an Elixir `case` pattern REBINDS,
+      # pinning needs `^target`, and reverting this clause and running the intermediate scenario
+      # returns `{:cancel, :unknown_version}` with the shard still `active` — verified, not
+      # reasoned. What was genuinely wrong was the LOG, which named the missing version as the
+      # "migration target" and sent an operator to look at the wrong one.
+      {:error, {:unknown_version, missing}} ->
         Logger.warning(
-          "shard #{shard_id}: migration target v#{target} is unknown/yanked; " <>
-            "cancelling (shard untouched, not quarantined)"
+          "shard #{shard_id}: cannot build the chain to v#{target} — v#{missing} is " <>
+            "unknown/yanked; cancelling (shard untouched, not quarantined)"
+        )
+
+        # The panel's fair objection to a plain cancel — and the part of #15 that WAS right — is
+        # that the shard is now permanently non-converging with NO durable record: it quietly stops
+        # being migrated and nothing above [info] says so. A distinct directory status would be a
+        # schema change; this makes the condition alertable now, and carries BOTH versions, because
+        # when they differ it is the RELEASE GRAPH that is broken and not the shard.
+        :telemetry.execute(
+          [:fathom, :migrator, :unbuildable_chain],
+          %{count: 1},
+          %{shard_id: shard_id, target: target, missing: missing}
         )
 
         {:cancel, :unknown_version}
