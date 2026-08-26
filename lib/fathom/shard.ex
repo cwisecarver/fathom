@@ -2694,12 +2694,21 @@ defmodule Fathom.Shard do
   defp maybe_promote_replica(shard_id, path, lease, etag, lineage) do
     # The gate is checked FIRST and returns the caller's own binding, so a node that has not
     # enabled this allocates nothing at all on its open path. See the note at the call site.
-    if promote_on_open?() do
+    #
+    # `follower_running?/0` is hoisted to sit beside the gate rather than living inside
+    # `nothing_to_promote?/1`, and that is a DEFAULT-ON decision: the gate is now on everywhere, so
+    # this `if` is the open path for every node that is not part of a replicating fleet, and it
+    # should cost one `Process.whereis` rather than a walk through two more predicates. No follower
+    # means no replica table to read AND nowhere for a pulled replica to install, so both branches
+    # below would have declined anyway — `Recovery.search/5` says so in as many words.
+    if promote_on_open?() and follower_running?() do
       try_promote(shard_id, path, lease, etag, lineage)
     else
       etag
     end
   end
+
+  defp follower_running?, do: Process.whereis(Follower) != nil
 
   # TWO PATHS, and the split is about what a cold open is allowed to pay for.
   #
@@ -2712,12 +2721,33 @@ defmodule Fathom.Shard do
   # concurrent round trip to each peer. That is the price of closing the RPO gap on a failover the
   # LB routed to a node holding no replica, and it is why `Recovery` is a separate gate rather than
   # part of `:replication_promote_on_open`.
+  # The middle branch is a COST check that became load-bearing when the gate started defaulting ON
+  # (2026-08-25): `try_promote_from_fleet/5` opens with `Storage.object_head/1`, so without it every
+  # cold open on every node — including nodes that follow nothing and have no peers — would pay an
+  # object-store round trip to reach a decision that was already determined.
+  #
+  # BOTH halves of `nothing_to_promote?/1` are required, and dropping either is a real regression
+  # rather than a tidier condition. An earlier draft short-circuited on `fleet_reachable?/1` alone
+  # and fell through to the LOCAL path, which `promote_on_open_test.exs:435` immediately caught: a
+  # node with a local replica and no peers still runs the fleet DECISION (`best_replica/3`
+  # short-circuits on its own replica before opening a socket), and only that path performs the
+  # mid-flight `recheck_object/4`. Routing it to the local path silently dropped the re-read and
+  # promoted against a stamp that had moved.
   defp try_promote(shard_id, path, lease, etag, lineage) do
-    if Recovery.enabled?() do
-      try_promote_from_fleet(shard_id, path, lease, etag, lineage)
-    else
-      try_promote_local(shard_id, path, lease, etag, lineage)
+    cond do
+      not Recovery.enabled?() -> try_promote_local(shard_id, path, lease, etag, lineage)
+      nothing_to_promote?(shard_id) -> etag
+      true -> try_promote_from_fleet(shard_id, path, lease, etag, lineage)
     end
+  end
+
+  # Provably nothing for the fleet path to find, established without touching the object store: no
+  # replica of this shard in the local follower's table, AND nobody to ask. Those are exactly the
+  # two conditions under which `Recovery.best_replica/3` returns `:none` — its local short-circuit
+  # needs a local replica, and `search/5` bails when the peer set is empty or no follower runs — so
+  # skipping straight to `etag` is what the long way round would have produced anyway.
+  defp nothing_to_promote?(shard_id) do
+    replica_state(shard_id) == nil and not Recovery.fleet_reachable?()
   end
 
   defp try_promote_local(shard_id, path, lease, etag, lineage) do
@@ -2816,12 +2846,26 @@ defmodule Fathom.Shard do
     if is_tuple(reason) and tuple_size(reason) > 0, do: elem(reason, 0), else: reason
   end
 
-  defp promote_on_open?, do: Application.get_env(:fathom, :replication_promote_on_open, false)
+  # Default ON since 2026-08-25 (`REPLICATION_PROMOTE_ON_OPEN=false` turns it off). Free on a node
+  # that holds no replicas: `try_promote_local/5` checks ETS before it touches the object store, so
+  # a node outside a replicating fleet pays one ETS miss per cold open and nothing else.
+  defp promote_on_open?, do: Application.get_env(:fathom, :replication_promote_on_open, true)
 
+  # THE `Process.whereis` IS NOT REDUNDANT WITH THE RESCUE, it is the whole cost of this function.
+  # `Follower.state_of/2` is an `:ets.lookup` on a table the follower owns, so on a node running no
+  # follower it RAISED and this clause rescued — raising is control flow here, and building an
+  # `ArgumentError` plus its stacktrace is orders of magnitude more expensive, and more garbage,
+  # than the lookup it replaces. That was survivable while `:replication_promote_on_open` was
+  # opt-in. Defaulting it on (2026-08-25) put it on every cold open of every node, and the bench
+  # gate caught it immediately: `fanout_kb_per_shard` +52.7% while its GC'd twin moved +1.1% and
+  # `served_kb_per_shard` -0.1% — i.e. per-open garbage, exactly the shape an exception makes.
+  #
+  # No follower process ⇒ no replica table ⇒ no replica, so the early return is also the truthful
+  # answer rather than a shortcut. The rescue stays as a backstop for the race where the follower
+  # dies between the two calls.
   defp replica_state(shard_id) do
-    Follower.state_of(Follower, shard_id)
+    if Process.whereis(Follower), do: Follower.state_of(Follower, shard_id)
   rescue
-    # No follower running on this node: there is no replica, which is not an error.
     ArgumentError -> nil
   end
 

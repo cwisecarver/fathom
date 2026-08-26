@@ -58,8 +58,14 @@ defmodule Fathom.Shard.Replication.Recovery do
   costs one concurrent round trip to each peer plus — only when a peer wins — a whole database
   transfer. That is the right trade during a failover and the wrong one on an ordinary open, which
   is why `:replication_recover_from_peers` is its own gate on top of
-  `:replication_promote_on_open`, off by default, and why the query round is bounded by
+  `:replication_promote_on_open`, and why the query round is bounded by
   `:replication_recovery_timeout_ms` rather than by TCP.
+
+  It defaults **on** (2026-08-25) despite that cost, because the cost is not paid by a node that
+  cannot use it: the gate below is `and` -ed with `:replication_listen`, which is off by default, so
+  a node outside a replicating fleet never opens a socket here. What defaulting on buys is that a
+  fleet which turns listening and shipping on gets the whole RPO story instead of the
+  "~0-if-lucky" half a forgotten fourth flag leaves behind.
 
   **The local replica is checked first and short-circuits the network entirely** — a node that
   already holds the freshest copy asks nobody.
@@ -97,10 +103,33 @@ defmodule Fathom.Shard.Replication.Recovery do
   @type position :: FollowerLog.t()
 
   @doc """
-  Is peer recovery switched on? (`:replication_recover_from_peers`, default `false`.)
+  Is peer recovery switched on? (`:replication_recover_from_peers`, default `true` since
+  2026-08-25.)
   """
   @spec enabled?() :: boolean()
-  def enabled?, do: Application.get_env(:fathom, :replication_recover_from_peers, false) == true
+  def enabled?, do: Application.get_env(:fathom, :replication_recover_from_peers, true) == true
+
+  @doc """
+  Is there anything to ask — does this node run a `Follower` (so a pulled replica has somewhere to
+  install) and does the fleet publish at least one peer?
+
+  **A COST gate, not a correctness one**, and it is what makes defaulting `enabled?/0` on affordable.
+  The fleet path's first act in `Fathom.Shard` is `Storage.object_head/1` — an object-store round
+  trip on the cold-open path — while the two conditions that make this whole search return `:none`
+  are a `Process.whereis` and a `:persistent_term` read. Without this check, the flipped default
+  would have put one HEAD on **every** cold open of **every** node, including nodes with no peers
+  and no listener where recovery can never do anything.
+
+  **False here does NOT mean "take the local path"**, and that distinction cost a test failure
+  before it was written down. `best_replica/3` short-circuits on this node's own replica *before*
+  opening a socket, so a node with a local replica and no peers still has a real fleet decision to
+  make — and only that path performs the mid-flight object re-check. The caller
+  (`Fathom.Shard.nothing_to_promote?/1`) therefore pairs this with "no local replica either", and
+  skips the whole thing only when both are true, which is precisely when `best_replica/3` would
+  have returned `:none`.
+  """
+  @spec fleet_reachable?(atom() | pid()) :: boolean()
+  def fleet_reachable?(follower \\ Follower), do: listening?(follower) and peers() != []
 
   @doc """
   Which copy of this shard should be served: ours, a peer's, or the stored object's.

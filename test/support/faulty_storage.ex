@@ -23,6 +23,19 @@ defmodule Fathom.Test.FaultyStorage do
     end
   end
 
+  # Same hook, but handed the shard id. `:faulty_before` is GLOBAL Application env while shard
+  # coordinators from earlier tests are still alive and still flushing, so a 0-arity hook used to
+  # OBSERVE a call (rather than to inject a fault) fires for other people's shards and the observing
+  # test flakes on whatever else the suite happens to be doing. Filtering belongs here, not in a
+  # `Process.sleep`. A 0-arity fun still works, so existing callers are untouched.
+  defp run_before(op, arg) do
+    case Application.get_env(:fathom, :faulty_before) do
+      {^op, fun} when is_function(fun, 1) -> fun.(arg)
+      {^op, fun} when is_function(fun, 0) -> fun.()
+      _ -> :ok
+    end
+  end
+
   # --- lock-etag semantics (expert review 2026-08-01 #9) -------------------------------------
   #
   # `Local` identifies a lock by `{owner, epoch}` only. The S3 backend also carries
@@ -271,6 +284,14 @@ defmodule Fathom.Test.FaultyStorage do
   # that, and a check that no test can drive is a check nobody knows is wired up.
   @impl true
   def object_head(shard_id) do
+    # `run_before(:object_head)` exists for the opposite of the usual reason: not to inject a fault,
+    # but to make a call OBSERVABLE so a test can assert it never happened. The A2 cost gate
+    # (`Fathom.Shard.nothing_to_promote?/1`) is invisible to outcome assertions — an open that skips
+    # the fleet path and an open that takes it and finds nothing both serve the stored object — so
+    # counting this call is the only way to tell them apart. Shard-scoped, because the suite has
+    # other coordinators flushing while an observing test holds this global hook.
+    run_before(:object_head, shard_id)
+
     case Local.object_head(shard_id) do
       {:ok, head} when is_map(head) ->
         if fault() == :object_head_moves and bump_head_reads() > 1,

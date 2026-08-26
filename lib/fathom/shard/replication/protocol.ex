@@ -256,18 +256,22 @@ defmodule Fathom.Shard.Replication.Protocol do
   @doc """
   Whether this node emits the lineage-carrying seed frame (`config :fathom,
   :replication_lineage_wire`, set by `REPLICATION_LINEAGE_WIRE` in `config/runtime.exs`, default
-  **false**).
+  **true** since 2026-08-25).
 
-  Off by default ON PURPOSE, and it is the second step of a two-step rollout: a peer one deploy
-  behind has no clause for `@seed_begin_lin` and answers `{:error, :malformed}`, which closes that
-  socket and stops it being seeded. Deploy everywhere first, then turn this on — the same contract
-  `FrameAuth.signing?/0` carries for `@signed` and `@push_ext`.
+  **`REPLICATION_LINEAGE_WIRE=false` is the switch to reach for during a rolling upgrade from a
+  build that predates this frame**, and it is the only situation that wants it: a peer running that
+  older code has no clause for `@seed_begin_lin`, answers `{:error, :malformed}` and closes the
+  socket, so it stops being seeded for as long as the version boundary exists. Unlike
+  `FrameAuth.signing?/0` — which stays opt-in because it also needs a key distributed — this one
+  guards a window that closes once, so it leads rather than follows.
 
-  Until it is on, `Promote.fresher?/2` sees `lineage: 0` on every replica and refuses to compare,
-  so promotion stays inert — which is exactly what it already was, not a regression.
+  With it off, `Promote.fresher?/2` sees `lineage: 0` on every replica and refuses to compare, so
+  promotion is inert. That is the pre-fix behaviour, not a regression — but an inert failover path
+  on a node that looks configured for failover is the more expensive of the two failures, which is
+  why the default flipped.
   """
   @spec lineage_wire?() :: boolean()
-  def lineage_wire?, do: Application.get_env(:fathom, :replication_lineage_wire, false) == true
+  def lineage_wire?, do: Application.get_env(:fathom, :replication_lineage_wire, true) == true
 
   @doc """
   One chunk of a seed. `part` is `:db` or `:wal`; `seq` counts from 0 **within its part**.

@@ -96,36 +96,51 @@ defmodule Fathom.RuntimeConfigTest do
     end
   end
 
-  # The lineage-carrying seed frame's gate (expert review 2026-08-24 #12) had the same shape of hole
-  # TEMPLATE_SHARD_ID above did, and it is the reason these two tests exist rather than the flag
-  # simply being flipped: `:replication_lineage_wire` was readable only from a config file or
-  # `Application.put_env`, so nothing but the test suite could ever set it. The fix shipped correct
-  # and UNDEPLOYABLE — every other replication knob has an env var, this one did not, so the
-  # documented "deploy everywhere, then turn it on fleet-wide" second step had no way to happen.
-  # Pre-fix the first test fails: the key is never written.
-  test "REPLICATION_LINEAGE_WIRE=true|1 turns on :replication_lineage_wire" do
-    for v <- ["true", "1"] do
-      assert Keyword.get(
-               fathom_config(%{"REPLICATION_LINEAGE_WIRE" => v}),
-               :replication_lineage_wire
-             ) == true,
-             "REPLICATION_LINEAGE_WIRE=#{v} did not enable the lineage seed frame"
+  # The three A2 gates that default ON (2026-08-25). They read through `env_bool`, which is
+  # TRI-STATE, and that is the whole point of these tests.
+  #
+  # `:replication_lineage_wire` is also the reason the helper exists at all. It had the same hole
+  # TEMPLATE_SHARD_ID above did — no runtime.exs entry, so nothing but a config file or
+  # `Application.put_env` could set it, and expert review 2026-08-24 #12's fix shipped correct and
+  # UNDEPLOYABLE. Wiring it with the usual two-state `in ~w(true 1)` form fixed that and immediately
+  # created the opposite hole the moment the default flipped: a knob that can only be turned ON is
+  # not a flag once it starts ON, it is a hardcode.
+  @default_on_gates [
+    {"REPLICATION_LINEAGE_WIRE", :replication_lineage_wire},
+    {"REPLICATION_PROMOTE_ON_OPEN", :replication_promote_on_open},
+    {"REPLICATION_RECOVER_FROM_PEERS", :replication_recover_from_peers}
+  ]
+
+  test "the default-on A2 gates write true for true|1" do
+    for {var, key} <- @default_on_gates, v <- ["true", "1"] do
+      assert Keyword.get(fathom_config(%{var => v}), key) == true,
+             "#{var}=#{v} did not write #{inspect(key)} true"
     end
   end
 
-  test "REPLICATION_LINEAGE_WIRE unset/false/0 leaves the wire gate off (rollout step one)" do
-    # UNWRITTEN, not `false` — the same shape SHARD_LOAD asserts, and here it is a safety property
-    # rather than a style: a peer one deploy behind has no clause for the new frame code and answers
-    # `{:error, :malformed}`, which closes the socket and stops it being seeded. A node that sets
-    # nothing has to stay on the legacy shape for the length of a rolling upgrade.
-    refute Keyword.has_key?(fathom_config(%{}), :replication_lineage_wire)
+  test "the default-on A2 gates write FALSE for false|0 — the off switch a flipped default needs" do
+    # Pre-`env_bool` this is the failing half: the two-state form ignored "false" entirely, leaving
+    # the key unwritten and the compiled default (now `true`) in force. An operator rolling back
+    # across the commit that introduced the lineage frame — the one case that genuinely wants the
+    # legacy wire shape — would have had no way to ask for it short of editing config and
+    # rebuilding.
+    for {var, key} <- @default_on_gates, v <- ["false", "0"] do
+      assert Keyword.get(fathom_config(%{var => v}), key) == false,
+             "#{var}=#{v} did not write #{inspect(key)} false"
+    end
+  end
 
-    for v <- ["false", "0"] do
-      refute Keyword.has_key?(
-               fathom_config(%{"REPLICATION_LINEAGE_WIRE" => v}),
-               :replication_lineage_wire
-             ),
-             "REPLICATION_LINEAGE_WIRE=#{v} should not write the key"
+  test "the default-on A2 gates leave the key UNWRITTEN when unset, so the module default stands" do
+    # Not `== true`: runtime.exs must say nothing, or it would pin a value that the module's own
+    # `Application.get_env(_, _, true)` default is supposed to own. Garbage is treated as unset for
+    # the same reason — a typo'd "yes" must not be read as "off" on a gate whose default is on.
+    cfg = fathom_config(%{})
+    unset = for {_, key} <- @default_on_gates, do: refute(Keyword.has_key?(cfg, key))
+    assert length(unset) == 3
+
+    for {var, key} <- @default_on_gates do
+      refute Keyword.has_key?(fathom_config(%{var => "yes"}), key),
+             "#{var}=yes should be treated as unset, not as off"
     end
   end
 end

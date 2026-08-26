@@ -458,6 +458,50 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
            "the promotion was abandoned but the pre-promotion snapshot was still taken"
   end
 
+  # THE COST GATE (2026-08-25), and the only place it is visible.
+  #
+  # `:replication_recover_from_peers` now defaults ON, and `try_promote_from_fleet/5` opens with
+  # `Storage.object_head/1`. Without `Fathom.Shard.nothing_to_promote?/1` that puts an object-store
+  # round trip on EVERY cold open of EVERY node — including nodes that follow nothing and have no
+  # peers, where the search can only ever return `:none`.
+  #
+  # OUTCOME ASSERTIONS CANNOT DISCRIMINATE HERE, which is why this test looks different from its
+  # neighbours: an open that skips the fleet path and an open that takes it and finds nothing both
+  # serve the stored object and both return the same rows. The `run_before(:object_head)` hook is
+  # the test — it was added to `FaultyStorage` for this, to make a call observable rather than to
+  # inject a fault.
+  #
+  # The setup's `Follower` IS running, so the skip rests on the empty peer set rather than on a
+  # missing listener; and `open_lineage/1` cannot confound it, because its own `object_head` read is
+  # behind `Fleet.replicating?/0`, which is off here.
+  #
+  # Probed: with the `nothing_to_promote?/1` branch deleted, this fails on the `refute_receive`.
+  test "a cold open with no replica and nobody to ask never reads the object head", ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+    Application.put_env(:fathom, :replication_recover_from_peers, true)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    {conn, coordinator} = build_shard(id, 3, 3)
+    tear_down_primary(id, conn, coordinator)
+
+    # Deliberately NO install_replica/2 — this node holds nothing to promote.
+    test_pid = self()
+    on_exit(fn -> Application.delete_env(:fathom, :faulty_before) end)
+
+    # SHARD-SCOPED. `:faulty_before` is global Application env and coordinators from earlier tests
+    # are still alive and still flushing, so an unfiltered hook reports their `object_head` reads as
+    # ours — which is exactly how this test failed on its first full-suite run while passing alone.
+    Application.put_env(
+      :fathom,
+      :faulty_before,
+      {:object_head, fn read_id -> if read_id == id, do: send(test_pid, :object_head_read) end}
+    )
+
+    assert open_and_read(id) == [1, 2, 3]
+    refute_receive :object_head_read, 100
+  end
+
   # The other direction, and the one that keeps the re-read from being a way to never recover: with
   # the object genuinely still, the fleet path promotes exactly as the local path does.
   test "an unmoved object still promotes through the fleet path", ctx do

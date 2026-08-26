@@ -88,6 +88,26 @@ env_nonneg_int = fn name ->
   end
 end
 
+# A TRI-STATE boolean env var: "true"/"1" ⇒ true, "false"/"0" ⇒ false, unset or anything else ⇒
+# nil, meaning "say nothing" so the compiled default survives.
+#
+# Every other flag here uses the two-state `if System.get_env("X") in ~w(true 1)` form, which can
+# only turn something ON. That was correct while every gate defaulted OFF. It is wrong the moment
+# one defaults ON: an operator would have no way to turn it off short of editing config and
+# rebuilding, which is not a flag, it is a hardcode with extra steps. The three A2 gates below are
+# the first to need it.
+#
+# NB: `Fathom.ConfigurationDocTest` scans this file for env-var names by matching the helper forms
+# by NAME. Adding a helper without adding it to that regex makes every knob read through it
+# invisible to the doc-completeness guard — which already happened once with `env_int`.
+env_bool = fn name ->
+  case System.get_env(name) do
+    v when v in ~w(true 1) -> true
+    v when v in ~w(false 0) -> false
+    _ -> nil
+  end
+end
+
 # Storage backend for shard files. SHARD_STORAGE=s3 selects the S3 backend and reads its
 # connection settings; the boot fence probe (Fathom.Application.check_storage_fence!) then
 # verifies the store enforces conditional writes before serving a byte.
@@ -655,8 +675,15 @@ end
 # stamp over-claims (it is read after the snapshot), promotion needs the replica STRICTLY ahead,
 # and an object with no stamp is never overridable at all. The last one means this is inert for a
 # shard until its next flush after upgrading.
-if System.get_env("REPLICATION_PROMOTE_ON_OPEN") in ~w(true 1) do
-  config :fathom, :replication_promote_on_open, true
+#
+# ON BY DEFAULT since 2026-08-25 — `REPLICATION_PROMOTE_ON_OPEN=false` turns it off. It was a
+# separate opt-in gate while its safety was unproven; the three fail-safe properties above are now
+# the reason it can lead rather than follow. It is INERT for a node that is not receiving replicas,
+# which is every node until `REPLICATION_LISTEN` is on, so defaulting it on costs nothing and
+# removes a step from the rollout that people were reaching failover without having taken.
+case env_bool.("REPLICATION_PROMOTE_ON_OPEN") do
+  nil -> :ok
+  v -> config :fathom, :replication_promote_on_open, v
 end
 
 # SURVIVOR SELECTION. Requires REPLICATION_PROMOTE_ON_OPEN, and completes it.
@@ -677,8 +704,15 @@ end
 # behind, an unstamped object — so there is no state in which it serves older bytes than leaving it
 # off would. It also needs REPLICATION_LISTEN on this node: the pull installs through the local
 # follower's replica directory.
-if System.get_env("REPLICATION_RECOVER_FROM_PEERS") in ~w(true 1) do
-  config :fathom, :replication_recover_from_peers, true
+#
+# ON BY DEFAULT since 2026-08-25 — `REPLICATION_RECOVER_FROM_PEERS=false` turns it off. Requires
+# `REPLICATION_LISTEN` on THIS node (the pull installs through the local replica directory), which
+# is off by default, so on a node that is not part of a replicating fleet this is inert and never
+# opens a socket. It defaults on so that a fleet which turns listening and shipping on gets the
+# whole RPO story, rather than the "~0-if-lucky" half that a forgotten fourth flag leaves behind.
+case env_bool.("REPLICATION_RECOVER_FROM_PEERS") do
+  nil -> :ok
+  v -> config :fathom, :replication_recover_from_peers, v
 end
 
 # How long a cold open waits for peers to answer "where is your replica?". All peers are asked at
@@ -790,10 +824,14 @@ end
 # stops being seeded for as long as the boundary exists. Landing the code changes nothing on the
 # wire; this flag is what starts emitting the new shape.
 #
-# Leaving it off is not a regression, it is today: `fresher?/2` sees `lineage: 0` on every replica
-# and refuses to rank it, exactly as before the fix landed.
-if System.get_env("REPLICATION_LINEAGE_WIRE") in ~w(true 1) do
-  config :fathom, :replication_lineage_wire, true
+# ON BY DEFAULT since 2026-08-25 — `REPLICATION_LINEAGE_WIRE=false` turns it off, and that is the
+# switch to reach for during a rolling upgrade FROM a build that predates the frame. The default
+# flipped because leaving it off makes promotion inert, and an inert failover path that looks
+# configured is worse than a rollout step: the gate was protecting a mixed-version window that only
+# exists while upgrading across this one commit.
+case env_bool.("REPLICATION_LINEAGE_WIRE") do
+  nil -> :ok
+  v -> config :fathom, :replication_lineage_wire, v
 end
 
 # Where the follower set comes from. `static` (default) is the hand-maintained
