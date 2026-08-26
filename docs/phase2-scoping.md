@@ -1,8 +1,18 @@
 # Phase 2 scoping — availability & capacity beyond the LB-keyspace-partition base
 
-**Status:** scoping (2026-07-01). Picks the highest-value Phase-2 item and locks the
-approach before any build. Phase 1 (the cluster phase, S1–S8 + the F1 heartbeat +
-the durability dirty-flag) is shipped; this doc scopes what's next.
+**Status:** scoping (2026-07-01) — **MOSTLY DELIVERED; not a work list (re-checked 2026-08-26).**
+Picks the highest-value Phase-2 item and locks the approach before any build. Phase 1 (the cluster
+phase, S1–S8 + the F1 heartbeat + the durability dirty-flag) was already shipped when this was
+written.
+
+Since then: **A1 warm standby is built** (`Fathom.Shard.WarmFollower`, `warm-standby.md`), **A2
+quorum replication is built** (`Fathom.Shard.Replication.*`, `a2-quorum-replication.md`), and
+**B dynamic rebalancing is built** (`Fathom.Rebalancer.*`, `rebalancing.md`) — every gate off by
+default, waiting on real hot-spot evidence rather than on code. **Only C — shard locality /
+affinity — remains unbuilt**: `AGENTS.md` records rendezvous/bounded-load hashing (C1) and
+multi-region affinity (C2) as absent, and there is no plan for them beyond this document.
+
+Read this for the reasoning that chose the order, not for what is left.
 
 ## The hard constraint
 

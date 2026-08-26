@@ -9,6 +9,14 @@ component map) is [`../AGENTS.md`](../AGENTS.md).** This folder holds the deeper
 references, the design plans, the benchmark plans, the operational runbooks, and the run reports.
 Each doc says whether it describes **built** behavior or a **plan**.
 
+**The plan docs here are records of reasoning, not work lists** (re-checked 2026-08-26). Every one
+has been delivered except [`a2-bare-metal-plan.md`](a2-bare-metal-plan.md), which is blocked on
+hardware. The tracked status record is the per-review `.progress.md` files under
+[`reviews/`](reviews/) — 392 findings across 15 reviews, all closed except the two named in
+[`reviews/expert-review-2026-08-24-223907.md.progress.md`](reviews/expert-review-2026-08-24-223907.md.progress.md):
+**#24** (needs a rig measurement) and **#25** (partially shipped; the autonomous-repair half needs an
+S3 budget and a precedence ruling).
+
 **New here?** The root [`../README.md`](../README.md) has the project overview and a two-path
 "Getting started" (Docker eval stack + native dev); [`../CONTRIBUTING.md`](../CONTRIBUTING.md) is the
 set-up-and-land-a-change guide for developers.
@@ -99,8 +107,11 @@ what actually shipped (some plan assumptions were superseded).
 - **[migration-engine-plan.md](migration-engine-plan.md)** — earlier migration-engine design notes.
   *Plan.*
 - **[phase2-scoping.md](phase2-scoping.md)** — Phase 2 scoping: warm standby (A), rebalancing (B),
-  locality/affinity (C). *Scoping — but A1, A2 and B1 have all since been BUILT; read the inline
-  "BUILT" notes on each bullet before treating anything here as future work.*
+  locality/affinity (C). *Scoping — but A1, A2 and B have all since been BUILT. **Only C is
+  unbuilt.** Read it for the reasoning that chose the order, not for what is left.*
+- **[a2-bare-metal-plan.md](a2-bare-metal-plan.md)** — **the one plan here that has NOT been run.**
+  Every A2 number on record comes from five nodes sharing one 12-vCPU VM; this measures whether the
+  ≤256-tenant replication ceiling belongs to fathom or to the rig. Blocked on hardware.
 - **[a2-quorum-replication.md](a2-quorum-replication.md)** — Phase 2 A2 in full: replicate-before-ack
   (the Waterpark quorum shape) as the answer to node-loss RPO, and why CRDT/OT cannot work over
   opaque tenant SQL. **Built and on `main`, off by default** (`REPLICATION_ENABLED` /
