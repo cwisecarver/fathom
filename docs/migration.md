@@ -164,6 +164,29 @@ those post-cutover writes, so the job **cancels deterministically** unless `forc
 you are throwing them away. A revert must be a pointer flip *within the retention window* — past
 `retain_until` the old version is gone and there's nothing to flip back to.
 
+**A cold-tail shard may not be able to flip to the version you named**, and since 2026-08-26 the
+revert handles that instead of quarantining it. A forward migration retains exactly one object,
+`<shard>@<current>` — the version the shard came *from* — and a cold shard walks `current+1 … target`
+in a **single** job. So a tenant that sat at v5 while the fleet reached v9 has only `<shard>@5`, and
+`Migrator.revert(9, 8)` asks it for a `<shard>@8` that was never created. `shards.retained_version`
+records what the retain actually wrote, in the cutover's own transaction; when it sits below the
+requested target, `RevertJob` restores it and then **enqueues a forward migration to the requested
+version**, so the shard rejoins the fleet at v8 rather than parking at v5.
+
+It lands on the requested version deliberately rather than "as far back as it can go": the fleet is
+only committed to **vN-1/vN** tolerance (below), so leaving a tenant three versions down trades *on
+the bad schema* for *on a schema nothing running can read*. The climb is briefly visible — those
+shards are below the fleet version until the forward job lands, they emit
+`fathom_migrator_revert_climb_back_count`, and they show up in `laggards`. **A count that stays
+non-zero after the migration queue drains means the climb is not completing**, and those tenants are
+outside the tolerance window until it does.
+
+`fathom_migrator_revert_no_retained_version_count` now means something narrower: the column is NULL
+(a pre-column row, or `RetirementJob` dropped the copy past retention) or names a version storage
+does not have. Those shards are still quarantined and still need a human — and `revert_status/1`
+counts only active rows, so `remaining: 0` there does **not** mean the fleet revert landed. Check
+the failed count.
+
 ### Reverting a bad Django migration — the full loop (the template gotcha)
 
 The fathom-side pointer flip is only half the story (expert review #32). A fleet revert yanks vN and

@@ -272,15 +272,27 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
   # partial revert #24 closed. So this asserts the deterministic cancel and the durable record
   # together, and the operator's discrimination comes from the log and the telemetry event.
   #
-  # The fixture is the real shape, not a contrived one: v1 retained, live at v3, revert asked for
-  # v2. Every existing revert test reverts a shard that moved exactly ONE version, which is why
-  # this never fired.
-  test "a revert to a version the shard never retained fails deterministically, not after retries",
+  # WHAT THIS COVERS CHANGED ON 2026-08-26 (#16b), and the fixture stayed identical, which is worth
+  # stating plainly. It was written as the chain-jump case: v1 retained, live at v3, revert asked
+  # for v2. That case is now HANDLED — `RevertJob` reads `shards.retained_version`, restores v1 and
+  # migrates forward to v2 (see the test below). This fixture cuts over with `Directory.cutover/2`,
+  # which does not write that column, so what it actually exercises now is the NULL case: a
+  # pre-column row, or a retained copy `RetirementJob` dropped past its retention window. That is
+  # still a real path and still has to fail deterministically, so the test is kept and relabelled
+  # rather than deleted.
+  #
+  # It also previously asserted the phrase "never passed through", which the message no longer
+  # carries — deliberately, because that explanation is now wrong when the column is NULL. The
+  # message says what NULL means instead.
+  test "a revert with no recorded retained version fails deterministically, not after retries",
        %{shard: shard} do
     seed_v1!(shard)
-    # The chain-jump: it came from v1 (so only @1 exists) and is now at v3.
+    # Live at v3 with only @1 on disk, and NO retained_version recorded (cutover/2).
     :ok = Storage.retain(shard, 1)
     {:ok, _} = Directory.cutover(shard, 3)
+
+    assert {:ok, %{retained_version: nil}} = Directory.get(shard),
+           "the fixture must leave the column NULL — that absence is what this test is about"
 
     refute File.exists?(Path.join(remote_dir(), "#{shard}@2.db")),
            "the fixture must NOT have a @2 backup — its absence is the whole scenario"
@@ -293,13 +305,53 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
       end)
 
     # The diagnosis is the deliverable here: both causes produce the same storage error, so the
-    # log is what lets an operator tell "retired past retention" from "never passed through it".
-    assert log =~ "never passed through"
+    # log is what lets an operator tell "retired past retention" from a column that was never set.
+    assert log =~ "retained_version says nil"
     assert log =~ "revert_status"
 
     assert {:ok, %{status: "migration_failed"}} = Directory.get(shard),
            "the durable record from review #24 must survive — a revert that did not land has to " <>
              "be visible somewhere other than a log line"
+  end
+
+  # THE CHAIN-JUMP, LANDED (expert review 2026-08-24 #16b). The fixture above is the same shape;
+  # the only difference is that `retained_version` is recorded, which is what a real cutover does.
+  #
+  # A cold-tail shard walks `current+1 … target` in ONE job and retains only the version it came
+  # FROM, so a fleet revert naming a version it skipped used to quarantine it and leave it on the
+  # bad schema — a fleet revert that read as landed while only the one-version-behind shards moved.
+  #
+  # IT LANDS ON THE REQUESTED VERSION, not on the retained one, and that is the substance. Stopping
+  # at v1 is the cheaper implementation and it is wrong: `docs/migration.md` commits the fleet to
+  # vN-1/vN tolerance, so parking a shard two versions below what the app expects trades "on the
+  # bad schema" for "on a schema nothing running can read". So the revert restores v1 and enqueues
+  # the forward climb back to v2.
+  test "a chain-jumped shard reverts to its retained copy and is sent forward to the target",
+       %{shard: shard} do
+    seed_v1!(shard)
+    :ok = Storage.retain(shard, 1)
+    # A REAL cutover: live at v3, and the column records that @1 is what was retained.
+    {:ok, _} = Directory.cutover(shard, 3, 1)
+
+    refute File.exists?(Path.join(remote_dir(), "#{shard}@2.db")),
+           "the fixture must NOT have a @2 backup — the shard skipped v2 entirely"
+
+    log =
+      capture_log(fn ->
+        assert :ok =
+                 perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 2}, attempt: 1)
+      end)
+
+    # Landed on the retained copy ...
+    assert {:ok, %{schema_version: 1, status: "active"}} = Directory.get(shard),
+           "the revert should have restored the retained v1 rather than quarantining"
+
+    # ... and is on its way back to the version the fleet asked for. Without this the shard sits
+    # below the fleet forever, which is the failure mode that made "revert as far back as it can
+    # go" the wrong answer.
+    assert_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => shard, "target" => 2})
+
+    assert log =~ "migrating forward v1 -> v2"
   end
 
   # Round-2 #30: a RevertJob dying between the cutover and the Oban ack retries with

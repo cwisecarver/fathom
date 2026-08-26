@@ -318,19 +318,63 @@ defmodule Fathom.Directory do
   immediately after a cutover the shard reads as "no activity since cutover" —
   the revert force-guard (`Fathom.Migrator.ShardMigration.revert/4`) detects
   post-cutover activity as strictly `last_active_at > cutover_at` (finding #13).
+
+  `retained_version` (3-arity) records which version the `Storage.retain/2` immediately before this
+  cutover actually wrote (expert review 2026-08-24 #16b). It belongs in THIS update because it is
+  the same transaction: the retain and the version stamp either both land or neither does, and a
+  `retained_version` that disagreed with what storage holds is worse than none — it points a revert
+  at an object that may not exist. The 2-arity form omits it and leaves the column untouched, which
+  is what a caller that did not retain anything wants.
   """
   @spec cutover(String.t(), non_neg_integer()) ::
           {:ok, Shard.t()} | {:error, :not_found | Ecto.Changeset.t()}
   def cutover(shard_id, schema_version) do
+    update_shard(shard_id, cutover_attrs(schema_version))
+  end
+
+  @spec cutover(String.t(), non_neg_integer(), non_neg_integer() | nil) ::
+          {:ok, Shard.t()} | {:error, :not_found | Ecto.Changeset.t()}
+  def cutover(shard_id, schema_version, retained_version) do
+    shard_id
+    |> update_shard(Map.put(cutover_attrs(schema_version), :retained_version, retained_version))
+  end
+
+  defp cutover_attrs(schema_version) do
     now = DateTime.utc_now()
 
-    update_shard(shard_id, %{
+    %{
       schema_version: schema_version,
       status: "active",
       last_active_at: now,
       cutover_at: now,
       migrating_since: nil
-    })
+    }
+  end
+
+  @doc """
+  Clears `retained_version` — but only if it still names `version` (expert review 2026-08-24 #16b).
+
+  Called by `Fathom.Migrator.RetirementJob` after it drops `<shard>@<version>`, so the column stops
+  claiming a copy that no longer exists. The conditional matters: a forward migration that ran
+  between the retirement's guards and its drop has already pointed the column at a NEWER retained
+  copy, and clearing unconditionally would erase a live recovery point's record while the object
+  survives — turning a revert that would have worked into a refusal.
+
+  Returns `:ok` whether or not a row matched; a shard with no row, or one whose column already
+  moved on, is not an error, it is the condition doing its job.
+  """
+  @spec clear_retained_version(String.t(), non_neg_integer()) :: :ok
+  def clear_retained_version(shard_id, version) do
+    {_count, _} =
+      Repo.update_all(
+        from(s in Shard,
+          where: s.shard_id == ^shard_id,
+          where: s.retained_version == ^version
+        ),
+        set: [retained_version: nil, updated_at: DateTime.utc_now()]
+      )
+
+    :ok
   end
 
   @doc "Marks a shard as mid-migration (the app pauses writes for the copy window)."

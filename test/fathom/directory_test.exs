@@ -94,6 +94,37 @@ defmodule Fathom.DirectoryTest do
       assert DateTime.compare(entry.cutover_at, entry.last_active_at) == :eq
     end
 
+    # `retained_version` (expert review 2026-08-24 #16b) — which version this shard has a retained
+    # copy of, so a fleet revert can tell whether the target it names is reachable for THIS shard.
+    # `cutover/2` must leave it alone: a caller that retained nothing has nothing to record, and
+    # writing nil there would erase a live recovery point.
+    test "cutover/3 records the retained version; cutover/2 leaves it untouched" do
+      assert {:ok, %Shard{retained_version: 4}} = Directory.cutover("acme", 5, 4)
+      assert {:ok, %Shard{retained_version: 4}} = Directory.cutover("acme", 6)
+    end
+
+    # THE CONDITION IS THE TEST. `RetirementJob` clears this after dropping `<shard>@<version>`, so
+    # the column stops claiming a copy that no longer exists — but a forward migration that ran
+    # between the retirement's guards and its drop has already pointed the column at a NEWER copy.
+    # An unconditional clear would erase that live recovery point's record while the object itself
+    # survives, turning a revert that would have worked into a refusal.
+    test "clear_retained_version only clears when it still names that version" do
+      {:ok, _} = Directory.cutover("acme", 5, 4)
+
+      assert :ok = Directory.clear_retained_version("acme", 3)
+
+      assert {:ok, %Shard{retained_version: 4}} = Directory.get("acme"),
+             "clearing a version the column does not name must be a no-op"
+
+      assert :ok = Directory.clear_retained_version("acme", 4)
+      assert {:ok, %Shard{retained_version: nil}} = Directory.get("acme")
+
+      # Idempotent, and a shard it does not know is not an error — a retirement can outlive its
+      # tenant, and raising there would strand the job.
+      assert :ok = Directory.clear_retained_version("acme", 4)
+      assert :ok = Directory.clear_retained_version("no-such-shard", 1)
+    end
+
     test "mark_migrating / mark_failed set status" do
       assert {:ok, %Shard{status: "migrating"}} = Directory.mark_migrating("acme")
       assert {:ok, %Shard{status: "migration_failed"}} = Directory.mark_failed("acme")

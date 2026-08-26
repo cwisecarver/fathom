@@ -618,9 +618,15 @@ defmodule Fathom.Migrator.ShardMigration do
   # in the job's perform — a blip there crashed the job, and its retry short-circuited on the
   # already-landed cutover to a bare `:ok` that skipped the enqueue, leaking the object indefinitely
   # with no self-heal). On failure NEITHER lands and the job retries the cutover.
+  # `retire_version` is BOTH the version whose retirement is scheduled and the version now retained
+  # — they are the same object, `<shard>@<retire_version>`, and recording it is what lets a fleet
+  # revert know whether a shard can reach the requested target at all (expert review 2026-08-24
+  # #16b). Written inside this transaction rather than beside it for the same reason the retirement
+  # is: a `retained_version` that outlived a rolled-back cutover would point a revert at an object
+  # the shard does not have.
   defp cutover_with_retirement(shard_id, cutover_to, retire_version) do
     Repo.transaction(fn ->
-      with {:ok, row} <- Directory.cutover(shard_id, cutover_to),
+      with {:ok, row} <- Directory.cutover(shard_id, cutover_to, retire_version),
            {:ok, _job} <- Oban.insert(RetirementJob.schedule_changeset(shard_id, retire_version)) do
         row
       else

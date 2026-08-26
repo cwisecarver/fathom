@@ -31,6 +31,7 @@ defmodule Fathom.Migrator.RevertJob do
   import Ecto.Query, only: [from: 2]
 
   alias Fathom.Migrator.ShardMigration
+  alias Fathom.Migrator.ShardMigrationJob
 
   @impl Oban.Worker
   def perform(
@@ -39,8 +40,13 @@ defmodule Fathom.Migrator.RevertJob do
           id: id
         } = job
       ) do
-    # Cancel the forward migration's pending retirement of to_version BEFORE touching
-    # storage (expert review #22, tightened by round-2 #17): to_version's retained copy
+    # THE TARGET THIS SHARD CAN ACTUALLY REACH, which is not always the one the fleet asked for
+    # (expert review 2026-08-24 #16b). Resolved FIRST, because everything below depends on it: the
+    # retirement cancel protects the restore source, and the restore source is `<shard>@<landing>`.
+    landing = landing_version(shard_id, to_version)
+
+    # Cancel the forward migration's pending retirement of the landing version BEFORE touching
+    # storage (expert review #22, tightened by round-2 #17): that version's retained copy
     # is this revert's RESTORE SOURCE, and the #22 cancel lived in the :ok branch —
     # after the whole race window — so a retirement dequeuing just before/mid-revert
     # still deleted it (its skip-when-live guard reads the directory, which says
@@ -49,21 +55,21 @@ defmodule Fathom.Migrator.RevertJob do
     # until the S3 lifecycle backstop; a deleted restore source quarantines the shard
     # unrecoverably. An already-EXECUTING retirement is uncancellable — that side is
     # closed by RetirementJob's revert-in-flight guard.
-    cancel_retirement(shard_id, to_version)
+    cancel_retirement(shard_id, landing)
 
     # Job id as the lease token — distinct from any forward ShardMigrationJob's owner, so the two
     # can't merge via the same-owner reclaim path (finding #9).
-    case ShardMigration.revert(shard_id, to_version, id, force: Map.get(args, "force", false)) do
+    case ShardMigration.revert(shard_id, landing, id, force: Map.get(args, "force", false)) do
       # Already fully reverted (a crashed-after-cutover retry, round-2 #30) — nothing
       # was touched, so there is no fresh backup to schedule retirement for.
       :ok ->
-        :ok
+        climb_back(shard_id, landing, to_version)
 
       # The revert backed the live vN object up as <shard>@<from> (finding #13) and its cutover
       # enqueued that object's retention deletion atomically (the outbox, expert review 2026-07-18
       # #5), so a Postgres blip can't leak it and this path needn't re-enqueue.
       {:ok, %{from: _backed_up}} ->
-        :ok
+        climb_back(shard_id, landing, to_version)
 
       {:retry, reason} ->
         Logger.info("shard #{shard_id}: revert deferred (#{inspect(reason)})")
@@ -124,13 +130,15 @@ defmodule Fathom.Migrator.RevertJob do
 
         Logger.error(
           "shard #{shard_id}: revert to v#{to_version} FAILED — no retained copy at " <>
-            "#{shard_id}@#{to_version}, and no retry can create one. Either it was retired past " <>
-            "its retention window, or this shard never passed through v#{to_version} at all: a " <>
-            "cold-tail shard chain-migrates several versions in ONE job and retains only the " <>
-            "version it came FROM, so a fleet-wide revert target does not exist for it. This " <>
-            "shard is still on its pre-revert schema. It is now quarantined, which means it also " <>
-            "drops out of revert_status/1 — so `remaining: 0` there does NOT mean the fleet " <>
-            "revert landed; check the failed count."
+            "#{shard_id}@#{landing}, and no retry can create one. The chain-jump case is now " <>
+            "handled before this point: shards.retained_version says " <>
+            "#{inspect(retained_version(shard_id))}, and a value BELOW the target would have been " <>
+            "restored and then migrated forward. Reaching here means the column is NULL (a " <>
+            "pre-column row, or RetirementJob dropped the copy past its retention window) or it " <>
+            "named a version storage does not actually have. This shard is still on its " <>
+            "pre-revert schema. It is now quarantined, which means it also drops out of " <>
+            "revert_status/1 — so `remaining: 0` there does NOT mean the fleet revert landed; " <>
+            "check the failed count."
         )
 
         :telemetry.execute(
@@ -143,6 +151,93 @@ defmodule Fathom.Migrator.RevertJob do
 
       {:error, reason} ->
         handle_error(job, shard_id, reason)
+    end
+  end
+
+  # WHICH VERSION THIS SHARD CAN ACTUALLY BE RESTORED TO (expert review 2026-08-24 #16b).
+  #
+  # A forward migration retains exactly ONE object, `<shard>@<current>`. A cold-tail shard walks
+  # `current+1 … target` in a SINGLE job, so a shard that sat at v5 while the fleet reached v9
+  # retains only `<shard>@5`. A fleet revert names one fleet-wide target — `Migrator.revert(9, 8)`
+  # — and `<shard>@8` was never created for that shard. Before this, every such shard burned the
+  # absent-object branch below and stayed on the bad schema; a fleet revert read as landed while
+  # only the one-version-behind shards had moved.
+  #
+  # `shards.retained_version` records what the retain actually wrote, in the cutover's own
+  # transaction. Reading it is one indexed column, not a storage listing — there is no
+  # `list_versions` callback and adding one would mean implementing it on Local, S3 and the test
+  # double to answer a question Postgres already holds more truthfully.
+  #
+  # DEVIATES ONLY DOWNWARD, and only on a definite integer. Equal (the ordinary case, the shard came
+  # from the target) and NULL (a pre-column row, or a copy `RetirementJob` has dropped) both return
+  # the requested version, so the common path is bit-for-bit what it was and an unknown column
+  # still lands in the absent-object branch with its diagnosis. A retained version ABOVE the target
+  # is not a landing site either: restoring it would move the shard to a version newer than the
+  # fleet asked for, which is not a revert.
+  defp landing_version(shard_id, to_version) do
+    case retained_version(shard_id) do
+      r when is_integer(r) and r < to_version -> r
+      _ -> to_version
+    end
+  end
+
+  defp retained_version(shard_id) do
+    case Fathom.Directory.get(shard_id) do
+      {:ok, %{retained_version: r}} -> r
+      :error -> nil
+    end
+  end
+
+  # THE SECOND HALF OF A CHAIN-JUMPER'S REVERT, and the reason this lands on the requested version
+  # rather than "as far back as it can go" (expert review 2026-08-24 #16b).
+  #
+  # Stopping at v5 would be the cheaper implementation and it is WRONG. `docs/migration.md` commits
+  # the fleet to exactly vN-1/vN tolerance — "the app reads both vN-1 and vN" — so parking a shard
+  # three versions below what the fleet's app expects turns "on the bad schema" into "on a schema
+  # nothing running can read". Reverting to the retained copy and then migrating FORWARD to the
+  # requested version keeps the fleet homogeneous, which is the whole point of a fleet revert.
+  #
+  # The forward leg needs no new machinery: `Migrator.revert/3` yanks the bad version first, so
+  # `head()` is already the requested target and this is the ordinary migration path a laggard
+  # takes. `ShardMigrationJob` is unique per shard, so a reconcile sweep that enqueues the same
+  # climb concurrently is deduped rather than doubled.
+  defp climb_back(_shard_id, landing, to_version) when landing >= to_version, do: :ok
+
+  defp climb_back(shard_id, landing, to_version) do
+    # WARNING, not info, and the level is the point: this shard is now BELOW the fleet version, and
+    # `docs/migration.md` only commits the app to vN-1/vN. That is a real (if brief) window in which
+    # a request for this tenant can hit a schema the running app does not expect — the same class of
+    # operator-visible consequence as the "writes DISCARDED" warning the revert itself emits, and it
+    # would be invisible at :info, which `config/test.exs` and most deploys filter out.
+    Logger.warning(
+      "shard #{shard_id}: reverted to v#{landing} (its only retained copy — it chain-migrated " <>
+        "past v#{to_version}); now migrating forward v#{landing} -> v#{to_version} to rejoin the " <>
+        "fleet. It is briefly below the fleet version, which the app's vN-1/vN tolerance does " <>
+        "not cover: watch for it in the laggard count until the forward job lands."
+    )
+
+    :telemetry.execute(
+      [:fathom, :migrator, :revert_climb_back],
+      %{count: 1},
+      %{shard_id: shard_id, landed_at: landing, target: to_version}
+    )
+
+    case Oban.insert(ShardMigrationJob.new(%{shard_id: shard_id, target: to_version})) do
+      {:ok, _job} ->
+        :ok
+
+      # The revert itself LANDED — the shard is on `landing` and storage is consistent. Only the
+      # climb failed to enqueue, and returning an error here would re-run a revert that has already
+      # cut over. Report it and let the reconcile sweep pick the shard up as an ordinary laggard,
+      # which is exactly what it now is.
+      {:error, reason} ->
+        Logger.error(
+          "shard #{shard_id}: reverted to v#{landing} but could not enqueue the forward climb to " <>
+            "v#{to_version} (#{inspect(reason)}). The shard is BELOW the fleet version; the " <>
+            "laggard sweep should collect it, but check that it does."
+        )
+
+        :ok
     end
   end
 

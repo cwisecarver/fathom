@@ -44,6 +44,17 @@ defmodule Fathom.Directory.Shard do
     # cutover" is exactly last_active_at > cutover_at. The revert force-guard reads this
     # (fable-review #13); nil (pre-column row / never cut over) = unknown write-age.
     field :cutover_at, :utc_datetime_usec
+
+    # WHICH version this shard has a retained copy of (expert review 2026-08-24 #16b) — written by
+    # `Directory.cutover/3` in the same transaction that stamps `schema_version`, because that is
+    # the transaction the `Storage.retain/2` before it belongs to.
+    #
+    # NOT derivable from `schema_version - 1`, which is the assumption that made a fleet revert only
+    # partially land: a cold-tail shard walks `current+1 … target` in ONE job and retains only the
+    # version it came FROM, so v5 → v9 leaves `retained_version = 5` against `schema_version = 9`.
+    # NULL means "none, or unknown" — a pre-column row, or a retained copy that `RetirementJob` has
+    # since dropped. Every consumer must treat NULL as "cannot revert by pointer flip".
+    field :retained_version, :integer
     # Per-shard Hrana-token revocation counter (expert review #31): a token embeds the
     # version it was minted at; bumping this via Fathom.HranaAuth.revoke/1 invalidates
     # every outstanding token for THIS shard alone (no fleet-wide secret rotation).
@@ -107,7 +118,11 @@ defmodule Fathom.Directory.Shard do
       :last_active_at,
       :retain_until,
       :migrating_since,
-      :cutover_at
+      :cutover_at,
+      # Castable here but deliberately NOT in `admin_changeset/2` above: it is a
+      # migration-state-machine field like `schema_version`, and a hand-edit that names a version
+      # with no object behind it points a revert at nothing.
+      :retained_version
     ])
     |> validate_required([:shard_id, :schema_version, :status, :last_active_at])
     # Shard ids become SQLite file names and registry keys elsewhere; defer to the single

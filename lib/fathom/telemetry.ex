@@ -698,7 +698,12 @@ defmodule Fathom.Telemetry do
       counter("fathom.migrator.revert_no_retained_version.count",
         event_name: [:fathom, :migrator, :revert_no_retained_version],
         description:
-          "Shards a fleet revert could not reach because they never passed through the fleet-wide to_version. A forward migration retains only the version the shard came FROM, and a cold-tail shard chain-migrates several versions in one job — so a revert to vN-1 finds no retained copy for anything that jumped over it. Non-zero means the revert PARTIALLY landed: these shards are still on the bad schema while `revert_status/1` reports remaining: 0, because it counts only active rows. The recovery is a per-shard revert to a version each shard actually retained. Untagged: to_version is a version number, unbounded as a label"
+          "Shards a fleet revert could not reach at all. The chain-jump case that used to dominate this is now HANDLED (2026-08-26): `shards.retained_version` records what the retain actually wrote, and a value below the target is restored and then migrated forward — see fathom.migrator.revert_climb_back. So non-zero here now means the column is NULL (a pre-column row, or RetirementJob dropped the copy past its retention window) or it named a version storage does not have. Still a PARTIAL revert: these shards are on the bad schema while `revert_status/1` reports remaining: 0, because it counts only active rows. Recovery is manual — restore from a snapshot, or roll forward with a fixed release. Untagged: to_version is a version number, unbounded as a label"
+      ),
+      counter("fathom.migrator.revert_climb_back.count",
+        event_name: [:fathom, :migrator, :revert_climb_back],
+        description:
+          "Shards a fleet revert had to land BELOW its target and then migrate forward to reach it (2026-08-26). A cold-tail shard chain-migrates several versions in one job and retains only the version it came FROM, so a fleet-wide revert target it skipped has no retained copy; rather than leaving it on the bad schema, the revert restores what it does have and enqueues the climb back. Expected to be non-zero during any revert of a release that sat long enough for cold tenants to skip versions. WATCH IT ALONGSIDE `laggards`: each of these shards is briefly BELOW the fleet version, which the app's documented vN-1/vN tolerance does not cover, so a count that stays non-zero after the migration queue drains means the climb is not completing and those tenants are on a schema the app does not expect. Untagged: landed_at and target are version numbers, unbounded as labels"
       ),
       counter("fathom.migrator.inline_migrate_failed.count",
         event_name: [:fathom, :migrator, :inline_migrate_failed],

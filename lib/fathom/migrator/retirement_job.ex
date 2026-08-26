@@ -50,7 +50,25 @@ defmodule Fathom.Migrator.RetirementJob do
         {:cancel, :revert_in_flight}
 
       true ->
-        Storage.drop_version(shard_id, version)
+        drop_and_forget(shard_id, version)
+    end
+  end
+
+  # The column has to stop claiming a copy this job just deleted (expert review 2026-08-24 #16b).
+  # `shards.retained_version` is what a fleet revert consults to decide whether a shard can reach
+  # the requested target, so a stale value is worse than a null one: it sends the revert at
+  # `<shard>@<version>` with confidence, and the absent-object path it lands in is the very thing
+  # the column exists to let us avoid.
+  #
+  # ONLY when it still names the version we dropped. A retain that ran between the guards above and
+  # this line has already moved it on, and clearing unconditionally would erase a live recovery
+  # point's record while the object itself survives — a revert that would have worked is then
+  # refused. Storage first: if the drop fails the object is still there and the column is still
+  # true, so the order is the one where a partial failure leaves a consistent pair.
+  defp drop_and_forget(shard_id, version) do
+    with :ok <- Storage.drop_version(shard_id, version) do
+      _ = Directory.clear_retained_version(shard_id, version)
+      :ok
     end
   end
 
