@@ -329,6 +329,31 @@ if n = System.get_env("RECONCILE_BATCH_SIZE") do
   config :fathom, :reconcile_batch_size, String.to_integer(n)
 end
 
+# THE PER-SHARD SIZE CAP, and the reason it is a knob at all: past S3's 5 GiB single-PUT ceiling a
+# shard keeps ACKING writes it can never flush, snapshot, fork or retain — permanently, with no
+# operator remedy, because the data is already acknowledged. The cap turns that into an honest
+# SQLITE_FULL at write time. `Fathom.Shard.Connection` derives pages from `PRAGMA page_size` per
+# file, so the bound is in bytes rather than a page count that means different things at 4 KiB and
+# 64 KiB.
+#
+# `env_nonneg_int`, NOT `env_int`, and the difference is the whole opt-out: **0 means unlimited**
+# and is the value the code comment tells an operator to reach for. `env_int` returns nil for 0,
+# which would silently leave the cap in place while the operator believed they had removed it.
+#
+# NEITHER OF THESE WAS READABLE FROM THE ENVIRONMENT until 2026-08-26, while
+# `connection.ex` said "Set `SHARD_MAX_BYTES=0` (or `SHARD_MAX_PAGE_COUNT=0`) to opt out" and
+# docs/configuration.md carried a row for the first. Found by `Fathom.EnvReachabilityTest`, which
+# exists because this was the fourth instance of the same defect in one session.
+if n = env_nonneg_int.("SHARD_MAX_BYTES") do
+  config :fathom, :shard_max_bytes, n
+end
+
+# Pages instead of bytes. Wins over SHARD_MAX_BYTES when set: an operator who configured pages meant
+# pages, and reinterpreting their number as bytes would be its own bug.
+if n = env_nonneg_int.("SHARD_MAX_PAGE_COUNT") do
+  config :fathom, :shard_max_page_count, n
+end
+
 # READ-ONLY restore drill: per-run sample size. Pulls each sampled shard's stored object,
 # `quick_check`s it, and compares its `PRAGMA user_version` against the directory — one GET per
 # sample, no copy. Unset ⇒ off, which is the shipped default.
