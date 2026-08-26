@@ -74,6 +74,23 @@ It tracks coordinator + connection-resource density faithfully; true RSS-per-sha
 (which the page cache dominates) is a follow-on once we decide it's worth the
 cross-platform noise.
 
+**`fanout_kb_per_shard` is WATCH-ONLY as of 2026-08-26** — still measured, still printed on every
+gate run, but it no longer blocks and no longer moves the verdict. It went 20% → 50% → watch, each
+step taken after the band was measured against its own noise and found to sit under it. The
+settling number: across `perf_history.jsonl`, runs sharing a commit *and* a dirty flag — identical
+trees — span 3.81–5.67, 4.01–6.62, 3.58–5.57 and 3.70–5.85 KiB/shard, i.e. up to **56%**, above the
+50% band it carried. It refused clean commits twice on 2026-08-25 alone.
+
+Read it, don't gate on it, and beware the daily median: runs on one day cluster (one build, one
+machine state, 200 coordinator heaps tipping a geometric size class together) and the cluster flips
+across days, which draws a convincing step function out of pure bimodality. `5bf86f2` on 2026-08-02
+already spanned 3.81–5.67 on one tree, eight days before the earliest apparent "step".
+
+The gating pair for the same question is `fanout_gc_kb_per_shard` (20%, the steady-state floor —
+it held 3.6–3.7 daily through a month where `fanout` swung 2.5–6.6) and `served_kb_per_shard` (20%,
+and tight: 5% lifetime spread). Per `Fathom.Bench.fanout_gc/1`: `fanout` up with `fanout_gc` flat
+is churn or a size-class tip; both up is a real retained-heap regression.
+
 ## Where the numbers live
 
 `scripts/perf_history.jsonl` — singular, since fathom is single-topology native

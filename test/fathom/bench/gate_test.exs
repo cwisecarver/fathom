@@ -85,13 +85,72 @@ defmodule Fathom.Bench.GateTest do
     assert result.worst > 27.0
   end
 
-  # Pins the per-metric override itself, which nothing covered: the same +27.8% that blocks on a
-  # default-band metric above must only WARN on fanout, or the widened band is not in effect.
+  # Pins the per-metric override itself: the same +27.8% that blocks on a default-band metric above
+  # must only WARN on a metric carrying a wider band, or the override is not in effect.
+  #
+  # THE VEHICLE HAS MOVED TWICE, and both moves were threshold changes rather than behaviour
+  # changes — worth saying so the next reader does not read the churn as instability. It was
+  # `fanout_kb_per_shard` until 2026-08-26, when fanout stopped carrying a numeric band at all
+  # (it is `:watch` now, covered below). `cold_open_p99_us` still carries 50, so it demonstrates
+  # the same mechanism.
   test "a metric with its own wider band uses it, not the default" do
-    new = %{@parent | "fanout_kb_per_shard" => 230.0}
-    result = Gate.compare(@parent, new)
-    assert result.verdict == :warn, "fanout carries a 50% block band; +27.8% must not block"
+    parent = Map.put(@parent, "cold_open_p99_us", 180.0)
+    new = %{parent | "cold_open_p99_us" => 230.0}
+    result = Gate.compare(parent, new)
+
+    assert result.verdict == :warn,
+           "cold_open_p99_us carries a 50% block band; +27.8% must not block"
+
     assert result.worst > 27.0
+  end
+
+  # `:watch` — reported, never gating. Demoted 2026-08-26 after the 50% band was measured to sit
+  # UNDER the metric's own same-tree spread (identical trees span up to 56% in perf_history.jsonl),
+  # so it refused clean commits twice on 2026-08-25 alone.
+  describe "a :watch metric" do
+    # 2.8x, far past any band the gate has ever carried, and it must still not block.
+    test "never blocks, however far it moves" do
+      new = %{@parent | "fanout_kb_per_shard" => 500.0}
+      result = Gate.compare(@parent, new)
+
+      assert result.verdict == :ok, "a watch-only metric reached the verdict"
+      refute :fanout_kb_per_shard in result.blocked
+    end
+
+    # THE HALF THAT MATTERS MORE, and the one a naive demotion gets wrong. `commit_with_bench.sh`
+    # PROMPTS on :warn and aborts when stdin is not a TTY, so leaving fanout in `worst` would still
+    # stop an unattended commit — the same outage one door down. `worst` must ignore it entirely.
+    test "is excluded from worst, so it cannot flip the verdict to :warn either" do
+      new = %{@parent | "fanout_kb_per_shard" => 500.0}
+      result = Gate.compare(@parent, new)
+
+      assert result.worst == 0.0,
+             "fanout leaked into worst; commit_with_bench.sh aborts on a warn without a TTY"
+    end
+
+    # Demoting it must not mean hiding it — it is still the only reading of whether the
+    # coordinators' `fullsweep_after: 0` reclaims retained heap.
+    test "is still measured and still reported" do
+      new = %{@parent | "fanout_kb_per_shard" => 500.0}
+      result = Gate.compare(@parent, new)
+      d = Enum.find(result.deltas, &(&1.metric == :fanout_kb_per_shard))
+
+      refute d.skipped
+      assert d.pct > 170.0
+      assert Gate.format(result, "abc1234") =~ "watch only"
+    end
+
+    # A GUARD, NOT A REPRODUCTION — it passes against the pre-demotion code too, because a +30%
+    # cold_open blocked under the old band as well. The three tests above are the discriminating
+    # ones (verified: all three fail with fanout restored to a 50% band). This one exists so a
+    # future widening that accidentally swallowed neighbouring metrics would fail something.
+    test "does not shield the metrics that do gate" do
+      new = %{@parent | "fanout_kb_per_shard" => 500.0, "cold_open_p50_us" => 1300.0}
+      result = Gate.compare(@parent, new)
+
+      assert result.verdict == :block
+      assert :cold_open_p50_us in result.blocked
+    end
   end
 
   test "a metric nil in either run is skipped, never treated as flat" do

@@ -38,17 +38,28 @@ defmodule Fathom.Bench.Gate do
     # against entries after it, instead of one series with an unexplained cliff that reads like
     # a code regression forever. Any future harness change to this bench should rename again.
     {:copy_keystone_rows_per_s, :lower_worse},
-    # Gated at 50%, not the default 20% — the same treatment `cold_open_p99_us` gets below, and
-    # for the same reason: this is a fat-tailed number, not a precise one. It divides an
-    # `:erlang.memory(:total)` delta across 200 idle coordinators WITHOUT collecting them first
-    # (deliberately — see `Fathom.Bench.fanout/1`; it is the only thing that measures whether the
-    # coordinators' `fullsweep_after: 0` actually reclaims retained heap). The cost is precision:
-    # measured 2026-08-10, it moves ~30% in EITHER direction on changes that cannot affect
-    # footprint, reproduced on demand by adding code that runs strictly after its own sample; it
-    # has a 12× lifetime spread; and it can return NEGATIVE. At 20% it spent two sessions blocking
-    # a change that was later proven to cost nothing, which is worse than not gating it at all.
-    # 50% still catches a genuine density collapse. The tight per-shard bound is the pair below.
-    {:fanout_kb_per_shard, :higher_worse, 50},
+    # WATCH-ONLY since 2026-08-26: reported every run, never blocks, never moves the verdict.
+    # `Fathom.Bench.fanout/1`'s own docstring called it "a poor threshold to gate on and a good
+    # signal to watch" when it landed; this is that sentence applied to the gate.
+    #
+    # It went 20% → 50% → watch, each step after the band was measured and found to sit UNDER the
+    # noise. The number that settles it: across `perf_history.jsonl`, runs sharing a commit AND a
+    # dirty flag — identical trees — span 3.81–5.67 (48%), 4.01–6.62 (46%), 3.58–5.57 (49%) and
+    # 3.70–5.85 (56%). The 50% band was below its own same-tree spread, so it kept refusing clean
+    # commits; it did so twice on 2026-08-25 alone, once at +52.7% and once at +57.3%, and both
+    # were bimodality rather than code.
+    #
+    # A DAILY MEDIAN MAKES THIS LOOK LIKE A STEP FUNCTION, which is the trap. Runs on one day
+    # cluster together (one build, one machine state, so 200 coordinator heaps tip a geometric size
+    # class together) and the cluster flips across days — reading ~3.8 through 2026-08-09, ~5.6
+    # through 08-21, ~3.8 after. Those are not code steps: 5bf86f2 on 08-02 already spanned
+    # 3.81–5.67 on ONE tree, eight days before the earliest "step".
+    #
+    # It stays in the report because it is still the only reading of whether `fullsweep_after: 0`
+    # reclaims retained heap. Read it against the pair below, per `Fathom.Bench.fanout_gc/1`:
+    # fanout up with `fanout_gc` flat is churn or a size-class tip, both up is a real regression.
+    # Through the whole month above, `fanout_gc` held 3.6–3.7 daily while this swung 2.5–6.6.
+    {:fanout_kb_per_shard, :higher_worse, :watch},
     # The steady-state floor — `fanout` with the coordinators collected, so open-path churn is out
     # of it. Gated at the default 20% because this is the reading meant to be believed: `fanout`
     # up with this flat is churn, both up is a real retained-heap regression. Early and on few
@@ -149,6 +160,12 @@ defmodule Fathom.Bench.Gate do
 
   where each `delta` is `%{metric, parent, new, pct, skipped, reason}` and `pct` is
   the regression percent (positive = worse).
+
+  `worst` is the worst GATING metric. A metric declared `:watch` in `@metrics` still appears in
+  `deltas` and in the report, but is excluded from `worst` and from `blocked` — so it can move
+  arbitrarily without changing the verdict. Do not reintroduce it into `worst` as a compromise:
+  `commit_with_bench.sh` aborts on a warn when stdin is not a TTY, which makes a warn as final as
+  a block for anything running unattended.
   """
   @spec compare(map(), map(), number(), number()) :: map()
   def compare(parent, new, block \\ 20, warn \\ 20) do
@@ -162,11 +179,20 @@ defmodule Fathom.Bench.Gate do
       end)
 
     comparable = Enum.reject(deltas, & &1.skipped)
-    worst = comparable |> Enum.map(& &1.pct) |> max_or(0.0)
-    blocked = Enum.filter(comparable, &(&1.pct >= &1.block))
+
+    # A `:watch` metric is reported and then excluded from BOTH the block list and `worst`, so it
+    # cannot reach the verdict by either route. Excluding it from `worst` is not cosmetic:
+    # `scripts/commit_with_bench.sh` PROMPTS on a warn and aborts outright when stdin is not a TTY,
+    # so a watch-only metric left in `worst` would still stop an unattended commit — the exact
+    # failure the demotion exists to end, arriving one door down.
+    gating = Enum.reject(comparable, &(&1.block == :watch))
+    worst = gating |> Enum.map(& &1.pct) |> max_or(0.0)
+    blocked = Enum.filter(gating, &(&1.pct >= &1.block))
 
     verdict =
       cond do
+        # `comparable`, not `gating`: a run where the only readable metric is a watch-only one has
+        # data, and reporting it as `:no_data` would claim the bench did not run.
         comparable == [] -> :no_data
         blocked != [] -> :block
         worst > warn -> :warn
@@ -176,9 +202,11 @@ defmodule Fathom.Bench.Gate do
     %{verdict: verdict, worst: worst, deltas: deltas, blocked: Enum.map(blocked, & &1.metric)}
   end
 
-  # A metric may carry its OWN block threshold. Not a loophole — a threshold has to sit above the
-  # metric's measured noise floor or it reports noise as regression, and 20% was chosen for
-  # single-threaded p50s. See the tail entries in @metrics for the measured basis.
+  # A metric may carry its OWN block threshold, or the atom `:watch` for "report it, never gate on
+  # it". Not a loophole — a threshold has to sit above the metric's measured noise floor or it
+  # reports noise as regression, and 20% was chosen for single-threaded p50s. `:watch` is the
+  # honest end of that scale: a metric whose same-tree spread exceeds any band worth setting is one
+  # a human reads, not one a script decides on. See the @metrics entries for the measured basis.
   defp normalize({metric, dir}, default_block), do: {metric, dir, default_block}
   defp normalize({metric, dir, block}, _default_block), do: {metric, dir, block}
 
@@ -195,7 +223,13 @@ defmodule Fathom.Bench.Gate do
           "  #{name} skipped (#{d.reason})"
         else
           own = Map.get(d, :block, block)
-          note = if own != block, do: " (block >=#{own}%)", else: ""
+
+          note =
+            case own do
+              :watch -> " (watch only — never gates; read fanout_gc/served)"
+              ^block -> ""
+              n -> " (block >=#{n}%)"
+            end
 
           "  #{name} #{fmt(d.parent)} -> #{fmt(d.new)}   #{signed(d.pct)}%   " <>
             "#{tag(d.pct, own, warn)}#{note}"
@@ -236,6 +270,9 @@ defmodule Fathom.Bench.Gate do
   defp max_or([], default), do: default
   defp max_or(list, _default), do: Enum.max(list)
 
+  # `:watch` first, and it deliberately never renders BLOCK or warn — a row that says "warn" on a
+  # metric the verdict ignored is how a reader concludes the gate is broken.
+  defp tag(_pct, :watch, _warn), do: "watch"
   defp tag(pct, block, _warn) when pct >= block, do: "BLOCK"
   defp tag(pct, _block, warn) when pct > warn, do: "warn"
   defp tag(_pct, _block, _warn), do: "ok"
