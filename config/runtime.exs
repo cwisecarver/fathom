@@ -777,6 +777,25 @@ if secret = System.get_env("REPLICATION_HMAC_SECRET") do
   config :fathom, :replication_hmac_secret, secret
 end
 
+# THE LINEAGE-CARRYING SEED FRAME (expert review 2026-08-24 #12). The second wire-shape gate, and
+# it carries the same two-step contract the signing pair above does, for the same reason.
+#
+# What it fixes: a seed used to ship only the primary's LOCK epoch, but the lock epoch RESETS to 1
+# on every clean idle-drop, drain and handoff, while the stored object's position stamp carries the
+# monotonic LINEAGE. `Promote.fresher?/2` was therefore comparing two different counters, which made
+# promotion inert from a shard's second replicating open onward. With this on the seed ships both.
+#
+# ROLLOUT: deploy the code everywhere FIRST, then set this fleet-wide. A peer one deploy behind has
+# no clause for the new frame code, answers `{:error, :malformed}` and closes that socket — so it
+# stops being seeded for as long as the boundary exists. Landing the code changes nothing on the
+# wire; this flag is what starts emitting the new shape.
+#
+# Leaving it off is not a regression, it is today: `fresher?/2` sees `lineage: 0` on every replica
+# and refuses to rank it, exactly as before the fix landed.
+if System.get_env("REPLICATION_LINEAGE_WIRE") in ~w(true 1) do
+  config :fathom, :replication_lineage_wire, true
+end
+
 # Where the follower set comes from. `static` (default) is the hand-maintained
 # REPLICATION_FOLLOWERS list; `roster` derives it from the addresses nodes publish to
 # `rebalancer_nodes`, refreshed on a timer, so adding or replacing a node stops meaning "edit every

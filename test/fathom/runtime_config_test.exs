@@ -95,4 +95,37 @@ defmodule Fathom.RuntimeConfigTest do
       end
     end
   end
+
+  # The lineage-carrying seed frame's gate (expert review 2026-08-24 #12) had the same shape of hole
+  # TEMPLATE_SHARD_ID above did, and it is the reason these two tests exist rather than the flag
+  # simply being flipped: `:replication_lineage_wire` was readable only from a config file or
+  # `Application.put_env`, so nothing but the test suite could ever set it. The fix shipped correct
+  # and UNDEPLOYABLE — every other replication knob has an env var, this one did not, so the
+  # documented "deploy everywhere, then turn it on fleet-wide" second step had no way to happen.
+  # Pre-fix the first test fails: the key is never written.
+  test "REPLICATION_LINEAGE_WIRE=true|1 turns on :replication_lineage_wire" do
+    for v <- ["true", "1"] do
+      assert Keyword.get(
+               fathom_config(%{"REPLICATION_LINEAGE_WIRE" => v}),
+               :replication_lineage_wire
+             ) == true,
+             "REPLICATION_LINEAGE_WIRE=#{v} did not enable the lineage seed frame"
+    end
+  end
+
+  test "REPLICATION_LINEAGE_WIRE unset/false/0 leaves the wire gate off (rollout step one)" do
+    # UNWRITTEN, not `false` — the same shape SHARD_LOAD asserts, and here it is a safety property
+    # rather than a style: a peer one deploy behind has no clause for the new frame code and answers
+    # `{:error, :malformed}`, which closes the socket and stops it being seeded. A node that sets
+    # nothing has to stay on the legacy shape for the length of a rolling upgrade.
+    refute Keyword.has_key?(fathom_config(%{}), :replication_lineage_wire)
+
+    for v <- ["false", "0"] do
+      refute Keyword.has_key?(
+               fathom_config(%{"REPLICATION_LINEAGE_WIRE" => v}),
+               :replication_lineage_wire
+             ),
+             "REPLICATION_LINEAGE_WIRE=#{v} should not write the key"
+    end
+  end
 end

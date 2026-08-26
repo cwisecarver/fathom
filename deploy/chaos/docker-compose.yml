@@ -80,6 +80,17 @@ x-fathom-env: &fathom-env
   # shipping its own shards to its own listener, which works but muddies every result.
   REPLICATION_ENABLED: "${REPLICATION_ENABLED:-}"
   REPLICATION_QUORUM: "${REPLICATION_QUORUM:-2}"
+  # The lineage-carrying seed frame (2026-08-24 #12), ON here and OFF in production defaults.
+  #
+  # The flag exists because a peer one deploy behind cannot parse the new frame and closes the
+  # socket, so an operator turns it on only once the code is everywhere. THE RIG HAS NO SUCH
+  # BOUNDARY — `compose up` starts all five nodes from one image — so the mixed-version hazard the
+  # gate protects against cannot occur here, and leaving it off would mean the rig never exercises
+  # the shape production is being told to roll out to.
+  #
+  # Without it `Promote.fresher?/2` sees `lineage: 0` on every replica and refuses to rank it, so
+  # every promotion scenario on this rig silently measures the inert path.
+  REPLICATION_LINEAGE_WIRE: "${REPLICATION_LINEAGE_WIRE:-true}"
   # THE TWO BOUNDS THAT CLOSE THE 1024-TENANT OOM. Left EMPTY so a run exercises the shipped
   # defaults (1 MiB per push, 1 GiB queued per node) — the rig's job is to test what production
   # gets, not a rig-only tuning. Set either to sweep; 0 disables one, which is how you reproduce

@@ -94,6 +94,12 @@ fleet-wide for the length of a rolling upgrade. Leaving the version alone means 
 a query with `{:error, :malformed}` and closes that one short-lived socket, which `Recovery` already
 treats as "no offer". Both are loud; only one also breaks replication.
 
+The lineage-carrying seed frame (2026-08-24 #12) was added the same way, for the third time — a new
+code at `@version 2`, gated on `REPLICATION_LINEAGE_WIRE` so a node emits it only once an operator
+confirms the code is everywhere. Until that flag is on, `fresher?/2` sees `lineage: 0` on every
+replica and refuses to rank it, so promotion stays inert — which is what it already was, not a
+regression.
+
 **Still conditional on one thing:** the recovering node must have `REPLICATION_LISTEN` on, since the
 pull installs through its local replica directory. That matches the documented rollout order, and a
 node that cannot hold a replica could not be a useful survivor for anyone else either.
@@ -243,7 +249,8 @@ because the volume is single-attach and AZ-locked and the survivor is elsewhere.
 
 Note the shape of that sentence — *"the survivor is elsewhere."* Replicating the frames is only half
 an answer to it, because the survivor being elsewhere is also why it may hold no replica of its own.
-Closing the gap takes **both** `REPLICATION_PROMOTE_ON_OPEN` and `REPLICATION_RECOVER_FROM_PEERS`;
+Closing the gap takes `REPLICATION_LINEAGE_WIRE` (without it the comparison is between two different
+counters and never fires) **and** `REPLICATION_PROMOTE_ON_OPEN` **and** `REPLICATION_RECOVER_FROM_PEERS`;
 see [survivor selection](#the-rpo-claim-was-conditional-until-2026-08-12-and-survivor-selection-is-why).
 
 ## Why not resolve the conflict instead (CRDT / OT)

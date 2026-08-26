@@ -255,7 +255,8 @@ defmodule Fathom.Shard.Replication.Protocol do
 
   @doc """
   Whether this node emits the lineage-carrying seed frame (`config :fathom,
-  :replication_lineage_wire`, default **false**).
+  :replication_lineage_wire`, set by `REPLICATION_LINEAGE_WIRE` in `config/runtime.exs`, default
+  **false**).
 
   Off by default ON PURPOSE, and it is the second step of a two-step rollout: a peer one deploy
   behind has no clause for `@seed_begin_lin` and answers `{:error, :malformed}`, which closes that
