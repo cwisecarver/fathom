@@ -199,7 +199,8 @@ every arm:
 because an earlier design — the same feature, planning and shipping in parallel rather than
 re-entering the commit path — measured **2,697 txn/s / 2,486 errors at 512**, i.e. -15% throughput
 and 35x the errors. The difference is entirely in routing through the existing serialization instead
-of alongside it (`docs/../tasks/todo.md` carries the four-attempt history).
+of alongside it — four designs were tried before that landed, and the three that shipped
+alongside the commit path rather than through it all measured worse.
 
 One trap it also settles: 1024's error count varies run to run at saturation (12,042 on 2026-08-18,
 16,848 and 17,790 here). **Do not read a single 1024 error count as a regression** — the control arm

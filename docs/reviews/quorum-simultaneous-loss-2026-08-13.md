@@ -1,7 +1,8 @@
 # Quorum under simultaneous multi-node loss — 2026-08-13
 
 The last untested edge from the 2026-08-12 replication matrix
-(`chaos-replication-matrix-2026-08-12.md`), and the top open item in `tasks/todo.md`.
+(`chaos-replication-matrix-2026-08-12.md`), and the top open item on the project's list at
+the time.
 
 **Result: the boundary holds on both sides, and the fast-fail is real.** Losing the largest
 survivable number of followers at the same instant costs nothing measurable; losing one more fails

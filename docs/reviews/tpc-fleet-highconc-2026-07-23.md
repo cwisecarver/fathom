@@ -71,7 +71,7 @@ past 256), fresh namespaces per level:
   with 18.3% stale-keepalive reconnects and 10s p95 stalls; a rerun timed out at 10 min) —
   while the same 256-client width runs clean inside the 512/2-proc and 1024/4-proc levels,
   and 256 solo ran clean on the HOST path earlier the same night (1,026 tps, 0 errs).
-  Unattributed; follow-up in tasks/todo.md. Suspects: the tighter in-network RTT pushing
+  Unattributed, and still open as of 2026-08-26. Suspects: the tighter in-network RTT pushing
   one GIL past its request-loop saturation point (128/proc stays well clear), rig state
   at that sweep position, or a scheduling interaction unique to one saturated python
   process. Until it's understood, the driving rule tightens to **≤128 clients per driver
