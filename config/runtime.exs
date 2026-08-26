@@ -329,6 +329,22 @@ if n = System.get_env("RECONCILE_BATCH_SIZE") do
   config :fathom, :reconcile_batch_size, String.to_integer(n)
 end
 
+# READ-ONLY restore drill: per-run sample size. Pulls each sampled shard's stored object,
+# `quick_check`s it, and compares its `PRAGMA user_version` against the directory — one GET per
+# sample, no copy. Unset ⇒ off, which is the shipped default.
+#
+# IT HAD NO ENV WIRING UNTIL 2026-08-26, the same hole `:replication_lineage_wire` and
+# `:template_shard_id` each had: `:restore_drill_sample` was settable only from a config file, so a
+# RELEASE could not turn the drill on at all — while `docs/configuration.md` already referred to
+# `RESTORE_DRILL_SAMPLE` by name inside another knob's description, as if it existed. It is also
+# the only thing that populates `stamp_drift` / `stamp_drift_checked` in `Migrator.status/0`
+# (expert review 2026-08-24 #25), so with it unreachable that whole signal read a permanent zero —
+# and a zero there is indistinguishable from "nobody looked", which is why the denominator is
+# published alongside it.
+if n = env_int.("RESTORE_DRILL_SAMPLE") do
+  config :fathom, :restore_drill_sample, n
+end
+
 # Full restore drill (expert review 2026-08-01 #48): per-run sample size for the drill that
 # actually RESTORES — forks each sampled shard to a scratch tenant, compares row counts, drops it.
 # Separate from RESTORE_DRILL_SAMPLE and much smaller: a fork is a full object copy, so this costs

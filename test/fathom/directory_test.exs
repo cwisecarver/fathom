@@ -125,6 +125,49 @@ defmodule Fathom.DirectoryTest do
       assert :ok = Directory.clear_retained_version("no-such-shard", 1)
     end
 
+    # THE THREE-PLACE STAMP (expert review 2026-08-24 #25). `count_laggards/1` reads
+    # `schema_version` alone, so a shard whose stored FILE is behind while its ROW says HEAD is
+    # counted as converged — and `Migrator.status/0` publishes exactly that boolean to a release
+    # gate. `RestoreDrillJob` already detects the disagreement and records it here; until now
+    # nothing read it back out.
+    test "count_stamp_drift counts active shards whose last drill found a mismatch" do
+      {:ok, _} = Directory.resolve("drifted")
+      {:ok, _} = Directory.resolve("clean")
+
+      assert Directory.count_stamp_drift() == 0
+      assert Directory.stamp_drift_checked() == 0
+
+      assert Directory.record_verification("drifted", "schema_mismatch") == 1
+      assert Directory.record_verification("clean", "ok") == 1
+
+      assert Directory.count_stamp_drift() == 1
+      assert Directory.stamp_drift_checked() == 2
+    end
+
+    # THE DENOMINATOR IS NOT DECORATION. The drill is off by default and samples, so a bare
+    # `stamp_drift: 0` is ambiguous between "checked, clean" and "nobody has looked" — opposite
+    # facts for anyone deciding whether to ship. `stamp_drift_checked` is what separates them.
+    test "stamp_drift_checked distinguishes a clean fleet from an unchecked one" do
+      {:ok, _} = Directory.resolve("never-drilled")
+
+      assert Directory.count_stamp_drift() == 0
+      assert Directory.stamp_drift_checked() == 0, "an undrilled shard must not read as checked"
+
+      assert Directory.record_verification("never-drilled", "ok") == 1
+      assert Directory.stamp_drift_checked() == 1
+    end
+
+    # Quarantined and deleted rows are not the fleet a release ships to, and counting them would
+    # make the drift number grow with unrelated failures.
+    test "count_stamp_drift ignores non-active shards" do
+      {:ok, _} = Directory.resolve("quarantined")
+      assert Directory.record_verification("quarantined", "schema_mismatch") == 1
+      assert Directory.count_stamp_drift() == 1
+
+      {:ok, _} = Directory.mark_failed("quarantined")
+      assert Directory.count_stamp_drift() == 0
+    end
+
     test "mark_migrating / mark_failed set status" do
       assert {:ok, %Shard{status: "migrating"}} = Directory.mark_migrating("acme")
       assert {:ok, %Shard{status: "migration_failed"}} = Directory.mark_failed("acme")

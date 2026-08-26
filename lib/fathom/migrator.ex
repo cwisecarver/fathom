@@ -618,7 +618,13 @@ defmodule Fathom.Migrator do
           review_blocks: [map()],
           rate_per_hour: non_neg_integer(),
           eta_seconds: integer() | nil,
-          stalled: non_neg_integer()
+          stalled: non_neg_integer(),
+          # Added with the fields, not after them. This exact spec is the worked example in
+          # AGENTS.md § Typing of a stale declaration on a published shape: `review_blocks` was
+          # added to the code and to every caller and never here, and dialyzer's answer to a closed
+          # map that omits a key it can see being written is to call whole paths unreachable.
+          stamp_drift: non_neg_integer(),
+          stamp_drift_checked: non_neg_integer()
         }
   def status do
     head = head()
@@ -638,7 +644,23 @@ defmodule Fathom.Migrator do
       review_blocks: Enum.map(pending_review(), &review_block/1),
       rate_per_hour: rate,
       eta_seconds: eta_seconds(laggards, rate),
-      stalled: stalled_count()
+      stalled: stalled_count(),
+      # THE THREE-PLACE STAMP, published beside `converged` rather than folded into it (expert
+      # review 2026-08-24 #25). `laggards` — and therefore `converged` — reads `schema_version`
+      # alone, so a shard whose stored FILE is behind while its ROW says HEAD counts as converged,
+      # and a release gate on this endpoint ships against shards that are not at HEAD.
+      #
+      # NOT folded into `converged`, for two separate reasons and both matter. It is a published
+      # control-plane field, and the note above on `pending_review` records what changing one costs.
+      # More importantly `last_verify_status` is POINT-IN-TIME: a shard repaired since its last
+      # drill still carries the old status, so a boolean gate driven by it would block deploys on
+      # stale evidence. A caller that wants to gate on drift can, explicitly.
+      #
+      # `stamp_drift_checked` is the denominator and is not optional decoration: the drill is OFF by
+      # default and samples, so `stamp_drift: 0` against `stamp_drift_checked: 0` means "nobody has
+      # looked", which is the opposite of what a bare zero suggests.
+      stamp_drift: Directory.count_stamp_drift(),
+      stamp_drift_checked: Directory.stamp_drift_checked()
     }
   end
 

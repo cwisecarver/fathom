@@ -96,6 +96,33 @@ defmodule Fathom.RuntimeConfigTest do
     end
   end
 
+  # The read-only restore drill's sample size (expert review 2026-08-24 #25). Same hole
+  # TEMPLATE_SHARD_ID and REPLICATION_LINEAGE_WIRE each had — `:restore_drill_sample` was settable
+  # only from a config file, so a RELEASE could not turn the drill on — and here it was load-bearing
+  # twice over: the drill is the ONLY thing that populates `stamp_drift` / `stamp_drift_checked` in
+  # `Migrator.status/0`, so the signal read a permanent zero on every deployed node. Pre-fix the
+  # first assertion fails: the key is never written.
+  test "RESTORE_DRILL_SAMPLE sets :restore_drill_sample (the release-reachable drill knob)" do
+    assert Keyword.get(fathom_config(%{"RESTORE_DRILL_SAMPLE" => "25"}), :restore_drill_sample) ==
+             25
+
+    # Unset leaves it unwritten, so the compiled default (off) stands — the drill costs a GET per
+    # sample and must stay opt-in.
+    refute Keyword.has_key?(fathom_config(%{}), :restore_drill_sample)
+
+    # `env_int` rejects zero and garbage rather than writing them: `0` would be a sample size that
+    # runs the cron to do nothing, which looks configured and is not.
+    refute Keyword.has_key?(
+             fathom_config(%{"RESTORE_DRILL_SAMPLE" => "0"}),
+             :restore_drill_sample
+           )
+
+    refute Keyword.has_key?(
+             fathom_config(%{"RESTORE_DRILL_SAMPLE" => "lots"}),
+             :restore_drill_sample
+           )
+  end
+
   # The three A2 gates that default ON (2026-08-25). They read through `env_bool`, which is
   # TRI-STATE, and that is the whole point of these tests.
   #

@@ -24,6 +24,27 @@ The same schema version `N` is recorded three times, each for a different job:
 
 That third stamp is load-bearing: it's what makes "which of my millions of shards still need migrating?" a cheap question (`Fathom.Directory.laggards/2`).
 
+**And it is the one that can lie.** `laggards/2` reads `schema_version` alone, so a shard whose
+stored *file* is behind while its Postgres row says HEAD is counted as converged — which
+`Migrator.status/0` publishes as `converged: true`, and `GET /api/migrations/status` hands to a
+release gate. A directory row rolled back by a Postgres PITR, or a cutover transaction that failed
+after the file was stamped, produces exactly that.
+
+Since 2026-08-26 `status/0` also publishes **`stamp_drift`** — active shards whose last restore
+drill found the object's `user_version` disagreeing with the row — and **`stamp_drift_checked`**,
+how many have ever been drilled. Read them together, because the drill is off by default and
+samples: `stamp_drift: 0` with `stamp_drift_checked: 0` means *nobody has looked*, not *the fleet is
+clean*. Turn `RESTORE_DRILL_SAMPLE` on to get a real denominator.
+
+They sit **beside** `converged` rather than inside it on purpose. `last_verify_status` is
+point-in-time — a shard repaired since its last drill still carries the old status — so folding it
+into the boolean would block deploys on stale evidence. Gate on it explicitly if you want to.
+
+Two gaps remain, both open: nothing *repairs* a divergence without a human running
+`mix fathom.directory` (that sweep pulls every shard's object, so its cadence is a real S3 spend),
+and **nothing compares `django_migrations` against `PRAGMA user_version` at all** — the source of
+truth and the gate are never checked against each other.
+
 ## Blue/green, per shard — a pointer flip, never in-place
 
 The migration copies to a **fresh file** and flips a pointer; it never mutates a live shard in place.

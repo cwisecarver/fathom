@@ -103,6 +103,44 @@ defmodule Fathom.Migrator.RolloutRateTest do
       refute status.converged
     end
 
+    # THE THREE-PLACE STAMP, published beside `converged` (expert review 2026-08-24 #25).
+    #
+    # `laggards` — and therefore `converged` — reads `schema_version` alone, so a shard whose stored
+    # FILE is behind while its ROW says HEAD is counted as converged. `GET /api/migrations/status`
+    # is a thin wrapper over this map, so a release gate reading it ships app code against shards
+    # that are not at HEAD. `RestoreDrillJob` already detects the disagreement; this is where the
+    # detection becomes visible.
+    test "status/0 publishes stamp drift beside converged, with its denominator" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
+      shard_at_head!("drift_a", 1)
+      shard_at_head!("drift_b", 1)
+
+      status = Migrator.status()
+
+      assert status.converged,
+             "the fixture must be converged BY schema_version, which is the trap"
+
+      assert status.stamp_drift == 0
+      assert status.stamp_drift_checked == 0
+
+      # A drill finds one of them disagreeing with its own stored file.
+      assert Directory.record_verification("drift_a", "schema_mismatch") == 1
+      assert Directory.record_verification("drift_b", "ok") == 1
+
+      status = Migrator.status()
+
+      assert status.stamp_drift == 1
+      assert status.stamp_drift_checked == 2
+
+      # DELIBERATELY STILL CONVERGED, and this assertion is the design decision, not an oversight.
+      # `last_verify_status` is point-in-time: a shard repaired since its drill still carries the
+      # old status, so folding it into a boolean release gate would block deploys on stale
+      # evidence. `converged` keeps its published meaning and the drift is reported alongside for a
+      # caller to weigh explicitly.
+      assert status.converged,
+             "converged must keep its published meaning; drift is reported, not folded in"
+    end
+
     # The whole point of nil: a rollout that is stuck has no finish time. Reporting a huge integer
     # (or :infinity) puts a number on a dashboard that reads as progress.
     test "ETA is nil, not a large number, when the rollout is stalled" do

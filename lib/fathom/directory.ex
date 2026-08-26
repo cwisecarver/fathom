@@ -757,6 +757,51 @@ defmodule Fathom.Directory do
     Repo.aggregate(from(s in Shard, where: s.status == "migration_failed"), :count)
   end
 
+  @doc """
+  Shards whose last restore drill found their stored object's `PRAGMA user_version` disagreeing with
+  this row's `schema_version` — the three-place stamp having drifted (expert review 2026-08-24 #25).
+
+  **THE NUMBER THIS SITS NEXT TO IS THE REASON IT EXISTS.** `count_laggards/1` reads
+  `schema_version` alone, and `Migrator.status/0` publishes `converged: laggards == 0` from it. A
+  shard whose FILE is behind while its ROW says HEAD is therefore counted as converged, and a
+  release gate reading that endpoint ships app code against shards that are not at HEAD. This is the
+  same table's own record of the opposite being true.
+
+  **A SAMPLE, NOT A CENSUS, AND IT MUST BE READ THAT WAY.** `RestoreDrillJob` is off by default and
+  samples the least-recently-verified rows per run, so `0` means "no drift among the shards drilled
+  so far", never "no drift". `stamp_drift_checked/0` returns how many rows have ever been drilled,
+  which is what makes the zero interpretable — a zero against a checked count of zero says nothing
+  at all.
+
+  **POINT-IN-TIME, which is why it does not drive `converged`.** `last_verify_status` records what a
+  drill found when it ran; a shard repaired since then still carries the old status until it is
+  drilled again. Feeding that into a boolean release gate would block deploys on stale evidence, so
+  the count is published beside `converged` for a human (or an explicit gate) to weigh, not folded
+  into it.
+  """
+  @spec count_stamp_drift() :: non_neg_integer()
+  def count_stamp_drift do
+    Repo.aggregate(
+      from(s in Shard, where: s.status == "active" and s.last_verify_status == "schema_mismatch"),
+      :count
+    )
+  end
+
+  @doc """
+  How many active shards have ever been restore-drilled — the denominator that makes
+  `count_stamp_drift/0` readable (expert review 2026-08-24 #25).
+
+  Without it a `stamp_drift: 0` is ambiguous between "checked, clean" and "never checked", and those
+  are opposite facts for anyone deciding whether to ship.
+  """
+  @spec stamp_drift_checked() :: non_neg_integer()
+  def stamp_drift_checked do
+    Repo.aggregate(
+      from(s in Shard, where: s.status == "active" and not is_nil(s.last_verified_at)),
+      :count
+    )
+  end
+
   @doc "The quarantined (`migration_failed`) shards."
   @spec failed_shards() :: [Shard.t()]
   def failed_shards do
