@@ -51,8 +51,10 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
   """
   use ExUnit.Case, async: false
 
+  alias Fathom.Shard.Replication.Fleet
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Promote
+  alias Fathom.Shard.Replication.Recovery
   alias Fathom.Shard.Storage
   alias Fathom.ShardExecutor
   alias Fathom.Shards
@@ -475,12 +477,36 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
   # missing listener; and `open_lineage/1` cannot confound it, because its own `object_head` read is
   # behind `Fleet.replicating?/0`, which is off here.
   #
+  # THE PEER SET IS PINNED, NOT INHERITED, and that is not defensive tidiness — it is the bug this
+  # test shipped with. `Recovery.peers/0` reads `Fleet.running/0`, which is `:persistent_term` and
+  # therefore OUTLIVES the Fleet supervisor that wrote it (`Fleet.init/1` says so: it clears on
+  # start precisely because nothing clears on stop). So an earlier replication test leaves three
+  # dead shippers published fleet-wide for the rest of the run, `fleet_reachable?/1` is true, the
+  # fleet branch runs, and this test failed on CI while passing alone and passing the same suite
+  # under a different seed. Publishing an empty set and restoring it is the deterministic staging.
+  #
   # Probed: with the `nothing_to_promote?/1` branch deleted, this fails on the `refute_receive`.
   test "a cold open with no replica and nobody to ask never reads the object head", ctx do
     %{id: id} = ctx
     Application.put_env(:fathom, :replication_promote_on_open, true)
     Application.put_env(:fathom, :replication_recover_from_peers, true)
     Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    prev_running = Fleet.running()
+    prev_followers = Application.get_env(:fathom, :replication_followers)
+    Fleet.publish([])
+    Application.put_env(:fathom, :replication_followers, [])
+
+    on_exit(fn ->
+      Fleet.publish(prev_running)
+
+      if is_nil(prev_followers),
+        do: Application.delete_env(:fathom, :replication_followers),
+        else: Application.put_env(:fathom, :replication_followers, prev_followers)
+    end)
+
+    # Assert the precondition rather than assuming it — the whole point of the block above.
+    refute Recovery.fleet_reachable?(), "the peer set was not actually empty"
 
     {conn, coordinator} = build_shard(id, 3, 3)
     tear_down_primary(id, conn, coordinator)
