@@ -80,6 +80,14 @@ defmodule Fathom.Shard.Replication.Membership do
 
   @impl true
   def init(_opts) do
+    # TRAPPING EXITS IS WHAT MAKES `terminate/2` BELOW RUN AT ALL. A supervisor shutting a child
+    # down sends an exit signal, and a GenServer that does not trap it dies without its terminate
+    # callback — so the published set outlived the tree that owned it. Safe here specifically
+    # because this process links to nothing but its supervisor: shippers are linked to the shipper
+    # `DynamicSupervisor`, not to us, and the poll is a `send_after`, not a link. So there is no
+    # stray `{:EXIT, _, _}` for the trap to swallow.
+    Process.flag(:trap_exit, true)
+
     # Resolve synchronously before the supervisor reports started: `Fleet.children/0` places this
     # ahead of nothing in particular, but a commit arriving before the first swap would see an
     # empty shipper list and raise `q >= n`. Boot is also the one place a too-small set must be
@@ -116,6 +124,35 @@ defmodule Fathom.Shard.Replication.Membership do
 
     {:noreply, schedule(next)}
   end
+
+  # UNPUBLISH ON AN ORDERLY SHUTDOWN, because this process is the only thing that ever publishes a
+  # NON-EMPTY set (`Fleet.init/1` publishes `[]`), so it is the one that should retract it.
+  #
+  # `:persistent_term` outlives the tree that wrote it. `Fleet.init/1` clears on START and says why
+  # — "a Fleet restart that inherited the previous incarnation's names would hand the commit path
+  # shipper processes that no longer exist" — but nothing cleared on STOP, so a stopped Fleet left
+  # dead shipper names published for anything that read `shippers/0` or `running/0` afterwards.
+  # In the suite that made `Recovery.peers/0` non-empty for every test following a replication test,
+  # which silently routed promote-on-open through the fleet branch (caught on CI, 2026-08-26).
+  #
+  # THE REASON GUARD IS THE WHOLE SAFETY OF THIS, and the obvious version without it is a bug:
+  # `terminate/2` also runs when a callback RAISES, and blanking the published set on a crash would
+  # empty `shippers/0` on the commit path while this process restarts — `n` drops to 0 and
+  # `q >= n` raises inside live tenant writes, the exact failure `validate_quorum!/0` exists to keep
+  # off that path. A crash must leave the previous set standing; `init/1` republishes it moments
+  # later. Only a deliberate teardown retracts.
+  #
+  # Rare by construction, which is what makes the write affordable: a `:persistent_term` write
+  # schedules a literal-area scan across every process on the node, and `Fathom.Shard.Replication.Budget`
+  # records that per-shipper-incarnation writes had to be moved to ETS for exactly that reason. This
+  # fires once per Fleet shutdown — no more often than the membership swap that published it.
+  @impl true
+  def terminate(reason, _state) when reason in [:normal, :shutdown] do
+    Fleet.publish([])
+  end
+
+  def terminate({:shutdown, _}, _state), do: Fleet.publish([])
+  def terminate(_crash, _state), do: :ok
 
   # Only the roster source changes underneath us; a static list cannot, so polling it would be
   # pure noise in the logs and a pointless timer.

@@ -168,6 +168,51 @@ defmodule Fathom.Shard.ReplicationMembershipTest do
     end
   end
 
+  # `:persistent_term` outlives the tree that wrote it, and until 2026-08-26 nothing retracted the
+  # published set when Fleet stopped. `Fleet.init/1` clears on START and says why; there was no
+  # matching clear on STOP, so a stopped Fleet left dead shipper names published for every later
+  # reader of `shippers/0` and `running/0`.
+  #
+  # It surfaced as a CI failure two commits away from here: `Recovery.peers/0` was non-empty for
+  # every test that followed a replication test, so promote-on-open silently took the fleet branch.
+  # Note this file's own `setup` has published `[]` in `on_exit` all along — a workaround for a leak
+  # nobody had named, which is exactly why the tests in THIS file never saw it.
+  describe "shutdown retracts the published set" do
+    test "an orderly stop clears both keys" do
+      start_membership!()
+      assert length(Fleet.shippers()) == 3
+      assert length(Fleet.running()) == 3
+
+      :ok = stop_supervised(Fleet)
+
+      assert Fleet.running() == [], "running/0 still names shippers from a stopped Fleet"
+      assert Fleet.shippers() == [], "shippers/0 still names shippers from a stopped Fleet"
+    end
+
+    # THE GUARD, and the reason `terminate/2` is not simply "clear it". `terminate/2` also runs when
+    # a callback raises, and a crash blanks nothing on purpose: emptying `shippers/0` mid-flight
+    # drops `n` to 0 while this process restarts, and `q >= n` raises INSIDE a tenant's write — the
+    # failure `validate_quorum!/0` exists to keep off the commit path. `init/1` republishes the set
+    # moments later, so leaving it standing is both safe and correct.
+    #
+    # Driven by calling the callback directly rather than by crashing the live process: a real crash
+    # is restarted by the supervisor, which republishes, so the assertion would be racing its own
+    # recovery and would pass whether or not the guard existed.
+    test "a crash reason leaves the set standing; only a deliberate teardown retracts" do
+      start_membership!()
+      published = Fleet.running()
+      assert length(published) == 3
+
+      assert Membership.terminate(:boom, %{}) == :ok
+
+      assert Fleet.running() == published,
+             "a crash retracted the set and would strand live commits"
+
+      assert Membership.terminate({:shutdown, :db_connection_closed}, %{}) == :ok
+      assert Fleet.running() == [], "a {:shutdown, reason} teardown should retract"
+    end
+  end
+
   describe "roster source" do
     setup do
       Application.put_env(:fathom, :replication_membership, :roster)
