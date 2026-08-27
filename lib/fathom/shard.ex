@@ -1886,17 +1886,27 @@ defmodule Fathom.Shard do
     # flush_and_drop reads the write counter (unflushed?/1) to decide whether to upload, so forget
     # the counter AFTER it — forgetting first would zero the count and skip a dirty shard's flush.
     flush_and_drop_unless_tombstoned(state)
-    # THE FENCE COMES DOWN AFTER THE FLUSH, NOT BEFORE IT (expert review 2026-08-24 #6, found
-    # independently by three panels). This `forget` used to sit seven lines up, above
-    # `flush_and_drop` — so the fence published at the top of this clause covered only
-    # `settle_flush_task/1`, `settle_waiters/2` and three ETS deletes, and was DOWN for the entire
-    # checkpoint + VACUUM INTO + full-object PUT it was added to cover. That window is budgeted up
-    # to `:shard_shutdown_ms` and is seconds at real S3 latency, on every rolling deploy / SIGTERM
-    # / `Shards.stop` of a busy shard — i.e. the fence was off for precisely the interval named in
-    # its own comment. Clearing it here at all is belt-and-braces: `open_with_lease/8` clears it
-    # unconditionally on the next successful acquire (see the note above), which is what covers a
-    # brutal kill that never reaches this line.
-    Fathom.Shard.WriteFence.forget(state.id)
+    # THE FENCE IS NOT LIFTED HERE AT ALL (expert review 2026-08-26 #6).
+    #
+    # 2026-08-24 #6 moved this `forget` down so the fence covered the checkpoint + VACUUM INTO +
+    # full-object PUT rather than only three ETS deletes. Correct as far as it went — but even
+    # here it is too early. `flush_and_drop/1` RELEASES THE LEASE, and `terminate/2` has not
+    # returned, so per `drop_local_unless_serving/1` the streams have not learned the coordinator
+    # is dying. `fenced?/1` is a node-global ETS read consulted per statement, so the instant this
+    # ran, still-live streams could ACK writes again — on a shard this node no longer holds a lease
+    # for, into a file the next open will quarantine as a fork. Acknowledged, unrecoverable, and
+    # outside the RPO contract docs/durability.md advertises.
+    #
+    # Clearing it here was only ever belt-and-braces, as the comment it replaces said: the fence is
+    # cleared unconditionally by `open_with_lease/8` on the next successful acquire, which is also
+    # what covers a brutal kill that never reaches this line. So the belt is removed and the braces
+    # do the job.
+    #
+    # Residual cost is one leaked ETS row for a shard this node never re-opens — bounded by the
+    # open-shard count, reclaimed on the next open of that shard, and cheap next to acking a write
+    # into an unowned file. Do NOT "tidy" this back: the sibling `lease_lost: true` clause is safe
+    # doing its own cleanup only because it RENAMES the file first, so a late write lands in an
+    # already-quarantined inode. This clause has no such protection.
     WriteCounter.forget(state.id)
     FlushWatermark.forget(state.id)
     :ok

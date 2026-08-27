@@ -910,11 +910,38 @@ defmodule Fathom.ShardDurabilityTest do
 
     assert_receive {:fenced_during_flush, true}, 5_000
 
-    # …and it comes down afterwards. Belt-and-braces (the next `open_with_lease/8` lifts it
-    # unconditionally), but leaving it set here would be a per-tenant write outage until then.
+    # THIS ASSERTION USED TO BE ITS OPPOSITE, and the reversal is the point of expert review
+    # 2026-08-26 #6.
+    #
+    # It previously read `refute WriteFence.fenced?(shard)` — "the fence comes down afterwards" —
+    # with the note that leaving it set "would be a per-tenant write outage until the next
+    # acquire". That clear is too early, and its own comment already called it belt-and-braces:
+    # `flush_and_drop/1` RELEASES THE LEASE, and terminate/2 has not returned, so the streams have
+    # not learned the coordinator is dying. `fenced?/1` is a node-global ETS read consulted per
+    # statement, so the instant the fence came down, still-live streams could ACK writes again —
+    # on a shard this node no longer holds a lease for, into a file the next open quarantines as a
+    # fork. Acknowledged, unrecoverable, outside the RPO contract.
+    #
+    # The feared outage does not exist. `open_with_lease/8` calls `WriteFence.unfence/1`
+    # UNCONDITIONALLY on every successful acquire, and a request for this shard on this node must
+    # go through a coordinator open before any statement runs — so the fence is lifted as part of
+    # serving the next request, not left to strand the tenant. What is left behind meanwhile is one
+    # ETS row.
+    assert WriteFence.fenced?(shard),
+           "the fence was lifted while the streams it fences are still alive and the lease has " <>
+             "already been released — writes acked in that window are unowned and unrecoverable"
+
+    # And the next successful open clears it, which is what makes leaving it up safe.
+    # `:sys.get_state/1` to sync: `ensure/1` returns as soon as the process starts, but
+    # `open_with_lease/8` runs in `handle_continue(:open, …)`, so the unfence has not happened yet
+    # when ensure returns. (Asserting without this sync fails, which is how the race was found.)
+    {:ok, reopened} = Shards.ensure(shard)
+    _ = :sys.get_state(reopened)
+
     refute WriteFence.fenced?(shard),
-           "the shutdown fence was never lifted; every write to this tenant 503s until the " <>
-             "next successful lease acquire"
+           "open_with_lease/8 did not lift the stale fence, so the tenant really would 503 " <>
+             "until a node restart — that is the outage the terminate-time clear was protecting " <>
+             "against, and it must be covered here instead"
   end
 
   # Expert review #17: after a failover/LB flip re-homes a burst of shards, their phase-aligned
