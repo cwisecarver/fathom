@@ -75,7 +75,7 @@ defmodule Fathom.Bench.Gate do
     {:served_kb_per_shard, :higher_worse},
     {:served_binary_kb_per_shard, :higher_worse},
     # CONTENTION, gated from 2026-08-03 (#41.4). Every other gated metric is single-threaded, so
-    # the concurrency-tuned machinery (write_concurrency + decentralized_counters on the ETS
+    # the concurrency-tuned machinery (write_concurrency on the ETS
     # counters, the Lru CA-tree, +SDio, the per-shard coordinator GenServer.call) had no gate at
     # all. `same_shard` is separate on purpose: it bounds ONE coordinator's head-of-line
     # throughput, which a spread measurement averages away.

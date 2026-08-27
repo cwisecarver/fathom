@@ -1164,7 +1164,7 @@ defmodule Fathom.Bench do
   **Nothing in the gate could see contention.** `cold_open`, `copy`, `fanout`, `hrana_rt` and
   `wire_rows` are all serial; the only concurrent bench was `warm_all/1`, inside the opt-in S3
   path. Yet the things most likely to regress under load are all concurrency-tuned:
-  `write_concurrency` + `decentralized_counters` on `ShardLoad`/`ShardLatency`/`WriteCounter`, the
+  `write_concurrency` on `ShardLoad`/`ShardLatency`/`WriteCounter`, the
   `Lru` CA-tree coarsening, `+SDio 10`, and the per-shard coordinator `GenServer.call`. A change
   that serialises any of them leaves every serial p50 flat.
 

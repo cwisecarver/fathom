@@ -22,8 +22,8 @@ defmodule Fathom.ShardLatency do
   Each row is `{shard_id, b0, b1, …}` — a fixed **µs log-scale histogram** whose edges mirror
   the node-wide `fathom_shard_query_duration` buckets (×1000 for µs, plus a `0` floor), so a
   per-shard p99 lines up with the hero chart's node-wide p99. `record/2` bumps one bucket with
-  a single lock-free `:ets.update_counter` (per-shard key, `decentralized_counters` — no
-  cross-shard contention, no process hop), the same hot-path class as `ShardLoad.record_query`.
+  a single lock-free `:ets.update_counter` (per-shard key — no cross-shard contention, no process
+  hop), the same hot-path class as `ShardLoad.record_query`.
   Percentiles are computed **on read** by `Fathom.Rebalancer.Stats.percentile_from_histogram/3`
   (shared with the fleet q/s histogram, given these µs `edges/0`).
 
@@ -172,14 +172,17 @@ defmodule Fathom.ShardLatency do
   @impl true
   def init(_opts) do
     # Same shape as Fathom.ShardLoad: many executing processes bump concurrently, each on its
-    # own shard key; readers (the collector) are off the hot path. decentralized_counters keeps
-    # the concurrent update_counter writes off a shared counter cache line.
+    # own shard key; readers (the collector) are off the hot path.
+    #
+    # NO `decentralized_counters` — see the measurement recorded in `Fathom.Shard.WriteCounter`
+    # (expert review 2026-08-26 #41). It decentralises the TABLE'S internal counters, not user
+    # counter values, so on a per-shard-keyed table it bought nothing and made
+    # `:ets.info(tab, :size)` ~2.4x slower.
     :ets.new(@table, [
       :set,
       :public,
       :named_table,
       write_concurrency: true,
-      decentralized_counters: true,
       read_concurrency: true
     ])
 

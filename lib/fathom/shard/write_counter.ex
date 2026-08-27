@@ -128,14 +128,31 @@ defmodule Fathom.Shard.WriteCounter do
     :persistent_term.put({__MODULE__, :generation}, gen)
 
     # public + write_concurrency: many stream processes bump concurrently, each on its own shard
-    # key; the coordinator reads its own shard's count off the hot path. decentralized_counters
-    # keeps concurrent update_counter writes off a shared counter cache line.
+    # key; the coordinator reads its own shard's count off the hot path.
+    # NO `decentralized_counters` — it does not do what a reader (and this comment, until expert
+    # review 2026-08-26 #41) assumed. The option decentralises the TABLE'S OWN internal counters
+    # (what `:ets.info(tab, :size)` and `:memory` read), NOT user counter values, and its
+    # documented trade-off is that `:ets.info(tab, :size)` gets slower. Both this table and
+    # `Fathom.ShardLoad` are keyed per shard, so concurrent `update_counter` calls already land on
+    # different key locks; there is no shared counter cache line for it to relieve.
+    #
+    # Measured before removing it — N schedulers, 5,000 distinct keys, 40,000 bumps each, 3 trials:
+    #
+    #     update_counter    with 87 / 89 / 91 ms      without 82 / 91 / 92 ms    (indistinguishable)
+    #     info(:size)x2000  with 1297 / 1384 / 1297us without 620 / 492 / 519us  (~2.4x SLOWER with)
+    #
+    # So it bought nothing and cost on the one operation it does affect. `Directory.Recorder` calls
+    # `:ets.info(table, :size)` on a sibling table's shutdown path, which is the shape that would
+    # have paid for it here.
+    #
+    # Do NOT add this to `Fathom.Shard.FlushGate` either, where every writer on the node genuinely
+    # does hit ONE key: it would not help there for the same reason. That contention needs a
+    # wake-on-release queue (review #16), not a table flag.
     :ets.new(@table, [
       :set,
       :public,
       :named_table,
       write_concurrency: true,
-      decentralized_counters: true,
       read_concurrency: true
     ])
 
