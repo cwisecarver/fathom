@@ -86,6 +86,11 @@ defmodule Fathom.Admin.FlushWatermark do
 
   @impl true
   def init(_opts) do
+    # Bumped before the table exists, so a restart is detectable even though the table itself
+    # cannot survive it (see `republish_open_shards/0`).
+    gen = :persistent_term.get({__MODULE__, :generation}, 0) + 1
+    :persistent_term.put({__MODULE__, :generation}, gen)
+
     # Public so the coordinator writes its own row and the collector reads them all off the
     # coordinator mailbox; single-writer-per-key (each coordinator owns its shard's row).
     :ets.new(@table, [
@@ -96,6 +101,43 @@ defmodule Fathom.Admin.FlushWatermark do
       read_concurrency: true
     ])
 
+    if gen > 1, do: republish_open_shards()
+
     {:ok, %{}}
+  end
+
+  # A RESTART USED TO REPORT THE FLEET AS FULLY FLUSHED (expert review 2026-08-26 #17).
+  #
+  # This table is owned by this GenServer and has no `heir`, so a crash + supervisor restart makes
+  # ETS destroy it and `init/1` create a fresh empty one. `Measurements.do_durability/0` REDUCES
+  # over `snapshot/0`, so an absent row contributes nothing — it emitted `dirty_shards: 0,
+  # oldest_age_ms: 0`, i.e. "everything is flushed". And coordinators re-published only at open and
+  # after a SUCCESSFUL flush, so a shard whose flushes are failing — the exact condition the gauge
+  # exists to surface — never re-published and stayed invisible indefinitely.
+  #
+  # `FathomUnflushedAgeHigh` and `FathomManyDirtyShards` read that gauge, so one owner restart
+  # silenced both precisely while a persistent storage failure grew the RPO unbounded.
+  #
+  # Fixed by mirroring `Fathom.Shard.WriteCounter`, which already faced this and solved it the same
+  # way: detect the restart via a persistent_term generation and tell every open coordinator to
+  # re-assert its row. Chosen over an ETS `heir` deliberately — an heir needs a cooperating owner
+  # process to hold the table and hand it back through `{:"ETS-TRANSFER", ...}`, which is real
+  # machinery for a table whose contents can simply be re-published by their owners in
+  # milliseconds. The sibling module's precedent also keeps the two readable together.
+  defp republish_open_shards do
+    require Logger
+
+    Logger.warning(
+      "FlushWatermark restarted with a fresh table; asking open coordinators to re-publish " <>
+        "their watermarks (until they do, the RPO gauge under-reports)"
+    )
+
+    Fathom.ShardRegistry
+    |> Registry.select([{{:_, :"$1", :_}, [], [:"$1"]}])
+    |> Enum.each(&send(&1, :republish_flush_watermark))
+  rescue
+    # The registry itself is down (a whole-plane restart, not just this process) — the
+    # coordinators are dead too and there is nobody to notify.
+    ArgumentError -> :ok
   end
 end

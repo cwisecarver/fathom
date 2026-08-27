@@ -465,6 +465,19 @@ defmodule Fathom.Telemetry do
         measurement: :dirty_shards,
         description: "Open shards holding un-flushed writes (live RPO exposure)"
       ),
+      # #17: `watermark_rows` under `open_shards` means the RPO answer above is UNDER-reporting
+      # (the watermark table lost rows), rather than the fleet being clean. Without these two an
+      # emptied table looked exactly like a fully-flushed fleet.
+      last_value("fathom.durability.watermark_rows",
+        event_name: [:fathom, :durability, :rpo],
+        measurement: :watermark_rows,
+        description: "Watermark rows the RPO gauge could see (compare to open_shards)"
+      ),
+      last_value("fathom.durability.open_shards",
+        event_name: [:fathom, :durability, :rpo],
+        measurement: :open_shards,
+        description: "Open coordinators on this node, for the watermark completeness check"
+      ),
       last_value("fathom.durability.oldest_age_ms",
         event_name: [:fathom, :durability, :rpo],
         measurement: :oldest_age_ms,

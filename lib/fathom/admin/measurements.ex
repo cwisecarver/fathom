@@ -232,11 +232,34 @@ defmodule Fathom.Admin.Measurements do
           end
       end)
 
+    # `watermark_rows` vs `open_shards` is the honesty check (expert review 2026-08-26 #17).
+    #
+    # This function REDUCES over the watermark table, so a missing row contributes nothing and the
+    # result is indistinguishable from "that shard is flushed". If the table is ever emptied — a
+    # FlushWatermark owner restart is the known way — this emitted a confident `dirty_shards: 0`
+    # for a fleet it could not see. #17 makes coordinators re-publish on that restart, which closes
+    # the window in milliseconds; these two extra gauges make the window OBSERVABLE rather than
+    # trusting that fix to be perfect. `watermark_rows < open_shards` means the answer above is
+    # under-reporting, and an alert can say so instead of going quiet.
+    rows = length(FlushWatermark.snapshot())
+    open_shards = open_shard_count()
+
     :telemetry.execute(
       [:fathom, :durability, :rpo],
-      %{dirty_shards: dirty, oldest_age_ms: oldest},
+      %{
+        dirty_shards: dirty,
+        oldest_age_ms: oldest,
+        watermark_rows: rows,
+        open_shards: open_shards
+      },
       %{}
     )
+  end
+
+  defp open_shard_count do
+    Registry.count(Fathom.ShardRegistry)
+  rescue
+    ArgumentError -> 0
   end
 
   @doc """

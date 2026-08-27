@@ -254,6 +254,57 @@ defmodule Fathom.Admin.MetricsTest do
     assert is_list(snap.history)
   end
 
+  # ── #17: a FlushWatermark owner restart must not read as a fully-flushed fleet ──
+
+  # Expert review 2026-08-26 #17. The table is owned by the FlushWatermark GenServer with no ETS
+  # `heir`, so a crash + supervisor restart destroys it and init/1 makes a fresh empty one.
+  # `do_durability/0` REDUCES over it, so a missing row contributes nothing and the gauge emitted
+  # `dirty_shards: 0` — "everything is flushed" — for a fleet it could not see. Coordinators
+  # re-published only at open and after a SUCCESSFUL flush, so a shard whose flushes are FAILING
+  # (the exact condition the gauge exists to surface) stayed invisible indefinitely, and both
+  # FathomUnflushedAgeHigh and FathomManyDirtyShards went quiet with it.
+  test "a FlushWatermark restart re-collects watermarks instead of reporting a clean fleet (expert review 2026-08-26 #17)" do
+    id = "wmheir_#{System.unique_integer([:positive])}"
+
+    on_exit(fn ->
+      Fathom.Shards.drain(id, 2_000)
+
+      for dir <- [Fathom.Shard.data_dir(), Fathom.Shard.Storage.Local.dir()],
+          suffix <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock"],
+          do: File.rm(Path.join(dir, id <> suffix))
+    end)
+
+    # A dirty, open shard: it has published a watermark and has unflushed writes.
+    {:ok, conn} = Fathom.ShardExecutor.open(id)
+    {:ok, _} = Fathom.ShardExecutor.execute(conn, %Filo.Stmt{sql: "CREATE TABLE t (v TEXT)"})
+    :ok = Fathom.ShardExecutor.close(conn)
+    {:ok, pid} = Fathom.Shards.ensure(id)
+    assert Fathom.Shard.dirty?(pid), "precondition: the shard must be dirty"
+
+    assert Enum.any?(FlushWatermark.snapshot(), &(elem(&1, 0) == id)),
+           "precondition: the shard must have published a watermark before the kill"
+
+    owner = Process.whereis(Fathom.Admin.FlushWatermark)
+    ref = Process.monitor(owner)
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^owner, :killed}, 2_000
+
+    # The supervisor restarts it with a FRESH, EMPTY table.
+    assert eventually(fn ->
+             p = Process.whereis(Fathom.Admin.FlushWatermark)
+             is_pid(p) and p != owner
+           end),
+           "the FlushWatermark owner was not restarted"
+
+    # THE ASSERTION: the shard's row comes back without waiting for a successful flush.
+    assert eventually(fn ->
+             Enum.any?(FlushWatermark.snapshot(), &(elem(&1, 0) == id))
+           end),
+           "the watermark table stayed empty after the owner restarted, so the RPO gauge reports " <>
+             "dirty_shards: 0 for a fleet it cannot see — a shard whose flushes are failing would " <>
+             "never re-publish on its own"
+  end
+
   # ── #27: the O(open-shards) RPO walk is throttled, not run every tick ──
 
   # Expert review 2026-08-26 #27. `rpo/0` copies the whole FlushWatermark table into the collector's

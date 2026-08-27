@@ -1510,6 +1510,15 @@ defmodule Fathom.Shard do
     {:noreply, %{state | flushed_through: -1}}
   end
 
+  # `FlushWatermark` restarted with an empty table (expert review 2026-08-26 #17). Re-assert this
+  # shard's row so the RPO gauge stops under-reporting; without it a shard only re-published after
+  # its next SUCCESSFUL flush, which is exactly what does not happen on the shard the gauge most
+  # needs to show. Pure ETS insert, no storage or lease interaction.
+  def handle_info(:republish_flush_watermark, state) do
+    FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
+    {:noreply, state}
+  end
+
   # Proactive revalidation on a heartbeat lapse (expert review #34): the Heartbeat
   # moduledoc promised coordinators revalidate on the lapse broadcast instead of
   # waiting for their next flush, but nothing subscribed — a superseded coordinator
