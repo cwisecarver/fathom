@@ -13,6 +13,105 @@ defmodule Fathom.Shard.DurabilityEdgesTest do
   alias Fathom.Shard.Storage.Local
   alias Fathom.Shard.WriteCounter
 
+  # Expert review 2026-08-26 #4: a long-lived WRITING stream silently got 10x the advertised RPO.
+  #
+  # Review 2026-08-01 #42 made a clean-but-served shard poll at 10x the interval, relying on
+  # ShardExecutor casting :became_dirty to restore the fast cadence. That cast is guarded by
+  # signal_dirty_once/2, keyed on the CONNECTION in the stream's process dictionary — so it fires
+  # at most ONCE per stream. But a shard re-enters the slow cadence every time a flush leaves it
+  # clean, and the second write on the same stream sends nothing to lift it again.
+  #
+  # No existing test wrote twice across a flush boundary on ONE connection, which is why this
+  # survived: under CONN_MAX_AGE=0 every request is a fresh stream and the flag resets, and that is
+  # the configuration the suite and the chaos rig use.
+  describe "the durability cadence under a long-lived writing stream (#4)" do
+    setup do
+      prev = %{
+        interval: Application.get_env(:fathom, :shard_flush_interval_ms),
+        idle: Application.get_env(:fathom, :shard_idle_ms)
+      }
+
+      # Short interval so a flush boundary is crossable in a test; high idle so the coordinator
+      # does not stop underneath us.
+      Application.put_env(:fathom, :shard_flush_interval_ms, 100)
+      Application.put_env(:fathom, :shard_idle_ms, 60_000)
+
+      id = "rpo10x_#{System.unique_integer([:positive])}"
+
+      on_exit(fn ->
+        for {k, v} <- [shard_flush_interval_ms: prev.interval, shard_idle_ms: prev.idle] do
+          if is_nil(v),
+            do: Application.delete_env(:fathom, k),
+            else: Application.put_env(:fathom, k, v)
+        end
+
+        Fathom.Shards.drain(id, 2_000)
+
+        for dir <- [Fathom.Shard.data_dir(), Local.dir()],
+            suffix <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock"],
+            do: File.rm(Path.join(dir, id <> suffix))
+      end)
+
+      %{id: id}
+    end
+
+    test "a second write on the SAME stream does not leave a 10x timer armed", %{id: id} do
+      {:ok, conn} = Fathom.ShardExecutor.open(id)
+      on_exit(fn -> Fathom.ShardExecutor.close(conn) end)
+
+      {:ok, _} =
+        Fathom.ShardExecutor.execute(conn, %Filo.Stmt{sql: "CREATE TABLE t (v TEXT)"})
+
+      {:ok, pid} = Fathom.Shards.ensure(id)
+
+      # Let the flush land so the shard goes CLEAN while the stream is still held. This is the
+      # moment the slow (10x) timer used to be armed.
+      assert wait_for(fn -> not Fathom.Shard.dirty?(pid) end),
+             "precondition: the first write never flushed, so the slow cadence is never reached"
+
+      # THE SECOND WRITE, on the same connection. signal_dirty_once/2 has already fired for this
+      # stream, so no :became_dirty cast is sent — pre-fix nothing lifts the slow timer.
+      {:ok, _} = Fathom.ShardExecutor.execute(conn, %Filo.Stmt{sql: "INSERT INTO t VALUES ('b')"})
+
+      st = :sys.get_state(pid)
+
+      refute st.flush_timer_slow?,
+             "a stream that has written is on the 10x clean-poll timer, so its acked writes wait " <>
+               "up to @clean_poll_multiplier intervals instead of one — a silent 10x violation of " <>
+               "the RPO bound docs/durability.md advertises"
+
+      # And it really does flush again promptly, not 10 intervals later.
+      assert wait_for(fn -> not Fathom.Shard.dirty?(pid) end, 3_000),
+             "the second write never flushed within a reasonable multiple of the interval"
+    end
+
+    # The optimisation #42 added must survive: a held stream doing only READS still gets the slow
+    # cadence. Without this the fix would be "delete the optimisation", which is not the fix.
+    test "a read-only held stream still takes the slow cadence", %{id: id} do
+      {:ok, conn} = Fathom.ShardExecutor.open(id)
+      on_exit(fn -> Fathom.ShardExecutor.close(conn) end)
+
+      {:ok, _} = Fathom.ShardExecutor.execute(conn, %Filo.Stmt{sql: "SELECT 1"})
+      {:ok, pid} = Fathom.Shards.ensure(id)
+
+      assert wait_for(fn -> :sys.get_state(pid).flush_timer_slow? end),
+             "a read-only held stream should poll at the slow cadence — the optimisation from " <>
+               "review 2026-08-01 #42 has been lost"
+    end
+  end
+
+  defp wait_for(fun, remaining_ms \\ 2_000)
+  defp wait_for(_fun, remaining_ms) when remaining_ms <= 0, do: false
+
+  defp wait_for(fun, remaining_ms) do
+    if fun.() do
+      true
+    else
+      Process.sleep(10)
+      wait_for(fun, remaining_ms - 10)
+    end
+  end
+
   describe "a closed connection leaves the main .db complete" do
     # `Migrator.Copy.migrate_chain/3` does a plain `File.cp` of the main file — no `-wal` — so it
     # depends on `Connection.close/1` having folded the WAL in. SQLite skips the close-time

@@ -626,6 +626,11 @@ defmodule Fathom.Shard do
         # handler to tell "this shard is loafing and a write should speed it up" from "a flush is
         # already counting down and must not be restarted" (expert review 2026-08-24 #7).
         flush_timer_slow?: false,
+        # Has ANY write landed while the current set of connections has been held? Sticky for the
+        # life of the checkout, cleared when the last connection checks in (expert review
+        # 2026-08-26 #4). This is what distinguishes a genuinely read-only held stream — the case
+        # the slow durability cadence exists for — from a writing one.
+        wrote_during_checkout?: false,
         # The in-flight off-process durability flush (expert review #27), the watermark
         # it will advance flushed_through to on success, and the counter generation that
         # watermark was captured under (expert review #11 — restoring a watermark from a
@@ -1298,7 +1303,30 @@ defmodule Fathom.Shard do
   #
   # Note the tempting one-liner — dropping `cancel_flush/1` from `do_schedule_flush/2` — is wrong:
   # every other caller depends on it, and removing it leaks timers everywhere.
+  #
+  # THE STICKY HALF (expert review 2026-08-26 #4). `ShardExecutor`'s `signal_dirty_once/2` is keyed
+  # on the CONNECTION in the stream's process dictionary, so this cast arrives at most ONCE for the
+  # lifetime of that stream. The re-arm above is therefore not enough on its own: a shard re-enters
+  # the slow cadence every time a flush leaves it clean, and the second and subsequent writes on the
+  # same stream send nothing to lift it again.
+  #
+  #   t=0  write → this cast → fast timer
+  #   t=5  flush lands, shard now clean → schedule_flush → 50 s timer
+  #   t=6  same stream writes again → signal_dirty_once/2 already flagged → NO CAST
+  #        …dirty, with a 50 s timer armed
+  #
+  # So `docs/durability.md`'s "loss ≈ the flush interval" silently became 10× the interval for any
+  # stream that writes less often than the interval — the django-libsql WebSocket shape AGENTS.md
+  # calls the primary production client path. Invisible under `CONN_MAX_AGE=0`, where each request
+  # is a fresh stream and the flag resets, which is what the tests and the chaos rig use.
+  #
+  # One cast per stream is exactly enough to set a STICKY flag, and stickiness is the right shape:
+  # the slow cadence exists for a held stream doing only READS, so "this checkout has written" is
+  # precisely the condition that should disqualify it. Cleared when the last connection checks in
+  # (`release/2`), so a later read-only checkout gets the optimisation back.
   def handle_cast(:became_dirty, state) do
+    state = %{state | wrote_during_checkout?: true}
+
     if state.flush_timer == nil or state.flush_timer_slow? do
       {:noreply, schedule_flush(state)}
     else
@@ -1924,10 +1952,18 @@ defmodule Fathom.Shard do
     Fathom.Shards.Lru.touch(state.id)
 
     cond do
-      map_size(conns) > 0 -> state
+      map_size(conns) > 0 ->
+        state
+
       # Standing down: don't arm idle — stop_when_drained will stop us.
-      state.draining -> state
-      true -> schedule_idle(state)
+      state.draining ->
+        %{state | wrote_during_checkout?: false}
+
+      true ->
+        # Last connection gone, so the next checkout starts a fresh "has this stream written?"
+        # question (#4). Without this reset a shard that ever wrote would never take the slow
+        # cadence again, and the optimisation review 2026-08-01 #42 added would be dead.
+        schedule_idle(%{state | wrote_during_checkout?: false})
     end
   end
 
@@ -4248,10 +4284,35 @@ defmodule Fathom.Shard do
   # signal would mean un-flushed acknowledged writes. So a clean busy shard does not disarm
   # outright, it re-arms at a much slower cadence. A missed signal then costs up to
   # @clean_poll_multiplier intervals of extra RPO, never unbounded loss.
+  # THE `:became_dirty` SIGNAL FIRES AT MOST ONCE PER STREAM, EVER (expert review 2026-08-26 #4).
+  #
+  # The edge-triggered design above rests on `ShardExecutor` casting `:became_dirty` on a write.
+  # That cast is guarded by `signal_dirty_once/2`, keyed on the CONNECTION in the stream's process
+  # dictionary — so it fires once for the lifetime of that stream. But a shard enters the slow
+  # cadence many times per stream lifetime:
+  #
+  #   t=0  the stream writes → :became_dirty → fast timer. Flag set.
+  #   t=5  the flush lands → this function runs → conns > 0 and now CLEAN → 50 s timer.
+  #   t=6  the same stream writes again → signal_dirty_once/2 sees its flag → NO CAST.
+  #        The shard is dirty with a 50 s timer armed.
+  #
+  # Nothing rescued it: the checkout re-arm is gated on `flush_timer == nil`, and the
+  # `:became_dirty` handler's slow-timer branch is correct but never receives a message. So
+  # `docs/durability.md`'s "loss ≈ the flush interval" silently became 10× the interval for any
+  # stream writing less often than the interval — the django-libsql WebSocket shape AGENTS.md calls
+  # the primary production client path. Invisible under `CONN_MAX_AGE=0`, where every request is a
+  # fresh stream and the flag resets, which is the configuration the tests and the chaos rig use.
+  #
+  # The fix needs no new signalling: a flush that actually UPLOADED writes is itself evidence of an
+  # active writer, so stay fast for the next interval and let the absence of uploads be what slows
+  # the shard down. `unflushed?/1` cannot answer this — immediately after a successful flush it is
+  # false by construction, which is precisely the moment the slow timer was being armed.
   defp schedule_flush(state) do
-    if unflushed?(state),
-      do: do_schedule_flush(state),
-      else: do_schedule_flush(state, @clean_poll_multiplier)
+    cond do
+      unflushed?(state) -> do_schedule_flush(state)
+      state.wrote_during_checkout? -> do_schedule_flush(state)
+      true -> do_schedule_flush(state, @clean_poll_multiplier)
+    end
   end
 
   # Arm the periodic durability flush. A non-positive interval disables it
