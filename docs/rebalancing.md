@@ -103,8 +103,8 @@ default**, with a staged, observe-before-arming enable procedure and rollback in
 `docs/runbooks/rebalancer.md`. **Proven live** on the rig (`deploy/chaos/chaos.sh rebalance`): a
 manual pin (`acme` fathom1→fathom2) and a **fully autonomous** run where `Policy.propose` chose
 `green: fathom2→fathom1` off an engineered imbalance and `RebalanceJob`/`HandoffJob` executed it —
-isolation intact both times (`docs/reviews/chaos-run-2026-07-08.md`). Hardened per
-`docs/reviews/expert-review-2026-07-07-013852.md`.
+isolation intact both times (`docs/reviews/chaos-run-2026-07-08.md`). Hardened per the 2026-07-07
+expert-panel pass (18 findings; report kept locally, not in the repo).
 
 ## One-line summary
 

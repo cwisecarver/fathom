@@ -6,7 +6,7 @@ after the HEAD under test (01:25), and the run asserts the change's own observab
 anything.
 
 This is the second half of **expert review 2026-08-01 #43**. The
-[first half](expert-review-2026-08-01-000011.md.progress.md#43--telemetry-half-shipped-2026-08-04)
+first half (2026-08-01 audit #43, telemetry half shipped 2026-08-04)
 put `rate_per_hour` + `eta_seconds` on `Migrator.status/0` so an operator can *see* a rollout move.
 The finding's other half was that `:reconcile_batch_size` — 100 shards on an hourly cron, i.e.
 2,400/day, i.e. months for a deep cold tail — is a knob with **no evidence base**: nothing in the

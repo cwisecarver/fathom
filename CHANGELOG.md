@@ -139,7 +139,7 @@ the whole shards table on every keystroke.
 
 ## [0.2.0] - 2026-07-16
 
-Expert-panel review hardening (`docs/reviews/expert-review-2026-07-14-224105.md`) — the
+Expert-panel review hardening (the 2026-07-14 audit pass; report kept locally, not in the repo) — the
 production-readiness, correctness, tenant-lifecycle, and ops-packaging pass over the working slice.
 Highlights (see the review's resolution log for the full per-finding list and commits):
 

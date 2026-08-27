@@ -51,6 +51,18 @@ npm-debug.log
 # Local AI-assistant configuration and permissions.
 /.claude/
 
+# Expert-panel audit reports (`/expert-audit`) and their `.progress.md` logs.
+#
+# THE RULE: these never go in source control. They are a working artifact of a review pass —
+# long, model-generated, full of half-verified hypotheses, and superseded the moment the fixes
+# land. Committing them put ~26 files and several hundred provisional findings on the public
+# repo's face, where a reader cannot tell a confirmed defect from a rejected one.
+#
+# This is NOT the same thing as `docs/reviews/`, which stays TRACKED: those are the measured
+# run reports (benchmarks, chaos runs, density sweeps) that README.md cites as evidence for the
+# project's headline numbers. Measured evidence is published; audit working notes are not.
+/audits/
+
 # wire_history.jsonl (mix fathom.wire_bench) and tpc_history.jsonl (mix fathom.tpcc) are TRACKED
 # canonical baselines, like perf_history.jsonl. Entries are host-specific: the wire gate's
 # `--check` compares only same-host rows, and the TPC-C rows are a recorded-only trend. Commit a

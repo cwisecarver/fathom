@@ -4,8 +4,8 @@ How to turn the Phase-2 B1 rebalancer on in a real fleet, **one gate at a time**
 each stage, with an observe-before-arming step and a clean rollback. All gates are **off by
 default**; the cron is scheduled in every environment but stays inert until `REBALANCER_ENABLED`.
 
-Background: `docs/phase2-scoping.md` §B1, the code in `lib/fathom/rebalancer/`, the hardening
-review `docs/reviews/expert-review-2026-07-07-013852.md`, and the live validation
+Background: `docs/phase2-scoping.md` §B1, the code in `lib/fathom/rebalancer/`, the 2026-07-07
+hardening audit (report kept locally, not in the repo), and the live validation
 `docs/reviews/chaos-run-2026-07-08.md`. The chaos rig (`deploy/chaos/docker-compose.yml`) is a
 known-good full config to copy from.
 

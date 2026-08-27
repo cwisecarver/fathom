@@ -9,7 +9,11 @@ short because AGENTS.md is loaded into every session.
 
 - [`docs/README.md`](docs/README.md) — the index: per-subsystem how-it-works stories, design plans, benchmark plans, runbooks, run reports.
 - [`docs/component-notes.md`](docs/component-notes.md) — the long-form record for every component below: the finding that motivated it, the fix that was tried and was wrong, the measurement that settled it, the trap that will bite you. **Read the entry before changing a component.**
-- [`docs/reviews/`](docs/reviews/) — the full run reports.
+- [`docs/reviews/`](docs/reviews/) — the measured run reports (benchmarks, chaos runs, density
+  sweeps). **Expert-panel audits are NOT here and are never committed** — `/expert-audit` writes
+  them to the gitignored `audits/` directory, along with the `.progress.md` log `/iterate` keeps.
+  They are working artifacts full of provisional findings; only the fixes they drive belong in the
+  repo. See the `/audits/` entry in `.gitignore` for the reasoning.
 
 ### What exists today (the working slice)
 

@@ -11,9 +11,9 @@ Each doc says whether it describes **built** behavior or a **plan**.
 
 **The plan docs here are records of reasoning, not work lists** (re-checked 2026-08-26). Every one
 has been delivered except [`a2-bare-metal-plan.md`](a2-bare-metal-plan.md), which is blocked on
-hardware. The tracked status record is the per-review `.progress.md` files under
-[`reviews/`](reviews/) — 392 findings across 15 reviews, all closed except the two named in
-[`reviews/expert-review-2026-08-24-223907.md.progress.md`](reviews/expert-review-2026-08-24-223907.md.progress.md):
+hardware. The status record is the per-audit `.progress.md` log, kept with each report in the
+gitignored `audits/` directory (audits are never committed — see AGENTS.md) — 392 findings across
+15 reviews, all closed except the two from the 2026-08-24 pass:
 **#24** (needs a rig measurement) and **#25** (partially shipped; the autonomous-repair half needs an
 S3 budget and a precedence ruling).
 
@@ -234,8 +234,9 @@ noted).
   follow-ups — and refutes two of them, including one this project had already shipped.
 - **reviews/chaos-run-2026-07-0{5,8,9}.md** — chaos-rig run reports (failover, pause-fence, hotspots,
   rebalance handoff — the live proofs referenced by the built-engine docs).
-- **reviews/expert-review-2026-07-0\*.md** — expert-panel review passes (each with a `.progress.md`
-  working artifact); the hardening they drove is folded into the code and the docs above.
+- Expert-panel audit reports are **deliberately absent** from this directory and from the repo.
+  `/expert-audit` writes them to the gitignored `audits/` directory with a `.progress.md` log; the
+  hardening they drove is folded into the code and the docs above, which is the part that ships.
 
 ---
 
