@@ -293,6 +293,46 @@ defmodule Fathom.Shard.DurabilityEdgesTest do
       Application.put_env(:fathom, :steal_margin_ms, 0)
       assert ttl_ms() == 0
     end
+
+    # Added for expert review 2026-08-26 #42 (temptation A, "raise the heartbeat cache TTL").
+    #
+    # WHAT WAS ALREADY COVERED, because the honest version of this comment matters more than a
+    # dramatic one: the two tests above already assert the default is unchanged and that the TTL
+    # shrinks with the margin, and the second of them checks the bound AT ONE MARGIN (5 000 ms).
+    # Probed: a flat 10 s TTL, a flat 900 ms one, and `margin * 2` are each caught by that pair.
+    #
+    # So **#42's claim that this temptation "would pass the existing suite" is FALSE for temptation
+    # A.** It stands for temptation B (caching the lock read), which neither `Storage.Local` nor
+    # `Fathom.Test.FaultyStorage` can express — a prohibition with no mechanical guard at all.
+    #
+    # WHAT THIS ADDS, stated honestly after four rounds of probing: NO NEW COVERAGE. Every wrong
+    # derivation tried — flat 10 s, flat 900 ms, flat 1 000 ms, `margin * 2`, and even a contrived
+    # `div(margin, 5) + 900` that shrinks with the margin and fits at 5 000 ms — is already caught
+    # by the two tests above.
+    #
+    # It is kept anyway, and only for this: the BOUND is the property the safety argument actually
+    # names, and the tests above enforce it INCIDENTALLY while being about something else ("the
+    # default is unchanged", "it shrinks"). A future edit that legitimately changes what those two
+    # assert could weaken the bound without anyone noticing it was load-bearing. Six lines to say
+    # the invariant out loud, in the place someone reading #42 will look.
+    #
+    # If it ever gets in the way, delete it — the guard is the pair above, not this.
+    #
+    # Why the bound and not just the tracking: the cached entry holds the heartbeat AND the store's
+    # clock sample together, so a hit replays a self-consistent `:dead` verdict. Outliving the
+    # margin makes that a wrongful steal of a LIVE node, which self-fences and quarantines its
+    # acked writes.
+    test "the memo window never OUTLIVES the margin, not merely tracks it" do
+      for margin <- [50, 500, 1_000, 5_000, 30_000, 600_000] do
+        Application.put_env(:fathom, :steal_margin_ms, margin)
+
+        assert ttl_ms() <= margin,
+               "the heartbeat memo TTL is #{ttl_ms()}ms against a #{margin}ms steal margin — a " <>
+                 "cached :dead verdict can now outlive the clock-skew guard and wrongfully steal " <>
+                 "a live node. To make failover faster, raise :steal_margin_ms and let the " <>
+                 "derivation follow; that trades failover speed EXPLICITLY (#42)."
+      end
+    end
   end
 
   # The derivation lives in the S3 backend beside the margin it depends on; reach it the way the
