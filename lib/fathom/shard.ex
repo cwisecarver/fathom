@@ -663,6 +663,19 @@ defmodule Fathom.Shard do
         drain_reply_to: nil,
         # A lapse revalidation is scheduled (round-2 #26) — repeat broadcasts
         # coalesce onto the pending jittered timer.
+        # The heartbeat-lapse revalidation EPISODE, as one tri-state (expert review 2026-08-26
+        # #13a): `false` = none in progress, `true` = the jitter timer is armed, `%Task{}` = the
+        # off-process `check_lease` GET is in flight.
+        #
+        # ONE FIELD ON PURPOSE, and the reason is measured, not stylistic. Adding a separate
+        # `lapse_task` key made this map 31 keys and cost **+51% on `fanout_gc_kb_per_shard`**
+        # (3.65 -> 5.49 KiB/shard, reproduced three times, and reproduced by that ONE LINE against
+        # an otherwise-unmodified HEAD). The coordinator's process heap sits right on an Erlang
+        # heap size-class boundary, so one more word per process rounds every coordinator up to the
+        # next class — ~1.8 KiB each, which at fathom's scale IS the node-density floor. The bench
+        # gate blocked it, correctly.
+        #
+        # So: before adding a field here, bench it. This map is not free to grow.
         lapse_revalidate_pending: false
       }
 
@@ -1446,10 +1459,30 @@ defmodule Fathom.Shard do
     apply_renew_result(result, %{state | renew_task: nil})
   end
 
+  # The lapse-revalidation task's reply (expert review 2026-08-26 #13a). Clearing the field to
+  # `false` ends the episode, so a later lapse re-arms the timer normally.
+  def handle_info({ref, result}, %{lapse_revalidate_pending: %Task{ref: ref}} = state) do
+    Process.demonitor(ref, [:flush])
+    apply_lapse_verdict(result, %{state | lapse_revalidate_pending: false})
+  end
+
   # The renewal task crashed: treat as transient and retry on the next tick.
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{renew_task: %Task{ref: ref}} = state) do
     Logger.warning("shard #{state.id}: lease renewal task crashed (#{inspect(reason)}); retrying")
     {:noreply, schedule_renew(%{state | renew_task: nil})}
+  end
+
+  # The lapse-revalidation task crashed before replying, so ownership was neither confirmed nor
+  # refuted. Treated as `:skip` rather than as nothing: `note_not_valid/1` does not fence, it
+  # starts a clock that arms only after `margin + steal_margin` of CONTINUOUS failure and that any
+  # later success clears. Starting it costs a self-clearing timer; NOT starting it on a node that
+  # really is cut from storage is the unbounded-loss-window hole review 2026-08-24 #19 closed.
+  def handle_info(
+        {:DOWN, ref, :process, _pid, reason},
+        %{lapse_revalidate_pending: %Task{ref: ref}} = state
+      ) do
+    Logger.warning("shard #{state.id}: lapse revalidation task crashed (#{inspect(reason)})")
+    apply_lapse_verdict(:skip, %{state | lapse_revalidate_pending: false})
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{flush_task: %Task{ref: ref}} = state) do
@@ -1562,6 +1595,8 @@ defmodule Fathom.Shard do
   # fence when it fires, so a coalesced later lapse is still covered). The flush
   # fence remains the hard guard throughout the jitter window.
   def handle_info({:heartbeat_lapsed, gen}, state) do
+    # Truthy covers BOTH in-progress shapes: `true` (timer armed) and `%Task{}` (check in
+    # flight). Either way this lapse coalesces onto the episode already running.
     if state.acquire_gen != nil and gen != state.acquire_gen and
          not state.lapse_revalidate_pending do
       Process.send_after(self(), :revalidate_lapse, :rand.uniform(lapse_jitter_ms()))
@@ -1571,50 +1606,53 @@ defmodule Fathom.Shard do
     end
   end
 
+  # A lease-touching task is already in flight — skip this episode rather than racing it
+  # (expert review 2026-08-26 #13a). Mirrors `handle_info(:renew_lease, %{flush_task: t})`.
+  #
+  # This is MUTUAL EXCLUSION, not politeness, and the hazard is `Fence.check/2` merging a STALE
+  # lease back over a fresh one. In heartbeat mode `revalidate/2` returns `ctx.lease` unchanged, so
+  # the lapse task captures L1 and hands L1 back; if a concurrent flush task degrades to
+  # `legacy/2` (the heartbeat process died mid-flush) it renews and returns L2, and whichever reply
+  # lands second wins. L1 landing last means the next flush PUTs `If-Match: <stale lock_etag>`,
+  # gets a 412, and the coordinator reads it as a steal — it self-fences and quarantines the dirty
+  # local WITHOUT flushing. That is exactly the failure expert review 2026-08-24 #8 paid for once
+  # already, and the reason `:renew_lease` grew the same guard.
+  #
+  # Skipping loses nothing: an in-flight flush is running its OWN `Fence.check` right now and
+  # applies the same three verdicts. `lapse_revalidate_pending` is cleared so a later lapse re-arms.
+  #
+  # `renew_task` is in the guard for locality, not because it can co-occur: `schedule_renew/1` is
+  # armed only at open when `acquire_gen == nil`, and this handler is reachable only from the
+  # broadcast clause above, which requires `acquire_gen != nil`. The two are mode-exclusive — but
+  # that argument spans three call sites, and the guard is one clause.
+  def handle_info(:revalidate_lapse, %{flush_task: t} = state) when t != nil,
+    do: {:noreply, %{state | lapse_revalidate_pending: false}}
+
+  def handle_info(:revalidate_lapse, %{renew_task: t} = state) when t != nil,
+    do: {:noreply, %{state | lapse_revalidate_pending: false}}
+
+  # A check from an earlier lapse is still in flight — coalesce onto it rather than firing a
+  # second GET. (`lapse_revalidate_pending` holds the Task while the check runs; see its
+  # definition for why the task does not get a field of its own.)
+  def handle_info(:revalidate_lapse, %{lapse_revalidate_pending: %Task{}} = state),
+    do: {:noreply, state}
+
+  # RUNS OFF-PROCESS (expert review 2026-08-26 #13a). `Fence.check/2` here is not a local decision:
+  # in heartbeat mode a lapse routes to `revalidate/2`, which is a real `Storage.check_lease/2`
+  # object-store GET plus Req's retry ladder. Inline, that blocked THIS coordinator's mailbox for a
+  # storage RTT — and the broadcast reaches every open coordinator, so at the shipped
+  # `:max_open_shards` the node stalls its whole checkout/checkin path at the exact moment it has
+  # just proved it could not keep one small object fresh.
+  #
+  # This is the same stall the module already removed twice and documented both times: review
+  # 2026-07-18 #18 moved the flush fence off-process, review 2026-08-01 #29 moved the legacy renew
+  # PUT. This was the third and last inline round trip.
+  #
+  # Same monitored-task shape as those two: the task returns a fully RESOLVED verdict and the reply
+  # handler does ZERO storage I/O, only local state moves.
   def handle_info(:revalidate_lapse, state) do
-    state = %{state | lapse_revalidate_pending: false}
-
-    case Fence.check(fence_ctx(state)) do
-      {:ok, updates} ->
-        {:noreply, clear_write_fence(Map.merge(state, updates))}
-
-      :superseded ->
-        Logger.error(
-          "shard #{state.id}: lease superseded (heartbeat lapse broadcast); self-fencing"
-        )
-
-        {:stop, {:shutdown, :lease_lost}, %{state | lease_lost: true}}
-
-      # Ownership unconfirmed (transient) — the next flush's fence remains the guard for the
-      # REFUSAL, but the CLOCK starts here (expert review 2026-08-24 #19).
-      #
-      # `note_not_valid/1` was reachable from exactly one place: the `:fence_skip` branch of the
-      # durability-flush result. `handle_info(:durability_flush, …)` short-circuits at
-      # `not unflushed?(state)` BEFORE any fence check, so on a shard that is not dirty the clock
-      # never started. A read-mostly shard on a node cut from storage therefore observed nothing:
-      # the heartbeat lapsed, `ttl + steal_margin` passed, a peer became entitled to steal — and
-      # ten minutes later the first client write was ACKed, because the fence had never armed.
-      # Only then did the clock start, from zero, and writes kept being accepted for another full
-      # `margin + steal_margin`. `docs/single-writer.md` promises the loss window collapses to
-      # ~`ttl + steal_margin`; on that path it was unbounded relative to when ownership was lost.
-      #
-      # Here is the right moment BY CONSTRUCTION, which is why this is stamped here rather than
-      # back-dated from the heartbeat's deadline as the finding proposed. Back-dating can only make
-      # the breaker arm EARLIER, and earlier on a healthy node is a tenant write outage; whether a
-      # stale `mono_deadline_ms` can survive a heartbeat restart and cause exactly that could not be
-      # settled by reading. This path cannot fire early: it runs only after `mark_lapse/1` has
-      # edge-detected a real lapse and bumped the generation, and `Fence.check/2` has then failed to
-      # reconfirm ownership against storage. Its worst case is the status quo, not an outage.
-      #
-      # STILL BOUNDED BY THE NEXT FLUSH TICK, and worth knowing: this starts the clock but does not
-      # publish the fence, because at lapse time the node is not yet provably stealable — the delay
-      # IS the semantics. So the first write after a long lapse is still accepted, and the fence
-      # arms on the flush tick that write triggers, with the elapsed time now measured from the
-      # lapse instead of from the write. Closing that last gap needs a one-shot re-check timer per
-      # lapse episode; deliberately not bundled here.
-      :skip ->
-        {:noreply, note_not_valid(state)}
-    end
+    ctx = fence_ctx(state)
+    {:noreply, %{state | lapse_revalidate_pending: Task.async(fn -> Fence.check(ctx) end)}}
   end
 
   # Legacy-mode periodic lease renewal, run OFF-PROCESS (expert review 2026-08-01 #29).
@@ -1679,6 +1717,15 @@ defmodule Fathom.Shard do
       # A flush is already in flight — don't stack a second snapshot/PUT; the next
       # interval retries anything the in-flight one doesn't cover.
       state.flush_task != nil ->
+        {:noreply, schedule_flush(state)}
+
+      # A lapse revalidation is in flight (expert review 2026-08-26 #13a). The OTHER half of the
+      # mutual exclusion at `handle_info(:revalidate_lapse, %{flush_task: t})`: both run
+      # `Fence.check/2` and both merge its `lease` into coordinator state, so letting them overlap
+      # lets the later reply put a STALE `lock_etag` back — and a stale etag on the next flush PUT
+      # is a 412 the coordinator reads as a steal (review 2026-08-24 #8). A lapse check is one GET,
+      # so deferring one flush tick behind it is the same cost as deferring behind another flush.
+      match?(%Task{}, state.lapse_revalidate_pending) ->
         {:noreply, schedule_flush(state)}
 
       # Clean: local == storage, so there's nothing to upload and no clobber risk.
@@ -3412,7 +3459,18 @@ defmodule Fathom.Shard do
   defp clear_write_fence(%{not_valid_since: nil} = state), do: state
 
   defp clear_write_fence(state) do
+    was_fenced? = Fathom.Shard.WriteFence.fenced?(state.id)
     Fathom.Shard.WriteFence.unfence(state.id)
+
+    # The closing half of the `:write_fenced` breaker (expert review 2026-08-26 #13a). Only the
+    # OPENING was observable, so an operator watching a partition heal could see writes start being
+    # refused and never see them start being accepted again — the recovery had to be inferred from
+    # the absence of 503s. Emitted only on a real transition, so a healthy shard's every-flush
+    # `clear_write_fence` is silent.
+    if was_fenced? do
+      :telemetry.execute([:fathom, :shard, :write_unfenced], %{count: 1}, %{shard_id: state.id})
+    end
+
     %{state | not_valid_since: nil}
   end
 
@@ -4218,6 +4276,48 @@ defmodule Fathom.Shard do
     Process.cancel_timer(timer)
     %{state | timer: nil}
   end
+
+  # The lapse revalidation's verdict, applied back in the coordinator (expert review 2026-08-26
+  # #13a). Every branch is identical to what the inline version did — only WHERE the check_lease
+  # GET ran changed. No storage I/O here by construction.
+  defp apply_lapse_verdict({:ok, updates}, state) do
+    {:noreply, clear_write_fence(Map.merge(state, updates))}
+  end
+
+  defp apply_lapse_verdict(:superseded, state) do
+    Logger.error("shard #{state.id}: lease superseded (heartbeat lapse broadcast); self-fencing")
+
+    {:stop, {:shutdown, :lease_lost}, %{state | lease_lost: true}}
+  end
+
+  # Ownership unconfirmed (transient) — the next flush's fence remains the guard for the
+  # REFUSAL, but the CLOCK starts here (expert review 2026-08-24 #19).
+  #
+  # `note_not_valid/1` was reachable from exactly one place: the `:fence_skip` branch of the
+  # durability-flush result. `handle_info(:durability_flush, …)` short-circuits at
+  # `not unflushed?(state)` BEFORE any fence check, so on a shard that is not dirty the clock
+  # never started. A read-mostly shard on a node cut from storage therefore observed nothing:
+  # the heartbeat lapsed, `ttl + steal_margin` passed, a peer became entitled to steal — and
+  # ten minutes later the first client write was ACKed, because the fence had never armed.
+  # Only then did the clock start, from zero, and writes kept being accepted for another full
+  # `margin + steal_margin`. `docs/single-writer.md` promises the loss window collapses to
+  # ~`ttl + steal_margin`; on that path it was unbounded relative to when ownership was lost.
+  #
+  # Here is the right moment BY CONSTRUCTION, which is why this is stamped here rather than
+  # back-dated from the heartbeat's deadline as the finding proposed. Back-dating can only make
+  # the breaker arm EARLIER, and earlier on a healthy node is a tenant write outage; whether a
+  # stale `mono_deadline_ms` can survive a heartbeat restart and cause exactly that could not be
+  # settled by reading. This path cannot fire early: it runs only after `mark_lapse/1` has
+  # edge-detected a real lapse and bumped the generation, and `Fence.check/2` has then failed to
+  # reconfirm ownership against storage. Its worst case is the status quo, not an outage.
+  #
+  # STILL BOUNDED BY THE NEXT FLUSH TICK, and worth knowing: this starts the clock but does not
+  # publish the fence, because at lapse time the node is not yet provably stealable — the delay
+  # IS the semantics. So the first write after a long lapse is still accepted, and the fence
+  # arms on the flush tick that write triggers, with the elapsed time now measured from the
+  # lapse instead of from the write. Closing that last gap needs a one-shot re-check timer per
+  # lapse episode; deliberately not bundled here.
+  defp apply_lapse_verdict(:skip, state), do: {:noreply, note_not_valid(state)}
 
   # Renew well inside the TTL (every third) so a couple of transient failures
   # don't lapse the lease.

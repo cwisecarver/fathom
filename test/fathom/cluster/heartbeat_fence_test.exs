@@ -77,6 +77,95 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
     refute File.exists?(local_db(shard)), "fenced coordinator drops its local copy"
   end
 
+  # Expert review 2026-08-26 #13a. `handle_info(:revalidate_lapse, …)` called `Fence.check/2`
+  # SYNCHRONOUSLY in the coordinator's own process, and in heartbeat mode a lapse routes to
+  # `revalidate/2`, which is a real `Storage.check_lease/2` object-store GET plus Req's retry
+  # ladder. So the coordinator's mailbox was blocked for a full storage RTT — and the lapse
+  # broadcast reaches EVERY open coordinator at the same instant, so at the shipped
+  # `:max_open_shards` the whole node stalls its checkout/checkin path at the exact moment it has
+  # just proved it could not keep one small object fresh: checkouts queue, checkins queue (idle
+  # detection and LRU eviction lag), and `evict/2`'s 2 s probe budget expires against coordinators
+  # that are merely blocked.
+  #
+  # The invariant is RESPONSIVENESS DURING the check, which is why the fixture holds `check_lease`
+  # open rather than timing a fast one: with the GET in flight, the coordinator must still answer.
+  # Pre-fix it cannot — it is inside `Fence.check/2` — and this times out.
+  #
+  # `:faulty_check_lease` already exists for exactly this shape; its own comment says it was added
+  # to prove the flush's 412-reconcile runs off-process (review 2026-07-14 #8). This is the third
+  # inline round trip in the module, after the flush fence (#18) and the legacy renew PUT (#29).
+  test "a lapse revalidation does not block the coordinator mailbox", %{shard: shard, hb: hb} do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, coordinator} = Shards.ensure(shard)
+
+    assert is_integer(:sys.get_state(coordinator).acquire_gen),
+           "fixture: the coordinator must be in HEARTBEAT mode, or the lapse path is unreachable"
+
+    test_pid = self()
+
+    # Hold check_lease open so the GET is provably in flight when we probe the mailbox.
+    blocker = fn ->
+      # Hands back the pid that is actually blocked — the TASK, post-fix, and the coordinator
+      # itself pre-fix. Either way the release goes to the right process.
+      send(test_pid, {:check_lease_started, self()})
+
+      receive do
+        :release -> :ok
+      after
+        10_000 -> :ok
+      end
+    end
+
+    Application.put_env(:fathom, :faulty_check_lease, blocker)
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_check_lease)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    # Bump the generation so the fence takes :revalidate (the branch that does the GET). A lapse at
+    # the SAME generation would take :ok and never reach check_lease — AGENTS.md records that
+    # exact fixture mistake.
+    :sys.replace_state(hb, fn st ->
+      Heartbeat.publish_status(%{st | generation: st.generation + 1, lapsed: true})
+    end)
+
+    send(coordinator, :revalidate_lapse)
+    assert_receive {:check_lease_started, blocked_pid}, 2_000
+
+    # THE ASSERTION: with the storage GET provably in flight, the coordinator still answers.
+    # Pre-fix it is sitting inside Fence.check/2 and this exits with :timeout.
+    state =
+      try do
+        :sys.get_state(coordinator, 1_000)
+      catch
+        :exit, reason ->
+          send(blocked_pid, :release)
+
+          flunk(
+            "the coordinator mailbox is blocked while the lapse check_lease GET is in flight " <>
+              "(#{inspect(reason)})"
+          )
+      end
+
+    assert is_map(state)
+
+    # Post-fix the blocked process is the task, not the coordinator — so this also proves they are
+    # different processes, which is the whole point.
+    refute blocked_pid == coordinator,
+           "check_lease is running IN the coordinator process; it was not moved off-process"
+
+    send(blocked_pid, :release)
+    :ok = ShardExecutor.close(conn)
+  end
+
   # Expert review #34: the Heartbeat moduledoc promised a lapse "broadcasts so
   # coordinators can revalidate proactively instead of waiting for their next flush" —
   # but nothing subscribed, so a superseded coordinator kept accepting writes it would
@@ -182,10 +271,10 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
     test_pid = self()
     handler = "writefence-#{System.unique_integer([:positive])}"
 
-    :telemetry.attach(
+    :telemetry.attach_many(
       handler,
-      [:fathom, :shard, :write_fenced],
-      fn _e, _m, meta, _ -> send(test_pid, {:write_fenced, meta}) end,
+      [[:fathom, :shard, :write_fenced], [:fathom, :shard, :write_unfenced]],
+      fn [_, _, event], _m, meta, _ -> send(test_pid, {event, meta}) end,
       nil
     )
 
@@ -248,8 +337,16 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
       assert {:ok, %{rows: [["a"]]}} = ShardExecutor.execute(conn, stmt("SELECT v FROM kv"))
 
       # Recovery: the heartbeat is comfortably valid again → a revalidate reconfirms ownership and
-      # lifts the fence. revalidate_lapse runs the fence synchronously in the coordinator, so a
-      # :sys.get_state after it is a clean sync point (no async flush-task race).
+      # lifts the fence.
+      #
+      # SYNCED ON `:write_unfenced`, not on `:sys.get_state`. This comment used to read
+      # "revalidate_lapse runs the fence synchronously in the coordinator, so a :sys.get_state
+      # after it is a clean sync point" — true when written, and no longer: expert review
+      # 2026-08-26 #13a moved that check into a monitored task, because running a real
+      # `check_lease` GET inline blocked the coordinator's mailbox and the lapse broadcast reaches
+      # EVERY open coordinator at once. The behaviour under test is unchanged; only the sync point
+      # was an implementation detail. The telemetry event is the observable, so this no longer
+      # depends on where the check runs.
       :sys.replace_state(hb, fn s ->
         forged = %{s | mono_deadline_ms: System.monotonic_time(:millisecond) + 60_000}
         Heartbeat.publish_status(forged)
@@ -257,6 +354,7 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
       end)
 
       send(coordinator, :revalidate_lapse)
+      assert_receive {:write_unfenced, %{shard_id: ^shard}}, 2_000
       assert :sys.get_state(coordinator).not_valid_since == nil
       refute WriteFence.fenced?(shard)
 

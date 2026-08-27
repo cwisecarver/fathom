@@ -617,6 +617,11 @@ defmodule Fathom.Telemetry do
         description:
           "Shards whose WRITES were refused because the node's heartbeat went stale past the steal margin (:fence_writes_when_stealable, ON in prod). Deliberate — it collapses the loss window from the whole partition to ~ttl+margin — but it is a tenant-visible WRITE OUTAGE while it lasts, and reads keep succeeding so nothing else looks wrong"
       ),
+      counter("fathom.shard.write_unfenced.count",
+        event_name: [:fathom, :shard, :write_unfenced],
+        description:
+          "Write fences LIFTED — a coordinator reconfirmed ownership after being provably stealable (#13a). The closing half of write_fenced: a sustained gap between the two counts is a partition that opened breakers and has not healed"
+      ),
 
       # Migration wedge — the template diverged from the fleet and no rollout can proceed.
       counter("fathom.migrator.template_drift.count",
