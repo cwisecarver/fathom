@@ -1158,50 +1158,9 @@ defmodule Fathom.Migrator do
     end)
   end
 
-  # Bulk-enqueue a fleet sweep in batched round-trips instead of one Oban.insert per
-  # shard (a fleet-wide rollout was N serialized inserts). Takes `{shard_id, changeset}`
-  # pairs. insert_all/1 skips the workers' `unique` config, so we first drop shards that
-  # already have an in-flight job for this worker (preserving per-shard uniqueness against
-  # the lazy path, earlier sweeps, and the hourly reconcile), then insert the rest. A shard
-  # slipping in between the check and the insert only costs a redundant idempotent job.
-  #
-  # CHUNKED because Postgres's wire protocol caps a statement at 65,535 bind parameters:
-  # one unpartitioned Oban.insert_all crashed past ~7,281 jobs (9 params each), which a
-  # fleet revert (unbounded — every shard at a version) or a big rollout limit hits at
-  # scale (found by scripts/directory_scale.exs at 3.1M directory rows). 5,000 pairs per
-  # chunk keeps both statements comfortably under the cap (dedup: 1 param/id; insert:
-  # 9 params/job = 45,000).
-
-  defp enqueue_unique([]), do: 0
-
-  defp enqueue_unique(id_changesets) do
-    id_changesets
-    |> Enum.chunk_every(@enqueue_chunk)
-    |> Enum.reduce(0, fn chunk, acc -> acc + enqueue_unique_chunk(chunk) end)
-  end
-
-  defp enqueue_unique_chunk(id_changesets) do
-    shard_ids = Enum.map(id_changesets, &elem(&1, 0))
-    worker = id_changesets |> hd() |> elem(1) |> Ecto.Changeset.get_field(:worker)
-
-    already_queued =
-      from(j in Job,
-        where:
-          j.worker == ^worker and j.state in @unique_states and
-            fragment("?->>'shard_id'", j.args) in ^shard_ids,
-        select: fragment("?->>'shard_id'", j.args)
-      )
-      |> Repo.all()
-      |> MapSet.new()
-
-    changesets =
-      for {shard_id, changeset} <- id_changesets,
-          not MapSet.member?(already_queued, shard_id),
-          do: changeset
-
-    case changesets do
-      [] -> 0
-      cs -> cs |> Oban.insert_all() |> length()
-    end
-  end
+  # LIFTED to `Fathom.BulkEnqueue` (expert review 2026-08-26 #31), because `RetirementJob`,
+  # `RevokeJob` and `DeleteJob` all want the same thing and the token revoke had reimplemented the
+  # shape this replaces. Delegated rather than inlined at the call sites so this module's existing
+  # readers still find `enqueue_unique/1` where they expect it.
+  defp enqueue_unique(id_changesets), do: Fathom.BulkEnqueue.unique(id_changesets)
 end

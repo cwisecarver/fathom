@@ -113,14 +113,52 @@ defmodule Fathom.HranaAuth.Ledger do
   a cron or to retry after a partial failure.
   """
   @spec shards_issued_before(DateTime.t()) :: [String.t()]
-  def shards_issued_before(%DateTime{} = cutoff) do
-    Repo.all(
-      from i in Issuance,
-        join: s in Fathom.Directory.Shard,
-        on: s.shard_id == i.shard_id,
-        where: i.minted_at < ^cutoff and i.token_version >= s.token_version,
-        distinct: true,
-        select: i.shard_id
+  def shards_issued_before(%DateTime{} = cutoff), do: Enum.to_list(stream_issued_before(cutoff))
+
+  @doc """
+  Keyset-streams the same set a page at a time, ordered by `shard_id` (expert review 2026-08-26
+  #31).
+
+  `shards_issued_before/1` was an unbounded `distinct` join with **no `LIMIT`**, and
+  `HranaAuth.revoke_issued_before/2` applied its `:limit` with `Enum.take` AFTER the whole result
+  was in memory — so `limit: 100` still loaded every affected shard in the fleet. That runs during
+  a credential-compromise response, i.e. when it matters most.
+
+  `distinct` plus keyset paging is safe here because both are on the SAME column: `DISTINCT ON
+  shard_id` with `shard_id > last` and `ORDER BY shard_id` cannot skip or repeat a row, which is
+  not true of a distinct over one column paged by another.
+
+  **The join predicate is worth knowing about before trusting the plan.** `i.token_version >=
+  s.token_version` has no supporting index; the only issuance indexes are `[:minted_at]` and
+  `[:shard_id, :minted_at]`, so the `minted_at` range scan is the only selective step. Paging by
+  `shard_id` leans on the second of those. `EXPLAIN` this if issuances ever densify — the finding
+  flags it as the thing most likely to stop being true.
+  """
+  @spec stream_issued_before(DateTime.t(), pos_integer()) :: Enumerable.t()
+  def stream_issued_before(%DateTime{} = cutoff, page_size \\ 1_000) do
+    Stream.resource(
+      fn -> "" end,
+      fn last ->
+        ids =
+          Repo.all(
+            from i in Issuance,
+              join: s in Fathom.Directory.Shard,
+              on: s.shard_id == i.shard_id,
+              where:
+                i.minted_at < ^cutoff and i.token_version >= s.token_version and
+                  i.shard_id > ^last,
+              distinct: true,
+              order_by: [asc: i.shard_id],
+              limit: ^page_size,
+              select: i.shard_id
+          )
+
+        case ids do
+          [] -> {:halt, last}
+          _ -> {ids, List.last(ids)}
+        end
+      end,
+      fn _ -> :ok end
     )
   end
 end

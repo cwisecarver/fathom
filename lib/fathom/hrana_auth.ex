@@ -45,8 +45,18 @@ defmodule Fathom.HranaAuth do
 
   require Logger
 
-  alias Fathom.{Directory, ShardId}
-  alias Fathom.HranaAuth.{Ledger, Revocations}
+  alias Fathom.{BulkEnqueue, Directory, ShardId}
+  alias Fathom.HranaAuth.{Ledger, Revocations, RevokeJob}
+
+  # How many shards one bulk revoke insert covers. Smaller than `BulkEnqueue`'s own 5 000 chunk on
+  # purpose (expert review 2026-08-26 #31): the `tokens` queue runs at concurrency 3 and each job
+  # disconnects live clients, so the value of getting the FIRST shards revoking quickly beats the
+  # value of one large insert. BulkEnqueue re-chunks anyway if a caller passes more.
+  @revoke_enqueue_chunk 1_000
+
+  # Keyset page size for the revoke scan. Narrowed to the caller's `:limit` when one is given, so a
+  # bounded call reads a bounded number of ROWS and not merely a bounded number of results.
+  @revoke_page_size 1_000
 
   @salt "fathom hrana shard"
 
@@ -311,22 +321,50 @@ defmodule Fathom.HranaAuth do
     async? = Keyword.get(opts, :async, true)
     limit = Keyword.get(opts, :limit)
 
-    shards =
+    # PAGED, and the limit is a real one (expert review 2026-08-26 #31). This used to load the
+    # WHOLE affected set as one unbounded `distinct` join and then apply `:limit` with `Enum.take`
+    # — so `limit: 100` still materialized every affected shard in the fleet — and then
+    # `Enum.each`ed one `Oban.insert/1` per shard: N serialized round trips, each its own
+    # transaction, onto a `tokens` queue with concurrency 3. That is the identical shape
+    # `Migrator.enqueue_unique/1` was written to replace, and this runs during a
+    # credential-compromise response, i.e. when it matters most.
+    #
+    # `Stream.take/2` on a keyset stream stops FETCHING, not just counting, so a bounded call now
+    # reads a bounded number of rows.
+    # THE PAGE SIZE HAS TO HONOUR THE LIMIT, or the limit is not a real one. `Stream.take/2` alone
+    # only stops CONSUMING: with a 1 000-row page, `limit: 2` still fetched a full page. Caught by
+    # the regression test, which read 6 of 6 rows on a 6-shard fixture — the same defect this
+    # finding is about, one layer down.
+    page = if limit, do: min(limit, @revoke_page_size), else: @revoke_page_size
+
+    stream =
       cutoff
-      |> Ledger.shards_issued_before()
-      |> then(fn ids -> if limit, do: Enum.take(ids, limit), else: ids end)
+      |> Ledger.stream_issued_before(page)
+      |> then(fn s -> if limit, do: Stream.take(s, limit), else: s end)
 
-    Enum.each(shards, fn id ->
-      if async?, do: enqueue_revoke(id), else: revoke(id)
-    end)
-
-    {:ok, length(shards)}
-  end
-
-  defp enqueue_revoke(shard_id) do
-    %{shard_id: shard_id}
-    |> Fathom.HranaAuth.RevokeJob.new()
-    |> Oban.insert()
+    if async? do
+      # Bulk, deduplicated against in-flight RevokeJobs. `Oban.insert_all/1` does NOT honour a
+      # worker's `unique:` config, so `Fathom.BulkEnqueue.unique/1`'s explicit in-flight query is
+      # what keeps this from double-revoking — and a double revoke costs a second round of live
+      # client disconnects, which is exactly what `RevokeJob` says it exists to avoid.
+      stream
+      |> Stream.chunk_every(@revoke_enqueue_chunk)
+      |> Enum.reduce(0, fn ids, acc ->
+        acc + BulkEnqueue.unique(Enum.map(ids, &{&1, RevokeJob.new(%{shard_id: &1})}))
+      end)
+      |> then(&{:ok, &1})
+    else
+      # Synchronous mode revokes in-process; there is no job to batch, so it stays per-id. It is
+      # the operator/console path, not the fleet one.
+      {:ok,
+       Enum.reduce(stream, 0, fn id, acc ->
+         # Counted regardless of the individual result, matching the pre-#31 `Enum.each` +
+         # `length/1`: the return has always been "how many shards this call covered", not "how
+         # many succeeded".
+         _ = revoke(id)
+         acc + 1
+       end)}
+    end
   end
 
   @doc """

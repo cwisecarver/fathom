@@ -10,6 +10,7 @@ defmodule Fathom.HranaTokenLedgerTest do
   there was no list of what had been issued and no way to act on a time window.
   """
   use Fathom.DataCase, async: false
+  use Oban.Testing, repo: Fathom.Repo
 
   alias Fathom.Directory
   alias Fathom.HranaAuth
@@ -161,5 +162,80 @@ defmodule Fathom.HranaTokenLedgerTest do
       from(i in Fathom.HranaAuth.Issuance, where: i.shard_id == ^shard_id),
       set: [minted_at: then]
     )
+  end
+
+  # Expert review 2026-08-26 #31. `revoke_issued_before/2` called `Ledger.shards_issued_before/1` —
+  # an unbounded `distinct` join with NO LIMIT — and then applied `:limit` with `Enum.take` AFTER
+  # the whole result was in memory, so `limit: 100` still loaded every affected shard in the fleet.
+  # It then `Enum.each`ed one `Oban.insert/1` per shard: N serialized round trips, each its own
+  # transaction, onto a `tokens` queue with concurrency 3.
+  #
+  # This is a CREDENTIAL-COMPROMISE RESPONSE. It runs when it matters most.
+  describe "fleet revoke is bounded and batched (#31)" do
+    setup do
+      ids = for n <- 1..6, do: shard("blk#{n}")
+
+      for id <- ids do
+        {:ok, _} = Directory.resolve(id)
+        {:ok, _} = HranaAuth.token_for(id)
+        backdate(id, -3600)
+      end
+
+      %{ids: ids, cutoff: DateTime.add(DateTime.utc_now(), -60, :second)}
+    end
+
+    test "a limit stops FETCHING, not just counting", %{cutoff: cutoff} do
+      # The distinction the finding is about. Counting rows read rather than queries issued,
+      # because both shapes issue queries — only the materializing one reads the whole set.
+      # Scoped to this process: a telemetry handler is VM-global.
+      rows = :counters.new(1, [])
+      handler = "revoke-rows-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:fathom, :repo, :query],
+          fn _e, _m, meta, _c ->
+            with true <- self() == test_pid,
+                 "hrana_token_issuances" <- meta[:source],
+                 {:ok, %{num_rows: n}} <- meta[:result] do
+              :counters.add(rows, 1, n)
+            end
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      assert {:ok, 2} = HranaAuth.revoke_issued_before(cutoff, async: false, limit: 2)
+
+      read = :counters.get(rows, 1)
+
+      assert read <= 3,
+             "a limit: 2 revoke read #{read} issuance rows out of 6 — the limit is still being " <>
+               "applied after the whole set is in memory, which is the #31 defect. During a " <>
+               "credential compromise that set is the fleet."
+    end
+
+    test "the async path enqueues in BULK and dedups against in-flight jobs", %{
+      ids: ids,
+      cutoff: cutoff
+    } do
+      # Oban.insert_all/1 does NOT honour a worker's `unique:` config, so the dedup has to be
+      # explicit — and a double revoke costs a second round of live-client disconnects, which is
+      # what RevokeJob says it exists to avoid.
+      assert {:ok, 6} = HranaAuth.revoke_issued_before(cutoff, async: true)
+
+      for id <- ids do
+        assert_enqueued(worker: Fathom.HranaAuth.RevokeJob, args: %{"shard_id" => id})
+      end
+
+      # Second sweep: every job is still in flight, so nothing new is inserted.
+      assert {:ok, 0} = HranaAuth.revoke_issued_before(cutoff, async: true),
+             "the bulk path re-enqueued jobs that were already in flight — insert_all does not " <>
+               "honour :unique, so the explicit dedup query is the only thing preventing a " <>
+               "second round of client disconnects"
+    end
   end
 end
