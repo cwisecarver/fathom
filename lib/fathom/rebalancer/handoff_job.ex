@@ -67,9 +67,9 @@ defmodule Fathom.Rebalancer.HandoffJob do
       :ok
     else
       {:error, reason} when attempt >= max ->
-        result = revert(shard, from, reason, max)
-        emit(:stop, %{outcome: :reverted, shard_id: shard, from_node: from, to_node: to})
-        result
+        # ASK WHO ACTUALLY HOLDS THE LEASE before reverting (expert review 2026-08-26 #20).
+        # `{:error, :drain_timeout}` is a statement about the COMMAND CHANNEL, not about the shard.
+        settle_or_revert(shard, from, to, reason, max)
 
       {:error, reason} ->
         # Flip not applied yet, or source's connections haven't finished — retry (both
@@ -90,6 +90,81 @@ defmodule Fathom.Rebalancer.HandoffJob do
   # cooldown, so a wedged hot shard backs off instead of re-proposing every tick (#4). Cancel
   # any drain whose await timed out (row still pending) so the source poller can't fire it
   # after traffic was restored (#7).
+  # The last attempt failed. Before assuming the handoff did not happen, ask the data plane
+  # (expert review 2026-08-26 #20).
+  #
+  # `drain/2` returns `{:error, :drain_timeout}` when `Commands.await/2` expires — which says the
+  # command channel did not answer in time, NOT that the shard failed to move. The source may have
+  # drained, flushed and released its lease, and the target may already hold it.
+  #
+  # Reverting in that state is the worst available outcome. `revert/4` marks the override failed and
+  # re-renders the LB map, sending traffic back to the source; the source's `acquire_lease` then
+  # finds a LIVE lease held by the target, and neither of `Fathom.Shards`' hold paths applies —
+  # `handoff_pin_here?/1` is now false (the override carries `failed_at`) and the crash-failover
+  # hold is false because the target's heartbeat keeps advancing. So `do_checkout/3` returns
+  # `{:error, {:shard_held, target}}` immediately and the tenant 503s on EVERY request until the
+  # target's coordinator idles out — `:shard_idle_ms`, 60 s at the default — on the shard that, by
+  # construction, is the least likely in the fleet to go idle. The revert exists so that "a stuck
+  # shard is restored, not left pinned-and-unavailable" (docs/rebalancing.md §3); on this path it
+  # produced exactly the unavailability it was written to prevent.
+  #
+  # `lease_holder/1` is the callback that exists for this — `Fathom.Shard.Storage` calls it "the
+  # authoritative data-plane liveness check before unpinning".
+  #
+  # FAILS CLOSED. Only a positive identification of the TARGET keeps the pin; `:free`, the source,
+  # an unrecognised holder, a store error, or an exit all revert exactly as before. A revert is
+  # always safe (the shard is served by the source); keeping the pin on a bad reading is not.
+  defp settle_or_revert(shard, from, to, reason, max) do
+    # `to != from` matters: when they are equal the handoff is a no-op and the probe is
+    # DEGENERATE — "the target holds the lease" is trivially true of the source too, so it
+    # distinguishes nothing and a drain timeout means only that the command channel is broken.
+    # Learning nothing is a reason to take the conservative branch, not to skip it.
+    if to != from and lease_held_by?(shard, to) do
+      Logger.info(
+        "rebalance: handoff #{shard} #{from} -> #{to} reported #{inspect(reason)}, but #{to} holds " <>
+          "the lease — the handoff succeeded and the command channel lagged. Keeping the pin."
+      )
+
+      # The drain row is still pending; cancel it for the same reason `revert/4` does, so the
+      # source poller cannot fire it later against a shard that has already moved (#7).
+      Commands.cancel_pending_drains(shard)
+      emit(:stop, %{outcome: :completed, shard_id: shard, from_node: from, to_node: to})
+      :ok
+    else
+      result = revert(shard, from, reason, max)
+      emit(:stop, %{outcome: :reverted, shard_id: shard, from_node: from, to_node: to})
+      result
+    end
+  end
+
+  # Read-only, and deliberately strict: anything that is not "the target holds it" is false.
+  defp lease_held_by?(shard, node_key) do
+    case Fathom.Shard.Storage.lease_holder(shard) do
+      {:held, owner} -> owner_is_node?(owner, node_key)
+      _ -> false
+    end
+  rescue
+    _ -> false
+  catch
+    :exit, _ -> false
+  end
+
+  # A lease owner is `Heartbeat.owner/0` — `"#{node()}##{incarnation}"` — so this compares the node
+  # PREFIX rather than the whole string, anchored at the separator so `"node1"` cannot match
+  # `"node10#abc"`.
+  #
+  # KNOWN LIMIT, and it fails in the safe direction: the handoff's `to`/`from` are
+  # `Rebalancer.node_key/0`, which is `:node_key || node()`, while the lease owner is built from
+  # `node()` alone. On a deployment that SETS `:node_key` to something other than the node name the
+  # two never match, this returns false, and the job reverts exactly as it did before — no new
+  # hazard, just no benefit there. (`docs/configuration.md` describes `NODE_KEY` as covering the
+  # "heartbeat object", which `Heartbeat.owner/0` does not currently honour; that drift is worth a
+  # look on its own and is deliberately not chased here.)
+  defp owner_is_node?(owner, node_key) when is_binary(owner) and is_binary(node_key),
+    do: owner == node_key or String.starts_with?(owner, node_key <> "#")
+
+  defp owner_is_node?(_, _), do: false
+
   defp revert(shard, from, reason, max) do
     Overrides.mark_failed(shard)
     Commands.cancel_pending_drains(shard)

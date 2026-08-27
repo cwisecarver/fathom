@@ -228,4 +228,87 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
     assert job2.id == job1.id, "deduped to the still-in-flight handoff"
     assert length(all_enqueued(worker: HandoffJob, args: %{"shard_id" => shard})) == 1
   end
+
+  # Expert review 2026-08-26 #20. `drain/2` returns `{:error, :drain_timeout}` when
+  # `Commands.await/2` expires — a statement about the COMMAND CHANNEL, not about the shard. The
+  # source may have drained, flushed and released its lease, and the target may already hold it.
+  #
+  # Reverting there is the worst available outcome: `revert/4` marks the override failed and
+  # re-renders the LB map, sending traffic back to the source, whose `acquire_lease` then finds a
+  # LIVE lease held by the target. Neither of `Fathom.Shards`' hold paths applies —
+  # `handoff_pin_here?/1` is false (the override now carries `failed_at`) and the crash-failover
+  # hold is false (the target's heartbeat keeps advancing) — so the tenant 503s on EVERY request
+  # until the target's coordinator idles out, `:shard_idle_ms` = 60 s, on the shard that by
+  # construction is the least likely in the fleet to go idle.
+  #
+  # `from != to` in these two, unlike every other test in this file: with from == to the probe is
+  # degenerate and distinguishes nothing, which is exactly why the code refuses to act on it.
+  describe "a drain timeout consults the data plane before reverting (#20)" do
+    setup do
+      prev_warm = Application.get_env(:fathom, :handoff_warm_timeout_ms)
+      prev_drain = Application.get_env(:fathom, :handoff_drain_timeout_ms)
+      Application.put_env(:fathom, :handoff_warm_timeout_ms, 50)
+      Application.put_env(:fathom, :handoff_drain_timeout_ms, 50)
+
+      on_exit(fn ->
+        restore(:handoff_warm_timeout_ms, prev_warm)
+        restore(:handoff_drain_timeout_ms, prev_drain)
+      end)
+
+      :ok
+    end
+
+    test "the pin is KEPT when the target already holds the lease", %{shard: shard, node: node} do
+      # The target is this node and it holds the lease (an open coordinator); the source is a
+      # foreign node whose poller does not exist here, so the drain command is never answered and
+      # the await times out — the exact shape the finding is about.
+      {:ok, _pid, _ref, _path} = Shards.checkout(shard)
+
+      assert {:held, owner} = Fathom.Shard.Storage.lease_holder(shard),
+             "fixture: the target must actually hold the lease, or this test proves nothing"
+
+      assert String.starts_with?(owner, node),
+             "fixture: the lease owner (#{owner}) is not this node (#{node})"
+
+      args = %{
+        "shard_id" => shard,
+        "from_node" => "source@elsewhere",
+        "to_node" => node,
+        "q_per_s" => 500.0
+      }
+
+      assert :ok = perform_job(HandoffJob, args, attempt: 3),
+             "the handoff succeeded and the command channel merely lagged; reverting here strands " <>
+               "the tenant for a full :shard_idle_ms"
+
+      o = Overrides.for_shard(shard)
+      assert o != nil
+      assert o.failed_at == nil, "the pin was reverted even though the target holds the lease"
+      assert o.pinned_node == node
+
+      # Still cancelled, for the same reason revert/4 cancels it (#7): the row is pending and the
+      # source poller must not fire it later against a shard that has already moved.
+      assert Commands.cancel_pending_drains(shard) == 0
+    end
+
+    test "it still reverts when the target does NOT hold the lease", %{shard: shard, node: node} do
+      # The other half, and the one that keeps this from being a rubber stamp: no coordinator, so
+      # the lease is free and nothing says the handoff happened. Fail closed.
+      assert :free = Fathom.Shard.Storage.lease_holder(shard),
+             "fixture: the lease must be free for this to exercise the revert branch"
+
+      args = %{
+        "shard_id" => shard,
+        "from_node" => "source@elsewhere",
+        "to_node" => node,
+        "q_per_s" => 500.0
+      }
+
+      assert {:cancel, _} = perform_job(HandoffJob, args, attempt: 3)
+
+      o = Overrides.for_shard(shard)
+      assert o != nil, "override retained as a cooldown record after revert"
+      assert o.failed_at != nil, "a handoff nobody can confirm must revert, not keep the pin"
+    end
+  end
 end
