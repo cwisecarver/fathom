@@ -1111,20 +1111,38 @@ defmodule Fathom.Migrator do
     # chunk, so memory stays bounded regardless of fleet size.
     remaining = Directory.count_at_version(from_version)
 
+    # ONE JOIN, not O(N/5000) round trips with 5 000 binds each (expert review 2026-08-26 #34).
+    # The relation wanted — "RevertJobs in a live state whose shard is still at this version" — is
+    # a single join, and an operator polls this repeatedly while watching an emergency fleet revert
+    # drain.
+    #
+    # MEASURED, because the finding flags its own falsifying condition: "if the planner hash-joins
+    # over the whole live job set rather than using oban_jobs_worker_shard_id_live_index, the
+    # current chunked form may genuinely be better and this finding is wrong."
+    #
+    # EXPLAIN (ANALYZE) on 20 000 shards at the version, 20 000 live RevertJobs and 60 000 other
+    # live jobs: the planner DOES hash-join (Seq Scan on oban_jobs, 60 000 rows removed by filter,
+    # hashed against a 20 000-row scan of shards). And it is still much faster —
+    # **chunked 35 ms vs joined 6 ms**, identical results. The condition the finding named as
+    # falsifying occurs and turns out not to matter at this size, because 4 round trips carrying
+    # 5 000 binds each plus streaming 20 000 ids costs more than one hash join over 80 000 rows.
+    #
+    # WHAT IS NOT MEASURED, and is the honest caveat: at 1M shards the hash build is ~50x larger
+    # (~1M rows) and may spill. The chunked form's bind-parameter cost grows too, so this is not
+    # obviously the wrong trade there — but it is unverified above 20k, and `EXPLAIN (ANALYZE)` on
+    # a production-sized directory is the check to run before assuming it holds.
     in_flight =
-      Directory.stream_ids_at_version(from_version, @enqueue_chunk)
-      |> Stream.chunk_every(@enqueue_chunk)
-      |> Enum.reduce(0, fn chunk, acc ->
-        acc +
-          Repo.aggregate(
-            from(j in Job,
-              where: j.worker == "Fathom.Migrator.RevertJob",
-              where: j.state in @unique_states,
-              where: fragment("?->>'shard_id'", j.args) in ^chunk
-            ),
-            :count
-          )
-      end)
+      Repo.aggregate(
+        from(j in Job,
+          join: s in Directory.Shard,
+          on: s.shard_id == fragment("?->>'shard_id'", j.args),
+          where: j.worker == "Fathom.Migrator.RevertJob",
+          where: j.state in @unique_states,
+          where: s.schema_version == ^from_version,
+          where: s.status == "active"
+        ),
+        :count
+      )
 
     %{remaining: remaining, in_flight: in_flight, failed: Directory.count_failed()}
   end

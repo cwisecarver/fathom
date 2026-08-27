@@ -690,4 +690,71 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
   end
 
   defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
+  # Expert review 2026-08-26 #34. `revert_status/1`'s `in_flight` keyset-streamed EVERY active
+  # shard_id at the version in 5 000-row pages and ran one `Repo.aggregate` over `oban_jobs` per
+  # page — ~200 round trips and ~1M bind parameters at 1M shards, and an operator polls this
+  # repeatedly while watching an emergency fleet revert drain.
+  #
+  # The finding named its own falsifying condition (the planner hash-joining instead of using
+  # `oban_jobs_worker_shard_id_live_index`, which would make the chunked form better). Measured on
+  # 20 000 shards / 80 000 jobs: the planner DOES hash-join, and the join is still 6x faster
+  # (35 ms -> 6 ms) with identical results. That measurement is recorded at the call site.
+  #
+  # What this test pins is the CORRECTNESS half of that swap — the join must count the same
+  # relation the chunked form did, including the boundaries where a naive join goes wrong.
+  describe "revert_status/1 in_flight counts the same relation as the chunked form (#34)" do
+    test "counts only live RevertJobs whose shard is still at the version" do
+      at_version = "rs_at_#{System.unique_integer([:positive])}"
+      moved_on = "rs_moved_#{System.unique_integer([:positive])}"
+      other_worker = "rs_other_#{System.unique_integer([:positive])}"
+
+      for id <- [at_version, moved_on, other_worker] do
+        {:ok, _} = Directory.resolve(id)
+      end
+
+      {:ok, _} = Directory.cutover(at_version, 3)
+      {:ok, _} = Directory.cutover(other_worker, 3)
+      # This one has already reverted past the version, so its job must NOT be counted.
+      {:ok, _} = Directory.cutover(moved_on, 2)
+
+      {:ok, _} = Oban.insert(RevertJob.new(%{shard_id: at_version, to_version: 2}))
+      {:ok, _} = Oban.insert(RevertJob.new(%{shard_id: moved_on, to_version: 2}))
+
+      # A different worker for a shard that IS at the version — the worker predicate has to hold.
+      {:ok, _} = Oban.insert(ShardMigrationJob.new(%{shard_id: other_worker, target: 4}))
+
+      assert %{in_flight: 1} = Migrator.revert_status(3)
+    end
+
+    test "a shard with no job, and a job with no shard, are both excluded" do
+      # The join's two failure modes. An inner join drops a job whose shard row is gone (a deleted
+      # tenant mid-revert), which is correct — but it would also drop the shard if the join
+      # direction were wrong, so both sides are asserted.
+      no_job = "rs_nojob_#{System.unique_integer([:positive])}"
+      {:ok, _} = Directory.resolve(no_job)
+      {:ok, _} = Directory.cutover(no_job, 7)
+
+      {:ok, _} = Oban.insert(RevertJob.new(%{shard_id: "rs_ghost_never_resolved", to_version: 6}))
+
+      assert %{in_flight: 0} = Migrator.revert_status(7)
+    end
+
+    test "a completed job is not in flight" do
+      # `:completed` is deliberately absent from @unique_states; the count must follow.
+      id = "rs_done_#{System.unique_integer([:positive])}"
+      {:ok, _} = Directory.resolve(id)
+      {:ok, _} = Directory.cutover(id, 5)
+
+      {:ok, job} = Oban.insert(RevertJob.new(%{shard_id: id, to_version: 4}))
+      assert %{in_flight: 1} = Migrator.revert_status(5)
+
+      Fathom.Repo.update_all(
+        from(j in Oban.Job, where: j.id == ^job.id),
+        set: [state: "completed"]
+      )
+
+      assert %{in_flight: 0} = Migrator.revert_status(5),
+             "a completed revert job is still counted as in flight"
+    end
+  end
 end
