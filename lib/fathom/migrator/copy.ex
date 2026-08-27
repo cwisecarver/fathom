@@ -58,6 +58,27 @@ defmodule Fathom.Migrator.Copy do
 
     with :ok <- validate_transforms(chain, shard_id),
          :ok <- copy_file(source_path, dest_path),
+         # SERVING CONFIGURATION ON PURPOSE — a `purpose: :scratch` handle was built, MEASURED, and
+         # REVERTED (expert review 2026-08-26 #29). Do not rebuild it without new evidence.
+         #
+         # The finding is right about the mechanism: this destination is a temp file that gets
+         # uploaded and then `drop_temp`'d, so it pays `synchronous=FULL`'s WAL fsync per commit
+         # plus a `wal_checkpoint(TRUNCATE)` main-DB fsync per chain step for bytes deleted seconds
+         # later. The fix (`journal_mode=MEMORY`, `synchronous=OFF`, no checkpoint) was implemented
+         # and run through the audit's own falsifying experiment.
+         #
+         # MEASURED: `copy_keystone_rows_per_s` 2 994 909 without vs 2 977 254 with — **-0.6%**,
+         # inside noise. The audit's own instruction for that outcome is "the copy is dominated by
+         # `File.cp` plus the S3 round trips, this is not the bottleneck — bank that and stop".
+         #
+         # Two reasons it stayed reverted rather than shipping as a free win. The metric is
+         # single-threaded and one chain step, so it cannot see the finding's ACTUAL claim (fsync
+         # pressure at 10 concurrent migration workers) — the number proves no throughput win, not
+         # no fsync reduction. And dropping the checkpoint introduces a coupling that did not exist
+         # before: it is only safe BECAUSE `journal_mode=MEMORY` leaves no `-wal` to fold, so a
+         # future caller opening this path with the serving configuration would silently upload an
+         # incomplete file. Paying a new correctness coupling for an unmeasurable gain is the wrong
+         # trade; if the concurrency claim is ever measured on the rig, this becomes worth it again.
          {:ok, conn} <- Connection.open(dest_path) do
       try do
         Enum.reduce_while(chain, :ok, fn step, :ok ->
