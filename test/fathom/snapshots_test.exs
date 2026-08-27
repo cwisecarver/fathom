@@ -92,6 +92,79 @@ defmodule Fathom.SnapshotsTest do
            "the fenced restore with the live etag reverts to the snapshot (a only)"
   end
 
+  # Expert review 2026-08-26 #25. `Snapshots.restore/3` pulled the snapshot to a temp purely to
+  # read four bytes at file offset 60 (`PRAGMA user_version`, the schema-boundary guard), deleted
+  # that temp, and then had the backend fetch the SAME key again to promote it. Two costs: a
+  # doubled full-object GET and shard-sized temp write, and — the reason this test exists — the
+  # bytes that GATED the restore were not the bytes that became live. Nothing closed that gap.
+  #
+  # The invariant pinned here is that gap, not the byte count: whatever `snapshot_user_version`
+  # inspected is what lands on the live object. It is exercised by mutating the stored snapshot in
+  # exactly the window between the two, via FaultyStorage's `:restore_snapshot` hook, which fires
+  # at the same point on both the old and new promotion paths.
+  #
+  # Why it discriminates on the Local backend: Local's `restore_snapshot/3` promotes by copying the
+  # SNAPSHOT OBJECT, so swapping that object mid-restore promotes the swapped bytes. The one-
+  # download shape promotes the already-pulled temp, so the swap cannot reach live. (The doubled
+  # GET itself is an S3-only shape — Local does a server-side copy and never downloads twice — so
+  # counting downloads here would measure nothing. AGENTS.md: a gap between the double and the real
+  # backend's contract silently exempts every bug in that contract.)
+  test "the bytes a restore version-checks are the bytes it promotes", %{shard: shard} do
+    write!(shard, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('checked')"])
+    flush!(shard)
+    assert {:ok, snap} = Snapshots.create(shard)
+
+    # A DIFFERENT set of bytes, staged as a file, to swap in mid-restore. Distinguishable by
+    # content, so the assertion cannot pass on a coincidence.
+    swapped = Path.join(System.tmp_dir!(), "snap_swap_#{System.unique_integer([:positive])}.db")
+    {:ok, conn} = Fathom.Shard.Connection.open(swapped)
+    :ok = Fathom.Shard.Connection.exec(conn, "CREATE TABLE t (v TEXT)")
+    :ok = Fathom.Shard.Connection.exec(conn, "INSERT INTO t VALUES ('swapped')")
+    :ok = Fathom.Shard.Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Fathom.Shard.Connection.close(conn)
+
+    snapshot_object = Path.join(Fathom.Shard.Storage.Local.dir(), "#{shard}@snap-#{snap}.db")
+
+    assert File.exists?(snapshot_object),
+           "fixture: the snapshot object is not where this test expects it"
+
+    # Live moves past the snapshot so a restore is observable at all.
+    write!(shard, ["UPDATE t SET v = 'live'"])
+    flush!(shard)
+
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    # Fires once the promotion begins — after the version check has already read the snapshot.
+    # Filtered on the shard id: `:faulty_before` is global Application env and other tests'
+    # coordinators are still live.
+    swap = fn id ->
+      if id == shard do
+        File.cp!(swapped, snapshot_object)
+      end
+
+      :ok
+    end
+
+    Application.put_env(:fathom, :faulty_before, {:restore_snapshot, swap})
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+
+      for suffix <- ["", "-wal", "-shm"], do: File.rm(swapped <> suffix)
+    end)
+
+    assert :ok = Snapshots.restore(shard, snap)
+
+    assert read_one(shard, "SELECT v FROM t") == [["checked"]],
+           "live holds bytes the restore never version-checked; " <>
+             "the snapshot was re-read after the guard rather than promoted from the checked copy"
+  end
+
   test "list returns snapshots newest-first and drop removes one", %{shard: shard} do
     write!(shard, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('a')"])
     flush!(shard)

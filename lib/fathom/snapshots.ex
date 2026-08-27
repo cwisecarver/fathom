@@ -103,8 +103,28 @@ defmodule Fathom.Snapshots do
     force? = Keyword.get(opts, :force, false)
 
     with {:ok, id} <- cast(shard_id),
-         {:ok, snapshot_id} <- cast_snapshot_id(snapshot_id),
-         {:ok, snap_version} <- snapshot_user_version(id, snapshot_id),
+         {:ok, snapshot_id} <- cast_snapshot_id(snapshot_id) do
+      # ONE download for the whole restore (expert review 2026-08-26 #25). The snapshot is pulled
+      # to `tmp`, its `PRAGMA user_version` is read from THOSE bytes, and THOSE bytes are what gets
+      # promoted. Previously this pulled the snapshot to a temp, read four bytes at offset 60,
+      # deleted the temp, and then `Storage.restore_snapshot/3` downloaded the identical key a
+      # second time — so the version that GATED the restore was read from one download while a
+      # different download's bytes became the live object. `tmp` is deleted on every path.
+      #
+      # Built from the CAST id, never the caller's raw string: this is a filesystem path, and
+      # `cast/1` is what rules out a traversal component in it.
+      tmp = restore_temp(id)
+
+      try do
+        do_restore(id, snapshot_id, opts, force?, tmp)
+      after
+        for suffix <- ["", "-wal", "-shm"], do: File.rm(tmp <> suffix)
+      end
+    end
+  end
+
+  defp do_restore(id, snapshot_id, opts, force?, tmp) do
+    with {:ok, snap_version} <- snapshot_user_version(id, snapshot_id, tmp),
          :ok <- check_schema_boundary(id, snap_version, force?) do
       case Shards.drain(id, Keyword.get(opts, :drain_timeout, @drain_timeout)) do
         :ok ->
@@ -137,7 +157,9 @@ defmodule Fathom.Snapshots do
               try do
                 case Storage.object_etag(id) do
                   {:ok, etag} ->
-                    case Storage.restore_snapshot(id, snapshot_id, etag) do
+                    # The bytes at `tmp` are the bytes `snapshot_user_version/3` version-checked
+                    # (#25) — same fence as `restore_snapshot/3`, one fewer full-object GET.
+                    case Storage.restore_snapshot_from_file(id, tmp, etag) do
                       :ok ->
                         # Align the directory to the restored file's version so it never lies about
                         # the schema (#7); a below-head version lets the laggard sweep converge it
@@ -169,27 +191,28 @@ defmodule Fathom.Snapshots do
     end
   end
 
-  # The schema version the snapshot's bytes carry (its file's PRAGMA user_version), read by pulling
-  # the snapshot to a temp — the version the live object will have after the copy-back. Guards the
+  # The schema version the snapshot's bytes carry (its file's PRAGMA user_version), read from the
+  # pulled bytes at `tmp` — the version the live object will have after the copy-back. Guards the
   # cross-version restore and drives the post-restore directory reconcile (#7).
-  defp snapshot_user_version(id, snapshot_id) do
-    tmp =
-      Path.join(
-        System.tmp_dir!(),
-        "fathom_snaprestore_#{id}_#{System.unique_integer([:positive])}.db"
-      )
-
-    try do
-      case Storage.pull_snapshot(id, snapshot_id, tmp) do
-        # `{:absent, _}` = no bytes written, incl. a steal sentinel (expert review
-        # 2026-08-01 #24) — previously a sentinel read as a real snapshot of an empty db.
-        {:absent, _} -> {:error, :snapshot_not_found}
-        {:ok, _etag} -> read_user_version(tmp)
-        {:error, reason} -> {:error, reason}
-      end
-    after
-      for s <- ["", "-wal", "-shm"], do: File.rm(tmp <> s)
+  #
+  # `tmp` is the CALLER's and is deliberately NOT deleted here (#25): it is the same file
+  # `restore/3` promotes, which is what makes the version that gated the restore and the bytes that
+  # land on live one and the same. Deleting it here was the second download's whole cause.
+  defp snapshot_user_version(id, snapshot_id, tmp) do
+    case Storage.pull_snapshot(id, snapshot_id, tmp) do
+      # `{:absent, _}` = no bytes written, incl. a steal sentinel (expert review
+      # 2026-08-01 #24) — previously a sentinel read as a real snapshot of an empty db.
+      {:absent, _} -> {:error, :snapshot_not_found}
+      {:ok, _etag} -> read_user_version(tmp)
+      {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp restore_temp(shard_id) do
+    Path.join(
+      System.tmp_dir!(),
+      "fathom_snaprestore_#{shard_id}_#{System.unique_integer([:positive])}.db"
+    )
   end
 
   defp read_user_version(path) do

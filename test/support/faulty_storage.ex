@@ -472,8 +472,22 @@ defmodule Fathom.Test.FaultyStorage do
   def restore_snapshot(shard_id, snapshot_id), do: Local.restore_snapshot(shard_id, snapshot_id)
 
   @impl true
-  def restore_snapshot(shard_id, snapshot_id, expected_etag),
-    do: Local.restore_snapshot(shard_id, snapshot_id, expected_etag)
+  def restore_snapshot(shard_id, snapshot_id, expected_etag) do
+    # `:restore_snapshot` fires at the moment the PROMOTION begins — after `Fathom.Snapshots`
+    # has already read the snapshot's `PRAGMA user_version` to gate the restore. On BOTH fenced
+    # clauses, deliberately: it is the hook that lets a test mutate the stored snapshot in exactly
+    # the window expert review 2026-08-26 #25 is about, and it has to fire at the same point in the
+    # pre-fix shape (this clause, which re-reads the snapshot object) and the post-fix one (below,
+    # which promotes the already-verified bytes) or the test would not discriminate.
+    run_before(:restore_snapshot, shard_id)
+    Local.restore_snapshot(shard_id, snapshot_id, expected_etag)
+  end
+
+  @impl true
+  def restore_snapshot_from_file(shard_id, local_path, expected_etag) do
+    run_before(:restore_snapshot, shard_id)
+    Local.restore_snapshot_from_file(shard_id, local_path, expected_etag)
+  end
 
   @impl true
   def drop_snapshot(shard_id, snapshot_id), do: Local.drop_snapshot(shard_id, snapshot_id)

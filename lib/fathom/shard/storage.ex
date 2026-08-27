@@ -389,6 +389,25 @@ defmodule Fathom.Shard.Storage do
   @callback drop_snapshot(shard_id :: String.t(), snapshot_id :: String.t()) ::
               :ok | {:error, term()}
 
+  # Fenced restore of ALREADY-DOWNLOADED snapshot bytes (expert review 2026-08-26 #25). Same fence
+  # and same failure shapes as `restore_snapshot/3`; the only difference is that the caller supplies
+  # the bytes instead of the backend fetching them.
+  #
+  # This exists so `Fathom.Snapshots.restore/3` downloads a snapshot ONCE. It used to pull the
+  # snapshot to a temp purely to read four bytes at file offset 60 (`PRAGMA user_version`, the
+  # schema-boundary guard), delete that temp, and then have `restore_snapshot/3` download the
+  # IDENTICAL key again to promote it. Beyond the doubled GET and the doubled shard-sized temp
+  # write, the version that GATED the restore was read from download #1 while download #2's bytes
+  # became the live object — a gap no code closed. One download makes the verified bytes and the
+  # promoted bytes the same bytes.
+  #
+  # The caller owns `local_path` and is responsible for deleting it; a backend must not consume it.
+  @callback restore_snapshot_from_file(
+              shard_id :: String.t(),
+              local_path :: Path.t(),
+              expected_etag :: String.t() | nil
+            ) :: :ok | {:error, :superseded} | {:error, term()}
+
   # Downloads a snapshot's bytes to `local_path` (`{:ok, etag}`, or `{:ok, nil}` if the snapshot is
   # absent) — the read counterpart of `pull` for the `@snap-<id>` namespace. `Fathom.Snapshots.restore`
   # uses it to read a snapshot's `PRAGMA user_version` and refuse a cross-schema-version restore
@@ -813,6 +832,19 @@ defmodule Fathom.Shard.Storage do
           :ok | {:error, :superseded} | {:error, term()}
   def restore_snapshot(shard_id, snapshot_id, expected_etag),
     do: backend().restore_snapshot(shard_id, snapshot_id, expected_etag)
+
+  @doc """
+  Fenced restore of snapshot bytes the caller ALREADY downloaded — same fence, same failure shapes
+  as `restore_snapshot/3`, one fewer full-object GET (expert review 2026-08-26 #25).
+
+  `Fathom.Snapshots.restore/3` reads the snapshot's `PRAGMA user_version` from a pulled temp to
+  gate a cross-schema-version restore; passing that same temp here means the bytes that were
+  version-checked are the bytes that get promoted. The caller owns `local_path` and deletes it.
+  """
+  @spec restore_snapshot_from_file(String.t(), Path.t(), String.t() | nil) ::
+          :ok | {:error, :superseded} | {:error, term()}
+  def restore_snapshot_from_file(shard_id, local_path, expected_etag),
+    do: backend().restore_snapshot_from_file(shard_id, local_path, expected_etag)
 
   @doc "Deletes a stored snapshot (idempotent)."
   @spec drop_snapshot(String.t(), String.t()) :: :ok | {:error, term()}

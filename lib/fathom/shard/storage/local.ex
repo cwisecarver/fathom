@@ -366,6 +366,31 @@ defmodule Fathom.Shard.Storage.Local do
   end
 
   @impl true
+  def restore_snapshot_from_file(shard_id, local_path, expected_etag) do
+    # The promotion half of restore_snapshot/3 against caller-supplied bytes (expert review
+    # 2026-08-26 #25). Same mutex, same etag fence, same ordering: File.stat FIRST so a missing
+    # source returns {:error, :enoent} before the etag comparison rather than the more alarming
+    # :superseded. The caller owns local_path — this does NOT delete it.
+    with_lock_mutex(shard_id, fn ->
+      with {:ok, _} <- File.stat(local_path) do
+        current =
+          case file_etag(remote_path(shard_id)) do
+            {:ok, etag} -> etag
+            {:error, :enoent} -> nil
+            {:error, reason} -> throw({:error, reason})
+          end
+
+        cond do
+          expected_etag != current -> {:error, :superseded}
+          true -> Storage.atomic_copy(local_path, remote_path(shard_id))
+        end
+      end
+    end)
+  catch
+    {:error, _} = err -> err
+  end
+
+  @impl true
   def restore_snapshot(shard_id, snapshot_id, expected_etag) do
     # Fenced snapshot restore (expert review 2026-07-18 #2): the snapshot counterpart of the
     # fenced migration restore/3. Under the per-shard mutex so the read-compare-write is atomic —
