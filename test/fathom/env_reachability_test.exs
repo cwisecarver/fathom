@@ -144,4 +144,52 @@ defmodule Fathom.EnvReachabilityTest do
            "a message in lib/ tells an operator to set these, but nothing reads them — the " <>
              "instruction cannot work: #{Enum.join(unread, ", ")}"
   end
+
+  # The reverse direction, deliberately NARROW (expert review 2026-08-26 #15).
+  #
+  # That finding asked for "a test asserting that a config key something reads is also an
+  # advertised env var" — the general form of this file's rule. The moduledoc above already
+  # records why the general form was measured and REJECTED: 180 keys are read in `lib/` and 85 are
+  # wired, so it would ship with ~98 exemptions, and an exemption list that long is not maintained.
+  #
+  # So this is the maintainable half: an explicit, short list of keys whose ABSENCE from the
+  # environment is a safety problem rather than a tuning inconvenience. Each entry carries the
+  # consequence of it being unreachable. The list is meant to stay small; a key belongs here only
+  # if an operator being unable to set it on a running release is itself an incident.
+  @must_be_env_reachable %{
+    "query_timeout_ms" =>
+      "the ONLY thing that makes a lock wait cancellable — unset, ten blocked statements park " <>
+        "the whole dirty-IO pool node-wide (#15)",
+    "query_max_rows" =>
+      "the row cap; uncapped, one SELECT * on a large tenant is a node-level memory event (#15)",
+    "max_checkouts_per_shard" =>
+      "the per-tenant checkout/fd blast-radius cap that HRANA_STREAM_IDLE_MS's own docs cite (#15)",
+    "shard_max_bytes" =>
+      "stops a shard acking writes past S3's single-PUT ceiling, where the damage is permanent",
+    "max_open_shards" => "per-node admission control; unset, a novel-shard burst has no ceiling"
+  }
+
+  test "every safety-critical config key is reachable from the environment" do
+    wired = read_names()
+
+    unreachable =
+      Enum.reject(@must_be_env_reachable, fn {key, _why} ->
+        MapSet.member?(wired, String.upcase(key))
+      end)
+
+    assert unreachable == [],
+           """
+           These config keys gate a SAFETY bound and have no environment wiring, so an operator
+           running a release cannot turn them on without a code change:
+
+           #{Enum.map_join(unreachable, "\n", fn {k, why} -> "  * :#{k} — #{why}" end)}
+
+           Wire them in config/runtime.exs (and give them a row in #{@doc_path}, which the sibling
+           test then enforces).
+
+           This list is deliberately short. The GENERAL rule — every read key must be env-wired —
+           was measured and rejected: 180 keys are read in lib/ and 85 are wired, so it would need
+           ~98 exemptions. See this module's moduledoc.
+           """
+  end
 end

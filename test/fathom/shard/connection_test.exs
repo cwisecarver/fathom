@@ -198,35 +198,19 @@ defmodule Fathom.Shard.ConnectionTest do
     assert Enum.map(rows, &hd/1) == ["keep", "keep2"]
   end
 
-  # Review 2026-07-23 #26: the query-deadline watchdog is now ONE long-lived process per
-  # connection, armed per query (was a fresh spawn per query). These pin the lifecycle the
-  # persistent shape must preserve: repeated timeouts on one connection each fire
-  # independently, and a healthy query between/after them is never spuriously interrupted
-  # (the 2026-07-18 #13 stale-interrupt guarantee, now enforced by the blocking
-  # late-done consume in watchdog_loop).
-  test "the per-connection watchdog re-arms across timeouts and healthy queries", %{conn: conn} do
-    prev = Application.get_env(:fathom, :query_timeout_ms)
-    Application.put_env(:fathom, :query_timeout_ms, 60)
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :query_timeout_ms, prev),
-        else: Application.delete_env(:fathom, :query_timeout_ms)
-    end)
-
-    # A recursive CTE big enough to blow a 60ms deadline.
-    slow = """
-    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 200000000)
-    SELECT count(*) FROM c
-    """
-
-    assert {:error, :query_timeout} = Connection.query(conn, slow, [])
-    # A healthy query right after the timeout runs clean on the same connection.
-    assert {:ok, %{rows: [[1]]}} = Connection.query(conn, "SELECT 1", [])
-    # A second timeout on the same (re-armed) watchdog fires independently.
-    assert {:error, :query_timeout} = Connection.query(conn, slow, [])
-    assert {:ok, %{rows: [[2]]}} = Connection.query(conn, "SELECT 2", [])
-  end
+  # NOTE: "the per-connection watchdog re-arms across timeouts and healthy queries" used to live
+  # here and MOVED to `test/fathom/connection_watchdog_test.exs` (expert review 2026-08-26 #15).
+  #
+  # It went red once on CI, OTP 29 only, seed 462447, asserting `{:error, :query_timeout}` and
+  # getting `{:ok, _}` from a recursive CTE counting to 200 000 000 — a query that cannot finish
+  # inside a 60 ms deadline. The deadline therefore was not in effect: this module is
+  # `async: true` and the test mutated the GLOBAL `:query_timeout_ms`, while
+  # `connection_watchdog_test.exs` is `async: false` for exactly that reason — its own moduledoc
+  # says "Not async: drives real SQLite connections and flips :query_timeout_ms".
+  #
+  # An async module writing a global that a sync module owns is the hazard, not the CTE's size, so
+  # the remedy is the one this repo already uses (review #7 this same session moved tests off async
+  # for an unnameable flake) and NOT a longer timeout, which AGENTS.md forbids.
 
   @tag :bench
   test "repeated point-query throughput clears the statement-cache floor", %{conn: conn} do

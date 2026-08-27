@@ -30,6 +30,21 @@ config :fathom, :max_open_shards, 10_000
 # in prod (a data-loss guard, like the flush fence itself), off in dev/test. See Fathom.Shard.WriteFence.
 config :fathom, :fence_writes_when_stealable, config_env() == :prod
 
+# Per-query statement deadline (expert review 2026-08-26 #15). PROD-ONLY, like the write fence
+# above and for the same reason: it changes what a query can do, so dev and test keep the
+# unbounded behaviour their fixtures assume, and the deployed default is bounded.
+#
+# Without it `Connection.with_deadline/3` — and therefore `Sqlite3.cancel/1` — never runs, so the
+# 2026-07-24 #1 fix that made a busy-handler wait CANCELLABLE had nothing in a default deployment
+# that would cancel it. With `set_busy_timeout(conn, 5000)` and `+SDio 10` (rel/vm.args.eex), ten
+# concurrently lock-blocked statements park the entire dirty-IO scheduler pool.
+#
+# 30 s, not something tighter: it has to sit comfortably ABOVE the 5 s busy timeout, or a query
+# that is merely waiting out ordinary lock contention would be cancelled instead of served. It
+# bounds the runaway (a full scan on a large shard), not the contended-but-fine case. Any client
+# fathom serves has given up long before 30 s. Set QUERY_TIMEOUT_MS=0 to restore the unbounded park.
+config :fathom, :query_timeout_ms, if(config_env() == :prod, do: 30_000)
+
 # Soften the cap above: at capacity, evict the least-recently-used IDLE shard (flush +
 # drop + release its lease) to admit a new open, rather than refusing with a 503. An idle
 # shard is bottomless-backed, so eviction costs only a cold re-open if it's touched again;

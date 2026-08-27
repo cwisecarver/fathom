@@ -145,4 +145,41 @@ defmodule Fathom.ConnectionWatchdogTest do
     assert {:ok, %{rows: [[1]]}} = Connection.query(conn, "SELECT 1", [])
     assert mailbox_size() == 0
   end
+
+  # MOVED HERE from `test/fathom/shard/connection_test.exs` (expert review 2026-08-26 #15).
+  #
+  # It went red once on CI — OTP 29 only, seed 462447 — asserting `{:error, :query_timeout}` and
+  # getting `{:ok, _}` from a recursive CTE counting to 200 000 000, a query that cannot possibly
+  # finish inside a 60 ms deadline. So the deadline was not in effect. That file is `async: true`
+  # and the test mutated the GLOBAL `:query_timeout_ms`; THIS file is `async: false` for precisely
+  # that reason, as its moduledoc has always said.
+  #
+  # The hazard is an async module writing a global that a sync module owns, not the size of the
+  # CTE — so the remedy is the move (the same one review #7 made this session for an unnameable
+  # flake) and explicitly NOT a longer timeout, which AGENTS.md forbids.
+  #
+  # The precondition is now asserted rather than assumed: if the deadline is not actually in force
+  # the test says so, instead of reporting a watchdog that "did not fire".
+  test "the per-connection watchdog re-arms across timeouts and healthy queries", %{conn: conn} do
+    Application.put_env(:fathom, :query_timeout_ms, 60)
+
+    assert Application.get_env(:fathom, :query_timeout_ms) == 60,
+           "fixture: the statement deadline is not in force, so a slow query cannot time out " <>
+             "and this test would be measuring nothing"
+
+    # Slow BY CONSTRUCTION: 200M recursive-CTE iterations cannot complete in 60 ms on any hardware,
+    # so this does not race the deadline it is testing.
+    slow = """
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 200000000)
+    SELECT count(*) FROM c
+    """
+
+    assert {:error, :query_timeout} = Connection.query(conn, slow, [])
+    # A healthy query right after the timeout runs clean on the same connection — the 2026-07-18
+    # #13 stale-interrupt guarantee.
+    assert {:ok, %{rows: [[1]]}} = Connection.query(conn, "SELECT 1", [])
+    # A second timeout on the same (re-armed) watchdog fires independently.
+    assert {:error, :query_timeout} = Connection.query(conn, slow, [])
+    assert {:ok, %{rows: [[2]]}} = Connection.query(conn, "SELECT 2", [])
+  end
 end

@@ -154,6 +154,34 @@ if ms = env_int.("HRANA_STREAM_IDLE_MS") do
   config :fathom, :hrana_stream_idle_ms, ms
 end
 
+# --- Per-query resource bounds (expert review 2026-08-26 #15) --------------------------------
+#
+# All three existed in the code and NONE had env wiring, so an operator running a release could
+# not turn any of them on without a code change. That mattered most for :query_timeout_ms, because
+# `Connection.with_deadline/3` — and therefore `Sqlite3.cancel/1` — only runs when it is set: the
+# 2026-07-24 #1 fix made a busy-handler wait CANCELLABLE, and nothing in a default deployment ever
+# cancelled it. With `set_busy_timeout(conn, 5000)` and `+SDio 10` (rel/vm.args.eex), ten
+# concurrently lock-blocked statements park the ENTIRE dirty-IO scheduler pool for 5 s — node-wide,
+# not per-tenant.
+#
+# It also invalidated an earlier decision: the 2026-07-19 #25 note closed the per-tenant
+# rate-limit finding on the grounds that noisy-neighbour was "already covered by the per-query
+# resource bounds". Those bounds were not reachable.
+#
+# QUERY_TIMEOUT_MS defaults to @default_query_timeout_ms in prod (see `Fathom.Shard.Connection`);
+# set 0 to opt out and restore the unbounded park.
+if ms = env_nonneg_int.("QUERY_TIMEOUT_MS") do
+  config :fathom, :query_timeout_ms, if(ms == 0, do: nil, else: ms)
+end
+
+if n = env_nonneg_int.("QUERY_MAX_ROWS") do
+  config :fathom, :query_max_rows, if(n == 0, do: nil, else: n)
+end
+
+if n = env_nonneg_int.("MAX_CHECKOUTS_PER_SHARD") do
+  config :fathom, :max_checkouts_per_shard, if(n == 0, do: nil, else: n)
+end
+
 # Scheduled point-in-time snapshots (expert review 2026-08-01 #18). Both jobs are fleet singletons
 # on the Oban crontab and INERT until sized here.
 #
