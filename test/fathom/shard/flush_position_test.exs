@@ -42,6 +42,33 @@ defmodule Fathom.Shard.FlushPositionTest do
       assert Storage.parse_position(Storage.encode_position(pos)) == pos
     end
 
+    # The salt-bearing form (expert review 2026-08-26 #2). `wal_gen` is SQLite's ckpt_seq, which
+    # RESTARTS AT 0 when SQLite recreates the `-wal` — measured on this codebase, two consecutive
+    # streams on a quiet shard both read ckpt_seq=0 with salts 977542977 then 978380554. So the
+    # generation number alone is not an ordering, and `salt1` is what says WHICH WAL a stamp
+    # describes. The follower side has always carried it (`FollowerLog.t()`); the object stamp can
+    # now carry it too.
+    #
+    # Nothing EMITS the four-field form yet — `Promote.fresher?/2` still ignores the salt, and what
+    # to do when salts differ is a parked decision (see the audit's #2 entry). This pins the wire
+    # format so both halves of a mixed-version fleet are already tolerant when it does.
+    test "round-trips the salt-bearing form, and treats a three-field stamp as salt-unknown" do
+      with_salt = %{epoch: 7, wal_gen: 3, offset: 12_392, salt1: 978_380_554}
+      assert Storage.encode_position(with_salt) == "7:3:12392:978380554"
+      assert Storage.parse_position(Storage.encode_position(with_salt)) == with_salt
+
+      # A stamp written before #2 parses as before and simply carries no salt — ABSENT, not zero.
+      # Zero is a real salt value, so inventing one would be a fabricated identity.
+      parsed = Storage.parse_position("7:3:12392")
+      assert parsed == %{epoch: 7, wal_gen: 3, offset: 12_392}
+      refute Map.has_key?(parsed, :salt1)
+
+      # A malformed salt refuses the WHOLE stamp rather than degrading to the three-field form:
+      # this function's rule is that anything unexpected is nil, never a partial guess.
+      assert Storage.parse_position("7:3:12392:x") == nil
+      assert Storage.parse_position("7:3:12392:-1") == nil
+    end
+
     # Every one of these must be `nil` rather than a guess. `nil` means "unknown", and the only
     # consumer treats unknown as "never override the stored object" — so garbage degrades to the
     # safe answer instead of a fabricated ordering that could discard a lineage.
@@ -50,7 +77,9 @@ defmodule Fathom.Shard.FlushPositionTest do
             nil,
             "",
             "1:2",
-            "1:2:3:4",
+            # "1:2:3:4" was here until expert review 2026-08-26 #2 — see the round-trip test above
+            # for why four fields is now a VALID stamp. Five still is not.
+            "1:2:3:4:5",
             "a:2:3",
             "1:2:x",
             "-1:2:3",

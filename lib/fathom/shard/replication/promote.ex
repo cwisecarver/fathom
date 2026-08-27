@@ -133,6 +133,14 @@ defmodule Fathom.Shard.Replication.Promote do
         offset: o2
       })
       when is_integer(l1) and is_integer(l2) do
+    # NOT SOUND WITHIN A LINEAGE, and knowingly left that way — see the PARKED decision in
+    # `audits/…#2`. `wal_gen` is SQLite's `ckpt_seq`, which restarts at 0 when SQLite recreates the
+    # `-wal`; measured on this codebase, two consecutive streams on a quiet shard both read
+    # ckpt_seq=0 with salts 977542977 then 978380554. So the `{g1, o1} > {g2, o2}` below can
+    # compare two unrelated WALs. `Storage.position` now CARRIES `salt1` (optional) and
+    # `parse_position/1` accepts the four-field form, so the data needed to fix this is in place;
+    # what is not settled is what to DO when the salts differ, because refusing to rank turns
+    # promote inert for the common post-checkpoint case.
     {l1, g1, o1} > {l2, g2, o2}
   end
 

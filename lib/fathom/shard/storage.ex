@@ -117,9 +117,15 @@ defmodule Fathom.Shard.Storage do
   that assumes it counts a shard's history.
   """
   @type position :: %{
-          epoch: non_neg_integer(),
-          wal_gen: non_neg_integer(),
-          offset: non_neg_integer()
+          :epoch => non_neg_integer(),
+          :wal_gen => non_neg_integer(),
+          :offset => non_neg_integer(),
+          # The WAL's IDENTITY (expert review 2026-08-26 #2). Optional: absent on a stamp written
+          # before that review, and on any stamp whose WAL could not be read. Absent means
+          # "unknown", and `Promote.fresher?/2` refuses to rank against an unknown rather than
+          # guessing — `wal_gen` alone is NOT an ordering, because it restarts at 0 whenever
+          # SQLite recreates the `-wal`.
+          optional(:salt1) => non_neg_integer()
         }
 
   @typedoc """
@@ -503,14 +509,40 @@ defmodule Fathom.Shard.Storage do
   def object_position(shard_id), do: backend().object_position(shard_id)
 
   @doc """
-  Serialize a position stamp for transport. `"<epoch>:<wal_gen>:<offset>"`.
+  Serialize a position stamp for transport: `"<epoch>:<wal_gen>:<offset>"`, or
+  `"<epoch>:<wal_gen>:<offset>:<salt1>"` when the WAL's identity is known.
 
-  Deliberately a fixed three-integer shape rather than a map format: this crosses a network and
-  comes back from an object a tenant's node wrote, so `parse_position/1` must be able to refuse
-  anything unexpected without inventing a value. Shared here so every backend encodes it
-  identically — a per-backend format would be a contract only the double ever tested.
+  Deliberately a fixed integer shape rather than a map format: this crosses a network and comes
+  back from an object a tenant's node wrote, so `parse_position/1` must be able to refuse anything
+  unexpected without inventing a value. Shared here so every backend encodes it identically — a
+  per-backend format would be a contract only the double ever tested.
+
+  ## Why the fourth field exists (expert review 2026-08-26 #2)
+
+  `wal_gen` is SQLite's `ckpt_seq`, which counts checkpoints WITHIN ONE WAL FILE and restarts at 0
+  when SQLite deletes and recreates the `-wal`. That is not exotic — it happens on the last
+  connection close, which `snapshot_and_upload/1` notes is frequently the periodic flush itself, so
+  it is the QUIET-TENANT path. Measured on this codebase:
+
+      stream 1 open   ckpt_seq=0  salt1=977542977   (wal exists)
+      after close     wal UNLINKED
+      stream 2 open   ckpt_seq=0  salt1=978380554   (wal exists)
+
+  Same generation number, unrelated WAL. `salt1` is what distinguishes them, and the follower side
+  has carried it all along (`FollowerLog.t()`); only the object stamp did not.
+
+  ## Mixed-version fleets
+
+  Both directions degrade INERT, which is why this needs no rollout flag. An old node reading a
+  4-field stamp gets `nil` from its `parse_position/1` (unexpected shape) and treats the object as
+  un-overridable. A new node reading a 3-field stamp parses it without a salt, and
+  `Promote.fresher?/2` refuses to rank. Both answers are "never override the stored object" — the
+  pre-A2 behaviour AGENTS.md already calls "never worse than off".
   """
   @spec encode_position(position()) :: String.t()
+  def encode_position(%{epoch: e, wal_gen: g, offset: o, salt1: s}) when is_integer(s),
+    do: "#{e}:#{g}:#{o}:#{s}"
+
   def encode_position(%{epoch: e, wal_gen: g, offset: o}), do: "#{e}:#{g}:#{o}"
 
   @doc """
@@ -524,17 +556,39 @@ defmodule Fathom.Shard.Storage do
   def parse_position(nil), do: nil
 
   def parse_position(raw) when is_binary(raw) do
-    with [e, g, o] <- String.split(raw, ":"),
-         {epoch, ""} when epoch >= 0 <- Integer.parse(e),
-         {gen, ""} when gen >= 0 <- Integer.parse(g),
-         {off, ""} when off >= 0 <- Integer.parse(o) do
-      %{epoch: epoch, wal_gen: gen, offset: off}
-    else
+    case String.split(raw, ":") do
+      [e, g, o] -> parse_position(e, g, o, nil)
+      # The salt-bearing form (#2). A stamp written before that review has three fields and still
+      # parses — it simply carries no salt, which `Promote.fresher?/2` treats as unknown.
+      [e, g, o, s] -> parse_position(e, g, o, s)
       _ -> nil
     end
   end
 
   def parse_position(_), do: nil
+
+  defp parse_position(e, g, o, s) do
+    with {epoch, ""} when epoch >= 0 <- Integer.parse(e),
+         {gen, ""} when gen >= 0 <- Integer.parse(g),
+         {off, ""} when off >= 0 <- Integer.parse(o),
+         {:ok, salt} <- parse_salt(s) do
+      base = %{epoch: epoch, wal_gen: gen, offset: off}
+      if salt, do: Map.put(base, :salt1, salt), else: base
+    else
+      _ -> nil
+    end
+  end
+
+  defp parse_salt(nil), do: {:ok, nil}
+
+  defp parse_salt(s) when is_binary(s) do
+    case Integer.parse(s) do
+      {salt, ""} when salt >= 0 -> {:ok, salt}
+      # A malformed salt is NOT "no salt" — the whole stamp is refused, matching this function's
+      # rule that anything unexpected returns nil rather than a partially-invented value.
+      _ -> :error
+    end
+  end
 
   @doc "The stored object's current etag (`nil` if absent) without transferring the body."
   @spec object_etag(String.t()) :: {:ok, String.t() | nil} | {:error, term()}
