@@ -222,6 +222,31 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
 
       assert {:ok, %{rows: [["a"]]}} = ShardExecutor.execute(conn, stmt("SELECT v FROM kv"))
 
+      # THE TWO BYPASSES (expert review 2026-08-26 #1), both verified by execution in the audit.
+      #
+      # The assertion above uses a plain INSERT, so it could not see either. `write?` was
+      # `dml?(sql) or ddl?(sql)`, both leading-keyword tests, and the fence has NO engine backstop
+      # — a fenced shard's handle is perfectly writable, so the predicate IS the enforcement.
+      #
+      # 1. A CTE-prefixed write. `lead(sql, 7)` is "with sr", matching no @dml_prefixes and no
+      #    @ddl_leads, so the fence was never consulted and the write was ACKed on a node that had
+      #    provably lost its lease — un-flushable, quarantined on partition-heal.
+      assert {:error, %{code: "FILO_STALE_LEASE", status: 503}} =
+               ShardExecutor.execute(
+                 conn,
+                 stmt("WITH src(v) AS (VALUES ('cte')) INSERT INTO kv SELECT v FROM src")
+               ),
+             "a CTE-prefixed INSERT slipped past the write fence"
+
+      # 2. executescript(). `execute_sequence/2` never referenced WriteFence at all, while already
+      #    presuming a script writes (it bumps WriteCounter unconditionally).
+      assert {:error, %{code: "FILO_STALE_LEASE", status: 503}} =
+               ShardExecutor.execute_sequence(conn, "INSERT INTO kv VALUES ('script');"),
+             "a sequence/executescript request slipped past the write fence"
+
+      # Neither write landed.
+      assert {:ok, %{rows: [["a"]]}} = ShardExecutor.execute(conn, stmt("SELECT v FROM kv"))
+
       # Recovery: the heartbeat is comfortably valid again → a revalidate reconfirms ownership and
       # lifts the fence. revalidate_lapse runs the fence synchronously in the coordinator, so a
       # :sys.get_state after it is a clean sync point (no async flush-task race).
@@ -237,6 +262,18 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
 
       # And a write is accepted again.
       assert {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('c')"))
+
+      # THE GUARD ON THE FIX ITSELF. `write_candidate?/1` is deliberately separate from `dml?/1`
+      # because widening `dml?/1` to include "with" would make a read-only CTE report the inherited
+      # sqlite3_changes() as affected_row_count — re-opening 2026-07-14 #42 from the other side.
+      # Unfenced, a read-only CTE must still classify as a READ.
+      assert {:ok, %{affected_row_count: 0}} =
+               ShardExecutor.execute(
+                 conn,
+                 stmt("WITH src(v) AS (VALUES ('x')) SELECT v FROM src")
+               ),
+             "a read-only CTE is reporting a non-zero affected_row_count — dml?/1 was widened " <>
+               "instead of adding a separate fence predicate"
 
       :ok = ShardExecutor.close(conn)
     end)

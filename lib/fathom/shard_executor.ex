@@ -169,7 +169,9 @@ defmodule Fathom.ShardExecutor do
            status: 401
          }}
 
-      write? and WriteFence.fenced?(shard_id) ->
+      # `write_candidate?/1`, NOT `write?` (expert review 2026-08-26 #1). See its definition for
+      # why the fence needs a wider, fail-closed predicate than the one driving `read_only?`.
+      write_candidate?(sql) and WriteFence.fenced?(shard_id) ->
         {:error,
          %Error{
            message:
@@ -626,6 +628,21 @@ defmodule Fathom.ShardExecutor do
 
       denied = lifecycle_denied(shard_id) ->
         {:error, denied}
+
+      # A SCRIPT IS A WRITE (expert review 2026-08-26 #1). `execute_sequence/2` never consulted the
+      # write fence at all, even though this clause already presumes a script writes — it bumps
+      # `WriteCounter` unconditionally below. So `executescript()` was an unconditional way past
+      # the one circuit breaker that stops a stale-lease node ACKing writes a peer will quarantine.
+      # No `write_candidate?/1` check here: a multi-statement script's leading keyword says nothing
+      # about the rest of it, and the conservative answer for a script is always "it writes".
+      WriteFence.fenced?(shard_id) ->
+        {:error,
+         %Error{
+           message:
+             "shard \"#{shard_id}\" lease is stale on this node (storage unreachable); retry",
+           code: "FILO_STALE_LEASE",
+           status: 503
+         }}
 
       true ->
         # EVERY STATEMENT IN THE SCRIPT GOES THROUGH THE SAME GATE AS `execute/2` (expert review
@@ -1179,6 +1196,50 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp dml?(_), do: false
+
+  # THE FENCE'S OWN PREDICATE. Deliberately separate from `dml?/1`, and deliberately FAIL-CLOSED.
+  #
+  # `Fathom.Shard.WriteFence` is the circuit breaker that stops a provably-stealable node from
+  # ACKing writes a peer will quarantine on partition-heal. Unlike the `:ro` scope it has NO engine
+  # backstop — SQLite refuses a write on a `mode: :readonly` handle no matter how the SQL is
+  # spelled, but a fenced shard's handle is perfectly writable, so this predicate IS the entire
+  # enforcement. Two holes were verified by execution (expert review 2026-08-26 #1):
+  #
+  #   * `WITH src(v) AS (VALUES (?1)) INSERT INTO t(x) SELECT v FROM src` mutates
+  #     (num_changes: 1) while `lead(sql, 7)` is "with sr" — matching no `@dml_prefixes` and no
+  #     `@ddl_leads`, so `write? == false` and the fence was never consulted.
+  #   * `execute_sequence/2` never consulted the fence at all.
+  #
+  # WHY NOT JUST ADD "with" TO @dml_prefixes: `dml?/1` also drives `to_stmt_result/2`'s
+  # `read_only?`, so a read-only `WITH … SELECT` would start reporting the inherited
+  # `sqlite3_changes()` as `affected_row_count` — re-opening the defect fixed by 2026-07-14 #42
+  # from the other side. The two questions are genuinely different: "did this statement mutate"
+  # wants to be precise, "might this statement mutate" wants to be paranoid.
+  #
+  # So this returns true for anything NOT known to be a pure read. The trade is explicit: while a
+  # shard is fenced, a read-only CTE (and any statement whose head this file does not recognise) is
+  # also refused — on a node that has already lost its lease and is returning 503s for writes
+  # anyway. Refusing a read there is cheap; ACKing a write that will be quarantined is not.
+  defp write_candidate?(sql) when is_binary(sql) do
+    not read_shaped?(lead(sql, 7))
+  end
+
+  defp write_candidate?(_), do: true
+
+  # The only statement heads that cannot mutate the tenant's data.
+  #
+  #   * `with` is absent ON PURPOSE — a CTE can prefix INSERT/UPDATE/DELETE, which is the bypass
+  #     this predicate exists to close.
+  #   * `pragma` and `analyze` are absent on purpose too, and were in the first draft of this list.
+  #     A pragma ASSIGNMENT can change the file (`journal_mode`, `max_page_count`), and `ANALYZE`
+  #     writes `sqlite_stat1`. Both are writes; on a fenced shard both should be refused.
+  #   * Transaction control IS listed. Refusing COMMIT on a fenced shard would not un-ACK anything
+  #     — the statements inside the transaction were already gated individually — and refusing
+  #     ROLLBACK would leave the stream's transaction open with no way to close it. Blocking them
+  #     wedges clients without preventing a single write.
+  @read_shaped ~w(select explain begin commit rollback savepoint release)
+
+  defp read_shaped?(head), do: Enum.any?(@read_shaped, &String.starts_with?(head, &1))
 
   # --- statement gate (expert review 2026-08-01 #1, #7, #8) ---------------------------------
   #
