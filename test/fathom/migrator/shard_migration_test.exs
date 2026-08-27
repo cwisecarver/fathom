@@ -230,6 +230,50 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert %{rows: [[1]]} = query_live!(shard, "PRAGMA user_version")
   end
 
+  # Expert review 2026-08-26 #8. The forward path was the ONLY durable-object producer in the
+  # system that did not validate what it was about to publish. Every other one does — the
+  # coordinator's periodic flush gates on quick_check, the GDPR export refuses a corrupt export,
+  # the restore drill verifies twice — and docs/migration.md's step 3 already SAYS "Validate, then
+  # cutover". Storage.pull/2 verifies Content-MD5, so TRANSPORT corruption was caught; a logical
+  # SQLite corruption already in the source object was not. This path copies it forward AND
+  # advances all three version stamps to say the shard is healthy at HEAD.
+  #
+  # The VACUUM INTO caveat AGENTS.md records does not apply here, which is what makes the check
+  # meaningful: Copy.copy_file/2 is a plain File.cp, so the migrated file is a byte copy of the
+  # pulled source rather than a rebuilt-from-table-content VACUUM product.
+  test "a corrupt stored object is refused before cutover, not migrated forward", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+
+    # Corrupt the STORED object — what a migration will pull and copy forward.
+    remote = Path.join(remote_dir(), "#{shard}.db")
+    assert File.exists?(remote), "fixture: the stored object is not where expected"
+    corrupt_page!(remote)
+
+    # Precondition: the fixture really corrupted something. Without this the test passes vacuously
+    # on a fixture that only scribbled free space — AGENTS.md records that exact trap.
+    assert {:error, _} = Fathom.Shard.verify_integrity(remote),
+           "the fixture did not actually corrupt anything"
+
+    assert {:error, {:migrated_copy_corrupt, _}} = ShardMigration.run(shard, 2),
+           "a corrupt shard was migrated forward and cut over"
+
+    # The shard stays where it was, and all three stamps stay consistent — which is the point.
+    # Pre-fix the cutover succeeded and stamped HEAD on corrupt bytes.
+    assert {:ok, %{schema_version: 1}} = Directory.get(shard),
+           "the directory advanced despite the copy being corrupt"
+  end
+
+  defp corrupt_page!(path) do
+    size = File.stat!(path).size
+    assert size > 8192, "seeded db too small (#{size}B) to corrupt a data page"
+    {:ok, fd} = :file.open(path, [:read, :write, :binary, :raw])
+    # Page 2 (offset 4096) is a b-tree data page; page 1's header stays intact so the file still
+    # opens and quick_check is what finds the damage.
+    :ok = :file.pwrite(fd, 4096, :binary.copy(<<0xEF>>, 4096))
+    :file.close(fd)
+  end
+
   # Expert review 2026-07-18 #10: a `requires_review` version was ceilinged only in head/0, so a
   # DIRECT run(shard, N) at the flagged version bypassed the review floor and replayed the flagged
   # data-migration. statements/1 now refuses it structurally (like yanked), so the chain is

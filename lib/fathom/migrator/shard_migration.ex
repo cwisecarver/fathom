@@ -566,6 +566,30 @@ defmodule Fathom.Migrator.ShardMigration do
          # backfilling. Passed for every migration, not only transform-carrying ones — the chain is
          # built from release rows, so which steps carry a transform is not knowable here.
          :ok <- Copy.migrate_chain(old, new, chain, shard_id: shard_id),
+         # VALIDATE THE PRODUCT BEFORE IT BECOMES THE TENANT'S TRUTH (expert review 2026-08-26 #8).
+         #
+         # This was the only durable-object producer in the system that did not check what it was
+         # about to publish. Every other one does: the coordinator's periodic flush gates on
+         # `quick_check` of the live file, the GDPR export refuses `{:corrupt_export, _}`, and the
+         # restore drill verifies twice. `docs/migration.md`'s step 3 already SAYS "Validate, then
+         # `Fathom.Directory.cutover/2` flips the shard's pointer" — the validate was missing.
+         #
+         # `Storage.pull/2` verifies Content-MD5/etag, so TRANSPORT corruption was caught; a logical
+         # SQLite corruption already present in the source object was not. This path copies it
+         # forward AND advances all three version stamps to say the shard is healthy at HEAD — the
+         # divergence class `count_stamp_drift/0` exists to surface, arrived at through the forward
+         # path rather than a PITR.
+         #
+         # The `VACUUM INTO` caveat AGENTS.md records does NOT apply here, and that is why this
+         # check is worth having: the flush path's temp is a VACUUM product, which rebuilds indexes
+         # from table content and therefore repairs the exact divergence a gate would look for.
+         # `Copy.copy_file/2` is a plain `File.cp`, so `new` is a byte copy of the pulled source and
+         # `quick_check` on it is meaningful.
+         #
+         # Placed BEFORE `fence/2` and the flush, so a failure leaves the shard untouched at its old
+         # version and the job retries — rather than after, where it would be reporting on bytes
+         # already published.
+         :ok <- verify_migrated(shard_id, new),
          # Self-fence right before the clobbering flush: if we were superseded during the (long)
          # copy, abort instead of overwriting the new owner's object (finding #7).
          :ok <- fence(shard_id, lease),
@@ -646,6 +670,34 @@ defmodule Fathom.Migrator.ShardMigration do
       {:ok, etag} -> if File.exists?(path), do: {:ok, etag}, else: {:error, :no_live_object}
       {:absent, _} -> {:error, :no_live_object}
       error -> error
+    end
+  end
+
+  # Gated by the same `:verify_flush_integrity` switch as the coordinator's flush, so a deployment
+  # that has deliberately turned page verification off is not silently opted back in on this path.
+  #
+  # Classifies with the coordinator's own `classify_integrity_failure/1` so "I could not check it"
+  # is not reported as "it is corrupt": an open failure under fd pressure, a `:busy`, or a
+  # `:query_timeout` on a large `quick_check` all used to take the corruption branch elsewhere and
+  # the same distinction matters here. Both verdicts abort the migration, so the shard stays at its
+  # old version either way; what differs is whether an operator is told the data is bad.
+  defp verify_migrated(shard_id, path) do
+    if Application.get_env(:fathom, :verify_flush_integrity, true) do
+      case Fathom.Shard.verify_integrity(path) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Logger.error(
+            "shard #{shard_id}: the MIGRATED copy failed quick_check (#{inspect(reason)}); " <>
+              "refusing the cutover so the shard stays at its current version and the last good " <>
+              "stored object remains authoritative"
+          )
+
+          {:error, {:migrated_copy_corrupt, reason}}
+      end
+    else
+      :ok
     end
   end
 
