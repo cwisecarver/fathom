@@ -43,6 +43,78 @@ defmodule Fathom.BenchTest do
              "regression this metric exists for was exactly this shape"
   end
 
+  # The other half of the same gap (expert review 2026-08-26 #39). The comment above explains WHY
+  # an absolute floor is needed; six metrics had one and six did not, and the three guarded here
+  # are the three that own a hot path.
+  #
+  # `hrana_open_rt_us` is the sharpest omission. It is the dominant cost of an HTTP-SDK request
+  # (and of django-libsql under Django's default CONN_MAX_AGE=0, where every request is a fresh
+  # stream), and it was gated by a parent-ratio alone. The proof that a ratio is not enough is
+  # #10 from the same review: `Connection.open/2` called `File.mkdir_p!` on a directory that
+  # already existed, on EVERY stream open, for the entire life of the project — measured at ~24%
+  # of this metric — and no gate, no bench and no test ever saw it, because it was in the parent
+  # too. That is exactly the uniform-drift blind spot the ratio cannot cover.
+  test "the per-stream open and flush metrics clear their absolute bounds" do
+    open_rt = Fathom.Bench.hrana_open_rt_us(hrana_rt_samples: 30)
+    assert is_float(open_rt), "the loopback listener did not come up — this measured nothing"
+
+    # Composition being bounded: Filo stream open + shard-id cast + auth + the lifecycle ETS
+    # lookups + Registry.lookup + the coordinator GenServer.call + Connection.open/2
+    # (mkdir/sqlite3_open/pragmas/extension load) + one trivial round trip. Measured ~430µs on a
+    # dev build; 20ms is ~45x headroom, so this catches an order-of-magnitude break only.
+    assert open_rt < 20_000,
+           "hrana OPEN round trip #{open_rt}µs exceeded the 20ms ceiling — this is stream open " <>
+             "(no baton) plus one query, i.e. what an HTTP-SDK request costs"
+
+    # A fresh-stream request must stay in the same order of magnitude as a baton-reusing one.
+    # Not a tight ratio (open really is ~4x a warm round trip); this catches open-path work
+    # that scales with something it should not.
+    rt = Fathom.Bench.hrana_rt(hrana_rt_samples: 30)
+    assert is_float(rt)
+
+    assert open_rt < rt * 50,
+           "stream open #{open_rt}µs is more than 50x a warm round trip #{rt}µs — something on " <>
+             "the open path is scaling with a population it should not"
+
+    flush = Fathom.Bench.flush_p50(trials: 2, flush_rows: 500)
+    assert is_float(flush)
+
+    # flush_p50 raises if the shard is not dirty, so a "measuring nothing" run cannot reach here
+    # (bench.ex:flush_p50/1). The floor guards the OTHER direction the AGENTS.md rule names: a
+    # suspiciously GOOD number. A full VACUUM INTO + local PUT cannot be microseconds; the
+    # 2µs reading that motivated that rule would fail this.
+    assert flush > 100,
+           "flush p50 #{flush}µs is implausibly fast for VACUUM INTO + a full-object write — " <>
+             "suspect the flush did no work rather than banking the number"
+
+    assert flush < 5_000_000, "flush p50 #{flush}µs exceeded the 5s ceiling"
+  end
+
+  # `same_shard_checkout_per_s` is the head-of-line throughput of one coordinator's GenServer.call
+  # — the single lock every stream on a hot shard queues behind, and the metric #9 (Shards.stop/1
+  # blocking the shard supervisor) lands nearest. Ratio-gated only, until now.
+  test "same-shard checkout throughput clears its absolute floor" do
+    stats = Fathom.Bench.concurrent_checkout(concurrent_ms: 200, concurrent_shards: 8, trials: 1)
+
+    assert is_float(stats.same_shard_per_s)
+    assert is_float(stats.spread_per_s)
+
+    # Floors sized from measurement, not from caution. Three back-to-back samples on this machine
+    # read same_shard 465_200 / 468_600 / 466_300 per second and spread 1_030_430 / 1_053_495 /
+    # 1_047_375 — under 1% and ~2% spread respectively, which is tight enough to set a real bound.
+    # A floor of 100/s (the first draft here) would have passed a 4,600x collapse; that is not a
+    # guard, it is decoration. These sit ~9x and ~10x under the observed values: generous enough
+    # for a contended machine and a dev build, tight enough that an order-of-magnitude break fails.
+    assert stats.same_shard_per_s > 50_000,
+           "same-shard checkout #{stats.same_shard_per_s}/s fell under the 50k/s floor — one " <>
+             "coordinator's GenServer.call serializes every stream on a hot shard, so this is " <>
+             "the hot-shard ceiling and ~465k/s is what it measured when the floor was set"
+
+    assert stats.spread_per_s > 100_000,
+           "spread checkout #{stats.spread_per_s}/s fell under the 100k/s floor — this is the " <>
+             "ETS-counter and LRU path, measured at ~1.04M/s when the floor was set"
+  end
+
   test "the p99 metrics describe the same run as their p50, and bound it" do
     # One run, two reducers. If these ever came from separate runs the gate would compare two
     # samples of a noisy bench and call the difference a regression.
