@@ -587,6 +587,10 @@ defmodule Fathom.Application do
       # shards here and ShardExecutor reads it lock-free before each write. Before the shard
       # supervisor so the table is up before any coordinator publishes/forgets.
       Fathom.Shard.WriteFence,
+      # Owns the node-global schema generation (expert review 2026-08-26 #7): bumped when any
+      # connection runs DDL, read by Connection's statement cache to know its cached COLUMN LIST
+      # may be stale. Before the shard supervisor so the table is up before any statement prepares.
+      Fathom.Shard.SchemaGen,
       # Owns the node-wide concurrent-flush counter (expert review #17): coordinators reserve a slot
       # before spawning a durability-flush task, bounding the flush storm after a mass re-home.
       # Idle unless :shard_flush_max_concurrency is set. Before the shard supervisor so the table is

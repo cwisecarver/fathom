@@ -402,7 +402,10 @@ defmodule Fathom.Shard.Connection do
   end
 
   defp do_query(conn, sql, args, dml?) do
-    with {:ok, stmt, columns} <- cached_stmt(conn, sql) do
+    # A 4-tuple with a plain pattern, not a 3-tuple plus a guard. A `with` whose pattern carries a
+    # guard lets the unmatched value fall through as the function's return, which dialyzer caught
+    # as `{:ok, _, _} | {:refresh, reference(), [any()]}` escaping `query/4`'s spec.
+    with {:ok, stmt, columns, refresh_columns?} <- cached_stmt(conn, sql) do
       # The statement is owned by this connection's cache — reset it (not release) when done,
       # including on a bind/collect error or a row-cap abort. sqlite3_reset ends the statement's
       # execution (releasing its locks / read-transaction hold, which release/finalize used to
@@ -410,6 +413,13 @@ defmodule Fathom.Shard.Connection do
       try do
         with :ok <- Sqlite3.bind(stmt, args),
              {:ok, rows, row_count} <- collect(conn, stmt, row_cap()) do
+          # Post-step column read when the schema moved under this connection (expert review
+          # 2026-08-26 #7). Only on the `:refresh` path — a DDL happened somewhere since this
+          # statement was cached — so the ordinary hit pays nothing. See `cached_stmt/2` for why
+          # this cannot be done any earlier.
+          columns =
+            if refresh_columns?, do: refreshed_columns(conn, stmt, sql, columns), else: columns
+
           {:ok,
            %{
              columns: columns,
@@ -433,6 +443,32 @@ defmodule Fathom.Shard.Connection do
       after
         Sqlite3.reset(stmt)
       end
+    end
+  end
+
+  # Re-read the column list now that the statement has stepped, and correct the cache entry so the
+  # next execution takes the ordinary hit path. Falls back to the pre-step list if the read fails —
+  # degrading to the old (possibly stale) answer rather than failing a query that already succeeded.
+  defp refreshed_columns(conn, stmt, sql, fallback) do
+    case Sqlite3.columns(conn, stmt) do
+      {:ok, cols} ->
+        key = {__MODULE__, :stmt_cache, conn}
+
+        case Process.get(key) do
+          {seq, %{^sql => {canonical, ^stmt, _cols, stamp, gen}} = cache} ->
+            Process.put(
+              key,
+              {seq, Map.put(cache, canonical, {canonical, stmt, cols, stamp, gen})}
+            )
+
+          _ ->
+            :ok
+        end
+
+        cols
+
+      _ ->
+        fallback
     end
   end
 
@@ -469,24 +505,82 @@ defmodule Fathom.Shard.Connection do
   # numbers because it lands in :erlang.memory(:binary), not the process heap.
   #
   # :binary.copy/1 on the MISS path only, so the hot hit path pays nothing.
+  # THE CACHED COLUMN LIST GOES STALE ACROSS ANOTHER STREAM'S DDL (expert review 2026-08-26 #7).
+  #
+  # `prepare_v2` recompiles a statement transparently on a schema change, so the STATEMENT survives
+  # — but `cols`, captured beside it at prepare time, does not, and nothing re-read it. Verified by
+  # execution: connection B caches `SELECT * FROM t`, connection A runs
+  # `ALTER TABLE t ADD COLUMN y`, and B then returns two column NAMES with three VALUES per row.
+  # That `StmtResult` goes on the wire; a client zipping cols to values silently mis-maps them.
+  #
+  # Review 2026-07-24 #17 purges this cache for DDL the SAME connection ran. What it cannot see is
+  # DDL from a sibling stream on the same shard, which is the case `:block_tenant_ddl` exists to
+  # refuse and which is off by default.
+  #
+  # Each entry now carries the `Fathom.Shard.SchemaGen` value it was prepared under. On a hit with
+  # a moved generation, re-read the columns — NOT re-prepare: `prepare_v2` has already recompiled
+  # the statement itself, so only the Elixir-side list is stale, and `Sqlite3.columns/2` is the
+  # cheap half.
+  #
+  # NOT the tempting `length(hd(rows)) != length(cols)` check, which the review names explicitly:
+  # it cannot see the fault on a zero-row `SELECT *`, where the reported cols are still wrong.
   defp cached_stmt(conn, sql) do
     key = {__MODULE__, :stmt_cache, conn}
     {seq, cache} = Process.get(key, {0, %{}})
+    gen = Fathom.Shard.SchemaGen.current()
 
     case cache do
-      %{^sql => {canonical, stmt, cols, _stamp}} ->
+      %{^sql => {canonical, stmt, cols, _stamp, ^gen}} ->
         # Re-put under `canonical`, never the incoming sub-binary: a map that has grown past a
         # flatmap adopts the new key term, which would silently reinstate the pin.
-        Process.put(key, {seq + 1, Map.put(cache, canonical, {canonical, stmt, cols, seq + 1})})
-        {:ok, stmt, cols}
+        Process.put(
+          key,
+          {seq + 1, Map.put(cache, canonical, {canonical, stmt, cols, seq + 1, gen})}
+        )
+
+        {:ok, stmt, cols, false}
+
+      # Hit, but the schema moved since this entry was prepared. Re-prepare AND tell the caller to
+      # re-read the columns AFTER the statement has stepped.
+      #
+      # Both cheaper ideas were tried and measured wrong:
+      #
+      #   * `Sqlite3.columns/2` on the cached statement — `prepare_v2` recompiles LAZILY at the next
+      #     `sqlite3_step`, so the column names before stepping are still the pre-DDL ones.
+      #   * A fresh `Sqlite3.prepare/2` on this connection — ALSO returns the stale names, because
+      #     this connection's in-memory schema is itself stale until something makes it re-read.
+      #     Measured: a brand-new connection to the same file returned `["id", "x", "y"]` while a
+      #     fresh prepare on the DDL-unaware connection returned `["id", "x"]`.
+      #
+      # SQLite settles it at step (SQLITE_SCHEMA → automatic re-prepare), so the correct columns
+      # only exist after execution. The re-prepare is still worth doing — it drops a statement
+      # compiled against a schema this connection has since left behind — but the authoritative
+      # read happens in `do_query/4`.
+      %{^sql => {canonical, stmt, _stale_cols, _stamp, _older_gen}} ->
+        Sqlite3.release(conn, stmt)
+
+        with {:ok, fresh} <- Sqlite3.prepare(conn, canonical),
+             {:ok, cols} <- Sqlite3.columns(conn, fresh) do
+          Process.put(
+            key,
+            {seq + 1, Map.put(cache, canonical, {canonical, fresh, cols, seq + 1, gen})}
+          )
+
+          {:ok, fresh, cols, true}
+        end
 
       _ ->
         with {:ok, stmt} <- Sqlite3.prepare(conn, sql),
              {:ok, cols} <- Sqlite3.columns(conn, stmt) do
           canonical = :binary.copy(sql)
           cache = maybe_evict(conn, cache)
-          Process.put(key, {seq + 1, Map.put(cache, canonical, {canonical, stmt, cols, seq + 1})})
-          {:ok, stmt, cols}
+
+          Process.put(
+            key,
+            {seq + 1, Map.put(cache, canonical, {canonical, stmt, cols, seq + 1, gen})}
+          )
+
+          {:ok, stmt, cols, false}
         end
     end
   end
@@ -495,8 +589,8 @@ defmodule Fathom.Shard.Connection do
   # only on an over-cap miss — a workload cycling >64 distinct statements per stream is
   # re-preparing anyway, exactly as before the cache.
   defp maybe_evict(conn, cache) when map_size(cache) >= @stmt_cache_cap do
-    {lru_sql, {_canonical, stmt, _cols, _stamp}} =
-      Enum.min_by(cache, fn {_sql, {_canonical, _stmt, _cols, stamp}} -> stamp end)
+    {lru_sql, {_canonical, stmt, _cols, _stamp, _gen}} =
+      Enum.min_by(cache, fn {_sql, {_canonical, _stmt, _cols, stamp, _gen}} -> stamp end)
 
     Sqlite3.release(conn, stmt)
     Map.delete(cache, lru_sql)
@@ -518,7 +612,7 @@ defmodule Fathom.Shard.Connection do
   defp purge_stmt_cache(conn) do
     case Process.delete({__MODULE__, :stmt_cache, conn}) do
       {_seq, cache} ->
-        Enum.each(cache, fn {_sql, {_canonical, stmt, _cols, _}} ->
+        Enum.each(cache, fn {_sql, {_canonical, stmt, _cols, _stamp, _gen}} ->
           Sqlite3.release(conn, stmt)
         end)
 

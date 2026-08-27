@@ -259,7 +259,14 @@ defmodule Fathom.ShardExecutor do
         # the cache on DDL so a later `SELECT *` cannot report pre-ALTER columns for post-ALTER
         # rows. Off the hot path: only DDL pays it, and fathom blocks client DDL on tenant shards
         # entirely when :block_tenant_ddl is on.
-        if ddl?, do: Connection.purge_statements(conn)
+        if ddl? do
+          # Purge THIS connection's cache, and tell every OTHER connection on this node that its
+          # cached column lists may be stale (expert review 2026-08-26 #7). The local purge alone
+          # was the 2026-07-24 #17 fix; it cannot see a sibling stream on the same shard, whose
+          # cached `SELECT *` then reports the pre-DDL column names against post-DDL rows.
+          Connection.purge_statements(conn)
+          Fathom.Shard.SchemaGen.bump()
+        end
 
         capture(opts.template?, conn, sql, args)
         stmt_result = to_stmt_result(result, dml?)
