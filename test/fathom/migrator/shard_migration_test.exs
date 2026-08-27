@@ -229,6 +229,12 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     counter = :counters.new(1, [])
     handler = "chain-query-count-#{System.unique_integer([:positive])}"
 
+    # SCOPED TO THIS PROCESS. A telemetry handler is VM-global, and a background coordinator or
+    # recorder querying the same table would be counted as ours. Ecto emits
+    # `[:fathom, :repo, :query]` inline in the process that ran the query, so `self()` isolates it.
+    # (`Fathom.DirectoryTest`'s row counter went red exactly this way before it was scoped.)
+    test_pid = self()
+
     :ok =
       :telemetry.attach(
         handler,
@@ -237,7 +243,8 @@ defmodule Fathom.Migrator.ShardMigrationTest do
           # `source` is the schema's table; the chain read is the only thing that touches it on
           # this path. Counting the SOURCE rather than grepping SQL keeps this from breaking on a
           # formatting change (AGENTS.md: never hand-roll SQL parsing).
-          if meta[:source] == "shard_migrations", do: :counters.add(counter, 1, 1)
+          if self() == test_pid and meta[:source] == "shard_migrations",
+            do: :counters.add(counter, 1, 1)
         end,
         nil
       )
@@ -270,12 +277,15 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     counter = :counters.new(1, [])
     handler = "migration-roundtrips-#{System.unique_integer([:positive])}"
 
+    # Scoped to this process, for the same reason as the chain-query counter above.
+    test_pid = self()
+
     :ok =
       :telemetry.attach(
         handler,
         [:fathom, :repo, :query],
         fn _e, _m, meta, _c ->
-          if meta[:source] == "shards", do: :counters.add(counter, 1, 1)
+          if self() == test_pid and meta[:source] == "shards", do: :counters.add(counter, 1, 1)
         end,
         nil
       )

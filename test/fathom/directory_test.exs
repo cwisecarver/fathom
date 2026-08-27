@@ -645,12 +645,20 @@ defmodule Fathom.DirectoryTest do
       rows = :counters.new(1, [])
       handler = "streamfailed-#{System.unique_integer([:positive])}"
 
+      # SCOPED TO THIS PROCESS. A telemetry handler is VM-global and this module is `async: true`,
+      # so without the pid check the counter also sees `shards` queries from whatever else is
+      # running concurrently — which is exactly how this test went red once with
+      # "taking one row read 2 rows". Ecto emits `[:fathom, :repo, :query]` inline in the process
+      # that ran the query, so comparing `self()` isolates ours.
+      test_pid = self()
+
       :ok =
         :telemetry.attach(
           handler,
           [:fathom, :repo, :query],
           fn _e, _m, meta, _c ->
-            with "shards" <- meta[:source],
+            with true <- self() == test_pid,
+                 "shards" <- meta[:source],
                  {:ok, %{num_rows: n}} <- meta[:result] do
               :counters.add(rows, 1, n)
             end
