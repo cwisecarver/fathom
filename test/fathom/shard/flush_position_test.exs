@@ -223,7 +223,23 @@ defmodule Fathom.Shard.FlushPositionTest do
       [_, body] = String.split(source, "defp snapshot_and_upload(state) do", parts: 2)
       [body, _] = String.split(body, "\n  defp ", parts: 2)
 
-      snapshot_at = :binary.match(body, "snapshot(state.path, temp)") |> elem(0)
+      # The call was `snapshot(state.path, temp)` until expert review 2026-08-26 #12 folded the
+      # integrity check and the snapshot onto one connection as `verify_and_snapshot/2`. Only the
+      # NAME moved — the ordering invariant this test pins is unchanged, and the snapshot is still
+      # the thing the position read must come after.
+      snapshot_at =
+        case :binary.match(body, "verify_and_snapshot(state, temp)") do
+          {at, _} ->
+            at
+
+          :nomatch ->
+            flunk(
+              "could not find the snapshot call in snapshot_and_upload/1. This test pins a " <>
+                "read ORDER by reading the source, so a rename breaks it by design — re-point it " <>
+                "at whatever now performs the snapshot rather than deleting the guard."
+            )
+        end
+
       position_at = :binary.match(body, "flush_position(state, pre)") |> elem(0)
 
       assert position_at > snapshot_at,

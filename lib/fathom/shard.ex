@@ -984,7 +984,7 @@ defmodule Fathom.Shard do
   # the temp onto `<id>.db`, so a power cut in that window leaves a torn file whose sidecar MATCHES
   # the stored object. The next open reads `:match`, opens warm, and seeds dirty. A zero-length
   # file is a valid empty SQLite database and `PRAGMA quick_check` returns `ok`, so
-  # `verify_snapshot/2`'s integrity gate never fires — the tenant is served an empty database and
+  # `verify_and_snapshot/2`'s integrity gate never fires — the tenant is served an empty database and
   # the next periodic flush PUTs it over the good stored object with a valid If-Match.
   #
   # The cold-pull fallback on the `else` branch was already fsynced (`Storage.pull/2` promotes
@@ -2056,7 +2056,7 @@ defmodule Fathom.Shard do
             # (expert review 2026-08-24 #17). `upload_for_drop/1` calls `quarantine_corrupt!/2` when
             # `checkpoint_and_verify/1` ITSELF reports corruption. When the checkpoint merely comes
             # back BUSY — a lingering reader, entirely ordinary — it short-circuits without running
-            # `quick_check` and falls through to `snapshot_and_upload/1`, whose `verify_snapshot/2`
+            # `quick_check` and falls through to `snapshot_and_upload/1`, whose `verify_and_snapshot/2`
             # runs `quick_check` on the live file and returns the SAME `{:corrupt_local, reason}`
             # deliberately WITHOUT quarantining, because that function also runs while the shard is
             # being served (renaming the live path out from under open streams is the data-loss
@@ -2452,7 +2452,7 @@ defmodule Fathom.Shard do
   # connections to one tenant, one seeing data and one seeing nothing. Worse, the shard is still
   # dirty with an unchanged `state.etag`, so the next periodic flush snapshots that empty file and
   # PUTs it over the good stored object with a valid If-Match — destroying the only good copy.
-  # The serving path therefore refuses the flush and leaves the file alone; see verify_snapshot/2.
+  # The serving path therefore refuses the flush and leaves the file alone; see verify_and_snapshot/2.
   defp quarantine_corrupt!(state, reason) do
     dest = "#{state.path}.corrupt.#{System.system_time(:second)}"
     _ = File.rename(state.path, dest)
@@ -3576,8 +3576,7 @@ defmodule Fathom.Shard do
     try do
       # Integrity BEFORE the snapshot: quarantine_corrupt!/2 renames the live path, so checking
       # after would spend a full VACUUM on a file we are about to refuse and move aside.
-      with :ok <- verify_snapshot(state, temp),
-           :ok <- snapshot(state.path, temp),
+      with :ok <- verify_and_snapshot(state, temp),
            :ok <- recheck_before_put(state),
            {:ok, new_etag} <-
              Storage.flush(
@@ -3609,7 +3608,7 @@ defmodule Fathom.Shard do
   # `Fence.check` runs once, before this whole sequence, and `valid_for_write?`'s contract is
   # "valid WITH MARGIN … it won't expire mid-write". The margin is a hardcoded `ttl/3` (10 s at
   # the default 30 s TTL) and is not derived from the write it covers — which is
-  # `verify_snapshot` (a full `quick_check` page scan, added by #14) + `VACUUM INTO` + a
+  # `verify_and_snapshot` (a full `quick_check` page scan, added by #14) + `VACUUM INTO` + a
   # full-object PUT. Measured on this codebase against `Storage.Local`, no network at all:
   #
   #     1.4 MB      8.9 ms          71 MB     265 ms
@@ -3713,31 +3712,91 @@ defmodule Fathom.Shard do
   # (VACUUM INTO) and the whole temp (MD5 + PUT). Shards are small by fathom's premise, which is
   # what makes that acceptable; `:verify_flush_integrity` turns it off for a deployment that
   # disagrees.
-  defp verify_snapshot(state, _temp) do
-    if verify_flush_integrity?() do
-      case verify_integrity(state.path) do
-        :ok ->
-          :ok
-
-        # "I could not check it" is not "it is corrupt" (expert review 2026-08-20 #2). An
-        # Sqlite3.open failure under fd pressure (EMFILE — on a node whose density is the design
-        # premise), a :busy from a concurrent writer, or a :query_timeout on a large quick_check all
-        # used to take the corruption branch. Both verdicts REFUSE the flush, so the good stored
-        # object stays authoritative either way; what differs is the alarm — :corrupt_local is
-        # permanent and escalates on the first occurrence, :integrity_unknown is transient and just
-        # retries next interval.
-        #
-        # NEITHER branch quarantines. This path runs while the shard is being SERVED, and
-        # quarantine_corrupt!/2 renames the live file and unlinks its -shm; see the hazard note on
-        # that function. That rename is what made this a data-loss path rather than a refused flush.
-        {:error, reason} ->
-          case classify_integrity_failure(reason) do
-            :corrupt -> {:error, {:corrupt_local, reason}}
-            :unknown -> {:error, {:integrity_unknown, reason}}
+  #
+  # ONE CONNECTION, NOT TWO (expert review 2026-08-26 #12). This used to be `verify_snapshot/2`
+  # followed by a separate `snapshot/2`, each with its own `Connection.open` … `Connection.close`
+  # on the SAME path. Two costs, both per flush per write-active shard:
+  #
+  #   * A second full connection open — `File.dir?`/`mkdir_p`, `sqlite3_open`, seven pragmas, the
+  #     `PRAGMA page_size` prepare/fetch/release, and an extension load (enable → load → disable),
+  #     all dirty-IO NIFs. Measured at roughly 429 µs on this machine (review #10's probe).
+  #   * A WAL delete/recreate cycle. `snapshot/2`'s own comment records that the periodic flush
+  #     "fires on any dirty shard, which is routinely one with zero checked-out streams", so the
+  #     verify connection's close was FREQUENTLY THE LAST ONE — triggering SQLite's close-time
+  #     checkpoint and unlinking `-wal`/`-shm`, which the snapshot connection then recreated.
+  #
+  # `checkpoint_and_verify/1` describes this identical churn verbatim as the reason the DROP path
+  # was merged onto one connection (review 2026-07-24 #31). `verify_snapshot/2` arrived later
+  # (review 2026-08-01 #14) and never got the same treatment: the rare path was fixed and the
+  # dominant one was not.
+  #
+  # On a replicating fleet the extra close-time checkpoint also started a new WAL generation, which
+  # is the `{:reset, 0, size}` full-WAL-reship path — and it is the mechanism that manufactures the
+  # stale `wal_gen` in review #2, so folding it narrows that hazard's frequency too.
+  #
+  # THE THREE GUARDS THAT MUST SURVIVE ANY FUTURE EDIT HERE:
+  #   (a) `quick_check` runs on the LIVE file, never on the VACUUM temp — see the probe above.
+  #   (b) It SHORT-CIRCUITS before the VACUUM: a corrupt shard must not pay a full snapshot.
+  #   (c) The extension stays loaded on this connection (`Connection.open/2` does it): `VACUUM INTO`
+  #       rebuilds indexes and `quick_check` verifies them, so a Django expression index over a UDF
+  #       would fail "no such function" without it.
+  defp verify_and_snapshot(state, temp) do
+    case Connection.open(state.path) do
+      {:ok, conn} ->
+        try do
+          with :ok <- run_quick_check(conn) do
+            do_snapshot(conn, temp)
           end
+        after
+          Connection.close(conn)
+        end
+
+      other ->
+        # An open failure is "I could not check it", not "it is corrupt" — same classification the
+        # separate `verify_integrity/1` path applied.
+        integrity_verdict({:error, {:quick_check_open_failed, other}})
+    end
+  end
+
+  # `quick_check` on the open connection, gated by `:verify_flush_integrity`. Split out so the
+  # short-circuit above reads as one line and (b) cannot be accidentally reordered past the VACUUM.
+  defp run_quick_check(conn) do
+    if verify_flush_integrity?() do
+      case Connection.query(conn, "PRAGMA quick_check", []) do
+        {:ok, %{rows: [["ok"]]}} -> :ok
+        {:ok, %{rows: rows}} -> integrity_verdict({:error, {:quick_check, rows}})
+        {:error, reason} -> integrity_verdict({:error, {:quick_check_failed, reason}})
       end
     else
       :ok
+    end
+  end
+
+  # Classify a failed integrity check. "I could not check it" is not "it is corrupt" (expert review
+  # 2026-08-20 #2): an open failure under fd pressure (EMFILE, on a node whose density is the design
+  # premise), a :busy from a concurrent writer, or a :query_timeout on a large quick_check all used
+  # to take the corruption branch. Both verdicts REFUSE the flush, so the good stored object stays
+  # authoritative either way; what differs is the alarm — :corrupt_local is permanent and escalates
+  # on first occurrence, :integrity_unknown is transient and just retries next interval.
+  #
+  # NEITHER branch quarantines. This runs while the shard is being SERVED, and quarantine_corrupt!/2
+  # renames the live file and unlinks its -shm; that rename is what made this a data-loss path
+  # rather than a refused flush.
+  defp integrity_verdict({:error, reason}) do
+    # "I could not check it" is not "it is corrupt" (expert review 2026-08-20 #2). An
+    # Sqlite3.open failure under fd pressure (EMFILE — on a node whose density is the design
+    # premise), a :busy from a concurrent writer, or a :query_timeout on a large quick_check all
+    # used to take the corruption branch. Both verdicts REFUSE the flush, so the good stored
+    # object stays authoritative either way; what differs is the alarm — :corrupt_local is
+    # permanent and escalates on the first occurrence, :integrity_unknown is transient and just
+    # retries next interval.
+    #
+    # NEITHER branch quarantines. This path runs while the shard is being SERVED, and
+    # quarantine_corrupt!/2 renames the live file and unlinks its -shm; see the hazard note on
+    # that function. That rename is what made this a data-loss path rather than a refused flush.
+    case classify_integrity_failure(reason) do
+      :corrupt -> {:error, {:corrupt_local, reason}}
+      :unknown -> {:error, {:integrity_unknown, reason}}
     end
   end
 
@@ -3888,65 +3947,63 @@ defmodule Fathom.Shard do
   # are active (unlike a raw file copy). `VACUUM INTO` requires a string literal
   # path, so the destination (built from a validated shard id) is single-quote
   # escaped defensively.
-  defp snapshot(path, dest) do
-    with {:ok, conn} <- Connection.open(path) do
-      # The snapshot temp inherits this connection's safety_level (SQLite's sqlite3RunVacuum:
-      # `pgflags = db->aDb[iDb].safety_level | ...`), so at synchronous=FULL every periodic flush
-      # force-fsynced a full shard-sized file that `snapshot_and_upload/1` unlinks seconds later
-      # (expert review 2026-07-24 #11). At ~640 KiB/shard × 1,000 write-active shards that is
-      # ~128 MB per interval of pure-waste synchronous device writes, plus the SSD endurance.
-      #
-      # The temp has NO durability requirement: it is read back in-process for the Content-MD5 and
-      # the PUT, and a crash mid-snapshot just leaves the shard dirty to be re-snapshotted next
-      # interval. The durable artifact is the S3 object, still gated by content-md5 over these same
-      # bytes. VACUUM INTO takes only a READ transaction on the source, so the live shard's WAL +
-      # per-commit synchronous=FULL is untouched — the RPO contract's local layer is unaffected.
-      #
-      # Scoped to this connection only. Emphatically NOT for `checkpoint/1`: a checkpoint at
-      # synchronous=OFF can corrupt the main database on power loss.
-      Connection.exec(conn, "PRAGMA synchronous=OFF")
+  # Takes an ALREADY-OPEN connection (review 2026-08-26 #12) so the verify and the snapshot share
+  # one handle. Opening and closing is the caller's job — `verify_and_snapshot/2` owns the `after`.
+  defp do_snapshot(conn, dest) do
+    # The snapshot temp inherits this connection's safety_level (SQLite's sqlite3RunVacuum:
+    # `pgflags = db->aDb[iDb].safety_level | ...`), so at synchronous=FULL every periodic flush
+    # force-fsynced a full shard-sized file that `snapshot_and_upload/1` unlinks seconds later
+    # (expert review 2026-07-24 #11). At ~640 KiB/shard × 1,000 write-active shards that is
+    # ~128 MB per interval of pure-waste synchronous device writes, plus the SSD endurance.
+    #
+    # The temp has NO durability requirement: it is read back in-process for the Content-MD5 and
+    # the PUT, and a crash mid-snapshot just leaves the shard dirty to be re-snapshotted next
+    # interval. The durable artifact is the S3 object, still gated by content-md5 over these same
+    # bytes. VACUUM INTO takes only a READ transaction on the source, so the live shard's WAL +
+    # per-commit synchronous=FULL is untouched — the RPO contract's local layer is unaffected.
+    #
+    # Scoped to this connection only. Emphatically NOT for `checkpoint/1`: a checkpoint at
+    # synchronous=OFF can corrupt the main database on power loss.
+    Connection.exec(conn, "PRAGMA synchronous=OFF")
 
-      result = Connection.query(conn, "VACUUM INTO '#{String.replace(dest, "'", "''")}'", [])
+    result = Connection.query(conn, "VACUUM INTO '#{String.replace(dest, "'", "''")}'", [])
 
-      # RESTORE IT BEFORE ANYTHING ELSE TOUCHES THIS CONNECTION (expert review 2026-08-01 #5).
-      # The relaxation above is for the throwaway VACUUM temp only, but it stayed in effect for
-      # the checkpoint and the close below — violating the rule the comment right above states.
-      #
-      # `synchronous` is a pager property and SQLite derives checkpoint sync flags from it
-      # (`pPager->walSyncFlags`), so at OFF a checkpoint neither fsyncs the WAL before backfill
-      # nor fsyncs the main database after. TWO checkpoints ran that way: the explicit PASSIVE,
-      # and SQLite's close-time checkpoint — which, on the last connection to a WAL database,
-      # also UNLINKS `-wal`/`-shm`. And this is frequently the last connection: the periodic
-      # flush fires on any dirty shard, which is routinely one with zero checked-out streams.
-      #
-      # Main-database pages written without fsync, followed by deletion of the only recovery
-      # source, is a torn database on power loss — silent, unrecoverable, and then uploaded as
-      # the durable object.
-      Connection.exec(conn, "PRAGMA synchronous=FULL")
+    # RESTORE IT BEFORE ANYTHING ELSE TOUCHES THIS CONNECTION (expert review 2026-08-01 #5).
+    # The relaxation above is for the throwaway VACUUM temp only, but it stayed in effect for
+    # the checkpoint and the close below — violating the rule the comment right above states.
+    #
+    # `synchronous` is a pager property and SQLite derives checkpoint sync flags from it
+    # (`pPager->walSyncFlags`), so at OFF a checkpoint neither fsyncs the WAL before backfill
+    # nor fsyncs the main database after. TWO checkpoints ran that way: the explicit PASSIVE,
+    # and SQLite's close-time checkpoint — which, on the last connection to a WAL database,
+    # also UNLINKS `-wal`/`-shm`. And this is frequently the last connection: the periodic
+    # flush fires on any dirty shard, which is routinely one with zero checked-out streams.
+    #
+    # Main-database pages written without fsync, followed by deletion of the only recovery
+    # source, is a torn database on power loss — silent, unrecoverable, and then uploaded as
+    # the durable object.
+    Connection.exec(conn, "PRAGMA synchronous=FULL")
 
-      # Checkpoint here, where nobody is waiting (expert review 2026-07-24 #4). Without this the
-      # only thing truncating the WAL in steady state was SQLite's autocheckpoint, which runs
-      # INLINE INSIDE A COMMITTING TENANT STATEMENT on whichever connection happens to cross the
-      # threshold — a periodic multi-ms-to-tens-of-ms spike billed to an arbitrary client query,
-      # and under synchronous=FULL it fsyncs the main database too. Worse, the VACUUM INTO above
-      # is a long-lived reader that HOLDS BACK that passive checkpoint (docs/durability.md notes
-      # the same interaction from the other side), so the WAL kept growing past the threshold and
-      # the tenant that eventually won the race paid a larger checkpoint than the default implies.
-      #
-      # PASSIVE specifically: it never blocks writers and never waits on readers — it moves what it
-      # can and returns — so it cannot add latency to a concurrent tenant. A `busy` result is the
-      # normal "readers active" outcome and is ignored; the next interval retries. Runs only after
-      # a successful snapshot, i.e. after this connection's read transaction has ended, which is
-      # what unblocks the checkpointer in the first place.
-      if match?({:ok, _}, result),
-        do: Connection.query(conn, "PRAGMA wal_checkpoint(PASSIVE)", [])
+    # Checkpoint here, where nobody is waiting (expert review 2026-07-24 #4). Without this the
+    # only thing truncating the WAL in steady state was SQLite's autocheckpoint, which runs
+    # INLINE INSIDE A COMMITTING TENANT STATEMENT on whichever connection happens to cross the
+    # threshold — a periodic multi-ms-to-tens-of-ms spike billed to an arbitrary client query,
+    # and under synchronous=FULL it fsyncs the main database too. Worse, the VACUUM INTO above
+    # is a long-lived reader that HOLDS BACK that passive checkpoint (docs/durability.md notes
+    # the same interaction from the other side), so the WAL kept growing past the threshold and
+    # the tenant that eventually won the race paid a larger checkpoint than the default implies.
+    #
+    # PASSIVE specifically: it never blocks writers and never waits on readers — it moves what it
+    # can and returns — so it cannot add latency to a concurrent tenant. A `busy` result is the
+    # normal "readers active" outcome and is ignored; the next interval retries. Runs only after
+    # a successful snapshot, i.e. after this connection's read transaction has ended, which is
+    # what unblocks the checkpointer in the first place.
+    if match?({:ok, _}, result),
+      do: Connection.query(conn, "PRAGMA wal_checkpoint(PASSIVE)", [])
 
-      Connection.close(conn)
-
-      case result do
-        {:ok, _} -> :ok
-        {:error, reason} -> {:error, reason}
-      end
+    case result do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 

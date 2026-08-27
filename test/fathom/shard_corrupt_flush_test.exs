@@ -14,7 +14,7 @@ defmodule Fathom.ShardCorruptFlushTest do
        "a corrupt local db is quarantined…" drives it.
     2. The checkpoint comes back BUSY (a lingering reader), so `upload_for_drop/1` short-circuits
        WITHOUT running quick_check and falls through to `snapshot_and_upload/1`, whose
-       `verify_snapshot/2` finds the corruption and returns the SAME tuple — deliberately without
+       `verify_and_snapshot/2` finds the corruption and returns the SAME tuple — deliberately without
        quarantining, because that function also serves the live path (the serving test below is
        why). `flush_then_drop/1` could not tell them apart and assumed route 1, so the corrupt
        file was left at the live path with a matching provenance sidecar and the next open SERVED
@@ -34,8 +34,36 @@ defmodule Fathom.ShardCorruptFlushTest do
   fixture can stage.
 
   So the fix rests on reading, not on a red-then-green test. If you are changing
-  `upload_for_drop/1`, `verify_snapshot/2` or that branch of `flush_then_drop/1`, note that the
+  `upload_for_drop/1`, `verify_and_snapshot/2` or that branch of `flush_then_drop/1`, note that the
   suite will not catch a regression on route 2.
+
+  ## A SECOND PROPERTY WITH NO OBSERVABLE (expert review 2026-08-26 #12)
+
+  #12 folded the integrity check and the snapshot onto ONE connection (previously
+  `verify_snapshot/2` + `snapshot/2`, each opening and closing the same path). It states three
+  guards. Two are testable and ARE tested; the third is not, and this note exists so nobody
+  mistakes its absence for coverage:
+
+    * (a) `quick_check` runs on the LIVE file, never on the `VACUUM INTO` temp. Covered — "a
+      corrupt live db is REFUSED but left in place…" below fails if the check ever moves to the
+      temp, because `VACUUM INTO` rebuilds indexes from table content and therefore REPAIRS the
+      exact divergence class the gate exists to catch.
+    * (c) the extension stays loaded on that connection. Covered indirectly by the Django UDF
+      suite: a `quick_check` over an expression index calling a UDF fails "no such function"
+      without it.
+    * (b) the check SHORT-CIRCUITS BEFORE the VACUUM. **NOT COVERED, and it cannot be cheaply.**
+
+  A test was written for (b) and then withdrawn because it passed with the guard deliberately
+  reversed. The observable chosen — "no `.snap.*` temp survives a refused flush" — is structurally
+  blind: `snapshot_and_upload/1` removes the temp in an `after` block on every path, so it is
+  absent either way. Reversing the order was verified to leave all 5 tests green.
+
+  The reason it is hard is also the reason it is not urgent: reversing (b) is a PERFORMANCE
+  regression, not a correctness one. With (a) intact, a corrupt shard is still refused — it just
+  pays a full pointless `VACUUM INTO` first. So the cost of an undetected regression here is wasted
+  I/O per corrupt shard per interval, not a bad object.
+
+  If you reorder that `with`, nothing will fail. Read `verify_and_snapshot/2`'s comment first.
   """
   use ExUnit.Case, async: false
 
