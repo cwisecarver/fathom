@@ -17,6 +17,10 @@ defmodule Fathom.Admin.Fleet do
 
   # A node is "alive" if it beat within this window; hot-set load is summed over this window.
   @node_alive_ms 30_000
+  # How many quarantined shard ids the dashboard samples. Matches the `Enum.take(_, 40)` the
+  # template used to do client-side over an unbounded list.
+  @failed_sample 40
+
   @load_window_ms 60_000
 
   @doc "The overview page's fleet roll-up: shard counts, rollout state, node roster + load, pins, jobs."
@@ -81,11 +85,17 @@ defmodule Fathom.Admin.Fleet do
 
     %{
       head: head,
-      releases: Migrator.list(),
+      # Narrow projections, not full rows (expert review 2026-08-26 #30). This map is rebuilt every
+      # 5 s per connected viewer; `Migrator.list/0` carried every captured migration's full DDL and
+      # `Directory.failed_shards/0` was an unbounded select of full structs, while the template uses
+      # three columns and a count-plus-40-ids respectively. Same shape as the two fixes recorded
+      # above in this module.
+      releases: Migrator.list_summary(),
       review_blocks: Enum.map(Migrator.pending_review(), &Migrator.review_block/1),
       laggard_count: Directory.count_laggards(head),
       laggards: Directory.laggards(head, 50),
-      failed_shards: Directory.failed_shards()
+      failed_shard_count: Directory.count_failed(),
+      failed_shard_ids: Directory.failed_shard_ids(@failed_sample)
     }
   end
 

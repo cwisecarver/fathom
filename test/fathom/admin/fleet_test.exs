@@ -75,11 +75,34 @@ defmodule Fathom.Admin.FleetTest do
     assert is_list(o.oban)
   end
 
-  test "migrations roll-up returns head, releases, laggards and quarantine" do
+  # This previously asserted `is_list(m.failed_shards)` — the full quarantined Shard structs.
+  # Expert review 2026-08-26 #30 replaced that with a count plus a capped id sample, because
+  # `Fleet.migrations/0` is rebuilt every 5 s per connected dashboard viewer and the template only
+  # ever used `length/1` and the first 40 ids. The assertions below deliberately pin the NARROWNESS
+  # as well as the shape: a future "simplification" back to full rows should fail here, not just
+  # get slower silently.
+  test "migrations roll-up returns head, releases, laggards and a BOUNDED quarantine sample" do
     m = Fleet.migrations()
     assert Map.has_key?(m, :head)
     assert is_list(m.releases)
     assert is_integer(m.laggard_count)
-    assert is_list(m.failed_shards)
+
+    assert is_integer(m.failed_shard_count),
+           "the quarantine size must be an aggregate, not length/1 over materialized rows"
+
+    assert is_list(m.failed_shard_ids)
+    assert length(m.failed_shard_ids) <= 40, "the quarantine id sample must stay capped"
+
+    refute Map.has_key?(m, :failed_shards),
+           "failed_shards (unbounded full rows) is back on the 5s dashboard tick"
+
+    # Releases carry only what the table renders. `statements` is the full captured DDL of every
+    # Django migration ever taken and grows monotonically; it must not ride this tick.
+    for r <- m.releases do
+      assert Map.has_key?(r, :version) and Map.has_key?(r, :name) and Map.has_key?(r, :yanked)
+
+      refute Map.has_key?(r, :statements),
+             "the release projection is carrying captured DDL onto the dashboard tick again"
+    end
   end
 end

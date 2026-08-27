@@ -564,6 +564,33 @@ defmodule Fathom.Migrator do
   def list, do: Repo.all(from r in Release, order_by: [asc: r.version])
 
   @doc """
+  The columns a release LISTING needs, oldest first — version, name, and the two gate flags.
+
+  Deliberately separate from `list/0` rather than narrowing it (expert review 2026-08-26 #30).
+  `list/0` is a public API returning `Release.t()`, and `statements` / `statement_args` are the
+  point of it for a caller inspecting captured DDL; narrowing it in place would have silently
+  broken those. What it was NOT good for is a dashboard: `Fleet.migrations/0` called it every 5 s
+  per connected viewer while the template renders exactly three fields, so the full DDL of every
+  Django migration ever captured crossed the wire each tick, growing monotonically with the app's
+  migration history.
+  """
+  @spec list_summary() :: [
+          %{version: integer(), name: String.t(), yanked: boolean(), requires_review: boolean()}
+        ]
+  def list_summary do
+    Repo.all(
+      from r in Release,
+        order_by: [asc: r.version],
+        select: %{
+          version: r.version,
+          name: r.name,
+          yanked: r.yanked,
+          requires_review: r.requires_review
+        }
+    )
+  end
+
+  @doc """
   The template's `django_migrations` count recorded by the most recently captured version, or `nil`
   if nothing is captured yet or the latest release predates the count (expert review #6). This is
   the DURABLE baseline the non-atomic-gap check compares a new capture's pre-transaction count

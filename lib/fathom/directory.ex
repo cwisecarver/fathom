@@ -809,6 +809,26 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  Up to `limit` quarantined shard IDs, for a display that shows a sample rather than the set.
+
+  Exists because the dashboard called `failed_shards/0` — full structs, no `select`, no limit —
+  every 5 s per viewer, and then used only the count and the first 40 ids (expert review
+  2026-08-26 #30). The unbounded materialization is a real hazard rather than a tidiness one: the
+  scenario that produces a large quarantine is a fleet-wide storage outage burning migration
+  attempts, so the query is at its most expensive exactly when an operator is watching it.
+  """
+  @spec failed_shard_ids(pos_integer()) :: [String.t()]
+  def failed_shard_ids(limit) when is_integer(limit) and limit > 0 do
+    Repo.all(
+      from s in Shard,
+        where: s.status == "migration_failed",
+        order_by: [asc: s.shard_id],
+        limit: ^limit,
+        select: s.shard_id
+    )
+  end
+
+  @doc """
   HARD-delete a directory row, leaving no tombstone (expert review 2026-08-01 #48).
 
   Not for tenants. `Fathom.Tenants.delete/1` is the supported tenant removal and it tombstones on

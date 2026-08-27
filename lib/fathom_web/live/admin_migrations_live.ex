@@ -85,7 +85,7 @@ defmodule FathomWeb.AdminMigrationsLive do
           <.stat_tile label="Laggards" value={fmt_int(@mig.laggard_count)} accent="text-warning" />
           <.stat_tile
             label="Quarantined"
-            value={fmt_int(length(@mig.failed_shards))}
+            value={fmt_int(@mig.failed_shard_count)}
             accent="text-error"
           />
           <.stat_tile label="Releases" value={fmt_int(length(@mig.releases))} />
@@ -187,13 +187,13 @@ defmodule FathomWeb.AdminMigrationsLive do
               active shards are still behind <span class="num">v{@mig.head}</span>
               . The hourly reconcile sweep + lazy migrate converge the cold tail.
             </p>
-            <div :if={@mig.failed_shards != []} class="mt-4 border-t border-base-300 pt-3">
+            <div :if={@mig.failed_shard_count > 0} class="mt-4 border-t border-base-300 pt-3">
               <div class="mb-2 text-[11px] uppercase tracking-wide text-base-content/50">
                 Quarantined shards
               </div>
               <div class="flex flex-wrap gap-1.5">
-                <.badge :for={s <- Enum.take(@mig.failed_shards, 40)} kind={:error}>
-                  {s.shard_id}
+                <.badge :for={id <- @mig.failed_shard_ids} kind={:error}>
+                  {id}
                 </.badge>
               </div>
             </div>
