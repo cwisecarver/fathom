@@ -55,6 +55,95 @@ defmodule Fathom.ShardsDrainAllTest do
         do: refute(Process.alive?(pid), "each coordinator flushed + released + stopped")
   end
 
+  # Expert review 2026-08-26 #5. drain_all/1 passed each coordinator the WHOLE remaining budget
+  # while its docstring claimed "each coordinator gets a slice". With the defaults the first 16
+  # coordinators each got a 50 s window, so a handful of busy shards in the first wave burned the
+  # entire 55 s budget and every shard behind them got `deadline - now <= 0` — returning
+  # :timed_out WITHOUT BEING CONTACTED, and falling to the unbounded supervisor teardown that
+  # prep_stop/1 exists to avoid.
+  #
+  # TWO THINGS THIS TEST NEEDS, both learned by writing it wrong first:
+  #
+  #   * CONCURRENCY 1. The default is 16, so three shards all run in ONE wave and nothing is behind
+  #     anything — the first draft passed against the unfixed code for that reason. Starvation is a
+  #     property of SEQUENTIAL waves.
+  #   * EVERY shard busy. With a mix, whether starvation is observed depends on where the busy
+  #     shard lands in `Registry.select` order, which is not controllable — a coin-flip test. If
+  #     they are all busy, order stops mattering: pre-fix the first consumes the whole budget and
+  #     the rest report :timed_out; post-fix each gets a slice and reports :busy.
+  test "a busy shard does not consume the whole budget and strand the shards behind it", %{
+    ids: ids
+  } do
+    prev_conc = Application.get_env(:fathom, :drain_all_concurrency)
+    prev_grace = Application.get_env(:fathom, :drain_all_flush_grace_ms)
+    Application.put_env(:fathom, :drain_all_concurrency, 1)
+
+    # A SMALL grace, not zero. At the 5 s default a test-sized budget makes `remaining - grace`
+    # negative for every shard, so they all abort instantly and nothing is consumed (draft two of
+    # this test passed against the unfixed code for that reason). At exactly zero the drain window
+    # equals the exit wait, so the coordinator's abort races the await's timeout and everything
+    # reports :timed_out (draft three failed BOTH ways for that reason). It has to sit between.
+    Application.put_env(:fathom, :drain_all_flush_grace_ms, 200)
+
+    on_exit(fn ->
+      restore(:drain_all_concurrency, prev_conc)
+      restore(:drain_all_flush_grace_ms, prev_grace)
+    end)
+
+    conns =
+      for id <- ids do
+        {:ok, conn} = ShardExecutor.open(id)
+        {:ok, _} = Shards.ensure(id)
+        conn
+      end
+
+    on_exit(fn -> Enum.each(conns, &ShardExecutor.close/1) end)
+
+    test_pid = self()
+    handler = "drainslice-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shards, :drain_all, :slice],
+      fn _e, m, _meta, _ -> send(test_pid, {:slice, m.window_ms}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    result = Shards.drain_all(3_600)
+
+    windows =
+      for _ <- ids do
+        assert_receive {:slice, w}, 10_000
+        w
+      end
+
+    # THE ASSERTION IS FAIRNESS, not non-zero, and getting there took four drafts. What the
+    # unfixed code produces is windows like [3600, 200, 200]: the first shard is handed the entire
+    # budget, drains for nearly all of it, and the shards behind it are left the crumbs. They are
+    # not literally zero, so "min > 0" passes against the defect.
+    #
+    # The audit predicted the leftovers would surface as `:timed_out`. Traced, they do not: a
+    # crumb-window shard returns `:busy` immediately rather than exhausting the budget, so the
+    # %{drained:, busy:, timed_out:} tally is identical either way. That is why the window itself
+    # is emitted and asserted — it is the decision this fix makes, and the only thing that differs.
+    #
+    # Half of a fair share is a deliberately loose bound: the slice is recomputed per wave from the
+    # remaining budget, so a shard that drains early legitimately hands time to the ones behind it
+    # and the windows are not identical.
+    fair_share = div(3_600, length(ids))
+
+    assert Enum.min(windows) >= div(fair_share, 2),
+           "a coordinator was given only #{Enum.min(windows)}ms of drain window against a fair " <>
+             "share of #{fair_share}ms — the shards ahead of it consumed the budget, so its " <>
+             "streams are hard-cut rather than drained (windows: #{inspect(windows)}, " <>
+             "result: #{inspect(result)})"
+
+    assert Enum.max(windows) <= 3_600,
+           "a coordinator was handed more than the whole budget (windows: #{inspect(windows)})"
+  end
+
   test "a busy coordinator (a held connection) is reported busy, not hard-cut", %{ids: [id | _]} do
     {:ok, conn} = ShardExecutor.open(id)
     {:ok, pid} = Shards.ensure(id)

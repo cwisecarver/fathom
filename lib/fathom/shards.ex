@@ -43,6 +43,12 @@ defmodule Fathom.Shards do
   @default_drain_all_concurrency 16
   @default_drain_all_flush_grace_ms 5_000
 
+  # Floor on a per-wave drain slice (expert review 2026-08-26 #5). With a large open-shard count
+  # the computed slice can round toward zero, and a slice under the flush grace means
+  # `drain_pid/2` asks the coordinator to drain in <= 0 ms — i.e. it never really tries. Better to
+  # overshoot the budget slightly on a huge fleet than to convert every shard into a no-op drain.
+  @min_drain_slice_ms 1_000
+
   # Expert review #21: how long a checkout HOLDS + retries a `{:shard_held}` when the holder is a
   # CRASHED node — heartbeat frozen and aging out within this window, so the steal is imminent. Turns
   # the TAIL of the hard-crash TTL window (RTO floor ≈ :shard_lease_ttl_ms + steal_margin) into
@@ -467,8 +473,9 @@ defmodule Fathom.Shards do
   coordinator — refuse new checkouts → let in-flight streams finish → flush + release the lease + stop
   — with bounded concurrency and a **bounded overall budget**. Returns `%{drained, busy, timed_out}`.
 
-  Each coordinator gets a slice of the remaining budget; the fan-out is bounded so the drain doesn't
-  fire every shard's flush simultaneously. Wire it as a release **pre-stop** (`bin/fathom rpc
+  Each coordinator gets a **slice** of the remaining budget — sized per wave of the bounded
+  fan-out, so one busy shard cannot consume the whole window and strand the rest (expert review
+  2026-08-26 #5; before it, this sentence described a property the code did not have). Wire it as a release **pre-stop** (`bin/fathom rpc
   "Fathom.Shards.drain_all()"`) ahead of SIGTERM — see `docs/runbooks/cluster.md`. It never
   `end_draining`s: the node is on its way down, and a cancelled drain resets the flag explicitly.
   """
@@ -485,9 +492,55 @@ defmodule Fathom.Shards do
     deadline = System.monotonic_time(:millisecond) + budget_ms
     pids = Registry.select(@registry, [{{:_, :"$1", :_}, [], [:"$1"]}])
 
+    # A SLICE OF THE BUDGET, NOT ALL OF IT (expert review 2026-08-26 #5).
+    #
+    # This used to pass `deadline - now` to every coordinator, i.e. the WHOLE remaining budget,
+    # while the docstring above claimed "each coordinator gets a slice". With the defaults
+    # (55 s budget, concurrency 16, 5 s flush grace) the first 16 coordinators each got a 50 000 ms
+    # drain window. A coordinator with a checked-out stream sets `draining: true` and arms a timer
+    # for that whole window, exiting early only if its streams happen to check in — so a handful of
+    # busy shards in the FIRST WAVE burned the entire budget, `deadline - now` went <= 0, and
+    # `drain_pid/2`'s first clause returned `:timed_out` for every remaining shard WITHOUT
+    # CONTACTING IT. Those shards then took the unbounded supervisor teardown, which is the exact
+    # path `Fathom.Application.prep_stop/1` exists to avoid: "every open coordinator ran its
+    # checkpoint/snapshot + full-object PUT at once… whatever had not finished when the shutdown
+    # budget expired was killed mid-flush."
+    #
+    # So on a rolling deploy of a node serving long-lived django-libsql streams, the voluntary
+    # drain drained close to nothing and reported `busy: 16, timed_out: N`.
+    #
+    # The slice is computed per WAVE (`ceil(pending / concurrency)`), not per shard, because the
+    # waves run sequentially while the shards within a wave run in parallel. `pending` is recomputed
+    # from a counter as the stream progresses, so shards that drain quickly hand their unused time
+    # to the ones behind them rather than the slice being fixed up front.
+    waves = max(1, ceil(length(pids) / drain_all_concurrency()))
+    remaining_count = :counters.new(1, [:atomics])
+    :counters.put(remaining_count, 1, length(pids))
+
     pids
     |> Task.async_stream(
-      fn pid -> drain_pid(pid, max(0, deadline - System.monotonic_time(:millisecond))) end,
+      fn pid ->
+        left = max(0, deadline - System.monotonic_time(:millisecond))
+        pending = max(1, :counters.get(remaining_count, 1))
+        waves_left = max(1, min(waves, ceil(pending / drain_all_concurrency())))
+        slice = max(@min_drain_slice_ms, div(left, waves_left))
+        :counters.sub(remaining_count, 1, 1)
+        window = min(slice, left)
+
+        # The window each coordinator was actually given. Emitted because it is the DECISION this
+        # fix makes, and it is otherwise unobservable: a shard handed a zero window aborts `:busy`
+        # immediately, which is indistinguishable from a shard that waited its full slice and then
+        # aborted. (The audit predicted the leftovers would show up as `:timed_out`; traced, they
+        # do not — a zero-window shard returns fast rather than exhausting the budget, so the
+        # outcome tally looks identical either way.)
+        :telemetry.execute(
+          [:fathom, :shards, :drain_all, :slice],
+          %{window_ms: window},
+          %{}
+        )
+
+        drain_pid(pid, window)
+      end,
       max_concurrency: drain_all_concurrency(),
       timeout: :infinity,
       ordered: false

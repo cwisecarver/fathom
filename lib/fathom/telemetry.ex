@@ -506,6 +506,15 @@ defmodule Fathom.Telemetry do
         description:
           "Durability-flush failures (#27) — a persistent rate means flushes aren't landing and the RPO is growing silently (S3 auth / bucket-policy / reachability). The direct flush-failure signal behind the rising oldest-unflushed-age gauge"
       ),
+      # #5: the drain window each coordinator was given by drain_all/1. A distribution whose
+      # minimum is 0 means shards behind a busy one were handed no window at all — hard-cutting
+      # their streams instead of letting them finish, which is what the node drain exists to avoid.
+      last_value("fathom.shards.drain_all.slice.window_ms",
+        event_name: [:fathom, :shards, :drain_all, :slice],
+        measurement: :window_ms,
+        description:
+          "Drain window (ms) handed to one coordinator by drain_all/1 (#5) — a value of 0 means the budget was already spent by shards ahead of it, so its streams are hard-cut rather than drained"
+      ),
       # #3: which route a drop-flush took. `:checkpoint` uploads the LIVE database and is only
       # safe with nothing checked out; `:snapshot` goes through VACUUM INTO, which is quiescent by
       # construction. A rising `:checkpoint` rate with busy shards would mean the routing guard
