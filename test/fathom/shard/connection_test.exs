@@ -34,6 +34,51 @@ defmodule Fathom.Shard.ConnectionTest do
       """)
   end
 
+  # Expert review 2026-08-26 #10 made the directory creation conditional (`File.dir?` first,
+  # `mkdir_p!` only on a miss) because the unconditional `mkdir_p!` was ~23% of open cost on the
+  # per-stream path. The win is real but the SEMANTICS are what can silently break: 27 call sites
+  # rely on open/2 creating its directory, and several of them (Migrator.Copy, Snapshots,
+  # RestoreDrillJob, the bench and scale harnesses) legitimately open into a directory that does
+  # not exist yet. If the fast path ever swallowed the miss, those would fail far from here with
+  # an opaque SQLite error, so the create-if-missing contract is pinned explicitly.
+  test "open/2 creates a missing directory, including nested levels" do
+    base = Path.join(System.tmp_dir!(), "conn_mkdir_#{System.unique_integer([:positive])}")
+    # Two levels deep: `:filelib.ensure_path/1` walks every component, so a single-level test
+    # would not prove the nested case still works.
+    path = Path.join([base, "nested", "shard.db"])
+
+    on_exit(fn -> File.rm_rf(base) end)
+
+    refute File.dir?(Path.dirname(path)), "precondition: the directory must not exist yet"
+
+    {:ok, conn} = Connection.open(path)
+    assert File.dir?(Path.dirname(path)), "open/2 must still create a missing directory"
+    :ok = Connection.exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    assert File.exists?(path)
+
+    Connection.close(conn)
+  end
+
+  # The other half: reopening into a directory that already exists must behave identically. This
+  # is the path the fast branch takes on every stream open, so it is the one carrying the change.
+  test "open/2 succeeds against an already-existing directory and leaves it intact" do
+    base = Path.join(System.tmp_dir!(), "conn_exists_#{System.unique_integer([:positive])}")
+    path = Path.join(base, "shard.db")
+    File.mkdir_p!(base)
+
+    on_exit(fn -> File.rm_rf(base) end)
+
+    {:ok, c1} = Connection.open(path)
+    :ok = Connection.exec(c1, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+    :ok = Connection.exec(c1, "INSERT INTO t VALUES (1, 'kept')")
+    Connection.close(c1)
+
+    {:ok, c2} = Connection.open(path)
+    assert {:ok, %{rows: [[1, "kept"]]}} = Connection.query(c2, "SELECT id, v FROM t", [])
+    assert File.dir?(base)
+    Connection.close(c2)
+  end
+
   test "a large result reassembles in order with every row preserved", %{conn: conn} do
     # 20k rows spans hundreds of multi_step batches, so this exercises the batch-boundary
     # reassembly: a wrong reverse/concat would drop rows or reorder across batches.

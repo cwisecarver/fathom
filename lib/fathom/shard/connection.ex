@@ -31,7 +31,31 @@ defmodule Fathom.Shard.Connection do
   """
   @spec open(Path.t(), keyword()) :: {:ok, reference()} | {:error, term()}
   def open(path, opts \\ []) do
-    File.mkdir_p!(Path.dirname(path))
+    # `File.dir?` first, `mkdir_p!` only on a miss (expert review 2026-08-26 #10).
+    #
+    # This is on the PER-STREAM path: every Hrana stream opens a handle, which is every request
+    # for an HTTP SDK and for django-libsql under Django's default `CONN_MAX_AGE=0`. The
+    # unconditional `mkdir_p!` was ~23% of `Connection.open/2` and ~24% of `hrana_open_rt_us`.
+    #
+    # Why it is that expensive: on Elixir 1.20 `File.mkdir_p!/1` routes to
+    # `:filelib.ensure_path/1`, which walks EVERY path component from the root and issues a
+    # syscall per component. It is not one `stat`. Measured here, 3 runs x 2000 reps on the same
+    # already-existing directory: `mkdir_p!` 98.9 / 100.0 / 105.1 µs vs `File.dir?` 14.5 / 14.4 /
+    # 15.3 µs. Full `open(path, tenant?: true, scope: :rw)` went 428.8 µs -> 335.0 µs.
+    #
+    # Semantics are unchanged for all callers: `mkdir_p` on an existing directory is already a
+    # no-op, so the only difference is the syscall count. The slow path still runs whenever the
+    # directory is genuinely absent, which is what the migration engine, snapshots, the restore
+    # drill and the bench/scale harnesses rely on when they open into a fresh temp directory.
+    #
+    # On the tenant path the directory provably already exists — `Fathom.Shard`'s
+    # `handle_continue(:open, …)` creates it, and OTP runs the continue before any queued
+    # `:checkout`, so `Shards.checkout/1` cannot hand back a path whose directory is missing.
+    # `checkpoint_and_verify/1` (shard.ex) named this per-open cost and never removed it; nothing
+    # measured it because `hrana_open_rt_us` was ratio-gated only. Review #39 added the absolute
+    # guard that pins this win.
+    dir = Path.dirname(path)
+    unless File.dir?(dir), do: File.mkdir_p!(dir)
 
     tenant? = Keyword.get(opts, :tenant?, false)
     scope = Keyword.get(opts, :scope, :rw)
