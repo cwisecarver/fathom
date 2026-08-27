@@ -174,6 +174,14 @@ defmodule Fathom.Telemetry do
         description:
           "Checkouts that queued (held + retried) at the TAIL of a crashed owner's lease-TTL window instead of erroring (#21) — a burst per hard node crash is expected. The RTO floor is :shard_lease_ttl_ms + steal_margin; this only converts the last :crash_failover_hold_ms of it to latency"
       ),
+      summary("fathom.shards.held_retry.wait_ms",
+        event_name: [:fathom, :shards, :held_retry],
+        measurement: :wait_ms,
+        unit: :millisecond,
+        tags: [:aimed],
+        description:
+          "How long a held checkout slept before retrying, split by whether the wait was AIMED at a known steal instant (#23) or a blind backoff step. aimed=false dominating a crash failover means the backend stopped supplying the instant and the takeover is back to polling — ~8 retries and ~17 S3 requests per shard instead of one or two"
+      ),
       counter("fathom.shard.warm.promoted.count",
         event_name: [:fathom, :shard, :warm, :promoted],
         tags: [:result],

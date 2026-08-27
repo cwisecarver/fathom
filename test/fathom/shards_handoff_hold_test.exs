@@ -173,6 +173,77 @@ defmodule Fathom.ShardsHandoffHoldTest do
     drain_and_wait(shard)
   end
 
+  # Expert review 2026-08-26 #23. `holder_stealable_soon?` asked the backend for the exact instant
+  # the hold becomes stealable, reduced it to a boolean, and threw the instant away — and then
+  # `backoff_held` rediscovered that same instant by POLLING: 50, 100, 200, 400, 800, 1 000, 1 000,
+  # 1 000 ms, roughly eight retries inside the 5 s budget. Each retry re-enters `do_checkout/3`,
+  # which starts a new coordinator and re-pays a create_lock PUT plus a get_lock GET, so a single
+  # held-and-retried checkout cost ~17 S3 requests. On a hard-crash failover the survivor pays that
+  # per shard, across the dead node's whole keyspace slice, on its already-contended pool.
+  #
+  # The invariant is the retry SHAPE, not latency: with the steal instant known, the wait is aimed
+  # at it once rather than stepped up to it. Asserted on the `:held_retry` event's count and its
+  # `aimed:` flag, which is deterministic — a wall-clock assertion here would be exactly the
+  # timing-fixture flake AGENTS.md warns about.
+  #
+  # PROBED by restoring the old wait computation (`min(backoff, remaining)`) while keeping the
+  # telemetry: it emitted 5 un-aimed retries before the steal instead of 1 aimed one.
+  test "a known steal instant is slept TO once, not rediscovered by polling", %{shard: shard} do
+    Application.put_env(:fathom, :crash_failover_hold_ms, 5_000)
+    Application.put_env(:fathom, :steal_margin_ms, 100)
+    seed_durable(shard)
+
+    test_pid = self()
+    handler = "heldretry-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shards, :held_retry],
+      fn _e, m, meta, _ ->
+        if meta.shard_id == shard, do: send(test_pid, {:held_retry, m.wait_ms, meta.aimed})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    # A crashed owner whose steal instant is ~1.3 s out (heartbeat + lock both expiring in 1.2 s,
+    # plus the 100 ms steal margin) — comfortably inside the 5 s budget, and far enough past the
+    # early backoff steps that polling to it takes several attempts.
+    put_foreign_lock(shard, "dead@node#1", 1_200)
+    Storage.renew_heartbeat("dead@node#1", 1_200)
+
+    assert {:ok, pid, ref, _path} = Shards.checkout(shard),
+           "the crash-window tail must queue for the imminent steal, not error"
+
+    Fathom.Shard.checkin(pid, ref)
+
+    waits = drain_held_retries([])
+
+    assert length(waits) <= 2,
+           "#{length(waits)} retries to reach a steal instant the backend had already computed " <>
+             "(waits: #{inspect(waits)})"
+
+    assert [{first_wait, true} | _] = waits,
+           "the first wait must be AIMED at the known steal instant, not a backoff step " <>
+             "(waits: #{inspect(waits)})"
+
+    # ~1.3 s to the instant, plus at most @steal_wait_jitter_ms of spread. The bound is
+    # order-of-magnitude, not exact: it only has to exclude the 50 ms first backoff step.
+    assert first_wait > 500 and first_wait <= 1_500,
+           "the aimed wait was #{first_wait}ms; it should land near the ~1.3s steal instant"
+
+    drain_and_wait(shard)
+  end
+
+  defp drain_held_retries(acc) do
+    receive do
+      {:held_retry, wait, aimed} -> drain_held_retries([{wait, aimed} | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
   test "a held lease whose owner is LIVE (heartbeat far from expiry) errors immediately, never held",
        %{shard: shard} do
     Application.put_env(:fathom, :crash_failover_hold_ms, 5_000)

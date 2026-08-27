@@ -35,6 +35,11 @@ defmodule Fathom.Shards do
   @initial_held_backoff_ms 50
   @max_held_backoff_ms 1_000
 
+  # Spread added to a sleep aimed at a known steal instant (expert review 2026-08-26 #23). Small
+  # against a multi-second TTL wait, large enough to de-synchronize a whole keyspace slice whose
+  # holders crashed together.
+  @steal_wait_jitter_ms 100
+
   # Node-level graceful drain (expert review #28). Defaults sized for the common ~60s SIGTERM grace:
   # budget under 60s, a per-shard flush grace so a busy shard finishes its final flush before the
   # deadline, and bounded fan-out concurrency so the drain doesn't fire every coordinator's flush at
@@ -142,36 +147,44 @@ defmodule Fathom.Shards do
     end
   end
 
-  # `held` is nil until the first `{:shard_held}` error, then `{deadline_ms, next_backoff_ms}`.
+  # `held` is nil until the first `{:shard_held}` error, then
+  # `{deadline_ms, next_backoff_ms, stealable_at_ms | nil}`.
   # On the FIRST held error we decide once whether this is our in-flight handoff (one Overrides
   # read); if so we open a time-bounded retry window and carry the deadline so we don't re-query
   # Postgres per retry. A reverted handoff just exhausts the (bounded) budget and then errors.
   defp held_retry(shard_id, attempts, nil, {:error, {:shard_held, owner}} = err) do
     cond do
-      # #20 — an in-flight handoff to THIS node: hold for the source's drain window.
+      # #20 — an in-flight handoff to THIS node: hold for the source's drain window. No steal
+      # instant to aim at — the source releases when its drain finishes, which is not a clock
+      # value anyone can read — so this one polls.
       handoff_held_budget_ms() > 0 and handoff_pin_here?(shard_id) ->
-        start_held_retry(shard_id, attempts, handoff_held_budget_ms(), :handoff_wait, err)
+        start_held_retry(shard_id, attempts, handoff_held_budget_ms(), :handoff_wait, err, nil)
 
       # #21 — a hard-crash failover: the holder's heartbeat is frozen (dead) and ages out within the
       # budget, so the steal is imminent. Hold the TAIL of the TTL window as latency instead of a
       # 503. A LIVE holder keeps renewing (its expiry stays ~ttl ahead > budget), so this never
       # holds for one.
-      crash_failover_hold_ms() > 0 and
-          holder_stealable_soon?(shard_id, owner, crash_failover_hold_ms()) ->
-        start_held_retry(shard_id, attempts, crash_failover_hold_ms(), :crash_wait, err)
+      crash_failover_hold_ms() > 0 ->
+        case holder_stealable_at(shard_id, owner, crash_failover_hold_ms()) do
+          {:ok, at} ->
+            start_held_retry(shard_id, attempts, crash_failover_hold_ms(), :crash_wait, err, at)
+
+          :no ->
+            err
+        end
 
       true ->
         err
     end
   end
 
-  defp held_retry(shard_id, attempts, {deadline, backoff}, err),
-    do: backoff_held(shard_id, attempts, deadline, backoff, err)
+  defp held_retry(shard_id, attempts, {deadline, backoff, stealable_at}, err),
+    do: backoff_held(shard_id, attempts, deadline, backoff, stealable_at, err)
 
-  defp start_held_retry(shard_id, attempts, budget, event, err) do
+  defp start_held_retry(shard_id, attempts, budget, event, err, stealable_at) do
     :telemetry.execute([:fathom, :shards, event], %{count: 1}, %{shard_id: shard_id})
     deadline = System.monotonic_time(:millisecond) + budget
-    backoff_held(shard_id, attempts, deadline, @initial_held_backoff_ms, err)
+    backoff_held(shard_id, attempts, deadline, @initial_held_backoff_ms, stealable_at, err)
   end
 
   # Whether the foreign holder's lease will become stealable within `budget`. A crashed holder's
@@ -195,28 +208,75 @@ defmodule Fathom.Shards do
   # A different owner than the one our `acquire_lease` raced against ⇒ don't hold: the lock moved
   # while we were asking, so the error we already have is the fresher answer. `:free` likewise —
   # it is stealable NOW, so retrying immediately (the normal retry path) is right, not a hold.
-  defp holder_stealable_soon?(shard_id, owner, budget) do
+  #
+  # RETURNS THE INSTANT, it does not merely answer yes/no (expert review 2026-08-26 #23). The
+  # backend has just computed the exact system-clock millisecond at which the hold becomes
+  # stealable; the old shape reduced that to a boolean and then had `backoff_held/6` rediscover it
+  # by polling — 50, 100, 200, 400, 800, 1 000, 1 000, 1 000 ms, roughly eight retries inside the
+  # 5 s budget, each of which re-enters `do_checkout/3` and re-pays a create_lock PUT plus a
+  # get_lock GET. Sleeping TO the known instant makes it one or two.
+  defp holder_stealable_at(shard_id, owner, budget) do
     case Fathom.Shard.Storage.lease_stealable_at(shard_id) do
-      {:held, ^owner, at} -> at - System.system_time(:millisecond) <= budget
-      _ -> false
+      {:held, ^owner, at} ->
+        if at - System.system_time(:millisecond) <= budget, do: {:ok, at}, else: :no
+
+      _ ->
+        :no
     end
   rescue
-    _ -> false
+    _ -> :no
   catch
-    :exit, _ -> false
+    :exit, _ -> :no
   end
 
   defp crash_failover_hold_ms,
     do: Application.get_env(:fathom, :crash_failover_hold_ms, @default_crash_hold_ms)
 
-  defp backoff_held(shard_id, attempts, deadline, backoff, err) do
+  # Sleeps to the steal instant when one is known, otherwise backs off (expert review #23).
+  #
+  # `stealable_at` is used AT MOST ONCE and then cleared. Two reasons, and the second is the one
+  # that bites: the instant is now in the past, so recomputing the wait would be <= 0 and the loop
+  # would busy-spin through the rest of the budget; and the steal may legitimately not have
+  # happened on the first attempt (a peer won it, a clock differs), for which polling is the right
+  # shape. So it is one aimed sleep followed by today's backoff.
+  #
+  # `remaining` is a monotonic-clock duration and `stealable_at` a system-clock instant. Only the
+  # DURATION derived from each is compared, never the instants themselves — a system-clock step
+  # can make the aimed wait wrong, and the `min(_, remaining)` clamp plus the budget deadline is
+  # what bounds the damage to today's behaviour.
+  defp backoff_held(shard_id, attempts, deadline, backoff, stealable_at, err) do
     remaining = deadline - System.monotonic_time(:millisecond)
 
     if remaining > 0 do
-      Process.sleep(min(backoff, remaining))
-      do_checkout(shard_id, attempts, {deadline, min(backoff * 2, @max_held_backoff_ms)})
+      wait = min(held_wait_ms(backoff, stealable_at), remaining)
+
+      # Emitted so the RETRY SHAPE is observable, not just the outcome. Both shapes end in a served
+      # request, so nothing in the result distinguishes "slept once to the known instant" from
+      # "polled eight times to rediscover it" — the same reason #3's flush route and #5's drain
+      # window are emitted rather than inferred.
+      :telemetry.execute(
+        [:fathom, :shards, :held_retry],
+        %{wait_ms: wait},
+        %{shard_id: shard_id, aimed: stealable_at != nil}
+      )
+
+      Process.sleep(wait)
+      next_backoff = min(backoff * 2, @max_held_backoff_ms)
+      do_checkout(shard_id, attempts, {deadline, next_backoff, nil})
     else
       err
+    end
+  end
+
+  # Jittered so a takeover of many shards — whose holders all crashed at ~the same moment, and
+  # whose steal instants are therefore ~the same instant — does not wake every waiter together and
+  # hand the survivor a synchronized burst of lock PUTs.
+  defp held_wait_ms(backoff, nil), do: backoff
+
+  defp held_wait_ms(backoff, stealable_at) do
+    case stealable_at - System.system_time(:millisecond) do
+      ahead when ahead > 0 -> ahead + :rand.uniform(@steal_wait_jitter_ms)
+      _ -> backoff
     end
   end
 
