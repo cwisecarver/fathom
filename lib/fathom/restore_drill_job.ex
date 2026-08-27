@@ -67,6 +67,11 @@ defmodule Fathom.RestoreDrillJob do
   """
   @spec run_drill(pos_integer()) :: {:ok, map()}
   def run_drill(n) when is_integer(n) and n > 0 do
+    # Bumped ONCE per run, before the sample (expert review 2026-08-26 #24), so every shard in this
+    # run rotates to the same offset. Per-shard bumping would make the published coverage period a
+    # lie — a shard could sit on the same older snapshot forever depending on sample order.
+    bump_run_index()
+
     results = Enum.map(Directory.sample_for_drill(n), &drill_one/1)
     summary = Enum.frequencies(results)
     fails = Enum.count(results, &(&1 in @failures))
@@ -146,7 +151,23 @@ defmodule Fathom.RestoreDrillJob do
     # demands the drill notice.
     case Storage.list_snapshots(id) do
       {:ok, snapshots} when is_list(snapshots) ->
-        snapshots
+        # PUBLISH THE COVERAGE PERIOD (expert review 2026-08-26 #24). "Every snapshot is verified
+        # within N runs" is a guarantee only if N is visible; without this the rotation would be an
+        # unfalsifiable claim in a comment. `verified` vs `held` is also the amplification factor
+        # the finding's own falsifying experiment asks for, now emitted rather than inferred.
+        selected = select_for_verification(snapshots, run_index())
+
+        :telemetry.execute(
+          [:fathom, :restore_drill, :snapshot_coverage],
+          %{
+            held: length(snapshots),
+            verified: length(selected),
+            coverage_runs: coverage_runs(length(snapshots))
+          },
+          %{shard_id: id}
+        )
+
+        selected
         |> Enum.map(fn %{id: snapshot_id} -> verify_snapshot(id, snapshot_id) end)
         |> Enum.reduce(:ok, &worst_status/2)
 
@@ -163,6 +184,68 @@ defmodule Fathom.RestoreDrillJob do
     e -> list_failed(id, {:raised, e})
   catch
     :exit, reason -> list_failed(id, {:exit, reason})
+  end
+
+  @doc """
+  Which of a shard's snapshots this run verifies: the NEWEST always, plus ONE older on a
+  round-robin (expert review 2026-08-26 #24).
+
+  Snapshots are immutable objects at immutable keys, and nothing recorded that one had already been
+  verified — so every run re-downloaded and re-verified every snapshot of every sampled shard,
+  forever. With GFS retention at `24h,7d,4w` a shard carries up to ~35 snapshots; at
+  `restore_drill_sample: 50` that is up to ~1 750 full-object GETs per run, re-checking identical
+  bytes. The moduledoc's cost model ("the read-only drill costs a GET", "a shard with no snapshots
+  costs one LIST") was accurate only for shards with ZERO snapshots, and the GET budget silently
+  multiplied by the retention depth every time the retention policy widened — with no signal,
+  because the work still "succeeded".
+
+  ROTATE, DO NOT TRUNCATE. Capping to the k newest would be cheaper still and is explicitly the
+  wrong answer: an old snapshot is exactly the one an operator reaches for in a point-in-time
+  recovery, and it would then never be checked at all. Every snapshot is still verified, just
+  across `coverage_runs/1` runs instead of every run — and that period is published as telemetry so
+  the guarantee is checkable rather than asserted.
+
+  The newest is verified EVERY run because it is the one most likely to be restored and the one a
+  fresh corruption would appear in first.
+
+  Pure in `run_index` so it is testable without a clock.
+  """
+  @spec select_for_verification([map()], non_neg_integer()) :: [map()]
+  def select_for_verification([], _run_index), do: []
+  def select_for_verification([only], _run_index), do: [only]
+
+  def select_for_verification([newest | older], run_index) do
+    [newest, Enum.at(older, rem(run_index, length(older)))]
+  end
+
+  @doc """
+  How many runs it takes to verify every snapshot of a shard that has `count` of them — the
+  coverage period the rotation trades for the GET reduction (expert review 2026-08-26 #24).
+
+  Published as telemetry so an operator can check the guarantee instead of taking it on faith:
+  "every snapshot is verified within N runs" is only a guarantee if N is visible.
+  """
+  #
+  # `is_integer/1` states the DOMAIN of a public function, not a dialyzer appeasement: this is a
+  # snapshot count, it is published as a telemetry measurement and used to bound a `rem/2`, and a
+  # float "coverage period" is meaningless. Without it dialyzer can only prove `number()` here,
+  # because `<=` and `-` accept floats — and widening the spec to admit one would document a value
+  # the rest of the code could not use.
+  @spec coverage_runs(non_neg_integer()) :: pos_integer()
+  def coverage_runs(count) when is_integer(count) and count <= 1, do: 1
+  def coverage_runs(count) when is_integer(count), do: count - 1
+
+  # Monotonic per-node run counter driving the rotation. `:persistent_term`, not the directory: the
+  # rotation is statistical coverage, not a durable fact, and a node restart resetting it costs at
+  # most one repeated check. Reading and writing it once per drill run (not per shard) keeps every
+  # shard in the same run on the same rotation offset, which is what makes the published coverage
+  # period true.
+  defp run_index do
+    :persistent_term.get({__MODULE__, :run_index}, 0)
+  end
+
+  defp bump_run_index do
+    :persistent_term.put({__MODULE__, :run_index}, run_index() + 1)
   end
 
   defp list_failed(id, reason) do

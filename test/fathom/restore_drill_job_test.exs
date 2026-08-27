@@ -313,4 +313,70 @@ defmodule Fathom.RestoreDrillJobTest do
   end
 
   defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
+  # Expert review 2026-08-26 #24. Snapshots are immutable objects at immutable keys, and nothing
+  # recorded that one had already been verified — so every run re-downloaded and re-verified EVERY
+  # snapshot of every sampled shard, forever. With GFS retention at `24h,7d,4w` a shard carries up
+  # to ~35 snapshots; at `restore_drill_sample: 50` that is up to ~1 750 full-object GETs per run
+  # re-checking identical bytes. The moduledoc's cost model ("the read-only drill costs a GET") was
+  # accurate only for shards with ZERO snapshots, and the budget silently multiplied by the
+  # retention depth every time retention widened — with no signal, because the work still
+  # "succeeded".
+  #
+  # Tested on the PURE selector rather than by counting GETs through the drill: the rotation rule
+  # is the thing worth pinning, and it has no clock or storage in it.
+  describe "snapshot verification rotates instead of re-checking everything (#24)" do
+    defp snaps(n), do: for(i <- 1..n, do: %{id: "s#{i}", bytes: 1})
+
+    test "verifies the newest every run, plus exactly one older" do
+      selected = RestoreDrillJob.select_for_verification(snaps(10), 0)
+
+      assert length(selected) == 2,
+             "the drill is verifying #{length(selected)} of 10 snapshots — pre-fix it was all 10"
+
+      assert hd(selected).id == "s1", "the newest must be checked every run"
+    end
+
+    test "ROTATES — it does not truncate to the k newest" do
+      # The distinction the finding is explicit about. Capping to the newest few is cheaper and is
+      # the WRONG answer: an old snapshot is exactly the one an operator reaches for in a
+      # point-in-time recovery, and it would then never be checked at all.
+      all = snaps(6)
+
+      covered =
+        for run <- 0..(RestoreDrillJob.coverage_runs(6) - 1),
+            %{id: id} <- RestoreDrillJob.select_for_verification(all, run),
+            into: MapSet.new(),
+            do: id
+
+      for %{id: id} <- all do
+        assert MapSet.member?(covered, id),
+               "#{id} is never verified within the published coverage period — the rotation " <>
+                 "truncates instead of rotating, so an old snapshot rots unchecked"
+      end
+    end
+
+    test "the published coverage period is the real one" do
+      # The guarantee is only a guarantee if the number an operator reads is the number that holds.
+      for count <- [2, 3, 6, 35] do
+        all = snaps(count)
+
+        covered =
+          for run <- 0..(RestoreDrillJob.coverage_runs(count) - 1),
+              %{id: id} <- RestoreDrillJob.select_for_verification(all, run),
+              into: MapSet.new(),
+              do: id
+
+        assert MapSet.size(covered) == count,
+               "coverage_runs(#{count}) = #{RestoreDrillJob.coverage_runs(count)} runs covered " <>
+                 "only #{MapSet.size(covered)} of #{count} snapshots"
+      end
+    end
+
+    test "degenerate sizes are handled" do
+      assert RestoreDrillJob.select_for_verification([], 3) == []
+      assert [%{id: "s1"}] = RestoreDrillJob.select_for_verification(snaps(1), 7)
+      assert RestoreDrillJob.coverage_runs(0) == 1
+      assert RestoreDrillJob.coverage_runs(1) == 1
+    end
+  end
 end

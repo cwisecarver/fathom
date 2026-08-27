@@ -864,6 +864,24 @@ defmodule Fathom.Telemetry do
         description:
           "Snapshot verification outcomes (#48). Snapshots are storage objects with no directory row, so the shard sampler never saw them — the one class of data a point-in-time recovery reaches for was the one class nothing checked"
       ),
+      last_value("fathom.restore_drill.snapshot_coverage.coverage_runs",
+        event_name: [:fathom, :restore_drill, :snapshot_coverage],
+        measurement: :coverage_runs,
+        description:
+          "How many drill runs it takes to verify EVERY snapshot of a shard (#24). The drill rotates -- newest snapshot every run plus one older -- instead of re-downloading all ~35 of them every run. This publishes the period so the guarantee is checkable: if it climbs, retention widened and point-in-time coverage got slower without anyone deciding that"
+      ),
+      last_value("fathom.restore_drill.snapshot_coverage.held",
+        event_name: [:fathom, :restore_drill, :snapshot_coverage],
+        measurement: :held,
+        description:
+          "Snapshots a drilled shard holds. Against snapshot_coverage.verified this is the amplification factor the pre-#24 drill paid every run"
+      ),
+      last_value("fathom.restore_drill.snapshot_coverage.verified",
+        event_name: [:fathom, :restore_drill, :snapshot_coverage],
+        measurement: :verified,
+        description:
+          "Snapshots actually verified for a shard this run (1 or 2 after #24; it was `held` before)"
+      ),
 
       # Lifecycle deny-set — the recovery half of the degraded counter above (#33).
       counter("fathom.tenants.denylist.recovered.count",
