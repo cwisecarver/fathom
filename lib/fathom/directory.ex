@@ -24,6 +24,12 @@ defmodule Fathom.Directory do
   alias Fathom.Directory.Shard
   alias Fathom.Repo
 
+  # Page size for `stream_failed/1` (expert review 2026-08-26 #21). Matches `Fathom.Migrator`'s
+  # `@enqueue_chunk` so the sweep requeues and enqueues in step. It bounds the HEAP — how many
+  # rows exist at once — not a bind-parameter count; see `requeue_failed/1` for why that premise
+  # of the finding was measured and rejected.
+  @requeue_chunk 5_000
+
   # Postgres bind-parameter ceiling is ~65535; 6 fields/row keeps a chunk well
   # under it and bounds each statement's size.
   @batch_chunk 1_000
@@ -802,10 +808,49 @@ defmodule Fathom.Directory do
     )
   end
 
-  @doc "The quarantined (`migration_failed`) shards."
-  @spec failed_shards() :: [Shard.t()]
-  def failed_shards do
-    Repo.all(from s in Shard, where: s.status == "migration_failed")
+  @doc """
+  Keyset-streams `{shard_id, schema_version}` for every quarantined (`migration_failed`) shard,
+  a page at a time (expert review 2026-08-26 #21).
+
+  REPLACES `failed_shards/0`, which was a bare `Repo.all` with no `select` and no limit — full
+  structs for the whole quarantined slice in one heap, and then every id handed to
+  `requeue_failed/1` as bind parameters. Postgres caps a statement at **65 535 parameters**, so
+  past ~65k quarantined shards the operator's documented recovery API was a hard error, and it
+  failed EXACTLY when a large slice is quarantined (a fleet-wide S3 outage burning attempts) —
+  i.e. during the incident it exists for.
+
+  Same shape as `stream_ids_at_version/2`: each page is an independent short query ordered by
+  `shard_id`, so nothing materializes at once and nothing holds a long transaction. It carries
+  `schema_version` alongside the id because the only caller has to compare it against HEAD, and
+  fetching two narrow columns in the page beats a second query per shard.
+
+  SAFE TO REQUEUE WHILE ITERATING, which is what the caller does. The keyset advances by
+  `shard_id` and the caller only flips rows it has already read, so every flipped row sorts at or
+  below `last` and the next page — `status == "migration_failed" AND shard_id > last` — is
+  unaffected. A shard that leaves the set by some other route mid-scan is simply skipped.
+  """
+  @spec stream_failed(pos_integer()) :: Enumerable.t()
+  def stream_failed(page_size \\ @requeue_chunk) do
+    Stream.resource(
+      fn -> "" end,
+      fn last ->
+        rows =
+          Repo.all(
+            from(s in Shard,
+              where: s.status == "migration_failed" and s.shard_id > ^last,
+              order_by: [asc: s.shard_id],
+              limit: ^page_size,
+              select: {s.shard_id, s.schema_version}
+            )
+          )
+
+        case rows do
+          [] -> {:halt, last}
+          _ -> {rows, rows |> List.last() |> elem(0)}
+        end
+      end,
+      fn _ -> :ok end
+    )
   end
 
   @doc """
@@ -1031,6 +1076,25 @@ defmodule Fathom.Directory do
     n
   end
 
+  # DELIBERATELY NOT CHUNKED, and this comment exists so nobody adds it back.
+  #
+  # Expert review 2026-08-26 #21 asked for chunking here, on the premise that "Ecto expands
+  # `in ^ids` to one bind parameter per element" and Postgres caps a statement at 65 535 of them.
+  # MEASURED, and that is not what Ecto does: `field in ^list` compiles to `field = ANY($1)` —
+  # **one** parameter carrying an array. `Ecto.Adapters.SQL.to_sql/4` on this exact query with
+  # 70 000 ids returns `PARAM_COUNT: 1`, `SHAPES: [list: 70000]`.
+  #
+  # The finding conflated two different mechanisms. `Fathom.Migrator.enqueue_unique/1` genuinely
+  # does chunk at 5 000, but it uses Oban's `insert_all`, which emits one parameter per column per
+  # ROW — that is the real crash past ~7 281 jobs its comment records. A `WHERE … IN` does not
+  # grow that way, so the same cap does not reach this call. Chunking here would add a loop, and a
+  # comment claiming a hazard that does not exist, for no benefit.
+  #
+  # `directory_bind_parameter_test.exs` pins the measurement, so if a future Ecto or Postgrex
+  # changed the expansion this stops being safe LOUDLY rather than silently.
+  #
+  # The real half of #21 — `failed_shards/0` materializing the whole quarantined slice as structs
+  # — is fixed by `stream_failed/1` above.
   def requeue_failed(shard_ids) when is_list(shard_ids) do
     {n, _} =
       Repo.update_all(

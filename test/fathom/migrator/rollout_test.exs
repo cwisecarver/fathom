@@ -346,6 +346,54 @@ defmodule Fathom.Migrator.RolloutTest do
       # Idempotent: nothing left to requeue.
       assert {:ok, 0} = Migrator.retry_failed()
     end
+
+    # Expert review 2026-08-26 #21, the half that is REAL. `retry_failed/0` did
+    # `Directory.failed_shards()` — a bare `Repo.all` with no `select` and no limit — materializing
+    # every quarantined shard as a full struct in one heap before doing anything, the same
+    # O(fleet) blowup #12 and #15 closed on two other doors.
+    #
+    # The finding's OTHER half — that `in ^ids` would blow Postgres's 65 535-bind-parameter cap —
+    # was measured and is false; see `Directory.requeue_failed/1` and
+    # `directory_bind_parameter_test.exs`.
+    test "the whole quarantined slice is swept in chunks, and each chunk converges as it goes" do
+      {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
+
+      # More than one chunk's worth would take 5 001 shards; the invariant that is actually worth
+      # pinning at test size is that the sweep is driven by the keyset STREAM (which requeues rows
+      # it has already read while continuing to page) rather than by one materialized list.
+      ids = for i <- 1..25, do: "fqs_#{i}"
+
+      for id <- ids do
+        {:ok, _} = Directory.resolve(id)
+        {:ok, _} = Directory.mark_failed(id)
+      end
+
+      assert Directory.count_failed() >= 25
+
+      assert {:ok, n} = Migrator.retry_failed()
+      assert n >= 25
+
+      for id <- ids do
+        assert {:ok, %{status: "active"}} = Directory.get(id),
+               "#{id} was left quarantined — the scan and the requeue disagree about the set"
+
+        assert_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => id, "target" => 2})
+      end
+    end
+
+    # The pre-existing contract, pinned because the #21 rewrite could easily have dropped it: with
+    # no released version there is no target to enqueue, but un-quarantining is the OTHER half of
+    # what this API does and must still happen.
+    test "un-quarantines even when no version is released" do
+      {:ok, _} = Directory.resolve("fq_nohead")
+      {:ok, _} = Directory.mark_failed("fq_nohead")
+
+      assert Migrator.head() == 0, "fixture: a release exists, so this tests nothing"
+      assert {:ok, 0} = Migrator.retry_failed()
+
+      assert {:ok, %{status: "active"}} = Directory.get("fq_nohead"),
+             "the shard stayed quarantined; requeue must not be gated on a release existing"
+    end
   end
 
   describe "revert/2" do

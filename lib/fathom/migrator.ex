@@ -1054,27 +1054,43 @@ defmodule Fathom.Migrator do
   """
   @spec retry_failed() :: {:ok, non_neg_integer()}
   def retry_failed do
-    failed = Directory.failed_shards()
-    _ = Directory.requeue_failed(Enum.map(failed, & &1.shard_id))
+    # PER CHUNK, not per fleet (expert review 2026-08-26 #21). This used to materialize every
+    # quarantined shard as a full struct via `Directory.failed_shards/0` and hand every id to
+    # `requeue_failed/1` in ONE statement — and Postgres caps a statement at 65 535 bind
+    # parameters, so past ~65k quarantined shards the operator's documented recovery API was a
+    # hard error. It failed exactly when a large slice is quarantined (a fleet-wide S3 outage
+    # burning attempts), i.e. during the incident it exists for.
+    #
+    # Requeue-and-enqueue per chunk, mirroring `revert/3`: the first shards start converging
+    # before the scan finishes, which is what the emergency path wants.
+    # `head` is read ONCE, outside the scan: a release landing mid-sweep would otherwise send
+    # earlier chunks to one target and later ones to another.
+    head = head()
 
-    case {failed, head()} do
-      {[], _} ->
-        {:ok, 0}
+    count =
+      Directory.stream_failed()
+      |> Stream.chunk_every(@enqueue_chunk)
+      |> Enum.reduce(0, fn chunk, acc ->
+        # Un-quarantine FIRST, and unconditionally — including when no version is released. That
+        # is the pre-existing contract: `retry_failed/0` returns `{:ok, 0}` with `head() == 0`
+        # while still returning the shards to `active`, because "un-quarantine" and "enqueue a
+        # migration" are separate halves and only the second needs a target.
+        _ = Directory.requeue_failed(Enum.map(chunk, &elem(&1, 0)))
+        acc + enqueue_laggards(chunk, head)
+      end)
 
-      {_, 0} ->
-        {:ok, 0}
+    {:ok, count}
+  end
 
-      {failed, head} ->
-        count =
-          failed
-          |> Enum.filter(&(&1.schema_version < head))
-          |> Enum.map(
-            &{&1.shard_id, ShardMigrationJob.new(%{shard_id: &1.shard_id, target: head})}
-          )
-          |> enqueue_unique()
+  defp enqueue_laggards(_chunk, 0), do: 0
 
-        {:ok, count}
-    end
+  defp enqueue_laggards(chunk, head) do
+    chunk
+    |> Enum.filter(fn {_id, version} -> version < head end)
+    |> Enum.map(fn {id, _version} ->
+      {id, ShardMigrationJob.new(%{shard_id: id, target: head})}
+    end)
+    |> enqueue_unique()
   end
 
   @doc """

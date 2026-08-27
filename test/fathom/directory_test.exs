@@ -604,4 +604,93 @@ defmodule Fathom.DirectoryTest do
     |> Ecto.Changeset.change(migrating_since: ts)
     |> Fathom.Repo.update!()
   end
+
+  # Expert review 2026-08-26 #21, the half that is real. `retry_failed/0` reached the quarantined
+  # slice through `failed_shards/0` — a bare `Repo.all` with no `select` and no limit — so the
+  # whole set became full structs in one heap before anything happened. That is the same O(fleet)
+  # blowup #12 closed on `all/0` and #15 on `shards_at_version/1`, reached through a third door,
+  # and it bit hardest exactly when the set is large (a fleet-wide S3 outage burning attempts) —
+  # during the incident the API exists for.
+  #
+  # (The finding's OTHER half — a 65 535-bind-parameter cap on `in ^ids` — was measured and is
+  # false. See `Fathom.DirectoryBindParameterTest` and the comment on `requeue_failed/1`.)
+  describe "stream_failed/1" do
+    setup do
+      for i <- 1..5 do
+        id = "sf_#{i}_#{System.unique_integer([:positive])}"
+        {:ok, _} = Directory.resolve(id)
+        {:ok, _} = Directory.mark_failed(id)
+        id
+      end
+      |> then(&%{ids: &1})
+    end
+
+    test "yields narrow {shard_id, schema_version} tuples, never structs", %{ids: ids} do
+      rows = Directory.stream_failed(2) |> Enum.to_list()
+      got = rows |> Enum.map(&elem(&1, 0)) |> MapSet.new()
+
+      for id <- ids, do: assert(MapSet.member?(got, id))
+
+      assert Enum.all?(rows, &match?({id, v} when is_binary(id) and is_integer(v), &1)),
+             "stream_failed must select two columns, not load Shard structs: #{inspect(hd(rows))}"
+    end
+
+    test "is LAZY — taking one page FETCHES one page, not the whole set", %{ids: _ids} do
+      # The property that matters at fleet scale, and the one a materializing implementation
+      # cannot have.
+      #
+      # COUNT ROWS, NOT QUERIES. The first draft counted queries and passed against a deliberately
+      # materializing `Repo.all |> Enum.map` probe — because that shape also issues exactly one
+      # query. Query count cannot tell "fetched 1 row" from "fetched the fleet"; `num_rows` can.
+      rows = :counters.new(1, [])
+      handler = "streamfailed-#{System.unique_integer([:positive])}"
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:fathom, :repo, :query],
+          fn _e, _m, meta, _c ->
+            with "shards" <- meta[:source],
+                 {:ok, %{num_rows: n}} <- meta[:result] do
+              :counters.add(rows, 1, n)
+            end
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      # Page size 1 over >= 5 quarantined shards: taking one row must READ one row.
+      assert [_one] = Directory.stream_failed(1) |> Enum.take(1)
+
+      assert :counters.get(rows, 1) == 1,
+             "taking one row read #{:counters.get(rows, 1)} rows — the quarantined set is being " <>
+               "materialized rather than paged"
+    end
+
+    test "pages through the whole set rather than stopping at one page", %{ids: ids} do
+      # The other side of laziness: paging must not silently truncate.
+      got = Directory.stream_failed(2) |> Enum.map(&elem(&1, 0)) |> MapSet.new()
+      for id <- ids, do: assert(MapSet.member?(got, id), "#{id} was dropped by the keyset paging")
+    end
+
+    test "requeueing rows already read does not disturb the scan", %{ids: ids} do
+      # What `Migrator.retry_failed/0` actually does: flip each page to `active` while continuing
+      # to page. Safe because the keyset advances by shard_id and only already-read rows are
+      # flipped, so every flipped row sorts at or below `last`. If that reasoning were wrong this
+      # would drop shards.
+      seen =
+        Directory.stream_failed(2)
+        |> Enum.reduce([], fn {id, _v}, acc ->
+          _ = Directory.requeue_failed([id])
+          [id | acc]
+        end)
+        |> MapSet.new()
+
+      for id <- ids do
+        assert MapSet.member?(seen, id), "#{id} was skipped when earlier pages were requeued"
+        assert {:ok, %{status: "active"}} = Directory.get(id)
+      end
+    end
+  end
 end
