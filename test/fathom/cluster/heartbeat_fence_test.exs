@@ -669,4 +669,122 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
 
   defp hb_file,
     do: Path.join([Fathom.Shard.Storage.Local.dir(), "heartbeats", to_string(node())])
+
+  # Expert review 2026-08-26 #40 — THE LAPSE PATH WAS NEVER EXERCISED THROUGH PUBSUB.
+  #
+  # `shard.ex` calls `subscribe_lapse/0` only when `acquire_gen != nil` (heartbeat mode), and
+  # `config/test.exs` sets `heartbeat_server: false` — so in the default suite coordinators open in
+  # LEGACY mode and never subscribe at all. Every existing lapse test hand-delivers the message
+  # with `send(coordinator, {:heartbeat_lapsed, gen})`. Three links had zero coverage: that a
+  # heartbeat-mode coordinator subscribes, that the broadcast reaches it, and that coalescing works
+  # under a real broadcast to N coordinators rather than two hand-sends to one.
+  #
+  # Both `subscribe_lapse/0` and `broadcast_lapse/1` swallow every failure, so a PubSub
+  # misconfiguration was silent BY CONSTRUCTION — proactive revalidation would simply stop, a
+  # superseded coordinator would keep ACKing writes until its next flush (the defect review #34
+  # exists to fix), and the suite would stay green. This is AGENTS.md Testing item 3's "the
+  # environment already has the property" trap, against that exact config line.
+  #
+  # #13a and #13b in this same run changed this path; without these tests there was no harness that
+  # exercised it end to end.
+  describe "the lapse broadcast really reaches coordinators (#40)" do
+    setup do
+      # Pin the jitter so the scheduled revalidation does NOT fire during the assertion. #13b made
+      # the spread population-derived, which at test scale is a few milliseconds — so
+      # `lapse_revalidate_pending` would race from `true` to a `%Task{}` to `false` before it could
+      # be observed. This is the operator override existing for exactly this reason.
+      prev = Application.get_env(:fathom, :lapse_revalidate_jitter_ms)
+      Application.put_env(:fathom, :lapse_revalidate_jitter_ms, 60_000)
+
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:fathom, :lapse_revalidate_jitter_ms, prev),
+          else: Application.delete_env(:fathom, :lapse_revalidate_jitter_ms)
+      end)
+
+      :ok
+    end
+
+    test "a REAL broadcast reaches every heartbeat-mode coordinator", %{shard: shard, hb: hb} do
+      other = "#{shard}_b"
+      on_exit(fn -> Shards.drain(other, 5_000) end)
+
+      {:ok, c1} = ShardExecutor.open(shard)
+      {:ok, c2} = ShardExecutor.open(other)
+      {:ok, coord1} = Shards.ensure(shard)
+      {:ok, coord2} = Shards.ensure(other)
+
+      # ASSERT THE MODE ACTUALLY TOOK (AGENTS.md's two-mode rule). Without this the test could run
+      # entirely in legacy mode and prove nothing, which is the whole shape of #40.
+      for coord <- [coord1, coord2] do
+        assert is_integer(:sys.get_state(coord).acquire_gen),
+               "coordinator is in LEGACY mode, so it never subscribed — this test would pass " <>
+                 "without exercising the subscription at all"
+      end
+
+      gen = :sys.get_state(hb).generation
+
+      # The REAL broadcast, not a hand-delivered send/2. This is the link that had no coverage.
+      :ok =
+        Phoenix.PubSub.broadcast(
+          Fathom.PubSub,
+          Heartbeat.topic(),
+          {:heartbeat_lapsed, gen + 1}
+        )
+
+      for {coord, id} <- [{coord1, shard}, {coord2, other}] do
+        assert :sys.get_state(coord).lapse_revalidate_pending,
+               "#{id}'s coordinator did not arm a revalidation from a real PubSub broadcast — " <>
+                 "the subscription is not working, and both subscribe_lapse/0 and " <>
+                 "broadcast_lapse/1 swallow failures, so nothing else would have told us"
+      end
+
+      :ok = ShardExecutor.close(c1)
+      :ok = ShardExecutor.close(c2)
+    end
+
+    test "a repeat broadcast COALESCES onto the pending revalidation", %{shard: shard, hb: hb} do
+      {:ok, conn} = ShardExecutor.open(shard)
+      {:ok, coord} = Shards.ensure(shard)
+      assert is_integer(:sys.get_state(coord).acquire_gen)
+
+      gen = :sys.get_state(hb).generation
+
+      for _ <- 1..5 do
+        :ok =
+          Phoenix.PubSub.broadcast(Fathom.PubSub, Heartbeat.topic(), {:heartbeat_lapsed, gen + 1})
+      end
+
+      _ = :sys.get_state(coord)
+
+      # Five broadcasts, one armed revalidation — the coalescing round-2 #26 added, now exercised
+      # under a real broadcast instead of two hand-sends.
+      assert :sys.get_state(coord).lapse_revalidate_pending
+
+      :ok = ShardExecutor.close(conn)
+    end
+
+    test "a LEGACY-mode coordinator does not subscribe", %{shard: shard} do
+      # The other half of the two-mode rule. Legacy coordinators renew per shard and use the renew
+      # fence; subscribing them would arm a revalidation path their mode does not use.
+      stop_supervised!(Fathom.Shard.Heartbeat)
+
+      legacy = "#{shard}_legacy"
+      on_exit(fn -> Shards.drain(legacy, 5_000) end)
+
+      {:ok, conn} = ShardExecutor.open(legacy)
+      {:ok, coord} = Shards.ensure(legacy)
+
+      assert :sys.get_state(coord).acquire_gen == nil,
+             "fixture: the coordinator is not in legacy mode, so this asserts nothing"
+
+      :ok = Phoenix.PubSub.broadcast(Fathom.PubSub, Heartbeat.topic(), {:heartbeat_lapsed, 999})
+      _ = :sys.get_state(coord)
+
+      refute :sys.get_state(coord).lapse_revalidate_pending,
+             "a legacy-mode coordinator armed a lapse revalidation; it does not use that path"
+
+      :ok = ShardExecutor.close(conn)
+    end
+  end
 end

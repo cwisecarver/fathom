@@ -1200,12 +1200,28 @@ defmodule Fathom.Shard do
 
   # Best-effort, mirroring Heartbeat.broadcast_lapse: a missing PubSub (the
   # scale/bench harness) must not fail an open — the flush-time fence still guards.
+  #
+  # BUT IT NO LONGER SWALLOWS SILENTLY (expert review 2026-08-26 #40). A bare `rescue _ -> :ok`
+  # means a PubSub misconfiguration turns proactive revalidation off by construction, with a green
+  # suite and no log: a superseded coordinator then keeps ACKing writes until its next flush, which
+  # is exactly the defect review #34 was written to fix. The failure is still non-fatal — the
+  # flush-time fence remains the hard guard — but it is now visible.
   defp subscribe_lapse do
     Phoenix.PubSub.subscribe(Fathom.PubSub, Heartbeat.topic())
   rescue
-    _ -> :ok
+    e -> lapse_subscribe_failed(e)
   catch
-    :exit, _ -> :ok
+    :exit, reason -> lapse_subscribe_failed(reason)
+  end
+
+  defp lapse_subscribe_failed(reason) do
+    Logger.warning(
+      "shard: could not subscribe to the heartbeat lapse topic (#{inspect(reason)}); this " <>
+        "coordinator will NOT revalidate proactively on a lapse and falls back to the flush-time " <>
+        "fence, so a superseded lease is noticed up to one flush interval later"
+    )
+
+    :ok
   end
 
   defp pull_temp(path), do: path <> ".pull"
