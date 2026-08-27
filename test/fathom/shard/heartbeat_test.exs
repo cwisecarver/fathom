@@ -514,4 +514,109 @@ defmodule Fathom.Shard.HeartbeatTest do
       assert Heartbeat.renew_delay_ms(10_000, 25_000) == 0
     end
   end
+
+  # Expert review 2026-08-26 #18. `mark_lapse/1` called `broadcast_lapse/1` INLINE, and
+  # `Phoenix.PubSub.broadcast/3` runs `Registry.dispatch/3`, which for a `:duplicate` registry
+  # dispatches in the CALLING process — an `:ets.lookup` per partition copying one entry per
+  # subscribed coordinator into the heartbeat's own heap, then one `send` each. Every open
+  # coordinator on the node subscribes to that single topic.
+  #
+  # MEASURED against a synthetic 30 000-subscriber topic, which is the finding's own falsifying
+  # experiment ("if it is microseconds, the dispatch is not the cost"): **p50 35 ms**, range
+  # 32-41 ms over ten samples. So the one component whose entire purpose is to be O(1) per node —
+  # the F1 fix that replaced ~100k PUT/s with one PUT — was doing 35 ms of O(open-shards) work
+  # inside its own critical path, at the moment it is already behind. Every millisecond there
+  # extends the lapse, and the lapse is what triggers #13's revalidation fan-out.
+  describe "the lapse fan-out does not run in the heartbeat process (#18)" do
+    setup do
+      test_pid = self()
+      handler = "lapsefan-#{System.unique_integer([:positive])}"
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:fathom, :shard, :heartbeat, :lapse_broadcast],
+          fn _e, _m, meta, _c -> send(test_pid, {:lapse_broadcast, meta.inline}) end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+      :ok
+    end
+
+    # Forces the lapse edge: an expired deadline plus a renew tick.
+    defp force_lapse(pid) do
+      capture_log(fn ->
+        :sys.replace_state(pid, fn s ->
+          %{s | mono_deadline_ms: System.monotonic_time(:millisecond) - 1_000, lapsed: false}
+        end)
+
+        send(pid, :renew)
+        _ = :sys.get_state(pid)
+      end)
+    end
+
+    test "the fan-out runs OFF the heartbeat process", %{pid: pid} do
+      # THE HONEST ASSERTION, after a first draft that was not one. "The heartbeat is not blocked"
+      # is NOT observable at test scale: `Registry.dispatch/3`'s cost is per subscriber, and with
+      # two subscribers it is microseconds whether it runs inline or in a task. A test that
+      # asserted delivery would have passed either way.
+      #
+      # So assert the structural property instead — the dispatch is performed by a task, reported
+      # by the event emitted where the fan-out actually happens.
+      force_lapse(pid)
+
+      assert_receive {:lapse_broadcast, false},
+                     5_000,
+                     "the lapse fan-out ran INLINE in the heartbeat process. Measured at p50 " <>
+                       "35 ms against 30 000 subscribers, inside the critical path that ends " <>
+                       "the lapse."
+    end
+
+    test "the generation bump and publish stay INLINE, so the fence sees the lapse immediately",
+         %{pid: pid} do
+      # The finding's integrity guard. Moving the bump or `publish_status/1` off-process would let
+      # `valid_for_write?/1` keep answering with the pre-lapse generation while the broadcast was
+      # still queued — a window where the node believes it is valid and nothing says otherwise.
+      before_gen = Heartbeat.generation()
+
+      capture_log(fn ->
+        :sys.replace_state(pid, fn s ->
+          %{s | mono_deadline_ms: System.monotonic_time(:millisecond) - 1_000, lapsed: false}
+        end)
+
+        send(pid, :renew)
+        _ = :sys.get_state(pid)
+      end)
+
+      # Read through the lock-free status table, which is what the coordinators' fence reads.
+      assert Heartbeat.generation() > before_gen,
+             "the generation bump did not land synchronously with mark_lapse/1 — the fence would " <>
+               "still read the pre-lapse generation while the broadcast was in flight"
+    end
+
+    test "a missing task supervisor falls back to broadcasting inline, never to silence", %{
+      pid: pid
+    } do
+      # The scale/bench harness runs without the full tree. A lapse that notified nobody would be
+      # worse than a slow one, so the fallback is inline rather than skip — and it SAYS so, which
+      # is what makes a sustained inline rate alertable rather than invisible.
+      sup = Process.whereis(Fathom.TaskSupervisor)
+
+      if sup do
+        Process.unregister(Fathom.TaskSupervisor)
+
+        on_exit(fn ->
+          if Process.alive?(sup), do: Process.register(sup, Fathom.TaskSupervisor)
+        end)
+      end
+
+      force_lapse(pid)
+
+      assert_receive {:lapse_broadcast, true},
+                     5_000,
+                     "with no task supervisor the lapse was not broadcast at all — silence is " <>
+                       "worse than a slow heartbeat here"
+    end
+  end
 end

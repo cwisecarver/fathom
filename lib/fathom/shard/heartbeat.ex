@@ -531,8 +531,64 @@ defmodule Fathom.Shard.Heartbeat do
       owner: state.owner
     })
 
-    broadcast_lapse(gen)
+    # THE FAN-OUT GOES OFF-PROCESS; the bump and the publish stay inline (expert review 2026-08-26
+    # #18).
+    #
+    # `Phoenix.PubSub.broadcast/3` runs `Registry.dispatch/3`, which for a `:duplicate` registry
+    # dispatches IN THE CALLING PROCESS — an `:ets.lookup` per partition copying one entry per
+    # subscribed coordinator into this heap, then one `send` each. Every open coordinator on the
+    # node subscribes to this single topic.
+    #
+    # MEASURED against a synthetic 30 000-subscriber topic, which is what the finding asks for
+    # ("if it is microseconds, the dispatch is not the cost"): p50 **35 ms**, range 32-41 ms over
+    # ten samples. Not microseconds. The one component whose entire purpose is to be O(1) per node
+    # was doing 35 ms of O(open-shards) work inside its own critical path, at the one moment it is
+    # already behind — and every millisecond here extends the lapse, which is what triggers #13's
+    # revalidation fan-out.
+    #
+    # WHAT MUST NOT MOVE, and does not: the generation bump, the `:persistent_term.put` above, and
+    # `publish_status/1` below. Those are what the lock-free fence readers consult, so the lapse is
+    # visible to `valid_for_write?/1` before this function returns, exactly as before.
+    #
+    # A LATE BROADCAST IS STILL CORRECT. The message carries `gen`, and a coordinator compares it
+    # against its OWN `acquire_gen`, not against the heartbeat's current generation — so a
+    # broadcast landing after the next successful renewal still routes that coordinator to
+    # revalidate. The episode is identified by the number, not by the timing.
+    fan_out_lapse(gen)
     publish_status(%{state | generation: gen, lapsed: true})
+  end
+
+  # Best-effort in both directions: if the task supervisor is unavailable (the scale/bench harness
+  # runs without the full tree), fall back to broadcasting inline rather than skipping the
+  # notification — a slow heartbeat is better than a silent lapse.
+  defp fan_out_lapse(gen) do
+    case Task.Supervisor.start_child(Fathom.TaskSupervisor, fn -> dispatch_lapse(gen, false) end) do
+      {:ok, _pid} -> :ok
+      _ -> dispatch_lapse(gen, true)
+    end
+  rescue
+    _ -> dispatch_lapse(gen, true)
+  catch
+    :exit, _ -> dispatch_lapse(gen, true)
+  end
+
+  # Emitted where the fan-out ACTUALLY happens, carrying whether it ran inline.
+  #
+  # This path had no observable at all, which is the same complaint expert review 2026-08-26 #40
+  # makes about the subscribe side: `broadcast_lapse/1` swallows every failure, so a lapse that
+  # notified nobody looked exactly like one that notified everybody. `inline: true` sustained in
+  # production means the task supervisor is unavailable and the heartbeat is paying the dispatch —
+  # measured at p50 35 ms against 30 000 subscribers — inside its own critical path.
+  defp dispatch_lapse(gen, inline?) do
+    broadcast_lapse(gen)
+
+    :telemetry.execute(
+      [:fathom, :shard, :heartbeat, :lapse_broadcast],
+      %{count: 1},
+      %{generation: gen, inline: inline?}
+    )
+
+    :ok
   end
 
   # Best-effort: the lapse broadcast is observability/proactive-revalidation only, so

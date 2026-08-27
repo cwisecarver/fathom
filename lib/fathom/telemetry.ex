@@ -909,6 +909,12 @@ defmodule Fathom.Telemetry do
         description:
           "A node heartbeat lapsed (renewal didn't land within the TTL margin) — its shards become stealable; sustained ⇒ S3 reachability / mass self-fence risk"
       ),
+      counter("fathom.shard.heartbeat.lapse_broadcast.count",
+        event_name: [:fathom, :shard, :heartbeat, :lapse_broadcast],
+        tags: [:inline],
+        description:
+          "Lapse notifications actually fanned out to coordinators, tagged by whether the dispatch ran INLINE in the heartbeat process (#18). Before this the path had no observable at all -- broadcast_lapse/1 swallows every failure, so a lapse that notified nobody looked like one that notified everybody. inline=true sustained means the task supervisor is unavailable and the heartbeat is paying a dispatch measured at p50 35ms against 30k subscribers, inside the critical path that ends the lapse"
+      ),
 
       # Control-plane abuse throttles (#34): the admin BasicAuth brute-force lockout + the /api
       # request-rate limit. High-frequency security signals live here (not the Postgres audit log,

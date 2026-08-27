@@ -480,7 +480,20 @@ defmodule Fathom.Application do
       FathomWeb.Telemetry,
       Fathom.Repo,
       {DNSCluster, query: Application.get_env(:fathom, :dns_cluster_query) || :ignore},
-      {Phoenix.PubSub, name: Fathom.PubSub},
+      # PARTITIONED like `Fathom.ShardRegistry` (expert review 2026-08-26 #18), and for the same
+      # reason that Registry was: it now holds the same one-row-per-coordinator population.
+      #
+      # `Phoenix.PubSub.Supervisor` defaults `pool_size` to `ceil(schedulers / 4)` — 2-4 on a
+      # typical box — while the shard Registry is explicitly given `System.schedulers_online()`
+      # because "the default single partition serializes every coordinator
+      # registration/unregistration/death-cleanup through one process". Every open coordinator
+      # subscribes to ONE heartbeat topic, so the subscribe/unsubscribe path on shard open and
+      # close hits the same serialization the Registry was widened to avoid.
+      #
+      # This does NOT make the broadcast itself cheap — measured at p50 35 ms against 30 000
+      # subscribers, which is why the fan-out moved off the heartbeat process in
+      # `Heartbeat.mark_lapse/1`. The two are independent halves of #18, and the finding says so.
+      {Phoenix.PubSub, name: Fathom.PubSub, pool_size: System.schedulers_online()},
       # Node-local ETS fixed-window counter behind the control-plane throttles (expert review #34):
       # admin BasicAuth brute-force lockout + the /api request-rate limit. No deps (just owns the
       # table + sweeps it), so it comes up early, before the endpoint accepts requests.
