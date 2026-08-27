@@ -456,8 +456,18 @@ defmodule Fathom.Test.FaultyStorage do
 
   @impl true
   def snapshot(shard_id, snapshot_id), do: Local.snapshot(shard_id, snapshot_id)
+  # Injectable LIST failure (expert review 2026-08-26 #37). The drill used to match a bare `_` on
+  # this call and return :ok, so a 403 from a bucket-policy change could kill snapshot verification
+  # fleet-wide while every run reported the shard healthy. There was no seam to reproduce that,
+  # which is why the branch had no test.
   @impl true
-  def list_snapshots(shard_id), do: Local.list_snapshots(shard_id)
+  def list_snapshots(shard_id) do
+    case Application.get_env(:fathom, :storage_list_snapshots_error) do
+      nil -> Local.list_snapshots(shard_id)
+      reason -> {:error, reason}
+    end
+  end
+
   @impl true
   def restore_snapshot(shard_id, snapshot_id), do: Local.restore_snapshot(shard_id, snapshot_id)
 

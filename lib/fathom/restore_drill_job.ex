@@ -82,10 +82,52 @@ defmodule Fathom.RestoreDrillJob do
 
   defp drill_one(%{shard_id: id, schema_version: schema_version}) do
     status = verify(id, schema_version)
-    Directory.record_verification(id, Atom.to_string(status))
-    :telemetry.execute([:fathom, :restore_drill, :result], %{count: 1}, %{status: status})
-    verify_snapshots(id)
-    status
+
+    # Snapshot verdicts reach the DURABLE column too (expert review 2026-08-26 #37).
+    #
+    # `record_verification/2` used to run here, BEFORE `verify_snapshots/1`, and the snapshot
+    # statuses were discarded. So a shard whose only snapshot was corrupt durably recorded
+    # `last_verify_status = "ok"` — and this module's moduledoc claims "a failure is queryable",
+    # which held for the live object only. A DR audit query therefore returned a clean fleet while
+    # snapshots rotted.
+    snapshot_status = verify_snapshots(id)
+    overall = worst_status(status, snapshot_status)
+
+    Directory.record_verification(id, Atom.to_string(overall))
+    :telemetry.execute([:fathom, :restore_drill, :result], %{count: 1}, %{status: overall})
+    overall
+  end
+
+  # `:ok` only when BOTH the live object and every snapshot are clean, so a corrupt live object is
+  # never masked by healthy snapshots or the reverse.
+  #
+  # FAILS SAFE ON AN UNKNOWN STATUS. The first draft of this used
+  # `Enum.find(@status_rank, :ok, ...)`, which returned `:ok` for anything not in the list — and
+  # the list was incomplete, because `verify/2`, `check_schema/2` and `restore_one/1` between them
+  # also produce `:sentinel`, `:fork_failed` and `:restored_mismatch`. A status this function had
+  # not heard of would have been silently recorded as healthy, which is the same
+  # swallow-a-failure-as-ok defect #37 is about, reintroduced inside its own fix. The clauses below
+  # treat "not `:ok`" as the answer regardless of whether the rank list knows the atom, so adding a
+  # new status elsewhere can never downgrade it to healthy here.
+  @status_rank [
+    :corrupt,
+    :restored_mismatch,
+    :fork_failed,
+    :error,
+    :list_failed,
+    :sentinel,
+    :absent
+  ]
+
+  defp worst_status(:ok, :ok), do: :ok
+  defp worst_status(:ok, other), do: other
+  defp worst_status(other, :ok), do: other
+
+  defp worst_status(a, b) do
+    # Neither is :ok. Prefer the more severe of the two; an atom the rank does not list still wins
+    # over :ok because of the clauses above, and defaults to `a` here rather than to anything
+    # healthy.
+    Enum.find(@status_rank, a, fn s -> s == a or s == b end)
   end
 
   # Snapshots had NO health signal at all (expert review 2026-08-01 #48). `sample_for_drill/1`
@@ -104,15 +146,38 @@ defmodule Fathom.RestoreDrillJob do
     # demands the drill notice.
     case Storage.list_snapshots(id) do
       {:ok, snapshots} when is_list(snapshots) ->
-        Enum.each(snapshots, fn %{id: snapshot_id} -> verify_snapshot(id, snapshot_id) end)
+        snapshots
+        |> Enum.map(fn %{id: snapshot_id} -> verify_snapshot(id, snapshot_id) end)
+        |> Enum.reduce(:ok, &worst_status/2)
 
-      _ ->
-        :ok
+      # A FAILED LIST IS NOT A CLEAN SHARD (expert review 2026-08-26 #37). This used to match `_`
+      # and return `:ok` with no log, no telemetry and no counter — so a bucket-policy change, an
+      # endpoint misconfig or a credential rotation could kill snapshot verification FLEET-WIDE
+      # while every run reported the shard fine. AGENTS.md records the same class from `bump/1`
+      # rescuing to `:ok`, and the comment above records an earlier draft of THIS function doing
+      # it too.
+      other ->
+        list_failed(id, other)
     end
   rescue
-    _ -> :ok
+    e -> list_failed(id, {:raised, e})
   catch
-    :exit, _ -> :ok
+    :exit, reason -> list_failed(id, {:exit, reason})
+  end
+
+  defp list_failed(id, reason) do
+    Logger.error(
+      "restore drill: could not LIST snapshots for #{id} (#{inspect(reason)}) — snapshot " <>
+        "verification did not run, so this shard's point-in-time recovery is UNVERIFIED"
+    )
+
+    :telemetry.execute(
+      [:fathom, :restore_drill, :snapshot_result],
+      %{count: 1},
+      %{status: :list_failed, shard_id: id, snapshot_id: nil}
+    )
+
+    :list_failed
   end
 
   defp verify_snapshot(id, snapshot_id) do

@@ -152,6 +152,63 @@ defmodule Fathom.RestoreDrillJobTest do
       assert {:ok, _} = RestoreDrillJob.run_drill(5)
       assert_receive {:snapshot, status, "snap1"}, 2_000
       assert status in [:corrupt, :error], "a corrupt snapshot passed the drill as #{status}"
+
+      # THE DURABLE COLUMN, not just the telemetry (expert review 2026-08-26 #37).
+      #
+      # record_verification/2 used to run BEFORE verify_snapshots/1, and the snapshot statuses were
+      # discarded — so a shard whose only snapshot is corrupt recorded last_verify_status = "ok".
+      # This module's moduledoc claims "a failure is queryable"; that held for the live object
+      # only, and a DR audit query returned a clean fleet while snapshots rotted.
+      {:ok, row} = Directory.get(id)
+
+      refute row.last_verify_status == "ok",
+             "the live object is fine but its only snapshot is corrupt, and the shard still " <>
+               "records \"ok\" — a DR audit query would call this fleet healthy"
+
+      assert row.last_verify_status in ["corrupt", "error"]
+    end
+
+    # The other swallow on the same path. `{:error, {:s3_list_status, 403}}` — a bucket-policy
+    # change, an endpoint misconfig, a credential rotation — used to match a bare `_` and return
+    # :ok with no log, no telemetry and no counter, so snapshot verification could be dead
+    # FLEET-WIDE while every run reported every shard fine.
+    test "a failed snapshot LIST is reported, not swallowed as healthy", %{id: id} do
+      seed(id, ["CREATE TABLE kv (v TEXT)", "INSERT INTO kv VALUES ('a')"])
+
+      test_pid = self()
+      handler = "snaplist-#{id}"
+
+      :telemetry.attach(
+        handler,
+        [:fathom, :restore_drill, :snapshot_result],
+        fn _e, _m, meta, _ -> send(test_pid, {:snapshot, meta.status}) end,
+        nil
+      )
+
+      prev_storage = Application.get_env(:fathom, :shard_storage)
+
+      on_exit(fn ->
+        :telemetry.detach(handler)
+        Application.delete_env(:fathom, :storage_list_snapshots_error)
+
+        if is_nil(prev_storage),
+          do: Application.delete_env(:fathom, :shard_storage),
+          else: Application.put_env(:fathom, :shard_storage, prev_storage)
+      end)
+
+      # Make list_snapshots/1 fail the way a bucket-policy change does. FaultyStorage delegates
+      # everything else to Local, so the seeded object above is still the one the drill pulls.
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      Application.put_env(:fathom, :storage_list_snapshots_error, {:s3_list_status, 403})
+
+      assert {:ok, _} = RestoreDrillJob.run_drill(5)
+
+      assert_receive {:snapshot, :list_failed}, 2_000
+
+      {:ok, row} = Directory.get(id)
+
+      refute row.last_verify_status == "ok",
+             "snapshot verification could not run at all, and the shard still records \"ok\""
     end
   end
 
