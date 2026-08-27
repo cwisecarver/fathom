@@ -505,8 +505,23 @@ defmodule Fathom.Migrator.ShardMigration do
               # Marked only once the chain is buildable: an unknown/yanked target
               # must leave the shard's status untouched (#23), and the copy window
               # is what "migrating" pauses anyway.
-              Directory.mark_migrating(shard_id)
-              forward(shard_id, target, current, chain, old, new, lease, etag)
+              # REUSE the row `mark_migrating/1` returns instead of re-reading it (expert review
+              # 2026-08-26 #28). `forward/9` needs the DIRECTORY's `schema_version` to report a
+              # stamp divergence, and it used to fetch the row a THIRD time to get it — after
+              # `run/3` read it and after this write returned it. The update does not touch
+              # `schema_version`, so the returned row carries the same value the extra read would
+              # have, sampled at the same instant and INSIDE the lease.
+              #
+              # `:error` degrades to 0, matching the `current_version/1` this replaces: the value
+              # only drives a warning, so an unreadable directory must not fail a migration that
+              # the lease and the file version already authorize.
+              prev =
+                case Directory.mark_migrating(shard_id) do
+                  {:ok, %{schema_version: v}} -> v
+                  _ -> 0
+                end
+
+              forward(shard_id, target, current, prev, chain, old, new, lease, etag)
             end
         end
       end
@@ -543,7 +558,7 @@ defmodule Fathom.Migrator.ShardMigration do
     end
   end
 
-  defp forward(shard_id, target, current, chain, old, new, lease, expected_etag) do
+  defp forward(shard_id, target, current, prev, chain, old, new, lease, expected_etag) do
     # `current` is the FILE's version (`PRAGMA user_version`, read by `do_run/3`), which is what
     # the bytes we are about to retain actually are. `prev` is the DIRECTORY's stamp, kept only to
     # report a divergence (expert review 2026-08-24 #22).
@@ -560,8 +575,6 @@ defmodule Fathom.Migrator.ShardMigration do
     # the tenant runs a v2 schema with a v1 directory stamp and v2 rows in `django_migrations` —
     # a three-way divergence the operator believes was undone. Silent, because the forward path
     # self-corrects by re-reading the file.
-    prev = current_version(shard_id)
-
     if prev != current do
       Logger.warning(
         "shard #{shard_id}: directory says v#{prev} but the FILE is v#{current}; retaining and " <>

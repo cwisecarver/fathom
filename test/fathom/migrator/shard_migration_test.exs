@@ -251,6 +251,47 @@ defmodule Fathom.Migrator.ShardMigrationTest do
              "it must be one for the whole chain"
   end
 
+  # Expert review 2026-08-26 #28. One forward migration cost ~9 Postgres round trips, three of them
+  # avoidable, ALL INSIDE A TRANSACTION HOLDING A POOL CONNECTION — against the table
+  # `20260726023618` calls "the worst table in the system" for write amplification. At a 1M-shard
+  # rollout that is ~9M round trips.
+  #
+  # This pins the one that was free to remove: `forward/9` needed the DIRECTORY's `schema_version`
+  # to report a stamp divergence and re-read the row a THIRD time to get it, after `run/3` read it
+  # and after `mark_migrating/1` had just written and RETURNED it. The update does not touch
+  # `schema_version`, so the returned row carries the same value — sampled at the same instant and
+  # inside the lease, which is strictly fresher than the separate read it replaces.
+  #
+  # Measured both ways on this exact fixture: 6 queries against `shards` before, 5 after.
+  test "a forward migration does not re-read the directory row a third time", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+
+    counter = :counters.new(1, [])
+    handler = "migration-roundtrips-#{System.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:fathom, :repo, :query],
+        fn _e, _m, meta, _c ->
+          if meta[:source] == "shards", do: :counters.add(counter, 1, 1)
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    assert {:ok, %{from: 1, to: 2}} = ShardMigration.run(shard, 2)
+
+    n = :counters.get(counter, 1)
+
+    assert n <= 5,
+           "one forward migration made #{n} round trips to `shards`; it was 6 before #28 and " <>
+             "must not go back up — every one of these is inside a transaction holding a pool " <>
+             "connection, multiplied by the fleet size on a rollout"
+  end
+
   # The chain's fail-closed half: a missing/yanked INTERMEDIATE makes the chain
   # unbuildable — the migration must error with the shard untouched at its old
   # version, never stamp target having skipped a step (pre-fix it "succeeded",
