@@ -1653,17 +1653,24 @@ defmodule Fathom.Shard do
   # armed only at open when `acquire_gen == nil`, and this handler is reachable only from the
   # broadcast clause above, which requires `acquire_gen != nil`. The two are mode-exclusive — but
   # that argument spans three call sites, and the guard is one clause.
+  # THE IN-FLIGHT-TASK CLAUSE COMES FIRST, and the order is the point. The two clauses below clear
+  # `lapse_revalidate_pending` to `false`; if either matched while it held a `%Task{}`, the task's
+  # reference would be dropped, its reply would no longer match the handler that expects it, and
+  # its `:DOWN` would fall through to the generic clause that reads a monitor as a CONNECTION
+  # release. Not reachable today — the timer is armed only when the field is `false`, so a `%Task{}`
+  # and a pending `:revalidate_lapse` cannot coexist — but the safety of that argument lives three
+  # call sites away, and this ordering is safe on its own.
+  #
+  # Coalesce onto the in-flight check rather than firing a second GET. (`lapse_revalidate_pending`
+  # holds the Task while the check runs; see its definition for why the task has no field of its own.)
+  def handle_info(:revalidate_lapse, %{lapse_revalidate_pending: %Task{}} = state),
+    do: {:noreply, state}
+
   def handle_info(:revalidate_lapse, %{flush_task: t} = state) when t != nil,
     do: {:noreply, %{state | lapse_revalidate_pending: false}}
 
   def handle_info(:revalidate_lapse, %{renew_task: t} = state) when t != nil,
     do: {:noreply, %{state | lapse_revalidate_pending: false}}
-
-  # A check from an earlier lapse is still in flight — coalesce onto it rather than firing a
-  # second GET. (`lapse_revalidate_pending` holds the Task while the check runs; see its
-  # definition for why the task does not get a field of its own.)
-  def handle_info(:revalidate_lapse, %{lapse_revalidate_pending: %Task{}} = state),
-    do: {:noreply, state}
 
   # RUNS OFF-PROCESS (expert review 2026-08-26 #13a). `Fence.check/2` here is not a local decision:
   # in heartbeat mode a lapse routes to `revalidate/2`, which is a real `Storage.check_lease/2`

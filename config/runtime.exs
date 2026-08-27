@@ -182,6 +182,26 @@ if n = env_nonneg_int.("MAX_CHECKOUTS_PER_SHARD") do
   config :fathom, :max_checkouts_per_shard, if(n == 0, do: nil, else: n)
 end
 
+# --- Herd-derived storm brakes (expert review 2026-08-26 #13b and #16) ------------------------
+#
+# Both replace a FIXED window with one derived from the open-shard population, and both are the
+# knob an operator reaches for while watching the exact incident they bound. Wired here for the
+# same reason #15 exists: a brake nobody can reach on a running release is not a brake.
+#
+# The lapse revalidation spread. Target `check_lease` GETs per second across the node when a
+# heartbeat lapse broadcasts to every open coordinator at once. Lower = gentler on the object
+# store during a lapse, at the cost of coordinators revalidating later.
+if n = env_int.("LAPSE_REVALIDATIONS_PER_SEC") do
+  config :fathom, :lapse_revalidations_per_sec, n
+end
+
+# The flush-gate refusal backoff. Target gate PROBES per second when more shards are dirty than
+# the concurrency cap allows through. Lower = fewer wakeups during a node-wide flush backlog, at
+# the cost of a refused shard waiting longer for its slot. Capped at one flush interval regardless.
+if n = env_int.("FLUSH_GATE_PROBE_TARGET_PER_SEC") do
+  config :fathom, :flush_gate_probe_target_per_sec, n
+end
+
 # Scheduled point-in-time snapshots (expert review 2026-08-01 #18). Both jobs are fleet singletons
 # on the Oban crontab and INERT until sized here.
 #
