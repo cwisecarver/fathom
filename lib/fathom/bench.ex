@@ -700,6 +700,33 @@ defmodule Fathom.Bench do
   pending `hrana_rt_us`" — that metric shipped and does not answer it, because of the baton
   reuse. This one does: the baton is cleared before each sample, so `Executor.open/2` and
   `Connection.open/1` are inside the timed window (expert review 2026-08-01 #41.1).
+
+  ## Pooling the SQLite handle was measured and REJECTED (expert review 2026-08-26 #11)
+
+  That review claimed "opening a fresh SQLite handle per stream is ~98% of a fresh-stream
+  request's cost", from a probe reading 459 µs for open→query→close against 9 µs on a reused
+  connection, and predicted that pooling would pull this metric "toward ~130–150 µs".
+
+  Measured with a throwaway per-`{shard_id, scope}` handle cache in `ShardExecutor.do_open/3`
+  (every reset guard skipped, so an upper bound on what a real pool could reach):
+
+      pooled     hrana_open_rt_us  351 / 314 / 295      hrana_rt_us  83 / 90 / 90
+      unpooled   hrana_open_rt_us  373 / 340 / 334      hrana_rt_us  139 / 126 / 130
+
+  Nowhere near 130–150. And `hrana_rt_us` moved in the SAME direction by a similar proportion,
+  which by AGENTS.md's own rule ("when two unrelated metrics move together in one run, it is the
+  machine") means most of even that gap is contention, not the pool.
+
+  What the original probe actually measured was `Connection.open/2` in isolation, and the bulk of
+  it was the `File.mkdir_p!` review #10 has since removed — this metric fell 433 → 339 µs on that
+  one-line change. What remains is dominated by the Filo STREAM open, not the SQLite handle:
+  pooled open (~320 µs) against a baton-reusing round trip (~88 µs in the same run) still leaves
+  ~230 µs that pooling does not touch.
+
+  So the four reset guards a real pool needs — autocommit check, statement purge, dropping the
+  per-connection process-dictionary keys, re-applying `@tenant_pragma_allow` pragmas, plus
+  separate `:ro`/`:rw` pools — buy a few percent. Do not build it without re-running this A/B and
+  getting a different answer.
   """
   @spec hrana_open_rt_us(keyword()) :: float() | nil
   def hrana_open_rt_us(opts \\ []), do: hrana_open_rt(opts)
