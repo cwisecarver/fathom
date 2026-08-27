@@ -210,6 +210,47 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert {:ok, %{schema_version: 3}} = Directory.get(shard)
   end
 
+  # Expert review 2026-08-26 #22. `statement_chain/2` looped `Migrator.statement_step/1` over
+  # every version in the range, and each call was its own `Repo.get_by(Release, ...)` selecting
+  # the WHOLE row — `statements` (the full captured DDL) and `statement_args` (jsonb) included.
+  # Per shard, per rollout: a 1M-shard rollout shipped the same blob 1M times, holding a
+  # `Fathom.Repo` connection from the `:migrations` queue for each read.
+  #
+  # The invariant pinned here is COST, not correctness — the three tests around it already pin
+  # that a missing / yanked / requires_review version fails the chain closed. It is one query for
+  # the whole chain regardless of how many versions the chain spans, so the count must not scale
+  # with the range. Pre-fix this counted 3.
+  test "the whole chain costs ONE shard_migrations query, not one per version", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    {:ok, _} = Migrator.release(3, "v3", ["CREATE TABLE app_tag (id INTEGER PRIMARY KEY)"])
+    {:ok, _} = Migrator.release(4, "v4", ["CREATE TABLE app_note (id INTEGER PRIMARY KEY)"])
+
+    counter = :counters.new(1, [])
+    handler = "chain-query-count-#{System.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:fathom, :repo, :query],
+        fn _event, _measurements, meta, _config ->
+          # `source` is the schema's table; the chain read is the only thing that touches it on
+          # this path. Counting the SOURCE rather than grepping SQL keeps this from breaking on a
+          # formatting change (AGENTS.md: never hand-roll SQL parsing).
+          if meta[:source] == "shard_migrations", do: :counters.add(counter, 1, 1)
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    assert {:ok, %{from: 1, to: 4}} = ShardMigration.run(shard, 4)
+
+    assert :counters.get(counter, 1) == 1,
+           "the 3-version chain issued #{:counters.get(counter, 1)} shard_migrations queries; " <>
+             "it must be one for the whole chain"
+  end
+
   # The chain's fail-closed half: a missing/yanked INTERMEDIATE makes the chain
   # unbuildable — the migration must error with the shard untouched at its old
   # version, never stamp target having skipped a step (pre-fix it "succeeded",

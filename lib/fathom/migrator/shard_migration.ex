@@ -517,14 +517,24 @@ defmodule Fathom.Migrator.ShardMigration do
   end
 
   defp statement_chain(current, target) do
-    Enum.reduce_while((current + 1)..target//1, {:ok, []}, fn v, {:ok, acc} ->
-      # statement_pairs/1, not statements/1: the replay has to BIND Django's parameter values, which
-      # statements/1 (text only) discards. Same nil gates (unreleased / yanked / requires_review).
-      # statement_step/1, not statement_pairs/1: a version's per-shard transform (#26) has to
-      # travel with its DDL so `Copy.migrate_chain/4` can run it in the same transaction.
-      case Migrator.statement_step(v) do
-        nil -> {:halt, {:error, {:unknown_version, v}}}
-        {pairs, transform} -> {:cont, {:ok, [{v, pairs, transform} | acc]}}
+    versions = Enum.to_list((current + 1)..target//1)
+
+    # ONE query for the whole chain, not one per version (expert review 2026-08-26 #22). The loop
+    # below is unchanged in behaviour: `statement_steps/1` OMITS a version that is unreleased,
+    # yanked, or still `requires_review` — exactly the versions `statement_step/1` returned `nil`
+    # for — so the first such version still halts the chain with `{:unknown_version, v}` and the
+    # shard is left untouched. Ascending order matters: the error must name the FIRST unavailable
+    # version, which is what `shard_migration_job.ex` reports.
+    #
+    # statement_pairs, not statements: the replay has to BIND Django's parameter values, which
+    # statement text alone discards. And a version's per-shard transform (#26) travels with its
+    # DDL so `Copy.migrate_chain/4` can run it in the same transaction.
+    steps = Migrator.statement_steps(versions)
+
+    Enum.reduce_while(versions, {:ok, []}, fn v, {:ok, acc} ->
+      case Map.fetch(steps, v) do
+        :error -> {:halt, {:error, {:unknown_version, v}}}
+        {:ok, {pairs, transform}} -> {:cont, {:ok, [{v, pairs, transform} | acc]}}
       end
     end)
     |> case do

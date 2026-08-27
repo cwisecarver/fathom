@@ -177,6 +177,44 @@ defmodule Fathom.Migrator do
   end
 
   @doc """
+  `statement_step/1` for a whole rollout chain in ONE query: `%{version => {pairs, transform}}`.
+
+  Only appliable versions appear. A version that is unreleased, `yanked`, or still
+  `requires_review` is simply ABSENT from the map — the same gate `statement_step/1` expresses as
+  `nil`, so a caller walking the range in order still halts at the first unavailable version and
+  fails closed with `{:unknown_version, v}`.
+
+  Why this exists (expert review 2026-08-26 #22): `ShardMigration.statement_chain/2` looped
+  `Migrator.statement_step/1` over `(current + 1)..target`, and each call was its own
+  `Repo.get_by(Release, ...)` selecting the whole row — `statements` (the migration's full DDL)
+  and `statement_args` (jsonb) included. That is an N+1 over the largest rows in the control
+  plane, paid PER SHARD, per rollout, while holding a `Fathom.Repo` connection from the
+  `:migrations` queue.
+
+  **The gate columns are read here, not cached.** `yanked` and `requires_review` are mutable —
+  they are how an operator stops a bad version mid-rollout — so a straggler must see the CURRENT
+  value, not a remembered one. The audit's optional second tier (a `:persistent_term` cache of
+  the immutable payload) is deliberately NOT built: measured against the only realistic captured
+  corpus in the repo (`test/support/fixtures/django_migrate_capture.json`, 7.6 KB for a whole
+  Django project), the payload is kilobytes, which is the audit's own stated threshold for "(a)
+  is the whole fix".
+  """
+  @spec statement_steps([non_neg_integer()]) :: %{
+          non_neg_integer() => {list(), String.t() | nil}
+        }
+  def statement_steps([]), do: %{}
+
+  def statement_steps(versions) do
+    Release
+    |> where([r], r.version in ^versions)
+    |> where([r], r.yanked == false and r.requires_review == false)
+    |> Repo.all()
+    |> Map.new(fn release ->
+      {release.version, {zip_args(release.statements, release.statement_args), release.transform}}
+    end)
+  end
+
+  @doc """
   Attaches a per-shard `transform` module to `version` and clears its review flag (#26).
 
   This is the **third path** for a captured data migration. Previously an operator could only
