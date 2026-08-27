@@ -506,6 +506,16 @@ defmodule Fathom.Telemetry do
         description:
           "Durability-flush failures (#27) — a persistent rate means flushes aren't landing and the RPO is growing silently (S3 auth / bucket-policy / reachability). The direct flush-failure signal behind the rising oldest-unflushed-age gauge"
       ),
+      # #3: which route a drop-flush took. `:checkpoint` uploads the LIVE database and is only
+      # safe with nothing checked out; `:snapshot` goes through VACUUM INTO, which is quiescent by
+      # construction. A rising `:checkpoint` rate with busy shards would mean the routing guard
+      # regressed. Tagged by route only — a bounded two-value set; shard_id rides metadata.
+      counter("fathom.shard.drop_flush.route.count",
+        event_name: [:fathom, :shard, :drop_flush, :route],
+        tags: [:route],
+        description:
+          "Drop-flush route taken (#3) — :snapshot when connections are still checked out (VACUUM INTO, quiescent), :checkpoint when the shard is idle (uploads the live file in place). The live-file path is unsafe with live writers because the change guard between the Content-MD5 read and the body read compares second-resolution mtime"
+      ),
       counter("fathom.shard.flush.too_large.count",
         event_name: [:fathom, :shard, :flush, :too_large],
         description:

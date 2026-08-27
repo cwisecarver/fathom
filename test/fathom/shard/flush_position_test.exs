@@ -305,15 +305,18 @@ defmodule Fathom.Shard.FlushPositionTest do
       [_, body] = String.split(source, "defp upload_for_drop(state) do", parts: 2)
       [body, _] = String.split(body, "\n  defp ", parts: 2)
 
+      # Expert review 2026-08-26 #3 split the checkpoint out into `checkpoint_then_upload/2`, so
+      # `upload_for_drop/1` now holds the WAL read and the ROUTE. This guards the outer half: the
+      # header is captured before either route can run. Its sibling below guards the inner half.
       pre_at = :binary.match(body, "pre = Fathom.Shard.Replication.Wal.read") |> elem(0)
-      checkpoint_at = :binary.match(body, "checkpoint_and_verify(state.path)") |> elem(0)
+      route_at = :binary.match(body, "if map_size(state.conns) > 0") |> elem(0)
 
-      assert pre_at < checkpoint_at,
-             "upload_for_drop/1 reads the WAL header AFTER checkpoint_and_verify/1. The " <>
-               "checkpoint truncates the WAL and the connection close unlinks it, so the read " <>
-               "finds :empty and the object is stamped {epoch, 0, 0} — the LOWEST position for " <>
-               "its epoch, on the most complete copy of the shard. Any lagging replica then " <>
-               "outranks it and is promoted over it."
+      assert pre_at < route_at,
+             "upload_for_drop/1 reads the WAL header AFTER routing. Either route can destroy it " <>
+               "— the checkpoint route truncates the WAL and the connection close unlinks it — so " <>
+               "a late read finds :empty and the object is stamped {epoch, 0, 0}: the LOWEST " <>
+               "position for its epoch, on the most complete copy of the shard. Any lagging " <>
+               "replica then outranks it and is promoted over it."
     end
 
     # The drop path is where this bug was DETERMINISTIC, and it had no guard at all — the one
@@ -322,22 +325,26 @@ defmodule Fathom.Shard.FlushPositionTest do
     test "captures_the_generation_before_the_checkpoint_on_the_drop_path" do
       source = File.read!("lib/fathom/shard.ex")
 
-      [_, body] = String.split(source, "defp upload_for_drop(state) do", parts: 2)
-      [body, _] = String.split(body, "\n  defp ", parts: 2)
+      # THE ORDERING NOW SPANS TWO FUNCTIONS (expert review 2026-08-26 #3). `upload_for_drop/1`
+      # reads the WAL header and then ROUTES: a shard with connections still checked out goes to
+      # `snapshot_and_upload/1`, and only an idle one reaches `checkpoint_then_upload/2`, which is
+      # where the checkpoint and the stamp now live. The invariant is unchanged — the header must
+      # be captured before any checkpoint, and the position computed after it — so the guard is
+      # re-scoped rather than relaxed, asserted once per function.
+      drop_body = fn name ->
+        [_, body] = String.split(source, "defp #{name}", parts: 2)
+        [body, _] = String.split(body, "\n  defp ", parts: 2)
+        body
+      end
 
-      pre_at = :binary.match(body, "pre = Fathom.Shard.Replication.Wal.read") |> elem(0)
-      checkpoint_at = :binary.match(body, "checkpoint_and_verify(state.path)") |> elem(0)
-      position_at = :binary.match(body, "flush_position(state, pre)") |> elem(0)
+      inner = drop_body.("checkpoint_then_upload(state, pre) do")
 
-      assert pre_at < checkpoint_at,
-             "upload_for_drop/1 reads the WAL header AFTER checkpoint_and_verify/1, which runs " <>
-               "wal_checkpoint(TRUNCATE) and closes the connection (unlinking -wal on the last " <>
-               "one). The header is gone by then, the stamp collapses to {epoch, 0, 0}, and every " <>
-               "lagging replica outranks a complete object."
+      checkpoint_at = :binary.match(inner, "checkpoint_and_verify(state.path)") |> elem(0)
+      position_at = :binary.match(inner, "flush_position(state, pre)") |> elem(0)
 
       assert position_at > checkpoint_at,
-             "upload_for_drop/1 computes the position BEFORE the checkpoint, which under-claims " <>
-               "for the same reason the snapshot path must not."
+             "checkpoint_then_upload/2 computes the position BEFORE the checkpoint, which " <>
+               "under-claims for the same reason the snapshot path must not."
     end
 
     test "an object flushed without a stamp reports none", ctx do

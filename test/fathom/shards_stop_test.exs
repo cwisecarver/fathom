@@ -23,6 +23,13 @@ defmodule Fathom.ShardsStopTest do
   the full artificial flush delay (~2 s) instead of the asserted 1 s; test 2 saw a flush the fix
   removes. Neither passes pre-fix.
 
+  A third test (2026-08-26 #3) pins the drop-flush ROUTING for a busy shard. It asserts the
+  decision — a shard with a connection still checked out flushes through `snapshot_and_upload/1`,
+  not the live-file fast path — and that the final flush succeeds. It does NOT reproduce the race
+  itself: that needs a write to land between `Storage.flush/5`'s two reads of the live file with
+  the same size in the same wall-clock second, which is not deterministically forceable from a
+  test. The fix rests on removing the window rather than on catching it.
+
   Not async: shards, the Registry and the shard supervisor are node-global.
   """
   use ExUnit.Case, async: false
@@ -175,6 +182,85 @@ defmodule Fathom.ShardsStopTest do
     # `DynamicSupervisor.terminate_child/2` (it also returned on the `:DOWN`), so it is neither
     # introduced nor widened by review #9; asserting it synchronously was simply wrong.
     assert :ok = wait_until(fn -> Registry.lookup(Fathom.ShardRegistry, a) == [] end)
+  end
+
+  # Expert review 2026-08-26 #3. The drop-flush had a fast path that uploaded the LIVE database:
+  # Storage.flush/5 reads it once for the Content-MD5 and again to stream the body, and on the
+  # `conns > 0` terminate clause live streams still hold connections (the stream :DOWN cannot fire
+  # until terminate/2 RETURNS). A write landing between the two reads is invisible to the change
+  # guard, whose File.stat mtime is second-resolution — so a same-size, same-second in-place page
+  # rewrite (an inline autocheckpoint) slipped through. S3 catches it with BadDigest, but that is a
+  # FAILED flush, not a saved one, and this is the one flush trap_exit exists to guarantee.
+  #
+  # This pins the ROUTING, which is the decision: with a stream still checked out the drop must go
+  # through snapshot_and_upload/1, whose VACUUM INTO temp is quiescent by construction. Observable
+  # via the snapshot path's own telemetry rather than by racing the window, which is not
+  # deterministically forceable — see the moduledoc note on what this does and does not prove.
+  test "a busy shard's drop-flush takes the snapshot path, not the live-file fast path", %{
+    ids: [a | _]
+  } do
+    pid = open_dirty!(a)
+
+    # Hold a stream open across the stop, which is what makes this the `conns > 0` clause.
+    {:ok, conn} = ShardExecutor.open(a)
+
+    on_exit(fn -> ShardExecutor.close(conn) end)
+
+    assert :sys.get_state(pid).conns |> map_size() > 0,
+           "precondition: a connection must still be checked out or this is the conns == 0 clause"
+
+    test_pid = self()
+    handler = "dropflush-#{a}"
+
+    :telemetry.attach_many(
+      handler,
+      [
+        [:fathom, :shard, :flush, :failed],
+        [:fathom, :shard, :drop_flush, :route]
+      ],
+      fn
+        [:fathom, :shard, :flush, :failed], _m, meta, _ -> send(test_pid, {:flush_failed, meta})
+        [:fathom, :shard, :drop_flush, :route], _m, meta, _ -> send(test_pid, {:route, meta})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok = Shards.stop(a)
+        refute Process.alive?(pid)
+      end)
+
+    # THE DISCRIMINATOR, and it took three attempts to find one. Recorded because the two failed
+    # attempts each taught something about this path:
+    #
+    #   1. "assert the snapshot path ran" — does not discriminate. The audit predicted TRUNCATE
+    #      would usually return busy with a live reader, so the pre-fix code would already fall
+    #      through to the snapshot. It passed against the unfixed tree.
+    #   2. "assert the fallback warning is ABSENT" — also does not discriminate, and this is the
+    #      interesting one: it passed pre-fix too, which means the checkpoint SUCCEEDED with a
+    #      connection still checked out. So the audit's "nearly free in practice" guess is WRONG
+    #      for this shape — pre-fix the drop really did take the live-file fast path, which is the
+    #      hazard itself, not a rare corner of it.
+    #
+    # Both routes are silent on success, so the route is now emitted explicitly. Asserting on it
+    # pins the decision rather than an outcome that luck also produces.
+    assert_receive {:route, %{route: :snapshot, conns: conns}}, 2_000
+    assert conns > 0
+
+    refute log =~ "pre-drop checkpoint incomplete",
+           "the snapshot path was reached by FALLBACK, not by decision"
+
+    # And the flush must not have failed. Pre-fix the fast path could report
+    # {:source_changed_during_upload, _} or an s3_put_status 400 here.
+    refute_receive {:flush_failed, _}, 200
+
+    # And the object is present and readable — the acked writes made it out.
+    remote = Path.join(Fathom.Shard.Storage.Local.dir(), a <> ".db")
+    assert File.exists?(remote), "the busy shard's final flush produced no object"
+    assert :ok = Fathom.Shard.verify_integrity(remote)
   end
 
   test "stop/1 is :ok for a shard that is not open", %{ids: [_, _, c]} do

@@ -2320,6 +2320,53 @@ defmodule Fathom.Shard do
     # and rebalance handoff went out that way, and any lagging replica then outranked it.
     pre = Fathom.Shard.Replication.Wal.read(state.path <> "-wal")
 
+    # THE FAST PATH IS ONLY SAFE WITH NOTHING CHECKED OUT (expert review 2026-08-26 #3).
+    #
+    # The fast path hands `state.path` — the LIVE database — to `Storage.flush/5`, which reads it
+    # once for the Content-MD5 and a SECOND time to stream the body. On the `conns > 0` terminate
+    # clause (rolling deploy / SIGTERM / `Shards.stop`) live streams still hold connections: the
+    # stream `:DOWN` cannot fire until `terminate/2` RETURNS, as `drop_local_unless_serving/1`
+    # records. So a write can land between those two reads.
+    #
+    # The guard between them (`S3.stat_and_md5/1`) compares `size` and `mtime` from `File.stat/1`,
+    # and mtime is SECOND-resolution — so a same-size, same-second in-place page rewrite is
+    # invisible. That is exactly what an inline autocheckpoint does when a still-live stream's
+    # commit crosses `wal_autocheckpoint=4000`.
+    #
+    # S3's BadDigest catches the mismatch, but a BadDigest is a FAILED FLUSH, not a saved one: it
+    # routes to `keep_local_release_lease/3`, which keeps the local copy and releases the lease. On
+    # the stated ephemeral-container-disk deployment "keep the local copy" is not recovery, and this
+    # is the ONE flush `trap_exit` + `:shard_shutdown_ms` exist to guarantee. On `Storage.Local`
+    # it is worse: there is no Content-MD5 equivalent at all (it copies, then hashes the
+    # DESTINATION), so the same race yields a torn object stamped as good.
+    #
+    # `snapshot_and_upload/1`'s `VACUUM INTO` temp is quiescent by construction, so it has no such
+    # window. This costs little in practice: with live streams holding read marks,
+    # `wal_checkpoint(TRUNCATE)` usually returns `busy` and the code already fell through to the
+    # snapshot path — this makes that the DECIDED behaviour rather than a lucky one.
+    if map_size(state.conns) > 0 do
+      emit_drop_route(state, :snapshot)
+      snapshot_and_upload(state)
+    else
+      emit_drop_route(state, :checkpoint)
+      checkpoint_then_upload(state, pre)
+    end
+  end
+
+  # Which route the drop-flush took. Exists so the #3 routing decision is TESTABLE: both routes are
+  # otherwise silent on success, and the fallback's "checkpoint incomplete" warning does not
+  # distinguish them — measured, a TRUNCATE with a connection still checked out SUCCEEDS, so
+  # pre-fix this path really did upload the live file rather than falling through to the snapshot
+  # as the audit assumed. Without a route signal that difference is unobservable from a test.
+  defp emit_drop_route(state, route) do
+    :telemetry.execute(
+      [:fathom, :shard, :drop_flush, :route],
+      %{count: 1},
+      %{shard_id: state.id, route: route, conns: map_size(state.conns)}
+    )
+  end
+
+  defp checkpoint_then_upload(state, pre) do
     # checkpoint_and_verify/1 runs BOTH on one connection (review 2026-07-24 #31) and reports which
     # stage failed, because the two failures need opposite handling: a corrupt local db must refuse
     # the flush, while a merely-busy checkpoint must fall back to the snapshot path.
