@@ -2093,10 +2093,31 @@ defmodule Fathom.Shard.Storage.S3 do
   # own heartbeat, so the PUT is unconditional (no contention to fence).
 
   @impl true
-  def renew_heartbeat(owner, ttl_ms) do
+  def renew_heartbeat(owner, ttl_ms), do: renew_heartbeat(owner, ttl_ms, [])
+
+  @impl true
+  def renew_heartbeat(owner, ttl_ms, opts) do
     hb = %{owner: owner, expires_at_ms: Storage.now_ms() + ttl_ms}
 
-    case Req.put(req(), url: heartbeat_path(owner), body: Storage.encode_heartbeat(hb)) do
+    # BOUNDED PER ATTEMPT (expert review 2026-08-26 #14). `build_req/1` sets `connect_timeout` but
+    # neither `receive_timeout` (Req default 15 000 ms) nor `pool_timeout` (Finch default
+    # 5 000 ms), so one stalled attempt could occupy ~23 s against the heartbeat's 10 s cadence and
+    # 30 s TTL — losing two renewals and putting the whole node at `:not_valid` from nothing worse
+    # than pool contention. The caller owns the number because only it knows its cadence.
+    #
+    # Both halves are needed and they bound different things: `pool_timeout` is how long we wait
+    # for a CONNECTION (the one a warming or failover burst exhausts first, which is the actual
+    # trigger this finding is about), `receive_timeout` how long we wait for the RESPONSE.
+    timeouts =
+      case Keyword.get(opts, :budget_ms) do
+        ms when is_integer(ms) and ms > 0 -> [receive_timeout: ms, pool_timeout: ms]
+        _ -> []
+      end
+
+    case Req.put(
+           req(),
+           [url: heartbeat_path(owner), body: Storage.encode_heartbeat(hb)] ++ timeouts
+         ) do
       {:ok, %{status: status}} when status in 200..299 -> {:ok, hb}
       {:ok, %{status: status}} -> {:error, {:s3_put_status, status}}
       {:error, reason} -> {:error, reason}

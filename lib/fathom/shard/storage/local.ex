@@ -790,6 +790,11 @@ defmodule Fathom.Shard.Storage.Local do
   # --- node heartbeat ---
 
   @impl true
+  # No I/O, so the #14 per-attempt budget is inapplicable — accepted and ignored so the two
+  # backends present one contract.
+  def renew_heartbeat(owner, ttl_ms, _opts), do: renew_heartbeat(owner, ttl_ms)
+
+  @impl true
   def renew_heartbeat(owner, ttl_ms) do
     hb = %{owner: owner, expires_at_ms: Storage.now_ms() + ttl_ms}
 

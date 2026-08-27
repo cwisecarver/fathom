@@ -62,6 +62,13 @@ defmodule Fathom.Shard.Heartbeat do
   alias Fathom.Shard.Storage
 
   @default_ttl_ms 30_000
+
+  # How many renewal attempts one cycle affords, and the pause between them (expert review
+  # 2026-08-26 #14). Three, because each attempt is budgeted at `renew_ms / 3`; the pause exists
+  # so a fast failure (connection refused, which returns in microseconds) cannot spin the
+  # remaining budget.
+  @renew_attempts 3
+  @renew_retry_pause_ms 50
   @topic "fathom:heartbeat"
 
   @doc false
@@ -375,7 +382,7 @@ defmodule Fathom.Shard.Heartbeat do
          else: state
 
     state =
-      case Storage.renew_heartbeat(state.owner, state.ttl_ms) do
+      case renew_within_cycle(state, now) do
         {:ok, %{expires_at_ms: exp}} ->
           :telemetry.execute(
             [:fathom, :shard, :heartbeat, :renewed],
@@ -392,7 +399,51 @@ defmodule Fathom.Shard.Heartbeat do
       end
 
     publish_status(state)
-    schedule_renew(state)
+    schedule_renew(state, now)
+  end
+
+  # RETRY INSIDE THE CYCLE, not across cycles (expert review 2026-08-26 #14).
+  #
+  # `Storage.renew_heartbeat/2` is a PUT, and Req's default `retry: :safe_transient` covers only
+  # GET/HEAD — so a transient 5xx or socket error used to lose a whole renewal cycle with no retry
+  # at all. Two lost cycles put `valid_for_write?/1` at `:not_valid`, which stops every durability
+  # flush on the node, starts the write-fence clock, and at `margin + steal_margin` 503s this
+  # node's writes fleet-wide; past `ttl + steal_margin` peers may steal its whole keyspace slice
+  # while it is healthy and serving. The trigger for all of that is ordinary pool contention.
+  #
+  # Each attempt is budgeted at `renew_ms / 3` (see the `:budget_ms` option), so the cycle affords
+  # about three, and the WHOLE loop is bounded by `renew_ms` — where a single unbudgeted attempt
+  # could previously run ~23 s past it.
+  #
+  # Blocking this GenServer for up to a cycle is deliberate and is not a stall: every reader
+  # (`valid_for_write?/1`, `generation/0`, `margin_ms/0`) goes through the lock-free `status`
+  # ETS table, never through this process.
+  defp renew_within_cycle(state, started) do
+    budget = max(div(state.renew_ms, 3), 1)
+    attempt_renew(state, started + state.renew_ms, budget, @renew_attempts)
+  end
+
+  defp attempt_renew(state, _deadline, budget, 1) do
+    Storage.renew_heartbeat(state.owner, state.ttl_ms, budget_ms: budget)
+  end
+
+  defp attempt_renew(state, deadline, budget, attempts_left) do
+    case Storage.renew_heartbeat(state.owner, state.ttl_ms, budget_ms: budget) do
+      {:ok, _} = ok ->
+        ok
+
+      {:error, _} = error ->
+        # A connection-refused fails in microseconds, so without this the loop would spin the
+        # remaining budget. Only retry if a whole further attempt fits before the cycle ends.
+        remaining = deadline - System.monotonic_time(:millisecond)
+
+        if remaining >= budget + @renew_retry_pause_ms do
+          Process.sleep(@renew_retry_pause_ms)
+          attempt_renew(state, deadline, budget, attempts_left - 1)
+        else
+          error
+        end
+    end
   end
 
   # The persisted-generation key for `owner` (see init/1 — restart continuity).
@@ -495,8 +546,26 @@ defmodule Fathom.Shard.Heartbeat do
     :exit, _ -> :ok
   end
 
-  defp schedule_renew(state) do
+  # FIXED RATE, measured from the start of the cycle (expert review 2026-08-26 #14). This used to
+  # arm the next tick `renew_ms` after the previous attempt RETURNED, so the renewal cadence
+  # degraded in proportion to store latency — precisely backwards for a liveness signal, which
+  # needs to try HARDER as the store gets slower, not less often. A cycle that consumed its whole
+  # budget now re-fires immediately rather than adding another full interval on top.
+  defp schedule_renew(state, started) do
     if state.timer, do: Process.cancel_timer(state.timer)
-    %{state | timer: Process.send_after(self(), :renew, state.renew_ms)}
+    elapsed = System.monotonic_time(:millisecond) - started
+    %{state | timer: Process.send_after(self(), :renew, renew_delay_ms(state.renew_ms, elapsed))}
   end
+
+  # PURE so the cadence rule can be pinned without a timing test (AGENTS.md: a wall-clock
+  # assertion here is the flake shape, and `@doc false` public is how `Shards.report_fork/2` and
+  # `Shard.lapse_spread_ms/1` are tested for the same reason).
+  # `round/1` is not decoration: the result flows straight into `Process.send_after/3`, which
+  # requires a non-negative INTEGER, and `renew_ms` reaches this from an untyped state map — so
+  # dialyzer can only see `number()` here and correctly refused the `non_neg_integer()` spec
+  # without it. Normalizing at the boundary is the honest fix; widening the spec to admit a float
+  # would document a value `send_after` would then reject at runtime.
+  @doc false
+  @spec renew_delay_ms(pos_integer(), integer()) :: non_neg_integer()
+  def renew_delay_ms(renew_ms, elapsed_ms), do: max(round(renew_ms - elapsed_ms), 0)
 end

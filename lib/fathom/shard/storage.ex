@@ -311,6 +311,23 @@ defmodule Fathom.Shard.Storage do
               {:ok, heartbeat()} | :not_found | {:error, term()}
   @callback clear_heartbeat(owner :: String.t()) :: :ok | {:error, term()}
 
+  # Same, with a per-attempt budget (expert review 2026-08-26 #14). `opts[:budget_ms]` bounds ONE
+  # attempt's wire time — for an HTTP backend, its `receive_timeout` and `pool_timeout`.
+  #
+  # Why the heartbeat needs it and other ops do not: `Fathom.Shard.Heartbeat` renews every
+  # `ttl/3`, and the S3 request had `connect_timeout` set but neither `receive_timeout` (Req
+  # default 15 000 ms) nor `pool_timeout` (Finch default 5 000 ms), so ONE stalled attempt could
+  # occupy ~23 s against a 10 s cadence and a 30 s TTL. Two missed renewals put
+  # `valid_for_write?/1` at `:not_valid`, which stops every durability flush on the node and
+  # eventually 503s its writes — reachable from ordinary pool contention, no partition required.
+  #
+  # A backend that does no I/O (Local) ignores it.
+  @callback renew_heartbeat(
+              owner :: String.t(),
+              ttl_ms :: pos_integer(),
+              opts :: keyword()
+            ) :: {:ok, heartbeat()} | {:error, term()}
+
   # Versioned copies for blue/green migration: the live object stays
   # `<shard_id>`, and the migrator keeps prior versions under `<shard_id>@<version>`
   # for the retention window so a revert is a copy-back.
@@ -747,6 +764,15 @@ defmodule Fathom.Shard.Storage do
   """
   @spec renew_heartbeat(String.t(), pos_integer()) :: {:ok, heartbeat()} | {:error, term()}
   def renew_heartbeat(owner, ttl_ms), do: backend().renew_heartbeat(owner, ttl_ms)
+
+  @doc """
+  `renew_heartbeat/2` with a per-attempt budget: `opts[:budget_ms]` bounds one attempt's wire time.
+  See the callback (expert review 2026-08-26 #14).
+  """
+  @spec renew_heartbeat(String.t(), pos_integer(), keyword()) ::
+          {:ok, heartbeat()} | {:error, term()}
+  def renew_heartbeat(owner, ttl_ms, opts),
+    do: backend().renew_heartbeat(owner, ttl_ms, opts)
 
   @doc "Reads `owner`'s heartbeat (the liveness signal `acquire_lease/3` consults to steal)."
   @spec read_heartbeat(String.t()) :: {:ok, heartbeat()} | :not_found | {:error, term()}

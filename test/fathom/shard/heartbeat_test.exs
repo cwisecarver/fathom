@@ -384,4 +384,134 @@ defmodule Fathom.Shard.HeartbeatTest do
     assert {:ok, _} = Storage.read_heartbeat(owner),
            "a crash must leave the heartbeat object for the restarted process to re-renew"
   end
+
+  # Expert review 2026-08-26 #14. Four compounding properties on the renewal path, and the finding
+  # notes WHY they all survived: nothing in this file exercised a slow or failing renew.
+  #
+  #   (a) renew_heartbeat is a PUT, and Req's default `retry: :safe_transient` covers only
+  #       GET/HEAD — so a transient 5xx or socket error lost a whole renewal cycle, unretried.
+  #   (b) the S3 request set connect_timeout but neither receive_timeout (Req default 15 000 ms)
+  #       nor pool_timeout (Finch default 5 000 ms), so one stalled attempt could occupy ~23 s
+  #       against a 10 s cadence and a 30 s TTL.
+  #   (c) schedule_renew armed the next tick renew_ms after the previous attempt RETURNED, so the
+  #       cadence degraded in proportion to store latency — backwards for a liveness signal.
+  #
+  # Two missed renewals put valid_for_write?/1 at :not_valid, which stops EVERY durability flush
+  # on the node, starts the write-fence clock, and at margin + steal_margin 503s the node's writes
+  # fleet-wide; past ttl + steal_margin peers may steal its whole keyspace slice while it is
+  # healthy and serving. The trigger is ordinary pool contention, not a partition.
+  describe "renewal is bounded and retried within its cycle (#14)" do
+    setup do
+      prev_storage = Application.get_env(:fathom, :shard_storage)
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+      on_exit(fn ->
+        Application.delete_env(:fathom, :faulty_renew_heartbeat)
+
+        if prev_storage,
+          do: Application.put_env(:fathom, :shard_storage, prev_storage),
+          else: Application.delete_env(:fathom, :shard_storage)
+      end)
+
+      :ok
+    end
+
+    test "a transient failure is retried inside the SAME cycle, not lost to the next one",
+         %{pid: pid, owner: owner} do
+      test_pid = self()
+      attempts = :counters.new(1, [])
+
+      # Fail the first attempt, pass the second — the (a) shape exactly.
+      Application.put_env(:fathom, :faulty_renew_heartbeat, fn _opts ->
+        n = :counters.get(attempts, 1) + 1
+        :counters.add(attempts, 1, 1)
+        send(test_pid, {:renew_attempt, n})
+        if n == 1, do: {:error, {:transient, :s3_unreachable}}, else: :pass
+      end)
+
+      {:ok, %{expires_at_ms: before_exp}} = Storage.read_heartbeat(owner)
+
+      capture_log(fn ->
+        send(pid, :renew)
+        # Sync on the GenServer having finished the whole cycle.
+        _ = :sys.get_state(pid)
+      end)
+
+      assert_received {:renew_attempt, 1}
+
+      assert_received {:renew_attempt, 2},
+                      "a transient renew failure was not retried inside its cycle; " <>
+                        "pre-fix this lost the whole cycle and two lost cycles lapse the node"
+
+      {:ok, %{expires_at_ms: after_exp}} = Storage.read_heartbeat(owner)
+      assert after_exp >= before_exp, "the retry did not actually renew the stored heartbeat"
+
+      # And the in-cycle recovery means the node never entered a lapse.
+      refute :sys.get_state(pid).lapsed
+    end
+
+    test "each attempt carries a budget well under the renewal cadence", %{pid: pid} do
+      test_pid = self()
+
+      Application.put_env(:fathom, :faulty_renew_heartbeat, fn opts ->
+        send(test_pid, {:renew_opts, opts})
+        :pass
+      end)
+
+      send(pid, :renew)
+      _ = :sys.get_state(pid)
+
+      assert_received {:renew_opts, opts}
+      budget = Keyword.get(opts, :budget_ms)
+
+      renew_ms = :sys.get_state(pid).renew_ms
+
+      assert is_integer(budget) and budget > 0,
+             "the renew PUT carries no per-attempt budget, so Req's 15s receive_timeout and " <>
+               "Finch's 5s pool_timeout apply — ~23s against a #{renew_ms}ms cadence"
+
+      assert budget <= div(renew_ms, 3) + 1,
+             "the per-attempt budget (#{budget}ms) must leave room for more than one attempt " <>
+               "inside the #{renew_ms}ms cycle"
+    end
+
+    test "the whole retry loop stays inside one cycle when every attempt fails",
+         %{pid: pid} do
+      attempts = :counters.new(1, [])
+
+      Application.put_env(:fathom, :faulty_renew_heartbeat, fn _opts ->
+        :counters.add(attempts, 1, 1)
+        {:error, {:transient, :s3_unreachable}}
+      end)
+
+      capture_log(fn ->
+        send(pid, :renew)
+        _ = :sys.get_state(pid)
+      end)
+
+      # Bounded: it must retry, and it must stop. An unbounded loop here would block the
+      # heartbeat process past its own TTL, which is the failure it exists to prevent.
+      n = :counters.get(attempts, 1)
+      assert n > 1, "a failing renew was not retried at all"
+      assert n <= 3, "the retry loop is not bounded by the cycle (#{n} attempts)"
+    end
+  end
+
+  # The (c) half, pinned on the pure function rather than on wall-clock. A timing assertion here
+  # is exactly the flake shape AGENTS.md records; `renew_delay_ms/2` is the whole rule.
+  describe "renewal is scheduled at a FIXED RATE (#14c)" do
+    test "the next tick is measured from the START of the cycle, not from when it returned" do
+      # Pre-fix the delay was always renew_ms regardless of elapsed, so a cycle that took 9 s
+      # against a 10 s cadence produced a 19 s gap — the cadence degrading in proportion to store
+      # latency, which is backwards for a liveness signal.
+      assert Heartbeat.renew_delay_ms(10_000, 0) == 10_000
+      assert Heartbeat.renew_delay_ms(10_000, 4_000) == 6_000
+      assert Heartbeat.renew_delay_ms(10_000, 9_000) == 1_000
+
+      # A cycle that consumed its whole budget re-fires immediately rather than adding another
+      # full interval on top. Never negative — Process.send_after/3 rejects that.
+      assert Heartbeat.renew_delay_ms(10_000, 10_000) == 0
+      assert Heartbeat.renew_delay_ms(10_000, 25_000) == 0
+    end
+  end
 end

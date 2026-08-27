@@ -400,6 +400,24 @@ defmodule Fathom.Test.FaultyStorage do
   @impl true
   def renew_heartbeat(owner, ttl_ms), do: Local.renew_heartbeat(owner, ttl_ms)
   @impl true
+  def renew_heartbeat(owner, ttl_ms, opts) do
+    # `:faulty_renew_heartbeat` is a 1-arity fun handed the OPTS of this attempt. It returns
+    # `:pass` to delegate, or a `{:ok, _} | {:error, _}` to force that result. Added for expert
+    # review 2026-08-26 #14, whose own text notes that nothing in heartbeat_test.exs exercised a
+    # slow or failing renew — which is why four compounding defects lived on this path.
+    case Application.get_env(:fathom, :faulty_renew_heartbeat) do
+      fun when is_function(fun, 1) ->
+        case fun.(opts) do
+          :pass -> Local.renew_heartbeat(owner, ttl_ms, opts)
+          forced -> forced
+        end
+
+      _ ->
+        Local.renew_heartbeat(owner, ttl_ms, opts)
+    end
+  end
+
+  @impl true
   def clear_heartbeat(owner), do: Local.clear_heartbeat(owner)
   @impl true
   def retain(shard_id, version) do
