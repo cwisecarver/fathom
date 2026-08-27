@@ -35,6 +35,12 @@ defmodule Fathom.Admin.MetricsCollector do
   alias Fathom.ShardLoad
 
   @default_tick_ms 1_000
+
+  # How often the O(open-shards) RPO walk may actually run, regardless of tick rate
+  # (expert review 2026-08-26 #27). Matches `Fathom.Admin.Measurements.durability/0`'s poller
+  # cadence, so the dashboard's number is no staler than the Prometheus gauge derived from the
+  # identical reduce.
+  @rpo_interval_ms 10_000
   @default_usage_ms 60_000
   # Budget for one storage-usage poll (an S3 LIST); a slower one is killed so it can't pin the
   # overlap-guard slot (#22). Comfortably under the 60s poll cadence.
@@ -75,6 +81,14 @@ defmodule Fathom.Admin.MetricsCollector do
       prev_latency: %{},
       usage_task: nil,
       usage: nil,
+      # Cached RPO reduce + when it was taken (#27). nil forces a walk on the first tick.
+      rpo: {0, 0},
+      rpo_at: nil,
+      # Count of REAL walks. Exists so the throttle can be asserted without depending on
+      # millisecond clock resolution — several ticks inside one millisecond leave `rpo_at`
+      # numerically unchanged whether or not the walk re-ran, which made a stamp-based test
+      # report the wrong failure.
+      rpo_walks: 0,
       rings: [],
       current: nil
     }
@@ -195,7 +209,7 @@ defmodule Fathom.Admin.MetricsCollector do
     scrape = PrometheusScrape.parse(safe_scrape())
     s = scrape_step(scrape, state.prev_query_buckets, state.prev_counters, window_s)
 
-    {dirty, oldest_rpo} = rpo()
+    {state, {dirty, oldest_rpo}} = rpo_throttled(state)
 
     current = %{
       node_key: state.node_key,
@@ -390,6 +404,41 @@ defmodule Fathom.Admin.MetricsCollector do
 
   defp rate_group(group, prev, tag, window_s) do
     Map.new(group, fn {k, cur} -> {k, rate(cur, Map.get(prev, {tag, k}, cur), window_s)} end)
+  end
+
+  # Run the RPO walk at most every `@rpo_interval_ms`, reusing the last result in between
+  # (expert review 2026-08-26 #27).
+  #
+  # `rpo/0` copies the ENTIRE `FlushWatermark` table — one 4-tuple per open shard — into this
+  # process's heap and then does one `WriteCounter.count/1` lookup per row. It sat inside a tick
+  # that runs EVERY SECOND and is on by default (`Fathom.Admin.enabled?` defaults true, and
+  # `FlushWatermark` is written whenever it is). At 30k open shards that is ~30k tuples copied plus
+  # ~30k ETS lookups per second, in a process running the ERTS-default `fullsweep_after: 65535`, so
+  # its heap grows to the largest snapshot and stays.
+  #
+  # That is the same O(resident-shards) walk review 2026-07-23 #30 moved behind a 10 s poller, and
+  # the same shape review 2026-08-01 #31 rewrote for the HOT-SHARD half of this very tick — whose
+  # comment ("This runs EVERY SECOND, on by default, and is O(resident shards)… a fixed node-level
+  # tax growing on exactly the axis fathom scales on") describes this half exactly. The RPO half was
+  # left doing it 10x more often than #30's fix. The hot-shard half is free today only because
+  # `:shard_load` defaults off so `ShardLoad.snapshot_tuples/0` returns `[]`; `FlushWatermark` is
+  # genuinely populated in production.
+  #
+  # Throttling rather than reading the Prometheus gauge, which was the review's first suggestion:
+  # `[:fathom, :durability, :rpo]` is already emitted every 10 s and already scraped on this tick,
+  # so reading it would cost nothing — but it would make the dashboard depend on the reporter being
+  # up AND would inherit #17, where a `FlushWatermark` owner restart makes that gauge silently
+  # report a fully-flushed fleet. Recomputing on the same cadence keeps this readout independent of
+  # both, for one walk per 10 s instead of ten.
+  defp rpo_throttled(%{rpo_at: at, rpo: cached} = state) do
+    now = mono_ms()
+
+    if is_nil(at) or now - at >= @rpo_interval_ms do
+      fresh = rpo()
+      {%{state | rpo: fresh, rpo_at: now, rpo_walks: state.rpo_walks + 1}, fresh}
+    else
+      {state, cached}
+    end
   end
 
   # Dirty shards + oldest RPO age, derived from the published watermark exactly as

@@ -254,6 +254,59 @@ defmodule Fathom.Admin.MetricsTest do
     assert is_list(snap.history)
   end
 
+  # ── #27: the O(open-shards) RPO walk is throttled, not run every tick ──
+
+  # Expert review 2026-08-26 #27. `rpo/0` copies the whole FlushWatermark table into the collector's
+  # heap and does one WriteCounter lookup per row. It ran on EVERY tick — 1 s, on by default — which
+  # is the same O(resident-shards) tax review 2026-07-23 #30 moved behind a 10 s poller and review
+  # 2026-08-01 #31 removed from the hot-shard half of this same tick. At 30k shards that is ~30k
+  # tuples plus ~30k lookups per second for a dashboard number that changes on a 10 s cadence
+  # anyway.
+  #
+  # Pins the throttle behaviourally via the cache stamp, since the walk itself has no seam to count.
+  test "the RPO walk runs at most once per interval, not once per tick (expert review 2026-08-26 #27)" do
+    prev_tick = Application.get_env(:fathom, :admin_tick_ms)
+    Application.put_env(:fathom, :admin_tick_ms, 10)
+    on_exit(fn -> restore(:admin_tick_ms, prev_tick) end)
+
+    pid = start_supervised!(Fathom.Admin.MetricsCollector)
+
+    # First tick must take a real sample, or there is nothing to throttle.
+    assert eventually(fn -> :sys.get_state(pid).rpo_walks > 0 end),
+           "the collector never took an initial RPO sample"
+
+    first = :sys.get_state(pid).rpo_walks
+
+    # Several more ticks well inside the 10 s window. The stamp must not move: the cached value is
+    # being reused instead of re-walking the table.
+    for _ <- 1..5, do: send(pid, :tick)
+    _ = :sys.get_state(pid)
+
+    assert :sys.get_state(pid).rpo_walks == first,
+           "the RPO walk re-ran within its interval — the throttle is not holding"
+
+    # And it is a throttle, not a freeze: age the stamp past the interval and the next tick
+    # re-samples. Without this the test would pass just as well against a walk that never runs.
+    :sys.replace_state(pid, fn st -> %{st | rpo_at: st.rpo_at - 60_000} end)
+    send(pid, :tick)
+    _ = :sys.get_state(pid)
+
+    assert :sys.get_state(pid).rpo_walks > first,
+           "the RPO walk never re-ran after its interval elapsed — this is a freeze, not a throttle"
+  end
+
+  defp eventually(fun, remaining_ms \\ 2_000)
+  defp eventually(_fun, remaining_ms) when remaining_ms <= 0, do: false
+
+  defp eventually(fun, remaining_ms) do
+    if fun.() do
+      true
+    else
+      Process.sleep(10)
+      eventually(fun, remaining_ms - 10)
+    end
+  end
+
   # ── #11: a blank/failed scrape must not reset the rate baselines (no false-recovery spike) ──
 
   test "a blank scrape holds the diff baselines so recovery doesn't spike (expert review 2026-07-14 #11)" do
