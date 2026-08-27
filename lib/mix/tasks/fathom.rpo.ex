@@ -25,9 +25,13 @@ defmodule Mix.Tasks.Fathom.Rpo do
   VACUUM-INTO+PUT duration (p50/p90/p99/max µs). A tighter interval flushes
   proportionally more often (≈ `window/interval`) at ~constant per-flush cost, so
   5s vs 30s is ~6× the VACUUM/PUT rate for a tighter RPO — the cost that buys the
-  loss-window reduction the default mode measures. Local storage prices the VACUUM
-  + local copy; point `FATHOM_S3_TEST_*` at real S3 for the PUT cost + Finch-pool
-  contention with cold-opens.
+  loss-window reduction the default mode measures.
+
+  Storage backend: Local by default (prices the VACUUM + local copy only). Set
+  `FATHOM_S3_TEST_ENDPOINT` to run against real S3 and price the PUT plus its
+  Finch-pool contention with cold-opens. The chosen backend is printed with the
+  results, and appears as `storage` in the JSON line — before expert review
+  2026-08-26 #38 this text promised S3 while the harness always forced Local.
 
   Prints a human table to stderr and one JSON line to stdout. Optional
   `--append PATH` records the JSON line. Run prod-compiled (`MIX_ENV=prod`) for
@@ -83,6 +87,22 @@ defmodule Mix.Tasks.Fathom.Rpo do
 
         {Fathom.Rpo.measure(measure_opts), &print/1}
       end
+
+    # Report the backend rather than letting the reader assume (expert review 2026-08-26 #38). An
+    # operator who exported FATHOM_S3_TEST_* and silently got a local file copy is the exact
+    # failure that finding was, and a number is only as good as knowing what produced it.
+    kind = Fathom.Rpo.storage_kind()
+
+    IO.puts(
+      :stderr,
+      "storage: #{kind}" <>
+        if(kind == :local,
+          do: "  (VACUUM + local copy only — set FATHOM_S3_TEST_ENDPOINT to price a real PUT)",
+          else: "  (real S3 PUT + Finch-pool contention)"
+        )
+    )
+
+    result = Map.put(result, :storage, kind)
 
     try do
       printer.(result)

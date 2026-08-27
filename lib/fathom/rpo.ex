@@ -75,8 +75,14 @@ defmodule Fathom.Rpo do
   so it's ALWAYS dirty (a flush every interval), and count the flushes (each a VACUUM INTO snapshot +
   full-object PUT) and their per-flush duration. A tighter interval flushes proportionally more often
   (≈ `window/interval`), each paying the snapshot + upload cost — so 5s vs 30s is ~6× the VACUUM/PUT
-  rate for a tighter RPO. Local storage measures the VACUUM + local-copy cost; point
-  `FATHOM_S3_TEST_*` at real S3 to price the PUT (and its Finch-pool contention with cold-opens).
+  rate for a tighter RPO.
+
+  Storage backend: **Local by default**, which measures the VACUUM + local-copy cost only. Setting
+  `FATHOM_S3_TEST_ENDPOINT`, alongside the other `FATHOM_S3_TEST_` variables, switches the run to the
+  real S3 backend so the PUT and its Finch-pool contention with cold-opens are priced. `storage_kind/0`
+  reports which one a run will use — until expert review 2026-08-26 #38 this docstring promised the
+  S3 behaviour while `setup/0` unconditionally forced Local, so an operator who set the variables
+  measured a local file copy and had no way to tell.
 
   Options: `:rate` (writes/sec, default `#{@default_rate}`), `:window_ms`
   (write window per interval, default `#{@default_cost_window_ms}`), `:intervals`
@@ -255,14 +261,81 @@ defmodule Fathom.Rpo do
 
     result =
       case Storage.pull(shard, dst) do
-        {:ok, _etag} -> peek(dst) || {0, t0}
-        # No bytes written (no object / steal sentinel) — nothing to measure (#24).
-        _ -> {0, t0}
+        {:ok, _etag} ->
+          peek(dst) || {0, t0}
+
+        # No bytes written (no object / steal sentinel) — nothing durable yet, which is a real
+        # measurement, not a failure (#24).
+        {:absent, _} ->
+          {0, t0}
+
+        # A TRANSPORT error is NOT "nothing was durable" (expert review 2026-08-26 #38). This used
+        # to fall into the same `_` branch as `:absent` and report flushed_seq 0 — i.e. MAXIMAL
+        # loss — so a flaky store manufactured a catastrophic-looking RPO curve, and the number
+        # that sets `:shard_flush_interval_ms` would have been derived from it. Fail the run loudly
+        # instead: AGENTS.md requires a bench metric to assert its own preconditions rather than
+        # report a spectacular result for work that never happened.
+        {:error, reason} ->
+          raise "rpo: could not pull #{shard} to measure the durable position (#{inspect(reason)}). " <>
+                  "Refusing to report this as flushed_seq 0 — that would read as total loss and " <>
+                  "silently bias the RPO curve."
       end
 
     for s <- ["", "-wal", "-shm"], do: File.rm(dst <> s)
     result
   end
+
+  # HONOUR `FATHOM_S3_TEST_*` (expert review 2026-08-26 #38).
+  #
+  # `setup/0` used to force `Storage.Local` unconditionally, while BOTH docstrings — this module's
+  # and `mix fathom.rpo`'s — told the operator to "point FATHOM_S3_TEST_* at real S3 to price the
+  # PUT (and its Finch-pool contention with cold-opens)". Neither file ever read those variables:
+  # the promise was documentation only, and the forced `put_env` came AFTER whatever the operator
+  # had configured, so it overrode it.
+  #
+  # That matters more than a wrong docstring usually would. This harness produces the per-flush
+  # cost table in `docs/durability.md` that prices `:shard_flush_interval_ms` — the RPO knob, and
+  # per AGENTS.md's loud warning also the biggest throughput dial on a replicating fleet. It was
+  # timing a local `File.cp`, not an S3 PUT, and not the Finch-pool contention that is the whole
+  # reason the interval is contentious.
+  #
+  # Default stays Local, so the harness remains S3-free and offline-runnable unless an endpoint is
+  # explicitly set — the same opt-in rule `Fathom.Bench.s3_opt_in?/0` uses, and the config is read
+  # the same way so the two harnesses cannot drift apart.
+  defp configure_storage(store) do
+    if s3_opt_in?() do
+      {:ok, _} = Application.ensure_all_started(:req)
+      Application.put_env(:fathom, :shard_storage, Fathom.Shard.Storage.S3)
+      Application.put_env(:fathom, Fathom.Shard.Storage.S3, s3_config_from_env())
+
+      {Finch, finch_opts} = Fathom.Shard.Storage.S3.finch_child_spec()
+      ensure_started(Finch, finch_opts)
+    else
+      Application.put_env(:fathom, :shard_storage, Fathom.Shard.Storage.Local)
+      Application.put_env(:fathom, Fathom.Shard.Storage.Local, dir: store)
+    end
+  end
+
+  defp s3_opt_in?, do: System.get_env("FATHOM_S3_TEST_ENDPOINT") != nil
+
+  defp s3_config_from_env do
+    [
+      bucket: System.get_env("FATHOM_S3_TEST_BUCKET", "fathom-shards-test"),
+      region: System.get_env("FATHOM_S3_TEST_REGION", "us-east-1"),
+      endpoint: System.get_env("FATHOM_S3_TEST_ENDPOINT", "http://localhost:9100"),
+      path_style: true,
+      prefix: "rpo/",
+      access_key_id: System.get_env("FATHOM_S3_TEST_ACCESS_KEY", "fathomtest"),
+      secret_access_key: System.get_env("FATHOM_S3_TEST_SECRET_KEY", "fathomtest123")
+    ]
+  end
+
+  @doc """
+  Which storage backend a run will use, for the harness to print. Reported rather than assumed:
+  an operator who exported the S3 variables and silently got Local is exactly the failure #38 was.
+  """
+  @spec storage_kind() :: :s3 | :local
+  def storage_kind, do: if(s3_opt_in?(), do: :s3, else: :local)
 
   defp peek(path) do
     {:ok, conn} = Connection.open(path)
@@ -374,8 +447,7 @@ defmodule Fathom.Rpo do
     {:ok, _} = Application.ensure_all_started(:telemetry)
 
     Application.put_env(:fathom, :shard_data_dir, data)
-    Application.put_env(:fathom, :shard_storage, Fathom.Shard.Storage.Local)
-    Application.put_env(:fathom, Fathom.Shard.Storage.Local, dir: store)
+    configure_storage(store)
     Application.put_env(:fathom, :directory_touch, false)
     Application.put_env(:fathom, :lazy_migrate, false)
     # Hold the connection open the whole run, so a shard never idle-drops mid-
