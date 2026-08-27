@@ -286,4 +286,80 @@ defmodule Fathom.ShardLeaseTest do
 
   defp local_dir, do: Fathom.Shard.data_dir()
   defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
+
+  # Expert review 2026-08-26 #13b. Round-2 #26 replaced an inline O(open-shards) revalidation storm
+  # with a JITTERED one — but over a fixed 2 000 ms window, no matter how many coordinators were
+  # subscribed. The lapse broadcast reaches every open coordinator, so at the shipped
+  # `:max_open_shards` of 10 000 that is up to ~5 000 `check_lease` GETs/second offered to one
+  # connection pool, at the exact instant the node has just proved it could not keep one small
+  # object fresh. The tail was bounded by the POOL, not by the jitter.
+  #
+  # Tested at the pure-function level (`lapse_spread_ms/1` takes the count) rather than through the
+  # registry, so it does not race whatever else the suite has open — AGENTS.md's rule for
+  # concurrency-adjacent decisions.
+  describe "lapse revalidation spread (#13b)" do
+    setup do
+      prev_target = Application.get_env(:fathom, :lapse_revalidations_per_sec)
+      prev_jitter = Application.get_env(:fathom, :lapse_revalidate_jitter_ms)
+      Application.delete_env(:fathom, :lapse_revalidate_jitter_ms)
+
+      on_exit(fn ->
+        if prev_target,
+          do: Application.put_env(:fathom, :lapse_revalidations_per_sec, prev_target),
+          else: Application.delete_env(:fathom, :lapse_revalidations_per_sec)
+
+        if prev_jitter,
+          do: Application.put_env(:fathom, :lapse_revalidate_jitter_ms, prev_jitter),
+          else: Application.delete_env(:fathom, :lapse_revalidate_jitter_ms)
+      end)
+
+      :ok
+    end
+
+    test "scales with the open-shard population instead of being a constant" do
+      Application.put_env(:fathom, :lapse_revalidations_per_sec, 500)
+
+      # 500/s target: the spread is population/500 seconds. Pre-fix every one of these was 2 000.
+      assert Fathom.Shard.lapse_spread_ms(500) == 1_000
+      assert Fathom.Shard.lapse_spread_ms(1_000) == 2_000
+      assert Fathom.Shard.lapse_spread_ms(2_000) == 4_000
+
+      # The chosen default is not arbitrary: at 1 000 open shards it reproduces exactly the
+      # window that used to be hardcoded, so the old value is now what the formula yields at ONE
+      # fleet size rather than at every fleet size.
+      Application.delete_env(:fathom, :lapse_revalidations_per_sec)
+      assert Fathom.Shard.lapse_spread_ms(1_000) == 2_000
+    end
+
+    test "is capped at the heartbeat margin, so the write-fence still arms on time" do
+      # The cap is the audit's own guard and not a round number: the write-fence's arming instant
+      # is measured from the first :not_valid, so a spread longer than the margin would push
+      # revalidation past the moment the breaker is supposed to decide.
+      margin = Fathom.Shard.Heartbeat.margin_ms()
+
+      # A target of 1/s makes the derived spread absurd (100 000 ms for 100 shards) — the cap is
+      # the only thing that can produce the expected value.
+      Application.put_env(:fathom, :lapse_revalidations_per_sec, 1)
+
+      assert Fathom.Shard.lapse_spread_ms(100) == margin
+      assert Fathom.Shard.lapse_spread_ms(1_000_000) == margin
+    end
+
+    test "floors at 1 so :rand.uniform/1 can never be handed a zero" do
+      # Reachable: the broadcast can land as the last coordinator on the node stops, and
+      # `:rand.uniform(0)` raises.
+      Application.put_env(:fathom, :lapse_revalidations_per_sec, 500)
+      assert Fathom.Shard.lapse_spread_ms(0) == 1
+      assert Fathom.Shard.lapse_spread_ms(1) == 2
+    end
+
+    test "an explicit operator override still wins" do
+      # Back-compat: someone who pinned the old knob keeps exactly what they set, at any fleet size.
+      Application.put_env(:fathom, :lapse_revalidate_jitter_ms, 750)
+      Application.put_env(:fathom, :lapse_revalidations_per_sec, 500)
+
+      assert Fathom.Shard.lapse_spread_ms(10) == 750
+      assert Fathom.Shard.lapse_spread_ms(100_000) == 750
+    end
+  end
 end

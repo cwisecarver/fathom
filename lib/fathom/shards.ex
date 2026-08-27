@@ -1168,6 +1168,20 @@ defmodule Fathom.Shards do
 
   defp max_open_shards, do: Application.get_env(:fathom, :max_open_shards, :infinity)
 
+  @doc """
+  How many shard coordinators are open on this node, right now.
+
+  `Registry.count/1` is O(1) (it sums the partitions' `:ets.info(_, :size)`), which is what makes
+  it usable from a per-shard decision. Added for expert review 2026-08-26 #13b: the heartbeat-lapse
+  revalidation jitter has to be derived from the POPULATION being spread, and this module already
+  owns the registry that knows it.
+
+  A soft, instantaneous read — a concurrent open or stop moves it. Every caller so far wants an
+  order of magnitude, not an exact count.
+  """
+  @spec open_count() :: non_neg_integer()
+  def open_count, do: Registry.count(@registry)
+
   defp start(shard_id) do
     case DynamicSupervisor.start_child(@supervisor, {Fathom.Shard, shard_id}) do
       {:ok, pid} -> {:ok, pid}

@@ -88,6 +88,12 @@ defmodule Fathom.Shard do
   # queued behind sibling flushes through the shared Finch pool) at real S3 latency. Generous so a
   # flush-before-fork of a large template doesn't time out; bounded so a hung store can't wedge a caller.
   @flush_now_timeout 60_000
+
+  # Target rate for heartbeat-lapse revalidations, in `check_lease` GETs per second, used to derive
+  # the jitter spread from the open-shard count (expert review 2026-08-26 #13b). 500/s is the value
+  # at which a 1 000-shard fleet gets exactly the 2 000 ms window that used to be hardcoded for
+  # every fleet size. See `derived_lapse_spread_ms/0`.
+  @default_lapse_revalidations_per_sec 500
   # Supervisor shutdown budget for terminate/2's WHOLE exit path: settling any
   # in-flight durability-flush task (settle_yield_ms/0 caps that at a third of this
   # budget — expert review #18) and then the final fence + checkpoint + full-file
@@ -4202,7 +4208,61 @@ defmodule Fathom.Shard do
   end
 
   # Round-2 #26: spread the post-lapse revalidation fan-out across the jitter window.
-  defp lapse_jitter_ms, do: Application.get_env(:fathom, :lapse_revalidate_jitter_ms, 2_000)
+  # The spread a lapse revalidation is jittered over, DERIVED FROM THE POPULATION being spread
+  # (expert review 2026-08-26 #13b).
+  #
+  # Round-2 #26 replaced an inline O(open-shards) storm with a jittered one, but the window was a
+  # fixed 2 000 ms no matter how many coordinators were subscribed. The lapse broadcast reaches
+  # every one of them, so at the shipped `:max_open_shards` of 10 000 that is up to ~5 000
+  # `check_lease` GETs/second offered to one connection pool — fired at the exact instant the node
+  # has just proved it could not keep one small object fresh. The TAIL was bounded by the pool, not
+  # by the jitter, which is another way of saying it was not bounded.
+  #
+  # Spread = population / target rate. `@default_lapse_revalidations_per_sec` is 500 for a reason
+  # worth keeping: at 1 000 open shards it yields exactly the 2 000 ms that used to be hardcoded,
+  # so the old behaviour is the value this formula takes at one specific fleet size instead of at
+  # every fleet size.
+  #
+  # CAPPED AT `Heartbeat.margin_ms()` (10 s at defaults), which is the audit's own guard and not a
+  # round number: the write-fence's arming instant is measured from the first `:not_valid`, so a
+  # spread longer than the margin would push revalidation past the moment the breaker is supposed
+  # to decide, eroding the circuit breaker the spread exists to protect. Above ~5 000 shards the
+  # cap binds and the achieved rate is `open / margin_seconds` — still 5x better than the fixed
+  # window, and the honest ceiling for this mechanism. Beyond that the fix is a node-wide token
+  # bucket, which the audit names and this does not build.
+  #
+  # FLOORED AT 1: `:rand.uniform/1` raises on 0, and an empty registry is reachable (the broadcast
+  # can land as the last coordinator stops).
+  #
+  # An explicit `:lapse_revalidate_jitter_ms` still WINS, so an operator who pinned the old knob
+  # keeps exactly what they set.
+  # PURE IN `open_shards` so it can be tested without racing the registry (AGENTS.md: test a
+  # concurrency-adjacent decision at the pure-function level). `@doc false` public for the same
+  # reason `Shards.report_fork/2` is — the classification is the thing worth pinning, and it is
+  # not observable through the timer it feeds.
+  @doc false
+  @spec lapse_spread_ms(non_neg_integer()) :: pos_integer()
+  def lapse_spread_ms(open_shards) do
+    case Application.get_env(:fathom, :lapse_revalidate_jitter_ms) do
+      ms when is_integer(ms) and ms > 0 ->
+        ms
+
+      _ ->
+        target =
+          Application.get_env(
+            :fathom,
+            :lapse_revalidations_per_sec,
+            @default_lapse_revalidations_per_sec
+          )
+
+        (open_shards * 1000 / target)
+        |> round()
+        |> max(1)
+        |> min(Heartbeat.margin_ms())
+    end
+  end
+
+  defp lapse_jitter_ms, do: lapse_spread_ms(Fathom.Shards.open_count())
 
   defp idle_ms, do: Application.get_env(:fathom, :shard_idle_ms, @default_idle_ms)
   defp lease_ttl_ms, do: Application.get_env(:fathom, :shard_lease_ttl_ms, @default_lease_ttl_ms)
