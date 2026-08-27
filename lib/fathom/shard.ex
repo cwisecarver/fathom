@@ -1801,7 +1801,10 @@ defmodule Fathom.Shard do
     # flush_and_drop reads the write counter (unflushed?/1) to decide whether to upload before
     # dropping, so forget the counter AFTER it — forgetting first would zero the count and make a
     # dirty shard look clean, skipping the flush and losing the writes (findings #1/#27).
-    flush_and_drop(state)
+    #
+    # Tombstone guard shared with the `conns > 0` clause below (review 2026-08-26 #9): this clause
+    # is the COMMON state for a tenant delete, and it used to flush unconditionally.
+    flush_and_drop_unless_tombstoned(state)
     WriteCounter.forget(state.id)
     FlushWatermark.forget(state.id)
     :ok
@@ -1845,7 +1848,7 @@ defmodule Fathom.Shard do
     Fathom.Shards.Lru.forget(state.id)
     # flush_and_drop reads the write counter (unflushed?/1) to decide whether to upload, so forget
     # the counter AFTER it — forgetting first would zero the count and skip a dirty shard's flush.
-    unless Fathom.Tenants.Tombstones.tombstoned?(state.id), do: flush_and_drop(state)
+    flush_and_drop_unless_tombstoned(state)
     # THE FENCE COMES DOWN AFTER THE FLUSH, NOT BEFORE IT (expert review 2026-08-24 #6, found
     # independently by three panels). This `forget` used to sit seven lines up, above
     # `flush_and_drop` — so the fence published at the top of this clause covered only
@@ -1877,6 +1880,26 @@ defmodule Fathom.Shard do
     WriteCounter.forget(state.id)
     FlushWatermark.forget(state.id)
     :ok
+  end
+
+  # Skip the drop-flush for a TOMBSTONED shard, on BOTH terminate paths (expert review 2026-08-26 #9).
+  #
+  # This guard existed only in the `conns > 0` clause. The `conns == 0` clause — which is the
+  # COMMON state for a tenant being deleted, since a shard being erased is usually not mid-request —
+  # called `flush_and_drop/1` unconditionally. So `Tenants.purge/1` paid a full checkpoint +
+  # `VACUUM INTO` + full-object PUT + lease release for bytes that `Storage.purge_shard/1` erases on
+  # the very next line, and (before #9's other half) held the node's shard supervisor for the whole
+  # upload while doing it. The asymmetry was an oversight, not a decision.
+  #
+  # Skipping the whole of `flush_and_drop/1` — not just the upload — is right because
+  # `Tenants.purge/1` finishes the job: `purge_shard/1` deletes every object INCLUDING the `.lock`,
+  # and `rm_local/1` removes the local file. That is exactly why the `conns > 0` clause was already
+  # safe doing this, and the reasoning transfers unchanged.
+  #
+  # A shard that is NOT tombstoned still flushes on both paths, which is what keeps a rolling
+  # deploy's acked writes durable (review 2026-07-19 #2).
+  defp flush_and_drop_unless_tombstoned(state) do
+    unless Fathom.Tenants.Tombstones.tombstoned?(state.id), do: flush_and_drop(state)
   end
 
   # --- connection tracking ---

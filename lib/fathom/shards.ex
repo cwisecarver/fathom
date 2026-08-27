@@ -50,6 +50,12 @@ defmodule Fathom.Shards do
   # a voluntary handoff have different natures and an operator may want to tune them apart.
   @default_crash_hold_ms 5_000
 
+  # Mirrors `Fathom.Shard`'s own `@default_shutdown_ms` and reads the SAME config key, so
+  # `stop_and_await/1` waits exactly as long as the supervisor's child `shutdown` budget would
+  # have (expert review 2026-08-26 #9). Kept in sync by `shards_stop_test.exs`, which asserts the
+  # two agree rather than trusting this comment.
+  @default_shard_shutdown_ms 60_000
+
   @typedoc """
   A held checkout: the coordinator, the ref that identifies THIS checkout, and the local file path.
 
@@ -534,12 +540,62 @@ defmodule Fathom.Shards do
         :ok
 
       [{pid, _}] ->
-        # terminate_child blocks until the child is down (clean terminate, then brutal-kill
-        # at the child shutdown timeout). :not_found = it exited concurrently — also done.
-        case DynamicSupervisor.terminate_child(@supervisor, pid) do
-          :ok -> :ok
-          {:error, :not_found} -> :ok
-        end
+        stop_and_await(pid)
+    end
+  end
+
+  # The stop AND the wait both happen in the CALLING process (expert review 2026-08-26 #9).
+  #
+  # This was `DynamicSupervisor.terminate_child/2`, which is a `handle_call` served INSIDE the
+  # supervisor process: it monitors the child, sends the shutdown exit, and blocks in a `receive`
+  # until the `:DOWN` arrives or the child's `shutdown` budget elapses. `Fathom.ShardSupervisor`
+  # is the single process every cold open goes through (`start/1` → `DynamicSupervisor.start_child`),
+  # so for the entire duration of ONE coordinator's `terminate/2` — settle + checkpoint +
+  # `VACUUM INTO` + full-object PUT + lease release, seconds at real S3 latency and budgeted up to
+  # `:shard_shutdown_ms` (60 s default) — no other shard on the node could be started. Filo streams
+  # sit in `Shard.checkout/1`'s 75 s call rather than erroring, so it surfaced as a latency cliff,
+  # not an error rate. Measured with a standalone probe: a child whose `terminate/2` slept 3 s
+  # blocked an unrelated `start_child` for 2801 ms of the 3002 ms terminate.
+  #
+  # The ordering guarantee `Tenants.purge/1` depends on — "the coordinator has fully stopped before
+  # we delete the objects" — is UNCHANGED, because this still blocks until the `:DOWN`. What
+  # changes is *who* blocks: this caller, instead of the supervisor every other tenant needs.
+  #
+  # Safe because the coordinator is `restart: :temporary` (verified at runtime:
+  # `Fathom.Shard.child_spec/1` returns `%{restart: :temporary, shutdown: 60_000}`), so one that
+  # exits on its own is reaped by the supervisor's async `handle_info` and never restarted. On a
+  # `:permanent` or `:transient` child this change would be wrong.
+  #
+  # Do NOT swap `GenServer.stop` for `Process.exit(pid, :shutdown)`: the coordinator traps exits and
+  # its `handle_info({:EXIT, _, _}, state)` SWALLOWS a non-parent exit signal, so that would
+  # silently do nothing at all. `GenServer.stop` goes through `:proc_lib.stop`, which a trapping
+  # process handles as a system message and runs `terminate/2` for.
+  defp stop_and_await(pid) do
+    ref = Process.monitor(pid)
+    budget = Application.get_env(:fathom, :shard_shutdown_ms, @default_shard_shutdown_ms)
+
+    try do
+      GenServer.stop(pid, :shutdown, budget)
+    catch
+      # It exited concurrently — the old `{:error, :not_found}` branch, also done.
+      :exit, :noproc ->
+        :ok
+
+      # `terminate/2` outran its own shutdown budget. Brutal-kill it at exactly the deadline the
+      # supervisor would have, so the behaviour a caller sees is unchanged.
+      :exit, _ ->
+        Process.exit(pid, :kill)
+    end
+
+    # `GenServer.stop/3` only returns once the process is down, and the kill above is
+    # unconditional, so a `:DOWN` is already in flight on every branch. The `after` is a backstop
+    # against a wedged VM, not an expected path — `stop/1` must never block a caller forever.
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+    after
+      budget ->
+        Process.demonitor(ref, [:flush])
+        :ok
     end
   end
 
