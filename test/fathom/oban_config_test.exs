@@ -8,8 +8,11 @@ defmodule Fathom.ObanConfigTest do
   """
   use Fathom.DataCase, async: false
 
+  alias Fathom.HranaAuth.RevokeJob
   alias Fathom.Migrator.RevertJob
   alias Fathom.Migrator.ShardMigrationJob
+  alias Fathom.Rebalancer.HandoffJob
+  alias Fathom.Tenants.DeleteJob
 
   defp plugins, do: Application.get_env(:fathom, Oban)[:plugins] || []
 
@@ -86,7 +89,14 @@ defmodule Fathom.ObanConfigTest do
   # Backdating `inserted_at` is what makes this discriminate: the unique query keys on that column
   # (`timestamp: :inserted_at`), so an hour-old row is exactly the Lifeline case.
   test "dedup survives the 60s default window — an HOUR-old stranded row still blocks" do
-    for worker <- [ShardMigrationJob, RevertJob] do
+    # ENUMERATE EVERY per-shard worker (expert review 2026-08-26 #36). This loop covered two, and
+    # the two it omitted — DeleteJob and RevokeJob — were exactly the two still carrying Oban's
+    # default 60 s window, for two months. `config/config.exs` asserts the property by name for
+    # "ShardMigrationJob, RevertJob, DeleteJob and HandoffJob", and the Lifeline `rescue_after`
+    # argument at the top of this file is written against it, so a worker missing from this list
+    # is a claim nothing checks. Add new per-shard workers HERE as well as declaring `period:
+    # :infinity`, or the declaration is unverified.
+    for worker <- [ShardMigrationJob, RevertJob, DeleteJob, RevokeJob, HandoffJob] do
       shard = "oban_period_#{System.unique_integer([:positive])}"
       args = unique_args(worker, shard)
 
@@ -114,4 +124,9 @@ defmodule Fathom.ObanConfigTest do
 
   defp unique_args(ShardMigrationJob, shard), do: %{"shard_id" => shard, "target" => 2}
   defp unique_args(RevertJob, shard), do: %{"shard_id" => shard, "to_version" => 1}
+  defp unique_args(DeleteJob, shard), do: %{"shard_id" => shard}
+  defp unique_args(RevokeJob, shard), do: %{"shard_id" => shard}
+
+  defp unique_args(HandoffJob, shard),
+    do: %{"shard_id" => shard, "from_node" => "a", "to_node" => "b"}
 end

@@ -18,6 +18,19 @@ defmodule Fathom.HranaAuth.RevokeJob do
     max_attempts: 5,
     unique: [
       keys: [:shard_id],
+      # `period: :infinity` is LOAD-BEARING, not decoration (expert review 2026-08-24 #23, extended
+      # by 2026-08-26 #36). A KEYWORD LIST in `unique:` merges into Oban's @unique_defaults and so
+      # inherits `period: 60` — only a bare `unique: true` gets `:infinity`. Without this line the
+      # dedup silently expires after SIXTY SECONDS, and `max_attempts: 5` with Oban's default
+      # backoff puts attempt 3 well past that, so a re-issued job during a retry inserts a second
+      # concurrent run. A row stranded in `:executing` by a dead node also stops deduping after a
+      # minute — the wedge case Lifeline's `rescue_after` exists for, and `config/config.exs`
+      # asserts this property of every per-shard worker by name.
+      #
+      # Safe BECAUSE `:completed` is deliberately absent from the states below: an infinite period
+      # blocks re-enqueue only while a job for that shard is genuinely pending, never forever after
+      # one finishes.
+      period: :infinity,
       # Every incomplete state, matching ShardMigrationJob — omitting :suspended leaves a
       # uniqueness hole Oban warns about at compile time.
       states: [:scheduled, :available, :executing, :retryable, :suspended]

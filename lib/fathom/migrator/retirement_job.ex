@@ -3,6 +3,21 @@ defmodule Fathom.Migrator.RetirementJob do
   Drops a shard's retained old version once the retention window has passed.
   Scheduled by `Fathom.Migrator.ShardMigrationJob` for `now + retention` after a
   cutover; an S3 lifecycle rule backstops any it misses.
+
+  ## No `unique:`, deliberately (expert review 2026-08-26 #36)
+
+  Every other per-shard worker — `ShardMigrationJob`, `RevertJob`, `DeleteJob`, `RevokeJob`,
+  `HandoffJob` — declares `unique: [keys: [:shard_id], period: :infinity, states: [...]]`, and
+  `test/fathom/oban_config_test.exs` enumerates them to prove the dedup survives Oban's 60 s
+  default. This job is absent from that list on purpose, so the omission is not mistaken for the
+  same bug those five were fixed for:
+
+    * its work is a `drop_version` — idempotent, and an already-dropped object is a no-op; and
+    * it is enqueued from the cutover transaction's outbox, not from a request path or a sweep,
+      so there is no "two callers race to enqueue" shape for uniqueness to protect against.
+
+  If it ever gains a second enqueue site, it needs the same `unique:` block AND a line in that
+  test's worker list.
   """
   use Oban.Worker, queue: :retirement, max_attempts: 5
 
