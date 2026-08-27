@@ -49,9 +49,9 @@
   # Removable if these metrics stop sharing one helper, or if dialyzer gains per-call-site
   # instantiation.
   {"lib/fathom/bench.ex", :missing_range, 668},
-  {"lib/fathom/bench.ex", :missing_range, 704},
-  {"lib/fathom/bench.ex", :missing_range, 796},
-  {"lib/fathom/bench.ex", :extra_range, 854},
+  {"lib/fathom/bench.ex", :missing_range, 731},
+  {"lib/fathom/bench.ex", :missing_range, 823},
+  {"lib/fathom/bench.ex", :extra_range, 881},
 
   # `Quorum.remaining/1` is `max(0, q - MapSet.size(acked))` and `next_version/0` is an increment
   # over a Postgres aggregate; both are declared as integers and dialyzer allows `float()`, because
