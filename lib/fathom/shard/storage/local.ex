@@ -16,12 +16,17 @@ defmodule Fathom.Shard.Storage.Local do
 
   @impl true
   def pull(shard_id, local_path) do
-    case File.read(remote_path(shard_id)) do
-      {:ok, body} ->
+    # STREAMS rather than reading the object into a binary (expert review 2026-08-26 #26). This is
+    # the mass-warming path, so the old shape held one shard-sized binary per concurrent pull on
+    # the binary heap — the same defect review 2026-07-24 #25 fixed in `pull_if_changed/3` two
+    # functions below, whose comment states the reasoning. Byte-identical etag (`file_etag/1` is
+    # the same SHA-256 over the same bytes) and the identical fsync-before-rename contract.
+    case file_etag(remote_path(shard_id)) do
+      {:ok, etag} ->
         # Atomic (temp + rename) so a concurrent reader never sees a half-copied file (#24).
         # Return the content-hash etag so the coordinator can fence its first flush (#15).
-        case Storage.atomic_write(local_path, body) do
-          :ok -> {:ok, content_etag(body)}
+        case Storage.atomic_copy(remote_path(shard_id), local_path) do
+          :ok -> {:ok, etag}
           err -> err
         end
 
@@ -170,8 +175,12 @@ defmodule Fathom.Shard.Storage.Local do
 
   @impl true
   def object_etag(shard_id) do
-    case File.read(remote_path(shard_id)) do
-      {:ok, body} -> {:ok, content_etag(body)}
+    # The sharpest instance of #26: this read the WHOLE object into a binary purely to hash it,
+    # two functions above a streaming hasher that returns the same value. It sits on the hot
+    # resolution paths (six call sites in shard.ex), so the binary was allocated and discarded on
+    # every ownership re-check.
+    case file_etag(remote_path(shard_id)) do
+      {:ok, etag} -> {:ok, etag}
       {:error, :enoent} -> {:ok, nil}
       {:error, reason} -> {:error, reason}
     end
@@ -227,10 +236,12 @@ defmodule Fathom.Shard.Storage.Local do
     end
   end
 
-  defp content_etag(body), do: Base.encode16(:crypto.hash(:sha256, body), case: :lower)
-
-  # The same digest, computed by STREAMING the file rather than reading it whole into a binary
-  # (expert review 2026-07-24 #25). SHARD_STORAGE=local is a supported production selection and
+  # THE ONLY object hasher in this module, and the digest every fence in it compares.
+  #
+  # It computes SHA-256 by STREAMING the file rather than reading it whole into a binary (expert
+  # review 2026-07-24 #25). It had a whole-file twin, `content_etag/1`, used by five call sites
+  # that #25 did not reach; expert review 2026-08-26 #26 converted those and the twin is gone, so
+  # there is no longer a cheaper-looking wrong choice to reach for. SHARD_STORAGE=local is a supported production selection and
   # local-NVMe is a stated deployment, so a fenced flush used to hold two shard-sized binaries at
   # once (the local body and the remote body) plus two full hash passes — `2 * N * shard_bytes` of
   # transient binary heap at N concurrent flushes. Byte-identical output, so the emulated If-Match
@@ -270,17 +281,22 @@ defmodule Fathom.Shard.Storage.Local do
     # so the read-compare-write is atomic — the same faithful double of S3's conditional PUT the
     # flush fence relies on (expert review #28).
     with_lock_mutex(shard_id, fn ->
-      with {:ok, body} <- File.read(version_path(shard_id, version)) do
+      # Streams both sides (#26): the old shape held the source body AND the live body as
+      # binaries simultaneously, inside the per-shard mutex. `File.stat/1` first so a missing
+      # source still returns {:error, :enoent} BEFORE the etag comparison, exactly as the
+      # `File.read` it replaces did — otherwise a missing source with a stale etag would report
+      # :superseded, which is a different and more alarming answer.
+      with {:ok, _} <- File.stat(version_path(shard_id, version)) do
         current =
-          case File.read(remote_path(shard_id)) do
-            {:ok, remote_body} -> content_etag(remote_body)
+          case file_etag(remote_path(shard_id)) do
+            {:ok, etag} -> etag
             {:error, :enoent} -> nil
             {:error, reason} -> throw({:error, reason})
           end
 
         cond do
           expected_etag != current -> {:error, :superseded}
-          true -> Storage.atomic_write(remote_path(shard_id), body)
+          true -> Storage.atomic_copy(version_path(shard_id, version), remote_path(shard_id))
         end
       end
     end)
@@ -356,17 +372,22 @@ defmodule Fathom.Shard.Storage.Local do
     # if live's content-hash etag no longer matches what the caller captured (a write raced in
     # after the drain), abort with :superseded instead of clobbering it.
     with_lock_mutex(shard_id, fn ->
-      with {:ok, body} <- File.read(snapshot_path(shard_id, snapshot_id)) do
+      # Streams both sides (#26): the old shape held the source body AND the live body as
+      # binaries simultaneously, inside the per-shard mutex. `File.stat/1` first so a missing
+      # source still returns {:error, :enoent} BEFORE the etag comparison, exactly as the
+      # `File.read` it replaces did — otherwise a missing source with a stale etag would report
+      # :superseded, which is a different and more alarming answer.
+      with {:ok, _} <- File.stat(snapshot_path(shard_id, snapshot_id)) do
         current =
-          case File.read(remote_path(shard_id)) do
-            {:ok, remote_body} -> content_etag(remote_body)
+          case file_etag(remote_path(shard_id)) do
+            {:ok, etag} -> etag
             {:error, :enoent} -> nil
             {:error, reason} -> throw({:error, reason})
           end
 
         cond do
           expected_etag != current -> {:error, :superseded}
-          true -> Storage.atomic_write(remote_path(shard_id), body)
+          true -> Storage.atomic_copy(snapshot_path(shard_id, snapshot_id), remote_path(shard_id))
         end
       end
     end)
@@ -376,10 +397,12 @@ defmodule Fathom.Shard.Storage.Local do
 
   @impl true
   def pull_snapshot(shard_id, snapshot_id, local_path) do
-    case File.read(snapshot_path(shard_id, snapshot_id)) do
-      {:ok, body} ->
-        case Storage.atomic_write(local_path, body) do
-          :ok -> {:ok, content_etag(body)}
+    # Streams (#26). The restore drill pulls every snapshot of every sampled shard, so this was up
+    # to ~35 serial full-shard binaries per shard per run.
+    case file_etag(snapshot_path(shard_id, snapshot_id)) do
+      {:ok, etag} ->
+        case Storage.atomic_copy(snapshot_path(shard_id, snapshot_id), local_path) do
+          :ok -> {:ok, etag}
           err -> err
         end
 
