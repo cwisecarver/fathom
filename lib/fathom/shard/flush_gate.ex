@@ -27,6 +27,15 @@ defmodule Fathom.Shard.FlushGate do
   @table __MODULE__
   @counter :in_flight
 
+  # Monotonic count of `:full` answers (expert review 2026-08-26 #16). The refusal rate was
+  # invisible to EVERY existing metric: `[:fathom, :shard, :flush, :failed]` "only fires for a
+  # flush that actually RAN" (see `sweep/0` below), and the `[:fathom, :shard, :flush_gate]` gauge
+  # reports `in_flight`/`cap`, which say the gate is busy but not that anyone was turned away or
+  # how often. One extra `update_counter` on a path that already does two, read by the periodic
+  # gauge rather than emitted per refusal — at the density this finding is about, one telemetry
+  # event per refusal would itself be the problem.
+  @refusals :refusals
+
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
@@ -96,6 +105,7 @@ defmodule Fathom.Shard.FlushGate do
         else
           # Roll back our own increment (clamped at 0) — we didn't get a slot.
           :ets.update_counter(@table, @counter, {2, -1, 0, 0}, {@counter, 0})
+          :ets.update_counter(@table, @refusals, {2, 1}, {@refusals, 0})
           :full
         end
 
@@ -106,6 +116,52 @@ defmodule Fathom.Shard.FlushGate do
     # The table only exists once this GenServer has started; a flush during boot (or a test that
     # didn't start it) must fail OPEN (unbounded) rather than crash the flush path.
     ArgumentError -> :disabled
+  end
+
+  @doc """
+  Monotonic count of `:full` answers since this node booted (expert review 2026-08-26 #16).
+
+  Read by the periodic gauge, not emitted per refusal — at the density the gate exists for
+  (a failover re-homing a burst of shards) the refusal rate is the thing being measured, so
+  emitting an event per refusal would be the same mistake in a different colour.
+  """
+  @spec refusals() :: non_neg_integer()
+  def refusals do
+    case :ets.lookup(@table, @refusals) do
+      [{@refusals, n}] -> n
+      [] -> 0
+    end
+  rescue
+    ArgumentError -> 0
+  end
+
+  @doc """
+  How long a refused shard should wait before probing again — derived from the POPULATION that
+  could be probing, not a fixed 250 ms (expert review 2026-08-26 #16).
+
+  The fixed backoff turned a node-wide flush backlog into a node-wide busy-poll at exactly the
+  moment the node was I/O-saturated absorbing a failover. D dirty shards against cap C is a
+  service rate of C but a PROBE rate of `D / 0.25 s`: at 30 000 shards that is ~120 000 gate probes
+  per second, each two `:ets.update_counter` ops on ONE key, plus 120 000 timer insertions and
+  120 000 process wakeups. And it is reachable without a failover — `WriteCounter.init/1` marks
+  every open coordinator dirty at once on an ETS-owner restart, which is a documented, expected
+  event.
+
+  Same shape as `Fathom.Shard.lapse_spread_ms/1` and for the same reason: the spread has to come
+  from the size of the herd. `open_shards / target` seconds, floored at the fixed backoff (so
+  small fleets are completely unchanged) and capped at one flush interval — which is the audit's
+  own "demote the timer to a safety net at a much longer period". At 30 000 shards the cap binds
+  and the achieved probe rate is `30 000 / 5 s` = 6 000/s, a 20x reduction.
+
+  PURE in its inputs so it is testable without racing the registry.
+  """
+  @spec backoff_ms(non_neg_integer(), pos_integer(), pos_integer(), pos_integer()) ::
+          pos_integer()
+  def backoff_ms(open_shards, target_probes_per_sec, base_ms, flush_interval_ms) do
+    (open_shards * 1000 / target_probes_per_sec)
+    |> round()
+    |> max(base_ms)
+    |> min(max(flush_interval_ms, base_ms))
   end
 
   @doc "Release a slot reserved by `try_acquire/0`. Clamped at 0 so a stray release can't underflow."

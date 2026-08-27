@@ -344,6 +344,12 @@ defmodule Fathom.Telemetry do
         measurement: :cap,
         description: "Node-wide concurrent-flush cap; in_flight pinned here means nothing flushes"
       ),
+      last_value("fathom.shard.flush_gate.refusals",
+        event_name: [:fathom, :shard, :flush_gate],
+        measurement: :refusals,
+        description:
+          "Monotonic count of shards turned away by the flush gate (#16). in_flight at cap says the gate is BUSY; this says shards were REFUSED and how often. A rising rate against a flat in_flight is the node-wide flush backlog — every refused shard stays dirty and re-probes, so this is also the RPO-at-risk signal that fathom.shard.flush.failed cannot give (that one only fires for a flush that actually ran)"
+      ),
       # A follower refused to seed a shard because its replica volume is below the free-space
       # floor (expert review 2026-08-20 #23). Not an error: that shard's RPO stays at its stored
       # object, which is the pre-A2 behaviour. But a RISING rate means the replica store — which

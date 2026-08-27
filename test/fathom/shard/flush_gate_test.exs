@@ -158,4 +158,71 @@ defmodule Fathom.Shard.FlushGateTest do
       Process.exit(live, :kill)
     end
   end
+
+  # Expert review 2026-08-26 #16. Over the cap, `try_acquire/0` answered `:full` and the coordinator
+  # armed a jittered 250 ms timer — a FIXED one, with no waiting list and no admission ordering. D
+  # dirty shards against cap C gives a service rate of C but a PROBE rate of `D / 0.25 s`: at
+  # 30 000 shards, ~120 000 gate probes per second, each two `:ets.update_counter` ops on ONE key,
+  # plus 120 000 timer insertions and 120 000 process wakeups. A node-wide flush backlog became a
+  # node-wide busy-poll at exactly the moment the node was I/O-saturated absorbing a failover.
+  #
+  # It is reachable without a failover: `WriteCounter.init/1` marks every open coordinator dirty at
+  # once on an ETS-owner restart, a documented and expected event.
+  describe "the refusal backoff scales with the herd (#16)" do
+    test "small fleets keep the fixed backoff exactly" do
+      # 100 shards at a 2 000/s target derives 50 ms, so the floor is what applies — a small
+      # deployment sees no behaviour change at all.
+      assert FlushGate.backoff_ms(100, 2_000, 250, 5_000) == 250
+      assert FlushGate.backoff_ms(0, 2_000, 250, 5_000) == 250
+    end
+
+    test "the backoff stretches once the herd is big enough for the poll to be the cost" do
+      # Between the floor and the cap it is population/target seconds, which is what bounds the
+      # node-wide probe rate rather than the per-shard period.
+      assert FlushGate.backoff_ms(2_000, 2_000, 250, 5_000) == 1_000
+      assert FlushGate.backoff_ms(4_000, 2_000, 250, 5_000) == 2_000
+
+      # Pre-fix every one of these was 250.
+      refute FlushGate.backoff_ms(4_000, 2_000, 250, 5_000) == 250
+    end
+
+    test "it is capped at one flush interval — the safety-net period, not a poll" do
+      # At 30 000 shards the derived value is 15 s; the cap holds it at the flush interval, so the
+      # achieved probe rate is 30 000 / 5 s = 6 000/s against the old 120 000/s.
+      assert FlushGate.backoff_ms(30_000, 2_000, 250, 5_000) == 5_000
+      assert FlushGate.backoff_ms(1_000_000, 2_000, 250, 5_000) == 5_000
+    end
+
+    test "a flush interval below the base backoff cannot invert the two" do
+      # An operator can set :shard_flush_interval_ms under the 250 ms backoff. Without the inner
+      # max/2 the cap would then be BELOW the floor and min/2 would win, producing a backoff
+      # shorter than the fixed one — i.e. a tighter poll than before the fix, under exactly the
+      # config that makes flushes most frequent.
+      assert FlushGate.backoff_ms(30_000, 2_000, 250, 100) == 250
+    end
+
+    test "refusals are counted, so the busy-poll condition is visible at all" do
+      # Nothing could see this before: [:fathom, :shard, :flush, :failed] only fires for a flush
+      # that actually RAN, and the flush_gate gauge reported in_flight/cap — the gate being busy,
+      # not anyone being turned away.
+      prev = Application.get_env(:fathom, :shard_flush_max_concurrency)
+      Application.put_env(:fathom, :shard_flush_max_concurrency, 1)
+      on_exit(fn -> restore_concurrency(prev) end)
+
+      before = FlushGate.refusals()
+
+      assert :ok = FlushGate.try_acquire()
+      assert :full = FlushGate.try_acquire()
+      assert :full = FlushGate.try_acquire()
+      FlushGate.release()
+
+      assert FlushGate.refusals() == before + 2,
+             "gate refusals are not counted, so a node-wide flush backlog stays invisible"
+    end
+  end
+
+  defp restore_concurrency(nil), do: Application.delete_env(:fathom, :shard_flush_max_concurrency)
+
+  defp restore_concurrency(v),
+    do: Application.put_env(:fathom, :shard_flush_max_concurrency, v)
 end

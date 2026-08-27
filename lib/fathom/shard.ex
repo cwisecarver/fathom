@@ -83,6 +83,12 @@ defmodule Fathom.Shard do
   # Short retry after the node-wide flush cap (Fathom.Shard.FlushGate) refused a slot (#17); the
   # shard stayed dirty, so it just re-attempts soon rather than waiting a full interval.
   @default_flush_backoff_ms 250
+
+  # Target node-wide flush-gate PROBE rate, used to scale the refusal backoff to the open-shard
+  # count (expert review 2026-08-26 #16). 2 000/s leaves small fleets on the fixed 250 ms floor
+  # (100 shards derives 50 ms, which the floor overrides) and only starts stretching the backoff
+  # once the herd is big enough for the poll itself to be the cost.
+  @default_gate_probe_target_per_sec 2_000
   @pull_timeout 60_000
   # Synchronous force-flush (`:flush_now`) budget: a checkpoint + fenced full-file PUT (possibly
   # queued behind sibling flushes through the shared Finch pool) at real S3 latency. Generous so a
@@ -3593,14 +3599,25 @@ defmodule Fathom.Shard do
   # told plainly. `{:error, :flush_gate_full}` rather than `:flush_timeout` because the two ask for
   # different responses: this one says the node is saturated and the call is worth retrying, where
   # a timeout says nothing at all.
-  defp gate_full(%{flush_waiters: []} = state), do: schedule_flush_backoff(state)
+  #
+  # BOTH BRANCHES NOW USE THE POPULATION-DERIVED GATE BACKOFF (expert review 2026-08-26 #16), not
+  # the fixed 250 ms. See `schedule_gate_backoff/1`.
+  #
+  # The finding also asked to increment `flush_rekicks` on the no-waiter branch "so it is bounded".
+  # NOT DONE, and deliberately: the unboundedness that mattered is the RATE, which the derived
+  # backoff caps at one flush interval. Giving up entirely on a no-waiter shard would be wrong —
+  # it is still dirty and must eventually flush, and there is nobody to tell. Incrementing there
+  # would also silently spend the WAITER budget: a shard that had been bouncing off the gate would
+  # answer the next `flush_now` caller `{:error, :flush_gate_full}` immediately, with none of the
+  # patience that branch exists to give. Implement the finding, not the prescription.
+  defp gate_full(%{flush_waiters: []} = state), do: schedule_gate_backoff(state)
 
   defp gate_full(state) do
     if state.flush_rekicks < @max_flush_rekicks do
-      schedule_flush_backoff(%{state | flush_rekicks: state.flush_rekicks + 1})
+      schedule_gate_backoff(%{state | flush_rekicks: state.flush_rekicks + 1})
     else
       for w <- state.flush_waiters, do: GenServer.reply(w, {:error, :flush_gate_full})
-      schedule_flush_backoff(%{state | flush_waiters: [], flush_rekicks: 0})
+      schedule_gate_backoff(%{state | flush_waiters: [], flush_rekicks: 0})
     end
   end
 
@@ -4317,6 +4334,39 @@ defmodule Fathom.Shard do
 
   defp flush_backoff_ms,
     do: Application.get_env(:fathom, :shard_flush_backoff_ms, @default_flush_backoff_ms)
+
+  # The gate-refusal backoff, scaled to the herd (expert review 2026-08-26 #16). DISTINCT from
+  # `schedule_flush_backoff/1`, which serves the still-dirty-after-a-successful-flush case: that
+  # one means "there is more work and nobody is stopping me", and slowing it would delay a flush
+  # that can actually run. This one means "the node is saturated and I was turned away", where the
+  # probe itself is the cost. Only the second is scaled.
+  defp schedule_gate_backoff(state) do
+    state = cancel_flush(state)
+
+    delay =
+      jitter_interval(
+        FlushGate.backoff_ms(
+          Fathom.Shards.open_count(),
+          gate_probe_target_per_sec(),
+          flush_backoff_ms(),
+          flush_interval_ms()
+        )
+      )
+
+    %{
+      state
+      | flush_timer: Process.send_after(self(), :durability_flush, delay),
+        flush_timer_slow?: false
+    }
+  end
+
+  defp gate_probe_target_per_sec,
+    do:
+      Application.get_env(
+        :fathom,
+        :flush_gate_probe_target_per_sec,
+        @default_gate_probe_target_per_sec
+      )
 
   # Stamp the idle instant and arm ONE timer only when none is pending (review
   # 2026-07-23 #17) — the :idle_timeout handler re-arms for the remainder when the

@@ -73,7 +73,14 @@ defmodule Fathom.Admin.Measurements do
       cap when is_integer(cap) ->
         :telemetry.execute(
           [:fathom, :shard, :flush_gate],
-          %{in_flight: Fathom.Shard.FlushGate.in_flight(), cap: cap},
+          %{
+            in_flight: Fathom.Shard.FlushGate.in_flight(),
+            cap: cap,
+            # Monotonic refusal count (expert review 2026-08-26 #16). `in_flight` at cap says the
+            # gate is BUSY; it does not say anyone was turned away, or how often. A rising refusal
+            # rate with a flat `in_flight` is the busy-poll condition, and nothing could see it.
+            refusals: Fathom.Shard.FlushGate.refusals()
+          },
           %{}
         )
 
