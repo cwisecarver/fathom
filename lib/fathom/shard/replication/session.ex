@@ -170,6 +170,17 @@ defmodule Fathom.Shard.Replication.Session do
        # reading the shard's files — so the handler needs the path without a caller to supply it.
        # `nil` until the first commit, which is also the first moment a reply can exist.
        wal_path: nil,
+       # A held, inode-revalidated read fd for `wal_path` (expert review 2026-08-26 #32). One
+       # commit used to do THREE `open`/`close` pairs on this file — `Wal.read/1` in `ship/5`,
+       # `Wal.read_delta/3` per range, and `Wal.read/1` again for the stability re-check — all on
+       # dirty-IO schedulers on the tenant's synchronous write path. Measured at 123 µs/commit
+       # against 19 µs for a held fd, i.e. ~104 µs of the 288 µs `replication_cost_test` attributes
+       # to replication.
+       #
+       # `nil` when nothing is held, which is the starting state and the state after any read
+       # error. `Fathom.Shard.Replication.Wal` revalidates it by INODE on every use, so an
+       # unlink+recreate reopens rather than silently serving the old generation.
+       wal_fd: nil,
        # PER-FOLLOWER position: %{shipper => %{wal_gen, salt1, offset}}.
        #
        # A single shared offset was the original shape and it made catch-up impossible: followers
@@ -433,12 +444,20 @@ defmodule Fathom.Shard.Replication.Session do
   # `spawn_monitor` deliberately does not link (a raise inside `do_seed/5` must not take down the
   # shard's serialization point), so the cancellation is explicit here instead.
   @impl true
-  def terminate(_reason, %{seeding: seeding}) do
+  def terminate(_reason, %{seeding: seeding} = state) do
     for {_shipper, %{pid: pid}} <- seeding, do: Process.exit(pid, :kill)
+
+    # Release the held WAL read fd (expert review 2026-08-26 #32). The VM would reclaim it when the
+    # process dies, but closing explicitly keeps the fd's lifetime tied to the session's rather
+    # than to GC — at a million shards an fd per open session is not a rounding error.
+    _ = Wal.close_held(Map.get(state, :wal_fd))
     :ok
   end
 
-  def terminate(_reason, _state), do: :ok
+  def terminate(_reason, state) do
+    _ = Wal.close_held(Map.get(state, :wal_fd))
+    :ok
+  end
 
   # A reply cannot exist before the commit that provoked it, so `wal_path` is always set by the time
   # this runs. Matching on it anyway keeps a reply that somehow arrived first from crashing the
@@ -497,8 +516,10 @@ defmodule Fathom.Shard.Replication.Session do
   defp ship(state, wal_path, epoch, deadline), do: ship(state, wal_path, epoch, deadline, %{})
 
   defp ship(state, wal_path, epoch, deadline, seen) do
-    case Wal.read(wal_path) do
-      {:ok, header} ->
+    case Wal.read_held(state.wal_fd, wal_path) do
+      {:ok, header, fd} ->
+        state = %{state | wal_fd: fd}
+
         case ship_planned(state, wal_path, epoch, header) do
           # Nothing left to plan. On the first round that means the commit wrote no frames; on a
           # later one it means the catch-up converged.
@@ -557,8 +578,8 @@ defmodule Fathom.Shard.Replication.Session do
             {:error, reason}
         end
 
-      {:error, reason} ->
-        read_failed(state, reason)
+      {:error, reason, fd} ->
+        read_failed(%{state | wal_fd: fd}, reason)
     end
   end
 
@@ -594,8 +615,8 @@ defmodule Fathom.Shard.Replication.Session do
       :nothing
     else
       case build_pushes(state, wal_path, epoch, header, plans) do
-        {:ok, pushes} -> tag(deliver(state, header, plans, pushes, current), plans, header)
-        {:error, reason} -> read_failed(state, reason)
+        {:ok, pushes, state} -> tag(deliver(state, header, plans, pushes, current), plans, header)
+        {:error, reason, state} -> read_failed(state, reason)
       end
     end
   end
@@ -617,11 +638,13 @@ defmodule Fathom.Shard.Replication.Session do
     # One read per DISTINCT range, not per follower.
     ranges = plans |> Enum.map(fn {_s, {_k, off, len}} -> {off, len} end) |> Enum.uniq()
 
-    payloads =
-      Enum.reduce_while(ranges, {:ok, %{}}, fn {off, len}, {:ok, acc} ->
-        case Wal.read_delta(wal_path, off, len) do
-          {:ok, bin} -> {:cont, {:ok, Map.put(acc, {off, len}, bin)}}
-          {:error, r} -> {:halt, {:error, r}}
+    # The held fd is threaded through the fold rather than kept in state, because these reads are
+    # a tight loop and the caller reassembles state once at the end (expert review 2026-08-26 #32).
+    {payloads, fd} =
+      Enum.reduce_while(ranges, {{:ok, %{}}, state.wal_fd}, fn {off, len}, {{:ok, acc}, fd} ->
+        case Wal.read_delta_held(fd, wal_path, off, len) do
+          {:ok, bin, fd} -> {:cont, {{:ok, Map.put(acc, {off, len}, bin)}, fd}}
+          {:error, r, fd} -> {:halt, {{:error, r}, fd}}
         end
       end)
 
@@ -648,8 +671,20 @@ defmodule Fathom.Shard.Replication.Session do
     # `stable?/2` is the same check the SEED path already runs one function away, for the same
     # reason. Failing here re-plans on the next round, which is correct and cheap; shipping
     # mis-stamped bytes is neither.
+    # The re-check reads through the SAME held fd, so it is one stat + one pread rather than a
+    # third open/close pair — and the inode revalidation inside `read_held/2` makes it a STRICTLY
+    # STRONGER recreate detector than before, when an unlink+recreate between the two reads was
+    # caught only if the salt happened to differ.
+    {recheck, fd} =
+      case Wal.read_held(fd, wal_path) do
+        {:ok, after_, fd} -> {{:ok, after_}, fd}
+        {:error, reason, fd} -> {{:error, reason}, fd}
+      end
+
+    state = %{state | wal_fd: fd}
+
     with {:ok, by_range} <- payloads,
-         {:ok, after_} <- Wal.read(wal_path),
+         {:ok, after_} <- recheck,
          :ok <- stable?(header, after_, :checkpoint_during_push) do
       {:ok,
        for {shipper, {kind, off, len}} <- plans do
@@ -671,7 +706,9 @@ defmodule Fathom.Shard.Replication.Session do
             prev_extent: if(kind == :reset, do: outgoing_extent(state, shipper), else: 0),
             payload: Map.fetch!(by_range, {off, len})
           }}
-       end}
+       end, state}
+    else
+      {:error, reason} -> {:error, reason, state}
     end
   end
 

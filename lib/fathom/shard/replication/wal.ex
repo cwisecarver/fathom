@@ -178,4 +178,133 @@ defmodule Fathom.Shard.Replication.Wal do
   @doc "Size of the WAL header, which is where generation N's frames begin."
   @spec header_bytes() :: pos_integer()
   def header_bytes, do: @header_bytes
+
+  # --- held-fd reads (expert review 2026-08-26 #32) --------------------------------------------
+  #
+  # `read/1` and `read_delta/3` above each do their own `open`+`pread`+`close`. One
+  # `Session.commit/3` calls them three times, so a replicated commit paid THREE open/close pairs
+  # and TWO stats, all on dirty-IO schedulers, on the tenant's synchronous write path.
+  #
+  # MEASURED before building, because the finding is explicit that it is a hypothesis: 2 000 reps
+  # of the real shapes on a 64 KiB file — today 123.31 µs/commit, a held fd 19.62 µs/commit, a
+  # **103.7 µs** saving against the 288 µs `replication_cost_test` attributes to replication. The
+  # finding's own threshold for reverting was "under ~10 µs".
+  #
+  # THE INODE CHECK IS NOT AN OPTIMIZATION DETAIL, IT IS THE SAFETY PROPERTY. A cached fd survives
+  # an unlink+recreate: SQLite deletes and recreates `-wal`, and reads on the old fd would keep
+  # returning the OLD generation's bytes. `stable?/2` would then compare old-against-old and pass,
+  # which is exactly the cross-generation splice this module exists to prevent. Every read
+  # revalidates by inode first and reopens on a mismatch.
+  #
+  # It is also STRICTLY STRONGER than what exists today: nothing currently detects an
+  # unlink+recreate between `ship/5`'s `read/1` and the re-check `read/1`, except the salt
+  # happening to differ — which is not guaranteed.
+
+  @typedoc """
+  A revalidated read handle: the path, the open fd, and the inode it was opened on. `nil` means
+  "no fd held", which is the starting state and the state after any error.
+  """
+  @type handle :: %{path: Path.t(), fd: :file.fd(), inode: non_neg_integer()} | nil
+
+  @doc """
+  Header + size, read through `handle`, reopening if the file was recreated.
+
+  Returns `{:ok, header, handle}` / `{:ok, :empty, handle}` / `{:error, reason, handle}`. The
+  handle comes back in every case so the caller always has somewhere to put it — including on
+  error, where it comes back `nil` and closed, so the next commit starts clean.
+  """
+  @spec read_held(handle(), Path.t()) ::
+          {:ok, header(), handle()} | {:ok, :empty, handle()} | {:error, term(), handle()}
+  def read_held(handle, path) do
+    case File.stat(path) do
+      {:ok, %{size: size, inode: inode}} when size >= @header_bytes ->
+        case ensure_fd(handle, path, inode) do
+          {:ok, h} -> header_from(h, size)
+          {:error, reason} -> {:error, reason, close_held(handle)}
+        end
+
+      {:ok, _} ->
+        # Too short to hold a header: a shard opened but not yet written. Release the fd — the file
+        # it points at is not the one a later commit will read.
+        {:ok, :empty, close_held(handle)}
+
+      {:error, :enoent} ->
+        {:ok, :empty, close_held(handle)}
+
+      {:error, reason} ->
+        {:error, reason, close_held(handle)}
+    end
+  end
+
+  @doc """
+  `read_delta/3` through `handle`. Same `{:ok, bin, handle}` / `{:error, reason, handle}` shape,
+  and the same short-read guard: a shrunken file means a checkpoint raced us, so refuse.
+  """
+  @spec read_delta_held(handle(), Path.t(), non_neg_integer(), non_neg_integer()) ::
+          {:ok, binary(), handle()} | {:error, term(), handle()}
+  def read_delta_held(handle, _path, _offset, 0), do: {:ok, <<>>, handle}
+
+  def read_delta_held(handle, path, offset, len) do
+    case File.stat(path) do
+      {:ok, %{inode: inode}} ->
+        with {:ok, h} <- ensure_fd(handle, path, inode),
+             {:ok, bin} when byte_size(bin) == len <- :file.pread(h.fd, offset, len) do
+          {:ok, bin, h}
+        else
+          {:ok, _short} -> {:error, :short_read, handle}
+          :eof -> {:error, :short_read, handle}
+          {:error, reason} -> {:error, reason, close_held(handle)}
+        end
+
+      {:error, _} ->
+        {:error, :short_read, close_held(handle)}
+    end
+  end
+
+  @doc "Closes any held fd. Always returns `nil`, so callers can assign the result directly."
+  @spec close_held(handle()) :: nil
+  def close_held(nil), do: nil
+
+  def close_held(%{fd: fd}) do
+    :file.close(fd)
+    nil
+  end
+
+  # Reuse the fd only when BOTH the path and the inode match. A different inode is an
+  # unlink+recreate, and reading the old one would splice generations.
+  defp ensure_fd(%{path: path, inode: inode} = handle, path, inode), do: {:ok, handle}
+
+  defp ensure_fd(handle, path, inode) do
+    _ = close_held(handle)
+
+    case :file.open(path, [:read, :raw, :binary]) do
+      {:ok, fd} -> {:ok, %{path: path, fd: fd, inode: inode}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp header_from(handle, size) do
+    case :file.pread(handle.fd, 0, @header_bytes) do
+      {:ok, <<magic::32, _fmt::32, page::32, seq::32, salt1::32, salt2::32, _ck::binary>>}
+      when magic in @magics ->
+        {:ok,
+         %{
+           ckpt_seq: seq,
+           salt1: salt1,
+           size: size,
+           commit_extent: commit_extent(handle.fd, size, page, salt1, salt2)
+         }, handle}
+
+      {:ok, _} ->
+        # Same refusal as `read_header/2`: bytes we cannot identify the generation of are the
+        # splice this module exists to prevent.
+        {:error, :not_a_wal, close_held(handle)}
+
+      :eof ->
+        {:ok, :empty, close_held(handle)}
+
+      {:error, reason} ->
+        {:error, reason, close_held(handle)}
+    end
+  end
 end
