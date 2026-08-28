@@ -46,11 +46,12 @@ defmodule Fathom.Shard.Replication.Shipper do
 
   alias Fathom.Shard.Replication.Budget
   alias Fathom.Shard.Replication.Protocol
+  alias Fathom.Shard.Replication.Shipper.Writer
 
   @connect_timeout 5_000
   @reconnect_backoff_ms 500
 
-  defstruct [:host, :port, :sock, :id, :name, waiters: %{}]
+  defstruct [:host, :port, :sock, :writer, :id, :name, waiters: %{}]
 
   # ------------------------------------------------------------------------------------------
   # api
@@ -273,14 +274,19 @@ defmodule Fathom.Shard.Replication.Shipper do
         {:noreply, state}
 
       true ->
-        case :gen_tcp.send(state.sock, encode(p)) do
-          :ok ->
-            {:noreply, %{state | waiters: Map.put(state.waiters, p.shard_id, from)}}
-
-          {:error, reason} ->
-            send(from, {:repl_reply, state.id, {:reject, p.shard_id, :disconnected, 0}})
-            {:noreply, drop(state, reason)}
-        end
+        # HANDED TO THE WRITER, NOT SENT HERE (expert review 2026-08-26 #19). `:gen_tcp.send/2`
+        # blocks until the peer's receive window drains — up to `send_timeout`, 5 s — and this
+        # process is also the socket's READER. So a blocking send here leaves incoming acks for
+        # every OTHER shard on this link sitting unread in this mailbox: a shard whose ack has
+        # already arrived cannot complete its quorum until an unrelated shard's send unblocks, and
+        # `Budget.release/2` is delayed with it, so the node-wide byte budget stays claimed for the
+        # stall. Absorbed at N=3/Q=2; it bites at N=2/Q=1, the documented development topology.
+        #
+        # The waiter is recorded BEFORE the send is attempted, which is the one semantic change: a
+        # failure now arrives after further pushes have been accepted. `drop/2` fails all of them,
+        # which is what today does too — the difference is only how many are in flight when it runs.
+        Writer.frame(state.writer, encode(p))
+        {:noreply, %{state | waiters: Map.put(state.waiters, p.shard_id, from)}}
     end
   end
 
@@ -295,7 +301,7 @@ defmodule Fathom.Shard.Replication.Shipper do
       send(from, {:repl_reply, state.id, {:reject, s.shard_id, :already_in_flight, 0}})
       {:noreply, state}
     else
-      case :gen_tcp.send(state.sock, Protocol.encode_seed_begin(s)) do
+      case Writer.send_now(state.writer, Protocol.encode_seed_begin(s)) do
         :ok ->
           {:noreply, %{state | waiters: Map.put(state.waiters, s.shard_id, from)}}
 
@@ -312,7 +318,7 @@ defmodule Fathom.Shard.Replication.Shipper do
   def handle_cast({:seed_frame, _shard_id, _frame}, %{sock: nil} = state), do: {:noreply, state}
 
   def handle_cast({:seed_frame, shard_id, frame}, state) do
-    case :gen_tcp.send(state.sock, seed_frame(shard_id, frame)) do
+    case Writer.send_now(state.writer, seed_frame(shard_id, frame)) do
       :ok -> {:noreply, state}
       {:error, reason} -> {:noreply, drop(state, reason)}
     end
@@ -344,9 +350,30 @@ defmodule Fathom.Shard.Replication.Shipper do
     end
   end
 
-  def handle_info({:tcp_closed, _}, state), do: {:noreply, drop(state, :closed)}
-  def handle_info({:tcp_error, _, reason}, state), do: {:noreply, drop(state, reason)}
+  # MATCHED ON THE CURRENT SOCKET, and the guard is the whole point (expert review 2026-08-26 #19).
+  #
+  # `send_timeout_close: true` means a timed-out send CLOSES the socket, and this process is the
+  # controlling process, so it receives `{:tcp_closed, _}` as well as the writer's
+  # `{:send_failed, …}`. With a bare `_` here both arrive, `drop/2` runs TWICE and arms two
+  # reconnect timers — two `connect/1` calls, two sockets, one leaked, and the leaked one is the
+  # `active: true` reader for a link nobody drains. It shows up as a slow socket leak on a
+  # long-lived link, not as a test failure.
+  def handle_info({:tcp_closed, sock}, %{sock: sock} = state),
+    do: {:noreply, drop(state, :closed)}
+
+  def handle_info({:tcp_error, sock, reason}, %{sock: sock} = state),
+    do: {:noreply, drop(state, reason)}
+
+  # A WRITE FAILED ON THE CURRENT LINK. Same handling as an inline send error had: drop, which
+  # fails every waiter with `:disconnected`. Tagged by the writer pid so a straggler from a
+  # PREVIOUS incarnation — one that was still blocked in `send` when its socket was closed —
+  # cannot tear down the socket that replaced it.
+  def handle_info({:send_failed, writer, reason}, %{writer: writer} = state),
+    do: {:noreply, drop(state, reason)}
+
   def handle_info(:reconnect, state), do: {:noreply, connect(state)}
+
+  # Stale socket / stale writer events land here on purpose. See the guards above.
   def handle_info(_, state), do: {:noreply, state}
 
   @impl true
@@ -355,6 +382,7 @@ defmodule Fathom.Shard.Replication.Shipper do
     # supersedes this ref anyway, and `Budget.queued/0` only sums the shippers `Fleet` currently
     # publishes. This just keeps a departed follower's entry from outliving it in `:persistent_term`.
     Budget.forget(state.name)
+    Writer.stop(state.writer)
     if state.sock, do: :gen_tcp.close(state.sock)
     :ok
   end
@@ -389,7 +417,10 @@ defmodule Fathom.Shard.Replication.Shipper do
 
     case :gen_tcp.connect(host, state.port, opts, @connect_timeout) do
       {:ok, sock} ->
-        %{state | sock: sock}
+        # ONE WRITER PER SOCKET, not per shipper: a writer is meaningless without the socket it
+        # owns, and tying their lifetimes together is what makes a stale writer's report
+        # distinguishable from the live one's.
+        %{state | sock: sock, writer: Writer.start_link(sock, self())}
 
       {:error, reason} ->
         Logger.warning(
@@ -397,7 +428,7 @@ defmodule Fathom.Shard.Replication.Shipper do
         )
 
         Process.send_after(self(), :reconnect, @reconnect_backoff_ms)
-        %{state | sock: nil}
+        %{state | sock: nil, writer: nil}
     end
   end
 
@@ -477,6 +508,7 @@ defmodule Fathom.Shard.Replication.Shipper do
 
   defp drop(state, reason) do
     if state.sock, do: :gen_tcp.close(state.sock)
+    Writer.stop(state.writer)
 
     for {shard, from} <- state.waiters do
       send(from, {:repl_reply, state.id, {:reject, shard, :disconnected, 0}})
@@ -487,7 +519,7 @@ defmodule Fathom.Shard.Replication.Shipper do
     end
 
     Process.send_after(self(), :reconnect, @reconnect_backoff_ms)
-    %{state | sock: nil, waiters: %{}}
+    %{state | sock: nil, writer: nil, waiters: %{}}
   end
 
   # ONE EVENT PER REFUSED PUSH, tagged by REASON only.
