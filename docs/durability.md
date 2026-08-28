@@ -96,6 +96,14 @@ price the other request paths. Byte transfer is free on ingress and a flush over
 so a tighter interval buys RPO with **request count only** — not storage, not bandwidth. R2/Tigris
 differ; re-derive against your store's price sheet.
 
+**A flush used to be HEAD-then-PUT, not one request** (expert review 2026-08-26 #33). A PUT replaces
+all of an object's user metadata, so a coordinator with no lineage of its own — which is every
+coordinator when replication is off, the default — had to read back the lineage it was about to
+overwrite, before every PUT of an existing shard. The coordinator now caches what the previous
+flush reported and hands it back, so only the FIRST flush of its life pays that read. It was never
+a bytes cost; it was a request and a serialized RTT sitting between the ownership re-check and the
+write.
+
 **Cost per write is set by writes-per-flush, not by write count.** A flush uploads the whole object
 no matter how many writes accumulated behind it, so the per-write cost is purely amortization:
 

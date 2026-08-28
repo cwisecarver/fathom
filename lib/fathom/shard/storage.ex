@@ -179,12 +179,28 @@ defmodule Fathom.Shard.Storage do
   # under us (a stealer flushed) → the caller must self-fence and NOT clobber. On success
   # returns the new object etag so the caller can fence its next flush. Puts the fencing token
   # on the data write itself, closing the check-then-PUT window (finding #15).
+  #
+  # THE THIRD ELEMENT IS THE LINEAGE THE OBJECT NOW CARRIES (expert review 2026-08-26 #33) — an
+  # integer, `:none` for "it carries none", or `:unknown` for a backend that does not report it.
+  # The caller caches it and hands it back as the `lineage` argument's `{:carried, _}` shape, which
+  # is what lets `Storage.S3` skip the `object_head` it otherwise pays on EVERY flush of an
+  # existing shard when replication is off (the default). `:unknown` must not be cached.
   @callback flush(
               shard_id :: String.t(),
               local_path :: Path.t(),
               expected_etag :: String.t() | nil
             ) ::
-              {:ok, String.t()} | {:error, :superseded} | {:error, term()}
+              {:ok, String.t(), carried_lineage()}
+              | {:error, :superseded}
+              | {:error, term()}
+
+  @typedoc """
+  What a fenced flush reports about the object's lineage metadata after the write.
+
+  `:none` is a statement ("it carries no lineage"); `:unknown` is a refusal to state one and must
+  never be cached. See `Fathom.Shard`'s `carried_lineage` for the cache and its two invalidations.
+  """
+  @type carried_lineage :: non_neg_integer() | :none | :unknown
 
   # Fenced flush that also records HOW MUCH of the shard's history these bytes contain, so a
   # replica can be ordered against the stored object (Phase 2 A2 promote-on-open). `nil` writes no
@@ -199,7 +215,9 @@ defmodule Fathom.Shard.Storage do
               expected_etag :: String.t() | nil,
               position :: position() | nil
             ) ::
-              {:ok, String.t()} | {:error, :superseded} | {:error, term()}
+              {:ok, String.t(), carried_lineage()}
+              | {:error, :superseded}
+              | {:error, term()}
 
   # As `c:flush/4`, plus the shard's LINEAGE counter (expert review 2026-08-20 #8).
   #
@@ -222,9 +240,11 @@ defmodule Fathom.Shard.Storage do
               local_path :: Path.t(),
               expected_etag :: String.t() | nil,
               position :: position() | nil,
-              lineage :: non_neg_integer() | nil
+              lineage :: non_neg_integer() | {:carried, non_neg_integer() | :none} | nil
             ) ::
-              {:ok, String.t()} | {:error, :superseded} | {:error, term()}
+              {:ok, String.t(), carried_lineage()}
+              | {:error, :superseded}
+              | {:error, term()}
 
   # The stored object's position stamp, or `nil` when it has none — an object flushed before
   # stamping existed, or by a caller that passed `nil`. `nil` must be read as "unknown", never as
@@ -506,19 +526,25 @@ defmodule Fathom.Shard.Storage do
 
   @doc "Fenced flush: writes only if the stored object still matches `expected_etag`. See callback."
   @spec flush(String.t(), Path.t(), String.t() | nil) ::
-          {:ok, String.t()} | {:error, :superseded} | {:error, term()}
+          {:ok, String.t(), carried_lineage()} | {:error, :superseded} | {:error, term()}
   def flush(shard_id, local_path, expected_etag),
     do: backend().flush(shard_id, local_path, expected_etag, nil)
 
   @doc "Fenced flush carrying a position stamp. See the `c:flush/4` callback."
   @spec flush(String.t(), Path.t(), String.t() | nil, position() | nil) ::
-          {:ok, String.t()} | {:error, :superseded} | {:error, term()}
+          {:ok, String.t(), carried_lineage()} | {:error, :superseded} | {:error, term()}
   def flush(shard_id, local_path, expected_etag, position),
     do: backend().flush(shard_id, local_path, expected_etag, position)
 
   @doc "Fenced flush carrying a position stamp and a lineage counter. See the `c:flush/5` callback."
-  @spec flush(String.t(), Path.t(), String.t() | nil, position() | nil, non_neg_integer() | nil) ::
-          {:ok, String.t()} | {:error, :superseded} | {:error, term()}
+  @spec flush(
+          String.t(),
+          Path.t(),
+          String.t() | nil,
+          position() | nil,
+          non_neg_integer() | {:carried, non_neg_integer() | :none} | nil
+        ) ::
+          {:ok, String.t(), carried_lineage()} | {:error, :superseded} | {:error, term()}
   def flush(shard_id, local_path, expected_etag, position, lineage),
     do: backend().flush(shard_id, local_path, expected_etag, position, lineage)
 

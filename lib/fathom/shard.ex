@@ -713,6 +713,16 @@ defmodule Fathom.Shard do
         # Session caches the answer and only asks again when the salt changes, which is rare.
         wal_ordinal: 0,
         wal_salt: nil,
+        # WHAT THE STORED OBJECT'S LINEAGE METADATA IS, cached from the last fenced flush's report
+        # (expert review 2026-08-26 #33). `nil` = unknown, ask the backend; an integer or `:none` =
+        # a statement this coordinator may hand back so `Storage.S3` skips its `object_head`.
+        #
+        # Sound under the single-writer lease: while we hold it nobody else writes the object, so a
+        # cached value cannot go stale DOWNWARD — the only dangerous direction, because a lineage
+        # that decreases is what lets a stale replica outrank the object and roll a tenant back.
+        # Dropped on `{:reconciled, _}`, the one verdict where the object moved for a reason we did
+        # not cause.
+        carried_lineage: nil,
         # Consecutive durability-flush failures (expert review #27): a persistent S3 failure
         # (auth/bucket-policy change) would otherwise only Logger.warning per interval and let the
         # RPO grow unbounded and silently. We count consecutive failures, emit
@@ -1906,7 +1916,16 @@ defmodule Fathom.Shard do
             # missing key can only ever withhold an ordinal — never invent a wrong one. Withholding
             # degrades to "unknown ⇒ the stored object wins", which is the pre-A2 answer.
             snapshot_state =
-              Map.take(state, [:id, :path, :etag, :lease, :lineage, :wal_salt, :wal_ordinal])
+              Map.take(state, [
+                :id,
+                :path,
+                :etag,
+                :lease,
+                :lineage,
+                :wal_salt,
+                :wal_ordinal,
+                :carried_lineage
+              ])
 
             # THE SLOT IS RESERVED BEFORE THE STATE THAT OWNS ITS RELEASE EXISTS (expert review
             # 2026-08-20 #15) — the same class AGENTS.md records for `acquire_lease` → built state.
@@ -2215,7 +2234,9 @@ defmodule Fathom.Shard do
           state = Map.merge(state, updates)
 
           case upload_for_drop(state) do
-            {:ok, new_etag} ->
+            # The carried lineage is discarded on the DROP path: this coordinator is stopping, so
+            # there is no next flush to spend the cache on (expert review 2026-08-26 #33).
+            {:ok, new_etag, _carried} ->
               # Stamp the new etag into the provenance sidecar BEFORE dropping (expert
               # review 2026-07-14 #21). We're about to delete everything, so the write
               # is normally invisible — but a crash after this upload lands (object now
@@ -2444,7 +2465,7 @@ defmodule Fathom.Shard do
     result
   end
 
-  defp flush_outcome({:ok, _}), do: :uploaded
+  defp flush_outcome({:ok, _, _}), do: :uploaded
   defp flush_outcome({:reconciled, _}), do: :reconciled
   defp flush_outcome(:superseded), do: :superseded
   defp flush_outcome({:error, _}), do: :error
@@ -2487,7 +2508,7 @@ defmodule Fathom.Shard do
   # better than an unrecoverable unlink.
   defp retry_drop_upload(state) do
     with {:ok, etag} when not is_nil(etag) <- Storage.object_etag(state.id),
-         {:ok, new_etag} <- upload_for_drop(%{state | etag: etag}) do
+         {:ok, new_etag, _carried} <- upload_for_drop(%{state | etag: etag}) do
       Logger.info(
         "shard #{state.id}: flush 412 with lock ours; re-fenced to the object and re-uploaded"
       )
@@ -2590,7 +2611,7 @@ defmodule Fathom.Shard do
           state.path,
           state.etag,
           flush_position(state, pre),
-          lineage_to_store(state.lineage)
+          lineage_arg(state)
         )
 
       # Integrity failed (expert review 2026-07-14 #4). The checkpoint-then-raw-upload fast path
@@ -3183,7 +3204,7 @@ defmodule Fathom.Shard do
     try do
       with :ok <- snapshot_before_promotion(shard_id),
            :ok <- Promote.stage(follower, shard_id, temp),
-           {:ok, new_etag} <-
+           {:ok, new_etag, _carried} <-
              Storage.flush(
                shard_id,
                temp,
@@ -3817,6 +3838,27 @@ defmodule Fathom.Shard do
   defp lineage_to_store(n) when is_integer(n), do: n
   defp lineage_to_store(_), do: nil
 
+  # WHAT TO PASS AS THE FLUSH'S `lineage` ARGUMENT (expert review 2026-08-26 #33).
+  #
+  # A real lineage is passed straight through — replication is on, and the backend writes it with
+  # no read. Otherwise this coordinator has nothing to claim, and `nil` means "leave whatever is
+  # there alone" — which on S3 costs an `object_head` before EVERY PUT, because a PUT replaces all
+  # user metadata, so the backend has to read what it is about to overwrite. On the default
+  # (replication-off) configuration that HEAD is paid forever and returns nothing.
+  #
+  # `{:carried, _}` is the same instruction with the answer supplied: write exactly this, do not
+  # look. It is only ever the value the backend itself reported from the previous flush, so the
+  # coordinator is not deriving a lineage — it is remembering one. `nil` while the cache is cold
+  # keeps today's behaviour, which is what makes this a strict improvement rather than a new rule.
+  defp lineage_arg(%{lineage: n}) when is_integer(n), do: n
+
+  defp lineage_arg(state) do
+    case Map.get(state, :carried_lineage) do
+      nil -> nil
+      carried -> {:carried, carried}
+    end
+  end
+
   defp flush_position(state, pre, epoch) do
     case Fathom.Shard.Replication.Wal.read(state.path <> "-wal") do
       # commit_extent, not `size` (expert review 2026-08-20 #5): the file length is a high-water
@@ -3912,15 +3954,15 @@ defmodule Fathom.Shard do
       # after would spend a full VACUUM on a file we are about to refuse and move aside.
       with :ok <- verify_and_snapshot(state, temp),
            :ok <- recheck_before_put(state),
-           {:ok, new_etag} <-
+           {:ok, new_etag, carried} <-
              Storage.flush(
                state.id,
                temp,
                state.etag,
                flush_position(state, pre),
-               lineage_to_store(state.lineage)
+               lineage_arg(state)
              ) do
-        {:ok, new_etag}
+        {:ok, new_etag, carried}
       else
         {:error, :superseded} = superseded ->
           superseded
@@ -4179,7 +4221,7 @@ defmodule Fathom.Shard do
   # Fold a completed flush task's verdict into local state. Pure w.r.t. the fence — all the
   # Storage I/O already ran in the task — so both the live handler and the terminate-path
   # settle can call it. Returns `{status, state}`.
-  defp apply_flush_verdict(state, {:ok, new_etag}) do
+  defp apply_flush_verdict(state, {:ok, new_etag, carried}) do
     # Uploaded; advance the fence etag, the provenance sidecar, and the flushed watermark
     # captured when the task started (clears dirty up to that point).
     write_etag_sidecar(state.path, new_etag)
@@ -4188,7 +4230,12 @@ defmodule Fathom.Shard do
       state
       | flushed_through: state.flush_pending,
         counter_gen: state.flush_pending_gen,
-        etag: new_etag
+        etag: new_etag,
+        # CACHE WHAT THE BACKEND SAID IT CARRIED (expert review 2026-08-26 #33) — but never
+        # `:unknown`, which is a refusal to state one (`Storage.Local`, whose lineage lives in its
+        # own sidecar and costs nothing to leave alone). Caching a refusal would hand a fabricated
+        # `{:carried, :unknown}` to whatever backend runs next.
+        carried_lineage: cache_carried(state.carried_lineage, carried)
     }
 
     # Advance the published watermark (clears dirty up to flush_pending for the RPO reader).
@@ -4220,12 +4267,17 @@ defmodule Fathom.Shard do
   # the provenance check needs to not false-quarantine a fork.
   defp apply_flush_verdict(state, {:reconciled, object_etag}) when not is_nil(object_etag) do
     write_etag_sidecar(state.path, object_etag)
-    {:dirty, clear_flush_failures(%{state | etag: object_etag})}
+    # DROP THE LINEAGE CACHE (expert review 2026-08-26 #33). This is the one verdict where the
+    # object moved to an etag we did not write — our PUT 412'd — so what its metadata says is no
+    # longer something we know. The next flush pays one HEAD and re-learns it, which is the whole
+    # cost of being wrong here and is why the cache is safe to keep otherwise.
+    {:dirty, clear_flush_failures(%{state | etag: object_etag, carried_lineage: nil})}
   end
 
   # 412 + lock ours, but the object's etag came back nil/unreadable: keep serving with no etag
   # resync; stays dirty and retries next interval.
-  defp apply_flush_verdict(state, {:reconciled, nil}), do: {:dirty, state}
+  defp apply_flush_verdict(state, {:reconciled, nil}),
+    do: {:dirty, %{state | carried_lineage: nil}}
 
   defp apply_flush_verdict(state, :superseded), do: {:superseded, state}
 
@@ -4265,6 +4317,10 @@ defmodule Fathom.Shard do
   # flushes before dropping instead of deleting un-stored writes.
   defp apply_flush_verdict(state, {:error, reason}),
     do: {{:error, reason}, record_flush_failure(state, reason)}
+
+  # `:unknown` is not a statement, so it never enters the cache — the previous answer stands.
+  defp cache_carried(previous, :unknown), do: previous
+  defp cache_carried(_previous, carried), do: carried
 
   # Release the FlushGate slot this flush reserved, exactly once (expert review #17). Called at
   # every site that clears flush_task — completion, task crash, and terminate — so the node-wide

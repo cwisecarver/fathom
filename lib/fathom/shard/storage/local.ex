@@ -99,7 +99,13 @@ defmodule Fathom.Shard.Storage.Local do
                :ok <- write_position(shard_id, position),
                :ok <- write_lineage(shard_id, lineage),
                {:ok, etag} <- file_etag(remote_path(shard_id)) do
-            {:ok, etag}
+            # `:unknown`, not `:none` (expert review 2026-08-26 #33). The third element is what the
+            # object now carries, and this backend genuinely does not know without reading the
+            # sidecar — but it has no reason to: the lineage lives in its OWN file here, so a `nil`
+            # lineage leaves it alone for free. S3 pays a HEAD for the same effect, which is what
+            # #33 is about. `:unknown` tells the caller not to cache, so it never hands a Local
+            # answer back to an S3 backend after a config change.
+            {:ok, etag, :unknown}
           end
       end
     end)
@@ -126,6 +132,12 @@ defmodule Fathom.Shard.Storage.Local do
   # migration copy, a benchmark) has no business erasing the shard's history — and erasing it would
   # reintroduce exactly the reset this key exists to prevent.
   defp write_lineage(_shard_id, nil), do: :ok
+
+  # The `{:carried, _}` shape S3 uses to skip its HEAD (#33). Local has nothing to skip — its
+  # sidecar is already left alone by the `nil` clause — so a carried value is written when it is a
+  # real lineage and ignored when it is `:none`.
+  defp write_lineage(_shard_id, {:carried, :none}), do: :ok
+  defp write_lineage(shard_id, {:carried, n}) when is_integer(n), do: write_lineage(shard_id, n)
 
   defp write_lineage(shard_id, lineage) when is_integer(lineage) do
     Storage.atomic_write(lineage_path(shard_id), Integer.to_string(lineage))

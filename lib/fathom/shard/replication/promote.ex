@@ -261,7 +261,7 @@ defmodule Fathom.Shard.Replication.Promote do
       with :ok <- stage(follower, shard_id, temp),
            {:ok, expected} <- current_object_etag(shard_id),
            :ok <- File.rename(temp, path),
-           {:ok, etag} <- Storage.flush(shard_id, path, expected),
+           {:ok, etag, _carried} <- Storage.flush(shard_id, path, expected),
            :ok <- stamp_provenance(shard_id) do
         # Only now does the follower stop being a replica of this shard. Doing it earlier would
         # mean a failure above left the node holding neither a replica nor a primary.

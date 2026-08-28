@@ -290,7 +290,7 @@ defmodule Fathom.Migrator.ShardMigration do
         with {:ok, etag} <- pull_live(dst, old),
              :ok <- Copy.migrate(old, new, head, []),
              :ok <- fence(dst, lease),
-             {:ok, _new_etag} <- flush_fenced(dst, new, etag) do
+             {:ok, _new_etag, _carried} <- flush_fenced(dst, new, etag) do
           :ok
         end
       after
@@ -623,7 +623,7 @@ defmodule Fathom.Migrator.ShardMigration do
          # this PUT lands. An unconditional PUT would clobber the new owner's object with
          # a migrated copy of the OLD lineage, with zero error signal. If-Match turns that
          # into a 412 → :superseded, and the job retries from a fresh pull.
-         {:ok, _new_etag} <- flush_fenced(shard_id, new, expected_etag),
+         {:ok, _new_etag, _carried} <- flush_fenced(shard_id, new, expected_etag),
          {:ok, _} <- cutover_with_retirement(shard_id, target, current) do
       Logger.info("shard #{shard_id}: migrated v#{current} -> v#{target}")
       {:ok, %{from: current, to: target}}
@@ -644,8 +644,11 @@ defmodule Fathom.Migrator.ShardMigration do
     end
   end
 
-  # Storage.flush/3 returns {:ok, etag} | {:error, :superseded} | {:error, reason};
-  # normalize into the with-chain (a bare :superseded aborts the migration cleanly).
+  # Storage.flush/3 returns {:ok, etag, carried_lineage} | {:error, :superseded} | {:error, reason};
+  # normalize into the with-chain (a bare :superseded aborts the migration cleanly). The third
+  # element (expert review 2026-08-26 #33) is the object's lineage metadata and is discarded here:
+  # only the shard COORDINATOR caches it, because only it holds the lease that makes the cache
+  # sound. A migration copy is a one-off write.
   defp flush_fenced(shard_id, path, expected_etag) do
     Storage.flush(shard_id, path, expected_etag)
   end

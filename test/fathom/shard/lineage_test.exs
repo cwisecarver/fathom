@@ -99,7 +99,7 @@ defmodule Fathom.Shard.LineageTest do
     end
 
     test "a flushed lineage reads back through object_head/1", %{id: id, src: src} do
-      assert {:ok, _etag} = Storage.Local.flush(id, src, nil, nil, 4)
+      assert {:ok, _etag, _} = Storage.Local.flush(id, src, nil, nil, 4)
       assert {:ok, %{lineage: 4}} = Storage.Local.object_head(id)
     end
 
@@ -114,8 +114,8 @@ defmodule Fathom.Shard.LineageTest do
       #
       # Erasing it would reintroduce exactly the reset this counter exists to prevent, which is why
       # this is asserted rather than left to the reader of write_lineage/2.
-      assert {:ok, etag} = Storage.Local.flush(id, src, nil, nil, 6)
-      assert {:ok, _etag2} = Storage.Local.flush(id, src, etag, nil, nil)
+      assert {:ok, etag, _} = Storage.Local.flush(id, src, nil, nil, 6)
+      assert {:ok, _etag2, _} = Storage.Local.flush(id, src, etag, nil, nil)
       assert {:ok, %{lineage: 6}} = Storage.Local.object_head(id)
     end
 
@@ -123,7 +123,7 @@ defmodule Fathom.Shard.LineageTest do
       # nil and 0 are different answers: 0 is a real stamped value, nil means "nothing has ever
       # claimed one". next_lineage/1 treats them identically today, but a consumer that invented
       # 0 from absence would let a fresh owner reuse a number a previous one already used.
-      assert {:ok, _etag} = Storage.Local.flush(id, src, nil, nil, nil)
+      assert {:ok, _etag, _} = Storage.Local.flush(id, src, nil, nil, nil)
       assert {:ok, %{lineage: nil}} = Storage.Local.object_head(id)
     end
 

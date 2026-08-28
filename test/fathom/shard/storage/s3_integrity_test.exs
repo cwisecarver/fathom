@@ -61,7 +61,7 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
     expected = Base.encode64(:crypto.hash(:md5, @good))
     assert_receive {:content_md5, [^expected]}
 
-    assert {:ok, _} = S3.flush("s", local, nil)
+    assert {:ok, _, _} = S3.flush("s", local, nil)
     assert_receive {:content_md5, [^expected]}
   end
 
@@ -156,7 +156,7 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
     assert :ok = S3.flush("s", local)
     assert_receive {:meta, [^expected]}
 
-    assert {:ok, _} = S3.flush("s", local, nil)
+    assert {:ok, _, _} = S3.flush("s", local, nil)
     assert_receive {:meta, [^expected]}
   end
 

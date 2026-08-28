@@ -287,6 +287,10 @@ defmodule Fathom.Shard.Storage.S3 do
     cond_headers =
       if expected_etag, do: [{"if-match", expected_etag}], else: [{"if-none-match", "*"}]
 
+    # Resolved BEFORE the body is prepared, so the HEAD (when one is needed at all) does not sit
+    # inside the streaming upload's callback where a reader would miss it.
+    {header, carried} = carried_lineage_header(shard_id, expected_etag, lineage)
+
     with_body(local_path, fn body_path, size, md5, md5_hex, enc_headers ->
       with {:ok, resp} <-
              Req.put(req(),
@@ -301,11 +305,13 @@ defmodule Fathom.Shard.Storage.S3 do
                    {@md5_meta, md5_hex} | cond_headers
                  ] ++
                    enc_headers ++
-                   pos_meta_header(position) ++
-                   carried_lineage_header(shard_id, expected_etag, lineage)
+                   pos_meta_header(position) ++ header
              ) do
         case resp.status do
-          s when s in 200..299 -> {:ok, etag(resp.headers)}
+          # REPORTS WHAT IT CARRIED (expert review 2026-08-26 #33). The caller caches it and hands
+          # it back as `{:carried, _}` next time, so only the FIRST flush of a coordinator's life
+          # pays the HEAD above.
+          s when s in 200..299 -> {:ok, etag(resp.headers), carried}
           412 -> {:error, :superseded}
           s -> {:error, {:s3_put_status, s}}
         end
@@ -892,15 +898,40 @@ defmodule Fathom.Shard.Storage.S3 do
   #
   # The POSITION stamp is deliberately NOT carried — erasing it is correct, and `pos_meta_header/1`
   # keeps its own semantics.
+  #
+  # RETURNS `{headers, carried}` (expert review 2026-08-26 #33). `carried` is what the object will
+  # carry after this PUT — an integer, or `:none` for "it carries no lineage". The caller stashes
+  # it and hands it straight back as `{:carried, _}` on the next flush, which is what removes the
+  # HEAD from every flush after the first.
+  #
+  # THE HEAD WAS PURE WASTE ON THE DEFAULT CONFIG. With replication off `lineage_to_store/1` is
+  # `nil` and the third clause fires on every flush of an existing shard, forever — and on a fleet
+  # that never enabled replication the object carries no lineage, so the HEAD returns nothing and
+  # the header is empty. The cost is not bytes (the old note argued that): it is a request and a
+  # serialized RTT inserted AFTER `recheck_before_put/1` and before the PUT, partially undoing
+  # review 2026-08-01 #28, whose whole purpose was shrinking that window.
+  #
+  # SOUND UNDER THE SINGLE-WRITER LEASE: while this node holds it nobody else writes the object,
+  # so a cached value cannot go stale downward — which is the only dangerous direction, since the
+  # lineage must never decrease. The caller drops the cache on the two paths where `state.etag`
+  # moves for a reason we did not cause, and a dropped cache falls back to the HEAD.
   defp carried_lineage_header(_shard_id, _expected_etag, n) when is_integer(n),
-    do: [{@lineage_meta, Integer.to_string(n)}]
+    do: {[{@lineage_meta, Integer.to_string(n)}], n}
 
-  defp carried_lineage_header(_shard_id, nil, nil), do: []
+  # Told what the object carries, so no read at all. `:none` writes no header, which is exactly
+  # what the HEAD-then-empty path did.
+  defp carried_lineage_header(_shard_id, _expected_etag, {:carried, n}) when is_integer(n),
+    do: {[{@lineage_meta, Integer.to_string(n)}], n}
+
+  defp carried_lineage_header(_shard_id, _expected_etag, {:carried, :none}), do: {[], :none}
+
+  # A brand-new object has no metadata to inherit, so cold open pays nothing.
+  defp carried_lineage_header(_shard_id, nil, nil), do: {[], :none}
 
   defp carried_lineage_header(shard_id, _expected_etag, nil) do
     case object_head(shard_id) do
-      {:ok, %{lineage: n}} when is_integer(n) -> [{@lineage_meta, Integer.to_string(n)}]
-      _ -> []
+      {:ok, %{lineage: n}} when is_integer(n) -> {[{@lineage_meta, Integer.to_string(n)}], n}
+      _ -> {[], :none}
     end
   end
 
@@ -1244,7 +1275,7 @@ defmodule Fathom.Shard.Storage.S3 do
       case download(url_path(version_key(shard_id, version)), tmp) do
         {:ok, _etag} ->
           case flush(shard_id, tmp, expected_etag) do
-            {:ok, _new_etag} -> :ok
+            {:ok, _new_etag, _carried} -> :ok
             {:error, _} = error -> error
           end
 
@@ -1372,7 +1403,7 @@ defmodule Fathom.Shard.Storage.S3 do
     #
     # The caller owns local_path — this does NOT delete it.
     case flush(shard_id, local_path, expected_etag) do
-      {:ok, _new_etag} -> :ok
+      {:ok, _new_etag, _carried} -> :ok
       {:error, _} = error -> error
     end
   end

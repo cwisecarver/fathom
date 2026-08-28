@@ -99,7 +99,7 @@ defmodule Fathom.Shard.Storage.S3SentinelTest do
 
     # The stealer's first real flush replaces the sentinel via If-Match.
     real_file = tmp_db("the-stealer-lineage")
-    assert {:ok, _new_etag} = S3.flush(@shard, real_file, sentinel_etag)
+    assert {:ok, _new_etag, _} = S3.flush(@shard, real_file, sentinel_etag)
     assert S3EtagStore.body_of(store, @data_key) == "the-stealer-lineage"
     assert S3EtagStore.meta_of(store, @data_key)[@sentinel_meta] == nil
   end

@@ -124,7 +124,7 @@ defmodule Fathom.Test.StorageContract do
         test "a brand-new fenced flush (nil) succeeds once, then is superseded" do
           id = sid("newborn")
 
-          assert {:ok, etag} = @backend.flush(id, tmp_file("first"), nil)
+          assert {:ok, etag, _} = @backend.flush(id, tmp_file("first"), nil)
           assert is_binary(etag)
 
           # A second create-only flush must 412: this is what stops a zombie's stalled first
@@ -139,17 +139,17 @@ defmodule Fathom.Test.StorageContract do
           # acknowledged writes.
           id = sid("fence")
 
-          assert {:ok, etag} = @backend.flush(id, tmp_file("v1"), nil)
+          assert {:ok, etag, _} = @backend.flush(id, tmp_file("v1"), nil)
           assert {:ok, ^etag} = @backend.object_etag(id)
 
-          assert {:ok, etag2} = @backend.flush(id, tmp_file("v2"), etag)
+          assert {:ok, etag2, _} = @backend.flush(id, tmp_file("v2"), etag)
           assert {:ok, ^etag2} = @backend.object_etag(id)
         end
 
         test "a stale expected_etag is superseded and leaves the object untouched" do
           id = sid("stale")
-          {:ok, etag1} = @backend.flush(id, tmp_file("v1"), nil)
-          {:ok, _etag2} = @backend.flush(id, tmp_file("v2"), etag1)
+          {:ok, etag1, _} = @backend.flush(id, tmp_file("v1"), nil)
+          {:ok, _etag2, _} = @backend.flush(id, tmp_file("v2"), etag1)
 
           assert {:error, :superseded} = @backend.flush(id, tmp_file("v3"), etag1)
 
@@ -161,7 +161,7 @@ defmodule Fathom.Test.StorageContract do
       describe "#{inspect(unquote(backend))} — pull_if_changed/3 (warm-standby freshness)" do
         test "an unchanged object is :unchanged with no byte transfer" do
           id = sid("warm")
-          {:ok, etag} = @backend.flush(id, tmp_file("body"), nil)
+          {:ok, etag, _} = @backend.flush(id, tmp_file("body"), nil)
           dest = dest_path()
 
           assert {:ok, :unchanged} = @backend.pull_if_changed(id, dest, etag)
@@ -172,8 +172,8 @@ defmodule Fathom.Test.StorageContract do
 
         test "a changed object writes fresh bytes and returns the new etag" do
           id = sid("moved")
-          {:ok, etag1} = @backend.flush(id, tmp_file("old"), nil)
-          {:ok, _} = @backend.flush(id, tmp_file("new"), etag1)
+          {:ok, etag1, _} = @backend.flush(id, tmp_file("old"), nil)
+          {:ok, _, _} = @backend.flush(id, tmp_file("new"), etag1)
           dest = dest_path()
 
           assert {:ok, {:written, _new_etag}} = @backend.pull_if_changed(id, dest, etag1)
@@ -280,10 +280,10 @@ defmodule Fathom.Test.StorageContract do
 
         test "retain then restore round-trips a version" do
           id = sid("versioned")
-          {:ok, etag1} = @backend.flush(id, tmp_file("v1"), nil)
+          {:ok, etag1, _} = @backend.flush(id, tmp_file("v1"), nil)
 
           assert :ok = @backend.retain(id, 1)
-          {:ok, _} = @backend.flush(id, tmp_file("v2"), etag1)
+          {:ok, _, _} = @backend.flush(id, tmp_file("v2"), etag1)
           assert stored_body(id) == "v2"
 
           assert :ok = @backend.restore(id, 1)
@@ -292,10 +292,10 @@ defmodule Fathom.Test.StorageContract do
 
         test "snapshot then restore_snapshot round-trips" do
           id = sid("snapshotted")
-          {:ok, etag1} = @backend.flush(id, tmp_file("before"), nil)
+          {:ok, etag1, _} = @backend.flush(id, tmp_file("before"), nil)
           assert :ok = @backend.snapshot(id, "s1")
 
-          {:ok, _} = @backend.flush(id, tmp_file("after"), etag1)
+          {:ok, _, _} = @backend.flush(id, tmp_file("after"), etag1)
           assert :ok = @backend.restore_snapshot(id, "s1")
           assert stored_body(id) == "before"
         end

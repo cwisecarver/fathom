@@ -235,11 +235,11 @@ defmodule Fathom.Shard.DurabilityEdgesTest do
       id = "etag_#{System.unique_integer([:positive])}"
       src = tmp_file("v1-bytes")
 
-      assert {:ok, etag} = Local.flush(id, src, nil)
+      assert {:ok, etag, _} = Local.flush(id, src, nil)
       assert {:ok, ^etag} = Local.object_etag(id), "the fence etag does not describe the object"
 
       # And it is usable as a fence: the next flush with it must succeed.
-      assert {:ok, _} = Local.flush(id, tmp_file("v2-bytes"), etag)
+      assert {:ok, _, _} = Local.flush(id, tmp_file("v2-bytes"), etag)
     end
 
     test "a source mutated after the copy does not change the returned etag" do
@@ -249,11 +249,11 @@ defmodule Fathom.Shard.DurabilityEdgesTest do
       id = "etag_mut_#{System.unique_integer([:positive])}"
       src = tmp_file("original")
 
-      assert {:ok, etag} = Local.flush(id, src, nil)
+      assert {:ok, etag, _} = Local.flush(id, src, nil)
       File.write!(src, "mutated-after-the-copy")
 
       assert {:ok, ^etag} = Local.object_etag(id)
-      assert {:ok, _} = Local.flush(id, tmp_file("next"), etag), "the fence etag went stale"
+      assert {:ok, _, _} = Local.flush(id, tmp_file("next"), etag), "the fence etag went stale"
     end
   end
 

@@ -126,14 +126,14 @@ defmodule Fathom.ShardStorageS3Test do
     File.write!(src, "v1\n")
 
     # Claim lineage 7, then confirm the store really holds it.
-    assert {:ok, etag1} = S3.flush(shard, src, nil, nil, 7)
+    assert {:ok, etag1, _} = S3.flush(shard, src, nil, nil, 7)
     assert {:ok, %{lineage: 7}} = S3.object_head(shard)
 
     # A flush with NOTHING to claim must leave it at 7. Pre-fix this dropped the header and the
     # object came back with lineage nil, so `Storage.next_lineage/1` restarted the counter — and a
     # peer replica stamped higher then outranked the object at the next failover.
     File.write!(src, "v2\n")
-    assert {:ok, etag2} = S3.flush(shard, src, etag1, nil, nil)
+    assert {:ok, etag2, _} = S3.flush(shard, src, etag1, nil, nil)
 
     assert {:ok, %{lineage: 7}} = S3.object_head(shard),
            "a nil-lineage flush ERASED the shard's lineage; the counter has been reset and a " <>
@@ -141,7 +141,7 @@ defmodule Fathom.ShardStorageS3Test do
 
     # …and an integer still overwrites, so preserving is not the same as freezing.
     File.write!(src, "v3\n")
-    assert {:ok, _} = S3.flush(shard, src, etag2, nil, 9)
+    assert {:ok, _, _} = S3.flush(shard, src, etag2, nil, 9)
     assert {:ok, %{lineage: 9}} = S3.object_head(shard)
   end
 
@@ -150,7 +150,7 @@ defmodule Fathom.ShardStorageS3Test do
     File.write!(src, "new\n")
 
     # `If-None-Match: *` — there is no object to inherit metadata from, so `nil` means nil.
-    assert {:ok, _} = S3.flush(shard, src, nil, nil, nil)
+    assert {:ok, _, _} = S3.flush(shard, src, nil, nil, nil)
     assert {:ok, %{lineage: nil}} = S3.object_head(shard)
   end
 
@@ -449,7 +449,7 @@ defmodule Fathom.ShardStorageS3Test do
     File.write!(src, "the tenant's bytes\n")
 
     position = %{epoch: 3, wal_gen: 1, offset: 8272}
-    assert {:ok, etag0} = S3.flush(shard, src, nil, position)
+    assert {:ok, etag0, _} = S3.flush(shard, src, nil, position)
 
     # Precondition: the stamp is really on the object before any steal. Without this the whole
     # test could pass by never having written a stamp at all.

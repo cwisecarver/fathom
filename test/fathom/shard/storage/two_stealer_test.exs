@@ -149,7 +149,7 @@ defmodule Fathom.Shard.Storage.TwoStealerTest do
       Enum.each(tasks, &send(&1.pid, :go))
       results = Task.await_many(tasks, 5_000)
 
-      oks = for {:ok, _etag} <- results, do: :ok
+      oks = for {:ok, _etag, _carried} <- results, do: :ok
       superseded = for {:error, :superseded} <- results, do: :superseded
 
       assert length(oks) == 1,

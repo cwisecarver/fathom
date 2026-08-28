@@ -55,10 +55,10 @@ defmodule Fathom.Shard.Storage.FlushFenceTest do
       local: local
     } do
       File.write!(local, "v1")
-      assert {:ok, e1} = Storage.flush(shard, local, nil)
+      assert {:ok, e1, _} = Storage.flush(shard, local, nil)
 
       File.write!(local, "v2")
-      assert {:ok, e2} = Storage.flush(shard, local, e1)
+      assert {:ok, e2, _} = Storage.flush(shard, local, e1)
       assert e2 != e1
       assert {:ok, ^e2} = Storage.object_etag(shard)
     end
@@ -69,7 +69,7 @@ defmodule Fathom.Shard.Storage.FlushFenceTest do
       dir: dir
     } do
       File.write!(local, "ours")
-      assert {:ok, e1} = Storage.flush(shard, local, nil)
+      assert {:ok, e1, _} = Storage.flush(shard, local, nil)
 
       # A stealer overwrites the object; our next flush still holds the OLD etag.
       File.write!(Path.join(dir, "#{shard}.db"), "stolen")
@@ -133,12 +133,12 @@ defmodule Fathom.Shard.Storage.FlushFenceTest do
     end
 
     test "a known etag issues If-Match", %{tmp: tmp} do
-      assert {:ok, _new} = S3.flush("shard_x", tmp, "\"etag-1\"")
+      assert {:ok, _new, _} = S3.flush("shard_x", tmp, "\"etag-1\"")
       assert_received {:put, ["\"etag-1\""], [], "body"}
     end
 
     test "a nil etag issues If-None-Match:* (create-only)", %{tmp: tmp} do
-      assert {:ok, _new} = S3.flush("shard_x", tmp, nil)
+      assert {:ok, _new, _} = S3.flush("shard_x", tmp, nil)
       assert_received {:put, [], ["*"], "body"}
     end
   end
