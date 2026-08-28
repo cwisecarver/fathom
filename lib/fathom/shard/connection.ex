@@ -631,6 +631,9 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
+  # How often the watchdog re-issues a cancel that has not yet taken effect. See await_disarm/3.
+  @cancel_retry_ms 5
+
   # Run `fun` (the query) in THIS process while a watchdog process interrupts `conn` if the
   # deadline passes — the running `multi_step` is a blocking dirty NIF, so only another process can
   # interrupt it. A completed query disarms the watchdog; a spurious late interrupt on an
@@ -756,16 +759,7 @@ defmodule Fathom.Shard.Connection do
             # never cancelled at all. A spurious late cancel is already a no-op — exqlite resets
             # `cancelled` at the top of every subsequent db op.
             send(parent, {:timed_out, ref})
-            Sqlite3.cancel(conn)
-
-            # Consume the guaranteed late {:done, ref} before the next arm (the interrupt
-            # errors the running step, so the executing after-clause always sends it) —
-            # blocking here is what makes a stale interrupt racing a NEWER statement
-            # structurally impossible, the same guarantee the per-query watchdog had.
-            receive do
-              {:done, ^ref} -> :ok
-              {:DOWN, ^mon, :process, _, _} -> exit(:normal)
-            end
+            await_disarm(conn, ref, mon)
         end
 
         watchdog_loop(conn, mon)
@@ -775,6 +769,43 @@ defmodule Fathom.Shard.Connection do
 
       {:DOWN, ^mon, :process, _, _} ->
         exit(:normal)
+    end
+  end
+
+  # Cancel, then KEEP cancelling until the owner disarms (CI, OTP 29, 2026-08-28).
+  #
+  # A single cancel is LOST whenever the deadline expires before the statement has actually
+  # started running, and the deadline then does not apply at all. Both of its mechanisms fail
+  # for the same reason: `sqlite3_interrupt` issued while no statement is running is a
+  # documented no-op that explicitly does NOT affect statements started after it returns, and
+  # exqlite's own `cancelled` flag — the one the busy handler polls — is reset at the top of
+  # the next db op. So the query then runs unbounded, which is precisely what
+  # `:query_timeout_ms` exists to prevent.
+  #
+  # That gap is not exotic. `Sqlite3.multi_step/3` is a DIRTY NIF, so the owner blocks waiting
+  # for a dirty-CPU scheduler slot when they are all busy — and the count equals the core
+  # count. On a 2-core CI runner mid-suite that wait passed a 60 ms deadline and
+  # `connection_watchdog_test`'s SECOND slow query ran a 200 000 000-row recursive CTE to
+  # completion (`rows: [[200000000]]`, job 98748804302). The protection failed under exactly
+  # the load it is for, and would in production for the same reason.
+  #
+  # Retrying latches it: whenever the statement finally reaches a scheduler, the next cancel
+  # lands on a RUNNING statement and errors it. Overshoot is bounded by @cancel_retry_ms, and
+  # the healthy path pays nothing — an interrupted query's `{:done, ref}` arrives long before
+  # the first retry.
+  #
+  # Still blocking until `{:done, ref}`, so the 2026-07-23 #26 guarantee is intact: the
+  # watchdog cannot process a NEWER `{:arm, …}` while these cancels are in flight. A retry
+  # issued in the sliver between `Sqlite3.reset/1` and `{:done, ref}` is the same no-op class
+  # the single cancel already accepted, not a new hazard.
+  defp await_disarm(conn, ref, mon) do
+    Sqlite3.cancel(conn)
+
+    receive do
+      {:done, ^ref} -> :ok
+      {:DOWN, ^mon, :process, _, _} -> exit(:normal)
+    after
+      @cancel_retry_ms -> await_disarm(conn, ref, mon)
     end
   end
 

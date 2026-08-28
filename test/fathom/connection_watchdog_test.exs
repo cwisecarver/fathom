@@ -182,4 +182,53 @@ defmodule Fathom.ConnectionWatchdogTest do
     assert {:error, :query_timeout} = Connection.query(conn, slow, [])
     assert {:ok, %{rows: [[2]]}} = Connection.query(conn, "SELECT 2", [])
   end
+
+  # The defect the test above went red on (CI, OTP 29 only, job 98748804302): its SECOND slow
+  # query returned `{:ok, %{rows: [[200000000]]}}` — a 200M-iteration recursive CTE that RAN TO
+  # COMPLETION under a 60 ms deadline. The deadline was in force (the fixture asserts it), so the
+  # watchdog fired; the cancel simply did nothing.
+  #
+  # Root cause: a cancel issued while no statement is yet running is lost, in BOTH of its
+  # mechanisms. `sqlite3_interrupt` with nothing running is a documented no-op that does not
+  # affect statements started afterwards, and exqlite's `cancelled` flag is reset at the top of
+  # the next db op. The old watchdog cancelled exactly once and then parked, so the query ran
+  # unbounded. `Sqlite3.multi_step/3` is a DIRTY NIF and there are only as many dirty-CPU
+  # schedulers as cores, so on a loaded 2-core runner the wait for a slot outran the deadline.
+  #
+  # Deterministic where CI was lucky: rather than racing for a scheduler stall, arm the
+  # watchdog by hand and let it fire while the connection is IDLE, which is the same state.
+  test "a deadline that fires before the statement starts still bounds the query", %{conn: conn} do
+    Application.put_env(:fathom, :query_timeout_ms, 60)
+
+    # One guarded query, so the per-connection watchdog exists and is parked in its outer receive.
+    assert {:ok, _} = Connection.query(conn, "SELECT 1", [])
+
+    watchdog = Process.get({Connection, :watchdog, conn})
+
+    assert is_pid(watchdog) and Process.alive?(watchdog),
+           "fixture: no per-connection watchdog is armed, so this test would measure nothing"
+
+    # Arm against a ref we never disarm and let it fire with the connection idle.
+    ref = make_ref()
+    send(watchdog, {:arm, ref, 20, self()})
+    assert_receive {:timed_out, ^ref}, 2_000
+
+    # NOW start a statement. Before the fix the watchdog is parked forever on `{:done, ref}`, so
+    # this query's own `{:arm, …}` is never processed and nothing bounds it — it runs to
+    # completion, exactly as CI observed. After the fix the retried cancel lands on the running
+    # statement and errors it. Reported as a plain error, not `:query_timeout`: the watchdog
+    # never processed this call's arm, so there is no `{:timed_out, ref}` for the peek to find.
+    # What is being pinned is that the WORK is bounded, which is what the knob is for.
+    slow = """
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 20000000)
+    SELECT count(*) FROM c
+    """
+
+    assert {:error, _} = Connection.query(conn, slow, []),
+           "the statement outran its deadline: a cancel issued before it started was lost and " <>
+             "never retried, so :query_timeout_ms did not bound the query at all"
+
+    # Release the hand-armed watchdog so it stops cancelling this connection.
+    send(watchdog, {:done, ref})
+  end
 end
