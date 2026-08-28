@@ -382,7 +382,7 @@ defmodule Fathom.Shard.Replication.Promote do
             err
         end
 
-      {:error, {:held, other}} ->
+      {:error, {:held, other, _stealable_at}} ->
         {:error, {:lease_held, other}}
 
       {:error, reason} ->

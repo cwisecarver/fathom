@@ -43,7 +43,7 @@ defmodule Fathom.SnapshotsSchemaGuardTest do
   # at maximum operator pressure, with :ok already reported.
   #
   # THE PROPERTY IS THE WINDOW, not the refusal. A probe-only implementation ALSO returns
-  # {:error, {:held, _}} when someone already holds the lease, so asserting that discriminates
+  # {:error, {:held, _, _}} when someone already holds the lease, so asserting that discriminates
   # nothing — the first draft of this test did exactly that and passed against the bug. What has
   # to be pinned is that no one can ACQUIRE mid-restore, so this injects a competing acquire into
   # the window itself, through FaultyStorage's `run_before(:object_etag)` hook, which fires
@@ -109,7 +109,7 @@ defmodule Fathom.SnapshotsSchemaGuardTest do
     {:ok, snap} = Snapshots.create(shard)
 
     {:ok, other} = Storage.acquire_lease(shard, "someone-else@node", 30_000)
-    assert {:error, {:held, _}} = Snapshots.restore(shard, snap)
+    assert {:error, {:held, _, _}} = Snapshots.restore(shard, snap)
     :ok = Storage.release_lease(shard, other)
 
     assert :ok = Snapshots.restore(shard, snap)

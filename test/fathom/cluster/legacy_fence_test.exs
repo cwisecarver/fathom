@@ -66,7 +66,7 @@ defmodule Fathom.Cluster.LegacyFenceTest do
       put_heartbeat(@peer, Storage.now_ms() - Storage.steal_margin_ms() - 60_000)
       put_raw_lock(shard, @peer, 4, Storage.now_ms() + 60_000)
 
-      assert {:error, {:held, @peer}} = Storage.acquire_lease(shard, "me@node#1", 30_000),
+      assert {:error, {:held, @peer, _}} = Storage.acquire_lease(shard, "me@node#1", 30_000),
              "a stale heartbeat alone made a lock-renewing owner stealable — one heartbeat " <>
                "hiccup would hand away every shard that node owns"
 
@@ -89,7 +89,7 @@ defmodule Fathom.Cluster.LegacyFenceTest do
       # No heartbeat file is written: this is a node that runs no heartbeat server at all, which
       # is exactly this suite's own configuration.
       put_raw_lock(shard, @peer, 2, Storage.now_ms() + 60_000)
-      assert {:error, {:held, @peer}} = Storage.acquire_lease(shard, "me@node#1", 30_000)
+      assert {:error, {:held, @peer, _}} = Storage.acquire_lease(shard, "me@node#1", 30_000)
 
       put_raw_lock(shard, @peer, 2, Storage.now_ms() - Storage.steal_margin_ms() - 60_000)
       assert {:ok, %{took_over: true}} = Storage.acquire_lease(shard, "me@node#1", 30_000)

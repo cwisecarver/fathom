@@ -85,7 +85,7 @@ defmodule Fathom.Snapshots do
   any node — aborts the restore with `{:error, :superseded}` instead of being
   silently clobbered (expert review 2026-07-18 #2). Returns
   `{:error, {:shard_busy, reason}}` if the local coordinator won't drain, or
-  `{:error, {:held, owner}}` if a live node owns it. `opts[:drain_timeout]`
+  `{:error, {:held, owner, stealable_at_ms | nil}}` if a live node owns it. `opts[:drain_timeout]`
   overrides the drain wait (default #{@drain_timeout}ms).
 
   **Schema-version guard (expert review #7).** A snapshot carries the schema version its bytes were
@@ -178,8 +178,8 @@ defmodule Fathom.Snapshots do
                 Storage.release_lease(id, lease)
               end
 
-            {:error, {:held, owner}} ->
-              {:error, {:held, owner}}
+            {:error, {:held, owner, at}} ->
+              {:error, {:held, owner, at}}
 
             {:error, reason} ->
               {:error, reason}

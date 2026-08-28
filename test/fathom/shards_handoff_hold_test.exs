@@ -103,7 +103,7 @@ defmodule Fathom.ShardsHandoffHoldTest do
       File.rm(lock_file(shard))
     end)
 
-    # Pre-#20 this returned {:error, {:shard_held, _}} immediately. Now it HOLDS + retries and
+    # Pre-#20 this returned {:error, {:shard_held, _, _}} immediately. Now it HOLDS + retries and
     # serves once the lease frees.
     assert {:ok, pid, ref, _path} = Shards.checkout(shard),
            "a pinned handoff target must queue for the drain window, not error"
@@ -123,7 +123,7 @@ defmodule Fathom.ShardsHandoffHoldTest do
 
     {us, result} = :timer.tc(fn -> Shards.checkout(shard) end)
 
-    assert {:error, {:shard_held, "source@node"}} = result
+    assert {:error, {:shard_held, "source@node", _}} = result
     assert us < 2_000_000, "a non-handoff held error must not enter the retry budget (#{us} us)"
   end
 
@@ -138,7 +138,7 @@ defmodule Fathom.ShardsHandoffHoldTest do
 
     {us, result} = :timer.tc(fn -> Shards.checkout(shard) end)
 
-    assert {:error, {:shard_held, "source@node"}} = result
+    assert {:error, {:shard_held, "source@node", _}} = result
     assert us >= 250_000, "the checkout must have held ~the budget before falling back (#{us} us)"
     assert us < 3_000_000, "the hold must be bounded by the budget, not indefinite (#{us} us)"
   end
@@ -256,7 +256,7 @@ defmodule Fathom.ShardsHandoffHoldTest do
 
     {us, result} = :timer.tc(fn -> Shards.checkout(shard) end)
 
-    assert {:error, {:shard_held, "live@node#1"}} = result
+    assert {:error, {:shard_held, "live@node#1", _}} = result
     assert us < 2_000_000, "a live holder must not enter the crash-hold budget (#{us} us)"
   end
 
@@ -297,7 +297,7 @@ defmodule Fathom.ShardsHandoffHoldTest do
 
     {us, result} = :timer.tc(fn -> Shards.checkout(shard) end)
 
-    assert {:error, {:shard_held, "halfdead@node#1"}} = result
+    assert {:error, {:shard_held, "halfdead@node#1", _}} = result
 
     refute_receive {:crash_wait, %{shard_id: ^shard}}, 100
 
@@ -333,6 +333,73 @@ defmodule Fathom.ShardsHandoffHoldTest do
 
     Fathom.Shard.checkin(pid, ref)
     drain_and_wait(shard)
+  end
+
+  # THE PARKED TIER OF #23, now shipped. `acquire_lease` decides `:live` by reading the lock and the
+  # holder's heartbeat — everything `stealable_at` needs — and used to discard the answer, so
+  # `holder_stealable_at/4` paid for a SECOND `lease_stealable_at/1` round trip to rediscover it on
+  # every first held error. The backend now hands the instant back through
+  # `{:error, {:held, owner, at}}` and the read is gone.
+  #
+  # Counted rather than timed: a latency assertion on one avoided round trip against a local file
+  # backend would be noise. `Fathom.Test.FaultyStorage` counts the call in the CALLER's process
+  # dictionary, which is where `held_retry/4` runs, and otherwise delegates to `Local` — so
+  # behaviour is identical and only the observability differs.
+  test "the crash-hold uses the instant the acquire already computed, with no second read",
+       %{shard: shard} do
+    Application.put_env(:fathom, :crash_failover_hold_ms, 5_000)
+    Application.put_env(:fathom, :steal_margin_ms, 100)
+    prev_backend = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    on_exit(fn -> restore(:shard_storage, prev_backend) end)
+
+    seed_durable(shard)
+
+    test_pid = self()
+    handler = "noreread-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shards, :crash_wait],
+      fn _e, _m, meta, _ -> send(test_pid, {:crash_wait, meta}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    Process.put(:faulty_stealable_at_reads, 0)
+
+    put_foreign_lock(shard, "dead@node#3", 200)
+    Storage.renew_heartbeat("dead@node#3", 200)
+
+    assert {:ok, pid, ref, _path} = Shards.checkout(shard)
+
+    # PRECONDITION: the hold path actually ran. Without it a checkout that never reached
+    # `holder_stealable_at/4` at all would satisfy the read count for the wrong reason.
+    assert_received {:crash_wait, %{shard_id: ^shard}},
+                    "the crash-hold never fired, so the read count below proves nothing"
+
+    assert Process.get(:faulty_stealable_at_reads) == 0,
+           "holder_stealable_at/4 re-read lease_stealable_at even though acquire_lease handed " <>
+             "back the instant — the round trip #23 removes is back"
+
+    Fathom.Shard.checkin(pid, ref)
+    drain_and_wait(shard)
+  end
+
+  # The other half of the same dispatch: two paths cannot compute an instant (S3's lost-create-race
+  # `:exists`, where the winner's lock has not been read, and a `put_lock` held error), and there
+  # the re-read is the honest answer rather than a fabricated deadline. Structural, because
+  # producing an S3 lost-create-race against the Local backend is not something a unit test can do.
+  test "a held error with no instant still falls back to asking the backend" do
+    source = File.read!("lib/fathom/shards.ex")
+
+    assert source =~ "defp holder_stealable_at(_shard_id, _owner, budget, at) when is_integer(at)",
+           "the integer clause is gone; the instant the acquire supplies is being ignored again"
+
+    assert source =~ "defp holder_stealable_at(shard_id, owner, budget, _nil) do",
+           "the nil fallback is gone. Two backend paths cannot state an instant, and without " <>
+             "this clause they would silently lose the crash-failover hold entirely."
   end
 
   defp local_dir, do: Fathom.Shard.data_dir()

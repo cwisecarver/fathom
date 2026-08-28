@@ -102,7 +102,7 @@ defmodule Fathom.Shard.Storage.HeartbeatLeaseTest do
     assert {:ok, %{owner: ^a, epoch: 1}} = Local.acquire_lease(shard, a, @ttl)
 
     # b cannot steal — a's heartbeat is fresh, regardless of the lock's own TTL.
-    assert {:error, {:held, ^a}} = Local.acquire_lease(shard, b, @ttl)
+    assert {:error, {:held, ^a, _}} = Local.acquire_lease(shard, b, @ttl)
   end
 
   test "an owner with no heartbeat AND an expired lock TTL is stealable (epoch bumps)",
@@ -130,7 +130,7 @@ defmodule Fathom.Shard.Storage.HeartbeatLeaseTest do
     # No heartbeat object for a exists.
     assert Local.read_heartbeat(a) == :not_found
 
-    assert {:error, {:held, ^a}} = Local.acquire_lease(shard, b, @ttl)
+    assert {:error, {:held, ^a, _}} = Local.acquire_lease(shard, b, @ttl)
     # No steal happened — a still holds {a, epoch 1}.
     assert Local.check_lease(shard, %{owner: a, epoch: 1}) == :ok
   end
@@ -167,7 +167,7 @@ defmodule Fathom.Shard.Storage.HeartbeatLeaseTest do
       write_heartbeat(dir, a, past)
       write_lock(dir, shard, a, 3, System.system_time(:millisecond) + @ttl)
 
-      assert {:error, {:held, ^a}} = Local.acquire_lease(shard, b, @ttl),
+      assert {:error, {:held, ^a, _}} = Local.acquire_lease(shard, b, @ttl),
              "a stale heartbeat alone made a lock-renewing owner stealable — one process crash " <>
                "would hand away that node's entire keyspace slice while it kept serving"
 
@@ -188,7 +188,7 @@ defmodule Fathom.Shard.Storage.HeartbeatLeaseTest do
       write_lock(dir, shard, a, 1, fresh)
 
       assert Local.read_heartbeat(a) == :not_found
-      assert {:error, {:held, ^a}} = Local.acquire_lease(shard, b, @ttl)
+      assert {:error, {:held, ^a, _}} = Local.acquire_lease(shard, b, @ttl)
 
       write_heartbeat(
         dir,
@@ -196,7 +196,7 @@ defmodule Fathom.Shard.Storage.HeartbeatLeaseTest do
         System.system_time(:millisecond) - Storage.steal_margin_ms() - 1_000
       )
 
-      assert {:error, {:held, ^a}} = Local.acquire_lease(shard, b, @ttl),
+      assert {:error, {:held, ^a, _}} = Local.acquire_lease(shard, b, @ttl),
              "adding a stale heartbeat made a protected owner stealable"
     end
   end
@@ -210,7 +210,7 @@ defmodule Fathom.Shard.Storage.HeartbeatLeaseTest do
     recent = System.system_time(:millisecond) - div(Storage.steal_margin_ms(), 2)
     write_heartbeat(dir, a, recent)
 
-    assert {:error, {:held, ^a}} = Local.acquire_lease(shard, b, @ttl)
+    assert {:error, {:held, ^a, _}} = Local.acquire_lease(shard, b, @ttl)
   end
 
   # Expert review #6: owner identity was the bare node name, so a NEW incarnation of
@@ -230,7 +230,7 @@ defmodule Fathom.Shard.Storage.HeartbeatLeaseTest do
     write_lock(dir, shard, inc1, 3, System.system_time(:millisecond) + @ttl)
 
     # The new boot is a foreign owner — the live zombie's lock is NOT reclaimable.
-    assert {:error, {:held, ^inc1}} = Local.acquire_lease(shard, inc2, @ttl)
+    assert {:error, {:held, ^inc1, _}} = Local.acquire_lease(shard, inc2, @ttl)
 
     # The zombie dies — BOTH its heartbeat and its lock TTL lapse (#12; this previously staled
     # only the heartbeat, pinning the pre-#12 Local behaviour). The point of this test is the

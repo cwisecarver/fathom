@@ -99,7 +99,7 @@ defmodule Fathom.Shard.Storage.TwoStealerTest do
       results = Task.await_many(tasks, 5_000)
 
       winners = for {:ok, lease} <- results, do: lease
-      held = for {:error, {:held, holder}} <- results, do: holder
+      held = for {:error, {:held, holder, _}} <- results, do: holder
 
       assert length(winners) == 1,
              "round #{round}: exactly one stealer must win, got #{inspect(results)}\n" <>

@@ -879,7 +879,7 @@ defmodule Fathom.Migrator do
   Drains the template's coordinator first so its stored object is flushed +
   current (`{:error, :busy}` if it won't drain — e.g. a `manage.py migrate` session
   is still open; retry once it finishes), then refuses if a LIVE node still holds
-  the template's lease (`{:error, {:held, owner}}` — the cross-node guard, same as
+  the template's lease (`{:error, {:held, owner, _}}` — the cross-node guard, same as
   `Fathom.Snapshots.restore/3`), then copies the template's live stored object to
   `<template>@<HEAD>` via the existing `Storage.retain/2`. Never snapshots a
   half-migrated template: an active migrate session holds a connection, so the
@@ -898,7 +898,10 @@ defmodule Fathom.Migrator do
             :ok ->
               case Fathom.Shard.Storage.lease_holder(template) do
                 :free -> retain_snapshot(template, head)
-                {:held, owner} -> {:error, {:held, owner}}
+                # `lease_holder/1`'s probe is the 2-tuple and stays one — it answers WHO, not
+                # WHEN. The error it becomes carries the third slot as `nil` because no steal
+                # instant was computed here (expert review 2026-08-26 #23).
+                {:held, owner} -> {:error, {:held, owner, nil}}
                 {:error, reason} -> {:error, reason}
               end
 

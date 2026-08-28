@@ -96,7 +96,7 @@ defmodule Fathom.ShardLeaseTest do
     assert {:ok, %{owner: "a@node", epoch: 1}} = Storage.acquire_lease(shard, "a@node", 60_000)
     # a is alive: its heartbeat is fresh, so b cannot steal.
     put_raw_heartbeat("a@node", now_ms() + 60_000)
-    assert {:error, {:held, "a@node"}} = Storage.acquire_lease(shard, "b@node", 60_000)
+    assert {:error, {:held, "a@node", _}} = Storage.acquire_lease(shard, "b@node", 60_000)
   end
 
   test "an expired lease is stolen and the epoch bumps", %{shard: shard} do
@@ -144,7 +144,7 @@ defmodule Fathom.ShardLeaseTest do
     put_raw_heartbeat("thief@node", now_ms() + 60_000)
 
     capture_log(fn ->
-      assert {:error, {:shard_held, "thief@node"}} = Shards.checkout(shard)
+      assert {:error, {:shard_held, "thief@node", _}} = Shards.checkout(shard)
     end)
   end
 
@@ -159,7 +159,7 @@ defmodule Fathom.ShardLeaseTest do
     put_raw_heartbeat("thief@node", now_ms() + 60_000)
 
     capture_log(fn ->
-      assert {:error, {:shard_held, "thief@node"}} = Shards.checkout(shard)
+      assert {:error, {:shard_held, "thief@node", _}} = Shards.checkout(shard)
     end)
 
     refute File.exists?(local_db(shard)), "refused start must leave no promoted local copy"

@@ -369,7 +369,7 @@ defmodule Fathom.Migrator.ShardMigration do
           Storage.release_lease(shard_id, lease)
         end
 
-      {:error, {:held, holder}} ->
+      {:error, {:held, holder, _stealable_at}} ->
         {:retry, {:held, holder}}
 
       {:error, reason} ->

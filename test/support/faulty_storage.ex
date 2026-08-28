@@ -396,7 +396,16 @@ defmodule Fathom.Test.FaultyStorage do
   @impl true
   def lease_holder(shard_id), do: Local.lease_holder(shard_id)
   @impl true
-  def lease_stealable_at(shard_id), do: Local.lease_stealable_at(shard_id)
+  # COUNTED, so a test can prove the round trip is not made (expert review 2026-08-26 #23). The
+  # acquire error now carries the steal instant, and `Shards.holder_stealable_at/4` uses it instead
+  # of asking again — a claim that is only checkable if the ask is observable. Counted in the
+  # CALLER's process dictionary, which is where `held_retry/4` runs, matching the
+  # `:faulty_storage_head_reads` counter above.
+  def lease_stealable_at(shard_id) do
+    Process.put(:faulty_stealable_at_reads, (Process.get(:faulty_stealable_at_reads) || 0) + 1)
+    Local.lease_stealable_at(shard_id)
+  end
+
   @impl true
   def renew_heartbeat(owner, ttl_ms), do: Local.renew_heartbeat(owner, ttl_ms)
   @impl true

@@ -484,11 +484,14 @@ defmodule Fathom.Shard do
 
       # `{:shutdown, _}` (not a bare reason) so the `:transient` child is NOT
       # restarted — a held shard must stay down, not restart-loop.
-      {:error, {:held, holder}} ->
+      # THE STEAL INSTANT RIDES ALONG (expert review 2026-08-26 #23). `Shards.held_retry/4` is the
+      # only consumer that uses it, and it is three frames up — so the backend's answer has to
+      # travel through this stop reason or be re-read with another round trip.
+      {:error, {:held, holder, stealable_at}} ->
         emit_lease(:held, shard_id, %{holder: holder})
         abandon_fork_check(fork_task)
         abandon_pull(pull_task, path)
-        {:stop, {:shutdown, {:shard_held, holder}}, state}
+        {:stop, {:shutdown, {:shard_held, holder, stealable_at}}, state}
 
       # Fail closed: without a confirmed lease we must not open the shard.
       {:error, reason} ->

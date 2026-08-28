@@ -5,7 +5,7 @@ defmodule Fathom.ShardLeaseReleaseTest do
   `chaos.sh rollout` on 2026-08-04 — `docs/reviews/fleet-rollout-2026-08-04.md`).
 
   A leaked `.lock` names this node, and while this node's `Heartbeat` is running `owner_live?`
-  reports `:live` forever — so every peer gets `{:error, {:held, us}}` indefinitely. The shard
+  reports `:live` forever — so every peer gets `{:error, {:held, us, _}}` indefinitely. The shard
   is unopenable by any survivor and waiting does not fix it. The rebalancer handoff breaks the
   same way: its drain lands on this path, so the target the LB was already flipped to is
   refused.

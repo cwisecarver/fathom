@@ -1041,7 +1041,7 @@ defmodule Fathom.ShardExecutor do
   #
   # The owner is deliberately NOT in the message: it named the holding node, leaking internal
   # topology to a tenant.
-  defp open_error({:shard_held, _owner}),
+  defp open_error({:shard_held, _owner, _stealable_at}),
     do: %Error{
       message: "shard temporarily owned by another node; retry",
       code: "FILO_SHARD_HELD",

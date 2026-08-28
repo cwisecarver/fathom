@@ -29,7 +29,7 @@ defmodule Fathom.Shard.Storage do
   and never flushes over a newer owner.
 
   The lease is a `t:lease/0` (`owner`, `epoch`, `expires_at_ms`). `acquire_lease/3`
-  returns `{:error, {:held, owner}}` when another owner holds a live lease;
+  returns `{:error, {:held, owner, stealable_at_ms | nil}}` when another owner holds a live lease;
   `renew_lease/3` returns `{:error, :superseded}` once the lease has been taken
   over. Backends MUST enforce mutual exclusion with a conditional/atomic write
   (the `Local` backend uses an `O_EXCL` lock file; `S3` uses conditional PUTs) and
@@ -286,7 +286,9 @@ defmodule Fathom.Shard.Storage do
               | {:error, term()}
 
   @callback acquire_lease(shard_id :: String.t(), owner :: String.t(), ttl_ms :: pos_integer()) ::
-              {:ok, lease()} | {:error, {:held, String.t()}} | {:error, term()}
+              {:ok, lease()}
+              | {:error, {:held, String.t() | :unknown, integer() | nil}}
+              | {:error, term()}
   @callback renew_lease(shard_id :: String.t(), lease :: lease(), ttl_ms :: pos_integer()) ::
               {:ok, lease()} | {:error, :superseded} | {:error, term()}
   @callback release_lease(shard_id :: String.t(), lease :: lease()) :: :ok | {:error, term()}
@@ -692,12 +694,14 @@ defmodule Fathom.Shard.Storage do
 
   @doc """
   Acquires `shard_id`'s lease for `owner` with a `ttl_ms` window. Returns
-  `{:error, {:held, owner}}` if another owner holds a live lease, or
+  `{:error, {:held, owner, stealable_at_ms | nil}}` if another owner holds a live lease, or
   `{:error, reason}` on a transient store error (the caller must NOT proceed —
   see the module doc on failing closed).
   """
   @spec acquire_lease(String.t(), String.t(), pos_integer()) ::
-          {:ok, lease()} | {:error, {:held, String.t()}} | {:error, term()}
+          {:ok, lease()}
+          | {:error, {:held, String.t() | :unknown, integer() | nil}}
+          | {:error, term()}
   def acquire_lease(shard_id, owner, ttl_ms),
     do: backend().acquire_lease(shard_id, owner, ttl_ms)
 

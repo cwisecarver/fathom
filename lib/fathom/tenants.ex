@@ -150,7 +150,7 @@ defmodule Fathom.Tenants do
             end
 
           # Another node/coordinator holds the dst lease — refuse rather than clobber it.
-          {:error, {:held, _holder}} ->
+          {:error, {:held, _holder, _stealable_at}} ->
             {:error, :dst_busy}
 
           {:error, reason} ->

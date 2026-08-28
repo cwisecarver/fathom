@@ -608,7 +608,12 @@ defmodule Fathom.Shard.Storage.Local do
       {:ok, %{owner: other, epoch: epoch, expires_at_ms: lock_exp}} ->
         case owner_live?(shard_id, other, now, lock_exp) do
           :live ->
-            {:error, {:held, other}}
+            # CARRIES THE STEAL INSTANT (expert review 2026-08-26 #23). `owner_live?/4` and
+            # `stealable_at/3` are the same rule read two ways, and this branch has just paid for
+            # the reads both need — so handing the instant back saves `Shards.held_retry/4` a whole
+            # `lease_stealable_at/1` round trip on the first held error. `nil` when it cannot be
+            # computed, which the caller already treats as "poll instead of aim".
+            {:error, {:held, other, steal_instant(shard_id, other, lock_exp)}}
 
           :dead ->
             # took_over: the caller revalidates its speculative pull (expert review
@@ -730,6 +735,16 @@ defmodule Fathom.Shard.Storage.Local do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  # The steal instant, or `nil` when it cannot be computed. Shares `stealable_at/3` with
+  # `lease_stealable_at/1`, so the instant an acquire hands back and the instant a later probe
+  # would read are the same number rather than two derivations that can drift.
+  defp steal_instant(shard_id, other, lock_exp) do
+    case stealable_at(shard_id, other, lock_exp) do
+      {:ok, at} -> at
+      _ -> nil
     end
   end
 
@@ -922,8 +937,11 @@ defmodule Fathom.Shard.Storage.Local do
       # Lost the create race — whoever won holds it.
       {:error, :eexist} ->
         case read_lock(shard_id) do
-          {:ok, %{owner: owner}} -> {:error, {:held, owner}}
-          _ -> {:error, :lock_race}
+          {:ok, %{owner: owner, expires_at_ms: lock_exp}} ->
+            {:error, {:held, owner, steal_instant(shard_id, owner, lock_exp)}}
+
+          _ ->
+            {:error, :lock_race}
         end
 
       {:error, reason} ->

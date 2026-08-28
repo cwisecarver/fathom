@@ -202,7 +202,7 @@ defmodule Fathom.Test.StorageContract do
           id = sid("contended")
           {:ok, _} = @backend.acquire_lease(id, "a@node#1", 30_000)
 
-          assert {:error, {:held, "a@node#1"}} = @backend.acquire_lease(id, "b@node#2", 30_000)
+          assert {:error, {:held, "a@node#1", _}} = @backend.acquire_lease(id, "b@node#2", 30_000)
         end
 
         test "lease_stealable_at agrees with lease_holder, in both directions" do

@@ -1657,6 +1657,18 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  # The steal instant on the CALLER's clock, or `nil` when it cannot be computed. Shares
+  # `stealable_at/4` with `lease_stealable_at/1` — and the clock normalisation with it — so the
+  # instant an acquire hands back and the instant a later probe would read are the same number.
+  # See #13 for why the raw value cannot be returned: it is on S3's Date clock when the store
+  # sends one, and diffing that against `System.system_time/1` bakes the skew into the answer.
+  defp steal_instant(shard_id, other, now, lock_exp) do
+    case stealable_at(shard_id, other, now, lock_exp) do
+      {:ok, at, ref_now} -> at + (now - ref_now)
+      _ -> nil
+    end
+  end
+
   @impl true
   def lease_stealable_at(shard_id) do
     now = Storage.now_ms()
@@ -1713,7 +1725,12 @@ defmodule Fathom.Shard.Storage.S3 do
       {:ok, %{owner: other, epoch: epoch, expires_at_ms: lock_exp}, etag} ->
         case owner_live?(shard_id, other, now, lock_exp) do
           :live ->
-            {:error, {:held, other}}
+            # CARRIES THE STEAL INSTANT (expert review 2026-08-26 #23). `owner_live?/4` and
+            # `stealable_at/4` are the same rule read two ways, and this branch has just paid for
+            # the reads both need — so handing the instant back saves `Shards.held_retry/4` a
+            # whole `lease_stealable_at/1` round trip on the first held error. `nil` when it
+            # cannot be computed, which the caller already treats as "poll instead of aim".
+            {:error, {:held, other, steal_instant(shard_id, other, now, lock_exp)}}
 
           :dead ->
             stolen = %{owner: owner, epoch: epoch + 1, expires_at_ms: now + ttl_ms}
@@ -1794,7 +1811,10 @@ defmodule Fathom.Shard.Storage.S3 do
         case create_lock(shard_id, %{owner: owner, epoch: 1, expires_at_ms: now + ttl_ms}) do
           {:ok, _lease} = ok -> ok
           # Someone else created it in the gap — they hold it now.
-          :exists -> {:error, {:held, :unknown}}
+          # Neither owner nor instant is known here: the winner's lock was written in the gap and
+          # has not been read. `nil` is "no instant", which routes the caller to its ordinary
+          # backoff rather than to a fabricated deadline.
+          :exists -> {:error, {:held, :unknown, nil}}
           {:error, _reason} = error -> error
         end
 
@@ -1958,8 +1978,8 @@ defmodule Fathom.Shard.Storage.S3 do
           {:ok, _} = ok -> ok
           # The re-read lock names OUR OWN owner string — `owner` carries this node's boot
           # incarnation, so this cannot be another node. Confirm the epoch and retry.
-          {:error, {:held, ^owner}} -> renew_after_own_write(shard_id, renewed, owner, epoch)
-          {:error, {:held, _}} -> {:error, :superseded}
+          {:error, {:held, ^owner, _at}} -> renew_after_own_write(shard_id, renewed, owner, epoch)
+          {:error, {:held, _, _at}} -> {:error, :superseded}
           {:error, :precondition_failed} -> {:error, :superseded}
           err -> err
         end
@@ -1971,7 +1991,7 @@ defmodule Fathom.Shard.Storage.S3 do
           {:ok, %{owner: ^owner, epoch: ^epoch}, etag} ->
             case put_lock(shard_id, renewed, if_match: etag) do
               {:ok, _} = ok -> ok
-              {:error, {:held, _}} -> {:error, :superseded}
+              {:error, {:held, _, _at}} -> {:error, :superseded}
               {:error, :precondition_failed} -> {:error, :superseded}
               err -> err
             end
@@ -2271,7 +2291,7 @@ defmodule Fathom.Shard.Storage.S3 do
       # Another node wrote between our read and our conditional write.
       {:ok, %{status: 412}} ->
         case get_lock(shard_id) do
-          {:ok, %{owner: owner}, _etag} -> {:error, {:held, owner}}
+          {:ok, %{owner: owner}, _etag} -> {:error, {:held, owner, nil}}
           _ -> {:error, :precondition_failed}
         end
 

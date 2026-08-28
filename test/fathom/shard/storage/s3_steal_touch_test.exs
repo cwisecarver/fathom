@@ -186,7 +186,7 @@ defmodule Fathom.Shard.Storage.S3StealTouchTest do
     # S3 clock the heartbeat is still fresh — the owner is live and must not be stolen.
     S3EtagStore.set_date_ms(store, now - 20_000)
 
-    assert {:error, {:held, ^owner}} = S3.acquire_lease(@shard, "new@node#inc2", 30_000),
+    assert {:error, {:held, ^owner, _}} = S3.acquire_lease(@shard, "new@node#inc2", 30_000),
            "a forward reader-clock step must not steal a live owner (pre-#13: wrongful steal)"
   end
 

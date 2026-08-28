@@ -286,7 +286,7 @@ defmodule FathomWeb.Api.TenantController do
       {:error, {:shard_busy, _}} ->
         error(conn, :conflict, "shard is busy (active connections) — quiesce it and retry")
 
-      {:error, {:held, owner}} ->
+      {:error, {:held, owner, _stealable_at}} ->
         error(
           conn,
           :conflict,

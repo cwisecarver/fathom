@@ -320,7 +320,7 @@ defmodule Fathom.ShardStorageS3Test do
   test "acquire on a fresh shard returns epoch 1; a live lease blocks other owners",
        %{shard: shard} do
     assert {:ok, %{owner: "a@node", epoch: 1}} = S3.acquire_lease(shard, "a@node", 60_000)
-    assert {:error, {:held, "a@node"}} = S3.acquire_lease(shard, "b@node", 60_000)
+    assert {:error, {:held, "a@node", _}} = S3.acquire_lease(shard, "b@node", 60_000)
   end
 
   test "renew extends the holder's lease but is superseded after a steal",
@@ -368,7 +368,7 @@ defmodule Fathom.ShardStorageS3Test do
     # ... but its lock is fresh, because legacy mode renews per-shard.
     put_raw_lock(ctx, shard, "a@node", 3, now_ms() + 60_000)
 
-    assert {:error, {:held, "a@node"}} = S3.acquire_lease(shard, "b@node", 60_000),
+    assert {:error, {:held, "a@node", _}} = S3.acquire_lease(shard, "b@node", 60_000),
            "a healthy node that is still renewing its locks was stolen from"
   end
 

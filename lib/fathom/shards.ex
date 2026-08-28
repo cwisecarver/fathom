@@ -127,7 +127,7 @@ defmodule Fathom.Shards do
       # hold and retry the acquire with backoff up to a bounded budget (~the drain window) so the
       # first post-flip requests QUEUE instead of erroring. Anything else (foreign lease, no pin,
       # budget exhausted) falls back to the current error.
-      {:error, {:shard_held, _}} = err ->
+      {:error, {:shard_held, _, _}} = err ->
         held_retry(shard_id, attempts, held, err)
 
       # Race: `ensure` resolved a coordinator that lost a race with its own lifecycle, so a
@@ -152,7 +152,7 @@ defmodule Fathom.Shards do
   # On the FIRST held error we decide once whether this is our in-flight handoff (one Overrides
   # read); if so we open a time-bounded retry window and carry the deadline so we don't re-query
   # Postgres per retry. A reverted handoff just exhausts the (bounded) budget and then errors.
-  defp held_retry(shard_id, attempts, nil, {:error, {:shard_held, owner}} = err) do
+  defp held_retry(shard_id, attempts, nil, {:error, {:shard_held, owner, from_acquire}} = err) do
     cond do
       # #20 — an in-flight handoff to THIS node: hold for the source's drain window. No steal
       # instant to aim at — the source releases when its drain finishes, which is not a clock
@@ -165,7 +165,7 @@ defmodule Fathom.Shards do
       # 503. A LIVE holder keeps renewing (its expiry stays ~ttl ahead > budget), so this never
       # holds for one.
       crash_failover_hold_ms() > 0 ->
-        case holder_stealable_at(shard_id, owner, crash_failover_hold_ms()) do
+        case holder_stealable_at(shard_id, owner, crash_failover_hold_ms(), from_acquire) do
           {:ok, at} ->
             start_held_retry(shard_id, attempts, crash_failover_hold_ms(), :crash_wait, err, at)
 
@@ -215,7 +215,19 @@ defmodule Fathom.Shards do
   # by polling — 50, 100, 200, 400, 800, 1 000, 1 000, 1 000 ms, roughly eight retries inside the
   # 5 s budget, each of which re-enters `do_checkout/3` and re-pays a create_lock PUT plus a
   # get_lock GET. Sleeping TO the known instant makes it one or two.
-  defp holder_stealable_at(shard_id, owner, budget) do
+  # USES THE INSTANT THE ACQUIRE ALREADY COMPUTED when there is one (expert review 2026-08-26 #23,
+  # the tier parked in the first pass). `acquire_lease` decided `:live` by reading the lock and the
+  # holder's heartbeat — everything `stealable_at` needs — and used to throw the answer away, so
+  # this function paid for a second `get_lock` GET to rediscover it on every first held error. The
+  # backend now hands it back through the error, and the round trip is gone.
+  #
+  # `nil` still falls back to asking. Two backends' paths cannot compute an instant — S3's
+  # lost-create-race (`:exists`, where the winner's lock has not been read) and a `put_lock` held
+  # error — and a re-read is the honest answer there rather than a fabricated deadline.
+  defp holder_stealable_at(_shard_id, _owner, budget, at) when is_integer(at),
+    do: if(at - System.system_time(:millisecond) <= budget, do: {:ok, at}, else: :no)
+
+  defp holder_stealable_at(shard_id, owner, budget, _nil) do
     case Fathom.Shard.Storage.lease_stealable_at(shard_id) do
       {:held, ^owner, at} ->
         if at - System.system_time(:millisecond) <= budget, do: {:ok, at}, else: :no
@@ -311,7 +323,7 @@ defmodule Fathom.Shards do
   def retry_checkout?(reason), do: reason in [:unavailable, :normal]
 
   defp checkout_outcome({:ok, _, _, _}), do: :ok
-  defp checkout_outcome({:error, {:shard_held, _}}), do: :held
+  defp checkout_outcome({:error, {:shard_held, _, _}}), do: :held
   defp checkout_outcome({:error, :unavailable}), do: :unavailable
   defp checkout_outcome({:error, :node_at_capacity}), do: :at_capacity
   defp checkout_outcome({:error, :novel_shard_rate_limited}), do: :novel_rate_limited

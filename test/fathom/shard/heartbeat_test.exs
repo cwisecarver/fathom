@@ -299,7 +299,7 @@ defmodule Fathom.Shard.HeartbeatTest do
     # #34's win is REDUCED, not removed, and that trade was made explicitly: the wait goes from
     # `ttl + margin` (~40 s at defaults) to `ttl/2` (~15 s), and it is paid ONCE PER INCARNATION
     # rather than once per shard — so a node holding a thousand shards pays it once.
-    assert {:error, {:held, ^prev_owner}} =
+    assert {:error, {:held, ^prev_owner, _}} =
              Storage.acquire_lease("sh34", "contender@node", 30_000),
            "the first attempt must NOT fast-steal: one observation of a lock proves nothing " <>
              "about whether anyone is renewing it"

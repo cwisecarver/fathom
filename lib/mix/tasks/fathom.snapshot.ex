@@ -66,7 +66,7 @@ defmodule Mix.Tasks.Fathom.Snapshot do
           :ok ->
             Mix.shell().info("restored #{shard} to snapshot #{id}")
 
-          {:error, {:held, owner}} ->
+          {:error, {:held, owner, _stealable_at}} ->
             Mix.raise(
               "refused: #{shard} is served by a live node (#{owner}); quiesce it, or run " <>
                 "from that node's console: Fathom.Snapshots.restore(\"#{shard}\", \"#{id}\")"
@@ -108,7 +108,7 @@ defmodule Mix.Tasks.Fathom.Snapshot do
                 "once it finishes"
             )
 
-          {:error, {:held, owner}} ->
+          {:error, {:held, owner, _stealable_at}} ->
             Mix.raise("refused: the template is served by a live node (#{owner}); quiesce it")
 
           {:error, reason} ->
