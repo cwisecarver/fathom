@@ -113,6 +113,37 @@ defmodule Fathom.Shard.Replication.Protocol do
   # the one event that both rebuilds the pair and clears `torn`.
   @seed_begin_lin 14
 
+  # THE MONOTONE WAL ORDINAL (expert review 2026-08-26 #2, Critical). `Push` gains a trailing
+  # `wal_ordinal`, so a follower can record WHICH WAL its frames came from on a scale that
+  # ORDERS — `wal_gen` is SQLite's `ckpt_seq` and restarts at 0 every time SQLite recreates the
+  # `-wal`, which is after every Hrana stream on a quiet shard.
+  #
+  # `salt1` (v2, above) already lets the follower SEE a WAL change; it does not say which WAL is
+  # newer. That is the whole gap: `Promote.fresher?/2` compares `{lineage, wal_gen, offset}`
+  # lexicographically, so a replica holding a recreated WAL at gen 0 loses to an object stamped
+  # gen G+1, `Recovery.choose/3` returns `:none`, and the survivor cold-opens the stale object with
+  # the acked tail gone. Silently, and indistinguishably from A2 being off.
+  #
+  # A NEW TYPE CODE at `@version 2`, for the fourth time and for the reason the three blocks above
+  # give: bumping the version makes `decode/1` refuse EVERY frame from a node one deploy behind.
+  #
+  # IT NEEDS ITS OWN GATE, and this is the one thing it does NOT share with `@seed_begin_lin`.
+  # `lineage_wire?/0` defaults to TRUE, so emitting under it would start sending a code that every
+  # currently-deployed peer answers `{:error, :malformed}` to — the exact fleet-wide break the gate
+  # pattern exists to avoid. `ordinal_wire?/0` defaults to FALSE and follows `FrameAuth.signing?/0`
+  # instead: opt-in, turned on once the code is everywhere.
+  #
+  # UNLIKE THE LINEAGE, THIS CANNOT RIDE THE SEED ALONE. `@seed_begin_lin`'s comment explains that
+  # a push carrying a stale LINEAGE always routes through `FollowerLog.decide_fresh/2`, which sets
+  # `torn: true`, and a torn replica is refused everywhere — so the seed was enough. The ordinal
+  # changes WITHIN a lineage, on every WAL recreate, and that recreate ships as a `{:reset, 0, Y}`
+  # on a live session with no re-seed. A push is exactly where it changes.
+  #
+  # Layout is `@push_ext` plus a trailing 64-bit ordinal, so everything before it is byte-identical
+  # to the frame it extends — additive, not a layout change, the same property that made the three
+  # earlier codes safe.
+  @push_ord 15
+
   # Which file a chunk belongs to. Explicit rather than splitting one byte stream at `db_size`,
   # so a chunk never straddles the boundary and the follower can assert it received exactly the
   # promised number of database bytes before the first WAL byte.
@@ -178,7 +209,20 @@ defmodule Fathom.Shard.Replication.Protocol do
   defmodule Push do
     @moduledoc "A primary's frame delta for one shard."
     @enforce_keys [:shard_id, :epoch, :wal_gen, :salt1, :offset, :payload]
-    defstruct [:shard_id, :epoch, :wal_gen, :salt1, :offset, :payload, prev_extent: 0]
+    # `wal_ordinal` is the monotone per-lineage WAL counter (expert review 2026-08-26 #2). `nil`
+    # means "not stated" — a primary that predates the field, or one whose ordinal gate is off —
+    # and it encodes as 0, which `Promote.fresher?/2` must refuse to rank rather than read as a
+    # zeroth generation.
+    defstruct [
+      :shard_id,
+      :epoch,
+      :wal_gen,
+      :salt1,
+      :offset,
+      :payload,
+      :wal_ordinal,
+      prev_extent: 0
+    ]
 
     @type t :: %__MODULE__{
             shard_id: String.t(),
@@ -187,7 +231,8 @@ defmodule Fathom.Shard.Replication.Protocol do
             salt1: non_neg_integer(),
             offset: non_neg_integer(),
             payload: binary(),
-            prev_extent: non_neg_integer()
+            prev_extent: non_neg_integer(),
+            wal_ordinal: non_neg_integer() | nil
           }
   end
 
@@ -206,22 +251,44 @@ defmodule Fathom.Shard.Replication.Protocol do
     # The two shapes are chosen by the SIGNING gate, not by whether `prev_extent` happens to be
     # set, so that "what this node emits" is one operator-visible decision rather than a per-frame
     # property nobody can predict. #11a and #3 ride together for that reason.
-    if FrameAuth.signing?() do
-      seal([
-        <<@version::8, @push_ext::8, byte_size(shard)::16, p.epoch::64, p.wal_gen::64,
-          p.salt1::64, p.offset::64, prev_extent(p)::64>>,
-        shard,
-        p.payload
-      ])
-    else
-      [
-        <<@version::8, @push::8, byte_size(shard)::16, p.epoch::64, p.wal_gen::64, p.salt1::64,
-          p.offset::64>>,
-        shard,
-        p.payload
-      ]
+    cond do
+      # The ordinal frame supersedes both shapes below when its gate is on, and is sealed only if
+      # signing is also on — the two gates are independent because they guard different things (a
+      # rolling-upgrade window versus a distributed key).
+      ordinal_wire?() ->
+        frame = [
+          <<@version::8, @push_ord::8, byte_size(shard)::16, p.epoch::64, p.wal_gen::64,
+            p.salt1::64, p.offset::64, prev_extent(p)::64, wal_ordinal(p)::64>>,
+          shard,
+          p.payload
+        ]
+
+        if FrameAuth.signing?(), do: seal(frame), else: frame
+
+      FrameAuth.signing?() ->
+        seal([
+          <<@version::8, @push_ext::8, byte_size(shard)::16, p.epoch::64, p.wal_gen::64,
+            p.salt1::64, p.offset::64, prev_extent(p)::64>>,
+          shard,
+          p.payload
+        ])
+
+      true ->
+        [
+          <<@version::8, @push::8, byte_size(shard)::16, p.epoch::64, p.wal_gen::64, p.salt1::64,
+            p.offset::64>>,
+          shard,
+          p.payload
+        ]
     end
   end
+
+  # 0 means "no ordinal stated", exactly as `lineage: 0` does on the seed — and `Promote.fresher?/2`
+  # must refuse to rank against it rather than treat it as an ordering value. A frame reaching this
+  # with no ordinal is a primary that has the gate on but could not read its WAL, which is the
+  # "unknown" case, not a zeroth generation.
+  defp wal_ordinal(%Push{wal_ordinal: n}) when is_integer(n) and n >= 0, do: n
+  defp wal_ordinal(_), do: 0
 
   # 0 means "no statement about the previous generation", and it is deliberately the same value a
   # genuine zero carries. A generation in which nothing was ever shipped has no extent a follower
@@ -252,6 +319,25 @@ defmodule Fathom.Shard.Replication.Protocol do
       ])
     end
   end
+
+  @doc """
+  Whether this node emits the ordinal-carrying push frame (`config :fathom,
+  :replication_ordinal_wire`, set by `REPLICATION_ORDINAL_WIRE` in `config/runtime.exs`, default
+  **false**).
+
+  **Default false, unlike `lineage_wire?/0`, and the difference is the point.** That gate defaults
+  TRUE because it guards a window that closes once and it leads a rolling upgrade. This one adds a
+  type code that every currently-deployed peer answers `{:error, :malformed}` to, so emitting it
+  before the code is everywhere would close sockets fleet-wide — the exact break the gate pattern
+  exists to prevent. It follows `FrameAuth.signing?/0` instead: opt-in, turned on once the fleet is
+  upgraded.
+
+  With it off, a follower records no ordinal, `Promote.fresher?/2` sees "not stated" and keeps its
+  current behaviour — which is the pre-existing bug, but inert rather than wrong, and the same
+  posture `lineage_wire?/0` takes when off.
+  """
+  @spec ordinal_wire?() :: boolean()
+  def ordinal_wire?, do: Application.get_env(:fathom, :replication_ordinal_wire, false)
 
   @doc """
   Whether this node emits the lineage-carrying seed frame (`config :fathom,
@@ -354,6 +440,15 @@ defmodule Fathom.Shard.Replication.Protocol do
   def signable(<<@version::8, @push::8, slen::16, _::binary>> = frame)
       when byte_size(frame) >= 36 + slen,
       do: binary_part(frame, 0, 36 + slen)
+
+  # 52 = @push_ext's 44 plus the trailing 8-byte ordinal. The first draft returned the WHOLE frame
+  # here, which verified against nothing: `seal/1` signs only `[header, shard_id]`, so including
+  # the payload made the two sides compute different bytes and every signed ordinal frame came
+  # back `{:error, :unauthenticated}`. The moduledoc above says the two "agree by construction";
+  # they only do if this prefix length is right.
+  def signable(<<@version::8, @push_ord::8, slen::16, _::binary>> = frame)
+      when byte_size(frame) >= 52 + slen,
+      do: binary_part(frame, 0, 52 + slen)
 
   def signable(<<@version::8, @push_ext::8, slen::16, _::binary>> = frame)
       when byte_size(frame) >= 44 + slen,
@@ -513,6 +608,29 @@ defmodule Fathom.Shard.Replication.Protocol do
     else
       decode_frame(bytes)
     end
+  end
+
+  # ABOVE the `@push_ext` clause and matching its own type code, so the two never compete.
+  # `wal_ordinal` is the trailing field; everything before it is byte-identical to `@push_ext`,
+  # which is what makes this additive rather than a layout change.
+  defp decode_frame(
+         <<@version::8, @push_ord::8, slen::16, epoch::64, gen::64, salt::64, off::64, prev::64,
+           ord::64, rest::binary>>
+       )
+       when byte_size(rest) >= slen do
+    <<shard::binary-size(^slen), payload::binary>> = rest
+
+    {:ok,
+     %Push{
+       shard_id: shard,
+       epoch: epoch,
+       wal_gen: gen,
+       salt1: salt,
+       offset: off,
+       payload: payload,
+       prev_extent: prev,
+       wal_ordinal: ord
+     }}
   end
 
   defp decode_frame(

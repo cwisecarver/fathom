@@ -923,6 +923,27 @@ case env_bool.("REPLICATION_LINEAGE_WIRE") do
   v -> config :fathom, :replication_lineage_wire, v
 end
 
+# THE ORDINAL-CARRYING PUSH FRAME (expert review 2026-08-26 #2, Critical — data loss).
+#
+# `wal_gen` is SQLite's `ckpt_seq`, which restarts at 0 whenever SQLite recreates the `-wal` —
+# after every Hrana stream on a quiet shard. So `Promote.fresher?/2`'s `{lineage, wal_gen, offset}`
+# ordering can compare two unrelated WALs, a replica holding a recreated WAL loses to an older
+# object, and the survivor cold-opens the stale bytes with the acked tail gone. Silently.
+# `REPLICATION_ORDINAL_WIRE` starts emitting the monotone ordinal that fixes it.
+#
+# OFF BY DEFAULT, unlike REPLICATION_LINEAGE_WIRE above, and the difference is deliberate. That one
+# defaults ON because it guards a window that closes once and leads a rolling upgrade. This adds a
+# frame code that every currently-deployed peer answers `{:error, :malformed}` to and then closes
+# the socket — so turning it on before the code is everywhere breaks replication fleet-wide. It
+# follows REPLICATION_SIGN_FRAMES instead: land the code, roll it out, THEN flip this.
+#
+# Off, a follower records no ordinal and `Promote.fresher?/2` keeps today's behaviour — the
+# pre-existing bug, inert rather than wrong.
+case env_bool.("REPLICATION_ORDINAL_WIRE") do
+  nil -> :ok
+  v -> config :fathom, :replication_ordinal_wire, v
+end
+
 # Where the follower set comes from. `static` (default) is the hand-maintained
 # REPLICATION_FOLLOWERS list; `roster` derives it from the addresses nodes publish to
 # `rebalancer_nodes`, refreshed on a timer, so adding or replacing a node stops meaning "edit every
