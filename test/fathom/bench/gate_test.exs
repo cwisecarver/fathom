@@ -153,6 +153,39 @@ defmodule Fathom.Bench.GateTest do
     end
   end
 
+  # Demoted 2026-08-28 (the #33 investigation). The previous comment on this metric said outright
+  # "if that stability does not hold, widen this" — it did not hold, and the measurement that
+  # settled it also overturned a conclusion the repo had already acted on.
+  #
+  # Three runs of ONE IDENTICAL TREE read 5.48, 4.50, 5.49 — a 22% spread, already above the 20%
+  # band it was gating at. It had previously blocked review #13a at "+51%" for adding one field to
+  # the coordinator state map; the back-to-back A/B the next day read HEAD 5.51 vs the same line
+  # applied 5.56, i.e. +0.9%. The block was a mode flip.
+  describe "fanout_gc_kb_per_shard is watch-only" do
+    test "a large move is reported but never blocks or reaches the verdict" do
+      parent = Map.put(@parent, "fanout_gc_kb_per_shard", 3.7)
+      new = %{parent | "fanout_gc_kb_per_shard" => 11.1}
+      result = Gate.compare(parent, new)
+
+      assert result.verdict == :ok,
+             "fanout_gc_kb_per_shard still gates. Its own same-tree spread is 22%, above the " <>
+               "band, so it refuses clean commits — that is how #13a was mis-diagnosed."
+
+      refute :fanout_gc_kb_per_shard in result.blocked
+    end
+
+    test "served_kb_per_shard still gates, so the density regime is not left open" do
+      # The demotion above is only defensible because this one is stable: 189.6-196.1 (3.4%) over
+      # the same period. If this ever stops gating, the fan-out regime has NO gate at all.
+      parent = Map.put(@parent, "served_kb_per_shard", 190.0)
+      new = %{parent | "served_kb_per_shard" => 380.0}
+      result = Gate.compare(parent, new)
+
+      assert result.verdict == :block
+      assert :served_kb_per_shard in result.blocked
+    end
+  end
+
   test "a metric nil in either run is skipped, never treated as flat" do
     new = %{@parent | "dir_resolve_p50_us" => nil}
     result = Gate.compare(@parent, new)

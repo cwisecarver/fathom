@@ -60,13 +60,34 @@ defmodule Fathom.Bench.Gate do
     # fanout up with `fanout_gc` flat is churn or a size-class tip, both up is a real regression.
     # Through the whole month above, `fanout_gc` held 3.6–3.7 daily while this swung 2.5–6.6.
     {:fanout_kb_per_shard, :higher_worse, :watch},
-    # The steady-state floor — `fanout` with the coordinators collected, so open-path churn is out
-    # of it. Gated at the default 20% because this is the reading meant to be believed: `fanout`
-    # up with this flat is churn, both up is a real retained-heap regression. Early and on few
-    # samples, but it read 3.64/3.65 across runs where `fanout` read 5.37 through 5.74. If that
-    # stability does not hold, widen this — do not widen it pre-emptively, or the pair gates
-    # nothing between them.
-    {:fanout_gc_kb_per_shard, :higher_worse},
+    # WATCH-ONLY since 2026-08-28, on the instruction the previous version of this comment left:
+    # "it read 3.64/3.65 across runs where `fanout` read 5.37 through 5.74. **If that stability
+    # does not hold, widen this** — do not widen it pre-emptively." It did not hold, and the
+    # measurement that settled it also overturned a conclusion this repo had already acted on.
+    #
+    # THREE RUNS OF ONE IDENTICAL TREE: 5.48, 4.50, 5.49 — a 22% spread, already above the 20%
+    # band. Across a single evening, commit `aecfacd` alone spans 3.65 to 5.57 (53%). It is
+    # bimodal in exactly the way its sibling above is, and for the same reason: 200 coordinator
+    # heaps tip a geometric size class together, so one machine state reads ~3.7 and another
+    # ~5.5, with no code between them.
+    #
+    # WHAT IT COST BEFORE BEING CAUGHT. On 2026-08-27 this metric blocked review #13a at "+51%"
+    # (3.65 -> 5.49) for adding ONE field to the coordinator state map. That was accepted as real,
+    # written into the code as "the map is not free to grow", and used to PARK review #33 on the
+    # grounds that its fix would pay the same toll. All of it was one mode flip. The A/B, run back
+    # to back the next day on the same machine: HEAD 5.51, HEAD-plus-that-exact-line 5.56 —
+    # **+0.9%**. The coordinator's heap does not move either (610 words both ways).
+    #
+    # The lesson is the one AGENTS.md already states and this metric kept defeating: a same-trial
+    # RATIO cannot see a metric whose own spread exceeds the band. A single A/B against a bimodal
+    # metric is not evidence, however many times the B side is repeated — all four #13a samples
+    # landed in one mode.
+    #
+    # THE DENSITY REGIME IS STILL GATED. `served_kb_per_shard` below spans 189.6-196.1 over the
+    # same period (3.4%) and is the reading to believe. This one stays in the report as the only
+    # view of whether `fullsweep_after: 0` reclaims retained heap — read it against `fanout`, per
+    # `Fathom.Bench.fanout_gc/1`.
+    {:fanout_gc_kb_per_shard, :higher_worse, :watch},
     # The SERVED regime, gated from 2026-08-03 (#41.2). `fanout_kb_per_shard` holds no
     # connections, so every per-connection resource decision — `:shard_cache_size_kb`'s up-to-2 MiB
     # page cache per held stream, the statement cache's sub-binary pin — was outside the gate.
@@ -226,7 +247,7 @@ defmodule Fathom.Bench.Gate do
 
           note =
             case own do
-              :watch -> " (watch only — never gates; read fanout_gc/served)"
+              :watch -> " (watch only — never gates; read served_kb_per_shard)"
               ^block -> ""
               n -> " (block >=#{n}%)"
             end

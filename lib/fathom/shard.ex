@@ -679,15 +679,27 @@ defmodule Fathom.Shard do
         # #13a): `false` = none in progress, `true` = the jitter timer is armed, `%Task{}` = the
         # off-process `check_lease` GET is in flight.
         #
-        # ONE FIELD ON PURPOSE, and the reason is measured, not stylistic. Adding a separate
-        # `lapse_task` key made this map 31 keys and cost **+51% on `fanout_gc_kb_per_shard`**
-        # (3.65 -> 5.49 KiB/shard, reproduced three times, and reproduced by that ONE LINE against
-        # an otherwise-unmodified HEAD). The coordinator's process heap sits right on an Erlang
-        # heap size-class boundary, so one more word per process rounds every coordinator up to the
-        # next class — ~1.8 KiB each, which at fathom's scale IS the node-density floor. The bench
-        # gate blocked it, correctly.
+        # ONE FIELD, and the original reason given here was WRONG — corrected 2026-08-28 after the
+        # #33 investigation, because the wrong version was actively misleading.
         #
-        # So: before adding a field here, bench it. This map is not free to grow.
+        # What this comment used to say: that adding a separate `lapse_task` key cost **+51% on
+        # `fanout_gc_kb_per_shard`**, because the coordinator's process heap sits on an Erlang heap
+        # size-class boundary and one more word tips every coordinator to the next class. Both
+        # halves were measured and are false:
+        #
+        #   * A/B on the actual metric, same machine, back to back: HEAD 5.51 vs HEAD-plus-that-
+        #     exact-line 5.56. **+0.9%.** The field costs nothing.
+        #   * The heap does not move either: 610 words with and without it.
+        #   * `fanout_gc_kb_per_shard` is BIMODAL. Three runs of one identical tree read 5.48,
+        #     4.50, 5.49 (22%), and commit `aecfacd` alone spans 3.65-5.57 across one evening. The
+        #     original "+51%" was a mode flip that happened to land across the A and B samples.
+        #
+        # The metric is now `:watch` in `Fathom.Bench.Gate` for that reason; `served_kb_per_shard`
+        # (3.4% spread over the same period) is the density metric to believe.
+        #
+        # So the field count here is NOT a constraint, and no future field needs to be folded to
+        # avoid one. This one stays a tri-state because it genuinely describes ONE thing — the
+        # state of a lapse episode — which is a better reason than the one it was given.
         lapse_revalidate_pending: false
       }
 
