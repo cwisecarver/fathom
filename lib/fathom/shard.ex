@@ -267,6 +267,27 @@ defmodule Fathom.Shard do
   def lineage(pid) when is_pid(pid), do: GenServer.call(pid, :lineage)
 
   @doc """
+  The monotone ordinal for the WAL identified by `salt1` (expert review 2026-08-26 #2).
+
+  Replaces `wal_gen` as the ordering component of a position. `wal_gen` is SQLite's `ckpt_seq`,
+  which restarts at 0 whenever SQLite recreates the `-wal` — after every Hrana stream on a quiet
+  shard — so `{lineage, wal_gen, offset}` is not a total order within a lineage and
+  `Promote.fresher?/2` can compare two unrelated WALs. This only ever increases, so a recreated
+  WAL sorts ABOVE the generation it replaced.
+
+  Same `salt1` gives the same answer every time; a new one bumps. Both properties matter:
+  monotonicity is what makes it an order, and STABILITY is what lets the object's stamp and the
+  replicas' positions agree — they come from two different processes, and if those disagreed about
+  a WAL's ordinal the two would be on different scales.
+
+  `nil` (the WAL could not be read) returns the CURRENT ordinal without bumping. An unreadable WAL
+  is not evidence of a new one, and inventing a higher ordinal for it would let an unknown state
+  outrank a known one.
+  """
+  @spec wal_ordinal(pid(), non_neg_integer() | nil) :: non_neg_integer()
+  def wal_ordinal(pid, salt1) when is_pid(pid), do: GenServer.call(pid, {:wal_ordinal, salt1})
+
+  @doc """
   Force-flushes the coordinator's current on-disk state to storage WITHOUT dropping or stopping
   it (it keeps serving) — the flush-before-fork primitive. Blocks until the shard is durably
   clean; returns `:ok`, or `{:error, reason}` on a flush error / lease steal. See
@@ -664,6 +685,31 @@ defmodule Fathom.Shard do
         # The in-flight legacy-mode lease-renewal task (expert review 2026-08-01 #29), so the
         # renew PUT no longer blocks the coordinator mailbox every ttl/3.
         renew_task: nil,
+        # THE MONOTONE PER-LINEAGE WAL ORDINAL (expert review 2026-08-26 #2), and the salt it
+        # currently describes.
+        #
+        # `wal_gen` is SQLite's `ckpt_seq`: it counts checkpoints WITHIN one WAL file and restarts
+        # at 0 when SQLite deletes and recreates the `-wal` — which happens after every Hrana
+        # stream on a quiet shard. So `{lineage, wal_gen, offset}` is not a total order within a
+        # lineage, and `Promote.fresher?/2` can compare two unrelated WALs. Measured on this
+        # codebase: two consecutive streams both read ckpt_seq=0, salts 977542977 then 978380554.
+        #
+        # This counter replaces `wal_gen` as the ordering component. It only ever increases, so a
+        # recreated WAL sorts ABOVE the generation it replaced instead of below it.
+        #
+        # WHY A COORDINATOR-LOCAL COUNTER IS SOUND, which is the whole design: `open_lineage/1`
+        # takes its lineage from `Storage.next_lineage/1`, which is strictly greater than anything
+        # previously stamped for the shard. So a lineage NEVER repeats across coordinator
+        # lifetimes, one lineage has exactly one coordinator, and therefore exactly one counter.
+        # Restarting at 0 for a new coordinator is correct because `lineage` is compared first.
+        #
+        # It is the coordinator and not ETS because two readers must AGREE: the coordinator stamps
+        # the object's position and `Replication.Session` stamps the replicas', and if they
+        # disagreed about which ordinal a WAL has, the object and its replicas would be on
+        # different scales. Serializing through the single writer is what makes them agree; the
+        # Session caches the answer and only asks again when the salt changes, which is rare.
+        wal_ordinal: 0,
+        wal_salt: nil,
         # Consecutive durability-flush failures (expert review #27): a persistent S3 failure
         # (auth/bucket-policy change) would otherwise only Logger.warning per interval and let the
         # RPO grow unbounded and silently. We count consecutive failures, emit
@@ -1295,6 +1341,21 @@ defmodule Fathom.Shard do
     do: {:reply, n, state}
 
   def handle_call(:lineage, _from, state), do: {:reply, 0, state}
+
+  # An unreadable WAL does not advance the ordinal — see `wal_ordinal/2`.
+  def handle_call({:wal_ordinal, nil}, _from, state),
+    do: {:reply, state.wal_ordinal, state}
+
+  def handle_call({:wal_ordinal, salt}, _from, %{wal_salt: salt} = state),
+    do: {:reply, state.wal_ordinal, state}
+
+  def handle_call({:wal_ordinal, salt}, _from, state) do
+    # A salt we have not seen: this is a different WAL, so it gets the next ordinal. Bumping here
+    # rather than at the point the WAL is created means whichever of the coordinator or the
+    # replication session notices first assigns it, and the other then reads the same number.
+    next = state.wal_ordinal + 1
+    {:reply, next, %{state | wal_ordinal: next, wal_salt: salt}}
+  end
 
   # Synchronous force-flush (the flush-before-fork primitive): make the current on-disk state
   # durable WITHOUT dropping/stopping — the coordinator keeps serving. Replies :ok once the
