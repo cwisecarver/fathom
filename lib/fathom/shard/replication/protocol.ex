@@ -144,6 +144,19 @@ defmodule Fathom.Shard.Replication.Protocol do
   # earlier codes safe.
   @push_ord 15
 
+  # THE ORDINAL ON THE PEER OFFER (expert review 2026-08-26 #2, step 3b), and without it the fix is
+  # only half applied. `Promote.fresher?/2` refuses to rank a replica whose ordinal is unstated, and
+  # `Recovery.choose/3` filters peer offers through that same function — so an offer that cannot
+  # state one is never chosen, and CROSS-FLEET recovery stays inert even once the local path works.
+  # That is the failure a survivor hits after a real failover: it holds nothing, a peer holds the
+  # acked tail, and the object is behind both.
+  #
+  # Same layout as `@position` plus a trailing 64-bit ordinal, and the same gate as `@push_ord` —
+  # a peer one deploy behind answers `{:error, :malformed}` to an unknown code, so this cannot ride
+  # an already-on flag either. Only the have=1 form needs it; "I hold nothing" has no ordinal to
+  # state and keeps `@position`.
+  @position_ord 16
+
   # Which file a chunk belongs to. Explicit rather than splitting one byte stream at `db_size`,
   # so a chunk never straddles the boundary and the follower can assert it received exactly the
   # promised number of database bytes before the first WAL byte.
@@ -544,12 +557,25 @@ defmodule Fathom.Shard.Replication.Protocol do
   # rather than wrong, which is the safe half of the trade and is restored the moment the gate goes
   # on.
   def encode_position(shard_id, %{} = pos) do
-    seal([
-      <<@version::8, @position::8, 1::8, byte_size(shard_id)::16, ordering_key(pos)::64,
-        pos.wal_gen::64, pos.salt1::64, pos.next_offset::64>>,
-      shard_id
-    ])
+    if ordinal_wire?() do
+      seal([
+        <<@version::8, @position_ord::8, 1::8, byte_size(shard_id)::16, ordering_key(pos)::64,
+          pos.wal_gen::64, pos.salt1::64, pos.next_offset::64, offered_ordinal(pos)::64>>,
+        shard_id
+      ])
+    else
+      seal([
+        <<@version::8, @position::8, 1::8, byte_size(shard_id)::16, ordering_key(pos)::64,
+          pos.wal_gen::64, pos.salt1::64, pos.next_offset::64>>,
+        shard_id
+      ])
+    end
   end
+
+  # 0 means "not stated", the same value the push frame uses and the one `Promote.fresher?/2`
+  # refuses to rank — a replica seeded but never pushed to has no ordinal to offer.
+  defp offered_ordinal(%{wal_ordinal: n}) when is_integer(n) and n >= 0, do: n
+  defp offered_ordinal(_), do: 0
 
   defp ordering_key(%{lineage: l}) when is_integer(l), do: l
   defp ordering_key(%{epoch: e}), do: e
@@ -732,6 +758,24 @@ defmodule Fathom.Shard.Replication.Protocol do
 
   defp decode_frame(<<@version::8, @position_query::8, slen::16, shard::binary-size(slen)>>) do
     {:ok, {:position_query, shard}}
+  end
+
+  # ABOVE the `@position` clause and matching its own type code, so the two never compete.
+  # `wal_ordinal` is the trailing field; everything before it is byte-identical to `@position`.
+  defp decode_frame(
+         <<@version::8, @position_ord::8, 1::8, slen::16, epoch::64, gen::64, salt::64, off::64,
+           ord::64, shard::binary-size(slen)>>
+       ) do
+    {:ok,
+     {:position, shard,
+      %{
+        epoch: epoch,
+        lineage: epoch,
+        wal_gen: gen,
+        salt1: salt,
+        next_offset: off,
+        wal_ordinal: ord
+      }}}
   end
 
   defp decode_frame(

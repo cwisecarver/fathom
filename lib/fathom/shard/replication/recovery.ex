@@ -180,8 +180,20 @@ defmodule Fathom.Shard.Replication.Recovery do
   # Falls back to `epoch` for a map that has no lineage: a `local` read from an older follower
   # state, or a peer one deploy behind whose offer decodes with both keys set from the one wire
   # field. Same value in both cases, so the fallback changes nothing where it fires.
-  defp rank(%{lineage: l, wal_gen: g, next_offset: o}) when is_integer(l), do: {l, g, o}
-  defp rank(%{epoch: e, wal_gen: g, next_offset: o}), do: {e, g, o}
+  #
+  # THE SECOND COMPONENT IS THE ORDINAL (expert review 2026-08-26 #2, step 3b), for the same reason
+  # `fresher?/2` swapped: `wal_gen` restarts at 0 on a WAL recreate, so ranking peers by it could
+  # order two unrelated WALs. Ranking by a different key than the filter used was already called
+  # out as incoherent above; it still applies, so this moves with it.
+  #
+  # A peer with no ordinal ranks at 0, which loses to any peer that has one — and cannot be reached
+  # in practice anyway, because `choose/3` filtered these through `fresher?/2`, which refuses a
+  # replica whose ordinal is unstated.
+  defp rank(%{lineage: l, next_offset: o} = pos) when is_integer(l), do: {l, ordinal(pos), o}
+  defp rank(%{epoch: e, next_offset: o} = pos), do: {e, ordinal(pos), o}
+
+  defp ordinal(%{wal_ordinal: n}) when is_integer(n), do: n
+  defp ordinal(_), do: 0
 
   @typedoc "One read of the stored object: what it is, and what it claims. `nil` means no object."
   @type head :: %{etag: String.t() | nil, position: map() | nil} | nil
@@ -392,6 +404,13 @@ defmodule Fathom.Shard.Replication.Recovery do
 
     with :ok <- :gen_tcp.send(sock, Protocol.encode_replica_request(shard_id)),
          {:ok, offset} <- receive_seed(sock, follower, shard_id, deadline, %{}) do
+      # THE PULLED REPLICA HAS NO ORDINAL OF ITS OWN (expert review 2026-08-26 #2, step 3b): a seed
+      # installs `FollowerLog.seeded/5`'s state and `SeedBegin` carries none. Without this the
+      # survivor would hold a replica `Promote.fresher?/2` can never rank, and recovery would end
+      # exactly where it began — cold-opening the stale object. The offer this peer was CHOSEN on
+      # is the only statement about these bytes we have, and taking it can only under-claim.
+      Follower.note_ordinal(follower, shard_id, Map.get(promised, :wal_ordinal, 0))
+
       installed = local_state(follower, shard_id)
       elapsed = System.monotonic_time(:millisecond) - started
 

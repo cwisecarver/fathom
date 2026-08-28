@@ -169,6 +169,82 @@ defmodule Fathom.Shard.Replication.PushOrdinalWireTest do
     end
   end
 
+  # THE PEER OFFER CARRIES IT TOO, and without that the fix is only half applied (step 3b).
+  # `Recovery.choose/3` filters peer offers through `Promote.fresher?/2`, which refuses a replica
+  # whose ordinal is unstated — so an offer that cannot state one is never chosen and CROSS-FLEET
+  # recovery stays inert even once the local path works. That is exactly the case a real failover
+  # hits: the survivor holds nothing, a peer holds the acked tail, the object is behind both.
+  describe "the peer position offer" do
+    defp offer do
+      %{lineage: 9, epoch: 1, wal_gen: 5, salt1: 7, next_offset: 8_240, wal_ordinal: 12}
+    end
+
+    defp offer_roundtrip(pos),
+      do: "acme" |> Protocol.encode_position(pos) |> IO.iodata_to_binary() |> Protocol.decode()
+
+    test "with the gate OFF it is byte-identical to what shipped before" do
+      Application.put_env(:fathom, :replication_ordinal_wire, false)
+
+      with_ord = Protocol.encode_position("acme", offer()) |> IO.iodata_to_binary()
+      without = Protocol.encode_position("acme", Map.delete(offer(), :wal_ordinal))
+      without = IO.iodata_to_binary(without)
+
+      assert with_ord == without,
+             "the ordinal leaked into the offer frame while its gate was off — a peer one deploy " <>
+               "behind would answer :malformed and close the socket"
+
+      assert {:ok, {:position, "acme", decoded}} = offer_roundtrip(offer())
+      refute Map.has_key?(decoded, :wal_ordinal), "an ordinal appeared with the gate off"
+    end
+
+    test "with the gate ON the ordinal survives with every other field intact" do
+      Application.put_env(:fathom, :replication_ordinal_wire, true)
+
+      assert {:ok, {:position, "acme", decoded}} = offer_roundtrip(offer())
+      assert decoded.wal_ordinal == 12
+      assert decoded.lineage == 9
+      assert decoded.epoch == 9, "both keys still come from the one ordering-key field"
+      assert decoded.wal_gen == 5
+      assert decoded.salt1 == 7
+      assert decoded.next_offset == 8_240
+    end
+
+    test "an offer with no ordinal states 0, which fresher?/2 refuses to rank" do
+      Application.put_env(:fathom, :replication_ordinal_wire, true)
+
+      assert {:ok, {:position, "acme", decoded}} =
+               offer_roundtrip(Map.delete(offer(), :wal_ordinal))
+
+      assert decoded.wal_ordinal == 0
+    end
+
+    # "I hold nothing" keeps the OLD type code: there is no ordinal to state, so a new code would
+    # buy nothing and cost a rolling upgrade.
+    test "the empty offer is unchanged under either gate" do
+      Application.put_env(:fathom, :replication_ordinal_wire, true)
+      on = Protocol.encode_position("acme", nil) |> IO.iodata_to_binary()
+      Application.put_env(:fathom, :replication_ordinal_wire, false)
+      off = Protocol.encode_position("acme", nil) |> IO.iodata_to_binary()
+
+      assert on == off
+      assert {:ok, {:position, "acme", nil}} = Protocol.decode(on)
+    end
+
+    test "it composes with frame signing, and a tampered offer is REJECTED" do
+      Application.put_env(:fathom, :replication_ordinal_wire, true)
+      enable_signing()
+
+      frame = Protocol.encode_position("acme", offer()) |> IO.iodata_to_binary()
+      assert {:ok, {:position, "acme", %{wal_ordinal: 12}}} = Protocol.decode(frame)
+
+      <<head::binary-size(6), rest::binary>> = frame
+      tampered = head <> <<0xFF>> <> binary_part(rest, 1, byte_size(rest) - 1)
+
+      assert {:error, _} = Protocol.decode(tampered),
+             "a tampered signed offer decoded; the new type code is outside the signature"
+    end
+  end
+
   test "the version is NOT bumped — that is what keeps a rolling upgrade alive" do
     Application.put_env(:fathom, :replication_ordinal_wire, true)
     <<version::8, type::8, _::binary>> = Protocol.encode_push(push()) |> IO.iodata_to_binary()

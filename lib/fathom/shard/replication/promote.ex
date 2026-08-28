@@ -112,6 +112,22 @@ defmodule Fathom.Shard.Replication.Promote do
   def fresher?(%{lineage: 0}, _stamp), do: false
   def fresher?(_replica, %{epoch: 0}), do: false
 
+  # NO ORDINAL ⇒ UNKNOWN ⇒ THE STORED OBJECT WINS (expert review 2026-08-26 #2, step 3b).
+  #
+  # 0 is "not stated": a replica seeded but not yet pushed to, one whose primary has
+  # `Protocol.ordinal_wire?/0` off, or a peer that predates the field. It is NOT a zeroth
+  # generation, and it must never be RANKED — in either direction. Above the comparison so a 0
+  # cannot reach it.
+  #
+  # THE CONSEQUENCE IS DELIBERATE AND IT IS LARGE: while `REPLICATION_ORDINAL_WIRE` is off — the
+  # default — every replica carries 0, so promote-on-open and cross-fleet recovery are INERT. That
+  # is the point. The ordering they used until this commit was `wal_gen`, which is SQLite's
+  # `ckpt_seq` and restarts at 0 whenever SQLite recreates the `-wal`, so it could rank two
+  # unrelated WALs and promote a replica over a NEWER object — losing the acked tail silently. A
+  # feature that is off is never worse than off; one that is subtly wrong on a data-loss path is.
+  # Land, roll the fleet out, then flip the gate.
+  def fresher?(%{wal_ordinal: 0}, _stamp), do: false
+
   # LINEAGE against LINEAGE. The replica's `epoch` is the primary's LOCK epoch, which
   # `release_lease` resets to 1 on every clean idle-drop, drain and handoff; the object's position
   # stamp carries the monotonic LINEAGE in its `epoch` slot (`Fathom.Shard.stamp_epoch/1` →
@@ -127,21 +143,35 @@ defmodule Fathom.Shard.Replication.Promote do
   #
   # `epoch` is still carried on the replica and is still the right value for `FollowerLog.decide/2`'s
   # fencing check — the two are not interchangeable and neither replaces the other.
-  def fresher?(%{lineage: l1, wal_gen: g1, next_offset: o1}, %{
+  #
+  # THE SECOND COMPONENT IS THE ORDINAL, NOT `wal_gen` (expert review 2026-08-26 #2, step 3b), and
+  # that is what makes this an order at all. `wal_gen` is SQLite's `ckpt_seq`: it counts checkpoints
+  # WITHIN one WAL file and restarts at 0 when SQLite deletes and recreates that file, which it does
+  # after every Hrana stream on a quiet shard. Measured on this codebase, two consecutive streams
+  # both read ckpt_seq=0 with salts 977542977 then 978380554 — same number, unrelated WALs. So
+  # `{g1, o1} > {g2, o2}` was comparing positions from different files and could rank a replica
+  # above an object that is strictly newer.
+  #
+  # The ordinal is assigned by the shard coordinator (`Fathom.Shard.wal_ordinal/2`), which answers
+  # the SAME number for the same salt and a higher one for a new salt. The coordinator stamps the
+  # object with it and `Replication.Session` pushes it to the replicas, so both sides are on one
+  # scale rather than two counters that happen to look alike.
+  #
+  # `wal_gen` is still carried and is still right for `FollowerLog.decide/2`'s generation checks,
+  # which ask a different question — is this frame from before a checkpoint I already applied.
+  # The two are not interchangeable and neither replaces the other.
+  #
+  # A STAMP WITH NO ORDINAL FALLS THROUGH TO THE CATCH-ALL, which is the guard that matters: it
+  # answers false — unknown, so the object wins — and specifically NOT "equal", which would be a
+  # claim about a relationship nobody measured.
+  def fresher?(%{lineage: l1, wal_ordinal: n1, next_offset: o1}, %{
         epoch: l2,
-        wal_gen: g2,
+        wal_ordinal: n2,
         offset: o2
       })
-      when is_integer(l1) and is_integer(l2) do
-    # NOT SOUND WITHIN A LINEAGE, and knowingly left that way — see the PARKED decision in
-    # `audits/…#2`. `wal_gen` is SQLite's `ckpt_seq`, which restarts at 0 when SQLite recreates the
-    # `-wal`; measured on this codebase, two consecutive streams on a quiet shard both read
-    # ckpt_seq=0 with salts 977542977 then 978380554. So the `{g1, o1} > {g2, o2}` below can
-    # compare two unrelated WALs. `Storage.position` now CARRIES `salt1` (optional) and
-    # `parse_position/1` accepts the four-field form, so the data needed to fix this is in place;
-    # what is not settled is what to DO when the salts differ, because refusing to rank turns
-    # promote inert for the common post-checkpoint case.
-    {l1, g1, o1} > {l2, g2, o2}
+      when is_integer(l1) and is_integer(l2) and is_integer(n1) and n1 > 0 and is_integer(n2) and
+             n2 > 0 do
+    {l1, n1, o1} > {l2, n2, o2}
   end
 
   def fresher?(_replica, _stamp), do: false

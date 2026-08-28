@@ -117,10 +117,21 @@ defmodule Fathom.Shard.FlushPositionTest do
     # lineage. Same field name, two different counters, and the comparison silently meant nothing
     # from a shard's second replicating open onward. The replica now carries both: `lineage` for
     # ranking, `epoch` for `FollowerLog.decide/2`'s fencing check, which is a different question.
-    defp replica(l, g, o), do: %{lineage: l, epoch: 1, wal_gen: g, next_offset: o}
-    defp stamp(l, g, o), do: %{epoch: l, wal_gen: g, offset: o}
+    #
+    # THE SECOND ARGUMENT IS NOW THE ORDINAL (expert review 2026-08-26 #2, step 3b). `fresher?/2`
+    # ranks on `{lineage, wal_ordinal, offset}`; `wal_gen` is SQLite's `ckpt_seq` and restarts at 0
+    # on a WAL recreate, so it never was an order. Both helpers still set `wal_gen` because
+    # `FollowerLog.decide/2` reads it for a different question.
+    #
+    # `g + 1`, not `g`: an ordinal of 0 means "NOT STATED" and is refused outright, so a fixture
+    # written as generation 0 would stop being ranked rather than ranking lowest. The shift is
+    # monotone, so every ordering asserted below is unchanged.
+    defp replica(l, g, o),
+      do: %{lineage: l, epoch: 1, wal_gen: g, wal_ordinal: g + 1, next_offset: o}
 
-    test "orders lexicographically on epoch, then generation, then offset" do
+    defp stamp(l, g, o), do: %{epoch: l, wal_gen: g, wal_ordinal: g + 1, offset: o}
+
+    test "orders lexicographically on lineage, then WAL ordinal, then offset" do
       assert Promote.fresher?(replica(1, 0, 100), stamp(1, 0, 50))
       assert Promote.fresher?(replica(1, 1, 0), stamp(1, 0, 999_999))
       assert Promote.fresher?(replica(2, 0, 0), stamp(1, 9, 999_999))
@@ -146,6 +157,26 @@ defmodule Fathom.Shard.FlushPositionTest do
       refute Promote.fresher?(nil, stamp(1, 0, 0))
       refute Promote.fresher?(%{epoch: 1}, stamp(1, 0, 0))
       refute Promote.fresher?(replica(1, 0, 5), %{epoch: 1})
+    end
+
+    # THE 3b GUARD. An ordinal of 0 is "not stated" — a replica seeded but not yet pushed to, or one
+    # whose primary has `Protocol.ordinal_wire?/0` off, which is the DEFAULT. It must answer false,
+    # and specifically not "equal": equal would be a claim about a relationship nobody measured.
+    #
+    # This is what makes A2 promote inert until `REPLICATION_ORDINAL_WIRE` is rolled out, and that
+    # is the intended trade. The ordering it replaces could rank two unrelated WALs and promote a
+    # replica over a NEWER object, losing the acked tail silently.
+    test "a replica with no stated ordinal is never fresher, however far ahead it reads" do
+      refute Promote.fresher?(
+               %{lineage: 5, epoch: 1, wal_gen: 99, wal_ordinal: 0, next_offset: 999_999},
+               stamp(5, 0, 0)
+             )
+    end
+
+    # …and the object's side of the same rule. A stamp written before step 3a, or one whose salt
+    # the coordinator had never seen, carries NO `:wal_ordinal` key at all.
+    test "an object stamped with no ordinal is never overridable" do
+      refute Promote.fresher?(replica(5, 99, 999_999), %{epoch: 5, wal_gen: 0, offset: 0})
     end
 
     # A replica seeded before the lineage travelled on the wire — or while

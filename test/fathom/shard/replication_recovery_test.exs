@@ -39,10 +39,28 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
   # ranked against the stored object's position stamp, which carries the monotonic lineage; the
   # lock epoch resets to 1 on every clean release and is pinned here to say so. A peer's offer
   # arrives with both keys set from the one wire field — see `Protocol.ordering_key/1`.
+  #
+  # BOTH HELPERS NOW SUPPLY `wal_ordinal`, because the ranking field moved (expert review
+  # 2026-08-26 #2, step 3b): `Promote.fresher?/2` and `Recovery.rank/1` order on
+  # `{lineage, wal_ordinal, offset}`, not on `wal_gen`. `wal_gen` is SQLite's `ckpt_seq` and
+  # restarts at 0 when SQLite recreates the `-wal`, so it never was an order.
+  #
+  # `gen + 1`, not `gen`, and the shift is load-bearing: an ordinal of 0 means "NOT STATED" and is
+  # refused outright, so a fixture written as generation 0 would stop being ranked at all rather
+  # than ranking lowest. The shift is monotone, so every ordering these tests assert is unchanged —
+  # they read the second argument as "how far along", which is exactly what it still means.
   defp at(lineage, gen, off),
-    do: %{lineage: lineage, epoch: 1, wal_gen: gen, salt1: 0, next_offset: off}
+    do: %{
+      lineage: lineage,
+      epoch: 1,
+      wal_gen: gen,
+      wal_ordinal: gen + 1,
+      salt1: 0,
+      next_offset: off
+    }
 
-  defp stamp(epoch, gen, off), do: %{epoch: epoch, wal_gen: gen, offset: off}
+  defp stamp(epoch, gen, off),
+    do: %{epoch: epoch, wal_gen: gen, wal_ordinal: gen + 1, offset: off}
 
   defp peer(key, port \\ 1), do: {key, "127.0.0.1", port}
 
@@ -247,10 +265,19 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
   # not the lock epoch (expert review 2026-08-24 #12). The lock epoch is pinned at 1 because that
   # is what production resets it to on every clean release, which is exactly why it cannot be the
   # ordering key.
+  #
+  # AND AN ORDINAL, because a seed alone leaves none (expert review 2026-08-26 #2, step 3b).
+  # `FollowerLog.seeded/5` states 0 — `SeedBegin` carries no ordinal — and `Promote.fresher?/2`
+  # refuses to rank a 0, so a planted-but-never-pushed replica would be unrankable and every test
+  # here would return `:none` for a reason that has nothing to do with what it is asserting. A real
+  # replica gets its ordinal from the first push; `note_ordinal/3` is the same statement.
+  #
+  # `gen + 1` matches `at/3`'s shift above, and for the same reason: 0 means "not stated".
   defp plant_replica(name, id, lineage, gen, salt, db, wal) do
     File.write!(Follower.db_path(name, id), db)
     File.write!(Follower.wal_path(name, id), wal)
     Follower.seed(name, id, 1, gen, salt, byte_size(wal), lineage)
+    :ok = Follower.note_ordinal(name, id, gen + 1)
   end
 
   setup do
@@ -262,10 +289,21 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
     prev_wire = Application.get_env(:fathom, :replication_lineage_wire)
     Application.put_env(:fathom, :replication_lineage_wire, true)
 
+    # …and the ORDINAL likewise (expert review 2026-08-26 #2, step 3b). It rides its own gate, off
+    # by default, because it adds a frame type code an un-upgraded peer answers `:malformed` to.
+    # Off, a peer offers ordinal 0, `fresher?/2` refuses to rank it, and the cross-fleet path is
+    # INERT rather than wrong — the same trade the lineage gate above makes.
+    prev_ord = Application.get_env(:fathom, :replication_ordinal_wire)
+    Application.put_env(:fathom, :replication_ordinal_wire, true)
+
     on_exit(fn ->
       if is_nil(prev_wire),
         do: Application.delete_env(:fathom, :replication_lineage_wire),
         else: Application.put_env(:fathom, :replication_lineage_wire, prev_wire)
+
+      if is_nil(prev_ord),
+        do: Application.delete_env(:fathom, :replication_ordinal_wire),
+        else: Application.put_env(:fathom, :replication_ordinal_wire, prev_ord)
     end)
 
     %{id: id}
@@ -285,7 +323,7 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
     assert is_nil(Follower.state_of(survivor, id))
 
     assert {:ok, installed} =
-             Recovery.best_replica(id, %{epoch: 9, wal_gen: 5, offset: 0},
+             Recovery.best_replica(id, stamp(9, 5, 0),
                follower: survivor,
                peers: [{"src", "127.0.0.1", source_port}]
              )
@@ -304,6 +342,14 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
     # ordering value (expert review 2026-08-24 #12).
     assert %{lineage: 9, epoch: 1, wal_gen: 5, salt1: 0xDEADBEEF, next_offset: byte_size(wal)} ==
              Map.take(installed, [:lineage, :epoch, :wal_gen, :salt1, :next_offset])
+
+    # AND THE ORDINAL CAME ACROSS (expert review 2026-08-26 #2, step 3b). A seed states none —
+    # `SeedBegin` carries no ordinal — so the puller takes it from the OFFER the peer was chosen
+    # on. Without this the survivor holds a replica `Promote.fresher?/2` can never rank, and this
+    # whole path ends where it began: cold-opening the stale object. The source was planted at
+    # `gen + 1`, i.e. 6.
+    assert installed.wal_ordinal == 6,
+           "the pulled replica carries no ordinal, so it can never be promoted"
   end
 
   test "a survivor already holding the freshest copy asks nobody", %{id: id} do
@@ -319,7 +365,7 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
     started = System.monotonic_time(:millisecond)
 
     assert {:ok, %{next_offset: _}} =
-             Recovery.best_replica(id, %{epoch: 9, wal_gen: 5, offset: 0},
+             Recovery.best_replica(id, stamp(9, 5, 0),
                follower: survivor,
                peers: [{"gone", "127.0.0.1", 1}, {"also_gone", "127.0.0.1", 2}]
              )
@@ -331,7 +377,7 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
     {survivor, _} = start_follower("recov_surv")
 
     assert :none =
-             Recovery.best_replica(id, %{epoch: 9, wal_gen: 5, offset: 0},
+             Recovery.best_replica(id, stamp(9, 5, 0),
                follower: survivor,
                peers: [{"gone", "127.0.0.1", 1}],
                query_timeout_ms: 200
@@ -348,7 +394,7 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
     assert is_nil(Follower.state_of(source, id))
 
     assert :none =
-             Recovery.best_replica(id, %{epoch: 9, wal_gen: 5, offset: 0},
+             Recovery.best_replica(id, stamp(9, 5, 0),
                follower: survivor,
                peers: [{"src", "127.0.0.1", source_port}]
              )
@@ -367,7 +413,7 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
     # would DELETE acknowledged writes — the failure this whole comparison exists to prevent, and
     # the one direction where being wrong is unrecoverable.
     assert :none =
-             Recovery.best_replica(id, %{epoch: 9, wal_gen: 6, offset: 0},
+             Recovery.best_replica(id, stamp(9, 6, 0),
                follower: survivor,
                peers: [{"src", "127.0.0.1", source_port}]
              )
@@ -455,7 +501,7 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
       end)
 
     assert :none =
-             Recovery.best_replica(id, %{epoch: 9, wal_gen: 5, offset: 0},
+             Recovery.best_replica(id, stamp(9, 5, 0),
                follower: survivor,
                peers: [{"liar", "127.0.0.1", port}]
              )
@@ -514,7 +560,7 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
       end)
 
     assert :none =
-             Recovery.best_replica(id, %{epoch: 9, wal_gen: 5, offset: 0},
+             Recovery.best_replica(id, stamp(9, 5, 0),
                follower: survivor,
                peers: [{"short", "127.0.0.1", port}]
              )
@@ -564,7 +610,7 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
       end)
 
     assert :none =
-             Recovery.best_replica(id, %{epoch: 9, wal_gen: 5, offset: 0},
+             Recovery.best_replica(id, stamp(9, 5, 0),
                follower: survivor,
                peers: [{"aborter", "127.0.0.1", port}]
              )

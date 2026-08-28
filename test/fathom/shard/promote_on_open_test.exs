@@ -143,6 +143,12 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     # every clean release, so a fixture that set it from the stamp was quietly guaranteeing the two
     # counters agreed — which is precisely the coverage gap this file's moduledoc now describes.
     Follower.seed(Follower, id, 1, position.wal_gen, 0, position.offset, position.epoch)
+
+    # THE ORDINAL A PUSHED REPLICA WOULD CARRY (expert review 2026-08-26 #2, step 3b). A seed states
+    # none, so without this the replica is unrankable and never promoted. `Map.get` rather than a
+    # strict read because several fixtures below deliberately build a position with NO ordinal — an
+    # object stamped before step 3a — and those must stay unrankable.
+    :ok = Follower.note_ordinal(Follower, id, Map.get(position, :wal_ordinal, 0))
   end
 
   # The byte half of install_replica/2, callable while the live files still exist. The graceful
@@ -176,10 +182,35 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
 
     for i <- 1..total do
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (?1)", [i]))
-      if i == flush_after, do: flush!(coordinator)
+
+      if i == flush_after do
+        assign_ordinal!(id, coordinator)
+        flush!(coordinator)
+      end
     end
 
     {conn, coordinator}
+  end
+
+  # WHAT A REPLICATING SESSION DOES, and without it these tests measure nothing (expert review
+  # 2026-08-26 #2, step 3b). `flush_position/3` stamps an ordinal only for a salt the coordinator is
+  # already standing on, and only `Replication.Session` normally puts it there — on every salt
+  # change, from the commit path. These tests do not run a session, so the stamp would carry no
+  # ordinal, `Promote.fresher?/2` would refuse to rank it, and every promotion below would fail for
+  # a reason that has nothing to do with promotion.
+  #
+  # Called immediately before the flush, not earlier: a checkpoint restarts the log with FRESH
+  # SALTS, so a salt read any sooner names a WAL the flush will not see.
+  defp assign_ordinal!(id, coordinator) do
+    wal = Fathom.Shard.db_path(id) <> "-wal"
+    assert {:ok, %{salt1: salt}} = Fathom.Shard.Replication.Wal.read(wal)
+    n = Fathom.Shard.wal_ordinal(coordinator, salt)
+
+    assert n > 0,
+           "fixture: the coordinator assigned no ordinal, so the object stamp cannot be ranked " <>
+             "and this test would prove nothing"
+
+    n
   end
 
   # NODE LOSS, not a shutdown. `Shards.stop/1` is a graceful drain and its drop-flush uploads
@@ -218,6 +249,7 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     install_replica(id, %{
       epoch: stamp.epoch,
       wal_gen: stamp.wal_gen,
+      wal_ordinal: stamp.wal_ordinal,
       offset: stamp.offset + 1
     })
 
@@ -537,7 +569,14 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
 
     {conn, coordinator} = build_shard(id, 10, 3)
     assert {:ok, stamp} = Storage.object_position(id)
-    install_replica(id, %{epoch: stamp.epoch, wal_gen: stamp.wal_gen, offset: stamp.offset + 1})
+
+    install_replica(id, %{
+      epoch: stamp.epoch,
+      wal_gen: stamp.wal_gen,
+      wal_ordinal: stamp.wal_ordinal,
+      offset: stamp.offset + 1
+    })
+
     tear_down_primary(id, conn, coordinator)
 
     assert open_and_read(id) == Enum.to_list(1..10)

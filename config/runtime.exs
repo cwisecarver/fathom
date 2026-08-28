@@ -937,8 +937,11 @@ end
 # the socket — so turning it on before the code is everywhere breaks replication fleet-wide. It
 # follows REPLICATION_SIGN_FRAMES instead: land the code, roll it out, THEN flip this.
 #
-# Off, a follower records no ordinal and `Promote.fresher?/2` keeps today's behaviour — the
-# pre-existing bug, inert rather than wrong.
+# OFF, A2 PROMOTION IS INERT — not "keeps today's behaviour". `Promote.fresher?/2` ranks on the
+# ordinal and refuses a replica that states none, so promote-on-open and cross-fleet recovery both
+# fall back to the stored object, which is the pre-A2 answer and always correct. The ordering they
+# used before this landed could rank two unrelated WALs and promote over a NEWER object; off is
+# never worse than off, subtly wrong on a data-loss path is.
 case env_bool.("REPLICATION_ORDINAL_WIRE") do
   nil -> :ok
   v -> config :fathom, :replication_ordinal_wire, v

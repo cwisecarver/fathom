@@ -861,6 +861,36 @@ defmodule Fathom.Shard.Replication.Follower do
   # the first draft, and the pausable-peer transport test started intermittently reporting
   # `:disconnected` where it expects `:already_in_flight`. An `:ets.lookup` on a
   # `read_concurrency` table is strictly cheaper than the syscall it replaces.
+  @doc """
+  Record the WAL ordinal a PULLED replica was offered at (expert review 2026-08-26 #2, step 3b).
+
+  A pulled seed installs `FollowerLog.seeded/5`'s state, which states no ordinal — `SeedBegin`
+  carries none — so without this the survivor holds a replica `Promote.fresher?/2` can never rank
+  and cross-fleet recovery ends where it began: cold-opening the stale object. The number comes
+  from the offer the peer was CHOSEN on, which is the only statement about these bytes we have.
+
+  Taking the offer's value is safe in the one direction that matters. If the peer moved between
+  offering and streaming it can only have moved FORWARD — a new WAL takes a higher ordinal, a
+  checkpoint likewise — so this either matches or UNDER-claims. An under-claim costs at most a
+  promotion; an over-claim would cost the acked tail.
+
+  No-op for an unstated (0) ordinal, and for a shard this follower does not hold.
+  """
+  @spec note_ordinal(atom(), String.t(), non_neg_integer()) :: :ok
+  def note_ordinal(name \\ __MODULE__, shard_id, ordinal)
+
+  def note_ordinal(_name, _shard_id, ordinal) when not (is_integer(ordinal) and ordinal > 0),
+    do: :ok
+
+  def note_ordinal(name, shard_id, ordinal) do
+    case state_of(name, shard_id) do
+      %{} = state -> put_state(name, shard_id, %{state | wal_ordinal: ordinal})
+      _ -> :ok
+    end
+
+    :ok
+  end
+
   defp put_state(name, shard_id, state) do
     tab = table(name)
 

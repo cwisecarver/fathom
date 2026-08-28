@@ -100,6 +100,33 @@ confirms the code is everywhere. Until that flag is on, `fresher?/2` sees `linea
 replica and refuses to rank it, so promotion stays inert — which is what it already was, not a
 regression.
 
+### The ordinal, and why promotion is inert until you turn it on (2026-08-26 #2)
+
+`fresher?/2`'s second component was `wal_gen`, and `wal_gen` is SQLite's `ckpt_seq`: it counts
+checkpoints **within one WAL file** and restarts at 0 when SQLite deletes and recreates that file —
+which it does after every Hrana stream on a quiet shard. Measured here, two consecutive streams both
+read `ckpt_seq=0` with salts 977542977 then 978380554. So the ordering could compare positions from
+two *unrelated* WALs and promote a replica over an object that is strictly newer, losing the acked
+tail silently and indistinguishably from A2 being switched off.
+
+The replacement is a monotone per-lineage **ordinal**, assigned by the shard coordinator
+(`Fathom.Shard.wal_ordinal/2`). It answers the same number for the same salt and a higher one for a
+new salt, which is what lets the object's stamp and the replicas' positions be on ONE scale: the
+coordinator stamps it at flush, `Replication.Session` pushes it, and both read the same answer. It
+rides two new type codes — one on the push frame, one on the peer position offer — behind
+`REPLICATION_ORDINAL_WIRE`, which **defaults off**, for the same reason every other code did.
+
+**Until you turn it on, promote-on-open and cross-fleet recovery do nothing.** Every replica states
+ordinal 0, `fresher?/2` refuses to rank a 0 in either direction, and both paths fall back to the
+stored object. That is not a regression to route around: it is the honest replacement for an
+ordering that was wrong on a data-loss path. Roll the code out, confirm it is everywhere, then set
+`REPLICATION_ORDINAL_WIRE=true`.
+
+Both halves of the offer matter. The push frame is what gives a node's OWN replica an ordinal; the
+position offer is what lets a survivor rank someone else's. With only the first, local promotion
+works and a survivor that holds nothing still cold-opens the stale object — the exact failover this
+subsystem exists for.
+
 **Still conditional on one thing:** the recovering node must have `REPLICATION_LISTEN` on, since the
 pull installs through its local replica directory. That matches the documented rollout order, and a
 node that cannot hold a replica could not be a useful survivor for anyone else either.
