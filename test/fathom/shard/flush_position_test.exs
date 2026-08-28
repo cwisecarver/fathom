@@ -32,6 +32,7 @@ defmodule Fathom.Shard.FlushPositionTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Replication.Promote
+  alias Fathom.Shard.Replication.Wal
   alias Fathom.Shard.Storage
   alias Fathom.ShardExecutor
   alias Fathom.Shards
@@ -42,31 +43,44 @@ defmodule Fathom.Shard.FlushPositionTest do
       assert Storage.parse_position(Storage.encode_position(pos)) == pos
     end
 
-    # The salt-bearing form (expert review 2026-08-26 #2). `wal_gen` is SQLite's ckpt_seq, which
-    # RESTARTS AT 0 when SQLite recreates the `-wal` — measured on this codebase, two consecutive
-    # streams on a quiet shard both read ckpt_seq=0 with salts 977542977 then 978380554. So the
-    # generation number alone is not an ordering, and `salt1` is what says WHICH WAL a stamp
-    # describes. The follower side has always carried it (`FollowerLog.t()`); the object stamp can
-    # now carry it too.
+    # THIS TEST PREVIOUSLY ASSERTED THE OPPOSITE FIELD ORDER — `"7:3:12392:978380554"`, salt fourth
+    # — and updating it is deliberate (expert review 2026-08-26 #2, step 3).
     #
-    # Nothing EMITS the four-field form yet — `Promote.fresher?/2` still ignores the salt, and what
-    # to do when salts differ is a parked decision (see the audit's #2 entry). This pins the wire
-    # format so both halves of a mixed-version fleet are already tolerant when it does.
-    test "round-trips the salt-bearing form, and treats a three-field stamp as salt-unknown" do
-      with_salt = %{epoch: 7, wal_gen: 3, offset: 12_392, salt1: 978_380_554}
-      assert Storage.encode_position(with_salt) == "7:3:12392:978380554"
-      assert Storage.parse_position(Storage.encode_position(with_salt)) == with_salt
+    # The salt-bearing form was groundwork written before #2's design settled, when the plan was to
+    # rank on the salt. It is not: a salt is an IDENTITY, so the most it can say is "these are
+    # different WALs", and refusing to rank on that turns promote inert for the common
+    # post-checkpoint case. The settled design ranks on a monotone ORDINAL, and that made the field
+    # order matter for a concrete reason: `position_after_checkpoint/3` has an ordinal to over-claim
+    # for a WAL that no longer exists, so it has no current salt to name. The ranking field has to
+    # be expressible ALONE, which means fourth.
+    #
+    # Reordering was safe because NOTHING EVER WROTE a four-field stamp — the salt clause was
+    # reachable only from a `position` map carrying `:salt1`, and no code path built one. That was
+    # verified by grep before the change; this test is the thing that will notice if it stops
+    # being true.
+    test "round-trips the ordinal-bearing form, and treats a three-field stamp as unknown" do
+      with_ord = %{epoch: 7, wal_gen: 3, offset: 12_392, wal_ordinal: 11}
+      assert Storage.encode_position(with_ord) == "7:3:12392:11"
+      assert Storage.parse_position(Storage.encode_position(with_ord)) == with_ord
 
-      # A stamp written before #2 parses as before and simply carries no salt — ABSENT, not zero.
-      # Zero is a real salt value, so inventing one would be a fabricated identity.
+      # …and the salt rides fifth when there IS a live WAL to name.
+      with_both = Map.put(with_ord, :salt1, 978_380_554)
+      assert Storage.encode_position(with_both) == "7:3:12392:11:978380554"
+      assert Storage.parse_position(Storage.encode_position(with_both)) == with_both
+
+      # A stamp written before #2 parses as before and simply carries no ordinal — ABSENT, not
+      # zero. `Promote.fresher?/2` must read that as "unknown ⇒ the object wins", never as a zeroth
+      # generation it can rank against.
       parsed = Storage.parse_position("7:3:12392")
       assert parsed == %{epoch: 7, wal_gen: 3, offset: 12_392}
-      refute Map.has_key?(parsed, :salt1)
+      refute Map.has_key?(parsed, :wal_ordinal)
 
-      # A malformed salt refuses the WHOLE stamp rather than degrading to the three-field form:
-      # this function's rule is that anything unexpected is nil, never a partial guess.
+      # A malformed field refuses the WHOLE stamp rather than degrading to a shorter form: this
+      # function's rule is that anything unexpected is nil, never a partial guess.
       assert Storage.parse_position("7:3:12392:x") == nil
       assert Storage.parse_position("7:3:12392:-1") == nil
+      assert Storage.parse_position("7:3:12392:11:x") == nil
+      assert Storage.parse_position("7:3:12392:11:-1") == nil
     end
 
     # Every one of these must be `nil` rather than a guess. `nil` means "unknown", and the only
@@ -78,8 +92,9 @@ defmodule Fathom.Shard.FlushPositionTest do
             "",
             "1:2",
             # "1:2:3:4" was here until expert review 2026-08-26 #2 — see the round-trip test above
-            # for why four fields is now a VALID stamp. Five still is not.
-            "1:2:3:4:5",
+            # for why four fields is now a VALID stamp. "1:2:3:4:5" left the list at step 3, when
+            # the salt joined the ordinal as a fifth field. Six still is not a stamp.
+            "1:2:3:4:5:6",
             "a:2:3",
             "1:2:x",
             "-1:2:3",
@@ -345,6 +360,80 @@ defmodule Fathom.Shard.FlushPositionTest do
       assert position_at > checkpoint_at,
              "checkpoint_then_upload/2 computes the position BEFORE the checkpoint, which " <>
                "under-claims for the same reason the snapshot path must not."
+    end
+
+    # THE ORDINAL, WHICH IS WHAT MAKES THE STAMP RANKABLE (expert review 2026-08-26 #2, step 3).
+    #
+    # Positive and negative in one place because the negative is the whole safety argument: an
+    # ordinal is stamped ONLY when the coordinator has already assigned one for the salt the flush
+    # reads off the WAL. That is what keeps the object and the replicas on ONE scale — the same
+    # coordinator answers both, and `wal_ordinal/2` returns the same number for the same salt — and
+    # a coordinator that has never seen this WAL has no number the replicas were also given, so it
+    # states none rather than inventing one.
+    test "the stamp carries the ordinal the coordinator assigned for THIS WAL", ctx do
+      %{id: id, coordinator: coordinator, conn: conn, path: path} = ctx
+
+      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE t (a INTEGER)"))
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (1)"))
+
+      # NEGATIVE FIRST, on the same shard: nothing has asked for an ordinal, so the coordinator is
+      # standing on no salt and must refuse to state one. With replication off this is every flush,
+      # which is why it is the case that has to be silent rather than zero.
+      flush!(coordinator)
+      assert {:ok, unstamped} = Storage.object_position(id)
+
+      refute Map.has_key?(unstamped, :wal_ordinal),
+             "an ordinal was stamped for a WAL the coordinator has never seen — the object and " <>
+               "its replicas would then be on two different scales, which is the #2 defect rather " <>
+               "than the fix"
+
+      # Now do what `Replication.Session` does on every salt change — and do it AFTER the write
+      # that will be flushed, not before. The first flush checkpoints, SQLite then RESTARTS the log
+      # on the next write with FRESH SALTS, and a salt read any earlier names a WAL that no longer
+      # exists by the time the flush reads it. (Which is the #2 defect itself, observed from the
+      # other side: the first draft of this test read the salt before the write and the stamp came
+      # back with no ordinal at all.)
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (2)"))
+
+      assert {:ok, %{salt1: salt}} = Wal.read(path <> "-wal")
+      ordinal = Fathom.Shard.wal_ordinal(coordinator, salt)
+
+      assert ordinal > 0,
+             "fixture: the coordinator assigned no ordinal, so the positive half below would " <>
+               "pass for the same reason the negative half does"
+
+      flush!(coordinator)
+      assert {:ok, stamped} = Storage.object_position(id)
+
+      assert stamped.wal_ordinal == ordinal,
+             "the object claims a different ordinal than the one the replicas were pushed"
+
+      # …and the salt rides along to name the WAL that ordinal belongs to.
+      assert stamped.salt1 == salt
+    end
+
+    # THE OVER-CLAIM HAS TO APPLY TO THE ORDINAL TOO, and getting this wrong inverts the fix.
+    #
+    # A checkpoint folds the WAL into the database, so the object then holds everything through the
+    # end of that WAL. Once ranking is `{lineage, wal_ordinal, offset}`, stamping the folded WAL's
+    # own ordinal N at offset 0 would LOSE to every replica still sitting in it at any offset — on
+    # the most complete copy of the shard that exists. `N + 1` at offset 0 is the same reasoning
+    # `wal_gen + 1` already uses, one field over.
+    test "a checkpointed flush over-claims the ordinal, and names no salt" do
+      source = File.read!("lib/fathom/shard.ex")
+
+      [_, body] = String.split(source, "defp position_after_checkpoint(epoch,", parts: 2)
+      [body, _] = String.split(body, "\n  # ", parts: 2)
+
+      assert body =~ "stamp_ordinal(%{epoch: epoch, wal_gen: gen + 1, offset: 0}, state, salt, 1)",
+             "position_after_checkpoint/3 no longer over-claims the ordinal. Stamping N rather " <>
+               "than N + 1 makes every replica still in the folded WAL outrank the object that " <>
+               "just absorbed it."
+
+      # And the salt must NOT ride along here: it would assert the object sits inside a WAL it is
+      # actually past. `put_salt/3` drops it whenever the ordinal was bumped.
+      assert Storage.encode_position(%{epoch: 4, wal_gen: 9, offset: 0, wal_ordinal: 12}) ==
+               "4:9:0:12"
     end
 
     test "an object flushed without a stamp reports none", ctx do

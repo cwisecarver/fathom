@@ -165,6 +165,12 @@ defmodule Fathom.Shard.Replication.Session do
        # see `Fathom.Shard.lineage/1`. 0 means "no claim", which is also what a coordinator with
        # replication off reports.
        lineage: 0,
+       # The WAL the last push shipped from, and that WAL's monotone ordinal (expert review
+       # 2026-08-26 #2). Cached together so the coordinator is asked only when the salt CHANGES —
+       # a WAL recreate, which is rare — because this sits on the tenant's synchronous commit path
+       # and `Fathom.Shard.wal_ordinal/2` is a GenServer.call. `nil`/0 until the first push.
+       wal_salt: nil,
+       wal_ordinal: 0,
        # The WAL this shard commits through, remembered from the last commit. A follower's reply can
        # arrive long after the call that provoked it returned, and acting on `:unknown_shard` means
        # reading the shard's files — so the handler needs the path without a caller to supply it.
@@ -490,6 +496,30 @@ defmodule Fathom.Shard.Replication.Session do
     :exit, _ -> 0
   end
 
+  # The monotone ordinal for the WAL identified by `salt`, cached against that salt.
+  #
+  # STABILITY is the property that matters here, not just monotonicity. The coordinator answers the
+  # same number for the same salt however often it is asked, so the ordinal this session pushes to
+  # replicas and the one the coordinator stamps on the object are THE SAME NUMBER. Two independent
+  # counters would put the object and its replicas on different scales, which is the bug rather
+  # than the fix — see `Fathom.Shard.wal_ordinal/2`.
+  defp with_ordinal(%{wal_salt: salt, wal_ordinal: n} = state, salt) when is_integer(n),
+    do: {n, state}
+
+  defp with_ordinal(state, salt) do
+    n = ordinal_of(state, salt)
+    {n, %{state | wal_salt: salt, wal_ordinal: n}}
+  end
+
+  # Never fails the session, exactly like `lineage_of/1`: a coordinator that cannot state an ordinal
+  # yields 0 ("not stated"), which `Promote.fresher?/2` refuses to rank. Losing a promotion is the
+  # correct degradation; refusing to replicate is not.
+  defp ordinal_of(state, salt) do
+    Fathom.Shard.wal_ordinal(state.coordinator, salt)
+  catch
+    :exit, _ -> 0
+  end
+
   # SHIP UNTIL CAUGHT UP, IN BOUNDED ROUNDS.
   #
   # `Primary.plan/3` caps how much WAL one push may carry, which is what breaks the feedback loop
@@ -686,6 +716,12 @@ defmodule Fathom.Shard.Replication.Session do
     with {:ok, by_range} <- payloads,
          {:ok, after_} <- recheck,
          :ok <- stable?(header, after_, :checkpoint_during_push) do
+      # Resolved ONCE per round, after `stable?/3`: every push in this batch ships from the same
+      # header, so they all carry the same ordinal, and asking after the stability check means a
+      # WAL that turned out to have been recreated mid-read never bumps the counter for bytes that
+      # are not going to be shipped.
+      {ordinal, state} = with_ordinal(state, header.salt1)
+
       {:ok,
        for {shipper, {kind, off, len}} <- plans do
          {shipper,
@@ -704,6 +740,12 @@ defmodule Fathom.Shard.Replication.Session do
             # meaningful on a reset; 0 on an append, where the follower's own offset already says
             # everything and 0 is the protocol's "no statement".
             prev_extent: if(kind == :reset, do: outgoing_extent(state, shipper), else: 0),
+            # WHICH WAL, on a scale that ORDERS (expert review 2026-08-26 #2). `salt1` above says
+            # the WAL changed; only this says which of two WALs is newer, and `Promote.fresher?/2`
+            # needs the latter. Emitted on the wire only while `Protocol.ordinal_wire?/0` is on —
+            # but resolved either way, so the coordinator's counter tracks reality regardless of
+            # the gate and the object stamp can use it before the fleet is upgraded.
+            wal_ordinal: ordinal,
             payload: Map.fetch!(by_range, {off, len})
           }}
        end, state}

@@ -1896,7 +1896,14 @@ defmodule Fathom.Shard do
             # made the same omission silent — a shard flushing with no stamp forever, which is the
             # `carry_meta` failure mode (a hand-picked key list that quietly loses an entry) one
             # layer up.
-            snapshot_state = Map.take(state, [:id, :path, :etag, :lease, :lineage])
+            # `:wal_salt` / `:wal_ordinal` ride along for the position stamp (expert review
+            # 2026-08-26 #2, step 3). Unlike `:lineage` above these are read with a DEFAULT rather
+            # than strictly, and the difference is not laxity: `flush_position/3` stamps an ordinal
+            # only when the salt it reads off the WAL MATCHES the one in this snapshot, so a
+            # missing key can only ever withhold an ordinal — never invent a wrong one. Withholding
+            # degrades to "unknown ⇒ the stored object wins", which is the pre-A2 answer.
+            snapshot_state =
+              Map.take(state, [:id, :path, :etag, :lease, :lineage, :wal_salt, :wal_ordinal])
 
             # THE SLOT IS RESERVED BEFORE THE STATE THAT OWNS ITS RELEASE EXISTS (expert review
             # 2026-08-20 #15) — the same class AGENTS.md records for `acquire_lease` → built state.
@@ -3813,23 +3820,68 @@ defmodule Fathom.Shard do
       # mark that can include frames from a rolled-back transaction. A follower's position is
       # now the committed extent, so the object's stamp has to be on the same scale or the two
       # are not comparable and the object would always look ahead.
-      {:ok, %{ckpt_seq: gen, commit_extent: extent}} ->
-        %{epoch: epoch, wal_gen: gen, offset: extent}
+      {:ok, %{ckpt_seq: gen, salt1: salt, commit_extent: extent}} ->
+        stamp_ordinal(%{epoch: epoch, wal_gen: gen, offset: extent}, state, salt, 0)
 
       {:ok, :empty} ->
-        position_after_checkpoint(epoch, pre)
+        position_after_checkpoint(epoch, pre, state)
 
       {:error, _} ->
         nil
     end
   end
 
+  # THE ORDINAL, WHICH IS WHAT `Promote.fresher?/2` RANKS ON (expert review 2026-08-26 #2, step 3).
+  #
+  # Only stamped when the WAL's salt MATCHES the one the coordinator's counter is standing on,
+  # because the whole soundness argument is that the object and the replicas carry THE SAME NUMBER
+  # for the same WAL. The coordinator assigns it (`wal_ordinal/2`) and `Replication.Session` reads
+  # the same answer for the same salt; a salt this snapshot has never seen has no number the
+  # replicas were also given, and inventing one here would put the two sides on different scales —
+  # the bug, not the fix.
+  #
+  # A mismatch is therefore ANSWERED WITH SILENCE, not with a guess: no `:wal_ordinal` key, which
+  # `fresher?/2` reads as unknown and resolves in the stored object's favour. In the case that
+  # actually matters this never fires — replication being ON is what makes promotion possible at
+  # all, and a replicating shard's Session asks for the ordinal on every salt change, so by flush
+  # time the coordinator is already standing on it.
+  #
+  # `bump` is 1 for the post-checkpoint over-claim and 0 for a live read; see
+  # `position_after_checkpoint/3`.
+  defp stamp_ordinal(position, state, salt, bump) do
+    case {Map.get(state, :wal_salt), Map.get(state, :wal_ordinal)} do
+      {^salt, n} when is_integer(n) and n > 0 ->
+        position |> Map.put(:wal_ordinal, n + bump) |> put_salt(salt, bump)
+
+      _ ->
+        position
+    end
+  end
+
+  # The salt names the WAL the ordinal belongs to, so it is stamped only for a LIVE read. After a
+  # checkpoint the ordinal is an over-claim on a WAL that no longer exists, and naming a salt there
+  # would assert the object sits inside a WAL it is actually past.
+  defp put_salt(position, salt, 0), do: Map.put(position, :salt1, salt)
+  defp put_salt(position, _salt, _bump), do: position
+
   # The WAL is empty or gone AFTER the flush. What that means depends entirely on what was there
   # BEFORE, and the two cases are opposite.
   #
   # Known generation ⇒ the checkpoint folded it in ⇒ claim the next generation at offset 0.
-  defp position_after_checkpoint(epoch, {:ok, %{ckpt_seq: gen}}),
-    do: %{epoch: epoch, wal_gen: gen + 1, offset: 0}
+  #
+  # The ordinal takes the SAME over-claim, and it has to: once `fresher?/2` ranks on
+  # `{lineage, wal_ordinal, offset}` rather than `{lineage, wal_gen, offset}`, stamping the folded
+  # WAL's own ordinal `N` at offset 0 would LOSE to every replica still sitting in that WAL at any
+  # offset — even though the object now holds all of those bytes and more. `N + 1` at offset 0 is
+  # strictly greater than every `{N, ≤Y}` and strictly less than any genuinely newer WAL's
+  # `{N + 1, >0}`, which is exactly the `gen + 1` reasoning one field over.
+  #
+  # No salt-less variant of this clause: `Wal.read/1` answers `{:ok, %{ckpt_seq, salt1, …}}` or
+  # `{:ok, :empty}` or `{:error, _}`, so a header without a salt does not exist. One was written
+  # here as a defensive fallback and dialyzer refused it as unmatchable — correctly, and it is
+  # worth not re-adding: a clause that cannot run reads as a case someone handled.
+  defp position_after_checkpoint(epoch, {:ok, %{ckpt_seq: gen, salt1: salt}}, state),
+    do: stamp_ordinal(%{epoch: epoch, wal_gen: gen + 1, offset: 0}, state, salt, 1)
 
   # Empty before AND after is AMBIGUOUS, and `nil` is the only safe answer. It reads like "a brand
   # new shard at generation 0" — which is one of the two situations — but it is equally a shard
@@ -3839,7 +3891,7 @@ defmodule Fathom.Shard do
   # time means there are no un-folded writes, so the object IS complete and preferring it over any
   # replica is correct. The price is that promote-on-open will not fire for this shard — i.e. the
   # pre-A2 behaviour, which AGENTS.md already calls "never worse than off".
-  defp position_after_checkpoint(_epoch, _pre), do: nil
+  defp position_after_checkpoint(_epoch, _pre, _state), do: nil
 
   defp snapshot_and_upload(state) do
     temp = "#{state.path}.snap.#{System.unique_integer([:positive])}"

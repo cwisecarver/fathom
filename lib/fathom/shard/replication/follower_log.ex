@@ -60,7 +60,8 @@ defmodule Fathom.Shard.Replication.FollowerLog do
           salt1: non_neg_integer(),
           next_offset: non_neg_integer(),
           torn: boolean(),
-          lineage: non_neg_integer()
+          lineage: non_neg_integer(),
+          wal_ordinal: non_neg_integer()
         }
 
   @type decision ::
@@ -133,7 +134,7 @@ defmodule Fathom.Shard.Replication.FollowerLog do
   end
 
   def decide(%{next_offset: next} = state, %Push{offset: off} = push) when off == next do
-    {:append, %{state | next_offset: next + byte_size(push.payload)}}
+    {:append, %{merge_ordinal(state, push) | next_offset: next + byte_size(push.payload)}}
   end
 
   def decide(%{next_offset: next}, %Push{}) do
@@ -161,11 +162,34 @@ defmodule Fathom.Shard.Replication.FollowerLog do
          # commit path, which is why the salt clause exists) but stops being a COPY of anything
          # until a seed rebuilds the pair. `Promote.fresher?/2` refuses it while this is set, which
          # is the whole fix: promotion falls back to the stored object, which is always correct.
-         torn: true
+         torn: true,
+         # TAKEN OUTRIGHT, never merged — this is a DIFFERENT WAL, and carrying the previous
+         # generation's ordinal across the seam is precisely the unsound comparison #2 exists to
+         # remove. An unstated ordinal lands here as 0, which `Promote.fresher?/2` refuses to rank,
+         # so the replica falls back to the stored object rather than to a stale number.
+         wal_ordinal: stated_ordinal(push)
      }}
   end
 
   defp decide_fresh(_state, %Push{}), do: {:reject, :offset_mismatch, 0}
+
+  # The ordinal the push STATES, or 0 for "not stated" — a peer that predates the field, or one
+  # whose `Protocol.ordinal_wire?/0` gate is off. A real ordinal is always >= 1: the coordinator
+  # starts its counter at 0 and `handle_call({:wal_ordinal, salt}, …)` replies `current + 1` for the
+  # first salt it sees, so 0 is unambiguously "unknown" rather than a zeroth generation.
+  defp stated_ordinal(%Push{wal_ordinal: n}) when is_integer(n) and n > 0, do: n
+  defp stated_ordinal(_), do: 0
+
+  # On an APPEND the WAL has not changed, so the ordinal has not either — but a push may now STATE
+  # one that this follower has never recorded (the gate was flipped on mid-session). Take it when it
+  # is stated, keep what we have when it is not; never write 0 over a known ordinal, which would
+  # move a rankable replica back to "unknown" for no reason.
+  defp merge_ordinal(state, push) do
+    case stated_ordinal(push) do
+      0 -> state
+      n -> %{state | wal_ordinal: n}
+    end
+  end
 
   @doc """
   State for a shard that has just been seeded from storage.
@@ -196,7 +220,12 @@ defmodule Fathom.Shard.Replication.FollowerLog do
       salt1: salt1,
       next_offset: wal_bytes,
       torn: false,
-      lineage: lineage
+      lineage: lineage,
+      # 0 = "not stated". A seed cannot know it: `SeedBegin` carries no ordinal, and inventing one
+      # here would put this replica on a scale the primary never assigned. The first push on the
+      # seeded WAL supplies it, and until then `Promote.fresher?/2` refuses to rank — the object
+      # wins, which is the pre-A2 answer and always correct.
+      wal_ordinal: 0
     }
   end
 end

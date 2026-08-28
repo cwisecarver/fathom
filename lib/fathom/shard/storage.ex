@@ -120,11 +120,24 @@ defmodule Fathom.Shard.Storage do
           :epoch => non_neg_integer(),
           :wal_gen => non_neg_integer(),
           :offset => non_neg_integer(),
-          # The WAL's IDENTITY (expert review 2026-08-26 #2). Optional: absent on a stamp written
-          # before that review, and on any stamp whose WAL could not be read. Absent means
-          # "unknown", and `Promote.fresher?/2` refuses to rank against an unknown rather than
-          # guessing — `wal_gen` alone is NOT an ordering, because it restarts at 0 whenever
-          # SQLite recreates the `-wal`.
+          # The WAL's PLACE IN THE ORDER, and the field `Promote.fresher?/2` actually ranks on
+          # (expert review 2026-08-26 #2). `wal_gen` alone is NOT an ordering — it is SQLite's
+          # `ckpt_seq`, which restarts at 0 whenever SQLite recreates the `-wal`, i.e. after every
+          # Hrana stream on a quiet shard. This is assigned by the shard coordinator
+          # (`Fathom.Shard.wal_ordinal/2`) and only ever increases within a lineage, so a recreated
+          # WAL sorts ABOVE the generation it replaced.
+          #
+          # Optional, and ABSENT MEANS UNKNOWN: a stamp written before this review, or one whose
+          # WAL could not be read, or — the case worth knowing about — one whose salt the
+          # coordinator has not seen, so it cannot state an ordinal the replicas were also pushed.
+          # `fresher?/2` refuses to rank against an unknown rather than guessing, which leaves the
+          # stored object authoritative.
+          optional(:wal_ordinal) => non_neg_integer(),
+          # The WAL's IDENTITY, alongside the ordinal that names its place. Diagnostic rather than
+          # load-bearing: it is what lets a later reader confirm an ordinal belongs to the WAL it
+          # claims. Absent when the WAL is gone at stamp time — `position_after_checkpoint/2` has
+          # an ordinal to over-claim but no current salt to name — which is exactly why the ordinal
+          # takes the fourth encoded slot and this the fifth.
           optional(:salt1) => non_neg_integer()
         }
 
@@ -570,14 +583,33 @@ defmodule Fathom.Shard.Storage do
   ## Mixed-version fleets
 
   Both directions degrade INERT, which is why this needs no rollout flag. An old node reading a
-  4-field stamp gets `nil` from its `parse_position/1` (unexpected shape) and treats the object as
-  un-overridable. A new node reading a 3-field stamp parses it without a salt, and
-  `Promote.fresher?/2` refuses to rank. Both answers are "never override the stored object" — the
-  pre-A2 behaviour AGENTS.md already calls "never worse than off".
+  longer stamp gets `nil` from its `parse_position/1` (unexpected shape) and treats the object as
+  un-overridable. A new node reading a shorter one parses it without a salt or without an ordinal,
+  and `Promote.fresher?/2` refuses to rank. Both answers are "never override the stored object" —
+  the pre-A2 behaviour AGENTS.md already calls "never worse than off".
+
+  That is also why the ordinal (#2 step 3) could be added as a FIFTH field rather than needing its
+  own gate the way the wire frame did: a stamp is read by one node at a time out of storage, so a
+  shape it does not understand costs it a promotion it would not have made anyway. A wire frame is
+  read by a peer that answers `{:error, :malformed}` and closes the socket, which is why
+  `Protocol.ordinal_wire?/0` exists and this has no counterpart.
   """
   @spec encode_position(position()) :: String.t()
-  def encode_position(%{epoch: e, wal_gen: g, offset: o, salt1: s}) when is_integer(s),
-    do: "#{e}:#{g}:#{o}:#{s}"
+  # THE ORDINAL IS THE FOURTH FIELD AND THE SALT THE FIFTH, which reverses the slot the salt-bearing
+  # groundwork reserved (#2, before step 3 settled the design). The ordinal is the field that RANKS,
+  # so it has to be expressible ALONE — `position_after_checkpoint/2` stamps one for a WAL that no
+  # longer exists and therefore has no current salt to name. With the salt fourth that stamp would
+  # need an empty slot as a sentinel, which is the kind of encoding that goes wrong quietly.
+  #
+  # Safe to reorder because NOTHING EVER WROTE a four-field stamp: the salt clause was reachable
+  # only from a `position` map carrying `:salt1`, and no code path built one. Verified by grep
+  # before the change, and `flush_position_test` pins the new layout.
+  def encode_position(%{epoch: e, wal_gen: g, offset: o, wal_ordinal: n, salt1: s})
+      when is_integer(n) and is_integer(s),
+      do: "#{e}:#{g}:#{o}:#{n}:#{s}"
+
+  def encode_position(%{epoch: e, wal_gen: g, offset: o, wal_ordinal: n}) when is_integer(n),
+    do: "#{e}:#{g}:#{o}:#{n}"
 
   def encode_position(%{epoch: e, wal_gen: g, offset: o}), do: "#{e}:#{g}:#{o}"
 
@@ -593,34 +625,42 @@ defmodule Fathom.Shard.Storage do
 
   def parse_position(raw) when is_binary(raw) do
     case String.split(raw, ":") do
-      [e, g, o] -> parse_position(e, g, o, nil)
-      # The salt-bearing form (#2). A stamp written before that review has three fields and still
-      # parses — it simply carries no salt, which `Promote.fresher?/2` treats as unknown.
-      [e, g, o, s] -> parse_position(e, g, o, s)
+      # A stamp written before #2 has three fields and still parses — it simply carries no ordinal,
+      # which `Promote.fresher?/2` treats as unknown and therefore never overrides.
+      [e, g, o] -> parse_position(e, g, o, nil, nil)
+      # The ordinal-bearing form (#2 step 3), the only one `Promote.fresher?/2` can RANK.
+      [e, g, o, n] -> parse_position(e, g, o, n, nil)
+      # …plus the salt that names the WAL the ordinal belongs to, when there is a current one.
+      [e, g, o, n, s] -> parse_position(e, g, o, n, s)
       _ -> nil
     end
   end
 
   def parse_position(_), do: nil
 
-  defp parse_position(e, g, o, s) do
+  defp parse_position(e, g, o, n, s) do
     with {epoch, ""} when epoch >= 0 <- Integer.parse(e),
          {gen, ""} when gen >= 0 <- Integer.parse(g),
          {off, ""} when off >= 0 <- Integer.parse(o),
-         {:ok, salt} <- parse_salt(s) do
-      base = %{epoch: epoch, wal_gen: gen, offset: off}
-      if salt, do: Map.put(base, :salt1, salt), else: base
+         {:ok, ord} <- parse_field(n),
+         {:ok, salt} <- parse_field(s) do
+      %{epoch: epoch, wal_gen: gen, offset: off}
+      |> put_if(:wal_ordinal, ord)
+      |> put_if(:salt1, salt)
     else
       _ -> nil
     end
   end
 
-  defp parse_salt(nil), do: {:ok, nil}
+  defp put_if(map, _key, nil), do: map
+  defp put_if(map, key, value), do: Map.put(map, key, value)
 
-  defp parse_salt(s) when is_binary(s) do
+  defp parse_field(nil), do: {:ok, nil}
+
+  defp parse_field(s) when is_binary(s) do
     case Integer.parse(s) do
-      {salt, ""} when salt >= 0 -> {:ok, salt}
-      # A malformed salt is NOT "no salt" — the whole stamp is refused, matching this function's
+      {v, ""} when v >= 0 -> {:ok, v}
+      # A malformed field is NOT "absent" — the whole stamp is refused, matching this function's
       # rule that anything unexpected returns nil rather than a partially-invented value.
       _ -> :error
     end
