@@ -3104,17 +3104,4 @@ defmodule Fathom.ShardDurabilityTest do
 
   defp local_dir, do: Fathom.Shard.data_dir()
   defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
-  # Bounded poll. AGENTS.md forbids Process.sleep as a synchronisation primitive; this is a
-  # deadline-bounded predicate wait, which is the idiom the other tests here use.
-  defp wait_until(fun, remaining_ms \\ 2_000)
-  defp wait_until(_fun, remaining_ms) when remaining_ms <= 0, do: false
-
-  defp wait_until(fun, remaining_ms) do
-    if fun.() do
-      true
-    else
-      Process.sleep(10)
-      wait_until(fun, remaining_ms - 10)
-    end
-  end
 end
