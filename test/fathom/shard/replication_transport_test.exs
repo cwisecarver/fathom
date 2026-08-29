@@ -738,13 +738,18 @@ defmodule Fathom.Shard.ReplicationTransportTest do
       on_exit(fn -> File.rm_rf(dir) end)
 
       # The accept loop is the process blocked in :gen_tcp.accept on this listener's socket.
-      loop =
-        Process.info(pid, :links)
-        |> elem(1)
-        |> Enum.find(fn p ->
-          is_pid(p) and
-            match?({:current_function, {:prim_inet, _, _}}, Process.info(p, :current_function))
-        end)
+      #
+      # POLLED, NOT SAMPLED ONCE (CI, OTP 29, run 33230391419). `Follower.port/1` returning proves
+      # the loop was SPAWNED — `handle_continue(:accept, …)` runs before any call is served — but
+      # not that it has been SCHEDULED far enough to be parked in `:prim_inet.accept0`. A freshly
+      # spawned process still shows its own entry function, so a single sample on a 2-core runner
+      # found no match and the fixture refused to continue. It was right to: the assertion below
+      # would have been measuring nothing. What was missing is that "spawned" and "parked" are
+      # different instants, and only the second one is identifiable this way.
+      #
+      # Bounded and it FLUNKS — never a sleep-and-hope. A loop that never reaches `:prim_inet` is a
+      # real defect, and this still says so.
+      loop = await_accept_loop!(pid, 200)
 
       assert is_pid(loop), "could not find the accept loop; the fixture proves nothing"
 
@@ -761,6 +766,25 @@ defmodule Fathom.Shard.ReplicationTransportTest do
       # The port is genuinely released — terminate/2 ran.
       assert {:ok, l} = :gen_tcp.listen(port, [:binary, reuseaddr: true, active: false])
       :gen_tcp.close(l)
+    end
+
+    defp await_accept_loop!(_pid, 0), do: nil
+
+    defp await_accept_loop!(pid, tries) do
+      found =
+        Process.info(pid, :links)
+        |> elem(1)
+        |> Enum.find(fn p ->
+          is_pid(p) and
+            match?({:current_function, {:prim_inet, _, _}}, Process.info(p, :current_function))
+        end)
+
+      if is_pid(found) do
+        found
+      else
+        Process.sleep(5)
+        await_accept_loop!(pid, tries - 1)
+      end
     end
   end
 
