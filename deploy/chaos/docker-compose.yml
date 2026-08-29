@@ -204,6 +204,21 @@ x-fathom-node: &fathom-node
     interval: 5s
     timeout: 3s
     retries: 12
+  # Bind the replication listener to THIS container's private compose-network IP. The prod exposure
+  # guard (Application.check_replication_exposure!, review #3) refuses REPLICATION_LISTEN on all
+  # interfaces without REPLICATION_BIND_IP — and 0.0.0.0 counts as "all interfaces" — so the rig,
+  # which is MIX_ENV=prod, could not boot with replication on until each node was pinned to its own
+  # address. The compose network is private (no public interface to hide from) but the guard is
+  # correctly conservative, so we hand it a concrete non-wildcard IP. `hostname -i` is the container's
+  # eth0 IP, exactly what a peer's REPLICATION_ADVERTISE_HOST=fathomN resolves to. `$$` escapes
+  # compose interpolation so the shell sees `$` (same as lb-reloader below).
+  command:
+    - /bin/sh
+    - -c
+    - |
+      export REPLICATION_BIND_IP="$$(hostname -i | awk '{print $$1}')"
+      echo "replication bind ip: $$REPLICATION_BIND_IP"
+      exec /app/bin/fathom start
 
 services:
   postgres:
