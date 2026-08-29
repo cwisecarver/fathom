@@ -95,6 +95,18 @@ x-fathom-env: &fathom-env
   # Without it `Promote.fresher?/2` sees `lineage: 0` on every replica and refuses to rank it, so
   # every promotion scenario on this rig silently measures the inert path.
   REPLICATION_LINEAGE_WIRE: "${REPLICATION_LINEAGE_WIRE:-true}"
+  # The ordinal push frame (2026-08-26 #2), ON here for the same reason LINEAGE_WIRE is: one image,
+  # no version boundary, so the mixed-version hazard cannot occur — and with it OFF `Promote.fresher?/2`
+  # refuses every replica, so every promotion/RPO scenario on this rig silently measures the inert
+  # path. Prod now defaults it ON too (config/config.exs); pinned explicit so the rig does not depend
+  # on that default.
+  REPLICATION_ORDINAL_WIRE: "${REPLICATION_ORDINAL_WIRE:-true}"
+  # Frame authentication (2026-08-20 #3). OFF here, pinned explicit: prod now defaults these ON, but
+  # signing needs a shared key (HRANA_TOKEN_SECRET / REPLICATION_HMAC_SECRET) the rig does not set,
+  # and `check_replication_frame_auth!` refuses to boot with signing on and no key. Turn both on with
+  # a shared secret when the rig should exercise the authenticated wire.
+  REPLICATION_SIGN_FRAMES: "${REPLICATION_SIGN_FRAMES:-false}"
+  REPLICATION_HMAC_REQUIRED: "${REPLICATION_HMAC_REQUIRED:-false}"
   # THE TWO BOUNDS THAT CLOSE THE 1024-TENANT OOM. Left EMPTY so a run exercises the shipped
   # defaults (1 MiB per push, 1 GiB queued per node) — the rig's job is to test what production
   # gets, not a rig-only tuning. Set either to sweep; 0 disables one, which is how you reproduce

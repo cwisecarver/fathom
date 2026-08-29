@@ -49,6 +49,25 @@ config :fathom, :fence_writes_when_stealable, config_env() == :prod
 config :fathom, :replication_listen, config_env() == :prod
 config :fathom, :replication_enabled, config_env() == :prod
 
+# The wire-format + frame-authentication flags, ALSO default ON in prod (off in dev/test) — for the
+# same "replication is core" reason. With them off two core guarantees are missing: failover
+# PROMOTION is inert (`:replication_ordinal_wire` — the freshness rank refuses a replica that states
+# no monotone ordinal, so node-loss recovery falls back to the stored object and RPO≈0 never lands),
+# and the replication port is UNAUTHENTICATED (`:replication_sign_frames` +
+# `:replication_hmac_required` — an HMAC over the frame header is the only thing stopping a peer that
+# reaches the port from seeding a forged replica).
+#
+# These change the wire format, so on an ALREADY-RUNNING fleet they must be rolled out in order,
+# AFTER the code is on every node — a peer one deploy behind answers `:malformed` and drops the
+# socket (docs/configuration.md). Defaulting them on is safe here because fathom has no deployed
+# fleet to straddle; a future rolling upgrade across a wire change forces them `=false` on the first
+# deploy (runtime.exs overrides), then removes the override. A prod node with signing on needs a
+# frame-auth key — set `HRANA_TOKEN_SECRET` or `REPLICATION_HMAC_SECRET`, else
+# `check_replication_frame_auth!` refuses the boot.
+config :fathom, :replication_ordinal_wire, config_env() == :prod
+config :fathom, :replication_sign_frames, config_env() == :prod
+config :fathom, :replication_hmac_required, config_env() == :prod
+
 # Per-query statement deadline (expert review 2026-08-26 #15). PROD-ONLY, like the write fence
 # above and for the same reason: it changes what a query can do, so dev and test keep the
 # unbounded behaviour their fixtures assume, and the deployed default is bounded.

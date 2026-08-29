@@ -1,13 +1,15 @@
 # A2 — Quorum replication
 
-**Status: WORKING, ON `main` (merged 2026-08-12). ON BY DEFAULT IN PROD since 2026-08-29**
-(ship + receive; off in dev/test — `config/config.exs`). A prod node now **fails to boot** without
-`REPLICATION_FOLLOWERS` + `REPLICATION_BIND_IP` — that fail-closed boot is the enforcement of
-"replication is core, not optional". The failover-promotion **wire** flag (`REPLICATION_ORDINAL_WIRE`)
-and the frame-auth pair (`REPLICATION_SIGN_FRAMES`/`REPLICATION_HMAC_REQUIRED`) stay **staged env
-flips**: they change the wire format, so flip them fleet-wide only AFTER this code is deployed
-everywhere. Until `REPLICATION_ORDINAL_WIRE` is on, shipping + quorum durability are live but
-promotion is inert (falls back to the stored object). Scoped
+**Status: WORKING, ON `main` (merged 2026-08-12). ON BY DEFAULT IN PROD since 2026-08-29** — the
+whole feature, not half of it: ship + receive + the ordinal push frame + frame authentication all
+default ON in prod (off in dev/test — `config/config.exs`). A prod node now **fails to boot** unless
+it is configured for it: `REPLICATION_FOLLOWERS` (else nothing to ship to), `REPLICATION_BIND_IP`
+(else the unauthenticated port is on every interface), and a frame-auth key `HRANA_TOKEN_SECRET` /
+`REPLICATION_HMAC_SECRET` (else signing has no key). That fail-closed boot is the enforcement of
+"replication is core, not optional". Each gate is still separately forceable via env, and the
+**staged wire-rollout order** (deploy → sign → require; deploy → then ordinal) now matters only for a
+**future rolling upgrade across a frame-format change** — fathom is greenfield, so the first deploy
+carries the whole shape to a fleet with no version boundary. Scoped
 2026-08-08; both decision gates cleared the same day; the transport, commit path, seeding and
 promotion built 2026-08-08/09; **proven end to end multi-node 2026-08-11** — `chaos.sh smoke`
 passes with `REPLICATION_ENABLED=true` (five tenants, every write quorum-replicated, cross-shard

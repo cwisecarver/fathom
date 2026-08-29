@@ -893,12 +893,20 @@ end
 #
 # There is deliberately NO permissive middle value. A mode that accepts what it cannot verify is
 # not a control, and the ones that ship as temporary never get turned off.
-if System.get_env("REPLICATION_SIGN_FRAMES") in ~w(true 1) do
-  config :fathom, :replication_sign_frames, true
+#
+# BOTH DEFAULT ON IN PROD (config/config.exs) — the greenfield fleet has no version boundary to
+# straddle, so the 1-2-3 above is the procedure for a FUTURE rolling upgrade across a wire change,
+# reached by forcing these `=false` on the first deploy. The overrides below force either way; a
+# prod node with signing on still needs a key (`HRANA_TOKEN_SECRET` / `REPLICATION_HMAC_SECRET`) or
+# `check_replication_frame_auth!` refuses the boot.
+case env_bool.("REPLICATION_SIGN_FRAMES") do
+  nil -> :ok
+  v -> config :fathom, :replication_sign_frames, v
 end
 
-if System.get_env("REPLICATION_HMAC_REQUIRED") in ~w(true 1) do
-  config :fathom, :replication_hmac_required, true
+case env_bool.("REPLICATION_HMAC_REQUIRED") do
+  nil -> :ok
+  v -> config :fathom, :replication_hmac_required, v
 end
 
 # The signing key. Derived (never used raw) from REPLICATION_HMAC_SECRET when set, otherwise from
@@ -940,11 +948,12 @@ end
 # object, and the survivor cold-opens the stale bytes with the acked tail gone. Silently.
 # `REPLICATION_ORDINAL_WIRE` starts emitting the monotone ordinal that fixes it.
 #
-# OFF BY DEFAULT, unlike REPLICATION_LINEAGE_WIRE above, and the difference is deliberate. That one
-# defaults ON because it guards a window that closes once and leads a rolling upgrade. This adds a
-# frame code that every currently-deployed peer answers `{:error, :malformed}` to and then closes
-# the socket — so turning it on before the code is everywhere breaks replication fleet-wide. It
-# follows REPLICATION_SIGN_FRAMES instead: land the code, roll it out, THEN flip this.
+# ON BY DEFAULT IN PROD (config/config.exs) since 2026-08-29 — off in dev/test. It adds a frame code
+# that a peer running OLDER code answers `{:error, :malformed}` to and then closes the socket, so on
+# an ALREADY-RUNNING fleet it must not be emitted before the code is everywhere: land, roll out, THEN
+# flip (the same order as REPLICATION_SIGN_FRAMES). Defaulting it on is safe here because fathom has
+# no deployed fleet to straddle; a future rolling upgrade across the frame code forces it `=false`
+# on the first deploy via the override below, then removes it.
 #
 # OFF, A2 PROMOTION IS INERT — not "keeps today's behaviour". `Promote.fresher?/2` ranks on the
 # ordinal and refuses a replica that states none, so promote-on-open and cross-fleet recovery both
