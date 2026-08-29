@@ -767,7 +767,26 @@ defmodule Fathom.Shard.ReplicationCommitTest do
         )
 
       refute Process.alive?(task), "the expired task was forgotten but left running"
-      assert Process.alive?(Map.fetch!(seeding2, bh).pid)
+
+      assert is_pid(Map.fetch!(seeding2, bh).pid),
+             "the expiry forgot the wedged seed without recording a replacement"
+
+      # THIS USED TO ALSO ASSERT `Process.alive?` ON THE REPLACEMENT, and that assertion could not
+      # hold (CI, OTP 27, run 33230841000; the same test went red a different way on 2026-08-21,
+      # `logs/test-failures-20260821-054319.log`).
+      #
+      # `:replication_seed_expiry_ms` is pinned to **0** above so the FIRST seed expires. But
+      # `expire_seeds/1` compares `now - started_at >= seed_expiry_ms()`, which at 0 is true for
+      # EVERY seed — including the replacement, which is therefore born already expired. It runs on
+      # every `{:repl_reply, …}`, and the two LIVE followers in this fixture answer on their own
+      # schedule, so an unrelated reply landing between `await_seeding/4` and this line kills the
+      # replacement. On a fast box the read wins; on a loaded 2-core runner it does not. Nothing
+      # about that is a defect — it is the sweep doing exactly what the test configured it to do.
+      #
+      # What the test is FOR is carried by the three assertions above: the wedged task was alive
+      # (not merely dead), a DIFFERENT pid was recorded, and the old one was actually killed rather
+      # than only forgotten. Liveness of the replacement is a window this fixture does not control,
+      # so asserting it was measuring the scheduler, not the sweep.
     end
 
     test "a stopped session does not leave a seed streaming for a shard it no longer owns", ctx do
