@@ -726,6 +726,23 @@ defmodule Fathom.Shard.Connection do
   end
 
   defp watchdog_init(conn, owner) do
+    # HIGH PRIORITY so a saturated scheduler cannot starve the deadline (CI, OTP 28/29, 2026-08-29).
+    #
+    # `await_disarm/3` re-issues its cancel every @cancel_retry_ms until the owner disarms, and its
+    # correctness rests on one unstated assumption: that the next cancel actually RUNS. The watchdog
+    # is a plain process, and while the owner is blocked in the `multi_step` dirty NIF the watchdog
+    # must get an ORDINARY scheduler slot to call `Sqlite3.cancel`. On a loaded 2-core runner it did
+    # not — the run queue was full of the rest of the suite, the watchdog was not scheduled for the
+    # whole life of the query, and a 200 000 000-row recursive CTE ran to COMPLETION under a 60 ms
+    # deadline (`rows: [[200000000]]`). The retry loop was right; it never executed.
+    #
+    # `:high` makes the watchdog preempt normal-priority work, so its cancels land within a retry
+    # interval of the statement reaching a scheduler. It is cheap to run at this priority: the
+    # process is blocked in `receive` (not runnable) except in the brief window when a deadline is
+    # actually firing, and `Sqlite3.cancel` is a quick non-dirty NIF, so it never competes with the
+    # query itself (which runs on a DIRTY scheduler). Not `:max`, which is reserved for core runtime
+    # processes and can wedge the scheduler.
+    Process.flag(:priority, :high)
     mon = Process.monitor(owner)
     watchdog_loop(conn, mon)
   end

@@ -231,4 +231,31 @@ defmodule Fathom.ConnectionWatchdogTest do
     # Release the hand-armed watchdog so it stops cancelling this connection.
     send(watchdog, {:done, ref})
   end
+
+  # The watchdog runs at `:high` priority so a saturated scheduler cannot starve its deadline
+  # cancels (CI, OTP 28/29, 2026-08-29, run 33234915078). The failure was the "re-arms" test's
+  # SECOND slow query returning `{:ok, rows: [[200000000]]}` — a 200M-row recursive CTE that RAN TO
+  # COMPLETION under a 60 ms deadline. `await_disarm/3` re-issues its cancel every @cancel_retry_ms,
+  # but that only bounds the query if the watchdog actually gets a scheduler slot to run the cancel;
+  # while the owner is blocked in the `multi_step` DIRTY NIF, a normal-priority watchdog on a loaded
+  # 2-core runner was not scheduled for the whole life of the query, so no cancel ever landed and
+  # the deadline bounded nothing.
+  #
+  # Deterministic where the contention is not: rather than race a slow query against a stalled
+  # scheduler, assert the invariant the fix rests on. Fails against the pre-fix (`:normal`) watchdog.
+  test "the per-connection watchdog runs at elevated priority", %{conn: conn} do
+    Application.put_env(:fathom, :query_timeout_ms, 60)
+
+    # One guarded query so the per-connection watchdog is spawned and parked.
+    assert {:ok, _} = Connection.query(conn, "SELECT 1", [])
+
+    watchdog = Process.get({Connection, :watchdog, conn})
+
+    assert is_pid(watchdog) and Process.alive?(watchdog),
+           "fixture: no per-connection watchdog is armed, so this test would measure nothing"
+
+    assert Process.info(watchdog, :priority) == {:priority, :high},
+           "a normal-priority watchdog is starved on a saturated runner and its retry cancels " <>
+             "never fire, so :query_timeout_ms bounds nothing — see the CI failure this guards"
+  end
 end
