@@ -1,6 +1,13 @@
 # A2 — Quorum replication
 
-**Status: WORKING, ON `main` (merged 2026-08-12), off by default.** Scoped
+**Status: WORKING, ON `main` (merged 2026-08-12). ON BY DEFAULT IN PROD since 2026-08-29**
+(ship + receive; off in dev/test — `config/config.exs`). A prod node now **fails to boot** without
+`REPLICATION_FOLLOWERS` + `REPLICATION_BIND_IP` — that fail-closed boot is the enforcement of
+"replication is core, not optional". The failover-promotion **wire** flag (`REPLICATION_ORDINAL_WIRE`)
+and the frame-auth pair (`REPLICATION_SIGN_FRAMES`/`REPLICATION_HMAC_REQUIRED`) stay **staged env
+flips**: they change the wire format, so flip them fleet-wide only AFTER this code is deployed
+everywhere. Until `REPLICATION_ORDINAL_WIRE` is on, shipping + quorum durability are live but
+promotion is inert (falls back to the stored object). Scoped
 2026-08-08; both decision gates cleared the same day; the transport, commit path, seeding and
 promotion built 2026-08-08/09; **proven end to end multi-node 2026-08-11** — `chaos.sh smoke`
 passes with `REPLICATION_ENABLED=true` (five tenants, every write quorum-replicated, cross-shard
@@ -36,7 +43,7 @@ deleting it.
 **Not built:** per-shard follower sets, and zone-aware placement. The RTT sweep makes placement an
 82× lever, which makes it an operator-intent decision rather than one to infer — see
 [Replication factor](#replication-factor-n-vs-ack-threshold-q--do-not-set-q--n). Operator config is
-[configuration.md](configuration.md#quorum-replication-phase-2-a2--off-by-default).
+[configuration.md](configuration.md#quorum-replication-phase-2-a2--on-by-default-in-prod).
 
 ### The RPO claim was conditional until 2026-08-12, and survivor selection is why
 

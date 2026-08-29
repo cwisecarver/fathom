@@ -660,8 +660,13 @@ end
 # variable, same image, 512 tenants (2026-08-18): 5,000 -> 30,000 ms took the run from 22,599
 # errors to 4 and +49% throughput, with `:stale_wal_gen` and `:overloaded` both going to ZERO.
 # `Fathom.Application.check_replication_flush_interval!/0` warns at boot when the two disagree.
-if System.get_env("REPLICATION_ENABLED") in ~w(true 1) do
-  config :fathom, :replication_enabled, true
+# ON BY DEFAULT IN PROD (config/config.exs) — replication is core, not opt-in. This override forces
+# it either way: REPLICATION_ENABLED=false opts a single prod node out (also the first step of a
+# rolling upgrade FROM a fleet that had replication off), =true turns shipping on in dev for a local
+# multi-node test.
+case env_bool.("REPLICATION_ENABLED") do
+  nil -> :ok
+  v -> config :fathom, :replication_enabled, v
 end
 
 # The follower set, as `node_key@host:port` pairs, e.g.
@@ -835,8 +840,12 @@ end
 # ROLLOUT ORDER: turn this on FLEET-WIDE FIRST, confirm every node is listening, and only then
 # enable REPLICATION_ENABLED anywhere. A node can host others' replicas without replicating its
 # own shards, which is exactly why these are two flags and not one.
-if System.get_env("REPLICATION_LISTEN") in ~w(true 1) do
-  config :fathom, :replication_listen, true
+# ON BY DEFAULT IN PROD (config/config.exs). This override forces it either way; REPLICATION_LISTEN=false
+# opts a node out of hosting replicas. The ROLLOUT ORDER above still holds when turning replication on
+# by env on a fleet that had it off: listeners up fleet-wide FIRST, shippers second.
+case env_bool.("REPLICATION_LISTEN") do
+  nil -> :ok
+  v -> config :fathom, :replication_listen, v
 end
 
 # Port the follower listener binds. Default 9100 — the port this file's REPLICATION_FOLLOWERS

@@ -30,6 +30,25 @@ config :fathom, :max_open_shards, 10_000
 # in prod (a data-loss guard, like the flush fence itself), off in dev/test. See Fathom.Shard.WriteFence.
 config :fathom, :fence_writes_when_stealable, config_env() == :prod
 
+# Replication is a CORE part of fathom, not an opt-in. In prod BOTH halves default ON: this node
+# hosts peers' replicas (:replication_listen) and ships its own shards' WAL to a quorum
+# (:replication_enabled). Dev and test stay OFF — they are single-node with no peers, and the boot
+# guards below would (correctly) refuse to start an unconfigured node.
+#
+# Those same guards ARE the "not optional" enforcement: a PROD node that boots with these on but
+# without REPLICATION_FOLLOWERS (nothing to ship to — Fleet.validate_quorum!) or REPLICATION_BIND_IP
+# (an unauthenticated port on every interface — Application.check_replication_exposure!) FAILS TO
+# BOOT rather than silently serving unreplicated. Configure both on every prod node, or set
+# REPLICATION_ENABLED=false / REPLICATION_LISTEN=false (config/runtime.exs) to deliberately opt a
+# single node out or to lead a rolling upgrade listeners-first.
+#
+# Shipping + quorum durability are live from this default. Failover PROMOTION (RPO≈0 on node loss)
+# additionally needs REPLICATION_ORDINAL_WIRE, a wire-format change on its own staged rollout: land
+# this code fleet-wide FIRST, then flip that env var. Promotion stays inert (falls back to the
+# stored object) until then. See docs/a2-quorum-replication.md.
+config :fathom, :replication_listen, config_env() == :prod
+config :fathom, :replication_enabled, config_env() == :prod
+
 # Per-query statement deadline (expert review 2026-08-26 #15). PROD-ONLY, like the write fence
 # above and for the same reason: it changes what a query can do, so dev and test keep the
 # unbounded behaviour their fixtures assume, and the deployed default is bounded.

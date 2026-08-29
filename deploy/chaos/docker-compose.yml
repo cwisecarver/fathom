@@ -74,11 +74,15 @@ x-fathom-env: &fathom-env
   # interface to hide from, and each node's IP is assigned at runtime. Expect the boot line to name
   # 0.0.0.0 and say so — that warning firing IS the check that the knob is wired.
   #
-  # Shipping is per-scenario: empty by default so the rig runs exactly as before, and flipped for
+  # Shipping is per-scenario: OFF by default so the rig runs exactly as before, and flipped for
   # a run with `REPLICATION_ENABLED=true ./chaos.sh replication`. REPLICATION_FOLLOWERS is set
   # PER NODE below (each node's four peers, never itself) — a shared list would have every node
   # shipping its own shards to its own listener, which works but muddies every result.
-  REPLICATION_ENABLED: "${REPLICATION_ENABLED:-}"
+  #
+  # Pinned to an explicit `:-false` (not empty) since 2026-08-29: prod now defaults
+  # `:replication_enabled` ON (config/config.exs), and an empty value would inherit that default
+  # and make every plain `./chaos.sh up` ship — the rig keeps its opt-in-per-scenario model.
+  REPLICATION_ENABLED: "${REPLICATION_ENABLED:-false}"
   REPLICATION_QUORUM: "${REPLICATION_QUORUM:-2}"
   # The lineage-carrying seed frame (2026-08-24 #12), ON here and OFF in production defaults.
   #

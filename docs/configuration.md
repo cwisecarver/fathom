@@ -167,7 +167,7 @@ tenant-controllable signal, so it presumes the Hrana trust boundary is enforced.
 | `WARM_MIN_REPULL_MS` | 10 × `WARM_POLL_MS` | Floor on how often ONE cached shard's body may be re-transferred. | **This is what bounds the follower's steady-state cost.** A continuously-written tenant flushes faster than the poll, so without it every refresh is a full body + fsync, forever. Worst-case ingress is Σ(cached sizes) ÷ this. Raising it trades failover RTO on write-hot shards for bandwidth and device writes — never correctness, since promotion revalidates before serving. |
 | `WARM_REFRESH_BYTES_PER_S` | unset (uncapped) | Hard cap on warm-refresh ingress, spent lag-first. | Bounds the aggregate independently of cache size — set it to what the node's NIC/disk can spare. Too small doesn't break the cache, it just converges it more slowly (oldest-checked shard first, so the tail is never starved). |
 
-## Quorum replication (Phase-2 A2 — off by default)
+## Quorum replication (Phase-2 A2 — on by default in prod)
 
 Ships WAL frames to follower nodes and gates a tenant's commit on `REPLICATION_QUORUM` acks.
 Closes node-loss RPO from ~300 s to ~0, and it is the only thing that does. Read
@@ -185,6 +185,15 @@ Shipping and receiving are **separate gates**, and enabling them in the wrong or
 `REPLICATION_ENABLED` makes a node *ship*; `REPLICATION_LISTEN` makes a node *receive*. A shipper
 whose followers are not listening collects no acks and returns **503 `FILO_NO_QUORUM` on every
 tenant write**.
+
+> **As of 2026-08-29 both gates default ON in prod** (off in dev/test) — replication is core, not
+> opt-in (`config/config.exs`). A prod node therefore **fails to boot** unless it is given
+> `REPLICATION_FOLLOWERS` (else `Fleet.validate_quorum!` raises "nothing to replicate to") and
+> `REPLICATION_BIND_IP` (else `check_replication_exposure!` raises on the unauthenticated all-interfaces
+> port). That fail-closed boot **is** the enforcement of "not optional". The steps below are still the
+> order to follow — for the first deploy that carries this default, and any time you turn replication
+> on by env on a fleet that had it off. To deliberately run a single node without replication, set
+> `REPLICATION_ENABLED=false` and `REPLICATION_LISTEN=false`.
 
 1. Set `REPLICATION_LISTEN=true` (plus `REPLICATION_BIND_IP`, `REPLICATION_DIR`) **everywhere**, and
    confirm each node logged `replication follower listening on <ip>:<port>`.
@@ -209,7 +218,7 @@ tenant write**.
 
 | Var | Default | What it does | Safety consequence |
 |---|---|---|---|
-| `REPLICATION_LISTEN` | off | Accept frames as somebody's follower. **Turn on fleet-wide before any node ships.** | Opens an **unauthenticated** TCP port carrying raw tenant database bytes. Pin it with `REPLICATION_BIND_IP` and firewall it — the network is the trust boundary, same posture as `HRANA_AUTH` disabled. |
+| `REPLICATION_LISTEN` | **on in prod** (off dev/test) | Accept frames as somebody's follower. **Turn on fleet-wide before any node ships.** `=false` opts a node out. | Opens an **unauthenticated** TCP port carrying raw tenant database bytes. Pin it with `REPLICATION_BIND_IP` and firewall it — the network is the trust boundary, same posture as `HRANA_AUTH` disabled. |
 | `REPLICATION_LISTEN_PORT` | `9100` | Port the follower binds. | Must be reachable from every shipping node and from nowhere else. Clear of `HRANA_PORT` 8080 and `HEALTH_PORT` 8081. |
 | `REPLICATION_BIND_IP` | unset (**all interfaces**) | Interface the follower binds. | **A security control, not tuning.** Unset means every interface, which on a cloud host is the public one — and anyone who reaches the port can write into any shard this node follows. Invalid value refuses to boot. The follower logs the interface it bound; read that line. |
 | `REPLICATION_SIGN_FRAMES` | off | Sign every frame this node sends with an HMAC over the frame header. | **Step 1 of two, and it must be on fleet-wide before anything requires it.** Landing the code changes nothing on the wire; this flag is what starts emitting the signed shape (which also carries `prev_extent`, review #11a). It is a flag rather than unconditional because a node that signed the moment it restarted would be sending frames its not-yet-restarted peers cannot parse — every shard across that boundary would lose quorum for the length of the deploy. Refuses to boot with no key configured. |
@@ -219,7 +228,7 @@ tenant write**.
 | `REPLICATION_ADVERTISE_HOST` | unset | The host **peers** should dial to reach this node's replication port. Published to the fleet roster so membership can be derived instead of hand-listed. | **Never guessed** — a node cannot know which of its addresses a peer can reach, and publishing an unreachable one is worse than publishing none (the roster reports the node present while every shipper fails to connect). Unset ⇒ this node is not a membership candidate. Use the same address you would have written into `REPLICATION_FOLLOWERS` by hand. |
 | `REPLICATION_MEMBERSHIP` | `static` | Where the follower set comes from: `static` (the `REPLICATION_FOLLOWERS` list) or `roster` (addresses nodes publish to `rebalancer_nodes`). | **The static list stays the floor in `roster` mode** — whenever the roster cannot supply `REPLICATION_QUORUM+1` candidates (fresh fleet, rolling upgrade, Postgres outage) membership falls back to it rather than to nothing. A set below `quorum+1` is **refused** and the previous one stays live: `n` dropping below `q` is how `q >= n` starts raising inside a tenant's commit. Requires `REPLICATION_ADVERTISE_HOST` on candidate nodes and `LOAD_REPORTER` on (the beat rides that tick). |
 | `REPLICATION_MEMBERSHIP_POLL_MS` | `30000` | How often `roster` membership is recomputed. | Deliberately slow — a control-plane read, not a liveness signal. **Every membership change costs a seed per shard** on the added follower, over the one socket that also carries every other shard. Liveness never filters the per-commit push set; a merely-down follower stays a member and costs nothing. |
-| `REPLICATION_ENABLED` | off | Gate a tenant's commit on follower acks. | Adds a network round trip to every write. Measured +225 µs on loopback (74 → 299 µs); the real number is set by follower distance. **Requires the followers to be listening already** — see the rollout order above. |
+| `REPLICATION_ENABLED` | **on in prod** (off dev/test) | Gate a tenant's commit on follower acks. `=false` opts a node out (or leads a rolling upgrade listeners-first). | Adds a network round trip to every write. Measured +225 µs on loopback (74 → 299 µs); the real number is set by follower distance. **Requires the followers to be listening already** — see the rollout order above. On with an empty `REPLICATION_FOLLOWERS` **refuses to boot**. |
 | `REPLICATION_FOLLOWERS` | unset | Follower set as `node_key@host:port`, comma separated. `node_key@` optional. | **Order and locality are a latency decision** (see above). With `Q=2`, two followers must be near — and in a *different* AZ, or one AZ failure takes 3 of 5 copies and leaves exactly `Q` with no slack. A malformed entry **refuses to boot** rather than silently shortening the replica set. |
 | `REPLICATION_QUORUM` | `2` | Acks required before a commit returns. | **Must be < the follower count**; the boot check refuses `Q=N`. Q=N tolerates zero follower failures and inherits the slowest replica — measured 32× worse with one straggler, 82× with two far. |
 | `REPLICATION_FSYNC` | off | Follower `fdatasync`s before acking. | On costs ~398 µs against a ~96 µs floor — ~2.4× fathom's whole request round trip. Off matches Waterpark (ack from RAM, durability from replica count) and is never *worse* than today: if every replica holding an un-synced frame dies at once, the shard falls back to its S3 object, i.e. pre-A2 behaviour. |
