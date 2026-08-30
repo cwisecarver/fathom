@@ -70,9 +70,15 @@ x-fathom-env: &fathom-env
   REPLICATION_LISTEN: "true"
   REPLICATION_LISTEN_PORT: "9100"
   REPLICATION_DIR: /data/replicas
-  # REPLICATION_BIND_IP is deliberately unset: inside the compose network there is no public
-  # interface to hide from, and each node's IP is assigned at runtime. Expect the boot line to name
-  # 0.0.0.0 and say so — that warning firing IS the check that the knob is wired.
+  # REPLICATION_BIND_IP is set per node by the `command` entrypoint above to `hostname -i` (the
+  # container's private compose-network IP). The prod exposure guard
+  # (Application.check_replication_exposure!, review #3) RAISES — not warns — when the listener is on
+  # and bound to all interfaces (nil / 0.0.0.0), so the rig could not boot with replication until each
+  # node was pinned to a concrete address. The compose network is private, so there is no exposure.
+  #
+  # REPL_VIA_TOXI=1 on `up` routes every follower link through toxiproxy (see the entrypoint) so
+  # `./chaos.sh repl-latency <ms>` can inject a cross-AZ / cross-region replication hop. Off by default.
+  REPL_VIA_TOXI: "${REPL_VIA_TOXI:-}"
   #
   # Shipping is per-scenario: OFF by default so the rig runs exactly as before, and flipped for
   # a run with `REPLICATION_ENABLED=true ./chaos.sh replication`. REPLICATION_FOLLOWERS is set
@@ -218,6 +224,14 @@ x-fathom-node: &fathom-node
     - |
       export REPLICATION_BIND_IP="$$(hostname -i | awk '{print $$1}')"
       echo "replication bind ip: $$REPLICATION_BIND_IP"
+      # REPL_VIA_TOXI=1 routes every follower link through this node's toxiproxy repl proxy so
+      # `./chaos.sh repl-latency <ms>` can model a cross-AZ / cross-region replication hop. The
+      # transform is node-agnostic: each `@fathomK:9100` becomes `@toxiproxy:2910K` (proxy defined
+      # in toxiproxy.json). Off by default, so ordinary scenarios keep the direct path (no hop).
+      if [ "$$REPL_VIA_TOXI" = "1" ] && [ -n "$$REPLICATION_FOLLOWERS" ]; then
+        export REPLICATION_FOLLOWERS="$$(printf '%s' "$$REPLICATION_FOLLOWERS" | sed -E 's/@fathom([0-9]):9100/@toxiproxy:2910\1/g')"
+        echo "replication via toxiproxy: $$REPLICATION_FOLLOWERS"
+      fi
       exec /app/bin/fathom start
 
 services:

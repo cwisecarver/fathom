@@ -3,5 +3,10 @@
   { "name": "s3-fathom2", "listen": "0.0.0.0:21002", "upstream": "minio:9000", "enabled": true },
   { "name": "s3-fathom3", "listen": "0.0.0.0:21003", "upstream": "minio:9000", "enabled": true },
   { "name": "s3-fathom4", "listen": "0.0.0.0:21004", "upstream": "minio:9000", "enabled": true },
-  { "name": "s3-fathom5", "listen": "0.0.0.0:21005", "upstream": "minio:9000", "enabled": true }
+  { "name": "s3-fathom5", "listen": "0.0.0.0:21005", "upstream": "minio:9000", "enabled": true },
+  { "name": "repl-fathom1", "listen": "0.0.0.0:29101", "upstream": "fathom1:9100", "enabled": true },
+  { "name": "repl-fathom2", "listen": "0.0.0.0:29102", "upstream": "fathom2:9100", "enabled": true },
+  { "name": "repl-fathom3", "listen": "0.0.0.0:29103", "upstream": "fathom3:9100", "enabled": true },
+  { "name": "repl-fathom4", "listen": "0.0.0.0:29104", "upstream": "fathom4:9100", "enabled": true },
+  { "name": "repl-fathom5", "listen": "0.0.0.0:29105", "upstream": "fathom5:9100", "enabled": true }
 ]

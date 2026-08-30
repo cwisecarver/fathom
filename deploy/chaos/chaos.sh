@@ -9,6 +9,8 @@
 #   ./chaos.sh smoke              write+read a few tenants through the LB; check isolation
 #   ./chaos.sh owner <shard>      which node holds the shard file
 #   ./chaos.sh latency <ms>|clear inject S3 latency on every node (toxiproxy)
+#   ./chaos.sh repl-latency <ms>|clear  inject latency on the REPLICATION (follower) links to model a
+#                                 cross-AZ/region replica set. Needs `REPL_VIA_TOXI=1 ./chaos.sh up`.
 #   ./chaos.sh failover <shard>   silent-kill the owner; time LB reroute + survivor steal
 #   ./chaos.sh failover-herd [shards warm]  kill a node holding N shards; measure time-to-served
 #                                 across ALL its tenants (p50/p90/p99/max) — the herd, warm=on|off
@@ -369,6 +371,36 @@ cmd_latency() {
         "{\"name\":\"lat_up\",\"type\":\"latency\",\"stream\":\"upstream\",\"attributes\":{\"latency\":$ms}}" >/dev/null
     done
     echo "S3 latency: ${ms}ms each way on all nodes"
+  fi
+}
+
+# Inject latency on the REPLICATION (follower) links, to model a cross-AZ / cross-region replica
+# set. Mirrors cmd_latency but targets the repl-fathomN toxiproxy proxies. Only has an effect when
+# the fleet was brought up with REPL_VIA_TOXI=1 (which routes each follower link through toxiproxy —
+# see docker-compose.yml); without that, replication goes node->node directly and this is a no-op.
+# `<ms>` is added each way, so a quorum ack round-trip gains ~2x that.
+cmd_repl_latency() {
+  local p n
+  if [ "${1:-}" = "clear" ]; then
+    for n in "${NODES[@]}"; do
+      p="repl-$n"
+      curl -sS -X DELETE "$TOXI/proxies/$p/toxics/lat_down" >/dev/null 2>&1
+      curl -sS -X DELETE "$TOXI/proxies/$p/toxics/lat_up" >/dev/null 2>&1
+    done
+    echo "replication latency cleared"
+  else
+    local ms=${1:?usage: repl-latency <ms>|clear}
+    for n in "${NODES[@]}"; do
+      p="repl-$n"
+      curl -sS -X POST "$TOXI/proxies/$p/toxics" -d \
+        "{\"name\":\"lat_down\",\"type\":\"latency\",\"stream\":\"downstream\",\"attributes\":{\"latency\":$ms}}" >/dev/null
+      curl -sS -X POST "$TOXI/proxies/$p/toxics" -d \
+        "{\"name\":\"lat_up\",\"type\":\"latency\",\"stream\":\"upstream\",\"attributes\":{\"latency\":$ms}}" >/dev/null
+    done
+    echo "replication latency: ${ms}ms each way on all follower links (~$((ms * 2))ms added per quorum ack RTT)"
+    if [ "${REPL_VIA_TOXI:-}" != "1" ]; then
+      echo "  NOTE: bring the fleet up with REPL_VIA_TOXI=1 or replication bypasses toxiproxy and this is inert."
+    fi
   fi
 }
 
@@ -2466,6 +2498,7 @@ case "${1:-}" in
   smoke)       cmd_smoke ;;
   owner)       shift; cmd_owner "$@" ;;
   latency)     shift; cmd_latency "$@" ;;
+  repl-latency) shift; cmd_repl_latency "$@" ;;
   failover)    shift; cmd_failover "$@" ;;
   pause-fence) shift; cmd_pause_fence "$@" ;;
   partition)   shift; cmd_partition "$@" ;;
