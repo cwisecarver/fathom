@@ -48,11 +48,14 @@ defmodule Fathom.Shards do
   @default_drain_all_concurrency 16
   @default_drain_all_flush_grace_ms 5_000
 
-  # Floor on a per-wave drain slice (expert review 2026-08-26 #5). With a large open-shard count
-  # the computed slice can round toward zero, and a slice under the flush grace means
-  # `drain_pid/2` asks the coordinator to drain in <= 0 ms — i.e. it never really tries. Better to
-  # overshoot the budget slightly on a huge fleet than to convert every shard into a no-op drain.
-  @min_drain_slice_ms 1_000
+  # Minimum time a busy shard is given to check its streams back in BEFORE the flush grace begins
+  # (expert review 2026-08-31 #3). `drain_pid/2` hands the coordinator `window - flush_grace`, so
+  # the floor that matters is on the WINDOW, not the slice: a window at or below the grace gives a
+  # busy shard ZERO drain time and it aborts `:busy`. This used to be `@min_drain_slice_ms 1_000`, a
+  # floor on the SLICE that sat BELOW the 5_000 ms grace — so beyond ~160 open shards every window
+  # collapsed to a 0 ms drain, exactly the no-op storm the drain was built to avoid. Better to
+  # overshoot the budget slightly on a huge fleet than to convert every busy shard into a no-op.
+  @min_useful_drain_ms 1_000
 
   # Expert review #21: how long a checkout HOLDS + retries a `{:shard_held}` when the holder is a
   # CRASHED node — heartbeat frozen and aging out within this window, so the steal is imminent. Turns
@@ -594,10 +597,17 @@ defmodule Fathom.Shards do
       fn pid ->
         left = max(0, deadline - System.monotonic_time(:millisecond))
         pending = max(1, :counters.get(remaining_count, 1))
-        waves_left = max(1, min(waves, ceil(pending / drain_all_concurrency())))
-        slice = max(@min_drain_slice_ms, div(left, waves_left))
         :counters.sub(remaining_count, 1, 1)
-        window = min(slice, left)
+
+        window =
+          drain_window(
+            left,
+            pending,
+            waves,
+            drain_all_concurrency(),
+            drain_all_flush_grace_ms(),
+            @min_useful_drain_ms
+          )
 
         # The window each coordinator was actually given. Emitted because it is the DECISION this
         # fix makes, and it is otherwise unobservable: a shard handed a zero window aborts `:busy`
@@ -637,6 +647,23 @@ defmodule Fathom.Shards do
       {:error, :busy} -> :busy
       _ -> :timed_out
     end
+  end
+
+  # The window a single coordinator is granted, as a pure function of the remaining budget so the
+  # "never <= flush grace" invariant (#3) is testable without standing up a fleet.
+  #
+  # Each coordinator gets its fair per-wave slice of the remaining budget, but the window is floored
+  # at `grace + min_useful` (bounded by `left`) so `drain_pid/2`'s `window - grace` wait is positive
+  # whenever the budget can afford it. `waves_left` shrinks as shards finish, so quick shards hand
+  # their unused time to the ones behind them. When `left <= grace` (the tail of the budget) the
+  # floor collapses to `left` and a busy shard genuinely has no time left — unavoidable there, and
+  # confined to the very end rather than the whole fleet.
+  @doc false
+  def drain_window(left, pending, waves, concurrency, grace, min_useful) do
+    waves_left = max(1, min(waves, ceil(pending / concurrency)))
+    slice = div(left, waves_left)
+    min_window = min(left, grace + min_useful)
+    min(left, max(slice, min_window))
   end
 
   defp drain_all_budget_ms,
