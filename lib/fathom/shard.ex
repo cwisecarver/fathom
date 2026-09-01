@@ -608,10 +608,18 @@ defmodule Fathom.Shard do
       lineage = open_lineage(shard_id)
       etag = maybe_promote_replica(shard_id, path, lease, etag1, lineage)
 
-      # No idle timer yet: a coordinator is always checked out right after it
-      # starts, and the timer is (re)armed only when the last connection checks
-      # back in. This avoids a start-vs-checkout idle race. The lease renewal
-      # timer runs from the start, independent of checkouts.
+      # Arm the coalesced idle timer at open too (expert review 2026-08-31 #13). It used to be
+      # armed ONLY when the last connection checked back in, on the assumption "a coordinator is
+      # always checked out right after it starts." That breaks if the caller dies between
+      # Shards.ensure/1 returning {:ok, pid} and Shard.checkout/1 (a Filo stream killed on client
+      # disconnect during a slow cold-open, or an {:already_started, pid} race): the coordinator
+      # then holds a lease + fds with ZERO connections, zero timers and no LRU row (Lru.touch fires
+      # only on checkout/release) — permanently pinned, unstealable in heartbeat mode, reclaimed
+      # only at node shutdown, and eroding :max_open_shards with each leak. Arming here with
+      # idle_since set closes it: a :checkout clears idle_since so the timer no-ops (the normal
+      # release path re-arms it via schedule_idle), and if no checkout ever arrives the coordinator
+      # idle-stops normally. The lease renewal timer already runs from the start, independent of
+      # checkouts. See schedule_idle/1 and the :idle_timeout handler.
       # `acquire_gen` (captured in handle_continue BEFORE acquire_lease — see finding #5)
       # fixes the liveness mode for this shard's life: non-nil ⇒ heartbeat mode (the node
       # heartbeat proves liveness, so NO per-shard lease renewal — the F1 storm — and the
@@ -789,7 +797,7 @@ defmodule Fathom.Shard do
       # is what failed.
       Fathom.Shard.WriteFence.unfence(state.id)
 
-      {:noreply, schedule_flush(state)}
+      {:noreply, schedule_idle(schedule_flush(state))}
     else
       {:error, reason} ->
         # Couldn't make the file available — give the lease back so another node
