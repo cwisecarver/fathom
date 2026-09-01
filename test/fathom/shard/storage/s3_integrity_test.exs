@@ -191,6 +191,29 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
     refute File.exists?(local), "a corrupt body must never be promoted"
   end
 
+  # Expert review 2026-08-31 #6: a 200 with an EMPTY body and no integrity metadata was promoted
+  # as a valid empty SQLite database. verify_md5 skips a multipart-shaped etag, and with no
+  # @md5_meta the check is a no-op, so `File.touch(tmp)`'s zero-length file passed the gate and was
+  # fsynced into place. The tenant would then be served an empty db and the next flush would PUT
+  # the empty file over the real object — an unrecoverable wipe. A zero-length body is now refused.
+  test "a zero-length 200 body is refused, not promoted as an empty database", %{dir: dir} do
+    put_s3_config(fn conn ->
+      # Multipart-shaped etag (verify_md5 skips it), no x-amz-meta-fathom-md5, empty body — the
+      # exact combination that made the integrity check a no-op on a wipe-shaped input.
+      conn
+      |> Plug.Conn.put_resp_header("etag", ~s("deadbeefcafebabe-3"))
+      |> Plug.Conn.send_resp(200, "")
+    end)
+
+    local = Path.join(dir, "empty.db")
+
+    assert {:error, :empty_object} = S3.pull("s", local)
+
+    refute File.exists?(local),
+           "a zero-length body was promoted as an empty database — the next flush would wipe the " <>
+             "real stored object"
+  end
+
   test "a matching MD5 etag pulls normally; non-MD5 etags skip verification", %{dir: dir} do
     put_s3_config(fn conn ->
       case Plug.Conn.request_url(conn) =~ "multi" do

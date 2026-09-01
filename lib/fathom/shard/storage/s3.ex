@@ -935,6 +935,16 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  # A materialized download temp is empty (or unstattable). Empty is refused rather than promoted
+  # (#6); unstattable is refused too — the safe direction for a file we are about to hand SQLite.
+  defp empty_body?(path) do
+    case File.stat(path) do
+      {:ok, %{size: 0}} -> true
+      {:ok, _} -> false
+      _ -> true
+    end
+  end
+
   defp verify_md5(_digest, nil), do: :ok
 
   defp verify_md5(digest, etag) do
@@ -1074,22 +1084,39 @@ defmodule Fathom.Shard.Storage.S3 do
               # A 200 with an empty body never opened the temp — materialize the empty
               # file so the promote below behaves exactly as the eager-open code did.
               if Process.get(fd_key) == nil, do: File.touch(tmp)
-              digest = :crypto.hash_final(resp.private[:fathom_md5] || :crypto.hash_init(:md5))
 
-              # Prefer the etag-form-independent metadata hash (#17); fall back to the etag-MD5
-              # check when the object predates the metadata or came from an unfenced copy path.
-              case verify_integrity(digest, meta_md5(resp.headers), etag(resp.headers)) do
-                :ok ->
-                  case Storage.promote_temp(tmp, local_path) do
-                    :ok -> {:ok, etag(resp.headers)}
-                    {:error, _} = error -> error
-                  end
+              # A zero-length body is NEVER a fathom object: every flush writes a non-empty
+              # database AND an @md5_meta hash, and a brand-new shard is a 404 (:absent), not an
+              # empty 200. Without this floor a foreign/corrupt object carrying a multipart-shaped
+              # etag and no metadata makes verify_integrity a no-op (verify_md5 skips non-MD5
+              # etags), and the empty temp is fsynced + promoted as a valid empty SQLite database.
+              # The tenant is then served an empty db and the next flush PUTs the empty file over
+              # the real stored object — an unrecoverable wipe (expert review 2026-08-31 #6).
+              if empty_body?(tmp) do
+                Logger.error(
+                  "shard object at #{url} returned a zero-length body; refusing to promote it " <>
+                    "as an empty database (no integrity metadata to verify it against)"
+                )
 
-                # A torn transfer produced bytes that don't match the object's etag — a
-                # transient corruption, not a permanent one; retry the whole download with a
-                # fresh temp rather than failing the pull outright (expert review #1).
-                {:error, :checksum_mismatch} = error ->
-                  retry_or(error, url, local_path, headers, opts, attempts_left)
+                {:error, :empty_object}
+              else
+                digest = :crypto.hash_final(resp.private[:fathom_md5] || :crypto.hash_init(:md5))
+
+                # Prefer the etag-form-independent metadata hash (#17); fall back to the etag-MD5
+                # check when the object predates the metadata or came from an unfenced copy path.
+                case verify_integrity(digest, meta_md5(resp.headers), etag(resp.headers)) do
+                  :ok ->
+                    case Storage.promote_temp(tmp, local_path) do
+                      :ok -> {:ok, etag(resp.headers)}
+                      {:error, _} = error -> error
+                    end
+
+                  # A torn transfer produced bytes that don't match the object's etag — a
+                  # transient corruption, not a permanent one; retry the whole download with a
+                  # fresh temp rather than failing the pull outright (expert review #1).
+                  {:error, :checksum_mismatch} = error ->
+                    retry_or(error, url, local_path, headers, opts, attempts_left)
+                end
               end
           end
 
