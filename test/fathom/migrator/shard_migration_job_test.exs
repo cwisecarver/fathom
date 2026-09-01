@@ -184,6 +184,29 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
            "an in-flight revert's restore source must not be dropped"
   end
 
+  # Expert review 2026-08-31 #8: the guard above keyed on to_version == version, which holds only
+  # for a one-step revert. A CHAIN-JUMPER — a cold-tail shard reverted v5 -> v9 in one job — carries
+  # the fleet TARGET as to_version while its restore SOURCE is a LOWER landing version. So a
+  # retirement of that landing version passed the to_version-keyed guard and dropped the revert's
+  # restore source. The guard now matches ANY in-flight revert for the shard.
+  test "RetirementJob skips the restore source of a chain-jump revert (to_version != version)",
+       %{shard: shard} do
+    seed_v1!(shard)
+    :ok = Storage.retain(shard, 1)
+    # The shard is at v3 (from_version of the revert), NOT at v1 — so the #22 live-guard passes.
+    {:ok, _} = Directory.cutover(shard, 3)
+    # A revert whose FLEET TARGET is v2 is in flight, but its restore source for this shard is the
+    # lower retained landing v1. Pre-fix: revert_in_flight?(shard, 1) looked for to_version == 1,
+    # found to_version == 2, and dropped <shard>@1 — the restore source.
+    {:ok, _} = Oban.insert(RevertJob.new(%{shard_id: shard, to_version: 2}))
+
+    assert {:cancel, :revert_in_flight} =
+             perform_job(RetirementJob, %{"shard_id" => shard, "version" => 1})
+
+    assert File.exists?(Path.join(remote_dir(), "#{shard}@1.db")),
+           "a chain-jump revert's restore source (a landing version below to_version) was dropped"
+  end
+
   # The other half of #17: RevertJob cancels the pending retirement at the TOP of
   # perform (before restore), not in the :ok branch — so the restore source is
   # protected even when the revert itself then fails and retries.
