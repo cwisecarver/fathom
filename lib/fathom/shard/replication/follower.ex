@@ -1207,22 +1207,60 @@ defmodule Fathom.Shard.Replication.Follower do
 
   defp apply_write(name, %Protocol.Push{} = push, new_state, mode) do
     path = wal_path(name, push.shard_id)
-    modes = if mode == :truncate, do: [:write, :raw, :binary], else: [:append, :raw, :binary]
 
-    with {:ok, fd} <- :file.open(path, modes),
-         :ok <- :file.write(fd, push.payload),
-         :ok <- maybe_sync(fd),
-         :ok <- :file.close(fd) do
-      # State advances ONLY after the bytes are down. Advancing first and failing the write would
-      # leave the follower claiming an offset it does not hold, which the primary would believe.
-      put_state(name, push.shard_id, new_state)
-      Protocol.encode_ack(push.shard_id, new_state.next_offset)
-    else
+    case write_frame(path, push.offset, push.payload, mode) do
+      :ok ->
+        # State advances ONLY after the bytes are down. Advancing first and failing the write would
+        # leave the follower claiming an offset it does not hold, which the primary would believe.
+        put_state(name, push.shard_id, new_state)
+        Protocol.encode_ack(push.shard_id, new_state.next_offset)
+
       {:error, reason} ->
         Logger.error("replication write failed for #{push.shard_id}: #{inspect(reason)}")
         # Report where we actually are, so the primary retries rather than assuming we advanced.
         expected = (state_of(name, push.shard_id) || %{next_offset: 0}).next_offset
         Protocol.encode_reject(push.shard_id, :internal, expected)
+    end
+  end
+
+  # POSITIONAL, not append. A frame is written at its OWN offset, so a re-send is idempotent
+  # (expert review 2026-08-31 #1). The previous `[:append]` open wrote at EOF, and only stayed
+  # correct because `FollowerLog.decide/2` guarantees `push.offset == next_offset` — an ETS value
+  # never checked against the file's actual size. When a write's bytes landed but the follower's
+  # state did not advance (a failed close/put_state), the primary re-sent from the un-advanced
+  # offset and the append laid a SECOND copy of the frame after the first. A duplicate frame breaks
+  # SQLite's cumulative WAL checksum chain: on promote/recover SQLite treats the duplicate as
+  # end-of-WAL and silently drops every acked frame after it. `pwrite` at the decided offset writes
+  # the same bytes to the same place under a re-send, which removes the unverified EOF invariant.
+  @doc false
+  def write_frame(path, offset, payload, mode) do
+    {open_modes, write} =
+      case mode do
+        # Reset: `[:write]` truncates the file on open, laying the new generation from position 0
+        # (a reset push carries offset 0). Truncate here is the point — the old generation must go.
+        :truncate ->
+          {[:write, :raw, :binary], fn fd -> :file.write(fd, payload) end}
+
+        # Append: `[:read, :write]` creates-if-absent and does NOT truncate, so pwrite lands the
+        # frame at its own offset over any bytes a prior (un-acked) attempt already put there.
+        _append ->
+          {[:read, :write, :raw, :binary], fn fd -> :file.pwrite(fd, offset, payload) end}
+      end
+
+    with {:ok, fd} <- :file.open(path, open_modes) do
+      try do
+        with :ok <- write.(fd), :ok <- maybe_sync(fd) do
+          :file.close(fd)
+        else
+          {:error, _reason} = err ->
+            _ = :file.close(fd)
+            err
+        end
+      rescue
+        e ->
+          _ = :file.close(fd)
+          reraise e, __STACKTRACE__
+      end
     end
   end
 
