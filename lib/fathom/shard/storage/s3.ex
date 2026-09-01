@@ -1289,6 +1289,17 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   @impl true
+  def version_present?(shard_id, version) do
+    # A HEAD on the version key, like object_etag/1. Best-effort: anything but a 200 (a 404, a
+    # non-2xx, or a transport error) reads as absent so a release-time warning never fails a
+    # release (expert review 2026-08-31 #11).
+    case Req.head(req(), url: url_path(version_key(shard_id, version))) do
+      {:ok, %{status: 200}} -> true
+      _ -> false
+    end
+  end
+
+  @impl true
   def restore(shard_id, version, expected_etag) do
     # Fenced restore (expert review 2026-07-14 #4): the revert counterpart of the fenced flush/3.
     # A plain server-side CopyObject to live is UNCONDITIONAL, and S3 cannot carry an If-Match on

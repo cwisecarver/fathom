@@ -600,6 +600,18 @@ defmodule Fathom.Telemetry do
           "Novel tenants born EMPTY because fork-from-template failed while :fork_from_template was ON — the tenant is serving with NO schema, every ORM query fails, and the rollout CANNOT heal it. Any occurrence needs an operator to delete and re-mint that tenant; :no_template_snapshot means the `mix fathom.snapshot template-head` prerequisite never ran"
       ),
 
+      # The RELEASE-TIME half of the same hazard (expert review 2026-08-31 #11): a release advanced
+      # HEAD while :fork_from_template is ON, but the template@HEAD fork source has not been
+      # refreshed (`mix fathom.snapshot template-head` has no automatic caller after a release).
+      # Until it runs, EVERY novel tenant is born empty then quarantined — so this is the early
+      # warning that precedes a burst of fork_fallback. No version tag (the released version rides
+      # event metadata for the log line; a monotonically growing integer is not a bounded tag set).
+      counter("fathom.migrator.template_snapshot_stale.count",
+        event_name: [:fathom, :migrator, :template_snapshot_stale],
+        description:
+          "Releases that advanced HEAD with :fork_from_template ON but no refreshed template@HEAD snapshot — run `mix fathom.snapshot template-head` or novel tenants are born EMPTY and quarantined"
+      ),
+
       # --- The rest of the emitted-but-unexported sweep (2026-08-06) --------------------------
       # `fork_fallback` above was not a one-off. A diff of every `:telemetry.execute` in lib/
       # against this list found 13 events that emitted into the void — no metric, no Prometheus

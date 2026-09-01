@@ -8,6 +8,7 @@ defmodule Fathom.MigratorTest do
   @moduletag :capture_log
 
   alias Fathom.Migrator
+  alias Fathom.Shard.Storage
 
   describe "release/2 and head/0" do
     test "head is 0 before anything is released" do
@@ -44,14 +45,67 @@ defmodule Fathom.MigratorTest do
       refute log =~ "born EMPTY"
     end
 
-    test "releasing with :fork_from_template ON is silent" do
+    # Expert review 2026-08-31 #11. This test PREVIOUSLY asserted "fork ON ⇒ silent", which pinned
+    # an incomplete assumption: fork ON is not sufficient — fork_from_template/1 forks from the
+    # `template@HEAD` snapshot, created out-of-band by `mix fathom.snapshot template-head` with no
+    # automatic caller after a release. So the moment a release advances HEAD, that snapshot is
+    # stale and every novel tenant is born empty until it is refreshed. Release now warns for that
+    # gap too — the fork-ON case is silent ONLY when the snapshot for the new head is present.
+    test "fork ON but the template snapshot is STALE for the new head still warns (#11)" do
       Application.put_env(:fathom, :fork_from_template, true)
       on_exit(fn -> Application.put_env(:fathom, :fork_from_template, false) end)
 
-      # The warning names a real misconfiguration. Firing it on a correctly-configured fleet
-      # would train operators to ignore it, which is worse than not warning at all. A template IS
-      # configured here, so this asserts the FLAG silenced it — not the absence of a template.
+      test_pid = self()
+      handler = "tmpl-stale-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:fathom, :migrator, :template_snapshot_stale],
+        fn _e, m, _meta, _ -> send(test_pid, {:stale, m.version}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
       with_template(fn ->
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert {:ok, _} = Migrator.release(1, "initial schema")
+          end)
+
+        assert log =~ "no template@v1 snapshot",
+               "fork ON with no refreshed template snapshot must warn (novel tenants born empty)"
+
+        assert_receive {:stale, 1}
+      end)
+    end
+
+    # The other half of #11: with the snapshot present, the fork WILL succeed, so the release is
+    # silent. This is the assertion the old test MEANT to make — the flag silences it — but it only
+    # holds once the fork source actually exists.
+    test "fork ON WITH the template snapshot present for the new head is silent (#11)" do
+      Application.put_env(:fathom, :fork_from_template, true)
+      on_exit(fn -> Application.put_env(:fathom, :fork_from_template, false) end)
+
+      with_template(fn ->
+        # Create template@1 the way `mix fathom.snapshot template-head` would: a live template
+        # object, then retain it at the released version.
+        tmp =
+          Path.join(System.tmp_dir!(), "tmpl_present_#{System.unique_integer([:positive])}.db")
+
+        File.write!(tmp, "template-bytes")
+        :ok = Storage.flush("tmpl_warn_test", tmp)
+        :ok = Storage.retain("tmpl_warn_test", 1)
+        File.rm(tmp)
+
+        on_exit(fn ->
+          for path <- Path.wildcard(Path.join(Storage.Local.dir(), "tmpl_warn_test*")),
+              do: File.rm(path)
+        end)
+
+        assert Storage.version_present?("tmpl_warn_test", 1),
+               "fixture: the fork source must exist"
+
         log =
           ExUnit.CaptureLog.capture_log(fn ->
             assert {:ok, _} = Migrator.release(1, "initial schema")

@@ -371,6 +371,12 @@ defmodule Fathom.Shard.Storage do
   @callback restore(shard_id :: String.t(), version :: non_neg_integer()) ::
               :ok | {:error, term()}
 
+  # Best-effort presence probe (a HEAD, not a read) for a retained `<shard>@<version>` object.
+  # Used to warn at release time that the `template@HEAD` fork source has not been refreshed for
+  # the new head (expert review 2026-08-31 #11). Best-effort: any error/absence reads as false, so
+  # the warning never itself fails a release.
+  @callback version_present?(shard_id :: String.t(), version :: non_neg_integer()) :: boolean()
+
   # Fenced restore (expert review 2026-07-14 #4): copy the shard's `version` object back over
   # live only if the live object still matches `expected_etag` (`If-Match`) — the revert
   # counterpart of the fenced `flush/3`. A revert's read-only `check_lease` fence proves the lock
@@ -855,6 +861,10 @@ defmodule Fathom.Shard.Storage do
   @doc "Copies the shard's live object to its `version` (retains the old version for revert)."
   @spec retain(String.t(), non_neg_integer()) :: :ok | {:error, term()}
   def retain(shard_id, version), do: backend().retain(shard_id, version)
+
+  @doc "Best-effort: whether a retained `<shard>@<version>` object exists (expert review #11)."
+  @spec version_present?(String.t(), non_neg_integer()) :: boolean()
+  def version_present?(shard_id, version), do: backend().version_present?(shard_id, version)
 
   @doc "Copies the shard's `version` object back to live (the revert step)."
   @spec restore(String.t(), non_neg_integer()) :: :ok | {:error, term()}
