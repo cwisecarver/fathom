@@ -67,6 +67,30 @@ defmodule Fathom.RestoreDrillJobTest do
       assert summary[:ok] >= 1, "the restore rehearsal failed: #{inspect(summary)}"
     end
 
+    # Expert review 2026-08-31 #14: the source side used to be read through the LIVE coordinator, so
+    # a shard open + dirty at drill time counted un-flushed writes the fork (last-flushed) does not
+    # have — src > dst ⇒ a systematic false :restored_mismatch that trains operators to ignore the
+    # alarm. Both sides now read the DURABLE state.
+    test "a dirty source (unflushed writes) does not false-alarm as a broken restore", %{id: id} do
+      # Durable object: exactly one row.
+      seed(id, ["CREATE TABLE kv (v TEXT)", "INSERT INTO kv VALUES ('a')"])
+
+      # Make the shard DIRTY: reopen and write two more rows, holding the connection OPEN so the
+      # coordinator keeps the un-flushed live state (3 rows live, 1 row durable) through the drill.
+      {:ok, conn} = ShardExecutor.open(id)
+      on_exit(fn -> ShardExecutor.close(conn) end)
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('b')"))
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('c')"))
+
+      assert {:ok, summary} = RestoreDrillJob.run_full_drill(5)
+
+      assert Map.get(summary, :restored_mismatch, 0) == 0,
+             "a dirty source false-alarmed as a broken restore (summary: #{inspect(summary)})"
+
+      assert summary[:ok] == 1,
+             "the dirty source's DURABLE object should restore cleanly: #{inspect(summary)}"
+    end
+
     # The assertion that makes the rehearsal worth running. A fork that produced an EMPTY database
     # would pass quick_check and prove nothing, so the drill compares row counts against the source
     # — that is the difference between "the file opens" and "the data is there".
