@@ -448,6 +448,29 @@ defmodule Fathom.TenantsTest do
     test "refuses an invalid id" do
       assert {:error, :invalid_shard_id} = Tenants.provision("Not Valid!")
     end
+
+    # Expert review 2026-08-31 #10: with :fork_from_template ON the fork IS the birth path, so a
+    # failed fork means the tenant has no schema. provision used to swallow the outcome and return
+    # {:ok} — a silently broken tenant the rollout then quarantines. It now fails loudly and rolls
+    # the directory row back so the id is cleanly retriable.
+    test "fails loudly and rolls back when the template fork fails (fork ON)", %{id: id} do
+      prev = Application.get_env(:fathom, :fork_from_template)
+      Application.put_env(:fathom, :fork_from_template, true)
+
+      on_exit(fn ->
+        if prev == nil,
+          do: Application.delete_env(:fathom, :fork_from_template),
+          else: Application.put_env(:fathom, :fork_from_template, prev)
+      end)
+
+      # No release and no template@HEAD snapshot exist in this test, so fork_from_template cannot
+      # birth the tenant at HEAD — the born-empty failure.
+      assert {:error, {:fork_failed, _reason}} = Tenants.provision(id)
+
+      assert Directory.get(id) == :error,
+             "a failed fork must roll the directory row back, not leave a schema-less active@0 " <>
+               "tenant that reports success"
+    end
   end
 
   # Expert review #35: provision/fork is the one place that KNOWS the deployment's address (it
