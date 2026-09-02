@@ -33,6 +33,39 @@ defmodule Fathom.SnapshotsSchemaGuardTest do
     for snap <- Path.wildcard(Path.join(remote_dir(), "#{shard}@snap-*.db")), do: File.rm(snap)
   end
 
+  # Expert review 2026-08-31 #23: read_user_version opened the snapshot with a full read-WRITE
+  # Connection, which runs journal_mode=WAL on a VACUUM INTO snapshot (rollback-journal header mode)
+  # — WRITING to the file and creating -wal/-shm. That same temp is the file restore/3 promotes, so
+  # the promoted object differed byte-for-byte from the verified snapshot. It now reads the header
+  # directly and leaves the file untouched.
+  test "reading a snapshot's user_version does not mutate its bytes (#23)" do
+    src = Path.join(System.tmp_dir!(), "uvsrc_#{System.unique_integer([:positive])}.db")
+    snap = Path.join(System.tmp_dir!(), "uvsnap_#{System.unique_integer([:positive])}.db")
+    on_exit(fn -> for p <- [src, snap], s <- ["", "-wal", "-shm"], do: File.rm(p <> s) end)
+
+    {:ok, conn} = Connection.open(src)
+    {:ok, _} = Connection.query(conn, "PRAGMA user_version = 7", [])
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (x)", [])
+    # VACUUM INTO produces a rollback-journal (non-WAL) snapshot — the exact input a full
+    # Connection.open would rewrite to WAL.
+    {:ok, _} = Connection.query(conn, "VACUUM INTO '#{snap}'", [])
+    :ok = Connection.close(conn)
+
+    refute File.exists?(snap <> "-wal"),
+           "fixture: the VACUUM INTO snapshot must start in non-WAL mode"
+
+    before = File.read!(snap)
+
+    assert {:ok, 7} = Snapshots.read_user_version(snap)
+
+    assert File.read!(snap) == before,
+           "reading user_version mutated the snapshot bytes — the promoted object would differ " <>
+             "from the verified snapshot"
+
+    refute File.exists?(snap <> "-wal"),
+           "reading user_version created a -wal, i.e. a WAL conversion of the snapshot"
+  end
+
   # HOLDING the lease, not merely probing it (expert review 2026-08-20 #12).
   #
   # restore/3 used to read `lease_holder/1` and proceed on `:free`. A request landing on another

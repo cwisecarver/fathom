@@ -362,20 +362,16 @@ defmodule Fathom.RestoreDrillJob do
     end
   end
 
+  # Read user_version straight from the SQLite header (a 32-bit big-endian int at offset 60), not by
+  # opening the file (expert review 2026-08-31 #23). A full Connection.open runs journal_mode=WAL +
+  # the extension load + a close-time checkpoint, mutating a VACUUM INTO snapshot's rollback-journal
+  # bytes to read four bytes. The drill's temp is dropped rather than promoted, so here it is churn
+  # rather than a correctness bug — but the same shape as the snapshot restore path, so it uses the
+  # same header read. Corruption past the header is the drill's separate quick_check's job.
   defp read_user_version(path) do
-    case Connection.open(path) do
-      {:ok, conn} ->
-        version =
-          case Connection.query(conn, "PRAGMA user_version", []) do
-            {:ok, %{rows: [[v]]}} -> v
-            _ -> nil
-          end
-
-        Connection.close(conn)
-        version
-
-      _ ->
-        nil
+    case File.open(path, [:read, :binary], fn io -> :file.pread(io, 0, 64) end) do
+      {:ok, {:ok, <<"SQLite format 3\0", _::binary-size(44), v::signed-big-32>>}} -> v
+      _ -> nil
     end
   end
 
