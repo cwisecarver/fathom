@@ -17,6 +17,17 @@ defmodule Fathom.BulkEnqueue do
   idempotent) but it costs a second round of live-client disconnects, which is precisely what
   `Fathom.HranaAuth.RevokeJob`'s own moduledoc says it is avoiding.
 
+  The SELECT-then-`insert_all` is not atomic, so it is a fast-path filter, not the guarantee (expert
+  review 2026-08-31 #26): two concurrent callers could each see a shard un-queued and both insert.
+  The guarantee is a partial UNIQUE index on `(worker, (args->>'shard_id'))` over the live states,
+  SCOPED to exactly the three workers this is used with — `ShardMigrationJob`, `RevertJob`,
+  `RevokeJob` (migration `*_add_bulk_shard_unique_index_to_oban_jobs`). `Oban.insert_all` merges
+  `on_conflict: :nothing`, so a racing duplicate is silently skipped by the DB and the returned count
+  stays accurate. The index is deliberately NOT global: `RetirementJob` shares a shard_id across
+  different retained VERSIONS, so a global index would block retiring a shard's second version — a
+  new caller keyed by `(worker, shard_id)` must be added to that index's predicate, one keyed by
+  anything else must not.
+
   **Postgres caps a statement at 65 535 bind parameters**, and `insert_all` emits one parameter per
   column per ROW — unlike a `WHERE ... IN`, which Ecto compiles to a single array parameter (see
   `Fathom.Directory.requeue_failed/1`, where that distinction was measured and the two were found

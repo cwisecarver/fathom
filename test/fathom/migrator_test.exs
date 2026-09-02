@@ -232,9 +232,16 @@ defmodule Fathom.MigratorTest do
 
       plan = rows |> List.flatten() |> Enum.join("\n")
 
-      assert plan =~ "oban_jobs_worker_shard_id_live_index",
-             "the dedup query cannot use the index, so it still scans every live job row " <>
-               "per rollout chunk. Plan:\n#{plan}"
+      # Either expression index on (worker, args->>'shard_id') serves this query and keeps it off a
+      # seq scan — the intent here. The non-unique oban_jobs_worker_shard_id_live_index (#20) covers
+      # ALL workers; the scoped-unique oban_jobs_bulk_shard_unique_index (#26) covers exactly the
+      # three BulkEnqueue workers, of which ShardMigrationJob is one, so the planner may legitimately
+      # prefer the smaller unique index for this worker. This assertion previously named only the
+      # first; #26 added the second, and the point was always "an index, not a seq scan".
+      assert plan =~ "oban_jobs_worker_shard_id_live_index" or
+               plan =~ "oban_jobs_bulk_shard_unique_index",
+             "the dedup query cannot use any expression index, so it still scans every live job " <>
+               "row per rollout chunk. Plan:\n#{plan}"
     end
   end
 
