@@ -69,6 +69,15 @@ defmodule Fathom.Shard.Replication.Session do
   # again on every commit. Configurable so it can be exercised without a two-minute test.
   @default_seed_expiry_ms 120_000
 
+  # How much SHORTER the handler's internal deadline is than the caller's `GenServer.call` timeout
+  # (expert review 2026-08-31 #21). The caller starts its call timer BEFORE the message is delivered
+  # and the reply travels back after the handler finishes, so an internal deadline equal to the call
+  # timeout means a commit that runs right to the deadline is abandoned by the caller — surfacing a
+  # near-miss quorum as `{:session_down, :timeout}` instead of the handler's clean `{:no_quorum, _}`
+  # (or success). The margin covers that head-start + reply delivery; floored at half the timeout so
+  # a large margin config can't gut a small timeout.
+  @default_reply_margin_ms 100
+
   # ------------------------------------------------------------------------------------------
   # api
   # ------------------------------------------------------------------------------------------
@@ -140,7 +149,17 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
-  defp timeout, do: Application.get_env(:fathom, :replication_timeout_ms, 5_000)
+  @doc false
+  def timeout, do: Application.get_env(:fathom, :replication_timeout_ms, 5_000)
+
+  defp reply_margin,
+    do: Application.get_env(:fathom, :replication_reply_margin_ms, @default_reply_margin_ms)
+
+  # The handler's internal commit deadline BUDGET — shorter than the caller's `GenServer.call`
+  # timeout by `reply_margin`, so the handler always replies before the caller gives up (#21).
+  # Floored at half the call timeout so a large margin can't gut a small timeout.
+  @doc false
+  def commit_deadline_budget, do: max(div(timeout(), 2), timeout() - reply_margin())
 
   # ------------------------------------------------------------------------------------------
   # server
@@ -241,7 +260,11 @@ defmodule Fathom.Shard.Replication.Session do
     # could outlive the caller's `GenServer.call` timeout, and a reply nobody is waiting for is
     # worse than a late failure — the caller has already given up and the tenant already has an
     # error, while this process is still holding the shard's serialization point.
-    deadline = System.monotonic_time(:millisecond) + timeout()
+    #
+    # `commit_deadline_budget/0` is SHORTER than the caller's call timeout by a reply margin (#21),
+    # so the handler finishes and replies BEFORE the caller gives up — turning a near-miss quorum
+    # into a clean `{:no_quorum, _}` reply rather than a `{:session_down, :timeout}` call exit.
+    deadline = System.monotonic_time(:millisecond) + commit_deadline_budget()
 
     state = %{state | commits: state.commits + 1}
 
