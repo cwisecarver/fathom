@@ -36,7 +36,7 @@ defmodule Fathom.RestoreDrillJob do
   require Logger
 
   alias Fathom.{Directory, Shard}
-  alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Shard.{Connection, SqliteHeader, Storage}
 
   # Outcomes that mean the durable object is bad/unreachable (the alertable set) vs merely
   # "no data yet" (absent/sentinel — a brand-new tenant that never flushed).
@@ -347,9 +347,15 @@ defmodule Fathom.RestoreDrillJob do
     end
   end
 
+  # Read user_version from the SQLite header, not by opening the file (expert review 2026-08-31 #23):
+  # a full Connection.open runs journal_mode=WAL + the extension load + a close-time checkpoint,
+  # mutating a VACUUM INTO snapshot's rollback-journal bytes to read four bytes. The drill's temp is
+  # dropped rather than promoted, so here it is churn rather than a correctness bug — but the same
+  # shape as the snapshot restore path, so it shares `SqliteHeader` (self-review 2026-08-31 #2).
+  # Corruption past the header is the drill's separate quick_check's job.
   defp check_schema(id, tmp, schema_version) do
-    case read_user_version(tmp) do
-      ^schema_version ->
+    case SqliteHeader.user_version(tmp) do
+      {:ok, ^schema_version} ->
         :ok
 
       other ->
@@ -359,19 +365,6 @@ defmodule Fathom.RestoreDrillJob do
         )
 
         :schema_mismatch
-    end
-  end
-
-  # Read user_version straight from the SQLite header (a 32-bit big-endian int at offset 60), not by
-  # opening the file (expert review 2026-08-31 #23). A full Connection.open runs journal_mode=WAL +
-  # the extension load + a close-time checkpoint, mutating a VACUUM INTO snapshot's rollback-journal
-  # bytes to read four bytes. The drill's temp is dropped rather than promoted, so here it is churn
-  # rather than a correctness bug — but the same shape as the snapshot restore path, so it uses the
-  # same header read. Corruption past the header is the drill's separate quick_check's job.
-  defp read_user_version(path) do
-    case File.open(path, [:read, :binary], fn io -> :file.pread(io, 0, 64) end) do
-      {:ok, {:ok, <<"SQLite format 3\0", _::binary-size(44), v::signed-big-32>>}} -> v
-      _ -> nil
     end
   end
 

@@ -29,7 +29,7 @@ defmodule Fathom.Snapshots do
   """
 
   alias Fathom.Directory
-  alias Fathom.Shard.Storage
+  alias Fathom.Shard.{SqliteHeader, Storage}
   alias Fathom.ShardId
   alias Fathom.Shards
   alias Fathom.Snapshots.Retention
@@ -214,23 +214,13 @@ defmodule Fathom.Snapshots do
     )
   end
 
-  # Read user_version straight from the SQLite header — a 32-bit big-endian int at byte offset 60 —
-  # NOT by opening the file (expert review 2026-08-31 #23). A full `Connection.open/1` runs
-  # journal_mode=WAL + synchronous=FULL + the Django extension load + a close-time checkpoint, and a
-  # `VACUUM INTO` snapshot is in rollback-journal header mode, so journal_mode=WAL WRITES to the file
-  # and creates `-wal`/`-shm`. Because this `tmp` is the very file `restore/3` then promotes (it is
-  # deliberately not re-downloaded — see snapshot_user_version/3), that mutation made the promoted
-  # object differ byte-for-byte from the verified snapshot and paid an extension load + checkpoint to
-  # read four bytes. Reading the header leaves the file untouched; the SQLite magic is matched so a
-  # non-database file is still rejected the way the SQLite open used to reject it.
+  # Read user_version straight from the SQLite header, NOT by opening the file (expert review
+  # 2026-08-31 #23) — opening it would run journal_mode=WAL on a VACUUM INTO snapshot and mutate the
+  # very bytes `restore/3` then promotes. The header parse lives in `Fathom.Shard.SqliteHeader`,
+  # shared with `Fathom.RestoreDrillJob` (self-review 2026-08-31 #2); kept as a public passthrough so
+  # the snapshot-restore path is the entry point its no-mutation test asserts against.
   @doc false
-  def read_user_version(path) do
-    case File.open(path, [:read, :binary], fn io -> :file.pread(io, 0, 64) end) do
-      {:ok, {:ok, <<"SQLite format 3\0", _::binary-size(44), v::signed-big-32>>}} -> {:ok, v}
-      {:ok, other} -> {:error, {:user_version_unreadable, other}}
-      {:error, reason} -> {:error, reason}
-    end
-  end
+  def read_user_version(path), do: SqliteHeader.user_version(path)
 
   # Refuse a restore that would cross a schema-migration boundary unless force: true (#7). With no
   # directory row there is nothing to skew, so allow it. Fails OPEN on a directory (Postgres) error —
