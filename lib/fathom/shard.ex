@@ -1857,6 +1857,17 @@ defmodule Fathom.Shard do
       match?(%Task{}, state.lapse_revalidate_pending) ->
         {:noreply, schedule_flush(state)}
 
+      # A legacy-mode lease renewal is in flight (expert review 2026-08-31 #15). Like the lapse
+      # guard above, this is a lease-MUTATING operation: in legacy mode the flush's own fence takes
+      # Fence.legacy/2 — a renew PUT with the cached lock_etag — so running it concurrently with the
+      # periodic :renew_lease renew task issues TWO PUTs off the SAME base etag whose replies land
+      # into state.lease in arbitrary order, and a stale lock_etag on the next flush PUT is a 412
+      # the coordinator reads as a steal (review 2026-08-24 #8). Defer one flush tick behind the
+      # renew, exactly as the flush/lapse guards do. `renew_task` is always nil in heartbeat mode
+      # (no per-shard renewal), so this fires only in legacy mode.
+      state.renew_task != nil ->
+        {:noreply, schedule_flush(state)}
+
       # Clean: local == storage, so there's nothing to upload and no clobber risk.
       # Skip entirely (no fence, no PUT) — this is the durability-flush storm fix: at
       # a million mostly-idle/read-only shards, durability PUTs now track *writes*,
@@ -1995,7 +2006,7 @@ defmodule Fathom.Shard do
     # fence turns that into a retryable 503.
     Fathom.Shard.WriteFence.fence(state.id)
 
-    state = settle_flush_task(state)
+    state = state |> cancel_renew() |> settle_renew_task() |> settle_flush_task()
     # Reply to any pending flush_now caller before we exit (expert review 2026-07-18 #4): we
     # self-fenced WITHOUT flushing, so the on-disk state is NOT durable in storage. Without this,
     # the caller's GenServer.call gets a bare :DOWN → Shards.flush catches the exit as :ok → the
@@ -2017,7 +2028,11 @@ defmodule Fathom.Shard do
     # may land at any moment, and the drop-flush below fences on the etag — racing
     # them would make one 412 spuriously (the drop-flush's :superseded branch drops
     # the local copy WITHOUT uploading writes made after the task's snapshot).
-    state = settle_flush_task(state)
+    #
+    # Settle the legacy-mode renew task the same way and FIRST (expert review 2026-08-31 #15): the
+    # drop-flush below does a fence-renew + release_lease, and an in-flight renew PUT landing after
+    # that release would re-write the lock naming this dead coordinator — a leaked lock.
+    state = state |> cancel_renew() |> settle_renew_task() |> settle_flush_task()
     # A flush_now caller pending at idle/drain time gets an explicit error rather than a bare
     # exit that Shards.flush would mask as a false :ok (expert review 2026-07-18 #4). The retry
     # is correct: after the drop-flush the shard is cold and Shards.flush returns :ok if storage
@@ -2070,7 +2085,10 @@ defmodule Fathom.Shard do
     # reached its own cleanup is lifted by the next open rather than stranding the tenant.
     Fathom.Shard.WriteFence.fence(state.id)
 
-    state = settle_flush_task(state)
+    # Settle the legacy-mode renew task before the drop-flush's fence-renew + release_lease (expert
+    # review 2026-08-31 #15) — an in-flight renew PUT landing after the release would re-write the
+    # lock naming this dead coordinator. No-op in heartbeat mode.
+    state = state |> cancel_renew() |> settle_renew_task() |> settle_flush_task()
     state = settle_waiters(state, {:error, :coordinator_stopped})
     Fathom.ShardLoad.forget(state.id)
     Fathom.ShardLatency.forget(state.id)
@@ -4224,6 +4242,29 @@ defmodule Fathom.Shard do
       end
 
     release_flush_slot(settled)
+  end
+
+  # Settle an in-flight legacy-mode renew task before terminate/2's own fence-renew + release_lease
+  # (expert review 2026-08-31 #15). A renew is a Task.async PUT that rotates the lock etag; left
+  # in flight, its reply can land AFTER release_lease has rotated/deleted the lock — re-writing a
+  # lock that names this now-dead coordinator, an unstealable/unmigratable leaked lock. Await it
+  # (yield, then shutdown) and fold its result, mirroring settle_flush_task/1: on {:ok, lease} the
+  # subsequent release fences on the CURRENT etag; on :superseded a peer owns the shard, so mark
+  # lease_lost so the terminate path quarantines instead of clobbering. No-op in heartbeat mode
+  # (renew_task is always nil there), so this only changes the legacy fallback.
+  defp settle_renew_task(%{renew_task: nil} = state), do: state
+
+  defp settle_renew_task(%{renew_task: task} = state) do
+    case Task.yield(task, settle_yield_ms()) || Task.shutdown(task) do
+      {:ok, {:ok, lease}} ->
+        %{state | renew_task: nil, lease: lease}
+
+      {:ok, {:error, :superseded}} ->
+        %{state | renew_task: nil, lease_lost: true}
+
+      _ ->
+        %{state | renew_task: nil}
+    end
   end
 
   # Fold a completed flush task's verdict into local state. Pure w.r.t. the fence — all the
