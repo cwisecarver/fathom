@@ -168,6 +168,18 @@ defmodule Fathom.Migrator.Capture do
   def handle_cast({:begin, conn_id, count}, state) do
     # A new transaction supersedes any buffer awaiting bookkeeping: that one never got its
     # `django_migrations` row, so it really was a no-op transaction (the pre-fix behavior).
+    #
+    # But an awaiting buffer that still HOLDS DDL, dropped here, is exactly the silent-fork
+    # condition #6's awaiting mechanism exists to prevent (expert review 2026-08-31 #18). The
+    # FK-disabling path depends on the bookkeeping INSERT arriving in AUTOCOMMIT after the DDL
+    # COMMIT; if a future Django (or a differently-configured backend) ever emitted that write
+    # inside its OWN transaction, this BEGIN would drop the DDL before `bookkeeping/4` could close
+    # it, the version would never be recorded, the template would advance, and the fleet would
+    # silently never hear. Today's Django autocommits it, so this is a guard, not a live bug — but
+    # make it ALERTABLE rather than invisible, per AGENTS.md's distrust of this engine's untested
+    # Django assumptions.
+    warn_if_dropping_awaiting_ddl(conn_id, Map.get(state, conn_id))
+
     {:noreply, Map.put(state, conn_id, %{buffer: [], count_at_begin: count, awaiting?: false})}
   end
 
@@ -427,6 +439,34 @@ defmodule Fathom.Migrator.Capture do
   # A committed-but-unrecorded buffer: the DDL landed, the `django_migrations` row has not (yet).
   defp awaiting(buffer, count_at_begin),
     do: %{buffer: buffer, count_at_begin: count_at_begin, awaiting?: true}
+
+  # A new BEGIN is superseding a buffer still awaiting its bookkeeping row (expert review #18).
+  # Warn ONLY when it holds REAL migration statements: a no-rise commit that buffered only PURE
+  # READS (a genuinely empty `BEGIN; SELECT; COMMIT`) also parks as awaiting, and superseding THAT
+  # is the ordinary no-op — warning there would be the false alarm this guard exists to avoid. The
+  # forking hazard is specifically DDL/DML dropped before its django_migrations row lands.
+  defp warn_if_dropping_awaiting_ddl(conn_id, %{awaiting?: true, buffer: [_ | _] = buffer}) do
+    ddl = Enum.reject(buffer, fn {sql, _args} -> pure_read?(sql) end)
+
+    if ddl != [] do
+      Logger.warning(
+        "capture: a new BEGIN on conn #{inspect(conn_id)} superseded #{length(ddl)} migration " <>
+          "statement(s) still AWAITING their django_migrations bookkeeping row — the version was " <>
+          "NOT recorded. Expected only if Django emitted the recorder INSERT inside a transaction " <>
+          "(it normally autocommits it); a persistent occurrence forks template schema from fleet."
+      )
+
+      :telemetry.execute(
+        [:fathom, :migrator, :capture_awaiting_dropped],
+        %{count: length(ddl)},
+        %{}
+      )
+    end
+
+    :ok
+  end
+
+  defp warn_if_dropping_awaiting_ddl(_conn_id, _entry), do: :ok
 
   @dml_leads ~w(insert update delete replace)
 

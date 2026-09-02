@@ -612,6 +612,17 @@ defmodule Fathom.Telemetry do
           "Releases that advanced HEAD with :fork_from_template ON but no refreshed template@HEAD snapshot — run `mix fathom.snapshot template-head` or novel tenants are born EMPTY and quarantined"
       ),
 
+      # A capture buffer still holding DDL was dropped by a new BEGIN before its django_migrations
+      # bookkeeping row arrived (expert review 2026-08-31 #18). With today's Django (which autocommits
+      # the recorder INSERT) this never fires; a persistent occurrence means the recorder write moved
+      # inside a transaction and captured versions are silently NOT being recorded — template schema
+      # forking from fleet schema. Page-worthy.
+      counter("fathom.migrator.capture_awaiting_dropped.count",
+        event_name: [:fathom, :migrator, :capture_awaiting_dropped],
+        description:
+          "Capture DDL buffers dropped by a new BEGIN while still awaiting their django_migrations bookkeeping row — a version was NOT recorded (template schema forking from fleet)"
+      ),
+
       # --- The rest of the emitted-but-unexported sweep (2026-08-06) --------------------------
       # `fork_fallback` above was not a one-off. A diff of every `:telemetry.execute` in lib/
       # against this list found 13 events that emitted into the void — no metric, no Prometheus
