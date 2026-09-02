@@ -110,7 +110,9 @@ defmodule Fathom.Application do
   # always-on siblings, several of which do real I/O in callbacks and can raise repeatably
   # (`Heartbeat.do_renew/1` and its clear-previous-incarnation handler call `Storage.*` inline;
   # `WarmFollower.handle_continue(:refresh)` does a directory read plus S3 pulls;
-  # `TempReaper.handle_continue(:sweep)` does a fleet-sized `Path.wildcard` with no rescue).
+  # `TempReaper.handle_continue(:sweep)` does a fleet-sized `Path.wildcard` — now rescued
+  # (expert review 2026-08-31 #17), so it degrades to a logged skip rather than crash-looping,
+  # but the budget still backstops the others).
   # Four crashes of any one of those in five seconds took EVERY OPEN SHARD down at once — the
   # worst possible input to #16's own budget — while the Edge plane kept running, so live Hrana
   # streams held connections to files the terminating coordinators were about to unlink. That
