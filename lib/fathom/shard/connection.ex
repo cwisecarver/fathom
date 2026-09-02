@@ -61,10 +61,25 @@ defmodule Fathom.Shard.Connection do
     scope = Keyword.get(opts, :scope, :rw)
 
     case open_handle(path, scope) do
-      {:ok, conn, :readonly} -> configure_readonly(conn, tenant?)
-      {:ok, conn, :readwrite} -> configure_readwrite(conn, tenant?, scope)
+      {:ok, conn, :readonly} -> close_on_error(conn, configure_readonly(conn, tenant?))
+      {:ok, conn, :readwrite} -> close_on_error(conn, configure_readwrite(conn, tenant?, scope))
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  # Close the just-opened handle when configuration fails (expert review 2026-08-31 #25). A `with`
+  # short-circuit in configure_readonly/2 or configure_readwrite/3 — a busy_timeout/cache/authorizer
+  # error, or the security-relevant `{:could_not_disable_extension_loading, _}` — otherwise returns
+  # the error WITHOUT closing `conn`, so the fd/handle is released only when the NIF resource is
+  # GC-finalized. This is the per-stream open path, and relying on GC to close fds there is fragile
+  # and defeats the fail-the-open intent of the extension-disable guard. On success the handle rides
+  # out as before.
+  @doc false
+  def close_on_error(_conn, {:ok, _} = ok), do: ok
+
+  def close_on_error(conn, {:error, _reason} = err) do
+    _ = Sqlite3.close(conn)
+    err
   end
 
   # A `:ro` stream gets a genuinely read-only SQLite handle: the scope check in
