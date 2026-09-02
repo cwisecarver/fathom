@@ -258,6 +258,67 @@ defmodule Fathom.ShardDurabilityTest do
     :ok = ShardExecutor.close(conn)
   end
 
+  # Expert review 2026-08-31 #20: incremental_vacuum is a durable file mutation (freelist reclaim)
+  # that reports num_changes == 0 and no columns, so the blanket "pragma is control ⇒ read" rule
+  # left the shard clean and drop_clean discarded it on idle. It is tenant-ALLOWED, so a tenant
+  # running it lost the reclaim on the next idle drop. It now dirties the shard — but a bare
+  # `PRAGMA auto_vacuum` (a QUERY of the mode, also tenant-allowed as a read) must NOT.
+  test "incremental_vacuum dirties the shard; reading the auto_vacuum mode does not", %{
+    shard: shard
+  } do
+    {:ok, setup_conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(setup_conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(setup_conn, stmt("INSERT INTO kv VALUES (1, 'alice')"))
+    :ok = ShardExecutor.close(setup_conn)
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    flush_now(coordinator)
+    refute dirty?(shard), "clean baseline"
+
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    # A bare `PRAGMA auto_vacuum` READS the current mode — must not dirty.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("PRAGMA auto_vacuum"))
+    refute dirty?(shard), "reading the auto_vacuum mode must not dirty the shard"
+
+    # incremental_vacuum reclaims freelist pages — a durable write, and it uses `(N)`, not `=`.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("PRAGMA incremental_vacuum"))
+    assert dirty?(shard), "PRAGMA incremental_vacuum reclaims free pages — a durable write"
+
+    :ok = ShardExecutor.close(conn)
+  end
+
+  # auto_vacuum SET is BLOCKED for tenants by default, so it belongs in @durable_pragmas as
+  # defense-in-depth alongside the other blocked-but-durable entries (user_version, page_size,
+  # journal_mode): IF an operator allows it via :tenant_pragma_allow, `PRAGMA auto_vacuum = <mode>`
+  # rewrites the header flag and must dirty the shard, not be dropped on idle (#20).
+  test "auto_vacuum = <mode>, when allowed via config, dirties the shard", %{shard: shard} do
+    prev = Application.get_env(:fathom, :tenant_pragma_allow)
+    Application.put_env(:fathom, :tenant_pragma_allow, ["auto_vacuum"])
+
+    on_exit(fn ->
+      if prev,
+        do: Application.put_env(:fathom, :tenant_pragma_allow, prev),
+        else: Application.delete_env(:fathom, :tenant_pragma_allow)
+    end)
+
+    {:ok, setup_conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(setup_conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
+    :ok = ShardExecutor.close(setup_conn)
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    flush_now(coordinator)
+    refute dirty?(shard), "clean baseline"
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("PRAGMA auto_vacuum = FULL"))
+
+    assert dirty?(shard),
+           "PRAGMA auto_vacuum = <mode> rewrites the header flag — a durable write when allowed"
+
+    :ok = ShardExecutor.close(conn)
+  end
+
   # The finding's REAL acceptance test: the same shape on a PERSISTENT connection that already
   # wrote — Django's recommended CONN_MAX_AGE keeps connections alive across requests, so this,
   # not the fresh-connection case, is the primary production topology. sqlite3_changes() is not

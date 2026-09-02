@@ -443,7 +443,13 @@ defmodule Fathom.ShardExecutor do
   # beyond dirtiness — it is the unit the size cap is denominated in (see
   # `Connection.maybe_max_page_count/1`), so a shard whose page size changes underneath a
   # page-denominated cap silently changes its own byte ceiling.
-  @durable_pragmas ~w(user_version application_id schema_version page_size journal_mode)
+  # `auto_vacuum` added 2026-08-31 (expert review #20): `PRAGMA auto_vacuum = <mode>` rewrites the
+  # database HEADER's auto-vacuum flag, a durable file change reported as num_changes == 0 / no
+  # columns — so control ⇒ read left the shard clean and drop_clean discarded it on idle. It needs
+  # the `=` form (a bare `PRAGMA auto_vacuum` is a QUERY of the current mode, not a write), so it
+  # belongs in this `=`-gated set. `incremental_vacuum` is handled separately below — it takes the
+  # `(N)` argument form, not `=`.
+  @durable_pragmas ~w(user_version application_id schema_version page_size journal_mode auto_vacuum)
 
   # Slice + downcase a few head chars rather than the whole statement — this runs on every
   # no-column/no-change result, and the full-statement downcase was an O(len) binary copy per
@@ -610,8 +616,14 @@ defmodule Fathom.ShardExecutor do
   # The assignment form (`pragma [db.]name = value`) of a header-writing pragma; the
   # bare read form (`pragma user_version`) has no `=` and stays a read.
   defp durable_pragma_write?(lead) do
-    String.starts_with?(lead, "pragma") and String.contains?(lead, "=") and
-      Enum.any?(@durable_pragmas, &String.contains?(lead, &1))
+    # `PRAGMA incremental_vacuum(N)` (or the no-arg form) reclaims freelist pages — a durable
+    # file mutation reported as num_changes == 0 / no columns, and it uses `(N)` not `=`, so
+    # the `=`-gated set above cannot catch it (expert review 2026-08-31 #20). It is the only
+    # pragma with this name and every form of it writes, so a name match is exact — a bare
+    # `PRAGMA incremental_vacuum` still reclaims ALL free pages.
+    String.starts_with?(lead, "pragma") and
+      ((String.contains?(lead, "=") and Enum.any?(@durable_pragmas, &String.contains?(lead, &1))) or
+         String.contains?(lead, "incremental_vacuum"))
   end
 
   # Report the connection's REAL autocommit state (expert review 2026-07-14 #35). Hrana 3's
