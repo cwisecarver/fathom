@@ -902,9 +902,12 @@ defmodule Fathom.Directory do
   the row persists and the id joins the public `Tombstones` ETS set that admission consults on every
   checkout.
 
-  This exists for rows that were never a tenant — the restore drill's scratch forks, which nothing
-  ever routed to and no client ever held a token for. There is nothing to tombstone against, and a
-  tombstone per drill sample per run would grow that admission-path set without bound.
+  This exists for rows that were never a live tenant — the restore drill's scratch forks, and a
+  `Fathom.Tenants.provision/1` whose template fork failed (expert review 2026-08-31 #10): nothing
+  ever routed to them and no client ever held a token, so there is nothing to tombstone against, and
+  a tombstone per case would grow that admission-path set without bound. Rolling the row back also
+  keeps the id cleanly re-mintable on a retry, which a tombstone (the resurrection guard) would
+  block.
 
   Returns the number of rows removed (0 if it was already gone).
   """

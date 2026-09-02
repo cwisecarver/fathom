@@ -119,7 +119,9 @@ provision(id):
   cast + refuse if tombstoned (:tombstoned) or already-exists (:already_exists)
   dns_safety(id)                     # non-DNS-safe id → warn (default) or refuse (:id_not_dns_safe)
   Directory.resolve(id)              # explicit row, status "active"
-  maybe fork-from-template @HEAD     # when :fork_from_template is on (#10); else born empty
+  fork-from-template @HEAD           # when :fork_from_template is on (#10): a fork FAILURE fails
+                                     #   provision ({:error, {:fork_failed, _}}) and rolls the row
+                                     #   back, since the fork IS the birth path; else born empty
   mint a bearer token
   -> %{shard_id, url: "libsql://<id>.<base>", auth_token, auth_required, warnings}
 ```
