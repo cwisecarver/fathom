@@ -258,6 +258,18 @@ defmodule Fathom.Shard.Replication.Promote do
       #
       # A `nil` etag (no stored object at all) is a legitimate first publish and the 3-arity
       # accepts it, so a brand-new shard is unaffected.
+      #
+      # The 3-arity passes `position: nil`, so this publish writes NO position stamp — DELIBERATE,
+      # and the audit (expert review 2026-08-31 #19) had the consequence backwards. An object with
+      # no position stamp is read as "unknown" and `Promote.fresher?/2` refuses to rank ANY replica
+      # against it (`fresher?(_replica, nil) == false`), so the freshly-published object can NEVER be
+      # overridden by a replica — the SAFE direction, not a rollback. The only cost is that a future
+      # failover of THIS shard cannot use replica-promotion (it falls back to an S3 pull); the
+      # cold-open path (`Fathom.Shard.promote_replica/7`) stamps position+lineage precisely to keep
+      # replica-promotion available for the shards it opens. If `promote/2` is ever wired into a
+      # production/operator path where that failover matters, thread the replica's lineage through
+      # and stamp with the 5-arity flush — but do NOT "fix" the nil stamp into carrying the
+      # pre-promotion object's stamp, which is the actual rollback bug the audit imagined.
       with :ok <- stage(follower, shard_id, temp),
            {:ok, expected} <- current_object_etag(shard_id),
            :ok <- File.rename(temp, path),
