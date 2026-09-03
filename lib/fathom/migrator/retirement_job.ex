@@ -54,14 +54,20 @@ defmodule Fathom.Migrator.RetirementJob do
       version_live?(shard_id, version) ->
         {:cancel, :version_live}
 
-      # A revert TO this version is in flight (expert review round-2 #17): the
-      # directory still shows from_version until its cutover, so the live-guard above
-      # passes — but the retained copy is that revert's restore source. RevertJob's
-      # up-front cancel can't reach a retirement that already dequeued (executing is
-      # uncancellable), so this side must check. Cancelled, not snoozed: if the revert
-      # lands, the version is live (drop would be wrong); if it fails, the copy leaks
-      # until the S3 lifecycle backstop — the recoverable direction.
-      revert_in_flight?(shard_id, version) ->
+      # A revert for this shard is in flight (expert review round-2 #17; broadened 2026-08-31 #8):
+      # the directory still shows from_version until its cutover, so the live-guard above passes —
+      # but the retained copy is that revert's restore source. This matches ANY in-flight RevertJob
+      # for the shard, NOT one whose to_version equals `version`: a chain-jumper (a cold-tail shard
+      # that walked v5 -> v9 in one job) carries the fleet TARGET as to_version while its restore
+      # SOURCE is a LOWER landing version read from retained_version — so a to_version-keyed guard
+      # misses exactly the retirement that drops that source and strands the shard on a yanked
+      # version above head (it can neither forward-migrate nor revert, and revert_status reports it
+      # as landed). Over-matching an unrelated retirement is the SAFE direction: RevertJob's
+      # up-front cancel can't reach a retirement that already dequeued (executing is uncancellable),
+      # so this side must check. Cancelled, not snoozed: if the revert lands the version is live
+      # (drop would be wrong); if it fails, or the retirement was unrelated, the copy leaks until
+      # the S3 lifecycle backstop — the recoverable direction.
+      revert_in_flight?(shard_id) ->
         {:cancel, :revert_in_flight}
 
       true ->
@@ -91,13 +97,12 @@ defmodule Fathom.Migrator.RetirementJob do
     match?({:ok, %{schema_version: ^version}}, Directory.get(shard_id))
   end
 
-  defp revert_in_flight?(shard_id, version) do
+  defp revert_in_flight?(shard_id) do
     Fathom.Repo.exists?(
       from(j in Oban.Job,
         where: j.worker == "Fathom.Migrator.RevertJob",
         where: j.state in ["scheduled", "available", "executing", "retryable", "suspended"],
-        where: fragment("?->>'shard_id' = ?", j.args, ^shard_id),
-        where: fragment("(?->>'to_version')::bigint = ?", j.args, ^version)
+        where: fragment("?->>'shard_id' = ?", j.args, ^shard_id)
       )
     )
   end

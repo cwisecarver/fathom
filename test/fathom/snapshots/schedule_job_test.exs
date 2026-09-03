@@ -123,6 +123,28 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
       assert length(second) == length(first) + 1
     end
 
+    # Expert review 2026-08-31 #7: record_snapshot stamped wall-clock now(), which is LATER than the
+    # flush the snapshot reflects (Snapshots.create copies the last-flushed state). A flush landing
+    # between the copy and the stamp was then marked "already snapshotted" (the sample predicate is
+    # last_flushed_at > last_snapshot_at) though its bytes are in no snapshot. The stamp must be the
+    # captured watermark, so it equals last_flushed_at and any later flush stays selectable.
+    test "credits the snapshot with the flush watermark, not wall-clock now()", %{id: id} do
+      seed(id, ["CREATE TABLE t (v INTEGER)", "INSERT INTO t VALUES (1)"])
+      flushed_at = row(id).last_flushed_at
+      assert flushed_at
+
+      Application.put_env(:fathom, :snapshot_schedule_sample, 50)
+      assert {:ok, counts} = ScheduleJob.run(50)
+      assert Map.get(counts, :ok, 0) >= 1
+
+      snap_at = row(id).last_snapshot_at
+
+      assert DateTime.compare(snap_at, flushed_at) == :eq,
+             "last_snapshot_at (#{inspect(snap_at)}) is not the flush watermark " <>
+               "(#{inspect(flushed_at)}) — a flush landing during the copy would be marked " <>
+               "snapshotted though its bytes are in no snapshot"
+    end
+
     test "never selects a shard that has never flushed", %{id: id} do
       # No durable object exists yet, so a snapshot would copy nothing. Excluded at the query
       # rather than allowed to fail per-shard every run.

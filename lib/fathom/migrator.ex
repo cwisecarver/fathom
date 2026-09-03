@@ -97,19 +97,59 @@ defmodule Fathom.Migrator do
   # explicitly through `Fathom.Tenants.provision/1`, which forks on its own path.
   defp warn_if_births_are_empty(version) do
     template? = Application.get_env(:fathom, :template_shard_id) not in [nil, ""]
+    fork? = Application.get_env(:fathom, :fork_from_template, false)
 
-    if template? and not Application.get_env(:fathom, :fork_from_template, false) do
-      Logger.warning(
-        "released schema v#{version}, but :fork_from_template is OFF — a novel tenant minted by " <>
-          "traffic is born EMPTY at v0, its first ORM query fails, and the rollout CANNOT heal it " <>
-          "(replay onto an empty file dies on `no such table: django_migrations`). Set " <>
-          "FORK_FROM_TEMPLATE=true and run `mix fathom.snapshot template-head` so new tenants are " <>
-          "born at HEAD. Ignore this if every tenant is provisioned explicitly via the " <>
-          "/api/tenants control plane."
-      )
+    cond do
+      not template? ->
+        :ok
+
+      not fork? ->
+        Logger.warning(
+          "released schema v#{version}, but :fork_from_template is OFF — a novel tenant minted by " <>
+            "traffic is born EMPTY at v0, its first ORM query fails, and the rollout CANNOT heal " <>
+            "it (replay onto an empty file dies on `no such table: django_migrations`). Set " <>
+            "FORK_FROM_TEMPLATE=true and run `mix fathom.snapshot template-head` so new tenants " <>
+            "are born at HEAD. Ignore this if every tenant is provisioned explicitly via the " <>
+            "/api/tenants control plane."
+        )
+
+        :ok
+
+      # Fork ON but the template@<new head> snapshot has not been refreshed (expert review
+      # 2026-08-31 #11). fork_from_template/1 forks from `<template>@<head>`, and that object is
+      # created out-of-band by `mix fathom.snapshot template-head` — which has no automatic caller
+      # after a release. So from the moment this release advances HEAD until an operator refreshes
+      # the snapshot, every fork targets an object that does not exist yet and the tenant is born
+      # empty then quarantined. Warn, never refuse (a fleet may provision every tenant explicitly);
+      # release is the one cheap place to catch it (HEAD is in hand, once per release).
+      not template_head_snapshot_present?(version) ->
+        Logger.warning(
+          "released schema v#{version} with :fork_from_template ON, but no template@v#{version} " <>
+            "snapshot exists yet — until you run `mix fathom.snapshot template-head`, every novel " <>
+            "tenant is born EMPTY (the fork source is missing) and then quarantined. Run it now so " <>
+            "new tenants are born at HEAD."
+        )
+
+        :telemetry.execute(
+          [:fathom, :migrator, :template_snapshot_stale],
+          %{version: version},
+          %{}
+        )
+
+        :ok
+
+      true ->
+        :ok
     end
+  end
 
-    :ok
+  # Best-effort HEAD on the fork source. `false` on any error/absence — a warning must never fail a
+  # release, and "cannot tell" is the same actionable answer as "absent" here.
+  defp template_head_snapshot_present?(version) do
+    case template_shard_id() do
+      {:ok, template} -> Fathom.Shard.Storage.version_present?(template, version)
+      _ -> false
+    end
   end
 
   # Store bind values in Filo's tagged Hrana encoding (`%{"type" => "text", "value" => …}`,

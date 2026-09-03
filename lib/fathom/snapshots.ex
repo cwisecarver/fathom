@@ -29,8 +29,7 @@ defmodule Fathom.Snapshots do
   """
 
   alias Fathom.Directory
-  alias Fathom.Shard.Connection
-  alias Fathom.Shard.Storage
+  alias Fathom.Shard.{SqliteHeader, Storage}
   alias Fathom.ShardId
   alias Fathom.Shards
   alias Fathom.Snapshots.Retention
@@ -215,22 +214,13 @@ defmodule Fathom.Snapshots do
     )
   end
 
-  defp read_user_version(path) do
-    case Connection.open(path) do
-      {:ok, conn} ->
-        result =
-          case Connection.query(conn, "PRAGMA user_version", []) do
-            {:ok, %{rows: [[v]]}} when is_integer(v) -> {:ok, v}
-            other -> {:error, {:user_version_unreadable, other}}
-          end
-
-        Connection.close(conn)
-        result
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
+  # Read user_version straight from the SQLite header, NOT by opening the file (expert review
+  # 2026-08-31 #23) — opening it would run journal_mode=WAL on a VACUUM INTO snapshot and mutate the
+  # very bytes `restore/3` then promotes. The header parse lives in `Fathom.Shard.SqliteHeader`,
+  # shared with `Fathom.RestoreDrillJob` (self-review 2026-08-31 #2); kept as a public passthrough so
+  # the snapshot-restore path is the entry point its no-mutation test asserts against.
+  @doc false
+  def read_user_version(path), do: SqliteHeader.user_version(path)
 
   # Refuse a restore that would cross a schema-migration boundary unless force: true (#7). With no
   # directory row there is nothing to skew, so allow it. Fails OPEN on a directory (Postgres) error —

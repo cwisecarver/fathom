@@ -87,6 +87,14 @@ defmodule Fathom.Snapshots.ScheduleJob do
   end
 
   defp snapshot_one(shard_id) do
+    # Capture the watermark the snapshot will reflect BEFORE the copy. `Snapshots.create` copies
+    # the live stored object, i.e. state as of the last flush that preceded the CopyObject, so the
+    # snapshot must be CREDITED with that flush's time — not wall-clock now(), which would mark a
+    # flush landing between the copy and the stamp as "already snapshotted" though its bytes are not
+    # in the snapshot (expert review 2026-08-31 #7). Reading it first stamps at-or-behind the
+    # captured state, so the failure direction is a redundant re-snapshot, never a silent gap.
+    watermark = Directory.last_flushed_at(shard_id) || DateTime.utc_now()
+
     # `auto: true`, not `label: "auto"` (expert review 2026-08-20 #14). The marker is provenance,
     # and routing it through the operator-supplied label field is what let a manual snapshot forge
     # it — including by 40-char truncation.
@@ -95,7 +103,7 @@ defmodule Fathom.Snapshots.ScheduleJob do
         # Stamped ONLY on success. A failed snapshot must leave the shard at the head of the
         # rotation so the next run retries it — stamping regardless would mark a tenant "backed up"
         # on the strength of a failed copy and then not revisit it for a full cycle.
-        Directory.record_snapshot(shard_id)
+        Directory.record_snapshot(shard_id, watermark)
         :ok
 
       {:error, reason} ->

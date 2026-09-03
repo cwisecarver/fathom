@@ -36,7 +36,7 @@ defmodule Fathom.RestoreDrillJob do
   require Logger
 
   alias Fathom.{Directory, Shard}
-  alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Shard.{Connection, SqliteHeader, Storage}
 
   # Outcomes that mean the durable object is bad/unreachable (the alertable set) vs merely
   # "no data yet" (absent/sentinel — a brand-new tenant that never flushed).
@@ -347,9 +347,15 @@ defmodule Fathom.RestoreDrillJob do
     end
   end
 
+  # Read user_version from the SQLite header, not by opening the file (expert review 2026-08-31 #23):
+  # a full Connection.open runs journal_mode=WAL + the extension load + a close-time checkpoint,
+  # mutating a VACUUM INTO snapshot's rollback-journal bytes to read four bytes. The drill's temp is
+  # dropped rather than promoted, so here it is churn rather than a correctness bug — but the same
+  # shape as the snapshot restore path, so it shares `SqliteHeader` (self-review 2026-08-31 #2).
+  # Corruption past the header is the drill's separate quick_check's job.
   defp check_schema(id, tmp, schema_version) do
-    case read_user_version(tmp) do
-      ^schema_version ->
+    case SqliteHeader.user_version(tmp) do
+      {:ok, ^schema_version} ->
         :ok
 
       other ->
@@ -359,23 +365,6 @@ defmodule Fathom.RestoreDrillJob do
         )
 
         :schema_mismatch
-    end
-  end
-
-  defp read_user_version(path) do
-    case Connection.open(path) do
-      {:ok, conn} ->
-        version =
-          case Connection.query(conn, "PRAGMA user_version", []) do
-            {:ok, %{rows: [[v]]}} -> v
-            _ -> nil
-          end
-
-        Connection.close(conn)
-        version
-
-      _ ->
-        nil
     end
   end
 
@@ -462,9 +451,20 @@ defmodule Fathom.RestoreDrillJob do
   # would pass `quick_check` and prove nothing. Compare the restored copy's user table row counts to
   # the source's — if they disagree, the recovery path silently loses data, which is the failure
   # this drill exists to catch before an incident does.
+  #
+  # BOTH sides read the DURABLE state (expert review 2026-08-31 #14). `scratch` is a fork, which
+  # reflects the source's last-flushed stored object; the source side reads that SAME stored object
+  # via a fresh pull, NOT the live coordinator. Reading the source live (its previous behaviour)
+  # counted un-flushed writes a real recovery would not see, so any open+dirty shard at drill time
+  # reported `src > dst` ⇒ a false `:restored_mismatch` — the one alarm whose whole purpose is "a
+  # backup you haven't restored is a hypothesis" crying wolf and getting trained into noise. The
+  # pull is a DIFFERENT code path from the fork's server-side copy, so an empty/broken fork still
+  # shows up as a real mismatch (the failure this drill exists to catch). A flush landing between
+  # the fork and this pull could still make them differ, but that is a rare transient, not the
+  # systematic false positive on every dirty shard.
   defp compare_then_drop(id, scratch) do
     try do
-      case {table_counts(id), table_counts(scratch)} do
+      case {durable_table_counts(id), table_counts(scratch)} do
         {{:ok, src}, {:ok, dst}} when src == dst -> :ok
         {{:ok, _src}, {:ok, _dst}} -> :restored_mismatch
         _ -> :fork_failed
@@ -475,31 +475,12 @@ defmodule Fathom.RestoreDrillJob do
   end
 
   # {table_name => row_count} for the shard's USER tables, read through a normal checkout so the
-  # read goes down the same path a tenant's would. `sqlite_%` is excluded: internal tables differ
-  # between a freshly-written copy and a long-lived original for reasons that are not data loss.
+  # read goes down the same path a tenant's would. Used for the SCRATCH fork, which has no live
+  # coordinator and therefore cold-opens onto its own durable object.
   defp table_counts(shard_id) do
     with {:ok, pid, ref, path} <- Fathom.Shards.checkout(shard_id) do
       try do
-        {:ok, conn} = Connection.open(path)
-
-        try do
-          {:ok, %{rows: rows}} =
-            Connection.query(
-              conn,
-              "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-              []
-            )
-
-          counts =
-            Map.new(rows, fn [table] ->
-              {:ok, %{rows: [[n]]}} = Connection.query(conn, count_sql(table), [])
-              {table, n}
-            end)
-
-          {:ok, counts}
-        after
-          Connection.close(conn)
-        end
+        counts_from_file(path)
       after
         Fathom.Shard.checkin(pid, ref)
       end
@@ -508,6 +489,57 @@ defmodule Fathom.RestoreDrillJob do
     _ -> :error
   catch
     :exit, _ -> :error
+  end
+
+  # {table_name => row_count} read from the source's DURABLE stored object via a fresh pull into a
+  # temp — NOT the live coordinator, whose file carries un-flushed writes a recovery would not see
+  # (#14). An absent object is an empty durable state (its fork would be empty too), so `%{}` rather
+  # than an error.
+  defp durable_table_counts(shard_id) do
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "restoredrill_ref_#{shard_id}_#{System.unique_integer([:positive])}.db"
+      )
+
+    try do
+      case Fathom.Shard.Storage.pull(shard_id, tmp) do
+        {:ok, _etag} -> counts_from_file(tmp)
+        {:absent, _} -> {:ok, %{}}
+        {:error, _} -> :error
+      end
+    after
+      for suffix <- ["", "-wal", "-shm"], do: File.rm(tmp <> suffix)
+    end
+  rescue
+    _ -> :error
+  catch
+    :exit, _ -> :error
+  end
+
+  # `sqlite_%` is excluded: internal tables differ between a freshly-written copy and a long-lived
+  # original for reasons that are not data loss.
+  defp counts_from_file(path) do
+    {:ok, conn} = Connection.open(path)
+
+    try do
+      {:ok, %{rows: rows}} =
+        Connection.query(
+          conn,
+          "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+          []
+        )
+
+      counts =
+        Map.new(rows, fn [table] ->
+          {:ok, %{rows: [[n]]}} = Connection.query(conn, count_sql(table), [])
+          {table, n}
+        end)
+
+      {:ok, counts}
+    after
+      Connection.close(conn)
+    end
   end
 
   # Clean up the scratch tenant. Deliberately NOT `Tenants.delete/1`, which is the supported way to

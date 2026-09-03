@@ -114,7 +114,7 @@ defmodule Fathom.Rpo do
     )
 
     shard = "rpo_cost_#{System.unique_integer([:positive])}"
-    {:ok, h} = ShardExecutor.open(shard)
+    {:ok, h} = ShardExecutor.open(shard, :trusted)
 
     {:ok, _} =
       ShardExecutor.execute(
@@ -181,7 +181,7 @@ defmodule Fathom.Rpo do
     Application.put_env(:fathom, :shard_flush_interval_ms, interval_ms)
 
     shard = "rpo_#{System.unique_integer([:positive])}"
-    {:ok, h} = ShardExecutor.open(shard)
+    {:ok, h} = ShardExecutor.open(shard, :trusted)
 
     {:ok, _} =
       ShardExecutor.execute(
@@ -368,7 +368,7 @@ defmodule Fathom.Rpo do
     Application.put_env(:fathom, :shard_flush_interval_ms, 0)
 
     shard = "rpo_pk_#{System.unique_integer([:positive])}"
-    {:ok, h} = ShardExecutor.open(shard)
+    {:ok, h} = ShardExecutor.open(shard, :trusted)
     {:ok, _} = ShardExecutor.execute(h, %Stmt{sql: "CREATE TABLE t (seq INTEGER PRIMARY KEY)"})
 
     Enum.each(1..n, fn s ->
@@ -394,7 +394,7 @@ defmodule Fathom.Rpo do
 
     # Re-open: the present local file is authoritative on wake → adopt it (no
     # pull), and SQLite recovers the fsynced WAL.
-    {:ok, h2} = ShardExecutor.open(shard)
+    {:ok, h2} = ShardExecutor.open(shard, :trusted)
 
     survived =
       case ShardExecutor.execute(h2, %Stmt{sql: "SELECT COALESCE(MAX(seq), 0) FROM t"}) do

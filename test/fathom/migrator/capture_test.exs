@@ -396,6 +396,74 @@ defmodule Fathom.Migrator.CaptureTest do
       assert Migrator.head() == 0
     end
 
+    # Expert review 2026-08-31 #18: an awaiting buffer that still holds DDL, dropped by a new BEGIN
+    # before its django_migrations bookkeeping row arrives, is the silent-fork condition #6's
+    # awaiting mechanism exists to prevent. It is now ALERTABLE (warn + telemetry) rather than
+    # invisible — the FK-disabling migrate path depends on the recorder INSERT arriving in
+    # autocommit, and a future Django emitting it inside a transaction would silently stop recording
+    # versions.
+    test "a new BEGIN dropping awaiting DDL warns and emits telemetry (#18)" do
+      import ExUnit.CaptureLog
+      test_pid = self()
+      handler = "capture-dropped-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:fathom, :migrator, :capture_awaiting_dropped],
+        fn _e, m, _md, _ -> send(test_pid, {:dropped, m.count}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      conn = make_ref()
+      # BEGIN / DDL / COMMIT with NO count rise → the FK-disabling shape parks the DDL awaiting.
+      Capture.begin(conn, 0)
+      Capture.append(conn, ~s|CREATE TABLE "t" ("id" integer PRIMARY KEY)|, [])
+      assert Capture.commit(conn, 0) == :noop
+
+      # A new BEGIN arrives before the bookkeeping row — the awaiting DDL is dropped.
+      log =
+        capture_log(fn ->
+          Capture.begin(conn, 0)
+          _ = :sys.get_state(Capture)
+        end)
+
+      assert log =~ "AWAITING their django_migrations bookkeeping row"
+      assert_receive {:dropped, 1}
+    end
+
+    # The other half: a genuinely empty transaction (only pure reads buffered) superseded by a new
+    # BEGIN is the ordinary no-op and must NOT warn — a false alarm there defeats the point.
+    test "a new BEGIN dropping a pure-read awaiting buffer does NOT warn (#18)" do
+      import ExUnit.CaptureLog
+      test_pid = self()
+      handler = "capture-noread-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:fathom, :migrator, :capture_awaiting_dropped],
+        fn _e, m, _md, _ -> send(test_pid, {:dropped, m.count}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      conn = make_ref()
+      Capture.begin(conn, 0)
+      Capture.append(conn, "SELECT 1", [])
+      assert Capture.commit(conn, 0) == :noop
+
+      log =
+        capture_log(fn ->
+          Capture.begin(conn, 0)
+          _ = :sys.get_state(Capture)
+        end)
+
+      refute log =~ "AWAITING"
+      refute_receive {:dropped, _}, 50
+    end
+
     test "a second bookkeeping row does not re-record the same version" do
       conn = make_ref()
       Capture.begin(conn, 0)

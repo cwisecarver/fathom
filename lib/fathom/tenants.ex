@@ -86,14 +86,19 @@ defmodule Fathom.Tenants do
   resurrection guard), `{:error, :invalid_shard_id}`, or — when `:wildcard_tls_serving` is set —
   `{:error, :id_not_dns_safe}` for an id no `*.<zone>` cert can serve (#35); with that flag off such
   an id provisions but carries a `warnings` entry instead.
+
+  When `:fork_from_template` is ON the fork IS the birth path, so a fork FAILURE returns
+  `{:error, {:fork_failed, reason}}` and rolls the directory row back — provision never reports
+  success for a tenant that has no schema (expert review 2026-08-31 #10). A concurrent forker
+  winning the race is success, not a failure.
   """
   @spec provision(String.t()) :: {:ok, map()} | {:error, term()}
   def provision(shard_id) do
     with {:ok, id} <- cast(shard_id),
          :ok <- refuse_if_taken(id),
          {:ok, warnings} <- dns_safety(id),
-         {:ok, _row} <- Directory.resolve(id) do
-      maybe_fork(id)
+         {:ok, _row} <- Directory.resolve(id),
+         :ok <- fork_or_rollback(id) do
       {:ok, tenant_result(id, warnings)}
     end
   end
@@ -423,18 +428,56 @@ defmodule Fathom.Tenants do
     end
   end
 
-  # Fork the new tenant's schema from the template at HEAD when the fork path is enabled (#10);
-  # otherwise it's born empty on first connect (today's default). Best-effort — a provision is
-  # never failed for a fork miss (the shard just cold-opens empty).
-  defp maybe_fork(id) do
-    if Application.get_env(:fathom, :fork_from_template, false),
-      do: _ = Fathom.Migrator.fork_from_template(id)
+  # Fork the new tenant's schema from the template at HEAD (#10), then either succeed or ROLL BACK
+  # the just-registered directory row (expert review 2026-08-31 #10). When `:fork_from_template` is
+  # ON the fork IS the birth path, so a failed fork means the active@0 row describes a tenant with
+  # no schema whose first ORM query fails and which the rollout cannot heal — and provision used to
+  # discard that outcome and return {:ok}, a silently broken tenant. It now fails loudly.
+  #
+  # hard_delete, NOT tombstone: nothing ever routed to this id and no token was returned to any
+  # caller (tenant_result is only reached on success), so it was never a live tenant — and a retry
+  # must be able to re-mint the same id, which a tombstone (the resurrection guard) would block.
+  defp fork_or_rollback(id) do
+    case maybe_fork(id) do
+      :ok ->
+        :ok
 
-    :ok
-  rescue
-    _ -> :ok
-  catch
-    :exit, _ -> :ok
+      {:error, _} = err ->
+        _ = Directory.hard_delete(id)
+        err
+    end
+  end
+
+  # Runs the fork (when enabled) and maps its outcome CLASS to whether provision succeeds, reusing
+  # `Shards.report_fork/2` for the same alarm + telemetry the traffic-minted birth path emits. The
+  # benign classes leave the tenant with schema (born at HEAD), or legitimately un-forked (the
+  # capture template forking onto itself, a dst that already holds bytes, or a concurrent forker
+  # that won the race and birthed it); anything else is the born-empty failure that must not be
+  # reported as success. With the flag OFF, born-empty on first connect is today's intended default,
+  # so provision still succeeds.
+  defp maybe_fork(id) do
+    if Application.get_env(:fathom, :fork_from_template, false) do
+      outcome =
+        try do
+          Fathom.Migrator.fork_from_template(id)
+        rescue
+          e -> {:error, {:exception, e}}
+        catch
+          :exit, reason -> {:error, {:exit, reason}}
+        end
+
+      _ = Shards.report_fork(outcome, id)
+
+      case outcome do
+        {:ok, _} -> :ok
+        {:error, :template_shard} -> :ok
+        {:error, :dst_exists} -> :ok
+        {:retry, _} -> :ok
+        other -> {:error, {:fork_failed, other}}
+      end
+    else
+      :ok
+    end
   end
 
   defp mint_token(id) do

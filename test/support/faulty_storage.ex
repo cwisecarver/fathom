@@ -456,6 +456,9 @@ defmodule Fathom.Test.FaultyStorage do
   def drop_version(shard_id, version), do: Local.drop_version(shard_id, version)
 
   @impl true
+  def version_present?(shard_id, version), do: Local.version_present?(shard_id, version)
+
+  @impl true
   def put_tombstone(shard_id), do: Local.put_tombstone(shard_id)
   @impl true
   def tombstoned_ids, do: Local.tombstoned_ids()

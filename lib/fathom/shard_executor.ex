@@ -23,10 +23,28 @@ defmodule Fathom.ShardExecutor do
   alias Fathom.Shards
   alias Filo.{Describe, Error, Stmt, StmtResult}
 
-  # The behaviour's required 1-arity open; the real open is open/2. A direct open/1 (or an
-  # executor caller with no auth context) gets the full-access default scope.
+  # The behaviour's required 1-arity open; the real open is open/2. It carries NO auth context, so
+  # it can neither honour a :ro scope nor re-check a revoked token (token_version would be nil, so
+  # version_current?/2 passes unconditionally). On an auth-REQUIRED fleet that is a
+  # scope-escalation + revocation bypass the moment the wire ever reaches it, so it fails closed:
+  # every authenticated stream arrives through open/2 with its {scope, version} context, and
+  # internal trusted callers (migration, rpo, harnesses) pass an explicit `:trusted` context to
+  # open/2. When auth is DISABLED the network is the trust boundary (same posture as the
+  # unauthenticated replication port), so the historical full-access default stands
+  # (expert review 2026-08-31 #9).
   @impl true
-  def open(shard_id), do: open(shard_id, :rw)
+  def open(shard_id) do
+    if auth_required?() do
+      {:error,
+       %Error{
+         message: "no authentication context; open through the authorized wire path",
+         code: "FILO_NO_AUTH_CONTEXT",
+         status: 401
+       }}
+    else
+      open(shard_id, :trusted)
+    end
+  end
 
   @impl true
   # No shard could be resolved for the request (no subdomain, override off, and no configured
@@ -59,11 +77,17 @@ defmodule Fathom.ShardExecutor do
   # The context is `{scope, token_version}` from HranaAuth.authorize/2 (expert review 2026-08-20
   # #22 added the version). Older shapes — a bare scope atom, `nil` from a plain `:ok`, an internal
   # caller with no auth context — degrade to full access with no version, i.e. no floor re-check.
+  # An explicit internal-caller marker (migration, rpo, harnesses): full :rw, no revocation floor,
+  # regardless of the auth posture. Named rather than relying on the catch-all so the trust is
+  # visible at the call site and cannot be conjured by an unexpected wire value (expert review #9).
+  defp context_of(:trusted), do: {:rw, nil}
   defp context_of({scope, version}), do: {scope_of(scope), version}
   defp context_of(other), do: {scope_of(other), nil}
 
   defp scope_of(:ro), do: :ro
   defp scope_of(_), do: :rw
+
+  defp auth_required?, do: Application.get_env(:fathom, :hrana_auth, :disabled) == :required
 
   defp do_open(shard_id, scope, token_version) do
     case Shards.checkout(shard_id) do
@@ -419,7 +443,13 @@ defmodule Fathom.ShardExecutor do
   # beyond dirtiness — it is the unit the size cap is denominated in (see
   # `Connection.maybe_max_page_count/1`), so a shard whose page size changes underneath a
   # page-denominated cap silently changes its own byte ceiling.
-  @durable_pragmas ~w(user_version application_id schema_version page_size journal_mode)
+  # `auto_vacuum` added 2026-08-31 (expert review #20): `PRAGMA auto_vacuum = <mode>` rewrites the
+  # database HEADER's auto-vacuum flag, a durable file change reported as num_changes == 0 / no
+  # columns — so control ⇒ read left the shard clean and drop_clean discarded it on idle. It needs
+  # the `=` form (a bare `PRAGMA auto_vacuum` is a QUERY of the current mode, not a write), so it
+  # belongs in this `=`-gated set. `incremental_vacuum` is handled separately below — it takes the
+  # `(N)` argument form, not `=`.
+  @durable_pragmas ~w(user_version application_id schema_version page_size journal_mode auto_vacuum)
 
   # Slice + downcase a few head chars rather than the whole statement — this runs on every
   # no-column/no-change result, and the full-statement downcase was an O(len) binary copy per
@@ -586,8 +616,14 @@ defmodule Fathom.ShardExecutor do
   # The assignment form (`pragma [db.]name = value`) of a header-writing pragma; the
   # bare read form (`pragma user_version`) has no `=` and stays a read.
   defp durable_pragma_write?(lead) do
-    String.starts_with?(lead, "pragma") and String.contains?(lead, "=") and
-      Enum.any?(@durable_pragmas, &String.contains?(lead, &1))
+    # `PRAGMA incremental_vacuum(N)` (or the no-arg form) reclaims freelist pages — a durable
+    # file mutation reported as num_changes == 0 / no columns, and it uses `(N)` not `=`, so
+    # the `=`-gated set above cannot catch it (expert review 2026-08-31 #20). It is the only
+    # pragma with this name and every form of it writes, so a name match is exact — a bare
+    # `PRAGMA incremental_vacuum` still reclaims ALL free pages.
+    String.starts_with?(lead, "pragma") and
+      ((String.contains?(lead, "=") and Enum.any?(@durable_pragmas, &String.contains?(lead, &1))) or
+         String.contains?(lead, "incremental_vacuum"))
   end
 
   # Report the connection's REAL autocommit state (expert review 2026-07-14 #35). Hrana 3's

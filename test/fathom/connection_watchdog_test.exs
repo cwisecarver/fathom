@@ -160,6 +160,19 @@ defmodule Fathom.ConnectionWatchdogTest do
   #
   # The precondition is now asserted rather than assumed: if the deadline is not actually in force
   # the test says so, instead of reporting a watchdog that "did not fire".
+  #
+  # :flaky (self-review 2026-09-02). This RACES a real 200M-row CTE against a 60 ms deadline, and on
+  # a loaded 2-core CI runner the query can win — both dirty-CPU schedulers busy with the rest of the
+  # suite, so a cancel finds nothing running and the query then runs to completion once it gets a
+  # slot. It has now gone red on CI twice with the identical `{:ok, rows: [[200000000]]}` (runs
+  # 33234915078 and 33589351302), and the :high-priority watchdog fix did not make the RACE reliable
+  # — only rarer. The invariants it means to prove are pinned DETERMINISTICALLY below and pass on CI:
+  # "a deadline that fires before the statement starts still bounds the query" (idle-armed, no race)
+  # and "the per-connection watchdog runs at elevated priority". So this is the project's `:flaky`
+  # case exactly — a real behaviour whose repro is not reliable — not a masked failure. To un-tag it,
+  # the query would have to be bounded on a saturated 2-core box without racing (e.g. a stand-in for
+  # `multi_step` that yields a scheduler slot deterministically). Run with `mix test --include flaky`.
+  @tag :flaky
   test "the per-connection watchdog re-arms across timeouts and healthy queries", %{conn: conn} do
     Application.put_env(:fathom, :query_timeout_ms, 60)
 
@@ -257,5 +270,41 @@ defmodule Fathom.ConnectionWatchdogTest do
     assert Process.info(watchdog, :priority) == {:priority, :high},
            "a normal-priority watchdog is starved on a saturated runner and its retry cancels " <>
              "never fire, so :query_timeout_ms bounds nothing — see the CI failure this guards"
+  end
+
+  # Expert review 2026-08-31 #22. `with_deadline/3` armed the watchdog with a fire-and-forget send;
+  # a watchdog that died between `ensure_watchdog/1` returning a live pid and the send left the arm
+  # dropped and the query UNBOUNDED. `arm_watchdog/1` now re-checks liveness after the send.
+  #
+  # INVARIANT GUARD, not a race reproduction: `ensure_watchdog/1` gatekeeps every dead-pid case that
+  # is NOT the scheduler-dependent death-during-send window, so this pins the observable invariant
+  # both mechanisms serve — "a dead watchdog in the connection's dict never disables the deadline" —
+  # by planting a confirmed-dead pid and proving a slow query still times out. The exact
+  # death-during-send window the re-check additionally closes cannot be forced from a test (see the
+  # comment on arm_watchdog/4).
+  test "a dead watchdog in the dict does not disable the deadline", %{conn: conn} do
+    Application.put_env(:fathom, :query_timeout_ms, 60)
+
+    # A confirmed-dead pid planted as THIS connection's watchdog.
+    dead = spawn(fn -> :ok end)
+    dref = Process.monitor(dead)
+    assert_receive {:DOWN, ^dref, :process, ^dead, _}, 1_000
+    refute Process.alive?(dead)
+    Process.put({Connection, :watchdog, conn}, dead)
+
+    # Slow BY CONSTRUCTION so it cannot finish inside the 60 ms deadline on its own.
+    slow = """
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 200000000)
+    SELECT count(*) FROM c
+    """
+
+    assert {:error, _} = Connection.query(conn, slow, []),
+           "a dead watchdog in the dict let the query run UNBOUNDED — arming must land on a live " <>
+             "watchdog, never a corpse"
+
+    # And a fresh, live watchdog now backs the connection.
+    replacement = Process.get({Connection, :watchdog, conn})
+    assert is_pid(replacement) and Process.alive?(replacement)
+    refute replacement == dead
   end
 end

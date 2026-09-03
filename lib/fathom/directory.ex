@@ -254,16 +254,37 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  The shard's `last_flushed_at`, or nil if the shard is gone or has never flushed.
+
+  Read by the snapshot scheduler BEFORE it copies the object, so the snapshot can be credited with
+  the watermark it actually reflects rather than wall-clock now() (expert review 2026-08-31 #7).
+  """
+  @spec last_flushed_at(String.t()) :: DateTime.t() | nil
+  def last_flushed_at(shard_id) do
+    from(s in Shard, where: s.shard_id == ^shard_id, select: s.last_flushed_at)
+    |> Repo.one()
+  end
+
+  @doc """
   Stamps `last_snapshot_at` after a scheduled snapshot (#18). Returns rows updated (0 if gone).
 
   Stamped only on SUCCESS by the caller: a failed snapshot must leave the shard at the head of the
   rotation so the next run retries it, rather than marking it done and waiting a full cycle.
+
+  `at` is the WATERMARK the snapshot reflects — the shard's `last_flushed_at` read BEFORE the copy —
+  not wall-clock now() (expert review 2026-08-31 #7). `Snapshots.create` copies the live stored
+  object, i.e. state as of the last flush that preceded the CopyObject. Stamping now() instead
+  marked any flush that landed between the copy and this stamp as "already snapshotted" (the
+  `sample_for_snapshot/1` predicate is `last_flushed_at > last_snapshot_at`), even though those
+  bytes are not in the snapshot — a silent generation loss if that shard then went cold and the
+  live object was later lost. `updated_at` stays wall-clock now(): it records when the row changed,
+  not what the snapshot covers.
   """
   @spec record_snapshot(String.t(), DateTime.t()) :: non_neg_integer()
   def record_snapshot(shard_id, at \\ DateTime.utc_now()) do
     {count, _} =
       from(s in Shard, where: s.shard_id == ^shard_id)
-      |> Repo.update_all(set: [last_snapshot_at: at, updated_at: at])
+      |> Repo.update_all(set: [last_snapshot_at: at, updated_at: DateTime.utc_now()])
 
     count
   end
@@ -881,9 +902,12 @@ defmodule Fathom.Directory do
   the row persists and the id joins the public `Tombstones` ETS set that admission consults on every
   checkout.
 
-  This exists for rows that were never a tenant — the restore drill's scratch forks, which nothing
-  ever routed to and no client ever held a token for. There is nothing to tombstone against, and a
-  tombstone per drill sample per run would grow that admission-path set without bound.
+  This exists for rows that were never a live tenant — the restore drill's scratch forks, and a
+  `Fathom.Tenants.provision/1` whose template fork failed (expert review 2026-08-31 #10): nothing
+  ever routed to them and no client ever held a token, so there is nothing to tombstone against, and
+  a tombstone per case would grow that admission-path set without bound. Rolling the row back also
+  keeps the id cleanly re-mintable on a retry, which a tombstone (the resurrection guard) would
+  block.
 
   Returns the number of rows removed (0 if it was already gone).
   """

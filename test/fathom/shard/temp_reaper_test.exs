@@ -72,4 +72,35 @@ defmodule Fathom.Shard.TempReaperTest do
     refute File.exists?(stale_tmp), "a stale orphaned .tmp temp must be reaped by the sweep"
     assert File.exists?(fresh_dl), "the age gate must protect a concurrent pull's fresh temp"
   end
+
+  # Expert review 2026-08-31 #17: do_sweep had no rescue, so a persistent local-FS fault on the
+  # fleet-sized scan crash-loops the reaper — the DataPlane's restart budget absorbs a burst but a
+  # persistent fault exhausts it and cascades to every open coordinator. A raise is now caught and
+  # the pass is skipped.
+  test "a sweep that raises is caught — the reaper survives instead of crash-looping" do
+    reaper = start_supervised!(TempReaper)
+    ref = Process.monitor(reaper)
+    # Drain the boot sweep (still the good dir from setup).
+    _ = TempReaper.sweep()
+
+    good = Application.get_env(:fathom, :shard_data_dir)
+
+    # A non-binary data dir makes Path.join(data_dir(), "*") raise inside do_sweep — the cheapest
+    # deterministic stand-in for the persistent FS fault the rescue exists for.
+    Application.put_env(:fathom, :shard_data_dir, :not_a_path)
+
+    try do
+      # WITH the rescue this is a best-effort no-op (0) and the reaper lives; WITHOUT it the handler
+      # raises, the reaper crashes, and this GenServer.call exits.
+      assert TempReaper.sweep() == 0
+    after
+      Application.put_env(:fathom, :shard_data_dir, good)
+    end
+
+    refute_receive {:DOWN, ^ref, :process, ^reaper, _}, 100
+
+    assert Process.alive?(reaper),
+           "the reaper crashed on a sweep raise — a persistent FS fault would crash-loop it and " <>
+             "take the whole DataPlane down"
+  end
 end

@@ -73,11 +73,30 @@ defmodule Fathom.Shard.TempReaper do
   def handle_call(:sweep, _from, state), do: {:reply, do_sweep(), state}
 
   # One directory scan of the shard data dir for stale, uniquely-suffixed orphan temps.
+  #
+  # RESCUED because this is a best-effort janitor and a raise here is catastrophic out of all
+  # proportion (expert review 2026-08-31 #17). It runs from `handle_continue(:sweep)` at init and
+  # from the periodic `:sweep`, so a raise — a persistent local-FS fault on the fleet-sized
+  # `Path.wildcard` / `File.stat` sweep — crash-loops the reaper; the DataPlane's 30-in-10s restart
+  # budget absorbs a transient burst but a persistent fault exhausts it and cascades to EVERY open
+  # coordinator, inverting "a wobble in one plane can't restart another". Every other reap path in
+  # the codebase rescues; this now does too. Returns 0 on a failed pass — the next interval retries.
   defp do_sweep do
     reaped = Storage.reap_stale_temps(Path.join(Shard.data_dir(), "*"), @stale_after_ms)
     if reaped > 0, do: Logger.info("shard temp reaper: reaped #{reaped} orphaned temp(s)")
     sweep_quarantines()
     reaped
+  rescue
+    e ->
+      Logger.warning(
+        "shard temp reaper: sweep raised (#{Exception.message(e)}); skipping this pass"
+      )
+
+      0
+  catch
+    :exit, reason ->
+      Logger.warning("shard temp reaper: sweep exited (#{inspect(reason)}); skipping this pass")
+      0
   end
 
   # Quarantine inventory gauge + age-capped retention (expert review #23). The coordinator preserves

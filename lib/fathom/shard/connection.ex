@@ -61,10 +61,25 @@ defmodule Fathom.Shard.Connection do
     scope = Keyword.get(opts, :scope, :rw)
 
     case open_handle(path, scope) do
-      {:ok, conn, :readonly} -> configure_readonly(conn, tenant?)
-      {:ok, conn, :readwrite} -> configure_readwrite(conn, tenant?, scope)
+      {:ok, conn, :readonly} -> close_on_error(conn, configure_readonly(conn, tenant?))
+      {:ok, conn, :readwrite} -> close_on_error(conn, configure_readwrite(conn, tenant?, scope))
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  # Close the just-opened handle when configuration fails (expert review 2026-08-31 #25). A `with`
+  # short-circuit in configure_readonly/2 or configure_readwrite/3 — a busy_timeout/cache/authorizer
+  # error, or the security-relevant `{:could_not_disable_extension_loading, _}` — otherwise returns
+  # the error WITHOUT closing `conn`, so the fd/handle is released only when the NIF resource is
+  # GC-finalized. This is the per-stream open path, and relying on GC to close fds there is fragile
+  # and defeats the fail-the-open intent of the extension-disable guard. On success the handle rides
+  # out as before.
+  @doc false
+  def close_on_error(_conn, {:ok, _} = ok), do: ok
+
+  def close_on_error(conn, {:error, _reason} = err) do
+    _ = Sqlite3.close(conn)
+    err
   end
 
   # A `:ro` stream gets a genuinely read-only SQLite handle: the scope check in
@@ -667,8 +682,7 @@ defmodule Fathom.Shard.Connection do
     drain_stale_timeouts()
 
     ref = make_ref()
-    watchdog = ensure_watchdog(conn)
-    send(watchdog, {:arm, ref, ms, self()})
+    watchdog = arm_watchdog(conn, ref, ms)
 
     # Always disarm, even if fun raises (Sqlite3.bind raises ArgumentError on a bad bind
     # value — the reason query/3 has a rescue). Without try/after the raise unwinds before the
@@ -700,6 +714,34 @@ defmodule Fathom.Shard.Connection do
       {:timed_out, _stale} -> drain_stale_timeouts()
     after
       0 -> :ok
+    end
+  end
+
+  # Arm THIS query's deadline, re-checking liveness AFTER the send (expert review 2026-08-31 #22).
+  # `ensure_watchdog/1` replaces a watchdog that is already dead, but there is a TOCTOU between it
+  # returning a LIVE pid and the fire-and-forget `{:arm}` send: the watchdog can die in that window
+  # (it dies abnormally — e.g. a stale `await_disarm` cancel on a torn-down conn), and a send to a
+  # just-dead pid is dropped silently, leaving the query with NO deadline until the next query
+  # replaces the pid. Re-check after the send and re-arm a FRESH watchdog if it is gone.
+  #
+  # An async re-check, not a synchronous ack: the module deliberately rejected a per-query handshake
+  # round trip (see with_deadline). A vanishing residual window remains — a death after this
+  # `Process.alive?` check but before the `{:arm}` is processed — and it self-heals on the next
+  # query. That residual is why this race is NOT unit-testable: `ensure_watchdog/1` gatekeeps every
+  # non-race dead-pid case, so no test can inject a pid that reaches the send dead without also
+  # dying in a scheduler-dependent window a test cannot force. Bounded retries so a conn being torn
+  # down (its fresh watchdogs die immediately) cannot spin forever — after that the query is failing
+  # anyway.
+  @arm_attempts 3
+
+  defp arm_watchdog(conn, ref, ms, attempts \\ @arm_attempts) do
+    watchdog = ensure_watchdog(conn)
+    send(watchdog, {:arm, ref, ms, self()})
+
+    cond do
+      Process.alive?(watchdog) -> watchdog
+      attempts > 0 -> arm_watchdog(conn, ref, ms, attempts - 1)
+      true -> watchdog
     end
   end
 

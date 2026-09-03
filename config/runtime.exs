@@ -709,6 +709,16 @@ if ms = env_int.("REPLICATION_TIMEOUT_MS") do
   config :fathom, :replication_timeout_ms, ms
 end
 
+# How much SHORTER the commit handler's internal deadline is than the caller's `GenServer.call`
+# timeout above (expert review 2026-08-31 #21). The caller starts its call timer before the message
+# is delivered and the reply travels back after the handler finishes, so an internal deadline equal
+# to the call timeout means a commit that runs right to the wire is abandoned by the caller as
+# `{:session_down, :timeout}` exactly when the handler would have replied `{:no_quorum, _}` cleanly.
+# The default (100 ms) is floored at half the call timeout in code, so this rarely needs setting.
+if ms = env_nonneg_int.("REPLICATION_REPLY_MARGIN_MS") do
+  config :fathom, :replication_reply_margin_ms, ms
+end
+
 # THE TWO BOUNDS THAT CLOSE THE 1024-TENANT OOM. See
 # `docs/reviews/a2-shipper-feedback-loop-2026-08-16.md` — the failure is a positive feedback loop,
 # not a leak: a push carries the WAL since the follower's last ACK, so a delayed send makes the

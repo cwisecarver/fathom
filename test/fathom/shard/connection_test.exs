@@ -250,4 +250,28 @@ defmodule Fathom.Shard.ConnectionTest do
     assert length(rows) == n
     assert us < 1_000_000, "collect of #{n} rows took #{div(us, 1000)}ms — O(R²) regression?"
   end
+
+  # Expert review 2026-08-31 #25: open/2 returned a configure failure (a busy_timeout/cache/
+  # authorizer error, or the security-relevant {:could_not_disable_extension_loading, _}) WITHOUT
+  # closing the handle open_handle/2 had just created, leaking the fd until GC on the per-stream
+  # open path. close_on_error/2 now closes it on error and passes it through on success.
+  test "close_on_error closes the handle on a configure failure, keeps it on success" do
+    path = Path.join(System.tmp_dir!(), "conn_close_#{System.unique_integer([:positive])}.db")
+    on_exit(fn -> for s <- ["", "-wal", "-shm"], do: File.rm(path <> s) end)
+
+    {:ok, raw} = Exqlite.Sqlite3.open(path)
+
+    # Success passes the handle through untouched — it is still usable.
+    assert {:ok, ^raw} = Connection.close_on_error(raw, {:ok, raw})
+
+    assert {:ok, _stmt} = Exqlite.Sqlite3.prepare(raw, "SELECT 1"),
+           "a successful open must stay open"
+
+    # A configure error closes the handle rather than leaking it until GC.
+    assert {:error, :could_not_disable_extension_loading} =
+             Connection.close_on_error(raw, {:error, :could_not_disable_extension_loading})
+
+    assert {:error, :connection_closed} = Exqlite.Sqlite3.prepare(raw, "SELECT 1"),
+           "a configure failure must close the handle, not leak it until GC"
+  end
 end

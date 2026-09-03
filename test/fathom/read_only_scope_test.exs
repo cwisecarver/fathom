@@ -70,6 +70,26 @@ defmodule Fathom.ReadOnlyScopeTest do
     :ok = ShardExecutor.close(h)
   end
 
+  # --- the context-less open/1 fails closed under auth (audit 2026-08-31 #9) ---
+
+  # open/1 carries no auth context, so it cannot honour :ro or re-check a revoked token — its
+  # token_version is nil, which makes the revocation floor pass unconditionally. Pre-fix it degraded
+  # to full :rw next to the wire path; now, with auth required, it is refused. (Setup sets
+  # :hrana_auth to :required.)
+  test "open/1 with no auth context is refused when auth is required", %{shard: shard} do
+    assert {:error, %Filo.Error{status: 401, code: "FILO_NO_AUTH_CONTEXT"}} =
+             ShardExecutor.open(shard)
+  end
+
+  # Internal callers (migration, rpo, harnesses) keep full access through the explicit :trusted
+  # context — the escalation only closes for the context-less arity-1 path.
+  test "an explicit :trusted open still gets full :rw even when auth is required", %{shard: shard} do
+    assert {:ok, {_pid, _ref, _conn, ^shard, :rw, nil, _opts} = handle} =
+             ShardExecutor.open(shard, :trusted)
+
+    :ok = ShardExecutor.close(handle)
+  end
+
   # --- executor-level scope enforcement (scope threaded to open/2, not a same-process stash) ---
 
   test "a read-only token can SELECT but not write", %{shard: shard} do
