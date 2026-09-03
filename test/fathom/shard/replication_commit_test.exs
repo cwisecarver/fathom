@@ -275,6 +275,25 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     |> Enum.find(&(&1 != nil))
   end
 
+  # Await a `catchup_fails` condition rather than reading it synchronously right after `commit/2`
+  # (CI 2-core runners, 2026-09-02). The count is bumped in `handle_info({:repl_reply, …,
+  # {:reject, …}})` and cleared by a clean commit's acks — both ARRIVE AND ARE PROCESSED
+  # asynchronously, AFTER `commit/2` returns on the quorum it already has. An immediate
+  # `:sys.get_state(session).catchup_fails` therefore races the reject/ack and read 0 on a starved
+  # runner (the third follower's reject had not reached `handle_info/2` yet). Mirrors
+  # `await_empty_inflight/2`: it returns the moment `pred` holds, so a passing case is instant and
+  # only a genuinely-never-satisfied condition pays the full deadline and then fails the assert.
+  defp await_catchup_fails(session, pred, timeout \\ 2_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    Stream.repeatedly(fn ->
+      n = :sys.get_state(session).catchup_fails
+
+      if pred.(n) or System.monotonic_time(:millisecond) > deadline, do: n, else: nil
+    end)
+    |> Enum.find(&(&1 != nil))
+  end
+
   # REGRESSION — the 1024-tenant OOM. See `docs/reviews/a2-shipper-feedback-loop-2026-08-16.md`.
   #
   # THE SYMPTOM: nodes OOM-killed (exit 137) about two minutes into a 1024-tenant `tpc-fleet` run
@@ -565,7 +584,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       # which is what arms the deferred retry in the first place.
       _ = Session.commit(id, path <> "-wal", coordinator)
       [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
-      assert :sys.get_state(session).catchup_fails > 0
+      assert await_catchup_fails(session, &(&1 > 0)) > 0
 
       # The first commit started the seed; once it lands the follower answers cleanly and the
       # count must go back to zero, or the next genuine straggler waits a whole flush interval
@@ -575,7 +594,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
 
       {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
       assert :ok = Session.commit(id, path <> "-wal", coordinator)
-      assert :sys.get_state(session).catchup_fails == 0
+      assert await_catchup_fails(session, &(&1 == 0)) == 0
     end
   end
 
