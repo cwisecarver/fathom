@@ -138,9 +138,20 @@ jobs:
       # from the OS environment, and `System.put_env` cannot set that for native code (it updates
       # the BEAM's own table, not C `environ`). Without this line the test would be permanently
       # skipped, which is the same as deleting it.
+      #
+      # ERL_FLAGS raises the DIRTY-CPU scheduler count to blunt the dirty-NIF starvation that made
+      # SQLite/timing tests flake on this 2-core runner (connection_watchdog, replication_commit,
+      # heartbeat_fence — see the :flaky tags and the await_catchup_fails fix). `+SDcpu 4` ALONE is a
+      # no-op here: dirty-CPU schedulers cannot exceed NORMAL schedulers, so on a 2-core box it
+      # clamps back to 2 (verified: `+S 2:2 +SDcpu 4` reports 2). `+S 4:4` raises normal schedulers
+      # to 4 first, then `+SDcpu 4` sticks. Oversubscribed on 2 cores by design — lower scheduling
+      # latency (so a :high watchdog lands its cancel, and a query gets a dirty slot sooner) for a
+      # small throughput cost the ~99%-serial suite does not feel. DO NOT drop `+S 4:4`, or the
+      # `+SDcpu 4` silently reverts to the 2-core default and this line stops doing anything.
       - name: Run tests
         env:
           FATHOM_WAL_PROBE: "1"
+          ERL_FLAGS: "+S 4:4 +SDcpu 4"
         run: mix test --include wal_probe
 
       # THE FAILURE LOG IS THE ONLY EVIDENCE A CI-ONLY FLAKE EVER LEAVES, and without this step it
