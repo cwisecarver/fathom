@@ -640,9 +640,22 @@ defmodule Fathom.ShardStorageS3Test do
         secret_access_key: ctx.secret_key,
         service: :s3,
         region: "us-east-1"
-      ]
+      ],
+      # Retry a connection-level failure (self-review 2026-09-02). A MinIO keep-alive drop surfaces
+      # as %Req.TransportError{reason: :closed} on the CI runner (run 33590937454), and Req's default
+      # :safe_transient retries a GET but NOT a PUT — so the conditional-PUT test at :513 failed the
+      # whole :s3 job on one dropped connection. A transport error means no HTTP response was
+      # received, so re-issuing is safe for ANY method here. Scoped to transport errors ONLY: the
+      # HTTP statuses these tests assert (412/404/200) are never retried. Bounded + short so a
+      # genuinely-down store still fails fast.
+      retry: &transient_transport?/2,
+      max_retries: 3,
+      retry_delay: 100
     )
   end
+
+  defp transient_transport?(_req, %Req.TransportError{}), do: true
+  defp transient_transport?(_req, _response_or_exception), do: false
 
   # Write a heartbeat object directly, to stage an owner whose Heartbeat process died and left
   # its (now stale) object behind — the #12 scenario.
