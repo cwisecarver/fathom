@@ -274,4 +274,42 @@ defmodule Fathom.Shard.ConnectionTest do
     assert {:error, :connection_closed} = Exqlite.Sqlite3.prepare(raw, "SELECT 1"),
            "a configure failure must close the handle, not leak it until GC"
   end
+
+  # Expert review 2026-09-05 #3: the PRAGMA allow-list is the half of the tenant gate with no
+  # engine backstop, so tenant handles get an engine-level floor SQLite enforces regardless of
+  # how the SQL is spelled. Scoped to tenant handles — the coordinator's own connections run
+  # fathom's SQL (VACUUM INTO, migration replay) and must NOT be hardened.
+  defp harden_conn(opts) do
+    path = Path.join(System.tmp_dir!(), "harden_test_#{System.unique_integer([:positive])}.db")
+    {:ok, conn} = Connection.open(path, opts)
+
+    on_exit(fn ->
+      Connection.close(conn)
+      for s <- ["", "-wal", "-shm"], do: File.rm(path <> s)
+    end)
+
+    conn
+  end
+
+  describe "engine hardening (maybe_harden/2)" do
+    test "a :rw tenant handle has trusted_schema OFF and cell_size_check ON" do
+      conn = harden_conn(tenant?: true, scope: :rw)
+      assert {:ok, 0} = Connection.pragma(conn, "trusted_schema")
+      assert {:ok, 1} = Connection.pragma(conn, "cell_size_check")
+    end
+
+    test "a :ro tenant handle is hardened too (a read replica runs untrusted SELECTs)" do
+      conn = harden_conn(tenant?: true, scope: :ro)
+      assert {:ok, 0} = Connection.pragma(conn, "trusted_schema")
+      assert {:ok, 1} = Connection.pragma(conn, "cell_size_check")
+    end
+
+    test "a NON-tenant handle is NOT hardened (fathom's own SQL needs the full engine)" do
+      # Default open is tenant? false — the coordinator/migration/snapshot path.
+      conn = harden_conn([])
+
+      assert {:ok, 1} = Connection.pragma(conn, "trusted_schema"),
+             "hardening a non-tenant handle would risk the migration replay's schema objects"
+    end
+  end
 end

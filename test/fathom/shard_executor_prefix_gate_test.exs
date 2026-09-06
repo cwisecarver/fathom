@@ -54,7 +54,10 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
     "PRAGMA synchronous=OFF",
     "PRAGMA journal_mode=DELETE",
     "PRAGMA locking_mode=EXCLUSIVE",
-    "PRAGMA wal_autocheckpoint=0"
+    "PRAGMA wal_autocheckpoint=0",
+    # The engine-hardening floor (#3): a tenant must not turn these back off.
+    "PRAGMA writable_schema=ON",
+    "PRAGMA trusted_schema=ON"
   ]
 
   # Prefixes SQLite's parser sees through (each a literal string prepended to a statement). The
@@ -127,6 +130,21 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
              {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}},
              ShardExecutor.execute(h, stmt(";PRAGMA foreign_keys=ON"))
            )
+  end
+
+  test "the hardening deny-list beats a :tenant_pragma_allow override (#3)", %{handle: h} do
+    # The deny is checked BEFORE extra_pragma_allow(), so even an operator misconfiguration that
+    # named a hardening pragma in :tenant_pragma_allow cannot widen a tenant back into disabling
+    # the engine floor. Pre-#3 (deny == [query_only]) this override WOULD allow it.
+    prev = Application.get_env(:fathom, :tenant_pragma_allow, [])
+    Application.put_env(:fathom, :tenant_pragma_allow, ["writable_schema", "trusted_schema"])
+    on_exit(fn -> Application.put_env(:fathom, :tenant_pragma_allow, prev) end)
+
+    for sql <- ["PRAGMA writable_schema=ON", "PRAGMA trusted_schema=ON"] do
+      assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
+               ShardExecutor.execute(h, stmt(sql)),
+             "a :tenant_pragma_allow override let `#{sql}` disable the engine floor"
+    end
   end
 
   test "leading-; and comment-prefixed DDL is refused under :block_tenant_ddl", %{shard: shard} do

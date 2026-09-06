@@ -152,7 +152,8 @@ defmodule Fathom.Shard.Connection do
          :ok <- maybe_foreign_keys(conn),
          :ok <- maybe_cache_size(conn),
          :ok <- load_extension(conn),
-         :ok <- maybe_authorizer(conn, tenant?) do
+         :ok <- maybe_authorizer(conn, tenant?),
+         :ok <- maybe_harden(conn, tenant?) do
       {:ok, conn}
     end
   end
@@ -161,6 +162,7 @@ defmodule Fathom.Shard.Connection do
     with :ok <- configure(conn),
          :ok <- load_extension(conn),
          :ok <- maybe_authorizer(conn, tenant?),
+         :ok <- maybe_harden(conn, tenant?),
          :ok <- maybe_query_only(conn, scope) do
       {:ok, conn}
     end
@@ -212,6 +214,36 @@ defmodule Fathom.Shard.Connection do
   # Fallback belt for a `:ro` scope that could not get a read-only handle (see open_handle/2).
   defp maybe_query_only(conn, :ro), do: Sqlite3.execute(conn, "PRAGMA query_only=ON")
   defp maybe_query_only(_conn, _scope), do: :ok
+
+  # Engine-level hardening for handles that run untrusted client SQL (expert review 2026-09-05 #3).
+  # The PRAGMA allow-list in `Fathom.ShardExecutor` is the half of the tenant gate with NO engine
+  # backstop: unlike ATTACH (stopped by the authorizer) and `:ro` writes (stopped by a
+  # `mode: :readonly` handle), a PRAGMA miss in the head parser is a complete bypass — which is
+  # how 2026-08-20 #19, 2026-08-24 #1 and 2026-09-05 #1/#2 each landed. These two put a floor
+  # UNDER the parser, at the engine, where SQLite enforces them however the SQL is spelled:
+  #
+  #   * `trusted_schema=OFF` — refuse schema objects (views/triggers/CHECK/generated columns)
+  #     that call non-innocuous functions or virtual tables: the `writable_schema=ON`
+  #     hostile-schema class. Safe for Django — `native/fathom_udf` marks every `django_*`
+  #     function `SQLITE_INNOCUOUS` (lib.rs), so expression indexes and CHECK constraints over
+  #     them still compile; only fathom's own process-state WAL functions (correctly NOT
+  #     innocuous) are refused inside a schema object, which a tenant has no reason to embed.
+  #   * `cell_size_check=ON` — validate b-tree cell sizes as pages are read, so a hand-corrupted
+  #     page (reachable once `writable_schema` is set) fails loudly rather than parsing as a
+  #     hostile structure.
+  #
+  # SQLite's third recommended leg, `SQLITE_DBCONFIG_DEFENSIVE`, is NOT set: exqlite exposes no
+  # `sqlite3_db_config`, so it needs an upstream change (tracked). And they apply to tenant
+  # handles only — the coordinator's VACUUM-INTO snapshot and the migration replay run fathom's
+  # own SQL and legitimately need the unhardened engine. A failure to apply them fails the OPEN
+  # (like the extension re-disable), because the alternative is a tenant handle without the floor.
+  defp maybe_harden(_conn, false), do: :ok
+
+  defp maybe_harden(conn, true) do
+    with :ok <- Sqlite3.execute(conn, "PRAGMA trusted_schema=OFF") do
+      Sqlite3.execute(conn, "PRAGMA cell_size_check=ON")
+    end
+  end
 
   # This file's actual page size. Falls back to SQLite's default rather than raising: an
   # unreadable pragma must not stop a shard opening, and 4096 is the value that reproduces the

@@ -1381,7 +1381,13 @@ defmodule Fathom.ShardExecutor do
   # it IS the read-only scope, and `Fathom.Shard.Connection` says so where it sets it. A
   # `:tenant_pragma_allow` entry naming it would silently convert every such stream's scope into
   # an advisory one, so the widening lever deliberately cannot reach it.
-  @tenant_pragma_deny ~w(query_only)
+  #
+  # `writable_schema`, `trusted_schema` and `cell_size_check` are the engine-hardening floor set
+  # by `Fathom.Shard.Connection.maybe_harden/2` (expert review 2026-09-05 #3). Denying them here —
+  # checked BEFORE `extra_pragma_allow()` — keeps a `:tenant_pragma_allow` config from widening a
+  # tenant back into turning the floor off, and keeps the tenant from re-enabling `writable_schema`
+  # to hand the node a hostile schema.
+  @tenant_pragma_deny ~w(query_only writable_schema trusted_schema cell_size_check)
 
   # SQLite spells an argument-taking READ the same way it spells a setter — `PRAGMA
   # table_info(t)` and `PRAGMA journal_mode(delete)` are syntactically identical — so the
