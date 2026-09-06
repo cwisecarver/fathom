@@ -281,7 +281,14 @@ defmodule Fathom.Shard.Storage.Local do
 
   @impl true
   def restore(shard_id, version) do
-    Storage.atomic_copy(version_path(shard_id, version), remote_path(shard_id))
+    # Clear the A2 position stamp, matching flush/2 and S3's PUT semantics: a restore REPLACES the
+    # object's bytes, so a stamp describing the pre-restore lineage would let try_promote_local/5
+    # promote a replica of the rolled-back-from lineage over the restored bytes — re-applying the
+    # corruption the operator just recovered from (expert review 2026-09-05 #20). The `.lineage`
+    # sidecar stays (it is monotonic ownership provenance, not a byte-position claim).
+    with :ok <- Storage.atomic_copy(version_path(shard_id, version), remote_path(shard_id)) do
+      rm_ok(position_path(shard_id))
+    end
   end
 
   @impl true
@@ -310,8 +317,14 @@ defmodule Fathom.Shard.Storage.Local do
           end
 
         cond do
-          expected_etag != current -> {:error, :superseded}
-          true -> Storage.atomic_copy(version_path(shard_id, version), remote_path(shard_id))
+          expected_etag != current ->
+            {:error, :superseded}
+
+          true ->
+            # Clear the position stamp on success (#20): a restore replaces the bytes.
+            with :ok <-
+                   Storage.atomic_copy(version_path(shard_id, version), remote_path(shard_id)),
+                 do: rm_ok(position_path(shard_id))
         end
       end
     end)
@@ -377,7 +390,10 @@ defmodule Fathom.Shard.Storage.Local do
 
   @impl true
   def restore_snapshot(shard_id, snapshot_id) do
-    Storage.atomic_copy(snapshot_path(shard_id, snapshot_id), remote_path(shard_id))
+    # Clear the position stamp, matching flush/2 / S3's PUT — a restore replaces the bytes (#20).
+    with :ok <- Storage.atomic_copy(snapshot_path(shard_id, snapshot_id), remote_path(shard_id)) do
+      rm_ok(position_path(shard_id))
+    end
   end
 
   @impl true
@@ -396,8 +412,13 @@ defmodule Fathom.Shard.Storage.Local do
           end
 
         cond do
-          expected_etag != current -> {:error, :superseded}
-          true -> Storage.atomic_copy(local_path, remote_path(shard_id))
+          expected_etag != current ->
+            {:error, :superseded}
+
+          true ->
+            # Clear the position stamp on success (#20): a restore replaces the bytes.
+            with :ok <- Storage.atomic_copy(local_path, remote_path(shard_id)),
+                 do: rm_ok(position_path(shard_id))
         end
       end
     end)
@@ -426,8 +447,17 @@ defmodule Fathom.Shard.Storage.Local do
           end
 
         cond do
-          expected_etag != current -> {:error, :superseded}
-          true -> Storage.atomic_copy(snapshot_path(shard_id, snapshot_id), remote_path(shard_id))
+          expected_etag != current ->
+            {:error, :superseded}
+
+          true ->
+            # Clear the position stamp on success (#20): a restore replaces the bytes.
+            with :ok <-
+                   Storage.atomic_copy(
+                     snapshot_path(shard_id, snapshot_id),
+                     remote_path(shard_id)
+                   ),
+                 do: rm_ok(position_path(shard_id))
         end
       end
     end)
