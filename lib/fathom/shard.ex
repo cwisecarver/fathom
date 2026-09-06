@@ -2293,7 +2293,7 @@ defmodule Fathom.Shard do
               # (a clean crash-recovery of identical bytes). Writing it first closes the
               # window so recovery is an ordinary clean warm restart, matching the
               # periodic-flush, settle, and reconcile sites that already stamp on success.
-              write_etag_sidecar(state.path, new_etag)
+              write_etag_sidecar_durable(state.path, new_etag)
               # Record the durable-flush time before we drop + release (#28): the shard's writes
               # reached storage, so it's NOT dirty-at-loss even though its coordinator is gone.
               Fathom.Directory.Recorder.record_flush(state.id)
@@ -2558,7 +2558,7 @@ defmodule Fathom.Shard do
         "shard #{state.id}: flush 412 with lock ours; re-fenced to the object and re-uploaded"
       )
 
-      write_etag_sidecar(state.path, new_etag)
+      write_etag_sidecar_durable(state.path, new_etag)
       Fathom.Directory.Recorder.record_flush(state.id)
       drop_local_unless_serving(state)
       Storage.release_lease(state.id, state.lease)
@@ -3338,15 +3338,34 @@ defmodule Fathom.Shard do
   defp write_etag_sidecar(_path, nil), do: :ok
 
   defp write_etag_sidecar(path, etag) do
-    # A plain write, deliberately NOT atomic_write: the sidecar has a single writer
-    # (this coordinator) and is read only at open, before any writer exists, so no
-    # torn CONCURRENT read is possible — and a torn value after a crash merely reads
-    # as a mismatch ⇒ a spurious, recoverable quarantine (the safe direction). The
-    # temp+rename pattern costs ~5× more (two APFS-journaled metadata ops) on the
-    # timed cold-open path.
+    # A plain write, deliberately NOT atomic_write ON THE PULL PATH: the sidecar has a single writer
+    # (this coordinator) and is read only at open, before any writer exists, so no torn CONCURRENT
+    # read is possible — and a torn PULL-path value after a crash merely reads as a mismatch ⇒ a
+    # spurious, recoverable quarantine of an object with NO un-flushed local writes (the safe
+    # direction). The temp+rename pattern costs ~5× more (two APFS-journaled metadata ops) on the
+    # timed cold-open path. The FLUSH path uses write_etag_sidecar_durable/2 instead — see there for
+    # why the same torn value is NOT recoverable once the local .db holds acked writes (#15).
     case File.write(etag_sidecar(path), etag) do
       :ok -> :ok
       {:error, reason} -> Logger.warning("etag sidecar write failed: #{inspect(reason)}")
+    end
+  end
+
+  # The DURABLE sidecar write, for the FLUSH path (expert review 2026-09-05 #15). The plain write
+  # above is correct for the pull path, but after a periodic/drop flush PUT the sidecar names the
+  # object the tenant's fsynced commits descend from. If it is still in the page cache when an OS
+  # crash (kernel panic, power loss, hard VM reset) hits, the on-disk sidecar reverts to the OLD etag
+  # (or empty) while the local .db holds NEWER acked writes — fork_evidence then reads a divergence
+  # and quarantines the acked tail, serving the pre-PUT object. That is the RPO of node loss on the
+  # one path durability.md documents as loss-free (disk intact). storage.ex applies this same
+  # fsync+rename reasoning to every OBJECT file, but not to the file that decides whether the object
+  # is trusted. Cost: two metadata ops and one fsync on a ~40-byte file, beside a full-object PUT.
+  defp write_etag_sidecar_durable(_path, nil), do: :ok
+
+  defp write_etag_sidecar_durable(path, etag) do
+    case Storage.atomic_write(etag_sidecar(path), etag) do
+      :ok -> :ok
+      {:error, reason} -> Logger.warning("durable etag sidecar write failed: #{inspect(reason)}")
     end
   end
 
@@ -4304,7 +4323,7 @@ defmodule Fathom.Shard do
   defp apply_flush_verdict(state, {:ok, new_etag, carried}) do
     # Uploaded; advance the fence etag, the provenance sidecar, and the flushed watermark
     # captured when the task started (clears dirty up to that point).
-    write_etag_sidecar(state.path, new_etag)
+    write_etag_sidecar_durable(state.path, new_etag)
 
     state = %{
       state
@@ -4346,7 +4365,7 @@ defmodule Fathom.Shard do
   # whatever the object currently holds — same lineage, plus more writes. That is exactly what
   # the provenance check needs to not false-quarantine a fork.
   defp apply_flush_verdict(state, {:reconciled, object_etag}) when not is_nil(object_etag) do
-    write_etag_sidecar(state.path, object_etag)
+    write_etag_sidecar_durable(state.path, object_etag)
     # DROP THE LINEAGE CACHE (expert review 2026-08-26 #33). This is the one verdict where the
     # object moved to an etag we did not write — our PUT 412'd — so what its metadata says is no
     # longer something we know. The next flush pays one HEAD and re-learns it, which is the whole
