@@ -356,14 +356,19 @@ defmodule Fathom.Directory do
   @spec cutover(String.t(), non_neg_integer()) ::
           {:ok, Shard.t()} | {:error, :not_found | Ecto.Changeset.t()}
   def cutover(shard_id, schema_version) do
-    update_shard(shard_id, cutover_attrs(schema_version))
+    # Only a shard still `active` or `migrating` may cut over — never one suspended or deleted during
+    # the copy window (#11).
+    guarded_update_shard(shard_id, cutover_attrs(schema_version), ["active", "migrating"])
   end
 
   @spec cutover(String.t(), non_neg_integer(), non_neg_integer() | nil) ::
-          {:ok, Shard.t()} | {:error, :not_found | Ecto.Changeset.t()}
+          {:ok, Shard.t()} | {:error, :not_found | :status_conflict | Ecto.Changeset.t()}
   def cutover(shard_id, schema_version, retained_version) do
-    shard_id
-    |> update_shard(Map.put(cutover_attrs(schema_version), :retained_version, retained_version))
+    guarded_update_shard(
+      shard_id,
+      Map.put(cutover_attrs(schema_version), :retained_version, retained_version),
+      ["active", "migrating"]
+    )
   end
 
   defp cutover_attrs(schema_version) do
@@ -405,9 +410,17 @@ defmodule Fathom.Directory do
   end
 
   @doc "Marks a shard as mid-migration (the app pauses writes for the copy window)."
-  @spec mark_migrating(String.t()) :: {:ok, Shard.t()} | {:error, :not_found | Ecto.Changeset.t()}
+  @spec mark_migrating(String.t()) ::
+          {:ok, Shard.t()} | {:error, :not_found | :status_conflict | Ecto.Changeset.t()}
   def mark_migrating(shard_id),
-    do: update_shard(shard_id, %{status: "migrating", migrating_since: DateTime.utc_now()})
+    # Only an `active` shard may enter `migrating` — never resurrect a suspended/deleted tenant whose
+    # snoozing job finally got the drain it was waiting on (#11).
+    do:
+      guarded_update_shard(
+        shard_id,
+        %{status: "migrating", migrating_since: DateTime.utc_now()},
+        ["active"]
+      )
 
   @doc """
   Restores a shard from `migrating` back to `active` after a migration failed — the counterpart to
@@ -495,9 +508,18 @@ defmodule Fathom.Directory do
   end
 
   @doc "Quarantines a shard whose migration exhausted its retries."
-  @spec mark_failed(String.t()) :: {:ok, Shard.t()} | {:error, :not_found | Ecto.Changeset.t()}
+  @spec mark_failed(String.t()) ::
+          {:ok, Shard.t()} | {:error, :not_found | :status_conflict | Ecto.Changeset.t()}
   def mark_failed(shard_id),
-    do: update_shard(shard_id, %{status: "migration_failed", migrating_since: nil})
+    # Only an `active`/`migrating` shard may be quarantined — a suspend/delete that landed mid-copy
+    # must not be overwritten with `migration_failed` (which retry_failed/0 would then flip back to
+    # `active`, silently lifting the suspension) (#11).
+    do:
+      guarded_update_shard(
+        shard_id,
+        %{status: "migration_failed", migrating_since: nil},
+        ["active", "migrating"]
+      )
 
   @doc """
   Reclaims shards stuck in `migrating` past `stale_after_seconds` back to `active`, and
@@ -1262,6 +1284,43 @@ defmodule Fathom.Directory do
     case Repo.get_by(Shard, shard_id: shard_id) do
       nil -> {:error, :not_found}
       shard -> shard |> Shard.changeset(attrs) |> Repo.update()
+    end
+  end
+
+  # Like update_shard/2, but the write LANDS ONLY IF the row's status is still one of `allowed` —
+  # an atomic guard (a single conditional update_all ... returning), so a migration in flight across
+  # a suspend or delete cannot resurrect the tenant (expert review 2026-09-05 #11). This mirrors
+  # unmark_migrating/1, whose comment already states this invariant ("can never resurrect a tenant
+  # that was deleted or suspended during the copy window") — the difference is that the three writes
+  # that land on the migration SUCCESS and exhausted-failure paths (mark_migrating, cutover,
+  # mark_failed) went through the UNguarded update_shard/2 and so happily overwrote `suspended` /
+  # `deleted`. `admin_changeset/2` refuses to hand-flip these statuses for the same reason (moving
+  # the directory status while leaving the in-memory admission gate unset); the migration engine was
+  # doing exactly that flip on every cutover.
+  #
+  # Returns {:ok, shard} on a match, {:error, :status_conflict} when 0 rows matched (the row moved
+  # to a lifecycle state the caller may not flip), {:error, :not_found} when the row is gone. Callers
+  # already funnel any {:error, _} into aborting/cancelling the migration, which is the correct
+  # response to a tenant that left the active set mid-copy.
+  defp guarded_update_shard(shard_id, attrs, allowed) do
+    set = attrs |> Map.put(:updated_at, DateTime.utc_now()) |> Map.to_list()
+
+    {count, _} =
+      from(s in Shard, where: s.shard_id == ^shard_id and s.status in ^allowed)
+      |> Repo.update_all(set: set)
+
+    # shard_id is unique, so count is 0 or 1. On a match re-read the row (the caller's contract is
+    # {:ok, Shard.t()}); on a miss the row is either gone or in a status this write may not flip.
+    case count do
+      1 -> {:ok, Repo.get_by(Shard, shard_id: shard_id)}
+      0 -> status_conflict_reason(shard_id)
+    end
+  end
+
+  defp status_conflict_reason(shard_id) do
+    case Repo.get_by(Shard, shard_id: shard_id) do
+      nil -> {:error, :not_found}
+      _present -> {:error, :status_conflict}
     end
   end
 end

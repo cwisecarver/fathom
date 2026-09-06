@@ -701,4 +701,43 @@ defmodule Fathom.DirectoryTest do
       end
     end
   end
+
+  # Expert review 2026-09-05 #11: the migration state-machine writes (mark_migrating, cutover,
+  # mark_failed) went through the UNguarded update_shard/2 and overwrote a `suspended` or `deleted`
+  # row — silently lifting a legal-hold suspension or resurrecting a deleted tenant's directory row
+  # mid-rollout. They are now status-guarded like unmark_migrating/1. Verified by execution in the
+  # panel; each write must leave a terminal-status row untouched and in its admission id-set.
+  describe "migration writes never overwrite a terminal lifecycle status (#11)" do
+    for terminal <- ["suspended", "deleted"] do
+      test "mark_migrating / cutover / mark_failed refuse a #{terminal} row" do
+        terminal = unquote(terminal)
+        shard = "life_#{System.unique_integer([:positive])}"
+        {:ok, _} = Directory.resolve(shard)
+
+        case terminal do
+          "suspended" -> {:ok, _} = Directory.suspend(shard)
+          "deleted" -> Directory.tombstone(shard)
+        end
+
+        for write <- [
+              fn -> Directory.mark_migrating(shard) end,
+              fn -> Directory.cutover(shard, 5) end,
+              fn -> Directory.cutover(shard, 5, 4) end,
+              fn -> Directory.mark_failed(shard) end
+            ] do
+          assert {:error, :status_conflict} = write.(),
+                 "a migration write must refuse a #{terminal} row, not overwrite it"
+
+          assert {:ok, %Shard{status: ^terminal}} = Directory.get(shard),
+                 "the #{terminal} status must be preserved"
+        end
+
+        # The admission id-set still contains it — the gate the status drives is intact.
+        case terminal do
+          "suspended" -> assert shard in Directory.suspended_shard_ids()
+          "deleted" -> assert shard in Directory.deleted_shard_ids()
+        end
+      end
+    end
+  end
 end
