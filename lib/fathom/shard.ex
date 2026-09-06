@@ -1730,10 +1730,16 @@ defmodule Fathom.Shard do
   # fence when it fires, so a coalesced later lapse is still covered). The flush
   # fence remains the hard guard throughout the jitter window.
   def handle_info({:heartbeat_lapsed, gen}, state) do
-    # Truthy covers BOTH in-progress shapes: `true` (timer armed) and `%Task{}` (check in
-    # flight). Either way this lapse coalesces onto the episode already running.
+    # Arm a NEW revalidation episode only when none is in progress. `lapse_revalidate_pending` is a
+    # tri-state (`false` | `true` timer armed | `%Task{}` check in flight), so the "in progress" test
+    # must be an explicit `== false`, NOT `not/1`: `not` is STRICT boolean and raises ArgumentError
+    # on the `%Task{}` shape (verified). That crashed the coordinator from inside handle_info the
+    # first time a lapse landed while the jittered check GET was still running — precisely correlated
+    # with the storage trouble that produces lapses (a Heartbeat restart re-broadcasts unconditionally
+    # while tasks from the real lapse are in flight; a slow check_lease GET outlives one ttl). Both
+    # in-progress shapes coalesce onto the running episode (expert review 2026-09-05 #14).
     if state.acquire_gen != nil and gen != state.acquire_gen and
-         not state.lapse_revalidate_pending do
+         state.lapse_revalidate_pending == false do
       Process.send_after(self(), :revalidate_lapse, :rand.uniform(lapse_jitter_ms()))
       {:noreply, %{state | lapse_revalidate_pending: true}}
     else

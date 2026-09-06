@@ -284,6 +284,26 @@ defmodule Fathom.ShardLeaseTest do
            "the deferred revalidation must still self-fence without flushing"
   end
 
+  # Expert review 2026-09-05 #14: `lapse_revalidate_pending` is a tri-state
+  # (false | true | %Task{}), and the {:heartbeat_lapsed, gen} guard tested it with `not/1`, which
+  # is STRICT boolean and raises ArgumentError on the %Task{} shape — crashing the coordinator from
+  # inside handle_info the first time a lapse landed while the jittered check_lease GET was still in
+  # flight (a Heartbeat restart re-broadcasts unconditionally; a slow GET outlives one ttl). The
+  # guard must coalesce onto the running episode instead. This drives the callback directly with the
+  # exact production tri-state value (a check in flight) — the integration path that produces it is
+  # exercised by the heartbeat-fence tests, and holding the Task in flight there needs a storage
+  # delay that would make the test timing-bound. Pre-fix the handler raises; post-fix it returns the
+  # state unchanged.
+  test "a heartbeat lapse while a revalidation Task is in flight coalesces instead of crashing" do
+    # The handler does not inspect the Task's fields — it only branches on the %Task{} SHAPE — so any
+    # valid struct stands in for the in-flight check_lease task.
+    task = %Task{ref: make_ref(), owner: self(), pid: self(), mfa: {Fathom.Shard, :noop, 0}}
+    state = %{acquire_gen: 1, lapse_revalidate_pending: task}
+
+    assert {:noreply, %{lapse_revalidate_pending: %Task{}}} =
+             Fathom.Shard.handle_info({:heartbeat_lapsed, 2}, state)
+  end
+
   defp local_dir, do: Fathom.Shard.data_dir()
   defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 
