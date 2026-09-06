@@ -172,4 +172,60 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
 
     _ = shard
   end
+
+  # Expert review 2026-09-05 #21: PRAGMA user_version is fathom's own schema-version stamp and the
+  # migrator's crash-forward signal. It stays allowed for :rw (a durability-tested capability), but a
+  # tenant setting it can forge its convergence state — so under :block_tenant_ddl (the lever that
+  # routes schema evolution through the migration engine) the ASSIGNMENT is refused. The bare read
+  # stays allowed; the template is exempt.
+  test "under :block_tenant_ddl a tenant cannot set PRAGMA user_version, but can still read it",
+       %{
+         shard: _shard
+       } do
+    prev = Application.get_env(:fathom, :block_tenant_ddl, false)
+    Application.put_env(:fathom, :block_tenant_ddl, true)
+    uv_shard = "test_uv_#{System.unique_integer([:positive])}"
+    {:ok, h} = ShardExecutor.open(uv_shard)
+
+    on_exit(fn ->
+      ShardExecutor.close(h)
+      Application.put_env(:fathom, :block_tenant_ddl, prev)
+      rm_shard_files(uv_shard)
+    end)
+
+    for sql <- [
+          "PRAGMA user_version = 5",
+          "PRAGMA user_version=5",
+          "PRAGMA main.user_version = 5",
+          ";PRAGMA user_version = 5",
+          "/* c */ PRAGMA user_version(5)"
+        ] do
+      assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
+               ShardExecutor.execute(h, stmt(sql)),
+             "`#{sql}` forged the schema-version stamp under :block_tenant_ddl"
+    end
+
+    # The bare read still works (it discloses only the current stamp).
+    assert {:ok, _} = ShardExecutor.execute(h, stmt("PRAGMA user_version"))
+  end
+
+  test "with :block_tenant_ddl OFF, PRAGMA user_version stays settable (the durability capability)",
+       %{shard: _shard} do
+    prev = Application.get_env(:fathom, :block_tenant_ddl, false)
+    Application.put_env(:fathom, :block_tenant_ddl, false)
+    uv_shard = "test_uv_open_#{System.unique_integer([:positive])}"
+    {:ok, h} = ShardExecutor.open(uv_shard)
+
+    on_exit(fn ->
+      ShardExecutor.close(h)
+      Application.put_env(:fathom, :block_tenant_ddl, prev)
+      rm_shard_files(uv_shard)
+    end)
+
+    # Not gate-blocked when DDL is not locked down — shard_durability_test pins this round trip.
+    refute match?(
+             {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}},
+             ShardExecutor.execute(h, stmt("PRAGMA user_version = 5"))
+           )
+  end
 end

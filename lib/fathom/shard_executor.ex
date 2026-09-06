@@ -222,6 +222,25 @@ defmodule Fathom.ShardExecutor do
            status: 400
          }}
 
+      # `PRAGMA user_version = N` is fathom's OWN O(1) schema-version gate AND the migrator's
+      # crash-forward signal (expert review 2026-09-05 #21). It stays in @tenant_pragma_allow because
+      # stamping it is a documented, durability-tested capability — but a :rw tenant setting it can
+      # forge its convergence state (stamp itself to HEAD with no DDL, so `converged` counts it done
+      # while its app fails) or force its own quarantine (`ahead_of_target` ×5). It is not DDL, so
+      # `:block_tenant_ddl` — the lever that already routes schema evolution through the migration
+      # engine — did not cover it. Gate the ASSIGNMENT behind the same lever (the bare READ stays
+      # allowed, and the template is exempt as the migration source), so a fleet that locks DDL down
+      # has also locked the stamp.
+      opts.block_ddl? and not opts.template? and user_version_write?(sql) ->
+        {:error,
+         %Error{
+           message:
+             "PRAGMA user_version cannot be set on tenant \"#{shard_id}\"; the schema-version " <>
+               "stamp is advanced by the migration engine, not a direct tenant write",
+           code: "FILO_PRAGMA_BLOCKED",
+           status: 403
+         }}
+
       true ->
         run_statement(handle, stmt, dml?, ddl?)
     end
@@ -1612,6 +1631,23 @@ defmodule Fathom.ShardExecutor do
       _ -> false
     end
   end
+
+  # A `PRAGMA [schema.]user_version = N` / `(N)` ASSIGNMENT (not the bare read), for the
+  # :block_tenant_ddl gate (#21). Reuses the same structural parse as blocked_pragma/1 so a prefix
+  # trick (`;`, comments, `schema.`, insignificant whitespace) cannot slip an assignment past it.
+  defp user_version_write?(sql) when is_binary(sql) do
+    if String.starts_with?(lead(sql, 7), "pragma") do
+      rest = sql |> strip_lead_noise() |> String.slice(6..-1//1) |> String.trim_leading()
+      {name_raw, tail} = split_pragma_name(rest)
+
+      String.downcase(name_raw) == "user_version" and
+        (pragma_assignment?(tail) or argumentish_tail?(tail))
+    else
+      false
+    end
+  end
+
+  defp user_version_write?(_), do: false
 
   defp extra_pragma_allow, do: Application.get_env(:fathom, :tenant_pragma_allow, [])
 
