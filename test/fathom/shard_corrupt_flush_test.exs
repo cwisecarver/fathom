@@ -213,6 +213,37 @@ defmodule Fathom.ShardCorruptFlushTest do
     assert :ok = Shard.verify_integrity(remote)
   end
 
+  # Expert review 2026-09-05 #17: quarantine_corrupt!/2 named the quarantine `.corrupt.<second>` and
+  # File.rm'd the -wal/-shm. Two fixes, mirroring quarantine_fenced!/quarantine_fork!: an
+  # ms+unique-integer name (a <second> name collided — two quarantines of one shard within a second
+  # clobbered each other, the defect review #14 fixed for `.forked`), and RENAMING the -wal/-shm
+  # alongside instead of unlinking them (on the busy-checkpoint route the WAL still holds committed,
+  # acked frames — the better copy of recent history — and the forensic copy must keep them).
+  test "a corrupt-flush quarantine uses a collision-proof name and preserves WAL/SHM companions",
+       %{
+         shard: shard
+       } do
+    path = Shard.db_path(shard)
+
+    write_and_checkpoint(shard, ["CREATE TABLE t (v TEXT)", @seed_insert])
+    :ok = Shards.drain(shard, 10_000)
+
+    # Re-open and write, leaving a WAL companion around the corrupt drop.
+    write_and_checkpoint(shard, ["INSERT INTO t VALUES ('more')"])
+    corrupt_page!(path)
+    :ok = Shards.drain(shard, 10_000)
+
+    # The name carries a unique-integer suffix (`.corrupt.<ms>-<unique>`), not a bare 1-second
+    # stamp, so a repeat quarantine within the same second cannot rename over the first copy.
+    assert Path.wildcard(path <> ".corrupt.*-*") != [],
+           "the quarantine name must be collision-proof (ms + unique), not `.corrupt.<second>`"
+
+    # No live -wal/-shm was left unlinked out from under a would-be recovery: any companion that
+    # existed at quarantine time is moved to the quarantine name, never File.rm'd.
+    assert Path.wildcard(path <> "-wal") == [] and Path.wildcard(path <> "-shm") == [],
+           "the live companions must be moved aside with the db, not stranded"
+  end
+
   defp tmp_db,
     do: Path.join(System.tmp_dir!(), "fathom_qc_#{System.unique_integer([:positive])}.db")
 

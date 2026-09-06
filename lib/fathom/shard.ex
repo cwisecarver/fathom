@@ -2787,9 +2787,21 @@ defmodule Fathom.Shard do
   # PUTs it over the good stored object with a valid If-Match — destroying the only good copy.
   # The serving path therefore refuses the flush and leaves the file alone; see verify_and_snapshot/2.
   defp quarantine_corrupt!(state, reason) do
-    dest = "#{state.path}.corrupt.#{System.system_time(:second)}"
+    # `.corrupt.<ms>-<unique>`, and the -wal/-shm RENAMED alongside — mirroring quarantine_fenced!/
+    # quarantine_fork! (expert review 2026-09-05 #17). Two fixes over the old `<second>` + `File.rm`:
+    #   * <second> resolution collided — two quarantines of the same shard within one second renamed
+    #     over each other and the first forensic copy was lost, the defect review #14 fixed for
+    #     `.forked`. A crash-looping node is exactly where repeat quarantines happen.
+    #   * File.rm on the WAL DESTROYS committed, acknowledged frames on the route this is reached
+    #     from flush_then_drop's {:corrupt_local, _} — which fires when the checkpoint came back BUSY,
+    #     so the WAL still holds frames never folded into the main file, and a corrupt main-file page
+    #     with an intact WAL is the case where the WAL is the BETTER copy of recent history. Preserve
+    #     it for the operator recovery the "quarantined for forensics" message promises.
+    dest =
+      "#{state.path}.corrupt.#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
+
     _ = File.rename(state.path, dest)
-    Enum.each(["-wal", "-shm"], &File.rm(state.path <> &1))
+    Enum.each(["-wal", "-shm"], &File.rename(state.path <> &1, dest <> &1))
 
     Logger.error(
       "shard #{state.id}: local db failed quick_check (#{inspect(reason)}); REFUSING flush so the " <>
