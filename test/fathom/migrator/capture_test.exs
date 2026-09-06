@@ -194,6 +194,60 @@ defmodule Fathom.Migrator.CaptureTest do
       assert Migrator.statements(1) == ["CREATE TABLE app_kept (id INTEGER PRIMARY KEY)"]
     end
 
+    # Expert review 2026-09-05 #9: while an EARLIER capture is stashed pending (a control-plane
+    # blip), a LATER template commit must QUEUE behind it, not record now. record/3 takes
+    # next_version(), so recording the later commit while the earlier one waits would give the
+    # later commit the LOWER fleet version and invert replay order — the fleet then replays
+    # migration B's DDL before A's ("no such table/column"). Versions must be allocated in
+    # template-commit order; drain_pending/1 already guaranteed that for its own list, but the
+    # direct commit/bookkeeping paths bypassed it.
+    test "a commit while an earlier capture is pending queues behind it, preserving version order" do
+      import ExUnit.CaptureLog
+
+      prev_retry = Application.get_env(:fathom, :capture_retry_ms)
+      # Stop the auto-retry from draining the pending list mid-test; we drive it manually.
+      Application.put_env(:fathom, :capture_retry_ms, 300_000)
+
+      on_exit(fn ->
+        if prev_retry,
+          do: Application.put_env(:fathom, :capture_retry_ms, prev_retry),
+          else: Application.delete_env(:fathom, :capture_retry_ms)
+      end)
+
+      conn_a = make_ref()
+      conn_b = make_ref()
+
+      # A commits FIRST, but its record fails on a control-plane outage → stashed pending.
+      Capture.begin(conn_a, 0)
+      Capture.append(conn_a, "CREATE TABLE app_alpha (id INTEGER PRIMARY KEY)", [])
+      Capture.append(conn_a, "INSERT INTO django_migrations (app, name) VALUES ('app', 'A')", [])
+      Ecto.Adapters.SQL.Sandbox.mode(Fathom.Repo, :manual)
+      capture_log(fn -> assert {:error, _} = Capture.commit(conn_a, 1) end)
+
+      # Postgres RECOVERS, but A is still pending (the retry tick has not been driven).
+      owner = Ecto.Adapters.SQL.Sandbox.start_owner!(Fathom.Repo, shared: true)
+      on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(owner) end)
+
+      # B commits SECOND. Pre-fix it records NOW (Postgres is back) and grabs version 1 — the
+      # inversion. Post-fix it must queue behind A instead.
+      Capture.begin(conn_b, 1)
+      Capture.append(conn_b, "CREATE TABLE app_beta (id INTEGER PRIMARY KEY)", [])
+      Capture.append(conn_b, "INSERT INTO django_migrations (app, name) VALUES ('app', 'B')", [])
+      assert {:pending, _} = Capture.commit(conn_b, 2)
+
+      # Drain the pending list FIFO.
+      send(Capture, :retry_pending)
+      _ = :sys.get_state(Capture)
+
+      # A committed first, so it must be the LOWER version; B the higher. (hd/1, since each version
+      # also carries its django_migrations INSERT.)
+      assert hd(Migrator.statements(1)) == "CREATE TABLE app_alpha (id INTEGER PRIMARY KEY)",
+             "the earlier template commit (A) must get the lower fleet version"
+
+      assert hd(Migrator.statements(2)) == "CREATE TABLE app_beta (id INTEGER PRIMARY KEY)",
+             "the later template commit (B) must get the higher fleet version"
+    end
+
     # Expert review 2026-07-14 #1: a Django RunPython backfill crosses the wire as template-literal
     # INSERT/UPDATE/DELETE on a tenant table and is captured into the fleet version — replayed
     # verbatim it corrupts or silently skips tenant data. The version is still recorded (refusing

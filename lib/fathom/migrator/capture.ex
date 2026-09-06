@@ -221,19 +221,7 @@ defmodule Fathom.Migrator.Capture do
             # counts — recorded so the post-revert drift check (#32) can compare the template against
             # HEAD, and so record/3 can detect a non-atomic-migration GAP (#6): `before` should equal
             # the last captured count; if it's higher, migrations ran OUTSIDE a tracked transaction.
-            case record(statements, count, before) do
-              {:recorded, _} = recorded ->
-                {:reply, recorded, state}
-
-              {:error, _} = error ->
-                # Expert review #19: the migration has ALREADY committed on the template
-                # shard, so re-running `manage.py migrate` is a no-op — dropping this
-                # buffer on a Postgres blip would permanently fork template schema from
-                # fleet schema (every subsequent captured version assumes DDL the fleet
-                # never received, so all future replays fail or half-apply). Keep the
-                # statements and retry until the control plane recovers.
-                {:reply, error, stash_pending(state, statements, count, before)}
-            end
+            record_or_queue(state, statements, count, before)
 
           # django_migrations SHRANK: a backwards Django migrate (`manage.py migrate <app> <prev>`)
           # deleted its bookkeeping row (expert review 2026-07-14 #6). The fleet does NOT follow a
@@ -273,15 +261,7 @@ defmodule Fathom.Migrator.Capture do
         _ = entry
         statements = Enum.reverse([{sql, args} | buffer])
 
-        case record(statements, count, before) do
-          {:recorded, _} = recorded ->
-            {:reply, recorded, state}
-
-          # Same durability rule as commit/3: the migration has ALREADY committed on the template,
-          # so re-running `manage.py migrate` is a no-op. Keep the statements and retry.
-          {:error, _} = error ->
-            {:reply, error, stash_pending(state, statements, count, before)}
-        end
+        record_or_queue(state, statements, count, before)
 
       _ ->
         {:reply, :noop, state}
@@ -334,6 +314,35 @@ defmodule Fathom.Migrator.Capture do
         )
 
         :ok
+    end
+  end
+
+  # Record this capture now, UNLESS an earlier capture is still pending (a prior record/3 failed on
+  # a control-plane blip and is stashed for :retry_pending). In that case QUEUE behind it instead of
+  # recording (expert review 2026-09-05 #9): record/3 takes next_version(), so recording this LATER
+  # template commit while an EARLIER one waits would assign the later commit the LOWER fleet version
+  # and invert replay order — a fleet-wide "no such table/column" once the operator approves the
+  # mis-attributed gap hold. This is the exact invariant drain_pending/1 documents for its own list;
+  # the direct commit/bookkeeping paths bypassed it. `:retry_pending` drains the whole list FIFO, so
+  # versions are always allocated in template-commit order.
+  #
+  # On the durability side this also preserves expert review #19: a record/3 that FAILS keeps the
+  # statements (the migration already committed on the template, so re-running manage.py migrate is a
+  # no-op — dropping the buffer would permanently fork template schema from fleet schema) and retries.
+  defp record_or_queue(state, statements, count, before) do
+    case Map.get(state, :pending, []) do
+      [] ->
+        case record(statements, count, before) do
+          {:recorded, _} = recorded ->
+            {:reply, recorded, state}
+
+          {:error, _} = error ->
+            {:reply, error, stash_pending(state, statements, count, before)}
+        end
+
+      _pending ->
+        {:reply, {:pending, :queued_behind_earlier_capture},
+         stash_pending(state, statements, count, before)}
     end
   end
 
