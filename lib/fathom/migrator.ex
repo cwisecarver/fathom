@@ -1062,48 +1062,69 @@ defmodule Fathom.Migrator do
   `Fathom.Migrator.ShardMigration.revert/4` (finding #13).
 
   Yanks `from_version` first (expert review #12) so HEAD drops and the reconcile
-  sweep / lazy migrate cannot re-apply the version being reverted away from. Pass
-  `yank: false` to keep the release live (rare — e.g. reverting a few canary shards
-  while the rollout continues).
+  sweep / lazy migrate cannot re-apply the version being reverted away from.
+
+  `yank: false` keeps the release live. There is NO per-shard "hold below HEAD"
+  pin, so a shard reverted below HEAD is by definition a laggard: the reconcile
+  sweep / lazy migrate-on-touch re-migrates it straight back within the hour. The
+  once-documented "revert a few canary shards while the rollout continues" flow
+  therefore does the flip and then silently undoes it. `force: true` with
+  `yank: false` is REFUSED (`{:error, :force_revert_requires_yank}`) — it would
+  discard each canary's post-cutover writes AND re-migrate within the hour, the
+  destructive half with none of the benefit. A real canary-hold would need a
+  `held_below` column on `shards` that `Directory.laggards/2`, `behind?/2` and the
+  migrate-on-touch enqueue respect; that is a schema feature, deliberately not
+  built here (expert review 2026-09-05 #31).
   """
   @enqueue_chunk 5_000
 
-  @spec revert(non_neg_integer(), non_neg_integer(), keyword()) :: {:ok, non_neg_integer()}
+  @spec revert(non_neg_integer(), non_neg_integer(), keyword()) ::
+          {:ok, non_neg_integer()} | {:error, :force_revert_requires_yank}
   def revert(from_version, to_version, opts \\ []) do
     force? = Keyword.get(opts, :force, false)
-    if Keyword.get(opts, :yank, true), do: yank(from_version)
+    yank? = Keyword.get(opts, :yank, true)
 
-    # Keyset-stream the shard_ids in pages instead of materializing every shard at the version as a
-    # full struct (expert review 2026-07-18 #12 — a fleet revert loaded millions of rows into
-    # memory). Process each page independently so a page's jobs commit and start reverting before
-    # the next page is fetched (the emergency path wants shards reverting ASAP, not after a
-    # full-fleet scan). Per page: upgrade in-flight jobs (force), then enqueue the rest.
-    total =
-      Directory.stream_ids_at_version(from_version, @enqueue_chunk)
-      |> Stream.chunk_every(@enqueue_chunk)
-      |> Enum.reduce(0, fn ids, acc ->
-        # Expert review #23: the per-shard dedup in enqueue_unique ignores `force`, so in the
-        # intended operator flow — non-force sweep, guard cancels some shards, re-issue with
-        # force: true — any shard whose first RevertJob was still in flight (snoozing on
-        # :shard_busy / {:held, _}) was silently dropped from the force sweep; the surviving
-        # non-force job then hit the guard and cancelled, so the shard was never reverted despite
-        # the explicit force. Upgrade in-flight jobs' args instead. Round-2 #21 tightened this to
-        # the WHOLE operation: upgrading only `force` while a snoozing job targeted a different
-        # to_version force-reverted the shard (a destructive discard) to the WRONG version — so the
-        # retarget sets to_version too (last operator command wins).
-        forced = if force?, do: retarget_inflight_reverts(ids, to_version), else: 0
+    if force? and not yank? do
+      # The one revert combination that ONLY destroys (expert review 2026-09-05 #31): `force: true`
+      # discards each shard's post-cutover writes, and `yank: false` leaves HEAD at `from_version`
+      # so the reconcile sweep / lazy migrate-on-touch re-migrates every reverted shard straight
+      # back within the hour — there is no per-shard "hold below HEAD" pin, so the documented
+      # canary-hold flow does the destructive half with none of the benefit. Refuse it rather than
+      # silently discard writes for a revert that undoes itself.
+      {:error, :force_revert_requires_yank}
+    else
+      if yank?, do: yank(from_version)
+      {:ok, revert_pages(from_version, to_version, force?)}
+    end
+  end
 
-        enqueued =
-          ids
-          |> Enum.map(
-            &{&1, RevertJob.new(%{shard_id: &1, to_version: to_version, force: force?})}
-          )
-          |> enqueue_unique()
+  # Keyset-stream the shard_ids in pages instead of materializing every shard at the version as a
+  # full struct (expert review 2026-07-18 #12 — a fleet revert loaded millions of rows into
+  # memory). Process each page independently so a page's jobs commit and start reverting before
+  # the next page is fetched (the emergency path wants shards reverting ASAP, not after a
+  # full-fleet scan). Per page: upgrade in-flight jobs (force), then enqueue the rest.
+  defp revert_pages(from_version, to_version, force?) do
+    Directory.stream_ids_at_version(from_version, @enqueue_chunk)
+    |> Stream.chunk_every(@enqueue_chunk)
+    |> Enum.reduce(0, fn ids, acc ->
+      # Expert review #23: the per-shard dedup in enqueue_unique ignores `force`, so in the
+      # intended operator flow — non-force sweep, guard cancels some shards, re-issue with
+      # force: true — any shard whose first RevertJob was still in flight (snoozing on
+      # :shard_busy / {:held, _}) was silently dropped from the force sweep; the surviving
+      # non-force job then hit the guard and cancelled, so the shard was never reverted despite
+      # the explicit force. Upgrade in-flight jobs' args instead. Round-2 #21 tightened this to
+      # the WHOLE operation: upgrading only `force` while a snoozing job targeted a different
+      # to_version force-reverted the shard (a destructive discard) to the WRONG version — so the
+      # retarget sets to_version too (last operator command wins).
+      forced = if force?, do: retarget_inflight_reverts(ids, to_version), else: 0
 
-        acc + enqueued + forced
-      end)
+      enqueued =
+        ids
+        |> Enum.map(&{&1, RevertJob.new(%{shard_id: &1, to_version: to_version, force: force?})})
+        |> enqueue_unique()
 
-    {:ok, total}
+      acc + enqueued + forced
+    end)
   end
 
   @doc """

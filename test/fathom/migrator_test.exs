@@ -148,6 +148,26 @@ defmodule Fathom.MigratorTest do
     end
   end
 
+  # Expert review 2026-09-05 #31: the documented canary revert (`yank: false`) is undone by the
+  # next sweep because there is no per-shard hold-below-HEAD pin, and with `force: true` it discards
+  # the canary's post-cutover writes for a revert that re-migrates within the hour. The minimal
+  # honest fix refuses only the destructive combination (a real hold-below pin is a schema feature,
+  # deliberately not built).
+  describe "revert/3 option safety (#31)" do
+    test "force: true with yank: false is refused (destructive discard for nothing)" do
+      # Pre-fix this returned {:ok, 0} and would have enqueued RevertJobs that discard post-cutover
+      # writes; the reverted shards then re-migrate straight back within the hour.
+      assert {:error, :force_revert_requires_yank} =
+               Migrator.revert(2, 1, yank: false, force: true)
+    end
+
+    test "yank: false without force is still allowed (churny but non-destructive)" do
+      # A pointer-flip revert with the release live loses no writes, so only the destructive combo
+      # is refused, not yank: false in general.
+      assert {:ok, _} = Migrator.revert(2, 1, yank: false)
+    end
+  end
+
   describe "list/0" do
     test "returns releases oldest first" do
       {:ok, _} = Migrator.release(2, "second")
