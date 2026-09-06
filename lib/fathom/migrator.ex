@@ -717,6 +717,7 @@ defmodule Fathom.Migrator do
   @spec status() :: %{
           head: non_neg_integer(),
           laggards: non_neg_integer(),
+          above_head: non_neg_integer(),
           failed: non_neg_integer(),
           converged: boolean(),
           pending_review: [pos_integer()],
@@ -734,13 +735,21 @@ defmodule Fathom.Migrator do
   def status do
     head = head()
     laggards = Directory.count_laggards(head)
+    above_head = Directory.count_above_head(head)
     rate = rollout_rate(head)
 
     %{
       head: head,
       laggards: laggards,
+      # Active shards stranded ABOVE head (a yanked vN that completed in the race window). Unlike
+      # stamp_drift (point-in-time drill evidence), this is the directory's CURRENT claim, so it is
+      # folded into `converged`: a deploy gate must not read the fleet as homogeneous at HEAD while
+      # a tenant still serves the reverted-away schema (expert review 2026-09-05 #19). revert_stranded
+      # cannot clear it for a live tenant (the write-age guard refuses), so it stays non-zero — a real
+      # signal — until an operator resolves it, instead of an hourly log line under a green gate.
+      above_head: above_head,
       failed: Directory.count_failed(),
-      converged: laggards == 0,
+      converged: laggards == 0 and above_head == 0,
       # `pending_review` stays a list of VERSION NUMBERS. Changing it to the block objects broke
       # `migration_controller_test` immediately, which is the API's own consumers telling you the
       # same thing: this is a published control-plane endpoint and a field changing type is a

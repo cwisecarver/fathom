@@ -707,6 +707,20 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  How many active shards are stamped ABOVE `head_version` — stranded past HEAD (expert review
+  2026-09-05 #19). A shard that completed its migration in the yank race window sits at the yanked
+  vN with `schema_version > head`; `count_laggards/1` is strictly `< head`, so it excludes them and
+  `converged` reads true while those tenants still serve the reverted-away schema. This is a
+  CURRENT directory claim (unlike the point-in-time stamp-drift gauge), so `Migrator.status/0`
+  folds it into `converged`.
+  """
+  @spec count_above_head(non_neg_integer()) :: non_neg_integer()
+  def count_above_head(head_version) do
+    from(s in Shard, where: s.schema_version > ^head_version and s.status == "active")
+    |> Repo.aggregate(:count)
+  end
+
+  @doc """
   How many active shards reached `head_version` at or after `since` — the numerator of the fleet
   rollout rate (expert review 2026-08-01 #43).
 

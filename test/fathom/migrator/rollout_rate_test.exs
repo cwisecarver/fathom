@@ -103,6 +103,29 @@ defmodule Fathom.Migrator.RolloutRateTest do
       refute status.converged
     end
 
+    # Expert review 2026-09-05 #19: a shard that completed its migration in the yank race window
+    # sits at the yanked vN with schema_version > head. count_laggards is strictly < head, so it
+    # excludes them and `converged` read true while those tenants still served the reverted-away
+    # schema — the CI deploy gate lied. status/0 now folds an above_head count into converged.
+    test "status/0 folds shards stranded ABOVE head into converged" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
+      shard_at_head!("ah_ok", 1)
+
+      # Stranded above head: schema_version 2 > head 1, still active.
+      {:ok, _} = Directory.resolve("ah_stranded")
+      {:ok, _} = Directory.cutover("ah_stranded", 2)
+
+      status = Migrator.status()
+
+      refute status.converged,
+             "a shard serving a reverted-away schema above head must not read as converged"
+
+      assert status.laggards == 0,
+             "the stranded shard is above head, not below, so it is not a laggard"
+
+      assert status.above_head == 1
+    end
+
     # THE THREE-PLACE STAMP, published beside `converged` (expert review 2026-08-24 #25).
     #
     # `laggards` — and therefore `converged` — reads `schema_version` alone, so a shard whose stored
