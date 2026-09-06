@@ -94,6 +94,52 @@ defmodule Fathom.Migrator.RolloutTest do
       assert length(all_enqueued(worker: ShardMigrationJob)) == 2
     end
 
+    # Expert review 2026-09-05 #13: the sweep applies `limit` BEFORE the in-flight dedup, so a hot
+    # shard whose job snoozes forever on :shard_busy stays `active` at the old version, sorts to the
+    # top of every batch (most-recently-active first), fills the whole `limit`, gets deduped away,
+    # and inserts ZERO jobs — the cold tail behind it is never reached and the deploy gate never
+    # turns green. Excluding already-queued shards from the SELECTION lets LIMIT skip past them.
+    test "a shard with a live job does not starve the cold tail: rollout skips past it (limit before dedup)" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      # panel_hot is MORE recently active (sorts first); panel_cold is an hour older.
+      Repo.insert_all("shards", [
+        %{
+          shard_id: "panel_hot",
+          schema_version: 0,
+          status: "active",
+          last_active_at: now,
+          inserted_at: now,
+          updated_at: now
+        },
+        %{
+          shard_id: "panel_cold",
+          schema_version: 0,
+          status: "active",
+          last_active_at: DateTime.add(now, -3600, :second),
+          inserted_at: now,
+          updated_at: now
+        }
+      ])
+
+      # panel_hot already has a live migration job (the snoozing one).
+      {:ok, _} = Oban.insert(ShardMigrationJob.new(%{shard_id: "panel_hot", target: 1}))
+
+      # With batch_size 1, the OLD selection returns [panel_hot], dedups it, and inserts 0 —
+      # panel_cold is never reached. The fix skips panel_hot in the SELECT and reaches panel_cold.
+      assert {:ok, 1} = Migrator.rollout(1)
+
+      assert_enqueued(
+        worker: ShardMigrationJob,
+        args: %{"shard_id" => "panel_cold", "target" => 1}
+      )
+
+      # panel_hot still has exactly its one pre-existing job — the sweep did not touch it.
+      assert length(all_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => "panel_hot"})) ==
+               1
+    end
+
     # Found by scripts/directory_scale.exs at 3.1M directory rows: Postgres caps a statement
     # at 65,535 bind parameters, so one unpartitioned Oban.insert_all crashed past ~7,281
     # jobs (9 params each) — which a fleet revert (unbounded: every shard at a version) or a

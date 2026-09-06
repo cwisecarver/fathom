@@ -667,10 +667,37 @@ defmodule Fathom.Directory do
   """
   @spec laggards(non_neg_integer(), pos_integer()) :: [Shard.t()]
   def laggards(head_version, limit) do
-    laggard_query(head_version)
+    head_version
+    |> laggard_query()
+    |> without_live_migration_job()
     |> order_by([s], desc: s.last_active_at)
     |> limit(^limit)
     |> Repo.all()
+  end
+
+  # Exclude shards that ALREADY have a live ShardMigrationJob from the ROLLOUT SELECTION, not after
+  # (expert review 2026-09-05 #13). `laggards/2` returns the `limit` most-recently-active laggards
+  # and BulkEnqueue then drops those already queued -- so once >= batch_size hot shards have a job
+  # snoozing forever on :shard_busy (they stay `active` at the old version, and being hottest they
+  # sort to the top of EVERY sweep), each sweep selected the same batch, deduped all of it, and
+  # inserted ZERO jobs: the cold tail behind them was never reached and the deploy gate never turned
+  # green. Excluding them in the SELECT lets LIMIT skip past them to the tail; BulkEnqueue's dedup
+  # stays as the race backstop.
+  #
+  # The literal state list and worker match `oban_jobs_worker_shard_id_live_index`'s partial
+  # predicate EXACTLY (and Fathom.BulkEnqueue.unique_states/0), so the planner uses that index for
+  # the NOT EXISTS. Kept literal rather than parameterized precisely so the partial-index predicate
+  # match holds; the states are a fixed constant, never user input. `count_laggards/1` deliberately
+  # does NOT get this exclusion -- an in-flight-but-behind shard is still a laggard, and hiding it
+  # from the convergence gauge would make `converged` lie (the opposite of #19).
+  defp without_live_migration_job(query) do
+    from(s in query,
+      where:
+        fragment(
+          "NOT EXISTS (SELECT 1 FROM oban_jobs j WHERE j.worker = 'Fathom.Migrator.ShardMigrationJob' AND j.state IN ('scheduled','available','executing','retryable','suspended') AND j.args->>'shard_id' = ?)",
+          s.shard_id
+        )
+    )
   end
 
   @doc "How many active shards are still behind `head_version` (the reconcile gauge)."
