@@ -29,6 +29,31 @@ defmodule Fathom.HranaAuthRevocationTest do
 
   defp uniq, do: "rev_#{System.unique_integer([:positive])}"
 
+  # Expert review 2026-09-05 #10: the per-statement re-check (cached_floor/1) must not fail OPEN when
+  # the cache TTL lapses. A present-but-expired floor still proves this node knew the credential was
+  # revoked, and a floor only rises, so serving it is stale-but-safe. Pre-fix a lookup miss (an
+  # expired entry whose staleness the bulk marker could not vouch for) collapsed to :unknown and
+  # version_current? ALLOWED the revoked token — the 2026-08-20 #22 bypass reopened under a
+  # control-plane stall (the exact window a compromise-response revoke_issued_before sweep runs in).
+  test "an expired-but-present floor still refuses a revoked token when the bulk marker is stale" do
+    shard = uniq()
+
+    # The revocation cache is a public, module-named ETS table; seed the exact expired/stale state a
+    # control-plane outage produces rather than racing a real TTL (10_000_000 ms >> the 30 s TTL, so
+    # bulk_fresh? is deterministically false and the running bulk-refresh timer won't fire in-window).
+    old = System.monotonic_time(:millisecond) - 10_000_000
+    # {shard_id, floor_version, bumped_at, expires_at} and {@bulk_marker, at}.
+    :ets.insert(Revocations, {shard, 5, nil, old})
+    :ets.insert(Revocations, {:__bulk_ok__, old})
+
+    refute HranaAuth.version_current?(shard, 4),
+           "a revoked token (below the cached floor) must stay revoked on an open connection even " <>
+             "when the bulk refresh has stalled"
+
+    assert HranaAuth.version_current?(shard, 5),
+           "a token at/above the floor is still valid — the floor is served, not ignored"
+  end
+
   test "revoking a shard invalidates its outstanding tokens" do
     shard = uniq()
     {:ok, _} = Directory.resolve(shard)

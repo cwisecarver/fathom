@@ -99,8 +99,26 @@ defmodule Fathom.HranaAuth.Revocations do
   @spec cached_floor(String.t()) :: {non_neg_integer(), DateTime.t() | nil} | :unknown
   def cached_floor(shard_id) do
     case lookup(shard_id, System.monotonic_time(:millisecond)) do
-      {:hit, info} -> info
-      :miss -> :unknown
+      {:hit, info} ->
+        info
+
+      :miss ->
+        # A `lookup` miss is TWO different situations, and collapsing both to :unknown (which
+        # version_current?/2 ALLOWS) is a revocation bypass (expert review 2026-09-05 #10). A
+        # present-but-expired entry that the bulk marker cannot vouch for still PROVES this node
+        # already knew the credential was revoked to `version`, and a floor only rises — so serving
+        # it is stale-but-safe, never weaker than what this node knew. Dropping it re-admitted a
+        # revoked token on every OPEN connection whenever the bulk marker was stale: for a few ms
+        # every cycle in steady state (entry TTL and marker freshness lapse together), and
+        # UNBOUNDEDLY during a bulk-refresh stall (a control-plane outage — exactly when a
+        # compromise-response revoke_issued_before sweep runs, the 2026-08-20 #22 hole reopened).
+        # `:unknown` must mean "no entry AT ALL", where authorize/2's hello-time read_through was the
+        # last word. `lookup/2` itself is left unchanged so floor_info/1 (the authoritative hello
+        # path) still reads through on a genuine miss.
+        case stale_floor(shard_id) do
+          {:ok, info} -> info
+          :none -> :unknown
+        end
     end
   rescue
     ArgumentError -> :unknown
