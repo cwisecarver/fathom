@@ -178,6 +178,38 @@ defmodule Fathom.Shard.Storage.S3 do
     probe_rotation!(key, "single→multipart touch rotation")
     probe_rotation!(key, "multipart→single touch rotation")
 
+    # The lock-release fence (`release_lease/2`) is a conditional DELETE, and the whole lock-leak
+    # fix (`resolve_412_release`, finding #22) rests on the store answering 412 to a stale-etag
+    # DELETE. Conditional DELETE support DIFFERS across AWS general-purpose/directory buckets, R2,
+    # Tigris and MinIO: a store that IGNORES the precondition lets a zombie's release delete a LIVE
+    # owner's lock (two writers, silent clobber), and one that REJECTS every conditional DELETE
+    # leaks every lock (no failover, migration or rebalance can ever hand off a shard). Nothing else
+    # in this self-test exercises DELETE, so probe both directions and refuse boot on either failure
+    # (expert review 2026-09-05 #8). NOTE: this is what makes the boot answer "does the deployed
+    # store support conditional DELETE?", which the module was never verified against a real bucket.
+    probe_delete_status!(
+      key,
+      [{"if-match", ~s("fathom-bogus-etag")}],
+      [412],
+      "conditional DELETE enforcement (a stale-etag release MUST be refused 412)"
+    )
+
+    case head_object(key) do
+      {:ok, real_etag, _sentinel?, _meta} when is_binary(real_etag) ->
+        probe_delete_status!(
+          key,
+          [{"if-match", real_etag}],
+          200..299,
+          "conditional DELETE with the matching etag MUST succeed (else every lock leaks)"
+        )
+
+      other ->
+        raise "shard storage fence self-test failed: the probe object vanished before the " <>
+                "conditional-DELETE probe (#{inspect(other)}) — refusing to boot (expert review #8)."
+    end
+
+    # The valid probe above already removed the object; this is a best-effort belt in case a store
+    # answered the probe 2xx without actually deleting.
     _ = Req.delete(req(), url: url_path(key))
     :ok
   end
@@ -222,6 +254,25 @@ defmodule Fathom.Shard.Storage.S3 do
       {:error, reason} ->
         raise "shard storage fence self-test unreachable (#{label}): #{inspect(reason)}. " <>
                 "Refusing to boot with an unverified fence (expert review #16)."
+    end
+  end
+
+  # DELETE sibling of probe_status!/4 — the release fence is a conditional DELETE, not a PUT
+  # (expert review 2026-09-05 #8).
+  defp probe_delete_status!(key, headers, expected, label) do
+    case Req.delete(req(), url: url_path(key), headers: headers) do
+      {:ok, %{status: s}} ->
+        if s in expected do
+          :ok
+        else
+          raise "shard storage fence self-test failed (#{label}): expected " <>
+                  "#{inspect(expected)}, got #{s}. This store does not enforce the conditional " <>
+                  "DELETE the lock-release fence depends on — refusing to boot (expert review #8)."
+        end
+
+      {:error, reason} ->
+        raise "shard storage fence self-test unreachable (#{label}): #{inspect(reason)}. " <>
+                "Refusing to boot with an unverified fence (expert review #8)."
     end
   end
 

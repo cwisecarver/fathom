@@ -374,9 +374,31 @@ defmodule Fathom.Test.S3EtagStore do
     end
   end
 
+  # Conditional DELETE (expert review 2026-09-05 #8). The lock-release fence (`release_lease/2`) is
+  # a `DELETE ... If-Match: <etag>`, and the lock-leak fix (`resolve_412_release`, finding #22) is
+  # load-bearing on the store answering 412 to a stale etag. This double USED to delete
+  # unconditionally and return 204 regardless of If-Match, so no S3-path test could observe a DELETE
+  # 412 — the double-vs-real contract gap AGENTS.md § Testing names. Now it enforces the header:
+  # a matching etag deletes (204), a mismatch (or a conditional delete of an absent object) is
+  # refused (412), and an unconditional DELETE (no header) still deletes.
   defp delete_object(conn, agent, key) do
-    Agent.update(agent, &%{&1 | objects: Map.delete(&1.objects, key)})
-    Plug.Conn.send_resp(conn, 204, "")
+    if_match = Plug.Conn.get_req_header(conn, "if-match")
+    current = Agent.get(agent, &Map.get(&1.objects, key))
+
+    cond do
+      if_match == [] ->
+        Agent.update(agent, &%{&1 | objects: Map.delete(&1.objects, key)})
+        Plug.Conn.send_resp(conn, 204, "")
+
+      current != nil and hd(if_match) == etag(current) ->
+        Agent.update(agent, &%{&1 | objects: Map.delete(&1.objects, key)})
+        Plug.Conn.send_resp(conn, 204, "")
+
+      true ->
+        # Absent object or a mismatched etag: the precondition failed, exactly as S3 answers a
+        # conditional DELETE whose If-Match does not name the current object.
+        Plug.Conn.send_resp(conn, 412, "")
+    end
   end
 
   # ListObjectsV2. Only `prefix` and the paging pair are modelled — that is all `purge_shard/1`

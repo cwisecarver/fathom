@@ -113,4 +113,28 @@ defmodule Fathom.Shard.Storage.S3FenceProbeTest do
 
     assert_raise RuntimeError, fn -> S3.verify_conditional_writes!() end
   end
+
+  # Expert review 2026-09-05 #8: the release fence is a conditional DELETE, and a store that
+  # enforces conditional PUTs but IGNORES If-Match on DELETE (returns 204 for a stale-etag release)
+  # is a silent single-writer breach — a zombie's release removes a live owner's lock. This is the
+  # case no prior probe or S3-path test could see: the old boot self-test never issued a
+  # conditional DELETE, and S3EtagStore.delete_object used to delete unconditionally too. The boot
+  # probe must now refuse it.
+  test "refuses to boot against a store that ignores conditional DELETE (finding #8)" do
+    store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{}) end})
+
+    # Enforces every PUT/copy conditional and rotates the touch (delegates to the faithful double),
+    # but a bare object DELETE ignores If-Match and always 204s.
+    put_s3_config(fn conn ->
+      if conn.method == "DELETE" and not (conn.query_string =~ "uploadId") do
+        Plug.Conn.send_resp(conn, 204, "")
+      else
+        S3EtagStore.serve(conn, store)
+      end
+    end)
+
+    assert_raise RuntimeError, ~r/conditional DELETE/, fn ->
+      S3.verify_conditional_writes!()
+    end
+  end
 end
