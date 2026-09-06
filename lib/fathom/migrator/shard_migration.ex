@@ -654,12 +654,33 @@ defmodule Fathom.Migrator.ShardMigration do
   end
 
   defp finalize(shard_id, target) do
-    prev = current_version(shard_id)
+    prev = retained_version_for_finalize(shard_id, target)
 
     with {:ok, _} <- cutover_with_retirement(shard_id, target, prev) do
       {:ok, %{from: prev, to: target}}
     end
   end
+
+  # finalize/2 is the CRASH-FORWARD path: a prior attempt flushed `target` and died before cutover,
+  # so the DIRECTORY stamp never advanced and cannot say what that attempt RETAINED (expert review
+  # 2026-09-05 #18). current_version/1 (the stale stamp) would name an object that is gone or holds
+  # PRE-retained bytes, so cutover_with_retirement would record a `retained_version` a later revert
+  # restores from — landing the tenant on an OLDER generation and silently discarding a version's
+  # writes, while the correct backup sits ORPHANED in storage. forward/9 was already fixed (#22) to
+  # retain and record against the FILE version; this makes the crash-forward path agree by asking
+  # STORAGE what it actually holds: the highest retained `<shard>@v` below target (Storage.retain
+  # overwrites <shard>@current and retirement deletes superseded ones, so the highest present @v is
+  # the prior attempt's retained object). Fall back to the directory stamp only when no retained
+  # object is present at all.
+  defp retained_version_for_finalize(shard_id, target) when target > 0 do
+    Enum.find(
+      (target - 1)..0//-1,
+      current_version(shard_id),
+      &Storage.version_present?(shard_id, &1)
+    )
+  end
+
+  defp retained_version_for_finalize(shard_id, _target), do: current_version(shard_id)
 
   # The retirement outbox (expert review 2026-07-18 #5): cut the directory over to `cutover_to` AND
   # enqueue the retention deletion of `retire_version`'s `@version` object in ONE Postgres

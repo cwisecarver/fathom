@@ -433,6 +433,44 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert %{rows: [[2]]} = query_live!(shard, "PRAGMA user_version")
   end
 
+  # Expert review 2026-09-05 #18: forward/9 retains and records against the FILE version (#22), but
+  # the crash-forward finalize/2 stamped retained_version from the (possibly stale) DIRECTORY stamp.
+  # With file=v3, directory behind at v1 and a retained <shard>@2 present, finalize recorded
+  # retained_version: 1 — naming an object that is gone/pre-v2 while the real backup <shard>@2 is
+  # orphaned — so a later revert(3,2) would restore v1 bytes and silently discard the v2-era writes.
+  # The fix reads what STORAGE actually holds (the highest retained @v below target).
+  test "crash-forward finalize records the retained version storage holds, not the stale stamp",
+       %{
+         shard: shard
+       } do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+
+    {:ok, _} =
+      Migrator.release(3, "add tags", [
+        "CREATE TABLE app_tag (id INTEGER PRIMARY KEY, label TEXT)",
+        "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0003_add_tags', 'now')"
+      ])
+
+    # Migrate v1->v2 (retains @1), then v2->v3 (retains @2) — so <shard>@2 is the backup a
+    # revert(3, 2) would need, and the file lands at v3.
+    {:ok, _} = ShardMigration.run(shard, 2)
+    {:ok, _} = ShardMigration.run(shard, 3)
+    assert retained?(shard, 2), "the run v2->v3 retains <shard>@2"
+
+    # Simulate a crash-forward whose DIRECTORY stamp is stale (two behind the v3 file): a failed
+    # cutover transaction or a Postgres PITR does this.
+    {:ok, _} = Directory.cutover(shard, 1)
+
+    # The crash-forward retry: file == target, so finalize runs. It must record the version storage
+    # holds (@2), not the stale directory stamp (1).
+    assert {:ok, %{from: 2, to: 3}} = ShardMigration.run(shard, 3),
+           "finalize's `from` is the retained version, which must be 2 (storage), not 1 (stale stamp)"
+
+    assert {:ok, %{schema_version: 3, retained_version: 2}} = Directory.get(shard),
+           "finalize must retain against the object storage actually holds, not the stale stamp"
+  end
+
   # Finding #13: a revert overwrites the live vN object with the vN-1 copy. Without a backup, all
   # post-cutover writes on vN (and vN itself) are destroyed unrecoverably. The revert now retains
   # vN first, so those writes survive at <shard>@<vN> for the retention window.
