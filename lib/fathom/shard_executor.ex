@@ -422,8 +422,7 @@ defmodule Fathom.ShardExecutor do
   # answered the non-binary case, which cannot occur. A future caller that broke that now fails at
   # the dialyzer gate rather than silently classifying a write as a read.
   defp read_verb?(sql) when is_binary(sql) do
-    head = sql |> String.trim_leading() |> String.slice(0, 7) |> String.downcase()
-    Enum.any?(@read_verbs, &String.starts_with?(head, &1))
+    Enum.any?(@read_verbs, &String.starts_with?(lead(sql, 7), &1))
   end
 
   @control_prefixes ~w(begin commit end rollback savepoint release pragma)
@@ -458,11 +457,11 @@ defmodule Fathom.ShardExecutor do
   # `=` and the header-writing names), and pragma statements are short, so the full downcase
   # is confined to that branch.
   defp control_statement?(sql) when is_binary(sql) do
-    trimmed = String.trim_leading(sql)
-    head = trimmed |> String.slice(0, 9) |> String.downcase()
+    stripped = strip_lead_noise(sql)
+    head = stripped |> String.slice(0, 9) |> String.downcase()
 
     cond do
-      String.starts_with?(head, "pragma") -> not durable_pragma_write?(String.downcase(trimmed))
+      String.starts_with?(head, "pragma") -> not durable_pragma_write?(String.downcase(stripped))
       Enum.any?(@control_prefixes, &String.starts_with?(head, &1)) -> true
       true -> false
     end
@@ -476,7 +475,7 @@ defmodule Fathom.ShardExecutor do
   # CREATE) is never mistaken for a transaction commit. Slice-first for the same per-query
   # reason as control_statement?/1 — this runs on every clean (SELECT) result.
   defp ends_transaction?(sql) when is_binary(sql) do
-    head = sql |> String.trim_leading() |> String.slice(0, 6) |> String.downcase()
+    head = lead(sql, 6)
     String.starts_with?(head, "commit") or String.starts_with?(head, "end")
   end
 
@@ -583,8 +582,7 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp begins_transaction?(sql) when is_binary(sql) do
-    head = sql |> String.trim_leading() |> String.slice(0, 5) |> String.downcase()
-    String.starts_with?(head, "begin")
+    String.starts_with?(lead(sql, 5), "begin")
   end
 
   # Statements at which in-flight writes become durable-able and the shard must be re-dirtied if
@@ -597,8 +595,7 @@ defmodule Fathom.ShardExecutor do
   defp commit_boundary?(sql), do: ends_transaction?(sql) or releases_savepoint?(sql)
 
   defp releases_savepoint?(sql) when is_binary(sql) do
-    head = sql |> String.trim_leading() |> String.slice(0, 7) |> String.downcase()
-    String.starts_with?(head, "release")
+    String.starts_with?(lead(sql, 7), "release")
   end
 
   # A plain `ROLLBACK` [TRANSACTION] discards the whole transaction — nothing is left to flush, so
@@ -608,9 +605,9 @@ defmodule Fathom.ShardExecutor do
   # exactly Django's nested-atomic-raises-then-outer-commit shape. When in doubt, KEEP the flag:
   # keeping over-bumps (safe), clearing loses data.
   defp rolls_back?(sql) when is_binary(sql) do
-    lead = sql |> String.trim_leading() |> String.slice(0, 40) |> String.downcase()
+    head = lead(sql, 40)
 
-    String.starts_with?(lead, "rollback") and not String.contains?(lead, " to ")
+    String.starts_with?(head, "rollback") and not String.contains?(head, " to ")
   end
 
   # The assignment form (`pragma [db.]name = value`) of a header-writing pragma; the
@@ -952,11 +949,7 @@ defmodule Fathom.ShardExecutor do
 
   # Leading-keyword EXPLAIN detection for describe/2 (only ever called with binary sql).
   defp explain?(sql) do
-    sql
-    |> String.trim_leading()
-    |> String.slice(0, 7)
-    |> String.downcase()
-    |> String.starts_with?("explain")
+    String.starts_with?(lead(sql, 7), "explain")
   end
 
   # --- migration capture (template shard only) ---
@@ -1296,12 +1289,21 @@ defmodule Fathom.ShardExecutor do
   # Hot path: this runs on every statement, so the common case (a statement starting with a
   # letter) costs one extra 2-byte match over the previous `trim_leading`. Only a statement
   # that actually opens with a comment pays the scan.
-  defp lead(sql, n), do: sql |> strip_lead_comments() |> String.slice(0, n) |> String.downcase()
+  defp lead(sql, n), do: sql |> strip_lead_noise() |> String.slice(0, n) |> String.downcase()
 
-  defp strip_lead_comments(sql) do
+  # Normalize the FRONT of a statement to the first byte SQLite's parser will actually run:
+  # strip, in a loop, insignificant leading whitespace, both SQL comment forms, AND empty
+  # statements (a bare `;` — `ecmd ::= SEMI` in SQLite's grammar, so `;PRAGMA …` parses and RUNS
+  # the pragma). Every head classifier and every authorization gate keys on this one function
+  # (via `lead/2` or directly), so a prefix trick cannot be seen through by one classifier and
+  # missed by another — the defect class of expert review 2026-08-20 #19, 2026-08-24 #1, and
+  # 2026-09-05 #1. The last was the leading `;`, verified by execution: `;PRAGMA
+  # max_page_count=777` ran the pragma while the gate saw head ";pragma" and matched nothing.
+  defp strip_lead_noise(sql) do
     case String.trim_leading(sql) do
-      "/*" <> rest -> rest |> after_delim("*/") |> strip_lead_comments()
-      "--" <> rest -> rest |> after_delim("\n") |> strip_lead_comments()
+      "/*" <> rest -> rest |> after_delim("*/") |> strip_lead_noise()
+      "--" <> rest -> rest |> after_delim("\n") |> strip_lead_noise()
+      ";" <> rest -> strip_lead_noise(rest)
       other -> other
     end
   end
@@ -1409,12 +1411,66 @@ defmodule Fathom.ShardExecutor do
       String.starts_with?(head, "pragma") ->
         blocked_pragma(sql)
 
+      # EXPLAIN [QUERY PLAN] <inner>: SQLite runs the inner statement's PARSE-TIME pragmas (every
+      # PragTyp_FLAG, synchronous, locking_mode, wal_autocheckpoint, hard_heap_limit, …) during
+      # `sqlite3_prepare`, BEFORE the VDBE it then merely lists — so `EXPLAIN PRAGMA
+      # synchronous=OFF` sets it, and `EXPLAIN PRAGMA query_only=OFF` flips a :ro handle's only
+      # guard. Re-run the gate on the inner statement (recursively, so a nested EXPLAIN or
+      # `EXPLAIN QUERY PLAN` is covered). EXPLAIN of a DML genuinely does NOT execute it, so this
+      # touches only the blocked-verb / pragma gate, never the read/write classifiers (expert
+      # review 2026-09-05 #2, verified by execution).
+      String.starts_with?(head, "explain") ->
+        case explain_inner(sql) do
+          {:ok, inner} -> blocked_statement(inner)
+          :not_explain -> nil
+        end
+
       true ->
         nil
     end
   end
 
   defp blocked_statement(_sql), do: nil
+
+  # Strip a leading `EXPLAIN` (and an optional `QUERY PLAN`), returning `{:ok, inner}`; return
+  # `:not_explain` when the head only looks like the keyword (an identifier that starts with
+  # those bytes, e.g. `EXPLAINX`). The inner keeps its own leading noise — the recursive
+  # `blocked_statement/1` re-normalizes it.
+  defp explain_inner(sql) do
+    case take_word(strip_lead_noise(sql), "explain") do
+      {:ok, after_explain} -> {:ok, drop_query_plan(after_explain)}
+      :error -> :not_explain
+    end
+  end
+
+  defp drop_query_plan(sql) do
+    with {:ok, after_query} <- take_word(strip_lead_noise(sql), "query"),
+         {:ok, after_plan} <- take_word(strip_lead_noise(after_query), "plan") do
+      after_plan
+    else
+      :error -> sql
+    end
+  end
+
+  # `bin` begins with `word` (case-insensitive) followed by a token boundary — SQLite whitespace
+  # or end-of-input. Returns {:ok, rest_after_word} or :error. The boundary check is what keeps
+  # `EXPLAINX` (one identifier token to SQLite) from being read as the EXPLAIN keyword.
+  defp take_word(bin, word) do
+    wlen = byte_size(word)
+
+    case bin do
+      <<candidate::binary-size(^wlen), rest::binary>> ->
+        if String.downcase(candidate) == word and word_boundary?(rest),
+          do: {:ok, rest},
+          else: :error
+
+      _ ->
+        :error
+    end
+  end
+
+  defp word_boundary?(""), do: true
+  defp word_boundary?(<<c, _::binary>>), do: c in [?\s, ?\t, ?\n, ?\r, ?\f, ?\v]
 
   # `PRAGMA [schema.]name = value` / `PRAGMA [schema.]name(value)` is an assignment;
   # `PRAGMA [schema.]name` alone is a read. SQLite accepts both setter forms, so both are
@@ -1443,7 +1499,7 @@ defmodule Fathom.ShardExecutor do
   defp blocked_pragma(sql) do
     rest =
       sql
-      |> strip_lead_comments()
+      |> strip_lead_noise()
       |> String.slice(6..-1//1)
       |> String.trim_leading()
 
