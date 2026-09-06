@@ -25,6 +25,17 @@ defmodule Fathom.Migrator do
   # sweeps below filter candidates against jobs already in these states before inserting.
   @unique_states ~w(scheduled available executing retryable suspended)
 
+  # yank/1 cancels every NOT-YET-STARTED forward job, but deliberately NOT `executing` (expert
+  # review 2026-09-05 #22): an Oban cancel of an executing job is a brutal Task.Supervisor exit,
+  # and the job process does not trap exits, so its copy `after` (which releases the lease) never
+  # runs — the lease is stranded to its TTL, the temp files leak, the row stays `migrating` until
+  # the 1 h reclaim, and a kill between the fenced flush and the cutover leaves the live object at
+  # the yanked version with a stale directory stamp. Let an executing job COMPLETE cleanly instead
+  # (it already holds the lease and fetched its chain); if it cuts over to the yanked version it is
+  # the ordinary "completed in the yank window" strand the revert_stranded belt and status.above_head
+  # (#19) converge/surface.
+  @yank_cancel_states @unique_states -- ["executing"]
+
   # The trailing window `status/0` measures the rollout rate over (expert review 2026-08-01 #43).
   # One hour because that is `ReconcileJob`'s own cron period: a shorter window reads zero for
   # most of every hour (the sweep enqueues in one burst then goes quiet), which would render the
@@ -574,18 +585,15 @@ defmodule Fathom.Migrator do
       release ->
         {:ok, _} = release |> Ecto.Changeset.change(yanked: true) |> Repo.update()
 
-        # ALL live states, including executing/suspended (expert review round-2 #22):
-        # an executing job already fetched its statements, so it would keep running
-        # past the yank, fence, and cut the shard over to the yanked version AFTER
-        # revert/3 read shards_at_version — stranding it (schema_version > head means
-        # no laggard sweep ever sees it). Cancelling an executing job kills it, and
-        # the migration aborts safely: the lease is released in the copy's `after`,
-        # and no cutover has happened yet. The ReconcileJob's stranded sweep is the
-        # belt for any job that completes in the cancel's race window.
+        # Cancel every NOT-YET-STARTED forward job to this version (`@yank_cancel_states`), but NOT
+        # an `executing` one — see that attribute. Round-2 #22 cancelled executing too on the
+        # reasoning "the copy's `after` releases the lease and no cutover has happened yet", but an
+        # Oban cancel of an executing job is a brutal exit that SKIPS the `after`; letting it complete
+        # cleanly and relying on revert_stranded + status.above_head (#19) is the correct handling.
         Oban.cancel_all_jobs(
           from(j in Job,
             where: j.worker == "Fathom.Migrator.ShardMigrationJob",
-            where: j.state in @unique_states,
+            where: j.state in @yank_cancel_states,
             where: fragment("(?->>'target')::bigint = ?", j.args, ^version)
           )
         )

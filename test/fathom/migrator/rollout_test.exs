@@ -230,17 +230,22 @@ defmodule Fathom.Migrator.RolloutTest do
       assert Migrator.head() == 2, "a canary revert must be able to keep the release live"
     end
 
-    # Round-2 #22: yank excluded executing/suspended, so a job mid-copy (statements
-    # already fetched) survived the yank, fenced, and cut its shard over to the
-    # yanked version AFTER revert/3 read shards_at_version — stranding it above HEAD
-    # where no laggard sweep converges it. Cancelling an executing job kills it
-    # safely: the copy's `after` releases the lease and no cutover has happened.
-    test "yank cancels EXECUTING forward jobs targeting the version" do
+    # Expert review 2026-09-05 #22 REVERSES round-2 #22's decision to cancel executing jobs. An Oban
+    # cancel of an executing job is a brutal Task.Supervisor exit — the non-trapping job process
+    # never runs its copy `after`, so the lease leaks to its TTL, the temp files leak, the row stays
+    # `migrating` for the 1 h reclaim, and a kill between the fenced flush and the cutover strands the
+    # object at the yanked version with a stale directory stamp. So yank must LEAVE an executing job
+    # to complete cleanly; the completed-in-the-window strand is the ordinary case revert_stranded +
+    # status.above_head (#19) handle. This test previously asserted the OPPOSITE, on a FAKE
+    # `executing` state (a bare Repo.update_all, no running Task) that could not exercise the brutal
+    # kill it claimed was safe.
+    test "yank does NOT cancel an executing forward job (it completes cleanly), only pending ones" do
       {:ok, _} = Migrator.release(2, "bad", ["SELECT 1"])
       {:ok, _} = Directory.resolve("e")
-      assert {:ok, 1} = Migrator.rollout()
+      {:ok, _} = Directory.resolve("p")
+      assert {:ok, 2} = Migrator.rollout()
 
-      # The job dequeues (executing) just before the yank.
+      # 'e' is mid-copy (executing) just before the yank; 'p' is still pending.
       {1, _} =
         Repo.update_all(
           from(j in Oban.Job,
@@ -252,14 +257,25 @@ defmodule Fathom.Migrator.RolloutTest do
 
       assert :ok = Migrator.yank(2)
 
-      assert [%{state: "cancelled"}] =
+      # The executing job is LEFT to complete cleanly (so its `after` releases the lease).
+      assert [%{state: "executing"}] =
                Repo.all(
                  from(j in Oban.Job,
                    where: j.worker == "Fathom.Migrator.ShardMigrationJob",
                    where: fragment("?->>'shard_id' = 'e'", j.args)
                  )
                ),
-             "an executing forward job must be cancelled by the yank, not left to cut over"
+             "a brutal cancel would skip the copy's `after` and leak the lease — let it finish"
+
+      # A not-yet-started job to the yanked version is still cancelled.
+      assert [%{state: "cancelled"}] =
+               Repo.all(
+                 from(j in Oban.Job,
+                   where: j.worker == "Fathom.Migrator.ShardMigrationJob",
+                   where: fragment("?->>'shard_id' = 'p'", j.args)
+                 )
+               ),
+             "a pending forward job to the yanked version must still be cancelled"
     end
 
     # Round-2 #22 (the belt): a migration that completed IN the yank-cancel race
