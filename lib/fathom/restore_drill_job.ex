@@ -273,17 +273,25 @@ defmodule Fathom.RestoreDrillJob do
     status =
       try do
         case Storage.pull_snapshot(id, snapshot_id, tmp) do
+          # Same sentinel/absent distinction as `verify/2`: `{:absent, etag}` is a placeholder,
+          # `{:absent, nil}` a true absence. The old `{:ok, _}` + missing-temp -> `:absent` branch
+          # was dead (sentinels come back `{:absent, etag}`), and BOTH `{:absent, _}` shapes fell
+          # through to the `_ -> :error` catch-all — so a legitimately absent snapshot alerted as
+          # `:error`. Match the shapes explicitly (the callback's success typing is exactly these,
+          # so no catch-all — dialyzer would flag one as unreachable).
+          {:absent, etag} when is_binary(etag) ->
+            :sentinel
+
+          {:absent, nil} ->
+            :absent
+
           {:ok, _} ->
-            if File.exists?(tmp) do
-              case Shard.verify_integrity(tmp) do
-                :ok -> :ok
-                {:error, _} -> :corrupt
-              end
-            else
-              :absent
+            case Shard.verify_integrity(tmp) do
+              :ok -> :ok
+              {:error, _} -> :corrupt
             end
 
-          _ ->
+          {:error, _reason} ->
             :error
         end
       rescue
@@ -316,22 +324,25 @@ defmodule Fathom.RestoreDrillJob do
 
     try do
       case Storage.pull(id, tmp) do
-        # No bytes written — a never-flushed brand-new tenant, a lost object, or a steal
-        # sentinel (expert review 2026-08-01 #24; a sentinel used to read as a healthy pull
-        # of an empty database, so the drill passed on nothing).
-        {:absent, _} ->
+        # A steal-time brand-new sentinel at the data key: a stealer's `touch_object` planted a
+        # placeholder because the shard was never flushed, so the "backup" is not data. S3 maps
+        # `{:sentinel, _} -> {:absent, etag}` (s3.ex:299-300), so an etag WITH no bytes written is
+        # the sentinel; a true absence carries `nil` (s3.ex:306, local.ex:37). This USED to key on
+        # `{:ok, etag}` + a missing temp — a branch unreachable since expert review 2026-08-01 #24
+        # flipped that mapping, so every stranded sentinel was silently folded into the benign
+        # `:absent` below and never surfaced in `last_verify_status`, telemetry or logs.
+        {:absent, etag} when is_binary(etag) ->
+          :sentinel
+
+        # No stored object at all — a never-flushed brand-new tenant, or a lost object.
+        {:absent, nil} ->
           :absent
 
         {:ok, _etag} ->
-          # A sentinel writes NO local file (Storage.pull maps {:sentinel,_} -> {:ok, etag}); a real
-          # object does. So {:ok, etag} + a missing temp is a sentinel-at-data-key.
-          if File.exists?(tmp) do
-            case Shard.verify_integrity(tmp) do
-              :ok -> check_schema(id, tmp, schema_version)
-              {:error, _reason} -> :corrupt
-            end
-          else
-            :sentinel
+          # `{:ok, etag}` means bytes were written, so the temp exists; no File.exists? guard.
+          case Shard.verify_integrity(tmp) do
+            :ok -> check_schema(id, tmp, schema_version)
+            {:error, _reason} -> :corrupt
           end
 
         {:error, reason} ->

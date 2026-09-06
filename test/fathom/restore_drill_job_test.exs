@@ -11,7 +11,12 @@ defmodule Fathom.RestoreDrillJobTest do
 
   alias Fathom.{Directory, RestoreDrillJob, ShardExecutor, Shards}
   alias Fathom.Directory.Shard, as: DirShard
+  alias Fathom.Shard.Storage
+  alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.S3EtagStore
   alias Filo.Stmt
+
+  @sentinel_meta "x-amz-meta-fathom-sentinel"
 
   setup do
     id = "drill_#{System.unique_integer([:positive])}"
@@ -31,6 +36,45 @@ defmodule Fathom.RestoreDrillJobTest do
 
   defp restore(k, nil), do: Application.delete_env(:fathom, k)
   defp restore(k, v), do: Application.put_env(:fathom, k, v)
+
+  # Point the storage backend at the S3EtagStore HTTP mock so the REAL S3 backend runs. A steal
+  # sentinel is an S3-only concept (Local never returns {:absent, etag}, storage_contract.ex:39),
+  # so this is the only way to plant one — via the steal path, exactly as s3_sentinel_test does.
+  defp start_s3_store(objects) do
+    store = start_supervised!({Agent, fn -> S3EtagStore.initial(objects) end})
+    prev_s3 = Application.get_env(:fathom, S3)
+    prev_backend = Application.get_env(:fathom, :shard_storage)
+
+    Application.put_env(:fathom, S3,
+      bucket: "b",
+      region: "us-east-1",
+      access_key_id: "k",
+      secret_access_key: "s",
+      endpoint: "https://s3.example",
+      path_style: true,
+      req_plug: fn conn -> S3EtagStore.serve(conn, store) end
+    )
+
+    Application.put_env(:fathom, :shard_storage, S3)
+
+    on_exit(fn ->
+      restore(:shard_storage, prev_backend)
+
+      if prev_s3,
+        do: Application.put_env(:fathom, S3, prev_s3),
+        else: Application.delete_env(:fathom, S3)
+    end)
+
+    store
+  end
+
+  defp dead_lock do
+    Storage.encode_lease(%{
+      owner: "dead@node#old",
+      epoch: 5,
+      expires_at_ms: Storage.now_ms() - Storage.steal_margin_ms() - 60_000
+    })
+  end
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
 
@@ -285,6 +329,30 @@ defmodule Fathom.RestoreDrillJobTest do
     assert {:ok, %{absent: 1}} = RestoreDrillJob.run_drill(10)
     assert_received {:drill, ^ref, :absent}
     assert fetch(id).last_verify_status == "absent"
+  end
+
+  # Expert review 2026-09-05 #33. Since expert review 2026-08-01 #24 the S3 backend maps a steal
+  # sentinel to `{:absent, etag}` (a true absence is `{:absent, nil}`), which made the drill's
+  # `{:ok, etag}` + missing-temp -> `:sentinel` branch UNREACHABLE — a stranded sentinel (a tenant's
+  # only copy lived on a node that died before its first flush) was silently recorded as the benign
+  # `:absent`. This drives the real S3 backend against the mock so the steal plants a genuine
+  # sentinel; pre-fix `run_drill` returns `%{absent: 1}`, post-fix `%{sentinel: 1}`.
+  test "a steal sentinel at the data key is :sentinel, not :absent (#33)", %{id: id} do
+    store = start_s3_store(%{"#{id}.lock" => dead_lock()})
+
+    assert {:ok, %{took_over: true}} = S3.acquire_lease(id, "stealer@node#2", 30_000)
+
+    assert S3EtagStore.meta_of(store, "#{id}.db")[@sentinel_meta] == "1",
+           "the steal must plant a sentinel at the data key"
+
+    {:ok, _} = Directory.resolve(id)
+
+    ref = attach()
+    assert {:ok, %{sentinel: 1}} = RestoreDrillJob.run_drill(10)
+    assert_received {:drill, ^ref, :sentinel}
+
+    assert fetch(id).last_verify_status == "sentinel",
+           "a stranded steal sentinel must be recorded as :sentinel, not the benign :absent"
   end
 
   test "a valid object whose user_version disagrees with the directory is :schema_mismatch",
