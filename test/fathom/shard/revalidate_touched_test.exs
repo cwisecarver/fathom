@@ -436,6 +436,48 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
     end)
   end
 
+  test "F (finding #6): a warm never-flushed copy whose OWN steal-touch planted a sentinel is ADOPTED, not quarantined",
+       %{shard: shard} do
+    # The shard was born locally against no stored object (the `-` sentinel sidecar) and never
+    # flushed; then the node crashed and restarted on the same disk. The store has NO data object,
+    # only a stale foreign lock — so acquire STEALS and the touch plants a SENTINEL over nothing
+    # (touch_pre_etag == nil). Pre-fix, both HEAD orderings read this as a fork and the only copy
+    # of the tenant's acked writes was quarantined while an EMPTY db was served. The fix (a
+    # :no_object warm-branch clause + an :orphaned self-touch clause) adopts the local copy and
+    # stamps the sentinel so the first flush If-Matches it. The Local/Faulty doubles cannot express
+    # this (no steal-touch, no sentinel), so it can only be reproduced over S3EtagStore.
+    local = build_db!("local-only")
+    data_key = "#{shard}.db"
+    # NO data object — just a dead lock, so the steal-touch creates a sentinel at the data key.
+    store = start_store(%{"#{shard}.lock" => dead_lock()})
+
+    # Warm copy carrying the "no stored object" provenance sentinel ("-").
+    place_warm(shard, local, "-")
+    attach_forked_telemetry(shard)
+    cnt = start_counters()
+    configure_s3(build_plug(store, data_key, cnt, []))
+
+    capture_log(fn ->
+      value = open_read(shard)
+
+      assert value == "local-only",
+             "the never-flushed local copy must be SERVED, not quarantined into an empty db"
+
+      assert forked_files(shard) == [],
+             "our own sentinel-over-nothing touch is not a fork — no quarantine"
+
+      refute_received {:forked, _}
+
+      # The sentinel the touch planted is now the provenance, so the first flush If-Matches it.
+      sentinel = S3EtagStore.etag_of(store, data_key)
+
+      assert File.read!(sidecar_path(shard)) == sentinel,
+             "the adopted sidecar is the sentinel etag, so the next flush fences on it"
+
+      drain(shard)
+    end)
+  end
+
   # ── post_lease_warm_check (non-takeover warm) ────────────────────────────────
 
   test "P1: a warm non-takeover open whose store object is unchanged serves the local copy (no re-pull)",

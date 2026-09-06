@@ -869,6 +869,19 @@ defmodule Fathom.Shard do
             write_etag_sidecar(path, post)
             {:ok, post}
 
+          # Finding #6: a never-flushed local shard carries the `-` (no object) sidecar. If this
+          # node crashed before this shard's first flush and restarted on the same disk, its OWN
+          # steal-touch planted a SENTINEL over an EMPTY store (`pre == nil` — there was no lineage
+          # to source), so `post` names that sentinel and there is no peer lineage to fork from.
+          # Adopt the local copy and stamp the sentinel, so the first flush If-Matches it. The
+          # sentinel is create-only (`If-None-Match: *`), so `pre == nil` cannot coexist with a peer
+          # lineage — a genuine foreign write gives the touch a non-nil source and misses this
+          # clause. Without it the tenant's acked, fsynced writes are quarantined and an EMPTY db is
+          # served on a same-node restart, on the one path where the disk is intact.
+          :no_object when is_nil(pre) ->
+            write_etag_sidecar(path, post)
+            {:ok, post}
+
           _ ->
             if quarantine_fork!(shard_id, path, :diverged) == :ok do
               repull(shard_id, path)
@@ -3452,10 +3465,22 @@ defmodule Fathom.Shard do
   # Provenance says "no stored object" and the store agrees — our own brand-new shard.
   defp resolve_fork(:no_object_confirmed, _shard_id, _path, _lease), do: false
 
-  # Provenance says "no stored object" but one exists: a peer created the lineage while we
-  # were down. Never serve or flush over it.
-  defp resolve_fork({:orphaned, _store_etag}, shard_id, path, _lease),
-    do: quarantine_fork!(shard_id, path, :orphaned) == :ok
+  # Provenance says "no stored object" but one exists: normally a peer created the lineage while we
+  # were down, so never serve or flush over it. The exception (finding #6): our OWN steal-touch,
+  # after a same-node crash before this shard's first flush, plants a SENTINEL over the empty store
+  # — so the "object that exists" is that sentinel, not a peer's data. `touch_pre_etag == nil` (the
+  # touch sourced nothing) and `touch_post_etag == store_etag` (the store holds exactly our touch's
+  # output) identify it; adopt the local copy rather than quarantine it into an empty re-pull. This
+  # mirrors the :diverged self-touch clause below, and is the ordering where `fork_evidence`'s HEAD
+  # ran AFTER the sentinel landed (the `:no_object` warm branch of `revalidate_touched` handles the
+  # HEAD-first ordering).
+  defp resolve_fork({:orphaned, store_etag}, shard_id, path, lease) do
+    if lease[:touch_pre_etag] == nil and lease[:touch_post_etag] == store_etag do
+      false
+    else
+      quarantine_fork!(shard_id, path, :orphaned) == :ok
+    end
+  end
 
   defp resolve_fork(:match, _shard_id, _path, _lease), do: false
   defp resolve_fork(:absent, _shard_id, _path, _lease), do: false
