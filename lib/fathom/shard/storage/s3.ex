@@ -2233,7 +2233,14 @@ defmodule Fathom.Shard.Storage.S3 do
   # own heartbeat, so the PUT is unconditional (no contention to fence).
 
   @impl true
-  def renew_heartbeat(owner, ttl_ms), do: renew_heartbeat(owner, ttl_ms, [])
+  # /2 keeps the two-element contract (the store clock is a /3-only concern — expert review
+  # 2026-09-05 #16), so it strips the third element /3 now carries. /3 does the work.
+  def renew_heartbeat(owner, ttl_ms) do
+    case renew_heartbeat(owner, ttl_ms, []) do
+      {:ok, hb, _store_now} -> {:ok, hb}
+      other -> other
+    end
+  end
 
   @impl true
   def renew_heartbeat(owner, ttl_ms, opts) do
@@ -2258,7 +2265,13 @@ defmodule Fathom.Shard.Storage.S3 do
            req(),
            [url: heartbeat_path(owner), body: Storage.encode_heartbeat(hb)] ++ timeouts
          ) do
-      {:ok, %{status: status}} when status in 200..299 -> {:ok, hb}
+      # Return the store's Date so the caller can detect OWNER-CLOCK SKEW (expert review
+      # 2026-09-05 #16). #13 fixed the reader (a stealer compares against S3's Date); this closes
+      # the owner side — `hb.expires_at_ms` was stamped from `Storage.now_ms()`, this node's wall
+      # clock, and a lagging clock makes a peer read the lease stealable while our own monotonic
+      # deadline still says :ok. `s3_date_ms/1` is `nil` when the header is absent/unparseable, and
+      # the caller then skips skew detection rather than guessing.
+      {:ok, %{status: status} = resp} when status in 200..299 -> {:ok, hb, s3_date_ms(resp)}
       {:ok, %{status: status}} -> {:error, {:s3_put_status, status}}
       {:error, reason} -> {:error, reason}
     end

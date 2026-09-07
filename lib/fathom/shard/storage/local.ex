@@ -851,8 +851,16 @@ defmodule Fathom.Shard.Storage.Local do
 
   @impl true
   # No I/O, so the #14 per-attempt budget is inapplicable — accepted and ignored so the two
-  # backends present one contract.
-  def renew_heartbeat(owner, ttl_ms, _opts), do: renew_heartbeat(owner, ttl_ms)
+  # backends present one contract. /3 carries the store clock as a third element for owner-clock
+  # skew detection (expert review 2026-09-05 #16); a single-clock backend reports its OWN now, i.e.
+  # zero skew, which is correct — there is no owner-vs-store divergence to represent in mix test
+  # (that is the #16 double's `:heartbeat_skew_ms` fault's job).
+  def renew_heartbeat(owner, ttl_ms, _opts) do
+    case renew_heartbeat(owner, ttl_ms) do
+      {:ok, hb} -> {:ok, hb, Storage.now_ms()}
+      err -> err
+    end
+  end
 
   @impl true
   def renew_heartbeat(owner, ttl_ms) do

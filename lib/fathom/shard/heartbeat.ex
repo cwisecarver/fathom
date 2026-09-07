@@ -378,15 +378,41 @@ defmodule Fathom.Shard.Heartbeat do
 
     state =
       case renew_within_cycle(state, now) do
-        {:ok, %{expires_at_ms: exp}} ->
+        {:ok, %{expires_at_ms: exp}, store_now} ->
           :telemetry.execute(
             [:fathom, :shard, :heartbeat, :renewed],
             %{count: 1},
             %{owner: state.owner}
           )
 
-          # Recovered — fresh expiry, lapse episode over.
-          %{state | expires_at_ms: exp, mono_deadline_ms: now + state.ttl_ms, lapsed: false}
+          renewed = %{state | expires_at_ms: exp}
+          skew = skew_ms(store_now)
+
+          # OWNER-CLOCK SKEW (expert review 2026-09-05 #16). #13 fixed the READER (a stealer compares
+          # exp against the store's Date); this is the OWNER, which stamped exp from its own wall
+          # clock. If that clock LAGS the store past the bound, a peer reading exp against the store's
+          # Date sees the lease stealable while our own monotonic deadline still says :ok — so
+          # self-lapse here, arming the write fence + revalidation BEFORE a peer is entitled to steal.
+          # mark_lapse ONLY on the transition, so a persistent skew does not churn the generation
+          # every cycle; while it persists we hold the deadline in the past without recovering.
+          if skew_forces_lapse?(skew, state.ttl_ms, state.renew_ms, Storage.steal_margin_ms()) do
+            lapsed = %{renewed | mono_deadline_ms: now - 1}
+
+            if state.lapsed do
+              lapsed
+            else
+              Logger.error(
+                "heartbeat owner clock lags the store for #{state.owner} by ~#{skew}ms " <>
+                  "(> ttl - renew - steal_margin); self-lapsing to arm the write fence before a " <>
+                  "peer treats the lease as stealable (expert review 2026-09-05 #16)"
+              )
+
+              mark_lapse(lapsed)
+            end
+          else
+            # Recovered — fresh expiry, lapse episode over.
+            %{renewed | mono_deadline_ms: now + state.ttl_ms, lapsed: false}
+          end
 
         {:error, reason} ->
           Logger.warning("heartbeat renew failed for #{state.owner}: #{inspect(reason)}")
@@ -395,6 +421,29 @@ defmodule Fathom.Shard.Heartbeat do
 
     publish_status(state)
     schedule_renew(state, now)
+  end
+
+  # Owner-behind-store skew in ms, or nil when the store did not state a clock (S3 Date absent).
+  # `now_ms/0` is this node's WALL clock — NOT the monotonic `now` do_renew uses for the deadline;
+  # the two are different clocks and must not be diffed.
+  defp skew_ms(nil), do: nil
+  defp skew_ms(store_now) when is_integer(store_now), do: store_now - Storage.now_ms()
+
+  @doc """
+  Whether an owner-behind-store clock skew is large enough to self-lapse (expert review #16).
+
+  Pure, and public for the boundary test. The owner renews every `renew_ms`, so at worst its stamped
+  `expires_at` is `renew_ms` old; a peer comparing it against the store's Date can steal once
+  `skew > ttl - renew_ms + steal_margin` (the worst case, just before a renew). Tripping at
+  `skew >= ttl - renew_ms - steal_margin` lapses with `2 * steal_margin` of headroom before that.
+  Only the owner-BEHIND direction (`skew > 0`) risks a steal; a degenerate config whose bound is
+  non-positive never trips, and an unknown (`nil`) skew never trips.
+  """
+  @spec skew_forces_lapse?(integer() | nil, pos_integer(), pos_integer(), non_neg_integer()) ::
+          boolean()
+  def skew_forces_lapse?(skew_ms, ttl_ms, renew_ms, steal_margin_ms) do
+    bound = ttl_ms - renew_ms - steal_margin_ms
+    is_integer(skew_ms) and bound > 0 and skew_ms >= bound
   end
 
   # RETRY INSIDE THE CYCLE, not across cycles (expert review 2026-08-26 #14).
@@ -424,7 +473,9 @@ defmodule Fathom.Shard.Heartbeat do
 
   defp attempt_renew(state, deadline, budget, attempts_left) do
     case Storage.renew_heartbeat(state.owner, state.ttl_ms, budget_ms: budget) do
-      {:ok, _} = ok ->
+      # 3-tuple: {:ok, heartbeat, store_now} (expert review 2026-09-05 #16 — the store clock rides
+      # along for owner-skew detection in do_renew/1).
+      {:ok, _, _} = ok ->
         ok
 
       {:error, _} = error ->

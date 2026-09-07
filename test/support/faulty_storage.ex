@@ -423,14 +423,28 @@ defmodule Fathom.Test.FaultyStorage do
     case Application.get_env(:fathom, :faulty_renew_heartbeat) do
       fun when is_function(fun, 1) ->
         case fun.(opts) do
-          :pass -> Local.renew_heartbeat(owner, ttl_ms, opts)
+          :pass -> with_skew(Local.renew_heartbeat(owner, ttl_ms, opts))
           forced -> forced
         end
 
       _ ->
-        Local.renew_heartbeat(owner, ttl_ms, opts)
+        with_skew(Local.renew_heartbeat(owner, ttl_ms, opts))
     end
   end
+
+  # `:heartbeat_skew_ms` models an owner whose WALL CLOCK lags the store by N ms (expert review
+  # 2026-09-05 #16): the store's Date reads N ms ahead of the owner's local now. Storage.Local uses
+  # ONE clock (owner and store both `now_ms`), so owner-vs-store skew is unrepresentable in mix test
+  # — this fault overrides the store-clock third element the /3 contract carries. Absent ⇒ zero
+  # skew (the delegated value is left untouched).
+  defp with_skew({:ok, hb, _store_now} = ok) do
+    case Application.get_env(:fathom, :heartbeat_skew_ms) do
+      n when is_integer(n) -> {:ok, hb, Fathom.Shard.Storage.now_ms() + n}
+      _ -> ok
+    end
+  end
+
+  defp with_skew(other), do: other
 
   @impl true
   def clear_heartbeat(owner), do: Local.clear_heartbeat(owner)

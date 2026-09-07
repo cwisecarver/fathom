@@ -357,11 +357,14 @@ defmodule Fathom.Shard.Storage do
   # eventually 503s its writes — reachable from ordinary pool contention, no partition required.
   #
   # A backend that does no I/O (Local) ignores it.
+  # The third success element is the STORE's clock (S3's `Date`, or the local now for a single-clock
+  # backend), for owner-clock skew detection (expert review 2026-09-05 #16); `nil` when the store
+  # did not state one. Only /3 carries it — /2's callers (test setup) keep the two-element shape.
   @callback renew_heartbeat(
               owner :: String.t(),
               ttl_ms :: pos_integer(),
               opts :: keyword()
-            ) :: {:ok, heartbeat()} | {:error, term()}
+            ) :: {:ok, heartbeat(), integer() | nil} | {:error, term()}
 
   # Versioned copies for blue/green migration: the live object stays
   # `<shard_id>`, and the migrator keeps prior versions under `<shard_id>@<version>`
@@ -843,10 +846,11 @@ defmodule Fathom.Shard.Storage do
 
   @doc """
   `renew_heartbeat/2` with a per-attempt budget: `opts[:budget_ms]` bounds one attempt's wire time.
-  See the callback (expert review 2026-08-26 #14).
+  See the callback (expert review 2026-08-26 #14). Returns the store's clock as the third element
+  for owner-skew detection (expert review 2026-09-05 #16).
   """
   @spec renew_heartbeat(String.t(), pos_integer(), keyword()) ::
-          {:ok, heartbeat()} | {:error, term()}
+          {:ok, heartbeat(), integer() | nil} | {:error, term()}
   def renew_heartbeat(owner, ttl_ms, opts),
     do: backend().renew_heartbeat(owner, ttl_ms, opts)
 

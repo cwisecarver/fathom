@@ -155,6 +155,61 @@ defmodule Fathom.Shard.HeartbeatTest do
     send(reader, :release)
   end
 
+  # Expert review 2026-09-05 #16: review #13 fixed the READER (a stealer compares a lock's exp
+  # against S3's Date); this closes the OWNER, which stamped exp from its own wall clock. A lagging
+  # owner clock makes a peer read the lease stealable while the owner's own monotonic deadline still
+  # says :ok. The owner now self-lapses when its clock lags the store past ttl - renew - steal_margin.
+  describe "owner-clock skew self-lapses the heartbeat (#16)" do
+    test "skew_forces_lapse? trips only owner-behind, past ttl - renew - steal_margin" do
+      # bound = 30_000 - 10_000 - 5_000 = 15_000
+      refute Heartbeat.skew_forces_lapse?(14_999, 30_000, 10_000, 5_000)
+      assert Heartbeat.skew_forces_lapse?(15_000, 30_000, 10_000, 5_000)
+      assert Heartbeat.skew_forces_lapse?(20_000, 30_000, 10_000, 5_000)
+      # Owner AHEAD of the store (negative skew) is not the steal direction.
+      refute Heartbeat.skew_forces_lapse?(-20_000, 30_000, 10_000, 5_000)
+      # Unknown skew (store stated no clock) never trips.
+      refute Heartbeat.skew_forces_lapse?(nil, 30_000, 10_000, 5_000)
+      # Degenerate config (bound <= 0) never trips.
+      refute Heartbeat.skew_forces_lapse?(1_000, 1_000, 10_000, 5_000)
+    end
+
+    # Behavioral, self-discriminating: the SAME renew path yields :ok with no skew and :not_valid
+    # once the store clock reads far ahead of the owner's (the :heartbeat_skew_ms double fault). A
+    # full pre-fix run cannot express this — pre-#16 renew_heartbeat/3 returns a 2-tuple with no
+    # store clock, so the double's fault is inert and there is nothing to detect (the "double cannot
+    # express the bug" class); the skew-vs-no-skew contrast here is the discriminator.
+    test "the owner self-lapses when its clock lags the store past the bound", %{pid: pid} do
+      gen = Heartbeat.generation()
+
+      # No skew (Local, one clock): a normal renew keeps the fence valid.
+      send(pid, :renew)
+      _ = :sys.get_state(pid)
+      assert Heartbeat.valid_for_write?(gen) == :ok
+
+      prev_storage = Application.get_env(:fathom, :shard_storage)
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+      # Store clock reads 60 s ahead of the owner's — far past the 15 s bound (ttl 30 / renew 10 /
+      # margin 5).
+      Application.put_env(:fathom, :heartbeat_skew_ms, 60_000)
+
+      on_exit(fn ->
+        Application.delete_env(:fathom, :heartbeat_skew_ms)
+
+        if prev_storage,
+          do: Application.put_env(:fathom, :shard_storage, prev_storage),
+          else: Application.delete_env(:fathom, :shard_storage)
+      end)
+
+      send(pid, :renew)
+      _ = :sys.get_state(pid)
+
+      assert Heartbeat.valid_for_write?(gen) == :not_valid,
+             "an owner whose clock lags the store past ttl - renew - steal_margin must self-lapse " <>
+               "so the write fence arms before a peer treats the lease as stealable"
+    end
+  end
+
   # Expert review #21: the local validity/lapse decisions used the wall clock, so a
   # backward clock step (NTP correction, VM live-migration) after a renewal inflated
   # perceived remaining validity — a genuine lapse (during which a peer with a correct
