@@ -187,32 +187,61 @@ defmodule Fathom.Shard.Storage.S3 do
     # in this self-test exercises DELETE, so probe both directions and refuse boot on either failure
     # (expert review 2026-09-05 #8). NOTE: this is what makes the boot answer "does the deployed
     # store support conditional DELETE?", which the module was never verified against a real bucket.
-    probe_delete_status!(
-      key,
-      [{"if-match", ~s("fathom-bogus-etag")}],
-      [412],
-      "conditional DELETE enforcement (a stale-etag release MUST be refused 412)"
-    )
+    #
+    # TEST-STORE ESCAPE HATCH (`:allow_weak_conditional_delete`, env
+    # SHARD_STORAGE_ALLOW_WEAK_CONDITIONAL_DELETE, DEFAULT OFF — prod stays strict). A store that does
+    # not implement conditional DELETE AT ALL — MinIO returns 204, ignoring `If-Match`, which also
+    # DELETES the probe object so the matching-etag probe below then fails "object vanished" — cannot
+    # pass this section, so a chaos rig built on MinIO could never boot after #8. When the flag is on,
+    # the WHOLE conditional-DELETE probe is skipped with a loud warning: the lock-release fence (#22)
+    # is genuinely NOT enforced by such a store, which is acceptable ONLY in a test rig and NEVER in
+    # production. Scenarios that do not exercise it (replication lineage #4/#12, commit-ack ownership
+    # #5, clock skew #16) are unaffected.
+    if allow_weak_conditional_delete?() do
+      Logger.warning(
+        "shard storage: SKIPPING the conditional-DELETE fence self-test — " <>
+          ":allow_weak_conditional_delete is on. The lock-release fence (#22) is NOT enforced by " <>
+          "this store (e.g. MinIO answers a conditional DELETE 204, not 412). Acceptable ONLY for a " <>
+          "test rig; NEVER set this in production."
+      )
 
-    case head_object(key) do
-      {:ok, real_etag, _sentinel?, _meta} when is_binary(real_etag) ->
-        probe_delete_status!(
-          key,
-          [{"if-match", real_etag}],
-          200..299,
-          "conditional DELETE with the matching etag MUST succeed (else every lock leaks)"
-        )
+      # The store ignores the precondition, so clean the probe object up unconditionally.
+      _ = Req.delete(req(), url: url_path(key))
+    else
+      probe_delete_status!(
+        key,
+        [{"if-match", ~s("fathom-bogus-etag")}],
+        [412],
+        "conditional DELETE enforcement (a stale-etag release MUST be refused 412)"
+      )
 
-      other ->
-        raise "shard storage fence self-test failed: the probe object vanished before the " <>
-                "conditional-DELETE probe (#{inspect(other)}) — refusing to boot (expert review #8)."
+      case head_object(key) do
+        {:ok, real_etag, _sentinel?, _meta} when is_binary(real_etag) ->
+          probe_delete_status!(
+            key,
+            [{"if-match", real_etag}],
+            200..299,
+            "conditional DELETE with the matching etag MUST succeed (else every lock leaks)"
+          )
+
+        other ->
+          raise "shard storage fence self-test failed: the probe object vanished before the " <>
+                  "conditional-DELETE probe (#{inspect(other)}) — refusing to boot (expert review #8)."
+      end
+
+      # The valid probe above already removed the object; this is a best-effort belt in case a store
+      # answered the probe 2xx without actually deleting.
+      _ = Req.delete(req(), url: url_path(key))
     end
 
-    # The valid probe above already removed the object; this is a best-effort belt in case a store
-    # answered the probe 2xx without actually deleting.
-    _ = Req.delete(req(), url: url_path(key))
     :ok
   end
+
+  # Test-store escape hatch for the conditional-DELETE probe above (expert review 2026-09-05 #8).
+  # DEFAULT OFF, so production refuses to boot on a store without conditional DELETE exactly as
+  # before; only a test rig on a limited store (MinIO) turns it on.
+  defp allow_weak_conditional_delete?,
+    do: Application.get_env(:fathom, :allow_weak_conditional_delete, false) == true
 
   defp probe_rotation!(key, label) do
     # The probe deliberately keeps its own HEAD-based verification (it is a boot-time

@@ -29,6 +29,11 @@ x-fathom-env: &fathom-env
   SHARD_STORAGE: s3
   S3_BUCKET: fathom-shards
   S3_PATH_STYLE: "true"
+  # MinIO does not implement conditional DELETE (a stale-etag If-Match DELETE answers 204, not the
+  # 412 the #8 boot fence requires), so the rig sets this to boot on MinIO. Prod leaves it UNSET —
+  # the guard refuses a store the lock-release fence (#22) cannot trust. The lock-release fence is
+  # degraded on this rig; scenarios here validate replication lineage/ack/skew, not that fence.
+  SHARD_STORAGE_ALLOW_WEAK_CONDITIONAL_DELETE: "${SHARD_STORAGE_ALLOW_WEAK_CONDITIONAL_DELETE:-true}"
   AWS_ACCESS_KEY_ID: fathom
   AWS_SECRET_ACCESS_KEY: fathom-secret
   SHARD_DATA_DIR: /data/shards

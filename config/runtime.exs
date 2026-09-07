@@ -144,6 +144,14 @@ case System.get_env("SHARD_STORAGE") do
     raise "SHARD_STORAGE must be \"s3\" or \"local\", got: #{inspect(other)}"
 end
 
+# TEST-STORE escape hatch for the boot fence's conditional-DELETE probe (expert review #8). A store
+# that does not implement conditional DELETE (MinIO answers a stale-etag If-Match DELETE 204, not
+# 412) cannot pass it, so the chaos rig sets this to boot on MinIO. NEVER set in production: the
+# guard exists to refuse a store the lock-release fence (#22) cannot trust. Default OFF ⇒ strict.
+if env_bool.("SHARD_STORAGE_ALLOW_WEAK_CONDITIONAL_DELETE") do
+  config :fathom, :allow_weak_conditional_delete, true
+end
+
 # Per-stream Hrana idle timeout (ms). Filo's default is 10s and fathom used to pass nothing, so
 # this was unreachable on a deployed release (expert review 2026-07-24 #22). It bounds CLIENT THINK
 # TIME inside an open transaction, not the server: a stream holds live transaction state, and
