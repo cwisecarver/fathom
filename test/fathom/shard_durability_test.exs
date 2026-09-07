@@ -530,6 +530,35 @@ defmodule Fathom.ShardDurabilityTest do
     ShardExecutor.close(conn)
   end
 
+  # Expert review 2026-09-05 #26: the same `:DOWN` clause used `reason != :normal`, which ALSO
+  # force-dirtied on `:noproc`. `:noproc` is what a checked-out caller's monitor delivers when the
+  # caller was ALREADY DEAD at grant (its `:checkout` sat behind a slow cold open); it never ran a
+  # statement, so nothing a drop could lose — and the spurious dirty makes a freshly-pulled clean
+  # shard log a `local_file_missing` alarm on its idle drop. The `:kill` test above passes with or
+  # without the exclusion (a `:kill` SHOULD bump), so this pins the reason that must NOT bump.
+  test "a :noproc connection death does NOT force-dirty (caller never ran a statement) (#26)",
+       %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, coordinator} = Shards.ensure(shard)
+    flush_now(coordinator)
+    refute dirty?(shard), "a flushed shard must be clean before the :noproc DOWN"
+
+    # A second checkout registers a monitored conn; `ref` is its key in `state.conns`. `conn` above
+    # stays open, so the coordinator cannot idle-stop between the DOWN and the assertion.
+    {:ok, ^coordinator, ref, _path} = Shards.checkout(shard)
+
+    # The EXACT message the monitor delivers when a checked-out caller was already dead at grant.
+    send(coordinator, {:DOWN, ref, :process, self(), :noproc})
+    _ = :sys.get_state(coordinator)
+
+    refute dirty?(shard),
+           "a :noproc death (caller already dead, never ran a statement) must not force the shard " <>
+             "dirty (pre-fix it did, and a brand-new shard then logged local_file_missing)"
+
+    ShardExecutor.close(conn)
+  end
+
   test "the durability flush is fenced: a lost lease self-fences instead of clobbering",
        %{shard: shard} do
     {:ok, conn} = ShardExecutor.open(shard)

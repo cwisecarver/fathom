@@ -1659,7 +1659,18 @@ defmodule Fathom.Shard do
     # (unflushed? is true) rather than drop_clean deleting the possibly-uncounted committed
     # write (expert review 2026-07-14 #14). Zero per-statement cost (fires only on stream
     # death); over-dirtying is the documented safe direction — an extra flush, never lost data.
-    if reason != :normal and Map.has_key?(state.conns, ref), do: WriteCounter.bump(state.id)
+    # `reason != :normal` used to fire here, which ALSO force-dirtied on `:noproc` — and `:noproc`
+    # means the caller was ALREADY DEAD when its checkout was granted (its monitor fired immediately,
+    # behind a slow `handle_continue(:open)`), so it never ran a statement on this grant and there is
+    # nothing a `drop_clean` could lose. Bumping there marks a freshly-pulled, CLEAN shard dirty,
+    # whose idle drop then logs a spurious `local_file_missing` error — an alert meant to signal a
+    # stranded lease. Exclude `:noproc`; keep the bump for a genuine mid-request death (`:killed`, an
+    # exception, or a `:shutdown` that could have landed between commit and bump — the safe,
+    # over-dirty direction). (expert review 2026-09-05 #26; the Filo-side half — HTTP streams
+    # `trap_exit` so they check in on a supervisor stop, removing the `:shutdown` over-dirty on
+    # rolling deploys — lands in the Filo repo.)
+    if reason not in [:normal, :noproc] and Map.has_key?(state.conns, ref),
+      do: WriteCounter.bump(state.id)
 
     stop_when_drained(release(state, ref))
   end
