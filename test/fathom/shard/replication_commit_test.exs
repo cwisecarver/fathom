@@ -147,6 +147,108 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     for {name, _} <- followers, do: await_wal(name, id, grown)
   end
 
+  # Expert review 2026-09-05 #5. `Session.commit` acked a quorum-durable write without asking
+  # whether this node still held the lease, so a zombie (VM/GC pause past the TTL) or an
+  # S3-partitioned owner that reached quorum on stale-epoch followers reported a write durable that
+  # the S3 etag fence then discarded — an acked write lost. The fix gates the ack on
+  # `Heartbeat.valid_for_write?(acquire_gen)` in HEARTBEAT MODE only.
+  #
+  # AGENTS.md § Testing: the coordinator has two liveness modes and the suite defaults to LEGACY
+  # (heartbeat_server: false). So this starts a Heartbeat FIRST and ASSERTS the mode took
+  # (`acquire_gen` is a non-nil integer) — a scenario that silently ran legacy would exercise the
+  # ungated path and look like coverage while being none. The `:not_valid` verdict is forged the
+  # only way that reaches it: a past `mono_deadline_ms` at the SAME generation (a different
+  # generation routes to `:revalidate`).
+  describe "the commit ack is gated on confirmed ownership (#5)" do
+    test "heartbeat mode refuses the ack when liveness is unconfirmed; legacy is ungated", ctx do
+      %{id: id, root: root} = ctx
+      followers = start_followers!(root, 3)
+
+      Application.put_env(:fathom, :replication_enabled, true)
+      Application.put_env(:fathom, :replication_quorum, 2)
+
+      Application.put_env(
+        :fathom,
+        :replication_followers,
+        for({_n, port} <- followers, do: {~c"127.0.0.1", port})
+      )
+
+      start_supervised!(Fleet)
+
+      # Heartbeat FIRST, so `Shards.checkout` opens the coordinator in HEARTBEAT mode.
+      owner = "n_#{System.unique_integer([:positive])}@test"
+      hb = start_supervised!({Fathom.Shard.Heartbeat, ttl_ms: 30_000, owner: owner})
+      _ = :sys.get_state(hb)
+
+      {:ok, coordinator, ref, path} = Shards.checkout(id)
+      on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+      {:ok, conn} = Connection.open(path)
+      on_exit(fn -> Connection.close(conn) end)
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+
+      wal = path <> "-wal"
+      for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0, 0)
+
+      # ASSERT THE MODE TOOK. A nil here means legacy, and this test would exercise the ungated path.
+      gen = Fathom.Shard.acquire_gen(coordinator)
+
+      assert is_integer(gen),
+             "the coordinator opened in LEGACY mode — this test is not exercising the heartbeat gate"
+
+      # A confirmed-live owner acks normally.
+      assert :ok = Session.commit(id, wal, coordinator)
+
+      # The zombie: still reaching quorum, but no longer entitled to call a write durable.
+      :sys.replace_state(hb, fn s ->
+        Fathom.Shard.Heartbeat.publish_status(%{
+          s
+          | mono_deadline_ms: System.monotonic_time(:millisecond) - 1
+        })
+      end)
+
+      assert Fathom.Shard.Heartbeat.valid_for_write?(gen) == :not_valid
+
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
+
+      assert {:error, :ownership_unconfirmed} = Session.commit(id, wal, coordinator),
+             "a commit whose owner cannot confirm the lease must NOT ack a quorum-durable write " <>
+               "(pre-fix this returned :ok)"
+    end
+
+    test "legacy mode (no heartbeat started) leaves the ack ungated", ctx do
+      %{id: id, root: root} = ctx
+      followers = start_followers!(root, 3)
+
+      Application.put_env(:fathom, :replication_enabled, true)
+      Application.put_env(:fathom, :replication_quorum, 2)
+
+      Application.put_env(
+        :fathom,
+        :replication_followers,
+        for({_n, port} <- followers, do: {~c"127.0.0.1", port})
+      )
+
+      start_supervised!(Fleet)
+
+      # No Heartbeat → legacy mode (acquire_gen nil), so the gate is a no-op and commits still ack.
+      {:ok, coordinator, ref, path} = Shards.checkout(id)
+      on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+      {:ok, conn} = Connection.open(path)
+      on_exit(fn -> Connection.close(conn) end)
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+
+      wal = path <> "-wal"
+      for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0, 0)
+
+      assert Fathom.Shard.acquire_gen(coordinator) == nil,
+             "expected legacy mode — no Heartbeat was started"
+
+      assert :ok = Session.commit(id, wal, coordinator)
+    end
+  end
+
   test "committing with nothing new ships nothing and still succeeds", ctx do
     %{id: id, root: root} = ctx
     followers = start_followers!(root, 3)

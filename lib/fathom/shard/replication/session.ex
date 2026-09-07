@@ -184,6 +184,11 @@ defmodule Fathom.Shard.Replication.Session do
        # see `Fathom.Shard.lineage/1`. 0 means "no claim", which is also what a coordinator with
        # replication off reports.
        lineage: 0,
+       # The coordinator's fence generation at open (expert review 2026-09-05 #5), resolved
+       # alongside `epoch`/`lineage` in `with_epoch/1` and cached with them (fixed for the
+       # coordinator's life in heartbeat mode). An integer gates the commit ack on
+       # `Heartbeat.valid_for_write?/1`; `nil` (legacy mode, no heartbeat) leaves the ack ungated.
+       acquire_gen: nil,
        # The WAL the last push shipped from, and that WAL's monotone ordinal (expert review
        # 2026-08-26 #2). Cached together so the coordinator is asked only when the salt CHANGES —
        # a WAL recreate, which is rare — because this sits on the tenant's synchronous commit path
@@ -282,13 +287,16 @@ defmodule Fathom.Shard.Replication.Session do
           {:ok, new_state, rejects} ->
             new_state = start_seeds(new_state, wal_path, rejects)
 
-            {:reply, :ok,
-             new_state
-             |> drain_late_replies(wal_path)
-             # A commit can SUCCEED on the quorum while a follower was refused by OUR OWN shipper.
-             # That follower is now behind with nothing scheduled to fix it, and the tenant saw
-             # `:ok` — so nothing anywhere looks wrong. This is the arm that matters.
-             |> arm_if_rejected(rejects)}
+            new_state
+            |> drain_late_replies(wal_path)
+            # A commit can SUCCEED on the quorum while a follower was refused by OUR OWN shipper.
+            # That follower is now behind with nothing scheduled to fix it, and the tenant saw
+            # `:ok` — so nothing anywhere looks wrong. This is the arm that matters.
+            |> arm_if_rejected(rejects)
+            # Gate the ack on confirmed ownership (expert review 2026-09-05 #5) — a zombie that
+            # reached quorum on stale-epoch followers must not report a write durable. See
+            # `ack_if_owned/1`.
+            |> ack_if_owned()
 
           :nothing ->
             {:reply, :ok, state}
@@ -505,8 +513,12 @@ defmodule Fathom.Shard.Replication.Session do
       # release, so it cannot order a replica against the stored object, whose position stamp
       # carries the monotonic lineage. A seed ships both. Read here rather than at seed time so it
       # costs one call per session, on the path that already pays one.
-      {:ok, epoch} -> {:ok, %{state | epoch: epoch, lineage: lineage_of(state)}}
-      {:error, reason} -> {:error, reason}
+      {:ok, epoch} ->
+        {:ok,
+         %{state | epoch: epoch, lineage: lineage_of(state), acquire_gen: acquire_gen_of(state)}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -517,6 +529,54 @@ defmodule Fathom.Shard.Replication.Session do
     Fathom.Shard.lineage(state.coordinator)
   catch
     :exit, _ -> 0
+  end
+
+  # The coordinator's fence generation, read once and cached beside `epoch` (expert review
+  # 2026-09-05 #5). `nil` in legacy mode (no heartbeat), which leaves the ack ungated. A dead
+  # coordinator would already have failed `with_epoch/1` above, so this only runs on a live one; the
+  # catch is belt-and-suspenders and degrades to legacy rather than crashing the commit.
+  defp acquire_gen_of(state) do
+    Fathom.Shard.acquire_gen(state.coordinator)
+  catch
+    :exit, _ -> nil
+  end
+
+  # Gate a quorum-durable commit ack on confirmed ownership (expert review 2026-09-05 #5).
+  #
+  # HEARTBEAT MODE ONLY: `Heartbeat.valid_for_write?/1` is a lock-free ETS read, so a zombie (VM/GC
+  # pause past the TTL) or S3-partitioned owner that reached quorum on stale-epoch followers is
+  # caught BEFORE it tells the tenant "committed" — an ack the S3 etag fence would then discard,
+  # losing a write reported quorum-durable. Anything but `:ok` (`:revalidate` — the fence generation
+  # moved — or `:not_valid`) refuses with a RETRYABLE `{:error, :ownership_unconfirmed}`, which
+  # `ShardExecutor` maps to a 503 the client retries against the successor. The safe direction only:
+  # it can refuse a commit this node should not ack, never wrongly ack one, and it never runs an
+  # inline S3 GET (the stronger `:revalidate` variant is out of scope).
+  #
+  # LEGACY MODE (`acquire_gen == nil`) is left ungated: `valid_for_write?/1` is a heartbeat-mode
+  # mechanism (a nil gen reads `:revalidate` and would spuriously gate every legacy commit), and
+  # prod runs heartbeat, so the deployed fleet is covered. Legacy's own last-verdict mechanism is a
+  # separate follow-up.
+  defp ack_if_owned(state) do
+    case state.acquire_gen do
+      gen when is_integer(gen) ->
+        case heartbeat_ok(gen) do
+          :ok -> {:reply, :ok, state}
+          _ -> {:reply, {:error, :ownership_unconfirmed}, state}
+        end
+
+      _ ->
+        {:reply, :ok, state}
+    end
+  end
+
+  # A dead heartbeat process must degrade, not crash the commit — mirrors `Fathom.Shard`'s
+  # `heartbeat_recheck/1`. When the heartbeat is down the coordinator's flush fence has already
+  # degraded to the legacy renew PUT, which IS the ownership proof in that mode, so acking here is
+  # the same safe direction.
+  defp heartbeat_ok(gen) do
+    Fathom.Shard.Heartbeat.valid_for_write?(gen)
+  catch
+    :exit, _ -> :ok
   end
 
   # The monotone ordinal for the WAL identified by `salt`, cached against that salt.
@@ -1110,7 +1170,12 @@ defmodule Fathom.Shard.Replication.Session do
   defp retry_after_seed(state, wal_path, deadline, why) do
     case ship(state, wal_path, state.epoch, deadline) do
       {:ok, new_state, rejects} ->
-        {:reply, :ok, drain_late_replies(start_seeds(new_state, wal_path, rejects), wal_path)}
+        # Same ownership gate as the primary commit path (expert review 2026-09-05 #5): a post-seed
+        # quorum is still only durable if this node still holds the lease.
+        new_state
+        |> start_seeds(wal_path, rejects)
+        |> drain_late_replies(wal_path)
+        |> ack_if_owned()
 
       :nothing ->
         {:reply, :ok, state}

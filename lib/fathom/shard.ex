@@ -267,6 +267,20 @@ defmodule Fathom.Shard do
   def lineage(pid) when is_pid(pid), do: GenServer.call(pid, :lineage)
 
   @doc """
+  This coordinator's fence GENERATION captured at open (heartbeat mode), or `nil` in legacy mode.
+
+  What `Fathom.Shard.Replication.Session` reads to gate a commit ack on
+  `Heartbeat.valid_for_write?/1` (expert review 2026-09-05 #5): a lock-free ETS read that refuses to
+  ack a quorum-durable commit when this node no longer confirms it holds the lease — the zombie /
+  S3-partitioned owner that reaches quorum on stale-epoch followers. Fixed for the coordinator's
+  life in heartbeat mode (`Fence.revalidate/2` preserves it), so Session reads it once and caches it
+  beside `epoch`. `nil` when the coordinator opened without a heartbeat; the caller leaves the ack
+  ungated there (legacy mode's own last-verdict mechanism is a separate follow-up).
+  """
+  @spec acquire_gen(pid()) :: integer() | nil
+  def acquire_gen(pid) when is_pid(pid), do: GenServer.call(pid, :acquire_gen)
+
+  @doc """
   The monotone ordinal for the WAL identified by `salt1` (expert review 2026-08-26 #2).
 
   Replaces `wal_gen` as the ordering component of a position. `wal_gen` is SQLite's `ckpt_seq`,
@@ -1375,6 +1389,10 @@ defmodule Fathom.Shard do
     do: {:reply, n, state}
 
   def handle_call(:lineage, _from, state), do: {:reply, 0, state}
+
+  # The fence generation captured at open, for Session's commit-ack ownership gate (expert review
+  # 2026-09-05 #5). `nil` in legacy mode. Read-only; never mutates state.
+  def handle_call(:acquire_gen, _from, state), do: {:reply, state.acquire_gen, state}
 
   # An unreadable WAL does not advance the ordinal — see `wal_ordinal/2`.
   def handle_call({:wal_ordinal, nil}, _from, state),
