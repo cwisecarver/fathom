@@ -9,6 +9,21 @@ defmodule Fathom.Migrator.ShardMigrationTest do
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.{Directory, Migrator}
 
+  # A data transform that rewrites VALUES in place — the class of change DDL cannot express, and
+  # whose revert is the leg expert review 2026-09-05 #28 found untested. Allowlisted per-test.
+  defmodule UppercaseName do
+    @moduledoc false
+    @behaviour Fathom.Migrator.Transform
+
+    @impl true
+    def run(conn, _shard_id) do
+      case Fathom.Shard.Connection.query(conn, "UPDATE app_thing SET name = upper(name)", []) do
+        {:ok, _} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
   @v2_statements [
     "ALTER TABLE app_thing ADD COLUMN created_at TEXT",
     "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0002_add_created_at', 'now')"
@@ -174,6 +189,45 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert {:ok, %{from: 2, to: 1}} = ShardMigration.revert(shard, 1)
 
     assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 2})
+  end
+
+  # Expert review 2026-09-05 #28: the migration gate requires forward + revert + cross-version for a
+  # transform-carrying version, but transforms were only tested FORWARD (Copy.migrate_chain). A
+  # transform rewrites VALUES in place — a change DDL cannot make — so its revert is a distinct
+  # property: the pointer-flip must restore the retained PRE-transform bytes, not the rewritten ones.
+  # This is a coverage/gate test (it pins existing behaviour; there is no bug being fixed), the
+  # transform half of the three-way requirement #11's directory-guard and #13's rollout tests cover
+  # for DDL.
+  test "reverting a transform-carrying version restores the pre-transform rows (#28)", %{
+    shard: shard
+  } do
+    seed_v1!(shard)
+    assert %{rows: [[1, "alice"]]} = query_live!(shard, "SELECT id, name FROM app_thing")
+
+    prev = Application.get_env(:fathom, :migration_transforms)
+    Application.put_env(:fathom, :migration_transforms, [UppercaseName])
+
+    on_exit(fn ->
+      if prev,
+        do: Application.put_env(:fathom, :migration_transforms, prev),
+        else: Application.delete_env(:fathom, :migration_transforms)
+    end)
+
+    {:ok, _} = Migrator.release(2, "v2 + uppercase", @v2_statements)
+    :ok = Migrator.attach_transform(2, UppercaseName)
+
+    assert {:ok, %{from: 1, to: 2}} = ShardMigration.run(shard, 2)
+
+    # Forward: the DDL added created_at AND the transform rewrote the values in place.
+    assert %{rows: [[1, "ALICE", nil]]} =
+             query_live!(shard, "SELECT id, name, created_at FROM app_thing")
+
+    # Revert to v1: a pointer-flip to the retained pre-transform copy.
+    assert {:ok, %{from: 2, to: 1}} = ShardMigration.revert(shard, 1)
+
+    # The transform's value rewrite is GONE (name back to 'alice') and the pre-transform rows are
+    # exactly as seeded — the property the three-way gate exists to guarantee for a Transform.
+    assert %{rows: [[1, "alice"]]} = query_live!(shard, "SELECT id, name FROM app_thing")
   end
 
   # Round-2 #9 (Critical): do_run fetched only statements(target) and stamped
