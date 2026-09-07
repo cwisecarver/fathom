@@ -829,6 +829,11 @@ defmodule Fathom.Shard.Replication.Session do
             # but resolved either way, so the coordinator's counter tracks reality regardless of
             # the gate and the object stamp can use it before the fleet is upgraded.
             wal_ordinal: ordinal,
+            # THE OWNERSHIP LINEAGE (expert review 2026-09-05 #4/#12), cached beside `epoch` by
+            # `with_epoch/1`. On the wire only while `Protocol.ordinal_wire?/0` is on (it rides the
+            # same `@push_ord_lin` frame as the ordinal). Lets the follower's `decide/2` fence on the
+            # monotonic lineage instead of the reset-prone lock epoch, and refresh a frozen lineage.
+            lineage: state.lineage,
             payload: Map.fetch!(by_range, {off, len})
           }}
        end, state}

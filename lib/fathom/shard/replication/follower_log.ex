@@ -78,6 +78,31 @@ defmodule Fathom.Shard.Replication.FollowerLog do
   @spec decide(t() | nil, Push.t()) :: decision()
   def decide(nil, _push), do: {:reject, :unknown_shard, 0}
 
+  # LINEAGE FENCE (expert review 2026-09-05 #4/#12), ABOVE the epoch fence and firing ONLY when both
+  # sides state a lineage (>0). Lineage is the MONOTONIC ownership counter; the lock epoch below is
+  # NOT (it resets to 1 on every clean release), so a legitimately reopened primary ships a LOWER
+  # epoch and the epoch fence would `:stale_epoch` it forever — a settled reject, i.e. FILO_NO_QUORUM
+  # on every write to that tenant until each Follower restarts (#12). A strictly HIGHER lineage is a
+  # new ownership regardless of the epoch; a strictly LOWER one is genuinely deposed. Equal lineage
+  # falls through to the epoch/salt/gen logic below (same ownership). An UNSTATED lineage (0 —
+  # push-lineage wire off, or a seed/peer that predates the field) skips these, so the epoch fence
+  # applies exactly as before: the default-off posture, and what `replication_test`'s epoch-only
+  # fence assertion pins.
+  def decide(%{lineage: mine}, %Push{lineage: pushed})
+      when is_integer(mine) and mine > 0 and is_integer(pushed) and pushed > 0 and pushed < mine do
+    # A lower ownership than ours: genuinely deposed. Offset 0 — it must re-acquire, not rewind.
+    {:reject, :stale_epoch, 0}
+  end
+
+  def decide(%{lineage: mine} = state, %Push{lineage: pushed} = push)
+      when is_integer(mine) and mine > 0 and is_integer(pushed) and pushed > 0 and pushed > mine do
+    # A NEW ownership (a genuine takeover, OR a reopen whose lock epoch reset to a lower value): its
+    # WAL is its own, so accept from the beginning of the new generation regardless of the lock
+    # epoch — THE #12 fix. `decide_fresh` refreshes lineage + carries the push's epoch and marks the
+    # replica torn until a seed rebuilds the `.db`/`-wal` pair.
+    decide_fresh(%{state | epoch: push.epoch}, push)
+  end
+
   def decide(%{epoch: epoch}, %Push{epoch: pushed}) when pushed < epoch do
     # A deposed primary still shipping. This is THE fence: the lease epoch is already fathom's
     # fencing token (Fathom.Shard.Storage), so a node that lost the lease and has not noticed yet
@@ -134,7 +159,16 @@ defmodule Fathom.Shard.Replication.FollowerLog do
   end
 
   def decide(%{next_offset: next} = state, %Push{offset: off} = push) when off == next do
-    {:append, %{merge_ordinal(state, push) | next_offset: next + byte_size(push.payload)}}
+    # Refresh lineage from the push too (expert review 2026-09-05 #4): within one coordinator's life
+    # it never changes, but the field used to be frozen at seed time, so a following replica whose
+    # primary reopened (advancing the object's lineage) reported a STALE lineage and `fresher?/2`
+    # ranked it below the object forever. `merge_lineage/2` never writes 0 over a known value.
+    {:append,
+     %{
+       merge_ordinal(state, push)
+       | next_offset: next + byte_size(push.payload),
+         lineage: merge_lineage(state, push)
+     }}
   end
 
   def decide(%{next_offset: next}, %Push{}) do
@@ -167,7 +201,12 @@ defmodule Fathom.Shard.Replication.FollowerLog do
          # generation's ordinal across the seam is precisely the unsound comparison #2 exists to
          # remove. An unstated ordinal lands here as 0, which `Promote.fresher?/2` refuses to rank,
          # so the replica falls back to the stored object rather than to a stale number.
-         wal_ordinal: stated_ordinal(push)
+         wal_ordinal: stated_ordinal(push),
+         # REFRESH LINEAGE from the push (expert review 2026-09-05 #4): a reopen/takeover advances
+         # the object's lineage, and this is the path a new-salt/new-ownership push takes — so the
+         # follower's lineage must move with it, not stay frozen at seed. Unstated keeps the current
+         # value (never 0 over a known lineage).
+         lineage: merge_lineage(state, push)
      }}
   end
 
@@ -190,6 +229,13 @@ defmodule Fathom.Shard.Replication.FollowerLog do
       n -> %{state | wal_ordinal: n}
     end
   end
+
+  # The lineage the push STATES, or the follower's current one when unstated — the push-lineage wire
+  # gate off, or a peer that predates the field (expert review 2026-09-05 #4/#12). Never write 0 over
+  # a known lineage, which would move a rankable replica back to "unknown" and, worse, disarm the
+  # lineage fence on the next push. A real lineage is always >= 1 (`Storage.next_lineage/1`).
+  defp merge_lineage(_state, %Push{lineage: n}) when is_integer(n) and n > 0, do: n
+  defp merge_lineage(state, _push), do: state.lineage
 
   @doc """
   State for a shard that has just been seeded from storage.

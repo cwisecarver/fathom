@@ -254,6 +254,10 @@ defmodule Fathom.Shard.Replication.PushOrdinalWireTest do
              "the commit path down fleet-wide for the length of a rolling upgrade — the cost the " <>
              "protocol's own comments record for exactly this decision. Add a TYPE CODE instead."
 
-    assert type == 15, "the ordinal push should be its own type code"
+    # 17 = @push_ord_lin since expert review 2026-09-05 #4/#12: the ordinal-wire push now carries the
+    # ownership lineage too (the two are only jointly useful), so it moved from @push_ord (15) to the
+    # combined @push_ord_lin (17). Still a NEW TYPE CODE at version 2 — the rolling-upgrade property
+    # this test pins is unchanged; only which code ordinal_wire emits moved.
+    assert type == 17, "the ordinal+lineage push should be its own type code (@push_ord_lin)"
   end
 end

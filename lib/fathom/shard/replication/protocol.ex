@@ -157,6 +157,21 @@ defmodule Fathom.Shard.Replication.Protocol do
   # state and keeps `@position`.
   @position_ord 16
 
+  # THE OWNERSHIP LINEAGE ON THE PUSH (expert review 2026-09-05 #4/#12). The seed already carries
+  # lineage (`@seed_begin_lin`); the PUSH did not, so a following replica's lineage froze at seed
+  # while the object advanced (#4), and `FollowerLog.decide/2` had only the lock epoch to fence on —
+  # which RESETS to 1 on every clean release, so a legitimately reopened primary was `:stale_epoch`'d
+  # forever (#12). `@push_ord_lin` is `@push_ord` plus a trailing 64-bit lineage: it carries BOTH the
+  # ordinal (which #4's promotion ranking needs) and the lineage (which the fence needs), because the
+  # two are only jointly useful — a replica with no ordinal is unrankable regardless of its lineage.
+  #
+  # Emitted under the SAME gate as `@push_ord` (`ordinal_wire?/0`, default FALSE): a peer one deploy
+  # behind answers `{:error, :malformed}` to this unknown code, so it stays opt-in until the code is
+  # everywhere. `@push_ord` is kept as a decode-only clause for a peer still emitting it. With the
+  # gate off, the push carries neither ordinal nor lineage, `decide/2` falls back to the epoch fence
+  # and `fresher?/2` refuses to rank — the pre-fix behaviour, inert not wrong.
+  @push_ord_lin 17
+
   # Which file a chunk belongs to. Explicit rather than splitting one byte stream at `db_size`,
   # so a chunk never straddles the boundary and the follower can assert it received exactly the
   # promised number of database bytes before the first WAL byte.
@@ -226,6 +241,13 @@ defmodule Fathom.Shard.Replication.Protocol do
     # means "not stated" — a primary that predates the field, or one whose ordinal gate is off —
     # and it encodes as 0, which `Promote.fresher?/2` must refuse to rank rather than read as a
     # zeroth generation.
+    # `lineage` is the monotonic OWNERSHIP counter (expert review 2026-09-05 #4/#12). Unlike the lock
+    # `epoch` above — which resets to 1 on every clean release, so a legitimately reopened primary
+    # ships a LOWER epoch and `FollowerLog.decide/2`'s epoch fence would reject it forever — lineage
+    # never resets, so it is the sound fence key. Delivered only on the seed until now; carrying it on
+    # the push lets `decide/2` fence on it and refresh a following replica's frozen lineage. `nil`
+    # means "not stated" (the push-lineage wire gate off, or a peer that predates the field) and
+    # encodes as 0, which `decide/2` and `Promote.fresher?/2` refuse to rank.
     defstruct [
       :shard_id,
       :epoch,
@@ -234,6 +256,7 @@ defmodule Fathom.Shard.Replication.Protocol do
       :offset,
       :payload,
       :wal_ordinal,
+      :lineage,
       prev_extent: 0
     ]
 
@@ -245,7 +268,8 @@ defmodule Fathom.Shard.Replication.Protocol do
             offset: non_neg_integer(),
             payload: binary(),
             prev_extent: non_neg_integer(),
-            wal_ordinal: non_neg_integer() | nil
+            wal_ordinal: non_neg_integer() | nil,
+            lineage: non_neg_integer() | nil
           }
   end
 
@@ -269,9 +293,12 @@ defmodule Fathom.Shard.Replication.Protocol do
       # signing is also on — the two gates are independent because they guard different things (a
       # rolling-upgrade window versus a distributed key).
       ordinal_wire?() ->
+        # `@push_ord_lin` = `@push_ord` + a trailing lineage (expert review 2026-09-05 #4/#12).
+        # Carries both under the one gate; an unset lineage encodes as 0, which `decide/2` and
+        # `fresher?/2` refuse to rank.
         frame = [
-          <<@version::8, @push_ord::8, byte_size(shard)::16, p.epoch::64, p.wal_gen::64,
-            p.salt1::64, p.offset::64, prev_extent(p)::64, wal_ordinal(p)::64>>,
+          <<@version::8, @push_ord_lin::8, byte_size(shard)::16, p.epoch::64, p.wal_gen::64,
+            p.salt1::64, p.offset::64, prev_extent(p)::64, wal_ordinal(p)::64, lineage(p)::64>>,
           shard,
           p.payload
         ]
@@ -302,6 +329,11 @@ defmodule Fathom.Shard.Replication.Protocol do
   # "unknown" case, not a zeroth generation.
   defp wal_ordinal(%Push{wal_ordinal: n}) when is_integer(n) and n >= 0, do: n
   defp wal_ordinal(_), do: 0
+
+  # 0 means "no lineage stated", exactly as `wal_ordinal/1` does — `FollowerLog.decide/2`'s lineage
+  # fence and `Promote.fresher?/2` both refuse to rank a 0 rather than read it as a zeroth ownership.
+  defp lineage(%Push{lineage: n}) when is_integer(n) and n >= 0, do: n
+  defp lineage(_), do: 0
 
   # 0 means "no statement about the previous generation", and it is deliberately the same value a
   # genuine zero carries. A generation in which nothing was ever shipped has no extent a follower
@@ -459,6 +491,13 @@ defmodule Fathom.Shard.Replication.Protocol do
   # the payload made the two sides compute different bytes and every signed ordinal frame came
   # back `{:error, :unauthenticated}`. The moduledoc above says the two "agree by construction";
   # they only do if this prefix length is right.
+  # 60 = @push_ord's 52 plus the trailing 8-byte lineage (expert review 2026-09-05 #4/#12). Same
+  # reasoning as @push_ord's clause: signing covers everything except the trailing opaque payload, so
+  # the prefix length must be exact or a signed @push_ord_lin verifies against the wrong bytes.
+  def signable(<<@version::8, @push_ord_lin::8, slen::16, _::binary>> = frame)
+      when byte_size(frame) >= 60 + slen,
+      do: binary_part(frame, 0, 60 + slen)
+
   def signable(<<@version::8, @push_ord::8, slen::16, _::binary>> = frame)
       when byte_size(frame) >= 52 + slen,
       do: binary_part(frame, 0, 52 + slen)
@@ -639,6 +678,30 @@ defmodule Fathom.Shard.Replication.Protocol do
   # ABOVE the `@push_ext` clause and matching its own type code, so the two never compete.
   # `wal_ordinal` is the trailing field; everything before it is byte-identical to `@push_ext`,
   # which is what makes this additive rather than a layout change.
+  # ABOVE the `@push_ord` clause and matching its own type code, so the two never compete. `lineage`
+  # is the trailing field; everything before it is byte-identical to `@push_ord`, which is what makes
+  # this additive (expert review 2026-09-05 #4/#12).
+  defp decode_frame(
+         <<@version::8, @push_ord_lin::8, slen::16, epoch::64, gen::64, salt::64, off::64,
+           prev::64, ord::64, lin::64, rest::binary>>
+       )
+       when byte_size(rest) >= slen do
+    <<shard::binary-size(^slen), payload::binary>> = rest
+
+    {:ok,
+     %Push{
+       shard_id: shard,
+       epoch: epoch,
+       wal_gen: gen,
+       salt1: salt,
+       offset: off,
+       payload: payload,
+       prev_extent: prev,
+       wal_ordinal: ord,
+       lineage: lin
+     }}
+  end
+
   defp decode_frame(
          <<@version::8, @push_ord::8, slen::16, epoch::64, gen::64, salt::64, off::64, prev::64,
            ord::64, rest::binary>>

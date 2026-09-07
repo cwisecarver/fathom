@@ -25,6 +25,9 @@ defmodule Fathom.Shard.ReplicationTest do
       epoch: Keyword.get(opts, :epoch, 7),
       wal_gen: Keyword.get(opts, :wal_gen, 3),
       offset: Keyword.get(opts, :offset, 4120),
+      # `lineage` defaults to nil ("not stated"), so every existing test exercises the epoch fence;
+      # the lineage-fence tests (#4/#12) pass it explicitly.
+      lineage: Keyword.get(opts, :lineage),
       payload: Keyword.get(opts, :payload, :binary.copy(<<0xAB>>, 4120))
     }
   end
@@ -37,6 +40,33 @@ defmodule Fathom.Shard.ReplicationTest do
                p |> Protocol.encode_push() |> IO.iodata_to_binary() |> Protocol.decode()
 
       assert decoded == p
+    end
+
+    test "with the ordinal wire on, a push carries ordinal AND lineage round-trip (#4/#12)" do
+      prev = Application.get_env(:fathom, :replication_ordinal_wire)
+      Application.put_env(:fathom, :replication_ordinal_wire, true)
+
+      on_exit(fn ->
+        if is_nil(prev),
+          do: Application.delete_env(:fathom, :replication_ordinal_wire),
+          else: Application.put_env(:fathom, :replication_ordinal_wire, prev)
+      end)
+
+      p = %Push{
+        shard_id: "acme",
+        epoch: 7,
+        wal_gen: 3,
+        salt1: 0,
+        offset: 4120,
+        wal_ordinal: 7,
+        lineage: 42,
+        payload: "hello"
+      }
+
+      assert {:ok, decoded} =
+               p |> Protocol.encode_push() |> IO.iodata_to_binary() |> Protocol.decode()
+
+      assert decoded == p, "the @push_ord_lin frame must round-trip ordinal AND lineage"
     end
 
     test "a shard id containing the delimiterless header bytes still decodes" do
@@ -145,6 +175,65 @@ defmodule Fathom.Shard.ReplicationTest do
     test "a deposed primary cannot land writes on the new owner" do
       state = FollowerLog.seeded(7, 3, 0, 4120)
       assert {:reject, :stale_epoch, 0} = FollowerLog.decide(state, push(epoch: 6))
+    end
+
+    # Expert review 2026-09-05 #12: the lock epoch RESETS to 1 on a clean release, so a legitimately
+    # reopened primary ships a LOWER epoch than a follower left holding from a prior crash-steal. The
+    # epoch fence above then :stale_epoch's it forever (a settled reject → FILO_NO_QUORUM on every
+    # write). Lineage is monotonic, so fencing on it instead accepts the reopen. Gated: these fire
+    # only when both sides state a lineage (>0); an unstated lineage keeps the epoch fence (the test
+    # above).
+    test "a reopened primary (reset lock epoch, higher lineage) is accepted, not fenced (#12)" do
+      # Seeded in ownership lineage 5 at lock epoch 2 (a crash-steal had bumped the epoch).
+      state = FollowerLog.seeded(2, 3, 11, 4120, 5)
+
+      # Cleanly released + reopened: lock epoch reset to 1, lineage advanced to 6, new WAL.
+      assert {:reset_then_append, new} =
+               FollowerLog.decide(
+                 state,
+                 push(epoch: 1, lineage: 6, wal_gen: 0, salt1: 22, offset: 0, payload: "abc")
+               ),
+             "pre-fix the epoch fence rejects this reopen as :stale_epoch (epoch 1 < 2) forever"
+
+      assert new.lineage == 6 and new.epoch == 1 and new.next_offset == 3
+      assert new.torn, "a new generation leaves the .db behind until a seed rebuilds the pair"
+    end
+
+    test "a lower-lineage push is fenced as deposed even when its lock epoch is higher (#12)" do
+      # Current ownership is lineage 6 (lock epoch happens to be 1 after a clean reopen).
+      state = FollowerLog.seeded(1, 3, 11, 4120, 6)
+
+      # A genuinely deposed old primary at lineage 5 — but its lock epoch is 9 (an earlier
+      # crash-steal). The epoch fence would ACCEPT it (9 > 1 → decide_fresh); the lineage fence
+      # correctly refuses it.
+      assert {:reject, :stale_epoch, 0} =
+               FollowerLog.decide(state, push(epoch: 9, lineage: 5)),
+             "the lineage fence must refuse a lower-lineage owner even with a higher lock epoch"
+    end
+
+    # Expert review 2026-09-05 #4: lineage used to be frozen at seed time — no decide/2 clause
+    # refreshed it — so a following replica whose primary reopened reported a stale lineage and
+    # Promote.fresher?/2 ranked it below the object forever. The accept paths now adopt a stated
+    # lineage, never clobbering a known one with 0.
+    test "a follower adopts a stated lineage it lacked, and unstated pushes keep it (#4)" do
+      # A recovered/legacy follower with no lineage (0).
+      state = FollowerLog.seeded(2, 3, 11, 4120, 0)
+
+      assert {:append, new} =
+               FollowerLog.decide(
+                 state,
+                 push(epoch: 2, wal_gen: 3, salt1: 11, offset: 4120, lineage: 5, payload: "z")
+               )
+
+      assert new.lineage == 5, "the follower must adopt the lineage the push states"
+
+      assert {:append, kept} =
+               FollowerLog.decide(
+                 new,
+                 push(epoch: 2, wal_gen: 3, salt1: 11, offset: 4121, lineage: nil, payload: "q")
+               )
+
+      assert kept.lineage == 5, "an unstated (nil/0) lineage must never clobber a known one"
     end
 
     test "a new epoch resets, and only from the start of its WAL" do
