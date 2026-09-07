@@ -133,6 +133,19 @@ defmodule Fathom.Telemetry do
           "Cold opens that promoted a newer local replica over the stored object (A2). Each one " <>
             "recovered writes the last flush did not have, and snapshotted what it replaced"
       ),
+      # The off-process previous-incarnation recheck's outcome (expert review 2026-09-05 #25).
+      # Tagged by `result` (a bounded set: :cleared | :live | :absent), never by owner. `:live` is
+      # the one to alert on — a predecessor's heartbeat is being RENEWED while this node booted on
+      # the same data dir (a persisted/remounted volume shared with a live node), the split-brain
+      # risk the recheck refuses to clear.
+      counter("fathom.shard.heartbeat.prev_incarnation_recheck.count",
+        event_name: [:fathom, :shard, :heartbeat, :prev_incarnation_recheck],
+        tags: [:result],
+        description:
+          "Outcome of the off-process recheck of a previous incarnation's heartbeat on a fast " <>
+            "restart: :cleared (dead predecessor, lock freed), :live (a live node shares this " <>
+            "data dir — split-brain risk, NOT cleared), or :absent (gone/unreadable)"
+      ),
       # NO `source` TAG, though the event carries one. A node_key is bounded by fleet size today
       # and would be a legitimate label — but the number an operator acts on is "did any shard have
       # to reach across the fleet to recover", and splitting it by source only makes the alert
