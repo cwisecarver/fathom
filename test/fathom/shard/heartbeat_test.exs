@@ -34,6 +34,26 @@ defmodule Fathom.Shard.HeartbeatTest do
     %{pid: pid, owner: owner}
   end
 
+  # The {:clear_previous_incarnation, …} recheck runs OFF-PROCESS since expert review 2026-09-05 #25
+  # (it must not block the liveness loop), so a synchronous :sys.get_state no longer sees its effect.
+  # Await its telemetry instead. Filtered on the owner (the event is global).
+  defp attach_recheck do
+    ref = make_ref()
+    test = self()
+
+    :telemetry.attach(
+      {__MODULE__, ref},
+      [:fathom, :shard, :heartbeat, :prev_incarnation_recheck],
+      fn _e, _m, %{owner: owner, result: result}, _ ->
+        send(test, {:recheck, ref, owner, result})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach({__MODULE__, ref}) end)
+    ref
+  end
+
   test "writes a fresh heartbeat on start and reports generation 0", %{owner: owner} do
     assert {:ok, %{owner: ^owner, expires_at_ms: exp}} = Storage.read_heartbeat(owner)
     assert exp > System.system_time(:millisecond)
@@ -88,6 +108,51 @@ defmodule Fathom.Shard.HeartbeatTest do
     end)
 
     assert Heartbeat.valid_for_write?(0) == :not_valid
+  end
+
+  # Expert review 2026-09-05 #25: the scheduled {:clear_previous_incarnation, …} handler did
+  # unbounded storage I/O (read_heartbeat + clear_heartbeat) INLINE in this liveness process, so a
+  # slow/partitioned store held it past the TTL while :renew waited in the mailbox — expiring the
+  # heartbeat and letting peers steal every shard the node opened at boot. The fix runs the recheck
+  # in a Task.Supervisor child. Pinned deterministically (no timing): the FaultyStorage
+  # :read_heartbeat hook runs in whatever process performs the read, so post-fix it is the Task
+  # child, pre-fix it is the Heartbeat GenServer itself.
+  test "the previous-incarnation recheck runs off-process, not in the liveness loop (#25)",
+       %{pid: pid} do
+    prev_owner = "prev_#{System.unique_integer([:positive])}@test"
+    test = self()
+
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    hook = fn owner ->
+      if owner == prev_owner do
+        send(test, {:reading_from, self()})
+        receive do: (:release -> :ok)
+      end
+
+      :ok
+    end
+
+    Application.put_env(:fathom, :faulty_before, {:read_heartbeat, hook})
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    send(pid, {:clear_previous_incarnation, prev_owner, 123_456})
+
+    assert_receive {:reading_from, reader}, 2_000
+
+    refute reader == pid,
+           "the previous-incarnation recheck ran INLINE in the liveness process — a slow store " <>
+             "there blocks :renew and lapses the heartbeat; it must run off-process (#25)"
+
+    send(reader, :release)
   end
 
   # Expert review #21: the local validity/lapse decisions used the wall clock, so a
@@ -186,8 +251,9 @@ defmodule Fathom.Shard.HeartbeatTest do
     # Drive the scheduled re-check: the predecessor's expiry is FROZEN (no renewer —
     # it is dead), so the second read clears it — the #6 fast restart, one renew
     # interval late instead of a full TTL.
+    ref = attach_recheck()
     send(pid, {:clear_previous_incarnation, prev_owner, prev_exp})
-    _ = :sys.get_state(pid)
+    assert_receive {:recheck, ^ref, ^prev_owner, :cleared}, 2_000
 
     assert Storage.read_heartbeat(prev_owner) == :not_found,
            "a frozen (dead) previous incarnation's heartbeat must be cleared so its locks are stealable"
@@ -230,10 +296,13 @@ defmodule Fathom.Shard.HeartbeatTest do
     # The predecessor is ALIVE: it renews between the boot read and the re-check.
     {:ok, _} = Storage.renew_heartbeat(prev_owner, 90_000)
 
+    ref = attach_recheck()
+
     log =
       capture_log(fn ->
         send(pid, {:clear_previous_incarnation, prev_owner, exp_at_boot})
-        _ = :sys.get_state(pid)
+        # Await the off-process recheck inside the capture so its "refusing" log is captured.
+        assert_receive {:recheck, ^ref, ^prev_owner, :live}, 2_000
       end)
 
     assert {:ok, _} = Storage.read_heartbeat(prev_owner),

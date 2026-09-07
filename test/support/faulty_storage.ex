@@ -218,6 +218,12 @@ defmodule Fathom.Test.FaultyStorage do
 
   @impl true
   def read_heartbeat(owner) do
+    # `:faulty_before {:read_heartbeat, fun}` fires here handed the owner, so a test can block or
+    # observe the read IN THE PROCESS THAT PERFORMS IT — which is how the previous-incarnation
+    # recheck's off-process move is pinned (expert review 2026-09-05 #25): the hook runs in the
+    # Task, not the liveness GenServer.
+    run_before(:read_heartbeat, owner)
+
     if fault() == :read_heartbeat,
       do: {:error, :s3_unreachable},
       else: Local.read_heartbeat(owner)

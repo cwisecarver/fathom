@@ -300,23 +300,18 @@ defmodule Fathom.Shard.Heartbeat do
   # keeps serving (split-brain), so refuse loudly and leave it.
   @impl true
   def handle_info({:clear_previous_incarnation, prev_owner, prev_exp}, state) do
-    case Storage.read_heartbeat(prev_owner) do
-      {:ok, %{expires_at_ms: ^prev_exp}} ->
-        _ = Storage.clear_heartbeat(prev_owner)
-        # Frozen expiry = no renewer = proven dead; see judge_previous (round-2 #34).
-        Storage.mark_incarnation_dead(prev_owner)
-
-      {:ok, _advanced} ->
-        Logger.error(
-          "refusing to clear previous incarnation #{prev_owner}: its heartbeat is being " <>
-            "RENEWED, so a live node shares this data dir (persisted/remounted volume?). " <>
-            "Clearing it would open a split-brain steal window (expert review #16)."
-        )
-
-      # Gone (cleanly shut down meanwhile) or unreadable — nothing to do / fail closed.
-      _ ->
-        :ok
-    end
+    # OFF-PROCESS (expert review 2026-09-05 #25). The recheck below does unbounded storage I/O
+    # (read_heartbeat + clear_heartbeat at Req defaults), and running it INLINE blocks the node's
+    # liveness process — the one that must service :renew on its cadence. A slow/partitioned store
+    # here held it past the TTL while :renew waited in the mailbox, expiring the heartbeat:
+    # coordinators read :not_valid, flushes stopped, the write fence armed, and peers legitimately
+    # stole every shard the node opened at boot — the failover scenario itself. A supervised child
+    # (like fan_out_lapse/1) keeps the work off the mailbox, and a crash in it no longer crash-loops
+    # the liveness process. The recheck touches no Heartbeat state, so nothing comes back.
+    _ =
+      Task.Supervisor.start_child(Fathom.TaskSupervisor, fn ->
+        recheck_previous_incarnation(prev_owner, prev_exp)
+      end)
 
     {:noreply, state}
   end
@@ -471,6 +466,60 @@ defmodule Fathom.Shard.Heartbeat do
   rescue
     e ->
       Logger.warning("previous-incarnation heartbeat clear failed: #{Exception.message(e)}")
+      :ok
+  end
+
+  # The scheduled second read of a previous incarnation's still-fresh heartbeat (expert review #16),
+  # run OFF-PROCESS by the {:clear_previous_incarnation, …} handler (expert review 2026-09-05 #25 —
+  # see there). A dead predecessor's heartbeat is frozen at the expiry we captured, so an unchanged
+  # value means it is safe to clear (the #6 fast restart, one renew interval late). ANY advance
+  # means a live renewer shares this data dir — clearing its heartbeat would declare its long-held
+  # shards stealable while it keeps serving (split-brain), so refuse loudly and leave it. Rescued so
+  # a storage exception logs and returns rather than crashing (harmless in a supervised child, but
+  # it keeps the crash report out of the logs).
+  defp recheck_previous_incarnation(prev_owner, prev_exp) do
+    result =
+      case Storage.read_heartbeat(prev_owner) do
+        {:ok, %{expires_at_ms: ^prev_exp}} ->
+          _ = Storage.clear_heartbeat(prev_owner)
+          # Frozen expiry = no renewer = proven dead; see judge_previous (round-2 #34).
+          Storage.mark_incarnation_dead(prev_owner)
+          :cleared
+
+        {:ok, _advanced} ->
+          Logger.error(
+            "refusing to clear previous incarnation #{prev_owner}: its heartbeat is being " <>
+              "RENEWED, so a live node shares this data dir (persisted/remounted volume?). " <>
+              "Clearing it would open a split-brain steal window (expert review #16)."
+          )
+
+          :live
+
+        # Gone (cleanly shut down meanwhile) or unreadable — nothing to do / fail closed.
+        _ ->
+          :absent
+      end
+
+    # Observable completion of the OFF-PROCESS recheck (expert review 2026-09-05 #25): nothing
+    # awaits the task otherwise, so this is how a test — or an operator — sees the outcome land.
+    :telemetry.execute(
+      [:fathom, :shard, :heartbeat, :prev_incarnation_recheck],
+      %{count: 1},
+      %{owner: prev_owner, result: result}
+    )
+  rescue
+    e ->
+      Logger.warning(
+        "previous-incarnation recheck for #{prev_owner} failed: #{Exception.message(e)}"
+      )
+
+      :ok
+  catch
+    kind, reason ->
+      Logger.warning(
+        "previous-incarnation recheck for #{prev_owner} exited: #{inspect({kind, reason})}"
+      )
+
       :ok
   end
 
