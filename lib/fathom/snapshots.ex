@@ -156,9 +156,19 @@ defmodule Fathom.Snapshots do
               try do
                 case Storage.object_etag(id) do
                   {:ok, etag} ->
-                    # The bytes at `tmp` are the bytes `snapshot_user_version/3` version-checked
-                    # (#25) — same fence as `restore_snapshot/3`, one fewer full-object GET.
-                    case Storage.restore_snapshot_from_file(id, tmp, etag) do
+                    # HOLD the lease for the WHOLE copy-back, not just its first ttl + steal_margin
+                    # (~35 s at defaults) (expert review 2026-09-05 #24). The restore owner has no
+                    # heartbeat object, so a peer evaluating owner_live? falls to the lock's own TTL
+                    # and STEALS it once it lapses; the stealer's touch_object rotates the data etag
+                    # and the copy-back's If-Match PUT then 412s -> {:error, :superseded},
+                    # deterministically for any tenant whose copy-back (a full MD5 pass + a
+                    # full-object streamed PUT) outlasts 35 s. Run the copy-back in a task and renew
+                    # the lock every ttl/3 while it streams. The bytes at `tmp` are the bytes
+                    # snapshot_user_version/3 version-checked (#25) — one fewer full-object GET.
+                    task =
+                      Task.async(fn -> Storage.restore_snapshot_from_file(id, tmp, etag) end)
+
+                    case renew_while_restoring(id, lease, task) do
                       :ok ->
                         # Align the directory to the restored file's version so it never lies about
                         # the schema (#7); a below-head version lets the laggard sweep converge it
@@ -174,6 +184,10 @@ defmodule Fathom.Snapshots do
                     {:error, reason}
                 end
               after
+                # Releasing the ORIGINAL lease is correct even after renewals rotated the lock etag:
+                # release_lease's conditional DELETE If-Matches the stale etag, 412s, and its 412
+                # fallback GETs the lock, confirms this owner still holds it, and DELETEs — the same
+                # rotate-then-release path `Fathom.Shard.flush_then_drop` documents.
                 Storage.release_lease(id, lease)
               end
 
@@ -240,6 +254,31 @@ defmodule Fathom.Snapshots do
   defp restore_owner, do: "snapshot-restore@#{node()}@#{System.unique_integer([:positive])}"
 
   defp restore_lease_ttl, do: Application.get_env(:fathom, :shard_lease_ttl_ms, 30_000)
+
+  # Renew the restore lock every ttl/3 while the copy-back task streams, so a peer never sees it
+  # lapse (expert review 2026-09-05 #24). Each renew_lease fences on the CURRENT lock etag, so the
+  # rotated lease is threaded internally; the caller's `after` releases the original, which the 412
+  # fallback resolves. On a renew failure (we lost the lock, or a storage hiccup) stop renewing and
+  # wait the copy-back out exactly as the pre-fix synchronous call did — its fenced PUT surfaces the
+  # outcome (:superseded on a real steal); no worse on a hang than before, and unbounded drop/flush
+  # storage under a brownout is the separate #30.
+  defp renew_while_restoring(id, lease, task) do
+    interval = max(div(restore_lease_ttl(), 3), 1)
+
+    case Task.yield(task, interval) do
+      {:ok, result} ->
+        result
+
+      {:exit, reason} ->
+        {:error, {:restore_task_exit, reason}}
+
+      nil ->
+        case Storage.renew_lease(id, lease, restore_lease_ttl()) do
+          {:ok, lease} -> renew_while_restoring(id, lease, task)
+          {:error, _} -> Task.await(task, :infinity)
+        end
+    end
+  end
 
   defp reconcile_directory_schema(id, snap_version) do
     case directory_schema_version(id) do

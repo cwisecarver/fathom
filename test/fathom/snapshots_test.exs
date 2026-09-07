@@ -45,6 +45,28 @@ defmodule Fathom.SnapshotsTest do
   # stored object, so a snapshot only sees flushed data).
   defp flush!(shard), do: :ok = Shards.drain(shard, 5_000)
 
+  # Poll until the lock's stealable_at moves past `base` (a renewal extended it), the await shape
+  # used elsewhere — returns the instant it advances, so a passing case is fast and only a
+  # never-renewed lock pays the full deadline.
+  defp wait_stealable_advanced(shard, base, timeout) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    Stream.repeatedly(fn ->
+      case Storage.lease_stealable_at(shard) do
+        {:held, _owner, at} when at > base -> :advanced
+        _ -> Process.sleep(10)
+      end
+    end)
+    |> Enum.find(fn
+      :advanced -> true
+      _ -> System.monotonic_time(:millisecond) > deadline
+    end)
+    |> case do
+      :advanced -> true
+      _ -> false
+    end
+  end
+
   test "snapshot then restore reverts the live object", %{shard: shard} do
     write!(shard, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('v1')"])
     flush!(shard)
@@ -57,6 +79,69 @@ defmodule Fathom.SnapshotsTest do
 
     assert :ok = Snapshots.restore(shard, snap_id)
     assert read_one(shard, "SELECT v FROM t") == [["v1"]]
+  end
+
+  # Expert review 2026-09-05 #24: Snapshots.restore/3 held an unrenewed, heartbeat-less lease, so a
+  # copy-back longer than ttl + steal_margin (~35 s) was stolen by ordinary tenant traffic and the
+  # fenced PUT 412'd with :superseded. The fix renews the lock every ttl/3 for the whole copy-back.
+  #
+  # Deterministic, no wall-clock race: the FaultyStorage :restore_snapshot hook BLOCKS the copy-back,
+  # and while it is blocked the renew loop must keep the lock fresh — so the lock's stealable_at
+  # ADVANCES. Pre-fix (no renew loop, a synchronous copy-back) it is frozen at acquire + ttl +
+  # steal_margin, so the poll times out and the test fails.
+  test "the restore lease is renewed for the whole copy-back, so a slow restore is not stolen (#24)",
+       %{shard: shard} do
+    write!(shard, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('v1')"])
+    flush!(shard)
+    assert {:ok, snap_id} = Snapshots.create(shard, label: "before")
+    write!(shard, ["UPDATE t SET v = 'v2'"])
+    flush!(shard)
+
+    prev_ttl = Application.get_env(:fathom, :shard_lease_ttl_ms)
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+
+    # Small TTL so the renew interval (ttl/3 ≈ 100 ms) is short and renews before the lock lapses.
+    Application.put_env(:fathom, :shard_lease_ttl_ms, 300)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    test = self()
+
+    hook = fn id ->
+      if id == shard do
+        send(test, {:copy_started, self()})
+        receive do: (:proceed -> :ok)
+      end
+
+      :ok
+    end
+
+    Application.put_env(:fathom, :faulty_before, {:restore_snapshot, hook})
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if prev_ttl,
+        do: Application.put_env(:fathom, :shard_lease_ttl_ms, prev_ttl),
+        else: Application.delete_env(:fathom, :shard_lease_ttl_ms)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    restore = Task.async(fn -> Snapshots.restore(shard, snap_id) end)
+
+    # The copy-back has begun and is blocked in the hook; the restore holds the lease.
+    assert_receive {:copy_started, hook_pid}, 2_000
+    {:held, _owner, stealable_0} = Storage.lease_stealable_at(shard)
+
+    assert wait_stealable_advanced(shard, stealable_0, 2_000),
+           "the restore lease was never renewed during a long copy-back — a peer would steal it " <>
+             "(pre-fix: no renew loop, stealable_at is frozen at acquire + ttl + steal_margin)"
+
+    # Let the copy-back finish; the restore lands under the still-held lease.
+    send(hook_pid, :proceed)
+    assert :ok = Task.await(restore, 5_000)
   end
 
   # Expert review 2026-07-18 #2: restore_snapshot was an UNCONDITIONAL copy, so a write that raced
