@@ -131,7 +131,7 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp do_execute(
-         {_pid, _ref, _conn, shard_id, scope, token_version, opts} = handle,
+         {_pid, _ref, conn, shard_id, scope, token_version, opts} = handle,
          %Stmt{sql: sql} = stmt
        ) do
     # Classify the statement ONCE — dml?/ddl? each slice+downcase the statement head, and the old
@@ -200,6 +200,27 @@ defmodule Fathom.ShardExecutor do
          %Error{
            message:
              "shard \"#{shard_id}\" lease is stale on this node (storage unreachable); retry",
+           code: "FILO_STALE_LEASE",
+           status: 503
+         }}
+
+      # A COMMIT/END/RELEASE that FINALIZES writes accepted earlier in this transaction is refused
+      # on a fenced shard too (expert review 2026-09-05 #29). `@read_shaped` exempts commit
+      # boundaries from `write_candidate?/1` on the reasoning that the STEALABLE fence already
+      # refused the individual DML — but on the TERMINATE fence (the `conns > 0` terminate clause
+      # publishing `WriteFence.fence/1`) those DML were accepted while the coordinator was healthy,
+      # and letting the COMMIT land after `snapshot_and_upload/1` took its consistent read ACKs a
+      # write the released object never contains — lost the moment the tenant is routed to a peer on
+      # the deploy. `txn_wrote?/1` is exactly what distinguishes the two fences: on the stealable
+      # fence the refused DML set nothing, so it is false and the COMMIT still passes (nothing to
+      # un-ACK, no client wedged); on the terminate fence it is true. ROLLBACK is
+      # `commit_boundary?`-false and left alone, so the stream's teardown can still abandon the
+      # transaction and the client retries against the successor with nothing acknowledged.
+      commit_boundary?(sql) and txn_wrote?(conn) and WriteFence.fenced?(shard_id) ->
+        {:error,
+         %Error{
+           message:
+             "shard \"#{shard_id}\" lease is stale on this node (terminating); retry the transaction",
            code: "FILO_STALE_LEASE",
            status: 503
          }}
@@ -1288,10 +1309,14 @@ defmodule Fathom.ShardExecutor do
   #   * `pragma` and `analyze` are absent on purpose too, and were in the first draft of this list.
   #     A pragma ASSIGNMENT can change the file (`journal_mode`, `max_page_count`), and `ANALYZE`
   #     writes `sqlite_stat1`. Both are writes; on a fenced shard both should be refused.
-  #   * Transaction control IS listed. Refusing COMMIT on a fenced shard would not un-ACK anything
-  #     — the statements inside the transaction were already gated individually — and refusing
-  #     ROLLBACK would leave the stream's transaction open with no way to close it. Blocking them
-  #     wedges clients without preventing a single write.
+  #   * Transaction control IS listed, but only for the STEALABLE fence. Refusing COMMIT there would
+  #     not un-ACK anything — the statements inside the transaction were already gated individually —
+  #     and refusing ROLLBACK would leave the stream's transaction open with no way to close it.
+  #     Blocking them wedges clients without preventing a single write. The TERMINATE fence is the
+  #     exception (expert review 2026-09-05 #29): its DML were accepted while the coordinator was
+  #     healthy, so `do_execute/2` refuses a `commit_boundary?` statement THERE when `txn_wrote?/1`
+  #     is set — do not "simplify" that clause away by trusting this list, which is written for the
+  #     stealable case. ROLLBACK stays exempt in both.
   @read_shaped ~w(select explain begin commit rollback savepoint release)
 
   defp read_shaped?(head), do: Enum.any?(@read_shaped, &String.starts_with?(head, &1))
@@ -1647,7 +1672,11 @@ defmodule Fathom.ShardExecutor do
     end
   end
 
-  defp user_version_write?(_), do: false
+  # No non-binary catch-all: the only caller passes `%Stmt{sql: sql}` (a binary), and `do_execute/2`
+  # has already called `dml?/1`/`ddl?/1` on it in the same `cond`, so `sql` is provably a binary
+  # here. The clause was flagged dead once #29's `commit_boundary?(sql)` guard tightened the cond's
+  # type inference; a non-binary would now raise (a loud should-never-happen) rather than silently
+  # returning false and mis-gating a DDL.
 
   defp extra_pragma_allow, do: Application.get_env(:fathom, :tenant_pragma_allow, [])
 

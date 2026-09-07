@@ -559,6 +559,46 @@ defmodule Fathom.ShardDurabilityTest do
     ShardExecutor.close(conn)
   end
 
+  # Expert review 2026-09-05 #29: COMMIT is @read_shaped, so it passed the write fence — correct for
+  # the STEALABLE fence (the DML inside were refused individually) but WRONG for the TERMINATE
+  # fence, where the DML were accepted while the coordinator was healthy and the COMMIT then lands
+  # after snapshot_and_upload/1 took its read, ACKing a write the released object never contains.
+  # do_execute now refuses a commit boundary when the connection wrote in its open transaction
+  # (txn_wrote?), so the client rolls back and retries against the successor. ROLLBACK and read-only
+  # commits are left alone.
+  test "a write-finalizing COMMIT is refused on a fenced shard; a read-only commit is not (#29)",
+       %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+
+    # A written transaction, accepted while the shard is HEALTHY (the DML must land before the fence
+    # — the whole point of #29 is that these were accepted, not refused).
+    {:ok, _} = ShardExecutor.execute(conn, stmt("BEGIN"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('x')"))
+
+    # The terminate fence arms (the conns > 0 terminate clause publishes WriteFence.fence/1).
+    WriteFence.fence(shard)
+
+    assert {:error, %{code: "FILO_STALE_LEASE", status: 503}} =
+             ShardExecutor.execute(conn, stmt("COMMIT")),
+           "a COMMIT finalizing writes accepted before the fence must be refused " <>
+             "(pre-fix it :ok'd and the write landed after the snapshot)"
+
+    # A read-only commit (nothing written in its transaction) still passes the fence — proving the
+    # gate is txn_wrote?-scoped, not a blanket commit refusal. On a SECOND connection because
+    # `conn`'s write transaction is left open (a fenced client cannot COMMIT or, per a separate
+    # lead(7) classification wart, ROLLBACK via a statement — it abandons the connection instead).
+    {:ok, conn2} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn2, stmt("BEGIN"))
+
+    assert {:ok, _} = ShardExecutor.execute(conn2, stmt("COMMIT")),
+           "a read-only commit (txn_wrote? false) must not be wedged by the fence"
+
+    WriteFence.unfence(shard)
+    ShardExecutor.close(conn2)
+    ShardExecutor.close(conn)
+  end
+
   test "the durability flush is fenced: a lost lease self-fences instead of clobbering",
        %{shard: shard} do
     {:ok, conn} = ShardExecutor.open(shard)
