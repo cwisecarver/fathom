@@ -338,15 +338,32 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
 
     assert {:ok, stamp} = Storage.object_position(id)
 
-    # THE PRECONDITION, and the assertion that fails pre-fix. Two outcomes are correct here and
-    # both are safe: `nil` (the WAL was already unlinked by the last stream close, so the
-    # generation is unknowable and the object is un-overridable) or `{epoch, gen + 1, 0}` (the
-    # checkpoint folded generation `gen` in). What must NEVER happen is `{epoch, 0, 0}` — the
-    # LOWEST position for the epoch, stamped on an object holding every row, which is what the
-    # old read-after-the-checkpoint produced and what let any lagging replica outrank it.
-    refute match?(%{wal_gen: 0, offset: 0}, stamp),
-           "the drop-flush stamped a complete object at the minimum position for its epoch " <>
-             "(#{inspect(stamp)}); every lagging replica now outranks it"
+    # THE PRECONDITION, and the assertion that fails pre-fix. What must NEVER happen is an
+    # UN-RANKABLE MINIMUM stamped on an object holding every row — the thing that let a lagging
+    # replica outrank a complete object. Three outcomes are safe: `nil` (un-overridable), a
+    # `{epoch, gen + 1, 0}` positive claim (`wal_gen > 0`), or the seed-on-known-short over-claim
+    # `{epoch, 0, 0, wal_ordinal: n + 1}` (2026-09-07) — an ordinal STRICTLY ABOVE every replica
+    # this coordinator shipped, so a laggard loses on the field `Promote.fresher?/2` actually ranks.
+    #
+    # This previously refuted ANY `%{wal_gen: 0, offset: 0}` as "the minimum position". That proxy
+    # predates ordinal ranking: once `fresher?/2` ranks on `wal_ordinal` (not `{wal_gen, offset}`),
+    # a `{0, 0}` bearing `wal_ordinal: n > 0` is an over-claim, not the minimum. Refusing it would
+    # forbid the correct seed-on-known-short stamp. Assert the real invariant instead.
+    case stamp do
+      nil ->
+        :ok
+
+      %{wal_ordinal: n} when is_integer(n) and n > 0 ->
+        :ok
+
+      %{wal_gen: g, offset: o} when g > 0 or o > 0 ->
+        :ok
+
+      other ->
+        flunk(
+          "the drop-flush stamped an un-rankable minimum (#{inspect(other)}); a lagging replica outranks it"
+        )
+    end
 
     # A replica that is BEHIND: generation 0, but far along in it. Strictly greater than the buggy
     # {epoch, 0, 0} and strictly less than either correct answer, so this fixture discriminates

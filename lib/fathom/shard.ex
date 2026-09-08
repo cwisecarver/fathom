@@ -4045,6 +4045,44 @@ defmodule Fathom.Shard do
   defp position_after_checkpoint(epoch, {:ok, %{ckpt_seq: gen, salt1: salt}}, state),
     do: stamp_ordinal(%{epoch: epoch, wal_gen: gen + 1, offset: 0}, state, salt, 1)
 
+  # SEED FROM THE KNOWN ORDINAL WHEN THIS COORDINATOR HAS SHIPPED ONE (expert review 2026-09-05 #7,
+  # the deferred "seed-on-known-short"; root-caused 2026-09-07 from the chaos-rig `rpo` INVALID).
+  #
+  # Empty before AND after with `wal_ordinal > 0` is NOT the ambiguous case the clause below handles.
+  # It is the COMMON durability path: the last Hrana stream's close checkpointed and unlinked the
+  # `-wal`, so both reads land on `:empty` even though this shard has been shipping. The catch-all's
+  # `nil` then stamps EVERY idle-dropped (and every empty-WAL `flush_now`) object of a replicating
+  # shard with no position — measured, `Storage.object_position` returned `{:ok, nil}` for a plain
+  # insert+idle-drop — which makes `Promote.fresher?/2` un-rankable against it and defeats A2
+  # promote-on-open for the window from a cold reopen to its first live-WAL flush. That is exactly
+  # what the rig's `rpo` scenario reported as "a stamping/durability problem, not survivor-selection".
+  #
+  # The object has folded every acked frame (empty pre ⇒ nothing un-folded; an un-shipped-but-acked
+  # frame would still be IN the WAL and take the header branch above), and every frame this
+  # coordinator ever shipped carries an ordinal ≤ `wal_ordinal` — they were numbered from the same
+  # counter (`wal_ordinal/2`). So `{lineage, wal_ordinal + 1, offset 0}` is strictly greater than
+  # every replica at `{≤ wal_ordinal, any}` and correct at drop time (the object IS complete), while
+  # a genuinely newer write can only arrive on the NEXT open, which increments the LINEAGE and so
+  # wins on the first ranked component regardless of the ordinal. This is the same `n + 1` over-claim
+  # the header branch makes with `bump: 1`, sourced from the coordinator's counter because the WAL
+  # header that would carry the salt is gone.
+  #
+  # `wal_gen: 0` DELIBERATELY: `fresher?/2` ranks on `{lineage, wal_ordinal, offset}`, never on
+  # `wal_gen`, and there is no live WAL whose `ckpt_seq` this could name. Seeding `wal_gen` (from
+  # `counter_gen`) instead of the ordinal — the literal wording of the parked finding — does NOT fix
+  # this: a stamp with no `wal_ordinal` still falls through `fresher?/2` to its `false` catch-all.
+  # DO NOT "simplify" this back to a generation seed. No salt for the same reason the header branch
+  # omits it on a `bump: 1` stamp (`put_salt/3`): a salt asserts the ordinal sits inside a live WAL,
+  # and this one is an over-claim past a folded one.
+  #
+  # RIG-GATED: the ordinal/salt timing this rests on (a post-truncate write always lands in a NEW
+  # WAL, so its ordinal bumps past this over-claim) is a chaos-rig invariant — validate `rpo` PASS
+  # before this is pushed. `wal_ordinal == 0` (never shipped: a non-replicating shard, or one pulled
+  # and never written) keeps the ambiguous-nil below, so the non-replicating path is bit-for-bit
+  # unchanged.
+  defp position_after_checkpoint(epoch, _pre, %{wal_ordinal: n}) when is_integer(n) and n > 0,
+    do: %{epoch: epoch, wal_gen: 0, offset: 0, wal_ordinal: n + 1}
+
   # Empty before AND after is AMBIGUOUS, and `nil` is the only safe answer. It reads like "a brand
   # new shard at generation 0" — which is one of the two situations — but it is equally a shard
   # whose WAL was truncated and unlinked by an EARLIER cycle, which may sit at any generation with
@@ -4052,7 +4090,8 @@ defmodule Fathom.Shard do
   # "unknown", making the object un-overridable, and that costs nothing real: an empty WAL at flush
   # time means there are no un-folded writes, so the object IS complete and preferring it over any
   # replica is correct. The price is that promote-on-open will not fire for this shard — i.e. the
-  # pre-A2 behaviour, which AGENTS.md already calls "never worse than off".
+  # pre-A2 behaviour, which AGENTS.md already calls "never worse than off". Reached now only when
+  # `wal_ordinal == 0` (never shipped); a shipping shard takes the seed-on-known-short clause above.
   defp position_after_checkpoint(_epoch, _pre, _state), do: nil
 
   defp snapshot_and_upload(state) do
