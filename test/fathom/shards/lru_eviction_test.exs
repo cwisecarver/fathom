@@ -176,7 +176,16 @@ defmodule Fathom.Shards.LruEvictionTest do
   # wiring: a held shard reads busy, a released one reads not-busy.
   test "the coordinator publishes its busy count for eviction (#14)" do
     # A finite cap makes Lru tracking active (enabled?), but large enough that nothing is evicted.
-    Application.put_env(:fathom, :max_open_shards, 100)
+    #
+    # Sized ABOVE the current registry population, not a fixed 100. Coordinators left mid-teardown by
+    # prior tests (this file tolerates them — see the moduledoc — because the reset Lru holds none of
+    # them, so they are never the one evicted) STILL count toward `at_capacity?/0`, which is
+    # `Registry.count >= cap`. A fixed cap of 100 therefore refused THIS open with
+    # `{:error, :node_at_capacity}` whenever ≥100 coordinators were still shutting down — a seed-order
+    # flake reproducible at `--seed 570749 --max-cases 8` (CI OTP-29, 2026-09-08). The reset Lru is
+    # empty, so `evicted_for_room?/0` cannot make room, and the open is refused rather than evicting.
+    # Headroom over the live count keeps the cap finite (Lru tracking active) while never at capacity.
+    Application.put_env(:fathom, :max_open_shards, Registry.count(Fathom.ShardRegistry) + 100)
     id = uniq()
 
     {:ok, pid, ref, _path} = Shards.checkout(id)
