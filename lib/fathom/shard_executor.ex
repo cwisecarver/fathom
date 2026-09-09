@@ -1297,7 +1297,7 @@ defmodule Fathom.ShardExecutor do
   # also refused — on a node that has already lost its lease and is returning 503s for writes
   # anyway. Refusing a read there is cheap; ACKing a write that will be quarantined is not.
   defp write_candidate?(sql) when is_binary(sql) do
-    not read_shaped?(lead(sql, 7))
+    not read_shaped?(sql)
   end
 
   defp write_candidate?(_), do: true
@@ -1319,7 +1319,18 @@ defmodule Fathom.ShardExecutor do
   #     stealable case. ROLLBACK stays exempt in both.
   @read_shaped ~w(select explain begin commit rollback savepoint release)
 
-  defp read_shaped?(head), do: Enum.any?(@read_shaped, &String.starts_with?(head, &1))
+  # The head this reads must be AS LONG AS THE LONGEST verb, or `String.starts_with?/2` can never
+  # match it: a 7-char head cannot start with 8-char "rollback" or 9-char "savepoint", so both fell
+  # through to `write_candidate? == true` and a fenced shard 503'd a client's ROLLBACK/SAVEPOINT —
+  # abandoning the connection instead of letting it cleanly abort/checkpoint the transaction (the
+  # `write_candidate?/1` caller used a hard-coded `lead(sql, 7)`; expert review 2026-09-05 follow-up).
+  # Derived from the list so a longer verb added later stays covered — do NOT hard-code it back.
+  @read_shaped_lead @read_shaped |> Enum.map(&byte_size/1) |> Enum.max()
+
+  defp read_shaped?(sql) do
+    head = lead(sql, @read_shaped_lead)
+    Enum.any?(@read_shaped, &String.starts_with?(head, &1))
+  end
 
   # --- statement gate (expert review 2026-08-01 #1, #7, #8) ---------------------------------
   #

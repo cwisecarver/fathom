@@ -348,6 +348,19 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
       # Neither write landed.
       assert {:ok, %{rows: [["a"]]}} = ShardExecutor.execute(conn, stmt("SELECT v FROM kv"))
 
+      # TRANSACTION CONTROL MUST PASS THE FENCE (expert review 2026-09-05 follow-up). ROLLBACK and
+      # SAVEPOINT ack no tenant write, so the fence must let them through — otherwise a fenced client
+      # cannot cleanly abort/checkpoint its transaction and abandons the connection instead. Pre-fix
+      # `write_candidate?/1` read `lead(sql, 7)`, and `String.starts_with?/2` on a 7-char head can
+      # never match 8-char "rollback" or 9-char "savepoint", so BOTH were 503'd here. SAVEPOINT
+      # begins an implicit transaction; the ROLLBACK closes it, so no transaction is left open for
+      # the recovery section below.
+      assert {:ok, _} = ShardExecutor.execute(conn, stmt("SAVEPOINT sp1")),
+             "SAVEPOINT was refused by the write fence (misclassified as a write)"
+
+      assert {:ok, _} = ShardExecutor.execute(conn, stmt("ROLLBACK")),
+             "ROLLBACK was refused by the write fence (misclassified as a write)"
+
       # Recovery: the heartbeat is comfortably valid again → a revalidate reconfirms ownership and
       # lifts the fence.
       #
