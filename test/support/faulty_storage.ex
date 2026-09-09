@@ -242,9 +242,11 @@ defmodule Fathom.Test.FaultyStorage do
 
   @impl true
   def flush(shard_id, local_path, expected_etag, position \\ nil, lineage \\ nil) do
-    # run_before(:flush) lets a test steal the shard (overwrite the object) in the window
-    # between the coordinator's fence check and this write, exercising the fenced flush (#15).
-    run_before(:flush)
+    # run_before(:flush, shard_id) lets a test steal the shard (overwrite the object) in the window
+    # between the coordinator's fence check and this write, exercising the fenced flush (#15). The
+    # shard-id form (not the bare 0-arity one) so a test that only wants to OBSERVE its own shard's
+    # flush can filter out other coordinators still draining — see run_before/2's note.
+    run_before(:flush, shard_id)
     flush_delay()
 
     cond do

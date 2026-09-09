@@ -2307,7 +2307,7 @@ defmodule Fathom.Shard do
           # Every other release site already threads the refreshed lease back; this one did not.
           state = Map.merge(state, updates)
 
-          case upload_for_drop(state) do
+          case bounded_upload_for_drop(state) do
             # The carried lineage is discarded on the DROP path: this coordinator is stopping, so
             # there is no next flush to spend the cache on (expert review 2026-08-26 #33).
             {:ok, new_etag, _carried} ->
@@ -2395,6 +2395,20 @@ defmodule Fathom.Shard do
             {:error, {:corrupt_local, reason}} ->
               if File.exists?(state.path), do: quarantine_corrupt!(state, reason)
               Storage.release_lease(state.id, state.lease)
+
+            # The upload exceeded its time budget under a storage brownout (expert review 2026-09-05
+            # #30). The coordinator is Registry-registered until terminate/2 returns, so an unbounded
+            # drop-flush made a concurrent `Shards.checkout` GenServer.call queue past
+            # `checkout_timeout` (75 s) — and `:timeout` is excluded from `retry_checkout?/1`, so the
+            # tenant got a hard FILO_SHARD_OPEN 500 rather than retrying onto a fresh coordinator.
+            # Keep the local copy (NO data loss — `drop_local` above only runs on a durable upload) and
+            # release the lease, exactly as `{:error, reason}` does, so terminate returns promptly.
+            {:error, :drop_flush_timeout} ->
+              keep_local_release_lease(
+                state,
+                "self-initiated drop-flush exceeded its budget",
+                :drop_flush_timeout
+              )
 
             {:error, reason} ->
               keep_local_release_lease(state, "flush failed", reason)
@@ -2656,6 +2670,39 @@ defmodule Fathom.Shard do
     else
       emit_drop_route(state, :checkpoint)
       checkpoint_then_upload(state, pre)
+    end
+  end
+
+  # BOUND THE SELF-INITIATED DROP-FLUSH'S UPLOAD (expert review 2026-09-05 #30). `terminate/2` runs
+  # `flush_then_drop/1` inline for as long as storage takes, and the coordinator stays Registry-
+  # registered until it exits — so under a storage brownout a concurrent `Shards.checkout` queues on
+  # its GenServer.call up to `checkout_timeout` (75 s) and then 500s (`:timeout` is excluded from
+  # `retry_checkout?/1`). The upload (checkpoint + full-object PUT) is the dominant cost and exactly
+  # what the finding's falsifier delays, so bound IT: `settle_yield_ms/0` (`shard_shutdown_ms`/3,
+  # ~20 s) is the same budget the settle path already yields on and sits well under `checkout_timeout`,
+  # so the checkout retries onto a fresh coordinator. A timeout surfaces as `{:error,
+  # :drop_flush_timeout}`, which `flush_then_drop/1` routes to `keep_local_release_lease/3` — no data
+  # loss (the local copy is kept; `drop_local` only runs on a durable upload) and the lease released.
+  #
+  # `upload_for_drop/1` is task-safe: `checkpoint_and_verify/1` opens its OWN connection from the path
+  # and `snapshot_and_upload/1` already runs off-process in the periodic flush task. `Task.shutdown/1`
+  # aborts an in-flight PUT cleanly (S3 PUT is atomic; a partial upload leaves the last-good object).
+  #
+  # SCOPE / RIG-PENDING: this bounds the UPLOAD. A total S3 outage that also hangs the subsequent
+  # `release_lease` DELETE is a node-wide degradation left as a follow-up (a stranded lock is still
+  # reclaimed by this node's next same-incarnation open, so the local checkout recovers regardless).
+  # Brownout behavior is validated on the chaos rig before push (AGENTS.md).
+  defp bounded_upload_for_drop(state) do
+    task = Task.async(fn -> upload_for_drop(state) end)
+
+    case Task.yield(task, settle_yield_ms()) || Task.shutdown(task) do
+      {:ok, result} ->
+        result
+
+      # Timed out (nil) or the task exited (`{:exit, _}`): abandon the upload and keep local. Matches
+      # settle_flush_task/1's `_` clause — do not narrow to `nil`, which drops `{:exit, _}` on the floor.
+      _ ->
+        {:error, :drop_flush_timeout}
     end
   end
 
