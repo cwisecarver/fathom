@@ -154,9 +154,10 @@ defmodule Fathom.MixProject do
       # The Hrana (libSQL) protocol server AND client — fathom serves shards through it.
       # On Hex as of filo 0.2.0, so a clone of fathom no longer needs filo as a sibling.
       #
-      # "~> 0.2.0" and not "~> 0.2": filo is pre-1.0, and its CONTRIBUTING states that
+      # "~> 0.3.0" and not "~> 0.3": filo is pre-1.0, and its CONTRIBUTING states that
       # below 1.0.0 the MINOR number carries breaking changes. So this must not float
-      # to 0.3.0 on its own.
+      # to 0.4.0 on its own. (0.3.0 added the per-connection store_sql/cursor caps —
+      # expert review #23.)
       #
       # Co-developing both repos? Point FILO_PATH at your checkout — no mix.exs edit,
       # so the path dep can never be committed by accident:
@@ -177,7 +178,7 @@ defmodule Fathom.MixProject do
 
   defp filo_dep do
     case System.get_env("FILO_PATH") do
-      nil -> "~> 0.2.0"
+      nil -> "~> 0.3.0"
       path -> [path: path, override: true]
     end
   end
