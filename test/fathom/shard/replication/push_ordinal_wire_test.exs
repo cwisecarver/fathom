@@ -162,7 +162,14 @@ defmodule Fathom.Shard.Replication.PushOrdinalWireTest do
       <<head::binary-size(6), rest::binary>> =
         Protocol.encode_push(push()) |> IO.iodata_to_binary()
 
-      tampered = head <> <<0xFF>> <> binary_part(rest, 1, byte_size(rest) - 1)
+      # Byte 6 is inside the random 16-byte HMAC tag; SETTING it to 0xFF is a no-op ~1/256 of the
+      # time (when it is already 0xFF), leaving the frame untampered so the MAC still verifies and
+      # this assertion falsely fails. FLIP it so the tamper always lands. (Same fix as the offer
+      # tamper below, which is what actually failed on CI OTP 27, 2026-09-11.)
+      tampered =
+        head <>
+          <<Bitwise.bxor(:binary.at(rest, 0), 0xFF)>> <>
+          binary_part(rest, 1, byte_size(rest) - 1)
 
       assert {:error, _} = Protocol.decode(tampered),
              "a tampered signed ordinal frame decoded; the new type code is outside the signature"
@@ -238,7 +245,16 @@ defmodule Fathom.Shard.Replication.PushOrdinalWireTest do
       assert {:ok, {:position, "acme", %{wal_ordinal: 12}}} = Protocol.decode(frame)
 
       <<head::binary-size(6), rest::binary>> = frame
-      tampered = head <> <<0xFF>> <> binary_part(rest, 1, byte_size(rest) - 1)
+      # Byte 6 lands inside the 16-byte HMAC tag, whose bytes are uniformly random per run (the
+      # secret is fresh every `enable_signing`). SETTING it to 0xFF is a no-op ~1/256 of the time —
+      # when that tag byte is already 0xFF — so the "tampered" frame equals the original, the MAC
+      # still verifies, and this assertion fails for a frame that was never actually tampered.
+      # (Seen on CI OTP 27, 2026-09-11: decoded with every field intact, proving the payload and the
+      # tag were both untouched.) FLIP the byte instead of setting it, so the tamper always lands.
+      tampered =
+        head <>
+          <<Bitwise.bxor(:binary.at(rest, 0), 0xFF)>> <>
+          binary_part(rest, 1, byte_size(rest) - 1)
 
       assert {:error, _} = Protocol.decode(tampered),
              "a tampered signed offer decoded; the new type code is outside the signature"
