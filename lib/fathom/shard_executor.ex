@@ -796,6 +796,20 @@ defmodule Fathom.ShardExecutor do
             status: 400
           }
 
+        # The stamp gate execute/2 enforces (expert review 2026-09-05 #21): the script path
+        # previously checked only ddl?/blocked_statement, so `execute_sequence("PRAGMA
+        # user_version = 99")` forged the schema-version stamp on a tenant with :block_tenant_ddl
+        # on. Match execute/2's FILO_PRAGMA_BLOCKED here so a script cannot route around the
+        # single-statement gate.
+        opts.block_ddl? and not opts.template? and user_version_write?(stmt) ->
+          %Error{
+            message:
+              "PRAGMA user_version cannot be set on tenant \"#{shard_id}\"; the schema-version " <>
+                "stamp is advanced by the migration engine, not a direct tenant write",
+            code: "FILO_PRAGMA_BLOCKED",
+            status: 403
+          }
+
         true ->
           blocked_statement(stmt)
       end
@@ -1359,6 +1373,12 @@ defmodule Fathom.ShardExecutor do
       "/*" <> rest -> rest |> after_delim("*/") |> strip_lead_noise()
       "--" <> rest -> rest |> after_delim("\n") |> strip_lead_noise()
       ";" <> rest -> strip_lead_noise(rest)
+      # A leading UTF-8 BOM (U+FEFF, bytes EF BB BF) is skipped by SQLite's own tokenizer at
+      # statement start but NOT by String.trim_leading/1 (verified), so without this clause a
+      # `\uFEFFCREATE …` / `\uFEFFPRAGMA …` defeated every leading-keyword classifier — including
+      # :block_tenant_ddl and the user_version stamp gate, which have no engine backstop. Strip it
+      # in the same loop so no classifier can see past another (the 2026-09-05 #1 `;` defect class).
+      <<0xEF, 0xBB, 0xBF, rest::binary>> -> strip_lead_noise(rest)
       other -> other
     end
   end
