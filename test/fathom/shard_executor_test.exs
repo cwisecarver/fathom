@@ -224,6 +224,67 @@ defmodule Fathom.ShardExecutorTest do
     ShardExecutor.close(conn)
   end
 
+  # A leading UTF-8 BOM (U+FEFF) is skipped by SQLite's own tokenizer at statement start but NOT
+  # by String.trim_leading/1, so without BOM-stripping in strip_lead_noise/1 a `\uFEFFCREATE`
+  # defeats every leading-keyword classifier — including :block_tenant_ddl, which has no engine
+  # backstop. Pre-fix (no BOM clause) the CREATE succeeds and the table is created.
+  test "with :block_tenant_ddl on, a BOM-prefixed CREATE is still refused", %{shard: shard} do
+    prev = Application.get_env(:fathom, :block_tenant_ddl)
+    Application.put_env(:fathom, :block_tenant_ddl, true)
+    on_exit(fn -> restore_env(:block_tenant_ddl, prev) end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    bom = "\xEF\xBB\xBF"
+
+    assert {:error, %Error{code: "FILO_DDL_BLOCKED"}} =
+             ShardExecutor.execute(conn, stmt(bom <> "CREATE TABLE t (v TEXT)"))
+
+    # pin the consequence, not just the refusal code: the table must not exist
+    assert {:ok, %StmtResult{rows: []}} =
+             ShardExecutor.execute(conn, stmt("SELECT name FROM sqlite_master WHERE name = 't'"))
+
+    ShardExecutor.close(conn)
+  end
+
+  # The same BOM trick against the user_version stamp gate, which also has no engine backstop
+  # (the authorizer only denies attach/detach). Pre-fix (no BOM clause) the stamp is set.
+  test "with :block_tenant_ddl on, a BOM-prefixed PRAGMA user_version is still refused", %{
+    shard: shard
+  } do
+    prev = Application.get_env(:fathom, :block_tenant_ddl)
+    Application.put_env(:fathom, :block_tenant_ddl, true)
+    on_exit(fn -> restore_env(:block_tenant_ddl, prev) end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    bom = "\xEF\xBB\xBF"
+
+    assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
+             ShardExecutor.execute(conn, stmt(bom <> "PRAGMA user_version = 7"))
+
+    ShardExecutor.close(conn)
+  end
+
+  # execute/2 gates `PRAGMA user_version = N` behind :block_tenant_ddl (FILO_PRAGMA_BLOCKED), but
+  # the script path (refuse_script/3) previously checked only ddl?/blocked_statement — so
+  # `execute_sequence("PRAGMA user_version = 99")` forged the stamp on a locked tenant. Pre-fix
+  # the sequence returns :ok and the stamp becomes 99.
+  test "with :block_tenant_ddl on, a script cannot set user_version", %{shard: shard} do
+    prev = Application.get_env(:fathom, :block_tenant_ddl)
+    Application.put_env(:fathom, :block_tenant_ddl, true)
+    on_exit(fn -> restore_env(:block_tenant_ddl, prev) end)
+
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
+             ShardExecutor.execute_sequence(conn, "PRAGMA user_version = 99")
+
+    # and the stamp was not advanced
+    assert {:ok, %StmtResult{rows: [[0]]}} =
+             ShardExecutor.execute(conn, stmt("PRAGMA user_version"))
+
+    ShardExecutor.close(conn)
+  end
+
   # Expert review 2026-07-14 #19: "limited dataset per shard" must be ENFORCEABLE — a per-shard
   # size cap (`:shard_max_page_count`) so one runaway tenant can't grow unbounded and inflate every
   # whole-shard cost. A write past the cap fails SQLITE_FULL. Pre-fix (no cap) the inserts all
