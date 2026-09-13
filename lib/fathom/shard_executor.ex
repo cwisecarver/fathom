@@ -1356,6 +1356,13 @@ defmodule Fathom.ShardExecutor do
   # max_page_count=777` ran the pragma while the gate saw head ";pragma" and matched nothing.
   defp strip_lead_noise(sql) do
     case String.trim_leading(sql) do
+      # A UTF-8 BOM (U+FEFF): SQLite's tokenizer skips a leading one and RUNS the statement, but
+      # `String.trim_leading/1` does NOT — U+FEFF is Unicode Cf (format), not White_Space — so
+      # without this clause a `﻿PRAGMA max_page_count=…` or `﻿CREATE …` was seen by every gate as
+      # head "﻿pragm"/"﻿creat", matched nothing, and reached the engine (the size cap and
+      # per-commit durability pragmas have no authorizer backstop). Same defect class as the leading
+      # `;` (expert review 2026-09-05 #1), verified by execution 2026-09-13.
+      "﻿" <> rest -> strip_lead_noise(rest)
       "/*" <> rest -> rest |> after_delim("*/") |> strip_lead_noise()
       "--" <> rest -> rest |> after_delim("\n") |> strip_lead_noise()
       ";" <> rest -> strip_lead_noise(rest)

@@ -69,6 +69,14 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
     {"form-feed then semicolon", "\f;"},
     {"vertical-tab then semicolon", "\v;"},
     {"leading block comment", "/* c */ "},
+    # A leading UTF-8 BOM (U+FEFF): SQLite's tokenizer skips it and RUNS the statement, but
+    # `String.trim_leading/1` does NOT strip it (U+FEFF is Unicode Cf, not White_Space), so every
+    # gate keying on `strip_lead_noise/1` missed it and the pragma reached the engine. Verified by
+    # execution: `<BOM>PRAGMA max_page_count=777` set the cap and `<BOM>CREATE TABLE` ran. Same
+    # defect class as the leading-`;` bypass (expert review 2026-09-05 #1), one prefix later.
+    {"byte-order mark", "﻿"},
+    {"BOM then semicolon", "﻿;"},
+    {"semicolon then BOM", ";﻿"},
     {"EXPLAIN", "EXPLAIN "},
     {"EXPLAIN QUERY PLAN", "EXPLAIN QUERY PLAN "},
     {"comment then EXPLAIN", "/* c */ EXPLAIN "},
@@ -163,7 +171,10 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
     for sql <- [
           ";CREATE TABLE semi (x)",
           "/* c */ ;CREATE INDEX i ON semi (x)",
-          ";;DROP TABLE IF EXISTS semi"
+          ";;DROP TABLE IF EXISTS semi",
+          # A leading BOM SQLite runs but the gate missed (see @prefixes).
+          "﻿CREATE TABLE bom (x)",
+          "﻿;CREATE TABLE bomsemi (x)"
         ] do
       assert {:error, %Error{code: "FILO_DDL_BLOCKED"}} =
                ShardExecutor.execute(h, stmt(sql)),
