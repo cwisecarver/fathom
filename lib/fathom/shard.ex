@@ -61,6 +61,7 @@ defmodule Fathom.Shard do
     Fence,
     FlushGate,
     Heartbeat,
+    Integrity,
     Position,
     Provenance,
     Storage,
@@ -2395,7 +2396,9 @@ defmodule Fathom.Shard do
             # not quarantining is correct and must stay, so re-tagging means changing a value two
             # paths agree on to fix one of them. The guard is local to the path that differs.
             {:error, {:corrupt_local, reason}} ->
-              if File.exists?(state.path), do: quarantine_corrupt!(state, reason)
+              if File.exists?(state.path),
+                do: Integrity.quarantine_corrupt!(state.path, state.id, reason)
+
               Storage.release_lease(state.id, state.lease)
 
             # The upload exceeded its time budget under a storage brownout (expert review 2026-09-05
@@ -2749,14 +2752,14 @@ defmodule Fathom.Shard do
       # a genuinely malformed file would have stopped being quarantined at all, because SQLite
       # reports bad bytes through the ERROR channel, not as rows.
       {:error, reason} ->
-        if classify_integrity_failure(reason) == :corrupt do
+        if Integrity.classify_failure(reason) == :corrupt do
           # Integrity failed (expert review 2026-07-14 #4). The checkpoint-then-raw-upload fast path
           # uploads the bytes as-is, so a locally corrupted db (disk/fs/memory fault, exqlite/OS bug)
           # would be flushed with a valid If-Match by the legitimate owner — the fence can't help,
           # it's not a steal — permanently clobbering the last good stored object. Refuse the flush
           # (the good object stays authoritative), quarantine the corrupt copy, and alarm. Safe here
           # and only here: the coordinator is terminating and releases the lease.
-          quarantine_corrupt!(state, reason)
+          Integrity.quarantine_corrupt!(state.path, state.id, reason)
           {:error, {:corrupt_local, reason}}
         else
           # Checkpoint incomplete (typically busy), or integrity indeterminate. Fall back to
@@ -2771,40 +2774,8 @@ defmodule Fathom.Shard do
     end
   end
 
-  # SQLite reports "these bytes are bad" through TWO different channels, and the difference is not
-  # the tuple tag (expert review 2026-08-20 #2, corrected against a really-corrupted file rather
-  # than against the finding's prescription). A mildly damaged db returns rows describing the
-  # damage — `{:quick_check, rows}`. A badly damaged one makes the query itself ERROR, arriving as
-  # `{:quick_check_failed, "database disk image is malformed"}` — the same shape a plain `:busy`
-  # produces. Measured: overwriting one b-tree page with garbage yields the ERROR form, not rows.
-  #
-  # So classify on the REASON, not the tag. Defaulting to :unknown is the safe direction: both
-  # verdicts refuse the flush, so the stored object is protected either way, and the only cost of
-  # guessing :unknown is a retry — whereas guessing :corrupt discards a healthy local copy on the
-  # drop path, including its unflushed acked writes.
-  @corrupt_messages [
-    "database disk image is malformed",
-    "file is not a database",
-    "malformed database schema",
-    "database corruption"
-  ]
-
-  defp classify_integrity_failure({:quick_check, _}), do: :corrupt
-  defp classify_integrity_failure({:quick_check_failed, reason}), do: corrupt_reason(reason)
-  defp classify_integrity_failure({:quick_check_open_failed, reason}), do: corrupt_reason(reason)
-  defp classify_integrity_failure(_), do: :unknown
-
-  defp corrupt_reason(reason) when is_binary(reason) do
-    down = String.downcase(reason)
-    if Enum.any?(@corrupt_messages, &String.contains?(down, &1)), do: :corrupt, else: :unknown
-  end
-
-  defp corrupt_reason(reason) when is_atom(reason) do
-    if reason in [:corrupt, :not_a_db], do: :corrupt, else: :unknown
-  end
-
-  defp corrupt_reason({_, reason}), do: corrupt_reason(reason)
-  defp corrupt_reason(_), do: :unknown
+  # Integrity classification (classify_integrity_failure/corrupt_reason) moved to
+  # `Fathom.Shard.Integrity` (2026-09-13, Phase 2) as `classify_failure/1`.
 
   @doc """
   Stamp provenance on a shard file that was placed in the live data dir out-of-band.
@@ -2830,64 +2801,13 @@ defmodule Fathom.Shard do
     :ok
   end
 
-  # Run `PRAGMA quick_check` on the file at `path`; `:ok` iff SQLite reports the single row "ok".
-  # Cheap (shards are small by premise). `@doc false` public so the corrupt-flush guard is
-  # testable directly (expert review 2026-07-14 #4).
+  # Public seam kept here for the external callers (tenants, restore drill, migrator); the check
+  # itself lives in `Fathom.Shard.Integrity.verify/1` (2026-09-13, Phase 2).
   @doc false
   @spec verify_integrity(Path.t()) :: :ok | {:error, term()}
-  def verify_integrity(path) do
-    case Connection.open(path) do
-      {:ok, conn} ->
-        result = Connection.query(conn, "PRAGMA quick_check", [])
-        Connection.close(conn)
+  def verify_integrity(path), do: Integrity.verify(path)
 
-        case result do
-          {:ok, %{rows: [["ok"]]}} -> :ok
-          {:ok, %{rows: rows}} -> {:error, {:quick_check, rows}}
-          {:error, reason} -> {:error, {:quick_check_failed, reason}}
-        end
-
-      other ->
-        {:error, {:quick_check_open_failed, other}}
-    end
-  end
-
-  # A local db failed quick_check: move it aside (preserve for forensics) and drop its now-stale
-  # WAL/SHM so the next open pulls the last-good stored object instead of adopting the corrupt
-  # local copy. Loud error + telemetry so an operator sees it (the good object is still safe).
-  #
-  # ONLY SAFE WHERE THE SHARD IS PROVABLY NOT BEING SERVED — i.e. the drop path, where the
-  # coordinator is terminating and releases the lease (expert review 2026-08-20 #2). Calling this
-  # while streams are checked out renames the live path out from under them AND unlinks the -shm,
-  # so the next connection to open `state.path` creates a BRAND-NEW EMPTY DATABASE: two sets of
-  # connections to one tenant, one seeing data and one seeing nothing. Worse, the shard is still
-  # dirty with an unchanged `state.etag`, so the next periodic flush snapshots that empty file and
-  # PUTs it over the good stored object with a valid If-Match — destroying the only good copy.
-  # The serving path therefore refuses the flush and leaves the file alone; see verify_and_snapshot/2.
-  defp quarantine_corrupt!(state, reason) do
-    # `.corrupt.<ms>-<unique>`, and the -wal/-shm RENAMED alongside — mirroring quarantine_fenced!/
-    # quarantine_fork! (expert review 2026-09-05 #17). Two fixes over the old `<second>` + `File.rm`:
-    #   * <second> resolution collided — two quarantines of the same shard within one second renamed
-    #     over each other and the first forensic copy was lost, the defect review #14 fixed for
-    #     `.forked`. A crash-looping node is exactly where repeat quarantines happen.
-    #   * File.rm on the WAL DESTROYS committed, acknowledged frames on the route this is reached
-    #     from flush_then_drop's {:corrupt_local, _} — which fires when the checkpoint came back BUSY,
-    #     so the WAL still holds frames never folded into the main file, and a corrupt main-file page
-    #     with an intact WAL is the case where the WAL is the BETTER copy of recent history. Preserve
-    #     it for the operator recovery the "quarantined for forensics" message promises.
-    dest =
-      "#{state.path}.corrupt.#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
-
-    _ = File.rename(state.path, dest)
-    Enum.each(["-wal", "-shm"], &File.rename(state.path <> &1, dest <> &1))
-
-    Logger.error(
-      "shard #{state.id}: local db failed quick_check (#{inspect(reason)}); REFUSING flush so the " <>
-        "last good stored object stays authoritative; quarantined corrupt copy to #{dest}"
-    )
-
-    :telemetry.execute([:fathom, :shard, :corrupt_flush], %{count: 1}, %{shard_id: state.id})
-  end
+  # quarantine_corrupt! moved to `Fathom.Shard.Integrity.quarantine_corrupt!/3` (2026-09-13, Phase 2).
 
   # The fence decision itself lives in Fathom.Shard.Fence (unit-tested there). This
   # projects the coordinator state down to the fields the fence reads; the caller
@@ -2975,8 +2895,11 @@ defmodule Fathom.Shard do
 
         result =
           case classify_checkpoint(cp) do
-            :ok -> classify_quick_check(Connection.query(conn, "PRAGMA quick_check", []))
-            err -> err
+            :ok ->
+              Integrity.classify_quick_check(Connection.query(conn, "PRAGMA quick_check", []))
+
+            err ->
+              err
           end
 
         Connection.close(conn)
@@ -2993,14 +2916,6 @@ defmodule Fathom.Shard do
       {:ok, %{rows: [[busy, _log, _checkpointed]]}} -> {:error, {:checkpoint_busy, busy}}
       {:ok, other} -> {:error, {:checkpoint_unexpected, other}}
       {:error, reason} -> {:error, {:checkpoint_failed, reason}}
-    end
-  end
-
-  defp classify_quick_check(result) do
-    case result do
-      {:ok, %{rows: [["ok"]]}} -> :ok
-      {:ok, %{rows: rows}} -> {:error, {:quick_check, rows}}
-      {:error, reason} -> {:error, {:quick_check_failed, reason}}
     end
   end
 
@@ -4052,7 +3967,7 @@ defmodule Fathom.Shard do
     case Connection.open(state.path) do
       {:ok, conn} ->
         try do
-          with :ok <- run_quick_check(conn) do
+          with :ok <- Integrity.run_quick_check(conn) do
             do_snapshot(conn, temp)
           end
         after
@@ -4062,54 +3977,12 @@ defmodule Fathom.Shard do
       other ->
         # An open failure is "I could not check it", not "it is corrupt" — same classification the
         # separate `verify_integrity/1` path applied.
-        integrity_verdict({:error, {:quick_check_open_failed, other}})
+        Integrity.verdict({:error, {:quick_check_open_failed, other}})
     end
   end
 
-  # `quick_check` on the open connection, gated by `:verify_flush_integrity`. Split out so the
-  # short-circuit above reads as one line and (b) cannot be accidentally reordered past the VACUUM.
-  defp run_quick_check(conn) do
-    if verify_flush_integrity?() do
-      case Connection.query(conn, "PRAGMA quick_check", []) do
-        {:ok, %{rows: [["ok"]]}} -> :ok
-        {:ok, %{rows: rows}} -> integrity_verdict({:error, {:quick_check, rows}})
-        {:error, reason} -> integrity_verdict({:error, {:quick_check_failed, reason}})
-      end
-    else
-      :ok
-    end
-  end
-
-  # Classify a failed integrity check. "I could not check it" is not "it is corrupt" (expert review
-  # 2026-08-20 #2): an open failure under fd pressure (EMFILE, on a node whose density is the design
-  # premise), a :busy from a concurrent writer, or a :query_timeout on a large quick_check all used
-  # to take the corruption branch. Both verdicts REFUSE the flush, so the good stored object stays
-  # authoritative either way; what differs is the alarm — :corrupt_local is permanent and escalates
-  # on first occurrence, :integrity_unknown is transient and just retries next interval.
-  #
-  # NEITHER branch quarantines. This runs while the shard is being SERVED, and quarantine_corrupt!/2
-  # renames the live file and unlinks its -shm; that rename is what made this a data-loss path
-  # rather than a refused flush.
-  defp integrity_verdict({:error, reason}) do
-    # "I could not check it" is not "it is corrupt" (expert review 2026-08-20 #2). An
-    # Sqlite3.open failure under fd pressure (EMFILE — on a node whose density is the design
-    # premise), a :busy from a concurrent writer, or a :query_timeout on a large quick_check all
-    # used to take the corruption branch. Both verdicts REFUSE the flush, so the good stored
-    # object stays authoritative either way; what differs is the alarm — :corrupt_local is
-    # permanent and escalates on the first occurrence, :integrity_unknown is transient and just
-    # retries next interval.
-    #
-    # NEITHER branch quarantines. This path runs while the shard is being SERVED, and
-    # quarantine_corrupt!/2 renames the live file and unlinks its -shm; see the hazard note on
-    # that function. That rename is what made this a data-loss path rather than a refused flush.
-    case classify_integrity_failure(reason) do
-      :corrupt -> {:error, {:corrupt_local, reason}}
-      :unknown -> {:error, {:integrity_unknown, reason}}
-    end
-  end
-
-  defp verify_flush_integrity?,
-    do: Application.get_env(:fathom, :verify_flush_integrity, true)
+  # run_quick_check/1, integrity_verdict/1 and verify_flush_integrity?/0 moved to
+  # `Fathom.Shard.Integrity` (2026-09-13, Phase 2) as run_quick_check/1, verdict/1 and verify_flush?/0.
 
   # Wait out an in-flight durability-flush task and fold its result into the state
   # (expert review #27) — used on the terminate path so the final drop-flush never
