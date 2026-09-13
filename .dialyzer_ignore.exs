@@ -97,12 +97,12 @@
   # knowable and the catch-all is genuinely reachable. `list_unused_filters: true` caught the stale
   # entry, which is the whole reason that option is on.
 
-  # `Shard.flush_position/1`'s no-lease clause. It is guarded `when is_integer(epoch)` on a
-  # destructured `%{lease: %{epoch: epoch}}`, and every state dialyzer can see has one — but the
-  # clause answers the no-lease case with `nil`, which the comment above it explains is the SAFE
-  # answer: an absent stamp reads as "unknown" and makes the object un-overridable. Crashing there
-  # instead would fail a durability flush.
-  {"lib/fathom/shard.ex", :pattern_match_cov},
+  # REMOVED 2026-09-13. This covered `Shard.flush_position/1`'s no-lease clause, which dialyzer
+  # called unreachable because every coordinator state it could see carried a lease with an integer
+  # epoch. That code moved to `Fathom.Shard.Position` (Phase 0 of the coordinator decomposition),
+  # where `flush_position/1,2` are PUBLIC with a `map()` spec — so the no-lease catch-all is now
+  # genuinely reachable and dialyzer stops flagging it. No filter needed; `list_unused_filters:
+  # true` caught the stale entry, which is the whole reason that option is on.
 
   # `Bench.seed_dead_lock/1` passes a NEGATIVE ttl to `Storage.acquire_lease/3`, whose contract is
   # `pos_integer()`. This is deliberate and commented: it seeds an already-expired lock so the next

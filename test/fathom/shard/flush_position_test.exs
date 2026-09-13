@@ -451,7 +451,8 @@ defmodule Fathom.Shard.FlushPositionTest do
     # the most complete copy of the shard that exists. `N + 1` at offset 0 is the same reasoning
     # `wal_gen + 1` already uses, one field over.
     test "a checkpointed flush over-claims the ordinal, and names no salt" do
-      source = File.read!("lib/fathom/shard.ex")
+      # position_after_checkpoint/3 moved to Fathom.Shard.Position (2026-09-13, Phase 0).
+      source = File.read!("lib/fathom/shard/position.ex")
 
       [_, body] = String.split(source, "defp position_after_checkpoint(epoch,", parts: 2)
       [body, _] = String.split(body, "\n  # ", parts: 2)
