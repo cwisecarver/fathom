@@ -62,6 +62,7 @@ defmodule Fathom.Shard do
     FlushGate,
     Heartbeat,
     Position,
+    Provenance,
     Storage,
     WarmFollower,
     WriteCounter
@@ -879,9 +880,9 @@ defmodule Fathom.Shard do
         # etag ONLY when the touch's SOURCE (`pre`) is this file's own
         # provenance; anything else is a fork — quarantine and re-pull, the #1
         # contract.
-        case read_etag_sidecar(path) do
+        case Provenance.read(path) do
           {:ok, provenance} when is_binary(pre) and provenance == pre ->
-            write_etag_sidecar(path, post)
+            Provenance.write(path, post)
             {:ok, post}
 
           # Finding #6: a never-flushed local shard carries the `-` (no object) sidecar. If this
@@ -894,7 +895,7 @@ defmodule Fathom.Shard do
           # clause. Without it the tenant's acked, fsynced writes are quarantined and an EMPTY db is
           # served on a same-node restart, on the one path where the disk is intact.
           :no_object when is_nil(pre) ->
-            write_etag_sidecar(path, post)
+            Provenance.write(path, post)
             {:ok, post}
 
           _ ->
@@ -921,7 +922,7 @@ defmodule Fathom.Shard do
       # `etag == pre` unambiguously means the pre-touch object. Only reachable on the cold
       # (non-warm) takeover path — the warm clause above catches warm? == true first.
       is_binary(pre) and etag == pre ->
-        write_etag_sidecar(path, post)
+        Provenance.write(path, post)
         {:ok, post}
 
       true ->
@@ -946,11 +947,11 @@ defmodule Fathom.Shard do
       # clobber). Drop the now-wrong provenance sidecar so a crash before that
       # flush doesn't strand the next open fencing on the vanished etag.
       {:ok, nil} ->
-        File.rm(etag_sidecar(path))
+        File.rm(Provenance.sidecar_path(path))
         {:ok, nil}
 
       {:ok, current} when warm? ->
-        write_etag_sidecar(path, current)
+        Provenance.write(path, current)
         {:ok, current}
 
       {:ok, _newer} ->
@@ -985,7 +986,7 @@ defmodule Fathom.Shard do
       # warm, fence with nil so the first flush RECREATES it (an If-Match against a
       # gone object could never succeed), and drop the dangling sidecar.
       {:ok, nil} ->
-        File.rm(etag_sidecar(path))
+        File.rm(Provenance.sidecar_path(path))
         {:ok, nil}
 
       # The release-in-gap fork (#19): another owner acquired, flushed, and
@@ -1160,7 +1161,7 @@ defmodule Fathom.Shard do
     # was unreachable at open, fencing with the provenance etag makes a forked flush
     # 412 (self-fence) instead of clobbering. A missing sidecar is a legacy warm file
     # from before provenance tracking: fall back to adopting the current etag, once.
-    case read_etag_sidecar(path) do
+    case Provenance.read(path) do
       {:ok, etag} ->
         {:ok, etag}
 
@@ -1266,7 +1267,7 @@ defmodule Fathom.Shard do
       # `.db`, see handle_continue's `warm?`), and the brand-new-open branch below
       # File.rm's a stale sidecar before landing. The sidecar path is `<path>.etag`,
       # derived from the FINAL path, so it's writable before the rename.
-      write_etag_sidecar(path, etag)
+      Provenance.write(path, etag)
 
       case File.rename(temp, path) do
         :ok ->
@@ -1291,7 +1292,7 @@ defmodule Fathom.Shard do
       # So record the absence EXPLICITLY. `@no_object_sentinel` means "this file was created
       # locally against no stored object", which is a provenance claim the open path can check
       # (see fork_evidence/2) rather than an absence it has to guess about.
-      write_no_object_sidecar(path)
+      Provenance.write_no_object(path)
       {:ok, etag}
     end
   end
@@ -2323,7 +2324,7 @@ defmodule Fathom.Shard do
               # (a clean crash-recovery of identical bytes). Writing it first closes the
               # window so recovery is an ordinary clean warm restart, matching the
               # periodic-flush, settle, and reconcile sites that already stamp on success.
-              write_etag_sidecar_durable(state.path, new_etag)
+              Provenance.write_durable(state.path, new_etag)
               # Record the durable-flush time before we drop + release (#28): the shard's writes
               # reached storage, so it's NOT dirty-at-loss even though its coordinator is gone.
               Fathom.Directory.Recorder.record_flush(state.id)
@@ -2602,7 +2603,7 @@ defmodule Fathom.Shard do
         "shard #{state.id}: flush 412 with lock ours; re-fenced to the object and re-uploaded"
       )
 
-      write_etag_sidecar_durable(state.path, new_etag)
+      Provenance.write_durable(state.path, new_etag)
       Fathom.Directory.Recorder.record_flush(state.id)
       drop_local_unless_serving(state)
       Storage.release_lease(state.id, state.lease)
@@ -2822,8 +2823,8 @@ defmodule Fathom.Shard do
     path = db_path(shard_id)
 
     case Storage.object_etag(shard_id) do
-      {:ok, etag} when not is_nil(etag) -> write_etag_sidecar(path, etag)
-      _ -> write_no_object_sidecar(path)
+      {:ok, etag} when not is_nil(etag) -> Provenance.write(path, etag)
+      _ -> Provenance.write_no_object(path)
     end
 
     :ok
@@ -3050,7 +3051,7 @@ defmodule Fathom.Shard do
     case File.rename(state.path, dest) do
       :ok ->
         Enum.each(["-wal", "-shm"], &File.rename(state.path <> &1, dest <> &1))
-        File.rm(etag_sidecar(state.path))
+        File.rm(Provenance.sidecar_path(state.path))
         unflushed = max(WriteCounter.count(state.id) - state.flushed_through, 0)
 
         Logger.error(
@@ -3349,7 +3350,7 @@ defmodule Fathom.Shard do
         case File.rename(temp, path) do
           :ok ->
             Enum.each(["-wal", "-shm"], &File.rm(path <> &1))
-            write_etag_sidecar(path, new_etag)
+            Provenance.write(path, new_etag)
             Follower.forget(follower, shard_id)
 
             Logger.warning(
@@ -3406,79 +3407,10 @@ defmodule Fathom.Shard do
     end
   end
 
-  # --- etag provenance sidecar (expert review #1) ---
-  #
-  # `<path>.etag` records which stored-object version the live local file derives
-  # from — written on every pull promotion and successful flush, removed with the
-  # local copy. A warm restart compares it to the store's current etag: equal ⇒ the
-  # local file continues the stored lineage (and may hold newer un-flushed writes);
-  # different ⇒ the lineages FORKED (another node wrote and released while we were
-  # down) and serving or flushing our copy would clobber acknowledged writes.
-
-  defp etag_sidecar(path), do: path <> ".etag"
-
-  # "Derived from: no stored object." A real etag is a hex content hash, so this can never
-  # collide with one. Written when a brand-new shard is born locally, so that "no object" is a
-  # POSITIVE provenance claim rather than an absent sidecar (expert review 2026-08-01 #2).
-  @no_object_sentinel "-"
-
-  defp write_no_object_sidecar(path), do: write_etag_sidecar(path, @no_object_sentinel)
-
-  defp write_etag_sidecar(_path, nil), do: :ok
-
-  defp write_etag_sidecar(path, etag) do
-    # A plain write, deliberately NOT atomic_write ON THE PULL PATH: the sidecar has a single writer
-    # (this coordinator) and is read only at open, before any writer exists, so no torn CONCURRENT
-    # read is possible — and a torn PULL-path value after a crash merely reads as a mismatch ⇒ a
-    # spurious, recoverable quarantine of an object with NO un-flushed local writes (the safe
-    # direction). The temp+rename pattern costs ~5× more (two APFS-journaled metadata ops) on the
-    # timed cold-open path. The FLUSH path uses write_etag_sidecar_durable/2 instead — see there for
-    # why the same torn value is NOT recoverable once the local .db holds acked writes (#15).
-    case File.write(etag_sidecar(path), etag) do
-      :ok -> :ok
-      {:error, reason} -> Logger.warning("etag sidecar write failed: #{inspect(reason)}")
-    end
-  end
-
-  # The DURABLE sidecar write, for the FLUSH path (expert review 2026-09-05 #15). The plain write
-  # above is correct for the pull path, but after a periodic/drop flush PUT the sidecar names the
-  # object the tenant's fsynced commits descend from. If it is still in the page cache when an OS
-  # crash (kernel panic, power loss, hard VM reset) hits, the on-disk sidecar reverts to the OLD etag
-  # (or empty) while the local .db holds NEWER acked writes — fork_evidence then reads a divergence
-  # and quarantines the acked tail, serving the pre-PUT object. That is the RPO of node loss on the
-  # one path durability.md documents as loss-free (disk intact). storage.ex applies this same
-  # fsync+rename reasoning to every OBJECT file, but not to the file that decides whether the object
-  # is trusted. Cost: two metadata ops and one fsync on a ~40-byte file, beside a full-object PUT.
-  defp write_etag_sidecar_durable(_path, nil), do: :ok
-
-  defp write_etag_sidecar_durable(path, etag) do
-    case Storage.atomic_write(etag_sidecar(path), etag) do
-      :ok -> :ok
-      {:error, reason} -> Logger.warning("durable etag sidecar write failed: #{inspect(reason)}")
-    end
-  end
-
-  defp read_etag_sidecar(path) do
-    case File.read(etag_sidecar(path)) do
-      # A zero-length sidecar is a TORN WRITE, not "no provenance" (expert review
-      # #12): File.write is O_TRUNC and power loss classically leaves the truncated
-      # empty file. Mapping it to :missing fell through to the legacy adopt-current
-      # branch — the exact clobber the sidecar exists to prevent. Corrupt routes to
-      # quarantine instead (spurious but recoverable, the safe direction).
-      {:ok, ""} -> :corrupt
-      # An explicit "born locally against no stored object" claim (2026-08-01 #2) — distinct
-      # from an absent sidecar, which means unknown provenance.
-      {:ok, @no_object_sentinel} -> :no_object
-      {:ok, etag} -> {:ok, etag}
-      # A truly ABSENT sidecar is now UNKNOWN provenance, not "legacy, trust it". Every file
-      # this node creates carries a sidecar — a pulled object gets the object's etag, a
-      # born-empty shard gets the sentinel — so an absent one is a file fathom did not write
-      # here: a pre-provenance legacy copy, or a planted one.
-      {:error, :enoent} -> :missing
-      # Unreadable (eacces/eio/...) is unknown provenance, same safe direction.
-      {:error, _} -> :corrupt
-    end
-  end
+  # The etag provenance sidecar (`<path>.etag`) moved to `Fathom.Shard.Provenance` (2026-09-13,
+  # Phase 1). `Provenance.read/1` / `write/2` / `write_durable/2` / `write_no_object/1` /
+  # `sidecar_path/1` are the pure I/O; `stamp_local_provenance/1` above stays here as the public
+  # out-of-band seam and delegates to them.
 
   # Warm-restart fork detection. true ⇒ the local copy was quarantined (renamed to
   # `<path>.forked*`, preserved for operator recovery) and the open proceeds COLD,
@@ -3502,7 +3434,7 @@ defmodule Fathom.Shard do
   # our own touch from a real fork because it has `touch_pre_etag`/`touch_post_etag`. The HEAD
   # stays overlapped, so the latency win is unchanged.
   defp fork_evidence(shard_id, path) do
-    case read_etag_sidecar(path) do
+    case Provenance.read(path) do
       :missing ->
         :no_sidecar
 
@@ -3637,7 +3569,7 @@ defmodule Fathom.Shard do
     case File.rename(path, dest) do
       :ok ->
         Enum.each(["-wal", "-shm"], &File.rename(path <> &1, dest <> &1))
-        File.rm(etag_sidecar(path))
+        File.rm(Provenance.sidecar_path(path))
 
         cause =
           case reason do
@@ -4247,7 +4179,7 @@ defmodule Fathom.Shard do
   defp apply_flush_verdict(state, {:ok, new_etag, carried}) do
     # Uploaded; advance the fence etag, the provenance sidecar, and the flushed watermark
     # captured when the task started (clears dirty up to that point).
-    write_etag_sidecar_durable(state.path, new_etag)
+    Provenance.write_durable(state.path, new_etag)
 
     state = %{
       state
@@ -4289,7 +4221,7 @@ defmodule Fathom.Shard do
   # whatever the object currently holds — same lineage, plus more writes. That is exactly what
   # the provenance check needs to not false-quarantine a fork.
   defp apply_flush_verdict(state, {:reconciled, object_etag}) when not is_nil(object_etag) do
-    write_etag_sidecar_durable(state.path, object_etag)
+    Provenance.write_durable(state.path, object_etag)
     # DROP THE LINEAGE CACHE (expert review 2026-08-26 #33). This is the one verdict where the
     # object moved to an etag we did not write — our PUT 412'd — so what its metadata says is no
     # longer something we know. The next flush pays one HEAD and re-learns it, which is the whole
