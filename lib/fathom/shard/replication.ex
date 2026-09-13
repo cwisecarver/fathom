@@ -7,10 +7,11 @@ defmodule Fathom.Shard.Replication do
   `FollowerLog` and `Quorum` are pure decisions, `Follower` and `Shipper` are socket shells. This
   module is the only place they meet.
 
-  **Nothing calls this from the commit path yet.** The WAL hook that will feed it exists
-  (`native/fathom_udf/src/wal.rs`), but wiring the two together puts a network round trip inside a
-  tenant's COMMIT, and that step deserves its own review rather than arriving as a side effect of
-  building the transport.
+  **This is wired into the commit path and default-on in prod.** A committed write reaches it via
+  `ShardExecutor.maybe_replicate/5` → `Session.commit/3` → `ship_quorum/3`, so a tenant's COMMIT now
+  carries the network round trip this moduledoc once warned about. Shipping + quorum durability are
+  live from the prod default (`config/config.exs`); failover PROMOTION additionally waits on
+  `REPLICATION_ORDINAL_WIRE`. See `docs/a2-quorum-replication.md`.
   """
 
   require Logger

@@ -111,10 +111,13 @@ defmodule Fathom.Shard.Storage do
     * `Promote.fresher?/2` can pick a replica stranded at a HIGHER epoch from a previous ownership
       generation over an object flushed under a lower post-reset one — the older lineage.
 
-  **Not yet fixed** — the candidate fixes trade against cold-open latency and the storage contract,
-  so the decision is written up in the review's progress file rather than guessed at. Until then:
-  treat `epoch` as ordering-within-one-ownership-generation only, and do not add a third consumer
-  that assumes it counts a shard's history.
+  **Worked around, not "fixed in place."** The `epoch` field is still a lock generation and still
+  resets on a clean release — that did not change. What changed is that A2 no longer reads `epoch`
+  as history: a separate monotonic `lineage` counter (`Fathom.Shard.lineage/1`, seeded by
+  `next_lineage/1`, carried on `flush/5` and every replication push) is the shard-history number
+  now, and `FollowerLog.decide/2` / `Promote.fresher?/2` rank on it. So the rule below still holds:
+  treat `epoch` as ordering-within-one-ownership-generation only, and route any new consumer that
+  needs a shard's history to `lineage`, never to `epoch`.
   """
   @type position :: %{
           :epoch => non_neg_integer(),
