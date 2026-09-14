@@ -14,6 +14,12 @@ short because AGENTS.md is loaded into every session.
   them to the gitignored `audits/` directory, along with the `.progress.md` log `/iterate` keeps.
   They are working artifacts full of provisional findings; only the fixes they drive belong in the
   repo. See the `/audits/` entry in `.gitignore` for the reasoning.
+  - **Cite a review finding by DATE, not a bare `#N`.** Because the reports are gitignored, an
+    outside reader can't resolve a reference — and `#N` collides across review series (`#18` appears
+    in several unrelated ones), so a bare number is ambiguous even internally. New in-code
+    references must carry the review date: `expert review 2026-07-14 #18`, not `review #18`. The
+    ~386 legacy bare-`#N` comments already in `lib/` are grandfathered — a mechanical sweep to
+    date them is not worth the risk (arch review 2026-09-12 #7); just don't add more.
 
 ### What exists today (the working slice)
 
