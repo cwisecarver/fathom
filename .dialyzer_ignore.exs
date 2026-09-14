@@ -67,12 +67,20 @@
   # cannot narrow on the literal tuple. Removable if OTP's spec gains overloads.
   {"lib/fathom/rate_limiter.ex", :missing_range, 45},
 
-  # Attributed to line 1, i.e. macro-expanded rather than fathom source: `Fathom.Shard` is
-  # `use GenServer, restart: :temporary` with an overridden `child_spec/1` that calls `super()`.
-  # There is no line-1 code to fix, and no conditional in the module's own source that matches
-  # (`grep` for compile-time branches finds none). Removable if a future Elixir/OTP attributes it
-  # to real source, at which point it should be re-read rather than re-ignored.
-  {"lib/fathom/shard.ex", :pattern_match, 1},
+  # RELOCATED 2026-09-13 (Phase 5): this was `{"lib/fathom/shard.ex", :pattern_match, 1}`, and its
+  # old comment MISDIAGNOSED it as the `use GenServer` + `child_spec/1` super() macro. It is not —
+  # extracting the A2 promote-on-open code carried the warning with it to
+  # `lib/fathom/shard/promote_on_open.ex`, which proves the real source is there. It is
+  # `elem_reason/1`'s defensive `if is_tuple(reason) and tuple_size(reason) > 0, …, else: reason`:
+  # every reason that reaches it today IS a tagged tuple (`Recovery.recheck/3`'s
+  # `{:object_moved,…}`/`{:object_advanced,…}` and the `{:object_head_unreadable,…}` the other
+  # caller passes), so dialyzer proves the guard always true and the `else` (false) branch dead.
+  # Category (2): kept as a TOTAL clause anyway, because it runs inside `decline_promotion/3` on the
+  # shard-open path — a future plain-atom reason would otherwise raise FunctionClauseError from a
+  # telemetry label and fail an open the ordinary stored-object path would have served fine.
+  # The macro-expanded `if` attributes it to line 1. Removable if a future reason makes the else
+  # reachable (then dialyzer stops flagging it and this filter goes unused).
+  {"lib/fathom/shard/promote_on_open.ex", :pattern_match, 1},
 
   # --- (2) deliberate, and unreachable only for reasons that are not guaranteed -----------------
 
