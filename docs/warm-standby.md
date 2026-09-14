@@ -1,10 +1,15 @@
 # Fathom — warm standby (how the built engine works)
 
-> Status: **BUILT** (Phase 2 A1, `Fathom.Shard.WarmFollower`). Gated `:warm_follower`, **off by
-> default** (and off in test). This is the "how it actually works" reference; the RTO / warm-density
-> numbers live under Benchmarking in `AGENTS.md` (and `mix fathom.bench --only failover_rto` /
-> `mix fathom.scale --warm-density`). Live WAL streaming (A2) — keeping a standby *continuously*
-> fresh — is **deferred**; this is the pre-pull-the-hot-set approach.
+> Status: **BUILT but SUPERSEDED by A2 replication** (arch review 2026-09-12 #3, decided
+> 2026-09-14). A2 (`docs/a2-quorum-replication.md`) shipped and is ON by default in prod; it closes
+> the node-loss **RPO** gap, which warm standby never did — warm standby only cut failover **RTO**
+> (it skips the cold S3 pull). Keeping both is two failover mechanisms sharing the `Promote.fresher?`
+> concept but not an implementation, so warm standby is **retired, not removed**: still gated
+> `:warm_follower` **off by default**, code kept (it is wired into
+> `Fathom.Shard.Materializer.warm_or_cold_pull/2` and A2 has no read-cache story yet), intended end
+> state is to fold this read cache into A2's follower read path. **Do not enable in prod without
+> revisiting.** The doc below is the "how it actually works" reference for the retained code; RTO /
+> warm-density numbers live under Benchmarking in `AGENTS.md`.
 
 ## The problem it solves
 

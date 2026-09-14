@@ -1,5 +1,18 @@
 defmodule Fathom.Shard.WarmFollower do
   @moduledoc """
+  **SUPERSEDED by A2 replication (arch review 2026-09-12 #3, decided 2026-09-14).** A2
+  (replicate-before-ack, `docs/a2-quorum-replication.md`, ON by default in prod) is the strategic
+  failover path: it closes the node-loss **RPO** gap, which warm standby never addressed — warm
+  standby only cut failover **RTO** (it avoids the cold S3 pull; the two solve different problems).
+  Keeping both means maintaining two failover-promotion mechanisms that share the `Promote.fresher?`
+  freshness concept but not an implementation. So this module is **retired, not deleted**: it stays
+  gated `:warm_follower` **off by default**, the code is kept because it is still wired into the pull
+  fast path (`Fathom.Shard.Materializer.warm_or_cold_pull/2`) and A2 has no read-cache story yet, and
+  the intended end state is to FOLD this read cache into A2's follower read path rather than run two.
+  **Do not build new features on it, and do not turn it on in prod without revisiting this decision.**
+
+  ---
+
   Keeps the fleet's recently-active shards **warm** on this node so a failover skips
   the cold-open-from-S3 (the Phase-2 availability win — see `docs/phase2-scoping.md`).
 
@@ -16,7 +29,7 @@ defmodule Fathom.Shard.WarmFollower do
   Because the cache may lag the owner's latest flush, a cached copy is **never served
   as-is**: each pull goes through `Storage.pull_if_changed/3` and records the object's
   etag in a `<shard>.db.etag` sidecar, and at failover the coordinator revalidates that
-  etag against the store before promoting the cache (`Fathom.Shard.start_pull` — H2).
+  etag against the store before promoting the cache (`Fathom.Shard.Materializer.start_pull/2` — H2).
 
   ## Revalidation rides the directory's flush signal, not a GET-per-shard poll
 
