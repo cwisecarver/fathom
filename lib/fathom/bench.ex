@@ -55,7 +55,10 @@ defmodule Fathom.Bench do
 
   alias Fathom.Migrator.Copy
   alias Fathom.Shard.Connection
+  alias Fathom.Shard.Replication.Follower
+  alias Fathom.Shard.Replication.Wal
   alias Fathom.Shard.Storage
+  alias Fathom.ShardExecutor
   alias Fathom.Shards
 
   @default_trials 5
@@ -72,6 +75,12 @@ defmodule Fathom.Bench do
   @concurrent_ms 1_000
   @recorder_rows 2_000
   @warm_size_kb 256
+  # A2 promote-on-open failover arm: the shard holds @promote_rows, the stored object is stamped
+  # holding only the first @promote_flush_after (so a survivor that cold-opened would be short),
+  # and a local replica carries the rest. The gap is what promote-on-open recovers, and the row
+  # count is the in-harness guard that the promotion actually fired.
+  @promote_rows 20
+  @promote_flush_after 10
   # How many shards `warm_s3_throughput/1` pulls concurrently. The name is legacy (the metric was
   # `warm_s3` when it shared harness bits with the retired WarmFollower); the measurement is and
   # always was concurrent S3-pull throughput, kept under its original series name for continuity.
@@ -136,9 +145,11 @@ defmodule Fathom.Bench do
       # Concurrent S3-pull throughput (N shards pulled at once ÷ wall) — the node-startup / mass
       # failover number. Named `warm_s3` for series continuity; it never depended on WarmFollower.
       warm_s3_shards_per_s: run_if(only, :warm_s3, fn -> warm_s3_throughput(opts) end),
-      # Failover RTO at real size: cold pull (opt-in, S3). The warm 304-promote arm was removed
-      # 2026-09-14 with the WarmFollower retirement.
+      # Failover RTO at real size, both opt-in (S3): the cold S3 body-pull baseline, and the A2
+      # promote-on-open arm that serves a pre-positioned local replica instead. The promote arm
+      # replaces the warm 304-promote arm removed 2026-09-14 with the WarmFollower retirement.
       failover_cold_s3_p50_us: rto && rto.cold_us,
+      failover_promote_p50_us: rto && rto.promote_us,
       dir_resolve_p50_us: run_if(only, :dir_resolve, fn -> dir_resolve(opts) end),
       # The path per-checkout directory work ACTUALLY takes since the Recorder landed (#41.6);
       # dir_resolve above is control-plane only and was standing in for a per-request cost it no
@@ -373,28 +384,33 @@ defmodule Fathom.Bench do
     drop_db(tmp)
   end
 
-  # --- failover RTO: warm-standby vs cold (S3) -----------------------------
+  # --- failover RTO: A2 promote-on-open vs cold (S3) -----------------------
 
   @doc """
-  Failover RTO: median latency (µs) to open a shard on a survivor **cold** (pull the
-  whole object from S3, today's failover cost) vs **warm** (the shard is already in
-  the warm-follower cache). Both take the real crash-failover path — a lease STEAL that
-  touches (etag-rotates) the object (#15) — so the warm sample exercises the steal+touch
-  takeover the warm follower must survive, not a no-steal open. Both at `:warm_size_kb`.
-  Returns `%{cold_us, warm_us}`, or `nil` without an S3 endpoint (opt-in, like `cold_open_s3/1`).
+  Failover RTO: median latency (µs) to open a shard on a survivor **cold** (pull the whole object
+  from S3, today's baseline failover cost) vs **promote** (a local A2 replica is already on disk,
+  so `Fathom.Shard.Replication.PromoteOnOpen` serves it instead of a body GET). Both at
+  `:warm_size_kb`. Returns `%{cold_us, promote_us}` — `promote_us` is `nil` if the promote arm
+  could not be exercised — or the whole thing is `nil` without an S3 endpoint (opt-in, like
+  `cold_open_s3/1`).
 
-  The honest delta: the warm path is **not** purely local. H2 must confirm the cache
-  hasn't gone stale (a warm copy can lag the owner's latest flush), so it still pays
-  ONE S3 round-trip — but a `304` with no body. The win over cold is the object
-  **body transfer** avoided, so it grows with shard size and bandwidth-delay and is
-  marginal for a tiny shard on a fast link. Against localhost MinIO this measures
-  protocol + loopback; inject latency/bandwidth (`scripts/benchmark_s3_latency.sh`) or
+  The honest delta: promote-on-open is **not** purely local — it still takes a pre-promotion
+  snapshot, reads the object head, and does a fenced PUT of the promoted bytes. The win over cold
+  is the object **body transfer** (the S3 GET) avoided, so it grows with shard size and
+  bandwidth-delay and is marginal for a tiny shard on a fast link. Against localhost MinIO this
+  measures protocol + loopback; inject latency/bandwidth (`scripts/benchmark_s3_latency.sh`) or
   point `FATHOM_S3_TEST_ENDPOINT` at in-region S3 for the production gap.
+
+  Replaces the removed warm-follower arm (`failover_warm_s3_p50_us`, retired 2026-09-14): A2
+  promote-on-open is the mechanism that now shortens failover by pre-positioning bytes. The promote
+  sample asserts the promotion **actually fired** (the served row count must include the rows only
+  the replica held); a silent cold-open fallback raises rather than being timed and mislabeled.
+
+  Caveat carried from `PromoteOnOpenTest`'s moduledoc: the fixture ranks the replica by seeding it
+  strictly ahead of the object's own stamp, so this is a "promotion-path latency" number, not proof
+  that production's two-counter (lineage vs lock-epoch) comparison ranks a real shipped replica.
   """
-  # Cold failover RTO only. The warm arm (304-promote from the WarmFollower cache) was removed
-  # 2026-09-14 with the WarmFollower retirement; failover is now always a cold open from S3 (or an
-  # A2 promote-on-open, measured separately).
-  @spec failover_rto(keyword()) :: %{cold_us: float()} | nil
+  @spec failover_rto(keyword()) :: %{cold_us: float(), promote_us: float() | nil} | nil
   def failover_rto(opts \\ []) do
     if s3_opt_in?() do
       setup_s3(opts)
@@ -421,7 +437,7 @@ defmodule Fathom.Bench do
           end)
           |> p50()
 
-        %{cold_us: cold}
+        %{cold_us: cold, promote_us: promote_rto(samples, size_kb)}
       rescue
         e ->
           Logger.warning("failover_rto skipped: S3 unreachable/misconfigured (#{inspect(e)})")
@@ -435,6 +451,195 @@ defmodule Fathom.Bench do
       nil
     end
   end
+
+  # The A2 promote-on-open arm. Degrades to nil (never a fake number) if the promote path cannot be
+  # exercised — the row-count guard inside promote_open_sample/3 turns a silent cold-open fallback
+  # into a raise, which is caught here and reported as "not measured". The bench_test.exs @tag :bench
+  # test is what asserts the mechanism actually fires on every run (it runs on Local storage, so it
+  # works without an S3 endpoint); this arm carries the real-size S3 number when a rig provides one.
+  defp promote_rto(samples, size_kb) do
+    replica_dir = Path.join(tmp_dir(), "bench_replica_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(replica_dir)
+    ensure_started(Follower, name: Follower, port: 0, dir: replica_dir)
+    setup_write_path()
+
+    prev_gate = Application.get_env(:fathom, :replication_promote_on_open)
+    prev_recover = Application.get_env(:fathom, :replication_recover_from_peers)
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+    # Force the local promote path (no peer sockets); there is no fleet here to ask.
+    Application.put_env(:fathom, :replication_recover_from_peers, false)
+    blob_bytes = div(size_kb * 1024, @promote_rows)
+
+    try do
+      times(samples, fn _ ->
+        promote_open_sample(@promote_rows, @promote_flush_after, blob_bytes)
+      end)
+      |> p50()
+    rescue
+      e ->
+        Logger.warning("failover_rto promote arm skipped: #{inspect(e)}")
+        nil
+    catch
+      :exit, reason ->
+        Logger.warning("failover_rto promote arm skipped: #{inspect(reason)}")
+        nil
+    after
+      restore_env(:replication_promote_on_open, prev_gate)
+      restore_env(:replication_recover_from_peers, prev_recover)
+    end
+  end
+
+  @doc false
+  # One promote-on-open failover sample: a shard whose stored object is stamped holding only
+  # `flush_after` rows while a local A2 replica carries all `total`. Kill the primary, time the
+  # survivor open (which runs `maybe_promote_replica/5`), and RAISE unless the promotion fired —
+  # the served row count must be the full `total`, or a silent cold open was measured. Public so the
+  # @tag :bench verification test drives the exact same code the S3 arm does. Requires a
+  # default-named `Follower` already running and `:replication_promote_on_open` true.
+  @spec promote_open_sample(pos_integer(), pos_integer(), non_neg_integer()) :: non_neg_integer()
+  def promote_open_sample(total, flush_after, blob_bytes) do
+    id = uniq("bench_promote")
+    {handle, coordinator} = build_stamped_shard(id, total, flush_after, blob_bytes)
+    {:ok, stamp} = Storage.object_position(id)
+
+    install_bench_replica(id, %{
+      epoch: stamp.epoch,
+      wal_gen: stamp.wal_gen,
+      wal_ordinal: Map.get(stamp, :wal_ordinal, 0),
+      offset: stamp.offset + 1
+    })
+
+    tear_down_bench_primary(id, handle, coordinator)
+
+    {us, served} = :timer.tc(fn -> open_count(id) end)
+    Shards.drain(id)
+
+    unless served == total do
+      raise "promote bench measured a cold open: served #{served}/#{total} rows, promotion did " <>
+              "not fire (unstamped object, or replica not ranked ahead)"
+    end
+
+    us
+  end
+
+  # Build a shard through the coordinator write path, flushing at `flush_after` so the STORED OBJECT
+  # is stamped holding only those rows, then write the rest so the live shard (and the replica taken
+  # from it) is ahead. `assign_ordinal!/2` is the step a replicating Session normally does — without
+  # it the object stamp carries no WAL ordinal and `Promote.fresher?/2` refuses to rank any replica.
+  defp build_stamped_shard(id, total, flush_after, blob_bytes) do
+    {:ok, coordinator} = Shards.ensure(id)
+    {:ok, handle} = ShardExecutor.open(id)
+
+    {:ok, _} =
+      ShardExecutor.execute(handle, %Filo.Stmt{
+        sql: "CREATE TABLE t (a INTEGER PRIMARY KEY, data BLOB)",
+        args: []
+      })
+
+    for i <- 1..total do
+      {:ok, _} =
+        ShardExecutor.execute(handle, %Filo.Stmt{
+          sql: "INSERT INTO t VALUES (?1, randomblob(?2))",
+          args: [i, blob_bytes]
+        })
+
+      if i == flush_after do
+        _ = assign_ordinal!(id, coordinator)
+        flush_settle(coordinator)
+      end
+    end
+
+    {handle, coordinator}
+  end
+
+  # Read the current WAL salt and have the coordinator assign the ordinal for it — the stamp the
+  # flush will carry. Called immediately before the flush: a checkpoint restarts the log with fresh
+  # salts, so a salt read any earlier names a WAL the flush will not see.
+  defp assign_ordinal!(id, coordinator) do
+    wal = Fathom.Shard.db_path(id) <> "-wal"
+    {:ok, %{salt1: salt}} = Wal.read(wal)
+    n = Fathom.Shard.wal_ordinal(coordinator, salt)
+
+    if n <= 0 do
+      raise "bench: the coordinator assigned no WAL ordinal; the object stamp cannot be ranked"
+    end
+
+    n
+  end
+
+  defp flush_settle(coordinator) do
+    send(coordinator, :durability_flush)
+    settle_flush(coordinator, 400)
+  end
+
+  defp settle_flush(_c, 0), do: raise("bench: durability flush task never settled")
+
+  defp settle_flush(c, tries) do
+    if :sys.get_state(c).flush_task == nil do
+      :ok
+    else
+      Process.sleep(10)
+      settle_flush(c, tries - 1)
+    end
+  end
+
+  # Copy the live shard's own bytes into the follower dir and seed its position — a real replica,
+  # not a fabrication (the WAL offsets refer to the primary's WAL, as shipped frames would leave
+  # them). Lock epoch pinned at 1; the ranking field is the lineage (position.epoch) + ordinal.
+  defp install_bench_replica(id, position) do
+    path = Fathom.Shard.db_path(id)
+    File.cp!(path, Follower.db_path(Follower, id))
+
+    case File.stat(path <> "-wal") do
+      {:ok, %{size: size}} when size > 0 ->
+        File.cp!(path <> "-wal", Follower.wal_path(Follower, id))
+
+      _ ->
+        File.write!(Follower.wal_path(Follower, id), "")
+    end
+
+    Follower.seed(Follower, id, 1, position.wal_gen, 0, position.offset, position.epoch)
+    :ok = Follower.note_ordinal(Follower, id, Map.get(position, :wal_ordinal, 0))
+  end
+
+  # Node loss, not a shutdown: kill the coordinator (a graceful stop would drop-flush every row to
+  # the object and make the promote guard vacuous) and remove the dead node's local files, leaving
+  # only the object and the replica.
+  defp tear_down_bench_primary(id, handle, coordinator) do
+    ref = Process.monitor(coordinator)
+    Process.exit(coordinator, :kill)
+
+    receive do
+      {:DOWN, ^ref, :process, ^coordinator, _} -> :ok
+    after
+      2_000 -> raise "bench: the coordinator did not die"
+    end
+
+    _ =
+      try do
+        ShardExecutor.close(handle)
+      catch
+        :exit, _ -> :ok
+      end
+
+    for s <- ["", "-wal", "-shm", ".etag"], do: File.rm(Fathom.Shard.db_path(id) <> s)
+    :ok
+  end
+
+  # The survivor open — runs the coordinator open path where promote-on-open fires — returning the
+  # served row count so the caller can prove the promotion happened.
+  defp open_count(id) do
+    {:ok, handle} = ShardExecutor.open(id)
+
+    {:ok, %{rows: [[n]]}} =
+      ShardExecutor.execute(handle, %Filo.Stmt{sql: "SELECT count(*) FROM t", args: []})
+
+    :ok = ShardExecutor.close(handle)
+    n
+  end
+
+  defp restore_env(key, nil), do: Application.delete_env(:fathom, key)
+  defp restore_env(key, val), do: Application.put_env(:fathom, key, val)
 
   # Seed a dead prior owner's lock so the next open STEALS it and touches (etag-rotates)
   # the object — the crash-failover path (#15). A negative TTL lands `expires_at_ms` past

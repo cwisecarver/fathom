@@ -209,10 +209,87 @@ defmodule Fathom.BenchTest do
   end
 
   test "failover_rto is opt-in: nil without an S3 endpoint" do
-    # The warm-vs-cold failover RTO delta is only meaningful against a network store
-    # (the warm win is the S3 body transfer avoided), so it's S3-only like cold_open_s3.
+    # The cold-vs-promote failover RTO delta is only meaningful against a network store
+    # (the promote win is the S3 body transfer avoided), so it's S3-only like cold_open_s3.
     unless System.get_env("FATHOM_S3_TEST_ENDPOINT") do
       assert Fathom.Bench.failover_rto() == nil
+    end
+  end
+
+  # The A2 promote-on-open failover arm's MECHANISM, on Local storage so it runs on every machine
+  # without an S3 endpoint (the S3 `failover_rto` arm above is nil-skipped here). This is the guard
+  # AGENTS.md demands for a new bench metric: `promote_open_sample/3` RAISES unless the promotion
+  # actually fired — the survivor open must serve all `total` rows, not just the `flush_after` the
+  # stored object held — so a silent cold-open fallback (unstamped object, replica not ranked ahead)
+  # fails this test loudly instead of banking a mislabeled number. Without it the metric could ship
+  # measuring a cold open and calling it a promote.
+  test "the promote-on-open arm actually promotes, and clears its ceiling" do
+    dir = Path.join(System.tmp_dir!(), "bench_promote_test_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+
+    start_supervised!(
+      {Fathom.Shard.Replication.Follower,
+       name: Fathom.Shard.Replication.Follower, port: 0, dir: dir}
+    )
+
+    prev_gate = Application.get_env(:fathom, :replication_promote_on_open)
+    prev_recover = Application.get_env(:fathom, :replication_recover_from_peers)
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+    Application.put_env(:fathom, :replication_recover_from_peers, false)
+
+    on_exit(fn ->
+      if is_nil(prev_gate),
+        do: Application.delete_env(:fathom, :replication_promote_on_open),
+        else: Application.put_env(:fathom, :replication_promote_on_open, prev_gate)
+
+      if is_nil(prev_recover),
+        do: Application.delete_env(:fathom, :replication_recover_from_peers),
+        else: Application.put_env(:fathom, :replication_recover_from_peers, prev_recover)
+
+      File.rm_rf(dir)
+    end)
+
+    # 20 rows, object stamped at 10 — a cold open would serve 10, a promote serves 20. If the
+    # promotion did not fire, promote_open_sample/3 raises and this test fails, which is the point.
+    us = Fathom.Bench.promote_open_sample(20, 10, 4096)
+
+    assert is_integer(us) and us > 0
+    assert us < 5_000_000, "promote-on-open open #{us}µs exceeded the 5s ceiling"
+  end
+
+  # The guard BITES (AGENTS.md: a guard that cannot fail is decoration). With promote-on-open
+  # disabled, the survivor open serves only the stored object's 10 rows, so promote_open_sample/3
+  # must RAISE rather than time a cold open and call it a promote. This is the "run the new test
+  # against the unfixed code" probe made permanent — it is what stands between the metric and a
+  # silently-mislabeled number.
+  test "the promote sample raises when the promotion does not fire" do
+    dir = Path.join(System.tmp_dir!(), "bench_promote_off_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+
+    start_supervised!(
+      {Fathom.Shard.Replication.Follower,
+       name: Fathom.Shard.Replication.Follower, port: 0, dir: dir}
+    )
+
+    prev_gate = Application.get_env(:fathom, :replication_promote_on_open)
+    prev_recover = Application.get_env(:fathom, :replication_recover_from_peers)
+    Application.put_env(:fathom, :replication_promote_on_open, false)
+    Application.put_env(:fathom, :replication_recover_from_peers, false)
+
+    on_exit(fn ->
+      if is_nil(prev_gate),
+        do: Application.delete_env(:fathom, :replication_promote_on_open),
+        else: Application.put_env(:fathom, :replication_promote_on_open, prev_gate)
+
+      if is_nil(prev_recover),
+        do: Application.delete_env(:fathom, :replication_recover_from_peers),
+        else: Application.put_env(:fathom, :replication_recover_from_peers, prev_recover)
+
+      File.rm_rf(dir)
+    end)
+
+    assert_raise RuntimeError, ~r/measured a cold open/, fn ->
+      Fathom.Bench.promote_open_sample(20, 10, 4096)
     end
   end
 end

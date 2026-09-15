@@ -28,6 +28,10 @@ defmodule Fathom.Bench.Gate do
     # `failover_cold_s3_p50_us` is today's real failover cost and is opt-in like `cold_open_s3_p50_us`
     # above (nil ⇒ skipped): gating an opt-in metric costs nothing when unset and compares it when set.
     {:failover_cold_s3_p50_us, :higher_worse},
+    # The A2 promote-on-open failover arm — the honest successor to the removed warm 304-promote
+    # metric. Opt-in (S3) and nil-skipped like its cold sibling; the bench raises rather than
+    # emitting a number if the promotion did not actually fire, so a value here is a real promote.
+    {:failover_promote_p50_us, :higher_worse},
     {:dir_resolve_p50_us, :higher_worse},
     # The LIVE directory path, gated from 2026-08-03 (#41.6). `dir_resolve_p50_us` above is
     # control-plane only (provision/fork/migrate) and stopped being the per-request path when the
