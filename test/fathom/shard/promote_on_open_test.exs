@@ -19,35 +19,37 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
   The rest pin that everything uncertain falls back to the stored object: gate off, no stamp, and
   a replica level with the object.
 
-  ## WHAT THESE TESTS CANNOT SEE (expert review 2026-08-24 #12)
+  ## WHAT THESE TESTS RANK ON, AND WHERE THE WIRE IS PROVEN (expert review 2026-08-24 #12 — CLOSED)
 
-  Read this before trusting a green run here. Every test in this file seeds the replica FROM the
-  object's own stamp — `install_replica/2` calls
-  `Follower.seed(Follower, id, position.epoch, position.wal_gen, 0, position.offset)` — so both
-  sides of `Promote.fresher?/2` come from one number and the comparison is guaranteed
-  well-founded. **In production they come from two different counters.**
+  This file exercises the promote DECISION (`Promote.fresher?/2`) with conveniently-seeded
+  fixtures; the honest end-to-end WIRE coverage lives elsewhere (named below). Read this so you
+  don't mistake the fixture convenience for a coverage gap — it once was one, and is not now.
 
-  The object's stamp carries the LINEAGE (`open_lineage/1` → `Storage.next_lineage/1`, monotonic
-  across a release, never reset). The replica's `epoch` comes from `Session.with_epoch/1` →
-  `Fathom.Shard.epoch/1` → `state.lease.epoch` — the LOCK epoch, which `release_lease` resets to
-  **1** on every clean idle-drop, drain and handoff. The 2026-08-20 #8 fix split one number into
-  two and only migrated the object side.
+  `install_replica/2` here seeds the replica with the lock `epoch` PINNED at 1 and the lineage
+  supplied separately — `Follower.seed(Follower, id, 1, position.wal_gen, 0, position.offset,
+  position.epoch)` (the 7th arg is the lineage, taken from the object stamp's `:epoch` slot). So the
+  two counters are already SPLIT in these fixtures: `fresher?/2` ranks the replica's stated lineage
+  against the object's, exactly as production does, and the lock epoch is not the ranking field.
 
-  So from a shard's SECOND replicating open onward, `fresher?/2` is false for every replica no
-  matter how far ahead it is, and promote-on-open goes inert fleet-wide — silently, recovering to
-  the last flush exactly as if A2 were switched off. The unsafe direction is reachable too: on a
-  gate-toggled fleet a flush with `lineage: :disabled` stamps the LOCK epoch into the position
-  slot, so a replica stranded at a higher lock epoch from an earlier crash-steal can outrank a
-  NEWER object.
+  The gap this section used to describe (review #12) — the replica's `epoch` came from the LOCK
+  epoch (`state.lease.epoch`, reset to 1 on every clean idle-drop/drain/handoff) while the object
+  carried the monotonic LINEAGE (`open_lineage/1` → `Storage.next_lineage/1`), so from a shard's
+  second replicating open onward `fresher?/2` went inert fleet-wide, and a stale-high-lock-epoch
+  replica could outrank a newer object — is **CLOSED**. The lineage now ships as its own field on
+  both frames (`@seed_begin_lin` type 14, `@push_ord_lin` type 17 in `protocol.ex`), the follower
+  stores it (`FollowerLog` `:lineage`), and `fresher?/2` ranks on `{lineage, wal_ordinal,
+  next_offset}` — never the lock epoch. Fix commits: `e014e88` (ship the lineage), `3fad98c` (carry
+  it on the push + fence on it), `a210470` (rank on the WAL ordinal, not `wal_gen`).
 
-  These tests pass either way. Nothing in this file — or anywhere — lets a real push-derived epoch
-  meet a real lineage stamp. `ownership_cycle_position_test.exs` is the only test driving a real
-  shipped position, and it lands on `stamp == nil` (it says so itself), so its `refute` is
-  vacuous for this question.
-
-  Fixing it properly means shipping the lineage as its own field in `Push`/`SeedBegin` — a wire
-  change — which is why it is not fixed here. Do not add a test to this file that seeds from
-  `position.epoch` and call the gap closed; the seeding IS the gap.
+  The wire-honest test the old note said did not exist now does:
+  `ownership_cycle_position_test.exs` — "a real seeded replica ranks on the same counter as the
+  object's stamp" runs a full ownership cycle so the lineage outruns the lock epoch, enables
+  `:replication_lineage_wire`, seeds a REAL replica through the wire, does a real flush (a stamped
+  object, `is_map(stamp)`, not `nil`), and asserts `replica.lineage == stamp.epoch` while
+  `refute`-ing `replica.lineage == lock_epoch`. `replication_recovery_test.exs` and
+  `push_ordinal_wire_test.exs` also round-trip a real lineage across the wire. Those are the guards
+  against a real push-derived counter meeting a real lineage stamp; this file guards the ranking
+  logic itself.
   """
   use ExUnit.Case, async: false
 

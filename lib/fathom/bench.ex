@@ -406,9 +406,11 @@ defmodule Fathom.Bench do
   sample asserts the promotion **actually fired** (the served row count must include the rows only
   the replica held); a silent cold-open fallback raises rather than being timed and mislabeled.
 
-  Caveat carried from `PromoteOnOpenTest`'s moduledoc: the fixture ranks the replica by seeding it
-  strictly ahead of the object's own stamp, so this is a "promotion-path latency" number, not proof
-  that production's two-counter (lineage vs lock-epoch) comparison ranks a real shipped replica.
+  Scope caveat: like `PromoteOnOpenTest`'s fixtures, this seeds the replica strictly ahead of the
+  object's own stamp, so it is a "promotion-path latency" number — it does not itself re-prove the
+  lineage-vs-lock-epoch wire ranking. That ranking IS proven (the review-#12 gap is closed): see
+  `ownership_cycle_position_test.exs` "a real seeded replica ranks on the same counter as the
+  object's stamp", which drives a real lineage across the wire.
   """
   @spec failover_rto(keyword()) :: %{cold_us: float(), promote_us: float() | nil} | nil
   def failover_rto(opts \\ []) do
