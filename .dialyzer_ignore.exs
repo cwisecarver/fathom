@@ -48,10 +48,17 @@
   # on 2026-08-14 (also on `HranaClient.await_upgrade/2`), and written up next to the helper.
   # Removable if these metrics stop sharing one helper, or if dialyzer gains per-call-site
   # instantiation.
-  {"lib/fathom/bench.ex", :missing_range, 850},
-  {"lib/fathom/bench.ex", :missing_range, 913},
-  {"lib/fathom/bench.ex", :missing_range, 1005},
-  {"lib/fathom/bench.ex", :extra_range, 1063},
+  #
+  # LINE-LESS ON PURPOSE (2026-09-15). These were line-keyed ({file, kind, line}) and broke on
+  # every edit that shifted bench.ex line numbers — three times in one day, each a spurious
+  # `list_unused_filters` failure that has nothing to do with the code. bench.ex already carries
+  # line-less `:call`/`:no_return` filters below for the same reason. The trade-off is precision: a
+  # line-less `:missing_range`/`:extra_range` here will also swallow a genuinely NEW range warning
+  # elsewhere in bench.ex. Accepted because bench.ex is a benchmark harness (not a runtime path) and
+  # the four `with_wire/3` findings are the only range warnings it has ever produced; if a real one
+  # is ever masked, re-tighten to line-keyed for the specific new site, not the whole file.
+  {"lib/fathom/bench.ex", :missing_range},
+  {"lib/fathom/bench.ex", :extra_range},
 
   # `Quorum.remaining/1` is `max(0, q - MapSet.size(acked))` and `next_version/0` is an increment
   # over a Postgres aggregate; both are declared as integers and dialyzer allows `float()`, because
