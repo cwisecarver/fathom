@@ -5,12 +5,15 @@ Picks the highest-value Phase-2 item and locks the approach before any build. Ph
 phase, S1–S8 + the F1 heartbeat + the durability dirty-flag) was already shipped when this was
 written.
 
-Since then: **A1 warm standby is built** (`Fathom.Shard.WarmFollower`, `warm-standby.md`), **A2
-quorum replication is built** (`Fathom.Shard.Replication.*`, `a2-quorum-replication.md`), and
-**B dynamic rebalancing is built** (`Fathom.Rebalancer.*`, `rebalancing.md`) — every gate off by
-default, waiting on real hot-spot evidence rather than on code. **Only C — shard locality /
-affinity — remains unbuilt**: `AGENTS.md` records rendezvous/bounded-load hashing (C1) and
-multi-region affinity (C2) as absent, and there is no plan for them beyond this document.
+Since then: **A1 warm standby was built and then REMOVED 2026-09-14** (it was
+`Fathom.Shard.WarmFollower`; see the `warm-standby.md` removal tombstone) — **superseded by A2**,
+which closes the node-loss RPO gap A1 never did while a replica-holding target + promote-on-open now
+cover the failover-RTO win A1 was built for. **A2 quorum replication is built** (`Fathom.Shard.Replication.*`,
+`a2-quorum-replication.md`), and **B dynamic rebalancing is built** (`Fathom.Rebalancer.*`,
+`rebalancing.md`) — every gate off by default, waiting on real hot-spot evidence rather than on
+code. **Only C — shard locality / affinity — remains unbuilt**: `AGENTS.md` records
+rendezvous/bounded-load hashing (C1) and multi-region affinity (C2) as absent, and there is no plan
+for them beyond this document.
 
 Read this for the reasoning that chose the order, not for what is left.
 
@@ -49,6 +52,11 @@ So the three Phase-2 features each attack a different axis: **A** cuts failover 
 
 ## A — Warm standby / WAL-follower  (axis: failover RTO, maybe RPO)
 
+> **Outcome (2026-09-14):** A1 was built and then **removed**, superseded by A2 (the WAL-follower
+> fork below). A2 shipped and stayed; A1 did not. The scoping reasoning is kept below as the record
+> of how the order was chosen — it is not a description of current code. `Fathom.Shard.WarmFollower`
+> no longer exists.
+
 Keep recently-active shards **warm on a standby** so a failover skips the
 cold-open-from-S3. The fork is how warm:
 
@@ -75,7 +83,7 @@ cold-open-from-S3. The fork is how warm:
     failover-RTO bench: warm vs cold, plus a warm-standby density test). **Risk:** low —
     additive, no model change, no correctness impact on the single-writer invariant
     (the standby holds no lease, so it can never double-write).
-  - **Status: A1 done (H1+H2+H3).** H1 = `Fathom.Shard.WarmFollower` (directory-poll `active_recent`,
+  - **Status: A1 was done (H1+H2+H3), then REMOVED 2026-09-14 (superseded by A2).** H1 = `Fathom.Shard.WarmFollower` (directory-poll `active_recent`,
     pre-pull, LRU-evict; gated `:warm_follower`, off by default). **H2 = freshness-validated
     promotion**, the correctness core the "prefer the warm copy" line glossed: a warm cache may
     lag the owner's latest flush, so it is **never served as-is** — the coordinator's cold-open
@@ -242,6 +250,12 @@ hash. The fork is where the override lives:
 (access-driven warming) and B (placement). Not a standalone Phase-2 item.
 
 ## Recommendation
+
+> **Historical (2026-07-01).** This was the original priority call, and it is preserved as the record
+> of the reasoning. It has since been overtaken: A1 was built, then **removed 2026-09-14 and
+> superseded by A2** (`a2-quorum-replication.md`), and B is built. Read the current status at the top
+> of this file; the "build A1 first / decisions to lock before building A1" material below describes a
+> plan that has already run its course.
 
 Priority by value-per-risk:
 

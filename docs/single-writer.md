@@ -111,8 +111,9 @@ owner (heartbeat frozen and aging out within the budget) for `:crash_failover_ho
 0 disables), converting the **tail** of the TTL window into latency instead of client `503`s
 (`fathom.shards.crash_wait`). It's a tail conversion, not a fix: a request landing early in the
 window (its steal further out than the budget) still errors, and a *live* owner is never held (its
-heartbeat keeps advancing past the budget). The warm follower pre-positions bytes but **cannot**
-shorten the TTL wait.
+heartbeat keeps advancing past the budget). A2 replication pre-positions the shard's data on a
+follower, but that **cannot** shorten the TTL wait either — the wait is the lease/fence lapsing, not
+the byte transfer.
 
 **The real fix (follow-up).** A **dead-node takeover sweeper** — a fleet-singleton (Oban, like
 `RebalanceJob`) that watches `heartbeat/<owner>` objects and, on confirmed death, enumerates the

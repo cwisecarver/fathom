@@ -158,8 +158,10 @@ the data as of the source's last flush, and the source's post-flush unflushed wr
 (within RPO). If the dead node was only *frozen* and revives, its attempt to flush finds the object
 superseded and it self-fences (drops its stale writes). This is exactly what `chaos.sh pause-fence`
 demonstrates: the survivor's post-steal write survives, the zombie's unflushed write is never
-resurrected. Warm standby ([warm-standby](warm-standby.md)) shrinks the *time* of that failover, not
-the loss window — the loss window is set by the flush interval.
+resurrected. Live WAL replication ([a2-quorum-replication](a2-quorum-replication.md)) shrinks the
+loss window itself: a promoted follower carries the WAL tail past the last flush, so failover need
+not fall back to the last flushed object. (The removed warm-standby cache only shortened failover
+*time*, never this loss window — which the flush interval alone otherwise sets.)
 
 ## Snapshots & point-in-time restore (logical-corruption recovery)
 

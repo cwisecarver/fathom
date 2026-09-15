@@ -332,7 +332,7 @@ term*; steady-state (warm) requests are not on this curve at all. A 100–300 ms
    Raise it so active tenants stay resident longer (fewer cold-opens) at the cost of more open
    shards per node — trade it against your node density (`docs/configuration.md`,
    `docs/reviews/fleet-density-2026-07-10.md`).
-3. **Pre-warm on login (optional).** The warm-standby follower (A1) covers *failover*, not
+3. **Pre-warm on login (optional).** A2 quorum replication covers *failover*, not
    *first-touch of a cold tenant*. To hide the cold-open from the user's first real request, open a
    cheap stream (e.g. `SELECT 1`) against the tenant's subdomain when they log in / land — that
    triggers the cold-open ahead of the work. Provisioning already returns the tenant URL, so this is

@@ -288,8 +288,8 @@ intra-region and billed on egress):
   requests, one-time, bounded by the dedicated S3 Finch pool (`warm_s3_shards_per_s`).
 
 Levers if cold-open request cost dominates: raise `:shard_idle_ms` (fewer open/close
-cycles), warm standby (A1, avoids the pull body on failover), and — for byte transfer —
-same-region buckets.
+cycles), A2 quorum replication (a replica-holding target promotes on open, skipping the
+cold S3 pull on failover), and — for byte transfer — same-region buckets.
 
 **Liveness dependency (owned SPOF).** Because acquire/renew/steal all go through S3,
 **S3 availability is fathom's control-plane availability**: during an S3 regional event no

@@ -397,10 +397,13 @@ one. Boot must validate **`Q < N`** (else the fault tolerance is configured away
 
 ## The fathom mapping
 
-The component already exists. `Fathom.Shard.WarmFollower` (A1, built) holds a lease-less copy of
-another node's shard and never serves. A2 is the same component with the data path reversed:
+A2 was originally scoped as a reshaping of the A1 warm follower (`Fathom.Shard.WarmFollower`, since
+**removed 2026-09-14** — A2 superseded it). The warm follower asynchronously *pulled* a lease-less
+copy of another node's shard from S3 and never served; A2 reverses the data path — the primary
+*pushes* frames to followers. The table contrasts the two approaches (the A1 column is historical —
+the warm follower no longer exists):
 
-| Today (A1) | A2 |
+| A1 warm follower (removed) | A2 |
 |---|---|
 | follower **pulls** from S3, asynchronously | primary **pushes** frames to followers |
 | copy may be stale; revalidated by etag | copy is current as of the last acked commit |
