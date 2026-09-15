@@ -556,6 +556,18 @@ the RTT sweep above.
 ## What it would and would not improve
 
 - **Would:** node-loss RPO from ~300 s to ~0. This is the entire benefit.
+  - **Re-confirmed on the rig 2026-09-15** after the WarmFollower removal + coordinator
+    decomposition: `REPLICATION_ENABLED=true ./chaos.sh rpo` PASS — an acked-but-unflushed write is
+    lost with survivor selection OFF (0) and survives with it ON (1), the survivor pulling the
+    fresher replica from a peer (3 ms, 8 KiB) and logging `PROMOTED a local replica over the stored
+    object`.
+- **Would NOT: cut failover RTO meaningfully.** Promote-on-open's speed win is only the S3 body
+  transfer it avoids, and end-to-end failover RTO is **lease-floor-bound**, not pull-bound: measured
+  `./chaos.sh failover` = **15,945 ms ≈ TTL 10 s + steal margin 5 s**. The isolated open-latency
+  delta (`failover_promote_p50_us` vs `failover_cold_s3_p50_us`) is a **tie for a tiny shard on a
+  fast link** and only reaches ~24% at 5 MB on a bandwidth-capped link (`docs/benchmark-plan.md`,
+  Failover RTO). So promote's value is **RPO (data survival), not RTO speed** — it only fires when a
+  replica is strictly ahead of the stored object (i.e. there is acked-but-unflushed data).
 - **Would NOT: reduce S3 cost.** PUT count is driven by how *often* a dirty shard uploads, not how
   much — ingress bytes are free. Streaming frames *to S3* more often would cost **more** PUTs, not
   fewer. The win is only on the node-to-node path.
