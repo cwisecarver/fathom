@@ -56,7 +56,6 @@ defmodule Fathom.Bench do
   alias Fathom.Migrator.Copy
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Storage
-  alias Fathom.Shard.WarmFollower
   alias Fathom.Shards
 
   @default_trials 5
@@ -72,7 +71,6 @@ defmodule Fathom.Bench do
   @concurrent_shards 64
   @concurrent_ms 1_000
   @recorder_rows 2_000
-  @warm_shards 200
   @warm_size_kb 256
   @hrana_rt_samples 200
   @wire_rows 1_000
@@ -80,7 +78,6 @@ defmodule Fathom.Bench do
   @all_metrics [
     :cold_open,
     :cold_open_s3,
-    :warm_s3,
     :failover_rto,
     :dir_resolve,
     :dir_recorder,
@@ -131,11 +128,9 @@ defmodule Fathom.Bench do
       cold_open_p99_us: cold && cold.p99_us,
       # The cold-S3 path — nil unless an S3 endpoint is configured (opt-in).
       cold_open_s3_p50_us: run_if(only, :cold_open_s3, fn -> cold_open_s3(opts) end),
-      # Aggregate warming rate (shards/s) pulling many shards from S3 at once — opt-in.
-      warm_s3_shards_per_s: run_if(only, :warm_s3, fn -> warm_s3_throughput(opts) end),
-      # Failover RTO at real size: cold pull vs warm 304-promote (opt-in, S3).
+      # Failover RTO at real size: cold pull (opt-in, S3). The warm 304-promote arm was removed
+      # 2026-09-14 with the WarmFollower retirement.
       failover_cold_s3_p50_us: rto && rto.cold_us,
-      failover_warm_s3_p50_us: rto && rto.warm_us,
       dir_resolve_p50_us: run_if(only, :dir_resolve, fn -> dir_resolve(opts) end),
       # The path per-checkout directory work ACTUALLY takes since the Recorder landed (#41.6);
       # dir_resolve above is control-plane only and was standing in for a per-request cost it no
@@ -300,50 +295,8 @@ defmodule Fathom.Bench do
 
   defp uniq(prefix), do: "#{prefix}_#{System.unique_integer([:positive])}"
 
-  # --- warming throughput (S3) ---------------------------------------------
-
-  @doc """
-  Aggregate warming throughput (shards/s): provision N `:warm_size_kb` shards in S3,
-  drop local, then warm them ALL concurrently (`Fathom.Shards.checkout/1` each, which
-  pulls from S3) and report `N ÷ wall`. The node-startup / failover number. Returns
-  `nil` unless an S3 endpoint is configured (opt-in). Concurrency is bounded by the
-  Req/Finch connection pool to the S3 host, so this exposes the pool ceiling.
-  """
-  @spec warm_s3_throughput(keyword()) :: float() | nil
-  def warm_s3_throughput(opts \\ []) do
-    if s3_opt_in?() do
-      setup_s3(opts)
-      n = Keyword.get(opts, :warm_shards, @warm_shards)
-      size_kb = Keyword.get(opts, :warm_size_kb, @warm_size_kb)
-
-      try do
-        ids = for _ <- 1..n, do: uniq("bench_s3_warm")
-        Enum.each(ids, &seed_s3_sized(&1, size_kb))
-
-        {us, _} = :timer.tc(fn -> warm_all(ids) end)
-
-        Enum.each(ids, &Shards.drain/1)
-        n / (us / 1_000_000)
-      rescue
-        e ->
-          Logger.warning("warm_s3 skipped: S3 unreachable/misconfigured (#{inspect(e)})")
-          nil
-      catch
-        :exit, reason ->
-          Logger.warning("warm_s3 skipped: #{inspect(reason)}")
-          nil
-      end
-    else
-      nil
-    end
-  end
-
-  # Fire every checkout concurrently; the S3 pulls bottleneck on the Finch pool.
-  defp warm_all(ids) do
-    ids
-    |> Task.async_stream(&Shards.checkout/1, max_concurrency: length(ids), timeout: 120_000)
-    |> Stream.run()
-  end
+  # The warm_s3_throughput metric (concurrent S3-pull throughput, mislabeled "warm") was removed
+  # 2026-09-14 with the WarmFollower retirement. cold_open_s3 covers the single-pull S3 latency.
 
   # Seed a ~size_kb shard object into S3 (incompressible randomblob), drop local.
   defp seed_s3_sized(id, size_kb) do
@@ -385,27 +338,25 @@ defmodule Fathom.Bench do
   protocol + loopback; inject latency/bandwidth (`scripts/benchmark_s3_latency.sh`) or
   point `FATHOM_S3_TEST_ENDPOINT` at in-region S3 for the production gap.
   """
-  @spec failover_rto(keyword()) :: %{cold_us: float(), warm_us: float()} | nil
+  # Cold failover RTO only. The warm arm (304-promote from the WarmFollower cache) was removed
+  # 2026-09-14 with the WarmFollower retirement; failover is now always a cold open from S3 (or an
+  # A2 promote-on-open, measured separately).
+  @spec failover_rto(keyword()) :: %{cold_us: float()} | nil
   def failover_rto(opts \\ []) do
     if s3_opt_in?() do
       setup_s3(opts)
       samples = Keyword.get(opts, :failover_samples, @cold_open_s3_samples)
       size_kb = Keyword.get(opts, :warm_size_kb, @warm_size_kb)
 
-      cache = Path.join(tmp_dir(), "bench_warm_cache")
-      File.rm_rf!(cache)
-      File.mkdir_p!(cache)
-      Application.put_env(:fathom, :warm_cache_dir, cache)
-
       try do
         # Warm-up doubles as a reachability probe (raises → degrade to nil).
-        warm = uniq("bench_rto_probe")
-        seed_s3_sized(warm, size_kb)
-        teardown_open(warm, open_and_query(warm))
+        probe = uniq("bench_rto_probe")
+        seed_s3_sized(probe, size_kb)
+        teardown_open(probe, open_and_query(probe))
 
-        # Cold: every sample pulls the whole object from S3 (no warm cache). A real
-        # failover STEALS the dead owner's lease, which touches (etag-rotates) the
-        # object — seed the dead-owner lock so the measurement takes that path (#15).
+        # Cold: every sample pulls the whole object from S3. A real failover STEALS the dead
+        # owner's lease, which touches (etag-rotates) the object — seed the dead-owner lock so the
+        # measurement takes that path (#15).
         cold =
           times(samples, fn _ ->
             id = uniq("bench_rto_cold")
@@ -417,26 +368,7 @@ defmodule Fathom.Bench do
           end)
           |> p50()
 
-        # Warm: the shard is pre-cached with its etag. Expert review #15: on a real
-        # crash failover the steal touches (etag-rotates) the object, so the pre-cached
-        # etag no longer matches — seed the dead-owner lock so the "warm" sample
-        # measures the steal+touch takeover the warm follower must survive, not the
-        # no-steal open it took before (which never rotated the etag and so overstated
-        # the win). With the #15 fix the takeover adopts the touched etag from the copy
-        # it already holds instead of re-pulling the whole object.
-        warm_us =
-          times(samples, fn _ ->
-            id = uniq("bench_rto_warm")
-            seed_s3_sized(id, size_kb)
-            populate_warm_cache(id)
-            seed_dead_lock(id)
-            {us, handle} = :timer.tc(fn -> open_and_query(id) end)
-            teardown_open(id, handle)
-            us
-          end)
-          |> p50()
-
-        %{cold_us: cold, warm_us: warm_us}
+        %{cold_us: cold}
       rescue
         e ->
           Logger.warning("failover_rto skipped: S3 unreachable/misconfigured (#{inspect(e)})")
@@ -449,16 +381,6 @@ defmodule Fathom.Bench do
     else
       nil
     end
-  end
-
-  # Pre-pull the shard's current S3 object into the warm cache and record its etag,
-  # exactly as `Fathom.Shard.WarmFollower` does — so the next open takes the H2
-  # freshness-validated promotion path (a 304), not a cold pull.
-  defp populate_warm_cache(id) do
-    path = WarmFollower.cache_path(id)
-    File.mkdir_p!(Path.dirname(path))
-    {:ok, {:written, etag}} = Storage.pull_if_changed(id, path, nil)
-    File.write!(path <> ".etag", etag)
   end
 
   # Seed a dead prior owner's lock so the next open STEALS it and touches (etag-rotates)
@@ -1349,10 +1271,9 @@ defmodule Fathom.Bench do
     Application.put_env(:fathom, :directory_touch, false)
     Application.put_env(:fathom, :lazy_migrate, false)
 
-    # The warm_s3 metric exists to exercise the dedicated S3 Finch pool's
-    # ceiling, but `mix fathom.bench` doesn't boot the app supervision tree, so
-    # the bench has to start the pool itself (sized from the S3 config above —
-    # FATHOM_S3_TEST_POOL_SIZE lets the sweep vary it).
+    # The S3 metrics (cold_open_s3, failover_rto) exercise the dedicated S3 Finch pool, but
+    # `mix fathom.bench` doesn't boot the app supervision tree, so the bench has to start the pool
+    # itself (sized from the S3 config above — FATHOM_S3_TEST_POOL_SIZE lets the sweep vary it).
     {Finch, finch_opts} = Fathom.Shard.Storage.S3.finch_child_spec()
     ensure_started(Finch, finch_opts)
 

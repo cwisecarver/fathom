@@ -1192,18 +1192,10 @@ defmodule Fathom.Directory do
     n
   end
 
-  @doc """
-  The most-recently-active shards, newest first, capped at `limit` — the fleet-wide
-  hot set a warm-standby (`Fathom.Shard.WarmFollower`) pre-pulls so a failover skips
-  the cold-open from S3.
-  """
-  @spec active_recent(pos_integer()) :: [Shard.t()]
-  def active_recent(limit) do
-    from(s in Shard, where: s.status == "active" and not is_nil(s.last_active_at))
-    |> order_by([s], desc: s.last_active_at)
-    |> limit(^limit)
-    |> Repo.all()
-  end
+  # active_recent/1 (the fleet-wide hot set the WarmFollower read cache pre-pulled) was removed
+  # 2026-09-14 with the WarmFollower retirement — it had no other caller. The partial index it used
+  # (shards_active_last_active_at_index) is KEPT; the laggard path relies on the same
+  # status='active' + last_active_at shape.
 
   @max_page 200
   @default_page 50

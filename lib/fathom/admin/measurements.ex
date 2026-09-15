@@ -108,25 +108,25 @@ defmodule Fathom.Admin.Measurements do
   ones an S3 credential or reachability problem produces, so without this gauge the diagnostic path
   points away from the actual cause.
 
-  Emits per directory (`data` = `SHARD_DATA_DIR`, `warm` = the warm-standby cache, `replica` =
-  `REPLICATION_DIR`), tagged so a fleet dashboard can break them out: `free_bytes`, `total_bytes`,
-  `used_ratio` — the last matching the `process_used_ratio` / `port_used_ratio` convention above.
+  Emits per directory (`data` = `SHARD_DATA_DIR`, `replica` = `REPLICATION_DIR`), tagged so a fleet
+  dashboard can break them out: `free_bytes`, `total_bytes`, `used_ratio` — the last matching the
+  `process_used_ratio` / `port_used_ratio` convention above. (The `warm` dir gauge was removed
+  2026-09-14 with the WarmFollower retirement.)
 
   `replica` joined 2026-08-10 with the follower listener. A node acting as somebody's follower
   stores a **full copy of every shard it follows**, so it is a third disk consumer of exactly the
   kind this gauge exists for — and the one with the least warning, because it grows from other
   nodes' write traffic rather than from anything happening locally. It is only non-nil on a node
-  that actually listens; a pure primary reports `data` and `warm` as before.
+  that actually listens; a pure primary reports just `data`.
 
-  Best-effort: a path that does not exist yet (no warm cache configured, first boot before the data
-  dir is created) is skipped rather than reported as 0 free, which would read as a full disk.
+  Best-effort: a path that does not exist yet (first boot before the data dir is created) is skipped
+  rather than reported as 0 free, which would read as a full disk.
   """
   @spec disk() :: :ok
   def disk do
     for {label, path} <-
           [
             {"data", Fathom.Shard.data_dir()},
-            {"warm", warm_cache_dir()},
             {"replica", replica_dir()}
           ],
         is_binary(path),
@@ -185,11 +185,8 @@ defmodule Fathom.Admin.Measurements do
     :exit, _ -> :error
   end
 
-  defp warm_cache_dir do
-    if Fathom.Shard.WarmFollower.enabled?(), do: Fathom.Shard.WarmFollower.cache_dir()
-  end
-
-  # Gated on `listening?/0` for the same reason `warm_cache_dir/0` is gated on `enabled?/0`: a node
+  # Gated on `listening?/0` (the `warm` dir gauge was removed 2026-09-14 with the WarmFollower
+  # retirement): a node
   # that is not somebody's follower writes nothing here, and reporting the default tmp path would
   # publish a `dir=replica` series for a directory that will never grow — which is worse than
   # absent, because an alert on it would be measuring an unrelated filesystem.

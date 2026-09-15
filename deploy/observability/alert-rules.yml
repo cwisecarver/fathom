@@ -230,7 +230,7 @@ groups:
         labels: {severity: ticket}
         annotations:
           summary: "Cold-open p99 > 1s on {{ $labels.node }}"
-          description: "S3-pull cold-open p99 exceeds the failover SLO. Check S3 latency / region; consider the warm-standby follower for faster failover."
+          description: "S3-pull cold-open p99 exceeds the failover SLO. Check S3 latency / region; A2 replication with promote-on-open recovers such shards without a full cold pull."
           runbook: docs/runbooks/cluster.md#runbook-a-shard-is-stuck-unavailable
 
       - alert: FathomLeaseStoreDown
@@ -403,7 +403,7 @@ groups:
         labels: {severity: ticket}
         annotations:
           summary: "Disk {{ $labels.dir }} on {{ $labels.node }} is {{ $value | humanizePercentage }} full"
-          description: "The volume holding fathom's {{ $labels.dir }} directory is filling. At 100% every cold-open pull and every VACUUM INTO fails while writes keep being acked — durability stops silently. With the warm follower on, `:warm_cache_max` bounds the cache in shard COUNT, not bytes; consider :warm_cache_max_bytes / :warm_disk_free_floor_bytes."
+          description: "The volume holding fathom's {{ $labels.dir }} directory is filling. At 100% every cold-open pull and every VACUUM INTO fails while writes keep being acked — durability stops silently. On a follower node the replica dir (dir=replica) grows from other nodes' write traffic and has no retention; size local disk accordingly."
           runbook: docs/runbooks/operations.md#runbook-node-disk-full-shard_data_dir
 
       - alert: FathomDiskCritical
@@ -470,14 +470,6 @@ groups:
           description: "The per-node replication byte budget is full and pushes are being rejected, so commits are failing their quorum and tenants are seeing 503 FILO_NO_QUORUM. The budget refuses EVERY push once over cap, including small ones for healthy shards, so one saturated node can become a node-wide write outage — see the known limitation in tasks/todo.md."
           runbook: docs/runbooks/cluster.md
 
-      - alert: FathomWarmCacheDiskPressure
-        # The follower declined to warm new shards because the volume is below the free floor.
-        # Not itself an outage — failover readiness is degrading, and the disk is the cause.
-        expr: increase(fathom_warm_follower_disk_pressure_declined[15m]) > 0
-        for: 15m
-        labels: {severity: ticket}
-        annotations:
-          summary: "Warm follower on {{ $labels.node }} is refusing new shards (disk floor)"
-          description: "Free space is below :warm_disk_free_floor_bytes, so the standby cache has stopped taking on shards. Already-cached shards are retained; failover for everything else falls back to a full cold pull."
-          runbook: docs/runbooks/operations.md#runbook-node-disk-full-shard_data_dir
+      # FathomWarmCacheDiskPressure and its warm-follower disk-pressure series were removed
+      # 2026-09-14 with the WarmFollower retirement (the metric no longer exists).
 

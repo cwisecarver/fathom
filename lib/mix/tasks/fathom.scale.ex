@@ -46,7 +46,6 @@ defmodule Mix.Tasks.Fathom.Scale do
     lease_rps: :boolean,
     lease_ttl_ms: :integer,
     window_ms: :integer,
-    warm_density: :boolean,
     hotspots: :boolean,
     zipf: :float,
     queries: :integer,
@@ -67,10 +66,6 @@ defmodule Mix.Tasks.Fathom.Scale do
 
         Keyword.get(opts, :ramp, false) ->
           {Fathom.Scale.ramp(Keyword.take(opts, [:max, :checkpoint])), &print_ramp/1}
-
-        Keyword.get(opts, :warm_density, false) ->
-          {Fathom.Scale.warm_density(Keyword.take(opts, [:shards, :shard_size_mb])),
-           &print_warm_density/1}
 
         Keyword.get(opts, :hotspots, false) ->
           {Fathom.Scale.hotspots(
@@ -171,24 +166,7 @@ defmodule Mix.Tasks.Fathom.Scale do
     Mix.shell().error("")
   end
 
-  defp print_warm_density(r) do
-    rows = [
-      {"cached", "#{r.cached}/#{r.shards_requested} shards @ ~#{r.shard_size_mb_actual} MB"},
-      {"warm cache disk", "#{r.warm_cache_disk_mb} MB (#{r.warm_disk_kb_per_shard} KiB/shard)"},
-      {"warm BEAM/shard", "#{r.warm_beam_kb_per_shard} KiB (follower cached-id set)"},
-      {"warm RSS/shard", "#{r.warm_rss_kb_per_shard} KiB (noisy: incl. page cache)"},
-      {"warming rate", "#{r.warm_pull_per_s} shards/s"},
-      {"open-shard ref",
-       "~#{r.open_shard_beam_kb_ref} KiB BEAM + ~#{r.open_shard_fds_ref} fds each — warm is disk-bound, open is BEAM/fd-bound"}
-    ]
-
-    Mix.shell().error(
-      "\n=== fathom.scale --warm-density (warm cache: disk-bound, ~0 BEAM/fd) ==="
-    )
-
-    Enum.each(rows, fn {k, v} -> Mix.shell().error("  #{String.pad_trailing(k, 16)} #{v}") end)
-    Mix.shell().error("")
-  end
+  # print_warm_density/1 (and --warm-density) removed 2026-09-14 with the WarmFollower retirement.
 
   defp print_ramp(r) do
     rows = [

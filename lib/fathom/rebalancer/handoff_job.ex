@@ -55,7 +55,10 @@ defmodule Fathom.Rebalancer.HandoffJob do
     %{"shard_id" => shard, "from_node" => from, "to_node" => to} = args
     q = args["q_per_s"]
 
-    warm(shard, to)
+    # No pre-warm step: the WarmFollower pre-warm was dropped when warm standby was retired
+    # (2026-09-14). It was always best-effort (correctness is the target's cold-open), and affinity
+    # now prefers a target that already holds an A2 replica — so the target is usually warm anyway.
+    # The handoff is now flip → drain.
 
     # Gate the drain on a confirmed live flip (finding #11): draining the source while the
     # LB still routes to it (flip not applied) would strand the shard. pin_and_flip fails
@@ -173,26 +176,6 @@ defmodule Fathom.Rebalancer.HandoffJob do
     {:cancel, "handoff failed after #{max} attempts (#{inspect(reason)}); reverted to #{from}"}
   end
 
-  # Best-effort: a warm failure isn't fatal (the target cold-opens correctly), so proceed.
-  # A rejected issue (e.g. an invalid shard_id now gated at Command.changeset — #6) is logged
-  # and skipped, NOT hard-matched — so an invalid shard reverts at pin_and_flip (#14) instead
-  # of MatchError-crashing here before the with-chain can handle it.
-  defp warm(shard, to) do
-    case Commands.issue(shard, to, "warm") do
-      {:ok, cmd} ->
-        case Commands.await(cmd.id, timeout_ms: warm_timeout()) do
-          {:ok, _} ->
-            :ok
-
-          other ->
-            Logger.info("rebalance: warm #{shard} on #{to} not confirmed (#{inspect(other)})")
-        end
-
-      {:error, changeset} ->
-        Logger.info("rebalance: warm #{shard} not issued (#{inspect(changeset.errors)})")
-    end
-  end
-
   # Pin the DB override, then apply the LB map. Returns apply!'s result: :ok when the flip
   # is live-or-out-of-band, {:error, reason} when it's known not live (so drain is skipped).
   # A rejected pin (e.g. an invalid shard_id — finding #14) returns {:error, _} instead of
@@ -219,8 +202,6 @@ defmodule Fathom.Rebalancer.HandoffJob do
       {:error, :timeout} -> {:error, :drain_timeout}
     end
   end
-
-  defp warm_timeout, do: Application.get_env(:fathom, :handoff_warm_timeout_ms, 30_000)
 
   # The drain await must exceed the poller's WORST-CASE drain — its `command_drain_ms` budget
   # plus `Fathom.Shards.drain`'s coordinator-shutdown safety net (+30s) — so a legitimately

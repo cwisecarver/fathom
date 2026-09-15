@@ -6,8 +6,9 @@ defmodule Fathom.Shard.ReplicationIdentifierTest do
   construction. `Follower` builds filesystem paths out of a `shard_id` that arrives **from the
   network**, and had no such test.
 
-  The suite already had the exact shape one directory over, for the strictly SAFER path
-  (`warm_follower_test.exs`: `for bad <- ["../etc/passwd", "a/b", "acme.evil", "has space"]`).
+  The suite already had the exact shape elsewhere, for the strictly SAFER path
+  (the command-boundary id gate: `for bad <- ["../etc/passwd", "a/b", "acme.evil", "has space"]` —
+  see `commands_test.exs`; the same shape formerly lived in the now-removed `warm_follower_test`).
   Meanwhile the twelve replication test files exercised offsets, generations, salts, epochs, torn
   replicas and quorum boundaries — every PROTOCOL decision — and **zero IDENTIFIER decisions**.
   That is why #1 survived a review pass that explicitly hardened this path.

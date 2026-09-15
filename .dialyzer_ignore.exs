@@ -48,10 +48,10 @@
   # on 2026-08-14 (also on `HranaClient.await_upgrade/2`), and written up next to the helper.
   # Removable if these metrics stop sharing one helper, or if dialyzer gains per-call-site
   # instantiation.
-  {"lib/fathom/bench.ex", :missing_range, 668},
-  {"lib/fathom/bench.ex", :missing_range, 731},
-  {"lib/fathom/bench.ex", :missing_range, 823},
-  {"lib/fathom/bench.ex", :extra_range, 881},
+  {"lib/fathom/bench.ex", :missing_range, 590},
+  {"lib/fathom/bench.ex", :missing_range, 653},
+  {"lib/fathom/bench.ex", :missing_range, 745},
+  {"lib/fathom/bench.ex", :extra_range, 803},
 
   # `Quorum.remaining/1` is `max(0, q - MapSet.size(acked))` and `next_version/0` is an increment
   # over a Postgres aggregate; both are declared as integers and dialyzer allows `float()`, because

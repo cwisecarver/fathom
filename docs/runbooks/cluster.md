@@ -125,7 +125,7 @@ or renew (it would rather be unavailable than risk a split-brain).
 - Shards already open keep serving until their lease lapses (≤ TTL); new opens wait for S3.
 - When S3 recovers, opens resume automatically; no manual shard intervention needed.
 
-## Failover herd + warm-standby sizing
+## Failover herd
 
 When a node dies, **all** its tenants re-home onto survivors at once. Measured on the rig
 ([`../reviews/failover-herd-2026-07-16.md`](../reviews/failover-herd-2026-07-16.md), N=300): the herd
@@ -142,20 +142,12 @@ single-writer lease and the bounded Finch pool make it safe by construction). Wh
   absorbs the herd. It grows with `active_shards_per_node / s3_pool_size × RTT`; size the S3
   `pool_size` for your density.
 
-**When to enable the warm follower (`WARM_FOLLOWER=true`).** The warm win is the object **body
-transfer avoided** on failover, so it's marginal for tiny shards (the lease floor + ~1 RTT dominate;
-the rig measured ~0.5 s saved for one-row shards) and grows with shard size. Enable it when the
-cold-pull herd would move real bytes — roughly when
-
-```
-active_shards_per_node × avg_shard_size / S3_bandwidth   ≳   your failover-RTO budget
-```
-
-i.e. large shards (MB+) at high density (thousands/node). For KB-scale shards, leave it off — the
-follower's disk + revalidation cost buys almost nothing. **Size `:warm_cache_max`** so a survivor can
-hold a full dead peer's active set: `:warm_cache_max ≥ active_shards_per_node` (a warm copy costs
-its file on disk plus ~0 process/fd — it's disk-bound, so err generous). Watch
-`fathom.shard.warm.promoted{result="hit"}` to confirm failovers are landing on the warm path.
+**Cutting the body transfer on failover.** The warm-standby follower that used to pre-pull the hot
+set and promote from a 304 was **removed 2026-09-14** (superseded by A2). With A2 replication on
+(prod default), a survivor that already holds a replica recovers via **promote-on-open** — no full
+cold pull — and the rebalancer prefers a replica-holding target for a planned handoff. There is no
+`WARM_*` knob to size anymore; size the S3 `pool_size` (above) for the cold-open herd on shards no
+survivor holds a replica of.
 
 ## Graceful drain (rolling-deploy pre-stop) — audit #28
 

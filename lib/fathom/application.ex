@@ -109,7 +109,6 @@ defmodule Fathom.Application do
   # `Fathom.DataPlane.Supervisor` holds the Registry and ShardSupervisor alongside a dozen
   # always-on siblings, several of which do real I/O in callbacks and can raise repeatably
   # (`Heartbeat.do_renew/1` and its clear-previous-incarnation handler call `Storage.*` inline;
-  # `WarmFollower.handle_continue(:refresh)` does a directory read plus S3 pulls;
   # `TempReaper.handle_continue(:sweep)` does a fleet-sized `Path.wildcard` — now rescued
   # (expert review 2026-08-31 #17), so it degrades to a logged skip rather than crash-looping,
   # but the budget still backstops the others).
@@ -639,7 +638,7 @@ defmodule Fathom.Application do
         # A task's mailbox dies with the task.
         {Task.Supervisor, name: Fathom.TaskSupervisor},
         {DynamicSupervisor, shard_supervisor_opts()}
-      ] ++ warm_follower_children() ++ Fathom.Shard.Replication.Fleet.children()
+      ] ++ Fathom.Shard.Replication.Fleet.children()
   end
 
   # Default DynamicSupervisor restart intensity is 3 restarts / 5 s — sized for a small
@@ -734,14 +733,7 @@ defmodule Fathom.Application do
       else: []
   end
 
-  # The warm-standby follower (Phase 2): pre-pulls the fleet's hot set from S3 so a
-  # failover skips the cold-open. Opt-in per node role (off by default, off in test),
-  # since a node takes on the standby role explicitly.
-  defp warm_follower_children do
-    if Application.get_env(:fathom, :warm_follower, false),
-      do: [Fathom.Shard.WarmFollower],
-      else: []
-  end
+  # The warm-standby follower (Phase 2 A1) was removed 2026-09-14, superseded by A2 replication.
 
   @doc """
   Whether this node serves the Hrana data plane.

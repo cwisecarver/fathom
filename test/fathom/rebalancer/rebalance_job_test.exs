@@ -113,7 +113,7 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
 
     {:ok, old_done} = Commands.issue("s1", "n1", "drain")
     {:ok, _} = Commands.complete(old_done, "done", "drained")
-    {:ok, old_pending} = Commands.issue("s2", "n1", "warm")
+    {:ok, old_pending} = Commands.issue("s2", "n1", "drain")
 
     # Age both ~2h so they clear the default retention (1h) / stale (15min) windows.
     at = DateTime.add(DateTime.utc_now(), -7_200_000, :millisecond)

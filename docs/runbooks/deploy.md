@@ -70,8 +70,9 @@ Do one node at a time; never restart a quorum at once (the survivors absorb each
 4. **What tenants on that node experience:** their subdomains reroute to a survivor, which
    cold-opens the shard from S3 and acquires the (already-released) lease **immediately** — no TTL
    wait, because the graceful shutdown released it (contrast a crash, which waits out the lease TTL).
-   First request after the reroute pays one cold-open (~1 S3 RTT). Enable the warm-standby follower
-   (`WARM_FOLLOWER`) to serve that from a 304 instead of a full pull.
+   First request after the reroute pays one cold-open (~1 S3 RTT). With A2 replication on (prod
+   default), a survivor holding a replica recovers via promote-on-open instead of a full cold pull.
+   (The warm-standby follower that used to serve this from a 304 was removed 2026-09-14.)
 5. **Verify** the node rejoined healthy and is taking its share of shards again (its subdomains
    re-home on the next touch, or immediately if you restored its LB weight). Watch
    `fathom_shard_lease_superseded_count` stays quiet (a spike means churn — pause the rollout).

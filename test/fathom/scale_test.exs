@@ -27,24 +27,7 @@ defmodule Fathom.ScaleTest do
     end
   end
 
-  test "warm-density pre-pulls sized shards into the cache: disk-bound, cheap BEAM" do
-    result = Fathom.Scale.warm_density(shards: 8, shard_size_mb: 1)
-
-    try do
-      assert result.cached == 8, "expected all 8 shards warmed into the cache"
-      assert result.warm_disk_kb_per_shard >= 800, "cache holds ~1 MB/shard on disk"
-      # The point of warm standby — a cached shard costs far less BEAM than an open
-      # coordinator (~196 KiB) — is a *scale* claim: at N=8 the per-shard BEAM delta is
-      # pure GC noise (can land at 197 or go negative when a prior test left the heap
-      # high), so assert it's present, not its magnitude. `mix fathom.scale --warm-density`
-      # measures the real warm-vs-open gap. (Same GC-noise caveat as the fan-out RSS case.)
-      assert is_integer(result.warm_beam_kb_per_shard)
-      assert result.warm_pull_per_s > 0
-    after
-      Fathom.Scale.cleanup()
-      Application.delete_env(:fathom, :warm_cache_dir)
-    end
-  end
+  # The warm-density scale test was removed 2026-09-14 with the WarmFollower retirement.
 
   test "hotspots: a Zipf drive yields a detectable, stable hot set via ShardLoad" do
     # The harness flips :shard_load on and pins the cap/idle for the run; snapshot

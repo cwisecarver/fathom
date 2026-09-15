@@ -195,12 +195,9 @@ defmodule Fathom.Telemetry do
         description:
           "How long a held checkout slept before retrying, split by whether the wait was AIMED at a known steal instant (#23) or a blind backoff step. aimed=false dominating a crash failover means the backend stopped supplying the instant and the takeover is back to polling — ~8 retries and ~17 S3 requests per shard instead of one or two"
       ),
-      counter("fathom.shard.warm.promoted.count",
-        event_name: [:fathom, :shard, :warm, :promoted],
-        tags: [:result],
-        description:
-          "Warm-cache promotions at cold-open by result (hit = served warm, stale = re-pulled)"
-      ),
+      # fathom.shard.warm.{promoted,pulled,evicted,refresh} removed 2026-09-14 with the WarmFollower
+      # retirement (no emitter). The cold-open `warm` TAG (warm restart = local file present) and
+      # the rebalancer affinity hit-rate are unrelated and stay.
       distribution("fathom.shards.checkout.stop.duration",
         event_name: [:fathom, :shards, :checkout, :stop],
         measurement: :duration,
@@ -331,18 +328,8 @@ defmodule Fathom.Telemetry do
         measurement: :port_used_ratio,
         description: "Open ports as a fraction of +Q (1.0 ⇒ the listener stops accepting)"
       ),
-      sum("fathom.warm_follower.disk_pressure.declined",
-        event_name: [:fathom, :warm_follower, :disk_pressure],
-        measurement: :declined,
-        description:
-          "Shards the warm follower REFUSED to warm because the volume is below " <>
-            ":warm_disk_free_floor_bytes. Failover readiness is degrading and disk is the cause"
-      ),
-      last_value("fathom.warm_follower.disk_pressure.held",
-        event_name: [:fathom, :warm_follower, :disk_pressure],
-        measurement: :held,
-        description: "Shards still cached while under disk pressure (retained, not evicted)"
-      ),
+      # The warm_follower.disk_pressure metrics were removed 2026-09-14 with the WarmFollower
+      # retirement. The replication.disk_pressure metrics below are UNRELATED (A2) and stay.
       # The flush gate had no observability at all (expert review 2026-08-20 #15). A leaked slot is
       # permanent without the sweep, the cap is single digits, and a node whose gate is full simply
       # stops flushing — quietly, because the failure counter only moves for flushes that RAN.
@@ -368,7 +355,7 @@ defmodule Fathom.Telemetry do
       # object, which is the pre-A2 behaviour. But a RISING rate means the replica store — which
       # grows from other nodes' traffic and has no retention — is squeezing the disk this node's
       # own durability flushes depend on, and that ends in acked writes that can never be made
-      # durable. The counterpart of [:fathom, :warm_follower, :disk_pressure].
+      # durable. (Was the counterpart of the warm-cache disk-pressure metric, removed 2026-09-14.)
       # A lock file that existed but decoded to nothing, recreated at acquire (expert review
       # 2026-08-20 #31). Not routine: an undecodable lock means a full or failing disk, and it
       # used to take that tenant permanently offline because `:corrupt_lock` had two producers and
@@ -394,7 +381,7 @@ defmodule Fathom.Telemetry do
         measurement: :free_bytes,
         tags: [:dir],
         description:
-          "Free bytes on the volume holding this directory (dir=data|warm). A full volume fails " <>
+          "Free bytes on the volume holding this directory (dir=data|replica). A full volume fails " <>
             "every cold-open pull AND every VACUUM INTO, so writes stay acked and never durable"
       ),
       last_value("fathom.node.disk.used_ratio",
@@ -740,23 +727,8 @@ defmodule Fathom.Telemetry do
           "Purges that deleted a live object while a REMOTE node still held the lease — correct by design (that node self-fences on its next fenced flush rather than resurrecting the object), but it makes a cross-node erase observable instead of silent. Untagged: the owner is another node's key, and the shard_id stays in the log"
       ),
 
-      # Warm standby — the failover-readiness cache's actual throughput (A1).
-      counter("fathom.shard.warm.pulled.count",
-        event_name: [:fathom, :shard, :warm, :pulled],
-        description:
-          "Shards pre-pulled into the warm-follower cache — the failover-readiness fill rate. `warm.promoted` already showed the PAYOFF at failover; this is what pays for it"
-      ),
-      sum("fathom.shard.warm.pulled.bytes",
-        event_name: [:fathom, :shard, :warm, :pulled],
-        measurement: :bytes,
-        description:
-          "Bytes pulled into the warm-follower cache — the disk and bandwidth the standby is spending, and the input to :warm_cache_max_bytes / the disk-pressure floor (#36)"
-      ),
-      counter("fathom.shard.warm.evicted.count",
-        event_name: [:fathom, :shard, :warm, :evicted],
-        description:
-          "Shards LRU-evicted from the warm-follower cache — sustained eviction against a steady fleet means :warm_cache_max is too small and failover readiness is churning rather than accumulating"
-      ),
+      # Warm-standby cache throughput metrics (warm.pulled{.count,.bytes}, warm.evicted) removed
+      # 2026-09-14 with the WarmFollower retirement — no emitter.
 
       # Rebalancer — a fail-safe deferral, so silence here can mean 'working' or 'wedged'.
       counter("fathom.rebalancer.reconcile.skipped.count",
@@ -859,19 +831,8 @@ defmodule Fathom.Telemetry do
           "Lease releases that hit a 412 and re-read to find the lock STILL OURS at a rotated etag, then finished the delete (the 2026-08-04 stuck-lease fix). Every one of these would previously have leaked a lock that no live node could ever steal — a tenant that serves normally but can NEVER migrate, snoozing forever with failed: 0"
       ),
 
-      # Warm standby — the revalidation sweep's actual shape (A1).
-      last_value("fathom.shard.warm.refresh.cached",
-        event_name: [:fathom, :shard, :warm, :refresh],
-        measurement: :cached,
-        description:
-          "Shards held in the warm-follower cache after a revalidation sweep — the standing failover-readiness gauge, bounded by :warm_cache_max and the disk-free floor (#36)"
-      ),
-      sum("fathom.shard.warm.refresh.body_bytes",
-        event_name: [:fathom, :shard, :warm, :refresh],
-        measurement: :body_bytes,
-        description:
-          "Bytes re-downloaded during warm revalidation — the sweep is designed to land on the 304 fast path, so a rising number means cached copies are going stale faster than they are being refreshed"
-      ),
+      # Warm-standby revalidation metrics (warm.refresh.{cached,body_bytes}) removed 2026-09-14 with
+      # the WarmFollower retirement — no emitter.
 
       # Snapshots — the scheduler half (the retention/deletion half is above).
       sum("fathom.snapshots.scheduled.ok",

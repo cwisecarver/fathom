@@ -13,10 +13,10 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   page numbers in the *primary's* layout, so appending them to a VACUUM'd copy applies the right
   frames to the wrong pages, silently.
 
-  That also means A1's `WarmFollower`, which pulls from S3, is **not** a valid A2 seed source
-  despite the design doc's table describing A2 as "the same component with the data path reversed".
-  The base copy has to be the primary's live bytes. `seeds_from_live_bytes_not_a_vacuum_snapshot`
-  below pins that, so nobody re-optimises the seed into an S3 pull.
+  That also means an S3 pull is **not** a valid A2 seed source (this was the point of the retired
+  A1 WarmFollower, which pulled from S3): the base copy has to be the primary's live bytes.
+  `seeds_from_live_bytes_not_a_vacuum_snapshot` below pins that, so nobody re-optimises the seed
+  into an S3 pull.
   """
   use ExUnit.Case, async: false
 

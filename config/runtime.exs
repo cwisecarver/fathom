@@ -434,17 +434,10 @@ if n = System.get_env("RESTORE_DRILL_FULL_SAMPLE") do
   config :fathom, :restore_drill_full_sample, String.to_integer(n)
 end
 
-# Warm-cache DISK back-pressure (expert review 2026-08-01 #36). `:warm_cache_max` bounds the
-# standby cache in shard COUNT, which says nothing about bytes — 500 shards is 8 MB or 2 TB — and
-# the cache shares a filesystem with the live shard data, so filling it fails every cold-open pull
-# AND every VACUUM INTO while writes keep being acked.
-if b = System.get_env("WARM_DISK_FREE_FLOOR_BYTES") do
-  config :fathom, :warm_disk_free_floor_bytes, String.to_integer(b)
-end
-
-if b = System.get_env("WARM_CACHE_MAX_BYTES") do
-  config :fathom, :warm_cache_max_bytes, String.to_integer(b)
-end
+# The WARM_* warm-cache config (WARM_DISK_FREE_FLOOR_BYTES, WARM_CACHE_MAX_BYTES, and the
+# WARM_FOLLOWER / WARM_CACHE_DIR / WARM_POLL_MS / WARM_HOME_RETENTION_MS / WARM_MIN_REPULL_MS /
+# WARM_REFRESH_BYTES_PER_S block that was below) was removed 2026-09-14 with the WarmFollower
+# retirement (superseded by A2).
 
 # How long a migration job may keep DEFERRING before it is reported as stalled (2026-08-04).
 # A `{:retry, _}` (shard busy / lease held) snoozes, and an Oban snooze raises max_attempts
@@ -613,43 +606,9 @@ if System.get_env("VERIFY_STORAGE_FENCE") in ~w(false 0) do
   config :fathom, :verify_storage_fence, false
 end
 
-# Warm-standby follower (Phase 2 A1): opt-in per node role.
-if System.get_env("WARM_FOLLOWER") in ~w(true 1) do
-  config :fathom, :warm_follower, true
-end
-
-if dir = System.get_env("WARM_CACHE_DIR") do
-  config :fathom, :warm_cache_dir, dir
-end
-
-if ms = System.get_env("WARM_POLL_MS") do
-  config :fathom, :warm_poll_ms, String.to_integer(ms)
-end
-
-# How long after this node last owned a shard the warm follower still treats it as
-# "home" and won't re-warm it (a shard routes back to its home, so warming it has no
-# failover value). Outlast a routine idle→reopen gap; a real LB remap lapses it.
-if ms = System.get_env("WARM_HOME_RETENTION_MS") do
-  config :fathom, :warm_home_retention_ms, String.to_integer(ms)
-end
-
-# Floor on how often ONE cached shard's body may be re-transferred (expert review 2026-07-24 #26).
-# Defaults to 10× the poll. This is what bounds the follower's steady-state cost: a continuously
-# written tenant flushes faster than the poll, so its flush signal advances every cycle and every
-# conditional GET comes back 200-with-a-body plus a local fsync — forever, to save one body
-# transfer at a failover that may never happen. Raising this trades failover RTO on write-hot
-# shards for ingress and device writes; it never trades correctness, because the coordinator
-# revalidates before promoting a cached copy.
-if ms = env_int.("WARM_MIN_REPULL_MS") do
-  config :fathom, :warm_min_repull_ms, ms
-end
-
-# Optional hard cap on warm-refresh ingress, in bytes/second, spent lag-first (oldest-checked
-# shard first) so a budget too small for the whole set converges the cache round-robin instead of
-# starving its tail. Unset ⇒ no cap, and the budget path costs nothing.
-if n = env_int.("WARM_REFRESH_BYTES_PER_S") do
-  config :fathom, :warm_refresh_bytes_per_s, n
-end
+# Warm-standby follower (Phase 2 A1) removed 2026-09-14, superseded by A2 replication. Its env —
+# WARM_FOLLOWER, WARM_CACHE_DIR, WARM_POLL_MS, WARM_HOME_RETENTION_MS, WARM_MIN_REPULL_MS,
+# WARM_REFRESH_BYTES_PER_S — is no longer read.
 
 # ---- Quorum replication (Phase 2 A2) ------------------------------------------------------
 # Off by default, like every other Phase 2 component. Until this section existed A2 had NO
@@ -1020,7 +979,7 @@ if host = System.get_env("REPLICATION_ADVERTISE_HOST") do
 end
 
 # Where a follower keeps the replicas it receives. Defaults under System.tmp_dir!/ like
-# SHARD_DATA_DIR and WARM_CACHE_DIR — fine for dev, wrong for a node that is somebody's durability
+# SHARD_DATA_DIR — fine for dev, wrong for a node that is somebody's durability
 # guarantee. Point it at real local disk; it holds a full copy of every shard this node follows,
 # and `fathom.node.disk` reports it as `dir=replica`.
 if dir = System.get_env("REPLICATION_DIR") do

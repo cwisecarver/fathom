@@ -33,8 +33,8 @@ defmodule Fathom.Rebalancer.Policy do
     below the source's *current* load — otherwise the move just relocates the hotspot.
     A uniformly-loaded fleet (nowhere better to put it) yields no moves.
   - **Affinity (Phase 2 C):** among viable targets whose load is within `band × q` of the
-    least-loaded (`q` = the load being moved), prefer one that already has the shard
-    warm-cached (`:warm_locations`) — a cheap 304 handoff instead of a full S3 pull. The band
+    least-loaded (`q` = the load being moved), prefer one that already holds the shard warm — an A2
+    replica of it (`:warm_locations`) — a cheap peer-pull instead of a full cold S3 pull. The band
     is anchored to the coldest option, so affinity never lands more than `band × q` worse
     (post-move) than the best available balance.
   - **max_moves:** at most N moves per tick (default 1), hottest first, one shard per

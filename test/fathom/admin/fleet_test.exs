@@ -59,7 +59,7 @@ defmodule Fathom.Admin.FleetTest do
   end
 
   test "all_pending returns fleet-wide pending handoff commands" do
-    {:ok, _} = Commands.issue("acme", "fathom1", "warm")
+    {:ok, _} = Commands.issue("acme", "fathom1", "drain")
     assert [%{shard_id: "acme", node: "fathom1", status: "pending"}] = Commands.all_pending()
   end
 

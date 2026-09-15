@@ -25,8 +25,6 @@ defmodule Fathom.Scale do
   require Logger
 
   alias Fathom.Shard.Connection
-  alias Fathom.Shard.Storage
-  alias Fathom.Shard.WarmFollower
   alias Fathom.ShardExecutor
   alias Fathom.Shards
   alias Filo.Stmt
@@ -344,125 +342,7 @@ defmodule Fathom.Scale do
     |> Stream.run()
   end
 
-  # --- warm-standby density ------------------------------------------------
-
-  @doc """
-  Warm-standby density: how cheaply a standby holds shards **warm** (pre-pulled into
-  the follower cache) vs **open** (a live coordinator — `fanout/1`, ~196 KiB BEAM +
-  ~3 fds each).
-
-  A warm-cached shard is just its file on disk plus one id in the follower's set — no
-  coordinator, no `Fathom.Shard.Connection`, no file descriptors. So a standby's warm
-  capacity is **disk-bound** (`disk_budget / shard_size`), far above its open-shard
-  ceiling: the follower's per-shard *process* overhead is ~0.
-
-  Provisions N `:shard_size_mb` shards to storage, pre-pulls them ALL into the warm
-  cache (the `Storage.pull_if_changed/3` + etag-sidecar path the real follower runs),
-  and reports per-cached-shard disk, the follower's per-shard BEAM bookkeeping (the
-  cached-id set — the only thing it retains in memory), warming throughput, and the
-  open-vs-warm contrast.
-
-  Opts: `:shards` (1000), `:shard_size_mb` (1).
-  """
-  @spec warm_density(keyword()) :: map()
-  def warm_density(opts \\ []) do
-    n = Keyword.get(opts, :shards, 1000)
-    size_mb = Keyword.get(opts, :shard_size_mb, 1)
-    setup()
-
-    cache = Path.join(scratch(), "warm_cache")
-    File.rm_rf!(cache)
-    File.mkdir_p!(cache)
-    Application.put_env(:fathom, :warm_cache_dir, cache)
-
-    Logger.warning("provisioning #{n} shards @ ~#{size_mb} MB to storage ...")
-    {_us, sizes} = :timer.tc(fn -> provision(n, size_mb) end)
-    ids = Enum.map(1..n, &"scale_#{&1}")
-
-    :erlang.garbage_collect()
-    beam_before = :erlang.memory(:total)
-    rss_before = rss_kb()
-
-    Logger.warning("warming #{n} shards into the follower cache ...")
-    {warm_us, cached} = :timer.tc(fn -> warm_pull_all(ids) end)
-
-    # Retain the follower's per-shard bookkeeping (its cached-id set) so the BEAM
-    # delta reflects what the WarmFollower actually holds in memory per cached shard —
-    # the cache bytes themselves live on disk, not the heap.
-    cached_set = MapSet.new(cached)
-    :erlang.garbage_collect()
-    beam_after = :erlang.memory(:total)
-    rss_after = rss_kb()
-    held = max(MapSet.size(cached_set), 1)
-
-    cache_disk_kb = dir_size_kb(cache)
-
-    %{
-      mode: "warm_density",
-      shards_requested: n,
-      cached: MapSet.size(cached_set),
-      shard_size_mb_actual: round1(Enum.sum(sizes) / max(length(sizes), 1) / 1_048_576),
-      warm_cache_disk_mb: round1(cache_disk_kb / 1024),
-      warm_disk_kb_per_shard: round(safe_div(cache_disk_kb, held)),
-      # The follower's per-shard heap cost (its cached-id set) — the point is it's ~0
-      # next to an open coordinator's ~196 KiB.
-      warm_beam_kb_per_shard: kb(safe_div(beam_after - beam_before, held)),
-      # RSS delta includes transient page cache from writing the files, so it's noisy —
-      # reported for context, not as the density limit (disk is).
-      warm_rss_kb_per_shard: round(safe_div(rss_after - rss_before, held)),
-      warm_pull_per_s: round(safe_div(held, max(warm_us / 1_000_000, 0.001))),
-      # An OPEN shard (live coordinator + held connection) costs ~196 KiB BEAM + ~3
-      # fds; a WARM shard costs ~0 process/BEAM/fd — only disk. So a standby holds warm
-      # shards until it runs out of DISK, orders of magnitude past its open ceiling.
-      open_shard_beam_kb_ref: 196,
-      open_shard_fds_ref: 3
-    }
-  end
-
-  # Pre-pull each shard's current object into the warm cache + record its etag, exactly
-  # as Fathom.Shard.WarmFollower does. Concurrent so warming parallelizes.
-  defp warm_pull_all(ids) do
-    ids
-    |> Task.async_stream(&warm_pull_one/1,
-      max_concurrency: System.schedulers_online() * 4,
-      timeout: 120_000,
-      ordered: false
-    )
-    |> Enum.reduce([], fn
-      {:ok, {:ok, id}}, acc -> [id | acc]
-      _other, acc -> acc
-    end)
-  end
-
-  defp warm_pull_one(id) do
-    path = WarmFollower.cache_path(id)
-
-    case Storage.pull_if_changed(id, path, nil) do
-      {:ok, {:written, etag}} ->
-        File.write(path <> ".etag", etag)
-        {:ok, id}
-
-      _ ->
-        :skip
-    end
-  rescue
-    _ -> :skip
-  catch
-    :exit, _ -> :skip
-  end
-
-  defp dir_size_kb(dir) do
-    case :os.cmd(String.to_charlist("du -sk #{dir}")) |> List.to_string() |> String.split() do
-      [kb | _] ->
-        case Integer.parse(kb) do
-          {n, _} -> n
-          :error -> 0
-        end
-
-      _ ->
-        0
-    end
-  end
+  # warm_density/1 (warm-standby cache density) was removed 2026-09-14 with the WarmFollower retirement.
 
   # --- hot-spot evidence (Phase-2 §B rebalancing prerequisite) -------------
 

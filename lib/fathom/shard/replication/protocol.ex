@@ -197,8 +197,8 @@ defmodule Fathom.Shard.Replication.Protocol do
     `VACUUM INTO` snapshot — a rebuilt, defragmented database whose page layout differs from the
     live file (measured: 65,536 bytes against 118,784 live for the same data). WAL frames reference
     page numbers in the *primary's* layout, so appending them to a VACUUM'd copy applies the right
-    frames to the wrong pages. Silent corruption, and "just pull it from S3 like `WarmFollower`
-    does" is the obvious-looking answer that causes it.
+    frames to the wrong pages. Silent corruption, and "just pull it from S3 (a plain cold-open)"
+    is the obvious-looking answer that causes it.
 
     `db_size` and `wal_size` are declared up front so the follower can refuse a seed that did not
     arrive whole, rather than installing a truncated database that opens cleanly and is missing

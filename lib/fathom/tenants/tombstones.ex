@@ -15,7 +15,8 @@ defmodule Fathom.Tenants.Tombstones do
 
     * **loaded at boot** from `Fathom.Directory.deleted_shard_ids/0`;
     * **pushed fleet-wide** on delete over Oban's LISTEN/NOTIFY (`:fathom_tenant_deleted`),
-      so every node refuses the id and purges its warm-follower copy immediately;
+      so every node refuses the id immediately (the warm-follower-copy purge was removed
+      2026-09-14 with the WarmFollower retirement);
     * **refreshed periodically** (`:tenant_tombstone_refresh_ms`, default 5 min) so a node
       that booted during a Postgres outage, or missed a fire-and-forget notification,
       still converges. The set is append-only in memory — a tombstone is permanent, so a
@@ -122,11 +123,10 @@ defmodule Fathom.Tenants.Tombstones do
   @impl true
   def handle_info({:notification, @channel, %{"shard_id" => shard_id}}, state)
       when is_binary(shard_id) do
-    # One event does both jobs of a delete broadcast: block re-mint (ETS) and drop this
-    # node's lease-less warm copy of the erased shard (GDPR timeliness — otherwise the
-    # copy lingers until the follower's next refresh evicts it for leaving active_recent).
+    # Block re-mint of the erased shard (ETS). The warm-copy purge was removed 2026-09-14 with the
+    # WarmFollower retirement — there is no lease-less warm copy to drop anymore. (A2 replicas of a
+    # deleted shard are handled by the delete/purge path, not here.)
     insert(state.table, shard_id)
-    purge_warm(shard_id)
     {:noreply, state}
   end
 
@@ -166,14 +166,6 @@ defmodule Fathom.Tenants.Tombstones do
     :ets.insert(table, {shard_id})
   rescue
     ArgumentError -> :ok
-  end
-
-  defp purge_warm(shard_id) do
-    Fathom.Shard.WarmFollower.purge_now(shard_id)
-  rescue
-    _ -> :ok
-  catch
-    :exit, _ -> :ok
   end
 
   # Additive load — never clears the set, so a transiently-empty query result (or a

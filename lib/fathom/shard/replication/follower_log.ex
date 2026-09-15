@@ -6,8 +6,8 @@ defmodule Fathom.Shard.Replication.FollowerLog do
   `Fathom.Shard.Replication.Follower`. Every way this can corrupt a tenant's database is a decision
   made here — accepting frames from a deposed primary, appending across a checkpoint seam, or
   writing a delta at the wrong offset — and none of those needs a socket to test. The same
-  reasoning as `WarmFollower.headroom?/4` and `Snapshots.Retention.plan/3`: the branch that must
-  never be wrong should be reachable from a plain unit test.
+  reasoning as `Snapshots.Retention.plan/3`: the branch that must never be wrong should be
+  reachable from a plain unit test.
 
   The failure mode being defended against is the quiet one. A follower that appends the wrong bytes
   does not raise; it produces a SQLite file that looks fine until it is promoted, at which point the

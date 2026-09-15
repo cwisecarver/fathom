@@ -72,14 +72,15 @@ Host-based and does not resolve through Postgres.
 
 **Symptom:** on one node, cold-opens fail (pull can't write the temp file), flushes/checkpoints
 fail, new-shard opens error; `checkout` outcome `error` on that node only; `df` on
-`SHARD_DATA_DIR` (and `WARM_CACHE_DIR` if the warm follower is on) near 100%.
+`SHARD_DATA_DIR` (and `REPLICATION_DIR` if this node follows peers) near 100%.
 
 **What is and isn't happening:**
 - `SHARD_DATA_DIR` holds the **working copy** of every open shard (+ `-wal`/`-shm`). It grows with
   open-shard count × shard size, not with total tenants — an idle shard's bytes live in S3, not here.
-- The **warm follower** (`WARM_FOLLOWER=true`, `WARM_CACHE_DIR`) pre-pulls foreign shards and is a
-  large, *elastic* consumer: warm capacity is disk-bound by design. A full disk is often the warm
-  cache, not the served set.
+- The **A2 replica dir** (`REPLICATION_DIR`, gauge `dir=replica`) holds a full copy of every shard
+  this node follows and is the large, *elastic* consumer: it grows from other nodes' write traffic
+  and has no retention. A full disk is often the replica set, not the served set. (The warm-standby
+  follower that used to be this elastic consumer was removed 2026-09-14.)
 - A failed **pull** stops the coordinator with `{:shutdown, _}` (not restarted); the checkout maps
   to `{:error, _}` — the tenant is down on this node, but nothing is corrupted (the temp file is
   promoted only after a complete pull + lease confirm).
@@ -88,14 +89,15 @@ fail, new-shard opens error; `checkout` outcome `error` on that node only; `df` 
   unless the node is also lost** before the disk is freed.
 
 **Diagnose:**
-1. `df` the data dir and the warm cache dir. Which is the consumer?
+1. `df` the data dir and the replica dir. Which is the consumer?
 2. Count open shards on the node (`fathom.shards.active`) vs the measured per-shard footprint
    (`docs/reviews/fleet-density-2026-07-10.md`).
 
 **Respond:**
-- **Fastest relief:** if the warm follower is the consumer, lower `WARM_CACHE_MAX` (or set
-  `WARM_FOLLOWER=false` on that node and restart) — the warm cache holds no lease and serves
-  nothing, so dropping it is non-disruptive.
+- **If the replica dir is the consumer:** the replicas are load-bearing for A2 (a survivor promotes
+  from them on failover), so they are NOT free to drop — give `REPLICATION_DIR` real local disk
+  sized for a full copy of what this node follows, or reduce this node's follower set (membership).
+  Do not point it at the same small volume as `SHARD_DATA_DIR`.
 - **Shed served load:** idle shards flush-and-drop on their own (`SHARD_IDLE_MS`); to force it,
   lower the LB's weight for that node so new streams land elsewhere, then let the idle set drain.
   The soft cap's LRU idle-eviction (`:evict_idle_at_capacity`) also frees idle shards under pressure.

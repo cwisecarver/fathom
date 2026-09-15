@@ -360,13 +360,14 @@ defmodule Fathom.DirectoryTest do
   end
 
   # Finding #12: `status` was in no index, so every status='active'-filtered query
-  # (active_recent every warm-follower poll; laggards/count_laggards every reconcile +
-  # rollout sweep; shards_at_version on revert) sequentially scanned the whole shards
-  # table — linear in fleet size (millions at target scale). These partial indexes make
-  # the status-filtered reads index-bound. Pin their existence + partial predicate so a
-  # future migration can't silently drop the fleet back to full scans.
+  # (laggards/count_laggards every reconcile + rollout sweep; shards_at_version on revert)
+  # sequentially scanned the whole shards table — linear in fleet size (millions at target
+  # scale). These partial indexes make the status-filtered reads index-bound. Pin their
+  # existence + partial predicate so a future migration can't silently drop the fleet back
+  # to full scans. (The active_recent query the index also served was removed 2026-09-14 with
+  # the WarmFollower retirement; the index stays for the laggard path.)
   describe "status-filtered query indexes (finding #12)" do
-    test "partial indexes on active shards exist for active_recent and the laggard path" do
+    test "partial indexes on active shards exist for the laggard path" do
       defs =
         Fathom.Repo.query!(
           "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'shards'"

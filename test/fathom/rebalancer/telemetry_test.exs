@@ -147,11 +147,12 @@ defmodule Fathom.Rebalancer.TelemetryTest do
     end)
 
     attach([[:fathom, :rebalancer, :command, :stop]])
-    {:ok, _} = Commands.issue(shard, node, "warm")
+    {:ok, _} = Fathom.Rebalancer.Overrides.pin(shard, node, reason: "test")
+    {:ok, _} = Commands.issue(shard, node, "drain")
     start_supervised!(CommandPoller)
     assert CommandPoller.poll_now() == 1
 
     assert_receive {:telemetry, [:fathom, :rebalancer, :command, :stop], %{count: 1},
-                    %{command: "warm", outcome: :done}}
+                    %{command: "drain", outcome: :done}}
   end
 end

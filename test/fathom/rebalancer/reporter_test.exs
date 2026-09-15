@@ -102,25 +102,21 @@ defmodule Fathom.Rebalancer.ReporterTest do
     assert beat.q_p99 > 0.0
   end
 
-  test "advertises the fleet-hot shards it has warm-cached (affinity signal, #C)" do
+  test "advertises the fleet-hot shards it holds an A2 replica of (affinity signal, #C)" do
     alias Fathom.Rebalancer.{LoadSample, WarmLocations}
+    alias Fathom.Shard.Replication.Follower
 
-    warm_dir = Path.join(System.tmp_dir!(), "warmloc_test_#{System.unique_integer([:positive])}")
-    File.mkdir_p!(warm_dir)
-    prev_dir = Application.get_env(:fathom, :warm_cache_dir)
-    Application.put_env(:fathom, :warm_cache_dir, warm_dir)
+    # The affinity signal was re-sourced from the A2 replica set on 2026-09-14 (WarmFollower
+    # retirement): a node holding a non-torn replica is "warm" for that shard. Start a follower
+    # under the default name (the reporter reads `Follower.replica_shard_ids/0`) and seed one.
+    dir = Path.join(System.tmp_dir!(), "reploc_test_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf(dir) end)
 
-    on_exit(fn ->
-      if is_nil(prev_dir),
-        do: Application.delete_env(:fathom, :warm_cache_dir),
-        else: Application.put_env(:fathom, :warm_cache_dir, prev_dir)
-
-      File.rm_rf(warm_dir)
-    end)
-
-    # This node has "wl_hot" warm-cached; a recent sample (from another node) makes it
-    # fleet-hot. "wl_cold" is fleet-hot but not warm here.
-    File.write!(Path.join(warm_dir, "wl_hot.db"), "x")
+    start_supervised!({Follower, port: 0, dir: dir})
+    # This node holds a replica of "wl_hot"; a recent sample (from another node) makes it
+    # fleet-hot. "wl_cold" is fleet-hot but this node holds no replica of it.
+    Follower.seed(Follower, "wl_hot", 1, 0, 0, 0)
 
     for shard <- ["wl_hot", "wl_cold"] do
       Repo.insert!(%LoadSample{

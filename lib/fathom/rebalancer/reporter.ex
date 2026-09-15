@@ -26,7 +26,7 @@ defmodule Fathom.Rebalancer.Reporter do
   alias Fathom.Rebalancer
   alias Fathom.Rebalancer.{LoadSample, LoadSamples, Nodes, Stats, WarmLocations}
   alias Fathom.Repo
-  alias Fathom.Shard.WarmFollower
+  alias Fathom.Shard.Replication.Follower
   alias Fathom.ShardLoad
 
   import Ecto.Query, only: [from: 2]
@@ -221,15 +221,19 @@ defmodule Fathom.Rebalancer.Reporter do
     end
   end
 
-  # Advertise the fleet-hot shards this node has warm-cached (affinity-aware target, #C). The
-  # fleet-hot set is the recent samples' distinct shards; intersect with this node's warm cache
-  # (`WarmFollower.cached?/1` — a node not running the follower matches none). Prune dead-node
+  # Advertise the fleet-hot shards this node holds an A2 replica of (affinity-aware target, #C). The
+  # fleet-hot set is the recent samples' distinct shards; intersect with this node's held replicas
+  # (`Follower.replica_shard_ids/1` — a node not running the follower holds none). Prune dead-node
   # leftovers past the same window the reader trusts.
+  #
+  # The signal was re-sourced from the A2 replica set on 2026-09-14 when the WarmFollower read cache
+  # was retired: a node holding a replica already has recent bytes, so a handoff there is a
+  # peer-pull/304 rather than a full cold S3 pull — the same win the warm cache gave, from the
+  # mechanism that replaced it.
   defp publish_warm_locations do
-    # One directory read for this node's whole warm set, then in-memory membership — not one
-    # File.exists? per recent-hot shard inline in the GenServer (finding #12). A node not
-    # running the follower has an empty set and advertises none.
-    warm_set = MapSet.new(WarmFollower.cached_shard_ids())
+    # One ETS scan of this node's replica table, then in-memory membership. A node not running the
+    # follower has an empty set and advertises none.
+    warm_set = MapSet.new(Follower.replica_shard_ids())
 
     warm_hot =
       @warm_hot_window_ms

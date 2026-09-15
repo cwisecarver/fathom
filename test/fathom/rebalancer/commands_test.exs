@@ -14,13 +14,13 @@ defmodule Fathom.Rebalancer.CommandsTest do
   end
 
   test "issue / pending_for / complete lifecycle" do
-    {:ok, cmd} = Commands.issue("hot_1", "fathom2", "warm")
+    {:ok, cmd} = Commands.issue("hot_1", "fathom2", "drain")
     assert cmd.status == "pending"
 
     assert Enum.any?(Commands.pending_for("fathom2"), &(&1.id == cmd.id))
     assert Commands.pending_for("fathom1") == [], "only the addressed node sees it"
 
-    {:ok, done} = Commands.complete(cmd, "done", "warmed")
+    {:ok, done} = Commands.complete(cmd, "done", "drained")
     assert done.status == "done"
     assert Commands.pending_for("fathom2") == [], "completed commands drop out of the queue"
   end
@@ -34,7 +34,7 @@ defmodule Fathom.Rebalancer.CommandsTest do
     {:ok, _} = Commands.complete(bad, "failed", "busy")
     assert {:error, {:command_failed, "busy"}} = Commands.await(bad.id, timeout_ms: 100)
 
-    {:ok, pending} = Commands.issue("s", "n", "warm")
+    {:ok, pending} = Commands.issue("s", "n", "drain")
     assert {:error, :timeout} = Commands.await(pending.id, timeout_ms: 60, poll_ms: 20)
   end
 
@@ -44,22 +44,23 @@ defmodule Fathom.Rebalancer.CommandsTest do
   end
 
   test "rejects an invalid shard_id at the command boundary (#6)" do
-    # The isolation gate: a command's shard_id is handed straight to Shards.drain /
-    # WarmFollower.warm_now (a file path) by the poller — a path-traversal or nginx-injection
-    # id must never be persisted for a node to execute.
+    # The isolation gate: a command's shard_id is handed straight to Shards.drain (a file path)
+    # by the poller — a path-traversal or nginx-injection id must never be persisted for a node
+    # to execute.
     for bad <- ["../etc/passwd", "acme.evil", "a/b", "has space", String.duplicate("x", 65)] do
-      assert {:error, changeset} = Commands.issue(bad, "n", "warm")
+      assert {:error, changeset} = Commands.issue(bad, "n", "drain")
       assert "is not a valid shard id" in errors_on(changeset).shard_id
     end
 
     # A valid id still issues.
-    assert {:ok, _} = Commands.issue("acme_1", "n", "warm")
+    assert {:ok, _} = Commands.issue("acme_1", "n", "drain")
   end
 
-  test "cancel_pending_drains cancels only pending drains for the shard (#7)" do
+  test "cancel_pending_drains cancels only PENDING drains for the shard (#7)" do
+    # `drain` is the only command type since the `warm` command was removed 2026-09-14, so this now
+    # proves the two dimensions that still vary: PENDING vs terminal, and this shard vs another.
     {:ok, d1} = Commands.issue("s", "src", "drain")
     {:ok, d2} = Commands.issue("s", "src", "drain")
-    {:ok, warm} = Commands.issue("s", "tgt", "warm")
     {:ok, done} = Commands.issue("s", "src", "drain")
     {:ok, _} = Commands.complete(done, "done", "drained")
     {:ok, other} = Commands.issue("other", "src", "drain")
@@ -68,8 +69,7 @@ defmodule Fathom.Rebalancer.CommandsTest do
 
     assert Commands.get(d1.id).status == "cancelled"
     assert Commands.get(d2.id).status == "cancelled"
-    # A warm, an already-terminal drain, and another shard's drain are untouched.
-    assert Commands.get(warm.id).status == "pending"
+    # An already-terminal drain and another shard's drain are untouched.
     assert Commands.get(done.id).status == "done"
     assert Commands.get(other.id).status == "pending"
 
@@ -80,8 +80,8 @@ defmodule Fathom.Rebalancer.CommandsTest do
   test "prune_terminal deletes old terminal commands, keeps recent + pending (#12)" do
     {:ok, old_done} = Commands.issue("s", "n", "drain")
     {:ok, _} = Commands.complete(old_done, "done", "drained")
-    {:ok, recent_done} = Commands.issue("s2", "n", "warm")
-    {:ok, _} = Commands.complete(recent_done, "done", "warmed")
+    {:ok, recent_done} = Commands.issue("s2", "n", "drain")
+    {:ok, _} = Commands.complete(recent_done, "done", "drained")
     {:ok, pending} = Commands.issue("s3", "n", "drain")
 
     # old_done completed 2h ago; retention 1h.
@@ -95,7 +95,7 @@ defmodule Fathom.Rebalancer.CommandsTest do
 
   test "expire_stale_pending fails old pending, keeps recent pending + terminal (#12)" do
     {:ok, old_pending} = Commands.issue("s", "n", "drain")
-    {:ok, recent_pending} = Commands.issue("s2", "n", "warm")
+    {:ok, recent_pending} = Commands.issue("s2", "n", "drain")
     {:ok, done} = Commands.issue("s3", "n", "drain")
     {:ok, _} = Commands.complete(done, "done", "drained")
 

@@ -137,6 +137,32 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   @doc """
+  The shard ids this node holds a coherent (non-torn) A2 replica of — the "warm" set for
+  affinity-aware placement (`Fathom.Rebalancer.WarmLocations`).
+
+  This became the affinity signal when the `Fathom.Shard.WarmFollower` read cache was retired
+  (2026-09-14): a node holding an A2 replica IS "warm" for that shard — it already has recent bytes,
+  so a handoff there is a peer-pull/304 rather than a full cold S3 pull. Torn replicas are excluded,
+  the same `offerable/2` notion, because an affinity target must actually hold bytes worth pulling.
+  A node not running a `Follower` (replication off) has no table and answers `[]`, exactly as the
+  old `WarmFollower.cached_shard_ids/0` returned an empty set on a node with no cache.
+  """
+  @spec replica_shard_ids(atom()) :: [String.t()]
+  def replica_shard_ids(name \\ __MODULE__) do
+    if Process.whereis(name) do
+      table(name)
+      |> :ets.tab2list()
+      |> Enum.reject(fn {_id, s} -> match?(%{torn: true}, s) end)
+      |> Enum.map(fn {id, _s} -> id end)
+    else
+      []
+    end
+  rescue
+    # The follower died between the whereis and the read — no table, no replicas to advertise.
+    ArgumentError -> []
+  end
+
+  @doc """
   Where this follower keeps the WAL files it receives.
 
   Per-instance, not global. Four followers sharing one directory would all write the SAME file for
@@ -168,7 +194,7 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   # Path-traversal / isolation gate (expert review 2026-08-20 #1), the same fail-closed assertion
-  # `Fathom.Shard.WarmFollower.cache_path/1` carries and for the same reason: shard_id becomes a
+  # every shard-id-to-path boundary carries and for the same reason: shard_id becomes a
   # FILE NAME here, so a `..` or `/` id escapes dir/1. `Path.join/2` neutralizes a leading `/` but
   # NOT `..` — `Path.join("/a/b", "../c")` is `/a/b/../c`, which the OS resolves.
   #
@@ -427,8 +453,8 @@ defmodule Fathom.Shard.Replication.Follower do
   #
   # Validating here rather than in each handler is deliberate: the frame boundary is the ONE place
   # every path flows through, and `Fathom.ShardId.valid?/1` is the allowlist the rest of the
-  # codebase already enforces at exactly this boundary (`WarmFollower.cache_path/1`,
-  # `Snapshots`' id pattern, `Recovery`'s pinned `^shard_id`). Deliberately NOT `Path.expand` +
+  # codebase already enforces at exactly this boundary (`Snapshots`' id pattern, `Recovery`'s
+  # pinned `^shard_id`). Deliberately NOT `Path.expand` +
   # prefix comparison: a second mechanism would drift from the first.
   #
   # An unparseable IDENTIFIER is as much a framing failure as an unparseable frame, so this returns

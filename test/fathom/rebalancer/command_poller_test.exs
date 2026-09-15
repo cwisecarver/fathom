@@ -79,7 +79,7 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
   test "a Postgres outage makes a poll tick a no-op without crashing (#13)", %{shard: shard} do
     import ExUnit.CaptureLog
 
-    {:ok, _} = Commands.issue(shard, Rebalancer.node_key(), "warm")
+    {:ok, _} = Commands.issue(shard, Rebalancer.node_key(), "drain")
     pid = start_supervised!(CommandPoller)
 
     # Cut the poller off from Postgres: pending_for raises. do_poll must drop the tick
@@ -114,7 +114,9 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
 
     on_exit(fn -> :telemetry.detach(id) end)
 
-    {:ok, cmd} = Commands.issue("crashwedge_#{System.unique_integer([:positive])}", node, "warm")
+    shard = "crashwedge_#{System.unique_integer([:positive])}"
+    {:ok, _} = Overrides.pin(shard, node, reason: "test")
+    {:ok, cmd} = Commands.issue(shard, node, "drain")
     start_supervised!(CommandPoller)
     assert CommandPoller.poll_now() == 1
 
@@ -123,12 +125,12 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
 
   test "a poll batch executes all commands concurrently off the poller (#8)", %{node: node} do
     # Multiple commands in one batch all complete via a single poll (the Task.Supervisor
-    # async_stream), so a slow drain can't head-of-line-block the warms behind it.
+    # async_stream), so a slow drain can't head-of-line-block the drains behind it.
     ids =
       for i <- 1..3 do
-        {:ok, c} =
-          Commands.issue("warmbatch_#{i}_#{System.unique_integer([:positive])}", node, "warm")
-
+        shard = "drainbatch_#{i}_#{System.unique_integer([:positive])}"
+        {:ok, _} = Overrides.pin(shard, node, reason: "test")
+        {:ok, c} = Commands.issue(shard, node, "drain")
         c.id
       end
 
@@ -160,11 +162,13 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
   end
 
   test "the poll timer decouples from a slow in-flight drain (#11)", %{node: node} do
-    # A slow drain must not gate the next tick's warm pickup. Drive dispatch explicitly (high
-    # auto-poll interval) so the assertions are deterministic, and hold a connection so the
-    # drain blocks ~command_drain_ms instead of completing.
-    drain_shard = "poll11d_#{System.unique_integer([:positive])}"
-    warm_shard = "poll11w_#{System.unique_integer([:positive])}"
+    # A slow drain must not gate the next tick's pickup of a DIFFERENT command. Drive dispatch
+    # explicitly (high auto-poll interval) so the assertions are deterministic, and hold a
+    # connection on the slow shard so its drain blocks ~command_drain_ms instead of completing.
+    # (Before warm standby was retired 2026-09-14 the second command was a `warm`; it is now a
+    # second, fast drain — the decoupling property is identical.)
+    slow_shard = "poll11d_#{System.unique_integer([:positive])}"
+    fast_shard = "poll11f_#{System.unique_integer([:positive])}"
 
     prev_poll = Application.get_env(:fathom, :command_poll_ms)
     prev_drain = Application.get_env(:fathom, :command_drain_ms)
@@ -175,54 +179,44 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
       restore(:command_poll_ms, prev_poll)
       restore(:command_drain_ms, prev_drain)
 
-      for id <- [drain_shard, warm_shard],
+      for id <- [slow_shard, fast_shard],
           dir <- [Fathom.Shard.data_dir(), Fathom.Shard.Storage.Local.dir()],
           s <- ["", "-wal", "-shm"] do
         File.rm(Path.join([dir, "#{id}.db"]) <> s)
       end
     end)
 
-    {:ok, _} = Overrides.pin(drain_shard, node, reason: "test")
-    {:ok, cpid, ref, _} = Shards.checkout(drain_shard)
-    {:ok, drain_cmd} = Commands.issue(drain_shard, node, "drain")
+    {:ok, _} = Overrides.pin(slow_shard, node, reason: "test")
+    {:ok, cpid, ref, _} = Shards.checkout(slow_shard)
+    {:ok, slow_cmd} = Commands.issue(slow_shard, node, "drain")
 
     poller = start_supervised!(CommandPoller)
 
-    # Tick 1: dispatch the drain; its task blocks on the held connection (in-flight).
+    # Tick 1: dispatch the slow drain; its task blocks on the held connection (in-flight).
     send(poller, :poll)
-    assert MapSet.member?(:sys.get_state(poller).in_flight, drain_cmd.id)
+    assert MapSet.member?(:sys.get_state(poller).in_flight, slow_cmd.id)
 
-    # A warm arrives while the drain is still blocked.
-    {:ok, warm_cmd} = Commands.issue(warm_shard, node, "warm")
+    # A fast drain (no held connection) arrives while the slow one is still blocked.
+    {:ok, _} = Overrides.pin(fast_shard, node, reason: "test")
+    {:ok, fast_cmd} = Commands.issue(fast_shard, node, "drain")
 
-    # Tick 2: the warm is picked up and completes within a short window while the drain (5s) is
-    # still pending — the decoupling. (Pre-fix the poller blocked on the drain batch, so the
-    # warm couldn't be dispatched until the drain returned.)
+    # Tick 2: the fast drain is picked up and completes within a short window while the slow drain
+    # (5s) is still pending — the decoupling. (Pre-fix the poller blocked on the first drain batch,
+    # so the second command couldn't be dispatched until the slow drain returned.)
     send(poller, :poll)
-    assert {:ok, %{status: "done"}} = Commands.await(warm_cmd.id, timeout_ms: 2_000, poll_ms: 25)
+    assert {:ok, %{status: "done"}} = Commands.await(fast_cmd.id, timeout_ms: 2_000, poll_ms: 25)
 
-    assert Commands.get(drain_cmd.id).status == "pending",
-           "drain still draining, didn't block the warm"
+    assert Commands.get(slow_cmd.id).status == "pending",
+           "slow drain still draining, didn't block the fast one"
 
-    # Release so the drain finishes; the poller survives.
+    # Release so the slow drain finishes; the poller survives.
     down = Process.monitor(cpid)
     Fathom.Shard.checkin(cpid, ref)
     assert_receive {:DOWN, ^down, :process, ^cpid, _}, 8_000
     assert Process.alive?(poller)
   end
 
-  test "a warm command is best-effort: an un-flushed shard still marks done",
-       %{shard: shard, node: node} do
-    # No stored object for this shard, so warm_now can't fetch — but warm is only an
-    # optimization (the target cold-opens correctly), so the command still completes.
-    {:ok, cmd} = Commands.issue(shard, node, "warm")
-    start_supervised!(CommandPoller)
-    assert CommandPoller.poll_now() == 1
-
-    done = Commands.get(cmd.id)
-    assert done.status == "done"
-    assert done.detail =~ "warm"
-  end
+  # (The "warm command is best-effort" test was removed 2026-09-14 with the WarmFollower retirement.)
 
   test "a batch task killed by an exit signal frees its in-flight ids — no permanent leak (#19)",
        %{node: node} do

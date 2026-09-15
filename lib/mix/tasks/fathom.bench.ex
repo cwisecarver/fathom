@@ -69,7 +69,6 @@ defmodule Mix.Tasks.Fathom.Bench do
   @all_metrics [
     :cold_open,
     :cold_open_s3,
-    :warm_s3,
     :failover_rto,
     :dir_resolve,
     :dir_recorder,
@@ -102,7 +101,6 @@ defmodule Mix.Tasks.Fathom.Bench do
     cold_open_samples: :integer,
     cold_open_s3_samples: :integer,
     failover_samples: :integer,
-    warm_shards: :integer,
     warm_size_kb: :integer,
     resolve_samples: :integer,
     copy_rows: :integer,
@@ -160,7 +158,6 @@ defmodule Mix.Tasks.Fathom.Bench do
       |> put_opt(opts, :cold_open_samples)
       |> put_opt(opts, :cold_open_s3_samples)
       |> put_opt(opts, :failover_samples)
-      |> put_opt(opts, :warm_shards)
       |> put_opt(opts, :warm_size_kb)
       |> put_opt(opts, :resolve_samples)
       |> put_opt(opts, :copy_rows)
@@ -214,12 +211,8 @@ defmodule Mix.Tasks.Fathom.Bench do
       {"cold_open_p99_us", metrics.cold_open_p99_us, "µs   (cold-open TAIL, same samples)"},
       {"cold_open_s3_p50_us", metrics.cold_open_s3_p50_us,
        "µs   (cold-open, pull from S3; opt-in)"},
-      {"warm_s3_shards_per_s", metrics.warm_s3_shards_per_s,
-       "shards/s (warm many from S3; opt-in)"},
       {"failover_cold_s3_p50_us", metrics.failover_cold_s3_p50_us,
        "µs   (failover open, cold full pull; opt-in)"},
-      {"failover_warm_s3_p50_us", metrics.failover_warm_s3_p50_us,
-       "µs   (failover open, warm 304-promote; opt-in)#{rto_speedup(metrics)}"},
       {"dir_resolve_p50_us", metrics.dir_resolve_p50_us, "µs   (directory resolve, warm)"},
       {"dir_recorder_flush_rows_per_s", metrics.dir_recorder_flush_rows_per_s,
        "rows/s (directory Recorder batch flush — the live path)"},
@@ -261,13 +254,7 @@ defmodule Mix.Tasks.Fathom.Bench do
     Mix.shell().error("")
   end
 
-  # The warm-vs-cold RTO speedup, appended to the warm row when both are measured.
-  defp rto_speedup(%{failover_cold_s3_p50_us: cold, failover_warm_s3_p50_us: warm})
-       when is_number(cold) and is_number(warm) and warm > 0 do
-    " — #{Float.round(cold / warm, 2)}x vs cold"
-  end
-
-  defp rto_speedup(_), do: ""
+  # rto_speedup/1 (warm-vs-cold RTO) removed 2026-09-14 with the WarmFollower retirement.
 
   defp format_value(nil), do: String.pad_leading("skipped", 12)
 

@@ -1,9 +1,11 @@
 defmodule Fathom.Rebalancer.WarmLocations do
   @moduledoc """
-  The warm-location signal (`shard_warm_locations`) — which nodes have a given hot shard
-  warm-cached, so the rebalancer can prefer a handoff target that already holds it (Phase 2 C,
-  folded into B1). Written per-node by `Fathom.Rebalancer.Reporter` (warmth is node-local, no
-  BEAM cluster) and read by `Fathom.Rebalancer.RebalanceJob`.
+  The warm-location signal (`shard_warm_locations`) — which nodes hold a given hot shard warm (an
+  A2 replica of it), so the rebalancer can prefer a handoff target that already holds it (Phase 2 C,
+  folded into B1). Written per-node by `Fathom.Rebalancer.Reporter` (warmth is node-local, no BEAM
+  cluster) and read by `Fathom.Rebalancer.RebalanceJob`. Source: the node's A2 replica set
+  (`Follower.replica_shard_ids/1`) since 2026-09-14 — before that it was the `WarmFollower` read
+  cache, retired in favour of A2.
   """
   import Ecto.Query, only: [from: 2]
 

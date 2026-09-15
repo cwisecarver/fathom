@@ -4,10 +4,6 @@ defmodule Fathom.Rebalancer.CommandPoller do
   command channel. Every `:command_poll_ms` it reads `Commands.pending_for/1` for this
   node's `Fathom.Rebalancer.node_key/0` and runs each:
 
-    * **warm** — `Fathom.Shard.WarmFollower.warm_now/1` pulls the shard into this node's
-      warm cache ahead of a handoff. Best-effort: a shard with no stored object (never
-      flushed) or a transient pull failure still marks `done`, because the target's
-      cold-open revalidates/pulls correctly anyway — warm only trims the blip.
     * **drain** — `Fathom.Shards.drain/2` flushes + releases the lease so another node can
       acquire it. `:ok` ⇒ `done`; a `{:error, _}` (e.g. `:busy` — connections didn't drain
       in time) ⇒ `failed`, and the orchestrator decides whether to retry. Skipped
@@ -44,7 +40,6 @@ defmodule Fathom.Rebalancer.CommandPoller do
 
   alias Fathom.Rebalancer
   alias Fathom.Rebalancer.{Commands, Overrides}
-  alias Fathom.Shard.WarmFollower
   alias Fathom.Shards
 
   @default_poll_ms 1_000
@@ -237,18 +232,6 @@ defmodule Fathom.Rebalancer.CommandPoller do
     :exit, reason ->
       Logger.warning("command poller tick exited: #{inspect(reason)}")
       0
-  end
-
-  # Warm is best-effort: correctness comes from the target's cold-open, so even a skip is
-  # `done` (the handoff proceeds; warm only saved a body transfer).
-  defp execute(%{command: "warm", shard_id: id} = cmd) do
-    detail =
-      case WarmFollower.warm_now(id) do
-        :ok -> "warmed"
-        {:error, reason} -> "warm skipped (#{inspect(reason)})"
-      end
-
-    complete(cmd, "done", detail)
   end
 
   # Drain releases the lease. Failure (busy / drain_failed) is terminal-for-this-command;

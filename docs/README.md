@@ -52,9 +52,9 @@ single-node basics first, then what happens across nodes.
    most one node ever writes a shard's file*, across failover / remap / partition, with **no BEAM
    cluster** — the S3 lease `{owner, epoch}`, the etag/epoch flush fence, and the O(nodes) node
    heartbeat.
-5. **[warm-standby.md](warm-standby.md)** — how survivors pre-pull the hot set into a lease-less read
-   cache and promote a warm copy on failover after a single conditional (304) round-trip instead of
-   a full-body pull.
+5. **[warm-standby.md](warm-standby.md)** — REMOVED 2026-09-14 (tombstone). The warm-standby
+   follower was superseded by A2 replication; a survivor recovers via promote-on-open from a replica
+   instead of a warm cache.
 6. **[rebalancing.md](rebalancing.md)** — how a persistently-hot shard is moved off an overloaded
    node: detect (per-node load reporting) → decide (a fleet-singleton policy) → execute (the
    warm → flip-the-LB → drain-the-lease handoff).
@@ -67,8 +67,8 @@ single-node basics first, then what happens across nodes.
 8. **[auth.md](auth.md)** — how an unchanged libSQL client authenticates per shard (a
    `Phoenix.Token` as `authToken` on Filo's `:authorize` seam), the `:disabled`/`:required` modes,
    and the network trust boundary when auth is off.
-9. **[directory.md](directory.md)** — the Postgres control plane the migration / rebalancing /
-   warm-standby readers use, and the off-hot-path recorder (lock-free ETS coalesce + batch-flush) so
+9. **[directory.md](directory.md)** — the Postgres control plane the migration / rebalancing
+   readers use, and the off-hot-path recorder (lock-free ETS coalesce + batch-flush) so
    a Postgres outage never fails a checkout.
 10. **[tenant-lifecycle.md](tenant-lifecycle.md)** — the tenant control plane: **provision**
     (explicit create + token), **suspend/resume** (administrative offline via a reversible ETS deny
@@ -107,8 +107,9 @@ what actually shipped (some plan assumptions were superseded).
 - **[migration-engine-plan.md](migration-engine-plan.md)** — earlier migration-engine design notes.
   *Plan.*
 - **[phase2-scoping.md](phase2-scoping.md)** — Phase 2 scoping: warm standby (A), rebalancing (B),
-  locality/affinity (C). *Scoping — but A1, A2 and B have all since been BUILT. **Only C is
-  unbuilt.** Read it for the reasoning that chose the order, not for what is left.*
+  locality/affinity (C). *Scoping — but A2 and B were BUILT, **A1 (warm standby) was built and then
+  REMOVED 2026-09-14** (superseded by A2), and only C1/C2 are unbuilt. Read it for the reasoning
+  that chose the order, not for what is left.*
 - **[a2-bare-metal-plan.md](a2-bare-metal-plan.md)** — **the one plan here that has NOT been run.**
   Every A2 number on record comes from five nodes sharing one 12-vCPU VM; this measures whether the
   ≤256-tenant replication ceiling belongs to fathom or to the rig. Blocked on hardware.
