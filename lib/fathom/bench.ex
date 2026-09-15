@@ -72,12 +72,17 @@ defmodule Fathom.Bench do
   @concurrent_ms 1_000
   @recorder_rows 2_000
   @warm_size_kb 256
+  # How many shards `warm_s3_throughput/1` pulls concurrently. The name is legacy (the metric was
+  # `warm_s3` when it shared harness bits with the retired WarmFollower); the measurement is and
+  # always was concurrent S3-pull throughput, kept under its original series name for continuity.
+  @warm_shards 200
   @hrana_rt_samples 200
   @wire_rows 1_000
 
   @all_metrics [
     :cold_open,
     :cold_open_s3,
+    :warm_s3,
     :failover_rto,
     :dir_resolve,
     :dir_recorder,
@@ -128,6 +133,9 @@ defmodule Fathom.Bench do
       cold_open_p99_us: cold && cold.p99_us,
       # The cold-S3 path — nil unless an S3 endpoint is configured (opt-in).
       cold_open_s3_p50_us: run_if(only, :cold_open_s3, fn -> cold_open_s3(opts) end),
+      # Concurrent S3-pull throughput (N shards pulled at once ÷ wall) — the node-startup / mass
+      # failover number. Named `warm_s3` for series continuity; it never depended on WarmFollower.
+      warm_s3_shards_per_s: run_if(only, :warm_s3, fn -> warm_s3_throughput(opts) end),
       # Failover RTO at real size: cold pull (opt-in, S3). The warm 304-promote arm was removed
       # 2026-09-14 with the WarmFollower retirement.
       failover_cold_s3_p50_us: rto && rto.cold_us,
@@ -295,8 +303,53 @@ defmodule Fathom.Bench do
 
   defp uniq(prefix), do: "#{prefix}_#{System.unique_integer([:positive])}"
 
-  # The warm_s3_throughput metric (concurrent S3-pull throughput, mislabeled "warm") was removed
-  # 2026-09-14 with the WarmFollower retirement. cold_open_s3 covers the single-pull S3 latency.
+  @doc """
+  Concurrent S3-pull throughput: pull `@warm_shards` shard objects from S3 at once and report
+  `N ÷ wall` (shards/s). The node-startup / mass-failover number — `cold_open_s3` covers the
+  single-pull LATENCY, this covers the aggregate THROUGHPUT of many pulls contending on the
+  dedicated S3 Finch pool. `nil` without an S3 endpoint (opt-in, like `cold_open_s3/1`).
+
+  The `warm_s3` name is legacy: it shared harness setup with the retired WarmFollower and was
+  labeled "warm", but the measurement never touched that cache — it is plain concurrent
+  `Shards.checkout/1` (each a cold pull). Kept under the original series name so the historical
+  `warm_s3_shards_per_s` entries in perf_history.jsonl stay comparable.
+  """
+  @spec warm_s3_throughput(keyword()) :: float() | nil
+  def warm_s3_throughput(opts \\ []) do
+    if s3_opt_in?() do
+      setup_s3(opts)
+      n = Keyword.get(opts, :warm_shards, @warm_shards)
+      size_kb = Keyword.get(opts, :warm_size_kb, @warm_size_kb)
+
+      try do
+        ids = for _ <- 1..n, do: uniq("bench_s3_warm")
+        Enum.each(ids, &seed_s3_sized(&1, size_kb))
+
+        {us, _} = :timer.tc(fn -> warm_all(ids) end)
+
+        Enum.each(ids, &Shards.drain/1)
+        n / (us / 1_000_000)
+      rescue
+        e ->
+          Logger.warning("warm_s3 skipped: S3 unreachable/misconfigured (#{inspect(e)})")
+          nil
+      catch
+        :exit, reason ->
+          Logger.warning("warm_s3 skipped: #{inspect(reason)}")
+          nil
+      end
+    else
+      nil
+    end
+  end
+
+  # Concurrently check out (cold-pull) every id. Finite timeout, not :infinity — one wedged pull
+  # must not hang the whole sweep.
+  defp warm_all(ids) do
+    ids
+    |> Task.async_stream(&Shards.checkout/1, max_concurrency: length(ids), timeout: 120_000)
+    |> Stream.run()
+  end
 
   # Seed a ~size_kb shard object into S3 (incompressible randomblob), drop local.
   defp seed_s3_sized(id, size_kb) do

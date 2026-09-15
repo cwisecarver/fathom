@@ -69,6 +69,7 @@ defmodule Mix.Tasks.Fathom.Bench do
   @all_metrics [
     :cold_open,
     :cold_open_s3,
+    :warm_s3,
     :failover_rto,
     :dir_resolve,
     :dir_recorder,

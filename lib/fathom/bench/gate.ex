@@ -18,13 +18,16 @@ defmodule Fathom.Bench.Gate do
   @metrics [
     {:cold_open_p50_us, :higher_worse},
     {:cold_open_s3_p50_us, :higher_worse},
+    # Concurrent S3-pull throughput (node-startup / mass failover). Kept through the WarmFollower
+    # retirement (2026-09-14): the metric was named `warm_s3` but never touched that cache — it is
+    # plain concurrent `Shards.checkout/1`, so it stays a real measurement. Opt-in (nil ⇒ skipped).
     {:warm_s3_shards_per_s, :lower_worse},
-    # The failover RTO pair. Opt-in like the two S3 metrics above (nil ⇒ skipped), and ungated for
-    # the same non-reason they were: nobody added them. Gating an opt-in metric costs nothing when
-    # it is unset and compares it when it is not, which is exactly how `cold_open_s3_p50_us` is
-    # already treated — there was no argument for splitting them.
+    # The failover RTO metric. `failover_warm_s3_p50_us` (the 304-promote-from-warm-cache arm) was
+    # dropped 2026-09-14 with the WarmFollower retirement — that code path no longer exists, so there
+    # is nothing to time; the honest successor is an A2 promote-on-open RTO metric, not yet built.
+    # `failover_cold_s3_p50_us` is today's real failover cost and is opt-in like `cold_open_s3_p50_us`
+    # above (nil ⇒ skipped): gating an opt-in metric costs nothing when unset and compares it when set.
     {:failover_cold_s3_p50_us, :higher_worse},
-    {:failover_warm_s3_p50_us, :higher_worse},
     {:dir_resolve_p50_us, :higher_worse},
     # The LIVE directory path, gated from 2026-08-03 (#41.6). `dir_resolve_p50_us` above is
     # control-plane only (provision/fork/migrate) and stopped being the per-request path when the
