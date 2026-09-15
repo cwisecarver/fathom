@@ -22,6 +22,12 @@ BUCKET="${FATHOM_S3_TEST_BUCKET:-fathom-shards-test}"
 ACCESS_KEY="${FATHOM_S3_TEST_ACCESS_KEY:-fathomtest}"
 SECRET_KEY="${FATHOM_S3_TEST_SECRET_KEY:-fathomtest123}"
 
+# Pull MinIO from quay.io, not Docker Hub. Anonymous Docker Hub pulls are rate-limited / access-
+# denied on GitHub-hosted runners ("pull access denied for minio/minio"), which fails this step
+# before a single test runs. MinIO publishes the identical image to quay.io, which has no such wall.
+# Override with FATHOM_MINIO_IMAGE if you need a pinned tag or a private mirror.
+MINIO_IMAGE="${FATHOM_MINIO_IMAGE:-quay.io/minio/minio:latest}"
+
 KEEP=0
 [ "${1:-}" = "--keep" ] && KEEP=1
 
@@ -33,7 +39,7 @@ docker run -d --name "$NAME" \
   -p "${API_PORT}:9000" -p "${CONSOLE_PORT}:9001" \
   -e MINIO_ROOT_USER="$ACCESS_KEY" \
   -e MINIO_ROOT_PASSWORD="$SECRET_KEY" \
-  minio/minio:latest server /data --console-address ":9001" >/dev/null
+  "$MINIO_IMAGE" server /data --console-address ":9001" >/dev/null
 
 echo "Waiting for MinIO at ${ENDPOINT} ..."
 for _ in $(seq 1 40); do

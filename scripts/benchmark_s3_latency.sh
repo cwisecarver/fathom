@@ -54,9 +54,11 @@ cleanup
 docker network create "$NET" >/dev/null
 
 echo "=== starting MinIO + toxiproxy ==="
+# quay.io, not Docker Hub — anonymous Docker Hub pulls are rate-limited/denied on shared runners
+# (see scripts/minio_test.sh). Override with FATHOM_MINIO_IMAGE.
 docker run -d --name "$MINIO" --network "$NET" -p "${MINIO_HOST_PORT}:9000" \
   -e MINIO_ROOT_USER="$AK" -e MINIO_ROOT_PASSWORD="$SK" \
-  minio/minio:latest server /data >/dev/null
+  "${FATHOM_MINIO_IMAGE:-quay.io/minio/minio:latest}" server /data >/dev/null
 
 docker run -d --name "$TOXI" --network "$NET" \
   -p "${PROXY_HOST_PORT}:${PROXY_HOST_PORT}" -p "${TOXI_API_PORT}:8474" \

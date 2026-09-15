@@ -45,9 +45,10 @@ trap cleanup EXIT
 cleanup
 
 docker network create "$NET" >/dev/null
+# quay.io, not Docker Hub — see scripts/minio_test.sh. Override with FATHOM_MINIO_IMAGE.
 docker run -d --name "$MINIO" --network "$NET" -p "$MP:9000" \
   -e MINIO_ROOT_USER="$AK" -e MINIO_ROOT_PASSWORD="$SK" \
-  minio/minio:latest server /data >/dev/null
+  "${FATHOM_MINIO_IMAGE:-quay.io/minio/minio:latest}" server /data >/dev/null
 docker run -d --name "$TOXI" --network "$NET" -p "$PP:$PP" -p "$API:8474" \
   ghcr.io/shopify/toxiproxy:latest >/dev/null
 
