@@ -73,6 +73,41 @@ defmodule Fathom.ShardLoadTest do
     assert ["hot" | _] = ShardLoad.top(3, :queries) |> Enum.map(& &1.shard_id)
   end
 
+  describe "top/2 is a bounded selection (review dsv41f.perf 2026-09-16 #4)" do
+    test "returns exactly the n hottest when n < shard count, matching a full sort" do
+      for {id, q} <- [{"s1", 5}, {"s2", 50}, {"s3", 20}, {"s4", 90}, {"s5", 1}, {"s6", 35}],
+          _ <- 1..q do
+        ShardLoad.record_query(id, 1, 0)
+      end
+
+      # Reference: the full sort + take that top/2 replaced with a bounded keep-top scan. Values are
+      # distinct so there is no boundary-tie ambiguity between the two shapes.
+      expected =
+        ShardLoad.snapshot()
+        |> Enum.sort_by(& &1.rows_read, :desc)
+        |> Enum.take(3)
+        |> Enum.map(& &1.shard_id)
+
+      assert expected == ["s4", "s2", "s6"]
+      assert ShardLoad.top(3, :rows_read) |> Enum.map(& &1.shard_id) == expected
+    end
+
+    test "returns every shard, sorted, when n exceeds the shard count" do
+      ShardLoad.record_query("a", 3, 0)
+      ShardLoad.record_query("b", 7, 0)
+
+      assert ShardLoad.top(99, :rows_read) |> Enum.map(& &1.shard_id) == ["b", "a"]
+    end
+
+    test "ranks each dimension independently" do
+      ShardLoad.record_query("reader", 100, 1)
+      ShardLoad.record_query("writer", 1, 100)
+
+      assert ["reader" | _] = ShardLoad.top(2, :rows_read) |> Enum.map(& &1.shard_id)
+      assert ["writer" | _] = ShardLoad.top(2, :rows_written) |> Enum.map(& &1.shard_id)
+    end
+  end
+
   test "forget drops a shard's row" do
     ShardLoad.record_checkout("gone")
     assert ShardLoad.get("gone")
