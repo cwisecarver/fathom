@@ -1,7 +1,9 @@
 # Spike plan — per-stream SQLite connection pooling
 
-**Status:** proposed spike (throwaway experiment), not an implementation plan. Decide GO/NO-GO from
-measurement, then write a separate implementation plan only if GO.
+**Status:** spike RUN 2026-09-17 — **GO, conditional on a bounded (LRU-capped) pool**. All three
+hypotheses measured (results at the end); the remaining gate is a clean-box re-measure to pin exact
+figures before an implementation plan is written. Measured on a machine under post-OS-upgrade
+indexing, so absolute numbers are min-based / order-of-magnitude, not final.
 
 ## The question
 
@@ -105,6 +107,40 @@ The machine is under sustained post-OS-upgrade indexing (noisy for days), so **d
 Time-box to a focused spike (throwaway pool + observable + A/B harness + the two security probes),
 then a written decision. If it runs long or the pool can't be made to hit, that is itself the
 answer for this pass — stop and report.
+
+## Results (measured 2026-09-17)
+
+Throwaway probes through the real `Fathom.Shard.Connection.open/2`, min of 400 samples (min filters
+the load noise). Machine was under sustained post-upgrade indexing, so absolutes are noisy — the
+STRUCTURAL results (does it hit; residual size; per-handle order of magnitude) are the trustworthy
+part, exact percentages are not.
+
+**H2 — does the pool actually hit? PASS (the decisive result).** The observable held: `-shm` was
+absent between unpooled opens and present the whole time the pooled handle was held, and the pooled
+arm opened exactly one handle. The pool serves a live handle rather than silently reopening — the
+specific thing the 2026-08-26 #11 A/B got wrong.
+
+**H1 — the win. PASS, large.** Unpooled `open + query + close` was ~370–510 µs (the two runs
+disagreed — box noise); a warm pooled request was **~23 µs** (reset guards + query) or ~13 µs
+(query only). Pooling removes essentially the entire per-open cost — the 9 pragmas, the extension
+load, the authorizer, and the `-shm` setup — leaving ~20 µs. Reconciled against `hrana_open_rt_us`
+(347 µs, whose non-open baseline `hrana_rt_us` is 131 µs, so the open is ~216 µs): pooling removes
+nearly all of that ~216 µs → roughly a **~50–60% cut of `hrana_open_rt_us`**, higher than the
+conservative ~35% first estimate. Exact figure pending a clean-box, end-to-end Hrana measurement
+(this probe measured `Connection.open` in isolation, not the full transport path).
+
+**H3 — density cost. CONDITIONAL PASS.** RSS per kept-alive handle (NIF/C page-cache memory, so
+measured as OS RSS, 50 handles warmed by a full scan): ~150–275 KB, drifting up with the shard's
+working set toward SQLite's ~2 MiB `cache_size` cap (numbers non-monotonic = noise; treat as order
+of magnitude). This matches the existing `served_kb_per_shard` = 196 KiB. Meaning: a pooled-but-idle
+shard costs ~200 KB (the "served" level) instead of ~26 KB (idle coordinator) — a **~7–8× density
+hit per held shard**. Node density is memory-bound, so a hold-everything pool is a NO; a pool capped
+(LRU) to the hot working set is fine, since cost = (hot set) × ~200 KB.
+
+**Verdict:** GO on H1 and H2; H3 forces the pool to be **bounded/LRU-capped to the hot set**, never
+hold-everything. Before an implementation plan: (1) re-measure H1 (exact %) and H3 (exact KB) on a
+quiet box; (2) the implementation adds the LRU/eviction this spike left out of scope, plus the
+security isolation tests (scope leak, stale state) the throwaway did not carry.
 
 ## References
 
