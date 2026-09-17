@@ -1,9 +1,17 @@
 # Spike plan — per-stream SQLite connection pooling
 
-**Status:** spike RUN 2026-09-17 — **GO, conditional on a bounded (LRU-capped) pool**. All three
-hypotheses measured (results at the end); the remaining gate is a clean-box re-measure to pin exact
-figures before an implementation plan is written. Measured on a machine under post-OS-upgrade
-indexing, so absolute numbers are min-based / order-of-magnitude, not final.
+**Status:** BUILT + measured, but **NOT enabled** — turning it on by default was BLOCKED 2026-09-17
+by a validation run. The spike said GO (conditional on a bounded pool); the full pool was implemented
+(`Fathom.Shard.HandlePool` + `Connection.reset_for_reuse/2` + coordinator `pool_take`/`checkin/4`/
+`close_pool` + executor reuse, all gated on `:connection_pool`, default off) and the win re-confirmed
+on the real path (below). But running the WHOLE suite with pooling forced on failed two shard-lifecycle
+tests: `ShardPositionSeedTest` (empty-WAL idle-drop must stamp a rankable ordinal, not nil — the exact
+invariant A2 promote-on-open ranks on) and `ShardDurabilityTest` (first write restores the full-rate
+flush timer). Cause: a pooled handle keeps a SQLite connection OPEN on an otherwise-idle shard, and the
+snapshot / position-stamp / flush-timer logic assumes an idle shard has zero open connections. **Before
+this can be enabled, the pool must be drained (handles closed) around those lifecycle points, and the
+suite re-run forced-on until green.** A TTL-sweep timer and telemetry are also still deferred; all
+numbers are min-based on a machine under post-upgrade load.
 
 ## The question
 
@@ -141,6 +149,26 @@ hit per held shard**. Node density is memory-bound, so a hold-everything pool is
 hold-everything. Before an implementation plan: (1) re-measure H1 (exact %) and H3 (exact KB) on a
 quiet box; (2) the implementation adds the LRU/eviction this spike left out of scope, plus the
 security isolation tests (scope leak, stale state) the throwaway did not carry.
+
+### Re-measured on the REAL implementation (2026-09-17)
+
+Through the shipped path (`ShardExecutor.open` → query → `close`, `:connection_pool` on vs off, min
+of 400 — box still under post-upgrade load, so min-based):
+
+| per request (open + query + close) | µs |
+|---|---|
+| pooling OFF (fresh handle each request) | **392** (p50 467) |
+| pooling ON (warm handle reused) | **45** (p50 55) |
+
+**~347 µs saved, ~88% off that path.** Mapped to the end-to-end `hrana_open_rt_us` (~347 µs, whose
+non-open `hrana_rt_us` baseline of ~131 µs is Filo transport pooling cannot remove): roughly a
+**~50–55% cut of the full per-stream open** — in line with the spike prediction, a touch more
+conservative than the throwaway probe because `reset_for_reuse/2` does real work the probe skipped.
+H1 and H2 confirmed on real code; H3 (~200 KB/held handle) is bounded by the per-shard cap + the
+existing idle-drop. The win justified enabling it — but the forced-on validation run (see Status)
+BLOCKED that on the position-ordinal / flush-timer lifecycle interaction, so it stays off. Still-open
+follow-ups: the pool-drain-around-lifecycle fix (the enablement blocker), a quiet-box absolute
+re-measure, the TTL-sweep timer, and telemetry.
 
 ## References
 
