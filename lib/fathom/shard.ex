@@ -61,6 +61,7 @@ defmodule Fathom.Shard do
     Fence,
     FlushGate,
     Fork,
+    HandlePool,
     Heartbeat,
     Integrity,
     Materializer,
@@ -194,6 +195,18 @@ defmodule Fathom.Shard do
     do_checkout(pid, make_ref())
   end
 
+  @doc """
+  Ask the coordinator's per-shard handle pool for a reusable `scope` connection, AFTER a successful
+  `checkout/1` (the grant keeps the shard from draining, so the pool is stable across this call).
+  Returns `{:reuse, conn}` on a pool hit — the caller MUST `Connection.reset_for_reuse(conn, scope)`
+  and fall back to opening the shard path on a reset error — or `:open` on a miss / pooling-off. Kept
+  a SEPARATE call from `checkout/1` so the retry machinery in `Fathom.Shards` stays untouched;
+  `checkin/4` returns the handle. Used by the request path (`Fathom.ShardExecutor`).
+  """
+  @spec pool_take(pid(), :ro | :rw) :: {:reuse, reference()} | :open
+  def pool_take(pid, scope) when is_pid(pid) and scope in [:ro, :rw],
+    do: GenServer.call(pid, {:pool_take, scope})
+
   defp do_checkout(pid, op) do
     # The open path (handle_continue) can legitimately block a queued :checkout for up to
     # @pull_timeout (a large cold pull, cross-region S3), and an inline durability flush can
@@ -233,6 +246,16 @@ defmodule Fathom.Shard do
   @doc "Releases a connection previously checked out with `checkout/1`."
   @spec checkin(pid(), reference()) :: :ok
   def checkin(pid, ref) when is_pid(pid), do: GenServer.cast(pid, {:checkin, ref})
+
+  @doc """
+  Pooling checkin: releases the grant `ref` AND hands the stream's SQLite handle back to the
+  coordinator, which either returns it to the per-shard pool for the next stream to reuse or closes
+  it (pooling off, over the per-scope cap, or the shard is draining). The caller must NOT close the
+  handle itself after this. Pairs with `checkout/2`.
+  """
+  @spec checkin(pid(), reference(), reference(), :ro | :rw) :: :ok
+  def checkin(pid, ref, conn, scope) when is_pid(pid) and scope in [:ro, :rw],
+    do: GenServer.cast(pid, {:checkin, ref, conn, scope})
 
   @doc """
   Whether the shard holds local writes not yet flushed to storage — i.e. its write counter
@@ -645,6 +668,11 @@ defmodule Fathom.Shard do
         id: shard_id,
         path: path,
         conns: %{},
+        # Idle (checked-in) SQLite handles reusable by the next stream of THIS shard — connection
+        # pooling (docs/pooling-spike-plan.md). `nil` unless `:connection_pool` is on, which keeps
+        # this whole path inert by default. Drained + closed on every terminate clause (close_pool/1);
+        # a pooled handle must not outlive the shard's lease on this node.
+        pool: init_pool(),
         idle_ms: idle_ms(),
         timer: nil,
         # Monotonic-ms instant the shard last went idle (all connections checked in), or
@@ -1077,6 +1105,14 @@ defmodule Fathom.Shard do
     end
   end
 
+  # Hand the caller a reusable idle handle for `scope`, or `:open` (miss / pooling off). Called only
+  # after a successful checkout — the grant keeps the shard busy, so the pool cannot be drained out
+  # from under this. `pool_take/2` returns `:open` unchanged when `pool` is nil.
+  def handle_call({:pool_take, scope}, _from, state) when scope in [:ro, :rw] do
+    {reuse, state} = take_from_pool(state, scope)
+    {:reply, reuse, state}
+  end
+
   def handle_call(:dirty?, _from, state), do: {:reply, unflushed?(state), state}
 
   # The lease epoch, for A2 replication's fence (`Fathom.Shard.Replication`). Read ONCE per
@@ -1134,6 +1170,13 @@ defmodule Fathom.Shard do
 
   @impl true
   def handle_cast({:checkin, ref}, state), do: stop_when_drained(release(state, ref))
+
+  # Pooling checkin: pool the returned handle (or close it — pooling off, over cap, or draining) and
+  # release the grant. `pool_checkin/3` owns the close, so the handle is never leaked.
+  def handle_cast({:checkin, ref, conn, scope}, state) when scope in [:ro, :rw] do
+    state = pool_checkin(state, conn, scope)
+    stop_when_drained(release(state, ref))
+  end
 
   # A caller's checkout call timed out (expert review #26): drop the conn granted to
   # it that it never received. Ordering makes this exact: the cast is sent AFTER the
@@ -1737,6 +1780,8 @@ defmodule Fathom.Shard do
 
   @impl true
   def terminate(_reason, %{lease_lost: true} = state) do
+    close_pool(state)
+
     # We no longer own the shard; flushing our local copy would clobber the node that took over.
     # But don't DESTROY it: a dirty local holds acked-but-unflushed committed writes — exactly the
     # class of data the fork path carefully preserves — so quarantine it (.fenced.<ts>) for recovery
@@ -1777,6 +1822,8 @@ defmodule Fathom.Shard do
   end
 
   def terminate(_reason, %{conns: conns} = state) when map_size(conns) == 0 do
+    close_pool(state)
+
     # Settle any in-flight flush task FIRST (expert review #27): its conditional PUT
     # may land at any moment, and the drop-flush below fences on the etag — racing
     # them would make one 412 spuriously (the drop-flush's :superseded branch drops
@@ -1827,6 +1874,8 @@ defmodule Fathom.Shard do
   # so a shutdown-ordering edge (Tombstones dies first) fails toward flushing — the safe direction.
   def terminate(_reason, %{conns: conns, lease: lease} = state)
       when map_size(conns) > 0 and not is_nil(lease) do
+    close_pool(state)
+
     # Refuse NEW writes for the duration of the shutdown (expert review 2026-08-20 #9). Streams do
     # not learn this coordinator is going away until its `:DOWN` fires, which is after terminate/2
     # returns — so without this they keep committing through a checkpoint + VACUUM INTO + PUT that
@@ -1879,6 +1928,8 @@ defmodule Fathom.Shard do
   # so the state is the minimal `%{id: ...}` that matches no clause above) — always drop the shard's
   # load row so a stopped shard never leaks a counter.
   def terminate(_reason, state) do
+    close_pool(state)
+
     # A flush_now caller pending when the coordinator is force-stopped (a pre-open failure) gets an
     # explicit error, not a swallowed exit → false :ok (expert review 2026-07-18 #4). settle_waiters
     # is a no-op on the empty/pre-open waiter list.
@@ -1908,6 +1959,68 @@ defmodule Fathom.Shard do
   #
   # A shard that is NOT tombstoned still flushes on both paths, which is what keeps a rolling
   # deploy's acked writes durable (review 2026-07-19 #2).
+  # --- connection pool (docs/pooling-spike-plan.md) --------------------------------------------
+  #
+  # Off by default (`:connection_pool`), so `pool` is `nil` and every helper below is inert. Handles
+  # are opened/reset/closed in the STREAM process (`Fathom.ShardExecutor`); the coordinator only owns
+  # the idle set and its lifecycle, because it is the shard's fence authority — a pooled handle must
+  # not outlive this node's lease, which is why every terminate clause calls `close_pool/1`. In-use
+  # (checked-out) handles need no special fence handling: writes stay fence-gated per statement, so a
+  # handle whose shard is fenced simply cannot write, pooled or not.
+  defp init_pool do
+    if Application.get_env(:fathom, :connection_pool, false) do
+      cfg = Application.get_env(:fathom, :connection_pool_opts, [])
+
+      HandlePool.new(
+        max_per_scope: Keyword.get(cfg, :max_per_scope, 1),
+        ttl_ms: Keyword.get(cfg, :ttl_ms, 30_000)
+      )
+    else
+      nil
+    end
+  end
+
+  defp take_from_pool(%{pool: nil} = state, _scope), do: {:open, state}
+
+  defp take_from_pool(%{pool: pool} = state, scope) do
+    case HandlePool.take(pool, scope) do
+      {:hit, conn, pool} -> {{:reuse, conn}, %{state | pool: pool}}
+      {:miss, pool} -> {:open, %{state | pool: pool}}
+    end
+  end
+
+  # Close, never pool, when pooling is off or the shard is draining (a draining shard is on its way
+  # to drop; a handle pooled now would be closed moments later by close_pool anyway, and must not be
+  # handed to a new stream of a shard we are giving up).
+  defp pool_checkin(%{pool: nil} = state, conn, _scope) do
+    Connection.close(conn)
+    state
+  end
+
+  defp pool_checkin(%{draining: true} = state, conn, _scope) do
+    Connection.close(conn)
+    state
+  end
+
+  defp pool_checkin(%{pool: pool} = state, conn, scope) do
+    {pool, evicted} = HandlePool.put(pool, scope, conn, System.monotonic_time(:millisecond))
+    if evicted, do: Connection.close(evicted)
+    %{state | pool: pool}
+  end
+
+  # Close every idle pooled handle. Called on EVERY terminate clause — a pooled handle is idle (no
+  # in-flight write, no fence role), so closing it is always safe and order-independent. The `_`
+  # clause covers the minimal pre-open state (`%{id: ...}`) that has no `:pool` key.
+  defp close_pool(%{pool: nil}), do: :ok
+
+  defp close_pool(%{pool: pool}) do
+    {conns, _pool} = HandlePool.drain(pool)
+    Enum.each(conns, &Connection.close/1)
+    :ok
+  end
+
+  defp close_pool(_state), do: :ok
+
   defp flush_and_drop_unless_tombstoned(state) do
     unless Fathom.Tenants.Tombstones.tombstoned?(state.id), do: flush_and_drop(state)
   end

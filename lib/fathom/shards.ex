@@ -107,6 +107,28 @@ defmodule Fathom.Shards do
     end
   end
 
+  @doc """
+  Pooling-aware checkout: `checkout/1`'s grant, plus a reusable `scope` handle from the coordinator's
+  per-shard pool when `:connection_pool` is on. Returns `{:ok, pid, ref, path, {:reuse, conn} | :open}`.
+  The grant (and its whole retry machinery) is untouched — the pool is a separate `Fathom.Shard.pool_take/2`
+  call after a successful grant, which the held ref keeps stable. Used by the request path;
+  every other caller keeps `checkout/1`.
+  """
+  @spec checkout(term(), :ro | :rw) ::
+          {:ok, pid(), reference(), Path.t(), {:reuse, reference()} | :open} | {:error, term()}
+  def checkout(shard_id, scope) when scope in [:ro, :rw] do
+    case checkout(shard_id) do
+      {:ok, pid, ref, path} ->
+        reuse = if connection_pool?(), do: Fathom.Shard.pool_take(pid, scope), else: :open
+        {:ok, pid, ref, path, reuse}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp connection_pool?, do: Application.get_env(:fathom, :connection_pool, false)
+
   defp do_checkout(shard_id, attempts, held \\ nil) do
     with :ok <- maybe_lazy_migrate(shard_id),
          {:ok, pid} <- ensure(shard_id),
