@@ -1,28 +1,31 @@
 # Spike plan — per-stream SQLite connection pooling
 
-**Status:** BUILT + measured, gated OFF (`:connection_pool`), and **NOT enable-able yet** — one deep
-blocker remains after a partial fix. The full pool is implemented (`Fathom.Shard.HandlePool` +
-`Connection.reset_for_reuse/2` + coordinator `pool_take`/`checkin/4`/`close_pool` + executor reuse)
-and the win re-confirmed on the real path (below). A whole-suite forced-on validation (2026-09-17)
-found two shard-lifecycle failures; a **drain-on-idle** fix (`release/1` closes the pool the instant
-`conns` hits 0, so an idle shard holds zero pooled connections) CLEARED the flush-timer one
-(`ShardDurabilityTest`) — but `ShardPositionSeedTest` still fails, and it is the hard one:
+**Status:** BUILT + measured + the two lifecycle blockers FIXED (whole-suite forced-on is green,
+2015 passed). Still gated OFF (`:connection_pool`) until a chaos-rig `rpo` PASS clears it for prod
+(see below). The full pool is implemented (`Fathom.Shard.HandlePool` + `Connection.reset_for_reuse/2`
++ coordinator `pool_take`/`checkin/4`/`close_pool` + executor reuse) and the win re-confirmed on the
+real path (below).
 
-> **The remaining blocker (A2 position stamp).** Non-pooled `close` runs `Connection.close` in the
-> STREAM process, checkpointing+unlinking the `-wal` BEFORE the coordinator is notified — so every
-> later durability flush reads an empty WAL and stamps the empty-WAL ordinal over-claim
-> (`wal_ordinal + 1`) that `Promote.fresher?/2` ranks on. Pooling closes the handle INSIDE the
-> coordinator on checkin, which RACES the dirty-shard durability flush: the flush can read the WAL
-> still present with a salt that no longer matches `state.wal_salt`, so `Fathom.Shard.Position.stamp_ordinal/4`
-> silences the ordinal (its deliberate "mismatch ⇒ no `:wal_ordinal`" branch) and the object stamps
-> `%{wal_gen: N}` with no ordinal — silently disabling A2 promote-on-open, the exact regression the
-> test guards. Fixing it means checkpointing a pooled connection's WAL at the same point the
-> non-pooled stream close does (before the coordinator's flush/position logic can observe it), which
-> is the irreducible fence/durability core — and per AGENTS.md it needs a chaos-rig `rpo` PASS before
-> it can be pushed, not a hot patch. Deferred deliberately.
+Two fixes got there:
 
-A TTL-sweep timer and telemetry are also still deferred; all numbers are min-based on a machine under
-post-upgrade load.
+1. **drain-on-idle** (`release/1` closes the pool the instant `conns` hits 0, so an idle shard holds
+   zero pooled connections; reuse serves overlapping streams). Cleared `ShardDurabilityTest`.
+2. **finalize statements on checkin** (`Connection.release_owner_state/1`, called in the STREAM
+   process before handing the handle off). Root cause of `ShardPositionSeedTest`, found by
+   instrumentation: exqlite's `Sqlite3.close/1` is `sqlite3_close_v2`, which DEFERS the close (and so
+   skips the last-connection WAL checkpoint) while any prepared statement is unfinalized. A stream's
+   statement cache lives in the stream's process dictionary, unreachable from the coordinator — so
+   pooling's coordinator-side close left the WAL un-checkpointed, and the next durability flush read
+   a non-empty `-wal` and took the salt-mismatch SILENCE branch of `Position.stamp_ordinal/4` instead
+   of the empty-WAL ordinal over-claim A2 `Promote.fresher?/2` ranks on. Finalizing the stream's
+   statements in the stream process on checkin restores the exact non-pooled WAL behaviour (verified:
+   `-wal` GONE / `Wal.read` `{:ok, :empty}` after a pooled drain).
+
+**Before it can be turned ON in prod:** a chaos-rig `REPLICATION_ENABLED=true ./chaos.sh rpo` PASS
+with pooling forced on — the `position.ex` durability-timing invariants are RIG-GATED, and this
+change touches when a pooled connection's WAL is checkpointed. The box has been too loaded (post-OS
+upgrade) to trust the rig; run it on a quiet machine, then flip `config/config.exs`. A TTL-sweep
+timer and telemetry are also still deferred; all latency numbers are min-based on a loaded box.
 
 ## The question
 

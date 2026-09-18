@@ -70,6 +70,29 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
     :ok = ShardExecutor.close(hb)
   end
 
+  test "pooling ON: draining a pooled handle checkpoints+unlinks the WAL (A2 durability invariant)",
+       %{shard: shard} do
+    Application.put_env(:fathom, :connection_pool, true)
+
+    {:ok, ha} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(ha, stmt("INSERT INTO kv VALUES ('a')"))
+    pid = pid_of(ha)
+    wal = Path.join(Fathom.Shard.data_dir(), "#{shard}.db-wal")
+    assert File.exists?(wal), "precondition: the write is in the -wal"
+
+    # Last stream closes → checkin/4 → drain → Connection.close. This MUST checkpoint+unlink the WAL
+    # exactly as a non-pooled stream close does; if the stream's prepared statements were not
+    # finalized in the stream process first (release_owner_state/1), sqlite3_close_v2 would defer the
+    # close and skip the checkpoint, leaving the WAL and desyncing the empty-WAL position stamp A2
+    # promote-on-open ranks on.
+    :ok = ShardExecutor.close(ha)
+    _ = :sys.get_state(pid)
+
+    refute File.exists?(wal),
+           "draining a pooled handle left the -wal in place — the deferred-close / WAL-checkpoint bug"
+  end
+
   test "pooling ON: an idle shard drains its pool — the durability invariant", %{shard: shard} do
     Application.put_env(:fathom, :connection_pool, true)
 

@@ -1008,6 +1008,11 @@ defmodule Fathom.ShardExecutor do
     # state is not part of what reset_for_reuse/2 scrubs. `checkin/4` owns the handle's fate (pool or
     # close); a plain `checkin/2` + local close is the non-pooled path, byte for byte as before.
     if connection_pool?() and not opts.template? do
+      # Finalize THIS stream's prepared statements + watchdog in THIS process before handing the
+      # handle off — the coordinator cannot reach them, and an unfinalized statement makes
+      # `sqlite3_close_v2` defer the eventual close, skipping the WAL checkpoint the durability
+      # position stamp depends on (see Connection.release_owner_state/1).
+      Connection.release_owner_state(conn)
       Shard.checkin(pid, ref, conn, scope)
     else
       Connection.close(conn)

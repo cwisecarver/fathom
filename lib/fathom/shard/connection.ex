@@ -995,9 +995,28 @@ defmodule Fathom.Shard.Connection do
   """
   @spec close(reference()) :: :ok
   def close(conn) do
+    release_owner_state(conn)
+    Sqlite3.close(conn)
+    :ok
+  end
+
+  @doc """
+  Release THIS process's per-connection state — the cached prepared statements and the query
+  watchdog — WITHOUT closing the connection. Both live in the owning process's dictionary keyed by
+  `conn`, so they can only be reached from that process.
+
+  Connection pooling calls this in the STREAM process on checkin, before handing the handle to the
+  coordinator. It is load-bearing, not just tidiness: `Sqlite3.close/1` is `sqlite3_close_v2`, which
+  DEFERS the close (and so skips the last-connection WAL checkpoint) while any prepared statement is
+  unfinalized. A stream's statements live in the stream's dict, unreachable from the coordinator — so
+  without finalizing them here, the coordinator's later close would leave the WAL un-checkpointed,
+  which desynchronises the durability position stamp (A2 promote-on-open ranks on it). `close/1`
+  calls this then closes; the next stream to reuse the pooled handle starts from a clean owner state.
+  """
+  @spec release_owner_state(reference()) :: :ok
+  def release_owner_state(conn) do
     purge_stmt_cache(conn)
     stop_watchdog(conn)
-    Sqlite3.close(conn)
     :ok
   end
 
