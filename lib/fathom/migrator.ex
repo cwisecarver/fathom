@@ -439,6 +439,27 @@ defmodule Fathom.Migrator do
   end
 
   @doc """
+  The `django_migrations` row count a shard stamped at `version` should carry — the bridge for the
+  restore drill's ledger check (`RestoreDrillJob`, the third leg of the three-place version stamp).
+
+  This is `Release.template_migration_count`, the template's `django_migrations` count when the
+  version was captured (expert review #32). Yanked is not excluded: a shard legitimately stamped at
+  a yanked version (post-revert) should still match that version's ledger count, and the drift is
+  what we want to detect either way.
+
+  Returns `:unknown` when there is no release row for the version (e.g. a born-empty shard at
+  version 0) or the row predates `template_migration_count` (nullable — pre-#32 releases). The
+  caller must NOT treat `:unknown` as a mismatch; there is nothing to compare against.
+  """
+  @spec expected_migration_count(integer()) :: {:ok, non_neg_integer()} | :unknown
+  def expected_migration_count(version) do
+    case Repo.get_by(Release, version: version) do
+      %{template_migration_count: c} when is_integer(c) -> {:ok, c}
+      _ -> :unknown
+    end
+  end
+
+  @doc """
   Records WHY `version` was flagged (expert review #26 part 1).
 
   A separate call rather than two more positional parameters on `release/6`, which already takes

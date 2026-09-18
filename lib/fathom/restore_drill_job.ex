@@ -404,6 +404,14 @@ defmodule Fathom.RestoreDrillJob do
   Failure classes are distinct from `verify/2`'s on purpose — `:fork_failed` and `:restored_mismatch`
   say the RECOVERY PATH is broken, which is a different alarm from "this stored object is corrupt"
   and wants a different response.
+
+  Once recovery is proven (row counts match), it also runs the version-stamp LEDGER check — the one
+  leg nothing else covers, `django_migrations` (Django's truth) vs `PRAGMA user_version` (the gate).
+  `:ledger_mismatch` when the ledger row count disagrees with what `user_version` should carry; a
+  missing table counts as zero rows, so a shard STAMPED as migrated with no ledger is a mismatch,
+  while a born-empty shard (version 0) is `:ok`. A version with no expected count (unreleased, or a
+  pre-#32 release with a NULL count) is `:ok` — the drill will not manufacture a mismatch from a gap
+  in its own registry.
   """
   @spec run_full_drill(pos_integer()) :: {:ok, map()}
   def run_full_drill(n) when is_integer(n) and n > 0 do
@@ -476,7 +484,11 @@ defmodule Fathom.RestoreDrillJob do
   defp compare_then_drop(id, scratch) do
     try do
       case {durable_table_counts(id), table_counts(scratch)} do
-        {{:ok, src}, {:ok, dst}} when src == dst -> :ok
+        # Recovery is proven (row counts match); now check the THIRD leg of the version stamp that
+        # nothing else does — `django_migrations` (Django's own ledger, the truth) vs the
+        # `PRAGMA user_version` gate. `:restored_mismatch`/`:fork_failed` are the louder alarms about
+        # the recovery PATH, so only reach for the ledger once the fork itself is sound.
+        {{:ok, src}, {:ok, dst}} when src == dst -> ledger_status(scratch)
         {{:ok, _src}, {:ok, _dst}} -> :restored_mismatch
         _ -> :fork_failed
       end
@@ -551,6 +563,101 @@ defmodule Fathom.RestoreDrillJob do
     after
       Connection.close(conn)
     end
+  end
+
+  # The three-place version stamp is `django_migrations` (Django's own ledger — the TRUTH),
+  # `PRAGMA user_version` (the O(1) gate), and `shards.schema_version` (Postgres). `verify/2` already
+  # checks user_version vs the directory; NOTHING checked the ledger against user_version, so a shard
+  # whose fast gate drifted from what Django actually applied would be trusted anyway. This closes
+  # that leg, riding the fork the deep drill already opened.
+  #
+  #   :ok              — ledger count matches the version's expected count (or nothing to compare)
+  #   :ledger_mismatch — django_migrations count disagrees with what user_version should carry
+  #
+  # A MISSING django_migrations table counts as ZERO rows and runs the SAME comparison, deliberately:
+  # a born-empty shard (user_version 0, no release expectation) is `:ok`, but a shard STAMPED as
+  # migrated (user_version > 0 with a known expected count) that has no ledger is a real mismatch —
+  # its truth vanished — not a benign "absent". Nothing to compare (an unreleased version, or a
+  # pre-#32 release with a NULL `template_migration_count`) is `:ok`: the drill must not invent a
+  # mismatch from a gap in its OWN registry.
+  defp ledger_status(shard_id) do
+    with {:ok, pid, ref, path} <- Fathom.Shards.checkout(shard_id) do
+      try do
+        ledger_status_for_path(shard_id, path)
+      after
+        Fathom.Shard.checkin(pid, ref)
+      end
+    else
+      # Recovery is already proven by the row-count compare; a checkout hiccup here must not
+      # downgrade that to a failure. The counts read one line earlier just checked out the same fork.
+      _ -> :ok
+    end
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  @doc false
+  # Public (undocumented) so the ledger classification can be tested on a crafted SQLite file
+  # directly, without standing up the fork/directory machinery `run_full_drill/1` needs.
+  def ledger_status_for_path(shard_id, path) do
+    {:ok, conn} = Connection.open(path)
+
+    try do
+      actual = ledger_count(conn)
+      version = read_user_version(conn)
+
+      case Fathom.Migrator.expected_migration_count(version) do
+        {:ok, ^actual} ->
+          :ok
+
+        {:ok, expected} ->
+          Logger.error(
+            "restore drill (FULL): #{shard_id} LEDGER MISMATCH — user_version=#{version} " <>
+              "expects #{expected} django_migrations row(s), found #{actual}"
+          )
+
+          :ledger_mismatch
+
+        :unknown ->
+          Logger.info(
+            "restore drill (FULL): #{shard_id} ledger check skipped — no expected count for " <>
+              "user_version=#{version} (unreleased version or pre-#32 release)"
+          )
+
+          :ok
+      end
+    after
+      Connection.close(conn)
+    end
+  end
+
+  # Count of applied Django migrations, or 0 when the table does not exist. A missing ledger is
+  # deliberately ZERO, not a distinct sentinel: the caller runs one comparison, so an empty-or-absent
+  # ledger under a positive, released user_version surfaces as the mismatch it is (see the caller).
+  # Checking `sqlite_master` first (rather than `try/rescue` on a bad-table error) keeps "no ledger"
+  # from being conflated with a genuine query failure, which would raise here.
+  defp ledger_count(conn) do
+    case Connection.query(
+           conn,
+           "SELECT name FROM sqlite_master WHERE type='table' AND name='django_migrations'",
+           []
+         ) do
+      {:ok, %{rows: []}} ->
+        0
+
+      {:ok, %{rows: [_ | _]}} ->
+        {:ok, %{rows: [[n]]}} =
+          Connection.query(conn, "SELECT COUNT(*) FROM django_migrations", [])
+
+        n
+    end
+  end
+
+  defp read_user_version(conn) do
+    {:ok, %{rows: [[v]]}} = Connection.query(conn, "PRAGMA user_version", [])
+    v
   end
 
   # Clean up the scratch tenant. Deliberately NOT `Tenants.delete/1`, which is the supported way to
