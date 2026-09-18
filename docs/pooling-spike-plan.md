@@ -178,8 +178,25 @@ conservative than the throwaway probe because `reset_for_reuse/2` does real work
 H1 and H2 confirmed on real code; H3 (~200 KB/held handle) is bounded by the per-shard cap + the
 existing idle-drop. The win justified enabling it — but the forced-on validation run (see Status)
 BLOCKED that on the position-ordinal / flush-timer lifecycle interaction, so it stays off. Still-open
-follow-ups: the pool-drain-around-lifecycle fix (the enablement blocker), a quiet-box absolute
+follow-ups: the A2 position-stamp fix (the enablement blocker, see Status), a quiet-box absolute
 re-measure, the TTL-sweep timer, and telemetry.
+
+**The number that matters after the drain-on-idle fix — CONCURRENT throughput (2026-09-17).** The
+~88% above was SEQUENTIAL back-to-back reuse, which drain-on-idle disables (an idle shard drains its
+pool); reuse now serves OVERLAPPING streams, so the real win is a concurrency measurement. 8 workers
+each running 300 `open+query+close` ops against one shard, best of 3 (load ~6, so ratios robust /
+absolutes noisy):
+
+| | throughput | vs OFF |
+|---|---|---|
+| pooling OFF | 5,195 ops/s | — |
+| pooling ON, default `max_per_scope: 1` | 11,455 ops/s | **+120% (2.2×)** |
+| pooling ON, `max_per_scope: 8` | 15,240 ops/s | **+193% (2.9×)** |
+
+So even the default cap of 1 roughly DOUBLES concurrent throughput — the drain-on-idle fix did not gut
+the win, it just moved it from the (unrealistic) sequential case to the concurrent one that matches a
+hot shard under many clients. This is a tight open-heavy loop; a workload with heavier per-request
+query work sees a smaller-but-still-real gain. Still gated off pending the A2 blocker.
 
 ## References
 
