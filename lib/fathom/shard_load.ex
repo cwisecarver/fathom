@@ -144,9 +144,37 @@ defmodule Fathom.ShardLoad do
   """
   @spec top(pos_integer(), :checkouts | :queries | :rows_read | :rows_written) :: [map()]
   def top(n, dimension \\ :queries) when is_integer(n) and n > 0 do
-    snapshot()
-    |> Enum.sort_by(&Map.fetch!(&1, dimension), :desc)
-    |> Enum.take(n)
+    # BOUNDED selection, not tab2list -> map-per-row -> full sort -> take(n) (review dsv41f.perf
+    # 2026-09-16 #4). This is the million-shard "which of my shards are hot" query, so it must be
+    # O(shards) with an O(n) working set, not O(shards) allocation + an O(shards log shards) sort.
+    # Same shape `Fathom.Admin.MetricsCollector.keep_top/2` already uses; `to_map/1` is paid for
+    # the <= n survivors only. Tie-breaking among equal values is unspecified (ETS iteration order
+    # is), exactly as the old sort-then-take was over arbitrary tab2list order.
+    idx = dim_index(dimension)
+
+    @table
+    |> :ets.tab2list()
+    |> Enum.reduce([], fn row, heap -> keep_top(heap, n, elem(row, idx), row) end)
+    |> Enum.sort_by(fn {v, _row} -> v end, :desc)
+    |> Enum.map(fn {_v, row} -> to_map(row) end)
+  rescue
+    ArgumentError -> []
+  end
+
+  # Tuple position of a dimension in `{shard_id, checkouts, queries, rows_read, rows_written}`.
+  defp dim_index(:checkouts), do: 1
+  defp dim_index(:queries), do: 2
+  defp dim_index(:rows_read), do: 3
+  defp dim_index(:rows_written), do: 4
+
+  # Keep at most `n` `{value, row}` entries — the largest by `value`. `length(heap) < n` fills the
+  # heap; once full, a new row displaces the current minimum only when strictly greater (so equal
+  # values never churn the set), mirroring `MetricsCollector.keep_top/2`.
+  defp keep_top(heap, n, value, row) when length(heap) < n, do: [{value, row} | heap]
+
+  defp keep_top(heap, _n, value, row) do
+    {min_v, _} = min_entry = Enum.min_by(heap, fn {v, _} -> v end)
+    if value > min_v, do: [{value, row} | List.delete(heap, min_entry)], else: heap
   end
 
   @doc "Clears all load counters (test/ops helper)."

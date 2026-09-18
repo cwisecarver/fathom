@@ -899,16 +899,35 @@ defmodule Fathom.Bench do
   which by AGENTS.md's own rule ("when two unrelated metrics move together in one run, it is the
   machine") means most of even that gap is contention, not the pool.
 
-  What the original probe actually measured was `Connection.open/2` in isolation, and the bulk of
-  it was the `File.mkdir_p!` review #10 has since removed — this metric fell 433 → 339 µs on that
-  one-line change. What remains is dominated by the Filo STREAM open, not the SQLite handle:
-  pooled open (~320 µs) against a baton-reusing round trip (~88 µs in the same run) still leaves
-  ~230 µs that pooling does not touch.
+  What the original probe actually measured was `Connection.open/2` in isolation, and part of it
+  was the `File.mkdir_p!` review #10 has since removed — this metric fell 433 → 339 µs on that
+  one-line change.
 
-  So the four reset guards a real pool needs — autocommit check, statement purge, dropping the
-  per-connection process-dictionary keys, re-applying `@tenant_pragma_allow` pragmas, plus
-  separate `:ro`/`:rw` pools — buy a few percent. Do not build it without re-running this A/B and
-  getting a different answer.
+  The residual, though, is NOT the Filo stream open — an earlier draft of this note said it was
+  (review dsv41f.perf 2026-09-16 corrected it). It is dominated by SQLite's per-open **WAL-index
+  (`-shm`) setup**: SQLite builds and maps the `-shm` on the FIRST statement of a connection and
+  unlinks it on the LAST close (`Fathom.Shard`'s snapshot path documents the unlink side). A
+  one-query Hrana stream is the shard's ONLY connection, so the previous close unlinked `-shm` and
+  the next open recreates it. Re-probed 2026-09-16 (raw `Exqlite.Sqlite3`, WAL, MIN of 400 samples —
+  the min filters the load-10-12 noise and held at 230/224/222 µs across three interleaved runs, so
+  it is trustworthy despite the loaded box): a bare open + first statement + close costs ~230 µs
+  with the shard's only connection vs ~54 µs when a second handle keeps `-shm` mapped — **~76% of
+  the bare open is the WAL-index creation** (~176 µs, roughly half of `hrana_open_rt_us`). It is
+  also the flat `L=1` per-stream-open ceiling in `docs/benchmark-plan.md`. (The review's ~50–58%
+  figure is the same cost as a fraction of the fuller `Connection.open/2`, which also pays the
+  extension load and the pragmas.)
+
+  This DOES bear on pooling, against what the paragraph above concludes. A real pool that keeps the
+  handle (and therefore `-shm`) alive removes that ~176 µs — so the 2026-08-26 #11 A/B (pooled ≈
+  unpooled) most likely never hit its cache: a process-local cache in a per-request stream process
+  misses across the HTTP request→stream hop (see the side-channel note in `Fathom.ShardExecutor`).
+  **Still do not build the pool on this note alone.** A persistent handle carries the per-connection
+  page cache (the ~2 MiB tail review 2026-07-24 #29 bounded), trading the `-shm` setup for the
+  density ceiling `served_kb_per_shard` exists to protect — the win is real and past the 20% gate,
+  but it has to be measured against that density cost, with the four reset guards (autocommit check,
+  statement purge, dropping the per-connection process-dictionary keys, re-applying
+  `@tenant_pragma_allow` pragmas, plus separate `:ro`/`:rw` pools) as the floor of the work, not the
+  whole of it.
   """
   @spec hrana_open_rt_us(keyword()) :: float() | nil
   def hrana_open_rt_us(opts \\ []), do: hrana_open_rt(opts)

@@ -995,10 +995,71 @@ defmodule Fathom.Shard.Connection do
   """
   @spec close(reference()) :: :ok
   def close(conn) do
-    purge_stmt_cache(conn)
-    stop_watchdog(conn)
+    release_owner_state(conn)
     Sqlite3.close(conn)
     :ok
+  end
+
+  @doc """
+  Release THIS process's per-connection state — the cached prepared statements and the query
+  watchdog — WITHOUT closing the connection. Both live in the owning process's dictionary keyed by
+  `conn`, so they can only be reached from that process.
+
+  Connection pooling calls this in the STREAM process on checkin, before handing the handle to the
+  coordinator. It is load-bearing, not just tidiness: `Sqlite3.close/1` is `sqlite3_close_v2`, which
+  DEFERS the close (and so skips the last-connection WAL checkpoint) while any prepared statement is
+  unfinalized. A stream's statements live in the stream's dict, unreachable from the coordinator — so
+  without finalizing them here, the coordinator's later close would leave the WAL un-checkpointed,
+  which desynchronises the durability position stamp (A2 promote-on-open ranks on it). `close/1`
+  calls this then closes; the next stream to reuse the pooled handle starts from a clean owner state.
+  """
+  @spec release_owner_state(reference()) :: :ok
+  def release_owner_state(conn) do
+    purge_stmt_cache(conn)
+    stop_watchdog(conn)
+    :ok
+  end
+
+  @doc """
+  Return a POOLED handle to its just-opened connection-local state before another stream of the SAME
+  shard reuses it (connection pooling — the pool is per-`{shard_id, scope}`, so this is cross-REQUEST
+  hygiene for one tenant, NOT a cross-tenant boundary; a handle never crosses shards).
+
+  What must be scrubbed is the SQLITE HANDLE, not this process: the statement cache and watchdog live
+  in the stream process's dictionary (see `close/1`), so a new stream already starts clean — but the
+  connection itself carries an open transaction and any pragmas the previous stream toggled. So:
+
+    * **Roll back any open transaction** — otherwise the next stream's statements silently join the
+      previous one's transaction. This is the load-bearing guard.
+    * **`:rw` only — re-apply the connection-local pragmas `configure/1` sets**, so a
+      `PRAGMA foreign_keys=OFF` (or another allow-listed toggle) from the previous stream does not
+      carry over. A `:ro` handle cannot write, so rollback of its read transaction is enough and the
+      writable-path reconfigure is skipped.
+
+  Returns `:ok`, or `{:error, reason}` — on which the caller MUST discard (close) the handle and open
+  a fresh one rather than serve on a half-reset connection.
+
+  NOT force-reset: the `@tenant_pragma_allow` connection-local toggles `configure/1` does not itself
+  set (`defer_foreign_keys`, `recursive_triggers`, `case_sensitive_like`, …). They are client-session
+  behavioural settings and same-tenant here, so a leak between one tenant's own requests is a benign
+  quirk, not an isolation breach; widen this reset if a concrete need appears.
+  """
+  @spec reset_for_reuse(reference(), :ro | :rw) :: :ok | {:error, term()}
+  def reset_for_reuse(conn, scope) when scope in [:ro, :rw] do
+    with :ok <- rollback_if_open(conn) do
+      if scope == :rw, do: configure(conn), else: :ok
+    end
+  end
+
+  defp rollback_if_open(conn) do
+    if autocommit?(conn) do
+      :ok
+    else
+      case Sqlite3.execute(conn, "ROLLBACK") do
+        :ok -> :ok
+        other -> other
+      end
+    end
   end
 
   # exqlite's default multi_step chunk is 50, so a 200k-row result cost 4,000 dirty-scheduler

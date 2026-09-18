@@ -90,15 +90,19 @@ defmodule Fathom.ShardExecutor do
   defp auth_required?, do: Application.get_env(:fathom, :hrana_auth, :disabled) == :required
 
   defp do_open(shard_id, scope, token_version) do
-    case Shards.checkout(shard_id) do
-      {:ok, pid, ref, path} ->
+    case Shards.checkout(shard_id, scope) do
+      {:ok, pid, ref, path, reuse} ->
         # THE one connection in fathom that runs SQL fathom did not author, so it is the one
         # that gets the restricted handle: ATTACH/DETACH denied at the SQLite authorizer, and a
         # genuinely read-only handle for a `:ro` token (expert review 2026-08-01 #1, #7).
         # Everything else — the coordinator's VACUUM INTO snapshot, the migration replay, the
         # harnesses — opens unrestricted, which is required: the authorizer also blocks
         # VACUUM INTO. See Fathom.Shard.Connection.maybe_authorizer/2.
-        case Connection.open(path, tenant?: true, scope: scope) do
+        #
+        # `reuse` is `:open` unless connection pooling handed back a warm handle for this scope
+        # (docs/pooling-spike-plan.md); `obtain_conn/3` resets a reused one and falls back to a fresh
+        # open if it will not reset cleanly, so a request never serves on a half-reset handle.
+        case obtain_conn(reuse, path, scope) do
           {:ok, conn} ->
             # The scope rides the handle so execute/2 can enforce read-only across baton-resumes
             # and every stream on the connection.
@@ -113,6 +117,22 @@ defmodule Fathom.ShardExecutor do
         {:error, open_error(reason)}
     end
   end
+
+  # A reused pooled handle is reset for the new stream; if it will not reset cleanly it is discarded
+  # (closed) and a fresh one opened — never served half-reset. `:open` is the fresh-open path, byte
+  # for byte what the non-pooled executor did.
+  defp obtain_conn({:reuse, conn}, path, scope) do
+    case Connection.reset_for_reuse(conn, scope) do
+      :ok ->
+        {:ok, conn}
+
+      {:error, _reason} ->
+        Connection.close(conn)
+        Connection.open(path, tenant?: true, scope: scope)
+    end
+  end
+
+  defp obtain_conn(:open, path, scope), do: Connection.open(path, tenant?: true, scope: scope)
 
   @impl true
   def execute({_pid, _ref, _conn, shard_id, _scope, _ver, _opts} = handle, %Stmt{} = stmt) do
@@ -979,13 +999,30 @@ defmodule Fathom.ShardExecutor do
   end
 
   @impl true
-  def close({pid, ref, conn, _shard_id, _scope, _ver, opts}) do
-    Connection.close(conn)
-    Shard.checkin(pid, ref)
+  def close({pid, ref, conn, _shard_id, scope, _ver, opts}) do
     forget_txn_write(conn)
     if opts.template?, do: Capture.forget(conn)
+
+    # With pooling on, hand the handle back to the coordinator's pool (checkin/4) instead of closing
+    # it, so the next stream of this shard reuses it. NEVER pool a template handle — its DDL-capture
+    # state is not part of what reset_for_reuse/2 scrubs. `checkin/4` owns the handle's fate (pool or
+    # close); a plain `checkin/2` + local close is the non-pooled path, byte for byte as before.
+    if connection_pool?() and not opts.template? do
+      # Finalize THIS stream's prepared statements + watchdog in THIS process before handing the
+      # handle off — the coordinator cannot reach them, and an unfinalized statement makes
+      # `sqlite3_close_v2` defer the eventual close, skipping the WAL checkpoint the durability
+      # position stamp depends on (see Connection.release_owner_state/1).
+      Connection.release_owner_state(conn)
+      Shard.checkin(pid, ref, conn, scope)
+    else
+      Connection.close(conn)
+      Shard.checkin(pid, ref)
+    end
+
     :ok
   end
+
+  defp connection_pool?, do: Application.get_env(:fathom, :connection_pool, false)
 
   # Leading-keyword EXPLAIN detection for describe/2 (only ever called with binary sql).
   defp explain?(sql) do
