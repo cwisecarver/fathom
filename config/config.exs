@@ -49,13 +49,16 @@ config :fathom, :fence_writes_when_stealable, config_env() == :prod
 config :fathom, :replication_listen, config_env() == :prod
 config :fathom, :replication_enabled, config_env() == :prod
 
-# Per-stream SQLite connection pooling (docs/pooling-spike-plan.md) is built and tested but stays
-# OFF by default (no config line ⇒ `get_env(..., false)`). Enabling it was BLOCKED 2026-09-17 by a
-# validation run (whole suite forced on): a pooled handle keeps a SQLite connection open on an
-# otherwise-idle shard, which breaks the empty-WAL position-ordinal stamp A2 promotion ranks on
-# (`ShardPositionSeedTest`) and the flush-timer restore (`ShardDurabilityTest`). It needs the pool
-# drained around the snapshot / position / flush lifecycle before it can be turned on. Set
-# `config :fathom, :connection_pool, true` to opt in for a single shard/test meanwhile.
+# Per-stream SQLite connection pooling (docs/pooling-spike-plan.md). ON in prod, off in dev/test —
+# matching the replication convention above. The 2026-09-17 A2 blocker (a pooled handle held a
+# SQLite connection open on an idle shard, leaving the WAL un-checkpointed so the empty-WAL
+# position-ordinal stamp A2 promotion ranks on never fired) is fixed: `Connection.release_owner_state/1`
+# finalizes the stream's statements on pooled checkin, and `release/1` drains the pool on idle.
+# Validated 2026-09-18: `REPLICATION_ENABLED=true ./chaos.sh rpo` PASSED with pooling forced on
+# (acked write survived node loss via peer pull; promote-on-open fired). The default test suite runs
+# with pooling OFF (config_env() != :prod); `connection_pool_integration_test.exs` forces it on for
+# the on-path coverage. Set `config :fathom, :connection_pool, true` to opt in for a single shard/test.
+config :fathom, :connection_pool, config_env() == :prod
 
 # The wire-format + frame-authentication flags, ALSO default ON in prod (off in dev/test) — for the
 # same "replication is core" reason. With them off two core guarantees are missing: failover
