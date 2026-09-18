@@ -2049,8 +2049,28 @@ defmodule Fathom.Shard do
         # Last connection gone, so the next checkout starts a fresh "has this stream written?"
         # question (#4). Without this reset a shard that ever wrote would never take the slow
         # cadence again, and the optimisation review 2026-08-01 #42 added would be dead.
-        schedule_idle(%{state | wrote_during_checkout?: false})
+        #
+        # DRAIN THE POOL HERE — an idle shard must hold ZERO SQLite connections. Everything
+        # downstream (the empty-WAL position stamp A2 ranks on, the durability snapshot, the
+        # clean→dirty flush-timer edge) assumes the last stream's close checkpointed+unlinked the
+        # WAL; a pooled handle left open would keep the WAL alive and make the next periodic flush
+        # stamp a WAL-content position instead of the empty-WAL over-claim (breaks
+        # `ShardPositionSeedTest` / `ShardDurabilityTest`). So pooling serves OVERLAPPING streams
+        # (`conns` stays > 0 across the reuse) and closes on idle — connection-pooling is a
+        # busy-shard optimisation, never a change to what an idle shard looks like.
+        schedule_idle(drain_pool(%{state | wrote_during_checkout?: false}))
     end
+  end
+
+  # Close every pooled idle handle now (used on the idle transition; the pool is per-shard, so this
+  # touches only this shard's handles). Distinct from `close_pool/1`, which is the terminate-time
+  # variant — same effect, but this one returns the updated state to thread on.
+  defp drain_pool(%{pool: nil} = state), do: state
+
+  defp drain_pool(%{pool: pool} = state) do
+    {conns, pool} = HandlePool.drain(pool)
+    Enum.each(conns, &Connection.close/1)
+    %{state | pool: pool}
   end
 
   # Stop (flushing + releasing via terminate) once the last connection drains

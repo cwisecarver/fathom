@@ -1,17 +1,28 @@
 # Spike plan — per-stream SQLite connection pooling
 
-**Status:** BUILT + measured, but **NOT enabled** — turning it on by default was BLOCKED 2026-09-17
-by a validation run. The spike said GO (conditional on a bounded pool); the full pool was implemented
-(`Fathom.Shard.HandlePool` + `Connection.reset_for_reuse/2` + coordinator `pool_take`/`checkin/4`/
-`close_pool` + executor reuse, all gated on `:connection_pool`, default off) and the win re-confirmed
-on the real path (below). But running the WHOLE suite with pooling forced on failed two shard-lifecycle
-tests: `ShardPositionSeedTest` (empty-WAL idle-drop must stamp a rankable ordinal, not nil — the exact
-invariant A2 promote-on-open ranks on) and `ShardDurabilityTest` (first write restores the full-rate
-flush timer). Cause: a pooled handle keeps a SQLite connection OPEN on an otherwise-idle shard, and the
-snapshot / position-stamp / flush-timer logic assumes an idle shard has zero open connections. **Before
-this can be enabled, the pool must be drained (handles closed) around those lifecycle points, and the
-suite re-run forced-on until green.** A TTL-sweep timer and telemetry are also still deferred; all
-numbers are min-based on a machine under post-upgrade load.
+**Status:** BUILT + measured, gated OFF (`:connection_pool`), and **NOT enable-able yet** — one deep
+blocker remains after a partial fix. The full pool is implemented (`Fathom.Shard.HandlePool` +
+`Connection.reset_for_reuse/2` + coordinator `pool_take`/`checkin/4`/`close_pool` + executor reuse)
+and the win re-confirmed on the real path (below). A whole-suite forced-on validation (2026-09-17)
+found two shard-lifecycle failures; a **drain-on-idle** fix (`release/1` closes the pool the instant
+`conns` hits 0, so an idle shard holds zero pooled connections) CLEARED the flush-timer one
+(`ShardDurabilityTest`) — but `ShardPositionSeedTest` still fails, and it is the hard one:
+
+> **The remaining blocker (A2 position stamp).** Non-pooled `close` runs `Connection.close` in the
+> STREAM process, checkpointing+unlinking the `-wal` BEFORE the coordinator is notified — so every
+> later durability flush reads an empty WAL and stamps the empty-WAL ordinal over-claim
+> (`wal_ordinal + 1`) that `Promote.fresher?/2` ranks on. Pooling closes the handle INSIDE the
+> coordinator on checkin, which RACES the dirty-shard durability flush: the flush can read the WAL
+> still present with a salt that no longer matches `state.wal_salt`, so `Fathom.Shard.Position.stamp_ordinal/4`
+> silences the ordinal (its deliberate "mismatch ⇒ no `:wal_ordinal`" branch) and the object stamps
+> `%{wal_gen: N}` with no ordinal — silently disabling A2 promote-on-open, the exact regression the
+> test guards. Fixing it means checkpointing a pooled connection's WAL at the same point the
+> non-pooled stream close does (before the coordinator's flush/position logic can observe it), which
+> is the irreducible fence/durability core — and per AGENTS.md it needs a chaos-rig `rpo` PASS before
+> it can be pushed, not a hot patch. Deferred deliberately.
+
+A TTL-sweep timer and telemetry are also still deferred; all numbers are min-based on a machine under
+post-upgrade load.
 
 ## The question
 
