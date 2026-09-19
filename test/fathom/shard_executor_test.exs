@@ -517,6 +517,57 @@ defmodule Fathom.ShardExecutorTest do
     assert Fathom.Application.check_rebalancer_config!() == nil
   end
 
+  # Expert review 2026-09-18 #12: :max_open_shards bounds coordinators, but pooling adds idle handles
+  # (each a distinct SQLite connection/fds) per shard that the cap cannot see, so a pooling-on fleet
+  # hits emfile below the intended shard count. A prod boot with pooling on + a finite cap must WARN,
+  # quantifying the multiplier; it must stay quiet when pooling is off, the cap is infinite, or
+  # outside prod.
+  test "the boot guard warns that pooling inflates the fd budget past :max_open_shards" do
+    import ExUnit.CaptureLog
+
+    prev_env = Application.get_env(:fathom, :env)
+    prev_pool = Application.get_env(:fathom, :connection_pool)
+    prev_cap = Application.get_env(:fathom, :max_open_shards)
+    prev_opts = Application.get_env(:fathom, :connection_pool_opts)
+
+    on_exit(fn ->
+      restore_env(:env, prev_env)
+      restore_env(:connection_pool, prev_pool)
+      restore_env(:max_open_shards, prev_cap)
+      restore_env(:connection_pool_opts, prev_opts)
+    end)
+
+    Application.put_env(:fathom, :env, :prod)
+    Application.put_env(:fathom, :connection_pool, true)
+    Application.put_env(:fathom, :max_open_shards, 1000)
+    Application.put_env(:fathom, :connection_pool_opts, max_per_scope: 2)
+
+    log = capture_log(fn -> assert Fathom.Application.check_pool_fd_budget!() == nil end)
+    assert log =~ "connection_pool is ON"
+    # per_shard = 1 + 2*2 = 5, so 1000 coordinators -> ~5000 connections.
+    assert log =~ "5000 connections"
+
+    # Quiet when the cap is unbounded (nothing to inflate past).
+    Application.put_env(:fathom, :max_open_shards, :infinity)
+
+    refute capture_log(fn -> Fathom.Application.check_pool_fd_budget!() end) =~
+             "connection_pool is ON"
+
+    # Quiet when pooling is off.
+    Application.put_env(:fathom, :max_open_shards, 1000)
+    Application.put_env(:fathom, :connection_pool, false)
+
+    refute capture_log(fn -> Fathom.Application.check_pool_fd_budget!() end) =~
+             "connection_pool is ON"
+
+    # Quiet outside prod.
+    Application.put_env(:fathom, :connection_pool, true)
+    Application.put_env(:fathom, :env, :test)
+
+    refute capture_log(fn -> Fathom.Application.check_pool_fd_budget!() end) =~
+             "connection_pool is ON"
+  end
+
   defp restore_env(k, nil), do: Application.delete_env(:fathom, k)
   defp restore_env(k, v), do: Application.put_env(:fathom, k, v)
 

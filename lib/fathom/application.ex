@@ -33,6 +33,7 @@ defmodule Fathom.Application do
     check_replication_frame_auth!()
     check_replication_disk!()
     check_replication_flush_interval!()
+    check_pool_fd_budget!()
 
     # Grouped into plane sub-supervisors (each with its own restart budget) rather than
     # one flat list, so a control-plane restart-storm (e.g. Repo) is contained to its
@@ -381,6 +382,48 @@ defmodule Fathom.Application do
           "was 22,599 errors vs 4, and +49% throughput. Raise it to at least " <>
           "#{@replication_flush_floor_ms} ms unless you are deliberately buying RPO with " <>
           "throughput (expert review 2026-08-20 #33)."
+      )
+    end
+
+    nil
+  end
+
+  # :max_open_shards BOUNDS COORDINATORS, NOT CONNECTIONS (expert review 2026-09-18 #12).
+  #
+  # The soft admission cap counts coordinators (`Registry.count`), and it is sized from fd/RSS
+  # density to keep the node below `emfile`. Connection pooling (on by default in prod) lets each
+  # busy shard additionally hold up to `max_per_scope` idle handles PER SCOPE (:ro + :rw), and every
+  # pooled handle is a distinct SQLite connection with its own fds — invisible to the cap. So a fleet
+  # that turns pooling on against a cap sized for the pre-pooling world holds ~2-3x the fds per busy
+  # shard and hits `emfile` at a fraction of the intended shard count — the same class as AGENTS.md's
+  # "numbers measured with a feature off don't hold with it on".
+  #
+  # WARNS rather than raises, and prod-only like every sibling: a cap that already accounts for the
+  # multiplier is a legitimate config, and silently re-deriving the operator's :max_open_shards would
+  # be a more surprising failure than the one this removes. It quantifies the multiplier so the cap
+  # (and `ulimit -n`) can be sized deliberately.
+  @doc false
+  def check_pool_fd_budget! do
+    cap = Application.get_env(:fathom, :max_open_shards, :infinity)
+
+    if Application.get_env(:fathom, :env) == :prod and
+         Application.get_env(:fathom, :connection_pool, false) == true and
+         is_integer(cap) do
+      cfg = Application.get_env(:fathom, :connection_pool_opts, [])
+      per_scope = Keyword.get(cfg, :max_per_scope, 1)
+
+      # The coordinator's own working connection plus up to max_per_scope idle handles in each of the
+      # two scopes (:ro, :rw).
+      per_shard = 1 + 2 * per_scope
+
+      Logger.warning(
+        "config warning: :connection_pool is ON with :max_open_shards = #{cap}, but that cap " <>
+          "bounds COORDINATORS only. Each open shard can additionally hold up to #{2 * per_scope} " <>
+          "idle pooled handles (:ro + :rw, max_per_scope=#{per_scope}), each a distinct SQLite " <>
+          "connection with its own fds — so the node can hold ~#{cap * per_shard} connections, not " <>
+          "#{cap}. Size :max_open_shards and the OS fd limit (ulimit -n) for #{cap} * #{per_shard} " <>
+          "= #{cap * per_shard} connections, or the node hits emfile well below the intended shard " <>
+          "count (expert review 2026-09-18 #12)."
       )
     end
 
