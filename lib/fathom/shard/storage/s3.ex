@@ -2473,11 +2473,49 @@ defmodule Fathom.Shard.Storage.S3 do
   # Conditionally rewrite a lock WE wrote, only while it is still ours. The caller supplies the
   # replacement content; see the `touch_failed` branch for why it is the previous owner at
   # `epoch + 2` rather than at `epoch` (monotonicity) or absent (an unfenced epoch-1 reclaim).
-  defp restore_lock(shard_id, ours, replacement) do
+  # Bounded so a TRANSIENT put failure does not strand the failed-steal lock (expert review
+  # 2026-09-18 #21). The old code did `_ = put_lock(...)` — one attempt, result discarded — so a
+  # correlated brownout that failed BOTH the touch and this rollback left the lock at our own
+  # `{owner, epoch+1}`. The IMMEDIATE outer checkout retry then reads its OWN owner and takes the
+  # same-owner RECLAIM path (re-PUT, no steal-touch, no `took_over`), skipping the zombie data-etag
+  # fence and the takeover revalidation. Retrying the rollback closes the common transient case:
+  # once it lands `{other, epoch+2}`, the retry re-enters the FULL steal path instead.
+  @restore_lock_attempts 3
+
+  defp restore_lock(shard_id, ours, replacement),
+    do: restore_lock(shard_id, ours, replacement, @restore_lock_attempts)
+
+  defp restore_lock(shard_id, ours, replacement, attempts) do
     case get_lock(shard_id) do
       {:ok, %{owner: o, epoch: e}, etag} when o == ours.owner and e == ours.epoch ->
-        _ = put_lock(shard_id, replacement, if_match: etag)
-        :ok
+        case put_lock(shard_id, replacement, if_match: etag) do
+          {:ok, _} ->
+            :ok
+
+          # A concurrent write already replaced our stranded lock with a foreign owner (412): the
+          # next acquire re-enters the steal path anyway, so there is nothing left to roll back.
+          {:error, {:held, _, _}} ->
+            :ok
+
+          {:error, :precondition_failed} ->
+            :ok
+
+          # A transient storage error — the correlated-brownout case this guard exists for. Retry;
+          # leaving our own `{owner, epoch+1}` in place is what lets the immediate outer retry reclaim
+          # it unfenced.
+          {:error, _reason} when attempts > 1 ->
+            restore_lock(shard_id, ours, replacement, attempts - 1)
+
+          {:error, reason} = err ->
+            Logger.error(
+              "shard #{shard_id}: could NOT roll back a failed steal-touch lock after " <>
+                "#{@restore_lock_attempts} attempts (#{inspect(reason)}). The lock is stranded at " <>
+                "our own epoch+1 and the next checkout would RECLAIM it UNFENCED; the data-object " <>
+                "etag fence is the remaining backstop (expert review 2026-09-18 #21)."
+            )
+
+            err
+        end
 
       _ ->
         :ok
