@@ -216,6 +216,12 @@ defmodule Fathom.Shard.ReplicationCommitTest do
                "(pre-fix this returned :ok)"
     end
 
+    # Expert review 2026-09-18 #5 makes this the EXPLICIT best-effort contract, not an accident:
+    # legacy mode (heartbeat server down) has no cheap in-memory ownership signal, so the ack is not
+    # gated on a live check. The exposure — a legacy-mode zombie can ack a write the fleet discards
+    # on fence resolution — is held by the FOLLOWER epoch/lineage fence, not by this ack path. Prod
+    # runs heartbeat, so the deployed fleet never reaches this clause. This test pins the contract so
+    # it cannot silently change; gating it on an inline S3 check_lease is a deliberate deferral.
     test "legacy mode (no heartbeat started) leaves the ack ungated", ctx do
       %{id: id, root: root} = ctx
       followers = start_followers!(root, 3)
@@ -246,6 +252,83 @@ defmodule Fathom.Shard.ReplicationCommitTest do
              "expected legacy mode — no Heartbeat was started"
 
       assert :ok = Session.commit(id, wal, coordinator)
+    end
+  end
+
+  # Expert review 2026-09-18 #4. `with_epoch/1` caches `acquire_gen` ONCE for the session's life
+  # (it short-circuits on an integer epoch). `ack_if_owned` gates on
+  # `Heartbeat.valid_for_write?(acquire_gen)`, which returns `:revalidate` whenever the live fence
+  # generation != the cached one. A heartbeat lapse bumps the generation; the COORDINATOR recovers
+  # by advancing its own `acquire_gen` in `Fence.revalidate/2` after a read-only ownership check,
+  # but pre-fix the session had NO refresh path — so its frozen `acquire_gen` mismatched forever and
+  # it refused EVERY write on a node that fully retains ownership, turning a transient blip into a
+  # durable per-tenant write outage. The fix re-reads the coordinator's revalidated generation on
+  # `:revalidate` and re-checks.
+  describe "a heartbeat lapse must not permanently 503 the session (#4)" do
+    test "the session recovers its ack after the coordinator revalidates the generation", ctx do
+      %{id: id, root: root} = ctx
+      followers = start_followers!(root, 3)
+
+      Application.put_env(:fathom, :replication_enabled, true)
+      Application.put_env(:fathom, :replication_quorum, 2)
+
+      Application.put_env(
+        :fathom,
+        :replication_followers,
+        for({_n, port} <- followers, do: {~c"127.0.0.1", port})
+      )
+
+      start_supervised!(Fleet)
+
+      # Heartbeat FIRST, so the coordinator opens in HEARTBEAT mode.
+      owner = "n_#{System.unique_integer([:positive])}@test"
+      hb = start_supervised!({Fathom.Shard.Heartbeat, ttl_ms: 30_000, owner: owner})
+      _ = :sys.get_state(hb)
+
+      {:ok, coordinator, ref, path} = Shards.checkout(id)
+      on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+      {:ok, conn} = Connection.open(path)
+      on_exit(fn -> Connection.close(conn) end)
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+
+      wal = path <> "-wal"
+      for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0, 0)
+
+      gen = Fathom.Shard.acquire_gen(coordinator)
+
+      assert is_integer(gen),
+             "the coordinator opened in LEGACY mode — this test is not exercising the heartbeat gate"
+
+      # First commit acks and caches acquire_gen == gen in the session (with_epoch reads it once).
+      assert :ok = Session.commit(id, wal, coordinator)
+
+      # A heartbeat lapse bumps the fence generation while ownership is RETAINED (deadline still
+      # comfortable). The coordinator recovers via Fence.revalidate, advancing its acquire_gen to the
+      # new generation — reproduce that recovered state directly: heartbeat at gen+1 (comfortable
+      # deadline), coordinator's acquire_gen advanced to gen+1.
+      :sys.replace_state(hb, fn s ->
+        Fathom.Shard.Heartbeat.publish_status(%{
+          s
+          | generation: gen + 1,
+            mono_deadline_ms: System.monotonic_time(:millisecond) + 60_000
+        })
+      end)
+
+      :sys.replace_state(coordinator, fn s -> %{s | acquire_gen: gen + 1} end)
+
+      # The session's frozen gen now mismatches the live one → :revalidate; the coordinator's
+      # revalidated gen is comfortably valid → :ok.
+      assert Fathom.Shard.Heartbeat.valid_for_write?(gen) == :revalidate
+      assert Fathom.Shard.Heartbeat.valid_for_write?(gen + 1) == :ok
+
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
+
+      # Post-fix: the session re-reads the coordinator's revalidated gen and acks. Pre-fix: it stayed
+      # frozen at the old gen and returned :ownership_unconfirmed indefinitely.
+      assert :ok = Session.commit(id, wal, coordinator),
+             "a session whose owner revalidated after a heartbeat lapse must recover and ack " <>
+               "(pre-fix this returned :ownership_unconfirmed for the rest of the session's life)"
     end
   end
 

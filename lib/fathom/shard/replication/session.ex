@@ -546,27 +546,80 @@ defmodule Fathom.Shard.Replication.Session do
   # HEARTBEAT MODE ONLY: `Heartbeat.valid_for_write?/1` is a lock-free ETS read, so a zombie (VM/GC
   # pause past the TTL) or S3-partitioned owner that reached quorum on stale-epoch followers is
   # caught BEFORE it tells the tenant "committed" — an ack the S3 etag fence would then discard,
-  # losing a write reported quorum-durable. Anything but `:ok` (`:revalidate` — the fence generation
-  # moved — or `:not_valid`) refuses with a RETRYABLE `{:error, :ownership_unconfirmed}`, which
-  # `ShardExecutor` maps to a 503 the client retries against the successor. The safe direction only:
-  # it can refuse a commit this node should not ack, never wrongly ack one, and it never runs an
-  # inline S3 GET (the stronger `:revalidate` variant is out of scope).
+  # losing a write reported quorum-durable. `:not_valid` refuses with a RETRYABLE
+  # `{:error, :ownership_unconfirmed}`, which `ShardExecutor` maps to a 503 the client retries
+  # against the successor. `:revalidate` (the fence generation moved after a heartbeat lapse) is NOT
+  # a permanent refusal: the session re-reads the coordinator's revalidated generation once and
+  # re-checks (expert review 2026-09-18 #4), so a transient lapse no longer freezes the session into
+  # refusing every write for its lifetime. The safe direction only: it can refuse a commit this node
+  # should not ack, never wrongly ack one, and the ack path never runs an inline S3 GET (the
+  # coordinator's `Fence.revalidate/2` did the read-only ownership check).
   #
-  # LEGACY MODE (`acquire_gen == nil`) is left ungated: `valid_for_write?/1` is a heartbeat-mode
-  # mechanism (a nil gen reads `:revalidate` and would spuriously gate every legacy commit), and
-  # prod runs heartbeat, so the deployed fleet is covered. Legacy's own last-verdict mechanism is a
-  # separate follow-up.
+  # LEGACY MODE (`acquire_gen == nil`) is BEST-EFFORT, pinned by `replication_commit_test.exs`'s
+  # "legacy mode ... leaves the ack ungated" (expert review 2026-09-18 #5) — see the legacy clause
+  # at the bottom of the function for the full contract and why it is a deliberate deferral.
   defp ack_if_owned(state) do
     case state.acquire_gen do
       gen when is_integer(gen) ->
         case heartbeat_ok(gen) do
-          :ok -> {:reply, :ok, state}
-          _ -> {:reply, {:error, :ownership_unconfirmed}, state}
+          :ok ->
+            {:reply, :ok, state}
+
+          # A heartbeat lapse bumped the fence generation since this session cached `acquire_gen`
+          # in `with_epoch/1` (expert review 2026-09-18 #4). The COORDINATOR recovers — a lapse
+          # arms `:revalidate_lapse`, and the next flush fence runs `Fence.revalidate/2`, which
+          # confirms ownership with a read-only `check_lease` and advances `acquire_gen` to the new
+          # generation. The SESSION, however, froze its copy at open and has no refresh path, so
+          # `valid_for_write?/1` would read `:revalidate` for the rest of the session's life and
+          # refuse EVERY write on a node that fully retains ownership — a transient blip turned into
+          # a durable per-tenant write outage. Re-read the coordinator's (revalidated,
+          # ownership-confirmed) generation ONCE and re-check. The write that provoked this ack
+          # keeps the shard dirty, so the coordinator's flush fence revalidates promptly; until it
+          # does, the re-read returns the same stale generation and we refuse with a RETRYABLE 503
+          # — never a false ack — and the client's retry succeeds once the coordinator has advanced.
+          :revalidate ->
+            refreshed = refresh_acquire_gen(state)
+
+            case refreshed.acquire_gen do
+              g when is_integer(g) ->
+                case heartbeat_ok(g) do
+                  :ok -> {:reply, :ok, refreshed}
+                  _ -> {:reply, {:error, :ownership_unconfirmed}, refreshed}
+                end
+
+              # The heartbeat process itself went down since acquire ⇒ the coordinator degraded to
+              # legacy mode. Ack per legacy best-effort semantics (see the legacy clause below).
+              _ ->
+                {:reply, :ok, refreshed}
+            end
+
+          _ ->
+            {:reply, {:error, :ownership_unconfirmed}, state}
         end
 
+      # LEGACY MODE (`acquire_gen == nil`, heartbeat server not running) is BEST-EFFORT: the ack is
+      # not gated on a live ownership check (expert review 2026-09-18 #5). `valid_for_write?/1` is a
+      # heartbeat-mode mechanism (a nil gen reads `:revalidate` and would gate every legacy commit),
+      # and legacy mode has no cheap in-memory ownership signal — the only live check is a read-only
+      # `check_lease` S3 GET, which on this per-commit path would add an S3 round-trip to every
+      # commit's critical path in the degraded window. The exposure is real but bounded: a
+      # legacy-mode zombie that reached quorum on stale-epoch followers can ack a write the fleet
+      # will DISCARD on fence resolution, but the FOLLOWER epoch/lineage fence is the backstop that
+      # actually keeps that write from being served. Prod runs heartbeat, so the deployed fleet
+      # never reaches this clause. Gating it on an inline `check_lease` (S3 latency per legacy commit
+      # vs. coverage) is a deliberate deferral, not an oversight; the "legacy mode ... leaves the ack
+      # ungated" test in `replication_commit_test.exs` pins this best-effort contract explicitly so
+      # it cannot change silently.
       _ ->
         {:reply, :ok, state}
     end
+  end
+
+  # Re-read the coordinator's current (revalidated) fence generation into the session's cache
+  # (expert review 2026-09-18 #4). `acquire_gen_of/1` already catches a coordinator exit and
+  # degrades to `nil` (legacy), so this never crashes the commit.
+  defp refresh_acquire_gen(state) do
+    %{state | acquire_gen: acquire_gen_of(state)}
   end
 
   # A dead heartbeat process must degrade, not crash the commit — mirrors `Fathom.Shard`'s
