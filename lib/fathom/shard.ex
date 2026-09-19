@@ -669,9 +669,12 @@ defmodule Fathom.Shard do
         path: path,
         conns: %{},
         # Idle (checked-in) SQLite handles reusable by the next stream of THIS shard — connection
-        # pooling (docs/pooling-spike-plan.md). `nil` unless `:connection_pool` is on, which keeps
-        # this whole path inert by default. Drained + closed on every terminate clause (close_pool/1);
-        # a pooled handle must not outlive the shard's lease on this node.
+        # pooling (docs/pooling-spike-plan.md). `nil` unless `:connection_pool` is on — OFF in
+        # dev/test but ON IN PROD (config/config.exs sets it to `config_env() == :prod`), so this is
+        # the SHIPPED path, not a dormant one (expert review 2026-09-18 #15). Coverage of the on-path
+        # lives in `connection_pool_integration_test.exs` (reuse, flush/drop/drain, the lease
+        # invariant, scope isolation), which the default suite runs OFF. Drained + closed on every
+        # terminate clause (close_pool/1); a pooled handle must not outlive the shard's lease here.
         pool: init_pool(),
         idle_ms: idle_ms(),
         timer: nil,
@@ -1961,7 +1964,10 @@ defmodule Fathom.Shard do
   # deploy's acked writes durable (review 2026-07-19 #2).
   # --- connection pool (docs/pooling-spike-plan.md) --------------------------------------------
   #
-  # Off by default (`:connection_pool`), so `pool` is `nil` and every helper below is inert. Handles
+  # OFF in dev/test, ON IN PROD (`:connection_pool` = `config_env() == :prod`), so in the shipped
+  # configuration `pool` is a real `HandlePool` and every helper below is live — NOT inert by default
+  # (expert review 2026-09-18 #15). The default test suite runs it OFF; the on-path is exercised by
+  # `connection_pool_integration_test.exs`. Handles
   # are opened/reset/closed in the STREAM process (`Fathom.ShardExecutor`); the coordinator only owns
   # the idle set and its lifecycle, because it is the shard's fence authority — a pooled handle must
   # not outlive this node's lease, which is why every terminate clause calls `close_pool/1`. In-use
