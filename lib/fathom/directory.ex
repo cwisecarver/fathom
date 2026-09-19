@@ -731,8 +731,19 @@ defmodule Fathom.Directory do
   is already stamped fleet-wide by `cutover/2` and survives both. The counter still ships, for
   per-node dashboards; this is what the gate reads.
 
-  Scoped to `schema_version == head_version` so a **revert** is not counted as rollout progress:
-  `cutover/2` stamps `cutover_at` on the way back down too, and a reverted shard lands below head.
+  Scoped to `schema_version == head_version`, which excludes the COMMON revert (a shard reverted to
+  vN-1 lands below head, uncounted). **It does NOT exclude every revert (expert review 2026-09-18
+  #25):** `Migrator.revert_stranded/0` reverts shards stranded ABOVE head back DOWN to head, and
+  `RevertJob`'s `climb_back` sends a chain-jumper FORWARD up to `to_version` (== head after a fleet
+  revert) — both land AT head and stamp `cutover_at` via the shared `cutover/2`, so during an
+  EMERGENCY REVERT this count (and the `rate_per_hour`/`eta_seconds` it feeds on the deploy gate)
+  over-reports, making a reverting fleet read as progressing. `converged` — the primary gate — is
+  unaffected. Distinguishing a revert-to-head from a forward cutover precisely needs a PRE-CUTOVER
+  version to compare against, i.e. another column on `shards` — the system's hottest write table,
+  where an index was deleted (`20260726023618`) specifically to stop paying for one. That cost is not
+  justified for a secondary metric that is only wrong during the rare emergency-revert window, so the
+  limitation is documented rather than closed; `status/0`'s `above_head` is the signal that a revert
+  is in flight and the rate should be read with that in mind.
 
   **The `last_active_at` predicate is deliberately redundant** — do not "simplify" it away. There
   is no index on `cutover_at` (and `shards` is the system's hottest write table, where
