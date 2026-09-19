@@ -40,6 +40,20 @@ defmodule Fathom.Directory do
   # genuinely in-flight migration is never reclaimed out from under itself.
   @default_migration_stale_seconds 3_600
 
+  # RESERVED PREFIX for the restore drill's throwaway scratch forks (expert review 2026-09-18 #27).
+  # `RestoreDrillJob.restore_one/1` forks a shard to `<prefix><int>`, verifies it, and drops it in an
+  # `after` — but a node crash (the job is `max_attempts: 1`) between the fork and the drop leaves an
+  # ACTIVE scratch directory row stamped at the SOURCE's schema_version (which can be < HEAD). Without
+  # exclusion that row is an eternal laggard: `count_laggards/1` counts it so `converged` never turns
+  # true, `laggards/2` keeps enqueuing a migration for a throwaway, and later drills re-sample it.
+  # Excluded from the rollout + drill sweeps exactly like the capture template. No real tenant may use
+  # this prefix (`RestoreDrillJob` owns the naming via `scratch_prefix/0`).
+  @scratch_prefix "restoredrill"
+
+  @doc "The reserved prefix for restore-drill scratch forks — see `@scratch_prefix` (#27)."
+  @spec scratch_prefix() :: String.t()
+  def scratch_prefix, do: @scratch_prefix
+
   @doc """
   Resolves a shard, registering it on first use and recording the access. Returns
   `{:ok, entry}` with the shard's current `schema_version`/`status` (or
@@ -225,6 +239,9 @@ defmodule Fathom.Directory do
       limit: ^n,
       select: %{shard_id: s.shard_id, schema_version: s.schema_version}
     )
+    # Never sample a scratch fork (#27): drilling a throwaway is wasted, and a LEAKED one
+    # (never-verified) sorts FIRST under `asc_nulls_first`, so it would be re-drilled every run.
+    |> exclude_scratch()
     |> Repo.all()
   end
 
@@ -1349,7 +1366,9 @@ defmodule Fathom.Directory do
   end
 
   defp laggard_query(head_version) do
-    base = from(s in Shard, where: s.schema_version < ^head_version and s.status == "active")
+    base =
+      from(s in Shard, where: s.schema_version < ^head_version and s.status == "active")
+      |> exclude_scratch()
 
     # The reserved capture template (config :template_shard_id) is migrated directly by Django, so
     # its directory stamp never advances and it perpetually reads as the most-recent laggard. Left
@@ -1361,6 +1380,13 @@ defmodule Fathom.Directory do
       nil -> base
       id -> from(s in base, where: s.shard_id != ^id)
     end
+  end
+
+  # Exclude the restore drill's reserved scratch prefix (#27) so a leaked scratch fork is not an
+  # eternal laggard / re-sampled drill target. LIKE is safe here: the prefix is a fixed constant with
+  # no wildcard metacharacters.
+  defp exclude_scratch(query) do
+    from(s in query, where: not like(s.shard_id, ^(@scratch_prefix <> "%")))
   end
 
   defp template_shard_id do

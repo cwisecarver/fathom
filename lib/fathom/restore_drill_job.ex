@@ -432,7 +432,8 @@ defmodule Fathom.RestoreDrillJob do
   end
 
   defp restore_one(%{shard_id: id}) do
-    scratch = "restoredrill#{System.unique_integer([:positive])}"
+    # Reserved prefix, owned by Directory so the exclusion (#27) and the naming cannot drift.
+    scratch = "#{Directory.scratch_prefix()}#{System.unique_integer([:positive])}"
     status = restore_and_compare(id, scratch)
 
     # Record the verdict DURABLY, not only as telemetry (expert review 2026-09-18 #10). Pre-fix the

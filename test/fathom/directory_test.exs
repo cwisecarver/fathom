@@ -241,6 +241,29 @@ defmodule Fathom.DirectoryTest do
       for id <- ~w(a b c), do: Directory.resolve(id)
       assert length(Directory.laggards(1, 2)) == 2
     end
+
+    # Expert review 2026-09-18 #27: a node crash between the restore drill's fork and its drop leaves
+    # an ACTIVE scratch row (reserved prefix) behind HEAD — an eternal laggard that keeps `converged`
+    # false, gets a migration enqueued for a throwaway, and (never-verified) sorts FIRST in drill
+    # sampling. The reserved prefix must be excluded from the rollout + drill sweeps.
+    test "a leaked restore-drill scratch fork is excluded from laggards + drill sampling (#27)" do
+      {:ok, _} = Directory.resolve("real-laggard")
+      # The reserved prefix literal (see Directory.scratch_prefix/0) — kept literal here so this
+      # discriminates the exclusion itself, not the constant's presence.
+      scratch = "restoredrill999"
+      {:ok, _} = Directory.resolve(scratch)
+
+      # Only the real laggard counts / is swept — not the scratch fork.
+      assert Directory.count_laggards(5) == 1,
+             "a leaked scratch fork must not count as a laggard (converged would never turn true)"
+
+      laggard_ids = Directory.laggards(5, 10) |> Enum.map(& &1.shard_id)
+      assert "real-laggard" in laggard_ids
+      refute scratch in laggard_ids
+
+      drill_ids = Directory.sample_for_drill(10) |> Enum.map(& &1.shard_id)
+      refute scratch in drill_ids, "a scratch fork must not be re-sampled by the drill"
+    end
   end
 
   # Finding #20: a migration whose Oban job is lost leaves the shard in `migrating` forever,
