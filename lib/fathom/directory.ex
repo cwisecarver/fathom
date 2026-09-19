@@ -806,6 +806,35 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  Counts shards mid-copy (`status == "migrating"`) whose directory stamp is still BELOW `version`
+  (expert review 2026-09-18 #2).
+
+  `count_at_or_above_version/1` filters `status == "active"`, so it is blind to a shard in the copy
+  window: `mark_migrating/1` flips the status to `"migrating"` and does NOT touch `schema_version`
+  (the stamp only advances at `cutover`), so a shard actively copying toward `>= version` sits at
+  `status == "migrating"` with `schema_version < version` — invisible to the at-or-above count. Such
+  a shard built its replay chain (which reads the `transform` column) BEFORE `mark_migrating`, so
+  attaching a transform to `version` now would let that shard cut over WITHOUT the backfill while a
+  shard that starts migrating later gets it — the exact silent fleet split the attach refusal exists
+  to block, reached through the TOCTOU window the active-only count does not cover.
+
+  `< version`, not `<=`: a shard whose stamp already sits at or above `version` cannot cross it, and
+  the forward engine migrates toward HEAD (`>= version`), so any migrating shard below `version`
+  crosses it. Excludes the reserved template for the same reason `count_at_or_above_version/1` does.
+  """
+  @spec count_migrating_below_version(non_neg_integer()) :: non_neg_integer()
+  def count_migrating_below_version(version) do
+    base =
+      from(s in Shard, where: s.schema_version < ^version and s.status == "migrating")
+
+    case template_shard_id() do
+      nil -> base
+      id -> from(s in base, where: s.shard_id != ^id)
+    end
+    |> Repo.aggregate(:count)
+  end
+
+  @doc """
   Lazily streams the active shard_ids at `version` in keyset-paginated pages of `page_size` (#12),
   so a fleet-wide set (millions) never materializes at once and never holds one long transaction:
   each page is an independent short query ordered by `shard_id`, so the revert engine can enqueue +

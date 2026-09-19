@@ -314,7 +314,8 @@ defmodule Fathom.Migrator do
          {:ok, resolved} <- resolve_transform(module),
          :ok <- refuse_if_data_statements(release),
          :ok <- refuse_if_gap(release),
-         :ok <- refuse_if_rolled_out(version) do
+         :ok <- refuse_if_rolled_out(version),
+         :ok <- refuse_if_migrating_below(version) do
       {:ok, _} =
         release
         |> Ecto.Changeset.change(
@@ -371,6 +372,21 @@ defmodule Fathom.Migrator do
     case Fathom.Directory.count_at_or_above_version(version) do
       0 -> :ok
       count -> {:error, {:already_rolled_out, count}}
+    end
+  end
+
+  # Closes the attach TOCTOU (expert review 2026-09-18 #2): `refuse_if_rolled_out/1` only sees
+  # `status == "active"` shards, so a shard mid-copy toward `>= version` (status `"migrating"`,
+  # stamp still below `version`) slips through. That shard's replay chain was built BEFORE
+  # `mark_migrating`, so it would cut over WITHOUT a transform attached during its copy window while
+  # a later migrator gets it — a silent fleet split with all three version stamps agreeing. Refusing
+  # while a crossing migration is live matches the documented operator flow: attach the backfill
+  # BEFORE rolling, not once shards are already moving. A fleet REVERT keeps its shards `"active"` at
+  # HEAD, so it is already covered by `refuse_if_rolled_out/1`.
+  defp refuse_if_migrating_below(version) do
+    case Fathom.Directory.count_migrating_below_version(version) do
+      0 -> :ok
+      count -> {:error, {:migration_in_flight, count}}
     end
   end
 

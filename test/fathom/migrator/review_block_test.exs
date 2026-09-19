@@ -222,6 +222,33 @@ defmodule Fathom.Migrator.ReviewBlockTest do
       assert Repo.get_by(Release, version: r.version).transform == to_string(OkTransform)
     end
 
+    # Expert review 2026-09-18 #2 — the attach TOCTOU. `refuse_if_rolled_out/1` only counts
+    # `status == "active"` shards, so a shard mid-copy toward the version (status `"migrating"`,
+    # stamp still below it) is invisible to that guard. It already built its replay chain BEFORE
+    # `mark_migrating`, so attaching now would let it cut over WITHOUT the backfill while a later
+    # migrator gets it — a silent fleet split. This must be refused, not merely allowed.
+    #
+    # Pins the invariant: an in-flight migration crossing `version` blocks the attach.
+    test "refuses while a shard is mid-copy toward the version (migrating, stamp below)" do
+      r = insert_release(%{requires_review: true, review_reason: "data_migration"})
+
+      # A shard actively copying toward `r.version`: it sits one version behind and is `migrating`,
+      # so its directory stamp is still below `r.version` — exactly the window the active-only count
+      # cannot see.
+      shard = "attach_migrating_#{System.unique_integer([:positive])}"
+      {:ok, _} = Directory.resolve(shard)
+      {:ok, _} = Directory.cutover(shard, r.version - 1)
+      {:ok, %{status: "migrating"}} = Directory.mark_migrating(shard)
+
+      assert {:error, {:migration_in_flight, 1}} =
+               Migrator.attach_transform(r.version, OkTransform)
+
+      assert Repo.get_by(Release, version: r.version).requires_review,
+             "the block must remain — the operator's move is a NEW version, not this one"
+
+      refute Repo.get_by(Release, version: r.version).transform
+    end
+
     test "refuses a version held for a migration GAP" do
       # A transform cannot conjure the DDL the fleet missed; clearing the flag here would hide a
       # real template/fleet divergence behind a backfill.
