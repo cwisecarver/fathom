@@ -111,6 +111,24 @@ defmodule Fathom.RestoreDrillJobTest do
       assert summary[:ok] >= 1, "the restore rehearsal failed: #{inspect(summary)}"
     end
 
+    # Expert review 2026-09-18 #10: the full drill used to emit telemetry ONLY — it never called
+    # Directory.record_verification — so its verdict (including the ledger_mismatch/restored_mismatch/
+    # fork_failed it is the sole leg to produce) never reached the durable column a DR audit reads.
+    # A clean full drill must now STAMP last_verify_status, like the read-only drill does. Pre-fix
+    # this asserts nil (never recorded).
+    test "the full drill records its verdict durably, not only as telemetry", %{id: id} do
+      seed(id, ["CREATE TABLE kv (v TEXT)", "INSERT INTO kv VALUES ('a')"])
+
+      # Not stamped before the drill runs.
+      assert Repo.get_by!(DirShard, shard_id: id).last_verify_status == nil
+
+      assert {:ok, summary} = RestoreDrillJob.run_full_drill(5)
+      assert summary[:ok] >= 1, "the restore rehearsal failed: #{inspect(summary)}"
+
+      assert Repo.get_by!(DirShard, shard_id: id).last_verify_status == "ok",
+             "the full drill must record its verdict durably (pre-fix it emitted telemetry only)"
+    end
+
     # Expert review 2026-08-31 #14: the source side used to be read through the LIVE coordinator, so
     # a shard open + dirty at drill time counted un-flushed writes the fork (last-flushed) does not
     # have — src > dst ⇒ a systematic false :restored_mismatch that trains operators to ignore the

@@ -435,6 +435,15 @@ defmodule Fathom.RestoreDrillJob do
     scratch = "restoredrill#{System.unique_integer([:positive])}"
     status = restore_and_compare(id, scratch)
 
+    # Record the verdict DURABLY, not only as telemetry (expert review 2026-09-18 #10). Pre-fix the
+    # FULL drill — the ONLY leg running the `:ledger_mismatch` check (django_migrations vs
+    # user_version), plus `:restored_mismatch`/`:fork_failed` — emitted telemetry alone, so a DR
+    # audit query (`count_stamp_drift/0` / `GET /api/migrations/status`) read a clean fleet while the
+    # ledgers had drifted. `drill_one/1` already stamps `last_verify_status`; the full drill must too,
+    # or the loudest DR gate is blind to the failure this leg exists to find. Mirrors `drill_one`:
+    # records whatever it found (point-in-time, same shared column semantics).
+    Directory.record_verification(id, Atom.to_string(status))
+
     :telemetry.execute(
       [:fathom, :restore_drill, :full_result],
       %{count: 1},

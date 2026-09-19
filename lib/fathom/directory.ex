@@ -900,8 +900,19 @@ defmodule Fathom.Directory do
   """
   @spec count_stamp_drift() :: non_neg_integer()
   def count_stamp_drift do
+    # Counts BOTH stamp-drift verdicts, not just the first (expert review 2026-09-18 #10):
+    #   "schema_mismatch"  — user_version disagrees with the directory (leg 2 vs leg 3)
+    #   "ledger_mismatch"  — django_migrations disagrees with user_version (leg 1 vs leg 2)
+    # Both are the three-place version stamp disagreeing; the full restore drill is the only leg that
+    # produces "ledger_mismatch", and before it recorded durably (and before this counted it) a DR
+    # audit read clean while the ledgers had drifted. `restored_mismatch`/`fork_failed` are recovery-
+    # PATH failures, a different class, so they stay out of the STAMP-drift gauge (they remain
+    # queryable via `last_verify_status`).
     Repo.aggregate(
-      from(s in Shard, where: s.status == "active" and s.last_verify_status == "schema_mismatch"),
+      from(s in Shard,
+        where:
+          s.status == "active" and s.last_verify_status in ["schema_mismatch", "ledger_mismatch"]
+      ),
       :count
     )
   end

@@ -144,6 +144,24 @@ defmodule Fathom.DirectoryTest do
       assert Directory.stamp_drift_checked() == 2
     end
 
+    # Expert review 2026-09-18 #10: the full restore drill checks the THIRD stamp leg
+    # (django_migrations vs user_version) and reports "ledger_mismatch", but count_stamp_drift only
+    # counted "schema_mismatch" — so a ledger drift was invisible to the DR audit / deploy gate even
+    # once recorded. Both are the version stamp disagreeing and both must count.
+    test "count_stamp_drift counts a ledger_mismatch too, not only schema_mismatch (#10)" do
+      {:ok, _} = Directory.resolve("ledger-drifted")
+      {:ok, _} = Directory.resolve("schema-drifted")
+      {:ok, _} = Directory.resolve("recovery-failed")
+
+      assert Directory.record_verification("ledger-drifted", "ledger_mismatch") == 1
+      assert Directory.record_verification("schema-drifted", "schema_mismatch") == 1
+      # A recovery-PATH failure is a different class and stays OUT of the stamp-drift gauge.
+      assert Directory.record_verification("recovery-failed", "restored_mismatch") == 1
+
+      assert Directory.count_stamp_drift() == 2,
+             "both stamp-drift verdicts (ledger + schema) must count; recovery-path failures must not"
+    end
+
     # THE DENOMINATOR IS NOT DECORATION. The drill is off by default and samples, so a bare
     # `stamp_drift: 0` is ambiguous between "checked, clean" and "nobody has looked" — opposite
     # facts for anyone deciding whether to ship. `stamp_drift_checked` is what separates them.
