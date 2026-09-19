@@ -353,16 +353,22 @@ defmodule Fathom.Directory do
   at an object that may not exist. The 2-arity form omits it and leaves the column untouched, which
   is what a caller that did not retain anything wants.
   """
+  # Spec matches `guarded_update_shard/3`'s real return (expert review 2026-09-18 #26): it uses
+  # `Repo.update_all` + a re-read, never a changeset, so `Ecto.Changeset.t()` was impossible; and it
+  # returns `:status_conflict` when the row left the `active`/`migrating` set mid-flip, which the old
+  # 2-arity spec omitted even though `register_fork/2` calls this form and a shard suspended/deleted
+  # mid-fork yields exactly that.
   @spec cutover(String.t(), non_neg_integer()) ::
-          {:ok, Shard.t()} | {:error, :not_found | Ecto.Changeset.t()}
+          {:ok, Shard.t()} | {:error, :not_found | :status_conflict}
   def cutover(shard_id, schema_version) do
     # Only a shard still `active` or `migrating` may cut over — never one suspended or deleted during
     # the copy window (#11).
     guarded_update_shard(shard_id, cutover_attrs(schema_version), ["active", "migrating"])
   end
 
+  # Same real return as the 2-arity form; the `Ecto.Changeset.t()` here was impossible too (#26).
   @spec cutover(String.t(), non_neg_integer(), non_neg_integer() | nil) ::
-          {:ok, Shard.t()} | {:error, :not_found | :status_conflict | Ecto.Changeset.t()}
+          {:ok, Shard.t()} | {:error, :not_found | :status_conflict}
   def cutover(shard_id, schema_version, retained_version) do
     guarded_update_shard(
       shard_id,

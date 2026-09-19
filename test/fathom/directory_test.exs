@@ -85,6 +85,18 @@ defmodule Fathom.DirectoryTest do
       assert {:ok, %Shard{schema_version: 5, status: "active"}} = Directory.cutover("acme", 5)
     end
 
+    # Expert review 2026-09-18 #26: cutover only flips a shard still active/migrating; a row that left
+    # that set (suspended/deleted/quarantined mid-flip) yields {:error, :status_conflict} — a real,
+    # reachable return (register_fork/2 calls the 2-arity form). The 2-arity spec used to OMIT it and
+    # instead name an impossible Ecto.Changeset.t(); this pins the behaviour the corrected spec
+    # documents so it cannot be dropped again. Runtime behaviour is unchanged, so this passes both
+    # before and after the spec fix — it guards the invariant, not the spec text.
+    test "cutover on a shard no longer active/migrating returns :status_conflict" do
+      {:ok, _} = Directory.mark_failed("acme")
+      assert {:error, :status_conflict} = Directory.cutover("acme", 5)
+      assert {:error, :status_conflict} = Directory.cutover("acme", 5, 4)
+    end
+
     # The revert force-guard (finding #13) reads "activity since cutover" as strictly
     # last_active_at > cutover_at, which only works if cutover stamps BOTH with the same
     # instant — two separate now() calls would make every fresh cutover read as active.
