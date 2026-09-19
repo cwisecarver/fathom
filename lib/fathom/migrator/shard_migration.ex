@@ -45,9 +45,40 @@ defmodule Fathom.Migrator.ShardMigration do
     # revert write-age guard), and a mistyped id minted a bogus active v0 row.
     # Registering genuinely-new shards is the checkout path's job.
     case Directory.get(shard_id) do
-      {:ok, %{schema_version: v}} when v >= target -> :ok
-      {:ok, _} -> with_lease(shard_id, token, fn lease -> do_run(shard_id, target, lease) end)
-      :error -> {:error, :unknown_shard}
+      {:ok, %{schema_version: v}} when v >= target ->
+        :ok
+
+      {:ok, %{schema_version: v}} ->
+        # PRE-FLIGHT chain buildability from the DIRECTORY stamp before draining (expert review
+        # 2026-09-18 #11). A yanked/unreleased INTERMEDIATE (v4 yanked, HEAD 9) makes every shard
+        # below it unbuildable, but that used to be discovered only AFTER `with_lease` drained the
+        # live coordinator (evicting a served tenant) and `do_run` pulled the full object from S3 —
+        # and since the shard stays `active`, every hourly reconcile re-did that drain+pull forever,
+        # all discarded, and the fleet never reported converged. `statement_chain/2` answers
+        # `{:error, {:unknown_version, v}}` from the release rows alone (one cheap Postgres query, no
+        # lease, no S3), so ask it FIRST and bail with the SAME result the late check produced —
+        # `shard_migration_job` maps it to `{:cancel, :unknown_version}` + telemetry, shard untouched
+        # — now without the drain/pull.
+        #
+        # Uses the directory stamp as `current`. The one shard this diverges from the old behaviour
+        # for is a CRASH-FORWARD one — file already at `target`, directory stamp stale below a version
+        # that was later yanked — which `do_run`'s `current == target -> finalize` would have
+        # self-healed. That is a rare compound event (a finalize crash between the file stamp and the
+        # directory stamp, THEN a yank of an already-applied version); the shard serves correctly from
+        # its file, and its stale stamp is exactly the case `mix fathom.directory` exists to reconcile
+        # (see `forward/9`). Trading that corner for not re-draining every genuine laggard hourly.
+        case statement_chain(v, target) do
+          {:ok, chain} ->
+            with_lease(shard_id, token, fn lease ->
+              do_run(shard_id, target, lease, v, chain)
+            end)
+
+          {:error, _} = err ->
+            err
+        end
+
+      :error ->
+        {:error, :unknown_shard}
     end
   end
 
@@ -474,7 +505,10 @@ defmodule Fathom.Migrator.ShardMigration do
 
   # --- the migration ---
 
-  defp do_run(shard_id, target, lease) do
+  # `pf_version`/`pf_chain` are the directory stamp and the chain the pre-flight in `run/3` already
+  # built from it (expert review 2026-09-18 #11). Reused when the FILE version matches that stamp —
+  # the common case — so the buildability pre-flight adds no second `shard_migrations` query.
+  defp do_run(shard_id, target, lease, pf_version, pf_chain) do
     old = temp_path(shard_id, "old")
     new = temp_path(shard_id, "new")
 
@@ -501,7 +535,16 @@ defmodule Fathom.Migrator.ShardMigration do
             # corruption with all three version stamps agreeing. A missing/yanked
             # intermediate makes the chain unbuildable — error (the shard stays
             # untouched at its old version) rather than half-apply.
-            with {:ok, chain} <- statement_chain(current, target) do
+            # Reuse the pre-flight chain when the file version equals the directory stamp it was
+            # built from (the common case) — so the #11 buildability pre-flight costs no extra
+            # query. Only a file/directory skew (a failed cutover txn / PITR) needs a fresh chain
+            # for the real file version.
+            chain_result =
+              if current == pf_version,
+                do: {:ok, pf_chain},
+                else: statement_chain(current, target)
+
+            with {:ok, chain} <- chain_result do
               # Marked only once the chain is buildable: an unknown/yanked target
               # must leave the shard's status untouched (#23), and the copy window
               # is what "migrating" pauses anyway.

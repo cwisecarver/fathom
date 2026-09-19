@@ -402,6 +402,11 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     # queries) — register it, since run/3 no longer implicitly mints rows (#40).
     {:ok, _} = Directory.resolve(shard)
     put_foreign_lock(shard)
+    # v1 released too so the 0->2 chain is BUILDABLE (expert review 2026-09-18 #11): run/3 now
+    # pre-flights chain buildability BEFORE with_lease, so a v0->v2 job with v1 missing would cancel
+    # (unbuildable) instead of ever reaching the held-lease snooze this test exercises. A v2 with no
+    # v1 is a gap production flags anyway, so releasing v1 makes the fixture realistic.
+    {:ok, _} = Migrator.release(1, "v1", ["CREATE TABLE app_v1 (id INTEGER PRIMARY KEY)"])
     {:ok, _} = Migrator.release(2, "v2", @v2_statements)
 
     assert {:snooze, _} = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
@@ -417,6 +422,10 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     setup %{shard: shard} do
       {:ok, _} = Directory.resolve(shard)
       put_foreign_lock(shard)
+
+      # v1 released so the 0->2 chain is BUILDABLE — run/3's #11 pre-flight would otherwise cancel a
+      # v1-missing chain before ever reaching the held-lease deferral these tests exercise.
+      {:ok, _} = Migrator.release(1, "v1", ["CREATE TABLE app_v1 (id INTEGER PRIMARY KEY)"])
       {:ok, _} = Migrator.release(2, "v2", @v2_statements)
       :ok
     end
@@ -537,9 +546,11 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
 
   test "exhausted attempts quarantine the shard", %{shard: shard} do
     {:ok, _} = Directory.resolve(shard)
-    # A RELEASED target but no live storage object -> a persistent {:error, _}
-    # through every retry. (An unknown/yanked target no longer quarantines — that
-    # cancels without marking, round-2 #23 — so it can't be the vehicle here.)
+    # A RELEASED target with a BUILDABLE chain but no live storage object -> a persistent
+    # {:error, _} through every retry. (An unknown/yanked target — or now an unbuildable chain
+    # (#11) — cancels without marking, round-2 #23, so neither can be the vehicle here: v1 is
+    # released so the chain builds and the failure is the missing OBJECT, reached in do_run.)
+    {:ok, _} = Migrator.release(1, "v1", ["CREATE TABLE app_v1 (id INTEGER PRIMARY KEY)"])
     {:ok, _} = Migrator.release(2, "v2", @v2_statements)
 
     capture_log(fn ->

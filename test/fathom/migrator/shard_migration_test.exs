@@ -376,6 +376,32 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert %{rows: [[1]]} = query_live!(shard, "PRAGMA user_version")
   end
 
+  # Expert review 2026-09-18 #11: an unbuildable chain (a yanked intermediate) used to be
+  # discovered only AFTER with_lease drained the live coordinator and do_run pulled the full object
+  # from S3 — so every hourly reconcile re-drained a served tenant and re-pulled, forever, all
+  # discarded. The pre-flight refuses from the release rows alone, before touching the lease/storage.
+  #
+  # Discriminator: HOLD the lease from another owner. Pre-fix, run/3 reaches with_lease first and
+  # returns {:retry, {:held, _}} (the drain+pull already happened; the chain was never checked).
+  # Post-fix, the pre-flight refuses with {:unknown_version, 2} regardless of the held lease.
+  test "a yanked intermediate is refused BEFORE draining/acquiring the lease (#11)", %{
+    shard: shard
+  } do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "bad", @v2_statements)
+    {:ok, _} = Migrator.release(3, "good", ["CREATE TABLE app_ok (id INTEGER PRIMARY KEY)"])
+    assert :ok = Migrator.yank(2)
+
+    # Someone else holds the lease, un-stealably (long TTL).
+    {:ok, _held} = Storage.acquire_lease(shard, "someone_else@node", 60_000)
+
+    assert {:error, {:unknown_version, 2}} = ShardMigration.run(shard, 3),
+           "the pre-flight must refuse before with_lease (pre-fix a held lease made this {:retry, {:held, _}})"
+
+    assert {:ok, %{schema_version: 1}} = Directory.get(shard),
+           "the shard must stay untouched at its old version"
+  end
+
   # Expert review 2026-08-26 #8. The forward path was the ONLY durable-object producer in the
   # system that did not validate what it was about to publish. Every other one does — the
   # coordinator's periodic flush gates on quick_check, the GDPR export refuses a corrupt export,
