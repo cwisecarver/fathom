@@ -624,6 +624,25 @@ defmodule Fathom.Migrator.CaptureTest do
       end
     end
 
+    # Expert review 2026-09-18 #8: the shard-local-row-copy exemption skipped ANY INSERT..SELECT
+    # with no VALUES — including a constant/literal-only projection with NO table source, e.g.
+    # `INSERT INTO customers(id,ssn) SELECT 42,'999-99-9999'`. No VALUES ⇒ exempted ⇒ its literals
+    # replayed onto EVERY shard: the exact RunPython-backfill poisoning shape the lint exists to
+    # catch. Requiring a FROM clause closes it while keeping every real Django table-rebuild exempt.
+    # Uses the pure public classifier directly. Pre-fix the poison line returns [] (exempted).
+    test "flags a constant-literal INSERT..SELECT with no FROM (fleet-poisoning vector, #8)" do
+      poison = ~s|INSERT INTO "customers" ("id", "ssn") SELECT 42, '999-99-9999'|
+
+      # The Django table-rebuild copy — a literal (NULL) projection but WITH a FROM — must stay exempt.
+      rebuild = ~s|INSERT INTO "new__t" ("id", "x") SELECT "id", NULL FROM "t"|
+
+      assert Capture.data_migration_statements([poison]) == [poison],
+             "a FROM-less literal INSERT..SELECT must be flagged (pre-fix it was exempted)"
+
+      assert Capture.data_migration_statements([rebuild]) == [],
+             "a real table-rebuild copy (INSERT..SELECT ... FROM) must stay exempt"
+    end
+
     # Expert review #6: a non-atomic (`atomic = False`) migration runs autocommit — no tracked
     # BEGIN/COMMIT — so capture never sees it, the template schema moves, and the fleet never hears.
     # Caught at the NEXT capture: its pre-transaction count exceeds the last captured count (the gap).

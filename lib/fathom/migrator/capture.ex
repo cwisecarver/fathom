@@ -619,9 +619,21 @@ defmodule Fathom.Migrator.Capture do
   # Fails closed: only an INSERT drawing from a SELECT with NO `values` row-source is exempt.
   # Anything carrying VALUES (including `INSERT ... VALUES ((SELECT …))`) stays flagged, as does
   # every UPDATE/DELETE/REPLACE — the rebuild path never emits those.
+  #
+  # ALSO REQUIRES A `FROM` CLAUSE (expert review 2026-09-18 #8). Without it, a constant/literal-only
+  # projection — `INSERT INTO customers(id,ssn) SELECT 42,'999-99-9999'` — has no VALUES, so it slid
+  # through the exemption and replayed those literals onto EVERY shard: exactly the RunPython-backfill
+  # poisoning shape this lint exists to catch. Django's `_remake_table` always draws the copy FROM the
+  # old table (`… SELECT cols FROM x`), so requiring a FROM keeps every legitimate rebuild exempt while
+  # rejecting the FROM-less literal injection (which then requires review). Matched with `\bfrom\b`
+  # rather than a bare substring so a column named `from_date` (word char after "from" ⇒ no boundary)
+  # does not read as a clause. Accepted limitation: a `SELECT <literal> FROM x` still exempts, because
+  # a new-column-default rebuild (`SELECT id, 0 FROM x`) is byte-shaped identically and only a real SQL
+  # parser — which this project does not have — could tell them apart; the FROM-less case is the
+  # clear-cut vector this closes.
   defp shard_local_row_copy?(lead, down) do
     String.starts_with?(lead, "insert") and String.contains?(down, "select") and
-      not String.contains?(down, "values")
+      not String.contains?(down, "values") and Regex.match?(~r/\bfrom\b/, down)
   end
 
   # The version is computed per attempt (next_version() under the unique index as
