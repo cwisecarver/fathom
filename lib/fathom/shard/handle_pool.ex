@@ -59,22 +59,23 @@ defmodule Fathom.Shard.HandlePool do
   end
 
   @doc """
-  Return `handle` to the pool for `scope` at monotonic time `now_ms`. If the bucket is now over
-  `max_per_scope`, the oldest (LRU) handle is evicted and returned in `to_close`; otherwise
-  `to_close` is `nil`. Callers MUST close a returned handle.
+  Return `handle` to the pool for `scope` at monotonic time `now_ms`. Keeps the newest
+  `max_per_scope` handles and returns everything over the cap in `to_close` (a LIST, empty when
+  nothing is evicted). Callers MUST close every returned handle.
   """
-  @spec put(t(), scope(), handle(), integer()) :: {t(), handle() | nil}
+  @spec put(t(), scope(), handle(), integer()) :: {t(), [handle()]}
   def put(%__MODULE__{idle: idle, max_per_scope: max} = pool, scope, handle, now_ms)
       when scope in [:ro, :rw] do
     bucket = [{handle, now_ms} | Map.fetch!(idle, scope)]
 
-    if length(bucket) > max do
-      # Over cap: drop the LRU (tail). Keeping the newest preserves the warmest -shm/cache.
-      {kept, [{evicted, _ts}]} = Enum.split(bucket, max)
-      {%{pool | idle: Map.put(idle, scope, kept)}, evicted}
-    else
-      {%{pool | idle: Map.put(idle, scope, bucket)}, nil}
-    end
+    # Keep the newest `max` (warmest -shm/cache); everything past the cap is evicted for the caller
+    # to close. `put/4` prepends one and maintains `bucket <= max`, so `over` is normally 0 or 1
+    # element — but return it as a LIST and map generally rather than matching a rigid `[{h, _}]`,
+    # so a hypothetical invariant break (a lowered `max_per_scope` against a populated bucket)
+    # evicts+closes ALL the extras instead of a MatchError that crashes the coordinator (expert
+    # review 2026-09-18 #24).
+    {kept, over} = Enum.split(bucket, max)
+    {%{pool | idle: Map.put(idle, scope, kept)}, Enum.map(over, fn {h, _ts} -> h end)}
   end
 
   @doc """

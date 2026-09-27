@@ -2018,7 +2018,7 @@ defmodule Fathom.Shard do
 
   defp pool_checkin(%{pool: pool} = state, conn, scope) do
     {pool, evicted} = HandlePool.put(pool, scope, conn, System.monotonic_time(:millisecond))
-    if evicted, do: Connection.close(evicted)
+    Enum.each(evicted, &Connection.close/1)
     %{state | pool: pool}
   end
 

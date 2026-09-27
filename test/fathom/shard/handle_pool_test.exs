@@ -21,13 +21,13 @@ defmodule Fathom.Shard.HandlePoolTest do
   end
 
   test "a returned handle is reused once, then the bucket is empty" do
-    {pool, nil} = HandlePool.put(HandlePool.new(), :rw, :h1, 0)
+    {pool, []} = HandlePool.put(HandlePool.new(), :rw, :h1, 0)
     assert {:hit, :h1, pool} = HandlePool.take(pool, :rw)
     assert {:miss, _} = HandlePool.take(pool, :rw)
   end
 
   test "SCOPE ISOLATION: a :ro checkout is never handed a :rw handle" do
-    {pool, nil} = HandlePool.put(HandlePool.new(max_per_scope: 4), :rw, :writable, 0)
+    {pool, []} = HandlePool.put(HandlePool.new(max_per_scope: 4), :rw, :writable, 0)
 
     assert {:miss, pool} = HandlePool.take(pool, :ro),
            "a :ro take must not return the writable handle"
@@ -37,8 +37,8 @@ defmodule Fathom.Shard.HandlePoolTest do
 
   test "reuse is MRU — the most recently returned handle comes back first" do
     pool = HandlePool.new(max_per_scope: 4)
-    {pool, nil} = HandlePool.put(pool, :rw, :older, 1)
-    {pool, nil} = HandlePool.put(pool, :rw, :newer, 2)
+    {pool, []} = HandlePool.put(pool, :rw, :older, 1)
+    {pool, []} = HandlePool.put(pool, :rw, :newer, 2)
 
     assert {:hit, :newer, pool} = HandlePool.take(pool, :rw)
     assert {:hit, :older, _} = HandlePool.take(pool, :rw)
@@ -46,34 +46,52 @@ defmodule Fathom.Shard.HandlePoolTest do
 
   test "over cap evicts the LRU (oldest) handle and returns it to close" do
     pool = HandlePool.new(max_per_scope: 1)
-    {pool, nil} = HandlePool.put(pool, :rw, :a, 1)
+    {pool, []} = HandlePool.put(pool, :rw, :a, 1)
     {pool, evicted} = HandlePool.put(pool, :rw, :b, 2)
 
-    assert evicted == :a, "the older handle is evicted for the caller to close"
+    assert evicted == [:a], "the older handle is evicted for the caller to close"
     assert HandlePool.count(pool, :rw) == 1
     assert {:hit, :b, _} = HandlePool.take(pool, :rw)
   end
 
   test "under cap returns nil to close" do
     {_, to_close} = HandlePool.put(HandlePool.new(max_per_scope: 2), :rw, :a, 1)
-    assert to_close == nil
+    assert to_close == []
   end
 
   test "eviction with a larger cap drops only the single oldest" do
     pool = HandlePool.new(max_per_scope: 2)
-    {pool, nil} = HandlePool.put(pool, :rw, :a, 1)
-    {pool, nil} = HandlePool.put(pool, :rw, :b, 2)
+    {pool, []} = HandlePool.put(pool, :rw, :a, 1)
+    {pool, []} = HandlePool.put(pool, :rw, :b, 2)
     {pool, evicted} = HandlePool.put(pool, :rw, :c, 3)
 
-    assert evicted == :a
+    assert evicted == [:a]
     assert {:hit, :c, pool} = HandlePool.take(pool, :rw)
     assert {:hit, :b, _} = HandlePool.take(pool, :rw)
   end
 
+  # Expert review 2026-09-18 #24: the over-cap branch matched a rigid `[{evicted, _ts}]`, assuming
+  # exactly one eviction. That holds via the pool's own invariant (put maintains bucket <= max), so
+  # it is unreachable through the public API — but a bucket that is somehow already over cap (a
+  # hypothetical lowered max_per_scope against a populated bucket) gave Enum.split a multi-element
+  # tail and MatchError-crashed the coordinator. put must now evict+return ALL the extras. Construct
+  # the over-cap state directly, since the public API cannot reach it.
+  test "put evicts ALL over-cap handles without crashing (#24)" do
+    over = %HandlePool{idle: %{ro: [], rw: [{:a, 1}, {:b, 2}, {:c, 3}]}, max_per_scope: 1}
+
+    assert {%HandlePool{} = pool, evicted} = HandlePool.put(over, :rw, :d, 4)
+
+    # Newest (:d) kept; the three prior handles all evicted for the caller to close — pre-fix this
+    # raised a MatchError instead of returning.
+    assert HandlePool.count(pool, :rw) == 1
+    assert Enum.sort(evicted) == [:a, :b, :c]
+    assert {:hit, :d, _} = HandlePool.take(pool, :rw)
+  end
+
   test "sweep closes handles idle past the ttl, keeps fresh ones" do
     pool = HandlePool.new(max_per_scope: 4, ttl_ms: 100)
-    {pool, nil} = HandlePool.put(pool, :rw, :stale, 0)
-    {pool, nil} = HandlePool.put(pool, :ro, :fresh, 90)
+    {pool, []} = HandlePool.put(pool, :rw, :stale, 0)
+    {pool, []} = HandlePool.put(pool, :ro, :fresh, 90)
 
     {pool, expired} = HandlePool.sweep(pool, 150)
 
@@ -83,14 +101,14 @@ defmodule Fathom.Shard.HandlePoolTest do
   end
 
   test "sweep before the ttl expires nothing" do
-    {pool, nil} = HandlePool.put(HandlePool.new(ttl_ms: 100), :rw, :a, 0)
+    {pool, []} = HandlePool.put(HandlePool.new(ttl_ms: 100), :rw, :a, 0)
     assert {_, []} = HandlePool.sweep(pool, 99)
   end
 
   test "drain returns every handle across scopes and empties the pool" do
     pool = HandlePool.new(max_per_scope: 4)
-    {pool, nil} = HandlePool.put(pool, :ro, :r, 1)
-    {pool, nil} = HandlePool.put(pool, :rw, :w, 2)
+    {pool, []} = HandlePool.put(pool, :ro, :r, 1)
+    {pool, []} = HandlePool.put(pool, :rw, :w, 2)
 
     {handles, pool} = HandlePool.drain(pool)
 
@@ -102,9 +120,9 @@ defmodule Fathom.Shard.HandlePoolTest do
 
   test "count reports total and per-scope" do
     pool = HandlePool.new(max_per_scope: 4)
-    {pool, nil} = HandlePool.put(pool, :ro, :r1, 1)
-    {pool, nil} = HandlePool.put(pool, :ro, :r2, 2)
-    {pool, nil} = HandlePool.put(pool, :rw, :w1, 3)
+    {pool, []} = HandlePool.put(pool, :ro, :r1, 1)
+    {pool, []} = HandlePool.put(pool, :ro, :r2, 2)
+    {pool, []} = HandlePool.put(pool, :rw, :w1, 3)
 
     assert HandlePool.count(pool) == 3
     assert HandlePool.count(pool, :ro) == 2
