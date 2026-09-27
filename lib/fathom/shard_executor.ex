@@ -1013,7 +1013,23 @@ defmodule Fathom.ShardExecutor do
       # `sqlite3_close_v2` defer the eventual close, skipping the WAL checkpoint the durability
       # position stamp depends on (see Connection.release_owner_state/1).
       Connection.release_owner_state(conn)
-      Shard.checkin(pid, ref, conn, scope)
+
+      # Roll back any transaction this stream left open BEFORE the handle is pooled (expert review
+      # 2026-09-18 #3). reset_for_reuse/2 also rolls back, but LAZILY on the NEXT reuse — so a handle
+      # checked in mid-BEGIN would sit in the idle pool holding the SQLite write lock and pinning the
+      # WAL for the whole idle interval, blocking every other :rw writer with SQLITE_BUSY and growing
+      # the WAL unbounded. Like the finalize above, this MUST run here in the STREAM process — the
+      # coordinator that owns the pool is the shard's fence authority and must never block on a tenant
+      # SQLite call. A handle that will not roll back is not poolable: close it and take the
+      # non-pooled checkin, so the next stream opens fresh.
+      case Connection.rollback_if_open(conn) do
+        :ok ->
+          Shard.checkin(pid, ref, conn, scope)
+
+        {:error, _reason} ->
+          Connection.close(conn)
+          Shard.checkin(pid, ref)
+      end
     else
       Connection.close(conn)
       Shard.checkin(pid, ref)

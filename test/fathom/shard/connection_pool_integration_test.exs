@@ -204,6 +204,37 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
     :ok = ShardExecutor.close(hb)
   end
 
+  # Expert review 2026-09-18 #3: a stream that checks in MID-TRANSACTION (BEGIN;INSERT, no commit)
+  # used to pool the handle STILL holding the SQLite write lock — the rollback was deferred to the
+  # next reuse (reset_for_reuse/2). During the idle interval every OTHER :rw stream on the shard
+  # blocked on the 5s busy_timeout then hit SQLITE_BUSY, and the WAL grew unbounded. close/1 now rolls
+  # the handle back at checkin, in the stream process, before it is pooled. This is the
+  # concurrent-writer case the reuse-time rollback test above does NOT cover: there the SAME handle is
+  # reused, so the lazy rollback hides the stranded lock; here a SEPARATE handle competes for it.
+  test "pooling ON: a mid-transaction checkin does not strand the write lock for a concurrent writer (#3)",
+       %{shard: shard} do
+    Application.put_env(:fathom, :connection_pool, true)
+
+    {:ok, ha} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))
+
+    # A SECOND concurrent :rw stream on its OWN handle (the pool is empty while A is checked out), so
+    # it cannot reuse A's handle — it competes for the shard's single SQLite write lock.
+    {:ok, hb} = ShardExecutor.open(shard)
+
+    # A opens a write transaction and checks in WITHOUT committing.
+    {:ok, _} = ShardExecutor.execute(ha, stmt("BEGIN"))
+    {:ok, _} = ShardExecutor.execute(ha, stmt("INSERT INTO kv VALUES ('a')"))
+    :ok = ShardExecutor.close(ha)
+
+    # THE ASSERTION: B takes the write lock immediately. Pre-fix A's pooled handle held it, so this
+    # blocked for the full 5s busy_timeout and returned SQLITE_BUSY.
+    assert {:ok, %StmtResult{}} = ShardExecutor.execute(hb, stmt("INSERT INTO kv VALUES ('b')")),
+           "a concurrent writer was blocked by the checked-in handle's stranded write lock"
+
+    :ok = ShardExecutor.close(hb)
+  end
+
   test "pooling ON: scope isolation — a :ro stream is NOT handed the :rw pooled handle", %{
     shard: shard
   } do

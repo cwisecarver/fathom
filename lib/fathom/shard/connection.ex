@@ -1058,7 +1058,19 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
-  defp rollback_if_open(conn) do
+  @doc """
+  Roll back any transaction left open on `conn`; `:ok` when it is already in autocommit.
+
+  Called from `reset_for_reuse/2` AND directly at pool CHECKIN (`ShardExecutor.close/1`). The
+  checkin call is what fixes expert review 2026-09-18 #3: `reset_for_reuse/2` rolls back only LAZILY
+  on the next reuse, so a handle checked in mid-`BEGIN` would sit in the idle pool holding the SQLite
+  write lock and pinning the WAL — blocking every other `:rw` writer with `SQLITE_BUSY` and growing
+  the WAL unbounded — until some later stream happened to reuse it. Fails safe: `autocommit?/1`
+  returns `true` on a read error, so a handle whose state cannot be read is treated as clean and left
+  for `sqlite3_close_v2` to roll back.
+  """
+  @spec rollback_if_open(reference()) :: :ok | {:error, term()}
+  def rollback_if_open(conn) do
     if autocommit?(conn) do
       :ok
     else
