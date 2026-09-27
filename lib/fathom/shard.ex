@@ -204,8 +204,16 @@ defmodule Fathom.Shard do
   `checkin/4` returns the handle. Used by the request path (`Fathom.ShardExecutor`).
   """
   @spec pool_take(pid(), :ro | :rw) :: {:reuse, reference()} | :open
-  def pool_take(pid, scope) when is_pid(pid) and scope in [:ro, :rw],
-    do: GenServer.call(pid, {:pool_take, scope})
+  def pool_take(pid, scope) when is_pid(pid) and scope in [:ro, :rw] do
+    GenServer.call(pid, {:pool_take, scope})
+  catch
+    # The grant already SUCCEEDED (`checkout/1` returned before this), so a coordinator that is
+    # briefly blocked or that died between the two calls must NOT turn a request whose slot is held
+    # into a 5xx (expert review 2026-09-18 #16). Every exit reason has the same safe answer here —
+    # `:open`, a fresh handle off the shard path — which is exactly what a pool MISS returns, so no
+    # per-reason mapping like `do_checkout/2` needs. A dropped pool reuse only costs one extra open.
+    :exit, _ -> :open
+  end
 
   defp do_checkout(pid, op) do
     # The open path (handle_continue) can legitimately block a queued :checkout for up to

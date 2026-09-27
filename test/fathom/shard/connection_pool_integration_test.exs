@@ -45,6 +45,18 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   defp conn_of({_pid, _ref, conn, _id, _sc, _v, _o}), do: conn
   defp pid_of({pid, _ref, _conn, _id, _sc, _v, _o}), do: pid
 
+  # Expert review 2026-09-18 #16: pool_take/2 was a bare GenServer.call with NO :exit rescue (unlike
+  # do_checkout/2). The grant from checkout/1 already succeeded, so a coordinator briefly blocked or
+  # dead between the two calls turned a request whose slot is held into a 5xx. It must degrade to
+  # :open (a fresh handle) on any exit. Pre-fix this RAISES an exit into the caller.
+  test "pool_take degrades to :open when the coordinator is gone (#16)" do
+    {dead, ref} = spawn_monitor(fn -> :ok end)
+    assert_receive {:DOWN, ^ref, :process, ^dead, _}
+
+    assert Fathom.Shard.pool_take(dead, :rw) == :open
+    assert Fathom.Shard.pool_take(dead, :ro) == :open
+  end
+
   test "pooling ON: a handle checked in while the shard is still busy is reused by the next stream",
        %{shard: shard} do
     Application.put_env(:fathom, :connection_pool, true)
