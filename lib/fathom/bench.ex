@@ -494,7 +494,7 @@ defmodule Fathom.Bench do
   @doc false
   # One promote-on-open failover sample: a shard whose stored object is stamped holding only
   # `flush_after` rows while a local A2 replica carries all `total`. Kill the primary, time the
-  # survivor open (which runs `maybe_promote_replica/5`), and RAISE unless the promotion fired —
+  # survivor open (which runs `maybe_promote_replica/6`), and RAISE unless the promotion fired —
   # the served row count must be the full `total`, or a silent cold open was measured. Public so the
   # @tag :bench verification test drives the exact same code the S3 arm does. Requires a
   # default-named `Follower` already running and `:replication_promote_on_open` true.

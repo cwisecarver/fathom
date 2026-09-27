@@ -238,6 +238,24 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     :ok
   end
 
+  # A crash that leaves the disk BEHIND — the warm-restart state, the mirror of tear_down_primary/3's
+  # node loss. The former primary's own local files (with its acked-but-unflushed writes) are still
+  # there, so the next open is WARM and the local bytes are authoritative.
+  defp kill_primary_keep_disk(conn, coordinator) do
+    ref = Process.monitor(coordinator)
+    Process.exit(coordinator, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^coordinator, _}, 2_000
+
+    _ =
+      try do
+        ShardExecutor.close(conn)
+      catch
+        :exit, _ -> :ok
+      end
+
+    :ok
+  end
+
   test "recovers_writes_the_stored_object_never_had", ctx do
     %{id: id} = ctx
     Application.put_env(:fathom, :replication_promote_on_open, true)
@@ -598,6 +616,48 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
 
     tear_down_primary(id, conn, coordinator)
 
+    assert open_and_read(id) == Enum.to_list(1..10)
+  end
+
+  # A WARM restart is a former primary reopening its OWN local files, which still hold
+  # acked-but-unflushed writes the stored object and the peer replicas are behind on. Promote-on-open
+  # must NOT overwrite them (expert review 2026-09-18 #1 — a data-loss bug). This is the mirror of
+  # every test above: they delete the local disk (tear_down_primary/3) so the survivor opens COLD and
+  # promotion is the only way to recover the writes; here the disk survives, so the local file is
+  # authoritative and promotion must stand down. Invariant pinned: a warm open serves the LOCAL
+  # bytes, never a peer replica that is fresher-than-the-object but staler-than-the-local.
+  test "a warm restart keeps its own fresher local and never promotes a peer over it (#1)", ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+
+    # Object flushed at 3; local written to 7; then a peer replica taken at 7 rows, ranked just past
+    # the object. THEN three more rows land locally with no flush — so the local file holds 10, the
+    # peer holds 7, and the stored object holds 3. Pre-fix, promote picks the peer (fresher than the
+    # object) and File.renames its 7 rows over the fresher 10-row local.
+    {conn, coordinator} = build_shard(id, 7, 3)
+    assert {:ok, stamp} = Storage.object_position(id)
+    refute is_nil(stamp), "no stamp — the comparison could not run and this proves nothing"
+
+    install_replica(id, %{
+      epoch: stamp.epoch,
+      wal_gen: stamp.wal_gen,
+      wal_ordinal: stamp.wal_ordinal,
+      offset: stamp.offset + 1
+    })
+
+    for i <- 8..10 do
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (?1)", [i]))
+    end
+
+    kill_primary_keep_disk(conn, coordinator)
+
+    # Precondition: the local .db is genuinely present, or this is a cold open in disguise and would
+    # prove nothing.
+    assert File.exists?(Fathom.Shard.db_path(id)),
+           "the local file was not kept — this degenerated into a cold open"
+
+    # THE ASSERTION: the warm open serves the local's ten rows. Pre-fix it promoted the 7-row peer
+    # over the fresher local and this returned 1..7.
     assert open_and_read(id) == Enum.to_list(1..10)
   end
 end

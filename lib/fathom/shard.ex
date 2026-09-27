@@ -668,7 +668,7 @@ defmodule Fathom.Shard do
       # later flush of this coordinator stamp the SAME lineage — they are one ownership. See
       # open_lineage/1 for why it is read once and never recomputed.
       lineage = open_lineage(shard_id)
-      etag = PromoteOnOpen.maybe_promote_replica(shard_id, path, lease, etag1, lineage)
+      etag = PromoteOnOpen.maybe_promote_replica(shard_id, path, lease, etag1, lineage, warm?)
 
       # Arm the coalesced idle timer at open too (expert review 2026-08-31 #13). It used to be
       # armed ONLY when the last connection checked back in, on the assumption "a coordinator is
@@ -2947,7 +2947,7 @@ defmodule Fathom.Shard do
     end
   end
 
-  # A2 promote-on-open (maybe_promote_replica/5 and its helpers) moved to
+  # A2 promote-on-open (maybe_promote_replica/6 and its helpers) moved to
   # `Fathom.Shard.PromoteOnOpen` (2026-09-13, Phase 5). It runs after the lease + fork verdict
   # are settled and decides which bytes are served; every non-win branch returns etag unchanged.
 

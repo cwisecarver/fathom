@@ -8,7 +8,8 @@ defmodule Fathom.Shard.PromoteOnOpen do
   fork verdict are settled (`revalidate_takeover/5`), passing the shard id, live path, lease, the
   fence etag so far, and the lineage.
 
-  `maybe_promote_replica/5` is the only entry point. Every branch that is not a proven win returns
+  `maybe_promote_replica/6` is the only entry point (the coordinator passes `warm?`, and a warm open
+  never promotes — see the head of that function). Every branch that is not a proven win returns
   the caller's `etag` unchanged, so the ordinary open path is bit-for-bit what it was — including
   every error, because a failed promotion must never fail an open (the stored-object path is still
   correct, it just recovers less). `Promote.fresher?/2` is what makes it safe: a replica is promoted
@@ -29,22 +30,47 @@ defmodule Fathom.Shard.PromoteOnOpen do
   alias Fathom.Shard.Replication.Recovery
   alias Fathom.Shard.Storage
 
-  @spec maybe_promote_replica(String.t(), Path.t(), map(), String.t() | nil, term()) ::
+  @spec maybe_promote_replica(String.t(), Path.t(), map(), String.t() | nil, term(), boolean()) ::
           String.t() | nil | {:error, term()}
-  def maybe_promote_replica(shard_id, path, lease, etag, lineage) do
-    # The gate is checked FIRST and returns the caller's own binding, so a node that has not
-    # enabled this allocates nothing at all on its open path. See the note at the call site.
-    #
-    # `follower_running?/0` is hoisted to sit beside the gate rather than living inside
-    # `nothing_to_promote?/1`, and that is a DEFAULT-ON decision: the gate is now on everywhere, so
-    # this `if` is the open path for every node that is not part of a replicating fleet, and it
-    # should cost one `Process.whereis` rather than a walk through two more predicates. No follower
-    # means no replica table to read AND nowhere for a pulled replica to install, so both branches
-    # below would have declined anyway — `Recovery.search/5` says so in as many words.
-    if promote_on_open?() and follower_running?() do
-      try_promote(shard_id, path, lease, etag, lineage)
-    else
-      etag
+  def maybe_promote_replica(shard_id, path, lease, etag, lineage, warm?) do
+    cond do
+      # A WARM open means the coordinator has ALREADY decided this node's local file is the bytes to
+      # serve, and promote must not then clobber them (expert review 2026-09-18 #1 — a data-loss
+      # bug). `warm? = file present AND NOT Fork.resolve(...)`, so a warm local is a non-forked,
+      # SAME-LINEAGE copy — this node's own former-primary file. The primary writes locally BEFORE it
+      # ships a frame, so no same-lineage peer replica (nor the stored object, which the primary's
+      # own flush produced) can be strictly ahead of it; a cross-lineage stale local is a FORK, which
+      # makes `warm?` false and routes here as a cold open instead. So promoting a peer over a warm
+      # local always File.renames away acked-but-unflushed writes the local uniquely holds. Skipping
+      # on `warm?` keeps ONE authority for "is the local good?" — the coordinator cannot both serve
+      # the warm local and overwrite it. The node-loss RPO promote-on-open exists for is the COLD
+      # failover path (a survivor the LB routed to that holds no local, so `warm?` is false), which
+      # is untouched.
+      #
+      # DIVERGENCE from the review's suggested fix (recorded 2026-09-18): the review preferred a
+      # position comparison — promote only when the candidate is strictly ahead of BOTH the warm
+      # local file AND the object. That is more code (it must recompute the warm local's
+      # lineage+ordinal, the subtle part) buying defense-in-depth against a Fork.resolve gap — but if
+      # Fork.resolve were wrong the SERVE path would already be serving a stale local, so a promote
+      # path that re-derived freshness independently would only let the two disagree. Revisit only if
+      # a Fork.resolve gap is ever actually found.
+      warm? ->
+        etag
+
+      # The gate is checked before the fleet machinery, so a node that has not enabled this allocates
+      # nothing at all on its (cold) open path. See the note at the call site.
+      #
+      # `follower_running?/0` is hoisted to sit beside the gate rather than living inside
+      # `nothing_to_promote?/1`, and that is a DEFAULT-ON decision: the gate is now on everywhere, so
+      # this branch is the open path for every node that is not part of a replicating fleet, and it
+      # should cost one `Process.whereis` rather than a walk through two more predicates. No follower
+      # means no replica table to read AND nowhere for a pulled replica to install, so both branches
+      # below would have declined anyway — `Recovery.search/5` says so in as many words.
+      promote_on_open?() and follower_running?() ->
+        try_promote(shard_id, path, lease, etag, lineage)
+
+      true ->
+        etag
     end
   end
 
