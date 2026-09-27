@@ -57,6 +57,44 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
     assert Fathom.Shard.pool_take(dead, :ro) == :open
   end
 
+  # Expert review 2026-09-18 #19: HandlePool.sweep/2 + ttl_ms existed and were documented as the
+  # density bound, but NOTHING called sweep/2 — the ttl was inert. The coordinator now arms a
+  # ttl-cadence :sweep_pool timer. Long ttl here so the coordinator's OWN auto-sweep can't fire
+  # during the test; we inject a pre-aged handle and drive one sweep manually.
+  test "pooling ON: the coordinator sweeps a pooled handle idle past the ttl (#19)", %{
+    shard: shard
+  } do
+    Application.put_env(:fathom, :connection_pool, true)
+    prev_opts = Application.get_env(:fathom, :connection_pool_opts)
+    Application.put_env(:fathom, :connection_pool_opts, max_per_scope: 4, ttl_ms: 60_000)
+    on_exit(fn -> restore(:connection_pool_opts, prev_opts) end)
+
+    {:ok, pid, ref, path} = Shards.checkout(shard)
+
+    on_exit(fn ->
+      Fathom.Shard.checkin(pid, ref)
+      Shards.drain(shard, 2_000)
+    end)
+
+    # A real idle handle aged 100s (well past the 60s ttl), injected into the coordinator's pool.
+    {:ok, h} = Fathom.Shard.Connection.open(path)
+    now = System.monotonic_time(:millisecond)
+
+    :sys.replace_state(pid, fn s ->
+      {pool, []} = HandlePool.put(s.pool, :rw, h, now - 100_000)
+      %{s | pool: pool}
+    end)
+
+    assert HandlePool.count(pool_of(pid), :rw) == 1
+
+    # Pre-fix nothing handled :sweep_pool, so the aged handle stayed pooled indefinitely.
+    send(pid, :sweep_pool)
+    _ = :sys.get_state(pid)
+
+    assert HandlePool.count(pool_of(pid), :rw) == 0,
+           "a pooled handle idle past the ttl must be swept (pre-fix sweep/2 had no call site)"
+  end
+
   test "pooling ON: a handle checked in while the shard is still busy is reused by the next stream",
        %{shard: shard} do
     Application.put_env(:fathom, :connection_pool, true)

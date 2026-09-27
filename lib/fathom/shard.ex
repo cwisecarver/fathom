@@ -852,7 +852,7 @@ defmodule Fathom.Shard do
       # is what failed.
       Fathom.Shard.WriteFence.unfence(state.id)
 
-      {:noreply, schedule_idle(schedule_flush(state))}
+      {:noreply, schedule_idle(schedule_flush(schedule_sweep(state)))}
     else
       {:error, reason} ->
         # Couldn't make the file available — give the lease back so another node
@@ -1492,6 +1492,21 @@ defmodule Fathom.Shard do
   # coordinator already in terminate); this handler remains as the eager belt.
   def handle_info(:write_counter_reset, state) do
     {:noreply, %{state | flushed_through: -1}}
+  end
+
+  # Shed pooled handles idle past the pool's ttl (expert review 2026-09-18 #19). `HandlePool.sweep/2`
+  # and its `ttl_ms` existed and were documented as the density bound, but NOTHING called `sweep/2`
+  # (zero call sites in `lib/`) — the ttl was inert and idle handles were held for the shard's entire
+  # busy period, so the moduledoc density claim was false. This is the call site: on a ttl-cadence
+  # timer armed at open (`schedule_sweep/1`), close every expired idle handle and re-arm. A pooled
+  # handle is idle by definition (no in-flight write, no fence role), so closing it is always safe;
+  # `close_pool/1` on terminate remains the backstop that no handle outlives the lease.
+  def handle_info(:sweep_pool, %{pool: nil} = state), do: {:noreply, state}
+
+  def handle_info(:sweep_pool, %{pool: pool} = state) do
+    {pool, expired} = HandlePool.sweep(pool, System.monotonic_time(:millisecond))
+    Enum.each(expired, &Connection.close/1)
+    {:noreply, schedule_sweep(%{state | pool: pool})}
   end
 
   # `FlushWatermark` restarted with an empty table (expert review 2026-08-26 #17). Re-assert this
@@ -3789,6 +3804,17 @@ defmodule Fathom.Shard do
   defp cancel_idle(%{timer: timer} = state) do
     Process.cancel_timer(timer)
     %{state | timer: nil}
+  end
+
+  # Arm the pool sweep on a ttl-cadence timer, ONLY when pooling is on (expert review 2026-09-18
+  # #19). A handle idle past `ttl_ms` is then closed within ~one interval. No-op (and no timer at
+  # all) when pooling is off. The timer is not tracked in state — it re-arms from the handler and
+  # dies with the coordinator, and a stray tick on a pool that emptied is a cheap no-op sweep.
+  defp schedule_sweep(%{pool: nil} = state), do: state
+
+  defp schedule_sweep(%{pool: pool} = state) do
+    Process.send_after(self(), :sweep_pool, pool.ttl_ms)
+    state
   end
 
   # The lapse revalidation's verdict, applied back in the coordinator (expert review 2026-08-26
