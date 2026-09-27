@@ -95,7 +95,20 @@ defmodule Fathom.Shard.Storage.Local do
           # force-stop terminates a coordinator while its streams are live, and that path has no
           # such ordering. A fence etag that does not describe the stored object makes the next
           # flush 412 and the shard self-fence away acknowledged writes.
-          with :ok <- Storage.atomic_copy(local_path, remote_path(shard_id)),
+          # REMOVE THE STALE STAMP BEFORE THE NEW BYTES LAND (expert review 2026-09-18 #22). S3
+          # stamps the position on the SAME atomic PUT, so it is always consistent; Local writes the
+          # object, the position, and the lineage as THREE separate files. On the update path a prior
+          # `.pos` already exists, so a crash after `atomic_copy` but before `write_position` used to
+          # leave the NEW object under the OLD, lower stamp — and under A2 a replica behind the new
+          # object but ahead of the old stamp reads as fresher and is promoted → rollback (the
+          # comment on `write_position/2` claimed a crash leaves a stamp-LESS object, which held only
+          # when there was no prior stamp). Removing it first makes the copy window stamp-less, which
+          # `object_position/1` reads as "unknown" (never overridable) — the safe state. Real only on
+          # the Local backend (dev/test; replication is off there and S3 is already correct), so the
+          # cost — a failed copy also drops a still-valid stamp until the next flush re-writes it — is
+          # accepted for the simpler invariant.
+          with :ok <- rm_ok(position_path(shard_id)),
+               :ok <- Storage.atomic_copy(local_path, remote_path(shard_id)),
                :ok <- write_position(shard_id, position),
                :ok <- write_lineage(shard_id, lineage),
                {:ok, etag} <- file_etag(remote_path(shard_id)) do
