@@ -3541,7 +3541,11 @@ defmodule Fathom.Shard do
   # escaped defensively.
   # Takes an ALREADY-OPEN connection (review 2026-08-26 #12) so the verify and the snapshot share
   # one handle. Opening and closing is the caller's job — `verify_and_snapshot/2` owns the `after`.
-  defp do_snapshot(conn, dest) do
+  # @doc false / public only so a test can drive the raise path directly (the caller,
+  # verify_and_snapshot/2, closes the conn, so the restored `synchronous` can't be observed from
+  # there). See shard_snapshot_sync_test.exs.
+  @doc false
+  def do_snapshot(conn, dest) do
     # The snapshot temp inherits this connection's safety_level (SQLite's sqlite3RunVacuum:
     # `pgflags = db->aDb[iDb].safety_level | ...`), so at synchronous=FULL every periodic flush
     # force-fsynced a full shard-sized file that `snapshot_and_upload/1` unlinks seconds later
@@ -3558,23 +3562,26 @@ defmodule Fathom.Shard do
     # synchronous=OFF can corrupt the main database on power loss.
     Connection.exec(conn, "PRAGMA synchronous=OFF")
 
-    result = Connection.query(conn, "VACUUM INTO '#{String.replace(dest, "'", "''")}'", [])
-
-    # RESTORE IT BEFORE ANYTHING ELSE TOUCHES THIS CONNECTION (expert review 2026-08-01 #5).
-    # The relaxation above is for the throwaway VACUUM temp only, but it stayed in effect for
-    # the checkpoint and the close below — violating the rule the comment right above states.
+    # RESTORE synchronous=FULL IN AN `after`, so it happens even if VACUUM INTO RAISES rather than
+    # returning `{:error}` (expert review 2026-09-18 #7). Pre-fix these were three flat statements:
+    # a raise from the VACUUM step (Connection.query rescues only ArgumentError, so a different
+    # exception propagates) skipped the restore, and the exception unwound through
+    # verify_and_snapshot/2's `after Connection.close(conn)` — which, on the last connection to a WAL
+    # database, runs the close-time checkpoint that UNLINKS `-wal`/`-shm`, at synchronous=OFF: a torn
+    # database on power loss, uploaded as the durable object. The trigger is narrow (most VACUUM
+    # failures return `{:error}` and already restored FULL below), but the consequence is unrecoverable.
     #
-    # `synchronous` is a pager property and SQLite derives checkpoint sync flags from it
-    # (`pPager->walSyncFlags`), so at OFF a checkpoint neither fsyncs the WAL before backfill
-    # nor fsyncs the main database after. TWO checkpoints ran that way: the explicit PASSIVE,
-    # and SQLite's close-time checkpoint — which, on the last connection to a WAL database,
-    # also UNLINKS `-wal`/`-shm`. And this is frequently the last connection: the periodic
-    # flush fires on any dirty shard, which is routinely one with zero checked-out streams.
-    #
-    # Main-database pages written without fsync, followed by deletion of the only recovery
-    # source, is a torn database on power loss — silent, unrecoverable, and then uploaded as
-    # the durable object.
-    Connection.exec(conn, "PRAGMA synchronous=FULL")
+    # RESTORE IT BEFORE ANYTHING ELSE TOUCHES THIS CONNECTION (expert review 2026-08-01 #5): the
+    # relaxation is for the throwaway VACUUM temp only. `synchronous` is a pager property and SQLite
+    # derives checkpoint sync flags from it (`pPager->walSyncFlags`), so at OFF a checkpoint neither
+    # fsyncs the WAL before backfill nor fsyncs the main database after — which is why the PASSIVE
+    # checkpoint below and SQLite's close-time checkpoint must both run at FULL.
+    result =
+      try do
+        Connection.query(conn, "VACUUM INTO '#{String.replace(dest, "'", "''")}'", [])
+      after
+        Connection.exec(conn, "PRAGMA synchronous=FULL")
+      end
 
     # Checkpoint here, where nobody is waiting (expert review 2026-07-24 #4). Without this the
     # only thing truncating the WAL in steady state was SQLite's autocheckpoint, which runs
