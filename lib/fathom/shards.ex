@@ -117,22 +117,32 @@ defmodule Fathom.Shards do
   @spec checkout(term(), :ro | :rw) ::
           {:ok, pid(), reference(), Path.t(), {:reuse, reference()} | :open} | {:error, term()}
   def checkout(shard_id, scope) when scope in [:ro, :rw] do
-    case checkout(shard_id) do
-      {:ok, pid, ref, path} ->
-        reuse = if connection_pool?(), do: Fathom.Shard.pool_take(pid, scope), else: :open
-        {:ok, pid, ref, path, reuse}
+    # ONE coordinator round-trip now: the grant and the pool take fold into a single `:checkout`
+    # reply (expert review 2026-09-18 #18), instead of `checkout/1` + a separate `pool_take/2`. The
+    # coordinator returns `:open` for the pool when pooling is off, so this path needs no
+    # `connection_pool?` branch — pooling-off is unchanged (still one round-trip), pooling-on drops
+    # the second. Same validation + telemetry span as `checkout/1`, via the shared `do_checkout/4`.
+    case Fathom.ShardId.cast(shard_id) do
+      {:ok, id} ->
+        :telemetry.span([:fathom, :shards, :checkout], %{shard_id: id}, fn ->
+          result = do_checkout(id, 3, nil, scope)
+          {result, %{shard_id: id, outcome: checkout_outcome(result)}}
+        end)
 
-      {:error, _} = err ->
-        err
+      :error ->
+        {:error, :invalid_shard_id}
     end
   end
 
-  defp connection_pool?, do: Application.get_env(:fathom, :connection_pool, false)
-
-  defp do_checkout(shard_id, attempts, held \\ nil) do
+  # `scope` (nil | :ro | :rw) threads through the retry machinery unchanged (expert review 2026-09-18
+  # #18): when set, the grant is the FOLDED `Fathom.Shard.checkout/2` that returns the pool reuse in
+  # the same coordinator round-trip, so the request path no longer pays a second `:pool_take` call.
+  # `grant/2` normalizes to a 4-tuple (reuse `:open` when scope is nil), so this `with` and every
+  # retry path stay one shape; `checkout_result/5` drops the reuse for the plain (nil-scope) caller.
+  defp do_checkout(shard_id, attempts, held \\ nil, scope \\ nil) do
     with :ok <- maybe_lazy_migrate(shard_id),
          {:ok, pid} <- ensure(shard_id),
-         {:ok, ref, path} <- Fathom.Shard.checkout(pid) do
+         {:ok, ref, path, reuse} <- grant(pid, scope) do
       record_use(shard_id)
       # Per-shard load: the checkout (traffic) signal for the rebalancer. Lock-free
       # ETS bump, gated + off by default (see Fathom.ShardLoad).
@@ -142,7 +152,7 @@ defmodule Fathom.Shards do
       # double-stamped every cycle from a second process). While a stream is held the
       # shard is busy-filtered from eviction anyway, so the release stamp is the one that
       # defines its LRU order.
-      {:ok, pid, ref, path}
+      checkout_result(pid, ref, path, reuse, scope)
     else
       # Expected in-flight handoff (expert review #20): the LB flips to the target BEFORE the
       # source drains, so this node's acquire is `{:shard_held, source}` for the drain window.
@@ -153,7 +163,7 @@ defmodule Fathom.Shards do
       # first post-flip requests QUEUE instead of erroring. Anything else (foreign lease, no pin,
       # budget exhausted) falls back to the current error.
       {:error, {:shard_held, _, _}} = err ->
-        held_retry(shard_id, attempts, held, err)
+        held_retry(shard_id, attempts, held, err, scope)
 
       # Race: `ensure` resolved a coordinator that lost a race with its own lifecycle, so a
       # 1 ms re-resolve to a fresh coordinator fixes it (see retry_checkout?/1). Bounded so a
@@ -162,7 +172,7 @@ defmodule Fathom.Shards do
       {:error, reason} when attempts > 1 ->
         if retry_checkout?(reason) do
           Process.sleep(1)
-          do_checkout(shard_id, attempts - 1, held)
+          do_checkout(shard_id, attempts - 1, held, scope)
         else
           {:error, reason}
         end
@@ -172,18 +182,46 @@ defmodule Fathom.Shards do
     end
   end
 
+  # The grant, normalized to `{:ok, ref, path, reuse}` so `do_checkout/4` and the retry paths stay
+  # one shape. nil scope ⇒ the plain `checkout/1` with `reuse: :open`; a scope ⇒ the folded
+  # `checkout/2` that carries the pool reuse (#18).
+  defp grant(pid, nil) do
+    with {:ok, ref, path} <- Fathom.Shard.checkout(pid), do: {:ok, ref, path, :open}
+  end
+
+  defp grant(pid, scope), do: Fathom.Shard.checkout(pid, scope)
+
+  # The plain caller (`checkout/1`) gets the 4-tuple it always did; the scope caller (`checkout/2`)
+  # gets the reuse folded in (#18).
+  defp checkout_result(pid, ref, path, _reuse, nil), do: {:ok, pid, ref, path}
+  defp checkout_result(pid, ref, path, reuse, _scope), do: {:ok, pid, ref, path, reuse}
+
   # `held` is nil until the first `{:shard_held}` error, then
   # `{deadline_ms, next_backoff_ms, stealable_at_ms | nil}`.
   # On the FIRST held error we decide once whether this is our in-flight handoff (one Overrides
   # read); if so we open a time-bounded retry window and carry the deadline so we don't re-query
   # Postgres per retry. A reverted handoff just exhausts the (bounded) budget and then errors.
-  defp held_retry(shard_id, attempts, nil, {:error, {:shard_held, owner, from_acquire}} = err) do
+  defp held_retry(
+         shard_id,
+         attempts,
+         nil,
+         {:error, {:shard_held, owner, from_acquire}} = err,
+         scope
+       ) do
     cond do
       # #20 — an in-flight handoff to THIS node: hold for the source's drain window. No steal
       # instant to aim at — the source releases when its drain finishes, which is not a clock
       # value anyone can read — so this one polls.
       handoff_held_budget_ms() > 0 and handoff_pin_here?(shard_id) ->
-        start_held_retry(shard_id, attempts, handoff_held_budget_ms(), :handoff_wait, err, nil)
+        start_held_retry(
+          shard_id,
+          attempts,
+          handoff_held_budget_ms(),
+          :handoff_wait,
+          err,
+          nil,
+          scope
+        )
 
       # #21 — a hard-crash failover: the holder's heartbeat is frozen (dead) and ages out within the
       # budget, so the steal is imminent. Hold the TAIL of the TTL window as latency instead of a
@@ -192,7 +230,15 @@ defmodule Fathom.Shards do
       crash_failover_hold_ms() > 0 ->
         case holder_stealable_at(shard_id, owner, crash_failover_hold_ms(), from_acquire) do
           {:ok, at} ->
-            start_held_retry(shard_id, attempts, crash_failover_hold_ms(), :crash_wait, err, at)
+            start_held_retry(
+              shard_id,
+              attempts,
+              crash_failover_hold_ms(),
+              :crash_wait,
+              err,
+              at,
+              scope
+            )
 
           :no ->
             err
@@ -203,13 +249,13 @@ defmodule Fathom.Shards do
     end
   end
 
-  defp held_retry(shard_id, attempts, {deadline, backoff, stealable_at}, err),
-    do: backoff_held(shard_id, attempts, deadline, backoff, stealable_at, err)
+  defp held_retry(shard_id, attempts, {deadline, backoff, stealable_at}, err, scope),
+    do: backoff_held(shard_id, attempts, deadline, backoff, stealable_at, err, scope)
 
-  defp start_held_retry(shard_id, attempts, budget, event, err, stealable_at) do
+  defp start_held_retry(shard_id, attempts, budget, event, err, stealable_at, scope) do
     :telemetry.execute([:fathom, :shards, event], %{count: 1}, %{shard_id: shard_id})
     deadline = System.monotonic_time(:millisecond) + budget
-    backoff_held(shard_id, attempts, deadline, @initial_held_backoff_ms, stealable_at, err)
+    backoff_held(shard_id, attempts, deadline, @initial_held_backoff_ms, stealable_at, err, scope)
   end
 
   # Whether the foreign holder's lease will become stealable within `budget`. A crashed holder's
@@ -281,7 +327,7 @@ defmodule Fathom.Shards do
   # DURATION derived from each is compared, never the instants themselves — a system-clock step
   # can make the aimed wait wrong, and the `min(_, remaining)` clamp plus the budget deadline is
   # what bounds the damage to today's behaviour.
-  defp backoff_held(shard_id, attempts, deadline, backoff, stealable_at, err) do
+  defp backoff_held(shard_id, attempts, deadline, backoff, stealable_at, err, scope) do
     remaining = deadline - System.monotonic_time(:millisecond)
 
     if remaining > 0 do
@@ -299,7 +345,7 @@ defmodule Fathom.Shards do
 
       Process.sleep(wait)
       next_backoff = min(backoff * 2, @max_held_backoff_ms)
-      do_checkout(shard_id, attempts, {deadline, next_backoff, nil})
+      do_checkout(shard_id, attempts, {deadline, next_backoff, nil}, scope)
     else
       err
     end
@@ -348,6 +394,8 @@ defmodule Fathom.Shards do
   def retry_checkout?(reason), do: reason in [:unavailable, :normal]
 
   defp checkout_outcome({:ok, _, _, _}), do: :ok
+  # The folded scope-carrying checkout (#18) returns the reuse handle as a 5th element.
+  defp checkout_outcome({:ok, _, _, _, _}), do: :ok
   defp checkout_outcome({:error, {:shard_held, _, _}}), do: :held
   defp checkout_outcome({:error, :unavailable}), do: :unavailable
   defp checkout_outcome({:error, :node_at_capacity}), do: :at_capacity

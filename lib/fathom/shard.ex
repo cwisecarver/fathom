@@ -196,6 +196,17 @@ defmodule Fathom.Shard do
   end
 
   @doc """
+  Checkout that ALSO returns a reusable pooled handle for `scope` in the SAME reply — one coordinator
+  round-trip instead of `checkout/1` + a separate `pool_take/2` (expert review 2026-09-18 #18).
+  Returns `{:ok, ref, path, {:reuse, conn} | :open}`. `:open` when pooling is off / a pool miss.
+  """
+  @spec checkout(pid(), :ro | :rw) ::
+          {:ok, reference(), Path.t(), {:reuse, reference()} | :open} | {:error, term()}
+  def checkout(pid, scope) when is_pid(pid) and scope in [:ro, :rw] do
+    do_checkout(pid, make_ref(), scope)
+  end
+
+  @doc """
   Ask the coordinator's per-shard handle pool for a reusable `scope` connection, AFTER a successful
   `checkout/1` (the grant keeps the shard from draining, so the pool is stable across this call).
   Returns `{:reuse, conn}` on a pool hit — the caller MUST `Connection.reset_for_reuse(conn, scope)`
@@ -215,7 +226,11 @@ defmodule Fathom.Shard do
     :exit, _ -> :open
   end
 
-  defp do_checkout(pid, op) do
+  defp do_checkout(pid, op, scope \\ nil) do
+    # `scope` nil ⇒ the plain grant ({:checkout, op}); a scope folds the pool take into the same
+    # reply ({:checkout, op, scope}) — one round-trip (#18). Both share the timeout budget and the
+    # :exit rescue below.
+    msg = if scope, do: {:checkout, op, scope}, else: {:checkout, op}
     # The open path (handle_continue) can legitimately block a queued :checkout for up to
     # @pull_timeout (a large cold pull, cross-region S3), and an inline durability flush can
     # add more. The default 5s GenServer.call timeout is far below that, so a slow-but-normal
@@ -224,7 +239,7 @@ defmodule Fathom.Shard do
     # for a caller that had already given up. Give the call a budget above the coordinator's
     # own open budget; the coordinator still bounds the pull with @pull_timeout, so this
     # never waits forever on a genuinely stuck open. Configurable for real-S3 tuning.
-    GenServer.call(pid, {:checkout, op}, checkout_timeout())
+    GenServer.call(pid, msg, checkout_timeout())
   catch
     # The coordinator self-stopped while opening storage (lease held by another
     # node, or pull failed) — its `{:shutdown, reason}` exit reaches the pending
@@ -1084,41 +1099,36 @@ defmodule Fathom.Shard do
     {:reply, {:error, :draining}, state}
   end
 
+  # The scope-carrying checkout folds the pool take into the grant reply (expert review 2026-09-18
+  # #18), so the request path makes ONE coordinator round-trip instead of `:checkout` + a separate
+  # `:pool_take`. The draining clause mirrors the 2-arg form.
+  def handle_call({:checkout, _op, _scope}, _from, %{draining: true} = state) do
+    {:reply, {:error, :draining}, state}
+  end
+
   def handle_call({:checkout, op}, {caller, _tag}, state) do
-    # Per-shard concurrent-stream cap (expert review 2026-07-14 #26): bound how many streams one
-    # tenant can hold open at once, so a single tenant can't monopolize a node's streams (and,
-    # combined with the timeout/row caps, can't wedge the shard un-drainable). Off by default
-    # (`:max_checkouts_per_shard` unset ⇒ unlimited); the caller maps the refusal to a 503.
-    case max_checkouts() do
-      cap when is_integer(cap) and cap > 0 and map_size(state.conns) >= cap ->
-        {:reply, {:error, :shard_at_stream_capacity}, state}
-
-      _ ->
-        ref = Process.monitor(caller)
-        # The value carries the caller AND the call's op tag, so an abandon names
-        # exactly one grant (round-2 #33) instead of every grant this pid holds.
-        # Clearing idle_since (not cancelling the timer) is what defers idle-stop: a
-        # pending timer fires as a cheap no-op/re-arm instead of paying a
-        # cancel_timer + send_after pair per stream cycle (review 2026-07-23 #17).
-        state = %{state | conns: Map.put(state.conns, ref, {caller, op}), idle_since: nil}
-
-        # Re-arm the durability timer if the idle+clean state disarmed it (review 2026-07-24 #10).
-        # Deliberately on the GRANT, not on checkin: the timer must be live for the whole window in
-        # which this connection can write. Cheap — only when there is no timer, i.e. once per
-        # idle→busy transition, never per stream cycle.
-        state = if state.flush_timer == nil, do: do_schedule_flush(state), else: state
-
-        # Publish the busy count so the at-capacity eviction probe skips this shard while it serves
-        # (expert review #14) — otherwise a long-lived held stream ages to the LRU front but can't be
-        # evicted, starving admission. A best-effort hint, no-op unless eviction is enabled.
-        Fathom.Shards.Lru.record_conns(state.id, map_size(state.conns))
-        {:reply, {:ok, ref, state.path}, state}
+    case grant_checkout(op, caller, state) do
+      {:ok, ref, path, state} -> {:reply, {:ok, ref, path}, state}
+      {:error, reason, state} -> {:reply, {:error, reason}, state}
     end
   end
 
-  # Hand the caller a reusable idle handle for `scope`, or `:open` (miss / pooling off). Called only
-  # after a successful checkout — the grant keeps the shard busy, so the pool cannot be drained out
-  # from under this. `pool_take/2` returns `:open` unchanged when `pool` is nil.
+  def handle_call({:checkout, op, scope}, {caller, _tag}, state) when scope in [:ro, :rw] do
+    case grant_checkout(op, caller, state) do
+      {:ok, ref, path, state} ->
+        # The grant keeps the shard busy, so the pool cannot be drained out from under this take —
+        # exactly the invariant the separate `:pool_take` call relied on, now in one hop.
+        {reuse, state} = take_from_pool(state, scope)
+        {:reply, {:ok, ref, path, reuse}, state}
+
+      {:error, reason, state} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  # Hand the caller a reusable idle handle for `scope`, or `:open` (miss / pooling off). Retained for
+  # any caller that still takes the pool separately; the request path now folds it into `:checkout`
+  # (#18). The grant keeps the shard busy, so the pool cannot be drained out from under this.
   def handle_call({:pool_take, scope}, _from, state) when scope in [:ro, :rw] do
     {reuse, state} = take_from_pool(state, scope)
     {:reply, reuse, state}
@@ -2006,6 +2016,42 @@ defmodule Fathom.Shard do
       )
     else
       nil
+    end
+  end
+
+  # The grant itself: the per-shard concurrent-stream cap, the monitor+conns bookkeeping, the
+  # durability-timer re-arm, and the LRU busy hint. Shared by the plain (`{:checkout, op}`) and the
+  # scope-carrying (`{:checkout, op, scope}`) checkout so the two cannot drift (expert review
+  # 2026-09-18 #18). Returns `{:ok, ref, path, state}` or `{:error, reason, state}`.
+  defp grant_checkout(op, caller, state) do
+    # Per-shard concurrent-stream cap (expert review 2026-07-14 #26): bound how many streams one
+    # tenant can hold open at once, so a single tenant can't monopolize a node's streams (and,
+    # combined with the timeout/row caps, can't wedge the shard un-drainable). Off by default
+    # (`:max_checkouts_per_shard` unset ⇒ unlimited); the caller maps the refusal to a 503.
+    case max_checkouts() do
+      cap when is_integer(cap) and cap > 0 and map_size(state.conns) >= cap ->
+        {:error, :shard_at_stream_capacity, state}
+
+      _ ->
+        ref = Process.monitor(caller)
+        # The value carries the caller AND the call's op tag, so an abandon names
+        # exactly one grant (round-2 #33) instead of every grant this pid holds.
+        # Clearing idle_since (not cancelling the timer) is what defers idle-stop: a
+        # pending timer fires as a cheap no-op/re-arm instead of paying a
+        # cancel_timer + send_after pair per stream cycle (review 2026-07-23 #17).
+        state = %{state | conns: Map.put(state.conns, ref, {caller, op}), idle_since: nil}
+
+        # Re-arm the durability timer if the idle+clean state disarmed it (review 2026-07-24 #10).
+        # Deliberately on the GRANT, not on checkin: the timer must be live for the whole window in
+        # which this connection can write. Cheap — only when there is no timer, i.e. once per
+        # idle→busy transition, never per stream cycle.
+        state = if state.flush_timer == nil, do: do_schedule_flush(state), else: state
+
+        # Publish the busy count so the at-capacity eviction probe skips this shard while it serves
+        # (expert review #14) — otherwise a long-lived held stream ages to the LRU front but can't be
+        # evicted, starving admission. A best-effort hint, no-op unless eviction is enabled.
+        Fathom.Shards.Lru.record_conns(state.id, map_size(state.conns))
+        {:ok, ref, state.path, state}
     end
   end
 

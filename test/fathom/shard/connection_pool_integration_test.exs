@@ -57,6 +57,30 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
     assert Fathom.Shard.pool_take(dead, :ro) == :open
   end
 
+  # Expert review 2026-09-18 #18: checkout/2 used to make TWO coordinator round-trips (:checkout,
+  # then a separate :pool_take). Fathom.Shard.checkout/2 now folds the pool take into the grant
+  # reply — one call. This pins that the folded primitive returns the pooled handle in the reply.
+  test "Fathom.Shard.checkout/2 returns a pooled handle in the grant reply, in one call (#18)", %{
+    shard: shard
+  } do
+    Application.put_env(:fathom, :connection_pool, true)
+
+    {:ok, pid, ref, path, :open} = Shards.checkout(shard, :rw)
+    on_exit(fn -> Fathom.Shard.checkin(pid, ref) end)
+
+    # Inject a pooled :rw handle; the shard stays busy (ref held), so it is not drained.
+    {:ok, h} = Fathom.Shard.Connection.open(path)
+
+    :sys.replace_state(pid, fn s ->
+      {pool, []} = HandlePool.put(s.pool, :rw, h, System.monotonic_time(:millisecond))
+      %{s | pool: pool}
+    end)
+
+    # The folded grant returns the pooled handle as its 4th element — no separate pool_take call.
+    assert {:ok, ref2, ^path, {:reuse, ^h}} = Fathom.Shard.checkout(pid, :rw)
+    Fathom.Shard.checkin(pid, ref2)
+  end
+
   # Expert review 2026-09-18 #19: HandlePool.sweep/2 + ttl_ms existed and were documented as the
   # density bound, but NOTHING called sweep/2 — the ttl was inert. The coordinator now arms a
   # ttl-cadence :sweep_pool timer. Long ttl here so the coordinator's OWN auto-sweep can't fire
