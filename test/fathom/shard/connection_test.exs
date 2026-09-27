@@ -34,6 +34,26 @@ defmodule Fathom.Shard.ConnectionTest do
       """)
   end
 
+  # Expert review 2026-09-18 #13: a `:ro` handle from the WAL-recovery / new-file fallback is
+  # physically READ-WRITE, its read-only-ness resting SOLELY on `PRAGMA query_only=ON`.
+  # reset_for_reuse(:ro) did a rollback only, so if `query_only` was OFF on the reused handle it
+  # stayed a writable "read-only" handle. The fix re-asserts `query_only=ON` on `:ro` reuse.
+  test "reset_for_reuse(:ro) re-asserts query_only so a reused handle refuses writes (#13)", %{
+    conn: conn
+  } do
+    # A handle whose query_only is OFF (a writable handle, standing in for a :ro fallback whose
+    # query_only was toggled off — the leak ShardExecutor normally blocks).
+    :ok = Connection.exec(conn, "PRAGMA query_only=OFF")
+
+    assert {:ok, _} = Connection.query(conn, "INSERT INTO t (v) VALUES ('a')", []),
+           "precondition: with query_only OFF the handle writes"
+
+    assert :ok = Connection.reset_for_reuse(conn, :ro)
+
+    assert {:error, _} = Connection.query(conn, "INSERT INTO t (v) VALUES ('b')", []),
+           "a reused :ro handle must refuse writes — pre-fix reset_for_reuse(:ro) left query_only OFF"
+  end
+
   # Expert review 2026-08-26 #10 made the directory creation conditional (`File.dir?` first,
   # `mkdir_p!` only on a miss) because the unconditional `mkdir_p!` was ~23% of open cost on the
   # per-stream path. The win is real but the SEMANTICS are what can silently break: 27 call sites

@@ -1047,7 +1047,14 @@ defmodule Fathom.Shard.Connection do
   @spec reset_for_reuse(reference(), :ro | :rw) :: :ok | {:error, term()}
   def reset_for_reuse(conn, scope) when scope in [:ro, :rw] do
     with :ok <- rollback_if_open(conn) do
-      if scope == :rw, do: configure(conn), else: :ok
+      # `:rw` re-applies the writable-path pragmas (`configure/1`). `:ro` RE-ASSERTS `query_only=ON`
+      # (expert review 2026-09-18 #13): a `:ro` handle from the WAL-recovery / new-file fallback is
+      # physically READ-WRITE, and its read-only-ness rests SOLELY on `PRAGMA query_only=ON` (see the
+      # open path's `maybe_query_only/2` and the note there). Rollback alone left that unenforced on
+      # reuse — safe only because `ShardExecutor` denies the `query_only` pragma to tenants, but a
+      # trust boundary must not rest on a single upstream guard. `maybe_query_only/2` is a no-op for
+      # `:rw`, so this is scope-correct either way.
+      if scope == :rw, do: configure(conn), else: maybe_query_only(conn, scope)
     end
   end
 
