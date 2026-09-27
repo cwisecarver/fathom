@@ -78,6 +78,53 @@ defmodule Fathom.Shards.NovelLimiterTest do
     {:ok, _} = Supervisor.restart_child(Fathom.DataPlane.Supervisor, Fathom.Shards.NovelLimiter)
   end
 
+  # Expert review 2026-09-18 #9: the novel-rate gate must be consulted BEFORE evicted_for_room?,
+  # which is NOT a predicate — it flushes+drops+releases the lease of an LRU idle shard. Pre-fix, at
+  # the cap a novel-shard spray evicted a warm legitimate co-tenant and only THEN got rate-refused,
+  # churning real tenants for a request never going to be admitted. Invariant: a rate-refused novel
+  # open evicts nobody. (Here, not shard_admission_test, because novelty reads the directory in the
+  # CALLER and needs the DataCase sandbox connection.)
+  test "at capacity, a rate-refused NOVEL open evicts no legitimate tenant (#9)" do
+    Fathom.Shards.Lru.reset()
+    prev_cap = Application.get_env(:fathom, :max_open_shards)
+    prev_evict = Application.get_env(:fathom, :evict_idle_at_capacity)
+    Application.put_env(:fathom, :evict_idle_at_capacity, true)
+
+    on_exit(fn ->
+      restore_env(:max_open_shards, prev_cap)
+      restore_env(:evict_idle_at_capacity, prev_evict)
+      Fathom.Shards.Lru.reset()
+    end)
+
+    # A legitimate, idle, evictable tenant — the only Lru candidate after the reset, so it is the
+    # shard evicted_for_room? WOULD pick. Opened with the rate gate still OFF, so its own open is
+    # ungated.
+    legit = unique_shard("novel_legit")
+    {:ok, pid_a, ref_a, _} = Fathom.Shards.checkout(legit)
+    Fathom.Shard.checkin(pid_a, ref_a)
+    _ = :sys.get_state(pid_a)
+    a_mon = Process.monitor(pid_a)
+
+    # Enable the gate and take the limiter down → any novel open fails closed (allow/1 exits).
+    Application.put_env(:fathom, :novel_shard_rate, 1000)
+    :ok = Supervisor.terminate_child(Fathom.DataPlane.Supervisor, Fathom.Shards.NovelLimiter)
+
+    on_exit(fn ->
+      Supervisor.restart_child(Fathom.DataPlane.Supervisor, Fathom.Shards.NovelLimiter)
+    end)
+
+    Application.put_env(:fathom, :max_open_shards, 1)
+
+    # The novel spray shard is refused; pre-fix it evicted `legit` first (clause 1 ran before the
+    # rate gate).
+    assert {:error, :novel_shard_rate_limited} =
+             Fathom.Shards.checkout(unique_shard("novel_spray"))
+
+    # Pre-fix, evicted_for_room? had already flushed+dropped `legit` (its coordinator stops → DOWN).
+    refute_receive {:DOWN, ^a_mon, :process, ^pid_a, _}, 800
+    assert Process.alive?(pid_a), "a rate-refused novel spray must not churn a warm co-tenant"
+  end
+
   # --- the token bucket itself (private instance, injected clock) ---
 
   describe "the bucket" do

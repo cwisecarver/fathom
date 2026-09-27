@@ -909,37 +909,43 @@ defmodule Fathom.Shards do
     # with both gates on it ran twice: two File.exists? stats + two synchronous directory
     # reads, doubling novel-open control-plane latency under exactly the signup/spray
     # traffic these gates target). Neither gate on ⇒ no stat and no Postgres read at all.
+    # `NovelLimiter.enabled?/0`, NOT `!= nil` (expert review 2026-08-24 #20). The gate must be
+    # ON only for a POSITIVE rate: `NOVEL_SHARD_RATE=0` is the natural operator spelling of
+    # "disabled" — the docs say "unset = off" — and `0` is not nil, so it used to reach
+    # `allow/2`, crash the limiter on a `CaseClauseError`, and (via the plane supervisor's
+    # `max_restarts: 30` in `max_seconds: 10`) take the data plane down after 31 novel-shard
+    # requests in ten seconds. See that function for the whole sequence.
+    #
+    # Novelty ("nothing knows the shard") is consulted by BOTH the rate limiter and fork-from-
+    # template, so it's computed AT MOST ONCE per open (review 2026-07-23 #28). The `(rate_gated? or
+    # fork_gated?) and …` short-circuit means neither gate on ⇒ no stat and no Postgres read at all.
+    rate_gated? = Fathom.Shards.NovelLimiter.enabled?()
+    fork_gated? = Application.get_env(:fathom, :fork_from_template, false)
+    novel? = (rate_gated? or fork_gated?) and novel_shard?(shard_id)
+
     cond do
-      # At the cap, first try to make room by evicting the least-recently-used IDLE
-      # shard (soft cap). Only if nothing idle can be evicted do we refuse — a node
-      # saturated with *active* connections genuinely has no room, and 503 tells the
-      # LB/client to back off rather than letting DynamicSupervisor spawn past the fd
-      # cliff (emfile) and degrade the whole node.
+      # THE NOVEL-RATE GATE COMES FIRST, BEFORE ANY EVICTION (expert review 2026-09-18 #9). A spray
+      # of unseen ids must be refused before it can churn a warm legitimate co-tenant — the
+      # `NovelLimiter` contract is "refused before any of that work runs". The old order checked
+      # `at_capacity?() and not evicted_for_room?()` first, but `evicted_for_room?/0` is NOT a
+      # predicate: it flushes + drops + releases the lease of an LRU IDLE shard (real S3 I/O). So at
+      # the cap, a novel-shard spray evicted a legitimate tenant and only THEN got rate-refused —
+      # exploitable in the default `:hrana_auth=:disabled` posture. Gating novelty first means an
+      # eviction is only ever spent to admit a request that will actually be admitted.
+      rate_gated? and novel? and limiter_refused?(shard_id) ->
+        {:error, :novel_shard_rate_limited}
+
+      # At the cap, try to make room by evicting the least-recently-used IDLE shard (soft cap). Only
+      # if nothing idle can be evicted do we refuse — a node saturated with *active* connections
+      # genuinely has no room, and 503 tells the LB/client to back off rather than letting
+      # DynamicSupervisor spawn past the fd cliff (emfile) and degrade the whole node.
       at_capacity?() and not evicted_for_room?() ->
         :telemetry.execute([:fathom, :shards, :at_capacity], %{count: 1}, %{shard_id: shard_id})
         {:error, :node_at_capacity}
 
       true ->
-        # `NovelLimiter.enabled?/0`, NOT `!= nil` (expert review 2026-08-24 #20). The gate must be
-        # ON only for a POSITIVE rate: `NOVEL_SHARD_RATE=0` is the natural operator spelling of
-        # "disabled" — the docs say "unset = off" — and `0` is not nil, so it used to reach
-        # `allow/2`, crash the limiter on a `CaseClauseError`, and (via the plane supervisor's
-        # `max_restarts: 30` in `max_seconds: 10`) take the data plane down after 31 novel-shard
-        # requests in ten seconds. See that function for the whole sequence.
-        rate_gated? = Fathom.Shards.NovelLimiter.enabled?()
-        fork_gated? = Application.get_env(:fathom, :fork_from_template, false)
-        novel? = (rate_gated? or fork_gated?) and novel_shard?(shard_id)
-
-        # The churn half of finding #14: the cap above bounds how many shards this node
-        # holds open; this bounds how FAST unseen ids can mint new ones (coordinator +
-        # fds + file + S3 lock PUT + Postgres row per novel id). Refused before any of
-        # that work runs.
-        if rate_gated? and novel? and limiter_refused?(shard_id) do
-          {:error, :novel_shard_rate_limited}
-        else
-          if fork_gated? and novel?, do: fork_novel(shard_id)
-          start(shard_id)
-        end
+        if fork_gated? and novel?, do: fork_novel(shard_id)
+        start(shard_id)
     end
   end
 
