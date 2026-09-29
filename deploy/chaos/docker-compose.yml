@@ -266,26 +266,40 @@ services:
       timeout: 2s
       retries: 30
 
+  # Upstream MinIO stopped publishing its community images (late 2025): minio/minio and minio/mc
+  # no longer pull from Docker Hub or quay.io. Chainguard rebuilds MinIO from source (amd64 +
+  # arm64); fathom mirrors it at ghcr.io/cwisecarver/minio (see scripts/minio_test.sh), and the full
+  # :s3 suite passes against it. The image is minimal — no curl/wget — but ships bash and `mc`, so
+  # the healthcheck probes the same /minio/health/live endpoint over bash's /dev/tcp (HTTP/1.1 WITH a
+  # Host header — MinIO answers a bare HTTP/1.0 request 400), and minio-init
+  # reuses this image instead of a separate mc image.
   minio:
-    image: minio/minio:latest
+    image: ${FATHOM_MINIO_IMAGE:-cgr.dev/chainguard/minio:latest}
     command: server /data
     environment:
       MINIO_ROOT_USER: fathom
       MINIO_ROOT_PASSWORD: fathom-secret
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/9000 && printf "GET /minio/health/live HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3 && read -r status <&3 && [[ $$status == *" 200 "* ]]'
       interval: 2s
       timeout: 2s
       retries: 30
 
   minio-init:
-    image: minio/mc
+    image: ${FATHOM_MINIO_IMAGE:-cgr.dev/chainguard/minio:latest}
     depends_on:
       minio:
         condition: service_healthy
+    environment:
+      # The image runs as uid 65532 with no writable home; give mc a config dir it can write.
+      MC_CONFIG_DIR: /tmp/.mc
     entrypoint: >
-      /bin/sh -c "mc alias set local http://minio:9000 fathom fathom-secret &&
-                  mc mb -p local/fathom-shards"
+      bash -c "mc alias set local http://minio:9000 fathom fathom-secret &&
+               mc mb -p local/fathom-shards"
 
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:2.12.0
