@@ -22,11 +22,19 @@ BUCKET="${FATHOM_S3_TEST_BUCKET:-fathom-shards-test}"
 ACCESS_KEY="${FATHOM_S3_TEST_ACCESS_KEY:-fathomtest}"
 SECRET_KEY="${FATHOM_S3_TEST_SECRET_KEY:-fathomtest123}"
 
-# Pull MinIO from quay.io, not Docker Hub. Anonymous Docker Hub pulls are rate-limited / access-
-# denied on GitHub-hosted runners ("pull access denied for minio/minio"), which fails this step
-# before a single test runs. MinIO publishes the identical image to quay.io, which has no such wall.
-# Override with FATHOM_MINIO_IMAGE if you need a pinned tag or a private mirror.
+# Pull MinIO for the :s3 suite. NEITHER public registry is reliably pullable anonymously on
+# GitHub-hosted runners, so this tries a PRIMARY and falls back to the OTHER, failing only if BOTH
+# refuse:
+#   - Docker Hub (minio/minio) rate-limits / denies anonymous pulls from shared runner IPs
+#     ("pull access denied for minio/minio") — this is why the step originally used quay.io.
+#   - quay.io (quay.io/minio/minio) then began returning "unauthorized: access to the requested
+#     resource is not authorized" for :latest (observed 2026-09-29), failing `docker run` with a
+#     cryptic exit 125 before any test ran.
+# The identical image is published to both, so whichever the runner can currently read is fine.
+# FATHOM_MINIO_IMAGE overrides the primary (a pinned tag or a private mirror); the last-resort fix if
+# both are walled is registry auth (docker/login-action) or a mirror the runner can read.
 MINIO_IMAGE="${FATHOM_MINIO_IMAGE:-quay.io/minio/minio:latest}"
+MINIO_IMAGE_FALLBACK="${FATHOM_MINIO_IMAGE_FALLBACK:-minio/minio:latest}"
 
 KEEP=0
 [ "${1:-}" = "--keep" ] && KEEP=1
@@ -35,6 +43,22 @@ cleanup() { [ "$KEEP" = "1" ] || docker rm -f "$NAME" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
+
+# Resolve the image up front: a registry refusal is a clear message HERE, not a cryptic `docker run`
+# exit 125 mid-step (the failure that had this step red on 2026-09-27..29). Try the primary, fall
+# back to the other registry, fail the step only if BOTH refuse.
+if ! docker pull "$MINIO_IMAGE" >/dev/null 2>&1; then
+  echo "MinIO pull failed for ${MINIO_IMAGE}; falling back to ${MINIO_IMAGE_FALLBACK}" >&2
+  if docker pull "$MINIO_IMAGE_FALLBACK" >/dev/null 2>&1; then
+    MINIO_IMAGE="$MINIO_IMAGE_FALLBACK"
+  else
+    echo "both MinIO registries refused the pull (${MINIO_IMAGE} and ${MINIO_IMAGE_FALLBACK})." >&2
+    echo "The :s3 suite cannot run without the image. Add registry auth (docker/login-action) or" >&2
+    echo "point FATHOM_MINIO_IMAGE at a mirror the runner can read." >&2
+    exit 1
+  fi
+fi
+
 docker run -d --name "$NAME" \
   -p "${API_PORT}:9000" -p "${CONSOLE_PORT}:9001" \
   -e MINIO_ROOT_USER="$ACCESS_KEY" \
