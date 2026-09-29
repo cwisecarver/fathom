@@ -22,19 +22,24 @@ BUCKET="${FATHOM_S3_TEST_BUCKET:-fathom-shards-test}"
 ACCESS_KEY="${FATHOM_S3_TEST_ACCESS_KEY:-fathomtest}"
 SECRET_KEY="${FATHOM_S3_TEST_SECRET_KEY:-fathomtest123}"
 
-# Pull MinIO for the :s3 suite. NEITHER public registry is reliably pullable anonymously on
-# GitHub-hosted runners, so this tries a PRIMARY and falls back to the OTHER, failing only if BOTH
-# refuse:
-#   - Docker Hub (minio/minio) rate-limits / denies anonymous pulls from shared runner IPs
-#     ("pull access denied for minio/minio") — this is why the step originally used quay.io.
-#   - quay.io (quay.io/minio/minio) then began returning "unauthorized: access to the requested
-#     resource is not authorized" for :latest (observed 2026-09-29), failing `docker run` with a
-#     cryptic exit 125 before any test ran.
-# The identical image is published to both, so whichever the runner can currently read is fine.
-# FATHOM_MINIO_IMAGE overrides the primary (a pinned tag or a private mirror); the last-resort fix if
-# both are walled is registry auth (docker/login-action) or a mirror the runner can read.
-MINIO_IMAGE="${FATHOM_MINIO_IMAGE:-quay.io/minio/minio:latest}"
-MINIO_IMAGE_FALLBACK="${FATHOM_MINIO_IMAGE_FALLBACK:-minio/minio:latest}"
+# WHERE MinIO COMES FROM (rewritten 2026-09-29). Upstream MinIO stopped publishing its community
+# Docker images in late 2025: `minio/minio` on Docker Hub now answers "repository does not exist",
+# and `quay.io/minio/minio` answers 401 — from a laptop as well as from GitHub runners, so this is
+# not a rate limit and no amount of registry juggling brings them back. (This step was red from
+# 2026-09-27 for exactly that reason; an earlier comment here blamed Docker Hub rate limits, which
+# was the right diagnosis once and stopped being the whole story.)
+#
+# The replacement is Chainguard's MinIO, rebuilt from source and multi-arch (amd64 + arm64). The
+# full :s3 suite (26 tests, including the conditional-write lease fence) passes against it. It is
+# MIRRORED into this project's own registry so an upstream policy change cannot break CI again:
+#   primary:  ghcr.io/cwisecarver/minio:latest   (mirror; also tagged 2026-09-29)
+#   fallback: cgr.dev/chainguard/minio:latest    (the source of the mirror; anonymous pulls)
+# Refresh the mirror with:
+#   docker buildx imagetools create --tag ghcr.io/cwisecarver/minio:latest \
+#     --tag ghcr.io/cwisecarver/minio:$(date +%F) cgr.dev/chainguard/minio:latest
+# FATHOM_MINIO_IMAGE / FATHOM_MINIO_IMAGE_FALLBACK override either.
+MINIO_IMAGE="${FATHOM_MINIO_IMAGE:-ghcr.io/cwisecarver/minio:latest}"
+MINIO_IMAGE_FALLBACK="${FATHOM_MINIO_IMAGE_FALLBACK:-cgr.dev/chainguard/minio:latest}"
 
 KEEP=0
 [ "${1:-}" = "--keep" ] && KEEP=1
@@ -46,7 +51,7 @@ docker rm -f "$NAME" >/dev/null 2>&1 || true
 
 # Resolve the image up front: a registry refusal is a clear message HERE, not a cryptic `docker run`
 # exit 125 mid-step (the failure that had this step red on 2026-09-27..29). Try the primary, fall
-# back to the other registry, fail the step only if BOTH refuse.
+# back to the other source, fail the step only if BOTH refuse.
 if ! docker pull "$MINIO_IMAGE" >/dev/null 2>&1; then
   echo "MinIO pull failed for ${MINIO_IMAGE}; falling back to ${MINIO_IMAGE_FALLBACK}" >&2
   if docker pull "$MINIO_IMAGE_FALLBACK" >/dev/null 2>&1; then
