@@ -920,10 +920,39 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
+  # SYNCHRONOUS: wait for the watchdog to be gone (expert review 2026-09-29 #33). With pooling the
+  # handle is handed to ANOTHER stream right after this, and a watchdog that fired on this stream's
+  # last query can still be between its retry timer and `Sqlite3.cancel/1` when `{:done, ref}` is
+  # sent — a fire-and-forget `:stop` let that cancel land on the NEXT stream's running statement: a
+  # SQLITE_INTERRUPT on an unrelated request, not even mapped to FILO_QUERY_TIMEOUT (that stream
+  # never armed the ref). The watchdog handles its mailbox in order, so once it has exited every
+  # cancel it issued has returned, and a returned cancel cannot touch a later statement (exqlite
+  # resets its flag at the next op; `sqlite3_interrupt` with nothing running is a no-op).
+  #
+  # Cheap: an idle watchdog is blocked in `receive`, so this is one message round trip, paid only
+  # when `:query_timeout_ms` is set. Bounded: a watchdog mid-`await_disarm` sees `{:done, ref}`
+  # within @cancel_retry_ms; past @watchdog_stop_ms it is killed rather than waited on.
+  @watchdog_stop_ms 1_000
+
   defp stop_watchdog(conn) do
     case Process.delete({__MODULE__, :watchdog, conn}) do
-      nil -> :ok
-      pid -> send(pid, :stop)
+      nil ->
+        :ok
+
+      pid ->
+        mon = Process.monitor(pid)
+        send(pid, :stop)
+
+        receive do
+          {:DOWN, ^mon, :process, _, _} -> :ok
+        after
+          @watchdog_stop_ms ->
+            Process.exit(pid, :kill)
+
+            receive do
+              {:DOWN, ^mon, :process, _, _} -> :ok
+            end
+        end
     end
 
     :ok

@@ -74,6 +74,37 @@ defmodule Fathom.ConnectionWatchdogTest do
            "the watchdog leaked {:timed_out, ref} into the owner's mailbox"
   end
 
+  # Expert review 2026-09-29 #33. With pooling, release_owner_state/1 is the last thing a stream
+  # does before its handle goes to ANOTHER stream. A watchdog that fired on this stream's last query
+  # can still be about to call `Sqlite3.cancel/1`, and a fire-and-forget `:stop` let that late cancel
+  # interrupt the next stream's statement. Invariant: when release_owner_state/1 returns, the
+  # watchdog is dead, so nothing can cancel the handle after handoff.
+  #
+  # The race itself is scheduler-timed, so the test makes the watchdog SLOW instead: it is suspended
+  # (standing in for "not yet scheduled to process :stop") and resumed 50 ms later. Pre-fix,
+  # release_owner_state/1 returned at once with the watchdog still alive; now it waits it out.
+  test "release_owner_state/1 returns only once the watchdog is gone (pooled handoff)",
+       %{conn: conn} do
+    Application.put_env(:fathom, :query_timeout_ms, 5_000)
+    assert {:ok, _} = Connection.query(conn, "SELECT 1", [])
+
+    watchdog = Process.get({Connection, :watchdog, conn})
+    assert is_pid(watchdog), "the query did not start a watchdog to test"
+
+    true = :erlang.suspend_process(watchdog)
+    on_exit(fn -> if Process.alive?(watchdog), do: :erlang.resume_process(watchdog) end)
+
+    spawn(fn ->
+      Process.sleep(50)
+      :erlang.resume_process(watchdog)
+    end)
+
+    :ok = Connection.release_owner_state(conn)
+
+    refute Process.alive?(watchdog),
+           "the watchdog outlived the handoff, so a late cancel can hit the next stream"
+  end
+
   test "a stale timeout message is swept by the next guarded query", %{conn: conn} do
     # Deterministic where the race is not: inject exactly the residue the race produces, then run
     # one ordinary guarded query and assert the mailbox came back clean. Fails without the sweep.
