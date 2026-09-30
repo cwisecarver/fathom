@@ -704,4 +704,75 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     # over the fresher local and this returned 1..7.
     assert open_and_read(id) == Enum.to_list(1..10)
   end
+
+  # Expert review 2026-09-29 #10. `warm?` is decided BEFORE the lease; revalidation can then find the
+  # object MOVED (here: another owner flushed in the gap between our fork check and our acquire — the
+  # 2026-09-05 #19 release-in-gap case), quarantine the local file and RE-PULL. The file is then an
+  # ordinary cold pull, but the stale `warm? = true` still reached promote-on-open, whose warm skip
+  # (2026-09-18 #1) declined — so a peer replica holding acked writes the object lacks was ignored.
+  #
+  # FIXTURE NOTE: the "other owner" re-flushes the object under the SAME position stamp, so the peer
+  # replica (ranked just past that stamp) is still the fresher copy. That is a convenience to make the
+  # promote decision deterministic; what this pins is only that a re-pulled open is treated as COLD.
+  test "a warm open that revalidation re-pulled is cold, and promotion runs (#10)", ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    on_exit(fn -> Application.delete_env(:fathom, :faulty_before) end)
+
+    {conn, coordinator} = build_shard(id, 7, 3)
+    assert {:ok, stamp} = Storage.object_position(id)
+    refute is_nil(stamp)
+
+    install_replica(id, %{
+      epoch: stamp.epoch,
+      wal_gen: stamp.wal_gen,
+      wal_ordinal: stamp.wal_ordinal,
+      offset: stamp.offset + 1
+    })
+
+    # The "other owner's" flush: the object's rows plus one it wrote (so the bytes — and the Local
+    # backend's content-hash etag — genuinely change).
+    moved = Path.join(ctx.dir, "moved.db")
+    assert {:ok, _} = Storage.pull(id, moved)
+    {:ok, mconn} = Fathom.Shard.Connection.open(moved)
+    {:ok, _} = Fathom.Shard.Connection.query(mconn, "INSERT INTO t VALUES (100)", [])
+    Fathom.Shard.Connection.close(mconn)
+
+    kill_primary_keep_disk(conn, coordinator)
+    assert File.exists?(Fathom.Shard.db_path(id)), "precondition: the local file was not kept"
+
+    # Let the pre-lease fork check read the object unchanged (so the open is judged WARM), then move
+    # the object before the post-lease re-check reads it.
+    calls = :counters.new(1, [])
+
+    Application.put_env(
+      :fathom,
+      :faulty_before,
+      {:object_etag,
+       fn sid ->
+         if sid == id do
+           :counters.add(calls, 1, 1)
+
+           if :counters.get(calls, 1) == 2 do
+             {:ok, current} = Fathom.Shard.Storage.Local.object_etag(id)
+
+             {:ok, _, _} =
+               Fathom.Shard.Storage.Local.flush(id, moved, current, stamp, stamp.epoch)
+           end
+         end
+
+         :ok
+       end}
+    )
+
+    rows = open_and_read(id)
+
+    assert :counters.get(calls, 1) >= 2,
+           "fixture: the post-lease warm re-check never ran, so the object never moved"
+
+    assert rows == Enum.to_list(1..7),
+           "a warm open that revalidation RE-PULLED skipped promotion as if still warm: served " <>
+             "#{inspect(rows)} instead of the peer replica's acked rows"
+  end
 end

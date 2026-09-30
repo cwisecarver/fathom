@@ -654,7 +654,8 @@ defmodule Fathom.Shard do
 
   defp open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen) do
     with {:ok, etag0} <- Materializer.await_pull(pull_task, path, shard_id),
-         {:ok, etag1} <- revalidate_takeover(shard_id, path, lease, etag0, warm?) do
+         {verdict, etag1} when verdict in [:ok, :repulled] <-
+           revalidate_takeover(shard_id, path, lease, etag0, warm?) do
       # NOT a `with` clause, and returning a bare etag rather than `{:ok, etag}`. Both are for the
       # same measured reason: `handle_continue/2` garbage-collects this coordinator early to shrink
       # its init high-water mark, so ANY allocation after that point stays resident for the shard's
@@ -668,7 +669,22 @@ defmodule Fathom.Shard do
       # later flush of this coordinator stamp the SAME lineage — they are one ownership. See
       # open_lineage/1 for why it is read once and never recomputed.
       lineage = open_lineage(shard_id)
-      promoted = PromoteOnOpen.maybe_promote_replica(shard_id, path, lease, etag1, lineage, warm?)
+      # `warm?` was decided BEFORE the lease was held. Revalidation can then quarantine that local
+      # file and RE-PULL the object (a fork, a moved object), after which the file is an ordinary
+      # cold pull — and promote-on-open's warm skip (2026-09-18 #1, "never promote a peer over a
+      # warm local") no longer has a warm local to protect. Passing the stale `true` suppressed the
+      # promotion that exists for exactly this case: a peer's acked-but-unflushed writes the object
+      # lacks (expert review 2026-09-29 #10).
+      promoted =
+        PromoteOnOpen.maybe_promote_replica(
+          shard_id,
+          path,
+          lease,
+          etag1,
+          lineage,
+          warm? and verdict == :ok
+        )
+
       etag = PromoteOnOpen.etag_of(promoted)
 
       # Arm the coalesced idle timer at open too (expert review 2026-08-31 #13). It used to be
@@ -1019,15 +1035,23 @@ defmodule Fathom.Shard do
     end
   end
 
+  # Answers `{:repulled, etag}` rather than `{:ok, etag}` so the open knows the local file it
+  # judged warm has been REPLACED by the object's bytes (expert review 2026-09-29 #10).
   defp repull(shard_id, path) do
-    case Storage.pull(shard_id, Materializer.pull_temp(path)) do
-      # `promote_pull/2` already distinguishes the two by checking whether the temp exists, so
-      # both shapes route through it: bytes ⇒ promote + stamp the object's etag as provenance;
-      # no bytes ⇒ the born-empty branch, which stamps the "no object" sentinel sidecar. The
-      # fence etag is carried through either way (expert review 2026-08-01 #24).
-      {:ok, new_etag} -> Materializer.promote_pull(path, new_etag)
-      {:absent, new_etag} -> Materializer.promote_pull(path, new_etag)
-      {:error, reason} -> {:error, {:revalidate_failed, reason}}
+    result =
+      case Storage.pull(shard_id, Materializer.pull_temp(path)) do
+        # `promote_pull/2` already distinguishes the two by checking whether the temp exists, so
+        # both shapes route through it: bytes ⇒ promote + stamp the object's etag as provenance;
+        # no bytes ⇒ the born-empty branch, which stamps the "no object" sentinel sidecar. The
+        # fence etag is carried through either way (expert review 2026-08-01 #24).
+        {:ok, new_etag} -> Materializer.promote_pull(path, new_etag)
+        {:absent, new_etag} -> Materializer.promote_pull(path, new_etag)
+        {:error, reason} -> {:error, {:revalidate_failed, reason}}
+      end
+
+    case result do
+      {:ok, etag} -> {:repulled, etag}
+      other -> other
     end
   end
 

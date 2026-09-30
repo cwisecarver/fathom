@@ -327,7 +327,8 @@ defmodule Fathom.Test.FaultyStorage do
   # release entirely and stranded the lock. See the guard in `Fathom.Shard.handle_continue/2`.
   @impl true
   def object_etag(shard_id) do
-    run_before(:object_etag)
+    # Handed the shard id (a 1-arity hook) so a test can act on ITS shard only; 0-arity still works.
+    run_before(:object_etag, shard_id)
     Local.object_etag(shard_id)
   end
 
