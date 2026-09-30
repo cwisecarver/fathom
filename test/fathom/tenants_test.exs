@@ -116,6 +116,18 @@ defmodule Fathom.TenantsTest do
       :ok = Exqlite.Sqlite3.close(db)
     end
 
+    # Expert review 2026-09-29 #21 — the export half: pre-fix this returns the erased tenant's data.
+    test "refuses to export a DELETED tenant during the erase window", %{id: id} do
+      {:ok, _} = Directory.resolve(id)
+      write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('erase-me')"])
+      flush!(id)
+      assert {:ok, _} = Tenants.delete(id)
+      assert {:ok, etag} = Storage.object_etag(id)
+      refute is_nil(etag), "fixture: the object is already erased, so this is not the window"
+
+      assert {:error, :not_stored} = Tenants.export(id)
+    end
+
     test "not_stored for a shard that was never flushed", %{id: id} do
       assert {:error, :not_stored} = Tenants.export(id)
     end
@@ -241,6 +253,22 @@ defmodule Fathom.TenantsTest do
     test "refuses a source with no stored object", %{id: src, dst: dst} do
       {:ok, _} = Directory.resolve(src)
       assert {:error, :no_source} = Tenants.fork(src, dst)
+    end
+
+    # Expert review 2026-09-29 #21: delete tombstones synchronously and erases asynchronously, and
+    # in that window fork copied the still-present object into a NEW live tenant with a fresh :rw
+    # token — a deleted tenant resurrected outside every erasure guarantee. Pre-fix this forks.
+    test "refuses a DELETED source during the erase window", %{id: src, dst: dst} do
+      {:ok, _} = Directory.resolve(src)
+      write!(src, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('erase-me')"])
+      flush!(src)
+      assert {:ok, _} = Tenants.delete(src)
+
+      assert {:ok, etag} = Storage.object_etag(src)
+      refute is_nil(etag), "fixture: the object is already erased, so this is not the window"
+
+      assert {:error, :no_source} = Tenants.fork(src, dst)
+      assert {:ok, nil} = Storage.object_etag(dst), "the deleted tenant was cloned"
     end
 
     # Expert review 2026-07-18 #14: refuse_if_taken (a directory check) then an unconditional

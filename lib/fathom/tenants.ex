@@ -258,6 +258,7 @@ defmodule Fathom.Tenants do
           {:ok, %{path: Path.t(), filename: String.t()}} | {:error, term()}
   def export(shard_id, opts \\ []) do
     with {:ok, id} <- cast(shard_id),
+         :ok <- refuse_if_erased(id),
          :ok <- maybe_flush_export(id, opts) do
       tmp =
         Path.join(
@@ -496,10 +497,25 @@ defmodule Fathom.Tenants do
 
   defp fetch_src(src) do
     case Directory.get(src) do
-      {:ok, row} -> {:ok, row}
+      {:ok, row} -> if erased?(src, row), do: {:error, :no_source}, else: {:ok, row}
       :error -> {:error, :no_source}
     end
   end
+
+  # A DELETED TENANT IS NOT A SOURCE (expert review 2026-09-29 #21). `delete/1` tombstones
+  # synchronously but erases asynchronously (DeleteJob, with retries and backoff), so for that whole
+  # window the stored object is still there — and fork copied it into a NEW live tenant with a fresh
+  # `:rw` token, and export handed it out, both outside every deletion guarantee. The tombstone set
+  # is checked as well as the row, since it is the durable guard that survives a directory restore.
+  # A SUSPENDED source is deliberately still allowed — whether an offline tenant may be forked or
+  # exported is a policy question recorded in the audit log, not decided here.
+  defp erased?(id, row), do: row.status == "deleted" or Tombstones.tombstoned?(id)
+
+  # Export checks nothing but the tombstone set — no directory read. `delete/1` puts the tombstone on the
+  # deleting node synchronously and NOTIFYs the rest of the fleet, so the set is the authority here;
+  # a Postgres read would add a control-plane dependency to a path that otherwise needs none.
+  defp refuse_if_erased(id),
+    do: if(Tombstones.tombstoned?(id), do: {:error, :not_stored}, else: :ok)
 
   # Register the fork's directory row AT the source's schema version — critical so the laggard sweep
   # doesn't see the fork at v0 and replay a migration onto its already-vN copy (the #7/#8 quarantine
