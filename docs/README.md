@@ -110,6 +110,10 @@ what actually shipped (some plan assumptions were superseded).
   locality/affinity (C). *Scoping — but A2 and B were BUILT, **A1 (warm standby) was built and then
   REMOVED 2026-09-14** (superseded by A2), and only C1/C2 are unbuilt. Read it for the reasoning
   that chose the order, not for what is left.*
+- **[object-store-alternatives.md](object-store-alternatives.md)** — replacing MinIO (upstream
+  unmaintained since 2026-02) for local + CI. *Tabled 2026-09-30 — Chainguard's MinIO works for now.*
+  Records the candidates, the conditional-write requirement that rules Garage out, and the probe to
+  run before switching.
 - **[a2-bare-metal-plan.md](a2-bare-metal-plan.md)** — **the one plan here that has NOT been run.**
   Every A2 number on record comes from five nodes sharing one 12-vCPU VM; this measures whether the
   ≤256-tenant replication ceiling belongs to fathom or to the rig. Blocked on hardware.
