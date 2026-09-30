@@ -292,6 +292,50 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     assert Enum.any?(snapshots, &String.contains?(snapshot_id(&1), "pre-promotion"))
   end
 
+  # Expert review 2026-09-29 #9. The promotion published the object with a NIL position stamp: the
+  # temp is checkpointed and closed, so its WAL is empty, and the synthetic state had no ordinal to
+  # seed from. `fresher?(_, nil)` is false, so a SECOND failover before this owner's first dirty
+  # flush could promote nothing — its quorum-acked writes died with it. Pre-fix `object_position`
+  # reads `{:ok, nil}` here, and the coordinator's counter restarts at 0 (its first WAL would rank
+  # BELOW any stamp at the replica's ordinal).
+  test "a promoted object is position-stamped, and the new owner numbers its WAL above it", ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+
+    {conn, coordinator} = build_shard(id, 10, 3)
+    assert {:ok, stamp} = Storage.object_position(id)
+    refute is_nil(stamp)
+
+    replica_ordinal = stamp.wal_ordinal
+
+    install_replica(id, %{
+      epoch: stamp.epoch,
+      wal_gen: stamp.wal_gen,
+      wal_ordinal: replica_ordinal,
+      offset: stamp.offset + 1
+    })
+
+    tear_down_primary(id, conn, coordinator)
+    assert open_and_read(id) == Enum.to_list(1..10), "precondition: the promotion did not fire"
+
+    assert {:ok, %{wal_ordinal: promoted_ord} = promoted} = Storage.object_position(id),
+           "the promoted object carries no position stamp, so no later failover can promote"
+
+    assert promoted_ord == replica_ordinal + 1
+
+    assert Promote.fresher?(
+             %{lineage: promoted.epoch, wal_ordinal: replica_ordinal, next_offset: 1_000_000},
+             promoted
+           ) == false,
+           "a replica still at the promoted ordinal must not outrank the object it became"
+
+    {:ok, new_owner} = Shards.ensure(id)
+
+    assert Fathom.Shard.wal_ordinal(new_owner, 123_456_789) > promoted_ord,
+           "the new owner's first WAL numbers at or below the promoted stamp, so its own " <>
+             "quorum-acked frames can never be promoted over it"
+  end
+
   defp snapshot_id(%{id: id}), do: id
   defp snapshot_id(id) when is_binary(id), do: id
   defp snapshot_id(other), do: inspect(other)

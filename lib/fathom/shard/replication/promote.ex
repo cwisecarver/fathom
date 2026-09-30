@@ -265,8 +265,10 @@ defmodule Fathom.Shard.Replication.Promote do
       # against it (`fresher?(_replica, nil) == false`), so the freshly-published object can NEVER be
       # overridden by a replica — the SAFE direction, not a rollback. The only cost is that a future
       # failover of THIS shard cannot use replica-promotion (it falls back to an S3 pull); the
-      # cold-open path (`Fathom.Shard.promote_replica/7`) stamps position+lineage precisely to keep
-      # replica-promotion available for the shards it opens. If `promote/2` is ever wired into a
+      # cold-open path (`Fathom.Shard.PromoteOnOpen.promote_replica/7`) stamps position+lineage to
+      # keep replica-promotion available for the shards it opens — as of expert review 2026-09-29
+      # #9; before that it ALSO published a nil stamp, despite this comment saying otherwise. If
+      # `promote/2` is ever wired into a
       # production/operator path where that failover matters, thread the replica's lineage through
       # and stamp with the 5-arity flush — but do NOT "fix" the nil stamp into carrying the
       # pre-promotion object's stamp, which is the actual rollback bug the audit imagined.

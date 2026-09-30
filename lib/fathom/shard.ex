@@ -668,7 +668,8 @@ defmodule Fathom.Shard do
       # later flush of this coordinator stamp the SAME lineage — they are one ownership. See
       # open_lineage/1 for why it is read once and never recomputed.
       lineage = open_lineage(shard_id)
-      etag = PromoteOnOpen.maybe_promote_replica(shard_id, path, lease, etag1, lineage, warm?)
+      promoted = PromoteOnOpen.maybe_promote_replica(shard_id, path, lease, etag1, lineage, warm?)
+      etag = PromoteOnOpen.etag_of(promoted)
 
       # Arm the coalesced idle timer at open too (expert review 2026-08-31 #13). It used to be
       # armed ONLY when the last connection checked back in, on the assumption "a coordinator is
@@ -789,7 +790,9 @@ defmodule Fathom.Shard do
         # disagreed about which ordinal a WAL has, the object and its replicas would be on
         # different scales. Serializing through the single writer is what makes them agree; the
         # Session caches the answer and only asks again when the salt changes, which is rare.
-        wal_ordinal: 0,
+        # Seeded past a promoted replica's ordinal (expert review 2026-09-29 #9) — see
+        # `PromoteOnOpen.seed_ordinal_of/1`. 0 on every open that did not promote.
+        wal_ordinal: PromoteOnOpen.seed_ordinal_of(promoted),
         wal_salt: nil,
         # WHAT THE STORED OBJECT'S LINEAGE METADATA IS, cached from the last fenced flush's report
         # (expert review 2026-08-26 #33). `nil` = unknown, ask the backend; an integer or `:none` =

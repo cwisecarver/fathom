@@ -31,7 +31,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
   alias Fathom.Shard.Storage
 
   @spec maybe_promote_replica(String.t(), Path.t(), map(), String.t() | nil, term(), boolean()) ::
-          String.t() | nil | {:error, term()}
+          String.t() | nil | {:error, term()} | {:promoted, String.t(), pos_integer()}
   def maybe_promote_replica(shard_id, path, lease, etag, lineage, warm?) do
     cond do
       # A WARM open means the coordinator has ALREADY decided this node's local file is the bytes to
@@ -75,6 +75,29 @@ defmodule Fathom.Shard.PromoteOnOpen do
   end
 
   defp follower_running?, do: Process.whereis(Follower) != nil
+
+  @doc """
+  The etag to serve from, given what `maybe_promote_replica/6` returned.
+
+  A promotion that stated an ordinal answers `{:promoted, etag, seed}`; every other outcome is the
+  etag itself. Unwrapped with two pattern-matching accessors rather than a tuple on every open, so
+  the (overwhelmingly common) no-promotion path allocates nothing new — see the note at the call
+  site in `Fathom.Shard` about per-open allocations staying resident.
+  """
+  @spec etag_of(term()) :: term()
+  def etag_of({:promoted, etag, _seed}), do: etag
+  def etag_of(etag), do: etag
+
+  @doc """
+  The WAL ordinal a coordinator must start its counter from after a promotion, or 0.
+
+  See `promote_replica/7`: the promoted object is stamped at the replica's ordinal + 1, so this
+  coordinator's first WAL must number ABOVE it — or its own quorum-acked frames rank below the
+  object it just published and can never be promoted if it dies before its first flush.
+  """
+  @spec seed_ordinal_of(term()) :: non_neg_integer()
+  def seed_ordinal_of({:promoted, _etag, seed}), do: seed
+  def seed_ordinal_of(_etag), do: 0
 
   # TWO PATHS, and the split is about what a cold open is allowed to pay for.
   #
@@ -259,7 +282,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
                shard_id,
                temp,
                etag,
-               Position.flush_position(%{lease: lease, path: temp, lineage: lineage}),
+               Position.flush_position(promoted_stamp_state(lease, temp, lineage, replica)),
                Position.lineage_to_store(lineage)
              ) do
         case File.rename(temp, path) do
@@ -280,7 +303,10 @@ defmodule Fathom.Shard.PromoteOnOpen do
               %{shard_id: shard_id, epoch: lease.epoch}
             )
 
-            new_etag
+            case replica_ordinal(replica) do
+              0 -> new_etag
+              n -> {:promoted, new_etag, n + 1}
+            end
 
           {:error, reason} ->
             # The ONE failure here that cannot be shrugged off: the object is now the replica while
@@ -303,6 +329,27 @@ defmodule Fathom.Shard.PromoteOnOpen do
       Enum.each(["", "-wal", "-shm"], &File.rm(temp <> &1))
     end
   end
+
+  # THE PROMOTED OBJECT GETS A POSITION STAMP (expert review 2026-09-29 #9). The temp has been
+  # checkpointed and closed, so its WAL reads `:empty`, and a synthetic state with no `:wal_ordinal`
+  # fell through `Position.position_after_checkpoint/3` to `nil` — every promotion published an
+  # object `Promote.fresher?/2` cannot rank against, so a SECOND failover before this coordinator's
+  # first dirty flush could not promote anything, and this owner's quorum-acked writes were lost with
+  # it. Carrying the replica's own ordinal takes the seed-on-known-short clause: the object is stamped
+  # `{lineage, ordinal + 1, 0}`, strictly above every replica still at that ordinal (the object holds
+  # all of it — it IS that replica, folded). `seed_ordinal_of/1` then starts this coordinator's
+  # counter at `ordinal + 1`, so its first WAL numbers `ordinal + 2` and its own frames rank above
+  # the stamp — which matters because in the canonical failover the new owner's lineage EQUALS the
+  # replica's (expert review 2026-09-29 #3), so the ordinal is the only component that separates them.
+  defp promoted_stamp_state(lease, temp, lineage, replica) do
+    case replica_ordinal(replica) do
+      0 -> %{lease: lease, path: temp, lineage: lineage}
+      n -> %{lease: lease, path: temp, lineage: lineage, wal_ordinal: n}
+    end
+  end
+
+  defp replica_ordinal(%{wal_ordinal: n}) when is_integer(n) and n > 0, do: n
+  defp replica_ordinal(_replica), do: 0
 
   # Best-effort, and deliberately not fatal: a shard with no stored object yet has nothing to
   # snapshot, and a snapshot backend hiccup should not block a recovery that is otherwise sound.
