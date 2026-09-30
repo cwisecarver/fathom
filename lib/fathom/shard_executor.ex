@@ -1484,7 +1484,7 @@ defmodule Fathom.ShardExecutor do
   # `wal_checkpoint` is a maintenance operation, not a safety defeat — it is the same
   # checkpoint the coordinator runs after each snapshot, and fathom's own durability tests
   # drive it through this path.
-  @tenant_pragma_allow ~w(foreign_keys defer_foreign_keys legacy_alter_table busy_timeout
+  @tenant_pragma_allow ~w(foreign_keys defer_foreign_keys legacy_alter_table
                           cache_size temp_store recursive_triggers ignore_check_constraints
                           case_sensitive_like automatic_index reverse_unordered_selects
                           analysis_limit threads user_version application_id
@@ -1502,7 +1502,17 @@ defmodule Fathom.ShardExecutor do
   # checked BEFORE `extra_pragma_allow()` — keeps a `:tenant_pragma_allow` config from widening a
   # tenant back into turning the floor off, and keeps the tenant from re-enabling `writable_schema`
   # to hand the node a hostile schema.
-  @tenant_pragma_deny ~w(query_only writable_schema trusted_schema cell_size_check)
+  #
+  # `busy_timeout` is DENIED, not merely un-allowed (expert review 2026-09-29 #4). SQLite routes
+  # `PRAGMA busy_timeout=N` to `sqlite3_busy_timeout()`, which REPLACES exqlite's cancellable busy
+  # handler with the engine default — a bare sleep loop the watchdog's interrupt cannot cut
+  # (2026-07-24 #1, pinned in `query_bounds_test`). That fix removed fathom's own use but left the
+  # pragma on the tenant allow-list, so one tenant could set it huge, hold `BEGIN IMMEDIATE`, and park
+  # a dirty-IO thread per blocked stream uninterruptibly; ten of them (`+SDio 10`) stall every
+  # co-resident tenant's SQLite call. It also outlived the stream on a pooled handle, since
+  # `reset_for_reuse`'s `set_busy_timeout` does not reinstall the handler. On the deny list so a
+  # `:tenant_pragma_allow` config cannot re-open it either. The bare read form stays allowed.
+  @tenant_pragma_deny ~w(query_only writable_schema trusted_schema cell_size_check busy_timeout)
 
   # SQLite spells an argument-taking READ the same way it spells a setter — `PRAGMA
   # table_info(t)` and `PRAGMA journal_mode(delete)` are syntactically identical — so the

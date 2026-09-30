@@ -114,6 +114,43 @@ defmodule Fathom.QueryBoundsTest do
     :ok = ShardExecutor.close(holder)
   end
 
+  # Expert review 2026-09-29 #4: the fix above removed FATHOM's use of `PRAGMA busy_timeout`, but the
+  # pragma stayed on the tenant allow-list — so a tenant could reinstall the uncancellable handler on
+  # its own stream and every lock wait on it went back to sleeping the full timeout on a dirty-IO
+  # thread (node-wide starvation with ten such streams). Pre-fix the pragma is accepted and the
+  # blocked write sleeps ~3s; post-fix the pragma is refused and the write still times out at the
+  # deadline.
+  test "a tenant cannot reinstall the uncancellable busy handler with PRAGMA busy_timeout", %{
+    shard: shard
+  } do
+    seed!(shard, ["CREATE TABLE t (v INTEGER)"])
+
+    {:ok, holder} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(holder, stmt("BEGIN IMMEDIATE"))
+    {:ok, _} = ShardExecutor.execute(holder, stmt("INSERT INTO t VALUES (1)"))
+
+    Application.put_env(:fathom, :query_timeout_ms, 200)
+    {:ok, blocked} = ShardExecutor.open(shard)
+
+    assert {:error, %Filo.Error{code: "FILO_PRAGMA_BLOCKED"}} =
+             ShardExecutor.execute(blocked, stmt("PRAGMA busy_timeout = 3000"))
+
+    # The bare read form is still allowed — it only discloses this connection's own setting.
+    assert {:ok, _} = ShardExecutor.execute(blocked, stmt("PRAGMA busy_timeout"))
+
+    {elapsed_us, result} =
+      :timer.tc(fn -> ShardExecutor.execute(blocked, stmt("INSERT INTO t VALUES (2)")) end)
+
+    assert {:error, %Filo.Error{status: 503, code: "FILO_QUERY_TIMEOUT"}} = result
+
+    assert elapsed_us < 2_000_000,
+           "the lock wait ignored the deadline (#{div(elapsed_us, 1000)}ms)"
+
+    {:ok, _} = ShardExecutor.execute(holder, stmt("ROLLBACK"))
+    :ok = ShardExecutor.close(blocked)
+    :ok = ShardExecutor.close(holder)
+  end
+
   # Expert review 2026-07-24 #8: the prepared-statement cache keyed entries by the caller's SQL
   # binary. filo reads a whole HTTP body / WS frame into one binary and Jason.decode's it, and Jason
   # extracts strings with binary_part/3 — so on any body >64 bytes the "sql" field is a SUB-BINARY

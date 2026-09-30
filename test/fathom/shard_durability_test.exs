@@ -2301,7 +2301,9 @@ defmodule Fathom.ShardDurabilityTest do
 
     # The read form and a connection-local assignment must NOT dirty.
     {:ok, _} = ShardExecutor.execute(conn, stmt("PRAGMA user_version"))
-    {:ok, _} = ShardExecutor.execute(conn, stmt("PRAGMA busy_timeout = 9000"))
+    # `cache_size`, not `busy_timeout`: the latter is DENIED to tenants since expert review
+    # 2026-09-29 #4 (it swaps in an uncancellable busy handler), so it no longer reaches here.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("PRAGMA cache_size = 9000"))
     refute dirty?(shard), "reads and connection-local pragmas must stay clean"
 
     # The durable header write must dirty.
