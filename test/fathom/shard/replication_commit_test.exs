@@ -255,6 +255,107 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     end
   end
 
+  # A heartbeat-mode coordinator with a seeded 3-follower quorum and one acked commit, for the ack
+  # gate tests below. Asserts the mode took — a legacy-mode run would exercise the ungated path.
+  defp heartbeat_session!(ctx) do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+
+    Application.put_env(:fathom, :replication_enabled, true)
+    Application.put_env(:fathom, :replication_quorum, 2)
+
+    Application.put_env(
+      :fathom,
+      :replication_followers,
+      for({_n, port} <- followers, do: {~c"127.0.0.1", port})
+    )
+
+    start_supervised!(Fleet)
+
+    owner = "n_#{System.unique_integer([:positive])}@test"
+    hb = start_supervised!({Fathom.Shard.Heartbeat, ttl_ms: 30_000, owner: owner})
+    _ = :sys.get_state(hb)
+
+    {:ok, coordinator, ref, path} = Shards.checkout(id)
+    on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+    {:ok, conn} = Connection.open(path)
+    on_exit(fn -> Connection.close(conn) end)
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+
+    wal = path <> "-wal"
+    for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0, 0)
+
+    gen = Fathom.Shard.acquire_gen(coordinator)
+    assert is_integer(gen), "the coordinator opened in LEGACY mode — the gate is not exercised"
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    %{id: id, coordinator: coordinator, conn: conn, wal: wal, hb: hb, gen: gen}
+  end
+
+  describe "the ack gate has no bypasses (expert review 2026-09-29 #7/#8)" do
+    # #7: a commit whose frames another commit already shipped plans `:nothing` for every follower,
+    # and that branch replied `:ok` without the ownership gate. So on a zombie owner the FIRST write
+    # was refused (503) while the followers still advanced, and the NEXT commit — with nothing left
+    # to ship — was acked quorum-durable. Pre-fix the second assertion reads `:ok`.
+    test "a commit with nothing left to ship is still gated on ownership", ctx do
+      %{id: id, coordinator: coordinator, conn: conn, wal: wal, hb: hb, gen: gen} =
+        heartbeat_session!(ctx)
+
+      :sys.replace_state(hb, fn s ->
+        Fathom.Shard.Heartbeat.publish_status(%{
+          s
+          | mono_deadline_ms: System.monotonic_time(:millisecond) - 1
+        })
+      end)
+
+      assert Fathom.Shard.Heartbeat.valid_for_write?(gen) == :not_valid
+
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
+      assert {:error, :ownership_unconfirmed} = Session.commit(id, wal, coordinator)
+
+      # The frames went out anyway; this commit has nothing new to ship.
+      assert {:error, :ownership_unconfirmed} = Session.commit(id, wal, coordinator),
+             "a commit that shipped nothing was acked on an owner that cannot confirm the lease"
+    end
+
+    # #8: on `:revalidate` the session re-reads the coordinator's generation, and an EXIT from that
+    # call (the coordinator dead or wedged — e.g. it has just self-fenced and quarantined the write)
+    # was caught as nil and read as "legacy mode, ack best-effort". A suspended coordinator makes the
+    # call time out deterministically. Pre-fix this reads `:ok`.
+    @tag timeout: 60_000
+    test "an unreachable coordinator on revalidate refuses the ack, it does not read as legacy",
+         ctx do
+      Application.put_env(:fathom, :replication_timeout_ms, 15_000)
+      on_exit(fn -> Application.delete_env(:fathom, :replication_timeout_ms) end)
+
+      %{id: id, coordinator: coordinator, conn: conn, wal: wal, hb: hb, gen: gen} =
+        heartbeat_session!(ctx)
+
+      # The generation moved (a lapse), deadline comfortable → `:revalidate`, which makes the
+      # session re-read the coordinator.
+      :sys.replace_state(hb, fn s ->
+        Fathom.Shard.Heartbeat.publish_status(%{
+          s
+          | generation: gen + 1,
+            mono_deadline_ms: System.monotonic_time(:millisecond) + 60_000
+        })
+      end)
+
+      assert Fathom.Shard.Heartbeat.valid_for_write?(gen) == :revalidate
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
+
+      :ok = :sys.suspend(coordinator)
+      on_exit(fn -> if Process.alive?(coordinator), do: :sys.resume(coordinator) end)
+
+      result = Session.commit(id, wal, coordinator)
+      :ok = :sys.resume(coordinator)
+
+      assert {:error, :ownership_unconfirmed} = result,
+             "an unreachable coordinator was read as legacy mode and the write acked durable"
+    end
+  end
+
   # Expert review 2026-09-18 #4. `with_epoch/1` caches `acquire_gen` ONCE for the session's life
   # (it short-circuits on an integer epoch). `ack_if_owned` gates on
   # `Heartbeat.valid_for_write?(acquire_gen)`, which returns `:revalidate` whenever the live fence

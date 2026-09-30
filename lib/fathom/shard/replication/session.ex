@@ -298,8 +298,15 @@ defmodule Fathom.Shard.Replication.Session do
             # `ack_if_owned/1`.
             |> ack_if_owned()
 
+          # NOTHING TO SHIP IS NOT PROOF OF OWNERSHIP (expert review 2026-09-29 #7). Streams commit
+          # concurrently, and one call reads a WAL header that already covers another stream's
+          # frames and ships both. If THAT call's gate refused (a lapsed or zombie owner), the
+          # followers still advanced — and the second stream's commit then plans `:nothing` for
+          # every follower. It used to reply `:ok` straight away, so the first write was refused
+          # and the next was acked quorum-durable by a node that no longer owned the shard. The
+          # frames this commit is acking were shipped by someone; the ownership question is the same.
           :nothing ->
-            {:reply, :ok, state}
+            ack_if_owned(state)
 
           # Out of time mid-catch-up. Answered here rather than falling into the seed-and-retry
           # clause below, because nothing about this is a seeding problem: the followers are known,
@@ -578,19 +585,29 @@ defmodule Fathom.Shard.Replication.Session do
           # does, the re-read returns the same stale generation and we refuse with a RETRYABLE 503
           # — never a false ack — and the client's retry succeeds once the coordinator has advanced.
           :revalidate ->
-            refreshed = refresh_acquire_gen(state)
+            case fetch_acquire_gen(state) do
+              # A COORDINATOR THAT CANNOT ANSWER IS NOT "LEGACY MODE" (expert review 2026-09-29 #8).
+              # The re-read used to catch an exit and return nil, and nil read as "the heartbeat
+              # degraded, ack best-effort" — but in heartbeat mode a live coordinator never reports
+              # nil (`Fence.revalidate/2` preserves the generation). An exit here means the
+              # coordinator is gone or wedged: the zombie case, where it has just self-fenced on
+              # `:superseded` and quarantined the very write this commit is about to ack. Refuse with
+              # the same retryable 503; the client's retry reaches the real owner.
+              :unreachable ->
+                {:reply, {:error, :ownership_unconfirmed}, state}
 
-            case refreshed.acquire_gen do
-              g when is_integer(g) ->
+              {:ok, g} when is_integer(g) ->
+                refreshed = %{state | acquire_gen: g}
+
                 case heartbeat_ok(g) do
                   :ok -> {:reply, :ok, refreshed}
                   _ -> {:reply, {:error, :ownership_unconfirmed}, refreshed}
                 end
 
-              # The heartbeat process itself went down since acquire ⇒ the coordinator degraded to
-              # legacy mode. Ack per legacy best-effort semantics (see the legacy clause below).
-              _ ->
-                {:reply, :ok, refreshed}
+              # The coordinator ANSWERED nil: its heartbeat process went down since acquire and it
+              # degraded to legacy mode. Ack per legacy best-effort semantics (legacy clause below).
+              {:ok, nil} ->
+                {:reply, :ok, %{state | acquire_gen: nil}}
             end
 
           _ ->
@@ -615,11 +632,13 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
-  # Re-read the coordinator's current (revalidated) fence generation into the session's cache
-  # (expert review 2026-09-18 #4). `acquire_gen_of/1` already catches a coordinator exit and
-  # degrades to `nil` (legacy), so this never crashes the commit.
-  defp refresh_acquire_gen(state) do
-    %{state | acquire_gen: acquire_gen_of(state)}
+  # Re-read the coordinator's current (revalidated) fence generation (expert review 2026-09-18 #4),
+  # keeping "the coordinator answered nil" (legacy) distinct from "the coordinator did not answer"
+  # (expert review 2026-09-29 #8). Never crashes the commit.
+  defp fetch_acquire_gen(state) do
+    {:ok, Fathom.Shard.acquire_gen(state.coordinator)}
+  catch
+    :exit, _ -> :unreachable
   end
 
   # A dead heartbeat process must degrade, not crash the commit — mirrors `Fathom.Shard`'s
