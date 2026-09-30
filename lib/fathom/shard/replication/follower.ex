@@ -105,6 +105,7 @@ defmodule Fathom.Shard.Replication.Follower do
     # And the torn marker (expert review 2026-08-20 #11b), or a promoted-then-re-followed shard
     # inherits a quarantine flag from a replica that no longer exists.
     File.rm(torn_path(name, shard_id))
+    File.rm(lineage_path(name, shard_id))
     :ok
   rescue
     ArgumentError -> :ok
@@ -217,6 +218,12 @@ defmodule Fathom.Shard.Replication.Follower do
   def torn_path(name \\ __MODULE__, shard_id) do
     assert_valid_shard_id!(shard_id)
     Path.join(dir(name), shard_id <> ".db.torn")
+  end
+
+  @doc false
+  def lineage_path(name \\ __MODULE__, shard_id) do
+    assert_valid_shard_id!(shard_id)
+    Path.join(dir(name), shard_id <> ".db.lineage")
   end
 
   defp assert_valid_shard_id!(shard_id) do
@@ -920,17 +927,38 @@ defmodule Fathom.Shard.Replication.Follower do
   defp put_state(name, shard_id, state) do
     tab = table(name)
 
-    was_torn? =
+    {was_torn?, was_lineage} =
       case :ets.lookup(tab, shard_id) do
-        [{^shard_id, %{torn: t}}] -> t
-        _ -> false
+        [{^shard_id, %{torn: t} = prev}] -> {t, Map.get(prev, :lineage, 0)}
+        _ -> {false, 0}
       end
 
     # Marker BEFORE the ETS row, so a crash between the two leaves the SAFE state: the marker
     # present and the replica treated as torn, never the reverse.
     if was_torn? != state.torn, do: sync_torn_marker(name, shard_id, state)
+    if state.lineage != was_lineage, do: sync_lineage(name, shard_id, state.lineage)
     :ets.insert(tab, {shard_id, state})
     state
+  end
+
+  # THE LINEAGE FENCE SURVIVES A RESTART (expert review 2026-09-29 #2c). Recovery used to come back
+  # at lineage 0, which disarms `FollowerLog`'s lineage fence (it fires only when BOTH sides state
+  # one), so the first primary to push after a follower restart was accepted as the owner — a
+  # deposed one included. It changes once per ownership, so this is one small write per takeover,
+  # not per frame. Written plainly (no fsync): losing it to an OS crash recovers 0, which is exactly
+  # the pre-fix behaviour, never a wrong value.
+  defp sync_lineage(name, shard_id, lineage) when is_integer(lineage) and lineage > 0,
+    do: File.write(lineage_path(name, shard_id), Integer.to_string(lineage))
+
+  defp sync_lineage(_name, _shard_id, _lineage), do: :ok
+
+  defp recovered_lineage(name, shard_id) do
+    with {:ok, text} <- File.read(lineage_path(name, shard_id)),
+         {n, ""} when n > 0 <- Integer.parse(String.trim(text)) do
+      n
+    else
+      _ -> 0
+    end
   end
 
   defp sync_torn_marker(name, shard_id, %{torn: true}) do
@@ -1078,7 +1106,13 @@ defmodule Fathom.Shard.Replication.Follower do
       # together — but this is not a seed, it is a recovery, and the marker on disk is the only
       # thing that remembers the two files were a generation apart when we went down.
       torn? = File.exists?(torn_path(name, shard_id))
-      :ets.insert(tab, {shard_id, %{FollowerLog.seeded(0, gen, salt, size) | torn: torn?}})
+      lineage = recovered_lineage(name, shard_id)
+
+      :ets.insert(
+        tab,
+        {shard_id, %{FollowerLog.seeded(0, gen, salt, size, lineage) | torn: torn?}}
+      )
+
       true
     else
       _ -> false
@@ -1099,8 +1133,7 @@ defmodule Fathom.Shard.Replication.Follower do
         # A new epoch or a checkpointed WAL: our bytes are meaningless now, so the file is replaced
         # rather than extended — but the pages in the WAL we are about to throw away are NOT
         # meaningless, and absorbing them first is what keeps this replica whole.
-        absorbed =
-          absorb_before_reset(name, push.shard_id, new_state, complete_through_reset?(prev, push))
+        absorbed = absorb_before_reset(name, push.shard_id, new_state, reset_verdict(prev, push))
 
         apply_write(name, push, absorbed, :truncate)
 
@@ -1167,15 +1200,38 @@ defmodule Fathom.Shard.Replication.Follower do
   # generation to be short of.
   defp complete_through_reset?(_prev, _push), do: true
 
-  defp absorb_before_reset(name, shard_id, new_state, complete?) do
+  # TORN IS STICKY (expert review 2026-09-29 #2). A replica that was ALREADY torn going into this
+  # reset stays torn whatever the reset says, because absorbing a complete NEXT generation does not
+  # put back the pages the earlier seam lost: a page written only in the short generation's missing
+  # tail is in neither file, and nothing in the new WAL mentions it. `FollowerLog`'s own contract is
+  # "cleared only by a seed"; this used to clear it on any complete reset, which laundered a replica
+  # the #11a rule had just correctly marked short. The same hole let a follower RESTART launder it:
+  # recovery reads the durable marker (#11b) into `prev.torn`, the first push after the restart is a
+  # reset from offset 0, and that reset cleared the flag and deleted the marker #11b exists to keep.
+  #
+  # Cost, stated plainly: a torn replica is now torn until it is re-seeded, and nothing re-seeds a
+  # torn replica today (seeds start only on `:unknown_shard`). That is the pre-A2 answer for that one
+  # shard on that one follower — promotion falls back to the stored object — not a loss.
+  defp reset_verdict(%{torn: true}, _push), do: :already_torn
+
+  defp reset_verdict(prev, push),
+    do: if(complete_through_reset?(prev, push), do: :complete, else: :short)
+
+  defp absorb_before_reset(name, shard_id, new_state, verdict) do
     db = db_path(name, shard_id)
     wal = wal_path(name, shard_id)
 
     # Nothing to absorb: a shard we hold no files for (the reset IS the first frame) is not torn,
-    # it is simply new — `apply_write` is about to lay down a whole generation from offset 0.
+    # it is simply new — `apply_write` is about to lay down a whole generation from offset 0. An
+    # empty WAL over an existing `.db` has nothing to absorb either, but it does NOT make a torn
+    # replica whole, so a sticky verdict survives this branch too.
     if File.exists?(db) and wal_bytes(wal) > 0 do
       case checkpoint_into_db(db) do
-        :ok when not complete? ->
+        :ok when verdict == :already_torn ->
+          # Absorbing is still right — the pages we hold are real — but it cannot clear the flag.
+          new_state
+
+        :ok when verdict == :short ->
           # The checkpoint SUCCEEDED and the replica is still torn, which is the whole point: the
           # local move was fine, the INPUT to it was short. Absorbing incomplete pages produces a
           # database that looks healthy, so the flag is the only thing standing between it and a
@@ -1199,7 +1255,7 @@ defmodule Fathom.Shard.Replication.Follower do
           new_state
       end
     else
-      %{new_state | torn: false}
+      if verdict == :already_torn, do: new_state, else: %{new_state | torn: false}
     end
   end
 

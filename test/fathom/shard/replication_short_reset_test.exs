@@ -285,6 +285,104 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
              "upgrade that marks the entire fleet un-promotable"
   end
 
+  # TORN IS STICKY (expert review 2026-09-29 #2). Both tests below failed before the fix: the second
+  # reset — one the follower held COMPLETELY — cleared a torn flag the first reset had correctly set,
+  # although the pages the first reset's missing tail carried are in neither file. `FollowerLog`
+  # says torn is "cleared only by a seed"; `absorb_before_reset/4` cleared it on any complete reset.
+  test "a torn replica stays torn through a later COMPLETE reset", ctx do
+    %{name: name, port: port, state: state, id: id} = seeded_follower!(ctx)
+
+    assert {:ok, _} =
+             send_frame!(
+               port,
+               Protocol.encode_push(reset_push(id, state, state.next_offset + 4096))
+             )
+
+    torn = Follower.state_of(name, id)
+    assert torn.torn, "precondition: the short reset did not mark the replica torn"
+
+    # The next generation, held in full: `prev_extent` equals exactly what the follower has.
+    assert {:ok, _} =
+             send_frame!(port, Protocol.encode_push(reset_push(id, torn, torn.next_offset)))
+
+    assert Follower.state_of(name, id).torn,
+           "a complete reset laundered a replica that is still missing the earlier seam's pages"
+
+    assert File.exists?(Follower.torn_path(name, id)), "the durable torn marker was deleted"
+  end
+
+  test "a follower RESTART does not launder a torn replica on the first push", ctx do
+    %{name: name, state: state, id: id} = seeded_follower!(ctx)
+
+    # Mark it torn the way the #11b restart test does, leaving the REAL seeded WAL on disk: a torn
+    # replica produced by a crafted reset holds a 32-byte zero "WAL" that `Wal.read/1` refuses, so
+    # recovery would skip the shard entirely and the test would measure nothing.
+    :ets.insert(Follower.table(name), {id, %{state | torn: true}})
+    File.write!(Follower.torn_path(name, id), "")
+
+    # Restart the SAME follower over the SAME directory: recovery reads the marker (#11b) but
+    # comes back at epoch 0 / lineage 0, so the primary's next push routes to `decide_fresh` and
+    # arrives as a reset from offset 0 with no prev_extent statement — which read as "complete".
+    stop_supervised!(name)
+    dir = Path.join(ctx.root, to_string(name))
+    pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
+    {:ok, port2} = Follower.port(pid)
+
+    recovered = Follower.state_of(name, id)
+    assert recovered.torn, "precondition: recovery dropped the durable torn marker"
+
+    assert {:ok, _} =
+             send_frame!(port2, Protocol.encode_push(reset_push(id, state, 0)))
+
+    assert Follower.state_of(name, id).torn,
+           "the first push after a follower restart cleared a durably-recorded torn flag"
+
+    assert File.exists?(Follower.torn_path(name, id)),
+           "the first push after a restart deleted the marker #11b exists to keep"
+  end
+
+  # THE LINEAGE FENCE SURVIVES A RESTART (expert review 2026-09-29 #2c). Before the fix recovery came
+  # back at lineage 0, and `FollowerLog`'s lineage fence only fires when BOTH sides state one — so the
+  # first push after a follower restart was accepted from ANY primary, a deposed one included.
+  test "a restarted follower still fences a DEPOSED (lower-lineage) primary", ctx do
+    %{name: name, state: state, id: id} = seeded_follower!(ctx)
+    assert state.lineage > 0, "precondition: the seeded replica states no lineage to fence with"
+
+    # The WRITE side: a seed persisted the lineage beside the replica.
+    assert File.read!(Follower.lineage_path(name, id)) == Integer.to_string(state.lineage)
+
+    # A fresh shard's lineage is 1, and a push cannot state anything LOWER than 1 (0 means
+    # "unstated", which skips the fence by design). So advance the recorded lineage the way a later
+    # takeover would, leaving room for a deposed primary to state a real, lower one.
+    File.write!(Follower.lineage_path(name, id), Integer.to_string(state.lineage + 5))
+    state = %{state | lineage: state.lineage + 5}
+
+    stop_supervised!(name)
+    dir = Path.join(ctx.root, to_string(name))
+    pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
+    {:ok, port} = Follower.port(pid)
+
+    assert Follower.state_of(name, id).lineage == state.lineage,
+           "recovery forgot the replica's lineage, which disarms the lineage fence"
+
+    deposed = %{reset_push(id, state, 0) | lineage: state.lineage - 1, epoch: state.epoch + 5}
+
+    # A push states its lineage only in the ordinal frame shape; without the gate it goes out as 0
+    # ("unstated") and the fence is skipped by design, so the test would measure the wrong thing.
+    prior = Application.get_env(:fathom, :replication_ordinal_wire)
+    Application.put_env(:fathom, :replication_ordinal_wire, true)
+
+    on_exit(fn ->
+      if is_nil(prior),
+        do: Application.delete_env(:fathom, :replication_ordinal_wire),
+        else: Application.put_env(:fathom, :replication_ordinal_wire, prior)
+    end)
+
+    assert {:ok, {:reject, ^id, :stale_epoch, _}} =
+             send_frame!(port, Protocol.encode_push(deposed)),
+           "a restarted follower accepted a push from a lower-lineage (deposed) primary"
+  end
+
   test "the raw-socket injection these tests rely on is what #3 closes", ctx do
     %{port: port, state: state, id: id} = seeded_follower!(ctx)
 
