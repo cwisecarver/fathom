@@ -30,18 +30,6 @@ defmodule Fathom.Admin.DiskMeasurementTest do
     on_exit(fn -> :telemetry.detach(handler) end)
   end
 
-  defp put_env(key, value) do
-    prev = Application.fetch_env(:fathom, key)
-    Application.put_env(:fathom, key, value)
-
-    on_exit(fn ->
-      case prev do
-        {:ok, v} -> Application.put_env(:fathom, key, v)
-        :error -> Application.delete_env(:fathom, key)
-      end
-    end)
-  end
-
   describe "the disk gauge" do
     test "emits free/total/used_ratio for the shard data dir" do
       attach([:fathom, :node, :disk])
