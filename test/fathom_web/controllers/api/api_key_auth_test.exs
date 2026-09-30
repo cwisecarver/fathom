@@ -65,6 +65,58 @@ defmodule FathomWeb.Api.ApiKeyAuthTest do
     assert conn |> bearer(token) |> delete("/api/tenants/#{id}") |> Map.get(:status) == 403
   end
 
+  # Expert review 2026-09-29 #19: a `:rw` token for the capture TEMPLATE is a fleet-wide write — its
+  # DDL is captured and rolled onto every shard — yet a `manage` key could mint or rotate one, while
+  # erasing a single tenant needed `destroy`. Pre-fix the manage-key template mints return 200.
+  describe "template credentials need destroy (#19)" do
+    setup do
+      template = "apikey_tpl_#{System.unique_integer([:positive])}"
+      prev = Application.get_env(:fathom, :template_shard_id)
+      Application.put_env(:fathom, :template_shard_id, template)
+
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:fathom, :template_shard_id, prev),
+          else: Application.delete_env(:fathom, :template_shard_id)
+      end)
+
+      %{template: template}
+    end
+
+    test "a manage key is refused a template token (mint and rotate, any case)", %{
+      conn: conn,
+      template: template
+    } do
+      token = mint("manage")
+
+      for path <- [
+            "/api/tenants/#{template}/token",
+            "/api/tenants/#{String.upcase(template)}/token",
+            "/api/tenants/#{template}/token/rotate"
+          ] do
+        status = conn |> bearer(token) |> post(path, %{"scope" => "rw"}) |> Map.get(:status)
+        assert status == 403, "a manage key got #{status} for #{path}"
+      end
+    end
+
+    test "a manage key still mints for an ordinary tenant; a destroy key for the template", %{
+      conn: conn,
+      template: template
+    } do
+      other = "apikey_ord_#{System.unique_integer([:positive])}"
+
+      assert conn
+             |> bearer(mint("manage"))
+             |> post("/api/tenants/#{other}/token", %{"scope" => "rw"})
+             |> Map.get(:status) == 200
+
+      assert conn
+             |> bearer(mint("destroy"))
+             |> post("/api/tenants/#{template}/token", %{"scope" => "rw"})
+             |> Map.get(:status) == 200
+    end
+  end
+
   test "a destroy-scoped key may delete (scope allows it — not 401/403)", %{conn: conn} do
     token = mint("destroy")
     id = "apikey_del_#{System.unique_integer([:positive])}"

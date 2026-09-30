@@ -43,7 +43,8 @@ defmodule FathomWeb.Api.TenantController do
 
   defp require_scope(conn, _opts) do
     # Default to the most restrictive scope for any unmapped action (fail closed).
-    required = Map.get(@action_scopes, action_name(conn), :destroy)
+    required = conn |> action_name() |> then(&Map.get(@action_scopes, &1, :destroy))
+    required = template_credential_scope(conn, required)
     actor = conn.assigns[:api_actor]
 
     if actor && ApiKeys.scope_at_least?(actor.scope, required) do
@@ -53,6 +54,26 @@ defmodule FathomWeb.Api.TenantController do
       |> put_status(:forbidden)
       |> json(%{error: "insufficient scope: this action requires #{required}"})
       |> halt()
+    end
+  end
+
+  # A CREDENTIAL FOR THE CAPTURE TEMPLATE IS A FLEET-WIDE WRITE (expert review 2026-09-29 #19).
+  # Every DDL a `:rw` template token runs is captured and, unless the data-migration lint flags it,
+  # auto-advances HEAD onto EVERY shard — a `CREATE TRIGGER` on a tenant table is never flagged.
+  # AGENTS.md calls the template "a fleet-wide poisoning vector", yet minting/rotating its token sat
+  # at `manage`, below `destroy`, which only erases ONE tenant. So the credential actions on the
+  # template require `destroy`. The id is normalized the way `ShardExecutor.template?/1` does, so a
+  # mixed-case path cannot slip past.
+  @template_credential_actions [:mint_token, :rotate_token]
+
+  defp template_credential_scope(conn, required) do
+    with true <- action_name(conn) in @template_credential_actions,
+         {:ok, id} <- Fathom.ShardId.cast(conn.params["id"]),
+         {:ok, template} <- Fathom.ShardId.cast(Application.get_env(:fathom, :template_shard_id)),
+         true <- id == template do
+      :destroy
+    else
+      _ -> required
     end
   end
 
