@@ -90,6 +90,25 @@ defmodule Fathom.Shard.WalHookTest do
              "the hook fired but reported 0 WAL pages, so the frame count A2 ships on is unusable"
     end
 
+    # Expert review 2026-09-29 #28: `reset_for_reuse(:rw)` re-ran all of `configure/1`, whose
+    # `PRAGMA wal_autocheckpoint` re-installs SQLite's built-in WAL hook over the extension's — the
+    # same slot — and extension loading is disabled after open, so a pooled handle never got it
+    # back. Pre-fix the counter does not move after the reset. Same :wal_probe gating as above.
+    @tag :wal_probe
+    test "a pooled :rw handle keeps the hook through reset_for_reuse", %{path: path} do
+      conn = open!(path)
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+
+      assert :ok = Connection.reset_for_reuse(conn, :rw)
+
+      before = scalar!(conn, "SELECT fathom_wal_commits()")
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+      after_ = scalar!(conn, "SELECT fathom_wal_commits()")
+
+      assert after_ > before,
+             "the WAL hook stopped firing after reset_for_reuse — pooled handles lost the A2 seam"
+    end
+
     # Deliberately NOT excluded by a tag. It is the regression test for a silent, slow,
     # misattributed production failure (unbounded WAL growth presenting as a disk-fill), it runs in
     # well under a second, and it must execute on every plain `mix test`.

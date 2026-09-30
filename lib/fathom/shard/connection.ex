@@ -315,6 +315,26 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
+  # THE CONNECTION-LOCAL HALF OF `configure/1`, for a pooled `:rw` handle's reuse (expert review
+  # 2026-09-29 #28). Re-running all of `configure/1` re-issued `PRAGMA wal_autocheckpoint`, and
+  # AGENTS.md's loud warning applies: that pragma and `sqlite3_wal_hook` are THE SAME SLOT, so it
+  # re-installed SQLite's built-in checkpoint hook over the extension's `on_commit` hook — and
+  # extension loading is disabled after open, so the extension's hook never came back. Every reused
+  # handle silently lost the A2 frame seam and its commit counters (checkpointing itself was fine:
+  # the built-in hook runs the same PASSIVE 4000-page checkpoint the extension's does).
+  #
+  # `journal_mode` is file-level and persistent, and `wal_autocheckpoint` is not settable by a tenant,
+  # so neither needs re-applying; the rest are cheap and are what a stream could have changed or
+  # what `configure/1` guarantees per connection.
+  defp reconfigure_for_reuse(conn) do
+    with :ok <- Sqlite3.execute(conn, "PRAGMA synchronous=FULL"),
+         :ok <- Sqlite3.set_busy_timeout(conn, 5000),
+         :ok <- maybe_foreign_keys(conn),
+         :ok <- maybe_cache_size(conn) do
+      maybe_max_page_count(conn)
+    end
+  end
+
   # SQLite defaults foreign_keys=OFF, but Django (≥2.2) assumes ON and enforces it via a
   # per-connection `PRAGMA foreign_keys = ON` in get_new_connection (expert review 2026-07-14
   # #2). A remote client can't be relied on to replay that on every stream — and even when it
@@ -1055,7 +1075,7 @@ defmodule Fathom.Shard.Connection do
       # reuse — safe only because `ShardExecutor` denies the `query_only` pragma to tenants, but a
       # trust boundary must not rest on a single upstream guard. `maybe_query_only/2` is a no-op for
       # `:rw`, so this is scope-correct either way.
-      if scope == :rw, do: configure(conn), else: maybe_query_only(conn, scope)
+      if scope == :rw, do: reconfigure_for_reuse(conn), else: maybe_query_only(conn, scope)
     end
   end
 
