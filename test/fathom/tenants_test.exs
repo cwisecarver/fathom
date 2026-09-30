@@ -128,6 +128,30 @@ defmodule Fathom.TenantsTest do
       assert {:error, :not_stored} = Tenants.export(id)
     end
 
+    # Policy decided 2026-09-29 (expert review 2026-09-29 #21, the parked half): suspension is a
+    # reversible pause, not erasure, so a SUSPENDED source stays exportable and forkable — an
+    # operator often needs exactly that while a tenant is offline. Pins the policy so a later
+    # "treat suspended like deleted" change is a deliberate decision, not a drive-by.
+    test "a SUSPENDED tenant can still be exported and forked", %{id: id} do
+      {:ok, _} = Directory.resolve(id)
+      write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('keep')"])
+      flush!(id)
+      assert :ok = Tenants.suspend(id)
+      assert {:ok, %{status: "suspended"}} = Directory.get(id)
+
+      assert {:ok, %{path: path}} = Tenants.export(id, flush: false)
+      File.rm(path)
+
+      dst = "#{id}susp"
+
+      on_exit(fn ->
+        Storage.purge_shard(dst)
+        for p <- Path.wildcard(Path.join([Fathom.Shard.data_dir(), "#{dst}*"])), do: File.rm(p)
+      end)
+
+      assert {:ok, %{shard_id: ^dst}} = Tenants.fork(id, dst)
+    end
+
     test "not_stored for a shard that was never flushed", %{id: id} do
       assert {:error, :not_stored} = Tenants.export(id)
     end

@@ -519,8 +519,9 @@ defmodule Fathom.Tenants do
   # window the stored object is still there — and fork copied it into a NEW live tenant with a fresh
   # `:rw` token, and export handed it out, both outside every deletion guarantee. The tombstone set
   # is checked as well as the row, since it is the durable guard that survives a directory restore.
-  # A SUSPENDED source is deliberately still allowed — whether an offline tenant may be forked or
-  # exported is a policy question recorded in the audit log, not decided here.
+  # A SUSPENDED source is deliberately still allowed (decided 2026-09-29): suspension is a reversible
+  # pause, not erasure — the data is still the tenant's, and an operator often needs an export
+  # precisely while a tenant is offline. Pinned by tenants_test.
   defp erased?(id, row), do: row.status == "deleted" or Tombstones.tombstoned?(id)
 
   # Export checks nothing but the tombstone set — no directory read. `delete/1` puts the tombstone on the
