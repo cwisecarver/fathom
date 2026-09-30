@@ -259,6 +259,15 @@ defmodule Fathom.Migrator do
     Release
     |> where([r], r.version in ^versions)
     |> where([r], r.yanked == false and r.requires_review == false)
+    # FOR SHARE (expert review 2026-09-29 #12, the row-lock tier). The migrator reads its chain
+    # AFTER `mark_migrating`, and `attach_transform/2` counts migrating shards BEFORE it writes —
+    # two check-then-act sequences that could interleave so each missed the other: the attach
+    # counted before the mark committed, and the chain was read before the transform committed. A
+    # shared lock here waits for an attach holding its FOR UPDATE, and Postgres then re-reads the
+    # updated row, so the chain carries the transform. Taken the other way round, the mark
+    # committed before this read, so it committed before the attach's lock and its count sees it.
+    # Held only for this one statement: nothing wraps it in a transaction.
+    |> lock("FOR SHARE")
     |> Repo.all()
     |> Map.new(fn release ->
       {release.version, {zip_args(release.statements, release.statement_args), release.transform}}
@@ -434,28 +443,44 @@ defmodule Fathom.Migrator do
   @spec attach_transform(non_neg_integer(), module() | String.t()) ::
           :ok | {:error, term()}
   def attach_transform(version, module) do
-    with {:ok, release} <- fetch_release(version),
-         {:ok, resolved} <- resolve_transform(module),
-         :ok <- refuse_if_data_statements(release),
-         :ok <- refuse_if_gap(release),
-         :ok <- refuse_if_rolled_out(version),
-         :ok <- refuse_if_migrating_below(version) do
-      {:ok, _} =
-        release
-        |> Ecto.Changeset.change(
-          transform: to_string(resolved),
-          requires_review: false,
-          review_reason: nil
-        )
-        |> Repo.update()
+    # ONE TRANSACTION, RELEASE ROW LOCKED FIRST (expert review 2026-09-29 #12). The two refusal
+    # counts below are check-then-act: without the lock a shard could be marked `migrating` and
+    # read its chain between the count and the update, and replay without the transform. The FOR
+    # UPDATE is taken BEFORE the counts so they run after any chain read already holding its FOR
+    # SHARE has finished — see `statement_steps/1` for the other half of the argument.
+    Repo.transaction(fn ->
+      with {:ok, release} <- fetch_release(version, lock: true),
+           {:ok, resolved} <- resolve_transform(module),
+           :ok <- refuse_if_data_statements(release),
+           :ok <- refuse_if_gap(release),
+           :ok <- refuse_if_rolled_out(version),
+           :ok <- refuse_if_migrating_below(version) do
+        {:ok, _} =
+          release
+          |> Ecto.Changeset.change(
+            transform: to_string(resolved),
+            requires_review: false,
+            review_reason: nil
+          )
+          |> Repo.update()
 
-      refresh_head_cache()
-      :ok
+        :ok
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> case do
+      {:ok, :ok} ->
+        refresh_head_cache()
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
-  defp fetch_release(version) do
-    case Repo.get_by(Release, version: version) do
+  defp fetch_release(version, lock: true) do
+    case Repo.one(from(r in Release, where: r.version == ^version, lock: "FOR UPDATE")) do
       nil -> {:error, :unknown_version}
       release -> {:ok, release}
     end
