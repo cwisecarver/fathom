@@ -1473,30 +1473,9 @@ defmodule Fathom.ShardExecutor do
   # missed by another — the defect class of expert review 2026-08-20 #19, 2026-08-24 #1, and
   # 2026-09-05 #1. The last was the leading `;`, verified by execution: `;PRAGMA
   # max_page_count=777` ran the pragma while the gate saw head ";pragma" and matched nothing.
-  defp strip_lead_noise(sql) do
-    case String.trim_leading(sql) do
-      # A UTF-8 BOM (U+FEFF): SQLite's tokenizer skips a leading one and RUNS the statement, but
-      # `String.trim_leading/1` does NOT — U+FEFF is Unicode Cf (format), not White_Space — so
-      # without this clause a `﻿PRAGMA max_page_count=…` or `﻿CREATE …` was seen by every gate as
-      # head "﻿pragm"/"﻿creat", matched nothing, and reached the engine (the size cap and
-      # per-commit durability pragmas have no authorizer backstop). Same defect class as the leading
-      # `;` (expert review 2026-09-05 #1), verified by execution 2026-09-13.
-      "﻿" <> rest -> strip_lead_noise(rest)
-      "/*" <> rest -> rest |> after_delim("*/") |> strip_lead_noise()
-      "--" <> rest -> rest |> after_delim("\n") |> strip_lead_noise()
-      ";" <> rest -> strip_lead_noise(rest)
-      other -> other
-    end
-  end
-
-  # An unterminated comment leaves no statement behind — "" classifies as nothing and falls to
-  # the conservative path, which is the safe direction for every caller here.
-  defp after_delim(bin, delim) do
-    case :binary.match(bin, delim) do
-      {i, len} -> binary_part(bin, i + len, byte_size(bin) - i - len)
-      :nomatch -> ""
-    end
-  end
+  # Lives in `Fathom.SqlLead` since expert review 2026-09-29 #18, so the migration capture's lint
+  # uses the SAME definition of "where the statement starts" (see that module).
+  defp strip_lead_noise(sql), do: Fathom.SqlLead.strip(sql)
 
   # Verbs a tenant may never run. `attach`/`detach` are the cross-tenant read+write breach
   # (#1); `vacuum` covers `VACUUM INTO '<any path>'`, an arbitrary-file-write primitive that a

@@ -643,6 +643,45 @@ defmodule Fathom.Migrator.CaptureTest do
              "a real table-rebuild copy (INSERT..SELECT ... FROM) must stay exempt"
     end
 
+    # Expert review 2026-09-29 #18. The lint classified on `String.trim_leading/1` and exempted any
+    # statement whose TEXT contained "django_migrations", so each of these was captured UNFLAGGED —
+    # HEAD auto-advanced and the template's literals replayed onto every shard with no review:
+    # a leading line comment (ordinary `RunSQL("-- backfill\nUPDATE …")`), a block comment, a leading
+    # `;`, a BOM, a CTE-led DML, and a deliberate `-- django_migrations` suffix. Pre-fix every
+    # element of `bypasses` returns [] here.
+    test "the data-migration lint sees through comments, `;`, BOM, CTEs and name-dropping (#18)" do
+      bypasses = [
+        "-- backfill\nUPDATE app_thing SET slug = 'from-template'",
+        "/* backfill */ UPDATE app_thing SET slug = 'from-template'",
+        ";DELETE FROM app_thing",
+        "﻿INSERT INTO app_thing (slug) VALUES ('x')",
+        "WITH src(v) AS (VALUES ('x')) INSERT INTO app_thing (slug) SELECT v FROM src",
+        "UPDATE app_thing SET slug = 'x' -- django_migrations"
+      ]
+
+      for sql <- bypasses do
+        assert Capture.data_migration_statements([sql]) == [sql],
+               "the lint did not flag a data migration: #{inspect(sql)}"
+      end
+
+      # Django's own bookkeeping stays exempt by its TARGET table, quoted or not, commented or not.
+      for sql <- [
+            ~s|INSERT INTO "django_migrations" ("app", "name", "applied") VALUES (?, ?, ?)|,
+            "-- record\ninsert into django_migrations (app) values (?)",
+            ~s|DELETE FROM "django_migrations" WHERE "app" = 'x'|
+          ] do
+        assert Capture.data_migration_statements([sql]) == [],
+               "Django bookkeeping was flagged as a data migration: #{inspect(sql)}"
+      end
+
+      # And bookkeeping?/1 no longer mistakes a tenant-table INSERT for the applied-migration row.
+      refute Capture.bookkeeping?(
+               "INSERT INTO app_thing (slug) VALUES ('x') -- django_migrations"
+             )
+
+      assert Capture.bookkeeping?("-- record\nINSERT INTO django_migrations (app) VALUES (?)")
+    end
+
     # Expert review #6: a non-atomic (`atomic = False`) migration runs autocommit — no tracked
     # BEGIN/COMMIT — so capture never sees it, the template schema moves, and the fleet never hears.
     # Caught at the NEXT capture: its pre-transaction count exceeds the last captured count (the gap).

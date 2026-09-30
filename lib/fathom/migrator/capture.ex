@@ -92,8 +92,8 @@ defmodule Fathom.Migrator.Capture do
   """
   @spec bookkeeping?(String.t()) :: boolean()
   def bookkeeping?(sql) when is_binary(sql) do
-    norm = sql |> String.trim() |> String.upcase()
-    String.starts_with?(norm, "INSERT") and String.contains?(norm, "DJANGO_MIGRATIONS")
+    head = sql |> Fathom.SqlLead.strip() |> String.downcase()
+    String.starts_with?(head, "insert") and targets_django_migrations?(head)
   end
 
   def bookkeeping?(_), do: false
@@ -527,14 +527,42 @@ defmodule Fathom.Migrator.Capture do
   @spec data_migration_statements([String.t()]) :: [String.t()]
   def data_migration_statements(statements) do
     Enum.filter(statements, fn sql ->
-      lead = sql |> String.trim_leading() |> String.slice(0, 12) |> String.downcase()
+      # THE SAME HEAD THE EXECUTOR'S GATES SEE (expert review 2026-09-29 #18). This used
+      # `String.trim_leading/1`, so a leading comment, `;` or BOM hid the verb —
+      # `RunSQL("-- backfill\nUPDATE …")` is ordinary Django and was captured UNFLAGGED, auto-advancing
+      # HEAD and replaying its template literals onto every shard without review.
+      head = sql |> Fathom.SqlLead.strip() |> String.downcase()
+      lead = String.slice(head, 0, 12)
       down = String.downcase(sql)
 
-      Enum.any?(@dml_leads, &String.starts_with?(lead, &1)) and
-        not String.contains?(down, "django_migrations") and
-        not shard_local_row_copy?(lead, down)
+      cond do
+        # Django's own bookkeeping — exempt by its TARGET TABLE, not because the text mentions
+        # `django_migrations` anywhere (a trailing `-- django_migrations` used to exempt any DML).
+        targets_django_migrations?(head) ->
+          false
+
+        # `WITH … INSERT/UPDATE/DELETE` is valid SQLite DML that no `@dml_leads` prefix matches.
+        # A CTE-led statement is flagged for REVIEW, which is the conservative direction: a
+        # CTE-led pure read in a migration is rare, and costs an operator a click, not a tenant.
+        String.starts_with?(lead, "with") ->
+          true
+
+        Enum.any?(@dml_leads, &String.starts_with?(lead, &1)) ->
+          not shard_local_row_copy?(lead, down)
+
+        true ->
+          false
+      end
     end)
   end
+
+  # Whether an ALREADY lead-stripped, downcased statement writes to `django_migrations` itself —
+  # `INSERT [OR …] INTO`, `REPLACE INTO`, `DELETE FROM` or `UPDATE [OR …]` naming it (optionally
+  # `main.`-qualified, optionally quoted). Structural on the target, so the table name appearing in
+  # a comment, a string literal or a subquery of some OTHER table's DML does not exempt it.
+  @django_migrations_target ~r/\A(?:insert(?:\s+or\s+\w+)?\s+into|replace\s+into|delete\s+from|update(?:\s+or\s+\w+)?)\s+(?:(?:"main"|`main`|\[main\]|main)\s*\.\s*)?(?:"django_migrations"|`django_migrations`|\[django_migrations\]|django_migrations)(?=[\s(;]|\z)/
+
+  defp targets_django_migrations?(head), do: Regex.match?(@django_migrations_target, head)
 
   @doc """
   Whether `sql` is a statement that only READS — Django's schema-editor introspection, which rides
