@@ -120,6 +120,9 @@ defmodule FathomWeb.Api.TenantController do
       {:error, :invalid_shard_id} ->
         error(conn, :bad_request, "invalid shard id")
 
+      {:error, :reserved_shard_id} ->
+        error(conn, :unprocessable_entity, "shard id is reserved for restore-drill scratch forks")
+
       {:error, :already_exists} ->
         error(conn, :conflict, "tenant already exists")
 
@@ -201,6 +204,13 @@ defmodule FathomWeb.Api.TenantController do
 
       {:error, :invalid_shard_id} ->
         error(conn, :bad_request, "invalid shard or destination id")
+
+      {:error, :reserved_shard_id} ->
+        error(
+          conn,
+          :unprocessable_entity,
+          "destination id is reserved for restore-drill scratch forks"
+        )
 
       {:error, :already_exists} ->
         error(conn, :conflict, "destination already exists")

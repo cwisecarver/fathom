@@ -554,6 +554,33 @@ defmodule Fathom.TenantsTest do
     end
   end
 
+  # Expert review 2026-09-29 #34. `restoredrill<digits>` is the restore drill's scratch shape, which
+  # the rollout and drill sweeps exclude — a tenant born with it would never migrate. Refused at
+  # provision and as a fork destination; only the drill's own fork (`scratch: true`) may create one.
+  describe "the restore-drill scratch shape is reserved (#34)" do
+    test "provision refuses it and creates no row" do
+      id = "restoredrill#{System.unique_integer([:positive])}"
+      assert {:error, :reserved_shard_id} = Tenants.provision(id)
+      assert Directory.get(id) == :error
+    end
+
+    test "a merely prefix-sharing id still provisions" do
+      id = "restoredrill-eu-#{System.unique_integer([:positive])}"
+      assert {:ok, _} = Tenants.provision(id)
+    end
+
+    test "fork refuses it as a destination unless the caller is the drill", %{id: id} do
+      {:ok, _} = Directory.resolve(id)
+      write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
+      flush!(id)
+      dst = "restoredrill#{System.unique_integer([:positive])}"
+      on_exit(fn -> Storage.purge_shard(dst) end)
+
+      assert {:error, :reserved_shard_id} = Tenants.fork(id, dst)
+      assert {:ok, %{shard_id: ^dst}} = Tenants.fork(id, dst, scratch: true)
+    end
+  end
+
   test "the DeleteJob worker runs purge end to end", %{id: id} do
     write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
     flush!(id)

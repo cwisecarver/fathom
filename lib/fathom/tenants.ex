@@ -95,6 +95,7 @@ defmodule Fathom.Tenants do
   @spec provision(String.t()) :: {:ok, map()} | {:error, term()}
   def provision(shard_id) do
     with {:ok, id} <- cast(shard_id),
+         :ok <- refuse_scratch(id, []),
          :ok <- refuse_if_taken(id),
          {:ok, warnings} <- dns_safety(id),
          {:ok, _row} <- Directory.resolve(id),
@@ -122,6 +123,7 @@ defmodule Fathom.Tenants do
   def fork(src_id, dst_id, opts \\ []) do
     with {:ok, src} <- cast(src_id),
          {:ok, dst} <- cast(dst_id),
+         :ok <- refuse_scratch(dst, opts),
          :ok <- refuse_if_taken(dst),
          {:ok, warnings} <- dns_safety(dst),
          {:ok, %{schema_version: schema_version}} <- fetch_src(src),
@@ -413,6 +415,16 @@ defmodule Fathom.Tenants do
       {:ok, id} -> {:ok, id}
       :error -> {:error, :invalid_shard_id}
     end
+  end
+
+  # The restore drill's scratch shape is reserved (expert review 2026-09-29 #34): the rollout and
+  # drill sweeps exclude it, so a tenant born with such an id would never be migrated while
+  # `converged` read true. Only the drill's own fork passes `scratch: true` — an internal option the
+  # API controller never forwards.
+  defp refuse_scratch(id, opts) do
+    if Directory.scratch_id?(id) and not Keyword.get(opts, :scratch, false),
+      do: {:error, :reserved_shard_id},
+      else: :ok
   end
 
   defp refuse_if_taken(id) do

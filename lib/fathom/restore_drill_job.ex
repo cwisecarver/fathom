@@ -455,7 +455,7 @@ defmodule Fathom.RestoreDrillJob do
   end
 
   defp restore_and_compare(id, scratch) do
-    case Fathom.Tenants.fork(id, scratch) do
+    case Fathom.Tenants.fork(id, scratch, scratch: true) do
       {:ok, _} ->
         compare_then_drop(id, scratch)
 

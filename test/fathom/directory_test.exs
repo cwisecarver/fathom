@@ -264,6 +264,30 @@ defmodule Fathom.DirectoryTest do
       drill_ids = Directory.sample_for_drill(10) |> Enum.map(& &1.shard_id)
       refute scratch in drill_ids, "a scratch fork must not be re-sampled by the drill"
     end
+
+    # Expert review 2026-09-29 #34. The exclusion was `LIKE 'restoredrill%'`, and nothing refused
+    # that prefix for a real tenant — so `restoredrill-eu` was silently never migrated while
+    # `converged` read true. Only the drill's own shape, `restoredrill<digits>`, is excluded now.
+    test "a real tenant that merely starts with the drill prefix is still a laggard (#34)" do
+      real = ["restoredrill-eu", "restoredrills", "restoredrill1a"]
+      for id <- real, do: {:ok, _} = Directory.resolve(id)
+      {:ok, _} = Directory.resolve("restoredrill42")
+
+      assert Directory.count_laggards(5) == length(real)
+      assert Enum.sort(Enum.map(Directory.laggards(5, 10), & &1.shard_id)) == Enum.sort(real)
+
+      drill_ids = Directory.sample_for_drill(10) |> Enum.map(& &1.shard_id)
+      for id <- real, do: assert(id in drill_ids, "#{id} was excluded from the drill sample")
+      refute "restoredrill42" in drill_ids
+    end
+
+    test "scratch_id?/1 is exactly the drill's <prefix><digits> shape (#34)" do
+      assert Directory.scratch_id?("restoredrill1")
+      assert Directory.scratch_id?("restoredrill123456")
+
+      for id <- ["restoredrill", "restoredrill-eu", "restoredrill1a", "xrestoredrill1", "acme"],
+          do: refute(Directory.scratch_id?(id), id)
+    end
   end
 
   # Finding #20: a migration whose Oban job is lost leaves the shard in `migrating` forever,

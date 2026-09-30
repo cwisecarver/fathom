@@ -46,13 +46,28 @@ defmodule Fathom.Directory do
   # ACTIVE scratch directory row stamped at the SOURCE's schema_version (which can be < HEAD). Without
   # exclusion that row is an eternal laggard: `count_laggards/1` counts it so `converged` never turns
   # true, `laggards/2` keeps enqueuing a migration for a throwaway, and later drills re-sample it.
-  # Excluded from the rollout + drill sweeps exactly like the capture template. No real tenant may use
-  # this prefix (`RestoreDrillJob` owns the naming via `scratch_prefix/0`).
+  # Excluded from the rollout + drill sweeps exactly like the capture template. `RestoreDrillJob` owns
+  # the naming via `scratch_prefix/0`; the reserved shape is `scratch_id?/1`, enforced by `Tenants`.
   @scratch_prefix "restoredrill"
 
   @doc "The reserved prefix for restore-drill scratch forks — see `@scratch_prefix` (#27)."
   @spec scratch_prefix() :: String.t()
   def scratch_prefix, do: @scratch_prefix
+
+  # The drill names a scratch fork `<prefix><positive integer>` and nothing else. Only THIS shape is
+  # reserved (expert review 2026-09-29 #34) — the prefix alone would also reserve `restoredrill-eu`.
+  @scratch_id_pattern "^" <> @scratch_prefix <> "[0-9]+$"
+
+  @doc """
+  True for an id of the restore drill's scratch shape, `#{@scratch_prefix}<digits>` — reserved:
+  excluded from rollout and drill sweeps, so a real tenant with such an id would never migrate.
+  `Fathom.Tenants` refuses it at provision and fork (#34).
+  """
+  @spec scratch_id?(String.t()) :: boolean()
+  def scratch_id?(@scratch_prefix <> rest) when rest != "",
+    do: String.match?(rest, ~r/\A[0-9]+\z/)
+
+  def scratch_id?(_), do: false
 
   @doc """
   Resolves a shard, registering it on first use and recording the access. Returns
@@ -1382,11 +1397,14 @@ defmodule Fathom.Directory do
     end
   end
 
-  # Exclude the restore drill's reserved scratch prefix (#27) so a leaked scratch fork is not an
-  # eternal laggard / re-sampled drill target. LIKE is safe here: the prefix is a fixed constant with
-  # no wildcard metacharacters.
+  # Exclude the restore drill's scratch forks (#27) so a leaked one is not an eternal laggard /
+  # re-sampled drill target. EXACTLY the drill's own shape, `<prefix><digits>` (expert review
+  # 2026-09-29 #34): this was `LIKE 'restoredrill%'`, but nothing refused that prefix for a real
+  # tenant, so `restoredrill-eu` provisioned fine and was then silently never migrated while
+  # `converged` read true. The exact shape is also refused at every tenant-facing birth path (see
+  # `scratch_id?/1`), so the two sets cannot overlap.
   defp exclude_scratch(query) do
-    from(s in query, where: not like(s.shard_id, ^(@scratch_prefix <> "%")))
+    from(s in query, where: fragment("? !~ ?", s.shard_id, ^@scratch_id_pattern))
   end
 
   defp template_shard_id do
