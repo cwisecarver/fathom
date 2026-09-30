@@ -87,6 +87,15 @@ defmodule Fathom.ShardExecutor do
   defp scope_of(:ro), do: :ro
   defp scope_of(_), do: :rw
 
+  # 401 with its OWN code, so a client can tell "get a fresh token and reconnect" from a revoke.
+  defp token_expired(shard_id) do
+    %Error{
+      message: "the token for shard \"#{shard_id}\" has expired; reconnect with a fresh one",
+      code: "FILO_TOKEN_EXPIRED",
+      status: 401
+    }
+  end
+
   defp auth_required?, do: Application.get_env(:fathom, :hrana_auth, :disabled) == :required
 
   defp do_open(shard_id, scope, token_version) do
@@ -206,6 +215,11 @@ defmodule Fathom.ShardExecutor do
       # either — unlike the write fence below, which is about durability and deliberately lets
       # reads through. Cache-only, so this never reaches Postgres; an unknown floor allows, since
       # `authorize/2` already did the authoritative check when the connection opened.
+      # Expiry, per statement, beside the revocation floor (expert review 2026-09-29 #23):
+      # `max_age` was only ever checked at `authorize/2`, once per WebSocket / baton chain.
+      HranaAuth.expired?(token_version) ->
+        {:error, token_expired(shard_id)}
+
       not HranaAuth.version_current?(shard_id, token_version) ->
         {:error,
          %Error{
@@ -766,6 +780,11 @@ defmodule Fathom.ShardExecutor do
       when is_binary(sql) do
     cond do
       # Same per-statement revocation re-check as execute/2 — a script is not a loophole.
+      # Expiry, per statement, beside the revocation floor (expert review 2026-09-29 #23):
+      # `max_age` was only ever checked at `authorize/2`, once per WebSocket / baton chain.
+      HranaAuth.expired?(token_version) ->
+        {:error, token_expired(shard_id)}
+
       not HranaAuth.version_current?(shard_id, token_version) ->
         {:error,
          %Error{
@@ -991,6 +1010,11 @@ defmodule Fathom.ShardExecutor do
 
   defp describe_allowed(shard_id, token_version, sql) do
     cond do
+      # Expiry, per statement, beside the revocation floor (expert review 2026-09-29 #23):
+      # `max_age` was only ever checked at `authorize/2`, once per WebSocket / baton chain.
+      HranaAuth.expired?(token_version) ->
+        {:error, token_expired(shard_id)}
+
       not HranaAuth.version_current?(shard_id, token_version) ->
         {:error,
          %Error{

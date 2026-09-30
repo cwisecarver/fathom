@@ -83,6 +83,48 @@ defmodule Fathom.HranaAuthTest do
     assert {:ok, {:rw, _}} = HranaAuth.authorize("acme", token!("acme"))
   end
 
+  # Expert review 2026-09-29 #23: `max_age` was enforced only at authorize (once per WebSocket /
+  # baton chain), so a stolen token used once before expiry kept a session alive forever. The
+  # context now carries the token's real deadline — minted into the token as "e", so it does not
+  # depend on when the session started — and the executor refuses statements past it.
+  test "the authorize context carries the token's own expiry, not the session's start" do
+    require_auth!()
+    Application.put_env(:fathom, :hrana_token_max_age, 60)
+    signed_at = System.system_time(:second) - 50
+
+    assert {:ok, {:rw, {_version, expires_at}}} =
+             HranaAuth.authorize("acme", token!("acme", signed_at: signed_at))
+
+    assert expires_at == signed_at + 60
+    refute HranaAuth.expired?({1, expires_at})
+    assert HranaAuth.expired?({1, System.system_time(:second) - 1})
+    refute HranaAuth.expired?(1), "no expiry to check when max_age is :infinity / auth is off"
+  end
+
+  test "a stream whose token expired mid-session is refused per statement (#23)" do
+    shard = "expiry_#{System.unique_integer([:positive])}"
+
+    on_exit(fn ->
+      Fathom.Shards.drain(shard, 2_000)
+      for s <- ["", "-wal", "-shm"], do: File.rm(Fathom.Shard.db_path(shard) <> s)
+    end)
+
+    live = System.system_time(:second) + 60
+    {:ok, h} = Fathom.ShardExecutor.open(shard, {:rw, {1, live}})
+    stmt = %Filo.Stmt{sql: "SELECT 1", args: []}
+    assert {:ok, _} = Fathom.ShardExecutor.execute(h, stmt)
+    :ok = Fathom.ShardExecutor.close(h)
+
+    # The same session shape, but its token's deadline has passed since `hello`.
+    {:ok, h2} = Fathom.ShardExecutor.open(shard, {:rw, {1, System.system_time(:second) - 1}})
+
+    assert {:error, %Filo.Error{status: 401, code: "FILO_TOKEN_EXPIRED"}} =
+             Fathom.ShardExecutor.execute(h2, stmt),
+           "an expired token kept running statements on an already-open session"
+
+    :ok = Fathom.ShardExecutor.close(h2)
+  end
+
   test "a nil shard passes through so open(nil) keeps its fail-closed 400 (#26)" do
     require_auth!()
     # {:ok, :rw} — the scope is moot; open(nil, _) refuses with a 400 regardless.

@@ -90,9 +90,15 @@ defmodule Fathom.HranaAuth do
 
   Filo treats the context as OPAQUE at all four of its call sites, so widening it from an atom to
   a tuple is not a wire or API change for it.
+
+  With a finite `:hrana_token_max_age` the version slot is `{version, expires_at}` (unix seconds,
+  expert review 2026-09-29 #23), so the executor can refuse a statement once the token has
+  EXPIRED as well as once it is revoked — see `expired?/1`.
   """
+  @type token_ref :: integer() | {integer(), integer()} | nil
+
   @spec authorize(String.t() | nil, String.t() | nil) ::
-          {:ok, {:rw | :ro, integer() | nil}} | {:error, Filo.Error.t()}
+          {:ok, {:rw | :ro, token_ref()}} | {:error, Filo.Error.t()}
   # No shard resolved: authorize as :rw so `ShardExecutor.open(nil, _)` refuses with its
   # clearer 400 (the fail-closed posture, finding #26) instead of a misleading 401 —
   # nothing can open on a nil shard regardless, so the scope here is moot.
@@ -119,7 +125,7 @@ defmodule Fathom.HranaAuth do
       # stream open as Filo's authorize context, so the executor can re-check the revocation floor
       # per statement — `authorize/2` runs exactly ONCE per WebSocket connection, at `hello`, and
       # a django-libsql connection lives for hours.
-      {:ok, {decode_scope(Map.get(payload, "sc")), version}}
+      {:ok, {decode_scope(Map.get(payload, "sc")), with_expiry(version, payload)}}
     else
       # Bad signature/expiry, a token for a different shard, a revoked (stale-version)
       # token, or an id that doesn't cast (defense-in-depth). One opaque refusal for
@@ -147,8 +153,10 @@ defmodule Fathom.HranaAuth do
   Cache-only (`Revocations.cached_floor/1`): never touches Postgres, and an unknown floor allows,
   because `authorize/2` already did the authoritative check at `hello`.
   """
-  @spec version_current?(String.t(), integer() | nil) :: boolean()
+  @spec version_current?(String.t(), token_ref()) :: boolean()
   def version_current?(_shard_id, nil), do: true
+
+  def version_current?(shard_id, {version, _expires_at}), do: version_current?(shard_id, version)
 
   def version_current?(shard_id, version) when is_integer(version) do
     case Revocations.cached_floor(shard_id) do
@@ -218,7 +226,11 @@ defmodule Fathom.HranaAuth do
         # only, no Repo) defaults to version 1 — the floor is also read fail-open, so
         # a v1 token works until a revoke actually bumps the floor above 1.
         version = current_token_version(canonical)
-        payload = put_scope(%{"s" => canonical, "v" => version}, scope)
+
+        payload =
+          %{"s" => canonical, "v" => version}
+          |> put_scope(scope)
+          |> put_expiry(sign_opts)
 
         # Issuance ledger (#37). Best-effort and AFTER the claims are settled: the mint is the
         # authoritative act and a ledger outage must never fail it (`mix fathom.token` runs with no
@@ -230,6 +242,49 @@ defmodule Fathom.HranaAuth do
 
       :error ->
         {:error, :invalid_shard_id}
+    end
+  end
+
+  # EXPIRY IS ENFORCED FOR THE WHOLE SESSION, NOT JUST AT ITS START (expert review 2026-09-29 #23).
+  #
+  # `Phoenix.Token.verify/4` checks `max_age` once, at `authorize/2` — i.e. at a WebSocket's `hello`
+  # or the first request of a baton chain — and neither is ever re-authorized, so a stolen token used
+  # once before its expiry kept a django-libsql socket (no idle or lifetime limit) or a continuously
+  # used baton chain alive indefinitely. The 2026-08-20 #22 fix threaded the token's VERSION to the
+  # executor so revocation is re-checked per statement; this threads its EXPIRY the same way.
+  #
+  # The deadline is minted into the token as `"e"` (signed, so unforgeable), because `verify/4`
+  # returns only the payload, not `signed_at`. A token minted before this has no `"e"`, and gets
+  # `now + max_age` at authorize — an UPPER bound on its real expiry (it was already some age when
+  # presented), which still bounds the session; it just may run a little past the true deadline.
+  defp with_expiry(version, payload) do
+    case max_age() do
+      age when is_integer(age) ->
+        {version, Map.get(payload, "e", System.system_time(:second) + age)}
+
+      _ ->
+        version
+    end
+  end
+
+  @doc """
+  Whether the token behind a stream's context has passed its expiry (expert review 2026-09-29 #23).
+  False when there is no expiry to check (auth disabled, or `:hrana_token_max_age` is `:infinity`).
+  """
+  @spec expired?(token_ref()) :: boolean()
+  def expired?({_version, expires_at}) when is_integer(expires_at),
+    do: System.system_time(:second) >= expires_at
+
+  def expired?(_token_ref), do: false
+
+  defp put_expiry(payload, sign_opts) do
+    case max_age() do
+      age when is_integer(age) ->
+        signed_at = Keyword.get(sign_opts, :signed_at, System.system_time(:second))
+        Map.put(payload, "e", signed_at + age)
+
+      _ ->
+        payload
     end
   end
 

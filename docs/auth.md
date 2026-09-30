@@ -82,6 +82,12 @@ revocation **floor**. That floor is the lever for two distinct operations:
   included — a revoked credential must not keep reading a tenant's data either. The check is
   cache-only, so it never reaches Postgres; an unknown floor allows, because `authorize/2` already
   did the authoritative check when the connection opened.
+
+  **Expiry is re-checked the same way** (expert review 2026-09-29 #23 — the #22 fix closed the
+  revocation half only). A token now carries its deadline as a signed `"e"` claim, and the executor
+  refuses any statement past it with `FILO_TOKEN_EXPIRED` (401, distinct from a revoke, so a client
+  knows to reconnect with a fresh token). A token minted before the claim existed is bounded by
+  `hello` time + `max_age` instead — an upper bound on its real deadline.
 - **`HranaAuth.rotate/1` — zero-downtime.** Raises the version and mints a **new** token, but stamps
   `token_version_bumped_at`, and `verify` keeps accepting the **previous** version for a grace window
   (`:hrana_rotation_grace_ms`, default 1h): mint-new → deploy → the old auto-hardens out. This is the
