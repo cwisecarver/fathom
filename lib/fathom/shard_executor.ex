@@ -901,6 +901,18 @@ defmodule Fathom.ShardExecutor do
             status: 400
           }
 
+        # The same stamp gate execute/2 applies (expert review 2026-09-05 #21) — without it a
+        # Hrana `sequence` carrying `PRAGMA user_version = N` forged the stamp that execute/2
+        # refuses (expert review 2026-09-29 #30).
+        opts.block_ddl? and not opts.template? and user_version_write?(stmt) ->
+          %Error{
+            message:
+              "PRAGMA user_version cannot be set on tenant \"#{shard_id}\"; the schema-version " <>
+                "stamp is advanced by the migration engine, not a direct tenant write",
+            code: "FILO_PRAGMA_BLOCKED",
+            status: 403
+          }
+
         true ->
           blocked_statement(stmt)
       end

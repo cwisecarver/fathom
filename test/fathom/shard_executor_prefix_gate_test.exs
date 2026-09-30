@@ -216,8 +216,22 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
              "`#{sql}` forged the schema-version stamp under :block_tenant_ddl"
     end
 
-    # The bare read still works (it discloses only the current stamp).
-    assert {:ok, _} = ShardExecutor.execute(h, stmt("PRAGMA user_version"))
+    # The Hrana `sequence` path shares the gate (expert review 2026-09-29 #30): refuse_script
+    # used to check only DDL, so a script carrying the same assignment forged the stamp that
+    # execute/2 refuses — and the stamp really moved.
+    for sql <- [
+          "PRAGMA user_version = 5",
+          "SELECT 1; PRAGMA user_version = 5",
+          "/* c */ PRAGMA main.user_version(5);"
+        ] do
+      assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
+               ShardExecutor.execute_sequence(h, sql),
+             "sequence `#{sql}` forged the schema-version stamp under :block_tenant_ddl"
+    end
+
+    # The bare read still works (it discloses only the current stamp) — and it is still 0.
+    assert {:ok, %Filo.StmtResult{rows: [[0]]}} =
+             ShardExecutor.execute(h, stmt("PRAGMA user_version"))
   end
 
   test "with :block_tenant_ddl OFF, PRAGMA user_version stays settable (the durability capability)",
