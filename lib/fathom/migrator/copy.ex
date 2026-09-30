@@ -79,7 +79,18 @@ defmodule Fathom.Migrator.Copy do
          # future caller opening this path with the serving configuration would silently upload an
          # incomplete file. Paying a new correctness coupling for an unmeasurable gain is the wrong
          # trade; if the concurrency claim is ever measured on the rig, this becomes worth it again.
-         {:ok, conn} <- Connection.open(dest_path) do
+         {:ok, conn} <- Connection.open(dest_path),
+         # FOREIGN KEYS OFF FOR THE REPLAY, AS DJANGO HAS THEM (expert review 2026-09-29 #15).
+         # `Connection.open` turns them ON (2026-07-14 #2) and its escape hatch is a client sending
+         # `PRAGMA foreign_keys=OFF` on its own stream — but the replay has no client, and Django's
+         # SQLite schema editor issues that pragma BEFORE `BEGIN`, so it is never in the captured
+         # buffer. With FKs enforced, Django's table rebuild (CREATE new__x / INSERT…SELECT / DROP
+         # TABLE x / RENAME) counts a deferred violation for every child row that references `x` at
+         # the DROP, and COMMIT fails — every AlterField/RemoveField on a referenced model, on every
+         # POPULATED tenant (empty ones pass, which is why capture on the template never saw it).
+         # Must be set outside a transaction; SQLite ignores it inside one. Integrity is re-checked
+         # per step below, as Django's `check_constraints()` does.
+         :ok <- Connection.exec(conn, "PRAGMA foreign_keys=OFF") do
       try do
         Enum.reduce_while(chain, :ok, fn step, :ok ->
           {version, statements, transform} = normalize_step(step)
@@ -171,6 +182,7 @@ defmodule Fathom.Migrator.Copy do
            # added, and a transform that failed must roll back the DDL with it rather than leaving
            # the shard with a new column and no data in it.
            :ok <- run_transform(conn, transform, shard_id, version),
+           :ok <- foreign_key_check(conn, version),
            :ok <- Connection.exec(conn, "COMMIT") do
         :ok
       else
@@ -185,6 +197,17 @@ defmodule Fathom.Migrator.Copy do
          :ok <- Connection.exec(conn, "PRAGMA user_version = #{version}"),
          :ok <- Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)") do
       :ok
+    end
+  end
+
+  # The integrity check Django's schema editor runs on exit (`check_constraints()`), inside the
+  # step's transaction and before COMMIT, so a step that genuinely breaks a reference rolls back
+  # instead of shipping. Needed because FKs are OFF for the replay (see `migrate_chain/4`).
+  defp foreign_key_check(conn, version) do
+    case Connection.query(conn, "PRAGMA foreign_key_check", []) do
+      {:ok, %{rows: []}} -> :ok
+      {:ok, %{rows: rows}} -> {:error, {:foreign_key_violation, version, Enum.take(rows, 5)}}
+      {:error, _} = error -> error
     end
   end
 

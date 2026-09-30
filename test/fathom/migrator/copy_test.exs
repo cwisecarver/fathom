@@ -137,4 +137,59 @@ defmodule Fathom.Migrator.CopyTest do
     # The table the injected fragment tried to drop is still there, with both rows.
     assert %{rows: [[2]]} = query!(dest, "SELECT count(*) FROM app_thing")
   end
+
+  # Expert review 2026-09-29 #15. Django's SQLite schema editor sends `PRAGMA foreign_keys = OFF`
+  # BEFORE `BEGIN`, so it is never in the captured buffer, and `Connection.open` turns FKs ON. The
+  # replay then ran Django's table rebuild with FKs enforced: the DROP of a parent counts a deferred
+  # violation for every child row that references it, and COMMIT fails. Every AlterField /
+  # RemoveField / constraint change on a referenced model failed on every POPULATED tenant. The
+  # fixture is populated on purpose — an empty child table passes either way, which is exactly why
+  # capture (on the template) and the existing tests never saw it. Pre-fix this returns
+  # {:error, _} ("FOREIGN KEY constraint failed").
+  defp seed_parent_child!(path) do
+    {:ok, conn} = Connection.open(path)
+    :ok = Connection.exec(conn, "CREATE TABLE app_parent (id INTEGER PRIMARY KEY, name TEXT)")
+
+    :ok =
+      Connection.exec(
+        conn,
+        "CREATE TABLE app_child (id INTEGER PRIMARY KEY, " <>
+          "parent_id INTEGER NOT NULL REFERENCES app_parent (id) DEFERRABLE INITIALLY DEFERRED)"
+      )
+
+    :ok = Connection.exec(conn, "INSERT INTO app_parent (id, name) VALUES (1, 'p')")
+    :ok = Connection.exec(conn, "INSERT INTO app_child (id, parent_id) VALUES (1, 1)")
+    Connection.close(conn)
+  end
+
+  # Django's `_remake_table`, as captured: build new__x, copy, drop x, rename.
+  @rebuild_parent [
+    {"CREATE TABLE \"new__app_parent\" (\"id\" integer NOT NULL PRIMARY KEY, " <>
+       "\"name\" varchar(200) NOT NULL)", []},
+    {"INSERT INTO \"new__app_parent\" (\"id\", \"name\") SELECT \"id\", \"name\" " <>
+       "FROM \"app_parent\"", []},
+    {"DROP TABLE \"app_parent\"", []},
+    {"ALTER TABLE \"new__app_parent\" RENAME TO \"app_parent\"", []}
+  ]
+
+  test "a Django table rebuild of an FK-referenced table replays onto a populated shard",
+       %{source: source, dest: dest} do
+    seed_parent_child!(source)
+
+    assert :ok = Copy.migrate(source, dest, 2, @rebuild_parent),
+           "the rebuild failed under enforced foreign keys on a shard with child rows"
+
+    assert %{rows: [[1, 1]]} = query!(dest, "SELECT id, parent_id FROM app_child")
+    assert %{rows: [[1, "p"]]} = query!(dest, "SELECT id, name FROM app_parent")
+  end
+
+  # The other half: FKs are OFF during the replay, so the per-step `foreign_key_check` is what still
+  # refuses a step that GENUINELY breaks a reference — the check Django's schema editor runs on exit.
+  test "a step that genuinely orphans a child row is refused, not shipped",
+       %{source: source, dest: dest} do
+    seed_parent_child!(source)
+
+    assert {:error, {:foreign_key_violation, 2, [_ | _]}} =
+             Copy.migrate(source, dest, 2, [{"DELETE FROM app_parent", []}])
+  end
 end
