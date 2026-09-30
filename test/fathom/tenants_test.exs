@@ -90,6 +90,42 @@ defmodule Fathom.TenantsTest do
       refute Enum.any?(Path.wildcard(local_base <> "*"), &String.contains?(&1, ".fenced."))
     end
 
+    # Expert review 2026-09-29 #20, the purge half. A migration job already past every status check
+    # can `retain` (server-side copy the live object to `<id>@v`) between purge's LIST and its
+    # DELETEs, creating an object the sweep never saw — a full copy of an erased tenant that nothing
+    # retires. The hook plants exactly the object that race leaves, after the first sweep. Pre-fix
+    # purge swept once, so it survived.
+    test "a retain copy that lands during the sweep is still erased", %{id: id} do
+      write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('secret')"])
+      flush!(id)
+
+      prev = Application.get_env(:fathom, :shard_storage)
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      leaked = Path.join(remote_dir(), "#{id}@1.db")
+
+      Application.put_env(
+        :fathom,
+        :faulty_before,
+        {:put_tombstone, fn sid -> if sid == id, do: File.write!(leaked, "secret bytes") end}
+      )
+
+      on_exit(fn ->
+        Application.delete_env(:fathom, :faulty_before)
+
+        if prev,
+          do: Application.put_env(:fathom, :shard_storage, prev),
+          else: Application.delete_env(:fathom, :shard_storage)
+      end)
+
+      assert :ok = Tenants.purge(id)
+
+      assert File.exists?(Path.join([remote_dir(), "tombstones", id])),
+             "fixture: no marker written"
+
+      refute File.exists?(leaked),
+             "a retained copy that landed during the purge survived the erase"
+    end
+
     test "is idempotent on an already-erased tenant", %{id: id} do
       assert :ok = Tenants.purge(id)
       assert :ok = Tenants.purge(id)

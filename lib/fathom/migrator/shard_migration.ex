@@ -192,7 +192,7 @@ defmodule Fathom.Migrator.ShardMigration do
            # post-cutover writes survive at <shard>@<current> for the retention window
            # instead of being destroyed unrecoverably (finding #13). RevertJob schedules
            # its retirement.
-           :ok <- Storage.retain(shard_id, current),
+           :ok <- retain_unless_deleted(shard_id, current),
            # If-Match-fence the restore on the live object's pull-time etag (expert review
            # 2026-07-14 #4): the read-only fence/2 above only proves the LOCK is ours at THIS
            # instant, but the migrator can then stall and a coordinator steal + flush new bytes
@@ -642,6 +642,28 @@ defmodule Fathom.Migrator.ShardMigration do
     end
   end
 
+  # NEVER CREATE A COPY OF A DELETED TENANT (expert review 2026-09-29 #20, the purge half).
+  #
+  # `run/3` refuses a tenant that is not active, and `mark_migrating` refuses one that left active
+  # after `run/3` looked — but a job ALREADY past both keeps going, and `retain` is an unconditional
+  # server-side copy to `<shard>@v`. A delete tombstones the tenant synchronously and purges storage
+  # later (`DeleteJob`); a retain landing between purge's LIST and its DELETEs creates an object the
+  # purge never saw and nothing will ever retire — a full copy of an erased tenant.
+  #
+  # The tombstone is always written BEFORE the purge starts, so checking it here, immediately before
+  # the copy, refuses every retain that could land inside a purge except one whose check itself
+  # predates the tombstone — a single S3 round trip that would have to span the delete call, the
+  # job pickup and the purge's LIST. `Tenants.purge/1` sweeps a second time after writing its marker
+  # for that remainder. The answer reuses `{:not_active, "deleted"}` so both jobs cancel it the way
+  # they cancel a tenant `run/3` refused, without `mark_failed` overwriting the deleted status.
+  # Covers the REVERT path too: it stays unguarded for a SUSPENDED tenant (an operator's restore),
+  # but reverting a deleted one is never meaningful and its retain is the same leak.
+  defp retain_unless_deleted(shard_id, version) do
+    if Fathom.Tenants.Tombstones.tombstoned?(shard_id),
+      do: {:error, {:not_active, "deleted"}},
+      else: Storage.retain(shard_id, version)
+  end
+
   defp forward(shard_id, target, current, prev, chain, old, new, lease, expected_etag) do
     # `current` is the FILE's version (`PRAGMA user_version`, read by `do_run/3`), which is what
     # the bytes we are about to retain actually are. `prev` is the DIRECTORY's stamp, kept only to
@@ -668,7 +690,7 @@ defmodule Fathom.Migrator.ShardMigration do
       )
     end
 
-    with :ok <- Storage.retain(shard_id, current),
+    with :ok <- retain_unless_deleted(shard_id, current),
          # shard_id is threaded so a version's per-shard transform (#26) knows whose data it is
          # backfilling. Passed for every migration, not only transform-carrying ones — the chain is
          # built from release rows, so which steps carry a transform is not knowable here.

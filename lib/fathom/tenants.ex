@@ -215,15 +215,20 @@ defmodule Fathom.Tenants do
           # boot even if the directory row that backs the Tombstones ETS is restored away. Its
           # `tombstones/` namespace is untouched by purge_shard, so a job retry can't sweep it. A write
           # failure retries the (idempotent) job so the backstop is durably in place.
-          case Storage.put_tombstone(id) do
-            :ok ->
-              rm_local(id)
-              :telemetry.execute([:fathom, :tenants, :deleted], %{count: 1}, %{shard_id: id})
-              :ok
-
+          # SWEEP AGAIN after the marker (expert review 2026-09-29 #20). A migration job already
+          # past every status check may have landed a `retain` copy (`<id>@v`) between the first
+          # sweep's LIST and its DELETEs; the migrator refuses to retain for a tombstoned id, and
+          # this second pass collects the one that raced that check. Idempotent, like the first.
+          with :ok <- Storage.put_tombstone(id),
+               :ok <- Storage.purge_shard(id) do
+            rm_local(id)
+            :telemetry.execute([:fathom, :tenants, :deleted], %{count: 1}, %{shard_id: id})
+            :ok
+          else
             {:error, reason} ->
               Logger.error(
-                "tenant #{id}: tombstone marker write failed (#{inspect(reason)}) — will retry"
+                "tenant #{id}: tombstone marker write or final sweep failed " <>
+                  "(#{inspect(reason)}) — will retry"
               )
 
               {:error, reason}

@@ -149,6 +149,13 @@ defmodule Fathom.Migrator.RevertJob do
 
         {:cancel, :no_retained_version}
 
+      # The tenant was DELETED while this revert ran (expert review 2026-09-29 #20): its retain
+      # refused so no copy of an erased tenant is created. Nothing to retry, and `mark_failed` would
+      # overwrite the deleted status.
+      {:error, {:not_active, status}} ->
+        Logger.info("shard #{shard_id}: revert abandoned — tenant is #{inspect(status)}")
+        {:cancel, :not_active}
+
       {:error, reason} ->
         handle_error(job, shard_id, reason)
     end

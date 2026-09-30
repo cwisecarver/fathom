@@ -8,6 +8,7 @@ defmodule Fathom.Migrator.ShardMigrationTest do
   alias Fathom.Migrator.{RetirementJob, ShardMigration}
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.{Directory, Migrator}
+  alias Fathom.Tenants.Tombstones
 
   # A data transform that rewrites VALUES in place — the class of change DDL cannot express, and
   # whose revert is the leg expert review 2026-09-05 #28 found untested. Allowlisted per-test.
@@ -515,6 +516,44 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert {:ok, ^before} = Storage.object_etag(shard), "the object was rewritten after a suspend"
     refute retained?(shard, 1)
     assert {:ok, %{status: "suspended", schema_version: 1}} = Directory.get(shard)
+  end
+
+  # Expert review 2026-09-29 #20, the purge half. A job already past `run/3` and `mark_migrating`
+  # kept going when the tenant was DELETED under it, and `retain` copied the live object to
+  # `<shard>@1` — an object a concurrent purge may never see. The hook tombstones the tenant in the
+  # fleet-wide gate during the migrator's pull; the directory row is left `active` so
+  # `mark_migrating` still passes, which is the state a delete landing just AFTER the mark produces.
+  # Pre-fix the copy is made and `retained?/2` is true.
+  test "a tenant deleted mid-run gets no retained copy (#20)", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    {:ok, before} = Storage.object_etag(shard)
+
+    prev = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    test_pid = self()
+
+    Application.put_env(
+      :fathom,
+      :faulty_before,
+      {:pull,
+       fn sid -> if sid == shard and self() == test_pid, do: Tombstones.put(shard), else: :ok end}
+    )
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+      :ets.delete(Tombstones, shard)
+
+      if prev,
+        do: Application.put_env(:fathom, :shard_storage, prev),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    assert {:error, {:not_active, "deleted"}} = ShardMigration.run(shard, 2)
+    refute retained?(shard, 1), "a copy of a deleted tenant was created"
+
+    assert {:ok, ^before} = Storage.object_etag(shard),
+           "the deleted tenant's object was rewritten"
   end
 
   # Expert review 2026-08-26 #8. The forward path was the ONLY durable-object producer in the

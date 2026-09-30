@@ -254,6 +254,32 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     refute_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1})
   end
 
+  # Expert review 2026-09-29 #20, the purge half: a revert of a DELETED tenant must not create a
+  # `<shard>@2` backup copy (a copy of an erased tenant the purge may never see), and must cancel
+  # rather than `mark_failed` over the deleted status. Pre-fix the retain ran and the job fell to
+  # `handle_error/3`.
+  test "RevertJob of a deleted tenant creates no backup copy and cancels", %{shard: shard} do
+    # A REAL v2 live object: with only the directory cut over, the live file is still v1 and the
+    # revert takes its crash-forward branch, which never retains — the test would pass pre-fix.
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+    File.rm(Path.join(remote_dir(), "#{shard}@2.db"))
+    Fathom.Tenants.Tombstones.put(shard)
+    on_exit(fn -> :ets.delete(Fathom.Tenants.Tombstones, shard) end)
+
+    capture_log(fn ->
+      assert {:cancel, :not_active} =
+               perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 1})
+    end)
+
+    refute File.exists?(Path.join(remote_dir(), "#{shard}@2.db")),
+           "the revert copied a deleted tenant's live object to a backup"
+
+    refute match?({:ok, %{status: "failed"}}, Directory.get(shard)),
+           "the cancelled revert quarantined the shard"
+  end
+
   # THE RETAINED BACKUP MUST BE LABELLED WITH THE BYTES IT HOLDS (expert review 2026-08-24 #22).
   #
   # `do_run/3` treats the FILE as authoritative — `current = live_version(old)` reads
