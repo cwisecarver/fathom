@@ -567,8 +567,14 @@ defmodule Fathom.ShardExecutor do
   # trying to make cheap.
   # One `:became_dirty` cast per checkout (expert review 2026-08-01 #42). Keyed by the
   # connection ref in the owning process's dictionary — the same single-owner idiom as the
-  # statement cache and the txn-write flag — so it dies with the stream and a write-heavy
-  # stream costs exactly one message rather than one per statement.
+  # statement cache and the txn-write flag — and a write-heavy stream costs exactly one message
+  # rather than one per statement.
+  #
+  # It does NOT "die with the stream" on its own: a `Filo.Socket` runs every stream of a WebSocket
+  # session in one long-lived process, so `close/1` must delete it (expert review 2026-09-29 #29).
+  # Left behind, it grew the socket's dictionary by one entry per stream for the life of the
+  # session, and a pooled conn reused in the same process inherited a stale `true` and skipped
+  # its `:became_dirty` signal (masked only by `wrote_during_checkout?` stickiness).
   @dirty_signalled_key :dirty_signalled
 
   defp signal_dirty_once(pid, conn) do
@@ -581,6 +587,8 @@ defmodule Fathom.ShardExecutor do
 
     :ok
   end
+
+  defp forget_dirty_signalled(conn), do: Process.delete({__MODULE__, @dirty_signalled_key, conn})
 
   @txn_wrote_key :txn_wrote
 
@@ -1083,6 +1091,7 @@ defmodule Fathom.ShardExecutor do
   @impl true
   def close({pid, ref, conn, _shard_id, scope, _ver, opts}) do
     forget_txn_write(conn)
+    forget_dirty_signalled(conn)
     if opts.template?, do: Capture.forget(conn)
 
     # Read (and clear) BEFORE the branch, so the key never outlives the stream on either path.

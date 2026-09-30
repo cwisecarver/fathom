@@ -54,6 +54,30 @@ defmodule Fathom.ShardExecutorTest do
     assert :ok = ShardExecutor.close(conn)
   end
 
+  # Expert review 2026-09-29 #29. A Filo.Socket runs every stream of a WebSocket session in ONE
+  # long-lived process, so any per-conn process-dictionary key that close/1 does not delete grows
+  # the socket's dictionary by one entry per stream for hours. `:dirty_signalled` was such a key.
+  # Invariant: after close/1, the stream leaves no ShardExecutor keys behind in its process.
+  test "close/1 leaves no per-conn process-dictionary state behind (WS socket process)",
+       %{shard: shard} do
+    executor_keys = fn ->
+      for {{Fathom.ShardExecutor, _, _} = k, _} <- Process.get(), do: k
+    end
+
+    {:ok, c} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(c, stmt("CREATE TABLE t (v INTEGER)"))
+    :ok = ShardExecutor.close(c)
+
+    for i <- 1..5 do
+      {:ok, c} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(c, stmt("INSERT INTO t VALUES (?)", [i]))
+      assert executor_keys.() != [], "the write did not set any per-conn state to leak"
+      :ok = ShardExecutor.close(c)
+    end
+
+    assert executor_keys.() == []
+  end
+
   test "two streams on the same shard get isolated transactions", %{shard: shard} do
     {:ok, a} = ShardExecutor.open(shard)
     {:ok, b} = ShardExecutor.open(shard)
