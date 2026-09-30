@@ -835,39 +835,71 @@ defmodule Fathom.Shards do
   @spec flush(Fathom.ShardId.t()) :: :ok | {:error, term()}
   def flush(shard_id) do
     case Registry.lookup(@registry, shard_id) do
+      # NO COORDINATOR IS NOT PROOF THE OBJECT IS CURRENT (expert review 2026-09-29 #13). A drop
+      # whose flush failed (S3 brownout, `:drop_flush_timeout`, a fence skip, an inconclusive 412)
+      # deliberately KEEPS the local `.db` with its acked-but-unflushed writes and exits
+      # (`Fathom.Shard.keep_local_release_lease/3`); every clean stop deletes it. So a local file
+      # with no coordinator is exactly the state where "the stored object is current" is FALSE, and
+      # answering `:ok` let an export or a keystone fork read the stale object as the tenant's
+      # complete data. Re-open it (a warm open marks it dirty) and flush; never report success on
+      # a copy we could not make durable.
       [] ->
-        :ok
+        if File.exists?(Fathom.Shard.db_path(shard_id)),
+          do: flush_kept_local(shard_id),
+          else: :ok
 
       [{pid, _}] ->
-        try do
-          Fathom.Shard.flush_now(pid)
-        catch
-          # A hung/slow store (or a live-writer livelock) past @flush_now_timeout: the shard is
-          # NOT durably clean, so the flush-before-fork primitive (Tenants.fork flush_source:, the
-          # tenant API flush endpoint) must NOT report success — a keystone-fork would clone stale
-          # bytes on a swallowed timeout (expert review #14). Surface it as an error.
-          :exit, {:timeout, _} ->
-            {:error, :flush_timeout}
-
-          # The coordinator legitimately went away mid-call (idle-drop flushes on its way out; a
-          # steal quarantines; a normal/shutdown stop) — its stored state stands, so best-effort
-          # :ok. A force-stop with a pending waiter returns via an explicit reply, not this catch
-          # (review 2026-07-18 #4 settles flush_waiters in every terminate clause).
-          :exit, {reason, _} when reason in [:noproc, :normal, :shutdown] ->
-            :ok
-
-          :exit, {{:shutdown, _}, _} ->
-            :ok
-
-          # Any other exit (a genuine coordinator crash reason) left durability unknown — surface
-          # it rather than swallow it as a false success.
-          :exit, {reason, _} ->
-            {:error, {:flush_exited, reason}}
-
-          :exit, reason ->
-            {:error, {:flush_exited, reason}}
-        end
+        flush_pid(shard_id, pid)
     end
+  end
+
+  defp flush_kept_local(shard_id) do
+    case ensure(shard_id) do
+      {:ok, pid} -> flush_pid(shard_id, pid)
+      {:error, reason} -> {:error, {:unflushed_local_copy, reason}}
+    end
+  end
+
+  defp flush_pid(shard_id, pid) do
+    try do
+      Fathom.Shard.flush_now(pid)
+    catch
+      # A hung/slow store (or a live-writer livelock) past @flush_now_timeout: the shard is
+      # NOT durably clean, so the flush-before-fork primitive (Tenants.fork flush_source:, the
+      # tenant API flush endpoint) must NOT report success — a keystone-fork would clone stale
+      # bytes on a swallowed timeout (expert review #14). Surface it as an error.
+      :exit, {:timeout, _} ->
+        {:error, :flush_timeout}
+
+      # The coordinator legitimately went away mid-call (idle-drop flushes on its way out; a
+      # steal quarantines; a normal/shutdown stop) — its stored state stands, so best-effort
+      # :ok. A force-stop with a pending waiter returns via an explicit reply, not this catch
+      # (review 2026-07-18 #4 settles flush_waiters in every terminate clause).
+      #
+      # Unless it went away LEAVING a local copy — a drop whose own flush failed (#13 above).
+      :exit, {reason, _} when reason in [:noproc, :normal, :shutdown] ->
+        stopped_clean(shard_id)
+
+      :exit, {{:shutdown, _}, _} ->
+        stopped_clean(shard_id)
+
+      # Any other exit (a genuine coordinator crash reason) left durability unknown — surface
+      # it rather than swallow it as a false success.
+      :exit, {reason, _} ->
+        {:error, {:flush_exited, reason}}
+
+      :exit, reason ->
+        {:error, {:flush_exited, reason}}
+    end
+  end
+
+  # A clean stop deletes the local file. One still there means the stop kept it (its drop flush
+  # failed), or a fresh coordinator has already warm-opened it — either way this call did not make
+  # it durable, and the error is retryable (the retry finds the running coordinator and flushes it).
+  defp stopped_clean(shard_id) do
+    if File.exists?(Fathom.Shard.db_path(shard_id)),
+      do: {:error, :unflushed_local_copy},
+      else: :ok
   end
 
   # Wait up to `exit_wait_ms` for the coordinator to exit after a drain request, cleaning
