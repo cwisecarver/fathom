@@ -1046,7 +1046,8 @@ defmodule Fathom.Shard.Connection do
   """
   @spec reset_for_reuse(reference(), :ro | :rw) :: :ok | {:error, term()}
   def reset_for_reuse(conn, scope) when scope in [:ro, :rw] do
-    with :ok <- rollback_if_open(conn) do
+    with :ok <- rollback_if_open(conn),
+         :ok <- reload_schema(conn) do
       # `:rw` re-applies the writable-path pragmas (`configure/1`). `:ro` RE-ASSERTS `query_only=ON`
       # (expert review 2026-09-18 #13): a `:ro` handle from the WAL-recovery / new-file fallback is
       # physically READ-WRITE, and its read-only-ness rests SOLELY on `PRAGMA query_only=ON` (see the
@@ -1057,6 +1058,18 @@ defmodule Fathom.Shard.Connection do
       if scope == :rw, do: configure(conn), else: maybe_query_only(conn, scope)
     end
   end
+
+  # RELOAD THE SCHEMA BEFORE A POOLED HANDLE SERVES AGAIN (expert review 2026-09-29 #11).
+  #
+  # A handle idle in the pool does not see a sibling stream's DDL until it next reads the schema
+  # cookie, and `prepare` alone does not read it: on a stale schema it returns the OLD column list,
+  # which the statement-cache miss path stores — so after a sibling's `ALTER TABLE t ADD COLUMN y`,
+  # `SELECT *` reported `["id","x"]` over rows `[1, 1, nil]` for the rest of the stream (the
+  # 2026-08-26 #7 mis-mapping, back through pooling). Measured on exqlite: neither a rollback,
+  # `PRAGMA query_only=ON`, `PRAGMA schema_version` nor `BEGIN; ROLLBACK` refreshes it; STEPPING a
+  # statement that reads `sqlite_schema` does. `:rw` was protected only incidentally, by
+  # `PRAGMA max_page_count` in `configure/1`, and not at all when the size cap is disabled.
+  defp reload_schema(conn), do: Sqlite3.execute(conn, "SELECT 1 FROM sqlite_schema LIMIT 0")
 
   @doc """
   True when this connection's `temp` schema holds no objects — a precondition for POOLING it

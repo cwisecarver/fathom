@@ -201,6 +201,43 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
     :ok = ShardExecutor.close(hb)
   end
 
+  # Expert review 2026-09-29 #11: a pooled handle does not see a sibling's DDL until it re-reads the
+  # schema cookie, and a bare `prepare` does not — so the statement-cache miss path took the OLD
+  # column list and `SELECT *` returned two names over three values. Pre-fix the column count is 1
+  # over rows of width 2. `:ro` is the case that matters: its reset never ran the `max_page_count`
+  # pragma that incidentally refreshed `:rw`.
+  test "pooling ON: a reused :ro handle sees a sibling's ADD COLUMN in its column names", %{
+    shard: shard
+  } do
+    Application.put_env(:fathom, :connection_pool, true)
+
+    {:ok, w} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(w, stmt("CREATE TABLE s (a INTEGER)"))
+    {:ok, _} = ShardExecutor.execute(w, stmt("INSERT INTO s VALUES (1)"))
+
+    {:ok, ra} = ShardExecutor.open(shard, :ro)
+    assert {:ok, %StmtResult{cols: [_]}} = ShardExecutor.execute(ra, stmt("SELECT * FROM s"))
+    pid = pid_of(ra)
+    conn_a = conn_of(ra)
+    :ok = ShardExecutor.close(ra)
+    assert HandlePool.count(pool_of(pid), :ro) == 1, "precondition: the :ro handle was not pooled"
+
+    {:ok, _} = ShardExecutor.execute(w, stmt("ALTER TABLE s ADD COLUMN b INTEGER"))
+
+    {:ok, rc} = ShardExecutor.open(shard, :ro)
+    assert conn_of(rc) == conn_a, "precondition: the :ro handle was not reused"
+
+    assert {:ok, %StmtResult{cols: cols, rows: [row]}} =
+             ShardExecutor.execute(rc, stmt("SELECT * FROM s"))
+
+    assert length(cols) == length(row),
+           "a reused handle reported #{length(cols)} column names over rows of width " <>
+             "#{length(row)} after a sibling's ALTER TABLE"
+
+    :ok = ShardExecutor.close(rc)
+    :ok = ShardExecutor.close(w)
+  end
+
   # The availability direction: Django sends `PRAGMA foreign_keys = ON` on every new connection. It
   # is re-applied by configure/1 on reuse, so it must NOT defeat pooling — otherwise the fix would
   # silently turn pooling off for every Django client.
