@@ -144,6 +144,82 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
     :ok = ShardExecutor.close(hb)
   end
 
+  # Expert review 2026-09-29 #6: reset_for_reuse/2 rolls back and re-runs configure/1 — it does not
+  # touch the TEMP schema, nor connection-local switches configure/1 never sets. A pooled handle
+  # therefore carried a stream's TEMP table (shadowing the main table of the same name for the next
+  # stream's unqualified SQL — reads saw the temp rows, writes went to a table that is never flushed)
+  # and its `ignore_check_constraints`. Pre-fix both handles were pooled and reused.
+  test "pooling ON: a handle holding a TEMP object is closed, not pooled", %{shard: shard} do
+    Application.put_env(:fathom, :connection_pool, true)
+
+    {:ok, ha} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(ha, stmt("INSERT INTO kv VALUES ('real')"))
+    {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TEMP TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(ha, stmt("INSERT INTO kv VALUES ('fake')"))
+
+    {:ok, hb} = ShardExecutor.open(shard)
+    pid = pid_of(ha)
+    conn_a = conn_of(ha)
+    :ok = ShardExecutor.close(ha)
+
+    assert HandlePool.count(pool_of(pid)) == 0, "a handle holding a TEMP table was pooled"
+
+    {:ok, hc} = ShardExecutor.open(shard)
+    refute conn_of(hc) == conn_a, "the next stream reused the handle holding a TEMP table"
+
+    assert {:ok, %StmtResult{rows: [["real"]]}} =
+             ShardExecutor.execute(hc, stmt("SELECT v FROM kv")),
+           "an unqualified read saw another stream's TEMP table instead of the main one"
+
+    :ok = ShardExecutor.close(hc)
+    :ok = ShardExecutor.close(hb)
+  end
+
+  test "pooling ON: a handle a stream set a session-only pragma on is closed, not pooled", %{
+    shard: shard
+  } do
+    Application.put_env(:fathom, :connection_pool, true)
+
+    {:ok, ha} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE c (n INTEGER CHECK (n >= 0))"))
+    {:ok, _} = ShardExecutor.execute(ha, stmt("PRAGMA ignore_check_constraints = ON"))
+
+    {:ok, hb} = ShardExecutor.open(shard)
+    pid = pid_of(ha)
+    :ok = ShardExecutor.close(ha)
+
+    assert HandlePool.count(pool_of(pid)) == 0,
+           "a handle with ignore_check_constraints=ON was pooled for the next stream"
+
+    {:ok, hc} = ShardExecutor.open(shard)
+
+    assert {:error, _} = ShardExecutor.execute(hc, stmt("INSERT INTO c VALUES (-5)")),
+           "a later stream inherited ignore_check_constraints and wrote a CHECK-violating row"
+
+    :ok = ShardExecutor.close(hc)
+    :ok = ShardExecutor.close(hb)
+  end
+
+  # The availability direction: Django sends `PRAGMA foreign_keys = ON` on every new connection. It
+  # is re-applied by configure/1 on reuse, so it must NOT defeat pooling — otherwise the fix would
+  # silently turn pooling off for every Django client.
+  test "pooling ON: a foreign_keys pragma (reset on reuse) does not defeat pooling", %{
+    shard: shard
+  } do
+    Application.put_env(:fathom, :connection_pool, true)
+
+    {:ok, ha} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(ha, stmt("PRAGMA foreign_keys = ON"))
+
+    {:ok, hb} = ShardExecutor.open(shard)
+    pid = pid_of(ha)
+    :ok = ShardExecutor.close(ha)
+
+    assert HandlePool.count(pool_of(pid)) == 1, "a foreign_keys pragma stopped the handle pooling"
+    :ok = ShardExecutor.close(hb)
+  end
+
   test "pooling ON: draining a pooled handle checkpoints+unlinks the WAL (A2 durability invariant)",
        %{shard: shard} do
     Application.put_env(:fathom, :connection_pool, true)

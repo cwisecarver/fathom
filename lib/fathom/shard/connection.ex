@@ -1059,6 +1059,36 @@ defmodule Fathom.Shard.Connection do
   end
 
   @doc """
+  True when this connection's `temp` schema holds no objects — a precondition for POOLING it
+  (expert review 2026-09-29 #6).
+
+  A TEMP table, view or trigger is connection state that neither a rollback nor `configure/1`
+  touches, so a pooled handle carried it into the NEXT stream: a `CREATE TEMP TRIGGER … ON main.t`
+  fired on a later request's writes, and a TEMP table named like a main table SHADOWED it for
+  unqualified names (which is how Django writes SQL) — reads returned the temp rows, and writes
+  landed in a table that is never flushed. Deliberately a raw prepare/step with no statement cache
+  and no watchdog: it runs at checkin, after the stream's own state is torn down.
+
+  Any failure answers `false`: a handle whose temp schema cannot be read is not pooled.
+  """
+  @spec temp_schema_empty?(reference()) :: boolean()
+  def temp_schema_empty?(conn) do
+    case Sqlite3.prepare(conn, "SELECT 1 FROM temp.sqlite_schema LIMIT 1") do
+      {:ok, stmt} ->
+        try do
+          Sqlite3.step(conn, stmt) == :done
+        after
+          Sqlite3.release(conn, stmt)
+        end
+
+      {:error, _} ->
+        false
+    end
+  rescue
+    _ -> false
+  end
+
+  @doc """
   Roll back any transaction left open on `conn`; `:ok` when it is already in autocommit.
 
   Called from `reset_for_reuse/2` AND directly at pool CHECKIN (`ShardExecutor.close/1`). The

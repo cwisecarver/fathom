@@ -159,6 +159,7 @@ defmodule Fathom.ShardExecutor do
     dml? = dml?(sql)
     ddl? = ddl?(sql)
     write? = dml? or ddl?
+    note_session_state(conn, sql)
 
     cond do
       # Statements no tenant may run, regardless of scope or config (expert review 2026-08-01
@@ -601,6 +602,61 @@ defmodule Fathom.ShardExecutor do
 
   defp forget_txn_write(conn), do: Process.delete({__MODULE__, @txn_wrote_key, conn})
 
+  # SESSION STATE A POOLED HANDLE MUST NOT CARRY (expert review 2026-09-29 #6). `reset_for_reuse/2`
+  # rolls back and (for `:rw`) re-runs `configure/1`, and that is all it CAN undo. Several
+  # allow-listed pragmas are connection-local switches it never touches — `ignore_check_constraints`
+  # disables CHECKs, `case_sensitive_like` changes LIKE, `recursive_triggers`, `legacy_alter_table`,
+  # `reverse_unordered_selects`, `temp_store`, … — and some (`case_sensitive_like`) have no read
+  # form, so they cannot be detected after the fact. So the stream that SETS one marks its handle,
+  # and `close/1` closes a marked handle instead of pooling it. These are the pragmas that are safe
+  # to pool after: `configure/1` re-applies them on `:rw` reuse (`foreign_keys`, `cache_size`), or
+  # they are durable/one-shot rather than a session switch.
+  @pool_safe_pragmas ~w(foreign_keys cache_size user_version application_id wal_checkpoint
+                        incremental_vacuum shrink_memory optimize)
+
+  @session_mutated_key :session_mutated
+
+  defp note_session_state(conn, sql) do
+    if session_pragma?(sql), do: mark_session_mutated(conn)
+    :ok
+  end
+
+  # A script is opaque (`Connection.exec/2`), so it is presumed to have set session state.
+  # Scripts are migration-rare; not pooling after one costs nothing measurable.
+  defp mark_session_mutated(conn), do: Process.put({__MODULE__, @session_mutated_key, conn}, true)
+
+  defp take_session_mutated(conn),
+    do: Process.delete({__MODULE__, @session_mutated_key, conn}) == true
+
+  defp session_pragma?(sql) when is_binary(sql) do
+    head = lead(sql, 7)
+
+    cond do
+      String.starts_with?(head, "pragma") ->
+        rest = sql |> strip_lead_noise() |> String.slice(6..-1//1) |> String.trim_leading()
+        {name_raw, tail} = split_pragma_name(rest)
+        name = String.downcase(name_raw)
+
+        (pragma_assignment?(tail) or argumentish_tail?(tail)) and
+          name not in @pool_safe_pragmas and not introspect_pragma?(name)
+
+      # `EXPLAIN PRAGMA x = …` applies parse-time pragmas without running the VDBE, the same reason
+      # `blocked_statement/1` recurses here.
+      String.starts_with?(head, "explain") ->
+        case explain_inner(sql) do
+          {:ok, inner} -> session_pragma?(inner)
+          :not_explain -> false
+        end
+
+      true ->
+        false
+    end
+  end
+
+  # Kept so the binary guard above does not narrow `do_execute/2`'s type inference for `sql` (which
+  # would mark `write_candidate?/1`'s own non-binary clause unreachable and fail the build).
+  defp session_pragma?(_sql), do: false
+
   # ---------------------------------------------------------------------------------------------
   # A2 quorum replication (expert-reviewed design in docs/a2-quorum-replication.md)
   # ---------------------------------------------------------------------------------------------
@@ -774,6 +830,8 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp run_script(conn, sql, shard_id, opts) do
+    mark_session_mutated(conn)
+
     case Connection.exec(conn, sql) do
       :ok ->
         # THE DURABILITY TRAP (#34): `exec` bypasses the `wrote?`-based WriteCounter bump in the
@@ -1003,11 +1061,19 @@ defmodule Fathom.ShardExecutor do
     forget_txn_write(conn)
     if opts.template?, do: Capture.forget(conn)
 
+    # Read (and clear) BEFORE the branch, so the key never outlives the stream on either path.
+    session_mutated? = take_session_mutated(conn)
+
     # With pooling on, hand the handle back to the coordinator's pool (checkin/4) instead of closing
     # it, so the next stream of this shard reuses it. NEVER pool a template handle — its DDL-capture
     # state is not part of what reset_for_reuse/2 scrubs. `checkin/4` owns the handle's fate (pool or
     # close); a plain `checkin/2` + local close is the non-pooled path, byte for byte as before.
-    if connection_pool?() and not opts.template? do
+    # Nor a handle carrying SESSION STATE `reset_for_reuse/2` cannot undo (expert review 2026-09-29
+    # #6): a connection-local pragma this stream set, or TEMP objects. Checked here, in the stream
+    # process, before the handle is handed off; such a handle is closed and the next stream opens
+    # fresh, which is exactly the pre-pooling behaviour for that one handle.
+    if connection_pool?() and not opts.template? and not session_mutated? and
+         Connection.temp_schema_empty?(conn) do
       # Finalize THIS stream's prepared statements + watchdog in THIS process before handing the
       # handle off — the coordinator cannot reach them, and an unfinalized statement makes
       # `sqlite3_close_v2` defer the eventual close, skipping the WAL checkpoint the durability
@@ -1527,6 +1593,8 @@ defmodule Fathom.ShardExecutor do
                                function_list module_list pragma_list compile_options
                                freelist_count page_count quick_check integrity_check
                                foreign_key_check stats optimize)
+
+  defp introspect_pragma?(name), do: name in @tenant_pragma_introspect
 
   defp blocked_statement(sql) when is_binary(sql) do
     head = lead(sql, 7)
