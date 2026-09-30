@@ -119,6 +119,72 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
            "a pooled handle idle past the ttl must be swept (pre-fix sweep/2 had no call site)"
   end
 
+  # Expert review 2026-09-29 #35. The sweep timer was armed at open and re-armed on every tick for
+  # the coordinator's whole life, but an idle shard's pool is always EMPTY (release/2 drains it) —
+  # so every open coordinator woke every ttl for nothing (~1000/s across ~30k coordinators at the
+  # 30 s default). Invariant: the timer runs only while the pool holds a handle.
+  test "pooling ON: an idle coordinator with an empty pool gets no sweep wakeups (#35)", %{
+    shard: shard
+  } do
+    Application.put_env(:fathom, :connection_pool, true)
+    prev_opts = Application.get_env(:fathom, :connection_pool_opts)
+    Application.put_env(:fathom, :connection_pool_opts, max_per_scope: 4, ttl_ms: 20)
+    on_exit(fn -> restore(:connection_pool_opts, prev_opts) end)
+
+    {:ok, h} = ShardExecutor.open(shard)
+    {:ok, %StmtResult{}} = ShardExecutor.execute(h, stmt("SELECT 1"))
+    pid = pid_of(h)
+    :ok = ShardExecutor.close(h)
+    on_exit(fn -> Shards.drain(shard, 2_000) end)
+
+    assert HandlePool.count(pool_of(pid)) == 0, "the fixture should leave the pool empty"
+
+    # Count the :sweep_pool messages the coordinator receives over ~8 ttl periods.
+    :erlang.trace(pid, true, [:receive])
+    on_exit(fn -> if Process.alive?(pid), do: :erlang.trace(pid, false, [:receive]) end)
+
+    # A FIXED window (a per-message timeout never expires pre-fix — a tick every 20 ms resets it).
+    deadline = System.monotonic_time(:millisecond) + 160
+
+    ticks =
+      Stream.repeatedly(fn ->
+        left = max(deadline - System.monotonic_time(:millisecond), 0)
+
+        receive do
+          {:trace, ^pid, :receive, :sweep_pool} -> 1
+          {:trace, ^pid, :receive, _} -> 0
+        after
+          left -> :done
+        end
+      end)
+      |> Enum.take_while(&(&1 != :done))
+      |> Enum.sum()
+
+    :erlang.trace(pid, false, [:receive])
+    assert ticks == 0, "an idle, empty-pool coordinator woke #{ticks} times to sweep nothing"
+  end
+
+  test "pooling ON: the sweep timer is armed while a handle is pooled and cancelled on drain (#35)",
+       %{shard: shard} do
+    Application.put_env(:fathom, :connection_pool, true)
+
+    {:ok, ha} = ShardExecutor.open(shard)
+    {:ok, hb} = ShardExecutor.open(shard)
+    {:ok, %StmtResult{}} = ShardExecutor.execute(ha, stmt("SELECT 1"))
+    pid = pid_of(ha)
+    on_exit(fn -> Shards.drain(shard, 2_000) end)
+
+    # B keeps the shard busy, so closing A pools A's handle — which must arm the sweep.
+    :ok = ShardExecutor.close(ha)
+    assert HandlePool.count(pool_of(pid)) == 1
+    assert is_reference(:sys.get_state(pid).sweep_timer)
+
+    # Last stream closes → the pool is drained → nothing left to sweep, so no timer.
+    :ok = ShardExecutor.close(hb)
+    assert HandlePool.count(pool_of(pid)) == 0
+    assert :sys.get_state(pid).sweep_timer == nil
+  end
+
   test "pooling ON: a handle checked in while the shard is still busy is reused by the next stream",
        %{shard: shard} do
     Application.put_env(:fathom, :connection_pool, true)
