@@ -997,8 +997,12 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
+  # DURABLE (expert review 2026-09-29 #26): the marker exists to survive a restart (2026-08-20
+  # #11b), and a plain `File.write` survives a BEAM restart but not an OS crash, which can lose a
+  # just-created file outright. fsync-before-rename, like every other file fathom trusts after a
+  # crash. Written only when a replica first goes torn, so the cost is off every hot path.
   defp sync_torn_marker(name, shard_id, %{torn: true}) do
-    File.write(torn_path(name, shard_id), "")
+    Fathom.Shard.Storage.atomic_write(torn_path(name, shard_id), "")
   end
 
   defp sync_torn_marker(name, shard_id, _state) do
@@ -1148,7 +1152,16 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   defp recover_live_shard(tab, name, shard_id) do
-    with {:ok, %{ckpt_seq: gen, salt1: salt, size: size}} <- Wal.read(wal_path(name, shard_id)),
+    # `commit_extent`, NOT `size` (expert review 2026-09-29 #26). With `:replication_fsync` off (the
+    # default) an OS crash — not a BEAM crash — can leave the WAL with a zero-filled or partial tail,
+    # and `size` counted it as held. `complete_through_reset?/2` then compared that inflated offset
+    # with the primary's `prev_extent`, passed, and the absorb cleared `torn` over a replica that is
+    # missing frames. `Wal.read/1`'s commit extent walks back to the last frame that is a commit
+    # under this WAL's salts, which a zeroed tail is not. Frames are written POSITIONALLY
+    # (`write_frame/4`), so resuming at the lower offset overwrites the junk rather than appending
+    # after it.
+    with {:ok, %{ckpt_seq: gen, salt1: salt, commit_extent: size}} <-
+           Wal.read(wal_path(name, shard_id)),
          true <- File.exists?(db_path(name, shard_id)) do
       # Carry `torn` across the restart (expert review 2026-08-20 #11b). `FollowerLog.seeded/4`
       # stamps `torn: false` because a real SEED is the one event that rebuilds both files

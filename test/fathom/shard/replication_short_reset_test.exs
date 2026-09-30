@@ -341,6 +341,26 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
            "the first push after a restart deleted the marker #11b exists to keep"
   end
 
+  # Expert review 2026-09-29 #26: recovery took `next_offset` from the WAL file's SIZE. With
+  # `:replication_fsync` off, an OS crash can leave a zero-filled tail, and the inflated offset later
+  # passed `complete_through_reset?/2` and laundered a short replica. The zero tail below stands in
+  # for that crash residue. Pre-fix the recovered offset is the padded size.
+  test "a follower restart resumes at the WAL's commit extent, not its padded size", ctx do
+    %{name: name, state: state, id: id} = seeded_follower!(ctx)
+    wal = Follower.wal_path(name, id)
+    held = state.next_offset
+
+    stop_supervised!(name)
+    File.write!(wal, :binary.copy(<<0>>, 4096 + 24), [:append])
+    assert File.stat!(wal).size > held, "fixture: the zero tail did not land"
+
+    dir = Path.join(ctx.root, to_string(name))
+    start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
+
+    assert Follower.state_of(name, id).next_offset == held,
+           "recovery claimed the zero-filled tail as held WAL bytes"
+  end
+
   # THE LINEAGE FENCE SURVIVES A RESTART (expert review 2026-09-29 #2c). Before the fix recovery came
   # back at lineage 0, and `FollowerLog`'s lineage fence only fires when BOTH sides state one — so the
   # first push after a follower restart was accepted from ANY primary, a deposed one included.
