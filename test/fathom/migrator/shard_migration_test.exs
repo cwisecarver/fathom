@@ -274,7 +274,15 @@ defmodule Fathom.Migrator.ShardMigrationTest do
   # that a missing / yanked / requires_review version fails the chain closed. It is one query for
   # the whole chain regardless of how many versions the chain spans, so the count must not scale
   # with the range. Pre-fix this counted 3.
-  test "the whole chain costs ONE shard_migrations query, not one per version", %{shard: shard} do
+  #
+  # IT NOW COUNTS 2, AND THAT IS INTENDED (expert review 2026-09-29 #12). This test used to assert
+  # exactly 1, which held only because `do_run` REUSED the pre-flight chain read before the drain —
+  # and that reuse is what let an `attach_transform` accepted during the pull window be skipped.
+  # The chain is now read twice: once for buildability before the lease (2026-09-18 #11), once,
+  # authoritatively, after `mark_migrating`. Both are single queries, so the property this test
+  # exists for — the count does not scale with the range (3 versions here) — still holds.
+  test "the whole chain costs a CONSTANT number of shard_migrations queries, not one per version",
+       %{shard: shard} do
     seed_v1!(shard)
     {:ok, _} = Migrator.release(2, "v2", @v2_statements)
     {:ok, _} = Migrator.release(3, "v3", ["CREATE TABLE app_tag (id INTEGER PRIMARY KEY)"])
@@ -307,9 +315,9 @@ defmodule Fathom.Migrator.ShardMigrationTest do
 
     assert {:ok, %{from: 1, to: 4}} = ShardMigration.run(shard, 4)
 
-    assert :counters.get(counter, 1) == 1,
+    assert :counters.get(counter, 1) == 2,
            "the 3-version chain issued #{:counters.get(counter, 1)} shard_migrations queries; " <>
-             "it must be one for the whole chain"
+             "it must be two (pre-flight + post-mark) regardless of the range"
   end
 
   # Expert review 2026-08-26 #28. One forward migration cost ~9 Postgres round trips, three of them
@@ -400,6 +408,60 @@ defmodule Fathom.Migrator.ShardMigrationTest do
 
     assert {:ok, %{schema_version: 1}} = Directory.get(shard),
            "the shard must stay untouched at its old version"
+  end
+
+  # Expert review 2026-09-29 #12. The 2026-09-18 #11 pre-flight read the replay chain BEFORE the
+  # drain, the lease and the full S3 pull, and `do_run` REUSED it. The shard stays `active` for that
+  # whole window, so the attach_transform guard (which counts shards `migrating` below the version)
+  # saw zero and accepted a transform — and this shard then replayed the stale chain WITHOUT it and
+  # cut over: a silently split fleet with all three stamps agreeing. The transform is attached here
+  # from inside the migrator's own pull, i.e. squarely in that window. Pre-fix the row reads
+  # 'alice' (transform skipped); post-fix the chain is read after `mark_migrating` and it is 'ALICE'.
+  test "a transform attached during the pull window is applied, not skipped (#12)", %{
+    shard: shard
+  } do
+    seed_v1!(shard)
+
+    for {key, val} <- [
+          migration_transforms: [UppercaseName],
+          shard_storage: Fathom.Test.FaultyStorage
+        ] do
+      prev = Application.get_env(:fathom, key)
+      Application.put_env(:fathom, key, val)
+
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:fathom, key, prev),
+          else: Application.delete_env(:fathom, key)
+      end)
+    end
+
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    test_pid = self()
+
+    Application.put_env(
+      :fathom,
+      :faulty_before,
+      {:pull,
+       fn sid ->
+         if sid == shard and self() == test_pid and Process.get(:attached_12) == nil do
+           Process.put(:attached_12, true)
+
+           assert :ok = Migrator.attach_transform(2, UppercaseName),
+                  "fixture: the guard refused the attach, so the window was not reached"
+         end
+
+         :ok
+       end}
+    )
+
+    on_exit(fn -> Application.delete_env(:fathom, :faulty_before) end)
+
+    assert {:ok, %{from: 1, to: 2}} = ShardMigration.run(shard, 2)
+    assert Process.get(:attached_12), "fixture: the pull hook never ran"
+
+    assert %{rows: [[1, "ALICE"]]} = query_live!(shard, "SELECT id, name FROM app_thing"),
+           "a transform accepted mid-migration was skipped by this shard's replay"
   end
 
   # Expert review 2026-08-26 #8. The forward path was the ONLY durable-object producer in the

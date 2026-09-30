@@ -175,6 +175,7 @@ defmodule Fathom.Test.FaultyStorage do
   @impl true
   def pull(shard_id, local_path) do
     delay()
+    run_before(:pull, shard_id)
 
     if fault() == :pull,
       do: {:error, :s3_unreachable},

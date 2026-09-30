@@ -67,10 +67,12 @@ defmodule Fathom.Migrator.ShardMigration do
         # directory stamp, THEN a yank of an already-applied version); the shard serves correctly from
         # its file, and its stale stamp is exactly the case `mix fathom.directory` exists to reconcile
         # (see `forward/9`). Trading that corner for not re-draining every genuine laggard hourly.
+        # BUILDABILITY ONLY — the chain itself is re-read inside `do_run/3` after the shard is marked
+        # `migrating` (expert review 2026-09-29 #12). See the note there.
         case statement_chain(v, target) do
-          {:ok, chain} ->
+          {:ok, _buildable} ->
             with_lease(shard_id, token, fn lease ->
-              do_run(shard_id, target, lease, v, chain)
+              do_run(shard_id, target, lease)
             end)
 
           {:error, _} = err ->
@@ -505,10 +507,7 @@ defmodule Fathom.Migrator.ShardMigration do
 
   # --- the migration ---
 
-  # `pf_version`/`pf_chain` are the directory stamp and the chain the pre-flight in `run/3` already
-  # built from it (expert review 2026-09-18 #11). Reused when the FILE version matches that stamp —
-  # the common case — so the buildability pre-flight adds no second `shard_migrations` query.
-  defp do_run(shard_id, target, lease, pf_version, pf_chain) do
+  defp do_run(shard_id, target, lease) do
     old = temp_path(shard_id, "old")
     new = temp_path(shard_id, "new")
 
@@ -535,36 +534,38 @@ defmodule Fathom.Migrator.ShardMigration do
             # corruption with all three version stamps agreeing. A missing/yanked
             # intermediate makes the chain unbuildable — error (the shard stays
             # untouched at its old version) rather than half-apply.
-            # Reuse the pre-flight chain when the file version equals the directory stamp it was
-            # built from (the common case) — so the #11 buildability pre-flight costs no extra
-            # query. Only a file/directory skew (a failed cutover txn / PITR) needs a fresh chain
-            # for the real file version.
-            chain_result =
-              if current == pf_version,
-                do: {:ok, pf_chain},
-                else: statement_chain(current, target)
+            # MARK FIRST, THEN READ THE CHAIN (expert review 2026-09-29 #12).
+            #
+            # The `attach_transform` / yank guards (fa2f8fa, `Migrator.refuse_if_migrating_below/1`)
+            # count shards that are `migrating` below the version. The 2026-09-18 #11 pre-flight
+            # moved the chain read to BEFORE the drain, the lease and a full S3 pull, and this path
+            # REUSED that chain — so for the whole of that window the shard was still `active`, the
+            # guards counted zero, an `attach_transform` landing there was accepted, and this shard
+            # then replayed the chain WITHOUT it and cut over: a silently split fleet with all three
+            # stamps agreeing, which is what 2026-09-18 #2 closed. With the mark first, a transform
+            # attached before it is in the chain read below, and one attached after it is refused.
+            # (The guard's own count-then-insert is not a lock; closing THAT window needs a shared
+            # row lock on the release rows — recorded in the audit progress log, not done here.)
+            #
+            # REUSE the row `mark_migrating/1` returns instead of re-reading it (expert review
+            # 2026-08-26 #28). `forward/9` needs the DIRECTORY's `schema_version` to report a
+            # stamp divergence. `:error` degrades to 0: the value only drives a warning.
+            prev =
+              case Directory.mark_migrating(shard_id) do
+                {:ok, %{schema_version: v}} -> v
+                _ -> 0
+              end
 
-            with {:ok, chain} <- chain_result do
-              # Marked only once the chain is buildable: an unknown/yanked target
-              # must leave the shard's status untouched (#23), and the copy window
-              # is what "migrating" pauses anyway.
-              # REUSE the row `mark_migrating/1` returns instead of re-reading it (expert review
-              # 2026-08-26 #28). `forward/9` needs the DIRECTORY's `schema_version` to report a
-              # stamp divergence, and it used to fetch the row a THIRD time to get it — after
-              # `run/3` read it and after this write returned it. The update does not touch
-              # `schema_version`, so the returned row carries the same value the extra read would
-              # have, sampled at the same instant and INSIDE the lease.
-              #
-              # `:error` degrades to 0, matching the `current_version/1` this replaces: the value
-              # only drives a warning, so an unreadable directory must not fail a migration that
-              # the lease and the file version already authorize.
-              prev =
-                case Directory.mark_migrating(shard_id) do
-                  {:ok, %{schema_version: v}} -> v
-                  _ -> 0
-                end
+            case statement_chain(current, target) do
+              {:ok, chain} ->
+                forward(shard_id, target, current, prev, chain, old, new, lease, etag)
 
-              forward(shard_id, target, current, prev, chain, old, new, lease, etag)
+              # The chain became unbuildable between the pre-flight and here (a yank landed).
+              # Leave the shard's status as it was (#23): `unmark_migrating/1` is conditional on the
+              # row still being `migrating`, so it cannot resurrect a suspended or deleted tenant.
+              {:error, _} = err ->
+                _ = Directory.unmark_migrating(shard_id)
+                err
             end
         end
       end
