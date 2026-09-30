@@ -674,10 +674,19 @@ defmodule Fathom.Shard.Replication.Follower do
     # complete; drop its files rather than leak them.
     seeds = discard_seed(seeds, b.shard_id)
 
-    if headroom?(name, b) do
-      open_seed_temps(name, seeds, b)
-    else
-      refuse_seed(name, seeds, b)
+    cond do
+      # Never re-create a replica of a DELETED tenant (expert review 2026-09-29 #5): after
+      # `Tombstones` erases it, a straggling push answers `:unknown_shard` and the primary's reflex
+      # is to seed it straight back. Dropping the begin leaves no temps and never acks.
+      Fathom.Tenants.Tombstones.tombstoned?(b.shard_id) ->
+        Logger.info("replication follower refusing to seed #{b.shard_id}: tenant is deleted")
+        seeds
+
+      headroom?(name, b) ->
+        open_seed_temps(name, seeds, b)
+
+      true ->
+        refuse_seed(name, seeds, b)
     end
   end
 
@@ -685,7 +694,8 @@ defmodule Fathom.Shard.Replication.Follower do
   #
   # A node acting as a follower stores a full `.db` + `-wal` copy of EVERY shard it follows, and
   # this store had no bound of any kind: no count cap, no byte cap, no free-space floor, no
-  # retention. `forget/2` is called from exactly two places, both promotions. It grows monotonically
+  # retention. `forget/2` is called from promotions and from tombstoning (a deleted tenant's replica
+  # is erased, expert review 2026-09-29 #5) — never for a live shard. It grows monotonically
   # from OTHER NODES' write traffic, and both directories default under `System.tmp_dir!()`, so out
   # of the box the replica store and the live shard data dir SHARE A VOLUME.
   #
@@ -1099,6 +1109,19 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   defp recover_shard(tab, name, shard_id) do
+    if Fathom.Tenants.Tombstones.tombstoned?(shard_id) do
+      # A replica of a DELETED tenant (expert review 2026-09-29 #5): the delete happened while this
+      # node was down, or before its Follower booted, so `Tombstones`' erase hook had nothing to
+      # erase yet. Erase it here rather than recover it — `Tombstones` starts before the Follower in
+      # the application tree, so its set is already loaded.
+      forget(name, shard_id)
+      false
+    else
+      recover_live_shard(tab, name, shard_id)
+    end
+  end
+
+  defp recover_live_shard(tab, name, shard_id) do
     with {:ok, %{ckpt_seq: gen, salt1: salt, size: size}} <- Wal.read(wal_path(name, shard_id)),
          true <- File.exists?(db_path(name, shard_id)) do
       # Carry `torn` across the restart (expert review 2026-08-20 #11b). `FollowerLog.seeded/4`

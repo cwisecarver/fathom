@@ -15,8 +15,8 @@ defmodule Fathom.Tenants.Tombstones do
 
     * **loaded at boot** from `Fathom.Directory.deleted_shard_ids/0`;
     * **pushed fleet-wide** on delete over Oban's LISTEN/NOTIFY (`:fathom_tenant_deleted`),
-      so every node refuses the id immediately (the warm-follower-copy purge was removed
-      2026-09-14 with the WarmFollower retirement);
+      so every node refuses the id immediately AND erases its own A2 replica of it
+      (`forget_replica/1`, expert review 2026-09-29 #5);
     * **refreshed periodically** (`:tenant_tombstone_refresh_ms`, default 5 min) so a node
       that booted during a Postgres outage, or missed a fire-and-forget notification,
       still converges. The set is append-only in memory — a tombstone is permanent, so a
@@ -78,6 +78,7 @@ defmodule Fathom.Tenants.Tombstones do
     table = Keyword.get(opts, :table, @table)
     loader = Keyword.get(opts, :loader, &Directory.deleted_shard_ids/0)
     since_loader = Keyword.get(opts, :since_loader, &Directory.deleted_shard_ids_since/1)
+    on_new = Keyword.get(opts, :on_new, &forget_replica/1)
     retry_ms = Keyword.get(opts, :retry_ms, DenyList.initial_retry_ms())
 
     # public read_concurrency: admission reads directly from the caller process.
@@ -91,10 +92,11 @@ defmodule Fathom.Tenants.Tombstones do
     # append-only, so the periodic (directory-only) refresh never drops these; no recurring LIST.
     # Storage is S3-derived, independent of the Postgres directory, so it also loads (and contributes
     # deny coverage) during a Postgres outage that fails the directory load below.
-    load_from_storage(table)
+    load_from_storage(table, on_new)
 
     state = %{
       table: table,
+      on_new: on_new,
       loader: loader,
       since_loader: since_loader,
       retry_ms: retry_ms,
@@ -123,10 +125,9 @@ defmodule Fathom.Tenants.Tombstones do
   @impl true
   def handle_info({:notification, @channel, %{"shard_id" => shard_id}}, state)
       when is_binary(shard_id) do
-    # Block re-mint of the erased shard (ETS). The warm-copy purge was removed 2026-09-14 with the
-    # WarmFollower retirement — there is no lease-less warm copy to drop anymore. (A2 replicas of a
-    # deleted shard are handled by the delete/purge path, not here.)
-    insert(state.table, shard_id)
+    # Block re-mint of the erased shard (ETS), and erase this node's A2 replica of it (see
+    # `forget_replica/1`) — every node receives this, which is what reaches the FOLLOWERS.
+    insert(state.table, shard_id, state.on_new)
     {:noreply, state}
   end
 
@@ -147,7 +148,7 @@ defmodule Fathom.Tenants.Tombstones do
       :ok ->
         # Recovered — re-attempt the storage backstop (it may have failed at boot too), signal
         # recovery, and fall back to the normal refresh cadence.
-        load_from_storage(state.table)
+        load_from_storage(state.table, state.on_new)
         DenyList.recovered(:tombstones)
         schedule_refresh()
         {:noreply, %{state | loaded: true, since: now_minus_overlap()}}
@@ -162,8 +163,38 @@ defmodule Fathom.Tenants.Tombstones do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
-  defp insert(table, shard_id) do
-    :ets.insert(table, {shard_id})
+  # `on_new` runs only for an id this node had NOT already tombstoned, so a full reload (which
+  # re-reads every id ever deleted) does not re-run it for the whole history.
+  defp insert(table, shard_id, on_new \\ &forget_replica/1) do
+    if :ets.insert_new(table, {shard_id}), do: on_new.(shard_id)
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  # ERASE THIS NODE'S A2 REPLICA OF A DELETED SHARD (expert review 2026-09-29 #5).
+  #
+  # `Tenants.purge/1` removes the stored objects and the deleting node's own data dir, and nothing
+  # else. With replication on (the prod default) every follower in the quorum also holds a complete
+  # `.db` + `-wal` of the tenant, and `Follower.forget/2` was called only from promotions, so a
+  # deleted tenant's full database stayed on Q other nodes indefinitely — against the "erase
+  # everything" contract in docs/tenant-lifecycle.md. (The notification used to drop the
+  # WarmFollower's copy; that step went with the WarmFollower on 2026-09-14 and was never ported.)
+  #
+  # This is the one place every node learns of a delete — the NOTIFY, the periodic refresh, and the
+  # deleting node's own `put/1` all funnel through `insert/3` — so a node that missed the NOTIFY
+  # still converges at the next refresh. Replicas that exist on disk before this node's Follower
+  # has booted are handled by `Follower`'s recovery, which skips and deletes tombstoned shards;
+  # `Follower.begin_seed/3` refuses to re-seed one.
+  defp forget_replica(shard_id) do
+    follower = Fathom.Shard.Replication.Follower
+
+    if Process.whereis(follower) && follower.state_of(follower, shard_id) do
+      follower.forget(follower, shard_id)
+      Logger.info("tenant #{shard_id} is tombstoned — erased this node's A2 replica of it")
+    end
+
+    :ok
   rescue
     ArgumentError -> :ok
   end
@@ -197,8 +228,8 @@ defmodule Fathom.Tenants.Tombstones do
 
   defp now_minus_overlap, do: DateTime.add(DateTime.utc_now(), -@overlap_ms, :millisecond)
 
-  defp load_since(%{table: table, since_loader: loader}, since) do
-    for id <- loader.(since), do: insert(table, id)
+  defp load_since(%{table: table, since_loader: loader, on_new: on_new}, since) do
+    for id <- loader.(since), do: insert(table, id, on_new)
     :ok
   rescue
     e ->
@@ -210,8 +241,8 @@ defmodule Fathom.Tenants.Tombstones do
       {:error, reason}
   end
 
-  defp load_from_directory(%{table: table, loader: loader}) do
-    for id <- loader.(), do: insert(table, id)
+  defp load_from_directory(%{table: table, loader: loader, on_new: on_new}) do
+    for id <- loader.(), do: insert(table, id, on_new)
     :ok
   rescue
     e ->
@@ -226,9 +257,9 @@ defmodule Fathom.Tenants.Tombstones do
   # Additive union from durable storage (#6) — the DR backstop that survives a directory restore.
   # Best-effort: a storage blip at boot just means the directory-derived set stands until the storage
   # is reachable (a restore is a rare, operator-driven event).
-  defp load_from_storage(table) do
+  defp load_from_storage(table, on_new) do
     case Fathom.Shard.Storage.tombstoned_ids() do
-      {:ok, ids} -> for id <- ids, do: insert(table, id)
+      {:ok, ids} -> for id <- ids, do: insert(table, id, on_new)
       {:error, reason} -> Logger.warning("tombstone storage load failed: #{inspect(reason)}")
     end
 

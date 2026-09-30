@@ -21,7 +21,7 @@ physical erase to a durable, retryable job.
 ```
 delete(id):
   Directory.tombstone(id)          # 1. durable: status -> "deleted" (upsert; never resurrected)
-  broadcast_deleted(id)            # 2. fleet-wide: ETS re-mint gate + warm-cache purge, now
+  broadcast_deleted(id)            # 2. fleet-wide: ETS re-mint gate + A2 replica erase, now
   enqueue DeleteJob(id)            # 3. the physical erase, off the request path
 ```
 
@@ -41,8 +41,12 @@ The guard is `Fathom.Tenants.Tombstones`, modeled on `HranaAuth.Revocations`:
   open path, so it never touches cold-open latency and holds even during a directory outage.
 - **loaded from the directory at boot** (`Directory.deleted_shard_ids/0`),
 - **pushed fleet-wide on delete** over Oban's `LISTEN/NOTIFY` (`:fathom_tenant_deleted`) — the same
-  notification also drops each node's lease-less **warm-follower copy** of the shard, so an erased
-  tenant's cached bytes don't linger until the follower's next poll,
+  notification also **erases each node's A2 replica** of the shard (`Follower.forget/2`, run from
+  `Tombstones` on every newly-seen tombstone — the NOTIFY, the refresh, and the deleting node's own
+  `put/1` alike). A follower that was down during the delete erases the replica when it recovers,
+  and a follower never re-seeds a tombstoned shard. (Until 2026-09-29 this bullet described the
+  retired WarmFollower's copy; the A2 replicas that replaced it were never erased — expert review
+  2026-09-29 #5.)
 - **refreshed periodically** (`:tenant_tombstone_refresh_ms`, default 5 min) so a node that booted
   during a Postgres outage, or missed a fire-and-forget notification, still converges. The set is
   append-only in memory (a tombstone is permanent).
@@ -80,7 +84,7 @@ of the *erased tenant's data*, surviving the erasure.
 still valid**, so shutdown flushes/releases cleanly (or is brutal-killed) and never takes the
 self-fence path. Only *then* does `purge` delete the storage. `rm_local` additionally sweeps any
 stray `.fenced.*` / `.forked.*` / `.corrupt.*` copies (anchored at `<id>.db` so it can't hit a sibling
-id). No copy of a deleted tenant is left on disk.
+id). Together with the A2 replica erase above, no copy of a deleted tenant is left on disk.
 
 ### Cross-node safety
 
@@ -253,7 +257,7 @@ hold — the data is untouched, so resume brings the tenant straight back.
 - `lib/fathom_web/controllers/api/tenant_controller.ex` — the `/api/tenants` JSON control-plane.
 - `lib/mix/tasks/fathom.shard.ex` — the `pull`/`inspect`/`fork` operator CLI (#14); `Storage.fork_shard/2`
   is the copy primitive and `Tenants.fork/2` the orchestration.
-- `lib/fathom/tenants/tombstones.ex` — the ETS re-mint gate + notifier listener + warm-cache purge.
+- `lib/fathom/tenants/tombstones.ex` — the ETS re-mint gate + notifier listener + A2 replica erase.
 - `lib/fathom/tenants/delete_job.ex` — the Oban worker (queue `:tenants`, unique per shard).
 - `lib/fathom/shard/storage.ex` (+ `local.ex` / `s3.ex`) — `purge_shard/1`.
 - `lib/fathom/shards.ex` — `stop/1` (force-stop for deletion).
