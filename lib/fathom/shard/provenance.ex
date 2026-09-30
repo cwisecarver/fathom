@@ -12,7 +12,8 @@ defmodule Fathom.Shard.Provenance do
 
   Two write paths, deliberately different (the reason each exists is on the function):
 
-    * `write/2` — a plain `File.write`, for the PULL path (single writer, read only at open).
+    * `write/2` — a plain `File.write`, for the OPEN paths (single writer, read only at open). Made
+      durable by `make_durable/1` on the shard's first write (expert review 2026-09-29 #14).
     * `write_durable/2` — fsync+rename, for the FLUSH path (the sidecar then names the object the
       tenant's fsynced commits descend from, and a torn value there is not recoverable).
 
@@ -73,6 +74,24 @@ defmodule Fathom.Shard.Provenance do
     case Storage.atomic_write(sidecar_path(path), etag) do
       :ok -> :ok
       {:error, reason} -> Logger.warning("durable etag sidecar write failed: #{inspect(reason)}")
+    end
+  end
+
+  @doc """
+  Re-write the sidecar DURABLY with whatever it currently says (expert review 2026-09-29 #14).
+
+  The open paths write the sidecar with plain `write/2` — making every open pay the fsync was
+  measured at +24–28% cold_open_p50. That plain write is safe only while the local `.db` holds
+  nothing newer than the object it names; the coordinator calls this on the shard's FIRST write
+  after open, so the sidecar is on disk before acked writes can depend on it. An absent/corrupt
+  sidecar is left alone (the open path already decided what that means).
+  """
+  @spec make_durable(String.t()) :: :ok
+  def make_durable(path) do
+    case read(path) do
+      {:ok, etag} -> write_durable(path, etag)
+      :no_object -> write_durable(path, @no_object_sentinel)
+      _ -> :ok
     end
   end
 

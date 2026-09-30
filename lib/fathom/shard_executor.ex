@@ -784,7 +784,7 @@ defmodule Fathom.ShardExecutor do
   # statements for side effects, no rows. A read-only token can't run one (a script writes), and the
   # tenant-DDL block applies to its leading statement.
   @impl true
-  def execute_sequence({_pid, _ref, conn, shard_id, scope, token_version, opts}, sql)
+  def execute_sequence({pid, _ref, conn, shard_id, scope, token_version, opts}, sql)
       when is_binary(sql) do
     cond do
       # Same per-statement revocation re-check as execute/2 — a script is not a loophole.
@@ -851,12 +851,12 @@ defmodule Fathom.ShardExecutor do
             {:error, err}
 
           nil ->
-            run_script(conn, sql, shard_id, opts)
+            run_script(pid, conn, sql, shard_id, opts)
         end
     end
   end
 
-  defp run_script(conn, sql, shard_id, opts) do
+  defp run_script(pid, conn, sql, shard_id, opts) do
     mark_session_mutated(conn)
 
     case Connection.exec(conn, sql) do
@@ -867,6 +867,11 @@ defmodule Fathom.ShardExecutor do
         # script's writes (same class as the RETURNING bug). A script is presumed to write, so
         # bump unconditionally.
         Fathom.Shard.WriteCounter.bump(shard_id)
+
+        # …and tell the coordinator, as the statement path does. Without this a script-only writer
+        # never reached `:became_dirty`, so neither the fast flush cadence nor the first-write
+        # sidecar fsync (expert review 2026-09-29 #14) fired until the slow safety-net poll.
+        signal_dirty_once(pid, conn)
 
         # …and record it against the open transaction, so a BEGIN (query) → write (exec) →
         # COMMIT (query) sequence still re-bumps at the commit boundary (review 2026-07-24 #3).

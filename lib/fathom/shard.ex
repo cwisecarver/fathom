@@ -725,6 +725,8 @@ defmodule Fathom.Shard do
         # The pool-sweep timer, armed ONLY while the pool holds a handle (expert review 2026-09-29
         # #35) — see schedule_sweep/1.
         sweep_timer: nil,
+        # Has the open path's plain sidecar write been made durable yet? See sync_sidecar_once/1.
+        sidecar_synced?: false,
         idle_ms: idle_ms(),
         timer: nil,
         # Monotonic-ms instant the shard last went idle (all connections checked in), or
@@ -1297,7 +1299,7 @@ defmodule Fathom.Shard do
   # precisely the condition that should disqualify it. Cleared when the last connection checks in
   # (`release/2`), so a later read-only checkout gets the optimisation back.
   def handle_cast(:became_dirty, state) do
-    state = %{state | wrote_during_checkout?: true}
+    state = %{sync_sidecar_once(state) | wrote_during_checkout?: true}
 
     if state.flush_timer == nil or state.flush_timer_slow? do
       {:noreply, schedule_flush(state)}
@@ -4084,6 +4086,23 @@ defmodule Fathom.Shard do
       state.wrote_during_checkout? -> do_schedule_flush(state)
       true -> do_schedule_flush(state, @clean_poll_multiplier)
     end
+  end
+
+  # FIRST-WRITE SIDECAR FSYNC (expert review 2026-09-29 #14, option B as decided 2026-09-29).
+  #
+  # The open paths (pull / born-empty / warm-adopt / promote) write `<db>.etag` with a plain write.
+  # Once the shard takes an acked, fsynced write, a sidecar still in the page cache at an OS crash
+  # reads back torn/empty, `Fork.resolve` quarantines the live `.db`, and the older object is
+  # served — and the first flush that would rewrite it durably can be a whole interval away.
+  # Writing it durably AT open closes that but was measured at +24%/+28% cold_open_p50, so it is
+  # done here instead: once per coordinator, on the first `:became_dirty`, off the open path.
+  # Read-only opens never pay, and have no acked writes to lose. What remains is the window
+  # between the first acked write and this cast being handled — accepted as the trade.
+  defp sync_sidecar_once(%{sidecar_synced?: true} = state), do: state
+
+  defp sync_sidecar_once(state) do
+    Provenance.make_durable(state.path)
+    %{state | sidecar_synced?: true}
   end
 
   # Arm the periodic durability flush. A non-positive interval disables it
