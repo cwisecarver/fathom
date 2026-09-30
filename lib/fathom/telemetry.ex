@@ -754,6 +754,11 @@ defmodule Fathom.Telemetry do
         description:
           "Shards whose migration was CANCELLED because a version the chain needs is unknown or yanked. Cancelling is correct — the version will never exist again, and quarantining a healthy untouched shard would hide it from `laggards/2`, `shards_at_version/1` and a later fleet revert — but the shard is then permanently non-converging with nothing above [info] saying so, which is what this exists to surface. Non-zero after a `Migrator.yank/1` of a MIDDLE version means the release graph has a hole every shard below it must walk through, and the fix is a new release bridging it, not a retry. Untagged: `target` and `missing` are version numbers, unbounded as labels"
       ),
+      counter("fathom.migrator.no_live_object.count",
+        event_name: [:fathom, :migrator, :no_live_object],
+        description:
+          "Migration jobs CANCELLED because the shard has no stored object yet — it has never flushed (expert review 2026-09-29 #31). Routine: any Host-minted id registers an active v0 directory row, so a sweep enqueues it as a laggard with nothing to copy. It used to burn five attempts and then quarantine a healthy shard; now it cancels unmarked and the next sweep picks it up once it flushes. A steady high rate means sweeps are enqueuing ids that never get written. Untagged: `target` is a version number, unbounded as a label"
+      ),
       counter("fathom.migrator.revert_no_retained_version.count",
         event_name: [:fathom, :migrator, :revert_no_retained_version],
         description:

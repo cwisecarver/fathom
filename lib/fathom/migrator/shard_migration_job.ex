@@ -135,6 +135,22 @@ defmodule Fathom.Migrator.ShardMigrationJob do
 
         {:cancel, :not_active}
 
+      # Nothing stored to migrate (expert review 2026-09-29 #31): the shard has never flushed.
+      # Any Host-minted id registers an active v0 row, so this is routine, and `lazy_migrate/1`
+      # already treats it as benign. Retrying cannot help and exhausting attempts QUARANTINED a
+      # healthy shard. Cancel without `mark_failed`: once it flushes it is an ordinary laggard
+      # and the next sweep picks it up.
+      {:error, :no_live_object} ->
+        Logger.info("shard #{shard_id}: not migrating to v#{target} — nothing stored yet")
+
+        :telemetry.execute(
+          [:fathom, :migrator, :no_live_object],
+          %{count: 1},
+          %{shard_id: shard_id, target: target}
+        )
+
+        {:cancel, :no_live_object}
+
       {:error, reason} ->
         handle_error(job, shard_id, reason)
     end

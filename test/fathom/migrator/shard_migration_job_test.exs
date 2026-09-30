@@ -29,7 +29,9 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     %{shard: shard}
   end
 
-  defp seed_v1!(shard) do
+  # `file_version` stamps the STORED object's `user_version`; the directory row is always v1. A
+  # value above the job's target makes a stored file that is ahead of it.
+  defp seed_v1!(shard, file_version \\ 1) do
     seed =
       Path.join(System.tmp_dir!(), "seedjob_#{shard}_#{System.unique_integer([:positive])}.db")
 
@@ -49,7 +51,7 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
         "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0001', 'now')"
       )
 
-    :ok = Connection.exec(conn, "PRAGMA user_version = 1")
+    :ok = Connection.exec(conn, "PRAGMA user_version = #{file_version}")
     :ok = Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
     Connection.close(conn)
 
@@ -105,6 +107,28 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
     assert {:ok, %{schema_version: 2}} = Directory.get(shard)
     assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1})
+  end
+
+  # Expert review 2026-09-29 #31. Any Host-minted id registers an ACTIVE v0 directory row before it
+  # has ever flushed, so a sweep enqueues it as a laggard with nothing stored to migrate. The inline
+  # path already treats `:no_live_object` as benign; the job burned five attempts on it and then
+  # QUARANTINED (`migration_failed`) a healthy never-flushed shard — which also hides it from later
+  # sweeps after it does flush. Invariant: no live object ⇒ cancel, never retry, never quarantine.
+  test "a never-flushed shard behind HEAD is cancelled, not retried or quarantined",
+       %{shard: shard} do
+    {:ok, _} = Directory.resolve(shard)
+    {:ok, _} = Migrator.release(1, "v1", ["CREATE TABLE app_thing (id INTEGER PRIMARY KEY)"])
+    assert {:ok, %{schema_version: 0, status: "active"}} = Directory.get(shard)
+
+    for attempt <- [1, 5] do
+      assert {:cancel, :no_live_object} =
+               perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 1},
+                 attempt: attempt,
+                 max_attempts: 5
+               )
+    end
+
+    assert {:ok, %{schema_version: 0, status: "active"}} = Directory.get(shard)
   end
 
   # Expert review 2026-08-01 #43. The event is the per-node rollout-throughput signal, so it must
@@ -545,16 +569,16 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
   end
 
   test "exhausted attempts quarantine the shard", %{shard: shard} do
-    {:ok, _} = Directory.resolve(shard)
-    # A RELEASED target with a BUILDABLE chain but no live storage object -> a persistent
-    # {:error, _} through every retry. (An unknown/yanked target — or now an unbuildable chain
-    # (#11) — cancels without marking, round-2 #23, so neither can be the vehicle here: v1 is
-    # released so the chain builds and the failure is the missing OBJECT, reached in do_run.)
-    {:ok, _} = Migrator.release(1, "v1", ["CREATE TABLE app_v1 (id INTEGER PRIMARY KEY)"])
+    # A stored file AHEAD of the target (directory v1, file stamped v3, target v2) -> a persistent
+    # {:error, {:ahead_of_target, 3}} through every retry. This used a missing storage object as
+    # its vehicle until expert review 2026-09-29 #31 made that a benign cancel (a never-flushed
+    # shard is healthy, not failed). An unknown/yanked target or an unbuildable chain cancels
+    # without marking too (round-2 #23, #11), so neither can be the vehicle either.
+    seed_v1!(shard, 3)
     {:ok, _} = Migrator.release(2, "v2", @v2_statements)
 
     capture_log(fn ->
-      assert {:cancel, _} =
+      assert {:cancel, {:ahead_of_target, 3}} =
                perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2}, attempt: 5)
     end)
 
