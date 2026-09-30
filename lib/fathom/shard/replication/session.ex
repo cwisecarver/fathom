@@ -928,8 +928,11 @@ defmodule Fathom.Shard.Replication.Session do
   #
   # **The honest limitation**: with a single follower the max is that follower's own offset, so this
   # never fires and the replica is treated as complete. That is deliberate — it only ever reports a
-  # gap it has EVIDENCE for, and inventing one would mark replicas torn across the fleet. Closing
-  # that case is the primary-side seed rule, deferred pending the rig's seed-rate measurement.
+  # gap it has EVIDENCE for, and inventing one would mark replicas torn across the fleet. What IS
+  # closed since expert review 2026-09-29 #1 is the case this number could never see: a NEW owner's
+  # session has no record of any follower and always states 0, so an ownership change is now
+  # detected by the follower itself (`FollowerLog.reseed?/2`) and answered with a seed request.
+  # A single follower short WITHIN one ownership is still unstated — the remaining limitation.
   defp outgoing_extent(state, shipper) do
     case Map.get(state.followers, shipper) do
       %{wal_gen: gen, salt1: salt, offset: own} when is_integer(own) ->
@@ -1317,7 +1320,7 @@ defmodule Fathom.Shard.Replication.Session do
           send(
             session,
             {:seeded, shipper,
-             do_seed(shipper, acc.shard_id, db_path, wal_path, acc.epoch, acc.lineage)}
+             timed_seed(shipper, acc.shard_id, db_path, wal_path, acc.epoch, acc.lineage)}
           )
         end)
 
@@ -1358,6 +1361,45 @@ defmodule Fathom.Shard.Replication.Session do
         %{acc | seeding: forget_seed(acc.seeding, shipper)}
       else
         acc
+      end
+    end)
+  end
+
+  # `do_seed/6` with its cost reported. A seed is the one replication operation whose cost scales
+  # with DATABASE size rather than write volume, and every rule that would seed more often (expert
+  # review 2026-09-29 #1: seed on ownership change) is priced by exactly two numbers — bytes and
+  # wall time per seed. Neither was observable before: the only trace was a log line with the
+  # resulting position. `bytes` is what was DECLARED (db + wal at seed_begin), measured before the
+  # stream so a failed seed still reports what it was attempting.
+  defp timed_seed(shipper, shard_id, db_path, wal_path, epoch, lineage) do
+    bytes = seed_bytes(db_path, wal_path)
+    started = System.monotonic_time()
+    result = do_seed(shipper, shard_id, db_path, wal_path, epoch, lineage)
+    duration = System.monotonic_time() - started
+    ms = System.convert_time_unit(duration, :native, :millisecond)
+
+    :telemetry.execute(
+      [:fathom, :replication, :seed],
+      %{duration: duration, bytes: bytes},
+      %{shard_id: shard_id, result: seed_outcome(result)}
+    )
+
+    Logger.info(
+      "replication seed #{seed_outcome(result)} for #{shard_id} to #{inspect(shipper)}: " <>
+        "bytes=#{bytes} ms=#{ms}"
+    )
+
+    result
+  end
+
+  defp seed_outcome({:ok, _}), do: :ok
+  defp seed_outcome({:error, _}), do: :error
+
+  defp seed_bytes(db_path, wal_path) do
+    Enum.reduce([db_path, wal_path], 0, fn path, acc ->
+      case File.stat(path) do
+        {:ok, %{size: size}} -> acc + size
+        _ -> acc
       end
     end)
   end

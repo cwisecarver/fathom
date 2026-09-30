@@ -32,6 +32,10 @@
 #                                 from its peers (the half that was never started outside tests).
 #                                 Add REPLICATION_ENABLED=true — to `up` AND to this — to also
 #                                 ship a write and check followers hold a replica.
+#   ./chaos.sh seed-rate [kib...] Phase-2 A2: what one seed costs by shard size (default 64 1024
+#                                 8192 32768 KiB) — per-seed ms and the first-write latency a
+#                                 seed-on-ownership-change rule would add. Needs REPLICATION_ENABLED;
+#                                 SEED_LINK_KBPS=125000 (+ REPL_VIA_TOXI=1 on up) models a 1 Gbit link.
 #   ./chaos.sh rpo [shard]        Phase-2 A2: kill a node with NO flush in between and prove an
 #                                 acked, replicated write survives on a survivor that holds no
 #                                 replica of its own. Runs BOTH arms — gate off must LOSE the row,
@@ -830,6 +834,127 @@ cmd_replication() {
     echo "FAIL: only $holders followers hold a replica — below the quorum the commit claimed"
     return 1
   fi
+}
+
+# -- seed-rate: what one A2 seed costs, by shard size ---------------------------
+#
+# The number expert review 2026-09-29 #1 is waiting on. The candidate fix for #1 re-seeds a shard's
+# followers on every ownership change (every idle-drop + reopen, every takeover), and a seed ships
+# the WHOLE database — so whether that rule is affordable is two numbers: what one seed costs at a
+# given size, and how often ownership changes. This measures the first; the second is a traffic
+# property (at most one per shard per `:shard_idle_ms` of quiet), so the verdict line projects it.
+#
+# How it forces a seed without a code change: fill a shard to SIZE, flush it (so the `.db` holds the
+# bytes and the WAL is small, the state a reopen actually sees), then `Follower.forget/2` the replica
+# on every follower. The next write is refused `:unknown_shard` by all of them — the same answer the
+# candidate rule would produce — and `Session` seeds them and waits for a quorum inside that write.
+# So the TRIGGER write's latency is exactly the tenant-visible cost the rule would add, and the
+# `replication seed ok ... bytes= ms=` lines (Session.timed_seed/6) give per-seed wall time.
+#
+# A trigger write that FAILS (FILO_NO_QUORUM) is a result, not an error: it means a quorum of seeds
+# did not finish inside `replication_timeout_ms`, i.e. at that size the rule would fail writes.
+cmd_seed_rate() {
+  local sizes=(64 1024 8192 32768)
+  [ $# -gt 0 ] && sizes=("$@")
+  if [ "${REPLICATION_ENABLED:-}" != "true" ]; then
+    echo "seed-rate needs shipping ON: REPLICATION_ENABLED=true ./chaos.sh up && REPLICATION_ENABLED=true ./chaos.sh seed-rate"
+    return 1
+  fi
+
+  # THE RIG'S OWN NUMBER IS THE LOOPBACK FLOOR. Every node shares one VM, so a follower link is a
+  # memory copy (~2 GB/s measured 2026-09-30) and a seed looks free. SEED_LINK_KBPS caps every
+  # follower link through toxiproxy (needs `REPL_VIA_TOXI=1 ./chaos.sh up`) so the result reflects a
+  # real network: 125000 ≈ 1 Gbit/s per link. Removed again on exit.
+  local p
+  if [ -n "${SEED_LINK_KBPS:-}" ]; then
+    if [ "${REPL_VIA_TOXI:-}" != "1" ]; then
+      echo "SEED_LINK_KBPS needs the fleet up with REPL_VIA_TOXI=1, or replication bypasses toxiproxy."
+      return 1
+    fi
+    for n in "${NODES[@]}"; do
+      p="repl-$n"
+      curl -sS -X DELETE "$TOXI/proxies/$p/toxics/seed_bw" >/dev/null 2>&1
+      curl -sS -X POST "$TOXI/proxies/$p/toxics" -d \
+        '{"name":"seed_bw","type":"bandwidth","stream":"upstream","attributes":{"rate":'"$SEED_LINK_KBPS"'}}' >/dev/null
+    done
+    echo "follower links capped at ${SEED_LINK_KBPS} KB/s each (toxiproxy bandwidth, primary -> follower)"
+    trap 'for n in "${NODES[@]}"; do curl -sS -X DELETE "$TOXI/proxies/repl-$n/toxics/seed_bw" >/dev/null 2>&1; done; trap - RETURN' RETURN
+  fi
+
+  local kib shard home n t0 t1 base_ms trig_ms trig_ok mib i since lines
+  printf '%-9s %-10s %-6s %-22s %-10s %-10s %-9s %s\n' \
+    size_kib db_bytes seeds "seed_ms(min/med/max)" base_ms trig_ms trig_ok MB/s_med
+  for kib in "${sizes[@]}"; do
+    shard="seedrate${kib}k"
+    sql "$shard" "CREATE TABLE IF NOT EXISTS big (b BLOB)" >/dev/null || { echo "FAIL: create $shard"; return 1; }
+    sql "$shard" "DELETE FROM big" >/dev/null || true
+    # Fill in <= 1 MiB statements: one push carries at most `replication_max_push_bytes` (1 MiB), and
+    # a single 32 MiB commit would spend the whole quorum deadline catching up, not measuring a seed.
+    local out
+    if [ "$kib" -le 1024 ]; then
+      out=$(sql "$shard" "INSERT INTO big VALUES (randomblob($((kib * 1024))))" 2>&1) || { echo "FAIL: fill $shard: $out" | cut -c1-400; return 1; }
+    else
+      mib=$((kib / 1024))
+      for ((i = 0; i < mib; i++)); do
+        out=$(sql "$shard" "INSERT INTO big VALUES (randomblob(1048576))" 2>&1) || { echo "FAIL: fill $shard at ${i} MiB: $out" | cut -c1-400; return 1; }
+      done
+    fi
+    # The node with a LIVE coordinator, not `cmd_owner` (which reports any node holding a `.db`, and
+    # a node that idle-dropped under a fence skip keeps its local copy). Flushing through the wrong
+    # node would re-open the shard there (`Shards.flush/1` reopens a kept local copy) and move it.
+    home=""
+    for n in "${NODES[@]}"; do
+      case "$(rpc "$n" 'IO.puts(Registry.lookup(Fathom.ShardRegistry, "'"$shard"'") != [])')" in
+        *true*) home=$n; break ;;
+      esac
+    done
+    [ -n "$home" ] || { echo "FAIL: no live coordinator for $shard"; return 1; }
+    rpc "$home" 'Fathom.Shards.flush("'"$shard"'")' >/dev/null
+
+    # Baseline: an ordinary replicated write with every follower current.
+    t0=$(now_ms); sql "$shard" "INSERT INTO big VALUES (x'00')" >/dev/null; t1=$(now_ms)
+    base_ms=$((t1 - t0))
+
+    for n in "${NODES[@]}"; do
+      [ "$n" = "$home" ] && continue
+      rpc "$n" 'Fathom.Shard.Replication.Follower.forget(Fathom.Shard.Replication.Follower, "'"$shard"'")' >/dev/null
+    done
+
+    # Minus a second: docker stamps log lines with the VM's clock, which can trail the host's.
+    since=$(/usr/bin/python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ"))')
+    t0=$(now_ms)
+    if sql "$shard" "INSERT INTO big VALUES (x'01')" >/dev/null 2>&1; then trig_ok=yes; else trig_ok=NO; fi
+    t1=$(now_ms)
+    trig_ms=$((t1 - t0))
+
+    # Let the seeds the quorum did not wait for finish, then read every seed line for this shard.
+    sleep 5
+    lines=$(compose logs --since "$since" 2>/dev/null | grep "replication seed ok for $shard " || true)
+    local stats
+    stats=$(printf '%s\n' "$lines" | /usr/bin/python3 -c '
+import re, sys
+rows = []
+for l in sys.stdin:
+    m = re.search(r"bytes=(\d+) ms=(\d+)", l)
+    if m: rows.append((int(m.group(1)), int(m.group(2))))
+if not rows: print("0 - - -"); sys.exit()
+# Only the seeds of the FULL shard. The window can also catch the shard'"'"'s first-write seeds
+# (an empty db + wal, ~12 KB), which would drag the median to the floor.
+top = max(b for b, _ in rows)
+by = [b for b, _ in rows if b == top]; ms = sorted(m for b, m in rows if b == top)
+ms.sort(); med = ms[len(ms)//2]
+rate = (by[0] / 1e6) / (med / 1000) if med > 0 else float("inf")
+print(len(ms), "%d/%d/%d" % (ms[0], med, ms[-1]), by[0], "%.1f" % rate)
+')
+    local nseeds sms sbytes rate
+    read -r nseeds sms sbytes rate <<< "$stats"
+    printf '%-9s %-10s %-6s %-22s %-10s %-10s %-9s %s\n' \
+      "$kib" "$sbytes" "$nseeds" "$sms" "$base_ms" "$trig_ms" "$trig_ok" "$rate"
+  done
+  echo
+  echo "Projection for 'seed on ownership change': seeds/s per node <= reopens/s x ${#NODES[@]}-1 followers,"
+  echo "and reopens/s per node <= shards_per_node / (shard_idle_ms / 1000). trig_ms - base_ms is what the"
+  echo "first write after each reopen would pay; trig_ok=NO means that size fails the write instead."
 }
 
 # -- rpo: the node-loss RPO claim, killed with NO flush in between --------------
@@ -2490,6 +2615,7 @@ case "${1:-}" in
   rebalance)   shift; cmd_rebalance "$@" ;;
   hotspots)    shift; cmd_hotspots "$@" ;;
   replication) shift; cmd_replication "$@" ;;
+  seed-rate)   shift; cmd_seed_rate "$@" ;;
   rpo)         shift; cmd_rpo "$@" ;;
   quorum-loss) shift; cmd_quorum_loss "$@" ;;
   up)          cmd_up ;;

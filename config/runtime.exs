@@ -734,6 +734,18 @@ if ms = env_nonneg_int.("REPLICATION_CATCHUP_MS") do
   config :fathom, :replication_catchup_ms, ms
 end
 
+# A follower asks for a fresh SEED (answers `:unknown_shard`) on a push from a new ownership, on a
+# reset it is short for, and on any push while its replica is torn (expert review 2026-09-29 #1).
+# Default ON. The primary seeds inside that write, so the first write after each shard reopen or
+# takeover pays one seed at link speed — measured ~290 ms for a 32 MiB shard on 1 Gbit/s
+# (`./chaos.sh seed-rate`). `false` is for a fleet whose shards are too large to seed inside
+# REPLICATION_TIMEOUT_MS: the replica then stays torn (un-promotable) instead, and still never
+# absorbs across an ownership change.
+case env_bool.("REPLICATION_RESEED") do
+  nil -> :ok
+  v -> config :fathom, :replication_reseed, v
+end
+
 # Let a cold open serve a local REPLICA when it is provably newer than the stored object — the
 # failover half of A2, and the only thing that actually turns node-loss RPO from ~300 s into ~0.
 #

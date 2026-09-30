@@ -62,6 +62,20 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     end
   end
 
+  # Pre-seed a follower as the CURRENT owner would have: at its real lock epoch and lineage.
+  #
+  # The rest of this file pre-seeds at epoch 0 / lineage 0, a state production never produces (a
+  # seed always carries the sender's ownership). Since expert review 2026-09-29 #1 a follower answers
+  # a push from a HIGHER ownership than it was built under with `:unknown_shard` — a request for a
+  # fresh seed — so an epoch-0 replica now asks to be re-seeded on the first real push. Most tests
+  # here do not care (the re-seed completes and they assert on the result); the ones that need a
+  # follower to be CURRENT without a seed — the black-hole seed tests, where a seed never finishes,
+  # and the catch-up test, which needs the quorum to succeed without the unseeded third — use this.
+  defp preseed_current!(name, id, coordinator) do
+    {:ok, epoch} = Fathom.Shard.epoch(coordinator)
+    Follower.seed(name, id, epoch, 0, 0, 0, Fathom.Shard.lineage(coordinator))
+  end
+
   # A commit returns at the Q-th ack, so the follower that did NOT make the quorum can still be
   # writing when it does. Asserting on all N immediately asserts a guarantee A2 deliberately does
   # not make — stopping at Q is the entire measured value of a quorum (2-of-4 at 1.6 ms against
@@ -864,7 +878,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       on_exit(fn -> Connection.close(conn) end)
       {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
 
-      for {n, _} <- Enum.take(followers, 2), do: Follower.seed(n, id, 0, 0, 0, 0)
+      for {n, _} <- Enum.take(followers, 2), do: preseed_current!(n, id, coordinator)
 
       # The third is deliberately left unseeded: it answers `:unknown_shard`, which is a reject,
       # which is what arms the deferred retry in the first place.
@@ -964,7 +978,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
 
       # The two live followers are pre-seeded so the quorum forms without them; the black hole is
       # the one whose seed will hang.
-      for {n, _} <- live, do: Follower.seed(n, id, 0, 0, 0, 0)
+      for {n, _} <- live, do: preseed_current!(n, id, coordinator)
 
       assert :ok = Session.commit(id, path <> "-wal", coordinator)
       [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
@@ -1046,7 +1060,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       {:ok, conn} = Connection.open(path)
       on_exit(fn -> Connection.close(conn) end)
       {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
-      for {n, _} <- live, do: Follower.seed(n, id, 0, 0, 0, 0)
+      for {n, _} <- live, do: preseed_current!(n, id, coordinator)
 
       assert :ok = Session.commit(id, path <> "-wal", coordinator)
       [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
@@ -1116,7 +1130,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       {:ok, conn} = Connection.open(path)
       on_exit(fn -> Connection.close(conn) end)
       {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
-      for {n, _} <- live, do: Follower.seed(n, id, 0, 0, 0, 0)
+      for {n, _} <- live, do: preseed_current!(n, id, coordinator)
 
       assert :ok = Session.commit(id, path <> "-wal", coordinator)
       [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)

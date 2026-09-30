@@ -96,10 +96,16 @@ Two things to know:
   in that generation, so a single-follower fleet never fires it. `prev_extent: 0` from an
   un-upgraded peer means "no statement" and clears `torn` as before — otherwise a rolling upgrade
   would mark every replica in the fleet un-promotable.
-- **The primary-side half is NOT shipped.** Sending a full seed instead of a reset when a follower
-  is known short is deferred until the rig's seed rate is measured. Seeds are the expensive
-  operation A2 exists to avoid, and a rule that turns "behind at a boundary" into "ship the whole
-  database" can convert a lag spike into a seed storm.
+- **A short follower asks for a seed** (expert review 2026-09-29 #1, shipped 2026-09-30). Instead
+  of absorbing a WAL it knows is incomplete, it answers the reset `:unknown_shard`, marks itself
+  torn, and the primary seeds it inside that write — as it also does for every push from a NEW
+  ownership (reopen, takeover, restore), and for every push to a replica that is already torn.
+  This waited on the rig's seed-rate measurement (`./chaos.sh seed-rate`): a seed runs at link
+  speed, ~290 ms for a 32 MiB shard on 1 Gbit/s, and the first write after each ownership change
+  pays it. `REPLICATION_RESEED=false` turns the request off (the replica stays torn, and never
+  absorbs across an ownership change) for a fleet whose shards are too large to seed inside
+  `replication_timeout_ms`.
 
-Expect `absorbed a SHORT WAL before a reset` warnings after step 2. They are the feature working;
-each names a replica that will not be promoted until it is re-seeded.
+Expect `replication follower asking for a seed` info lines after step 2 and after every shard
+reopen. They are the feature working. `absorbed a SHORT WAL before a reset` now appears only with
+`REPLICATION_RESEED=false`.

@@ -1210,20 +1210,85 @@ defmodule Fathom.Shard.Replication.Follower do
     prev = state_of(name, push.shard_id)
 
     case FollowerLog.decide(prev, push) do
-      {:append, new_state} ->
-        apply_write(name, push, new_state, :append)
-
-      {:reset_then_append, new_state} ->
-        # A new epoch or a checkpointed WAL: our bytes are meaningless now, so the file is replaced
-        # rather than extended — but the pages in the WAL we are about to throw away are NOT
-        # meaningless, and absorbing them first is what keeps this replica whole.
-        absorbed = absorb_before_reset(name, push.shard_id, new_state, reset_verdict(prev, push))
-
-        apply_write(name, push, absorbed, :truncate)
-
       {:reject, reason, expected} ->
         Protocol.encode_reject(push.shard_id, reason, expected)
+
+      {_accept, new_state} = decision ->
+        cond do
+          reseed?(prev, push) -> request_seed(name, prev, new_state, push)
+          short_reset?(decision, prev, push) -> request_seed(name, prev, new_state, push)
+          true -> apply_decision(name, decision, prev, push)
+        end
     end
+  end
+
+  defp apply_decision(name, {:append, new_state}, _prev, push),
+    do: apply_write(name, push, new_state, :append)
+
+  defp apply_decision(name, {:reset_then_append, new_state}, prev, push) do
+    # A checkpointed WAL: our bytes are meaningless now, so the file is replaced rather than
+    # extended — but the pages in the WAL we are about to throw away are NOT meaningless, and
+    # absorbing them first is what keeps this replica whole.
+    absorbed = absorb_before_reset(name, push.shard_id, new_state, reset_verdict(prev, push))
+
+    apply_write(name, push, absorbed, :truncate)
+  end
+
+  # `:replication_reseed` (default ON) is the switch back to the pre-2026-09-30 behaviour — accept,
+  # stay torn, never ask for a seed — for a fleet whose shards are too large to re-seed on every
+  # ownership change inside `replication_timeout_ms`. Off does NOT reintroduce the hybrid (#1): an
+  # ownership change still refuses to absorb and marks the replica torn, it just waits there.
+  defp reseed?(prev, push) do
+    FollowerLog.reseed?(prev, push) and
+      Application.get_env(:fathom, :replication_reseed, true)
+  end
+
+  # A checkpoint reset this follower was SHORT for (#11a): the WAL it would absorb is missing the
+  # outgoing generation's tail, so the result would be torn from the moment it is written. Ask for
+  # the seed now rather than one push later — on a quiet shard "one push later" is unbounded.
+  defp short_reset?({:reset_then_append, _}, prev, push),
+    do:
+      prev != nil and Application.get_env(:fathom, :replication_reseed, true) and
+        reset_verdict(prev, push) == :short
+
+  defp short_reset?(_decision, _prev, _push), do: false
+
+  # ANSWER `:unknown_shard` — "I hold nothing you can build on" — which is the signal `Session`
+  # already seeds on, so the primary side needed no new reason, no wire change and no new path: the
+  # seed, its wait inside the commit, its dedup and its expiry are the ones the first-write seed has
+  # used since 2026-08-11.
+  #
+  # NOTHING IS WRITTEN TO THE REPLICA FILES. Absorbing the old WAL is what built the hybrid (#1), and
+  # appending the new ownership's frames onto a base it was not built from is the same hybrid one
+  # step later. The files stay exactly as they were until `install/3` replaces them.
+  #
+  # The state IS updated, in two fields, and both are load-bearing:
+  #
+  #   * `torn: true`, durably (the marker). This is the safety net the finding's option A asked for:
+  #     if the seed never arrives — refused for disk headroom, a shard too large for the deadline,
+  #     `:replication_reseed` off, the primary dying first — the replica is un-promotable rather than
+  #     a hybrid, and `reseed?/2` keeps asking on every push until a seed clears it;
+  #   * `epoch` and `lineage` ADVANCE to the new ownership's. Keeping the old ones would let the
+  #     DEPOSED owner, still shipping at the old lineage, pass the lineage fence as an equal and have
+  #     its own seed accepted over this one. Advancing them fences it exactly as a completed reset
+  #     would have, and the new owner's seed (same lineage) is still accepted by `begin_seed/3`.
+  #
+  # The position fields (`wal_gen`, `salt1`, `next_offset`, `wal_ordinal`) keep describing the files
+  # that are actually on disk; nothing reads them for an append while `torn` holds.
+  defp request_seed(name, prev, decided, push) do
+    Logger.info(
+      "replication follower asking for a seed of #{push.shard_id}: " <>
+        if(prev.torn, do: "the replica is torn", else: "new ownership or a short reset")
+    )
+
+    put_state(name, push.shard_id, %{
+      prev
+      | torn: true,
+        epoch: decided.epoch,
+        lineage: decided.lineage
+    })
+
+    Protocol.encode_reject(push.shard_id, :unknown_shard, 0)
   end
 
   # Absorb our own WAL into our own `.db` before the reset discards it.
@@ -1267,22 +1332,18 @@ defmodule Fathom.Shard.Replication.Follower do
   # a rolling upgrade, which is the failure this subsystem exists to prevent, arriving by the door
   # marked safety.
   #
-  # The PRIMARY-side half of #11a — sending a full seed instead of a reset when a follower is known
-  # short — is deliberately NOT here. Seeds are the expensive operation A2 exists to avoid, and
-  # AGENTS.md records ~10k `:already_in_flight` rejects per node at 512 tenants; a rule that turns
-  # "behind at a generation boundary" into "ship the whole database" needs the rig's seed rate
-  # measured first or it converts a lag spike into a seed storm. The follower-side half stands
-  # alone: it refuses to CLAIM completeness it cannot prove, which is strictly safe on its own.
+  # The seed half of #11a now exists (expert review 2026-09-29 #1): a follower short at a reset asks
+  # for a seed on that same push (`short_reset?/3` → `request_seed/4`) instead of absorbing a WAL it
+  # knows is incomplete. It waited on the rig's seed-rate measurement, because a rule that turns
+  # "behind at a generation boundary" into "ship the whole database" could convert a lag spike into
+  # a seed storm; measured 2026-09-30 (`./chaos.sh seed-rate`) at link speed, ~290 ms for 32 MiB on
+  # 1 Gbit/s. It stays write-gated: only a push can provoke it.
   defp complete_through_reset?(_prev, %Protocol.Push{prev_extent: prev}) when prev in [0, nil],
     do: true
 
   defp complete_through_reset?(%{next_offset: held}, %Protocol.Push{prev_extent: prev})
        when is_integer(held),
        do: held >= prev
-
-  # No prior state at all: the reset IS the first frame for this shard, so there is no partial
-  # generation to be short of.
-  defp complete_through_reset?(_prev, _push), do: true
 
   # TORN IS STICKY (expert review 2026-09-29 #2). A replica that was ALREADY torn going into this
   # reset stays torn whatever the reset says, because absorbing a complete NEXT generation does not
@@ -1293,13 +1354,33 @@ defmodule Fathom.Shard.Replication.Follower do
   # recovery reads the durable marker (#11b) into `prev.torn`, the first push after the restart is a
   # reset from offset 0, and that reset cleared the flag and deleted the marker #11b exists to keep.
   #
-  # Cost, stated plainly: a torn replica is now torn until it is re-seeded, and nothing re-seeds a
-  # torn replica today (seeds start only on `:unknown_shard`). That is the pre-A2 answer for that one
-  # shard on that one follower — promotion falls back to the stored object — not a loss.
+  # A torn replica is torn until it is re-seeded — and since expert review 2026-09-29 #1 it ASKS for
+  # that seed on its next push (`FollowerLog.reseed?/2`), so this path is only reached with
+  # `:replication_reseed` off. Until the seed lands, promotion falls back to the stored object: the
+  # pre-A2 answer for that one shard on that one follower, not a loss.
   defp reset_verdict(%{torn: true}, _push), do: :already_torn
 
-  defp reset_verdict(prev, push),
-    do: if(complete_through_reset?(prev, push), do: :complete, else: :short)
+  # A NEW OWNERSHIP'S reset (expert review 2026-09-29 #1). Only reached with `:replication_reseed`
+  # off — on, `request_seed/4` answers it first. See `absorb_before_reset/4`'s `:ownership` clause.
+  defp reset_verdict(%{} = prev, push) do
+    cond do
+      FollowerLog.ownership_change?(prev, push) -> :ownership
+      complete_through_reset?(prev, push) -> :complete
+      true -> :short
+    end
+  end
+
+  # No prior state: the reset IS the first frame for this shard.
+  defp reset_verdict(nil, _push), do: :complete
+
+  # NEVER ABSORB ACROSS AN OWNERSHIP CHANGE (expert review 2026-09-29 #1). The absorb is sound only
+  # when the pushing primary's base IS the state our old WAL leads to — true for a checkpoint within
+  # one ownership, and not knowable across two: after a restore or revert the new owner's `.db` is
+  # OLDER bytes, after an unflushed takeover it is the stale object, and a follower lagging at the
+  # handoff holds a short tail. `prev_extent` cannot help, because a new owner's session has no
+  # record of this follower and always states 0. So the replica stays torn (what `decide_fresh/2`
+  # set) and waits for a seed instead of becoming a promotable hybrid of two ownerships.
+  defp absorb_before_reset(_name, _shard_id, new_state, :ownership), do: new_state
 
   defp absorb_before_reset(name, shard_id, new_state, verdict) do
     db = db_path(name, shard_id)

@@ -466,6 +466,23 @@ defmodule Fathom.Telemetry do
             "budget; `already_in_flight` = a straggler still holds that shard's waiter, which is " <>
             "routine and absorbed by the quorum."
       ),
+      # A2 SEEDS (expert review 2026-09-29 #1). Since a follower asks for a seed on every ownership
+      # change, the seed rate tracks the shard reopen/takeover rate, and each one ships a whole
+      # database — so rate AND bytes are the two numbers that say whether the rule still fits the
+      # link. Tagged by outcome only; the shard rides the metadata for the log line.
+      counter("fathom.replication.seed.count",
+        event_name: [:fathom, :replication, :seed],
+        tags: [:result],
+        description:
+          "A2 seeds this node sent, by result. Tracks the reopen/takeover rate: a follower " <>
+            "asks for a fresh seed on every ownership change."
+      ),
+      sum("fathom.replication.seed.bytes",
+        event_name: [:fathom, :replication, :seed],
+        measurement: :bytes,
+        tags: [:result],
+        description: "Bytes declared by A2 seeds this node sent (db + wal), by result."
+      ),
       counter("fathom.replication.membership_refused.count",
         event_name: [:fathom, :replication, :membership_refused],
         measurement: :kept,

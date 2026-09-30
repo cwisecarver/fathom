@@ -238,6 +238,56 @@ defmodule Fathom.Shard.Replication.FollowerLog do
   defp merge_lineage(state, _push), do: state.lineage
 
   @doc """
+  Whether an ACCEPTED push must instead be answered with a request for a fresh seed (expert review
+  2026-09-29 #1). Only meaningful after `decide/2` accepted: every fence runs first, so a deposed
+  primary is still refused `:stale_epoch` and never provokes a seed.
+
+  Two cases, both of which mean "the files this follower holds are not a base the pushing primary's
+  WAL can be applied to":
+
+    * **the replica is torn** — its `.db` and `-wal` are already a generation apart, and
+      `torn` is cleared only by a seed, so nothing short of one makes it a copy again. Before this,
+      nothing ever re-seeded a torn replica (seeds started only on `:unknown_shard`), so a replica
+      that went torn stayed un-promotable for the life of the shard;
+    * **the push is from a NEW OWNERSHIP** (`ownership_change?/2`). A new owner's WAL is built on the
+      `.db` IT opened, which is not necessarily the old owner's final state: a snapshot restore or
+      migration revert replaced the object with older bytes, a takeover opened an object the old
+      owner never flushed to, or this follower was lagging at the handoff. Absorbing the old WAL
+      and appending the new one produced a promotable HYBRID of two ownerships. Only a seed from the
+      new owner is known to be its base.
+
+  The cost of the second case was measured before it was built (`./chaos.sh seed-rate`,
+  2026-09-30): a seed runs at link speed — ~115 MB/s on a 1 Gbit/s link plus ~2 ms fixed, so ~75 ms
+  at 8 MiB and ~290 ms at 32 MiB — and the first write after each ownership change waits for it.
+  Ownership changes at most once per `:shard_idle_ms` of quiet per shard, and seeding stays
+  write-gated (it happens inside a write), so a shard nobody writes to is never seeded.
+  """
+  @spec reseed?(t() | nil, Push.t()) :: boolean()
+  def reseed?(nil, _push), do: false
+  def reseed?(%{torn: true}, _push), do: true
+  def reseed?(state, push), do: ownership_change?(state, push)
+
+  @doc """
+  Whether `push` comes from a different ownership than the one `state` was built under.
+
+  Lineage decides when both sides state one: it is the monotonic ownership counter, and it is the
+  only one that orders a clean reopen (whose lock epoch resets to 1). Otherwise — a peer that
+  predates the field, or the wire gate off — a higher lock epoch is the only evidence available,
+  exactly as `decide/2` uses it.
+  """
+  @spec ownership_change?(t(), Push.t()) :: boolean()
+  #
+  # EQUAL stated lineages are the SAME ownership whatever the epochs say — and must not fall through
+  # to the epoch clause. A restarted follower recovers at epoch 0 with its persisted lineage
+  # (2026-09-29 #2c), so the current owner's next push states a higher epoch at the same lineage;
+  # reading that as a new ownership would re-seed every replica on every follower restart.
+  def ownership_change?(%{lineage: mine}, %Push{lineage: pushed})
+      when is_integer(mine) and mine > 0 and is_integer(pushed) and pushed > 0,
+      do: pushed > mine
+
+  def ownership_change?(%{epoch: epoch}, %Push{epoch: pushed}), do: pushed > epoch
+
+  @doc """
   State for a shard that has just been seeded from storage.
 
   `wal_gen` and `next_offset` come from the seed, not from zero: a pull copies the primary's `.db`
