@@ -339,10 +339,25 @@ defmodule Fathom.Shard.ReplicationOwnershipReseedTest do
   defp stop_shard!(id, {coordinator, ref, _path, conn}) do
     Connection.close(conn)
     Fathom.Shard.checkin(coordinator, ref)
+
+    # The Session monitors its coordinator and stops ITSELF on the DOWN, so it is monitored here
+    # and awaited — never stopped. This used to call `Session.stop/1` after the coordinator's DOWN,
+    # which raced the Session's own exit: on a loaded CI runner the Registry still named the pid
+    # and `GenServer.stop/3` exited `:normal` (CI, OTP 27, run 36672054563, seed 517105).
+    session =
+      case Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id) do
+        [{pid, _}] -> {pid, Process.monitor(pid)}
+        [] -> nil
+      end
+
     mon = Process.monitor(coordinator)
     :ok = Shards.stop(id)
     assert_receive {:DOWN, ^mon, :process, ^coordinator, _}, 10_000
-    Session.stop(id)
+
+    with {pid, smon} <- session do
+      assert_receive {:DOWN, ^smon, :process, ^pid, _}, 10_000
+    end
+
     # Cold-open from the stored object on the next checkout, which is what makes a restore take.
     for e <- ["", "-wal", "-shm", ".etag"], do: File.rm(Fathom.Shard.db_path(id) <> e)
   end
