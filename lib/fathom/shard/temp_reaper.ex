@@ -126,12 +126,34 @@ defmodule Fathom.Shard.TempReaper do
     length(files)
   end
 
-  # Age from the file's mtime (the quarantine is never rewritten after the rename, so mtime is its
-  # creation time). Unstattable ⇒ age 0 ⇒ never swept (fail-safe: keep the data).
-  defp quarantine_age_ms(file, now_ms) do
-    case File.stat(file, time: :posix) do
-      {:ok, %File.Stat{mtime: mtime_sec}} -> now_ms - mtime_sec * 1000
-      _ -> 0
+  # Age from the QUARANTINE time embedded in the name — `<id>.db.<kind>.<ms>[-<unique>][-wal|-shm]`
+  # — not the mtime (expert review 2026-09-29 #32). A quarantine is a RENAME, and rename preserves
+  # mtime, so mtime is when the content was last WRITTEN: a `.forked`/`.corrupt` copy of a shard idle
+  # for more than the retention window was swept within one reaper interval of being quarantined —
+  # the recovery copy gone before anyone could look. The old comment here claimed mtime was the
+  # creation time; it is not. The `-wal`/`-shm` siblings carry the same `<ms>`, so a recovery set
+  # ages as a unit instead of being split by their independent mtimes.
+  #
+  # A name without the stamp (none is written today) falls back to mtime; unstattable ⇒ age 0 ⇒
+  # never swept (fail-safe: keep the data).
+  @quarantine_stamp ~r/\.db\.(?:fenced|forked|corrupt)\.(\d+)(?:-\d+)?(?:-wal|-shm)?$/
+
+  @doc """
+  Milliseconds since `file` was QUARANTINED, read from the stamp in its name (mtime only as a
+  fallback — a rename preserves it, so it is the content's age, not the quarantine's). Shared with
+  `mix fathom.shard quarantines` so the listing an operator reads agrees with what retention does.
+  """
+  @spec quarantine_age_ms(Path.t(), integer()) :: number()
+  def quarantine_age_ms(file, now_ms) do
+    case Regex.run(@quarantine_stamp, Path.basename(file), capture: :all_but_first) do
+      [ms] ->
+        now_ms - String.to_integer(ms)
+
+      nil ->
+        case File.stat(file, time: :posix) do
+          {:ok, %File.Stat{mtime: mtime_sec}} -> now_ms - mtime_sec * 1000
+          _ -> 0
+        end
     end
   end
 

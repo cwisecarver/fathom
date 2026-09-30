@@ -215,9 +215,12 @@ defmodule Mix.Tasks.Fathom.Shard do
   end
 
   defp quarantine_stat(file, now_ms) do
-    case File.stat(file, time: :posix) do
-      {:ok, %File.Stat{size: size, mtime: mtime_sec}} ->
-        {"#{div(now_ms - mtime_sec * 1000, 1000)}s", "#{size}B"}
+    # Age from the name's quarantine stamp, as retention does (expert review 2026-09-29 #32) — the
+    # mtime survives the rename, so it showed the content's age and hid how close retention was.
+    case File.stat(file) do
+      {:ok, %File.Stat{size: size}} ->
+        age_ms = Fathom.Shard.TempReaper.quarantine_age_ms(file, now_ms)
+        {"#{div(age_ms, 1000)}s", "#{size}B"}
 
       _ ->
         {"?", "?"}

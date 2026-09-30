@@ -49,12 +49,15 @@ defmodule Fathom.Shard.QuarantineTest do
   test "the reaper sweeps quarantines past retention, keeps fresh ones, and emits the count gauge",
        %{dir: dir} do
     Application.put_env(:fathom, :shard_data_dir, dir)
-    # A 1-minute retention; the old file (mtime 1h ago) is past it, the fresh one is not.
+    # A 1-minute retention; the old file (quarantined 1h ago, per its name) is past it, the fresh
+    # one is not. This used to set the age with `File.touch` on the mtime and name the files with
+    # ms stamps of 1 and 2 — i.e. it pinned the mtime ageing that expert review 2026-09-29 #32
+    # showed is wrong (rename preserves mtime). The name's stamp is the quarantine time now.
     Application.put_env(:fathom, :quarantine_retention_ms, 60_000)
+    now = System.system_time(:millisecond)
 
-    old = touch!(Path.join(dir, "old.db.fenced.1-1"))
-    fresh = touch!(Path.join(dir, "fresh.db.forked.2-2"))
-    :ok = File.touch(old, System.os_time(:second) - 3600)
+    old = touch!(Path.join(dir, "old.db.fenced.#{now - 3_600_000}-1"))
+    fresh = touch!(Path.join(dir, "fresh.db.forked.#{now}-2"))
 
     ref = make_ref()
     test = self()
@@ -74,6 +77,40 @@ defmodule Fathom.Shard.QuarantineTest do
     refute File.exists?(old), "a quarantine older than the retention cap must be swept"
     assert File.exists?(fresh), "a fresh quarantine must NOT be swept"
     assert_received {:gauge, ^ref, count} when count >= 1
+  end
+
+  # Expert review 2026-09-29 #32. A quarantine is a RENAME and rename preserves mtime, so a copy of
+  # content last written long ago carries an ancient mtime the moment it is quarantined. Ageing by
+  # mtime swept that recovery copy within one reaper interval. Invariant: age = the quarantine time
+  # in the name, and a `.db` + `-wal` + `-shm` set is kept or swept as a unit.
+  test "age is the quarantine time in the name, not the content's mtime; sets age as a unit",
+       %{dir: dir} do
+    Application.put_env(:fathom, :shard_data_dir, dir)
+    Application.put_env(:fathom, :quarantine_retention_ms, 60_000)
+    now = System.system_time(:millisecond)
+    ancient = System.os_time(:second) - 60 * 24 * 3600
+
+    # Just quarantined, but the content (and so the mtime, carried by the rename) is 60 days old.
+    fresh =
+      for s <- ["", "-wal", "-shm"], do: touch!(Path.join(dir, "idle.db.forked.#{now}-7#{s}"))
+
+    for f <- fresh, do: :ok = File.touch(f, ancient)
+
+    # Quarantined an hour ago; its -wal was appended to just before, so its mtime is recent.
+    stale =
+      for s <- ["", "-wal", "-shm"],
+          do: touch!(Path.join(dir, "busy.db.corrupt.#{now - 3_600_000}-8#{s}"))
+
+    :ok = File.touch(Enum.at(stale, 1), System.os_time(:second))
+
+    start_supervised!(TempReaper)
+    _ = TempReaper.sweep()
+
+    for f <- fresh,
+        do: assert(File.exists?(f), "#{Path.basename(f)}: a fresh quarantine was swept by mtime")
+
+    for f <- stale,
+        do: refute(File.exists?(f), "#{Path.basename(f)}: a stale set was split or kept")
   end
 
   test "retention 0 keeps quarantines forever (the leak-off escape hatch)", %{dir: dir} do
