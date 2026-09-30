@@ -236,6 +236,19 @@ is left ahead of the live fleet. `yank/1` runs it automatically and, on drift, e
 wedged pipeline is an alert, not a surprise at the next `makemigrations`. (Releases captured before
 this feature carry no count and report `:unknown` rather than false-alarming.)
 
+**How the reverted shards reach vN+1** (expert review 2026-09-29 #16). A shard reverted to vN-1
+needs the chain `vN-1 → vN+1`, which passes through the yanked vN. The rollout **skips** vN only when
+it can prove step 2 happened: vN+1's pre-capture `django_migrations` count (its recorded count minus
+the bookkeeping rows it inserts) must equal vN-1's count. If it does not — the fix was captured on a
+template still carrying vN — the chain halts on vN exactly as before (`unbuildable_chain`), because
+skipping would silently cut shards over to schema vN+1 was never authored against.
+
+Capture enforces the same rule at the source: a version captured on a template that was not walked
+back is recorded (the migration already committed on the template) but held `requires_review` with
+reason `template_drift`, so it never becomes HEAD, and `approve_review/1` **refuses** it
+(`{:error, :template_drift_requires_recapture}`). The remedy is: yank it, do step 2, and re-run the
+migration so it is captured again on the aligned template.
+
 ## The gate (a migration isn't done without these)
 
 1. **Forward** — seed a vN-1 shard, run the copy+transform, validate vN by row counts / checksums.

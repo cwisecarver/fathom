@@ -615,10 +615,23 @@ defmodule Fathom.Migrator.ShardMigration do
     # DDL so `Copy.migrate_chain/4` can run it in the same transaction.
     steps = Migrator.statement_steps(versions)
 
+    # A yanked version the template was provably walked back from before the next capture is
+    # SKIPPED rather than halting the chain (expert review 2026-09-29 #16) — see
+    # `Migrator.skippable_yanked/2` for why that is decidable and when it is not. Every other
+    # unavailable version still halts, exactly as before. Queried ONLY when the chain has a hole, so
+    # the healthy path keeps its constant query count (the 2026-08-26 #22 N+1 test pins it).
+    skip =
+      if map_size(steps) == length(versions),
+        do: MapSet.new(),
+        else: Migrator.skippable_yanked(current, target)
+
     Enum.reduce_while(versions, {:ok, []}, fn v, {:ok, acc} ->
       case Map.fetch(steps, v) do
-        :error -> {:halt, {:error, {:unknown_version, v}}}
-        {:ok, {pairs, transform}} -> {:cont, {:ok, [{v, pairs, transform} | acc]}}
+        {:ok, {pairs, transform}} ->
+          {:cont, {:ok, [{v, pairs, transform} | acc]}}
+
+        :error ->
+          if v in skip, do: {:cont, {:ok, acc}}, else: {:halt, {:error, {:unknown_version, v}}}
       end
     end)
     |> case do

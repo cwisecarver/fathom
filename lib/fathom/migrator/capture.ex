@@ -445,6 +445,23 @@ defmodule Fathom.Migrator.Capture do
     )
   end
 
+  defp alarm_capture_drift(version, drift) do
+    Logger.error(
+      "captured version #{version} on a template that was NOT walked back after the revert of " <>
+        "v#{Enum.join(drift["yanked"], ", v")}: django_migrations was #{drift["before"]} when the " <>
+        "capture began, but the live HEAD v#{drift["live_version"]} was captured at " <>
+        "#{drift["live_count"]}. This version assumes schema the fleet reverted away from, so it is " <>
+        "held requires_review and cannot be approved. Yank it, backwards-migrate the template to " <>
+        "v#{drift["live_version"]}, and re-run the migration to re-capture. See docs/migration.md."
+    )
+
+    :telemetry.execute(
+      [:fathom, :migrator, :template_drift],
+      %{count: 1},
+      %{template_version: version, head_version: drift["live_version"]}
+    )
+  end
+
   # A committed-but-unrecorded buffer: the DDL landed, the `django_migrations` row has not (yet).
   defp awaiting(buffer, count_at_begin),
     do: %{buffer: buffer, count_at_begin: count_at_begin, awaiting?: true}
@@ -502,7 +519,12 @@ defmodule Fathom.Migrator.Capture do
   # `django_migrations` — Django's own bookkeeping `INSERT INTO django_migrations` is the one benign
   # DML in a migration transaction. A heuristic, not a SQL parser: it flags the RunPython-backfill
   # case; a data migration that references django_migrations in a WHERE clause (rare) would be missed.
-  defp record_review_reason(version, statements, gap) do
+  # A drift hold wins the reason: it is the one approve_review/1 refuses, and its remedy (yank +
+  # walk back + re-capture) supersedes whatever else the version would need.
+  defp record_review_reason(version, _statements, _gap, drift) when is_map(drift),
+    do: Migrator.set_review_reason(version, "template_drift", drift)
+
+  defp record_review_reason(version, statements, gap, nil) do
     data = data_migration_statements(statements)
 
     {reason, detail} =
@@ -696,12 +718,17 @@ defmodule Fathom.Migrator.Capture do
     # the earlier attempt hit).
     gap = migration_gap(before)
 
+    # Expert review 2026-09-29 #16: a capture on top of a YANKED version the template was never
+    # walked back from. Held for review like a gap — and unlike a gap, `approve_review/1` refuses it:
+    # the only safe remedy is yank this version, walk the template back, and re-capture.
+    drift = Migrator.capture_drift(before)
+
     # Expert review #1: flag a captured version that carries template-literal DATA migrations (or a
     # detected gap) so HEAD stays below it until an operator reviews it — replaying its DML fleet-wide
     # corrupts/skips tenant data, and a gap means it assumes DDL the fleet doesn't have. We still
     # RECORD it (refusing would fork the template from the fleet, the #19 invariant); the flag blocks
     # the rollout, not the capture.
-    requires_review = data_migration_statements(statements) != [] or gap != nil
+    requires_review = data_migration_statements(statements) != [] or gap != nil or drift != nil
 
     case Migrator.release(
            version,
@@ -714,8 +741,9 @@ defmodule Fathom.Migrator.Capture do
       {:ok, _} ->
         # Record WHY, so `GET /api/migrations/status` can tell an operator what tripped the flag and
         # what their options are (#26) instead of just `pending_review: [7]`.
-        if requires_review, do: record_review_reason(version, statements, gap)
+        if requires_review, do: record_review_reason(version, statements, gap, drift)
         if gap, do: alarm_gap(version, gap)
+        if drift, do: alarm_capture_drift(version, drift)
         alarm_on_data_migration(version, statements)
         {:recorded, version}
 

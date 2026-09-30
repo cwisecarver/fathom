@@ -266,6 +266,130 @@ defmodule Fathom.Migrator do
   end
 
   @doc """
+  The YANKED versions strictly between `current` and `target` that a rollout chain may safely
+  SKIP (expert review 2026-09-29 #16; decided 2026-09-29).
+
+  The documented revert loop is: canary vN, `revert` (yanks vN), walk the template back, fix, and
+  capture vN+1. A shard reverted to vN-1 then needs `vN-1 → vN+1`, and the chain used to HALT on the
+  yanked vN (`{:unknown_version, N}` → cancelled as an unbuildable chain, forever). Skipping vN is
+  correct only if vN+1 was captured on a template that no longer had vN. If the operator skipped the
+  walk-back, vN+1 was authored on top of vN's schema, and skipping vN on a shard at vN-1 can SUCCEED
+  silently (vN made a table vN+1 never mentions) with all three stamps at vN+1.
+
+  That is decidable from what every captured release already stores. `template_migration_count` is
+  the template's `django_migrations` count AFTER the capture, and each Django migration in it
+  inserts exactly one bookkeeping row, so the count BEFORE the capture is
+  `count - bookkeeping inserts`. A run of yanked versions is skippable iff the next live release's
+  pre-capture count equals the post-capture count of the last live release below the run — i.e.
+  the template was back at exactly that state when the next version was captured. Anything
+  unknowable (a hand-authored release with no count, a shard at v0 with no release) is NOT
+  skippable, which keeps today's fail-closed halt. A yanked `target` is never skipped. A MIDDLE
+  version yanked after later versions were already captured on top of it stays unskippable, because
+  those later captures' pre-counts include it.
+  """
+  @spec skippable_yanked(non_neg_integer(), non_neg_integer()) :: MapSet.t(pos_integer())
+  def skippable_yanked(current, target) when target > current + 1 do
+    rows =
+      Repo.all(
+        from(r in Release,
+          where: r.version >= ^current and r.version <= ^target,
+          order_by: [asc: r.version],
+          select: %{
+            version: r.version,
+            yanked: r.yanked,
+            count: r.template_migration_count,
+            statements: r.statements
+          }
+        )
+      )
+
+    by_version = Map.new(rows, &{&1.version, &1})
+    base = by_version[current]
+
+    (current + 1)..(target - 1)//1
+    |> Enum.reduce({MapSet.new(), base && base.count, []}, fn v, {skip, live_count, run} ->
+      case by_version[v] do
+        %{yanked: true} ->
+          {skip, live_count, [v | run]}
+
+        %{yanked: false} = live ->
+          skip =
+            if run != [] and walked_back?(live, live_count),
+              do: Enum.reduce(run, skip, &MapSet.put(&2, &1)),
+              else: skip
+
+          {skip, live.count, []}
+
+        nil ->
+          {skip, nil, []}
+      end
+    end)
+    |> then(fn {skip, live_count, run} ->
+      # A trailing run ends at `target` itself — skippable only if target is live and qualifies.
+      case {run, by_version[target]} do
+        {[_ | _], %{yanked: false} = t} ->
+          if walked_back?(t, live_count),
+            do: Enum.reduce(run, skip, &MapSet.put(&2, &1)),
+            else: skip
+
+        _ ->
+          skip
+      end
+    end)
+  end
+
+  def skippable_yanked(_current, _target), do: MapSet.new()
+
+  defp walked_back?(%{count: count, statements: statements}, live_count)
+       when is_integer(count) and is_integer(live_count) do
+    count - Enum.count(statements, &Capture.bookkeeping?/1) == live_count
+  end
+
+  defp walked_back?(_release, _live_count), do: false
+
+  @doc """
+  The capture-time half of #16 (expert review 2026-09-29; decided 2026-09-29): is the template about
+  to record a new version on top of a YANKED one it was never walked back from?
+
+  `before` is the template's `django_migrations` count when the capturing transaction began. When
+  the newest releases are yanked (a revert with nothing captured since), the template must be back
+  at the newest LIVE release's post-capture count; anything else means the new version assumes
+  schema the fleet reverted away from. Returns `nil` when there is nothing to compare (no yanked
+  tail, or a count is unknown) and a detail map on drift. The caller records the version anyway —
+  the migration already committed on the template, and refusing would fork template from fleet —
+  but held `requires_review`, which `approve_review/1` refuses to clear.
+  """
+  @spec capture_drift(non_neg_integer()) :: map() | nil
+  def capture_drift(before) do
+    live =
+      Repo.one(from(r in Release, where: not r.yanked, order_by: [desc: r.version], limit: 1))
+
+    live_version = if live, do: live.version, else: 0
+
+    yanked_above =
+      Repo.all(
+        from(r in Release,
+          where: r.yanked and r.version > ^live_version,
+          order_by: [asc: r.version],
+          select: r.version
+        )
+      )
+
+    case {yanked_above, live} do
+      {[_ | _], %{template_migration_count: count}} when is_integer(count) and count != before ->
+        %{
+          "before" => before,
+          "live_version" => live_version,
+          "live_count" => count,
+          "yanked" => yanked_above
+        }
+
+      _ ->
+        nil
+    end
+  end
+
+  @doc """
   Attaches a per-shard `transform` module to `version` and clears its review flag (#26).
 
   This is the **third path** for a captured data migration. Previously an operator could only
@@ -357,6 +481,9 @@ defmodule Fathom.Migrator do
       flagged -> {:error, {:data_statements_present, flagged}}
     end
   end
+
+  defp refuse_if_gap(%{review_reason: "template_drift"}),
+    do: {:error, :template_drift_requires_recapture}
 
   defp refuse_if_gap(%{review_reason: reason}) when is_binary(reason) do
     if String.contains?(reason, "gap"), do: {:error, :gap_requires_reconcile}, else: :ok
@@ -569,7 +696,21 @@ defmodule Fathom.Migrator do
       }
     ]
 
+    drift = [
+      %{
+        action: "recapture",
+        how:
+          "Fathom.Migrator.yank(version); backwards-migrate the template to HEAD " <>
+            "(manage.py migrate <app> <prev>); re-run the forward migration to re-capture",
+        effect:
+          "the version was captured on a template still carrying a reverted (yanked) version, so " <>
+            "its DDL assumes schema the fleet does not have. It cannot be approved (expert review " <>
+            "2026-09-29 #16); a clean re-capture is the only safe path."
+      }
+    ]
+
     case reason do
+      "template_drift" -> drift
       "data_migration" -> data
       "migration_gap" -> gap
       "data_migration_and_gap" -> gap ++ data
@@ -582,11 +723,18 @@ defmodule Fathom.Migrator do
   the captured data migration is safe to replay fleet-wide — HEAD then advances (up to the next
   flagged version, if any) and the rollout proceeds. Refreshes this node's HeadCache.
   """
-  @spec approve_review(pos_integer()) :: :ok | {:error, :unknown_version}
+  @spec approve_review(pos_integer()) ::
+          :ok | {:error, :unknown_version | :template_drift_requires_recapture}
   def approve_review(version) do
     case Repo.get_by(Release, version: version) do
       nil ->
         {:error, :unknown_version}
+
+      # Captured on a template that still carried a yanked version (expert review 2026-09-29 #16):
+      # its DDL assumes schema the fleet reverted away from, and approving it would let the chain
+      # skip-or-replay onto shards that never had that schema. The remedy is re-capture, not review.
+      %{review_reason: "template_drift"} ->
+        {:error, :template_drift_requires_recapture}
 
       release ->
         {:ok, _} = release |> Ecto.Changeset.change(requires_review: false) |> Repo.update()
