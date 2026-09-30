@@ -78,7 +78,13 @@ defmodule Fathom.Shard.Storage do
           :owner => String.t(),
           :epoch => non_neg_integer(),
           :expires_at_ms => integer(),
-          optional(:lock_etag) => String.t()
+          optional(:lock_etag) => String.t(),
+          # The LINEAGE this owner claimed, written into the lock body so a successor can go
+          # strictly above it (expert review 2026-09-29 #3) — see `takeover_claim/2`. Present only
+          # on a lock taken over from an EXISTING one (a steal, or a reclaim of our own stale lock)
+          # while replicating; a fresh create carries none. `:unknown` is lease-local, never
+          # written: the store could not be read, so there is no safe number to claim.
+          optional(:claim) => pos_integer() | :unknown
         }
 
   @typedoc """
@@ -1017,21 +1023,76 @@ defmodule Fathom.Shard.Storage do
 
   @doc false
   @spec encode_lease(lease()) :: binary()
-  def encode_lease(%{owner: owner, epoch: epoch, expires_at_ms: exp}),
-    do: Jason.encode!(%{"owner" => owner, "epoch" => epoch, "expires_at_ms" => exp})
+  def encode_lease(%{owner: owner, epoch: epoch, expires_at_ms: exp} = lease) do
+    base = %{"owner" => owner, "epoch" => epoch, "expires_at_ms" => exp}
+
+    case Map.get(lease, :claim) do
+      claim when is_integer(claim) -> Jason.encode!(Map.put(base, "claim", claim))
+      _ -> Jason.encode!(base)
+    end
+  end
 
   @doc false
   @spec decode_lease(binary()) :: {:ok, lease()} | :error
   def decode_lease(body) do
     case Jason.decode(body) do
-      {:ok, %{"owner" => owner, "epoch" => epoch, "expires_at_ms" => exp}}
+      {:ok, %{"owner" => owner, "epoch" => epoch, "expires_at_ms" => exp} = m}
       when is_binary(owner) and is_integer(epoch) and is_integer(exp) ->
-        {:ok, %{owner: owner, epoch: epoch, expires_at_ms: exp}}
+        lease = %{owner: owner, epoch: epoch, expires_at_ms: exp}
+
+        case Map.get(m, "claim") do
+          claim when is_integer(claim) and claim > 0 -> {:ok, Map.put(lease, :claim, claim)}
+          _ -> {:ok, lease}
+        end
 
       _ ->
         :error
     end
   end
+
+  @doc """
+  The lineage a node must claim when it takes over an EXISTING lock — a steal of a dead owner's, or
+  a reclaim of its own stale one (expert review 2026-09-29 #3; decided 2026-09-29).
+
+  `Fathom.Shard`'s open used `next_lineage(object_head)`, so an owner X that claimed L+1, shipped
+  frames to its followers and crashed before flushing left the object at L — and its successor took
+  L+1 as well, restarting the WAL ordinal under a lineage the followers already held from X. Two
+  different histories with one label; `Promote.fresher?/2` and `FollowerLog.decide/2` cannot tell
+  them apart.
+
+  The previous holder's claim is bounded by what its lock says:
+
+    * the lock names a `claim` c — that holder used exactly c, so go to `max(next_lineage, c + 1)`;
+    * the lock names none — the holder took the fresh-create path, whose lineage is
+      `next_lineage(object at its open)`, and nobody else could flush while it held the lock, so it
+      used at most `next_lineage(object now)`; go one above that.
+
+  The result is written into the new lock body, so the NEXT successor finds it — which is what makes
+  two crashes in a row safe, where "+1 on steal" alone would collide again. `nil` when replication is
+  off (nothing ranks on lineage), `:unknown` when the store cannot be read.
+  """
+  @spec takeover_claim(String.t(), pos_integer() | nil) :: pos_integer() | :unknown | nil
+  def takeover_claim(shard_id, previous_claim) do
+    if Fathom.Shard.Replication.Fleet.replicating?() do
+      case object_head(shard_id) do
+        {:ok, head} ->
+          claim_above(next_lineage(head), previous_claim)
+
+        {:error, _} ->
+          :unknown
+      end
+    end
+  end
+
+  defp claim_above(base, previous) when is_integer(previous), do: max(base, previous + 1)
+  defp claim_above(base, _none), do: base + 1
+
+  # Attach a takeover claim to a lease about to be written. `nil` (replication off) leaves the lease
+  # exactly as before, so the lock body is byte-identical on a non-replicating fleet.
+  @doc false
+  @spec with_claim(lease(), pos_integer() | :unknown | nil) :: lease()
+  def with_claim(lease, nil), do: lease
+  def with_claim(lease, claim), do: Map.put(lease, :claim, claim)
 
   @doc false
   @spec encode_heartbeat(heartbeat()) :: binary()

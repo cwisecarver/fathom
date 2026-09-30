@@ -668,7 +668,7 @@ defmodule Fathom.Shard do
       # Computed BEFORE the promote, and passed into it, so that a promoted replica and every
       # later flush of this coordinator stamp the SAME lineage — they are one ownership. See
       # open_lineage/1 for why it is read once and never recomputed.
-      lineage = open_lineage(shard_id)
+      lineage = open_lineage(shard_id, lease)
       # `warm?` was decided BEFORE the lease was held. Revalidation can then quarantine that local
       # file and RE-PULL the object (a fork, a moved object), after which the file is an ordinary
       # cold pull — and promote-on-open's warm skip (2026-09-18 #1, "never promote a peer over a
@@ -2995,19 +2995,31 @@ defmodule Fathom.Shard do
   #     the store for its bytes, so this is reachable while still serving correctly. There is no
   #     lineage to claim, so nothing is stamped and the object becomes un-overridable — the same
   #     safe direction flush_position/2 already takes for an unreadable WAL.
-  defp open_lineage(shard_id) do
+  #
+  # A TAKEOVER USES THE CLAIM ITS LOCK RECORDS (expert review 2026-09-29 #3). `next_lineage` of the
+  # object is only safe for a FRESH lock: when this owner took over an existing one (a steal, or a
+  # reclaim of its own stale lock), the previous holder may have shipped frames under exactly that
+  # number and crashed before flushing, and reusing it gave two histories one label.
+  # `Storage.takeover_claim/2` picked a number strictly above that bound and wrote it into the lock,
+  # so the next successor finds it; this must use that same number, or the lock would understate it.
+  defp open_lineage(shard_id, lease) do
     # Gate first and return an atom, mirroring promote_on_open?/0 at the call site above: a node
     # that has not enabled replication must not pay for a feature it does not run.
     # `Fleet.replicating?/0`, the owned predicate, rather than a re-inlined config read: the
     # lineage rides the SHIPPING gate, not the listen gate. A node that ships is a node whose
     # stamps get compared against replicas; a node that only receives has no stamps of its own.
-    if Fleet.replicating?() do
-      case Storage.object_head(shard_id) do
-        {:ok, head} -> Storage.next_lineage(head)
-        {:error, _} -> :unknown
-      end
-    else
-      :disabled
+    cond do
+      not Fleet.replicating?() ->
+        :disabled
+
+      is_map_key(lease, :claim) ->
+        lease.claim
+
+      true ->
+        case Storage.object_head(shard_id) do
+          {:ok, head} -> Storage.next_lineage(head)
+          {:error, _} -> :unknown
+        end
     end
   end
 

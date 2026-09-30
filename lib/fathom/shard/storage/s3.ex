@@ -1864,14 +1864,21 @@ defmodule Fathom.Shard.Storage.S3 do
   # and this read (the holder just released) is retried as a fresh create.
   defp acquire_existing(shard_id, owner, ttl_ms, now) do
     case get_lock(shard_id) do
-      {:ok, %{owner: ^owner, epoch: epoch}, etag} ->
-        put_lock(shard_id, %{owner: owner, epoch: epoch, expires_at_ms: now + ttl_ms},
+      # A same-owner reclaim is a takeover from a previous coordinator of THIS node that may have
+      # shipped under its claim, so it claims above it like a steal (expert review 2026-09-29 #3).
+      {:ok, %{owner: ^owner, epoch: epoch} = existing, etag} ->
+        put_lock(
+          shard_id,
+          Storage.with_claim(
+            %{owner: owner, epoch: epoch, expires_at_ms: now + ttl_ms},
+            Storage.takeover_claim(shard_id, Map.get(existing, :claim))
+          ),
           if_match: etag
         )
 
       # Someone else holds it — liveness is *their heartbeat* (with the lock's own TTL as the
       # fallback when they run no heartbeat — see owner_live?/3).
-      {:ok, %{owner: other, epoch: epoch, expires_at_ms: lock_exp}, etag} ->
+      {:ok, %{owner: other, epoch: epoch, expires_at_ms: lock_exp} = dead_lock, etag} ->
         case owner_live?(shard_id, other, now, lock_exp) do
           :live ->
             # CARRIES THE STEAL INSTANT (expert review 2026-08-26 #23). `owner_live?/4` and
@@ -1882,7 +1889,14 @@ defmodule Fathom.Shard.Storage.S3 do
             {:error, {:held, other, steal_instant(shard_id, other, now, lock_exp)}}
 
           :dead ->
-            stolen = %{owner: owner, epoch: epoch + 1, expires_at_ms: now + ttl_ms}
+            # The new lock records the lineage this owner claims, strictly above anything the dead
+            # owner could have shipped under (expert review 2026-09-29 #3). Read BEFORE the PUT so it
+            # rides the steal write itself — no extra lock write per takeover.
+            stolen =
+              Storage.with_claim(
+                %{owner: owner, epoch: epoch + 1, expires_at_ms: now + ttl_ms},
+                Storage.takeover_claim(shard_id, Map.get(dead_lock, :claim))
+              )
 
             case put_lock(shard_id, stolen, if_match: etag) do
               {:ok, lease} ->
@@ -1938,11 +1952,16 @@ defmodule Fathom.Shard.Storage.S3 do
                   # Best-effort — if the rollback itself fails, the etag data-fence still
                   # backstops a clobber.
                   {:error, reason} ->
-                    restore_lock(shard_id, stolen, %{
-                      owner: other,
-                      epoch: epoch + 2,
-                      expires_at_ms: lock_exp
-                    })
+                    # Keeps the dead owner's recorded claim (#3), so the retry's takeover still
+                    # goes above it.
+                    restore_lock(
+                      shard_id,
+                      stolen,
+                      Map.merge(
+                        %{owner: other, epoch: epoch + 2, expires_at_ms: lock_exp},
+                        Map.take(dead_lock, [:claim])
+                      )
+                    )
 
                     {:error, {:transient_lookup, {:touch_failed, reason}}}
                 end
@@ -2104,7 +2123,14 @@ defmodule Fathom.Shard.Storage.S3 do
   @impl true
   def renew_lease(shard_id, %{owner: owner, epoch: epoch} = lease, ttl_ms) do
     now = Storage.now_ms()
-    renewed = %{owner: owner, epoch: epoch, expires_at_ms: now + ttl_ms}
+
+    # Carries the claim this lease wrote (#3): a renew rewrites the whole lock body, and dropping it
+    # would let a later successor fall back to the fresh-create bound and collide with our lineage.
+    renewed =
+      Map.merge(
+        %{owner: owner, epoch: epoch, expires_at_ms: now + ttl_ms},
+        Map.take(lease, [:claim])
+      )
 
     case lease do
       # Fast path (review 2026-07-23 #6): we cached the lock's etag when WE last wrote it

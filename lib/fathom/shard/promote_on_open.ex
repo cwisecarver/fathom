@@ -270,6 +270,23 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # one that cannot be shrugged off — the object is now the replica while the local file is not —
   # so it fails the open, which releases the lease and lets a clean open pull the bytes we just
   # published.
+  # PROMOTE STRICTLY ABOVE THE REPLICA (expert review 2026-09-29 #3, the promote tier). The promoted
+  # object is stamped with THIS owner's lineage; a replica already holding that lineage or a higher
+  # one came from a history this owner does not continue, and stamping over it would give two
+  # histories one label. With the takeover claim in the lock (`Storage.takeover_claim/2`) the
+  # canonical failover always opens ABOVE the dead owner's replica, so this should never fire —
+  # it is the guard for anything that reaches here otherwise, and it declines rather than stamping:
+  # serving the stored object is always correct, merely older.
+  defp promote_replica(shard_id, _path, _lease, etag, %{lineage: rl}, _stamp, lineage)
+       when is_integer(rl) and is_integer(lineage) and rl >= lineage do
+    Logger.warning(
+      "shard #{shard_id}: not promoting — the replica's lineage #{rl} is not below this owner's " <>
+        "#{lineage}, so stamping it would reuse a lineage; serving the stored object"
+    )
+
+    etag
+  end
+
   defp promote_replica(shard_id, path, lease, etag, replica, stamp, lineage) do
     temp = "#{path}.promote.#{System.unique_integer([:positive])}"
     follower = Follower

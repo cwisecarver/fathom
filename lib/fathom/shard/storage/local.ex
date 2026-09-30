@@ -657,13 +657,21 @@ defmodule Fathom.Shard.Storage.Local do
     now = Storage.now_ms()
 
     case read_lock(shard_id) do
-      # Our own lease (live or stale) — reclaim it, keeping the epoch.
-      {:ok, %{owner: ^owner, epoch: epoch}} ->
-        write_lock(shard_id, %{owner: owner, epoch: epoch, expires_at_ms: now + ttl_ms})
+      # Our own lease (live or stale) — reclaim it, keeping the epoch. A reclaim is a takeover from a
+      # previous coordinator of THIS node that may have shipped under its claim, so it claims above
+      # it exactly like a steal does (expert review 2026-09-29 #3).
+      {:ok, %{owner: ^owner, epoch: epoch} = existing} ->
+        write_lock(
+          shard_id,
+          Storage.with_claim(
+            %{owner: owner, epoch: epoch, expires_at_ms: now + ttl_ms},
+            Storage.takeover_claim(shard_id, Map.get(existing, :claim))
+          )
+        )
 
       # Someone else holds it — liveness is *their heartbeat* (with the lock's own TTL as the
       # fallback when they run no heartbeat — see owner_live?/3).
-      {:ok, %{owner: other, epoch: epoch, expires_at_ms: lock_exp}} ->
+      {:ok, %{owner: other, epoch: epoch, expires_at_ms: lock_exp} = dead_lock} ->
         case owner_live?(shard_id, other, now, lock_exp) do
           :live ->
             # CARRIES THE STEAL INSTANT (expert review 2026-08-26 #23). `owner_live?/4` and
@@ -679,11 +687,15 @@ defmodule Fathom.Shard.Storage.Local do
             # change without the bytes changing, and this backend is single-node
             # (the in-VM Registry already serializes coordinators), so the S3 zombie
             # scenario can't arise here.
-            case write_lock(shard_id, %{
-                   owner: owner,
-                   epoch: epoch + 1,
-                   expires_at_ms: now + ttl_ms
-                 }) do
+            # The new lock records the lineage this owner claims, strictly above anything the dead
+            # owner could have shipped under (expert review 2026-09-29 #3).
+            stolen =
+              Storage.with_claim(
+                %{owner: owner, epoch: epoch + 1, expires_at_ms: now + ttl_ms},
+                Storage.takeover_claim(shard_id, Map.get(dead_lock, :claim))
+              )
+
+            case write_lock(shard_id, stolen) do
               {:ok, lease} -> {:ok, Map.put(lease, :took_over, true)}
               other -> other
             end
@@ -925,8 +937,16 @@ defmodule Fathom.Shard.Storage.Local do
     now = Storage.now_ms()
 
     case read_lock(shard_id) do
-      {:ok, %{owner: ^owner, epoch: ^epoch}} ->
-        write_lock(shard_id, %{owner: owner, epoch: epoch, expires_at_ms: now + ttl_ms})
+      # A renew keeps the lock's recorded claim (#3); dropping it would let a later successor fall
+      # back to the fresh-create bound and collide with the lineage this owner is using.
+      {:ok, %{owner: ^owner, epoch: ^epoch} = current} ->
+        write_lock(
+          shard_id,
+          Map.merge(
+            %{owner: owner, epoch: epoch, expires_at_ms: now + ttl_ms},
+            Map.take(current, [:claim])
+          )
+        )
 
       # Owner or epoch changed, or the lock vanished — we've been superseded.
       {:ok, _other} ->
