@@ -417,7 +417,9 @@ defmodule Fathom.Directory do
       status: "active",
       last_active_at: now,
       cutover_at: now,
-      migrating_since: nil
+      migrating_since: nil,
+      # The retain intent is consumed by the cutover that records `retained_version` (#27).
+      retaining_version: nil
     }
   end
 
@@ -447,16 +449,25 @@ defmodule Fathom.Directory do
     :ok
   end
 
-  @doc "Marks a shard as mid-migration (the app pauses writes for the copy window)."
-  @spec mark_migrating(String.t()) ::
+  @doc """
+  Marks a shard as mid-migration (the app pauses writes for the copy window), recording
+  `retaining_version` — the FILE version the migration is about to retain — in the same update
+  (expert review 2026-09-29 #27), so a crash between the flush and the cutover leaves a durable
+  record of what was retained. `nil` records nothing (the column is cleared at cutover).
+  """
+  @spec mark_migrating(String.t(), non_neg_integer() | nil) ::
           {:ok, Shard.t()} | {:error, :not_found | :status_conflict | Ecto.Changeset.t()}
-  def mark_migrating(shard_id),
+  def mark_migrating(shard_id, retaining_version \\ nil),
     # Only an `active` shard may enter `migrating` — never resurrect a suspended/deleted tenant whose
     # snoozing job finally got the drain it was waiting on (#11).
     do:
       guarded_update_shard(
         shard_id,
-        %{status: "migrating", migrating_since: DateTime.utc_now()},
+        %{
+          status: "migrating",
+          migrating_since: DateTime.utc_now(),
+          retaining_version: retaining_version
+        },
         ["active"]
       )
 

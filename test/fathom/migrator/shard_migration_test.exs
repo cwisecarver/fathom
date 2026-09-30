@@ -666,6 +666,56 @@ defmodule Fathom.Migrator.ShardMigrationTest do
            "finalize must retain against the object storage actually holds, not the stale stamp"
   end
 
+  # Expert review 2026-09-29 #27. The storage heuristic above picks the highest `<shard>@v` below
+  # target, and a REVERT leaves a same-named `@N` holding pre-revert bytes for the retention window.
+  # So: v1 → v2, revert to v1 (leaves @2), then a v1 → v3 migration that retains @1, flushes v3 and
+  # crashes before cutover. Finalize found the stale @2 first, recorded retained_version: 2,
+  # scheduled its retirement, and orphaned the real @1 — a later revert restores the old generation.
+  # Invariant: finalize records what the crashed attempt RETAINED, which it wrote down beforehand.
+  test "crash-forward finalize records the recorded retain intent, not a revert's leftover @N", %{
+    shard: shard
+  } do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, _} = ShardMigration.run(shard, 2)
+    assert {:ok, %{from: 2, to: 1}} = ShardMigration.revert(shard, 1)
+    assert retained?(shard, 2), "fixture: the revert must leave its @2 backup"
+
+    {:ok, _} =
+      Migrator.release(3, "add tags", [
+        "CREATE TABLE app_tag (id INTEGER PRIMARY KEY, label TEXT)",
+        "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0003_add_tags', 'now')"
+      ])
+
+    {:ok, _} = ShardMigration.run(shard, 3)
+    assert {:ok, %{retaining_version: nil}} = Directory.get(shard), "cutover clears the intent"
+
+    # The crash: v3 flushed, cutover never landed. The directory is still at v1 and the intent row
+    # that mark_migrating wrote before the retain survives (status reclaimed to active).
+    {:ok, _} = Directory.cutover(shard, 1)
+
+    {1, _} =
+      Fathom.Repo.update_all(
+        from(s in Fathom.Directory.Shard, where: s.shard_id == ^shard),
+        set: [retaining_version: 1]
+      )
+
+    assert retained?(shard, 1) and retained?(shard, 2), "fixture: both backups must be present"
+
+    assert {:ok, %{from: 1, to: 3}} = ShardMigration.run(shard, 3),
+           "finalize picked the revert's stale @2 instead of the @1 this migration retained"
+
+    assert {:ok, %{schema_version: 3, retained_version: 1, retaining_version: nil}} =
+             Directory.get(shard)
+  end
+
+  test "mark_migrating records the retain intent the migration then acts on", %{shard: shard} do
+    seed_v1!(shard)
+
+    assert {:ok, %{status: "migrating", retaining_version: 1}} =
+             Directory.mark_migrating(shard, 1)
+  end
+
   # Finding #13: a revert overwrites the live vN object with the vN-1 copy. Without a backup, all
   # post-cutover writes on vN (and vN itself) are destroyed unrecoverably. The revert now retains
   # vN first, so those writes survive at <shard>@<vN> for the retention window.

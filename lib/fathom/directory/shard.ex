@@ -55,6 +55,11 @@ defmodule Fathom.Directory.Shard do
     # NULL means "none, or unknown" — a pre-column row, or a retained copy that `RetirementJob` has
     # since dropped. Every consumer must treat NULL as "cannot revert by pointer flip".
     field :retained_version, :integer
+    # The FILE version an in-flight forward migration is retaining, written with `migrating` and
+    # BEFORE the flush, cleared at cutover (expert review 2026-09-29 #27). Lets the crash-forward
+    # `finalize/2` record what was actually retained instead of guessing from storage, which a
+    # revert's leftover `@N` backup can fool. NULL = none in flight, or a pre-column row.
+    field :retaining_version, :integer
     # Per-shard Hrana-token revocation counter (expert review #31): a token embeds the
     # version it was minted at; bumping this via Fathom.HranaAuth.revoke/1 invalidates
     # every outstanding token for THIS shard alone (no fleet-wide secret rotation).

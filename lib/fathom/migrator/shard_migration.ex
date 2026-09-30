@@ -563,7 +563,9 @@ defmodule Fathom.Migrator.ShardMigration do
             # means the tenant was suspended or deleted after `run/3` looked, and the 2026-09-05 #11
             # guard on `mark_migrating` only helps if the caller stops. Before this, `forward/9` went
             # on to retain, copy and flush over the object, and only the cutover refused.
-            mark = Directory.mark_migrating(shard_id)
+            # `current` (the FILE version) is what forward/9 retains; record it now, before the
+            # retain and the flush, so a crash before cutover leaves the intent durable (#27).
+            mark = Directory.mark_migrating(shard_id, current)
 
             prev =
               case mark do
@@ -754,15 +756,29 @@ defmodule Fathom.Migrator.ShardMigration do
   # overwrites <shard>@current and retirement deletes superseded ones, so the highest present @v is
   # the prior attempt's retained object). Fall back to the directory stamp only when no retained
   # object is present at all.
+  #
+  # THE RECORDED INTENT WINS (expert review 2026-09-29 #27). The storage heuristic above cannot tell
+  # a prior attempt's `@N-1` from a revert's leftover `@N` backup (both are real `<shard>@v` objects),
+  # so after a revert + a crashed N-1 → N+1 migration it picked the stale `@N`, recorded it and
+  # scheduled its retirement, orphaning the real backup. `mark_migrating/2` now writes
+  # `retaining_version` before the retain + flush; it is only absent for a row from before that
+  # column, which keeps the heuristic as the fallback.
   defp retained_version_for_finalize(shard_id, target) when target > 0 do
+    case Directory.get(shard_id) do
+      {:ok, %{retaining_version: v}} when is_integer(v) and v < target -> v
+      _ -> retained_version_from_storage(shard_id, target)
+    end
+  end
+
+  defp retained_version_for_finalize(shard_id, _target), do: current_version(shard_id)
+
+  defp retained_version_from_storage(shard_id, target) do
     Enum.find(
       (target - 1)..0//-1,
       current_version(shard_id),
       &Storage.version_present?(shard_id, &1)
     )
   end
-
-  defp retained_version_for_finalize(shard_id, _target), do: current_version(shard_id)
 
   # The retirement outbox (expert review 2026-07-18 #5): cut the directory over to `cutover_to` AND
   # enqueue the retention deletion of `retire_version`'s `@version` object in ONE Postgres
