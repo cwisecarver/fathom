@@ -1088,9 +1088,22 @@ defmodule Fathom.ShardExecutor do
       # coordinator that owns the pool is the shard's fence authority and must never block on a tenant
       # SQLite call. A handle that will not roll back is not poolable: close it and take the
       # non-pooled checkin, so the next stream opens fresh.
+      #
+      # A DEAD COORDINATOR CANNOT TAKE THE HANDLE (expert review 2026-09-29 #22). `checkin/4` is a
+      # cast and a cast to a dead pid is silently dropped, so the handle was never closed — and the
+      # dead-coordinator case is not rare, it is exactly when Filo calls this: `Filo.Socket` and
+      # `Filo.Stream` close their streams on the coordinator's DOWN (a self-fence, a tenant delete,
+      # a crash). The leak held an fd, a mapped `-shm` and page cache for the life of a WebSocket,
+      # and an extra open connection on a reopened inode stops the last close from checkpointing.
+      # Close it here instead. (A coordinator dying between this check and the cast is the
+      # residual window; its terminate closes only what is pooled, not this.)
       case Connection.rollback_if_open(conn) do
         :ok ->
-          Shard.checkin(pid, ref, conn, scope)
+          if Process.alive?(pid) do
+            Shard.checkin(pid, ref, conn, scope)
+          else
+            Connection.close(conn)
+          end
 
         {:error, _reason} ->
           Connection.close(conn)

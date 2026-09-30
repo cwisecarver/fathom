@@ -238,6 +238,58 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
     :ok = ShardExecutor.close(w)
   end
 
+  defp closed?(conn), do: match?({:error, _}, Sqlite3.execute(conn, "SELECT 1"))
+
+  # Expert review 2026-09-29 #22 (part 1): pooled close is a CAST to the coordinator, and a cast to
+  # a dead pid is dropped — so the handle was never closed. That is exactly the case Filo hits: it
+  # closes a stream on the coordinator's DOWN (self-fence, tenant delete, crash). Pre-fix the handle
+  # is still open after close/1.
+  test "pooling ON: closing a stream whose coordinator is dead closes the handle", %{shard: shard} do
+    Application.put_env(:fathom, :connection_pool, true)
+
+    {:ok, h} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(h, stmt("CREATE TABLE d (a INTEGER)"))
+    pid = pid_of(h)
+    conn = conn_of(h)
+
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _}
+
+    :ok = ShardExecutor.close(h)
+    assert closed?(conn), "the handle leaked: its checkin was cast to a dead coordinator"
+  end
+
+  # Part 2: a grant can carry a POOLED handle in its reply, and the reply is lost when the caller
+  # was already dead (`:noproc`) or timed out (`abandon_checkout`). Nothing held the handle; it was
+  # closed only on this process's next GC. Pre-fix the injected handle is still open afterwards.
+  test "pooling ON: a pooled handle lent to a caller that was already dead is closed", %{
+    shard: shard
+  } do
+    Application.put_env(:fathom, :connection_pool, true)
+
+    {:ok, pid, ref, path, :open} = Shards.checkout(shard, :rw)
+    on_exit(fn -> Fathom.Shard.checkin(pid, ref) end)
+    {:ok, h} = Fathom.Shard.Connection.open(path)
+
+    :sys.replace_state(pid, fn s ->
+      {pool, []} = HandlePool.put(s.pool, :rw, h, System.monotonic_time(:millisecond))
+      %{s | pool: pool}
+    end)
+
+    {dead, dref} = spawn_monitor(fn -> :ok end)
+    assert_receive {:DOWN, ^dref, :process, ^dead, _}
+
+    # A checkout from a caller that is already gone: granted (with the pooled handle in the reply),
+    # then its monitor fires :noproc and the grant is released.
+    send(pid, {:"$gen_call", {dead, make_ref()}, {:checkout, make_ref(), :rw}})
+    _ = :sys.get_state(pid)
+    _ = :sys.get_state(pid)
+
+    assert HandlePool.count(pool_of(pid), :rw) == 0, "fixture: the pooled handle was not taken"
+    assert closed?(h), "the handle lent to a dead caller was never closed"
+  end
+
   # The availability direction: Django sends `PRAGMA foreign_keys = ON` on every new connection. It
   # is re-applied by configure/1 on reuse, so it must NOT defeat pooling — otherwise the fix would
   # silently turn pooling off for every Django client.

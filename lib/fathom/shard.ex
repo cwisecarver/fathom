@@ -716,6 +716,12 @@ defmodule Fathom.Shard do
         # invariant, scope isolation), which the default suite runs OFF. Drained + closed on every
         # terminate clause (close_pool/1); a pooled handle must not outlive the shard's lease here.
         pool: init_pool(),
+        # Grant ref => the POOLED handle handed out in that grant's reply (expert review 2026-09-29
+        # #22). The reply can be lost — the caller timed out (`abandon_checkout`) or was already dead
+        # (`:noproc`) — and then nobody holds the handle: it was closed only when this process next
+        # garbage-collected, which an idle coordinator never does. Cleared at checkin; closed here
+        # when the grant ends any other way. See `close_lent/2`.
+        lent: %{},
         idle_ms: idle_ms(),
         timer: nil,
         # Monotonic-ms instant the shard last went idle (all connections checked in), or
@@ -1146,7 +1152,7 @@ defmodule Fathom.Shard do
         # The grant keeps the shard busy, so the pool cannot be drained out from under this take —
         # exactly the invariant the separate `:pool_take` call relied on, now in one hop.
         {reuse, state} = take_from_pool(state, scope)
-        {:reply, {:ok, ref, path, reuse}, state}
+        {:reply, {:ok, ref, path, reuse}, lend(state, ref, reuse)}
 
       {:error, reason, state} ->
         {:reply, {:error, reason}, state}
@@ -1217,12 +1223,13 @@ defmodule Fathom.Shard do
   end
 
   @impl true
-  def handle_cast({:checkin, ref}, state), do: stop_when_drained(release(state, ref))
+  def handle_cast({:checkin, ref}, state),
+    do: stop_when_drained(release(returned(state, ref), ref))
 
   # Pooling checkin: pool the returned handle (or close it — pooling off, over cap, or draining) and
   # release the grant. `pool_checkin/3` owns the close, so the handle is never leaked.
   def handle_cast({:checkin, ref, conn, scope}, state) when scope in [:ro, :rw] do
-    state = pool_checkin(state, conn, scope)
+    state = state |> returned(ref) |> pool_checkin(conn, scope)
     stop_when_drained(release(state, ref))
   end
 
@@ -1236,7 +1243,7 @@ defmodule Fathom.Shard do
   # hazard the conn tracking exists to prevent.
   def handle_cast({:abandon_checkout, caller, op}, state) do
     refs = for {ref, {pid, tag}} <- state.conns, pid == caller and tag == op, do: ref
-    stop_when_drained(Enum.reduce(refs, state, &release(&2, &1)))
+    stop_when_drained(Enum.reduce(refs, state, &release(close_lent(&2, &1), &1)))
   end
 
   # A stream wrote for the first time on its checkout (expert review 2026-08-01 #42). A clean
@@ -1468,7 +1475,8 @@ defmodule Fathom.Shard do
     if reason not in [:normal, :noproc] and Map.has_key?(state.conns, ref),
       do: WriteCounter.bump(state.id)
 
-    stop_when_drained(release(state, ref))
+    # The caller is dead, so a pooled handle its grant carried can never come back (#22).
+    stop_when_drained(release(close_lent(state, ref), ref))
   end
 
   # We trap exits (see init/1). The only process linked to us is the transient pull
@@ -2088,6 +2096,27 @@ defmodule Fathom.Shard do
     case HandlePool.take(pool, scope) do
       {:hit, conn, pool} -> {{:reuse, conn}, %{state | pool: pool}}
       {:miss, pool} -> {:open, %{state | pool: pool}}
+    end
+  end
+
+  # Track a pooled handle handed out in a grant reply, so a lost reply does not leak it (#22).
+  defp lend(state, ref, {:reuse, conn}), do: %{state | lent: Map.put(state.lent, ref, conn)}
+  defp lend(state, _ref, :open), do: state
+
+  # The stream checked its grant back in: whatever it was lent is its own business again (it either
+  # hands the handle back to the pool with this very checkin, or closed it itself).
+  defp returned(state, ref), do: %{state | lent: Map.delete(state.lent, ref)}
+
+  # The grant ended WITHOUT a checkin (the caller died, or its checkout timed out): close the handle
+  # it was lent, which nothing else will ever do.
+  defp close_lent(state, ref) do
+    case Map.pop(state.lent, ref) do
+      {nil, _} ->
+        state
+
+      {conn, lent} ->
+        Connection.close(conn)
+        %{state | lent: lent}
     end
   end
 
