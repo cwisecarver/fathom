@@ -27,9 +27,18 @@ defmodule Fathom.Shard.Replication.FrameAuth do
   That is a deliberate trade, not an oversight: a push payload is up to `REPLICATION_MAX_PUSH_BYTES`
   (1 MiB) and hashing it would put a megabyte of SHA-256 on the commit path, which is the hot path
   A2 is already the 4x cost of. The threat this is sized for is an unauthenticated peer opening a
-  socket and injecting frames — which it stops completely, because such a peer cannot produce a
+  socket and injecting frames it CONSTRUCTED — which it stops, because such a peer cannot produce a
   valid header at all. It is not sized for an on-path attacker who can rewrite an authenticated
   peer's traffic; that is what TLS would be for, and there is none here.
+
+  **Nor does it stop REPLAY by a passive observer** (expert review 2026-09-29 #17 — this section
+  used to say injection was stopped "completely"). A signed header carries no nonce, timestamp or
+  connection binding, and a seed's chunk/end frames sign only the header and the shard id, so
+  anyone who can SNIFF one seed on the replication network can later open their own socket, replay
+  the captured `seed_begin`, and stream chunks of their own bytes under the replayed headers. The
+  follower refuses a seed whose lineage is below the replica it holds, which confines a replay to
+  the CURRENT ownership; closing it fully (payload MACs on seeds, a per-connection challenge covered
+  by every frame's MAC, or TLS) is a wire change and is parked with that finding.
 
   ## The two gates, and why there are two
 

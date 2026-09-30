@@ -682,6 +682,20 @@ defmodule Fathom.Shard.Replication.Follower do
         Logger.info("replication follower refusing to seed #{b.shard_id}: tenant is deleted")
         seeds
 
+      # A seed from a LOWER lineage than the replica we already hold is a deposed primary — or a
+      # REPLAYED `seed_begin` (expert review 2026-09-29 #17): the frame MAC covers the header but no
+      # nonce, so a captured seed-begin verifies forever. Lineage is the monotonic ownership counter,
+      # so no legitimate seed ever goes backwards. The same fence `FollowerLog.decide/2` applies to
+      # pushes; only fires when both sides state one (0 = unstated). This bounds a replay to the
+      # CURRENT lineage; binding frames to a connection is the wire change parked with the finding.
+      stale_lineage_seed?(name, b) ->
+        Logger.warning(
+          "replication follower refusing to seed #{b.shard_id}: seed lineage #{b.lineage} is " <>
+            "below the replica's (deposed primary or replayed frame)"
+        )
+
+        seeds
+
       headroom?(name, b) ->
         open_seed_temps(name, seeds, b)
 
@@ -689,6 +703,18 @@ defmodule Fathom.Shard.Replication.Follower do
         refuse_seed(name, seeds, b)
     end
   end
+
+  defp stale_lineage_seed?(name, %Protocol.SeedBegin{shard_id: id, lineage: pushed})
+       when is_integer(pushed) and pushed > 0 do
+    case state_of(name, id) do
+      %{lineage: mine} when is_integer(mine) and mine > pushed -> true
+      _ -> false
+    end
+  rescue
+    ArgumentError -> false
+  end
+
+  defp stale_lineage_seed?(_name, _begin), do: false
 
   # DISK BACK-PRESSURE ON THE REPLICA STORE (expert review 2026-08-20 #23).
   #
