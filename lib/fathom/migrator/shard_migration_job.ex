@@ -124,6 +124,17 @@ defmodule Fathom.Migrator.ShardMigrationJob do
 
         {:cancel, :unknown_version}
 
+      # Suspended or deleted (expert review 2026-09-29 #20): a lifecycle state, not a migration
+      # fault — cancel without retrying and WITHOUT `mark_failed`, which would overwrite the
+      # `suspended`/`deleted` status. A resumed tenant is a laggard again and the next sweep picks it
+      # up; a deleted one is never touched again.
+      {:error, {:not_active, status}} ->
+        Logger.info(
+          "shard #{shard_id}: not migrating to v#{target} — tenant is #{inspect(status)}"
+        )
+
+        {:cancel, :not_active}
+
       {:error, reason} ->
         handle_error(job, shard_id, reason)
     end

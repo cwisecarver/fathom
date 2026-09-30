@@ -45,6 +45,14 @@ defmodule Fathom.Migrator.ShardMigration do
     # revert write-age guard), and a mistyped id minted a bogus active v0 row.
     # Registering genuinely-new shards is the checkout path's job.
     case Directory.get(shard_id) do
+      # ONLY A LIVE TENANT IS MIGRATED (expert review 2026-09-29 #20). This checked `schema_version`
+      # alone, so a job queued before a suspend (or a `climb_back` / `retry_failed`) drained,
+      # retained, copied and FENCED-FLUSHED the migrated file over a SUSPENDED tenant's live object —
+      # only the cutover refused — and a job for a DELETED tenant re-drained and re-acquired a lease
+      # (a fresh `.lock` for an erased id) on every retry after the purge.
+      {:ok, %{status: status}} when status not in ["active", "migrating"] ->
+        {:error, {:not_active, status}}
+
       {:ok, %{schema_version: v}} when v >= target ->
         :ok
 
@@ -550,15 +558,32 @@ defmodule Fathom.Migrator.ShardMigration do
             # REUSE the row `mark_migrating/1` returns instead of re-reading it (expert review
             # 2026-08-26 #28). `forward/9` needs the DIRECTORY's `schema_version` to report a
             # stamp divergence. `:error` degrades to 0: the value only drives a warning.
+            #
+            # A `:status_conflict` is NOT degraded to 0 any more (expert review 2026-09-29 #20): it
+            # means the tenant was suspended or deleted after `run/3` looked, and the 2026-09-05 #11
+            # guard on `mark_migrating` only helps if the caller stops. Before this, `forward/9` went
+            # on to retain, copy and flush over the object, and only the cutover refused.
+            mark = Directory.mark_migrating(shard_id)
+
             prev =
-              case Directory.mark_migrating(shard_id) do
+              case mark do
                 {:ok, %{schema_version: v}} -> v
                 _ -> 0
               end
 
-            case statement_chain(current, target) do
+            chain_result =
+              case mark do
+                {:error, :status_conflict} -> {:error, {:not_active, :status_conflict}}
+                _ -> statement_chain(current, target)
+              end
+
+            case chain_result do
               {:ok, chain} ->
                 forward(shard_id, target, current, prev, chain, old, new, lease, etag)
+
+              # The tenant left `active` under us — nothing was marked, nothing to undo.
+              {:error, {:not_active, _}} = err ->
+                err
 
               # The chain became unbuildable between the pre-flight and here (a yank landed).
               # Leave the shard's status as it was (#23): `unmark_migrating/1` is conditional on the

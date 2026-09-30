@@ -464,6 +464,59 @@ defmodule Fathom.Migrator.ShardMigrationTest do
            "a transform accepted mid-migration was skipped by this shard's replay"
   end
 
+  # Expert review 2026-09-29 #20. `run/3` checked only `schema_version`, so a SUSPENDED tenant's
+  # queued job drained, retained, copied and fence-flushed the migrated file over its live object —
+  # only the cutover refused — leaving the file at v2 and the directory at v1. Pre-fix both tests
+  # below see the stored object rewritten (a retained @1 copy and the v2 column appear).
+  test "a suspended tenant is not migrated (#20)", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    {:ok, before} = Storage.object_etag(shard)
+    {:ok, _} = Directory.suspend(shard)
+
+    assert {:error, {:not_active, "suspended"}} = ShardMigration.run(shard, 2)
+
+    assert {:ok, ^before} = Storage.object_etag(shard),
+           "the suspended tenant's object was rewritten"
+
+    refute retained?(shard, 1)
+  end
+
+  test "a tenant suspended mid-run (after run/3 looked) stops at mark_migrating (#20)", %{
+    shard: shard
+  } do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    {:ok, before} = Storage.object_etag(shard)
+
+    prev = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    test_pid = self()
+
+    Application.put_env(
+      :fathom,
+      :faulty_before,
+      {:pull,
+       fn sid ->
+         if sid == shard and self() == test_pid, do: {:ok, _} = Directory.suspend(shard)
+         :ok
+       end}
+    )
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if prev,
+        do: Application.put_env(:fathom, :shard_storage, prev),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    assert {:error, {:not_active, _}} = ShardMigration.run(shard, 2)
+    assert {:ok, ^before} = Storage.object_etag(shard), "the object was rewritten after a suspend"
+    refute retained?(shard, 1)
+    assert {:ok, %{status: "suspended", schema_version: 1}} = Directory.get(shard)
+  end
+
   # Expert review 2026-08-26 #8. The forward path was the ONLY durable-object producer in the
   # system that did not validate what it was about to publish. Every other one does — the
   # coordinator's periodic flush gates on quick_check, the GDPR export refuses a corrupt export,
