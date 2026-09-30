@@ -886,6 +886,22 @@ case env_bool.("REPLICATION_HMAC_REQUIRED") do
   v -> config :fathom, :replication_hmac_required, v
 end
 
+# PER-CONNECTION REPLAY BINDING (expert review 2026-09-29 #17). With this on, each new replication
+# connection opens with a `hello` exchange of 16 random bytes per side, every signed frame's MAC
+# covers the nonce the RECEIVER generated for that connection (so a frame recorded off the wire
+# verifies on no other connection), and seed chunks' payloads are MAC'd as well. Pushes still sign
+# the header only; on-path rewriting of a live connection needs TLS, which this is not.
+#
+# It changes the connection's FIRST exchange, so it is all-or-nothing across the fleet: a node with
+# it on waits for a `hello` a node with it off never sends. ON BY DEFAULT IN PROD (config/config.exs)
+# on the same greenfield reasoning as the flags above; a future rolling upgrade across it forces
+# `REPLICATION_CONN_NONCE=false` on the first deploy, then removes the override. Only meaningful with
+# REPLICATION_SIGN_FRAMES on — the nonce is only ever used inside a MAC.
+case env_bool.("REPLICATION_CONN_NONCE") do
+  nil -> :ok
+  v -> config :fathom, :replication_conn_nonce, v
+end
+
 # The signing key. Derived (never used raw) from REPLICATION_HMAC_SECRET when set, otherwise from
 # HRANA_TOKEN_SECRET — so a fleet already distributing one shared secret does not have to
 # distribute a second, while an operator who wants them rotated independently can have that. Both

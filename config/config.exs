@@ -79,6 +79,11 @@ config :fathom, :replication_ordinal_wire, config_env() == :prod
 config :fathom, :replication_sign_frames, config_env() == :prod
 config :fathom, :replication_hmac_required, config_env() == :prod
 
+# The per-connection nonce handshake (expert review 2026-09-29 #17): every frame MAC covers a nonce
+# the receiving side generated for THIS connection, so a recorded frame replays on no other, and seed
+# chunks' payloads are MAC'd too. Same wire-change contract as the three above.
+config :fathom, :replication_conn_nonce, config_env() == :prod
+
 # Per-query statement deadline (expert review 2026-08-26 #15). PROD-ONLY, like the write fence
 # above and for the same reason: it changes what a query can do, so dev and test keep the
 # unbounded behaviour their fixtures assume, and the deployed default is bounded.

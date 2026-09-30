@@ -492,7 +492,23 @@ defmodule Fathom.Shard.Replication.Recovery do
 
   # -- helpers ---------------------------------------------------------------------------------
 
+  # Connect, then run the #17 handshake before any frame is exchanged (a no-op with
+  # `REPLICATION_CONN_NONCE` off). Each query/pull runs in its own process and dials its own
+  # connection, so the binding the handshake leaves in the process dictionary is exactly this one.
   defp connect(host, port) do
+    with {:ok, sock} <- dial(host, port) do
+      case Protocol.handshake_connect(sock, Protocol.handshake_timeout_ms()) do
+        :ok ->
+          {:ok, sock}
+
+        {:error, _} = error ->
+          :gen_tcp.close(sock)
+          error
+      end
+    end
+  end
+
+  defp dial(host, port) do
     charlist = if is_binary(host), do: String.to_charlist(host), else: host
 
     :gen_tcp.connect(

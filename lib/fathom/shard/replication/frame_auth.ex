@@ -31,14 +31,15 @@ defmodule Fathom.Shard.Replication.FrameAuth do
   valid header at all. It is not sized for an on-path attacker who can rewrite an authenticated
   peer's traffic; that is what TLS would be for, and there is none here.
 
-  **Nor does it stop REPLAY by a passive observer** (expert review 2026-09-29 #17 — this section
-  used to say injection was stopped "completely"). A signed header carries no nonce, timestamp or
-  connection binding, and a seed's chunk/end frames sign only the header and the shard id, so
-  anyone who can SNIFF one seed on the replication network can later open their own socket, replay
-  the captured `seed_begin`, and stream chunks of their own bytes under the replayed headers. The
-  follower refuses a seed whose lineage is below the replica it holds, which confines a replay to
-  the CURRENT ownership; closing it fully (payload MACs on seeds, a per-connection challenge covered
-  by every frame's MAC, or TLS) is a wire change and is parked with that finding.
+  **REPLAY by a passive observer is stopped only with `REPLICATION_CONN_NONCE` on** (expert review
+  2026-09-29 #17). Without it a signed header carries no nonce, timestamp or connection binding and
+  a seed chunk signs only its header and shard id, so anyone who can SNIFF one seed on the
+  replication network can open their own socket, replay the captured `seed_begin`, and stream
+  chunks of their own bytes under the replayed headers. With it (on by default in prod), each
+  connection opens with a nonce exchange, every MAC covers the nonce the RECEIVER generated for that
+  connection — so a recorded frame verifies on no other — and seed chunks' payloads are covered too.
+  See `Fathom.Shard.Replication.Protocol`'s `@hello`. Push payloads remain uncovered (above), and
+  the follower still refuses a seed whose lineage is below the replica it holds.
 
   ## The two gates, and why there are two
 

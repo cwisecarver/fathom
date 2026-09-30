@@ -354,7 +354,7 @@ defmodule Fathom.Shard.Replication.Follower do
         #
         # Unlinked handler, deliberately: one primary dropping its connection must not take down
         # the listener, and a malformed frame from one peer must not affect another's shards.
-        {:ok, pid} = Task.start(fn -> serve(sock, name) end)
+        {:ok, pid} = Task.start(fn -> serve_connection(sock, name) end)
 
         case :gen_tcp.controlling_process(sock, pid) do
           :ok ->
@@ -374,6 +374,28 @@ defmodule Fathom.Shard.Replication.Follower do
       {:error, reason} ->
         Logger.warning("replication accept failed: #{inspect(reason)}")
         accept_loop(lsock, name)
+    end
+  end
+
+  # The connection's first exchange (expert review 2026-09-29 #17): with `REPLICATION_CONN_NONCE`
+  # on, bind this handler's frames to a per-connection nonce pair before reading anything, so a
+  # frame recorded on another connection cannot be replayed here. A peer that does not complete the
+  # handshake is closed without a single frame being interpreted.
+  defp serve_connection(sock, name) do
+    case Protocol.handshake_accept(sock, Protocol.handshake_timeout_ms()) do
+      :ok ->
+        serve(sock, name)
+
+      # A peer that connects and hangs up before its hello is ordinary — a reachability probe (the
+      # chaos rig's `replication` step 1 does exactly this) or a load balancer health check — so it
+      # is not worth a warning. Anything else (a bad hello, a timeout) is.
+      {:error, :closed} ->
+        Logger.debug("replication follower: peer closed before the handshake")
+        :gen_tcp.close(sock)
+
+      {:error, reason} ->
+        Logger.warning("replication follower: handshake failed (#{inspect(reason)}); closing")
+        :gen_tcp.close(sock)
     end
   end
 

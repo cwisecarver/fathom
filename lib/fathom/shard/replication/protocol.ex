@@ -172,6 +172,27 @@ defmodule Fathom.Shard.Replication.Protocol do
   # and `fresher?/2` refuses to rank — the pre-fix behaviour, inert not wrong.
   @push_ord_lin 17
 
+  # PER-CONNECTION REPLAY BINDING (expert review 2026-09-29 #17, option B as decided 2026-09-29).
+  #
+  # A signed header carried no nonce, timestamp or connection binding, so a passive observer on the
+  # replication network could record a seed and REPLAY it later over its own socket, streaming
+  # chunks of its own bytes under the recorded headers (seed chunks signed only header + shard id).
+  # With `conn_nonce?/0` on, each side of a new connection sends one `@hello` carrying 16 random
+  # bytes before anything else, and every tag a side produces covers the PEER's nonce — the value
+  # the peer generated for this connection and will verify against. A frame recorded on one
+  # connection therefore verifies on no other. Under the same binding a seed chunk's MAC also covers
+  # its PAYLOAD (seeds are not the commit hot path, so the hashing cost the push path avoids does not
+  # apply), which closes substituting bytes under a captured header. Pushes still sign the header
+  # only — on-path rewriting of an established connection is TLS territory (option C, not built).
+  #
+  # A NEW TYPE CODE at `@version 2`, like every block above. It changes the connection's first
+  # exchange, so both ends must agree: `REPLICATION_CONN_NONCE` is a fleet-wide switch, on by default
+  # in prod (greenfield — no deployed fleet to straddle) and off in dev/test. A future rolling
+  # upgrade across it forces it `=false` on the first deploy, then removes the override.
+  @hello 18
+  @nonce_bytes 16
+  @nonce_key {__MODULE__, :conn_nonce}
+
   # Which file a chunk belongs to. Explicit rather than splitting one byte stream at `db_size`,
   # so a chunk never straddles the boundary and the follower can assert it received exactly the
   # promised number of database bytes before the first WAL byte.
@@ -460,13 +481,126 @@ defmodule Fathom.Shard.Replication.Protocol do
   @spec seal(iolist()) :: iolist()
   def seal([header, shard | rest] = inner) do
     if FrameAuth.signing?() do
-      case FrameAuth.sign([header, shard]) do
+      case FrameAuth.sign(send_material(header, shard, rest)) do
         nil -> inner
         tag -> [<<@version::8, @signed::8, byte_size(tag)::8>>, tag, header, shard | rest]
       end
     else
       inner
     end
+  end
+
+  # What a tag covers when SENDING. Unbound (no handshake on this connection): the header and shard
+  # id, byte for byte as before. Bound (#17): the PEER's nonce first, and for a seed chunk its
+  # payload too — see `@hello`.
+  defp send_material(header, shard, rest) do
+    case Process.get(@nonce_key) do
+      {peer_nonce, _mine} ->
+        if seed_chunk_header?(header),
+          do: [peer_nonce, header, shard | rest],
+          else: [peer_nonce, header, shard]
+
+      nil ->
+        [header, shard]
+    end
+  end
+
+  # What a received envelope's tag must cover — the mirror of `send_material/3`, computed from a
+  # flat binary off the socket. Bound: THIS side's nonce (the one the peer signed over), and a seed
+  # chunk's whole frame.
+  defp recv_material(inner) do
+    case Process.get(@nonce_key) do
+      {_peer_nonce, mine} ->
+        if seed_chunk_header?(inner), do: [mine, inner], else: [mine, signable(inner)]
+
+      nil ->
+        signable(inner)
+    end
+  end
+
+  defp seed_chunk_header?(<<@version::8, @seed_chunk::8, _::binary>>), do: true
+  defp seed_chunk_header?(_), do: false
+
+  @doc """
+  How long either side waits for the peer's `@hello` (#17). Bounded because the accepting handler
+  and the dialing Shipper both block in a passive `recv` until it arrives, and a peer that connects
+  and says nothing must not pin either. `:replication_handshake_timeout_ms`, default 5 s.
+  """
+  @spec handshake_timeout_ms() :: pos_integer()
+  def handshake_timeout_ms,
+    do: Application.get_env(:fathom, :replication_handshake_timeout_ms, 5_000)
+
+  @doc "Whether new replication connections run the `@hello` nonce exchange (#17)."
+  @spec conn_nonce?() :: boolean()
+  def conn_nonce?, do: Application.get_env(:fathom, :replication_conn_nonce, false) == true
+
+  @doc """
+  The ACCEPTING side of the connection handshake (#17): send our nonce, read the dialer's, and bind
+  this process's frames to the pair. A no-op returning `:ok` when `conn_nonce?/0` is off.
+
+  Binding lives in the process dictionary of the process that owns the connection — the one
+  process that encodes and decodes its frames — so `seal/1` and `decode/1` pick it up without any
+  of the ~15 send and decode sites changing. Must run before the first frame is read or written.
+  """
+  @spec handshake_accept(:gen_tcp.socket(), timeout()) :: :ok | {:error, term()}
+  def handshake_accept(sock, timeout) do
+    if conn_nonce?() do
+      mine = :crypto.strong_rand_bytes(@nonce_bytes)
+
+      with :ok <- :gen_tcp.send(sock, hello(mine)),
+           {:ok, theirs} <- recv_hello(sock, timeout) do
+        bind(theirs, mine)
+      end
+    else
+      unbind()
+    end
+  end
+
+  @doc """
+  The DIALING side of the handshake (#17): read the acceptor's nonce, send ours, bind. The socket
+  must be passive; an `active: true` owner switches to active only after this returns `:ok`.
+  """
+  @spec handshake_connect(:gen_tcp.socket(), timeout()) :: :ok | {:error, term()}
+  def handshake_connect(sock, timeout) do
+    if conn_nonce?() do
+      mine = :crypto.strong_rand_bytes(@nonce_bytes)
+
+      with {:ok, theirs} <- recv_hello(sock, timeout),
+           :ok <- :gen_tcp.send(sock, hello(mine)) do
+        bind(theirs, mine)
+      end
+    else
+      unbind()
+    end
+  end
+
+  # Never sealed: there is no binding to sign over yet, and the nonce is not a secret — it only has
+  # to be fresh, and the side that generated it is the one that checks it.
+  defp hello(nonce), do: [<<@version::8, @hello::8, @nonce_bytes::8>>, nonce]
+
+  defp recv_hello(sock, timeout) do
+    case :gen_tcp.recv(sock, 0, timeout) do
+      {:ok, <<@version::8, @hello::8, @nonce_bytes::8, nonce::binary-size(@nonce_bytes)>>} ->
+        {:ok, nonce}
+
+      {:ok, _other} ->
+        {:error, :bad_hello}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp bind(peer_nonce, mine) do
+    Process.put(@nonce_key, {peer_nonce, mine})
+    :ok
+  end
+
+  # A reconnect in the same process with the switch off must not keep signing over a dead
+  # connection's nonce.
+  defp unbind do
+    Process.delete(@nonce_key)
+    :ok
   end
 
   @doc """
@@ -653,7 +787,7 @@ defmodule Fathom.Shard.Replication.Protocol do
       when byte_size(rest) > tlen do
     <<tag::binary-size(^tlen), inner::binary>> = rest
 
-    if FrameAuth.valid?(signable(inner), tag) do
+    if FrameAuth.valid?(recv_material(inner), tag) do
       # `decode_frame/1`, not `decode/1`: an envelope cannot contain an envelope. Recursing would
       # let a peer nest them, and there is no reason to.
       decode_frame(inner)

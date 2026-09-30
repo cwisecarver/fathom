@@ -409,13 +409,20 @@ defmodule Fathom.Shard.Replication.Shipper do
       # arrives, and packet_size is the only bound. Applies to this direction too, because a
       # follower's reply frame is parsed the same way.
       packet_size: Fathom.Shard.Replication.Protocol.max_frame_bytes(),
-      active: true,
+      # PASSIVE until the #17 handshake completes: the acceptor's `@hello` is read with a plain
+      # `recv`, and switching to active first would deliver it as a `{:tcp, …}` message that
+      # `handle_info/2` decodes as a malformed reply. Flipped to active right after.
+      active: false,
       nodelay: true,
       send_timeout: send_timeout(),
       send_timeout_close: true
     ]
 
-    case :gen_tcp.connect(host, state.port, opts, @connect_timeout) do
+    with {:ok, sock} <- :gen_tcp.connect(host, state.port, opts, @connect_timeout),
+         :ok <- handshake(sock) do
+      {:ok, sock}
+    end
+    |> case do
       {:ok, sock} ->
         # ONE WRITER PER SOCKET, not per shipper: a writer is meaningless without the socket it
         # owns, and tying their lifetimes together is what makes a stale writer's report
@@ -429,6 +436,20 @@ defmodule Fathom.Shard.Replication.Shipper do
 
         Process.send_after(self(), :reconnect, @reconnect_backoff_ms)
         %{state | sock: nil, writer: nil}
+    end
+  end
+
+  # Runs in the Shipper process, which is also the one that encodes every frame for this link and
+  # decodes every reply, so the binding the handshake leaves in its process dictionary covers
+  # exactly this connection (a reconnect re-binds). Closes the socket on failure.
+  defp handshake(sock) do
+    with :ok <- Protocol.handshake_connect(sock, Protocol.handshake_timeout_ms()),
+         :ok <- :inet.setopts(sock, active: true) do
+      :ok
+    else
+      {:error, _} = error ->
+        :gen_tcp.close(sock)
+        error
     end
   end
 

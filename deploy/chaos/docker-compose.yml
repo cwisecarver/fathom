@@ -118,6 +118,11 @@ x-fathom-env: &fathom-env
   # a shared secret when the rig should exercise the authenticated wire.
   REPLICATION_SIGN_FRAMES: "${REPLICATION_SIGN_FRAMES:-false}"
   REPLICATION_HMAC_REQUIRED: "${REPLICATION_HMAC_REQUIRED:-false}"
+  # The shared frame-auth key, passed through so the two flags above can be turned on (empty = none).
+  REPLICATION_HMAC_SECRET: "${REPLICATION_HMAC_SECRET:-}"
+  # Per-connection replay binding (2026-09-29 #17). ON, like prod: the `hello` handshake runs on every
+  # replication connection even with signing off, so the rig always exercises the connection setup.
+  REPLICATION_CONN_NONCE: "${REPLICATION_CONN_NONCE:-true}"
   # THE TWO BOUNDS THAT CLOSE THE 1024-TENANT OOM. Left EMPTY so a run exercises the shipped
   # defaults (1 MiB per push, 1 GiB queued per node) — the rig's job is to test what production
   # gets, not a rig-only tuning. Set either to sweep; 0 disables one, which is how you reproduce
