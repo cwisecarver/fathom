@@ -87,6 +87,19 @@ defmodule Fathom.Admin.MetricsTest do
     refute List.keyfind(FlushWatermark.snapshot(), "wm_a", 0)
   end
 
+  # Expert review 2026-10-01 perf #33: the pollers count and reduce the table without copying it.
+  # size/0 and fold/2 must agree with the list snapshot/0 returns, row for row.
+  test "size/0 and fold/2 agree with snapshot/0 without building the list" do
+    gen = WriteCounter.generation()
+    for i <- 1..5, do: FlushWatermark.record("wm_fold_#{i}", i, gen)
+
+    rows = FlushWatermark.snapshot()
+    assert FlushWatermark.size() == length(rows)
+
+    assert FlushWatermark.fold([], fn row, acc -> [row | acc] end) |> Enum.sort() ==
+             Enum.sort(rows)
+  end
+
   test "record is a no-op when the metrics layer is disabled" do
     Application.put_env(:fathom, :metrics_collector, false)
     FlushWatermark.record("off", 1, WriteCounter.generation())

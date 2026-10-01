@@ -447,7 +447,7 @@ defmodule Fathom.Admin.MetricsCollector do
     now = mono_ms()
     gen = WriteCounter.generation()
 
-    Enum.reduce(FlushWatermark.snapshot(), {0, 0}, fn
+    FlushWatermark.fold({0, 0}, fn
       {id, flushed_through, counter_gen, flushed_at}, {dirty, oldest} ->
         if counter_gen != gen or WriteCounter.count(id) > flushed_through do
           {dirty + 1, max(oldest, now - flushed_at)}

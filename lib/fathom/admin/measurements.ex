@@ -227,7 +227,7 @@ defmodule Fathom.Admin.Measurements do
     gen = WriteCounter.generation()
 
     {dirty, oldest} =
-      Enum.reduce(FlushWatermark.snapshot(), {0, 0}, fn
+      FlushWatermark.fold({0, 0}, fn
         {id, flushed_through, counter_gen, flushed_at}, {dirty, oldest} ->
           if counter_gen != gen or WriteCounter.count(id) > flushed_through do
             {dirty + 1, max(oldest, now - flushed_at)}
@@ -245,7 +245,7 @@ defmodule Fathom.Admin.Measurements do
     # the window in milliseconds; these two extra gauges make the window OBSERVABLE rather than
     # trusting that fix to be perfect. `watermark_rows < open_shards` means the answer above is
     # under-reporting, and an alert can say so instead of going quiet.
-    rows = length(FlushWatermark.snapshot())
+    rows = FlushWatermark.size()
     open_shards = open_shard_count()
 
     :telemetry.execute(

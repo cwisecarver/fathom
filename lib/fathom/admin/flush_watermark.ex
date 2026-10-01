@@ -75,6 +75,31 @@ defmodule Fathom.Admin.FlushWatermark do
     ArgumentError -> []
   end
 
+  @doc """
+  How many watermark rows are published, without copying the table (expert review 2026-10-01
+  perf #33: the durability poller used `length(snapshot())`, a full `tab2list` of every open shard
+  just to count it).
+  """
+  @spec size() :: non_neg_integer()
+  def size do
+    :ets.info(@table, :size)
+  rescue
+    ArgumentError -> 0
+  end
+
+  @doc """
+  Folds over every published watermark without building the list `snapshot/0` returns. The
+  pollers reduce over the whole table every tick, and at tens of thousands of open shards the list
+  was a few MB of transient heap per tick for nothing.
+  """
+  @spec fold(acc, ({String.t(), non_neg_integer(), integer(), integer()}, acc -> acc)) :: acc
+        when acc: term()
+  def fold(acc, fun) do
+    :ets.foldl(fun, acc, @table)
+  rescue
+    ArgumentError -> acc
+  end
+
   @doc "Clears all rows (test/ops helper)."
   @spec reset() :: :ok
   def reset do
