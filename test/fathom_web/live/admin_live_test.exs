@@ -97,6 +97,52 @@ defmodule FathomWeb.AdminLiveTest do
       assert html =~ "Storage (S3)"
     end
 
+    # "Nodes live" counts the `rebalancer_nodes` roster, which ONLY the load reporter writes
+    # (LOAD_REPORTER, off by default). With it off the tile read "0 / 0" on a node that was serving
+    # the very page — an outage reading for a healthy fleet (admin walkthrough 2026-09-30). Pre-fix
+    # the two empty-roster tests see "/ 0" and no reason.
+    defp broadcast_fleet(nodes) do
+      fleet = %{Fathom.Admin.Fleet.overview() | nodes: nodes}
+
+      Phoenix.PubSub.broadcast(
+        Fathom.PubSub,
+        Fathom.Admin.FleetCollector.topic(),
+        {:fleet, fleet}
+      )
+    end
+
+    test "Nodes live says the reporter is off instead of 0 / 0", %{conn: conn} do
+      refute Fathom.Rebalancer.Reporter.enabled?(), "fixture: the reporter is on in test config"
+      {:ok, view, _html} = conn |> auth() |> live("/admin")
+      broadcast_fleet([])
+
+      assert has_element?(view, "#nodes-live-tile", "reporter off")
+      refute has_element?(view, "#nodes-live-tile", "/ 0")
+    end
+
+    test "Nodes live with the reporter ON but no check-ins says so", %{conn: conn} do
+      Application.put_env(:fathom, :load_reporter, true)
+      on_exit(fn -> Application.delete_env(:fathom, :load_reporter) end)
+
+      {:ok, view, _html} = conn |> auth() |> live("/admin")
+      broadcast_fleet([])
+
+      assert has_element?(view, "#nodes-live-tile", "none reporting")
+    end
+
+    test "Nodes live counts the roster when nodes report", %{conn: conn} do
+      {:ok, view, _html} = conn |> auth() |> live("/admin")
+      now = DateTime.utc_now()
+
+      broadcast_fleet([
+        %{node_key: "a@h", last_seen_at: now, q_p99: 1.0, sample_count: 1, alive: true},
+        %{node_key: "b@h", last_seen_at: now, q_p99: 1.0, sample_count: 1, alive: false}
+      ])
+
+      assert has_element?(view, "#nodes-live-tile", "/ 2")
+      refute has_element?(view, "#nodes-live-tile", "reporter off")
+    end
+
     test "a collector broadcast updates the live KPIs", %{conn: conn} do
       {:ok, view, _html} = conn |> auth() |> live("/admin")
 

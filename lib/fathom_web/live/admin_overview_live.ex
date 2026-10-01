@@ -33,6 +33,7 @@ defmodule FathomWeb.AdminOverviewLive do
       socket
       |> assign(:page_title, "Overview")
       |> assign(:node_key, Fathom.Rebalancer.node_key())
+      |> assign(:reporter_on, Fathom.Rebalancer.Reporter.enabled?())
       |> assign(:metrics, snap.current)
       |> assign(:history, snap.history)
       |> assign(:fleet, initial_fleet(connected))
@@ -116,11 +117,23 @@ defmodule FathomWeb.AdminOverviewLive do
         <div :if={@fleet} class="grid grid-cols-2 gap-4 lg:grid-cols-4">
           <.stat_tile label="Total shards" value={fmt_int(@fleet.total_shards)} />
           <.stat_tile label="Active" value={fmt_int(@fleet.by_status["active"] || 0)} />
-          <.stat_tile
-            label="Nodes live"
-            value={fmt_int(Enum.count(@fleet.nodes, & &1.alive))}
-            unit={"/ #{length(@fleet.nodes)}"}
-          />
+          <%!-- The roster is written ONLY by the load reporter (LOAD_REPORTER, off by default), so an
+               empty one is "nobody reports", not "nobody is alive": this very node is serving the
+               page. "0 / 0" read like an outage (admin walkthrough 2026-09-30). --%>
+          <div id="nodes-live-tile">
+            <.stat_tile
+              :if={@fleet.nodes != []}
+              label="Nodes live"
+              value={fmt_int(Enum.count(@fleet.nodes, & &1.alive))}
+              unit={"/ #{length(@fleet.nodes)}"}
+            />
+            <.stat_tile
+              :if={@fleet.nodes == []}
+              label="Nodes live"
+              value="—"
+              unit={if(@reporter_on, do: "none reporting", else: "reporter off")}
+            />
+          </div>
           <.stat_tile
             label="Fleet HEAD"
             value={if(@fleet.head_version, do: "v#{@fleet.head_version}", else: "—")}
