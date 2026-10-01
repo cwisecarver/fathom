@@ -1,0 +1,115 @@
+defmodule Fathom.Migrator.LedgerTest do
+  @moduledoc """
+  `Fathom.Migrator.Ledger.classify/4` — Django's ledger by NAME against the version label — and the
+  name extraction that feeds it. The classification is pure, so every verdict is pinned here
+  without a shard; `shard_migration_test.exs` drives it through real migrations.
+  """
+  use Fathom.DataCase, async: true
+
+  alias Fathom.Migrator.Ledger
+  alias Fathom.Migrator.Release
+
+  defp n(name), do: {"app", name}
+  defp names(list), do: MapSet.new(list, &n/1)
+  defp fact(list, count \\ nil), do: %{names: names(list), count: count}
+
+  # v1 adds 0001, v2 adds 0002, v3 adds 0003.
+  @facts %{
+    1 => %{names: MapSet.new([{"app", "0001"}]), count: nil},
+    2 => %{names: MapSet.new([{"app", "0002"}]), count: nil},
+    3 => %{names: MapSet.new([{"app", "0003"}]), count: nil}
+  }
+
+  describe "classify/4" do
+    test "a ledger that matches its label is :ok" do
+      assert :ok = Ledger.classify(2, names(~w(0001 0002)), 2, @facts)
+    end
+
+    test "names belonging to no release (the template's baseline) are not evidence" do
+      assert :ok = Ledger.classify(2, names(~w(baseline 0001 0002)), 3, @facts)
+    end
+
+    test "a label AHEAD of a clean ledger prefix is {:behind, k} — the real version" do
+      # The file says v3, but Django applied only through v1.
+      assert {:behind, 1} = Ledger.classify(3, names(~w(0001)), 1, @facts)
+    end
+
+    test "a name from a release ABOVE the label is a mismatch, not a repair" do
+      assert {:mismatch, %{unexpected: [{3, {"app", "0003"}}]}} =
+               Ledger.classify(2, names(~w(0001 0002 0003)), 3, @facts)
+    end
+
+    test "a hole that is not a clean prefix is a mismatch" do
+      # 0001 missing, 0002 present: no version k explains it.
+      assert {:mismatch, %{candidates: [], missing: [{1, {"app", "0001"}}]}} =
+               Ledger.classify(2, names(~w(0002)), 1, @facts)
+    end
+
+    test "a partially applied release is a mismatch" do
+      facts = %{1 => fact(~w(0001a 0001b))}
+      assert {:mismatch, _} = Ledger.classify(1, names(~w(0001a)), 1, facts)
+    end
+
+    test "an unnamed release between candidates makes the real version ambiguous" do
+      # v2 carries no bookkeeping rows, so a ledger through v1 fits k=1 AND k=2. The label (3) is
+      # wrong, but replaying from the wrong one of those would skip or re-run v2's DDL.
+      facts = Map.put(@facts, 2, fact([]))
+      assert {:mismatch, %{candidates: [1, 2]}} = Ledger.classify(3, names(~w(0001)), 1, facts)
+    end
+
+    test "a known template count that disagrees is a mismatch even when every name fits" do
+      # An extra migration run against the shard directly: its name belongs to no release.
+      facts = Map.put(@facts, 2, fact(~w(0002), 2))
+
+      assert {:mismatch, %{expected_count: 2, count: 3}} =
+               Ledger.classify(2, names(~w(0001 0002 rogue)), 3, facts)
+    end
+
+    test "no named releases at all is no evidence — :ok, as before the check existed" do
+      assert :ok = Ledger.classify(5, names(~w(whatever)), 1, %{1 => fact([]), 5 => fact([])})
+    end
+
+    test "a missing ledger at a released version reads as behind at v0, not as a mismatch" do
+      # Deliberate. An empty ledger IS a clean prefix (nothing applied), so the replay starts from
+      # v0. That is right if the schema really is empty, and SAFE if it is not: v1's DDL then fails
+      # inside its own transaction on a temp copy, nothing is published, and the migration is
+      # refused. The restore drill's count check reported this as `:ledger_mismatch`; the migrator
+      # can do better than refuse because it can try the replay without risk.
+      assert {:behind, 0} = Ledger.classify(1, MapSet.new(), 0, @facts)
+    end
+  end
+
+  describe "release_names/1 — SQLite parses Django's own INSERTs" do
+    test "reads names from parameterized bookkeeping rows and their bound values" do
+      release = %Release{
+        statements: [
+          "CREATE TABLE app_x (id INTEGER PRIMARY KEY)",
+          ~s|INSERT INTO "django_migrations" ("app", "name", "applied") VALUES (?, ?, ?)|
+        ],
+        statement_args: [
+          %{"args" => []},
+          %{"args" => Enum.map(["app", "0007_x", "2026-01-01"], &Filo.Value.encode/1)}
+        ]
+      }
+
+      assert Ledger.release_names(release) == MapSet.new([{"app", "0007_x"}])
+    end
+
+    test "reads literal rows, including one that omits `applied`" do
+      release = %Release{
+        statements: [
+          "INSERT INTO django_migrations (app, name, applied) VALUES ('a', '0001', 'now')",
+          "INSERT INTO django_migrations (app, name) VALUES ('b', '0002')"
+        ],
+        statement_args: nil
+      }
+
+      assert Ledger.release_names(release) == MapSet.new([{"a", "0001"}, {"b", "0002"}])
+    end
+
+    test "a release with no bookkeeping rows has no names" do
+      release = %Release{statements: ["CREATE TABLE t (a)"], statement_args: nil}
+      assert Ledger.release_names(release) == MapSet.new()
+    end
+  end
+end

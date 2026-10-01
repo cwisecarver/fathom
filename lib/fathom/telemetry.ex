@@ -784,6 +784,12 @@ defmodule Fathom.Telemetry do
         description:
           "Migration jobs CANCELLED because the shard has no stored object yet — it has never flushed (expert review 2026-09-29 #31). Routine: any Host-minted id registers an active v0 directory row, so a sweep enqueues it as a laggard with nothing to copy. It used to burn five attempts and then quarantine a healthy shard; now it cancels unmarked and the next sweep picks it up once it flushes. A steady high rate means sweeps are enqueuing ids that never get written. Untagged: `target` is a version number, unbounded as a label"
       ),
+      counter("fathom.migrator.ledger.count",
+        event_name: [:fathom, :migrator, :ledger],
+        tags: [:result],
+        description:
+          "Migrations where Django's ledger disagreed with the version label (Fathom.Migrator.Ledger). result=repaired: the label was provably ahead and the chain replayed from the real version. refused: unreconcilable, shard quarantined with last_verify_status=ledger_mismatch. warned: MIGRATION_LEDGER_CHECK=warn let it through. Any refused needs a human; a burst of repaired means labels drifted fleet-wide and is worth explaining"
+      ),
       counter("fathom.migrator.revert_no_retained_version.count",
         event_name: [:fathom, :migrator, :revert_no_retained_version],
         description:

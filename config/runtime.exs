@@ -479,6 +479,19 @@ case System.get_env("MIGRATE_ON_TOUCH") do
     raise "MIGRATE_ON_TOUCH must be \"off\", \"async\", or \"inline\", got: #{inspect(other)}"
 end
 
+# Django's ledger (`django_migrations`) checked BY NAME against the shard's version label, before and
+# after every migration's replay (`Fathom.Migrator.Ledger`). `enforce` (default) migrates a shard
+# whose label is provably ahead of its ledger from the real version, and refuses + quarantines one
+# whose ledger cannot be reconciled. `warn` logs a mismatch and migrates from the label anyway — the
+# escape hatch for a fleet with known legacy drift mid-rollout. `off` skips the check.
+case System.get_env("MIGRATION_LEDGER_CHECK") do
+  nil -> :ok
+  "enforce" -> config :fathom, :migration_ledger_check, :enforce
+  "warn" -> config :fathom, :migration_ledger_check, :warn
+  "off" -> config :fathom, :migration_ledger_check, :off
+  other -> raise "MIGRATION_LEDGER_CHECK must be enforce, warn or off, got: #{inspect(other)}"
+end
+
 # The reserved capture template (`Fathom.Migrator.Capture`): the one shard Django migrates
 # directly, whose transaction SQL is recorded as the next fleet version and replayed onto every
 # other shard. This had NO env wiring — it was set only in `config/dev.exs` ("demo"), so a

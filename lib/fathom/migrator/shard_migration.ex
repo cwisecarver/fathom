@@ -25,7 +25,7 @@ defmodule Fathom.Migrator.ShardMigration do
   """
   require Logger
 
-  alias Fathom.Migrator.{Copy, RetirementJob}
+  alias Fathom.Migrator.{Copy, Ledger, RetirementJob}
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.{Directory, Migrator, Repo, Shards}
 
@@ -535,63 +535,11 @@ defmodule Fathom.Migrator.ShardMigration do
             {:error, {:ahead_of_target, current}}
 
           true ->
-            # Round-2 #9: replay EVERY version from current+1 through target, in
-            # order — capture records one fleet version per Django migration
-            # transaction, so a cold-tail shard 2+ behind is routine, and jumping
-            # straight to target applied only target's DDL: silent per-shard schema
-            # corruption with all three version stamps agreeing. A missing/yanked
-            # intermediate makes the chain unbuildable — error (the shard stays
-            # untouched at its old version) rather than half-apply.
-            # MARK FIRST, THEN READ THE CHAIN (expert review 2026-09-29 #12).
-            #
-            # The `attach_transform` / yank guards (fa2f8fa, `Migrator.refuse_if_migrating_below/1`)
-            # count shards that are `migrating` below the version. The 2026-09-18 #11 pre-flight
-            # moved the chain read to BEFORE the drain, the lease and a full S3 pull, and this path
-            # REUSED that chain — so for the whole of that window the shard was still `active`, the
-            # guards counted zero, an `attach_transform` landing there was accepted, and this shard
-            # then replayed the chain WITHOUT it and cut over: a silently split fleet with all three
-            # stamps agreeing, which is what 2026-09-18 #2 closed. With the mark first, a transform
-            # attached before it is in the chain read below, and one attached after it is refused.
-            # (The guard's own count-then-insert is not a lock; closing THAT window needs a shared
-            # row lock on the release rows — recorded in the audit progress log, not done here.)
-            #
-            # REUSE the row `mark_migrating/1` returns instead of re-reading it (expert review
-            # 2026-08-26 #28). `forward/9` needs the DIRECTORY's `schema_version` to report a
-            # stamp divergence. `:error` degrades to 0: the value only drives a warning.
-            #
-            # A `:status_conflict` is NOT degraded to 0 any more (expert review 2026-09-29 #20): it
-            # means the tenant was suspended or deleted after `run/3` looked, and the 2026-09-05 #11
-            # guard on `mark_migrating` only helps if the caller stops. Before this, `forward/9` went
-            # on to retain, copy and flush over the object, and only the cutover refused.
-            # `current` (the FILE version) is what forward/9 retains; record it now, before the
-            # retain and the flush, so a crash before cutover leaves the intent durable (#27).
-            mark = Directory.mark_migrating(shard_id, current)
+            case ledger_start(shard_id, old, current, target) do
+              {:ok, start} ->
+                migrate_from(shard_id, target, current, start, old, new, lease, etag)
 
-            prev =
-              case mark do
-                {:ok, %{schema_version: v}} -> v
-                _ -> 0
-              end
-
-            chain_result =
-              case mark do
-                {:error, :status_conflict} -> {:error, {:not_active, :status_conflict}}
-                _ -> statement_chain(current, target)
-              end
-
-            case chain_result do
-              {:ok, chain} ->
-                forward(shard_id, target, current, prev, chain, old, new, lease, etag)
-
-              # The tenant left `active` under us — nothing was marked, nothing to undo.
-              {:error, {:not_active, _}} = err ->
-                err
-
-              # The chain became unbuildable between the pre-flight and here (a yank landed).
-              # Leave the shard's status as it was (#23): `unmark_migrating/1` is conditional on the
-              # row still being `migrating`, so it cannot resurrect a suspended or deleted tenant.
               {:error, _} = err ->
-                _ = Directory.unmark_migrating(shard_id)
                 err
             end
         end
@@ -601,6 +549,158 @@ defmodule Fathom.Migrator.ShardMigration do
       drop_temp(new)
     end
   end
+
+  # `current` is the FILE's label (what forward/9 retains and records); `start` is where the replay
+  # chain begins — the same, unless the Django ledger proved the label is ahead of what was actually
+  # applied (`ledger_start/4`), in which case the chain starts from the real version.
+  defp migrate_from(shard_id, target, current, start, old, new, lease, etag) do
+    # Round-2 #9: replay EVERY version from current+1 through target, in
+    # order — capture records one fleet version per Django migration
+    # transaction, so a cold-tail shard 2+ behind is routine, and jumping
+    # straight to target applied only target's DDL: silent per-shard schema
+    # corruption with all three version stamps agreeing. A missing/yanked
+    # intermediate makes the chain unbuildable — error (the shard stays
+    # untouched at its old version) rather than half-apply.
+    # MARK FIRST, THEN READ THE CHAIN (expert review 2026-09-29 #12).
+    #
+    # The `attach_transform` / yank guards (fa2f8fa, `Migrator.refuse_if_migrating_below/1`)
+    # count shards that are `migrating` below the version. The 2026-09-18 #11 pre-flight
+    # moved the chain read to BEFORE the drain, the lease and a full S3 pull, and this path
+    # REUSED that chain — so for the whole of that window the shard was still `active`, the
+    # guards counted zero, an `attach_transform` landing there was accepted, and this shard
+    # then replayed the chain WITHOUT it and cut over: a silently split fleet with all three
+    # stamps agreeing, which is what 2026-09-18 #2 closed. With the mark first, a transform
+    # attached before it is in the chain read below, and one attached after it is refused.
+    # The guard's own count-then-insert is closed by row locks (b68b59d): the chain read below
+    # takes FOR SHARE on the release rows, `attach_transform/2` takes FOR UPDATE before counting.
+    #
+    # REUSE the row `mark_migrating/1` returns instead of re-reading it (expert review
+    # 2026-08-26 #28). `forward/9` needs the DIRECTORY's `schema_version` to report a
+    # stamp divergence. `:error` degrades to 0: the value only drives a warning.
+    #
+    # A `:status_conflict` is NOT degraded to 0 any more (expert review 2026-09-29 #20): it
+    # means the tenant was suspended or deleted after `run/3` looked, and the 2026-09-05 #11
+    # guard on `mark_migrating` only helps if the caller stops. Before this, `forward/9` went
+    # on to retain, copy and flush over the object, and only the cutover refused.
+    # `current` (the FILE version) is what forward/9 retains; record it now, before the
+    # retain and the flush, so a crash before cutover leaves the intent durable (#27).
+    mark = Directory.mark_migrating(shard_id, current)
+
+    prev =
+      case mark do
+        {:ok, %{schema_version: v}} -> v
+        _ -> 0
+      end
+
+    chain_result =
+      case mark do
+        {:error, :status_conflict} -> {:error, {:not_active, :status_conflict}}
+        _ -> statement_chain(start, target)
+      end
+
+    case chain_result do
+      {:ok, chain} ->
+        forward(shard_id, target, current, prev, chain, old, new, lease, etag)
+
+      # The tenant left `active` under us — nothing was marked, nothing to undo.
+      {:error, {:not_active, _}} = err ->
+        err
+
+      # The chain became unbuildable between the pre-flight and here (a yank landed).
+      # Leave the shard's status as it was (#23): `unmark_migrating/1` is conditional on the
+      # row still being `migrating`, so it cannot resurrect a suspended or deleted tenant.
+      {:error, _} = err ->
+        _ = Directory.unmark_migrating(shard_id)
+        err
+    end
+  end
+
+  # THE LEDGER LEG OF THE VERSION STAMP, before anything is touched (admin follow-up 2026-10-01).
+  # `Fathom.Migrator.Ledger` reads `django_migrations` by NAME and says whether the file's label is
+  # what Django actually applied:
+  #
+  #   * consistent ⇒ replay from the label, as always;
+  #   * provably BEHIND the label at exactly one earlier version ⇒ replay from THAT version, in
+  #     order. Re-applying only the "missing" migrations on top of later ones would run DDL out of
+  #     order; replaying from the real version runs it in the order it was authored, and each step
+  #     is its own transaction on a temp copy, so DDL that turns out to be present already fails
+  #     the step and publishes nothing;
+  #   * anything else ⇒ refuse. Extra or unknown migrations, a partially applied release, or an
+  #     ambiguous history cannot be repaired by a machine. Recorded on the row
+  #     (`last_verify_status`) so `count_stamp_drift/0` and the API see it; the job quarantines.
+  #
+  # `:migration_ledger_check` is `:enforce` (default), `:warn` (log a mismatch and migrate from the
+  # label anyway — the escape hatch for a fleet with known legacy drift) or `:off`.
+  defp ledger_start(shard_id, old, current, target) do
+    case ledger_mode() do
+      :off ->
+        {:ok, current}
+
+      mode ->
+        case Ledger.check_file(old) do
+          {_label, :ok} ->
+            {:ok, current}
+
+          {_label, {:behind, k}} ->
+            Logger.warning(
+              "shard #{shard_id}: file says v#{current} but django_migrations was applied only " <>
+                "through v#{k}; replaying v#{k + 1}..v#{target} in order from the real version"
+            )
+
+            :telemetry.execute([:fathom, :migrator, :ledger], %{count: 1}, %{result: :repaired})
+            {:ok, k}
+
+          {_label, {:mismatch, detail}} ->
+            ledger_mismatch(shard_id, mode, current, detail, :before)
+        end
+    end
+  end
+
+  # The same check on the PRODUCT, beside `verify_migrated/2`: after the replay the ledger must be
+  # exactly the target's. A replay that wrote the wrong bookkeeping rows is caught here, before the
+  # flush publishes it.
+  defp verify_ledger(shard_id, path, target) do
+    case ledger_mode() do
+      :off ->
+        :ok
+
+      mode ->
+        case Ledger.check_file(path) do
+          {^target, :ok} ->
+            :ok
+
+          {label, verdict} ->
+            detail = %{label: label, verdict: verdict}
+
+            with {:ok, _} <- ledger_mismatch(shard_id, mode, target, detail, :after),
+                 do: :ok
+        end
+    end
+  end
+
+  defp ledger_mismatch(shard_id, :warn, version, detail, phase) do
+    Logger.warning(
+      "shard #{shard_id}: django_migrations disagrees with v#{version} (#{phase} the replay, " <>
+        "#{inspect(detail)}); migrating anyway because :migration_ledger_check is :warn"
+    )
+
+    :telemetry.execute([:fathom, :migrator, :ledger], %{count: 1}, %{result: :warned})
+    {:ok, version}
+  end
+
+  defp ledger_mismatch(shard_id, _enforce, version, detail, phase) do
+    Logger.error(
+      "shard #{shard_id}: django_migrations disagrees with v#{version} (#{phase} the replay, " <>
+        "#{inspect(detail)}); refusing the migration — the shard stays on its current version"
+    )
+
+    _ = Directory.record_verification(shard_id, "ledger_mismatch")
+    :telemetry.execute([:fathom, :migrator, :ledger], %{count: 1}, %{result: :refused})
+    {:error, {:ledger_mismatch, detail}}
+  end
+
+  defp ledger_mode,
+    do: Application.get_env(:fathom, :migration_ledger_check, :enforce)
 
   defp statement_chain(current, target) do
     versions = Enum.to_list((current + 1)..target//1)
@@ -719,6 +819,7 @@ defmodule Fathom.Migrator.ShardMigration do
          # version and the job retries — rather than after, where it would be reporting on bytes
          # already published.
          :ok <- verify_migrated(shard_id, new),
+         :ok <- verify_ledger(shard_id, new, target),
          # Self-fence right before the clobbering flush: if we were superseded during the (long)
          # copy, abort instead of overwriting the new owner's object (finding #7).
          :ok <- fence(shard_id, lease),

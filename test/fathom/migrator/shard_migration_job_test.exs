@@ -254,6 +254,42 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     refute_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1})
   end
 
+  # A Django ledger the migrator cannot reconcile with the label (Fathom.Migrator.Ledger) is
+  # deterministic, so the job quarantines on the FIRST attempt instead of retrying to the same
+  # answer. Pre-fix the run migrated and the job returned :ok.
+  test "a ledger mismatch quarantines the shard without retrying", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+
+    {:ok, _} =
+      Migrator.release(3, "v3", [
+        "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0003_x', 'now')"
+      ])
+
+    # Plant v3's ledger row in the v1 object: a migration the label does not admit to.
+    tmp = Path.join(System.tmp_dir!(), "lmm_#{shard}_#{System.unique_integer([:positive])}.db")
+    {:ok, _} = Storage.pull(shard, tmp)
+    {:ok, conn} = Connection.open(tmp)
+
+    :ok =
+      Connection.exec(
+        conn,
+        "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0003_x', 'now')"
+      )
+
+    :ok = Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(conn)
+    :ok = Storage.flush(shard, tmp)
+    for s <- ["", "-wal", "-shm"], do: File.rm(tmp <> s)
+
+    capture_log(fn ->
+      assert {:cancel, :ledger_mismatch} =
+               perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2}, attempt: 1)
+    end)
+
+    assert {:ok, %{status: "migration_failed", schema_version: 1}} = Directory.get(shard)
+  end
+
   # Expert review 2026-09-29 #20, the purge half: a revert of a DELETED tenant must not create a
   # `<shard>@2` backup copy (a copy of an erased tenant the purge may never see), and must cancel
   # rather than `mark_failed` over the deleted status. Pre-fix the retain ran and the job fell to

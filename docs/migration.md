@@ -59,7 +59,15 @@ The migration copies to a **fresh file** and flips a pointer; it never mutates a
    copy-and-stamp transaction, so a cold-tail laggard converges the whole way in one job.
    **`Migrator.ShardMigration`** orchestrates it and is **idempotent** (re-run on an
    already-migrated shard is a no-op).
-3. Validate, then **`Fathom.Directory.cutover/2`** flips the shard's pointer to vN and stamps
+   Before the replay, **`Migrator.Ledger`** reads the shard's `django_migrations` **by name** and
+   checks it against the `user_version` label (every release stores Django's own bookkeeping rows,
+   so the names each version adds are known). A label provably ahead of the ledger — the file says
+   v7, Django applied only through v5 — is replayed from the **real** version, in order. A ledger
+   that cannot be reconciled (a later version's migration already present, a partial release, an
+   ambiguous history, a count that disagrees) is refused: the shard stays put and is quarantined
+   with `last_verify_status: ledger_mismatch`. `MIGRATION_LEDGER_CHECK=warn|off` relaxes it.
+3. Validate (`quick_check`, and the same ledger check on the migrated copy, which must match the
+   target exactly), then **`Fathom.Directory.cutover/2`** flips the shard's pointer to vN and stamps
    `cutover_at` (the same instant as `last_active_at`, so "written since cutover" is exactly
    `last_active_at > cutover_at`). The old vN-1 version is **retired with a `retain_until`** — kept
    for the revert window, not deleted.

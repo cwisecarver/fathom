@@ -316,9 +316,13 @@ defmodule Fathom.Migrator.ShardMigrationTest do
 
     assert {:ok, %{from: 1, to: 4}} = ShardMigration.run(shard, 4)
 
-    assert :counters.get(counter, 1) == 2,
+    # FOUR since the ledger check (2026-10-01): pre-flight + post-mark chain read, plus ONE
+    # release read each for the ledger check before and after the replay. It was two; it changed
+    # because two whole-range reads were added, not because anything became per-version — which is
+    # what this test exists to catch.
+    assert :counters.get(counter, 1) == 4,
            "the 3-version chain issued #{:counters.get(counter, 1)} shard_migrations queries; " <>
-             "it must be two (pre-flight + post-mark) regardless of the range"
+             "it must be four (pre-flight + post-mark + two ledger reads) regardless of the range"
   end
 
   # Expert review 2026-08-26 #28. One forward migration cost ~9 Postgres round trips, three of them
@@ -516,6 +520,103 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert {:ok, ^before} = Storage.object_etag(shard), "the object was rewritten after a suspend"
     refute retained?(shard, 1)
     assert {:ok, %{status: "suspended", schema_version: 1}} = Directory.get(shard)
+  end
+
+  # ---- the ledger leg (Fathom.Migrator.Ledger), 2026-10-01 -------------------------------------
+  #
+  # Releases that carry Django's bookkeeping rows, as captured ones do: v1 adds 0001_initial, v2 adds
+  # a column + 0002_add_created_at, v3 adds a table + 0003_tag.
+  @l1 [
+    "CREATE TABLE app_thing (id INTEGER PRIMARY KEY, name TEXT)",
+    "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0001_initial', 'now')"
+  ]
+  @l3 [
+    "CREATE TABLE app_tag (id INTEGER PRIMARY KEY)",
+    "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0003_tag', 'now')"
+  ]
+
+  defp release_ledger_chain! do
+    {:ok, _} = Migrator.release(1, "v1", @l1)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    {:ok, _} = Migrator.release(3, "v3", @l3)
+  end
+
+  # A stored object whose LABEL is `label` but whose schema and ledger are v1's plus `extra_names`.
+  defp seed_labelled!(shard, label, extra_names) do
+    seed = Path.join(System.tmp_dir!(), "lseed_#{shard}_#{System.unique_integer([:positive])}.db")
+    {:ok, conn} = Connection.open(seed)
+    :ok = Connection.exec(conn, "CREATE TABLE app_thing (id INTEGER PRIMARY KEY, name TEXT)")
+    :ok = Connection.exec(conn, "INSERT INTO app_thing (id, name) VALUES (1, 'alice')")
+
+    :ok =
+      Connection.exec(
+        conn,
+        "CREATE TABLE django_migrations (id INTEGER PRIMARY KEY, app TEXT, name TEXT, applied TEXT)"
+      )
+
+    for name <- ["0001_initial" | extra_names] do
+      {:ok, _} =
+        Connection.query(
+          conn,
+          "INSERT INTO django_migrations (app, name, applied) VALUES ('app', ?1, 'now')",
+          [name]
+        )
+    end
+
+    :ok = Connection.exec(conn, "PRAGMA user_version = #{label}")
+    :ok = Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(conn)
+
+    :ok = Storage.flush(shard, seed)
+    for s <- ["", "-wal", "-shm"], do: File.rm(seed <> s)
+    {:ok, _} = Directory.resolve(shard)
+    {:ok, _} = Directory.cutover(shard, label)
+    :ok
+  end
+
+  test "a label AHEAD of its Django ledger is migrated from the real version, in order", %{
+    shard: shard
+  } do
+    release_ledger_chain!()
+    # The file says v2, but v2 was never applied: no created_at column, no 0002 row.
+    seed_labelled!(shard, 2, [])
+
+    assert {:ok, %{from: 2, to: 3}} = ShardMigration.run(shard, 3)
+
+    # v2 was replayed (from the real version, v1), then v3. Pre-fix the chain started at the
+    # label, so v2 was skipped: created_at never existed and 0002 never landed, under a v3 stamp.
+    assert %{rows: [[1, "alice", nil]]} =
+             query_live!(shard, "SELECT id, name, created_at FROM app_thing")
+
+    assert %{rows: [["0001_initial"], ["0002_add_created_at"], ["0003_tag"]]} =
+             query_live!(shard, "SELECT name FROM django_migrations ORDER BY name")
+  end
+
+  test "a ledger carrying a LATER release's migration is refused and left untouched", %{
+    shard: shard
+  } do
+    release_ledger_chain!()
+    # Labelled v1, but 0003_tag is already in the ledger: someone ran migrate against the shard.
+    seed_labelled!(shard, 1, ["0003_tag"])
+    {:ok, before} = Storage.object_etag(shard)
+
+    assert {:error, {:ledger_mismatch, _}} = ShardMigration.run(shard, 2)
+    assert {:ok, ^before} = Storage.object_etag(shard), "the object was rewritten"
+    refute retained?(shard, 1)
+
+    assert {:ok, %{schema_version: 1, status: "active", last_verify_status: "ledger_mismatch"}} =
+             Directory.get(shard)
+  end
+
+  test ":migration_ledger_check :warn lets a mismatched shard migrate from its label", %{
+    shard: shard
+  } do
+    release_ledger_chain!()
+    seed_labelled!(shard, 1, ["0003_tag"])
+    Application.put_env(:fathom, :migration_ledger_check, :warn)
+    on_exit(fn -> Application.delete_env(:fathom, :migration_ledger_check) end)
+
+    assert {:ok, %{from: 1, to: 2}} = ShardMigration.run(shard, 2)
   end
 
   # Expert review 2026-09-29 #20, the purge half. A job already past `run/3` and `mark_migrating`

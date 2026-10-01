@@ -151,6 +151,14 @@ defmodule Fathom.Migrator.ShardMigrationJob do
 
         {:cancel, :no_live_object}
 
+      # Django's ledger disagrees with the version label in a way a machine cannot repair
+      # (`Fathom.Migrator.Ledger`). Deterministic — the same bytes give the same verdict on every
+      # retry — so quarantine now rather than burn four more attempts reaching the same answer.
+      # The shard stays on its current version; `last_verify_status` already says why.
+      {:error, {:ledger_mismatch, _detail}} ->
+        Directory.mark_failed(shard_id)
+        {:cancel, :ledger_mismatch}
+
       {:error, reason} ->
         handle_error(job, shard_id, reason)
     end

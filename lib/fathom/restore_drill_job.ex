@@ -612,62 +612,22 @@ defmodule Fathom.RestoreDrillJob do
   # Public (undocumented) so the ledger classification can be tested on a crafted SQLite file
   # directly, without standing up the fork/directory machinery `run_full_drill/1` needs.
   def ledger_status_for_path(shard_id, path) do
-    {:ok, conn} = Connection.open(path)
+    # BY NAME since 2026-10-01 (`Fathom.Migrator.Ledger`), not by row count: a count cannot tell
+    # "one migration missing, one extra" from correct, and never said WHICH. The drill has no
+    # migration to repair with, so anything but a ledger consistent with its label — including a
+    # label provably ahead of what Django applied (`{:behind, _}`) — is a mismatch here.
+    case Fathom.Migrator.Ledger.check_file(path) do
+      {_label, :ok} ->
+        :ok
 
-    try do
-      actual = ledger_count(conn)
-      version = read_user_version(conn)
+      {label, verdict} ->
+        Logger.error(
+          "restore drill (FULL): #{shard_id} LEDGER MISMATCH — user_version=#{label}, " <>
+            "django_migrations says #{inspect(verdict)}"
+        )
 
-      case Fathom.Migrator.expected_migration_count(version) do
-        {:ok, ^actual} ->
-          :ok
-
-        {:ok, expected} ->
-          Logger.error(
-            "restore drill (FULL): #{shard_id} LEDGER MISMATCH — user_version=#{version} " <>
-              "expects #{expected} django_migrations row(s), found #{actual}"
-          )
-
-          :ledger_mismatch
-
-        :unknown ->
-          Logger.info(
-            "restore drill (FULL): #{shard_id} ledger check skipped — no expected count for " <>
-              "user_version=#{version} (unreleased version or pre-#32 release)"
-          )
-
-          :ok
-      end
-    after
-      Connection.close(conn)
+        :ledger_mismatch
     end
-  end
-
-  # Count of applied Django migrations, or 0 when the table does not exist. A missing ledger is
-  # deliberately ZERO, not a distinct sentinel: the caller runs one comparison, so an empty-or-absent
-  # ledger under a positive, released user_version surfaces as the mismatch it is (see the caller).
-  # Checking `sqlite_master` first (rather than `try/rescue` on a bad-table error) keeps "no ledger"
-  # from being conflated with a genuine query failure, which would raise here.
-  defp ledger_count(conn) do
-    case Connection.query(
-           conn,
-           "SELECT name FROM sqlite_master WHERE type='table' AND name='django_migrations'",
-           []
-         ) do
-      {:ok, %{rows: []}} ->
-        0
-
-      {:ok, %{rows: [_ | _]}} ->
-        {:ok, %{rows: [[n]]}} =
-          Connection.query(conn, "SELECT COUNT(*) FROM django_migrations", [])
-
-        n
-    end
-  end
-
-  defp read_user_version(conn) do
-    {:ok, %{rows: [[v]]}} = Connection.query(conn, "PRAGMA user_version", [])
-    v
   end
 
   # Clean up the scratch tenant. Deliberately NOT `Tenants.delete/1`, which is the supported way to
