@@ -65,15 +65,20 @@ defmodule Fathom.Shard.FlushGate do
 
   defp default_cap do
     pool_size = get_in(Application.get_env(:fathom, Fathom.Shard.Storage.S3, []), [:pool_size])
-    default_cap(pool_size || 200, System.schedulers_online())
+    # The DIRTY-IO scheduler count, not `System.schedulers_online/0` (expert review 2026-10-01
+    # perf #4). Every exqlite NIF is a dirty-IO job and each flush's `quick_check` and
+    # `VACUUM INTO` hold one dirty-IO thread for the whole scan, so that pool (`+SDio`, 10 by
+    # default) is the one a flush wave exhausts. `schedulers_online` let an 18-core box run 18
+    # concurrent flushes against 10 dirty-IO threads, parking every tenant's query on the node.
+    default_cap(pool_size || 200, :erlang.system_info(:dirty_io_schedulers))
   end
 
   @doc """
-  The pure derivation behind `cap/0`: a quarter of the Finch pool, capped at the scheduler
-  count (each in-flight flush's `VACUUM INTO` occupies one) and never below 4.
+  The pure derivation behind `cap/0`: a quarter of the Finch pool, capped at the dirty-IO
+  scheduler count (each in-flight flush's `VACUUM INTO` occupies one) and never below 4.
 
   Public and pure ONLY so it is testable on any machine. Driving it through
-  `System.schedulers_online/0` is not: on a small-core box `schedulers` is the binding term
+  the live scheduler count is not: on a small-core box `schedulers` is the binding term
   at *every* pool size, so the cap is a flat 4 and "raising the pool raises the cap" is
   unobservable — not because the derivation is wrong, but because that machine has no band
   in which the pool is the binding term. That is exactly how `flush_storm_test`'s

@@ -74,7 +74,7 @@ defmodule Fathom.FlushStormTest do
     # `schedulers` binds at both pool sizes and the cap is a flat 4, so `big > small` is
     # false. It passed locally and failed on all three OTP versions in CI from `dc3d2a3`
     # until the derivation was extracted. Keep this driven by the pure function.
-    test "the default derives from the Finch pool, capped by schedulers and floored at 4" do
+    test "the default derives from the Finch pool, capped by dirty-IO schedulers and floored at 4" do
       # The pool is the binding term: a quarter of it, and raising it raises the cap.
       assert FlushGate.default_cap(40, 64) == 10
       assert FlushGate.default_cap(4000, 64) == 64, "capped by schedulers, not a quarter of 4000"
@@ -98,7 +98,27 @@ defmodule Fathom.FlushStormTest do
       on_exit(fn -> Application.put_env(:fathom, Fathom.Shard.Storage.S3, prev_s3) end)
       Application.put_env(:fathom, Fathom.Shard.Storage.S3, Keyword.put(prev_s3, :pool_size, 40))
 
-      assert FlushGate.cap() == FlushGate.default_cap(40, System.schedulers_online())
+      assert FlushGate.cap() ==
+               FlushGate.default_cap(40, :erlang.system_info(:dirty_io_schedulers))
+    end
+
+    # THE BOUND IS THE DIRTY-IO POOL, NOT THE CPU COUNT (expert review 2026-10-01 perf #4). Every
+    # exqlite NIF runs on a dirty-IO scheduler, and a flush's `quick_check` and `VACUUM INTO` each
+    # hold one for the whole scan. `cap/0` used to pass `System.schedulers_online/0`, so on an
+    # 18-core box with the default 10 dirty-IO threads (`+SDio 10`) it allowed 18 concurrent
+    # flushes: enough to occupy every dirty-IO thread and park every tenant's query on the node.
+    # The test above asserted `schedulers_online` until this fix; it pinned the defect.
+    test "the default cap never exceeds the dirty-IO scheduler count" do
+      Application.delete_env(:fathom, :shard_flush_max_concurrency)
+      prev_s3 = Application.get_env(:fathom, Fathom.Shard.Storage.S3, [])
+      on_exit(fn -> Application.put_env(:fathom, Fathom.Shard.Storage.S3, prev_s3) end)
+      Application.put_env(:fathom, Fathom.Shard.Storage.S3, Keyword.put(prev_s3, :pool_size, 400))
+
+      dirty_io = :erlang.system_info(:dirty_io_schedulers)
+
+      assert FlushGate.cap() <= max(dirty_io, 4),
+             "cap #{FlushGate.cap()} exceeds the #{dirty_io} dirty-IO schedulers every flush's " <>
+               "VACUUM INTO and quick_check run on"
     end
 
     test "an explicit integer still wins" do
