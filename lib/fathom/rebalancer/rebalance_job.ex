@@ -253,9 +253,9 @@ defmodule Fathom.Rebalancer.RebalanceJob do
     Enum.map_join(moves, ", ", fn m -> "#{m.shard_id} #{m.from_node}->#{m.to_node}" end)
   end
 
-  @doc "Whether the rebalancer acts (`:rebalancer_enabled`, default off)."
+  # Whether the rebalancer acts (`:rebalancer_enabled`, default off).
   @spec enabled?() :: boolean()
-  def enabled?, do: Application.get_env(:fathom, :rebalancer_enabled, false) == true
+  defp enabled?, do: Application.get_env(:fathom, :rebalancer_enabled, false) == true
 
   defp horizon_ms,
     do: Application.get_env(:fathom, :rebalance_sample_horizon_ms, @sample_horizon_ms)

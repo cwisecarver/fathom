@@ -71,9 +71,9 @@ defmodule Fathom.ShardLatency do
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
-  @doc "Whether per-shard latency recording is enabled — rides `Fathom.ShardLoad`'s `:shard_load` gate."
+  # Whether per-shard latency recording is enabled — rides `Fathom.ShardLoad`'s `:shard_load` gate.
   @spec enabled?() :: boolean()
-  def enabled?, do: Application.get_env(:fathom, :shard_load, false) == true
+  defp enabled?, do: Application.get_env(:fathom, :shard_load, false) == true
 
   @doc """
   Records one query's latency (a `System.monotonic_time/0` diff, native units) against

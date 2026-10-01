@@ -417,7 +417,7 @@ defmodule Fathom.Shard.ReplicationTest do
       q = Quorum.new(4, 2)
 
       assert {:pending, q} = Quorum.ack(q, :f1)
-      assert {:reached, q} = Quorum.ack(q, :f2)
+      assert {:reached, _q} = Quorum.ack(q, :f2)
     end
 
     test "one chatty follower cannot satisfy a quorum by itself" do

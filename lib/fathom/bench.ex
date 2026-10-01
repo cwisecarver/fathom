@@ -707,24 +707,22 @@ defmodule Fathom.Bench do
     end
   end
 
-  @doc """
-  `dir_recorder_flush_rows_per_s` — rows/sec through `Fathom.Directory.Recorder.flush/0`
-  (expert review 2026-08-01 #41.6).
-
-  **`dir_resolve_p50_us` is not the request path and has not been since the Recorder landed.**
-  `Directory.resolve/1`'s live callers are `Fathom.Tenants` (provision, fork) and
-  `Migrator.ShardMigration` — provisioning and migration, all control-plane. It stays gated
-  because it still guards that reader, but it was standing in for a per-request cost it no
-  longer represents, and `docs/benchmark-plan.md` said so in as many words until this commit.
-
-  What per-checkout directory work actually costs now is THIS: touches coalesce into ETS and are
-  batch-flushed, so the live cost is an `:ets.select` walk plus one `:ets.take` per touched
-  shard, then `insert_all` in 1,000-row chunks — and it scales with DENSITY. At 30k active
-  shards that is ~30k ETS takes and ~30 multi-row upserts every second against a `pool_size` of
-  25, which is the shape that falls over quietly.
-  """
+  # `dir_recorder_flush_rows_per_s` — rows/sec through `Fathom.Directory.Recorder.flush/0`
+  # (expert review 2026-08-01 #41.6).
+  #
+  # **`dir_resolve_p50_us` is not the request path and has not been since the Recorder landed.**
+  # `Directory.resolve/1`'s live callers are `Fathom.Tenants` (provision, fork) and
+  # `Migrator.ShardMigration` — provisioning and migration, all control-plane. It stays gated
+  # because it still guards that reader, but it was standing in for a per-request cost it no
+  # longer represents, and `docs/benchmark-plan.md` said so in as many words until this commit.
+  #
+  # What per-checkout directory work actually costs now is THIS: touches coalesce into ETS and are
+  # batch-flushed, so the live cost is an `:ets.select` walk plus one `:ets.take` per touched
+  # shard, then `insert_all` in 1,000-row chunks — and it scales with DENSITY. At 30k active
+  # shards that is ~30k ETS takes and ~30 multi-row upserts every second against a `pool_size` of
+  # 25, which is the shape that falls over quietly.
   @spec dir_recorder_flush(keyword()) :: float() | nil
-  def dir_recorder_flush(opts \\ []) do
+  defp dir_recorder_flush(opts) do
     setup(opts)
     n = Keyword.get(opts, :recorder_rows, @recorder_rows)
     trials = Keyword.get(opts, :trials, @default_trials)
@@ -842,13 +840,11 @@ defmodule Fathom.Bench do
     end
   end
 
-  @doc """
-  `hrana_rt/1`'s samples reduced to BOTH p50 and p99 — see `cold_open_stats/1` for why the tail
-  is gated at all (expert review 2026-08-01 #41.5). This is the wire's tail: a request-path
-  change that adds an occasional stall shows up here and nowhere else in the gate.
-  """
+  # `hrana_rt/1`'s samples reduced to BOTH p50 and p99 — see `cold_open_stats/1` for why the tail
+  # is gated at all (expert review 2026-08-01 #41.5). This is the wire's tail: a request-path
+  # change that adds an occasional stall shows up here and nowhere else in the gate.
   @spec hrana_rt_stats(keyword()) :: %{p50_us: float(), p99_us: float()} | nil
-  def hrana_rt_stats(opts \\ []) do
+  defp hrana_rt_stats(opts) do
     samples = Keyword.get(opts, :hrana_rt_samples, @hrana_rt_samples)
 
     with_wire(opts, "benchrt", fn client ->
@@ -1049,38 +1045,36 @@ defmodule Fathom.Bench do
     end)
   end
 
-  @doc """
-  `wire_encode_rows_per_s` — rows/sec through `Filo.Value.encode/1`, the OTHER encoder
-  (expert review 2026-08-01 #41.7).
-
-  `Filo.Value` has two encoding PATHS and the gate only ever ran one. `wire_rows_per_s` drives
-  `encode_json/1`, which emits JSON directly. The other path builds tagged maps with `encode/1`
-  and then serialises them, and `Filo.Value`'s own moduledoc records that the tagged-map layer
-  "roughly doubled" per-cell cost. `Cursor.entries/2` takes it for `rows: :maps`, and
-  `Protobuf.encode_value/1` consumes the same maps — i.e. exactly when result sets are large.
-
-  **This times `encode/1` FOLLOWED BY the JSON serialisation, not `encode/1` alone**, and the
-  first draft got that wrong. Measured per cell on keystone rows:
-
-      encode/1 alone          0.053 µs   <- FASTER than encode_json/1; times half the work
-      encode_json/1           0.111 µs
-      encode/1 + Jason        0.269 µs   <- 2.42x, the doubling the moduledoc describes
-
-  Timing `encode/1` by itself made the "slower encoder" look 0.41x the cost of the fast one,
-  because building a map is cheap and the expense is serialising it afterwards. A metric that
-  reads *better* than its comparison is the tell that it is measuring the wrong span.
-
-  **NOT driven through the cursor HTTP transport**, which is what the review proposed.
-  `Filo.Client` states outright that cursors are outside its scope, so that shape would mean new
-  HTTP plumbing to cover a path the finding itself calls "no live bug today — coverage only".
-  This is the per-cell cost, which is the whole of the risk; cursor/protobuf FRAMING stays
-  ungated, and that is a deliberate, stated limit rather than an oversight.
-
-  Same keystone source as `wire_rows_per_s`, so every SQLite storage class — including the BLOB
-  that carried the 200x regression — crosses this path too.
-  """
+  # `wire_encode_rows_per_s` — rows/sec through `Filo.Value.encode/1`, the OTHER encoder
+  # (expert review 2026-08-01 #41.7).
+  #
+  # `Filo.Value` has two encoding PATHS and the gate only ever ran one. `wire_rows_per_s` drives
+  # `encode_json/1`, which emits JSON directly. The other path builds tagged maps with `encode/1`
+  # and then serialises them, and `Filo.Value`'s own moduledoc records that the tagged-map layer
+  # "roughly doubled" per-cell cost. `Cursor.entries/2` takes it for `rows: :maps`, and
+  # `Protobuf.encode_value/1` consumes the same maps — i.e. exactly when result sets are large.
+  #
+  # **This times `encode/1` FOLLOWED BY the JSON serialisation, not `encode/1` alone**, and the
+  # first draft got that wrong. Measured per cell on keystone rows:
+  #
+  #     encode/1 alone          0.053 µs   <- FASTER than encode_json/1; times half the work
+  #     encode_json/1           0.111 µs
+  #     encode/1 + Jason        0.269 µs   <- 2.42x, the doubling the moduledoc describes
+  #
+  # Timing `encode/1` by itself made the "slower encoder" look 0.41x the cost of the fast one,
+  # because building a map is cheap and the expense is serialising it afterwards. A metric that
+  # reads *better* than its comparison is the tell that it is measuring the wrong span.
+  #
+  # **NOT driven through the cursor HTTP transport**, which is what the review proposed.
+  # `Filo.Client` states outright that cursors are outside its scope, so that shape would mean new
+  # HTTP plumbing to cover a path the finding itself calls "no live bug today — coverage only".
+  # This is the per-cell cost, which is the whole of the risk; cursor/protobuf FRAMING stays
+  # ungated, and that is a deliberate, stated limit rather than an oversight.
+  #
+  # Same keystone source as `wire_rows_per_s`, so every SQLite storage class — including the BLOB
+  # that carried the 200x regression — crosses this path too.
   @spec wire_encode_rows(keyword()) :: float() | nil
-  def wire_encode_rows(opts \\ []) do
+  defp wire_encode_rows(opts) do
     setup(opts)
     rows = Keyword.get(opts, :wire_rows, @wire_rows)
     trials = Keyword.get(opts, :trials, @default_trials)

@@ -530,9 +530,9 @@ defmodule Fathom.Shard.Replication.Protocol do
   def handshake_timeout_ms,
     do: Application.get_env(:fathom, :replication_handshake_timeout_ms, 5_000)
 
-  @doc "Whether new replication connections run the `@hello` nonce exchange (#17)."
+  # Whether new replication connections run the `@hello` nonce exchange (#17).
   @spec conn_nonce?() :: boolean()
-  def conn_nonce?, do: Application.get_env(:fathom, :replication_conn_nonce, false) == true
+  defp conn_nonce?, do: Application.get_env(:fathom, :replication_conn_nonce, false) == true
 
   @doc """
   The ACCEPTING side of the connection handshake (#17): send our nonce, read the dialer's, and bind

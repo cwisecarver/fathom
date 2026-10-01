@@ -73,14 +73,12 @@ defmodule Fathom.Keystone do
 
   # --- schema ----------------------------------------------------------------
 
-  @doc """
-  The keystone's DDL, as a list of SQL strings in application order.
-
-  Returned separately from `build!/2` so a caller can replay the schema through the migration
-  engine (see `statement_pairs/0`) instead of only creating it directly.
-  """
+  # The keystone's DDL, as a list of SQL strings in application order.
+  #
+  # Returned separately from `build!/2` so a caller can replay the schema through the migration
+  # engine (see `statement_pairs/0`) instead of only creating it directly.
   @spec schema_statements() :: [String.t()]
-  def schema_statements do
+  defp schema_statements do
     [
       # --- every affinity, every declared-type spelling, all nullable so NULL appears in each ---
       #

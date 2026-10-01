@@ -363,14 +363,12 @@ defmodule Fathom.Shard.Replication.Fleet do
     end
   end
 
-  @doc """
-  The port the follower listener binds. `:replication_listen_port`, default #{@default_listen_port}.
-
-  Deliberately not 0 (which `Follower` reads as "pick any"): an ephemeral port is right for a test
-  and useless in production, where peers must be told where to connect.
-  """
+  # The port the follower listener binds. `:replication_listen_port`, default `@default_listen_port` (9100).
+  #
+  # Deliberately not 0 (which `Follower` reads as "pick any"): an ephemeral port is right for a test
+  # and useless in production, where peers must be told where to connect.
   @spec listen_port() :: :inet.port_number()
-  def listen_port do
+  defp listen_port do
     Application.get_env(:fathom, :replication_listen_port, @default_listen_port)
   end
 

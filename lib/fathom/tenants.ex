@@ -379,13 +379,11 @@ defmodule Fathom.Tenants do
   @spec suspended?(String.t()) :: boolean()
   def suspended?(shard_id), do: Suspensions.suspended?(shard_id)
 
-  @doc """
-  Broadcasts a suspend (`suspended: true`) or resume (`false`) fleet-wide: updates THIS node's
-  suspension gate immediately, then pushes over Oban's notifier so every other node converges (a
-  down node catches up on the periodic reconcile). Best-effort. See `Fathom.Tenants.Suspensions`.
-  """
+  # Broadcasts a suspend (`suspended: true`) or resume (`false`) fleet-wide: updates THIS node's
+  # suspension gate immediately, then pushes over Oban's notifier so every other node converges (a
+  # down node catches up on the periodic reconcile). Best-effort. See `Fathom.Tenants.Suspensions`.
   @spec broadcast_suspension(String.t(), boolean()) :: :ok
-  def broadcast_suspension(shard_id, suspended?) do
+  defp broadcast_suspension(shard_id, suspended?) do
     if suspended?, do: Suspensions.put(shard_id), else: Suspensions.remove(shard_id)
 
     Oban.Notifier.notify(Oban, Suspensions.channel(), %{shard_id: shard_id, suspended: suspended?})
@@ -397,15 +395,13 @@ defmodule Fathom.Tenants do
     :exit, _ -> :ok
   end
 
-  @doc """
-  Announces `shard_id`'s deletion fleet-wide: records it in THIS node's tombstone set
-  immediately (so re-mint is blocked the instant a delete starts) and pushes it over Oban's
-  LISTEN/NOTIFY so every other node tombstones it and erases its A2 replica. Best-effort
-  — a node that's down misses the push and converges on the periodic tombstone refresh. See
-  `Fathom.Tenants.Tombstones`.
-  """
+  # Announces `shard_id`'s deletion fleet-wide: records it in THIS node's tombstone set
+  # immediately (so re-mint is blocked the instant a delete starts) and pushes it over Oban's
+  # LISTEN/NOTIFY so every other node tombstones it and erases its A2 replica. Best-effort
+  # — a node that's down misses the push and converges on the periodic tombstone refresh. See
+  # `Fathom.Tenants.Tombstones`.
   @spec broadcast_deleted(String.t()) :: :ok
-  def broadcast_deleted(shard_id) do
+  defp broadcast_deleted(shard_id) do
     Tombstones.put(shard_id)
     Oban.Notifier.notify(Oban, Tombstones.channel(), %{shard_id: shard_id})
     :ok

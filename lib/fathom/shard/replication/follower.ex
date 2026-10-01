@@ -1073,9 +1073,8 @@ defmodule Fathom.Shard.Replication.Follower do
   @spec discard_seeds(map()) :: map()
   def discard_seeds(seeds), do: Enum.reduce(Map.keys(seeds), seeds, &discard_seed(&2, &1))
 
-  @doc false
   @spec discard_seed(map(), String.t()) :: map()
-  def discard_seed(seeds, shard_id) do
+  defp discard_seed(seeds, shard_id) do
     case Map.pop(seeds, shard_id) do
       {nil, seeds} ->
         seeds

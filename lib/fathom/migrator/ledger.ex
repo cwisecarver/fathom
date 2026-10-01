@@ -138,9 +138,9 @@ defmodule Fathom.Migrator.Ledger do
     for {v, f} <- named, v > label, n <- f.names, MapSet.member?(present, n), do: {v, n}
   end
 
-  @doc "The `(app, name)` set and row count of the shard's ledger; an absent table is empty."
+  # The `(app, name)` set and row count of the shard's ledger; an absent table is empty.
   @spec shard_ledger(reference()) :: {MapSet.t(name), non_neg_integer()}
-  def shard_ledger(conn) do
+  defp shard_ledger(conn) do
     case Connection.query(
            conn,
            "SELECT name FROM sqlite_master WHERE type='table' AND name='django_migrations'",
@@ -157,12 +157,10 @@ defmodule Fathom.Migrator.Ledger do
     end
   end
 
-  @doc """
-  `%{version => %{names, count}}` for every non-yanked release. Yanked releases are left out: the
-  chain may skip them (2026-09-29 #16), so their names are neither required nor forbidden.
-  """
+  # `%{version => %{names, count}}` for every non-yanked release. Yanked releases are left out: the
+  # chain may skip them (2026-09-29 #16), so their names are neither required nor forbidden.
   @spec release_facts() :: map()
-  def release_facts do
+  defp release_facts do
     releases = Repo.all(from(r in Release, where: not r.yanked, order_by: [asc: r.version]))
 
     Map.new(releases, fn r ->

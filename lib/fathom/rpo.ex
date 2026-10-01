@@ -356,14 +356,12 @@ defmodule Fathom.Rpo do
 
   # --- process-crash case (disk intact ⇒ zero loss) ------------------------
 
-  @doc """
-  The process-crash case: with the periodic + idle flush disabled (nothing
-  reaches storage), write N rows, hard-kill the coordinator, re-open on the same
-  local file, and count survivors. `synchronous=FULL` ⇒ zero loss. The stored
-  object stays empty, so survival can only come from the local WAL.
-  """
+  # The process-crash case: with the periodic + idle flush disabled (nothing
+  # reaches storage), write N rows, hard-kill the coordinator, re-open on the same
+  # local file, and count survivors. `synchronous=FULL` ⇒ zero loss. The stored
+  # object stays empty, so survival can only come from the local WAL.
   @spec process_kill(pos_integer()) :: map()
-  def process_kill(n \\ 200) do
+  defp process_kill(n \\ 200) do
     prev_flush = Application.get_env(:fathom, :shard_flush_interval_ms)
     Application.put_env(:fathom, :shard_flush_interval_ms, 0)
 

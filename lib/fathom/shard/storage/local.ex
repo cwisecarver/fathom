@@ -159,7 +159,7 @@ defmodule Fathom.Shard.Storage.Local do
   # Not gated on the object existing, unlike `object_position/1`. A lineage outliving its object is
   # not a lie about bytes — it is a true statement about how many owners this shard has had, and
   # keeping it is what stops a re-created shard reusing numbers a replica still remembers.
-  def object_lineage(shard_id) do
+  defp object_lineage(shard_id) do
     case File.read(lineage_path(shard_id)) do
       {:ok, raw} ->
         case Integer.parse(String.trim(raw)) do

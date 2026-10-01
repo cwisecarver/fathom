@@ -12,7 +12,6 @@ defmodule Fathom.RestoreDrillLedgerTest do
   """
   use Fathom.DataCase, async: false
 
-  alias Fathom.Migrator
   alias Fathom.Migrator.Release
   alias Fathom.RestoreDrillJob
   alias Fathom.Shard.Connection

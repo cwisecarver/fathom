@@ -19,9 +19,6 @@ defmodule Fathom.ApiKeys.ApiKey do
     timestamps(type: :utc_datetime_usec)
   end
 
-  @doc "The valid scopes, least- to most-privileged."
-  def scopes, do: @scopes
-
   def changeset(key, attrs) do
     key
     |> cast(attrs, [:name, :scope, :token_hash, :revoked_at])

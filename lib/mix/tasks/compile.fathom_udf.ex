@@ -134,13 +134,11 @@ defmodule Mix.Tasks.Compile.FathomUdf do
     end
   end
 
-  @doc """
-  The platform's shared-library name for the crate.
-
-  macOS produces `.dylib`, Linux `.so`. The name is resolved rather than guessed at load time so
-  `Fathom.Shard.Extension` and this task cannot disagree about it.
-  """
-  def artifact_name do
+  # The platform's shared-library name for the crate.
+  #
+  # macOS produces `.dylib`, Linux `.so`. The name is resolved rather than guessed at load time so
+  # `Fathom.Shard.Extension` and this task cannot disagree about it.
+  defp artifact_name do
     case :os.type() do
       {:unix, :darwin} -> "libfathom_udf.dylib"
       {:win32, _} -> "fathom_udf.dll"
