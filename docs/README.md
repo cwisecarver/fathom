@@ -9,13 +9,10 @@ component map) is [`../AGENTS.md`](../AGENTS.md).** This folder holds the deeper
 references, the design plans, the benchmark plans, the operational runbooks, and the run reports.
 Each doc says whether it describes **built** behavior or a **plan**.
 
-**The plan docs here are records of reasoning, not work lists** (re-checked 2026-08-26). Every one
-has been delivered except [`a2-bare-metal-plan.md`](a2-bare-metal-plan.md), which is blocked on
-hardware. The status record is the per-audit `.progress.md` log, kept with each report in the
-gitignored `audits/` directory (audits are never committed — see AGENTS.md) — 392 findings across
-15 reviews, all closed except the two from the 2026-08-24 pass:
-**#24** (needs a rig measurement) and **#25** (partially shipped; the autonomous-repair half needs an
-S3 budget and a precedence ruling).
+**The plan docs here are records of reasoning, not work lists.** Every one has been delivered
+except [`a2-bare-metal-plan.md`](a2-bare-metal-plan.md), which is blocked on hardware. Open-finding
+status lives in the per-audit `.progress.md` logs in the gitignored `audits/` directory (audits are
+never committed — see AGENTS.md); check there rather than trusting a count copied into this file.
 
 **New here?** The root [`../README.md`](../README.md) has the project overview and a two-path
 "Getting started" (Docker eval stack + native dev); [`../CONTRIBUTING.md`](../CONTRIBUTING.md) is the
@@ -28,6 +25,9 @@ set-up-and-land-a-change guide for developers.
   finding that motivated it, the fix that was tried and was wrong, the measurement that settled an
   argument, the trap that will bite the next person. **Read the entry before changing a component.**
   AGENTS.md § Project is now the map; this is the why.
+- **[agent-field-notes.md](agent-field-notes.md)** — the measured incidents behind AGENTS.md's
+  benchmarking, gate and typing rules (moved out of AGENTS.md so every session doesn't pay for them).
+  Read the matching section before relaxing one of those rules.
 
 ## How it works — built-engine stories
 
@@ -119,8 +119,8 @@ what actually shipped (some plan assumptions were superseded).
   ≤256-tenant replication ceiling belongs to fathom or to the rig. Blocked on hardware.
 - **[a2-quorum-replication.md](a2-quorum-replication.md)** — Phase 2 A2 in full: replicate-before-ack
   (the Waterpark quorum shape) as the answer to node-loss RPO, and why CRDT/OT cannot work over
-  opaque tenant SQL. **Built and on `main`, off by default** (`REPLICATION_ENABLED` /
-  `REPLICATION_LISTEN`). The doc's stated blocker — "exqlite exposes no WAL-frame API" — was
+  opaque tenant SQL. **Built and on by default in prod since 2026-08-29** (off in
+  dev/test; `REPLICATION_ENABLED` / `REPLICATION_LISTEN` override it). The doc's stated blocker — "exqlite exposes no WAL-frame API" — was
   **disproved 2026-08-09**: a loadable extension gets a live `sqlite3*` and `sqlite3_wal_hook` is in
   the extension pointer table, so exqlite's surface was never the boundary. Current scale limit and
   the fixed OOM: [reviews/a2-feedback-loop-fixed-2026-08-17.md](reviews/a2-feedback-loop-fixed-2026-08-17.md).
@@ -247,4 +247,4 @@ noted).
 
 *New a subsystem doc? Match the shape of the built-engine stories (problem → constraint → mechanism
 → safety → the honest limit → one-line summary), ground every claim in the code, and link it from
-its `AGENTS.md` bullet.*
+its row in the `AGENTS.md` § Project table.*
