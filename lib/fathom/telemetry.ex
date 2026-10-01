@@ -187,11 +187,15 @@ defmodule Fathom.Telemetry do
         description:
           "Checkouts that queued (held + retried) at the TAIL of a crashed owner's lease-TTL window instead of erroring (#21) — a burst per hard node crash is expected. The RTO floor is :shard_lease_ttl_ms + steal_margin; this only converts the last :crash_failover_hold_ms of it to latency"
       ),
-      summary("fathom.shards.held_retry.wait_ms",
+      # DISTRIBUTION, not summary: TelemetryMetricsPrometheus.Core has no summary type and DROPS
+      # one at boot with only a warning, so as a summary this never reached /metrics or the
+      # dashboard (admin walkthrough 2026-09-30). Same for clock_skew below.
+      distribution("fathom.shards.held_retry.wait_ms",
         event_name: [:fathom, :shards, :held_retry],
         measurement: :wait_ms,
         unit: :millisecond,
         tags: [:aimed],
+        reporter_options: [buckets: [10, 50, 100, 250, 500, 1000, 2500, 5000, 10_000, 30_000]],
         description:
           "How long a held checkout slept before retrying, split by whether the wait was AIMED at a known steal instant (#23) or a blind backoff step. aimed=false dominating a crash failover means the backend stopped supplying the instant and the takeover is back to polling — ~8 retries and ~17 S3 requests per shard instead of one or two"
       ),
@@ -217,10 +221,14 @@ defmodule Fathom.Telemetry do
         description:
           "Control-plane / admin audit events by action + outcome (#9) — delete / restore / export / token ops"
       ),
-      summary("fathom.shard.clock_skew.skew_ms",
+      # Signed: negative means this node's clock is BEHIND the store's, so the buckets are too.
+      distribution("fathom.shard.clock_skew.skew_ms",
         event_name: [:fathom, :shard, :clock_skew],
         measurement: :skew_ms,
         unit: :millisecond,
+        reporter_options: [
+          buckets: [-10_000, -5000, -1000, -250, -50, 0, 50, 250, 1000, 5000, 10_000]
+        ],
         description:
           "Local clock minus S3's response Date at a steal-liveness check (#13) — watch for skew that would drive wrongful steals"
       ),

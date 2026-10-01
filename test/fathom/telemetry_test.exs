@@ -118,6 +118,34 @@ defmodule Fathom.TelemetryTest do
     assert [:fathom, :shards, :active] in names
   end
 
+  # Admin walkthrough 2026-09-30: `held_retry.wait_ms` and `clock_skew.skew_ms` were `summary`
+  # metrics, a type TelemetryMetricsPrometheus.Core does not support — it DROPS them at boot with
+  # only a warning, so neither ever reached /metrics or the dashboard. This runs the real reporter
+  # over metrics/0 and scrapes it, so any metric the reporter would silently drop fails here.
+  # Pre-fix both series are absent from the scrape.
+  test "every metric in metrics/0 survives the Prometheus reporter and scrapes" do
+    refute Enum.any?(Fathom.Telemetry.metrics(), &match?(%Telemetry.Metrics.Summary{}, &1)),
+           "a summary metric: the Prometheus reporter drops these at boot"
+
+    name = :"fathom_metrics_test_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {TelemetryMetricsPrometheus.Core, metrics: Fathom.Telemetry.metrics(), name: name}
+    )
+
+    # The reporter attaches its handlers in a `{:setup, …}` message AFTER start returns; an event
+    # fired before that is never seen, and the scrape reads empty for a reason unrelated to the
+    # metric types. Sync on the registry first.
+    _ = :sys.get_state(name)
+
+    :telemetry.execute([:fathom, :shards, :held_retry], %{wait_ms: 120}, %{aimed: true})
+    :telemetry.execute([:fathom, :shard, :clock_skew], %{skew_ms: -300}, %{})
+
+    scrape = TelemetryMetricsPrometheus.Core.scrape(name)
+    assert scrape =~ "fathom_shards_held_retry_wait_ms_bucket"
+    assert scrape =~ "fathom_shard_clock_skew_skew_ms_bucket"
+  end
+
   # Review #30: the observability package (deploy/observability/alert-rules.yml) references these
   # page-worthy signals. Each already emitted telemetry but wasn't exported to Prometheus, so an
   # adopter's alerting was blind to them. Pin that every alert-rule metric stays defined — removing
