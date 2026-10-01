@@ -203,7 +203,9 @@ query work sees a smaller-but-still-real gain. Still gated off pending the A2 bl
 
 ## References
 
-- `reviews/dsv41f.perf.md` — the headline finding this spike acts on.
+- The dsv41f performance review (2026-09-16) — the headline finding this spike acts on. It is a
+  local working file (`audits/dsv41f.perf.md`, gitignored like every review report; see AGENTS.md),
+  so it is not in the repository.
 - `Fathom.Bench` `hrana_open_rt_us` moduledoc — the corrected attribution + the `-shm` numbers.
 - expert review 2026-08-26 #11 — the prior rejection this re-tests.
 - expert review 2026-07-24 #29 — the ~2 MiB per-connection page-cache bound (the density cost).
