@@ -2097,7 +2097,13 @@ defmodule Fathom.Shard do
         # Publish the busy count so the at-capacity eviction probe skips this shard while it serves
         # (expert review #14) — otherwise a long-lived held stream ages to the LRU front but can't be
         # evicted, starving admission. A best-effort hint, no-op unless eviction is enabled.
-        Fathom.Shards.Lru.record_conns(state.id, map_size(state.conns))
+        #
+        # Only on the 0 -> 1 EDGE (expert review 2026-10-01 perf #34): the hint's only reader,
+        # `Lru.busy?/1`, asks `count > 0`, so re-publishing on every grant to a busy shard wrote the
+        # same answer to the same ETS key once per stream for nothing.
+        if map_size(state.conns) == 1,
+          do: Fathom.Shards.Lru.record_conns(state.id, 1)
+
         {:ok, ref, state.path, state}
     end
   end
@@ -2177,7 +2183,8 @@ defmodule Fathom.Shard do
 
     # Update the busy count and re-stamp recency (#14): a just-released shard was recently used, so it
     # should not read as the LRU-coldest, and its lowered count lets the eviction probe consider it.
-    Fathom.Shards.Lru.record_conns(state.id, map_size(conns))
+    # The count only on the 1 -> 0 EDGE, the one change `Lru.busy?/1` can observe (perf #34).
+    if map_size(conns) == 0, do: Fathom.Shards.Lru.record_conns(state.id, 0)
     Fathom.Shards.Lru.touch(state.id)
 
     cond do

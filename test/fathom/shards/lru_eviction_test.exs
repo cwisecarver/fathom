@@ -197,6 +197,27 @@ defmodule Fathom.Shards.LruEvictionTest do
     refute Lru.busy?(id), "a released shard must publish as not-busy"
   end
 
+  # Expert review 2026-10-01 perf #34: the count is now published only on the 0 <-> 1 edges. The
+  # risky case is the MIDDLE: with two holders, releasing one must leave the shard busy, and only
+  # the last release may clear it.
+  test "busy stays set while ANY holder remains and clears only on the last release" do
+    Application.put_env(:fathom, :max_open_shards, Registry.count(Fathom.ShardRegistry) + 100)
+    id = uniq()
+
+    {:ok, pid, ref1, _path} = Shards.checkout(id)
+    {:ok, ^pid, ref2, _path} = Shards.checkout(id)
+    _ = :sys.get_state(pid)
+    assert Lru.busy?(id)
+
+    Fathom.Shard.checkin(pid, ref1)
+    _ = :sys.get_state(pid)
+    assert Lru.busy?(id), "releasing one of two holders cleared busy while a stream still serves"
+
+    Fathom.Shard.checkin(pid, ref2)
+    _ = :sys.get_state(pid)
+    refute Lru.busy?(id), "the last release must clear busy"
+  end
+
   test "with :evict_idle_at_capacity false (hard cap), an idle shard is not evicted" do
     Application.put_env(:fathom, :evict_idle_at_capacity, false)
     idle = open_idle(uniq())
