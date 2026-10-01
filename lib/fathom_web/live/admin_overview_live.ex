@@ -25,6 +25,8 @@ defmodule FathomWeb.AdminOverviewLive do
       # timer, so the directory-scale reads behind Fleet.overview/0 multiplied by open tabs —
       # worst exactly during an incident, when several operators have the dashboard up.
       Phoenix.PubSub.subscribe(Fathom.PubSub, FleetCollector.topic())
+      # The collector polls only while a viewer is registered (expert review 2026-10-01 perf #20).
+      FleetCollector.watch()
     end
 
     snap = MetricsCollector.snapshot()
