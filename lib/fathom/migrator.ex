@@ -896,6 +896,9 @@ defmodule Fathom.Migrator do
         }
   def status do
     head = head()
+    # Read ONCE (expert review 2026-10-01 perf #29): both fields below derive from it, and each
+    # call is a full release fetch.
+    review = pending_review()
     laggards = Directory.count_laggards(head)
     above_head = Directory.count_above_head(head)
     rate = rollout_rate(head)
@@ -916,8 +919,8 @@ defmodule Fathom.Migrator do
       # `migration_controller_test` immediately, which is the API's own consumers telling you the
       # same thing: this is a published control-plane endpoint and a field changing type is a
       # break for anyone reading it. The legible form (#26) is additive, in `review_blocks`.
-      pending_review: Enum.map(pending_review(), & &1.version),
-      review_blocks: Enum.map(pending_review(), &review_block/1),
+      pending_review: Enum.map(review, & &1.version),
+      review_blocks: Enum.map(review, &review_block/1),
       rate_per_hour: rate,
       eta_seconds: eta_seconds(laggards, rate),
       stalled: stalled_count(),

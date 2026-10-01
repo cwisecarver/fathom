@@ -623,6 +623,34 @@ defmodule Fathom.DirectoryTest do
     end
   end
 
+  # Expert review 2026-10-01 perf #29. These three predicates ran as sequential scans of `shards`:
+  # the two stamp-drift counts on every `Migrator.status/0` (the CI deploy gate, polled), and the
+  # hourly `reclaim_stale_migrating/1`. Same technique as above (forbid seq scans), but the
+  # assertion names the PARTIAL index: with seq scans off the planner will happily walk a broad
+  # `status = 'active'` index over every active row, which reads "Index" and is still a full pass.
+  describe "control-plane counts are index-served (expert review 2026-10-01 perf #29)" do
+    for {label, index, sql} <- [
+          {"count_stamp_drift", "shards_active_stamp_drift_index",
+           "SELECT count(*) FROM shards s WHERE s.status = 'active' AND " <>
+             "s.last_verify_status IN ('schema_mismatch', 'ledger_mismatch')"},
+          {"stamp_drift_checked", "shards_active_verified_index",
+           "SELECT count(*) FROM shards s WHERE s.status = 'active' AND " <>
+             "s.last_verified_at IS NOT NULL"},
+          {"reclaim_stale_migrating", "shards_migrating_since_index",
+           "SELECT s.shard_id FROM shards s WHERE s.status = 'migrating' AND " <>
+             "s.migrating_since IS NOT NULL AND s.migrating_since < now()"}
+        ] do
+      test "#{label} is served by its partial index" do
+        Fathom.Repo.query!("SET LOCAL enable_seqscan = off")
+        %{rows: rows} = Fathom.Repo.query!("EXPLAIN " <> unquote(sql), [])
+        plan = rows |> List.flatten() |> Enum.join("\n")
+
+        assert plan =~ unquote(index),
+               "#{unquote(label)} is not served by #{unquote(index)}. Plan:\n#{plan}"
+      end
+    end
+  end
+
   describe "flush accounting (#28)" do
     test "record_flush_batch sets last_flushed_at and leaves last_active_at alone" do
       {:ok, row} = Directory.resolve("fa")
