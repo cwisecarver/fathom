@@ -180,7 +180,7 @@ defmodule Fathom.Migrator do
   a `requires_review` version (a captured data-migration held as a fleet-corruption risk) must
   not be replayed until an operator clears the flag (`approve_review/1`). `head/0` already
   ceilings the *automated* rollout below the lowest flagged version, but a DIRECT
-  `ShardMigration.run/enqueue_migration` takes an explicit target and would otherwise replay the
+  `ShardMigration.run/3` (or a hand-enqueued job) takes an explicit target and would otherwise replay the
   flagged DML at/above the floor. Returning `nil` here makes `ShardMigration.statement_chain/2`
   treat the version as unavailable, so that direct path errors (`{:unknown_version, v}`) with the
   shard left untouched — the same fail-closed behavior yanked already gets.
@@ -194,49 +194,14 @@ defmodule Fathom.Migrator do
   end
 
   @doc """
-  The replay-facing form of `statements/1`: `[{sql, args}]`, ready to bind.
-
-  Django sends parameterized SQL — its `INSERT INTO django_migrations … VALUES (?, ?, ?)` carries
-  the values separately — so replaying statement TEXT alone bound NULL and died on
-  `django_migrations.app NOT NULL`, aborting the copy. The values are BOUND, never substituted into
-  the SQL (see `Fathom.Migrator.Release`). A release captured before `statement_args` existed yields
-  empty args, which is exactly how it replayed before. Same gates as `statements/1`: `nil` for an
-  unreleased, yanked, or `requires_review` version.
-  """
-  @spec statement_pairs(pos_integer()) :: [{String.t(), [term()]}] | nil
-  def statement_pairs(version) do
-    case fetch_appliable(version) do
-      nil -> nil
-      release -> zip_args(release.statements, release.statement_args)
-    end
-  end
-
-  @doc """
-  A rollout chain step for `version`: `{statement_pairs, transform}`, or `nil` if the version is
-  unreleased / yanked / still `requires_review` (expert review 2026-08-01 #26).
-
-  Separate from `statement_pairs/1` rather than replacing it because the bench harness and several
-  tests build chains from statements alone; this is the shape `Migrator.ShardMigration` needs so a
-  version's per-shard transform travels with its DDL.
-  """
-  @spec statement_step(non_neg_integer()) :: {list(), String.t() | nil} | nil
-  def statement_step(version) do
-    case fetch_appliable(version) do
-      nil -> nil
-      release -> {zip_args(release.statements, release.statement_args), release.transform}
-    end
-  end
-
-  @doc """
-  `statement_step/1` for a whole rollout chain in ONE query: `%{version => {pairs, transform}}`.
+  A whole rollout chain in ONE query: `%{version => {pairs, transform}}`.
 
   Only appliable versions appear. A version that is unreleased, `yanked`, or still
-  `requires_review` is simply ABSENT from the map — the same gate `statement_step/1` expresses as
-  `nil`, so a caller walking the range in order still halts at the first unavailable version and
-  fails closed with `{:unknown_version, v}`.
+  `requires_review` is simply ABSENT from the map, so a caller walking the range in order still
+  halts at the first unavailable version and fails closed with `{:unknown_version, v}`.
 
-  Why this exists (expert review 2026-08-26 #22): `ShardMigration.statement_chain/2` looped
-  `Migrator.statement_step/1` over `(current + 1)..target`, and each call was its own
+  Why this exists (expert review 2026-08-26 #22): `ShardMigration.statement_chain/2` looped a
+  per-version lookup (the since-removed `statement_step/1`) over `(current + 1)..target`, and each call was its own
   `Repo.get_by(Release, ...)` selecting the whole row — `statements` (the migration's full DDL)
   and `statement_args` (jsonb) included. That is an N+1 over the largest rows in the control
   plane, paid PER SHARD, per rollout, while holding a `Fathom.Repo` connection from the
@@ -604,27 +569,6 @@ defmodule Fathom.Migrator do
     Repo.all(
       from(r in Release, where: r.requires_review and not r.yanked, order_by: [asc: r.version])
     )
-  end
-
-  @doc """
-  The `django_migrations` row count a shard stamped at `version` should carry — the bridge for the
-  restore drill's ledger check (`RestoreDrillJob`, the third leg of the three-place version stamp).
-
-  This is `Release.template_migration_count`, the template's `django_migrations` count when the
-  version was captured (expert review #32). Yanked is not excluded: a shard legitimately stamped at
-  a yanked version (post-revert) should still match that version's ledger count, and the drift is
-  what we want to detect either way.
-
-  Returns `:unknown` when there is no release row for the version (e.g. a born-empty shard at
-  version 0) or the row predates `template_migration_count` (nullable — pre-#32 releases). The
-  caller must NOT treat `:unknown` as a mismatch; there is nothing to compare against.
-  """
-  @spec expected_migration_count(integer()) :: {:ok, non_neg_integer()} | :unknown
-  def expected_migration_count(version) do
-    case Repo.get_by(Release, version: version) do
-      %{template_migration_count: c} when is_integer(c) -> {:ok, c}
-      _ -> :unknown
-    end
   end
 
   @doc """
@@ -1226,15 +1170,6 @@ defmodule Fathom.Migrator do
       {:ok, id} -> {:ok, id}
       :error -> {:error, :no_template}
     end
-  end
-
-  @doc "Enqueues a per-shard migration job to bring `shard_id` to `target`."
-  @spec enqueue_migration(String.t(), pos_integer()) ::
-          {:ok, Oban.Job.t()} | {:error, Ecto.Changeset.t()}
-  def enqueue_migration(shard_id, target) do
-    %{shard_id: shard_id, target: target}
-    |> ShardMigrationJob.new()
-    |> Oban.insert()
   end
 
   @doc """

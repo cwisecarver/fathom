@@ -125,16 +125,4 @@ defmodule Fathom.Shard.Storage.S3SentinelTest do
     assert S3EtagStore.meta_of(store, @data_key)[@sentinel_meta] == "1",
            "a form-rotation copy would strip the sentinel meta; the refresh must keep it"
   end
-
-  test "the follower treats a sentinel as absent (nothing to warm)" do
-    store = start_store(%{@lock_key => dead_lock()})
-    assert {:ok, _} = S3.acquire_lease(@shard, "b@node#inc2", 30_000)
-    assert S3EtagStore.meta_of(store, @data_key)[@sentinel_meta] == "1"
-
-    dest = Path.join(System.tmp_dir!(), "sentwarm_#{System.unique_integer([:positive])}.db")
-    on_exit(fn -> File.rm(dest) end)
-
-    assert {:ok, :absent} = S3.pull_if_changed(@shard, dest, nil)
-    refute File.exists?(dest)
-  end
 end

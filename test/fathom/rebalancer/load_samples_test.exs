@@ -53,9 +53,5 @@ defmodule Fathom.Rebalancer.LoadSamplesTest do
 
     assert length(LoadSamples.since(10_000)) == 1, "only the 5s-old sample is within 10s"
     assert length(LoadSamples.since(120_000)) == 2
-
-    {deleted, _} = LoadSamples.prune(30_000)
-    assert deleted == 1, "the 90s-old sample is pruned"
-    assert length(LoadSamples.since(120_000)) == 1
   end
 end

@@ -63,7 +63,7 @@ defmodule Fathom.Rebalancer.ReporterTest do
 
     # Clear window-1's rows so the assertion below can ONLY see what window 2 publishes —
     # otherwise window-1's positive sample masks a window-2 drop-to-0 (within the 60s read).
-    LoadSamples.prune(0)
+    Fathom.Repo.delete_all(Fathom.Rebalancer.LoadSample)
 
     # Simulate an evict + cold re-open: drop the row, then it re-accrues from 0 (curr < prev).
     ShardLoad.forget("reset_shard")

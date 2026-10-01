@@ -28,10 +28,7 @@ defmodule Fathom.Migrator.RetirementJob do
 
   @retention_seconds 7 * 24 * 60 * 60
 
-  @doc "Retention window (seconds) a retired version's storage object is kept before this job drops it."
-  @spec retention_seconds() :: pos_integer()
-  def retention_seconds, do: @retention_seconds
-
+  # Retention window (seconds) a retired version's storage object is kept before this job drops it.
   @doc """
   An Oban changeset scheduling `version`'s storage object for deletion after the retention window.
   The migration/revert cutover `Oban.insert`s this INSIDE its Postgres transaction (the retirement

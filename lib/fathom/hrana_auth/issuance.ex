@@ -28,10 +28,6 @@ defmodule Fathom.HranaAuth.Issuance do
     timestamps(type: :utc_datetime_usec)
   end
 
-  @doc "Valid scope claims: `rw` (full) and `ro` (read-only, the #24 `\"sc\"` claim)."
-  @spec scopes() :: [String.t()]
-  def scopes, do: @scopes
-
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(issuance, attrs) do
     issuance

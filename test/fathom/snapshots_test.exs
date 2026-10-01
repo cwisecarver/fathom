@@ -144,13 +144,27 @@ defmodule Fathom.SnapshotsTest do
     assert :ok = Task.await(restore, 5_000)
   end
 
+  # The production promotion path: download the snapshot, then the fenced
+  # `restore_snapshot_from_file/3`. (The by-id `restore_snapshot/3` this test first pinned had no
+  # production caller once restore moved here, and was removed 2026-10-01.)
+  defp restore_via_file(shard, snap, etag) do
+    tmp = Path.join(System.tmp_dir!(), "snaptest_#{System.unique_integer([:positive])}.db")
+
+    try do
+      {:ok, _} = Storage.pull_snapshot(shard, snap, tmp)
+      Storage.restore_snapshot_from_file(shard, tmp, etag)
+    after
+      File.rm(tmp)
+    end
+  end
+
   # Expert review 2026-07-18 #2: restore_snapshot was an UNCONDITIONAL copy, so a write that raced
   # in after Snapshots.restore's drain (a fresh checkout acquiring the freed lease and flushing)
   # was silently clobbered — the exact TOCTOU the fenced migration restore/3 already closed.
   # Snapshots.restore now captures the live etag at the lease-free instant and restores under an
   # If-Match fence. This pins the fenced primitive: a stale etag must abort with :superseded and
   # leave live untouched; the current etag restores.
-  test "restore_snapshot/3 is fenced: a stale etag aborts with :superseded and never clobbers live",
+  test "the snapshot restore is fenced: a stale etag aborts with :superseded and never clobbers live",
        %{shard: shard} do
     write!(shard, ["CREATE TABLE kv (v TEXT)", "INSERT INTO kv VALUES ('a')"])
     flush!(shard)
@@ -162,7 +176,7 @@ defmodule Fathom.SnapshotsTest do
     assert {:ok, live_etag} = Storage.object_etag(shard)
 
     # A stale etag stands in for "a writer flushed after I looked" — the restore must NOT clobber.
-    assert {:error, :superseded} = Storage.restore_snapshot(shard, snap, "stale-etag")
+    assert {:error, :superseded} = restore_via_file(shard, snap, "stale-etag")
 
     assert read_one(shard, "SELECT count(*) FROM kv") == [[2]],
            "a superseded restore must leave live untouched (still a + b)"
@@ -171,7 +185,7 @@ defmodule Fathom.SnapshotsTest do
     flush!(shard)
 
     # The live etag restores — the fenced happy path.
-    assert :ok = Storage.restore_snapshot(shard, snap, live_etag)
+    assert :ok = restore_via_file(shard, snap, live_etag)
 
     assert read_one(shard, "SELECT count(*) FROM kv") == [[1]],
            "the fenced restore with the live etag reverts to the snapshot (a only)"

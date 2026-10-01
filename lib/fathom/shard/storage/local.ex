@@ -233,34 +233,6 @@ defmodule Fathom.Shard.Storage.Local do
     end
   end
 
-  # A content hash stands in for S3's opaque etag: it changes iff the bytes change,
-  # which is exactly the freshness signal `pull_if_changed/3` needs. (S3's real 304
-  # skips the body; the Local double reads it to hash, which is fine on local disk.)
-  @impl true
-  def pull_if_changed(shard_id, local_path, etag) do
-    # The (removed) warm-follower revalidation loop called this for every cached shard on every poll, and it
-    # used to read AND fully hash the entire object just to conclude nothing changed — O(cached ×
-    # shard bytes) of disk read and hashing per poll, where the S3 backend does a bodiless 304
-    # (expert review 2026-07-24 #25).
-    case file_etag(remote_path(shard_id)) do
-      {:ok, current} when current == etag ->
-        {:ok, :unchanged}
-
-      {:ok, current} ->
-        # Atomic so a warm-cache rewrite can't be read half-old/half-new by a promotion (#24).
-        case Storage.atomic_copy(remote_path(shard_id), local_path) do
-          :ok -> {:ok, {:written, current}}
-          err -> err
-        end
-
-      {:error, :enoent} ->
-        {:ok, :absent}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
   # THE ONLY object hasher in this module, and the digest every fence in it compares.
   #
   # It computes SHA-256 by STREAMING the file rather than reading it whole into a binary (expert
@@ -402,16 +374,8 @@ defmodule Fathom.Shard.Storage.Local do
   end
 
   @impl true
-  def restore_snapshot(shard_id, snapshot_id) do
-    # Clear the position stamp, matching flush/2 / S3's PUT — a restore replaces the bytes (#20).
-    with :ok <- Storage.atomic_copy(snapshot_path(shard_id, snapshot_id), remote_path(shard_id)) do
-      rm_ok(position_path(shard_id))
-    end
-  end
-
-  @impl true
   def restore_snapshot_from_file(shard_id, local_path, expected_etag) do
-    # The promotion half of restore_snapshot/3 against caller-supplied bytes (expert review
+    # The fenced snapshot restore, against caller-supplied bytes (expert review
     # 2026-08-26 #25). Same mutex, same etag fence, same ordering: File.stat FIRST so a missing
     # source returns {:error, :enoent} before the etag comparison rather than the more alarming
     # :superseded. The caller owns local_path — this does NOT delete it.
@@ -431,45 +395,6 @@ defmodule Fathom.Shard.Storage.Local do
           true ->
             # Clear the position stamp on success (#20): a restore replaces the bytes.
             with :ok <- Storage.atomic_copy(local_path, remote_path(shard_id)),
-                 do: rm_ok(position_path(shard_id))
-        end
-      end
-    end)
-  catch
-    {:error, _} = err -> err
-  end
-
-  @impl true
-  def restore_snapshot(shard_id, snapshot_id, expected_etag) do
-    # Fenced snapshot restore (expert review 2026-07-18 #2): the snapshot counterpart of the
-    # fenced migration restore/3. Under the per-shard mutex so the read-compare-write is atomic —
-    # if live's content-hash etag no longer matches what the caller captured (a write raced in
-    # after the drain), abort with :superseded instead of clobbering it.
-    with_lock_mutex(shard_id, fn ->
-      # Streams both sides (#26): the old shape held the source body AND the live body as
-      # binaries simultaneously, inside the per-shard mutex. `File.stat/1` first so a missing
-      # source still returns {:error, :enoent} BEFORE the etag comparison, exactly as the
-      # `File.read` it replaces did — otherwise a missing source with a stale etag would report
-      # :superseded, which is a different and more alarming answer.
-      with {:ok, _} <- File.stat(snapshot_path(shard_id, snapshot_id)) do
-        current =
-          case file_etag(remote_path(shard_id)) do
-            {:ok, etag} -> etag
-            {:error, :enoent} -> nil
-            {:error, reason} -> throw({:error, reason})
-          end
-
-        cond do
-          expected_etag != current ->
-            {:error, :superseded}
-
-          true ->
-            # Clear the position stamp on success (#20): a restore replaces the bytes.
-            with :ok <-
-                   Storage.atomic_copy(
-                     snapshot_path(shard_id, snapshot_id),
-                     remote_path(shard_id)
-                   ),
                  do: rm_ok(position_path(shard_id))
         end
       end

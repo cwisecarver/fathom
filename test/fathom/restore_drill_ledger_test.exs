@@ -7,8 +7,8 @@ defmodule Fathom.RestoreDrillLedgerTest do
 
   These exercise `RestoreDrillJob.ledger_status_for_path/2` on REAL crafted SQLite files (a shard is a
   real file, never the Repo sandbox — AGENTS Testing), with the release registry in Postgres
-  (DataCase). The mapping version → expected count is `Migrator.Release.template_migration_count`,
-  looked up by `Migrator.expected_migration_count/1`.
+  (DataCase). Since 2026-10-01 the check is by NAME via `Fathom.Migrator.Ledger`, which also
+  reads `Migrator.Release.template_migration_count` for the absolute count.
   """
   use Fathom.DataCase, async: false
 
@@ -71,22 +71,6 @@ defmodule Fathom.RestoreDrillLedgerTest do
       template_migration_count: template_migration_count
     })
     |> Repo.insert!()
-  end
-
-  describe "expected_migration_count/1" do
-    test "returns the release's template_migration_count" do
-      release!(3, 7)
-      assert {:ok, 7} = Migrator.expected_migration_count(3)
-    end
-
-    test ":unknown when the version has no release row" do
-      assert :unknown = Migrator.expected_migration_count(99)
-    end
-
-    test ":unknown when the release predates template_migration_count (NULL)" do
-      release!(4, nil)
-      assert :unknown = Migrator.expected_migration_count(4)
-    end
   end
 
   describe "ledger_status_for_path/2" do

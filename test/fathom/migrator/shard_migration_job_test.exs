@@ -647,11 +647,6 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     assert {:ok, %{status: "migration_failed"}} = Directory.get(shard)
   end
 
-  test "enqueue_migration enqueues a unique-per-shard job", %{shard: shard} do
-    assert {:ok, _} = Migrator.enqueue_migration(shard, 2)
-    assert_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => shard, "target" => 2})
-  end
-
   # Finding #13: RevertJob must back up the live vN object and schedule its retirement, or the
   # <shard>@vN backup leaks (RetirementJob otherwise only drops the forward `from` version).
   test "revert backs up the live version and schedules its retirement", %{shard: shard} do

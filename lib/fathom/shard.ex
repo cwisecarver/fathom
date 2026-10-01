@@ -3767,9 +3767,6 @@ defmodule Fathom.Shard do
   @quarantine_kinds ["fenced", "forked", "corrupt"]
 
   @doc false
-  def quarantine_kinds, do: @quarantine_kinds
-
-  @doc false
   @spec quarantine_files(Path.t()) :: [Path.t()]
   def quarantine_files(dir \\ data_dir()) do
     for kind <- @quarantine_kinds, f <- Path.wildcard(Path.join(dir, "*.db.#{kind}.*")), do: f

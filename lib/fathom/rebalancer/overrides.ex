@@ -75,16 +75,6 @@ defmodule Fathom.Rebalancer.Overrides do
   @spec for_shard(String.t()) :: Override.t() | nil
   def for_shard(shard_id), do: Repo.get_by(Override, shard_id: canon(shard_id))
 
-  @doc "The set of shard_ids actively pinned to `node_key` (failed/reverted rows excluded)."
-  @spec pinned_to(String.t()) :: [String.t()]
-  def pinned_to(node_key) do
-    Repo.all(
-      from o in Override,
-        where: o.pinned_node == ^node_key and is_nil(o.failed_at),
-        select: o.shard_id
-    )
-  end
-
   # Canonicalize a shard_id (downcase) so every Overrides lookup/write agrees with the stored
   # canonical key (#15). An invalid id is passed through unchanged: pin's changeset then rejects
   # it, and a read simply misses — never a crash.

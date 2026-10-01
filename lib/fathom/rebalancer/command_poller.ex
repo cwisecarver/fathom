@@ -51,10 +51,6 @@ defmodule Fathom.Rebalancer.CommandPoller do
   # killed mid-flight; only a genuinely wedged command hits it (finding #11).
   @task_shutdown_grace_ms 35_000
 
-  @doc "Whether this node acts on handoff commands (`:command_poller`, default off)."
-  @spec enabled?() :: boolean()
-  def enabled?, do: Application.get_env(:fathom, :command_poller, false) == true
-
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 

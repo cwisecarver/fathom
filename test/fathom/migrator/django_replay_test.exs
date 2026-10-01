@@ -74,7 +74,14 @@ defmodule Fathom.Migrator.DjangoReplayTest do
     :ok
   end
 
-  defp pairs(v), do: Migrator.statement_pairs(v.version)
+  # The bound pairs the rollout replays for `v` (`Migrator.statement_steps/1`; the per-version
+  # `statement_pairs/1` wrapper had no caller outside tests and was removed 2026-10-01).
+  defp pairs(v) do
+    case Map.get(Migrator.statement_steps([v.version]), v.version) do
+      {pairs, _transform} -> pairs
+      nil -> nil
+    end
+  end
 
   defp query!(path, sql) do
     {:ok, conn} = Connection.open(path)

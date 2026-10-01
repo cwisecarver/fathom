@@ -1306,26 +1306,6 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
-  # Conditional GET with `If-None-Match: <etag>` — the warm-standby freshness check. A
-  # `304` means the cached copy still equals the current object (no body transferred);
-  # a `200` carries the fresh bytes; a `404` is a brand-new shard. A `nil` etag omits
-  # the header, so it's an unconditional GET that captures the current etag.
-  @impl true
-  def pull_if_changed(shard_id, local_path, etag) do
-    headers = if etag, do: [{"if-none-match", etag}], else: []
-
-    # Streamed + verified like pull/2 (expert reviews #20/#37); a 304 transfers no body.
-    case download(object_path(shard_id), local_path, headers, allow_304: true) do
-      {:ok, new_etag} -> {:ok, {:written, new_etag}}
-      :unchanged -> {:ok, :unchanged}
-      :absent -> {:ok, :absent}
-      # A brand-new sentinel (round-2 #7) is nothing to warm: the follower treats
-      # it as absent and drops any stale cache entry.
-      {:sentinel, _etag} -> {:ok, :absent}
-      {:error, _} = error -> error
-    end
-  end
-
   # --- versioned copies (blue/green migration) ---
 
   # Refuse a server-side copy whose SOURCE is a steal sentinel (expert review 2026-08-01 #25).
@@ -1496,11 +1476,6 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   @impl true
-  def restore_snapshot(shard_id, snapshot_id) do
-    copy_unless_sentinel_source(snapshot_key(shard_id, snapshot_id), db_key(shard_id))
-  end
-
-  @impl true
   def pull_snapshot(shard_id, snapshot_id, local_path) do
     case download(url_path(snapshot_key(shard_id, snapshot_id)), local_path) do
       {:ok, etag} -> {:ok, etag}
@@ -1514,7 +1489,7 @@ defmodule Fathom.Shard.Storage.S3 do
 
   @impl true
   def restore_snapshot_from_file(shard_id, local_path, expected_etag) do
-    # The promotion half of restore_snapshot/3, split out so a caller that already holds the
+    # The fenced snapshot restore. Split out (when it was the promotion half of a by-id restore) so a caller that already holds the
     # snapshot's bytes does not re-download them (expert review 2026-08-26 #25). Identical fence:
     # flush/3 conditional-PUTs with If-Match on the live etag the caller captured, so a writer that
     # raced in after the drain aborts the restore with :superseded rather than being clobbered.
@@ -1523,34 +1498,6 @@ defmodule Fathom.Shard.Storage.S3 do
     case flush(shard_id, local_path, expected_etag) do
       {:ok, _new_etag, _carried} -> :ok
       {:error, _} = error -> error
-    end
-  end
-
-  @impl true
-  def restore_snapshot(shard_id, snapshot_id, expected_etag) do
-    # Fenced snapshot restore (expert review 2026-07-18 #2): the snapshot counterpart of the fenced
-    # migration restore/3. S3 can't carry an If-Match on a CopyObject DESTINATION, so mirror the
-    # forward flush: download the snapshot bytes to a temp, then conditional-PUT them to live via
-    # flush/3 (If-Match the live etag the caller captured). A 412 → :superseded aborts without
-    # clobbering a writer that raced in after the drain.
-    tmp = restore_temp(shard_id, snapshot_id)
-
-    try do
-      case download(url_path(snapshot_key(shard_id, snapshot_id)), tmp) do
-        {:ok, _etag} ->
-          restore_snapshot_from_file(shard_id, tmp, expected_etag)
-
-        :absent ->
-          {:error, :snapshot_absent}
-
-        {:sentinel, _etag} ->
-          {:error, :snapshot_absent}
-
-        {:error, _} = error ->
-          error
-      end
-    after
-      File.rm(tmp)
     end
   end
 

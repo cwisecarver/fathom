@@ -158,35 +158,6 @@ defmodule Fathom.Test.StorageContract do
         end
       end
 
-      describe "#{inspect(unquote(backend))} — pull_if_changed/3 (warm-standby freshness)" do
-        test "an unchanged object is :unchanged with no byte transfer" do
-          id = sid("warm")
-          {:ok, etag, _} = @backend.flush(id, tmp_file("body"), nil)
-          dest = dest_path()
-
-          assert {:ok, :unchanged} = @backend.pull_if_changed(id, dest, etag)
-
-          refute File.exists?(dest),
-                 ":unchanged means the caller's existing copy is current — nothing is written"
-        end
-
-        test "a changed object writes fresh bytes and returns the new etag" do
-          id = sid("moved")
-          {:ok, etag1, _} = @backend.flush(id, tmp_file("old"), nil)
-          {:ok, _, _} = @backend.flush(id, tmp_file("new"), etag1)
-          dest = dest_path()
-
-          assert {:ok, {:written, _new_etag}} = @backend.pull_if_changed(id, dest, etag1)
-          assert File.read!(dest) == "new"
-        end
-
-        test "an absent object is :absent, and writes nothing" do
-          dest = dest_path()
-          assert {:ok, :absent} = @backend.pull_if_changed(sid("nothing"), dest, nil)
-          refute File.exists?(dest)
-        end
-      end
-
       describe "#{inspect(unquote(backend))} — the lease lifecycle" do
         test "free → acquire → held → release → free" do
           id = sid("lease")
@@ -290,13 +261,20 @@ defmodule Fathom.Test.StorageContract do
           assert stored_body(id) == "v1"
         end
 
-        test "snapshot then restore_snapshot round-trips" do
+        test "snapshot, pull it back, then a fenced restore_snapshot_from_file round-trips" do
           id = sid("snapshotted")
           {:ok, etag1, _} = @backend.flush(id, tmp_file("before"), nil)
           assert :ok = @backend.snapshot(id, "s1")
 
-          {:ok, _, _} = @backend.flush(id, tmp_file("after"), etag1)
-          assert :ok = @backend.restore_snapshot(id, "s1")
+          {:ok, etag2, _} = @backend.flush(id, tmp_file("after"), etag1)
+          snap = dest_path()
+          assert {:ok, _} = @backend.pull_snapshot(id, "s1", snap)
+
+          # The fence: a stale expected etag must refuse and leave live alone.
+          assert {:error, :superseded} = @backend.restore_snapshot_from_file(id, snap, etag1)
+          assert stored_body(id) == "after"
+
+          assert :ok = @backend.restore_snapshot_from_file(id, snap, etag2)
           assert stored_body(id) == "before"
         end
       end

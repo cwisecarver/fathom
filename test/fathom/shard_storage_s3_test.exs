@@ -266,55 +266,6 @@ defmodule Fathom.ShardStorageS3Test do
              "object's identity doesn't depend on how it happened to be stored"
   end
 
-  # ── conditional pull (warm-standby freshness) ──
-
-  test "pull_if_changed: nil etag writes; matching etag is a 304; stale etag re-pulls",
-       %{shard: shard} do
-    src = tmp_path("#{shard}-src")
-    dst = tmp_path("#{shard}-dst")
-    File.write!(src, "v1\n")
-    assert :ok = S3.flush(shard, src)
-
-    # nil etag ⇒ unconditional GET, writes and captures the current etag.
-    assert {:ok, {:written, etag1}} = S3.pull_if_changed(shard, dst, nil)
-    assert is_binary(etag1)
-    assert File.read!(dst) == "v1\n"
-
-    # Same etag ⇒ If-None-Match matches ⇒ 304, no byte written.
-    File.rm!(dst)
-    assert {:ok, :unchanged} = S3.pull_if_changed(shard, dst, etag1)
-    refute File.exists?(dst)
-
-    # A new flush moves the etag; the stale etag re-pulls the fresh bytes.
-    File.write!(src, "v2\n")
-    assert :ok = S3.flush(shard, src)
-    assert {:ok, {:written, etag2}} = S3.pull_if_changed(shard, dst, etag1)
-    assert etag2 != etag1
-    assert File.read!(dst) == "v2\n"
-  end
-
-  # This test failed ONCE in a full `--include s3` run (2026-07-25) and never reproduced across
-  # ~10 further full runs and 16 seed-swept runs. It was not root-caused. The most plausible
-  # mechanism was cross-run shard-id collision against a persistent bucket, which the run-token in
-  # `setup` now makes impossible — but that is a removed HAZARD, not a proven fix, so the
-  # assertions carry what they actually saw. If this fires again the message alone should identify
-  # whether an object was really there, and whose.
-  test "pull_if_changed on a missing object returns :absent", %{shard: shard} = ctx do
-    dst = tmp_path("#{shard}-dst")
-
-    first = S3.pull_if_changed(shard, dst, nil)
-
-    assert {:ok, :absent} = first,
-           "expected no object at #{@prefix}#{shard}.db, got #{inspect(first)}. " <>
-             "If this is {:ok, {:written, _}} the bucket held a stale object for this id — " <>
-             "check for a leaked key from an earlier run (run_token=#{ctx.run_token})."
-
-    stale = S3.pull_if_changed(shard, dst, "\"stale\"")
-    assert {:ok, :absent} = stale, "a stale etag against a missing object: got #{inspect(stale)}"
-
-    refute File.exists?(dst), "a pull of a missing object must write no local file"
-  end
-
   # ── lease ──
 
   test "acquire on a fresh shard returns epoch 1; a live lease blocks other owners",
@@ -559,7 +510,9 @@ defmodule Fathom.ShardStorageS3Test do
 
   # Point-in-time snapshots (expert review 2026-07-14 #12): server-side copy to/from
   # `<shard>@snap-<id>`, listed via ListObjectsV2 over the snapshot prefix.
-  test "snapshot + restore_snapshot round-trip; list and drop", %{shard: shard} do
+  test "snapshot + pull_snapshot + restore_snapshot_from_file round-trip; list and drop", %{
+    shard: shard
+  } do
     v1 = tmp_path("#{shard}-v1")
     File.write!(v1, "v1")
     assert :ok = S3.flush(shard, v1)
@@ -572,7 +525,10 @@ defmodule Fathom.ShardStorageS3Test do
     assert {:ok, snaps} = S3.list_snapshots(shard)
     assert Enum.any?(snaps, &(&1.id == "test1" and &1.bytes == 2))
 
-    assert :ok = S3.restore_snapshot(shard, "test1")
+    snap = tmp_path("#{shard}-snap")
+    assert {:ok, _} = S3.pull_snapshot(shard, "test1", snap)
+    {:ok, live_etag} = S3.object_etag(shard)
+    assert :ok = S3.restore_snapshot_from_file(shard, snap, live_etag)
     dst = tmp_path("#{shard}-dst")
     assert {:ok, _} = S3.pull(shard, dst)
     assert File.read!(dst) == "v1"

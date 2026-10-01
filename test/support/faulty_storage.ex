@@ -202,22 +202,6 @@ defmodule Fathom.Test.FaultyStorage do
   end
 
   @impl true
-  def pull_if_changed(shard_id, local_path, etag) do
-    delay()
-
-    if fault() == :pull do
-      {:error, :s3_unreachable}
-    else
-      result = Local.pull_if_changed(shard_id, local_path, etag)
-      # run_before(:promote) fires between a 304 and the caller's warm-cache copy,
-      # exercising the promotion TOCTOU (#13): the follower swaps fresher bytes into
-      # the cache path after the freshness check validated the older etag.
-      if result == {:ok, :unchanged}, do: run_before(:promote)
-      result
-    end
-  end
-
-  @impl true
   def read_heartbeat(owner) do
     # `:faulty_before {:read_heartbeat, fun}` fires here handed the owner, so a test can block or
     # observe the read IN THE PROCESS THAT PERFORMS IT — which is how the previous-incarnation
@@ -529,22 +513,10 @@ defmodule Fathom.Test.FaultyStorage do
   end
 
   @impl true
-  def restore_snapshot(shard_id, snapshot_id), do: Local.restore_snapshot(shard_id, snapshot_id)
-
-  @impl true
-  def restore_snapshot(shard_id, snapshot_id, expected_etag) do
-    # `:restore_snapshot` fires at the moment the PROMOTION begins — after `Fathom.Snapshots`
-    # has already read the snapshot's `PRAGMA user_version` to gate the restore. On BOTH fenced
-    # clauses, deliberately: it is the hook that lets a test mutate the stored snapshot in exactly
-    # the window expert review 2026-08-26 #25 is about, and it has to fire at the same point in the
-    # pre-fix shape (this clause, which re-reads the snapshot object) and the post-fix one (below,
-    # which promotes the already-verified bytes) or the test would not discriminate.
-    run_before(:restore_snapshot, shard_id)
-    Local.restore_snapshot(shard_id, snapshot_id, expected_etag)
-  end
-
-  @impl true
   def restore_snapshot_from_file(shard_id, local_path, expected_etag) do
+    # `:restore_snapshot` fires at the moment the PROMOTION begins — after `Fathom.Snapshots` has
+    # already read the snapshot's `PRAGMA user_version` to gate the restore — so a test can mutate
+    # the stored snapshot in exactly the window expert review 2026-08-26 #25 is about.
     run_before(:restore_snapshot, shard_id)
     Local.restore_snapshot_from_file(shard_id, local_path, expected_etag)
   end

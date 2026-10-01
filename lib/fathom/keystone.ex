@@ -71,10 +71,6 @@ defmodule Fathom.Keystone do
   @spec tables() :: [String.t()]
   def tables, do: @tables
 
-  @doc "Default number of fuzzed rows per table when `:rows` is not given."
-  @spec default_rows() :: pos_integer()
-  def default_rows, do: @default_rows
-
   # --- schema ----------------------------------------------------------------
 
   @doc """
@@ -214,13 +210,6 @@ defmodule Fathom.Keystone do
       """
     ]
   end
-
-  @doc """
-  `schema_statements/0` as `{sql, args}` pairs — the shape `Fathom.Migrator.Copy` binds, so the
-  keystone's schema can be replayed through the real migration path.
-  """
-  @spec statement_pairs() :: [{String.t(), list()}]
-  def statement_pairs, do: Enum.map(schema_statements(), &{&1, []})
 
   # --- build -----------------------------------------------------------------
 

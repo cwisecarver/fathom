@@ -60,14 +60,11 @@
   {"lib/fathom/bench.ex", :missing_range},
   {"lib/fathom/bench.ex", :extra_range},
 
-  # `Quorum.remaining/1` is `max(0, q - MapSet.size(acked))` and `next_version/0` is an increment
-  # over a Postgres aggregate; both are declared as integers and dialyzer allows `float()`, because
-  # struct field types and Ecto aggregate results are not enforced at runtime and it cannot rule a
-  # float out. `Quorum.new/2` guards `is_integer/1` on both fields, so every properly-constructed
-  # struct satisfies the spec. Widening the specs to `number()` would document a value the code
-  # deliberately refuses to construct.
-  {"lib/fathom/shard/replication/quorum.ex", :missing_range, 114},
-  {"lib/fathom/migrator.ex", :missing_range, 778},
+  # `next_version/0` is an increment over a Postgres aggregate, declared as an integer; dialyzer
+  # allows `float()` because Ecto aggregate results are not enforced at runtime and it cannot rule a
+  # float out. Widening the spec to `number()` would document a value the code never produces.
+  # (The matching `Quorum.remaining/1` filter went with that function, removed 2026-10-01.)
+  {"lib/fathom/migrator.ex", :missing_range, 722},
 
   # `RateLimiter.bump/4` calls `:ets.update_counter/3` with a single `{pos, incr}` op, which returns
   # an integer; the list-of-ops form returns a list. OTP's spec is the union of both, and dialyzer

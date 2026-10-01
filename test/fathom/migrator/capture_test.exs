@@ -135,7 +135,7 @@ defmodule Fathom.Migrator.CaptureTest do
       # filtering the statements without filtering the args in lockstep would hand the bookkeeping
       # INSERT the dropped SELECT's `["q1", "q2"]` — reviving the NULL-binding class of bug that
       # `beff929` fixed, but silently and only for migrations that contain a parameterized read.
-      assert Migrator.statement_pairs(1) == [
+      assert pairs_of(1) == [
                {"CREATE TABLE app_reads (id INTEGER PRIMARY KEY)", []},
                {"CREATE INDEX app_reads_id ON app_reads (id)", []},
                {"INSERT INTO django_migrations (app, name, applied) VALUES (?, ?, ?)",
@@ -554,7 +554,7 @@ defmodule Fathom.Migrator.CaptureTest do
       assert Capture.bookkeeping(conn, insert, args, 1) == :noop
       assert {:recorded, version} = Capture.commit(conn, 1)
 
-      pairs = Migrator.statement_pairs(version)
+      pairs = pairs_of(version)
 
       assert [
                {"CREATE TABLE app_thing (id INTEGER PRIMARY KEY, blob BLOB)", []},
@@ -570,7 +570,7 @@ defmodule Fathom.Migrator.CaptureTest do
     test "a release stored without args replays with none (pre-feature rows keep working)" do
       {:ok, _} = Migrator.release(3, "hand-authored", ["CREATE TABLE t (id INTEGER)"])
 
-      assert Migrator.statement_pairs(3) == [{"CREATE TABLE t (id INTEGER)", []}]
+      assert pairs_of(3) == [{"CREATE TABLE t (id INTEGER)", []}]
     end
 
     test "bookkeeping?/1 matches Django's applied-migration INSERT only" do
@@ -810,6 +810,16 @@ defmodule Fathom.Migrator.CaptureTest do
       assert Migrator.head() == 2
       assert Migrator.statements(2) == ["stmt-v2"]
       assert Migrator.statements(1) == nil, "the yanked version stays unappliable"
+    end
+  end
+
+  # The bound `{sql, args}` pairs for an appliable `version`, or nil. Reads the same rows the
+  # rollout replays (`Migrator.statement_steps/1`); the per-version `statement_pairs/1` wrapper it
+  # replaces had no caller outside tests and was removed 2026-10-01.
+  defp pairs_of(version) do
+    case Map.get(Migrator.statement_steps([version]), version) do
+      {pairs, _transform} -> pairs
+      nil -> nil
     end
   end
 end

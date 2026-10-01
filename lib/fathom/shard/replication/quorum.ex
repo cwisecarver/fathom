@@ -109,8 +109,4 @@ defmodule Fathom.Shard.Replication.Quorum do
       true -> {:pending, state}
     end
   end
-
-  @doc "How many more acks are needed. Zero once the quorum is reached."
-  @spec remaining(t()) :: non_neg_integer()
-  def remaining(%__MODULE__{} = s), do: max(0, s.q - MapSet.size(s.acked))
 end

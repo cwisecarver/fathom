@@ -105,17 +105,6 @@ defmodule Fathom.HranaAuth.Ledger do
   end
 
   @doc """
-  Distinct shard ids with at least one token minted before `cutoff` that is **still outstanding**.
-
-  The input to the time-scoped bulk revoke. Scoped to outstanding issuances so a repeat sweep over
-  the same window is a no-op instead of bumping every shard's floor again — a revoke is cheap but
-  not free (it invalidates live clients), and an idempotent sweep is what makes it safe to run from
-  a cron or to retry after a partial failure.
-  """
-  @spec shards_issued_before(DateTime.t()) :: [String.t()]
-  def shards_issued_before(%DateTime{} = cutoff), do: Enum.to_list(stream_issued_before(cutoff))
-
-  @doc """
   Keyset-streams the same set a page at a time, ordered by `shard_id` (expert review 2026-08-26
   #31).
 

@@ -42,9 +42,8 @@ defmodule Fathom.Rebalancer.OverridesTest do
     o = Overrides.for_shard("hot_1")
     assert o != nil, "row retained as a cooldown record, not deleted"
     assert o.failed_at != nil
-    # Still in all/0 so the Policy sees it for cooldown; excluded from pinned_to (reverted).
+    # Still in all/0 so the Policy sees it for cooldown; failed_at is what the renderer skips on.
     assert Enum.map(Overrides.all(), & &1.shard_id) == ["hot_1"]
-    assert Overrides.pinned_to("fathom2") == []
 
     # Idempotent-ish no-op when there's no row to cool.
     assert :ok = Overrides.mark_failed("never_pinned")
@@ -57,7 +56,7 @@ defmodule Fathom.Rebalancer.OverridesTest do
 
     {:ok, _} = Overrides.pin("hot_1", "fathom3", from_node: "fathom1")
     assert Overrides.for_shard("hot_1").failed_at == nil
-    assert Overrides.pinned_to("fathom3") == ["hot_1"]
+    assert Overrides.for_shard("hot_1").pinned_node == "fathom3"
   end
 
   test "pin rejects an invalid shard_id at the write boundary (isolation gate, #14)" do
@@ -89,7 +88,7 @@ defmodule Fathom.Rebalancer.OverridesTest do
     {:ok, o2} = Overrides.pin("ACME", "fathom3")
     assert o2.id == o.id
     assert length(Overrides.all()) == 1
-    assert Overrides.pinned_to("fathom3") == ["acme"]
+    assert Overrides.for_shard("acme").pinned_node == "fathom3"
 
     # mark_failed / unpin also honor case.
     :ok = Overrides.mark_failed("aCmE")
@@ -98,13 +97,12 @@ defmodule Fathom.Rebalancer.OverridesTest do
     assert Overrides.for_shard("acme") == nil
   end
 
-  test "all is shard-sorted (stable render) and pinned_to filters by node" do
+  test "all is shard-sorted (stable render) and carries each pin's node" do
     {:ok, _} = Overrides.pin("hot_3", "fathom1")
     {:ok, _} = Overrides.pin("hot_1", "fathom2")
     {:ok, _} = Overrides.pin("hot_2", "fathom2")
 
     assert Enum.map(Overrides.all(), & &1.shard_id) == ["hot_1", "hot_2", "hot_3"]
-    assert Enum.sort(Overrides.pinned_to("fathom2")) == ["hot_1", "hot_2"]
-    assert Overrides.pinned_to("fathom1") == ["hot_3"]
+    assert Enum.map(Overrides.all(), & &1.pinned_node) == ["fathom2", "fathom2", "fathom1"]
   end
 end

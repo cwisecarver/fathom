@@ -290,31 +290,6 @@ defmodule Fathom.Shard.Storage do
                | nil}
               | {:error, term()}
 
-  # Conditional pull, keyed on the caller's currently-held `etag` (an opaque store
-  # value captured from a prior pull). Written as the warm standby's freshness check (a
-  # cached copy may lag the owner's latest flush, so confirm it equals the store's current
-  # object). NO CALLER since that cache was removed 2026-09-14 — kept only as a backend
-  # contract; remove it or give it a caller.
-  #
-  #   * `{:ok, :unchanged}` — the object's etag matches `etag`; nothing written, the
-  #     caller's existing local copy is current (a store 304). No byte transfer.
-  #   * `{:ok, {:written, new_etag}}` — the object differs (or `etag` was `nil`); fresh
-  #     bytes were written to `local_path`, `new_etag` is the current object's etag
-  #     (may be `nil` if the store returned none).
-  #   * `{:ok, :absent}` — no object exists (a brand-new shard); nothing written.
-  #
-  # `nil` `etag` degrades to an unconditional pull (always `:written` or `:absent`),
-  # which is how a follower captures the initial etag.
-  @callback pull_if_changed(
-              shard_id :: String.t(),
-              local_path :: Path.t(),
-              etag :: String.t() | nil
-            ) ::
-              {:ok, :unchanged}
-              | {:ok, {:written, String.t() | nil}}
-              | {:ok, :absent}
-              | {:error, term()}
-
   @callback acquire_lease(shard_id :: String.t(), owner :: String.t(), ttl_ms :: pos_integer()) ::
               {:ok, lease()}
               | {:error, {:held, String.t() | :unknown, integer() | nil}}
@@ -443,26 +418,19 @@ defmodule Fathom.Shard.Storage do
   # already skips any `@`-keyed object). Backend-uniform (Local + S3), so the whole snapshot/
   # restore path is testable without a real object store; S3 bucket versioning
   # (`docs/durability.md`) layers underneath as defense-in-depth. `snapshot/2` copies live →
-  # snapshot; `restore_snapshot/2` copies snapshot → live UNCONDITIONALLY (a low-level primitive,
-  # exercised only by backend round-trip tests). Production restore goes through the FENCED
-  # `restore_snapshot/3` — mirroring `restore/2` vs the fenced `restore/3` — which If-Match's the
-  # live etag so a write racing in after `Fathom.Snapshots.restore/3`'s drain can't be silently
-  # clobbered (expert review 2026-07-18 #2): a mismatch is `{:error, :superseded}`, no overwrite.
+  # snapshot; `pull_snapshot/3` downloads one; restore promotes downloaded bytes through the FENCED
+  # `restore_snapshot_from_file/3` below, which If-Match's the live etag so a write racing in after
+  # `Fathom.Snapshots.restore/3`'s drain can't be silently clobbered (expert review 2026-07-18 #2):
+  # a mismatch is `{:error, :superseded}`, no overwrite. (The by-id `restore_snapshot/2,3` that
+  # preceded it had no production caller once restore moved to the file form, and were removed
+  # 2026-10-01.)
   @callback snapshot(shard_id :: String.t(), snapshot_id :: String.t()) :: :ok | {:error, term()}
   @callback list_snapshots(shard_id :: String.t()) :: {:ok, [snapshot()]} | {:error, term()}
-  @callback restore_snapshot(shard_id :: String.t(), snapshot_id :: String.t()) ::
-              :ok | {:error, term()}
-  @callback restore_snapshot(
-              shard_id :: String.t(),
-              snapshot_id :: String.t(),
-              expected_etag :: String.t() | nil
-            ) :: :ok | {:error, :superseded} | {:error, term()}
   @callback drop_snapshot(shard_id :: String.t(), snapshot_id :: String.t()) ::
               :ok | {:error, term()}
 
-  # Fenced restore of ALREADY-DOWNLOADED snapshot bytes (expert review 2026-08-26 #25). Same fence
-  # and same failure shapes as `restore_snapshot/3`; the only difference is that the caller supplies
-  # the bytes instead of the backend fetching them.
+  # Fenced restore of ALREADY-DOWNLOADED snapshot bytes (expert review 2026-08-26 #25) — the only
+  # snapshot restore primitive.
   #
   # This exists so `Fathom.Snapshots.restore/3` downloads a snapshot ONCE. It used to pull the
   # snapshot to a temp purely to read four bytes at file offset 60 (`PRAGMA user_version`, the
@@ -723,21 +691,6 @@ defmodule Fathom.Shard.Storage do
   def object_head(shard_id), do: backend().object_head(shard_id)
 
   @doc """
-  Conditional pull keyed on the caller's held `etag` — the warm-standby freshness
-  check. Returns `{:ok, :unchanged}` (store object matches `etag`; nothing written),
-  `{:ok, {:written, new_etag}}` (fresh bytes written to `local_path`), or
-  `{:ok, :absent}` (no object). A `nil` `etag` is an unconditional pull that captures
-  the current etag. See the callback docs.
-  """
-  @spec pull_if_changed(String.t(), Path.t(), String.t() | nil) ::
-          {:ok, :unchanged}
-          | {:ok, {:written, String.t() | nil}}
-          | {:ok, :absent}
-          | {:error, term()}
-  def pull_if_changed(shard_id, local_path, etag),
-    do: backend().pull_if_changed(shard_id, local_path, etag)
-
-  @doc """
   Acquires `shard_id`'s lease for `owner` with a `ttl_ms` window. Returns
   `{:error, {:held, owner, stealable_at_ms | nil}}` if another owner holds a live lease, or
   `{:error, reason}` on a transient store error (the caller must NOT proceed —
@@ -934,28 +887,10 @@ defmodule Fathom.Shard.Storage do
   def list_snapshots(shard_id), do: backend().list_snapshots(shard_id)
 
   @doc """
-  Copies a snapshot back over the shard's live object, UNCONDITIONALLY. Low-level primitive
-  (backend round-trip tests); production restore uses the fenced `restore_snapshot/3`.
-  """
-  @spec restore_snapshot(String.t(), String.t()) :: :ok | {:error, term()}
-  def restore_snapshot(shard_id, snapshot_id),
-    do: backend().restore_snapshot(shard_id, snapshot_id)
-
-  @doc """
-  Fenced snapshot restore: copies the snapshot over live only if live still matches
-  `expected_etag` (captured by the caller right after its `lease_holder` check). A write that
-  raced in after `Fathom.Snapshots.restore/3`'s drain — a fresh checkout on this or any node that
-  acquired the freed lease and flushed — moves live's etag, so this returns `{:error, :superseded}`
-  and does NOT clobber it (expert review 2026-07-18 #2). Mirrors the fenced migration `restore/3`.
-  """
-  @spec restore_snapshot(String.t(), String.t(), String.t() | nil) ::
-          :ok | {:error, :superseded} | {:error, term()}
-  def restore_snapshot(shard_id, snapshot_id, expected_etag),
-    do: backend().restore_snapshot(shard_id, snapshot_id, expected_etag)
-
-  @doc """
-  Fenced restore of snapshot bytes the caller ALREADY downloaded — same fence, same failure shapes
-  as `restore_snapshot/3`, one fewer full-object GET (expert review 2026-08-26 #25).
+  Fenced restore of snapshot bytes the caller ALREADY downloaded: copies them over live only if
+  live still matches `expected_etag`; a write that raced in after the drain moves live's etag, so
+  this returns `{:error, :superseded}` and does not clobber it (expert review 2026-07-18 #2,
+  2026-08-26 #25).
 
   `Fathom.Snapshots.restore/3` reads the snapshot's `PRAGMA user_version` from a pulled temp to
   gate a cross-schema-version restore; passing that same temp here means the bytes that were

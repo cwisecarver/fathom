@@ -35,9 +35,6 @@ defmodule Fathom.Shard.Provenance do
   # POSITIVE provenance claim rather than an absent sidecar (expert review 2026-08-01 #2).
   @no_object_sentinel "-"
 
-  @spec no_object_sentinel() :: String.t()
-  def no_object_sentinel, do: @no_object_sentinel
-
   @spec write_no_object(String.t()) :: :ok
   def write_no_object(path), do: write(path, @no_object_sentinel)
 

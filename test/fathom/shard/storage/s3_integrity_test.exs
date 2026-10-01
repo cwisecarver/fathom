@@ -77,8 +77,6 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
 
     assert {:error, :checksum_mismatch} = S3.pull("s", local)
     refute File.exists?(local), "a corrupted body must never be written"
-
-    assert {:error, :checksum_mismatch} = S3.pull_if_changed("s", Path.join(dir, "w.db"), nil)
   end
 
   # Round-2 expert review #1: the streamed download ran with Req's default

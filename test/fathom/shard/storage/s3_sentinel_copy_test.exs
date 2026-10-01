@@ -7,7 +7,7 @@ defmodule Fathom.Shard.Storage.S3SentinelCopyTest do
   `touch_object/2` plants a sentinel **at the data key** on a steal of a never-flushed shard
   (round-2 #7 — the zombie's stalled create-only `PUT If-None-Match:*` has to 412, and it only
   does if that key is occupied). CopyObject's default metadata directive is `COPY`, so
-  `retain`/`snapshot`/`fork_shard`/`fork_from`/`restore_snapshot` all duplicated the placeholder
+  `retain`/`snapshot`/`fork_shard`/`fork_from` (and the since-removed `restore_snapshot`) all duplicated the placeholder
   verbatim and reported `:ok`.
 
   #24 was the same root cause — a sentinel read as real bytes — on the *pull* consumers. The panel
@@ -130,12 +130,21 @@ defmodule Fathom.Shard.Storage.S3SentinelCopyTest do
       refute S3EtagStore.meta_of(store, "newborn.db")
     end
 
-    test "restore_snapshot/2 refuses a sentinel snapshot rather than clobbering live with it" do
+    # Restore promotes bytes it first downloads with pull_snapshot/3, so THAT is where a sentinel
+    # snapshot has to be refused. (The by-id restore_snapshot/2 this test used to cover was removed
+    # 2026-10-01 as dead code; production never called it.)
+    test "pull_snapshot/3 reads a sentinel snapshot as absent, so restore never promotes it" do
       store = start_store(%{"acme.lock" => dead_lock()})
       :ok = steal_to_plant_sentinel(store, "acme")
       :ok = S3EtagStore.copy(store, "acme.db", "acme@snap-poisoned.db")
 
-      assert {:error, :no_source} = S3.restore_snapshot("acme", "poisoned")
+      dest =
+        Path.join(System.tmp_dir!(), "sentinel_snap_#{System.unique_integer([:positive])}.db")
+
+      on_exit(fn -> File.rm(dest) end)
+
+      assert {:absent, _} = S3.pull_snapshot("acme", "poisoned", dest)
+      refute File.exists?(dest), "placeholder bytes were written as a snapshot"
     end
   end
 

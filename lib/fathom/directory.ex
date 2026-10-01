@@ -814,21 +814,9 @@ defmodule Fathom.Directory do
   end
 
   @doc """
-  Active shards currently at `version` — the set a fleet revert flips back.
-
-  Materializes the WHOLE set as full structs, so at fleet scale (millions at a version) this is a
-  memory blowup (expert review 2026-07-18 #12). The revert engine now uses `count_at_version/1`
-  (aggregate) and `stream_ids_at_version/2` (keyset-paged ids) instead; keep this only for small,
-  known-bounded callers (ops/iex).
-  """
-  @spec shards_at_version(non_neg_integer()) :: [Shard.t()]
-  def shards_at_version(version) do
-    Repo.all(from s in Shard, where: s.schema_version == ^version and s.status == "active")
-  end
-
-  @doc """
   How many active shards are at `version` — the aggregate count (#12) for a revert-status gauge,
-  without materializing the (potentially millions-large) set the way `shards_at_version/1` does.
+  without materializing the (potentially millions-large) set — the unbounded `shards_at_version/1`
+  this replaced (expert review 2026-07-18 #12) was removed 2026-10-01 as dead code.
   """
   @spec count_at_version(non_neg_integer()) :: non_neg_integer()
   def count_at_version(version) do

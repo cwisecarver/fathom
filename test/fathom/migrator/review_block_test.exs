@@ -271,11 +271,12 @@ defmodule Fathom.Migrator.ReviewBlockTest do
         })
 
       # Held: the rollout refuses to build a chain through it.
-      assert Migrator.statement_step(r.version) == nil
+      refute Map.has_key?(Migrator.statement_steps([r.version]), r.version)
 
       assert :ok = Migrator.attach_transform(r.version, OkTransform)
 
-      assert {pairs, transform} = Migrator.statement_step(r.version)
+      assert %{} = steps = Migrator.statement_steps([r.version])
+      assert {pairs, transform} = Map.fetch!(steps, r.version)
       assert transform == to_string(OkTransform)
       assert [{"ALTER TABLE t ADD COLUMN x INT", []}] = pairs
     end

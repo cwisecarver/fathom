@@ -52,12 +52,18 @@ defmodule Fathom.Shard.StorageRestorePositionTest do
            "a restore replaces the object's bytes, so the pre-restore position stamp must be gone"
   end
 
-  test "restore_snapshot/2 leaves the object unstamped", %{shard: shard} do
+  test "a snapshot restore (restore_snapshot_from_file/3) leaves the object unstamped", %{
+    shard: shard
+  } do
     seed_stamped!(shard, "live-bytes")
     :ok = Storage.snapshot(shard, "snap-a")
     seed_stamped!(shard, "newer-bytes")
 
-    :ok = Storage.restore_snapshot(shard, "snap-a")
+    tmp = Path.join(System.tmp_dir!(), "restorepos_#{System.unique_integer([:positive])}.db")
+    on_exit(fn -> File.rm(tmp) end)
+    {:ok, _} = Storage.pull_snapshot(shard, "snap-a", tmp)
+    {:ok, live} = Storage.object_etag(shard)
+    :ok = Storage.restore_snapshot_from_file(shard, tmp, live)
 
     assert {:ok, nil} = Storage.object_position(shard),
            "a snapshot restore replaces the bytes, so the pre-restore position stamp must be gone"

@@ -412,7 +412,11 @@ defmodule Fathom.Shard.ReplicationOwnershipReseedTest do
     stop_shard!(id, one)
 
     # The operator restores the snapshot: the object now holds OLDER bytes than every replica.
-    :ok = Storage.restore_snapshot(id, "before")
+    snap = Path.join(System.tmp_dir!(), "reseed_snap_#{System.unique_integer([:positive])}.db")
+    on_exit(fn -> File.rm(snap) end)
+    {:ok, _} = Storage.pull_snapshot(id, "before", snap)
+    {:ok, live} = Storage.object_etag(id)
+    :ok = Storage.restore_snapshot_from_file(id, snap, live)
 
     # Ownership 2 builds on the restored base, and touches `t` only.
     two = write!(id, [100])

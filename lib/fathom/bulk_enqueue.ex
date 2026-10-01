@@ -68,10 +68,6 @@ defmodule Fathom.BulkEnqueue do
     |> Enum.reduce(0, fn chunk, acc -> acc + unique_chunk(chunk) end)
   end
 
-  @doc "The in-flight job states bulk dedup filters against."
-  @spec unique_states() :: [String.t()]
-  def unique_states, do: @unique_states
-
   defp unique_chunk(id_changesets) do
     shard_ids = Enum.map(id_changesets, &elem(&1, 0))
     worker = id_changesets |> hd() |> elem(1) |> Ecto.Changeset.get_field(:worker)

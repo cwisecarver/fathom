@@ -63,7 +63,7 @@ defmodule Fathom.ShardLatencyTest do
     # A tight cluster at 1.5ms: every percentile falls in the [1000,2000)µs bucket.
     for _ <- 1..100, do: ShardLatency.record("tight", native_us(1500))
 
-    p = ShardLatency.percentiles("tight")
+    p = pct("tight")
     assert p.p50_ms >= 1.0 and p.p50_ms <= 2.0
     assert p.p99_ms >= 1.0 and p.p99_ms <= 2.0
     assert p.p99_ms >= p.p50_ms
@@ -74,13 +74,13 @@ defmodule Fathom.ShardLatencyTest do
     for _ <- 1..90, do: ShardLatency.record("bimodal", native_us(500))
     for _ <- 1..10, do: ShardLatency.record("bimodal", native_us(50_000))
 
-    p = ShardLatency.percentiles("bimodal")
+    p = pct("bimodal")
     assert p.p50_ms < 5.0, "the median tracks the fast 90% (~0.5ms)"
     assert p.p99_ms >= 10.0, "the p99 catches the slow 10% (~50ms)"
   end
 
   test "percentiles are zero for a shard with no samples" do
-    assert ShardLatency.percentiles("empty") == %{p50_ms: 0.0, p95_ms: 0.0, p99_ms: 0.0}
+    assert pct("empty") == %{p50_ms: 0.0, p95_ms: 0.0, p99_ms: 0.0}
   end
 
   # The windowing seam the collector uses (expert review 2026-07-14 #12): percentiles taken over a
@@ -133,7 +133,7 @@ defmodule Fathom.ShardLatencyTest do
     assert Enum.sum(ShardLatency.histogram(id)) >= 3,
            "each executed statement records a latency sample"
 
-    p = ShardLatency.percentiles(id)
+    p = pct(id)
     assert p.p50_ms >= 0.0 and p.p99_ms >= p.p50_ms
 
     :ok = ShardExecutor.close(handle)
@@ -170,4 +170,10 @@ defmodule Fathom.ShardLatencyTest do
 
   defp local_dir, do: Fathom.Shard.data_dir()
   defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
+
+  # p50/p95/p99 over a shard's cumulative histogram — what the removed `percentiles/1` wrapper did
+  # (no production caller; `MetricsCollector` diffs histograms first and calls the from-histogram
+  # form directly).
+  defp pct(shard_id),
+    do: shard_id |> ShardLatency.histogram() |> ShardLatency.percentiles_from_histogram()
 end

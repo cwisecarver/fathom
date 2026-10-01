@@ -56,11 +56,4 @@ defmodule Fathom.Rebalancer.LoadSamples do
       from s in LoadSample, where: s.sampled_at >= ^cutoff, select: s.shard_id, distinct: true
     )
   end
-
-  @doc "Deletes samples older than `ms` ago (ops/test helper; the reporter prunes too)."
-  @spec prune(non_neg_integer()) :: {non_neg_integer(), nil}
-  def prune(ms) do
-    cutoff = DateTime.add(DateTime.utc_now(), -ms, :millisecond)
-    Repo.delete_all(from s in LoadSample, where: s.sampled_at < ^cutoff)
-  end
 end
