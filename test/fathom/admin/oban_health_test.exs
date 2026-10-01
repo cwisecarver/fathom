@@ -7,6 +7,10 @@ defmodule Fathom.Admin.ObanHealthTest do
 
   alias Fathom.Admin.Measurements
 
+  # What Oban's cron plugin stamps on every job it inserts (deps/oban/lib/oban/plugins/cron.ex).
+  # A cron fixture without it is a job no cron leader could have inserted.
+  @cron_meta %{"cron" => true, "cron_expr" => "@hourly"}
+
   defp insert_job(attrs) do
     now = DateTime.utc_now()
 
@@ -64,7 +68,8 @@ defmodule Fathom.Admin.ObanHealthTest do
       worker: "Fathom.Rebalancer.RebalanceJob",
       queue: "rebalance",
       state: "completed",
-      inserted_at: old
+      inserted_at: old,
+      meta: @cron_meta
     })
 
     ref = attach([:fathom, :oban, :cron])
@@ -87,7 +92,8 @@ defmodule Fathom.Admin.ObanHealthTest do
       worker: "Fathom.Migrator.ReconcileJob",
       queue: "migrations",
       state: "completed",
-      inserted_at: stalled
+      inserted_at: stalled,
+      meta: @cron_meta
     })
 
     ref = attach([:fathom, :oban, :cron])
@@ -97,5 +103,34 @@ defmodule Fathom.Admin.ObanHealthTest do
 
     assert age > 7_200_000,
            "a cron stale for 3h must exceed the 2x-hourly-period alert threshold (got #{age})"
+  end
+
+  # Expert review 2026-10-01 perf #13. The freshness query used to read EVERY row of a cron
+  # worker's name, with no index on `worker`, so after a large rollout it scanned millions of
+  # completed jobs every 30 s on every node. It now reads only CRON inserts (`meta @> {cron: true}`,
+  # which Oban's cron plugin stamps), served by Oban's GIN `meta` index. That is also the correct
+  # meaning: a job someone enqueued BY HAND is not evidence the cron leader is alive, and counting
+  # it masked exactly the wedge this gauge exists to catch.
+  test "a hand-enqueued job of a cron worker does not mask a stalled cron" do
+    stalled = DateTime.add(DateTime.utc_now(), -3 * 3600, :second)
+
+    insert_job(%{
+      worker: "Fathom.Migrator.ReconcileJob",
+      queue: "migrations",
+      state: "completed",
+      inserted_at: stalled,
+      meta: @cron_meta
+    })
+
+    # Inserted NOW, but not by the cron plugin.
+    insert_job(%{worker: "Fathom.Migrator.ReconcileJob", queue: "migrations", state: "completed"})
+
+    ref = attach([:fathom, :oban, :cron])
+    assert :ok = Measurements.oban_health()
+
+    assert_receive {:telem, ^ref, %{age_ms: age}, %{worker: "Fathom.Migrator.ReconcileJob"}}
+
+    assert age > 7_200_000,
+           "a manual insert reset the cron freshness gauge (age #{age} ms), hiding a 3h-stalled cron"
   end
 end

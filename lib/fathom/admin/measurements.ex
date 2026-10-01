@@ -338,8 +338,14 @@ defmodule Fathom.Admin.Measurements do
 
       workers ->
         Repo.all(
+          # CRON INSERTS ONLY (expert review 2026-10-01 perf #13). `worker` has no index, so the
+          # unfiltered form scanned every row of these workers' names — millions of completed
+          # jobs for a week after a large rollout — every 30 s on every node. Oban's cron plugin
+          # stamps `meta.cron = true` on what it inserts, and Oban's GIN index on `meta` serves
+          # the containment, so this reads only cron rows. It is also the right meaning: a job
+          # enqueued by hand is not evidence the cron leader is alive.
           from(j in Oban.Job,
-            where: j.worker in ^workers,
+            where: j.worker in ^workers and fragment("? @> ?", j.meta, ^%{cron: true}),
             group_by: j.worker,
             select: {j.worker, max(j.inserted_at)}
           )
