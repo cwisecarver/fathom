@@ -316,13 +316,16 @@ defmodule Fathom.Migrator.ShardMigrationTest do
 
     assert {:ok, %{from: 1, to: 4}} = ShardMigration.run(shard, 4)
 
-    # FOUR since the ledger check (2026-10-01): pre-flight + post-mark chain read, plus ONE
-    # release read each for the ledger check before and after the replay. It was two; it changed
-    # because two whole-range reads were added, not because anything became per-version — which is
-    # what this test exists to catch.
-    assert :counters.get(counter, 1) == 4,
+    # FIVE since the ledger names were memoised (expert review 2026-10-01 perf #12): pre-flight +
+    # post-mark chain read, ONE narrow (id/version/count) release read for each ledger check, and
+    # ONE payload fetch for the releases this node had never derived names for — this test's
+    # releases are new, so the first check pays it and the second finds them cached. Every later
+    # shard on the node pays four, with narrow rows instead of full payloads. Still constant in the
+    # range, which is what this test exists to catch.
+    assert :counters.get(counter, 1) == 5,
            "the 3-version chain issued #{:counters.get(counter, 1)} shard_migrations queries; " <>
-             "it must be four (pre-flight + post-mark + two ledger reads) regardless of the range"
+             "it must be five (pre-flight + post-mark + two narrow ledger reads + one payload " <>
+             "fetch for never-seen releases) regardless of the range"
   end
 
   # Expert review 2026-08-26 #28. One forward migration cost ~9 Postgres round trips, three of them

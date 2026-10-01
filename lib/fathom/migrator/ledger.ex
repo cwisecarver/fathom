@@ -159,13 +159,54 @@ defmodule Fathom.Migrator.Ledger do
 
   # `%{version => %{names, count}}` for every non-yanked release. Yanked releases are left out: the
   # chain may skip them (2026-09-29 #16), so their names are neither required nor forbidden.
+  #
+  # NAMES ARE DERIVED ONCE PER RELEASE PER NODE (expert review 2026-10-01 perf #12). This runs twice
+  # per migrated shard (before and after the replay), and deriving a release's names opens an
+  # in-memory SQLite connection and replays its bookkeeping INSERTs. Doing that for every release on
+  # every call made a fleet rollout pay O(releases) SQLite opens per shard on the dirty-IO pool the
+  # tenants share. A release's statements are written once at capture and never updated, so its
+  # names are a pure function of `{id, version}` and are memoised in `:persistent_term` (a NEW key
+  # never triggers the global GC an update or erase does; nothing here is ever updated). The
+  # MUTABLE columns (`yanked`, the count) are re-read on every call, and only the narrow columns:
+  # the statement payloads are fetched only for releases this node has not seen.
   @spec release_facts() :: map()
   defp release_facts do
-    releases = Repo.all(from(r in Release, where: not r.yanked, order_by: [asc: r.version]))
+    rows =
+      Repo.all(
+        from(r in Release,
+          where: not r.yanked,
+          order_by: [asc: r.version],
+          select: {r.id, r.version, r.template_migration_count}
+        )
+      )
 
-    Map.new(releases, fn r ->
-      {r.version, %{names: release_names(r), count: r.template_migration_count}}
+    names = names_for(rows)
+
+    Map.new(rows, fn {id, version, count} ->
+      {version, %{names: Map.fetch!(names, id), count: count}}
     end)
+  end
+
+  defp names_for(rows) do
+    {cached, missing} =
+      Enum.reduce(rows, {%{}, []}, fn {id, version, _}, {hit, miss} ->
+        case :persistent_term.get({__MODULE__, :names, id, version}, nil) do
+          nil -> {hit, [id | miss]}
+          names -> {Map.put(hit, id, names), miss}
+        end
+      end)
+
+    if missing == [] do
+      cached
+    else
+      from(r in Release, where: r.id in ^missing)
+      |> Repo.all()
+      |> Enum.reduce(cached, fn r, acc ->
+        names = release_names(r)
+        :persistent_term.put({__MODULE__, :names, r.id, r.version}, names)
+        Map.put(acc, r.id, names)
+      end)
+    end
   end
 
   @doc "The `(app, name)` rows a release's bookkeeping statements insert."

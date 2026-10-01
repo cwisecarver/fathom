@@ -6,6 +6,8 @@ defmodule Fathom.Migrator.LedgerTest do
   """
   use Fathom.DataCase, async: true
 
+  import Ecto.Query
+
   alias Fathom.Migrator.Ledger
   alias Fathom.Migrator.Release
 
@@ -76,6 +78,92 @@ defmodule Fathom.Migrator.LedgerTest do
       # refused. The restore drill's count check reported this as `:ledger_mismatch`; the migrator
       # can do better than refuse because it can try the replay without risk.
       assert {:behind, 0} = Ledger.classify(1, MapSet.new(), 0, @facts)
+    end
+  end
+
+  describe "check_file/1 reads each release's names once per node (expert review 2026-10-01 perf #12)" do
+    # A release's statements are written once at capture and never updated, so its names are a
+    # pure function of the release. check_file/1 used to re-derive every release's names (one
+    # in-memory SQLite open + replay per release) on EVERY call, twice per migrated shard, so a
+    # fleet rollout paid O(releases) SQLite opens per shard. These pin that a release's names are
+    # derived once and reused.
+    defp bookkeeping_release!(version, name) do
+      %Release{}
+      |> Release.changeset(%{
+        version: version,
+        name: "v#{version}",
+        statements: [
+          ~s|INSERT INTO "django_migrations" ("app", "name", "applied") VALUES (?, ?, ?)|
+        ],
+        statement_args: [%{"args" => Enum.map(["app", name, "2026-01-01"], &Filo.Value.encode/1)}]
+      })
+      |> Fathom.Repo.insert!()
+    end
+
+    defp ledger_file!(version, names) do
+      path = Path.join(System.tmp_dir!(), "ledgermemo_#{System.unique_integer([:positive])}.db")
+      on_exit(fn -> for s <- ["", "-wal", "-shm"], do: File.rm(path <> s) end)
+      {:ok, conn} = Fathom.Shard.Connection.open(path)
+
+      :ok =
+        Fathom.Shard.Connection.exec(
+          conn,
+          "CREATE TABLE django_migrations (id INTEGER PRIMARY KEY, app TEXT, name TEXT, applied TEXT)"
+        )
+
+      for n <- names do
+        {:ok, _} =
+          Fathom.Shard.Connection.query(
+            conn,
+            "INSERT INTO django_migrations (app, name, applied) VALUES ('app', ?, 'x')",
+            [n]
+          )
+      end
+
+      :ok = Fathom.Shard.Connection.exec(conn, "PRAGMA user_version = #{version}")
+      :ok = Fathom.Shard.Connection.close(conn)
+      path
+    end
+
+    test "a release's names are derived once, not on every check" do
+      release = bookkeeping_release!(1, "0001_memo")
+      path = ledger_file!(1, ["0001_memo"])
+
+      assert {1, :ok} = Ledger.check_file(path)
+
+      # Rewrite the stored payload behind the cache's back. Production never does this (statements
+      # are immutable after capture); here it is the observable: a check that re-derived the names
+      # would now see "0001_other", call the shard's ledger a mismatch, and fail.
+      bad = [~s|INSERT INTO "django_migrations" ("app", "name", "applied") VALUES (?, ?, ?)|]
+
+      Fathom.Repo.update_all(
+        from(r in Release, where: r.id == ^release.id),
+        set: [
+          statements: bad,
+          statement_args: [
+            %{"args" => Enum.map(["app", "0001_other", "2026-01-01"], &Filo.Value.encode/1)}
+          ]
+        ]
+      )
+
+      assert {1, :ok} = Ledger.check_file(path),
+             "check_file/1 re-derived a release's names instead of reusing them"
+    end
+
+    test "a yank is still seen after the names are cached" do
+      _ = bookkeeping_release!(1, "0001_y")
+      r2 = bookkeeping_release!(2, "0002_y")
+
+      # Label 1, but it also holds release 2's name: a migration the label does not admit to.
+      path = ledger_file!(1, ["0001_y", "0002_y"])
+      assert {1, {:mismatch, _}} = Ledger.check_file(path)
+
+      # Yanking is MUTABLE, unlike the statements: the chain may skip a yanked release, so its
+      # names stop being evidence. The cache must not freeze the yank out.
+      Fathom.Repo.update_all(from(r in Release, where: r.id == ^r2.id), set: [yanked: true])
+
+      assert {1, :ok} = Ledger.check_file(path),
+             "the yank was not seen: a cached release kept counting after it was yanked"
     end
   end
 
