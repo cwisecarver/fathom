@@ -1056,7 +1056,7 @@ defmodule Fathom.Shard.Storage.S3 do
   @download_attempts 3
 
   defp download(url, local_path, headers \\ [], opts \\ []) do
-    File.mkdir_p!(Path.dirname(local_path))
+    Storage.ensure_dir(Path.dirname(local_path))
     do_download(url, local_path, headers, opts, @download_attempts)
   end
 

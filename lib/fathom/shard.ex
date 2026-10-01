@@ -411,7 +411,7 @@ defmodule Fathom.Shard do
   def handle_continue(:open, %{id: shard_id} = state) do
     open_started = System.monotonic_time()
     path = db_path(shard_id)
-    File.mkdir_p!(Path.dirname(path))
+    Storage.ensure_dir(Path.dirname(path))
 
     # Clear THIS shard's DETERMINISTIC orphaned pull temps by direct name — O(1), no
     # directory scan (expert review 2026-07-14 #2). The old `Storage.reap_stale_temps/2`

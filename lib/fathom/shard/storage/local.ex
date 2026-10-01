@@ -917,7 +917,7 @@ defmodule Fathom.Shard.Storage.Local do
 
   defp create_lock(shard_id, lease) do
     path = lock_path(shard_id)
-    File.mkdir_p!(Path.dirname(path))
+    Storage.ensure_dir(Path.dirname(path))
 
     case File.open(path, [:write, :exclusive]) do
       {:ok, io} ->

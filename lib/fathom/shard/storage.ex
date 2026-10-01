@@ -1098,7 +1098,7 @@ defmodule Fathom.Shard.Storage do
   # a directory fsync, which the BEAM can't do portably (`:file.open` on a dir is
   # eisdir); losing the rename only re-exposes the old object, which is safe.
   defp with_atomic_temp(dst, produce) do
-    File.mkdir_p!(Path.dirname(dst))
+    ensure_dir(Path.dirname(dst))
     tmp = "#{dst}.tmp.#{System.unique_integer([:positive])}"
 
     with :ok <- produce.(tmp),
@@ -1113,6 +1113,20 @@ defmodule Fathom.Shard.Storage do
   end
 
   @doc """
+  `File.mkdir_p!/1`, but only when the directory is missing (expert review 2026-10-01 perf #11).
+
+  On an existing directory `mkdir_p!` still walks and stats every path component: measured
+  98.9 / 100.0 / 105.1 µs against 14.5 µs for `File.dir?/1` (expert review 2026-08-26 #10, which
+  fixed `Connection.open/2` only). A cold open hit it two or three more times — the coordinator's
+  data dir, the pull's temp dir, the promote — always on a directory that already exists.
+  """
+  @spec ensure_dir(Path.t()) :: :ok
+  def ensure_dir(dir) do
+    unless File.dir?(dir), do: File.mkdir_p!(dir)
+    :ok
+  end
+
+  @doc """
   Fsync + atomically rename an already-materialized temp into `dst` — the promotion
   half of `atomic_write/2` for callers that STREAM their bytes into the temp
   themselves (the S3 backend's downloads, expert review #20) instead of buffering a
@@ -1120,7 +1134,7 @@ defmodule Fathom.Shard.Storage do
   """
   @spec promote_temp(Path.t(), Path.t()) :: :ok | {:error, term()}
   def promote_temp(tmp, dst) do
-    File.mkdir_p!(Path.dirname(dst))
+    ensure_dir(Path.dirname(dst))
 
     with :ok <- sync_file(tmp),
          :ok <- File.rename(tmp, dst) do
