@@ -78,6 +78,51 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
 
   defp row(id), do: Repo.get_by(Fathom.Directory.Shard, shard_id: id)
 
+  # Expert review 2026-10-01 perf #27. The scheduler snapshotted its sample ONE SHARD AT A TIME,
+  # each a HEAD + CopyObject plus two Postgres calls, so a fleet-singleton run managed roughly
+  # 1/(2 RTT + copy) shards per second and an hourly cron at 1M tenants overran its own slot.
+  describe "concurrency" do
+    test "a run snapshots its sample concurrently, not one shard at a time" do
+      ids = for i <- 1..6, do: "snapschedc#{i}_#{System.unique_integer([:positive])}"
+
+      prev_backend = Application.get_env(:fathom, :shard_storage)
+
+      on_exit(fn ->
+        Application.delete_env(:fathom, :faulty_before)
+        restore(:shard_storage, prev_backend)
+
+        for id <- ids do
+          Shards.drain(id, 2_000)
+
+          for dir <- [remote_dir(), Fathom.Shard.data_dir()],
+              suffix <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock"],
+              do: File.rm(Path.join(dir, id <> suffix))
+        end
+      end)
+
+      for id <- ids, do: seed(id, ["CREATE TABLE t (v INTEGER)", "INSERT INTO t VALUES (1)"])
+
+      # Each of OUR copies takes 300 ms, the way a real CopyObject takes real time. Six serial
+      # copies need >= 1.8 s; concurrent ones finish in roughly one copy's time.
+      mine = MapSet.new(ids)
+      # The suite's default backend is `Local`, which has no hook; the double delegates to it.
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+      Application.put_env(
+        :fathom,
+        :faulty_before,
+        {:snapshot, fn id -> if MapSet.member?(mine, id), do: Process.sleep(300) end}
+      )
+
+      {us, {:ok, _counts}} = :timer.tc(fn -> ScheduleJob.run(50) end)
+
+      for id <- ids, do: assert({:ok, [_ | _]} = Snapshots.list(id))
+
+      assert us < 1_200_000,
+             "six 300 ms snapshot copies took #{div(us, 1000)} ms: the run is serial"
+    end
+  end
+
   describe "selection" do
     test "snapshots a shard that has flushed and never been snapshotted", %{id: id} do
       seed(id, ["CREATE TABLE t (v INTEGER)", "INSERT INTO t VALUES (1)"])

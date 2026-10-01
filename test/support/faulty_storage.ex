@@ -499,7 +499,13 @@ defmodule Fathom.Test.FaultyStorage do
   def drop_live(shard_id), do: Local.drop_live(shard_id)
 
   @impl true
-  def snapshot(shard_id, snapshot_id), do: Local.snapshot(shard_id, snapshot_id)
+  def snapshot(shard_id, snapshot_id) do
+    # `run_before(:snapshot, shard_id)` lets a test give each snapshot copy a real duration, the
+    # only way to tell a serial snapshot loop from a concurrent one (expert review 2026-10-01 #27).
+    run_before(:snapshot, shard_id)
+    Local.snapshot(shard_id, snapshot_id)
+  end
+
   # Injectable LIST failure (expert review 2026-08-26 #37). The drill used to match a bare `_` on
   # this call and return :ok, so a 403 from a bucket-policy change could kill snapshot verification
   # fleet-wide while every run reported the shard healthy. There was no seam to reproduce that,

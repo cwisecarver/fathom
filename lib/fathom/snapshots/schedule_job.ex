@@ -44,6 +44,12 @@ defmodule Fathom.Snapshots.ScheduleJob do
   alias Fathom.Directory
   alias Fathom.Snapshots
 
+  # Copies in flight at once. Each is one CopyObject against the shared store pool, so this stays
+  # well under the Finch pool rather than competing with cold-open pulls for it.
+  @default_concurrency 16
+  # Per shard: a CopyObject of a large object is server-side but still takes real time.
+  @snapshot_timeout_ms 300_000
+
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
     case sample_size() do
@@ -62,10 +68,24 @@ defmodule Fathom.Snapshots.ScheduleJob do
   """
   @spec run(pos_integer()) :: {:ok, map()}
   def run(n) when is_integer(n) and n > 0 do
+    # CONCURRENTLY, bounded (expert review 2026-10-01 perf #27). Each shard is a HEAD + CopyObject
+    # on the store plus two Postgres calls, so a serial loop ran at ~1/(2 RTT + copy) shards per
+    # second and an hourly cron over a large fleet overran its own slot. A real per-shard timeout,
+    # never `:infinity` (AGENTS.md: one wedged tenant once hung a whole sweep); a shard that times
+    # out counts as an error and stays at the head of the rotation for the next run.
     results =
       n
       |> Directory.sample_for_snapshot()
-      |> Enum.map(&snapshot_one(&1.shard_id))
+      |> Task.async_stream(&snapshot_one(&1.shard_id),
+        max_concurrency: concurrency(),
+        timeout: @snapshot_timeout_ms,
+        on_timeout: :kill_task,
+        ordered: false
+      )
+      |> Enum.map(fn
+        {:ok, result} -> result
+        {:exit, _reason} -> :error
+      end)
 
     counts = Enum.frequencies(results)
 
@@ -118,4 +138,11 @@ defmodule Fathom.Snapshots.ScheduleJob do
   end
 
   defp sample_size, do: Application.get_env(:fathom, :snapshot_schedule_sample)
+
+  defp concurrency do
+    case Application.get_env(:fathom, :snapshot_schedule_concurrency, @default_concurrency) do
+      n when is_integer(n) and n > 0 -> n
+      _ -> @default_concurrency
+    end
+  end
 end
