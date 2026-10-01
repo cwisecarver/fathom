@@ -204,7 +204,14 @@ defmodule Fathom.Shard.Replication.Wal do
   A revalidated read handle: the path, the open fd, and the inode it was opened on. `nil` means
   "no fd held", which is the starting state and the state after any error.
   """
-  @type handle :: %{path: Path.t(), fd: :file.fd(), inode: non_neg_integer()} | nil
+  @type handle ::
+          %{
+            path: Path.t(),
+            fd: :file.fd(),
+            inode: non_neg_integer(),
+            cursor: {non_neg_integer(), non_neg_integer(), non_neg_integer()} | nil
+          }
+          | nil
 
   @doc """
   Header + size, read through `handle`, reopening if the file was recreated.
@@ -278,8 +285,81 @@ defmodule Fathom.Shard.Replication.Wal do
     _ = close_held(handle)
 
     case :file.open(path, [:read, :raw, :binary]) do
-      {:ok, fd} -> {:ok, %{path: path, fd: fd, inode: inode}}
+      {:ok, fd} -> {:ok, %{path: path, fd: fd, inode: inode, cursor: nil}}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # THE COMMITTED EXTENT THROUGH A HELD FD, WITHOUT THE BACKWARD WALK (expert review 2026-10-01
+  # perf #8). After a checkpoint SQLite restarts the WAL IN PLACE: the file keeps its high-water
+  # mark and the new generation overwrites it from frame 0, so everything past the extent is stale
+  # frames from the old generation. `scan_back/5` starts at EOF and steps back one 24-byte pread
+  # per stale frame until it reaches this generation's last commit. Measured on this repo's exqlite
+  # with one small commit after a checkpoint: 20 us with no stale tail, 2.1 ms at 1,000 stale
+  # frames, 7.6 ms at 4,000 (the default autocheckpoint size) and 49 ms at 25,000, and a commit
+  # reads the header at least twice.
+  #
+  # The held fd remembers the extent it last found and the salts it belongs to. In order:
+  #   1. the frame at EOF is a commit of this generation: that is the extent (one pread, the
+  #      ordinary no-stale-tail case, same as the first step of `scan_back/5`);
+  #   2. the cursor is from THIS generation: walk FORWARD from it. Committed frames of a generation
+  #      are never rewritten before the next reset, so the extent only grows from there;
+  #   3. the cursor is from an EARLIER generation: a restart happened since, so this generation is
+  #      young and its frames start at the header. Walk forward from there;
+  #   4. no cursor (a freshly opened fd): fall back to `scan_back/5`.
+  # The forward walk stops at the first frame whose salts are not this generation's, which is
+  # SQLite's own recovery rule: nothing after an invalid frame is valid.
+  defp held_extent(handle, size, page, salt1, salt2) when page > 0 do
+    frame_bytes = @frame_header_bytes + page
+    frames = div(size - @header_bytes, frame_bytes)
+    limit = @header_bytes + frames * frame_bytes
+
+    cond do
+      frames > 0 and commit_frame?(handle.fd, limit - frame_bytes, salt1, salt2) ->
+        limit
+
+      match?({^salt1, ^salt2, ext} when ext <= limit, handle.cursor) ->
+        {_, _, ext} = handle.cursor
+        scan_forward(handle.fd, ext, limit, frame_bytes, salt1, salt2, ext)
+
+      handle.cursor != nil ->
+        scan_forward(handle.fd, @header_bytes, limit, frame_bytes, salt1, salt2, @header_bytes)
+
+      true ->
+        scan_back(handle.fd, frames, frame_bytes, salt1, salt2)
+    end
+  end
+
+  defp held_extent(_handle, _size, _page, _s1, _s2), do: @header_bytes
+
+  defp commit_frame?(fd, at, salt1, salt2) do
+    case :file.pread(fd, at, @frame_header_bytes) do
+      {:ok, <<_pgno::32, truncate::32, ^salt1::32, ^salt2::32, _ck::binary>>} -> truncate != 0
+      _ -> false
+    end
+  end
+
+  # `extent` is the end of the last commit frame seen so far; `at` the next frame to read.
+  defp scan_forward(_fd, at, limit, frame_bytes, _s1, _s2, extent) when at + frame_bytes > limit,
+    do: extent
+
+  defp scan_forward(fd, at, limit, frame_bytes, salt1, salt2, extent) do
+    case :file.pread(fd, at, @frame_header_bytes) do
+      {:ok, <<_pgno::32, truncate::32, ^salt1::32, ^salt2::32, _ck::binary>>} ->
+        next = at + frame_bytes
+
+        scan_forward(
+          fd,
+          next,
+          limit,
+          frame_bytes,
+          salt1,
+          salt2,
+          if(truncate != 0, do: next, else: extent)
+        )
+
+      _ ->
+        extent
     end
   end
 
@@ -287,13 +367,10 @@ defmodule Fathom.Shard.Replication.Wal do
     case :file.pread(handle.fd, 0, @header_bytes) do
       {:ok, <<magic::32, _fmt::32, page::32, seq::32, salt1::32, salt2::32, _ck::binary>>}
       when magic in @magics ->
-        {:ok,
-         %{
-           ckpt_seq: seq,
-           salt1: salt1,
-           size: size,
-           commit_extent: commit_extent(handle.fd, size, page, salt1, salt2)
-         }, handle}
+        extent = held_extent(handle, size, page, salt1, salt2)
+
+        {:ok, %{ckpt_seq: seq, salt1: salt1, size: size, commit_extent: extent},
+         %{handle | cursor: {salt1, salt2, extent}}}
 
       {:ok, _} ->
         # Same refusal as `read_header/2`: bytes we cannot identify the generation of are the

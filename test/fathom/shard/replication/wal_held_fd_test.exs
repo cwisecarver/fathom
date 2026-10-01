@@ -140,4 +140,101 @@ defmodule Fathom.Shard.Replication.WalHeldFdTest do
   test "close_held/1 is idempotent and always returns nil" do
     assert Wal.close_held(nil) == nil
   end
+
+  describe "the held extent cursor (expert review 2026-10-01 perf #8)" do
+    # These drive a REAL SQLite WAL through the states the cursor has to get right, and compare
+    # the held read against `Wal.read/1`, which still walks backward from EOF on a fresh fd and is
+    # the reference. A cursor that drifts from it would ship the wrong byte range.
+    setup do
+      dir = Path.join(System.tmp_dir!(), "walcursor_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      path = Path.join(dir, "c.db")
+      {:ok, db} = Exqlite.Sqlite3.open(path)
+      on_exit(fn -> Exqlite.Sqlite3.close(db) end)
+      :ok = Exqlite.Sqlite3.execute(db, "PRAGMA journal_mode=WAL")
+      :ok = Exqlite.Sqlite3.execute(db, "PRAGMA wal_autocheckpoint=0")
+      :ok = Exqlite.Sqlite3.execute(db, "CREATE TABLE t (a INTEGER, b BLOB)")
+      %{db: db, wal: path <> "-wal"}
+    end
+
+    defp exec!(db, sql), do: :ok = Exqlite.Sqlite3.execute(db, sql)
+
+    defp grow!(db, rows) do
+      exec!(db, "BEGIN")
+      for i <- 1..rows, do: exec!(db, "INSERT INTO t VALUES (#{i}, randomblob(3900))")
+      exec!(db, "COMMIT")
+    end
+
+    defp agrees!(h, wal, label) do
+      assert {:ok, held, h} = Wal.read_held(h, wal)
+      assert {:ok, ref} = Wal.read(wal)
+
+      assert held.commit_extent == ref.commit_extent,
+             "#{label}: held extent #{held.commit_extent} != reference #{ref.commit_extent}"
+
+      h
+    end
+
+    test "agrees with the backward walk through appends, a rollback and a restart", ctx do
+      %{db: db, wal: wal} = ctx
+      exec!(db, "INSERT INTO t VALUES (0, NULL)")
+      h = agrees!(nil, wal, "first read (no cursor)")
+
+      grow!(db, 50)
+      h = agrees!(h, wal, "after an append (cursor, same generation)")
+
+      # A rolled-back transaction leaves abandoned frames of THIS generation past the extent.
+      exec!(db, "BEGIN")
+      for i <- 1..30, do: exec!(db, "INSERT INTO t VALUES (#{i}, randomblob(3900))")
+      exec!(db, "ROLLBACK")
+      h = agrees!(h, wal, "after a rollback (abandoned tail)")
+
+      exec!(db, "INSERT INTO t VALUES (-1, NULL)")
+      h = agrees!(h, wal, "a commit over the abandoned slots")
+
+      # Checkpoint, then write: the WAL restarts in place, so a stale tail of the old generation.
+      exec!(db, "PRAGMA wal_checkpoint(PASSIVE)")
+      exec!(db, "INSERT INTO t VALUES (-2, NULL)")
+      h = agrees!(h, wal, "first read after a restart (cursor from the old generation)")
+
+      exec!(db, "INSERT INTO t VALUES (-3, NULL)")
+      h = agrees!(h, wal, "second read in the new generation")
+
+      Wal.close_held(h)
+    end
+
+    # THE REGRESSION GUARD. Pre-fix every header read walked back over every stale frame: measured
+    # 7.6 ms per read at 4,000 stale frames (the default autocheckpoint size) against ~25 us with
+    # the cursor. The bound is ~25x the post-fix figure and well under the pre-fix one, so it
+    # discriminates without being a latency assertion.
+    @tag :bench
+    test "a header read over a 4,000-frame stale tail does not walk it", ctx do
+      %{db: db, wal: wal} = ctx
+      grow!(db, 4_000)
+      exec!(db, "PRAGMA wal_checkpoint(PASSIVE)")
+      exec!(db, "INSERT INTO t VALUES (-1, NULL)")
+
+      {:ok, hdr, h} = Wal.read_held(nil, wal)
+      assert hdr.size - hdr.commit_extent > 4_000 * 4_000, "fixture: no stale tail to walk"
+
+      n = 50
+
+      {us, h} =
+        :timer.tc(fn ->
+          Enum.reduce(1..n, h, fn _, acc ->
+            {:ok, _, acc} = Wal.read_held(acc, wal)
+            acc
+          end)
+        end)
+
+      Wal.close_held(h)
+      per_read = div(us, n)
+
+      assert per_read < 1_000,
+             "Wal.read_held took #{per_read} us per read over a 4,000-frame stale tail; it is " <>
+               "walking the tail again (pre-fix: ~7,600 us)"
+    end
+  end
 end
