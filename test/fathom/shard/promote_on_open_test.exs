@@ -663,6 +663,77 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     assert open_and_read(id) == Enum.to_list(1..10)
   end
 
+  # ONE DECISION READ PER COLD OPEN, NOT TWO (expert review 2026-10-01 perf #3). With shipping on,
+  # `open_lineage` HEADs the object to derive this ownership's lineage, and the fleet path then
+  # HEADed the SAME object again, back to back under the same lease with nothing served in
+  # between, to make its promote decision. Each is a serial object-store round trip on every
+  # replicating cold open. The decision now reuses the lineage read; the post-transfer RE-read
+  # (`recheck_object/4`) is a different read on purpose and stays. So: two reads, not three.
+  test "a replicating cold open that promotes reads the object head twice, not three times",
+       ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+    Application.put_env(:fathom, :replication_recover_from_peers, true)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    {conn, coordinator} = build_shard(id, 10, 3)
+    assert {:ok, stamp} = Storage.object_position(id)
+
+    install_replica(id, %{
+      epoch: stamp.epoch,
+      wal_gen: stamp.wal_gen,
+      wal_ordinal: stamp.wal_ordinal,
+      offset: stamp.offset + 1
+    })
+
+    tear_down_primary(id, conn, coordinator)
+
+    # A FRESH lock, not a takeover. A takeover reads the head inside the acquire
+    # (`Storage.takeover_claim/2`) and carries the lineage on the lease, so `open_lineage` never
+    # reads it and the double read this test pins cannot happen. The dead owner's lock is removed
+    # so the reopen acquires fresh, the path every ordinary cold open takes.
+    File.rm!(Path.join(Fathom.Shard.Storage.Local.dir(), "#{id}.lock"))
+
+    # Shipping on for the REOPEN only: it is what makes `open_lineage` read the head at all, and
+    # turning it on earlier would route the fixture's own commits through a session with no peers.
+    prev_enabled = Application.get_env(:fathom, :replication_enabled)
+    Application.put_env(:fathom, :replication_enabled, true)
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if is_nil(prev_enabled),
+        do: Application.delete_env(:fathom, :replication_enabled),
+        else: Application.put_env(:fathom, :replication_enabled, prev_enabled)
+    end)
+
+    test_pid = self()
+
+    Application.put_env(
+      :fathom,
+      :faulty_before,
+      {:object_head, fn read_id -> if read_id == id, do: send(test_pid, :object_head_read) end}
+    )
+
+    # The promotion really happened, or the count below describes some other path.
+    assert open_and_read(id) == Enum.to_list(1..10)
+    Application.delete_env(:fathom, :faulty_before)
+
+    reads = count_messages(:object_head_read)
+
+    assert reads == 2,
+           "a replicating cold open read the object head #{reads} times; expected 2 (the " <>
+             "lineage/decision read and the post-transfer recheck)"
+  end
+
+  defp count_messages(msg, n \\ 0) do
+    receive do
+      ^msg -> count_messages(msg, n + 1)
+    after
+      0 -> n
+    end
+  end
+
   # A WARM restart is a former primary reopening its OWN local files, which still hold
   # acked-but-unflushed writes the stored object and the peer replicas are behind on. Promote-on-open
   # must NOT overwrite them (expert review 2026-09-18 #1 — a data-loss bug). This is the mirror of

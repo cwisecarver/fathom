@@ -8,7 +8,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
   fork verdict are settled (`revalidate_takeover/5`), passing the shard id, live path, lease, the
   fence etag so far, and the lineage.
 
-  `maybe_promote_replica/6` is the only entry point (the coordinator passes `warm?`, and a warm open
+  `maybe_promote_replica/7` is the only entry point (the coordinator passes `warm?`, and a warm open
   never promotes — see the head of that function). Every branch that is not a proven win returns
   the caller's `etag` unchanged, so the ordinary open path is bit-for-bit what it was — including
   every error, because a failed promotion must never fail an open (the stored-object path is still
@@ -30,9 +30,25 @@ defmodule Fathom.Shard.PromoteOnOpen do
   alias Fathom.Shard.Replication.Recovery
   alias Fathom.Shard.Storage
 
-  @spec maybe_promote_replica(String.t(), Path.t(), map(), String.t() | nil, term(), boolean()) ::
+  @doc """
+  Decide which bytes a cold open serves: the stored object, or a fresher A2 replica.
+
+  The last argument is the object head the coordinator already read for this open's lineage
+  (`{:ok, head}` / `{:error, _}`), or `nil` when it read none. When present it is the fleet path's
+  decision read, so a replicating cold open pays one HEAD here rather than two back to back
+  (expert review 2026-10-01 perf #3).
+  """
+  @spec maybe_promote_replica(
+          String.t(),
+          Path.t(),
+          map(),
+          String.t() | nil,
+          term(),
+          boolean(),
+          {:ok, term()} | {:error, term()} | nil
+        ) ::
           String.t() | nil | {:error, term()} | {:promoted, String.t(), pos_integer()}
-  def maybe_promote_replica(shard_id, path, lease, etag, lineage, warm?) do
+  def maybe_promote_replica(shard_id, path, lease, etag, lineage, warm?, head) do
     cond do
       # A WARM open means the coordinator has ALREADY decided this node's local file is the bytes to
       # serve, and promote must not then clobber them (expert review 2026-09-18 #1 — a data-loss
@@ -67,7 +83,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
       # means no replica table to read AND nowhere for a pulled replica to install, so both branches
       # below would have declined anyway — `Recovery.search/5` says so in as many words.
       promote_on_open?() and follower_running?() ->
-        try_promote(shard_id, path, lease, etag, lineage)
+        try_promote(shard_id, path, lease, etag, lineage, head)
 
       true ->
         etag
@@ -77,7 +93,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
   defp follower_running?, do: Process.whereis(Follower) != nil
 
   @doc """
-  The etag to serve from, given what `maybe_promote_replica/6` returned.
+  The etag to serve from, given what `maybe_promote_replica/7` returned.
 
   A promotion that stated an ordinal answers `{:promoted, etag, seed}`; every other outcome is the
   etag itself. Unwrapped with two pattern-matching accessors rather than a tuple on every open, so
@@ -122,11 +138,11 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # short-circuits on its own replica before opening a socket), and only that path performs the
   # mid-flight `recheck_object/4`. Routing it to the local path silently dropped the re-read and
   # promoted against a stamp that had moved.
-  defp try_promote(shard_id, path, lease, etag, lineage) do
+  defp try_promote(shard_id, path, lease, etag, lineage, head) do
     cond do
       not Recovery.enabled?() -> try_promote_local(shard_id, path, lease, etag, lineage)
       nothing_to_promote?(shard_id) -> etag
-      true -> try_promote_from_fleet(shard_id, path, lease, etag, lineage)
+      true -> try_promote_from_fleet(shard_id, path, lease, etag, lineage, head)
     end
   end
 
@@ -160,10 +176,15 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # and a flush landing in there left the promote decision resting on a version that no longer
   # exists. That was never unsafe — the fenced publish 412s — but the cost was a whole transfer, a
   # snapshot, and a log line claiming the object was behind when by then it was not.
-  defp try_promote_from_fleet(shard_id, path, lease, etag, lineage) do
+  #
+  # The decision read reuses the head the coordinator took for this open's lineage when it has one:
+  # both read the same object under the same lease with nothing served in between, so a second HEAD
+  # only added a serial round trip (expert review 2026-10-01 perf #3). The RE-read below is a
+  # different read on purpose and is never shared.
+  defp try_promote_from_fleet(shard_id, path, lease, etag, lineage, prefetched) do
     started = System.monotonic_time(:millisecond)
 
-    with {:ok, head} <- Storage.object_head(shard_id),
+    with {:ok, head} <- decision_head(shard_id, prefetched),
          {:ok, replica} <- Recovery.best_replica(shard_id, position_of(head)),
          true <- Promote.fresher?(replica, position_of(head)),
          :ok <- recheck_object(shard_id, head, replica, started) do
@@ -172,6 +193,9 @@ defmodule Fathom.Shard.PromoteOnOpen do
       _ -> etag
     end
   end
+
+  defp decision_head(_shard_id, {:ok, _} = head), do: head
+  defp decision_head(shard_id, _), do: Storage.object_head(shard_id)
 
   defp position_of(nil), do: nil
   defp position_of(%{position: position}), do: position
