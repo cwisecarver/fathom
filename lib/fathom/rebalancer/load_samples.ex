@@ -45,7 +45,7 @@ defmodule Fathom.Rebalancer.LoadSamples do
 
   @doc """
   Distinct shard_ids seen in any node's samples within `ms` — the recent fleet-hot set. The
-  reporter intersects this with its local warm cache to publish the warm-location signal (the
+  reporter intersects this with its local A2 replica set to publish the warm-location signal (the
   affinity-aware target input).
   """
   @spec recent_shard_ids(non_neg_integer()) :: [String.t()]

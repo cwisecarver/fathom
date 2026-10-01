@@ -14,7 +14,7 @@ defmodule Fathom.Rebalancer.WarmLocations do
 
   @doc """
   Makes `node_key`'s advertised warm set exactly `shard_ids` (the intersection of the
-  fleet-hot shards and this node's warm cache): upserts a fresh row per shard and drops this
+  fleet-hot shards and this node's A2 replica set): upserts a fresh row per shard and drops this
   node's rows for shards no longer warm+hot. Returns `:ok`.
   """
   @spec publish(String.t(), [String.t()]) :: :ok

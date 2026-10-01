@@ -133,7 +133,7 @@ defmodule Fathom.Directory do
           # GREATEST, not a plain replace: touches are coalesced and flushed later, and two
           # nodes serving the same shard across a remap can flush out of order, so an
           # unconditional replace could rewind last_active_at with a stale stamp — corrupting
-          # the recency heuristics (warm-follower target set, laggard ordering). Keep the
+          # the recency heuristics (laggard ordering, the revert write-age guard). Keep the
           # newer of incoming vs stored; updated_at (bookkeeping) always advances.
           on_conflict:
             from(s in Shard,

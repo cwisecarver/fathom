@@ -998,10 +998,9 @@ defmodule Fathom.Shard do
       # the post-touch object. Adopt the post-touch etag with NO re-pull (the same
       # provenance argument the warm branch makes via its sidecar), stamping the sidecar
       # to `post` so a later warm restart fences with the store's real etag. This is the
-      # warm standby's HEADLINE scenario — a data-bearing crash failover: the survivor's
-      # live path is empty (the warm copy lives in the follower cache, so warm? is false),
-      # so without this every such failover discarded the promoted/pulled copy for a full
-      # body re-pull, the exact cost the warm follower exists to avoid. `pre != post` is
+      # data-bearing crash failover: the survivor's live path is empty (warm? is false), so
+      # without this every such failover discarded the pulled copy for a full body re-pull.
+      # (It was written for the warm standby, removed 2026-09-14; the case outlives it.) `pre != post` is
       # guaranteed by confirm_rotation, and `etag == post` was already handled above, so
       # `etag == pre` unambiguously means the pre-touch object. Only reachable on the cold
       # (non-warm) takeover path — the warm clause above catches warm? == true first.
@@ -1101,8 +1100,7 @@ defmodule Fathom.Shard do
 
   # The pull / warm-promotion / open-materialization path moved to `Fathom.Shard.Materializer`
   # (2026-09-13, Phase 4): start_pull/2, await_pull/3, promote_pull/2, abandon_pull/2, pull_temp/1
-  # (public), and warm_or_cold_pull / promote_warm_cache / warm_cache_stat / emit_warm / rm_pull_temp
-  # (private). It is the concern that blocks on the S3 GET.
+  # (public), and rm_pull_temp (private). It is the concern that blocks on the S3 GET.
 
   # Best-effort, mirroring Heartbeat.broadcast_lapse: a missing PubSub (the
   # scale/bench harness) must not fail an open — the flush-time fence still guards.

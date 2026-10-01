@@ -117,9 +117,9 @@ defmodule Fathom.Rebalancer.Reporter do
 
       publish(Enum.take(rows, top_n()))
       prune()
-      # Advertise which fleet-hot shards THIS node has warm-cached (affinity-aware target, #C):
-      # the intersection of the recent fleet-hot set and this node's warm cache. Bounded to hot
-      # shards; a node not running the follower simply advertises none (cached? is false).
+      # Advertise which fleet-hot shards THIS node holds an A2 replica of (affinity-aware
+      # target, #C): the intersection of the recent fleet-hot set and this node's replica set.
+      # Bounded to hot shards; a node that follows nothing advertises none.
       publish_warm_locations()
     rescue
       e -> Logger.warning("load reporter window dropped: #{Exception.message(e)}")

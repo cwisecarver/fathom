@@ -291,9 +291,10 @@ defmodule Fathom.Shard.Storage do
               | {:error, term()}
 
   # Conditional pull, keyed on the caller's currently-held `etag` (an opaque store
-  # value captured from a prior pull). The warm-standby freshness check: a warm cache
-  # may lag the owner's latest flush, so before serving it we confirm it equals the
-  # store's current object.
+  # value captured from a prior pull). Written as the warm standby's freshness check (a
+  # cached copy may lag the owner's latest flush, so confirm it equals the store's current
+  # object). NO CALLER since that cache was removed 2026-09-14 — kept only as a backend
+  # contract; remove it or give it a caller.
   #
   #   * `{:ok, :unchanged}` — the object's etag matches `etag`; nothing written, the
   #     caller's existing local copy is current (a store 304). No byte transfer.
@@ -1435,7 +1436,7 @@ defmodule Fathom.Shard.Storage do
     # on `:shard_shutdown_ms` expiry, on `DynamicSupervisor.terminate_child` from `Shards.stop/1`,
     # and on node death. One full shard-sized orphan (plus its `-wal`/`-shm`) per killed promotion,
     # on a volume nothing ever swept — it eats the density budget and, via
-    # `Fathom.Admin.Measurements.disk/0`, the free-space floor the warm cache backs off against.
+    # `Fathom.Admin.Measurements.disk/0`, the free-space floor A2 follower seeding backs off against.
     for tmp <- Path.wildcard(base <> ".{dl,snap,tmp,pull,z,promote}*"),
         stale_file?(tmp, cutoff),
         reduce: 0 do

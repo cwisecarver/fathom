@@ -10,7 +10,7 @@ defmodule Fathom.Shard.Replication.Fleet do
     * a `Registry` + `DynamicSupervisor` for the per-shard `Session` processes
 
   Entirely inert unless one of those gates is on, matching every other Phase 2 component
-  (`:shard_load`, `:warm_follower`, `:rebalancer_enabled`): a feature that changes the commit path
+  (`:shard_load`, `:rebalancer_enabled`): a feature that changes the commit path
   must be something an operator turns on deliberately, after reading the runbook, not something
   that arrives with a deploy.
 

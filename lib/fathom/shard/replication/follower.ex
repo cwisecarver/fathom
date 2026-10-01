@@ -765,7 +765,7 @@ defmodule Fathom.Shard.Replication.Follower do
     incoming = (b.db_size || 0) + (b.wal_size || 0)
 
     case Fathom.Admin.Measurements.disk_info(dir(name)) do
-      # Cannot read the volume — fail OPEN, exactly as WarmFollower.headroom?/4 does. Refusing to
+      # Cannot read the volume — fail OPEN (as the removed WarmFollower did). Refusing to
       # replicate because a stat failed would turn an observability gap into a durability one.
       :error ->
         true

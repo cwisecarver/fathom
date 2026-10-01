@@ -96,9 +96,9 @@ defmodule Fathom.Admin.Measurements do
   Local-disk headroom for the directories fathom writes to (expert review 2026-08-01 #36).
 
   Nothing in the metrics layer read the filesystem before this: `fathom.storage.bytes` is *S3*
-  usage, and the warm-follower cache — the one component deliberately sized to fill disk — is
-  budgeted in shard **count** (`:warm_cache_max`, default 500), which is 8 MB or 2 TB depending on
-  tenant size. `docs/runbooks/operations.md` ranks disk-full a top-four incident and its prevention
+  usage, and the then warm-follower cache (removed 2026-09-14) — the one component deliberately
+  sized to fill disk — was budgeted in shard **count**, which is 8 MB or 2 TB depending on tenant
+  size. The A2 replica store (`replica` below) is the disk consumer that grows like that now. `docs/runbooks/operations.md` ranks disk-full a top-four incident and its prevention
   step is "alert on disk %", a signal fathom did not emit.
 
   **Why it matters more than an ordinary capacity gauge:** when the volume fills, every cold-open
@@ -152,12 +152,12 @@ defmodule Fathom.Admin.Measurements do
   `[{mount, total_kb, available_kb, capacity_percent}]`. KB there is 1024-byte blocks. Returns
   `:error` rather than raising or guessing: this feeds a gauge and a back-pressure decision, and a
   fabricated number in either is worse than an absent one — a wrong "plenty free" disables the
-  brake, a wrong "full" stops warming on a healthy node.
+  brake, a wrong "full" makes a healthy follower refuse seeds (`Follower.headroom?/2`).
   """
   @spec disk_info(String.t()) ::
           {:ok, %{mount: String.t(), total_bytes: integer(), free_bytes: integer()}} | :error
   def disk_info(path) do
-    # Resolve to the nearest EXISTING ancestor first. `SHARD_DATA_DIR` and the warm cache are
+    # Resolve to the nearest EXISTING ancestor first. `SHARD_DATA_DIR` and `REPLICATION_DIR` are
     # created lazily — the data dir does not exist until the first shard opens — and `disksup`
     # returns nothing for a path that is not there. Without this the gauge is blind on exactly the
     # node state where disk headroom is most worth knowing: a freshly booted node about to pull its

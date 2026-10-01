@@ -9,7 +9,7 @@ defmodule Fathom.Tenants do
 
   A "tenant" is one shard — one SQLite file. Deletion is the hard case: a full erase
   must reach the live stored object + lock, every retained migration version, every
-  snapshot, the owner node's local file, every warm-follower cache copy fleet-wide, the
+  snapshot, the owner node's local file, every A2 follower replica fleet-wide, the
   directory row, and any pending per-shard Oban jobs — and it must leave a **tombstone**
   so novel-shard admission can't silently re-mint the subdomain as an empty shard.
 
@@ -17,7 +17,7 @@ defmodule Fathom.Tenants do
 
   `delete/1` sets the re-mint guard **first and synchronously** — tombstone the directory
   row, then broadcast so every node's `Fathom.Tenants.Tombstones` ETS set refuses the id
-  and drops its warm-follower copy — and only then enqueues `Fathom.Tenants.DeleteJob` for
+  and erases its A2 replica — and only then enqueues `Fathom.Tenants.DeleteJob` for
   the durable, retryable physical erase. So from the instant a delete starts, no new
   stream can open the shard.
 
@@ -400,7 +400,7 @@ defmodule Fathom.Tenants do
   @doc """
   Announces `shard_id`'s deletion fleet-wide: records it in THIS node's tombstone set
   immediately (so re-mint is blocked the instant a delete starts) and pushes it over Oban's
-  LISTEN/NOTIFY so every other node tombstones it and purges its warm-follower copy. Best-effort
+  LISTEN/NOTIFY so every other node tombstones it and erases its A2 replica. Best-effort
   — a node that's down misses the push and converges on the periodic tombstone refresh. See
   `Fathom.Tenants.Tombstones`.
   """

@@ -41,7 +41,7 @@ defmodule Fathom.Migrator.ShardMigration do
     # Directory.get, NOT resolve (expert review #40): resolve upserts last_active_at
     # and registers unknown ids, so every rollout/reconcile sweep attempt — including
     # ones that merely snooze — phantom-bumped recency on shards no client touched
-    # (corrupting warm-follower targeting, laggard ordering, and over-refusing the
+    # (corrupting laggard ordering and over-refusing the
     # revert write-age guard), and a mistyped id minted a bogus active v0 row.
     # Registering genuinely-new shards is the checkout path's job.
     case Directory.get(shard_id) do

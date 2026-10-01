@@ -238,7 +238,7 @@ defmodule Fathom.Shard.Storage.Local do
   # skips the body; the Local double reads it to hash, which is fine on local disk.)
   @impl true
   def pull_if_changed(shard_id, local_path, etag) do
-    # The warm-follower revalidation loop calls this for every cached shard on every poll, and it
+    # The (removed) warm-follower revalidation loop called this for every cached shard on every poll, and it
     # used to read AND fully hash the entire object just to conclude nothing changed — O(cached ×
     # shard bytes) of disk read and hashing per poll, where the S3 backend does a bodiless 304
     # (expert review 2026-07-24 #25).

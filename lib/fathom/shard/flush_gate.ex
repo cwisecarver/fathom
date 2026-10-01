@@ -47,7 +47,7 @@ defmodule Fathom.Shard.FlushGate do
   ±25% timer jitter, which decorrelates phase but not sustained rate. At the measured density
   and the default 5s interval that is thousands of full-object PUTs per second per node
   through one 200-connection Finch pool that also carries cold-open pulls, lease and heartbeat
-  ops, and warm-follower revalidation — on exactly the survivor absorbing a failover.
+  ops — on exactly the survivor absorbing a failover.
   #
   The default is derived from the pool rather than fixed, so raising `pool_size` raises the
   cap with it: a quarter of the pool for bulk background writes, floored at the dirty-IO

@@ -17,7 +17,7 @@ defmodule Fathom.Rebalancer.HandoffJob do
   3. **Drain the source** — with new traffic now going to the target, the source's
      in-flight connections finish and it flushes + releases the lease.
   4. The target's next request (already routed there) acquires the freed lease and serves
-     from the warm cache.
+     from an A2 replica when it holds one (promote-on-open), else a cold pull.
 
   **Why this order.** Draining first would leave the shard routed to the source (old hash
   home), so a client would immediately re-open it there — a race. Flipping first stops the

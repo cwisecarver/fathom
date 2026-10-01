@@ -1063,9 +1063,9 @@ defmodule Fathom.Shard.Storage.S3 do
   defp do_download(url, local_path, headers, opts, attempts_left) do
     tmp = "#{local_path}.dl.#{System.unique_integer([:positive])}"
     # The temp file/fd is created LAZILY on the first 200 data chunk (review 2026-07-23
-    # #15b): a 304/404 has no body, and the eager open cost every warm-follower
-    # revalidation a create/open/close/rm disk cycle per 304 — pure churn at
-    # O(cached)/poll. The fd rides this process's dictionary (the `into` fun runs in the
+    # #15b): a 304/404 has no body, and the eager open cost every (since-removed)
+    # warm-follower revalidation a create/open/close/rm disk cycle per 304 — pure churn
+    # at O(cached)/poll; a missing object still benefits. The fd rides this process's dictionary (the `into` fun runs in the
     # calling process) so the after-block can close it on ANY exit, including a transport
     # error where Req returns no response to carry it.
     fd_key = {__MODULE__, :dl_fd, tmp}
