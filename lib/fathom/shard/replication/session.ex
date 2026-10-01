@@ -1518,8 +1518,15 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
+  # The COMMITTED EXTENT, not the file size (expert review 2026-10-01 perf #1). A reused WAL keeps
+  # its high-water mark, so the bytes past the extent are stale frames from an earlier generation.
+  # Seeding them and recording the follower at the file size put it AHEAD of every later commit's
+  # extent: each commit planned a reset, the follower (same salt, same generation) answered
+  # `:offset_mismatch`, and once the extent finally passed the old mark the primary appended from
+  # there, so the frames written in between never reached the replica. Committed frames of the
+  # current generation are never rewritten before the next reset, so 0..extent is stable to stream.
   defp wal_size_of(:empty), do: 0
-  defp wal_size_of(%{size: size}), do: size
+  defp wal_size_of(%{commit_extent: extent}), do: extent
 
   defp chunk_bytes,
     do: Application.get_env(:fathom, :replication_seed_chunk_bytes, 4 * 1024 * 1024)

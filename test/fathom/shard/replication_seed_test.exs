@@ -1122,6 +1122,82 @@ defmodule Fathom.Shard.ReplicationSeedTest do
 
   # THE ISOLATION GATE (expert review 2026-08-20 #1, and the test gap #37 named).
   #
+  # A SEED MUST POSITION THE FOLLOWER AT THE COMMIT EXTENT, NOT THE FILE SIZE (expert review
+  # 2026-10-01 perf #1).
+  #
+  # SQLite never shrinks a reused WAL: after a checkpoint the next write restarts it IN PLACE from
+  # frame 0 with fresh salts, so the file keeps its high-water mark while the committed extent is
+  # small. The seed recorded the follower at `before.size` — the high-water mark — and shipped the
+  # stale old-generation frames past the extent too. The next commit's extent was then below that
+  # recorded offset, so the primary planned a reset, the follower (same salt, same generation)
+  # answered `:offset_mismatch` at the high-water mark, and that repeated on every commit: no
+  # follower could ack anything until the extent grew past the old size. And when it finally did,
+  # the primary appended from the high-water mark, so the frames written between the seed-time
+  # extent and that mark were never sent and the replica held stale bytes in their place.
+  test "a seed taken over a REUSED WAL lets the next commits replicate, and the replica holds them",
+       ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+    enable!(followers, 2)
+
+    {coordinator, conn, path} = open_shard!(id)
+    wal = path <> "-wal"
+
+    # Grow the WAL, checkpoint it fully (no other readers, so PASSIVE completes), then commit one
+    # small row: SQLite restarts the WAL in place, leaving the file at its high-water mark.
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER, pad BLOB)", [])
+
+    for i <- 1..200 do
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?, randomblob(2000))", [i])
+    end
+
+    {:ok, _} = Connection.query(conn, "PRAGMA wal_checkpoint(PASSIVE)", [])
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1000, NULL)", [])
+
+    {:ok, hdr} = Wal.read(wal)
+
+    assert hdr.commit_extent < hdr.size,
+           "the WAL was not reused in place (extent #{hdr.commit_extent}, size #{hdr.size}); " <>
+             "this test would prove nothing"
+
+    for {name, _} <- followers, do: refute(Follower.state_of(name, id))
+
+    # The first commit finds every follower without a copy, so it seeds them all from this WAL.
+    _ = Session.commit(id, wal, coordinator)
+
+    for {name, _} <- followers,
+        do: await_seeded(name, id, fn -> Session.commit(id, wal, coordinator) end)
+
+    # Commits after the seed must replicate. Two, so the second is not a lucky first-after-seed.
+    for a <- [1001, 1002] do
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?, NULL)", [a])
+
+      assert :ok = Session.commit(id, wal, coordinator),
+             "a commit after a seed over a reused WAL failed: the seed recorded the follower at " <>
+               "the WAL's file size, so every follower answers :offset_mismatch until the " <>
+               "committed extent grows past the old high-water mark"
+    end
+
+    {:ok, %{rows: [[expected]]}} = Connection.query(conn, "SELECT count(*) FROM t", [])
+
+    # Open a COPY of each replica the way promotion would, so the follower's own files are untouched.
+    for {name, _} <- followers, Follower.state_of(name, id) do
+      copy = Path.join(root, "copy_#{name}.db")
+      File.cp!(Follower.db_path(name, id), copy)
+
+      if File.exists?(Follower.wal_path(name, id)),
+        do: File.cp!(Follower.wal_path(name, id), copy <> "-wal")
+
+      {:ok, r} = Connection.open(copy)
+      got = Connection.query(r, "SELECT count(*) FROM t", [])
+      :ok = Connection.close(r)
+
+      assert {:ok, %{rows: [[^expected]]}} = got,
+             "replica on #{name} does not hold every committed row (expected #{expected}): " <>
+               inspect(got)
+    end
+  end
+
   # Every other test in this file drives the receive path through a real primary, which only ever
   # sends legitimate shard ids. Nothing drove it with a HOSTILE one — and the listener is
   # unauthenticated, so a hostile id is exactly what an attacker supplies. The follower built every
