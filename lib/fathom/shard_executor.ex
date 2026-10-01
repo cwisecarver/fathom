@@ -309,6 +309,7 @@ defmodule Fathom.ShardExecutor do
          ddl?
        ) do
     started = System.monotonic_time()
+    schema_before = if ddl?, do: schema_version(conn)
 
     case Connection.query(conn, sql, args, dml?: dml?) do
       {:ok, result} ->
@@ -364,7 +365,18 @@ defmodule Fathom.ShardExecutor do
           # was the 2026-07-24 #17 fix; it cannot see a sibling stream on the same shard, whose
           # cached `SELECT *` then reports the pre-DDL column names against post-DDL rows.
           Connection.purge_statements(conn)
-          Fathom.Shard.SchemaGen.bump()
+
+          # ONLY WHEN THE MAIN SCHEMA ACTUALLY MOVED (expert review 2026-10-01 perf #9). The
+          # generation is node-global, so a bump makes every cached statement of every tenant on
+          # the node re-prepare. `ddl?/1` matches by leading keyword, so a no-op
+          # `CREATE TABLE IF NOT EXISTS` and a connection-local `CREATE TEMP TABLE` (neither
+          # visible to any other connection) used to bump it too, and frameworks issue both on
+          # every boot or request. `PRAGMA schema_version` is SQLite's own counter of main-schema
+          # changes; a read failure on either side counts as "moved", the safe direction.
+          case schema_version(conn) do
+            v when is_integer(v) and v == schema_before -> :ok
+            _ -> Fathom.Shard.SchemaGen.bump()
+          end
         end
 
         capture(opts.template?, conn, sql, args)
@@ -1883,6 +1895,15 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp ddl?(_), do: false
+
+  # The main schema's change counter, or nil if it cannot be read. Only ever called for a DDL
+  # statement, so it adds two tiny queries to DDL and nothing to anything else.
+  defp schema_version(conn) do
+    case Connection.query(conn, "PRAGMA schema_version", []) do
+      {:ok, %{rows: [[v]]}} when is_integer(v) -> v
+      _ -> nil
+    end
+  end
 
   # `:busy` (the busy-timeout expiry from Connection) is the SQLite "database is locked"
   # condition; give it the human message a client expects instead of the inspected atom ":busy"

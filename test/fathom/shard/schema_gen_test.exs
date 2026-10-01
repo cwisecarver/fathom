@@ -69,6 +69,47 @@ defmodule Fathom.Shard.SchemaGenTest do
     assert row == [1, "hello", "0"]
   end
 
+  # A DDL THAT CHANGED NOTHING MUST NOT INVALIDATE THE NODE (expert review 2026-10-01 perf #9).
+  # The generation is node-global, so every bump makes every cached statement on every stream of
+  # every tenant re-prepare on its next use. The executor bumped on ANY statement that LOOKS like
+  # DDL, including `CREATE TABLE IF NOT EXISTS` on a table that exists and `CREATE TEMP TABLE`,
+  # which is connection-local and invisible to every other connection. Frameworks issue both on
+  # every boot or request, so one such tenant kept the whole node's statement cache cold.
+  test "only DDL that changes the main schema bumps the node-wide generation" do
+    id = "schemagen_exec_#{System.unique_integer([:positive])}"
+
+    on_exit(fn ->
+      Fathom.Shards.stop(id)
+      for s <- ["", "-wal", "-shm", ".etag"], do: File.rm(Fathom.Shard.db_path(id) <> s)
+    end)
+
+    {:ok, conn} = Fathom.ShardExecutor.open(id)
+    on_exit(fn -> Fathom.ShardExecutor.close(conn) end)
+
+    run = fn sql ->
+      assert {:ok, _} = Fathom.ShardExecutor.execute(conn, %Filo.Stmt{sql: sql, args: []})
+    end
+
+    run.("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    before = Fathom.Shard.SchemaGen.current()
+
+    run.("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)")
+    run.("CREATE INDEX IF NOT EXISTS t_id ON t (id)")
+    after_index = Fathom.Shard.SchemaGen.current()
+    assert after_index > before, "a CREATE INDEX that did create one must still bump"
+
+    run.("CREATE INDEX IF NOT EXISTS t_id ON t (id)")
+    run.("DROP TABLE IF EXISTS no_such_table")
+    run.("CREATE TEMP TABLE scratch (a INTEGER)")
+
+    assert Fathom.Shard.SchemaGen.current() == after_index,
+           "a DDL statement that left the main schema unchanged bumped the node-wide generation, " <>
+             "forcing every cached statement on the node to re-prepare"
+
+    run.("ALTER TABLE t ADD COLUMN y TEXT")
+    assert Fathom.Shard.SchemaGen.current() > after_index, "a real schema change must bump"
+  end
+
   # The zero-row case, which is why the tempting `length(hd(rows)) != length(cols)` guard was NOT
   # used: there is no row to measure, and the reported columns are still wrong.
   test "the stale-column fix also covers a SELECT * that returns no rows" do
