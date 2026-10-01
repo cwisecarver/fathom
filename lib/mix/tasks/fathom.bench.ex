@@ -80,6 +80,7 @@ defmodule Mix.Tasks.Fathom.Bench do
     :concurrent,
     :hrana_rt,
     :hrana_open_rt,
+    :hrana_oneshot,
     :wire_rows,
     :wire_encode,
     :flush
@@ -235,6 +236,8 @@ defmodule Mix.Tasks.Fathom.Bench do
        "\u00b5s   (Hrana round trip TAIL, same samples)"},
       {"hrana_open_rt_us", metrics.hrana_open_rt_us,
        "\u00b5s   (Hrana round trip INCLUDING stream open)"},
+      {"hrana_oneshot_rt_us", metrics.hrana_oneshot_rt_us,
+       "\u00b5s   (one-shot stream: open + execute + CLOSE, the HTTP-SDK request)"},
       {"flush_p50_us", metrics.flush_p50_us, "\u00b5s   (one durability flush, local storage)"},
       {"wire_rows_per_s", metrics.wire_rows_per_s,
        "rows/s (result-set encode over the wire, keystone rows)"},

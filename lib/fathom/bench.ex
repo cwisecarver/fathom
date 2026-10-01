@@ -102,6 +102,7 @@ defmodule Fathom.Bench do
     :concurrent,
     :hrana_rt,
     :hrana_open_rt,
+    :hrana_oneshot,
     :wire_rows,
     :wire_encode,
     :flush
@@ -179,6 +180,10 @@ defmodule Fathom.Bench do
       # 2026-08-01 #41.1). hrana_rt_us above reuses one client, so every one of its samples is
       # a baton-resumed stream and the open is explicitly excluded from the timed window.
       hrana_open_rt_us: run_if(only, :hrana_open_rt, fn -> hrana_open_rt(opts) end),
+      # The same request as a real HTTP SDK sends it: open, execute AND close, so every sample
+      # runs the executor's close (checkin, pool reset or close) that hrana_open_rt_us never
+      # reaches (expert review 2026-10-01 perf #19). Watch-only until its variance is measured.
+      hrana_oneshot_rt_us: run_if(only, :hrana_oneshot, fn -> hrana_oneshot_rt(opts) end),
       wire_rows_per_s: run_if(only, :wire_rows, fn -> wire_rows(opts) end),
       # The OTHER encoder (#41.7). wire_rows_per_s drives encode_json/1; this drives encode/1,
       # the tagged-map builder Cursor and Protobuf reach, whose own moduledoc says the tagged-map
@@ -944,6 +949,51 @@ defmodule Fathom.Bench do
           {:ok, _, c} = result
           {c, [t | acc]}
         end)
+
+      p50(us)
+    end)
+  end
+
+  @doc """
+  `hrana_oneshot_rt_us` — median round trip of a ONE-SHOT stream: `[execute, close]` in one
+  pipeline with no baton, which is exactly what an HTTP SDK (and django-libsql under Django's
+  default `CONN_MAX_AGE=0`) sends per request.
+
+  Why it exists next to `hrana_open_rt_us` (expert review 2026-10-01 perf #19): that metric sends
+  `execute` only and drops the baton, so its streams are never closed. A run accumulates ~200
+  live streams (and SQLite handles) on one shard until Filo's idle timeout reaps them, which
+  means it (a) never runs `ShardExecutor.close/1` — no checkin, no pool reset, no
+  `release_owner_state` — and (b) always measures the regime where another handle keeps `-shm`
+  mapped. Prod pays both. This metric asserts its own precondition: if streams accumulate, it is
+  measuring the wrong thing and raises.
+  """
+  @spec hrana_oneshot_rt_us(keyword()) :: float() | nil
+  def hrana_oneshot_rt_us(opts \\ []), do: hrana_oneshot_rt(opts)
+
+  defp hrana_oneshot_rt(opts) do
+    samples = Keyword.get(opts, :hrana_rt_samples, @hrana_rt_samples)
+
+    requests = [
+      %{"type" => "execute", "stmt" => %{"sql" => "SELECT 1", "args" => []}},
+      %{"type" => "close"}
+    ]
+
+    with_wire(opts, "benchoneshot", fn client ->
+      # Warm the SHARD, then close that stream too so the timed loop starts from zero streams.
+      {:ok, _, client} = Filo.Client.pipeline(client, requests)
+
+      {_client, us} =
+        Enum.reduce(1..samples, {client, []}, fn _, {c, acc} ->
+          c = %{c | baton: nil}
+          {t, result} = :timer.tc(fn -> Filo.Client.pipeline(c, requests) end)
+          {:ok, [%{"type" => "ok"}, %{"type" => "ok"}], c} = result
+          {c, [t | acc]}
+        end)
+
+      live = Registry.count(Module.concat(Fathom.Bench.WireStreams, Registry))
+
+      unless live <= 1,
+        do: raise("hrana_oneshot_rt_us left #{live} live streams; it is not closing them")
 
       p50(us)
     end)

@@ -54,6 +54,19 @@ defmodule Fathom.BenchTest do
   # already existed, on EVERY stream open, for the entire life of the project — measured at ~24%
   # of this metric — and no gate, no bench and no test ever saw it, because it was in the parent
   # too. That is exactly the uniform-drift blind spot the ratio cannot cover.
+  # Expert review 2026-10-01 perf #19: the first metric that CLOSES its streams, so the first that
+  # runs the executor's close, the pool checkin and the reset. Measured ~620 us on a dev build
+  # against ~347 us for hrana_open_rt_us, whose streams are never closed; the difference is the
+  # close path plus `-shm` re-creation when the shard's last connection goes. 20 ms is ~30x headroom:
+  # an order-of-magnitude guard, and proof the metric ran (it raises if streams accumulate).
+  test "the one-shot stream metric clears its absolute bound" do
+    oneshot = Fathom.Bench.hrana_oneshot_rt_us(hrana_rt_samples: 30)
+    assert is_float(oneshot), "the loopback listener did not come up — this measured nothing"
+
+    assert oneshot < 20_000,
+           "one-shot [execute, close] round trip #{oneshot}us exceeded the 20ms ceiling"
+  end
+
   test "the per-stream open and flush metrics clear their absolute bounds" do
     open_rt = Fathom.Bench.hrana_open_rt_us(hrana_rt_samples: 30)
     assert is_float(open_rt), "the loopback listener did not come up — this measured nothing"

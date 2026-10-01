@@ -140,6 +140,10 @@ defmodule Fathom.Bench.Gate do
     # which would just re-blind the write path.
     {:hrana_open_rt_us, :higher_worse},
     {:flush_p50_us, :higher_worse},
+    # WATCH-ONLY until its band is measured (expert review 2026-10-01 perf #19), the same rule
+    # hrana_open_rt_us and flush_p50_us followed above: variance first, then a threshold. It is
+    # the first metric that runs the executor's close and the connection pool at all.
+    {:hrana_oneshot_rt_us, :higher_worse, :watch},
     # THE TAIL, gated from 2026-08-03 (expert review #41.5). Every metric above is a p50, and
     # `delta/4` is a pure ratio — which AGENTS.md forbids in as many words ("Assert an absolute
     # floor, not only a ratio… The ratio holds while throughput collapses"). A change that leaves
