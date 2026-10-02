@@ -482,6 +482,85 @@ defmodule Fathom.Shard.ReplicationSeedTest do
              "gets an empty database over a working stored object."
   end
 
+  # A TORN REPLICA'S RE-SEED MUST NOT LOSE A RACE WITH THE NEXT COMMIT'S PUSH (2026-10-02, the
+  # chaos rig's dominant 1024-tenant error source).
+  #
+  # A torn follower answers every push `:unknown_shard`, and `start_seeds/3` answers that with an
+  # ASYNC seed task. The shard's next commit then planned a push to the same follower as if nothing
+  # were happening. A `Shipper` holds ONE waiter per shard, so whichever of the two reached it
+  # second was refused `:already_in_flight` — and when that was the seed, it failed, the replica
+  # stayed torn, the next push was refused `:unknown_shard` again, and the loop repeated. The rig
+  # logged 7,855 torn re-asks (up to 52 for one shard) and 2,679 `seed failed :already_in_flight`
+  # in one five-minute run, with every one of those shards a follower short for the whole loop.
+  test "a torn replica is re-seeded while commits keep flowing, without already_in_flight",
+       ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+    enable!(followers, 2)
+    # Small chunks stretch the seed across many frames, so it is still streaming when the next
+    # commits arrive — the window the race needs.
+    Application.put_env(:fathom, :replication_seed_chunk_bytes, 4 * 1024)
+
+    {coordinator, conn, path} = open_shard!(id)
+    wal = path <> "-wal"
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER, b BLOB)", [])
+
+    {:ok, _} = Connection.query(conn, "BEGIN", [])
+
+    for i <- 1..1500 do
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?, randomblob(4000))", [i])
+    end
+
+    {:ok, _} = Connection.query(conn, "COMMIT", [])
+
+    for {name, _} <- followers,
+        do: await_seeded(name, id, fn -> Session.commit(id, wal, coordinator) end)
+
+    {name, _} = hd(followers)
+    torn = %{Follower.state_of(name, id) | torn: true}
+    :ets.insert(Follower.table(name), {id, torn})
+    File.write!(Follower.torn_path(name, id), "")
+    assert Follower.state_of(name, id).torn, "fixture: the replica is not torn"
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        for i <- 1..40 do
+          {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?, NULL)", [1000 + i])
+          _ = Session.commit(id, wal, coordinator)
+        end
+      end)
+
+    # Either order of the race shows up here: a push that reaches the shipper while the seed holds
+    # the shard's waiter is refused `:already_in_flight`, and a seed that arrives second fails with
+    # it. Neither should happen: a follower being seeded must not be pushed to at all.
+    refute log =~ ":already_in_flight",
+           "a commit pushed to a follower whose re-seed was in flight:\n" <>
+             (log
+              |> String.split("\n")
+              |> Enum.filter(&(&1 =~ "already_in_flight"))
+              |> Enum.take(5)
+              |> Enum.join("\n"))
+
+    # The seed is a ~6 MB stream in 4 KiB chunks, so it can still be running when the 40 commits
+    # finish. Keep committing (a real shard keeps writing) until it lands, bounded.
+    deadline = System.monotonic_time(:millisecond) + 30_000
+
+    healed? =
+      Stream.repeatedly(fn ->
+        if Follower.state_of(name, id).torn do
+          {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (0, NULL)", [])
+          _ = Session.commit(id, wal, coordinator)
+          Process.sleep(50)
+          :torn
+        else
+          :healed
+        end
+      end)
+      |> Enum.find(fn r -> r == :healed or System.monotonic_time(:millisecond) > deadline end)
+
+    assert healed? == :healed, "the torn replica was never re-seeded"
+  end
+
   # Ask a follower for its replica over the real socket and return the first decoded frame.
   defp replica_request!(port, shard_id) do
     # `packet: 4` to match the listener — the frames are length-prefixed, and a raw socket reads

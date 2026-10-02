@@ -70,11 +70,20 @@ defmodule Fathom.Shard.Replication do
   `q - u < total - u` reduces to `q < total`, which `Fleet.validate_quorum!/0` enforces at boot. A
   residual of zero never reaches here — see `ship_async/1`.
   """
-  @spec ship_quorum([{GenServer.server(), Protocol.Push.t()}], pos_integer(), timeout()) ::
+  @spec ship_quorum(
+          [{GenServer.server(), Protocol.Push.t()}],
+          pos_integer(),
+          timeout(),
+          keyword()
+        ) ::
           {:ok, [pid()], [{pid(), atom(), non_neg_integer()}]}
           | {:error, {:no_quorum, :impossible | :timeout, [{pid(), atom(), non_neg_integer()}]}}
-  def ship_quorum(pushes, q, timeout \\ @default_timeout_ms) do
-    n = length(pushes)
+  def ship_quorum(pushes, q, timeout \\ @default_timeout_ms, opts \\ []) do
+    # `:skip` — followers that belong to the quorum but are not sent anything, counted as refusals
+    # up front (reason `:seeding`): a follower mid-seed can only refuse a push, and pushing to it
+    # races the seed for its shipper's per-shard waiter. See `Session.ship_planned/4`.
+    skipped = Keyword.get(opts, :skip, [])
+    n = length(pushes) + length(skipped)
     # Raises on q >= n. That is intentional and load-bearing — see Quorum.new/2.
     quorum = Quorum.new(n, q)
 
@@ -85,11 +94,24 @@ defmodule Fathom.Shard.Replication do
         {shipper, p.offset + byte_size(p.payload)}
       end)
 
-    shard_id = pushes |> hd() |> elem(1) |> Map.fetch!(:shard_id)
-    for {shipper, p} <- pushes, do: Shipper.push(shipper, p)
+    shard_id =
+      Keyword.get_lazy(opts, :shard_id, fn ->
+        pushes |> hd() |> elem(1) |> Map.fetch!(:shard_id)
+      end)
 
     deadline = System.monotonic_time(:millisecond) + timeout
-    collect(quorum, shard_id, deadline, {[], []}, expected)
+    rejects = for s <- skipped, do: {s, :seeding, 0}
+    outcome = Enum.reduce(skipped, {:pending, quorum}, fn s, {_, qs} -> Quorum.reject(qs, s) end)
+
+    case outcome do
+      # Decided before anything is sent: the followers left cannot make the quorum.
+      {:impossible, _} = decided ->
+        settle(decided, shard_id, deadline, {[], rejects}, expected)
+
+      {:pending, quorum} ->
+        for {shipper, p} <- pushes, do: Shipper.push(shipper, p)
+        collect(quorum, shard_id, deadline, {[], rejects}, expected)
+    end
   end
 
   # `rejects` accumulates {shipper, reason} so the caller can act on WHY a follower refused rather

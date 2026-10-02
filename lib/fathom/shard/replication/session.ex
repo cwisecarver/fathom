@@ -805,9 +805,24 @@ defmodule Fathom.Shard.Replication.Session do
     if plans == [] do
       :nothing
     else
-      case build_pushes(state, wal_path, epoch, header, plans) do
-        {:ok, pushes, state} -> tag(deliver(state, header, plans, pushes, current), plans, header)
-        {:error, reason, state} -> read_failed(state, reason)
+      # A FOLLOWER BEING SEEDED IS PLANNED BUT NOT PUSHED TO (2026-10-02). It still counts in the
+      # quorum's denominator, as a refusal, so `Quorum.new/2`'s q < n guard sees the same fleet; it
+      # simply is not sent a push it could only refuse. Pushing to it raced the seed for the
+      # shipper's single per-shard waiter: when the push won, the seed failed `:already_in_flight`,
+      # the replica stayed torn, its next reply re-requested a seed, and the loop repeated — the
+      # rig's dominant 1024-tenant error source. The seed carries everything up to its start, and
+      # the frames committed meanwhile follow as an append once its result lands.
+      {skipped, sendable} =
+        Enum.split_with(plans, fn {s, _} -> Map.has_key?(state.seeding, s) end)
+
+      skipped = Enum.map(skipped, &elem(&1, 0))
+
+      case build_pushes(state, wal_path, epoch, header, sendable) do
+        {:ok, pushes, state} ->
+          tag(deliver(state, header, sendable, pushes, current, skipped), plans, header)
+
+        {:error, reason, state} ->
+          read_failed(state, reason)
       end
     end
   end
@@ -957,7 +972,7 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
-  defp deliver(state, header, plans, pushes, current) do
+  defp deliver(state, header, plans, pushes, current, skipped) do
     # Recorded BEFORE anything is sent, because a reply can be observed by a later commit's drain
     # with no plan in scope. See the `inflight` note in `init/1`.
     #
@@ -992,12 +1007,15 @@ defmodule Fathom.Shard.Replication.Session do
         {:ok, state, []}
 
       needed ->
-        collect(state, pushes, needed)
+        collect(state, pushes, needed, skipped)
     end
   end
 
-  defp collect(state, pushes, needed) do
-    case Replication.ship_quorum(pushes, needed, timeout()) do
+  defp collect(state, pushes, needed, skipped) do
+    case Replication.ship_quorum(pushes, needed, timeout(),
+           skip: skipped,
+           shard_id: state.shard_id
+         ) do
       {:ok, acked, rejects} ->
         # Advance ONLY the followers that actually ACKED — not everyone the quorum succeeded
         # without. Advancing a rejecter would leave the primary believing it holds bytes it
