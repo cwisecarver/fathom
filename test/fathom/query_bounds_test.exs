@@ -102,7 +102,16 @@ defmodule Fathom.QueryBoundsTest do
     {elapsed_us, result} =
       :timer.tc(fn -> ShardExecutor.execute(blocked, stmt("INSERT INTO t VALUES (2)")) end)
 
-    assert {:error, %Filo.Error{status: 503, code: "FILO_QUERY_TIMEOUT"}} = result
+    # DIAGNOSTIC ORDER (2026-10-02): CI OTP 28 failed this twice with `SQLITE_BUSY` and no timing,
+    # and it never reproduced locally (macOS/Linux, OTP 28, loaded, 2 CPUs). The elapsed time is what
+    # separates the three ways exqlite's busy handler returns early: ~0 ms means it gave up WITHOUT
+    # waiting (a caller-liveness check or a zero timeout), ~200 ms means it was cancelled but the
+    # timeout was not classified, ~5 s means the watchdog never fired. So it is reported FIRST, in
+    # the failure message, rather than discovered after the result assert has already stopped.
+    assert match?({:error, %Filo.Error{status: 503, code: "FILO_QUERY_TIMEOUT"}}, result),
+           "blocked write returned #{inspect(result)} after #{div(elapsed_us, 1000)} ms " <>
+             "(~0 ms: busy handler gave up without waiting; ~200 ms: cancelled but not " <>
+             "classified as a timeout; ~5000 ms: the watchdog never fired)"
 
     # The load-bearing half: it must give up at the DEADLINE, not at the 5s busy timeout.
     assert elapsed_us < 2_000_000,
