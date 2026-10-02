@@ -698,9 +698,15 @@ defmodule Fathom.Shard.Replication.Session do
   # same thing next round and refuses again, so it resurfaces) but only by accident, and a seed
   # deferred to the next commit is precisely the silent under-replication the late-reply drain
   # exists to prevent.
-  defp ship(state, wal_path, epoch, deadline), do: ship(state, wal_path, epoch, deadline, %{})
+  # `first?` separates "this commit wrote no frames" (nothing to plan on the FIRST round) from "the
+  # catch-up converged" (nothing left on a LATER round). They used to be told apart by whether any
+  # reject had been seen, so a multi-round commit with no rejects returned `:nothing` from its last
+  # round and `handle_call/3` replied from the PRE-ship state, discarding every follower's advance
+  # (2026-10-02, the rig's residual `offset_mismatch` storm). A later round always returns its state.
+  defp ship(state, wal_path, epoch, deadline),
+    do: ship(state, wal_path, epoch, deadline, %{}, true)
 
-  defp ship(state, wal_path, epoch, deadline, seen) do
+  defp ship(state, wal_path, epoch, deadline, seen, first?) do
     case Wal.read_held(state.wal_fd, wal_path) do
       {:ok, header, fd} ->
         state = %{state | wal_fd: fd}
@@ -708,7 +714,7 @@ defmodule Fathom.Shard.Replication.Session do
         case ship_planned(state, wal_path, epoch, header) do
           # Nothing left to plan. On the first round that means the commit wrote no frames; on a
           # later one it means the catch-up converged.
-          :nothing when map_size(seen) == 0 ->
+          :nothing when first? ->
             :nothing
 
           :nothing ->
@@ -753,7 +759,7 @@ defmodule Fathom.Shard.Replication.Session do
                 # Re-read the header rather than reusing it. Other streams commit to this shard
                 # concurrently, so the WAL may have grown again; planning from a stale header would
                 # ship a delta that is already short by the time it lands.
-                |> ship(wal_path, epoch, deadline, seen)
+                |> ship(wal_path, epoch, deadline, seen, false)
             end
 
           {:error, {:no_quorum, why}, new_state, rejects} ->
@@ -816,8 +822,12 @@ defmodule Fathom.Shard.Replication.Session do
 
   defp tag(other, _plans, _header), do: other
 
-  defp complete?(plans, %{size: size}),
-    do: Enum.all?(plans, fn {_shipper, {_kind, off, len}} -> off + len >= size end)
+  # Against the COMMIT EXTENT, the same bound `Primary.plan/3` ships to (expert review 2026-08-20 #5),
+  # not the file size. After a checkpoint the WAL keeps its high-water mark, so a round that shipped
+  # everything committed still compared short of `size` and forced a pointless extra round on every
+  # commit until the extent outgrew the old file (2026-10-02).
+  defp complete?(plans, %{commit_extent: extent}),
+    do: Enum.all?(plans, fn {_shipper, {_kind, off, len}} -> off + len >= extent end)
 
   defp build_pushes(state, wal_path, epoch, header, plans) do
     # One read per DISTINCT range, not per follower.

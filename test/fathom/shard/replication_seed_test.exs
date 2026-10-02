@@ -1198,6 +1198,63 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     end
   end
 
+  # A COMMIT IN A REUSED WAL GENERATION MUST NOT LOSE ITS OWN ADVANCE (2026-10-02, found chasing
+  # the 65k `offset_mismatch` lines left on the chaos rig after expert review 2026-10-01 perf #1).
+  #
+  # Two defects compounded. `complete?/2` compared a round against the WAL's FILE SIZE, which after
+  # a checkpoint stays at its high-water mark, so a round that shipped everything up to the commit
+  # extent still read as incomplete and the loop ran a second round. That round planned nothing and
+  # returned `:nothing` — the value that means "this commit wrote no frames" — so `handle_call/3`
+  # replied from the state it had BEFORE the ship and dropped the followers' advance. The next
+  # commit planned from the stale position, every follower answered `:offset_mismatch`, and the
+  # commit recovered only through an extra rejected round. On the rig: every commit of every shard
+  # between a flush and the WAL outgrowing its old size.
+  #
+  # WHAT THIS PINS: the OUTCOME (no lost advance, so no mismatch rounds). Probed both ways: it fails
+  # with both defects present, and EACH fix alone also makes it pass — `complete?/2` on the extent
+  # removes the extra round that hit the bad return, and `first?` makes that return keep its state.
+  # Both shipped because each is wrong on its own terms; this test cannot tell you which one broke.
+  test "commits after a checkpoint keep their followers' advance (no offset_mismatch rounds)",
+       ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+    enable!(followers, 2)
+
+    {coordinator, conn, path} = open_shard!(id)
+    wal = path <> "-wal"
+    {:ok, other} = Connection.open(path)
+    on_exit(fn -> Connection.close(other) end)
+
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER, b BLOB)", [])
+
+    for {name, _} <- followers,
+        do: await_seeded(name, id, fn -> Session.commit(id, wal, coordinator) end)
+
+    # Grow the WAL, then checkpoint from ANOTHER connection the way the flush does: the next write
+    # restarts the log in place and the file keeps its high-water mark.
+    for i <- 1..10 do
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?, randomblob(3000))", [i])
+      assert :ok = Session.commit(id, wal, coordinator)
+    end
+
+    {:ok, _} = Connection.query(other, "PRAGMA wal_checkpoint(PASSIVE)", [])
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        for i <- 11..16 do
+          {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?, randomblob(3000))", [i])
+          assert :ok = Session.commit(id, wal, coordinator)
+        end
+      end)
+
+    {:ok, hdr} = Wal.read(wal)
+    assert hdr.commit_extent < hdr.size, "fixture: the WAL was not reused in place"
+
+    refute log =~ "offset_mismatch",
+           "commits in a reused WAL generation bounced off offset_mismatch, i.e. the primary " <>
+             "lost the followers' previous advance:\n" <> log
+  end
+
   # Every other test in this file drives the receive path through a real primary, which only ever
   # sends legitimate shard ids. Nothing drove it with a HOSTILE one — and the listener is
   # unauthenticated, so a hostile id is exactly what an attacker supplies. The follower built every
