@@ -281,7 +281,10 @@ defmodule Fathom.Shard.Replication.Session do
         # Drain first: a straggler's reply that landed while the PREVIOUS call was still running has
         # not reached `handle_info/2` yet, and leaving it would let the next `collect/4` mistake it
         # for an answer to the push about to be sent.
-        state = drain_late_replies(%{state | wal_path: wal_path}, wal_path)
+        state =
+          %{state | wal_path: wal_path}
+          |> drain_late_replies(wal_path)
+          |> await_stragglers_if_short(wal_path, deadline)
 
         case ship(state, wal_path, state.epoch, deadline) do
           {:ok, new_state, rejects} ->
@@ -1119,6 +1122,59 @@ defmodule Fathom.Shard.Replication.Session do
   #
   # Non-blocking (`after 0`): this runs on the commit path and must never wait for a follower that
   # the quorum already decided not to wait for.
+  # WAIT FOR THE PREVIOUS COMMIT'S STRAGGLERS WHEN THEY WOULD COST THIS ONE ITS QUORUM (2026-10-02).
+  #
+  # `ship_quorum/4` returns at the Q-th ack, so the previous commit's other followers are usually
+  # still mid-flight when a tenant's next statement arrives — and a `Shipper` holds ONE waiter per
+  # shard, so pushing to them now is refused `:already_in_flight`. With N=4/Q=2 that is harmless
+  # while two followers are free; but add one seeding, torn or overloaded follower and the commit
+  # fails `{:no_quorum, :impossible}` although every follower would have answered milliseconds
+  # later. On the chaos rig at 1024 tenants that was the single largest quorum-failure reason.
+  #
+  # So only when the followers that are FREE (no outstanding push, no seed in flight) number fewer
+  # than the quorum, wait for the outstanding replies first, bounded by this commit's own deadline.
+  # In steady state two followers are always free and this costs nothing; it trades a few ms of
+  # latency for a commit that would otherwise have failed outright.
+  #
+  # It waits only until ENOUGH are free, not for all of them: a dead follower with an outstanding
+  # push must not make every commit sit out its whole deadline.
+  defp await_stragglers_if_short(state, wal_path, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if map_size(state.inflight) == 0 or free_followers(state) >= quorum() or remaining <= 0 do
+      state
+    else
+      receive do
+        {:repl_reply, from, {:ack, _shard, next}} ->
+          state
+          |> settle_late_ack(from, next)
+          |> forget_inflight(from)
+          |> await_stragglers_if_short(wal_path, deadline)
+
+        {:repl_reply, from, {:reject, _shard, reason, follower_offset}} ->
+          rejects = [{from, reason, follower_offset}]
+
+          state
+          |> reconcile(rejects)
+          |> start_seeds(wal_path, rejects)
+          |> await_stragglers_if_short(wal_path, deadline)
+
+        {:seeded, shipper, result} ->
+          state
+          |> apply_seed_result(shipper, result)
+          |> await_stragglers_if_short(wal_path, deadline)
+      after
+        remaining -> state
+      end
+    end
+  end
+
+  defp free_followers(state) do
+    Enum.count(shippers(), fn s ->
+      not Map.has_key?(state.inflight, s) and not Map.has_key?(state.seeding, s)
+    end)
+  end
+
   defp drain_late_replies(state, wal_path) do
     receive do
       # A late ACK is not noise to be thrown away — it is a follower reporting that it holds the

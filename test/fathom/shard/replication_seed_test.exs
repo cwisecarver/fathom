@@ -561,6 +561,60 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     assert healed? == :healed, "the torn replica was never re-seeded"
   end
 
+  # A COMMIT MUST WAIT FOR ITS PREDECESSOR'S STRAGGLERS RATHER THAN FAIL ON THEM (2026-10-02, the
+  # chaos rig's largest 1024-tenant quorum-failure reason: `:already_in_flight` on 3 of 4 followers).
+  #
+  # A `Shipper` holds one waiter per shard, so a follower still answering the previous push refuses
+  # the next one locally. When so many followers are mid-flight that the rest cannot make the
+  # quorum, the commit used to fail `{:no_quorum, :impossible}` at once, although the stragglers
+  # answered milliseconds later. It now waits for enough of them, bounded by its own deadline.
+  #
+  # Staged deterministically: two of three shippers are suspended so the first commit times out
+  # with pushes in flight on both, and they are resumed only AFTER the second commit has started.
+  test "a commit waits for in-flight stragglers instead of failing on already_in_flight", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+    enable!(followers, 2)
+
+    {coordinator, conn, path} = open_shard!(id)
+    wal = path <> "-wal"
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+
+    for {name, _} <- followers,
+        do: await_seeded(name, id, fn -> Session.commit(id, wal, coordinator) end)
+
+    prev_timeout = Application.get_env(:fathom, :replication_timeout_ms)
+    Application.put_env(:fathom, :replication_timeout_ms, 1_000)
+
+    [a, b, _c] = Fleet.shippers()
+    pids = Enum.map([a, b], &GenServer.whereis/1)
+
+    on_exit(fn ->
+      for p <- pids, Process.alive?(p), do: :sys.resume(p)
+
+      if is_nil(prev_timeout),
+        do: Application.delete_env(:fathom, :replication_timeout_ms),
+        else: Application.put_env(:fathom, :replication_timeout_ms, prev_timeout)
+    end)
+
+    Enum.each(pids, &:sys.suspend/1)
+
+    # Commit 1: only one shipper can answer, so it fails with pushes outstanding on the other two.
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+    assert {:error, _} = Session.commit(id, wal, coordinator), "fixture: commit 1 was not short"
+
+    # The stragglers come back only after commit 2 has started.
+    spawn(fn ->
+      Process.sleep(200)
+      Enum.each(pids, &:sys.resume/1)
+    end)
+
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
+
+    assert :ok = Session.commit(id, wal, coordinator),
+           "a commit failed on the previous commit's in-flight pushes instead of waiting for them"
+  end
+
   # Ask a follower for its replica over the real socket and return the first decoded frame.
   defp replica_request!(port, shard_id) do
     # `packet: 4` to match the listener — the frames are length-prefixed, and a raw socket reads
