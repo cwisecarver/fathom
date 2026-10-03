@@ -1001,7 +1001,11 @@ defmodule Fathom.Shards do
     # fork_gated?) and …` short-circuit means neither gate on ⇒ no stat and no Postgres read at all.
     rate_gated? = Fathom.Shards.NovelLimiter.enabled?()
     fork_gated? = Application.get_env(:fathom, :fork_from_template, false)
-    novel? = (rate_gated? or fork_gated?) and novel_shard?(shard_id)
+
+    {rate_novel?, fork_novel?} =
+      novelty(rate_gated?, fork_gated?, Fathom.Shards.KnownShards.known?(shard_id), fn ->
+        novel_shard?(shard_id)
+      end)
 
     cond do
       # THE NOVEL-RATE GATE COMES FIRST, BEFORE ANY EVICTION (expert review 2026-09-18 #9). A spray
@@ -1012,7 +1016,7 @@ defmodule Fathom.Shards do
       # the cap, a novel-shard spray evicted a legitimate tenant and only THEN got rate-refused —
       # exploitable in the default `:hrana_auth=:disabled` posture. Gating novelty first means an
       # eviction is only ever spent to admit a request that will actually be admitted.
-      rate_gated? and novel? and limiter_refused?(shard_id) ->
+      rate_novel? and limiter_refused?(shard_id) ->
         {:error, :novel_shard_rate_limited}
 
       # At the cap, try to make room by evicting the least-recently-used IDLE shard (soft cap). Only
@@ -1024,9 +1028,28 @@ defmodule Fathom.Shards do
         {:error, :node_at_capacity}
 
       true ->
-        if fork_gated? and novel?, do: fork_novel(shard_id)
-        start(shard_id)
+        if fork_novel?, do: fork_novel(shard_id)
+
+        with {:ok, _pid} = ok <- start(shard_id) do
+          Fathom.Shards.KnownShards.put(shard_id)
+          ok
+        end
     end
+  end
+
+  @doc false
+  # Which gates see this open as novel: `{rate_novel?, fork_novel?}` (expert review 2026-10-01
+  # #18). `fresh` is the real check (a stat plus a synchronous directory read), run AT MOST ONCE
+  # (review 2026-07-23 #28) and only when a gate needs it.
+  #
+  # `known?` — the node-local KnownShards set — answers for the RATE gate only. A shard waking from
+  # an idle drop has no local file, so without it every cold reopen read Postgres to learn what
+  # this node already knew. The FORK decision always takes the fresh answer: a stale "known" there
+  # would let a deleted-and-recreated tenant skip its template fork and be born empty.
+  @spec novelty(boolean(), boolean(), boolean(), (-> boolean())) :: {boolean(), boolean()}
+  def novelty(rate_gated?, fork_gated?, known?, fresh) do
+    novel? = (fork_gated? or (rate_gated? and not known?)) and fresh.()
+    {rate_gated? and not known? and novel?, fork_gated? and novel?}
   end
 
   # Fork-from-template (finding #10), gated OFF by default (`:fork_from_template`): when

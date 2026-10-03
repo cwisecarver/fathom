@@ -633,6 +633,9 @@ defmodule Fathom.Application do
       # Node-local recency index for idle-eviction at capacity. Before the shard
       # supervisor so the table exists before any checkout stamps or terminate forgets.
       Fathom.Shards.Lru,
+      # The rate gate's node-local "known shard" set (expert review 2026-10-01 #18). Before the
+      # shard supervisor so the first open can record into it.
+      Fathom.Shards.KnownShards,
       # Owns the per-shard write-counter ETS table (the dirty-flag signal, off the coordinator
       # mailbox — finding #27). Always on (a data-loss invariant), before the shard supervisor.
       Fathom.Shard.WriteCounter,
