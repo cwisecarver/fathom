@@ -33,6 +33,7 @@ defmodule Fathom.Shard.ReplicationWriterTest do
   alias Fathom.Shard.Replication.Budget
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Protocol.Push
+  alias Fathom.Shard.Replication.Protocol.SeedBegin
   alias Fathom.Shard.Replication.Shipper
 
   # Big enough that a handful of them exceed any default socket buffer, small enough that filling
@@ -253,6 +254,19 @@ defmodule Fathom.Shard.ReplicationWriterTest do
 
     seeder =
       Task.async(fn ->
+        # The chunks must belong to a seed this task began: the shipper refuses chunks from a
+        # process that does not own the shard's waiter (see the stray-reply test below).
+        Shipper.seed_begin(shipper, %SeedBegin{
+          shard_id: "seedme",
+          epoch: 1,
+          wal_gen: 1,
+          salt1: 0,
+          wal_offset: 0,
+          db_size: 24 * @payload_bytes,
+          wal_size: 0,
+          lineage: 0
+        })
+
         for seq <- 0..23, do: Shipper.seed_chunk(shipper, "seedme", :db, seq, chunk)
       end)
 
@@ -268,6 +282,78 @@ defmodule Fathom.Shard.ReplicationWriterTest do
 
     send(peer, :close)
     Task.shutdown(seeder, :brutal_kill)
+  end
+
+  # RIG 2026-10-03: hundreds of `gen_of(nil)` crashes per 1024-tenant run. A seed whose
+  # `seed_begin` the shipper refused (`:already_in_flight` — a push for the shard was awaiting its
+  # reply) still sent its chunks and then `seed_abort`; the follower answered the abort, and since
+  # replies are matched by shard id, that answer completed the PUSH's waiter. The invariant: seed
+  # frames are only sent by the seed that owns the shard's waiter.
+  test "a refused seed sends no frames and cannot steal a push's reply" do
+    {:ok, listen} = :gen_tcp.listen(0, [:binary, packet: 4, active: false, reuseaddr: true])
+    {:ok, port} = :inet.port(listen)
+    test = self()
+
+    # Reads every frame and forwards it, decoded, to the test. Never replies on its own.
+    peer =
+      spawn(fn ->
+        {:ok, s} = :gen_tcp.accept(listen)
+        :ok = Protocol.handshake_accept(s, Protocol.handshake_timeout_ms())
+        send(test, {:peer_sock, s})
+        forward_frames(s, test)
+      end)
+
+    on_exit(fn -> Process.exit(peer, :kill) end)
+
+    name = :"writer_stray_#{System.unique_integer([:positive])}"
+    shipper = start_supervised!({Shipper, name: name, id: name, host: ~c"127.0.0.1", port: port})
+    assert Shipper.connected?(shipper)
+    assert_receive {:peer_sock, peer_sock}, 2_000
+
+    # A push is in flight for "s": the TEST owns the waiter.
+    Shipper.push(shipper, push("s", "data"))
+    assert_receive {:peer_frame, %Push{shard_id: "s"}}, 2_000
+
+    seeder =
+      Task.async(fn ->
+        Shipper.seed_begin(shipper, %SeedBegin{
+          shard_id: "s",
+          epoch: 1,
+          wal_gen: 1,
+          salt1: 0,
+          wal_offset: 0,
+          db_size: 4,
+          wal_size: 0,
+          lineage: 0
+        })
+
+        chunk = Shipper.seed_chunk(shipper, "s", :db, 0, "abcd")
+        Shipper.seed_abort(shipper, "s")
+        _ = :sys.get_state(shipper)
+        chunk
+      end)
+
+    assert {:error, :not_seeding} = Task.await(seeder)
+    _ = :sys.get_state(shipper)
+
+    # Unfixed: the chunk and the abort both reach the follower.
+    refute_receive {:peer_frame, {:seed_chunk, "s", _, _, _}}, 200
+    refute_receive {:peer_frame, {:seed_abort, "s"}}, 50
+
+    # And the push's own reply still reaches the push.
+    :ok = :gen_tcp.send(peer_sock, Protocol.encode_ack("s", 4))
+    assert_receive {:repl_reply, ^name, {:ack, "s", 4}}, 1_000
+  end
+
+  defp forward_frames(sock, test) do
+    case :gen_tcp.recv(sock, 0) do
+      {:ok, bytes} ->
+        with {:ok, frame} <- Protocol.decode(bytes), do: send(test, {:peer_frame, frame})
+        forward_frames(sock, test)
+
+      {:error, _} ->
+        :ok
+    end
   end
 
   defp drain_forever do

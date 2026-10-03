@@ -1565,8 +1565,13 @@ defmodule Fathom.Shard.Replication.Session do
     })
   end
 
+  # `before` is nil on the ABORT path, which only drains the abort's answer: an ack there is not a
+  # completed seed, whatever produced it, and must not crash the task on `gen_of(nil)`.
   defp await_seed_reply(shipper, shard_id, before, wal_size) do
     receive do
+      {:repl_reply, ^shipper, {:ack, ^shard_id, _}} when is_nil(before) ->
+        {:error, :aborted}
+
       {:repl_reply, ^shipper, {:ack, ^shard_id, _}} ->
         {:ok, %{wal_gen: gen_of(before), salt1: salt_of(before), offset: wal_size}}
 

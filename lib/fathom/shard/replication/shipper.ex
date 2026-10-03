@@ -157,12 +157,12 @@ defmodule Fathom.Shard.Replication.Shipper do
   @doc "Commit the streamed seed. This is the frame the follower answers."
   @spec seed_end(GenServer.server(), String.t()) :: :ok
   def seed_end(shipper, shard_id),
-    do: GenServer.cast(shipper, {:seed_frame, shard_id, :end})
+    do: GenServer.cast(shipper, {:seed_frame, shard_id, :end, self()})
 
   @doc "Abandon a partial seed — the follower drops it and answers, releasing the waiter."
   @spec seed_abort(GenServer.server(), String.t()) :: :ok
   def seed_abort(shipper, shard_id),
-    do: GenServer.cast(shipper, {:seed_frame, shard_id, :abort})
+    do: GenServer.cast(shipper, {:seed_frame, shard_id, :abort, self()})
 
   @doc "Whether the underlying socket is currently up. For tests and health reporting."
   @spec connected?(GenServer.server()) :: boolean()
@@ -216,10 +216,14 @@ defmodule Fathom.Shard.Replication.Shipper do
   def handle_call({:seed_chunk, _shard_id, _frame}, _from, %{sock: nil} = state),
     do: {:reply, {:error, :disconnected}, state}
 
-  def handle_call({:seed_chunk, shard_id, frame}, _from, state) do
-    case Writer.send_now(state.writer, seed_frame(shard_id, frame)) do
-      :ok -> {:reply, :ok, state}
-      {:error, reason} -> {:reply, {:error, reason}, drop(state, reason)}
+  def handle_call({:seed_chunk, shard_id, frame}, {pid, _}, state) do
+    if seed_owner?(state, shard_id, pid) do
+      case Writer.send_now(state.writer, seed_frame(shard_id, frame)) do
+        :ok -> {:reply, :ok, state}
+        {:error, reason} -> {:reply, {:error, reason}, drop(state, reason)}
+      end
+    else
+      {:reply, {:error, :not_seeding}, state}
     end
   end
 
@@ -351,14 +355,41 @@ defmodule Fathom.Shard.Replication.Shipper do
   # Chunks, end and abort all ride the waiter `seed_begin` claimed, so none of them registers or
   # answers anything. A failure drops the socket, and `drop/2` fails that waiter with
   # `:disconnected` — so the seeder is told, once, through the channel it is already listening on.
-  def handle_cast({:seed_frame, _shard_id, _frame}, %{sock: nil} = state), do: {:noreply, state}
+  #
+  # ONLY THE SEED THAT OWNS THE WAITER MAY SEND THEM (rig 2026-10-03). `seed_begin` is refused
+  # `:already_in_flight` when a push for the shard is still awaiting its reply, but the seeder does
+  # not read that until it is done streaming, so it went on to send chunks and then `seed_abort` /
+  # `seed_end` for a seed the follower never began. The follower ANSWERS those, and `reply_to/3`
+  # matches answers by shard id — so the stray answer completed the PUSH's waiter (the session read
+  # a reject for a commit that was fine), and the push's real ack then completed the NEXT waiter,
+  # which could be a new seed: `Session.await_seed_reply/4` received an ack after an abort and
+  # crashed on `gen_of(nil)`. Hundreds of times per 1024-tenant run once per-shard follower workers
+  # (#7) made replies fast enough to hit the window.
+  def handle_cast({:seed_frame, shard_id, frame, from}, %{sock: nil} = state) do
+    not_seeding(state, shard_id, frame, from)
+    {:noreply, state}
+  end
 
-  def handle_cast({:seed_frame, shard_id, frame}, state) do
-    case Writer.send_now(state.writer, seed_frame(shard_id, frame)) do
-      :ok -> {:noreply, state}
-      {:error, reason} -> {:noreply, drop(state, reason)}
+  def handle_cast({:seed_frame, shard_id, frame, from}, state) do
+    if seed_owner?(state, shard_id, from) do
+      case Writer.send_now(state.writer, seed_frame(shard_id, frame)) do
+        :ok -> {:noreply, state}
+        {:error, reason} -> {:noreply, drop(state, reason)}
+      end
+    else
+      not_seeding(state, shard_id, frame, from)
+      {:noreply, state}
     end
   end
+
+  defp seed_owner?(state, shard_id, pid), do: Map.get(state.waiters, shard_id) == pid
+
+  # `end` and `abort` each expect one answer; give the seeder one so it never waits out its timeout.
+  # Its mailbox may already hold the `seed_begin` refusal — the extra reply dies with the task.
+  defp not_seeding(state, shard_id, frame, from) when frame in [:end, :abort],
+    do: send(from, {:repl_reply, state.id, {:reject, shard_id, :not_seeding, 0}})
+
+  defp not_seeding(_state, _shard_id, _frame, _from), do: :ok
 
   defp seed_frame(shard_id, {:chunk, part, seq, bytes}),
     do: Protocol.encode_seed_chunk(shard_id, part, seq, bytes)
