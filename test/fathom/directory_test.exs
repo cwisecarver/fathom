@@ -641,6 +641,24 @@ defmodule Fathom.DirectoryTest do
              "s.migrating_since IS NOT NULL AND s.migrating_since < now()"}
         ] do
       test "#{label} is served by its partial index" do
+        # A REALISTIC TABLE, or the plan is a coin toss (flaked in precommit 2026-10-03, seed
+        # 836400). On the near-empty test table every partial `status = 'active'` index costs the
+        # same, and `stamp_drift_checked` came back on `shards_last_snapshot_at_active_index` — a
+        # full pass over active rows that the assertion rightly rejects. Production has many active
+        # rows and few matching ones, which is what makes the narrow index win: seed that shape and
+        # ANALYZE it (both roll back with the sandbox transaction).
+        Fathom.Repo.query!("""
+        INSERT INTO shards (shard_id, schema_version, status, last_active_at, inserted_at,
+                            updated_at, last_verified_at, last_verify_status, migrating_since)
+        SELECT 'plan_' || g, 1, CASE WHEN g <= 5 THEN 'migrating' ELSE 'active' END,
+               now(), now(), now(),
+               CASE WHEN g BETWEEN 6 AND 10 THEN now() END,
+               CASE WHEN g BETWEEN 11 AND 15 THEN 'schema_mismatch' END,
+               CASE WHEN g <= 5 THEN now() - interval '1 hour' END
+        FROM generate_series(1, 2000) g
+        """)
+
+        Fathom.Repo.query!("ANALYZE shards")
         Fathom.Repo.query!("SET LOCAL enable_seqscan = off")
         %{rows: rows} = Fathom.Repo.query!("EXPLAIN " <> unquote(sql), [])
         plan = rows |> List.flatten() |> Enum.join("\n")
