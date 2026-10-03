@@ -459,6 +459,60 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
     end
   end
 
+  # Expert review 2026-10-01 #3c: a blackholed peer cost EVERY cold open its full connect timeout
+  # (~2 s each, in a failover burst). A connect that timed out now marks the peer unreachable for a
+  # few seconds and opens skip it. Only a TIMEOUT marks: a refused connect is already instant and is
+  # what a restarting peer — possibly the one with the freshest replica — returns.
+  describe "unreachable peers (#3c)" do
+    setup do
+      Recovery.init_table()
+      :ok
+    end
+
+    test "only a connect timeout marks a peer unreachable" do
+      assert Recovery.mark_unreachable?(:timeout)
+
+      for reason <- [:econnrefused, :econnreset, :closed, :ehostunreach, :nxdomain] do
+        refute Recovery.mark_unreachable?(reason), "#{reason} would skip a peer that answers fast"
+      end
+    end
+
+    test "a peer marked unreachable is not dialed; an unmarked one is", %{id: id} do
+      {survivor, _} = start_follower("recov_surv")
+      test = self()
+
+      port =
+        start_fake_peer(fn sock, msg -> send(test, {:asked, msg}) && :gen_tcp.close(sock) end)
+
+      endpoint = {"slow_#{System.unique_integer([:positive])}", "127.0.0.1", port}
+
+      # Control first: unmarked, the peer is asked. Without this the refute below could pass
+      # because the fake never answers anything.
+      assert :none =
+               Recovery.best_replica(id, stamp(9, 5, 0), follower: survivor, peers: [endpoint])
+
+      assert_receive {:asked, _}, 1_000
+
+      Recovery.note_unreachable(endpoint, :timeout)
+      assert Recovery.unreachable?(endpoint)
+
+      assert :none =
+               Recovery.best_replica(id, stamp(9, 5, 0), follower: survivor, peers: [endpoint])
+
+      refute_receive {:asked, _}, 200
+    end
+
+    test "a refused connect does not mark the peer", %{id: id} do
+      {survivor, _} = start_follower("recov_surv")
+      endpoint = {"refused_#{System.unique_integer([:positive])}", "127.0.0.1", 1}
+
+      assert :none =
+               Recovery.best_replica(id, stamp(9, 5, 0), follower: survivor, peers: [endpoint])
+
+      refute Recovery.unreachable?(endpoint)
+    end
+  end
+
   test "a peer answering with ANOTHER tenant's bytes installs nothing", %{id: id} do
     {survivor, _} = start_follower("recov_surv")
     victim = "#{id}_victim"

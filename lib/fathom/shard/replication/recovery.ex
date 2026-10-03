@@ -350,18 +350,96 @@ defmodule Fathom.Shard.Replication.Recovery do
   end
 
   defp ask_one({_key, host, port} = endpoint, shard_id, timeout_ms) do
-    case connect(host, port) do
-      {:ok, sock} ->
-        try do
-          {endpoint, query(sock, shard_id, timeout_ms)}
-        after
-          :gen_tcp.close(sock)
-        end
+    if unreachable?(endpoint) do
+      {endpoint, nil}
+    else
+      case connect(host, port) do
+        {:ok, sock} ->
+          reachable(endpoint)
 
-      {:error, _reason} ->
-        {endpoint, nil}
+          try do
+            {endpoint, query(sock, shard_id, timeout_ms)}
+          after
+            :gen_tcp.close(sock)
+          end
+
+        {:error, reason} ->
+          note_unreachable(endpoint, reason)
+          {endpoint, nil}
+      end
     end
   end
+
+  # -- unreachable peers -----------------------------------------------------------------------
+  #
+  # A BLACKHOLED PEER COST EVERY COLD OPEN ITS FULL CONNECT TIMEOUT (expert review 2026-10-01 #3c).
+  # `ask/3` dials every peer on every promote-eligible open, and a peer that drops SYNs (paused,
+  # partitioned, its host gone) answers nothing until `@connect_timeout` — so during a failover,
+  # exactly when the opens come in a burst, each one waited ~2 s on the same dead node.
+  #
+  # So a connect that TIMED OUT marks the endpoint unreachable for `unreachable_ms/0` (10 s), and
+  # opens in that window skip it. Deliberately ONLY a timeout:
+  #
+  #   * A refused or reset connect already fails in microseconds; skipping it saves nothing, and
+  #     it is what a peer mid-restart returns — the peer most likely to come back holding the
+  #     freshest replica a moment later.
+  #   * Skipping trades RPO for latency: a skipped peer may hold the freshest copy, and the open then
+  #     falls back to the stored object (correct, recovers less). That is why it is not keyed off the
+  #     shipper's connection status, which goes `:disconnected` on any blip (option A in the review);
+  #     a peer has to have actually swallowed a full connect timeout to be skipped, and only for
+  #     seconds. A successful connect clears the mark.
+  @unreachable_table __MODULE__.Unreachable
+
+  @doc false
+  # Owned by `Fleet`'s supervisor, created before any shard can open. Idempotent for tests.
+  @spec init_table() :: :ok
+  def init_table do
+    :ets.new(@unreachable_table, [:named_table, :public, :set, read_concurrency: true])
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  @doc false
+  # Which connect failures mark a peer unreachable. Pure, for the test.
+  @spec mark_unreachable?(term()) :: boolean()
+  def mark_unreachable?(:timeout), do: true
+  def mark_unreachable?(_reason), do: false
+
+  @doc false
+  @spec unreachable?(endpoint()) :: boolean()
+  def unreachable?(endpoint) do
+    case :ets.lookup(@unreachable_table, endpoint) do
+      [{_, until}] -> System.monotonic_time(:millisecond) < until
+      [] -> false
+    end
+  rescue
+    ArgumentError -> false
+  end
+
+  @doc false
+  @spec note_unreachable(endpoint(), term()) :: :ok
+  def note_unreachable(endpoint, reason) do
+    if mark_unreachable?(reason) do
+      :ets.insert(
+        @unreachable_table,
+        {endpoint, System.monotonic_time(:millisecond) + unreachable_ms()}
+      )
+    end
+
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp reachable(endpoint) do
+    :ets.delete(@unreachable_table, endpoint)
+  rescue
+    ArgumentError -> true
+  end
+
+  defp unreachable_ms,
+    do: Application.get_env(:fathom, :replication_recovery_unreachable_ms, 10_000)
 
   defp query(sock, shard_id, timeout_ms) do
     with :ok <- :gen_tcp.send(sock, Protocol.encode_position_query(shard_id)),
