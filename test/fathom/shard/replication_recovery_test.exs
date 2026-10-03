@@ -482,7 +482,10 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
       test = self()
 
       port =
-        start_fake_peer(fn sock, msg -> send(test, {:asked, msg}) && :gen_tcp.close(sock) end)
+        start_fake_peer(fn sock, msg ->
+          send(test, {:asked, msg})
+          :gen_tcp.close(sock)
+        end)
 
       endpoint = {"slow_#{System.unique_integer([:positive])}", "127.0.0.1", port}
 
