@@ -234,6 +234,9 @@ defmodule Fathom.Shard.Replication.Fleet do
       [
         {Registry, keys: :unique, name: @registry},
         {DynamicSupervisor, name: @sessions, strategy: :one_for_one},
+        # Node-wide cap on concurrent seeds (expert review 2026-10-01 #6). Before the sessions
+        # can seed, i.e. before Membership starts the shippers.
+        Fathom.Shard.Replication.SeedGate,
         # Shippers moved OFF the static child list (2026-08-10) so membership can change without a
         # restart. `Membership` starts them, and starts the first set inside its own `init/1` — so
         # by the time this supervisor reports started, the shippers a commit will read already

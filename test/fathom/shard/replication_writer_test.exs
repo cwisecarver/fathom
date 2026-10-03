@@ -236,6 +236,40 @@ defmodule Fathom.Shard.ReplicationWriterTest do
     end
   end
 
+  # EXPERT REVIEW 2026-10-01 #6. `seed_chunk/5` was a cast, so a seeder `pread` the whole database
+  # into the shipper's mailbox while the shipper sent one chunk at a time: a 2 GB tenant was 2 GB
+  # resident on the primary, uncounted. The invariant: a seed chunk is not accepted until the
+  # previous one is on the wire, so a stalled link stops the seeder reading instead of buffering.
+  test "a seed chunk does not return while the link is stalled (#6)" do
+    {peer, port} = deaf_peer!()
+
+    name = :"writer_seed_#{System.unique_integer([:positive])}"
+    shipper = start_supervised!({Shipper, name: name, id: name, host: ~c"127.0.0.1", port: port})
+    assert Shipper.connected?(shipper)
+    assert_receive {:deaf_accepted, ^peer}, 2_000
+    sock = :sys.get_state(shipper).sock
+
+    chunk = :binary.copy(<<0x5E>>, @payload_bytes)
+
+    seeder =
+      Task.async(fn ->
+        for seq <- 0..23, do: Shipper.seed_chunk(shipper, "seedme", :db, seq, chunk)
+      end)
+
+    await_stall!(sock, 200)
+
+    # Unfixed: the 24 casts return at once and the task finishes with the link still stalled.
+    assert Task.yield(seeder, 300) == nil,
+           "the seeder finished while the link was stalled: every chunk was buffered in the " <>
+             "shipper instead of waiting for the wire"
+
+    {:message_queue_len, queued} = Process.info(shipper, :message_queue_len)
+    assert queued <= 1, "#{queued} seed chunks are queued in the shipper's mailbox"
+
+    send(peer, :close)
+    Task.shutdown(seeder, :brutal_kill)
+  end
+
   defp drain_forever do
     receive do
       _ -> drain_forever()

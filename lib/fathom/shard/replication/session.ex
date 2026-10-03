@@ -39,6 +39,7 @@ defmodule Fathom.Shard.Replication.Session do
   alias Fathom.Shard.Replication.Primary
   alias Fathom.Shard.Replication.Protocol.Push
   alias Fathom.Shard.Replication.Protocol.SeedBegin
+  alias Fathom.Shard.Replication.SeedGate
   alias Fathom.Shard.Replication.Shipper
   alias Fathom.Shard.Replication.Wal
 
@@ -1404,7 +1405,7 @@ defmodule Fathom.Shard.Replication.Session do
           send(
             session,
             {:seeded, shipper,
-             timed_seed(shipper, acc.shard_id, db_path, wal_path, acc.epoch, acc.lineage)}
+             gated_seed(shipper, acc.shard_id, db_path, wal_path, acc.epoch, acc.lineage)}
           )
         end)
 
@@ -1448,6 +1449,28 @@ defmodule Fathom.Shard.Replication.Session do
       end
     end)
   end
+
+  # A node-wide slot first (expert review 2026-10-01 #6): a failover burst starts one seed task per
+  # shard x follower at once, and each holds its follower's single link for the whole transfer. The
+  # wait is bounded below `seed_expiry_ms/0`, so a seed that never got a slot gives up on its own
+  # rather than being killed as wedged. A killed task's slot is freed by SeedGate's monitor.
+  defp gated_seed(shipper, shard_id, db_path, wal_path, epoch, lineage) do
+    case SeedGate.acquire(seed_gate_wait_ms()) do
+      :ok ->
+        try do
+          timed_seed(shipper, shard_id, db_path, wal_path, epoch, lineage)
+        after
+          SeedGate.release()
+        end
+
+      {:error, _} = error ->
+        Logger.warning("replication seed for #{shard_id} found no free seed slot; will retry")
+        error
+    end
+  end
+
+  defp seed_gate_wait_ms,
+    do: Application.get_env(:fathom, :replication_seed_gate_wait_ms, 60_000)
 
   # `do_seed/6` with its cost reported. A seed is the one replication operation whose cost scales
   # with DATABASE size rather than write volume, and every rule that would seed more often (expert
@@ -1581,8 +1604,11 @@ defmodule Fathom.Shard.Replication.Session do
 
     case :file.pread(fd, offset, len) do
       {:ok, bin} when byte_size(bin) == len ->
-        Shipper.seed_chunk(shipper, shard_id, part, seq, bin)
-        stream_chunks(shipper, shard_id, part, fd, offset + len, seq + 1, size)
+        # Blocks until the chunk is on the wire, so a seed holds one chunk in memory, not the
+        # whole database (expert review 2026-10-01 #6).
+        with :ok <- Shipper.seed_chunk(shipper, shard_id, part, seq, bin) do
+          stream_chunks(shipper, shard_id, part, fd, offset + len, seq + 1, size)
+        end
 
       {:ok, _short} ->
         {:error, :short_read}

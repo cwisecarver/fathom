@@ -49,6 +49,9 @@ defmodule Fathom.Shard.Replication.Shipper do
   alias Fathom.Shard.Replication.Shipper.Writer
 
   @connect_timeout 5_000
+
+  # Above `Writer`'s own 30 s `send_now` bound, so the writer's answer always arrives first.
+  @seed_chunk_call_ms 60_000
   @reconnect_backoff_ms 500
 
   defstruct [:host, :port, :sock, :writer, :writer_budget, :id, :name, waiters: %{}]
@@ -126,14 +129,30 @@ defmodule Fathom.Shard.Replication.Shipper do
     do: GenServer.cast(shipper, {:seed_begin, s, self()})
 
   @doc """
-  Send one chunk. No reply, and no waiter bookkeeping — `seed_begin/2` already claimed it.
+  Send one chunk and RETURN ONLY ONCE IT IS SENT. No waiter bookkeeping — `seed_begin/2` already
+  claimed it.
 
-  A send failure here does not go unnoticed: it drops the socket, which fails every waiter
-  including this seed's, so the sender learns immediately instead of waiting out its timeout.
+  SYNCHRONOUS ON PURPOSE (expert review 2026-10-01 #6). This was a cast, and the seeder reads the
+  next chunk the moment the previous call returns, so a cast let it `pread` the WHOLE database into
+  this shipper's mailbox in one go while the shipper sent one chunk at a time — a 2 GB tenant was
+  2 GB resident here, uncounted by `Budget`, which is exactly what chunking was meant to prevent.
+  Waiting for the send bounds a seed to the one chunk in flight.
+
+  A send failure drops the socket (failing every waiter, including this seed's) and is also
+  returned here, so the seeder stops reading instead of streaming into a dead link.
   """
-  @spec seed_chunk(GenServer.server(), String.t(), :db | :wal, non_neg_integer(), binary()) :: :ok
-  def seed_chunk(shipper, shard_id, part, seq, bytes),
-    do: GenServer.cast(shipper, {:seed_frame, shard_id, {:chunk, part, seq, bytes}})
+  @spec seed_chunk(GenServer.server(), String.t(), :db | :wal, non_neg_integer(), binary()) ::
+          :ok | {:error, term()}
+  def seed_chunk(shipper, shard_id, part, seq, bytes) do
+    GenServer.call(
+      shipper,
+      {:seed_chunk, shard_id, {:chunk, part, seq, bytes}},
+      @seed_chunk_call_ms
+    )
+  catch
+    # The shipper died or stayed blocked past the bound: either way this seed is over.
+    :exit, reason -> {:error, {:seed_chunk, reason}}
+  end
 
   @doc "Commit the streamed seed. This is the frame the follower answers."
   @spec seed_end(GenServer.server(), String.t()) :: :ok
@@ -193,6 +212,16 @@ defmodule Fathom.Shard.Replication.Shipper do
 
   @impl true
   def handle_call(:connected?, _from, state), do: {:reply, state.sock != nil, state}
+
+  def handle_call({:seed_chunk, _shard_id, _frame}, _from, %{sock: nil} = state),
+    do: {:reply, {:error, :disconnected}, state}
+
+  def handle_call({:seed_chunk, shard_id, frame}, _from, state) do
+    case Writer.send_now(state.writer, seed_frame(shard_id, frame)) do
+      :ok -> {:reply, :ok, state}
+      {:error, reason} -> {:reply, {:error, reason}, drop(state, reason)}
+    end
+  end
 
   @impl true
   def handle_cast({:push, p, from, reserved}, %{sock: nil} = state) do
