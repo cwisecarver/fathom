@@ -133,6 +133,8 @@ x-fathom-env: &fathom-env
   # (6,893 -> 15,798 MB) and would have reported success.
   REPLICATION_MAX_PUSH_BYTES: "${REPLICATION_MAX_PUSH_BYTES:-}"
   REPLICATION_MAX_QUEUE_BYTES: "${REPLICATION_MAX_QUEUE_BYTES:-}"
+  # SeedGate's node-wide cap (expert review 2026-10-01 #6). Empty = the default (off).
+  REPLICATION_SEED_MAX_CONCURRENCY: "${REPLICATION_SEED_MAX_CONCURRENCY:-}"
   # Deferred retry for a push OUR OWN shipper refused (:already_in_flight / :overloaded), which never
   # reached the follower. Empty ⇒ the shipped 1000 ms default; 0 disables, which is the A/B control.
   REPLICATION_CATCHUP_MS: "${REPLICATION_CATCHUP_MS:-}"

@@ -2110,6 +2110,9 @@ cmd_tpc_fleet() {
       "$(awk -v x="$p50" 'BEGIN{printf "%.2f", x/1000}')" \
       "$(awk -v x="$p95" 'BEGIN{printf "%.2f", x/1000}')" \
       "$(awk -v x="$p99" 'BEGIN{printf "%.2f", x/1000}')" "$errs" "$shed"
+    # WHAT the errors were. The driver tallies them by reason, but this sweep discarded its stderr
+    # and printed only the count, so a 7x error jump on 2026-10-03 could not be attributed.
+    printf "  err reasons: %s\n" "$(printf '%s' "$json" | jq -c '.err_reasons // {}')"
   done
 
   # Per-node distribution: how many tenant shards each node held + total query load it absorbed.
