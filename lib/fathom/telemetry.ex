@@ -95,6 +95,17 @@ defmodule Fathom.Telemetry do
         reporter_options: [buckets: [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000]],
         description: "Shard cold-open latency (tag warm: local file present vs pulled from S3)"
       ),
+      # How soon an idle-dropped shard is opened again (expert review 2026-10-01 #10): the number
+      # `:shard_idle_ms` should be set from. Mass in the low buckets means the idle timeout is
+      # buying churn; mass near 1 h means it is doing its job.
+      distribution("fathom.shard.reopen.gap_ms",
+        event_name: [:fathom, :shard, :reopen],
+        measurement: :gap_ms,
+        reporter_options: [
+          buckets: [1_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000, 600_000, 1_800_000]
+        ],
+        description: "Time from an idle drop to the shard's next cold open, ms"
+      ),
       counter("fathom.shard.lease.acquired.count",
         description: "Lease acquisitions (steal-on-lapse + first open)"
       ),

@@ -1527,6 +1527,8 @@ defmodule Fathom.Shard do
         {:noreply, state}
 
       now - state.idle_since >= state.idle_ms ->
+        # The reopen-gap measurement (expert review 2026-10-01 #10) counts IDLE drops only.
+        Fathom.Shard.ReopenGap.dropped(state.id)
         {:stop, :normal, state}
 
       # A newer stream cycle moved the stamp — re-arm for the remainder.
@@ -3872,6 +3874,8 @@ defmodule Fathom.Shard do
       %{duration: System.monotonic_time() - started},
       %{shard_id: shard_id, warm: warm?}
     )
+
+    Fathom.Shard.ReopenGap.reopened(shard_id)
   end
 
   defp maybe_emit_cold_open(_result, _shard_id, _warm?, _started), do: :ok
