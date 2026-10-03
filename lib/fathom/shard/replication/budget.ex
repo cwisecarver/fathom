@@ -104,10 +104,11 @@ defmodule Fathom.Shard.Replication.Budget do
 
   def install(_name), do: :ok
 
-  @doc "Drop a departed follower's counter. Best-effort — a fresh `install/1` also supersedes it."
+  @doc "Drop a departed follower's counters. Best-effort — a fresh `install/1` also supersedes it."
   @spec forget(atom() | nil) :: :ok
   def forget(name) when is_atom(name) and not is_nil(name) do
     :ets.delete(@table, name)
+    :ets.delete(@table, {:writer, name})
     :ok
   rescue
     # No table: nothing to forget.
@@ -115,6 +116,75 @@ defmodule Fathom.Shard.Replication.Budget do
   end
 
   def forget(_name), do: :ok
+
+  # ------------------------------------------------------------------------------------------
+  # THE WRITER'S SHARE (expert review 2026-10-01 #17).
+  #
+  # Since the Writer landed (7b92a89), a push leaves the shipper's mailbox and waits in the
+  # WRITER's mailbox until `:gen_tcp.send/2` returns. The shipper released its reservation at the
+  # hand-off, so on a stalled link every byte queued behind the blocked send was uncounted:
+  # `queued/0` read ~0 and `:overloaded` never fired while the memory the budget exists to bound
+  # piled up one link down. So the reservation now MOVES to the writer at hand-off and is released
+  # only after the send returns.
+  #
+  # WHY A SEPARATE COUNTER PER WRITER, not the shipper's counter held longer. A writer exits on the
+  # first failed send, and anything still in its mailbox (or cast to it before the shipper notices)
+  # is never sent and never released. On the shipper's long-lived counter those bytes would be
+  # charged until the shipper itself restarted — and a link that times out repeatedly would ratchet
+  # the node toward refusing everything. A counter per writer incarnation, dropped by `drop_writer/1`
+  # when the link drops, makes the stranded bytes die with the writer that stranded them: the same
+  # argument as "Why a ref per shipper incarnation" above, one level down.
+  # ------------------------------------------------------------------------------------------
+
+  @doc """
+  Publish a fresh counter for the writer of `name`'s current socket and return it. Called once per
+  connection. `nil` for an unregistered shipper (no budget applies, as for `install/1`).
+  """
+  @spec install_writer(atom() | nil) :: :counters.counters_ref() | nil
+  def install_writer(name) when is_atom(name) and not is_nil(name) do
+    init_table()
+    ref = :counters.new(1, [:write_concurrency])
+    :ets.insert(@table, {{:writer, name}, ref})
+    ref
+  end
+
+  def install_writer(_name), do: nil
+
+  @doc "Stop counting the writer of `name`'s dropped socket. Its stranded bytes die with it."
+  @spec drop_writer(atom() | nil) :: :ok
+  def drop_writer(name) when is_atom(name) and not is_nil(name) do
+    :ets.delete(@table, {:writer, name})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  def drop_writer(_name), do: :ok
+
+  @doc """
+  Move a push's reservation from the shipper's counter to its writer's, at the moment the shipper
+  hands the frame over. Added to the writer BEFORE it leaves the shipper, so a concurrent `queued/0`
+  never sees the bytes in neither place.
+
+  With no writer counter (an unregistered shipper) this is a plain `release/2`: nothing will ever
+  release them later.
+  """
+  @spec hand_off(atom() | pid(), :counters.counters_ref() | nil, non_neg_integer()) :: :ok
+  def hand_off(shipper, writer_ref, bytes) when writer_ref != nil and bytes > 0 do
+    :counters.add(writer_ref, @slot, bytes)
+    release(shipper, bytes)
+  end
+
+  def hand_off(shipper, _writer_ref, bytes), do: release(shipper, bytes)
+
+  @doc "Release a handed-off reservation once its send has returned. Called by the writer."
+  @spec sent(:counters.counters_ref() | nil, non_neg_integer()) :: :ok
+  def sent(writer_ref, bytes) when writer_ref != nil and bytes > 0 do
+    :counters.sub(writer_ref, @slot, bytes)
+    :ok
+  end
+
+  def sent(_writer_ref, _bytes), do: :ok
 
   @doc """
   Claim `bytes` of the node's budget for a push about to be enqueued.
@@ -143,7 +213,10 @@ defmodule Fathom.Shard.Replication.Budget do
     end
   end
 
-  @doc "Give back what `reserve/2` claimed, once the push has left the mailbox."
+  @doc """
+  Give back what `reserve/2` claimed, for a push that will never reach the writer (rejected, or no
+  socket). A push that does reach it goes through `hand_off/3` and `sent/2` instead.
+  """
   @spec release(atom() | pid(), non_neg_integer()) :: :ok
   def release(shipper, bytes) when is_integer(bytes) and bytes > 0 do
     case ref(shipper) do
@@ -167,12 +240,22 @@ defmodule Fathom.Shard.Replication.Budget do
     Enum.reduce(Fleet.shippers(), 0, fn name, acc -> acc + queued(name) end)
   end
 
-  @doc "Bytes currently queued for one shipper. 0 when it has no counter."
+  @doc """
+  Bytes currently queued for one shipper: its own mailbox plus its writer's (see `hand_off/3`).
+  0 when it has no counter.
+  """
   @spec queued(atom() | pid()) :: non_neg_integer()
   def queued(shipper) do
     case ref(shipper) do
       # Clamped at 0: a release without its reserve is a bug, but reporting a negative budget would
       # let it manufacture headroom rather than surface.
+      ref when ref != nil -> max(:counters.get(ref, @slot), 0) + writer_queued(shipper)
+      _ -> 0
+    end
+  end
+
+  defp writer_queued(shipper) do
+    case ref({:writer, shipper}) do
       ref when ref != nil -> max(:counters.get(ref, @slot), 0)
       _ -> 0
     end
@@ -208,11 +291,34 @@ defmodule Fathom.Shard.Replication.Budget do
   end
 
   defp ref(pid) when is_pid(pid) do
-    case Process.info(pid, :registered_name) do
-      {:registered_name, name} when is_atom(name) and name != nil -> ref(name)
+    case registered_name(pid) do
+      nil -> nil
+      name -> ref(name)
+    end
+  end
+
+  defp ref({:writer, name} = key) when is_atom(name) do
+    case :ets.lookup(@table, key) do
+      [{^key, ref}] -> ref
       _ -> nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp ref({:writer, pid}) when is_pid(pid) do
+    case registered_name(pid) do
+      nil -> nil
+      name -> ref({:writer, name})
     end
   end
 
   defp ref(_other), do: nil
+
+  defp registered_name(pid) do
+    case Process.info(pid, :registered_name) do
+      {:registered_name, name} when is_atom(name) and name != nil -> name
+      _ -> nil
+    end
+  end
 end

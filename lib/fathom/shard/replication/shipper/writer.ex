@@ -24,7 +24,9 @@ defmodule Fathom.Shard.Replication.Shipper.Writer do
       order between one pair of processes, so frames leave in the order they were cast.
     * **The bound already exists.** Moving the block here moves the queue here, which would be
       unbounded — except one push per shard is enforced by the shipper's `waiters`, and the
-      node-wide `Budget` caps total bytes in flight.
+      node-wide `Budget` caps total bytes in flight. That second half was FALSE until 2026-10-01
+      #17: the shipper released each reservation at hand-off, so bytes waiting here were
+      uncounted. Each frame now carries its reservation and is released after its send returns.
     * **A drop still fails every waiter.** A failed send is reported back and the shipper runs its
       ordinary `drop/2`.
 
@@ -51,6 +53,8 @@ defmodule Fathom.Shard.Replication.Shipper.Writer do
   # whatever it is, because the socket is what actually bounds the send.
   @call_timeout_ms 30_000
 
+  alias Fathom.Shard.Replication.Budget
+
   @doc """
   Start a writer for `sock`, reporting failures to `shipper`.
 
@@ -66,12 +70,16 @@ defmodule Fathom.Shard.Replication.Shipper.Writer do
   Queue `iodata` for sending. Returns immediately; a failure is reported to the shipper.
 
   This is the whole point of the module: the caller does not block, so it keeps reading acks.
-  """
-  @spec frame(pid() | nil, iodata()) :: :ok
-  def frame(nil, _iodata), do: :ok
 
-  def frame(writer, iodata) do
-    send(writer, {:frame, iodata})
+  `budget_ref` and `reserved` are the push's byte reservation, already moved onto this writer's
+  counter by `Budget.hand_off/3`; it is released here, after the send returns, so the node budget
+  still counts a frame while it waits behind a blocked send (expert review 2026-10-01 #17).
+  """
+  @spec frame(pid() | nil, iodata(), :counters.counters_ref() | nil, non_neg_integer()) :: :ok
+  def frame(nil, _iodata, budget_ref, reserved), do: Budget.sent(budget_ref, reserved)
+
+  def frame(writer, iodata, budget_ref, reserved) do
+    send(writer, {:frame, iodata, budget_ref, reserved})
     :ok
   end
 
@@ -100,9 +108,10 @@ defmodule Fathom.Shard.Replication.Shipper.Writer do
 
   defp loop(sock, shipper) do
     receive do
-      {:frame, iodata} ->
+      {:frame, iodata, budget_ref, reserved} ->
         case :gen_tcp.send(sock, iodata) do
           :ok ->
+            Budget.sent(budget_ref, reserved)
             loop(sock, shipper)
 
           {:error, reason} ->

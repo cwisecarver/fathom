@@ -30,6 +30,7 @@ defmodule Fathom.Shard.ReplicationWriterTest do
   """
   use ExUnit.Case, async: false
 
+  alias Fathom.Shard.Replication.Budget
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Protocol.Push
   alias Fathom.Shard.Replication.Shipper
@@ -157,6 +158,100 @@ defmodule Fathom.Shard.ReplicationWriterTest do
       _ ->
         Process.sleep(5)
         await_stall!(sock, tries - 1)
+    end
+  end
+
+  # EXPERT REVIEW 2026-10-01 #17. The shipper released each push's byte reservation when it handed
+  # the frame to the writer, so on a stalled link every byte queued behind the blocked send was
+  # invisible to `Budget`: `queued/0` read ~0, `:overloaded` never fired, and the memory the budget
+  # exists to bound grew in the writer's mailbox. The invariant: a frame stays counted until its
+  # send returns, and a dropped link's stranded frames stop counting.
+  describe "the byte budget follows the frame into the writer (#17)" do
+    test "frames stuck behind a blocked send are still counted" do
+      {peer, port} = deaf_peer!()
+
+      name = :"writer_budget_#{System.unique_integer([:positive])}"
+
+      shipper =
+        start_supervised!({Shipper, name: name, id: name, host: ~c"127.0.0.1", port: port})
+
+      assert Shipper.connected?(shipper)
+      assert_receive {:deaf_accepted, ^peer}, 2_000
+      sock = :sys.get_state(shipper).sock
+
+      payload = :binary.copy(<<0xCD>>, @payload_bytes)
+      for i <- 1..24, do: Shipper.push(shipper, push("q#{i}", payload))
+
+      await_stall!(sock, 200)
+      # Every push has left the SHIPPER's mailbox: whatever is still counted is in the writer.
+      _ = :sys.get_state(shipper)
+      flush_rejects()
+
+      # Unfixed: 0 — the shipper had already released every one of these.
+      assert Budget.queued(name) >= 4 * @payload_bytes,
+             "only #{Budget.queued(name)} bytes counted while the link is stalled with frames " <>
+               "queued in the writer: the budget is released before the send"
+
+      # The link drops. The frames queued in the dead writer will never be sent, so they must stop
+      # counting — or a link that keeps timing out ratchets the node toward refusing everything.
+      ref = Process.monitor(:sys.get_state(shipper).writer)
+      send(peer, :close)
+      assert_receive {:DOWN, ^ref, :process, _, _}, 10_000
+      _ = :sys.get_state(shipper)
+
+      assert Budget.queued(name) == 0,
+             "#{Budget.queued(name)} bytes still charged to a dropped link's dead writer"
+    end
+
+    test "a frame that was sent is released" do
+      {:ok, listen} = :gen_tcp.listen(0, [:binary, packet: 4, active: false, reuseaddr: true])
+      {:ok, port} = :inet.port(listen)
+
+      # Accepts and reads (and discards) everything, so every send completes.
+      reader =
+        spawn(fn ->
+          {:ok, s} = :gen_tcp.accept(listen)
+          :ok = Protocol.handshake_accept(s, Protocol.handshake_timeout_ms())
+          :ok = :inet.setopts(s, active: true)
+          drain_forever()
+        end)
+
+      on_exit(fn -> Process.exit(reader, :kill) end)
+
+      name = :"writer_budget_ok_#{System.unique_integer([:positive])}"
+
+      shipper =
+        start_supervised!({Shipper, name: name, id: name, host: ~c"127.0.0.1", port: port})
+
+      assert Shipper.connected?(shipper)
+
+      payload = :binary.copy(<<0xEF>>, 4096)
+      for i <- 1..10, do: Shipper.push(shipper, push("ok#{i}", payload))
+
+      # Precondition: the pushes really reached the writer (a waiter each), not a reject.
+      assert map_size(:sys.get_state(shipper).waiters) == 10
+
+      assert await_budget_zero(name, 200) == 0,
+             "sent frames were never released: the budget would ratchet up on a healthy link"
+    end
+  end
+
+  defp drain_forever do
+    receive do
+      _ -> drain_forever()
+    end
+  end
+
+  defp await_budget_zero(name, 0), do: Budget.queued(name)
+
+  defp await_budget_zero(name, tries) do
+    case Budget.queued(name) do
+      0 ->
+        0
+
+      _ ->
+        Process.sleep(5)
+        await_budget_zero(name, tries - 1)
     end
   end
 

@@ -51,7 +51,7 @@ defmodule Fathom.Shard.Replication.Shipper do
   @connect_timeout 5_000
   @reconnect_backoff_ms 500
 
-  defstruct [:host, :port, :sock, :writer, :id, :name, waiters: %{}]
+  defstruct [:host, :port, :sock, :writer, :writer_budget, :id, :name, waiters: %{}]
 
   # ------------------------------------------------------------------------------------------
   # api
@@ -205,11 +205,15 @@ defmodule Fathom.Shard.Replication.Shipper do
   end
 
   def handle_cast({:push, p, from, reserved}, state) do
-    # Released the moment the payload leaves the mailbox, on EVERY branch below — the budget bounds
-    # what is queued, not what is in flight. Doing it here rather than per-branch is what keeps each
-    # `Budget.reserve/2` matched by exactly one release.
-    Budget.release(state.name, reserved)
-
+    # EVERY BRANCH BELOW SETTLES `reserved` EXACTLY ONCE: the two rejects release it here, and the
+    # send branch hands it to the writer, which releases it after `:gen_tcp.send/2` returns.
+    #
+    # It used to be released HERE, before the cond, for all three — correct when this process did
+    # the send, wrong once the Writer took it over (expert review 2026-10-01 #17): a frame then
+    # waited in the writer's mailbox behind a blocked send with its bytes uncounted, so on a
+    # stalled link `Budget.queued/0` read ~0, `:overloaded` never fired, and the memory the budget
+    # exists to bound grew one process down. Holding it to the send makes a saturated link reject
+    # sooner (FILO_NO_QUORUM) instead of accumulating — the trade `Budget` was built to make.
     cond do
       # OVERLOADED: more work queued than this link can drain. Reject NOW, for exactly the reason
       # the `sock: nil` clause above rejects — a follower that cannot take the work must subtract
@@ -262,6 +266,7 @@ defmodule Fathom.Shard.Replication.Shipper do
       # Rejecting is cheap, so under overload the shipper becomes a fast rejector instead of a slow
       # accumulator. The cost is honest: writes fail with FILO_NO_QUORUM while a link is saturated.
       overloaded?(state) ->
+        Budget.release(state.name, reserved)
         count_reject(:overloaded)
         send(from, {:repl_reply, state.id, {:reject, p.shard_id, :overloaded, 0}})
         {:noreply, state}
@@ -269,6 +274,7 @@ defmodule Fathom.Shard.Replication.Shipper do
       Map.has_key?(state.waiters, p.shard_id) ->
         # One writer per shard means one push in flight. Two is a caller bug, and overwriting the
         # waiter would strand the first commit forever.
+        Budget.release(state.name, reserved)
         count_reject(:already_in_flight)
         send(from, {:repl_reply, state.id, {:reject, p.shard_id, :already_in_flight, 0}})
         {:noreply, state}
@@ -285,7 +291,8 @@ defmodule Fathom.Shard.Replication.Shipper do
         # The waiter is recorded BEFORE the send is attempted, which is the one semantic change: a
         # failure now arrives after further pushes have been accepted. `drop/2` fails all of them,
         # which is what today does too — the difference is only how many are in flight when it runs.
-        Writer.frame(state.writer, encode(p))
+        Budget.hand_off(state.name, state.writer_budget, reserved)
+        Writer.frame(state.writer, encode(p), state.writer_budget, reserved)
         {:noreply, %{state | waiters: Map.put(state.waiters, p.shard_id, from)}}
     end
   end
@@ -427,7 +434,15 @@ defmodule Fathom.Shard.Replication.Shipper do
         # ONE WRITER PER SOCKET, not per shipper: a writer is meaningless without the socket it
         # owns, and tying their lifetimes together is what makes a stale writer's report
         # distinguishable from the live one's.
-        %{state | sock: sock, writer: Writer.start_link(sock, self())}
+        #
+        # And one budget counter per writer, for the same reason: bytes still queued in a writer
+        # that dies are never sent and never released, and must die with it (see `Budget`).
+        %{
+          state
+          | sock: sock,
+            writer: Writer.start_link(sock, self()),
+            writer_budget: Budget.install_writer(state.name)
+        }
 
       {:error, reason} ->
         Logger.warning(
@@ -435,7 +450,7 @@ defmodule Fathom.Shard.Replication.Shipper do
         )
 
         Process.send_after(self(), :reconnect, @reconnect_backoff_ms)
-        %{state | sock: nil, writer: nil}
+        %{state | sock: nil, writer: nil, writer_budget: nil}
     end
   end
 
@@ -530,6 +545,9 @@ defmodule Fathom.Shard.Replication.Shipper do
   defp drop(state, reason) do
     if state.sock, do: :gen_tcp.close(state.sock)
     Writer.stop(state.writer)
+    # The dropped writer's queued frames will never be sent, so its share stops counting now —
+    # not at the next successful connect, which for a peer that stays down may be never.
+    Budget.drop_writer(state.name)
 
     for {shard, from} <- state.waiters do
       send(from, {:repl_reply, state.id, {:reject, shard, :disconnected, 0}})
@@ -540,7 +558,7 @@ defmodule Fathom.Shard.Replication.Shipper do
     end
 
     Process.send_after(self(), :reconnect, @reconnect_backoff_ms)
-    %{state | sock: nil, writer: nil, waiters: %{}}
+    %{state | sock: nil, writer: nil, writer_budget: nil, waiters: %{}}
   end
 
   # ONE EVENT PER REFUSED PUSH, tagged by REASON only.
