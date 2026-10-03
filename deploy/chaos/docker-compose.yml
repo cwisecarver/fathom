@@ -135,6 +135,8 @@ x-fathom-env: &fathom-env
   REPLICATION_MAX_QUEUE_BYTES: "${REPLICATION_MAX_QUEUE_BYTES:-}"
   # SeedGate's node-wide cap (expert review 2026-10-01 #6). Empty = the default (off).
   REPLICATION_SEED_MAX_CONCURRENCY: "${REPLICATION_SEED_MAX_CONCURRENCY:-}"
+  # Follower workers per primary connection (expert review 2026-10-01 #7). Empty = 8; 1 = serial.
+  REPLICATION_FOLLOWER_WORKERS: "${REPLICATION_FOLLOWER_WORKERS:-}"
   # Deferred retry for a push OUR OWN shipper refused (:already_in_flight / :overloaded), which never
   # reached the follower. Empty ⇒ the shipped 1000 ms default; 0 disables, which is the A/B control.
   REPLICATION_CATCHUP_MS: "${REPLICATION_CATCHUP_MS:-}"

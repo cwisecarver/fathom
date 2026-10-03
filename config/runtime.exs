@@ -839,6 +839,14 @@ if n = env_nonneg_int.("REPLICATION_SEED_MAX_CONCURRENCY") do
 end
 
 # ---- The RECEIVE half: this node acts as somebody's follower --------------------------------
+
+# Workers per primary connection on the follower (expert review 2026-10-01 #7). Each shard's frames
+# go to one worker, so a slow absorb on one shard no longer holds every other shard on the link.
+# Default 8; 1 restores the old single serial loop.
+if n = env_int.("REPLICATION_FOLLOWER_WORKERS") do
+  config :fathom, :replication_follower_workers, n
+end
+
 # SEPARATE GATE FROM REPLICATION_ENABLED, and the reason is a real gap this closes (2026-08-10):
 # the `Follower` listener was only ever started by the test suite, so a node with replication on
 # shipped every commit to addresses where nothing listened, got no acks, and 503'd

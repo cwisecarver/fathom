@@ -340,6 +340,10 @@ defmodule Fathom.Shard.Replication.Follower do
   # The receive side held ~0.2% of the send side's binary memory and stayed flat (1 -> 3 MB) while
   # the shippers went 0 -> 1,031 MB. Adding the flag here would be optimizing from analogy against a
   # measurement that says there is nothing to collect.
+  #
+  # UPDATE 2026-10-01 #7: that measurement predates the per-shard workers below. The READER still
+  # holds one frame at a time, but workers now wait in `receive` with frames in their mailboxes
+  # (bounded by `@max_outstanding_bytes`), so the WORKERS are spawned with `fullsweep_after: 0`.
   defp accept_loop(lsock, name) do
     case :gen_tcp.accept(lsock) do
       {:ok, sock} ->
@@ -399,71 +403,216 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
-  # `seeds` holds the partial seeds in flight ON THIS CONNECTION, keyed by shard id. Connection-
-  # scoped rather than in the ETS table on purpose: a partial seed belongs to the primary that
-  # started it, so a dropped connection must abandon it, and `discard_seeds/2` on the way out makes
-  # that automatic rather than something a later reconnect has to clean up.
-  defp serve(sock, name, seeds \\ %{}) do
-    case :gen_tcp.recv(sock, 0) do
+  # ONE READER, PER-SHARD WORKERS (expert review 2026-10-01 #7).
+  #
+  # This was one serial loop per primary connection: recv -> decide -> write -> ack, strictly in
+  # order, for EVERY shard that primary replicates here. So one shard's slow step held every other
+  # shard on the link — and the slow steps are routine, not exotic: every primary WAL reset absorbs
+  # the old WAL (`checkpoint_into_db/1`: a SQLite open, a TRUNCATE checkpoint, fsyncs), which happens
+  # on every flush; seed chunks and installs ran in the same loop too. The rig (2026-10-03, 1024
+  # tenants) measured this socket's Recv-Q at a 2-3 MB median and ~6 MB (the buffer max) at p90 on
+  # every node, before and after the #17/#6 changes: the follower was not reading fast enough, and
+  # the primary's sends were blocking behind it.
+  #
+  # Now the reader only decodes and dispatches. Each shard's frames go to one worker, chosen by a
+  # hash of the shard id, so ONE SHARD'S FRAMES STAY IN ORDER (the follower log, seeds and absorbs
+  # all rely on that) while different shards proceed in parallel. Workers send their own replies:
+  # the primary matches every reply by shard id and holds at most one push in flight per shard
+  # (`Shipper.reply_to/3`), so acks for different shards may arrive in any order. No wire change.
+  #
+  # BOUNDED. The old loop held one frame at a time. Workers have mailboxes, so the reader counts
+  # the bytes it has handed out and not yet seen finished, and stops reading at
+  # `@max_outstanding_bytes` — the socket then fills and the primary blocks, exactly as before, just
+  # later. `:replication_follower_workers` = 1 restores the serial behaviour.
+  #
+  # `seeds` (partial seeds in flight on THIS connection) now lives in the worker that owns those
+  # shards. Still connection-scoped: when the connection drops, every worker discards its partial
+  # seeds on the way out, so a reconnect never inherits them.
+  @max_outstanding_bytes 16 * 1024 * 1024
+  @worker_stop_ms 5_000
+
+  defp serve(sock, name) do
+    conn = %{
+      sock: sock,
+      name: name,
+      binding: Protocol.binding(),
+      nworkers: max(Application.get_env(:fathom, :replication_follower_workers, 8), 1),
+      workers: %{},
+      outstanding: 0
+    }
+
+    read_loop(conn)
+  end
+
+  defp read_loop(conn) do
+    conn = reap_done(conn)
+
+    case :gen_tcp.recv(conn.sock, 0) do
       {:ok, bytes} ->
         case decode_validated(bytes) do
-          {:ok, %Protocol.Push{} = push} ->
-            reply = handle_push(name, push)
-            :ok = :gen_tcp.send(sock, reply)
-            serve(sock, name, seeds)
+          {:ok, frame} ->
+            case frame_shard_id(frame) do
+              nil ->
+                # A follower receiving an ack means someone pointed a primary at a primary.
+                Logger.warning("replication follower got a non-push message: #{inspect(frame)}")
+                read_loop(conn)
 
-          {:ok, %Protocol.SeedBegin{} = begin} ->
-            serve(sock, name, begin_seed(name, seeds, begin))
-
-          {:ok, {:seed_chunk, shard, part, seq, chunk}} ->
-            serve(sock, name, write_chunk(seeds, shard, part, seq, chunk))
-
-          {:ok, {:seed_end, shard}} ->
-            {result, seeds} = finish_seed(name, seeds, shard)
-            :ok = :gen_tcp.send(sock, encode_seed_result(shard, result))
-            serve(sock, name, seeds)
-
-          {:ok, {:position_query, shard}} ->
-            # How far along our replica is, so a node taking over the shard can decide whether we
-            # are worth pulling from. Read-only and cheap on purpose: this is asked of every peer
-            # on a cold open, so it must never touch the database or the object store.
-            #
-            # A TORN replica offers NOTHING rather than its position — same answer as never having
-            # seen the shard. `Promote.fresher?/2` would refuse it on arrival anyway, but a peer
-            # would first pay a whole database transfer to be told so, and the bytes it pulled
-            # would be the incoherent `.db`/`-wal` pair. Answering "nothing" is both cheaper and
-            # honest: we do not hold a copy of this shard right now.
-            :ok = :gen_tcp.send(sock, Protocol.encode_position(shard, offerable(name, shard)))
-            serve(sock, name, seeds)
-
-          {:ok, {:replica_request, shard}} ->
-            :ok = send_replica(sock, name, shard)
-            serve(sock, name, seeds)
-
-          {:ok, {:seed_abort, shard}} ->
-            # The primary found its two halves no longer belong together. Drop the partial files
-            # and answer, so the sender is not left waiting out its seed timeout.
-            seeds = discard_seed(seeds, shard)
-            :ok = :gen_tcp.send(sock, Protocol.encode_reject(shard, :internal, 0))
-            serve(sock, name, seeds)
-
-          {:ok, other} ->
-            # A follower receiving an ack means someone pointed a primary at a primary.
-            Logger.warning("replication follower got a non-push message: #{inspect(other)}")
-            serve(sock, name, seeds)
+              shard_id ->
+                read_loop(dispatch(conn, shard_id, frame, byte_size(bytes)))
+            end
 
           {:error, reason} ->
             # Do not keep reading a stream we cannot parse — the framing may be out of sync, and
             # every further read would be garbage interpreted as a push.
             Logger.error("replication follower closing connection: #{inspect(reason)}")
-            discard_seeds(seeds)
-            :gen_tcp.close(sock)
+            close_connection(conn)
         end
 
       {:error, _} ->
-        discard_seeds(seeds)
-        :gen_tcp.close(sock)
+        close_connection(conn)
     end
+  end
+
+  defp dispatch(conn, shard_id, frame, size) do
+    {worker, conn} = worker_for(conn, :erlang.phash2(shard_id, conn.nworkers))
+    send(worker, {:frame, frame, size})
+    conn = %{conn | outstanding: conn.outstanding + size}
+
+    if conn.outstanding >= @max_outstanding_bytes, do: await_done(conn), else: conn
+  end
+
+  defp worker_for(conn, index) do
+    case conn.workers do
+      %{^index => pid} ->
+        {pid, conn}
+
+      _ ->
+        reader = self()
+        %{sock: sock, name: name, binding: binding} = conn
+
+        # LINKED: a worker that crashes takes the connection down (the primary reconnects and its
+        # waiters are failed `:disconnected`), rather than leaving its shards silently unanswered.
+        # `fullsweep_after: 0` because a worker, unlike the old loop, sits in `receive` holding
+        # references to frame binaries — the Shipper's measured retention problem in miniature.
+        pid =
+          :erlang.spawn_opt(
+            fn -> worker_init(sock, name, binding, reader) end,
+            [:link, fullsweep_after: 0]
+          )
+
+        {pid, %{conn | workers: Map.put(conn.workers, index, pid)}}
+    end
+  end
+
+  # Block until enough dispatched work has finished to read again.
+  defp await_done(conn) do
+    receive do
+      {:frame_done, size} ->
+        conn = %{conn | outstanding: conn.outstanding - size}
+        if conn.outstanding >= @max_outstanding_bytes, do: await_done(conn), else: conn
+    end
+  end
+
+  defp reap_done(conn) do
+    receive do
+      {:frame_done, size} -> reap_done(%{conn | outstanding: conn.outstanding - size})
+    after
+      0 -> conn
+    end
+  end
+
+  # Every worker discards its partial seeds and exits. Bounded: a worker stuck in a long step is
+  # killed after `@worker_stop_ms`, which leaves its seed temps for the next seed of that shard to
+  # replace — the same outcome a crashed handler had before.
+  defp close_connection(conn) do
+    :gen_tcp.close(conn.sock)
+
+    refs =
+      for {_i, pid} <- conn.workers do
+        ref = Process.monitor(pid)
+        send(pid, :stop)
+        {pid, ref}
+      end
+
+    deadline = System.monotonic_time(:millisecond) + @worker_stop_ms
+
+    Enum.each(refs, fn {pid, ref} ->
+      wait = max(deadline - System.monotonic_time(:millisecond), 0)
+
+      receive do
+        {:DOWN, ^ref, :process, ^pid, _} -> :ok
+      after
+        wait ->
+          Process.unlink(pid)
+          Process.exit(pid, :kill)
+      end
+    end)
+  end
+
+  defp worker_init(sock, name, binding, reader) do
+    # Replies are sealed with this connection's binding, which lives in the process dictionary of
+    # whoever encodes them (see `Protocol.seal/1`).
+    Protocol.adopt_binding(binding)
+    worker_loop(sock, name, reader, %{})
+  end
+
+  defp worker_loop(sock, name, reader, seeds) do
+    receive do
+      {:frame, frame, size} ->
+        seeds = handle_frame(sock, name, seeds, frame)
+        send(reader, {:frame_done, size})
+        worker_loop(sock, name, reader, seeds)
+
+      :stop ->
+        discard_seeds(seeds)
+    end
+  end
+
+  # A failed reply send means the connection is going away; the reader sees it on its next recv and
+  # closes everything, so the worker only has to not crash on it.
+  defp reply(sock, iodata), do: _ = :gen_tcp.send(sock, iodata)
+
+  defp handle_frame(sock, name, seeds, %Protocol.Push{} = push) do
+    reply(sock, handle_push(name, push))
+    seeds
+  end
+
+  defp handle_frame(_sock, name, seeds, %Protocol.SeedBegin{} = begin),
+    do: begin_seed(name, seeds, begin)
+
+  defp handle_frame(_sock, _name, seeds, {:seed_chunk, shard, part, seq, chunk}),
+    do: write_chunk(seeds, shard, part, seq, chunk)
+
+  defp handle_frame(sock, name, seeds, {:seed_end, shard}) do
+    {result, seeds} = finish_seed(name, seeds, shard)
+    reply(sock, encode_seed_result(shard, result))
+    seeds
+  end
+
+  defp handle_frame(sock, name, seeds, {:position_query, shard}) do
+    # How far along our replica is, so a node taking over the shard can decide whether we are worth
+    # pulling from. Read-only and cheap on purpose: this is asked of every peer on a cold open, so
+    # it must never touch the database or the object store.
+    #
+    # A TORN replica offers NOTHING rather than its position — same answer as never having seen the
+    # shard. `Promote.fresher?/2` would refuse it on arrival anyway, but a peer would first pay a
+    # whole database transfer to be told so, and the bytes it pulled would be the incoherent
+    # `.db`/`-wal` pair. Answering "nothing" is both cheaper and honest.
+    reply(sock, Protocol.encode_position(shard, offerable(name, shard)))
+    seeds
+  end
+
+  defp handle_frame(sock, name, seeds, {:replica_request, shard}) do
+    _ = send_replica(sock, name, shard)
+    seeds
+  end
+
+  defp handle_frame(sock, _name, seeds, {:seed_abort, shard}) do
+    # The primary found its two halves no longer belong together. Drop the partial files and
+    # answer, so the sender is not left waiting out its seed timeout.
+    seeds = discard_seed(seeds, shard)
+    reply(sock, Protocol.encode_reject(shard, :internal, 0))
+    seeds
   end
 
   # THE ISOLATION GATE (expert review 2026-08-20 #1).

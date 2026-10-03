@@ -243,6 +243,68 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
     %{name: name, port: port, state: state, id: id}
   end
 
+  # EXPERT REVIEW 2026-10-01 #7. The follower served each primary connection in ONE serial loop,
+  # so a reset's absorb (a SQLite open + TRUNCATE checkpoint) on one shard held the ack of every
+  # other shard on the link. The invariant: a slow step on shard A does not delay shard B's reply.
+  # The slow step here is real, not injected: a reader holding a snapshot on A's replica makes the
+  # TRUNCATE checkpoint wait out its busy timeout, as a long promote-side read would.
+  test "a slow absorb on one shard does not hold another shard's ack (#7)", ctx do
+    %{name: name, port: port, state: state, id: id} = seeded_follower!(ctx)
+
+    # A shard on a DIFFERENT worker: two shards sharing one are serial by design (that is what keeps
+    # one shard's frames in order), so a colliding pick would measure nothing. The follower hashes
+    # with `:erlang.phash2(shard_id, workers)`, default 8 workers.
+    other =
+      Enum.find_value(1..100, fn i ->
+        candidate = "#{id}-b#{i}"
+        if :erlang.phash2(candidate, 8) != :erlang.phash2(id, 8), do: candidate
+      end)
+
+    Follower.seed(name, other, 1, 1, 0, 0)
+
+    {:ok, db} = Exqlite.Sqlite3.open(Follower.db_path(name, id))
+    on_exit(fn -> Exqlite.Sqlite3.close(db) end)
+    :ok = Exqlite.Sqlite3.execute(db, "BEGIN")
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT count(*) FROM t")
+    {:row, [_]} = Exqlite.Sqlite3.step(db, stmt)
+
+    {:ok, sock} =
+      :gen_tcp.connect(~c"127.0.0.1", port, [:binary, packet: 4, active: false], 5_000)
+
+    on_exit(fn -> :gen_tcp.close(sock) end)
+
+    started = System.monotonic_time(:millisecond)
+    :ok = :gen_tcp.send(sock, Protocol.encode_push(reset_push(id, state, state.next_offset)))
+
+    :ok =
+      :gen_tcp.send(
+        sock,
+        Protocol.encode_push(%Protocol.Push{
+          shard_id: other,
+          epoch: 1,
+          wal_gen: 1,
+          salt1: 0,
+          offset: 0,
+          payload: :binary.copy(<<1>>, 32)
+        })
+      )
+
+    # Unfixed: the first reply is A's, ~5 s later, so this recv times out.
+    assert {:ok, first} = :gen_tcp.recv(sock, 0, 2_000),
+           "no reply within 2 s: shard B's push is queued behind shard A's absorb"
+
+    assert {:ok, {:ack, ^other, 32}} = Protocol.decode(first)
+
+    assert {:ok, second} = :gen_tcp.recv(sock, 0, 15_000)
+    assert {:ok, {_, ^id, _}} = Protocol.decode(second)
+
+    # PRECONDITION: A's absorb really was slow. Without it B would be answered first either way.
+    assert System.monotonic_time(:millisecond) - started >= 1_000,
+           "shard A's reset was not slowed by the held snapshot, so this measured nothing"
+
+    _ = Exqlite.Sqlite3.release(db, stmt)
+  end
+
   test "a follower SHORT of the outgoing generation stays torn through a reset", ctx do
     %{name: name, port: port, state: state, id: id} = seeded_follower!(ctx)
 

@@ -591,6 +591,18 @@ defmodule Fathom.Shard.Replication.Protocol do
     end
   end
 
+  @doc false
+  # This process's connection binding, for handing to a process that encodes frames for the same
+  # connection (the follower's per-shard workers, expert review 2026-10-01 #7). Opaque.
+  @spec binding() :: term()
+  def binding, do: Process.get(@nonce_key)
+
+  @doc false
+  # Adopt a binding read with `binding/0` in the connection's owner. `nil` = unbound.
+  @spec adopt_binding(term()) :: :ok
+  def adopt_binding(nil), do: unbind()
+  def adopt_binding({peer_nonce, mine}), do: bind(peer_nonce, mine)
+
   defp bind(peer_nonce, mine) do
     Process.put(@nonce_key, {peer_nonce, mine})
     :ok
