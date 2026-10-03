@@ -832,6 +832,12 @@ if n = env_int.("REPLICATION_SEED_CHUNK_BYTES") do
   config :fathom, :replication_seed_chunk_bytes, n
 end
 
+# Node-wide cap on concurrent seeds (expert review 2026-10-01 #6; see SeedGate). Off by default:
+# a cap of 8 measured ~5x the failed commits at flush 5 s on the rig. 0 disables.
+if n = env_nonneg_int.("REPLICATION_SEED_MAX_CONCURRENCY") do
+  config :fathom, :replication_seed_max_concurrency, n
+end
+
 # ---- The RECEIVE half: this node acts as somebody's follower --------------------------------
 # SEPARATE GATE FROM REPLICATION_ENABLED, and the reason is a real gap this closes (2026-08-10):
 # the `Follower` listener was only ever started by the test suite, so a node with replication on

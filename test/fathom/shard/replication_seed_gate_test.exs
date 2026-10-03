@@ -102,6 +102,16 @@ defmodule Fathom.Shard.ReplicationSeedGateTest do
     assert %{held: 2, waiting: 0} = SeedGate.stats(gate)
   end
 
+  # Rig 2026-10-03 (1024 tenants, flush 5 s): a default cap of 8 measured 50,837 failed commits
+  # against 10,769 uncapped — queued seeds leave followers unseeded and shards without a quorum.
+  # The default must not shed writes; the cap is an operator's opt-in.
+  test "the gate is OFF unless configured", %{gate: gate} do
+    Application.delete_env(:fathom, :replication_seed_max_concurrency)
+    assert SeedGate.cap() == 0
+    for _ <- 1..20, do: assert(:ok = SeedGate.acquire(100, gate))
+    assert %{held: 0} = SeedGate.stats(gate)
+  end
+
   test "a cap of 0 disables the gate", %{gate: gate} do
     Application.put_env(:fathom, :replication_seed_max_concurrency, 0)
     for _ <- 1..5, do: assert(:ok = SeedGate.acquire(100, gate))

@@ -22,11 +22,19 @@ defmodule Fathom.Shard.Replication.SeedGate do
   seed task with `Process.exit(pid, :kill)` (`expire_seeds/1`), which runs no `after` block, and a
   release that depended on the task's own cleanup would leak the slot. The `:DOWN` frees it.
 
-  `:replication_seed_max_concurrency` sets the cap (default 8); `0` or `nil` disables the gate.
+  `:replication_seed_max_concurrency` sets the cap; `0` or `nil` (the default) disables the gate —
+  see `@default_cap` for the measurement that turned it off.
   """
   use GenServer
 
-  @default_cap 8
+  # OFF BY DEFAULT, MEASURED (rig, 2026-10-03, 1024 tenants, flush 5 s, valid same-session runs):
+  # cap 8 = 2,315 txn/s / 50,837 errors; no cap = 1,983 / 10,769; the pre-#6 build = 2,008 /
+  # 11,214. A queued seed is not harmless: until it lands, that follower answers `:unknown_shard` /
+  # `:seeding`, and a shard whose followers are all waiting in line has no quorum at all. Bounding
+  # link contention that way traded a little head-of-line blocking for ~5x the failed commits. At
+  # 30 s flush the cap was neutral-to-better (1,348 errors vs 2,556 pre-#6), so the knob stays for
+  # an operator who measures their own fleet; the default must not shed writes.
+  @default_cap 0
 
   @doc false
   def start_link(opts),
