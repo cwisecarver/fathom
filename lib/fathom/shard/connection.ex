@@ -326,13 +326,45 @@ defmodule Fathom.Shard.Connection do
   # `journal_mode` is file-level and persistent, and `wal_autocheckpoint` is not settable by a tenant,
   # so neither needs re-applying; the rest are cheap and are what a stream could have changed or
   # what `configure/1` guarantees per connection.
+  #
+  # ONE BATCH, AND ONLY WHAT CAN HAVE CHANGED (expert review 2026-10-01 perf #24). The schema reload
+  # (see "RELOAD THE SCHEMA" below) leads, then the pragmas a stream can set. Dropped from the reuse path:
+  #
+  #   * `set_busy_timeout` — `busy_timeout` is on `ShardExecutor`'s hard DENY list, which no
+  #     operator allow-list can re-open, so the value set at open is still there.
+  #   * `max_page_count` — not tenant-settable, and recomputing it cost a `PRAGMA page_size` prepare,
+  #     fetch and release on every reuse. Re-applied only when an operator has put it on
+  #     `:tenant_pragma_allow`, the one way a stream could have changed it.
+  #
+  # `synchronous` stays in the batch for the same operator-allow reason; inside one `execute` it is
+  # nearly free.
   defp reconfigure_for_reuse(conn) do
-    with :ok <- Sqlite3.execute(conn, "PRAGMA synchronous=FULL"),
-         :ok <- Sqlite3.set_busy_timeout(conn, 5000),
-         :ok <- maybe_foreign_keys(conn),
-         :ok <- maybe_cache_size(conn) do
-      maybe_max_page_count(conn)
+    with :ok <- Sqlite3.execute(conn, rw_reuse_sql()) do
+      if "max_page_count" in Application.get_env(:fathom, :tenant_pragma_allow, []),
+        do: maybe_max_page_count(conn),
+        else: :ok
     end
+  end
+
+  # Built from config (booleans and integers fathom owns, never tenant input), mirroring
+  # `maybe_foreign_keys/1` and `maybe_cache_size/1` exactly.
+  defp rw_reuse_sql do
+    fk =
+      if Application.get_env(:fathom, :foreign_keys, true),
+        do: [";PRAGMA foreign_keys=ON"],
+        else: []
+
+    cache =
+      case Application.get_env(:fathom, :shard_cache_size_kb, 2000) do
+        kb when is_integer(kb) and kb > 0 -> [";PRAGMA cache_size=-#{kb}"]
+        _ -> []
+      end
+
+    IO.iodata_to_binary([
+      "SELECT 1 FROM sqlite_schema LIMIT 0;PRAGMA synchronous=FULL",
+      fk,
+      cache
+    ])
   end
 
   # SQLite defaults foreign_keys=OFF, but Django (≥2.2) assumes ON and enforces it via a
@@ -1093,18 +1125,24 @@ defmodule Fathom.Shard.Connection do
   behavioural settings and same-tenant here, so a leak between one tenant's own requests is a benign
   quirk, not an isolation breach; widen this reset if a concrete need appears.
   """
+  # The `:ro` reuse batch: schema reload, then re-assert read-only. See `reset_for_reuse/2`.
+  @ro_reuse_sql "SELECT 1 FROM sqlite_schema LIMIT 0;PRAGMA query_only=ON"
+
   @spec reset_for_reuse(reference(), :ro | :rw) :: :ok | {:error, term()}
   def reset_for_reuse(conn, scope) when scope in [:ro, :rw] do
-    with :ok <- rollback_if_open(conn),
-         :ok <- reload_schema(conn) do
+    with :ok <- rollback_if_open(conn) do
       # `:rw` re-applies the writable-path pragmas (`configure/1`). `:ro` RE-ASSERTS `query_only=ON`
       # (expert review 2026-09-18 #13): a `:ro` handle from the WAL-recovery / new-file fallback is
       # physically READ-WRITE, and its read-only-ness rests SOLELY on `PRAGMA query_only=ON` (see the
       # open path's `maybe_query_only/2` and the note there). Rollback alone left that unenforced on
       # reuse — safe only because `ShardExecutor` denies the `query_only` pragma to tenants, but a
-      # trust boundary must not rest on a single upstream guard. `maybe_query_only/2` is a no-op for
-      # `:rw`, so this is scope-correct either way.
-      if scope == :rw, do: reconfigure_for_reuse(conn), else: maybe_query_only(conn, scope)
+      # trust boundary must not rest on a single upstream guard.
+      #
+      # Both are ONE `Sqlite3.execute` batch that starts with the schema reload (expert review
+      # 2026-10-01 perf #24): every exqlite call is a dirty-IO NIF dispatch on a pool sized to the
+      # core count, and the separate calls were ~7 per reuse. Measured on a warm handle (2026-10-01,
+      # 3,000 samples): 19 us separate vs 7 us batched.
+      if scope == :rw, do: reconfigure_for_reuse(conn), else: Sqlite3.execute(conn, @ro_reuse_sql)
     end
   end
 
@@ -1118,7 +1156,9 @@ defmodule Fathom.Shard.Connection do
   # `PRAGMA query_only=ON`, `PRAGMA schema_version` nor `BEGIN; ROLLBACK` refreshes it; STEPPING a
   # statement that reads `sqlite_schema` does. `:rw` was protected only incidentally, by
   # `PRAGMA max_page_count` in `configure/1`, and not at all when the size cap is disabled.
-  defp reload_schema(conn), do: Sqlite3.execute(conn, "SELECT 1 FROM sqlite_schema LIMIT 0")
+  #
+  # That statement now LEADS both reuse batches (`@ro_reuse_sql`, `rw_reuse_sql/0`) rather than
+  # running as its own call (expert review 2026-10-01 perf #24).
 
   @doc """
   True when this connection's `temp` schema holds no objects — a precondition for POOLING it
