@@ -91,15 +91,28 @@ defmodule Fathom.ConnectionWatchdogTest do
     watchdog = Process.get({Connection, :watchdog, conn})
     assert is_pid(watchdog), "the query did not start a watchdog to test"
 
-    true = :erlang.suspend_process(watchdog)
-    on_exit(fn -> if Process.alive?(watchdog), do: :erlang.resume_process(watchdog) end)
+    # ONE process suspends AND resumes. A suspension belongs to the process that made it, so the
+    # old shape (suspend here, resume from a spawned helper) raised "process is not suspended" in
+    # the helper: the watchdog stayed frozen, release_owner_state/1 hit its 1 s kill fallback, and
+    # this test passed on the fallback instead of the wait it is about. Worse, the frozen-then-
+    # killed watchdog left the NEXT test's 5 ms deadline unenforced about half the time (seed
+    # 630387: a 90M-row query ran to completion) — order-dependent, so CI saw it only rarely.
+    test = self()
 
     spawn(fn ->
+      true = :erlang.suspend_process(watchdog)
+      send(test, :suspended)
       Process.sleep(50)
       :erlang.resume_process(watchdog)
     end)
 
-    :ok = Connection.release_owner_state(conn)
+    assert_receive :suspended, 1_000
+
+    {us, :ok} = :timer.tc(fn -> Connection.release_owner_state(conn) end)
+
+    # It WAITED for the resumed watchdog, rather than killing it at the 1 s fallback.
+    assert us < 900_000,
+           "release_owner_state/1 took #{div(us, 1000)} ms: it hit the kill fallback"
 
     refute Process.alive?(watchdog),
            "the watchdog outlived the handoff, so a late cancel can hit the next stream"

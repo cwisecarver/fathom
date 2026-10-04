@@ -252,6 +252,20 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # volume rather than to database size.
   #
   # `docs/reviews/a2-checkpoint-torn-replica-2026-08-12.md`.
+  defp await_gen_change(name, id, gen_before, tries \\ 250) do
+    case Follower.state_of(name, id) do
+      %{wal_gen: gen} when gen != gen_before ->
+        :ok
+
+      _ when tries > 0 ->
+        Process.sleep(20)
+        await_gen_change(name, id, gen_before, tries - 1)
+
+      state ->
+        flunk("follower never applied the reset: #{inspect(state)}")
+    end
+  end
+
   test "a follower ABSORBS its WAL at a reset, so the replica is still a database", ctx do
     %{id: id, root: root} = ctx
     followers = start_followers!(root, 3)
@@ -274,10 +288,18 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     assert File.stat!(Follower.db_path(name, id)).size <= 4096,
            "the follower's .db already holds the rows, so a lost checkpoint would prove nothing"
 
+    gen_before = Follower.state_of(name, id).wal_gen
+
     # The seam: TRUNCATE rewrites the WAL with fresh salts, so the next commit ships a reset.
     {:ok, _} = Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", [])
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (3)", [])
     assert :ok = Session.commit(id, wal, coordinator)
+
+    # WAIT FOR THIS FOLLOWER, not the quorum (CI OTP 27, 2026-10-04, seed 542787: rows [[1], [2]]).
+    # q=2 of 3, so `commit/3` returns on two acks and `name` can be the third, still applying the
+    # reset. The per-shard follower workers (2026-10-01 perf #7) made that window easy to hit. The
+    # straggler class the rest of this file guards against, in the one test that read too early.
+    await_gen_change(name, id, gen_before)
 
     # THE ASSERTION, and it is checked BEFORE the flag so a regression reports the data loss rather
     # than the bookkeeping. Open the replica the way promotion does: 1 and 2 come back out of the
