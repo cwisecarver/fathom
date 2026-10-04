@@ -375,8 +375,10 @@ defmodule Fathom.ShardExecutor do
           # changes; a read failure on either side counts as "moved", the safe direction.
           case schema_version(conn) do
             v when is_integer(v) and v == schema_before -> :ok
-            _ -> Fathom.Shard.SchemaGen.bump()
+            _ -> bump_schema_gen(conn)
           end
+        else
+          bump_if_ddl_transaction_ended(conn)
         end
 
         capture(opts.template?, conn, sql, args)
@@ -1898,6 +1900,36 @@ defmodule Fathom.ShardExecutor do
 
   # The main schema's change counter, or nil if it cannot be read. Only ever called for a DDL
   # statement, so it adds two tiny queries to DDL and nothing to anything else.
+  # DDL INSIDE AN EXPLICIT TRANSACTION (expert review 2026-10-01 perf #9, verified 2026-10-04).
+  # The generation is bumped when the DDL statement runs, which is BEFORE its COMMIT. A sibling
+  # stream that read in that window re-read the columns of the still-COMMITTED schema (correct at
+  # the time) and cached them under the NEW generation; the COMMIT then bumped nothing, so the
+  # sibling kept serving them. Measured: `BEGIN; ALTER TABLE t ADD COLUMN y`, sibling
+  # `SELECT *`, `COMMIT`, sibling `SELECT *` -> columns ["id", "x"] over rows [1, "hello", "0"].
+  # So a DDL that leaves a transaction open marks it, and the statement that ends the transaction
+  # bumps again. Detected by the connection returning to autocommit rather than by SQL keyword,
+  # so COMMIT, END, a RELEASE of the outermost savepoint and a ROLLBACK are all covered; a
+  # ROLLBACK's extra bump only costs one round of re-reads. The mark is per connection, in this
+  # stream's dictionary, like the statement cache: a stream that dies mid-transaction committed
+  # nothing.
+  defp bump_schema_gen(conn) do
+    Fathom.Shard.SchemaGen.bump()
+
+    unless Connection.autocommit?(conn),
+      do: Process.put({__MODULE__, :ddl_in_txn, conn}, true)
+  end
+
+  defp bump_if_ddl_transaction_ended(conn) do
+    key = {__MODULE__, :ddl_in_txn, conn}
+
+    if Process.get(key) && Connection.autocommit?(conn) do
+      Process.delete(key)
+      Fathom.Shard.SchemaGen.bump()
+    end
+
+    :ok
+  end
+
   defp schema_version(conn) do
     case Connection.query(conn, "PRAGMA schema_version", []) do
       {:ok, %{rows: [[v]]}} when is_integer(v) -> v

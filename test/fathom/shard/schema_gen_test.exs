@@ -135,4 +135,56 @@ defmodule Fathom.Shard.SchemaGenTest do
              Connection.query(b, "SELECT * FROM t", []),
            "an empty SELECT * still reported the pre-DDL columns"
   end
+
+  # DDL INSIDE AN EXPLICIT TRANSACTION (expert review 2026-10-01 perf #9, verified 2026-10-04). The
+  # executor bumped the generation at the ALTER, BEFORE the COMMIT. A sibling reading in that window
+  # cached the still-committed column list under the NEW generation, and the COMMIT bumped nothing,
+  # so the sibling kept it: columns ["id", "x"] over rows [1, "hello", "0"] — the 2026-08-26 #7
+  # mis-mapping, back through a transaction. Driven through the executor, which owns the bump.
+  test "a sibling sees the columns a DDL transaction added once it commits" do
+    shard = "schemagen_txn_#{System.unique_integer([:positive])}"
+
+    on_exit(fn ->
+      for base <- [
+            Path.join([Fathom.Shard.data_dir(), "#{shard}.db"]),
+            Path.join([Fathom.Shard.Storage.Local.dir(), "#{shard}.db"])
+          ],
+          suffix <- ["", "-wal", "-shm"],
+          do: File.rm(base <> suffix)
+    end)
+
+    stmt = fn sql -> %Filo.Stmt{sql: sql, args: []} end
+    {:ok, a} = Fathom.ShardExecutor.open(shard)
+    {:ok, b} = Fathom.ShardExecutor.open(shard)
+
+    {:ok, _} =
+      Fathom.ShardExecutor.execute(a, stmt.("CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)"))
+
+    {:ok, _} = Fathom.ShardExecutor.execute(a, stmt.("INSERT INTO t VALUES (1, 'hello')"))
+    {:ok, _} = Fathom.ShardExecutor.execute(b, stmt.("SELECT * FROM t"))
+
+    {:ok, _} = Fathom.ShardExecutor.execute(a, stmt.("BEGIN"))
+
+    {:ok, _} =
+      Fathom.ShardExecutor.execute(a, stmt.("ALTER TABLE t ADD COLUMN y TEXT DEFAULT ('0')"))
+
+    # The sibling reads INSIDE the window: the change is not committed, so two columns is right.
+    assert {:ok, %Filo.StmtResult{cols: mid_cols, rows: [mid_row]}} =
+             Fathom.ShardExecutor.execute(b, stmt.("SELECT * FROM t"))
+
+    assert length(mid_cols) == length(mid_row) and length(mid_row) == 2,
+           "precondition: the sibling did not read the pre-commit schema inside the window"
+
+    {:ok, _} = Fathom.ShardExecutor.execute(a, stmt.("COMMIT"))
+
+    assert {:ok, %Filo.StmtResult{cols: cols, rows: [row]}} =
+             Fathom.ShardExecutor.execute(b, stmt.("SELECT * FROM t"))
+
+    assert length(cols) == length(row),
+           "columns #{inspect(cols)} over row #{inspect(row)}: the sibling kept the column list " <>
+             "it cached inside the DDL transaction"
+
+    :ok = Fathom.ShardExecutor.close(a)
+    :ok = Fathom.ShardExecutor.close(b)
+  end
 end
