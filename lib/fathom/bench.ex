@@ -103,6 +103,7 @@ defmodule Fathom.Bench do
     :hrana_rt,
     :hrana_open_rt,
     :hrana_oneshot,
+    :hrana_pooled,
     :wire_rows,
     :wire_encode,
     :flush
@@ -184,6 +185,10 @@ defmodule Fathom.Bench do
       # runs the executor's close (checkin, pool reset or close) that hrana_open_rt_us never
       # reaches (expert review 2026-10-01 perf #19). Watch-only until its variance is measured.
       hrana_oneshot_rt_us: run_if(only, :hrana_oneshot, fn -> hrana_oneshot_rt(opts) end),
+      # The same one-shot request while ANOTHER stream holds the shard open, so each sample's open
+      # is a pool HIT — the reuse path (`reset_for_reuse`, the temp-schema probe) no other metric
+      # reaches (expert review 2026-10-01 perf #19/#24). Watch-only until its variance is measured.
+      hrana_pooled_open_rt_us: run_if(only, :hrana_pooled, fn -> hrana_pooled_open_rt(opts) end),
       wire_rows_per_s: run_if(only, :wire_rows, fn -> wire_rows(opts) end),
       # The OTHER encoder (#41.7). wire_rows_per_s drives encode_json/1; this drives encode/1,
       # the tagged-map builder Cursor and Protobuf reach, whose own moduledoc says the tagged-map
@@ -997,6 +1002,85 @@ defmodule Fathom.Bench do
 
       p50(us)
     end)
+  end
+
+  @doc """
+  `hrana_pooled_open_rt_us` — median round trip of a one-shot `[execute, close]` stream that
+  REUSES a pooled handle.
+
+  `hrana_oneshot_rt_us` closes its streams but never reuses one: a serial client takes the shard's
+  open-connection count to zero on every close, which drains the pool (2026-09-29 #25), so every
+  sample opens fresh. Prod reuses whenever streams overlap. Here one background stream stays open
+  for the whole run, so each timed stream's open is a pool hit and its close a pool checkin —
+  `reset_for_reuse/2` and the temp-schema probe, the path expert review 2026-10-01 perf #24 is
+  about. The pool is forced on for this metric only (it is off outside prod config), and the
+  metric counts `[:fathom, :shard, :pool_take]` hits and raises if they are not the norm.
+  """
+  @spec hrana_pooled_open_rt_us(keyword()) :: float() | nil
+  def hrana_pooled_open_rt_us(opts \\ []), do: hrana_pooled_open_rt(opts)
+
+  defp hrana_pooled_open_rt(opts) do
+    samples = Keyword.get(opts, :hrana_rt_samples, @hrana_rt_samples)
+
+    requests = [
+      %{"type" => "execute", "stmt" => %{"sql" => "SELECT 1", "args" => []}},
+      %{"type" => "close"}
+    ]
+
+    prev_pool = Application.get_env(:fathom, :connection_pool)
+    Application.put_env(:fathom, :connection_pool, true)
+    hits = :counters.new(2, [])
+    handler = "bench-pooled-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shard, :pool_take],
+      fn _event, _m, %{result: result}, _ ->
+        :counters.add(hits, if(result == :hit, do: 1, else: 2), 1)
+      end,
+      nil
+    )
+
+    try do
+      with_wire(opts, "benchpooled", fn client ->
+        # The background stream: execute, keep its baton, never close it until the end. While it
+        # is open the shard's connection count never reaches zero, so the pool is never drained.
+        {:ok, _, held} = Filo.Client.execute(%{client | baton: nil}, "SELECT 1")
+        held_baton = held.baton
+
+        # Warm: one one-shot puts a handle in the pool for the first timed sample to take.
+        {:ok, _, client} = Filo.Client.pipeline(%{held | baton: nil}, requests)
+        :counters.put(hits, 1, 0)
+        :counters.put(hits, 2, 0)
+
+        {client, us} =
+          Enum.reduce(1..samples, {client, []}, fn _, {c, acc} ->
+            c = %{c | baton: nil}
+            {t, result} = :timer.tc(fn -> Filo.Client.pipeline(c, requests) end)
+            {:ok, [%{"type" => "ok"}, %{"type" => "ok"}], c} = result
+            {c, [t | acc]}
+          end)
+
+        {:ok, _, _} = Filo.Client.pipeline(%{client | baton: held_baton}, [%{"type" => "close"}])
+
+        hit = :counters.get(hits, 1)
+
+        unless hit * 2 >= samples,
+          do:
+            raise(
+              "hrana_pooled_open_rt_us got #{hit} pool hits in #{samples} samples " <>
+                "(#{:counters.get(hits, 2)} misses); it is not measuring the reuse path"
+            )
+
+        p50(us)
+      end)
+    after
+      :telemetry.detach(handler)
+
+      if is_nil(prev_pool),
+        do: Application.delete_env(:fathom, :connection_pool),
+        else: Application.put_env(:fathom, :connection_pool, prev_pool)
+    end
   end
 
   @doc """

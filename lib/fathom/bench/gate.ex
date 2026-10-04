@@ -144,6 +144,9 @@ defmodule Fathom.Bench.Gate do
     # hrana_open_rt_us and flush_p50_us followed above: variance first, then a threshold. It is
     # the first metric that runs the executor's close and the connection pool at all.
     {:hrana_oneshot_rt_us, :higher_worse, :watch},
+    # The pooled-REUSE round trip (expert review 2026-10-01 perf #24). Watch-only until its band is
+    # measured, same rule as above.
+    {:hrana_pooled_open_rt_us, :higher_worse, :watch},
     # THE TAIL, gated from 2026-08-03 (expert review #41.5). Every metric above is a p50, and
     # `delta/4` is a pure ratio — which AGENTS.md forbids in as many words ("Assert an absolute
     # floor, not only a ratio… The ratio holds while throughput collapses"). A change that leaves

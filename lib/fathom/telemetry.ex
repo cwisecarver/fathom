@@ -106,6 +106,13 @@ defmodule Fathom.Telemetry do
         ],
         description: "Time from an idle drop to the shard's next cold open, ms"
       ),
+      # Pooled-handle reuse rate (expert review 2026-10-01 perf #19/#24). Tagged by result only
+      # (:hit | :miss), never by shard.
+      counter("fathom.shard.pool_take.count",
+        event_name: [:fathom, :shard, :pool_take],
+        tags: [:result],
+        description: "Connection-pool takes on a stream open, by hit/miss"
+      ),
       counter("fathom.shard.lease.acquired.count",
         description: "Lease acquisitions (steal-on-lapse + first open)"
       ),

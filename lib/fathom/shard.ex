@@ -2112,10 +2112,18 @@ defmodule Fathom.Shard do
 
   defp take_from_pool(%{pool: nil} = state, _scope), do: {:open, state}
 
+  # Every take reports hit or miss (expert review 2026-10-01 perf #19/#24): until this, nothing
+  # could say whether a pooled handle was ever reused, so no bench could prove it measured the reuse
+  # path, and a pool that never hit looked exactly like one that always did.
   defp take_from_pool(%{pool: pool} = state, scope) do
     case HandlePool.take(pool, scope) do
-      {:hit, conn, pool} -> {{:reuse, conn}, %{state | pool: pool}}
-      {:miss, pool} -> {:open, %{state | pool: pool}}
+      {:hit, conn, pool} ->
+        :telemetry.execute([:fathom, :shard, :pool_take], %{count: 1}, %{result: :hit})
+        {{:reuse, conn}, %{state | pool: pool}}
+
+      {:miss, pool} ->
+        :telemetry.execute([:fathom, :shard, :pool_take], %{count: 1}, %{result: :miss})
+        {:open, %{state | pool: pool}}
     end
   end
 
