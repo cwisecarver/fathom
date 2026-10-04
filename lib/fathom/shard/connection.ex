@@ -187,9 +187,38 @@ defmodule Fathom.Shard.Connection do
   # arbitrary code loading enabled.
   defp load_extension(conn) do
     case Fathom.Shard.Extension.load(conn) do
-      :ok -> :ok
+      :ok -> arm_backstop(conn)
       :skipped -> :ok
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # THE ON-THREAD DEADLINE BACKSTOP (2026-10-04; native/fathom_udf/src/backstop.rs). The watchdog
+  # enforces `:query_timeout_ms` with a BEAM timer, and after the VM had idled no normal-scheduler
+  # timer fired while a long query ran in its dirty NIF: a 5 ms deadline fired at ~5,550 ms, when
+  # the query had already finished. The extension's progress handler runs ON the query's thread,
+  # so it cannot be starved that way. Set here, BEFORE the authorizer and any tenant SQL, because
+  # the extension accepts only the first value — a tenant's own `fathom_backstop(0)` is ignored.
+  #
+  # The cost of set-once: a runtime change to `:query_timeout_ms` reaches the backstop only on
+  # connections opened after it. The watchdog reads the live value on every query.
+  #
+  # A failure is logged, not fatal: the backstop is a second line, and an extension artifact that
+  # predates it should not make every open fail.
+  defp arm_backstop(conn) do
+    case timeout_ms() do
+      ms when is_integer(ms) and ms > 0 ->
+        case Sqlite3.execute(conn, "SELECT fathom_backstop(#{ms})") do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Logger.warning("statement-deadline backstop not armed: #{inspect(reason)}")
+            :ok
+        end
+
+      _ ->
+        :ok
     end
   end
 
@@ -773,6 +802,8 @@ defmodule Fathom.Shard.Connection do
     # {:done, ref} send, leaving the watchdog armed to interrupt a LATER statement reusing this
     # connection `ms` later — a spurious FILO_QUERY_TIMEOUT on a healthy query (expert review
     # 2026-07-18 #13). The raise then propagates to query/3's rescue as before.
+    started = System.monotonic_time(:millisecond)
+
     result =
       try do
         fun.()
@@ -788,10 +819,23 @@ defmodule Fathom.Shard.Connection do
       end
 
     case {timed_out?, result} do
-      {true, {:error, _}} -> {:error, :query_timeout}
-      _ -> result
+      {true, {:error, _}} ->
+        {:error, :query_timeout}
+
+      # The extension's backstop interrupted it (see `arm_backstop/1`) while the watchdog's timer
+      # had not fired: an interrupt with the deadline already past is the same timeout.
+      {false, {:error, reason}} ->
+        if interrupted?(reason) and System.monotonic_time(:millisecond) - started >= ms,
+          do: {:error, :query_timeout},
+          else: result
+
+      _ ->
+        result
     end
   end
+
+  defp interrupted?(reason) when is_binary(reason), do: reason =~ "interrupt"
+  defp interrupted?(_reason), do: false
 
   defp drain_stale_timeouts do
     receive do

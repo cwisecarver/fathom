@@ -48,6 +48,7 @@ use rusqlite::types::{Type, Value, ValueRef};
 use rusqlite::{ffi, Connection, Error, Result};
 
 pub mod aggregates;
+pub mod backstop;
 pub mod datetime;
 pub mod pyre;
 pub mod pytypes;
@@ -97,6 +98,10 @@ fn register_all(db: Connection) -> Result<bool> {
     // checkpointing it displaces. See src/wal.rs; removing this line silently disables BOTH the
     // hook and (harmlessly) restores SQLite's own autocheckpoint.
     wal::install(&db)?;
+
+    // The statement-deadline backstop: a timeout enforced on the query's own thread, because a
+    // BEAM timer can fail to fire while the query runs. See src/backstop.rs.
+    backstop::install(&db)?;
 
     Ok(false)
 }

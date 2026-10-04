@@ -351,4 +351,106 @@ defmodule Fathom.ConnectionWatchdogTest do
     assert is_pid(replacement) and Process.alive?(replacement)
     refute replacement == dead
   end
+
+  # 2026-10-04. After the VM had idled, no BEAM timer fired while a long query ran in its dirty
+  # NIF, so the watchdog's deadline never landed (measured: a 5 ms deadline fired at ~5,550 ms).
+  # The extension now enforces the same deadline from SQLite's progress handler, on the query's own
+  # thread. These freeze the watchdog to stand in for "its timer never fires": that state cannot be
+  # forced through the scheduler directly, and a frozen watchdog is exactly what the query saw.
+  describe "the on-thread deadline backstop" do
+    @heavy "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 90000000) " <>
+             "SELECT count(*) FROM c"
+
+    defp backstop_conn!(ms) do
+      Application.put_env(:fathom, :query_timeout_ms, ms)
+      path = Path.join(System.tmp_dir!(), "backstop_#{System.unique_integer([:positive])}.db")
+      {:ok, conn} = Connection.open(path)
+
+      on_exit(fn ->
+        Connection.close(conn)
+        for s <- ["", "-wal", "-shm"], do: File.rm(path <> s)
+      end)
+
+      # PRECONDITION: the backstop is armed with this deadline. The extension answers the
+      # deadline it holds; 0 would mean it was never set and these tests would prove nothing.
+      assert {:ok, %{rows: [[^ms]]}} = Connection.query(conn, "SELECT fathom_backstop(0)", [])
+      conn
+    end
+
+    # One process suspends AND resumes (a suspension belongs to its suspender).
+    defp freeze_watchdog!(conn) do
+      assert {:ok, _} = Connection.query(conn, "SELECT 1", [])
+      watchdog = Process.get({Connection, :watchdog, conn})
+      assert is_pid(watchdog)
+      test = self()
+
+      freezer =
+        spawn(fn ->
+          true = :erlang.suspend_process(watchdog)
+          send(test, :frozen)
+
+          receive do
+            :thaw -> :erlang.resume_process(watchdog)
+          end
+        end)
+
+      assert_receive :frozen, 1_000
+      on_exit(fn -> send(freezer, :thaw) end)
+      freezer
+    end
+
+    test "a long query is stopped at its deadline even when the watchdog cannot run" do
+      conn = backstop_conn!(100)
+      freezer = freeze_watchdog!(conn)
+
+      {us, result} = :timer.tc(fn -> Connection.query(conn, @heavy, []) end)
+
+      # Unfixed: the query runs to completion (~5 s) and returns {:ok, ...}.
+      assert {:error, :query_timeout} = result,
+             "got #{inspect(result)} after #{div(us, 1000)} ms with the watchdog frozen"
+
+      assert us < 2_000_000, "stopped only after #{div(us, 1000)} ms"
+      send(freezer, :thaw)
+    end
+
+    test "a tenant cannot switch the backstop off" do
+      conn = backstop_conn!(100)
+
+      # First value wins: this is ignored, and the answer is still the deadline fathom set.
+      assert {:ok, %{rows: [[100]]}} = Connection.query(conn, "SELECT fathom_backstop(0)", [])
+
+      assert {:ok, %{rows: [[100]]}} =
+               Connection.query(conn, "SELECT fathom_backstop(999999)", [])
+
+      freezer = freeze_watchdog!(conn)
+      assert {:error, :query_timeout} = Connection.query(conn, @heavy, [])
+      send(freezer, :thaw)
+    end
+
+    test "the clock restarts per statement: many short statements are never stopped" do
+      conn = backstop_conn!(20)
+      :ok = Connection.exec(conn, "CREATE TABLE s (a INTEGER)")
+
+      :ok =
+        Connection.exec(
+          conn,
+          "WITH RECURSIVE g(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM g WHERE v < 2000) " <>
+            "INSERT INTO s SELECT v FROM g"
+        )
+
+      started = System.monotonic_time(:millisecond)
+
+      results =
+        for _ <- 1..40 do
+          r = Connection.query(conn, "SELECT count(*) FROM s WHERE a % 7 = 0", [])
+          Process.sleep(2)
+          r
+        end
+
+      assert System.monotonic_time(:millisecond) - started > 40,
+             "the run was shorter than one deadline, so a stale clock could not have tripped"
+
+      assert Enum.all?(results, &match?({:ok, _}, &1)), "a short statement was stopped"
+    end
+  end
 end
