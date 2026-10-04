@@ -87,13 +87,6 @@ fn from_int_result(r: Result<Option<i64>, datetime::UdfError>) -> Outcome {
     }
 }
 
-fn from_opt_int(o: Option<i64>) -> Outcome {
-    match o {
-        None => Outcome::Null,
-        Some(i) => Outcome::Int(i),
-    }
-}
-
 fn from_opt_text(o: Option<String>) -> Outcome {
     match o {
         None => Outcome::Null,
