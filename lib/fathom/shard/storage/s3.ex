@@ -1087,7 +1087,16 @@ defmodule Fathom.Shard.Storage.S3 do
           fd =
             case Process.get(fd_key) do
               nil ->
-                {:ok, fd} = File.open(tmp, [:write, :raw, :binary])
+                # Buffered (expert review 2026-10-01 perf #35): over TLS each chunk is one record,
+                # <= 16 KiB, so an unbuffered fd paid one write syscall per record — a 5 MiB pull
+                # was 320 writes, 10.8 ms of handler work vs 6.1 ms with a 1 MiB buffer, and this
+                # runs between socket reads. A buffered write's error surfaces at close instead,
+                # which is why the close below is a hard `:ok =` match: an unflushed buffer must
+                # fail the pull, never reach promote with a short file (the MD5 is over the bytes
+                # handed to binwrite, so it would not catch a lost write by itself).
+                {:ok, fd} =
+                  File.open(tmp, [:write, :raw, :binary, {:delayed_write, 1_048_576, 50}])
+
                 Process.put(fd_key, fd)
                 fd
 
