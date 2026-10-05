@@ -751,15 +751,20 @@ defmodule Fathom.Bench do
         trials
         |> times(fn _ ->
           Enum.each(ids, &Fathom.Directory.Recorder.record/1)
-          {us, flushed} = :timer.tc(fn -> Fathom.Directory.Recorder.flush() end)
+          buffered = :ets.info(Fathom.Directory.Recorder, :size)
+          {us, _written} = :timer.tc(fn -> Fathom.Directory.Recorder.flush() end)
+          left = :ets.info(Fathom.Directory.Recorder, :size)
 
           # The whole point is the batch upsert; a flush that drained nothing would report an
-          # enormous rows/sec for work that never happened.
-          if flushed < n do
-            raise "recorder flush drained #{flushed}/#{n} rows — measuring nothing"
+          # enormous rows/sec for work that never happened. Checked on the BUFFER, not on
+          # flush/0's rows-written: since the #22 write guard (perf review 2026-10-01), trials
+          # after the first re-touch rows inside the granularity window, which Postgres skips —
+          # the steady-state path at density, and the one worth timing — so they write ~0 rows.
+          if buffered < n or left != 0 do
+            raise "recorder flush drained #{buffered - left}/#{n} touches — measuring nothing"
           end
 
-          flushed / (us / 1_000_000)
+          n / (us / 1_000_000)
         end)
         |> median()
 

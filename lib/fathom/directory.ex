@@ -33,6 +33,9 @@ defmodule Fathom.Directory do
   # Postgres bind-parameter ceiling is ~65535; 6 fields/row keeps a chunk well
   # under it and bounds each statement's size.
   @batch_chunk 1_000
+  # A re-touch within this many seconds of the stored last_active_at is not written (perf review
+  # 2026-10-01 #22). See record_batch/1.
+  @default_touch_granularity_s 30
 
   # How long a shard may sit in `migrating` before the reconcile sweep assumes its
   # migration job was lost and reclaims it (see reclaim_stale_migrating/1). Generous —
@@ -103,6 +106,24 @@ defmodule Fathom.Directory do
   number of rows written. Raises on a Postgres error; the caller (the recorder)
   treats flushing as best-effort.
 
+  **A re-touch is written at most every `:directory_touch_granularity_s` (30 s)** — perf
+  review 2026-10-01 #22. Every write here is a non-HOT update (`last_active_at` and
+  `updated_at` are indexed), so recording every touched shard every second cost, at 30k
+  active shards, ~30k row versions/s, **20.2 MiB/s of WAL** and 2.3M dead tuples in two
+  minutes; with the guard, ~1k rows/s and 2.4 MiB/s (-88%, Postgres 18, 120 s each). No
+  reader needs second precision, but two need exactness at an EDGE, so a touch is always
+  written when the stored value is at or before:
+
+    * `cutover_at` — the revert write-age guard refuses on `last_active_at > cutover_at`, and
+      cutover stamps both with the same instant, so the first post-cutover touch must land
+      or a revert would discard writes it could not see;
+    * `last_flushed_at` — the loss-window report calls a shard dirty when
+      `last_active_at > last_flushed_at`, so the first touch after a flush must land.
+
+  Inside a dirty period `last_active_at` can therefore trail by up to the granularity
+  (the reported loss window is at most that much short); dirty-vs-clean and
+  used-since-cutover stay exact.
+
   Shard ids reaching here already passed `Fathom.Shards`' id validation at
   checkout, and `insert_all` parameterizes every value, so this is injection-safe
   even though it bypasses changeset validation.
@@ -112,6 +133,9 @@ defmodule Fathom.Directory do
 
   def record_batch(entries) do
     now = DateTime.utc_now()
+
+    granularity_s =
+      Application.get_env(:fathom, :directory_touch_granularity_s, @default_touch_granularity_s)
 
     entries
     |> Enum.chunk_every(@batch_chunk)
@@ -143,7 +167,17 @@ defmodule Fathom.Directory do
                     fragment("GREATEST(EXCLUDED.last_active_at, ?)", s.last_active_at),
                   updated_at: fragment("EXCLUDED.updated_at")
                 ]
-              ]
+              ],
+              # The #22 write guard (see @doc). A row the WHERE rejects is not updated at all —
+              # no new tuple, no index entries, no WAL — and does not count in the return value.
+              where:
+                fragment(
+                  "EXCLUDED.last_active_at > ? + make_interval(secs => ?)",
+                  s.last_active_at,
+                  ^granularity_s
+                ) or
+                  fragment("? <= coalesce(?, '-infinity')", s.last_active_at, s.cutover_at) or
+                  fragment("? <= coalesce(?, '-infinity')", s.last_active_at, s.last_flushed_at)
             ),
           conflict_target: :shard_id
         )

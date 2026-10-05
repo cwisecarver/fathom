@@ -25,6 +25,13 @@ round-trip in front of every query — latency on the hot path, and a Postgres o
   op) and **batch-upserts** every touched shard in one chunked `Repo.insert_all`
   (`Directory.record_batch/1`) — one round-trip per interval for the whole node, not one per
   checkout.
+- **A re-touch is written at most every 30 s** (`:directory_touch_granularity_s`; perf review
+  2026-10-01 #22). Each upsert is a non-HOT update (every index written), so re-recording every
+  touched shard every second cost ~20 MiB/s of WAL at 30k active shards; the `ON CONFLICT … WHERE`
+  guard cut that to ~2.4 MiB/s. The two edges a reader needs exact always land: the first touch
+  after a **cutover** (the revert write-age guard) and the first after a recorded **flush** (the
+  loss-window report's dirty test). So `last_active_at` can trail by up to 30 s inside an
+  active period, while "used since cutover" and "dirty since flush" stay exact.
 - **A Postgres outage drops a *flush*, never a *checkout*.** The `record/1` ETS insert already
   succeeded, so the request never blocked on or failed from Postgres; and a *failed batch*
   **re-buffers** the drained touches (`:ets.insert_new`, so a fresher touch already back in the

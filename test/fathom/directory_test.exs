@@ -424,7 +424,10 @@ defmodule Fathom.DirectoryTest do
       t1 = first.last_active_at
       older = DateTime.add(t1, -60, :second)
 
-      assert Directory.record_batch([{"recency", older}]) == 1
+      # Until perf review 2026-10-01 #22 this asserted 1: the stale stamp was "written" as a no-op
+      # GREATEST. The write guard now skips it outright (no row version), so 0 rows are written —
+      # the invariant this test exists for, recency never moving backward, is unchanged.
+      assert Directory.record_batch([{"recency", older}]) == 0
       {:ok, after_stale} = Directory.get("recency")
       assert DateTime.compare(after_stale.last_active_at, t1) == :eq
 
@@ -433,6 +436,57 @@ defmodule Fathom.DirectoryTest do
       assert Directory.record_batch([{"recency", newer}]) == 1
       {:ok, after_fresh} = Directory.get("recency")
       assert DateTime.compare(after_fresh.last_active_at, t1) == :gt
+    end
+  end
+
+  # Perf review 2026-10-01 #22: every record_batch write is a non-HOT update, and the Recorder
+  # re-recorded every touched shard every second — ~30k row versions and ~20 MiB of WAL per second
+  # at 30k active shards. A re-touch inside :directory_touch_granularity_s (30 s) is now skipped,
+  # EXCEPT where a reader needs the edge exact. Each escape below has its own test because each
+  # protects a different guard, and dropping any one silently breaks that guard only.
+  describe "record_batch/1 write guard (#22)" do
+    defp stored(id) do
+      {:ok, row} = Directory.get(id)
+      row
+    end
+
+    test "a re-touch inside the granularity is not written; one past it is" do
+      {:ok, first} = Directory.resolve("g_basic")
+      t1 = first.last_active_at
+
+      assert Directory.record_batch([{"g_basic", DateTime.add(t1, 10, :second)}]) == 0
+      assert DateTime.compare(stored("g_basic").last_active_at, t1) == :eq
+
+      later = DateTime.add(t1, 31, :second)
+      assert Directory.record_batch([{"g_basic", later}]) == 1
+      assert DateTime.compare(stored("g_basic").last_active_at, later) == :eq
+    end
+
+    # The revert write-age guard (Migrator.ShardMigration) refuses when last_active_at >
+    # cutover_at, and cutover stamps both with the same instant. Without this escape a write 5 s
+    # after cutover is skipped and a revert would silently discard it.
+    test "the first touch after a cutover always lands (revert write-age guard)" do
+      {:ok, _} = Directory.resolve("g_cutover")
+      {:ok, cut} = Directory.cutover("g_cutover", 2)
+      assert DateTime.compare(cut.last_active_at, cut.cutover_at) == :eq
+
+      assert Directory.record_batch([{"g_cutover", DateTime.add(cut.cutover_at, 5, :second)}]) ==
+               1
+
+      assert DateTime.compare(stored("g_cutover").last_active_at, cut.cutover_at) == :gt
+    end
+
+    # flush_lag_report calls a shard dirty when last_active_at > last_flushed_at. Without this
+    # escape, a touch a few seconds after a flush is skipped and a dirty shard reads clean.
+    test "the first touch after a recorded flush always lands (loss-window report)" do
+      {:ok, first} = Directory.resolve("g_flush")
+      t1 = first.last_active_at
+      flushed = DateTime.add(t1, 2, :second)
+      assert Directory.record_flush_batch([{"g_flush", flushed}]) == 1
+      refute Enum.any?(Directory.flush_lag_report(1000), &(&1.shard_id == "g_flush"))
+
+      assert Directory.record_batch([{"g_flush", DateTime.add(flushed, 1, :second)}]) == 1
+      assert Enum.any?(Directory.flush_lag_report(1000), &(&1.shard_id == "g_flush"))
     end
   end
 
