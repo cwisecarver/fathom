@@ -120,6 +120,28 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # returns as soon as the outcome is known, so a straggler's `:unknown_shard` arrives after the
   # fact and is picked up by the next commit's drain. So this drives commits while it waits, which
   # is exactly what a live shard under write traffic does.
+  # Polls (the follower exposes no notification) until `name` holds the shard's WAL through
+  # `extent`, then returns; flunks with the follower's position if it never gets there.
+  defp await_caught_up(name, id, extent, timeout \\ 5_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    caught_up =
+      Stream.repeatedly(fn ->
+        case Follower.state_of(name, id) do
+          %{next_offset: o} when o >= extent ->
+            :caught_up
+
+          _ ->
+            Process.sleep(10)
+            :waiting
+        end
+      end)
+      |> Enum.find(fn r -> r == :caught_up or System.monotonic_time(:millisecond) > deadline end)
+
+    assert caught_up == :caught_up,
+           "#{name} never reached the committed extent #{extent}: #{inspect(Follower.state_of(name, id))}"
+  end
+
   defp await_seeded(name, id, commit, timeout \\ 5_000) do
     deadline = System.monotonic_time(:millisecond) + timeout
 
@@ -1334,6 +1356,16 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     end
 
     {:ok, %{rows: [[expected]]}} = Connection.query(conn, "SELECT count(*) FROM t", [])
+
+    # `Session.commit` returns :ok on a QUORUM (2 of 3), so the third follower may still be writing
+    # the last commit's frames when it returns. Reading its copy straight away flaked in CI
+    # (2026-10-05, fcf06ed, seed 49015: 202 of 203 rows) and locally ~1 run in 17. Wait for each
+    # follower to reach the primary's committed extent — `next_offset` advances only after the bytes
+    # are down (Follower.apply_write) — and only then compare. A follower that never catches up
+    # still fails here, which is the bug this test exists for.
+    {:ok, %{commit_extent: extent}} = Wal.read(wal)
+
+    for {name, _} <- followers, Follower.state_of(name, id), do: await_caught_up(name, id, extent)
 
     # Open a COPY of each replica the way promotion would, so the follower's own files are untouched.
     for {name, _} <- followers, Follower.state_of(name, id) do
