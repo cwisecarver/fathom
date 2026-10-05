@@ -121,6 +121,52 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
       assert us < 1_200_000,
              "six 300 ms snapshot copies took #{div(us, 1000)} ms: the run is serial"
     end
+
+    # Second half of the same finding: RetentionJob swept its sample one shard at a time (a LIST
+    # plus ~one DELETE each), so it could not keep up with the snapshots the now-concurrent
+    # scheduler creates.
+    test "a retention run sweeps its sample concurrently, not one shard at a time" do
+      ids = for i <- 1..6, do: "snapretc#{i}_#{System.unique_integer([:positive])}"
+      prev_backend = Application.get_env(:fathom, :shard_storage)
+
+      on_exit(fn ->
+        Application.delete_env(:fathom, :faulty_before)
+        restore(:shard_storage, prev_backend)
+
+        for id <- ids do
+          Shards.drain(id, 2_000)
+          _ = Fathom.Shard.Storage.Local.purge_shard(id)
+
+          for dir <- [remote_dir(), Fathom.Shard.data_dir()],
+              suffix <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock"],
+              do: File.rm(Path.join(dir, id <> suffix))
+        end
+      end)
+
+      for id <- ids, do: seed(id, ["CREATE TABLE t (v INTEGER)", "INSERT INTO t VALUES (1)"])
+      {:ok, _} = ScheduleJob.run(50)
+      for id <- ids, do: assert({:ok, [_]} = Snapshots.list(id))
+
+      # Each of OUR retention LISTs takes 300 ms. Six serial sweeps need >= 1.8 s.
+      mine = MapSet.new(ids)
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+      Application.put_env(
+        :fathom,
+        :faulty_before,
+        {:list_snapshots, fn id -> if MapSet.member?(mine, id), do: Process.sleep(300) end}
+      )
+
+      {us, {:ok, totals}} = :timer.tc(fn -> RetentionJob.run(50, %{}) end)
+      Application.delete_env(:fathom, :faulty_before)
+
+      # The sweep really ran on our shards: the keep-nothing policy expired each auto snapshot.
+      for id <- ids, do: assert({:ok, []} = Snapshots.list(id))
+      assert totals.errors == 0
+
+      assert us < 1_200_000,
+             "six 300 ms retention sweeps took #{div(us, 1000)} ms: the run is serial"
+    end
   end
 
   describe "selection" do

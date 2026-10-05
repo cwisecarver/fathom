@@ -512,6 +512,10 @@ defmodule Fathom.Test.FaultyStorage do
   # which is why the branch had no test.
   @impl true
   def list_snapshots(shard_id) do
+    # `run_before(:list_snapshots, shard_id)` gives each retention LIST a real duration, the only way
+    # to tell a serial retention sweep from a concurrent one (expert review 2026-10-01 perf #27).
+    run_before(:list_snapshots, shard_id)
+
     case Application.get_env(:fathom, :storage_list_snapshots_error) do
       nil -> Local.list_snapshots(shard_id)
       reason -> {:error, reason}

@@ -30,6 +30,12 @@ defmodule Fathom.Snapshots.RetentionJob do
   alias Fathom.Snapshots
   alias Fathom.Snapshots.Retention
 
+  # Shards swept at once: a LIST and a few DELETEs each against the shared store pool, so this
+  # stays well under the Finch pool rather than competing with cold-open pulls (as ScheduleJob).
+  @default_concurrency 16
+  # Per shard: a LIST plus its DELETEs. Generous, but never `:infinity`.
+  @sweep_timeout_ms 120_000
+
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
     with policy when is_map(policy) <- policy(),
@@ -54,10 +60,26 @@ defmodule Fathom.Snapshots.RetentionJob do
     dry_run? = Keyword.get(opts, :dry_run, false)
     now = Keyword.get(opts, :now, DateTime.utc_now())
 
+    # CONCURRENTLY, bounded (expert review 2026-10-01 perf #27, second half). Each shard is a LIST
+    # plus, in steady state, about one DELETE, so a serial sweep ran at ~1/(2 RTT) shards per
+    # second — the same shape ScheduleJob had before 584ac87, and retention must keep up with what
+    # the scheduler now creates. A real per-shard timeout, never `:infinity`; a shard that times
+    # out counts as an error and, never having been swept, is picked again next run. Batching the
+    # DELETEs (DeleteObjects) was the review's other half and is NOT done: at ~1 expiring snapshot
+    # per shard per run there is nothing to batch within a shard.
     results =
       n
       |> Directory.sample_for_retention()
-      |> Enum.map(&sweep_one(&1.shard_id, policy, now, dry_run?))
+      |> Task.async_stream(&sweep_one(&1.shard_id, policy, now, dry_run?),
+        max_concurrency: concurrency(),
+        timeout: @sweep_timeout_ms,
+        on_timeout: :kill_task,
+        ordered: false
+      )
+      |> Enum.map(fn
+        {:ok, result} -> result
+        {:exit, _reason} -> %{kept: 0, dropped: 0, ineligible: 0, errors: 1}
+      end)
 
     totals =
       Enum.reduce(results, %{kept: 0, dropped: 0, ineligible: 0, errors: 0}, fn r, acc ->
@@ -149,4 +171,11 @@ defmodule Fathom.Snapshots.RetentionJob do
   end
 
   defp sample_size, do: Application.get_env(:fathom, :snapshot_retention_sample)
+
+  defp concurrency do
+    case Application.get_env(:fathom, :snapshot_retention_concurrency, @default_concurrency) do
+      n when is_integer(n) and n > 0 -> n
+      _ -> @default_concurrency
+    end
+  end
 end
