@@ -1603,7 +1603,12 @@ defmodule Fathom.Shard.Replication.Follower do
   defp apply_write(name, %Protocol.Push{} = push, new_state, mode) do
     path = wal_path(name, push.shard_id)
 
-    case write_frame(path, push.offset, push.payload, mode) do
+    written =
+      if mode == :append,
+        do: write_held(path, push.offset, push.payload),
+        else: write_frame(path, push.offset, push.payload, mode)
+
+    case written do
       :ok ->
         # State advances ONLY after the bytes are down. Advancing first and failing the write would
         # leave the follower claiming an offset it does not hold, which the primary would believe.
@@ -1657,6 +1662,81 @@ defmodule Fathom.Shard.Replication.Follower do
           reraise e, __STACKTRACE__
       end
     end
+  end
+
+  # A HELD FILE PER SHARD for appends (expert review 2026-10-01 perf #7, its last part). Opening
+  # and closing the WAL around every push cost 42-47 us p50 against 5 us for the pwrite alone, on a
+  # 17 KB frame — and it is on the commit path, since the primary waits for this ack.
+  #
+  # THE HAZARD a held file brings, and the check that removes it: other processes REPLACE or DELETE
+  # this file — a seed from a new primary arrives on another connection (another worker) and renames
+  # a new WAL into place, Recovery installs a pulled replica the same way, a tenant delete removes it.
+  # A stale handle would then write into an unlinked inode: acked, and gone. So every append first
+  # compares the path's inode with the one the handle was opened on, and reopens on a mismatch.
+  # That is exact rather than heuristic: while this handle is open its inode cannot be freed, so no
+  # new file at the path can reuse it. Costs one `stat` (~13 us), so the net is ~18 us per push
+  # instead of ~45. A reset (`:truncate`) still goes through `write_frame/4`; it truncates the same
+  # inode, so a held handle stays valid across it.
+  #
+  # Per WORKER (the process dictionary of the connection's per-shard worker that owns these shards)
+  # and closed when it exits. Capped so a follower of thousands of shards cannot exhaust its fds.
+  @held_fds_cap 64
+
+  defp write_held(path, offset, payload) do
+    key = {__MODULE__, :held_fds}
+    held = Process.get(key, %{})
+
+    case held_fd(held, path) do
+      {:ok, fd, held} ->
+        with :ok <- :file.pwrite(fd, offset, payload),
+             :ok <- maybe_sync(fd) do
+          Process.put(key, held)
+          :ok
+        else
+          {:error, _} = err ->
+            Process.put(key, drop_held(held, path))
+            err
+        end
+
+      {:error, _} = err ->
+        Process.put(key, drop_held(held, path))
+        err
+    end
+  end
+
+  defp held_fd(held, path) do
+    case {Map.get(held, path), :file.read_file_info(path, [:raw])} do
+      {{fd, inode, _used}, {:ok, info}} when elem(info, 11) == inode ->
+        {:ok, fd, Map.put(held, path, {fd, inode, System.monotonic_time()})}
+
+      _stale_missing_or_none ->
+        held = drop_held(held, path)
+
+        # Creates the file if absent, like `write_frame/4`'s append mode.
+        with {:ok, fd} <- :file.open(path, [:read, :write, :raw, :binary]),
+             {:ok, info} <- :file.read_file_info(fd) do
+          held = evict_oldest(held)
+          {:ok, fd, Map.put(held, path, {fd, elem(info, 11), System.monotonic_time()})}
+        end
+    end
+  end
+
+  defp drop_held(held, path) do
+    case Map.pop(held, path) do
+      {{fd, _inode, _used}, rest} ->
+        _ = :file.close(fd)
+        rest
+
+      {nil, rest} ->
+        rest
+    end
+  end
+
+  defp evict_oldest(held) when map_size(held) < @held_fds_cap, do: held
+
+  defp evict_oldest(held) do
+    {path, _} = Enum.min_by(held, fn {_path, {_fd, _inode, used}} -> used end)
+    drop_held(held, path)
   end
 
   defp maybe_sync(fd) do

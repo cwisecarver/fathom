@@ -337,6 +337,32 @@ defmodule Fathom.Shard.ReplicationTransportTest do
       assert File.read!(Follower.wal_path(:f_seq, "acme")) == "aaabbb"
     end
 
+    # Expert review 2026-10-01 perf #7: the follower now keeps each shard's WAL open across pushes.
+    # Other processes replace that file (a seed from a new primary, a Recovery install) by renaming a
+    # new one into place. A stale handle would keep writing into the unlinked old file: acked, and
+    # gone. The invariant: after the path is replaced, the next push lands in the file AT the path.
+    test "a push after the WAL was replaced underneath lands in the new file" do
+      port = start_follower_named!(:f_held)
+      ship = start_shipper!(:s_held, port)
+      Follower.seed(:f_held, "acme", 1, 1, 0, 0)
+      wal = Follower.wal_path(:f_held, "acme")
+
+      Shipper.push(ship, push("acme", offset: 0, payload: "aaa"))
+      assert_receive {:repl_reply, ^ship, {:ack, "acme", 3}}, 2_000
+
+      # Replace the file the way an install does: write a new one and rename it over the path.
+      replacement = wal <> ".replacement"
+      File.write!(replacement, "XYZ")
+      File.rename!(replacement, wal)
+
+      Shipper.push(ship, push("acme", offset: 3, payload: "bbb"))
+      assert_receive {:repl_reply, ^ship, {:ack, "acme", 6}}, 2_000
+
+      assert File.read!(wal) == "XYZbbb",
+             "the second push did not reach the file at the path (#{inspect(File.read!(wal))}): " <>
+               "it went to the replaced file through a stale handle"
+    end
+
     test "a gap is refused with the follower's real offset, and nothing is written" do
       port = start_follower_named!(:f_gap)
       ship = start_shipper!(:s_gap, port)
