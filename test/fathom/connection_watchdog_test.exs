@@ -427,6 +427,77 @@ defmodule Fathom.ConnectionWatchdogTest do
       send(freezer, :thaw)
     end
 
+    # Two connections on ONE file: `holder` takes the write lock and keeps it, `blocked` then waits
+    # on it. Both are opened after `ms` is set, so both carry the backstop.
+    defp lock_pair!(ms) do
+      Application.put_env(:fathom, :query_timeout_ms, ms)
+
+      path =
+        Path.join(System.tmp_dir!(), "backstop_lock_#{System.unique_integer([:positive])}.db")
+
+      {:ok, holder} = Connection.open(path)
+      {:ok, blocked} = Connection.open(path)
+
+      on_exit(fn ->
+        Connection.close(blocked)
+        Connection.close(holder)
+        for s <- ["", "-wal", "-shm"], do: File.rm(path <> s)
+      end)
+
+      :ok = Connection.exec(holder, "CREATE TABLE t (a INTEGER)")
+      :ok = Connection.exec(holder, "BEGIN IMMEDIATE")
+      :ok = Connection.exec(holder, "INSERT INTO t VALUES (1)")
+      {holder, blocked}
+    end
+
+    # CI 2026-10-04 (query_bounds_test:89): a write blocked behind another stream's lock under a
+    # 200 ms deadline returned SQLITE_BUSY after 5,012 ms — the watchdog never fired, and the
+    # progress handler does not run during a lock wait. The extension's busy handler now gives up
+    # at the deadline itself.
+    test "a write waiting on another connection's lock stops at its deadline with the watchdog frozen" do
+      {_holder, blocked} = lock_pair!(200)
+      freezer = freeze_watchdog!(blocked)
+
+      {us, result} =
+        :timer.tc(fn -> Connection.query(blocked, "INSERT INTO t VALUES (2)", []) end)
+
+      # Unfixed: exqlite's busy handler waits out the full 5 s busy timeout, then SQLITE_BUSY.
+      assert {:error, :query_timeout} = result,
+             "got #{inspect(result)} after #{div(us, 1000)} ms with the watchdog frozen"
+
+      assert us < 1_500_000, "the lock wait ended only after #{div(us, 1000)} ms"
+      send(freezer, :thaw)
+    end
+
+    test "a tenant can lower its lock-wait limit but never raise it" do
+      conn = backstop_conn!(100)
+
+      assert {:ok, %{rows: [[5000]]}} =
+               Connection.query(conn, "SELECT fathom_busy_timeout(99999)", [])
+
+      assert {:ok, %{rows: [[300]]}} =
+               Connection.query(conn, "SELECT fathom_busy_timeout(300)", [])
+
+      assert {:ok, %{rows: [[300]]}} =
+               Connection.query(conn, "SELECT fathom_busy_timeout(5000)", [])
+    end
+
+    # The extension's busy handler REPLACED exqlite's, so exqlite's own busy-timeout field no longer
+    # decides anything wherever the extension is loaded. `Connection.set_busy_timeout/2` must reach
+    # the extension too, or the coordinator's 1 s checkpoint wait (Fathom.Shard) silently becomes 5 s.
+    test "Connection.set_busy_timeout/2 reaches the extension's lock-wait limit" do
+      {_holder, blocked} = lock_pair!(nil)
+      :ok = Connection.set_busy_timeout(blocked, 300)
+
+      {us, result} =
+        :timer.tc(fn -> Connection.query(blocked, "INSERT INTO t VALUES (2)", []) end)
+
+      assert {:error, :busy} = result, "expected SQLITE_BUSY, got #{inspect(result)}"
+
+      assert us < 1_500_000,
+             "waited #{div(us, 1000)} ms: the 300 ms limit did not reach the handler"
+    end
+
     test "the clock restarts per statement: many short statements are never stopped" do
       conn = backstop_conn!(20)
       :ok = Connection.exec(conn, "CREATE TABLE s (a INTEGER)")

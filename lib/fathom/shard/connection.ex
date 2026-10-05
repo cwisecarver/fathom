@@ -822,10 +822,11 @@ defmodule Fathom.Shard.Connection do
       {true, {:error, _}} ->
         {:error, :query_timeout}
 
-      # The extension's backstop interrupted it (see `arm_backstop/1`) while the watchdog's timer
-      # had not fired: an interrupt with the deadline already past is the same timeout.
+      # The extension's backstop stopped it (see `arm_backstop/1`) while the watchdog's timer had
+      # not fired: an interrupt, or a lock wait given up as SQLITE_BUSY, with the deadline already
+      # past is the same timeout.
       {false, {:error, reason}} ->
-        if interrupted?(reason) and System.monotonic_time(:millisecond) - started >= ms,
+        if deadline_error?(reason) and System.monotonic_time(:millisecond) - started >= ms,
           do: {:error, :query_timeout},
           else: result
 
@@ -834,8 +835,11 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
-  defp interrupted?(reason) when is_binary(reason), do: reason =~ "interrupt"
-  defp interrupted?(_reason), do: false
+  # SQLITE_INTERRUPT arrives as SQLite's message ("interrupted"); a lock wait given up arrives as
+  # exqlite's `:busy` from step. Only consulted when the deadline has already passed.
+  defp deadline_error?(:busy), do: true
+  defp deadline_error?(reason) when is_binary(reason), do: reason =~ "interrupt"
+  defp deadline_error?(_reason), do: false
 
   defp drain_stale_timeouts do
     receive do
@@ -1068,8 +1072,20 @@ defmodule Fathom.Shard.Connection do
   default `sqlite3OsSleep` loop — making the wait uninterruptible, so `:query_timeout_ms` can no
   longer bound it and a blocked statement pins a dirty-IO scheduler thread for the full timeout.
   """
+  #
+  # TWO places hold the limit since 2026-10-04: exqlite's own field (read by exqlite's busy handler,
+  # which is what runs when the extension is not loaded) and the extension's (its busy handler
+  # replaced exqlite's to enforce the statement deadline during lock waits — see
+  # native/fathom_udf/src/backstop.rs). Setting only exqlite's would silently stop working wherever
+  # the extension is loaded. The extension's limit can only go DOWN, so a raise reaches exqlite only.
   @spec set_busy_timeout(reference(), non_neg_integer()) :: :ok | {:error, term()}
-  def set_busy_timeout(conn, ms), do: Sqlite3.set_busy_timeout(conn, ms)
+  def set_busy_timeout(conn, ms) do
+    with :ok <- Sqlite3.set_busy_timeout(conn, ms) do
+      # "no such function" means the extension is not loaded here; exqlite's handler is the live one.
+      _ = Sqlite3.execute(conn, "SELECT fathom_busy_timeout(#{ms})")
+      :ok
+    end
+  end
 
   @doc """
   Introspects a statement WITHOUT running it (the Hrana `describe` request, #34): returns its result
