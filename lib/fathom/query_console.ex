@@ -104,8 +104,7 @@ defmodule Fathom.QueryConsole do
         json: body,
         headers: headers,
         receive_timeout: @receive_timeout,
-        retry: false,
-        decode_json: [keys: :strings]
+        retry: false
       )
 
     latency = elapsed_ms(started)
