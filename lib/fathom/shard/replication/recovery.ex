@@ -573,6 +573,14 @@ defmodule Fathom.Shard.Replication.Recovery do
   # Connect, then run the #17 handshake before any frame is exchanged (a no-op with
   # `REPLICATION_CONN_NONCE` off). Each query/pull runs in its own process and dials its own
   # connection, so the binding the handshake leaves in the process dictionary is exactly this one.
+  #
+  # A per-peer reused query connection was considered and NOT built (perf review 2026-10-01
+  # #3(d)). Measured 2026-10-05 on loopback with the nonce handshake: fresh dial + handshake +
+  # position query p50 227 µs / p99 431 µs vs 56 / 136 µs on a held socket, i.e. ~0.17 ms of local
+  # work plus ~2 peer RTTs (connect, the follower's hello) per replicating cold open, with peers
+  # queried in parallel. In-region that is well under the open's S3 round trips (tens of ms), and
+  # a pooled socket breaks the one-connection-per-process assumption the handshake binding relies
+  # on. The large cost here was a blackholed peer, which the unreachable cache handles (#3(c)).
   defp connect(host, port) do
     with {:ok, sock} <- dial(host, port) do
       case Protocol.handshake_connect(sock, Protocol.handshake_timeout_ms()) do
