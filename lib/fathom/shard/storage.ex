@@ -1131,6 +1131,13 @@ defmodule Fathom.Shard.Storage do
   half of `atomic_write/2` for callers that STREAM their bytes into the temp
   themselves (the S3 backend's downloads, expert review #20) instead of buffering a
   whole object in memory. Same crash-consistency contract (expert review #17).
+
+  The fsync sits on the S3 cold-open critical path and cannot be deferred: the base must be
+  durable before the first WAL commit lands on it. Measured 2026-10-05 (expert review 2026-10-01
+  perf #36), `:file.sync` of a freshly written file: macOS APFS 0.36 ms (1 MB) / 0.49 ms (5 MB);
+  Linux in the colima VM 0.42 / 1.28 ms — about 1–5% of a 26–133 ms S3 cold open, under the
+  finding's 10% bar, so it was left in place. Unmeasured: a throughput-capped network volume
+  (EBS gp3), where a large pull's fsync scales with the bytes still unwritten.
   """
   @spec promote_temp(Path.t(), Path.t()) :: :ok | {:error, term()}
   def promote_temp(tmp, dst) do
