@@ -74,11 +74,35 @@ defmodule Fathom.Telemetry do
   # observability layer (Fathom.Admin.enabled?, off in test). Named :fathom_metrics so the
   # collector and the /metrics endpoint target it via TelemetryMetricsPrometheus.Core.scrape/1.
   defp prometheus_children do
-    if Fathom.Admin.enabled?() do
-      [{TelemetryMetricsPrometheus.Core, metrics: metrics(), name: :fathom_metrics}]
-    else
-      []
-    end
+    if Fathom.Admin.enabled?(), do: reporter_children(), else: []
+  end
+
+  @doc """
+  The Prometheus reporters over `metrics/0`: `TelemetryMetricsPrometheus.Core` for everything
+  except the per-query distributions, which `Fathom.Telemetry.FastHistogram` records lock-free
+  (Core's one-key-per-metric insert cost 28% of node query throughput; perf review 2026-10-01
+  #14). Public so the scale harness runs exactly what production runs. Read both with `scrape/0`.
+  """
+  @spec reporter_children() :: [Supervisor.child_spec() | {module(), keyword()}]
+  def reporter_children do
+    {fast, core} = Enum.split_with(metrics(), &Fathom.Telemetry.FastHistogram.handles?/1)
+
+    [
+      {TelemetryMetricsPrometheus.Core, metrics: core, name: :fathom_metrics},
+      {Fathom.Telemetry.FastHistogram, metrics: fast}
+    ]
+  end
+
+  @doc """
+  The full Prometheus exposition: Core's metrics plus the `FastHistogram` ones. Raises (like
+  `TelemetryMetricsPrometheus.Core.scrape/1`) when the reporters are not running.
+  """
+  @spec scrape() :: String.t()
+  def scrape do
+    IO.iodata_to_binary([
+      TelemetryMetricsPrometheus.Core.scrape(:fathom_metrics),
+      Fathom.Telemetry.FastHistogram.render()
+    ])
   end
 
   @doc """

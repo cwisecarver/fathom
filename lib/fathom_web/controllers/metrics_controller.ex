@@ -13,7 +13,7 @@ defmodule FathomWeb.MetricsController do
   end
 
   defp scrape do
-    :fathom_metrics |> TelemetryMetricsPrometheus.Core.scrape() |> IO.iodata_to_binary()
+    Fathom.Telemetry.scrape()
   rescue
     _ -> ""
   catch

@@ -15,7 +15,7 @@ defmodule Mix.Tasks.Fathom.Scale do
 
       mix fathom.scale --ramp [--max 200000] [--checkpoint 10000]
       mix fathom.scale --lease-rps [--shards 5000] [--lease-ttl-ms 900] [--window-ms 3000]
-      mix fathom.scale --hotspots [--shards 1000] [--zipf 1.1] [--queries 50000] [--workers N] [--stream-len 1]
+      mix fathom.scale --hotspots [--shards 1000] [--zipf 1.1] [--queries 50000] [--workers N] [--stream-len 1] [--prometheus [--prometheus-core-only]]
 
   `--ramp` opens empty shards until the fd ceiling to find the node-density limit
   cheaply. `--lease-rps` measures that the lease-renewal storm is gone: per-shard
@@ -50,7 +50,9 @@ defmodule Mix.Tasks.Fathom.Scale do
     zipf: :float,
     queries: :integer,
     workers: :integer,
-    stream_len: :integer
+    stream_len: :integer,
+    prometheus: :boolean,
+    prometheus_core_only: :boolean
   ]
 
   @impl true
@@ -69,7 +71,15 @@ defmodule Mix.Tasks.Fathom.Scale do
 
         Keyword.get(opts, :hotspots, false) ->
           {Fathom.Scale.hotspots(
-             Keyword.take(opts, [:shards, :zipf, :queries, :workers, :stream_len])
+             Keyword.take(opts, [
+               :shards,
+               :zipf,
+               :queries,
+               :workers,
+               :stream_len,
+               :prometheus,
+               :prometheus_core_only
+             ])
            ), &print_hotspots/1}
 
         true ->
@@ -158,13 +168,21 @@ defmodule Mix.Tasks.Fathom.Scale do
       {"sweep absolute", abs_sweep},
       {"anti-flap top-20", "Jaccard #{r.flap_top20_jaccard} across the two windows"},
       {"hottest 10", top},
-      {"verdict", r.verdict}
+      {"verdict", r.verdict},
+      {"prometheus", prometheus_row(r)}
     ]
 
     Mix.shell().error("\n=== fathom.scale --hotspots (Phase-2 §B rebalancing evidence) ===")
     Enum.each(rows, fn {k, v} -> Mix.shell().error("  #{String.pad_trailing(k, 18)} #{v}") end)
     Mix.shell().error("")
   end
+
+  defp prometheus_row(%{prometheus: true} = r) do
+    "ON (#{r.prom_layout}): #{r.prom_queries_observed} queries recorded, #{r.prom_scrapes} scrapes " <>
+      "(mean #{r.prom_scrape_ms_mean} ms, max #{r.prom_scrape_ms_max} ms)"
+  end
+
+  defp prometheus_row(_), do: "off (no telemetry handler attached)"
 
   # print_warm_density/1 (and --warm-density) removed 2026-09-14 with the WarmFollower retirement.
 

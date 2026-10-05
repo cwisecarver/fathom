@@ -395,6 +395,13 @@ defmodule Fathom.Scale do
   stream before it rotates to a new Zipf-drawn shard; raise it to measure persistent-stream
   throughput). At most `:workers` connections are open at once, so `ulimit -n` bounds
   `:workers`, not the shard count.
+
+  `:prometheus` (false) attaches the production metrics layer for the drive: the
+  `TelemetryMetricsPrometheus.Core` reporter over `Fathom.Telemetry.metrics/0` plus a loop
+  doing what `Fathom.Admin.MetricsCollector` does each tick (scrape, render, parse, every
+  1 s). The harness does not start the app, so without this flag NO telemetry handler is
+  attached and the per-query metrics cost is absent from both arms of an A/B. Run with and
+  without it to price that cost (perf review 2026-10-01 #14).
   """
   @spec hotspots(keyword()) :: map()
   def hotspots(opts \\ []) do
@@ -417,6 +424,10 @@ defmodule Fathom.Scale do
     provision_tiny(n)
 
     cdf = zipf_cdf(n, s)
+    # Started after provisioning so the setup's checkouts don't seed the distributions.
+    prom =
+      if Keyword.get(opts, :prometheus, false),
+        do: start_prometheus(Keyword.get(opts, :prometheus_core_only, false))
 
     Logger.warning(
       "window A: driving ~#{per_window} Zipf(s=#{s}) queries over #{n} shards " <>
@@ -427,7 +438,11 @@ defmodule Fathom.Scale do
     Logger.warning("window B: repeating the drive for anti-flap stability ...")
     {rates_b, wb, _exec_b} = drive_window(per_window, cdf, workers, stream_len)
 
-    result = report(n, s, stream_len, exec_a, rates_a, wa, rates_b, wb)
+    result =
+      n
+      |> report(s, stream_len, exec_a, rates_a, wa, rates_b, wb)
+      |> Map.merge(stop_prometheus(prom))
+
     # Stop the coordinators (idle was raised so they persist through the run) before the
     # caller's cleanup rm_rf's the store, so a teardown flush never races the delete or
     # self-fences on a vanished lease object.
@@ -833,6 +848,79 @@ defmodule Fathom.Scale do
       {:ok, _pid} -> :ok
       {:error, {:already_started, _pid}} -> :ok
     end
+  end
+
+  # The production metrics layer for `hotspots(prometheus: true)`: the reporters
+  # `Fathom.Telemetry` starts, plus a scraper standing in for MetricsCollector's 1 s tick
+  # (scrape → render → parse). The scrape is what drains Core's distribution samples, so the
+  # loop also keeps its duplicate_bag from growing without bound, as it does in production.
+  # `core_only?` runs every metric on TelemetryMetricsPrometheus.Core, the layout before
+  # FastHistogram, to keep that A/B reproducible.
+  defp start_prometheus(core_only?) do
+    {:ok, _} = Application.ensure_all_started(:telemetry)
+
+    children =
+      if core_only?,
+        do: [
+          {TelemetryMetricsPrometheus.Core,
+           metrics: Fathom.Telemetry.metrics(), name: :fathom_metrics}
+        ],
+        else: Fathom.Telemetry.reporter_children()
+
+    {:ok, sup} = Supervisor.start_link(children, strategy: :one_for_one)
+    Process.unlink(sup)
+    # Core attaches its handlers in a message after start returns; sync so the drive is seen.
+    _ = :sys.get_state(:fathom_metrics)
+    parent = self()
+    scraper = spawn_link(fn -> scrape_loop(parent, []) end)
+    %{sup: sup, scraper: scraper}
+  end
+
+  defp scrape_loop(parent, times_us) do
+    receive do
+      :stop -> send(parent, {:scrape_times, times_us})
+    after
+      1_000 ->
+        {us, _} =
+          :timer.tc(fn ->
+            Fathom.Telemetry.scrape()
+            |> Fathom.Admin.PrometheusScrape.parse()
+          end)
+
+        scrape_loop(parent, [us | times_us])
+    end
+  end
+
+  defp stop_prometheus(nil), do: %{prometheus: false}
+
+  defp stop_prometheus(%{sup: sup, scraper: scraper}) do
+    send(scraper, :stop)
+    times = receive(do: ({:scrape_times, t} -> t), after: (5_000 -> []))
+
+    # Precondition: the reporter actually saw the drive. A handler that never attached (a renamed
+    # event, the wrong reporter name) would make this arm identical to the control and the A/B
+    # would report "no cost" while measuring nothing.
+    observed =
+      Fathom.Telemetry.scrape()
+      |> Fathom.Admin.PrometheusScrape.parse()
+      |> Fathom.Admin.PrometheusScrape.value("fathom_shard_query_duration_count")
+
+    if observed == 0, do: raise("prometheus arm recorded no queries: it is measuring nothing")
+
+    layout = if Process.whereis(Fathom.Telemetry.FastHistogram), do: "fast", else: "core"
+    ref = Process.monitor(sup)
+    Process.exit(sup, :shutdown)
+    receive(do: ({:DOWN, ^ref, _, _, _} -> :ok), after: (5_000 -> :ok))
+
+    %{
+      prometheus: true,
+      prom_layout: layout,
+      prom_queries_observed: round(observed),
+      prom_scrapes: length(times),
+      prom_scrape_ms_mean:
+        if(times == [], do: 0, else: round(Enum.sum(times) / length(times)) / 1000),
+      prom_scrape_ms_max: if(times == [], do: 0, else: Enum.max(times) / 1000)
+    }
   end
 
   @doc "Removes the scale scratch dir (called by the task after the run)."

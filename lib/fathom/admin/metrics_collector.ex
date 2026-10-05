@@ -49,7 +49,6 @@ defmodule Fathom.Admin.MetricsCollector do
   # Bounded ring of recent points for the hero charts, so a freshly-connected LiveView can paint a
   # populated chart from snapshot/0 instead of waiting to accumulate ticks. ~5 min at 1 s.
   @ring 300
-  @reporter :fathom_metrics
   @s3_methods ~w(get put head delete post)
 
   @doc false
@@ -464,7 +463,7 @@ defmodule Fathom.Admin.MetricsCollector do
   defp rate(curr, prev, window_s), do: (curr - prev) / window_s
 
   defp safe_scrape do
-    @reporter |> TelemetryMetricsPrometheus.Core.scrape() |> IO.iodata_to_binary()
+    Fathom.Telemetry.scrape()
   rescue
     _ -> ""
   catch
