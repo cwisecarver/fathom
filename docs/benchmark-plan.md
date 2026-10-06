@@ -140,7 +140,9 @@ crashed run left it — `rm` it), and creates + removes it otherwise, even on fa
 create is atomic (`O_EXCL`), so two simultaneous starts can't both win.
 
 The path defaults to `/tmp/fathom_bench.lock` and is overridable with **`FATHOM_BENCH_LOCK`**.
-Point several projects at the *same* path to interlock benchmarks across a shared host:
+Several projects can share one path to interlock their benchmarks across a shared host —
+**but only if every one of them follows this protocol** (file exists ⇒ held; atomic create;
+never delete a lock it didn't create):
 
 ```bash
 FATHOM_BENCH_LOCK=/tmp/shared_bench.lock mix fathom.bench
@@ -148,6 +150,16 @@ FATHOM_BENCH_LOCK=/tmp/shared_bench.lock mix fathom.bench
 
 That's the reason it's an env var rather than a constant: co-tenant projects can agree on a
 shared lock without either repo hardcoding the other's name.
+
+**The sibling project tidepool (`~/NotWork/tidepool`).** Its bench and soak entrypoints
+(`scripts/lib_bench_lock.sh`) hold `/tmp/tidepool_bench.lock` and also treat
+`/tmp/fathom_bench.lock` as a peer lock: while a fathom run holds it with a live PID, every
+tidepool bench refuses. Tidepool parses fathom's `fathom.bench pid <N> <ts>` line, clears a lock only
+when that PID is dead, and treats an unparseable lock as held — so even a shared path is safe.
+The reverse is **not** automatic: `mix fathom.bench` only checks its own path. Before benching,
+confirm `/tmp/tidepool_bench.lock` is absent and the box is idle — or run with
+`FATHOM_BENCH_LOCK=/tmp/tidepool_bench.lock` so the two projects contend for one file and each
+refuses while the other runs.
 
 ## The harness (this is what B1/B2 build)
 

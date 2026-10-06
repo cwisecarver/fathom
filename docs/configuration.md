@@ -261,4 +261,4 @@ Alert rules for both `0` and negative are in `deploy/observability/alert-rules.y
 
 | Variable | Default | What it does | Notes |
 |---|---|---|---|
-| `FATHOM_BENCH_LOCK` | `/tmp/fathom_bench.lock` | Path to the host-wide lock `mix fathom.bench` takes for a run, so no benchmark measures under another's load. | Dev-only; nothing in the server reads it. Point co-tenant projects sharing a host at the **same** path to interlock their benchmarks — that's why it's a variable rather than a constant. See [`benchmark-plan.md`](benchmark-plan.md). |
+| `FATHOM_BENCH_LOCK` | `/tmp/fathom_bench.lock` | Path to the host-wide lock `mix fathom.bench` takes for a run, so no benchmark measures under another's load. | Dev-only; nothing in the server reads it. Co-tenant projects that follow the same protocol (exists ⇒ held, atomic create) can share one path to interlock their benchmarks — that's why it's a variable rather than a constant. Setting it to tidepool's `/tmp/tidepool_bench.lock` interlocks with tidepool's benches in both directions. See [`benchmark-plan.md`](benchmark-plan.md). |

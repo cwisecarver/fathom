@@ -40,10 +40,14 @@ defmodule Mix.Tasks.Fathom.Bench do
   so two simultaneous starts can't both win.
 
   The path defaults to `/tmp/fathom_bench.lock` and is overridable with the
-  `FATHOM_BENCH_LOCK` environment variable. Point several projects at the *same* path to
-  interlock their benchmarks across a shared host:
+  `FATHOM_BENCH_LOCK` environment variable. Projects that follow the same protocol (file
+  exists ⇒ held, atomic create) can point at the *same* path to interlock their benchmarks
+  across a shared host:
 
       FATHOM_BENCH_LOCK=/tmp/shared_bench.lock mix fathom.bench
+
+  Tidepool's benches on the same host already refuse while this lock is held; to make this
+  task refuse during theirs too, point it at their lock: `FATHOM_BENCH_LOCK=/tmp/tidepool_bench.lock`.
   """
   @shortdoc "Run fathom hot-path benchmarks, emit a perf-history JSON line"
 
