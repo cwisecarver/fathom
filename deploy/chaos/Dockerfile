@@ -7,7 +7,7 @@
 # `dockerfile: fathom/deploy/chaos/Dockerfile`; Dockerfile.dockerignore next to
 # this file whitelists only fathom/ and filo/ (BuildKit per-Dockerfile ignore).
 
-ARG BUILDER_IMAGE=hexpm/elixir:1.19.5-erlang-27.3.4.14-debian-bookworm-20260623-slim
+ARG BUILDER_IMAGE=hexpm/elixir:1.20.4-erlang-28.5.0.7-debian-bookworm-20260918-slim
 ARG RUNNER_IMAGE=debian:bookworm-slim
 
 FROM ${BUILDER_IMAGE} AS builder

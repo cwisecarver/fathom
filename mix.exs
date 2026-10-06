@@ -1,6 +1,13 @@
 defmodule Fathom.MixProject do
   use Mix.Project
 
+  # OTP 28 is the floor (2026-10-05): stored shard objects default to zstd, and `:zstd` first
+  # ships in OTP 28. On OTP 27 the build would succeed and the first flush would crash, so refuse
+  # to build instead.
+  if String.to_integer(System.otp_release()) < 28 do
+    Mix.raise("fathom requires Erlang/OTP 28 or newer (found OTP #{System.otp_release()})")
+  end
+
   def project do
     [
       app: :fathom,
