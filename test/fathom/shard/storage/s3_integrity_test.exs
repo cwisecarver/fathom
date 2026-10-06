@@ -46,11 +46,16 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
   test "data PUTs carry a Content-MD5 of the body", %{dir: dir} do
     test_pid = self()
 
+    # Content-MD5 must hash the bytes ON THE WIRE — the compressed body under the zstd default
+    # (2026-10-05), not the database — so the stub hashes exactly what it received. This used to
+    # compare against md5(@good), which only held while objects were stored raw.
     put_s3_config(fn conn ->
-      send(test_pid, {:content_md5, Plug.Conn.get_req_header(conn, "content-md5")})
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      wire_md5 = Base.encode64(:crypto.hash(:md5, body))
+      send(test_pid, {:content_md5, Plug.Conn.get_req_header(conn, "content-md5"), wire_md5})
 
       conn
-      |> Plug.Conn.put_resp_header("etag", md5_etag(@good))
+      |> Plug.Conn.put_resp_header("etag", md5_etag(body))
       |> Plug.Conn.send_resp(200, "")
     end)
 
@@ -58,11 +63,12 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
     File.write!(local, @good)
 
     assert :ok = S3.flush("s", local)
-    expected = Base.encode64(:crypto.hash(:md5, @good))
-    assert_receive {:content_md5, [^expected]}
+    assert_receive {:content_md5, [header], wire_md5}
+    assert header == wire_md5
 
     assert {:ok, _, _} = S3.flush("s", local, nil)
-    assert_receive {:content_md5, [^expected]}
+    assert_receive {:content_md5, [header], wire_md5}
+    assert header == wire_md5
   end
 
   test "a pulled body that mismatches an MD5 etag errors and writes nothing", %{dir: dir} do

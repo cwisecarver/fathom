@@ -172,37 +172,84 @@ defmodule Fathom.ShardStorageS3Test do
   # Compressible, and big enough that the ratio is unambiguous.
   defp compressible, do: String.duplicate("SQLite format 3 page of repetitive row data. ", 20_000)
 
-  test "a zlib-encoded object round-trips and is stored smaller", %{shard: shard} = ctx do
-    src = tmp_path("#{shard}-src")
-    dst = tmp_path("#{shard}-dst")
-    body = compressible()
-    File.write!(src, body)
+  for enc <- [:zlib, :zstd] do
+    test "a #{enc}-encoded object round-trips and is stored smaller", %{shard: shard} = ctx do
+      src = tmp_path("#{shard}-src")
+      dst = tmp_path("#{shard}-dst")
+      body = compressible()
+      File.write!(src, body)
 
-    with_encoding(:zlib, fn -> assert :ok = S3.flush(shard, src) end)
+      with_encoding(unquote(enc), fn -> assert :ok = S3.flush(shard, src) end)
 
-    # The STORED bytes are compressed — read the object raw, bypassing the backend's decode.
-    %{status: 200} = raw = Req.get!(signed_req(ctx), url: object_url(ctx, shard <> ".db"))
+      # The STORED bytes are compressed — read the object raw, bypassing the backend's decode.
+      %{status: 200} = raw = Req.get!(signed_req(ctx), url: object_url(ctx, shard <> ".db"))
 
-    assert byte_size(raw.body) < byte_size(body) / 2,
-           "the object wasn't actually compressed on the wire/at rest"
+      assert byte_size(raw.body) < byte_size(body) / 2,
+             "the object wasn't actually compressed on the wire/at rest"
 
-    assert {:ok, _etag} = S3.pull(shard, dst)
-    assert File.read!(dst) == body, "the pull must inflate back to the exact database bytes"
+      assert {:ok, _etag} = S3.pull(shard, dst)
+      assert File.read!(dst) == body, "the pull must decode back to the exact database bytes"
+    end
+
+    # DECODE-ALWAYS. This is what lets a fleet roll the flag back: an object written while
+    # encoding was on must stay readable by a node that has since turned it off. Without this the
+    # flag is a one-way door and a rollback orphans every object written in between.
+    test "an object written with #{enc} is readable by a node with encoding OFF",
+         %{shard: shard} do
+      src = tmp_path("#{shard}-src")
+      dst = tmp_path("#{shard}-dst")
+      body = compressible()
+      File.write!(src, body)
+
+      with_encoding(unquote(enc), fn -> assert :ok = S3.flush(shard, src) end)
+      with_encoding(:none, fn -> assert {:ok, _} = S3.pull(shard, dst) end)
+
+      assert File.read!(dst) == body
+    end
   end
 
-  # DECODE-ALWAYS. This is what lets a fleet roll the flag back: an object written while encoding
-  # was on must stay readable by a node that has since turned it off. Without this the flag is a
-  # one-way door and a rollback orphans every object written in between.
-  test "an object written with encoding ON is readable by a node with it OFF", %{shard: shard} do
+  # The zstd default (2026-10-05) must not strand objects a zlib node wrote before it.
+  test "a zlib object is readable by a node writing zstd", %{shard: shard} do
     src = tmp_path("#{shard}-src")
     dst = tmp_path("#{shard}-dst")
     body = compressible()
     File.write!(src, body)
 
     with_encoding(:zlib, fn -> assert :ok = S3.flush(shard, src) end)
-    with_encoding(:none, fn -> assert {:ok, _} = S3.pull(shard, dst) end)
+    with_encoding(:zstd, fn -> assert {:ok, _} = S3.pull(shard, dst) end)
 
     assert File.read!(dst) == body
+  end
+
+  # The download receives the body in many chunks and :zstd.stream/2 may stop before consuming one
+  # (Codec's remainder loop). An incompressible multi-MB body is the stress case for that.
+  test "a multi-MB incompressible zstd object round-trips byte for byte", %{shard: shard} do
+    src = tmp_path("#{shard}-src")
+    dst = tmp_path("#{shard}-dst")
+    body = :crypto.strong_rand_bytes(5 * 1024 * 1024 + 4097)
+    File.write!(src, body)
+
+    with_encoding(:zstd, fn -> assert :ok = S3.flush(shard, src) end)
+    assert {:ok, _} = S3.pull(shard, dst)
+    assert File.read!(dst) == body
+  end
+
+  # A body that does not decode under its own (known) marker is torn or corrupt: the pull retries
+  # and then fails, and must leave NO local file — never undecoded bytes where SQLite will look.
+  test "an object marked zstd whose body is not zstd fails the pull and writes nothing",
+       %{shard: shard} = ctx do
+    dst = tmp_path("#{shard}-dst")
+
+    %{status: status} =
+      Req.put!(signed_req(ctx),
+        url: object_url(ctx, shard <> ".db"),
+        body: String.duplicate("definitely not a zstd frame ", 100),
+        headers: [{Fathom.Shard.Storage.Codec.meta_header(), "zstd"}]
+      )
+
+    assert status in 200..299
+    assert {:error, {:undecodable_body, {:zstd, _}}} = S3.pull(shard, dst)
+    refute File.exists?(dst)
   end
 
   # And the other direction: turning encoding ON must not break reading the raw objects already
@@ -213,7 +260,7 @@ defmodule Fathom.ShardStorageS3Test do
     File.write!(src, "plain bytes, no marker\n")
 
     with_encoding(:none, fn -> assert :ok = S3.flush(shard, src) end)
-    with_encoding(:zlib, fn -> assert {:ok, _} = S3.pull(shard, dst) end)
+    with_encoding(:zstd, fn -> assert {:ok, _} = S3.pull(shard, dst) end)
 
     assert File.read!(dst) == "plain bytes, no marker\n"
   end
@@ -243,27 +290,29 @@ defmodule Fathom.ShardStorageS3Test do
 
   # The integrity metadata must keep meaning "this database's hash" regardless of storage form,
   # or verify_integrity/3 would have to know about encodings.
-  test "the integrity metadata is the UNCOMPRESSED hash", %{shard: shard} = ctx do
-    src = tmp_path("#{shard}-src")
-    body = compressible()
-    File.write!(src, body)
+  for enc <- [:zlib, :zstd] do
+    test "#{enc}: the integrity metadata is the UNCOMPRESSED hash", %{shard: shard} = ctx do
+      src = tmp_path("#{shard}-src")
+      body = compressible()
+      File.write!(src, body)
 
-    with_encoding(:zlib, fn -> assert :ok = S3.flush(shard, src) end)
+      with_encoding(unquote(enc), fn -> assert :ok = S3.flush(shard, src) end)
 
-    %{status: 200, headers: headers} =
-      Req.head!(signed_req(ctx), url: object_url(ctx, shard <> ".db"))
+      %{status: 200, headers: headers} =
+        Req.head!(signed_req(ctx), url: object_url(ctx, shard <> ".db"))
 
-    meta =
-      case headers["x-amz-meta-fathom-md5"] do
-        [v | _] -> v
-        v -> v
-      end
+      meta =
+        case headers["x-amz-meta-fathom-md5"] do
+          [v | _] -> v
+          v -> v
+        end
 
-    plaintext_md5 = :crypto.hash(:md5, body) |> Base.encode16(case: :lower)
+      plaintext_md5 = :crypto.hash(:md5, body) |> Base.encode16(case: :lower)
 
-    assert meta == plaintext_md5,
-           "x-amz-meta-fathom-md5 must hash the DATABASE, not the compressed body, so an " <>
-             "object's identity doesn't depend on how it happened to be stored"
+      assert meta == plaintext_md5,
+             "x-amz-meta-fathom-md5 must hash the DATABASE, not the compressed body, so an " <>
+               "object's identity doesn't depend on how it happened to be stored"
+    end
   end
 
   # ── lease ──
@@ -513,14 +562,18 @@ defmodule Fathom.ShardStorageS3Test do
   test "snapshot + pull_snapshot + restore_snapshot_from_file round-trip; list and drop", %{
     shard: shard
   } do
-    v1 = tmp_path("#{shard}-v1")
-    File.write!(v1, "v1")
-    assert :ok = S3.flush(shard, v1)
-    assert :ok = S3.snapshot(shard, "test1")
+    # `bytes` is the STORED object size, so the exact-size check needs raw storage: under the zstd
+    # default (2026-10-05) a 2-byte body is an 11-byte frame. Encoding is covered above.
+    with_encoding(:none, fn ->
+      v1 = tmp_path("#{shard}-v1")
+      File.write!(v1, "v1")
+      assert :ok = S3.flush(shard, v1)
+      assert :ok = S3.snapshot(shard, "test1")
 
-    v2 = tmp_path("#{shard}-v2")
-    File.write!(v2, "v2")
-    assert :ok = S3.flush(shard, v2)
+      v2 = tmp_path("#{shard}-v2")
+      File.write!(v2, "v2")
+      assert :ok = S3.flush(shard, v2)
+    end)
 
     assert {:ok, snaps} = S3.list_snapshots(shard)
     assert Enum.any?(snaps, &(&1.id == "test1" and &1.bytes == 2))

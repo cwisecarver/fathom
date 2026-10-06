@@ -51,6 +51,22 @@ defmodule Fathom.Test.S3EtagStore do
   end
 
   @doc """
+  The DATABASE bytes stored at `key`: `body_of/2` decoded by the object's own encoding marker, the
+  way a real pull decodes. Stored objects are zstd-compressed by default (2026-10-05), so a test that
+  asserts on content or opens the object as SQLite wants this, not the raw stored body.
+  """
+  def plain_body_of(agent, key) do
+    case {body_of(agent, key), meta_of(agent, key)} do
+      {nil, _} -> nil
+      {body, meta} -> decode(body, meta && meta[Fathom.Shard.Storage.Codec.meta_header()])
+    end
+  end
+
+  defp decode(body, "zstd"), do: body |> :zstd.decompress() |> IO.iodata_to_binary()
+  defp decode(body, "zlib"), do: :zlib.uncompress(body)
+  defp decode(body, nil), do: body
+
+  @doc """
   Force-set `key` to `body` at single (MD5) form, unconditionally (no If-Match).
 
   Models an out-of-band write LANDING in the store between two of a caller's reads —

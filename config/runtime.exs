@@ -313,7 +313,9 @@ if n = env_int.("HRANA_GC_EVERY_N") do
   config :fathom, :hrana_gc_every_n, n
 end
 
-# Compression for stored shard objects (expert review 2026-07-24 #38). Default `none`.
+# Compression for stored shard objects (expert review 2026-07-24 #38). Default `zstd` (level 3,
+# since 2026-10-05, perf review 2026-10-01 #31: ~9x less CPU than zlib-6 for a slightly better
+# ratio on a 4.2 MB shard — 8.7 ms vs 75 ms). `zlib` and `none` remain selectable.
 #
 # DECODING IS ALWAYS ON regardless of this setting — a node reads any marked object — so the flag
 # rolls forward and back without a flag day and mixed-version nodes interoperate. This only
@@ -321,18 +323,17 @@ end
 #
 # It does NOT speed up single-shard cold-open: that path is RTT-bound at fathom's shard sizes
 # (~1 RTT with the body essentially free). It pays on aggregate-bandwidth-bound work — mass
-# warming/failover, steady-state PUT volume for write-hot shards, cross-region, storage cost — and
-# it spends CPU, which is the contended resource on a loaded node. Measure `warm_s3_shards_per_s`
-# under `S3_FAKE_RATE_KBPS` before enabling it fleet-wide.
+# warming/failover, steady-state PUT volume for write-hot shards, cross-region, storage cost.
 #
 # Applies to the S3 backend; `Storage.Local` (dev/test) stores raw bytes either way. Not
 # `String.to_atom` — an unknown value must not mint an atom or silently mean "none".
 case System.get_env("SHARD_OBJECT_ENCODING") do
   nil -> :ok
   "" -> :ok
+  "zstd" -> config(:fathom, :shard_object_encoding, :zstd)
   "none" -> config(:fathom, :shard_object_encoding, :none)
   "zlib" -> config(:fathom, :shard_object_encoding, :zlib)
-  other -> raise ~s(SHARD_OBJECT_ENCODING must be "none" or "zlib", got: #{inspect(other)})
+  other -> raise ~s(SHARD_OBJECT_ENCODING must be zstd, zlib or none, got: #{inspect(other)})
 end
 
 # Where shard files live locally while a shard is open (default: System.tmp_dir!/fathom_shards).

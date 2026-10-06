@@ -417,14 +417,14 @@ defmodule Fathom.Shard.Storage.S3 do
           fun.(local_path, size, md5, md5_hex, [])
         end
 
-      :zlib ->
+      encoding ->
         # The plaintext hash must NOT go through stat_and_md5: that applies the single-PUT
         # ceiling, and the plaintext is not what gets PUT.
         with {:ok, plain_hex} <- file_md5_hex(local_path),
-             {:ok, tmp} <- Codec.compress_to_temp(local_path) do
+             {:ok, tmp} <- Codec.compress_to_temp(local_path, encoding) do
           try do
             with {:ok, size, md5, _} <- stat_and_md5(tmp) do
-              fun.(tmp, size, md5, plain_hex, Codec.upload_headers(:zlib))
+              fun.(tmp, size, md5, plain_hex, Codec.upload_headers(encoding))
             end
           after
             File.rm(tmp)
@@ -1124,16 +1124,15 @@ defmodule Fathom.Shard.Storage.S3 do
               {:halt, {req, Req.Response.put_private(resp, :fathom_enc_error, err)}}
 
             z ->
-              plain = Codec.inflate(z, chunk)
-              :ok = IO.binwrite(fd, plain)
-              # The digest is over the DECODED bytes, so it still means "this database's hash"
-              # and matches @md5_meta whether or not the object was compressed.
-              md5 = resp.private[:fathom_md5] || :crypto.hash_init(:md5)
+              case Codec.inflate(z, chunk) do
+                {:ok, plain} ->
+                  {:cont, {req, write_plain(resp, fd, plain)}}
 
-              resp =
-                Req.Response.put_private(resp, :fathom_md5, :crypto.hash_update(md5, plain))
-
-              {:cont, {req, resp}}
+                # A body that does not decode: torn or corrupt in transit, handled like a
+                # checksum mismatch below (retry the whole download), never written.
+                {:error, _} = err ->
+                  {:halt, {req, Req.Response.put_private(resp, :fathom_decode_error, err)}}
+              end
           end
         else
           {:cont, {req, resp}}
@@ -1152,6 +1151,20 @@ defmodule Fathom.Shard.Storage.S3 do
         # temp holds nothing usable and handing raw bytes to SQLite as a database is precisely
         # the correctness incident the marker exists to prevent. Not retryable: the marker will
         # be the same next time. Upgrade the node instead.
+        # The body would not decode under its own marker — corrupt or torn in transit. Same
+        # handling as a checksum mismatch: a fresh temp and the whole download again.
+        {:ok, %{private: %{fathom_decode_error: {:error, reason}}}} ->
+          Logger.warning("shard object at #{url} did not decode (#{inspect(reason)}); retrying")
+
+          retry_or(
+            {:error, {:undecodable_body, reason}},
+            url,
+            local_path,
+            headers,
+            opts,
+            attempts_left
+          )
+
         {:ok, %{private: %{fathom_enc_error: {:error, reason}}}} ->
           Logger.error(
             "shard object at #{url} is stored with an encoding this node cannot decode " <>
@@ -1230,16 +1243,22 @@ defmodule Fathom.Shard.Storage.S3 do
       end
 
       # Release the inflate context on every exit path, exactly like the fd (#38).
-      case Process.delete({__MODULE__, :dl_z, tmp}) do
-        z when is_reference(z) -> Codec.finish(z)
-        _ -> :ok
-      end
+      Codec.release(Process.delete({__MODULE__, :dl_z, tmp}))
 
       File.rm(tmp)
     end
   end
 
-  # `nil` for the raw path, an inflate context for a decodable encoding, or the error tuple
+  # Write decoded bytes to the temp and fold them into the plaintext digest. The digest is over the
+  # DECODED bytes, so it still means "this database's hash" and matches @md5_meta whether or not
+  # the object was compressed.
+  defp write_plain(resp, fd, plain) do
+    :ok = IO.binwrite(fd, plain)
+    md5 = resp.private[:fathom_md5] || :crypto.hash_init(:md5)
+    Req.Response.put_private(resp, :fathom_md5, :crypto.hash_update(md5, plain))
+  end
+
+  # `nil` for the raw path, a decode context for a decodable encoding, or the error tuple
   # itself so the `into` fun can halt on it.
   defp decode_state({:ok, encoding}), do: Codec.init(encoding)
   defp decode_state({:error, _} = error), do: error

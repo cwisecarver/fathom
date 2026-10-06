@@ -154,7 +154,7 @@ defmodule Fathom.Shard.WarmTakeoverLineageTest do
     end)
 
     # After the idle flush, the durable object still contains the zombie's write.
-    final = S3EtagStore.body_of(store, "#{shard}.db")
+    final = S3EtagStore.plain_body_of(store, "#{shard}.db")
     tmp = Path.join(System.tmp_dir!(), "lin_check_#{System.unique_integer([:positive])}.db")
     File.write!(tmp, final)
     on_exit(fn -> File.rm(tmp) end)

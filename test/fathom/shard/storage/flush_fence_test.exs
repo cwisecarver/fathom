@@ -94,6 +94,17 @@ defmodule Fathom.Shard.Storage.FlushFenceTest do
 
   describe "S3 flush/3 conditional header" do
     setup do
+      # These pin the If-Match / If-None-Match headers; the body assertion is incidental, so store
+      # raw bytes rather than the zstd default (2026-10-05). Encoding has its own suites.
+      prev_enc = Application.get_env(:fathom, :shard_object_encoding)
+      Application.put_env(:fathom, :shard_object_encoding, :none)
+
+      on_exit(fn ->
+        if prev_enc,
+          do: Application.put_env(:fathom, :shard_object_encoding, prev_enc),
+          else: Application.delete_env(:fathom, :shard_object_encoding)
+      end)
+
       test = self()
 
       plug = fn conn ->

@@ -1,6 +1,7 @@
 defmodule Fathom.Shard.Storage.CodecTest do
   @moduledoc """
-  The optional stored-object compression codec (expert review 2026-07-24 #38).
+  The stored-object compression codec (expert review 2026-07-24 #38; zstd default since
+  2026-10-05, perf review 2026-10-01 #31).
 
   The properties that matter here are safety ones, not compression ratio: decode-always so a
   fleet can roll the flag back, and fail-closed on a marker this node doesn't understand — the
@@ -15,43 +16,76 @@ defmodule Fathom.Shard.Storage.CodecTest do
   defp tmp(name),
     do: Path.join(System.tmp_dir!(), "codec_#{name}_#{System.unique_integer([:positive])}")
 
+  # The download path's shape: decode chunk by chunk (16 KiB, a TLS record), then release.
   defp stream_inflate(path, decoder) do
     z = Codec.init(decoder)
 
-    out =
+    body =
       path
-      |> File.stream!(64 * 1024)
-      |> Enum.reduce([], fn chunk, acc -> [acc, Codec.inflate(z, chunk)] end)
-      |> IO.iodata_to_binary()
+      |> File.stream!(16 * 1024)
+      |> Enum.reduce([], fn chunk, acc ->
+        {:ok, out} = Codec.inflate(z, chunk)
+        [acc, out]
+      end)
 
-    Codec.finish(z)
-    out
+    :ok = Codec.release(z)
+    IO.iodata_to_binary(body)
   end
 
-  test "round-trips a file through compress + streaming inflate" do
-    src = tmp("src")
-    # Repetitive, like real SQLite pages — and big enough to cross chunk boundaries.
-    body = String.duplicate("the quick brown fox jumps over the lazy dog. ", 60_000)
-    File.write!(src, body)
-    on_exit(fn -> File.rm(src) end)
+  for enc <- [:zlib, :zstd] do
+    test "#{enc}: round-trips a file through compress + streaming decode" do
+      src = tmp("src")
+      # Repetitive, like real SQLite pages — and big enough to cross many 16 KiB chunks.
+      body = String.duplicate("the quick brown fox jumps over the lazy dog. ", 60_000)
+      File.write!(src, body)
+      on_exit(fn -> File.rm(src) end)
 
-    assert {:ok, z} = Codec.compress_to_temp(src)
-    on_exit(fn -> File.rm(z) end)
+      assert {:ok, z} = Codec.compress_to_temp(src, unquote(enc))
+      on_exit(fn -> File.rm(z) end)
 
-    assert File.stat!(z).size < File.stat!(src).size,
-           "compression didn't shrink obviously-compressible input"
+      assert File.stat!(z).size < File.stat!(src).size,
+             "compression didn't shrink obviously-compressible input"
 
-    assert stream_inflate(z, :zlib) == body
+      assert stream_inflate(z, unquote(enc)) == body
+    end
+
+    test "#{enc}: an incompressible multi-MB file round-trips byte for byte" do
+      src = tmp("rand")
+      body = :crypto.strong_rand_bytes(3 * 1024 * 1024 + 17)
+      File.write!(src, body)
+      on_exit(fn -> File.rm(src) end)
+
+      assert {:ok, z} = Codec.compress_to_temp(src, unquote(enc))
+      on_exit(fn -> File.rm(z) end)
+      assert stream_inflate(z, unquote(enc)) == body
+    end
+
+    test "#{enc}: an empty file round-trips" do
+      src = tmp("empty")
+      File.write!(src, "")
+      on_exit(fn -> File.rm(src) end)
+
+      assert {:ok, z} = Codec.compress_to_temp(src, unquote(enc))
+      on_exit(fn -> File.rm(z) end)
+      assert stream_inflate(z, unquote(enc)) == ""
+    end
+
+    # A body that is not what its marker says must come back as an error the download can retry,
+    # never a raise out of the HTTP callback and never bytes written to the temp.
+    test "#{enc}: a body that does not decode is an error, not a raise" do
+      z = Codec.init(unquote(enc))
+      on_exit(fn -> Codec.release(z) end)
+
+      assert {:error, {unquote(enc), _}} =
+               Codec.inflate(z, String.duplicate("not compressed ", 100))
+    end
   end
 
-  test "an empty file round-trips" do
-    src = tmp("empty")
-    File.write!(src, "")
-    on_exit(fn -> File.rm(src) end)
-
-    assert {:ok, z} = Codec.compress_to_temp(src)
-    on_exit(fn -> File.rm(z) end)
-    assert stream_inflate(z, :zlib) == ""
+  test "zstd is the default encoding" do
+    prev = Application.get_env(:fathom, :shard_object_encoding)
+    on_exit(fn -> restore(prev) end)
+    Application.delete_env(:fathom, :shard_object_encoding)
+    assert Codec.encoding() == :zstd
   end
 
   # Decode-always: reading must NOT depend on this node's own encoding setting, or rolling the
@@ -63,6 +97,7 @@ defmodule Fathom.Shard.Storage.CodecTest do
     Application.put_env(:fathom, :shard_object_encoding, :none)
     assert Codec.encoding() == :none
     assert Codec.decoder("zlib") == {:ok, :zlib}
+    assert Codec.decoder("zstd") == {:ok, :zstd}
 
     Application.put_env(:fathom, :shard_object_encoding, :zlib)
     assert Codec.encoding() == :zlib
@@ -73,7 +108,7 @@ defmodule Fathom.Shard.Storage.CodecTest do
   # pull. Handing the raw (still-compressed, or otherwise-encoded) bytes to SQLite as a database
   # is the one way this feature turns into a correctness incident.
   test "an unrecognised marker fails closed" do
-    assert {:error, {:unknown_object_encoding, "zstd"}} = Codec.decoder("zstd")
+    assert {:error, {:unknown_object_encoding, "zstd-v9"}} = Codec.decoder("zstd-v9")
     assert {:error, {:unknown_object_encoding, "gzip"}} = Codec.decoder("gzip")
     assert {:error, {:unknown_object_encoding, "aes256"}} = Codec.decoder("aes256")
   end
@@ -87,30 +122,31 @@ defmodule Fathom.Shard.Storage.CodecTest do
   test "an unencoded upload carries no marker at all" do
     assert Codec.upload_headers(:none) == []
     assert [{header, "zlib"}] = Codec.upload_headers(:zlib)
+    assert [{^header, "zstd"}] = Codec.upload_headers(:zstd)
     assert header == Codec.meta_header()
   end
 
-  # A torn compressed transfer must surface as a failure the caller can retry, not a crash and
-  # not silently-truncated output.
-  test "inflating a truncated stream does not corrupt silently" do
-    src = tmp("torn")
-    File.write!(src, String.duplicate("abcdefgh", 50_000))
-    on_exit(fn -> File.rm(src) end)
+  # A torn compressed transfer must not decode to the whole file. Neither codec REPORTS the tear,
+  # so the download's plaintext MD5 is what fails it — this pins that the bytes differ for it.
+  for enc <- [:zlib, :zstd] do
+    test "#{enc}: decoding a truncated stream does not yield the whole file" do
+      src = tmp("torn")
+      File.write!(src, :crypto.strong_rand_bytes(400_000))
+      on_exit(fn -> File.rm(src) end)
 
-    {:ok, z} = Codec.compress_to_temp(src)
-    on_exit(fn -> File.rm(z) end)
+      {:ok, z} = Codec.compress_to_temp(src, unquote(enc))
+      on_exit(fn -> File.rm(z) end)
 
-    full = File.read!(z)
-    torn = binary_part(full, 0, div(byte_size(full), 2))
+      full = File.read!(z)
+      torn = binary_part(full, 0, div(byte_size(full), 2))
 
-    stream = Codec.init(:zlib)
-    partial = stream |> Codec.inflate(torn) |> IO.iodata_to_binary()
+      stream = Codec.init(unquote(enc))
+      {:ok, partial} = Codec.inflate(stream, torn)
+      :ok = Codec.release(stream)
 
-    refute partial == File.read!(src),
-           "a half transfer must not inflate to the whole file"
-
-    # finish/1 tolerates the incomplete stream rather than raising out of the download path.
-    assert Codec.finish(stream) == :ok
+      refute IO.iodata_to_binary(partial) == File.read!(src),
+             "a half transfer must not decode to the whole file"
+    end
   end
 
   defp restore(nil), do: Application.delete_env(:fathom, :shard_object_encoding)
