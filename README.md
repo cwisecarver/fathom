@@ -83,7 +83,7 @@ One `docker compose up` brings up fathom + PostgreSQL + MinIO (as S3) + nginx wi
 
 **Prerequisites**
 
-- **Elixir ≥ 1.15** on a compatible OTP (the project builds and tests on Elixir 1.19 / OTP 27).
+- **Elixir ≥ 1.15** on a compatible OTP (CI builds and tests on Elixir 1.20 with OTP 28 and 29; OTP 28 is the minimum).
 - A **C toolchain** — the `exqlite` SQLite NIF compiles from source (`build-essential` on Linux, Xcode Command Line Tools on macOS).
 - A running local **PostgreSQL** — the control-plane / directory store (shard *data* is SQLite). By default fathom connects as your OS user with no password; set `PGUSER` / `PGPASSWORD` / `PGHOST` / `PGDATABASE` to override, or edit `config/dev.exs`.
 - **The `filo` sibling repo.** fathom depends on [Filo](https://github.com/cwisecarver/filo) (the Hrana/libSQL protocol server) as a **path dependency at `../filo`**, so check both out side by side — a clone of `fathom` alone will fail `mix deps.get`:

@@ -31,10 +31,11 @@ jobs:
 
     strategy:
       # Elixir stays at 1.20.1 (filo requires ~> 1.20); we vary OTP to catch VM-version issues.
-      # fail-fast off so one OTP's result doesn't cancel the others.
+      # fail-fast off so one OTP's result doesn't cancel the others. OTP 27 dropped 2026-10-05:
+      # OTP 28 is the floor (its :zstd is wanted for shard objects and replication frames).
       fail-fast: false
       matrix:
-        otp: ["27", "28", "29"]
+        otp: ["28", "29"]
 
     services:
       postgres:
@@ -122,7 +123,7 @@ jobs:
       # drivers re-introduce the mint_web_socket opaque-type cascade documented in mix.exs. This
       # analyzes lib/ only, exactly as the precommit step does.
       #
-      # Runs in the matrix so a typing difference between OTP 27/28/29 surfaces here rather than on
+      # Runs in the matrix so a typing difference between OTP 28/29 surfaces here rather than on
       # someone's machine — precommit only ever exercises whichever OTP the developer has.
       - name: Dialyzer (typing gate)
         env:
