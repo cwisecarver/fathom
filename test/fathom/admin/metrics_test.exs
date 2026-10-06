@@ -454,16 +454,27 @@ defmodule Fathom.Admin.MetricsTest do
     end)
 
     attach([:fathom, :storage, :usage])
+
+    # Fathom.Admin.TaskSupervisor is GLOBAL and its tasks are async_nolink, so a collector from an
+    # earlier test can leave a usage-poll task still finishing. Counting every child flaked in the
+    # full suite (2026-10-05, seed 641545: 2 children, passes alone). Count only the tasks this
+    # collector started.
+    before = MapSet.new(Task.Supervisor.children(Fathom.Admin.TaskSupervisor))
+
+    ours = fn ->
+      Enum.reject(Task.Supervisor.children(Fathom.Admin.TaskSupervisor), &(&1 in before))
+    end
+
     pid = start_supervised!(Fathom.Admin.MetricsCollector)
 
     # init fires one :usage_poll ⇒ exactly one SUPERVISED task starts and blocks in the stub.
     assert_receive {:usage_poll_started, task_pid}, 1_000
-    assert length(Task.Supervisor.children(Fathom.Admin.TaskSupervisor)) == 1
+    assert ours.() == [task_pid]
 
     # A second :usage_poll while the first is in flight must NOT spawn a second task (overlap guard).
     send(pid, :usage_poll)
     refute_receive {:usage_poll_started, _}, 200
-    assert length(Task.Supervisor.children(Fathom.Admin.TaskSupervisor)) == 1
+    assert ours.() == [task_pid]
 
     # Release the in-flight poll: it completes, caches usage (republished as the gauge), frees the slot.
     send(task_pid, :release)
