@@ -45,8 +45,27 @@ defmodule Fathom.Shard.ReplicationCostTest do
       enabled: Application.get_env(:fathom, :replication_enabled),
       followers: Application.get_env(:fathom, :replication_followers),
       quorum: Application.get_env(:fathom, :replication_quorum),
-      fsync: Application.get_env(:fathom, :replication_fsync)
+      fsync: Application.get_env(:fathom, :replication_fsync),
+      ordinal_wire: Application.get_env(:fathom, :replication_ordinal_wire),
+      compress: Application.get_env(:fathom, :replication_compress)
     }
+
+    # REPL_COST_WIRE picks the push frame for the whole run (perf review 2026-10-01 #32): `plain` is
+    # the ordinal frame uncompressed, `z` the zstd one. Unset keeps the test env's default (no
+    # ordinal wire, so no compression). Run both to price compression on loopback, where bandwidth
+    # is free and it is pure CPU:  REPL_COST_WIRE=z mix test --include bench <this file>
+    case System.get_env("REPL_COST_WIRE") do
+      "plain" ->
+        Application.put_env(:fathom, :replication_ordinal_wire, true)
+        Application.put_env(:fathom, :replication_compress, false)
+
+      "z" ->
+        Application.put_env(:fathom, :replication_ordinal_wire, true)
+        Application.put_env(:fathom, :replication_compress, true)
+
+      _ ->
+        :ok
+    end
 
     on_exit(fn ->
       Session.stop(id)
@@ -55,7 +74,9 @@ defmodule Fathom.Shard.ReplicationCostTest do
             replication_enabled: prev.enabled,
             replication_followers: prev.followers,
             replication_quorum: prev.quorum,
-            replication_fsync: prev.fsync
+            replication_fsync: prev.fsync,
+            replication_ordinal_wire: prev.ordinal_wire,
+            replication_compress: prev.compress
           ] do
         if is_nil(v),
           do: Application.delete_env(:fathom, k),
@@ -167,7 +188,7 @@ defmodule Fathom.Shard.ReplicationCostTest do
     IO.puts("""
 
     === A2 per-write cost (loopback followers; NO inter-node latency) ===
-      N=#{@followers} followers, Q=#{@quorum}, #{@samples} samples, p50
+      N=#{@followers} followers, Q=#{@quorum}, #{@samples} samples, p50, wire=#{System.get_env("REPL_COST_WIRE", "default")}
 
       write only (replication off)        #{off} µs
       write + replication (RAM ack)       #{on_ram} µs

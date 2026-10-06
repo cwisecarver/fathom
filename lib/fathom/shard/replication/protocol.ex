@@ -191,6 +191,22 @@ defmodule Fathom.Shard.Replication.Protocol do
   # upgrade across it forces it `=false` on the first deploy, then removes the override.
   @hello 18
   @nonce_bytes 16
+
+  # COMPRESSED PUSH (perf review 2026-10-01 #32). `@push_ord_lin` plus a trailing 64-bit
+  # UNCOMPRESSED length, followed by the shard id and a zstd payload. Measured on 1,000 TPC-B
+  # commits (avg 17,011 B of WAL frames each): zstd-1 shrinks a push 13.6x at 8 µs p50 with
+  # pgbench's blank filler and 4.5x at 12 µs with random filler — the WAL frames are mostly
+  # unchanged page bytes. zlib-1 managed 4.1x at 62 µs, which is why this is zstd (OTP 28+).
+  #
+  # The payload is not MAC'd (pushes sign the header only, see `@hello`), so the receiver bounds
+  # decompression by the SIGNED `raw_len` and the frame cap — a forged payload cannot become a
+  # decompression bomb — and refuses any frame whose output differs from `raw_len`.
+  #
+  # Emitted only on the `ordinal_wire?/0` path and only while `compress?/0` is on; decoded always.
+  # A peer one deploy behind answers `{:error, :malformed}` to this code, so a future rolling
+  # upgrade across it sets REPLICATION_COMPRESS=false on the first deploy (fathom is greenfield).
+  @push_ord_lin_z 19
+  @zstd_push_level 1
   @nonce_key {__MODULE__, :conn_nonce}
 
   # Which file a chunk belongs to. Explicit rather than splitting one byte stream at `db_size`,
@@ -278,6 +294,9 @@ defmodule Fathom.Shard.Replication.Protocol do
       :payload,
       :wal_ordinal,
       :lineage,
+      # The payload pre-compressed for the wire (perf review 2026-10-01 #32), or nil. Set once per
+      # distinct range by `Session`, so N followers share one compression; never set on decode.
+      :zpayload,
       prev_extent: 0
     ]
 
@@ -290,7 +309,8 @@ defmodule Fathom.Shard.Replication.Protocol do
             payload: binary(),
             prev_extent: non_neg_integer(),
             wal_ordinal: non_neg_integer() | nil,
-            lineage: non_neg_integer() | nil
+            lineage: non_neg_integer() | nil,
+            zpayload: binary() | nil
           }
   end
 
@@ -313,6 +333,17 @@ defmodule Fathom.Shard.Replication.Protocol do
       # The ordinal frame supersedes both shapes below when its gate is on, and is sealed only if
       # signing is also on — the two gates are independent because they guard different things (a
       # rolling-upgrade window versus a distributed key).
+      ordinal_wire?() and is_binary(p.zpayload) ->
+        frame = [
+          <<@version::8, @push_ord_lin_z::8, byte_size(shard)::16, p.epoch::64, p.wal_gen::64,
+            p.salt1::64, p.offset::64, prev_extent(p)::64, wal_ordinal(p)::64, lineage(p)::64,
+            byte_size(p.payload)::64>>,
+          shard,
+          p.zpayload
+        ]
+
+        if FrameAuth.signing?(), do: seal(frame), else: frame
+
       ordinal_wire?() ->
         # `@push_ord_lin` = `@push_ord` + a trailing lineage (expert review 2026-09-05 #4/#12).
         # Carries both under the one gate; an unset lineage encodes as 0, which `decide/2` and
@@ -404,6 +435,55 @@ defmodule Fathom.Shard.Replication.Protocol do
   """
   @spec ordinal_wire?() :: boolean()
   def ordinal_wire?, do: Application.get_env(:fathom, :replication_ordinal_wire, false)
+
+  @doc """
+  Whether pushes are zstd-compressed on the wire (`config :fathom, :replication_compress`, set by
+  `REPLICATION_COMPRESS`, default TRUE). Effective only on the `ordinal_wire?/0` path, the shape
+  prod sends. Decoding a compressed push does not depend on this.
+  """
+  @spec compress?() :: boolean()
+  def compress?, do: Application.get_env(:fathom, :replication_compress, true) != false
+
+  @doc """
+  A push payload compressed for the wire, or `nil` when compression would not shrink it (a tiny or
+  incompressible delta then ships uncompressed, in the plain `@push_ord_lin` frame).
+  """
+  @spec compress_payload(binary()) :: binary() | nil
+  def compress_payload(payload) when is_binary(payload) do
+    z = IO.iodata_to_binary(:zstd.compress(payload, %{compressionLevel: @zstd_push_level}))
+    if byte_size(z) < byte_size(payload), do: z, else: nil
+  end
+
+  # Streams the payload through a zstd context and STOPS as soon as output passes `raw_len`, so a
+  # payload claiming to inflate past its signed length costs at most one output buffer, never the
+  # claimed size. `:zstd` raises on a malformed frame; that and any length mismatch are `:error`.
+  defp decompress_bounded(zpayload, raw_len) do
+    {:ok, ctx} = :zstd.context(:decompress)
+
+    try do
+      case bounded_stream(ctx, zpayload, [], 0, raw_len) do
+        {:ok, out, ^raw_len} -> {:ok, IO.iodata_to_binary(out)}
+        _ -> :error
+      end
+    catch
+      _, _ -> :error
+    after
+      :zstd.close(ctx)
+    end
+  end
+
+  defp bounded_stream(_ctx, _data, _acc, n, raw_len) when n > raw_len, do: :error
+
+  defp bounded_stream(ctx, data, acc, n, raw_len) do
+    case :zstd.stream(ctx, data) do
+      {:continue, remainder, out} ->
+        bounded_stream(ctx, remainder, [acc, out], n + IO.iodata_length(out), raw_len)
+
+      {:continue, out} ->
+        n = n + IO.iodata_length(out)
+        if n > raw_len, do: :error, else: {:ok, [acc, out], n}
+    end
+  end
 
   @doc """
   Whether this node emits the lineage-carrying seed frame (`config :fathom,
@@ -644,6 +724,12 @@ defmodule Fathom.Shard.Replication.Protocol do
       when byte_size(frame) >= 60 + slen,
       do: binary_part(frame, 0, 60 + slen)
 
+  # 68 = @push_ord_lin's 60 plus the trailing 8-byte uncompressed length, which IS signed: it is
+  # what bounds decompression of the unsigned payload.
+  def signable(<<@version::8, @push_ord_lin_z::8, slen::16, _::binary>> = frame)
+      when byte_size(frame) >= 68 + slen,
+      do: binary_part(frame, 0, 68 + slen)
+
   def signable(<<@version::8, @push_ord::8, slen::16, _::binary>> = frame)
       when byte_size(frame) >= 52 + slen,
       do: binary_part(frame, 0, 52 + slen)
@@ -827,6 +913,32 @@ defmodule Fathom.Shard.Replication.Protocol do
   # ABOVE the `@push_ord` clause and matching its own type code, so the two never compete. `lineage`
   # is the trailing field; everything before it is byte-identical to `@push_ord`, which is what makes
   # this additive (expert review 2026-09-05 #4/#12).
+  defp decode_frame(
+         <<@version::8, @push_ord_lin_z::8, slen::16, epoch::64, gen::64, salt::64, off::64,
+           prev::64, ord::64, lin::64, raw_len::64, rest::binary>>
+       )
+       when byte_size(rest) >= slen do
+    <<shard::binary-size(^slen), zpayload::binary>> = rest
+
+    with true <- raw_len <= max_frame_bytes(),
+         {:ok, payload} <- decompress_bounded(zpayload, raw_len) do
+      {:ok,
+       %Push{
+         shard_id: shard,
+         epoch: epoch,
+         wal_gen: gen,
+         salt1: salt,
+         offset: off,
+         payload: payload,
+         prev_extent: prev,
+         wal_ordinal: ord,
+         lineage: lin
+       }}
+    else
+      _ -> {:error, :malformed}
+    end
+  end
+
   defp decode_frame(
          <<@version::8, @push_ord_lin::8, slen::16, epoch::64, gen::64, salt::64, off::64,
            prev::64, ord::64, lin::64, rest::binary>>

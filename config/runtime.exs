@@ -998,6 +998,15 @@ case env_bool.("REPLICATION_ORDINAL_WIRE") do
   v -> config :fathom, :replication_ordinal_wire, v
 end
 
+# zstd-compress push payloads on the wire (perf review 2026-10-01 #32). Default ON; effective only
+# with REPLICATION_ORDINAL_WIRE (the frame prod sends). TPC-B pushes shrink 4.5–13.6x at 8–12 µs
+# each. Receivers always decode it; a peer one deploy BEHIND does not know the frame, so a future
+# rolling upgrade across it sets this false on the first deploy.
+case env_bool.("REPLICATION_COMPRESS") do
+  nil -> :ok
+  v -> config :fathom, :replication_compress, v
+end
+
 # Where the follower set comes from. `static` (default) is the hand-maintained
 # REPLICATION_FOLLOWERS list; `roster` derives it from the addresses nodes publish to
 # `rebalancer_nodes`, refreshed on a timer, so adding or replacing a node stops meaning "edit every

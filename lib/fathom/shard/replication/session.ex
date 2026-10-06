@@ -37,6 +37,7 @@ defmodule Fathom.Shard.Replication.Session do
 
   alias Fathom.Shard.Replication
   alias Fathom.Shard.Replication.Primary
+  alias Fathom.Shard.Replication.Protocol, as: ReplProtocol
   alias Fathom.Shard.Replication.Protocol.Push
   alias Fathom.Shard.Replication.Protocol.SeedBegin
   alias Fathom.Shard.Replication.SeedGate
@@ -906,6 +907,16 @@ defmodule Fathom.Shard.Replication.Session do
       # are not going to be shipped.
       {ordinal, state} = with_ordinal(state, header.salt1)
 
+      # Compressed ONCE per distinct range (perf review 2026-10-01 #32): followers in step share a
+      # range, so N followers cost one zstd pass, not N. Only the ordinal frame carries it.
+      zby_range =
+        if ReplProtocol.ordinal_wire?() and ReplProtocol.compress?(),
+          do:
+            Map.new(by_range, fn {range, bytes} ->
+              {range, ReplProtocol.compress_payload(bytes)}
+            end),
+          else: %{}
+
       {:ok,
        for {shipper, {kind, off, len}} <- plans do
          {shipper,
@@ -935,7 +946,8 @@ defmodule Fathom.Shard.Replication.Session do
             # same `@push_ord_lin` frame as the ordinal). Lets the follower's `decide/2` fence on the
             # monotonic lineage instead of the reset-prone lock epoch, and refresh a frozen lineage.
             lineage: state.lineage,
-            payload: Map.fetch!(by_range, {off, len})
+            payload: Map.fetch!(by_range, {off, len}),
+            zpayload: Map.get(zby_range, {off, len})
           }}
        end, state}
     else
