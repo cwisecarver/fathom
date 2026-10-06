@@ -480,6 +480,10 @@ defmodule Fathom.Shard.Replication.Shipper do
       # `recv`, and switching to active first would deliver it as a `{:tcp, …}` message that
       # `handle_info/2` decodes as a malformed reply. Flipped to active right after.
       active: false,
+      # No `delay_send` (perf review 2026-10-01 #28, measured and dropped 2026-10-06). It coalesces
+      # writes queued in one scheduling round into one syscall. Rig A/B, 1024 tenants, replication
+      # and compression on, 30 s flush: 3,401 txn/s off vs 3,408 on, p99 493 vs 497 ms, identical
+      # bytes — per-push syscalls are not the bottleneck at this load. Same on the follower side.
       nodelay: true,
       send_timeout: send_timeout(),
       send_timeout_close: true
