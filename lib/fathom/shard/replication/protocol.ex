@@ -449,6 +449,10 @@ defmodule Fathom.Shard.Replication.Protocol do
   incompressible delta then ships uncompressed, in the plain `@push_ord_lin` frame).
   """
   @spec compress_payload(binary()) :: binary() | nil
+  # Empty is handled before `:zstd`: OTP 28's `:zstd.compress(<<>>)` raises FunctionClauseError in
+  # `:zstd.codec_loop/3` (OTP 29 returns an empty frame). Caught by CI's OTP 28 job, 2026-10-06.
+  def compress_payload(<<>>), do: nil
+
   def compress_payload(payload) when is_binary(payload) do
     z = IO.iodata_to_binary(:zstd.compress(payload, %{compressionLevel: @zstd_push_level}))
     if byte_size(z) < byte_size(payload), do: z, else: nil

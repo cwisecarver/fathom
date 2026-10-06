@@ -112,6 +112,10 @@ x-fathom-env: &fathom-env
   # path. Prod now defaults it ON too (config/config.exs); pinned explicit so the rig does not depend
   # on that default.
   REPLICATION_ORDINAL_WIRE: "${REPLICATION_ORDINAL_WIRE:-true}"
+  # zstd push payloads (perf review 2026-10-01 #32) and zstd stored objects (#31). Passed through so
+  # one image can run both arms of an A/B; empty means the app default (both zstd).
+  REPLICATION_COMPRESS: "${REPLICATION_COMPRESS:-}"
+  SHARD_OBJECT_ENCODING: "${SHARD_OBJECT_ENCODING:-}"
   # Frame authentication (2026-08-20 #3). OFF here, pinned explicit: prod now defaults these ON, but
   # signing needs a shared key (HRANA_TOKEN_SECRET / REPLICATION_HMAC_SECRET) the rig does not set,
   # and `check_replication_frame_auth!` refuses to boot with signing on and no key. Turn both on with
