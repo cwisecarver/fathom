@@ -15,6 +15,25 @@ defmodule Fathom.Shard.FlushGate do
   matter how many shards phase-align. It bounds concurrency; `schedule_flush`'s jitter separately
   decorrelates the timers so shards don't pile onto the gate in lockstep in the first place.
 
+  ## Why one stage, sized to the dirty-IO pool (expert review 2026-10-01 perf #15, measured 2026-10-06)
+
+  A slot is held across the S3 PUT, so node flush throughput is ~cap / PUT time, and at the 5 s
+  library-default interval the gate DOES refuse: chaos rig, 1,024 tenants, replication on, 20 ms
+  injected S3 latency, every node refused 1,300–3,700 flushes in a ~2.5 min run. A two-stage gate
+  (upload slots = a quarter of the Finch pool, 50; a separate blocking permit around the scan,
+  half the dirty-IO schedulers) was built and A/B'd on one image, back to back:
+
+      cap 10 (this design)    2,909 txn/s   p99 607 ms   36 errors   1,300–3,700 refusals/node
+      cap 50 + scan permit    2,753 txn/s   p99 749 ms   80 errors   0 refusals
+
+  Refusals went to zero, but tenants paid for it (p99 +23%, errors 2x): letting every dirty shard
+  flush on schedule at 5 s means more WAL checkpoints, and each one costs replication work (the
+  AGENTS.md loud warning). The refusals are the gate shedding flush work, which costs RPO at that
+  interval rather than tenant latency; at prod's 300 s interval there are none to shed. So it was
+  reverted. Revisit only with an RPO measurement (oldest-dirty age) that prices what the refusals
+  cost. A single earlier "after" run read -40% txn/s; the back-to-back A/B above shows that was
+  run-to-run noise, not the change.
+
   A public ETS counter bumped lock-free (`:ets.update_counter`), no GenServer hop on the flush
   path. Gated by `:shard_flush_max_concurrency` (nil ⇒ unbounded, the default): when unset a
   coordinator never touches this table (`try_acquire/0` returns `:disabled`), so it is zero-cost
