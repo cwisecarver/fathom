@@ -63,7 +63,7 @@ defmodule Fathom.Migrator.Copy do
          #
          # The finding is right about the mechanism: this destination is a temp file that gets
          # uploaded and then `drop_temp`'d, so it pays `synchronous=FULL`'s WAL fsync per commit
-         # plus a `wal_checkpoint(TRUNCATE)` main-DB fsync per chain step for bytes deleted seconds
+         # plus a `wal_checkpoint(TRUNCATE)` main-DB fsync per chain step (one per chain since 2026-10-01 #30) for bytes deleted seconds
          # later. The fix (`journal_mode=MEMORY`, `synchronous=OFF`, no checkpoint) was implemented
          # and run through the audit's own falsifying experiment.
          #
@@ -92,14 +92,24 @@ defmodule Fathom.Migrator.Copy do
          # per step below, as Django's `check_constraints()` does.
          :ok <- Connection.exec(conn, "PRAGMA foreign_keys=OFF") do
       try do
-        Enum.reduce_while(chain, :ok, fn step, :ok ->
-          {version, statements, transform} = normalize_step(step)
+        with :ok <-
+               Enum.reduce_while(chain, :ok, fn step, :ok ->
+                 {version, statements, transform} = normalize_step(step)
 
-          case replay(conn, version, statements, transform, shard_id) do
-            :ok -> {:cont, :ok}
-            {:error, _} = error -> {:halt, error}
-          end
-        end)
+                 case replay(conn, version, statements, transform, shard_id) do
+                   :ok -> {:cont, :ok}
+                   {:error, _} = error -> {:halt, error}
+                 end
+               end) do
+          # ONE fold for the whole chain, after the last step (expert review 2026-10-01 #30), so the
+          # copy is a complete single file to flush. It used to run after EVERY step, writing and
+          # fsyncing the main DB K times for a K-step chain — for a temp file nobody reads between
+          # steps: `ShardMigration.forward` discards it on any error. MEASURED (49 MB shard, 10-step
+          # table-rebuild chain, 3 runs each): 1,124-1,145 ms per-step vs 917-935 ms once, -18%;
+          # single-step migrations are unchanged. Each step still commits and stamps its own
+          # `user_version`, so a mid-chain failure still leaves the copy at the last applied step.
+          Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
+        end
       after
         Connection.close(conn)
       end
@@ -191,12 +201,10 @@ defmodule Fathom.Migrator.Copy do
           error
       end
 
-    with :ok <- result,
-         # Not transactional, so after the commit: stamp the version, then fold the
-         # WAL into the main file so the copy is a complete single file to flush.
-         :ok <- Connection.exec(conn, "PRAGMA user_version = #{version}"),
-         :ok <- Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)") do
-      :ok
+    # Not transactional, so after the commit. The WAL fold happens once, after the whole chain
+    # (`migrate_chain/4`).
+    with :ok <- result do
+      Connection.exec(conn, "PRAGMA user_version = #{version}")
     end
   end
 

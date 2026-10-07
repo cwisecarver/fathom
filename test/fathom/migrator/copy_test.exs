@@ -192,4 +192,58 @@ defmodule Fathom.Migrator.CopyTest do
     assert {:error, {:foreign_key_violation, 2, [_ | _]}} =
              Copy.migrate(source, dest, 2, [{"DELETE FROM app_parent", []}])
   end
+
+  # Expert review 2026-10-01 #30: the WAL is folded ONCE, after the last step, not after every step.
+  # The product is flushed as a single file (the flush and `durability_edges_test` copy the main file
+  # with no `-wal`), so every step's changes and the final `user_version` must be in the main file
+  # alone once the chain returns.
+  #
+  # This test does NOT discriminate the explicit fold: with it replaced by `:ok` it still passes
+  # (probed 2026-10-06), because closing the last connection also checkpoints and removes the WAL.
+  # It is an invariant guard on the product, not proof the `wal_checkpoint` line is load-bearing.
+  test "a multi-step chain leaves every step in the main file, with no WAL needed",
+       %{source: source, dest: dest} do
+    seed_v0!(source)
+
+    chain = [
+      {2, [{"ALTER TABLE app_thing ADD COLUMN a TEXT", []}]},
+      {3, [{"ALTER TABLE app_thing ADD COLUMN b TEXT", []}]},
+      {4, [{"UPDATE app_thing SET a = 'x', b = 'y'", []}]}
+    ]
+
+    assert :ok = Copy.migrate_chain(source, dest, chain)
+
+    refute File.exists?(dest <> "-wal") and File.stat!(dest <> "-wal").size > 0,
+           "the chain left committed pages in the WAL instead of the main file"
+
+    main_only = dest <> "-mainonly.db"
+    on_exit(fn -> for s <- ["", "-wal", "-shm"], do: File.rm(main_only <> s) end)
+    File.cp!(dest, main_only)
+
+    assert %{rows: [[1, "alice", "x", "y"]]} =
+             query!(main_only, "SELECT id, name, a, b FROM app_thing")
+
+    assert %{rows: [[4]]} = query!(main_only, "PRAGMA user_version")
+  end
+
+  # The per-step fold was removed, but each step still commits and stamps on its own: a failure
+  # mid-chain leaves the copy at the last fully applied step, never half a step.
+  test "a mid-chain failure leaves the copy at the last applied step",
+       %{source: source, dest: dest} do
+    seed_v0!(source)
+
+    chain = [
+      {2, [{"ALTER TABLE app_thing ADD COLUMN a TEXT", []}]},
+      {3,
+       [
+         {"ALTER TABLE app_thing ADD COLUMN b TEXT", []},
+         {"INSERT INTO does_not_exist (x) VALUES (1)", []}
+       ]}
+    ]
+
+    assert {:error, _} = Copy.migrate_chain(source, dest, chain)
+
+    assert %{columns: ["id", "name", "a"]} = query!(dest, "SELECT * FROM app_thing")
+    assert %{rows: [[2]]} = query!(dest, "PRAGMA user_version")
+  end
 end
