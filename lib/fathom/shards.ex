@@ -45,7 +45,14 @@ defmodule Fathom.Shards do
   # deadline, and bounded fan-out concurrency so the drain doesn't fire every coordinator's flush at
   # once (the #17 storm). All operator-tunable via config.
   @default_drain_all_budget_ms 55_000
-  @default_drain_all_concurrency 16
+  # 64, not 16 (expert review 2026-10-01 perf #16). A drain is RTT-bound (a clean one is a lock
+  # DELETE; a dirty one adds checkpoint + PUT), so width is what sets drain throughput. Measured on
+  # the chaos rig, 5,000 open shards on one node (1,000 dirty), 20 ms injected S3 latency each way:
+  # 16-wide drained in 17.1 s, 64-wide in 4.1 s, neither timing out. 16-wide is ~290 shards/s, so a
+  # node past ~16k open shards could not drain inside the 55 s budget and the remainder fell to
+  # the unbounded supervisor teardown. 64 still bounds the #17 storm: the node is out of the LB
+  # by then, and 64 concurrent PUTs sit well inside the 200-connection pool.
+  @default_drain_all_concurrency 64
   @default_drain_all_flush_grace_ms 5_000
 
   # Minimum time a busy shard is given to check its streams back in BEFORE the flush grace begins
