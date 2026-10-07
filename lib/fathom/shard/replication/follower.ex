@@ -1423,6 +1423,21 @@ defmodule Fathom.Shard.Replication.Follower do
   #
   # The position fields (`wal_gen`, `salt1`, `next_offset`, `wal_ordinal`) keep describing the files
   # that are actually on disk; nothing reads them for an append while `torn` holds.
+  #
+  # WHAT THIS COSTS, AND THE PARKED FIX (expert review 2026-10-01 perf #6(a), parked 2026-10-06).
+  # Every open bumps the lineage, so every reopen after an idle drop re-sends the WHOLE database to
+  # every follower. Measured on the chaos rig (256 tenants, replication on, drain every shard, run
+  # the same tenants again): ~1,024 full seeds, ~48 KB each (the whole DB), ~10 MB of seed bytes per
+  # node — ~11% of that round's traffic for these tiny TPC-B tenants. A 10 MB tenant writing a little
+  # after each quiet spell would spend ~40 MB of seed to deliver ~1.6 MB of changes (~96%).
+  #
+  # The safe skip: a DIRTY idle drop uploads the raw `.db` after a TRUNCATE checkpoint (not a VACUUM
+  # copy), so a follower that absorbs its own WAL often holds that exact file. If the follower sends
+  # an MD5 of its absorbed `.db` and the new owner's `.db` hashes the same, the seed can carry the WAL
+  # only — byte-identical base, so no hybrid. Not built because the plumbing is wide: the request is
+  # a plain `:unknown_shard` reject that flows through Shipper, Quorum and Session's reject list, and
+  # the alternative (hash in SeedBegin, follower answers reuse/full) breaks the seed's one-reply
+  # contract the Shipper's waiter relies on. A clean drop (object = last VACUUM copy) must still seed.
   defp request_seed(name, prev, decided, push) do
     Logger.info(
       "replication follower asking for a seed of #{push.shard_id}: " <>
