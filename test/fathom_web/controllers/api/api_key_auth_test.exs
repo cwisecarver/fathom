@@ -99,6 +99,59 @@ defmodule FathomWeb.Api.ApiKeyAuthTest do
       end
     end
 
+    # Expert review 2026-10-08 #3, verified by execution: `create` and `fork` also answer with a
+    # `:rw` token for the id they make, so a manage key got a template token (201) by creating the
+    # template id, or by forking a tenant it built INTO the template id. Gated on the TARGET id.
+    test "a manage key cannot create the template, or fork into it (any case)", %{
+      conn: conn,
+      template: template
+    } do
+      token = mint("manage")
+
+      for id <- [template, String.upcase(template)] do
+        status =
+          conn |> bearer(token) |> post("/api/tenants", %{"shard_id" => id}) |> Map.get(:status)
+
+        assert status == 403, "a manage key got #{status} creating #{id}"
+
+        status =
+          conn
+          |> bearer(token)
+          |> post("/api/tenants/apikey_src_x/fork", %{"dst" => id})
+          |> Map.get(:status)
+
+        assert status == 403, "a manage key got #{status} forking into #{id}"
+
+        status =
+          conn
+          |> bearer(token)
+          |> post("/api/tenants/apikey_src_x/fork", %{"to" => id})
+          |> Map.get(:status)
+
+        assert status == 403, "a manage key got #{status} forking (to:) into #{id}"
+      end
+
+      refute Fathom.Repo.get_by(Shard, shard_id: template),
+             "the refused create must not have registered the template id"
+    end
+
+    test "forking FROM the template, and creating an ordinary tenant, stay at manage", %{
+      conn: conn,
+      template: template
+    } do
+      token = mint("manage")
+      dst = "apikey_from_tpl_#{System.unique_integer([:positive])}"
+      on_exit(fn -> :ets.delete(Tombstones, dst) end)
+
+      status =
+        conn
+        |> bearer(token)
+        |> post("/api/tenants/#{template}/fork", %{"dst" => dst})
+        |> Map.get(:status)
+
+      refute status in [401, 403], "forking from the template is a read of it, got #{status}"
+    end
+
     test "a manage key still mints for an ordinary tenant; a destroy key for the template", %{
       conn: conn,
       template: template

@@ -64,11 +64,17 @@ defmodule FathomWeb.Api.TenantController do
   # at `manage`, below `destroy`, which only erases ONE tenant. So the credential actions on the
   # template require `destroy`. The id is normalized the way `ShardExecutor.template?/1` does, so a
   # mixed-case path cannot slip past.
-  @template_credential_actions [:mint_token, :rotate_token]
-
+  #
+  # `create` and `fork` MINT ONE TOO (expert review 2026-10-08 #1's sibling, #3, verified by
+  # execution). Both answer with `Tenants.tenant_result/2`, which carries a `:rw` token for the id
+  # they just made, so the #19 fix was one door of three: a `manage` key POSTing
+  # `{"shard_id": <template>}` got a template token back (201), and forking an attacker-built
+  # tenant INTO the template id also seeded `template@HEAD`, which `:fork_from_template` copies into
+  # every new tenant. Gated by the id each action TARGETS — `create`'s new id, `fork`'s `dst`;
+  # forking FROM the template only reads it.
   defp template_credential_scope(conn, required) do
-    with true <- action_name(conn) in @template_credential_actions,
-         {:ok, id} <- Fathom.ShardId.cast(conn.params["id"]),
+    with {:ok, raw} <- template_target(action_name(conn), conn.params),
+         {:ok, id} <- Fathom.ShardId.cast(raw),
          {:ok, template} <- Fathom.ShardId.cast(Application.get_env(:fathom, :template_shard_id)),
          true <- id == template do
       :destroy
@@ -76,6 +82,14 @@ defmodule FathomWeb.Api.TenantController do
       _ -> required
     end
   end
+
+  # The id an action hands a fresh `:rw` credential for; params read as `create/2` and `fork/2` do.
+  defp template_target(action, params) when action in [:mint_token, :rotate_token],
+    do: {:ok, params["id"]}
+
+  defp template_target(:create, params), do: {:ok, params["shard_id"] || params["id"]}
+  defp template_target(:fork, params), do: {:ok, params["dst"] || params["to"]}
+  defp template_target(_action, _params), do: :none
 
   # The mutating, high-blast-radius actions the audit log (#9) records. Reads (index/show/list) are
   # not audited.
