@@ -77,6 +77,33 @@ defmodule FathomWeb.ClientIp do
     end
   end
 
+  @doc """
+  The key a per-client throttle counts against: the IPv4 address itself, or an IPv6 address
+  masked to its `:throttle_ipv6_prefix` (default /64).
+
+  PER-ADDRESS IS PER-ATTACKER ONLY FOR IPv4 (expert review 2026-10-08 #29). An IPv6 end site is
+  routinely handed a whole /64 — 2^64 addresses — so keying on the full address gave one attacker
+  a fresh `ADMIN_AUTH_MAX_FAILURES` budget per address and made the admin brute-force lockout
+  (2026-08-01 #34) and the `/api` rate limit no limit at all. An IPv4-mapped IPv6 peer is keyed as
+  its IPv4 address, the same host.
+  """
+  @spec throttle_key(:inet.ip_address()) :: :inet.ip_address()
+  def throttle_key(ip) do
+    case normalize(ip) do
+      {_, _, _, _} = v4 ->
+        v4
+
+      {_, _, _, _, _, _, _, _} = v6 ->
+        prefix = Application.get_env(:fathom, :throttle_ipv6_prefix, 64)
+        <<net::bitstring-size(^prefix), rest::bitstring>> = bits(v6)
+
+        <<a::16, b::16, c::16, d::16, e::16, f::16, g::16, h::16>> =
+          <<net::bitstring, 0::size(bit_size(rest))>>
+
+        {a, b, c, d, e, f, g, h}
+    end
+  end
+
   @doc "Parsed `:trusted_proxies`, as `{network, prefix_bits}` pairs. Unparseable entries dropped."
   @spec trusted_proxies() :: [{:inet.ip_address(), non_neg_integer()}]
   def trusted_proxies do

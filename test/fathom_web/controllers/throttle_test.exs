@@ -51,6 +51,26 @@ defmodule FathomWeb.ThrottleTest do
            "the lockout precedes the credential check, so brute force can't slip a hit through"
   end
 
+  # Expert review 2026-10-08 #29: keyed per FULL IPv6 address, one attacker holding a /64 (what an
+  # IPv6 end site is routinely handed) got a fresh failure budget from every address in it.
+  test "the admin lockout counts an IPv6 /64 as one source", %{conn: conn} do
+    Application.put_env(:fathom, :admin_auth_max_failures, 3)
+    from = fn last -> %{conn | remote_ip: {0x2001, 0xDB8, 0xA, 0xB, 0, 0, 0, last}} end
+
+    for last <- 1..3 do
+      assert from.(last) |> basic("admin", "wrong") |> get("/admin/metrics") |> Map.get(:status) ==
+               401
+    end
+
+    assert from.(99) |> basic("admin", "wrong") |> get("/admin/metrics") |> Map.get(:status) ==
+             429,
+           "a fourth address in the same /64 got a fresh failure budget"
+
+    # Another /64 is another source.
+    other = %{conn | remote_ip: {0x2001, 0xDB8, 0xA, 0xC, 0, 0, 0, 1}}
+    assert other |> basic("admin", "wrong") |> get("/admin/metrics") |> Map.get(:status) == 401
+  end
+
   test "a successful admin auth clears the failure count", %{conn: conn} do
     Application.put_env(:fathom, :admin_auth_max_failures, 3)
 

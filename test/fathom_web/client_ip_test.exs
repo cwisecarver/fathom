@@ -144,4 +144,24 @@ defmodule FathomWeb.ClientIpTest do
       assert ClientIp.resolve(conn({10, 0, 0, 1}, ["203.0.113.9"])) == {10, 0, 0, 1}
     end
   end
+
+  describe "throttle_key/1 (expert review 2026-10-08 #29)" do
+    alias FathomWeb.ClientIp
+
+    test "IPv4 keys on the address itself" do
+      assert ClientIp.throttle_key({203, 0, 113, 7}) == {203, 0, 113, 7}
+    end
+
+    test "IPv6 keys on its /64, so one end site is one source" do
+      a = ClientIp.throttle_key({0x2001, 0xDB8, 1, 2, 0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD})
+      b = ClientIp.throttle_key({0x2001, 0xDB8, 1, 2, 0, 0, 0, 1})
+      assert a == b
+      assert a == {0x2001, 0xDB8, 1, 2, 0, 0, 0, 0}
+      refute ClientIp.throttle_key({0x2001, 0xDB8, 1, 3, 0, 0, 0, 1}) == a
+    end
+
+    test "an IPv4-mapped IPv6 peer is keyed as its IPv4 address" do
+      assert ClientIp.throttle_key({0, 0, 0, 0, 0, 0xFFFF, 0xCB00, 0x7107}) == {203, 0, 113, 7}
+    end
+  end
 end

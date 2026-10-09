@@ -224,7 +224,7 @@ defmodule FathomWeb.Router do
         false
 
       limit ->
-        Fathom.RateLimiter.count(:admin_auth, client_ip(conn), admin_fail_window()) >= limit
+        Fathom.RateLimiter.count(:admin_auth, throttle_key(conn), admin_fail_window()) >= limit
     end
   end
 
@@ -238,7 +238,9 @@ defmodule FathomWeb.Router do
       limit ->
         cond do
           conn.halted and conn.status == 401 ->
-            new_count = Fathom.RateLimiter.bump(:admin_auth, client_ip(conn), admin_fail_window())
+            new_count =
+              Fathom.RateLimiter.bump(:admin_auth, throttle_key(conn), admin_fail_window())
+
             :telemetry.execute([:fathom, :admin_auth, :failed], %{count: 1}, %{})
 
             # Audit ONLY the lockout transition (the attempt that crosses the threshold), never every
@@ -251,7 +253,7 @@ defmodule FathomWeb.Router do
             conn
 
           not conn.halted ->
-            Fathom.RateLimiter.forget(:admin_auth, client_ip(conn))
+            Fathom.RateLimiter.forget(:admin_auth, throttle_key(conn))
             conn
 
           true ->
@@ -269,7 +271,7 @@ defmodule FathomWeb.Router do
         conn
 
       limit ->
-        case Fathom.RateLimiter.check(:api, client_ip(conn), limit, api_rate_window()) do
+        case Fathom.RateLimiter.check(:api, throttle_key(conn), limit, api_rate_window()) do
           :ok ->
             conn
 
@@ -304,7 +306,11 @@ defmodule FathomWeb.Router do
   # credential, so a username adds no partition — it only lets an attacker vary the username field
   # to get a fresh failure budget per made-up name, multiplying the attempts the lockout allows.
   # That weakens the exact brute-force protection the finding is about.
-  defp client_ip(conn), do: FathomWeb.ClientIp.resolve(conn)
+  #
+  # Keyed by `throttle_key/1`: the resolved address, with IPv6 masked to its /64 (expert review
+  # 2026-10-08 #29) — per full IPv6 address, one attacker's /64 was 2^64 fresh budgets.
+  defp throttle_key(conn),
+    do: conn |> FathomWeb.ClientIp.resolve() |> FathomWeb.ClientIp.throttle_key()
 
   # The Hrana (libSQL) endpoint is served by Filo on its own listener (see
   # Fathom.Application.hrana_listener/0), not through this router.
