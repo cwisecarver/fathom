@@ -142,6 +142,16 @@ defmodule Fathom.Shard.Materializer do
     end
   end
 
+  # Test seam for the crash window between the sidecar write and the rename (expert review
+  # 2026-10-08 #10): a test sets `:promote_pull_crash_hook` to a function that raises, standing in for
+  # a node dying at exactly that point. Unset in every real config, so this is one env read per pull.
+  defp before_promote_rename(path) do
+    case Application.get_env(:fathom, :promote_pull_crash_hook) do
+      nil -> :ok
+      hook -> hook.(path)
+    end
+  end
+
   # A new shard has no object, so the pull wrote no temp — leave the path absent (the first
   # connection creates it empty). Otherwise move the temp into place. Carries the object etag
   # through for the flush fence.
@@ -160,6 +170,16 @@ defmodule Fathom.Shard.Materializer do
       File.rm(path <> "-wal")
       File.rm(path <> "-shm")
 
+      # …and any `.db` ALREADY at the path, BEFORE the sidecar is written (expert review 2026-10-08
+      # #10). Sidecar-first below is safe only if a crash between it and the rename leaves "a
+      # sidecar with no `.db`". On a REPULL (`Fathom.Shard.repull/2`, after revalidation judged the
+      # first pull stale) the path already holds that stale pull, so the residue was the STALE
+      # bytes paired with the NEWER etag — the next open read the sidecar as a match, served the
+      # stale copy, and its first flush If-Matched the newer object and overwrote it: a silent
+      # rollback of acked writes. Those bytes were already judged stale and no connection has
+      # opened them (the pull runs inside the open), so removing them first loses nothing.
+      File.rm(path)
+
       # Establish provenance BEFORE the pulled file becomes authoritative (expert
       # review 2026-07-14 #5). Writing the sidecar AFTER the rename left a crash
       # window: an authoritative warm `.db` with NO sidecar. The next warm open reads
@@ -174,6 +194,7 @@ defmodule Fathom.Shard.Materializer do
       # File.rm's a stale sidecar before landing. The sidecar path is `<path>.etag`,
       # derived from the FINAL path, so it's writable before the rename.
       Provenance.write(path, etag)
+      before_promote_rename(path)
 
       case File.rename(temp, path) do
         :ok ->
