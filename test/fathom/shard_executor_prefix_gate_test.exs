@@ -240,6 +240,55 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
     assert read_pragma(h, "temp_store") == before
   end
 
+  # Expert review 2026-10-08 #9: the size cap covered `main` only, so a TEMP table grew past it (four
+  # 100 MB inserts under a 50 MB cap). The temp schema is now capped lazily, before DDL and scripts —
+  # not at open, which cost ~85 KiB per connection and was refused by the served-density gate.
+  describe "the TEMP schema under a 1 MiB shard cap" do
+    setup do
+      prev = Application.get_env(:fathom, :shard_max_bytes)
+      Application.put_env(:fathom, :shard_max_bytes, 1024 * 1024)
+      shard = "test_tempcap_#{System.unique_integer([:positive])}"
+      {:ok, h} = ShardExecutor.open(shard)
+
+      on_exit(fn ->
+        ShardExecutor.close(h)
+
+        if prev,
+          do: Application.put_env(:fathom, :shard_max_bytes, prev),
+          else: Application.delete_env(:fathom, :shard_max_bytes)
+
+        rm_shard_files(shard)
+      end)
+
+      %{temp_handle: h}
+    end
+
+    @big_insert """
+    INSERT INTO big SELECT randomblob(4000) FROM
+      (WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000)
+       SELECT i FROM n)
+    """
+
+    test "a TEMP table cannot grow past the cap", %{temp_handle: h} do
+      {:ok, _} = ShardExecutor.execute(h, stmt("CREATE TEMP TABLE big (x)"))
+      assert read_pragma(h, "temp.max_page_count") == 256
+
+      assert {:error, %Error{message: message}} = ShardExecutor.execute(h, stmt(@big_insert)),
+             "a ~4 MB TEMP insert succeeded under a 1 MiB shard cap"
+
+      assert message =~ "full"
+    end
+
+    test "nor through a script", %{temp_handle: h} do
+      assert {:error, _} =
+               ShardExecutor.execute_sequence(
+                 h,
+                 "CREATE TEMPORARY TABLE big (x); " <> @big_insert
+               ),
+             "a script grew a TEMP table past the 1 MiB cap"
+    end
+  end
+
   test "bare reads with trailing comments, and later batched statements, stay reads", %{
     handle: h
   } do

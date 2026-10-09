@@ -484,6 +484,37 @@ defmodule Fathom.Shard.Connection do
   #
   # `:shard_max_page_count` still wins when set explicitly — an operator who configured pages meant
   # pages, and silently reinterpreting their number as bytes would be its own bug.
+  @doc """
+  Caps this connection's TEMP schema at the shard size cap (expert review 2026-10-08 #9).
+
+  `max_page_count` caps `main` only, and a TEMP table lives in the temp schema, outside it — a
+  long-lived stream grew one statement by statement past `:shard_max_bytes` (four 100 MB inserts
+  under a 50 MB cap) onto node disk. CALLED LAZILY, before a statement that can create a TEMP
+  object, never at open: setting `temp.max_page_count` makes SQLite create the connection's temp
+  database, which cost ~85 KiB per connection when this ran at open — the served-density bench gate
+  refused it (195 -> 287 KiB per served shard). Idempotent and cheap, so callers need not track
+  whether it already ran. The temp database's page size is SQLite's default, 4096: it is fixed when
+  the temp database is created and `page_size` is not tenant-settable, and `temp_store` (which would
+  discard the temp database and this cap) is not on the tenant allow-list.
+  """
+  @spec cap_temp(reference()) :: :ok | {:error, term()}
+  def cap_temp(conn) do
+    case {Application.get_env(:fathom, :shard_max_page_count),
+          Application.get_env(:fathom, :shard_max_bytes, @default_max_bytes)} do
+      {n, _} when is_integer(n) and n > 0 ->
+        Sqlite3.execute(conn, "PRAGMA temp.max_page_count=#{n}")
+
+      {n, _} when is_integer(n) ->
+        :ok
+
+      {_, bytes} when is_integer(bytes) and bytes > 0 ->
+        Sqlite3.execute(conn, "PRAGMA temp.max_page_count=#{max(div(bytes, 4096), 1)}")
+
+      _ ->
+        :ok
+    end
+  end
+
   defp maybe_max_page_count(conn) do
     case {Application.get_env(:fathom, :shard_max_page_count),
           Application.get_env(:fathom, :shard_max_bytes, @default_max_bytes)} do

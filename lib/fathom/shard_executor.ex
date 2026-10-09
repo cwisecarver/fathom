@@ -302,6 +302,16 @@ defmodule Fathom.ShardExecutor do
     end
   end
 
+  # A failure to set the cap is logged, not fatal: refusing every DDL because one pragma could not be
+  # set would turn a defence into an outage, and the statement it guards is still size-bounded per
+  # statement by the deadline.
+  defp cap_temp(conn) do
+    case Connection.cap_temp(conn) do
+      :ok -> :ok
+      {:error, reason} -> Logger.warning("could not cap the TEMP schema: #{inspect(reason)}")
+    end
+  end
+
   defp run_statement(
          {pid, _ref, conn, shard_id, _scope, _ver, opts},
          %Stmt{sql: sql, args: args},
@@ -310,6 +320,11 @@ defmodule Fathom.ShardExecutor do
        ) do
     started = System.monotonic_time()
     schema_before = if ddl?, do: schema_version(conn)
+
+    # Every TEMP table, index, view and trigger is born from a CREATE, so the temp schema is capped
+    # before any DDL and never for anything else (expert review 2026-10-08 #9; why not at open:
+    # `Connection.cap_temp/1`).
+    if ddl?, do: cap_temp(conn)
 
     case Connection.query(conn, sql, args, dml?: dml?) do
       {:ok, result} ->
@@ -871,6 +886,10 @@ defmodule Fathom.ShardExecutor do
 
   defp run_script(pid, conn, sql, shard_id, opts) do
     mark_session_mutated(conn)
+
+    # A script can hide a CREATE TEMP anywhere in it, and scripts are migration-rare, so cap the temp
+    # schema before every one (expert review 2026-10-08 #9).
+    cap_temp(conn)
 
     case Connection.exec(conn, sql) do
       :ok ->
