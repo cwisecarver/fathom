@@ -443,18 +443,32 @@ defmodule Fathom.Directory do
   # here, so it is treated as USED: `last_active_at` lands one microsecond past `cutover_at`, and a
   # revert needs `force`. Over-refusing is the guard's documented safe direction. `cutover_at` stays
   # `now` because the rollout rate counts it.
+  #
+  # `keep_suspended: true` is for a REVERT (expert review 2026-10-08 #18). Reverting a suspended
+  # tenant is deliberately allowed — it is an operator's restore — and the revert's retain and
+  # restore ran for one, but this cutover accepted only `active`/`migrating`, so it rolled back after
+  # the destructive restore had landed: live at the old version, the directory still at the new one,
+  # no retirement scheduled for the backup, and five retries each re-pulling the shard. Now a
+  # suspended row takes the cutover too, keeping its `suspended` status (a revert is not a resume).
   @spec cutover(String.t(), non_neg_integer(), non_neg_integer() | nil, keyword()) ::
           {:ok, Shard.t()} | {:error, :not_found | :status_conflict}
   def cutover(shard_id, schema_version, retained_version, opts \\ []) do
-    guarded_update_shard(
-      shard_id,
+    attrs =
       Map.put(
         cutover_attrs(schema_version, Keyword.get(opts, :used_since_live, false)),
         :retained_version,
         retained_version
-      ),
-      ["active", "migrating"]
-    )
+      )
+
+    case guarded_update_shard(shard_id, attrs, ["active", "migrating"]) do
+      {:error, :status_conflict} = conflict ->
+        if Keyword.get(opts, :keep_suspended, false),
+          do: guarded_update_shard(shard_id, Map.delete(attrs, :status), ["suspended"]),
+          else: conflict
+
+      other ->
+        other
+    end
   end
 
   defp cutover_attrs(schema_version, used_since_live? \\ false) do

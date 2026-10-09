@@ -182,7 +182,10 @@ defmodule Fathom.Migrator.ShardMigration do
       # bytes have been live since that attempt, so writes on them must not read as pre-cutover
       # (expert review 2026-10-08 #14).
       with {:ok, _} <-
-             cutover_with_retirement(shard_id, to_version, current, used_since_live: true) do
+             cutover_with_retirement(shard_id, to_version, current,
+               used_since_live: true,
+               keep_suspended: true
+             ) do
         warn_revert(shard_id, current, to_version, last_active)
         {:ok, %{from: current, to: to_version}}
       end
@@ -204,8 +207,10 @@ defmodule Fathom.Migrator.ShardMigration do
            # 412 and self-fence away its own writes (check_lease still sees our lock — the restore
            # touched the DATA object, not the lock). A 412 → :superseded aborts here, no clobber.
            :ok <- Storage.restore(shard_id, to_version, expected_etag),
-           # Cut over AND schedule the backed-up @current object's retirement atomically (#5).
-           {:ok, _} <- cutover_with_retirement(shard_id, to_version, current) do
+           # Cut over AND schedule the backed-up @current object's retirement atomically (#5). A
+           # suspended tenant's revert lands too, still suspended (expert review 2026-10-08 #18).
+           {:ok, _} <-
+             cutover_with_retirement(shard_id, to_version, current, keep_suspended: true) do
         warn_revert(shard_id, current, to_version, last_active)
         {:ok, %{from: current, to: to_version}}
       end

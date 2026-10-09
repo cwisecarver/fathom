@@ -967,6 +967,25 @@ defmodule Fathom.Migrator.ShardMigrationTest do
   # (the review's "a revert issued days into the retention window silently discards days of tenant
   # writes"). The invariant pinned: a shard the directory shows ACTIVE since cutover_at refuses
   # the revert — before anything touches storage — unless the operator passes force: true.
+  # Expert review 2026-10-08 #18: reverting a suspended tenant is a deliberate operator restore —
+  # retain and restore ran for one — but the cutover accepted only active/migrating and rolled back
+  # AFTER the destructive restore, leaving live at v1 under a directory stamp of v2, no retirement
+  # for the v2 backup, and five retries each re-pulling the shard.
+  test "reverting a suspended tenant lands the cutover and keeps it suspended", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, _} = ShardMigration.run(shard, 2)
+    {:ok, _} = Directory.suspend(shard)
+
+    assert {:ok, %{from: 2, to: 1}} = ShardMigration.revert(shard, 1)
+
+    assert %{rows: [[1]]} = query_live!(shard, "PRAGMA user_version")
+
+    assert {:ok, %{schema_version: 1, status: "suspended", retained_version: 2}} =
+             Directory.get(shard),
+           "the live file and the directory stamp disagree after the revert"
+  end
+
   test "revert refuses a shard active since cutover unless forced", %{shard: shard} do
     seed_v1!(shard)
     {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
