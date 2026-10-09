@@ -90,6 +90,35 @@ defmodule Fathom.Shard.Replication.FollowerAppendMissingWalTest do
     refute File.exists?(Follower.torn_path(name, id))
   end
 
+  # Expert review 2026-10-08 #28: the held-fd cache is an fd budget that multiplies across workers
+  # and peers, so it is configurable — and 0 must really turn it off, not leave fds held.
+  test "with the held-fd cache off, appends still land and no WAL fd is held", ctx do
+    %{name: name, id: id, worker: worker} = ctx
+    prev = Application.get_env(:fathom, :replication_held_wal_fds)
+    Application.put_env(:fathom, :replication_held_wal_fds, 0)
+
+    on_exit(fn ->
+      if prev,
+        do: Application.put_env(:fathom, :replication_held_wal_fds, prev),
+        else: Application.delete_env(:fathom, :replication_held_wal_fds)
+    end)
+
+    :ok = Follower.seed(name, id, 1, 0, 0, 0)
+    assert {:ack, ^id, 6} = send_push(ctx, push(id, 0))
+    assert {:ack, ^id, 12} = send_push(ctx, %{push(id, 6) | payload: "more!!"})
+    assert File.read!(Follower.wal_path(name, id)) == "framesmore!!"
+
+    {:dictionary, dict} = Process.info(worker, :dictionary)
+
+    held =
+      Enum.find_value(dict, %{}, fn
+        {{Follower, :held_fds}, h} -> h
+        _ -> nil
+      end)
+
+    assert held == %{}, "the worker still holds #{map_size(held)} WAL fd(s) with the cache off"
+  end
+
   test "an append at offset 0 still starts a WAL (it carries the header)", ctx do
     %{name: name, id: id} = ctx
     :ok = Follower.seed(name, id, 1, 0, 0, 0)

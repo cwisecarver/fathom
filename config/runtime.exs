@@ -848,6 +848,13 @@ if n = env_int.("REPLICATION_FOLLOWER_WORKERS") do
   config :fathom, :replication_follower_workers, n
 end
 
+# Held replica-WAL fds per follower worker (expert review 2026-10-08 #28). Node total = this ×
+# REPLICATION_FOLLOWER_WORKERS × inbound primaries, held for the connections' lifetime — size it
+# from `nofile`. Default 64; 0 disables the cache (open-pwrite-close per push).
+if n = env_nonneg_int.("REPLICATION_HELD_WAL_FDS") do
+  config :fathom, :replication_held_wal_fds, n
+end
+
 # SEPARATE GATE FROM REPLICATION_ENABLED, and the reason is a real gap this closes (2026-08-10):
 # the `Follower` listener was only ever started by the test suite, so a node with replication on
 # shipped every commit to addresses where nothing listened, got no acks, and 503'd

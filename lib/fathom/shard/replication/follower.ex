@@ -1783,9 +1783,26 @@ defmodule Fathom.Shard.Replication.Follower do
   #
   # Per WORKER (the process dictionary of the connection's per-shard worker that owns these shards)
   # and closed when it exits. Capped so a follower of thousands of shards cannot exhaust its fds.
-  @held_fds_cap 64
+  #
+  # THE CAP IS AN FD BUDGET, AND IT MULTIPLIES (expert review 2026-10-08 #28): held fds per node =
+  # cap × `:replication_follower_workers` × inbound primaries — 64 × 8 × 4 = 2,048 on a 5-node
+  # fleet, held for as long as the connections live, on top of each served shard's own fds. At
+  # Linux's default `nofile` of 1024 that alone exceeds the limit. Configurable with
+  # `REPLICATION_HELD_WAL_FDS` (0 turns the cache off: open-pwrite-close per push, the pre-perf-#7
+  # cost); size it from `nofile` alongside the served-density budget (docs/configuration.md). Above
+  # the cap a worker serving more active shards than it holds misses on most pushes.
+  @default_held_fds_cap 64
+
+  defp held_fds_cap,
+    do: Application.get_env(:fathom, :replication_held_wal_fds, @default_held_fds_cap)
 
   defp write_held(path, offset, payload) do
+    if held_fds_cap() > 0,
+      do: write_cached(path, offset, payload),
+      else: write_frame(path, offset, payload, :append)
+  end
+
+  defp write_cached(path, offset, payload) do
     key = {__MODULE__, :held_fds}
     held = Process.get(key, %{})
 
@@ -1856,9 +1873,11 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
-  defp evict_oldest(held) when map_size(held) < @held_fds_cap, do: held
-
   defp evict_oldest(held) do
+    if map_size(held) < held_fds_cap(), do: held, else: evict_lru(held)
+  end
+
+  defp evict_lru(held) do
     {path, _} = Enum.min_by(held, fn {_path, {_fd, _inode, used}} -> used end)
     drop_held(held, path)
   end
