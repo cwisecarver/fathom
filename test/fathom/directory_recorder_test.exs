@@ -29,6 +29,34 @@ defmodule Fathom.Directory.RecorderTest do
     assert {:ok, %{shard_id: ^b, schema_version: 0, status: "active"}} = Directory.get(b)
   end
 
+  # Expert review 2026-10-08 #24: a flush (t1) and a later access (t2, inside the 30 s re-touch
+  # window) buffered in the SAME tick. Accesses were written first, so the touch was skipped against
+  # the OLD flush stamp, then the flush stamp moved past `last_active_at` — and `flush_lag_report/1`
+  # called the shard clean while it held unflushed writes from t2. The buffers are filled directly
+  # with chosen instants so the ordering is exact rather than raced.
+  test "an access after a flush in the same tick still marks the shard dirty" do
+    a = uniq()
+    {:ok, _} = Directory.resolve(a)
+    now = System.os_time(:microsecond)
+    at = fn us_ago -> DateTime.from_unix!(now - us_ago, :microsecond) end
+
+    # Stored: dirty — last active 10 s ago, last flushed 20 s ago.
+    {1, _} =
+      Fathom.Repo.update_all(
+        Ecto.Query.from(s in Fathom.Directory.Shard, where: s.shard_id == ^a),
+        set: [last_active_at: at.(10_000_000), last_flushed_at: at.(20_000_000)]
+      )
+
+    # Buffered in one tick: a flush 5 s ago, then an access 2 s ago (8 s after the stored touch,
+    # inside the re-touch window).
+    :ets.insert(Module.concat(Recorder, Flushes), {a, now - 5_000_000})
+    :ets.insert(Recorder, {a, now - 2_000_000})
+    Recorder.flush()
+
+    assert Enum.any?(Directory.flush_lag_report(1_000), &(&1.shard_id == a)),
+           "the shard holds a write made after its last flush but the report calls it clean"
+  end
+
   test "flushing an empty buffer is a no-op" do
     assert Recorder.flush() == 0
   end

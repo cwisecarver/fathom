@@ -183,14 +183,22 @@ defmodule Fathom.Directory.Recorder do
 
   # `deadline` is a monotonic-ms instant to stop draining at, or `:infinity` for the periodic
   # path (which has a whole interval and re-runs a second later anyway).
+  #
+  # FLUSHES BEFORE ACCESSES (expert review 2026-10-08 #24). `record_batch/1` skips a re-touch within
+  # the granularity window unless the stored `last_active_at` is at or behind `last_flushed_at` (or
+  # `cutover_at`) — the escape that keeps "dirty vs clean" exact. With accesses written first, a
+  # flush at t1 and a later access at t2 in the SAME tick lost that access: the touch was skipped
+  # against the OLD flush stamp, then the flush stamp moved past `last_active_at`, and
+  # `flush_lag_report/1` called the shard clean while it held unflushed writes from t2 — wrong
+  # until its next flush, which for a shard gone quiet may never come. Landing the flush first lets
+  # the escape see it.
   defp do_flush(deadline \\ :infinity) do
-    flush_table(@table, &Directory.record_batch/1, [:fathom, :directory, :flush], deadline) +
-      flush_table(
-        @flush_table,
-        &Directory.record_flush_batch/1,
-        [:fathom, :directory, :flush_recorded],
-        deadline
-      )
+    flush_table(
+      @flush_table,
+      &Directory.record_flush_batch/1,
+      [:fathom, :directory, :flush_recorded],
+      deadline
+    ) + flush_table(@table, &Directory.record_batch/1, [:fathom, :directory, :flush], deadline)
   end
 
   # Drain and upsert in bounded chunks (expert review 2026-07-24 #23) rather than materializing the
