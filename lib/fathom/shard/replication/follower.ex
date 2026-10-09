@@ -1656,7 +1656,54 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
-  defp apply_write(name, %Protocol.Push{} = push, new_state, mode) do
+  # AN APPEND NEVER CREATES THE WAL (expert review 2026-10-08 #21). An append extends a WAL this
+  # replica already holds; one that is missing, or shorter than the push's offset, is a replica that
+  # lost bytes it acked — a worker killed mid-install between removing the old WAL and renaming the
+  # new one in, or a `forget/2` (promotion, tenant erase) racing an in-flight push. Opening for
+  # write CREATED it, the pwrite at `offset > 0` left that many zero bytes in front — an invalid
+  # header SQLite ignores outright — and the state advanced `torn: false`, so the replica read as
+  # current and promotable while serving the `.db` alone. After a `forget`, it also put the ETS row
+  # and a WAL back for a shard this node had dropped, which nothing ever cleaned up.
+  #
+  # So: with no state row (`forget/2` deletes it first), the shard is not followed here any more —
+  # refuse `:unknown_shard` and write nothing. With state but a WAL shorter than the offset (absent
+  # counts as empty), mark the replica torn (durably) and refuse `:unknown_shard`, which makes the
+  # primary re-seed it. An append at offset 0 may still create the file: it starts with the WAL
+  # header, so what it writes is a valid WAL.
+  defp apply_write(name, %Protocol.Push{} = push, new_state, :append) do
+    case append_precondition(name, push.shard_id, push.offset) do
+      :ok ->
+        do_apply_write(name, push, new_state, :append)
+
+      :not_followed ->
+        Protocol.encode_reject(push.shard_id, :unknown_shard, 0)
+
+      :wal_missing ->
+        Logger.warning(
+          "replication: #{push.shard_id}'s replica WAL is missing or shorter than the push offset " <>
+            "#{push.offset}; marking it torn and asking for a re-seed"
+        )
+
+        case state_of(name, push.shard_id) do
+          nil -> :ok
+          prev -> put_state(name, push.shard_id, %{prev | torn: true})
+        end
+
+        Protocol.encode_reject(push.shard_id, :unknown_shard, 0)
+    end
+  end
+
+  defp apply_write(name, push, new_state, mode), do: do_apply_write(name, push, new_state, mode)
+
+  defp append_precondition(name, shard_id, offset) do
+    cond do
+      state_of(name, shard_id) == nil -> :not_followed
+      wal_bytes(wal_path(name, shard_id)) < offset -> :wal_missing
+      true -> :ok
+    end
+  end
+
+  defp do_apply_write(name, %Protocol.Push{} = push, new_state, mode) do
     path = wal_path(name, push.shard_id)
 
     written =
@@ -1742,7 +1789,7 @@ defmodule Fathom.Shard.Replication.Follower do
     key = {__MODULE__, :held_fds}
     held = Process.get(key, %{})
 
-    case held_fd(held, path) do
+    case held_fd(held, path, offset) do
       {:ok, fd, held} ->
         with :ok <- :file.pwrite(fd, offset, payload),
              :ok <- maybe_sync(fd) do
@@ -1760,21 +1807,42 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
-  defp held_fd(held, path) do
+  defp held_fd(held, path, offset) do
     case {Map.get(held, path), :file.read_file_info(path, [:raw])} do
       {{fd, inode, _used}, {:ok, info}} when elem(info, 11) == inode ->
         {:ok, fd, Map.put(held, path, {fd, inode, System.monotonic_time()})}
 
-      _stale_missing_or_none ->
+      {_stale_or_none, stat} ->
         held = drop_held(held, path)
 
-        # Creates the file if absent, like `write_frame/4`'s append mode.
-        with {:ok, fd} <- :file.open(path, [:read, :write, :raw, :binary]),
-             {:ok, info} <- :file.read_file_info(fd) do
+        # Creates a missing file ONLY for an append at offset 0, which begins with the WAL header
+        # (expert review 2026-10-08 #21). Otherwise the file must exist, and the inode is checked
+        # against the stat taken before the open — `[:read, :write]` creates a missing file, so a
+        # WAL removed in between (a `forget/2` racing this push) shows up as a different inode and
+        # the write is refused rather than landing in a fresh, headerless file.
+        expected =
+          case stat do
+            {:ok, before} -> {:ok, elem(before, 11)}
+            {:error, :enoent} when offset == 0 -> {:ok, :created}
+            {:error, _} = err -> err
+          end
+
+        with {:ok, inode} <- expected,
+             {:ok, fd} <- :file.open(path, [:read, :write, :raw, :binary]),
+             {:ok, info} <- :file.read_file_info(fd),
+             :ok <- same_inode(fd, inode, elem(info, 11)) do
           held = evict_oldest(held)
           {:ok, fd, Map.put(held, path, {fd, elem(info, 11), System.monotonic_time()})}
         end
     end
+  end
+
+  defp same_inode(_fd, :created, _got), do: :ok
+  defp same_inode(_fd, inode, inode), do: :ok
+
+  defp same_inode(fd, _expected, _got) do
+    _ = :file.close(fd)
+    {:error, :wal_replaced}
   end
 
   defp drop_held(held, path) do
