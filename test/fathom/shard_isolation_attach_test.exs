@@ -396,7 +396,7 @@ defmodule Fathom.ShardIsolationAttachTest do
       for sql <- [
             "PRAGMA main.foreign_keys=ON",
             "PRAGMA main . foreign_keys = ON",
-            "PRAGMA main.\tcache_size = -2000",
+            "PRAGMA main.\tlegacy_alter_table = OFF",
             ~s(PRAGMA "main"."foreign_keys" = ON)
           ] do
         assert {:ok, _} = ShardExecutor.execute(a, stmt(sql)),
@@ -440,7 +440,6 @@ defmodule Fathom.ShardIsolationAttachTest do
       assert {:ok, _} = ShardExecutor.execute(a, stmt("PRAGMA foreign_keys=ON"))
       assert {:ok, _} = ShardExecutor.execute(a, stmt("PRAGMA legacy_alter_table=ON"))
       assert {:ok, _} = ShardExecutor.execute(a, stmt("PRAGMA defer_foreign_keys=ON"))
-      assert {:ok, _} = ShardExecutor.execute(a, stmt("PRAGMA cache_size=-2000"))
       # Read forms are never gated.
       assert {:ok, %StmtResult{}} = ShardExecutor.execute(a, stmt("PRAGMA table_info(t)"))
       assert {:ok, %StmtResult{}} = ShardExecutor.execute(a, stmt("PRAGMA foreign_key_list(t)"))

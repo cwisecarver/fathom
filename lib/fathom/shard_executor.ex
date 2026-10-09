@@ -1605,8 +1605,15 @@ defmodule Fathom.ShardExecutor do
   # `wal_checkpoint` is a maintenance operation, not a safety defeat — it is the same
   # checkpoint the coordinator runs after each snapshot, and fathom's own durability tests
   # drive it through this path.
+  #
+  # `cache_size` is NOT here (expert review 2026-10-08 #8, measured). The `:shard_cache_size_kb`
+  # ceiling is only each connection's starting value, and every Hrana stream is its own connection
+  # with its own page cache, so a tenant of any scope raising it per stream grew node RSS with
+  # streams x cache: six streams at `cache_size=-2000000` over a 125 MB shard took RSS from 174 MB
+  # to 922 MB. Django does not set it. The bare read stays allowed; an operator who needs a client
+  # to set it can widen with `:tenant_pragma_allow`.
   @tenant_pragma_allow ~w(foreign_keys defer_foreign_keys legacy_alter_table
-                          cache_size temp_store recursive_triggers ignore_check_constraints
+                          temp_store recursive_triggers ignore_check_constraints
                           case_sensitive_like automatic_index reverse_unordered_selects
                           analysis_limit threads user_version application_id
                           wal_checkpoint incremental_vacuum shrink_memory)

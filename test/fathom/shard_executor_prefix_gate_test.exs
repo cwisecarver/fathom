@@ -203,6 +203,30 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
     assert read_pragma(oh, "hard_heap_limit") == before
   end
 
+  # Expert review 2026-10-08 #8, measured: every stream is its own connection with its own page
+  # cache, and `:shard_cache_size_kb` was only each one's starting value — a tenant raising it per
+  # stream took node RSS from 174 MB to 922 MB with six streams. Any scope could. Refused now; the
+  # bare read stays allowed.
+  test "a tenant stream cannot raise its page cache past the configured ceiling", %{
+    shard: shard,
+    handle: h
+  } do
+    {:ok, ro} = ShardExecutor.open(shard, {:ro, nil})
+    on_exit(fn -> ShardExecutor.close(ro) end)
+
+    for handle <- [h, ro] do
+      before = read_pragma(handle, "cache_size")
+
+      for sql <- ["PRAGMA cache_size = -2000000", "PRAGMA main.cache_size(-2000000)"] do
+        assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
+                 ShardExecutor.execute(handle, stmt(sql)),
+               "`#{sql}` raised a tenant stream's page cache"
+      end
+
+      assert read_pragma(handle, "cache_size") == before
+    end
+  end
+
   test "bare reads with trailing comments, and later batched statements, stay reads", %{
     handle: h
   } do
