@@ -433,23 +433,37 @@ defmodule Fathom.Directory do
   end
 
   # Same real return as the 2-arity form; the `Ecto.Changeset.t()` here was impossible too (#26).
-  @spec cutover(String.t(), non_neg_integer(), non_neg_integer() | nil) ::
+  #
+  # `used_since_live: true` is for a CRASH-FORWARD cutover (expert review 2026-10-08 #14): an earlier
+  # attempt already made the new version's bytes live and died before this stamp, so clients may
+  # have written on them in between — for a whole Oban backoff, or an hour after a crash. Stamping
+  # `last_active_at == cutover_at == now` made every one of those writes look pre-cutover, so the
+  # revert write-age guard (`last_active_at > cutover_at` ⇒ refuse unless forced) passed and an
+  # unforced revert restored the old version over them. When that window started is unknowable
+  # here, so it is treated as USED: `last_active_at` lands one microsecond past `cutover_at`, and a
+  # revert needs `force`. Over-refusing is the guard's documented safe direction. `cutover_at` stays
+  # `now` because the rollout rate counts it.
+  @spec cutover(String.t(), non_neg_integer(), non_neg_integer() | nil, keyword()) ::
           {:ok, Shard.t()} | {:error, :not_found | :status_conflict}
-  def cutover(shard_id, schema_version, retained_version) do
+  def cutover(shard_id, schema_version, retained_version, opts \\ []) do
     guarded_update_shard(
       shard_id,
-      Map.put(cutover_attrs(schema_version), :retained_version, retained_version),
+      Map.put(
+        cutover_attrs(schema_version, Keyword.get(opts, :used_since_live, false)),
+        :retained_version,
+        retained_version
+      ),
       ["active", "migrating"]
     )
   end
 
-  defp cutover_attrs(schema_version) do
+  defp cutover_attrs(schema_version, used_since_live? \\ false) do
     now = DateTime.utc_now()
 
     %{
       schema_version: schema_version,
       status: "active",
-      last_active_at: now,
+      last_active_at: if(used_since_live?, do: DateTime.add(now, 1, :microsecond), else: now),
       cutover_at: now,
       migrating_since: nil,
       # The retain intent is consumed by the cutover that records `retained_version` (#27).

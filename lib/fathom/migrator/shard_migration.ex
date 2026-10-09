@@ -178,8 +178,11 @@ defmodule Fathom.Migrator.ShardMigration do
       # copy of the post-cutover writes that backup exists to preserve (and the
       # write-age guard passes identically on a retry, so nothing else stops it).
       # The live file's own user_version is the truth: just finish the cutover (co-committing the
-      # backed-up @current object's retirement — the outbox, #5).
-      with {:ok, _} <- cutover_with_retirement(shard_id, to_version, current) do
+      # backed-up @current object's retirement — the outbox, #5). As in `finalize/2`, the restored
+      # bytes have been live since that attempt, so writes on them must not read as pre-cutover
+      # (expert review 2026-10-08 #14).
+      with {:ok, _} <-
+             cutover_with_retirement(shard_id, to_version, current, used_since_live: true) do
         warn_revert(shard_id, current, to_version, last_active)
         {:ok, %{from: current, to: to_version}}
       end
@@ -875,7 +878,9 @@ defmodule Fathom.Migrator.ShardMigration do
   defp finalize(shard_id, target) do
     prev = retained_version_for_finalize(shard_id, target)
 
-    with {:ok, _} <- cutover_with_retirement(shard_id, target, prev) do
+    # The target bytes have been live since the earlier attempt's flush, not since now — so the
+    # stamp must not hide writes made on them in between (expert review 2026-10-08 #14).
+    with {:ok, _} <- cutover_with_retirement(shard_id, target, prev, used_since_live: true) do
       {:ok, %{from: prev, to: target}}
     end
   end
@@ -928,9 +933,9 @@ defmodule Fathom.Migrator.ShardMigration do
   # #16b). Written inside this transaction rather than beside it for the same reason the retirement
   # is: a `retained_version` that outlived a rolled-back cutover would point a revert at an object
   # the shard does not have.
-  defp cutover_with_retirement(shard_id, cutover_to, retire_version) do
+  defp cutover_with_retirement(shard_id, cutover_to, retire_version, opts \\ []) do
     Repo.transaction(fn ->
-      with {:ok, row} <- Directory.cutover(shard_id, cutover_to, retire_version),
+      with {:ok, row} <- Directory.cutover(shard_id, cutover_to, retire_version, opts),
            {:ok, _job} <- Oban.insert(RetirementJob.schedule_changeset(shard_id, retire_version)) do
         row
       else

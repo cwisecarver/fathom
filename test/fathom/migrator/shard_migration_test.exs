@@ -791,6 +791,31 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert %{rows: [[2]]} = query_live!(shard, "PRAGMA user_version")
   end
 
+  # Expert review 2026-10-08 #14: a crash-forward finalize stamped `cutover_at == last_active_at ==
+  # now`, but the target bytes had been live since the earlier attempt's flush — clients wrote on
+  # them in between. Those writes then looked pre-cutover, the write-age guard passed, and an
+  # unforced revert restored v1 over them.
+  test "writes made between a crashed flush and its crash-forward cutover still block a revert",
+       %{
+         shard: shard
+       } do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, _} = ShardMigration.run(shard, 2)
+
+    # A crash between the flush (live = v2) and the cutover: the directory is back at 1 …
+    {:ok, _} = Directory.cutover(shard, 1)
+    # … and a client uses the v2 bytes before the retry finalizes.
+    {:ok, _} = Directory.resolve(shard)
+
+    assert {:ok, %{from: 1, to: 2}} = ShardMigration.run(shard, 2)
+
+    assert {:error, {:writes_since_cutover, _}} = ShardMigration.revert(shard, 1),
+           "an unforced revert discarded writes made on v2 before its crash-forward cutover"
+
+    assert %{rows: [[2]]} = query_live!(shard, "PRAGMA user_version")
+  end
+
   # Expert review 2026-09-05 #18: forward/9 retains and records against the FILE version (#22), but
   # the crash-forward finalize/2 stamped retained_version from the (possibly stale) DIRECTORY stamp.
   # With file=v3, directory behind at v1 and a retained <shard>@2 present, finalize recorded
