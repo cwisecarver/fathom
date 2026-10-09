@@ -93,6 +93,28 @@ defmodule Fathom.Shard.Replication.PushCompressTest do
       4096::64, 0::64, 11::64, 5::64, raw_len::64, shard::binary, zpayload::binary>>
   end
 
+  # Expert review 2026-10-08 #17: the follower decompresses a push BEFORE handing it to a worker,
+  # so a queued push holds its raw payload — but the reader's 16 MiB backpressure bound counted the
+  # compressed wire bytes, loosening the bound by the compression ratio. The bound must charge what
+  # the queued frame actually holds.
+  test "the follower's backpressure charges a compressed push its decoded size" do
+    wire = compressed_push() |> Protocol.encode_push() |> IO.iodata_to_binary()
+    {:ok, decoded} = Protocol.decode(wire)
+
+    assert byte_size(decoded.payload) > byte_size(wire) * 4,
+           "fixture: the payload did not compress enough to tell the two sizes apart"
+
+    assert Fathom.Shard.Replication.Follower.held_bytes(decoded, byte_size(wire)) ==
+             byte_size(decoded.payload)
+
+    # An uncompressed frame costs what it did: its wire size, which already includes the payload.
+    plain = push(wal_payload(), nil) |> Protocol.encode_push() |> IO.iodata_to_binary()
+    {:ok, plain_decoded} = Protocol.decode(plain)
+
+    assert Fathom.Shard.Replication.Follower.held_bytes(plain_decoded, byte_size(plain)) ==
+             byte_size(plain)
+  end
+
   describe "the encoder" do
     test "a push carrying a compressed payload goes out as @push_ord_lin_z and round-trips exactly" do
       p = compressed_push()

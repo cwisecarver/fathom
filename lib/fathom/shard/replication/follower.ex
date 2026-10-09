@@ -461,7 +461,7 @@ defmodule Fathom.Shard.Replication.Follower do
                 read_loop(conn)
 
               shard_id ->
-                read_loop(dispatch(conn, shard_id, frame, byte_size(bytes)))
+                read_loop(dispatch(conn, shard_id, frame, held_bytes(frame, byte_size(bytes))))
             end
 
           {:error, reason} ->
@@ -673,6 +673,24 @@ defmodule Fathom.Shard.Replication.Follower do
         other
     end
   end
+
+  # What a dispatched frame holds in its worker's mailbox, for the `@max_outstanding_bytes` bound.
+  #
+  # THE DECODED SIZE, NOT THE WIRE SIZE (expert review 2026-10-08 #17). Push payloads are zstd on the
+  # wire by default (4f3bcfe) and the reader decompresses before dispatch, so a queued push holds its
+  # whole raw payload while the bound counted the compressed bytes — loosening the 16 MiB cap c61cbe3
+  # set by the compression ratio (13.6x on TPC-B, far more for zero-filled pages), in the subsystem
+  # whose history includes multi-GiB binary OOMs. The larger of the two, so an uncompressed frame
+  # costs exactly what it did.
+  @doc false
+  @spec held_bytes(term(), non_neg_integer()) :: non_neg_integer()
+  def held_bytes(%Protocol.Push{payload: payload}, wire) when is_binary(payload),
+    do: max(wire, byte_size(payload))
+
+  def held_bytes({:seed_chunk, _id, _part, _seq, chunk}, wire) when is_binary(chunk),
+    do: max(wire, byte_size(chunk))
+
+  def held_bytes(_frame, wire), do: wire
 
   defp frame_shard_id(%Protocol.Push{shard_id: id}), do: id
   defp frame_shard_id(%Protocol.SeedBegin{shard_id: id}), do: id
