@@ -1183,105 +1183,28 @@ defmodule Fathom.Shard.Storage.S3 do
 
       result = Req.get(req(), url: url, headers: headers, into: into, retry: false)
 
-      case Process.get(fd_key) do
-        nil -> :ok
-        fd -> :ok = File.close(fd)
-      end
+      # A buffered write's error surfaces HERE (see the open above), and it used to be a hard
+      # `:ok =` match — fail-closed, but as a raise: it skipped the retry below and crashed a
+      # coordinator open that called this outside a rescue (expert review 2026-10-08 #26). Now it is
+      # an error result like any other torn transfer, retried with a fresh temp.
+      fd = Process.delete(fd_key)
 
-      case result do
-        # An object marked with an encoding this node cannot perform (#38). FAIL THE PULL — the
-        # temp holds nothing usable and handing raw bytes to SQLite as a database is precisely
-        # the correctness incident the marker exists to prevent. Not retryable: the marker will
-        # be the same next time. Upgrade the node instead.
-        # The body would not decode under its own marker — corrupt or torn in transit. Same
-        # handling as a checksum mismatch: a fresh temp and the whole download again.
-        {:ok, %{private: %{fathom_decode_error: {:error, reason}}}} ->
-          Logger.warning("shard object at #{url} did not decode (#{inspect(reason)}); retrying")
+      case close_download_temp(fd) do
+        :ok ->
+          handle_download_result(result, {url, local_path, headers, opts, attempts_left},
+            tmp: tmp,
+            opened?: fd != nil
+          )
 
+        {:error, reason} ->
           retry_or(
-            {:error, {:undecodable_body, reason}},
+            {:error, {:temp_close_failed, reason}},
             url,
             local_path,
             headers,
             opts,
             attempts_left
           )
-
-        {:ok, %{private: %{fathom_enc_error: {:error, reason}}}} ->
-          Logger.error(
-            "shard object at #{url} is stored with an encoding this node cannot decode " <>
-              "(#{inspect(reason)}); refusing the pull rather than serving undecodable bytes " <>
-              "as a database. Upgrade this node to a build that supports it."
-          )
-
-          {:error, reason}
-
-        {:ok, %{status: 200} = resp} ->
-          cond do
-            # A brand-new steal sentinel (round-2 #7): not shard bytes — never
-            # promote it into place. The after-block drops the temp; the caller
-            # carries the sentinel's etag as the brand-new shard's first-flush fence.
-            sentinel_response?(resp.headers) ->
-              {:sentinel, etag(resp.headers)}
-
-            true ->
-              # A 200 with an empty body never opened the temp — materialize the empty
-              # file so the promote below behaves exactly as the eager-open code did.
-              if Process.get(fd_key) == nil, do: File.touch(tmp)
-
-              # A zero-length body is NEVER a fathom object: every flush writes a non-empty
-              # database AND an @md5_meta hash, and a brand-new shard is a 404 (:absent), not an
-              # empty 200. Without this floor a foreign/corrupt object carrying a multipart-shaped
-              # etag and no metadata makes verify_integrity a no-op (verify_md5 skips non-MD5
-              # etags), and the empty temp is fsynced + promoted as a valid empty SQLite database.
-              # The tenant is then served an empty db and the next flush PUTs the empty file over
-              # the real stored object — an unrecoverable wipe (expert review 2026-08-31 #6).
-              if empty_body?(tmp) do
-                Logger.error(
-                  "shard object at #{url} returned a zero-length body; refusing to promote it " <>
-                    "as an empty database (no integrity metadata to verify it against)"
-                )
-
-                {:error, :empty_object}
-              else
-                digest = :crypto.hash_final(resp.private[:fathom_md5] || :crypto.hash_init(:md5))
-
-                # Prefer the etag-form-independent metadata hash (#17); fall back to the etag-MD5
-                # check when the object predates the metadata or came from an unfenced copy path.
-                case verify_decoded(digest, resp.headers) do
-                  :ok ->
-                    case Storage.promote_temp(tmp, local_path) do
-                      :ok -> {:ok, etag(resp.headers)}
-                      {:error, _} = error -> error
-                    end
-
-                  # A torn transfer produced bytes that don't match the object's etag — a
-                  # transient corruption, not a permanent one; retry the whole download with a
-                  # fresh temp rather than failing the pull outright (expert review #1).
-                  {:error, :checksum_mismatch} = error ->
-                    retry_or(error, url, local_path, headers, opts, attempts_left)
-
-                  # Encoded but carrying no plaintext digest (see verify_decoded/2): nothing to
-                  # check the decoded bytes against, and a retry reads the same headers.
-                  {:error, {:missing_plain_digest, _}} = error ->
-                    error
-                end
-              end
-          end
-
-        {:ok, %{status: 304}} ->
-          if opts[:allow_304], do: :unchanged, else: {:error, {:s3_get_status, 304}}
-
-        {:ok, %{status: 404}} ->
-          :absent
-
-        {:ok, %{status: status}} ->
-          {:error, {:s3_get_status, status}}
-
-        # A transport error (possibly mid-body, so the temp may hold partial bytes):
-        # drop the partial temp and retry the whole download with a fresh one.
-        {:error, reason} ->
-          retry_or({:error, reason}, url, local_path, headers, opts, attempts_left)
       end
     after
       case Process.delete(fd_key) do
@@ -1293,6 +1216,111 @@ defmodule Fathom.Shard.Storage.S3 do
       Codec.release(Process.delete({__MODULE__, :dl_z, tmp}))
 
       File.rm(tmp)
+    end
+  end
+
+  @doc false
+  @spec close_download_temp(term()) :: :ok | {:error, term()}
+  def close_download_temp(nil), do: :ok
+  def close_download_temp(fd), do: File.close(fd)
+
+  defp handle_download_result(result, {url, local_path, headers, opts, attempts_left}, temp) do
+    tmp = Keyword.fetch!(temp, :tmp)
+
+    case result do
+      # An object marked with an encoding this node cannot perform (#38). FAIL THE PULL — the
+      # temp holds nothing usable and handing raw bytes to SQLite as a database is precisely
+      # the correctness incident the marker exists to prevent. Not retryable: the marker will
+      # be the same next time. Upgrade the node instead.
+      # The body would not decode under its own marker — corrupt or torn in transit. Same
+      # handling as a checksum mismatch: a fresh temp and the whole download again.
+      {:ok, %{private: %{fathom_decode_error: {:error, reason}}}} ->
+        Logger.warning("shard object at #{url} did not decode (#{inspect(reason)}); retrying")
+
+        retry_or(
+          {:error, {:undecodable_body, reason}},
+          url,
+          local_path,
+          headers,
+          opts,
+          attempts_left
+        )
+
+      {:ok, %{private: %{fathom_enc_error: {:error, reason}}}} ->
+        Logger.error(
+          "shard object at #{url} is stored with an encoding this node cannot decode " <>
+            "(#{inspect(reason)}); refusing the pull rather than serving undecodable bytes " <>
+            "as a database. Upgrade this node to a build that supports it."
+        )
+
+        {:error, reason}
+
+      {:ok, %{status: 200} = resp} ->
+        cond do
+          # A brand-new steal sentinel (round-2 #7): not shard bytes — never
+          # promote it into place. The after-block drops the temp; the caller
+          # carries the sentinel's etag as the brand-new shard's first-flush fence.
+          sentinel_response?(resp.headers) ->
+            {:sentinel, etag(resp.headers)}
+
+          true ->
+            # A 200 with an empty body never opened the temp — materialize the empty
+            # file so the promote below behaves exactly as the eager-open code did.
+            unless Keyword.fetch!(temp, :opened?), do: File.touch(tmp)
+
+            # A zero-length body is NEVER a fathom object: every flush writes a non-empty
+            # database AND an @md5_meta hash, and a brand-new shard is a 404 (:absent), not an
+            # empty 200. Without this floor a foreign/corrupt object carrying a multipart-shaped
+            # etag and no metadata makes verify_integrity a no-op (verify_md5 skips non-MD5
+            # etags), and the empty temp is fsynced + promoted as a valid empty SQLite database.
+            # The tenant is then served an empty db and the next flush PUTs the empty file over
+            # the real stored object — an unrecoverable wipe (expert review 2026-08-31 #6).
+            if empty_body?(tmp) do
+              Logger.error(
+                "shard object at #{url} returned a zero-length body; refusing to promote it " <>
+                  "as an empty database (no integrity metadata to verify it against)"
+              )
+
+              {:error, :empty_object}
+            else
+              digest = :crypto.hash_final(resp.private[:fathom_md5] || :crypto.hash_init(:md5))
+
+              # Prefer the etag-form-independent metadata hash (#17); fall back to the etag-MD5
+              # check when the object predates the metadata or came from an unfenced copy path.
+              case verify_decoded(digest, resp.headers) do
+                :ok ->
+                  case Storage.promote_temp(tmp, local_path) do
+                    :ok -> {:ok, etag(resp.headers)}
+                    {:error, _} = error -> error
+                  end
+
+                # A torn transfer produced bytes that don't match the object's etag — a
+                # transient corruption, not a permanent one; retry the whole download with a
+                # fresh temp rather than failing the pull outright (expert review #1).
+                {:error, :checksum_mismatch} = error ->
+                  retry_or(error, url, local_path, headers, opts, attempts_left)
+
+                # Encoded but carrying no plaintext digest (see verify_decoded/2): nothing to
+                # check the decoded bytes against, and a retry reads the same headers.
+                {:error, {:missing_plain_digest, _}} = error ->
+                  error
+              end
+            end
+        end
+
+      {:ok, %{status: 304}} ->
+        if opts[:allow_304], do: :unchanged, else: {:error, {:s3_get_status, 304}}
+
+      {:ok, %{status: 404}} ->
+        :absent
+
+      {:ok, %{status: status}} ->
+        {:error, {:s3_get_status, status}}
+
+      # A transport error (possibly mid-body, so the temp may hold partial bytes):
+      # drop the partial temp and retry the whole download with a fresh one.
+      {:error, reason} ->
+        retry_or({:error, reason}, url, local_path, headers, opts, attempts_left)
     end
   end
 
