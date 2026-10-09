@@ -438,7 +438,10 @@ defmodule Fathom.Shard.Replication.Follower do
       binding: Protocol.binding(),
       nworkers: max(Application.get_env(:fathom, :replication_follower_workers, 8), 1),
       workers: %{},
-      outstanding: 0
+      outstanding: 0,
+      # Set by `close_connection/1` before it stops the workers; each worker checks it before
+      # taking a frame. See `worker_loop/5`.
+      closed: :atomics.new(1, [])
     }
 
     read_loop(conn)
@@ -487,21 +490,22 @@ defmodule Fathom.Shard.Replication.Follower do
         {pid, conn}
 
       _ ->
-        reader = self()
-        %{sock: sock, name: name, binding: binding} = conn
-
-        # LINKED: a worker that crashes takes the connection down (the primary reconnects and its
-        # waiters are failed `:disconnected`), rather than leaving its shards silently unanswered.
-        # `fullsweep_after: 0` because a worker, unlike the old loop, sits in `receive` holding
-        # references to frame binaries — the Shipper's measured retention problem in miniature.
-        pid =
-          :erlang.spawn_opt(
-            fn -> worker_init(sock, name, binding, reader) end,
-            [:link, fullsweep_after: 0]
-          )
-
+        %{sock: sock, name: name, binding: binding, closed: closed} = conn
+        pid = spawn_worker(sock, name, binding, self(), closed)
         {pid, %{conn | workers: Map.put(conn.workers, index, pid)}}
     end
+  end
+
+  # LINKED: a worker that crashes takes the connection down (the primary reconnects and its waiters
+  # are failed `:disconnected`), rather than leaving its shards silently unanswered.
+  # `fullsweep_after: 0` because a worker, unlike the old loop, sits in `receive` holding references
+  # to frame binaries — the Shipper's measured retention problem in miniature.
+  @doc false
+  def spawn_worker(sock, name, binding, reader, closed) do
+    :erlang.spawn_opt(
+      fn -> worker_init(sock, name, binding, reader, closed) end,
+      [:link, fullsweep_after: 0]
+    )
   end
 
   # Block until enough dispatched work has finished to read again.
@@ -525,6 +529,9 @@ defmodule Fathom.Shard.Replication.Follower do
   # killed after `@worker_stop_ms`, which leaves its seed temps for the next seed of that shard to
   # replace — the same outcome a crashed handler had before.
   defp close_connection(conn) do
+    # Before the :stop messages, so a worker with frames still queued stops at its next one rather
+    # than applying them all first (see `worker_loop/5`).
+    :atomics.put(conn.closed, 1, 1)
     :gen_tcp.close(conn.sock)
 
     refs =
@@ -549,19 +556,35 @@ defmodule Fathom.Shard.Replication.Follower do
     end)
   end
 
-  defp worker_init(sock, name, binding, reader) do
+  defp worker_init(sock, name, binding, reader, closed) do
     # Replies are sealed with this connection's binding, which lives in the process dictionary of
     # whoever encodes them (see `Protocol.seal/1`).
     Protocol.adopt_binding(binding)
-    worker_loop(sock, name, reader, %{})
+    worker_loop(sock, name, reader, closed, %{})
   end
 
-  defp worker_loop(sock, name, reader, seeds) do
+  # A CLOSED CONNECTION'S QUEUED FRAMES ARE DROPPED, NOT APPLIED (expert review 2026-10-08 #5).
+  # `:stop` sits BEHIND every frame already in the mailbox — up to `@max_outstanding_bytes` of them —
+  # so a worker used to apply them all before it saw it, for up to `@worker_stop_ms`, while the
+  # primary had already reconnected and was re-sending the same shards to a NEW connection's worker.
+  # Nothing serializes one shard across two connections, so the old worker could truncate a WAL the
+  # new one had just appended to and acked, or roll `next_offset` back. Dropping is safe: those
+  # frames' replies could never be sent (the socket is closed), so the primary counts none of them
+  # and re-sends from its un-advanced position.
+  #
+  # This narrows the overlap to the ONE frame a worker may be in the middle of — what it was before
+  # per-shard workers (c61cbe3). Closing it entirely needs per-shard serialization across
+  # connections, which is parked in the review's progress file.
+  defp worker_loop(sock, name, reader, closed, seeds) do
     receive do
       {:frame, frame, size} ->
-        seeds = handle_frame(sock, name, seeds, frame)
-        send(reader, {:frame_done, size})
-        worker_loop(sock, name, reader, seeds)
+        if :atomics.get(closed, 1) == 1 do
+          discard_seeds(seeds)
+        else
+          seeds = handle_frame(sock, name, seeds, frame)
+          send(reader, {:frame_done, size})
+          worker_loop(sock, name, reader, closed, seeds)
+        end
 
       :stop ->
         discard_seeds(seeds)
