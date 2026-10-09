@@ -70,7 +70,8 @@ defmodule Fathom.Snapshots.RetentionJob do
     results =
       n
       |> Directory.sample_for_retention()
-      |> Task.async_stream(&sweep_one(&1.shard_id, policy, now, dry_run?),
+      |> Task.async_stream(
+        fn %{shard_id: id} -> {id, sweep_one(id, policy, now, dry_run?)} end,
         max_concurrency: concurrency(),
         timeout: @sweep_timeout_ms,
         on_timeout: :kill_task,
@@ -78,8 +79,22 @@ defmodule Fathom.Snapshots.RetentionJob do
       )
       |> Enum.map(fn
         {:ok, result} -> result
-        {:exit, _reason} -> %{kept: 0, dropped: 0, ineligible: 0, errors: 1}
+        {:exit, _reason} -> {nil, %{kept: 0, dropped: 0, ineligible: 0, errors: 1}}
       end)
+
+    # Advance the rotation past every shard swept cleanly (expert review 2026-10-08 #19). One that
+    # errored or timed out is not stamped, so it stays at the head and is retried next run. A dry
+    # run deletes nothing, so it does not count as a sweep.
+    unless dry_run? do
+      results
+      |> Enum.flat_map(fn
+        {id, %{errors: 0}} when is_binary(id) -> [id]
+        _ -> []
+      end)
+      |> Directory.record_retention(now)
+    end
+
+    results = Enum.map(results, fn {_id, result} -> result end)
 
     totals =
       Enum.reduce(results, %{kept: 0, dropped: 0, ineligible: 0, errors: 0}, fn r, acc ->

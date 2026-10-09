@@ -81,6 +81,8 @@ defmodule Fathom.Directory.Shard do
     # (ASC NULLS FIRST) and skips shards whose `last_flushed_at` has not moved since, so a cold
     # tenant is never re-snapshotted for bytes that did not change.
     field :last_snapshot_at, :utc_datetime_usec
+    # The retention sweep's rotation key (expert review 2026-10-08 #19).
+    field :last_retention_at, :utc_datetime_usec
 
     timestamps(type: :utc_datetime_usec)
   end

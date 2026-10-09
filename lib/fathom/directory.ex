@@ -356,22 +356,44 @@ defmodule Fathom.Directory do
   end
 
   @doc """
-  Active shards that have been snapshotted at least once, least-recently-*expired* first (#18).
+  Active shards that have been snapshotted at least once, least-recently-*swept* first (#18).
 
-  The retention sweep's rotation. Keyed off `last_snapshot_at` rather than a separate column
-  because a shard that is being snapshotted is exactly the one accumulating snapshots to expire,
-  and a second timestamp would be one more thing to keep consistent for no gain.
+  The retention sweep's rotation, keyed on its OWN stamp, `last_retention_at`, NULLs first (expert
+  review 2026-10-08 #19). It used to be keyed off `last_snapshot_at` on the reasoning that a shard
+  being snapshotted is the one accumulating snapshots to expire — but that stamp moves only on a
+  new snapshot, so the coldest once-snapshotted shards held the head of the order forever, every
+  run re-swept them, and the hot shards that actually accumulate snapshots sorted last and were
+  never reached once more than `n` shards had any. `record_retention/2` stamps each swept shard, so
+  the rotation now visits all of them.
   """
   @spec sample_for_retention(pos_integer()) :: [%{shard_id: String.t()}]
   def sample_for_retention(n) when is_integer(n) and n > 0 do
     from(s in Shard,
       where: s.status == "active",
       where: not is_nil(s.last_snapshot_at),
-      order_by: [asc: s.last_snapshot_at],
+      order_by: [asc_nulls_first: s.last_retention_at, asc: s.last_snapshot_at],
       limit: ^n,
       select: %{shard_id: s.shard_id}
     )
     |> Repo.all()
+  end
+
+  @doc """
+  Stamps `last_retention_at` on the shards a retention sweep visited (expert review 2026-10-08 #19),
+  moving them to the back of `sample_for_retention/1`'s rotation. The caller passes only shards whose
+  sweep completed, so one that errored stays at the head and is retried next run. Returns rows
+  updated.
+  """
+  @spec record_retention([String.t()], DateTime.t()) :: non_neg_integer()
+  def record_retention(shard_ids, at \\ DateTime.utc_now())
+  def record_retention([], _at), do: 0
+
+  def record_retention(shard_ids, at) when is_list(shard_ids) do
+    {count, _} =
+      from(s in Shard, where: s.shard_id in ^shard_ids)
+      |> Repo.update_all(set: [last_retention_at: at, updated_at: DateTime.utc_now()])
+
+    count
   end
 
   @doc """

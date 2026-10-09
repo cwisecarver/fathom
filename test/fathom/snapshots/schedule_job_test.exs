@@ -169,6 +169,59 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
     end
   end
 
+  # Expert review 2026-10-08 #19: the retention sweep took the n shards with the OLDEST
+  # `last_snapshot_at` and stamped nothing, so the same coldest shards — nothing to expire — headed
+  # every run, and the hot shard accumulating snapshots (newest `last_snapshot_at`) was never reached
+  # once more than n shards had any. Storage grew without bound under a green `dropped: 0`.
+  describe "retention rotation" do
+    test "every snapshotted shard is swept within ceil(count / n) runs, hot ones included" do
+      now = DateTime.utc_now()
+      cold = for i <- 1..4, do: "retrot_cold_#{i}_#{System.unique_integer([:positive])}"
+      hot = "retrot_hot_#{System.unique_integer([:positive])}"
+
+      for {id, age_h} <- Enum.zip(cold, [40, 30, 20, 10]) ++ [{hot, 0}] do
+        {:ok, _} = Directory.resolve(id)
+        1 = Directory.record_snapshot(id, DateTime.add(now, -age_h * 3600, :second))
+      end
+
+      prev_storage = Application.get_env(:fathom, :shard_storage)
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      test_pid = self()
+
+      Application.put_env(
+        :fathom,
+        :faulty_before,
+        {:list_snapshots, fn id -> send(test_pid, {:swept, id}) end}
+      )
+
+      on_exit(fn ->
+        Application.delete_env(:fathom, :faulty_before)
+
+        if prev_storage,
+          do: Application.put_env(:fathom, :shard_storage, prev_storage),
+          else: Application.delete_env(:fathom, :shard_storage)
+      end)
+
+      # 5 snapshotted shards, 2 per run: three runs must reach all of them.
+      for _ <- 1..3, do: {:ok, _} = RetentionJob.run(2, %{weekly: 1})
+
+      swept = collect_swept(MapSet.new())
+
+      assert hot in swept,
+             "the hot shard was never swept: #{inspect(MapSet.to_list(swept))}"
+
+      assert MapSet.subset?(MapSet.new(cold), swept)
+    end
+  end
+
+  defp collect_swept(acc) do
+    receive do
+      {:swept, id} -> collect_swept(MapSet.put(acc, id))
+    after
+      0 -> acc
+    end
+  end
+
   describe "selection" do
     test "snapshots a shard that has flushed and never been snapshotted", %{id: id} do
       seed(id, ["CREATE TABLE t (v INTEGER)", "INSERT INTO t VALUES (1)"])
