@@ -4,7 +4,12 @@ defmodule Fathom.Migrator.LedgerTest do
   name extraction that feeds it. The classification is pure, so every verdict is pinned here
   without a shard; `shard_migration_test.exs` drives it through real migrations.
   """
-  use Fathom.DataCase, async: true
+  # NOT async. Several tests here insert release rows at versions 1 and 2, and `shard_migrations`
+  # has a unique index on `version`. `migrator_test.exs` (async) inserts the same versions, and two
+  # sandboxed transactions inserting the same unique keys in different orders DEADLOCK in Postgres
+  # (40P01) — reproducible with `mix test --seed 427150` (2026-10-09). The sandbox isolates what each
+  # test sees, not the index locks taken while inserting.
+  use Fathom.DataCase, async: false
 
   import Ecto.Query
 
