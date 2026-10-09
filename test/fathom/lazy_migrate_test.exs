@@ -170,6 +170,61 @@ defmodule Fathom.LazyMigrateTest do
     ShardExecutor.close(conn)
   end
 
+  # Expert review 2026-10-08 #16 (a): `:inline` read the directory unrescued on every checkout, so a
+  # Postgres outage raised through `Shards.checkout/1` and failed every request on every shard —
+  # while the rest of the data path is built never to fail on the directory. The sandbox in manual
+  # mode with nothing checked out makes every Repo call raise, the same shape as an exhausted pool.
+  test "migrate_on_touch: :inline still serves when the directory is unreachable", %{
+    shard: shard
+  } do
+    Application.put_env(:fathom, :migrate_on_touch, :inline)
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    Migrator.HeadCache.refresh()
+
+    Ecto.Adapters.SQL.Sandbox.mode(Fathom.Repo, :manual)
+
+    result =
+      try do
+        ShardExecutor.open(shard)
+      after
+        :ok = Ecto.Adapters.SQL.Sandbox.checkout(Fathom.Repo)
+        Ecto.Adapters.SQL.Sandbox.mode(Fathom.Repo, {:shared, self()})
+      end
+
+    assert {:ok, conn} = result, "a directory outage failed the checkout: #{inspect(result)}"
+    assert {:ok, %StmtResult{cols: ["id", "name"]}} = exec(conn, "SELECT * FROM app_thing")
+    ShardExecutor.close(conn)
+  end
+
+  # Expert review 2026-10-08 #16 (b): a laggard already OPEN here was drained inline on the next
+  # checkout. With a stream still held, the drain held the coordinator `draining` — refusing that
+  # checkout and every sibling's — for the whole drain window, then aborted `:busy` and failed the
+  # checkout, on every new stream. An open shard is served and handed to the async rollout.
+  test "migrate_on_touch: :inline serves a shard already open and enqueues its migration", %{
+    shard: shard
+  } do
+    seed_v1!(shard)
+    {:ok, held} = ShardExecutor.open(shard)
+    on_exit(fn -> ShardExecutor.close(held) end)
+
+    Application.put_env(:fathom, :migrate_on_touch, :inline)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    Migrator.HeadCache.refresh()
+
+    {us, result} = :timer.tc(fn -> ShardExecutor.open(shard) end)
+
+    assert {:ok, conn} = result,
+           "a second stream on an open laggard was refused: #{inspect(result)}"
+
+    assert us < 2_000_000,
+           "the second stream waited #{div(us, 1000)} ms — it sat behind an inline drain"
+
+    assert {:ok, %{schema_version: 1}} = Directory.get(shard)
+    assert_enqueued(worker: ShardMigrationJob, args: %{shard_id: shard, target: 2})
+    ShardExecutor.close(conn)
+  end
+
   # The reserved capture template must NEVER be migrate-on-touched. Django migrates it directly, so
   # its directory stamp never advances and it always reads as a laggard — but replaying its own
   # captured DDL back onto itself is "already exists", and a drain racing an in-flight

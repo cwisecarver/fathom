@@ -472,67 +472,105 @@ defmodule Fathom.Shards do
     :exit, _ -> :ok
   end
 
+  # TWO WAYS THIS USED TO FAIL A CHECKOUT THAT `:async` WOULD HAVE SERVED (expert review 2026-10-08
+  # #16):
+  #
+  #   * A Postgres error. `behind?/2` reads the directory, unrescued, on every checkout, so a blip or
+  #     pool exhaustion raised through `checkout/1` and failed every request on every shard of the
+  #     node — while the rest of the data path is built never to fail on the directory. Rescued now,
+  #     degrading to the async hand-off (which is itself best-effort).
+  #   * A shard already OPEN here. The inline migration drains it, and a drain with a stream still
+  #     checked out holds the coordinator `draining` — refusing every sibling checkout — for the
+  #     whole drain window, then aborts `:busy`, which failed this checkout too. For a busy laggard
+  #     that repeated on every new stream. An open shard is handed to the async rollout and served,
+  #     and a `:shard_busy` retry degrades the same way; inline migration is for the cold touch.
   defp lazy_migrate(shard_id) do
     # HEAD from the TTL cache (persistent_term), not a per-checkout Postgres
     # `max(version)` — see Fathom.Migrator.HeadCache.
     head = Fathom.Migrator.HeadCache.get()
 
-    if head > 0 and behind?(shard_id, head) do
-      case Fathom.Migrator.ShardMigration.run(shard_id, head) do
-        :ok ->
-          :ok
+    cond do
+      head == 0 -> :ok
+      Registry.lookup(@registry, shard_id) != [] -> enqueue_migrate_on_touch(shard_id)
+      behind?(shard_id, head) -> run_inline_migration(shard_id, head)
+      true -> :ok
+    end
+  rescue
+    e ->
+      Logger.warning(
+        "shard #{shard_id}: inline migrate-on-touch could not run (#{Exception.message(e)}); " <>
+          "serving the shard at its current version and handing it to the async rollout"
+      )
 
-        {:ok, _} ->
-          :ok
+      enqueue_migrate_on_touch(shard_id)
+  catch
+    :exit, reason ->
+      Logger.warning(
+        "shard #{shard_id}: inline migrate-on-touch could not run (#{inspect(reason)}); " <>
+          "serving the shard at its current version and handing it to the async rollout"
+      )
 
-        # Nothing stored to migrate yet: a brand-new shard was born empty (or, with
-        # :fork_from_template enabled, already at HEAD via maybe_fork_novel/1) and
-        # hasn't flushed — there is nothing behind HEAD to copy.
-        {:error, :no_live_object} ->
-          :ok
+      enqueue_migrate_on_touch(shard_id)
+  end
 
-        # HEAD dropped (a yank) between this node's cache refresh and the run
-        # (round-2 #23): the target no longer exists, and serving the shard at its
-        # OLD version is exactly correct — never fail the client checkout for a
-        # version the fleet just reverted away from.
-        {:error, {:unknown_version, _}} ->
-          :ok
+  defp run_inline_migration(shard_id, head) do
+    case Fathom.Migrator.ShardMigration.run(shard_id, head) do
+      :ok ->
+        :ok
 
-        # Another worker holds it / it's busy — the caller retries.
-        {:retry, reason} ->
-          {:error, {:shard_migrating, reason}}
+      {:ok, _} ->
+        :ok
 
-        # A migration that FAILED (bad captured SQL, a shard whose schema was advanced out of band,
-        # anything deterministic) used to fail the CHECKOUT, which takes the tenant completely
-        # offline — the client sees an opaque stream error on every request, forever, because the
-        # next checkout retries the same doomed copy. That is the worst possible response: the shard
-        # is intact at its current version, and serving vN-1 is safe by the same expand-contract
-        # argument that makes `:off` and `:async` correct modes. So degrade to exactly what `:async`
-        # does — hand the shard to the async rollout (which owns retry and quarantine) and serve it
-        # now — instead of an outage plus a multi-second failed copy on every request.
-        #
-        # Found live 2026-07-31: a demo fleet whose tenants had been provisioned by a direct
-        # per-shard `manage.py migrate` (so their schema was ahead of fathom's stamp) had every one
-        # of its pages fail with STREAM_NOT_FOUND the moment a version was released, because the
-        # replay hit "table already exists" on each page view.
-        {:error, reason} ->
-          Logger.error(
-            "shard #{shard_id}: inline migrate-on-touch to v#{head} FAILED (#{inspect(reason)}); " <>
-              "serving the shard at its current version and handing it to the async rollout. If " <>
-              "this repeats, the shard's schema is likely ahead of its fathom version stamp — a " <>
-              "direct `manage.py migrate` against a tenant does that (see :block_tenant_ddl)."
-          )
+      # Nothing stored to migrate yet: a brand-new shard was born empty (or, with
+      # :fork_from_template enabled, already at HEAD via maybe_fork_novel/1) and
+      # hasn't flushed — there is nothing behind HEAD to copy.
+      {:error, :no_live_object} ->
+        :ok
 
-          :telemetry.execute(
-            [:fathom, :migrator, :inline_migrate_failed],
-            %{count: 1},
-            %{shard_id: shard_id, target: head}
-          )
+      # HEAD dropped (a yank) between this node's cache refresh and the run
+      # (round-2 #23): the target no longer exists, and serving the shard at its
+      # OLD version is exactly correct — never fail the client checkout for a
+      # version the fleet just reverted away from.
+      {:error, {:unknown_version, _}} ->
+        :ok
 
-          enqueue_migrate_on_touch(shard_id)
-      end
-    else
-      :ok
+      # Streams opened on it between the check above and the drain: serve it, hand it to the
+      # async rollout (see the comment on lazy_migrate/1).
+      {:retry, :shard_busy} ->
+        enqueue_migrate_on_touch(shard_id)
+
+      # Another worker holds it — the caller retries.
+      {:retry, reason} ->
+        {:error, {:shard_migrating, reason}}
+
+      # A migration that FAILED (bad captured SQL, a shard whose schema was advanced out of band,
+      # anything deterministic) used to fail the CHECKOUT, which takes the tenant completely
+      # offline — the client sees an opaque stream error on every request, forever, because the
+      # next checkout retries the same doomed copy. That is the worst possible response: the shard
+      # is intact at its current version, and serving vN-1 is safe by the same expand-contract
+      # argument that makes `:off` and `:async` correct modes. So degrade to exactly what `:async`
+      # does — hand the shard to the async rollout (which owns retry and quarantine) and serve it
+      # now — instead of an outage plus a multi-second failed copy on every request.
+      #
+      # Found live 2026-07-31: a demo fleet whose tenants had been provisioned by a direct
+      # per-shard `manage.py migrate` (so their schema was ahead of fathom's stamp) had every one
+      # of its pages fail with STREAM_NOT_FOUND the moment a version was released, because the
+      # replay hit "table already exists" on each page view.
+      {:error, reason} ->
+        Logger.error(
+          "shard #{shard_id}: inline migrate-on-touch to v#{head} FAILED (#{inspect(reason)}); " <>
+            "serving the shard at its current version and handing it to the async rollout. If " <>
+            "this repeats, the shard's schema is likely ahead of its fathom version stamp — a " <>
+            "direct `manage.py migrate` against a tenant does that (see :block_tenant_ddl)."
+        )
+
+        :telemetry.execute(
+          [:fathom, :migrator, :inline_migrate_failed],
+          %{count: 1},
+          %{shard_id: shard_id, target: head}
+        )
+
+        enqueue_migrate_on_touch(shard_id)
     end
   end
 
