@@ -72,8 +72,7 @@ defmodule Fathom.Migrator.RevertJob do
         climb_back(shard_id, landing, to_version)
 
       {:retry, reason} ->
-        Logger.info("shard #{shard_id}: revert deferred (#{inspect(reason)})")
-        {:snooze, 5}
+        handle_retry(job, shard_id, landing, reason)
 
       # The force-guard refused (finding #13): the shard was written since its cutover, so the
       # revert would discard tenant data. Deterministic — retrying can only see MORE writes —
@@ -159,6 +158,37 @@ defmodule Fathom.Migrator.RevertJob do
       {:error, reason} ->
         handle_error(job, shard_id, reason)
     end
+  end
+
+  # A busy shard or a held lease. Retried forever, as for a forward migration — both clear on their
+  # own — but PACED and VISIBLE the way `ShardMigrationJob` already is (expert review 2026-10-08
+  # #20). This was a flat `{:snooze, 5}` logged at `:info`: every attempt drains the shard, and a
+  # drain refuses new checkouts until it gives up, so during a fleet revert — the emergency path — a
+  # hot tenant with a persistent connection spent about half its time refusing opens, indefinitely
+  # and silently. Now the snooze backs off (capped), and past `:migration_stall_after_ms` the job logs
+  # a warning and emits `[:fathom, :migrator, :migration_stalled]` with `kind: :revert`, and
+  # `Migrator.status/0`'s `stalled` counts it.
+  defp handle_retry(%Oban.Job{attempt: attempt, inserted_at: inserted_at}, shard_id, to, reason) do
+    stalled_for_ms = DateTime.diff(DateTime.utc_now(), inserted_at, :millisecond)
+
+    if stalled_for_ms >= ShardMigrationJob.stall_after_ms() do
+      Logger.warning(
+        "shard #{shard_id}: revert to v#{to} STALLED — deferred for #{div(stalled_for_ms, 1000)}s " <>
+          "over #{attempt} attempts (#{inspect(reason)}). It keeps retrying, and each attempt " <>
+          "drains the shard; check for a stream that never closes or a lease held by a " <>
+          "coordinator that no longer exists (`Fathom.Shard.Storage.lease_holder/1`)."
+      )
+
+      :telemetry.execute(
+        [:fathom, :migrator, :migration_stalled],
+        %{stalled_for_ms: stalled_for_ms, attempt: attempt},
+        %{shard_id: shard_id, target: to, reason: reason, kind: :revert}
+      )
+    else
+      Logger.info("shard #{shard_id}: revert deferred (#{inspect(reason)})")
+    end
+
+    {:snooze, ShardMigrationJob.snooze_seconds(attempt)}
   end
 
   # WHICH VERSION THIS SHARD CAN ACTUALLY BE RESTORED TO (expert review 2026-08-24 #16b).

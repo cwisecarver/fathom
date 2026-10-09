@@ -966,8 +966,10 @@ defmodule Fathom.Migrator do
   defp stalled_count do
     cutoff = DateTime.add(DateTime.utc_now(), -stall_after_ms(), :millisecond)
 
+    # RevertJob too (expert review 2026-10-08 #20): a revert deferred on a busy shard snoozes the
+    # same way, and during an emergency rollback is the deferral an operator most needs to see.
     from(j in Job,
-      where: j.worker == "Fathom.Migrator.ShardMigrationJob",
+      where: j.worker in ["Fathom.Migrator.ShardMigrationJob", "Fathom.Migrator.RevertJob"],
       where: j.state in ["scheduled", "available", "retryable", "executing"],
       where: j.inserted_at < ^cutoff
     )

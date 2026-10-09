@@ -206,13 +206,20 @@ defmodule Fathom.Migrator.ShardMigrationJob do
   # 5s forever; at the 300-tenant rig scale that is pure load against a condition that is not going
   # to clear on this tick. Capped rather than unbounded so a shard whose lease DOES free up is still
   # picked up promptly.
-  defp snooze_seconds(attempt) when attempt <= 1, do: @snooze_seconds
+  #
+  # Public (`@doc false`) because `RevertJob` paces its own busy/held deferrals the same way (expert
+  # review 2026-10-08 #20).
+  @doc false
+  @spec snooze_seconds(integer()) :: pos_integer()
+  def snooze_seconds(attempt) when attempt <= 1, do: @snooze_seconds
 
-  defp snooze_seconds(attempt) do
+  def snooze_seconds(attempt) do
     min(@snooze_seconds * Integer.pow(2, min(attempt - 1, 8)), @max_snooze_seconds)
   end
 
-  defp stall_after_ms,
+  @doc false
+  @spec stall_after_ms() :: non_neg_integer()
+  def stall_after_ms,
     do: Application.get_env(:fathom, :migration_stall_after_ms, @default_stall_after_ms)
 
   defp handle_error(%Oban.Job{attempt: attempt, max_attempts: max}, shard_id, reason)

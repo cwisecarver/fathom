@@ -585,6 +585,61 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
       assert later > first, "repeated deferrals must back off"
       assert far <= 60, "and stay capped so a freed lease is still picked up quickly"
     end
+
+    # Expert review 2026-10-08 #20: RevertJob deferred with a flat `{:snooze, 5}` at `[info]`. Every
+    # attempt drains the shard, and a drain refuses new checkouts until it gives up, so during a
+    # fleet revert a hot tenant spent about half its time refusing opens — forever, and silently.
+    test "a deferred revert backs off and escalates the same way", %{shard: shard} do
+      test_pid = self()
+      handler = "revert-stalled-#{shard}"
+
+      :telemetry.attach(
+        handler,
+        [:fathom, :migrator, :migration_stalled],
+        fn _e, meas, meta, _ -> send(test_pid, {:stalled, meas, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      revert = fn attempt, inserted_at ->
+        {{:snooze, seconds}, log} =
+          with_log(fn ->
+            perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 1},
+              attempt: attempt,
+              inserted_at: inserted_at
+            )
+          end)
+
+        {seconds, log}
+      end
+
+      {first, _} = revert.(1, DateTime.utc_now())
+      {later, quiet} = revert.(4, DateTime.utc_now())
+
+      {far, loud} =
+        revert.(50, DateTime.add(DateTime.utc_now(), -:timer.minutes(30), :millisecond))
+
+      assert later > first, "a revert deferred again and again kept snoozing #{first}s"
+      assert far <= 60
+      refute quiet =~ "STALLED"
+      assert loud =~ "STALLED", "a revert deferring for 30 minutes must be alertable"
+      assert_receive {:stalled, %{attempt: 50}, %{shard_id: ^shard, kind: :revert}}, 2_000
+    end
+
+    test "a stalled revert counts in Migrator.status/0's stalled", %{shard: shard} do
+      {:ok, job} = Oban.insert(RevertJob.new(%{shard_id: shard, to_version: 1}, schedule_in: 60))
+      old = DateTime.add(DateTime.utc_now(), -:timer.minutes(30), :millisecond)
+
+      {1, _} =
+        Fathom.Repo.update_all(
+          Ecto.Query.from(j in Oban.Job, where: j.id == ^job.id),
+          set: [inserted_at: old]
+        )
+
+      assert Migrator.status().stalled >= 1,
+             "a revert stalled for 30 minutes was invisible to the status endpoint"
+    end
   end
 
   # Finding #9: forward and revert jobs must not merge via the same-owner lease reclaim. Each
