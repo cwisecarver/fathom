@@ -30,6 +30,12 @@ defmodule Fathom.RestoreDrillLedgerTest do
       for suffix <- ["", "-wal", "-shm", ".etag"], do: File.rm(path <> suffix)
     end)
 
+    # `System.unique_integer/1` restarts with every VM, so a file left in tmp by an earlier run that
+    # died before its `on_exit` can carry this run's name — the fixture then fails on
+    # "table django_migrations already exists" (2026-10-09, seed 616119, against files from a
+    # crashed 2026-09-18 run). Start from nothing.
+    for suffix <- ["", "-wal", "-shm", ".etag"], do: File.rm(path <> suffix)
+
     {:ok, conn} = Connection.open(path)
 
     try do
