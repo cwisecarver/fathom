@@ -790,6 +790,22 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  How many shards are mid-migration (`migrating`) and still stamped below `head_version` (expert
+  review 2026-10-08 #6).
+
+  `count_laggards/1` is active-only, and a shard is `migrating` for its whole drain → copy → flush
+  → cutover — while it still serves the old schema, since that status does not block checkout. So
+  when the last laggards were all executing, `converged` read true while those tenants were still
+  on vN-1, and the deploy gate shipped code that needs HEAD against them. `Migrator.status/0` folds
+  this count into `converged`; `laggards/2` keeps selecting active rows only, so nothing re-enqueues
+  a shard already being migrated.
+  """
+  @spec count_in_flight(non_neg_integer()) :: non_neg_integer()
+  def count_in_flight(head_version) do
+    behind_query(head_version, "migrating") |> Repo.aggregate(:count)
+  end
+
+  @doc """
   How many active shards are stamped ABOVE `head_version` — stranded past HEAD (expert review
   2026-09-05 #19). A shard that completed its migration in the yank race window sits at the yanked
   vN with `schema_version > head`; `count_laggards/1` is strictly `< head`, so it excludes them and
@@ -1413,9 +1429,12 @@ defmodule Fathom.Directory do
     end
   end
 
-  defp laggard_query(head_version) do
+  defp laggard_query(head_version), do: behind_query(head_version, "active")
+
+  # Shards stamped below `head_version` in `status`, minus the scratch forks and the template.
+  defp behind_query(head_version, status) do
     base =
-      from(s in Shard, where: s.schema_version < ^head_version and s.status == "active")
+      from(s in Shard, where: s.schema_version < ^head_version and s.status == ^status)
       |> exclude_scratch()
 
     # The reserved capture template (config :template_shard_id) is migrated directly by Django, so

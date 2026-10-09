@@ -880,6 +880,7 @@ defmodule Fathom.Migrator do
           head: non_neg_integer(),
           laggards: non_neg_integer(),
           above_head: non_neg_integer(),
+          in_flight: non_neg_integer(),
           failed: non_neg_integer(),
           converged: boolean(),
           pending_review: [pos_integer()],
@@ -901,6 +902,7 @@ defmodule Fathom.Migrator do
     review = pending_review()
     laggards = Directory.count_laggards(head)
     above_head = Directory.count_above_head(head)
+    in_flight = Directory.count_in_flight(head)
     rate = rollout_rate(head)
 
     %{
@@ -913,8 +915,12 @@ defmodule Fathom.Migrator do
       # cannot clear it for a live tenant (the write-age guard refuses), so it stays non-zero — a real
       # signal — until an operator resolves it, instead of an hourly log line under a green gate.
       above_head: above_head,
+      # Shards mid-migration and still below head: serving vN-1 until their cutover, so not
+      # converged (expert review 2026-10-08 #6). A new field rather than a change to `laggards`, whose
+      # meaning ("active and behind": what the sweep will pick up) the ETA and dashboards rely on.
+      in_flight: in_flight,
       failed: Directory.count_failed(),
-      converged: laggards == 0 and above_head == 0,
+      converged: laggards == 0 and above_head == 0 and in_flight == 0,
       # `pending_review` stays a list of VERSION NUMBERS. Changing it to the block objects broke
       # `migration_controller_test` immediately, which is the API's own consumers telling you the
       # same thing: this is a published control-plane endpoint and a field changing type is a

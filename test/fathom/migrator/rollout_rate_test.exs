@@ -126,6 +126,41 @@ defmodule Fathom.Migrator.RolloutRateTest do
       assert status.above_head == 1
     end
 
+    # Expert review 2026-10-08 #6: a shard is `migrating` for its whole drain → copy → flush →
+    # cutover, still serving vN-1, but `count_laggards` is active-only — so when the last laggards
+    # were all executing, `converged` read true and the CI deploy gate shipped against tenants not
+    # yet at HEAD.
+    test "status/0 does not read converged while a shard below head is mid-migration" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
+      shard_at_head!("inflight_done", 1)
+      {:ok, _} = Directory.resolve("inflight_running")
+      {:ok, _} = Directory.mark_migrating("inflight_running", 0)
+
+      status = Migrator.status()
+
+      assert status.laggards == 0,
+             "fixture: the running shard must not count as an active laggard"
+
+      assert status.in_flight == 1
+
+      refute status.converged,
+             "a shard still serving vN-1 mid-migration must not read as converged"
+    end
+
+    test "a shard mid-migration that already reached head does not hold up converged" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
+      shard_at_head!("inflight_at_head", 1)
+
+      {1, _} =
+        Repo.update_all(from(s in Shard, where: s.shard_id == "inflight_at_head"),
+          set: [status: "migrating"]
+        )
+
+      status = Migrator.status()
+      assert status.in_flight == 0
+      assert status.converged
+    end
+
     # THE THREE-PLACE STAMP, published beside `converged` (expert review 2026-08-24 #25).
     #
     # `laggards` — and therefore `converged` — reads `schema_version` alone, so a shard whose stored
