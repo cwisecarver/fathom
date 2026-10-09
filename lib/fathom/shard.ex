@@ -1478,9 +1478,16 @@ defmodule Fathom.Shard do
     # whose idle drop then logs a spurious `local_file_missing` error — an alert meant to signal a
     # stranded lease. Exclude `:noproc`; keep the bump for a genuine mid-request death (`:killed`, an
     # exception, or a `:shutdown` that could have landed between commit and bump — the safe,
-    # over-dirty direction). (expert review 2026-09-05 #26; the Filo-side half — HTTP streams
-    # `trap_exit` so they check in on a supervisor stop, removing the `:shutdown` over-dirty on
-    # rolling deploys — lands in the Filo repo.)
+    # over-dirty direction). (expert review 2026-09-05 #26.)
+    #
+    # THE FILO-SIDE HALF HAS NOT LANDED (expert review 2026-10-08 #30). This used to say that HTTP
+    # streams would `trap_exit` in Filo, so a supervisor stop would check them in. As of filo 0.3.1
+    # `Filo.Stream` does not trap exits: on SIGTERM the Edge plane stops first, every live HTTP stream
+    # is killed `:shutdown` without running `terminate`, so `ShardExecutor.close/1` never runs (no
+    # rollback-before-pool, no checkin; the SQLite handle closes only when its NIF resource is
+    # collected) and each such shard takes this bump — an extra flush per shard per rolling deploy.
+    # The fix is `Process.flag(:trap_exit, true)` in `Filo.Stream.init/1`; it is an open Filo change,
+    # tracked in that review's progress file.
     if reason not in [:normal, :noproc] and Map.has_key?(state.conns, ref),
       do: WriteCounter.bump(state.id)
 
