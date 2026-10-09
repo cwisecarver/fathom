@@ -944,6 +944,22 @@ defmodule Fathom.Shard.Storage.S3 do
   # independent of the etag's shape and survives the rotation, so when it's present we verify
   # against IT regardless of etag form. Falls back to the etag-MD5 check for objects with no
   # metadata (older flushes, or the unfenced copy paths); a no-op when neither is available.
+  # An ENCODED object must carry `@md5_meta` (expert review 2026-10-08 #23). Without it the
+  # fallback below compares the DECODED bytes' digest with the etag, which is the MD5 of the stored
+  # COMPRESSED bytes — so the pull fails every time on a single-PUT etag, and on a multipart etag
+  # (which `verify_md5/2` skips) the decoded bytes are not checked at all. Every fathom write that
+  # sets the marker also sets the digest; an object that has one without the other came from
+  # something else, and is refused rather than served unverified.
+  defp verify_decoded(digest, headers) do
+    case {meta_enc(headers), meta_md5(headers)} do
+      {enc, nil} when is_binary(enc) and enc != "" ->
+        {:error, {:missing_plain_digest, enc}}
+
+      {_enc, meta_hex} ->
+        verify_integrity(digest, meta_hex, etag(headers))
+    end
+  end
+
   defp verify_integrity(digest, nil, etag), do: verify_md5(digest, etag)
 
   defp verify_integrity(digest, meta_hex, _etag) do
@@ -1232,7 +1248,7 @@ defmodule Fathom.Shard.Storage.S3 do
 
                 # Prefer the etag-form-independent metadata hash (#17); fall back to the etag-MD5
                 # check when the object predates the metadata or came from an unfenced copy path.
-                case verify_integrity(digest, meta_md5(resp.headers), etag(resp.headers)) do
+                case verify_decoded(digest, resp.headers) do
                   :ok ->
                     case Storage.promote_temp(tmp, local_path) do
                       :ok -> {:ok, etag(resp.headers)}
@@ -1244,6 +1260,11 @@ defmodule Fathom.Shard.Storage.S3 do
                   # fresh temp rather than failing the pull outright (expert review #1).
                   {:error, :checksum_mismatch} = error ->
                     retry_or(error, url, local_path, headers, opts, attempts_left)
+
+                  # Encoded but carrying no plaintext digest (see verify_decoded/2): nothing to
+                  # check the decoded bytes against, and a retry reads the same headers.
+                  {:error, {:missing_plain_digest, _}} = error ->
+                    error
                 end
               end
           end

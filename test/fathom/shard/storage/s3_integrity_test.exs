@@ -108,6 +108,32 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
                     "a body labelled with a hash it does not decode to was uploaded"
   end
 
+  # Expert review 2026-10-08 #23: with the encoding marker but no plaintext digest, the fallback
+  # compared the DECODED bytes' MD5 against the etag — the MD5 of the COMPRESSED bytes — so a
+  # single-PUT object failed every pull, and a multipart etag (which `verify_md5/2` skips) was served
+  # with no check at all. Every fathom write that sets the marker sets the digest; an object with one
+  # and not the other is refused.
+  for {label, etag} <- [{"multipart", ~s("0123456789abcdef0123456789abcdef-3")}, {"single", nil}] do
+    test "an encoded object with no plaintext digest is refused (#{label} etag)", %{dir: dir} do
+      body = :zstd.compress(@good) |> IO.iodata_to_binary()
+      etag = unquote(etag) || md5_etag(body)
+
+      put_s3_config(fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("etag", etag)
+        |> Plug.Conn.put_resp_header("x-amz-meta-fathom-enc", "zstd")
+        |> Plug.Conn.send_resp(200, body)
+      end)
+
+      local = Path.join(dir, "pull.db")
+
+      assert {:error, {:missing_plain_digest, "zstd"}} = S3.pull("s", local)
+
+      refute File.exists?(local),
+             "decoded bytes with nothing to verify them against were promoted"
+    end
+  end
+
   test "a pulled body that mismatches an MD5 etag errors and writes nothing", %{dir: dir} do
     put_s3_config(fn conn ->
       # The store claims the MD5 of the GOOD bytes but serves corrupted ones.
