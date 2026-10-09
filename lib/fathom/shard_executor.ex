@@ -669,12 +669,11 @@ defmodule Fathom.ShardExecutor do
 
     cond do
       String.starts_with?(head, "pragma") ->
-        rest = sql |> strip_lead_noise() |> String.slice(6..-1//1) |> String.trim_leading()
-        {name_raw, tail} = split_pragma_name(rest)
+        {name_raw, tail} = pragma_name_and_tail(sql)
         name = String.downcase(name_raw)
 
-        (pragma_assignment?(tail) or argumentish_tail?(tail)) and
-          name not in @pool_safe_pragmas and not introspect_pragma?(name)
+        not bare_read_tail?(tail) and name not in @pool_safe_pragmas and
+          not introspect_pragma?(name)
 
       # `EXPLAIN PRAGMA x = …` applies parse-time pragmas without running the VDBE, the same reason
       # `blocked_statement/1` recurses here.
@@ -1752,13 +1751,7 @@ defmodule Fathom.ShardExecutor do
   # Scanning to the first delimiter is also CHEAPER than the old slice: O(name) rather than
   # O(200), on a path that runs for every statement.
   defp blocked_pragma(sql) do
-    rest =
-      sql
-      |> strip_lead_noise()
-      |> String.slice(6..-1//1)
-      |> String.trim_leading()
-
-    {name_raw, tail} = split_pragma_name(rest)
+    {name_raw, tail} = pragma_name_and_tail(sql)
     name = String.downcase(name_raw)
 
     allowed? =
@@ -1770,8 +1763,8 @@ defmodule Fathom.ShardExecutor do
       allowed? ->
         nil
 
-      # Nothing after the name but whitespace or a terminator: a bare read, always allowed.
-      not pragma_assignment?(tail) and not argumentish_tail?(tail) ->
+      # Nothing after the name but whitespace, comments or a terminator: a bare read, always allowed.
+      bare_read_tail?(tail) ->
         nil
 
       true ->
@@ -1841,37 +1834,78 @@ defmodule Fathom.ShardExecutor do
 
   defp split_at_pragma_delim(tail, acc), do: {acc, tail}
 
-  # Belt, worn because the parser above is the SECOND one to be wrong here. If anything that
-  # looks like an argument survives in this statement after a name the allow-list does not
-  # cover, refuse rather than guess — over-refusal costs a 403, under-refusal costs the bypass
-  # above. Scoped to THIS statement (cut at the first `;`) so a bare read followed by unrelated
-  # batched statements is not caught: `PRAGMA journal_mode; UPDATE t SET a=1` stays a read.
-  defp argumentish_tail?(tail) do
-    [this_statement | _] = String.split(tail, ";", parts: 2)
-    String.contains?(this_statement, ["=", "("])
+  # `{name, tail}` for a statement already known to lead with PRAGMA. The text after the keyword is
+  # first reduced to THIS statement's code — comments removed, cut at the first unquoted `;` — and
+  # only then parsed, so a comment can sit at no token boundary the parser has to know about.
+  #
+  # COMMENTS ARE SKIPPED, NOT CUT AT (expert review 2026-10-08 #1, verified by execution). Before,
+  # the name parse and two tail checks each ran on raw text: `pragma_assignment?` looked only at
+  # the tail's first non-blank byte, `argumentish_tail?` cut the statement at the first `;` with a
+  # plain `String.split`, and the bare-name scan stopped at a `;` inside a comment. So
+  # `PRAGMA synchronous /*;*/ = OFF`, `PRAGMA x -- ;\n = v` and `PRAGMA /*;*/ x = v` all read as
+  # bare reads and SQLite ran the assignment. Every protective pragma was settable that way, from a
+  # `:ro` token too, including the process-global `hard_heap_limit`, which then failed every
+  # co-resident tenant's allocations with "out of memory" until the BEAM restarted (the limit can
+  # only be lowered). The fifth parser defect in this gate, so the fix normalizes the input once,
+  # with the same comment- and quote-aware rules as `split_statements/1`, rather than tweaking
+  # another delimiter.
+  defp pragma_name_and_tail(sql) do
+    sql
+    |> strip_lead_noise()
+    |> String.slice(6..-1//1)
+    |> this_statement_code("")
+    |> String.trim_leading()
+    |> split_pragma_name()
   end
 
-  # An assignment is `= value` or `(value)`. Anything else — end of statement, a bare `;`, trailing
-  # whitespace — is a read. Leading whitespace is skipped so `PRAGMA foo   =   1` is still an
-  # assignment; that gap is exactly what the old windowed parse lost.
-  defp pragma_assignment?(tail) do
-    case String.trim_leading(tail) do
-      "=" <> _ -> true
-      "(" <> _ -> true
-      _ -> false
-    end
+  # Whether the tail after the pragma name is EMPTY, the only shape of a bare read: SQLite's pragma
+  # grammar is `PRAGMA name [= value | (value)]`, so anything left is an argument, and for a name
+  # the allow-list does not cover the gate refuses rather than guesses which kind. The tail comes
+  # from `pragma_name_and_tail/1`, already comment-free and scoped to this statement, so a bare
+  # read followed by unrelated batched statements stays a read: `PRAGMA journal_mode; UPDATE t SET a=1`.
+  defp bare_read_tail?(tail), do: String.trim(tail) == ""
+
+  # The code of the current statement with every comment removed (each replaced by a space, as
+  # SQLite's tokenizer treats it), cut at the first `;` that is outside a quote or comment. Quoted
+  # regions are kept whole so a `;` or `--` inside a literal neither ends the statement nor hides
+  # what follows. An unterminated comment runs to end of input, as in SQLite.
+  defp this_statement_code(<<>>, acc), do: acc
+  defp this_statement_code(<<?;, _::binary>>, acc), do: acc
+
+  defp this_statement_code(<<"--", rest::binary>>, acc) do
+    {_comment, rest} = until(rest, "\n", "")
+    this_statement_code(rest, acc <> " ")
   end
+
+  defp this_statement_code(<<"/*", rest::binary>>, acc) do
+    {_comment, rest} = until(rest, "*/", "")
+    this_statement_code(rest, acc <> " ")
+  end
+
+  defp this_statement_code(<<q, rest::binary>>, acc) when q in [?\', ?\", ?`] do
+    {chunk, rest} = quoted(rest, q, "")
+    this_statement_code(rest, acc <> <<q>> <> chunk)
+  end
+
+  defp this_statement_code(<<?[, rest::binary>>, acc) do
+    {chunk, rest} = until(rest, "]", "")
+    this_statement_code(rest, acc <> "[" <> chunk)
+  end
+
+  defp this_statement_code(<<c::utf8, rest::binary>>, acc),
+    do: this_statement_code(rest, acc <> <<c::utf8>>)
+
+  # Not valid UTF-8: keep the byte — it is still "something after the name", so the gate refuses.
+  defp this_statement_code(<<c, rest::binary>>, acc), do: this_statement_code(rest, acc <> <<c>>)
 
   # A `PRAGMA [schema.]user_version = N` / `(N)` ASSIGNMENT (not the bare read), for the
   # :block_tenant_ddl gate (#21). Reuses the same structural parse as blocked_pragma/1 so a prefix
   # trick (`;`, comments, `schema.`, insignificant whitespace) cannot slip an assignment past it.
   defp user_version_write?(sql) when is_binary(sql) do
     if String.starts_with?(lead(sql, 7), "pragma") do
-      rest = sql |> strip_lead_noise() |> String.slice(6..-1//1) |> String.trim_leading()
-      {name_raw, tail} = split_pragma_name(rest)
+      {name_raw, tail} = pragma_name_and_tail(sql)
 
-      String.downcase(name_raw) == "user_version" and
-        (pragma_assignment?(tail) or argumentish_tail?(tail))
+      String.downcase(name_raw) == "user_version" and not bare_read_tail?(tail)
     else
       false
     end

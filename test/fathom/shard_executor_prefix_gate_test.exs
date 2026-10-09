@@ -95,6 +95,131 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
     end
   end
 
+  # Noise INSIDE the statement, at the token boundaries after the pragma name (expert review
+  # 2026-10-08 #1). The corpus above only ever prepended noise; this defect sat between the name and
+  # the `=`. `pragma_assignment?` looked at the tail's first non-blank byte (a comment there read as
+  # "not an assignment") and `argumentish_tail?` cut at the first `;` with a plain split (a `;`
+  # inside a comment hid the `= value`), so all of these reached the engine and RAN — verified by
+  # execution, including from a `:ro` token.
+  @inner_noise [
+    {"block comment holding a semicolon", "/*;*/"},
+    {"line comment holding a semicolon", "-- ;\n"},
+    {"empty block comment", "/**/"},
+    {"line comment", "--x\n"},
+    {"tab", "\t"},
+    {"newline", "\n"}
+  ]
+
+  # {pragma, value} pairs whose effect a later bare READ on the same connection can observe, so
+  # the assertion is on the engine's state and not only on the gate's verdict.
+  @inner_targets [
+    {"max_page_count", "777"},
+    {"synchronous", "0"},
+    {"wal_autocheckpoint", "0"},
+    {"cell_size_check", "0"}
+  ]
+
+  defp inner_variants(name, value) do
+    for {label, n} <- @inner_noise do
+      [
+        {"#{label} before =", "PRAGMA #{name} #{n}= #{value}"},
+        {"#{label} after =", "PRAGMA #{name} =#{n} #{value}"},
+        {"#{label} before (", "PRAGMA #{name} #{n}(#{value})"},
+        {"#{label} after schema dot", "PRAGMA main.#{n}#{name} #{n}= #{value}"},
+        {"#{label} before the name", "PRAGMA #{n}#{name} = #{value}"}
+      ]
+    end
+    |> List.flatten()
+  end
+
+  defp read_pragma(h, name) do
+    {:ok, %Filo.StmtResult{rows: [[v]]}} = ShardExecutor.execute(h, stmt("PRAGMA #{name}"))
+    v
+  end
+
+  test "noise inside the statement cannot turn an assignment into a 'bare read'", %{handle: h} do
+    for {name, value} <- @inner_targets do
+      before = read_pragma(h, name)
+
+      for {label, sql} <- inner_variants(name, value) do
+        assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
+                 ShardExecutor.execute(h, stmt(sql)),
+               "#{label}: `#{inspect(sql)}` reached the engine"
+
+        assert read_pragma(h, name) == before,
+               "#{label}: `#{inspect(sql)}` changed PRAGMA #{name}"
+      end
+    end
+  end
+
+  test "the sequence and describe paths share the inner-noise gate", %{handle: h} do
+    before = read_pragma(h, "max_page_count")
+
+    for sql <- [
+          "PRAGMA max_page_count /*;*/ = 779",
+          "SELECT 1; PRAGMA max_page_count -- ;\n = 779"
+        ] do
+      assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
+               ShardExecutor.execute_sequence(h, sql),
+             "sequence `#{inspect(sql)}` reached the engine"
+    end
+
+    # describe prepares only the first statement, so it gets the single-statement form.
+    for sql <- ["PRAGMA max_page_count /*;*/ = 779", "PRAGMA /*;*/ max_page_count = 779"] do
+      assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} = ShardExecutor.describe(h, sql),
+             "describe `#{inspect(sql)}` was not refused"
+    end
+
+    assert read_pragma(h, "max_page_count") == before
+  end
+
+  # The worst instance: `hard_heap_limit` is PROCESS-GLOBAL in SQLite, so one tenant's stream set it
+  # for every tenant on the node, and it can only ever be lowered. A `:ro` token was enough. The
+  # value used here is huge on purpose, so that if this test ever runs against a broken gate it
+  # does not starve the rest of the suite of memory — it still fails, on the other tenant's read.
+  test "a :ro stream cannot set the process-global heap limit seen by another tenant", %{
+    shard: shard
+  } do
+    other = "test_prefix_other_#{System.unique_integer([:positive])}"
+    {:ok, ro} = ShardExecutor.open(shard, {:ro, nil})
+    {:ok, oh} = ShardExecutor.open(other)
+
+    on_exit(fn ->
+      ShardExecutor.close(ro)
+      ShardExecutor.close(oh)
+      rm_shard_files(other)
+    end)
+
+    before = read_pragma(oh, "hard_heap_limit")
+
+    for sql <- [
+          "PRAGMA hard_heap_limit /*;*/ = 4611686018427387904",
+          "PRAGMA soft_heap_limit -- ;\n = 4611686018427387904"
+        ] do
+      assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} = ShardExecutor.execute(ro, stmt(sql)),
+             "a :ro stream ran `#{inspect(sql)}`"
+    end
+
+    assert read_pragma(oh, "hard_heap_limit") == before
+  end
+
+  test "bare reads with trailing comments, and later batched statements, stay reads", %{
+    handle: h
+  } do
+    for sql <- [
+          "PRAGMA journal_mode /* c */",
+          "PRAGMA journal_mode -- c",
+          "PRAGMA journal_mode /* = ( */ ;",
+          "PRAGMA synchronous; SELECT 'a=1'"
+        ] do
+      refute match?(
+               {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}},
+               ShardExecutor.execute(h, stmt(sql))
+             ),
+             "`#{inspect(sql)}` is a bare read and was refused"
+    end
+  end
+
   test "describe/2 shares the gate, so the same prefixes are refused there too", %{handle: h} do
     for sql <- [
           ";PRAGMA max_page_count=777",
