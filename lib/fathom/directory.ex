@@ -494,6 +494,15 @@ defmodule Fathom.Directory do
   def mark_migrating(shard_id, retaining_version \\ nil),
     # Only an `active` shard may enter `migrating` — never resurrect a suspended/deleted tenant whose
     # snoozing job finally got the drain it was waiting on (#11).
+    #
+    # …OR ONE ALREADY `migrating` (expert review 2026-10-08 #7). An attempt that marks the row and
+    # then dies before its `else` can unmark it — a node kill or deploy, an Oban Lifeline rescue, a
+    # raise from a Postgres blip or `File.mkdir_p!` — leaves the row `migrating`. `run/3` lets that
+    # through, but this refused it, and since f1cff2a the refusal is `{:not_active, :status_conflict}`
+    # → the job CANCELS: the retry, the job's whole purpose after a transient fault, was dropped and
+    # the shard sat invisible to every sweep until `reclaim_stale_migrating` plus the next reconcile.
+    # The caller holds the shard's lease here, so the previous attempt is gone and re-marking just
+    # re-stamps `migrating_since` and the retain intent. Suspended and deleted are still refused.
     do:
       guarded_update_shard(
         shard_id,
@@ -502,7 +511,7 @@ defmodule Fathom.Directory do
           migrating_since: DateTime.utc_now(),
           retaining_version: retaining_version
         },
-        ["active"]
+        ["active", "migrating"]
       )
 
   @doc """

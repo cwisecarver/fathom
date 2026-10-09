@@ -525,6 +525,26 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert {:ok, %{status: "suspended", schema_version: 1}} = Directory.get(shard)
   end
 
+  # Expert review 2026-10-08 #7: an attempt that marked the row and then died before unmarking it
+  # (node kill, Lifeline rescue, a raise) leaves it `migrating`. `run/3` lets that through, but
+  # `mark_migrating` accepted only `active`, so the retry got `{:not_active, :status_conflict}` and
+  # the job CANCELLED instead of resuming — the retry was the whole point.
+  test "a retry after a crash that left the row migrating resumes and migrates", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, %{status: "migrating"}} = Directory.mark_migrating(shard, 1)
+
+    assert {:ok, %{from: 1, to: 2}} = ShardMigration.run(shard, 2)
+    assert {:ok, %{schema_version: 2, status: "active"}} = Directory.get(shard)
+    assert %{rows: [[2]]} = query_live!(shard, "PRAGMA user_version")
+  end
+
+  test "re-marking still refuses a suspended tenant", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Directory.suspend(shard)
+    assert {:error, :status_conflict} = Directory.mark_migrating(shard, 1)
+  end
+
   # ---- the ledger leg (Fathom.Migrator.Ledger), 2026-10-01 -------------------------------------
   #
   # Releases that carry Django's bookkeeping rows, as captured ones do: v1 adds 0001_initial, v2 adds
