@@ -1531,6 +1531,16 @@ defmodule Fathom.Shard.Replication.Session do
   # time — which would hand the follower a database and a WAL whose salts do not match. Retrying is
   # correct and cheap; shipping the inconsistent pair is neither.
   #
+  # KNOWN GAP — THE CHECK ABOVE DOES NOT SEE EVERY CHECKPOINT (expert review 2026-10-08 #12, measured).
+  # Only a checkpoint that RESTARTS the log moves the generation. A PASSIVE checkpoint — the commit
+  # hook's at 4000 pages, or a tenant's own `PRAGMA wal_checkpoint` — backfills pages into the `.db`
+  # and leaves the WAL header byte-identical (same ckpt_seq, salt and size: probed). So the `.db`
+  # stream can carry pages from frames committed AFTER `wal_size` was read, and the follower gets a
+  # base newer in places than the WAL prefix it is told to replay. It converges once catch-up ships
+  # past those frames; until then the replica is inconsistent, and promotable if the primary dies
+  # after its first push. The fix (a read transaction pinned across the stream, or streaming the
+  # `.db` first and declaring the WAL extent after it) is parked in that review's progress file.
+  #
   # Streaming widens that window (the copy now takes as long as the transfer rather than as long as
   # a `File.read`), which is exactly why the check moved to AFTER the last chunk and gained an
   # explicit `seed_abort`: the follower must be told to drop what it has, and the sender must not
