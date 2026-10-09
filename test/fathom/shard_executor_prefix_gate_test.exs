@@ -227,6 +227,19 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
     end
   end
 
+  # Expert review 2026-10-08 #9: `temp_store=MEMORY` put a stream's TEMP tables — outside the shard
+  # size cap — in node RAM (166 -> 584 MB RSS from four 100 MB inserts under a 50 MB cap).
+  test "a tenant cannot move its TEMP storage into node memory", %{handle: h} do
+    before = read_pragma(h, "temp_store")
+
+    for sql <- ["PRAGMA temp_store = MEMORY", "PRAGMA temp_store = 2", "PRAGMA temp_store(2)"] do
+      assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} = ShardExecutor.execute(h, stmt(sql)),
+             "`#{sql}` was accepted"
+    end
+
+    assert read_pragma(h, "temp_store") == before
+  end
+
   test "bare reads with trailing comments, and later batched statements, stay reads", %{
     handle: h
   } do

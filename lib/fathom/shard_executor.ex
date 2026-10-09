@@ -1612,8 +1612,14 @@ defmodule Fathom.ShardExecutor do
   # streams x cache: six streams at `cache_size=-2000000` over a 125 MB shard took RSS from 174 MB
   # to 922 MB. Django does not set it. The bare read stays allowed; an operator who needs a client
   # to set it can widen with `:tenant_pragma_allow`.
+  #
+  # Nor is `temp_store` (expert review 2026-10-08 #9). `temp_store=MEMORY` moves the TEMP schema —
+  # which the shard size cap does not cover — into node RAM: four 100 MB TEMP inserts took a node
+  # from 166 MB to 584 MB RSS under a 50 MB cap. Django does not set it. (Capping TEMP itself at open
+  # was built and measured: it forces SQLite to create every connection's temp database, +~85 KiB
+  # per connection, which the served-density bench gate refused. That half is parked.)
   @tenant_pragma_allow ~w(foreign_keys defer_foreign_keys legacy_alter_table
-                          temp_store recursive_triggers ignore_check_constraints
+                          recursive_triggers ignore_check_constraints
                           case_sensitive_like automatic_index reverse_unordered_selects
                           analysis_limit threads user_version application_id
                           wal_checkpoint incremental_vacuum shrink_memory)
