@@ -589,6 +589,8 @@ defmodule Fathom.Shards do
 
   Returns `:ok` once the coordinator has fully stopped (data is durable in storage
   and the lease is free), or `:ok` if it wasn't running (already cold). Returns
+  `{:error, :unflushed_local_copy}` if the stop kept a local copy its flush could not make
+  durable — retryable. Returns
   `{:error, :busy}` if connections didn't drain in time — the coordinator keeps
   serving and the caller should retry later. Blocks until the coordinator exits.
   """
@@ -596,11 +598,25 @@ defmodule Fathom.Shards do
   # (eviction, the rebalancer handoff, tenant delete), and every one of them already holds a cast
   # id. It looks the shard up in the registry rather than casting, so an uncast id would silently
   # miss instead of being rejected.
+  #
+  # A STOP THAT KEPT THE LOCAL COPY IS NOT A DRAIN (expert review 2026-10-08 #4, verified by
+  # execution). When the drop flush fails (S3 error, `:drop_flush_timeout`, a fence skip, an
+  # inconclusive 412) the coordinator deliberately keeps the `.db` with its acked-but-unflushed
+  # writes, releases the lease, and still exits `:normal` — so this returned `:ok` while the stored
+  # object lacked those writes. The migrator then took the free lease and migrated the STALE object,
+  # and the tenant's next open quarantined the kept copy as `.forked.<ts>`. `flush/1` was fixed for
+  # the same state in 2026-09-29 #13; this is the drain half. A clean stop deletes the local file,
+  # so one still there means the data is not provably durable — the same signal `flush/1` uses.
+  #
+  # The same answer with NO coordinator running: a kept copy left by an earlier stop is not "already
+  # cold". Drain does not re-open it to flush — callers drain in teardown paths that must not start a
+  # coordinator as a side effect — so a caller that needs the copy durable calls `flush/1` (which
+  # re-opens and flushes it) and drains again; `ShardMigration.with_lease` does exactly that.
   @spec drain(Fathom.ShardId.t(), non_neg_integer()) :: :ok | {:error, term()}
   def drain(shard_id, drain_timeout \\ @default_drain_ms) do
     case Registry.lookup(@registry, shard_id) do
       [] ->
-        :ok
+        if kept_local_copy?(shard_id), do: {:error, :unflushed_local_copy}, else: :ok
 
       [{pid, _}] ->
         ref = Process.monitor(pid)
@@ -612,10 +628,13 @@ defmodule Fathom.Shards do
         # a shorter budget and keeps the :exit_timeout as "couldn't confirm this exited".
         case await_coordinator_exit(pid, ref, drain_timeout + @default_exit_grace_ms) do
           {:error, :exit_timeout} -> {:error, :busy}
+          :ok -> stopped_clean(shard_id)
           other -> other
         end
     end
   end
+
+  defp kept_local_copy?(shard_id), do: File.exists?(Fathom.Shard.db_path(shard_id))
 
   @doc """
   Node-level graceful drain (expert review #28): the ordered voluntary alternative to funnelling
@@ -623,7 +642,7 @@ defmodule Fathom.Shards do
   draining (`Fathom.HealthPlug.begin_draining/0`, so the LB deregisters it first), optionally waits
   `:drain_lb_settle_ms` for the LB to notice, then fans out `request_drain` across every open
   coordinator — refuse new checkouts → let in-flight streams finish → flush + release the lease + stop
-  — with bounded concurrency and a **bounded overall budget**. Returns `%{drained, busy, timed_out}`.
+  — with bounded concurrency and a **bounded overall budget**. Returns `%{drained, busy, timed_out, kept_local}`.
 
   Each coordinator gets a **slice** of the remaining budget — sized per wave of the bounded
   fan-out, so one busy shard cannot consume the whole window and strand the rest (expert review
@@ -634,7 +653,8 @@ defmodule Fathom.Shards do
   @spec drain_all(pos_integer()) :: %{
           drained: non_neg_integer(),
           busy: non_neg_integer(),
-          timed_out: non_neg_integer()
+          timed_out: non_neg_integer(),
+          kept_local: non_neg_integer()
         }
   def drain_all(budget_ms \\ drain_all_budget_ms()) do
     Fathom.HealthPlug.begin_draining()
@@ -642,7 +662,7 @@ defmodule Fathom.Shards do
     if settle > 0, do: Process.sleep(settle)
 
     deadline = System.monotonic_time(:millisecond) + budget_ms
-    pids = Registry.select(@registry, [{{:_, :"$1", :_}, [], [:"$1"]}])
+    pids = Registry.select(@registry, [{{:"$1", :"$2", :_}, [], [{{:"$1", :"$2"}}]}])
 
     # A SLICE OF THE BUDGET, NOT ALL OF IT (expert review 2026-08-26 #5).
     #
@@ -671,7 +691,7 @@ defmodule Fathom.Shards do
 
     pids
     |> Task.async_stream(
-      fn pid ->
+      fn {shard_id, pid} ->
         left = max(0, deadline - System.monotonic_time(:millisecond))
         pending = max(1, :counters.get(remaining_count, 1))
         :counters.sub(remaining_count, 1, 1)
@@ -698,13 +718,13 @@ defmodule Fathom.Shards do
           %{}
         )
 
-        drain_pid(pid, window)
+        drain_pid(shard_id, pid, window)
       end,
       max_concurrency: drain_all_concurrency(),
       timeout: :infinity,
       ordered: false
     )
-    |> Enum.reduce(%{drained: 0, busy: 0, timed_out: 0}, fn {:ok, outcome}, acc ->
+    |> Enum.reduce(%{drained: 0, busy: 0, timed_out: 0, kept_local: 0}, fn {:ok, outcome}, acc ->
       Map.update!(acc, outcome, &(&1 + 1))
     end)
   end
@@ -713,16 +733,32 @@ defmodule Fathom.Shards do
   # to `remaining - flush_grace`, then flushes + releases + stops within the grace, so it exits
   # before the budget deadline and we observe `:drained`; a still-busy shard aborts (`:busy`) and one
   # that neither finishes nor aborts in the window is `:timed_out` (left to the supervisor shutdown).
-  defp drain_pid(_pid, remaining) when remaining <= 0, do: :timed_out
+  # One that stopped but KEPT its local copy (its drop flush failed) is `:kept_local`, never
+  # `:drained` (expert review 2026-10-08 #4): on a deploy the node is about to exit, and on an
+  # ephemeral disk that copy — acked writes the store does not hold — goes with it.
+  defp drain_pid(_shard_id, _pid, remaining) when remaining <= 0, do: :timed_out
 
-  defp drain_pid(pid, remaining) do
+  defp drain_pid(shard_id, pid, remaining) do
     ref = Process.monitor(pid)
     Fathom.Shard.request_drain(pid, max(0, remaining - drain_all_flush_grace_ms()), self())
 
     case await_coordinator_exit(pid, ref, remaining) do
-      :ok -> :drained
+      :ok -> drained_or_kept(shard_id)
       {:error, :busy} -> :busy
       _ -> :timed_out
+    end
+  end
+
+  defp drained_or_kept(shard_id) do
+    if kept_local_copy?(shard_id) do
+      Logger.error(
+        "drain_all: shard #{shard_id} stopped but kept its local copy (its drop flush failed, " <>
+          "or streams were still checked out); its latest acked writes may not be in storage"
+      )
+
+      :kept_local
+    else
+      :drained
     end
   end
 
@@ -730,7 +766,7 @@ defmodule Fathom.Shards do
   # "never <= flush grace" invariant (#3) is testable without standing up a fleet.
   #
   # Each coordinator gets its fair per-wave slice of the remaining budget, but the window is floored
-  # at `grace + min_useful` (bounded by `left`) so `drain_pid/2`'s `window - grace` wait is positive
+  # at `grace + min_useful` (bounded by `left`) so `drain_pid/3`'s `window - grace` wait is positive
   # whenever the budget can afford it. `waves_left` shrinks as shards finish, so quick shards hand
   # their unused time to the ones behind them. When `left <= grace` (the tail of the budget) the
   # floor collapses to `left` and a busy shard genuinely has no time left — unavoidable there, and

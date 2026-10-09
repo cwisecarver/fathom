@@ -388,9 +388,21 @@ defmodule Fathom.Migrator.ShardMigration do
 
   defp with_lease(shard_id, token, fun) do
     case Shards.drain(shard_id) do
-      :ok -> hold_lease(shard_id, token, fun)
-      {:error, :busy} -> {:retry, :shard_busy}
-      {:error, reason} -> {:error, {:drain_failed, reason}}
+      :ok ->
+        hold_lease(shard_id, token, fun)
+
+      {:error, :busy} ->
+        {:retry, :shard_busy}
+
+      # The stop kept a local copy its flush could not make durable (expert review 2026-10-08 #4).
+      # Migrating now would copy the STALE stored object. Try to make the copy durable (`flush/1`
+      # re-opens and flushes it) and retry; the retry's drain then stops a clean coordinator.
+      {:error, :unflushed_local_copy} ->
+        _ = Shards.flush(shard_id)
+        {:retry, :unflushed_local_copy}
+
+      {:error, reason} ->
+        {:error, {:drain_failed, reason}}
     end
   end
 

@@ -106,4 +106,53 @@ defmodule Fathom.ShardsFlushKeptLocalTest do
     # Storage still refuses flushes: the answer must say so.
     refute Shards.flush(id) == :ok
   end
+
+  # The DRAIN half (expert review 2026-10-08 #4, verified by execution). The coordinator that keeps
+  # its local copy still exits `:normal`, and `drain/2` mapped a `:normal` DOWN to `:ok` — "data is
+  # durable in storage and the lease is free" — while the stored object lacked the acked row. The
+  # migrator, rebalancer handoff and snapshot restore all proceed on that `:ok`. Lease mode does not
+  # enter into it: the defect is in how the DOWN is classified, after the coordinator is gone.
+  defp kept_local_fixture(id) do
+    {:ok, conn} = ShardExecutor.open(id)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE t (a INTEGER)"))
+    :ok = Shards.flush(id)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (1)"))
+    :ok = ShardExecutor.close(conn)
+    Application.put_env(:fathom, :storage_fault, :flush)
+    {:ok, pid} = Shards.ensure(id)
+    {pid, Process.monitor(pid)}
+  end
+
+  test "drain/2 does not report :ok when the stop kept an unflushed local copy", %{id: id} do
+    {pid, ref} = kept_local_fixture(id)
+
+    assert {:error, :unflushed_local_copy} = Shards.drain(id, 5_000)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000
+
+    assert File.exists?(Fathom.Shard.db_path(id)), "fixture: the failed drop kept no local copy"
+    assert stored_rows(id) == [], "fixture: the stored object already holds the unflushed row"
+
+    # No coordinator now, but the kept copy is still the only holder of the row: a retried drain
+    # must keep saying so rather than read the empty registry as "already cold".
+    assert {:error, :unflushed_local_copy} = Shards.drain(id, 5_000)
+
+    # Storage is back: flush/1 makes the copy durable (the migrator's retry path), and only then
+    # does the drain report a clean stop.
+    Application.delete_env(:fathom, :storage_fault)
+    assert :ok = Shards.flush(id)
+    assert :ok = Shards.drain(id, 5_000)
+    assert stored_rows(id) == [1], "drain/2 reported :ok without the acked row in storage"
+    refute File.exists?(Fathom.Shard.db_path(id))
+  end
+
+  test "drain_all counts a kept local copy as kept_local, not drained", %{id: id} do
+    {pid, ref} = kept_local_fixture(id)
+    on_exit(fn -> Fathom.HealthPlug.end_draining() end)
+
+    result = Shards.drain_all(5_000)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000
+
+    assert result.kept_local >= 1, "drain_all tallied #{inspect(result)}"
+    assert File.exists?(Fathom.Shard.db_path(id))
+  end
 end

@@ -158,8 +158,16 @@ defmodule Fathom.ShardLeaseReleaseTest do
     ref = Process.monitor(coordinator)
 
     capture_log(fn ->
-      :ok = Shards.drain(shard, 5_000)
+      result = Shards.drain(shard, 5_000)
       assert_receive {:DOWN, ^ref, :process, ^coordinator, _}, 5_000
+
+      # This helper used to assert `:ok` unconditionally — including in the scenarios below whose
+      # drop flush FAILS and keeps the local copy, i.e. it pinned the defect of expert review
+      # 2026-10-08 #4 (a kept, unflushed copy reported as a clean drain). The drain's answer must
+      # now agree with what the stop left behind.
+      if File.exists?(Shard.db_path(shard)),
+        do: assert(result == {:error, :unflushed_local_copy}),
+        else: assert(result == :ok)
     end)
   end
 
