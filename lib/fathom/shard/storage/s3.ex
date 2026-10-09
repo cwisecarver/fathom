@@ -1124,9 +1124,12 @@ defmodule Fathom.Shard.Storage.S3 do
               {:halt, {req, Req.Response.put_private(resp, :fathom_enc_error, err)}}
 
             z ->
-              case Codec.inflate(z, chunk) do
-                {:ok, plain} ->
-                  {:cont, {req, write_plain(resp, fd, plain)}}
+              # Each decoded piece is written as the codec yields it, never collected per chunk —
+              # a chunk of highly compressible data decodes to tens of MB (expert review 2026-10-08
+              # #2; see Codec.inflate_into/4).
+              case Codec.inflate_into(z, chunk, &write_plain(&2, fd, &1), resp) do
+                {:ok, resp} ->
+                  {:cont, {req, resp}}
 
                 # A body that does not decode: torn or corrupt in transit, handled like a
                 # checksum mismatch below (retry the whole download), never written.

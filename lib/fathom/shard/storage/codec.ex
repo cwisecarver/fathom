@@ -148,10 +148,10 @@ defmodule Fathom.Shard.Storage.Codec do
   @doc """
   Opens a streaming decode context, or `nil` for the raw path.
 
-  Returned as an opaque handle threaded through `inflate/2` → `release/1` so the download path
+  Returned as an opaque handle threaded through `inflate_into/4` → `release/1` so the download path
   can decode chunk-by-chunk as they arrive, without buffering the object.
 
-  `inflate/2` returns everything decodable from the bytes it has been given; there is no
+  `inflate_into/4` hands out everything decodable from the bytes it has been given; there is no
   held-back tail to collect at the end (measured 2026-10-05 for zstd: 0 bytes from
   `:zstd.finish/2` after a complete frame, at chunk sizes from 1 B to 1 MiB, provided the
   remainder loop below runs). A TRUNCATED body is not reported by either codec — the download's
@@ -172,27 +172,59 @@ defmodule Fathom.Shard.Storage.Codec do
   end
 
   @doc """
-  Decodes one chunk. The raw path passes the chunk through untouched.
+  Decodes one received chunk, handing each piece of decoded output to `fun.(piece, acc)` as soon
+  as the codec produces it. The raw path hands the chunk over untouched.
+
+  STREAMED, NEVER COLLECTED (expert review 2026-10-08 #2, measured). This used to return the whole
+  chunk's decoded output as one iodata for the caller to write. That is unbounded: the ratio is
+  the data's, not the codec's, and ordinary tenant data reaches it — a database holding a 200 MiB
+  `zeroblob` compressed 1244:1 at zstd-3, so one 16 KiB TLS record decoded to 19.8 MB and one
+  1 MiB plain-HTTP read to the whole 210 MB, per pull, times however many pulls a mass warm or
+  failover runs at once. Handing pieces out as they come bounds what a pull holds to one codec
+  output buffer (zstd ~128 KiB, zlib's `safeInflate` 16 KiB) whatever the ratio.
 
   A body that does not decode is `{:error, reason}`, never a raise: the caller treats it like a
-  torn transfer and retries the whole download with a fresh temp.
+  torn transfer and retries the whole download with a fresh temp. Only the codec call is guarded —
+  a raise from `fun` (a failed write) propagates, so it is not mistaken for a corrupt body.
   """
-  @spec inflate(nil | {:zlib | :zstd, term()}, iodata()) :: {:ok, iodata()} | {:error, term()}
-  def inflate(nil, chunk), do: {:ok, chunk}
+  @spec inflate_into(nil | {:zlib | :zstd, term()}, iodata(), (iodata(), acc -> acc), acc) ::
+          {:ok, acc} | {:error, term()}
+        when acc: var
+  def inflate_into(nil, chunk, fun, acc), do: {:ok, fun.(chunk, acc)}
+  def inflate_into({:zlib, z}, chunk, fun, acc), do: zlib_each(z, chunk, fun, acc)
+  def inflate_into({:zstd, c}, chunk, fun, acc), do: zstd_each(c, chunk, fun, acc)
 
-  def inflate({:zlib, z}, chunk) do
-    {:ok, :zlib.inflate(z, chunk)}
-  rescue
-    e -> {:error, {:zlib, Exception.message(e)}}
-  catch
-    _, reason -> {:error, {:zlib, reason}}
+  # `safeInflate/2` returns at most one output buffer per call: `{:continue, out}` means more output
+  # is pending for the input already given (call again with `[]`), `{:finished, out}` means that
+  # input is used up — NOT that the stream ended; the next chunk continues it (probed 2026-10-08).
+  defp zlib_each(z, data, fun, acc) do
+    case guard(:zlib, fn -> :zlib.safeInflate(z, data) end) do
+      {:ok, {:continue, out}} -> zlib_each(z, [], fun, fun.(out, acc))
+      {:ok, {:finished, out}} -> {:ok, fun.(out, acc)}
+      {:ok, {:need_dictionary, _adler, _out}} -> {:error, {:zlib, :need_dictionary}}
+      {:error, _} = error -> error
+    end
   end
 
-  def inflate({:zstd, c}, chunk) do
-    {:ok, zstd_stream(c, chunk, [])}
+  # `:zstd.stream/2` stops when its output buffer fills (`{:continue, remainder, out}`); the
+  # remainder must be fed back in or those bytes are silently lost. `{:continue, out}` means the
+  # whole input was consumed.
+  defp zstd_each(c, data, fun, acc) do
+    case guard(:zstd, fn -> :zstd.stream(c, data) end) do
+      {:ok, {:continue, remainder, out}} -> zstd_each(c, remainder, fun, fun.(out, acc))
+      {:ok, {:continue, out}} -> {:ok, fun.(out, acc)}
+      {:error, _} = error -> error
+    end
+  end
+
+  # The NIFs RAISE on a malformed body (zstd: `{:zstd_error, "Unknown frame descriptor"}`, zlib: a
+  # `data_error`). Turn that into an error tuple at the call, and only there.
+  defp guard(codec, call) do
+    {:ok, call.()}
+  rescue
+    e -> {:error, {codec, Exception.message(e)}}
   catch
-    # The NIF RAISES on a malformed frame (`{:zstd_error, "Unknown frame descriptor"}`).
-    _, reason -> {:error, {:zstd, reason}}
+    _, reason -> {:error, {codec, reason}}
   end
 
   # `:zstd.stream/2` may stop before consuming its whole input (`{:continue, remainder, out}`) when

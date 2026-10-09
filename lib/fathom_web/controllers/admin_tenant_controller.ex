@@ -20,13 +20,13 @@ defmodule FathomWeb.AdminTenantController do
     case Fathom.Tenants.export(id) do
       {:ok, %{path: path, filename: filename}} ->
         try do
-          # Read + stream from memory then delete the temp — small shards (fathom's thesis)
-          # make this cheap; a streaming-download-then-cleanup for very large shards is a
-          # follow-up. Deleting after the send keeps an exported copy from lingering (GDPR).
-          data = File.read!(path)
+          # Sent from the file, never read into memory first (expert review 2026-10-08 #2): a
+          # shard is up to the 4 GiB cap, and `File.read!` held all of it as one binary per export.
+          # `send_download/3` with `{:file, _}` writes the body before returning, so the delete
+          # below still runs after the send and no exported copy lingers on disk (GDPR).
           Fathom.Audit.log(conn, "export", id, "ok")
 
-          send_download(conn, {:binary, data},
+          send_download(conn, {:file, path},
             filename: filename,
             content_type: "application/x-sqlite3"
           )

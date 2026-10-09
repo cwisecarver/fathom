@@ -43,6 +43,10 @@ defmodule FathomWeb.AdminTenantControllerTest do
     assert Enum.any?(get_resp_header(conn, "content-disposition"), &(&1 =~ "#{id}.db"))
     # The SQLite magic header proves the body is a real database, not an error page.
     assert String.starts_with?(conn.resp_body, "SQLite format 3")
+
+    # The body is sent from the temp file now (expert review 2026-10-08 #2), and the temp must
+    # still be gone afterwards — no exported copy lingers on disk.
+    assert Path.wildcard(Path.join(System.tmp_dir!(), "fathom_export_#{id}_*")) == []
   end
 
   test "404 when the shard has no stored data (never flushed / deleted)", %{conn: conn, id: id} do
