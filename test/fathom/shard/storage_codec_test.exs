@@ -129,6 +129,33 @@ defmodule Fathom.Shard.Storage.CodecTest do
     end
   end
 
+  # Expert review 2026-10-08 #15: the upload path proves a compressed body decodes to the plaintext
+  # hash it will be labelled with before PUTting it.
+  for enc <- [:zlib, :zstd] do
+    test "#{enc}: verify_decodes_to accepts the right hash and refuses any other" do
+      src = tmp("verify")
+      File.write!(src, String.duplicate("row data ", 50_000))
+      on_exit(fn -> File.rm(src) end)
+
+      {:ok, z} = Codec.compress_to_temp(src, unquote(enc))
+      on_exit(fn -> File.rm(z) end)
+
+      right = Base.encode16(:crypto.hash(:md5, File.read!(src)), case: :lower)
+      wrong = Base.encode16(:crypto.hash(:md5, "something else"), case: :lower)
+
+      assert :ok = Codec.verify_decodes_to(z, unquote(enc), right)
+
+      assert {:error, {:compressed_body_mismatch, ^right}} =
+               Codec.verify_decodes_to(z, unquote(enc), wrong)
+
+      # A body that does not decode at all is an error too, never a raise.
+      bad = tmp("garbage")
+      File.write!(bad, String.duplicate("not compressed ", 1000))
+      on_exit(fn -> File.rm(bad) end)
+      assert {:error, {unquote(enc), _}} = Codec.verify_decodes_to(bad, unquote(enc), right)
+    end
+  end
+
   test "zstd is the default encoding" do
     prev = Application.get_env(:fathom, :shard_object_encoding)
     on_exit(fn -> restore(prev) end)

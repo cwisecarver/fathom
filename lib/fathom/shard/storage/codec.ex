@@ -116,6 +116,42 @@ defmodule Fathom.Shard.Storage.Codec do
     end
   end
 
+  @doc """
+  Decodes the compressed file at `path` as `encoding` and checks its plaintext MD5 is `expected_hex`.
+
+  `:ok`, or `{:error, {:compressed_body_mismatch, actual_hex}}` / `{:error, {:zstd | :zlib, _}}`.
+  The upload path runs it before PUTting a compressed body (expert review 2026-10-08 #15), so a
+  body that would not decode to the database it is labelled as is never stored. Streamed, in
+  bounded pieces, like the download path.
+  """
+  @spec verify_decodes_to(Path.t(), :zlib | :zstd, String.t()) :: :ok | {:error, term()}
+  def verify_decodes_to(path, encoding, expected_hex) do
+    ctx = init(encoding)
+
+    try do
+      path
+      |> File.stream!(@chunk)
+      |> Enum.reduce_while({:ok, :crypto.hash_init(:md5)}, fn chunk, {:ok, md5} ->
+        case inflate_into(ctx, chunk, &:crypto.hash_update(&2, &1), md5) do
+          {:ok, _} = ok -> {:cont, ok}
+          {:error, _} = error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, md5} ->
+          case Base.encode16(:crypto.hash_final(md5), case: :lower) do
+            ^expected_hex -> :ok
+            actual -> {:error, {:compressed_body_mismatch, actual}}
+          end
+
+        {:error, _} = error ->
+          error
+      end
+    after
+      release(ctx)
+    end
+  end
+
   defp compressor(:zlib) do
     z = :zlib.open()
     :ok = :zlib.deflateInit(z, @level)

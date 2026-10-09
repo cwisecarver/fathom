@@ -71,6 +71,43 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
     assert header == wire_md5
   end
 
+  # Expert review 2026-10-08 #15: a compressed upload hashes the file in one read and compresses it
+  # in a second, and nothing tied the uploaded body to the hash it is labelled with. A file that
+  # changed between the reads (or a codec defect) became an object every pull refuses — and on an
+  # idle drop the local copy was deleted on the PUT's success. The body must now be proved to
+  # decode to that hash before anything is PUT.
+  test "a compressed body that does not decode to its labelled hash is never PUT", %{dir: dir} do
+    test_pid = self()
+
+    put_s3_config(fn conn ->
+      send(test_pid, {:put, conn.method})
+      Plug.Conn.send_resp(conn, 200, "")
+    end)
+
+    prev = Application.get_env(:fathom, :shard_object_encoding)
+    Application.put_env(:fathom, :shard_object_encoding, :zstd)
+
+    Application.put_env(:fathom, :s3_between_hash_and_compress_hook, fn path ->
+      File.write!(path, "the file changed after it was hashed")
+    end)
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :s3_between_hash_and_compress_hook)
+
+      if prev,
+        do: Application.put_env(:fathom, :shard_object_encoding, prev),
+        else: Application.delete_env(:fathom, :shard_object_encoding)
+    end)
+
+    local = Path.join(dir, "s.db")
+    File.write!(local, @good)
+
+    assert {:error, {:compressed_body_mismatch, _}} = S3.flush("s", local, nil)
+
+    refute_received {:put, "PUT"},
+                    "a body labelled with a hash it does not decode to was uploaded"
+  end
+
   test "a pulled body that mismatches an MD5 etag errors and writes nothing", %{dir: dir} do
     put_s3_config(fn conn ->
       # The store claims the MD5 of the GOOD bytes but serves corrupted ones.

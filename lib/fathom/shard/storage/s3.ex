@@ -420,16 +420,39 @@ defmodule Fathom.Shard.Storage.S3 do
       encoding ->
         # The plaintext hash must NOT go through stat_and_md5: that applies the single-PUT
         # ceiling, and the plaintext is not what gets PUT.
+        #
+        # AND THE COMPRESSED BODY IS PROVED TO DECODE TO THAT HASH BEFORE IT IS PUT (expert review
+        # 2026-10-08 #15). Uncompressed, `content-md5` and `@md5_meta` are one digest over one byte
+        # string, so the store's BadDigest check verified the object's identity end to end.
+        # Compressed, they are over different reads of the file — the hash read, then the compress
+        # read — and nothing tied the uploaded body to the hash it is labelled with. A codec defect
+        # (a9ce967 records the `{:continue, remainder, out}` case losing bytes in development) or a
+        # file that changed between the two reads produced an object every pull then refuses as a
+        # checksum mismatch, and on an idle drop or drain the local copy was deleted on the PUT's
+        # success. zstd decodes several times faster than it encodes, so this costs a fraction of the
+        # compress it guards.
         with {:ok, plain_hex} <- file_md5_hex(local_path),
+             :ok <- between_hash_and_compress(local_path),
              {:ok, tmp} <- Codec.compress_to_temp(local_path, encoding) do
           try do
-            with {:ok, size, md5, _} <- stat_and_md5(tmp) do
+            with :ok <- Codec.verify_decodes_to(tmp, encoding, plain_hex),
+                 {:ok, size, md5, _} <- stat_and_md5(tmp) do
               fun.(tmp, size, md5, plain_hex, Codec.upload_headers(encoding))
             end
           after
             File.rm(tmp)
           end
         end
+    end
+  end
+
+  # Test seam for the gap between the two reads of a compressed upload (expert review 2026-10-08
+  # #15): a test sets `:s3_between_hash_and_compress_hook` to change the file there, the race the
+  # decode check exists to catch. Unset in every real config — one env read per compressed flush.
+  defp between_hash_and_compress(path) do
+    case Application.get_env(:fathom, :s3_between_hash_and_compress_hook) do
+      nil -> :ok
+      hook -> hook.(path)
     end
   end
 
