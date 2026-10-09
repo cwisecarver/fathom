@@ -244,6 +244,31 @@ the bucket underneath the fathom-managed snapshots above:
 - **Versioning on** + a lifecycle policy to expire noncurrent versions — every fenced flush then
   leaves an automatic version trail at zero code cost, a second recovery path beneath the explicit
   snapshots.
+
+  **A version is usually NOT a SQLite file as stored.** Shard objects are compressed by default
+  (zstd since 2026-10-05; `:shard_object_encoding`), so `get-object --version-id` hands back a
+  compressed stream and `sqlite3` reports "file is not a database" (expert review 2026-10-08 #22).
+  The object's own metadata says how to read it:
+
+  ```bash
+  # 1. What the version is: Metadata.fathom-enc (zstd | zlib | absent = raw) and
+  #    Metadata.fathom-md5 (the MD5 of the DECODED database).
+  aws s3api head-object --bucket "$BUCKET" --key "<shard>.db" --version-id "$VID"
+  aws s3api get-object  --bucket "$BUCKET" --key "<shard>.db" --version-id "$VID" v.bin
+
+  # 2. Decode by that marker.
+  zstd -d v.bin -o shard.db                                   # fathom-enc = zstd
+  python3 -c 'import sys, zlib; sys.stdout.buffer.write(zlib.decompress(open(sys.argv[1], "rb").read()))' \
+    v.bin > shard.db                                          # fathom-enc = zlib
+  cp v.bin shard.db                                           # no fathom-enc: stored raw
+
+  # 3. Verify before trusting it: the MD5 must equal fathom-md5, and SQLite must accept it.
+  md5 -q shard.db        # macOS; `md5sum shard.db` on Linux
+  sqlite3 shard.db 'PRAGMA quick_check'
+  ```
+
+  A version with `fathom-enc` but no `fathom-md5` was not written by fathom; the pull path refuses
+  such an object, and so should you.
 - **Object Lock (or MFA-delete)** on the live prefix, and **cross-region/-account replication**, so
   a single bucket-level mistake or compromise can't erase every tenant at once.
 - **Least-privilege node credentials:** the data plane needs read/write on `<shard>.db` and the
