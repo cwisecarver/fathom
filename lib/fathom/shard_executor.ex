@@ -326,7 +326,7 @@ defmodule Fathom.ShardExecutor do
     # `Connection.cap_temp/1`).
     if ddl?, do: cap_temp(conn)
 
-    case Connection.query(conn, sql, args, dml?: dml?) do
+    case Connection.query(conn, sql, args, dml?: dml?, deadline: true) do
       {:ok, result} ->
         # A write bumps the shard's write counter so the periodic durability flush knows local
         # holds un-flushed changes; a read-only shard stays clean and skips the upload (the
@@ -1270,7 +1270,7 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp migrations_count(conn) do
-    case Connection.query(conn, "SELECT count(*) FROM django_migrations", []) do
+    case Connection.query(conn, "SELECT count(*) FROM django_migrations", [], deadline: true) do
       {:ok, %{rows: [[n]]}} -> n
       _ -> 0
     end
@@ -1997,7 +1997,7 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp schema_version(conn) do
-    case Connection.query(conn, "PRAGMA schema_version", []) do
+    case Connection.query(conn, "PRAGMA schema_version", [], deadline: true) do
       {:ok, %{rows: [[v]]}} when is_integer(v) -> v
       _ -> nil
     end

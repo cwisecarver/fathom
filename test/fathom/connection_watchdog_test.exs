@@ -44,11 +44,17 @@ defmodule Fathom.ConnectionWatchdogTest do
     path = Path.join(System.tmp_dir!(), "watchdog_#{System.unique_integer([:positive])}.db")
     on_exit(fn -> for s <- ["", "-wal", "-shm"], do: File.rm(path <> s) end)
 
-    {:ok, conn} = Connection.open(path)
+    {:ok, conn} = Connection.open(path, tenant?: true)
     on_exit(fn -> Connection.close(conn) end)
 
     %{conn: conn}
   end
+
+  # The deadline bounds CLIENT SQL only (expert review 2026-10-08 #11): `Connection.query/4` applies
+  # it under `deadline: true` — which `Fathom.ShardExecutor` passes — and the on-thread backstop is
+  # armed only on `tenant?: true` handles. These tests used plain handles and plain queries, which
+  # modelled the tenant path with a fixture production no longer runs it through.
+  defp query(conn, sql, args), do: Connection.query(conn, sql, args, deadline: true)
 
   defp restore(key, nil), do: Application.delete_env(:fathom, key)
   defp restore(key, value), do: Application.put_env(:fathom, key, value)
@@ -66,8 +72,8 @@ defmodule Fathom.ConnectionWatchdogTest do
     :ok = Connection.exec(conn, "CREATE TABLE t (a INTEGER)")
 
     for i <- 1..200 do
-      _ = Connection.query(conn, "INSERT INTO t VALUES (?)", [i])
-      _ = Connection.query(conn, "SELECT count(*) FROM t", [])
+      _ = query(conn, "INSERT INTO t VALUES (?)", [i])
+      _ = query(conn, "SELECT count(*) FROM t", [])
     end
 
     assert mailbox_size() == 0,
@@ -86,7 +92,7 @@ defmodule Fathom.ConnectionWatchdogTest do
   test "release_owner_state/1 returns only once the watchdog is gone (pooled handoff)",
        %{conn: conn} do
     Application.put_env(:fathom, :query_timeout_ms, 5_000)
-    assert {:ok, _} = Connection.query(conn, "SELECT 1", [])
+    assert {:ok, _} = query(conn, "SELECT 1", [])
 
     watchdog = Process.get({Connection, :watchdog, conn})
     assert is_pid(watchdog), "the query did not start a watchdog to test"
@@ -128,7 +134,7 @@ defmodule Fathom.ConnectionWatchdogTest do
     send(self(), {:timed_out, make_ref()})
     assert mailbox_size() == 2, "the fixture did not plant the residue it is about to check for"
 
-    assert {:ok, _} = Connection.query(conn, "SELECT 1", [])
+    assert {:ok, _} = query(conn, "SELECT 1", [])
 
     assert mailbox_size() == 0,
            "residue from an earlier deadline survives into a long-lived stream's mailbox, one " <>
@@ -143,7 +149,7 @@ defmodule Fathom.ConnectionWatchdogTest do
     send(self(), {:timed_out, make_ref()})
 
     result =
-      Connection.query(
+      query(
         conn,
         "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 90000000) " <>
           "SELECT count(*) FROM c",
@@ -161,7 +167,7 @@ defmodule Fathom.ConnectionWatchdogTest do
 
     # A recursive CTE that runs well past the deadline.
     result =
-      Connection.query(
+      query(
         conn,
         "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 5000000) " <>
           "SELECT count(*) FROM c",
@@ -178,7 +184,7 @@ defmodule Fathom.ConnectionWatchdogTest do
     :ok = Connection.exec(conn, "CREATE TABLE t (a INTEGER)")
 
     _ =
-      Connection.query(
+      query(
         conn,
         "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 5000000) " <>
           "SELECT count(*) FROM c",
@@ -186,7 +192,7 @@ defmodule Fathom.ConnectionWatchdogTest do
       )
 
     Application.put_env(:fathom, :query_timeout_ms, 5_000)
-    assert {:ok, %{rows: [[1]]}} = Connection.query(conn, "SELECT 1", [])
+    assert {:ok, %{rows: [[1]]}} = query(conn, "SELECT 1", [])
     assert mailbox_size() == 0
   end
 
@@ -231,13 +237,13 @@ defmodule Fathom.ConnectionWatchdogTest do
     SELECT count(*) FROM c
     """
 
-    assert {:error, :query_timeout} = Connection.query(conn, slow, [])
+    assert {:error, :query_timeout} = query(conn, slow, [])
     # A healthy query right after the timeout runs clean on the same connection — the 2026-07-18
     # #13 stale-interrupt guarantee.
-    assert {:ok, %{rows: [[1]]}} = Connection.query(conn, "SELECT 1", [])
+    assert {:ok, %{rows: [[1]]}} = query(conn, "SELECT 1", [])
     # A second timeout on the same (re-armed) watchdog fires independently.
-    assert {:error, :query_timeout} = Connection.query(conn, slow, [])
-    assert {:ok, %{rows: [[2]]}} = Connection.query(conn, "SELECT 2", [])
+    assert {:error, :query_timeout} = query(conn, slow, [])
+    assert {:ok, %{rows: [[2]]}} = query(conn, "SELECT 2", [])
   end
 
   # The defect the test above went red on (CI, OTP 29 only, job 98748804302): its SECOND slow
@@ -258,7 +264,7 @@ defmodule Fathom.ConnectionWatchdogTest do
     Application.put_env(:fathom, :query_timeout_ms, 60)
 
     # One guarded query, so the per-connection watchdog exists and is parked in its outer receive.
-    assert {:ok, _} = Connection.query(conn, "SELECT 1", [])
+    assert {:ok, _} = query(conn, "SELECT 1", [])
 
     watchdog = Process.get({Connection, :watchdog, conn})
 
@@ -281,7 +287,7 @@ defmodule Fathom.ConnectionWatchdogTest do
     SELECT count(*) FROM c
     """
 
-    assert {:error, _} = Connection.query(conn, slow, []),
+    assert {:error, _} = query(conn, slow, []),
            "the statement outran its deadline: a cancel issued before it started was lost and " <>
              "never retried, so :query_timeout_ms did not bound the query at all"
 
@@ -304,7 +310,7 @@ defmodule Fathom.ConnectionWatchdogTest do
     Application.put_env(:fathom, :query_timeout_ms, 60)
 
     # One guarded query so the per-connection watchdog is spawned and parked.
-    assert {:ok, _} = Connection.query(conn, "SELECT 1", [])
+    assert {:ok, _} = query(conn, "SELECT 1", [])
 
     watchdog = Process.get({Connection, :watchdog, conn})
 
@@ -342,7 +348,7 @@ defmodule Fathom.ConnectionWatchdogTest do
     SELECT count(*) FROM c
     """
 
-    assert {:error, _} = Connection.query(conn, slow, []),
+    assert {:error, _} = query(conn, slow, []),
            "a dead watchdog in the dict let the query run UNBOUNDED — arming must land on a live " <>
              "watchdog, never a corpse"
 
@@ -364,7 +370,7 @@ defmodule Fathom.ConnectionWatchdogTest do
     defp backstop_conn!(ms) do
       Application.put_env(:fathom, :query_timeout_ms, ms)
       path = Path.join(System.tmp_dir!(), "backstop_#{System.unique_integer([:positive])}.db")
-      {:ok, conn} = Connection.open(path)
+      {:ok, conn} = Connection.open(path, tenant?: true)
 
       on_exit(fn ->
         Connection.close(conn)
@@ -373,13 +379,13 @@ defmodule Fathom.ConnectionWatchdogTest do
 
       # PRECONDITION: the backstop is armed with this deadline. The extension answers the
       # deadline it holds; 0 would mean it was never set and these tests would prove nothing.
-      assert {:ok, %{rows: [[^ms]]}} = Connection.query(conn, "SELECT fathom_backstop(0)", [])
+      assert {:ok, %{rows: [[^ms]]}} = query(conn, "SELECT fathom_backstop(0)", [])
       conn
     end
 
     # One process suspends AND resumes (a suspension belongs to its suspender).
     defp freeze_watchdog!(conn) do
-      assert {:ok, _} = Connection.query(conn, "SELECT 1", [])
+      assert {:ok, _} = query(conn, "SELECT 1", [])
       watchdog = Process.get({Connection, :watchdog, conn})
       assert is_pid(watchdog)
       test = self()
@@ -403,7 +409,7 @@ defmodule Fathom.ConnectionWatchdogTest do
       conn = backstop_conn!(100)
       freezer = freeze_watchdog!(conn)
 
-      {us, result} = :timer.tc(fn -> Connection.query(conn, @heavy, []) end)
+      {us, result} = :timer.tc(fn -> query(conn, @heavy, []) end)
 
       # Unfixed: the query runs to completion (~5 s) and returns {:ok, ...}.
       assert {:error, :query_timeout} = result,
@@ -417,13 +423,13 @@ defmodule Fathom.ConnectionWatchdogTest do
       conn = backstop_conn!(100)
 
       # First value wins: this is ignored, and the answer is still the deadline fathom set.
-      assert {:ok, %{rows: [[100]]}} = Connection.query(conn, "SELECT fathom_backstop(0)", [])
+      assert {:ok, %{rows: [[100]]}} = query(conn, "SELECT fathom_backstop(0)", [])
 
       assert {:ok, %{rows: [[100]]}} =
-               Connection.query(conn, "SELECT fathom_backstop(999999)", [])
+               query(conn, "SELECT fathom_backstop(999999)", [])
 
       freezer = freeze_watchdog!(conn)
-      assert {:error, :query_timeout} = Connection.query(conn, @heavy, [])
+      assert {:error, :query_timeout} = query(conn, @heavy, [])
       send(freezer, :thaw)
     end
 
@@ -435,8 +441,8 @@ defmodule Fathom.ConnectionWatchdogTest do
       path =
         Path.join(System.tmp_dir!(), "backstop_lock_#{System.unique_integer([:positive])}.db")
 
-      {:ok, holder} = Connection.open(path)
-      {:ok, blocked} = Connection.open(path)
+      {:ok, holder} = Connection.open(path, tenant?: true)
+      {:ok, blocked} = Connection.open(path, tenant?: true)
 
       on_exit(fn ->
         Connection.close(blocked)
@@ -459,7 +465,7 @@ defmodule Fathom.ConnectionWatchdogTest do
       freezer = freeze_watchdog!(blocked)
 
       {us, result} =
-        :timer.tc(fn -> Connection.query(blocked, "INSERT INTO t VALUES (2)", []) end)
+        :timer.tc(fn -> query(blocked, "INSERT INTO t VALUES (2)", []) end)
 
       # Unfixed: exqlite's busy handler waits out the full 5 s busy timeout, then SQLITE_BUSY.
       assert {:error, :query_timeout} = result,
@@ -473,13 +479,13 @@ defmodule Fathom.ConnectionWatchdogTest do
       conn = backstop_conn!(100)
 
       assert {:ok, %{rows: [[5000]]}} =
-               Connection.query(conn, "SELECT fathom_busy_timeout(99999)", [])
+               query(conn, "SELECT fathom_busy_timeout(99999)", [])
 
       assert {:ok, %{rows: [[300]]}} =
-               Connection.query(conn, "SELECT fathom_busy_timeout(300)", [])
+               query(conn, "SELECT fathom_busy_timeout(300)", [])
 
       assert {:ok, %{rows: [[300]]}} =
-               Connection.query(conn, "SELECT fathom_busy_timeout(5000)", [])
+               query(conn, "SELECT fathom_busy_timeout(5000)", [])
     end
 
     # The extension's busy handler REPLACED exqlite's, so exqlite's own busy-timeout field no longer
@@ -490,7 +496,7 @@ defmodule Fathom.ConnectionWatchdogTest do
       :ok = Connection.set_busy_timeout(blocked, 300)
 
       {us, result} =
-        :timer.tc(fn -> Connection.query(blocked, "INSERT INTO t VALUES (2)", []) end)
+        :timer.tc(fn -> query(blocked, "INSERT INTO t VALUES (2)", []) end)
 
       assert {:error, :busy} = result, "expected SQLITE_BUSY, got #{inspect(result)}"
 
@@ -513,7 +519,7 @@ defmodule Fathom.ConnectionWatchdogTest do
 
       results =
         for _ <- 1..40 do
-          r = Connection.query(conn, "SELECT count(*) FROM s WHERE a % 7 = 0", [])
+          r = query(conn, "SELECT count(*) FROM s WHERE a % 7 = 0", [])
           Process.sleep(2)
           r
         end

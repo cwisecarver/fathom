@@ -151,7 +151,7 @@ defmodule Fathom.Shard.Connection do
     with :ok <- Sqlite3.set_busy_timeout(conn, 5000),
          :ok <- maybe_foreign_keys(conn),
          :ok <- maybe_cache_size(conn),
-         :ok <- load_extension(conn),
+         :ok <- load_extension(conn, tenant?),
          :ok <- maybe_authorizer(conn, tenant?),
          :ok <- maybe_harden(conn, tenant?) do
       {:ok, conn}
@@ -160,7 +160,7 @@ defmodule Fathom.Shard.Connection do
 
   defp configure_readwrite(conn, tenant?, scope) do
     with :ok <- configure(conn),
-         :ok <- load_extension(conn),
+         :ok <- load_extension(conn, tenant?),
          :ok <- maybe_authorizer(conn, tenant?),
          :ok <- maybe_harden(conn, tenant?),
          :ok <- maybe_query_only(conn, scope) do
@@ -185,9 +185,9 @@ defmodule Fathom.Shard.Connection do
   # load one of its own; see its moduledoc for that contract. A failure to re-disable fails the
   # OPEN rather than degrading, because the alternative is handing a tenant a connection with
   # arbitrary code loading enabled.
-  defp load_extension(conn) do
+  defp load_extension(conn, tenant?) do
     case Fathom.Shard.Extension.load(conn) do
-      :ok -> arm_backstop(conn)
+      :ok -> if tenant?, do: arm_backstop(conn), else: :ok
       :skipped -> :ok
       {:error, reason} -> {:error, reason}
     end
@@ -205,6 +205,10 @@ defmodule Fathom.Shard.Connection do
   #
   # A failure is logged, not fatal: the backstop is a second line, and an extension artifact that
   # predates it should not make every open fail.
+  #
+  # TENANT HANDLES ONLY (expert review 2026-10-08 #11), for the reason `query/4` gives: the deadline
+  # bounds client SQL. Armed on every handle, it also cut off fathom's own `VACUUM INTO` snapshot and
+  # `quick_check` — through `exec/2` too, which the watchdog never covered.
   defp arm_backstop(conn) do
     case timeout_ms() do
       ms when is_integer(ms) and ms > 0 ->
@@ -537,6 +541,9 @@ defmodule Fathom.Shard.Connection do
   @doc """
   Runs `sql` (with native-value `args`) on `conn`, returning native Elixir values
   in `{:ok, %{columns, rows, num_changes, last_insert_rowid}}` or `{:error, _}`.
+
+  `deadline: true` bounds the statement by `:query_timeout_ms`. Only CLIENT SQL passes it — see
+  the comment in the body for why fathom's own statements do not.
   """
   @spec query(reference(), String.t(), list(), keyword()) :: {:ok, map()} | {:error, term()}
   def query(conn, sql, args, opts \\ []) do
@@ -546,8 +553,17 @@ defmodule Fathom.Shard.Connection do
     # query (missing-index full scan) is interrupted so it can't pin memory and keep the shard busy
     # (blocking eviction/drain/handoff). Only armed when configured — unset ⇒ no watchdog, no
     # overhead (the default, matching fathom's other protective knobs).
-    case timeout_ms() do
-      nil ->
+    #
+    # CLIENT SQL ONLY (expert review 2026-10-08 #11, verified by execution). This applied to every
+    # caller, so fathom's own durability work ran under the tenant's 30 s budget: with the deadline
+    # at 20 ms a 58 MB shard's snapshot returned `{:error, :query_timeout}` and `Integrity.verify`
+    # `{:quick_check_failed, :query_timeout}`. In prod that is a shard large or I/O-starved enough
+    # that its `quick_check` passes 30 s — it can then never complete a periodic flush (unbounded
+    # RPO), and its drop keeps the local copy instead of uploading it. The deadline bounds what a
+    # CLIENT can make the node do; `Fathom.ShardExecutor` is the one path that runs client SQL, and
+    # it opts in.
+    case Keyword.get(opts, :deadline, false) && timeout_ms() do
+      falsy when falsy in [nil, false] ->
         do_query(conn, sql, args, dml?)
 
       ms when is_integer(ms) and ms > 0 ->
