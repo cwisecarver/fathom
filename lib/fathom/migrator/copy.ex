@@ -108,11 +108,27 @@ defmodule Fathom.Migrator.Copy do
           # table-rebuild chain, 3 runs each): 1,124-1,145 ms per-step vs 917-935 ms once, -18%;
           # single-step migrations are unchanged. Each step still commits and stamps its own
           # `user_version`, so a mid-chain failure still leaves the copy at the last applied step.
-          Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
+          fold_wal(conn)
         end
       after
         Connection.close(conn)
       end
+    end
+  end
+
+  # The fold's RESULT is checked, not just its return code (expert review 2026-10-08 #25). The
+  # pragma "succeeds" when it could not finish — a reader still holding a snapshot makes it return
+  # `busy = 1`, with the frames past that reader's mark left in the WAL — and since the fold moved to
+  # once per chain (60c0b99) it is the only thing that puts the whole chain into the main file before
+  # the main file alone is uploaded. `verify_migrated` and `verify_ledger` read THROUGH the WAL, so
+  # they pass on exactly that incomplete file, and all three version stamps would then claim a
+  # migration the uploaded bytes do not hold. The likely culprit is a `Transform` that leaves a
+  # statement or a second connection open; failing the chain discards the copy, as any step failure does.
+  defp fold_wal(conn) do
+    case Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", []) do
+      {:ok, %{rows: [[0, log, log]]}} -> :ok
+      {:ok, %{rows: [row]}} -> {:error, {:wal_fold_incomplete, row}}
+      {:error, reason} -> {:error, {:wal_fold_failed, reason}}
     end
   end
 
