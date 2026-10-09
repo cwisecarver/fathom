@@ -842,7 +842,14 @@ defmodule Fathom.Shard.Connection do
     drain_stale_timeouts()
 
     ref = make_ref()
-    watchdog = arm_watchdog(conn, ref, ms)
+    # THE WATCHDOG ANSWERS AN ALIAS, NOT THIS PID (expert review 2026-10-08 #27). The sweep above
+    # only helps if the owner runs another guarded query; when the near-miss is the LAST statement
+    # of a request, the stray `{:timed_out, ref}` reached the owner's mailbox and — the owner being
+    # a `Filo.Stream` GenServer with no catch-all `handle_info` — crashed the stream (lost
+    # interactive transaction, STREAM_NOT_FOUND to the client, an over-dirtied shard). The alias is
+    # dropped below, after which the runtime discards any late send to it outright.
+    reply_to = Process.alias()
+    watchdog = arm_watchdog(conn, ref, ms, reply_to)
 
     # Always disarm, even if fun raises (Sqlite3.bind raises ArgumentError on a bad bind
     # value — the reason query/3 has a rescue). Without try/after the raise unwinds before the
@@ -857,6 +864,10 @@ defmodule Fathom.Shard.Connection do
       after
         send(watchdog, {:done, ref})
       end
+
+    # Unalias BEFORE the peek: a send that beat the unalias is already in the mailbox and the peek
+    # finds it; one after it is discarded by the runtime and can never become residue.
+    Process.unalias(reply_to)
 
     timed_out? =
       receive do
@@ -913,13 +924,13 @@ defmodule Fathom.Shard.Connection do
   # anyway.
   @arm_attempts 3
 
-  defp arm_watchdog(conn, ref, ms, attempts \\ @arm_attempts) do
+  defp arm_watchdog(conn, ref, ms, reply_to, attempts \\ @arm_attempts) do
     watchdog = ensure_watchdog(conn)
-    send(watchdog, {:arm, ref, ms, self()})
+    send(watchdog, {:arm, ref, ms, reply_to})
 
     cond do
       Process.alive?(watchdog) -> watchdog
-      attempts > 0 -> arm_watchdog(conn, ref, ms, attempts - 1)
+      attempts > 0 -> arm_watchdog(conn, ref, ms, reply_to, attempts - 1)
       true -> watchdog
     end
   end
