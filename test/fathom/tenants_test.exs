@@ -524,6 +524,21 @@ defmodule Fathom.TenantsTest do
   end
 
   describe "suspend/1 and resume/1" do
+    # Fix-review R3-6. Symptom: Directory.resume flipped the row but the broadcast failed; the retry
+    # saw an `active` row, got :status_conflict, and this node's gate stayed set forever.
+    test "a retried resume on an already-active row re-announces the resume", %{id: id} do
+      {:ok, _} = Directory.resolve(id)
+      assert :ok = Tenants.suspend(id)
+      assert :ok = Tenants.resume(id)
+
+      # Simulate the lost broadcast: the gate is still set although the row is active.
+      Suspensions.put(id)
+      assert Tenants.suspended?(id)
+
+      assert :ok = Tenants.resume(id)
+      refute Tenants.suspended?(id)
+    end
+
     test "suspend denies admission (403) and resume restores service", %{id: id} do
       {:ok, _} = Directory.resolve(id)
 

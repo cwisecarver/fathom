@@ -931,9 +931,13 @@ defmodule Fathom.DirectoryTest do
       end
     end
 
-    test "resume refuses an active row; suspend/resume round-trips from active" do
+    # Previously asserted `{:error, :status_conflict}` on an active row. That pinned a defect
+    # (fix-review R3-6): a resume whose broadcast failed was retried, got :status_conflict, and never
+    # re-broadcast. resume is now idempotent on `active`; suspend stays strict about its source.
+    test "resume is idempotent on an active row; suspend/resume round-trips from active" do
       shard = seeded("active")
-      assert {:error, :status_conflict} = Directory.resume(shard)
+      assert {:ok, %Shard{status: "active"}} = Directory.resume(shard)
+      assert {:ok, %Shard{status: "active"}} = Directory.resume(shard)
 
       assert {:ok, %Shard{status: "suspended"}} = Directory.suspend(shard)
       # idempotent re-suspend

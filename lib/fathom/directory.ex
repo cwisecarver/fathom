@@ -826,15 +826,21 @@ defmodule Fathom.Directory do
 
   @doc """
   Resumes a suspended shard back to `active` (#20). Refuses `:not_found` or `:deleted`, and
-  `{:error, :status_conflict}` for any row that is not `suspended` — resuming a `migrating` /
-  `migration_failed` / `retired` row used to flip it to `active` (expert review 2026-10-10 #10).
+  `{:error, :status_conflict}` for a `migrating` / `migration_failed` / `retired` row, which used
+  to be flipped to `active` (expert review 2026-10-10 #10). An already-`active` row returns
+  `{:ok, row}` untouched, so a retried resume still re-broadcasts (fix-review R3-6).
   """
   @spec resume(String.t()) ::
           {:ok, Shard.t()}
           | {:error, :not_found | :deleted | :status_conflict | Ecto.Changeset.t()}
   def resume(shard_id) do
-    with {:ok, %Shard{status: status}} when status != "deleted" <- fetch_for_status(shard_id) do
-      guarded_update_shard(shard_id, %{status: "active"}, ["suspended"])
+    case fetch_for_status(shard_id) do
+      # Idempotent (fix-review R3-6): an `active` row means an earlier resume already landed, so a
+      # retry after a failed broadcast must reach `Tenants.resume`'s re-broadcast rather than
+      # getting `:status_conflict` and never re-announcing. Only `suspend` stays strict about source.
+      {:ok, %Shard{status: "active"} = shard} -> {:ok, shard}
+      {:ok, %Shard{}} -> guarded_update_shard(shard_id, %{status: "active"}, ["suspended"])
+      {:error, _} = error -> error
     end
   end
 
