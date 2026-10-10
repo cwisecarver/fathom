@@ -1039,6 +1039,17 @@ defmodule Fathom.Telemetry do
         description:
           "Admin-auth requests refused with 429 because the source IP is locked out (too many failures in the window) (#34)"
       ),
+      # Expert review 2026-10-10 panel2 W8: the same signals for /api Bearer keys, counted apart
+      # so a key-guessing flood is distinguishable from a password one.
+      counter("fathom.api_key_auth.failed.count",
+        event_name: [:fathom, :api_key_auth, :failed],
+        description: "Failed /api Bearer-key attempts — the brute-force signal for API keys"
+      ),
+      counter("fathom.api_key_auth.blocked.count",
+        event_name: [:fathom, :api_key_auth, :blocked],
+        description:
+          "/api Bearer requests refused with 429 because the source is locked out after too many bad keys"
+      ),
       counter("fathom.api.rate_limited.count",
         event_name: [:fathom, :api, :rate_limited],
         description:
