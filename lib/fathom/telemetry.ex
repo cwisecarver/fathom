@@ -169,6 +169,17 @@ defmodule Fathom.Telemetry do
           "Coordinator shutdowns that kept the local shard copy because connections were still " <>
             "checked out, instead of unlinking it under the streams still using it"
       ),
+      # A warm open's fork-evidence HEAD timed out (fix-review R1-5). `attempt` is 1 | 2 (bounded);
+      # attempt 2 means the retry also timed out and the open served warm on the provenance-etag
+      # fence alone. A sustained rate means the store is slow on exactly the check that decides
+      # whether a possibly-forked local copy may serve. No shard_id tag (cardinality).
+      counter("fathom.shard.fork_evidence.timeout.count",
+        event_name: [:fathom, :shard, :fork_evidence, :timeout],
+        tags: [:attempt],
+        description:
+          "Warm-open fork-evidence HEADs that timed out (attempt 1 is retried once; attempt 2 " <>
+            "serves the local copy warm, fenced only by the provenance etag)"
+      ),
       counter("fathom.shard.replica_promoted.count",
         event_name: [:fathom, :shard, :replica_promoted],
         description:

@@ -254,4 +254,176 @@ defmodule Fathom.ShardCoordinatorOpenTest do
       assert state.lapse_revalidate_pending == true
     end
   end
+
+  for mode <- @modes do
+    describe "#{mode} mode — fix-review R1-1 / R1-2 (orphan coordinator)" do
+      # Kill the coordinator's Registry partition, then start the REPLACEMENT coordinator while the
+      # orphan is still alive (it stops itself ~250 ms later via :verify_registration).
+      defp orphan_and_replacement(shard) do
+        {:ok, orphan} = Shards.ensure(shard)
+        {:links, links} = Process.info(orphan, :links)
+
+        partition =
+          Enum.find(links, fn pid ->
+            match?({:registered_name, n} when is_atom(n), Process.info(pid, :registered_name)) and
+              String.starts_with?(
+                Atom.to_string(elem(Process.info(pid, :registered_name), 1)),
+                "Elixir.Fathom.ShardRegistry."
+              )
+          end)
+
+        assert is_pid(partition)
+        ref = Process.monitor(orphan)
+        Process.exit(partition, :kill)
+        {orphan, ref, wait_replacement(shard, orphan, 50)}
+      end
+
+      defp safe_ensure(shard) do
+        Shards.ensure(shard)
+      catch
+        :exit, reason -> {:exit, reason}
+      end
+
+      defp wait_replacement(_shard, _orphan, 0), do: flunk("no replacement coordinator started")
+
+      defp wait_replacement(shard, orphan, n) do
+        case safe_ensure(shard) do
+          {:ok, pid} when pid != orphan ->
+            pid
+
+          _ ->
+            Process.sleep(10)
+            wait_replacement(shard, orphan, n - 1)
+        end
+      end
+
+      test "an orphan's registry_lost stop leaves the replacement's files and lease intact",
+           %{shard: shard} do
+        set_mode!(unquote(mode))
+        seed!(shard)
+
+        capture_log(fn ->
+          {orphan, ref, replacement} = orphan_and_replacement(shard)
+          assert_mode!(replacement, unquote(mode))
+
+          # Send the check now rather than wait out the 250 ms timer.
+          send(orphan, :verify_registration)
+          assert_receive {:DOWN, ^ref, :process, ^orphan, {:shutdown, :registry_lost}}, 5_000
+
+          # Pre-fix: the orphan's terminate ran flush_and_drop -> drop_local (deleting the
+          # replacement's .db/-wal/-shm/.etag) and released the lease the replacement holds.
+          assert Process.alive?(replacement)
+          assert File.exists?(Shard.db_path(shard)), "the orphan deleted the replacement's .db"
+
+          refute Storage.lease_holder(shard) == :free,
+                 "the orphan released the replacement's lease"
+
+          {:ok, conn} = ShardExecutor.open(shard)
+          assert {:ok, _} = ShardExecutor.execute(conn, stmt("SELECT v FROM kv"))
+          :ok = ShardExecutor.close(conn)
+        end)
+      end
+
+      # Not deterministic pre-fix: whether Registry.lookup/2 RAISES (ETS table gone) or returns []
+      # depends on how fast the supervisor restarts the partition. Post-fix both end in the same
+      # clean registry_lost stop, never a crash.
+      test "a verify racing the partition restart never crashes the coordinator",
+           %{shard: shard} do
+        set_mode!(unquote(mode))
+        seed!(shard)
+        {:ok, orphan} = Shards.ensure(shard)
+        {:links, links} = Process.info(orphan, :links)
+
+        partition =
+          Enum.find(links, fn pid ->
+            case Process.info(pid, :registered_name) do
+              {:registered_name, n} when is_atom(n) ->
+                String.starts_with?(Atom.to_string(n), "Elixir.Fathom.ShardRegistry.")
+
+              _ ->
+                false
+            end
+          end)
+
+        ref = Process.monitor(orphan)
+
+        capture_log(fn ->
+          Process.exit(partition, :kill)
+          send(orphan, :verify_registration)
+          assert_receive {:DOWN, ^ref, :process, ^orphan, reason}, 5_000
+          assert reason == {:shutdown, :registry_lost}
+        end)
+      end
+    end
+
+    describe "#{mode} mode — fix-review R1-5 (fork-evidence timeout)" do
+      setup %{shard: shard} do
+        set_mode!(unquote(mode))
+        seed!(shard)
+        {:ok, first} = Shards.ensure(shard)
+        assert_mode!(first, unquote(mode))
+        assert :ok = Shards.flush(shard)
+        ref = Process.monitor(first)
+        Process.exit(first, :kill)
+        assert_receive {:DOWN, ^ref, :process, ^first, _}, 5_000
+
+        Application.put_env(:fathom, :fork_evidence_timeout_ms, 100)
+        test_pid = self()
+        id = {:fork_evidence_timeout, make_ref()}
+
+        :telemetry.attach(
+          id,
+          [:fathom, :shard, :fork_evidence, :timeout],
+          fn _e, _m, meta, _ -> send(test_pid, {:fe_timeout, meta.attempt}) end,
+          nil
+        )
+
+        on_exit(fn -> :telemetry.detach(id) end)
+        :ok
+      end
+
+      test "a single slow HEAD is retried once and the retry's verdict is used", %{shard: shard} do
+        calls = :counters.new(1, [])
+
+        Application.put_env(
+          :fathom,
+          :faulty_before,
+          {:object_etag,
+           fn
+             ^shard ->
+               :counters.add(calls, 1, 1)
+               if :counters.get(calls, 1) == 1, do: Process.sleep(3_000)
+
+             _ ->
+               :ok
+           end}
+        )
+
+        {:ok, second} = Shards.ensure(shard)
+        {:ok, _ref, _path} = Shard.checkout(second)
+
+        assert_received {:fe_timeout, 1}
+        refute_received {:fe_timeout, 2}
+        assert :counters.get(calls, 1) >= 2, "the HEAD was not retried"
+      end
+
+      test "two timeouts emit attempts 1 and 2 and the open still serves warm", %{shard: shard} do
+        Application.put_env(
+          :fathom,
+          :faulty_before,
+          {:object_etag,
+           fn
+             ^shard -> Process.sleep(3_000)
+             _ -> :ok
+           end}
+        )
+
+        {:ok, second} = Shards.ensure(shard)
+        {:ok, _ref, _path} = Shard.checkout(second)
+
+        assert_received {:fe_timeout, 1}
+        assert_received {:fe_timeout, 2}
+      end
+    end
+  end
 end

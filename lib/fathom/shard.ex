@@ -498,18 +498,7 @@ defmodule Fathom.Shard do
     # handle_continue exits with a NON-{:shutdown, _} reason, release_lease never ran and
     # terminate/2 fell to the pre-open clause that has no lease to release. The lock survived,
     # and while this node's heartbeat stayed fresh every peer read {:held, us}.
-    fork_task =
-      if file? do
-        Task.async(fn ->
-          try do
-            Fork.evidence(shard_id, path)
-          rescue
-            _ -> :unreachable
-          catch
-            :exit, _ -> :unreachable
-          end
-        end)
-      end
+    fork_task = if file?, do: start_fork_evidence(shard_id, path)
 
     pull_task = if file?, do: nil, else: Materializer.start_pull(shard_id, path)
 
@@ -616,7 +605,7 @@ defmodule Fathom.Shard do
     # forked flush 412s and self-fences rather than clobbering.
     warm? =
       file? and
-        not Fork.resolve(await_fork_evidence(fork_task), shard_id, path, lease)
+        not Fork.resolve(await_fork_evidence(fork_task, shard_id, path), shard_id, path, lease)
 
     pull_task = pull_task || if warm?, do: nil, else: Materializer.start_pull(shard_id, path)
     result = open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen)
@@ -663,16 +652,66 @@ defmodule Fathom.Shard do
   defp abandon_fork_check(nil), do: :ok
   defp abandon_fork_check(task), do: Task.shutdown(task, :brutal_kill)
 
+  # Rescued like start_pull/2 (expert review 2026-08-01 #33): a raise in the storage HEAD must not
+  # become an exit in the awaiting coordinator.
+  defp start_fork_evidence(shard_id, path) do
+    Task.async(fn ->
+      try do
+        Fork.evidence(shard_id, path)
+      rescue
+        _ -> :unreachable
+      catch
+        :exit, _ -> :unreachable
+      end
+    end)
+  end
+
   # Bounded consumption of the overlapped fork-evidence HEAD (expert review 2026-08-01 #33).
   # Anything other than a clean, timely verdict is `:unreachable` — resolve_fork/4's fail-safe.
+  #
+  # A TIMEOUT (not an in-task error) is retried ONCE and is observable (expert review 2026-10-10
+  # #29 shrank the wait to 5 s; fix-review R1-5): `:unreachable` means warm-serve, fenced only by
+  # the provenance etag, so one slow HEAD should not quietly decide a possibly-forked copy serves.
+  # Each timeout emits `[:fathom, :shard, :fork_evidence, :timeout]` (tag `attempt`: 1 | 2 — a
+  # bounded set; never the shard id). Worst case is two bounded waits, still far under the checkout
+  # budget.
+  defp await_fork_evidence(task, shard_id, path) do
+    case Task.yield(task, fork_evidence_timeout()) || Task.shutdown(task, :brutal_kill) do
+      {:ok, verdict} ->
+        verdict
+
+      _ ->
+        fork_evidence_timed_out(shard_id, 1)
+        retry = start_fork_evidence(shard_id, path)
+
+        case Task.yield(retry, fork_evidence_timeout()) || Task.shutdown(retry, :brutal_kill) do
+          {:ok, verdict} ->
+            verdict
+
+          _ ->
+            fork_evidence_timed_out(shard_id, 2)
+            :unreachable
+        end
+    end
+  end
+
   defp fork_evidence_timeout,
     do: Application.get_env(:fathom, :fork_evidence_timeout_ms, @fork_evidence_timeout)
 
-  defp await_fork_evidence(task) do
-    case Task.yield(task, fork_evidence_timeout()) || Task.shutdown(task, :brutal_kill) do
-      {:ok, verdict} -> verdict
-      _ -> :unreachable
-    end
+  defp fork_evidence_timed_out(shard_id, attempt) do
+    Logger.warning(
+      "shard #{shard_id}: fork-evidence HEAD timed out (attempt #{attempt}); " <>
+        if(attempt == 1,
+          do: "retrying once",
+          else: "serving the local copy warm (fenced by etag)"
+        )
+    )
+
+    :telemetry.execute(
+      [:fathom, :shard, :fork_evidence, :timeout],
+      %{count: 1},
+      %{shard_id: shard_id, attempt: attempt}
+    )
   end
 
   defp open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen) do
@@ -1159,9 +1198,33 @@ defmodule Fathom.Shard do
   # suite and no log: a superseded coordinator then keeps ACKing writes until its next flush, which
   # is exactly the defect review #34 was written to fix. The failure is still non-fatal — the
   # flush-time fence remains the hard guard — but it is now visible.
-  defp registered?(shard_id),
-    do:
-      Enum.any?(Registry.lookup(Fathom.ShardRegistry, shard_id), fn {pid, _} -> pid == self() end)
+  #
+  # `Registry.lookup/2` RAISES ArgumentError while the partition's ETS table is being rebuilt after a
+  # partition restart (fix-review R1-2) — exactly the window this check exists for. `:unknown` lets
+  # the caller re-arm once instead of crashing the coordinator (a crash with a non-`{:shutdown, _}`
+  # reason would run the drop path against a file that may belong to the replacement).
+  defp registered?(shard_id) do
+    Enum.any?(Registry.lookup(Fathom.ShardRegistry, shard_id), fn {pid, _} -> pid == self() end)
+  rescue
+    ArgumentError -> :unknown
+  end
+
+  # `first?` re-arms ONE more check when the lookup itself was unavailable; a second `:unknown` is
+  # treated as unregistered (fix-review R1-2).
+  defp verify_registration(state, first?) do
+    case registered?(state.id) do
+      true ->
+        {:noreply, state}
+
+      :unknown when first? ->
+        Process.send_after(self(), :verify_registration_retry, 250)
+        {:noreply, state}
+
+      _ ->
+        Logger.error("shard #{state.id}: lost its Registry registration; stopping the orphan")
+        {:stop, {:shutdown, :registry_lost}, state}
+    end
+  end
 
   defp subscribe_lapse do
     Phoenix.PubSub.subscribe(Fathom.PubSub, Heartbeat.topic())
@@ -1560,14 +1623,8 @@ defmodule Fathom.Shard do
     {:noreply, state}
   end
 
-  def handle_info(:verify_registration, state) do
-    if registered?(state.id) do
-      {:noreply, state}
-    else
-      Logger.error("shard #{state.id}: lost its Registry registration; stopping the orphan")
-      {:stop, {:shutdown, :registry_lost}, state}
-    end
-  end
+  def handle_info(:verify_registration, state), do: verify_registration(state, true)
+  def handle_info(:verify_registration_retry, state), do: verify_registration(state, false)
 
   # A stale timer firing after the drain already resolved (resume_serving cancelled
   # it, but a fire could already be in flight) must be inert — pre-guard it could
@@ -1938,6 +1995,18 @@ defmodule Fathom.Shard do
   end
 
   @impl true
+  # An ORPHAN (expert review 2026-10-10 #5): our Registry registration is gone, so a replacement
+  # coordinator may already own this shard's `.db`/`-wal`/`-shm`/`.etag`, its lease, and every
+  # shard-id-keyed ETS row (write fence, watermark, load, LRU). All of that is the replacement's
+  # now — flushing, dropping, releasing the lease or `forget`-ing any of it would destroy the live
+  # coordinator's state (fix-review R1-1). Close only what is ours alone: the handle pool, and
+  # answer any pending flush waiters. Open stream connections end with their streams.
+  def terminate({:shutdown, :registry_lost}, state) do
+    close_pool(state)
+    settle_waiters(state, {:error, :coordinator_stopped})
+    :ok
+  end
+
   def terminate(_reason, %{lease_lost: true} = state) do
     close_pool(state)
 
