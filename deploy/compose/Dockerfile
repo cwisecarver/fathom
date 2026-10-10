@@ -29,9 +29,11 @@ RUN apt-get update -y && apt-get install -y build-essential git curl \
 # backstop, size limits, Django UDFs). `mix compile.fathom_udf` SKIPS without cargo, and since
 # expert review 2026-10-10 #8 a prod node without the artifact REFUSES TO BOOT (ALLOW_NO_UDF=true
 # overrides) — so this image must build it.
+# Toolchain pinned to 1.98.0 (the version `rustc --version` reports on the build host), not
+# `stable`, so the same Dockerfile does not produce a different extension binary as stable moves.
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-  | sh -s -- -y --profile minimal --default-toolchain stable \
+  | sh -s -- -y --profile minimal --default-toolchain 1.98.0 \
   && rustc --version && cargo --version
 
 ENV MIX_ENV=prod
@@ -63,7 +65,14 @@ ENV WEB_INSECURE_LOCAL=${WEB_INSECURE_LOCAL}
 
 # Compile FIRST: colocated LiveView hooks are extracted at compile time and the esbuild bundle
 # imports them. Then build + digest assets (config/prod.exs expects the cache manifest at boot).
-RUN mix compile
+# The cargo target dir and registry are BuildKit cache mounts, not image layers: this RUN sits
+# below COPY lib, so every lib/ edit re-ran it, and without the mounts cargo rebuilt the crate from
+# scratch each time. With them cargo is incremental across builds. The .so still lands in
+# priv/sqlite_ext/ inside the image, which is what the release packages.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/fathom/native/fathom_udf/target \
+    mix compile
 RUN mix assets.setup && mix assets.deploy
 
 # Runtime config changes shouldn't bust the compile cache.
@@ -73,7 +82,11 @@ COPY fathom/config/runtime.exs config/
 # flags is absent from the image — this is the canonical deployable image, so that omission shipped
 # ERTS defaults to every container deployment while the release was believed to be tuned.
 COPY fathom/rel rel
-RUN mix release
+# Same cache mounts as `mix compile`: mix release re-runs the :fathom_udf compiler, which calls cargo.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/fathom/native/fathom_udf/target \
+    mix release
 
 FROM ${RUNNER_IMAGE}
 

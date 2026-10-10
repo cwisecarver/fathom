@@ -21,9 +21,12 @@ RUN apt-get update -y && apt-get install -y build-essential git curl \
 # contributor without Rust can still build fathom) and the rig would come up silently lacking
 # django_date_extract / Trunc* / regexp — a difference between the rig and production that the
 # rig exists to NOT have.
+# Toolchain pinned to the version the crate is developed against (`rustc --version` on the
+# build host, 1.98.0), not `stable`: `stable` moves under the image's feet, so the same
+# Dockerfile could produce a different extension binary on each rebuild.
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-  | sh -s -- -y --profile minimal --default-toolchain stable \
+  | sh -s -- -y --profile minimal --default-toolchain 1.98.0 \
   && rustc --version && cargo --version
 
 ENV MIX_ENV=prod
@@ -53,7 +56,16 @@ COPY fathom/native native
 ENV WEB_INSECURE_LOCAL=1
 # Compile FIRST: colocated LiveView hooks are extracted into the build dir at
 # compile time and the esbuild bundle imports them (phoenix-colocated/fathom).
-RUN mix compile
+# The cargo target dir and registry are BuildKit cache mounts, NOT image layers. Without them,
+# every lib/ edit (which invalidates this RUN, since COPY lib sits above it) re-ran cargo from
+# scratch, because the crate's target/ was never in an image layer to reuse. With them cargo
+# is incremental across builds, so a lib/-only change recompiles only the Elixir app plus a
+# cargo no-op. The built .so is still copied into priv/sqlite_ext/ inside the image, so the
+# release carries it. `mix release` below also runs the :fathom_udf compiler, hence the same mounts.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/fathom/native/fathom_udf/target \
+    mix compile
 # Downloads the tailwind/esbuild binaries on first run, builds + digests assets
 # (config/prod.exs expects priv/static/cache_manifest.json at endpoint boot).
 RUN mix assets.setup && mix assets.deploy
@@ -66,7 +78,12 @@ COPY fathom/config/runtime.exs config/
 # release was believed to be running 64. Verified by reading the limits back out of a booted node,
 # which is the only way to catch it — a rendered-template test passes either way.
 COPY fathom/rel rel
-RUN mix release
+# Same cache mounts as `mix compile` above: mix release re-runs the :fathom_udf compiler, which
+# calls cargo. Without the mounts that is a second from-scratch crate build in this layer.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/fathom/native/fathom_udf/target \
+    mix release
 
 FROM ${RUNNER_IMAGE}
 
