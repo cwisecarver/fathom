@@ -876,6 +876,10 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
+  # SCOPE (fix-review R1-3): the refusal lasts only as long as the coordinator is registered. After
+  # an idle-drop a still-alive DEPOSED owner can re-seed this node again; that is bounded by its own
+  # self-fence (it cannot keep a quorum or flush under a stale epoch). A durable lineage floor that
+  # outlives the coordinator was the rejected alternative (user decision 2026-10-10).
   defp coordinated_here?(name, shard_id) do
     case :ets.lookup(locks(name), :__coordinator_registry__) do
       # Only a coordinator that HOLDS the lease counts (`Fathom.Shard` marks its registry entry

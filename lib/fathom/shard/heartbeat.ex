@@ -385,6 +385,10 @@ defmodule Fathom.Shard.Heartbeat do
     # can ONLY trip `mark_lapse` here — it never sets or extends `mono_deadline_ms`, so a wall step
     # cannot inflate validity (the #21 hazard stays closed; a backward step yields a negative
     # elapsed and trips nothing).
+    #
+    # KNOWN, ACCEPTED (fix-review R1-4): a FORWARD wall step of >= ~margin (NTP jump, VM clock
+    # resync) is indistinguishable from a suspend here and trips a node-wide lapse. The cost is a
+    # revalidate herd (every coordinator re-checks its fence once), not an outage.
     state =
       if not state.lapsed and not is_nil(state.mono_deadline_ms) and
            (now > state.mono_deadline_ms or suspend_forces_lapse?(state, now, wall)),
