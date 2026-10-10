@@ -248,7 +248,18 @@ the bucket underneath the fathom-managed snapshots above:
   **A version is usually NOT a SQLite file as stored.** Shard objects are compressed by default
   (zstd since 2026-10-05; `:shard_object_encoding`), so `get-object --version-id` hands back a
   compressed stream and `sqlite3` reports "file is not a database" (expert review 2026-10-08 #22).
-  The object's own metadata says how to read it:
+  **One command does all of it:**
+
+  ```bash
+  mix fathom.shard pull <shard> shard.db --version-id "$VID"
+  sqlite3 shard.db 'PRAGMA quick_check'
+  ```
+
+  It fetches that version (`GET ?versionId=`) through the same decode + plaintext-digest check +
+  atomic promote as a normal pull, so `shard.db` is the verified database or nothing is written; it
+  refuses an encoded version with no `fathom-md5`, and needs the S3 backend. In a release (no Mix),
+  the node-console equivalent is `Fathom.Shard.Storage.pull_object_version(shard, vid, path)`.
+  With neither at hand, the object's own metadata says how to read it by hand:
 
   ```bash
   # 1. What the version is: Metadata.fathom-enc (zstd | zlib | absent = raw) and

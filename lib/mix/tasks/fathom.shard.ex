@@ -7,6 +7,7 @@ defmodule Mix.Tasks.Fathom.Shard do
   an undocumented key layout under incident pressure.
 
       mix fathom.shard pull <shard> [<path>]        # download the stored .db (default ./<shard>.db)
+      mix fathom.shard pull <shard> [<path>] --version-id <id>  # a noncurrent S3 bucket VERSION
       mix fathom.shard inspect <shard>              # pull + read-only quick_check, user_version, tables
       mix fathom.shard fork <src> <dst>             # clone a live tenant to a NEW shard id (+ token)
       mix fathom.shard quarantines                  # list local quarantine files (shard, kind, age, size)
@@ -16,6 +17,12 @@ defmodule Mix.Tasks.Fathom.Shard do
   is a real, `quick_check`-clean database and reports its schema version and per-table row counts.
   An untested restore path is an unproven backup; run `inspect` on a sample of shards regularly (a
   scheduled fleet drill is a follow-up).
+
+  `pull --version-id <id>` recovers one S3 bucket version of the live object (versioning on, see
+  docs/durability.md "Harden the bucket"). A version is usually stored compressed, so its raw bytes
+  are not a SQLite file; this runs the version through the same decode + plaintext-digest check +
+  atomic promote as a normal pull, and refuses an encoded version with no `fathom-md5` (expert
+  review 2026-10-08 #22). S3 backend only.
 
   `quarantines` and `quarantine-diff` are the recovery tools for the coordinator's designated
   data-loss artifacts (expert review #23): the `.db.fenced/.forked/.corrupt` files it renames aside
@@ -44,6 +51,24 @@ defmodule Mix.Tasks.Fathom.Shard do
   def run(args) do
     Mix.Task.run("app.config")
 
+    {opts, args} = parse_opts!(args)
+
+    case {args, opts[:version_id]} do
+      {["pull", shard], vid} when is_binary(vid) ->
+        pull_version(shard, vid, "#{shard}.db")
+
+      {["pull", shard, path], vid} when is_binary(vid) ->
+        pull_version(shard, vid, path)
+
+      {_, vid} when is_binary(vid) ->
+        Mix.raise("--version-id only applies to: mix fathom.shard pull <shard> [path]")
+
+      {args, nil} ->
+        dispatch(args)
+    end
+  end
+
+  defp dispatch(args) do
     case args do
       ["pull", shard] ->
         pull(shard, "#{shard}.db")
@@ -71,7 +96,7 @@ defmodule Mix.Tasks.Fathom.Shard do
 
       _ ->
         Mix.raise(
-          "usage: mix fathom.shard pull <shard> [path] | inspect <shard> | fork <src> <dst> | " <>
+          "usage: mix fathom.shard pull <shard> [path] [--version-id <id>] | inspect <shard> | fork <src> <dst> | " <>
             "loss-report [limit] | quarantines | quarantine-diff <file> <shard>"
         )
     end
@@ -84,6 +109,50 @@ defmodule Mix.Tasks.Fathom.Shard do
       {:absent, _} -> Mix.raise("no stored object for #{shard} (never flushed, or deleted)")
       {:ok, etag} -> Mix.shell().info("pulled #{shard} -> #{path} (etag #{inspect(etag)})")
       {:error, reason} -> Mix.raise("pull failed: #{inspect(reason)}")
+    end
+  end
+
+  defp parse_opts!(args) do
+    case OptionParser.parse(args, strict: [version_id: :string]) do
+      {opts, positional, []} -> {opts, positional}
+      {_, _, invalid} -> Mix.raise("unknown or malformed option(s): #{inspect(invalid)}")
+    end
+  end
+
+  # One noncurrent bucket version (expert review 2026-10-08 #22), decoded and digest-verified by the
+  # same path as `pull`, so the file written is the database the version stored — or nothing.
+  defp pull_version(_shard, "", _path), do: Mix.raise("--version-id must not be empty")
+
+  defp pull_version(shard, version_id, path) do
+    storage_deps!()
+
+    case Storage.pull_object_version(shard, version_id, path) do
+      {:ok, etag} ->
+        Mix.shell().info(
+          "pulled #{shard} version #{version_id} -> #{path} (etag #{inspect(etag)}; decoded and " <>
+            "digest-verified). Check it: sqlite3 #{path} 'PRAGMA quick_check'"
+        )
+
+      {:error, {:object_versions_unsupported, backend}} ->
+        Mix.raise(
+          "--version-id needs the S3 storage backend (bucket object versions); " <>
+            "the configured backend is #{inspect(backend)}"
+        )
+
+      {:error, :no_such_version} ->
+        Mix.raise("no version #{version_id} of #{shard}'s object (wrong id, or expired)")
+
+      {:error, :sentinel_version} ->
+        Mix.raise("version #{version_id} of #{shard} is a steal sentinel, not database bytes")
+
+      {:error, {:missing_plain_digest, enc}} ->
+        Mix.raise(
+          "refused: version #{version_id} is #{enc}-encoded but carries no fathom-md5 digest — " <>
+            "it was not written by fathom and cannot be verified"
+        )
+
+      {:error, reason} ->
+        Mix.raise("pull of version #{version_id} failed: #{inspect(reason)}")
     end
   end
 

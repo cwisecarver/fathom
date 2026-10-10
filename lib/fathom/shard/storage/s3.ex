@@ -1181,7 +1181,17 @@ defmodule Fathom.Shard.Storage.S3 do
         end
       end
 
-      result = Req.get(req(), url: url, headers: headers, into: into, retry: false)
+      # `params` is empty for every pull but `pull_object_version/3`'s (`versionId`); Req's
+      # put_params step query-encodes it before sigv4 signs the request, so a version id is never
+      # spliced into the URL by hand.
+      result =
+        Req.get(req(),
+          url: url,
+          params: Keyword.get(opts, :params, []),
+          headers: headers,
+          into: into,
+          retry: false
+        )
 
       # A buffered write's error surfaces HERE (see the open above), and it used to be a hard
       # `:ok =` match — fail-closed, but as a raise: it skipped the retry below and crashed a
@@ -1576,6 +1586,28 @@ defmodule Fathom.Shard.Storage.S3 do
     # A sentinel live object is not snapshottable bytes (#25) — a "successful" snapshot of a
     # placeholder is worse than a failed one, because the operator stops looking.
     copy_unless_sentinel_source(db_key(shard_id), snapshot_key(shard_id, snapshot_id))
+  end
+
+  @doc """
+  Downloads one specific S3 object VERSION of `shard_id`'s live object to `local_path` (expert
+  review 2026-10-08 #22) — the one-command path behind `mix fathom.shard pull --version-id`.
+
+  A bucket version is usually compressed (`x-amz-meta-fathom-enc`), so the raw bytes are not a
+  SQLite file. This goes through the SAME decode + plaintext-digest verification + atomic promote as
+  `pull/2`, including its refusal of an encoded object with no `x-amz-meta-fathom-md5`. Not part of
+  the `Storage` behaviour: object versions are an S3 bucket feature with no `Local` counterpart.
+  """
+  @spec pull_object_version(String.t(), String.t(), Path.t()) ::
+          {:ok, String.t() | nil} | {:error, term()}
+  def pull_object_version(shard_id, version_id, local_path)
+      when is_binary(version_id) and version_id != "" do
+    case download(object_path(shard_id), local_path, [], params: [versionId: version_id]) do
+      {:ok, etag} -> {:ok, etag}
+      # A steal sentinel is a placeholder, not shard bytes — nothing was written.
+      {:sentinel, _etag} -> {:error, :sentinel_version}
+      :absent -> {:error, :no_such_version}
+      {:error, _} = error -> error
+    end
   end
 
   @impl true

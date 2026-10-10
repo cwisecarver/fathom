@@ -507,6 +507,23 @@ defmodule Fathom.Shard.Storage do
           {:ok, String.t()} | {:absent, String.t() | nil} | {:error, term()}
   def pull(shard_id, local_path), do: backend().pull(shard_id, local_path)
 
+  @doc """
+  Pulls one bucket VERSION of the shard's live object to `local_path`, decoded and verified exactly
+  like `pull/2` (expert review 2026-10-08 #22). S3 only — object versions are a bucket feature, so
+  any other backend answers `{:error, {:object_versions_unsupported, backend}}`.
+  """
+  @spec pull_object_version(String.t(), String.t(), Path.t()) ::
+          {:ok, String.t() | nil} | {:error, term()}
+  def pull_object_version(shard_id, version_id, local_path) do
+    case backend() do
+      Fathom.Shard.Storage.S3 ->
+        Fathom.Shard.Storage.S3.pull_object_version(shard_id, version_id, local_path)
+
+      other ->
+        {:error, {:object_versions_unsupported, other}}
+    end
+  end
+
   @doc "Unconditional flush of `local_path` (unfenced — see `flush/3` for the coordinator)."
   @spec flush(String.t(), Path.t()) :: :ok | {:error, term()}
   def flush(shard_id, local_path), do: backend().flush(shard_id, local_path)
