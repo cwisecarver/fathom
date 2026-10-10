@@ -166,7 +166,10 @@ defmodule Fathom.EnvReachabilityTest do
       "the per-tenant checkout/fd blast-radius cap that HRANA_STREAM_IDLE_MS's own docs cite (#15)",
     "shard_max_bytes" =>
       "stops a shard acking writes past S3's single-PUT ceiling, where the damage is permanent",
-    "max_open_shards" => "per-node admission control; unset, a novel-shard burst has no ceiling"
+    "max_open_shards" => "per-node admission control; unset, a novel-shard burst has no ceiling",
+    "shard_soft_heap_limit_bytes" =>
+      "the node-wide page-cache bound; without it cache grows as held streams × 2 MiB " <>
+        "(expert review 2026-10-08 #8)"
   }
 
   test "every safety-critical config key is reachable from the environment" do

@@ -9,13 +9,17 @@ defmodule Fathom.RuntimeConfigTest do
 
   # Evaluate config/runtime.exs in :test env with env_overlay applied, return the
   # :fathom keyword list, then restore the environment.
-  defp fathom_config(env_overlay) do
+  defp fathom_config(env_overlay, config_env \\ :test) do
     prev = Map.new(env_overlay, fn {k, _} -> {k, System.get_env(k)} end)
-    Enum.each(env_overlay, fn {k, v} -> System.put_env(k, v) end)
+
+    Enum.each(env_overlay, fn
+      {k, nil} -> System.delete_env(k)
+      {k, v} -> System.put_env(k, v)
+    end)
 
     try do
       "config/runtime.exs"
-      |> Config.Reader.read!(env: :test)
+      |> Config.Reader.read!(env: config_env)
       |> Keyword.get(:fathom, [])
     after
       Enum.each(prev, fn
@@ -23,6 +27,98 @@ defmodule Fathom.RuntimeConfigTest do
         {k, v} -> System.put_env(k, v)
       end)
     end
+  end
+
+  # The same script evaluated as PROD, with the variables the prod block refuses to boot without.
+  # Values are dummies: Config.Reader only evaluates the script, nothing connects to them.
+  defp prod_config(env_overlay) do
+    %{
+      "DATABASE_URL" => "ecto://u:p@localhost/fathom_runtime_config_test",
+      "SECRET_KEY_BASE" => String.duplicate("k", 64),
+      "ADMIN_USER" => "admin",
+      "ADMIN_PASS" => "admin"
+    }
+    |> Map.merge(env_overlay)
+    |> fathom_config(:prod)
+  end
+
+  # --- Expert review 2026-10-08 #8: per-tenant stream cap + node-wide page-cache bound -----------
+  #
+  # Both knobs carry a PROD-ONLY default, so dev/test (and a stranger embedding the library) keep
+  # the unlimited / untouched behaviour while a deployed release is bounded. `0` must stay the
+  # documented way back to unlimited in BOTH envs — `env_int` would read it as "unset" and silently
+  # keep the prod default, which is the trap `env_nonneg_int` exists for.
+  @heap_8gib 8 * 1024 * 1024 * 1024
+
+  test "MAX_CHECKOUTS_PER_SHARD defaults to 256 in prod; 0 restores unlimited; N overrides" do
+    assert Keyword.fetch!(
+             prod_config(%{"MAX_CHECKOUTS_PER_SHARD" => nil}),
+             :max_checkouts_per_shard
+           ) ==
+             256
+
+    assert Keyword.fetch!(
+             prod_config(%{"MAX_CHECKOUTS_PER_SHARD" => "0"}),
+             :max_checkouts_per_shard
+           ) ==
+             nil
+
+    assert Keyword.fetch!(
+             prod_config(%{"MAX_CHECKOUTS_PER_SHARD" => "16"}),
+             :max_checkouts_per_shard
+           ) ==
+             16
+  end
+
+  test "MAX_CHECKOUTS_PER_SHARD outside prod: unset leaves the key unwritten (unlimited)" do
+    refute Keyword.has_key?(
+             fathom_config(%{"MAX_CHECKOUTS_PER_SHARD" => nil}),
+             :max_checkouts_per_shard
+           )
+
+    assert Keyword.fetch!(
+             fathom_config(%{"MAX_CHECKOUTS_PER_SHARD" => "0"}),
+             :max_checkouts_per_shard
+           ) == nil
+
+    assert Keyword.fetch!(
+             fathom_config(%{"MAX_CHECKOUTS_PER_SHARD" => "8"}),
+             :max_checkouts_per_shard
+           ) == 8
+  end
+
+  test "SHARD_SOFT_HEAP_LIMIT_BYTES defaults to 8 GiB in prod; 0 turns it off; N overrides" do
+    assert Keyword.fetch!(
+             prod_config(%{"SHARD_SOFT_HEAP_LIMIT_BYTES" => nil}),
+             :shard_soft_heap_limit_bytes
+           ) == @heap_8gib
+
+    assert Keyword.fetch!(
+             prod_config(%{"SHARD_SOFT_HEAP_LIMIT_BYTES" => "0"}),
+             :shard_soft_heap_limit_bytes
+           ) == nil
+
+    assert Keyword.fetch!(
+             prod_config(%{"SHARD_SOFT_HEAP_LIMIT_BYTES" => "1073741824"}),
+             :shard_soft_heap_limit_bytes
+           ) == 1_073_741_824
+  end
+
+  test "SHARD_SOFT_HEAP_LIMIT_BYTES outside prod: unset leaves the key unwritten (no limit)" do
+    refute Keyword.has_key?(
+             fathom_config(%{"SHARD_SOFT_HEAP_LIMIT_BYTES" => nil}),
+             :shard_soft_heap_limit_bytes
+           )
+
+    assert Keyword.fetch!(
+             fathom_config(%{"SHARD_SOFT_HEAP_LIMIT_BYTES" => "0"}),
+             :shard_soft_heap_limit_bytes
+           ) == nil
+
+    assert Keyword.fetch!(
+             fathom_config(%{"SHARD_SOFT_HEAP_LIMIT_BYTES" => "67108864"}),
+             :shard_soft_heap_limit_bytes
+           ) == 67_108_864
   end
 
   test "SHARD_LOAD=true|1 turns on :shard_load (the deployed-node enable knob)" do

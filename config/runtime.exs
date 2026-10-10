@@ -186,8 +186,53 @@ if n = env_nonneg_int.("QUERY_MAX_ROWS") do
   config :fathom, :query_max_rows, if(n == 0, do: nil, else: n)
 end
 
-if n = env_nonneg_int.("MAX_CHECKOUTS_PER_SHARD") do
-  config :fathom, :max_checkouts_per_shard, if(n == 0, do: nil, else: n)
+# Per-shard concurrent-stream cap. Library default: unlimited. PROD DEFAULT 256 (expert review
+# 2026-10-08 #8): each held stream is one connection with up to `:shard_cache_size_kb` of page
+# cache + ~3 fds, so uncapped, one tenant's stream leak scales its memory and fds with nothing in
+# the way. A Django worker/thread holds ONE stream (`CONN_MAX_AGE=None`, docs/quickstart-django.md),
+# and the LB sends every worker of a tenant to that tenant's one node, so this cap is the tenant's
+# whole app-tier concurrency. 64 was tried first and refused by the bench gate: the same-shard
+# contention metric runs schedulers × 4 = 72 workers on one shard, which is also what a modest app
+# fleet (say 20 pods × 4 workers) looks like. 256 still bounds one tenant at 256 × 2 MiB = 512 MiB
+# of cache and ~768 fds. Past the cap a checkout is refused as a retryable 503 `FILO_SHARD_BUSY`.
+# MAX_CHECKOUTS_PER_SHARD=0 restores unlimited.
+if config_env() == :prod do
+  case env_nonneg_int.("MAX_CHECKOUTS_PER_SHARD") do
+    nil -> config :fathom, :max_checkouts_per_shard, 256
+    0 -> config :fathom, :max_checkouts_per_shard, nil
+    n -> config :fathom, :max_checkouts_per_shard, n
+  end
+else
+  if n = env_nonneg_int.("MAX_CHECKOUTS_PER_SHARD") do
+    config :fathom, :max_checkouts_per_shard, if(n == 0, do: nil, else: n)
+  end
+end
+
+# Node-wide SQLite soft heap limit, in bytes (expert review 2026-10-08 #8). The per-connection
+# `:shard_cache_size_kb` ceiling multiplies by held streams with no node-wide bound; this is that
+# bound. It is SOFT: past it SQLite recycles cache pages instead of growing, it never fails a
+# statement, so the cost of setting it too low is page re-reads (usually from the OS page cache —
+# a pread + copy), not errors. Applied once at boot by `Fathom.Application` from a trusted
+# connection (`Fathom.Shard.Connection.apply_soft_heap_limit/0`); process-global in SQLite.
+#
+# PROD DEFAULT 8 GiB, chosen to err generous: the heaviest measured regime, `served-data`
+# (docs/reviews/fleet-density-2026-07-10.md: 10k held data-bearing streams/node at ~640 KiB each
+# vs ~220 KiB without data), puts at most ~420 KiB × 10k ≈ 4 GiB/node in SQLite's heap, so 8 GiB
+# leaves 2× headroom over everything we have measured while cutting the 60 GB worst-case tail
+# (2 MiB × 30k streams) by ~7×. A fixed number rather than a fraction of system RAM on purpose: in
+# a container `memsup` reports the HOST's memory, not the cgroup limit, so a derived default would
+# be wrong exactly where it matters. On a node with less than ~16 GiB, set it lower.
+# SHARD_SOFT_HEAP_LIMIT_BYTES=0 turns it off (SQLite's default: no limit).
+if config_env() == :prod do
+  case env_nonneg_int.("SHARD_SOFT_HEAP_LIMIT_BYTES") do
+    nil -> config :fathom, :shard_soft_heap_limit_bytes, 8 * 1024 * 1024 * 1024
+    0 -> config :fathom, :shard_soft_heap_limit_bytes, nil
+    n -> config :fathom, :shard_soft_heap_limit_bytes, n
+  end
+else
+  if n = env_nonneg_int.("SHARD_SOFT_HEAP_LIMIT_BYTES") do
+    config :fathom, :shard_soft_heap_limit_bytes, if(n == 0, do: nil, else: n)
+  end
 end
 
 # --- Herd-derived storm brakes (expert review 2026-08-26 #13b and #16) ------------------------

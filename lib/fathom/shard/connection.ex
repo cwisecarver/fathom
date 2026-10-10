@@ -1146,6 +1146,66 @@ defmodule Fathom.Shard.Connection do
   end
 
   @doc """
+  Applies `:shard_soft_heap_limit_bytes` as SQLite's node-wide `soft_heap_limit` (expert review
+  2026-10-08 #8). Called once at boot by `Fathom.Application`; idempotent, so calling it again
+  re-asserts the configured value. Unset (nil) or `0` leaves SQLite's own setting untouched.
+
+  Returns `:ok`, `:skipped` (not configured), or raises if SQLite did not take the value — a
+  memory bound an operator configured and the node silently lacks is worse than a boot failure.
+  """
+  #
+  # WHY A SOFT HEAP LIMIT, AND WHY HERE. `:shard_cache_size_kb` bounds page cache PER CONNECTION, and
+  # fathom holds one connection per Hrana stream, so total page cache is streams × that ceiling
+  # (2 MiB × 30k held streams ≈ 60 GB of tail) with nothing node-wide over it. `soft_heap_limit` is
+  # the node-wide bound: past it SQLite's pcache recycles unpinned pages instead of allocating new
+  # ones (`sqlite3HeapNearlyFull` → `pcache1UnderMemoryPressure`), so caches SHED rather than any
+  # statement failing. That is why it is the soft limit and never `hard_heap_limit`, which makes
+  # allocations fail with SQLITE_NOMEM.
+  #
+  # It is PROCESS-GLOBAL in SQLite, not per connection — which is both why it works (one setting
+  # covers every exqlite connection in this BEAM) and why it is applied from a trusted, throwaway
+  # `:memory:` connection rather than a tenant one. Tenants cannot set it: `soft_heap_limit` /
+  # `hard_heap_limit` assignments are refused by `ShardExecutor`'s pragma gate.
+  #
+  # Verified before building (2026-10-09 probe, exqlite 0.42): set on connection A, read back the
+  # same value on an ALREADY-OPEN connection B, on a freshly opened C, and on B after A closed.
+  # Effect: 4 connections at `cache_size=-200000` each scanning a 120 MB table grew the BEAM's
+  # system memory by ~505 MiB with no limit and ~61 MiB at a 64 MiB limit, with every scan
+  # returning the full, correct result.
+  @spec apply_soft_heap_limit() :: :ok | :skipped
+  def apply_soft_heap_limit do
+    case Application.get_env(:fathom, :shard_soft_heap_limit_bytes) do
+      bytes when is_integer(bytes) and bytes > 0 -> set_soft_heap_limit!(bytes)
+      _ -> :skipped
+    end
+  end
+
+  defp set_soft_heap_limit!(bytes) do
+    {:ok, conn} = Sqlite3.open(":memory:")
+
+    try do
+      {:ok, stmt} = Sqlite3.prepare(conn, "PRAGMA soft_heap_limit=#{bytes}")
+
+      result =
+        try do
+          Sqlite3.fetch_all(conn, stmt)
+        after
+          Sqlite3.release(conn, stmt)
+        end
+
+      case result do
+        {:ok, [[^bytes]]} ->
+          :ok
+
+        other ->
+          raise "PRAGMA soft_heap_limit=#{bytes} did not take (SQLite answered #{inspect(other)})"
+      end
+    after
+      Sqlite3.close(conn)
+    end
+  end
+
+  @doc """
   Introspects a statement WITHOUT running it (the Hrana `describe` request, #34): returns its result
   column names and its bound-parameter count as `%{params: [nil, …], cols: [name, …]}`. Parameters
   are reported positionally (`nil` each — exqlite exposes the count, not the names), which is what a

@@ -35,6 +35,11 @@ defmodule Fathom.Application do
     check_replication_flush_interval!()
     check_pool_fd_budget!()
 
+    # Node-wide SQLite page-cache bound (expert review 2026-10-08 #8). Before the tree, so no tenant
+    # connection opens ahead of it; process-global, so this one trusted `:memory:` connection covers
+    # every connection the node will ever open. Unset (dev/test default) ⇒ untouched.
+    _ = Fathom.Shard.Connection.apply_soft_heap_limit()
+
     # Grouped into plane sub-supervisors (each with its own restart budget) rather than
     # one flat list, so a control-plane restart-storm (e.g. Repo) is contained to its
     # subtree instead of counting against the top supervisor's budget and taking the
