@@ -124,6 +124,40 @@ defmodule Fathom.Shard.Provenance do
   """
   @spec record_intent(String.t(), String.t()) :: :ok
   def record_intent(path, md5_hex) when byte_size(md5_hex) == @intent_width do
+    sidecar = sidecar_path(path)
+
+    # Steady state (expert review 2026-10-10 #P5): the sidecar already holds a valid record, so ONE
+    # read yields the etag, both intent slots and proof that the in-place pwrite is safe. The
+    # general path below costs `read` + `read_intents` + `put_record`'s stat and read before the
+    # write, on every flush. The pre-PUT fsync (pwrite_sync) and the demotion rule are unchanged,
+    # and `encode_record` recomputes the CRC.
+    case File.read(sidecar) do
+      {:ok, @record_magic <> _ = bin} when byte_size(bin) == @record_size ->
+        record_intent_in_place(sidecar, bin, md5_hex)
+
+      _ ->
+        record_intent_general(path, md5_hex)
+    end
+  end
+
+  defp record_intent_in_place(sidecar, bin, md5_hex) do
+    with {:ok, etag, intent, prev} <- parse_record(bin),
+         demoted = demote(Enum.reject([intent, prev], &is_nil/1), md5_hex),
+         {:ok, record} <- encode_record(etag, md5_hex, demoted),
+         :ok <- pwrite_sync(sidecar, record) do
+      :ok
+    else
+      # A record that does not parse (torn, bad CRC) is left alone, like an absent sidecar.
+      :error ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("etag sidecar intent write failed: #{inspect(reason)}")
+    end
+  end
+
+  # Legacy bare-format, absent, or otherwise non-record sidecar: the original read-then-put path.
+  defp record_intent_general(path, md5_hex) do
     etag =
       case read(path) do
         {:ok, etag} -> etag
@@ -145,8 +179,10 @@ defmodule Fathom.Shard.Provenance do
 
   # The intent a NEW intent displaces: the current one if it differs (it becomes "previous"), else
   # the existing previous (re-recording the same md5 must not lose an older unresolved one).
-  defp demoted_intent(path, new_md5) do
-    case read_intents(path) do
+  defp demoted_intent(path, new_md5), do: demote(read_intents(path), new_md5)
+
+  defp demote(intents, new_md5) do
+    case intents do
       [^new_md5, prev] -> prev
       [^new_md5] -> nil
       [current | _] -> current
