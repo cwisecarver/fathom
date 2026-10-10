@@ -1320,38 +1320,39 @@ defmodule Fathom.ShardExecutor do
 
   # HTTP status hints (Filo surfaces them on the pipeline path — else the transport default): a bad
   # id is a client error (400); a full node is a retryable overload (503); anything else is a 500.
-  defp open_error(:invalid_shard_id),
+  @doc false
+  def open_error(:invalid_shard_id),
     do: %Error{message: "invalid shard id", code: "FILO_SHARD_OPEN", status: 400}
 
-  defp open_error(:node_at_capacity),
+  def open_error(:node_at_capacity),
     do: %Error{message: "node at capacity", code: "FILO_AT_CAPACITY", status: 503}
 
   # An over-rate NOVEL shard creation (finding #14): the caller is asking to mint a
   # brand-new shard faster than the node's budget. 429 (back off), not 503 — the node
   # is healthy and existing shards keep serving.
-  defp open_error(:novel_shard_rate_limited),
+  def open_error(:novel_shard_rate_limited),
     do: %Error{message: "shard creation rate limited", code: "FILO_RATE_LIMITED", status: 429}
 
   # A drain is a routine, short-lived migration state ("the caller should retry
   # later"), not a server fault: 503, so client SDKs back off and retry instead of
   # treating every planned blue/green window as an error (expert review #33 — the
   # fallthrough's status-less error surfaced as the transport-default 500).
-  defp open_error(:draining),
+  def open_error(:draining),
     do: %Error{message: "shard draining", code: "FILO_DRAINING", status: 503}
 
   # The shard already holds its max concurrent streams (#26): one tenant can't monopolize a node's
   # streams. 503 (retry later) — a checked-in stream frees a slot, and the shard is otherwise healthy.
-  defp open_error(:shard_at_stream_capacity),
+  def open_error(:shard_at_stream_capacity),
     do: %Error{message: "shard at stream capacity", code: "FILO_SHARD_BUSY", status: 503}
 
   # A suspended tenant (#20): administratively disabled, not a transient fault — 403 so the
   # client sees a distinct "forbidden" (a retry won't help; the operator must resume it).
-  defp open_error(:shard_suspended),
+  def open_error(:shard_suspended),
     do: %Error{message: "tenant suspended", code: "FILO_TENANT_SUSPENDED", status: 403}
 
   # A deleted tenant (#15): the shard is gone for good — 410 Gone, distinct from a 400/500, so
   # the client can tell "this tenant no longer exists" from "bad request" / "server error".
-  defp open_error(:shard_tombstoned),
+  def open_error(:shard_tombstoned),
     do: %Error{message: "tenant deleted", code: "FILO_TENANT_DELETED", status: 410}
 
   # Another node currently owns the lease (expert review 2026-08-01 #15). This is the SAME
@@ -1366,15 +1367,37 @@ defmodule Fathom.ShardExecutor do
   #
   # The owner is deliberately NOT in the message: it named the holding node, leaking internal
   # topology to a tenant.
-  defp open_error({:shard_held, _owner, _stealable_at}),
+  def open_error({:shard_held, _owner, _stealable_at}),
     do: %Error{
       message: "shard temporarily owned by another node; retry",
       code: "FILO_SHARD_HELD",
       status: 503
     }
 
-  defp open_error(reason),
-    do: %Error{message: "cannot open shard: #{inspect(reason)}", code: "FILO_SHARD_OPEN"}
+  # A lazy migration another worker holds (`Shards.checkout` -> `{:shard_migrating, _}`): the same
+  # routine retry-later class as `:shard_held` (expert review 2026-10-10 #H6).
+  def open_error({:shard_migrating, _reason}),
+    do: %Error{
+      message: "shard is being migrated; retry",
+      code: "FILO_SHARD_BUSY",
+      status: 503
+    }
+
+  # The coordinator stopped between lookup and checkout and the bounded retry ran out.
+  def open_error(:unavailable),
+    do: %Error{
+      message: "shard temporarily unavailable; retry",
+      code: "FILO_UNAVAILABLE",
+      status: 503
+    }
+
+  # Anything unclassified: a generic 500 with a FIXED message. `inspect(reason)` used to go to the
+  # tenant -- internal terms, file paths, node names -- and the status-less error rendered as a
+  # 500 anyway. The reason is logged server-side (expert review 2026-10-10 #H6).
+  def open_error(reason) do
+    Logger.error("cannot open shard: #{inspect(reason)}")
+    %Error{message: "cannot open shard", code: "FILO_OPEN_FAILED", status: 500}
+  end
 
   @doc """
   Resolves the shard id for a request. Primary: the **Host subdomain** (e.g.

@@ -298,6 +298,26 @@ defmodule Fathom.ShardExecutorTest do
     assert {:error, %Error{code: "FILO_SHARD_OPEN"}} = ShardExecutor.open("bad/../id")
   end
 
+  # Expert review 2026-10-10 #H6. `{:shard_migrating, _}` and `:unavailable` fell into the
+  # catch-all: a status-less 500 whose message carried `inspect(reason)` (internal terms) to the
+  # tenant. Routine retry-later states are 503; the catch-all is a fixed message, reason logged.
+  test "open errors: retryable states are 503, the catch-all leaks nothing" do
+    import ExUnit.CaptureLog
+
+    assert %Error{code: "FILO_SHARD_BUSY", status: 503} =
+             ShardExecutor.open_error({:shard_migrating, :held_by_worker})
+
+    assert %Error{code: "FILO_UNAVAILABLE", status: 503} = ShardExecutor.open_error(:unavailable)
+
+    log =
+      capture_log(fn ->
+        assert %Error{code: "FILO_OPEN_FAILED", status: 500, message: "cannot open shard"} =
+                 ShardExecutor.open_error({:weird, "/var/secret/path", :node@internal})
+      end)
+
+    assert log =~ "/var/secret/path"
+  end
+
   test "shard_from_conn reads the host subdomain, then ?db=, then header, then default" do
     # Host subdomain is primary (how libSQL clients address a database).
     assert ShardExecutor.shard_from_conn(conn(:get, "http://acme.fathom.test/")) == "acme"
