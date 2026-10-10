@@ -160,6 +160,49 @@ defmodule Fathom.ShardsDrainAllTest do
     :ok = ShardExecutor.close(conn)
   end
 
+  # Expert review 2026-10-10 #34: the drain_all stream was `timeout: :infinity`, against AGENTS.md's
+  # "give async_stream a real timeout" rule. Every drain is already bounded by its window, so this
+  # is the backstop for a task that makes no progress at all. The hang here is a telemetry handler
+  # that blocks in the task process (telemetry runs synchronously in the emitter), held for 4 s
+  # against a 300 ms budget with a 50 ms grace. Pre-fix nothing cuts the task, so drain_all returns
+  # only after the 4 s hold; post-fix the task is killed at budget + grace and counted :timed_out.
+  test "a drain task that stops making progress is cut at budget + grace, not left to block", %{
+    ids: [id | _]
+  } do
+    prev_grace = Application.get_env(:fathom, :drain_all_flush_grace_ms)
+    Application.put_env(:fathom, :drain_all_flush_grace_ms, 50)
+    on_exit(fn -> restore(:drain_all_flush_grace_ms, prev_grace) end)
+
+    _pid = open_idle!(id)
+
+    handler = "drainhang-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shards, :drain_all, :slice],
+      fn _e, _m, _meta, _ ->
+        receive do
+          :never -> :ok
+        after
+          4_000 -> :ok
+        end
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    {elapsed_us, result} = :timer.tc(fn -> Shards.drain_all(300) end)
+    elapsed_ms = div(elapsed_us, 1_000)
+
+    assert result.timed_out >= 1,
+           "the hung drain task is tallied :timed_out, not dropped (#{inspect(result)})"
+
+    assert elapsed_ms < 2_000,
+           "drain_all returned after #{elapsed_ms} ms; a 300 ms budget + 50 ms grace should cut " <>
+             "the hung task, not wait out its 4 s hold"
+  end
+
   test "health returns 503 while draining, 200 otherwise (#28 LB deregistration)" do
     HealthPlug.end_draining()
     assert probe() == {200, "ok"}

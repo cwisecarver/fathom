@@ -774,11 +774,18 @@ defmodule Fathom.Shards do
         drain_pid(shard_id, pid, window)
       end,
       max_concurrency: drain_all_concurrency(),
-      timeout: :infinity,
+      # A real per-task bound, not `:infinity` (expert review 2026-10-10 #34, AGENTS.md: a bounded
+      # budget, never `:infinity`). Each coordinator's own drain is already bounded by its window
+      # (`drain_pid/3`), so this is the backstop for a task that stops making progress anyway: the
+      # budget plus one flush grace. `on_timeout: :kill_task` reclaims the task, and the stream
+      # reports it as `{:exit, :timeout}`, which the reducer tallies as `:timed_out`.
+      timeout: budget_ms + drain_all_flush_grace_ms(),
+      on_timeout: :kill_task,
       ordered: false
     )
-    |> Enum.reduce(%{drained: 0, busy: 0, timed_out: 0, kept_local: 0}, fn {:ok, outcome}, acc ->
-      Map.update!(acc, outcome, &(&1 + 1))
+    |> Enum.reduce(%{drained: 0, busy: 0, timed_out: 0, kept_local: 0}, fn
+      {:ok, outcome}, acc -> Map.update!(acc, outcome, &(&1 + 1))
+      {:exit, _reason}, acc -> Map.update!(acc, :timed_out, &(&1 + 1))
     end)
   end
 
