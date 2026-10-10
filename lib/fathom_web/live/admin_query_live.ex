@@ -17,6 +17,8 @@ defmodule FathomWeb.AdminQueryLive do
 
   import FathomWeb.AdminComponents
 
+  require Logger
+
   alias Fathom.{QueryConsole, ShardId}
 
   @impl true
@@ -27,6 +29,8 @@ defmodule FathomWeb.AdminQueryLive do
      # session by the router's `admin_live_session/1`; a LiveView cannot read the BasicAuth header
      # itself, and an unattributed mint is what poisons the fleet-wide revoke.
      |> assign(:admin_actor, Map.get(session, "admin_actor", "console"))
+     |> assign(:admin_ip, Map.get(session, "admin_ip"))
+     |> assign(:pending, nil)
      |> assign(:page_title, "Query")
      |> assign(:node_key, Fathom.Rebalancer.node_key())
      |> assign(:form, to_form(%{"shard" => "", "sql" => ""}, as: :q))
@@ -76,6 +80,7 @@ defmodule FathomWeb.AdminQueryLive do
          |> assign(:error, nil)
          |> assign(:result, nil)
          |> assign(:form, to_form(%{"shard" => shard, "sql" => sql}, as: :q))
+         |> assign(:pending, {shard, sql})
          |> start_async(:query, fn ->
            QueryConsole.run(shard, sql, actor: actor)
          end)}
@@ -84,20 +89,52 @@ defmodule FathomWeb.AdminQueryLive do
 
   @impl true
   def handle_async(:query, {:ok, {:ok, result}}, socket) do
+    audit_run(socket, "ok", %{})
     {:noreply, assign(socket, running: false, result: result, error: nil)}
   end
 
   def handle_async(:query, {:ok, {:error, error}}, socket) do
+    audit_run(socket, "error", %{code: error.code})
     {:noreply, assign(socket, running: false, error: error, result: nil)}
   end
 
   def handle_async(:query, {:exit, reason}, socket) do
+    audit_run(socket, "error", %{code: "CONSOLE_CRASH"})
+    Logger.error("query console task exited: #{inspect(reason)}")
+
     {:noreply,
      assign(socket,
        running: false,
        result: nil,
        error: %{code: "CONSOLE_CRASH", message: "query task exited: #{inspect(reason)}"}
      )}
+  end
+
+  # Every console run is audited (expert review 2026-10-10 #W1): the console executes arbitrary
+  # SQL — writes and DDL included — against any tenant, and used to leave no trail. Detail holds
+  # the statement's sha256 plus its first 200 chars (not the whole text, to keep rows small).
+  # Best-effort like every audit write.
+  defp audit_run(socket, outcome, extra) do
+    case socket.assigns.pending do
+      {shard, sql} ->
+        detail =
+          Map.merge(extra, %{
+            sql_sha256: Base.encode16(:crypto.hash(:sha256, sql), case: :lower),
+            sql_head: String.slice(sql, 0, 200)
+          })
+
+        Fathom.Audit.record(
+          socket.assigns.admin_actor,
+          "console_query",
+          shard,
+          socket.assigns.admin_ip,
+          outcome,
+          detail
+        )
+
+      _ ->
+        :ok
+    end
   end
 
   defp input_error(message), do: %{code: "INPUT", message: message}

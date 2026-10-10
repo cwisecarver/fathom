@@ -188,7 +188,15 @@ defmodule FathomWeb.Router do
         _ -> "console"
       end
 
-    %{"admin_actor" => actor}
+    # The peer address, so dashboard audit rows carry a source IP like the /api ones
+    # (expert review 2026-10-10 #W1/#W2). Resolved the same way as the throttles.
+    ip =
+      case :inet.ntoa(FathomWeb.ClientIp.resolve(conn)) do
+        {:error, _} -> nil
+        addr -> to_string(addr)
+      end
+
+    %{"admin_actor" => actor, "admin_ip" => ip}
   end
 
   defp require_admin_auth(conn, _opts) do

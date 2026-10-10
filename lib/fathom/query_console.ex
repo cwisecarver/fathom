@@ -78,8 +78,29 @@ defmodule Fathom.QueryConsole do
     # function that needs it and any second caller reopens the bug. AGENTS.md: route every
     # shard resolution through one place.
     case Fathom.ShardId.cast(shard_id) do
-      {:ok, id} -> do_run(id, sql, opts)
-      :error -> {:error, %{code: "INPUT", message: "invalid shard id", latency_ms: 0.0}}
+      {:ok, id} ->
+        # The template shard is the fleet-wide fork source: a console write to it poisons every
+        # future tenant (expert review 2026-10-10 #W1; AGENTS.md "template shard" warning).
+        if template?(id) do
+          {:error,
+           %{
+             code: "TEMPLATE_BLOCKED",
+             message: "the template shard is not reachable from the console",
+             latency_ms: 0.0
+           }}
+        else
+          do_run(id, sql, opts)
+        end
+
+      :error ->
+        {:error, %{code: "INPUT", message: "invalid shard id", latency_ms: 0.0}}
+    end
+  end
+
+  defp template?(id) do
+    case Fathom.ShardId.cast(Application.get_env(:fathom, :template_shard_id)) do
+      {:ok, template} -> template == id
+      :error -> false
     end
   end
 
