@@ -165,6 +165,21 @@ defmodule FathomWeb.AdminDirectoryLiveTest do
     assert row.status == "active"
   end
 
+  # Expert review 2026-10-10 #W5: a `save` arriving with no row being edited (stale/double submit)
+  # crashed the LiveView; a malformed `edit` id must not become the edit target either.
+  test "save with no row being edited is a no-op; a malformed edit id is ignored", %{conn: conn} do
+    put_shard(%{shard_id: "ui_noedit", status: "active"})
+    {:ok, view, _html} = conn |> auth() |> live("/admin/directory")
+
+    render_hook(view, "save", %{"edit" => %{"status" => "retired", "retain_until" => ""}})
+    render_hook(view, "edit", %{"id" => "bad/../id"})
+    render_hook(view, "save", %{"edit" => %{"status" => "retired", "retain_until" => ""}})
+
+    assert has_element?(view, "#dir-row-ui_noedit")
+    refute has_element?(view, "#directory-edit-form")
+    assert {:ok, %{status: "active"}} = Directory.get("ui_noedit")
+  end
+
   # Expert review 2026-10-10 #W2: dashboard audit rows were attributed to a hard-coded
   # "admin (dashboard)" with no IP, and the hand-edit (`save`) was not audited at all.
   test "suspend and save are audited with the session operator and peer IP", %{conn: conn} do

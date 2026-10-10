@@ -74,7 +74,12 @@ defmodule FathomWeb.AdminDirectoryLive do
   end
 
   def handle_event("edit", %{"id" => shard_id}, socket) do
-    {:noreply, assign(socket, editing: shard_id, edit_error: nil)}
+    # The id is client-supplied: only a well-formed shard id may become the `editing` target
+    # (expert review 2026-10-10 #W5); anything else is ignored.
+    case Fathom.ShardId.cast(shard_id) do
+      {:ok, id} -> {:noreply, assign(socket, editing: id, edit_error: nil)}
+      :error -> {:noreply, socket}
+    end
   end
 
   def handle_event("cancel_edit", _params, socket) do
@@ -109,6 +114,13 @@ defmodule FathomWeb.AdminDirectoryLive do
 
   def handle_event("resume_tenant", %{"id" => shard_id}, socket) do
     lifecycle(socket, Fathom.Tenants.resume(shard_id), shard_id, "resume", "Resumed")
+  end
+
+  # A stale/duplicated submit (double-click after a successful save, or a form from before a
+  # cancel) arrives with `editing: nil`; it used to reach `Directory.admin_update(nil, _)` and
+  # crash the LiveView (expert review 2026-10-10 #W5).
+  def handle_event("save", _params, %{assigns: %{editing: nil}} = socket) do
+    {:noreply, socket}
   end
 
   def handle_event("save", %{"edit" => %{"status" => status, "retain_until" => retain}}, socket) do
