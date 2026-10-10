@@ -164,4 +164,27 @@ defmodule FathomWeb.AdminDirectoryLiveTest do
     assert {:ok, row} = Directory.get("ui_badtime")
     assert row.status == "active"
   end
+
+  # Expert review 2026-10-10 #W2: dashboard audit rows were attributed to a hard-coded
+  # "admin (dashboard)" with no IP, and the hand-edit (`save`) was not audited at all.
+  test "suspend and save are audited with the session operator and peer IP", %{conn: conn} do
+    put_shard(%{shard_id: "ui_aud", status: "active"})
+    on_exit(fn -> :ets.delete(Fathom.Tenants.Suspensions, "ui_aud") end)
+
+    {:ok, view, _html} = conn |> auth() |> live("/admin/directory")
+
+    view |> element("#dir-suspend-ui_aud") |> render_click()
+    view |> element("#dir-resume-ui_aud") |> render_click()
+    view |> element("#dir-edit-ui_aud") |> render_click()
+
+    view
+    |> element("#directory-edit-form")
+    |> render_submit(%{"edit" => %{"status" => "retired", "retain_until" => ""}})
+
+    events = Fathom.Audit.list(shard_id: "ui_aud")
+    assert Enum.sort(Enum.map(events, & &1.action)) == ["admin_update", "resume", "suspend"]
+    assert Enum.all?(events, &(&1.actor == "console:admin"))
+    assert Enum.all?(events, &(&1.source_ip == "127.0.0.1"))
+    assert Enum.find(events, &(&1.action == "admin_update")).detail["status"] == "retired"
+  end
 end

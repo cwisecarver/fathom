@@ -21,9 +21,13 @@ defmodule FathomWeb.AdminDirectoryLive do
   @page_size 50
 
   @impl true
-  def mount(_params, _session, socket) do
+  def mount(_params, session, socket) do
     socket =
       socket
+      # Operator identity + peer IP from the router's `admin_live_session/1` (expert review
+      # 2026-10-10 #W2); audit rows used to say a coarse "admin (dashboard)" with no IP.
+      |> assign(:admin_actor, Map.get(session, "admin_actor", "console"))
+      |> assign(:admin_ip, Map.get(session, "admin_ip"))
       |> assign(:page_title, "Directory")
       |> assign(:node_key, Fathom.Rebalancer.node_key())
       |> assign(:statuses, Shard.statuses())
@@ -82,7 +86,7 @@ defmodule FathomWeb.AdminDirectoryLive do
   # guard. Physical erase runs in the background DeleteJob, so we report "scheduled".
   def handle_event("delete_tenant", %{"id" => shard_id}, socket) do
     result = Fathom.Tenants.delete(shard_id)
-    audit("delete", shard_id, if(match?({:ok, _}, result), do: "ok", else: "error"))
+    audit(socket, "delete", shard_id, if(match?({:ok, _}, result), do: "ok", else: "error"))
 
     case result do
       {:ok, :scheduled} ->
@@ -120,15 +124,22 @@ defmodule FathomWeb.AdminDirectoryLive do
     end
   end
 
-  # Best-effort audit of a dashboard action (#9). There is no conn in a LiveView and the BasicAuth
-  # username isn't threaded into the socket, so the actor is coarse ("admin (dashboard)") — finer
-  # per-operator dashboard identity is a follow-up. The action + shard + outcome are the audit's core.
-  defp audit(action, shard_id, outcome),
-    do: Fathom.Audit.record("admin (dashboard)", action, shard_id, nil, outcome, %{})
+  # Best-effort audit of a dashboard action (#9). A LiveView has no conn, so the actor and peer IP
+  # come from the session the router built (expert review 2026-10-10 #W2).
+  defp audit(socket, action, shard_id, outcome, detail \\ %{}),
+    do:
+      Fathom.Audit.record(
+        socket.assigns.admin_actor,
+        action,
+        shard_id,
+        socket.assigns.admin_ip,
+        outcome,
+        detail
+      )
 
   # Shared result-handling for the suspend/resume events (#20).
   defp lifecycle(socket, result, shard_id, action, verb) do
-    audit(action, shard_id, if(result == :ok, do: "ok", else: "error"))
+    audit(socket, action, shard_id, if(result == :ok, do: "ok", else: "error"))
 
     case result do
       :ok ->
@@ -149,7 +160,22 @@ defmodule FathomWeb.AdminDirectoryLive do
   end
 
   defp save(socket, shard_id, attrs) do
-    case Directory.admin_update(shard_id, attrs) do
+    result = Directory.admin_update(shard_id, attrs)
+
+    # Hand-editing status/retain_until is a control-plane mutation like delete/suspend, so it is
+    # audited too (expert review 2026-10-10 #W2), with the attempted change as detail.
+    audit(
+      socket,
+      "admin_update",
+      shard_id,
+      if(match?({:ok, _}, result), do: "ok", else: "error"),
+      %{
+        status: attrs.status,
+        retain_until: attrs.retain_until && DateTime.to_iso8601(attrs.retain_until)
+      }
+    )
+
+    case result do
       {:ok, _shard} ->
         {:noreply,
          socket
