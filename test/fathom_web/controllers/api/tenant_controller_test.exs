@@ -102,6 +102,30 @@ defmodule FathomWeb.Api.TenantControllerTest do
     end
   end
 
+  # Expert review 2026-10-10 #W4: the catch-all error clauses echoed `inspect(reason)` to the API
+  # caller (internal terms: module names, storage details). The body now carries a stable code only.
+  test "an unexpected provision failure returns a stable code and leaks no internal term",
+       %{conn: conn} do
+    prev = Application.get_env(:fathom, :fork_from_template)
+    Application.put_env(:fathom, :fork_from_template, true)
+
+    on_exit(fn ->
+      if prev == nil,
+        do: Application.delete_env(:fathom, :fork_from_template),
+        else: Application.put_env(:fathom, :fork_from_template, prev)
+    end)
+
+    {body, log} =
+      ExUnit.CaptureLog.with_log(fn ->
+        conn |> auth() |> post("/api/tenants", %{shard_id: "api-w4"}) |> json_response(500)
+      end)
+
+    assert body["code"] == "PROVISION_FAILED"
+    assert body["error"] == "provision failed"
+    refute inspect(body) =~ "fork_failed"
+    assert log =~ "fork_failed", "the reason must still reach the server log"
+  end
+
   describe "GET /api/tenants" do
     test "lists matching tenants with a total", %{conn: conn} do
       put_shard("api_list_a")

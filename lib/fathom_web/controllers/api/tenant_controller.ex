@@ -14,6 +14,8 @@ defmodule FathomWeb.Api.TenantController do
   """
   use FathomWeb, :controller
 
+  require Logger
+
   alias Fathom.{ApiKeys, Directory, HranaAuth, Snapshots, Tenants}
 
   # Per-action scope enforcement (expert review #8): the `api_actor` set by the router's :api_auth
@@ -152,7 +154,7 @@ defmodule FathomWeb.Api.TenantController do
         )
 
       {:error, reason} ->
-        error(conn, :internal_server_error, "provision failed: #{inspect(reason)}")
+        reason_error(conn, :internal_server_error, "provision failed", reason)
     end
   end
 
@@ -192,7 +194,7 @@ defmodule FathomWeb.Api.TenantController do
         error(conn, :bad_request, "invalid shard id")
 
       {:error, reason} ->
-        error(conn, :unprocessable_entity, "delete failed: #{inspect(reason)}")
+        reason_error(conn, :unprocessable_entity, "delete failed", reason)
     end
   end
 
@@ -244,7 +246,7 @@ defmodule FathomWeb.Api.TenantController do
         )
 
       {:error, reason} ->
-        error(conn, :unprocessable_entity, "fork failed: #{inspect(reason)}")
+        reason_error(conn, :unprocessable_entity, "fork failed", reason)
     end
   end
 
@@ -254,7 +256,7 @@ defmodule FathomWeb.Api.TenantController do
     case Tenants.flush(id) do
       :ok -> json(conn, %{shard_id: id, flushed: true})
       {:error, :invalid_shard_id} -> error(conn, :bad_request, "invalid shard id")
-      {:error, reason} -> error(conn, :unprocessable_entity, "flush failed: #{inspect(reason)}")
+      {:error, reason} -> reason_error(conn, :unprocessable_entity, "flush failed", reason)
     end
   end
 
@@ -271,13 +273,13 @@ defmodule FathomWeb.Api.TenantController do
       conn |> put_status(:created) |> json(%{shard_id: id, snapshot_id: snap})
     else
       {:error, {:flush_failed, reason}} ->
-        error(conn, :unprocessable_entity, "flush before snapshot failed: #{inspect(reason)}")
+        reason_error(conn, :unprocessable_entity, "flush before snapshot failed", reason)
 
       {:error, :invalid_shard_id} ->
         error(conn, :bad_request, "invalid shard id")
 
       {:error, reason} ->
-        error(conn, :unprocessable_entity, "snapshot failed: #{inspect(reason)}")
+        reason_error(conn, :unprocessable_entity, "snapshot failed", reason)
     end
   end
 
@@ -303,7 +305,7 @@ defmodule FathomWeb.Api.TenantController do
         error(conn, :bad_request, "invalid shard id")
 
       {:error, reason} ->
-        error(conn, :unprocessable_entity, "list snapshots failed: #{inspect(reason)}")
+        reason_error(conn, :unprocessable_entity, "list snapshots failed", reason)
     end
   end
 
@@ -341,7 +343,7 @@ defmodule FathomWeb.Api.TenantController do
         )
 
       {:error, reason} ->
-        error(conn, :unprocessable_entity, "restore failed: #{inspect(reason)}")
+        reason_error(conn, :unprocessable_entity, "restore failed", reason)
     end
   end
 
@@ -355,7 +357,7 @@ defmodule FathomWeb.Api.TenantController do
         error(conn, :bad_request, "invalid shard id")
 
       {:error, reason} ->
-        error(conn, :unprocessable_entity, "drop snapshot failed: #{inspect(reason)}")
+        reason_error(conn, :unprocessable_entity, "drop snapshot failed", reason)
     end
   end
 
@@ -401,11 +403,20 @@ defmodule FathomWeb.Api.TenantController do
 
   defp lifecycle(conn, result, id, new_status) do
     case result do
-      :ok -> json(conn, %{shard_id: id, status: new_status})
-      {:error, :invalid_shard_id} -> error(conn, :bad_request, "invalid shard id")
-      {:error, :not_found} -> error(conn, :not_found, "no such tenant")
-      {:error, :deleted} -> error(conn, :conflict, "tenant is deleted")
-      {:error, reason} -> error(conn, :unprocessable_entity, "failed: #{inspect(reason)}")
+      :ok ->
+        json(conn, %{shard_id: id, status: new_status})
+
+      {:error, :invalid_shard_id} ->
+        error(conn, :bad_request, "invalid shard id")
+
+      {:error, :not_found} ->
+        error(conn, :not_found, "no such tenant")
+
+      {:error, :deleted} ->
+        error(conn, :conflict, "tenant is deleted")
+
+      {:error, reason} ->
+        reason_error(conn, :unprocessable_entity, "tenant lifecycle change failed", reason)
     end
   end
 
@@ -423,6 +434,16 @@ defmodule FathomWeb.Api.TenantController do
   defp iso(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
 
   defp error(conn, status, message), do: conn |> put_status(status) |> json(%{error: message})
+
+  # The catch-all for an unexpected `{:error, reason}`. The raw term (`inspect(reason)`) used to be
+  # echoed to the API caller, leaking internals (module names, paths, Ecto/storage details); now the
+  # body carries only a stable `code` (the action's phrase, upcased) and the term goes to the
+  # server log (expert review 2026-10-10 #W4).
+  defp reason_error(conn, status, what, reason) do
+    Logger.error("api #{what}: #{inspect(reason)}")
+    code = what |> String.upcase() |> String.replace(~r/[^A-Z0-9]+/, "_")
+    conn |> put_status(status) |> json(%{error: what, code: code})
+  end
 
   defp parse_int(nil), do: nil
 

@@ -13,6 +13,8 @@ defmodule FathomWeb.AdminDirectoryLive do
   """
   use FathomWeb, :live_view
 
+  require Logger
+
   import FathomWeb.AdminComponents
 
   alias Fathom.Directory
@@ -102,7 +104,8 @@ defmodule FathomWeb.AdminDirectoryLive do
          |> load()}
 
       {:error, reason} ->
-        {:noreply, put_flash(socket, :error, "Could not delete #{shard_id}: #{inspect(reason)}")}
+        Logger.error("admin delete #{shard_id} failed: #{inspect(reason)}")
+        {:noreply, put_flash(socket, :error, "Could not delete #{shard_id} (DELETE_FAILED)")}
     end
   end
 
@@ -162,11 +165,13 @@ defmodule FathomWeb.AdminDirectoryLive do
          |> load()}
 
       {:error, reason} ->
+        Logger.error("admin #{action} #{shard_id} failed: #{inspect(reason)}")
+
         {:noreply,
          put_flash(
            socket,
            :error,
-           "Could not #{String.downcase(verb)} #{shard_id}: #{inspect(reason)}"
+           "Could not #{String.downcase(verb)} #{shard_id} (#{String.upcase(action)}_FAILED)"
          )}
     end
   end

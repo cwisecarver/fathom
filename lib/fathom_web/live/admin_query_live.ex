@@ -106,7 +106,7 @@ defmodule FathomWeb.AdminQueryLive do
      assign(socket,
        running: false,
        result: nil,
-       error: %{code: "CONSOLE_CRASH", message: "query task exited: #{inspect(reason)}"}
+       error: %{code: "CONSOLE_CRASH", message: "the query task crashed; see the server log"}
      )}
   end
 
