@@ -945,8 +945,11 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
       seed_v1!(shard)
       {:ok, _} = Migrator.release(2, "v2", @v2_statements)
       put_remote_lock(shard)
+      # The remote drain is only attempted when the fleet runs the CommandPoller (R3-1).
+      Application.put_env(:fathom, :command_poller, true)
 
       on_exit(fn ->
+        Application.delete_env(:fathom, :command_poller)
         File.rm(Path.join([remote_dir(), "heartbeats", URI.encode_www_form(@remote_owner)]))
       end)
 
@@ -1023,6 +1026,44 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
 
       assert [] = Fathom.Rebalancer.Commands.pending_for("remotenode"),
              "a timed-out migrator command must not stay pending for the holder to fire later"
+    end
+
+    # expert review 2026-10-10 fix-review R3-1. Symptom: with COMMAND_POLLER off (the default) the
+    # migrator still issued a command and parked an Oban :migrations worker for the whole await.
+    # Invariant: no poller => snooze immediately, nothing issued.
+    test "with the command poller off no command is issued and the job snoozes at once",
+         %{shard: shard} do
+      Application.delete_env(:fathom, :command_poller)
+      Application.put_env(:fathom, :migration_remote_drain_ms, 60_000)
+      on_exit(fn -> Application.delete_env(:fathom, :migration_remote_drain_ms) end)
+
+      {us, result} =
+        :timer.tc(fn -> perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2}) end)
+
+      assert {:snooze, _} = result
+      assert us < 5_000_000, "the worker waited on a command nobody can answer"
+      assert [] = Fathom.Rebalancer.Commands.pending_for("remotenode")
+    end
+
+    # Same symptom for a dead-but-leased holder: the lock TTL is live but its heartbeat has lapsed.
+    test "a holder whose heartbeat has lapsed is not asked to drain", %{shard: shard} do
+      File.write!(
+        Path.join([remote_dir(), "heartbeats", URI.encode_www_form(@remote_owner)]),
+        Jason.encode!(%{
+          "owner" => @remote_owner,
+          "expires_at_ms" => System.system_time(:millisecond) - 1_000
+        })
+      )
+
+      Application.put_env(:fathom, :migration_remote_drain_ms, 60_000)
+      on_exit(fn -> Application.delete_env(:fathom, :migration_remote_drain_ms) end)
+
+      {us, result} =
+        :timer.tc(fn -> perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2}) end)
+
+      assert {:snooze, _} = result
+      assert us < 5_000_000
+      assert [] = Fathom.Rebalancer.Commands.pending_for("remotenode")
     end
 
     test "the revert path drains the remote holder too", %{shard: shard} do

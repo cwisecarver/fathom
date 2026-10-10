@@ -425,9 +425,13 @@ defmodule Fathom.Migrator.ShardMigration do
         # retry the acquire. Any failure falls back to the old `{:retry, {:held, _}}` snooze.
         case remote_holder_node(holder) do
           {:ok, holder_node} when not remote_drained? ->
-            case remote_drain(shard_id, holder_node) do
-              :ok -> hold_lease(shard_id, token, fun, true)
-              :error -> {:retry, {:held, holder}}
+            if remote_drain_viable?(holder) do
+              case remote_drain(shard_id, holder_node) do
+                :ok -> hold_lease(shard_id, token, fun, true)
+                :error -> {:retry, {:held, holder}}
+              end
+            else
+              {:retry, {:held, holder}}
             end
 
           _ ->
@@ -469,6 +473,28 @@ defmodule Fathom.Migrator.ShardMigration do
 
   defp remote_holder_node(_), do: :none
 
+  # Expert review 2026-10-10 fix-review R3-1: `Commands.await/2` parks this Oban `:migrations` worker
+  # for the whole await, so only ask when an answer is plausible. (a) `:command_poller` is off by
+  # default — nothing would ever act on the command (the config is fleet-uniform: every node's
+  # runtime.exs reads the same COMMAND_POLLER env). (b) The holder's HEARTBEAT must be live
+  # (`lease_holder/1` = `{:held, _}` only for a live owner): a dead-but-still-leased node never
+  # answers and its lock simply expires, which a snooze waits out for free. Otherwise ten such jobs
+  # starved the queue it shares with the snapshot Schedule/Retention crons.
+  defp remote_drain_viable?(holder) do
+    Application.get_env(:fathom, :command_poller, false) == true and
+      holder_heartbeat_fresh?(holder)
+  end
+
+  # `acquire_lease` reports `held` while EITHER the heartbeat or the lock TTL is live (#12), so a
+  # crashed node still reads held until its lock TTL lapses. Only a genuinely fresh heartbeat means
+  # a poller is running over there to answer.
+  defp holder_heartbeat_fresh?(holder) do
+    case Storage.read_heartbeat(holder) do
+      {:ok, %{owner: ^holder, expires_at_ms: exp}} -> exp > Storage.now_ms()
+      _ -> false
+    end
+  end
+
   defp remote_drain(shard_id, holder_node) do
     alias Fathom.Rebalancer.Commands
 
@@ -490,8 +516,10 @@ defmodule Fathom.Migrator.ShardMigration do
   end
 
   defp remote_drain_timeout_ms do
-    Application.get_env(:fathom, :migration_remote_drain_ms) ||
-      Fathom.Rebalancer.HandoffJob.drain_timeout()
+    # Capped at a few seconds (R3-1): one poll interval plus a quick drain. A slower drain still
+    # completes on the holder (we only cancel a command it has not picked up); the snoozed retry
+    # then finds the lease free.
+    Application.get_env(:fathom, :migration_remote_drain_ms, 5_000)
   end
 
   # A linked process that renews the migrator lease every ttl/3. Unlinked + stopped in the
