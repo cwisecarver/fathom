@@ -291,6 +291,28 @@ defmodule FathomWeb.Api.TenantControllerTest do
       assert read_one(sid, "SELECT v FROM t") == [["a"]]
     end
 
+    # Expert review 2026-10-10 #9 (SYMPTOM): the controller passed the raw URL id to Shards.flush/1,
+    # whose Registry lookup and db_path are lowercase-keyed, so `POST /api/tenants/UPPER/snapshots
+    # {"flush":true}` found no coordinator, saw no file, answered :ok WITHOUT flushing, and 201'd a
+    # snapshot missing the just-written row. Invariant: any case spelling flushes the one canonical
+    # shard.
+    test "flush: true with an UPPERCASE id still flushes the live shard", %{conn: conn, sid: sid} do
+      {:ok, _} = Directory.resolve(sid)
+      write!(sid, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('a')"])
+
+      body =
+        conn
+        |> auth()
+        |> post("/api/tenants/#{String.upcase(sid)}/snapshots", %{flush: true})
+        |> json_response(201)
+
+      flush!(sid)
+      write!(sid, ["INSERT INTO t VALUES ('b')"])
+      flush!(sid)
+      conn |> auth() |> post("/api/tenants/#{sid}/restore", %{snapshot: body["snapshot_id"]})
+      assert read_one(sid, "SELECT v FROM t") == [["a"]]
+    end
+
     # Expert review 2026-07-18 #15: flush: true is the caller's request for a guaranteed-current
     # snapshot, so a failed force-flush must surface (422), not be swallowed into a silently-stale
     # snapshot. Steal the lease so the coordinator's flush_now self-fences with an error.

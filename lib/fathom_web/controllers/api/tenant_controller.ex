@@ -14,7 +14,7 @@ defmodule FathomWeb.Api.TenantController do
   """
   use FathomWeb, :controller
 
-  alias Fathom.{ApiKeys, Directory, HranaAuth, Shards, Snapshots, Tenants}
+  alias Fathom.{ApiKeys, Directory, HranaAuth, Snapshots, Tenants}
 
   # Per-action scope enforcement (expert review #8): the `api_actor` set by the router's :api_auth
   # plug must hold at least the action's required scope. read < manage < destroy. `destroy` gates the
@@ -282,8 +282,9 @@ defmodule FathomWeb.Api.TenantController do
 
   defp maybe_flush(id, params) do
     if truthy?(params["flush"]) do
-      case Shards.flush(id) do
+      case Tenants.flush(id) do
         :ok -> :ok
+        {:error, :invalid_shard_id} -> {:error, :invalid_shard_id}
         {:error, reason} -> {:error, {:flush_failed, reason}}
       end
     else

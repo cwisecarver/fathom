@@ -652,6 +652,15 @@ defmodule Fathom.Shards do
   # re-opens and flushes it) and drains again; `ShardMigration.with_lease` does exactly that.
   @spec drain(Fathom.ShardId.t(), non_neg_integer()) :: :ok | {:error, term()}
   def drain(shard_id, drain_timeout \\ @default_drain_ms) do
+    # Canonicalize at the entry (expert review 2026-10-10 #9): the Registry, the ETS gates and the
+    # file path are all lowercase-keyed, so a raw "ACME" would miss the live "acme" coordinator.
+    case Fathom.ShardId.cast(shard_id) do
+      {:ok, id} -> do_drain(id, drain_timeout)
+      :error -> {:error, :invalid_shard_id}
+    end
+  end
+
+  defp do_drain(shard_id, drain_timeout) do
     case Registry.lookup(@registry, shard_id) do
       [] ->
         if kept_local_copy?(shard_id), do: {:error, :unflushed_local_copy}, else: :ok
@@ -838,12 +847,13 @@ defmodule Fathom.Shards do
   """
   @spec stop(Fathom.ShardId.t()) :: :ok
   def stop(shard_id) do
-    case Registry.lookup(@registry, shard_id) do
-      [] ->
-        :ok
-
-      [{pid, _}] ->
-        stop_and_await(pid)
+    # Canonicalize (expert review 2026-10-10 #9); an invalid id can have no coordinator, so it is
+    # trivially "already cold".
+    with {:ok, id} <- Fathom.ShardId.cast(shard_id),
+         [{pid, _}] <- Registry.lookup(@registry, id) do
+      stop_and_await(pid)
+    else
+      _ -> :ok
     end
   end
 
@@ -915,6 +925,17 @@ defmodule Fathom.Shards do
   """
   @spec flush(Fathom.ShardId.t()) :: :ok | {:error, term()}
   def flush(shard_id) do
+    # Canonicalize at the entry (expert review 2026-10-10 #9). A raw "ACME" used to miss the
+    # lowercase Registry key AND the lowercase `db_path`, fall to the `[] -> File.exists?` branch,
+    # answer `:ok` without flushing, and let `POST /snapshots {"flush":true}` 201 a stale snapshot
+    # (and made the uncast File.exists? a `*.db` existence oracle).
+    case Fathom.ShardId.cast(shard_id) do
+      {:ok, id} -> do_flush(id)
+      :error -> {:error, :invalid_shard_id}
+    end
+  end
+
+  defp do_flush(shard_id) do
     case Registry.lookup(@registry, shard_id) do
       # NO COORDINATOR IS NOT PROOF THE OBJECT IS CURRENT (expert review 2026-09-29 #13). A drop
       # whose flush failed (S3 brownout, `:drop_flush_timeout`, a fence skip, an inconclusive 412)
@@ -1033,10 +1054,16 @@ defmodule Fathom.Shards do
   @doc "Returns `{:ok, pid}` for `shard_id`, starting the coordinator if needed."
   @spec ensure(Fathom.ShardId.t()) :: {:ok, pid()} | {:error, term()}
   def ensure(shard_id) when is_binary(shard_id) do
-    cond do
-      not Fathom.ShardId.valid?(shard_id) ->
-        {:error, :invalid_shard_id}
+    # Cast, not just `valid?` (expert review 2026-10-10 #9): the ETS gates and Registry are keyed
+    # lowercase, so an uppercase id must be canonicalized before any of them is consulted.
+    case Fathom.ShardId.cast(shard_id) do
+      {:ok, id} -> do_ensure(id)
+      :error -> {:error, :invalid_shard_id}
+    end
+  end
 
+  defp do_ensure(shard_id) do
+    cond do
       # Lifecycle denies, checked on EVERY checkout (not just a new open) so a deleted or
       # suspended tenant is refused even when a coordinator is still running — closing the
       # window between a delete/suspend and the coordinator's stop. Both are O(1) ETS lookups
