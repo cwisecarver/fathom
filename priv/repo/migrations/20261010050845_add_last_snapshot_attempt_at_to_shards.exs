@@ -10,17 +10,29 @@ defmodule Fathom.Repo.Migrations.AddLastSnapshotAttemptAtToShards do
 
   This column is stamped on every ATTEMPT (before the copy, so a timeout-killed task counts too) and
   the rotation orders by it, NULLs first: a failing shard is retried once per cycle, not every run.
+
+  Fix-review R3-4: the index is a COMPOSITE that matches `sample_for_snapshot/1`'s
+  `ORDER BY last_snapshot_attempt_at ASC NULLS FIRST, last_snapshot_at ASC NULLS FIRST` exactly (a
+  single-column ASC NULLS LAST index cannot serve a NULLS FIRST order), and is built CONCURRENTLY —
+  hence no DDL transaction and no migration lock — so it does not block writes on a large live
+  directory (same convention as `20260725055213_*`).
   """
   use Ecto.Migration
+
+  @disable_ddl_transaction true
+  @disable_migration_lock true
 
   def change do
     alter table(:shards) do
       add :last_snapshot_attempt_at, :utc_datetime_usec
     end
 
-    create index(:shards, [:last_snapshot_attempt_at],
+    create index(
+             :shards,
+             ["last_snapshot_attempt_at ASC NULLS FIRST", "last_snapshot_at ASC NULLS FIRST"],
              where: "status = 'active'",
-             name: :shards_last_snapshot_attempt_at_active_index
+             name: :shards_snapshot_rotation_active_index,
+             concurrently: true
            )
   end
 end

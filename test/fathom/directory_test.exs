@@ -638,6 +638,23 @@ defmodule Fathom.DirectoryTest do
     end
   end
 
+  # Fix-review R3-4. Symptom: the snapshot-rotation index was a single-column ASC NULLS LAST index,
+  # which cannot serve `ORDER BY last_snapshot_attempt_at ASC NULLS FIRST, last_snapshot_at ASC NULLS
+  # FIRST`, and it was built non-concurrently inside the DDL transaction. Invariant: the index's
+  # definition matches the query's ordering exactly.
+  describe "snapshot rotation index (fix-review R3-4)" do
+    test "is a composite whose order matches sample_for_snapshot/1" do
+      %{rows: [[def_]]} =
+        Fathom.Repo.query!(
+          "SELECT indexdef FROM pg_indexes WHERE indexname = 'shards_snapshot_rotation_active_index'"
+        )
+
+      assert def_ =~ "last_snapshot_attempt_at NULLS FIRST"
+      assert def_ =~ "last_snapshot_at NULLS FIRST"
+      assert def_ =~ "status"
+    end
+  end
+
   # Review #35: the non-partial (schema_version, last_active_at) index from 20260628001559 was
   # superseded by the `WHERE status = 'active'` partial one from 20260702011500, because every
   # schema_version predicate in lib/ also filters status = 'active'. It was serving no read while
