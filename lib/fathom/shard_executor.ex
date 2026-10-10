@@ -1803,7 +1803,8 @@ defmodule Fathom.ShardExecutor do
     allowed? =
       name not in @tenant_pragma_deny and
         (name in @tenant_pragma_allow or name in @tenant_pragma_introspect or
-           name in extra_pragma_allow())
+           name in extra_pragma_allow()) and
+        checkpoint_mode_ok?(name, tail)
 
     cond do
       allowed? ->
@@ -1821,6 +1822,19 @@ defmodule Fathom.ShardExecutor do
         }
     end
   end
+
+  # `wal_checkpoint` is allowed for tenants ONLY in PASSIVE mode (expert review 2026-10-10 #33b).
+  # `TRUNCATE`, `RESTART` and `FULL` block on the WAL and rewrite it to zero, so a tenant looping
+  # `PRAGMA wal_checkpoint(TRUNCATE)` was a checkpoint-churn lever on the shared replication link.
+  # PASSIVE never blocks and never truncates, so it stays. The bare read is always allowed. The
+  # argument is matched against the closed set {PASSIVE} in the `(…)` or `= …` form, after the
+  # statement tail was already isolated by `pragma_name_and_tail/1`; anything else (a quoted mode,
+  # an unknown word, a second argument) is refused, so the gate fails closed.
+  defp checkpoint_mode_ok?("wal_checkpoint", tail) do
+    bare_read_tail?(tail) or Regex.match?(~r/\A\s*(?:\(\s*PASSIVE\s*\)|=\s*PASSIVE)\s*\z/i, tail)
+  end
+
+  defp checkpoint_mode_ok?(_name, _tail), do: true
 
   # `PRAGMA [schema.]name` — read STRUCTURALLY, tolerating insignificant whitespace and SQLite
   # quoting at every position an identifier may carry them. Returns {unquoted_name, tail}.

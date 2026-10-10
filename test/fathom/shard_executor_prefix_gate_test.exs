@@ -240,6 +240,42 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
     assert read_pragma(h, "temp_store") == before
   end
 
+  # Expert review 2026-10-10 #33b: `wal_checkpoint` was on the tenant allow-list in every mode, so a
+  # tenant looping `PRAGMA wal_checkpoint(TRUNCATE)` churned the WAL on the shared replication link
+  # (each checkpoint is replication work). TRUNCATE / RESTART / FULL block on the WAL and must be
+  # refused in every spelling; PASSIVE never blocks and the bare read stays a read. Both sides are
+  # asserted so the gate cannot be "fixed" by refusing the whole pragma.
+  test "a tenant may checkpoint only PASSIVE: TRUNCATE, RESTART and FULL are refused", %{
+    handle: h
+  } do
+    for mode <- ~w(TRUNCATE RESTART FULL truncate) do
+      for sql <- [
+            "PRAGMA wal_checkpoint(#{mode})",
+            "PRAGMA wal_checkpoint = #{mode}",
+            "PRAGMA main.wal_checkpoint(#{mode})"
+          ] do
+        assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} = ShardExecutor.execute(h, stmt(sql)),
+               "`#{sql}` (a blocking checkpoint) was accepted from a tenant"
+      end
+    end
+
+    # A quoted or unknown mode is not in the closed set, so it is refused too (fail closed).
+    for sql <- ["PRAGMA wal_checkpoint('TRUNCATE')", "PRAGMA wal_checkpoint(NOPE)"] do
+      assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} = ShardExecutor.execute(h, stmt(sql)),
+             "`#{sql}` was accepted from a tenant"
+    end
+
+    # PASSIVE and the bare read stay allowed.
+    for sql <- [
+          "PRAGMA wal_checkpoint(PASSIVE)",
+          "PRAGMA wal_checkpoint = passive",
+          "PRAGMA wal_checkpoint"
+        ] do
+      assert {:ok, _} = ShardExecutor.execute(h, stmt(sql)),
+             "`#{sql}` (a non-blocking checkpoint or read) was refused"
+    end
+  end
+
   # Expert review 2026-10-08 #9: the size cap covered `main` only, so a TEMP table grew past it (four
   # 100 MB inserts under a 50 MB cap). The temp schema is now capped lazily, before DDL and scripts —
   # not at open, which cost ~85 KiB per connection and was refused by the served-density gate.

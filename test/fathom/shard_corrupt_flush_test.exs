@@ -94,7 +94,11 @@ defmodule Fathom.ShardCorruptFlushTest do
   defp write_and_checkpoint(shard, sqls) do
     {:ok, handle} = ShardExecutor.open(shard)
     Enum.each(sqls, fn s -> {:ok, _} = ShardExecutor.execute(handle, stmt(s)) end)
-    {:ok, _} = ShardExecutor.execute(handle, stmt("PRAGMA wal_checkpoint(TRUNCATE)"))
+    # The blocking fold runs on the underlying connection, not through the tenant gate: a tenant
+    # handle may checkpoint only PASSIVE (expert review 2026-10-10 #33b), and this helper needs the
+    # WAL truly empty before the drop.
+    {_pid, _ref, conn, _shard_id, _scope, _ver, _opts} = handle
+    {:ok, _} = Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", [])
     :ok = ShardExecutor.close(handle)
   end
 
