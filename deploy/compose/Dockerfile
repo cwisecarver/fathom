@@ -25,6 +25,15 @@ FROM ${BUILDER_IMAGE} AS builder
 RUN apt-get update -y && apt-get install -y build-essential git curl \
   && apt-get clean && rm -f /var/lib/apt/lists/*_*
 
+# Rust, for native/fathom_udf — the loadable SQLite extension (engine PRAGMA authorizer, deadline
+# backstop, size limits, Django UDFs). `mix compile.fathom_udf` SKIPS without cargo, and since
+# expert review 2026-10-10 #8 a prod node without the artifact REFUSES TO BOOT (ALLOW_NO_UDF=true
+# overrides) — so this image must build it.
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+  | sh -s -- -y --profile minimal --default-toolchain stable \
+  && rustc --version && cargo --version
+
 ENV MIX_ENV=prod
 RUN mix local.hex --force && mix local.rebar --force
 
@@ -42,6 +51,9 @@ RUN mix deps.compile
 COPY fathom/priv priv
 COPY fathom/lib lib
 COPY fathom/assets assets
+# The Rust crate `mix compile.fathom_udf` builds into priv/sqlite_ext/ (copied after deps.compile so
+# a crate edit does not bust the dependency layer cache).
+COPY fathom/native native
 
 # SSL posture is compile-time (config/prod.exs reads WEB_INSECURE_LOCAL at compile). Default empty =
 # force_ssl ON (production; front with a TLS-terminating LB). The eval stack passes 1 to reach the

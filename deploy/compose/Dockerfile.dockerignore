@@ -7,6 +7,7 @@
 !fathom/lib
 !fathom/priv
 !fathom/assets
+!fathom/native
 # The release's vm.args template. Omitting it does not fail the build — `mix release` just
 # generates a default vm.args — so the VM flags vanish silently. Keep this whitelisted.
 !fathom/rel
@@ -16,3 +17,4 @@ filo/deps
 filo/.git
 filo/erl_crash.dump
 fathom/priv/static/assets
+fathom/native/*/target

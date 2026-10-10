@@ -190,9 +190,10 @@ defmodule Fathom.Shard.Extension do
   @doc """
   Whether Django's UDFs will be available on connections opened from now on.
 
-  Read by `Fathom.Application` at boot to log the compatibility posture once, so an operator
-  debugging an `OperationalError: no such function: django_date_extract` can tell from the startup
-  log whether the node ever had them.
+  Read by `Fathom.Application.check_udf_extension!/0` at boot (expert review 2026-10-10 #8): a prod
+  node without the artifact refuses to start unless `ALLOW_NO_UDF=true` acknowledges the
+  downgrade (no engine PRAGMA authorizer, no deadline backstop, no size limits, no Django UDFs).
+  Before that nothing called this, and a node built without cargo degraded silently.
   """
   @spec available?() :: boolean()
   def available?, do: path() != nil

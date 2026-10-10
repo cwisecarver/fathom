@@ -152,6 +152,12 @@ if env_bool.("SHARD_STORAGE_ALLOW_WEAK_CONDITIONAL_DELETE") do
   config :fathom, :allow_weak_conditional_delete, true
 end
 
+# Boot guard override (expert review 2026-10-10 #8): a prod node refuses to boot without the
+# fathom_udf SQLite extension unless this acknowledges the degraded posture.
+if env_bool.("ALLOW_NO_UDF") do
+  config :fathom, :allow_no_udf, true
+end
+
 # Per-stream Hrana idle timeout (ms). Filo's default is 10s and fathom used to pass nothing, so
 # this was unreachable on a deployed release (expert review 2026-07-24 #22). It bounds CLIENT THINK
 # TIME inside an open transaction, not the server: a stream holds live transaction state, and

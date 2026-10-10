@@ -21,6 +21,7 @@ defmodule Fathom.Application do
 
     check_template_default!()
     check_template_auth!()
+    check_udf_extension!()
     Fathom.HranaAuth.check_config!()
     check_storage_fence!()
     check_rebalancer_config!()
@@ -205,6 +206,25 @@ defmodule Fathom.Application do
               "an anonymously reachable template shard is a fleet-wide poisoning vector " <>
               "(a captured migration is replayed onto every shard; expert review #9). " <>
               "Set HRANA_AUTH=required or unset the template."
+    end
+  end
+
+  # Expert review 2026-10-10 #8: a prod node whose `fathom_udf` artifact is missing (an image built
+  # without cargo — `compile.fathom_udf` SKIPS rather than fails) silently lost the engine PRAGMA
+  # authorizer, the on-thread deadline backstop and Django's UDFs, falling back to exqlite's
+  # ATTACH-only authorizer. Refuse to boot instead, unless the operator acknowledges the downgrade
+  # with ALLOW_NO_UDF=true (`:allow_no_udf`). Also trips on an explicit `:sqlite_extension false`,
+  # which is the same downgrade chosen on purpose.
+  @doc false
+  def check_udf_extension! do
+    if Application.get_env(:fathom, :env) == :prod and
+         not Fathom.Shard.Extension.available?() and
+         not Application.get_env(:fathom, :allow_no_udf, false) do
+      raise "config error: the fathom_udf SQLite extension is not available on this prod node " <>
+              "(artifact missing — was the image built without cargo? — or :sqlite_extension " <>
+              "disabled). Without it tenant handles lose the engine PRAGMA authorizer, the " <>
+              "statement-deadline backstop, the SQLite size limits and Django's UDFs. " <>
+              "Build the extension, or set ALLOW_NO_UDF=true to boot degraded on purpose."
     end
   end
 
