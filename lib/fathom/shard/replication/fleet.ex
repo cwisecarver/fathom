@@ -354,7 +354,13 @@ defmodule Fathom.Shard.Replication.Fleet do
   defp follower_children do
     if listening?() do
       opts =
-        [port: listen_port(), dir: Fathom.Shard.Replication.Follower.default_dir()]
+        [
+          port: listen_port(),
+          dir: Fathom.Shard.Replication.Follower.default_dir(),
+          # Refuse replica pushes/seeds for a shard this node coordinates (expert review
+          # 2026-10-10 #1).
+          coordinator_registry: Fathom.ShardRegistry
+        ]
         |> then(fn base ->
           case Application.get_env(:fathom, :replication_bind_ip) do
             nil -> base

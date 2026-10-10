@@ -326,6 +326,23 @@ defmodule Fathom.Shard.Replication.Follower do
   """
   @spec forget(atom(), String.t()) :: :ok
   def forget(name \\ __MODULE__, shard_id) do
+    # Under the shard's lock (expert review 2026-10-10 #22): the row delete and the file removals
+    # must not interleave with a push or seed install, which could re-create the row over files
+    # that are then removed (or the reverse). If the lock stays busy for the whole wait we forget
+    # anyway — erasing a deleted tenant's replica (Tombstones) must not be blockable by a stuck
+    # holder, and that is exactly what this did before the lock existed.
+    case with_shard_lock(name, shard_id, forget_lock_wait_ms(), fn ->
+           do_forget(name, shard_id)
+         end) do
+      :ok -> :ok
+      {:error, _busy_or_stopped} -> do_forget(name, shard_id)
+    end
+  end
+
+  defp forget_lock_wait_ms,
+    do: Application.get_env(:fathom, :replication_forget_lock_wait_ms, 2_000)
+
+  defp do_forget(name, shard_id) do
     :ets.delete(table(name), shard_id)
     File.rm(db_path(name, shard_id))
     File.rm(wal_path(name, shard_id))
@@ -489,7 +506,18 @@ defmodule Fathom.Shard.Replication.Follower do
     # whose release then raises is rescued (`unlock_shard/2`). See the lock section above.
     :ets.new(locks(name), [:named_table, :public, :set, write_concurrency: true])
 
+    # Which registry says "this node coordinates that shard" (`coordinated_here?/2`). `Fleet` passes
+    # `Fathom.ShardRegistry`, so production always has it. The DEFAULT is off (`nil`) because a
+    # loopback test runs the PRIMARY and the follower in one VM: the primary's coordinator is then
+    # registered in the same registry and would be mistaken for the follower's own node serving the
+    # shard, refusing the very pushes the test exists to drive.
+    :ets.insert(
+      locks(name),
+      {:__coordinator_registry__, Keyword.get(opts, :coordinator_registry)}
+    )
+
     reap_stale_seed_temps(dir)
+    schedule_seed_temp_reap()
     recover(tab, name, dir)
 
     # `ip:` is a security control, not tuning. This socket takes raw WAL frames for a tenant's
@@ -516,7 +544,12 @@ defmodule Fathom.Shard.Replication.Follower do
         end
       end)
 
-    {:ok, lsock} = :gen_tcp.listen(Keyword.get(opts, :port, 0), listen_opts)
+    # Accepted sockets inherit the keepalive options. If the OS rejects the tuned raw options the
+    # listener still starts, on plain keepalive or none (expert review 2026-10-10 #11).
+    {:ok, lsock} =
+      Fathom.Shard.Replication.Keepalive.with_fallback(listen_opts, fn o ->
+        :gen_tcp.listen(Keyword.get(opts, :port, 0), o)
+      end)
 
     {:ok, port} = :inet.port(lsock)
     Logger.info("replication follower listening on #{bind_label(opts)}:#{port} (dir #{dir})")
@@ -549,7 +582,23 @@ defmodule Fathom.Shard.Replication.Follower do
     {:stop, {:accept_loop_exited, reason}, state}
   end
 
+  # PERIODIC SEED-TEMP SWEEP (expert review 2026-10-10 #19). Since 8162cf3 seed temps are unique per
+  # seed, so a worker killed in `close_connection/1` leaves files nothing replaces; the boot reaper
+  # alone let them accumulate for the life of the node. Same age gate, run on a timer.
+  def handle_info(:reap_seed_temps, state) do
+    reap_stale_seed_temps(dir(state.name))
+    schedule_seed_temp_reap()
+    {:noreply, state}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
+
+  defp schedule_seed_temp_reap do
+    Process.send_after(self(), :reap_seed_temps, seed_temp_reap_ms())
+  end
+
+  defp seed_temp_reap_ms,
+    do: Application.get_env(:fathom, :replication_seed_temp_reap_ms, 5 * 60_000)
 
   @impl true
   def terminate(_reason, %{lsock: lsock}), do: :gen_tcp.close(lsock)
@@ -827,17 +876,66 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
+  defp coordinated_here?(name, shard_id) do
+    case :ets.lookup(locks(name), :__coordinator_registry__) do
+      # Only a coordinator that HOLDS the lease counts (`Fathom.Shard` marks its registry entry
+      # `:lease_held` once `acquire_lease` succeeded). A coordinator is registered BEFORE the lease
+      # is acquired, and while that acquire is pending a legitimate owner on another node may still
+      # be shipping to us: refusing it would cost that owner this follower's ack (`:stale_epoch` is
+      # a settled reject, so its quorum shrinks) for nothing.
+      [{_, registry}] when not is_nil(registry) ->
+        match?([{_pid, :lease_held}], Registry.lookup(registry, shard_id))
+
+      _ ->
+        false
+    end
+  rescue
+    # Follower or registry not running: nothing is coordinated here.
+    ArgumentError -> false
+  end
+
+  defp refused_coordinated(shard_id) do
+    :telemetry.execute([:fathom, :replication, :refused_coordinated], %{count: 1}, %{
+      shard_id: shard_id
+    })
+  end
+
   # A failed reply send means the connection is going away; the reader sees it on its next recv and
   # closes everything, so the worker only has to not crash on it.
   defp reply(sock, iodata), do: _ = :gen_tcp.send(sock, iodata)
 
+  # A NODE THAT COORDINATES A SHARD IS NOT ITS REPLICA (expert review 2026-10-10 #1).
+  #
+  # Promotion fences the replica (lineage raised, torn) and then `forget/2`s it, which removes the
+  # row the fence lived in. The deposed owner's next push was then `:unknown_shard`, its Session
+  # re-seeded, and `stale_lineage_seed?/2` (which needs a row to compare against) accepted the seed
+  # — so the deposed owner got acks from the NEW owner's own node and counted them toward its
+  # quorum: writes acked by a primary the real owner never sees. While a coordinator for the shard
+  # is registered here this node is the primary, never a follower of it, so every wire frame that
+  # would create or mutate a replica is refused. No persistent fence row: the registry entry is the
+  # fence, and it ends exactly when the coordinator stops, after which this node is a legitimate
+  # follower again. Applies to WIRE frames only — `Recovery`'s own pull drives `begin_seed/3`
+  # directly on a shard it is opening, with its coordinator already registered, and must not trip it.
   defp handle_frame(sock, name, seeds, %Protocol.Push{} = push) do
-    reply(sock, handle_push(name, push))
+    if coordinated_here?(name, push.shard_id) do
+      refused_coordinated(push.shard_id)
+      reply(sock, Protocol.encode_reject(push.shard_id, :stale_epoch, 0))
+    else
+      reply(sock, handle_push(name, push))
+    end
+
     seeds
   end
 
-  defp handle_frame(_sock, name, seeds, %Protocol.SeedBegin{} = begin),
-    do: begin_seed(name, seeds, begin)
+  defp handle_frame(_sock, name, seeds, %Protocol.SeedBegin{} = begin) do
+    if coordinated_here?(name, begin.shard_id) do
+      refused_coordinated(begin.shard_id)
+      # Failed, not absent, so `seed_end` answers a reject rather than "no seed in flight".
+      Map.put(discard_seed(seeds, begin.shard_id), begin.shard_id, %{name: name, failed: true})
+    else
+      begin_seed(name, seeds, begin)
+    end
+  end
 
   defp handle_frame(_sock, _name, seeds, {:seed_chunk, shard, part, seq, chunk}),
     do: write_chunk(seeds, shard, part, seq, chunk)
@@ -1453,13 +1551,34 @@ defmodule Fathom.Shard.Replication.Follower do
     do: :ok
 
   def note_ordinal(name, shard_id, ordinal) do
-    case state_of(name, shard_id) do
-      %{} = state -> put_state(name, shard_id, %{state | wal_ordinal: ordinal})
-      _ -> :ok
-    end
+    # Read-modify-write under the shard's lock (expert review 2026-10-10 #22): a concurrent push's
+    # `put_state` between the read and the put was overwritten by this stale copy. A busy replica
+    # is skipped — the ordinal is an under-claim hint, and losing it costs at most a promotion.
+    _ =
+      with_shard_lock(name, shard_id, lock_wait_ms(), fn ->
+        case state_of(name, shard_id) do
+          %{} = state -> put_state(name, shard_id, %{state | wal_ordinal: ordinal})
+          _ -> :ok
+        end
+      end)
 
     :ok
   end
+
+  @doc false
+  # Ride the offered ordinal in a pulled seed's own state, so `do_install/3` stamps it inside the
+  # install — under the lock the seed already holds (expert review 2026-10-10 #22). Recovery used to
+  # call `note_ordinal/3` after `finish_seed` had released the lock.
+  @spec stamp_seed_ordinal(map(), String.t(), non_neg_integer()) :: map()
+  def stamp_seed_ordinal(seeds, shard_id, ordinal) when is_integer(ordinal) and ordinal > 0 do
+    case Map.get(seeds, shard_id) do
+      %{failed: true} -> seeds
+      %{} = seed -> Map.put(seeds, shard_id, Map.put(seed, :wal_ordinal, ordinal))
+      nil -> seeds
+    end
+  end
+
+  def stamp_seed_ordinal(seeds, _shard_id, _ordinal), do: seeds
 
   defp put_state(name, shard_id, state) do
     tab = table(name)
@@ -1540,9 +1659,7 @@ defmodule Fathom.Shard.Replication.Follower do
     with :ok <- rm_if_present(wal),
          :ok <- File.rename(state.db_temp, db),
          :ok <- File.rename(state.wal_temp, wal) do
-      put_state(
-        name,
-        shard_id,
+      seeded =
         FollowerLog.seeded(
           state.epoch,
           state.wal_gen,
@@ -1550,7 +1667,8 @@ defmodule Fathom.Shard.Replication.Follower do
           state.wal_offset,
           Map.get(state, :lineage, 0)
         )
-      )
+
+      put_state(name, shard_id, %{seeded | wal_ordinal: Map.get(state, :wal_ordinal, 0)})
 
       Logger.info(
         "replication seeded #{shard_id}: #{state.db_size}B db + #{state.wal_size}B wal " <>
@@ -1620,7 +1738,9 @@ defmodule Fathom.Shard.Replication.Follower do
   @stale_seed_temp_s 15 * 60
 
   defp reap_stale_seed_temps(dir) do
-    cutoff = System.os_time(:second) - @stale_seed_temp_s
+    cutoff =
+      System.os_time(:second) -
+        Application.get_env(:fathom, :replication_stale_seed_temp_s, @stale_seed_temp_s)
 
     case File.ls(dir) do
       {:ok, entries} ->

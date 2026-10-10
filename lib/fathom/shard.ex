@@ -676,6 +676,12 @@ defmodule Fathom.Shard do
   end
 
   defp open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen) do
+    # The lease is in hand: mark this coordinator's registry entry so the replication follower
+    # refuses a deposed owner's pushes/seeds for this shard (expert review 2026-10-10 #1). Set here,
+    # BEFORE promote-on-open's `Follower.forget`, so there is no window where the replica row is gone
+    # and the shard is not yet marked. Cleared by the process exiting (the entry dies with it).
+    _ = Registry.update_value(Fathom.ShardRegistry, shard_id, fn _ -> :lease_held end)
+
     with {:ok, etag0} <- Materializer.await_pull(pull_task, path, shard_id),
          {verdict, etag1} when verdict in [:ok, :repulled] <-
            revalidate_takeover(shard_id, path, lease, etag0, warm?) do

@@ -479,16 +479,17 @@ defmodule Fathom.Shard.Replication.Recovery do
 
   defp do_pull(sock, shard_id, {key, _h, _p}, promised, follower, timeout, started) do
     deadline = started + timeout
+    ordinal = Map.get(promised, :wal_ordinal, 0)
 
     with :ok <- :gen_tcp.send(sock, Protocol.encode_replica_request(shard_id)),
-         {:ok, offset} <- receive_seed(sock, follower, shard_id, deadline, %{}) do
+         {:ok, offset} <- receive_seed(sock, follower, shard_id, deadline, %{}, ordinal) do
       # THE PULLED REPLICA HAS NO ORDINAL OF ITS OWN (expert review 2026-08-26 #2, step 3b): a seed
       # installs `FollowerLog.seeded/5`'s state and `SeedBegin` carries none. Without this the
       # survivor would hold a replica `Promote.fresher?/2` can never rank, and recovery would end
       # exactly where it began — cold-opening the stale object. The offer this peer was CHOSEN on
       # is the only statement about these bytes we have, and taking it can only under-claim.
-      Follower.note_ordinal(follower, shard_id, Map.get(promised, :wal_ordinal, 0))
-
+      # Stamped by the install itself, under the shard's lock (expert review 2026-10-10 #22):
+      # `Follower.stamp_seed_ordinal/3` above, not a read-modify-write after the lock was released.
       installed = local_state(follower, shard_id)
       elapsed = System.monotonic_time(:millisecond) - started
 
@@ -520,7 +521,7 @@ defmodule Fathom.Shard.Replication.Recovery do
   # tenant's bytes would otherwise install them under this shard's name — a cross-tenant leak, which
   # AGENTS.md treats as a release blocker rather than a finding. The port is unauthenticated, so
   # "our own peer would not do that" is not a property we get to assume.
-  defp receive_seed(sock, follower, shard_id, deadline, seeds) do
+  defp receive_seed(sock, follower, shard_id, deadline, seeds, ordinal) do
     case remaining(deadline) do
       0 ->
         Follower.discard_seeds(seeds)
@@ -528,21 +529,24 @@ defmodule Fathom.Shard.Replication.Recovery do
 
       left ->
         case :gen_tcp.recv(sock, 0, left) do
-          {:ok, bytes} -> handle_frame(sock, follower, shard_id, deadline, seeds, bytes)
+          {:ok, bytes} -> handle_frame(sock, follower, shard_id, deadline, seeds, ordinal, bytes)
           {:error, reason} -> abort(seeds, {:error, reason})
         end
     end
   end
 
-  defp handle_frame(sock, follower, shard_id, deadline, seeds, bytes) do
+  defp handle_frame(sock, follower, shard_id, deadline, seeds, ordinal, bytes) do
     case Protocol.decode(bytes) do
       {:ok, %Protocol.SeedBegin{shard_id: ^shard_id} = begin} ->
         seeds = Follower.begin_seed(follower, seeds, begin)
-        receive_seed(sock, follower, shard_id, deadline, seeds)
+        # The ordinal rides in the seed's own state so the install stamps it under the shard lock
+        # (expert review 2026-10-10 #22) instead of a read-modify-write after the lock is released.
+        seeds = Follower.stamp_seed_ordinal(seeds, shard_id, ordinal)
+        receive_seed(sock, follower, shard_id, deadline, seeds, ordinal)
 
       {:ok, {:seed_chunk, ^shard_id, part, seq, chunk}} ->
         seeds = Follower.write_chunk(seeds, shard_id, part, seq, chunk)
-        receive_seed(sock, follower, shard_id, deadline, seeds)
+        receive_seed(sock, follower, shard_id, deadline, seeds, ordinal)
 
       {:ok, {:seed_end, ^shard_id}} ->
         {result, _seeds} = Follower.finish_seed(follower, seeds, shard_id)

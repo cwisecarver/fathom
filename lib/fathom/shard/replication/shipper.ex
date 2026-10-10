@@ -489,7 +489,10 @@ defmodule Fathom.Shard.Replication.Shipper do
       send_timeout_close: true
     ]
 
-    with {:ok, sock} <- :gen_tcp.connect(host, state.port, opts, @connect_timeout),
+    # Notice a hard-dead follower in ~60 s, not 2 h (expert review 2026-10-10 #11).
+    connect = fn o -> :gen_tcp.connect(host, state.port, o, @connect_timeout) end
+
+    with {:ok, sock} <- Fathom.Shard.Replication.Keepalive.with_fallback(opts, connect),
          :ok <- handshake(sock) do
       {:ok, sock}
     end
