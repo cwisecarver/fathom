@@ -264,20 +264,24 @@ defmodule Fathom.HranaAuth.Revocations do
         info
 
       :none ->
-        # The directory (Postgres) is unreadable and this node has no cached floor. The durable
-        # storage floor is an INDEPENDENT source (mirrored on every revoke), so consult it before
-        # taking the blind posture (expert review 2026-10-10 #7): a PG blip on a cold shard (a
-        # failover/rebalance target) used to serve floor 0 and re-accept every revoked token even
-        # though S3 knew the floor. A positive storage floor is used as-is (not cached, like every
-        # error-path answer); only when storage ALSO yields nothing (error, or no floor recorded)
-        # does `:hrana_revocation_on_error` decide.
-        case storage_floor_result(shard_id) do
-          {:ok, v} when is_integer(v) and v > 0 ->
-            {v, nil}
+        # The directory (Postgres) is unreadable and this node has no cached floor. Under
+        # `:fail_open` the durable storage floor is an INDEPENDENT source (mirrored on every
+        # revoke), so consult it before taking the blind posture (expert review 2026-10-10 #7): a
+        # PG blip on a cold shard (a failover/rebalance target) used to serve floor 0 and re-accept
+        # every revoked token even though S3 knew the floor. A positive storage floor is used as-is
+        # (not cached, like every error-path answer).
+        #
+        # Under `:fail_closed` the storage floor is NOT served (expert review 2026-10-10 fix-review
+        # R4-1): it is best-effort and may LAG the directory, so answering from it would admit
+        # tokens a revoke the directory already knows about invalidated -- the opposite of what an
+        # operator choosing fail_closed asked for. The answer stays `:unavailable`.
+        case Application.get_env(:fathom, :hrana_revocation_on_error, :fail_open) do
+          :fail_closed ->
+            :unavailable
 
           _ ->
-            case Application.get_env(:fathom, :hrana_revocation_on_error, :fail_open) do
-              :fail_closed -> :unavailable
+            case storage_floor_result(shard_id) do
+              {:ok, v} when is_integer(v) and v > 0 -> {v, nil}
               _ -> {0, nil}
             end
         end

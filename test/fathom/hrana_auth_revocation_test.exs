@@ -273,6 +273,38 @@ defmodule Fathom.HranaAuthRevocationTest do
     on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(owner) end)
   end
 
+  # Fix-review R4-1 (SYMPTOM): the storage-floor fallback also answered under :fail_closed. The
+  # storage floor is best-effort and may LAG the directory, so serving it admits tokens the directory
+  # already revoked. Invariant: fail_closed + directory down => :unavailable, whatever storage says.
+  test "fail_closed never serves the (possibly lagging) storage floor on a directory outage" do
+    import ExUnit.CaptureLog
+
+    shard = uniq()
+    prev_ttl = Application.get_env(:fathom, :hrana_revocation_ttl_ms)
+    Application.put_env(:fathom, :hrana_revocation_ttl_ms, 0)
+    Application.put_env(:fathom, :hrana_revocation_on_error, :fail_closed)
+
+    on_exit(fn ->
+      if prev_ttl == nil,
+        do: Application.delete_env(:fathom, :hrana_revocation_ttl_ms),
+        else: Application.put_env(:fathom, :hrana_revocation_ttl_ms, prev_ttl)
+
+      Application.delete_env(:fathom, :hrana_revocation_on_error)
+      File.rm(Path.join([Fathom.Shard.Storage.Local.dir(), "tokenfloors", shard]))
+    end)
+
+    :ok = Fathom.Shard.Storage.put_token_floor(shard, 7)
+    :ets.delete(Revocations, shard)
+    Ecto.Adapters.SQL.Sandbox.mode(Fathom.Repo, :manual)
+
+    capture_log(fn ->
+      assert Revocations.floor(shard) == :unavailable
+    end)
+
+    owner = Ecto.Adapters.SQL.Sandbox.start_owner!(Fathom.Repo, shared: true)
+    on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(owner) end)
+  end
+
   test "tokens sign with the dedicated secret, independent of secret_key_base" do
     shard = uniq()
     {:ok, _} = Directory.resolve(shard)
