@@ -56,7 +56,7 @@ defmodule Fathom.Shard.Storage.Local do
   end
 
   @impl true
-  def flush(shard_id, local_path, expected_etag, position \\ nil, lineage \\ nil) do
+  def flush(shard_id, local_path, expected_etag, position \\ nil, lineage \\ nil, opts \\ []) do
     # Model S3's If-Match / If-None-Match:* fence with the content-hash etag: only write if the
     # remote's current etag still matches what the coordinator last saw (or, for a brand-new
     # shard, only if no object exists). A mismatch means a stealer flushed in the window since
@@ -107,7 +107,8 @@ defmodule Fathom.Shard.Storage.Local do
           # the Local backend (dev/test; replication is off there and S3 is already correct), so the
           # cost — a failed copy also drops a still-valid stamp until the next flush re-writes it — is
           # accepted for the simpler invariant.
-          with :ok <- rm_ok(position_path(shard_id)),
+          with :ok <- pre_put(local_path, opts),
+               :ok <- rm_ok(position_path(shard_id)),
                :ok <- Storage.atomic_copy(local_path, remote_path(shard_id)),
                :ok <- write_position(shard_id, position),
                :ok <- write_lineage(shard_id, lineage),
@@ -124,6 +125,42 @@ defmodule Fathom.Shard.Storage.Local do
     end)
   catch
     {:error, _} = err -> err
+  end
+
+  # The `:pre_put` flush option (expert review 2026-10-10 #6): hand the caller the plaintext md5 of
+  # the bytes about to be stored, and wait for its `:ok`. S3 does this with the hash it already
+  # computes for `content-md5`; here the file is hashed once because this is the dev/test backend.
+  defp pre_put(local_path, opts) do
+    case Keyword.get(opts, :pre_put) do
+      nil ->
+        :ok
+
+      fun ->
+        case file_md5_hex(local_path) do
+          {:ok, hex} -> fun.(hex)
+          {:error, _} = error -> error
+        end
+    end
+  end
+
+  @md5_chunk 256 * 1024
+  defp file_md5_hex(path) do
+    digest =
+      path
+      |> File.stream!(@md5_chunk)
+      |> Enum.reduce(:crypto.hash_init(:md5), &:crypto.hash_update(&2, &1))
+      |> :crypto.hash_final()
+
+    {:ok, Base.encode16(digest, case: :lower)}
+  rescue
+    e in File.Error -> {:error, e.reason}
+  end
+
+  defp file_md5(shard_id) do
+    case file_md5_hex(remote_path(shard_id)) do
+      {:ok, hex} -> hex
+      {:error, _} -> nil
+    end
   end
 
   # The position stamp S3 carries as object metadata. A companion file here, written AFTER the
@@ -226,7 +263,7 @@ defmodule Fathom.Shard.Storage.Local do
     with {:ok, etag} when not is_nil(etag) <- object_etag(shard_id),
          {:ok, position} <- object_position(shard_id),
          {:ok, lineage} <- object_lineage(shard_id) do
-      {:ok, %{etag: etag, position: position, lineage: lineage}}
+      {:ok, %{etag: etag, position: position, lineage: lineage, md5: file_md5(shard_id)}}
     else
       {:ok, nil} -> {:ok, nil}
       {:error, _} = error -> error

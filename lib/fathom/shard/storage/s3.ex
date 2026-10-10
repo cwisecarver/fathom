@@ -361,7 +361,7 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   @impl true
-  def flush(shard_id, local_path, expected_etag, position \\ nil, lineage \\ nil) do
+  def flush(shard_id, local_path, expected_etag, position \\ nil, lineage \\ nil, opts \\ []) do
     # If-Match the etag we last saw (or If-None-Match:* for a brand-new shard), so the PUT
     # only lands if the object hasn't changed under us. A 412 means a stealer flushed in the
     # window since our fence check → superseded, don't clobber (finding #15). Return the new
@@ -374,7 +374,11 @@ defmodule Fathom.Shard.Storage.S3 do
     {header, carried} = carried_lineage_header(shard_id, expected_etag, lineage)
 
     with_body(local_path, fn body_path, size, md5, md5_hex, enc_headers ->
-      with {:ok, resp} <-
+      # The caller's chance to record "I am about to PUT bytes hashing to md5_hex" durably, BEFORE
+      # the object can change (expert review 2026-10-10 #6). A caller that cannot record it must
+      # not stop the flush — the recording only buys a crash-recovery adoption.
+      with :ok <- run_pre_put(opts, md5_hex),
+           {:ok, resp} <-
              Req.put(req(),
                url: object_path(shard_id),
                body: File.stream!(body_path, @stream_chunk),
@@ -399,6 +403,24 @@ defmodule Fathom.Shard.Storage.S3 do
         end
       end
     end)
+  end
+
+  # The `:pre_put` flush option. The fun is awaited (it is a durable local write); a result other
+  # than `:ok` is logged and ignored, because losing the intent only re-opens the old, quarantining
+  # behaviour for a crash in the gap — it must never fail a durability flush.
+  defp run_pre_put(opts, md5_hex) do
+    case Keyword.get(opts, :pre_put) do
+      nil ->
+        :ok
+
+      fun ->
+        case fun.(md5_hex) do
+          :ok -> :ok
+          other -> Logger.warning("flush pre_put hook did not record: #{inspect(other)}")
+        end
+
+        :ok
+    end
   end
 
   # Prepares the PUT body for `local_path`, honouring `:shard_object_encoding` (#38), and hands
@@ -1407,7 +1429,8 @@ defmodule Fathom.Shard.Storage.S3 do
          %{
            etag: etag(h),
            position: Storage.parse_position(header_value(h, @pos_meta)),
-           lineage: parse_lineage(header_value(h, @lineage_meta))
+           lineage: parse_lineage(header_value(h, @lineage_meta)),
+           md5: meta_md5(h)
          }}
 
       {:ok, %{status: 404}} ->

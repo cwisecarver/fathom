@@ -2800,7 +2800,8 @@ defmodule Fathom.Shard do
           state.path,
           state.etag,
           Position.flush_position(state, pre),
-          Position.lineage_arg(state)
+          Position.lineage_arg(state),
+          flush_intent_opts(state.path)
         )
 
       # Integrity failed (expert review 2026-07-14 #4). The checkpoint-then-raw-upload fast path
@@ -3408,7 +3409,8 @@ defmodule Fathom.Shard do
                temp,
                state.etag,
                Position.flush_position(state, pre),
-               Position.lineage_arg(state)
+               Position.lineage_arg(state),
+               flush_intent_opts(state.path)
              ) do
         {:ok, new_etag, carried}
       else
@@ -3426,6 +3428,14 @@ defmodule Fathom.Shard do
       Enum.each(["", "-wal", "-shm"], &File.rm(temp <> &1))
     end
   end
+
+  # Record the flush INTENT durably before the PUT lands (expert review 2026-10-10 #6). The
+  # sidecar only learns the new etag when the coordinator handles the task result (or, on the drop
+  # path, after the upload returns) — a crash in between leaves sidecar=E0, object=E1 and a local
+  # `.db` that descends from E1, which `Fork` read as a divergence and quarantined (acked writes
+  # hidden in `.forked.<ts>`). The backend hands us the md5 of the exact bytes it is about to PUT;
+  # `Fork.resolve` adopts a stored object whose `fathom-md5` equals it. See `Provenance`.
+  defp flush_intent_opts(path), do: [pre_put: &Provenance.record_intent(path, &1)]
 
   # Re-check ownership between the SNAPSHOT and the PUT (expert review 2026-08-01 #28).
   #

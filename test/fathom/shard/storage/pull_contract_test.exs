@@ -144,7 +144,9 @@ defmodule Fathom.Shard.Storage.PullContractTest do
 
       assert :ok = Fathom.ShardExecutor.close(conn)
 
-      assert File.read!(Fathom.Shard.db_path(shard) <> ".etag") == "-",
+      # Read through Provenance, not as raw bytes: the first write makes the sidecar durable, which
+      # rewrites it as the fixed-width record (expert review 2026-10-10 #6). Same claim either way.
+      assert :no_object = Fathom.Shard.Provenance.read(Fathom.Shard.db_path(shard)),
              "a born-empty shard must record the no-object provenance sentinel"
     end
   end

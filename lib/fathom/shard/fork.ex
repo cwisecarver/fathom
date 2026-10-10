@@ -135,7 +135,11 @@ defmodule Fathom.Shard.Fork do
     if lease[:touch_pre_etag] == nil and lease[:touch_post_etag] == store_etag do
       false
     else
-      quarantine!(shard_id, path, :orphaned) == :ok
+      # The first-ever flush of a born-here shard has the same lag: sidecar "-", object now ours.
+      case adopt_own_put(shard_id, path) do
+        :fork -> quarantine!(shard_id, path, :orphaned) == :ok
+        _adopted_or_keep -> false
+      end
     end
   end
 
@@ -158,7 +162,56 @@ defmodule Fathom.Shard.Fork do
     if lease[:touch_pre_etag] == sidecar and lease[:touch_post_etag] == store do
       false
     else
-      quarantine!(shard_id, path, :diverged) == :ok
+      case adopt_own_put(shard_id, path) do
+        :adopted -> false
+        :keep -> false
+        :fork -> quarantine!(shard_id, path, :diverged) == :ok
+      end
+    end
+  end
+
+  # A stored object that is EXACTLY the snapshot this node was about to PUT is this node's own
+  # flush that landed before the sidecar learned it (expert review 2026-10-10 #6) — a crash between
+  # the PUT and the coordinator handling the task result, or a response lost and the process
+  # killed. `Provenance.record_intent/2` durably recorded the plaintext md5 BEFORE the PUT; the
+  # stored object's `fathom-md5` metadata equal to it means the stored bytes are our own lineage's
+  # snapshot (a peer cannot produce identical bytes by accident, and identical bytes lose nothing),
+  # and the local `.db` — which only grew since — descends from them. Re-stamp the sidecar with the
+  # object's current etag and keep the copy warm instead of hiding acked writes in `.forked.<ts>`.
+  #
+  #   * `:adopted` — intent matched; sidecar re-stamped.
+  #   * `:fork`    — no intent, or it does not match: a real divergence, quarantine as before.
+  #   * `:keep`    — the HEAD failed: unknown, same fail-safe as `:unreachable` (keep warm; the
+  #                  later post-lease checks and the fenced flush still guard the lineage).
+  @spec adopt_own_put(String.t(), Path.t()) :: :adopted | :fork | :keep
+  defp adopt_own_put(shard_id, path) do
+    case Provenance.read_intent(path) do
+      nil ->
+        :fork
+
+      intent ->
+        case Storage.object_head(shard_id) do
+          {:ok, %{etag: etag, md5: ^intent}} when is_binary(etag) ->
+            Provenance.write_durable(path, etag)
+
+            Logger.warning(
+              "shard #{shard_id}: sidecar lagged this node's own flush (the PUT landed, the " <>
+                "stamp did not); stored object matches the recorded flush intent — adopted " <>
+                "etag #{etag} instead of quarantining"
+            )
+
+            :telemetry.execute([:fathom, :shard, :intent_adopted], %{count: 1}, %{
+              shard_id: shard_id
+            })
+
+            :adopted
+
+          {:error, _unreachable} ->
+            :keep
+
+          _no_match ->
+            :fork
+        end
     end
   end
 

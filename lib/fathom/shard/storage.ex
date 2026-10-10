@@ -255,6 +255,24 @@ defmodule Fathom.Shard.Storage do
               | {:error, :superseded}
               | {:error, term()}
 
+  # As `c:flush/5`, plus `opts`. The one option today is `:pre_put` — a 1-arity fun the backend calls
+  # with the plaintext MD5 (lowercase hex) of the bytes it is ABOUT to PUT, just before the PUT, and
+  # whose `:ok` it waits for. The coordinator uses it to record the flush intent durably BEFORE the
+  # object can change (expert review 2026-10-10 #6), reusing the hash the backend computes anyway
+  # instead of reading the snapshot a second time. Optional: a backend without it simply never calls
+  # the fun, which leaves the pre-existing (louder, quarantining) behaviour.
+  @callback flush(
+              shard_id :: String.t(),
+              local_path :: Path.t(),
+              expected_etag :: String.t() | nil,
+              position :: position() | nil,
+              lineage :: non_neg_integer() | {:carried, non_neg_integer() | :none} | nil,
+              opts :: keyword()
+            ) ::
+              {:ok, String.t(), carried_lineage()}
+              | {:error, :superseded}
+              | {:error, term()}
+
   # The stored object's position stamp, or `nil` when it has none — an object flushed before
   # stamping existed, or by a caller that passed `nil`. `nil` must be read as "unknown", never as
   # "empty": an unknown stamp means the object can NEVER be overridden by a replica.
@@ -285,7 +303,10 @@ defmodule Fathom.Shard.Storage do
                %{
                  etag: String.t() | nil,
                  position: position() | nil,
-                 lineage: non_neg_integer() | nil
+                 lineage: non_neg_integer() | nil,
+                 # Plaintext md5 (hex) the object was written with: `fathom-md5` metadata on S3, a
+                 # file hash on Local; `nil` when the object carries none (expert review 2026-10-10 #6).
+                 md5: String.t() | nil
                }
                | nil}
               | {:error, term()}
@@ -475,7 +496,7 @@ defmodule Fathom.Shard.Storage do
   # dispatcher returns `{:error, :unsupported}`. Potentially expensive (an S3 LIST), so callers
   # poll it slowly + cache; at fleet scale prefer S3 Inventory / CloudWatch over a live LIST.
   @callback stored_usage() :: {non_neg_integer(), non_neg_integer()} | {:error, term()}
-  @optional_callbacks stored_usage: 0
+  @optional_callbacks stored_usage: 0, flush: 6
 
   # The cross-store DR backstop (expert review #6): a deleted tenant's re-mint guard is the Postgres
   # directory (loaded into the Tombstones ETS), but a Postgres point-in-time restore rolls the
@@ -551,6 +572,24 @@ defmodule Fathom.Shard.Storage do
           {:ok, String.t(), carried_lineage()} | {:error, :superseded} | {:error, term()}
   def flush(shard_id, local_path, expected_etag, position, lineage),
     do: backend().flush(shard_id, local_path, expected_etag, position, lineage)
+
+  @doc "Fenced flush with options (`:pre_put`). See the `c:flush/6` callback."
+  @spec flush(
+          String.t(),
+          Path.t(),
+          String.t() | nil,
+          position() | nil,
+          non_neg_integer() | {:carried, non_neg_integer() | :none} | nil,
+          keyword()
+        ) ::
+          {:ok, String.t(), carried_lineage()} | {:error, :superseded} | {:error, term()}
+  def flush(shard_id, local_path, expected_etag, position, lineage, opts) do
+    b = backend()
+
+    if Code.ensure_loaded?(b) and function_exported?(b, :flush, 6),
+      do: b.flush(shard_id, local_path, expected_etag, position, lineage, opts),
+      else: b.flush(shard_id, local_path, expected_etag, position, lineage)
+  end
 
   @doc """
   The next lineage value for `shard_id`, given what the store currently holds.
@@ -704,7 +743,9 @@ defmodule Fathom.Shard.Storage do
 
   @doc "The object's etag and position stamp from ONE read. See the callback."
   @spec object_head(String.t()) ::
-          {:ok, %{etag: String.t() | nil, position: position() | nil} | nil} | {:error, term()}
+          {:ok,
+           %{etag: String.t() | nil, position: position() | nil, md5: String.t() | nil} | nil}
+          | {:error, term()}
   def object_head(shard_id), do: backend().object_head(shard_id)
 
   @doc """
