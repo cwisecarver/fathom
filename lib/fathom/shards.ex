@@ -591,8 +591,14 @@ defmodule Fathom.Shards do
     if capture_template?(shard_id) do
       false
     else
+      # Only an `active` row is a migration candidate (expert review 2026-10-10 #16). A suspended,
+      # tombstoned, `migration_failed` (quarantined) or already-`migrating` laggard used to read as
+      # "behind" too: every checkout then inserted a job that cancels `:not_active`, and inline mode
+      # ran a doomed migration and logged an ERROR + telemetry on each cold touch. The status is
+      # read in the same row as the version, so this adds no query.
       case Fathom.Directory.get(shard_id) do
-        {:ok, %{schema_version: v}} -> v < head
+        {:ok, %{schema_version: v, status: "active"}} -> v < head
+        {:ok, %{}} -> false
         # Not yet in the directory (brand-new): nothing to migrate — the shard is born
         # empty (or at HEAD via the gated fork-from-template, which registers its row).
         :error -> false

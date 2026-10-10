@@ -170,6 +170,45 @@ defmodule Fathom.LazyMigrateTest do
     ShardExecutor.close(conn)
   end
 
+  # Symptom (expert review 2026-10-10 #16): behind?/2 checked only the version, so a suspended or
+  # quarantined (migration_failed) laggard read as "behind" on every touch: :async inserted a job
+  # per checkout that cancels `:not_active`, and :inline ran a doomed migration and logged an ERROR
+  # plus `inline_migrate_failed` telemetry on each cold touch. Invariant: only an `active` row is a
+  # migrate-on-touch candidate.
+  for mode <- [:async, :inline], status <- ["suspended", "migration_failed"] do
+    test "migrate_on_touch: #{mode} ignores a #{status} laggard", %{shard: shard} do
+      Application.put_env(:fathom, :migrate_on_touch, unquote(mode))
+      seed_v1!(shard)
+      {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+      Migrator.HeadCache.refresh()
+
+      case unquote(status) do
+        "suspended" -> {:ok, _} = Directory.suspend(shard)
+        "migration_failed" -> {:ok, _} = Directory.mark_failed(shard)
+      end
+
+      test_pid = self()
+      handler = "lazy-status-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:fathom, :migrator, :inline_migrate_failed],
+        fn _, _, meta, _ -> send(test_pid, {:inline_failed, meta.shard_id}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      {:ok, conn} = ShardExecutor.open(shard)
+
+      refute_enqueued(worker: ShardMigrationJob, args: %{shard_id: shard})
+      refute_received {:inline_failed, ^shard}
+      assert {:ok, %{schema_version: 1, status: unquote(status)}} = Directory.get(shard)
+
+      ShardExecutor.close(conn)
+    end
+  end
+
   # Expert review 2026-10-08 #16 (a): `:inline` read the directory unrescued on every checkout, so a
   # Postgres outage raised through `Shards.checkout/1` and failed every request on every shard —
   # while the rest of the data path is built never to fail on the directory. The sandbox in manual
