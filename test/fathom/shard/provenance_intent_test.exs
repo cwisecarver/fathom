@@ -247,6 +247,44 @@ defmodule Fathom.Shard.ProvenanceIntentTest do
       assert quarantined?(shard)
     end
 
+    # Symptom (expert review 2026-10-10 R2-1): flush #1's PUT landed (object md5 = m1) but its result
+    # was never stamped; the retry flush recorded m2 over the single intent slot, its PUT 412'd, and
+    # a crash left intent m2 vs object m1 -> a good copy quarantined. Two slots keep m1 resolvable.
+    test "a retry's newer intent does not erase the unresolved earlier one", %{
+      shard: shard,
+      path: path,
+      store_etag: store_etag,
+      md5: md5
+    } do
+      retry = if md5 == @md5_a, do: @md5_b, else: @md5_a
+      Provenance.write_durable(path, "stale-etag")
+      Provenance.record_intent(path, md5)
+      Provenance.record_intent(path, retry)
+      assert Provenance.read_intents(path) == [retry, md5]
+
+      capture_log(fn ->
+        verdict = Fork.evidence(shard, path)
+        assert {:diverged, "stale-etag", ^store_etag} = verdict
+        refute Fork.resolve(verdict, shard, path, %{})
+      end)
+
+      assert {:ok, ^store_etag} = Provenance.read(path) |> normalize()
+      refute quarantined?(shard)
+    end
+
+    test "re-recording the same intent keeps the older one; a third drops the oldest", %{
+      path: path
+    } do
+      Provenance.write_durable(path, "e")
+      Provenance.record_intent(path, @md5_a)
+      Provenance.record_intent(path, @md5_b)
+      Provenance.record_intent(path, @md5_b)
+      assert Provenance.read_intents(path) == [@md5_b, @md5_a]
+      c = String.duplicate("c", 32)
+      Provenance.record_intent(path, c)
+      assert Provenance.read_intents(path) == [c, @md5_b]
+    end
+
     test "no intent quarantines (the pre-existing behaviour)", %{shard: shard, path: path} do
       Provenance.write_durable(path, "stale-etag")
 

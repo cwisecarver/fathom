@@ -185,26 +185,18 @@ defmodule Fathom.Shard.Fork do
   #                  later post-lease checks and the fenced flush still guard the lineage).
   @spec adopt_own_put(String.t(), Path.t()) :: :adopted | :fork | :keep
   defp adopt_own_put(shard_id, path) do
-    case Provenance.read_intent(path) do
-      nil ->
+    case Provenance.read_intents(path) do
+      [] ->
         :fork
 
-      intent ->
-        case Storage.object_head(shard_id) do
-          {:ok, %{etag: etag, md5: ^intent}} when is_binary(etag) ->
-            Provenance.write_durable(path, etag)
+      intents ->
+        # EITHER slot: a retry flush demotes the first flush's intent rather than erasing it
+        # (expert review 2026-10-10 R2-1), and the object on the store may be the older one.
+        head = Storage.object_head(shard_id)
 
-            Logger.warning(
-              "shard #{shard_id}: sidecar lagged this node's own flush (the PUT landed, the " <>
-                "stamp did not); stored object matches the recorded flush intent — adopted " <>
-                "etag #{etag} instead of quarantining"
-            )
-
-            :telemetry.execute([:fathom, :shard, :intent_adopted], %{count: 1}, %{
-              shard_id: shard_id
-            })
-
-            :adopted
+        case head do
+          {:ok, %{etag: etag, md5: md5}} when is_binary(etag) and is_binary(md5) ->
+            if md5 in intents, do: adopt!(shard_id, path, etag), else: :fork
 
           {:error, _unreachable} ->
             :keep
@@ -213,6 +205,20 @@ defmodule Fathom.Shard.Fork do
             :fork
         end
     end
+  end
+
+  defp adopt!(shard_id, path, etag) do
+    Provenance.write_durable(path, etag)
+
+    Logger.warning(
+      "shard #{shard_id}: sidecar lagged this node's own flush (the PUT landed, the " <>
+        "stamp did not); stored object matches the recorded flush intent — adopted " <>
+        "etag #{etag} instead of quarantining"
+    )
+
+    :telemetry.execute([:fathom, :shard, :intent_adopted], %{count: 1}, %{shard_id: shard_id})
+
+    :adopted
   end
 
   # Returns :ok when the local copy was moved aside (the caller opens COLD), or

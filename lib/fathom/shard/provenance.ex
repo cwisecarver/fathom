@@ -32,7 +32,14 @@ defmodule Fathom.Shard.Provenance do
   directory fsync to be missing, and a record far smaller than a sector is written whole or not at
   all. The first write over a legacy (variable-width) file converts it with temp+rename once.
 
-      "FPV1 " <> etag (space-padded to 96) <> " " <> intent md5 (space-padded to 32) <> "\n"
+      "FPV1 " <> etag (96) <> " " <> intent md5 (32) <> " " <> previous intent md5 (32) <> "\n"
+
+  (every field space-padded to its width). TWO intent slots, because a retry flush records its own
+  intent BEFORE its PUT: a first flush whose PUT landed but whose result was never stamped, then a
+  retry that overwrites the single slot and 412s (the object is still the first one's), then a
+  crash — the surviving intent matched nothing and a good copy was quarantined (expert review
+  2026-10-10 #R2-1 of the fix-review). Recording a NEW intent demotes the current one to "previous"
+  (an unresolved intent is never dropped by a retry); `Fork` adopts on a match with EITHER.
 
   The same record carries the PUT INTENT: the plaintext md5 of the bytes about to be PUT, recorded
   durably BEFORE the PUT. If the process dies after the object landed but before the sidecar learned
@@ -52,8 +59,8 @@ defmodule Fathom.Shard.Provenance do
   @record_magic "FPV1 "
   @etag_width 96
   @intent_width 32
-  # magic + etag + " " + intent + "\n"
-  @record_size byte_size(@record_magic) + @etag_width + 1 + @intent_width + 1
+  # magic + etag + " " + intent + " " + previous intent + "\n"
+  @record_size byte_size(@record_magic) + @etag_width + 1 + @intent_width + 1 + @intent_width + 1
 
   @spec sidecar_path(String.t()) :: String.t()
   def sidecar_path(path), do: path <> ".etag"
@@ -106,7 +113,8 @@ defmodule Fathom.Shard.Provenance do
   Durably record the plaintext md5 (hex) of the bytes about to be PUT, keeping the current etag
   (expert review 2026-10-10 #6). Called by the storage backend right before the PUT. A sidecar that
   is absent or corrupt is left alone — that open already fails closed, and an intent cannot make an
-  unknown provenance known. Cleared by the next `write_durable/2`.
+  unknown provenance known. Cleared by the next `write_durable/2`. An existing, different intent
+  is kept as the "previous" slot (see the moduledoc: a retry must not erase an unresolved intent).
   """
   @spec record_intent(String.t(), String.t()) :: :ok
   def record_intent(path, md5_hex) when byte_size(md5_hex) == @intent_width do
@@ -118,7 +126,7 @@ defmodule Fathom.Shard.Provenance do
       end
 
     with etag when is_binary(etag) <- etag,
-         :ok <- put_record(path, etag, md5_hex) do
+         :ok <- put_record(path, etag, md5_hex, demoted_intent(path, md5_hex)) do
       :ok
     else
       nil ->
@@ -129,18 +137,33 @@ defmodule Fathom.Shard.Provenance do
     end
   end
 
-  @doc "The recorded PUT intent (plaintext md5, hex), or `nil` — none recorded or a legacy sidecar."
+  # The intent a NEW intent displaces: the current one if it differs (it becomes "previous"), else
+  # the existing previous (re-recording the same md5 must not lose an older unresolved one).
+  defp demoted_intent(path, new_md5) do
+    case read_intents(path) do
+      [^new_md5, prev] -> prev
+      [^new_md5] -> nil
+      [current | _] -> current
+      [] -> nil
+    end
+  end
+
+  @doc "The CURRENT recorded PUT intent (plaintext md5, hex), or `nil` — none recorded or a legacy sidecar."
   @spec read_intent(String.t()) :: String.t() | nil
-  def read_intent(path) do
+  def read_intent(path), do: path |> read_intents() |> List.first()
+
+  @doc "Every unresolved PUT intent, newest first (at most two); `[]` for none or a legacy sidecar."
+  @spec read_intents(String.t()) :: [String.t()]
+  def read_intents(path) do
     case File.read(sidecar_path(path)) do
       {:ok, @record_magic <> _ = bin} ->
         case parse_record(bin) do
-          {:ok, _etag, intent} -> intent
-          :error -> nil
+          {:ok, _etag, intent, prev} -> Enum.reject([intent, prev], &is_nil/1)
+          :error -> []
         end
 
       _ ->
-        nil
+        []
     end
   end
 
@@ -148,8 +171,8 @@ defmodule Fathom.Shard.Provenance do
   # no rename to lose); otherwise temp+rename once, which converts a legacy sidecar. An etag that
   # does not fit the record (or has whitespace) falls back to the legacy bare format, which `read/1`
   # still understands — no intent can ride on it, so the gap stays open for such an etag only.
-  defp put_record(path, etag, intent) do
-    case encode_record(etag, intent) do
+  defp put_record(path, etag, intent, prev_intent \\ nil) do
+    case encode_record(etag, intent, prev_intent) do
       {:ok, record} ->
         sidecar = sidecar_path(path)
 
@@ -185,12 +208,14 @@ defmodule Fathom.Shard.Provenance do
     end
   end
 
-  defp encode_record(etag, intent) do
+  defp encode_record(etag, intent, prev_intent) do
     if byte_size(etag) in 1..@etag_width and etag =~ ~r/\A[^\s]+\z/ do
       {:ok,
        @record_magic <>
          String.pad_trailing(etag, @etag_width) <>
-         " " <> String.pad_trailing(intent || "", @intent_width) <> "\n"}
+         " " <>
+         String.pad_trailing(intent || "", @intent_width) <>
+         " " <> String.pad_trailing(prev_intent || "", @intent_width) <> "\n"}
     else
       :error
     end
@@ -198,22 +223,30 @@ defmodule Fathom.Shard.Provenance do
 
   defp parse_record(bin) when byte_size(bin) == @record_size do
     @record_magic <> rest = bin
-    <<etag::binary-size(@etag_width), " ", intent::binary-size(@intent_width), "\n">> = rest
 
-    case {String.trim_trailing(etag), String.trim_trailing(intent)} do
-      {"", _} -> :error
-      {etag, ""} -> {:ok, etag, nil}
-      {etag, intent} -> {:ok, etag, intent}
+    <<etag::binary-size(@etag_width), " ", intent::binary-size(@intent_width), " ",
+      prev::binary-size(@intent_width), "\n">> = rest
+
+    case String.trim_trailing(etag) do
+      "" -> :error
+      etag -> {:ok, etag, blank_nil(intent), blank_nil(prev)}
     end
   end
 
   defp parse_record(_), do: :error
 
+  defp blank_nil(field) do
+    case String.trim_trailing(field) do
+      "" -> nil
+      value -> value
+    end
+  end
+
   # A record that does not parse is a torn/garbled sidecar: same safe direction as an empty one.
   defp read_record(bin) do
     case parse_record(bin) do
-      {:ok, @no_object_sentinel, _intent} -> :no_object
-      {:ok, etag, _intent} -> {:ok, etag}
+      {:ok, @no_object_sentinel, _intent, _prev} -> :no_object
+      {:ok, etag, _intent, _prev} -> {:ok, etag}
       :error -> :corrupt
     end
   end
