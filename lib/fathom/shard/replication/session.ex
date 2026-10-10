@@ -35,6 +35,7 @@ defmodule Fathom.Shard.Replication.Session do
 
   require Logger
 
+  alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication
   alias Fathom.Shard.Replication.Primary
   alias Fathom.Shard.Replication.Protocol, as: ReplProtocol
@@ -1531,15 +1532,36 @@ defmodule Fathom.Shard.Replication.Session do
   # time — which would hand the follower a database and a WAL whose salts do not match. Retrying is
   # correct and cheap; shipping the inconsistent pair is neither.
   #
-  # KNOWN GAP — THE CHECK ABOVE DOES NOT SEE EVERY CHECKPOINT (expert review 2026-10-08 #12, measured).
-  # Only a checkpoint that RESTARTS the log moves the generation. A PASSIVE checkpoint — the commit
-  # hook's at 4000 pages, or a tenant's own `PRAGMA wal_checkpoint` — backfills pages into the `.db`
-  # and leaves the WAL header byte-identical (same ckpt_seq, salt and size: probed). So the `.db`
-  # stream can carry pages from frames committed AFTER `wal_size` was read, and the follower gets a
-  # base newer in places than the WAL prefix it is told to replay. It converges once catch-up ships
-  # past those frames; until then the replica is inconsistent, and promotable if the primary dies
-  # after its first push. The fix (a read transaction pinned across the stream, or streaming the
-  # `.db` first and declaring the WAL extent after it) is parked in that review's progress file.
+  # THE CHECK ABOVE DOES NOT SEE EVERY CHECKPOINT, SO A READ TRANSACTION PINS THE `.db` (expert
+  # review 2026-10-08 #12, measured). Only a checkpoint that RESTARTS the log moves the generation. A
+  # PASSIVE checkpoint — the commit hook's at 4000 pages, or a tenant's own `PRAGMA wal_checkpoint` —
+  # backfills pages into the `.db` and leaves the WAL header byte-identical (same ckpt_seq, salt and
+  # size: probed). Unpinned, the `.db` stream carried pages from frames committed AFTER `wal_size`
+  # was read, and the follower got a base newer in places than the WAL prefix it was told to replay:
+  # an inconsistent replica, promotable if the primary died after its first push.
+  #
+  # `with_pinned_snapshot/2` opens a read connection on the `.db` and takes a snapshot (BEGIN + one
+  # read) BEFORE anything else is read, and holds it until the stream is over. SQLite never backfills
+  # a frame past an active reader's mark (probed 2026-10-09: with a reader at mark 28 of a 58-frame
+  # WAL, PASSIVE returned `checkpointed = 28`; with a reader at mark 0 — WAL fully backfilled when it
+  # began — PASSIVE backfilled nothing and the `.db` bytes did not change). So every page that lands
+  # in the `.db` while we stream comes from a frame at or below the reader's mark M.
+  #
+  # ORDERING IS THE WHOLE ARGUMENT. Snapshot first, THEN `Wal.read`: the extent E read afterwards
+  # can only be >= M, because committed frames of a generation are only ever appended. So every page
+  # in the shipped `.db` is either older than E or comes from a frame inside the shipped prefix 0..E,
+  # which the follower replays over it with identical bytes. Read the header first and the snapshot
+  # second and a commit landing between the two puts M past E — the original gap, narrowed, not
+  # closed. The one case the reader does NOT block is a WAL restart while it holds mark 0 (restart
+  # needs only marks 1..N free); that moves `ckpt_seq`/salt, so `stable?/2` still catches it — and a
+  # restart before our `Wal.read` is harmless anyway, because mark 0 blocks every backfill and the
+  # new generation's frames are exactly what the prefix ships.
+  #
+  # THE COST: while a seed streams, nothing past M reaches the `.db`, and a TRUNCATE checkpoint on
+  # this shard cannot complete — the durability flush gets `busy` and falls through to its `VACUUM
+  # INTO` snapshot path (`Fathom.Shard.checkpoint_and_verify/1`), and the WAL grows for the
+  # duration of the seed. Bounded by the seed itself: the read is released on every exit, abort and
+  # raise included (try/after), and a seed is gated by `SeedGate` and its own timeouts.
   #
   # Streaming widens that window (the copy now takes as long as the transfer rather than as long as
   # a `File.read`), which is exactly why the check moved to AFTER the last chunk and gained an
@@ -1549,7 +1571,49 @@ defmodule Fathom.Shard.Replication.Session do
   # Nothing here holds the database in memory — `:file.pread` walks it a chunk at a time. That is
   # the point of the change: the old path did `File.read(db_path)`, so a 2 GB tenant was 2 GB
   # resident on the primary and again on the follower.
-  defp do_seed(shipper, shard_id, db_path, wal_path, epoch, lineage) do
+  #
+  # Public (`@doc false`) only so the 2026-10-08 #12 regression test can drive a seed against a fake
+  # shipper that checkpoints mid-stream; production reaches it through `gated_seed/6`.
+  @doc false
+  @spec do_seed(GenServer.server(), String.t(), Path.t(), Path.t(), integer(), integer()) ::
+          {:ok, map()} | {:error, term()}
+  def do_seed(shipper, shard_id, db_path, wal_path, epoch, lineage) do
+    with_pinned_snapshot(db_path, fn ->
+      stream_seed(shipper, shard_id, db_path, wal_path, epoch, lineage)
+    end)
+  end
+
+  # Holds a read transaction on `db_path` for the duration of `fun` — see the note above
+  # `do_seed/6`. `file_size/1` first because a `:ro` `Connection.open/2` materializes an ABSENT
+  # file, and a seed of a shard with no `.db` must fail as it always did, not ship an empty database.
+  # A trusted handle (no `tenant?`): no authorizer, no statement deadline.
+  defp with_pinned_snapshot(db_path, fun) do
+    with {:ok, _} <- file_size(db_path),
+         {:ok, conn} <- Connection.open(db_path, scope: :ro) do
+      try do
+        case pin_snapshot(conn) do
+          :ok -> fun.()
+          {:error, reason} -> {:error, {:seed_snapshot_failed, reason}}
+        end
+      after
+        # `conn` used here is also what keeps the handle reachable for the whole stream: a NIF
+        # resource nothing references is finalized at the next GC, which releases the snapshot
+        # mid-stream (probed: with these two lines dropped, the snapshot regression test in
+        # seed_pinned_snapshot_test.exs failed in 1 run of 4).
+        _ = Connection.rollback_if_open(conn)
+        Connection.close(conn)
+      end
+    end
+  end
+
+  # BEGIN alone takes no snapshot (it is DEFERRED); the read is what acquires the WAL read mark.
+  defp pin_snapshot(conn) do
+    with :ok <- Connection.exec(conn, "BEGIN") do
+      Connection.exec(conn, "SELECT 1 FROM sqlite_schema LIMIT 1")
+    end
+  end
+
+  defp stream_seed(shipper, shard_id, db_path, wal_path, epoch, lineage) do
     with {:ok, before} <- Wal.read(wal_path),
          {:ok, db_size} <- file_size(db_path),
          wal_size = wal_size_of(before),
