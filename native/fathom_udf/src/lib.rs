@@ -50,6 +50,7 @@ use rusqlite::{ffi, Connection, Error, Result};
 pub mod aggregates;
 pub mod backstop;
 pub mod datetime;
+pub mod pragma_guard;
 pub mod pyre;
 pub mod pytypes;
 pub mod scalars;
@@ -102,6 +103,12 @@ fn register_all(db: Connection) -> Result<bool> {
     // The statement-deadline backstop: a timeout enforced on the query's own thread, because a
     // BEAM timer can fail to fire while the query runs. See src/backstop.rs.
     backstop::install(&db)?;
+
+    // The engine half of the tenant PRAGMA gate. Registers only the set-once
+    // `fathom_pragma_guard(...)` setter; the authorizer itself is installed when fathom calls it,
+    // on tenant handles only (an authorizer denies ATTACH, and VACUUM INTO is an ATTACH). See
+    // src/pragma_guard.rs.
+    pragma_guard::install(&db)?;
 
     Ok(false)
 }

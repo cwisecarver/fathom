@@ -507,10 +507,17 @@ defmodule Fathom.ShardIsolationAttachTest do
       assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
                ShardExecutor.execute(a, stmt("PRAGMA secure_delete=ON"))
 
-      Application.put_env(:fathom, :tenant_pragma_allow, ["secure_delete"])
-      assert {:ok, _} = ShardExecutor.execute(a, stmt("PRAGMA secure_delete=ON"))
-
       :ok = ShardExecutor.close(a)
+
+      # The widening reaches streams opened AFTER it. This test used to widen mid-stream on the
+      # same handle; since the engine PRAGMA guard (expert review 2026-10-08 #1, tier b) the
+      # allow-list is also handed to the handle's SQLite authorizer at open, set-once so a tenant
+      # cannot widen it, and an already-open handle keeps the list it was opened with.
+      Application.put_env(:fathom, :tenant_pragma_allow, ["secure_delete"])
+      {:ok, b} = ShardExecutor.open(ctx.attacker)
+      assert {:ok, _} = ShardExecutor.execute(b, stmt("PRAGMA secure_delete=ON"))
+
+      :ok = ShardExecutor.close(b)
     end
 
     # …but it cannot reach `query_only` (expert review 2026-08-24 #3). That one is not just another
@@ -522,9 +529,10 @@ defmodule Fathom.ShardIsolationAttachTest do
       prev = Application.get_env(:fathom, :tenant_pragma_allow, [])
       on_exit(fn -> Application.put_env(:fathom, :tenant_pragma_allow, prev) end)
 
-      {:ok, a} = ShardExecutor.open(ctx.attacker)
-
+      # Widened BEFORE the open: the engine guard takes the list at open (see the test above).
       Application.put_env(:fathom, :tenant_pragma_allow, ["query_only", "secure_delete"])
+
+      {:ok, a} = ShardExecutor.open(ctx.attacker)
 
       assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
                ShardExecutor.execute(a, stmt("PRAGMA query_only=OFF")),

@@ -106,7 +106,7 @@ defmodule Fathom.ShardExecutor do
         # genuinely read-only handle for a `:ro` token (expert review 2026-08-01 #1, #7).
         # Everything else — the coordinator's VACUUM INTO snapshot, the migration replay, the
         # harnesses — opens unrestricted, which is required: the authorizer also blocks
-        # VACUUM INTO. See Fathom.Shard.Connection.maybe_authorizer/2.
+        # VACUUM INTO. See Fathom.Shard.Connection.maybe_authorizer/3.
         #
         # `reuse` is `:open` unless connection pooling handed back a warm handle for this scope
         # (docs/pooling-spike-plan.md); `obtain_conn/3` resets a reused one and falls back to a fresh
@@ -1950,6 +1950,28 @@ defmodule Fathom.ShardExecutor do
   # returning false and mis-gating a DDL.
 
   defp extra_pragma_allow, do: Application.get_env(:fathom, :tenant_pragma_allow, [])
+
+  # The names `blocked_pragma/1` lets a tenant ASSIGN, minus the hard deny list — computed in the
+  # same order as that function's `allowed?` (deny wins over every allow source).
+  @tenant_pragma_assignable_base (@tenant_pragma_allow ++ @tenant_pragma_introspect) --
+                                   @tenant_pragma_deny
+
+  @doc """
+  The pragma names a tenant may ASSIGN: `@tenant_pragma_allow`, `@tenant_pragma_introspect` and the
+  operator's `:tenant_pragma_allow`, minus `@tenant_pragma_deny` — exactly what this module's text
+  gate admits.
+
+  `Fathom.Shard.Connection` hands this list to the `fathom_udf` extension's engine-level PRAGMA
+  authorizer on every tenant handle (expert review 2026-10-08 #1, tier b), so the backstop and the
+  gate are built from ONE list and cannot drift.
+  """
+  @spec tenant_pragma_assignable() :: [String.t()]
+  def tenant_pragma_assignable do
+    case extra_pragma_allow() do
+      [] -> @tenant_pragma_assignable_base
+      extra -> @tenant_pragma_assignable_base ++ (extra -- @tenant_pragma_deny)
+    end
+  end
 
   defp block_tenant_ddl?, do: Application.get_env(:fathom, :block_tenant_ddl, false)
 

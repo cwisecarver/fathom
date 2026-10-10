@@ -84,7 +84,13 @@ defmodule Fathom.Shard.ConnectionResetForReuseTest do
     Connection.close(conn)
   end
 
+  # `cache_size` is tenant-settable only when an operator puts it on `:tenant_pragma_allow` (expert
+  # review 2026-10-08 #8). This set it with no widening while only the text gate guarded it; the
+  # engine PRAGMA guard (2026-10-08 #1, tier b) now refuses that, so the fixture widens first — the
+  # one configuration in which a stream can actually leave a changed cache_size behind.
   test "re-asserts cache_size after the previous stream changed it (:rw)", %{path: path} do
+    Application.put_env(:fathom, :tenant_pragma_allow, ["cache_size"])
+    on_exit(fn -> Application.delete_env(:fathom, :tenant_pragma_allow) end)
     {:ok, conn} = Connection.open(path, tenant?: true, scope: :rw)
     {:ok, configured} = Connection.pragma(conn, "cache_size")
     :ok = Sqlite3.execute(conn, "PRAGMA cache_size=-1")

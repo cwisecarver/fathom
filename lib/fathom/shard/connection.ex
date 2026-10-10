@@ -19,10 +19,12 @@ defmodule Fathom.Shard.Connection do
   ## Options
 
     * `:tenant?` — this handle will execute **client-supplied** SQL, so deny
-      `ATTACH`/`DETACH` at the SQLite authorizer (expert review 2026-08-01 #1).
+      `ATTACH`/`DETACH` at the SQLite authorizer (expert review 2026-08-01 #1) and,
+      when the `fathom_udf` extension is loaded, PRAGMA assignments outside the
+      tenant allow-list (expert review 2026-10-08 #1, tier b).
       Defaults to `false`: fathom's own callers (the coordinator's durability
       snapshot, the migration engine's replay, the bench/scale harnesses) are
-      trusted and MUST NOT get the authorizer — see `maybe_authorizer/2`.
+      trusted and MUST NOT get the authorizer — see `maybe_authorizer/3`.
     * `:scope` — `:rw` (default) or `:ro`. A `:ro` handle is opened
       `mode: :readonly` so SQLite itself refuses every write (#7).
 
@@ -151,19 +153,19 @@ defmodule Fathom.Shard.Connection do
     with :ok <- Sqlite3.set_busy_timeout(conn, 5000),
          :ok <- maybe_foreign_keys(conn),
          :ok <- maybe_cache_size(conn),
-         :ok <- load_extension(conn, tenant?),
-         :ok <- maybe_authorizer(conn, tenant?),
-         :ok <- maybe_harden(conn, tenant?) do
+         {:ok, ext} <- load_extension(conn, tenant?),
+         :ok <- maybe_harden(conn, tenant?),
+         :ok <- maybe_authorizer(conn, tenant?, ext) do
       {:ok, conn}
     end
   end
 
   defp configure_readwrite(conn, tenant?, scope) do
     with :ok <- configure(conn),
-         :ok <- load_extension(conn, tenant?),
-         :ok <- maybe_authorizer(conn, tenant?),
+         {:ok, ext} <- load_extension(conn, tenant?),
          :ok <- maybe_harden(conn, tenant?),
-         :ok <- maybe_query_only(conn, scope) do
+         :ok <- maybe_query_only(conn, scope),
+         :ok <- maybe_authorizer(conn, tenant?, ext) do
       {:ok, conn}
     end
   end
@@ -172,7 +174,7 @@ defmodule Fathom.Shard.Connection do
   #
   # ORDERING MATTERS in two directions, and both are load-bearing:
   #
-  #   * BEFORE `maybe_authorizer/2`. The authorizer denies `:attach`, and SQLite implements
+  #   * BEFORE `maybe_authorizer/3`. The authorizer denies `:attach`, and SQLite implements
   #     `sqlite3_load_extension` as a privileged operation the authorizer can also refuse. Loading
   #     first keeps the extension available on tenant handles — which is the entire point, since
   #     tenant handles are the ones running Django's SQL — while the authorizer still governs
@@ -185,11 +187,20 @@ defmodule Fathom.Shard.Connection do
   # load one of its own; see its moduledoc for that contract. A failure to re-disable fails the
   # OPEN rather than degrading, because the alternative is handing a tenant a connection with
   # arbitrary code loading enabled.
+  #
+  # Returns `{:ok, :loaded | :skipped}`: `maybe_authorizer/3` needs to know which authorizer the
+  # handle can carry.
   defp load_extension(conn, tenant?) do
     case Fathom.Shard.Extension.load(conn) do
-      :ok -> if tenant?, do: arm_backstop(conn), else: :ok
-      :skipped -> :ok
-      {:error, reason} -> {:error, reason}
+      :ok ->
+        if tenant?, do: :ok = arm_backstop(conn)
+        {:ok, :loaded}
+
+      :skipped ->
+        {:ok, :skipped}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -241,8 +252,79 @@ defmodule Fathom.Shard.Connection do
   # flush. That is a happy accident on the tenant side: it also closes the `VACUUM INTO
   # '<any path>'` arbitrary-file-write primitive (#8) at the engine, not just at the
   # statement gate.
-  defp maybe_authorizer(_conn, false), do: :ok
-  defp maybe_authorizer(conn, true), do: Sqlite3.set_authorizer(conn, [:attach, :detach])
+  #
+  # THE ENGINE PRAGMA GATE (expert review 2026-10-08 #1, tier b). `Fathom.ShardExecutor`'s PRAGMA
+  # allow-list is a hand parser over statement text, and five of its defects shipped as live
+  # bypasses — each one let a tenant (a `:ro` one too) turn off `max_page_count`, `synchronous`,
+  # `writable_schema` or the process-global `hard_heap_limit`. When the extension is loaded, the
+  # authorizer is the extension's instead of exqlite's (native/fathom_udf/src/pragma_guard.rs): it
+  # sees each pragma as SQLite PARSED it and denies an ASSIGNMENT whose name the tenant may not set,
+  # so the next parser defect is a 403-vs-"not authorized" difference rather than a bypass. A READ
+  # (no value) is always allowed. A connection has ONE authorizer slot, so the extension's also
+  # denies ATTACH/DETACH, keeping everything above.
+  #
+  #   * The allowed names come from `ShardExecutor.tenant_pragma_assignable/0` — the text gate's own
+  #     lists — so the two cannot drift. `pinned_pragmas/0` adds the exact assignments FATHOM makes
+  #     on a tenant handle after this point (pooled reuse, the lazy TEMP cap).
+  #   * Installed LAST in the open, after `maybe_harden/2` and `maybe_query_only/2` (fathom's own
+  #     pragmas), and before any tenant SQL. The extension accepts only the first call, so a
+  #     tenant's own `fathom_pragma_guard(...)` cannot widen it.
+  #   * Fails the OPEN if it cannot be installed while the extension IS loaded: the alternative is a
+  #     tenant handle with neither the pragma backstop nor exqlite's ATTACH deny.
+  #   * Extension absent (`:skipped`): exqlite's ATTACH/DETACH authorizer, exactly as before.
+  defp maybe_authorizer(_conn, false, _ext), do: :ok
+
+  defp maybe_authorizer(conn, true, :skipped),
+    do: Sqlite3.set_authorizer(conn, [:attach, :detach])
+
+  defp maybe_authorizer(conn, true, :loaded), do: install_pragma_guard(conn)
+
+  # Bound, not interpolated: the operator's `:tenant_pragma_allow` reaches this SQL.
+  defp install_pragma_guard(conn) do
+    names = Enum.join(Fathom.ShardExecutor.tenant_pragma_assignable(), ",")
+
+    with {:ok, stmt} <- Sqlite3.prepare(conn, "SELECT fathom_pragma_guard(?1, ?2)") do
+      try do
+        with :ok <- Sqlite3.bind(stmt, [names, pinned_pragmas()]),
+             {:row, [1]} <- Sqlite3.step(conn, stmt) do
+          :ok
+        else
+          {:error, reason} -> {:error, {:pragma_guard_not_installed, reason}}
+          other -> {:error, {:pragma_guard_not_installed, other}}
+        end
+      after
+        Sqlite3.release(conn, stmt)
+      end
+    else
+      {:error, reason} -> {:error, {:pragma_guard_not_installed, reason}}
+    end
+  end
+
+  # The `[schema.]name=value` assignments fathom itself sends on a TENANT handle after the guard is
+  # installed, each allowed with exactly this value (a tenant sending the same one changes nothing —
+  # every value is fathom's own protective setting):
+  #
+  #   * `synchronous=FULL`, `cache_size=-<kb>` — `reconfigure_for_reuse/1` on a pooled `:rw` handle
+  #     (`foreign_keys` is already an allowed name, and the main `max_page_count` is re-applied there
+  #     only when the operator allowed that name).
+  #   * `query_only=ON` — `@ro_reuse_sql` on a pooled `:ro` handle.
+  #   * `temp.max_page_count=<n>` — `cap_temp/1`, before TEMP DDL. Pinned WITH its schema: the value
+  #     is derived at a 4096-byte page and is larger than the main cap on a bigger-page file, so a
+  #     bare `max_page_count=<n>` must not match it.
+  #
+  # Read from config at open, the same reads those paths make. If an operator changes
+  # `:shard_cache_size_kb` or the size cap at runtime, a pooled handle's reuse batch is refused and
+  # `reset_for_reuse/2`'s caller discards the handle and opens a fresh one — the safe direction.
+  defp pinned_pragmas do
+    [
+      "synchronous=FULL",
+      "query_only=ON",
+      cache_size_kb() && "cache_size=-#{cache_size_kb()}",
+      temp_cap_pages() && "temp.max_page_count=#{temp_cap_pages()}"
+    ]
+    |> Enum.filter(& &1)
+    |> Enum.join(",")
+  end
 
   # Fallback belt for a `:ro` scope that could not get a read-only handle (see open_handle/2).
   defp maybe_query_only(conn, :ro), do: Sqlite3.execute(conn, "PRAGMA query_only=ON")
@@ -252,7 +334,9 @@ defmodule Fathom.Shard.Connection do
   # The PRAGMA allow-list in `Fathom.ShardExecutor` is the half of the tenant gate with NO engine
   # backstop: unlike ATTACH (stopped by the authorizer) and `:ro` writes (stopped by a
   # `mode: :readonly` handle), a PRAGMA miss in the head parser is a complete bypass — which is
-  # how 2026-08-20 #19, 2026-08-24 #1 and 2026-09-05 #1/#2 each landed. These two put a floor
+  # how 2026-08-20 #19, 2026-08-24 #1 and 2026-09-05 #1/#2 each landed. (Since 2026-10-08 #1 tier b
+  # the extension's authorizer backstops assignments — see `maybe_authorizer/3` — but only when the
+  # extension is loaded, and these still hold underneath it.) These two put a floor
   # UNDER the parser, at the engine, where SQLite enforces them however the SQL is spelled:
   #
   #   * `trusted_schema=OFF` — refuse schema objects (views/triggers/CHECK/generated columns)
@@ -388,9 +472,9 @@ defmodule Fathom.Shard.Connection do
         else: []
 
     cache =
-      case Application.get_env(:fathom, :shard_cache_size_kb, 2000) do
-        kb when is_integer(kb) and kb > 0 -> [";PRAGMA cache_size=-#{kb}"]
-        _ -> []
+      case cache_size_kb() do
+        nil -> []
+        kb -> [";PRAGMA cache_size=-#{kb}"]
       end
 
     IO.iodata_to_binary([
@@ -440,9 +524,18 @@ defmodule Fathom.Shard.Connection do
   # blind. Negative value = KiB (SQLite's own convention); a positive value would mean *pages*, so
   # the sign is forced here rather than left to the operator.
   defp maybe_cache_size(conn) do
+    case cache_size_kb() do
+      nil -> :ok
+      kb -> Sqlite3.execute(conn, "PRAGMA cache_size=-#{kb}")
+    end
+  end
+
+  # The configured per-connection page cache in KiB, or nil when unset/invalid. Shared by the open,
+  # the pooled-reuse batch and `pinned_pragmas/0`, which must agree on the exact value.
+  defp cache_size_kb do
     case Application.get_env(:fathom, :shard_cache_size_kb, 2000) do
-      kb when is_integer(kb) and kb > 0 -> Sqlite3.execute(conn, "PRAGMA cache_size=-#{kb}")
-      _ -> :ok
+      kb when is_integer(kb) and kb > 0 -> kb
+      _ -> nil
     end
   end
 
@@ -503,19 +596,21 @@ defmodule Fathom.Shard.Connection do
   """
   @spec cap_temp(reference()) :: :ok | {:error, term()}
   def cap_temp(conn) do
+    case temp_cap_pages() do
+      nil -> :ok
+      n -> Sqlite3.execute(conn, "PRAGMA temp.max_page_count=#{n}")
+    end
+  end
+
+  # The TEMP cap in pages, or nil when the size cap is off. Shared with `pinned_pragmas/0`, which
+  # must allow exactly the value `cap_temp/1` sends.
+  defp temp_cap_pages do
     case {Application.get_env(:fathom, :shard_max_page_count),
           Application.get_env(:fathom, :shard_max_bytes, @default_max_bytes)} do
-      {n, _} when is_integer(n) and n > 0 ->
-        Sqlite3.execute(conn, "PRAGMA temp.max_page_count=#{n}")
-
-      {n, _} when is_integer(n) ->
-        :ok
-
-      {_, bytes} when is_integer(bytes) and bytes > 0 ->
-        Sqlite3.execute(conn, "PRAGMA temp.max_page_count=#{max(div(bytes, 4096), 1)}")
-
-      _ ->
-        :ok
+      {n, _} when is_integer(n) and n > 0 -> n
+      {n, _} when is_integer(n) -> nil
+      {_, bytes} when is_integer(bytes) and bytes > 0 -> max(div(bytes, 4096), 1)
+      _ -> nil
     end
   end
 
