@@ -14,8 +14,12 @@ defmodule Fathom.ReleasePackagingTest do
   @dockerfiles Path.wildcard("deploy/*/Dockerfile*")
                |> Enum.reject(&String.ends_with?(&1, ".dockerignore"))
 
+  # `RUN mix release`, optionally preceded by BuildKit `--mount=...` options split across `\`
+  # continuation lines (the cargo cache mounts, c152bbe) -- a plain `^RUN\s+mix` stopped matching.
+  @release_run ~r/^RUN\s+(?:--mount=\S+\s*(?:\\\s*\n\s*)?)*mix\s+release/m
+
   defp release_images do
-    Enum.filter(@dockerfiles, fn path -> File.read!(path) =~ ~r/^RUN\s+mix\s+release/m end)
+    Enum.filter(@dockerfiles, fn path -> File.read!(path) =~ @release_run end)
   end
 
   test "the Dockerfiles that build a release are actually discovered" do
@@ -34,7 +38,7 @@ defmodule Fathom.ReleasePackagingTest do
                "generate a default vm.args and drop every flag in rel/vm.args.eex"
 
       copy_at = index_of(body, ~r/^COPY\s+fathom\/rel\s+rel\s*$/m)
-      release_at = index_of(body, ~r/^RUN\s+mix\s+release/m)
+      release_at = index_of(body, @release_run)
 
       assert copy_at < release_at,
              "#{path} copies fathom/rel AFTER `mix release`, so the release is built without it"
