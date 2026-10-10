@@ -114,6 +114,43 @@ defmodule Fathom.Shard.PragmaGuardTest do
       assert {:ok, %{rows: [[_]]}} = Connection.query(conn, "PRAGMA writable_schema", [])
     end
 
+    # Expert review 2026-10-10 #33b: the text gate (2220284) limits tenant `wal_checkpoint` to
+    # PASSIVE, but the engine guard admitted every mode, so a sixth text-parser defect would let a
+    # tenant loop TRUNCATE/RESTART/FULL (they wait on other connections and stall co-resident writers).
+    for scope <- [:rw, :ro] do
+      test "wal_checkpoint is PASSIVE-or-bare only at the engine (#{scope})", %{path: path} do
+        conn = open!(path, tenant?: true, scope: unquote(scope))
+
+        for sql <- [
+              "PRAGMA wal_checkpoint(TRUNCATE)",
+              "PRAGMA wal_checkpoint(RESTART)",
+              "PRAGMA wal_checkpoint(FULL)",
+              "PRAGMA wal_checkpoint(full)",
+              "PRAGMA wal_checkpoint = truncate",
+              "PRAGMA main.wal_checkpoint(FULL)",
+              "PRAGMA main . wal_checkpoint ( RESTART )",
+              "PRAGMA \"wal_checkpoint\"(TRUNCATE)",
+              "PRAGMA wal_checkpoint('TRUNCATE')",
+              "PRAGMA wal_checkpoint(\"restart\")",
+              "PRAGMA wal_checkpoint /*;*/ (TRUNCATE)",
+              "EXPLAIN PRAGMA wal_checkpoint(TRUNCATE)"
+            ] do
+          result = Connection.query(conn, sql, [])
+          assert refused?(result), "#{inspect(sql)} was not refused: #{inspect(result)}"
+        end
+
+        for sql <- [
+              "PRAGMA wal_checkpoint",
+              "PRAGMA wal_checkpoint(PASSIVE)",
+              "PRAGMA wal_checkpoint(passive)",
+              "PRAGMA main.wal_checkpoint(PASSIVE)",
+              "PRAGMA wal_checkpoint('Passive')"
+            ] do
+          assert {:ok, _} = Connection.query(conn, sql, []), sql
+        end
+      end
+    end
+
     test "ATTACH, DETACH and VACUUM INTO stay refused (the one authorizer slot)", %{
       path: path,
       dir: dir

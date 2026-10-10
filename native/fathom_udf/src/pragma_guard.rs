@@ -96,6 +96,7 @@ pub fn decide(
 ) -> c_int {
     match action {
         ffi::SQLITE_ATTACH | ffi::SQLITE_DETACH => ffi::SQLITE_DENY,
+        ffi::SQLITE_PRAGMA if !wal_checkpoint_mode_allowed(name, value) => ffi::SQLITE_DENY,
         ffi::SQLITE_PRAGMA => match value {
             // A read: always allowed.
             None => ffi::SQLITE_OK,
@@ -108,6 +109,21 @@ pub fn decide(
             }
         },
         _ => ffi::SQLITE_OK,
+    }
+}
+
+/// `wal_checkpoint` is allow-listed by NAME, but its argument is the mode: TRUNCATE/RESTART/FULL
+/// block on (or wait for) other connections' readers and writers, so a tenant looping them stalls
+/// every co-resident writer (expert review 2026-10-10 #33b). Only a bare `PRAGMA wal_checkpoint`
+/// (value NULL) or PASSIVE passes. Probed 2026-10-10: `(TRUNCATE)`, `= truncate`, `main.` and quoted
+/// spellings all reach the authorizer as name `wal_checkpoint` with the dequoted mode as arg 4.
+/// Any other pragma is not this function's business.
+fn wal_checkpoint_mode_allowed(name: Option<&[u8]>, value: Option<&[u8]>) -> bool {
+    match (name, value) {
+        (Some(n), Some(mode)) if n.eq_ignore_ascii_case(b"wal_checkpoint") => {
+            mode.eq_ignore_ascii_case(b"passive")
+        }
+        _ => true,
     }
 }
 
@@ -401,6 +417,53 @@ mod tests {
         );
         assert_eq!(
             pragma("max_page_count", Some("1048576"), Some("main")),
+            ffi::SQLITE_DENY
+        );
+    }
+
+    #[test]
+    fn wal_checkpoint_only_passive_or_bare() {
+        let p = Policy::parse("wal_checkpoint", "");
+        let run = |name: &[u8], value: Option<&[u8]>, schema: Option<&[u8]>| {
+            decide(ffi::SQLITE_PRAGMA, Some(name), value, schema, &p)
+        };
+        assert_eq!(run(b"wal_checkpoint", None, None), ffi::SQLITE_OK);
+        assert_eq!(run(b"wal_checkpoint", None, Some(b"main")), ffi::SQLITE_OK);
+        assert_eq!(
+            run(b"wal_checkpoint", Some(b"PASSIVE"), None),
+            ffi::SQLITE_OK
+        );
+        assert_eq!(
+            run(b"WAL_Checkpoint", Some(b"passive"), Some(b"main")),
+            ffi::SQLITE_OK
+        );
+        for mode in [
+            &b"TRUNCATE"[..],
+            b"restart",
+            b"Full",
+            b"noop",
+            b"",
+            b"bogus",
+            b"passive ",
+        ] {
+            assert_eq!(
+                run(b"wal_checkpoint", Some(mode), None),
+                ffi::SQLITE_DENY,
+                "{mode:?}"
+            );
+            assert_eq!(
+                run(b"WAL_CHECKPOINT", Some(mode), Some(b"main")),
+                ffi::SQLITE_DENY
+            );
+        }
+        // Another pragma named with the word "passive" is unaffected.
+        assert_eq!(
+            pragma("foreign_keys", Some("passive"), None),
+            ffi::SQLITE_OK
+        );
+        // A policy that never allowed wal_checkpoint still refuses even PASSIVE assignments.
+        assert_eq!(
+            pragma("wal_checkpoint", Some("passive"), None),
             ffi::SQLITE_DENY
         );
     }
