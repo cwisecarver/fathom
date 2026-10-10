@@ -67,6 +67,28 @@ defmodule FathomWeb.AdminLiveTest do
       assert get_resp_header(conn, "content-type") |> hd() =~ "text/plain"
     end
 
+    # Expert review 2026-10-10 #W7: a failing scrape (reporter down) used to answer an empty 200,
+    # which Prometheus records as a healthy scrape of zero series. Enabled-but-failing is a 503.
+    test "GET /admin/metrics is 503 when metrics are enabled but the scrape fails", %{conn: conn} do
+      prev = Application.get_env(:fathom, :metrics_collector)
+      Application.put_env(:fathom, :metrics_collector, true)
+
+      on_exit(fn ->
+        if prev == nil,
+          do: Application.delete_env(:fathom, :metrics_collector),
+          else: Application.put_env(:fathom, :metrics_collector, prev)
+      end)
+
+      # The reporter is off in test, so scrape/0 raises — exactly the failure being pinned.
+      assert Process.whereis(:fathom_metrics) == nil
+
+      {conn, log} =
+        ExUnit.CaptureLog.with_log(fn -> conn |> auth() |> get("/admin/metrics") end)
+
+      assert conn.status == 503
+      assert log =~ "metrics scrape"
+    end
+
     test "fails closed with 503 when no credentials are configured", %{conn: conn} do
       prev = Application.get_env(:fathom, :admin_auth)
       Application.delete_env(:fathom, :admin_auth)
