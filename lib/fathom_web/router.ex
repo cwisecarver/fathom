@@ -90,15 +90,34 @@ defmodule FathomWeb.Router do
   defp api_auth(conn, _opts) do
     case bearer_token(conn) do
       {:ok, token} ->
-        case Fathom.ApiKeys.authenticate(token) do
-          {:ok, actor} ->
-            Plug.Conn.assign(conn, :api_actor, actor)
+        # Bearer failures count toward a per-IP lockout, like the BasicAuth path (expert review
+        # 2026-10-10 #W8): the key space is 256-bit so guessing is hopeless, but an unbounded
+        # stream of bad keys still costs a Postgres lookup each. `ApiKeys.authenticate/1` is one
+        # indexed `token_hash = $1` lookup (unique index), so the lockout bounds volume, not
+        # per-attempt cost. Same `:admin_auth_max_failures` knob, separate `:api_key` counter.
+        if api_key_blocked?(conn) do
+          :telemetry.execute([:fathom, :api_key_auth, :blocked], %{count: 1}, %{})
 
-          :error ->
-            conn
-            |> Plug.Conn.put_resp_content_type("text/plain")
-            |> Plug.Conn.send_resp(401, "invalid or revoked API key")
-            |> Plug.Conn.halt()
+          conn
+          |> Plug.Conn.put_resp_content_type("text/plain")
+          |> Plug.Conn.send_resp(429, "too many failed API key attempts; retry later")
+          |> Plug.Conn.halt()
+        else
+          case Fathom.ApiKeys.authenticate(token) do
+            {:ok, actor} ->
+              if admin_fail_limit(),
+                do: Fathom.RateLimiter.forget(:api_key, throttle_key(conn))
+
+              Plug.Conn.assign(conn, :api_actor, actor)
+
+            :error ->
+              record_api_key_failure(conn)
+
+              conn
+              |> Plug.Conn.put_resp_content_type("text/plain")
+              |> Plug.Conn.send_resp(401, "invalid or revoked API key")
+              |> Plug.Conn.halt()
+          end
         end
 
       :none ->
@@ -223,6 +242,34 @@ defmodule FathomWeb.Router do
         conn
         |> Plug.BasicAuth.basic_auth(username: user, password: pass)
         |> record_admin_auth_result()
+    end
+  end
+
+  defp api_key_blocked?(conn) do
+    case admin_fail_limit() do
+      nil ->
+        false
+
+      limit ->
+        Fathom.RateLimiter.count(:api_key, throttle_key(conn), admin_fail_window()) >= limit
+    end
+  end
+
+  defp record_api_key_failure(conn) do
+    case admin_fail_limit() do
+      nil ->
+        :ok
+
+      limit ->
+        new_count = Fathom.RateLimiter.bump(:api_key, throttle_key(conn), admin_fail_window())
+        :telemetry.execute([:fathom, :api_key_auth, :failed], %{count: 1}, %{})
+
+        # Audit only the lockout transition, as the BasicAuth path does.
+        if new_count == limit do
+          Fathom.Audit.log(conn, :api_key_locked_out, nil, :blocked, %{failures: new_count})
+        end
+
+        :ok
     end
   end
 

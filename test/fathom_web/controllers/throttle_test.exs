@@ -71,6 +71,26 @@ defmodule FathomWeb.ThrottleTest do
     assert other |> basic("admin", "wrong") |> get("/admin/metrics") |> Map.get(:status) == 401
   end
 
+  # Expert review 2026-10-10 #W8: only BasicAuth failures were counted; a Bearer key-guessing flood
+  # got unlimited 401s (a Postgres lookup each). Bad Bearer keys now lock the source IP out too.
+  test "bad Bearer API keys lock out a source IP after the failure threshold (429)", %{conn: conn} do
+    Application.put_env(:fathom, :admin_auth_max_failures, 3)
+    bearer = fn c, t -> Plug.Conn.put_req_header(c, "authorization", "Bearer " <> t) end
+
+    for _ <- 1..3 do
+      assert conn |> bearer.("fk_nope") |> get("/api/tenants") |> Map.get(:status) == 401
+    end
+
+    assert conn |> bearer.("fk_nope") |> get("/api/tenants") |> Map.get(:status) == 429
+
+    # The lockout is per-IP and precedes the lookup, so a valid key is refused too ...
+    {:ok, good, _key} = Fathom.ApiKeys.mint("lockout-test", "read")
+    assert conn |> bearer.(good) |> get("/api/tenants") |> Map.get(:status) == 429
+
+    # ... but it is a SEPARATE counter from the BasicAuth one.
+    assert conn |> basic("admin", "secret") |> get("/admin/metrics") |> Map.get(:status) == 200
+  end
+
   test "a successful admin auth clears the failure count", %{conn: conn} do
     Application.put_env(:fathom, :admin_auth_max_failures, 3)
 
