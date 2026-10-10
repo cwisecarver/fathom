@@ -771,21 +771,33 @@ defmodule Fathom.Directory do
   Suspends a shard — flips its directory row to `suspended` (administrative offline, #20). A
   suspended tenant is denied at admission (via the `Fathom.Tenants.Suspensions` gate) until
   `resume/1`. Refuses `:not_found`, or `:deleted` (a tombstoned tenant is gone, not suspendable).
+
+  Only an `active` row may be suspended (a re-suspend of an already-`suspended` row is an idempotent
+  no-op so an operator retry after a partial failure still reaches the broadcast/drain). A
+  `migrating` / `migration_failed` / `retired` row is refused with `{:error, :status_conflict}`:
+  the old unconditional write overwrote a live migration's status, and `resume/1` then lifted it to
+  `active` with the migration still in flight (expert review 2026-10-10 #10).
   """
   @spec suspend(String.t()) ::
-          {:ok, Shard.t()} | {:error, :not_found | :deleted | Ecto.Changeset.t()}
+          {:ok, Shard.t()}
+          | {:error, :not_found | :deleted | :status_conflict | Ecto.Changeset.t()}
   def suspend(shard_id) do
     with {:ok, %Shard{status: status}} when status != "deleted" <- fetch_for_status(shard_id) do
-      update_shard(shard_id, %{status: "suspended"})
+      guarded_update_shard(shard_id, %{status: "suspended"}, ["active", "suspended"])
     end
   end
 
-  @doc "Resumes a suspended shard back to `active` (#20). Refuses `:not_found` or `:deleted`."
+  @doc """
+  Resumes a suspended shard back to `active` (#20). Refuses `:not_found` or `:deleted`, and
+  `{:error, :status_conflict}` for any row that is not `suspended` — resuming a `migrating` /
+  `migration_failed` / `retired` row used to flip it to `active` (expert review 2026-10-10 #10).
+  """
   @spec resume(String.t()) ::
-          {:ok, Shard.t()} | {:error, :not_found | :deleted | Ecto.Changeset.t()}
+          {:ok, Shard.t()}
+          | {:error, :not_found | :deleted | :status_conflict | Ecto.Changeset.t()}
   def resume(shard_id) do
     with {:ok, %Shard{status: status}} when status != "deleted" <- fetch_for_status(shard_id) do
-      update_shard(shard_id, %{status: "active"})
+      guarded_update_shard(shard_id, %{status: "active"}, ["suspended"])
     end
   end
 

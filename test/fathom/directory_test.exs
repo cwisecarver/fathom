@@ -885,6 +885,56 @@ defmodule Fathom.DirectoryTest do
   # row — silently lifting a legal-hold suspension or resurrecting a deleted tenant's directory row
   # mid-rollout. They are now status-guarded like unmark_migrating/1. Verified by execution in the
   # panel; each write must leave a terminal-status row untouched and in its admission id-set.
+  # Symptom (expert review 2026-10-10 #10): suspend/resume used the UNguarded update_shard, so
+  # suspend overwrote a live migration's `migrating` and resume lifted `migrating` /
+  # `migration_failed` / `retired` rows to `active`. Invariant: resume lands only from `suspended`,
+  # suspend only from `active` (idempotent on `suspended`).
+  describe "suspend/resume are status-guarded (#10)" do
+    defp seeded(status) do
+      shard = "sr_#{status}_#{System.unique_integer([:positive])}"
+      {:ok, _} = Directory.resolve(shard)
+
+      case status do
+        "active" -> :ok
+        "migrating" -> {:ok, _} = Directory.mark_migrating(shard)
+        "migration_failed" -> {:ok, _} = Directory.mark_failed(shard)
+      end
+
+      shard
+    end
+
+    for status <- ["migrating", "migration_failed"] do
+      test "suspend and resume refuse a #{status} row and leave it untouched" do
+        status = unquote(status)
+        shard = seeded(status)
+
+        assert {:error, :status_conflict} = Directory.suspend(shard)
+        assert {:error, :status_conflict} = Directory.resume(shard)
+        assert {:ok, %Shard{status: ^status}} = Directory.get(shard)
+      end
+    end
+
+    test "resume refuses an active row; suspend/resume round-trips from active" do
+      shard = seeded("active")
+      assert {:error, :status_conflict} = Directory.resume(shard)
+
+      assert {:ok, %Shard{status: "suspended"}} = Directory.suspend(shard)
+      # idempotent re-suspend
+      assert {:ok, %Shard{status: "suspended"}} = Directory.suspend(shard)
+      assert {:ok, %Shard{status: "active"}} = Directory.resume(shard)
+    end
+
+    test "unknown and deleted shards keep their distinct errors" do
+      assert {:error, :not_found} =
+               Directory.suspend("nope_#{System.unique_integer([:positive])}")
+
+      shard = seeded("active")
+      Directory.tombstone(shard)
+      assert {:error, :deleted} = Directory.suspend(shard)
+      assert {:error, :deleted} = Directory.resume(shard)
+    end
+  end
+
   describe "migration writes never overwrite a terminal lifecycle status (#11)" do
     for terminal <- ["suspended", "deleted"] do
       test "mark_migrating / cutover / mark_failed refuse a #{terminal} row" do
