@@ -61,13 +61,23 @@ defmodule Fathom.Shard.Replication.Follower do
   environment that cannot express the topology cannot catch bugs in it (AGENTS.md).
   """
   @spec table(atom()) :: atom()
-  def table(name \\ __MODULE__), do: Module.concat(name, Shards)
+  # The default (production) name resolves at compile time; `Module.concat/2` interned an atom and
+  # allocated a binary on EVERY call, 17 sites on the per-frame path (expert review 2026-10-10 #P4).
+  # Other names (tests standing up several followers) keep the concat.
+  @default_table Module.concat(__MODULE__, Shards)
+  @default_locks Module.concat(__MODULE__, ShardLocks)
+
+  def table(name \\ __MODULE__)
+  def table(__MODULE__), do: @default_table
+  def table(name), do: Module.concat(name, Shards)
 
   @doc false
   # The per-shard mutex table (expert review 2026-10-08 #5). Separate from `table/1` so the lock
   # rows can never be mistaken for state rows by `replica_shard_ids/1`'s `tab2list`.
   @spec locks(atom()) :: atom()
-  def locks(name \\ __MODULE__), do: Module.concat(name, ShardLocks)
+  def locks(name \\ __MODULE__)
+  def locks(__MODULE__), do: @default_locks
+  def locks(name), do: Module.concat(name, ShardLocks)
 
   # ------------------------------------------------------------------------------------------
   # the per-shard lock
@@ -511,9 +521,9 @@ defmodule Fathom.Shard.Replication.Follower do
     # loopback test runs the PRIMARY and the follower in one VM: the primary's coordinator is then
     # registered in the same registry and would be mistaken for the follower's own node serving the
     # shard, refusing the very pushes the test exists to drive.
-    :ets.insert(
-      locks(name),
-      {:__coordinator_registry__, Keyword.get(opts, :coordinator_registry)}
+    :persistent_term.put(
+      {__MODULE__, :coordinator_registry, name},
+      Keyword.get(opts, :coordinator_registry)
     )
 
     reap_stale_seed_temps(dir)
@@ -881,17 +891,19 @@ defmodule Fathom.Shard.Replication.Follower do
   # self-fence (it cannot keep a quorum or flush under a stale epoch). A durable lineage floor that
   # outlives the coordinator was the rejected alternative (user decision 2026-10-10).
   defp coordinated_here?(name, shard_id) do
-    case :ets.lookup(locks(name), :__coordinator_registry__) do
+    # Cached in persistent_term at init: the setting is fixed for the follower's life, and the ETS
+    # row it replaces was read on every push (expert review 2026-10-10 #P4).
+    case :persistent_term.get({__MODULE__, :coordinator_registry, name}, nil) do
       # Only a coordinator that HOLDS the lease counts (`Fathom.Shard` marks its registry entry
       # `:lease_held` once `acquire_lease` succeeded). A coordinator is registered BEFORE the lease
       # is acquired, and while that acquire is pending a legitimate owner on another node may still
       # be shipping to us: refusing it would cost that owner this follower's ack (`:stale_epoch` is
       # a settled reject, so its quorum shrinks) for nothing.
-      [{_, registry}] when not is_nil(registry) ->
-        match?([{_pid, :lease_held}], Registry.lookup(registry, shard_id))
-
-      _ ->
+      nil ->
         false
+
+      registry ->
+        match?([{_pid, :lease_held}], Registry.lookup(registry, shard_id))
     end
   rescue
     # Follower or registry not running: nothing is coordinated here.
