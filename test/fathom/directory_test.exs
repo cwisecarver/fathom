@@ -653,6 +653,36 @@ defmodule Fathom.DirectoryTest do
       assert def_ =~ "last_snapshot_at NULLS FIRST"
       assert def_ =~ "status"
     end
+
+    # Expert review 2026-10-10 #P2. Symptom: the index predicate was only `status = 'active'`, so
+    # the two-column "changed since last snapshot" test ran as a filter over the ordered walk and
+    # dormant clean shards sat at the head forever. Invariant: the predicate carries the whole
+    # need-a-snapshot condition, and the query's WHERE implies it (so the planner may use it).
+    test "index predicate carries the needs-a-snapshot condition" do
+      %{rows: [[def_]]} =
+        Fathom.Repo.query!(
+          "SELECT indexdef FROM pg_indexes WHERE indexname = 'shards_snapshot_rotation_active_index'"
+        )
+
+      assert def_ =~ "last_flushed_at IS NOT NULL"
+      assert def_ =~ "last_flushed_at > last_snapshot_at"
+    end
+
+    test "planner uses the rotation index for sample_for_snapshot/1's query" do
+      Fathom.Repo.query!("SET LOCAL enable_seqscan = off")
+
+      %{rows: rows} =
+        Fathom.Repo.query!("""
+        EXPLAIN SELECT shard_id FROM shards
+        WHERE status = 'active' AND last_flushed_at IS NOT NULL
+          AND (last_snapshot_at IS NULL OR last_flushed_at > last_snapshot_at)
+        ORDER BY last_snapshot_attempt_at ASC NULLS FIRST, last_snapshot_at ASC NULLS FIRST
+        LIMIT 10
+        """)
+
+      plan = rows |> List.flatten() |> Enum.join("\n")
+      assert plan =~ "shards_snapshot_rotation_active_index", plan
+    end
   end
 
   # Review #35: the non-partial (schema_version, last_active_at) index from 20260628001559 was
