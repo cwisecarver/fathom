@@ -276,35 +276,55 @@ defmodule Fathom.Tenants do
       dir = export_dir!()
       tmp = Path.join(dir, "#{id}.db")
 
-      case Storage.pull(id, tmp) do
-        # No bytes written: no object, or a steal sentinel (expert review 2026-08-01 #24).
-        # Previously a sentinel arrived as `{:ok, <etag>}` and fell through to the success
-        # branch, so export returned a fabricated EMPTY database as the tenant's data.
-        {:absent, _} ->
+      # The 0700 dir holds a full tenant copy: remove it on EVERY non-success path, including a
+      # raise in Storage.pull/verify_integrity (expert review 2026-10-10 fix-review R4-2).
+      try do
+        case export_pull(id, dir, tmp) do
+          {:ok, _} = ok ->
+            ok
+
+          error ->
+            File.rm_rf(dir)
+            error
+        end
+      rescue
+        e ->
           File.rm_rf(dir)
-          {:error, :not_stored}
-
-        {:ok, _etag} ->
-          case Fathom.Shard.verify_integrity(tmp) do
-            :ok ->
-              # verify_integrity opened the temp (WAL mode) for a read-only quick_check; drop any
-              # empty WAL siblings it left so the returned file is a self-contained db the caller
-              # can read + delete cleanly.
-              for s <- ["-wal", "-shm"], do: File.rm(tmp <> s)
-              {:ok, %{path: tmp, dir: dir, filename: "#{id}.db"}}
-
-            {:error, reason} ->
-              # A corrupt stored object must never be handed to the tenant as their portability
-              # export (#22) — drop the temp and surface it. Better a loud error than silent
-              # corruption the departing customer discovers later.
-              File.rm_rf(dir)
-              {:error, {:corrupt_export, reason}}
-          end
-
-        {:error, reason} ->
+          reraise e, __STACKTRACE__
+      catch
+        kind, reason ->
           File.rm_rf(dir)
-          {:error, reason}
+          :erlang.raise(kind, reason, __STACKTRACE__)
       end
+    end
+  end
+
+  defp export_pull(id, dir, tmp) do
+    case Storage.pull(id, tmp) do
+      # No bytes written: no object, or a steal sentinel (expert review 2026-08-01 #24).
+      # Previously a sentinel arrived as `{:ok, <etag>}` and fell through to the success
+      # branch, so export returned a fabricated EMPTY database as the tenant's data.
+      {:absent, _} ->
+        {:error, :not_stored}
+
+      {:ok, _etag} ->
+        case Fathom.Shard.verify_integrity(tmp) do
+          :ok ->
+            # verify_integrity opened the temp (WAL mode) for a read-only quick_check; drop any
+            # empty WAL siblings it left so the returned file is a self-contained db the caller
+            # can read + delete cleanly.
+            for s <- ["-wal", "-shm"], do: File.rm(tmp <> s)
+            {:ok, %{path: tmp, dir: dir, filename: "#{id}.db"}}
+
+          {:error, reason} ->
+            # A corrupt stored object must never be handed to the tenant as their portability
+            # export (#22) -- surface it. Better a loud error than silent corruption the departing
+            # customer discovers later.
+            {:error, {:corrupt_export, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

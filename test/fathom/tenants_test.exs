@@ -163,6 +163,36 @@ defmodule Fathom.TenantsTest do
       :ok = Exqlite.Sqlite3.close(db)
     end
 
+    # Fix-review R4-2 (SYMPTOM): a raise inside Storage.pull / verify_integrity skipped the
+    # File.rm_rf of the 0700 export dir, leaking a tenant copy (or its partial) in the temp dir.
+    # Invariant: no export path leaves a fathom_export_* directory behind.
+    test "a raise during the export pull does not leak the export directory", %{id: id} do
+      prev = Application.get_env(:fathom, :shard_storage)
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+      Application.put_env(
+        :fathom,
+        :faulty_before,
+        {:pull, fn ^id -> raise "boom during pull" end}
+      )
+
+      on_exit(fn ->
+        Application.delete_env(:fathom, :faulty_before)
+
+        if prev,
+          do: Application.put_env(:fathom, :shard_storage, prev),
+          else: Application.delete_env(:fathom, :shard_storage)
+      end)
+
+      tmp = System.tmp_dir!()
+      before = Path.wildcard(Path.join(tmp, "fathom_export_*")) |> MapSet.new()
+
+      assert_raise RuntimeError, "boom during pull", fn -> Tenants.export(id, flush: false) end
+
+      after_ = Path.wildcard(Path.join(tmp, "fathom_export_*")) |> MapSet.new()
+      assert MapSet.difference(after_, before) == MapSet.new(), "export dir leaked on a raise"
+    end
+
     # Expert review 2026-10-10 #33c: the export is a full copy of one tenant's database. It was
     # written as a plain file straight into the shared system temp dir, with the default umask, so
     # other local users could read it. It now lands in a fresh directory that is 0700 (private
