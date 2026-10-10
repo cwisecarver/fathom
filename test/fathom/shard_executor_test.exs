@@ -612,6 +612,39 @@ defmodule Fathom.ShardExecutorTest do
              "connection_pool is ON"
   end
 
+  # Expert review 2026-10-10 #P1. A replicated shard holds one raw WAL read fd on top of its
+  # coordinator connection, and the :max_open_shards cap does not count it -- so replication ON
+  # (the prod default) with the pool OFF still multiplies the fd footprint.
+  test "the fd budget warning counts the held replication WAL fd" do
+    import ExUnit.CaptureLog
+
+    keys = [:env, :connection_pool, :max_open_shards, :replication_enabled, :connection_pool_opts]
+    prev = for k <- keys, do: {k, Application.get_env(:fathom, k)}
+    on_exit(fn -> for {k, v} <- prev, do: restore_env(k, v) end)
+
+    Application.put_env(:fathom, :env, :prod)
+    Application.put_env(:fathom, :connection_pool, false)
+    Application.put_env(:fathom, :max_open_shards, 1000)
+    Application.put_env(:fathom, :replication_enabled, true)
+
+    log = capture_log(fn -> assert Fathom.Application.check_pool_fd_budget!() == nil end)
+    assert log =~ "replication is ON"
+    # per_shard = 1 coordinator connection + 1 WAL fd.
+    assert log =~ "2000 connections"
+    refute log =~ "connection_pool is ON"
+
+    # Both on: 1 + 2*1 (default max_per_scope 1) + 1.
+    Application.put_env(:fathom, :connection_pool, true)
+    Application.delete_env(:fathom, :connection_pool_opts)
+    log = capture_log(fn -> Fathom.Application.check_pool_fd_budget!() end)
+    assert log =~ "4000 connections"
+
+    # Replication off and pool off: quiet.
+    Application.put_env(:fathom, :connection_pool, false)
+    Application.put_env(:fathom, :replication_enabled, false)
+    assert capture_log(fn -> Fathom.Application.check_pool_fd_budget!() end) == ""
+  end
+
   defp restore_env(k, nil), do: Application.delete_env(:fathom, k)
   defp restore_env(k, v), do: Application.put_env(:fathom, k, v)
 

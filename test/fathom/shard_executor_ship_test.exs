@@ -123,4 +123,18 @@ defmodule Fathom.ShardExecutorShipTest do
     {:ok, _} = run(conn, "INSERT INTO t VALUES (2, 'b')")
     assert await_quorum(f, id), "autocommit write after SAVEPOINT/RELEASE was acked unshipped"
   end
+
+  # Expert review 2026-10-10 #P1: one Session per replicated shard, mostly idle -- it must sweep
+  # fully and hibernate like Shard/Shipper.
+  test "a replication Session runs with fullsweep_after 0", %{
+    id: id,
+    followers: f
+  } do
+    conn = open!(id, f)
+    {:ok, _} = run(conn, "INSERT INTO t VALUES (1, 'a')")
+    [{pid, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+
+    {:garbage_collection, gc} = Process.info(pid, :garbage_collection)
+    assert gc[:fullsweep_after] == 0
+  end
 end

@@ -430,25 +430,38 @@ defmodule Fathom.Application do
   @doc false
   def check_pool_fd_budget! do
     cap = Application.get_env(:fathom, :max_open_shards, :infinity)
+    pooled? = Application.get_env(:fathom, :connection_pool, false) == true
+    # Replication holds ONE raw WAL read fd per replicated shard on top of the coordinator's
+    # connection (`Session`'s `wal_fd`, expert review 2026-08-26 #32), invisible to the cap too
+    # (expert review 2026-10-10 #P1).
+    replicating? = Application.get_env(:fathom, :replication_enabled, false) == true
 
-    if Application.get_env(:fathom, :env) == :prod and
-         Application.get_env(:fathom, :connection_pool, false) == true and
+    if Application.get_env(:fathom, :env) == :prod and (pooled? or replicating?) and
          is_integer(cap) do
       cfg = Application.get_env(:fathom, :connection_pool_opts, [])
       per_scope = Keyword.get(cfg, :max_per_scope, 1)
 
       # The coordinator's own working connection plus up to max_per_scope idle handles in each of the
-      # two scopes (:ro, :rw).
-      per_shard = 1 + 2 * per_scope
+      # two scopes (:ro, :rw), plus the held WAL fd when replicating.
+      pool_extra = if pooled?, do: 2 * per_scope, else: 0
+      per_shard = 1 + pool_extra + if(replicating?, do: 1, else: 0)
+
+      why =
+        [
+          pooled? &&
+            "connection_pool is ON (up to #{2 * per_scope} idle pooled handles per shard, " <>
+              "max_per_scope=#{per_scope})",
+          replicating? && "replication is ON (one held WAL read fd per replicated shard)"
+        ]
+        |> Enum.filter(& &1)
+        |> Enum.join(" and ")
 
       Logger.warning(
-        "config warning: :connection_pool is ON with :max_open_shards = #{cap}, but that cap " <>
-          "bounds COORDINATORS only. Each open shard can additionally hold up to #{2 * per_scope} " <>
-          "idle pooled handles (:ro + :rw, max_per_scope=#{per_scope}), each a distinct SQLite " <>
-          "connection with its own fds — so the node can hold ~#{cap * per_shard} connections, not " <>
-          "#{cap}. Size :max_open_shards and the OS fd limit (ulimit -n) for #{cap} * #{per_shard} " <>
-          "= #{cap * per_shard} connections, or the node hits emfile well below the intended shard " <>
-          "count (expert review 2026-09-18 #12)."
+        "config warning: #{why} with :max_open_shards = #{cap}, but that cap bounds COORDINATORS only. Each open shard " <>
+          "can hold up to #{per_shard} fds/connections, so the node can hold " <>
+          "~#{cap * per_shard} connections, not #{cap}. Size :max_open_shards and the OS fd " <>
+          "limit (ulimit -n) for #{cap} * #{per_shard} = #{cap * per_shard} connections, or the " <>
+          "node hits emfile well below the intended shard count (expert review 2026-09-18 #12)."
       )
     end
 

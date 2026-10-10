@@ -47,6 +47,14 @@ defmodule Fathom.Shard.Replication.Session do
 
   @registry Fathom.Shard.Replication.SessionRegistry
 
+  # One Session lives per replicated shard, so the fleet carries thousands of them, almost all idle
+  # between commits. Same treatment as `Fathom.Shard` and `Shipper` (expert review 2026-10-10 #P1):
+  # `fullsweep_after: 0` because the live set is small (a position map and a held fd) and ERTS's
+  # default effectively never full-sweeps, so garbage from past pushes lingers; `hibernate_after`
+  # compacts an idle Session's heap to almost nothing. Idle hibernation costs a wake-up copy only.
+  @spawn_opt [fullsweep_after: 0]
+  @hibernate_after_ms 30_000
+
   # Reject reasons after which NO reply is outstanding from that follower, so its `inflight`
   # expectation can be dropped. Everything here is either the follower's own answer
   # (`:stale_wal_gen`, `:stale_epoch`, `:unknown_shard`, `:internal`) or a dead socket
@@ -115,7 +123,12 @@ defmodule Fathom.Shard.Replication.Session do
 
   def start_link(opts) do
     shard_id = Keyword.fetch!(opts, :shard_id)
-    GenServer.start_link(__MODULE__, opts, name: {:via, Registry, {@registry, shard_id}})
+
+    GenServer.start_link(__MODULE__, opts,
+      name: {:via, Registry, {@registry, shard_id}},
+      spawn_opt: @spawn_opt,
+      hibernate_after: @hibernate_after_ms
+    )
   end
 
   @doc """
