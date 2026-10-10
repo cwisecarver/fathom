@@ -260,7 +260,13 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
       put_raw_lock(shard, "thief@node", 999, now_ms() + 60_000)
 
       :ok = ShardExecutor.close(conn)
-      assert_receive {:DOWN, ^ref, :process, ^coordinator, :normal}, 2_000
+      # Two terminal paths now reach "self-fenced, never flushed": the close-time flush fence
+      # (`:normal`) and — since expert review 2026-10-10 #12, which delivers a lapse that landed
+      # before the open's lapse subscription — the proactive revalidation, which can win the race
+      # against the thief and stop `{:shutdown, :lease_lost}`. This previously asserted `:normal`
+      # only, which pinned the missed-lapse defect; the invariant is the refute below.
+      assert_receive {:DOWN, ^ref, :process, ^coordinator, reason}, 2_000
+      assert reason in [:normal, {:shutdown, :lease_lost}]
     end)
 
     refute File.exists?(remote_db(shard)),

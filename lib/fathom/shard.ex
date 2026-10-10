@@ -93,6 +93,13 @@ defmodule Fathom.Shard do
   # once the herd is big enough for the poll itself to be the cost.
   @default_gate_probe_target_per_sec 2_000
   @pull_timeout 60_000
+
+  # The overlapped fork-evidence HEAD is a single storage HEAD, so a few seconds is generous. It was
+  # bounded by @pull_timeout (60 s), and a warm-but-diverged open then spent that wait PLUS a full
+  # pull (another 60 s) against a checkout budget of pull + 15 s: the caller timed out (not retried)
+  # while the open was healthy (expert review 2026-10-10 #29). A timeout maps to `:unreachable`,
+  # which keeps the local copy and fences by the provenance etag, so a short bound is safe.
+  @fork_evidence_timeout 5_000
   # Synchronous force-flush (`:flush_now`) budget: a checkpoint + fenced full-file PUT (possibly
   # queued behind sibling flushes through the shared Finch pool) at real S3 latency. Generous so a
   # flush-before-fork of a large template doesn't time out; bounded so a hung store can't wedge a caller.
@@ -409,6 +416,19 @@ defmodule Fathom.Shard do
 
   @impl true
   def handle_continue(:open, %{id: shard_id} = state) do
+    # Re-check the lifecycle denies BEFORE any I/O or lease (expert review 2026-10-10 #18).
+    # `Shards.ensure/1` gates tombstone/suspension, but `start_if_capacity` then does slow work
+    # (eviction, novelty directory reads) before `start/1`, so a delete that completed in between
+    # (purge already erased the `.lock`/`.db`) was followed by an open that re-created a lock and
+    # a `.db` nothing would ever reclaim. Nothing is held yet, so there is nothing to release.
+    cond do
+      Fathom.Tenants.tombstoned?(shard_id) -> {:stop, {:shutdown, :shard_tombstoned}, state}
+      Fathom.Tenants.suspended?(shard_id) -> {:stop, {:shutdown, :shard_suspended}, state}
+      true -> open_coordinator(state)
+    end
+  end
+
+  defp open_coordinator(%{id: shard_id} = state) do
     open_started = System.monotonic_time()
     path = db_path(shard_id)
     Storage.ensure_dir(Path.dirname(path))
@@ -645,8 +665,11 @@ defmodule Fathom.Shard do
 
   # Bounded consumption of the overlapped fork-evidence HEAD (expert review 2026-08-01 #33).
   # Anything other than a clean, timely verdict is `:unreachable` — resolve_fork/4's fail-safe.
+  defp fork_evidence_timeout,
+    do: Application.get_env(:fathom, :fork_evidence_timeout_ms, @fork_evidence_timeout)
+
   defp await_fork_evidence(task) do
-    case Task.yield(task, @pull_timeout) || Task.shutdown(task, :brutal_kill) do
+    case Task.yield(task, fork_evidence_timeout()) || Task.shutdown(task, :brutal_kill) do
       {:ok, verdict} -> verdict
       _ -> :unreachable
     end
@@ -880,7 +903,21 @@ defmodule Fathom.Shard do
       # Heartbeat mode: subscribe to lapse broadcasts so a steal window is
       # revalidated proactively (expert review #34), not just lazily at the next
       # flush. Legacy mode revalidates via its own per-shard renewals.
-      if acquire_gen != nil, do: subscribe_lapse()
+      if acquire_gen != nil do
+        subscribe_lapse()
+        # A `{:heartbeat_lapsed, gen}` broadcast between sampling `acquire_gen` (before the lease
+        # acquire + pull) and this subscribe was lost, and the handler only reacts to broadcasts.
+        # Re-check the generation now that we are subscribed: if it moved, deliver the lapse to
+        # ourselves (expert review 2026-10-10 #12). Subscribe FIRST, so nothing falls in a new gap.
+        case Fence.generation() do
+          gen when is_integer(gen) and gen != acquire_gen ->
+            send(self(), {:heartbeat_lapsed, gen})
+
+          _ ->
+            :ok
+        end
+      end
+
       # Publish the initial flush watermark so the metrics layer can derive RPO/dirtiness for
       # this shard without a per-coordinator GenServer call (Fathom.Admin.FlushWatermark).
       FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
@@ -1116,6 +1153,10 @@ defmodule Fathom.Shard do
   # suite and no log: a superseded coordinator then keeps ACKing writes until its next flush, which
   # is exactly the defect review #34 was written to fix. The failure is still non-fatal — the
   # flush-time fence remains the hard guard — but it is now visible.
+  defp registered?(shard_id),
+    do:
+      Enum.any?(Registry.lookup(Fathom.ShardRegistry, shard_id), fn {pid, _} -> pid == self() end)
+
   defp subscribe_lapse do
     Phoenix.PubSub.subscribe(Fathom.PubSub, Heartbeat.topic())
   rescue
@@ -1500,7 +1541,27 @@ defmodule Fathom.Shard do
   # shutdown — so its terminal EXIT signal is redundant noise here. Ignore it. The
   # parent supervisor's EXIT is handled by the gen_server engine (→ terminate/2), not
   # routed to handle_info, so this never swallows a shutdown.
-  def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
+  #
+  # ONE exception (expert review 2026-10-10 #5): the `{:via, Registry, ...}` registration links us to
+  # our Registry PARTITION, and that link's EXIT is swallowed here too. A partition crash then left
+  # this coordinator alive but unregistered: the next checkout started a SECOND coordinator on the
+  # same `.db`, and this orphan's idle `drop_*` could delete the live file. So an abnormal EXIT is
+  # re-verified shortly after, and an unregistered coordinator stops. The check is DEFERRED, not
+  # immediate: the EXIT signal can beat the partition's ETS table teardown, so a lookup in this same
+  # handler still found us (measured). A killed Task costs one timer and one ETS read, and no stop.
+  def handle_info({:EXIT, _pid, reason}, state) do
+    if reason != :normal, do: Process.send_after(self(), :verify_registration, 250)
+    {:noreply, state}
+  end
+
+  def handle_info(:verify_registration, state) do
+    if registered?(state.id) do
+      {:noreply, state}
+    else
+      Logger.error("shard #{state.id}: lost its Registry registration; stopping the orphan")
+      {:stop, {:shutdown, :registry_lost}, state}
+    end
+  end
 
   # A stale timer firing after the drain already resolved (resume_serving cancelled
   # it, but a fire could already be in flight) must be inert — pre-guard it could
