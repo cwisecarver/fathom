@@ -288,6 +288,28 @@ defmodule Fathom.ShardDurabilityTest do
     :ok = ShardExecutor.close(conn)
   end
 
+  # Expert review 2026-10-10 #24: `PRAGMA optimize` runs ANALYZE, which writes `sqlite_stat1`. It
+  # was classified as a read (no `=`, not in @durable_pragmas), so a tenant's optimize left the
+  # shard clean and the idle drop discarded the statistics. Name-matched like incremental_vacuum.
+  test "PRAGMA optimize (ANALYZE writes sqlite_stat1) dirties the shard", %{shard: shard} do
+    {:ok, setup_conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(setup_conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(setup_conn, stmt("INSERT INTO kv VALUES (1, 'alice')"))
+    :ok = ShardExecutor.close(setup_conn)
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    flush_now(coordinator)
+    refute dirty?(shard), "clean baseline"
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    # optimize RETURNS a column (`optimize`), so the column-bearing branch of wrote?/2 must not
+    # be the thing that decides it.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("PRAGMA optimize"))
+    assert dirty?(shard), "PRAGMA optimize runs ANALYZE — a durable sqlite_stat1 write"
+
+    :ok = ShardExecutor.close(conn)
+  end
+
   # auto_vacuum SET is BLOCKED for tenants by default, so it belongs in @durable_pragmas as
   # defense-in-depth alongside the other blocked-but-durable entries (user_version, page_size,
   # journal_mode): IF an operator allows it via :tenant_pragma_allow, `PRAGMA auto_vacuum = <mode>`

@@ -482,9 +482,14 @@ defmodule Fathom.ShardExecutor do
   # rows, and is not control-prefixed, so it still reaches `changes > 0` and classifies as a write.
   # Durable PRAGMA assignments (`user_version`) are likewise not control — `control_statement?`
   # returns false for them — so they still classify as writes via the DDL fallthrough.
+  #
+  # A durable pragma that RETURNS a column (`PRAGMA optimize` → cols ["optimize"], and
+  # `PRAGMA journal_mode = wal` → cols ["journal_mode"]) must be checked before the `cols != []`
+  # clause below, or the "result has columns ⇒ read" rule drops it: expert review 2026-10-10 #24.
   defp wrote?(%{columns: cols, num_changes: changes}, sql) do
     cond do
       control_statement?(sql) -> false
+      durable_pragma_statement?(sql) -> true
       cols != [] and read_verb?(sql) -> false
       changes > 0 -> true
       cols != [] -> false
@@ -778,15 +783,24 @@ defmodule Fathom.ShardExecutor do
 
   # The assignment form (`pragma [db.]name = value`) of a header-writing pragma; the
   # bare read form (`pragma user_version`) has no `=` and stays a read.
+  defp durable_pragma_statement?(sql) when is_binary(sql) do
+    String.starts_with?(lead(sql, 6), "pragma") and
+      durable_pragma_write?(String.downcase(strip_lead_noise(sql)))
+  end
+
   defp durable_pragma_write?(lead) do
     # `PRAGMA incremental_vacuum(N)` (or the no-arg form) reclaims freelist pages — a durable
     # file mutation reported as num_changes == 0 / no columns, and it uses `(N)` not `=`, so
     # the `=`-gated set above cannot catch it (expert review 2026-08-31 #20). It is the only
     # pragma with this name and every form of it writes, so a name match is exact — a bare
     # `PRAGMA incremental_vacuum` still reclaims ALL free pages.
+    # `PRAGMA optimize` runs ANALYZE, which writes `sqlite_stat1` (a durable table). It takes no
+    # `=` and no argument form that is a pure read, so it is name-matched like incremental_vacuum
+    # (expert review 2026-10-10 #24): classified as a read, it left the shard clean and the idle
+    # drop discarded the statistics.
     String.starts_with?(lead, "pragma") and
       ((String.contains?(lead, "=") and Enum.any?(@durable_pragmas, &String.contains?(lead, &1))) or
-         String.contains?(lead, "incremental_vacuum"))
+         String.contains?(lead, "incremental_vacuum") or String.contains?(lead, "optimize"))
   end
 
   # Report the connection's REAL autocommit state (expert review 2026-07-14 #35). Hrana 3's
