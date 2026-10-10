@@ -32,9 +32,11 @@ defmodule Fathom.Shard.Provenance do
   directory fsync to be missing, and a record far smaller than a sector is written whole or not at
   all. The first write over a legacy (variable-width) file converts it with temp+rename once.
 
-      "FPV1 " <> etag (96) <> " " <> intent md5 (32) <> " " <> previous intent md5 (32) <> "\n"
+      "FPV1 " <> etag (96) <> " " <> intent md5 (32) <> " " <> previous intent md5 (32) <> " " <> crc32 (8 hex) <> "\n"
 
-  (every field space-padded to its width). TWO intent slots, because a retry flush records its own
+  (every field but the crc space-padded to its width; the CRC32 covers all bytes before it, so a
+  write torn between old and new bytes reads as `:corrupt` instead of parsing as a chimera —
+  expert review 2026-10-10 R2-5). TWO intent slots, because a retry flush records its own
   intent BEFORE its PUT: a first flush whose PUT landed but whose result was never stamped, then a
   retry that overwrites the single slot and 412s (the object is still the first one's), then a
   crash — the surviving intent matched nothing and a good copy was quarantined (expert review
@@ -59,8 +61,12 @@ defmodule Fathom.Shard.Provenance do
   @record_magic "FPV1 "
   @etag_width 96
   @intent_width 32
-  # magic + etag + " " + intent + " " + previous intent + "\n"
-  @record_size byte_size(@record_magic) + @etag_width + 1 + @intent_width + 1 + @intent_width + 1
+  # magic + etag + " " + intent + " " + previous intent
+  @crc_width 8
+  @body_size 5 + 96 + 1 + 32 + 1 + 32
+  # ... + " " + crc32 of everything before it (8 lowercase hex) + "\n"
+  @record_size byte_size(@record_magic) + @etag_width + 1 + @intent_width + 1 + @intent_width + 1 +
+                 @crc_width + 1
 
   @spec sidecar_path(String.t()) :: String.t()
   def sidecar_path(path), do: path <> ".etag"
@@ -215,25 +221,42 @@ defmodule Fathom.Shard.Provenance do
          String.pad_trailing(etag, @etag_width) <>
          " " <>
          String.pad_trailing(intent || "", @intent_width) <>
-         " " <> String.pad_trailing(prev_intent || "", @intent_width) <> "\n"}
+         " " <> String.pad_trailing(prev_intent || "", @intent_width)}
+      |> with_crc()
     else
       :error
     end
   end
 
+  defp with_crc({:ok, body}), do: {:ok, body <> " " <> crc_hex(body) <> "\n"}
+
+  defp crc_hex(body) do
+    body
+    |> :erlang.crc32()
+    |> Integer.to_string(16)
+    |> String.downcase()
+    |> String.pad_leading(@crc_width, "0")
+  end
+
   defp parse_record(bin) when byte_size(bin) == @record_size do
-    @record_magic <> rest = bin
+    <<body::binary-size(@body_size), " ", crc::binary-size(@crc_width), "\n">> = bin
+
+    if crc_hex(body) == crc, do: parse_body(body), else: :error
+  end
+
+  defp parse_record(_), do: :error
+
+  defp parse_body(body) do
+    @record_magic <> rest = body
 
     <<etag::binary-size(@etag_width), " ", intent::binary-size(@intent_width), " ",
-      prev::binary-size(@intent_width), "\n">> = rest
+      prev::binary-size(@intent_width)>> = rest
 
     case String.trim_trailing(etag) do
       "" -> :error
       etag -> {:ok, etag, blank_nil(intent), blank_nil(prev)}
     end
   end
-
-  defp parse_record(_), do: :error
 
   defp blank_nil(field) do
     case String.trim_trailing(field) do

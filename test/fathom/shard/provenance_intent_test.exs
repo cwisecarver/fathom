@@ -364,6 +364,31 @@ defmodule Fathom.Shard.ProvenanceIntentTest do
       assert :corrupt = Provenance.read(path)
     end
 
+    # Symptom (expert review 2026-10-10 R2-5): the in-place record had no checksum, so a write torn
+    # between old and new bytes (right length, right framing) parsed as a chimera of two stamps.
+    test "a full-length record mixing old and new bytes reads as corrupt", %{
+      path: path,
+      sidecar: sidecar
+    } do
+      Provenance.write_durable(path, "etag-old")
+      old = File.read!(sidecar)
+      Provenance.write_durable(path, "etag-new")
+      Provenance.record_intent(path, @md5_a)
+      new = File.read!(sidecar)
+      assert byte_size(old) == byte_size(new)
+      assert {:ok, "etag-new"} = Provenance.read(path)
+
+      # The new stamp's etag bytes but the old tail (intent/crc region): same length, valid framing.
+      split = 5 + 96 + 1
+      torn = binary_part(new, 0, split) <> binary_part(old, split, byte_size(old) - split)
+      File.write!(sidecar, torn)
+      assert :corrupt = Provenance.read(path)
+      assert Provenance.read_intents(path) == []
+
+      File.write!(sidecar, new)
+      assert {:ok, "etag-new"} = Provenance.read(path)
+    end
+
     test "an etag too wide for the record falls back to the legacy format and still reads", %{
       path: path
     } do

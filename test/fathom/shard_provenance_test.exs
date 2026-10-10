@@ -205,7 +205,9 @@ defmodule Fathom.ShardProvenanceTest do
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('born')"))
       :ok = ShardExecutor.close(conn)
 
-      assert File.read!(sidecar(shard)) == @sentinel,
+      # Read through Provenance: the first write re-stamps the sentinel as a fixed-width record
+      # (expert review 2026-10-10 #6), so the raw bytes are no longer the bare "-".
+      assert Fathom.Shard.Provenance.read(local_db(shard)) == :no_object,
              "a born-empty shard must record 'derived from no object', not nothing at all"
     end
 
