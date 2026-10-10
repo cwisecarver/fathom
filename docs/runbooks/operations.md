@@ -286,3 +286,15 @@ first warm open of every shard whose sidecar was rewritten by the new code; to a
 (`Shards.drain_all`) so every shard flushes and drops its local copy BEFORE rolling back. Forward
 (old sidecar → new code) is safe: a bare-etag sidecar is still read and is converted on the first
 durable write. Expert review 2026-10-10 R2-4.
+
+## Notes: rotating the admin password does not close open dashboard sockets
+
+The `/admin` LiveViews authenticate with BasicAuth once, on the HTTP request that mounts the page;
+the WebSocket that follows is bound to the session token minted at that point and the credential is
+**not re-checked per event**. Rotating `ADMIN_USER`/`ADMIN_PASS` therefore locks out *new* page
+loads immediately, but a dashboard tab that is already open keeps working — query console and
+directory edits included — until its session token expires or the tab/node is restarted. If a
+credential is compromised, rotate the password **and** restart the nodes (or wait out the session
+max-age) to be sure no old socket survives; new `/api` calls are unaffected, since each is
+authenticated per request. Decision recorded in expert review 2026-10-10 (round 2, W6): document,
+not change.
