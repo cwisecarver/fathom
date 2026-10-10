@@ -1099,7 +1099,7 @@ defmodule Fathom.Shard.Connection do
             :ok
 
           {:DOWN, ^mon, :process, _, _} ->
-            exit(:normal)
+            owner_down(conn)
         after
           ms ->
             # cancel/1, not interrupt/1 (expert review 2026-07-24 #1): interrupt only aborts VDBE
@@ -1129,8 +1129,18 @@ defmodule Fathom.Shard.Connection do
         exit(:normal)
 
       {:DOWN, ^mon, :process, _, _} ->
-        exit(:normal)
+        owner_down(conn)
     end
+  end
+
+  # Expert review 2026-10-10 #23. The owner died, possibly mid-statement. Exiting without a cancel
+  # left that statement running while holding the connection mutex, and the coordinator's
+  # `close_lent` -> `Sqlite3.close` then blocked on it for the statement's remaining runtime,
+  # stalling the whole shard. The owner is gone, so nothing can want the statement's result: cancel
+  # it (a late cancel on an idle handle is a no-op — exqlite resets its flag at the next db op).
+  defp owner_down(conn) do
+    _ = Sqlite3.cancel(conn)
+    exit(:normal)
   end
 
   # Cancel, then KEEP cancelling until the owner disarms (CI, OTP 29, 2026-08-28).
@@ -1164,7 +1174,7 @@ defmodule Fathom.Shard.Connection do
 
     receive do
       {:done, ^ref} -> :ok
-      {:DOWN, ^mon, :process, _, _} -> exit(:normal)
+      {:DOWN, ^mon, :process, _, _} -> owner_down(conn)
     after
       @cancel_retry_ms -> await_disarm(conn, ref, mon)
     end

@@ -530,4 +530,41 @@ defmodule Fathom.ConnectionWatchdogTest do
       assert Enum.all?(results, &match?({:ok, _}, &1)), "a short statement was stopped"
     end
   end
+
+  # Expert review 2026-10-10 #23. Symptom: the watchdog exited on owner DOWN without cancelling, so
+  # the statement the dead owner left running kept the connection mutex until it finished, and the
+  # coordinator's close_lent -> Sqlite3.close blocked on that mutex for the statement's remaining
+  # runtime, stalling the whole shard. Invariant: owner death mid-statement cancels the statement.
+  describe "owner death mid-statement" do
+    @tag timeout: 30_000
+    test "cancels the running statement so the connection closes promptly", %{conn: conn} do
+      Application.put_env(:fathom, :query_timeout_ms, 60_000)
+      test_pid = self()
+
+      owner =
+        spawn(fn ->
+          send(test_pid, :owner_up)
+
+          # Effectively endless: 2e9-row recursive CTE, far longer than this test's budget.
+          query(
+            conn,
+            "WITH RECURSIVE g(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM g WHERE v < 2000000000) " <>
+              "SELECT count(*) FROM g",
+            []
+          )
+        end)
+
+      assert_receive :owner_up
+      # Let the statement reach its dirty NIF.
+      Process.sleep(300)
+      ref = Process.monitor(owner)
+      Process.exit(owner, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^owner, :killed}
+
+      {us, _} = :timer.tc(fn -> Exqlite.Sqlite3.close(conn) end)
+
+      assert us < 5_000_000,
+             "close blocked #{div(us, 1000)} ms behind the dead owner's statement"
+    end
+  end
 end
