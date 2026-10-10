@@ -38,6 +38,36 @@ defmodule Fathom.Rebalancer.PolicyTest do
     assert move.q_per_s == 900.0
   end
 
+  # Symptom (expert review 2026-10-10 #27): the policy trusted load alone, so a suspended / erased /
+  # mid-migration tenant that was hot got handed off like any other. Invariant: an `:ineligible`
+  # shard is never proposed, however hot.
+  test "an ineligible shard is never proposed, however hot" do
+    samples = [
+      s("n1", "hot_1", 900, 10),
+      s("n1", "hot_1", 900, 0),
+      s("n1", "hot_2", 800, 10),
+      s("n1", "hot_2", 800, 0),
+      s("n2", "warm", 50, 0),
+      s("n3", "cool", 10, 0)
+    ]
+
+    assert [%{shard_id: "hot_1"}] = propose(samples, floor: 500.0, confirm_windows: 2)
+
+    assert [%{shard_id: "hot_2"}] =
+             propose(samples,
+               floor: 500.0,
+               confirm_windows: 2,
+               ineligible: MapSet.new(["hot_1"])
+             )
+
+    assert [] =
+             propose(samples,
+               floor: 500.0,
+               confirm_windows: 2,
+               ineligible: MapSet.new(["hot_1", "hot_2"])
+             )
+  end
+
   test "anti-flap: a one-window spike (< confirm_windows) is not moved" do
     samples = [
       s("n1", "spike", 900, 0),

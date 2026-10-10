@@ -348,6 +348,22 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  Of `shard_ids`, those with a directory row whose status is NOT `active` (suspended, deleted,
+  migrating, quarantined, retired). A shard with no row is not listed. Used by the rebalancer to
+  skip tenants that must not be handed off (expert review 2026-10-10 #27).
+  """
+  @spec non_active_among([String.t()]) :: [String.t()]
+  def non_active_among([]), do: []
+
+  def non_active_among(shard_ids) when is_list(shard_ids) do
+    Repo.all(
+      from s in Shard,
+        where: s.shard_id in ^shard_ids and s.status != "active",
+        select: s.shard_id
+    )
+  end
+
+  @doc """
   Stamps `last_snapshot_at` after a scheduled snapshot (#18). Returns rows updated (0 if gone).
 
   Stamped only on SUCCESS by the caller: a failed snapshot must leave the shard at the head of the

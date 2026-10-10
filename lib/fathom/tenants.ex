@@ -32,6 +32,7 @@ defmodule Fathom.Tenants do
   import Ecto.Query, only: [from: 2]
 
   alias Fathom.{Directory, HranaAuth, Shards}
+  alias Fathom.Rebalancer.Overrides
   alias Fathom.Shard.{SqliteHeader, Storage}
   alias Fathom.ShardId
   alias Fathom.Tenants.{DeleteJob, Suspensions, Tombstones}
@@ -200,6 +201,10 @@ defmodule Fathom.Tenants do
   def purge(shard_id) do
     with {:ok, id} <- cast(shard_id) do
       cancel_pending_jobs(id)
+      # Release any rebalancer LB pin (expert review 2026-10-10 #27): purge never unpinned, so the
+      # LB map kept an exception row for an erased tenant (and a re-minted id would inherit it).
+      # Idempotent; the next rebalance tick re-renders the LB map without it.
+      Overrides.unpin(id)
       # Stop the home coordinator BEFORE deleting storage: while its lease is still valid the
       # shutdown flushes/releases cleanly and never self-fences, so no `.fenced.<ts>` copy of
       # the tenant's data is left behind (the erase's whole point). Then note whether another

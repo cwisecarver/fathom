@@ -241,6 +241,51 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
            "warm-location signal steered the handoff to n3, not the cold n2"
   end
 
+  # Symptom (expert review 2026-10-10 #27): the rebalancer ignored tenant lifecycle, so a hot but
+  # suspended tenant, or one with a migration in flight, was handed off (pinning an LB override).
+  describe "lifecycle eligibility (#27)" do
+    setup do
+      Application.put_env(:fathom, :rebalancer_enabled, true)
+      Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+      Application.put_env(:fathom, :rebalance_confirm_windows, 2)
+      :ok
+    end
+
+    defp hot_fleet(shard) do
+      sample("n1", shard, 900, 10_000)
+      sample("n1", shard, 900, 0)
+      sample("n1", "filler", 300, 0)
+      sample("n2", "warm", 40, 0)
+      sample("n3", "cool", 10, 0)
+    end
+
+    test "control: an active hot shard is handed off" do
+      {:ok, _} = Fathom.Directory.resolve("lc_hot")
+      hot_fleet("lc_hot")
+      assert :ok = perform_job(RebalanceJob, %{})
+      assert_enqueued(worker: HandoffJob, args: %{"shard_id" => "lc_hot"})
+    end
+
+    test "a suspended hot shard is not handed off" do
+      {:ok, _} = Fathom.Directory.resolve("lc_hot")
+      {:ok, _} = Fathom.Directory.suspend("lc_hot")
+      hot_fleet("lc_hot")
+      assert :ok = perform_job(RebalanceJob, %{})
+      refute_enqueued(worker: HandoffJob)
+    end
+
+    for worker <- [Fathom.Migrator.ShardMigrationJob, Fathom.Migrator.RevertJob] do
+      test "a hot shard with a #{inspect(worker)} in flight is not handed off" do
+        {:ok, _} = Fathom.Directory.resolve("lc_hot")
+        args = %{shard_id: "lc_hot", target: 2, to_version: 1}
+        {:ok, _} = Oban.insert(unquote(worker).new(args))
+        hot_fleet("lc_hot")
+        assert :ok = perform_job(RebalanceJob, %{})
+        refute_enqueued(worker: HandoffJob)
+      end
+    end
+  end
+
   test "gate on but nothing hot: no handoffs" do
     Application.put_env(:fathom, :rebalancer_enabled, true)
     Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)

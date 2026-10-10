@@ -41,6 +41,12 @@ defmodule Fathom.Rebalancer.Policy do
     target per tick — moves are deliberate and re-evaluated against fresh samples next
     tick.
 
+  - **Lifecycle:** `:ineligible` (a `MapSet` of shard ids) are never proposed. The orchestrator
+    fills it with shards that are not `active` (suspended, deleted, quarantined, mid-migration) or
+    have a `ShardMigrationJob`/`RevertJob` in flight — handing off a tenant that is being erased,
+    suspended or migrated pins an LB override for it and drains a shard that must not serve
+    (expert review 2026-10-10 #27).
+
   Config (all overridable via `opts`): `:floor` (absolute q/s, default from
   `:rebalance_hot_qps_floor`, nil ⇒ p99-relative), `:p99_multiple` (20), `:confirm_windows`
   (2), `:cooldown_ms` (300_000), `:max_moves` (1).
@@ -88,6 +94,9 @@ defmodule Fathom.Rebalancer.Policy do
     warm_locations = Keyword.get(opts, :warm_locations, %{})
     band = Keyword.get(opts, :locality_band, cfg(:rebalance_locality_band, 0.5)) / 1.0
     alive_nodes = Keyword.get(opts, :alive_nodes)
+    # Shards the orchestrator found ineligible to move (not `active`, or a migration/revert in
+    # flight) — expert review 2026-10-10 #27. Pure here: the DB lookups live in `RebalanceJob`.
+    ineligible = Keyword.get(opts, :ineligible, MapSet.new())
     now = Keyword.get(opts, :now, DateTime.utc_now())
 
     latest = latest_per_shard(samples)
@@ -107,6 +116,7 @@ defmodule Fathom.Rebalancer.Policy do
     |> Enum.filter(&(&1.q_per_s >= threshold and threshold > 0.0))
     |> Enum.filter(&(&1.node_key in backend_keys))
     |> Enum.reject(&(&1.shard_id in cooling))
+    |> Enum.reject(&MapSet.member?(ineligible, &1.shard_id))
     |> Enum.filter(&confirmed_hot?(&1, samples, threshold, confirm))
     # Hottest first, tie-broken by shard_id for a canonical (not iteration-order) choice (#18).
     |> Enum.sort_by(&{-&1.q_per_s, &1.shard_id})

@@ -16,6 +16,7 @@ defmodule Fathom.Rebalancer.RebalanceJob do
   require Logger
   import Ecto.Query, only: [from: 2]
 
+  alias Fathom.Directory
   alias Fathom.Rebalancer
   alias Fathom.Repo
   alias Fathom.Shard.Storage
@@ -86,6 +87,7 @@ defmodule Fathom.Rebalancer.RebalanceJob do
     warm_locations = WarmLocations.warm_nodes(node_stale_ms())
 
     case Policy.propose(samples, overrides, backends,
+           ineligible: ineligible_shards(samples),
            fleet_p99: fleet_p99,
            warm_locations: warm_locations,
            alive_nodes: alive
@@ -98,6 +100,27 @@ defmodule Fathom.Rebalancer.RebalanceJob do
         Logger.info("rebalance: enqueued #{length(moves)} handoff(s): #{summarize(moves)}")
         :ok
     end
+  end
+
+  # Shards the policy must not propose (expert review 2026-10-10 #27): not `active` in the
+  # directory (suspended / deleted / quarantined / mid-migration / retired), or with a migration or
+  # revert job in flight. The policy is pure and trusts only load, so a suspended or half-erased
+  # tenant — or one a migration is copying — used to be handed off like any hot shard, pinning an LB
+  # override for it. Looked up only for the shards present in the samples (a bounded head).
+  @migration_workers ["Fathom.Migrator.ShardMigrationJob", "Fathom.Migrator.RevertJob"]
+  @migration_live_states ~w(scheduled available executing retryable suspended)
+  defp ineligible_shards(samples) do
+    ids = samples |> Enum.map(& &1.shard_id) |> Enum.uniq()
+
+    in_flight =
+      Repo.all(
+        from j in Oban.Job,
+          where: j.worker in ^@migration_workers and j.state in @migration_live_states,
+          where: fragment("?->>'shard_id' = ANY(?)", j.args, ^ids),
+          select: fragment("?->>'shard_id'", j.args)
+      )
+
+    MapSet.new(Directory.non_active_among(ids) ++ in_flight)
   end
 
   # Unpin overrides whose pinned_node isn't in the live fleet (finding #1b). FAIL OPEN: if

@@ -53,6 +53,17 @@ defmodule Fathom.TenantsTest do
   end
 
   describe "purge/1 (the DeleteJob body)" do
+    # Symptom (expert review 2026-10-10 #27): purge never unpinned the rebalancer's LB override, so
+    # the LB map kept an exception row for an erased tenant (and a re-minted id inherited it).
+    test "releases the tenant's rebalancer LB pin", %{id: id} do
+      {:ok, _} = Fathom.Rebalancer.Overrides.pin(id, "n2", reason: "rebalance")
+      assert Fathom.Rebalancer.Overrides.for_shard(id) != nil
+
+      assert :ok = Tenants.purge(id)
+
+      assert Fathom.Rebalancer.Overrides.for_shard(id) == nil
+    end
+
     test "erases every stored object of an idle tenant", %{id: id} do
       write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('secret')"])
       flush!(id)
