@@ -23,6 +23,21 @@ section, so you can Grep for the heading and Read just that entry.
 ## Shard storage
 
 **Shard storage.** `Fathom.Shard.Storage` is a `pull/2` + `flush/2` behaviour, backend chosen by `config :fathom, :shard_storage` — `Fathom.Shard.Storage.Local` (a filesystem object store, the default for dev/test) or `Fathom.Shard.Storage.S3` (Req + `aws_sigv4`, no AWS dep; works with S3 / R2 / Tigris / MinIO). A present local file is authoritative on wake (pull only on cold start), so an un-flushed shard is never clobbered.
+## Shard storage: the flat 60 s pull timeout is deliberate
+
+`Fathom.Shard.Materializer` bounds a `pull/2` with a flat `Task.yield(task, 60_000)` that covers the
+retries too, and a partial download is not resumed. Expert review 2026-10-10 #28 proposed a
+progress-based deadline that resets on each byte received. **Decision (2026-10-10): keep the flat
+timeout (WONTFIX).** Reasons:
+
+- The design targets small shards. A shard is capped at 4 GiB, so a full pull inside 60 s is the
+  normal case. A pull that runs past it signals a slow store or a wedged transfer, and an operator
+  should see that rather than wait it out.
+- The checkout budget is derived from this value (`pull + 15 s`, see `Fathom.Shard`). A
+  progress-based deadline would make the checkout bound open-ended as well.
+
+Revisit if the size cap rises, or if a real tenant starts hitting the timeout in production.
+
 ## Network protocol
 
 **Network protocol.** `Fathom.ShardExecutor` (a `Filo.Executor`) binds each Hrana stream to a shard. The **Filo** library (separate repo, `{:filo, path: "../filo"}`) speaks the libSQL Hrana wire protocol — HTTP v1/v2/v3 (+ cursor) and WebSocket hrana1/2/3 — on its own Bandit listener (`:hrana_port`, default 8080; gated by `:hrana_server`, off in test), separate from the web/dashboard endpoint on 4000. `django-libsql` (WebSocket) and `libsql-experimental`/SDKs (HTTP) both work end to end.

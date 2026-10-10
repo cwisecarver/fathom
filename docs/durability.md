@@ -280,6 +280,10 @@ the bucket underneath the fathom-managed snapshots above:
 
   A version with `fathom-enc` but no `fathom-md5` was not written by fathom; the pull path refuses
   such an object, and so should you.
+- **Versioning also bounds tenant erasure** (expert review 2026-10-10 #13). The purge deletes current
+  keys only, so the noncurrent versions survive it until a noncurrent-version expiration rule removes
+  them. Erasure is complete only at that expiry. See
+  [tenant-lifecycle.md](tenant-lifecycle.md#erasure-is-bounded-by-noncurrent-versions).
 - **Object Lock (or MFA-delete)** on the live prefix, and **cross-region/-account replication**, so
   a single bucket-level mistake or compromise can't erase every tenant at once.
 - **Least-privilege node credentials:** the data plane needs read/write on `<shard>.db` and the

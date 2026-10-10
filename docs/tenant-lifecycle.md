@@ -71,6 +71,28 @@ be `.` (live/lock) or `@` (a version/snapshot). A bare `starts_with(<id>)` match
 different tenant, so purging `acme` provably never touches `acme2` (this is the shard-isolation gate,
 pinned by test).
 
+### Erasure is bounded by noncurrent versions
+
+`purge_shard/1` removes the tenant's fathom-managed keys: the live `.db`, the `.lock`, every
+`@<version>` and every `@snap-<id>`. On a bucket with **versioning on**, S3 keeps the previous object
+versions behind those keys. Each fenced flush leaves one, and `Shards.stop/1`'s final flush adds one
+more. The purge's plain `DeleteObject` only stacks a delete marker on top. Those noncurrent versions
+still hold the erased tenant's data until something expires them.
+
+fathom never deletes object versions. Doing so would need `s3:DeleteObjectVersion`, which the data
+plane is deliberately not granted (see [durability.md](durability.md), least-privilege node
+credentials). So the erase is bounded like this:
+
+- Erasure is **complete only after a noncurrent-version expiration lifecycle rule** on the shard
+  bucket has removed the tenant's old versions. Until then the erased data persists as noncurrent
+  versions, readable by any principal with `s3:GetObjectVersion`.
+- The rule's `NoncurrentDays` is the bound. The tenant's data survives the erase by at most that many
+  days after its last version became noncurrent.
+- A bucket without versioning has no such gap, and the purge is the whole erase.
+
+An operator who issues erasures must configure that rule on the shard bucket, and must treat the
+erasure as complete only at its expiry.
+
 ### Why `Shards.stop/1` and not `drain/2` (a real leak, fixed)
 
 The obvious implementation — graceful-drain then delete — has a data-surviving-the-erase bug. A

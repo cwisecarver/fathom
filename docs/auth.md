@@ -114,6 +114,14 @@ Mint, rotate, and revoke are exposed programmatically on the control-plane API: 
 falling back to the shared admin BasicAuth for backward compatibility (see
 [tenant-lifecycle.md](tenant-lifecycle.md)); token routes require the `manage` scope.
 
+**A `manage` key is data-plane-equivalent across every tenant** (expert review 2026-10-10 #32). API
+keys are fleet-wide: there is no per-key tenant allow-list. A `manage` key can mint a read/write
+token for any shard, rotate or revoke any tenant's token, and fork any tenant. That is the same reach
+the data plane has, so a manage key is a credential for the whole fleet. Mint them sparingly, and
+rotate them the way you would the admin BasicAuth password. A per-key allow-list is not built: this
+is a single-company deployment with one trust domain, so the allow-list would be complexity without a
+boundary to enforce.
+
 ## Issuance ledger & fleet-wide revocation (#37)
 
 Everything above covers **one shard**. What was missing was the layer above it, which is the shape
