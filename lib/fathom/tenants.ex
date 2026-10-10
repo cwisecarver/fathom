@@ -93,15 +93,15 @@ defmodule Fathom.Tenants do
   success for a tenant that has no schema (expert review 2026-08-31 #10). A concurrent forker
   winning the race is success, not a failure.
   """
-  @spec provision(String.t()) :: {:ok, map()} | {:error, term()}
-  def provision(shard_id) do
+  @spec provision(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def provision(shard_id, opts \\ []) do
     with {:ok, id} <- cast(shard_id),
          :ok <- refuse_scratch(id, []),
          :ok <- refuse_if_taken(id),
          {:ok, warnings} <- dns_safety(id),
          {:ok, _row} <- Directory.resolve(id),
          :ok <- fork_or_rollback(id) do
-      {:ok, tenant_result(id, warnings)}
+      {:ok, tenant_result(id, warnings, opts)}
     end
   end
 
@@ -131,7 +131,7 @@ defmodule Fathom.Tenants do
          :ok <- maybe_flush_source(src, opts),
          :ok <- fork_into_leased_dst(src, dst),
          :ok <- register_fork(dst) do
-      {:ok, tenant_result(dst, warnings)}
+      {:ok, tenant_result(dst, warnings, opts)}
     end
   end
 
@@ -529,8 +529,10 @@ defmodule Fathom.Tenants do
     end
   end
 
-  defp mint_token(id) do
-    case HranaAuth.token_for(id, actor: "Tenants.provision") do
+  # `opts[:actor]` is the caller's identity for the issuance ledger (expert review 2026-10-10 #W3);
+  # without it every API-minted token read as the anonymous "Tenants.provision".
+  defp mint_token(id, opts) do
+    case HranaAuth.token_for(id, actor: Keyword.get(opts, :actor) || "Tenants.provision") do
       {:ok, token} -> token
       _ -> nil
     end
@@ -630,11 +632,11 @@ defmodule Fathom.Tenants do
 
   # The provision/fork response shape. `warnings` is always present (empty when the id is fine) so
   # the API surface is consistent (expert review #35).
-  defp tenant_result(id, warnings) do
+  defp tenant_result(id, warnings, opts) do
     %{
       shard_id: id,
       url: tenant_url(id),
-      auth_token: mint_token(id),
+      auth_token: mint_token(id, opts),
       auth_required: auth_required?(),
       warnings: warnings
     }

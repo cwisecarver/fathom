@@ -178,6 +178,27 @@ defmodule FathomWeb.Api.TenantControllerTest do
       assert is_binary(body["auth_token"])
     end
 
+    # Expert review 2026-10-10 #W3: mint/rotate recorded the route string "api:/api/tenants/:id/token"
+    # (and create/fork "Tenants.provision") as the ledger actor, so the fleet-wide time-scoped
+    # revoke could not tell WHICH API key minted what. Every API mint now names the caller.
+    test "every API token mint is attributed to the calling actor in the issuance ledger",
+         %{conn: conn} do
+      put_shard("api_attr")
+      conn |> auth() |> post("/api/tenants/api_attr/token") |> json_response(200)
+      conn |> auth() |> post("/api/tenants/api_attr/token/rotate") |> json_response(200)
+
+      conn
+      |> auth()
+      |> post("/api/tenants", %{shard_id: "api-attr-new"})
+      |> json_response(201)
+
+      actors = Fathom.HranaAuth.Ledger.history("api_attr") |> Enum.map(& &1.actor)
+      assert actors == ["api:admin (basic-auth)", "api:admin (basic-auth)"]
+
+      assert ["api:admin (basic-auth)"] =
+               Fathom.HranaAuth.Ledger.history("api-attr-new") |> Enum.map(& &1.actor)
+    end
+
     test "revoke reports the new floor", %{conn: conn} do
       put_shard("api_rev")
       body = conn |> auth() |> delete("/api/tenants/api_rev/token") |> json_response(200)

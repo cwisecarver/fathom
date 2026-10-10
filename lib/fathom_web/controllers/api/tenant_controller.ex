@@ -127,7 +127,7 @@ defmodule FathomWeb.Api.TenantController do
 
   # POST /api/tenants  {"shard_id": "acme"}
   def create(conn, params) do
-    case Tenants.provision(params["shard_id"] || params["id"] || "") do
+    case Tenants.provision(params["shard_id"] || params["id"] || "", actor: token_actor(conn)) do
       {:ok, tenant} ->
         conn |> put_status(:created) |> json(tenant)
 
@@ -210,7 +210,8 @@ defmodule FathomWeb.Api.TenantController do
   # Clone a live tenant to a new id (#14). `flush_source: true` first force-flushes the source so
   # the fork carries its latest writes (keystone-fork of a just-migrated template, #10).
   def fork(conn, %{"id" => src} = params) do
-    opts = if truthy?(params["flush_source"]), do: [flush_source: true], else: []
+    opts = [actor: token_actor(conn)]
+    opts = if truthy?(params["flush_source"]), do: [{:flush_source, true} | opts], else: opts
 
     case Tenants.fork(src, params["dst"] || params["to"] || "", opts) do
       {:ok, tenant} ->
@@ -362,7 +363,7 @@ defmodule FathomWeb.Api.TenantController do
   def mint_token(conn, %{"id" => id} = params) do
     scope = scope_param(params)
 
-    case HranaAuth.token_for(id, scope: scope, actor: "api:/api/tenants/:id/token") do
+    case HranaAuth.token_for(id, scope: scope, actor: token_actor(conn)) do
       {:ok, token} -> json(conn, %{shard_id: id, auth_token: token, scope: to_string(scope)})
       {:error, :invalid_shard_id} -> error(conn, :bad_request, "invalid shard id")
     end
@@ -372,7 +373,7 @@ defmodule FathomWeb.Api.TenantController do
   def rotate_token(conn, %{"id" => id} = params) do
     scope = scope_param(params)
 
-    case HranaAuth.rotate(id, scope: scope) do
+    case HranaAuth.rotate(id, scope: scope, actor: token_actor(conn)) do
       {:ok, token} -> json(conn, %{shard_id: id, auth_token: token, scope: to_string(scope)})
       {:error, :invalid_shard_id} -> error(conn, :bad_request, "invalid shard id")
     end
@@ -385,6 +386,11 @@ defmodule FathomWeb.Api.TenantController do
       {:error, :invalid_shard_id} -> error(conn, :bad_request, "invalid shard id")
     end
   end
+
+  # The issuance-ledger identity of whoever asked for a token: the API key's name (or the BasicAuth
+  # fallback's), not a route string (expert review 2026-10-10 #W3) — the fleet-wide time-scoped
+  # revoke needs to know WHICH credential minted what.
+  defp token_actor(conn), do: "api:#{conn.assigns.api_actor.name}"
 
   # Explicit map — never String.to_atom on the request scope (atom-exhaustion hygiene).
   defp scope_param(%{"scope" => "ro"}), do: :ro
