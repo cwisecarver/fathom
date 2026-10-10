@@ -230,14 +230,54 @@ defmodule Fathom.Shard.Replication.Promote do
   replica bytes while its provenance sidecar still names the stored object. The coordinator would
   then serve one lineage and fence with another's etag. The same temp-then-promote discipline the
   pull path uses, for the same reason.
+
+  ## The copy is taken under the replica's lock, and the replica is fenced before it is released
+
+  Expert review 2026-10-08 #13. The `.db` and `-wal` are two copies, and nothing used to stop the
+  follower worker that owns this shard from mutating the replica between them: until `forget/2`
+  runs after the publish, the DEPOSED owner's lineage is still accepted, and its reset push
+  (absorb into the `.db`, truncate the `-wal`) landing between the two copies staged a `.db` from
+  one generation with a `-wal` from the next — a torn pair `quick_check` cannot see. So:
+
+    1. take the shard's replica lock (`Follower.with_shard_lock/4`): no push, seed or pulled seed
+       mutates the files while it is held, and one already in flight finishes first (bounded by
+       `:replication_promote_lock_wait_ms`; a replica still busy after that declines the
+       promotion with `{:error, :replica_busy}`);
+    2. copy the pair under it;
+    3. FENCE the replica (`Follower.fence_for_promotion/3`) before releasing it, so the deposed
+       owner's later pushes are refused rather than acked for writes the promoted database will
+       never hold.
+
+  `fence` takes `:lineage` (the promoting owner's), `:epoch` (the promoting lease's) and `:expect`
+  (the replica state the caller ranked; a replica that has moved since is refused
+  `{:error, :replica_changed}` and left untouched). A failure in the copy leaves the replica
+  untouched and the promotion retryable; a failure after the fence (the checkpoint, `quick_check`,
+  the publish) leaves it fenced and torn — the safe direction: it waits for a re-seed rather than
+  being ranked against the new owner's own stamps.
   """
-  @spec stage(atom(), String.t(), Path.t()) :: :ok | {:error, term()}
-  def stage(follower, shard_id, temp) do
-    with :ok <- install(follower, shard_id, temp),
+  @spec stage(atom(), String.t(), Path.t(), keyword()) :: :ok | {:error, term()}
+  def stage(follower, shard_id, temp, fence \\ []) do
+    with :ok <- fenced_copy(follower, shard_id, temp, fence),
          :ok <- checkpoint_and_verify(temp) do
       :ok
     end
   end
+
+  # Copy, THEN fence: the fence re-checks `:expect` and is the only step that changes the replica,
+  # so a copy that fails, or a replica that moved since it was ranked, leaves it exactly as it was.
+  defp fenced_copy(follower, shard_id, temp, fence) do
+    Follower.with_shard_lock(follower, shard_id, promote_lock_wait_ms(), fn ->
+      with :ok <- install(follower, shard_id, temp) do
+        Follower.fence_for_promotion(follower, shard_id, fence)
+      end
+    end)
+  end
+
+  # Longer than a push's wait: a promotion runs once per failover rather than per commit, and the
+  # thing it may be waiting out is a whole seed. Bounded all the same, because it is on the
+  # shard-open path.
+  defp promote_lock_wait_ms,
+    do: Application.get_env(:fathom, :replication_promote_lock_wait_ms, 2_000)
 
   defp install_and_publish(follower, shard_id, lease) do
     path = Shard.db_path(shard_id)
@@ -272,7 +312,8 @@ defmodule Fathom.Shard.Replication.Promote do
       # production/operator path where that failover matters, thread the replica's lineage through
       # and stamp with the 5-arity flush — but do NOT "fix" the nil stamp into carrying the
       # pre-promotion object's stamp, which is the actual rollback bug the audit imagined.
-      with :ok <- stage(follower, shard_id, temp),
+      # Fenced with the lease's epoch: this operator path has no lineage of its own to claim.
+      with :ok <- stage(follower, shard_id, temp, epoch: lease.epoch),
            {:ok, expected} <- current_object_etag(shard_id),
            :ok <- File.rename(temp, path),
            {:ok, etag, _carried} <- Storage.flush(shard_id, path, expected),

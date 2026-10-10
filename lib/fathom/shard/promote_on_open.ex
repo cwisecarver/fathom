@@ -317,7 +317,10 @@ defmodule Fathom.Shard.PromoteOnOpen do
 
     try do
       with :ok <- snapshot_before_promotion(shard_id),
-           :ok <- Promote.stage(follower, shard_id, temp),
+           # Copied under the replica's lock and fenced at THIS owner's lineage before the lock is
+           # released (expert review 2026-10-08 #13), and only if the replica is still the one
+           # ranked above (`expect:`) — see `Promote.stage/4`.
+           :ok <- Promote.stage(follower, shard_id, temp, lineage: lineage, expect: replica),
            {:ok, new_etag, _carried} <-
              Storage.flush(
                shard_id,

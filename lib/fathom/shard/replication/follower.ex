@@ -230,6 +230,66 @@ defmodule Fathom.Shard.Replication.Follower do
   defp lock_max_ms,
     do: Application.get_env(:fathom, :replication_shard_lock_max_ms, @default_lock_max_ms)
 
+  @doc """
+  Fence this follower's replica of `shard_id` for a promotion (expert review 2026-10-08 #13).
+  **Call it holding the shard's lock** (`with_shard_lock/4`) and only after the copy succeeded.
+
+  Until `forget/2` runs after a promotion publishes, the replica row still accepts the DEPOSED
+  owner's pushes — an append it acks after the copy is a write the promoted database does not hold,
+  and its reset would absorb-and-truncate under a later reader. This advances the row so those
+  pushes are refused by `FollowerLog.decide/2`'s existing fences:
+
+    * `:lineage` — the promoting owner's lineage; a deposed owner states a lower one and is refused
+      `:stale_epoch` by the lineage fence. Raised, never lowered.
+    * `:epoch` — the promoting lease's epoch, for the operator path (`Promote.promote/2`) that has
+      no lineage to claim. Raised, never lowered.
+
+  And always `torn: true`, durably: from here the row no longer describes a replica of anyone's
+  history (its lineage is the new owner's, its bytes the old owner's), so it must never be ranked
+  by `Promote.fresher?/2` or offered to a peer — if the promotion goes on to fail, the replica
+  waits for a re-seed rather than being mis-ranked against the new owner's own stamps.
+
+  `:expect` — the replica state the caller decided to promote on. Refused `{:error,
+  :replica_changed}` if the replica has since gone torn, changed lineage or moved to a lower
+  ordinal (a re-seed), because the staged copy would no longer be the replica that decision ranked.
+  """
+  @spec fence_for_promotion(atom(), String.t(), keyword()) ::
+          :ok | {:error, :no_replica | :replica_changed}
+  def fence_for_promotion(name, shard_id, opts) do
+    case state_of(name, shard_id) do
+      nil ->
+        {:error, :no_replica}
+
+      state ->
+        if changed_since?(state, Keyword.get(opts, :expect)) do
+          {:error, :replica_changed}
+        else
+          put_state(name, shard_id, %{
+            state
+            | torn: true,
+              lineage: raise_to(state.lineage, Keyword.get(opts, :lineage)),
+              epoch: raise_to(state.epoch, Keyword.get(opts, :epoch))
+          })
+
+          :ok
+        end
+    end
+  rescue
+    ArgumentError -> {:error, :no_replica}
+  end
+
+  # Only a real counter moves the fence, and only upward: the caller's lineage can be `:disabled`
+  # (`Position.lineage_to_store/1`) or nil, and neither may land in the replica's state.
+  defp raise_to(current, value) when is_integer(value) and value > current, do: value
+  defp raise_to(current, _value), do: current
+
+  defp changed_since?(_state, nil), do: false
+
+  defp changed_since?(state, expect) do
+    state.torn or state.lineage != Map.get(expect, :lineage, 0) or
+      Map.get(state, :wal_ordinal, 0) < Map.get(expect, :wal_ordinal, 0)
+  end
+
   @doc "The port this follower is listening on (0 in config means 'pick one')."
   @spec port(GenServer.server()) :: {:ok, :inet.port_number()}
   def port(server \\ __MODULE__), do: GenServer.call(server, :port)
