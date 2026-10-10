@@ -31,6 +31,9 @@ cd "$ROOT"
 export MIX_ENV=prod
 export DATABASE_URL="${FATHOM_BENCH_DATABASE_URL:-ecto://${FATHOM_BENCH_PGUSER:-$USER}@localhost/fathom_bench}"
 export SECRET_KEY_BASE="${SECRET_KEY_BASE:-benchonlynotasecret0000000000000000000000000000000000000000000000}"
+# Prod refuses to boot with HRANA_AUTH unset (expert review 2026-10-10 #21); the bench drives
+# shards in-process, so the data-plane auth posture is irrelevant to what it measures.
+export HRANA_AUTH="${HRANA_AUTH:-disabled}"
 
 HISTORY="scripts/perf_history.jsonl"
 mkdir -p logs
