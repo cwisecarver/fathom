@@ -243,6 +243,65 @@ defmodule Fathom.Shard.HeartbeatTest do
     assert Heartbeat.valid_for_write?(0) == :revalidate
   end
 
+  # Expert review 2026-10-10 #17 (SYMPTOM): a host suspend longer than the TTL (VM pause, live
+  # migration) does not advance CLOCK_MONOTONIC, so after resume `now <= mono_deadline_ms`: no
+  # lapse was detected, valid_for_write? kept saying :ok while peers (judging by wall time) had
+  # legitimately stolen the shards, and coordinators acked writes until a flush 412 quarantined them.
+  # Invariant: wall elapsed since the last good renewal beyond ttl - margin, with the monotonic clock
+  # having lost the difference, trips mark_lapse; wall time can only lapse, never extend validity.
+  # Heartbeat mode (the production fence): driven through the real Heartbeat process.
+  describe "host-suspend trip-wire (#17)" do
+    test "suspend_gap? trips only on a wall-ahead-of-mono gap inside the unsafe margin" do
+      ttl = 30_000
+      margin = 10_000
+      # Suspended 60 s: wall moved, mono did not.
+      assert Heartbeat.suspend_gap?(60_000, 100, ttl, margin)
+
+      # Boundary: wall exactly ttl - margin (and a full margin of gap) trips; one ms less does not.
+      assert Heartbeat.suspend_gap?(20_000, 0, ttl, margin)
+      refute Heartbeat.suspend_gap?(19_999, 0, ttl, margin)
+      # Ordinary slow/failed renewal: wall and mono advance together -> existing mono path.
+      refute Heartbeat.suspend_gap?(25_000, 25_000, ttl, margin)
+      # A small NTP forward step is ignored; a backward step (negative elapsed) never trips.
+      refute Heartbeat.suspend_gap?(21_000, 15_000, ttl, margin)
+      refute Heartbeat.suspend_gap?(-60_000, 100, ttl, margin)
+    end
+
+    test "a renew tick after a long suspend lapses, though the monotonic deadline still reads valid",
+         %{pid: pid} do
+      assert Heartbeat.generation() == 0
+      assert Heartbeat.valid_for_write?(0) == :ok
+
+      # Forge the state a 60 s suspend leaves: last good renewal was 60 s ago by the WALL clock, but
+      # only ~100 ms ago by the monotonic one (which froze), so the mono deadline is still far off.
+      :sys.replace_state(pid, fn s ->
+        %{s | renewed_wall_ms: s.renewed_wall_ms - 60_000}
+      end)
+
+      assert Heartbeat.valid_for_write?(0) == :ok,
+             "precondition: the monotonic view alone still says valid (the bug's blind spot)"
+
+      capture_log(fn ->
+        send(pid, :renew)
+        _ = :sys.get_state(pid)
+      end)
+
+      assert Heartbeat.generation() == 1, "the suspend must be edge-detected as a lapse"
+      assert Heartbeat.valid_for_write?(0) == :revalidate
+      assert Heartbeat.valid_for_write?(1) == :ok
+    end
+
+    test "a wall clock stepped BACKWARD never lapses and never extends validity", %{pid: pid} do
+      :sys.replace_state(pid, fn s -> %{s | renewed_wall_ms: s.renewed_wall_ms + 3_600_000} end)
+
+      send(pid, :renew)
+      _ = :sys.get_state(pid)
+
+      assert Heartbeat.generation() == 0
+      assert Heartbeat.valid_for_write?(0) == :ok
+    end
+  end
+
   # Round-2 #26: the lapse broadcast fans a fence check out to every open
   # coordinator at the same instant, and each check was a GenServer.call into this
   # single process — the flood serialized on its mailbox, and a timed-out call

@@ -260,6 +260,10 @@ defmodule Fathom.Shard.Heartbeat do
       # never edge-detecting it, never bumping the generation, and letting flushes
       # skip revalidation against a peer that legitimately stole our shards.
       mono_deadline_ms: nil,
+      # The mono/wall instants of the last SUCCESSFUL renew start — read only by the suspend
+      # trip-wire (`suspend_forces_lapse?/3`), never to compute validity.
+      renewed_mono_ms: nil,
+      renewed_wall_ms: nil,
       generation: generation,
       lapsed: false,
       timer: nil
@@ -367,12 +371,23 @@ defmodule Fathom.Shard.Heartbeat do
     # object's expiry, and the PUT takes time — measuring after it would skew the
     # deadline later (the unsafe direction).
     now = System.monotonic_time(:millisecond)
+    wall = System.system_time(:millisecond)
 
     # Edge-detect a lapse: we had a valid heartbeat and it expired before we renewed.
     # Monotonic elapsed time, immune to wall-clock steps (expert review #21).
+    #
+    # PLUS a wall-clock TRIP-WIRE (expert review 2026-10-10 #17). CLOCK_MONOTONIC does not advance
+    # while the host is suspended (VM pause, live migration, laptop sleep), but peers judge our
+    # stored heartbeat against WALL time. After a suspend longer than the TTL the monotonic
+    # deadline still reads "valid", so no lapse was detected and coordinators kept acking until a
+    # flush 412 quarantined them. If wall elapsed since the last good renewal says we are inside
+    # the unsafe margin while the monotonic clock lost the difference, lapse now. The wall clock
+    # can ONLY trip `mark_lapse` here — it never sets or extends `mono_deadline_ms`, so a wall step
+    # cannot inflate validity (the #21 hazard stays closed; a backward step yields a negative
+    # elapsed and trips nothing).
     state =
       if not state.lapsed and not is_nil(state.mono_deadline_ms) and
-           now > state.mono_deadline_ms,
+           (now > state.mono_deadline_ms or suspend_forces_lapse?(state, now, wall)),
          do: mark_lapse(state),
          else: state
 
@@ -385,7 +400,7 @@ defmodule Fathom.Shard.Heartbeat do
             %{owner: state.owner}
           )
 
-          renewed = %{state | expires_at_ms: exp}
+          renewed = %{state | expires_at_ms: exp, renewed_mono_ms: now, renewed_wall_ms: wall}
           skew = skew_ms(store_now)
 
           # OWNER-CLOCK SKEW (expert review 2026-09-05 #16). #13 fixed the READER (a stealer compares
@@ -421,6 +436,27 @@ defmodule Fathom.Shard.Heartbeat do
 
     publish_status(state)
     schedule_renew(state, now)
+  end
+
+  defp suspend_forces_lapse?(%{renewed_mono_ms: m, renewed_wall_ms: w} = state, now, wall)
+       when is_integer(m) and is_integer(w),
+       do: suspend_gap?(wall - w, now - m, state.ttl_ms, state.margin_ms)
+
+  defp suspend_forces_lapse?(_state, _now, _wall), do: false
+
+  @doc """
+  Whether wall-clock time since the last good renewal shows a host suspend the monotonic clock
+  missed (expert review 2026-10-10 #17).
+
+  Pure, and public for the boundary test. True when the wall clock says we are inside the unsafe
+  margin (`wall_elapsed >= ttl - margin`) AND the wall clock ran at least `margin` ahead of the
+  monotonic one. The second condition keeps ordinary slow/failed renewals (wall and mono advance
+  together — the monotonic deadline already handles those, later) on their existing path, and
+  ignores a small NTP step. A negative `wall_elapsed` (backward step) is never true.
+  """
+  @spec suspend_gap?(integer(), integer(), pos_integer(), pos_integer()) :: boolean()
+  def suspend_gap?(wall_elapsed_ms, mono_elapsed_ms, ttl_ms, margin_ms) do
+    wall_elapsed_ms >= ttl_ms - margin_ms and wall_elapsed_ms - mono_elapsed_ms >= margin_ms
   end
 
   # Owner-behind-store skew in ms, or nil when the store did not state a clock (S3 Date absent).
