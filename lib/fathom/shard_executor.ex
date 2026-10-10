@@ -811,9 +811,20 @@ defmodule Fathom.ShardExecutor do
     # `=` and no argument form that is a pure read, so it is name-matched like incremental_vacuum
     # (expert review 2026-10-10 #24): classified as a read, it left the shard clean and the idle
     # drop discarded the statistics.
+    #
+    # Match the PARSED pragma name, never a substring of the text (expert review 2026-10-10 R2-2):
+    # `PRAGMA table_info(optimize_x)` contains "optimize" and used to classify as a write, so a
+    # `:ro` token could force a durability flush every interval. A durable header pragma writes
+    # when it has ANY argument (`= v` or `(v)` — SQLite accepts both); the bare form is a query.
+    # Over-classifying as a write is the safe direction; the old substring test was neither.
     String.starts_with?(lead, "pragma") and
-      ((String.contains?(lead, "=") and Enum.any?(@durable_pragmas, &String.contains?(lead, &1))) or
-         String.contains?(lead, "incremental_vacuum") or String.contains?(lead, "optimize"))
+      (
+        {name, tail} = pragma_name_and_tail(lead)
+        name = String.downcase(name)
+
+        name in ["optimize", "incremental_vacuum"] or
+          (name in @durable_pragmas and not bare_read_tail?(tail))
+      )
   end
 
   # Report the connection's REAL autocommit state (expert review 2026-07-14 #35). Hrana 3's

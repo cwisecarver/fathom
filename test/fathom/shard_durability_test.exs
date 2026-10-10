@@ -310,6 +310,33 @@ defmodule Fathom.ShardDurabilityTest do
     :ok = ShardExecutor.close(conn)
   end
 
+  # Symptom (expert review 2026-10-10 R2-2): classification was a SUBSTRING test on the statement
+  # text, so a pure introspection pragma whose ARGUMENT mentions "optimize" / "incremental_vacuum"
+  # dirtied the shard — a :ro token could force a durability flush every interval. The parsed
+  # pragma NAME is what decides.
+  test "a read pragma whose argument merely contains 'optimize'/'incremental_vacuum' stays clean",
+       %{shard: shard} do
+    {:ok, setup_conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(setup_conn, stmt("CREATE TABLE optimize_x (k INTEGER)"))
+    {:ok, _} = ShardExecutor.execute(setup_conn, stmt("CREATE TABLE incremental_vacuum_y (k)"))
+    :ok = ShardExecutor.close(setup_conn)
+
+    {:ok, coordinator} = Shards.ensure(shard)
+    flush_now(coordinator)
+    refute dirty?(shard), "clean baseline"
+
+    {:ok, conn} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("PRAGMA table_info(optimize_x)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("PRAGMA table_info(incremental_vacuum_y)"))
+    refute dirty?(shard), "introspection must not dirty the shard"
+
+    # ...and the real names still do, including a schema-qualified one.
+    {:ok, _} = ShardExecutor.execute(conn, stmt("PRAGMA main.optimize"))
+    assert dirty?(shard), "PRAGMA main.optimize is still a write"
+
+    :ok = ShardExecutor.close(conn)
+  end
+
   # auto_vacuum SET is BLOCKED for tenants by default, so it belongs in @durable_pragmas as
   # defense-in-depth alongside the other blocked-but-durable entries (user_version, page_size,
   # journal_mode): IF an operator allows it via :tenant_pragma_allow, `PRAGMA auto_vacuum = <mode>`
