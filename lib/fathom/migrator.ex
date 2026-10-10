@@ -920,7 +920,12 @@ defmodule Fathom.Migrator do
       # meaning ("active and behind": what the sweep will pick up) the ETA and dashboards rely on.
       in_flight: in_flight,
       failed: Directory.count_failed(),
-      converged: laggards == 0 and above_head == 0 and in_flight == 0,
+      # A quarantined shard below head is NOT converged (expert review 2026-10-10 #4): it serves the
+      # old schema and no sweep touches it until requeued, yet `laggards` is active-only, so a
+      # brownout that quarantined a fleet slice left the deploy gate green.
+      converged:
+        laggards == 0 and above_head == 0 and in_flight == 0 and
+          Directory.count_failed_below(head) == 0,
       # `pending_review` stays a list of VERSION NUMBERS. Changing it to the block objects broke
       # `migration_controller_test` immediately, which is the API's own consumers telling you the
       # same thing: this is a published control-plane endpoint and a field changing type is a
@@ -1288,7 +1293,19 @@ defmodule Fathom.Migrator do
   or no version is released).
   """
   @spec retry_failed() :: {:ok, non_neg_integer()}
-  def retry_failed do
+  def retry_failed, do: requeue_failed_since(nil)
+
+  @doc """
+  `retry_failed/0` restricted to shards quarantined at least `cool_off_ms` ago — the reconcile job's
+  automatic requeue (expert review 2026-10-10 #4). Without it a quarantine, even one caused by a
+  transient outage, was permanent until an operator ran `retry_failed/0`.
+  """
+  @spec retry_cooled_failed(non_neg_integer()) :: {:ok, non_neg_integer()}
+  def retry_cooled_failed(cool_off_ms) do
+    requeue_failed_since(DateTime.add(DateTime.utc_now(), -cool_off_ms, :millisecond))
+  end
+
+  defp requeue_failed_since(cutoff) do
     # PER CHUNK, not per fleet (expert review 2026-08-26 #21). This used to materialize every
     # quarantined shard as a full struct via `Directory.failed_shards/0` and hand every id to
     # `requeue_failed/1` in ONE statement — and Postgres caps a statement at 65 535 bind
@@ -1303,7 +1320,7 @@ defmodule Fathom.Migrator do
     head = head()
 
     count =
-      Directory.stream_failed()
+      Directory.stream_failed(5_000, cutoff)
       |> Stream.chunk_every(@enqueue_chunk)
       |> Enum.reduce(0, fn chunk, acc ->
         # Un-quarantine FIRST, and unconditionally — including when no version is released. That

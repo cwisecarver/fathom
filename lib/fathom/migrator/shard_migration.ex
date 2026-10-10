@@ -414,8 +414,26 @@ defmodule Fathom.Migrator.ShardMigration do
     end
   end
 
-  defp hold_lease(shard_id, token, fun) do
+  defp hold_lease(shard_id, token, fun, remote_drained? \\ false) do
     case Storage.acquire_lease(shard_id, owner(token), ttl()) do
+      {:error, {:held, holder, _stealable_at}} ->
+        # Expert review 2026-10-10 #3: `Shards.drain/2` above only sees THIS node's Registry, so a
+        # coordinator on another node answered `:ok` and the lease then read `held` forever — a hot
+        # shard (the one a rollout or emergency revert most needs) never migrated, since the
+        # migrations queue runs on every node and each snoozed. Ask the holder's node to drain via
+        # the existing Rebalancer command channel (Postgres-carried; no BEAM cluster), once, then
+        # retry the acquire. Any failure falls back to the old `{:retry, {:held, _}}` snooze.
+        case remote_holder_node(holder) do
+          {:ok, holder_node} when not remote_drained? ->
+            case remote_drain(shard_id, holder_node) do
+              :ok -> hold_lease(shard_id, token, fun, true)
+              :error -> {:retry, {:held, holder}}
+            end
+
+          _ ->
+            {:retry, {:held, holder}}
+        end
+
       {:ok, lease} ->
         # Keep the lock's TTL fresh for the whole (unbounded) copy so the #11 lock-TTL liveness
         # fallback keeps this no-heartbeat owner `:live` and a client checkout is refused instead
@@ -430,12 +448,50 @@ defmodule Fathom.Migrator.ShardMigration do
           Storage.release_lease(shard_id, lease)
         end
 
-      {:error, {:held, holder, _stealable_at}} ->
-        {:retry, {:held, holder}}
-
       {:error, reason} ->
         {:error, {:lease_unavailable, reason}}
     end
+  end
+
+  # A coordinator's lease owner is `Heartbeat.owner/0` = "<node>#<incarnation>". A migrator's is
+  # "migrator@…" (another operation: just wait). Our own node can't hold a coordinator here (the
+  # local drain just ran). Like HandoffJob, this addresses the node NAME, so a deployment that
+  # overrides `:node_key` gets no benefit and falls back to the snooze.
+  defp remote_holder_node(holder) when is_binary(holder) do
+    with false <- String.starts_with?(holder, "migrator@"),
+         [node_name, _incarnation] <- String.split(holder, "#", parts: 2),
+         true <- node_name != "" and node_name != to_string(node()) do
+      {:ok, node_name}
+    else
+      _ -> :none
+    end
+  end
+
+  defp remote_holder_node(_), do: :none
+
+  defp remote_drain(shard_id, holder_node) do
+    alias Fathom.Rebalancer.Commands
+
+    with {:ok, cmd} <- Commands.issue(shard_id, holder_node, "drain_for_migration") do
+      case Commands.await(cmd.id, timeout_ms: remote_drain_timeout_ms()) do
+        {:ok, _} ->
+          :ok
+
+        {:error, reason} ->
+          # Don't leave it pending for the holder to fire after we've given up.
+          _ = Commands.cancel_if_pending(cmd.id, "migrator gave up: #{inspect(reason)}")
+          :error
+      end
+    else
+      _ -> :error
+    end
+  rescue
+    _ -> :error
+  end
+
+  defp remote_drain_timeout_ms do
+    Application.get_env(:fathom, :migration_remote_drain_ms) ||
+      Fathom.Rebalancer.HandoffJob.drain_timeout()
   end
 
   # A linked process that renews the migrator lease every ttl/3. Unlinked + stopped in the

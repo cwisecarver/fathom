@@ -156,7 +156,13 @@ defmodule Fathom.Migrator.RevertJob do
         {:cancel, :not_active}
 
       {:error, reason} ->
-        handle_error(job, shard_id, reason)
+        # Expert review 2026-10-10 #4: environmental errors snooze instead of burning attempts
+        # toward quarantine (see `ShardMigrationJob.transient?/1`).
+        if ShardMigrationJob.transient?(reason) do
+          handle_retry(job, shard_id, landing, {:transient, reason})
+        else
+          handle_error(job, shard_id, reason)
+        end
     end
   end
 
@@ -190,6 +196,9 @@ defmodule Fathom.Migrator.RevertJob do
 
     {:snooze, ShardMigrationJob.snooze_seconds(attempt)}
   end
+
+  @impl Oban.Worker
+  def backoff(job), do: ShardMigrationJob.backoff(job)
 
   # WHICH VERSION THIS SHARD CAN ACTUALLY BE RESTORED TO (expert review 2026-08-24 #16b).
   #

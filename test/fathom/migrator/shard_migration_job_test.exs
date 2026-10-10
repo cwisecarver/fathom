@@ -338,9 +338,12 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
        %{shard: shard} do
     seed_v1!(shard)
     {:ok, _} = Migrator.release(2, "v2", @v2_statements)
-    {:ok, _} = Migrator.release(3, "v3", ["ALTER TABLE app_thing ADD COLUMN note TEXT"])
 
     assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+
+    # v3 is released AFTER the first hop: a job now migrates to the current head, not its stale arg
+    # (expert review 2026-10-10 #31), so releasing it earlier would skip straight past v2.
+    {:ok, _} = Migrator.release(3, "v3", ["ALTER TABLE app_thing ADD COLUMN note TEXT"])
 
     # The divergence: the file is v2, the directory says v1.
     {:ok, _} = Directory.cutover(shard, 1)
@@ -926,5 +929,186 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
       assert %{in_flight: 0} = Migrator.revert_status(5),
              "a completed revert job is still counted as in flight"
     end
+  end
+
+  # ---------------------------------------------------------------------------------------------
+  # Expert review 2026-10-10 #3: a coordinator on ANOTHER node. `Shards.drain/2` only sees this
+  # node's Registry, so it answered :ok, the lease read `held`, and the job snoozed forever — a hot
+  # shard (served by a coordinator on 2 of 3 nodes) never migrated. The fake remote below plays the
+  # holder node's CommandPoller: it sees the migrator's command in Postgres, releases the lease
+  # (removes the lock) and completes the command.
+  # ---------------------------------------------------------------------------------------------
+  describe "a lease held by a coordinator on another node" do
+    @remote_owner "remotenode#inc1"
+
+    setup %{shard: shard} do
+      seed_v1!(shard)
+      {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+      put_remote_lock(shard)
+
+      on_exit(fn ->
+        File.rm(Path.join([remote_dir(), "heartbeats", URI.encode_www_form(@remote_owner)]))
+      end)
+
+      :ok
+    end
+
+    defp put_remote_lock(shard) do
+      File.mkdir_p!(remote_dir())
+      exp = System.system_time(:millisecond) + 60_000
+
+      File.write!(
+        Path.join(remote_dir(), "#{shard}.lock"),
+        Jason.encode!(%{"owner" => @remote_owner, "epoch" => 1, "expires_at_ms" => exp})
+      )
+
+      hb_dir = Path.join(remote_dir(), "heartbeats")
+      File.mkdir_p!(hb_dir)
+
+      File.write!(
+        Path.join(hb_dir, URI.encode_www_form(@remote_owner)),
+        Jason.encode!(%{"owner" => @remote_owner, "expires_at_ms" => exp})
+      )
+    end
+
+    defp fake_remote_node(shard, outcome) do
+      Task.async(fn ->
+        cmds =
+          Stream.repeatedly(fn ->
+            Process.sleep(20)
+            Fathom.Rebalancer.Commands.pending_for("remotenode")
+          end)
+          |> Enum.find(&(&1 != []))
+
+        for cmd <- cmds do
+          assert cmd.command == "drain_for_migration"
+          assert cmd.shard_id == shard
+
+          if outcome == :drain do
+            File.rm!(Path.join(remote_dir(), "#{shard}.lock"))
+            Fathom.Rebalancer.Commands.complete(cmd, "done", "drained")
+          else
+            Fathom.Rebalancer.Commands.complete(cmd, "failed", "drain failed (:busy)")
+          end
+        end
+      end)
+    end
+
+    test "the migration drains the remote holder through the command channel and proceeds",
+         %{shard: shard} do
+      remote = fake_remote_node(shard, :drain)
+
+      assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+      Task.await(remote)
+
+      assert {:ok, %{schema_version: 2}} = Directory.get(shard)
+    end
+
+    test "a remote holder that refuses the drain leaves the job snoozing, not failing",
+         %{shard: shard} do
+      remote = fake_remote_node(shard, :refuse)
+
+      assert {:snooze, _} = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+      Task.await(remote)
+
+      assert {:ok, %{schema_version: 1, status: "active"}} = Directory.get(shard)
+    end
+
+    test "an unresponsive remote node (poller off) times out, cancels its command, and snoozes",
+         %{shard: shard} do
+      Application.put_env(:fathom, :migration_remote_drain_ms, 150)
+      on_exit(fn -> Application.delete_env(:fathom, :migration_remote_drain_ms) end)
+
+      assert {:snooze, _} = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+
+      assert [] = Fathom.Rebalancer.Commands.pending_for("remotenode"),
+             "a timed-out migrator command must not stay pending for the holder to fire later"
+    end
+
+    test "the revert path drains the remote holder too", %{shard: shard} do
+      # Migrate first (the remote releases), then a coordinator on the remote node re-takes the lease.
+      remote = fake_remote_node(shard, :drain)
+      assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+      Task.await(remote)
+
+      put_remote_lock(shard)
+      remote = fake_remote_node(shard, :drain)
+
+      assert :ok =
+               perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 1, "force" => true})
+
+      Task.await(remote)
+      assert {:ok, %{schema_version: 1}} = Directory.get(shard)
+    end
+  end
+
+  # Expert review 2026-10-10 #4.
+  describe "transient errors" do
+    test "environmental errors are transient; deterministic ones are not" do
+      for r <- [
+            {:lease_unavailable, :timeout},
+            {:drain_failed, :busy},
+            {:fence_failed, :closed},
+            {:s3_get_status, 503},
+            {:s3_put_status, 429},
+            :timeout
+          ] do
+        assert ShardMigrationJob.transient?(r), "#{inspect(r)} should be transient"
+      end
+
+      for r <- [{:ahead_of_target, 3}, {:s3_get_status, 404}, {:s3_put_status, 403}, :enoent] do
+        refute ShardMigrationJob.transient?(r), "#{inspect(r)} must keep counting"
+      end
+    end
+
+    # Symptom: a 5-minute S3 brownout burned all 5 attempts and QUARANTINED healthy shards.
+    # Invariant: a transient error on the LAST attempt snoozes and leaves the shard active.
+    test "a transient error on the final attempt does not quarantine", %{shard: shard} do
+      seed_v1!(shard)
+      {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+
+      # A lock-store failure: make the lock path a directory so acquire_lease errors.
+      lock = Path.join(remote_dir(), "#{shard}.lock")
+      File.mkdir_p!(lock)
+      on_exit(fn -> File.rm_rf(lock) end)
+
+      result =
+        capture_log(fn ->
+          send(
+            self(),
+            {:result,
+             perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2},
+               attempt: 5,
+               max_attempts: 5
+             )}
+          )
+        end)
+
+      assert is_binary(result)
+      assert_received {:result, {:snooze, _}}
+      assert {:ok, %{status: "active"}} = Directory.get(shard)
+    end
+
+    test "backoff grows and caps" do
+      assert ShardMigrationJob.backoff(%Oban.Job{attempt: 1}) == 30
+      assert ShardMigrationJob.backoff(%Oban.Job{attempt: 3}) == 120
+      assert ShardMigrationJob.backoff(%Oban.Job{attempt: 20}) == 900
+    end
+  end
+
+  # Expert review 2026-10-10 #31: unique-per-shard means a job queued at an old head blocks a newer
+  # enqueue. The job must therefore migrate to the CURRENT head, not its stale arg.
+  test "a job carrying a stale target migrates to the current head", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+
+    {:ok, _} =
+      Migrator.release(3, "v3", [
+        "ALTER TABLE app_thing ADD COLUMN extra TEXT",
+        "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0003', 'now')"
+      ])
+
+    assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+    assert {:ok, %{schema_version: 3}} = Directory.get(shard)
   end
 end

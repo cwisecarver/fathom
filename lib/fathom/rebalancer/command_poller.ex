@@ -253,6 +253,16 @@ defmodule Fathom.Rebalancer.CommandPoller do
     end
   end
 
+  # A migration/revert on another node needs this node's coordinator to release the lease (expert
+  # review 2026-10-10 #3). No pin to check: the migrator's own lease acquire is the fence, and a
+  # drained shard simply re-opens on its next request.
+  defp execute(%{command: "drain_for_migration", shard_id: id} = cmd) do
+    case Shards.drain(id, drain_ms()) do
+      :ok -> complete(cmd, "done", "drained")
+      {:error, reason} -> complete(cmd, "failed", "drain failed (#{inspect(reason)})")
+    end
+  end
+
   defp execute(%{command: other} = cmd) do
     complete(cmd, "failed", "unknown command #{inspect(other)}")
   end

@@ -1078,6 +1078,19 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  Quarantined (`migration_failed`) shards still BELOW `head` — the quarantined slice that is not at
+  the fleet's version. Unlike `count_laggards/1` (active only), this is what `Migrator.status/0`
+  folds into `converged` (expert review 2026-10-10 #4).
+  """
+  @spec count_failed_below(non_neg_integer()) :: non_neg_integer()
+  def count_failed_below(head) do
+    Repo.aggregate(
+      from(s in Shard, where: s.status == "migration_failed" and s.schema_version < ^head),
+      :count
+    )
+  end
+
+  @doc """
   Shards whose last restore drill found their stored object's `PRAGMA user_version` disagreeing with
   this row's `schema_version` — the three-place stamp having drifted (expert review 2026-08-24 #25).
 
@@ -1154,8 +1167,8 @@ defmodule Fathom.Directory do
   below `last` and the next page — `status == "migration_failed" AND shard_id > last` — is
   unaffected. A shard that leaves the set by some other route mid-scan is simply skipped.
   """
-  @spec stream_failed(pos_integer()) :: Enumerable.t()
-  def stream_failed(page_size \\ @requeue_chunk) do
+  @spec stream_failed(pos_integer(), DateTime.t() | nil) :: Enumerable.t()
+  def stream_failed(page_size \\ @requeue_chunk, cooled_before \\ nil) do
     Stream.resource(
       fn -> "" end,
       fn last ->
@@ -1167,6 +1180,7 @@ defmodule Fathom.Directory do
               limit: ^page_size,
               select: {s.shard_id, s.schema_version}
             )
+            |> cooled_before(cooled_before)
           )
 
         case rows do
@@ -1177,6 +1191,13 @@ defmodule Fathom.Directory do
       fn _ -> :ok end
     )
   end
+
+  # Only rows quarantined at or before `cutoff` (`mark_failed` stamps `updated_at`), for the
+  # reconcile job's cool-off requeue (expert review 2026-10-10 #4). nil = no restriction.
+  defp cooled_before(query, nil), do: query
+
+  defp cooled_before(query, %DateTime{} = cutoff),
+    do: from(s in query, where: s.updated_at <= ^cutoff)
 
   @doc """
   Up to `limit` quarantined shard IDs, for a display that shows a sample rather than the set.

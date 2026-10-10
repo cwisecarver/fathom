@@ -56,7 +56,14 @@ defmodule Fathom.Migrator.ShardMigrationJob do
   @default_stall_after_ms :timer.minutes(10)
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"shard_id" => shard_id, "target" => target}, id: id} = job) do
+  def perform(%Oban.Job{args: %{"shard_id" => shard_id, "target" => job_target}, id: id} = job) do
+    # Expert review 2026-10-10 #31: the job is unique per shard, so a job queued at an OLD head
+    # blocks the enqueue of a newer one (up to an hour, behind the snooze/backoff). Re-read HEAD at
+    # perform time and take the higher: a stale-target job now migrates straight to the current head.
+    # Never LOWER than the job's own target (a review ceiling / yank moving head down is the
+    # pre-existing behaviour and stays so).
+    target = max(job_target, Fathom.Migrator.head())
+
     # Pass the Oban job id as the migration-lease operation token: it's stable across this job's
     # retries/snoozes (so a snoozed job reclaims its own lock) and distinct from any RevertJob's,
     # so a forward and a revert on one shard can't merge (finding #9).
@@ -160,8 +167,47 @@ defmodule Fathom.Migrator.ShardMigrationJob do
         {:cancel, :ledger_mismatch}
 
       {:error, reason} ->
-        handle_error(job, shard_id, reason)
+        if transient?(reason) do
+          handle_retry(job, shard_id, target, {:transient, reason})
+        else
+          handle_error(job, shard_id, reason)
+        end
     end
+  end
+
+  # Expert review 2026-10-10 #4: an environmental failure (S3/PG brownout, a lease that could not be
+  # taken or drained, a fence that could not be confirmed) says nothing about the SHARD. These used
+  # to burn one of 5 attempts (~4 min of Oban's default backoff) and then `mark_failed`, so any
+  # five-minute brownout during a rollout quarantined a slice of healthy tenants — and `converged`
+  # did not count the quarantine. They now snooze (no attempt burned, stall visibility as for a held
+  # lease) and never count toward quarantine. Everything not listed here keeps counting: an unknown
+  # error is more likely a property of the shard than of the weather.
+  @doc false
+  @spec transient?(term()) :: boolean()
+  def transient?({tag, _}) when tag in [:lease_unavailable, :drain_failed, :fence_failed],
+    do: true
+
+  def transient?({:transient_lookup, _}), do: true
+
+  def transient?({tag, status}) when is_atom(tag) and is_integer(status),
+    do: s3_status?(tag, status)
+
+  def transient?(%DBConnection.ConnectionError{}), do: true
+  def transient?(reason) when reason in [:timeout, :closed, :econnrefused, :unavailable], do: true
+  def transient?(_), do: false
+
+  # `{:s3_get_status, 503}` etc.: 5xx, 429 and 408 are the store being unwell; 4xx (404, 403, 412)
+  # are answers about the object and stay deterministic.
+  defp s3_status?(tag, status) do
+    String.starts_with?(Atom.to_string(tag), "s3_") and (status >= 500 or status in [408, 429])
+  end
+
+  # Oban's retry delay for the errors that DO count (expert review 2026-10-10 #4). The default is
+  # ~15 s growing to minutes within 5 attempts — five attempts spent in four minutes. 30 s doubling,
+  # capped at 15 min, spreads the same attempts across about half an hour.
+  @impl Oban.Worker
+  def backoff(%Oban.Job{attempt: attempt}) do
+    min(30 * Integer.pow(2, max(attempt - 1, 0)), 900)
   end
 
   # A deferral: the shard is busy or its lease is held. Keep retrying — both clear on their own —

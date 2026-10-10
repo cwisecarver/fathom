@@ -65,6 +65,18 @@ defmodule Fathom.Rebalancer.Commands do
     n
   end
 
+  @doc "Cancels command `id` only if it is still `pending` (a racing completion is never overwritten)."
+  @spec cancel_if_pending(integer(), String.t()) :: non_neg_integer()
+  def cancel_if_pending(id, detail) do
+    {n, _} =
+      Repo.update_all(
+        from(c in Command, where: c.id == ^id and c.status == "pending"),
+        set: [status: "cancelled", detail: detail, updated_at: DateTime.utc_now()]
+      )
+
+    n
+  end
+
   @doc """
   Deletes terminal (done/failed/cancelled) commands older than `older_than_ms` ago (finding
   #12). `rebalance_commands` was never pruned, so terminal rows accumulated forever. Returns

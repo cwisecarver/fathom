@@ -390,6 +390,41 @@ defmodule Fathom.Migrator.RolloutTest do
   # of transient failures froze a slice of the fleet at the old version even after the
   # cause was fixed; un-quarantining took hand-written SQL against the shards table.
   # The invariant: an operator API returns quarantined shards to the rollout.
+  # Expert review 2026-10-10 #4. Symptom: a brownout quarantined healthy shards below HEAD, and
+  # `Migrator.status/0` still said `converged: true` (laggards counts ACTIVE shards only) — the
+  # deploy gate green over a fleet slice stuck at vN-1, with nothing ever requeueing it.
+  describe "quarantined shards and the deploy gate" do
+    test "converged is false while a migration_failed shard sits below head" do
+      {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
+      {:ok, _} = Directory.resolve("cg")
+      {:ok, _} = Directory.cutover("cg", 2)
+      assert %{converged: true, failed: 0} = Migrator.status()
+
+      {:ok, _} = Directory.resolve("cg_bad")
+      {:ok, _} = Directory.mark_failed("cg_bad")
+
+      assert %{converged: false, failed: 1, laggards: 0} = Migrator.status(),
+             "a quarantined shard below head must hold the deploy gate"
+    end
+
+    test "ReconcileJob requeues a migration_failed shard only after the cool-off" do
+      {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
+      {:ok, _} = Directory.resolve("cf")
+      {:ok, _} = Directory.mark_failed("cf")
+
+      assert :ok = perform_job(ReconcileJob, %{})
+      assert {:ok, %{status: "migration_failed"}} = Directory.get("cf")
+      refute_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => "cf"})
+
+      Application.put_env(:fathom, :migration_failed_cool_off_ms, 0)
+      on_exit(fn -> Application.delete_env(:fathom, :migration_failed_cool_off_ms) end)
+
+      assert :ok = perform_job(ReconcileJob, %{})
+      assert {:ok, %{status: "active"}} = Directory.get("cf")
+      assert_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => "cf", "target" => 2})
+    end
+  end
+
   describe "retry_failed/0" do
     test "un-quarantines failed shards and re-enqueues their migration to HEAD" do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])

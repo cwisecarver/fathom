@@ -33,6 +33,16 @@ defmodule Fathom.Migrator.ReconcileJob do
         )
     end
 
+    # Expert review 2026-10-10 #4: a quarantine was permanent until an operator ran
+    # `retry_failed/0`, so a transient brownout froze a fleet slice at the old version for good.
+    # Requeue after a cool-off; a deterministically broken shard re-quarantines (one attempt per
+    # cool-off period, not a hot loop).
+    {:ok, requeued} = Migrator.retry_cooled_failed(failed_cool_off_ms())
+
+    if requeued > 0 do
+      Logger.warning("reconcile: re-enqueued #{requeued} cooled-off migration_failed shard(s)")
+    end
+
     {:ok, _count} = Migrator.rollout(batch_size())
 
     # Converge shards stranded ON a yanked version above HEAD (round-2 #22): a
@@ -51,6 +61,11 @@ defmodule Fathom.Migrator.ReconcileJob do
 
     :ok
   end
+
+  @default_failed_cool_off_ms :timer.minutes(15)
+
+  defp failed_cool_off_ms,
+    do: Application.get_env(:fathom, :migration_failed_cool_off_ms, @default_failed_cool_off_ms)
 
   defp batch_size, do: Application.get_env(:fathom, :reconcile_batch_size, @default_batch_size)
 end
