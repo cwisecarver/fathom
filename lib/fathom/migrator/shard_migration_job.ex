@@ -182,6 +182,18 @@ defmodule Fathom.Migrator.ShardMigrationJob do
   # did not count the quarantine. They now snooze (no attempt burned, stall visibility as for a held
   # lease) and never count toward quarantine. Everything not listed here keeps counting: an unknown
   # error is more likely a property of the shard than of the weather.
+  # Postgres condition names (Postgrex atoms) for a server that is shutting down, restarting, out of
+  # connection slots, or dropped our session: environmental, retry later.
+  @pg_transient_codes [
+    :admin_shutdown,
+    :crash_shutdown,
+    :cannot_connect_now,
+    :too_many_connections,
+    :connection_failure,
+    :connection_does_not_exist,
+    :sqlclient_unable_to_establish_sqlconnection
+  ]
+
   @doc false
   @spec transient?(term()) :: boolean()
   def transient?({tag, _}) when tag in [:lease_unavailable, :drain_failed, :fence_failed],
@@ -193,6 +205,21 @@ defmodule Fathom.Migrator.ShardMigrationJob do
     do: s3_status?(tag, status)
 
   def transient?(%DBConnection.ConnectionError{}), do: true
+
+  # Fix-review R3-3: transport-level failures from the S3 client (Req 0.7 raises/returns
+  # `Req.TransportError`; the Mint layer's own struct can surface unwrapped) are the network being
+  # unwell, not a property of the shard. Same for Postgres refusing/dropping connections.
+  def transient?(%Req.TransportError{}), do: true
+  def transient?(%Mint.TransportError{}), do: true
+
+  def transient?(%Postgrex.Error{postgres: %{code: code}}) when code in @pg_transient_codes,
+    do: true
+
+  # An S3 call whose error payload is the exception itself, e.g. `{:s3_get, %Req.TransportError{}}`.
+  def transient?({tag, %{__exception__: true} = e}) when is_atom(tag) do
+    String.starts_with?(Atom.to_string(tag), "s3_") and transient?(e)
+  end
+
   def transient?(reason) when reason in [:timeout, :closed, :econnrefused, :unavailable], do: true
   def transient?(_), do: false
 
@@ -204,7 +231,7 @@ defmodule Fathom.Migrator.ShardMigrationJob do
 
   # Oban's retry delay for the errors that DO count (expert review 2026-10-10 #4). The default is
   # ~15 s growing to minutes within 5 attempts — five attempts spent in four minutes. 30 s doubling,
-  # capped at 15 min, spreads the same attempts across about half an hour.
+  # capped at 15 min, spreads the same attempts across about 7.5 minutes (30+60+120+240 s between the 5 attempts).
   @impl Oban.Worker
   def backoff(%Oban.Job{attempt: attempt}) do
     min(30 * Integer.pow(2, max(attempt - 1, 0)), 900)

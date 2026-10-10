@@ -1102,6 +1102,26 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
       end
     end
 
+    # Fix-review R3-3. Symptom: a network-level S3 failure or a Postgres connection refusal fell
+    # through to `transient?(_) -> false`, burned attempts and quarantined healthy shards. Real
+    # structs, not hand-rolled maps, so a struct rename in a dependency fails here.
+    test "transport and Postgres connection errors are transient (real structs)" do
+      for r <- [
+            %Req.TransportError{reason: :econnrefused},
+            %Req.TransportError{reason: :timeout},
+            %Mint.TransportError{reason: :closed},
+            {:s3_get, %Req.TransportError{reason: :closed}},
+            %Postgrex.Error{postgres: %{code: :too_many_connections}},
+            %Postgrex.Error{postgres: %{code: :admin_shutdown}}
+          ] do
+        assert ShardMigrationJob.transient?(r), "#{inspect(r)} should be transient"
+      end
+
+      # A deterministic SQL error stays non-transient and keeps counting toward quarantine.
+      refute ShardMigrationJob.transient?(%Postgrex.Error{postgres: %{code: :unique_violation}})
+      refute ShardMigrationJob.transient?({:s3_get, %ArgumentError{}})
+    end
+
     # Symptom: a 5-minute S3 brownout burned all 5 attempts and QUARANTINED healthy shards.
     # Invariant: a transient error on the LAST attempt snoozes and leaves the shard active.
     test "a transient error on the final attempt does not quarantine", %{shard: shard} do
