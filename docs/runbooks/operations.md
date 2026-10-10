@@ -266,3 +266,23 @@ suspected-corrupt shard.
   local file is guarded from clobbering the last good S3 copy (the pre-flush integrity check,
   `[:fathom, :shard, :corrupt_flush]`). Pull the S3 copy, verify it, and treat the node's local file
   as suspect.
+
+## Notes: two compatibility edges from the 2026-10-10 hardening
+
+**Tenant values over 64 MiB are unreadable and unwritable (`SQLITE_TOOBIG`).** Tenant handles run
+with `SQLITE_LIMIT_LENGTH` = 64 MiB (plus tighter SQL-length, LIKE-pattern and expression-depth
+limits); internal handles — flush, snapshot, migration copy, fork — keep SQLite's defaults. A
+tenant that already stores a single string/blob/row larger than 64 MiB will see `SQLITE_TOOBIG` on
+reading or writing it through the data plane, even though the data is intact in the shard file and
+in S3. To read such a row, `mix fathom.shard pull` the object and open it with a stock `sqlite3`.
+Expert review 2026-10-10 R2-3.
+
+**Rolling back across the provenance-sidecar change quarantines warm copies.** The `<path>.etag`
+sidecar is now a fixed-width checksummed record (`FPV1 …`, expert review 2026-10-10 #6 / R2-5).
+Code from before commit 97f2ec9 reads it as a garbled etag, finds it differs from the store, and
+**quarantines the warm local copy** (`<db>.forked.<ts>`; the node then cold-pulls the stored
+object, so the cost is the un-flushed tail plus a cold open). After a rollback, expect that on the
+first warm open of every shard whose sidecar was rewritten by the new code; to avoid it, drain
+(`Shards.drain_all`) so every shard flushes and drops its local copy BEFORE rolling back. Forward
+(old sidecar → new code) is safe: a bare-etag sidecar is still read and is converted on the first
+durable write. Expert review 2026-10-10 R2-4.
