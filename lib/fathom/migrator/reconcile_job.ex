@@ -37,10 +37,17 @@ defmodule Fathom.Migrator.ReconcileJob do
     # `retry_failed/0`, so a transient brownout froze a fleet slice at the old version for good.
     # Requeue after a cool-off; a deterministically broken shard re-quarantines (one attempt per
     # cool-off period, not a hot loop).
-    {:ok, requeued} = Migrator.retry_cooled_failed(failed_cool_off_ms())
+    # Fix-review R3-2: best-effort. A Postgres blip here must not raise out of `perform/1` and skip
+    # the rollout/revert sweeps below; the next hourly run retries the requeue.
+    case safe_retry_cooled() do
+      {:ok, requeued} when requeued > 0 ->
+        Logger.warning("reconcile: re-enqueued #{requeued} cooled-off migration_failed shard(s)")
 
-    if requeued > 0 do
-      Logger.warning("reconcile: re-enqueued #{requeued} cooled-off migration_failed shard(s)")
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("reconcile: cool-off requeue failed (#{inspect(reason)}); continuing")
     end
 
     {:ok, _count} = Migrator.rollout(batch_size())
@@ -60,6 +67,14 @@ defmodule Fathom.Migrator.ReconcileJob do
     end
 
     :ok
+  end
+
+  defp safe_retry_cooled do
+    Migrator.retry_cooled_failed(failed_cool_off_ms())
+  rescue
+    e -> {:error, e}
+  catch
+    :exit, reason -> {:error, reason}
   end
 
   @default_failed_cool_off_ms :timer.minutes(15)

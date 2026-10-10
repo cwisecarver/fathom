@@ -1327,7 +1327,14 @@ defmodule Fathom.Migrator do
         # is the pre-existing contract: `retry_failed/0` returns `{:ok, 0}` with `head() == 0`
         # while still returning the shards to `active`, because "un-quarantine" and "enqueue a
         # migration" are separate halves and only the second needs a target.
-        _ = Directory.requeue_failed(Enum.map(chunk, &elem(&1, 0)))
+        ids = Enum.map(chunk, &elem(&1, 0))
+
+        # The cooled (automatic) path counts against the per-shard cap; the operator path resets it.
+        _ =
+          if cutoff,
+            do: Directory.requeue_cooled_failed(ids),
+            else: Directory.requeue_failed(ids)
+
         acc + enqueue_laggards(chunk, head)
       end)
 

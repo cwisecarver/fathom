@@ -425,6 +425,79 @@ defmodule Fathom.Migrator.RolloutTest do
     end
   end
 
+  # Fix-review R3-2. Symptom: the cool-off filtered on `updated_at`, which every touch bumps (the
+  # recorder's upsert, resolve, snapshot/retention stamps), so a HOT quarantined shard never cooled
+  # off. Invariant: the cool-off clock is `quarantined_at`, set only by mark_failed.
+  describe "cool-off requeue (fix-review R3-2)" do
+    defp backdate!(shard_id, fields) do
+      import Ecto.Query
+
+      Fathom.Repo.update_all(
+        from(s in Fathom.Directory.Shard, where: s.shard_id == ^shard_id),
+        set: fields
+      )
+    end
+
+    test "a quarantined shard that is still being touched cools off on quarantined_at" do
+      {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
+      {:ok, _} = Directory.resolve("hot")
+      {:ok, _} = Directory.mark_failed("hot")
+
+      long_ago = DateTime.add(DateTime.utc_now(), -3_600, :second)
+      # quarantined an hour ago, but touched just now (updated_at = now from the touch).
+      backdate!("hot", quarantined_at: long_ago, updated_at: DateTime.utc_now())
+
+      assert {:ok, 1} = Migrator.retry_cooled_failed(:timer.minutes(15))
+      assert {:ok, %{status: "active", requeue_count: 1}} = Directory.get("hot")
+    end
+
+    test "a shard quarantined just now is not requeued even if its updated_at is old" do
+      {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
+      {:ok, _} = Directory.resolve("fresh")
+      {:ok, _} = Directory.mark_failed("fresh")
+      backdate!("fresh", updated_at: DateTime.add(DateTime.utc_now(), -3_600, :second))
+
+      assert {:ok, 0} = Migrator.retry_cooled_failed(:timer.minutes(15))
+      assert {:ok, %{status: "migration_failed"}} = Directory.get("fresh")
+    end
+
+    test "automatic requeues are capped; retry_failed/0 resets the cap; a cutover resets it" do
+      {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
+      {:ok, _} = Directory.resolve("flap")
+
+      for round <- 1..3 do
+        {:ok, _} = Directory.mark_failed("flap")
+        assert {:ok, _} = Migrator.retry_cooled_failed(0), "round #{round} should requeue"
+        assert {:ok, %{status: "active", requeue_count: ^round}} = Directory.get("flap")
+      end
+
+      {:ok, _} = Directory.mark_failed("flap")
+      assert {:ok, 0} = Migrator.retry_cooled_failed(0), "the 4th auto requeue must be refused"
+      assert {:ok, %{status: "migration_failed", requeue_count: 3}} = Directory.get("flap")
+
+      assert {:ok, _} = Migrator.retry_failed()
+      assert {:ok, %{requeue_count: 0}} = Directory.get("flap")
+
+      {:ok, _} = Directory.mark_failed("flap")
+      {:ok, _} = Migrator.retry_cooled_failed(0)
+      assert {:ok, %{requeue_count: 1}} = Directory.get("flap")
+      {:ok, _} = Directory.cutover("flap", 2)
+      assert {:ok, %{requeue_count: 0}} = Directory.get("flap")
+    end
+
+    test "ReconcileJob survives a failing cool-off requeue and still runs the rollout" do
+      {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
+      {:ok, _} = Directory.resolve("lag")
+
+      # A non-integer cool-off makes the requeue raise (stands in for a Postgres error).
+      Application.put_env(:fathom, :migration_failed_cool_off_ms, :boom)
+      on_exit(fn -> Application.delete_env(:fathom, :migration_failed_cool_off_ms) end)
+
+      assert :ok = perform_job(ReconcileJob, %{})
+      assert_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => "lag", "target" => 2})
+    end
+  end
+
   describe "retry_failed/0" do
     test "un-quarantines failed shards and re-enqueues their migration to HEAD" do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])

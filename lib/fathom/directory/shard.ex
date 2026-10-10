@@ -87,6 +87,13 @@ defmodule Fathom.Directory.Shard do
     # The snapshot scheduler's rotation key, stamped on every ATTEMPT (expert review 2026-10-10 #14).
     field :last_snapshot_attempt_at, :utc_datetime_usec
 
+    # When `Directory.mark_failed/1` quarantined the shard (fix-review R3-2). Unlike `updated_at`,
+    # nothing else touches it, so the reconcile cool-off measures real time in quarantine even for
+    # a hot shard. `requeue_count` counts AUTOMATIC cool-off requeues (capped; reset by a cutover or
+    # an operator `retry_failed/0`).
+    field :quarantined_at, :utc_datetime_usec
+    field :requeue_count, :integer, default: 0
+
     timestamps(type: :utc_datetime_usec)
   end
 

@@ -24,6 +24,9 @@ defmodule Fathom.Directory do
   alias Fathom.Directory.Shard
   alias Fathom.Repo
 
+  # Automatic cool-off requeues allowed per quarantined shard (fix-review R3-2).
+  @auto_requeue_max 3
+
   # Page size for `stream_failed/1` (expert review 2026-08-26 #21). Matches `Fathom.Migrator`'s
   # `@enqueue_chunk` so the sweep requeues and enqueues in step. It bounds the HEAP — how many
   # rows exist at once — not a bind-parameter count; see `requeue_failed/1` for why that premise
@@ -534,6 +537,8 @@ defmodule Fathom.Directory do
       last_active_at: if(used_since_live?, do: DateTime.add(now, 1, :microsecond), else: now),
       cutover_at: now,
       migrating_since: nil,
+      # A success ends the auto-requeue streak (fix-review R3-2).
+      requeue_count: 0,
       # The retain intent is consumed by the cutover that records `retained_version` (#27).
       retaining_version: nil
     }
@@ -691,7 +696,7 @@ defmodule Fathom.Directory do
     do:
       guarded_update_shard(
         shard_id,
-        %{status: "migration_failed", migrating_since: nil},
+        %{status: "migration_failed", migrating_since: nil, quarantined_at: DateTime.utc_now()},
         ["active", "migrating"]
       )
 
@@ -1192,12 +1197,27 @@ defmodule Fathom.Directory do
     )
   end
 
-  # Only rows quarantined at or before `cutoff` (`mark_failed` stamps `updated_at`), for the
-  # reconcile job's cool-off requeue (expert review 2026-10-10 #4). nil = no restriction.
+  # Only rows quarantined at or before `cutoff`, for the reconcile job's cool-off requeue (expert
+  # review 2026-10-10 #4). nil = no restriction (the operator path).
+  #
+  # Fix-review R3-2: keyed on `quarantined_at` (stamped only by `mark_failed`), NOT `updated_at` —
+  # every touch (the recorder's upsert, resolve, snapshot/retention stamps) bumps `updated_at`, so a
+  # hot quarantined shard never cooled off. A NULL `quarantined_at` (a row quarantined before the
+  # column existed) counts as cooled. Rows that have used up their automatic requeues
+  # (`:migration_auto_requeue_max`, default #{@auto_requeue_max}) are skipped: a deterministic
+  # failure must not flap forever. An operator holds a shard quarantined by setting its
+  # `requeue_count` at/above that cap (`UPDATE shards SET requeue_count = 1000 WHERE shard_id = …`);
+  # `retry_failed/0` resets it.
   defp cooled_before(query, nil), do: query
 
-  defp cooled_before(query, %DateTime{} = cutoff),
-    do: from(s in query, where: s.updated_at <= ^cutoff)
+  defp cooled_before(query, %DateTime{} = cutoff) do
+    max = Application.get_env(:fathom, :migration_auto_requeue_max, @auto_requeue_max)
+
+    from(s in query,
+      where: is_nil(s.quarantined_at) or s.quarantined_at <= ^cutoff,
+      where: s.requeue_count < ^max
+    )
+  end
 
   @doc """
   Up to `limit` quarantined shard IDs, for a display that shows a sample rather than the set.
@@ -1419,7 +1439,7 @@ defmodule Fathom.Directory do
     {n, _} =
       Repo.update_all(
         from(s in Shard, where: s.status == "migration_failed"),
-        set: [status: "active", updated_at: DateTime.utc_now()]
+        set: [status: "active", requeue_count: 0, updated_at: DateTime.utc_now()]
       )
 
     n
@@ -1448,7 +1468,23 @@ defmodule Fathom.Directory do
     {n, _} =
       Repo.update_all(
         from(s in Shard, where: s.status == "migration_failed" and s.shard_id in ^shard_ids),
-        set: [status: "active", updated_at: DateTime.utc_now()]
+        set: [status: "active", requeue_count: 0, updated_at: DateTime.utc_now()]
+      )
+
+    n
+  end
+
+  @doc """
+  `requeue_failed/1` for the reconcile job's AUTOMATIC cool-off requeue: same un-quarantine, but it
+  counts against the shard's `requeue_count` cap instead of resetting it (fix-review R3-2).
+  """
+  @spec requeue_cooled_failed([String.t()]) :: non_neg_integer()
+  def requeue_cooled_failed(shard_ids) when is_list(shard_ids) do
+    {n, _} =
+      Repo.update_all(
+        from(s in Shard, where: s.status == "migration_failed" and s.shard_id in ^shard_ids),
+        set: [status: "active", updated_at: DateTime.utc_now()],
+        inc: [requeue_count: 1]
       )
 
     n
