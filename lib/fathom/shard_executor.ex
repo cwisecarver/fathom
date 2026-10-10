@@ -111,7 +111,7 @@ defmodule Fathom.ShardExecutor do
         # `reuse` is `:open` unless connection pooling handed back a warm handle for this scope
         # (docs/pooling-spike-plan.md); `obtain_conn/3` resets a reused one and falls back to a fresh
         # open if it will not reset cleanly, so a request never serves on a half-reset handle.
-        case obtain_conn(reuse, path, scope) do
+        case obtain_conn(reuse, path, scope, open_opts(shard_id, scope)) do
           {:ok, conn} ->
             # The scope rides the handle so execute/2 can enforce read-only across baton-resumes
             # and every stream on the connection.
@@ -130,18 +130,31 @@ defmodule Fathom.ShardExecutor do
   # A reused pooled handle is reset for the new stream; if it will not reset cleanly it is discarded
   # (closed) and a fresh one opened — never served half-reset. `:open` is the fresh-open path, byte
   # for byte what the non-pooled executor did.
-  defp obtain_conn({:reuse, conn}, path, scope) do
-    case Connection.reset_for_reuse(conn, scope) do
+  defp obtain_conn({:reuse, conn}, path, _scope, opts) do
+    case Connection.reset_for_reuse(conn, opts[:scope]) do
       :ok ->
         {:ok, conn}
 
       {:error, _reason} ->
         Connection.close(conn)
-        Connection.open(path, tenant?: true, scope: scope)
+        Connection.open(path, opts)
     end
   end
 
-  defp obtain_conn(:open, path, scope), do: Connection.open(path, tenant?: true, scope: scope)
+  defp obtain_conn(:open, path, _scope, opts), do: Connection.open(path, opts)
+
+  # Open options for a tenant handle. `block_user_version?` (expert review 2026-10-10 #15): under
+  # `:block_tenant_ddl`, a non-template shard's engine PRAGMA authorizer must not allow
+  # `user_version` assignment — the text gate (`user_version_write?/1`) only fires when the
+  # statement starts with "pragma". Resolved once at open, like `stream_opts/1`; a pooled handle
+  # keeps its open-time value (the guard is set-once per connection).
+  defp open_opts(shard_id, scope) do
+    [
+      tenant?: true,
+      scope: scope,
+      block_user_version?: block_tenant_ddl?() and not template?(shard_id)
+    ]
+  end
 
   @impl true
   def execute({_pid, _ref, _conn, shard_id, _scope, _ver, _opts} = handle, %Stmt{} = stmt) do

@@ -232,7 +232,34 @@ unsafe extern "C" fn install_guard(
         result_error(ctx, "fathom_pragma_guard: sqlite3_set_authorizer failed");
         return;
     }
+    apply_limits(db);
     ffi::sqlite3_result_int64(ctx, 1);
+}
+
+/// Per-connection SQLite size limits for a TENANT handle (expert review 2026-10-10 #2).
+///
+/// With no `sqlite3_limit` anywhere, `SQLITE_LIMIT_LENGTH` is its compile-time 1e9, so one
+/// statement (`SELECT length(randomblob(999999999))`) allocated ~917 MB on the node: the deadline
+/// bounds time and `soft_heap_limit` only sheds cache, so a single token, `:ro` included, could OOM
+/// every co-resident tenant. `sqlite3_limit` is lowering-only past the compile-time maximum and is
+/// per connection, so setting it here — in the same set-once, `SQLITE_DIRECTONLY` call that installs
+/// the authorizer — leaves coordinator/migrator/`VACUUM INTO` handles (which never call
+/// `fathom_pragma_guard`) on SQLite's defaults. A tenant cannot raise them: no SQL reaches
+/// `sqlite3_limit`, and a second `fathom_pragma_guard` call is ignored.
+pub const LIMIT_LENGTH: c_int = 64 * 1024 * 1024;
+pub const LIMIT_SQL_LENGTH: c_int = 16 * 1024 * 1024;
+pub const LIMIT_LIKE_PATTERN_LENGTH: c_int = 10_000;
+// EXPR_DEPTH is deliberately NOT lowered: Django builds left-associative OR/AND chains (hundreds of
+// Q objects), depth is not a memory lever, and this finding is about memory. SQLite's 1000 stays.
+
+unsafe fn apply_limits(db: *mut ffi::sqlite3) {
+    ffi::sqlite3_limit(db, ffi::SQLITE_LIMIT_LENGTH, LIMIT_LENGTH);
+    ffi::sqlite3_limit(db, ffi::SQLITE_LIMIT_SQL_LENGTH, LIMIT_SQL_LENGTH);
+    ffi::sqlite3_limit(
+        db,
+        ffi::SQLITE_LIMIT_LIKE_PATTERN_LENGTH,
+        LIMIT_LIKE_PATTERN_LENGTH,
+    );
 }
 
 unsafe extern "C" fn destroy(p: *mut c_void) {
@@ -408,5 +435,16 @@ mod tests {
             decide(ffi::SQLITE_PRAGMA, Some(b"foreign_keys"), None, None, &p),
             ffi::SQLITE_OK
         );
+    }
+
+    // The limits themselves are applied through the loadable-extension API, which is only
+    // initialised when SQLite loads the .so, so they are proved end to end in
+    // test/fathom/shard/connection_limits_test.exs. Here: the caps must stay below SQLite's
+    // defaults, or the guard call would RAISE a limit (expert review 2026-10-10 #2).
+    #[test]
+    fn limits_are_below_sqlite_defaults() {
+        assert!(LIMIT_LENGTH < 1_000_000_000);
+        assert!(LIMIT_SQL_LENGTH < 1_000_000_000);
+        assert!(LIMIT_LIKE_PATTERN_LENGTH <= 50_000);
     }
 }

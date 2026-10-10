@@ -61,11 +61,17 @@ defmodule Fathom.Shard.Connection do
 
     tenant? = Keyword.get(opts, :tenant?, false)
     scope = Keyword.get(opts, :scope, :rw)
+    guard_opts = [block_user_version?: Keyword.get(opts, :block_user_version?, false)]
 
     case open_handle(path, scope) do
-      {:ok, conn, :readonly} -> close_on_error(conn, configure_readonly(conn, tenant?))
-      {:ok, conn, :readwrite} -> close_on_error(conn, configure_readwrite(conn, tenant?, scope))
-      {:error, reason} -> {:error, reason}
+      {:ok, conn, :readonly} ->
+        close_on_error(conn, configure_readonly(conn, tenant?, guard_opts))
+
+      {:ok, conn, :readwrite} ->
+        close_on_error(conn, configure_readwrite(conn, tenant?, scope, guard_opts))
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -149,23 +155,23 @@ defmodule Fathom.Shard.Connection do
   # A read-only handle takes only the connection-local pragmas. The file-level ones
   # (`journal_mode`, `wal_autocheckpoint`) describe writes this handle cannot perform, and
   # `max_page_count` is a growth cap on a connection that cannot grow the file.
-  defp configure_readonly(conn, tenant?) do
+  defp configure_readonly(conn, tenant?, guard_opts) do
     with :ok <- Sqlite3.set_busy_timeout(conn, 5000),
          :ok <- maybe_foreign_keys(conn),
          :ok <- maybe_cache_size(conn),
          {:ok, ext} <- load_extension(conn, tenant?),
          :ok <- maybe_harden(conn, tenant?),
-         :ok <- maybe_authorizer(conn, tenant?, ext) do
+         :ok <- maybe_authorizer(conn, tenant?, ext, guard_opts) do
       {:ok, conn}
     end
   end
 
-  defp configure_readwrite(conn, tenant?, scope) do
+  defp configure_readwrite(conn, tenant?, scope, guard_opts) do
     with :ok <- configure(conn),
          {:ok, ext} <- load_extension(conn, tenant?),
          :ok <- maybe_harden(conn, tenant?),
          :ok <- maybe_query_only(conn, scope),
-         :ok <- maybe_authorizer(conn, tenant?, ext) do
+         :ok <- maybe_authorizer(conn, tenant?, ext, guard_opts) do
       {:ok, conn}
     end
   end
@@ -272,16 +278,27 @@ defmodule Fathom.Shard.Connection do
   #   * Fails the OPEN if it cannot be installed while the extension IS loaded: the alternative is a
   #     tenant handle with neither the pragma backstop nor exqlite's ATTACH deny.
   #   * Extension absent (`:skipped`): exqlite's ATTACH/DETACH authorizer, exactly as before.
-  defp maybe_authorizer(_conn, false, _ext), do: :ok
+  defp maybe_authorizer(_conn, false, _ext, _guard_opts), do: :ok
 
-  defp maybe_authorizer(conn, true, :skipped),
+  defp maybe_authorizer(conn, true, :skipped, _guard_opts),
     do: Sqlite3.set_authorizer(conn, [:attach, :detach])
 
-  defp maybe_authorizer(conn, true, :loaded), do: install_pragma_guard(conn)
+  defp maybe_authorizer(conn, true, :loaded, guard_opts),
+    do: install_pragma_guard(conn, guard_opts)
 
   # Bound, not interpolated: the operator's `:tenant_pragma_allow` reaches this SQL.
-  defp install_pragma_guard(conn) do
-    names = Enum.join(Fathom.ShardExecutor.tenant_pragma_assignable(), ",")
+  #
+  # `user_version` is dropped from the allow-list when the caller asks (expert review 2026-10-10
+  # #15): under `:block_tenant_ddl` a non-template tenant must not stamp the schema version, and the
+  # text gate catches only statements that START with "pragma". The engine sees the pragma however
+  # it is spelled.
+  defp install_pragma_guard(conn, guard_opts) do
+    assignable = Fathom.ShardExecutor.tenant_pragma_assignable()
+
+    names =
+      if guard_opts[:block_user_version?],
+        do: Enum.join(assignable -- ["user_version"], ","),
+        else: Enum.join(assignable, ",")
 
     with {:ok, stmt} <- Sqlite3.prepare(conn, "SELECT fathom_pragma_guard(?1, ?2)") do
       try do
