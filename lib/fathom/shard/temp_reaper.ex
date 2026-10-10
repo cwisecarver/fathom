@@ -82,9 +82,22 @@ defmodule Fathom.Shard.TempReaper do
   # coordinator, inverting "a wobble in one plane can't restart another". Every other reap path in
   # the codebase rescues; this now does too. Returns 0 on a failed pass — the next interval retries.
   defp do_sweep do
-    reaped = Storage.reap_stale_temps(Path.join(Shard.data_dir(), "*"), @stale_after_ms)
+    # ONE directory listing for every family -- the orphan temps and the three quarantine kinds
+    # used to be four separate `Path.wildcard` readdirs of the fleet-sized dir (expert review
+    # 2026-10-10 #P6). A listing that fails reads as an empty dir: this pass is a no-op, the next
+    # interval retries.
+    dir = Shard.data_dir()
+
+    names =
+      case File.ls(dir) do
+        {:ok, names} -> names
+        {:error, _} -> []
+      end
+
+    temps = for name <- names, Storage.temp_orphan?(name), do: Path.join(dir, name)
+    reaped = Storage.reap_named_temps(temps, @stale_after_ms)
     if reaped > 0, do: Logger.info("shard temp reaper: reaped #{reaped} orphaned temp(s)")
-    sweep_quarantines()
+    sweep_quarantines(Shard.quarantine_files_in(names, dir))
     reaped
   rescue
     e ->
@@ -104,8 +117,7 @@ defmodule Fathom.Shard.TempReaper do
   # retention they leak on local disk forever. Emit a GAUGE of the standing count (an alert can fire
   # on a growing backlog — complements the per-event `[:fathom,:shard,:fenced_quarantine]` counter),
   # then delete any older than the retention cap (default 30d; 0 keeps forever). Returns the count.
-  defp sweep_quarantines do
-    files = Shard.quarantine_files()
+  defp sweep_quarantines(files) do
     :telemetry.execute([:fathom, :shard, :quarantines], %{count: length(files)}, %{})
 
     case quarantine_retention_ms() do

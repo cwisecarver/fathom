@@ -103,4 +103,49 @@ defmodule Fathom.Shard.TempReaperTest do
            "the reaper crashed on a sweep raise — a persistent FS fault would crash-loop it and " <>
              "take the whole DataPlane down"
   end
+
+  # Expert review 2026-10-10 #P6. The sweep now lists the data dir ONCE and filters the names in
+  # memory for all four families (it used to run four wildcard readdirs). The in-memory predicates
+  # must select exactly what the globs did, or the reaper silently stops covering a family.
+  test "the single-listing filters select exactly what the wildcards did", %{path: path} do
+    dir = Path.dirname(path)
+    stem = Path.basename(path)
+
+    names =
+      for suffix <- [
+            ".snap.7",
+            ".pull.dl.9",
+            ".tmp.3",
+            ".z.5",
+            ".promote.2",
+            ".pull",
+            ".fenced.1",
+            ".forked.2-3",
+            ".corrupt.9-wal",
+            ".db.fenced.1",
+            ".db.forked.2-3",
+            ".db.corrupt.9-wal",
+            ".db-wal",
+            ".etag",
+            ""
+          ] do
+        stem <> suffix
+      end ++ [".hidden.snap.1", ".hidden.db.fenced.1", "plain.db"]
+
+    for n <- names, do: File.write!(Path.join(dir, n), "x")
+
+    by_glob_temps =
+      Path.wildcard(Path.join(dir, "*.{dl,snap,tmp,pull,z,promote}*")) |> Enum.sort()
+
+    by_list_temps =
+      for(n <- names, Fathom.Shard.Storage.temp_orphan?(n), do: Path.join(dir, n)) |> Enum.sort()
+
+    assert by_list_temps == by_glob_temps
+    assert by_glob_temps != [], "fixture matched nothing -- this test measured nothing"
+
+    assert Enum.sort(Shard.quarantine_files_in(names, dir)) ==
+             Enum.sort(Shard.quarantine_files(dir))
+
+    assert Shard.quarantine_files(dir) != []
+  end
 end

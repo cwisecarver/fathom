@@ -1474,6 +1474,18 @@ defmodule Fathom.Shard.Storage do
     end
   end
 
+  # The uniquely-suffixed orphan-temp families `reap_stale_temps/2` globs for. One enumerator so the
+  # reaper's single directory listing (`temp_orphan?/1`) cannot drift from the glob above.
+  @temp_orphan_markers [".dl", ".snap", ".tmp", ".pull", ".z", ".promote"]
+
+  @doc false
+  # The same predicate as `<dir>/*.{dl,snap,tmp,pull,z,promote}*` over a bare file NAME:
+  # `Path.wildcard` never matches a dotfile, and the marker may sit anywhere after the first
+  # character (expert review 2026-10-10 #P6).
+  @spec temp_orphan?(String.t()) :: boolean()
+  def temp_orphan?("." <> _), do: false
+  def temp_orphan?(name), do: String.contains?(name, @temp_orphan_markers)
+
   @doc """
   Reap a KNOWN, fixed set of sibling temp `paths` older than `older_than_ms` by a
   direct `File.stat`/`File.rm` on each — **no directory scan**. The O(1) counterpart

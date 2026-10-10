@@ -3949,6 +3949,18 @@ defmodule Fathom.Shard do
     for kind <- @quarantine_kinds, f <- Path.wildcard(Path.join(dir, "*.db.#{kind}.*")), do: f
   end
 
+  @doc false
+  # `quarantine_files/1` over an ALREADY-LISTED directory: the same `*.db.<kind>.*` match applied to
+  # bare file names, so the TempReaper's one `File.ls` serves the quarantine sweep too instead of
+  # three more full wildcard readdirs of a fleet-sized dir (expert review 2026-10-10 #P6).
+  @spec quarantine_files_in([String.t()], Path.t()) :: [Path.t()]
+  def quarantine_files_in(names, dir) do
+    for name <- names,
+        not String.starts_with?(name, "."),
+        Enum.any?(@quarantine_kinds, &String.contains?(name, ".db.#{&1}.")),
+        do: Path.join(dir, name)
+  end
+
   # Round-2 #26: spread the post-lapse revalidation fan-out across the jitter window.
   # The spread a lapse revalidation is jittered over, DERIVED FROM THE POPULATION being spread
   # (expert review 2026-08-26 #13b).
