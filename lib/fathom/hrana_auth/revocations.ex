@@ -264,9 +264,22 @@ defmodule Fathom.HranaAuth.Revocations do
         info
 
       :none ->
-        case Application.get_env(:fathom, :hrana_revocation_on_error, :fail_open) do
-          :fail_closed -> :unavailable
-          _ -> {0, nil}
+        # The directory (Postgres) is unreadable and this node has no cached floor. The durable
+        # storage floor is an INDEPENDENT source (mirrored on every revoke), so consult it before
+        # taking the blind posture (expert review 2026-10-10 #7): a PG blip on a cold shard (a
+        # failover/rebalance target) used to serve floor 0 and re-accept every revoked token even
+        # though S3 knew the floor. A positive storage floor is used as-is (not cached, like every
+        # error-path answer); only when storage ALSO yields nothing (error, or no floor recorded)
+        # does `:hrana_revocation_on_error` decide.
+        case storage_floor_result(shard_id) do
+          {:ok, v} when is_integer(v) and v > 0 ->
+            {v, nil}
+
+          _ ->
+            case Application.get_env(:fathom, :hrana_revocation_on_error, :fail_open) do
+              :fail_closed -> :unavailable
+              _ -> {0, nil}
+            end
         end
     end
   end
@@ -275,14 +288,18 @@ defmodule Fathom.HranaAuth.Revocations do
   # Best-effort: any error → 0, so a storage blip just falls back to the directory floor and never
   # locks out valid traffic (the running-node monotonic guard already covers the common restore case).
   defp storage_floor(shard_id) do
-    case Fathom.Shard.Storage.read_token_floor(shard_id) do
+    case storage_floor_result(shard_id) do
       {:ok, v} when is_integer(v) -> v
       _ -> 0
     end
+  end
+
+  defp storage_floor_result(shard_id) do
+    Fathom.Shard.Storage.read_token_floor(shard_id)
   rescue
-    _ -> 0
+    _ -> {:error, :storage_floor_read_failed}
   catch
-    :exit, _ -> 0
+    :exit, _ -> {:error, :storage_floor_read_failed}
   end
 
   defp stale_floor(shard_id) do

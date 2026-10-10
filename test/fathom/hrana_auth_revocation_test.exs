@@ -228,6 +228,51 @@ defmodule Fathom.HranaAuthRevocationTest do
     on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(owner) end)
   end
 
+  # Expert review 2026-10-10 #7 (SYMPTOM): on a directory (Postgres) read error with no cached floor
+  # the fallback returned {0, nil} without ever consulting the independent durable storage floor, so
+  # a PG blip on a cold shard (failover/rebalance target) re-accepted every revoked token. Invariant:
+  # PG down + storage floor known => the storage floor is served; fail open (or closed, per posture)
+  # only when BOTH sources yield nothing.
+  test "a directory outage on a cold shard serves the durable storage floor; fails open only when both fail" do
+    import ExUnit.CaptureLog
+
+    shard = uniq()
+    prev_ttl = Application.get_env(:fathom, :hrana_revocation_ttl_ms)
+    prev_posture = Application.get_env(:fathom, :hrana_revocation_on_error)
+    Application.put_env(:fathom, :hrana_revocation_ttl_ms, 0)
+    Application.delete_env(:fathom, :hrana_revocation_on_error)
+
+    on_exit(fn ->
+      if prev_ttl == nil,
+        do: Application.delete_env(:fathom, :hrana_revocation_ttl_ms),
+        else: Application.put_env(:fathom, :hrana_revocation_ttl_ms, prev_ttl)
+
+      if prev_posture == nil,
+        do: Application.delete_env(:fathom, :hrana_revocation_on_error),
+        else: Application.put_env(:fathom, :hrana_revocation_on_error, prev_posture)
+
+      File.rm(Path.join([Fathom.Shard.Storage.Local.dir(), "tokenfloors", shard]))
+    end)
+
+    :ok = Fathom.Shard.Storage.put_token_floor(shard, 7)
+    :ets.delete(Revocations, shard)
+    Ecto.Adapters.SQL.Sandbox.mode(Fathom.Repo, :manual)
+
+    capture_log(fn ->
+      assert Revocations.floor(shard) == 7,
+             "PG down + storage floor 7 must serve 7, not fail open to 0"
+
+      # Both sources yield nothing (no storage floor recorded for this shard): posture decides.
+      other = uniq()
+      assert Revocations.floor(other) == 0
+      Application.put_env(:fathom, :hrana_revocation_on_error, :fail_closed)
+      assert Revocations.floor(other) == :unavailable
+    end)
+
+    owner = Ecto.Adapters.SQL.Sandbox.start_owner!(Fathom.Repo, shared: true)
+    on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(owner) end)
+  end
+
   test "tokens sign with the dedicated secret, independent of secret_key_base" do
     shard = uniq()
     {:ok, _} = Directory.resolve(shard)
