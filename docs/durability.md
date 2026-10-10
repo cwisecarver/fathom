@@ -187,7 +187,9 @@ or copy-on-write page server (expert review 2026-07-14 #12).
   id) and preview/staging environments — the differentiator Turso/Neon/PlanetScale market.
 
 Snapshots are backend-uniform (Local + S3), so the whole path is testable without a real object
-store (`test/fathom/snapshots_test.exs`).
+store (`test/fathom/snapshots_test.exs`). Object listing (`ListObjectsV2`) refuses a page marked
+`IsTruncated=true` that carries no `NextContinuationToken` (`:list_truncated_without_token`), rather
+than returning a silently short listing.
 
 ### On a schedule (expert review 2026-08-01 #18)
 
@@ -202,11 +204,14 @@ Two fleet-singleton Oban crons now close it, **both off by default**:
 
 - **`Fathom.Snapshots.ScheduleJob`** (hourly) snapshots up to `SNAPSHOT_SCHEDULE_SAMPLE` shards per
   run, selecting **active shards that have flushed since their last snapshot**,
-  least-recently-snapshotted first (`Directory.sample_for_snapshot/1`, keyed off the
-  `last_snapshot_at` column). That predicate is the design: a snapshot is a server-side object
+  least-recently-attempted first (`Directory.sample_for_snapshot/1`, ordered by
+  `last_snapshot_attempt_at`, then `last_snapshot_at`). That predicate is the design: a snapshot is a server-side object
   COPY, so cost tracks **writes**, not tenant count — a million cold tenants that have not flushed
   cost nothing. `last_snapshot_at` is stamped only on success, so a failed snapshot stays at the
-  head of the rotation instead of being marked done for a full cycle.
+  head of the rotation instead of being marked done for a full cycle. The rotation key is
+  `last_snapshot_attempt_at`, stamped before each try, so a failing shard moves to the back rather
+  than holding a slot forever. Cron runs are deduplicated: an overlapping tick, or a second node's
+  cron, does not double the run.
 - **`Fathom.Snapshots.RetentionJob`** (hourly, offset 30 min) applies a grandfather-father-son
   policy (`SNAPSHOT_RETENTION`, e.g. `24h,7d,4w`). Before this, nothing ever dropped a
   `@snap-<id>` object — `RetirementJob` expires `@<version>` objects only — so enabling snapshots
@@ -290,7 +295,19 @@ the bucket underneath the fathom-managed snapshots above:
   `.lock`/`@version`/`@snap-` keys but should not hold broad `DeleteObject` on the live prefix —
   scope deletes to the version/snapshot keys the retirement/retention paths actually remove.
 
+## Tenant engine limits and the checkpoint gate
+
+Tenant handles (not the coordinator's own connection) carry SQLite limits from
+`native/fathom_udf/src/pragma_guard.rs`: `LENGTH` 64 MiB, `SQL_LENGTH` 16 MiB, and
+`LIKE_PATTERN_LENGTH` 10000. Under `:block_tenant_ddl`, the engine refuses `user_version` assignment on
+non-template tenant handles. A tenant's `wal_checkpoint` is allowed only as a bare read or in PASSIVE
+mode. The coordinator's flush runs `wal_checkpoint(TRUNCATE)` itself (`checkpoint_and_verify`), because
+a tenant looping TRUNCATE would churn the replication link.
+
 ## The dials
+
+- **`:fork_evidence_timeout_ms`** — bounds the overlapped fork-evidence HEAD taken during lease
+  acquisition. Default 5000 ms. A timeout or any error is `:unreachable`, which fails safe.
 
 - **`synchronous`** — `FULL` (default): per-commit fsync, local durability to a process crash.
   `NORMAL` trades that for fewer fsyncs (was the old default; FULL is ~free here, so there's little

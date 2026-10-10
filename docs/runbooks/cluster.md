@@ -28,6 +28,8 @@ alert rules + dashboards for these signals live in [`deploy/observability/`](../
 | `fathom.rebalancer.command.stop.count` | counter, tags `command`,`outcome` | Warm/drain command outcomes: `done` / `failed` / `cancelled`. `drain`+`failed` = thrash. |
 | `fathom.rebalancer.lb_apply.count` | counter, tag `outcome` | LB-map apply: `applied` / `noop` / `reload_failed` / `config_test_failed` / `write_failed`. **Routing-at-risk.** |
 | `fathom.rebalancer.reconcile.unpinned.count` | counter | Pins dropped because their node went dead (#1b) — dead-node reconcile rate. |
+| `fathom.replication.refused_coordinated.count` | counter | Replica frames refused because this node's coordinator holds the shard's lease (the sender was deposed). Any sustained rate means a zombie primary is still shipping. |
+| `fathom.shard.intent_adopted.count` | counter | Opens that adopted our own landed PUT (the sidecar lagged it) instead of quarantining the local copy. Benign alone; a rate means flushes are being interrupted between PUT and stamp. |
 
 **Export.** Metrics: pass `Fathom.Telemetry.metrics/0` to a reporter
 (`TelemetryMetricsPrometheus`, `TelemetryMetricsStatsd`, or a `ConsoleReporter` in dev) — none

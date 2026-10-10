@@ -64,6 +64,13 @@ Signing is **per shard**, so rotating a shard's signing element revokes every ou
 Tokens **don't expire by default**; set `:hrana_token_max_age` to bound their lifetime — a node running
 `:required` with an infinite `max_age` logs a loud boot warning (#24).
 
+**Revocation-read posture (`:hrana_revocation_on_error`, default `:fail_open`).** This governs a
+directory floor read that fails when the node has no cached floor for the shard at all. `:fail_open`
+consults the durable storage floor, and otherwise uses floor `0`, so a revoked token can be accepted
+until the directory is readable again. `:fail_closed` returns `:unavailable` and refuses the token; it
+never answers from the storage floor, which can lag the directory. A last-known-good cached value is
+served under both postures.
+
 ## Token lifecycle: rotate, revoke, scope (#24)
 
 A token embeds the shard's **version** (`v`), and `verify` accepts it while `v` clears the shard's

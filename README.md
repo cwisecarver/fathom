@@ -69,7 +69,7 @@ imports at all. See [`docs/quickstart-django.md`](docs/quickstart-django.md).
 
 Fathom is a multi-tenant sharded data platform built on Phoenix: **one SQLite database per shard** (targeting millions), served to unchanged libSQL clients — e.g. an unchanged Django app via `django-libsql` — over the [Hrana wire protocol](https://github.com/libsql/hrana-client-ts/blob/main/HRANA_3_SPEC.md) via the [Filo](https://github.com/cwisecarver/filo) library.
 
-Filo speaks HTTP Hrana v1/v2/v3 (including cursor) and WebSocket hrana1/2/3. The Hrana listener runs on port 8080 (separate from the Phoenix dashboard on 4000). The target shard is derived from the `Host` subdomain (`acme.fathom.example` → shard `acme`), with `?db=` and `x-fathom-shard` as **dev-only** fallbacks (gated by `:allow_shard_override`, off in prod). Per-shard bearer-token auth (`Phoenix.Token`, presented as libSQL's `authToken`) is available via `HRANA_AUTH=required`; with it disabled (the default) the trust boundary is the network — the port must be LB-only-reachable (see [`docs/deploy-cluster.md`](docs/deploy-cluster.md)).
+Filo speaks HTTP Hrana v1/v2/v3 (including cursor) and WebSocket hrana1/2/3. The Hrana listener runs on port 8080 (separate from the Phoenix dashboard on 4000). The target shard is derived from the `Host` subdomain (`acme.fathom.example` → shard `acme`), with `?db=` and `x-fathom-shard` as **dev-only** fallbacks (gated by `:allow_shard_override`, off in prod). Per-shard bearer-token auth (`Phoenix.Token`, presented as libSQL's `authToken`) is available via `HRANA_AUTH=required`; with it disabled the trust boundary is the network — the port must be LB-only-reachable (see [`docs/deploy-cluster.md`](docs/deploy-cluster.md)). `:disabled` is the dev/test default; prod refuses to boot unless `HRANA_AUTH` is set explicitly to `required` or `disabled`.
 
 **New here?** Jump to [Getting started](#getting-started). Contributing? See [`CONTRIBUTING.md`](CONTRIBUTING.md). The full map of the project is the docs index, [`docs/README.md`](docs/README.md).
 
@@ -174,7 +174,7 @@ Full story: [`docs/tenant-lifecycle.md`](docs/tenant-lifecycle.md).
 
 ### Auth
 
-`Fathom.HranaAuth` gates the data path, controlled by `:hrana_auth` (`:disabled` by default; `HRANA_AUTH=required` in prod). A per-shard `Phoenix.Token` (minted via `mix fathom.token <shard>`) is presented as libSQL's `authToken` on Filo's `:authorize` seam. Tokens support **zero-downtime rotation** (a grace window keeps the previous version valid), immediate **revoke**, and a **read-only scope** (`token_for(id, scope: :ro)` → any write on that token is 403). With auth disabled the trust boundary is the network. Full story: [`docs/auth.md`](docs/auth.md).
+`Fathom.HranaAuth` gates the data path, controlled by `:hrana_auth` (`:disabled` by default in dev/test; in prod `HRANA_AUTH` must be set explicitly to `required` or `disabled`). A per-shard `Phoenix.Token` (minted via `mix fathom.token <shard>`) is presented as libSQL's `authToken` on Filo's `:authorize` seam. Tokens support **zero-downtime rotation** (a grace window keeps the previous version valid), immediate **revoke**, and a **read-only scope** (`token_for(id, scope: :ro)` → any write on that token is 403). With auth disabled the trust boundary is the network. Full story: [`docs/auth.md`](docs/auth.md).
 
 ### Control-plane API & admin dashboard
 

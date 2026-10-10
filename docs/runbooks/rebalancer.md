@@ -27,8 +27,8 @@ known-good full config to copy from.
 
 1. **Trust boundary (expert review #17).** The hot decision trusts `q_per_s`, a signal a tenant
    controls from the data path. Enabling the rebalancer presumes the Hrana boundary is enforced:
-   either **LB-only network reachability** (the default `HRANA_AUTH=disabled` posture — see
-   `docs/deploy-cluster.md`) or `HRANA_AUTH=required`. Without it, an LB-reachable caller can
+   either **LB-only network reachability** (the `HRANA_AUTH=disabled` posture, which prod requires
+   you to set explicitly — see `docs/deploy-cluster.md`) or `HRANA_AUTH=required`. Without it, an LB-reachable caller can
    drive a shard they don't own over the bar and induce a handoff (a brief drain blip on the
    victim). **Do not enable on a data path open to untrusted callers.**
 2. **NTP (expert review #15).** The per-node load samples order/prune on the reporter's wall
@@ -118,7 +118,8 @@ If it proposes nothing hot enough to move, that's expected on a balanced fleet.
 COMMAND_POLLER=true
 ```
 
-Each node now executes `warm`/`drain` commands addressed to its `NODE_KEY`. **Enable this before
+Each node now executes `drain` and `drain_for_migration` commands addressed to its `NODE_KEY` (`warm`
+was removed 2026-09-14). **Enable this before
 Stage 4** — a handoff issues commands that a node must be able to run; with the poller off,
 handoffs would stall and revert. No commands exist yet, so this is inert until Stage 4. Confirm
 the poller is up (a node log line or a healthy process); no errors.

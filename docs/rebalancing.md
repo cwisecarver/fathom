@@ -90,7 +90,9 @@ and briefly retries. **Failure handling is careful:** if the flip can't apply, t
 "Warm the target" and "drain the source" are instructions for *other* nodes, which the orchestrator
 can't RPC. They travel over a **`rebalance_commands` Postgres channel** + a per-node
 `Rebalancer.CommandPoller` (each node polls Postgres for commands addressed to it, gated
-`:command_poller`). The LB reload itself: the app writes the exception map to a shared dir; on the
+`:command_poller`). The command types are `drain` and `drain_for_migration`: the second is the same
+drain, issued by `Fathom.Migrator.ShardMigration` when a migration or revert finds the shard's lease held by
+a coordinator on another node. It differs from `drain` only in that it needs no active rebalance pin. The LB reload itself: the app writes the exception map to a shared dir; on the
 chaos rig an `lb-reloader` sidecar shares nginx's PID namespace and HUPs the master on a map change
 (no host bridge), while a real deploy uses `LB_RELOAD_CMD`. Everything routes through Postgres + a
 shared file + the lease — never node-to-node.

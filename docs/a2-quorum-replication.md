@@ -575,6 +575,27 @@ the RTT sweep above.
 - **Cost added:** every commit waits for ≥2 follower acks — a network round trip on the write path
   that does not exist today. Must be measured against `hrana_rt_us` before committing to it.
 
+## Dead-peer detection and the coordinated-shard refusal
+
+**TCP keepalive.** Both replication ends enable keepalive (`Fathom.Shard.Replication.Keepalive`). The
+follower's reader does a blocking `recv` with no timeout, by design, so a hard peer loss (power,
+kernel panic, a partition that drops rather than resets) would otherwise leave the connection
+half-open indefinitely. Defaults: idle 30 s, a probe every 10 s, dead after 3 unanswered probes, so
+about 60 s to notice. Overrides: `:replication_keepalive_idle_s`, `:replication_keepalive_interval_s`
+and `:replication_keepalive_count`; `idle_s: 0` keeps plain keepalive only. The tuned values are raw
+socket options on Linux and Darwin. Other OSes get plain `keepalive: true` with OS-default timers.
+If the OS rejects the options (`einval`), the socket steps down to plain keepalive, then to none. A
+keepalive problem costs detection speed, never startup.
+
+**Refusing a deposed owner.** The follower refuses `Push` and `SeedBegin` for a shard whose local
+coordinator holds the lease. The coordinator's registry entry is marked `:lease_held` once
+`acquire_lease` succeeds. The reply is `:stale_epoch`, and `fathom.replication.refused_coordinated`
+is emitted. A coordinator that is registered but still acquiring is not refused, because its owner
+may still be shipping legitimately. Scope limit: the check reads only this node's registry, so it
+catches a zombie primary on the follower's own node. A deposed owner on another node is not caught
+by it. The check is off unless the caller passes `:coordinator_registry`, which `Fleet` does and
+loopback tests do not.
+
 ## Decision gate
 
 ~~3. The BEAM-cluster reversal is accepted explicitly.~~ **Accepted 2026-08-08** — the "S3 is the

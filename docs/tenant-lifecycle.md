@@ -126,8 +126,9 @@ no format to build. It reflects the last flush (an active shard may have newer w
 coordinator; drain or let it idle for the very latest — the same caveat as a snapshot).
 
 `GET /admin/tenants/:id/export` (BasicAuth, `AdminTenantController`) streams the file via
-`send_download` through the `:4000` admin endpoint and **deletes the temp afterward**, so an exported
-copy never lingers. It's served through the operator boundary, never a public presigned URL (a
+`send_download` through the `:4000` admin endpoint and then **removes the whole 0700 export directory**
+(each export gets a fresh one), so an exported copy never lingers. `Tenants.export/1` removes that
+directory too on any failure, including a raise, so a failed export leaves nothing behind. It's served through the operator boundary, never a public presigned URL (a
 presigned-GET path for very large shards is a possible follow-up). The `:id` is validated by
 `ShardId.cast`, so a path-traversal id is a 400, not a file read.
 
@@ -187,12 +188,15 @@ legal-hold tenant. It's the reversible sibling of delete's tombstone:
 
 ```
 suspend(id):
-  Directory.suspend(id)             # status -> suspended (refuses a deleted tenant)
+  Directory.suspend(id)             # status -> suspended (refuses a deleted tenant; an already-suspended
+                                    #   row is a no-op; any other non-active row, e.g. migrating,
+                                    #   is refused with :status_conflict)
   broadcast (ETS gate + notify)     # every node denies NEW streams now
   Shards.drain(id)                  # graceful: in-flight txns finish, coordinator stops
 
 resume(id):
-  Directory.resume(id)              # status -> active
+  Directory.resume(id)              # status -> active (refuses any row that is not suspended, with
+                                    #   :status_conflict)
   broadcast (ETS gate + notify)     # gate stops denying; next request cold-opens fresh
 ```
 
@@ -203,6 +207,10 @@ resume converges. It's checked O(1) in `Fathom.Shards.ensure/1`, alongside the t
 **every** checkout — so a suspended (or deleted) tenant is refused a new stream even if a coordinator
 is still running. A suspended open surfaces a distinct **403 `FILO_TENANT_SUSPENDED`** (a retry won't
 help — an operator must resume); a deleted open is **410 `FILO_TENANT_DELETED`**.
+
+The deny is also re-checked on **every statement**: `Fathom.ShardExecutor` runs `lifecycle_denied/1`
+(tombstone and suspension, both O(1) ETS reads) in `execute` and `execute_sequence`, so a stream that
+outlives the suspend drain is refused at its next statement rather than served until it closes.
 
 Suspend denies new streams fleet-wide immediately and graceful-drains the home coordinator, so
 in-flight transactions finish but nothing new opens. It does not delete data — resume brings the
