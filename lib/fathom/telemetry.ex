@@ -428,6 +428,14 @@ defmodule Fathom.Telemetry do
         description:
           "Replica pushes refused because another connection held the shard's replica lock"
       ),
+      # Expert review 2026-10-10 #1. A push or seed refused because this node's own coordinator
+      # holds the shard's lease — the sender is a deposed owner. Any sustained rate means a
+      # zombie primary is still shipping.
+      counter("fathom.replication.refused_coordinated.count",
+        event_name: [:fathom, :replication, :refused_coordinated],
+        description:
+          "Replica frames refused because this node's coordinator holds the shard's lease (the sender was deposed)"
+      ),
       counter("fathom.shard.flush_gate.reclaimed.count",
         event_name: [:fathom, :shard, :flush_gate, :reclaimed],
         description:
@@ -715,6 +723,14 @@ defmodule Fathom.Telemetry do
         event_name: [:fathom, :shard, :forked],
         description:
           "Local shard copies found FORKED from the stored lineage and quarantined to a .forked.<ts> file (#2) — a peer advanced the object while this node held divergent writes. The forked writes survive in that file but are NOT in the tenant's database; recovery is manual. Any occurrence is page-worthy"
+      ),
+      # Expert review 2026-10-10 #6. The stored object matched our own pre-PUT md5 intent, so a
+      # sidecar that lagged our landed PUT was re-stamped instead of quarantining the copy.
+      # Benign by itself; a rate means flushes are being interrupted between PUT and stamp.
+      counter("fathom.shard.intent_adopted.count",
+        event_name: [:fathom, :shard, :intent_adopted],
+        description:
+          "Opens that adopted our own landed PUT (sidecar lagged it) instead of quarantining the local copy"
       ),
       counter("fathom.shard.write_fenced.count",
         event_name: [:fathom, :shard, :write_fenced],
