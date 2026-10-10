@@ -1444,6 +1444,75 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  # Ranged GET of the object's first @header_range bytes, stream-decoded just far enough to reach
+  # the SQLite header (expert review 2026-10-10 R3-5). The fork path used to pull the WHOLE object
+  # to a scratch file to read four bytes. The object is codec-encoded, so a raw byte range cannot
+  # be read directly: zstd emits output per block (<=128 KiB decoded, so a 256 KiB compressed
+  # prefix always yields one) and zlib per input chunk. A truncated prefix is not a decode error
+  # (see Codec.init/1); we only read the first 100 decoded bytes, and the full-object md5 is not
+  # checked here — this is a version read for stamping a fresh fork, not a data path.
+  @header_range 262_144
+  @impl true
+  def object_user_version(shard_id) do
+    result =
+      Req.get(req(),
+        url: object_path(shard_id),
+        headers: [{"range", "bytes=0-#{@header_range - 1}"}],
+        decode_body: false
+      )
+
+    case result do
+      {:ok, %{status: status, headers: h, body: body}} when status in [200, 206] ->
+        # A steal sentinel is a placeholder, not a database: no object, as pull/2 reports it.
+        if sentinel_response?(h),
+          do: {:absent, nil},
+          else: header_version(body, meta_enc(h))
+
+      {:ok, %{status: 404}} ->
+        {:absent, nil}
+
+      {:ok, %{status: status}} ->
+        {:error, {:s3_ranged_get_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp header_version(body, marker) when is_binary(body) do
+    with {:ok, enc} <- Codec.decoder(marker) do
+      prefix = binary_part(body, 0, min(byte_size(body), @header_range))
+      ctx = Codec.init(enc)
+
+      try do
+        # Keep only the first 100 decoded bytes; a high-ratio prefix never accumulates.
+        keep = fn piece, acc ->
+          need = 100 - byte_size(acc)
+
+          if need <= 0 do
+            acc
+          else
+            bin = IO.iodata_to_binary(piece)
+            acc <> binary_part(bin, 0, min(need, byte_size(bin)))
+          end
+        end
+
+        case Codec.inflate_into(ctx, prefix, keep, <<>>) do
+          {:ok, <<"SQLite format 3\0", _::binary-size(44), v::signed-big-32, _::binary>>} ->
+            {:ok, v}
+
+          {:ok, other} when is_binary(other) ->
+            {:error, {:header_unreachable, byte_size(other)}}
+
+          {:error, reason} ->
+            {:error, {:header_unreachable, reason}}
+        end
+      after
+        Codec.release(ctx)
+      end
+    end
+  end
+
   # --- versioned copies (blue/green migration) ---
 
   # Refuse a server-side copy whose SOURCE is a steal sentinel (expert review 2026-08-01 #25).

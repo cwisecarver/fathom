@@ -270,6 +270,16 @@ defmodule Fathom.Shard.Storage.Local do
     end
   end
 
+  # Local objects are stored raw (no codec), so the header is a plain pread.
+  @impl true
+  def object_user_version(shard_id) do
+    case Fathom.Shard.SqliteHeader.user_version(remote_path(shard_id)) do
+      {:ok, v} -> {:ok, v}
+      {:error, :enoent} -> {:absent, nil}
+      {:error, _} = error -> error
+    end
+  end
+
   # THE ONLY object hasher in this module, and the digest every fence in it compares.
   #
   # It computes SHA-256 by STREAMING the file rather than reading it whole into a binary (expert

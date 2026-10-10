@@ -311,6 +311,14 @@ defmodule Fathom.Shard.Storage do
                | nil}
               | {:error, term()}
 
+  # The stored database's `PRAGMA user_version`, read from its 100-byte header WITHOUT pulling the
+  # object (expert review 2026-10-10 R3-5). S3 objects are zstd/zlib-encoded, so the header is not
+  # at a raw byte offset: the S3 backend does a ranged GET of the first bytes and stream-decodes
+  # just enough to reach it. `{:error, {:header_unreachable, _}}` means the prefix did not decode
+  # to 100 bytes (the caller falls back to a full pull); `{:absent, nil}` is no object.
+  @callback object_user_version(shard_id :: String.t()) ::
+              {:ok, integer()} | {:absent, nil} | {:error, term()}
+
   @callback acquire_lease(shard_id :: String.t(), owner :: String.t(), ttl_ms :: pos_integer()) ::
               {:ok, lease()}
               | {:error, {:held, String.t() | :unknown, integer() | nil}}
@@ -747,6 +755,10 @@ defmodule Fathom.Shard.Storage do
            %{etag: String.t() | nil, position: position() | nil, md5: String.t() | nil} | nil}
           | {:error, term()}
   def object_head(shard_id), do: backend().object_head(shard_id)
+
+  @doc "The stored object's `user_version` without pulling it. See the callback."
+  @spec object_user_version(String.t()) :: {:ok, integer()} | {:absent, nil} | {:error, term()}
+  def object_user_version(shard_id), do: backend().object_user_version(shard_id)
 
   @doc """
   Acquires `shard_id`'s lease for `owner` with a `ttl_ms` window. Returns

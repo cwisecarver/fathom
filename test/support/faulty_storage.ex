@@ -296,6 +296,9 @@ defmodule Fathom.Test.FaultyStorage do
     end
   end
 
+  @impl true
+  def object_user_version(shard_id), do: Local.object_user_version(shard_id)
+
   # Counts calls so the fault can fire on the RE-read rather than the first one — the first read
   # is what the promote decision is made against, so moving it would test nothing.
   defp bump_head_reads do

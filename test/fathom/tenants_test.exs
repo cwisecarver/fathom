@@ -378,6 +378,39 @@ defmodule Fathom.TenantsTest do
       assert {:ok, %{schema_version: 3}} = Directory.get(dst)
     end
 
+    # Symptom (expert review 2026-10-10 R3-5): registering a fork read the copy's schema version by
+    # pulling the WHOLE object to a scratch file to read four header bytes. Invariant: the version
+    # comes from `Storage.object_user_version/1`, so the happy path never pulls the dst object.
+    test "register_fork reads the version from the header without pulling the object",
+         %{id: src, dst: dst} do
+      prev = Application.get_env(:fathom, :shard_storage)
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      test = self()
+
+      Application.put_env(
+        :fathom,
+        :faulty_before,
+        {:pull, fn id -> send(test, {:pulled, id}) end}
+      )
+
+      on_exit(fn ->
+        Application.delete_env(:fathom, :faulty_before)
+
+        if prev,
+          do: Application.put_env(:fathom, :shard_storage, prev),
+          else: Application.delete_env(:fathom, :shard_storage)
+      end)
+
+      {:ok, _} = Directory.resolve(src)
+      write!(src, ["CREATE TABLE t (v TEXT)", "PRAGMA user_version = 3"])
+      flush!(src)
+      :ok = Storage.fork_shard(src, dst)
+
+      assert :ok = Tenants.register_fork(dst)
+      assert {:ok, %{schema_version: 3}} = Directory.get(dst)
+      refute_received {:pulled, ^dst}, "register_fork pulled the whole dst object for 4 bytes"
+    end
+
     # Symptom (expert review 2026-10-10 #20): register_fork discarded cutover's result, so a dst that
     # could not be stamped (here: suspended between copy and register, `:status_conflict`) still
     # reported a successful fork. It must surface the error.

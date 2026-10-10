@@ -596,8 +596,21 @@ defmodule Fathom.Tenants do
   defp row_or_error({:ok, row}), do: {:ok, row}
   defp row_or_error(_), do: {:error, :not_found}
 
-  # The dst object's `user_version`, read from its header after pulling it to a scratch file.
+  # The dst object's `user_version`, read from its header (expert review 2026-10-10 R3-5). This used
+  # to pull the WHOLE object to a scratch file to read four bytes; `Storage.object_user_version/1`
+  # reads just the header (S3: a ranged GET stream-decoded through the object's codec). Only when
+  # the header cannot be reached that way (a prefix that does not decode to 100 bytes) do we fall
+  # back to the full pull, so the fast path can never make a fork fail that used to succeed.
   defp copied_version(dst) do
+    case Storage.object_user_version(dst) do
+      {:ok, v} -> {:ok, v}
+      {:absent, _} -> {:error, :dst_object_missing}
+      {:error, {:header_unreachable, _}} -> copied_version_by_pull(dst)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp copied_version_by_pull(dst) do
     tmp =
       Path.join(
         System.tmp_dir!(),
