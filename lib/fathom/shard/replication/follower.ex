@@ -2012,12 +2012,24 @@ defmodule Fathom.Shard.Replication.Follower do
   # `TRUNCATE` rather than PASSIVE so the WAL is actually emptied and cannot be re-applied on top of
   # the new generation we are about to write into the same file. The `-shm` goes with it: a stale
   # shared-memory index describes a WAL that no longer exists, and SQLite trusts it.
-  defp checkpoint_into_db(db) do
+  #
+  # THE RESULT ROW IS CHECKED, NOT JUST THE CALL (2026-10-09, found while fixing expert review
+  # 2026-10-08 #5). The pragma returns `{:ok, [[busy, log, checkpointed]]}` even when it could not
+  # finish: a reader holding an older snapshot (a peer-recovery or promote read on this replica)
+  # stops the backfill at its mark, leaving `checkpointed < log`. Any `{:ok, _}` used to count as
+  # absorbed, so the caller cleared `torn` and the reset then truncated the WAL holding the frames
+  # that never reached the `.db` — a replica marked whole and promotable, silently missing pages.
+  # `busy = 1` with every frame backfilled is fine (the reset rewrites the WAL itself), so the test
+  # is `log == checkpointed`. Same defect class as `Migrator.Copy`'s fold (review #25, 73d95f6).
+  @doc false
+  @spec checkpoint_into_db(Path.t()) :: :ok | {:error, term()}
+  def checkpoint_into_db(db) do
     case Connection.open(db) do
       {:ok, conn} ->
         try do
           case Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", []) do
-            {:ok, _} -> :ok
+            {:ok, %{rows: [[_busy, log, log]]}} -> :ok
+            {:ok, %{rows: [row]}} -> {:error, {:absorb_incomplete, row}}
             {:error, reason} -> {:error, {:checkpoint_failed, reason}}
           end
         after
