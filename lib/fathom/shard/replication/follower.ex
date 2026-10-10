@@ -63,6 +63,173 @@ defmodule Fathom.Shard.Replication.Follower do
   @spec table(atom()) :: atom()
   def table(name \\ __MODULE__), do: Module.concat(name, Shards)
 
+  @doc false
+  # The per-shard mutex table (expert review 2026-10-08 #5). Separate from `table/1` so the lock
+  # rows can never be mistaken for state rows by `replica_shard_ids/1`'s `tab2list`.
+  @spec locks(atom()) :: atom()
+  def locks(name \\ __MODULE__), do: Module.concat(name, ShardLocks)
+
+  # ------------------------------------------------------------------------------------------
+  # the per-shard lock
+  # ------------------------------------------------------------------------------------------
+  #
+  # ONE SHARD'S REPLICA IS MUTATED BY ONE PROCESS AT A TIME, NODE-WIDE (expert review 2026-10-08
+  # #5 tiers b+c, and #13).
+  #
+  # Per-shard workers (c61cbe3) keep one shard's frames in order WITHIN a connection, and that was
+  # the only serialization there was. A primary that reconnects gets a NEW connection with new
+  # workers while the old connection's workers may still be executing a frame, so two processes
+  # could each read the state, decide, write the WAL and put the state for the same shard — the
+  # old one truncating a WAL the new one had just appended to and acked, or rolling `next_offset`
+  # back. Seeds made it worse: a seed spans many frames, and a second connection's `seed_begin`
+  # truncated the first's temp file in place. `Promote.stage/4` copied the `.db` and the `-wal` with
+  # no coordination at all, so a deposed owner's reset push could land between the two copies.
+  #
+  # A row `{shard_id, holder_pid, acquired_at_ms}` in a `:public` ETS table owned by the Follower,
+  # taken with `:ets.insert_new/2` and released with `:ets.delete_object/2` of the exact row — one
+  # ETS op pair per push on the uncontended path, which is every push of single-connection
+  # operation. Held around:
+  #
+  #   * one push — decide, absorb, write, put_state (`handle_push/2`);
+  #   * one whole seed — `seed_begin` until its install or discard, across many frames (the seed's
+  #     state carries the token);
+  #   * a promotion's fence-and-copy (`with_shard_lock/4` from `Promote.stage/4`).
+  #
+  # RE-ENTRANT for the holder: a worker that holds a shard's seed lock and gets a push for the same
+  # shard on the same connection proceeds exactly as it did before this lock existed.
+  #
+  # A HOLDER CANNOT LEAK IT. A contender that finds the row held by a DEAD process (a worker killed
+  # by `close_connection/1`'s `@worker_stop_ms`, a crashed Recovery pull) or one older than
+  # `:replication_shard_lock_max_ms` (a seed on a half-open connection whose reader never sees the
+  # close) deletes that exact row and takes the lock. The age takeover is what makes unique seed
+  # temps (tier c) necessary rather than tidy: the overtaken holder may still be alive, so its
+  # files must be its own, and its install re-checks ownership before renaming anything.
+  #
+  # CONTENTION IS A BOUNDED WAIT, THEN A REFUSAL. A push waits `:replication_shard_lock_wait_ms`
+  # and is then refused `:internal` — a reject the primary already settles and re-plans from on its
+  # next commit (`Session`'s `@settled_rejects`), so no wire change and no new reason. Kept short
+  # because the waiting worker also serves every other shard hashed to it.
+  @default_lock_wait_ms 50
+  @default_lock_max_ms 180_000
+
+  @typedoc "Proof of holding a shard's lock, handed back to `unlock_shard/2`."
+  @type lock_token :: {:held, {String.t(), pid(), integer()}} | :reentrant
+
+  @doc false
+  @spec lock_shard(atom(), String.t(), non_neg_integer()) ::
+          {:ok, lock_token()} | {:error, :busy | :follower_stopped}
+  def lock_shard(name, shard_id, wait_ms) do
+    acquire_lock(locks(name), shard_id, System.monotonic_time(:millisecond) + wait_ms)
+  rescue
+    ArgumentError -> {:error, :follower_stopped}
+  end
+
+  defp acquire_lock(tab, shard_id, deadline) do
+    me = self()
+    now = System.monotonic_time(:millisecond)
+    row = {shard_id, me, now}
+
+    if :ets.insert_new(tab, row) do
+      {:ok, {:held, row}}
+    else
+      case :ets.lookup(tab, shard_id) do
+        [{_, ^me, _}] ->
+          {:ok, :reentrant}
+
+        # Released between the two calls.
+        [] ->
+          acquire_lock(tab, shard_id, deadline)
+
+        [{_, holder, at} = held] ->
+          cond do
+            abandoned_lock?(holder, at, now) ->
+              Logger.warning(
+                "replication: taking over #{shard_id}'s replica lock from " <>
+                  "#{inspect(holder)} (#{if Process.alive?(holder), do: "held #{now - at}ms", else: "holder is dead"})"
+              )
+
+              :ets.delete_object(tab, held)
+              acquire_lock(tab, shard_id, deadline)
+
+            now >= deadline ->
+              {:error, :busy}
+
+            true ->
+              receive do
+              after
+                1 -> :ok
+              end
+
+              acquire_lock(tab, shard_id, deadline)
+          end
+      end
+    end
+  end
+
+  defp abandoned_lock?(holder, at, now),
+    do: not Process.alive?(holder) or now - at > lock_max_ms()
+
+  @doc false
+  @spec unlock_shard(atom(), lock_token() | nil) :: :ok
+  def unlock_shard(name, {:held, row}) do
+    :ets.delete_object(locks(name), row)
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  def unlock_shard(_name, _reentrant_or_none), do: :ok
+
+  # Does `token` still hold the lock? False once a contender took it over by age.
+  defp owns_lock?(name, shard_id, {:held, row}) do
+    :ets.lookup(locks(name), shard_id) == [row]
+  rescue
+    ArgumentError -> false
+  end
+
+  defp owns_lock?(name, shard_id, :reentrant) do
+    me = self()
+    match?([{_, ^me, _}], :ets.lookup(locks(name), shard_id))
+  rescue
+    ArgumentError -> false
+  end
+
+  defp owns_lock?(_name, _shard_id, _none), do: false
+
+  @doc """
+  Run `fun` holding `shard_id`'s replica lock (see the lock section above), waiting at most
+  `wait_ms` for it. Returns `fun`'s result, or `{:error, :replica_busy}` when another holder kept
+  it for the whole wait, or `{:error, :no_replica}` when this follower is not running.
+
+  For callers outside the follower's own workers that must see a replica's `.db` and `-wal` as one
+  consistent pair — `Fathom.Shard.Replication.Promote.stage/4`.
+  """
+  @spec with_shard_lock(atom(), String.t(), non_neg_integer(), (-> result)) ::
+          result | {:error, :replica_busy | :no_replica}
+        when result: term()
+  def with_shard_lock(name, shard_id, wait_ms, fun) do
+    case lock_shard(name, shard_id, wait_ms) do
+      {:ok, token} ->
+        try do
+          fun.()
+        after
+          unlock_shard(name, token)
+        end
+
+      {:error, :busy} ->
+        {:error, :replica_busy}
+
+      {:error, :follower_stopped} ->
+        {:error, :no_replica}
+    end
+  end
+
+  defp lock_wait_ms,
+    do: Application.get_env(:fathom, :replication_shard_lock_wait_ms, @default_lock_wait_ms)
+
+  defp lock_max_ms,
+    do: Application.get_env(:fathom, :replication_shard_lock_max_ms, @default_lock_max_ms)
+
   @doc "The port this follower is listening on (0 in config means 'pick one')."
   @spec port(GenServer.server()) :: {:ok, :inet.port_number()}
   def port(server \\ __MODULE__), do: GenServer.call(server, :port)
@@ -257,6 +424,12 @@ defmodule Fathom.Shard.Replication.Follower do
       ])
 
     :ets.insert(tab, {:__dir__, dir})
+
+    # Owned here for the same reason as the state table: it dies with this process, and a holder
+    # whose release then raises is rescued (`unlock_shard/2`). See the lock section above.
+    :ets.new(locks(name), [:named_table, :public, :set, write_concurrency: true])
+
+    reap_stale_seed_temps(dir)
     recover(tab, name, dir)
 
     # `ip:` is a security control, not tuning. This socket takes raw WAL frames for a tenant's
@@ -526,8 +699,10 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   # Every worker discards its partial seeds and exits. Bounded: a worker stuck in a long step is
-  # killed after `@worker_stop_ms`, which leaves its seed temps for the next seed of that shard to
-  # replace — the same outcome a crashed handler had before.
+  # killed after `@worker_stop_ms`. A killed worker releases nothing: its shard locks are taken over
+  # by the next contender because the holder is dead (`abandoned_lock?/3`), and its uniquely-named
+  # seed temps are removed by the boot reaper (`reap_stale_seed_temps/1`) — expert review
+  # 2026-10-08 #5.
   defp close_connection(conn) do
     # Before the :stop messages, so a worker with frames still queued stops at its next one rather
     # than applying them all first (see `worker_loop/5`).
@@ -573,8 +748,9 @@ defmodule Fathom.Shard.Replication.Follower do
   # and re-sends from its un-advanced position.
   #
   # This narrows the overlap to the ONE frame a worker may be in the middle of — what it was before
-  # per-shard workers (c61cbe3). Closing it entirely needs per-shard serialization across
-  # connections, which is parked in the review's progress file.
+  # per-shard workers (c61cbe3). The shard lock (`lock_shard/3`, tiers b+c of the same finding)
+  # closes the rest: that one frame and the new connection's frame for the same shard can no longer
+  # interleave, they run one after the other.
   defp worker_loop(sock, name, reader, closed, seeds) do
     receive do
       {:frame, frame, size} ->
@@ -886,6 +1062,34 @@ defmodule Fathom.Shard.Replication.Follower do
     # complete; drop its files rather than leak them.
     seeds = discard_seed(seeds, b.shard_id)
 
+    # THE WHOLE SEED HOLDS THE SHARD'S LOCK (expert review 2026-10-08 #5), from here until its
+    # install or discard, so no other connection's push or seed can mutate the replica in between —
+    # and the checks below read a state nothing else can move under them.
+    id = b.shard_id
+
+    case lock_shard(name, id, lock_wait_ms()) do
+      {:ok, lock} ->
+        case checked_begin(name, seeds, b, lock) do
+          %{^id => %{lock: ^lock}} = opened ->
+            opened
+
+          refused ->
+            unlock_shard(name, lock)
+            refused
+        end
+
+      {:error, reason} ->
+        Logger.warning(
+          "replication follower refusing to seed #{b.shard_id}: its replica is busy " <>
+            "(#{inspect(reason)}) — another connection is mutating it"
+        )
+
+        # Failed, not absent, so `seed_end` answers a reject the primary re-seeds on.
+        Map.put(seeds, b.shard_id, %{name: name, failed: true})
+    end
+  end
+
+  defp checked_begin(name, seeds, b, lock) do
     cond do
       # Never re-create a replica of a DELETED tenant (expert review 2026-09-29 #5): after
       # `Tombstones` erases it, a straggling push answers `:unknown_shard` and the primary's reflex
@@ -909,7 +1113,7 @@ defmodule Fathom.Shard.Replication.Follower do
         seeds
 
       headroom?(name, b) ->
-        open_seed_temps(name, seeds, b)
+        open_seed_temps(name, seeds, b, lock)
 
       true ->
         refuse_seed(name, seeds, b)
@@ -984,13 +1188,25 @@ defmodule Fathom.Shard.Replication.Follower do
   defp disk_free_floor_bytes,
     do: Application.get_env(:fathom, :replication_disk_free_floor_bytes, 1024 * 1024 * 1024)
 
-  defp open_seed_temps(name, seeds, %Protocol.SeedBegin{} = b) do
-    with {:ok, db_fd} <-
-           :file.open(seeding_path(db_path(name, b.shard_id)), [:write, :raw, :binary]),
-         {:ok, wal_fd} <-
-           :file.open(seeding_path(wal_path(name, b.shard_id)), [:write, :raw, :binary]) do
+  # UNIQUE TEMP NAMES PER SEED (expert review 2026-10-08 #5 tier c). They were fixed per shard
+  # (`<db>.seeding`), so a second connection's `seed_begin` reopened the SAME inode with `:write`
+  # and truncated it while the first seed's fd was still writing into it: the first seed's later
+  # chunks landed inside whatever the second had installed, its install removed the live `-wal`
+  # before failing its rename, and its discard deleted the other seed's temp by path. The shard
+  # lock now keeps two seeds of one shard from overlapping, but a lock taken over by age leaves the
+  # overtaken holder alive — so each seed's files must be its own, and the paths ride in its state.
+  defp open_seed_temps(name, seeds, %Protocol.SeedBegin{} = b, lock) do
+    tag = Integer.to_string(System.unique_integer([:positive]))
+    db_temp = seeding_path(db_path(name, b.shard_id), tag)
+    wal_temp = seeding_path(wal_path(name, b.shard_id), tag)
+
+    with {:ok, db_fd} <- :file.open(db_temp, [:write, :raw, :binary]),
+         {:ok, wal_fd} <- open_or_close(wal_temp, db_fd) do
       Map.put(seeds, b.shard_id, %{
         name: name,
+        lock: lock,
+        db_temp: db_temp,
+        wal_temp: wal_temp,
         epoch: b.epoch,
         wal_gen: b.wal_gen,
         salt1: b.salt1,
@@ -1014,12 +1230,25 @@ defmodule Fathom.Shard.Replication.Follower do
           "replication seed could not open temps for #{b.shard_id}: #{inspect(reason)}"
         )
 
+        Enum.each([db_temp, wal_temp], &File.rm/1)
+
         # Recorded as failed rather than absent so `seed_end` has something to refuse — an absent
         # entry and a broken one must not be told apart by the primary, but they must both reject.
         Map.put(seeds, b.shard_id, %{name: name, failed: true})
     end
   rescue
     ArgumentError -> Map.put(seeds, b.shard_id, %{name: name, failed: true})
+  end
+
+  defp open_or_close(path, other_fd) do
+    case :file.open(path, [:write, :raw, :binary]) do
+      {:ok, fd} ->
+        {:ok, fd}
+
+      {:error, _} = err ->
+        _ = :file.close(other_fd)
+        err
+    end
   end
 
   @doc false
@@ -1222,16 +1451,35 @@ defmodule Fathom.Shard.Replication.Follower do
     :ok
   end
 
+  # OWNERSHIP IS RE-CHECKED BEFORE ANYTHING IS RENAMED (expert review 2026-10-08 #5). A seed whose
+  # lock was taken over by age (`abandoned_lock?/3`) is no longer the replica's writer — another seed
+  # or push owns the files now — so it removes only its own temps and refuses, which the primary
+  # answers with a re-seed. The lock is released on every path, success included.
   defp install(name, shard_id, state) do
-    db = db_path(name, shard_id)
-    wal = wal_path(name, shard_id)
-
     :file.close(state.db_fd)
     :file.close(state.wal_fd)
 
+    if owns_lock?(name, shard_id, state.lock) do
+      do_install(name, shard_id, state)
+    else
+      Logger.warning(
+        "replication seed of #{shard_id} lost its replica lock before install; discarding it"
+      )
+
+      rm_seed_temps(state)
+      {:error, :lock_lost}
+    end
+  after
+    unlock_shard(name, state.lock)
+  end
+
+  defp do_install(name, shard_id, state) do
+    db = db_path(name, shard_id)
+    wal = wal_path(name, shard_id)
+
     with :ok <- rm_if_present(wal),
-         :ok <- File.rename(seeding_path(db), db),
-         :ok <- File.rename(seeding_path(wal), wal) do
+         :ok <- File.rename(state.db_temp, db),
+         :ok <- File.rename(state.wal_temp, wal) do
       put_state(
         name,
         shard_id,
@@ -1253,6 +1501,9 @@ defmodule Fathom.Shard.Replication.Follower do
     else
       {:error, reason} ->
         Logger.error("replication seed install failed for #{shard_id}: #{inspect(reason)}")
+        # The temps are unique to this seed, so nothing else will ever replace (and so remove)
+        # them; whatever was not renamed goes now rather than waiting for the boot reaper.
+        rm_seed_temps(state)
         {:error, reason}
     end
   rescue
@@ -1273,10 +1524,10 @@ defmodule Fathom.Shard.Replication.Follower do
         if state[:db_fd], do: :file.close(state.db_fd)
         if state[:wal_fd], do: :file.close(state.wal_fd)
 
-        if name = state[:name] do
-          File.rm(seeding_path(db_path(name, shard_id)))
-          File.rm(seeding_path(wal_path(name, shard_id)))
-        end
+        # This seed's OWN temps, by the paths it opened — never by a per-shard name, which another
+        # connection's seed of the same shard could be writing (expert review 2026-10-08 #5).
+        rm_seed_temps(state)
+        if name = state[:name], do: unlock_shard(name, state[:lock])
 
         rest
     end
@@ -1290,7 +1541,45 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
-  defp seeding_path(path), do: path <> ".seeding"
+  defp rm_seed_temps(state) do
+    for key <- [:db_temp, :wal_temp], path = state[key], do: File.rm(path)
+    :ok
+  end
+
+  @seeding_marker ".seeding"
+  defp seeding_path(path, tag), do: path <> @seeding_marker <> "." <> tag
+
+  # THE BOOT REAPER for seed temps (expert review 2026-10-08 #5 tier c). Unique names mean a seed
+  # whose worker was killed (`close_connection/1`'s `@worker_stop_ms`), or whose follower died under
+  # it, leaves files nothing will ever replace — the fixed `.seeding` name used to be overwritten by
+  # the shard's next seed. AGE-GATED, because a Follower restart does not stop the old connections'
+  # workers (their reader is an unlinked Task), so a seed still streaming into this directory must
+  # keep its files: a live seed writes a chunk at least every few seconds, and the Session abandons
+  # one after `@default_seed_expiry_ms` (120 s), so a temp untouched for `@stale_seed_temp_s` is
+  # dead. Matches the pre-unique `<shard>.db.seeding` name too, so an upgrade does not strand those.
+  @stale_seed_temp_s 15 * 60
+
+  defp reap_stale_seed_temps(dir) do
+    cutoff = System.os_time(:second) - @stale_seed_temp_s
+
+    case File.ls(dir) do
+      {:ok, entries} ->
+        reaped =
+          entries
+          |> Enum.filter(&String.contains?(&1, @seeding_marker))
+          |> Enum.map(&Path.join(dir, &1))
+          |> Enum.count(fn path ->
+            match?({:ok, %{mtime: m}} when m < cutoff, File.stat(path, time: :posix)) and
+              File.rm(path) == :ok
+          end)
+
+        if reaped > 0,
+          do: Logger.info("replication follower reaped #{reaped} stale seed temp(s) in #{dir}")
+
+      {:error, _} ->
+        :ok
+    end
+  end
 
   # Returns the iodata to send back. All the judgement is in FollowerLog; this only performs it.
   #
@@ -1299,8 +1588,33 @@ defmodule Fathom.Shard.Replication.Follower do
   # Task with an unhandled exit. A primary is waiting on a reply, so the right answer is to refuse
   # the push — which subtracts from its quorum immediately — rather than to die silently and make
   # it wait out the timeout.
+  #
+  # UNDER THE SHARD'S LOCK (expert review 2026-10-08 #5): decide → absorb → write → put_state is one
+  # read-modify-write of the replica, and another connection's worker for the same shard must not
+  # interleave with it. A push that cannot get the lock within `lock_wait_ms/0` is refused
+  # `:internal` at our real position, the answer a failed write already gives.
   defp handle_push(name, %Protocol.Push{} = push) do
-    do_handle_push(name, push)
+    case lock_shard(name, push.shard_id, lock_wait_ms()) do
+      {:ok, lock} ->
+        try do
+          do_handle_push(name, push)
+        after
+          unlock_shard(name, lock)
+        end
+
+      {:error, reason} ->
+        Logger.info(
+          "replication follower refusing a push for #{push.shard_id}: its replica is busy " <>
+            "(#{inspect(reason)}); the primary re-plans on its next commit"
+        )
+
+        :telemetry.execute([:fathom, :replication, :shard_lock_busy], %{count: 1}, %{
+          shard_id: push.shard_id
+        })
+
+        expected = (state_of(name, push.shard_id) || %{next_offset: 0}).next_offset
+        Protocol.encode_reject(push.shard_id, :internal, expected)
+    end
   rescue
     ArgumentError ->
       Logger.warning("replication follower is shutting down; refusing #{push.shard_id}")

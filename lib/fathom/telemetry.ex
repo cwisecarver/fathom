@@ -420,6 +420,14 @@ defmodule Fathom.Telemetry do
         description:
           "Replica seeds refused because the replication volume is below its free-space floor"
       ),
+      # Expert review 2026-10-08 #5. A push refused because another connection held the shard's
+      # replica lock past the wait. Expected around a primary's reconnect or a promotion; a
+      # sustained rate means a lock holder is stuck (e.g. a seed on a half-open connection).
+      counter("fathom.replication.shard_lock_busy.count",
+        event_name: [:fathom, :replication, :shard_lock_busy],
+        description:
+          "Replica pushes refused because another connection held the shard's replica lock"
+      ),
       counter("fathom.shard.flush_gate.reclaimed.count",
         event_name: [:fathom, :shard, :flush_gate, :reclaimed],
         description:
