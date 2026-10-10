@@ -262,28 +262,26 @@ defmodule Fathom.Tenants do
 
   The pulled bytes are integrity-checked (`Fathom.Shard.verify_integrity/1`) before returning, so a
   corrupt stored object is refused (`{:error, {:corrupt_export, _}}`) rather than handed to the
-  tenant. The CALLER owns the returned temp file and must delete it after use (the admin download
-  does, so an exported copy never lingers on disk). Returns `{:error, :not_stored}` if the shard has
+  tenant. The export lands in a fresh 0700 directory (`dir`) holding `path`. The CALLER owns that
+  directory and must `File.rm_rf/1` it after use (the admin download does, so an exported copy
+  never lingers on disk). Returns `{:error, :not_stored}` if the shard has
   no stored object (never flushed, or already deleted), or `{:error, :invalid_shard_id}`.
   """
   @spec export(String.t(), keyword()) ::
-          {:ok, %{path: Path.t(), filename: String.t()}} | {:error, term()}
+          {:ok, %{path: Path.t(), dir: Path.t(), filename: String.t()}} | {:error, term()}
   def export(shard_id, opts \\ []) do
     with {:ok, id} <- cast(shard_id),
          :ok <- refuse_if_erased(id),
          :ok <- maybe_flush_export(id, opts) do
-      tmp =
-        Path.join(
-          System.tmp_dir!(),
-          "fathom_export_#{id}_#{System.unique_integer([:positive])}.db"
-        )
+      dir = export_dir!()
+      tmp = Path.join(dir, "#{id}.db")
 
       case Storage.pull(id, tmp) do
         # No bytes written: no object, or a steal sentinel (expert review 2026-08-01 #24).
         # Previously a sentinel arrived as `{:ok, <etag>}` and fell through to the success
         # branch, so export returned a fabricated EMPTY database as the tenant's data.
         {:absent, _} ->
-          File.rm(tmp)
+          File.rm_rf(dir)
           {:error, :not_stored}
 
         {:ok, _etag} ->
@@ -293,21 +291,33 @@ defmodule Fathom.Tenants do
               # empty WAL siblings it left so the returned file is a self-contained db the caller
               # can read + delete cleanly.
               for s <- ["-wal", "-shm"], do: File.rm(tmp <> s)
-              {:ok, %{path: tmp, filename: "#{id}.db"}}
+              {:ok, %{path: tmp, dir: dir, filename: "#{id}.db"}}
 
             {:error, reason} ->
               # A corrupt stored object must never be handed to the tenant as their portability
               # export (#22) — drop the temp and surface it. Better a loud error than silent
               # corruption the departing customer discovers later.
-              for s <- ["", "-wal", "-shm"], do: File.rm(tmp <> s)
+              File.rm_rf(dir)
               {:error, {:corrupt_export, reason}}
           end
 
         {:error, reason} ->
-          File.rm(tmp)
+          File.rm_rf(dir)
           {:error, reason}
       end
     end
+  end
+
+  # A fresh, unguessable directory for one export, created 0700 before anything is written into it.
+  # The export is a full copy of a tenant's database, so it must not sit as a world-readable file
+  # directly in the shared system temp dir (expert review 2026-10-10 #33c). The file inside is
+  # written only after the directory is private.
+  defp export_dir! do
+    name = "fathom_export_" <> Base.encode16(:crypto.strong_rand_bytes(12), case: :lower)
+    dir = Path.join(System.tmp_dir!(), name)
+    File.mkdir_p!(dir)
+    File.chmod!(dir, 0o700)
+    dir
   end
 
   # Force-flush the shard's live coordinator before the export (#22). Default ON — an export is rare

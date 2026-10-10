@@ -163,6 +163,24 @@ defmodule Fathom.TenantsTest do
       :ok = Exqlite.Sqlite3.close(db)
     end
 
+    # Expert review 2026-10-10 #33c: the export is a full copy of one tenant's database. It was
+    # written as a plain file straight into the shared system temp dir, with the default umask, so
+    # other local users could read it. It now lands in a fresh directory that is 0700 (private
+    # before the file is written), and the caller removes that whole directory.
+    test "the export is written into a private 0700 directory, not the shared temp dir", %{id: id} do
+      write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('private')"])
+      flush!(id)
+
+      assert {:ok, %{path: path, dir: dir}} = Tenants.export(id)
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      assert Path.dirname(path) == dir
+      assert Path.dirname(dir) == Path.expand(System.tmp_dir!())
+
+      assert Bitwise.band(File.stat!(dir).mode, 0o777) == 0o700,
+             "the export directory must be private to the owner"
+    end
+
     # Expert review 2026-09-29 #21 — the export half: pre-fix this returns the erased tenant's data.
     test "refuses to export a DELETED tenant during the erase window", %{id: id} do
       {:ok, _} = Directory.resolve(id)

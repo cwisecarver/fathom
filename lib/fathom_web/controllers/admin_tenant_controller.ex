@@ -18,7 +18,7 @@ defmodule FathomWeb.AdminTenantController do
     conn = assign(conn, :audit_actor, admin_actor(conn))
 
     case Fathom.Tenants.export(id) do
-      {:ok, %{path: path, filename: filename}} ->
+      {:ok, %{path: path, dir: dir, filename: filename}} ->
         try do
           # Sent from the file, never read into memory first (expert review 2026-10-08 #2): a
           # shard is up to the 4 GiB cap, and `File.read!` held all of it as one binary per export.
@@ -31,7 +31,8 @@ defmodule FathomWeb.AdminTenantController do
             content_type: "application/x-sqlite3"
           )
         after
-          File.rm(path)
+          # Remove the whole 0700 export directory, not just the file: it is one per export.
+          File.rm_rf(dir)
         end
 
       {:error, :not_stored} ->
