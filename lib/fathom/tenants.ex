@@ -32,7 +32,7 @@ defmodule Fathom.Tenants do
   import Ecto.Query, only: [from: 2]
 
   alias Fathom.{Directory, HranaAuth, Shards}
-  alias Fathom.Shard.Storage
+  alias Fathom.Shard.{SqliteHeader, Storage}
   alias Fathom.ShardId
   alias Fathom.Tenants.{DeleteJob, Suspensions, Tombstones}
 
@@ -126,10 +126,10 @@ defmodule Fathom.Tenants do
          :ok <- refuse_scratch(dst, opts),
          :ok <- refuse_if_taken(dst),
          {:ok, warnings} <- dns_safety(dst),
-         {:ok, %{schema_version: schema_version}} <- fetch_src(src),
+         {:ok, _src_row} <- fetch_src(src),
          :ok <- maybe_flush_source(src, opts),
-         :ok <- fork_into_leased_dst(src, dst) do
-      register_fork(dst, schema_version)
+         :ok <- fork_into_leased_dst(src, dst),
+         :ok <- register_fork(dst) do
       {:ok, tenant_result(dst, warnings)}
     end
   end
@@ -531,13 +531,53 @@ defmodule Fathom.Tenants do
   defp refuse_if_erased(id),
     do: if(Tombstones.tombstoned?(id), do: {:error, :not_stored}, else: :ok)
 
-  # Register the fork's directory row AT the source's schema version — critical so the laggard sweep
-  # doesn't see the fork at v0 and replay a migration onto its already-vN copy (the #7/#8 quarantine
-  # trap). resolve inserts active@0; cutover stamps the real version (a no-op skip when src is at v0).
-  defp register_fork(dst, schema_version) do
-    Directory.resolve(dst)
-    if schema_version > 0, do: Directory.cutover(dst, schema_version)
-    :ok
+  # Register the fork's directory row AT the version the COPIED FILE carries — critical so the laggard
+  # sweep doesn't see the fork at v0 and replay a migration onto its already-vN copy (the #7/#8
+  # quarantine trap). resolve inserts active@0; cutover stamps the real version (skipped at v0).
+  #
+  # Expert review 2026-10-10 #20: this used to DISCARD both results and stamp the version read from
+  # the source's directory row BEFORE the flush/copy. After a Postgres blip the dst was a vN object
+  # with a v0 (or no) row, and `ShardMigration.run`'s pre-flight could then cancel it forever as
+  # `unknown_version`; a source that migrated between the read and the copy stamped the wrong
+  # version outright. Now the version is read from the dst object's own header (the file is the
+  # truth; `PRAGMA user_version` is the O(1) gate) and a directory failure is returned, not
+  # swallowed. The copy has already happened, so a failure here leaves a dst object with no good
+  # row; the caller sees the error and `mix fathom.directory` reconciles the stamp from the file.
+  @doc false
+  @spec register_fork(String.t()) :: :ok | {:error, term()}
+  def register_fork(dst) do
+    with {:ok, version} <- copied_version(dst),
+         {:ok, _row} <- Directory.resolve(dst),
+         {:ok, _row} <- stamp_fork(dst, version) do
+      :ok
+    else
+      {:error, reason} -> {:error, {:fork_register_failed, reason}}
+    end
+  end
+
+  defp stamp_fork(dst, version) when version > 0, do: Directory.cutover(dst, version)
+  defp stamp_fork(dst, _v), do: Directory.get(dst) |> row_or_error()
+
+  defp row_or_error({:ok, row}), do: {:ok, row}
+  defp row_or_error(_), do: {:error, :not_found}
+
+  # The dst object's `user_version`, read from its header after pulling it to a scratch file.
+  defp copied_version(dst) do
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "fathom_forkver_#{dst}_#{System.unique_integer([:positive])}.db"
+      )
+
+    try do
+      case Storage.pull(dst, tmp) do
+        {:ok, _etag} -> SqliteHeader.user_version(tmp)
+        {:absent, _} -> {:error, :dst_object_missing}
+        {:error, reason} -> {:error, reason}
+      end
+    after
+      File.rm(tmp)
+    end
   end
 
   # The provision/fork response shape. `warnings` is always present (empty when the id is fine) so

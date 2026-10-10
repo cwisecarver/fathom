@@ -294,11 +294,44 @@ defmodule Fathom.TenantsTest do
          %{id: src, dst: dst} do
       {:ok, _} = Directory.resolve(src)
       {:ok, _} = Directory.cutover(src, 4)
-      write!(src, ["CREATE TABLE t (v TEXT)"])
+      # The file carries its version too (a realistic fixture: the directory stamp mirrors
+      # `PRAGMA user_version`, and the fork stamps from the copied file's header).
+      write!(src, ["CREATE TABLE t (v TEXT)", "PRAGMA user_version = 4"])
       flush!(src)
 
       assert {:ok, _} = Tenants.fork(src, dst)
       assert {:ok, %{schema_version: 4}} = Directory.get(dst)
+    end
+
+    # Symptom (expert review 2026-10-10 #20): the fork was stamped from the source's DIRECTORY row
+    # read BEFORE the flush/copy, so a stale/lagging source row (here v0 while the file is v3 — e.g.
+    # a migration that landed after the read) produced a vN object with a v0 row, which the laggard
+    # sweep then tried to replay a migration onto. Invariant: the dst is stamped from the copied
+    # file's own `user_version`.
+    test "stamps the fork from the copied file's user_version, not the source's row",
+         %{id: src, dst: dst} do
+      {:ok, _} = Directory.resolve(src)
+      assert {:ok, %{schema_version: 0}} = Directory.get(src)
+      write!(src, ["CREATE TABLE t (v TEXT)", "PRAGMA user_version = 3"])
+      flush!(src)
+
+      assert {:ok, _} = Tenants.fork(src, dst)
+      assert {:ok, %{schema_version: 3}} = Directory.get(dst)
+    end
+
+    # Symptom (expert review 2026-10-10 #20): register_fork discarded cutover's result, so a dst that
+    # could not be stamped (here: suspended between copy and register, `:status_conflict`) still
+    # reported a successful fork. It must surface the error.
+    test "register_fork reports a directory failure instead of swallowing it",
+         %{id: src, dst: dst} do
+      {:ok, _} = Directory.resolve(src)
+      write!(src, ["CREATE TABLE t (v TEXT)", "PRAGMA user_version = 3"])
+      flush!(src)
+      :ok = Storage.fork_shard(src, dst)
+      {:ok, _} = Directory.resolve(dst)
+      {:ok, _} = Directory.suspend(dst)
+
+      assert {:error, {:fork_register_failed, :status_conflict}} = Tenants.register_fork(dst)
     end
 
     test "refuses to fork onto an existing tenant", %{id: src, dst: dst} do
