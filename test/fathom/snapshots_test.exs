@@ -363,6 +363,24 @@ defmodule Fathom.SnapshotsTest do
     assert {:error, :invalid_snapshot_id} = Snapshots.drop(shard, nil)
   end
 
+  # Expert review 2026-10-10 #33a: the gate was `~r/^...$/`, and in PCRE `$` matches BEFORE a
+  # trailing newline, so "x\n" passed the charset check and reached the path/key join with a
+  # newline in it. The gate must be an anchored whole-string match (`\A...\z`): a trailing newline
+  # is refused with :invalid_snapshot_id, exactly like any other out-of-charset byte.
+  test "a snapshot_id with a trailing newline is rejected (the gate anchors the whole string)",
+       %{shard: shard} do
+    write!(shard, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('safe')"])
+    flush!(shard)
+
+    for bad <- ["x\n", "snap-1\n", "a\nb"] do
+      assert {:error, :invalid_snapshot_id} = Snapshots.restore(shard, bad),
+             "restore must reject #{inspect(bad)} — a trailing newline is not a valid id"
+
+      assert {:error, :invalid_snapshot_id} = Snapshots.drop(shard, bad),
+             "drop must reject #{inspect(bad)} — a trailing newline is not a valid id"
+    end
+  end
+
   defp rm_shard(id) do
     remote_dir = Fathom.Shard.Storage.Local.dir()
 

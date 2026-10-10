@@ -45,7 +45,9 @@ defmodule Fathom.Snapshots do
   # charset as `ShardId`: no dot (blocks `..`), no slash, no whitespace/control chars.
   # Case is preserved (unlike shard ids) — a generated id carries uppercase `T`/`Z` from
   # its UTC timestamp. 128 chars covers a timestamp + uniquifier + a 40-char label.
-  @snapshot_id_pattern ~r/^[a-zA-Z0-9_-]{1,128}$/
+  # `\A`/`\z`, not `^`/`$`: in PCRE `$` also matches before a trailing newline, so "x\n" passed
+  # the gate (expert review 2026-10-10 #33a).
+  @snapshot_id_pattern ~r/\A[a-zA-Z0-9_-]{1,128}\z/
 
   @doc """
   Snapshots `shard_id`'s current stored object. `opts[:label]` adds a
