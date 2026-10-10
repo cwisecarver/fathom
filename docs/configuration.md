@@ -75,7 +75,7 @@ config; diff from it.
 
 | Var | Default | What it does | Safety consequence |
 |---|---|---|---|
-| `HRANA_AUTH` | `disabled` | `required` makes every stream present a per-shard token; `disabled` trusts the network. Unknown values fail closed to required. | With `disabled`, the port MUST be reachable only via the LB (firewall/SG/private subnet + `HRANA_BIND_IP`). A reachable, unauthenticated `:8080` is open tenant access. Boot refuses `required` without a usable secret. |
+| `HRANA_AUTH` | **must be set in prod** (either value; unset refuses to boot — dev/test default `disabled`) | `required` makes every stream present a per-shard token; `disabled` trusts the network. Unknown values fail closed to required. | With `disabled`, the port MUST be reachable only via the LB (firewall/SG/private subnet + `HRANA_BIND_IP`). A reachable, unauthenticated `:8080` is open tenant access. Boot refuses `required` without a usable secret. |
 | `HRANA_TOKEN_SECRET` | falls back to `SECRET_KEY_BASE` | Dedicated token-signing secret, so a data-path secret rotation doesn't touch web sessions/CSRF. | Rotate independently; keep secret. |
 | `HRANA_TOKEN_MAX_AGE` | unset (tokens don't expire) | Optional token expiry (seconds). | Unset ⇒ revoke only by rotation; a boot warning fires when `required` runs with infinite max-age. |
 | `HRANA_BIND_IP` | unset (all interfaces) | Pins the Hrana listener to the private interface the LB reaches. | Defense-in-depth for the `disabled`-auth posture; unset relies on network isolation alone. |

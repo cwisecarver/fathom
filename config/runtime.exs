@@ -1219,6 +1219,20 @@ if config_env() == :prod do
     config :fathom, :hrana_token_secret, token_secret
   end
 
+  # The data-plane auth posture must be a DECISION, not a default (expert review 2026-10-10 #21).
+  # Replication is fail-closed in prod (it refuses to boot without its bind IP and frame-auth key),
+  # but an unset HRANA_AUTH silently shipped an unauthenticated data plane. Require it be set
+  # explicitly — either value is accepted (`disabled` is a valid posture behind a trusted LB; the
+  # operator just has to say so).
+  if is_nil(System.get_env("HRANA_AUTH")) do
+    raise """
+    environment variable HRANA_AUTH is missing.
+    Set it explicitly: HRANA_AUTH=required (every stream presents a per-shard token) or
+    HRANA_AUTH=disabled (the network is the trust boundary: :8080 reachable only via the LB —
+    see docs/auth.md). Prod no longer defaults to an unauthenticated data plane.
+    """
+  end
+
   case System.get_env("HRANA_AUTH", "disabled") do
     "required" -> config :fathom, :hrana_auth, :required
     "disabled" -> config :fathom, :hrana_auth, :disabled

@@ -37,6 +37,9 @@ x-fathom-env: &fathom-env
   AWS_ACCESS_KEY_ID: fathom
   AWS_SECRET_ACCESS_KEY: fathom-secret
   SHARD_DATA_DIR: /data/shards
+  # Prod refuses to boot with HRANA_AUTH unset (expert review 2026-10-10 #21); the rig's network is
+  # its own trust boundary.
+  HRANA_AUTH: "${HRANA_AUTH:-disabled}"
   # Short TTL so failover experiments iterate quickly; the TTL is the
   # failover-stall ceiling (a dead node's shards stay unstealable up to this long).
   SHARD_LEASE_TTL_MS: "10000"

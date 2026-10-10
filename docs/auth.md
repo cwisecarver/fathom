@@ -22,7 +22,11 @@ arrive until *after* the HTTP upgrade.
   boot guard (`check_config!/0`) refuses `:required` without a usable signing secret, and **any
   other configured value fails closed to `:required`** (a typo can't silently disable auth).
 
-`HRANA_AUTH=required` in prod. Whether auth checks anything is a **runtime** mode, so flipping it
+`HRANA_AUTH=required` in prod. **In prod `HRANA_AUTH` must be set explicitly — either value:**
+`config/runtime.exs` refuses to boot when it is unset (expert review 2026-10-10 #21), so an
+unauthenticated data plane is always a stated decision (`HRANA_AUTH=disabled`, network trust
+boundary), never a silent default — the same fail-closed posture replication has. The `:disabled`
+default above applies to dev/test only. Whether auth checks anything is a **runtime** mode, so flipping it
 needs no listener restart.
 
 ## The credential — a per-shard `Phoenix.Token`

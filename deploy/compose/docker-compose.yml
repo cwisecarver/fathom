@@ -36,10 +36,11 @@ x-fathom-env: &fathom-env
   # Eval convenience: reach the plaintext dashboard/API on localhost:4000. Paired with the
   # WEB_INSECURE_LOCAL build arg below (SSL forcing off). Never in a real deployment.
   WEB_INSECURE_LOCAL: "1"
-  # Auth is DISABLED by default (the network is the trust boundary). To require per-shard tokens,
-  # set HRANA_AUTH=required and mint tokens with `bin/fathom eval 'Fathom.HranaAuth.token_for(...)'`
-  # or the /api/tenants/:id/token endpoint. See docs/auth.md.
-  # HRANA_AUTH: required
+  # Prod REQUIRES HRANA_AUTH to be set explicitly (either value). This eval stack says `disabled`
+  # (the network is the trust boundary). To require per-shard tokens, set HRANA_AUTH=required and
+  # mint tokens with `bin/fathom eval 'Fathom.HranaAuth.token_for(...)'` or the
+  # /api/tenants/:id/token endpoint. See docs/auth.md.
+  HRANA_AUTH: disabled
 
 services:
   postgres:

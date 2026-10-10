@@ -36,7 +36,9 @@ defmodule Fathom.RuntimeConfigTest do
       "DATABASE_URL" => "ecto://u:p@localhost/fathom_runtime_config_test",
       "SECRET_KEY_BASE" => String.duplicate("k", 64),
       "ADMIN_USER" => "admin",
-      "ADMIN_PASS" => "admin"
+      "ADMIN_PASS" => "admin",
+      # Required explicitly in prod (expert review 2026-10-10 #21); either value boots.
+      "HRANA_AUTH" => "disabled"
     }
     |> Map.merge(env_overlay)
     |> fathom_config(:prod)
@@ -264,6 +266,27 @@ defmodule Fathom.RuntimeConfigTest do
     for {var, key} <- @default_on_gates do
       refute Keyword.has_key?(fathom_config(%{var => "yes"}), key),
              "#{var}=yes should be treated as unset, not as off"
+    end
+  end
+
+  # Expert review 2026-10-10 #21 (SYMPTOM): prod defaulted HRANA_AUTH to "disabled", so a deploy
+  # that never mentioned it silently served an unauthenticated data plane while replication was
+  # fail-closed. Invariant: in prod the variable must be SET (either value boots); unset refuses.
+  describe "HRANA_AUTH must be explicit in prod (#21)" do
+    test "unset refuses to boot in prod" do
+      assert_raise RuntimeError, ~r/HRANA_AUTH is missing/, fn ->
+        prod_config(%{"HRANA_AUTH" => nil})
+      end
+    end
+
+    test "either explicit value boots and is honoured" do
+      assert Keyword.fetch!(prod_config(%{"HRANA_AUTH" => "disabled"}), :hrana_auth) == :disabled
+
+      assert Keyword.fetch!(prod_config(%{"HRANA_AUTH" => "required"}), :hrana_auth) == :required
+    end
+
+    test "dev/test keep the unauthenticated default without the variable" do
+      refute Keyword.has_key?(fathom_config(%{"HRANA_AUTH" => nil}), :hrana_auth)
     end
   end
 end
