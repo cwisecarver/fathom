@@ -305,6 +305,48 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
     end
   end
 
+  # Symptom (expert review 2026-10-10 #14): the rotation ordered by `last_snapshot_at NULLS FIRST`,
+  # which is stamped only on SUCCESS, so a shard whose snapshot fails every time stayed at the head
+  # and held a per-run slot forever — with a sample of 1, nothing else was ever snapshotted. The
+  # rotation now orders by an ATTEMPT stamp, so a poison shard goes to the back after one try.
+  describe "poison shards (#14)" do
+    test "a shard whose snapshot always fails does not starve the rest of the queue", %{id: id} do
+      # Good shard: snapshotted once, then flushed again, so it is selectable with a NON-null
+      # last_snapshot_at — which sorts AFTER the poison shard's NULL in the old ordering.
+      seed(id, ["CREATE TABLE t (v INTEGER)"])
+      {:ok, _} = ScheduleJob.run(50)
+      seed(id, ["INSERT INTO t VALUES (1)"])
+      {:ok, before} = Snapshots.list(id)
+
+      # Poison: flushed per the directory, but no durable object exists, so the copy fails.
+      poison = "snappoison_#{System.unique_integer([:positive])}"
+      {:ok, _} = Directory.resolve(poison)
+      Directory.record_flush_batch([{poison, DateTime.utc_now()}])
+
+      assert {:ok, %{error: 1}} = ScheduleJob.run(1)
+      assert row(poison).last_snapshot_attempt_at != nil
+      assert row(poison).last_snapshot_at == nil
+
+      assert {:ok, %{ok: 1}} = ScheduleJob.run(1)
+      {:ok, after_run} = Snapshots.list(id)
+      assert length(after_run) == length(before) + 1, "the poison shard held the only slot"
+    end
+  end
+
+  # Symptom (expert review 2026-10-10 #14): no `unique:` on the cron workers, so an overlapping run
+  # (slow tick, or a leadership change) double-ran the COPY/sweep work.
+  describe "overlapping cron runs (#14)" do
+    for worker <- [ScheduleJob, RetentionJob] do
+      test "#{inspect(worker)} dedups while one is pending" do
+        worker = unquote(worker)
+        {:ok, first} = Oban.insert(worker.new(%{}))
+        refute first.conflict?
+        {:ok, second} = Oban.insert(worker.new(%{}))
+        assert second.conflict?, "a second #{inspect(worker)} was enqueued while one was pending"
+      end
+    end
+  end
+
   describe "gating" do
     test "perform/1 is inert with no sample size configured", %{id: id} do
       seed(id, ["CREATE TABLE t (v INTEGER)"])

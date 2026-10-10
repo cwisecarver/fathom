@@ -84,6 +84,9 @@ defmodule Fathom.Directory.Shard do
     # The retention sweep's rotation key (expert review 2026-10-08 #19).
     field :last_retention_at, :utc_datetime_usec
 
+    # The snapshot scheduler's rotation key, stamped on every ATTEMPT (expert review 2026-10-10 #14).
+    field :last_snapshot_attempt_at, :utc_datetime_usec
+
     timestamps(type: :utc_datetime_usec)
   end
 

@@ -37,7 +37,17 @@ defmodule Fathom.Snapshots.ScheduleJob do
   gated: turning snapshots on without retention grows storage without bound, which the config
   documentation says plainly and a boot-time warning repeats.
   """
-  use Oban.Worker, queue: :migrations, max_attempts: 1
+  use Oban.Worker,
+    queue: :migrations,
+    max_attempts: 1,
+    # Overlapping cron runs (a slow run still executing at the next tick, or Cron firing on two
+    # nodes across a leadership change) double the COPY work (expert review 2026-10-10 #14).
+    # `period: :infinity` is load-bearing: a keyword list merges into Oban's defaults and would
+    # inherit `period: 60`. Safe because `:completed` is absent — only an in-flight run blocks.
+    unique: [
+      period: :infinity,
+      states: [:scheduled, :available, :executing, :retryable, :suspended]
+    ]
 
   require Logger
 
@@ -114,6 +124,11 @@ defmodule Fathom.Snapshots.ScheduleJob do
     # in the snapshot (expert review 2026-08-31 #7). Reading it first stamps at-or-behind the
     # captured state, so the failure direction is a redundant re-snapshot, never a silent gap.
     watermark = Directory.last_flushed_at(shard_id) || DateTime.utc_now()
+
+    # Stamp the ATTEMPT first: the rotation orders by it, so a shard that fails (or whose task is
+    # timeout-killed) every time goes to the back instead of holding a slot forever
+    # (expert review 2026-10-10 #14).
+    Directory.record_snapshot_attempt(shard_id)
 
     # `auto: true`, not `label: "auto"` (expert review 2026-08-20 #14). The marker is provenance,
     # and routing it through the operator-supplied label field is what let a manual snapshot forge

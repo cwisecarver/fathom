@@ -22,7 +22,15 @@ defmodule Fathom.Snapshots.RetentionJob do
   size with no policy would be a delete sweep with no rule, which is the one configuration mistake
   here that destroys data. Requiring both makes neither reachable by half-configuring.
   """
-  use Oban.Worker, queue: :migrations, max_attempts: 1
+  use Oban.Worker,
+    queue: :migrations,
+    max_attempts: 1,
+    # No overlapping sweeps (expert review 2026-10-10 #14); see ScheduleJob for why
+    # `period: :infinity` and why `:completed` is absent.
+    unique: [
+      period: :infinity,
+      states: [:scheduled, :available, :executing, :retryable, :suspended]
+    ]
 
   require Logger
 

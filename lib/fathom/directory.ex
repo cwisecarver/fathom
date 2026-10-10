@@ -312,11 +312,27 @@ defmodule Fathom.Directory do
       where: s.status == "active",
       where: not is_nil(s.last_flushed_at),
       where: is_nil(s.last_snapshot_at) or s.last_flushed_at > s.last_snapshot_at,
-      order_by: [asc_nulls_first: s.last_snapshot_at],
+      order_by: [asc_nulls_first: s.last_snapshot_attempt_at, asc_nulls_first: s.last_snapshot_at],
       limit: ^n,
       select: %{shard_id: s.shard_id}
     )
     |> Repo.all()
+  end
+
+  @doc """
+  Stamps `last_snapshot_attempt_at` BEFORE a scheduled snapshot is tried (expert review 2026-10-10
+  #14). The rotation orders by it, so a shard whose snapshot fails every time moves to the back
+  after one attempt instead of holding a per-run slot forever (`last_snapshot_at` is stamped only
+  on success, so keying the rotation on it let poison shards starve the queue). Returns rows
+  updated.
+  """
+  @spec record_snapshot_attempt(String.t(), DateTime.t()) :: non_neg_integer()
+  def record_snapshot_attempt(shard_id, at \\ DateTime.utc_now()) do
+    {count, _} =
+      from(s in Shard, where: s.shard_id == ^shard_id)
+      |> Repo.update_all(set: [last_snapshot_attempt_at: at, updated_at: DateTime.utc_now()])
+
+    count
   end
 
   @doc """
