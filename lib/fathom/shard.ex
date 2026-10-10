@@ -1480,14 +1480,14 @@ defmodule Fathom.Shard do
     # exception, or a `:shutdown` that could have landed between commit and bump — the safe,
     # over-dirty direction). (expert review 2026-09-05 #26.)
     #
-    # THE FILO-SIDE HALF HAS NOT LANDED (expert review 2026-10-08 #30). This used to say that HTTP
-    # streams would `trap_exit` in Filo, so a supervisor stop would check them in. As of filo 0.3.1
-    # `Filo.Stream` does not trap exits: on SIGTERM the Edge plane stops first, every live HTTP stream
-    # is killed `:shutdown` without running `terminate`, so `ShardExecutor.close/1` never runs (no
-    # rollback-before-pool, no checkin; the SQLite handle closes only when its NIF resource is
-    # collected) and each such shard takes this bump — an extra flush per shard per rolling deploy.
-    # The fix is `Process.flag(:trap_exit, true)` in `Filo.Stream.init/1`; it is an open Filo change,
-    # tracked in that review's progress file.
+    # THE FILO-SIDE HALF LANDED IN FILO 0.3.2 (expert review 2026-10-08 #30). Before it, `Filo.Stream`
+    # did not trap exits: on SIGTERM the Edge plane stops first, every live HTTP stream was killed
+    # `:shutdown` without running `terminate`, so `ShardExecutor.close/1` never ran (no
+    # rollback-before-pool, no checkin; the SQLite handle closed only when its NIF resource was
+    # collected) and each such shard took this bump. 0.3.2 traps exits, so a supervisor stop now runs
+    # `close/1`, whose checkin reaches this coordinator before the stream's `:DOWN` (messages from one
+    # process arrive in order) — the grant is gone by then, so no bump. The bump remains for a genuine
+    # mid-request death. mix.exs requires `~> 0.3.2` so this cannot silently regress.
     if reason not in [:normal, :noproc] and Map.has_key?(state.conns, ref),
       do: WriteCounter.bump(state.id)
 
