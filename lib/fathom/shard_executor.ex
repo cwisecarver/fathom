@@ -745,13 +745,17 @@ defmodule Fathom.ShardExecutor do
   # network round trip per statement, for frames SQLite has not committed and a follower would
   # ignore until the commit frame arrives anyway.
   #
-  # `Process.get/1` WITHOUT a default is what separates the two states `txn_wrote?/1` collapses
-  # into `false`: `begins_transaction?` puts an explicit `false`, so a MISSING key means no explicit
-  # transaction is open. Hence `wrote? and is_nil(...)` is precisely "an autocommit write".
-  defp ships_now?(conn, sql, wrote?) do
-    in_txn? = Process.get({__MODULE__, @txn_wrote_key, conn}) != nil
-
-    (wrote? and not in_txn?) or (commit_boundary?(sql) and txn_wrote?(conn))
+  # "Inside a transaction" is SQLite's own answer (`Connection.autocommit?/1`, read AFTER the
+  # statement ran), NOT the text-parsed `txn_wrote` flag (expert review 2026-10-10 #H2). That flag
+  # is only updated by statements that SUCCEED, so it goes stale whenever SQLite ends the
+  # transaction itself (interrupt, SQLITE_FULL/IOERR auto-rollback, `ON CONFLICT ROLLBACK` -- the
+  # client's follow-up ROLLBACK then errors and never clears it) and after an outermost
+  # SAVEPOINT/RELEASE with no BEGIN. A stale "in a transaction" made every later autocommit write
+  # skip the quorum ship and be ACKED undurable -- on a node where replication is on in prod.
+  # The flag now answers only "did this transaction write", for the commit-boundary arm.
+  @doc false
+  def ships_now?(conn, sql, wrote?) do
+    Connection.autocommit?(conn) and (wrote? or (commit_boundary?(sql) and txn_wrote?(conn)))
   end
 
   # Distinct from a SQLite error, and a 503 rather than a 400: nothing is wrong with the statement,
