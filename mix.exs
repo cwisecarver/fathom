@@ -99,7 +99,7 @@ defmodule Fathom.MixProject do
   def application do
     [
       mod: {Fathom.Application, []},
-      extra_applications: [:logger, :runtime_tools, :os_mon]
+      extra_applications: [:logger, :runtime_tools, :os_mon, :xmerl]
     ]
   end
 

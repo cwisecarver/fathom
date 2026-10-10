@@ -40,6 +40,8 @@ defmodule Fathom.Shard.Storage.S3 do
 
   require Logger
 
+  alias Fathom.Shard.Storage.S3.ListPage
+
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.Codec
 
@@ -1655,21 +1657,28 @@ defmodule Fathom.Shard.Storage.S3 do
   # thesis is small shards with few versions/snapshots, so the per-shard object
   # count is tiny — no DeleteObjects batching needed, matching drop_* elsewhere).
   defp purge_shard_page(shard_id, token) do
+    with {:ok, page} <- list_page(prefix() <> shard_id, token),
+         :ok <- delete_keys(shard_object_keys(page.entries, shard_id)) do
+      case page.next do
+        nil -> :ok
+        next -> purge_shard_page(shard_id, next)
+      end
+    end
+  end
+
+  # One ListObjectsV2 page for `list_prefix`, parsed by `ListPage` (expert review 2026-10-10 #25):
+  # entity-decoded keys, and an error — never a short "complete" listing — when the response says
+  # it is truncated but gives no token to continue with.
+  defp list_page(list_prefix, token) do
     params =
-      [{"list-type", "2"}, {"prefix", prefix() <> shard_id}] ++
+      [{"list-type", "2"}, {"prefix", list_prefix}] ++
         if(token, do: [{"continuation-token", token}], else: [])
 
     case Req.get(req(), url: url_path(""), params: params) do
       {:ok, %{status: 200, body: body}} ->
-        case delete_keys(shard_object_keys(body, shard_id)) do
-          :ok ->
-            case next_token(body) do
-              nil -> :ok
-              next -> purge_shard_page(shard_id, next)
-            end
-
-          {:error, _} = err ->
-            err
+        case ListPage.parse(body) do
+          {:ok, _page} = ok -> ok
+          {:error, reason} -> {:error, {:s3_list_parse, reason}}
         end
 
       {:ok, %{status: status}} ->
@@ -1680,13 +1689,9 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
-  defp shard_object_keys(xml, shard_id) when is_binary(xml) do
-    ~r{<Key>(.*?)</Key>}s
-    |> Regex.scan(xml)
-    |> Enum.flat_map(fn [_, key] -> if shard_object_key?(key, shard_id), do: [key], else: [] end)
+  defp shard_object_keys(entries, shard_id) do
+    for %{key: key} <- entries, shard_object_key?(key, shard_id), do: key
   end
-
-  defp shard_object_keys(_body, _shard_id), do: []
 
   # Same delimiter rule as Local's shard_object?/2, on the prefix-qualified key: the
   # char after `<prefix><shard_id>` must be `.` or `@` (never a bare-prefix match).
@@ -1728,37 +1733,22 @@ defmodule Fathom.Shard.Storage.S3 do
   defp tombstoned_ids_page(token, acc) do
     scan_prefix = prefix() <> "tombstones/"
 
-    params =
-      [{"list-type", "2"}, {"prefix", scan_prefix}] ++
-        if(token, do: [{"continuation-token", token}], else: [])
+    with {:ok, page} <- list_page(scan_prefix, token) do
+      ids = tombstone_ids(page.entries, scan_prefix)
 
-    case Req.get(req(), url: url_path(""), params: params) do
-      {:ok, %{status: 200, body: body}} ->
-        ids = tombstone_ids_from_xml(body, scan_prefix)
-
-        case next_token(body) do
-          nil -> {:ok, acc ++ ids}
-          next -> tombstoned_ids_page(next, acc ++ ids)
-        end
-
-      {:ok, %{status: status}} ->
-        {:error, {:s3_list_status, status}}
-
-      {:error, reason} ->
-        {:error, reason}
+      case page.next do
+        nil -> {:ok, acc ++ ids}
+        next -> tombstoned_ids_page(next, acc ++ ids)
+      end
     end
   end
 
-  defp tombstone_ids_from_xml(xml, scan_prefix) when is_binary(xml) do
-    ~r{<Key>(.*?)</Key>}s
-    |> Regex.scan(xml)
-    |> Enum.flat_map(fn [_, key] ->
-      id = String.replace_prefix(key, scan_prefix, "")
-      if id != key and id != "", do: [id], else: []
-    end)
+  defp tombstone_ids(entries, scan_prefix) do
+    for %{key: key} <- entries,
+        id = String.replace_prefix(key, scan_prefix, ""),
+        id != key and id != "",
+        do: id
   end
-
-  defp tombstone_ids_from_xml(_body, _scan_prefix), do: []
 
   defp tombstone_key(shard_id), do: prefix() <> "tombstones/" <> shard_id
 
@@ -1801,41 +1791,23 @@ defmodule Fathom.Shard.Storage.S3 do
   defp list_snapshots(shard_id, token, acc) do
     snap_prefix = prefix() <> shard_id <> "@snap-"
 
-    params =
-      [{"list-type", "2"}, {"prefix", snap_prefix}] ++
-        if(token, do: [{"continuation-token", token}], else: [])
+    with {:ok, page} <- list_page(snap_prefix, token) do
+      entries = snapshot_entries(page.entries, snap_prefix)
 
-    case Req.get(req(), url: url_path(""), params: params) do
-      {:ok, %{status: 200, body: body}} ->
-        entries = snapshot_entries(body, snap_prefix)
-
-        case next_token(body) do
-          nil -> {:ok, Enum.sort_by(acc ++ entries, & &1.id, :desc)}
-          next -> list_snapshots(shard_id, next, acc ++ entries)
-        end
-
-      {:ok, %{status: status}} ->
-        {:error, {:s3_list_status, status}}
-
-      {:error, reason} ->
-        {:error, reason}
+      case page.next do
+        nil -> {:ok, Enum.sort_by(acc ++ entries, & &1.id, :desc)}
+        next -> list_snapshots(shard_id, next, acc ++ entries)
+      end
     end
   end
 
-  defp snapshot_entries(xml, snap_prefix) when is_binary(xml) do
-    ~r{<Contents>.*?<Key>(.*?)</Key>.*?<Size>(\d+)</Size>.*?</Contents>}s
-    |> Regex.scan(xml)
-    |> Enum.flat_map(fn [_, key, size] ->
-      if String.starts_with?(key, snap_prefix) and String.ends_with?(key, ".db") do
-        id = key |> String.replace_prefix(snap_prefix, "") |> String.replace_suffix(".db", "")
-        [%{id: id, bytes: String.to_integer(size)}]
-      else
-        []
-      end
-    end)
+  defp snapshot_entries(entries, snap_prefix) do
+    for %{key: key, size: size} when is_integer(size) <- entries,
+        String.starts_with?(key, snap_prefix) and String.ends_with?(key, ".db") do
+      id = key |> String.replace_prefix(snap_prefix, "") |> String.replace_suffix(".db", "")
+      %{id: id, bytes: size}
+    end
   end
-
-  defp snapshot_entries(_body, _prefix), do: []
 
   # Server-side copy: the destination is the request URL; the source is the
   # bucket-qualified key in x-amz-copy-source (S3/MinIO copy without download).
@@ -2647,45 +2619,25 @@ defmodule Fathom.Shard.Storage.S3 do
   def stored_usage, do: list_usage(nil, 0, 0)
 
   defp list_usage(token, count, bytes) do
-    params =
-      [{"list-type", "2"}, {"prefix", prefix()}] ++
-        if(token, do: [{"continuation-token", token}], else: [])
+    with {:ok, page} <- list_page(prefix(), token) do
+      {count, bytes} = tally_list(page.entries, count, bytes)
 
-    case Req.get(req(), url: url_path(""), params: params) do
-      {:ok, %{status: 200, body: body}} ->
-        {count, bytes} = tally_list(body, count, bytes)
-
-        case next_token(body) do
-          nil -> {count, bytes}
-          next -> list_usage(next, count, bytes)
-        end
-
-      {:ok, %{status: status}} ->
-        {:error, {:s3_list_status, status}}
-
-      {:error, reason} ->
-        {:error, reason}
+      case page.next do
+        nil -> {count, bytes}
+        next -> list_usage(next, count, bytes)
+      end
     end
   end
 
-  defp tally_list(xml, count, bytes) when is_binary(xml) do
-    ~r{<Contents>.*?<Key>(.*?)</Key>.*?<Size>(\d+)</Size>.*?</Contents>}s
-    |> Regex.scan(xml)
-    |> Enum.reduce({count, bytes}, fn [_, key, size], {c, b} ->
-      if live_db_object?(key), do: {c + 1, b + String.to_integer(size)}, else: {c, b}
+  defp tally_list(entries, count, bytes) do
+    Enum.reduce(entries, {count, bytes}, fn
+      %{key: key, size: size}, {c, b} when is_integer(size) ->
+        if live_db_object?(key), do: {c + 1, b + size}, else: {c, b}
+
+      _no_size, acc ->
+        acc
     end)
   end
-
-  defp tally_list(_body, count, bytes), do: {count, bytes}
-
-  defp next_token(xml) when is_binary(xml) do
-    case Regex.run(~r{<NextContinuationToken>(.*?)</NextContinuationToken>}s, xml) do
-      [_, token] -> token
-      _ -> nil
-    end
-  end
-
-  defp next_token(_body), do: nil
 
   defp live_db_object?(key),
     do: String.ends_with?(key, ".db") and not String.contains?(key, "@")
