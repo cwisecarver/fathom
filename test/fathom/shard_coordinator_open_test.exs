@@ -255,48 +255,48 @@ defmodule Fathom.ShardCoordinatorOpenTest do
     end
   end
 
+  # Kill the coordinator's Registry partition, then start the REPLACEMENT coordinator while the
+  # orphan is still alive (it stops itself ~250 ms later via :verify_registration).
+  defp orphan_and_replacement(shard) do
+    {:ok, orphan} = Shards.ensure(shard)
+    {:links, links} = Process.info(orphan, :links)
+
+    partition =
+      Enum.find(links, fn pid ->
+        match?({:registered_name, n} when is_atom(n), Process.info(pid, :registered_name)) and
+          String.starts_with?(
+            Atom.to_string(elem(Process.info(pid, :registered_name), 1)),
+            "Elixir.Fathom.ShardRegistry."
+          )
+      end)
+
+    assert is_pid(partition)
+    ref = Process.monitor(orphan)
+    Process.exit(partition, :kill)
+    {orphan, ref, wait_replacement(shard, orphan, 50)}
+  end
+
+  defp safe_ensure(shard) do
+    Shards.ensure(shard)
+  catch
+    :exit, reason -> {:exit, reason}
+  end
+
+  defp wait_replacement(_shard, _orphan, 0), do: flunk("no replacement coordinator started")
+
+  defp wait_replacement(shard, orphan, n) do
+    case safe_ensure(shard) do
+      {:ok, pid} when pid != orphan ->
+        pid
+
+      _ ->
+        Process.sleep(10)
+        wait_replacement(shard, orphan, n - 1)
+    end
+  end
+
   for mode <- @modes do
     describe "#{mode} mode — fix-review R1-1 / R1-2 (orphan coordinator)" do
-      # Kill the coordinator's Registry partition, then start the REPLACEMENT coordinator while the
-      # orphan is still alive (it stops itself ~250 ms later via :verify_registration).
-      defp orphan_and_replacement(shard) do
-        {:ok, orphan} = Shards.ensure(shard)
-        {:links, links} = Process.info(orphan, :links)
-
-        partition =
-          Enum.find(links, fn pid ->
-            match?({:registered_name, n} when is_atom(n), Process.info(pid, :registered_name)) and
-              String.starts_with?(
-                Atom.to_string(elem(Process.info(pid, :registered_name), 1)),
-                "Elixir.Fathom.ShardRegistry."
-              )
-          end)
-
-        assert is_pid(partition)
-        ref = Process.monitor(orphan)
-        Process.exit(partition, :kill)
-        {orphan, ref, wait_replacement(shard, orphan, 50)}
-      end
-
-      defp safe_ensure(shard) do
-        Shards.ensure(shard)
-      catch
-        :exit, reason -> {:exit, reason}
-      end
-
-      defp wait_replacement(_shard, _orphan, 0), do: flunk("no replacement coordinator started")
-
-      defp wait_replacement(shard, orphan, n) do
-        case safe_ensure(shard) do
-          {:ok, pid} when pid != orphan ->
-            pid
-
-          _ ->
-            Process.sleep(10)
-            wait_replacement(shard, orphan, n - 1)
-        end
-      end
-
       test "an orphan's registry_lost stop leaves the replacement's files and lease intact",
            %{shard: shard} do
         set_mode!(unquote(mode))
