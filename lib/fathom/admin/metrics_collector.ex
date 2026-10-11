@@ -213,7 +213,7 @@ defmodule Fathom.Admin.MetricsCollector do
     current = %{
       node_key: state.node_key,
       at_ms: system_ms(),
-      open_shards: Registry.count(Fathom.ShardRegistry),
+      open_shards: Fathom.Shards.open_count(),
       memory_bytes: :erlang.memory(:total),
       node_qps: node_qps,
       query_p50_ms: PrometheusScrape.percentile_cumulative(s.win, 50),

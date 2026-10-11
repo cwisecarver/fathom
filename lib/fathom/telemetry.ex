@@ -1114,7 +1114,7 @@ defmodule Fathom.Telemetry do
 
   @doc false
   def measure_active_shards do
-    :telemetry.execute([:fathom, :shards], %{active: Registry.count(Fathom.ShardRegistry)}, %{})
+    :telemetry.execute([:fathom, :shards], %{active: Fathom.Shards.open_count()}, %{})
   end
 
   # --- OpenTelemetry span bridge: the checkout :telemetry.span -> an OTel trace span ---

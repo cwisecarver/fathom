@@ -1453,7 +1453,7 @@ defmodule Fathom.Shards do
   defp at_capacity? do
     case max_open_shards() do
       :infinity -> false
-      cap when is_integer(cap) -> Registry.count(@registry) >= cap
+      cap when is_integer(cap) -> open_count() >= cap
     end
   end
 
@@ -1469,9 +1469,19 @@ defmodule Fathom.Shards do
 
   A soft, instantaneous read — a concurrent open or stop moves it. Every caller so far wants an
   order of magnitude, not an exact count.
+
+  It never raises. When a Registry partition has just died (its ETS table goes with it, and
+  `Registry.count/1` then raises on the missing table until the partition restarts), it falls back to
+  the coordinator supervisor's child count. Before that, the admission check (`at_capacity?/0`) raised
+  in that window, so every shard open on the node failed until the partition came back (CI run
+  38106971382, an ArithmeticError from `0 + :undefined` inside `Registry.count/1`).
   """
   @spec open_count() :: non_neg_integer()
-  def open_count, do: Registry.count(@registry)
+  def open_count do
+    Registry.count(@registry)
+  rescue
+    _ in [ArithmeticError, ArgumentError] -> DynamicSupervisor.count_children(@supervisor).active
+  end
 
   defp start(shard_id) do
     case DynamicSupervisor.start_child(@supervisor, {Fathom.Shard, shard_id}) do

@@ -260,10 +260,11 @@ defmodule Fathom.Admin.Measurements do
     )
   end
 
+  # The poller can run before the shard tree is up (or after it is gone): count zero then.
   defp open_shard_count do
-    Registry.count(Fathom.ShardRegistry)
-  rescue
-    ArgumentError -> 0
+    Fathom.Shards.open_count()
+  catch
+    :exit, _ -> 0
   end
 
   @doc """
