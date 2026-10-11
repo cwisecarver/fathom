@@ -850,6 +850,40 @@ defmodule Fathom.ShardExecutor do
   @impl true
   def owner({pid, _ref, _conn, _shard_id, _scope, _ver, _opts}), do: pid
 
+  @doc """
+  Asks the process holding one of this shard's connections to let go of it, so a coordinator drain
+  can finish instead of waiting out its window (expert review 2026-10-10 panel2 H4). `holder` is the
+  process that called `open/2`, which the coordinator already monitors:
+
+    * a `Filo.Stream` (an HTTP baton stream) gets `Filo.Stream.drain/1`: it closes if it is not in a
+      transaction, and the client's next request reopens on the successor;
+    * a Bandit connection process (where a WebSocket's `open/2` runs) gets `Filo.Socket.drain/1`: the
+      socket closes 1001 once no stream on it is in a transaction. The same process type also runs
+      the stateless v1 HTTP request, whose Bandit handler ignores the message;
+    * anything else (a migration job, a harness, an internal `:trusted` caller) is left alone.
+
+  A stream in a transaction is never cut here: it keeps the drain window, and if the window lapses
+  the drain aborts (or, on a node drain, the shutdown that follows rolls it back).
+  """
+  @spec drain_holder(pid()) :: :ok
+  def drain_holder(holder) when is_pid(holder) do
+    case holder_kind(:proc_lib.translate_initial_call(holder)) do
+      :filo_stream -> Filo.Stream.drain(holder)
+      :bandit_connection -> Filo.Socket.drain(holder)
+      :other -> :ok
+    end
+  end
+
+  # Classifies a holder by its initial call (pure, so it is testable without a live listener).
+  # `translate_initial_call/1` answers `{Module, :init, 1}` for a GenServer, and for a dead or
+  # non-proc_lib process an `{:proc_lib, :init_p, 5}` placeholder, which falls to `:other`.
+  @doc false
+  @spec holder_kind(mfa()) :: :filo_stream | :bandit_connection | :other
+  def holder_kind({Filo.Stream, :init, 1}), do: :filo_stream
+  def holder_kind({Bandit.DelegatingHandler, :init, 1}), do: :bandit_connection
+  def holder_kind({Bandit.InitialHandler, :init, 1}), do: :bandit_connection
+  def holder_kind(_), do: :other
+
   # Runs a SQL script (the Hrana `sequence` request — libSQL's `executescript()`, #34): one or more
   # statements for side effects, no rows. A read-only token can't run one (a script writes), and the
   # tenant-DDL block applies to its leading statement.

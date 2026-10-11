@@ -1455,6 +1455,15 @@ defmodule Fathom.Shard do
   def handle_cast({:drain, timeout, reply_to}, state) do
     timer = Process.send_after(self(), :drain_timeout, timeout)
 
+    # Ask every connection holder to let go (expert review 2026-10-10 panel2 H4). Without this a
+    # drain only waited: a django-libsql WebSocket or an HTTP baton stream stays open for as long as
+    # the client keeps it, so a migration or node drain on a served shard always ran out its window
+    # and aborted. Holders not in a transaction close now; one in a transaction keeps the window.
+    state.conns
+    |> Enum.map(fn {_ref, {caller, _op}} -> caller end)
+    |> Enum.uniq()
+    |> Enum.each(&Fathom.ShardExecutor.drain_holder/1)
+
     {:noreply,
      %{cancel_idle(state) | draining: true, drain_timer: timer, drain_reply_to: reply_to}}
   end

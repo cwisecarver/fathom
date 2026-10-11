@@ -160,6 +160,14 @@ deregisters it and stops routing here first), then fans out `request_drain` acro
 coordinator — refuse new checkouts → let in-flight streams finish → flush + release the lease + stop —
 with bounded concurrency and a bounded overall budget. It returns `%{drained, busy, timed_out}`.
 
+**Open connections are asked to close (expert review 2026-10-10 panel2 H4).** When a coordinator
+starts draining it tells each connection holder to let go: a WebSocket closes with code 1001 once
+none of its streams is inside a transaction, and an HTTP baton stream that is not in a transaction
+closes (its next request gets `STREAM_NOT_FOUND`, and the client reopens on the new owner). A stream
+inside a transaction is never cut by the drain: it keeps the window, and if the window lapses the
+shard is reported `busy`, and the shutdown that follows rolls that transaction back. Before this, a
+long-lived django-libsql WebSocket held every drain open until its window ran out, even when idle.
+
 **Wire it as a release pre-stop, ahead of SIGTERM.** In your deploy orchestration (or a
 `rel/env.sh.eex` pre-stop hook), before stopping the node:
 
