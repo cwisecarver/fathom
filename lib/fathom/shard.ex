@@ -2058,8 +2058,18 @@ defmodule Fathom.Shard do
   # now — flushing, dropping, releasing the lease or `forget`-ing any of it would destroy the live
   # coordinator's state (fix-review R1-1). Close only what is ours alone: the handle pool, and
   # answer any pending flush waiters. Open stream connections end with their streams.
+  #
+  # ITS OWN IN-FLIGHT WORK IS ALSO OURS ALONE (expert review 2026-10-12 #27): shut the flush, renew
+  # and lapse tasks down rather than leaving them to the exit signal — NOT settled, because settling
+  # folds a flush result into the provenance sidecar, which is the replacement's file — and give
+  # back the node-global FlushGate slot, which otherwise stayed held until the sweep found the dead
+  # holder. Lent pooled handles whose stream is already dead are closed too (their `:DOWN` is still
+  # in the mailbox); a live stream's lent handle is in use and is closed by that stream's own
+  # teardown when it sees us go down, as on every other terminate path.
   def terminate({:shutdown, :registry_lost}, state) do
     close_pool(state)
+    close_abandoned_lent(state)
+    state = shutdown_orphan_tasks(state)
     settle_waiters(state, {:error, :coordinator_stopped})
     :ok
   end
@@ -2348,6 +2358,33 @@ defmodule Fathom.Shard do
         Connection.close(conn)
         %{state | lent: lent}
     end
+  end
+
+  # The orphan's half of `close_lent/2` (expert review 2026-10-12 #27): only grants whose holder is
+  # already gone, i.e. whose `:DOWN` we will now never process. See terminate's `registry_lost`.
+  defp close_abandoned_lent(state) do
+    conns = Map.get(state, :conns, %{})
+
+    for {ref, conn} <- Map.get(state, :lent, %{}),
+        not live_holder?(conns, ref),
+        do: Connection.close(conn)
+
+    :ok
+  end
+
+  defp live_holder?(conns, ref) do
+    case Map.get(conns, ref) do
+      {caller, _op} when is_pid(caller) -> Process.alive?(caller)
+      _ -> false
+    end
+  end
+
+  defp shutdown_orphan_tasks(state) do
+    for key <- [:flush_task, :renew_task, :lapse_revalidate_pending],
+        match?(%Task{}, Map.get(state, key)),
+        do: Task.shutdown(Map.fetch!(state, key), :brutal_kill)
+
+    release_flush_slot(state)
   end
 
   # Close, never pool, when pooling is off or the shard is draining (a draining shard is on its way
