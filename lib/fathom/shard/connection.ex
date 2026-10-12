@@ -577,13 +577,19 @@ defmodule Fathom.Shard.Connection do
   # disk forever, since SQLite reuses the file in place after a checkpoint rather than shrinking it.
   # With it, the writer that resets the log truncates the file back to this many bytes.
   #
-  # A2 IS SAFE WITH THIS, and it was checked rather than assumed (A2 reads the WAL by offset through
-  # a held fd): a truncation happens only at a log reset, which A2 already detects from the header
-  # (ckpt_seq + salt1), and a pread past the new EOF is a `:short_read`, which fails the round and
-  # re-plans (`Session.build_pushes/5`). Proved by running the whole suite at a limit of 0 (every
-  # reset truncates): no A2 correctness test failed; three fixtures could no longer BUILD a
-  # reused-in-place WAL, which a 64 MiB limit leaves intact for any WAL under it.
-  # `wal_truncate_test.exs` pins the safe direction. The rig check is recorded in the commit.
+  # A2 IS SAFE WITH THIS, and what makes it safe is `Session.build_pushes/5`'s header re-check
+  # (expert review 2026-10-12 #33), not the truncation being detectable on its own. A truncation
+  # happens only at a log reset, which changes the WAL header's (ckpt_seq, salt1). A2 reads the
+  # header, then the planned range through a held fd, then RE-READS the header and fails the round
+  # with `:checkpoint_during_push` unless it is unchanged. That covers BOTH shapes: a reset that
+  # truncates the file (the range then reads `:short_read`, which also fails the round), and a reset
+  # whose new generation has already regrown PAST the planned range, where the pread succeeds and
+  # returns new-generation bytes under the old header; only the header re-check catches that one,
+  # and `replication_commit_test.exs` (#33) pins it. The next
+  # round re-plans. Proved by running the whole suite at a limit of 0 (every reset truncates): no
+  # A2 correctness test failed; three fixtures could no longer BUILD a reused-in-place WAL, which a
+  # 64 MiB limit leaves intact for any WAL under it. `wal_truncate_test.exs` pins only the narrow
+  # truncated-short-read direction. The rig check is recorded in the commit.
   #
   # Not a tenant pragma (the executor's allow-list does not admit it), so pooled reuse never sees a
   # changed value and it is not in `pinned_pragmas/0`. A negative value means "no limit".

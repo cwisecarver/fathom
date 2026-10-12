@@ -320,4 +320,28 @@ defmodule Fathom.RuntimeConfigTest do
       end
     end
   end
+
+  # --- Expert review 2026-10-12 #33: JOURNAL_SIZE_LIMIT parsing -----------------------------------
+  # `String.to_integer/1` turned a typo into an ArgumentError with no mention of the variable. The
+  # reading code (`maybe_journal_size_limit/1`) silently ignores a non-integer, so a bad value that
+  # got past boot would mean "no limit" with no signal. Boot must name the variable instead.
+  test "JOURNAL_SIZE_LIMIT accepts an integer (including 0 and -1)" do
+    for {raw, n} <- [{"0", 0}, {"-1", -1}, {"1048576", 1_048_576}, {" 7 ", 7}] do
+      assert Keyword.fetch!(fathom_config(%{"JOURNAL_SIZE_LIMIT" => raw}), :journal_size_limit) ==
+               n
+    end
+  end
+
+  test "JOURNAL_SIZE_LIMIT unset leaves the Connection default (64 MiB) in force" do
+    refute Keyword.has_key?(fathom_config(%{"JOURNAL_SIZE_LIMIT" => nil}), :journal_size_limit)
+  end
+
+  test "a non-integer JOURNAL_SIZE_LIMIT is a clear boot error naming the variable" do
+    for bad <- ["64MiB", "1.5", "", "abc"] do
+      error =
+        assert_raise RuntimeError, fn -> fathom_config(%{"JOURNAL_SIZE_LIMIT" => bad}) end
+
+      assert error.message =~ "JOURNAL_SIZE_LIMIT must be an integer"
+    end
+  end
 end

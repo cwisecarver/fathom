@@ -900,7 +900,12 @@ defmodule Fathom.Shard.Replication.Session do
   defp complete?(plans, %{commit_extent: extent}),
     do: Enum.all?(plans, fn {_shipper, {_kind, off, len}} -> off + len >= extent end)
 
-  defp build_pushes(state, wal_path, epoch, header, plans) do
+  # Public (`@doc false`) only so the 2026-10-12 #33 regression test can hand it a header taken
+  # BEFORE a log reset — the exact window between `ship/5`'s header read and this function's payload
+  # reads, which nothing else can land a reset inside deterministically. Production reaches it
+  # through `ship_planned/4`. Same precedent as `do_seed/6`.
+  @doc false
+  def build_pushes(state, wal_path, epoch, header, plans) do
     # One read per DISTINCT range, not per follower.
     ranges = plans |> Enum.map(fn {_s, {_k, off, len}} -> {off, len} end) |> Enum.uniq()
 

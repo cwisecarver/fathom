@@ -431,7 +431,16 @@ end
 # `Fathom.Shard.Connection.maybe_journal_size_limit/1`). -1 turns it off. The chaos rig sets 0 to
 # make every log reset truncate, which is the A2 stress case.
 if bytes = System.get_env("JOURNAL_SIZE_LIMIT") do
-  config :fathom, :journal_size_limit, String.to_integer(bytes)
+  # A clear boot error, not a `String.to_integer` ArgumentError (expert review 2026-10-12 #33).
+  # `maybe_journal_size_limit/1` would silently ignore a non-integer, so there is no later check.
+  case Integer.parse(String.trim(bytes)) do
+    {n, ""} ->
+      config :fathom, :journal_size_limit, n
+
+    _ ->
+      raise "JOURNAL_SIZE_LIMIT must be an integer number of bytes (-1 = no limit, 0 = truncate " <>
+              "on every log reset), got: #{inspect(bytes)}"
+  end
 end
 
 if ms = System.get_env("SHARD_IDLE_MS") do

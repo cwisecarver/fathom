@@ -734,11 +734,70 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       :ok = Connection.close(conn)
     end
 
+    # Expert review 2026-10-12 #33: the SESSION-LEVEL behaviour, not just the structure. A log
+    # reset whose new generation is at least as long as the planned range leaves the planned
+    # (off, len) perfectly readable — `read_delta` succeeds with new-generation bytes — so only the
+    # header re-check in `Session.build_pushes/5` stands between those bytes and a follower stamped
+    # with the old generation. (This is also the shape `journal_size_limit` makes possible, which is
+    # why its rationale cites this check rather than the short read.)
+    #
+    # The window is landed deterministically by SEQUENCE rather than by timing: take the header and
+    # plan from it (what `ship/5` does), THEN reset and regrow the log, THEN call `build_pushes/5`
+    # with the now-stale header. That is exactly the interleaving the race produces.
+    test "a WAL reset (new generation as long as the plan) fails the round; no stale delta ships" do
+      path = Path.join(System.tmp_dir!(), "wal33_#{System.unique_integer([:positive])}.db")
+      wal = path <> "-wal"
+      on_exit(fn -> for sfx <- ["", "-wal", "-shm"], do: File.rm(path <> sfx) end)
+
+      {:ok, conn} = Connection.open(path)
+      on_exit(fn -> Connection.close(conn) end)
+      {:ok, _} = Connection.query(conn, "PRAGMA wal_autocheckpoint=0", [])
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER, b TEXT)", [])
+      blob = String.duplicate("y", 1024)
+
+      for i <- 1..3 do
+        {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?, ?)", [i, blob])
+      end
+
+      # ship/5's header read, and the plan a follower at the start of the log would get.
+      {:ok, planned_from} = Fathom.Shard.Replication.Wal.read(wal)
+      off = Fathom.Shard.Replication.Wal.header_bytes()
+      len = planned_from.commit_extent - off
+      assert len > 0
+
+      # A checkpoint, then writes: the log restarts. Keep writing until the NEW generation is at
+      # least as long as the planned range, so the pread of (off, len) succeeds on new bytes.
+      {:ok, _} = Connection.query(conn, "PRAGMA wal_checkpoint(PASSIVE)", [])
+
+      for i <- 100..130 do
+        {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?, ?)", [i, blob])
+      end
+
+      {:ok, now} = Fathom.Shard.Replication.Wal.read(wal)
+
+      assert {now.ckpt_seq, now.salt1} != {planned_from.ckpt_seq, planned_from.salt1},
+             "the log was not reset, so the fixture shows nothing"
+
+      assert now.commit_extent >= planned_from.commit_extent,
+             "the new generation is shorter than the plan: that is a :short_read, which the " <>
+               "other guard catches; the case under test is the regrown one"
+
+      # PRECONDITION that makes this test discriminate: the byte read alone is perfectly happy.
+      assert {:ok, bin} = Fathom.Shard.Replication.Wal.read_delta(wal, off, len)
+      assert byte_size(bin) == len
+
+      state = %{wal_fd: nil, shard_id: "wal33"}
+      plans = [{:shipper, {:append, off, len}}]
+
+      assert {:error, :checkpoint_during_push, _state} =
+               Session.build_pushes(state, wal, 1, planned_from, plans)
+    end
+
     test "FIX: build_pushes re-reads the header and checks it after reading the payloads" do
       source = File.read!("lib/fathom/shard/replication/session.ex")
 
       [_, body] =
-        String.split(source, "defp build_pushes(state, wal_path, epoch, header, plans) do",
+        String.split(source, "def build_pushes(state, wal_path, epoch, header, plans) do",
           parts: 2
         )
 
