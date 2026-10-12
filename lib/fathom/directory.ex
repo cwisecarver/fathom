@@ -1089,14 +1089,14 @@ defmodule Fathom.Directory do
   end
 
   @doc """
-  Quarantined (`migration_failed`) shards still BELOW `head` — the quarantined slice that is not at
-  the fleet's version. Unlike `count_laggards/1` (active only), this is what `Migrator.status/0`
-  folds into `converged` (expert review 2026-10-10 #4).
+  Quarantined (`migration_failed`) shards NOT at `head` — below it (expert review 2026-10-10 #4) or
+  ABOVE it (a revert-failed shard left at the yanked vN; expert review 2026-10-12 #6). Unlike
+  `count_laggards/1` (active only), this is what `Migrator.status/0` folds into `converged`.
   """
-  @spec count_failed_below(non_neg_integer()) :: non_neg_integer()
-  def count_failed_below(head) do
+  @spec count_failed_off_head(non_neg_integer()) :: non_neg_integer()
+  def count_failed_off_head(head) do
     Repo.aggregate(
-      from(s in Shard, where: s.status == "migration_failed" and s.schema_version < ^head),
+      from(s in Shard, where: s.status == "migration_failed" and s.schema_version != ^head),
       :count
     )
   end

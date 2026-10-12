@@ -407,6 +407,23 @@ defmodule Fathom.Migrator.RolloutTest do
              "a quarantined shard below head must hold the deploy gate"
     end
 
+    # Expert review 2026-10-12 #6. Symptom: a revert that failed left its shard `migration_failed` at
+    # head+1 (the yanked schema); count_failed_below only saw < head, so the gate read converged.
+    test "converged is false while a migration_failed shard sits ABOVE head" do
+      {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
+      {:ok, _} = Migrator.release(3, "v3", ["SELECT 1"])
+      {:ok, _} = Directory.resolve("cg_hi")
+      {:ok, _} = Directory.cutover("cg_hi", 3)
+      assert :ok = Migrator.yank(3)
+      assert Migrator.head() == 2
+      {:ok, _} = Directory.mark_failed("cg_hi")
+
+      assert {:ok, %{schema_version: 3, status: "migration_failed"}} = Directory.get("cg_hi")
+
+      assert %{converged: false, above_head: 0, failed: 1} = Migrator.status(),
+             "a quarantined shard above head must hold the deploy gate"
+    end
+
     test "ReconcileJob requeues a migration_failed shard only after the cool-off" do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       {:ok, _} = Directory.resolve("cf")

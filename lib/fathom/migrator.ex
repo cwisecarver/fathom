@@ -925,7 +925,7 @@ defmodule Fathom.Migrator do
       # brownout that quarantined a fleet slice left the deploy gate green.
       converged:
         laggards == 0 and above_head == 0 and in_flight == 0 and
-          Directory.count_failed_below(head) == 0,
+          Directory.count_failed_off_head(head) == 0,
       # `pending_review` stays a list of VERSION NUMBERS. Changing it to the block objects broke
       # `migration_controller_test` immediately, which is the API's own consumers telling you the
       # same thing: this is a published control-plane endpoint and a field changing type is a
