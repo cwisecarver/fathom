@@ -93,11 +93,29 @@ defmodule Fathom.Directory do
       last_active_at: now
     })
     |> Repo.insert(
-      # On re-resolve, only bump recency — never reset version/status.
-      on_conflict: [set: [last_active_at: now, updated_at: now]],
+      # On re-resolve, only bump recency — never reset version/status. The recency stamp is the
+      # Postgres clock, like every `last_active_at` the Recorder writes and like `cutover_at`
+      # (expert review 2026-10-12 #8): the revert write-age guard compares them, so a caller on a
+      # node whose clock runs behind must not record a post-cutover access as pre-cutover.
+      on_conflict:
+        from(s in Shard,
+          update: [set: [last_active_at: fragment("clock_timestamp()"), updated_at: ^now]]
+        ),
       conflict_target: :shard_id,
       returning: true
     )
+  end
+
+  @doc """
+  The Postgres server's clock, now — the ONE clock `last_active_at` and `cutover_at` are stamped
+  from (expert review 2026-10-12 #8). `clock_timestamp()`, not `now()`: `now()` is the start of the
+  enclosing transaction, which is frozen for a whole test under the SQL sandbox and lags inside any
+  longer transaction.
+  """
+  @spec db_now() :: DateTime.t()
+  def db_now do
+    %{rows: [[%DateTime{} = now]]} = Repo.query!("SELECT clock_timestamp()")
+    now
   end
 
   @doc """
@@ -108,6 +126,11 @@ defmodule Fathom.Directory do
   and a re-sight only bumps recency — never resets version/status. Returns the
   number of rows written. Raises on a Postgres error; the caller (the recorder)
   treats flushing as best-effort.
+
+  **The stamps must be on the Postgres clock (`db_now/0`)**, the clock `cutover_at` is stamped
+  from — the Recorder rebases its node-clock stamps before calling this (expert review
+  2026-10-12 #8). A raw node-clock stamp reintroduces the cross-node skew the write-age guard
+  cannot see.
 
   **A re-touch is written at most every `:directory_touch_granularity_s` (30 s)** — perf
   review 2026-10-01 #22. Every write here is a non-HOT update (`last_active_at` and
@@ -528,8 +551,13 @@ defmodule Fathom.Directory do
     end
   end
 
+  # `now` is the POSTGRES clock, not this node's (expert review 2026-10-12 #8). The revert write-age
+  # guard compares `cutover_at` against `last_active_at`, which a DIFFERENT node — the one serving
+  # the tenant — records; stamped from two nodes' clocks, a serving node running behind made a
+  # post-cutover write read as pre-cutover and an unforced revert discarded it. Both now come from
+  # the one clock (the Recorder rebases its stamps onto it; `resolve/1` stamps it directly).
   defp cutover_attrs(schema_version, used_since_live? \\ false) do
-    now = DateTime.utc_now()
+    now = db_now()
 
     %{
       schema_version: schema_version,

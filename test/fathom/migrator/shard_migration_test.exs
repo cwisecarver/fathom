@@ -1030,6 +1030,36 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert %{rows: [[2]]} = query_live!(shard, "PRAGMA user_version")
   end
 
+  # Expert review 2026-10-12 #8: `last_active_at` was stamped by the SERVING node's clock and
+  # `cutover_at` by the MIGRATING node's. With the serving node's clock behind, a write made after
+  # the cutover was recorded with an instant before it, the guard saw "no writes since cutover",
+  # and an unforced revert discarded the write. The invariant pinned: a post-cutover touch blocks
+  # the unforced revert however far the recording node's clock lags — both stamps are on ONE clock.
+  #
+  # The skewed node is simulated end to end: the buffered stamp is its (5 s slow) clock reading,
+  # and the flush samples that same slow clock for its offset to Postgres, as that node's Recorder
+  # would.
+  test "a post-cutover touch from a node whose clock runs behind still blocks the revert",
+       %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, _} = ShardMigration.run(shard, 2)
+
+    skew_us = 5_000_000
+    slow_clock = fn -> System.os_time(:microsecond) - skew_us end
+
+    # Tenant traffic AFTER the cutover, recorded on the slow node.
+    :ets.insert(Fathom.Directory.Recorder, {shard, slow_clock.()})
+    Fathom.Directory.Recorder.flush(node_clock_us: slow_clock)
+
+    assert {:error, {:writes_since_cutover, _}} = ShardMigration.revert(shard, 1),
+           "a write recorded by a node whose clock lags the migrator's read as pre-cutover, " <>
+             "so an unforced revert discarded it"
+
+    assert %{rows: [[2]]} = query_live!(shard, "PRAGMA user_version")
+    refute retained?(shard, 2), "a refused revert must not touch storage"
+  end
+
   # A quiet shard (no directory activity since cutover) reverts without force: cutover stamps
   # last_active_at and cutover_at with the same instant, so "no activity" is exactly equality.
   test "revert of a quiet shard needs no force", %{shard: shard} do

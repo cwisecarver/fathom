@@ -202,54 +202,62 @@ defmodule Fathom.Directory.RecorderTest do
   #
   # Many samples deliberately: one sample discriminates ~99.9% of the time, so ALL of N must hold
   # for the assertion to be effectively deterministic rather than merely likely.
-  test "record/1 stamps on DateTime.utc_now/0's clock, so it orders against cutover_at" do
+  #
+  # UPDATED for expert review 2026-10-12 #8: `cutover_at` is now stamped from the POSTGRES clock
+  # (`Directory.db_now/0`), and the flush rebases every buffered stamp onto it, so the bounds are
+  # Postgres clock readings — taken before the touch and after the flush (the rebase can place a
+  # stamp up to the offset query's latency after the touch, never before it). This previously
+  # asserted `DateTime.utc_now/0` bounds, which pinned the two-node-clocks design #8 removed.
+  test "record/1 stamps land on cutover_at's clock (Postgres), so they order against it" do
     samples =
       for _ <- 1..50 do
         id = uniq()
-        before = DateTime.utc_now()
+        before = Directory.db_now()
         :ok = Recorder.record(id)
-        {id, before, DateTime.utc_now()}
+        {id, before}
       end
 
     Recorder.flush()
+    later = Directory.db_now()
 
-    for {id, before, later} <- samples do
+    for {id, before} <- samples do
       {:ok, row} = Directory.get(id)
 
       assert DateTime.compare(row.last_active_at, before) != :lt,
-             "last_active_at (#{inspect(row.last_active_at)}) landed BEFORE a DateTime.utc_now/0 " <>
+             "last_active_at (#{inspect(row.last_active_at)}) landed BEFORE a database clock reading " <>
                "taken before the touch (#{inspect(before)}) — the recorder is on a different " <>
                "clock from cutover_at, so the revert write-age guard can discard real writes"
 
       assert DateTime.compare(row.last_active_at, later) != :gt,
-             "last_active_at (#{inspect(row.last_active_at)}) landed AFTER a DateTime.utc_now/0 " <>
-               "taken after the touch (#{inspect(later)})"
+             "last_active_at (#{inspect(row.last_active_at)}) landed AFTER a database clock reading " <>
+               "taken after the flush (#{inspect(later)})"
     end
   end
 
   # Same invariant for the flush buffer: `last_flushed_at` is subtracted from `last_active_at` to
   # report each tenant's loss window, so a cross-clock stamp skews that window — in the direction
   # that UNDER-reports how much a node loss cost.
-  test "record_flush/1 stamps on DateTime.utc_now/0's clock too" do
+  test "record_flush/1 stamps land on the same (Postgres) clock too" do
     samples =
       for _ <- 1..50 do
         id = uniq()
         {:ok, _} = Directory.resolve(id)
-        before = DateTime.utc_now()
+        before = Directory.db_now()
         :ok = Recorder.record_flush(id)
-        {id, before, DateTime.utc_now()}
+        {id, before}
       end
 
     Recorder.flush()
+    later = Directory.db_now()
 
-    for {id, before, later} <- samples do
+    for {id, before} <- samples do
       {:ok, row} = Directory.get(id)
 
       assert DateTime.compare(row.last_flushed_at, before) != :lt,
-             "last_flushed_at landed before a prior DateTime.utc_now/0 — cross-clock stamp"
+             "last_flushed_at landed before a prior database clock reading — cross-clock stamp"
 
       assert DateTime.compare(row.last_flushed_at, later) != :gt,
-             "last_flushed_at landed after a later DateTime.utc_now/0 — cross-clock stamp"
+             "last_flushed_at landed after a later database clock reading — cross-clock stamp"
     end
   end
 

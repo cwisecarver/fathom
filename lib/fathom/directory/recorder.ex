@@ -60,6 +60,10 @@ defmodule Fathom.Directory.Recorder do
     # cutover and the touch is smaller than the skew, the guard fails to refuse an unforced revert
     # and DISCARDS committed post-cutover tenant writes — exactly the loss the guard exists to
     # prevent. It surfaced as an intermittent failure in ShardMigrationTest.
+    #
+    # Since expert review 2026-10-12 #8 `cutover_at` is on the POSTGRES clock and the flush rebases
+    # these stamps onto it by an offset sampled with `System.os_time` (`do_flush/2`). This stamp and
+    # that sample must still be the same clock, or the offset carries the slew above.
     :ets.insert(@table, {shard_id, System.os_time(:microsecond)})
     :ok
   rescue
@@ -93,6 +97,13 @@ defmodule Fathom.Directory.Recorder do
   @spec flush() :: non_neg_integer()
   def flush, do: GenServer.call(__MODULE__, :flush)
 
+  @doc false
+  # Test seam (expert review 2026-10-12 #8): `node_clock_us:` replaces this node's clock reading
+  # when the flush samples its offset to the Postgres clock, to simulate a node whose clock is
+  # skewed. Never used outside tests.
+  @spec flush(keyword()) :: non_neg_integer()
+  def flush(opts), do: GenServer.call(__MODULE__, {:flush, opts})
+
   @impl true
   def init(opts) do
     # Trap exits so a supervisor :shutdown runs terminate/2's final flush (expert
@@ -122,6 +133,10 @@ defmodule Fathom.Directory.Recorder do
   @impl true
   def handle_call(:flush, _from, state) do
     {:reply, do_flush(), state}
+  end
+
+  def handle_call({:flush, opts}, _from, state) do
+    {:reply, do_flush(:infinity, Keyword.get(opts, :node_clock_us, &node_clock_us/0)), state}
   end
 
   @impl true
@@ -192,13 +207,65 @@ defmodule Fathom.Directory.Recorder do
   # `flush_lag_report/1` called the shard clean while it held unflushed writes from t2 — wrong
   # until its next flush, which for a shard gone quiet may never come. Landing the flush first lets
   # the escape see it.
-  defp do_flush(deadline \\ :infinity) do
-    flush_table(
-      @flush_table,
-      &Directory.record_flush_batch/1,
-      [:fathom, :directory, :flush_recorded],
-      deadline
-    ) + flush_table(@table, &Directory.record_batch/1, [:fathom, :directory, :flush], deadline)
+  #
+  # ONE CLOCK: POSTGRES'S (expert review 2026-10-12 #8). The buffered stamps are this node's
+  # `System.os_time`, but `cutover_at` is stamped by whichever node ran the migration, and the
+  # revert write-age guard compares the two. A serving node whose clock ran behind the migrator's
+  # recorded a post-cutover write as pre-cutover, the guard let an unforced revert through, and the
+  # revert discarded that write. So every stamp is rebased onto the Postgres clock before it is
+  # written — the clock `Directory.cutover/2` also stamps `cutover_at` from.
+  #
+  # The rebase is an OFFSET sampled once per flush (`db_offset_us/1`), not a per-row
+  # `clock_timestamp()` in the upsert: one offset applied to both buffers keeps every relative
+  # order between this node's stamps exact to the microsecond — the flush-vs-access ordering the
+  # loss report depends on (#24 above) — while moving all of them onto the shared clock. The node
+  # clock is read BEFORE the database's, so the offset can only overshoot (by the query's latency):
+  # a rebased stamp is never earlier than the event, which errs toward REFUSING a revert, the
+  # guard's documented safe direction. Do not swap the two reads.
+  #
+  # No offset (Postgres unreachable) ⇒ write nothing and leave the buffer for the next tick: the
+  # upsert would fail in the same outage, and writing node-clock stamps is the bug.
+  defp do_flush(deadline \\ :infinity, node_clock \\ &node_clock_us/0) do
+    if pending() == 0 do
+      0
+    else
+      case db_offset_us(node_clock) do
+        {:ok, offset} ->
+          flush_table(
+            @flush_table,
+            &Directory.record_flush_batch/1,
+            [:fathom, :directory, :flush_recorded],
+            deadline,
+            offset
+          ) +
+            flush_table(
+              @table,
+              &Directory.record_batch/1,
+              [:fathom, :directory, :flush],
+              deadline,
+              offset
+            )
+
+        :error ->
+          0
+      end
+    end
+  end
+
+  # The clock `record/1` and `record_flush/1` stamp with.
+  defp node_clock_us, do: System.os_time(:microsecond)
+
+  defp db_offset_us(node_clock) do
+    before = node_clock.()
+    {:ok, DateTime.to_unix(Directory.db_now(), :microsecond) - before}
+  rescue
+    e ->
+      Logger.warning("Directory.Recorder flush skipped, no database clock: #{inspect(e)}")
+      :error
+  catch
+    :exit, reason ->
+      Logger.warning("Directory.Recorder flush skipped, no database clock: #{inspect(reason)}")
+      :error
   end
 
   # Drain and upsert in bounded chunks (expert review 2026-07-24 #23) rather than materializing the
@@ -213,14 +280,14 @@ defmodule Fathom.Directory.Recorder do
   # in the first place.
   @drain_chunk 2_000
 
-  defp flush_table(table, upsert, event, deadline) do
-    flush_chunks(table, upsert, event, 0, deadline)
+  defp flush_table(table, upsert, event, deadline, offset) do
+    flush_chunks(table, upsert, event, 0, deadline, offset)
   end
 
   # STOPS on a failed chunk. `restore/2` re-buffers the failed rows into the same table, so
   # continuing would immediately re-drain them and loop forever. Halting leaves them for the next
   # flush cycle, which is exactly the pre-chunking behaviour.
-  defp flush_chunks(table, upsert, event, acc, deadline) do
+  defp flush_chunks(table, upsert, event, acc, deadline, offset) do
     if past?(deadline) do
       acc
     else
@@ -229,8 +296,8 @@ defmodule Fathom.Directory.Recorder do
           acc
 
         rows ->
-          case flush_rows(table, rows, upsert, event) do
-            {:ok, n} -> flush_chunks(table, upsert, event, acc + n, deadline)
+          case flush_rows(table, rows, upsert, event, offset) do
+            {:ok, n} -> flush_chunks(table, upsert, event, acc + n, deadline, offset)
             :failed -> acc
           end
       end
@@ -240,19 +307,23 @@ defmodule Fathom.Directory.Recorder do
   defp past?(:infinity), do: false
   defp past?(deadline), do: System.monotonic_time(:millisecond) >= deadline
 
-  # No empty-list branch: `flush_chunks/5` is the only caller and already returns on `drain_chunk`
+  # No empty-list branch: `flush_chunks/6` is the only caller and already returns on `drain_chunk`
   # giving `[]`, so `rows` is always non-empty here. The check used to live in both places and was
   # left behind when chunking moved it up.
-  defp flush_rows(table, rows, upsert, event) do
+  defp flush_rows(table, rows, upsert, event, offset) do
     case rows do
       rows ->
         try do
           # The buffer holds integer microsecond stamps (see record/1); Directory's batch API
           # keeps its DateTime contract (:utc_datetime_usec — hence microsecond, not ms), so
-          # convert here — once per distinct shard per flush.
+          # convert here — once per distinct shard per flush — rebased onto the Postgres clock
+          # (#8, see do_flush/2). `restore/2` re-buffers the RAW node stamps, so a retried row
+          # is rebased with the retry's fresh offset, never twice.
           n =
             upsert.(
-              Enum.map(rows, fn {id, us} -> {id, DateTime.from_unix!(us, :microsecond)} end)
+              Enum.map(rows, fn {id, us} ->
+                {id, DateTime.from_unix!(us + offset, :microsecond)}
+              end)
             )
 
           if n > 0, do: :telemetry.execute(event, %{count: n}, %{})
