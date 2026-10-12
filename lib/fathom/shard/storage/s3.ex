@@ -173,6 +173,16 @@ defmodule Fathom.Shard.Storage.S3 do
     # A create-only PUT against an existing object MUST be refused.
     probe_status!(key, [{"if-none-match", "*"}], [412], "If-None-Match enforcement")
 
+    # A fenced PUT against a MISSING key must also be refused: AWS answers 404 NoSuchKey, others
+    # 412. `flush/6` maps both to :superseded (expert review 2026-10-12 #22); a store answering 2xx
+    # here would let a fenced flush resurrect a purged object.
+    probe_status!(
+      key <> ".absent",
+      [{"if-match", ~s("fathom-bogus-etag")}],
+      [404, 412],
+      "If-Match on a missing key"
+    )
+
     # Round-2 #4: the steal fence is only real if a touch produces a GENUINELY new
     # etag — on MD5-etag stores a plain self-copy does NOT rotate (same bytes, same
     # MD5). Probe BOTH alternating copy forms (single→multipart, multipart→single)
@@ -399,6 +409,13 @@ defmodule Fathom.Shard.Storage.S3 do
           # pays the HEAD above.
           s when s in 200..299 -> {:ok, etag(resp.headers), carried}
           412 -> {:error, :superseded}
+          # A FENCED (If-Match) PUT to a key that no longer exists: AWS answers 404 NoSuchKey
+          # rather than 412 (expert review 2026-10-12 #22). The fence did its job — the object we
+          # fenced on is gone (purge/delete) — so it is the same self-fence verdict as 412; the
+          # coordinator's `reconcile_superseded` re-checks the lock and either resyncs to an
+          # absent object (lock still ours) or self-fences. Not for the create-only
+          # (If-None-Match) form, where a 404 is a real error (missing bucket).
+          404 when expected_etag != nil -> {:error, :superseded}
           s -> {:error, {:s3_put_status, s}}
         end
       end
