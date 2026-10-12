@@ -1121,9 +1121,20 @@ defmodule Fathom.Shards do
 
       true ->
         case registry_lookup(shard_id) do
-          {:ok, [{pid, _}]} -> {:ok, pid}
-          {:ok, []} -> start_if_capacity(shard_id)
-          {:error, :unavailable} = unavailable -> unavailable
+          {:ok, [{pid, _}]} ->
+            {:ok, pid}
+
+          # Just drained for another node's migration (expert review 2026-10-12 #23): re-opening
+          # here would re-take the lease before the migrator's acquire and livelock a hot tenant's
+          # migration. Refused with the retryable migrating error until the short gate expires.
+          # Only on this cold-open branch, so a running shard's checkout never pays for it.
+          {:ok, []} ->
+            if Fathom.Shards.MigrationGate.closed?(shard_id),
+              do: {:error, {:shard_migrating, :drained_for_migration}},
+              else: start_if_capacity(shard_id)
+
+          {:error, :unavailable} = unavailable ->
+            unavailable
         end
     end
   end

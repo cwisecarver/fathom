@@ -54,6 +54,99 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     assert Commands.get(cmd.id).status == "done"
   end
 
+  defp touch_loop(shard, parent) do
+    outcome =
+      case Shards.checkout(shard) do
+        {:ok, pid, ref, _path} ->
+          Fathom.Shard.checkin(pid, ref)
+          :opened
+
+        {:error, reason} ->
+          reason
+      end
+
+    send(parent, {:touched, outcome})
+    touch_loop(shard, parent)
+  end
+
+  # Waits for `n` client attempts that STARTED after this call, discarding older ones.
+  defp await_fresh_touches(n) do
+    flush_touches()
+    for _ <- 1..n, do: assert_receive({:touched, _}, 5_000)
+  end
+
+  defp flush_touches do
+    receive do
+      {:touched, _} -> flush_touches()
+    after
+      0 -> :ok
+    end
+  end
+
+  describe "drain_for_migration re-open gate (expert review 2026-10-12 #23)" do
+    # A hot tenant's requests keep arriving at the holder (the LB routes there) while a migrator on
+    # another node waits for its drain_for_migration to complete and then acquires the lease. The
+    # request right after the drain re-opened the shard and re-took the lease first, every time, so
+    # the migration snoozed forever. The invariant pinned: after the holder completes the drain, a
+    # continuously-touching client cannot re-take the lease ahead of the migrator.
+    setup %{shard: shard} do
+      on_exit(fn -> Fathom.Shards.MigrationGate.open(shard) end)
+      :ok
+    end
+
+    test "the migrator's lease acquire wins against a continuously-touched shard",
+         %{shard: shard, node: node} do
+      {:ok, pid, ref, _path} = Shards.checkout(shard)
+      Fathom.Shard.checkin(pid, ref)
+
+      parent = self()
+      toucher = spawn_link(fn -> touch_loop(shard, parent) end)
+      await_fresh_touches(3)
+
+      {:ok, cmd} = Commands.issue(shard, node, "drain_for_migration")
+      start_supervised!(CommandPoller)
+      assert CommandPoller.poll_now() == 1
+      assert Commands.get(cmd.id).status == "done"
+
+      # The client gets its post-drain requests in BEFORE the migrator acquires — the race the
+      # migrator lost. Two, so at least one started after the drain completed.
+      await_fresh_touches(2)
+
+      assert {:ok, lease} =
+               Fathom.Shard.Storage.acquire_lease(shard, "migrator@test@1", 30_000),
+             "a client re-opened the drained shard and re-took the lease before the migrator"
+
+      Process.unlink(toucher)
+      Process.exit(toucher, :kill)
+      :ok = Fathom.Shard.Storage.release_lease(shard, lease)
+    end
+
+    test "open/1 (a failed drain) lifts the gate so the shard serves here again", %{shard: shard} do
+      Fathom.Shards.MigrationGate.close(shard, 60_000)
+      assert {:error, {:shard_migrating, :drained_for_migration}} = Shards.checkout(shard)
+
+      Fathom.Shards.MigrationGate.open(shard)
+      assert {:ok, pid, ref, _path} = Shards.checkout(shard)
+      Fathom.Shard.checkin(pid, ref)
+    end
+
+    test "the gate expires on its own", %{shard: shard} do
+      Fathom.Shards.MigrationGate.close(shard, 0)
+      refute Fathom.Shards.MigrationGate.closed?(shard)
+      assert {:ok, pid, ref, _path} = Shards.checkout(shard)
+      Fathom.Shard.checkin(pid, ref)
+    end
+
+    test "a running coordinator is never gated (only re-opens are)", %{shard: shard} do
+      {:ok, pid, ref, _path} = Shards.checkout(shard)
+      Fathom.Shard.checkin(pid, ref)
+
+      Fathom.Shards.MigrationGate.close(shard, 60_000)
+      assert {:ok, ^pid, ref, _path} = Shards.checkout(shard)
+      Fathom.Shard.checkin(pid, ref)
+    end
+  end
+
   test "a drain for a reverted shard is skipped + cancelled; the source is not drained (#7)",
        %{shard: shard, node: node} do
     # Regression for #7: the handoff reverted (pin marked failed) but a pending drain

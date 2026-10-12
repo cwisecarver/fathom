@@ -258,12 +258,33 @@ defmodule Fathom.Rebalancer.CommandPoller do
   end
 
   # A migration/revert on another node needs this node's coordinator to release the lease (expert
-  # review 2026-10-10 #3). No pin to check: the migrator's own lease acquire is the fence, and a
-  # drained shard simply re-opens on its next request.
-  defp execute(%{command: "drain_for_migration", shard_id: id} = cmd) do
+  # review 2026-10-10 #3). No pin to check: the migrator's own lease acquire is the fence.
+  #
+  # The drained shard must NOT re-open here before that acquire lands (expert review 2026-10-12
+  # #23): the LB still routes the tenant to this node, and on a hot tenant the next request re-took
+  # the lease every time, so the migration livelocked. `MigrationGate` refuses re-opens for the
+  # whole drain, then for a short TTL from its completion (the migrator polls the command every
+  # 200 ms, then acquires); a failed drain lifts it, since the shard keeps serving here.
+  defp execute(%{command: "drain_for_migration", shard_id: raw_id} = cmd) do
+    alias Fathom.Shards.MigrationGate
+
+    # The gate is keyed like the Registry (canonical id), which `Shards.drain/2` also casts to.
+    id =
+      case Fathom.ShardId.cast(raw_id) do
+        {:ok, canonical} -> canonical
+        :error -> raw_id
+      end
+
+    MigrationGate.close(id, drain_ms() + @task_shutdown_grace_ms)
+
     case Shards.drain(id, drain_ms()) do
-      :ok -> complete(cmd, "done", "drained")
-      {:error, reason} -> complete(cmd, "failed", "drain failed (#{inspect(reason)})")
+      :ok ->
+        MigrationGate.close(id)
+        complete(cmd, "done", "drained")
+
+      {:error, reason} ->
+        MigrationGate.open(id)
+        complete(cmd, "failed", "drain failed (#{inspect(reason)})")
     end
   end
 
