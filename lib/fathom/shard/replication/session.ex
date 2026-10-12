@@ -125,7 +125,7 @@ defmodule Fathom.Shard.Replication.Session do
     shard_id = Keyword.fetch!(opts, :shard_id)
 
     GenServer.start_link(__MODULE__, opts,
-      name: {:via, Registry, {@registry, shard_id}},
+      name: {:via, Registry, {@registry, shard_id, Keyword.fetch!(opts, :coordinator)}},
       spawn_opt: @spawn_opt,
       hibernate_after: @hibernate_after_ms
     )
@@ -148,20 +148,57 @@ defmodule Fathom.Shard.Replication.Session do
     ArgumentError -> :ok
   end
 
-  defp ensure_started(shard_id, coordinator) do
+  # A registered Session is only reusable by the coordinator it was built for (expert review
+  # 2026-10-12 #12). The Registry value is that coordinator's pid. A successor coordinator (the
+  # shard drained and reopened) that found its predecessor's Session still registered used to
+  # route its first commit into a Session about to stop on the old coordinator's DOWN: the call
+  # exited `:session_down`, surfaced as a 503 for a write already applied locally, and the
+  # client's retry duplicated it. So a Session of a different (or dead) coordinator is stopped
+  # SYNCHRONOUSLY and replaced. The Registry drops the entry on the Session's exit, a moment after
+  # our DOWN, hence the bounded retry rather than assuming the slot is already free.
+  defp ensure_started(shard_id, coordinator, attempts \\ 100) do
     case Registry.lookup(@registry, shard_id) do
-      [{pid, _}] ->
+      [{pid, ^coordinator}] ->
         {:ok, pid}
+
+      [{pid, _other}] when attempts > 0 ->
+        stop_and_wait(pid)
+        Process.sleep(1)
+        ensure_started(shard_id, coordinator, attempts - 1)
+
+      [{_pid, _other}] ->
+        {:error, :stale_session}
 
       [] ->
         case DynamicSupervisor.start_child(
                Fathom.Shard.Replication.SessionSupervisor,
                {__MODULE__, shard_id: shard_id, coordinator: coordinator}
              ) do
-          {:ok, pid} -> {:ok, pid}
-          {:error, {:already_started, pid}} -> {:ok, pid}
-          {:error, reason} -> {:error, reason}
+          {:ok, pid} ->
+            {:ok, pid}
+
+          {:error, {:already_started, _pid}} when attempts > 0 ->
+            ensure_started(shard_id, coordinator, attempts - 1)
+
+          {:error, reason} ->
+            {:error, reason}
         end
+    end
+  end
+
+  defp stop_and_wait(pid) do
+    ref = Process.monitor(pid)
+
+    try do
+      GenServer.stop(pid, :normal, 5_000)
+    catch
+      :exit, _ -> :ok
+    end
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _} -> :ok
+    after
+      5_000 -> Process.demonitor(ref, [:flush])
     end
   end
 
@@ -1435,8 +1472,27 @@ defmodule Fathom.Shard.Replication.Session do
           )
         end)
 
+      watch_session(session, pid)
       entry = %{ref: ref, pid: pid, started_at: System.monotonic_time(:millisecond)}
       %{acc | seeding: Map.put(acc.seeding, shipper, entry)}
+    end)
+  end
+
+  # A seed task must not outlive its Session (expert review 2026-10-12 #26). The `terminate/2`
+  # sweep does not run when the Session is killed or shut down by its supervisor (it traps no
+  # exits), which orphaned a task streaming a whole tenant database. The task is deliberately
+  # unlinked, so this watcher monitors the Session and kills the task on its DOWN, whatever the
+  # reason; it also ends when the task does. (The task cannot watch for itself: it spends its
+  # life blocked inside `do_seed/5`.)
+  defp watch_session(session, task) do
+    spawn(fn ->
+      session_ref = Process.monitor(session)
+      task_ref = Process.monitor(task)
+
+      receive do
+        {:DOWN, ^session_ref, :process, _, _} -> Process.exit(task, :kill)
+        {:DOWN, ^task_ref, :process, _, _} -> :ok
+      end
     end)
   end
 

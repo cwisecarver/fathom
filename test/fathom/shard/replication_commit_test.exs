@@ -1152,5 +1152,90 @@ defmodule Fathom.Shard.ReplicationCommitTest do
                      3_000,
                      "the Session stopped and left its seed task streaming"
     end
+
+    # expert review 2026-10-12 #26: `terminate/2` does not run when the Session is KILLED (or shut
+    # down by a supervisor, since it traps no exits), so the stop-path sweep above is not enough:
+    # the unlinked seed task kept streaming a whole tenant DB for a shard this node no longer owns.
+    test "a Session KILLED (terminate/2 never runs) does not leave its seed task streaming",
+         ctx do
+      %{id: id, root: root} = ctx
+
+      live = start_followers!(root, 2)
+      bh_port = seed_black_hole!()
+
+      Application.put_env(:fathom, :replication_enabled, true)
+      Application.put_env(:fathom, :replication_quorum, 1)
+
+      Application.put_env(
+        :fathom,
+        :replication_followers,
+        for({_n, p} <- live, do: {~c"127.0.0.1", p}) ++ [{~c"127.0.0.1", bh_port}]
+      )
+
+      start_supervised!(Fleet)
+
+      {:ok, coordinator, ref, path} = Shards.checkout(id)
+      on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+      {:ok, conn} = Connection.open(path)
+      on_exit(fn -> Connection.close(conn) end)
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
+      for {n, _} <- live, do: preseed_current!(n, id, coordinator)
+
+      assert :ok = Session.commit(id, path <> "-wal", coordinator)
+      [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+      bh = List.last(Fleet.shippers())
+      send(session, {:repl_reply, bh, {:reject, id, :unknown_shard, 0}})
+
+      seeding = await_seeding(session, &(map_size(&1) == 1), "the reject never started a seed")
+      %{pid: task} = Map.fetch!(seeding, bh)
+      task_ref = Process.monitor(task)
+
+      Process.exit(session, :kill)
+
+      assert_receive {:DOWN, ^task_ref, :process, ^task, :killed},
+                     3_000,
+                     "the Session was killed and left its seed task streaming"
+    end
+  end
+
+  # expert review 2026-10-12 #12: `ensure_started` returned whatever Session was registered for
+  # the shard, without checking it belonged to the caller's coordinator. A successor coordinator's
+  # first commit then went into a Session about to stop on its predecessor's DOWN: spurious
+  # `session_down` / 503 for a write already applied locally, and a duplicate on the client retry.
+  test "a successor coordinator replaces its predecessor's Session instead of inheriting it",
+       ctx do
+    %{id: id, root: root} = ctx
+
+    live = start_followers!(root, 2)
+    Application.put_env(:fathom, :replication_enabled, true)
+    Application.put_env(:fathom, :replication_quorum, 1)
+
+    Application.put_env(
+      :fathom,
+      :replication_followers,
+      for({_n, p} <- live, do: {~c"127.0.0.1", p})
+    )
+
+    start_supervised!(Fleet)
+
+    {:ok, coordinator, ref, path} = Shards.checkout(id)
+    on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+    {:ok, conn} = Connection.open(path)
+    on_exit(fn -> Connection.close(conn) end)
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
+
+    assert :ok = Session.commit(id, path <> "-wal", coordinator)
+    [{old, ^coordinator}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+    old_ref = Process.monitor(old)
+
+    # A different coordinator pid asks for the shard's Session. (It is not a real coordinator, so
+    # the commit itself errors; what is under test is WHICH Session it was routed to.)
+    successor = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> Process.exit(successor, :kill) end)
+    _ = Session.commit(id, path <> "-wal", successor)
+
+    assert_received {:DOWN, ^old_ref, :process, ^old, _}
+    assert [{new, ^successor}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+    assert new != old
   end
 end
