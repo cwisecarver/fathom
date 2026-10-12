@@ -30,7 +30,7 @@
 //! rule here is pinned by a differential test against CPython (`tests/oracle/generate_re_cases.py`).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use fancy_regex::Regex;
 
@@ -174,29 +174,45 @@ fn has_multiline_flag(pattern: &str) -> bool {
 /// clear keeps this a few lines instead of an LRU.
 const CACHE_CAP: usize = 256;
 
-static CACHE: Mutex<Option<HashMap<String, Regex>>> = Mutex::new(None);
+static CACHE: Mutex<Option<HashMap<String, Arc<Regex>>>> = Mutex::new(None);
 
 /// `re.search(pattern, subject)` — whether the pattern matches ANYWHERE in the subject.
 ///
 /// Python's `re.search` is unanchored, which is also `fancy_regex::Regex::is_match`'s behaviour;
 /// `re.match` (anchored at the start) is a different function and not what Django's `regexp` uses.
+///
+/// The cache lock is held only for the map lookup/insert, never across `Regex::new` or
+/// `is_match` (expert review 2026-10-12 #5): fancy-regex allows up to 1M backtracking steps per
+/// match, so a pathological pattern run over many rows used to hold this process-global mutex for
+/// the whole match and serialize every other tenant's REGEXP behind it (each waiter pinning a
+/// dirty-IO scheduler). The compiled regex is cloned out as an `Arc` and matched lock-free. Two
+/// threads missing on the same new pattern both compile it and the second insert wins, which is
+/// harmless.
 pub fn search(pattern: &str, subject: &str) -> Result<bool, fancy_regex::Error> {
+    let cached = cache_get(pattern);
+    let re = match cached {
+        Some(re) => re,
+        None => {
+            let re = Arc::new(Regex::new(&translate(pattern))?);
+            cache_put(pattern, &re);
+            re
+        }
+    };
+    re.is_match(subject)
+}
+
+fn cache_get(pattern: &str) -> Option<Arc<Regex>> {
+    let guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref()?.get(pattern).cloned()
+}
+
+fn cache_put(pattern: &str, re: &Arc<Regex>) {
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let cache = guard.get_or_insert_with(HashMap::new);
-
-    if let Some(re) = cache.get(pattern) {
-        return re.is_match(subject);
-    }
-
-    let re = Regex::new(&translate(pattern))?;
-    let matched = re.is_match(subject);
-
     if cache.len() >= CACHE_CAP {
         cache.clear();
     }
-    cache.insert(pattern.to_string(), re);
-
-    matched
+    cache.insert(pattern.to_string(), Arc::clone(re));
 }
 
 #[cfg(test)]
@@ -295,5 +311,49 @@ mod tests {
     fn an_invalid_pattern_is_an_error_not_a_panic() {
         assert!(search("(unclosed", "x").is_err());
         assert!(search("[", "x").is_err());
+    }
+
+    // expert review 2026-10-12 #5: the cache mutex was held across the whole match, so one
+    // tenant's backtracking-heavy pattern blocked every other REGEXP call on the node for the
+    // length of each match. A cache-hit lookup on another thread must not wait for a match.
+    //
+    // Timing-based: one pathological match is timed first (it runs to fancy-regex's backtrack
+    // limit, tens of ms), then a second thread hammers it while this one does cheap lookups.
+    // Pre-fix the worst cheap lookup waited roughly one full match; the bound is half a match,
+    // far above scheduler noise on an idle box and far below the pre-fix wait.
+    #[test]
+    fn a_slow_match_does_not_block_other_lookups() {
+        use std::time::{Duration, Instant};
+
+        let slow = "^(a*)*\\1$";
+        let subject = format!("{}d", "a".repeat(28));
+        let t = Instant::now();
+        let _ = search(slow, &subject); // Err (backtrack limit) is the expected, slow outcome
+        let one_match = t.elapsed();
+        assert!(
+            one_match > Duration::from_millis(4),
+            "the pathological pattern is not slow here ({one_match:?}); the test measures nothing"
+        );
+        assert!(m("^a", "abc")); // warm the fast pattern's cache entry
+
+        let worker = std::thread::spawn(move || {
+            let end = Instant::now() + one_match * 40;
+            while Instant::now() < end {
+                let _ = search(slow, &subject);
+            }
+        });
+
+        let mut worst = Duration::ZERO;
+        while !worker.is_finished() {
+            let t = Instant::now();
+            assert!(m("^a", "abc"));
+            worst = worst.max(t.elapsed());
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        worker.join().unwrap();
+        assert!(
+            worst < one_match / 2,
+            "a cached lookup waited {worst:?} behind a {one_match:?} match: the cache lock is held across matching"
+        );
     }
 }

@@ -27,6 +27,8 @@ rusqlite = { version = "0.40", features = [
     "functions",
     "window",
     "hooks",
+    # Connection::limit: REPEAT/LPAD/RPAD read the handle's SQLITE_LIMIT_LENGTH (src/lib.rs result_cap).
+    "limits",
 ] }
 
 # Bundled IANA timezone database. This is the whole reason #19 chose Rust: the six
@@ -54,7 +56,14 @@ serde_json = "1"
 
 [profile.release]
 opt-level = 2
-# Keep panics from unwinding across the C FFI boundary into SQLite. Every function
-# body is written to return an error rather than panic, but `abort` makes a bug a
-# crash instead of undefined behaviour.
-panic = "abort"
+# `unwind`, not `abort` (expert review 2026-10-12 #1, decision Q1): this extension is loaded into
+# the BEAM, so an abort on any missed panic path is a node-wide outage reachable by one tenant's
+# SELECT. rusqlite wraps every scalar/aggregate/window callback in `catch_unwind` (functions.rs
+# `call_boxed_closure`, `aggregate_step`, ...) and reports the panic to SQLite as an error
+# (`Error::UnwindingPanic`), so with `unwind` a missed panic becomes a SQL error on that one
+# statement instead of killing the VM. Every function body is still written to return an error
+# rather than panic (checked arithmetic, see tests/fuzz.rs); this is the backstop. Allocation
+# failure still aborts under either setting, which is why the text builders check their result
+# size before allocating. Panics in the extern "C" hooks (wal, backstop, authorizer) still abort,
+# as Rust does at any extern "C" boundary.
+panic = "unwind"

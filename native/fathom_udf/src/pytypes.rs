@@ -157,6 +157,12 @@ pub fn typecast_date(s: &str) -> Option<NaiveDate> {
     if parts.next().is_some() {
         return None;
     }
+    // Python's `datetime.date` spans years 1..=9999 and raises ValueError outside it (which the
+    // callers turn into NULL), so anything else is "unparseable" here too. chrono accepts about
+    // +-262143 years, and its `+`/`-` panic near that edge (expert review 2026-10-12 #1).
+    if !(1..=9999).contains(&year) {
+        return None;
+    }
     NaiveDate::from_ymd_opt(year, month, day)
 }
 
@@ -276,7 +282,9 @@ pub fn offset_micros(offset: &str) -> Option<i64> {
     let mut parts = offset.splitn(2, ':');
     let hours: i64 = parts.next()?.parse().ok()?;
     let minutes: i64 = parts.next()?.parse().ok()?;
-    Some(hours * MICROS_PER_HOUR + minutes * MICROS_PER_MINUTE)
+    hours
+        .checked_mul(MICROS_PER_HOUR)?
+        .checked_add(minutes.checked_mul(MICROS_PER_MINUTE)?)
 }
 
 /// `django.utils.duration.duration_microseconds` — a timedelta as a whole number of microseconds.

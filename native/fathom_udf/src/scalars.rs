@@ -17,38 +17,84 @@ fn py_prefix(s: &str, n: i64) -> String {
     s.chars().take(end as usize).collect()
 }
 
-/// Python's `s * n` — a non-positive count yields the empty string.
-fn py_repeat(s: &str, n: i64) -> String {
-    if n <= 0 {
-        return String::new();
+/// Why a text builder refused: the result would exceed the caller's byte cap.
+///
+/// Computed BEFORE anything is allocated (expert review 2026-10-12 #2): SQLite's
+/// `SQLITE_LIMIT_LENGTH` only checks the value a function RETURNS, after `s.repeat(n)` has already
+/// asked the allocator for it, so `REPEAT('abcdefghij', 4000000000)` was a ~40 GB request and
+/// Rust's alloc-failure handler aborts the whole BEAM no matter the panic strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooBig;
+
+/// Python's `s * n` — a non-positive count yields the empty string. `Err` if `s.len() * n` bytes
+/// would exceed `cap`.
+fn py_repeat(s: &str, n: i64, cap: usize) -> Result<String, TooBig> {
+    if n <= 0 || s.is_empty() {
+        return Ok(String::new());
     }
-    s.repeat(n as usize)
+    let total = usize::try_from(n)
+        .ok()
+        .and_then(|n| s.len().checked_mul(n))
+        .ok_or(TooBig)?;
+    if total > cap {
+        return Err(TooBig);
+    }
+    Ok(s.repeat(total / s.len()))
+}
+
+/// The first `n` characters of `fill` repeated endlessly — Python's `(fill * k)[:n]` for any
+/// `k >= n` (both pads call it with `k = length >= n`). Builds ONLY the `n` characters needed,
+/// after computing their exact byte size, so a huge `length` costs nothing until it is refused.
+fn cyclic_prefix(fill: &str, n: i64, cap: usize) -> Result<String, TooBig> {
+    if n <= 0 || fill.is_empty() {
+        return Ok(String::new());
+    }
+    let n = usize::try_from(n).map_err(|_| TooBig)?;
+    let fill_chars = fill.chars().count();
+    let (whole, rem) = (n / fill_chars, n % fill_chars);
+    let rem_bytes: usize = fill.chars().take(rem).map(char::len_utf8).sum();
+    let bytes = whole
+        .checked_mul(fill.len())
+        .and_then(|b| b.checked_add(rem_bytes))
+        .ok_or(TooBig)?;
+    if bytes > cap {
+        return Err(TooBig);
+    }
+    Ok(fill.chars().cycle().take(n).collect())
 }
 
 /// `_sqlite_lpad(text, length, fill_text)`.
 ///
 /// Note the asymmetry with `rpad`: when the text is already at least `length` long, lpad
 /// **truncates from the left** (`text[:length]`), it does not return the text untouched.
-pub fn lpad(text: &str, length: i64, fill: &str) -> String {
-    let delta = length - text.chars().count() as i64;
+///
+/// `cap` is the largest result, in bytes, the caller will accept (see [`TooBig`]).
+pub fn lpad(text: &str, length: i64, fill: &str, cap: usize) -> Result<String, TooBig> {
+    // `saturating_sub`: `length` is tenant-controlled and `i64::MIN - n` wraps in release.
+    let delta = length.saturating_sub(text.chars().count() as i64);
     if delta <= 0 {
-        return py_prefix(text, length);
+        return Ok(py_prefix(text, length));
     }
-    // `(fill * length)[:delta]` — the fill is repeated `length` times, not `delta` times, so an
-    // empty fill string yields an empty pad rather than looping forever.
-    let padding = py_prefix(&py_repeat(fill, length), delta);
-    format!("{padding}{text}")
+    // `(fill * length)[:delta]` — an empty fill yields an empty pad rather than looping forever.
+    // The result is `delta` pad chars plus the text; refuse before building the pad if even that
+    // minimum cannot fit.
+    let padding = cyclic_prefix(fill, delta, cap.saturating_sub(text.len()))?;
+    Ok(format!("{padding}{text}"))
 }
 
 /// `_sqlite_rpad(text, length, fill_text)` — `(text + fill_text * length)[:length]`.
-pub fn rpad(text: &str, length: i64, fill: &str) -> String {
-    let combined = format!("{text}{}", py_repeat(fill, length));
-    py_prefix(&combined, length)
+pub fn rpad(text: &str, length: i64, fill: &str, cap: usize) -> Result<String, TooBig> {
+    let delta = length.saturating_sub(text.chars().count() as i64);
+    if delta <= 0 {
+        return Ok(py_prefix(text, length));
+    }
+    let padding = cyclic_prefix(fill, delta, cap.saturating_sub(text.len()))?;
+    Ok(format!("{text}{padding}"))
 }
 
 /// `_sqlite_repeat(text, count)`.
-pub fn repeat(text: &str, count: i64) -> String {
-    py_repeat(text, count)
+pub fn repeat(text: &str, count: i64, cap: usize) -> Result<String, TooBig> {
+    py_repeat(text, count, cap)
 }
 
 /// `_sqlite_reverse(text)` — `text[::-1]`, reversing code points.
@@ -102,6 +148,58 @@ pub fn bitxor(x: i64, y: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CAP: usize = 64 * 1024 * 1024;
+
+    // The pre-cap tests below read naturally against a plain `String` return; these shadow the
+    // glob-imported capped functions (a local item wins over a glob import).
+    fn lpad(t: &str, l: i64, f: &str) -> String {
+        super::lpad(t, l, f, CAP).unwrap()
+    }
+    fn rpad(t: &str, l: i64, f: &str) -> String {
+        super::rpad(t, l, f, CAP).unwrap()
+    }
+    fn repeat(t: &str, n: i64) -> String {
+        super::repeat(t, n, CAP).unwrap()
+    }
+
+    // expert review 2026-10-12 #2: the result length is checked BEFORE allocating. Each of these
+    // used to be an abort (capacity-overflow panic, or a multi-GB allocation request).
+    #[test]
+    fn oversize_results_are_refused_not_allocated() {
+        assert_eq!(super::repeat("abcdefghij", 4_000_000_000, CAP), Err(TooBig));
+        assert_eq!(super::repeat("ab", i64::MAX, CAP), Err(TooBig));
+        assert_eq!(super::lpad("x", i64::MAX, "ab", CAP), Err(TooBig));
+        assert_eq!(super::rpad("x", i64::MAX, "ab", CAP), Err(TooBig));
+        // Just over / exactly at the cap, repeat and pads.
+        assert_eq!(super::repeat("ab", (CAP / 2) as i64 + 1, CAP), Err(TooBig));
+        assert_eq!(super::repeat("ab", (CAP / 2) as i64, CAP).unwrap().len(), CAP);
+        assert_eq!(super::rpad("", CAP as i64 + 1, "x", CAP), Err(TooBig));
+        assert_eq!(super::rpad("", CAP as i64, "x", CAP).unwrap().len(), CAP);
+        // The text counts toward the cap.
+        assert_eq!(super::lpad("xx", 11, "-", 10), Err(TooBig));
+        assert_eq!(super::lpad("xx", 10, "-", 10).unwrap(), "--------xx");
+        // Multi-byte fill is measured in bytes, not chars.
+        assert_eq!(super::lpad("", 4, "é", 7), Err(TooBig));
+        assert_eq!(super::lpad("", 4, "é", 8).unwrap(), "éééé");
+    }
+
+    #[test]
+    fn i64_min_length_does_not_wrap() {
+        // `length - chars` wrapped to a huge positive delta in release.
+        assert_eq!(super::lpad("abc", i64::MIN, "x", CAP).unwrap(), "");
+        assert_eq!(super::rpad("abc", i64::MIN, "x", CAP).unwrap(), "");
+        assert_eq!(super::repeat("abc", i64::MIN, CAP).unwrap(), "");
+    }
+
+    #[test]
+    fn a_pad_builds_only_the_chars_it_needs() {
+        // With the old `fill * length` this allocated `length * fill.len()` bytes for a 3-char pad.
+        assert_eq!(super::lpad("x", 4, "ab", CAP).unwrap(), "abax");
+        // 40 MB of fill would exceed a 1 KiB cap if it were materialized; only 3 chars are built.
+        let big_fill = "ab".repeat(20_000_000);
+        assert_eq!(super::lpad("x", 4, &big_fill, 1024).unwrap(), "abax");
+    }
 
     #[test]
     fn lpad_pads_on_the_left() {

@@ -22,6 +22,9 @@ use fathom_udf::datetime::{self, DtOut, DtParam};
 use fathom_udf::scalars;
 use serde_json::Value as J;
 
+/// The tenant `SQLITE_LIMIT_LENGTH` the text builders refuse beyond (expert review 2026-10-12 #2).
+const SQL_LENGTH_CAP: usize = 64 * 1024 * 1024;
+
 /// The shape of an outcome, normalized so Rust and Python results are comparable.
 #[derive(Debug, PartialEq)]
 enum Outcome {
@@ -178,17 +181,17 @@ fn run(func: &str, args: &[J]) -> Outcome {
                 return Outcome::Null;
             };
             let out = if func == "LPAD" {
-                scalars::lpad(text, len, fill)
+                scalars::lpad(text, len, fill, SQL_LENGTH_CAP)
             } else {
-                scalars::rpad(text, len, fill)
+                scalars::rpad(text, len, fill, SQL_LENGTH_CAP)
             };
-            Outcome::Text(out)
+            out.map_or(Outcome::Error, Outcome::Text)
         }
         "REPEAT" => {
             let (Some(text), Some(count)) = (arg_str(&args[0]), arg_i64(&args[1])) else {
                 return Outcome::Null;
             };
-            Outcome::Text(scalars::repeat(text, count))
+            scalars::repeat(text, count, SQL_LENGTH_CAP).map_or(Outcome::Error, Outcome::Text)
         }
         "REVERSE" => from_opt_text(arg_str(&args[0]).map(scalars::reverse)),
         "MD5" => from_opt_text(arg_str(&args[0]).map(scalars::md5_hex)),

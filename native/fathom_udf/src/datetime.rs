@@ -30,6 +30,9 @@ pub enum UdfError {
     /// Django reaching for a time attribute on a `datetime.date` (`AttributeError`), or
     /// `timezone.localtime` refusing a naive value (`ValueError`).
     Type(String),
+    /// A text builder (`REPEAT`/`LPAD`/`RPAD`) was asked for more than the handle's length limit.
+    /// SQLite's own wording for `SQLITE_TOOBIG`.
+    TooBig,
 }
 
 impl std::fmt::Display for UdfError {
@@ -38,6 +41,7 @@ impl std::fmt::Display for UdfError {
             UdfError::UnsupportedLookup(l) => write!(f, "Unsupported lookup type: '{l}'"),
             UdfError::UnknownTimezone(t) => write!(f, "No time zone found with key {t}"),
             UdfError::Type(m) => write!(f, "{m}"),
+            UdfError::TooBig => write!(f, "string or blob too big"),
         }
     }
 }
@@ -45,6 +49,39 @@ impl std::fmt::Display for UdfError {
 impl std::error::Error for UdfError {}
 
 type R<T> = Result<T, UdfError>;
+
+// ---- checked calendar arithmetic (expert review 2026-10-12 #1) --------------------------------
+//
+// chrono's `+`/`-` on dates, datetimes and zoned datetimes PANIC on overflow, and the release
+// profile used to be `panic = "abort"`, so one tenant-supplied integer (`django_format_dtdelta('+',
+// '2026-01-01 00:00:00', 9223372036854775807)`) was a SIGABRT of the whole BEAM. Python raises
+// OverflowError for the same inputs, which surfaces as a SQL error; so does every helper here.
+// Python's `datetime` only spans years 1..=9999, so results outside that are refused too.
+
+fn out_of_range() -> UdfError {
+    UdfError::Type("date value out of range".to_string())
+}
+
+fn in_py_range(d: NaiveDate) -> R<NaiveDate> {
+    if (1..=9999).contains(&d.year()) {
+        Ok(d)
+    } else {
+        Err(out_of_range())
+    }
+}
+
+fn add_days(d: NaiveDate, days: i64) -> R<NaiveDate> {
+    let delta = Duration::try_days(days).ok_or_else(out_of_range)?;
+    in_py_range(d.checked_add_signed(delta).ok_or_else(out_of_range)?)
+}
+
+fn add_micros(dt: NaiveDateTime, micros: i64) -> R<NaiveDateTime> {
+    let out = dt
+        .checked_add_signed(Duration::microseconds(micros))
+        .ok_or_else(out_of_range)?;
+    in_py_range(out.date())?;
+    Ok(out)
+}
 
 /// Treat an empty string the way Python treats a falsy `tzname`: `if conn_tzname:` and
 /// `if tzname is not None` are different tests, so the caller keeps `Option` and this only
@@ -69,7 +106,9 @@ fn attach(tz: Tz, naive: NaiveDateTime) -> R<DateTime<Tz>> {
         LocalResult::None => {
             // Sample the offset well before the gap (transitions are never within a day of each
             // other), then interpret the naive value as being at that offset.
-            let before = naive - Duration::days(1);
+            let before = naive
+                .checked_sub_signed(Duration::days(1))
+                .ok_or_else(out_of_range)?;
             let offset = match tz.offset_from_local_datetime(&before) {
                 LocalResult::Single(o) => o,
                 LocalResult::Ambiguous(o, _) => o,
@@ -81,7 +120,7 @@ fn attach(tz: Tz, naive: NaiveDateTime) -> R<DateTime<Tz>> {
             };
             let fixed = offset.fix();
             Ok(DateTime::from_naive_utc_and_offset(
-                naive - fixed,
+                naive.checked_sub_offset(fixed).ok_or_else(out_of_range)?,
                 offset,
             ))
         }
@@ -169,7 +208,12 @@ pub fn datetime_parse(
                 UdfError::Type(format!("could not read a time offset from {target}"))
             })?;
             let delta = Duration::microseconds(micros);
-            aware = if sign == '+' { aware + delta } else { aware - delta };
+            aware = if sign == '+' {
+                aware.checked_add_signed(delta)
+            } else {
+                aware.checked_sub_signed(delta)
+            }
+            .ok_or_else(out_of_range)?;
         }
         aware = aware.with_timezone(&zone(name)?);
     }
@@ -199,7 +243,7 @@ pub fn date_trunc(
         "month" => format!("{:04}-{:02}-01", d.year(), d.month()),
         "week" => {
             // Django subtracts `dt.weekday()` days — Monday-based, so the week starts Monday.
-            let start = d - Duration::days(weekday(d) as i64);
+            let start = add_days(d, -(weekday(d) as i64))?;
             format!("{:04}-{:02}-{:02}", start.year(), start.month(), start.day())
         }
         "day" => format!("{:04}-{:02}-{:02}", d.year(), d.month(), d.day()),
@@ -240,7 +284,7 @@ pub fn datetime_trunc(
         }
         "month" => format!("{:04}-{:02}-01 00:00:00", d.year(), d.month()),
         "week" => {
-            let start = d - Duration::days(weekday(d) as i64);
+            let start = add_days(d, -(weekday(d) as i64))?;
             format!(
                 "{:04}-{:02}-{:02} 00:00:00",
                 start.year(),
@@ -611,8 +655,11 @@ fn add_or_sub(lhs: DtParam, rhs: DtParam, negate: bool) -> R<String> {
             format_timedelta(total)
         }
 
-        (DateTime(dt), Delta(d)) => format_datetime(dt + Duration::microseconds(sign * d)),
-        (Delta(d), DateTime(dt)) if !negate => format_datetime(dt + Duration::microseconds(d)),
+        (DateTime(dt), Delta(d)) => {
+            let d = d.checked_mul(sign).ok_or_else(out_of_range)?;
+            format_datetime(add_micros(dt, d)?)
+        }
+        (Delta(d), DateTime(dt)) if !negate => format_datetime(add_micros(dt, d)?),
 
         // `date ± timedelta` uses ONLY the delta's normalized `.days` field — Python's date
         // arithmetic has no sub-day resolution.
@@ -625,11 +672,11 @@ fn add_or_sub(lhs: DtParam, rhs: DtParam, negate: bool) -> R<String> {
         // one. Ten of the thirteen final oracle divergences were this one character of ordering.
         (Date(d), Delta(delta)) => {
             let days = delta.div_euclid(86_400_000_000);
-            format_date(d + Duration::days(sign * days))
+            format_date(add_days(d, days.checked_mul(sign).ok_or_else(out_of_range)?)?)
         }
         (Delta(delta), Date(d)) if !negate => {
             let days = delta.div_euclid(86_400_000_000);
-            format_date(d + Duration::days(days))
+            format_date(add_days(d, days)?)
         }
 
         (DateTime(a), DateTime(b)) if negate => {

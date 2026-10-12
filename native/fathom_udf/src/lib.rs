@@ -281,6 +281,28 @@ fn register_datetime(db: &Connection, flags: FunctionFlags) -> Result<()> {
 // text
 // ---------------------------------------------------------------------------------------------
 
+/// The largest string a text-building UDF may return, in bytes: the handle's current
+/// `SQLITE_LIMIT_LENGTH`, capped at fathom's tenant limit (`pragma_guard::LIMIT_LENGTH`, 64 MiB).
+///
+/// SQLite enforces that limit on a function's RETURN value, i.e. after `REPEAT`/`LPAD`/`RPAD` have
+/// already allocated the whole thing, so the builders need the number up front to refuse before
+/// allocating (expert review 2026-10-12 #2). Falls back to the constant if the handle cannot be
+/// read, which is the safe direction.
+fn result_cap(ctx: &Context<'_>) -> usize {
+    let fallback = pragma_guard::LIMIT_LENGTH as usize;
+    // SAFETY: `get_connection` is unsafe only because the returned handle could be sent to another
+    // thread; it is used here for one read of one limit on this thread and dropped.
+    let limit = unsafe { ctx.get_connection() }
+        .and_then(|c| c.limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH))
+        .ok()
+        .and_then(|l| usize::try_from(l).ok());
+    limit.map_or(fallback, |l| l.min(fallback))
+}
+
+fn too_big() -> Error {
+    udf_err(UdfError::TooBig)
+}
+
 fn register_text(db: &Connection, flags: FunctionFlags) -> Result<()> {
     db.create_scalar_function("LPAD", 3, flags, |ctx| {
         let (Some(text), Some(len), Some(fill)) =
@@ -288,7 +310,9 @@ fn register_text(db: &Connection, flags: FunctionFlags) -> Result<()> {
         else {
             return Ok(None);
         };
-        Ok(Some(scalars::lpad(text, len, fill)))
+        scalars::lpad(text, len, fill, result_cap(ctx))
+            .map(Some)
+            .map_err(|_| too_big())
     })?;
 
     db.create_scalar_function("RPAD", 3, flags, |ctx| {
@@ -297,14 +321,18 @@ fn register_text(db: &Connection, flags: FunctionFlags) -> Result<()> {
         else {
             return Ok(None);
         };
-        Ok(Some(scalars::rpad(text, len, fill)))
+        scalars::rpad(text, len, fill, result_cap(ctx))
+            .map(Some)
+            .map_err(|_| too_big())
     })?;
 
     db.create_scalar_function("REPEAT", 2, flags, |ctx| {
         let (Some(text), Some(count)) = (opt_text(ctx, 0)?, opt_i64(ctx, 1)) else {
             return Ok(None);
         };
-        Ok(Some(scalars::repeat(text, count)))
+        scalars::repeat(text, count, result_cap(ctx))
+            .map(Some)
+            .map_err(|_| too_big())
     })?;
 
     db.create_scalar_function("REVERSE", 1, flags, |ctx| {
