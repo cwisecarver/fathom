@@ -1248,6 +1248,7 @@ defmodule Fathom.Shard.Replication.Follower do
             opened
 
           refused ->
+            release_reservation(name, id)
             unlock_shard(name, lock)
             refused
         end
@@ -1286,7 +1287,7 @@ defmodule Fathom.Shard.Replication.Follower do
 
         seeds
 
-      headroom?(name, b) ->
+      reserve_headroom?(name, b) ->
         open_seed_temps(name, seeds, b, lock)
 
       true ->
@@ -1328,18 +1329,106 @@ defmodule Fathom.Shard.Replication.Follower do
   # RPO simply stays at the stored object, which is the pre-A2 behaviour and always correct. What
   # to SHED once already full is a policy question (which replica, and what it does to the quorum's
   # effective redundancy) and is deliberately not decided here.
-  defp headroom?(name, %Protocol.SeedBegin{} = b) do
-    floor = disk_free_floor_bytes()
+  #
+  # RESERVED BYTES (expert review 2026-10-12 #18). The check used to read the volume's free space
+  # and subtract only THIS seed's size, so N seeds beginning together each saw the same free space
+  # and each passed — together they could blow through the floor. Each seed now RESERVES its
+  # incoming bytes before checking and the check subtracts every live reservation, so concurrent
+  # seeds see each other. Reserve-then-check (not check-then-reserve) so a race errs toward
+  # refusing: two simultaneous begins may both refuse, never both pass. A refused seed is simply
+  # re-seeded later, which is the documented cost of back-pressure.
+  #
+  # The reservation is released at install (success or failure), at discard, and when the begin is
+  # refused. A crashed worker never gets to release, so a reservation whose owner is dead is
+  # pruned on the next read rather than leaking free space forever. Bytes a seed has already
+  # written are counted twice (reservation AND the lower free space) — conservative by design.
+  #
+  # The volume read is cached ~1 s and timeout-bounded: `:disksup` is a single process and a
+  # per-seed `:infinity` call let a wedged disksup stall every seeding worker.
+  defp reserve_headroom?(name, %Protocol.SeedBegin{} = b) do
     incoming = (b.db_size || 0) + (b.wal_size || 0)
+    reserve(name, b.shard_id, incoming)
 
-    case Fathom.Admin.Measurements.disk_info(dir(name)) do
-      # Cannot read the volume — fail OPEN (as the removed WarmFollower did). Refusing to
-      # replicate because a stat failed would turn an observability gap into a durability one.
-      :error ->
-        true
+    ok? =
+      case disk_free(name) do
+        # Cannot read the volume — fail OPEN (as the removed WarmFollower did). Refusing to
+        # replicate because a stat failed would turn an observability gap into a durability one.
+        :error -> true
+        {:ok, free} -> free - reserved_bytes(name) >= disk_free_floor_bytes()
+      end
 
-      {:ok, %{free_bytes: free}} ->
-        free - incoming >= floor
+    unless ok?, do: release_reservation(name, b.shard_id)
+    ok?
+  end
+
+  # Reservation rows live in the lock table under `{:reserved, shard_id}` keys (a tuple, so they can
+  # never collide with a binary shard id's lock row); the disk-info cache under `{:disk, dir}`.
+  defp reserve(name, shard_id, bytes) do
+    :ets.insert(locks(name), {{:reserved, shard_id}, self(), bytes})
+  rescue
+    ArgumentError -> :ok
+  end
+
+  @doc false
+  @spec release_reservation(atom(), String.t()) :: :ok
+  def release_reservation(name, shard_id) do
+    :ets.match_delete(locks(name), {{:reserved, shard_id}, self(), :_})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  # Sum of live reservations; a row whose owner process died (crash path) is dropped on the way.
+  defp reserved_bytes(name) do
+    tab = locks(name)
+
+    :ets.foldl(
+      fn
+        {{:reserved, _}, pid, bytes} = row, acc ->
+          if Process.alive?(pid) do
+            acc + bytes
+          else
+            :ets.delete_object(tab, row)
+            acc
+          end
+
+        _other, acc ->
+          acc
+      end,
+      0,
+      tab
+    )
+  rescue
+    ArgumentError -> 0
+  end
+
+  @disk_cache_ms 1_000
+  @disk_timeout_ms 2_000
+
+  defp disk_free(name) do
+    dir = dir(name)
+    tab = locks(name)
+    now = System.monotonic_time(:millisecond)
+
+    case :ets.lookup(tab, {:disk, dir}) do
+      [{_, at, result}] when now - at < @disk_cache_ms ->
+        result
+
+      _ ->
+        result = read_disk_free(dir)
+        :ets.insert(tab, {{:disk, dir}, now, result})
+        result
+    end
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp read_disk_free(dir) do
+    task = Task.async(fn -> Fathom.Admin.Measurements.disk_info(dir) end)
+
+    case Task.yield(task, @disk_timeout_ms) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {:ok, %{free_bytes: free}}} -> {:ok, free}
+      _ -> :error
     end
   end
 
@@ -1665,6 +1754,7 @@ defmodule Fathom.Shard.Replication.Follower do
       {:error, :lock_lost}
     end
   after
+    release_reservation(name, shard_id)
     unlock_shard(name, state.lock)
   end
 
@@ -1721,7 +1811,11 @@ defmodule Fathom.Shard.Replication.Follower do
         # This seed's OWN temps, by the paths it opened — never by a per-shard name, which another
         # connection's seed of the same shard could be writing (expert review 2026-10-08 #5).
         rm_seed_temps(state)
-        if name = state[:name], do: unlock_shard(name, state[:lock])
+
+        if name = state[:name] do
+          release_reservation(name, shard_id)
+          unlock_shard(name, state[:lock])
+        end
 
         rest
     end

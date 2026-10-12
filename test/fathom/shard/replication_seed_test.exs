@@ -1656,4 +1656,82 @@ defmodule Fathom.Shard.ReplicationSeedTest do
       assert {:ok, ^port} = Follower.port(pid)
     end
   end
+
+  # Expert review 2026-10-12 #18: the headroom check subtracted only THIS seed's size from the
+  # volume's free space, so concurrent seeds each saw the same free space and each passed; together
+  # they could exceed the floor. Seeds now reserve their incoming bytes and the check subtracts all
+  # live reservations.
+  describe "concurrent seeds reserve headroom (expert review 2026-10-12 #18)" do
+    setup ctx do
+      prev = Application.get_env(:fathom, :replication_disk_free_floor_bytes)
+
+      on_exit(fn ->
+        if is_nil(prev),
+          do: Application.delete_env(:fathom, :replication_disk_free_floor_bytes),
+          else: Application.put_env(:fathom, :replication_disk_free_floor_bytes, prev)
+      end)
+
+      name = :"resv_f#{System.unique_integer([:positive])}"
+      dir = Path.join(ctx.root, "reserve")
+      start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
+      {:ok, %{free_bytes: free}} = Fathom.Admin.Measurements.disk_info(dir)
+
+      # Each seed claims a third of the volume; the floor leaves room for 1.5 of them. One passes,
+      # two together cannot. (Sizes are claims in the begin header: nothing is allocated.)
+      size = div(free, 3)
+      Application.put_env(:fathom, :replication_disk_free_floor_bytes, free - div(size * 3, 2))
+
+      begin = fn id ->
+        %Protocol.SeedBegin{
+          shard_id: id,
+          epoch: 1,
+          wal_gen: 0,
+          salt1: 0,
+          wal_offset: 0,
+          db_size: size,
+          wal_size: 0
+        }
+      end
+
+      %{name: name, begin: begin}
+    end
+
+    test "two seeds each under the floor alone but over it together: the second is refused",
+         %{name: name, begin: begin} do
+      seeds = Follower.begin_seed(name, %{}, begin.("resv_a"))
+      assert %{failed: false} = seeds["resv_a"], "the first seed alone fits and must be accepted"
+
+      seeds = Follower.begin_seed(name, seeds, begin.("resv_b"))
+
+      refute Map.has_key?(seeds, "resv_b"),
+             "the second seed must be refused: together they overshoot the floor"
+
+      # Releasing the first reservation frees the headroom: the same seed is now accepted.
+      seeds = Follower.discard_seeds(seeds)
+      seeds = Follower.begin_seed(name, seeds, begin.("resv_b"))
+      assert %{failed: false} = seeds["resv_b"]
+      Follower.discard_seeds(seeds)
+    end
+
+    test "a reservation held by a crashed worker is pruned, not leaked", %{
+      name: name,
+      begin: begin
+    } do
+      parent = self()
+
+      {pid, ref} =
+        spawn_monitor(fn ->
+          seeds = Follower.begin_seed(name, %{}, begin.("resv_dead"))
+          send(parent, {:opened, Map.has_key?(seeds, "resv_dead")})
+          # Dies without discarding: the crash path.
+        end)
+
+      assert_receive {:opened, true}
+      assert_receive {:DOWN, ^ref, :process, ^pid, _}
+
+      seeds = Follower.begin_seed(name, %{}, begin.("resv_live"))
+      assert %{failed: false} = seeds["resv_live"], "a dead worker's reservation leaked headroom"
+      Follower.discard_seeds(seeds)
+    end
+  end
 end
