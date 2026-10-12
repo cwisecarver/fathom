@@ -2546,7 +2546,8 @@ defmodule Fathom.Shard do
               if File.exists?(state.path),
                 do: Integrity.quarantine_corrupt!(state.path, state.id, reason)
 
-              Storage.release_lease(state.id, state.lease)
+              # Nothing was stamped, so keep the lineage claim (expert review 2026-10-12 #3).
+              release_keeping_claim(state)
 
             # The upload exceeded its time budget under a storage brownout (expert review 2026-09-05
             # #30). The coordinator is Registry-registered until terminate/2 returns, so an unbounded
@@ -2605,7 +2606,8 @@ defmodule Fathom.Shard do
         %{shard_id: state.id, reason: :local_file_missing}
       )
 
-      if is_map(state.lease), do: Storage.release_lease(state.id, state.lease)
+      # Dirty and unflushed: keep the lineage claim (expert review 2026-10-12 #3).
+      release_keeping_claim(state)
     end
 
     :ok
@@ -2646,8 +2648,21 @@ defmodule Fathom.Shard do
       %{shard_id: state.id, reason: reason}
     )
 
-    if is_map(state.lease), do: Storage.release_lease(state.id, state.lease)
+    release_keeping_claim(state)
     :ok
+  end
+
+  # The release for a drop that did NOT make this coordinator's lineage durable (expert review
+  # 2026-10-12 #3). Only a successful flush stamps the lineage onto the object; until one does, a
+  # fresh-created lock is the only place a successor could learn it — and `release_lease/2` deletes
+  # that lock, so the next opener's fresh create recomputes `next_lineage(object)` = the SAME lineage
+  # this coordinator may have shipped A2 frames under. The follower then absorbs our WAL and appends
+  # the successor's onto it as one ownership (a promotable hybrid), and promote-on-open refuses our
+  # replica (`rl >= lineage`), so our quorum-acked writes are not recovered. `Storage.release_lease/3`
+  # leaves a released marker carrying the claim instead, which the next acquire steals ABOVE. With
+  # replication off (`:disabled`) or no stated lineage (`:unknown`) it is the plain delete.
+  defp release_keeping_claim(state) do
+    if is_map(state.lease), do: Storage.release_lease(state.id, state.lease, state.lineage)
   end
 
   # The off-process periodic durability flush the coordinator's flush task runs (expert
@@ -3176,6 +3191,9 @@ defmodule Fathom.Shard do
   # number and crashed before flushing, and reusing it gave two histories one label.
   # `Storage.takeover_claim/2` picked a number strictly above that bound and wrote it into the lock,
   # so the next successor finds it; this must use that same number, or the lock would understate it.
+  # A RELEASE that did not stamp the lineage leaves a released marker carrying it, so the next open
+  # takes that same takeover path rather than a fresh create (expert review 2026-10-12 #3,
+  # `release_keeping_claim/1`).
   defp open_lineage(lease, head) do
     # Gate first and return an atom, mirroring promote_on_open?/0 at the call site above: a node
     # that has not enabled replication must not pay for a feature it does not run.

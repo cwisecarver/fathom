@@ -2389,6 +2389,70 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  # The release that keeps the holder's lineage claim (expert review 2026-10-12 #3 — see
+  # `Storage.release_lease/3`): the SAME conditions as `release_lease/2` — If-Match the lock we last
+  # wrote, the same 412 disambiguation — but a conditional PUT of the released marker where that
+  # path DELETEs. A lock that is no longer ours is left alone, as there.
+  @impl true
+  def release_lease_keeping_claim(shard_id, %{lock_etag: etag} = lease, claim)
+      when is_binary(etag) do
+    marker = Storage.released_marker(lease, claim)
+
+    case put_lock(shard_id, marker, if_match: etag) do
+      {:ok, _} ->
+        :ok
+
+      # `put_lock/3` folds its 412 into these two (it re-reads the holder). Either way "the lock is
+      # not the object I wrote" — the same two situations `resolve_412_release/2` tells apart.
+      {:error, :precondition_failed} ->
+        resolve_412_marker(shard_id, lease, marker)
+
+      {:error, {:held, _, _}} ->
+        resolve_412_marker(shard_id, lease, marker)
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  def release_lease_keeping_claim(shard_id, %{owner: owner, epoch: epoch} = lease, claim) do
+    case get_lock(shard_id) do
+      {:ok, %{owner: ^owner, epoch: ^epoch}, etag} ->
+        put_marker(shard_id, Storage.released_marker(lease, claim), etag)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp resolve_412_marker(shard_id, lease, marker) do
+    Storage.resolve_stale_release(
+      shard_id,
+      lease,
+      fn -> read_own_lock(shard_id, lease) end,
+      fn fresh_etag -> put_marker(shard_id, marker, fresh_etag) end
+    )
+  end
+
+  defp read_own_lock(shard_id, %{owner: owner}) do
+    case get_lock(shard_id) do
+      {:ok, %{owner: ^owner}, etag} -> {:ours, etag}
+      {:ok, _other, _etag} -> :not_ours
+      :not_found -> :not_ours
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # Raced again between the read and this write ⇒ someone else's now; leave it, as the delete does.
+  defp put_marker(shard_id, marker, etag) do
+    case put_lock(shard_id, marker, if_match: etag) do
+      {:ok, _} -> :ok
+      {:error, :precondition_failed} -> :ok
+      {:error, {:held, _, _}} -> :ok
+      {:error, _} = error -> error
+    end
+  end
+
   # The backend half of the conditional-release 412: report the FACT (is the lock still ours, at
   # what etag) and perform the retry delete. The DECISION lives in
   # `Fathom.Shard.Storage.resolve_stale_release/4` so every etag-carrying backend makes it

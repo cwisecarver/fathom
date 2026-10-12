@@ -327,6 +327,16 @@ defmodule Fathom.Shard.Storage do
               {:ok, lease()} | {:error, :superseded} | {:error, term()}
   @callback release_lease(shard_id :: String.t(), lease :: lease()) :: :ok | {:error, term()}
 
+  # Release `lease` WITHOUT forgetting the lineage its holder may have shipped under (expert review
+  # 2026-10-12 #3): instead of deleting the lock, conditionally overwrite it — only while it is still
+  # ours, exactly as `release_lease/2` deletes only while ours — with `released_marker(lease, claim)`.
+  # See `release_lease/3` for why, and for why the marker needs no new reader anywhere.
+  @callback release_lease_keeping_claim(
+              shard_id :: String.t(),
+              lease :: lease(),
+              claim :: pos_integer()
+            ) :: :ok | {:error, term()}
+
   # Read-only fence: confirm `lease` is still the live lock for `shard_id` (owner +
   # epoch unchanged) without writing. `:superseded` once another owner/epoch holds it.
   @callback check_lease(shard_id :: String.t(), lease :: lease()) ::
@@ -787,6 +797,69 @@ defmodule Fathom.Shard.Storage do
   @doc "Releases `lease` on `shard_id` (no-op if we no longer hold it)."
   @spec release_lease(String.t(), lease()) :: :ok | {:error, term()}
   def release_lease(shard_id, lease), do: backend().release_lease(shard_id, lease)
+
+  @doc """
+  Releases `lease` while keeping `claim` — the lineage its holder may have shipped A2 frames under —
+  durable for the next acquirer (expert review 2026-10-12 #3). A non-integer `claim` (`:disabled`,
+  `:unknown`, `nil`: nothing was shipped under a stated lineage) is a plain `release_lease/2`.
+
+  ## Why a release can lose a lineage
+
+  A fresh-created lock carries no claim, so its holder's lineage is `next_lineage(object at open)`,
+  and only a successful flush makes that number durable (the object's lineage stamp). A holder whose
+  DROP flush fails (an S3 brownout, `:drop_flush_timeout`, a fence skip) keeps its local copy and
+  releases — and `release_lease/2` DELETES the lock. The next acquire is then a fresh create, and
+  `next_lineage` of the unchanged object is the SAME number the previous holder shipped under. Two
+  ownerships with one label:
+
+    * promote-on-open declines the old owner's replica (`rl >= lineage`), so its quorum-acked
+      writes are not recovered;
+    * a follower holding the old owner's frames sees an EQUAL lineage and an equal (reset-to-1) lock
+      epoch, so `FollowerLog.reseed?/2` says "same ownership", the salt change routes through
+      `decide_fresh/2`, the reset verdict is `:complete` (a new owner's session states no
+      `prev_extent`), and `absorb_before_reset` checkpoints the OLD owner's WAL into the replica,
+      clears `torn`, and appends the NEW owner's frames on top — a promotable hybrid of two
+      ownerships.
+
+  `takeover_claim/2` already fixed this for a takeover of an EXISTING lock (2026-09-29 #3); the
+  release path was the remaining way to reach the fresh-create bound.
+
+  ## The marker
+
+  So instead of deleting, the lock is overwritten (conditionally — only while it is still ours)
+  with a lock naming a SENTINEL owner that no node can be, at expiry 0, carrying `claim`. Every
+  existing reader already handles it correctly with no change: the sentinel has no heartbeat and
+  its TTL is long past, so `owner_live?` reads it as dead — `lease_holder/1` answers `:free`, and the
+  next `acquire_lease/3` takes the ordinary STEAL path, whose `takeover_claim/2` goes strictly above
+  the recorded claim. `check_lease/2`/`renew_lease/3` see a foreign owner, i.e. `:superseded`, which
+  is right: the releaser gave the lease up.
+
+  Used only on the release paths that did NOT stamp the lineage (a successful flush makes it
+  durable on the object, so a clean drop keeps deleting and the 1-RTT fresh-create open stays the
+  common path). The cost lands on the one open after a failed drop: the steal path's extra reads.
+  """
+  @spec release_lease(String.t(), lease(), term()) :: :ok | {:error, term()}
+  def release_lease(shard_id, lease, claim) when is_integer(claim) and claim > 0,
+    do: backend().release_lease_keeping_claim(shard_id, lease, claim)
+
+  def release_lease(shard_id, lease, _no_claim), do: release_lease(shard_id, lease)
+
+  # Deliberately not a possible `Fathom.Shard.Heartbeat.owner/0` (`<node>#<nonce>`) nor a migrator
+  # owner (`migrator@<node>@<token>`): it contains neither `@` nor `#`, so no node ever holds a
+  # heartbeat under it and no acquirer can match it as "ours".
+  @released_owner "-released-"
+
+  @doc """
+  The lock body `release_lease/3` leaves behind: a sentinel owner, long expired, carrying `claim`.
+  Shared so every backend writes the identical marker.
+  """
+  @spec released_marker(lease(), pos_integer()) :: lease()
+  def released_marker(%{epoch: epoch}, claim) when is_integer(claim) and claim > 0,
+    do: %{owner: @released_owner, epoch: epoch, expires_at_ms: 0, claim: claim}
+
+  @doc "The sentinel owner `released_marker/2` writes."
+  @spec released_owner() :: String.t()
+  def released_owner, do: @released_owner
 
   @doc """
   The shared policy half of a **conditional** lease release that came back "not the object I

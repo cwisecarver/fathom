@@ -962,6 +962,25 @@ defmodule Fathom.Shard.Storage.Local do
     end
   end
 
+  # Same ownership condition as `do_release_lease/2`, but the lock is REPLACED by the released
+  # marker instead of removed, so the claim survives for the next acquirer (expert review
+  # 2026-10-12 #3 — see `Storage.release_lease/3`).
+  @impl true
+  def release_lease_keeping_claim(shard_id, %{owner: owner, epoch: epoch} = lease, claim) do
+    with_lock_mutex(shard_id, fn ->
+      case read_lock(shard_id) do
+        {:ok, %{owner: ^owner, epoch: ^epoch}} ->
+          case write_lock(shard_id, Storage.released_marker(lease, claim)) do
+            {:ok, _} -> :ok
+            error -> error
+          end
+
+        _ ->
+          :ok
+      end
+    end)
+  end
+
   defp create_lock(shard_id, lease) do
     path = lock_path(shard_id)
     Storage.ensure_dir(Path.dirname(path))

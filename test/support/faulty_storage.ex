@@ -343,6 +343,38 @@ defmodule Fathom.Test.FaultyStorage do
 
   def release_lease(shard_id, lease), do: Local.release_lease(shard_id, lease)
 
+  # The claim-keeping release (expert review 2026-10-12 #3) under the SAME lock-etag contract as
+  # `release_lease/2` above — the S3 backend If-Matches the marker PUT exactly as it does the DELETE,
+  # with the same 412 resolution. The marker is a lock WRITE, so it rotates the etag like any other.
+  @impl true
+  def release_lease_keeping_claim(shard_id, lease, claim) do
+    cond do
+      strict_lock_etag?() and is_binary(lease[:lock_etag]) and
+          current_lock_etag(shard_id) != lease[:lock_etag] ->
+        Fathom.Shard.Storage.resolve_stale_release(
+          shard_id,
+          lease,
+          fn ->
+            case Local.check_lease(shard_id, lease) do
+              :ok -> {:ours, current_lock_etag(shard_id)}
+              _ -> :not_ours
+            end
+          end,
+          fn _fresh -> marker_written(shard_id, lease, claim) end
+        )
+
+      true ->
+        marker_written(shard_id, lease, claim)
+    end
+  end
+
+  defp marker_written(shard_id, lease, claim) do
+    with :ok <- Local.release_lease_keeping_claim(shard_id, lease, claim) do
+      bump_lock_etag(shard_id)
+      :ok
+    end
+  end
+
   # Reports the FACT and performs the retry; the DECISION is
   # `Fathom.Shard.Storage.resolve_stale_release/4`, exactly as the S3 backend does it. Keeping the
   # policy in lib/ is what makes the fix testable at all: the default suite runs THIS module as its
