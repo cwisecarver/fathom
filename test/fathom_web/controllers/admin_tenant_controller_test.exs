@@ -57,6 +57,63 @@ defmodule FathomWeb.AdminTenantControllerTest do
     assert (conn |> auth() |> get("/admin/tenants/Bad%20Id/export")).status == 400
   end
 
+  # Expert review 2026-10-12 #31 (SYMPTOM): export is a GET that changes state, and a cross-site page
+  # could make the operator's browser fire it with the cached Basic-auth credentials. Invariant: the
+  # export runs only when the browser says the request is same-origin or user-initiated (`none`), or
+  # sends no Sec-Fetch-Site at all. A cross-site or same-site request is refused before any work.
+  describe "Sec-Fetch-Site guard (#31)" do
+    setup %{id: id} do
+      seed!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('guard')"])
+      :ok
+    end
+
+    test "same-origin export is allowed", %{conn: conn, id: id} do
+      conn =
+        conn
+        |> auth()
+        |> put_req_header("sec-fetch-site", "same-origin")
+        |> get("/admin/tenants/#{id}/export")
+
+      assert conn.status == 200
+      assert String.starts_with?(conn.resp_body, "SQLite format 3")
+    end
+
+    test "user-initiated (none) export is allowed", %{conn: conn, id: id} do
+      conn =
+        conn
+        |> auth()
+        |> put_req_header("sec-fetch-site", "none")
+        |> get("/admin/tenants/#{id}/export")
+
+      assert conn.status == 200
+    end
+
+    test "a missing Sec-Fetch-Site header is allowed (non-browser client)", %{conn: conn, id: id} do
+      assert (conn |> auth() |> get("/admin/tenants/#{id}/export")).status == 200
+    end
+
+    test "a cross-site export is refused with 403 and streams nothing", %{conn: conn, id: id} do
+      conn =
+        conn
+        |> auth()
+        |> put_req_header("sec-fetch-site", "cross-site")
+        |> get("/admin/tenants/#{id}/export")
+
+      assert conn.status == 403
+      refute String.starts_with?(conn.resp_body, "SQLite format 3")
+    end
+
+    test "a same-site (sibling subdomain) export is refused with 403", %{conn: conn, id: id} do
+      conn =
+        conn
+        |> auth()
+        |> put_req_header("sec-fetch-site", "same-site")
+        |> get("/admin/tenants/#{id}/export")
+
+      assert conn.status == 403
+    end
+  end
+
   defp seed!(id, sqls) do
     {:ok, handle} = ShardExecutor.open(id)
     Enum.each(sqls, fn s -> {:ok, _} = ShardExecutor.execute(handle, %Stmt{sql: s}) end)

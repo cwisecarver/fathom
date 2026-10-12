@@ -12,6 +12,13 @@ defmodule FathomWeb.AdminTenantController do
   """
   use FathomWeb, :controller
 
+  # Export is a GET that changes state (it downloads a whole tenant DB and writes an audit row), so a
+  # cross-site page could make the operator's browser fire it with the cached Basic-auth credentials
+  # (expert review 2026-10-12 #31). Refuse when the browser reports the request came from another site.
+  # Browsers send Sec-Fetch-Site on every request; a request without it (curl, a non-browser client)
+  # is allowed, since it carries no ambient browser credentials to ride on.
+  plug :refuse_cross_site when action == :export
+
   # Export downloads a tenant's ENTIRE database, so every attempt is audited (#9), attributed to the
   # admin operator's BasicAuth username (Plug.BasicAuth doesn't assign it, so parse it here).
   def export(conn, %{"id" => id}) do
@@ -81,6 +88,23 @@ defmodule FathomWeb.AdminTenantController do
     case Plug.BasicAuth.parse_basic_auth(conn) do
       {user, _pass} -> "admin:#{user}"
       _ -> "admin"
+    end
+  end
+
+  # See the `plug :refuse_cross_site` note above (expert review 2026-10-12 #31).
+  defp refuse_cross_site(conn, _opts) do
+    case get_req_header(conn, "sec-fetch-site") do
+      [] ->
+        conn
+
+      [site] when site in ["same-origin", "none"] ->
+        conn
+
+      _ ->
+        conn
+        |> put_resp_content_type("text/plain")
+        |> send_resp(403, "export refused: cross-site request")
+        |> halt()
     end
   end
 end
