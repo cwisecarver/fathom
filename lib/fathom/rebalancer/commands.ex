@@ -9,7 +9,7 @@ defmodule Fathom.Rebalancer.Commands do
   alias Fathom.Rebalancer.Command
   alias Fathom.Repo
 
-  @doc "Issues `command` (`\"warm\"` | `\"drain\"`) of `shard_id` for `node` to execute."
+  @doc "Issues `command` (`\"drain\"` | `\"drain_for_migration\"` | `\"flush\"`) of `shard_id` for `node` to execute."
   @spec issue(String.t(), String.t(), String.t()) ::
           {:ok, Command.t()} | {:error, Ecto.Changeset.t()}
   def issue(shard_id, node, command) do

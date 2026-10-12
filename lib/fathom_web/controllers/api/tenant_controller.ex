@@ -251,7 +251,7 @@ defmodule FathomWeb.Api.TenantController do
   end
 
   # POST /api/tenants/:id/flush   — force-flush the live coordinator so its state is durable (#10).
-  # Local to the node holding the coordinator (fan out on a multi-node fleet); a no-op :ok if none.
+  # A holder on another node is flushed through the command channel; 422 if it can't be reached.
   def flush(conn, %{"id" => id}) do
     case Tenants.flush(id) do
       :ok -> json(conn, %{shard_id: id, flushed: true})

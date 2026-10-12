@@ -10,6 +10,10 @@ defmodule Fathom.Rebalancer.CommandPoller do
       (`cancelled`) if the shard has no active pin when the poller reaches it — the handoff
       reverted and the source is serving again (finding #7).
 
+    * **drain_for_migration** — the same drain, issued by a migration; no pin required.
+    * **flush** — `Fathom.Shards.flush/2` (local only) so another node's export / fork /
+      `flush:true` snapshot sees this holder's current state.
+
   Gated by `:command_poller` (default off). Only this node's poller matches a command
   addressed to this node's key, so there's no cross-node contention.
 
@@ -260,6 +264,16 @@ defmodule Fathom.Rebalancer.CommandPoller do
     case Shards.drain(id, drain_ms()) do
       :ok -> complete(cmd, "done", "drained")
       {:error, reason} -> complete(cmd, "failed", "drain failed (#{inspect(reason)})")
+    end
+  end
+
+  # A non-disruptive force-flush asked by another node's export / fork / snapshot (expert review
+  # 2026-10-12 #7). `remote: false` so a holder that changed in the meantime answers from what THIS
+  # node has instead of bouncing the request back through the channel.
+  defp execute(%{command: "flush", shard_id: id} = cmd) do
+    case Shards.flush(id, remote: false) do
+      :ok -> complete(cmd, "done", "flushed")
+      {:error, reason} -> complete(cmd, "failed", "flush failed (#{inspect(reason)})")
     end
   end
 

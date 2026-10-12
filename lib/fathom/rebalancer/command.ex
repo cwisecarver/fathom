@@ -15,7 +15,9 @@ defmodule Fathom.Rebalancer.Command do
   # `drain_for_migration` (expert review 2026-10-10 #3): the same drain, issued by a migration/revert
   # that found the shard's lease held by a coordinator on ANOTHER node. It differs from `drain` only
   # in that the poller does not require an active rebalance pin (there is none — nothing is moving).
-  @commands ~w(drain drain_for_migration)
+  # `flush` (expert review 2026-10-12 #7): export / fork / snapshot landed on a node that is not the
+  # shard's holder and asks the holder to force-flush (`Fathom.Shards.RemoteFlush`); non-disruptive.
+  @commands ~w(drain drain_for_migration flush)
   # `cancelled` — a drain that's no longer wanted (the handoff reverted before the source
   # poller ran it, finding #7); terminal like done/failed but distinguishes "abandoned".
   @statuses ~w(pending done failed cancelled)

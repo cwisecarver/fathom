@@ -954,27 +954,31 @@ defmodule Fathom.Shards do
   @doc """
   Force-flushes `shard_id`'s live coordinator so its current on-disk state is durable in storage,
   WITHOUT dropping/stopping it (it keeps serving) — the flush-before-fork primitive (#10). Returns
-  `:ok` once the shard is durably clean, `:ok` if no coordinator is running on THIS node (nothing is
-  writing here, so the stored object is already current), or `{:error, reason}` on a flush error.
+  `:ok` once the shard is durably clean, `:ok` if NOBODY holds the shard's lease (the stored object is
+  already current), or `{:error, reason}` on a flush error.
 
-  **Local only.** It flushes the coordinator on this node. A shard whose coordinator lives on its LB
-  home elsewhere must be flushed on that node — fan the call out across the fleet, or route it via the
-  command channel (the production generalization, the same cross-node-coordinator follow-up as
-  `Fathom.Tenants.purge`'s drain). The single-home / single-node case needs neither.
+  **A coordinator on ANOTHER node** (expert review 2026-10-12 #7): this node has none, but the S3
+  lease says a live node does. The flush is routed to that node through the `Fathom.Rebalancer.Commands`
+  channel (`Fathom.Shards.RemoteFlush`, the migration drain's route) and awaited. If the holder can't
+  be reached (command poller off, heartbeat lapsed, command failed or timed out) the answer is
+  `{:error, :remote_holder_unflushed}` — never `:ok`, which let export / fork / `flush:true` snapshot
+  read the last periodic flush as the tenant's current state.
+
+  `remote: false` is the executing side of that command: flush only what THIS node has.
   """
-  @spec flush(Fathom.ShardId.t()) :: :ok | {:error, term()}
-  def flush(shard_id) do
+  @spec flush(Fathom.ShardId.t(), keyword()) :: :ok | {:error, term()}
+  def flush(shard_id, opts \\ []) do
     # Canonicalize at the entry (expert review 2026-10-10 #9). A raw "ACME" used to miss the
     # lowercase Registry key AND the lowercase `db_path`, fall to the `[] -> File.exists?` branch,
     # answer `:ok` without flushing, and let `POST /snapshots {"flush":true}` 201 a stale snapshot
     # (and made the uncast File.exists? a `*.db` existence oracle).
     case Fathom.ShardId.cast(shard_id) do
-      {:ok, id} -> do_flush(id)
+      {:ok, id} -> do_flush(id, Keyword.get(opts, :remote, true))
       :error -> {:error, :invalid_shard_id}
     end
   end
 
-  defp do_flush(shard_id) do
+  defp do_flush(shard_id, remote?) do
     case Registry.lookup(@registry, shard_id) do
       # NO COORDINATOR IS NOT PROOF THE OBJECT IS CURRENT (expert review 2026-09-29 #13). A drop
       # whose flush failed (S3 brownout, `:drop_flush_timeout`, a fence skip, an inconclusive 412)
@@ -985,9 +989,11 @@ defmodule Fathom.Shards do
       # complete data. Re-open it (a warm open marks it dirty) and flush; never report success on
       # a copy we could not make durable.
       [] ->
-        if File.exists?(Fathom.Shard.db_path(shard_id)),
-          do: flush_kept_local(shard_id),
-          else: :ok
+        cond do
+          File.exists?(Fathom.Shard.db_path(shard_id)) -> flush_kept_local(shard_id)
+          remote? -> Fathom.Shards.RemoteFlush.flush(shard_id)
+          true -> :ok
+        end
 
       [{pid, _}] ->
         flush_pid(shard_id, pid)

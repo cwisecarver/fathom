@@ -180,9 +180,9 @@ defmodule Fathom.Tenants do
   @doc """
   Force-flushes a tenant's live coordinator so its current state is durable in storage, without
   disrupting it (the shard keeps serving) — the flush-before-fork affordance (#10). Returns `:ok`
-  (flushed, or already clean, or no coordinator running locally), `{:error, reason}` on a flush
-  failure, or `{:error, :invalid_shard_id}`. **Local**: flushes the coordinator on THIS node; see
-  `Fathom.Shards.flush/1` for the multi-node caveat.
+  (flushed, already clean, or nobody holds the lease), `{:error, reason}` on a flush failure,
+  `{:error, :remote_holder_unflushed}` when another node holds the lease and could not be made to
+  flush (expert review 2026-10-12 #7), or `{:error, :invalid_shard_id}`. See `Fathom.Shards.flush/1`.
   """
   @spec flush(String.t()) :: :ok | {:error, term()}
   def flush(shard_id) do
@@ -343,8 +343,8 @@ defmodule Fathom.Tenants do
   # Force-flush the shard's live coordinator before the export (#22). Default ON — an export is rare
   # and the flush is cheap, and a portability export silently omitting recent writes is a compliance
   # defect. Mirrors the fork/snapshot flush-before; `Shards.flush` surfaces a flush error (incl. the
-  # #14 timeout) rather than exporting stale, and is a no-op when no coordinator runs here (nothing
-  # writing on this node, so the stored object is already current).
+  # #14 timeout) rather than exporting stale, and is a no-op only when nobody holds the lease; a
+  # holder on another node is asked to flush, or the export errors (expert review 2026-10-12 #7).
   defp maybe_flush_export(id, opts) do
     if Keyword.get(opts, :flush, true), do: Shards.flush(id), else: :ok
   end
