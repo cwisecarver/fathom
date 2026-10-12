@@ -25,7 +25,14 @@ defmodule Fathom.Directory.Reconcile do
   """
 
   alias Fathom.Directory
-  alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Shard.Storage
+
+  # Rows reconciled at once. Each is a couple of small ranged reads (expert review 2026-10-12 #19),
+  # so this is bounded well under the HTTP pool; the old serial whole-object pull took
+  # rows x (RTT + object size / bandwidth) in the one run that has to finish before traffic reopens.
+  @concurrency 16
+  # Per row: a ranged GET plus the token-floor read. Never `:infinity`.
+  @row_timeout_ms 60_000
 
   @type finding :: %{
           required(:shard_id) => String.t(),
@@ -45,8 +52,18 @@ defmodule Fathom.Directory.Reconcile do
     findings =
       Directory.all_paged()
       |> apply_limit(Keyword.get(opts, :limit))
-      |> Stream.flat_map(&reconcile_row(&1, fix?))
-      |> Enum.to_list()
+      |> Task.async_stream(&reconcile_row(&1, fix?),
+        max_concurrency: @concurrency,
+        timeout: @row_timeout_ms,
+        on_timeout: :kill_task,
+        ordered: true
+      )
+      |> Enum.flat_map(fn
+        {:ok, findings} -> findings
+        # A row whose reads timed out is skipped (like any transient storage error), not fatal:
+        # the next run revisits it.
+        {:exit, _reason} -> []
+      end)
 
     findings ++ reconcile_tombstones(deleted_ids(), fix?)
   end
@@ -116,44 +133,17 @@ defmodule Fathom.Directory.Reconcile do
     end
   end
 
-  # Pull the shard's stored object to a temp and read its header `user_version`. `:missing` when the
-  # object is absent (a dangling directory row). Best-effort: a transient storage/open error yields
+  # The stored object's header `user_version`, via a RANGED read (`Storage.object_user_version/1`)
+  # instead of pulling the whole object to a scratch file (expert review 2026-10-12 #19: at fleet
+  # scale a DR sweep downloaded every shard in full, serially, to read four bytes). `:missing` when
+  # the object is absent (a dangling directory row, or a steal sentinel — `{:absent, _}` never reads
+  # as a version 0, expert review 2026-08-01 #24). Best-effort: a transient storage error yields
   # `{:error, _}`, which reconcile_schema treats as "skip" rather than a false drift.
   defp stored_user_version(shard_id) do
-    tmp =
-      Path.join(
-        Fathom.Shard.TempReaper.scratch_dir(),
-        "fathom_reconcile_#{shard_id}_#{System.unique_integer([:positive])}.db"
-      )
-
-    try do
-      case Storage.pull(shard_id, tmp) do
-        # `{:absent, _}` covers both no-object and a steal sentinel (expert review
-        # 2026-08-01 #24). A sentinel previously read as a real pull, so `user_version` came
-        # back 0 from a fabricated empty db and `--fix` wrote that 0 into the directory.
-        {:absent, _} -> :missing
-        {:ok, _etag} -> read_user_version(tmp)
-        {:error, reason} -> {:error, reason}
-      end
-    after
-      for s <- ["", "-wal", "-shm"], do: File.rm(tmp <> s)
-    end
-  end
-
-  defp read_user_version(path) do
-    case Connection.open(path) do
-      {:ok, conn} ->
-        result =
-          case Connection.query(conn, "PRAGMA user_version", []) do
-            {:ok, %{rows: [[v]]}} when is_integer(v) -> {:ok, v}
-            other -> {:error, other}
-          end
-
-        Connection.close(conn)
-        result
-
-      {:error, reason} ->
-        {:error, reason}
+    case Storage.object_user_version(shard_id) do
+      {:absent, _} -> :missing
+      {:ok, uv} -> {:ok, uv}
+      {:error, reason} -> {:error, reason}
     end
   end
 end

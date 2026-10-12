@@ -88,4 +88,100 @@ defmodule Fathom.Directory.ReconcileTest do
   end
 
   defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
+
+  # Expert review 2026-10-12 #19: the sweep pulled every WHOLE object serially to read four header
+  # bytes. On the S3 req_plug seam, prove the version now comes from a RANGED read and no GET of the
+  # object body is ever made.
+  describe "S3: no whole-object pull (expert review 2026-10-12 #19)" do
+    alias Fathom.Shard.Storage.S3
+
+    setup do
+      prev_store = Application.get_env(:fathom, :shard_storage)
+      prev_s3 = Application.get_env(:fathom, S3)
+
+      on_exit(fn ->
+        if prev_store,
+          do: Application.put_env(:fathom, :shard_storage, prev_store),
+          else: Application.delete_env(:fathom, :shard_storage)
+
+        if prev_s3,
+          do: Application.put_env(:fathom, S3, prev_s3),
+          else: Application.delete_env(:fathom, S3)
+      end)
+    end
+
+    test "reads user_version with a ranged GET only and reports the drift" do
+      shard = uniq()
+      {:ok, _} = Directory.resolve(shard)
+      test_pid = self()
+
+      # A valid SQLite header (magic + user_version=9 at offset 60) then 1 MiB of filler.
+      object =
+        <<"SQLite format 3\0", 0::size(352), 9::signed-big-32, 0::size(288)>> <>
+          :crypto.strong_rand_bytes(1_048_576)
+
+      plug = fn conn ->
+        range = Plug.Conn.get_req_header(conn, "range")
+        send(test_pid, {:req, conn.method, conn.request_path, range})
+
+        cond do
+          conn.query_string =~ "list-type" ->
+            Plug.Conn.send_resp(
+              conn,
+              200,
+              ~s(<?xml version="1.0"?><ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>)
+            )
+
+          conn.request_path =~ ~r{tokenfloors|tombstones} ->
+            Plug.Conn.send_resp(conn, 404, "")
+
+          range == [] ->
+            Plug.Conn.send_resp(conn, 200, object)
+
+          true ->
+            ["bytes=0-" <> last] = range
+            body = binary_part(object, 0, min(byte_size(object), String.to_integer(last) + 1))
+            Plug.Conn.send_resp(conn, 206, body)
+        end
+      end
+
+      Application.put_env(:fathom, :shard_storage, S3)
+
+      Application.put_env(:fathom, S3,
+        bucket: "b",
+        region: "us-east-1",
+        access_key_id: "k",
+        secret_access_key: "s",
+        endpoint: "https://s3.example",
+        path_style: true,
+        req_plug: plug
+      )
+
+      findings = Reconcile.run()
+
+      assert Enum.any?(
+               findings,
+               &match?(%{shard_id: ^shard, kind: :schema_drift, from: 0, to: 9}, &1)
+             )
+
+      reqs = collect_reqs([])
+
+      assert Enum.any?(reqs, fn {m, p, r} ->
+               m == "GET" and String.ends_with?(p, shard <> ".db") and r != []
+             end)
+
+      refute Enum.any?(reqs, fn {m, p, r} ->
+               m == "GET" and String.ends_with?(p, shard <> ".db") and r == []
+             end),
+             "reconcile made a full-body GET of the object: #{inspect(reqs)}"
+    end
+
+    defp collect_reqs(acc) do
+      receive do
+        {:req, m, p, r} -> collect_reqs([{m, p, r} | acc])
+      after
+        0 -> acc
+      end
+    end
+  end
 end
