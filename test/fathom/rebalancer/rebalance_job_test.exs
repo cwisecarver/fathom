@@ -60,6 +60,28 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
     refute_enqueued(worker: HandoffJob)
   end
 
+  # Expert review 2026-10-12 #30. Symptom: with the rebalancer OFF the tick returned before pruning,
+  # but the migrator issues drain commands whenever COMMAND_POLLER is on, so terminal rows were never
+  # pruned and stale pending ones never expired.
+  test "gate off: command rows are still pruned and expired" do
+    Application.put_env(:fathom, :rebalancer_enabled, false)
+    {:ok, old_done} = Commands.issue("s", "n", "drain")
+    {:ok, _} = Commands.complete(old_done, "done", "drained")
+    {:ok, old_pending} = Commands.issue("s2", "n", "drain")
+
+    # Older than the default retention (terminal) and the default stale window (pending).
+    at = DateTime.add(DateTime.utc_now(), -30 * 86_400_000, :millisecond)
+
+    Repo.update_all(from(c in Command, where: c.id in ^[old_done.id, old_pending.id]),
+      set: [inserted_at: at, updated_at: at]
+    )
+
+    assert :ok = perform_job(RebalanceJob, %{})
+
+    assert Commands.get(old_done.id) == nil
+    assert Commands.get(old_pending.id).status == "failed"
+  end
+
   test "gate on: a confirmed hot shard on an overloaded node enqueues a handoff" do
     Application.put_env(:fathom, :rebalancer_enabled, true)
     Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)

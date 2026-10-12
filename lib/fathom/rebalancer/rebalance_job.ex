@@ -47,6 +47,13 @@ defmodule Fathom.Rebalancer.RebalanceJob do
 
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
+    # Bound the command channel each tick (finding #12) BEFORE the enabled check. The earlier
+    # premise ("commands only exist when the rebalancer is enabled") was wrong: the migrator issues
+    # remote-drain commands whenever COMMAND_POLLER is on, so with the rebalancer off the rows grew
+    # without bound and a stale pending one sat there forever (expert review 2026-10-12 #30).
+    Commands.prune_terminal(command_retention_ms())
+    Commands.expire_stale_pending(command_stale_ms())
+
     if enabled?() do
       run()
     else
@@ -55,11 +62,6 @@ defmodule Fathom.Rebalancer.RebalanceJob do
   end
 
   defp run do
-    # Bound the command channel each tick (finding #12): commands only exist when the
-    # rebalancer is enabled, so the enabled cron is the right home for the sweep.
-    Commands.prune_terminal(command_retention_ms())
-    Commands.expire_stale_pending(command_stale_ms())
-
     # The live fleet (nodes beating within the staleness window) — the reconciler prefilter
     # AND the policy's viable-target set. Computed once (review 2026-07-09 #1).
     alive = Nodes.alive(node_stale_ms())
