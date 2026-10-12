@@ -222,7 +222,7 @@ defmodule Fathom.Migrator.Ledger do
 
   # Let SQLite parse Django's INSERTs: run them into an empty ledger and read the names back.
   defp names_via_sqlite(rows) do
-    {:ok, conn} = Connection.open(":memory:")
+    {:ok, conn} = Connection.open(":memory:", wal?: false)
 
     try do
       :ok = Connection.exec(conn, @ledger_ddl)

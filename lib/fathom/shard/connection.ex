@@ -27,6 +27,9 @@ defmodule Fathom.Shard.Connection do
       trusted and MUST NOT get the authorizer — see `maybe_authorizer/3`.
     * `:scope` — `:rw` (default) or `:ro`. A `:ro` handle is opened
       `mode: :readonly` so SQLite itself refuses every write (#7).
+    * `:wal?` — require the handle to enter WAL mode (default `true`; the open fails with
+      `{:wal_unavailable, mode}` otherwise, expert review 2026-10-12 #11). Only a scratch
+      `:memory:` handle, which can never be WAL, passes `false`.
 
   Only `Fathom.ShardExecutor` passes `tenant?: true`; it is the one path that
   runs SQL fathom did not author.
@@ -62,13 +65,14 @@ defmodule Fathom.Shard.Connection do
     tenant? = Keyword.get(opts, :tenant?, false)
     scope = Keyword.get(opts, :scope, :rw)
     guard_opts = [block_user_version?: Keyword.get(opts, :block_user_version?, false)]
+    wal? = Keyword.get(opts, :wal?, true)
 
     case open_handle(path, scope) do
       {:ok, conn, :readonly} ->
         close_on_error(conn, configure_readonly(conn, tenant?, guard_opts))
 
       {:ok, conn, :readwrite} ->
-        close_on_error(conn, configure_readwrite(conn, tenant?, scope, guard_opts))
+        close_on_error(conn, configure_readwrite(conn, tenant?, scope, guard_opts, wal?))
 
       {:error, reason} ->
         {:error, reason}
@@ -166,8 +170,8 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
-  defp configure_readwrite(conn, tenant?, scope, guard_opts) do
-    with :ok <- configure(conn),
+  defp configure_readwrite(conn, tenant?, scope, guard_opts, wal?) do
+    with :ok <- configure(conn, wal?),
          {:ok, ext} <- load_extension(conn, tenant?),
          :ok <- maybe_harden(conn, tenant?),
          :ok <- maybe_query_only(conn, scope),
@@ -411,8 +415,28 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
-  defp configure(conn) do
-    with :ok <- Sqlite3.execute(conn, "PRAGMA journal_mode=WAL"),
+  # `PRAGMA journal_mode=WAL` does not fail when SQLite cannot honour it (a filesystem without
+  # shared memory — NFS/EFS/9p — or an in-memory database): it returns the mode it ended up in and
+  # silently stays there. A shard in `delete` mode has no WAL, so A2 ships nothing from it for the
+  # life of the file (expert review 2026-10-12 #11). Read the result row back and fail the open
+  # unless it is "wal". `prepare` + `fetch_all`, because `Sqlite3.execute/2` discards rows.
+  defp enable_wal(conn) do
+    with {:ok, stmt} <- Sqlite3.prepare(conn, "PRAGMA journal_mode=WAL") do
+      result = Sqlite3.fetch_all(conn, stmt)
+      Sqlite3.release(conn, stmt)
+
+      case result do
+        {:ok, [[mode]]} when is_binary(mode) ->
+          if String.downcase(mode) == "wal", do: :ok, else: {:error, {:wal_unavailable, mode}}
+
+        other ->
+          {:error, {:wal_unavailable, other}}
+      end
+    end
+  end
+
+  defp configure(conn, wal?) do
+    with :ok <- if(wal?, do: enable_wal(conn), else: :ok),
          # synchronous=FULL fsyncs the WAL on every commit, so a committed write survives a node
          # crash (per-commit local durability, tightening the local RPO below the S3 flush
          # interval). It is ~free for fathom's sharded model: throughput is wire/executor-bound,

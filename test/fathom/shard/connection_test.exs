@@ -332,4 +332,23 @@ defmodule Fathom.Shard.ConnectionTest do
              "hardening a non-tenant handle would risk the migration replay's schema objects"
     end
   end
+
+  # Expert review 2026-10-12 #11: `PRAGMA journal_mode=WAL` returns the mode it ended up in and
+  # does not error when it cannot switch (NFS/EFS/9p, in-memory). The open used to ignore the row
+  # and hand back a delete-mode shard on which A2 ships nothing. An in-memory database cannot be
+  # WAL (SQLite answers "memory"), which reproduces the same silent non-switch deterministically.
+  describe "journal_mode readback" do
+    test "an open that cannot enter WAL fails with a clear error" do
+      assert {:error, {:wal_unavailable, "memory"}} = Connection.open(":memory:")
+    end
+
+    test "a scratch :memory: handle can opt out with wal?: false (the migrator ledger does)" do
+      assert {:ok, conn} = Connection.open(":memory:", wal?: false)
+      Connection.close(conn)
+    end
+
+    test "a normal file open is in WAL", %{conn: conn} do
+      assert {:ok, "wal"} = Connection.pragma(conn, "journal_mode")
+    end
+  end
 end
