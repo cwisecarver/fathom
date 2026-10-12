@@ -310,6 +310,50 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
     Storage.release_lease(id, lease)
   end
 
+  # Expert review 2026-10-12 #28. `promote/2` renamed the staged replica over whatever was at the
+  # live path and never touched a leftover `-wal`/`-shm`. Symptoms: (1) a kept-local `.db` holding
+  # acked writes was overwritten with no trace; (2) a stale `-wal` beside an absent `.db` stayed next
+  # to the promoted file, for SQLite to apply to pages it does not belong to.
+  describe "operator promote vs leftovers at the live path (#28)" do
+    test "refuses to replace an existing local .db, leaving it and the lease untouched", ctx do
+      %{id: id, root: root} = ctx
+      followers = start_followers!(root, 3)
+      enable!(followers, 2)
+      :ok = replicate_then_abandon_primary(id, followers, 3)
+      [{name, _} | _] = followers
+
+      path = Fathom.Shard.db_path(id)
+      File.write!(path, "kept-local-copy-with-acked-writes")
+
+      assert {:error, {:local_copy_exists, ^path}} = Promote.promote(id, follower: name)
+      assert File.read!(path) == "kept-local-copy-with-acked-writes"
+
+      # Refused BEFORE taking the lease: a foreign owner can acquire it straight away.
+      assert {:ok, lease} = Storage.acquire_lease(id, "verifier#28", 10_000)
+      Storage.release_lease(id, lease)
+    end
+
+    test "removes a stale -wal/-shm left beside an absent .db before publishing", ctx do
+      %{id: id, root: root} = ctx
+      followers = start_followers!(root, 3)
+      enable!(followers, 2)
+      :ok = replicate_then_abandon_primary(id, followers, 3)
+      [{name, _} | _] = followers
+
+      path = Fathom.Shard.db_path(id)
+      File.write!(path <> "-wal", :crypto.strong_rand_bytes(4_152))
+      File.write!(path <> "-shm", :crypto.strong_rand_bytes(32_768))
+      refute File.exists?(path)
+
+      assert {:ok, _} = Promote.promote(id, follower: name)
+
+      refute File.exists?(path <> "-wal"), "a stale -wal was left beside the promoted database"
+      refute File.exists?(path <> "-shm"), "a stale -shm was left beside the promoted database"
+      assert Fathom.Shard.verify_integrity(path) == :ok
+      assert rows_in(path) == Enum.to_list(1..3)
+    end
+  end
+
   # THE THREE DEFECTS IN ONE FUNCTION (expert review 2026-08-20 #17). promote/2 is operator-invoked
   # only, but it is the tool reached for DURING an incident, and it left the shard in the one state
   # cold-open treats as hostile.
