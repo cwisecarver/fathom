@@ -1871,6 +1871,32 @@ defmodule Fathom.Shard do
   # rather than stacking PUTs; the in-flight one will reschedule when it lands.
   def handle_info(:renew_lease, state), do: {:noreply, state}
 
+  # The one-shot write-fence re-check armed at the FIRST `:not_valid` (expert review 2026-10-12 #9) —
+  # see `arm_write_fence_check/2`. Acts only if it belongs to the CURRENT not-valid episode: a
+  # reconfirming fence resets `not_valid_since` to nil, and a later episode starts a new instant, so a
+  # stale timer from either no-ops here.
+  def handle_info({:write_fence_check, since}, %{not_valid_since: since} = state)
+      when is_integer(since) do
+    case write_fence_recheck(state) do
+      :not_valid ->
+        state = note_not_valid(state)
+        arm_write_fence_check(state, since)
+        {:noreply, state}
+
+      # Valid with margin and no lapse since acquire: the same verdict `Fence.check/2` writes on
+      # with no per-shard I/O, i.e. ownership confirmed — close the episode.
+      :ok ->
+        {:noreply, clear_write_fence(state)}
+
+      # `:revalidate` (a lapse; the lapse broadcast's own revalidation decides) or the heartbeat is
+      # unreadable: no evidence either way, so leave it to the fence paths as before.
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:write_fence_check, _stale}, state), do: {:noreply, state}
+
   # Periodic durability flush: snapshot + upload the live shard without dropping
   # it, so a busy shard's data-loss window is bounded to the flush interval rather
   # than the whole session. Fenced like the idle flush.
@@ -3390,10 +3416,42 @@ defmodule Fathom.Shard do
         )
       end
 
+      # The FIRST observation of an episode arms the re-check (expert review 2026-10-12 #9).
+      if is_nil(state.not_valid_since), do: arm_write_fence_check(state, since)
+
       %{state | not_valid_since: since}
     else
       state
     end
+  end
+
+  # ARM THE BREAKER ON TIME, NOT ON THE NEXT TICK (expert review 2026-10-12 #9). `note_not_valid/1`
+  # publishes the fence only when it is CALLED past `stealable_after_ms`, and it is called only from
+  # a flush fence or a lapse verdict — so with a 30 s flush interval the fence armed up to ~60 s after
+  # the first `:not_valid`, against a stealable-after of ~15 s: writes acked on a node a peer was
+  # already entitled to steal from, then quarantined on heal. The A2 commit gate covers prod's
+  # replicating heartbeat-mode nodes; replication-off nodes had only this. One timer per episode,
+  # for exactly the remaining time, carrying the episode's start so a stale one no-ops.
+  defp arm_write_fence_check(state, since) do
+    remaining = stealable_after_ms(state) - (System.monotonic_time(:millisecond) - since)
+
+    if remaining > 0,
+      do: Process.send_after(self(), {:write_fence_check, since}, remaining + 1)
+
+    :ok
+  end
+
+  # Re-check before fencing on a timer: nothing re-observed the `:not_valid` since it was first seen,
+  # and a fence that outlives a recovered heartbeat on a clean shard would never be lifted (no flush
+  # runs, and no write can make one). Heartbeat mode reads the same lock-free status `Fence.check/2`
+  # does. Legacy mode has no such read, but there the clock is cleared by every successful renew
+  # (`apply_renew_result/2`), which runs on its own timer — still set means none has succeeded.
+  defp write_fence_recheck(%{acquire_gen: nil}), do: :not_valid
+
+  defp write_fence_recheck(%{acquire_gen: gen}) do
+    if Heartbeat.running?(), do: Heartbeat.valid_for_write?(gen), else: :unknown
+  catch
+    :exit, _ -> :unknown
   end
 
   # A fence just reconfirmed ownership — lift any write-fence and reset the not-valid clock. Cheap
