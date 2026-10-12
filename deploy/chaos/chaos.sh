@@ -5,7 +5,7 @@
 #
 #   ./chaos.sh build              build the fathom release image
 #   ./chaos.sh build-driver       build the in-network elixir tpc-driver image (for TPC_NET=container)
-#   ./chaos.sh up | down | logs [svc]
+#   ./chaos.sh up | down | logs [-f] [svc]   (logs prints and exits; -f follows)
 #   ./chaos.sh smoke              write+read a few tenants through the LB; check isolation
 #   ./chaos.sh owner <shard>      which node holds the shard file
 #   ./chaos.sh latency <ms>|clear inject S3 latency on every node (toxiproxy)
@@ -342,7 +342,9 @@ check_lb_port() {
   echo "  Then free the port, or re-run on another one:  LB_PORT=18080 ./chaos.sh up"
 }
 cmd_down()  { compose down -v --remove-orphans; }
-cmd_logs()  { compose logs -f "${1:-}"; }
+# Prints and exits by default. `-f` follows, which never returns: a script that captured node
+# logs with the old always-follow form hung for a day waiting on it (2026-10-11).
+cmd_logs()  { compose logs "$@"; }
 
 cmd_owner() {
   local shard=$1 n
@@ -608,7 +610,7 @@ cmd_partition() {
   compose logs --since "${secs}s" "$node" 2>/dev/null |
     grep -Ei "heartbeat|lapse|unconfirmed|ownership|flush skipped|fenc|error" | tail -10 | sed 's/^/  /'
   curl -sS -X POST "$TOXI/proxies/$proxy" -d '{"enabled": true}' >/dev/null
-  echo "restored; node should resume renewing (watch: ./chaos.sh logs $node)"
+  echo "restored; node should resume renewing (watch: ./chaos.sh logs -f $node)"
 }
 
 cmd_soak() {
@@ -638,7 +640,25 @@ cmd_soak() {
   echo "soak load done; letting flushes settle..."
   sleep 10
 
-  local total_acked=0 total_stored=0 leaks=0 unreadable=0 total_recovered=0
+  # Wait for every tenant to be readable through the LB before the verdict. The last churn kill
+  # can land seconds before the end, and a failover takes up to the lease TTL, so a tenant read
+  # too early is UNREADABLE — and its live rows then count nowhere. On 2026-10-12 that printed
+  # DESTROYED=1 for a tenant that served all 319/319 acked rows once the failover finished.
+  local settle_deadline=$(( $(now_ms) / 1000 + ${SOAK_SETTLE_S:-90} )) pending
+  while :; do
+    pending=()
+    for t in "${tenants[@]}"; do
+      is_num "$(sql "$t" "SELECT count(*) FROM kv" | val)" || pending+=("$t")
+    done
+    [ ${#pending[@]} -eq 0 ] && break
+    if [ "$(( $(now_ms) / 1000 ))" -ge "$settle_deadline" ]; then
+      echo "  still unreadable after ${SOAK_SETTLE_S:-90}s: ${pending[*]}"
+      break
+    fi
+    sleep 3
+  done
+
+  local total_acked=0 total_stored=0 leaks=0 unreadable=0 total_recovered=0 unverified=0 total_live_acked=0
   for t in "${tenants[@]}"; do
     local acked stored foreign recovered
     # `val` emits the literal string "null" when the response carries no row — which happens
@@ -661,24 +681,29 @@ cmd_soak() {
     # write committed server-side and the ACK was lost when churn killed the node mid-response.
     # That is a normal distributed outcome, not a surplus — so "destroyed" has to mean
     # "acked seqs present NOWHERE", which only a set difference answers.
-    local all_seqs acks_sorted
-    all_seqs=$(mktemp); acks_sorted=$(mktemp)
-    { sql "$t" "SELECT seq FROM kv" | vals; recoverable_seqs "$t"; } \
-      | grep -E '^[0-9]+$' | sort -u > "$all_seqs"
+    local all_seqs acks_sorted live_seqs live_acked
+    all_seqs=$(mktemp); acks_sorted=$(mktemp); live_seqs=$(mktemp)
+    sql "$t" "SELECT seq FROM kv" | vals | grep -E '^[0-9]+$' | sort -u > "$live_seqs"
+    { cat "$live_seqs"; recoverable_seqs "$t"; } | grep -E '^[0-9]+$' | sort -u > "$all_seqs"
     sort -u "$ack_dir/$t" > "$acks_sorted"
     acked=$(wc -l < "$acks_sorted" | tr -d ' ')
     recovered=$(comm -12 "$acks_sorted" "$all_seqs" | wc -l | tr -d ' ')
-    rm -f "$all_seqs" "$acks_sorted"
-    total_acked=$((total_acked + acked)); total_recovered=$((total_recovered + recovered))
+    # Acked rows the LIVE shard serves. Not `stored`, which also counts committed rows whose ack was
+    # lost to a kill, so `acked - stored` went negative (-8 on 2026-10-12).
+    live_acked=$(comm -12 "$acks_sorted" "$live_seqs" | wc -l | tr -d ' ')
+    rm -f "$all_seqs" "$acks_sorted" "$live_seqs"
 
     if is_num "$stored" && is_num "$foreign"; then
-      total_stored=$((total_stored + stored))
+      total_acked=$((total_acked + acked)); total_recovered=$((total_recovered + recovered))
+      total_stored=$((total_stored + stored)); total_live_acked=$((total_live_acked + live_acked))
       [ "$foreign" != "0" ] && { leaks=$((leaks + 1)); echo "  *** ISOLATION LEAK in $t: $foreign foreign rows"; }
       printf "  %-4s acked=%-6s stored=%-6s recoverable=%-6s destroyed=%-4s foreign=%s\n" \
         "$t" "$acked" "$stored" "$recovered" "$((acked - recovered))" "$foreign"
     else
-      unreadable=$((unreadable + 1))
-      printf "  %-4s acked=%-6s stored=%-6s recoverable=%-6s destroyed=%-4s foreign=%-6s  *** UNREADABLE live\n" \
+      # Its live rows could not be read, so its gap is UNVERIFIED, not destroyed: it stays out of
+      # the totals and the run is inconclusive rather than a false DESTROYED.
+      unreadable=$((unreadable + 1)); unverified=$((unverified + acked - recovered))
+      printf "  %-4s acked=%-6s stored=%-6s recoverable=%-6s unverified=%-4s foreign=%-6s  *** UNREADABLE live\n" \
         "$t" "$acked" "${stored:-?}" "$recovered" "$((acked - recovered))" "${foreign:-?}"
     fi
   done
@@ -696,9 +721,12 @@ cmd_soak() {
   # `.forked.*` merge rather than being served — but it is no longer the pass/fail number.
   local destroyed=$((total_acked - total_recovered))
   echo "RESULT soak: acked=$total_acked stored=$total_stored recoverable=$total_recovered DESTROYED=$destroyed (MUST be 0), leaks=$leaks (MUST be 0), unreadable=$unreadable"
-  echo "  needs-operator-recovery: $((total_acked - total_stored)) row(s) live only in .forked.* quarantine copies (RPO: committed-but-unflushed at a kill)"
-  [ "$unreadable" -gt 0 ] && echo "  NOTE: $unreadable tenant(s) unreadable live — their quarantined rows ARE counted in recoverable"
-  [ $leaks -eq 0 ] && [ $destroyed -eq 0 ]
+  echo "  needs-operator-recovery: $((total_recovered - total_live_acked)) acked row(s) live only in .forked.* quarantine copies (RPO: committed-but-unflushed at a kill)"
+  if [ "$unreadable" -gt 0 ]; then
+    echo "  INCONCLUSIVE: $unreadable tenant(s) unreadable live after the settle wait; their $unverified"
+    echo "  unmatched ack(s) are unverified, not counted as destroyed. Re-run, or raise SOAK_SETTLE_S."
+  fi
+  [ $leaks -eq 0 ] && [ $destroyed -eq 0 ] && [ "$unreadable" -eq 0 ]
 }
 
 # A shard's HOME node (the LB-hash target that serves it) must NOT warm its own
