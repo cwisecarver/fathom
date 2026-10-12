@@ -10,6 +10,8 @@ defmodule Fathom.Migrator.ReconcileJob do
   require Logger
 
   alias Fathom.{Directory, Migrator}
+  alias Fathom.Shard.Storage
+  alias Fathom.Tenants.DeleteJob
 
   # The rollout sweep's per-run cap (expert review 2026-07-18 #19). The default 100 keeps a single
   # hourly run bounded (migration-queue depth + S3 headroom), but at fleet scale a deep cold tail
@@ -66,7 +68,44 @@ defmodule Fathom.Migrator.ReconcileJob do
         )
     end
 
+    redrive_deletes()
+
     :ok
+  end
+
+  # Expert review 2026-10-12 #10. A DeleteJob that exhausted its attempts (long storage outage) or
+  # whose enqueue failed leaves a tombstoned tenant's object in storage with nothing to re-drive it.
+  # Re-enqueue the (unique, idempotent) DeleteJob for recently tombstoned rows whose live object
+  # still exists. Bounded: only rows deleted inside the window, at most @redrive_max per run, so the
+  # per-run storage HEADs do not scale with cumulative lifetime deletions. Best-effort, like the
+  # cool-off requeue above.
+  @redrive_window_days 30
+  @redrive_max 500
+
+  defp redrive_deletes do
+    since = DateTime.add(DateTime.utc_now(), -@redrive_window_days * 86_400, :second)
+
+    leftovers =
+      since
+      |> Directory.deleted_shard_ids_since()
+      |> Enum.take(@redrive_max)
+      |> Enum.filter(&match?({:ok, etag} when is_binary(etag), Storage.object_etag(&1)))
+
+    for id <- leftovers do
+      {:ok, _} = Oban.insert(DeleteJob.new(%{shard_id: id}))
+    end
+
+    if leftovers != [] do
+      Logger.warning(
+        "reconcile: re-enqueued DeleteJob for #{length(leftovers)} tombstoned shard(s) " <>
+          "whose objects still exist: #{inspect(leftovers)}"
+      )
+    end
+  rescue
+    e -> Logger.warning("reconcile: delete re-drive failed (#{inspect(e)}); continuing")
+  catch
+    :exit, reason ->
+      Logger.warning("reconcile: delete re-drive failed (#{inspect(reason)}); continuing")
   end
 
   defp safe_retry_cooled do

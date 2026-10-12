@@ -52,6 +52,61 @@ defmodule Fathom.TenantsTest do
     end
   end
 
+  # Expert review 2026-10-12 #10. Symptom: DeleteJob had max_attempts 5 on Oban's default backoff
+  # (about 7 minutes), so an S3 brownout discarded it and the tombstoned tenant's data stayed in
+  # storage with nothing to re-drive the purge.
+  describe "DeleteJob retry horizon and re-drive (expert review 2026-10-12 #10)" do
+    test "backoff doubles from 30 s and caps at 15 min; attempts >= 20" do
+      assert DeleteJob.backoff(%Oban.Job{attempt: 1}) == 30
+      assert DeleteJob.backoff(%Oban.Job{attempt: 2}) == 60
+      assert DeleteJob.backoff(%Oban.Job{attempt: 20}) == 900
+      assert DeleteJob.__opts__()[:max_attempts] >= 20
+    end
+
+    test "emits delete_discarded on the last failed attempt only" do
+      ref = make_ref()
+      me = self()
+
+      :telemetry.attach(
+        {ref, :d},
+        [:fathom, :tenants, :delete_discarded],
+        fn _e, m, meta, _ -> send(me, {:discarded, m, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach({ref, :d}) end)
+
+      # An invalid id makes purge/1 return {:error, _} without touching storage.
+      job = %Oban.Job{args: %{"shard_id" => "Not Valid!"}, attempt: 1, max_attempts: 20}
+      assert {:error, _} = DeleteJob.perform(job)
+      refute_received {:discarded, _, _}
+
+      assert {:error, _} = DeleteJob.perform(%{job | attempt: 20})
+      assert_received {:discarded, %{count: 1}, %{shard_id: "Not Valid!"}}
+    end
+
+    test "ReconcileJob re-enqueues a purge for a tombstoned shard whose object survived", %{
+      id: id
+    } do
+      src = Path.join(System.tmp_dir!(), "#{id}.src")
+      File.write!(src, "x")
+      on_exit(fn -> File.rm(src) end)
+      assert :ok = Storage.flush(id, src)
+      {:ok, _} = Directory.tombstone(id)
+      refute_enqueued(worker: DeleteJob, args: %{shard_id: id})
+
+      assert :ok = perform_job(Fathom.Migrator.ReconcileJob, %{})
+      assert_enqueued(worker: DeleteJob, args: %{shard_id: id})
+    end
+
+    test "ReconcileJob leaves a fully purged tombstoned shard alone", %{id: id} do
+      {:ok, _} = Directory.tombstone(id)
+
+      assert :ok = perform_job(Fathom.Migrator.ReconcileJob, %{})
+      refute_enqueued(worker: DeleteJob, args: %{shard_id: id})
+    end
+  end
+
   describe "purge/1 (the DeleteJob body)" do
     # Symptom (expert review 2026-10-10 #27): purge never unpinned the rebalancer's LB override, so
     # the LB map kept an exception row for an erased tenant (and a re-minted id inherited it).

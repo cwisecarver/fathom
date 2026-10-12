@@ -12,16 +12,26 @@ defmodule Fathom.Tenants.DeleteJob do
   every step tolerates already-gone state, so a retry after a partial run finishes the
   job cleanly.
   """
+  # Expert review 2026-10-12 #10. Was 5 attempts on Oban's default backoff (about 7 minutes of
+  # horizon): an S3 brownout longer than that DISCARDED the job, leaving a tombstoned tenant's data
+  # in storage with nothing to re-drive it. 20 attempts on a 30 s doubling backoff capped at 15 min
+  # is about 4.5 hours; `Fathom.Migrator.ReconcileJob` re-enqueues past even that.
+  @max_attempts 20
+  @backoff_base_s 30
+  @backoff_cap_s 900
+
+  require Logger
+
   use Oban.Worker,
     queue: :tenants,
-    max_attempts: 5,
+    max_attempts: @max_attempts,
     unique: [
       keys: [:shard_id],
       # `period: :infinity` is LOAD-BEARING, not decoration (expert review 2026-08-24 #23, extended
       # by 2026-08-26 #36). A KEYWORD LIST in `unique:` merges into Oban's @unique_defaults and so
       # inherits `period: 60` — only a bare `unique: true` gets `:infinity`. Without this line the
-      # dedup silently expires after SIXTY SECONDS, and `max_attempts: 5` with Oban's default
-      # backoff puts attempt 3 well past that, so a re-issued job during a retry inserts a second
+      # dedup silently expires after SIXTY SECONDS, and a short retry horizon with Oban's
+      # backoff put attempt 3 well past that, so a re-issued job during a retry inserts a second
       # concurrent run. A row stranded in `:executing` by a dead node also stops deduping after a
       # minute — the wedge case Lifeline's `rescue_after` exists for, and `config/config.exs`
       # asserts this property of every per-shard worker by name.
@@ -34,7 +44,28 @@ defmodule Fathom.Tenants.DeleteJob do
     ]
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"shard_id" => shard_id}}) do
-    Fathom.Tenants.purge(shard_id)
+  def perform(%Oban.Job{args: %{"shard_id" => shard_id}} = job) do
+    case Fathom.Tenants.purge(shard_id) do
+      {:error, reason} = err ->
+        # The last attempt's error return discards the job: the tenant is tombstoned but its data
+        # is still in storage. Make that loud; the reconcile sweep re-drives it.
+        if job.attempt >= job.max_attempts do
+          Logger.error("tenant #{shard_id}: DeleteJob discarded (#{inspect(reason)})")
+
+          :telemetry.execute([:fathom, :tenants, :delete_discarded], %{count: 1}, %{
+            shard_id: shard_id
+          })
+        end
+
+        err
+
+      other ->
+        other
+    end
+  end
+
+  @impl Oban.Worker
+  def backoff(%Oban.Job{attempt: attempt}) do
+    min(@backoff_base_s * Integer.pow(2, max(attempt - 1, 0)), @backoff_cap_s)
   end
 end
