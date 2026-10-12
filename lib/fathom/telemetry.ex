@@ -823,6 +823,11 @@ defmodule Fathom.Telemetry do
         description:
           "Tenant deletions completed (#15) — irreversible erase of every stored object. Also audited to Postgres; this is the RATE view, where a runaway script shows up as a spike"
       ),
+      counter("fathom.tenants.delete_discarded.count",
+        event_name: [:fathom, :tenants, :delete_discarded],
+        description:
+          "DeleteJobs that exhausted every attempt (expert review 2026-10-12 #10) — a tombstoned tenant's data is STILL in storage; the hourly reconcile re-drives it, but a non-zero count means a long storage outage and an erasure that is overdue"
+      ),
       counter("fathom.tenants.purge_while_held.count",
         event_name: [:fathom, :tenants, :purge_while_held],
         description:
