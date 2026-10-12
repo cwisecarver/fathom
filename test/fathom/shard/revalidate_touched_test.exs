@@ -117,6 +117,13 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
 
   defp local_path(shard), do: Path.join(local_dir(), "#{shard}.db")
   defp sidecar_path(shard), do: local_path(shard) <> ".etag"
+
+  # The sidecar is a fixed-width record since expert review 2026-10-12 #24, not the bare etag.
+  defp sidecar_etag(shard) do
+    {:ok, etag} = Fathom.Shard.Provenance.read(local_path(shard))
+    etag
+  end
+
   defp forked_files(shard), do: Path.wildcard(local_path(shard) <> ".forked.*")
 
   defp start_counters do
@@ -283,7 +290,7 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
       assert body_gets(cnt) == 1,
              "etag == post is the fast path — exactly the one speculative pull, no re-pull"
 
-      assert File.read!(sidecar_path(shard)) == post,
+      assert sidecar_etag(shard) == post,
              "the pulled (post-touch) etag is the provenance sidecar"
 
       drain(shard)
@@ -316,7 +323,7 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
       assert forked_files(shard) == [], "a provenance MATCH must not quarantine"
       refute_received {:forked, _}
 
-      assert File.read!(sidecar_path(shard)) == post,
+      assert sidecar_etag(shard) == post,
              "the adopted post-touch etag is persisted, so a later warm restart fences with the store's real etag"
 
       drain(shard)
@@ -471,7 +478,7 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
       # The sentinel the touch planted is now the provenance, so the first flush If-Matches it.
       sentinel = S3EtagStore.etag_of(store, data_key)
 
-      assert File.read!(sidecar_path(shard)) == sentinel,
+      assert sidecar_etag(shard) == sentinel,
              "the adopted sidecar is the sentinel etag, so the next flush fences on it"
 
       drain(shard)
@@ -500,7 +507,7 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
       assert body_gets(cnt) == 0, "an unchanged store object is served warm — no pull"
       assert forked_files(shard) == []
       refute_received {:forked, _}
-      assert File.read!(sidecar_path(shard)) == base_etag, "provenance is unchanged"
+      assert sidecar_etag(shard) == base_etag, "provenance is unchanged"
 
       drain(shard)
     end)
@@ -613,7 +620,7 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
       assert forked_files(shard) == []
       refute_received {:forked, _}
 
-      assert File.read!(sidecar_path(shard)) == base_etag,
+      assert sidecar_etag(shard) == base_etag,
              "provenance is retained so a forked flush self-fences instead of clobbering"
 
       drain(shard)

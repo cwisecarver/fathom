@@ -2755,7 +2755,7 @@ defmodule Fathom.ShardDurabilityTest do
     # And the sidecar records the PULLED object's etag exactly — so a later warm restart
     # fences with the real lineage via await_pull(nil), never the adopt-current path the
     # sidecar-less residue forced open.
-    assert File.read!(sidecar) == object_etag,
+    assert Fathom.Shard.Provenance.read(local_db(shard)) == {:ok, object_etag},
            "the sidecar must record the pulled object's etag, not adopt-current"
 
     close_and_stop(shard, conn)

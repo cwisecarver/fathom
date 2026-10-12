@@ -166,7 +166,8 @@ defmodule Fathom.Shard.StealTouchWarmStandbyTest do
       # The provenance sidecar is stamped to the post-touch etag, so a later warm
       # restart fences with the store's real etag instead of self-fencing on its first
       # flush (or needlessly quarantining + re-pulling).
-      assert File.read!(Path.join(local_dir(), "#{shard}.db.etag")) == post_etag,
+      assert elem(Fathom.Shard.Provenance.read(Path.join(local_dir(), "#{shard}.db")), 1) ==
+               post_etag,
              "the adopted post-touch etag must be persisted as the local provenance"
 
       {:ok, coordinator} = Shards.ensure(shard)

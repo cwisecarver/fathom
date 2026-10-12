@@ -332,7 +332,9 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
 
       # And it must agree with the store, or the next open reads it as a fork anyway.
       assert {:ok, etag} = Storage.object_etag(id)
-      assert String.trim(File.read!(sidecar)) == etag
+
+      assert {:ok, ^etag} =
+               Fathom.Shard.Provenance.read(String.replace_suffix(sidecar, ".etag", ""))
     end
 
     test "(b) the publish is FENCED — an object that moved under it refuses the promotion", ctx do

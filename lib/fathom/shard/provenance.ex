@@ -90,7 +90,20 @@ defmodule Fathom.Shard.Provenance do
     # direction). The temp+rename pattern costs ~5× more (two APFS-journaled metadata ops) on the
     # timed cold-open path. The FLUSH path uses write_durable/2 instead — see there for
     # why the same torn value is NOT recoverable once the local .db holds acked writes (#15).
-    case File.write(sidecar_path(path), etag) do
+    #
+    # WRITES THE FIXED-WIDTH RECORD DIRECTLY (expert review 2026-10-12 #24). It used to write the
+    # bare etag, so the first durable stamp after every open found a non-record file and converted
+    # it with temp+rename — the very rename-loses-the-sidecar window the in-place format exists to
+    # close, reopened on the first flush of each coordinator life. A record here makes every later
+    # stamp a pwrite. Same one plain write, no fsync, so the cold-open cost is unchanged. An etag
+    # that does not fit the record keeps the legacy bare form.
+    bytes =
+      case encode_record(etag, nil, nil) do
+        {:ok, record} -> record
+        :error -> etag
+      end
+
+    case File.write(sidecar_path(path), bytes) do
       :ok -> :ok
       {:error, reason} -> Logger.warning("etag sidecar write failed: #{inspect(reason)}")
     end
