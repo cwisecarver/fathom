@@ -302,8 +302,12 @@ defmodule Fathom.Shard do
   `{:error, :no_lease}` when the shard is not currently held, which a replication session must
   treat as "do not ship": frames from a node without a lease are exactly what the follower's epoch
   check exists to refuse.
+
+  `{:error, :lineage_unknown}` when replication is on but this coordinator could not read the
+  object to derive its lineage (expert review 2026-10-12 #21) — also "do not ship", and retried on
+  every call, so it clears as soon as the store answers. See `resolve_unknown_lineage/1`.
   """
-  @spec epoch(pid()) :: {:ok, non_neg_integer()} | {:error, :no_lease}
+  @spec epoch(pid()) :: {:ok, non_neg_integer()} | {:error, :no_lease | :lineage_unknown}
   def epoch(pid) when is_pid(pid), do: GenServer.call(pid, :epoch)
 
   @doc """
@@ -1295,6 +1299,22 @@ defmodule Fathom.Shard do
   # put this coordinator's mailbox in front of the shard's write path, which is the cost
   # WriteCounter's lock-free ETS exists to avoid. The session monitors this process and stops when
   # it does, so a cached epoch can never outlive the ownership it describes.
+  # NO LINEAGE YET ⇒ DO NOT SHIP, and try again (expert review 2026-10-12 #21). The open's HEAD
+  # failed, so `open_lineage/2` answered `:unknown`, which used to be fixed for the coordinator's
+  # life and shipped as lineage 0 ("unstated"). That is not a harmless degradation on a FRESH lock:
+  # its epoch reset to 1, so a follower already at a higher epoch answers `:stale_epoch` — a settled
+  # reject, FILO_NO_QUORUM on every write until idle-drop — and a follower at epoch 1 sees "same
+  # ownership" with a new salt and absorbs the previous owner's WAL under this one's frames (the
+  # #3 hybrid, by the other door). So the session's epoch read — the gate it already treats as "do
+  # not ship" — refuses until a lineage is known, and each refusal re-reads the head. The commit
+  # gets a retryable 503 and the client's retry ships once the store answers.
+  def handle_call(:epoch, _from, %{lease: %{epoch: epoch}, lineage: :unknown} = state) do
+    case resolve_unknown_lineage(state) do
+      %{lineage: n} = state when is_integer(n) -> {:reply, {:ok, epoch}, state}
+      state -> {:reply, {:error, :lineage_unknown}, state}
+    end
+  end
+
   def handle_call(:epoch, _from, %{lease: %{epoch: epoch}} = state),
     do: {:reply, {:ok, epoch}, state}
 
@@ -3235,6 +3255,45 @@ defmodule Fathom.Shard do
       true -> :unknown
     end
   end
+
+  # The deferred half of open_lineage/2 for a FRESH lock whose open HEAD failed (expert review
+  # 2026-10-12 #21). Same derivation, `next_lineage(object)`, and still sound this late: we hold the
+  # lock, so nobody else has flushed since the open, and our own flushes under `:unknown` stamp no
+  # lineage (Position.stamp_epoch/1 → nil, lineage_to_store/1 → nil, i.e. "leave it alone"); and
+  # nothing was shipped under it, because `:epoch` refuses until this succeeds. So the first integer
+  # lineage this coordinator ever states is the one the open would have chosen, and it is still read
+  # once and never recomputed after that.
+  #
+  # A TAKEOVER lock never reaches here: its claim must sit above the PREVIOUS holder's, which only
+  # the stolen lock body knew, so a takeover whose HEAD fails is refused at acquire instead
+  # (`Storage.with_takeover_claim/3`) rather than opened with a claim nobody can recompute.
+  #
+  # Inline but BOUNDED, like the open's fork-evidence wait: this is reached only after a failed open
+  # HEAD and only from a commit, and the bound keeps it well under the session's call timeout.
+  defp resolve_unknown_lineage(%{lease: lease} = state) when is_map_key(lease, :claim), do: state
+
+  defp resolve_unknown_lineage(state) do
+    id = state.id
+
+    task =
+      Task.async(fn ->
+        try do
+          Storage.object_head(id)
+        rescue
+          e -> {:error, e}
+        catch
+          :exit, r -> {:error, {:exit, r}}
+        end
+      end)
+
+    case Task.yield(task, lineage_retry_timeout()) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {:ok, head}} -> %{state | lineage: Storage.next_lineage(head)}
+      _ -> state
+    end
+  end
+
+  defp lineage_retry_timeout,
+    do: Application.get_env(:fathom, :lineage_retry_timeout_ms, 2_000)
 
   # The object head open_lineage/2 derives a fresh lock's lineage from, read once and also handed
   # to promote-on-open as its decision read. `nil` exactly when open_lineage/2 does not need it.

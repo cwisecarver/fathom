@@ -2012,15 +2012,17 @@ defmodule Fathom.Shard.Storage.S3 do
     case get_lock(shard_id) do
       # A same-owner reclaim is a takeover from a previous coordinator of THIS node that may have
       # shipped under its claim, so it claims above it like a steal (expert review 2026-09-29 #3).
+      # An unreadable claim fails closed BEFORE the write (2026-10-12 #21; see
+      # `Storage.with_takeover_claim/3`), so the existing lock and its claim survive for the retry.
       {:ok, %{owner: ^owner, epoch: epoch} = existing, etag} ->
-        put_lock(
-          shard_id,
-          Storage.with_claim(
-            %{owner: owner, epoch: epoch, expires_at_ms: now + ttl_ms},
-            Storage.takeover_claim(shard_id, Map.get(existing, :claim))
-          ),
-          if_match: etag
-        )
+        with {:ok, reclaimed} <-
+               Storage.with_takeover_claim(
+                 %{owner: owner, epoch: epoch, expires_at_ms: now + ttl_ms},
+                 shard_id,
+                 Map.get(existing, :claim)
+               ) do
+          put_lock(shard_id, reclaimed, if_match: etag)
+        end
 
       # Someone else holds it — liveness is *their heartbeat* (with the lock's own TTL as the
       # fallback when they run no heartbeat — see owner_live?/3).
@@ -2038,82 +2040,84 @@ defmodule Fathom.Shard.Storage.S3 do
             # The new lock records the lineage this owner claims, strictly above anything the dead
             # owner could have shipped under (expert review 2026-09-29 #3). Read BEFORE the PUT so it
             # rides the steal write itself — no extra lock write per takeover.
-            stolen =
-              Storage.with_claim(
-                %{owner: owner, epoch: epoch + 1, expires_at_ms: now + ttl_ms},
-                Storage.takeover_claim(shard_id, Map.get(dead_lock, :claim))
-              )
+            # Fails closed BEFORE the write when the claim is unreadable (2026-10-12 #21).
+            with {:ok, stolen} <-
+                   Storage.with_takeover_claim(
+                     %{owner: owner, epoch: epoch + 1, expires_at_ms: now + ttl_ms},
+                     shard_id,
+                     Map.get(dead_lock, :claim)
+                   ) do
+              case put_lock(shard_id, stolen, if_match: etag) do
+                {:ok, lease} ->
+                  # Expert review #3: invalidate the DATA object's etag at steal time,
+                  # BEFORE the new owner pulls/serves. The old owner may be stalled
+                  # inside a fenced flush it already passed the fence for (whole-VM
+                  # pause) — the steal never touched the data object, so its late
+                  # `If-Match` PUT would still land AFTER our pull, leaving us serving
+                  # a copy missing its final acknowledged writes and self-fencing away
+                  # our own on the first flush. A conditional self-copy changes the
+                  # etag without moving bytes, so the zombie's PUT deterministically
+                  # 412s and IT self-fences instead.
+                  case touch_object(shard_id) do
+                    {:ok, %{pre: pre, post: post}} ->
+                      # Thread the touch's lineage through the lease (round-2 #6):
+                      # the takeover revalidation needs the SOURCE etag the touch
+                      # If-Matched to tell "our own lineage, moved no bytes" from a
+                      # zombie flush laundered into the touched object.
+                      {:ok,
+                       lease
+                       |> Map.put(:took_over, true)
+                       |> Map.put(:touch_pre_etag, pre)
+                       |> Map.put(:touch_post_etag, post)}
 
-            case put_lock(shard_id, stolen, if_match: etag) do
-              {:ok, lease} ->
-                # Expert review #3: invalidate the DATA object's etag at steal time,
-                # BEFORE the new owner pulls/serves. The old owner may be stalled
-                # inside a fenced flush it already passed the fence for (whole-VM
-                # pause) — the steal never touched the data object, so its late
-                # `If-Match` PUT would still land AFTER our pull, leaving us serving
-                # a copy missing its final acknowledged writes and self-fencing away
-                # our own on the first flush. A conditional self-copy changes the
-                # etag without moving bytes, so the zombie's PUT deterministically
-                # 412s and IT self-fences instead.
-                case touch_object(shard_id) do
-                  {:ok, %{pre: pre, post: post}} ->
-                    # Thread the touch's lineage through the lease (round-2 #6):
-                    # the takeover revalidation needs the SOURCE etag the touch
-                    # If-Matched to tell "our own lineage, moved no bytes" from a
-                    # zombie flush laundered into the touched object.
-                    {:ok,
-                     lease
-                     |> Map.put(:took_over, true)
-                     |> Map.put(:touch_pre_etag, pre)
-                     |> Map.put(:touch_post_etag, post)}
-
-                  # Fail closed: an un-fenced steal is not a steal — but the epoch+1
-                  # lock write already LANDED, and leaving it would let our own next
-                  # checkout RECLAIM it (same owner + epoch) with no `took_over`:
-                  # the zombie fence and the takeover revalidation both skipped for a
-                  # takeover that was never fenced (expert review round-2 #20).
-                  #
-                  # Roll back to the dead owner's identity but at epoch + 2, NEVER back to
-                  # `epoch` (expert review 2026-08-01 #10). The old rollback wrote `epoch`
-                  # after `epoch + 1` had been durably visible — moving the fencing token
-                  # BACKWARD, and the epoch's monotonicity is the single invariant the
-                  # whole single-writer design rests on. Concretely it let the zombie's
-                  # lease `{other, epoch}` match `check_lease/2` again, so it could
-                  # conclude it was still the owner; and `touch_object` can fail AFTER its
-                  # rotation copy landed (the confirm-rotation HEAD erroring transiently),
-                  # leaving the data object's etag rotated — fencing the zombie's If-Match
-                  # — while the lock said the zombie still owned it.
-                  #
-                  # NOT a delete, though that is the tidier-looking fix and what the review
-                  # first proposed: with no lock object the next `acquire_lease` takes the
-                  # `:not_found` branch, which is a fresh `create_lock` at **epoch 1**. That
-                  # is both a bigger backward jump and a takeover with NO steal-touch —
-                  # exactly the unfenced reclaim round-2 #20 added this rollback to prevent
-                  # (`S3StealTouchRollbackTest` pins it).
-                  #
-                  # `epoch + 2` satisfies both at once: strictly greater than anything an
-                  # observer saw, so monotonic; a foreign owner, so our retry re-enters the
-                  # FULL steal path (epoch bump + touch) instead of the same-owner reclaim;
-                  # and `{other, epoch}` no longer matches, so the zombie reads superseded.
-                  # Best-effort — if the rollback itself fails, the etag data-fence still
-                  # backstops a clobber.
-                  {:error, reason} ->
-                    # Keeps the dead owner's recorded claim (#3), so the retry's takeover still
-                    # goes above it.
-                    restore_lock(
-                      shard_id,
-                      stolen,
-                      Map.merge(
-                        %{owner: other, epoch: epoch + 2, expires_at_ms: lock_exp},
-                        Map.take(dead_lock, [:claim])
+                    # Fail closed: an un-fenced steal is not a steal — but the epoch+1
+                    # lock write already LANDED, and leaving it would let our own next
+                    # checkout RECLAIM it (same owner + epoch) with no `took_over`:
+                    # the zombie fence and the takeover revalidation both skipped for a
+                    # takeover that was never fenced (expert review round-2 #20).
+                    #
+                    # Roll back to the dead owner's identity but at epoch + 2, NEVER back to
+                    # `epoch` (expert review 2026-08-01 #10). The old rollback wrote `epoch`
+                    # after `epoch + 1` had been durably visible — moving the fencing token
+                    # BACKWARD, and the epoch's monotonicity is the single invariant the
+                    # whole single-writer design rests on. Concretely it let the zombie's
+                    # lease `{other, epoch}` match `check_lease/2` again, so it could
+                    # conclude it was still the owner; and `touch_object` can fail AFTER its
+                    # rotation copy landed (the confirm-rotation HEAD erroring transiently),
+                    # leaving the data object's etag rotated — fencing the zombie's If-Match
+                    # — while the lock said the zombie still owned it.
+                    #
+                    # NOT a delete, though that is the tidier-looking fix and what the review
+                    # first proposed: with no lock object the next `acquire_lease` takes the
+                    # `:not_found` branch, which is a fresh `create_lock` at **epoch 1**. That
+                    # is both a bigger backward jump and a takeover with NO steal-touch —
+                    # exactly the unfenced reclaim round-2 #20 added this rollback to prevent
+                    # (`S3StealTouchRollbackTest` pins it).
+                    #
+                    # `epoch + 2` satisfies both at once: strictly greater than anything an
+                    # observer saw, so monotonic; a foreign owner, so our retry re-enters the
+                    # FULL steal path (epoch bump + touch) instead of the same-owner reclaim;
+                    # and `{other, epoch}` no longer matches, so the zombie reads superseded.
+                    # Best-effort — if the rollback itself fails, the etag data-fence still
+                    # backstops a clobber.
+                    {:error, reason} ->
+                      # Keeps the dead owner's recorded claim (#3), so the retry's takeover still
+                      # goes above it.
+                      restore_lock(
+                        shard_id,
+                        stolen,
+                        Map.merge(
+                          %{owner: other, epoch: epoch + 2, expires_at_ms: lock_exp},
+                          Map.take(dead_lock, [:claim])
+                        )
                       )
-                    )
 
-                    {:error, {:transient_lookup, {:touch_failed, reason}}}
-                end
+                      {:error, {:transient_lookup, {:touch_failed, reason}}}
+                  end
 
-              other ->
-                other
+                other ->
+                  other
+              end
             end
 
           # Fail closed: don't steal a possibly-live owner on a heartbeat read blip.

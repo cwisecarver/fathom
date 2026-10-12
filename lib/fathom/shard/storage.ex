@@ -82,8 +82,9 @@ defmodule Fathom.Shard.Storage do
           # The LINEAGE this owner claimed, written into the lock body so a successor can go
           # strictly above it (expert review 2026-09-29 #3) — see `takeover_claim/2`. Present only
           # on a lock taken over from an EXISTING one (a steal, or a reclaim of our own stale lock)
-          # while replicating; a fresh create carries none. `:unknown` is lease-local, never
-          # written: the store could not be read, so there is no safe number to claim.
+          # while replicating; a fresh create carries none. `:unknown` is no longer produced: an
+          # unreadable claim fails the acquire closed instead (`with_takeover_claim/3`, expert review
+          # 2026-10-12 #21).
           optional(:claim) => pos_integer() | :unknown
         }
 
@@ -1165,6 +1166,27 @@ defmodule Fathom.Shard.Storage do
 
   defp claim_above(base, previous) when is_integer(previous), do: max(base, previous + 1)
   defp claim_above(base, _none), do: base + 1
+
+  @doc """
+  `lease` with its takeover claim attached (`takeover_claim/2` + `with_claim/2`), or a fail-closed
+  `{:error, {:transient_lookup, :lineage_unreadable}}` when the claim cannot be computed (expert
+  review 2026-10-12 #21).
+
+  An `:unknown` claim used to be attached and the lock written anyway. But the lock body cannot
+  carry `:unknown`, so the write DROPPED the previous holder's recorded claim — the one number a
+  later successor (or a later retry of ours) needed to go above it — and the coordinator then ran
+  its whole life with no lineage, shipping as "unstated". Refusing BEFORE the lock write leaves the
+  previous lock (and its claim) intact, so the caller's retry, once the store answers, computes the
+  claim it should have. The same stance the steal path already takes on a heartbeat read blip.
+  """
+  @spec with_takeover_claim(lease(), String.t(), pos_integer() | nil) ::
+          {:ok, lease()} | {:error, {:transient_lookup, :lineage_unreadable}}
+  def with_takeover_claim(lease, shard_id, previous_claim) do
+    case takeover_claim(shard_id, previous_claim) do
+      :unknown -> {:error, {:transient_lookup, :lineage_unreadable}}
+      claim -> {:ok, with_claim(lease, claim)}
+    end
+  end
 
   # Attach a takeover claim to a lease about to be written. `nil` (replication off) leaves the lease
   # exactly as before, so the lock body is byte-identical on a non-replicating fleet.

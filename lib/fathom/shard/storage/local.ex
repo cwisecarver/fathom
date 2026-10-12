@@ -632,14 +632,17 @@ defmodule Fathom.Shard.Storage.Local do
       # Our own lease (live or stale) — reclaim it, keeping the epoch. A reclaim is a takeover from a
       # previous coordinator of THIS node that may have shipped under its claim, so it claims above
       # it exactly like a steal does (expert review 2026-09-29 #3).
+      # An unreadable claim fails closed BEFORE the write (2026-10-12 #21; see
+      # `Storage.with_takeover_claim/3`), so the existing lock and its claim survive for the retry.
       {:ok, %{owner: ^owner, epoch: epoch} = existing} ->
-        write_lock(
-          shard_id,
-          Storage.with_claim(
-            %{owner: owner, epoch: epoch, expires_at_ms: now + ttl_ms},
-            Storage.takeover_claim(shard_id, Map.get(existing, :claim))
-          )
-        )
+        with {:ok, reclaimed} <-
+               Storage.with_takeover_claim(
+                 %{owner: owner, epoch: epoch, expires_at_ms: now + ttl_ms},
+                 shard_id,
+                 Map.get(existing, :claim)
+               ) do
+          write_lock(shard_id, reclaimed)
+        end
 
       # Someone else holds it — liveness is *their heartbeat* (with the lock's own TTL as the
       # fallback when they run no heartbeat — see owner_live?/3).
@@ -661,15 +664,14 @@ defmodule Fathom.Shard.Storage.Local do
             # scenario can't arise here.
             # The new lock records the lineage this owner claims, strictly above anything the dead
             # owner could have shipped under (expert review 2026-09-29 #3).
-            stolen =
-              Storage.with_claim(
-                %{owner: owner, epoch: epoch + 1, expires_at_ms: now + ttl_ms},
-                Storage.takeover_claim(shard_id, Map.get(dead_lock, :claim))
-              )
-
-            case write_lock(shard_id, stolen) do
-              {:ok, lease} -> {:ok, Map.put(lease, :took_over, true)}
-              other -> other
+            with {:ok, stolen} <-
+                   Storage.with_takeover_claim(
+                     %{owner: owner, epoch: epoch + 1, expires_at_ms: now + ttl_ms},
+                     shard_id,
+                     Map.get(dead_lock, :claim)
+                   ),
+                 {:ok, lease} <- write_lock(shard_id, stolen) do
+              {:ok, Map.put(lease, :took_over, true)}
             end
 
           # Fail closed: don't steal a possibly-live owner on a heartbeat read blip.

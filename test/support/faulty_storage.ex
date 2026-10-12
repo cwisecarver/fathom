@@ -285,7 +285,12 @@ defmodule Fathom.Test.FaultyStorage do
     # other coordinators flushing while an observing test holds this global hook.
     run_before(:object_head, shard_id)
 
-    case Local.object_head(shard_id) do
+    # `:object_head` fails the read outright: the store-unreadable case behind a `:unknown` lineage
+    # and an uncomputable takeover claim (expert review 2026-10-12 #21).
+    case if(fault() == :object_head,
+           do: {:error, :s3_unreachable},
+           else: Local.object_head(shard_id)
+         ) do
       {:ok, head} when is_map(head) ->
         if fault() == :object_head_moves and bump_head_reads() > 1,
           do: {:ok, %{head | etag: head.etag <> "-moved"}},
