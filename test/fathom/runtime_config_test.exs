@@ -289,4 +289,35 @@ defmodule Fathom.RuntimeConfigTest do
       refute Keyword.has_key?(fathom_config(%{"HRANA_AUTH" => nil}), :hrana_auth)
     end
   end
+
+  # Expert review 2026-10-12 #32 (SYMPTOM): the outage posture :hrana_revocation_on_error had no
+  # env knob, so an operator could only change it by editing code. Invariant: the variable selects
+  # the posture when set, unset leaves the module default (:fail_open, decided 2026-10-10 #7), and
+  # an unknown value fails the boot rather than silently picking one.
+  describe "HRANA_REVOCATION_ON_ERROR (#32)" do
+    test "fail_open and fail_closed are written as the posture" do
+      assert Keyword.fetch!(
+               prod_config(%{"HRANA_REVOCATION_ON_ERROR" => "fail_open"}),
+               :hrana_revocation_on_error
+             ) == :fail_open
+
+      assert Keyword.fetch!(
+               prod_config(%{"HRANA_REVOCATION_ON_ERROR" => "fail_closed"}),
+               :hrana_revocation_on_error
+             ) == :fail_closed
+    end
+
+    test "unset leaves the key unwritten so the fail_open default stands" do
+      refute Keyword.has_key?(
+               prod_config(%{"HRANA_REVOCATION_ON_ERROR" => nil}),
+               :hrana_revocation_on_error
+             )
+    end
+
+    test "an unknown value fails the boot, naming the variable" do
+      assert_raise RuntimeError, ~r/HRANA_REVOCATION_ON_ERROR must be/, fn ->
+        prod_config(%{"HRANA_REVOCATION_ON_ERROR" => "fail_sideways"})
+      end
+    end
+  end
 end

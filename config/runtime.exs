@@ -1258,6 +1258,25 @@ if config_env() == :prod do
     config :fathom, :hrana_token_max_age, String.to_integer(max_age)
   end
 
+  # Revocation-floor posture when the directory is unreadable and this node has no cached floor
+  # (expert review 2026-10-12 #32; see Fathom.HranaAuth.Revocations). Default `fail_open` (decided
+  # 2026-10-10 #7): consult the durable storage floor, else floor 0. `fail_closed` refuses the token
+  # instead. Unset leaves the key unwritten so the module default stands. An unknown value raises at
+  # boot rather than silently picking a posture.
+  case System.get_env("HRANA_REVOCATION_ON_ERROR") do
+    nil ->
+      :ok
+
+    "fail_open" ->
+      config :fathom, :hrana_revocation_on_error, :fail_open
+
+    "fail_closed" ->
+      config :fathom, :hrana_revocation_on_error, :fail_closed
+
+    other ->
+      raise "HRANA_REVOCATION_ON_ERROR must be \"fail_open\" or \"fail_closed\", got: #{inspect(other)}"
+  end
+
   # Per-node open-shard cap (finding #14). config.exs sets a conservative finite default; operators
   # tune it to their node's measured fd/RSS density (mix fathom.scale --ramp) here.
   if cap = System.get_env("MAX_OPEN_SHARDS") do

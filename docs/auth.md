@@ -69,7 +69,7 @@ directory floor read that fails when the node has no cached floor for the shard 
 consults the durable storage floor, and otherwise uses floor `0`, so a revoked token can be accepted
 until the directory is readable again. `:fail_closed` returns `:unavailable` and refuses the token; it
 never answers from the storage floor, which can lag the directory. A last-known-good cached value is
-served under both postures.
+served under both postures. Set it with `HRANA_REVOCATION_ON_ERROR=fail_open|fail_closed` (unset ⇒ `fail_open`; any other value refuses to boot).
 
 ## Token lifecycle: rotate, revoke, scope (#24)
 
