@@ -992,7 +992,19 @@ defmodule Fathom.ShardExecutor do
         # to record for it (unlike the `execute` path, where Django's parameterized statements
         # carry their values separately and must be stored to replay).
         capture(opts.template?, conn, sql, [])
-        :ok
+
+        # QUORUM SHIP + OWNERSHIP GATE (expert review 2026-10-12 #4). A script used to be acked as
+        # soon as it was locally committed: it never reached `Session.commit`, so with A2 on it was
+        # neither shipped to a follower quorum nor gated by `ack_if_owned` (a zombie owner acked it).
+        # A script is presumed to write (`wrote? = true`). If it left a transaction open
+        # (`autocommit?` false) `ships_now?/3` declines and the COMMIT ships it, because
+        # `mark_txn_write` above recorded the write; a script that committed ships here. Same error
+        # mapping as `execute/2`: the local commit already happened, the client asked for a
+        # quorum-durable write and did not get one, so it gets the 503.
+        case maybe_replicate(shard_id, pid, conn, sql, true) do
+          :ok -> :ok
+          {:error, reason} -> {:error, no_quorum_error(reason)}
+        end
 
       {:error, reason} ->
         {:error, %Error{message: reason_to_string(reason), code: sqlite_code(reason)}}
@@ -1425,12 +1437,34 @@ defmodule Fathom.ShardExecutor do
       status: 503
     }
 
+  # Retryable open failures (expert review 2026-10-12 #13). These fell into the 500 catch-all, so
+  # SDKs treated a transient storage/lease blip as permanent. All are "try again shortly":
+  # a lease the storage backend could not grant right now, the 75 s cold-open `GenServer.call`
+  # timing out, `:normal` (the coordinator stopped under a checkout and the bounded retry ran out),
+  # and an open that exited mid-flight (`{:open_failed, {:exit, _}}`: a storage call timing out or
+  # a peer dying). A raw exception in `{:open_failed, e}` is a code/data fault and stays a 500.
+  # The reason is logged server-side only.
+  def open_error({:lease_unavailable, _} = reason), do: retryable_open_error(reason)
+  def open_error(:timeout), do: retryable_open_error(:timeout)
+  def open_error(:normal), do: retryable_open_error(:normal)
+  def open_error({:open_failed, {:exit, _}} = reason), do: retryable_open_error(reason)
+
   # Anything unclassified: a generic 500 with a FIXED message. `inspect(reason)` used to go to the
   # tenant -- internal terms, file paths, node names -- and the status-less error rendered as a
   # 500 anyway. The reason is logged server-side (expert review 2026-10-10 #H6).
   def open_error(reason) do
     Logger.error("cannot open shard: #{inspect(reason)}")
     %Error{message: "cannot open shard", code: "FILO_OPEN_FAILED", status: 500}
+  end
+
+  defp retryable_open_error(reason) do
+    Logger.warning("shard open failed (retryable): #{inspect(reason)}")
+
+    %Error{
+      message: "shard temporarily unavailable; retry",
+      code: "FILO_UNAVAILABLE",
+      status: 503
+    }
   end
 
   @doc """
