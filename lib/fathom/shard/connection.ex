@@ -442,6 +442,7 @@ defmodule Fathom.Shard.Connection do
          # Raised, NOT disabled: at 0 a wedged coordinator would let the WAL grow unbounded. This
          # keeps a backstop at ~4× the default.
          :ok <- Sqlite3.execute(conn, "PRAGMA wal_autocheckpoint=4000"),
+         :ok <- maybe_journal_size_limit(conn),
          :ok <- maybe_foreign_keys(conn),
          :ok <- maybe_cache_size(conn),
          :ok <- maybe_max_page_count(conn) do
@@ -544,6 +545,31 @@ defmodule Fathom.Shard.Connection do
     case cache_size_kb() do
       nil -> :ok
       kb -> Sqlite3.execute(conn, "PRAGMA cache_size=-#{kb}")
+    end
+  end
+
+  # Bound the WAL's on-disk high-water mark (expert review 2026-10-10 #30). Without it a WAL that
+  # once grew (a long reader holding off the checkpoint, one large transaction) keeps that size on
+  # disk forever, since SQLite reuses the file in place after a checkpoint rather than shrinking it.
+  # With it, the writer that resets the log truncates the file back to this many bytes.
+  #
+  # A2 IS SAFE WITH THIS, and it was checked rather than assumed (A2 reads the WAL by offset through
+  # a held fd): a truncation happens only at a log reset, which A2 already detects from the header
+  # (ckpt_seq + salt1), and a pread past the new EOF is a `:short_read`, which fails the round and
+  # re-plans (`Session.build_pushes/5`). Proved by running the whole suite at a limit of 0 (every
+  # reset truncates): no A2 correctness test failed; three fixtures could no longer BUILD a
+  # reused-in-place WAL, which a 64 MiB limit leaves intact for any WAL under it.
+  # `wal_truncate_test.exs` pins the safe direction. The rig check is recorded in the commit.
+  #
+  # Not a tenant pragma (the executor's allow-list does not admit it), so pooled reuse never sees a
+  # changed value and it is not in `pinned_pragmas/0`. A negative value means "no limit".
+  defp maybe_journal_size_limit(conn) do
+    case Application.get_env(:fathom, :journal_size_limit, 64 * 1024 * 1024) do
+      bytes when is_integer(bytes) and bytes >= 0 ->
+        Sqlite3.execute(conn, "PRAGMA journal_size_limit=#{bytes}")
+
+      _ ->
+        :ok
     end
   end
 

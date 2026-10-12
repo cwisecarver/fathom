@@ -61,6 +61,9 @@ x-fathom-env: &fathom-env
   # on a global default that silently taxes every other run.
   SHARD_FLUSH_INTERVAL_MS: "${SHARD_FLUSH_INTERVAL_MS:-300000}"
   SHARD_IDLE_MS: "20000"
+  # WAL size bound in bytes (expert review 2026-10-10 #30). Empty = the app default (64 MiB); set
+  # JOURNAL_SIZE_LIMIT=0 on `up` to make every WAL reset truncate, the A2 stress case.
+  JOURNAL_SIZE_LIMIT: "${JOURNAL_SIZE_LIMIT:-67108864}"
   # Per-shard load counters on, so `chaos.sh hotspots` can read Fathom.ShardLoad.top
   # per node — the real-traffic hot-spot measurement (Phase-2 §B).
   SHARD_LOAD: "true"

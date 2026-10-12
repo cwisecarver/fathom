@@ -427,6 +427,13 @@ else
   end
 end
 
+# The WAL's on-disk size bound in bytes (expert review 2026-10-10 #30; default 64 MiB, see
+# `Fathom.Shard.Connection.maybe_journal_size_limit/1`). -1 turns it off. The chaos rig sets 0 to
+# make every log reset truncate, which is the A2 stress case.
+if bytes = System.get_env("JOURNAL_SIZE_LIMIT") do
+  config :fathom, :journal_size_limit, String.to_integer(bytes)
+end
+
 if ms = System.get_env("SHARD_IDLE_MS") do
   config :fathom, :shard_idle_ms, String.to_integer(ms)
 end
