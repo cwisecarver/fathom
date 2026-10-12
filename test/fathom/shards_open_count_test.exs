@@ -59,4 +59,43 @@ defmodule Fathom.ShardsOpenCountTest do
       assert is_integer(count) and count >= 1
     end)
   end
+
+  # expert review 2026-10-12 #14: only open_count/0 survived a dead partition; checkout, drain,
+  # evict and stop raised ArgumentError out of Registry.lookup/2. Pick an id that hashes to the dead
+  # partition (a lookup for any other id still works), then pin each path.
+  defp id_on_dead_partition do
+    Enum.find_value(1..500, fn i ->
+      id = "deadpart_#{System.unique_integer([:positive])}_#{i}"
+
+      try do
+        Registry.match(Fathom.ShardRegistry, id, :_)
+        nil
+      rescue
+        ArgumentError -> id
+      end
+    end) || flunk("no shard id hashed to the dead partition")
+  end
+
+  test "checkout/drain/stop on a dead partition return errors instead of raising", %{shard: shard} do
+    {:ok, _pid} = Shards.ensure(shard)
+
+    with_dead_partition(fn ->
+      id = id_on_dead_partition()
+      assert {:error, :unavailable} = Shards.ensure(id)
+      assert {:error, :unavailable} = Shards.drain(id, 100)
+      assert :ok = Shards.stop(id)
+    end)
+  end
+
+  test "drain_all still drains the open coordinators while a partition is down", %{shard: shard} do
+    {:ok, pid} = Shards.ensure(shard)
+    ref = Process.monitor(pid)
+
+    with_dead_partition(fn ->
+      assert %{drained: drained} = Shards.drain_all(10_000)
+      assert drained >= 1
+    end)
+
+    assert_receive {:DOWN, ^ref, :process, ^pid, _}, 5_000
+  end
 end

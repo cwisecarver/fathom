@@ -667,11 +667,14 @@ defmodule Fathom.Shards do
   end
 
   defp do_drain(shard_id, drain_timeout) do
-    case Registry.lookup(@registry, shard_id) do
-      [] ->
+    case registry_lookup(shard_id) do
+      {:error, :unavailable} = unavailable ->
+        unavailable
+
+      {:ok, []} ->
         if kept_local_copy?(shard_id), do: {:error, :unflushed_local_copy}, else: :ok
 
-      [{pid, _}] ->
+      {:ok, [{pid, _}]} ->
         ref = Process.monitor(pid)
         Fathom.Shard.request_drain(pid, drain_timeout, self())
 
@@ -715,7 +718,7 @@ defmodule Fathom.Shards do
     if settle > 0, do: Process.sleep(settle)
 
     deadline = System.monotonic_time(:millisecond) + budget_ms
-    pids = Registry.select(@registry, [{{:"$1", :"$2", :_}, [], [{{:"$1", :"$2"}}]}])
+    pids = registered_coordinators()
 
     # A SLICE OF THE BUDGET, NOT ALL OF IT (expert review 2026-08-26 #5).
     #
@@ -745,6 +748,7 @@ defmodule Fathom.Shards do
     pids
     |> Task.async_stream(
       fn {shard_id, pid} ->
+        shard_id = shard_id || coordinator_id(pid)
         left = max(0, deadline - System.monotonic_time(:millisecond))
         pending = max(1, :counters.get(remaining_count, 1))
         :counters.sub(remaining_count, 1, 1)
@@ -863,10 +867,32 @@ defmodule Fathom.Shards do
     # Canonicalize (expert review 2026-10-10 #9); an invalid id can have no coordinator, so it is
     # trivially "already cold".
     with {:ok, id} <- Fathom.ShardId.cast(shard_id),
-         [{pid, _}] <- Registry.lookup(@registry, id) do
+         {:ok, [{pid, _}]} <- lookup_for_stop(id) do
       stop_and_await(pid)
     else
       _ -> :ok
+    end
+  end
+
+  # A delete must not mistake "the Registry partition is down" for "already cold" (the caller purges
+  # storage next): scan the supervisor's children for the coordinator instead (expert review
+  # 2026-10-12 #14). Rare and O(n), so a `:sys.get_state` per child is fine.
+  defp lookup_for_stop(id) do
+    case registry_lookup(id) do
+      {:error, :unavailable} ->
+        for {_, pid, _, _} <- DynamicSupervisor.which_children(@supervisor),
+            is_pid(pid),
+            (try do
+               coordinator_id(pid) == id
+             catch
+               :exit, _ -> false
+             end) do
+          {pid, nil}
+        end
+        |> then(&{:ok, Enum.take(&1, 1)})
+
+      found ->
+        found
     end
   end
 
@@ -1088,9 +1114,10 @@ defmodule Fathom.Shards do
         {:error, :shard_suspended}
 
       true ->
-        case Registry.lookup(@registry, shard_id) do
-          [{pid, _}] -> {:ok, pid}
-          [] -> start_if_capacity(shard_id)
+        case registry_lookup(shard_id) do
+          {:ok, [{pid, _}]} -> {:ok, pid}
+          {:ok, []} -> start_if_capacity(shard_id)
+          {:error, :unavailable} = unavailable -> unavailable
         end
     end
   end
@@ -1374,11 +1401,14 @@ defmodule Fathom.Shards do
   @evict_probe_grace_ms 250
 
   defp evict(shard_id, budget_ms) do
-    case Registry.lookup(@registry, shard_id) do
-      [] ->
+    case registry_lookup(shard_id) do
+      {:error, :unavailable} = unavailable ->
+        unavailable
+
+      {:ok, []} ->
         :ok
 
-      [{pid, _}] ->
+      {:ok, [{pid, _}]} ->
         # Probe from a SHORT-LIVED process, not the caller (expert review 2026-08-01 #34).
         #
         # `await_coordinator_exit/3`'s timeout branch peeks for a counterpart
@@ -1419,7 +1449,44 @@ defmodule Fathom.Shards do
   # Is this shard currently open on this node? Filters stale Lru rows (a coordinator that
   # already stopped without its `forget` having landed) so we don't count a no-op
   # `drain/2` on an already-gone shard as having freed a slot.
-  defp shard_open?(shard_id), do: Registry.lookup(@registry, shard_id) != []
+  # A dead partition reads as "not open": the row is not counted as a freed slot.
+  defp shard_open?(shard_id), do: match?({:ok, [_ | _]}, registry_lookup(shard_id))
+
+  # THE ONE REGISTRY READ for the shard-keyed paths (expert review 2026-10-12 #14). While a Registry
+  # partition is down its ETS table is gone and `Registry.lookup/2` raises ArgumentError until the
+  # partition restarts; only `open_count/0` and the coordinator's `registered?/1` used to survive
+  # that, so checkout, drain, evict and stop crashed the caller (a Hrana stream 500, a failed
+  # delete). `{:error, :unavailable}` is already retryable (503).
+  #
+  # MEASURED (Elixir 1.20, test/fathom/shards_open_count_test.exs): on a UNIQUE registry `lookup/2`
+  # does NOT raise on a dead partition, it answers `[]` ("nobody here") for a key it simply cannot
+  # see, and the open that follows then dies in `register_name` with `{:error, {:badarg, ...}}`. So
+  # the panel's "rescue ArgumentError" alone would have fixed nothing here. `Registry.match/3` DOES
+  # raise on the dead partition, so an empty `lookup` is re-confirmed with it. Hits (the hot
+  # path) cost only the lookup; the confirm runs on a miss, i.e. a cold open or an already-cold
+  # drain/stop, which are far heavier than one extra ETS select.
+  defp registry_lookup(shard_id) do
+    case Registry.lookup(@registry, shard_id) do
+      [] -> {:ok, Registry.match(@registry, shard_id, :_)}
+      found -> {:ok, found}
+    end
+  rescue
+    ArgumentError -> {:error, :unavailable}
+  end
+
+  # Every `{shard_id, pid}` registered on this node. If a partition is down the select raises, so
+  # fall back to the supervisor's children (they ARE the coordinators) with the id resolved lazily
+  # from the coordinator itself (`coordinator_id/1`), keeping `drain_all` able to drain the node.
+  defp registered_coordinators do
+    Registry.select(@registry, [{{:"$1", :"$2", :_}, [], [{{:"$1", :"$2"}}]}])
+  rescue
+    ArgumentError ->
+      for {_, pid, _, _} <- DynamicSupervisor.which_children(@supervisor),
+          is_pid(pid),
+          do: {nil, pid}
+  end
+
+  defp coordinator_id(pid), do: :sys.get_state(pid, 5_000).id
 
   # The limiter call needs the same exit protection the directory read below has
   # (expert review #28): the limiter's own backpressure model is mailbox saturation,
