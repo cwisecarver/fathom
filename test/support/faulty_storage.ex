@@ -334,6 +334,8 @@ defmodule Fathom.Test.FaultyStorage do
   # would be untestable — the same reason the lock-etag contract was modelled here at all.
   @impl true
   def release_lease(shard_id, %{lock_etag: etag} = lease) when is_binary(etag) do
+    run_before(:release, shard_id)
+
     if strict_lock_etag?() and current_lock_etag(shard_id) != etag do
       resolve_412_release(shard_id, lease)
     else
@@ -341,13 +343,19 @@ defmodule Fathom.Test.FaultyStorage do
     end
   end
 
-  def release_lease(shard_id, lease), do: Local.release_lease(shard_id, lease)
+  def release_lease(shard_id, lease) do
+    run_before(:release, shard_id)
+    Local.release_lease(shard_id, lease)
+  end
 
   # The claim-keeping release (expert review 2026-10-12 #3) under the SAME lock-etag contract as
   # `release_lease/2` above — the S3 backend If-Matches the marker PUT exactly as it does the DELETE,
   # with the same 412 resolution. The marker is a lock WRITE, so it rotates the etag like any other.
   @impl true
   def release_lease_keeping_claim(shard_id, lease, claim) do
+    # Observable like `release_lease/2`: the hook runs in the RELEASING process (the coordinator).
+    run_before(:release, shard_id)
+
     cond do
       strict_lock_etag?() and is_binary(lease[:lock_etag]) and
           current_lock_etag(shard_id) != lease[:lock_etag] ->

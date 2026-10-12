@@ -625,6 +625,7 @@ defmodule Fathom.Shard do
   defp abandon_open(shard_id, lease, state, reason, stacktrace) do
     released =
       try do
+        unmark_lease_held(shard_id)
         Storage.release_lease(shard_id, lease)
       rescue
         e -> {:error, e}
@@ -990,6 +991,7 @@ defmodule Fathom.Shard do
       {:error, reason} ->
         # Couldn't make the file available — give the lease back so another node
         # can try, rather than holding a shard we can't serve.
+        unmark_lease_held(shard_id)
         Storage.release_lease(shard_id, lease)
         {:stop, {:shutdown, {:pull_failed, reason}}, %{id: shard_id}}
     end
@@ -2017,6 +2019,8 @@ defmodule Fathom.Shard do
   end
 
   def terminate(_reason, %{lease_lost: true} = state) do
+    # The lease is gone: stop refusing the new owner's replication frames (2026-10-12 #20).
+    unmark_lease_held(state.id)
     close_pool(state)
 
     # We no longer own the shard; flushing our local copy would clobber the node that took over.
@@ -2411,6 +2415,7 @@ defmodule Fathom.Shard do
   # here rather than uploading over the node that took the shard: quarantine a dirty local for
   # recovery, exactly as that clause does.
   defp flush_and_drop(%{lease_lost: true} = state) do
+    unmark_lease_held(state.id)
     if unflushed?(state), do: quarantine_fenced!(state), else: drop_local(state.path)
     :ok
   end
@@ -2430,7 +2435,7 @@ defmodule Fathom.Shard do
     # connection open). The old file-gated release leaked the lock object: the next
     # same-owner open silently downgraded from the optimistic 1-RTT create to the reclaim
     # path, and a foreign node saw {:held, us} for as long as our heartbeat stayed fresh.
-    if is_map(state.lease), do: Storage.release_lease(state.id, state.lease)
+    release_plain(state)
 
     :ok
   end
@@ -2477,7 +2482,7 @@ defmodule Fathom.Shard do
               # reached storage, so it's NOT dirty-at-loss even though its coordinator is gone.
               Fathom.Directory.Recorder.record_flush(state.id)
               drop_local_unless_serving(state)
-              Storage.release_lease(state.id, state.lease)
+              release_plain(state)
 
             # A data-PUT 412 (expert review #2): re-check the lock before treating it as
             # a steal. Lock still ours ⇒ our own PUT landed (lost response); the object
@@ -2492,6 +2497,8 @@ defmodule Fathom.Shard do
                 # A GENUINE steal: the lock is someone else's, so there is nothing of ours to
                 # release and the conditional DELETE would no-op anyway.
                 {:error, :superseded} ->
+                  unmark_lease_held(state.id)
+
                   Logger.warning(
                     "shard #{state.id}: object superseded before flush; keeping local for recovery"
                   )
@@ -2571,6 +2578,8 @@ defmodule Fathom.Shard do
           # Lost the lease before we could flush (expert review #5). flush_then_drop only runs on a
           # dirty shard, so the local copy holds acked-but-unflushed writes — quarantine them for
           # recovery instead of drop_local. The stored object is the new owner's; we don't clobber it.
+          unmark_lease_held(state.id)
+
           Logger.warning(
             "shard #{state.id}: lost lease before flush; quarantining local instead of flushing"
           )
@@ -2662,7 +2671,26 @@ defmodule Fathom.Shard do
   # leaves a released marker carrying the claim instead, which the next acquire steals ABOVE. With
   # replication off (`:disabled`) or no stated lineage (`:unknown`) it is the plain delete.
   defp release_keeping_claim(state) do
+    unmark_lease_held(state.id)
     if is_map(state.lease), do: Storage.release_lease(state.id, state.lease, state.lineage)
+  end
+
+  defp release_plain(state) do
+    unmark_lease_held(state.id)
+    if is_map(state.lease), do: Storage.release_lease(state.id, state.lease)
+  end
+
+  # The registry mark `open_with_lease/8` sets (`:lease_held`) tells this node's replication follower
+  # "a coordinator HERE owns this shard, refuse wire frames for it" (expert review 2026-10-10 #1). It
+  # used to be cleared only by the process exiting, so a coordinator that had already given the lease
+  # up — released it, or learned it was superseded — kept refusing the NEW owner's pushes and seeds
+  # for the rest of its terminate (expert review 2026-10-12 #20): with N=3, Q=2 that is one follower
+  # of two lost to the new owner's quorum. Cleared at every point the coordinator learns the lease is
+  # gone, and BEFORE every release, so it never advertises a lease it is giving up. `update_value/3`
+  # touches only this process's own key, so an orphan (whose key is a successor's) is a no-op.
+  defp unmark_lease_held(shard_id) do
+    _ = Registry.update_value(Fathom.ShardRegistry, shard_id, fn _ -> nil end)
+    :ok
   end
 
   # The off-process periodic durability flush the coordinator's flush task runs (expert
@@ -2771,7 +2799,7 @@ defmodule Fathom.Shard do
       Provenance.write_durable(state.path, new_etag)
       Fathom.Directory.Recorder.record_flush(state.id)
       drop_local_unless_serving(state)
-      Storage.release_lease(state.id, state.lease)
+      release_plain(state)
     else
       # …and RELEASE THE LOCK while keeping it (expert review 2026-08-24 #10). This branch is
       # reached having just CONFIRMED via `check_lease/2` that the lock is still ours, so simply
