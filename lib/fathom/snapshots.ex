@@ -56,13 +56,20 @@ defmodule Fathom.Snapshots do
 
   `opts[:auto]` marks the snapshot as SCHEDULER-CREATED, which is the only thing the automatic
   retention policy will ever delete. It is a separate flag rather than a label because a label is
-  operator-supplied and could otherwise forge the marker — see `new_snapshot_id/2`.
+  operator-supplied and could otherwise forge the marker — see `new_snapshot_id/3`.
+
+  `opts[:pre_promotion]` likewise marks a `PromoteOnOpen` snapshot, which `RetentionJob` expires
+  after 14 days independent of GFS (expert review 2026-10-12 #16).
   """
   @spec create(String.t(), keyword()) :: {:ok, String.t()} | {:error, term()}
   def create(shard_id, opts \\ []) do
     with {:ok, id} <- cast(shard_id) do
       snapshot_id =
-        new_snapshot_id(Keyword.get(opts, :label), Keyword.get(opts, :auto, false) == true)
+        new_snapshot_id(
+          Keyword.get(opts, :label),
+          Keyword.get(opts, :auto, false) == true,
+          Keyword.get(opts, :pre_promotion, false) == true
+        )
 
       case Storage.snapshot(id, snapshot_id) do
         :ok -> {:ok, snapshot_id}
@@ -354,7 +361,7 @@ defmodule Fathom.Snapshots do
   #
   # The suffix FORMAT is unchanged, because snapshots already in storage carry it and
   # `Retention.auto?/1` must keep matching them. What changed is that only this flag can produce it.
-  defp new_snapshot_id(label, auto?) do
+  defp new_snapshot_id(label, auto?, pre_promotion?) do
     ts = DateTime.utc_now() |> Calendar.strftime("%Y%m%dT%H%M%SZ")
     uniq = System.unique_integer([:positive, :monotonic]) |> Integer.to_string()
     base = "#{ts}-#{String.slice(uniq, -4, 4)}"
@@ -366,6 +373,9 @@ defmodule Fathom.Snapshots do
         {lbl, true} -> "-#{lbl}-" <> Retention.auto_label()
         {lbl, false} -> "-#{lbl}"
       end
+
+    suffix =
+      if pre_promotion?, do: suffix <> "-" <> Retention.pre_promotion_label(), else: suffix
 
     base <> suffix
   end
@@ -387,17 +397,21 @@ defmodule Fathom.Snapshots do
   # the word is lossless in the way that matters: it removes a token that would otherwise assert
   # provenance the snapshot does not have, and the rest of the operator's label survives.
   defp strip_reserved_suffix(lbl) do
-    marker = Retention.auto_label()
+    stripped =
+      Enum.reduce(
+        [Retention.auto_label(), Retention.pre_promotion_label()],
+        lbl,
+        &strip_marker/2
+      )
 
+    if stripped == lbl, do: lbl, else: strip_reserved_suffix(stripped)
+  end
+
+  defp strip_marker(marker, lbl) do
     cond do
-      lbl == marker ->
-        ""
-
-      String.ends_with?(lbl, "-" <> marker) ->
-        lbl |> String.replace_suffix("-" <> marker, "") |> strip_reserved_suffix()
-
-      true ->
-        lbl
+      lbl == marker -> ""
+      String.ends_with?(lbl, "-" <> marker) -> String.replace_suffix(lbl, "-" <> marker, "")
+      true -> lbl
     end
   end
 end

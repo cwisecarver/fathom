@@ -214,6 +214,37 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
     end
   end
 
+  # Expert review 2026-10-12 #16: aged pre-promotion snapshots are deleted by the retention sweep on
+  # their own 14-day clock; fresh, operator-labelled and GFS-scheduled ones follow their own rules.
+  describe "pre-promotion expiry" do
+    test "deletes an aged pre-promotion snapshot only", %{id: id} do
+      seed(id, ["CREATE TABLE t (v INTEGER)"])
+      {:ok, _} = ScheduleJob.run(50)
+
+      mk = fn at, label ->
+        sid = Calendar.strftime(at, "%Y%m%dT%H%M%SZ") <> "-0001-" <> label
+        :ok = Fathom.Shard.Storage.snapshot(id, sid)
+        sid
+      end
+
+      now = DateTime.utc_now()
+      aged = mk.(DateTime.add(now, -15 * 86_400, :second), "pre-promotion-promoexp")
+      fresh = mk.(DateTime.add(now, -1 * 86_400, :second), "pre-promotion-promoexp")
+      operator = mk.(DateTime.add(now, -400 * 86_400, :second), "pre-promotion")
+      old_auto = mk.(DateTime.add(now, -400 * 86_400, :second), "auto")
+
+      {:ok, _} = RetentionJob.run(50, %{daily: 1})
+      {:ok, left} = Snapshots.list(id)
+      left = Enum.map(left, & &1.id)
+
+      refute aged in left
+      assert fresh in left
+      assert operator in left
+      # the scheduled one is still governed by GFS (daily: 1 keeps only the newest day)
+      refute old_auto in left
+    end
+  end
+
   defp collect_swept(acc) do
     receive do
       {:swept, id} -> collect_swept(MapSet.put(acc, id))

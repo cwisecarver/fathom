@@ -242,4 +242,29 @@ defmodule Fathom.Snapshots.RetentionTest do
       assert length(plan.drop) == length(snaps)
     end
   end
+
+  # Expert review 2026-10-12 #16: PromoteOnOpen's pre-promotion snapshots had no expiry, so every
+  # promotion leaked a full copy forever. They expire on their own clock, outside GFS.
+  describe "pre-promotion expiry (expert review 2026-10-12 #16)" do
+    test "only an aged marker-bearing id expires; fresh, operator-labelled and auto ones do not" do
+      old = days_ago(15)
+      fresh = days_ago(13)
+
+      ids = [
+        id(old, "pre-promotion-promoexp"),
+        id(fresh, "pre-promotion-promoexp"),
+        id(old, "pre-promotion"),
+        id(old, nil),
+        id(old, "auto")
+      ]
+
+      assert Retention.expired_pre_promotion(ids, now()) == [id(old, "pre-promotion-promoexp")]
+    end
+
+    test "GFS plan/3 never classifies a pre-promotion snapshot as eligible" do
+      pre = id(days_ago(40), "pre-promotion-promoexp")
+      plan = Retention.plan([pre], %{daily: 1}, now())
+      assert plan.drop == [] and plan.keep == [] and plan.ineligible == [pre]
+    end
+  end
 end

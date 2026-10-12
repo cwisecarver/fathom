@@ -429,6 +429,21 @@ defmodule Fathom.SnapshotsTest do
       end
     end
 
+    # Expert review 2026-10-12 #16: the pre-promotion expiry marker is just as unforgeable.
+    test "no operator label can forge the pre-promotion expiry marker", %{shard: shard} do
+      write!(shard, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
+      flush!(shard)
+
+      for label <- ["promoexp", "pre-promotion promoexp", "x-promoexp-auto"] do
+        {:ok, id} = Snapshots.create(shard, label: label)
+        refute Retention.pre_promotion?(id), "label #{inspect(label)} forged the marker: #{id}"
+      end
+
+      {:ok, id} = Snapshots.create(shard, label: "pre-promotion", pre_promotion: true)
+      assert Retention.pre_promotion?(id)
+      refute Retention.auto?(id)
+    end
+
     test "the truncation case specifically, with its arithmetic", %{shard: shard} do
       write!(shard, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
       flush!(shard)

@@ -44,6 +44,42 @@ defmodule Fathom.Snapshots.Retention do
   @doc "The label `ScheduleJob` stamps and `plan/3` requires."
   def auto_label, do: @auto_label
 
+  # `PromoteOnOpen`'s reserved expiry marker (expert review 2026-10-12 #16). A pre-promotion snapshot
+  # is a full copy taken before an irreversible step; with no expiry every promotion leaked one
+  # forever. It ends in this marker (never reachable from an operator label: `Snapshots` strips
+  # it), is NOT `-auto` (so GFS never classifies it), and `expired_pre_promotion/3` is the only
+  # thing that may delete it.
+  @pre_promotion_label "promoexp"
+  @pre_promotion_max_age_s 14 * 86_400
+
+  @doc "The reserved marker `PromoteOnOpen`'s pre-promotion snapshots end in."
+  def pre_promotion_label, do: @pre_promotion_label
+
+  @doc "Whether `id` is a PromoteOnOpen pre-promotion snapshot (ends in the reserved marker)."
+  @spec pre_promotion?(String.t()) :: boolean()
+  def pre_promotion?(id) when is_binary(id),
+    do: String.ends_with?(id, "-" <> @pre_promotion_label)
+
+  def pre_promotion?(_), do: false
+
+  @doc """
+  The pre-promotion snapshots in `ids` older than `max_age_s` (default 14 days) as of `now`.
+  Independent of the GFS policy: operator-labelled and scheduled snapshots are never returned.
+  """
+  @spec expired_pre_promotion([String.t()], DateTime.t(), non_neg_integer()) :: [String.t()]
+  def expired_pre_promotion(
+        ids,
+        now \\ DateTime.utc_now(),
+        max_age_s \\ @pre_promotion_max_age_s
+      ) do
+    Enum.filter(ids, fn id ->
+      case pre_promotion?(id) && parse_timestamp(id) do
+        %DateTime{} = ts -> DateTime.diff(now, ts, :second) > max_age_s
+        _ -> false
+      end
+    end)
+  end
+
   @doc """
   Splits `ids` into `%{keep: [...], drop: [...], ineligible: [...]}` under `policy`.
 

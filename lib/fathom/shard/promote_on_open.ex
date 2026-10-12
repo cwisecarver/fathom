@@ -399,7 +399,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # snapshot, and a snapshot backend hiccup should not block a recovery that is otherwise sound.
   # It is attempted first precisely because it is the cheap insurance on the irreversible step.
   defp snapshot_before_promotion(shard_id) do
-    case Fathom.Snapshots.create(shard_id, label: "pre-promotion") do
+    case Fathom.Snapshots.create(shard_id, label: "pre-promotion", pre_promotion: true) do
       {:ok, _snapshot_id} ->
         :ok
 

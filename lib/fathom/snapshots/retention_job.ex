@@ -126,7 +126,13 @@ defmodule Fathom.Snapshots.RetentionJob do
   defp sweep_one(shard_id, policy, now, dry_run?) do
     case Snapshots.list(shard_id) do
       {:ok, snapshots} ->
-        plan = Retention.plan(Enum.map(snapshots, & &1.id), policy, now)
+        ids = Enum.map(snapshots, & &1.id)
+        plan = Retention.plan(ids, policy, now)
+        # Pre-promotion snapshots expire on their own 14-day clock, outside GFS (expert review
+        # 2026-10-12 #16): `plan/3` never sees them (not `-auto`), so they are added to the drop
+        # list here and nothing else is.
+        expired = Retention.expired_pre_promotion(ids, now)
+        plan = %{plan | drop: plan.drop ++ expired, ineligible: plan.ineligible -- expired}
 
         errors =
           if dry_run? do
