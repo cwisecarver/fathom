@@ -543,13 +543,18 @@ defmodule Fathom.Shard.Storage.Local do
     # (`[a-zA-Z0-9_-]`, ShardId), so the id IS the filename; the body is empty (the key is the fact).
     path = Path.join([dir(), "tombstones", shard_id])
     File.mkdir_p!(Path.dirname(path))
-    File.write(path, "")
+
+    # fsync + rename (expert review 2026-10-12 #25): a bare `File.write` leaves an empty or missing
+    # marker after a power cut, and an erased tenant could be re-minted.
+    Storage.atomic_write(path, "")
   end
 
   @impl true
   def tombstoned_ids do
     case File.ls(Path.join(dir(), "tombstones")) do
-      {:ok, names} -> {:ok, names}
+      # A shard id is `[a-zA-Z0-9_-]`, so a name with a "." is an `atomic_write` temp a crash left
+      # behind, never a tombstone.
+      {:ok, names} -> {:ok, Enum.reject(names, &String.contains?(&1, "."))}
       {:error, :enoent} -> {:ok, []}
       {:error, reason} -> {:error, reason}
     end
@@ -559,7 +564,9 @@ defmodule Fathom.Shard.Storage.Local do
   def put_token_floor(shard_id, version) do
     path = Path.join([dir(), "tokenfloors", shard_id])
     File.mkdir_p!(Path.dirname(path))
-    File.write(path, Integer.to_string(version))
+    # fsync + rename (expert review 2026-10-12 #25): a truncating `File.write` can read back empty
+    # (floor nil, i.e. no revocation floor) after a crash; atomic_write is whole-old or whole-new.
+    Storage.atomic_write(path, Integer.to_string(version))
   end
 
   @impl true
