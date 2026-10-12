@@ -804,6 +804,9 @@ defmodule Fathom.Shard do
         # The pool-sweep timer, armed ONLY while the pool holds a handle (expert review 2026-09-29
         # #35) — see schedule_sweep/1.
         sweep_timer: nil,
+        # The in-flight idle-transition close of the drained pool (expert review 2026-10-12 #15),
+        # or nil. See drain_pool/1 and await_closing/1.
+        closing: nil,
         # Has the open path's plain sidecar write been made durable yet? See sync_sidecar_once/1.
         sidecar_synced?: false,
         idle_ms: idle_ms(),
@@ -1572,6 +1575,12 @@ defmodule Fathom.Shard do
     apply_lapse_verdict(result, %{state | lapse_revalidate_pending: false})
   end
 
+  # The idle-transition pool close finished (expert review 2026-10-12 #15) — see drain_pool/1.
+  def handle_info({ref, :ok}, %{closing: %Task{ref: ref}} = state) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, %{state | closing: nil}}
+  end
+
   # The renewal task crashed: treat as transient and retry on the next tick.
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{renew_task: %Task{ref: ref}} = state) do
     Logger.warning("shard #{state.id}: lease renewal task crashed (#{inspect(reason)}); retrying")
@@ -1599,6 +1608,13 @@ defmodule Fathom.Shard do
 
     # Dirty (the task never landed) — re-kick so a flush_now waiter retries rather than hangs.
     {:noreply, settle_flushed_and_reschedule(state)}
+  end
+
+  # The idle-transition close task crashed (expert review 2026-10-12 #15). Matched before the generic
+  # :DOWN below, which would read its monitor as a stream release.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{closing: %Task{ref: ref}} = state) do
+    Logger.warning("shard #{state.id}: pooled-handle close task crashed (#{inspect(reason)})")
+    {:noreply, %{state | closing: nil}}
   end
 
   @impl true
@@ -1911,6 +1927,11 @@ defmodule Fathom.Shard do
   # stay in the coordinator, the result is applied when the task replies, and at
   # most one flush task is in flight.
   def handle_info(:durability_flush, state) do
+    # The snapshot and its position stamp read the WAL, and assume an idle shard's last close
+    # already checkpointed + unlinked it — so a pending idle-transition close must finish first
+    # (expert review 2026-10-12 #15). Almost always already done (nil): a close is milliseconds.
+    state = await_closing(state)
+
     cond do
       # A flush is already in flight — don't stack a second snapshot/PUT; the next
       # interval retries anything the in-flight one doesn't cover.
@@ -2411,7 +2432,11 @@ defmodule Fathom.Shard do
   # clause covers the minimal pre-open state (`%{id: ...}`) that has no `:pool` key.
   defp close_pool(%{pool: nil}), do: :ok
 
-  defp close_pool(%{pool: pool}) do
+  # It also waits out a pending idle-transition close (expert review 2026-10-12 #15): every terminate
+  # clause goes on to flush, drop, rename or quarantine the shard's files, none of which may race a
+  # close that is still checkpointing the WAL into the `.db`.
+  defp close_pool(%{pool: pool} = state) do
+    _ = await_closing(state)
     {conns, _pool} = HandlePool.drain(pool)
     Enum.each(conns, &Connection.close/1)
     :ok
@@ -2466,11 +2491,58 @@ defmodule Fathom.Shard do
   # variant — same effect, but this one returns the updated state to thread on.
   defp drain_pool(%{pool: nil} = state), do: state
 
+  #
+  # THE CLOSE RUNS OFF-PROCESS (expert review 2026-10-12 #15). The idle transition closes the shard's
+  # LAST SQLite connection, and that close is SQLite's close-time checkpoint: backfill every
+  # un-checkpointed WAL frame into the `.db`, fsync, unlink `-wal`. Inline, that held this
+  # coordinator's mailbox — every :checkout, :flush_now and fence message for the shard — for the
+  # whole checkpoint. Measured (macOS APFS, pool on, :sys.get_state queued behind the checkin): a
+  # one-row write per stream 0.13 ms with plain fsync but 7 ms p50 / 10 ms p99 with a real
+  # device flush (F_FULLFSYNC — the cost Linux fsync pays), and 8.5 / 15.5 ms at 8 / 14 MiB of
+  # un-checkpointed WAL (18 / 24 ms with F_FULLFSYNC). The 4000-page wal_autocheckpoint caps the
+  # un-checkpointed WAL near 16 MiB — a larger WAL was already backfilled by its committing stream,
+  # so its close is ~0.6 ms. With pooling on (prod), Django's CONN_MAX_AGE=0 pattern takes this
+  # idle transition on every request.
+  #
+  # Ordering is what keeps this safe: everything that assumes the idle shard's WAL is gone waits
+  # for the task first — the periodic flush (handle_info(:durability_flush)), every terminate
+  # clause (via close_pool/1), and the next idle-transition close (so two closes never race each
+  # other's close-time checkpoint and both skip it). A stream checked out meanwhile simply opens a
+  # fresh handle, exactly like an overlapping stream with pooling off, whose streams have always
+  # closed their own handles outside this process.
   defp drain_pool(%{pool: pool} = state) do
     {conns, pool} = HandlePool.drain(pool)
-    Enum.each(conns, &Connection.close/1)
-    cancel_sweep(%{state | pool: pool})
+    state = cancel_sweep(%{state | pool: pool})
+
+    case conns do
+      [] -> state
+      conns -> start_close(await_closing(state), conns)
+    end
   end
+
+  defp start_close(state, conns) do
+    %{state | closing: Task.async(fn -> Enum.each(conns, &Connection.close/1) end)}
+  rescue
+    # `Task.async/1` raises `:system_limit` with a full process table (see the flush-task spawn):
+    # close inline, the pre-#15 behaviour, rather than leak the handles.
+    _ ->
+      Enum.each(conns, &Connection.close/1)
+      state
+  end
+
+  # Wait for a pending idle-transition close (see drain_pool/1). Bounded: a close is one checkpoint
+  # of at most ~16 MiB, so 30 s means a wedged filesystem, and the shutdown below at least frees the
+  # mailbox; SQLite still finishes or abandons the close in the NIF.
+  defp await_closing(%{closing: %Task{} = task} = state) do
+    if Task.yield(task, 30_000) == nil do
+      Logger.warning("shard #{state.id}: pooled-handle close still running after 30s")
+      Task.shutdown(task, :brutal_kill)
+    end
+
+    %{state | closing: nil}
+  end
+
+  defp await_closing(state), do: state
 
   # Stop (flushing + releasing via terminate) once the last connection drains
   # while standing down; otherwise carry on.

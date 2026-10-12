@@ -45,6 +45,19 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   defp conn_of({_pid, _ref, conn, _id, _sc, _v, _o}), do: conn
   defp pid_of({pid, _ref, _conn, _id, _sc, _v, _o}), do: pid
 
+  # Wait for the coordinator's off-process idle-transition close (expert review 2026-10-12 #15), if
+  # one is still running. `:sys.get_state` first so the checkin cast that starts it has been handled.
+  defp await_idle_close(pid) do
+    case :sys.get_state(pid).closing do
+      %Task{pid: tpid} ->
+        mref = Process.monitor(tpid)
+        assert_receive {:DOWN, ^mref, :process, ^tpid, _}, 5_000
+
+      nil ->
+        :ok
+    end
+  end
+
   # Expert review 2026-09-18 #16: pool_take/2 was a bare GenServer.call with NO :exit rescue (unlike
   # do_checkout/2). The grant from checkout/1 already succeeded, so a coordinator briefly blocked or
   # dead between the two calls turned a request whose slot is held into a 5xx. It must degrade to
@@ -391,11 +404,56 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
     # finalized in the stream process first (release_owner_state/1), sqlite3_close_v2 would defer the
     # close and skip the checkpoint, leaving the WAL and desyncing the empty-WAL position stamp A2
     # promote-on-open ranks on.
+    #
+    # The close runs in a task off the coordinator (expert review 2026-10-12 #15), so wait for it
+    # rather than for the checkin cast. This test used to read the WAL right after `:sys.get_state`.
     :ok = ShardExecutor.close(ha)
-    _ = :sys.get_state(pid)
+    await_idle_close(pid)
 
     refute File.exists?(wal),
            "draining a pooled handle left the -wal in place — the deferred-close / WAL-checkpoint bug"
+  end
+
+  # Expert review 2026-10-12 #15. Closing the shard's LAST SQLite connection runs SQLite's close-time
+  # checkpoint (backfill the WAL into the .db, fsync, unlink -wal), and the idle transition used to do
+  # it inside the coordinator — blocking every :checkout / :flush_now / fence message for the shard
+  # behind it: 7 ms p50 per one-row request with a real device flush, 15-25 ms at ~14 MiB of WAL
+  # (measured on macOS, pool on). Django's CONN_MAX_AGE=0 takes this transition on every request.
+  # The invariant pinned: the idle-transition close never runs IN the coordinator process — but it
+  # does run, and it still checkpoints+unlinks the WAL.
+  test "pooling ON: the idle-transition close runs off the coordinator, and still checkpoints (#15)",
+       %{shard: shard} do
+    Application.put_env(:fathom, :connection_pool, true)
+
+    {:ok, ha} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(ha, stmt("INSERT INTO kv VALUES ('a')"))
+    pid = pid_of(ha)
+    conn = conn_of(ha)
+    wal = Path.join(Fathom.Shard.data_dir(), "#{shard}.db-wal")
+    assert File.exists?(wal), "precondition: the write is in the -wal"
+
+    # Trace every Sqlite3.close made by the coordinator AND any process it spawns, so the close is
+    # observed wherever it runs and the test can say which process ran it.
+    :erlang.trace_pattern({Sqlite3, :close, 1}, true, [])
+    1 = :erlang.trace(pid, true, [:call, :set_on_spawn])
+
+    on_exit(fn ->
+      :erlang.trace_pattern({Sqlite3, :close, 1}, false, [])
+    end)
+
+    :ok = ShardExecutor.close(ha)
+
+    assert_receive {:trace, closer, :call, {Sqlite3, :close, [^conn]}},
+                   5_000,
+                   "the pooled handle was never closed on the idle transition"
+
+    refute closer == pid,
+           "the coordinator closed its last SQLite handle inline — the close-time WAL checkpoint " <>
+             "blocks the shard's mailbox (expert review 2026-10-12 #15)"
+
+    await_idle_close(pid)
+    refute File.exists?(wal), "the off-process close must still checkpoint+unlink the WAL"
   end
 
   test "pooling ON: an idle shard drains its pool — the durability invariant", %{shard: shard} do
