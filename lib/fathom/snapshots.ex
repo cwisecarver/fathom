@@ -232,7 +232,7 @@ defmodule Fathom.Snapshots do
 
   defp restore_temp(shard_id) do
     Path.join(
-      System.tmp_dir!(),
+      Fathom.Shard.TempReaper.scratch_dir(),
       "fathom_snaprestore_#{shard_id}_#{System.unique_integer([:positive])}.db"
     )
   end

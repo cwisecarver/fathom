@@ -1601,7 +1601,7 @@ defmodule Fathom.Shard.Storage.S3 do
 
   defp restore_temp(shard_id, version) do
     Path.join(
-      System.tmp_dir!(),
+      Fathom.Shard.TempReaper.scratch_dir(),
       "fathom_s3_restore_#{shard_id}@#{version}_#{System.unique_integer([:positive])}.db"
     )
   end

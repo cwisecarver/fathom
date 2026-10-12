@@ -122,7 +122,7 @@ defmodule Fathom.Directory.Reconcile do
   defp stored_user_version(shard_id) do
     tmp =
       Path.join(
-        System.tmp_dir!(),
+        Fathom.Shard.TempReaper.scratch_dir(),
         "fathom_reconcile_#{shard_id}_#{System.unique_integer([:positive])}.db"
       )
 

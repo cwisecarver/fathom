@@ -23,7 +23,10 @@ defmodule FathomWeb.AdminTenantControllerTest do
       for p <- Path.wildcard(Path.join([Fathom.Shard.data_dir(), "#{id}*"])),
           do: File.rm(p)
 
-      for p <- Path.wildcard(Path.join(System.tmp_dir!(), "fathom_export_#{id}_*")),
+      for p <-
+            Path.wildcard(
+              Path.join(Fathom.Shard.TempReaper.scratch_dir(), "fathom_export_#{id}_*")
+            ),
           do: File.rm(p)
     end)
 
@@ -46,7 +49,9 @@ defmodule FathomWeb.AdminTenantControllerTest do
 
     # The body is sent from the temp file now (expert review 2026-10-08 #2), and the temp must
     # still be gone afterwards — no exported copy lingers on disk.
-    assert Path.wildcard(Path.join(System.tmp_dir!(), "fathom_export_#{id}_*")) == []
+    assert Path.wildcard(
+             Path.join(Fathom.Shard.TempReaper.scratch_dir(), "fathom_export_#{id}_*")
+           ) == []
   end
 
   test "404 when the shard has no stored data (never flushed / deleted)", %{conn: conn, id: id} do

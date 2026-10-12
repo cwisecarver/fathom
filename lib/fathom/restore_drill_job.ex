@@ -266,7 +266,7 @@ defmodule Fathom.RestoreDrillJob do
   defp verify_snapshot(id, snapshot_id) do
     tmp =
       Path.join(
-        System.tmp_dir!(),
+        Fathom.Shard.TempReaper.scratch_dir(),
         "fathom_snapdrill_#{id}_#{System.unique_integer([:positive])}.db"
       )
 
@@ -320,7 +320,10 @@ defmodule Fathom.RestoreDrillJob do
 
   defp verify(id, schema_version) do
     tmp =
-      Path.join(System.tmp_dir!(), "fathom_drill_#{id}_#{System.unique_integer([:positive])}.db")
+      Path.join(
+        Fathom.Shard.TempReaper.scratch_dir(),
+        "fathom_drill_#{id}_#{System.unique_integer([:positive])}.db"
+      )
 
     try do
       case Storage.pull(id, tmp) do
@@ -531,7 +534,7 @@ defmodule Fathom.RestoreDrillJob do
   defp durable_table_counts(shard_id) do
     tmp =
       Path.join(
-        System.tmp_dir!(),
+        Fathom.Shard.TempReaper.scratch_dir(),
         "restoredrill_ref_#{shard_id}_#{System.unique_integer([:positive])}.db"
       )
 

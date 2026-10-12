@@ -73,6 +73,34 @@ defmodule Fathom.Shard.TempReaperTest do
     assert File.exists?(fresh_dl), "the age gate must protect a concurrent pull's fresh temp"
   end
 
+  # Expert review 2026-10-12 #17: shard-sized temps written outside the shard data dir (restore,
+  # drill, reconcile, migration, export, S3 restore temp) leaked forever after a brutal kill. They
+  # all live under TempReaper.scratch_dir/0 now, which the sweep reaps with an age gate. Entries may
+  # be files or directories (a tenant export is a 0700 dir).
+  test "a sweep reaps an aged orphan in the scratch dir, file or dir, and keeps a fresh one" do
+    start_supervised!(TempReaper)
+    _ = TempReaper.sweep()
+
+    scratch = TempReaper.scratch_dir()
+    n = System.unique_integer([:positive])
+    old_file = Path.join(scratch, "fathom_snaprestore_orphan_#{n}.db")
+    old_dir = Path.join(scratch, "fathom_export_orphan_#{n}")
+    fresh = Path.join(scratch, "fathom_drill_fresh_#{n}.db")
+
+    File.write!(old_file, "orphan")
+    File.mkdir_p!(old_dir)
+    File.write!(Path.join(old_dir, "t.db"), "orphan")
+    File.write!(fresh, "live")
+    on_exit(fn -> File.rm_rf([old_file, old_dir, fresh]) end)
+
+    for p <- [old_file, old_dir], do: File.touch!(p, {{2020, 1, 1}, {0, 0, 0}})
+
+    assert TempReaper.sweep() >= 2
+    refute File.exists?(old_file), "an aged scratch orphan must be reaped"
+    refute File.exists?(old_dir), "an aged scratch directory must be reaped"
+    assert File.exists?(fresh), "the age gate must spare a fresh scratch temp"
+  end
+
   # Expert review 2026-08-31 #17: do_sweep had no rescue, so a persistent local-FS fault on the
   # fleet-sized scan crash-loops the reaper — the DataPlane's restart budget absorbs a burst but a
   # persistent fault exhausts it and cascades to every open coordinator. A raise is now caught and

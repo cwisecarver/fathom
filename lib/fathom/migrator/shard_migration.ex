@@ -1124,9 +1124,11 @@ defmodule Fathom.Migrator.ShardMigration do
   defp make_token, do: System.unique_integer([:positive])
 
   defp temp_path(shard_id, suffix) do
-    dir = Path.join(System.tmp_dir!(), "fathom_migrate")
-    File.mkdir_p!(dir)
-    Path.join(dir, "#{shard_id}-#{suffix}-#{System.unique_integer([:positive])}.db")
+    # Under the reaper-swept scratch dir (expert review 2026-10-12 #17).
+    Path.join(
+      Fathom.Shard.TempReaper.scratch_dir(),
+      "#{shard_id}-#{suffix}-#{System.unique_integer([:positive])}.db"
+    )
   end
 
   defp drop_temp(path), do: Enum.each(["", "-wal", "-shm"], &File.rm(path <> &1))

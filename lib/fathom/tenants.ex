@@ -334,7 +334,7 @@ defmodule Fathom.Tenants do
   # written only after the directory is private.
   defp export_dir! do
     name = "fathom_export_" <> Base.encode16(:crypto.strong_rand_bytes(12), case: :lower)
-    dir = Path.join(System.tmp_dir!(), name)
+    dir = Path.join(Fathom.Shard.TempReaper.scratch_dir(), name)
     File.mkdir_p!(dir)
     File.chmod!(dir, 0o700)
     dir
@@ -615,7 +615,7 @@ defmodule Fathom.Tenants do
   defp copied_version_by_pull(dst) do
     tmp =
       Path.join(
-        System.tmp_dir!(),
+        Fathom.Shard.TempReaper.scratch_dir(),
         "fathom_forkver_#{dst}_#{System.unique_integer([:positive])}.db"
       )
 

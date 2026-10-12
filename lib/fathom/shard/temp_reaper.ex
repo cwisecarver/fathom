@@ -40,6 +40,27 @@ defmodule Fathom.Shard.TempReaper do
   # forever. Deletion only touches files older than the cap — a fresh quarantine is never swept.
   @default_quarantine_retention_ms 30 * 24 * 60 * 60 * 1000
 
+  # Expert review 2026-10-12 #17: shard-sized temps that live OUTSIDE the shard data dir (snapshot
+  # restore, restore drill, DR reconcile, migration copies, tenant exports, the S3 restore temp).
+  # Their try/after cleanup does not run on a brutal kill, OOM or node death, so they leaked
+  # forever. They all live under this one fathom-owned subdirectory, which `sweep/0` reaps.
+  #
+  # The gate is an hour, not `@stale_after_ms`: a scratch entry can be a DIRECTORY (a tenant export
+  # held while the file is streamed to the operator) whose mtime does not advance while it is read,
+  # and these jobs legitimately run for minutes. An hour is still a bounded leak.
+  @scratch_stale_after_ms 3_600_000
+
+  @doc """
+  The fathom-owned scratch directory for shard-sized temp files outside the shard data dir
+  (created on demand). Put every such temp here so `sweep/0` can reap it after a kill.
+  """
+  @spec scratch_dir() :: Path.t()
+  def scratch_dir do
+    dir = Path.join(System.tmp_dir!(), "fathom_scratch")
+    File.mkdir_p!(dir)
+    dir
+  end
+
   @doc "Start the reaper (registered under the module name)."
   def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
@@ -98,7 +119,7 @@ defmodule Fathom.Shard.TempReaper do
     reaped = Storage.reap_named_temps(temps, @stale_after_ms)
     if reaped > 0, do: Logger.info("shard temp reaper: reaped #{reaped} orphaned temp(s)")
     sweep_quarantines(Shard.quarantine_files_in(names, dir))
-    reaped
+    reaped + sweep_scratch()
   rescue
     e ->
       Logger.warning(
@@ -110,6 +131,25 @@ defmodule Fathom.Shard.TempReaper do
     :exit, reason ->
       Logger.warning("shard temp reaper: sweep exited (#{inspect(reason)}); skipping this pass")
       0
+  end
+
+  # Age-gated reap of the scratch dir (see `scratch_dir/0`). Entries may be files or directories.
+  defp sweep_scratch do
+    dir = scratch_dir()
+    cutoff = System.system_time(:second) - div(@scratch_stale_after_ms, 1000)
+
+    case File.ls(dir) do
+      {:ok, names} ->
+        Enum.count(names, fn name ->
+          path = Path.join(dir, name)
+
+          match?({:ok, %File.Stat{mtime: m}} when m < cutoff, File.stat(path, time: :posix)) and
+            match?({:ok, _}, File.rm_rf(path))
+        end)
+
+      {:error, _} ->
+        0
+    end
   end
 
   # Quarantine inventory gauge + age-capped retention (expert review #23). The coordinator preserves

@@ -239,7 +239,7 @@ defmodule Fathom.TenantsTest do
           else: Application.delete_env(:fathom, :shard_storage)
       end)
 
-      tmp = System.tmp_dir!()
+      tmp = Fathom.Shard.TempReaper.scratch_dir()
       before = Path.wildcard(Path.join(tmp, "fathom_export_*")) |> MapSet.new()
 
       assert_raise RuntimeError, "boom during pull", fn -> Tenants.export(id, flush: false) end
@@ -260,7 +260,7 @@ defmodule Fathom.TenantsTest do
       on_exit(fn -> File.rm_rf(dir) end)
 
       assert Path.dirname(path) == dir
-      assert Path.dirname(dir) == Path.expand(System.tmp_dir!())
+      assert Path.dirname(dir) == Path.expand(Fathom.Shard.TempReaper.scratch_dir())
 
       assert Bitwise.band(File.stat!(dir).mode, 0o777) == 0o700,
              "the export directory must be private to the owner"
