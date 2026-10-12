@@ -55,7 +55,7 @@ defmodule Fathom.Migrator.RevertJob do
     # until the S3 lifecycle backstop; a deleted restore source quarantines the shard
     # unrecoverably. An already-EXECUTING retirement is uncancellable — that side is
     # closed by RetirementJob's revert-in-flight guard.
-    cancel_retirement(shard_id, landing)
+    cancelled = cancel_retirement(shard_id, landing)
 
     # Job id as the lease token — distinct from any forward ShardMigrationJob's owner, so the two
     # can't merge via the same-owner reclaim path (finding #9).
@@ -91,6 +91,9 @@ defmodule Fathom.Migrator.RevertJob do
               "discarded; re-run with force: true to confirm (#{inspect(details)})"
           )
 
+          # The refused revert leaves the shard on vN and the copy un-restored, so the retirement
+          # cancelled up front must be rescheduled or the copy leaks (expert review 2026-10-12 #29).
+          reschedule_retirement(shard_id, landing, cancelled)
           {:cancel, guard}
         end
 
@@ -161,7 +164,7 @@ defmodule Fathom.Migrator.RevertJob do
         if ShardMigrationJob.transient?(reason) do
           handle_retry(job, shard_id, landing, {:transient, reason})
         else
-          handle_error(job, shard_id, reason)
+          handle_error(job, shard_id, reason, landing, cancelled)
         end
     end
   end
@@ -293,14 +296,23 @@ defmodule Fathom.Migrator.RevertJob do
   # believed the revert landed. Mirror ShardMigrationJob.handle_error: the final
   # attempt quarantines the shard (durable fleet state, visible via
   # Migrator.revert_status/1 and Directory.count_failed/0).
-  defp handle_error(%Oban.Job{attempt: attempt, max_attempts: max}, shard_id, reason)
+  defp handle_error(
+         %Oban.Job{attempt: attempt, max_attempts: max},
+         shard_id,
+         reason,
+         landing,
+         cancelled
+       )
        when attempt >= max do
     Fathom.Directory.mark_failed(shard_id)
+    # Terminal failure: no later attempt will restore the copy, so give it its retirement back
+    # (expert review 2026-10-12 #29).
+    reschedule_retirement(shard_id, landing, cancelled)
     Logger.error("shard #{shard_id}: revert failed permanently (#{inspect(reason)})")
     {:cancel, reason}
   end
 
-  defp handle_error(_job, shard_id, reason) do
+  defp handle_error(_job, shard_id, reason, _landing, _cancelled) do
     Logger.warning("shard #{shard_id}: revert error, will retry (#{inspect(reason)})")
     {:error, reason}
   end
@@ -317,14 +329,27 @@ defmodule Fathom.Migrator.RevertJob do
 
   defp row_args_changed?(_id, _args), do: false
 
+  # Re-insert the retirement `cancel_retirement/2` cancelled, but only when one was actually
+  # cancelled (otherwise it already ran, or never existed). Best-effort: a failed insert only leaks
+  # the copy until the S3 lifecycle backstop, which is the state the cancel already accepted.
+  defp reschedule_retirement(_shard_id, _version, 0), do: :ok
+
+  defp reschedule_retirement(shard_id, version, _cancelled) do
+    Oban.insert(Fathom.Migrator.RetirementJob.schedule_changeset(shard_id, version))
+    :ok
+  end
+
   defp cancel_retirement(shard_id, version) do
-    Oban.cancel_all_jobs(
-      from(j in Oban.Job,
-        where: j.worker == "Fathom.Migrator.RetirementJob",
-        where: j.state in ["scheduled", "available", "retryable"],
-        where: fragment("?->>'shard_id' = ?", j.args, ^shard_id),
-        where: fragment("(?->>'version')::bigint = ?", j.args, ^version)
+    {:ok, n} =
+      Oban.cancel_all_jobs(
+        from(j in Oban.Job,
+          where: j.worker == "Fathom.Migrator.RetirementJob",
+          where: j.state in ["scheduled", "available", "retryable"],
+          where: fragment("?->>'shard_id' = ?", j.args, ^shard_id),
+          where: fragment("(?->>'version')::bigint = ?", j.args, ^version)
+        )
       )
-    )
+
+    n
   end
 end

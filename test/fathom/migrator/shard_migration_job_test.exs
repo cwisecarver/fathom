@@ -740,6 +740,38 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 2})
   end
 
+  # Expert review 2026-10-12 #29. Symptom: RevertJob cancels the landing copy's retirement up front,
+  # then a refusal or terminal failure left the shard un-reverted with NO retirement pending, so the
+  # retained copy leaked until the S3 lifecycle backstop.
+  test "a write-age refusal reschedules the retirement it cancelled", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+    {:ok, _} = Directory.resolve(shard)
+
+    capture_log(fn ->
+      assert {:cancel, :writes_since_cutover} =
+               perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 1})
+    end)
+
+    assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1})
+  end
+
+  test "a terminal revert failure reschedules the retirement it cancelled", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Directory.cutover(shard, 2)
+    {:ok, _} = Oban.insert(RetirementJob.new(%{shard_id: shard, version: 1}, schedule_in: 60))
+    # Same failing shape as "cancels the pending retirement before restoring": no live object.
+    File.rm!(Path.join(remote_dir(), "#{shard}.db"))
+
+    capture_log(fn ->
+      assert {:cancel, _} =
+               perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 1}, attempt: 5)
+    end)
+
+    assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1})
+  end
+
   # Finding #13 (force-guard at the job level): a guard refusal is deterministic — retrying can
   # only observe MORE post-cutover writes — so the job must CANCEL, not burn its 5 attempts, and
   # a force: true re-issue is the operator's confirmation path.
