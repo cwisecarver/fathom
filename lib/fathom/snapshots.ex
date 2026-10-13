@@ -63,7 +63,8 @@ defmodule Fathom.Snapshots do
   """
   @spec create(String.t(), keyword()) :: {:ok, String.t()} | {:error, term()}
   def create(shard_id, opts \\ []) do
-    with {:ok, id} <- cast(shard_id),
+    with :ok <- check_label(Keyword.get(opts, :label)),
+         {:ok, id} <- cast(shard_id),
          :ok <- refuse_tombstoned(id) do
       snapshot_id =
         new_snapshot_id(
@@ -399,6 +400,21 @@ defmodule Fathom.Snapshots do
       if pre_promotion?, do: suffix <> "-" <> Retention.pre_promotion_label(), else: suffix
 
     base <> suffix
+  end
+
+  @doc """
+  True when `label` is an acceptable snapshot label: nil (no label) or a binary.
+
+  Expert review 2026-10-12 #38: `sanitize_label/1` only had clauses for nil and binaries, so a
+  JSON `{"label": 5}` raised FunctionClauseError (a 500, with no audit row). Anything else is now
+  refused with `{:error, :invalid_label}` before a snapshot id is built, and the API maps it to 400.
+  """
+  @spec valid_label?(term()) :: boolean()
+  def valid_label?(nil), do: true
+  def valid_label?(label), do: is_binary(label)
+
+  defp check_label(label) do
+    if valid_label?(label), do: :ok, else: {:error, :invalid_label}
   end
 
   defp sanitize_label(nil), do: ""

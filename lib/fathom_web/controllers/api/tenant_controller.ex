@@ -268,10 +268,17 @@ defmodule FathomWeb.Api.TenantController do
     # caller's request for a guaranteed-current snapshot, so a flush error (a transient store error
     # or a lease steal) has to surface — otherwise the snapshot is silently stale relative to the
     # contract. Short-circuit before creating the (stale) snapshot.
-    with :ok <- maybe_flush(id, params),
+    #
+    # The label is checked FIRST (expert review 2026-10-12 #38), so a bad label is a 400 without
+    # having flushed the live coordinator on the way to refusing it.
+    with :ok <- check_label(params["label"]),
+         :ok <- maybe_flush(id, params),
          {:ok, snap} <- Snapshots.create(id, label: params["label"]) do
       conn |> put_status(:created) |> json(%{shard_id: id, snapshot_id: snap})
     else
+      {:error, :invalid_label} ->
+        error(conn, :bad_request, "label must be a string")
+
       {:error, {:flush_failed, reason}} ->
         reason_error(conn, :unprocessable_entity, "flush before snapshot failed", reason)
 
@@ -281,6 +288,10 @@ defmodule FathomWeb.Api.TenantController do
       {:error, reason} ->
         reason_error(conn, :unprocessable_entity, "snapshot failed", reason)
     end
+  end
+
+  defp check_label(label) do
+    if Snapshots.valid_label?(label), do: :ok, else: {:error, :invalid_label}
   end
 
   defp maybe_flush(id, params) do

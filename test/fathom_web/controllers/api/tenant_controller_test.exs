@@ -392,6 +392,20 @@ defmodule FathomWeb.Api.TenantControllerTest do
       assert result.status == 422
     end
 
+    # Expert review 2026-10-12 #38: a non-string label raised FunctionClauseError (a 500) and wrote
+    # no audit row. It is now a 400 that names the problem, and no snapshot is taken. Pre-fix the
+    # request raised instead of answering, so this test fails there.
+    test "a non-string label is a 400 and takes no snapshot", %{conn: conn, sid: sid} do
+      for label <- [5, %{"x" => 1}, ["a"]] do
+        res = conn |> auth() |> post("/api/tenants/#{sid}/snapshots", %{label: label})
+        assert res.status == 400
+        assert json_response(res, 400)["error"] =~ "label"
+      end
+
+      assert {:ok, snaps} = Fathom.Snapshots.list(sid)
+      assert snaps == [], "a refused label must not leave a snapshot behind"
+    end
+
     test "400 for an invalid id, 401 without auth", %{conn: conn} do
       assert (conn |> auth() |> post("/api/tenants/Bad%20Id/snapshots")).status == 400
       assert post(conn, "/api/tenants/whatever/snapshots").status == 401
