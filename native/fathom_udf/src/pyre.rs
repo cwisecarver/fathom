@@ -54,10 +54,16 @@ pub fn translate(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len() + 8);
     let chars: Vec<char> = pattern.chars().collect();
     let mut i = 0;
+    // Position of the last `)`: an unclosed `(?P=` is then rejected in O(1) instead of rescanning
+    // to the end of the pattern each time.
+    let last_close = chars.iter().rposition(|&c| c == ')');
     // Depth is not enough: `[` inside a class is a literal, so this is a flag, not a counter.
     let mut in_class = false;
     // A `]` in the FIRST position of a class is a literal `]`, not the terminator — `[]]` is a
-    // class matching one `]`.
+    // class matching one `]`. Kept as a BYTE offset into `out` (`out.len()` is O(1); the old
+    // `out.chars().count()` was O(n) per bracket, so N bracket pairs cost O(N^2) — expert review
+    // 2026-10-12 #1). Only relative position matters, and the `[` / `^` it is compared against
+    // are ASCII.
     let mut class_start = 0usize;
 
     while i < chars.len() {
@@ -80,16 +86,16 @@ pub fn translate(pattern: &str) -> String {
 
             '[' if !in_class => {
                 in_class = true;
-                class_start = out.chars().count();
+                class_start = out.len();
                 out.push(c);
             }
 
             ']' if in_class => {
                 // Only closes the class if it is not the first character (`[]abc]`) and not first
                 // after a leading negation (`[^]abc]`).
-                let pos = out.chars().count();
-                let first = pos == class_start + 1
-                    || (pos == class_start + 2 && out.ends_with('^'));
+                let pos = out.len();
+                let first =
+                    pos == class_start + 1 || (pos == class_start + 2 && out.ends_with('^'));
                 if !first {
                     in_class = false;
                 }
@@ -101,9 +107,9 @@ pub fn translate(pattern: &str) -> String {
                 out.push_str("(?=\\n?\\z)");
             }
 
-            '(' if !in_class && starts_named_backref(&chars, i) => {
+            '(' if !in_class && named_backref_close(&chars, i, last_close).is_some() => {
                 // `(?P=name)` -> `\k<name>`
-                let close = chars[i..].iter().position(|&c| c == ')').unwrap() + i;
+                let close = named_backref_close(&chars, i, last_close).unwrap();
                 let name: String = chars[i + 4..close].iter().collect();
                 out.push_str("\\k<");
                 out.push_str(&name);
@@ -121,9 +127,17 @@ pub fn translate(pattern: &str) -> String {
     out
 }
 
-fn starts_named_backref(chars: &[char], i: usize) -> bool {
-    chars.get(i..i + 4) == Some(&['(', '?', 'P', '='])
-        && chars[i..].iter().any(|&c| c == ')')
+/// Index of the `)` closing a `(?P=name` that starts at `i`, if it is one.
+///
+/// `last_close` is the index of the pattern's final `)`. With no `)` at or after `i` the answer is
+/// known without scanning; otherwise the scan stops at the first `)` and the caller jumps past it,
+/// so total work is linear (expert review 2026-10-12 #1: an unclosed `(?P=` used to rescan to the
+/// end of the pattern each time, O(N^2)).
+fn named_backref_close(chars: &[char], i: usize, last_close: Option<usize>) -> Option<usize> {
+    if chars.get(i..i + 4) != Some(&['(', '?', 'P', '=']) || last_close.is_none_or(|l| l < i) {
+        return None;
+    }
+    chars[i..].iter().position(|&c| c == ')').map(|p| p + i)
 }
 
 /// Whether an inline `(?m)`-style flag group enables multiline.
@@ -174,7 +188,84 @@ fn has_multiline_flag(pattern: &str) -> bool {
 /// clear keeps this a few lines instead of an LRU.
 const CACHE_CAP: usize = 256;
 
-static CACHE: Mutex<Option<HashMap<String, Arc<Regex>>>> = Mutex::new(None);
+/// Patterns longer than this are refused before any work is done (expert review 2026-10-12 #1/#2):
+/// translation and compilation both run uninterruptibly inside one UDF call, where neither the
+/// statement watchdog nor the progress handler can stop them. A Django regex this long is not a
+/// realistic workload.
+pub const MAX_PATTERN_BYTES: usize = 64 * 1024;
+
+/// Compile-size tiers (expert review 2026-10-12 #2). A pattern is compiled under the smallest tier
+/// that accepts it, and that tier is what the cache CHARGES for it, because `fancy_regex::Regex`
+/// does not report its size. The top tier is the regex crate's own 10 MiB default: realistic
+/// Django patterns need up to ~8 MiB (`(?i)\w{100}` and `^[\w.@+-]{1,150}$` measure between 4 and
+/// 8 MiB because Unicode `\w` is large), so a tighter per-regex limit would be a compatibility
+/// regression. Memory is bounded by [`CACHE_BYTE_BUDGET`] instead, and a single pathological
+/// compile (`(?i)\w{1000}` needs ~128 MiB) is refused at the top tier. `backtrack_limit` is
+/// deliberately left at the crate default (1M, expert review 2026-10-12 #5).
+const COMPILE_TIERS: [usize; 4] = [256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 10 * 1024 * 1024];
+
+/// Lazy-DFA cache limit per regex.
+const DFA_SIZE_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Budget for the whole cache, in charged bytes (see [`COMPILE_TIERS`]). 64 MiB holds eight of the
+/// largest accepted programs, so 256 distinct `(?i)\w{100}x<i>` patterns (1.8 GB RSS before) now
+/// churn the cache instead of accumulating.
+const CACHE_BYTE_BUDGET: usize = 64 * 1024 * 1024;
+
+struct Cache {
+    map: HashMap<String, Arc<Regex>>,
+    bytes: usize,
+}
+
+static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+
+/// Why a REGEXP call failed.
+#[derive(Debug)]
+pub enum PyreError {
+    /// The pattern exceeds [`MAX_PATTERN_BYTES`].
+    PatternTooLong(usize),
+    /// `fancy-regex` refused to compile or run it.
+    Regex(fancy_regex::Error),
+}
+
+impl std::fmt::Display for PyreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PyreError::PatternTooLong(n) => write!(
+                f,
+                "regular expression is {n} bytes, over the {MAX_PATTERN_BYTES}-byte limit"
+            ),
+            PyreError::Regex(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for PyreError {}
+
+impl From<fancy_regex::Error> for PyreError {
+    fn from(e: fancy_regex::Error) -> Self {
+        PyreError::Regex(e)
+    }
+}
+
+/// Compiles under the smallest tier that accepts the pattern; returns the regex and the bytes the
+/// cache should charge for it. Parse errors return immediately (no tier will help).
+fn compile(pattern: &str) -> Result<(Regex, usize), fancy_regex::Error> {
+    let translated = translate(pattern);
+    let mut last = None;
+    for tier in COMPILE_TIERS {
+        match fancy_regex::RegexBuilder::new(&translated)
+            .delegate_size_limit(tier)
+            .delegate_dfa_size_limit(DFA_SIZE_LIMIT)
+            .build()
+        {
+            Ok(re) => return Ok((re, tier + pattern.len())),
+            Err(e @ fancy_regex::Error::CompileError(_)) => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.expect("COMPILE_TIERS is non-empty"))
+}
 
 /// `re.search(pattern, subject)` — whether the pattern matches ANYWHERE in the subject.
 ///
@@ -188,31 +279,52 @@ static CACHE: Mutex<Option<HashMap<String, Arc<Regex>>>> = Mutex::new(None);
 /// dirty-IO scheduler). The compiled regex is cloned out as an `Arc` and matched lock-free. Two
 /// threads missing on the same new pattern both compile it and the second insert wins, which is
 /// harmless.
-pub fn search(pattern: &str, subject: &str) -> Result<bool, fancy_regex::Error> {
+pub fn search(pattern: &str, subject: &str) -> Result<bool, PyreError> {
+    if pattern.len() > MAX_PATTERN_BYTES {
+        return Err(PyreError::PatternTooLong(pattern.len()));
+    }
     let cached = cache_get(pattern);
     let re = match cached {
         Some(re) => re,
         None => {
-            let re = Arc::new(Regex::new(&translate(pattern))?);
-            cache_put(pattern, &re);
+            let (re, cost) = compile(pattern)?;
+            let re = Arc::new(re);
+            cache_put(pattern, &re, cost);
             re
         }
     };
-    re.is_match(subject)
+    Ok(re.is_match(subject)?)
 }
 
 fn cache_get(pattern: &str) -> Option<Arc<Regex>> {
     let guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    guard.as_ref()?.get(pattern).cloned()
+    guard.as_ref()?.map.get(pattern).cloned()
 }
 
-fn cache_put(pattern: &str, re: &Arc<Regex>) {
+fn cache_put(pattern: &str, re: &Arc<Regex>, cost: usize) {
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    let cache = guard.get_or_insert_with(HashMap::new);
-    if cache.len() >= CACHE_CAP {
-        cache.clear();
+    let cache = guard.get_or_insert_with(|| Cache {
+        map: HashMap::new(),
+        bytes: 0,
+    });
+    if cache.map.len() >= CACHE_CAP || cache.bytes + cost > CACHE_BYTE_BUDGET {
+        cache.map.clear();
+        cache.bytes = 0;
     }
-    cache.insert(pattern.to_string(), Arc::clone(re));
+    if cache
+        .map
+        .insert(pattern.to_string(), Arc::clone(re))
+        .is_none()
+    {
+        cache.bytes += cost;
+    }
+}
+
+/// Estimated bytes currently held by the cache (test hook).
+#[cfg(test)]
+fn cache_bytes() -> usize {
+    let guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().map_or(0, |c| c.bytes)
 }
 
 #[cfg(test)]
@@ -311,6 +423,90 @@ mod tests {
     fn an_invalid_pattern_is_an_error_not_a_panic() {
         assert!(search("(unclosed", "x").is_err());
         assert!(search("[", "x").is_err());
+    }
+
+    // expert review 2026-10-12 #1: `out.chars().count()` per bracket made translate O(N^2), run
+    // uninterruptibly inside one UDF call. Unfixed this takes ~3.5 s at 200k pairs.
+    #[test]
+    fn translate_is_linear_in_pattern_length() {
+        use std::time::{Duration, Instant};
+        let n = 200_000;
+        let big = "[a]".repeat(n);
+        let t = Instant::now();
+        let out = translate(&big);
+        let t1 = t.elapsed();
+        assert_eq!(out.len(), big.len());
+        assert!(
+            t1 < Duration::from_millis(200),
+            "translate of {n} classes took {t1:?}"
+        );
+
+        // Doubling ratio: a quadratic algorithm is ~4x; linear is ~2x. Floor the base so noise on
+        // a fast run cannot flip the ratio.
+        let time = |k: usize| {
+            let p = "[a]".repeat(k);
+            let t = Instant::now();
+            let _ = translate(&p);
+            t.elapsed().max(Duration::from_millis(1))
+        };
+        let (a, b) = (time(100_000), time(200_000));
+        assert!(b < a * 3, "doubling the pattern took {a:?} -> {b:?}");
+
+        // Unclosed `(?P=` used to rescan to the end each time.
+        let p = "(?P=".repeat(n);
+        let t = Instant::now();
+        let _ = translate(&p);
+        assert!(
+            t.elapsed() < Duration::from_millis(200),
+            "unclosed (?P= is not linear"
+        );
+        // ...and a closed one still translates, with a later `(?P=` unclosed.
+        assert_eq!(translate("(?P<x>a)(?P=x)"), "(?P<x>a)\\k<x>");
+    }
+
+    // expert review 2026-10-12 #2: a single pathological compile must be refused, and a
+    // realistic Django pattern set must still compile (a too-tight limit is a compatibility
+    // regression: `(?i)\w{100}` is ordinary).
+    #[test]
+    fn pathological_programs_and_patterns_are_refused() {
+        // Needs ~128 MiB of program; the top tier is 10 MiB.
+        assert!(
+            search("(?i)\\w{1000}", "x").is_err(),
+            "a pathological program compiled"
+        );
+        let long = "a".repeat(MAX_PATTERN_BYTES + 1);
+        assert!(matches!(
+            search(&long, "a"),
+            Err(PyreError::PatternTooLong(_))
+        ));
+    }
+
+    #[test]
+    fn realistic_django_patterns_compile_and_match() {
+        assert!(m("(?i)\\w{100}", &"A".repeat(100)));
+        assert!(!m("(?i)\\w{100}", "short"));
+        assert!(m("^[\\w.@+-]{1,150}$", "user.name+tag@example"));
+        let alts: Vec<String> = (0..500).map(|i| format!("word{i}x")).collect();
+        let p = format!("(?i)^({})$", alts.join("|"));
+        assert!(m(&p, "WORD499X"));
+        assert!(!m(&p, "word500x"));
+        let lit = "a".repeat(16 * 1024);
+        assert!(m(&lit, &lit));
+    }
+
+    #[test]
+    fn the_cache_stays_within_its_byte_budget() {
+        for i in 0..60 {
+            // Each compiles at the 4-8 MiB tier and is charged for it: 60 would be ~480 MB, far
+            // under the 256-entry count cap, so only the byte budget keeps this in bounds.
+            let p = format!("(?i)\\w{{100}}x{i}");
+            assert!(search(&p, "b").is_ok(), "{:?}", search(&p, "b"));
+            // A literal 64 MiB, not the constant, so weakening the constant fails this.
+            assert!(
+                cache_bytes() <= 64 * 1024 * 1024,
+                "cache over budget at {i}"
+            );
+        }
     }
 
     // expert review 2026-10-12 #5: the cache mutex was held across the whole match, so one

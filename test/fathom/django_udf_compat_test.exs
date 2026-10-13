@@ -456,6 +456,23 @@ defmodule Fathom.DjangoUdfCompatTest do
                2
     end
 
+    test "regexp accepts realistic patterns and refuses pathological ones", %{conn: conn} do
+      # expert review 2026-10-12 #2: a realistic Unicode `\w` pattern must still compile (a
+      # too-tight compile limit was a compatibility regression)...
+      assert one(conn, "SELECT 'x' REGEXP '(?i)\\w{100}'") == 0
+      assert one(conn, "SELECT 'x' REGEXP '^[\\w.@+-]{1,150}$'") == 1
+
+      # ...while a single pathological program (~128 MiB of NFA) is an error, not an allocation.
+      assert {:error, reason} = Connection.query(conn, "SELECT 'x' REGEXP '(?i)\\w{1000}'", [])
+      assert inspect(reason) =~ ~r/NFA|size|limit/i
+
+      # ...and a pattern over the 64 KiB front-door cap is refused before any scanning.
+      assert {:error, reason} =
+               Connection.query(conn, "SELECT 'x' REGEXP ?", [String.duplicate("a", 65_537)])
+
+      assert inspect(reason) =~ "limit"
+    end
+
     test "uuid generators return Django's 32-char dashless hex", %{conn: conn} do
       for fun <- ["UUIDV4", "UUIDV7"] do
         value = one(conn, "SELECT #{fun}()")
