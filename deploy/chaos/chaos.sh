@@ -433,7 +433,9 @@ silent_kill() { # network-disconnect first so peers see a hang, not a clean RST
 
 revive() {
   local node=$1
-  "$DOCKER" network connect "$(netname)" "$(cname "$node")" 2>/dev/null
+  # --alias: without it the revived container has no DNS name on the network, so peers dialling
+  # "<node>" get nxdomain and peer recovery hears one answer too few (seen on the 2026-10-13 rig run).
+  "$DOCKER" network connect --alias "$node" "$(netname)" "$(cname "$node")" 2>/dev/null
   compose up -d "$node" >/dev/null 2>&1
 }
 
