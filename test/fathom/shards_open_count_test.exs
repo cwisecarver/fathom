@@ -48,7 +48,27 @@ defmodule Fathom.ShardsOpenCountTest do
     after
       :ok = :sys.resume(registry_sup)
       _ = :sys.get_state(registry_sup)
+      forget_restart(registry_sup)
     end
+  end
+
+  # The Registry's supervisor is `:one_for_all` with the default budget of 3 restarts in 5 s. This
+  # file kills a partition in each of its 3 tests, and other files kill partitions too, so in a
+  # fast, lightly loaded run the 4th kill inside 5 s made the Registry supervisor give up: the next
+  # `:sys.get_state/1` exited `shutdown` (CI 2026-10-13, OTP 28, open_count test). The kill here is
+  # a test fixture, not a fault the suite is measuring, so drop it from the supervisor's restart
+  # history once the partition is back. `restarts` follows `intensity` and `period` in OTP's
+  # supervisor state record (element 7 on OTP 28 and 29); the shape is asserted so a future layout
+  # change fails loudly here instead of corrupting the state.
+  defp forget_restart(sup) do
+    :sys.replace_state(sup, fn state ->
+      assert :state = elem(state, 0)
+
+      assert is_integer(elem(state, 5)) and is_integer(elem(state, 6)) and is_list(elem(state, 7)),
+             "OTP's supervisor state layout changed; update forget_restart/1"
+
+      put_elem(state, 7, [])
+    end)
   end
 
   test "open_count/0 does not raise while a Registry partition is down", %{shard: shard} do
