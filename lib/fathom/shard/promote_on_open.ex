@@ -329,10 +329,21 @@ defmodule Fathom.Shard.PromoteOnOpen do
                Position.flush_position(promoted_stamp_state(lease, temp, lineage, replica)),
                Position.lineage_to_store(lineage)
              ) do
+        # SIDECAR FIRST, like `Materializer.promote_pull/2` (expert review 2026-10-12 #22). Writing the
+        # sidecar AFTER the rename left a crash window: the live `.db` is the promoted bytes while the
+        # sidecar still names the pre-promotion etag, which the next open reads as a divergence
+        # (`Fork.resolve` → `:fork`), quarantining a shard-sized copy that equals the object and
+        # re-pulling it. Sidecar-first is safe only if the crash leaves "a sidecar and NO `.db`", and
+        # the ordinary pull that preceded this promotion left the pre-promotion `.db` at `path` — so
+        # that goes first (with its `-wal`/`-shm`, which must never be paired with the promoted
+        # bytes). No connection has opened it: this runs inside the open. Removing it loses nothing:
+        # the promoted object is already published and a cold open pulls exactly those bytes.
+        Enum.each(["-wal", "-shm", ""], &File.rm(path <> &1))
+        Provenance.write(path, new_etag)
+        before_promote_rename(path)
+
         case File.rename(temp, path) do
           :ok ->
-            Enum.each(["-wal", "-shm"], &File.rm(path <> &1))
-            Provenance.write(path, new_etag)
             Follower.forget(follower, shard_id)
 
             Logger.warning(
@@ -371,6 +382,16 @@ defmodule Fathom.Shard.PromoteOnOpen do
       end
     after
       Enum.each(["", "-wal", "-shm"], &File.rm(temp <> &1))
+    end
+  end
+
+  # Test seam for the crash window between the sidecar write and the rename (expert review
+  # 2026-10-12 #22), mirroring `:promote_pull_crash_hook` in `Materializer`. Unset in every real
+  # config, so this is one env read per promotion.
+  defp before_promote_rename(path) do
+    case Application.get_env(:fathom, :promote_replica_crash_hook) do
+      nil -> :ok
+      hook -> hook.(path)
     end
   end
 

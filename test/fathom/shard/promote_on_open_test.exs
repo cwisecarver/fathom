@@ -292,6 +292,59 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     assert Enum.any?(snapshots, &String.contains?(snapshot_id(&1), "pre-promotion"))
   end
 
+  # Expert review 2026-10-12 #22. The promotion wrote the provenance sidecar AFTER the live rename
+  # (the reverse of `Materializer.promote_pull/2`). A node dying between the two left the promoted
+  # bytes at the live path with a sidecar still naming the PRE-promotion etag; the next open read
+  # that as a divergence, quarantined a shard-sized `.forked.<ts>` copy (identical to the object) and
+  # re-pulled it, raising the fork alarm for nothing. The crash is reproduced with the
+  # `:promote_replica_crash_hook` seam. The invariant: whatever a crash mid-promotion leaves, the
+  # next open is a clean pull of the promoted object, with no fork.
+  test "a crash mid-promotion leaves no spurious fork on the next open (#22)", ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+
+    {conn, coordinator} = build_shard(id, 10, 3)
+    assert {:ok, stamp} = Storage.object_position(id)
+    refute is_nil(stamp), "no stamp, so the comparison could not run and this proves nothing"
+
+    install_replica(id, %{
+      epoch: stamp.epoch,
+      wal_gen: stamp.wal_gen,
+      wal_ordinal: stamp.wal_ordinal,
+      offset: stamp.offset + 1
+    })
+
+    tear_down_primary(id, conn, coordinator)
+
+    # The node dies after the promoted object is PUBLISHED, between the sidecar and the rename.
+    Application.put_env(:fathom, :promote_replica_crash_hook, fn _ -> raise "node died here" end)
+    on_exit(fn -> Application.delete_env(:fathom, :promote_replica_crash_hook) end)
+
+    assert {:error, _} = ShardExecutor.open(id),
+           "precondition: the crashed promotion failed the open"
+
+    Application.delete_env(:fathom, :promote_replica_crash_hook)
+
+    # The promoted object is what the store now holds (the crash came after the PUT).
+    stored = Path.join(ctx.dir, "stored.db")
+    assert {:ok, _} = Storage.pull(id, stored)
+    {:ok, sconn} = Fathom.Shard.Connection.open(stored)
+    {:ok, %{rows: srows}} = Fathom.Shard.Connection.query(sconn, "SELECT a FROM t ORDER BY a", [])
+    Fathom.Shard.Connection.close(sconn)
+
+    assert Enum.map(srows, fn [a] -> a end) == Enum.to_list(1..10),
+           "precondition: the crash happened after the promoted object was published"
+
+    # THE ASSERTIONS: the next open serves the promoted rows, and quarantined nothing.
+    assert open_and_read(id) == Enum.to_list(1..10)
+
+    forked = Path.wildcard(Fathom.Shard.db_path(id) <> ".forked.*")
+
+    assert forked == [],
+           "the next open quarantined the promoted copy as a fork: #{inspect(forked)} (the " <>
+             "sidecar was written after the rename; expert review 2026-10-12 #22)"
+  end
+
   # Expert review 2026-09-29 #9. The promotion published the object with a NIL position stamp: the
   # temp is checkpointed and closed, so its WAL is empty, and the synthetic state had no ordinal to
   # seed from. `fresher?(_, nil)` is false, so a SECOND failover before this owner's first dirty
