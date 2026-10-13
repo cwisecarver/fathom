@@ -237,8 +237,24 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
 
     Application.put_env(:fathom, :faulty_before, {:acquire, lapse})
 
+    # Hold the PROACTIVE lapse revalidation (expert review 2026-10-10 #12) past the flush. Its
+    # jitter scales with the number of open shards (`Shard.lapse_spread_ms/1`), so with this test's
+    # one shard it fires within milliseconds, confirms the lock is still ours (the thief has not
+    # arrived yet), and correctly re-baselines `acquire_gen` to the post-lapse generation. The thief
+    # put below then lands with no further lapse, which production cannot produce (a steal needs a
+    # lapse), so the flush trusts the heartbeat and writes the object. That made this test fail
+    # every time it ran alone and whenever few shards were open (CI, 2026-10-13, both OTPs), and
+    # pass in a busy suite where the jitter was longer. Pinning the jitter keeps the scenario this
+    # test is about: the lazy flush-path fence with a stale baseline.
+    prev_jitter = Application.get_env(:fathom, :lapse_revalidate_jitter_ms)
+    Application.put_env(:fathom, :lapse_revalidate_jitter_ms, 60_000)
+
     on_exit(fn ->
       Application.delete_env(:fathom, :faulty_before)
+
+      if prev_jitter,
+        do: Application.put_env(:fathom, :lapse_revalidate_jitter_ms, prev_jitter),
+        else: Application.delete_env(:fathom, :lapse_revalidate_jitter_ms)
 
       if prev_storage,
         do: Application.put_env(:fathom, :shard_storage, prev_storage),
