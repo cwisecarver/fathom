@@ -131,6 +131,8 @@ defmodule Fathom.Admin.Measurements do
           ],
         is_binary(path),
         {:ok, %{total_bytes: total, free_bytes: free}} <- [disk_info(path)] do
+      if label == "data", do: put_data_free_bytes(free)
+
       :telemetry.execute(
         [:fathom, :node, :disk],
         %{
@@ -143,6 +145,65 @@ defmodule Fathom.Admin.Measurements do
     end
 
     :ok
+  end
+
+  # The data volume's free bytes as the poller last read them, for the flush preflight (expert review
+  # 2026-10-12 #26). `:disksup.get_disk_info/1` runs `df` through a port on every call, so a flush
+  # must never call it; it reads this cache instead. Three `:atomics` cells (free bytes, monotonic ms
+  # of the sample, a valid flag; monotonic time can be negative, so it cannot double as the flag) behind one `:persistent_term` key that is written ONCE (an atomics ref never
+  # changes, so refreshing a reading is a lock-free `put`, not a persistent_term update, which
+  # would trigger a global GC scan of every process).
+  @free_key {__MODULE__, :data_free}
+  # A reading older than this is treated as unknown: a stalled or stopped poller must not freeze an
+  # old "disk is nearly full" (or "plenty free") answer into every flush.
+  @free_max_age_ms 120_000
+
+  @doc """
+  The data volume's free bytes from the poller's last reading, or `:unknown` when the poller has not
+  run, or its reading is older than #{div(@free_max_age_ms, 1000)} s. Cheap (two atomics reads):
+  safe on the flush path.
+  """
+  @spec data_free_bytes() :: {:ok, non_neg_integer()} | :unknown
+  def data_free_bytes do
+    with ref when ref != nil <- :persistent_term.get(@free_key, nil),
+         1 <- :atomics.get(ref, 3),
+         true <- System.monotonic_time(:millisecond) - :atomics.get(ref, 2) <= @free_max_age_ms do
+      {:ok, :atomics.get(ref, 1)}
+    else
+      _ -> :unknown
+    end
+  end
+
+  @doc """
+  Records the data volume's free bytes. Called by `disk/0` on every poll; public so a test can stand
+  in for the poller.
+  """
+  @spec put_data_free_bytes(non_neg_integer()) :: :ok
+  def put_data_free_bytes(free) when is_integer(free) and free >= 0 do
+    ref =
+      case :persistent_term.get(@free_key, nil) do
+        nil ->
+          ref = :atomics.new(3, signed: true)
+          :persistent_term.put(@free_key, ref)
+          ref
+
+        ref ->
+          ref
+      end
+
+    :atomics.put(ref, 1, free)
+    :atomics.put(ref, 2, System.monotonic_time(:millisecond))
+    :atomics.put(ref, 3, 1)
+    :ok
+  end
+
+  @doc "Forgets the cached free-space reading (a test's cleanup)."
+  @spec clear_data_free_bytes() :: :ok
+  def clear_data_free_bytes do
+    case :persistent_term.get(@free_key, nil) do
+      nil -> :ok
+      ref -> :atomics.put(ref, 3, 0)
+    end
   end
 
   @doc """

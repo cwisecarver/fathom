@@ -3757,7 +3757,8 @@ defmodule Fathom.Shard do
     try do
       # Integrity BEFORE the snapshot: quarantine_corrupt!/2 renames the live path, so checking
       # after would spend a full VACUUM on a file we are about to refuse and move aside.
-      with :ok <- verify_and_snapshot(state, temp),
+      with :ok <- flush_space_preflight(state),
+           :ok <- verify_and_snapshot(state, temp),
            :ok <- recheck_before_put(state),
            {:ok, new_etag, carried} <-
              Storage.flush(
@@ -3866,6 +3867,56 @@ defmodule Fathom.Shard do
 
   # Integrity-gate the PERIODIC flush (expert review 2026-08-01 #14).
   #
+  # FREE-SPACE PREFLIGHT (expert review 2026-10-12 #26). `VACUUM INTO` writes a temp about the
+  # size of the shard (plus its WAL content) next to the live file, so a near-full volume fails the
+  # flush late, after the whole `quick_check` page scan, with SQLITE_FULL, and the generic failure
+  # path only escalates on the 3rd consecutive one. Check the poller's cached reading
+  # (`Measurements.data_free_bytes/0`; never `:disksup` per flush, which runs `df`) against the
+  # shard's size plus a margin, and fail fast. Like `object_too_large`, the first occurrence is
+  # logged at error level and has its own event: retrying cannot help until someone frees space,
+  # while the shard keeps acking writes it cannot make durable. Escalation lives here rather than in
+  # record_flush_failure/2, which still counts the failure like any other.
+  #
+  # An unknown reading (poller not running, or stale) skips the check: a flush must never be refused
+  # on a guess.
+  @flush_space_margin_bytes 32 * 1024 * 1024
+  defp flush_space_preflight(state) do
+    with {:ok, free} <- Fathom.Admin.Measurements.data_free_bytes(),
+         need = local_db_bytes(state.path) + flush_space_margin(),
+         true <- free < need do
+      :telemetry.execute(
+        [:fathom, :shard, :flush, :no_space],
+        %{count: 1, need: need, free: free},
+        %{
+          shard_id: state.id
+        }
+      )
+
+      Logger.error(
+        "shard #{state.id}: durability flush REFUSED, the data volume has #{free} bytes free and " <>
+          "the flush needs about #{need} (shard size plus margin) for its VACUUM INTO temp. Acked " <>
+          "writes are NOT being made durable until space is freed; the shard stays dirty and retries."
+      )
+
+      {:error, {:flush_no_space, need, free}}
+    else
+      _ -> :ok
+    end
+  end
+
+  defp flush_space_margin,
+    do: Application.get_env(:fathom, :flush_space_margin_bytes, @flush_space_margin_bytes)
+
+  # The .db plus its WAL: the snapshot is the merged content of both.
+  defp local_db_bytes(path) do
+    Enum.reduce([path, path <> "-wal"], 0, fn p, acc ->
+      case File.stat(p) do
+        {:ok, %{size: size}} -> acc + size
+        _ -> acc
+      end
+    end)
+  end
+
   # Review 2026-07-14 #4 added a `quick_check` gate so a locally-corrupted database is never
   # flushed over the last good stored object — but it lived in exactly one place: the
   # checkpoint-then-raw-upload fast path of `upload_for_drop/1`, which runs only on the

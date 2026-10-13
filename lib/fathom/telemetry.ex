@@ -638,6 +638,11 @@ defmodule Fathom.Telemetry do
         description:
           "Flushes refused because the shard object exceeds the 5 GiB single-PUT ceiling (#37) — UNLIKE every other flush failure this is PERMANENT: retries fail identically forever while the shard keeps acking writes it can never make durable, and snapshot/fork/retain are disabled for it. Any occurrence is page-worthy and needs shard reduction, not waiting. :shard_max_page_count is the write-time brake that prevents it"
       ),
+      counter("fathom.shard.flush.no_space.count",
+        event_name: [:fathom, :shard, :flush, :no_space],
+        description:
+          "Flushes refused up front because the data volume's free space (the poller's last reading) is below the shard's size plus a margin (expert review 2026-10-12 #26). The flush's VACUUM INTO temp needs about the shard's size, so this flush would fail late with SQLITE_FULL after a full quick_check. Writes keep being acked and cannot be made durable until space is freed, so the first occurrence is page-worthy"
+      ),
       counter("fathom.shard.corrupt_flush.count",
         event_name: [:fathom, :shard, :corrupt_flush],
         description:
