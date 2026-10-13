@@ -157,15 +157,21 @@ defmodule Fathom.Shard.TakeoverClaimReleaseTest do
       } do
         dead_x!(shard)
 
-        # The takeover re-check's HEAD raises inside the coordinator (abandon_open/5) or inside
-        # the pull task (the pull-failure release) — both releases are under test here.
+        # The takeover re-check's HEAD raises INSIDE THE COORDINATOR (the only process registered
+        # under the shard id), never in the pull task — so this pins abandon_open/5's release, the
+        # one A2 recovery relies on, distinct from the pull-failure release above.
         Application.put_env(
           :fathom,
           :faulty_before,
-          {:object_etag, fn id -> if id == shard, do: raise("boom") end}
+          {:object_etag,
+           fn id ->
+             if id == shard and Registry.keys(Fathom.ShardRegistry, self()) == [shard],
+               do: raise("boom")
+           end}
         )
 
-        capture_log(fn -> open_fails!(shard) end)
+        log = capture_log(fn -> open_fails!(shard) end)
+        assert log =~ "open FAILED after the lease was acquired", "not the abandon_open path"
 
         assert Jason.decode!(File.read!(lock_path(shard)))["claim"] > @x_claim
         assert_next_owner_above_x!(shard, unquote(mode))
