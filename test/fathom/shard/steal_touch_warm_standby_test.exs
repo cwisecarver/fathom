@@ -101,22 +101,23 @@ defmodule Fathom.Shard.StealTouchWarmStandbyTest do
     body_gets = start_supervised!({Agent, fn -> 0 end}, id: :body_gets)
 
     plug = fn conn ->
-      query = URI.decode_query(conn.query_string || "")
       data? = String.ends_with?(conn.request_path, data_key)
+      touch_read? = Plug.Conn.get_req_header(conn, "if-match") != []
 
       cond do
-        # Hold the crash-steal touch (its first multipart step) until the speculative
-        # pull's GET has served, so the pull deterministically captures the PRE-touch
-        # object (scenario a — the pull races ahead of the touch). Deterministic
-        # ordering replaces a flaky wall-clock race; the object doesn't actually rotate
-        # until CompleteMultipartUpload, well after this hold releases.
-        conn.method == "POST" and data? and Map.has_key?(query, "uploads") ->
+        # Hold the crash-steal touch (its first step: the small-object touch's fenced GET of
+        # the version it re-nonces, expert review 2026-10-12 N1) until the speculative pull's
+        # GET has served, so the pull deterministically captures the PRE-touch object
+        # (scenario a — the pull races ahead of the touch). Deterministic ordering replaces a
+        # flaky wall-clock race; the object doesn't actually rotate until the touch's PUT,
+        # after this hold releases.
+        conn.method == "GET" and data? and touch_read? ->
           wait_until(test_pid, fn -> Agent.get(pull_served, & &1) end)
           S3EtagStore.serve(conn, store)
 
         # A correct open pulls the data object ONCE (the speculative pull). The pre-#15
         # cold branch re-pulled it a SECOND time; count full-body GETs to pin that the
-        # fix avoids the re-pull. (The touch uses HEAD/POST/PUT, never GET.)
+        # fix avoids the re-pull. (The touch's own GET carries If-Match and is excluded above.)
         conn.method == "GET" and data? ->
           resp = S3EtagStore.serve(conn, store)
           Agent.update(body_gets, &(&1 + 1))
@@ -146,12 +147,11 @@ defmodule Fathom.Shard.StealTouchWarmStandbyTest do
       refute_received :pull_never_served,
                       "the speculative pull's GET must have served before the touch"
 
-      # The steal genuinely rotated the etag (single -> multipart form), and it moved
-      # no bytes — so the survivor serves the last acknowledged write from the copy it
+      # The steal genuinely rotated the etag, and it changed no database content (only the
+      # stored nonce) — so the survivor serves the last acknowledged write from the copy it
       # already holds.
       post_etag = S3EtagStore.etag_of(store, data_key)
-      assert post_etag =~ "-1", "the crash-steal touch must rotate the etag to multipart form"
-      assert post_etag != pre_etag
+      assert post_etag != pre_etag, "the crash-steal touch must rotate the etag"
 
       assert {:ok, %StmtResult{rows: [["base-write"]]}} =
                ShardExecutor.execute(conn, stmt("SELECT v FROM kv")),

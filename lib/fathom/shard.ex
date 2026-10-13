@@ -1124,9 +1124,10 @@ defmodule Fathom.Shard do
         end
 
       # Expert review #15: the speculative pull captured the object the crash-steal
-      # touch used as its If-Match SOURCE (etag == pre). The touch is a self-copy — it
-      # rotates the etag but moves no bytes — so the pulled bytes are byte-identical to
-      # the post-touch object. Adopt the post-touch etag with NO re-pull (the same
+      # touch used as its If-Match SOURCE (etag == pre). The touch rotates the etag but
+      # changes no database content (a random-boundary self-copy, or a re-nonced re-PUT of a
+      # small object, expert review 2026-10-12 N1) — so the pulled database is identical to
+      # the post-touch object's. Adopt the post-touch etag with NO re-pull (the same
       # provenance argument the warm branch makes via its sidecar), stamping the sidecar
       # to `post` so a later warm restart fences with the store's real etag. This is the
       # data-bearing crash failover: the survivor's live path is empty (warm? is false), so

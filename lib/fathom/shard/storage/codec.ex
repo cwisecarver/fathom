@@ -125,12 +125,21 @@ defmodule Fathom.Shard.Storage.Codec do
   bounded pieces, like the download path.
   """
   @spec verify_decodes_to(Path.t(), :zlib | :zstd, String.t()) :: :ok | {:error, term()}
-  def verify_decodes_to(path, encoding, expected_hex) do
+  def verify_decodes_to(path, encoding, expected_hex),
+    do: verify_chunks(File.stream!(path, @chunk), encoding, expected_hex)
+
+  @doc """
+  `verify_decodes_to/3` for a body held in memory (the steal-touch's re-encoded small object).
+  """
+  @spec verify_binary_decodes_to(binary(), :zlib | :zstd, String.t()) :: :ok | {:error, term()}
+  def verify_binary_decodes_to(body, encoding, expected_hex),
+    do: verify_chunks([body], encoding, expected_hex)
+
+  defp verify_chunks(chunks, encoding, expected_hex) do
     ctx = init(encoding)
 
     try do
-      path
-      |> File.stream!(@chunk)
+      chunks
       |> Enum.reduce_while({:ok, :crypto.hash_init(:md5)}, fn chunk, {:ok, md5} ->
         case inflate_into(ctx, chunk, &:crypto.hash_update(&2, &1), md5) do
           {:ok, _} = ok -> {:cont, ok}
@@ -149,6 +158,82 @@ defmodule Fathom.Shard.Storage.Codec do
       end
     after
       release(ctx)
+    end
+  end
+
+  # --- the steal-touch nonce (expert review 2026-10-12 N1) ---
+  #
+  # A steal must leave the data object at an etag that key has NEVER had, or a zombie holding an
+  # old etag can land a fenced flush past the fence. For an object too small to split into a
+  # multipart copy (S3's 5 MiB part minimum), the only way to a new MD5 etag is new stored BYTES —
+  # so the touch appends a zstd SKIPPABLE FRAME carrying 16 random bytes. RFC 8878 §3.1.2: a
+  # decoder skips frames with magic 0x184D2A50..0x184D2A5F, so the decoded database (and its
+  # `x-amz-meta-fathom-md5`) is unchanged while the etag moves. One magic value is ours, and the
+  # payload starts with a fixed tag, so a later touch can recognise and REPLACE the previous nonce
+  # instead of growing the object by 32 bytes per steal.
+  @nonce_magic 0x184D2A5F
+  @nonce_tag "fathomtn"
+  @nonce_bytes 16
+  @nonce_payload byte_size(@nonce_tag) + @nonce_bytes
+  @nonce_frame 8 + @nonce_payload
+
+  @doc """
+  `zstd_body` with any trailing touch nonce replaced by a fresh one (expert review 2026-10-12 N1).
+
+  The input must be a zstd-encoded object body; the output decodes to exactly the same bytes.
+  """
+  @spec renonce(binary()) :: binary()
+  def renonce(zstd_body) when is_binary(zstd_body) do
+    payload = @nonce_tag <> :crypto.strong_rand_bytes(@nonce_bytes)
+
+    strip_nonce(zstd_body) <>
+      <<@nonce_magic::little-32, @nonce_payload::little-32, payload::binary>>
+  end
+
+  defp strip_nonce(body) do
+    keep = byte_size(body) - @nonce_frame
+
+    case body do
+      <<head::binary-size(^keep), @nonce_magic::little-32, @nonce_payload::little-32, @nonce_tag,
+        _::binary-size(@nonce_bytes)>>
+      when keep >= 0 ->
+        head
+
+      _ ->
+        body
+    end
+  end
+
+  @doc """
+  Re-encodes an in-memory object body stored as `from` (`:none` or `:zlib`) to zstd.
+
+  Returns `{:ok, zstd_body, plain_md5_hex}`. The plaintext streams from the decoder straight into
+  the compressor and is never collected, so a small zlib body of a highly compressible database
+  (a 200 MiB `zeroblob` is ~1000:1) never materializes its plaintext; only the zstd output, which
+  is about as small as the input, is held. The steal-touch uses it to move a `:none`/`:zlib` object
+  onto the encoding that can carry a nonce (expert review 2026-10-12 N1).
+  """
+  @spec reencode_zstd(binary(), :none | :zlib) :: {:ok, binary(), String.t()} | {:error, term()}
+  def reencode_zstd(body, from) when from in [:none, :zlib] do
+    dctx = init(from)
+    cctx = compressor(:zstd)
+
+    try do
+      feed = fn piece, {md5, out} ->
+        {:crypto.hash_update(md5, piece), [out, compress_chunk(cctx, piece)]}
+      end
+
+      case inflate_into(dctx, body, feed, {:crypto.hash_init(:md5), []}) do
+        {:ok, {md5, out}} ->
+          {:ok, IO.iodata_to_binary([out, compress_finish(cctx)]),
+           Base.encode16(:crypto.hash_final(md5), case: :lower)}
+
+        {:error, _} = error ->
+          error
+      end
+    after
+      release(dctx)
+      compress_close(cctx)
     end
   end
 

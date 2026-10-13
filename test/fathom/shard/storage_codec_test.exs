@@ -226,4 +226,84 @@ defmodule Fathom.Shard.Storage.CodecTest do
 
   defp restore(nil), do: Application.delete_env(:fathom, :shard_object_encoding)
   defp restore(v), do: Application.put_env(:fathom, :shard_object_encoding, v)
+
+  # --- the steal-touch nonce (expert review 2026-10-12 N1) ---
+  #
+  # A small object's steal-touch appends a zstd skippable frame with a random nonce, so the
+  # STORED bytes (and so the MD5 etag) change while the DECODED database does not. Every S3 read
+  # decodes through `inflate_into/4` (the streamed download behind pull, pull_snapshot, version
+  # restore, fork's cold-open, export and the restore drill) or through it on a ranged prefix
+  # (`object_user_version`), so these pin that the decoder skips the frame at every chunk
+  # boundary — including a boundary that splits the frame's own header.
+
+  defp zstd_of(plain), do: plain |> :zstd.compress() |> IO.iodata_to_binary()
+
+  defp inflate_chunks(body, chunk) do
+    z = Codec.init(:zstd)
+
+    out =
+      for <<piece::binary-size(^chunk) <- pad_chunks(body, chunk)>>, reduce: [] do
+        acc ->
+          {:ok, acc} = Codec.inflate_into(z, piece, &[&2, &1], acc)
+          acc
+      end
+
+    rest = binary_part(body, div(byte_size(body), chunk) * chunk, rem(byte_size(body), chunk))
+    {:ok, out} = Codec.inflate_into(z, rest, &[&2, &1], out)
+    :ok = Codec.release(z)
+    IO.iodata_to_binary(out)
+  end
+
+  defp pad_chunks(body, chunk), do: binary_part(body, 0, div(byte_size(body), chunk) * chunk)
+
+  test "a renonced zstd body decodes to the same bytes at every chunk size" do
+    plain = String.duplicate("SQLite page bytes, mostly repetitive. ", 20_000)
+    nonced = plain |> zstd_of() |> Codec.renonce() |> Codec.renonce()
+
+    for chunk <- [1, 3, 7, 32, 4096, 16 * 1024, byte_size(nonced)] do
+      assert inflate_chunks(nonced, chunk) == plain, "chunk size #{chunk}"
+    end
+
+    hex = Base.encode16(:crypto.hash(:md5, plain), case: :lower)
+    assert :ok = Codec.verify_binary_decodes_to(nonced, :zstd, hex)
+
+    path = tmp("nonced")
+    File.write!(path, nonced)
+    on_exit(fn -> File.rm(path) end)
+    assert :ok = Codec.verify_decodes_to(path, :zstd, hex)
+  end
+
+  test "renonce changes the stored bytes every time and replaces, never stacks, the nonce" do
+    base = zstd_of("db")
+    n1 = Codec.renonce(base)
+    n2 = Codec.renonce(n1)
+    n3 = Codec.renonce(n2)
+
+    assert length(Enum.uniq([base, n1, n2, n3])) == 4, "every touch must change the stored bytes"
+    assert byte_size(n1) == byte_size(base) + 32
+    assert byte_size(n3) == byte_size(n1), "a later touch replaces the previous nonce"
+    assert binary_part(n3, 0, byte_size(base)) == base, "the database frames are untouched"
+  end
+
+  test "a body that merely ends like a nonce frame is never truncated by renonce" do
+    # Not our tag: a foreign skippable frame (another magic value) must be kept intact.
+    foreign = <<0x184D2A50::little-32, 24::little-32, "othertag", 0::128>>
+    body = zstd_of("db") <> foreign
+    assert binary_part(Codec.renonce(body), 0, byte_size(body)) == body
+  end
+
+  for from <- [:none, :zlib] do
+    test "#{from}: reencode_zstd yields a zstd body of the same plaintext and its digest" do
+      plain = :crypto.strong_rand_bytes(70_000) <> String.duplicate("x", 300_000)
+      body = if unquote(from) == :zlib, do: :zlib.compress(plain), else: plain
+
+      assert {:ok, zbody, hex} = Codec.reencode_zstd(body, unquote(from))
+      assert hex == Base.encode16(:crypto.hash(:md5, plain), case: :lower)
+      assert inflate_chunks(Codec.renonce(zbody), 16 * 1024) == plain
+    end
+  end
+
+  test "reencode_zstd reports an undecodable zlib body as an error" do
+    assert {:error, {:zlib, _}} = Codec.reencode_zstd("not zlib at all", :zlib)
+  end
 end

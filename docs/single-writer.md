@@ -41,6 +41,34 @@ shard, `If-None-Match: *` — write only if nothing exists yet). A **412** comes
 flushing**. The epoch orders writers: a shard remapped away has an old epoch, and its flush is
 rejected, not applied. "**Never flush over a newer owner.**"
 
+**The steal-touch — what makes the fence hold for a zombie.** A dead owner may have passed its own
+fence check and be stalled *inside* its flush PUT, `If-Match: E` in hand. So a steal (S3 only —
+`Storage.Local` has no cross-node zombie) also **touches the data object** before serving
+(`touch_object` in `Fathom.Shard.Storage.S3`), moving it to a new etag so the zombie's late PUT
+412s. The new etag must be one the key has **never had**: an earlier version alternated copy forms
+(single-part ↔ one-part multipart), which for identical bytes only has two etags, so two consecutive
+steals went E0 → E1 → E0 and re-armed the zombie's `If-Match: E0` (expert review 2026-10-12 N1).
+The touch now picks a path by the stored object's size:
+
+- **≥ 6 MiB — random-boundary multipart copy.** A server-side two-part `UploadPartCopy` (byte
+  ranges; no data flows through fathom) split at a boundary drawn uniformly from
+  `[5 MiB, size)` (part 1 must meet S3's 5 MiB minimum). A two-part etag is
+  `md5(md5(p1) ‖ md5(p2))-2`, so each boundary is a distinct etag, never the single-part form a flush
+  leaves. The 6 MiB floor guarantees ≥ 2²⁰ boundaries: a given later touch repeats an earlier one's
+  boundary with probability ≤ 2⁻²⁰ (~10⁻⁶; ~1.7·10⁻⁸ for a 64 MiB shard). Costs nothing extra
+  over the old touch.
+- **< 6 MiB — a nonce in the stored bytes.** One part has one etag, so the only new etag is new
+  bytes: GET the object (`If-Match` the etag being touched), append a **zstd skippable frame**
+  carrying 16 random bytes (replacing the previous touch's), and PUT it back `If-Match`. Decoders
+  skip the frame, so the database and its `x-amz-meta-fathom-md5` (always the *uncompressed* hash)
+  are unchanged; only the etag moves. An object stored `:none`/`:zlib` is re-encoded to zstd on the
+  way, after checking its plaintext against its digest (or its MD5 etag). **Cost:** a small-object
+  steal now moves the object through the stealer twice (GET + PUT, up to ~6 MiB each way), which
+  adds to failover latency; the old touch transferred nothing.
+
+The boot self-test (`verify_conditional_writes!/0`) touches its probe object twice and refuses to
+boot unless the three etags are distinct, which catches a store (or a regression) that cycles.
+
 **3. The heartbeat — liveness that's O(nodes), not O(shards).** The naive design renews every
 shard's lease on a timer — millions of PUTs (the "F1 storm"). Instead, each **node** renews **one**
 `heartbeat/<node>` object every `ttl/3` (`Fathom.Shard.Heartbeat`), and a shard's owner is **live iff

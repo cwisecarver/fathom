@@ -29,7 +29,7 @@ defmodule Fathom.Shard.Storage.S3StealTouchRollbackTest do
   @shard "s20"
   @old_owner "old@node"
   @error_body ~s(<?xml version="1.0"?><Error><Code>InternalError</Code><Message>boom</Message></Error>)
-  @ok_copy_body ~s(<?xml version="1.0"?><CopyObjectResult><ETag>"db-2"</ETag></CopyObjectResult>)
+  @db_body "raw shard bytes"
 
   setup do
     prev = Application.get_env(:fathom, S3)
@@ -126,18 +126,30 @@ defmodule Fathom.Shard.Storage.S3StealTouchRollbackTest do
 
       {"HEAD", "/b/" <> @shard <> ".db"} ->
         e = Agent.get(store, & &1.db_etag)
-        conn |> Plug.Conn.put_resp_header("etag", e) |> Plug.Conn.send_resp(200, "")
+
+        conn
+        |> Plug.Conn.put_resp_header("etag", e)
+        |> Plug.Conn.put_resp_header("content-length", Integer.to_string(byte_size(@db_body)))
+        |> Plug.Conn.send_resp(200, "")
+
+      # The small-object steal-touch reads the version it re-nonces (expert review 2026-10-12 N1).
+      {"GET", "/b/" <> @shard <> ".db"} ->
+        e = Agent.get(store, & &1.db_etag)
+        conn |> Plug.Conn.put_resp_header("etag", e) |> Plug.Conn.send_resp(200, @db_body)
 
       {"PUT", "/b/" <> @shard <> ".db"} ->
-        # The steal-time touch (server-side self-copy). Fails once, then succeeds.
+        # The steal-time touch's fenced re-PUT. Fails once, then succeeds.
         touches =
           Agent.get_and_update(store, fn s -> {s.touches + 1, %{s | touches: s.touches + 1}} end)
 
         if touches == 1 do
-          Plug.Conn.send_resp(conn, 200, @error_body)
+          Plug.Conn.send_resp(conn, 500, @error_body)
         else
           Agent.update(store, fn s -> %{s | db_etag: ~s("db-#{touches}")} end)
-          Plug.Conn.send_resp(conn, 200, @ok_copy_body)
+
+          conn
+          |> Plug.Conn.put_resp_header("etag", ~s("db-#{touches}"))
+          |> Plug.Conn.send_resp(200, "")
         end
 
       {"GET", "/b/heartbeats/" <> _} ->

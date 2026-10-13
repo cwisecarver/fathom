@@ -138,6 +138,9 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
   # Build the req_plug: count full-body GETs and data-object HEADs, and let a test hook
   # the Nth data HEAD (to inject a zombie / release-in-gap flush, or force an error) and
   # the pull GET (to gate ordering). Everything else is the plain MD5-faithful store.
+  #
+  # A GET carrying `If-Match` is the small-object steal-touch reading the version it re-nonces
+  # (expert review 2026-10-12 N1), not a pull: it is neither counted nor hooked.
   defp build_plug(store, data_key, cnt, hooks) do
     on_head = Keyword.get(hooks, :on_head, fn _n, _conn, _store -> :cont end)
     on_get = Keyword.get(hooks, :on_get, fn _conn, _store -> :cont end)
@@ -154,7 +157,7 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
             :cont -> S3EtagStore.serve(conn, store)
           end
 
-        conn.method == "GET" and data? ->
+        conn.method == "GET" and data? and Plug.Conn.get_req_header(conn, "if-match") == [] ->
           resp =
             case on_get.(conn, store) do
               {:resp, r} -> r
@@ -193,9 +196,6 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
       true -> Process.sleep(5) && wait_until(test_pid, fun, tries - 1)
     end
   end
-
-  defp multipart?(nil), do: false
-  defp multipart?(etag), do: String.contains?(etag, "-")
 
   # Open, read the single kv value (which lineage the takeover served), close the stream.
   # The coordinator stays up (idle is 300s in setup) so the branch assertions can read the
@@ -256,13 +256,12 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
   test "A: a cold takeover whose speculative pull captured the POST-touch object adopts it (no re-pull)",
        %{shard: shard} do
     # No local file ⇒ cold; a dead lock ⇒ steal + touch. The pull's GET is held until the
-    # touch has rotated the object to multipart form, so the pull deterministically captures
+    # touch has rotated the object to a new etag, so the pull deterministically captures
     # the POST-touch object (etag == post → the fast path at shard.ex:460).
     base = build_db!("base-write")
     data_key = "#{shard}.db"
     store = start_store(%{data_key => base, "#{shard}.lock" => dead_lock()})
     pre = S3EtagStore.etag_of(store, data_key)
-    refute pre =~ "-", "seed must be single (MD5) form so the touch rotates it"
 
     test_pid = self()
     cnt = start_counters()
@@ -270,7 +269,7 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
     plug =
       build_plug(store, data_key, cnt,
         on_get: fn _conn, s ->
-          wait_until(test_pid, fn -> multipart?(S3EtagStore.etag_of(s, data_key)) end)
+          wait_until(test_pid, fn -> S3EtagStore.etag_of(s, data_key) != pre end)
           :cont
         end
       )
@@ -281,11 +280,13 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
       value = open_read(shard)
 
       refute_received :ordering_never_reached,
-                      "the touch must complete (object → multipart) before the pull GET serves"
+                      "the touch must complete (etag rotated) before the pull GET serves"
 
       post = S3EtagStore.etag_of(store, data_key)
-      assert post =~ "-1", "the steal touch must rotate the etag to multipart form"
-      assert value == "base-write", "the takeover serves the (byte-identical) post-touch object"
+      assert post != pre, "the steal touch must rotate the etag"
+
+      assert value == "base-write",
+             "the takeover serves the (content-identical) post-touch object"
 
       assert body_gets(cnt) == 1,
              "etag == post is the fast path — exactly the one speculative pull, no re-pull"
@@ -300,7 +301,7 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
   test "B1: a warm takeover whose provenance matches the touch source ADOPTS the post-touch etag with no re-pull",
        %{shard: shard} do
     # This node's own warm copy IS the current lineage (sidecar == the store's pre-touch
-    # etag). The steal touches it (moves no bytes), so the warm branch adopts the post-touch
+    # etag). The steal touches it (no database content changes), so the warm branch adopts the post-touch
     # etag straight off the copy already held (shard.ex:475-477) — the common warm failover.
     base = build_db!("base-write")
     data_key = "#{shard}.db"
@@ -315,7 +316,6 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
     capture_log(fn ->
       value = open_read(shard)
       post = S3EtagStore.etag_of(store, data_key)
-      assert post =~ "-1"
       assert post != pre
 
       assert value == "base-write", "the warm copy already held is served"

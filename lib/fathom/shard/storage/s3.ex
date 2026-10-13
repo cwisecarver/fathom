@@ -69,10 +69,10 @@ defmodule Fathom.Shard.Storage.S3 do
   @max_single_put 5 * 1024 * 1024 * 1024
 
   # Object metadata carrying the body's MD5 as lowercase base16 hex, independent of the etag
-  # form (expert review 2026-07-14 #17). A steal-time fence rotates the etag between single-part
-  # and multipart form to invalidate a zombie's If-Match, which disabled the etag-MD5 download
-  # check for the new owner's first pull; this metadata survives the rotation. See
-  # verify_integrity/3.
+  # form (expert review 2026-07-14 #17). A steal-time touch moves the etag to invalidate a zombie's
+  # If-Match — to a multipart form, or to the MD5 of re-nonced bytes that are no longer the bytes
+  # a flush PUT — which defeats the etag-MD5 download check for the new owner's first pull; this
+  # metadata survives the touch. See verify_integrity/3.
   @md5_meta "x-amz-meta-fathom-md5"
 
   # How much of the shard's history the object's bytes contain (Phase 2 A2 promote-on-open).
@@ -185,10 +185,10 @@ defmodule Fathom.Shard.Storage.S3 do
 
     # Round-2 #4: the steal fence is only real if a touch produces a GENUINELY new
     # etag — on MD5-etag stores a plain self-copy does NOT rotate (same bytes, same
-    # MD5). Probe BOTH alternating copy forms (single→multipart, multipart→single)
-    # and refuse boot on a store where either fails to move the etag.
-    probe_rotation!(key, "single→multipart touch rotation")
-    probe_rotation!(key, "multipart→single touch rotation")
+    # MD5). And a NEW etag is not enough: it must be one the key has never had, or two
+    # steals bring a zombie's etag back (expert review 2026-10-12 N1). Two consecutive
+    # touches of the identical probe bytes must yield three distinct etags.
+    probe_rotation!(key)
 
     # The lock-release fence (`release_lease/2`) is a conditional DELETE, and the whole lock-leak
     # fix (`resolve_412_release`, finding #22) rests on the store answering 412 to a stale-etag
@@ -255,20 +255,27 @@ defmodule Fathom.Shard.Storage.S3 do
   defp allow_weak_conditional_delete?,
     do: Application.get_env(:fathom, :allow_weak_conditional_delete, false) == true
 
-  defp probe_rotation!(key, label) do
+  # The probe object is 18 raw bytes, so this exercises the small-object touch twice: the first
+  # re-encodes `:none` -> zstd + nonce, the second replaces the nonce. Two GET+PUTs of a few dozen
+  # bytes. The large-object split touch is NOT probed — that would mean uploading >= 6 MiB per boot;
+  # a store that refused ranged UploadPartCopy fails each such steal closed instead.
+  defp probe_rotation!(key) do
     # The probe deliberately keeps its own HEAD-based verification (it is a boot-time
-    # self-test of the STORE, so it must not trust the copy response's claimed etag the
+    # self-test of the STORE, so it must not trust the write response's claimed etag the
     # way the steal path now does — review 2026-07-23 #13).
-    with {:ok, etag} when not is_nil(etag) <- head_etag(key),
-         {:ok, _claimed} <- rotate_etag(key, etag, []),
-         {:ok, new_etag} when not is_nil(new_etag) and new_etag != etag <- head_etag(key) do
+    with {:ok, e0, _, carry0, size0} when is_binary(e0) <- head_sized(key),
+         {:ok, _claimed} <- rotate_etag(key, e0, carry0, size0),
+         {:ok, e1, _, carry1, size1} when is_binary(e1) <- head_sized(key),
+         {:ok, _claimed} <- rotate_etag(key, e1, carry1, size1),
+         {:ok, e2} when is_binary(e2) <- head_etag(key),
+         [_, _, _] <- Enum.uniq([e0, e1, e2]) do
       :ok
     else
       other ->
-        raise "shard storage fence self-test failed (#{label}): the steal-time touch " <>
-                "did not rotate the object etag (#{inspect(other)}). On this store the " <>
+        raise "shard storage fence self-test failed: two steal-time touches did not rotate " <>
+                "the object etag to two NEW etags (#{inspect(other)}). On this store the " <>
                 "zombie-flush fence would be a silent no-op — refusing to boot " <>
-                "(expert review round-2 #4)."
+                "(expert review round-2 #4, 2026-10-12 N1)."
     end
   end
 
@@ -516,14 +523,12 @@ defmodule Fathom.Shard.Storage.S3 do
   # single-PUT uploads produce) a plain self-copy of identical bytes yields the
   # SAME etag, making the whole zombie fence a silent no-op in production.
   #
-  # The rotation that works for identical bytes at ANY size: ALTERNATE COPY FORMS.
-  # A single-form etag (32-hex MD5) is touched via a one-part MULTIPART copy —
-  # its etag is md5(part-md5s)-1, a different form entirely; a multipart-form
-  # etag ("...-N") is touched via a plain CopyObject — back to the single MD5
-  # form. Either direction provably moves the etag. The rotation is then
-  # CONFIRMED with a HEAD, and a non-rotating store fails the touch closed (an
-  # un-fenced steal is not a steal); verify_conditional_writes!/0 also probes
-  # both directions at boot.
+  # And a NEW etag is not enough: it must be one the key has NEVER had, or two
+  # steals bring a zombie's etag back (expert review 2026-10-12 N1). See rotate_etag/4
+  # for how each touch gets one (random-boundary split copy >= 6 MiB, re-nonced
+  # bytes below). A response that does not prove rotation is CONFIRMED with a HEAD,
+  # and a non-rotating store fails the touch closed (an un-fenced steal is not a
+  # steal); verify_conditional_writes!/0 also probes two consecutive touches at boot.
   #
   # 404 (a never-flushed brand-new shard was stolen): the old "nothing a zombie
   # flush could clobber" reasoning was the WRONG direction (round-2 #7) — the
@@ -544,8 +549,8 @@ defmodule Fathom.Shard.Storage.S3 do
   defp touch_object(shard_id, attempt \\ 1) do
     key = db_key(shard_id)
 
-    case head_object(key) do
-      {:ok, nil, _, _} ->
+    case head_sized(key) do
+      {:ok, nil, _, _, _} ->
         case create_sentinel(key) do
           {:ok, sentinel_etag} ->
             {:ok, %{pre: nil, post: sentinel_etag}}
@@ -564,7 +569,7 @@ defmodule Fathom.Shard.Storage.S3 do
       # would open the placeholder as shard bytes. Refresh it instead — a fresh
       # nonced body rotates the MD5 etag (fencing the previous stealer's zombie
       # If-Match) while keeping the sentinel semantics intact.
-      {:ok, etag, true, _} ->
+      {:ok, etag, true, _, _} ->
         case refresh_sentinel(key, etag) do
           {:ok, post} ->
             with {:ok, post} <- resolved_post(shard_id, etag, post),
@@ -577,8 +582,8 @@ defmodule Fathom.Shard.Storage.S3 do
             error
         end
 
-      {:ok, etag, false, md5} ->
-        case rotate_etag(key, etag, md5) do
+      {:ok, etag, false, carry, size} ->
+        case rotate_etag(key, etag, carry, size) do
           {:ok, post} ->
             with {:ok, post} <- resolved_post(shard_id, etag, post),
                  do: {:ok, %{pre: etag, post: post}}
@@ -624,11 +629,34 @@ defmodule Fathom.Shard.Storage.S3 do
   # keep a lock/metadata map in place across a touch, so "REPLACE drops user metadata" is a
   # property only the real backend has.
   defp head_object(key) do
+    with {:ok, etag, sentinel?, carry, _size} <- head_sized(key),
+         do: {:ok, etag, sentinel?, carry}
+  end
+
+  # `head_object/1` plus the stored size (`nil` when the store does not report it), which picks the
+  # steal-touch's path (expert review 2026-10-12 N1).
+  defp head_sized(key) do
     case Req.head(req(), url: url_path(key)) do
-      {:ok, %{status: 200, headers: h}} -> {:ok, etag(h), sentinel_response?(h), carry_meta(h)}
-      {:ok, %{status: 404}} -> {:ok, nil, false, []}
-      {:ok, %{status: s}} -> {:error, {:s3_head_status, s}}
-      {:error, reason} -> {:error, reason}
+      {:ok, %{status: 200, headers: h}} ->
+        {:ok, etag(h), sentinel_response?(h), carry_meta(h), content_length(h)}
+
+      {:ok, %{status: 404}} ->
+        {:ok, nil, false, [], nil}
+
+      {:ok, %{status: s}} ->
+        {:error, {:s3_head_status, s}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp content_length(headers) do
+    with v when is_binary(v) <- header_value(headers, "content-length"),
+         {n, ""} when n >= 0 <- Integer.parse(String.trim(v)) do
+      n
+    else
+      _ -> nil
     end
   end
 
@@ -713,48 +741,134 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
-  defp multipart_etag_form?(etag), do: etag |> String.trim(~s(")) |> String.contains?("-")
+  # THE STEAL-TOUCH MUST PRODUCE AN ETAG THE KEY HAS NEVER HAD (expert review 2026-10-12 N1).
+  #
+  # What this replaced alternated copy forms: a single-form (MD5) etag was touched with a one-part
+  # multipart self-copy (`md5(md5)-1`), a multipart one with a plain self-copy (back to `md5`).
+  # Each touch moved the etag, but for IDENTICAL BYTES there are only those two etags, so two
+  # consecutive steals went E0 -> E1 -> E0. A zombie that flushed at E0 and stalled across both
+  # steals then had its late `If-Match: E0` PUT ACCEPTED — an unfenced write past the fence.
+  # Metadata cannot help: user metadata does not enter an S3 etag.
+  #
+  # So the touch now always produces a fresh etag, by object size:
+  #
+  #   * >= @split_touch_min: a TWO-PART multipart self-copy (UploadPartCopy with byte ranges — the
+  #     store copies server-side, nothing is transferred) split at a RANDOM boundary. A multipart
+  #     etag is md5(md5(part1) <> md5(part2))-2, so a different boundary is a different etag, and
+  #     it is never the single-form etag a flush PUT leaves. Part 1 must be >= 5 MiB (S3's minimum
+  #     for every part but the last), so the boundary is drawn from [5 MiB, size): size - 5 MiB
+  #     choices. The floor is 6 MiB rather than 5 so there are always >= 2^20 of them: the chance
+  #     that any one later touch repeats a given touch's boundary is <= 2^-20 (~1e-6), and for a
+  #     64 MiB shard ~1.7e-8. Large objects pay nothing extra over the old touch: still three
+  #     requests' worth (create, part copies, complete), no bytes through fathom.
+  #
+  #   * smaller: there is no multipart copy with more than one part, and one part has exactly one
+  #     etag, so the only way to a new etag is new stored BYTES. GET the object (If-Match the etag
+  #     being touched), append a zstd skippable frame carrying a random nonce (replacing the
+  #     previous touch's), and PUT it back If-Match. A zstd decoder skips the frame, so the decoded
+  #     database and `x-amz-meta-fathom-md5` are unchanged; the etag is md5(new bytes), a repeat
+  #     with probability ~2^-128. An object stored `:none` or `:zlib` is re-encoded to zstd on the
+  #     way (every reader decodes by the object's own marker, so a changed encoding is invisible to
+  #     them), and the decoded plaintext is checked against the object's digest first. COST: a
+  #     small-object steal now moves the object through fathom twice (GET + PUT, up to ~6 MiB
+  #     each way), which adds to failover latency; the old touch moved no bytes.
+  @min_part_bytes 5 * 1024 * 1024
+  @split_touch_min @min_part_bytes + 1024 * 1024
 
-  defp rotate_etag(key, etag, carry) do
-    if multipart_etag_form?(etag),
-      do: single_copy_touch(key, etag, carry),
-      else: multipart_copy_touch(key, etag, carry)
-  end
+  # `size` is the object's stored size off the HEAD. A store that does not report it gets no
+  # touch, and so no steal: guessing a path could pick a multipart split the store then refuses.
+  defp rotate_etag(key, etag, carry, size) when is_integer(size) and size >= @split_touch_min,
+    do: split_copy_touch(key, etag, carry, size)
 
-  # Plain server-side self-copy: produces a single-form (MD5) etag. Used when the
-  # object currently carries a multipart-form etag, so the form flip IS the
-  # rotation. S3 requires the REPLACE metadata directive for a self-copy — which drops ALL user
-  # metadata, so `carry` re-sends every key the object had. Sending back only the integrity md5 is
-  # what silently erased A2's position stamp on every takeover — see `head_object/1`.
-  # Returns `{:ok, new_etag_or_nil}` — the CopyObjectResult body carries the new etag
-  # (nil if unparseable; the caller then confirms via HEAD).
-  defp single_copy_touch(key, etag, carry) do
-    source = "/" <> fetch!(config(), :bucket) <> "/" <> key
+  defp rotate_etag(key, etag, _carry, size) when is_integer(size), do: nonce_touch(key, etag)
 
-    case Req.put(req(),
-           url: url_path(key),
-           headers:
-             [
-               {"x-amz-copy-source", source},
-               {"x-amz-metadata-directive", "REPLACE"},
-               {"x-amz-copy-source-if-match", etag}
-             ] ++ carry
-         ) do
-      {:ok, %{status: s, body: body}} when s in 200..299 ->
-        body = to_string(body)
+  defp rotate_etag(_key, _etag, _carry, _size), do: {:error, :touch_unknown_size}
 
-        if copy_body_ok?(body),
-          do: {:ok, body_etag(body)},
-          else: {:error, {:s3_touch_error_body, body}}
+  # The small-object touch: GET exactly the version at `etag`, re-nonce it, PUT it back fenced on
+  # that same etag. The metadata re-sent is the GET's own (the same version's), for the reason
+  # `head_object/1` gives: a PUT keeps no `x-amz-meta-*` it is not sent.
+  defp nonce_touch(key, etag) do
+    # `raw: true`: the EXACT stored bytes — no HTTP-level decompression or body decoding by Req.
+    case Req.get(req(), url: url_path(key), headers: [{"if-match", etag}], raw: true) do
+      {:ok, %{status: 200, body: body, headers: h}} ->
+        with {:ok, new_body, meta} <- nonced_body(IO.iodata_to_binary(body), h, carry_meta(h)) do
+          put_touched(key, etag, new_body, meta)
+        end
 
-      {:ok, %{status: 412}} ->
+      # Changed (412) or gone (404) since the HEAD: the caller re-runs the touch once.
+      {:ok, %{status: s}} when s in [404, 412] ->
         {:error, :touch_precondition}
 
       {:ok, %{status: s}} ->
-        {:error, {:s3_touch_status, s}}
+        {:error, {:s3_touch_get_status, s}}
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp nonced_body(body, headers, carry) do
+    case Codec.decoder(meta_enc(headers)) do
+      # Already zstd: only the nonce changes. The original frames are untouched, so the body is not
+      # re-decoded here (that would be a full decompress on every failover); the pull decodes and
+      # digests it as always.
+      {:ok, :zstd} ->
+        {:ok, Codec.renonce(body), carry}
+
+      {:ok, from} ->
+        reencoded_body(body, from, headers, carry)
+
+      # An encoding this node cannot read: it cannot re-encode it either. Fail the touch closed.
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  # `:none`/`:zlib` -> zstd + nonce. The plaintext digest must match what the object claims BEFORE
+  # it is restamped (the metadata digest when present, else the MD5 etag of a raw single-PUT
+  # object), so a touch never launders a torn or foreign body into one carrying a fresh digest. A
+  # raw object with neither is the legacy unverifiable case the pull already serves as-is.
+  defp reencoded_body(body, from, headers, carry) do
+    with {:ok, zbody, plain_hex} <- Codec.reencode_zstd(body, from),
+         :ok <- plain_matches_object(plain_hex, from, headers),
+         new_body = Codec.renonce(zbody),
+         # The new encoding is proved to decode to the digest it is labelled with before it is
+         # stored, as every compressed flush is (expert review 2026-10-08 #15).
+         :ok <- Codec.verify_binary_decodes_to(new_body, :zstd, plain_hex) do
+      meta =
+        Enum.reject(carry, fn {k, _} -> k in [@md5_meta, Codec.meta_header()] end) ++
+          [{@md5_meta, plain_hex} | Codec.upload_headers(:zstd)]
+
+      {:ok, new_body, meta}
+    end
+  end
+
+  defp plain_matches_object(plain_hex, from, headers) do
+    case {meta_md5(headers), from} do
+      {nil, :none} ->
+        verify_md5(Base.decode16!(plain_hex, case: :lower), etag(headers))
+
+      {nil, enc} ->
+        {:error, {:missing_plain_digest, Atom.to_string(enc)}}
+
+      {hex, _} ->
+        if String.downcase(hex) == plain_hex, do: :ok, else: {:error, :checksum_mismatch}
+    end
+  end
+
+  defp put_touched(key, etag, body, meta) do
+    content_md5 = :md5 |> :crypto.hash(body) |> Base.encode64()
+
+    case Req.put(req(),
+           url: url_path(key),
+           body: body,
+           headers: [{"if-match", etag}, {"content-md5", content_md5} | meta]
+         ) do
+      {:ok, %{status: s, headers: h}} when s in 200..299 -> {:ok, etag(h)}
+      # A fenced PUT to a key deleted since the GET is 404 on AWS (see `flush/6`).
+      {:ok, %{status: s}} when s in [404, 412] -> {:error, :touch_precondition}
+      {:ok, %{status: s}} -> {:error, {:s3_touch_put_status, s}}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -767,16 +881,18 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
-  # One-part multipart self-copy: Complete's etag is md5(part-md5s)-1 — never the
-  # single MD5 form, so it rotates even for identical bytes. A single-part
-  # multipart upload has no minimum part size, so this works for any shard.
-  defp multipart_copy_touch(key, etag, carry) do
+  # The large-object touch: a two-part multipart self-copy split at a random boundary (see above).
+  # Both part copies are fenced on `etag`, so a flush landing mid-touch fails the touch (412) rather
+  # than mixing two versions' bytes into one object.
+  defp split_copy_touch(key, etag, carry, size) do
     source = "/" <> fetch!(config(), :bucket) <> "/" <> key
+    cut = split_point(size)
 
     case create_multipart(key, carry) do
       {:ok, upload_id} ->
-        with {:ok, part_etag} <- upload_part_copy(key, upload_id, source, etag),
-             {:ok, post} <- complete_multipart(key, upload_id, part_etag) do
+        with {:ok, p1} <- upload_part_copy(key, upload_id, source, etag, 1, {0, cut - 1}),
+             {:ok, p2} <- upload_part_copy(key, upload_id, source, etag, 2, {cut, size - 1}),
+             {:ok, post} <- complete_multipart(key, upload_id, [{1, p1}, {2, p2}]) do
           {:ok, post}
         else
           {:error, _} = error ->
@@ -787,6 +903,16 @@ defmodule Fathom.Shard.Storage.S3 do
       {:error, _} = error ->
         error
     end
+  end
+
+  # Uniform over [@min_part_bytes, size): part 1 is at least S3's 5 MiB minimum, part 2 at least one
+  # byte. From the CSPRNG, so two nodes (or a node restarted with the same seed) do not draw in step;
+  # the modulo bias over a 64-bit draw is below 2^-30 for any object under 16 GiB.
+  @doc false
+  @spec split_point(pos_integer()) :: pos_integer()
+  def split_point(size) when size > @min_part_bytes do
+    <<r::unsigned-64>> = :crypto.strong_rand_bytes(8)
+    @min_part_bytes + rem(r, size - @min_part_bytes)
   end
 
   # CreateMultipartUpload is where a multipart object's user metadata is set (parts carry none), so
@@ -812,12 +938,15 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
-  defp upload_part_copy(key, upload_id, source, etag) do
+  defp upload_part_copy(key, upload_id, source, etag, part, {first, last}) do
     case Req.put(req(),
-           url: url_path(key) <> "?partNumber=1&uploadId=#{URI.encode_www_form(upload_id)}",
+           url:
+             url_path(key) <>
+               "?partNumber=#{part}&uploadId=#{URI.encode_www_form(upload_id)}",
            headers: [
              {"x-amz-copy-source", source},
-             {"x-amz-copy-source-if-match", etag}
+             {"x-amz-copy-source-if-match", etag},
+             {"x-amz-copy-source-range", "bytes=#{first}-#{last}"}
            ]
          ) do
       {:ok, %{status: s, body: body}} when s in 200..299 ->
@@ -859,10 +988,12 @@ defmodule Fathom.Shard.Storage.S3 do
   # copy_body_ok? guards it like the other copies. Returns `{:ok, new_etag_or_nil}`: the
   # CompleteMultipartUploadResult body carries the completed object's etag (review
   # 2026-07-23 #13 — the caller previously re-fetched it with a confirm HEAD).
-  defp complete_multipart(key, upload_id, part_etag) do
+  defp complete_multipart(key, upload_id, parts) do
     body =
-      "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>" <>
-        ~s(<ETag>"#{part_etag}"</ETag></Part></CompleteMultipartUpload>)
+      "<CompleteMultipartUpload>" <>
+        Enum.map_join(parts, "", fn {n, part_etag} ->
+          "<Part><PartNumber>#{n}</PartNumber>" <> ~s(<ETag>"#{part_etag}"</ETag></Part>)
+        end) <> "</CompleteMultipartUpload>"
 
     case Req.post(req(),
            url: url_path(key) <> "?uploadId=#{URI.encode_www_form(upload_id)}",
@@ -978,10 +1109,10 @@ defmodule Fathom.Shard.Storage.S3 do
 
   # The download integrity gate (expert review 2026-07-14 #17). The etag-MD5 check
   # (verify_md5/2) only fires when the etag is the MD5-shaped single-part form, but the
-  # steal-time fence ROTATES a single-part etag to MULTIPART form (rotate_etag/touch_object)
-  # to invalidate a zombie's If-Match — so right after a steal the object carries a `...-N`
-  # etag and the new owner's failover cold-open pull would run with NO content check until the
-  # next single-PUT flush. The `x-amz-meta-fathom-md5` metadata carries the body's MD5
+  # steal-time fence ROTATES the etag (rotate_etag/touch_object) to invalidate a zombie's
+  # If-Match — so right after a steal the object carries a `...-N` etag, or the MD5 of re-nonced
+  # compressed bytes, and the new owner's failover cold-open pull would run with NO content check
+  # until the next flush. The `x-amz-meta-fathom-md5` metadata carries the body's MD5
   # independent of the etag's shape and survives the rotation, so when it's present we verify
   # against IT regardless of etag form. Falls back to the etag-MD5 check for objects with no
   # metadata (older flushes, or the unfenced copy paths); a no-op when neither is available.

@@ -9,9 +9,15 @@ defmodule Fathom.Shard.Storage.S3StealTouchTest do
   # non-multipart object — exactly fathom's single-PUT uploads) a plain self-copy
   # of identical bytes produces the SAME etag, so the old test's hand-returned
   # "changed" etag proved only request shape. This suite drives the steal against
-  # Fathom.Test.S3EtagStore, whose etags are content-derived like real S3 — the
-  # rotation must come from the ALTERNATING COPY FORM (single ↔ one-part
-  # multipart), and a store where nothing rotates must fail the steal closed.
+  # Fathom.Test.S3EtagStore, whose etags are content-derived like real S3, and a
+  # store where nothing rotates must fail the steal closed.
+  #
+  # Expert review 2026-10-12 N1 hardened it again: the rotation used to ALTERNATE copy
+  # forms (single <-> one-part multipart), which for identical bytes has only two etags,
+  # so a second steal returned the object to the first etag and re-armed a zombie's
+  # If-Match. These tests previously asserted that alternation; they now pin that each
+  # touch reaches an etag the key never had (the small-object touch re-nonces the stored
+  # bytes; s3_touch_aba_test.exs covers the large-object split copy and the zombie).
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage
@@ -67,10 +73,9 @@ defmodule Fathom.Shard.Storage.S3StealTouchTest do
            "the double must model MD5 etags — same bytes, same single-form etag"
   end
 
-  test "a steal rotates a single-form etag via the multipart copy form" do
+  test "a steal rotates a small object's etag by re-noncing its stored bytes, not its content" do
     store = start_store(%{@data_key => "shard-bytes", @lock_key => dead_lock()})
     before = S3EtagStore.etag_of(store, @data_key)
-    refute before =~ "-", "seed must carry a single-form (MD5) etag"
 
     assert {:ok, lease} = S3.acquire_lease(@shard, "new@node#inc2", 30_000)
     assert lease.epoch == 6, "a steal must bump the epoch"
@@ -78,16 +83,20 @@ defmodule Fathom.Shard.Storage.S3StealTouchTest do
 
     after_etag = S3EtagStore.etag_of(store, @data_key)
     assert after_etag != before, "the touch must GENUINELY rotate the etag (round-2 #4)"
-    assert after_etag =~ "-1", "a single-form etag rotates into the multipart form"
-    assert S3EtagStore.body_of(store, @data_key) == "shard-bytes", "the touch moves no bytes"
+
+    refute S3EtagStore.body_of(store, @data_key) == "shard-bytes",
+           "the stored bytes carry a nonce"
+
+    assert S3EtagStore.plain_body_of(store, @data_key) == "shard-bytes",
+           "the touch changes no database content"
   end
 
-  test "a second steal rotates a multipart-form etag back via the plain copy form" do
+  test "a second steal moves to a THIRD etag, never back to the first (N1)" do
     store = start_store(%{@data_key => "shard-bytes", @lock_key => dead_lock()})
+    first = S3EtagStore.etag_of(store, @data_key)
 
     assert {:ok, _} = S3.acquire_lease(@shard, "new@node#inc2", 30_000)
-    multipart_etag = S3EtagStore.etag_of(store, @data_key)
-    assert multipart_etag =~ "-1"
+    second = S3EtagStore.etag_of(store, @data_key)
 
     # The new owner dies unrenewed; a second contender steals the same bytes.
     Agent.update(store, fn s ->
@@ -99,16 +108,14 @@ defmodule Fathom.Shard.Storage.S3StealTouchTest do
 
     assert {:ok, %{took_over: true}} = S3.acquire_lease(@shard, "third@node#inc3", 30_000)
 
-    single_etag = S3EtagStore.etag_of(store, @data_key)
+    third = S3EtagStore.etag_of(store, @data_key)
 
-    assert single_etag != multipart_etag,
-           "the SECOND steal of identical bytes must also rotate (the form flips back)"
-
-    refute single_etag =~ "-"
+    assert length(Enum.uniq([first, second, third])) == 3,
+           "the second steal of identical content returned to an earlier etag (pre-N1: the first)"
   end
 
-  # Expert review #12: the steal-time touch self-copies with x-amz-metadata-directive: REPLACE (single
-  # form) or a multipart copy — both of which DROP the object's user metadata unless it is re-sent. So
+  # Expert review #12: the steal-time touch rewrites the object (a re-nonced PUT for a small object, a
+  # multipart copy for a large one) — both of which DROP the object's user metadata unless it is re-sent. So
   # the x-amz-meta-fathom-md5 integrity metadata (#17) was stripped by exactly the steal that precedes
   # the new owner's highest-risk pull (a failover of a possibly-multi-MB shard over a degraded
   # network), leaving that pull with no content verification. The touch now re-sends the md5 on both
@@ -124,34 +131,34 @@ defmodule Fathom.Shard.Storage.S3StealTouchTest do
     end)
   end
 
-  test "a steal preserves x-amz-meta-fathom-md5 across the single→multipart touch (#12)" do
+  test "a steal preserves x-amz-meta-fathom-md5 across the touch (#12)" do
     body = "shard-bytes"
     md5 = md5_hex(body)
     store = start_store(%{@data_key => body, @lock_key => dead_lock()})
     seed_md5_meta(store, @data_key, md5)
-    refute S3EtagStore.etag_of(store, @data_key) =~ "-", "seed must carry a single-form etag"
+    before = S3EtagStore.etag_of(store, @data_key)
 
     assert {:ok, %{took_over: true}} = S3.acquire_lease(@shard, "new@node#inc2", 30_000)
 
-    assert S3EtagStore.etag_of(store, @data_key) =~ "-1", "the touch rotated to multipart form"
+    refute S3EtagStore.etag_of(store, @data_key) == before, "the touch rotated the etag"
 
     assert S3EtagStore.meta_of(store, @data_key)[@md5_meta_key] == md5,
            "the integrity md5 metadata must survive the steal-time touch (pre-#12: dropped)"
   end
 
-  test "a second steal preserves x-amz-meta-fathom-md5 across the multipart→single touch (#12)" do
+  test "a second steal preserves x-amz-meta-fathom-md5 across the second touch (#12)" do
     body = "shard-bytes"
     md5 = md5_hex(body)
     store = start_store(%{@data_key => body, @lock_key => dead_lock()})
     seed_md5_meta(store, @data_key, md5)
 
     assert {:ok, _} = S3.acquire_lease(@shard, "new@node#inc2", 30_000)
-    assert S3EtagStore.etag_of(store, @data_key) =~ "-1"
+    first_touch = S3EtagStore.etag_of(store, @data_key)
 
     assert S3EtagStore.meta_of(store, @data_key)[@md5_meta_key] == md5,
-           "the metadata survives the first (single→multipart) touch"
+           "the metadata survives the first touch (which also re-encodes the raw seed to zstd)"
 
-    # A second contender steals the now-multipart object — rotate flips it back via single_copy_touch.
+    # A second contender steals the now re-nonced object.
     Agent.update(store, fn s ->
       %{
         s
@@ -160,10 +167,10 @@ defmodule Fathom.Shard.Storage.S3StealTouchTest do
     end)
 
     assert {:ok, %{took_over: true}} = S3.acquire_lease(@shard, "third@node#inc3", 30_000)
-    refute S3EtagStore.etag_of(store, @data_key) =~ "-", "rotated back to single form"
+    refute S3EtagStore.etag_of(store, @data_key) == first_touch, "the second touch rotated too"
 
     assert S3EtagStore.meta_of(store, @data_key)[@md5_meta_key] == md5,
-           "the md5 metadata must ALSO survive the multipart→single touch"
+           "the md5 metadata must ALSO survive the second touch"
   end
 
   # Expert review #13: owner_live? compared this reader's LOCAL clock to the owner's stamped heartbeat

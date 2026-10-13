@@ -882,7 +882,7 @@ defmodule Fathom.Shard.Storage do
   `lease` annotated so the released marker it leaves records its steal-touch's provenance (expert
   review 2026-10-12 #10). ONLY for a CLEAN release — a holder that wrote nothing.
 
-  A steal rotates the data object's etag with a byte-identical self-copy (`touch_object`), so a
+  A steal rotates the data object's etag with a content-identical touch (`touch_object`), so a
   zombie's late `If-Match` PUT fails. The cost: the previous holder's local copy is stamped with the
   PRE-touch etag, and when it reopens later its fork check sees `sidecar != store` and quarantines
   its own acked copy as a fork — though only a touch happened. The marker carries `touched_from`

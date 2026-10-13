@@ -108,6 +108,57 @@ defmodule Fathom.Shard.Storage.S3FenceProbeTest do
     end
   end
 
+  # Expert review 2026-10-12 N1: a touch that MOVES the etag is not enough if a second touch
+  # moves it back — two steals then re-arm a zombie's If-Match on the first etag. This store
+  # enforces every conditional and rotates on every write, but its etag only ever alternates
+  # between two values (as the old copy-form touch did for identical bytes on a real store).
+  defp two_cycle_store(conn, agent) do
+    etag = fn n -> ~s("cycle-#{rem(n, 2)}") end
+    %{exists: exists?, writes: n} = Agent.get(agent, & &1)
+    if_match = Plug.Conn.get_req_header(conn, "if-match")
+    if_none_match = Plug.Conn.get_req_header(conn, "if-none-match")
+    matches? = exists? and if_match in [[], [etag.(n)]]
+
+    case conn.method do
+      "HEAD" when exists? ->
+        conn
+        |> Plug.Conn.put_resp_header("etag", etag.(n))
+        |> Plug.Conn.put_resp_header("content-length", "18")
+        |> Plug.Conn.send_resp(200, "")
+
+      "GET" when matches? ->
+        conn
+        |> Plug.Conn.put_resp_header("etag", etag.(n))
+        |> Plug.Conn.send_resp(200, "fathom-fence-probe")
+
+      "PUT" when if_none_match == ["*"] and exists? ->
+        Plug.Conn.send_resp(conn, 412, "")
+
+      "PUT" when if_match == [] or matches? ->
+        Agent.update(agent, &%{&1 | exists: true, writes: &1.writes + 1})
+        conn |> Plug.Conn.put_resp_header("etag", etag.(n + 1)) |> Plug.Conn.send_resp(200, "")
+
+      "DELETE" when matches? ->
+        Agent.update(agent, &%{&1 | exists: false})
+        Plug.Conn.send_resp(conn, 204, "")
+
+      "HEAD" ->
+        Plug.Conn.send_resp(conn, 404, "")
+
+      _ ->
+        Plug.Conn.send_resp(conn, 412, "")
+    end
+  end
+
+  test "refuses to boot against a store whose second touch returns to the first etag (N1)" do
+    agent = start_supervised!({Agent, fn -> %{exists: false, writes: 0} end})
+    put_s3_config(&two_cycle_store(&1, agent))
+
+    assert_raise RuntimeError, ~r/two NEW etags/, fn ->
+      S3.verify_conditional_writes!()
+    end
+  end
+
   test "fails closed when the store is unreachable" do
     put_s3_config(fn _conn -> raise "connection refused" end)
 

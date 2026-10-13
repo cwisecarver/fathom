@@ -7,13 +7,16 @@ defmodule Fathom.Shard.TouchProvenanceTest do
 
   Holder A fails its drop flush: it keeps its local copy (sidecar E0, acked-but-unflushed writes)
   and leaves a released marker (d80e554). Peer B's acquire steals the marker, and the steal's
-  `touch_object` rotates the data object E0 -> E1 with a byte-identical self-copy (the zombie-PUT
-  fence). B serves reads and drops CLEAN. When A reopens, its steal touches again. For
-  byte-identical copies S3's etag only alternates between the single-part and one-part-multipart
-  forms, so this second touch goes E1 -> E0, not to a fresh tag; this test therefore holds A's touch
-  until A's fork check has read the store. `Fork` sees sidecar E0 against store E1 with no touch of
-  A's own explaining E0: verdict
+  `touch_object` rotates the data object E0 -> E1 with a content-identical touch (the zombie-PUT
+  fence). B serves reads and drops CLEAN. When A reopens, its steal touches again, E1 -> E2.
+  `Fork` sees sidecar E0 against store E1 (or E2) with no touch of A's own explaining E0: verdict
   `:fork`. A's acked local copy is quarantined to `.forked.<ts>` and the OLDER stored object serves.
+
+  This test used to HOLD A's touch until A's fork check had read the store: the touch then
+  alternated copy forms, so A's second touch of identical bytes went E1 -> E0, and a fork check
+  that happened to read after it saw E0 == sidecar and said `:match` by luck. Since expert review
+  2026-10-12 N1 every touch reaches an etag the key never had, so that ordering no longer exists
+  and the hold — which was only a workaround for the 2-cycle — is gone.
 
   ## The fix being pinned
 
@@ -75,7 +78,7 @@ defmodule Fathom.Shard.TouchProvenanceTest do
     bytes
   end
 
-  defp use_s3!(store, plug \\ nil) do
+  defp use_s3!(store) do
     Application.put_env(:fathom, S3,
       bucket: "b",
       region: "us-east-1",
@@ -83,7 +86,7 @@ defmodule Fathom.Shard.TouchProvenanceTest do
       secret_access_key: "s",
       endpoint: "https://s3.example",
       path_style: true,
-      req_plug: plug || fn conn -> S3EtagStore.serve(conn, store) end
+      req_plug: fn conn -> S3EtagStore.serve(conn, store) end
     )
 
     Application.put_env(:fathom, :shard_storage, S3)
@@ -98,42 +101,6 @@ defmodule Fathom.Shard.TouchProvenanceTest do
 
   defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
   defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
-
-  defp gated_plug(store, gate, shard) do
-    key = "#{shard}.db"
-
-    fn conn ->
-      db? = String.ends_with?(conn.request_path, key)
-      copy? = Plug.Conn.get_req_header(conn, "x-amz-copy-source") != []
-
-      cond do
-        db? and conn.method == "HEAD" ->
-          Agent.update(gate, &%{&1 | heads: &1.heads + 1})
-
-        db? and copy? and Agent.get(gate, & &1.on) ->
-          await_heads(gate, 3, 200)
-
-        true ->
-          :ok
-      end
-
-      S3EtagStore.serve(conn, store)
-    end
-  end
-
-  # Bounded: a miscount only delays the copy (2 s), it never deadlocks the open.
-  defp await_heads(_gate, _n, 0), do: :ok
-
-  defp await_heads(gate, n, tries) do
-    if Agent.get(gate, & &1.heads) >= n do
-      :ok
-    else
-      receive do
-      after
-        10 -> await_heads(gate, n, tries - 1)
-      end
-    end
-  end
 
   defp lock(store, shard),
     do: store |> S3EtagStore.body_of("#{shard}.lock") |> Jason.decode!()
@@ -153,13 +120,7 @@ defmodule Fathom.Shard.TouchProvenanceTest do
            fn -> S3EtagStore.initial(%{"#{shard}.db" => base, "#{shard}.lock" => marker}) end}
         )
 
-      # ORDER A's open deterministically. Two byte-identical form-rotation touches restore the
-      # ORIGINAL MD5 etag (single -> multipart -> single), so if A's fork-evidence HEAD happened to
-      # read the store AFTER A's own touch it would see E0 again and say `:match` by luck. Hold A's
-      # touch copy until the open's three .db HEADs (fork evidence, takeover claim, touch source)
-      # have been served, so the evidence reads B's E1 — the case the fix must decide.
-      gate = start_supervised!({Agent, fn -> %{on: false, heads: 0} end}, id: :gate)
-      use_s3!(store, gated_plug(store, gate, shard))
+      use_s3!(store)
       set_mode!(unquote(mode))
       e0 = S3EtagStore.etag_of(store, "#{shard}.db")
 
@@ -193,7 +154,6 @@ defmodule Fathom.Shard.TouchProvenanceTest do
       assert body["touched_from"] == e0 and body["touched_to"] == e1
 
       # A reopens with its acked local copy.
-      Agent.update(gate, &%{&1 | on: true, heads: 0})
       local = Path.join(Shard.data_dir(), "#{shard}.db")
       File.mkdir_p!(Shard.data_dir())
       File.cp!(a_bytes, local)
@@ -212,7 +172,10 @@ defmodule Fathom.Shard.TouchProvenanceTest do
       end)
 
       assert Path.wildcard(local <> ".forked.*") == [],
-             "only a byte-identical touch happened since A's sidecar: that is not a fork"
+             "only content-identical touches happened since A's sidecar: that is not a fork"
+
+      refute S3EtagStore.etag_of(store, "#{shard}.db") in [e0, e1],
+             "A's touch must reach an etag the key never had (pre-N1 it returned to E0)"
     end
   end
 

@@ -1,10 +1,20 @@
 defmodule Fathom.Test.S3EtagStore do
   @moduledoc """
   A stateful `req_plug` double of an **MD5-etag** S3 store (round-2 #4): etags are
-  DERIVED FROM CONTENT exactly like real S3 — a single-form etag is `md5(body)`, a
-  one-part multipart etag is `md5(md5(body))-1`. A plain self-copy of identical
-  bytes therefore does NOT rotate the etag (the honest production behavior the
-  original shape-only stubs missed), while the alternating-form touch does.
+  DERIVED FROM CONTENT exactly like real S3 — a single-form etag is `md5(body)`, an
+  N-part multipart etag is `md5(md5(part1) <> ... <> md5(partN))-N`. A plain self-copy
+  of identical bytes therefore does NOT rotate the etag (the honest production behavior
+  the original shape-only stubs missed).
+
+  Multipart is modelled the way S3 does it, not the way one caller happens to use it
+  (expert review 2026-10-12 N1): parts are keyed by `partNumber`, `UploadPartCopy` honours
+  `x-amz-copy-source-range` (416 on a range outside the source), and Complete takes the
+  part list from its XML body, checks each listed part's etag, and refuses a non-last part
+  under 5 MiB with `EntityTooSmall`. The one-part-only model this replaced could not express
+  a boundary-split touch at all, so it could neither show that touch working nor failing.
+
+  HEAD reports `content-length` (the touch picks its path by object size), and GET honours
+  `If-Match` (the small-object touch reads the exact version it rewrites).
 
   Usage: `store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{"k.db" => "bytes"}) end})`
   then `req_plug: fn conn -> S3EtagStore.serve(conn, store) end`. Objects live under
@@ -100,7 +110,7 @@ defmodule Fathom.Test.S3EtagStore do
   end
 
   def serve(%Plug.Conn{} = conn, agent) do
-    {:ok, body, conn} = Plug.Conn.read_body(conn)
+    {:ok, body, conn} = read_full_body(conn, "")
     key = strip_bucket(conn.request_path)
     query = URI.decode_query(conn.query_string || "")
 
@@ -122,7 +132,7 @@ defmodule Fathom.Test.S3EtagStore do
         create_upload(conn, agent, key)
 
       conn.method == "POST" and Map.has_key?(query, "uploadId") ->
-        complete_upload(conn, agent, key, query["uploadId"])
+        complete_upload(conn, agent, key, query["uploadId"], body)
 
       conn.method == "PUT" and Map.has_key?(query, "uploadId") ->
         part_copy(conn, agent, key, query["uploadId"])
@@ -157,6 +167,7 @@ defmodule Fathom.Test.S3EtagStore do
       obj ->
         conn
         |> Plug.Conn.put_resp_header("etag", etag(obj))
+        |> Plug.Conn.put_resp_header("content-length", Integer.to_string(byte_size(obj.body)))
         |> put_meta_headers(obj)
         |> Plug.Conn.send_resp(200, "")
     end
@@ -165,6 +176,7 @@ defmodule Fathom.Test.S3EtagStore do
   defp get(conn, agent, key) do
     conn = put_date(conn, agent)
     if_none_match = Plug.Conn.get_req_header(conn, "if-none-match")
+    if_match = Plug.Conn.get_req_header(conn, "if-match")
 
     case Agent.get(agent, &Map.get(&1.objects, key)) do
       nil ->
@@ -178,6 +190,10 @@ defmodule Fathom.Test.S3EtagStore do
         # S3 side of that primitive was unreachable from `mix test`. Found by the shared storage
         # contract; it is the same one-backend blind spot as expert review 2026-08-01 #30.
         cond do
+          # S3 answers 412 when If-Match names a version other than the current one.
+          if_match != [] and hd(if_match) != etag(obj) ->
+            Plug.Conn.send_resp(conn, 412, "")
+
           if_none_match == ["*"] ->
             not_modified(conn, obj)
 
@@ -313,7 +329,7 @@ defmodule Fathom.Test.S3EtagStore do
          %{
            s
            | seq: s.seq + 1,
-             uploads: Map.put(s.uploads, id, %{key: key, body: nil, meta: meta})
+             uploads: Map.put(s.uploads, id, %{key: key, parts: %{}, meta: meta})
          }}
       end)
 
@@ -327,6 +343,8 @@ defmodule Fathom.Test.S3EtagStore do
   defp part_copy(conn, agent, _key, upload_id) do
     src_key = strip_bucket(copy_source(conn))
     src_if_match = Plug.Conn.get_req_header(conn, "x-amz-copy-source-if-match")
+    part_number = conn.query_string |> URI.decode_query() |> Map.get("partNumber", "1")
+    range = Plug.Conn.get_req_header(conn, "x-amz-copy-source-range")
 
     Agent.get_and_update(agent, fn s ->
       src = Map.get(s.objects, src_key)
@@ -339,9 +357,18 @@ defmodule Fathom.Test.S3EtagStore do
           {{412, nil}, s}
 
         true ->
-          part_etag = md5hex(src.body)
-          uploads = Map.update!(s.uploads, upload_id, &%{&1 | body: src.body})
-          {{200, part_etag}, %{s | uploads: uploads}}
+          case copy_range(src.body, range) do
+            {:ok, bytes} ->
+              uploads =
+                Map.update!(s.uploads, upload_id, fn up ->
+                  %{up | parts: Map.put(up.parts, String.to_integer(part_number), bytes)}
+                end)
+
+              {{200, md5hex(bytes)}, %{s | uploads: uploads}}
+
+            :invalid ->
+              {{416, nil}, s}
+          end
       end
     end)
     |> case do
@@ -357,21 +384,57 @@ defmodule Fathom.Test.S3EtagStore do
 
       {404, _} ->
         Plug.Conn.send_resp(conn, 404, "")
+
+      {416, _} ->
+        Plug.Conn.send_resp(conn, 416, "<Error><Code>InvalidRange</Code></Error>")
     end
   end
 
-  defp complete_upload(conn, agent, key, upload_id) do
+  # `x-amz-copy-source-range: bytes=first-last` (inclusive), which S3 requires to lie inside the
+  # source object. No header copies the whole source.
+  defp copy_range(body, []), do: {:ok, body}
+
+  defp copy_range(body, ["bytes=" <> spec]) do
+    with [a, b] <- String.split(spec, "-"),
+         {first, ""} <- Integer.parse(a),
+         {last, ""} <- Integer.parse(b),
+         true <- first >= 0 and last >= first and last < byte_size(body) do
+      {:ok, binary_part(body, first, last - first + 1)}
+    else
+      _ -> :invalid
+    end
+  end
+
+  defp copy_range(_body, _other), do: :invalid
+
+  # S3's minimum size for every part but the last.
+  @min_part 5 * 1024 * 1024
+
+  defp complete_upload(conn, agent, key, upload_id, req_body) do
+    listed = completed_parts(req_body)
+
     Agent.get_and_update(agent, fn s ->
       case Map.get(s.uploads, upload_id) do
-        %{body: body, meta: meta} when is_binary(body) ->
-          obj = %{body: body, form: :multipart, meta: meta}
+        %{parts: parts, meta: meta} ->
+          case assemble(listed, parts) do
+            {:ok, bodies} ->
+              obj = %{
+                body: IO.iodata_to_binary(bodies),
+                form: :multipart,
+                meta: meta,
+                parts: Enum.map(bodies, &:crypto.hash(:md5, &1))
+              }
 
-          {{200, etag(obj)},
-           %{
-             s
-             | objects: Map.put(s.objects, key, obj),
-               uploads: Map.delete(s.uploads, upload_id)
-           }}
+              {{200, etag(obj)},
+               %{
+                 s
+                 | objects: Map.put(s.objects, key, obj),
+                   uploads: Map.delete(s.uploads, upload_id)
+               }}
+
+            {:error, code} ->
+              {{400, code}, s}
+          end
 
         _ ->
           {{404, nil}, s}
@@ -385,8 +448,51 @@ defmodule Fathom.Test.S3EtagStore do
           "<CompleteMultipartUploadResult><ETag>&quot;#{String.trim(new_etag, ~s("))}&quot;</ETag></CompleteMultipartUploadResult>"
         )
 
+      {400, code} ->
+        Plug.Conn.send_resp(conn, 400, "<Error><Code>#{code}</Code></Error>")
+
       {404, _} ->
         Plug.Conn.send_resp(conn, 404, "")
+    end
+  end
+
+  # The `<Part><PartNumber>/<ETag>` list of a CompleteMultipartUpload body, parsed with OTP's xmerl.
+  defp completed_parts(xml) do
+    {doc, _} = xml |> to_charlist() |> :xmerl_scan.string(quiet: true)
+
+    for part <- :xmerl_xpath.string(~c"//Part", doc) do
+      [num] = :xmerl_xpath.string(~c"PartNumber/text()", part)
+      [tag] = :xmerl_xpath.string(~c"ETag/text()", part)
+
+      {num |> xml_text() |> String.trim() |> String.to_integer(),
+       tag |> xml_text() |> String.trim(~s("))}
+    end
+  end
+
+  defp xml_text(node), do: node |> elem(4) |> to_string()
+
+  # S3's Complete rules: listed parts ascend, each exists with the etag the caller names, and every
+  # part but the last is at least 5 MiB.
+  defp assemble([], _parts), do: {:error, "MalformedXML"}
+
+  defp assemble(listed, parts) do
+    numbers = Enum.map(listed, &elem(&1, 0))
+
+    cond do
+      numbers != Enum.sort(Enum.uniq(numbers)) ->
+        {:error, "InvalidPartOrder"}
+
+      Enum.any?(listed, fn {n, tag} ->
+        not Map.has_key?(parts, n) or md5hex(parts[n]) != tag
+      end) ->
+        {:error, "InvalidPart"}
+
+      true ->
+        bodies = Enum.map(listed, fn {n, _} -> parts[n] end)
+
+        if Enum.any?(Enum.drop(bodies, -1), &(byte_size(&1) < @min_part)),
+          do: {:error, "EntityTooSmall"},
+          else: {:ok, bodies}
     end
   end
 
@@ -452,8 +558,21 @@ defmodule Fathom.Test.S3EtagStore do
 
   defp etag(%{body: body, form: :single}), do: ~s(") <> md5hex(body) <> ~s(")
 
+  defp etag(%{form: :multipart, parts: parts}),
+    do: ~s(") <> md5hex(IO.iodata_to_binary(parts)) <> "-#{length(parts)}" <> ~s(")
+
+  # An object staged by hand as `form: :multipart` with no part list is a one-part upload.
   defp etag(%{body: body, form: :multipart}),
     do: ~s(") <> md5hex(:crypto.hash(:md5, body)) <> ~s(-1")
+
+  # `Plug.Conn.read_body/1` answers `{:more, ...}` past its default 8 MB, and the large-object
+  # touch tests PUT bodies of that order.
+  defp read_full_body(conn, acc) do
+    case Plug.Conn.read_body(conn) do
+      {:ok, chunk, conn} -> {:ok, acc <> chunk, conn}
+      {:more, chunk, conn} -> read_full_body(conn, acc <> chunk)
+    end
+  end
 
   defp md5hex(data), do: Base.encode16(:crypto.hash(:md5, data), case: :lower)
 

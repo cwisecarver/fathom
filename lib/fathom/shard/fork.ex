@@ -153,8 +153,9 @@ defmodule Fathom.Shard.Fork do
   def resolve({:diverged, sidecar, store}, shard_id, path, lease) do
     # OUR OWN steal-touch, not a fork. Both halves are required: the touch SOURCED this file's
     # provenance (`pre == sidecar`, so the local bytes are the lineage the touch copied) and the
-    # store now holds exactly that touch's output (`post == store`). A self-copy moves no bytes, so
-    # the warm copy is still correct — this is the same argument `revalidate_touched/5`'s warm
+    # store now holds exactly that touch's output (`post == store`). A touch changes no database
+    # content (only the stored nonce/part layout, expert review 2026-10-12 N1), so the warm copy is
+    # still correct — this is the same argument `revalidate_touched/5`'s warm
     # branch already makes before adopting `post`.
     #
     # Anything else is a real fork. In particular the zombie-flush race (B2) is NOT captured here:
