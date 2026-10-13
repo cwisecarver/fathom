@@ -1070,6 +1070,168 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert {:ok, %{from: 2, to: 1}} = ShardMigration.revert(shard, 1)
   end
 
+  # Expert review 2026-10-12 #13: the guard's inputs are all in the directory row, yet an unforced
+  # revert used to drain the live coordinator, take the lease and pull the object BEFORE refusing -
+  # hourly, for every stranded shard (`revert_stranded`). The invariant pinned: a revert the guard
+  # will refuse touches nothing - the running coordinator is not drained (same pid, still serving).
+  test "an unforced revert the guard refuses does not drain the live coordinator", %{shard: shard} do
+    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
+    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+
+    on_exit(fn ->
+      if is_nil(prev_idle),
+        do: Application.delete_env(:fathom, :shard_idle_ms),
+        else: Application.put_env(:fathom, :shard_idle_ms, prev_idle)
+    end)
+
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, _} = ShardMigration.run(shard, 2)
+
+    # Tenant traffic after the cutover: opens a coordinator and bumps last_active_at.
+    {:ok, pid, ref, _path} = Fathom.Shards.checkout(shard)
+    Fathom.Shard.checkin(pid, ref)
+    :ok = Fathom.Directory.Recorder.record(shard)
+
+    assert {:error, {:writes_since_cutover, _}} = ShardMigration.revert(shard, 1)
+
+    assert [{^pid, _}] = Registry.lookup(Fathom.ShardRegistry, shard),
+           "a refused revert drained the live coordinator before checking the guard"
+
+    # The completed-revert no-op must survive the pre-flight: after a forced revert the row is at
+    # to_version, so a retry answers :ok even though the tenant has been active since.
+    assert {:ok, %{from: 2, to: 1}} = ShardMigration.revert(shard, 1, "force-token", force: true)
+    :ok = Fathom.Directory.Recorder.record(shard)
+    assert :ok = ShardMigration.revert(shard, 1, "retry-token")
+  end
+
+  # Expert review 2026-10-12 #13 (sweep half): `revert_stranded/0` runs hourly and unforced; every
+  # job for a shard the guard refuses cancelled and rescheduled the landing version's retirement
+  # (pushing it 7 days out each hour). The sweep must not enqueue what the guard will refuse.
+  test "revert_stranded skips shards the write-age guard would refuse", %{shard: shard} do
+    seed_v1!(shard)
+
+    # HEAD must be non-zero after the yank, or revert_stranded returns {:ok, 0} for the wrong reason.
+    {:ok, _} = Migrator.release(1, "initial", ["SELECT 1"])
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, _} = ShardMigration.run(shard, 2)
+    :ok = Migrator.yank(2)
+    assert Migrator.head() == 1
+
+    {:ok, _} = Directory.resolve(shard)
+
+    assert {:ok, 0} = Migrator.revert_stranded()
+
+    refute_enqueued(worker: Fathom.Migrator.RevertJob, args: %{"shard_id" => shard})
+
+    # Control: a quiet stranded shard IS enqueued (the filter is not simply dropping everything).
+    {1, _} =
+      Repo.update_all(
+        from(s in Fathom.Directory.Shard, where: s.shard_id == ^shard),
+        set: [last_active_at: DateTime.utc_now() |> DateTime.add(-3600)]
+      )
+
+    {1, _} =
+      Repo.update_all(
+        from(s in Fathom.Directory.Shard, where: s.shard_id == ^shard),
+        set: [cutover_at: DateTime.utc_now() |> DateTime.add(-3600)]
+      )
+
+    assert {:ok, 1} = Migrator.revert_stranded()
+    assert_enqueued(worker: Fathom.Migrator.RevertJob, args: %{"shard_id" => shard})
+  end
+
+  # Expert review 2026-10-12 #35: the Recorder flush had a 5 s call timeout over an unbounded
+  # flush, and the caller swallowed the exit and went on with a directory the Recorder had not
+  # finished writing. A flush that cannot be confirmed must make the write-age UNKNOWN, so an
+  # unforced revert of a (here quiet) shard is refused, and force still proceeds.
+  test "an unconfirmed recorder flush refuses an unforced revert (write-age unknown)",
+       %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, _} = ShardMigration.run(shard, 2)
+
+    Application.put_env(:fathom, :recorder_flush_timeout_ms, 50)
+    recorder = Process.whereis(Fathom.Directory.Recorder)
+    :ok = :sys.suspend(recorder)
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :recorder_flush_timeout_ms)
+      if Process.alive?(recorder), do: :sys.resume(recorder)
+    end)
+
+    assert {:error, {:unknown_write_age, _}} = ShardMigration.revert(shard, 1)
+    assert %{rows: [[2]]} = query_live!(shard, "PRAGMA user_version")
+    refute retained?(shard, 2), "a refused revert must not touch storage"
+
+    :ok = :sys.resume(recorder)
+    Application.delete_env(:fathom, :recorder_flush_timeout_ms)
+    assert {:ok, %{from: 2, to: 1}} = ShardMigration.revert(shard, 1)
+  end
+
+  # Expert review 2026-10-12 #14 (the local-node form of efa1d05 / #23): the migrator ran on the
+  # tenant's home node, drained it locally, and any request before its conditional lease PUT
+  # re-opened the shard and re-took the lease, so a hot tenant read `held` and snoozed forever.
+  # The race window is made deterministic by acting AT the migrator's acquire (the FaultyStorage
+  # `:faulty_before` hook fires on the migrator's own process, right before the PUT): a tenant
+  # request lands there. The invariant pinned: that request cannot re-take the lease ahead of the
+  # migrator, and the gate does not outlive the attempt.
+  test "a request landing between the local drain and the lease acquire cannot win it",
+       %{shard: shard} do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+
+      if is_nil(prev_storage),
+        do: Application.delete_env(:fathom, :shard_storage),
+        else: Application.put_env(:fathom, :shard_storage, prev_storage)
+    end)
+
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+
+    migrator = self()
+    test_pid = self()
+
+    Application.put_env(:fathom, :faulty_before, {
+      :acquire,
+      fn ->
+        # Only the migrator's own acquire (a coordinator's runs in another process), once.
+        if self() == migrator and Process.get(:raced) != true do
+          Process.put(:raced, true)
+
+          outcome =
+            case Fathom.Shards.checkout(shard) do
+              {:ok, pid, ref, _} ->
+                Fathom.Shard.checkin(pid, ref)
+                :opened
+
+              {:error, reason} ->
+                reason
+            end
+
+          send(test_pid, {:racer, outcome})
+        end
+
+        :ok
+      end
+    })
+
+    result = ShardMigration.run(shard, 2)
+
+    assert_received {:racer, outcome}
+
+    assert outcome == {:shard_migrating, :drained_for_migration},
+           "the racing request re-opened the drained shard (got #{inspect(outcome)})"
+
+    assert {:ok, _} = result,
+           "the migrator lost the lease to a request landing after its own drain: #{inspect(result)}"
+
+    refute Fathom.Shards.MigrationGate.closed?(shard), "the gate outlived the migration attempt"
+  end
+
   # A row with no cutover stamp (predates the cutover_at column, or the directory lost it) has
   # an UNKNOWN write-age — fail closed and make the operator confirm, rather than assuming
   # "no writes" on missing data.

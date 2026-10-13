@@ -28,6 +28,7 @@ defmodule Fathom.Migrator.ShardMigration do
   alias Fathom.Migrator.{Copy, Ledger, RetirementJob}
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.{Directory, Migrator, Repo, Shards}
+  alias Fathom.Shards.MigrationGate
 
   @doc """
   Brings `shard_id` to `target` (a no-op if it is already there). `token` uniquely identifies
@@ -113,15 +114,19 @@ defmodule Fathom.Migrator.ShardMigration do
   def revert(shard_id, to_version, token \\ make_token(), opts \\ []) do
     force? = Keyword.get(opts, :force, false)
 
+    with :ok <- preflight_write_age(shard_id, to_version, force?) do
+      revert_under_lease(shard_id, to_version, token, force?)
+    end
+  end
+
+  defp revert_under_lease(shard_id, to_version, token, force?) do
     with_lease(shard_id, token, fn lease ->
       # Push this node's buffered directory touches down before reading the guard's
       # inputs (expert review #11): a checkout sitting in the Recorder's ≤1s buffer is
       # otherwise invisible to the write-age guard, letting an unforced revert discard
       # real post-cutover activity. Best-effort and node-local — another node's buffer
       # can still lag; the guard remains the safe-direction approximation it documents.
-      flush_recorder()
-
-      {current, last_active, cutover_at} = current_state(shard_id)
+      {current, last_active, cutover_at} = guard_inputs(shard_id)
       tmp = temp_path(shard_id, "revert")
 
       try do
@@ -394,7 +399,30 @@ defmodule Fathom.Migrator.ShardMigration do
 
   # --- lease orchestration ---
 
+  # Expert review 2026-10-12 #14 (the local-node form of efa1d05's #23): when the holder is THIS
+  # node, `Shards.drain` stops the coordinator and the LB keeps routing the tenant here, so on a hot
+  # tenant the next request re-opened the shard and re-took the lease before the conditional PUT
+  # below, every attempt (a `{:retry, {:held, _}}` snooze of up to 60 s, then the same again). The
+  # command poller closes `MigrationGate` for the remote form; do the same around the local drain,
+  # and lift it on EVERY exit: the lease is ours (or the attempt is over) by then, and a lingering
+  # gate would refuse the tenant for no reason. Keyed by the canonical id, like the gate's reader.
   defp with_lease(shard_id, token, fun) do
+    gate_id =
+      case Fathom.ShardId.cast(shard_id) do
+        {:ok, canonical} -> canonical
+        :error -> shard_id
+      end
+
+    MigrationGate.close(gate_id)
+
+    try do
+      drain_and_hold(shard_id, gate_id, token, fun)
+    after
+      MigrationGate.open(gate_id)
+    end
+  end
+
+  defp drain_and_hold(shard_id, gate_id, token, fun) do
     case Shards.drain(shard_id) do
       :ok ->
         hold_lease(shard_id, token, fun)
@@ -404,8 +432,10 @@ defmodule Fathom.Migrator.ShardMigration do
 
       # The stop kept a local copy its flush could not make durable (expert review 2026-10-08 #4).
       # Migrating now would copy the STALE stored object. Try to make the copy durable (`flush/1`
-      # re-opens and flushes it) and retry; the retry's drain then stops a clean coordinator.
+      # re-opens and flushes it) and retry; the retry's drain then stops a clean coordinator. The
+      # gate is lifted first: that re-open is ours, and a closed gate would refuse it forever.
       {:error, :unflushed_local_copy} ->
+        MigrationGate.open(gate_id)
         _ = Shards.flush(shard_id)
         {:retry, :unflushed_local_copy}
 
@@ -1107,10 +1137,45 @@ defmodule Fathom.Migrator.ShardMigration do
   # Synchronous recorder flush, tolerant of the recorder being down (a control-plane
   # blip must not turn a revert into a crash — the guard then just sees the directory
   # as-is, no worse than before).
+  #
+  # Returns `:ok` or `:unknown` (expert review 2026-10-12 #35): a flush that timed out or hit a
+  # down Recorder means the guard's inputs may lag the tenant's real activity, so the caller must
+  # treat the write-age as UNKNOWN (refuse an unforced revert) rather than read a stale row.
   defp flush_recorder do
-    Fathom.Directory.Recorder.flush()
+    _ = Fathom.Directory.Recorder.flush()
+    :ok
   catch
-    :exit, _ -> 0
+    :exit, _ -> :unknown
+  end
+
+  # The guard's inputs, read AFTER a recorder flush; an unconfirmed flush blanks `last_active` so
+  # `write_age_guard/4` fails closed with `:unknown_write_age`.
+  defp guard_inputs(shard_id) do
+    flushed = flush_recorder()
+    {current, last_active, cutover_at} = current_state(shard_id)
+    {current, if(flushed == :ok, do: last_active), cutover_at}
+  end
+
+  # Pre-flight for `revert/4` (expert review 2026-10-12 #13): the write-age guard's inputs all come
+  # from the directory row, so a refusal needs no lease. Evaluated before `with_lease`, an unforced
+  # revert of a shard that has been used since cutover no longer drains it, takes its lease and
+  # pulls it before refusing (hourly, for every stranded shard, via `revert_stranded`). The
+  # under-lease re-check in `do_revert/9` stays: the row can change between here and the lease.
+  # A row already at `to_version` is the completed-revert no-op (a crashed-after-cutover retry);
+  # it must still answer `:ok`, not be refused for activity that followed the revert.
+  # Cost: a crash-forward retry (live already restored, directory still at the old version) whose
+  # shard saw traffic since is refused here, where the in-lease path would finish it; force: true
+  # finishes it, and that state needs a crash between restore and cutover.
+  defp preflight_write_age(_shard_id, _to_version, true), do: :ok
+
+  defp preflight_write_age(shard_id, to_version, false) do
+    case guard_inputs(shard_id) do
+      {^to_version, _, _} ->
+        :ok
+
+      {_current, last_active, cutover_at} ->
+        write_age_guard(shard_id, last_active, cutover_at, false)
+    end
   end
 
   # Per-operation lease owner so a forward and a revert on the same shard can't be merged by the

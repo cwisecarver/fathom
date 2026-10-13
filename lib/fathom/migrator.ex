@@ -783,7 +783,7 @@ defmodule Fathom.Migrator do
 
         count =
           Enum.reduce(yanked_above, 0, fn version, acc ->
-            {:ok, n} = revert(version, head, yank: false)
+            {:ok, n} = revert(version, head, yank: false, skip_guarded: true)
             acc + n
           end)
 
@@ -1253,7 +1253,9 @@ defmodule Fathom.Migrator do
       {:error, :force_revert_requires_yank}
     else
       if yank?, do: yank(from_version)
-      {:ok, revert_pages(from_version, to_version, force?)}
+
+      {:ok,
+       revert_pages(from_version, to_version, force?, Keyword.get(opts, :skip_guarded, false))}
     end
   end
 
@@ -1262,10 +1264,17 @@ defmodule Fathom.Migrator do
   # memory). Process each page independently so a page's jobs commit and start reverting before
   # the next page is fetched (the emergency path wants shards reverting ASAP, not after a
   # full-fleet scan). Per page: upgrade in-flight jobs (force), then enqueue the rest.
-  defp revert_pages(from_version, to_version, force?) do
+  #
+  # `skip_guarded?` (expert review 2026-10-12 #13; only the unforced reconcile sweep sets it) drops
+  # shards whose directory row the write-age guard would refuse. Their RevertJob would cancel, but
+  # only after cancelling and rescheduling the landing version's retirement, which pushed the
+  # retained copy's retirement out another 7 days every hour. They stay counted in `above_head`.
+  defp revert_pages(from_version, to_version, force?, skip_guarded?) do
     Directory.stream_ids_at_version(from_version, @enqueue_chunk)
     |> Stream.chunk_every(@enqueue_chunk)
     |> Enum.reduce(0, fn ids, acc ->
+      ids = if skip_guarded? and not force?, do: Directory.ids_passing_write_age(ids), else: ids
+
       # Expert review #23: the per-shard dedup in enqueue_unique ignores `force`, so in the
       # intended operator flow — non-force sweep, guard cancels some shards, re-issue with
       # force: true — any shard whose first RevertJob was still in flight (snoozing on

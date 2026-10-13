@@ -596,6 +596,11 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
       test_pid = self()
       handler = "revert-stalled-#{shard}"
 
+      # A realistic row: stamped by a cutover and quiet since. Without it (cutover_at nil) the
+      # revert's pre-flight write-age guard (expert review 2026-10-12 #13) refuses before the
+      # held-lease deferral this test exercises, just as the chain pre-flight does for a forward job.
+      {:ok, _} = Directory.cutover(shard, 1)
+
       :telemetry.attach(
         handler,
         [:fathom, :migrator, :migration_stalled],

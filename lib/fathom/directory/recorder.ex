@@ -95,7 +95,13 @@ defmodule Fathom.Directory.Recorder do
   path. The periodic timer does the same work in the background.
   """
   @spec flush() :: non_neg_integer()
-  def flush, do: GenServer.call(__MODULE__, :flush)
+  def flush, do: GenServer.call(__MODULE__, :flush, flush_timeout_ms())
+
+  # The flush is a Postgres write over an unbounded buffer, so the default 5 s call timeout could
+  # expire mid-flush under load (expert review 2026-10-12 #35), and the revert guard's caller then
+  # read a directory the Recorder had not finished writing. `:recorder_flush_timeout_ms` is the
+  # test seam for exercising that timeout.
+  defp flush_timeout_ms, do: Application.get_env(:fathom, :recorder_flush_timeout_ms, 60_000)
 
   @doc false
   # Test seam (expert review 2026-10-12 #8): `node_clock_us:` replaces this node's clock reading

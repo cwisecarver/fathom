@@ -1179,6 +1179,28 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  The subset of `ids` whose row passes the revert write-age guard: a cutover stamp exists and
+  `last_active_at` is not past it, i.e. an unforced revert would not be refused
+  (`ShardMigration`'s `write_age_guard/4`; expert review 2026-10-12 #13). `Migrator.revert_stranded/0`
+  uses it to skip shards the guard would refuse, rather than enqueue a job that cancels each hour.
+  Reads the row as stored (an unflushed Recorder touch only makes it under-refuse, the safe
+  direction: the job's own pre-flight flushes first).
+  """
+  @spec ids_passing_write_age([String.t()]) :: [String.t()]
+  def ids_passing_write_age([]), do: []
+
+  def ids_passing_write_age(ids) do
+    Repo.all(
+      from(s in Shard,
+        where:
+          s.shard_id in ^ids and not is_nil(s.cutover_at) and not is_nil(s.last_active_at) and
+            s.last_active_at <= s.cutover_at,
+        select: s.shard_id
+      )
+    )
+  end
+
+  @doc """
   How many shards are quarantined (`migration_failed` — set when a forward migration
   or a revert exhausts its attempts). A gauge next to `count_laggards/1` so quarantine
   growth is observable instead of silently accumulating (expert review #24).
