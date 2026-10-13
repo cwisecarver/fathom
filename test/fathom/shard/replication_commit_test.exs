@@ -287,8 +287,22 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     start_supervised!(Fleet)
 
     owner = "n_#{System.unique_integer([:positive])}@test"
-    hb = start_supervised!({Fathom.Shard.Heartbeat, ttl_ms: 30_000, owner: owner})
+    # :temporary so the #23 tests can kill it and have it STAY down.
+    hb =
+      start_supervised!(
+        Supervisor.child_spec({Fathom.Shard.Heartbeat, ttl_ms: 30_000, owner: owner},
+          restart: :temporary
+        )
+      )
+
     _ = :sys.get_state(hb)
+    # A killed Heartbeat leaves its last deadline behind; reset it for later tests.
+    on_exit(fn ->
+      case :persistent_term.get({Fathom.Shard.Heartbeat, :last_deadline_ref}, nil) do
+        nil -> :ok
+        ref -> :atomics.put(ref, 1, -9_223_372_036_854_775_808)
+      end
+    end)
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
@@ -367,6 +381,72 @@ defmodule Fathom.Shard.ReplicationCommitTest do
 
       assert {:error, :ownership_unconfirmed} = result,
              "an unreachable coordinator was read as legacy mode and the write acked durable"
+    end
+  end
+
+  describe "Session robustness (expert review 2026-10-12 #11, #23)" do
+    # #11 symptom: a coordinator busy past the call timeout made `with_epoch/1` EXIT inside the
+    # Session, crashing it (full rebuild + reseed of every follower). The commit must be refused
+    # retryably and the Session pid must survive, caching nothing.
+    @tag timeout: 60_000
+    test "an epoch call that times out refuses the commit and the Session survives", ctx do
+      Application.put_env(:fathom, :replication_timeout_ms, 15_000)
+      on_exit(fn -> Application.delete_env(:fathom, :replication_timeout_ms) end)
+
+      %{id: id, coordinator: coordinator, conn: conn, wal: wal} = heartbeat_session!(ctx)
+      # Drop the Session heartbeat_session! warmed, so the next commit has no cached epoch.
+      Session.stop(id)
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
+
+      :ok = :sys.suspend(coordinator)
+      on_exit(fn -> if Process.alive?(coordinator), do: :sys.resume(coordinator) end)
+
+      assert {:error, :coordinator_busy} = Session.commit(id, wal, coordinator)
+
+      [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+      assert Process.alive?(session), "the Session crashed on the epoch call exit"
+      assert :sys.get_state(session).epoch == nil, "a failed read must cache nothing"
+
+      :ok = :sys.resume(coordinator)
+      assert :ok = Session.commit(id, wal, coordinator)
+
+      assert [{^session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id),
+             "the retry must reuse the surviving Session"
+    end
+
+    # #23 symptom: with the Heartbeat process DOWN, `heartbeat_ok` read the exit as `:ok`, so a
+    # crash loop that renews nothing left commit acks ungated while peers could steal.
+    test "a down Heartbeat past its last good deadline refuses the ack", ctx do
+      %{id: id, coordinator: coordinator, conn: conn, wal: wal, hb: hb} = heartbeat_session!(ctx)
+
+      :sys.replace_state(hb, fn s ->
+        Fathom.Shard.Heartbeat.publish_status(%{
+          s
+          | mono_deadline_ms: System.monotonic_time(:millisecond) - 1
+        })
+      end)
+
+      ref = Process.monitor(hb)
+      Process.exit(hb, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^hb, :killed}
+      refute Fathom.Shard.Heartbeat.running?()
+
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
+
+      assert {:error, :ownership_unconfirmed} = Session.commit(id, wal, coordinator),
+             "a dead Heartbeat past its last good deadline was read as ownership confirmed"
+    end
+
+    test "a down Heartbeat before its last good deadline still degrades to an ack", ctx do
+      %{id: id, coordinator: coordinator, conn: conn, wal: wal, hb: hb} = heartbeat_session!(ctx)
+
+      ref = Process.monitor(hb)
+      Process.exit(hb, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^hb, :killed}
+
+      assert is_integer(Fathom.Shard.Heartbeat.last_deadline_ms())
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
+      assert :ok = Session.commit(id, wal, coordinator)
     end
   end
 

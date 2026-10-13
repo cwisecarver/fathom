@@ -577,31 +577,42 @@ defmodule Fathom.Shard.Replication.Session do
       # carries the monotonic lineage. A seed ships both. Read here rather than at seed time so it
       # costs one call per session, on the path that already pays one.
       {:ok, epoch} ->
-        {:ok,
-         %{state | epoch: epoch, lineage: lineage_of(state), acquire_gen: acquire_gen_of(state)}}
+        # All three reads are cached for the session's life, so none may cache a guess. A
+        # coordinator that does not answer in time (busy in `await_closing`, or in an inline S3
+        # HEAD) yields NOTHING cached: lineage 0 would silently disarm the follower lineage fence and
+        # promote ranking, and a nil `acquire_gen` would silently drop the ack gate to legacy
+        # (expert review 2026-10-12 #11). The commit is refused retryably; the next one re-reads.
+        with {:ok, lineage} <- lineage_of(state),
+             {:ok, acquire_gen} <- acquire_gen_of(state) do
+          {:ok, %{state | epoch: epoch, lineage: lineage, acquire_gen: acquire_gen}}
+        end
 
       {:error, reason} ->
         {:error, reason}
     end
+  catch
+    # A coordinator busy past the call timeout used to exit HERE, crashing the Session (a full
+    # rebuild and reseed of the shard's followers) for what is a transient (expert review
+    # 2026-10-12 #11). `{:error, _}` is the retryable-503 shape the commit path already returns.
+    :exit, _ -> {:error, :coordinator_busy}
   end
 
-  # Never fails the session: a coordinator that cannot state a lineage sends 0 ("no claim"), which
-  # `Promote.fresher?/2` refuses to rank rather than guessing. Losing promotion is the correct
-  # degradation; refusing to replicate would not be.
+  # An exit is "unknown", NOT lineage 0 ("no claim"): the caller refuses the commit and caches
+  # nothing, so the next commit re-reads (expert review 2026-10-12 #11).
   defp lineage_of(state) do
-    Fathom.Shard.lineage(state.coordinator)
+    {:ok, Fathom.Shard.lineage(state.coordinator)}
   catch
-    :exit, _ -> 0
+    :exit, _ -> {:error, :lineage_unknown}
   end
 
   # The coordinator's fence generation, read once and cached beside `epoch` (expert review
-  # 2026-09-05 #5). `nil` in legacy mode (no heartbeat), which leaves the ack ungated. A dead
-  # coordinator would already have failed `with_epoch/1` above, so this only runs on a live one; the
-  # catch is belt-and-suspenders and degrades to legacy rather than crashing the commit.
+  # 2026-09-05 #5). `nil` in legacy mode (no heartbeat), which leaves the ack ungated. An exit is NOT
+  # legacy: caching nil for a busy coordinator would drop the ack gate for the session's life, so it
+  # is surfaced and the commit refused (expert review 2026-10-12 #11).
   defp acquire_gen_of(state) do
-    Fathom.Shard.acquire_gen(state.coordinator)
+    {:ok, Fathom.Shard.acquire_gen(state.coordinator)}
   catch
-    :exit, _ -> nil
+    :exit, _ -> {:error, :coordinator_busy}
   end
 
   # Gate a quorum-durable commit ack on confirmed ownership (expert review 2026-09-05 #5).
@@ -697,14 +708,22 @@ defmodule Fathom.Shard.Replication.Session do
     :exit, _ -> :unreachable
   end
 
-  # A dead heartbeat process must degrade, not crash the commit — mirrors `Fathom.Shard`'s
-  # `heartbeat_recheck/1`. When the heartbeat is down the coordinator's flush fence has already
-  # degraded to the legacy renew PUT, which IS the ownership proof in that mode, so acking here is
-  # the same safe direction.
+  # A dead heartbeat process degrades only while its LAST GOOD deadline has not passed. Past it the
+  # lease may be stealable and nothing is renewing it (a crash loop renews nothing), so the ack is
+  # refused (expert review 2026-10-12 #23). The coordinator's flush fence degrades to the legacy
+  # renew PUT, but that proves ownership only on flush ticks, not per commit. No recorded deadline
+  # (never published) keeps the old `:ok`.
   defp heartbeat_ok(gen) do
     Fathom.Shard.Heartbeat.valid_for_write?(gen)
   catch
-    :exit, _ -> :ok
+    :exit, _ ->
+      case Fathom.Shard.Heartbeat.last_deadline_ms() do
+        deadline when is_integer(deadline) ->
+          if System.monotonic_time(:millisecond) > deadline, do: :not_valid, else: :ok
+
+        nil ->
+          :ok
+      end
   end
 
   # The monotone ordinal for the WAL identified by `salt`, cached against that salt.

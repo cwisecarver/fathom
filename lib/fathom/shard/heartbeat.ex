@@ -115,6 +115,41 @@ defmodule Fathom.Shard.Heartbeat do
   # busy. The named table dies with the process, so "table absent" still means
   # "heartbeat down" and the callers' legacy fallback semantics are unchanged.
   @status_table __MODULE__.Status
+  @last_deadline_key {__MODULE__, :last_deadline_ref}
+  @no_deadline -9_223_372_036_854_775_808
+
+  @doc """
+  The last renewal deadline (monotonic ms) this node's heartbeat ever published, or `nil`. Read-only;
+  outlives a crashed Heartbeat process, cleared on a clean stop.
+  """
+  @spec last_deadline_ms() :: integer() | nil
+  def last_deadline_ms do
+    case :persistent_term.get(@last_deadline_key, nil) do
+      nil ->
+        nil
+
+      ref ->
+        case :atomics.get(ref, 1) do
+          @no_deadline -> nil
+          ms -> ms
+        end
+    end
+  end
+
+  # One signed atomic, created once and never replaced: `persistent_term.put` of a CHANGED value
+  # triggers a global scan, so the ref is stored once and the deadline moves with `:atomics.put`.
+  defp deadline_ref do
+    case :persistent_term.get(@last_deadline_key, nil) do
+      nil ->
+        ref = :atomics.new(1, signed: true)
+        :atomics.put(ref, 1, @no_deadline)
+        :persistent_term.put(@last_deadline_key, ref)
+        ref
+
+      ref ->
+        ref
+    end
+  end
 
   @doc "Current lapse generation; a coordinator records this when it acquires a shard."
   @spec generation() :: non_neg_integer()
@@ -181,6 +216,13 @@ defmodule Fathom.Shard.Heartbeat do
   # can keep the published view in sync with the state they forged.
   @doc false
   def publish_status(state) do
+    # Survives this process (the ETS table does not): the last deadline a renewal confirmed, so a
+    # reader that finds the heartbeat DOWN can still tell "lease provably still ours" from "lease
+    # may be stealable and nothing is renewing it" (expert review 2026-10-12 #23). Never cleared by
+    # a nil publish (a restart's initial row), only by a clean stop.
+    if is_integer(state.mono_deadline_ms),
+      do: :atomics.put(deadline_ref(), 1, state.mono_deadline_ms)
+
     :ets.insert(
       @status_table,
       {:status, state.generation, state.mono_deadline_ms, state.margin_ms}
@@ -350,11 +392,13 @@ defmodule Fathom.Shard.Heartbeat do
     # Clean shutdown: drop our heartbeat so this node's shards are immediately
     # stealable (fast planned-failover) rather than waiting out the TTL.
     Storage.clear_heartbeat(state.owner)
+    :atomics.put(deadline_ref(), 1, @no_deadline)
     :ok
   end
 
   def terminate({:shutdown, _}, state) do
     Storage.clear_heartbeat(state.owner)
+    :atomics.put(deadline_ref(), 1, @no_deadline)
     :ok
   end
 
