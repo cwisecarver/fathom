@@ -1453,8 +1453,13 @@ defmodule Fathom.Shard.Storage do
   # the cost expert review #36 removed from the shipper budget for the same reason.
   @quiescence_table __MODULE__.Quiescence
 
+  # Lookup-only: a missing table reads as "no sample", which can only delay the fast path, never
+  # take it early. The table is created once at boot by `init_quiescence_table/0`, under a
+  # long-lived owner. It used to be created lazily by whichever coordinator asked first, so the
+  # table died with that coordinator on a crash-restart and no sample ever aged to `:quiescent`
+  # (expert review 2026-10-12 #17).
   defp quiescence_state(owner) do
-    case :ets.lookup(quiescence_table(), owner) do
+    case :ets.lookup(@quiescence_table, owner) do
       [{^owner, state}] -> state
       _ -> nil
     end
@@ -1463,32 +1468,27 @@ defmodule Fathom.Shard.Storage do
   end
 
   defp put_quiescence(owner, state) do
-    :ets.insert(quiescence_table(), {owner, state})
+    :ets.insert(@quiescence_table, {owner, state})
     :ok
   rescue
     ArgumentError -> :ok
   end
 
-  # `:ets.whereis/1` answers `:undefined`, not nil, when the table is absent — the `||` idiom
-  # dialyzer rejects. Created lazily and owned by whichever process asks first: this table is a
-  # CACHE of a re-derivable observation, so losing it costs one extra probe window, never
-  # correctness. That is why it does not need a supervised owner the way the shipper budget does.
-  defp quiescence_table do
-    case :ets.whereis(@quiescence_table) do
-      :undefined ->
-        :ets.new(@quiescence_table, [:named_table, :public, :set, read_concurrency: true])
-
-      _ ->
-        :ok
-    end
-
-    @quiescence_table
+  # Owned by the caller of this function, so it must be a long-lived process (the boot owner,
+  # `Fathom.Shard.Storage.HeartbeatCache`). Idempotent: a second call finds the table and returns.
+  @doc false
+  @spec init_quiescence_table() :: :ok
+  def init_quiescence_table do
+    :ets.new(@quiescence_table, [:named_table, :public, :set, read_concurrency: true])
+    :ok
+  rescue
+    ArgumentError -> :ok
   end
 
   @doc false
   @spec reset_quiescence() :: :ok
   def reset_quiescence do
-    :ets.delete_all_objects(quiescence_table())
+    :ets.delete_all_objects(@quiescence_table)
     :ok
   rescue
     ArgumentError -> :ok

@@ -69,6 +69,11 @@ defmodule Fathom.Shard.Storage.HeartbeatCache do
   @impl true
   def init(_opts) do
     :ets.new(@table, [:set, :public, :named_table, write_concurrency: true])
+    # Boot owner of the steal-path quiescence table (expert review 2026-10-12 #17). It was created
+    # lazily by whichever coordinator touched it first and died with that coordinator. This is the
+    # right owner because it is the one always-on process on the S3 steal path: Fleet is started only
+    # when replication is on, and Heartbeat is disabled in test.
+    :ok = Fathom.Shard.Storage.init_quiescence_table()
     {:ok, %{}}
   end
 end

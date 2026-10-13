@@ -161,4 +161,54 @@ defmodule Fathom.Shard.Storage.IncarnationQuiescenceTest do
                "round-2 #34 removed"
     end
   end
+
+  # expert review 2026-10-12 #17. The quiescence table used to be created lazily by whichever
+  # process asked first. After a restart, each open ended in a short-lived coordinator, and that
+  # coordinator's exit deleted the table with every sample in it, so no sample ever reached
+  # `:quiescent` and the fast steal never happened. The table must outlive the process that
+  # recorded a sample: owned by the boot owner, not by a caller.
+  describe "the quiescence table's lifetime" do
+    # No `reset_quiescence/0` here. On the unfixed code it creates the table lazily in THIS test
+    # process, which owns it for the whole test and hides exactly the bug this block pins.
+    setup do
+      Storage.reset_incarnation_deaths()
+
+      on_exit(fn ->
+        Storage.reset_quiescence()
+        Storage.reset_incarnation_deaths()
+      end)
+
+      :ok
+    end
+
+    test "a sample recorded by a short-lived process still ages to quiescent" do
+      table = Fathom.Shard.Storage.Quiescence
+      boot_owner = Process.whereis(Fathom.Shard.Storage.HeartbeatCache)
+      assert is_pid(boot_owner)
+
+      assert :ets.info(table, :owner) == boot_owner,
+             "the quiescence table must be owned by the long-lived boot owner, not by whichever " <>
+               "process touched it first"
+
+      probe =
+        Application.get_env(
+          :fathom,
+          :lease_quiescence_probe_ms,
+          div(Application.get_env(:fathom, :shard_lease_ttl_ms, 30_000), 2)
+        )
+
+      Storage.mark_incarnation_dead(@owner)
+
+      # First observation, from a process that exits straight after.
+      refute Task.await(Task.async(fn -> Storage.fast_steal_ok?(@owner, "acme", 5_000, 100) end))
+
+      # The first task is gone. Its sample must still be there for the second observation.
+      assert Task.await(
+               Task.async(fn -> Storage.fast_steal_ok?(@owner, "acme", 5_000, 100 + probe) end)
+             ),
+             "the sample died with the task that recorded it, so the fast path never settles"
+
+      assert :ets.info(table, :owner) == boot_owner
+    end
+  end
 end
