@@ -1808,6 +1808,8 @@ defmodule Fathom.Shard do
   # fence when it fires, so a coalesced later lapse is still covered). The flush
   # fence remains the hard guard throughout the jitter window.
   def handle_info({:heartbeat_lapsed, gen}, state) do
+    state = note_lapse_edge(state, gen)
+
     # Arm a NEW revalidation episode only when none is in progress. `lapse_revalidate_pending` is a
     # tri-state (`false` | `true` timer armed | `%Task{}` check in flight), so the "in progress" test
     # must be an explicit `== false`, NOT `not/1`: `not` is STRICT boolean and raises ArgumentError
@@ -3741,6 +3743,26 @@ defmodule Fathom.Shard do
     :ok
   end
 
+  # START THE CLOCK AT THE LAPSE EDGE, not at the lapse VERDICT (expert review 2026-10-12 #24). The
+  # one-shot timer above is anchored at the first OBSERVATION of `:not_valid`, and on a clean or
+  # lightly-written shard the first observation was the lapse revalidation's verdict — which runs
+  # only after a jitter of up to `Heartbeat.margin_ms()` (`lapse_spread_ms/1`), so the fence could
+  # still arm that much later than stealable. The broadcast itself is an observation: the heartbeat
+  # has just edge-detected a real lapse, and if the same lock-free status `Fence.check/2` reads says
+  # `:not_valid` now, start the episode now. The jittered storage revalidation is unchanged (it can
+  # still confirm ownership and close the episode).
+  #
+  # NOT back-dated from the heartbeat deadline (the panel's prescription, rejected in
+  # `apply_lapse_verdict(:skip, _)`'s note): this only moves the clock's start to an instant at which
+  # `:not_valid` was really observed, so it can never arm before a peer may steal. Heartbeat mode
+  # only — legacy coordinators do not subscribe to lapses.
+  defp note_lapse_edge(%{acquire_gen: acquire_gen} = state, gen)
+       when is_integer(acquire_gen) and gen != acquire_gen do
+    if write_fence_recheck(state) == :not_valid, do: note_not_valid(state), else: state
+  end
+
+  defp note_lapse_edge(state, _gen), do: state
+
   # Re-check before fencing on a timer: nothing re-observed the `:not_valid` since it was first seen,
   # and a fence that outlives a recovered heartbeat on a clean shard would never be lifted (no flush
   # runs, and no write can make one). Heartbeat mode reads the same lock-free status `Fence.check/2`
@@ -4706,8 +4728,10 @@ defmodule Fathom.Shard do
   # publish the fence, because at lapse time the node is not yet provably stealable — the delay
   # IS the semantics. So the first write after a long lapse is still accepted, and the fence
   # arms on the flush tick that write triggers, with the elapsed time now measured from the
-  # lapse instead of from the write. Closing that last gap needs a one-shot re-check timer per
-  # lapse episode; deliberately not bundled here.
+  # lapse instead of from the write. Closed since: the first `:not_valid` arms a one-shot re-check
+  # timer (expert review 2026-10-12 #9), and the lapse broadcast itself now starts the clock when the
+  # status already reads `:not_valid` (2026-10-12 #24, `note_lapse_edge/2`), so neither a write nor
+  # this jittered verdict is needed for the fence to arm.
   defp apply_lapse_verdict(:skip, state), do: {:noreply, note_not_valid(state)}
 
   # Renew well inside the TTL (every third) so a couple of transient failures

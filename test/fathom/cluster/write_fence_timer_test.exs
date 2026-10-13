@@ -183,4 +183,88 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
       ShardExecutor.close(conn)
     end)
   end
+
+  # expert review 2026-10-12 #24: the timer above is anchored at the first OBSERVATION of
+  # `:not_valid`, and on a shard that is not flushing that observation was the lapse revalidation's
+  # verdict — which waits out a jitter of up to `Heartbeat.margin_ms()` first. The broadcast itself
+  # must start the clock. Here the jitter is ten minutes and the flush interval is ten minutes, and
+  # the shard is CLEAN (nothing would ever flush it): pre-fix nothing armed the fence at all.
+  test "heartbeat mode: a lapse broadcast alone arms the fence, with no flush tick and no revalidation",
+       %{shard: shard} do
+    hb = set_mode!(:heartbeat)
+    prev = Application.get_env(:fathom, :lapse_revalidate_jitter_ms)
+    Application.put_env(:fathom, :lapse_revalidate_jitter_ms, 600_000)
+
+    on_exit(fn ->
+      if is_nil(prev),
+        do: Application.delete_env(:fathom, :lapse_revalidate_jitter_ms),
+        else: Application.put_env(:fathom, :lapse_revalidate_jitter_ms, prev)
+    end)
+
+    capture_log(fn ->
+      {:ok, coordinator} = Shards.ensure(shard)
+      assert_mode!(coordinator, :heartbeat)
+      refute Fathom.Shard.dirty?(coordinator)
+      gen = :sys.get_state(coordinator).acquire_gen
+
+      # A REAL lapse, as `mark_lapse/1` leaves it: generation bumped, deadline past.
+      :sys.replace_state(hb, fn s ->
+        Heartbeat.publish_status(%{
+          s
+          | generation: gen + 1,
+            mono_deadline_ms: System.monotonic_time(:millisecond) - 1_000,
+            margin_ms: 50
+        })
+      end)
+
+      send(coordinator, {:heartbeat_lapsed, gen + 1})
+
+      assert_receive :write_fenced,
+                     3_000,
+                     "the fence waited for the jittered revalidation instead of arming from the lapse"
+
+      assert WriteFence.fenced?(shard)
+
+      assert :sys.get_state(coordinator).lapse_revalidate_pending == true,
+             "the fixture must not have run the (ten-minute-jittered) revalidation"
+    end)
+  end
+
+  test "heartbeat mode: a lapse broadcast with the status already valid again starts no clock", %{
+    shard: shard
+  } do
+    hb = set_mode!(:heartbeat)
+
+    capture_log(fn ->
+      {:ok, coordinator} = Shards.ensure(shard)
+      assert_mode!(coordinator, :heartbeat)
+      gen = :sys.get_state(coordinator).acquire_gen
+
+      # Lapsed and already renewed: a new generation, a healthy deadline -> `:revalidate`, not
+      # `:not_valid`. Only the storage revalidation may decide this one.
+      :sys.replace_state(hb, fn s ->
+        Heartbeat.publish_status(%{
+          s
+          | generation: gen + 1,
+            mono_deadline_ms: System.monotonic_time(:millisecond) + 60_000,
+            margin_ms: 50
+        })
+      end)
+
+      send(coordinator, {:heartbeat_lapsed, gen + 1})
+      assert :sys.get_state(coordinator).not_valid_since == nil
+      refute_receive :write_fenced, 300
+    end)
+  end
+
+  test "legacy mode: a lapse broadcast is not this coordinator's signal", %{shard: shard} do
+    set_mode!(:legacy)
+
+    capture_log(fn ->
+      {:ok, coordinator} = Shards.ensure(shard)
+      assert_mode!(coordinator, :legacy)
+      send(coordinator, {:heartbeat_lapsed, 7})
+      assert :sys.get_state(coordinator).not_valid_since == nil
+    end)
+  end
 end
