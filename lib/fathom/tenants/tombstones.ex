@@ -99,6 +99,7 @@ defmodule Fathom.Tenants.Tombstones do
       on_new: on_new,
       loader: loader,
       since_loader: since_loader,
+      clock: Keyword.get(opts, :clock, &cursor_now/0),
       retry_ms: retry_ms,
       tick: 0,
       since: nil
@@ -109,7 +110,7 @@ defmodule Fathom.Tenants.Tombstones do
         schedule_refresh()
         # Seed the incremental cursor from the successful FULL boot load, so the very first
         # periodic refresh is already incremental (review 2026-07-24 #30).
-        {:ok, state |> Map.put(:loaded, true) |> Map.put(:since, now_minus_overlap())}
+        {:ok, state |> Map.put(:loaded, true) |> Map.put(:since, now_minus_overlap(state.clock))}
 
       # Expert review #33: a FAILED boot load must not wait the full refresh interval — that
       # leaves the re-mint guard empty (410 contract broken) for up to 5 min during a Postgres
@@ -151,7 +152,7 @@ defmodule Fathom.Tenants.Tombstones do
         load_from_storage(state.table, state.on_new)
         DenyList.recovered(:tombstones)
         schedule_refresh()
-        {:noreply, %{state | loaded: true, since: now_minus_overlap()}}
+        {:noreply, %{state | loaded: true, since: now_minus_overlap(state.clock)}}
 
       {:error, reason} ->
         DenyList.degraded(:tombstones, reason)
@@ -207,7 +208,11 @@ defmodule Fathom.Tenants.Tombstones do
   # theoretically accumulate; otherwise load only rows changed since the last refresh, minus an
   # overlap so a transaction that began earlier but committed later cannot slip below the
   # high-water mark. Re-reading a row is free — the set is append-only and inserts are idempotent.
-  @full_reload_every 12
+  #
+  # Daily, not hourly (expert review 2026-10-12 #31): the full reload grows with LIFETIME deletions,
+  # and with the cursor now on the Postgres clock (see `cursor_now/0`) the incremental key has no
+  # skew hole left to cover; NOTIFY and the storage union remain the other backstops.
+  @full_reload_every 288
   @overlap_ms 60_000
 
   defp refresh_from_directory(state) do
@@ -221,12 +226,24 @@ defmodule Fathom.Tenants.Tombstones do
       end
 
     case result do
-      :ok -> state |> Map.put(:tick, tick) |> Map.put(:since, now_minus_overlap())
+      :ok -> state |> Map.put(:tick, tick) |> Map.put(:since, now_minus_overlap(state.clock))
       _ -> Map.put(state, :tick, tick)
     end
   end
 
-  defp now_minus_overlap, do: DateTime.add(DateTime.utc_now(), -@overlap_ms, :millisecond)
+  defp now_minus_overlap(clock), do: DateTime.add(clock.(), -@overlap_ms, :millisecond)
+
+  # The incremental cursor is compared against `shards.updated_at`, which `Directory.tombstone/1`
+  # stamps from the Postgres clock, so `since` must come from the same clock (expert review
+  # 2026-10-12 #31; the a16ccf8 pattern). A database that can't answer falls back to the node clock:
+  # the overlap still covers small skew, and the next successful refresh re-seeds the cursor.
+  defp cursor_now do
+    Directory.db_now()
+  rescue
+    _ -> DateTime.utc_now()
+  catch
+    :exit, _ -> DateTime.utc_now()
+  end
 
   defp load_since(%{table: table, since_loader: loader, on_new: on_new}, since) do
     for id <- loader.(since), do: insert(table, id, on_new)

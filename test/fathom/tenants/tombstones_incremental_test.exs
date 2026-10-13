@@ -78,4 +78,31 @@ defmodule Fathom.Tenants.TombstonesIncrementalTest do
 
     assert Process.alive?(Process.whereis(name)), "and it must not take the process down"
   end
+
+  # Expert review 2026-10-12 #31: the cursor was `DateTime.utc_now()` (this node's clock) while
+  # `shards.updated_at` is now stamped by `Directory.tombstone/1` from the Postgres clock, so a node
+  # skewed by more than the 60 s overlap missed rows. The cursor must come from the injected
+  # (default: Postgres) clock. NOTE the stamp half (`Directory.tombstone/1` using `db_now/0`) is by
+  # construction and is NOT discriminated here: on one machine both clocks agree, so no test can
+  # observe which one stamped.
+  test "the incremental cursor is read from the database clock, not the node clock" do
+    parent = self()
+    db_clock = ~U[2031-01-01 00:10:00.000000Z]
+
+    {name, _table} =
+      start_isolated(
+        loader: fn -> [] end,
+        since_loader: fn dt ->
+          send(parent, {:since_called, dt})
+          []
+        end,
+        clock: fn -> db_clock end
+      )
+
+    send(name, :refresh)
+    _ = :sys.get_state(name)
+
+    # 60 s overlap behind the injected clock.
+    assert_receive {:since_called, ~U[2031-01-01 00:09:00.000000Z]}, 2_000
+  end
 end

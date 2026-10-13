@@ -785,9 +785,13 @@ defmodule Fathom.Directory do
   """
   @spec tombstone(String.t()) :: {:ok, Shard.t()} | {:error, Ecto.Changeset.t()}
   def tombstone(shard_id) do
-    now = DateTime.utc_now()
+    # The Postgres clock, not this node's (expert review 2026-10-12 #31): `updated_at` is the
+    # cursor key of the incremental tombstone refresh (`deleted_shard_ids_since/1`), whose `since`
+    # is also read from `db_now/0`. A deleting node whose clock ran > the 60 s overlap behind
+    # stamped a row the refresh then never asked for (only NOTIFY and the full reload recovered it).
+    now = db_now()
 
-    %Shard{}
+    %Shard{updated_at: now, inserted_at: now}
     |> Shard.changeset(%{
       shard_id: shard_id,
       schema_version: 0,
