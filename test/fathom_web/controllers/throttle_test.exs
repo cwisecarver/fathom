@@ -107,6 +107,38 @@ defmodule FathomWeb.ThrottleTest do
     assert conn |> basic("admin", "wrong") |> get("/admin/metrics") |> Map.get(:status) == 401
   end
 
+  # Expert review 2026-10-12 #12: the metrics scrape has its own failed-attempt bucket. Before the
+  # fix, /admin/metrics and the dashboard shared the :admin_auth counter, so a flood of bad
+  # credentials aimed at either one 429'd the other, and the scrape could be locked out by dashboard
+  # traffic. Pre-fix the first assertion below fails (the scrape is 429 after dashboard failures).
+  test "/admin/metrics has its own bucket: dashboard failures do not lock the scrape", %{
+    conn: conn
+  } do
+    Application.put_env(:fathom, :admin_auth_max_failures, 3)
+
+    for _ <- 1..3 do
+      assert conn |> basic("admin", "wrong") |> get("/admin/shards") |> Map.get(:status) == 401
+    end
+
+    assert conn |> basic("admin", "wrong") |> get("/admin/shards") |> Map.get(:status) == 429
+
+    assert conn |> basic("admin", "secret") |> get("/admin/metrics") |> Map.get(:status) == 200,
+           "the scrape must not share the dashboard's lockout"
+  end
+
+  test "/admin/metrics failures do not lock the dashboard", %{conn: conn} do
+    Application.put_env(:fathom, :admin_auth_max_failures, 3)
+
+    for _ <- 1..3 do
+      assert conn |> basic("admin", "wrong") |> get("/admin/metrics") |> Map.get(:status) == 401
+    end
+
+    assert conn |> basic("admin", "wrong") |> get("/admin/metrics") |> Map.get(:status) == 429
+
+    assert conn |> basic("admin", "secret") |> get("/admin/shards") |> Map.get(:status) != 429,
+           "the dashboard must not share the scrape's lockout"
+  end
+
   test "the lockout transition is audited exactly once (#9), never per-attempt", %{conn: conn} do
     Application.put_env(:fathom, :admin_auth_max_failures, 2)
 

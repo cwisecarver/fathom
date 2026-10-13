@@ -21,6 +21,13 @@ defmodule FathomWeb.Router do
     plug :require_admin_auth
   end
 
+  # The metrics scrape has its OWN failed-attempt bucket (expert review 2026-10-12 #12). It
+  # shares the credential with the dashboard, but not the lockout: a scraper's bad credential, or a
+  # flood aimed at /admin/metrics, must not 429 the operator's dashboard, and the reverse holds too.
+  pipeline :metrics_auth do
+    plug :require_metrics_auth
+  end
+
   scope "/", FathomWeb do
     pipe_through :browser
 
@@ -51,7 +58,7 @@ defmodule FathomWeb.Router do
   # Prometheus scrape — auth-gated, but no :browser (a scraper isn't an HTML client, so it must
   # not hit the `accepts ["html"]` negotiation).
   scope "/admin", FathomWeb do
-    pipe_through :admin_auth
+    pipe_through :metrics_auth
 
     get "/metrics", MetricsController, :index
   end
@@ -218,7 +225,13 @@ defmodule FathomWeb.Router do
     %{"admin_actor" => actor, "admin_ip" => ip}
   end
 
-  defp require_admin_auth(conn, _opts) do
+  defp require_admin_auth(conn, _opts), do: require_basic_auth(conn, :admin_auth)
+
+  defp require_metrics_auth(conn, _opts), do: require_basic_auth(conn, :metrics_auth)
+
+  # `bucket` names the failed-attempt counter this surface locks out on (`:admin_auth` for the
+  # dashboard and /api, `:metrics_auth` for the scrape). Same credential either way.
+  defp require_basic_auth(conn, bucket) do
     creds = Application.get_env(:fathom, :admin_auth, [])
     user = creds[:username]
     pass = creds[:password]
@@ -230,7 +243,7 @@ defmodule FathomWeb.Router do
         |> Plug.Conn.send_resp(503, "admin dashboard not configured (set ADMIN_USER/ADMIN_PASS)")
         |> Plug.Conn.halt()
 
-      admin_auth_blocked?(conn) ->
+      admin_auth_blocked?(conn, bucket) ->
         :telemetry.execute([:fathom, :admin_auth, :blocked], %{count: 1}, %{})
 
         conn
@@ -241,7 +254,7 @@ defmodule FathomWeb.Router do
       true ->
         conn
         |> Plug.BasicAuth.basic_auth(username: user, password: pass)
-        |> record_admin_auth_result()
+        |> record_admin_auth_result(bucket)
     end
   end
 
@@ -273,19 +286,19 @@ defmodule FathomWeb.Router do
     end
   end
 
-  defp admin_auth_blocked?(conn) do
+  defp admin_auth_blocked?(conn, bucket) do
     case admin_fail_limit() do
       nil ->
         false
 
       limit ->
-        Fathom.RateLimiter.count(:admin_auth, throttle_key(conn), admin_fail_window()) >= limit
+        Fathom.RateLimiter.count(bucket, throttle_key(conn), admin_fail_window()) >= limit
     end
   end
 
   # After Plug.BasicAuth: a halt with 401 is a failed credential (count it); an unhalted conn is a
   # success (clear the IP's failure count). A 503 (unconfigured) never reaches here.
-  defp record_admin_auth_result(conn) do
+  defp record_admin_auth_result(conn, bucket) do
     case admin_fail_limit() do
       nil ->
         conn
@@ -293,8 +306,7 @@ defmodule FathomWeb.Router do
       limit ->
         cond do
           conn.halted and conn.status == 401 ->
-            new_count =
-              Fathom.RateLimiter.bump(:admin_auth, throttle_key(conn), admin_fail_window())
+            new_count = Fathom.RateLimiter.bump(bucket, throttle_key(conn), admin_fail_window())
 
             :telemetry.execute([:fathom, :admin_auth, :failed], %{count: 1}, %{})
 
@@ -302,13 +314,16 @@ defmodule FathomWeb.Router do
             # attempt — a brute-force flood must not amplify into a Postgres audit-write flood. The
             # high-frequency per-attempt signal is the telemetry counter above.
             if new_count == limit do
-              Fathom.Audit.log(conn, :admin_auth_locked_out, nil, :blocked, %{failures: new_count})
+              Fathom.Audit.log(conn, :admin_auth_locked_out, nil, :blocked, %{
+                failures: new_count,
+                bucket: bucket
+              })
             end
 
             conn
 
           not conn.halted ->
-            Fathom.RateLimiter.forget(:admin_auth, throttle_key(conn))
+            Fathom.RateLimiter.forget(bucket, throttle_key(conn))
             conn
 
           true ->
