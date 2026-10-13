@@ -131,6 +131,27 @@ defmodule Fathom.Shard.Replication.FrameAuth do
   @spec key_configured?() :: boolean()
   def key_configured?, do: key() != nil
 
+  @min_secret_bytes 32
+
+  @doc """
+  Whether the configured secret is shorter than #{@min_secret_bytes} bytes. The boot guard asks
+  this in prod (expert review 2026-10-12 #21).
+
+  One HMAC pass over the secret is the whole key derivation, so a short secret can be brute-forced
+  offline from a single sniffed frame, and the key it yields authenticates every shard on the node.
+  False when no secret is configured at all: that case has its own guard, with a different message.
+  """
+  @spec weak_secret?() :: boolean()
+  def weak_secret? do
+    case configured_secret() do
+      secret when is_binary(secret) and byte_size(secret) > 0 ->
+        byte_size(secret) < @min_secret_bytes
+
+      _ ->
+        false
+    end
+  end
+
   @doc """
   Drop the cached derived key. For tests and for a secret rotation that changes config at runtime;
   the cache is otherwise permanent for the life of the node.

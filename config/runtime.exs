@@ -1358,6 +1358,13 @@ if config_env() == :prod do
            proxies |> String.split(",", trim: true) |> Enum.map(&String.trim/1)
   end
 
+  # The opt-out for the prod boot guard that refuses throttles on with no trusted proxy (expert
+  # review 2026-10-12 #12). Only for a deployment with NOTHING in front of :4000, where remote_ip
+  # is already the client. Setting it behind a proxy reinstates the one-flood lockout.
+  if System.get_env("ADMIN_THROTTLE_SHARED_BUCKET_OK") in ~w(true 1) do
+    config :fathom, :admin_throttle_shared_bucket_ok, true
+  end
+
   # Wildcard-TLS serving (#35): set when the deployment terminates TLS with a `*.<zone>` wildcard
   # cert, which CANNOT serve an id that isn't a DNS-safe label (an underscore id — RFC 6125). With
   # this on, `Tenants.provision`/`fork` REFUSE such an id (422) instead of handing back an un-servable

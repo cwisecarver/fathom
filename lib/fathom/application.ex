@@ -35,6 +35,8 @@ defmodule Fathom.Application do
     check_replication_disk!()
     check_replication_flush_interval!()
     check_pool_fd_budget!()
+    check_s3_static_credentials!()
+    check_throttle_proxy!()
 
     # Node-wide SQLite page-cache bound (expert review 2026-10-08 #8). Before the tree, so no tenant
     # connection opens ahead of it; process-global, so this one trusted `:memory:` connection covers
@@ -495,6 +497,10 @@ defmodule Fathom.Application do
   **Not prod-only.** The other exposure guards are, because they trade a real security control
   against a developer's convenience. These two are pure misconfiguration: there is no environment
   in which "sign, but with no key" or "require, but with no key" is a thing anyone meant.
+
+  A third check (expert review 2026-10-12 #21) refuses a PROD secret under 32 bytes, with no
+  opt-out, while signing or requiring is on: the key is one HMAC pass over the secret, so a short
+  one is brute-forceable from a single sniffed frame.
   """
   @spec check_replication_frame_auth!() :: nil
   def check_replication_frame_auth! do
@@ -508,6 +514,15 @@ defmodule Fathom.Application do
               "but no key is configured. Set REPLICATION_HMAC_SECRET, or HRANA_TOKEN_SECRET which " <>
               "it derives from. Without a key this node would send frames UNSIGNED while " <>
               "believing it signs them, and refuse every frame that arrives."
+    end
+
+    if (signing? or required?) and Application.get_env(:fathom, :env) == :prod and
+         Fathom.Shard.Replication.FrameAuth.weak_secret?() do
+      raise "config error: the replication frame-auth secret is under 32 bytes. The frame key is " <>
+              "one HMAC pass over it, so a short secret can be brute-forced offline from one " <>
+              "captured frame, and the key authenticates every shard on this node. Generate a " <>
+              "secret with: mix phx.gen.secret (set REPLICATION_HMAC_SECRET, or HRANA_TOKEN_SECRET " <>
+              "if that is the one in use). See docs/runbooks/replication-frame-auth.md."
     end
 
     # REQUIRING without SIGNING is the rollout run backwards. This node would refuse a peer that
@@ -536,6 +551,63 @@ defmodule Fathom.Application do
           "AND bound to all interfaces — the only tenant-isolation control is an external " <>
           "firewall/security-group. Set HRANA_AUTH=required or pin HRANA_BIND_IP to the private " <>
           "interface the LB reaches (expert review 2026-07-14 #18)."
+      )
+    end
+
+    nil
+  end
+
+  @doc """
+  Refuse a prod node whose failed-login throttles would share one bucket (expert review 2026-10-12
+  #12).
+
+  The admin and /api throttles key on the client IP. Without `:trusted_proxies`, `conn.remote_ip`
+  is whatever sits in front of `:4000`, so every client shares one bucket. Twenty bad requests from
+  anywhere then lock out every operator, valid passwords included, and the default throttles are on.
+  So prod refuses to boot when any throttle is on and no trusted proxy is configured.
+
+  The opt-out is `ADMIN_THROTTLE_SHARED_BUCKET_OK=true`, for a deployment with no proxy in front of
+  `:4000`, where `remote_ip` is already the client. Off in dev and test.
+  """
+  @spec check_throttle_proxy!() :: nil
+  def check_throttle_proxy! do
+    throttled? =
+      Application.get_env(:fathom, :admin_auth_max_failures) not in [nil, 0] or
+        Application.get_env(:fathom, :api_rate_limit) not in [nil, 0]
+
+    if Application.get_env(:fathom, :env) == :prod and throttled? and
+         FathomWeb.ClientIp.trusted_proxies() == [] and
+         Application.get_env(:fathom, :admin_throttle_shared_bucket_ok) != true do
+      raise "config error: the login and API throttles are on in prod, but TRUSTED_PROXIES is " <>
+              "empty, so every client shares one throttle bucket. One flood of bad requests would " <>
+              "lock out every operator. Set TRUSTED_PROXIES to the address(es) of whatever " <>
+              "terminates TLS in front of :4000, or, if nothing proxies :4000, set " <>
+              "ADMIN_THROTTLE_SHARED_BUCKET_OK=true. See docs/configuration.md."
+    end
+
+    nil
+  end
+
+  @doc """
+  Prod warning when the S3 credentials carry a session token (expert review 2026-10-12 #27).
+
+  Prod runs long-lived static keys (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) and the S3 client
+  caches them for the life of the process. A session token (STS, IRSA, instance role) expires, and
+  nothing refreshes it, so every S3 call returns 403 at once across the fleet. This only warns: the
+  node still boots, and the reason it cannot refresh is documented in docs/configuration.md.
+  """
+  @spec check_s3_static_credentials!() :: nil
+  def check_s3_static_credentials! do
+    s3 = Application.get_env(:fathom, Fathom.Shard.Storage.S3, [])
+
+    if Application.get_env(:fathom, :env) == :prod and
+         Application.get_env(:fathom, :shard_storage) == Fathom.Shard.Storage.S3 and
+         is_binary(s3[:token]) and s3[:token] != "" do
+      Logger.warning(
+        "config warning: AWS_SESSION_TOKEN is set, so the S3 credentials are temporary (STS, " <>
+          "IRSA or an instance role). They are cached for the life of the process and are NOT " <>
+          "refreshed: when they expire every shard operation fails with 403 at once, fleet-wide. " <>
+          "Prod is designed for long-lived static keys; see docs/configuration.md (S3 credentials)."
       )
     end
 

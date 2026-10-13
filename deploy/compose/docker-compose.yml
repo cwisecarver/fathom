@@ -33,6 +33,9 @@ x-fathom-env: &fathom-env
   # Admin dashboard + control-plane API (/api/tenants) BasicAuth. CHANGE THE PASSWORD.
   ADMIN_USER: admin
   ADMIN_PASS: admin
+  # Prod boot refuses the shared throttle bucket unless TRUSTED_PROXIES is set (expert review
+  # 2026-10-12 #12). This stack has no proxy in front of :4000, so the opt-out is correct here.
+  ADMIN_THROTTLE_SHARED_BUCKET_OK: "true"
   # Eval convenience: reach the plaintext dashboard/API on localhost:4000. Paired with the
   # WEB_INSECURE_LOCAL build arg below (SSL forcing off). Never in a real deployment.
   WEB_INSECURE_LOCAL: "1"

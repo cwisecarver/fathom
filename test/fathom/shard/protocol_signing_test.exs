@@ -352,6 +352,84 @@ defmodule Fathom.Shard.ProtocolSigningTest do
     end
   end
 
+  # Expert review 2026-10-12 #21: the frame key is one HMAC pass over the configured secret, so a
+  # short prod secret is brute-forceable offline from one sniffed frame. Prod refuses anything under
+  # 32 bytes while signing or requiring is on, with no opt-out. Before the fix, a 6-byte prod secret
+  # booted, so the first test fails there.
+  describe "the prod secret length floor" do
+    setup do
+      prev_env = Application.get_env(:fathom, :env)
+      prev_hrana = Application.get_env(:fathom, :hrana_token_secret)
+      Application.put_env(:fathom, :env, :prod)
+
+      on_exit(fn ->
+        if is_nil(prev_env),
+          do: Application.delete_env(:fathom, :env),
+          else: Application.put_env(:fathom, :env, prev_env)
+
+        if is_nil(prev_hrana),
+          do: Application.delete_env(:fathom, :hrana_token_secret),
+          else: Application.put_env(:fathom, :hrana_token_secret, prev_hrana)
+      end)
+
+      :ok
+    end
+
+    test "a short prod secret refuses to boot while signing is on" do
+      Application.put_env(:fathom, :replication_hmac_secret, "short")
+      FrameAuth.forget_key()
+      sign!(true)
+      require!(false)
+
+      assert_raise RuntimeError, ~r/under 32 bytes/, fn ->
+        Fathom.Application.check_replication_frame_auth!()
+      end
+    end
+
+    test "a short prod secret refuses to boot while requiring is on" do
+      Application.put_env(:fathom, :replication_hmac_secret, String.duplicate("s", 31))
+      FrameAuth.forget_key()
+      sign!(true)
+      require!(true)
+
+      assert_raise RuntimeError, ~r/under 32 bytes/, fn ->
+        Fathom.Application.check_replication_frame_auth!()
+      end
+    end
+
+    test "the HRANA fallback is held to the same floor" do
+      # The guard checks whichever secret is RESOLVED, so a short HRANA_TOKEN_SECRET cannot slip
+      # past it by not being the replication-specific variable.
+      Application.delete_env(:fathom, :replication_hmac_secret)
+      Application.put_env(:fathom, :hrana_token_secret, "short-hrana")
+      FrameAuth.forget_key()
+      sign!(true)
+      require!(false)
+
+      assert_raise RuntimeError, ~r/under 32 bytes/, fn ->
+        Fathom.Application.check_replication_frame_auth!()
+      end
+    end
+
+    test "exactly 32 bytes boots" do
+      Application.put_env(:fathom, :replication_hmac_secret, String.duplicate("k", 32))
+      FrameAuth.forget_key()
+      sign!(true)
+      require!(true)
+
+      assert Fathom.Application.check_replication_frame_auth!() == nil
+    end
+
+    test "a short secret is not refused while frame auth is off (the key is never used)" do
+      Application.put_env(:fathom, :replication_hmac_secret, "short")
+      FrameAuth.forget_key()
+      sign!(false)
+      require!(false)
+
+      assert Fathom.Application.check_replication_frame_auth!() == nil
+    end
+  end
+
   describe "key derivation" do
     test "the configured secret is NEVER the key" do
       # Domain separation. If the raw secret were the HMAC key, a leaked replication key would BE

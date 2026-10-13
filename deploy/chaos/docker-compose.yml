@@ -207,6 +207,9 @@ x-fathom-env: &fathom-env
   PHX_SERVER: "1"
   ADMIN_USER: admin
   ADMIN_PASS: admin
+  # Prod boot refuses the shared throttle bucket unless TRUSTED_PROXIES is set (expert review
+  # 2026-10-12 #12). The rig has no proxy in front of :4000, so the opt-out is correct here.
+  ADMIN_THROTTLE_SHARED_BUCKET_OK: "true"
   WEB_INSECURE_LOCAL: "1"
 
 x-fathom-node: &fathom-node
