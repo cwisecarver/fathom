@@ -147,6 +147,36 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     end
   end
 
+  # Expert review 2026-10-12 #34. A command whose task is killed by the per-command timeout never
+  # reached its own completion, so its row stayed `pending` and the next tick re-selected it: a live
+  # drain re-ran every tick and re-closed the MigrationGate each time. The poller must mark it failed.
+  test "a command killed by the task timeout is marked failed, not re-selected (#34)",
+       %{shard: shard, node: node} do
+    {:ok, _} = Overrides.pin(shard, node, reason: "test")
+    prev_t = Application.get_env(:fathom, :command_task_timeout_ms)
+    prev_d = Application.get_env(:fathom, :command_drain_ms)
+    Application.put_env(:fathom, :command_task_timeout_ms, 300)
+    Application.put_env(:fathom, :command_drain_ms, 5_000)
+
+    on_exit(fn ->
+      restore(:command_task_timeout_ms, prev_t)
+      restore(:command_drain_ms, prev_d)
+    end)
+
+    # Hold a checkout open so the drain blocks on the busy connection for its whole 5 s budget;
+    # the 300 ms task timeout kills the execute long before that.
+    {:ok, pid, ref, _path} = Shards.checkout(shard)
+
+    {:ok, cmd} = Commands.issue(shard, node, "drain")
+    start_supervised!(CommandPoller)
+    assert CommandPoller.poll_now() == 0
+
+    assert %{status: "failed", detail: "did not finish: " <> _} = Commands.get(cmd.id)
+    assert Commands.pending_for(node) == [], "a killed command must not be re-selected"
+
+    Fathom.Shard.checkin(pid, ref)
+  end
+
   test "a drain for a reverted shard is skipped + cancelled; the source is not drained (#7)",
        %{shard: shard, node: node} do
     # Regression for #7: the handoff reverted (pin marked failed) but a pending drain

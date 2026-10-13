@@ -34,13 +34,29 @@ defmodule Fathom.Rebalancer.Commands do
     Repo.all(from c in Command, where: c.status == "pending", order_by: [asc: c.inserted_at])
   end
 
-  @doc "Marks a command terminal (`\"done\"` | `\"failed\"`) with an optional detail string."
+  @doc """
+  Marks a command terminal (`"done"` | `"failed"` | `"cancelled"`) with an optional detail string.
+
+  Applies ONLY while the command is still `pending` (expert review 2026-10-12 #34). A command
+  that already reached a terminal status keeps it, and the call returns `{:error, :already_terminal}`
+  rather than overwriting a `cancelled` or `done` with a late completion.
+  """
   @spec complete(Command.t(), String.t(), String.t() | nil) ::
-          {:ok, Command.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, Command.t()} | {:error, :already_terminal | Ecto.Changeset.t()}
   def complete(%Command{} = command, status, detail \\ nil) do
-    command
-    |> Command.changeset(%{status: status, detail: detail})
-    |> Repo.update()
+    changeset = Command.changeset(command, %{status: status, detail: detail})
+
+    if changeset.valid? do
+      {n, _} =
+        Repo.update_all(
+          from(c in Command, where: c.id == ^command.id and c.status == "pending"),
+          set: [status: status, detail: detail, updated_at: DateTime.utc_now()]
+        )
+
+      if n == 1, do: {:ok, get(command.id)}, else: {:error, :already_terminal}
+    else
+      {:error, changeset}
+    end
   end
 
   @doc "The command by id, or nil."
@@ -119,6 +135,10 @@ defmodule Fathom.Rebalancer.Commands do
   Blocks until command `id` reaches a terminal status or `timeout_ms` elapses (polling
   every `poll_ms`). Returns `{:ok, command}` when `done`, `{:error, {:command_failed,
   detail}}` when `failed`, or `{:error, :timeout}`. Deadline is monotonic.
+
+  A `cancelled` command is terminal too (expert review 2026-10-12 #34): it returns
+  `{:error, {:command_failed, "cancelled: " <> detail}}` at once instead of polling to a timeout.
+  The callers match only `{:command_failed, _}` and `:timeout`, so the failure shape is kept.
   """
   @spec await(integer(), keyword()) ::
           {:ok, Command.t()} | {:error, {:command_failed, String.t() | nil}} | {:error, :timeout}
@@ -136,6 +156,9 @@ defmodule Fathom.Rebalancer.Commands do
 
       %Command{status: "failed", detail: detail} ->
         {:error, {:command_failed, detail}}
+
+      %Command{status: "cancelled", detail: detail} ->
+        {:error, {:command_failed, "cancelled: #{detail}"}}
 
       _pending_or_missing ->
         if System.monotonic_time(:millisecond) >= deadline do

@@ -38,6 +38,26 @@ defmodule Fathom.Rebalancer.CommandsTest do
     assert {:error, :timeout} = Commands.await(pending.id, timeout_ms: 60, poll_ms: 20)
   end
 
+  # Expert review 2026-10-12 #34. A cancelled command is terminal, but await/2 had no clause for it,
+  # so it polled a command that would never move until the deadline and reported :timeout.
+  test "await returns at once for a cancelled command, not a timeout (#34)" do
+    {:ok, cmd} = Commands.issue("s", "n", "drain")
+    assert 1 = Commands.cancel_if_pending(cmd.id, "handoff reverted")
+
+    assert {:error, {:command_failed, "cancelled: handoff reverted"}} =
+             Commands.await(cmd.id, timeout_ms: 1_000, poll_ms: 20)
+  end
+
+  # Expert review 2026-10-12 #34. complete/3 wrote unconditionally, so a late completion overwrote a
+  # terminal status: a cancelled drain could be relabelled done, and a done one could be failed.
+  test "complete never overwrites a terminal status (#34)" do
+    {:ok, cmd} = Commands.issue("s", "n", "drain")
+    {:ok, _} = Commands.complete(cmd, "cancelled", "handoff reverted")
+
+    assert {:error, :already_terminal} = Commands.complete(cmd, "done", "drained")
+    assert %{status: "cancelled", detail: "handoff reverted"} = Commands.get(cmd.id)
+  end
+
   test "rejects an unknown command type" do
     assert {:error, changeset} = Commands.issue("s", "n", "explode")
     assert "is invalid" in errors_on(changeset).command

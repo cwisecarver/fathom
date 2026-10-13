@@ -216,12 +216,19 @@ defmodule Fathom.Rebalancer.CommandPoller do
       timeout: task_timeout(),
       on_timeout: :kill_task
     )
+    # Ordered results, so each outcome pairs with the command that produced it.
+    |> Enum.zip(commands)
     |> Enum.reduce(0, fn
-      {:ok, _}, acc ->
+      {{:ok, _}, _cmd}, acc ->
         acc + 1
 
-      {:exit, reason}, acc ->
+      {{:exit, reason}, cmd}, acc ->
         Logger.warning("command poller: a command crashed: #{inspect(reason)}")
+        # expert review 2026-10-12 #34. A killed or crashed execute never reached its own
+        # `complete/3`, so the row stayed `pending` and the next tick re-selected it: a live drain
+        # re-ran every tick, and each run re-closed the MigrationGate. Mark it terminal here. The
+        # guarded complete is a no-op if the execute did finish in the window.
+        _ = complete(cmd, "failed", "did not finish: #{inspect(reason)}")
         acc
     end)
   rescue
@@ -308,15 +315,21 @@ defmodule Fathom.Rebalancer.CommandPoller do
   # the other emit sites and so a buggy handler can never sit between the executor and the DB
   # write. (`:telemetry.execute` already isolates a raising/exiting handler from the caller, so
   # the emit can't abort the completion in EITHER order — but emit-after is the correct shape.)
+  # Emits only when the completion APPLIED (expert review 2026-10-12 #34): a command already
+  # terminal (cancelled by a revert, or completed by its own execute) has no new outcome to report.
   defp complete(cmd, status, detail) do
-    result = Commands.complete(cmd, status, detail)
+    case Commands.complete(cmd, status, detail) do
+      {:ok, _} = ok ->
+        :telemetry.execute([:fathom, :rebalancer, :command, :stop], %{count: 1}, %{
+          command: cmd.command,
+          outcome: outcome_atom(status)
+        })
 
-    :telemetry.execute([:fathom, :rebalancer, :command, :stop], %{count: 1}, %{
-      command: cmd.command,
-      outcome: outcome_atom(status)
-    })
+        ok
 
-    result
+      other ->
+        other
+    end
   end
 
   defp outcome_atom("done"), do: :done
