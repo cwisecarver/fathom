@@ -1390,6 +1390,30 @@ defmodule Fathom.Directory do
     count
   end
 
+  @doc """
+  Rolls back the row `Fathom.Tenants.provision/1` just registered, after its template fork failed
+  (expert review 2026-10-12 #29). Unlike `hard_delete/1` it removes the row ONLY while it is still
+  the fresh active@0 registration: `status = 'active'`, `schema_version = 0`, `cutover_at IS NULL`.
+  `resolve/1` is an upsert that never resets status, so the row provision acts on can already be a
+  tombstone (a delete won the race) or a row that carries a schema; neither is provision's to erase,
+  and erasing a tombstone would drop the re-mint guard.
+
+  Returns the number of rows removed (0 when the row is gone or no longer fresh).
+  """
+  @spec rollback_provisioned(String.t()) :: non_neg_integer()
+  def rollback_provisioned(shard_id) do
+    {count, _} =
+      Repo.delete_all(
+        from(s in Shard,
+          where:
+            s.shard_id == ^shard_id and s.status == "active" and s.schema_version == 0 and
+              is_nil(s.cutover_at)
+        )
+      )
+
+    count
+  end
+
   @doc "Total shard rows in the directory across all statuses (the fleet's known-shard count)."
   @spec count() :: non_neg_integer()
   def count, do: Repo.aggregate(Shard, :count)

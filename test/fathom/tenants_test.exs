@@ -909,6 +909,42 @@ defmodule Fathom.TenantsTest do
              "a failed fork must roll the directory row back, not leave a schema-less active@0 " <>
                "tenant that reports success"
     end
+
+    # Expert review 2026-10-12 #29. The fork-failure rollback used `Directory.hard_delete/1`, which
+    # removes WHATEVER row the id holds. `Directory.resolve/1` is an upsert that never resets
+    # status, so a delete landing between provision's taken-check and its resolve leaves a
+    # TOMBSTONE in that row, and the rollback then erased the resurrection guard. Pre-fix,
+    # hard_delete/1 removed a tombstone; the rollback must now remove only the fresh active@0 row
+    # provision registered. These three rows pin that: a tombstone and a row that already carries a
+    # schema both survive, and a fresh row is still removed (the retry-friendly rollback).
+    test "the fork-failure rollback never removes a tombstone or a row with a schema (#29)", %{
+      id: id
+    } do
+      {:ok, _} = Directory.tombstone(id)
+
+      assert Directory.rollback_provisioned(id) == 0,
+             "the rollback must not hard-delete a tombstone (the re-mint guard)"
+
+      assert {:ok, %{status: "deleted"}} = Directory.get(id)
+
+      other = id <> "x"
+      {:ok, _} = Directory.resolve(other)
+
+      Fathom.Repo.update_all(
+        from(s in Fathom.Directory.Shard, where: s.shard_id == ^other),
+        set: [schema_version: 1]
+      )
+
+      assert Directory.rollback_provisioned(other) == 0,
+             "a row that already carries a schema was not provision's to roll back"
+
+      assert {:ok, %{status: "active", schema_version: 1}} = Directory.get(other)
+
+      fresh = id <> "f"
+      {:ok, _} = Directory.resolve(fresh)
+      assert Directory.rollback_provisioned(fresh) == 1
+      assert Directory.get(fresh) == :error
+    end
   end
 
   # Expert review #35: provision/fork is the one place that KNOWS the deployment's address (it

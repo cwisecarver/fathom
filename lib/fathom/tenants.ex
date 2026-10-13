@@ -99,7 +99,8 @@ defmodule Fathom.Tenants do
          :ok <- refuse_scratch(id, []),
          :ok <- refuse_if_taken(id),
          {:ok, warnings} <- dns_safety(id),
-         {:ok, _row} <- Directory.resolve(id),
+         {:ok, row} <- Directory.resolve(id),
+         :ok <- require_registered_active(row),
          :ok <- fork_or_rollback(id) do
       {:ok, tenant_result(id, warnings, opts)}
     end
@@ -483,19 +484,29 @@ defmodule Fathom.Tenants do
   # no schema whose first ORM query fails and which the rollout cannot heal — and provision used to
   # discard that outcome and return {:ok}, a silently broken tenant. It now fails loudly.
   #
-  # hard_delete, NOT tombstone: nothing ever routed to this id and no token was returned to any
-  # caller (tenant_result is only reached on success), so it was never a live tenant — and a retry
-  # must be able to re-mint the same id, which a tombstone (the resurrection guard) would block.
+  # The rollback removes the row only while it is still the fresh active@0 row provision registered
+  # (`Directory.rollback_provisioned/1`), not with `hard_delete/1`, which would also erase a tombstone
+  # a concurrent delete wrote into the same row (expert review 2026-10-12 #29). Nothing ever routed
+  # to a fresh id and no token was returned to any caller (tenant_result is only reached on success),
+  # so removing it is safe — and a retry must be able to re-mint the same id, which a tombstone (the
+  # resurrection guard) would block.
   defp fork_or_rollback(id) do
     case maybe_fork(id) do
       :ok ->
         :ok
 
       {:error, _} = err ->
-        _ = Directory.hard_delete(id)
+        _ = Directory.rollback_provisioned(id)
         err
     end
   end
+
+  # provision's own `resolve/1` can return a row that is not active when a delete won a race between
+  # the taken-check and the resolve (expert review 2026-10-12 #29). Refuse it rather than fork onto a
+  # tombstone and hand out a token for it.
+  defp require_registered_active(%{status: "active"}), do: :ok
+  defp require_registered_active(%{status: "deleted"}), do: {:error, :tombstoned}
+  defp require_registered_active(_row), do: {:error, :already_exists}
 
   # Runs the fork (when enabled) and maps its outcome CLASS to whether provision succeeds, reusing
   # `Shards.report_fork/2` for the same alarm + telemetry the traffic-minted birth path emits. The
