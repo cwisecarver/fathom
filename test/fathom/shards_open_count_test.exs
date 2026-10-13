@@ -76,25 +76,60 @@ defmodule Fathom.ShardsOpenCountTest do
     end) || flunk("no shard id hashed to the dead partition")
   end
 
-  test "checkout/drain/stop on a dead partition return errors instead of raising", %{shard: shard} do
+  # expert review 2026-10-12 #37: `flush/2` used a bare `Registry.lookup/2`. A dead partition answers
+  # `[]` to that, so with no local file the `remote: false` flush answered `:ok` for an id whose
+  # coordinator could not be seen. The id is fresh (never opened, no local file), so only the
+  # registry read decides the answer.
+  test "checkout/drain/stop/flush on a dead partition return errors instead of raising", %{
+    shard: shard
+  } do
     {:ok, _pid} = Shards.ensure(shard)
 
     with_dead_partition(fn ->
       id = id_on_dead_partition()
+      refute File.exists?(Fathom.Shard.db_path(id))
       assert {:error, :unavailable} = Shards.ensure(id)
       assert {:error, :unavailable} = Shards.drain(id, 100)
+      assert {:error, :unavailable} = Shards.flush(id, remote: false)
       assert :ok = Shards.stop(id)
     end)
   end
 
-  test "drain_all still drains the open coordinators while a partition is down", %{shard: shard} do
+  # expert review 2026-10-12 #36: on the dead-partition fallback the drain reads each coordinator's id
+  # with `:sys.get_state/2`. A child that cannot answer it (here a plain process that never handles
+  # system messages, so the call exits `:timeout` after 5 s) used to escape the async stream and kill
+  # the caller, which is the whole node drain. It must be counted `:timed_out` instead.
+  # (`:sys.suspend/1` does NOT make a GenServer unreadable: system messages still get answered, so
+  # the probe for this test has to be a non-OTP process.)
+  test "drain_all still drains open coordinators while a partition is down, and counts an unreadable one as timed out",
+       %{shard: shard} do
     {:ok, pid} = Shards.ensure(shard)
     ref = Process.monitor(pid)
 
-    with_dead_partition(fn ->
-      assert %{drained: drained} = Shards.drain_all(10_000)
-      assert drained >= 1
-    end)
+    {:ok, unreadable} =
+      DynamicSupervisor.start_child(Fathom.ShardSupervisor, %{
+        id: make_ref(),
+        start:
+          {Task, :start_link,
+           [
+             fn ->
+               receive do
+                 :never -> :ok
+               end
+             end
+           ]},
+        restart: :temporary
+      })
+
+    try do
+      with_dead_partition(fn ->
+        assert %{drained: drained, timed_out: timed_out} = Shards.drain_all(10_000)
+        assert drained >= 1
+        assert timed_out >= 1
+      end)
+    after
+      _ = DynamicSupervisor.terminate_child(Fathom.ShardSupervisor, unreadable)
+    end
 
     assert_receive {:DOWN, ^ref, :process, ^pid, _}, 5_000
   end

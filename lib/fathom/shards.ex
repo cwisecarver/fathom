@@ -748,34 +748,13 @@ defmodule Fathom.Shards do
     pids
     |> Task.async_stream(
       fn {shard_id, pid} ->
-        shard_id = shard_id || coordinator_id(pid)
-        left = max(0, deadline - System.monotonic_time(:millisecond))
-        pending = max(1, :counters.get(remaining_count, 1))
-        :counters.sub(remaining_count, 1, 1)
-
-        window =
-          drain_window(
-            left,
-            pending,
-            waves,
-            drain_all_concurrency(),
-            drain_all_flush_grace_ms(),
-            @min_useful_drain_ms
-          )
-
-        # The window each coordinator was actually given. Emitted because it is the DECISION this
-        # fix makes, and it is otherwise unobservable: a shard handed a zero window aborts `:busy`
-        # immediately, which is indistinguishable from a shard that waited its full slice and then
-        # aborted. (The audit predicted the leftovers would show up as `:timed_out`; traced, they
-        # do not — a zero-window shard returns fast rather than exhausting the budget, so the
-        # outcome tally looks identical either way.)
-        :telemetry.execute(
-          [:fathom, :shards, :drain_all, :slice],
-          %{window_ms: window},
-          %{}
-        )
-
-        drain_pid(shard_id, pid, window)
+        # A coordinator whose id cannot be read (dead, or not answering) is one we could not drain.
+        # Count it as `:timed_out` and move on: an exit here used to kill the task, and through the
+        # linked async stream, the whole node drain (expert review 2026-10-12 #36).
+        case shard_id || coordinator_id(pid) do
+          nil -> :timed_out
+          shard_id -> drain_slice(shard_id, pid, deadline, remaining_count, waves)
+        end
       end,
       max_concurrency: drain_all_concurrency(),
       # A real per-task bound, not `:infinity` (expert review 2026-10-10 #34, AGENTS.md: a bounded
@@ -791,6 +770,37 @@ defmodule Fathom.Shards do
       {:ok, outcome}, acc -> Map.update!(acc, outcome, &(&1 + 1))
       {:exit, _reason}, acc -> Map.update!(acc, :timed_out, &(&1 + 1))
     end)
+  end
+
+  # One coordinator's share of `drain_all/1`: take its slice of the remaining budget, then drain it.
+  defp drain_slice(shard_id, pid, deadline, remaining_count, waves) do
+    left = max(0, deadline - System.monotonic_time(:millisecond))
+    pending = max(1, :counters.get(remaining_count, 1))
+    :counters.sub(remaining_count, 1, 1)
+
+    window =
+      drain_window(
+        left,
+        pending,
+        waves,
+        drain_all_concurrency(),
+        drain_all_flush_grace_ms(),
+        @min_useful_drain_ms
+      )
+
+    # The window each coordinator was actually given. Emitted because it is the DECISION this
+    # fix makes, and it is otherwise unobservable: a shard handed a zero window aborts `:busy`
+    # immediately, which is indistinguishable from a shard that waited its full slice and then
+    # aborted. (The audit predicted the leftovers would show up as `:timed_out`; traced, they
+    # do not — a zero-window shard returns fast rather than exhausting the budget, so the
+    # outcome tally looks identical either way.)
+    :telemetry.execute(
+      [:fathom, :shards, :drain_all, :slice],
+      %{window_ms: window},
+      %{}
+    )
+
+    drain_pid(shard_id, pid, window)
   end
 
   # Drain one coordinator within `remaining` ms of budget. The coordinator waits for its streams up
@@ -979,7 +989,14 @@ defmodule Fathom.Shards do
   end
 
   defp do_flush(shard_id, remote?) do
-    case Registry.lookup(@registry, shard_id) do
+    # The shared registry read, not a bare `Registry.lookup/2` (expert review 2026-10-12 #37). A
+    # dead partition answers `[]` to a bare lookup, so it read as "no coordinator" and fell through
+    # to the local-file / remote branches, which could answer `:ok` for a shard that is open. Map it
+    # to the retryable error instead.
+    case registry_lookup(shard_id) do
+      {:error, :unavailable} = unavailable ->
+        unavailable
+
       # NO COORDINATOR IS NOT PROOF THE OBJECT IS CURRENT (expert review 2026-09-29 #13). A drop
       # whose flush failed (S3 brownout, `:drop_flush_timeout`, a fence skip, an inconclusive 412)
       # deliberately KEEPS the local `.db` with its acked-but-unflushed writes and exits
@@ -988,14 +1005,14 @@ defmodule Fathom.Shards do
       # answering `:ok` let an export or a keystone fork read the stale object as the tenant's
       # complete data. Re-open it (a warm open marks it dirty) and flush; never report success on
       # a copy we could not make durable.
-      [] ->
+      {:ok, []} ->
         cond do
           File.exists?(Fathom.Shard.db_path(shard_id)) -> flush_kept_local(shard_id)
           remote? -> Fathom.Shards.RemoteFlush.flush(shard_id)
           true -> :ok
         end
 
-      [{pid, _}] ->
+      {:ok, [{pid, _}]} ->
         flush_pid(shard_id, pid)
     end
   end
@@ -1503,7 +1520,13 @@ defmodule Fathom.Shards do
           do: {nil, pid}
   end
 
-  defp coordinator_id(pid), do: :sys.get_state(pid, 5_000).id
+  # `nil` when the coordinator is dead or does not answer within 5 s: the caller counts that shard as
+  # not drained rather than letting the exit take down the drain (expert review 2026-10-12 #36).
+  defp coordinator_id(pid) do
+    :sys.get_state(pid, 5_000).id
+  catch
+    :exit, _ -> nil
+  end
 
   # The limiter call needs the same exit protection the directory read below has
   # (expert review #28): the limiter's own backpressure model is mailbox saturation,
