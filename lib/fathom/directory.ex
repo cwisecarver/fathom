@@ -455,6 +455,74 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  Stamps `promotion_snapshot_at` after `PromoteOnOpen` took a `-promoexp` snapshot (expert review
+  2026-10-12 #8), so the always-on `ReconcileJob` can expire it. Update-only: a shard with no
+  directory row yet (the access recorder is buffered) returns 0 and keeps its snapshot until an
+  operator drops it. Best-effort — never raises into the caller.
+  """
+  @spec stamp_promotion_snapshot(String.t(), DateTime.t()) :: non_neg_integer()
+  def stamp_promotion_snapshot(shard_id, at \\ DateTime.utc_now()) do
+    {count, _} =
+      from(s in Shard, where: s.shard_id == ^shard_id)
+      |> Repo.update_all(set: [promotion_snapshot_at: at, updated_at: DateTime.utc_now()])
+
+    count
+  rescue
+    _ -> 0
+  end
+
+  @doc """
+  Rows whose `promotion_snapshot_at` is older than `cutoff`, ANY status (a deleted or suspended
+  tenant's snapshot is still storage), oldest first, at most `limit`, as
+  `[%{shard_id:, promotion_snapshot_at:}]`. Served by `shards_promotion_snapshot_at_index`.
+  """
+  @spec promotion_snapshots_due(DateTime.t(), pos_integer()) :: [
+          %{shard_id: String.t(), promotion_snapshot_at: DateTime.t()}
+        ]
+  def promotion_snapshots_due(%DateTime{} = cutoff, limit) when is_integer(limit) and limit > 0 do
+    Repo.all(
+      from s in Shard,
+        where: not is_nil(s.promotion_snapshot_at) and s.promotion_snapshot_at < ^cutoff,
+        order_by: [asc: s.promotion_snapshot_at],
+        limit: ^limit,
+        select: %{shard_id: s.shard_id, promotion_snapshot_at: s.promotion_snapshot_at}
+    )
+  end
+
+  @doc """
+  Clears the promotion stamp, but only if it still equals `stamped_at`: a promotion that landed
+  (and re-stamped) while the sweep was running must keep its pending expiry.
+  """
+  @spec clear_promotion_snapshot(String.t(), DateTime.t()) :: non_neg_integer()
+  def clear_promotion_snapshot(shard_id, %DateTime{} = stamped_at) do
+    {count, _} =
+      from(s in Shard,
+        where: s.shard_id == ^shard_id and s.promotion_snapshot_at == ^stamped_at
+      )
+      |> Repo.update_all(set: [promotion_snapshot_at: nil, updated_at: DateTime.utc_now()])
+
+    count
+  end
+
+  @doc """
+  Tombstoned ids, NEWEST deletion first, at most `limit` — the DeleteJob re-drive's candidate set
+  (expert review 2026-10-12 #7). `deleted_shard_ids_since/1` has no ORDER BY, and the partial index
+  made it return oldest-first, so past `limit` deletions in the window the same already-purged
+  prefix was checked every hour and the newest (the ones most likely to have leftovers) never.
+  """
+  @spec recently_deleted_shard_ids(DateTime.t(), pos_integer()) :: [String.t()]
+  def recently_deleted_shard_ids(%DateTime{} = since, limit)
+      when is_integer(limit) and limit > 0 do
+    Repo.all(
+      from s in Shard,
+        where: s.status == "deleted" and s.updated_at >= ^since,
+        order_by: [desc: s.updated_at, desc: s.shard_id],
+        limit: ^limit,
+        select: s.shard_id
+    )
+  end
+
+  @doc """
   Records a restore-drill outcome (#24) on the shard's row: stamps `last_verified_at` (drives the
   sampling weight) and `last_verify_status` (queryable durably). Returns how many rows were updated
   (0 if the shard is gone). Best-effort — never raises the caller.

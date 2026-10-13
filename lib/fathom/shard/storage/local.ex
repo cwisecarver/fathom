@@ -589,6 +589,15 @@ defmodule Fathom.Shard.Storage.Local do
     end
   end
 
+  @impl true
+  def any_shard_object?(shard_id) do
+    case File.ls(dir()) do
+      {:ok, names} -> {:ok, Enum.any?(names, &shard_object?(&1, shard_id))}
+      {:error, :enoent} -> {:ok, false}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   # A stored file belongs to `shard_id` iff the character AFTER the id is `.` (the
   # live `.db`, the `.lock`, an atomic-write `.db.tmp…` temp) or `@` (a `@<version>`
   # / `@snap-<id>` copy). Matching the delimiter — not a bare prefix — is what keeps

@@ -87,6 +87,11 @@ defmodule Fathom.Directory.Shard do
     # The snapshot scheduler's rotation key, stamped on every ATTEMPT (expert review 2026-10-10 #14).
     field :last_snapshot_attempt_at, :utc_datetime_usec
 
+    # When `PromoteOnOpen` last took a `-promoexp` pre-promotion snapshot of this shard (expert
+    # review 2026-10-12 #8). `ReconcileJob` sweeps rows where this is past the expiry (any status)
+    # and clears it, so the 14-day expiry no longer depends on the GFS retention job being on.
+    field :promotion_snapshot_at, :utc_datetime_usec
+
     # When `Directory.mark_failed/1` quarantined the shard (fix-review R3-2). Unlike `updated_at`,
     # nothing else touches it, so the reconcile cool-off measures real time in quarantine even for
     # a hot shard. `requeue_count` counts AUTOMATIC cool-off requeues (capped; reset by a cutover or

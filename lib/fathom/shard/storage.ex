@@ -510,6 +510,12 @@ defmodule Fathom.Shard.Storage do
   # shard and confirmed no live node holds the lease (`Fathom.Tenants.DeleteJob`).
   @callback purge_shard(shard_id :: String.t()) :: :ok | {:error, term()}
 
+  # True if ANY stored object still belongs to `shard_id` (live `.db`, `.lock`, `@<version>`,
+  # `@snap-<id>`), by the same delimiter rule as `purge_shard`. The DeleteJob re-drive's leftover
+  # test: a `.db` HEAD misses a partially purged tenant whose `.db` is gone but whose snapshots and
+  # versions remain (expert review 2026-10-12 #7).
+  @callback any_shard_object?(shard_id :: String.t()) :: {:ok, boolean()} | {:error, term()}
+
   # Aggregate storage footprint for observability — `{object_count, total_bytes}` of the live
   # shard objects. Optional: a backend that can't cheaply enumerate simply omits it, and the
   # dispatcher returns `{:error, :unsupported}`. Potentially expensive (an S3 LIST), so callers
@@ -1064,6 +1070,10 @@ defmodule Fathom.Shard.Storage do
   """
   @spec purge_shard(String.t()) :: :ok | {:error, term()}
   def purge_shard(shard_id), do: backend().purge_shard(shard_id)
+
+  @doc "True if any stored object (of any kind) still belongs to `shard_id`. See the callback."
+  @spec any_shard_object?(String.t()) :: {:ok, boolean()} | {:error, term()}
+  def any_shard_object?(shard_id), do: backend().any_shard_object?(shard_id)
 
   @doc """
   Writes the durable tombstone marker for `shard_id` (the DR backstop, #6) — a tiny object under a

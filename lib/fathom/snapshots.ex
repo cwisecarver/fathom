@@ -63,7 +63,8 @@ defmodule Fathom.Snapshots do
   """
   @spec create(String.t(), keyword()) :: {:ok, String.t()} | {:error, term()}
   def create(shard_id, opts \\ []) do
-    with {:ok, id} <- cast(shard_id) do
+    with {:ok, id} <- cast(shard_id),
+         :ok <- refuse_tombstoned(id) do
       snapshot_id =
         new_snapshot_id(
           Keyword.get(opts, :label),
@@ -72,9 +73,29 @@ defmodule Fathom.Snapshots do
         )
 
       case Storage.snapshot(id, snapshot_id) do
-        :ok -> {:ok, snapshot_id}
+        :ok -> recheck_tombstone(id, snapshot_id)
         {:error, reason} -> {:error, reason}
       end
+    end
+  end
+
+  # Expert review 2026-10-12 #20. A snapshot is a server-side copy; one that started before a tenant
+  # delete can land AFTER the delete's second purge sweep and re-create an object nothing collects
+  # (retention skips non-active rows). Refuse a tombstoned id up front, and re-check after the copy:
+  # if the id was tombstoned meanwhile, delete the new key ourselves. The DeleteJob re-drive's
+  # prefix List is the backstop for the copy-vs-recheck window.
+  defp refuse_tombstoned(id) do
+    if Fathom.Tenants.Tombstones.tombstoned?(id), do: {:error, :tombstoned}, else: :ok
+  end
+
+  defp recheck_tombstone(id, snapshot_id) do
+    case refuse_tombstoned(id) do
+      :ok ->
+        {:ok, snapshot_id}
+
+      {:error, :tombstoned} = refused ->
+        _ = Storage.drop_snapshot(id, snapshot_id)
+        refused
     end
   end
 

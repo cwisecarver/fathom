@@ -401,6 +401,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
   defp snapshot_before_promotion(shard_id) do
     case Fathom.Snapshots.create(shard_id, label: "pre-promotion", pre_promotion: true) do
       {:ok, _snapshot_id} ->
+        stamp_promotion_snapshot(shard_id)
         :ok
 
       {:error, reason} ->
@@ -411,5 +412,16 @@ defmodule Fathom.Shard.PromoteOnOpen do
 
         :ok
     end
+  end
+
+  # Expert review 2026-10-12 #8: record the promotion snapshot in the directory so the always-on
+  # ReconcileJob can expire it. Async and best-effort — a Postgres write must never sit on the open
+  # path, and a lost stamp only leaves the snapshot for an operator (as before).
+  defp stamp_promotion_snapshot(shard_id) do
+    Task.Supervisor.start_child(Fathom.TaskSupervisor, fn ->
+      Fathom.Directory.stamp_promotion_snapshot(shard_id)
+    end)
+  catch
+    :exit, _ -> :ok
   end
 end

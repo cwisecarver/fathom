@@ -107,6 +107,161 @@ defmodule Fathom.TenantsTest do
     end
   end
 
+  # Expert review 2026-10-12 #7. Symptom: the re-drive took the OLDEST 500 deleted rows (no ORDER BY)
+  # and HEADed only `<id>.db`, so past 500 deletions in the window the newest were never checked, and
+  # a tenant whose purge halted after the `.db` was deleted (`.db` sorts before `@snap-*`) kept full
+  # copies in storage that no sweep re-drove.
+  describe "DeleteJob re-drive paging and prefix leftover test (expert review 2026-10-12 #7)" do
+    defp put_object!(id) do
+      src = Path.join(System.tmp_dir!(), "#{id}.src")
+      File.write!(src, "x")
+      assert :ok = Storage.flush(id, src)
+      File.rm(src)
+    end
+
+    test "with 600 deleted rows, the newest few that still have objects are re-driven" do
+      now = DateTime.utc_now()
+
+      rows =
+        for n <- 1..600 do
+          %{
+            shard_id: "rd_#{n}",
+            schema_version: 0,
+            status: "deleted",
+            last_active_at: now,
+            # rd_1 is the NEWEST deletion, rd_600 the oldest.
+            updated_at: DateTime.add(now, -n * 60, :second),
+            inserted_at: now
+          }
+        end
+
+      rows |> Enum.chunk_every(200) |> Enum.each(&Fathom.Repo.insert_all(Directory.Shard, &1))
+
+      newest = for n <- 1..5, do: "rd_#{n}"
+      Enum.each(newest, &put_object!/1)
+      on_exit(fn -> Enum.each(newest, &Storage.purge_shard/1) end)
+
+      assert :ok = perform_job(Fathom.Migrator.ReconcileJob, %{})
+
+      for id <- newest, do: assert_enqueued(worker: DeleteJob, args: %{shard_id: id})
+    end
+
+    test "a tenant with only a snapshot left (the .db already purged) is re-driven", %{id: id} do
+      write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('secret')"])
+      flush!(id)
+      assert {:ok, _snap} = Snapshots.create(id)
+      assert :ok = Storage.drop_live(id)
+      # The fixture's precondition: no `.db`, so the old HEAD would see nothing to do.
+      assert {:ok, nil} = Storage.object_etag(id)
+      assert {:ok, true} = Storage.any_shard_object?(id)
+      {:ok, _} = Directory.tombstone(id)
+
+      assert :ok = perform_job(Fathom.Migrator.ReconcileJob, %{})
+      assert_enqueued(worker: DeleteJob, args: %{shard_id: id})
+    end
+
+    test "any_shard_object?/1 ignores a sibling id", %{id: id} do
+      put_object!(id <> "2")
+      on_exit(fn -> Storage.purge_shard(id <> "2") end)
+      assert {:ok, false} = Storage.any_shard_object?(id)
+    end
+  end
+
+  # Expert review 2026-10-12 #8. Symptom: the 14-day -promoexp expiry ran only inside RetentionJob
+  # (off by default, active+scheduler-snapshotted rows only), so with retention unset every
+  # promotion leaked a full copy forever. ReconcileJob now sweeps rows stamped by PromoteOnOpen.
+  describe "promotion snapshot expiry in ReconcileJob (expert review 2026-10-12 #8)" do
+    defp aged_promo_snapshot!(id, days) do
+      at = DateTime.add(DateTime.utc_now(), -days * 86_400, :second)
+      sid = Calendar.strftime(at, "%Y%m%dT%H%M%SZ") <> "-0001-pre-promotion-promoexp"
+      :ok = Storage.snapshot(id, sid)
+      {sid, at}
+    end
+
+    defp snapshot_ids(id) do
+      {:ok, snaps} = Snapshots.list(id)
+      Enum.map(snaps, & &1.id)
+    end
+
+    test "an aged stamped promotion snapshot is dropped and the stamp cleared; others are kept",
+         %{id: id} do
+      write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
+      flush!(id)
+      {:ok, _} = Directory.resolve(id)
+      {aged, at} = aged_promo_snapshot!(id, 15)
+      {:ok, operator} = Snapshots.create(id, label: "pre-promotion")
+      {:ok, fresh} = Snapshots.create(id, label: "keep-me", pre_promotion: true)
+      assert 1 = Directory.stamp_promotion_snapshot(id, at)
+
+      assert :ok = perform_job(Fathom.Migrator.ReconcileJob, %{})
+
+      left = snapshot_ids(id)
+      refute aged in left
+      assert operator in left
+      assert fresh in left
+      assert [] = Directory.promotion_snapshots_due(DateTime.utc_now(), 10)
+    end
+
+    test "a not-yet-due stamp is left alone", %{id: id} do
+      write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
+      flush!(id)
+      {:ok, _} = Directory.resolve(id)
+      {aged, _at} = aged_promo_snapshot!(id, 15)
+
+      assert 1 =
+               Directory.stamp_promotion_snapshot(id, DateTime.add(DateTime.utc_now(), -1, :day))
+
+      assert :ok = perform_job(Fathom.Migrator.ReconcileJob, %{})
+      assert aged in snapshot_ids(id)
+    end
+
+    test "a tombstoned (deleted) row is swept too", %{id: id} do
+      write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
+      flush!(id)
+      {aged, at} = aged_promo_snapshot!(id, 15)
+      {:ok, _} = Directory.tombstone(id)
+      assert 1 = Directory.stamp_promotion_snapshot(id, at)
+
+      assert :ok = perform_job(Fathom.Migrator.ReconcileJob, %{})
+      refute aged in snapshot_ids(id)
+    end
+  end
+
+  # Expert review 2026-10-12 #20. Symptom: Snapshots.create ignored tombstones, so a copy that
+  # started before a delete could land after the second purge sweep and re-create an object nothing
+  # collects.
+  describe "Snapshots.create vs tombstones (expert review 2026-10-12 #20)" do
+    test "refuses a tombstoned id", %{id: id} do
+      write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
+      flush!(id)
+      Tombstones.put(id)
+      assert {:error, :tombstoned} = Snapshots.create(id)
+      assert {:ok, []} = Snapshots.list(id)
+    end
+
+    test "a tombstone landing mid-copy removes the new snapshot", %{id: id} do
+      write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
+      flush!(id)
+
+      prev = Application.get_env(:fathom, :shard_storage)
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+      Application.put_env(
+        :fathom,
+        :faulty_before,
+        {:snapshot, fn sid -> if sid == id, do: Tombstones.put(id) end}
+      )
+
+      on_exit(fn ->
+        Application.delete_env(:fathom, :faulty_before)
+        restore_env(:shard_storage, prev)
+      end)
+
+      assert {:error, :tombstoned} = Snapshots.create(id)
+      assert {:ok, []} = Snapshots.list(id)
+    end
+  end
+
   describe "purge/1 (the DeleteJob body)" do
     # Symptom (expert review 2026-10-10 #27): purge never unpinned the rebalancer's LB override, so
     # the LB map kept an exception row for an erased tenant (and a re-minted id inherited it).

@@ -55,6 +55,10 @@ defmodule Fathom.Snapshots.Retention do
   @doc "The reserved marker `PromoteOnOpen`'s pre-promotion snapshots end in."
   def pre_promotion_label, do: @pre_promotion_label
 
+  @doc "How long a pre-promotion snapshot lives before it expires (seconds)."
+  @spec pre_promotion_max_age_s() :: pos_integer()
+  def pre_promotion_max_age_s, do: @pre_promotion_max_age_s
+
   @doc "Whether `id` is a PromoteOnOpen pre-promotion snapshot (ends in the reserved marker)."
   @spec pre_promotion?(String.t()) :: boolean()
   def pre_promotion?(id) when is_binary(id),

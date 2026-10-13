@@ -1775,13 +1775,28 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  # Any object left for the id? Two one-key LISTs on the delimiter-qualified prefixes (`<id>.` and
+  # `<id>@`), which is exactly `shard_object_key?/2`'s rule, so a sibling id (`acme2.db`) can never
+  # match and no paging past siblings is needed (expert review 2026-10-12 #7).
+  @impl true
+  def any_shard_object?(shard_id) do
+    Enum.reduce_while([".", "@"], {:ok, false}, fn delim, _acc ->
+      case list_page(prefix() <> shard_id <> delim, nil, 1) do
+        {:ok, %{entries: [_ | _]}} -> {:halt, {:ok, true}}
+        {:ok, _} -> {:cont, {:ok, false}}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
+
   # One ListObjectsV2 page for `list_prefix`, parsed by `ListPage` (expert review 2026-10-10 #25):
   # entity-decoded keys, and an error — never a short "complete" listing — when the response says
   # it is truncated but gives no token to continue with.
-  defp list_page(list_prefix, token) do
+  defp list_page(list_prefix, token, max_keys \\ nil) do
     params =
       [{"list-type", "2"}, {"prefix", list_prefix}] ++
-        if(token, do: [{"continuation-token", token}], else: [])
+        if(token, do: [{"continuation-token", token}], else: []) ++
+        if(max_keys, do: [{"max-keys", Integer.to_string(max_keys)}], else: [])
 
     case Req.get(req(), url: url_path(""), params: params) do
       {:ok, %{status: 200, body: body}} ->
