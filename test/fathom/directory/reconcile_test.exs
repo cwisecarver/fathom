@@ -89,6 +89,100 @@ defmodule Fathom.Directory.ReconcileTest do
 
   defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 
+  # Expert review 2026-10-12 #6: a storage error (or a killed row task) used to map to `[]`, so a
+  # brownout DR sweep reported "coherent". The stub answers per shard from app env.
+  defmodule StubStorage do
+    @moduledoc false
+    alias Fathom.Shard.Connection
+
+    defp answer(key, shard),
+      do: Application.fetch_env!(:fathom, :recon_stub) |> Map.fetch!({key, shard})
+
+    def object_user_version(shard), do: answer(:uv, shard)
+    def read_token_floor(shard), do: answer(:floor, shard)
+    def tombstoned_ids, do: {:ok, []}
+
+    # The full-pull fallback for {:header_unreachable, _}: materialize a v4 file.
+    def pull(_shard, path) do
+      {:ok, conn} = Connection.open(path)
+      {:ok, _} = Connection.query(conn, "PRAGMA user_version = 4", [])
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (x)", [])
+      :ok = Connection.close(conn)
+      {:ok, "etag"}
+    end
+  end
+
+  describe "unreadable rows are reported, never silently clean (expert review 2026-10-12 #6)" do
+    setup do
+      prev = Application.get_env(:fathom, :shard_storage)
+      Application.put_env(:fathom, :shard_storage, StubStorage)
+
+      on_exit(fn ->
+        Application.delete_env(:fathom, :recon_stub)
+
+        if prev,
+          do: Application.put_env(:fathom, :shard_storage, prev),
+          else: Application.delete_env(:fathom, :shard_storage)
+      end)
+    end
+
+    defp stub(map), do: Application.put_env(:fathom, :recon_stub, map)
+
+    test "a storage error on one shard yields an :unreadable finding" do
+      shard = uniq()
+      {:ok, _} = Directory.resolve(shard)
+      stub(%{{:uv, shard} => {:error, :timeout}, {:floor, shard} => {:ok, 0}})
+
+      assert Enum.any?(
+               Reconcile.run(),
+               &match?(
+                 %{shard_id: ^shard, kind: :unreadable, fact: :schema, reason: :timeout},
+                 &1
+               )
+             )
+    end
+
+    test "a token-floor read error yields an :unreadable finding" do
+      shard = uniq()
+      {:ok, _} = Directory.resolve(shard)
+      stub(%{{:uv, shard} => {:ok, 0}, {:floor, shard} => {:error, :econnrefused}})
+
+      assert Enum.any?(
+               Reconcile.run(),
+               &match?(%{shard_id: ^shard, kind: :unreadable, fact: :token}, &1)
+             )
+    end
+
+    test "header_unreachable falls back to a full pull to read the version" do
+      shard = uniq()
+      {:ok, _} = Directory.resolve(shard)
+
+      stub(%{
+        {:uv, shard} => {:error, {:header_unreachable, 12}},
+        {:floor, shard} => {:ok, 0}
+      })
+
+      findings = Reconcile.run()
+
+      assert Enum.any?(
+               findings,
+               &match?(%{shard_id: ^shard, kind: :schema_drift, from: 0, to: 4}, &1)
+             )
+
+      refute Enum.any?(findings, &(&1.kind == :unreadable and &1.shard_id == shard))
+    end
+
+    test "mix fathom.directory reconcile exits non-zero when anything is unreadable" do
+      shard = uniq()
+      {:ok, _} = Directory.resolve(shard)
+      stub(%{{:uv, shard} => {:error, :timeout}, {:floor, shard} => {:ok, 0}})
+
+      assert_raise Mix.Error, ~r/could not be read/, fn ->
+        Mix.Tasks.Fathom.Directory.run(["reconcile"])
+      end
+    end
+  end
+
   # Expert review 2026-10-12 #19: the sweep pulled every WHOLE object serially to read four header
   # bytes. On the S3 req_plug seam, prove the version now comes from a RANGED read and no GET of the
   # object body is ever made.

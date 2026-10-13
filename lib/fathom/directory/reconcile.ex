@@ -26,6 +26,7 @@ defmodule Fathom.Directory.Reconcile do
 
   alias Fathom.Directory
   alias Fathom.Shard.Storage
+  alias Fathom.Tenants
 
   # Rows reconciled at once. Each is a couple of small ranged reads (expert review 2026-10-12 #19),
   # so this is bounded well under the HTTP pool; the old serial whole-object pull took
@@ -49,20 +50,29 @@ defmodule Fathom.Directory.Reconcile do
     # table, and at fleet scale that is hundreds of MB in one process: an OOM, not a slow query.
     # This is the documented DR-completion step ("run it with --fix after a Postgres restore, before
     # reopening traffic"), so it failed exactly when the fleet was already down.
+    # Chunked so a task that exits (timeout/kill) can be attributed to its row: `async_stream`
+    # reports `{:exit, reason}` without the input, and "skipped silently" made a brownout look like
+    # a clean fleet (expert review 2026-10-12 #6).
     findings =
       Directory.all_paged()
       |> apply_limit(Keyword.get(opts, :limit))
-      |> Task.async_stream(&reconcile_row(&1, fix?),
-        max_concurrency: @concurrency,
-        timeout: @row_timeout_ms,
-        on_timeout: :kill_task,
-        ordered: true
-      )
-      |> Enum.flat_map(fn
-        {:ok, findings} -> findings
-        # A row whose reads timed out is skipped (like any transient storage error), not fatal:
-        # the next run revisits it.
-        {:exit, _reason} -> []
+      |> Stream.chunk_every(@concurrency * 4)
+      |> Enum.flat_map(fn rows ->
+        rows
+        |> Task.async_stream(&reconcile_row(&1, fix?),
+          max_concurrency: @concurrency,
+          timeout: @row_timeout_ms,
+          on_timeout: :kill_task,
+          ordered: true
+        )
+        |> Enum.zip(rows)
+        |> Enum.flat_map(fn
+          {{:ok, findings}, _row} ->
+            findings
+
+          {{:exit, reason}, row} ->
+            [%{shard_id: row.shard_id, kind: :unreadable, fact: :row, reason: unreadable(reason)}]
+        end)
       end)
 
     findings ++ reconcile_tombstones(deleted_ids(), fix?)
@@ -102,6 +112,9 @@ defmodule Fathom.Directory.Reconcile do
           }
         ]
 
+      {:error, reason} ->
+        [%{shard_id: row.shard_id, kind: :unreadable, fact: :schema, reason: reason}]
+
       _ ->
         []
     end
@@ -114,6 +127,9 @@ defmodule Fathom.Directory.Reconcile do
       {:ok, floor} when is_integer(floor) and floor > current ->
         fixed? = fix? and Directory.raise_token_version(row.shard_id, floor) == 1
         [%{shard_id: row.shard_id, kind: :token_drift, from: current, to: floor, fixed: fixed?}]
+
+      {:error, reason} ->
+        [%{shard_id: row.shard_id, kind: :unreadable, fact: :token, reason: reason}]
 
       _ ->
         []
@@ -128,21 +144,26 @@ defmodule Fathom.Directory.Reconcile do
           %{shard_id: id, kind: :orphan_tombstone, fixed: fixed?}
         end
 
-      {:error, _} ->
-        []
+      {:error, reason} ->
+        [%{shard_id: "(tombstones)", kind: :unreadable, fact: :tombstones, reason: reason}]
     end
   end
+
+  defp unreadable(:timeout), do: :timeout
+  defp unreadable(reason), do: reason
 
   # The stored object's header `user_version`, via a RANGED read (`Storage.object_user_version/1`)
   # instead of pulling the whole object to a scratch file (expert review 2026-10-12 #19: at fleet
   # scale a DR sweep downloaded every shard in full, serially, to read four bytes). `:missing` when
   # the object is absent (a dangling directory row, or a steal sentinel — `{:absent, _}` never reads
-  # as a version 0, expert review 2026-08-01 #24). Best-effort: a transient storage error yields
-  # `{:error, _}`, which reconcile_schema treats as "skip" rather than a false drift.
+  # as a version 0, expert review 2026-08-01 #24). Best-effort: a storage error yields
+  # `{:error, _}`, which reconcile_schema reports as an `:unreadable` finding (never a false drift,
+  # and never a silent skip: expert review 2026-10-12 #6). `{:header_unreachable, _}` takes the same
+  # full-pull fallback as `Tenants.copied_version/1`.
   defp stored_user_version(shard_id) do
-    case Storage.object_user_version(shard_id) do
-      {:absent, _} -> :missing
+    case Tenants.copied_version(shard_id) do
       {:ok, uv} -> {:ok, uv}
+      {:error, :dst_object_missing} -> :missing
       {:error, reason} -> {:error, reason}
     end
   end

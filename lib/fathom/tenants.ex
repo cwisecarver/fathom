@@ -603,7 +603,9 @@ defmodule Fathom.Tenants do
   # reads just the header (S3: a ranged GET stream-decoded through the object's codec). Only when
   # the header cannot be reached that way (a prefix that does not decode to 100 bytes) do we fall
   # back to the full pull, so the fast path can never make a fork fail that used to succeed.
-  defp copied_version(dst) do
+  @doc false
+  @spec copied_version(String.t()) :: {:ok, integer()} | {:error, term()}
+  def copied_version(dst) do
     case Storage.object_user_version(dst) do
       {:ok, v} -> {:ok, v}
       {:absent, _} -> {:error, :dst_object_missing}

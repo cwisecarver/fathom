@@ -45,6 +45,16 @@ defmodule Mix.Tasks.Fathom.Directory do
 
       Enum.each(findings, &print_finding/1)
       summarize(findings, fix?)
+
+      # An unreadable row means the sweep could NOT vouch for it. "Run with --fix before reopening
+      # traffic" must not read that as success (expert review 2026-10-12 #6): exit non-zero.
+      unreadable = Enum.count(findings, &(&1.kind == :unreadable))
+
+      if unreadable > 0 do
+        Mix.raise(
+          "reconcile: #{unreadable} fact(s) could not be read; the directory was NOT verified for them — re-run before reopening traffic"
+        )
+      end
     end
   end
 
@@ -68,6 +78,12 @@ defmodule Mix.Tasks.Fathom.Directory do
 
   defp print_finding(%{kind: :missing_object} = f),
     do: Mix.shell().error("  #{f.shard_id}: directory row has NO stored object (dangling row)")
+
+  defp print_finding(%{kind: :unreadable} = f),
+    do:
+      Mix.shell().error(
+        "  #{f.shard_id}: UNREADABLE #{f.fact} (#{inspect(f.reason)}) — not verified"
+      )
 
   defp fixed(%{fixed: true}), do: " [FIXED]"
   defp fixed(_), do: ""
