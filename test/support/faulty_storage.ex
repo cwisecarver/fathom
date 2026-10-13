@@ -93,7 +93,7 @@ defmodule Fathom.Test.FaultyStorage do
 
   @impl true
   def acquire_lease(shard_id, owner, ttl_ms) do
-    run_before(:acquire)
+    run_before(:acquire, shard_id)
 
     if fault() == :acquire do
       {:error, {:transient_lookup, :s3_unreachable}}

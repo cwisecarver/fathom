@@ -41,6 +41,10 @@ defmodule Fathom.ShardCoordinatorOpenTest do
       Suspensions.remove(shard)
       Shards.drain(shard, 2_000)
 
+      # Several tests here kill a Registry partition. Let that one_for_all restart land and drop it
+      # from the restart budget before the next test registers anything (Fathom.Test.RegistryKill).
+      Fathom.Test.RegistryKill.settle()
+
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock"],
           do: File.rm(Path.join(dir, shard <> suffix))
@@ -224,12 +228,16 @@ defmodule Fathom.ShardCoordinatorOpenTest do
       # ms, and the episode would resolve back to `false` before we could observe it).
       Application.put_env(:fathom, :lapse_revalidate_jitter_ms, 60_000)
 
-      # The pull task runs between the acquire_gen sample and subscribe_lapse/0; bump the heartbeat
-      # generation there — its broadcast fires while we are NOT yet subscribed, so it is lost.
+      # Bump the heartbeat generation between the acquire_gen sample and subscribe_lapse/0: its
+      # broadcast fires while we are NOT yet subscribed, so it is lost. The hook is on
+      # acquire_lease, which the coordinator runs itself right after sampling. It used to be on the
+      # pull, but the pull Task starts BEFORE the sample, so on some orders it bumped the
+      # generation first, the sample read the bumped value, and the precondition below failed
+      # (seed 587142, 2026-10-13).
       Application.put_env(
         :fathom,
         :faulty_before,
-        {:pull,
+        {:acquire,
          fn
            ^shard ->
              :sys.replace_state(hb, fn s ->
