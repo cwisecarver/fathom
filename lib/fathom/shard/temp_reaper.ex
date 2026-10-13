@@ -54,10 +54,17 @@ defmodule Fathom.Shard.TempReaper do
   The fathom-owned scratch directory for shard-sized temp files outside the shard data dir
   (created on demand). Put every such temp here so `sweep/0` can reap it after a kill.
   """
+  #
+  # Expert review 2026-10-12 #25: `mkdir_p!` alone leaves the directory at the process umask
+  # (0755), and the shard-sized temps inside it (0644) were readable by any local user, so the
+  # tenant data in a restore or export temp was world-readable. The mode is set explicitly on every
+  # call, not only on create, so a directory left 0755 by an earlier build is tightened on the next
+  # use.
   @spec scratch_dir() :: Path.t()
   def scratch_dir do
     dir = Path.join(System.tmp_dir!(), "fathom_scratch")
     File.mkdir_p!(dir)
+    File.chmod!(dir, 0o700)
     dir
   end
 

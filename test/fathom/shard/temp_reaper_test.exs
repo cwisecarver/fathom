@@ -101,6 +101,20 @@ defmodule Fathom.Shard.TempReaperTest do
     assert File.exists?(fresh), "the age gate must spare a fresh scratch temp"
   end
 
+  # Expert review 2026-10-12 #25: the scratch dir holds shard-sized copies of tenant data, so it must
+  # not be readable by other local users. Before the fix, mkdir_p left it at the umask (0755); this
+  # also pins that a dir left 0755 by an earlier build is tightened on the next call.
+  test "the scratch dir is owner-only (0700), including when it already exists 0755" do
+    scratch = TempReaper.scratch_dir()
+    assert Bitwise.band(File.stat!(scratch).mode, 0o777) == 0o700
+
+    File.chmod!(scratch, 0o755)
+    _ = TempReaper.scratch_dir()
+
+    assert Bitwise.band(File.stat!(scratch).mode, 0o777) == 0o700,
+           "a pre-existing 0755 scratch dir must be tightened, not left world-readable"
+  end
+
   # Expert review 2026-08-31 #17: do_sweep had no rescue, so a persistent local-FS fault on the
   # fleet-sized scan crash-loops the reaper — the DataPlane's restart budget absorbs a burst but a
   # persistent fault exhausts it and cascades to every open coordinator. A raise is now caught and
