@@ -2963,9 +2963,12 @@ defmodule Fathom.Shard do
     if is_map(state.lease), do: Storage.release_lease(state.id, state.lease, state.lineage)
   end
 
+  # No `is_map(state.lease)` guard: since drop_clean/1 moved to release_clean/1 (expert review
+  # 2026-10-12 #3), every remaining caller holds an opened coordinator's map lease, and dialyzer
+  # flagged the guard's false branch as unreachable.
   defp release_plain(state) do
     unmark_lease_held(state.id)
-    if is_map(state.lease), do: Storage.release_lease(state.id, state.lease)
+    Storage.release_lease(state.id, state.lease)
   end
 
   # The CLEAN drop's release (expert review 2026-10-12 #3). A clean coordinator shipped nothing of

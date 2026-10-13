@@ -325,7 +325,7 @@ defmodule Fathom.Shard.Replication.Recovery do
   `N - Q + 1`, or 0 when the stored object's stamp cannot be ranked (nothing could be promoted over
   it anyway). Pure, for the test.
   """
-  @spec answers_needed([endpoint()], map() | nil, keyword()) :: integer()
+  @spec answers_needed([endpoint()], map() | nil, keyword()) :: number()
   def answers_needed(peers, object_stamp, opts \\ []) do
     if rankable_stamp?(object_stamp) do
       length(peers) - Keyword.get(opts, :quorum, quorum()) + 1

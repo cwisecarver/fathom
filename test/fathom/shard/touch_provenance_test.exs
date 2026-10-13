@@ -8,8 +8,11 @@ defmodule Fathom.Shard.TouchProvenanceTest do
   Holder A fails its drop flush: it keeps its local copy (sidecar E0, acked-but-unflushed writes)
   and leaves a released marker (d80e554). Peer B's acquire steals the marker, and the steal's
   `touch_object` rotates the data object E0 -> E1 with a byte-identical self-copy (the zombie-PUT
-  fence). B serves reads and drops CLEAN. When A reopens, its steal touches again (E1 -> E2), and
-  `Fork` sees sidecar E0 against store E1/E2 with no touch of A's own explaining E0: verdict
+  fence). B serves reads and drops CLEAN. When A reopens, its steal touches again. For
+  byte-identical copies S3's etag only alternates between the single-part and one-part-multipart
+  forms, so this second touch goes E1 -> E0, not to a fresh tag; this test therefore holds A's touch
+  until A's fork check has read the store. `Fork` sees sidecar E0 against store E1 with no touch of
+  A's own explaining E0: verdict
   `:fork`. A's acked local copy is quarantined to `.forked.<ts>` and the OLDER stored object serves.
 
   ## The fix being pinned
