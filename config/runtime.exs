@@ -893,6 +893,15 @@ if ms = env_int.("REPLICATION_RECOVERY_PULL_TIMEOUT_MS") do
   config :fathom, :replication_recovery_pull_timeout_ms, ms
 end
 
+# The responder floor's bounded wait (expert review 2026-10-12 #5). A failover open whose peer
+# query heard fewer than N-Q+1 definite answers (this node's own included) cannot rule out a peer
+# holding quorum-acked writes, so it is refused with a retryable 503 (FILO_RECOVERING) for this long
+# per shard, anchored at the first refusal; after it, the open proceeds best-effort with an error log
+# and a [:fathom, :replication, :recovery_underquorum] event. Default 60000 ms.
+if ms = env_int.("REPLICATION_RECOVERY_UNDERQUORUM_WINDOW_MS") do
+  config :fathom, :replication_recovery_underquorum_window_ms, ms
+end
+
 # Bytes per frame when seeding a follower's base copy. Bounds MEMORY on both sides (a seed is a
 # whole database); it does not bound head-of-line blocking, since one socket per follower node
 # carries every shard. Default 4 MiB.

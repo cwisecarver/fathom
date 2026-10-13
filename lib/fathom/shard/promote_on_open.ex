@@ -185,12 +185,35 @@ defmodule Fathom.Shard.PromoteOnOpen do
     started = System.monotonic_time(:millisecond)
 
     with {:ok, head} <- decision_head(shard_id, prefetched),
-         {:ok, replica} <- Recovery.best_replica(shard_id, position_of(head)),
+         {:ok, replica} <- best_replica_or_refuse(shard_id, path, position_of(head)),
          true <- Promote.fresher?(replica, position_of(head)),
          :ok <- recheck_object(shard_id, head, replica, started) do
       promote_replica(shard_id, path, lease, etag, replica, position_of(head), lineage)
     else
       _ -> etag
+    end
+  end
+
+  # TOO FEW PEERS ANSWERED (expert review 2026-10-12 #5): refuse the open, so the client retries
+  # while the partition heals, rather than serve — and at the first flush re-stamp over — a view
+  # that may be missing quorum-acked writes. The raise lands in the coordinator's lease-holding
+  # try (`abandon_open/5`): the lease is released and the coordinator stops, so nothing is held for
+  # the window and the checkout gets a retryable `{:open_failed, %UnderQuorum{}}` (503).
+  #
+  # THE COLD-PULLED LOCAL COPY IS DELETED FIRST, and that is load-bearing: left on disk with its
+  # provenance sidecar, the retry's fork check reads `:match`, opens WARM, and a warm open never
+  # promotes (`maybe_promote_replica/7`) — so the second attempt would skip recovery and the window
+  # entirely and serve the object. Deleting is safe: this is a cold open, so the file is a fresh
+  # pull of the stored object (or its re-pull after revalidation) that nothing has served yet.
+  defp best_replica_or_refuse(shard_id, path, stamp) do
+    case Recovery.best_replica(shard_id, stamp) do
+      {:refuse, refusal} ->
+        Enum.each(["", "-wal", "-shm"], &File.rm(path <> &1))
+        File.rm(Provenance.sidecar_path(path))
+        raise refusal
+
+      other ->
+        other
     end
   end
 

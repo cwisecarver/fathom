@@ -225,6 +225,17 @@ defmodule Fathom.Telemetry do
           "Replica promotions abandoned after the pull because the stored object changed while " <>
             "we were recovering — a whole-database transfer that recovered nothing"
       ),
+      # The responder floor (expert review 2026-10-12 #5). Tagged by `outcome` only, a bounded set:
+      # `:refused` counts each retryable 503 while too few peers answer; `:opened_best_effort` is
+      # the one to alert on — a window elapsed and a shard opened on a partial view, so writes held
+      # only by the silent peers may have been lost.
+      counter("fathom.replication.recovery_underquorum.count",
+        event_name: [:fathom, :replication, :recovery_underquorum],
+        tags: [:outcome],
+        description:
+          "Failover opens whose peer query heard fewer than N-Q+1 definite answers: refused " <>
+            "(retryable 503) or, after the window, opened best-effort (possible acked-write loss)"
+      ),
       counter("fathom.shards.at_capacity.count",
         event_name: [:fathom, :shards, :at_capacity],
         description:

@@ -1453,6 +1453,17 @@ defmodule Fathom.ShardExecutor do
   def open_error(:normal), do: retryable_open_error(:normal)
   def open_error({:open_failed, {:exit, _}} = reason), do: retryable_open_error(reason)
 
+  # Peer recovery heard too few definite answers to rule out a fresher replica (expert review
+  # 2026-10-12 #5). Deliberate and bounded (`:replication_recovery_underquorum_window_ms`): the
+  # client retries while the partition heals. Its own code so a rig run or an SDK log can tell it
+  # from a storage blip.
+  def open_error({:open_failed, %Fathom.Shard.Replication.Recovery.UnderQuorum{}}),
+    do: %Error{
+      message: "shard recovering from a failover; retry",
+      code: "FILO_RECOVERING",
+      status: 503
+    }
+
   # Anything unclassified: a generic 500 with a FIXED message. `inspect(reason)` used to go to the
   # tenant -- internal terms, file paths, node names -- and the status-less error rendered as a
   # 500 anyway. The reason is logged server-side (expert review 2026-10-10 #H6).

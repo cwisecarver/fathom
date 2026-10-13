@@ -82,6 +82,7 @@ defmodule Fathom.Shard.Replication.Recovery do
   require Logger
 
   alias Fathom.Shard.Replication.{Fleet, Follower, FollowerLog, Promote, Protocol}
+  alias Fathom.Shard.Replication.Recovery.UnderQuorum
 
   @connect_timeout 2_000
   @query_timeout_ms 2_000
@@ -254,26 +255,60 @@ defmodule Fathom.Shard.Replication.Recovery do
   (`Fathom.Shard`'s cold open) treats `:none` as "open from the stored object", which is what it
   did before this existed.
 
+  `{:refuse, %UnderQuorum{}}` when too few peers answered to rule out a fresher replica and the
+  shard's under-quorum window is still open — see "The responder floor" below. The caller refuses
+  the open with a retryable error.
+
   Options:
 
     * `:follower` — the local `Follower` instance (default `Follower`).
     * `:peers` — override the peer set, for tests.
+    * `:quorum` — override `:replication_quorum`, for tests.
     * `:query_timeout_ms` / `:pull_timeout_ms` — bounds for the two network phases.
 
   **Never raises.** This runs inside a shard's open, and a failure to improve on the stored object
   must not fail the open — the ordinary path is still correct, it just recovers less.
+
+  ## The responder floor (expert review 2026-10-12 #5)
+
+  A write is acked once Q of the primary's N followers hold it, so only a read of at least
+  `N - Q + 1` of those N is guaranteed to include one of them. This used to accept whatever subset
+  answered within the query timeout: under a partial partition, two silent peers out of four with
+  Q=2 was enough to return `:none`, open from the object, stamp a higher lineage at the first
+  flush, and reseed the replicas holding the acked tail away. Acked writes lost, with no signal.
+
+  So recovery counts DEFINITE answers — "I have this position" and "I have nothing" both count; a
+  timeout, refused connect, skipped-unreachable peer or malformed reply does not — plus this node's
+  own replica table (it is listening, so its answer is definite too). Below the floor the open is
+  refused for a bounded per-shard window (`:replication_recovery_underquorum_window_ms`, default
+  60 s) so the client retries while the partition heals. After it, the open proceeds best-effort
+  over the answers it has (never older than the stored object), with an error log and a
+  `[:fathom, :replication, :recovery_underquorum]` event. This is the user's decision on the
+  2026-10-12 review (Q1 = A): availability is traded for at most one window, never indefinitely.
+
+  N is this node's peer set and Q this node's `:replication_quorum` — the symmetric-fleet
+  assumption `peers/0` already makes (every node follows every other, one fleet-wide quorum). The
+  floor applies only when the object's stamp is RANKABLE: against an unstamped object nothing can
+  ever be promoted, so no answer could change the outcome, and a brand-new shard is never refused.
+  With no peers, or with `Q >= N` (a misconfiguration the shipping side refuses at boot), the floor
+  is at most 1, which this node's own answer meets, so those cases are unchanged.
   """
-  @spec best_replica(String.t(), map() | nil, keyword()) :: {:ok, position()} | :none
+  @spec best_replica(String.t(), map() | nil, keyword()) ::
+          {:ok, position()} | :none | {:refuse, UnderQuorum.t()}
   def best_replica(shard_id, object_stamp, opts \\ []) do
     follower = Keyword.get(opts, :follower, Follower)
     local = local_state(follower, shard_id)
+    peers = Keyword.get(opts, :peers) || peers()
+    needed = answers_needed(peers, object_stamp, opts)
 
     # Short-circuit before any socket: a node that already holds a copy ahead of the object has
-    # nothing to gain from the fleet, and this is the common case on a warm restart.
-    if Promote.fresher?(local, object_stamp) do
+    # nothing to gain from the fleet — but only when this node's answer alone meets the responder
+    # floor. Above it, a local replica ahead of the object can still be BEHIND a peer that acked
+    # writes this node never received, and adopting it loses them exactly as the object would.
+    if needed <= 1 and Promote.fresher?(local, object_stamp) do
       {:ok, local}
     else
-      search(shard_id, object_stamp, local, follower, opts)
+      search(shard_id, object_stamp, local, follower, peers, needed, opts)
     end
   rescue
     e ->
@@ -285,9 +320,31 @@ defmodule Fathom.Shard.Replication.Recovery do
       :none
   end
 
-  defp search(shard_id, object_stamp, local, follower, opts) do
-    peers = Keyword.get(opts, :peers) || peers()
+  @doc """
+  How many definite answers (this node's own included) recovery needs before it may decide:
+  `N - Q + 1`, or 0 when the stored object's stamp cannot be ranked (nothing could be promoted over
+  it anyway). Pure, for the test.
+  """
+  @spec answers_needed([endpoint()], map() | nil, keyword()) :: integer()
+  def answers_needed(peers, object_stamp, opts \\ []) do
+    if rankable_stamp?(object_stamp) do
+      length(peers) - Keyword.get(opts, :quorum, quorum()) + 1
+    else
+      0
+    end
+  end
 
+  # Mirrors the clauses of `Promote.fresher?/2` that refuse on the STAMP side: nil, lineage 0 and an
+  # unstated ordinal answer false for every replica, so no peer's answer could matter.
+  defp rankable_stamp?(%{epoch: e, wal_ordinal: n})
+       when is_integer(e) and e > 0 and is_integer(n) and n > 0,
+       do: true
+
+  defp rankable_stamp?(_stamp), do: false
+
+  defp quorum, do: Application.get_env(:fathom, :replication_quorum, 2)
+
+  defp search(shard_id, object_stamp, local, follower, peers, needed, opts) do
     cond do
       peers == [] ->
         :none
@@ -301,15 +358,160 @@ defmodule Fathom.Shard.Replication.Recovery do
         :none
 
       true ->
-        offers = ask(peers, shard_id, Keyword.get(opts, :query_timeout_ms, query_timeout_ms()))
+        answers = ask(peers, shard_id, query_timeout_ms(opts), true)
 
-        case choose(local, object_stamp, offers) do
-          :none -> :none
-          :local -> {:ok, local}
-          {:pull, endpoint, pos} -> pull(shard_id, endpoint, pos, follower, opts)
+        if answered(answers) >= needed do
+          settle(shard_id, object_stamp, local, follower, answers, needed, opts)
+        else
+          under_quorum(shard_id, object_stamp, local, follower, peers, needed, answers, opts)
         end
     end
   end
+
+  # Enough answers: any under-quorum episode is over, and the choice is the ordinary one.
+  defp settle(shard_id, object_stamp, local, follower, answers, needed, opts) do
+    if needed > 1, do: clear_underquorum(shard_id)
+    act(shard_id, choose(local, object_stamp, offers(answers)), local, follower, opts)
+  end
+
+  defp under_quorum(shard_id, object_stamp, local, follower, peers, needed, answers, opts) do
+    case underquorum_step(shard_id) do
+      {:wait, waited} ->
+        refusal = %UnderQuorum{
+          shard_id: shard_id,
+          answered: answered(answers),
+          needed: needed,
+          waited_ms: waited
+        }
+
+        Logger.warning(Exception.message(refusal))
+        emit_underquorum(refusal, :refused)
+        {:refuse, refusal}
+
+      {:expired, waited} ->
+        # The last chance before deciding on a partial view: ask again WITHOUT the unreachable
+        # cache. Inside the window the cache keeps each refusal fast (a blackholed peer would cost
+        # every retry its full connect timeout) and its 10 s TTL re-dials a recovered peer well
+        # within the window; here, one connect timeout is cheap next to losing an acked tail.
+        answers = ask(peers, shard_id, query_timeout_ms(opts), false)
+
+        if answered(answers) >= needed do
+          settle(shard_id, object_stamp, local, follower, answers, needed, opts)
+        else
+          giving_up = %UnderQuorum{
+            shard_id: shard_id,
+            answered: answered(answers),
+            needed: needed,
+            waited_ms: waited
+          }
+
+          Logger.error(
+            "shard #{shard_id}: peer recovery still has only #{giving_up.answered} of the " <>
+              "#{needed} definite answers it needs after #{waited} ms; opening best-effort from " <>
+              "what answered (the stored object unless a peer is provably ahead of it). " <>
+              "Quorum-acked writes held only by the silent peers may be lost."
+          )
+
+          emit_underquorum(giving_up, :opened_best_effort)
+          act(shard_id, choose(local, object_stamp, offers(answers)), local, follower, opts)
+        end
+    end
+  end
+
+  defp act(_shard_id, :none, _local, _follower, _opts), do: :none
+  defp act(_shard_id, :local, local, _follower, _opts), do: {:ok, local}
+
+  defp act(shard_id, {:pull, endpoint, pos}, _local, follower, opts),
+    do: pull(shard_id, endpoint, pos, follower, opts)
+
+  # `outcome` is a bounded set (`:refused` | `:opened_best_effort`), so it is safe as a metric tag.
+  defp emit_underquorum(%UnderQuorum{} = e, outcome) do
+    :telemetry.execute(
+      [:fathom, :replication, :recovery_underquorum],
+      %{count: 1, answered: e.answered, needed: e.needed, waited_ms: e.waited_ms},
+      %{shard_id: e.shard_id, outcome: outcome}
+    )
+  end
+
+  # This node's own replica table is one definite answer: `search/7` only asks when it is
+  # listening, so a nil there means "I have nothing", not "I could not tell".
+  defp answered(answers), do: 1 + Enum.count(answers, &match?({_endpoint, {:answered, _}}, &1))
+
+  defp offers(answers) do
+    Enum.map(answers, fn
+      {endpoint, {:answered, pos}} -> {endpoint, pos}
+      {endpoint, :silent} -> {endpoint, nil}
+    end)
+  end
+
+  # -- the under-quorum window -----------------------------------------------------------------
+  #
+  # PER SHARD, PER NODE, and anchored at the FIRST refusal so retries do not extend it: each retry
+  # is a fresh coordinator that asks again and fails fast, and this row is the only state that spans
+  # them. Per node is enough because the LB hashes a shard to one node; a shard that moves starts a
+  # window there, which can only add one more bounded wait.
+  #
+  # A row nobody has touched for two windows is a PAST episode, not this one — otherwise a shard
+  # refused once and then left alone for an hour would skip the wait entirely at its next failover.
+  @underquorum_table __MODULE__.UnderQuorumWindow
+
+  @doc """
+  One step of a shard's under-quorum window. Pure, for the test.
+
+  `entry` is `{first_ms, last_ms}` from the previous refusal (or nil), `now` a monotonic
+  millisecond reading. Returns `{:wait, waited_ms, entry}` (refuse, and store `entry`) or
+  `{:expired, waited_ms}` (stop refusing; the caller forgets the row).
+  """
+  @spec window_step({integer(), integer()} | nil, integer(), integer()) ::
+          {:wait, integer(), {integer(), integer()}} | {:expired, integer()}
+  def window_step(nil, now, window_ms), do: window_start(now, window_ms)
+
+  def window_step({_first, last}, now, window_ms) when now - last > 2 * window_ms,
+    do: window_start(now, window_ms)
+
+  def window_step({first, _last}, now, window_ms) when now - first >= window_ms,
+    do: {:expired, now - first}
+
+  def window_step({first, _last}, now, _window_ms), do: {:wait, now - first, {first, now}}
+
+  defp window_start(_now, window_ms) when window_ms <= 0, do: {:expired, 0}
+  defp window_start(now, _window_ms), do: {:wait, 0, {now, now}}
+
+  # A MISSING TABLE FAILS OPEN (best-effort, still logged at error by the caller). The table is
+  # owned by `Fleet`, which also supervises the `Follower` this path requires, so it is absent only
+  # in a harness that started a follower by hand; refusing forever there is the worse failure.
+  defp underquorum_step(shard_id) do
+    now = System.monotonic_time(:millisecond)
+
+    entry =
+      case :ets.lookup(@underquorum_table, shard_id) do
+        [{_, first, last}] -> {first, last}
+        [] -> nil
+      end
+
+    case window_step(entry, now, underquorum_window_ms()) do
+      {:wait, waited, {first, last}} ->
+        :ets.insert(@underquorum_table, {shard_id, first, last})
+        {:wait, waited}
+
+      {:expired, waited} ->
+        :ets.delete(@underquorum_table, shard_id)
+        {:expired, waited}
+    end
+  rescue
+    ArgumentError -> {:expired, 0}
+  end
+
+  defp clear_underquorum(shard_id) do
+    :ets.delete(@underquorum_table, shard_id)
+  rescue
+    ArgumentError -> true
+  end
+
+  defp underquorum_window_ms,
+    do: Application.get_env(:fathom, :replication_recovery_underquorum_window_ms, 60_000)
+
+  defp query_timeout_ms(opts), do: Keyword.get(opts, :query_timeout_ms, query_timeout_ms())
 
   @doc """
   The nodes to ask: the live shipper set when this node is replicating, else the configured list.
@@ -333,25 +535,30 @@ defmodule Fathom.Shard.Replication.Recovery do
   # Every peer at once, bounded by one shared timeout. Sequentially this would be N round trips on
   # the cold-open path; concurrently it is one, which is what makes asking affordable enough to do
   # on every promote-eligible open rather than only when an operator suspects a failover.
-  defp ask(peers, shard_id, timeout_ms) do
+  #
+  # Each peer answers `{:answered, position | nil}` — a definite reply, "nothing" included — or
+  # `:silent`, which the responder floor does not count (expert review 2026-10-12 #5). A peer that
+  # timed out, refused, crashed or was skipped as unreachable is silent.
+  defp ask(peers, shard_id, timeout_ms, honor_unreachable?) do
     peers
-    |> Task.async_stream(&ask_one(&1, shard_id, timeout_ms),
+    |> Task.async_stream(&ask_one(&1, shard_id, timeout_ms, honor_unreachable?),
       timeout: timeout_ms + @connect_timeout,
       on_timeout: :kill_task,
       max_concurrency: max(length(peers), 1),
       ordered: false
     )
     |> Enum.flat_map(fn
-      {:ok, {endpoint, pos}} -> [{endpoint, pos}]
+      {:ok, {endpoint, answer}} -> [{endpoint, answer}]
       # A peer that timed out, refused, or crashed contributes nothing. NOT an error: the whole
       # point of a quorum is that some nodes are gone, and a failover is when that is most likely.
+      # It is also not an answer, which is what the responder floor counts.
       _ -> []
     end)
   end
 
-  defp ask_one({_key, host, port} = endpoint, shard_id, timeout_ms) do
-    if unreachable?(endpoint) do
-      {endpoint, nil}
+  defp ask_one({_key, host, port} = endpoint, shard_id, timeout_ms, honor_unreachable?) do
+    if honor_unreachable? and unreachable?(endpoint) do
+      {endpoint, :silent}
     else
       case connect(host, port) do
         {:ok, sock} ->
@@ -365,7 +572,7 @@ defmodule Fathom.Shard.Replication.Recovery do
 
         {:error, reason} ->
           note_unreachable(endpoint, reason)
-          {endpoint, nil}
+          {endpoint, :silent}
       end
     end
   end
@@ -393,11 +600,18 @@ defmodule Fathom.Shard.Replication.Recovery do
   @doc false
   # Owned by `Fleet`'s supervisor, created before any shard can open. Idempotent for tests.
   @spec init_table() :: :ok
+  # Also creates the per-shard under-quorum window table (expert review 2026-10-12 #5), each
+  # independently so an existing one does not stop the other being created.
   def init_table do
-    :ets.new(@unreachable_table, [:named_table, :public, :set, read_concurrency: true])
+    for table <- [@unreachable_table, @underquorum_table] do
+      try do
+        :ets.new(table, [:named_table, :public, :set, read_concurrency: true])
+      rescue
+        ArgumentError -> table
+      end
+    end
+
     :ok
-  rescue
-    ArgumentError -> :ok
   end
 
   @doc false
@@ -445,12 +659,12 @@ defmodule Fathom.Shard.Replication.Recovery do
     with :ok <- :gen_tcp.send(sock, Protocol.encode_position_query(shard_id)),
          {:ok, bytes} <- :gen_tcp.recv(sock, 0, timeout_ms),
          {:ok, {:position, ^shard_id, pos}} <- Protocol.decode(bytes) do
-      pos
+      {:answered, pos}
     else
       # Includes a peer one deploy behind, which answers `{:error, :malformed}` and closes: see the
       # note in `Protocol` on why these frames were added without bumping the version. It also
       # includes a reply naming a DIFFERENT shard, which is refused rather than trusted.
-      _ -> nil
+      _ -> :silent
     end
   end
 

@@ -140,6 +140,30 @@ subsystem exists for.
 pull installs through its local replica directory. That matches the documented rollout order, and a
 node that cannot hold a replica could not be a useful survivor for anyone else either.
 
+### Recovery needs N−Q+1 answers, or it waits (2026-10-12 #5)
+
+A write is acked at Q of N followers, so only a read of **N−Q+1** of them is guaranteed to see it.
+Recovery used to decide on whatever subset answered within `REPLICATION_RECOVERY_TIMEOUT_MS`: under
+a partial partition it could hear only peers lacking the acked tail, open from the stored object,
+stamp a higher lineage at the first flush, and reseed the replicas holding that tail away. Acked
+writes were lost, with no signal anywhere.
+
+`Recovery.best_replica/3` now counts **definite** answers, this node's own replica table included:
+"I hold position P" and "I hold nothing" both count; a timeout, a refused connect, a peer skipped by
+the unreachable cache, and a malformed reply do not. Below the floor the open is **refused** with a
+retryable 503 (`FILO_RECOVERING`). Each attempt releases the lease and deletes its cold pull, so
+nothing is held and the retry asks again. The refusals are bounded by a per-shard window
+(`REPLICATION_RECOVERY_UNDERQUORUM_WINDOW_MS`, default 60 s, anchored at the first refusal). After
+it, the fleet is asked once more with the unreachable cache bypassed. Then the open proceeds
+best-effort over what answered, with an error log and `[:fathom, :replication, :recovery_underquorum]`
+(`outcome: :opened_best_effort`). The floor also gates the local short-circuit: a local replica
+ahead of the object can still be behind a silent peer.
+
+N and Q are this node's peer set and `REPLICATION_QUORUM`, which assumes a symmetric fleet with one
+quorum. The floor applies only against a rankable object stamp, so a brand-new shard is never
+refused. With no peers or with recovery off, nothing changes. A lone survivor of an N≥2 fleet waits
+out one window and then opens best-effort.
+
 ### The touch erased the stamp, and that is why nothing was ever promoted
 
 The bug `chaos.sh rpo` found the first time it ran, and the reason building the scenario was worth
