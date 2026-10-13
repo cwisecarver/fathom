@@ -2096,11 +2096,15 @@ defmodule Fathom.Shard.Storage.S3 do
                       # the takeover revalidation needs the SOURCE etag the touch
                       # If-Matched to tell "our own lineage, moved no bytes" from a
                       # zombie flush laundered into the touched object.
+                      # The touch's ORIGIN chains through a clean released marker's provenance
+                      # (expert review 2026-10-12 #10), so a holder whose local copy predates an
+                      # intermediate clean visitor's touch is recognised as unforked.
                       {:ok,
                        lease
                        |> Map.put(:took_over, true)
                        |> Map.put(:touch_pre_etag, pre)
-                       |> Map.put(:touch_post_etag, post)}
+                       |> Map.put(:touch_post_etag, post)
+                       |> Map.put(:touch_origin_etag, Storage.touch_origin(dead_lock, pre))}
 
                     # Fail closed: an un-fenced steal is not a steal — but the epoch+1
                     # lock write already LANDED, and leaving it would let our own next

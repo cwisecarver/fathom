@@ -85,7 +85,12 @@ defmodule Fathom.Shard.Storage do
           # while replicating; a fresh create carries none. `:unknown` is no longer produced: an
           # unreadable claim fails the acquire closed instead (`with_takeover_claim/3`, expert review
           # 2026-10-12 #21).
-          optional(:claim) => pos_integer() | :unknown
+          optional(:claim) => pos_integer() | :unknown,
+          # TOUCH PROVENANCE on a released marker (expert review 2026-10-12 #10): the stored object
+          # at `touched_to` holds exactly the bytes the object had at etag `touched_from`, and no
+          # owner wrote in between. See `with_clean_touch/1`.
+          optional(:touched_from) => String.t(),
+          optional(:touched_to) => String.t()
         }
 
   @typedoc """
@@ -861,8 +866,57 @@ defmodule Fathom.Shard.Storage do
   Shared so every backend writes the identical marker.
   """
   @spec released_marker(lease(), pos_integer()) :: lease()
-  def released_marker(%{epoch: epoch}, claim) when is_integer(claim) and claim > 0,
-    do: %{owner: @released_owner, epoch: epoch, expires_at_ms: 0, claim: claim}
+  def released_marker(%{epoch: epoch} = lease, claim) when is_integer(claim) and claim > 0 do
+    marker = %{owner: @released_owner, epoch: epoch, expires_at_ms: 0, claim: claim}
+
+    case lease do
+      %{clean_touch: {from, to}} when is_binary(from) and is_binary(to) ->
+        Map.merge(marker, %{touched_from: from, touched_to: to})
+
+      _ ->
+        marker
+    end
+  end
+
+  @doc """
+  `lease` annotated so the released marker it leaves records its steal-touch's provenance (expert
+  review 2026-10-12 #10). ONLY for a CLEAN release — a holder that wrote nothing.
+
+  A steal rotates the data object's etag with a byte-identical self-copy (`touch_object`), so a
+  zombie's late `If-Match` PUT fails. The cost: the previous holder's local copy is stamped with the
+  PRE-touch etag, and when it reopens later its fork check sees `sidecar != store` and quarantines
+  its own acked copy as a fork — though only a touch happened. The marker carries `touched_from`
+  (the etag whose bytes the object still holds: this lease's touch ORIGIN, which itself chains
+  through an earlier clean marker — see `touch_origin/2`) and `touched_to` (the touch's output), so
+  the next stealer can tell "only touches since your sidecar" from a real fork.
+
+  Never for a dirty release: a holder that wrote without making it durable may have shipped A2
+  frames above the previous holder's, and forgiving the touch would let a warm local pre-empt the
+  promotion of those writes. A lease with no touch (a fresh create, a renewed legacy lease) is
+  returned unchanged, which is the pre-fix behaviour (fork).
+  """
+  @spec with_clean_touch(map()) :: map()
+  def with_clean_touch(%{touch_post_etag: to} = lease) when is_binary(to) do
+    case Map.get(lease, :touch_origin_etag) || Map.get(lease, :touch_pre_etag) do
+      from when is_binary(from) -> Map.put(lease, :clean_touch, {from, to})
+      _ -> lease
+    end
+  end
+
+  def with_clean_touch(lease), do: lease
+
+  @doc """
+  The ORIGIN of a steal-touch that rotated the object from `pre` (expert review 2026-10-12 #10): the
+  etag whose bytes the object still holds. When the stolen lock was a clean released marker whose
+  own touch produced exactly `pre`, the bytes at `pre` are those at the marker's `touched_from`, so
+  the chain continues; otherwise (a write landed since, or no provenance) it is `pre` itself.
+  """
+  @spec touch_origin(map(), String.t() | nil) :: String.t() | nil
+  def touch_origin(%{touched_to: to, touched_from: from}, pre)
+      when is_binary(to) and is_binary(from) and to == pre,
+      do: from
+
+  def touch_origin(_stolen_lock, pre), do: pre
 
   @doc "The sentinel owner `released_marker/2` writes."
   @spec released_owner() :: String.t()
@@ -1116,9 +1170,20 @@ defmodule Fathom.Shard.Storage do
   def encode_lease(%{owner: owner, epoch: epoch, expires_at_ms: exp} = lease) do
     base = %{"owner" => owner, "epoch" => epoch, "expires_at_ms" => exp}
 
-    case Map.get(lease, :claim) do
-      claim when is_integer(claim) -> Jason.encode!(Map.put(base, "claim", claim))
-      _ -> Jason.encode!(base)
+    base =
+      case Map.get(lease, :claim) do
+        claim when is_integer(claim) -> Map.put(base, "claim", claim)
+        _ -> base
+      end
+
+    # Touch provenance rides only on a released marker (expert review 2026-10-12 #10); absent
+    # otherwise, so every other lock body is byte-identical to before.
+    case lease do
+      %{touched_from: from, touched_to: to} when is_binary(from) and is_binary(to) ->
+        Jason.encode!(Map.merge(base, %{"touched_from" => from, "touched_to" => to}))
+
+      _ ->
+        Jason.encode!(base)
     end
   end
 
@@ -1130,9 +1195,18 @@ defmodule Fathom.Shard.Storage do
       when is_binary(owner) and is_integer(epoch) and is_integer(exp) ->
         lease = %{owner: owner, epoch: epoch, expires_at_ms: exp}
 
-        case Map.get(m, "claim") do
-          claim when is_integer(claim) and claim > 0 -> {:ok, Map.put(lease, :claim, claim)}
-          _ -> {:ok, lease}
+        lease =
+          case Map.get(m, "claim") do
+            claim when is_integer(claim) and claim > 0 -> Map.put(lease, :claim, claim)
+            _ -> lease
+          end
+
+        case m do
+          %{"touched_from" => from, "touched_to" => to} when is_binary(from) and is_binary(to) ->
+            {:ok, Map.merge(lease, %{touched_from: from, touched_to: to})}
+
+          _ ->
+            {:ok, lease}
         end
 
       _ ->

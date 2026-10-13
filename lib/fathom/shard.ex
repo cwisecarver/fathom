@@ -1070,6 +1070,7 @@ defmodule Fathom.Shard do
   defp revalidate_touched(shard_id, path, lease, etag, warm?) do
     post = lease[:touch_post_etag]
     pre = lease[:touch_pre_etag]
+    origin = lease[:touch_origin_etag]
 
     cond do
       # The speculative pull already captured the post-touch object.
@@ -1089,6 +1090,13 @@ defmodule Fathom.Shard do
         # contract.
         case Provenance.read(path) do
           {:ok, provenance} when is_binary(pre) and provenance == pre ->
+            Provenance.write(path, post)
+            {:ok, post}
+
+          # The touch's ORIGIN (expert review 2026-10-12 #10): `pre` was itself only a clean
+          # visitor's touch of this file's provenance, recorded in the marker we stole — the same
+          # bytes, so the same argument as the clause above.
+          {:ok, provenance} when is_binary(origin) and provenance == origin ->
             Provenance.write(path, post)
             {:ok, post}
 
@@ -2970,8 +2978,16 @@ defmodule Fathom.Shard do
   defp release_clean(state) do
     unmark_lease_held(state.id)
 
+    # Clean ⇒ this holder wrote nothing, so the marker may also record its steal-touch's provenance
+    # (expert review 2026-10-12 #10, `Storage.with_clean_touch/1`): a previous holder reopening with
+    # an older local copy then sees "only touches since your sidecar" instead of a fork.
     if is_map(state.lease),
-      do: Storage.release_lease(state.id, state.lease, unstamped_claim(state))
+      do:
+        Storage.release_lease(
+          state.id,
+          Storage.with_clean_touch(state.lease),
+          unstamped_claim(state)
+        )
   end
 
   defp unstamped_claim(%{lineage_stamped?: false, lease: %{claim: claim}})

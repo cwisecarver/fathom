@@ -159,7 +159,7 @@ defmodule Fathom.Shard.Fork do
     #
     # Anything else is a real fork. In particular the zombie-flush race (B2) is NOT captured here:
     # there the touch sources the ZOMBIE's etag, so `pre != sidecar` and we still quarantine.
-    if lease[:touch_pre_etag] == sidecar and lease[:touch_post_etag] == store do
+    if own_touch?(lease, sidecar, store) or touched_since?(lease, sidecar, store) do
       false
     else
       case adopt_own_put(shard_id, path) do
@@ -168,6 +168,27 @@ defmodule Fathom.Shard.Fork do
         :fork -> quarantine!(shard_id, path, :diverged) == :ok
       end
     end
+  end
+
+  defp own_touch?(lease, sidecar, store),
+    do: lease[:touch_pre_etag] == sidecar and lease[:touch_post_etag] == store
+
+  # ONLY TOUCHES SINCE THE SIDECAR (expert review 2026-10-12 #10). A previous holder that failed its
+  # drop flush kept its local copy (sidecar E0) and left a released marker; a peer then stole the
+  # marker, which rotated the object E0 -> E1 with a byte-identical touch, and dropped CLEAN. Our own
+  # steal of the peer's marker touched again. Without this, `sidecar E0` vs `store E1|E2` read as a
+  # fork and our acked local copy was quarantined while the (older) stored object served.
+  #
+  # `touch_origin_etag` is the etag whose bytes the store still holds, chained through the clean
+  # marker's provenance (`Storage.touch_origin/2`): equal to our sidecar ⇒ the local copy descends
+  # from exactly those bytes. The store may be read before our touch (`pre`) or after it (`post`);
+  # both hold the origin's bytes. Not "skip the touch" (the panel's primary prescription): the touch
+  # is what makes a zombie's late `If-Match` PUT fail, so it stays and only its provenance is added.
+  defp touched_since?(lease, sidecar, store) do
+    origin = lease[:touch_origin_etag]
+
+    is_binary(origin) and origin == sidecar and
+      (store == lease[:touch_pre_etag] or store == lease[:touch_post_etag])
   end
 
   # A stored object that is EXACTLY the snapshot this node was about to PUT is this node's own
