@@ -155,7 +155,8 @@ defmodule Fathom.Tenants do
             try do
               Storage.fork_shard(src, dst)
             after
-              Storage.release_lease(dst, lease)
+              # Keeps a takeover's lineage claim (expert review 2026-10-12 #3).
+              Storage.release_lease(dst, lease, lease[:claim])
             end
 
           # Another node/coordinator holds the dst lease — refuse rather than clobber it.

@@ -479,7 +479,9 @@ defmodule Fathom.Migrator.ShardMigration do
           fun.(lease)
         after
           stop_renewer(renewer)
-          Storage.release_lease(shard_id, lease)
+
+          # Keeps a takeover's lineage claim (expert review 2026-10-12 #3, `Storage.release_lease/3`).
+          Storage.release_lease(shard_id, lease, lease[:claim])
         end
 
       {:error, reason} ->

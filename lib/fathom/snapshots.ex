@@ -219,7 +219,8 @@ defmodule Fathom.Snapshots do
                 # release_lease's conditional DELETE If-Matches the stale etag, 412s, and its 412
                 # fallback GETs the lock, confirms this owner still holds it, and DELETEs — the same
                 # rotate-then-release path `Fathom.Shard.flush_then_drop` documents.
-                Storage.release_lease(id, lease)
+                # Keeps a takeover's lineage claim (expert review 2026-10-12 #3).
+                Storage.release_lease(id, lease, lease[:claim])
               end
 
             {:error, {:held, owner, at}} ->

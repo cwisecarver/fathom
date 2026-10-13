@@ -637,7 +637,8 @@ defmodule Fathom.Shard do
     released =
       try do
         unmark_lease_held(shard_id)
-        Storage.release_lease(shard_id, lease)
+        # A takeover lease's claim survives the failed open (expert review 2026-10-12 #3).
+        Storage.release_lease(shard_id, lease, lease[:claim])
       rescue
         e -> {:error, e}
       catch
@@ -833,6 +834,11 @@ defmodule Fathom.Shard do
         # slot (expert review 2026-08-20 #8). Fixed for the coordinator's life; see open_lineage/1
         # and stamp_epoch/1. `:disabled` when replication is off, which is the no-op default.
         lineage: lineage,
+        # Has an object write from THIS coordinator stamped `lineage` onto the stored object (a
+        # successful flush, or a promote-on-open publish)? Until one has, a takeover lease's claim
+        # is recorded only in the lock, so a release must keep it (expert review 2026-10-12 #3,
+        # `release_clean/1`).
+        lineage_stamped?: PromoteOnOpen.etag_of(promoted) != etag1,
         # The current etag of the remote object (nil = brand-new / no object yet). The flush
         # fence If-Matches it so a stale PUT can't clobber a stealer (finding #15); each
         # successful flush advances it.
@@ -1007,8 +1013,16 @@ defmodule Fathom.Shard do
       {:error, reason} ->
         # Couldn't make the file available — give the lease back so another node
         # can try, rather than holding a shard we can't serve.
+        #
+        # KEEPING A TAKEOVER'S CLAIM (expert review 2026-10-12 #3). A takeover lock records a claim
+        # strictly above the dead holder's lineage, and the dead holder may have shipped A2 frames
+        # under that lineage without ever stamping it. That claim exists nowhere else: deleting the
+        # lock here made the next opener a fresh create at `next_lineage(object)` — possibly the
+        # dead holder's own number, so followers saw one ownership (or `:stale_epoch` forever) and
+        # promote-on-open declined the dead holder's replica. A fresh-create lease has no claim and
+        # still deletes.
         unmark_lease_held(shard_id)
-        Storage.release_lease(shard_id, lease)
+        Storage.release_lease(shard_id, lease, lease[:claim])
         {:stop, {:shutdown, {:pull_failed, reason}}, %{id: shard_id}}
     end
   end
@@ -2671,7 +2685,7 @@ defmodule Fathom.Shard do
     # connection open). The old file-gated release leaked the lock object: the next
     # same-owner open silently downgraded from the optimistic 1-RTT create to the reclaim
     # path, and a foreign node saw {:held, us} for as long as our heartbeat stayed fresh.
-    release_plain(state)
+    release_clean(state)
 
     :ok
   end
@@ -2915,6 +2929,26 @@ defmodule Fathom.Shard do
     unmark_lease_held(state.id)
     if is_map(state.lease), do: Storage.release_lease(state.id, state.lease)
   end
+
+  # The CLEAN drop's release (expert review 2026-10-12 #3). A clean coordinator shipped nothing of
+  # its own, but a TAKEOVER lease carries a claim strictly above the previous holder's lineage, and
+  # that holder may have shipped frames under its lineage without stamping it. Until one of OUR
+  # writes stamps the object (`lineage_stamped?`), the lock is the only record of that bound, so
+  # deleting it let the next opener fresh-create at `next_lineage(object)` — possibly the previous
+  # holder's own number. Keep the claim in a released marker instead. A fresh-create lease (no
+  # claim) or a stamped one still deletes, which keeps the 1-RTT fresh-create reopen the common path.
+  defp release_clean(state) do
+    unmark_lease_held(state.id)
+
+    if is_map(state.lease),
+      do: Storage.release_lease(state.id, state.lease, unstamped_claim(state))
+  end
+
+  defp unstamped_claim(%{lineage_stamped?: false, lease: %{claim: claim}})
+       when is_integer(claim),
+       do: claim
+
+  defp unstamped_claim(_state), do: nil
 
   # The registry mark `open_with_lease/8` sets (`:lease_held`) tells this node's replication follower
   # "a coordinator HERE owns this shard, refuse wire frames for it" (expert review 2026-10-10 #1). It
@@ -4158,6 +4192,8 @@ defmodule Fathom.Shard do
       | flushed_through: state.flush_pending,
         counter_gen: state.flush_pending_gen,
         etag: new_etag,
+        # The flush stamped this coordinator's lineage onto the object (expert review 2026-10-12 #3).
+        lineage_stamped?: true,
         # CACHE WHAT THE BACKEND SAID IT CARRIED (expert review 2026-08-26 #33) — but never
         # `:unknown`, which is a refusal to state one (`Storage.Local`, whose lineage lives in its
         # own sidecar and costs nothing to leave alone). Caching a refusal would hand a fabricated

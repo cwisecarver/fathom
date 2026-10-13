@@ -216,7 +216,8 @@ defmodule Fathom.Shard.Replication.Promote do
         # nothing but still reads as a live owner, so it would block every other node from opening
         # the shard until it expired. Handing back a free lease over freshly-flushed bytes lets the
         # ordinary open path take it — from either this node or another.
-        Storage.release_lease(shard_id, lease)
+        # Keeps a takeover's lineage claim (expert review 2026-10-12 #3).
+        Storage.release_lease(shard_id, lease, lease[:claim])
       end
     end
   end
@@ -460,7 +461,8 @@ defmodule Fathom.Shard.Replication.Promote do
             {:ok, lease}
 
           {:error, _} = err ->
-            Storage.release_lease(shard_id, lease)
+            # Keeps a takeover's lineage claim (expert review 2026-10-12 #3).
+            Storage.release_lease(shard_id, lease, lease[:claim])
             err
         end
 
