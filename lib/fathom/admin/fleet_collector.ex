@@ -37,6 +37,8 @@ defmodule Fathom.Admin.FleetCollector do
   # timescales, so a 5 s cadence was paying directory-scale reads for numbers that had not changed.
   @default_refresh_ms 15_000
   @topic "admin:fleet"
+  @page_table :fathom_admin_migrations_page
+  @default_page_ttl_ms 10_000
 
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -65,8 +67,52 @@ defmodule Fathom.Admin.FleetCollector do
     :exit, _ -> nil
   end
 
+  @doc """
+  The migrations page's data (`Fleet.migrations/0` + `Fleet.oban_counts/0`), cached for
+  `:admin_migrations_cache_ms` (default 10 s) in an ETS table this collector owns.
+
+  Expert review 2026-10-12 #33: `AdminMigrationsLive` ran those directory-scale reads on its own 5 s
+  timer per open tab, the O(viewers) shape expert review 2026-07-24 #13 removed from the overview.
+  Inside the window a tab reuses the last result, so a node's cost is bounded by the TTL, not the
+  tab count. Computed in the CALLER (the LiveView's async task), never in the collector, so a slow
+  query can't block it. A failed compute raises and is not cached (the LiveView keeps its last-good
+  data). Without the collector (dashboard gating off, tests) there is no table and it computes
+  uncached.
+  """
+  @spec migrations_page() :: %{mig: map(), oban: list()}
+  def migrations_page do
+    ttl = Application.get_env(:fathom, :admin_migrations_cache_ms, @default_page_ttl_ms)
+    now = System.monotonic_time(:millisecond)
+
+    case lookup_page() do
+      {at, page} when now - at < ttl ->
+        page
+
+      _ ->
+        page = %{mig: Fleet.migrations(), oban: Fleet.oban_counts()}
+        store_page({now, page})
+        page
+    end
+  end
+
+  defp lookup_page do
+    case :ets.lookup(@page_table, :page) do
+      [{:page, entry}] -> entry
+      [] -> nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp store_page(entry) do
+    :ets.insert(@page_table, {:page, entry})
+  rescue
+    ArgumentError -> :ok
+  end
+
   @impl true
   def init(_opts) do
+    :ets.new(@page_table, [:named_table, :public, :set])
     # No poll at boot: nobody is watching yet. The first `watch/0` starts the loop.
     {:ok, %{current: nil, task: nil, timer: nil, watchers: %{}}}
   end

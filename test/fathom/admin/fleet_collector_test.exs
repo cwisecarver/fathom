@@ -105,4 +105,45 @@ defmodule Fathom.Admin.FleetCollectorTest do
     refute Process.whereis(FleetCollector)
     assert FleetCollector.snapshot() == nil
   end
+
+  # Expert review 2026-10-12 #33: AdminMigrationsLive ran Fleet.migrations/0 + oban_counts/0 per open
+  # tab every 5 s. Inside the TTL every tab must reuse one result (cost per node bounded by the TTL,
+  # not the tab count); a TTL of 0 recomputes.
+  describe "migrations_page/0 cache (expert review 2026-10-12 #33)" do
+    setup do
+      prev = Application.get_env(:fathom, :admin_migrations_cache_ms)
+      Application.put_env(:fathom, :admin_migrations_cache_ms, 60_000)
+
+      on_exit(fn ->
+        if is_nil(prev),
+          do: Application.delete_env(:fathom, :admin_migrations_cache_ms),
+          else: Application.put_env(:fathom, :admin_migrations_cache_ms, prev)
+      end)
+
+      start_supervised!(FleetCollector)
+      :ok
+    end
+
+    test "a second call inside the TTL reuses the cached page; TTL 0 recomputes" do
+      first = FleetCollector.migrations_page()
+      assert %{mig: %{head: _}, oban: oban} = first
+      assert is_list(oban)
+
+      # Plant a sentinel as the cached entry: a call inside the TTL must return it untouched.
+      :ets.insert(
+        :fathom_admin_migrations_page,
+        {:page, {System.monotonic_time(:millisecond), :cached}}
+      )
+
+      assert FleetCollector.migrations_page() == :cached
+
+      Application.put_env(:fathom, :admin_migrations_cache_ms, 0)
+      assert %{mig: %{head: _}} = FleetCollector.migrations_page()
+    end
+  end
+
+  test "migrations_page/0 computes uncached when the collector isn't running" do
+    refute Process.whereis(FleetCollector)
+    assert %{mig: %{head: _}, oban: _} = FleetCollector.migrations_page()
+  end
 end

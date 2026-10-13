@@ -28,7 +28,7 @@ defmodule FathomWeb.AdminMigrationsLive do
 
   import FathomWeb.AdminComponents
 
-  alias Fathom.Admin.Fleet
+  alias Fathom.Admin.FleetCollector
 
   @fleet_refresh_ms 5_000
 
@@ -51,7 +51,7 @@ defmodule FathomWeb.AdminMigrationsLive do
   defp load_fleet(socket, false), do: socket
 
   defp load_fleet(socket, true) do
-    start_async(socket, :fleet, fn -> %{mig: Fleet.migrations(), oban: Fleet.oban_counts()} end)
+    start_async(socket, :fleet, &FleetCollector.migrations_page/0)
   end
 
   @impl true
