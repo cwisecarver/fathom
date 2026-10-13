@@ -572,6 +572,17 @@ defmodule Fathom.Migrator.Capture do
         Enum.any?(@dml_leads, &String.starts_with?(lead, &1)) ->
           not shard_local_row_copy?(lead, down)
 
+        # Expert review 2026-10-12 #28. DDL that carries rows is not DML by its lead verb, so it
+        # needs its own flags: a `CREATE TABLE … AS SELECT` writes the SELECT's rows at migrate
+        # time, and a `CREATE TRIGGER` body runs DML on every later write to its table. Lead-token
+        # + clause checks, not a parse — a plain CREATE TABLE / CREATE INDEX stays unflagged.
+        Regex.match?(~r/\Acreate\s+(?:temp\s+|temporary\s+)?trigger\b/, head) ->
+          true
+
+        Regex.match?(~r/\Acreate\s+(?:temp\s+|temporary\s+)?table\b/, head) and
+            Regex.match?(~r/\bas\s+(?:select|with|values)\b/, down) ->
+          true
+
         true ->
           false
       end

@@ -643,6 +643,35 @@ defmodule Fathom.Migrator.CaptureTest do
              "a real table-rebuild copy (INSERT..SELECT ... FROM) must stay exempt"
     end
 
+    # Expert review 2026-10-12 #28. The lint only flagged DML leads, so a `CREATE TABLE … AS SELECT`
+    # (which writes rows) and a `CREATE TRIGGER` (whose body runs DML on every later write) both
+    # auto-advanced HEAD with their data literals unreviewed and replayed fleet-wide. Pre-fix every
+    # element of `seeds` returns []. Plain DDL (CREATE TABLE, CREATE INDEX, CREATE TRIGGER-free
+    # schema) must stay unflagged, or every ordinary migration would need a review click.
+    test "flags CREATE TABLE … AS SELECT and CREATE TRIGGER, not plain DDL (#28)" do
+      seeds = [
+        ~s|CREATE TABLE "seed" AS SELECT 1 AS a|,
+        "create temp table t2 as with src(v) as (values ('x')) select v from src",
+        "-- seed\nCREATE TABLE seed2 AS SELECT 'from-template' AS slug",
+        ~s|CREATE TRIGGER "t_ins" AFTER INSERT ON "app_thing" BEGIN UPDATE "app_thing" SET slug = 'x'; END|,
+        "create temporary trigger t_del before delete on app_thing begin select 1; end"
+      ]
+
+      for sql <- seeds do
+        assert Capture.data_migration_statements([sql]) == [sql],
+               "the lint did not flag a row-writing DDL statement: #{inspect(sql)}"
+      end
+
+      for sql <- [
+            ~s|CREATE TABLE "app_thing" ("id" integer NOT NULL PRIMARY KEY, "slug" varchar(50))|,
+            ~s|CREATE INDEX "app_thing_slug" ON "app_thing" ("slug")|,
+            ~s|CREATE UNIQUE INDEX "u" ON "app_thing" ("slug")|
+          ] do
+        assert Capture.data_migration_statements([sql]) == [],
+               "plain DDL was flagged as a data migration: #{inspect(sql)}"
+      end
+    end
+
     # Expert review 2026-09-29 #18. The lint classified on `String.trim_leading/1` and exempted any
     # statement whose TEXT contained "django_migrations", so each of these was captured UNFLAGGED —
     # HEAD auto-advanced and the template's literals replayed onto every shard with no review:
