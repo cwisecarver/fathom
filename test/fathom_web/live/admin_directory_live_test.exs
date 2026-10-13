@@ -99,6 +99,28 @@ defmodule FathomWeb.AdminDirectoryLiveTest do
     assert row.status == "retired"
   end
 
+  # Expert review 2026-10-12 #30. The operator opens the editor on an active row, a delete lands
+  # while the edit is open, and the operator submits "active". The guarded write refuses with
+  # :status_conflict. The LiveView must answer with a flash, not crash on an unhandled case clause,
+  # and the tombstone must stay a tombstone. Pre-fix the unguarded write resurrected the row.
+  test "an edit that loses a race with a delete is refused with a flash, not a crash",
+       %{conn: conn} do
+    put_shard(%{shard_id: "ui_race", status: "active"})
+
+    {:ok, view, _html} = conn |> auth() |> live("/admin/directory")
+    view |> element("#dir-edit-ui_race") |> render_click()
+    assert has_element?(view, "#directory-edit-form")
+
+    {:ok, _} = Directory.tombstone("ui_race")
+
+    view
+    |> element("#directory-edit-form")
+    |> render_submit(%{"edit" => %{"status" => "active", "retain_until" => ""}})
+
+    assert render(view) =~ "changed state while you were editing"
+    assert {:ok, %{status: "deleted"}} = Directory.get("ui_race")
+  end
+
   test "shows export + delete actions for a live tenant and hides them for a deleted one",
        %{conn: conn} do
     put_shard(%{shard_id: "ui_live", status: "active"})

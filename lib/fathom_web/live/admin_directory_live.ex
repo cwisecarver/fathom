@@ -209,6 +209,15 @@ defmodule FathomWeb.AdminDirectoryLive do
          |> assign(editing: nil)
          |> put_flash(:error, "#{shard_id} no longer exists")
          |> load()}
+
+      # expert review 2026-10-12 #30: the row moved to a lifecycle state the admin may not flip
+      # (deleted, suspended) while the edit was open. Refuse with a message, not a CaseClauseError.
+      {:error, :status_conflict} ->
+        {:noreply,
+         socket
+         |> assign(editing: nil)
+         |> put_flash(:error, "#{shard_id} changed state while you were editing; not updated")
+         |> load()}
     end
   end
 

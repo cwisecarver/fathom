@@ -1732,12 +1732,26 @@ defmodule Fathom.Directory do
   (the migration-state-machine fields can't be hand-flipped here). Returns
   `{:error, :not_found}` for an unknown shard.
   """
+  # The write is also FROM-STATUS guarded (expert review 2026-10-12 #30): it lands only while the
+  # row is still in an admin-editable status. Without that, a DELETED row could be set back to
+  # `active` (resurrecting a tombstoned tenant), and a SUSPENDED row set to `active` would bypass
+  # `Suspensions.remove`. A row that moved to a lifecycle state the admin may not flip returns
+  # `{:error, :status_conflict}`, the same contract as the migration engine's guarded writes.
   @spec admin_update(String.t(), map()) ::
-          {:ok, Shard.t()} | {:error, :not_found | Ecto.Changeset.t()}
+          {:ok, Shard.t()} | {:error, :not_found | :status_conflict | Ecto.Changeset.t()}
   def admin_update(shard_id, attrs) do
     case Repo.get_by(Shard, shard_id: shard_id) do
-      nil -> {:error, :not_found}
-      shard -> shard |> Shard.admin_changeset(attrs) |> Repo.update()
+      nil ->
+        {:error, :not_found}
+
+      shard ->
+        changeset = Shard.admin_changeset(shard, attrs)
+
+        if changeset.valid? do
+          guarded_update_shard(shard_id, changeset.changes, Shard.admin_editable_statuses())
+        else
+          {:error, changeset}
+        end
     end
   end
 

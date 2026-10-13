@@ -77,6 +77,39 @@ defmodule Fathom.DirectoryAdminTest do
       assert row.status == "active"
     end
 
+    # Expert review 2026-10-12 #30. admin_update/2 used an unguarded Repo.update, so the admin form
+    # could move a row out of a lifecycle state it had no business leaving: a DELETED row set back to
+    # `active` (resurrecting a tombstoned tenant without clearing the re-mint gate), and a SUSPENDED
+    # row set to `active` (bypassing Suspensions.remove). Pre-fix both returned {:ok, _}. The write
+    # now lands only while the row's status is still one the admin may edit.
+    test "a deleted row cannot be set back to active (#30)" do
+      put_shard(%{shard_id: "dir_undel", status: "deleted"})
+
+      assert {:error, :status_conflict} =
+               Directory.admin_update("dir_undel", %{status: "active"})
+
+      assert {:ok, %{status: "deleted"}} = Directory.get("dir_undel")
+    end
+
+    test "a suspended row cannot be set to active, bypassing the suspension gate (#30)" do
+      put_shard(%{shard_id: "dir_unsusp", status: "suspended"})
+
+      assert {:error, :status_conflict} =
+               Directory.admin_update("dir_unsusp", %{status: "active"})
+
+      assert {:ok, %{status: "suspended"}} = Directory.get("dir_unsusp")
+    end
+
+    test "a deleted row is not edited even when only retain_until changes (#30)" do
+      put_shard(%{shard_id: "dir_delretain", status: "deleted"})
+      until = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      assert {:error, :status_conflict} =
+               Directory.admin_update("dir_delretain", %{status: "deleted", retain_until: until})
+
+      assert {:ok, %{status: "deleted", retain_until: nil}} = Directory.get("dir_delretain")
+    end
+
     test "can clear retain_until" do
       put_shard(%{
         shard_id: "dir_clear",
