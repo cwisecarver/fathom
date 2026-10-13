@@ -2969,7 +2969,7 @@ defmodule Fathom.Shard do
   # flush-result handler (the handler then applies a resolved verdict purely). Returns:
   #   {:ok, new_etag}         — uploaded; advance the fence + watermark.
   #   {:reconciled, obj_etag} — 412 but the lock is still ours; obj_etag resyncs the fence
-  #                             (nil ⇒ object etag unreadable, keep serving, no resync).
+  #                             (`:absent` ⇒ the object is gone: re-create, alert — 2026-10-12 #4).
   #   :superseded             — 412 AND the lock was stolen; the coordinator self-fences.
   #   {:error, reason}        — a transient store error anywhere; keep dirty, retry.
   # The periodic durability flush's off-process body (expert review 2026-07-18 #18): fence FIRST,
@@ -3028,7 +3028,7 @@ defmodule Fathom.Shard do
   # A 412 means the object changed since our fence etag; re-check the LOCK to tell "our
   # own lost-but-applied PUT" (lock still ours — the single writer, so the object is our
   # own bytes) from a real steal (lock superseded). Returns `{:reconciled, etag}` (the
-  # object's current etag to resync the fence to — nil when unreadable), `:superseded`
+  # object's current etag to resync the fence to, or `:absent` — see reconcile_absent/1), `:superseded`
   # (self-fence), or `{:error, _transient}` (unconfirmable lock read — don't self-fence on
   # uncertainty; keep dirty and retry). The sidecar/watermark advance stays in the handler.
   defp reconcile_superseded(state) do
@@ -3036,7 +3036,10 @@ defmodule Fathom.Shard do
       :ok ->
         case Storage.object_etag(state.id) do
           {:ok, etag} when not is_nil(etag) -> {:reconciled, etag}
-          _ -> {:reconciled, nil}
+          {:ok, nil} -> reconcile_absent(state)
+          # UNREADABLE is not ABSENT (expert review 2026-10-12 #4): a transient error, counted as a
+          # failed flush and retried, not a silent `{:reconciled, nil}`.
+          {:error, _transient} = error -> error
         end
 
       {:error, :superseded} ->
@@ -3044,6 +3047,31 @@ defmodule Fathom.Shard do
 
       {:error, _transient} = error ->
         error
+    end
+  end
+
+  # THE STORED OBJECT VANISHED UNDER A LIVE OWNER (expert review 2026-10-12 #4): an operator delete,
+  # a lifecycle rule, a bucket restore, a misused `drop_live` — or a tenant PURGE. This used to come
+  # back `{:reconciled, nil}`, which kept the stale fence etag: every later flush PUT `If-Match` a
+  # gone object, 404/412'd, landed here again, and never escalated — the shard acked writes that
+  # never became durable, signalled only by an `outcome: :reconciled` telemetry event.
+  #
+  # Re-creating the object is right for every cause EXCEPT the purge, where it would RESURRECT an
+  # erased tenant: `purge_shard` deletes `<id>.db` before `<id>.lock` (`.db` sorts first), and
+  # `Tenants.purge/1` documents that a live remote owner is expected to self-fence on its next flush
+  # against the gone object. So re-create only when the id is NOT tombstoned AND a SECOND lock check,
+  # after seeing the object gone, still says ours (a purge that reached the lock in between reads
+  # superseded). Anything else self-fences. The panel's prescription (always `etag = nil` and
+  # re-PUT) was the resurrection.
+  defp reconcile_absent(state) do
+    if Fathom.Tenants.Tombstones.tombstoned?(state.id) do
+      :superseded
+    else
+      case Storage.check_lease(state.id, state.lease) do
+        :ok -> {:reconciled, :absent}
+        {:error, :superseded} -> :superseded
+        {:error, _transient} = error -> error
+      end
     end
   end
 
@@ -3596,6 +3624,19 @@ defmodule Fathom.Shard do
             "durable, the RPO is unbounded, and snapshot/fork/retain are disabled for this shard. " <>
             "Reduce the shard (delete rows + VACUUM) or split the tenant; :shard_max_page_count " <>
             "is the write-time brake that prevents reaching this state."
+        )
+
+      # The stored object vanished under a live owner (expert review 2026-10-12 #4). Escalate on the
+      # FIRST occurrence: nothing durable holds this shard until the re-create lands.
+      :object_absent ->
+        :telemetry.execute([:fathom, :shard, :flush, :object_absent], %{count: 1}, %{
+          shard_id: state.id
+        })
+
+        Logger.error(
+          "shard #{state.id}: the STORED OBJECT VANISHED while this node holds the lease (an " <>
+            "operator delete, a lifecycle rule, a bucket restore?). Acked writes are NOT durable " <>
+            "until the next flush re-creates it (create-only, If-None-Match)."
         )
 
       _ ->
@@ -4228,7 +4269,7 @@ defmodule Fathom.Shard do
   # The sidecar IS advanced: we are the single writer, so our local copy is a descendant of
   # whatever the object currently holds — same lineage, plus more writes. That is exactly what
   # the provenance check needs to not false-quarantine a fork.
-  defp apply_flush_verdict(state, {:reconciled, object_etag}) when not is_nil(object_etag) do
+  defp apply_flush_verdict(state, {:reconciled, object_etag}) when is_binary(object_etag) do
     Provenance.write_durable(state.path, object_etag)
     # DROP THE LINEAGE CACHE (expert review 2026-08-26 #33). This is the one verdict where the
     # object moved to an etag we did not write — our PUT 412'd — so what its metadata says is no
@@ -4237,10 +4278,15 @@ defmodule Fathom.Shard do
     {:dirty, clear_flush_failures(%{state | etag: object_etag, carried_lineage: nil})}
   end
 
-  # 412 + lock ours, but the object's etag came back nil/unreadable: keep serving with no etag
-  # resync; stays dirty and retries next interval.
-  defp apply_flush_verdict(state, {:reconciled, nil}),
-    do: {:dirty, %{state | carried_lineage: nil}}
+  # 412 + lock ours (checked twice) + the object is GONE and the id is not tombstoned (expert review
+  # 2026-10-12 #4, `reconcile_absent/1`). Fence the next flush as a CREATE (`etag: nil` ⇒
+  # `If-None-Match: *`, so it can never clobber an object someone else re-created meanwhile) and
+  # count this flush as FAILED, escalating on the first one: until that create lands, acked writes
+  # are not durable anywhere, and retrying blindly is what hid it.
+  defp apply_flush_verdict(state, {:reconciled, :absent}) do
+    state = %{state | etag: nil, carried_lineage: nil}
+    {{:error, :object_absent}, record_flush_failure(state, :object_absent)}
+  end
 
   defp apply_flush_verdict(state, :superseded), do: {:superseded, state}
 

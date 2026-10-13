@@ -643,6 +643,11 @@ defmodule Fathom.Telemetry do
         description:
           "Flushes refused up front because the data volume's free space (the poller's last reading) is below the shard's size plus a margin (expert review 2026-10-12 #26). The flush's VACUUM INTO temp needs about the shard's size, so this flush would fail late with SQLITE_FULL after a full quick_check. Writes keep being acked and cannot be made durable until space is freed, so the first occurrence is page-worthy"
       ),
+      counter("fathom.shard.flush.object_absent.count",
+        event_name: [:fathom, :shard, :flush, :object_absent],
+        description:
+          "Flushes that found the stored object GONE while this node holds the lease (expert review 2026-10-12 #4) — an operator delete, lifecycle rule or bucket restore. Acked writes are not durable until the next (create-only) flush re-creates it; a tombstoned (being-purged) id self-fences instead. Any occurrence is page-worthy"
+      ),
       counter("fathom.shard.corrupt_flush.count",
         event_name: [:fathom, :shard, :corrupt_flush],
         description:
