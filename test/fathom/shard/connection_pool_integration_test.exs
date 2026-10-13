@@ -48,8 +48,9 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   # Wait for the coordinator's off-process idle-transition close (expert review 2026-10-12 #15), if
   # one is still running. `:sys.get_state` first so the checkin cast that starts it has been handled.
   defp await_idle_close(pid) do
+    # `closing` is the pid of the tail of the close chain (expert review 2026-10-12 #16), or nil.
     case :sys.get_state(pid).closing do
-      %Task{pid: tpid} ->
+      tpid when is_pid(tpid) ->
         mref = Process.monitor(tpid)
         assert_receive {:DOWN, ^mref, :process, ^tpid, _}, 5_000
 

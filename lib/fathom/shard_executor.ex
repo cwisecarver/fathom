@@ -1265,15 +1265,19 @@ defmodule Fathom.ShardExecutor do
       # `Filo.Stream` close their streams on the coordinator's DOWN (a self-fence, a tenant delete,
       # a crash). The leak held an fd, a mapped `-shm` and page cache for the life of a WebSocket,
       # and an extra open connection on a reopened inode stops the last close from checkpointing.
-      # Close it here instead. (A coordinator dying between this check and the cast is the
-      # residual window; its terminate closes only what is pooled, not this.)
+      # Close it here instead. The liveness check goes AFTER the cast (expert review 2026-10-12 #9):
+      # checked before it, a coordinator dying between the check and the cast dropped the handle;
+      # checked after, a coordinator that is gone by now is caught whether it died before or during
+      # the cast, and `Connection.close` is idempotent, so closing a handle the coordinator also got
+      # to is harmless. (A monitor + `demonitor(:info)` cannot replace `alive?` here: demonitor
+      # signals are asynchronous, so it reports `true` even for an already-dead pid.) A coordinator
+      # that dies with the cast still in its mailbox closes it in terminate
+      # (`close_pending_checkins`); the residual is a cast landing in the instant between that drain
+      # and the process exiting.
       case Connection.rollback_if_open(conn) do
         :ok ->
-          if Process.alive?(pid) do
-            Shard.checkin(pid, ref, conn, scope)
-          else
-            Connection.close(conn)
-          end
+          Shard.checkin(pid, ref, conn, scope)
+          unless Process.alive?(pid), do: Connection.close(conn)
 
         {:error, _reason} ->
           Connection.close(conn)

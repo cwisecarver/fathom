@@ -104,6 +104,13 @@ defmodule Fathom.Shard do
   # queued behind sibling flushes through the shared Finch pool) at real S3 latency. Generous so a
   # flush-before-fork of a large template doesn't time out; bounded so a hung store can't wedge a caller.
   @flush_now_timeout 60_000
+  # How long the idle-transition close chain (`drain_pool/1`) may take before a waiter stops waiting
+  # for it: the periodic flush waits this long (a close is one checkpoint of at most ~16 MiB, so
+  # exceeding it means a wedged filesystem), and each link of the chain waits this long for its
+  # predecessor. TERMINATE waits far less (expert review 2026-10-12 #19): it holds the shutdown
+  # budget, and the write fence is already published by then in the clauses where that matters.
+  @close_wait_ms 30_000
+  @terminate_close_wait_ms 5_000
 
   # Target rate for heartbeat-lapse revalidations, in `check_lease` GETs per second, used to derive
   # the jitter spread from the open-shard count (expert review 2026-08-26 #13b). 500/s is the value
@@ -804,8 +811,10 @@ defmodule Fathom.Shard do
         # The pool-sweep timer, armed ONLY while the pool holds a handle (expert review 2026-09-29
         # #35) — see schedule_sweep/1.
         sweep_timer: nil,
-        # The in-flight idle-transition close of the drained pool (expert review 2026-10-12 #15),
-        # or nil. See drain_pool/1 and await_closing/1.
+        # The TAIL of the off-coordinator close chain (expert review 2026-10-12 #15, #16, #18): the pid
+        # of the newest process closing handles for this shard, or nil. Each link waits for its
+        # predecessor, so waiting on the tail waits for every close. See start_close/2 and
+        # await_closing/2.
         closing: nil,
         # Has the open path's plain sidecar write been made durable yet? See sync_sidecar_once/1.
         sidecar_synced?: false,
@@ -1575,12 +1584,6 @@ defmodule Fathom.Shard do
     apply_lapse_verdict(result, %{state | lapse_revalidate_pending: false})
   end
 
-  # The idle-transition pool close finished (expert review 2026-10-12 #15) — see drain_pool/1.
-  def handle_info({ref, :ok}, %{closing: %Task{ref: ref}} = state) do
-    Process.demonitor(ref, [:flush])
-    {:noreply, %{state | closing: nil}}
-  end
-
   # The renewal task crashed: treat as transient and retry on the next tick.
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{renew_task: %Task{ref: ref}} = state) do
     Logger.warning("shard #{state.id}: lease renewal task crashed (#{inspect(reason)}); retrying")
@@ -1608,13 +1611,6 @@ defmodule Fathom.Shard do
 
     # Dirty (the task never landed) — re-kick so a flush_now waiter retries rather than hangs.
     {:noreply, settle_flushed_and_reschedule(state)}
-  end
-
-  # The idle-transition close task crashed (expert review 2026-10-12 #15). Matched before the generic
-  # :DOWN below, which would read its monitor as a stream release.
-  def handle_info({:DOWN, ref, :process, _pid, reason}, %{closing: %Task{ref: ref}} = state) do
-    Logger.warning("shard #{state.id}: pooled-handle close task crashed (#{inspect(reason)})")
-    {:noreply, %{state | closing: nil}}
   end
 
   @impl true
@@ -2098,6 +2094,12 @@ defmodule Fathom.Shard do
   def terminate(_reason, %{lease_lost: true} = state) do
     # The lease is gone: stop refusing the new owner's replication frames (2026-10-12 #20).
     unmark_lease_held(state.id)
+
+    # PUBLISH THE WRITE FENCE BEFORE close_pool (expert review 2026-10-12 #19). close_pool/1 can wait
+    # on the idle-close chain, and a write acked during that wait is a write into a shard whose lease
+    # is already gone. The fence turns it into a retryable 503. (Why it must be published at all, and
+    # why it is only lifted after the quarantine rename, is the long note further down.)
+    Fathom.Shard.WriteFence.fence(state.id)
     close_pool(state)
 
     # We no longer own the shard; flushing our local copy would clobber the node that took over.
@@ -2114,14 +2116,12 @@ defmodule Fathom.Shard do
     # silently stranding acked writes. quarantine_fenced!'s File.rename is safe while streams hold
     # the file open (Unix keeps the fd on the renamed inode); the streams tear down when their
     # monitor on this dying coordinator fires.
-    # PUBLISH THE WRITE FENCE FIRST (expert review 2026-08-24 #6). This clause documents just
-    # above that it covers a self-fence with connections STILL CHECKED OUT — "the *likely* case" —
-    # yet it published no fence at all. We have lost the lease, so a write ACKed here is not ours
-    # to take; worse, `quarantine_fenced!` renames the live file out from under the open fds, so
-    # such a write lands in the `.fenced.<ts>` inode and is invisible to the tenant forever. The
-    # fence turns that into a retryable 503.
-    Fathom.Shard.WriteFence.fence(state.id)
-
+    # THE WRITE FENCE IS PUBLISHED AT THE TOP OF THIS CLAUSE (expert review 2026-08-24 #6, moved above
+    # close_pool by 2026-10-12 #19). This clause covers a self-fence with connections STILL CHECKED
+    # OUT — "the *likely* case". We have lost the lease, so a write ACKed here is not ours to take;
+    # worse, `quarantine_fenced!` renames the live file out from under the open fds, so such a write
+    # lands in the `.fenced.<ts>` inode and is invisible to the tenant forever. The fence turns that
+    # into a retryable 503.
     state = state |> cancel_renew() |> settle_renew_task() |> settle_flush_task()
     # Reply to any pending flush_now caller before we exit (expert review 2026-07-18 #4): we
     # self-fenced WITHOUT flushing, so the on-disk state is NOT durable in storage. Without this,
@@ -2192,8 +2192,6 @@ defmodule Fathom.Shard do
   # so a shutdown-ordering edge (Tombstones dies first) fails toward flushing — the safe direction.
   def terminate(_reason, %{conns: conns, lease: lease} = state)
       when map_size(conns) > 0 and not is_nil(lease) do
-    close_pool(state)
-
     # Refuse NEW writes for the duration of the shutdown (expert review 2026-08-20 #9). Streams do
     # not learn this coordinator is going away until its `:DOWN` fires, which is after terminate/2
     # returns — so without this they keep committing through a checkpoint + VACUUM INTO + PUT that
@@ -2203,7 +2201,11 @@ defmodule Fathom.Shard do
     # Safe to publish unconditionally now: expert review #6 made `open_with_lease/8` clear the
     # fence on every successful lease acquire, so a row left behind by a coordinator that never
     # reached its own cleanup is lifted by the next open rather than stranding the tenant.
+    #
+    # BEFORE close_pool (expert review 2026-10-12 #19): close_pool/1 can wait on the idle-close
+    # chain, and the streams keep committing for that whole wait if the fence is not up yet.
     Fathom.Shard.WriteFence.fence(state.id)
+    close_pool(state)
 
     # Settle the legacy-mode renew task before the drop-flush's fence-renew + release_lease (expert
     # review 2026-08-31 #15) — an in-flight renew PUT landing after the release would re-write the
@@ -2370,14 +2372,17 @@ defmodule Fathom.Shard do
 
   # The grant ended WITHOUT a checkin (the caller died, or its checkout timed out): close the handle
   # it was lent, which nothing else will ever do.
+  #
+  # The close goes through the off-coordinator close chain (expert review 2026-10-12 #18): the lent
+  # handle may be the shard's LAST connection (its stream died holding it), and closing that is the
+  # close-time checkpoint — 7-24 ms of fsync inside the mailbox.
   defp close_lent(state, ref) do
     case Map.pop(state.lent, ref) do
       {nil, _} ->
         state
 
       {conn, lent} ->
-        Connection.close(conn)
-        %{state | lent: lent}
+        start_close(%{state | lent: lent}, [conn])
     end
   end
 
@@ -2411,15 +2416,12 @@ defmodule Fathom.Shard do
   # Close, never pool, when pooling is off or the shard is draining (a draining shard is on its way
   # to drop; a handle pooled now would be closed moments later by close_pool anyway, and must not be
   # handed to a new stream of a shard we are giving up).
-  defp pool_checkin(%{pool: nil} = state, conn, _scope) do
-    Connection.close(conn)
-    state
-  end
+  #
+  # Both closes ride the off-coordinator chain (expert review 2026-10-12 #18) for the reason
+  # `drain_pool/1` does: the handle may be the shard's last connection, and its close checkpoints.
+  defp pool_checkin(%{pool: nil} = state, conn, _scope), do: start_close(state, [conn])
 
-  defp pool_checkin(%{draining: true} = state, conn, _scope) do
-    Connection.close(conn)
-    state
-  end
+  defp pool_checkin(%{draining: true} = state, conn, _scope), do: start_close(state, [conn])
 
   defp pool_checkin(%{pool: pool} = state, conn, scope) do
     {pool, evicted} = HandlePool.put(pool, scope, conn, System.monotonic_time(:millisecond))
@@ -2428,21 +2430,45 @@ defmodule Fathom.Shard do
   end
 
   # Close every idle pooled handle. Called on EVERY terminate clause — a pooled handle is idle (no
-  # in-flight write, no fence role), so closing it is always safe and order-independent. The `_`
-  # clause covers the minimal pre-open state (`%{id: ...}`) that has no `:pool` key.
-  defp close_pool(%{pool: nil}), do: :ok
+  # in-flight write, no fence role), so closing it is always safe and order-independent. Also valid
+  # for the minimal pre-open state (`%{id: ...}`) that has no `:pool` or `:closing` key.
+  #
+  # It first waits out the close chain (expert review 2026-10-12 #15, bounded to a few seconds by
+  # #19): every terminate clause goes on to flush, drop, rename or quarantine the shard's files, none
+  # of which may race a close that is still checkpointing the WAL into the `.db`. The wait is needed
+  # even with POOLING OFF, since the draining/no-pool checkin and `close_lent/2` ride the same chain
+  # (#18).
+  #
+  # Then it closes handles checked in to us but not yet processed (expert review 2026-10-12 #9): a
+  # `checkin/4` cast still in the mailbox is a handle nobody else will ever close, and when its NIF
+  # resource is finally garbage collected `sqlite3_close_v2` runs against a path a successor
+  # coordinator may by then have recreated. SQLite tracks other connections per inode, so the stale
+  # close can unlink the successor's `-wal` by name.
+  defp close_pool(state) do
+    _ = await_closing(state, @terminate_close_wait_ms)
+    close_pending_checkins()
 
-  # It also waits out a pending idle-transition close (expert review 2026-10-12 #15): every terminate
-  # clause goes on to flush, drop, rename or quarantine the shard's files, none of which may race a
-  # close that is still checkpointing the WAL into the `.db`.
-  defp close_pool(%{pool: pool} = state) do
-    _ = await_closing(state)
-    {conns, _pool} = HandlePool.drain(pool)
-    Enum.each(conns, &Connection.close/1)
+    case state do
+      %{pool: pool} when pool != nil ->
+        {conns, _pool} = HandlePool.drain(pool)
+        Enum.each(conns, &Connection.close/1)
+
+      _ ->
+        :ok
+    end
+
     :ok
   end
 
-  defp close_pool(_state), do: :ok
+  defp close_pending_checkins do
+    receive do
+      {:"$gen_cast", {:checkin, _ref, conn, _scope}} ->
+        Connection.close(conn)
+        close_pending_checkins()
+    after
+      0 -> :ok
+    end
+  end
 
   defp flush_and_drop_unless_tombstoned(state) do
     unless Fathom.Tenants.Tombstones.tombstoned?(state.id), do: flush_and_drop(state)
@@ -2516,33 +2542,88 @@ defmodule Fathom.Shard do
 
     case conns do
       [] -> state
-      conns -> start_close(await_closing(state), conns)
+      conns -> start_close(state, conns)
     end
   end
 
+  # THE CLOSE CHAIN (expert review 2026-10-12 #16). Closes are chained OFF the coordinator and never
+  # awaited by it on the request path: each new close process is handed the previous tail, waits for
+  # that process to exit, then closes its handles. So two closes never race each other's close-time
+  # checkpoint (the second would skip it and leave the WAL behind), yet the coordinator only spawns
+  # and returns. The first version of #15 awaited the PREVIOUS close inline here, which re-created the
+  # mailbox stall on a hot shard whose idle transitions arrive faster than one close takes (Django's
+  # CONN_MAX_AGE=0 pattern). `state.closing` is the tail, so waiting for it (`await_closing/2`) waits
+  # for every close; only terminate and the periodic flush do that.
+  #
+  # A plain `spawn`, not a Task: nobody reads a result, and an unlinked process still finishes its
+  # closes if this coordinator dies first (a linked Task would be killed with it and strand the
+  # handles until garbage collection, the stale-close hazard close_pool/1 describes).
   defp start_close(state, conns) do
-    %{state | closing: Task.async(fn -> Enum.each(conns, &Connection.close/1) end)}
+    id = state.id
+    prev = state.closing
+    %{state | closing: spawn(fn -> run_close(id, prev, conns) end)}
   rescue
-    # `Task.async/1` raises `:system_limit` with a full process table (see the flush-task spawn):
-    # close inline, the pre-#15 behaviour, rather than leak the handles.
+    # `spawn/1` raises `:system_limit` with a full process table (see the flush-task spawn): close
+    # inline, the pre-#15 behaviour, rather than leak the handles.
     _ ->
+      state = await_closing(state)
       Enum.each(conns, &Connection.close/1)
       state
   end
 
-  # Wait for a pending idle-transition close (see drain_pool/1). Bounded: a close is one checkpoint
-  # of at most ~16 MiB, so 30 s means a wedged filesystem, and the shutdown below at least frees the
-  # mailbox; SQLite still finishes or abandons the close in the NIF.
-  defp await_closing(%{closing: %Task{} = task} = state) do
-    if Task.yield(task, 30_000) == nil do
-      Logger.warning("shard #{state.id}: pooled-handle close still running after 30s")
-      Task.shutdown(task, :brutal_kill)
+  defp run_close(id, prev, conns) do
+    if is_pid(prev) do
+      ref = Process.monitor(prev)
+
+      receive do
+        {:DOWN, ^ref, :process, ^prev, _} -> :ok
+      after
+        @close_wait_ms ->
+          Logger.warning("shard #{id}: previous pooled-handle close still running after 30s")
+      end
     end
 
-    %{state | closing: nil}
+    # Test seam (expert review 2026-10-12 #16): lets a test make a close slow. Runs in this close
+    # process, never in the coordinator.
+    hook = Application.get_env(:fathom, :shard_pool_close_hook)
+
+    for conn <- conns do
+      if hook, do: hook.(conn)
+      Connection.close(conn)
+    end
+
+    :ok
+  rescue
+    e -> Logger.warning("shard #{id}: pooled-handle close crashed (#{Exception.message(e)})")
   end
 
-  defp await_closing(state), do: state
+  # Wait for the tail of the close chain (see start_close/2). Bounded: a close is one checkpoint of at
+  # most ~16 MiB, so running past the bound means a wedged filesystem. On timeout the chain is left
+  # running rather than killed (killing it would strand its handles), and `closing` is kept so a later
+  # waiter still orders behind it. Valid for the minimal pre-open state, which has no `:closing` key.
+  defp await_closing(state, timeout \\ @close_wait_ms) do
+    case Map.get(state, :closing) do
+      pid when is_pid(pid) ->
+        mref = Process.monitor(pid)
+
+        receive do
+          {:DOWN, ^mref, :process, ^pid, _} ->
+            %{state | closing: nil}
+        after
+          timeout ->
+            Process.demonitor(mref, [:flush])
+
+            Logger.warning(
+              "shard #{state.id}: pooled-handle close still running after #{timeout} ms"
+            )
+
+            state
+        end
+
+      _ ->
+        state
+    end
+  end
 
   # Stop (flushing + releasing via terminate) once the last connection drains
   # while standing down; otherwise carry on.
@@ -3786,6 +3867,56 @@ defmodule Fathom.Shard do
     end
   end
 
+  # FREE-SPACE PREFLIGHT (expert review 2026-10-12 #26). `VACUUM INTO` writes a temp about the
+  # size of the shard (plus its WAL content) next to the live file, so a near-full volume fails the
+  # flush late, after the whole `quick_check` page scan, with SQLITE_FULL, and the generic failure
+  # path only escalates on the 3rd consecutive one. Check the poller's cached reading
+  # (`Measurements.data_free_bytes/0`; never `:disksup` per flush, which runs `df`) against the
+  # shard's size plus a margin, and fail fast. Like `object_too_large`, the first occurrence is
+  # logged at error level and has its own event: retrying cannot help until someone frees space,
+  # while the shard keeps acking writes it cannot make durable. Escalation lives here rather than in
+  # record_flush_failure/2, which still counts the failure like any other.
+  #
+  # An unknown reading (poller not running, or stale) skips the check: a flush must never be refused
+  # on a guess.
+  @flush_space_margin_bytes 32 * 1024 * 1024
+  defp flush_space_preflight(state) do
+    with {:ok, free} <- Fathom.Admin.Measurements.data_free_bytes(),
+         need = local_db_bytes(state.path) + flush_space_margin(),
+         true <- free < need do
+      :telemetry.execute(
+        [:fathom, :shard, :flush, :no_space],
+        %{count: 1, need: need, free: free},
+        %{
+          shard_id: state.id
+        }
+      )
+
+      Logger.error(
+        "shard #{state.id}: durability flush REFUSED, the data volume has #{free} bytes free and " <>
+          "the flush needs about #{need} (shard size plus margin) for its VACUUM INTO temp. Acked " <>
+          "writes are NOT being made durable until space is freed; the shard stays dirty and retries."
+      )
+
+      {:error, {:flush_no_space, need, free}}
+    else
+      _ -> :ok
+    end
+  end
+
+  defp flush_space_margin,
+    do: Application.get_env(:fathom, :flush_space_margin_bytes, @flush_space_margin_bytes)
+
+  # The .db plus its WAL: the snapshot is the merged content of both.
+  defp local_db_bytes(path) do
+    Enum.reduce([path, path <> "-wal"], 0, fn p, acc ->
+      case File.stat(p) do
+        {:ok, %{size: size}} -> acc + size
+        _ -> acc
+      end
+    end)
+  end
+
   # Record the flush INTENT durably before the PUT lands (expert review 2026-10-10 #6). The
   # sidecar only learns the new etag when the coordinator handles the task result (or, on the drop
   # path, after the upload returns) — a crash in between leaves sidecar=E0, object=E1 and a local
@@ -3867,56 +3998,6 @@ defmodule Fathom.Shard do
 
   # Integrity-gate the PERIODIC flush (expert review 2026-08-01 #14).
   #
-  # FREE-SPACE PREFLIGHT (expert review 2026-10-12 #26). `VACUUM INTO` writes a temp about the
-  # size of the shard (plus its WAL content) next to the live file, so a near-full volume fails the
-  # flush late, after the whole `quick_check` page scan, with SQLITE_FULL, and the generic failure
-  # path only escalates on the 3rd consecutive one. Check the poller's cached reading
-  # (`Measurements.data_free_bytes/0`; never `:disksup` per flush, which runs `df`) against the
-  # shard's size plus a margin, and fail fast. Like `object_too_large`, the first occurrence is
-  # logged at error level and has its own event: retrying cannot help until someone frees space,
-  # while the shard keeps acking writes it cannot make durable. Escalation lives here rather than in
-  # record_flush_failure/2, which still counts the failure like any other.
-  #
-  # An unknown reading (poller not running, or stale) skips the check: a flush must never be refused
-  # on a guess.
-  @flush_space_margin_bytes 32 * 1024 * 1024
-  defp flush_space_preflight(state) do
-    with {:ok, free} <- Fathom.Admin.Measurements.data_free_bytes(),
-         need = local_db_bytes(state.path) + flush_space_margin(),
-         true <- free < need do
-      :telemetry.execute(
-        [:fathom, :shard, :flush, :no_space],
-        %{count: 1, need: need, free: free},
-        %{
-          shard_id: state.id
-        }
-      )
-
-      Logger.error(
-        "shard #{state.id}: durability flush REFUSED, the data volume has #{free} bytes free and " <>
-          "the flush needs about #{need} (shard size plus margin) for its VACUUM INTO temp. Acked " <>
-          "writes are NOT being made durable until space is freed; the shard stays dirty and retries."
-      )
-
-      {:error, {:flush_no_space, need, free}}
-    else
-      _ -> :ok
-    end
-  end
-
-  defp flush_space_margin,
-    do: Application.get_env(:fathom, :flush_space_margin_bytes, @flush_space_margin_bytes)
-
-  # The .db plus its WAL: the snapshot is the merged content of both.
-  defp local_db_bytes(path) do
-    Enum.reduce([path, path <> "-wal"], 0, fn p, acc ->
-      case File.stat(p) do
-        {:ok, %{size: size}} -> acc + size
-        _ -> acc
-      end
-    end)
-  end
-
   # Review 2026-07-14 #4 added a `quick_check` gate so a locally-corrupted database is never
   # flushed over the last good stored object — but it lived in exactly one place: the
   # checkpoint-then-raw-upload fast path of `upload_for_drop/1`, which runs only on the
