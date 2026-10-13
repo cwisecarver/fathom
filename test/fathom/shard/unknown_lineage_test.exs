@@ -70,6 +70,21 @@ defmodule Fathom.Shard.UnknownLineageTest do
   defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
   defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
 
+  # Waits for the coordinator's in-flight lineage HEAD (if any) to finish and its reply to be
+  # applied: the task sends its reply before exiting, so after its DOWN a sync call sees the result.
+  defp await_lineage_task(pid) do
+    case :sys.get_state(pid).lineage_task do
+      %Task{pid: tpid} ->
+        ref = Process.monitor(tpid)
+        assert_receive {:DOWN, ^ref, :process, ^tpid, _}, 5_000
+        _ = :sys.get_state(pid)
+        :ok
+
+      nil ->
+        :ok
+    end
+  end
+
   # A stored object at lineage `n`, so the expected next lineage is n + 1 rather than the 1 an
   # empty store gives (which a broken resolver could produce by accident).
   defp stored_at!(shard, n) do
@@ -96,8 +111,69 @@ defmodule Fathom.Shard.UnknownLineageTest do
         # Still unreadable: the session's gate must refuse, not ship lineage 0.
         assert Shard.epoch(pid) == {:error, :lineage_unknown}
 
-        # The store answers: the next gate read derives the lineage the open would have.
+        # The store answers: the next refusal starts the (off-mailbox) re-read, and once it lands the
+        # gate states the lineage the open would have (expert review 2026-10-12 #15).
+        await_lineage_task(pid)
         Application.delete_env(:fathom, :storage_fault)
+        assert Shard.epoch(pid) == {:error, :lineage_unknown}
+        await_lineage_task(pid)
+        assert {:ok, _epoch} = Shard.epoch(pid)
+        assert Shard.lineage(pid) == 5
+      end
+
+      test "the lineage re-read runs OFF the coordinator's mailbox, single-flight", %{
+        shard: shard
+      } do
+        stored_at!(shard, 4)
+        Application.put_env(:fathom, :storage_fault, :object_head)
+        {:ok, pid} = Shards.ensure(shard)
+        assert_mode!(pid, unquote(mode))
+        assert :sys.get_state(pid).lineage == :unknown
+        Application.delete_env(:fathom, :storage_fault)
+
+        # Every HEAD for this shard now announces itself and blocks until released: a slow store.
+        test_pid = self()
+
+        Application.put_env(
+          :fathom,
+          :faulty_before,
+          {:object_head,
+           fn id ->
+             if id == shard do
+               send(test_pid, {:head_started, self()})
+
+               receive do
+                 :release -> :ok
+               after
+                 5_000 -> :ok
+               end
+             end
+           end}
+        )
+
+        on_exit(fn -> Application.delete_env(:fathom, :faulty_before) end)
+
+        # A commit's epoch read from ANOTHER process (the Session), as in production.
+        commit = Task.async(fn -> Shard.epoch(pid) end)
+        assert_receive {:head_started, head}, 1_000
+
+        # While the HEAD is in flight the coordinator's mailbox is free — pre-fix the epoch call
+        # held it for up to lineage_retry_timeout, so this probe (a checkout/checkin stand-in)
+        # waited behind the HEAD...
+        {probe_us, _} = :timer.tc(fn -> :sys.get_state(pid) end)
+
+        assert probe_us < 100_000,
+               "the coordinator was blocked #{div(probe_us, 1000)} ms behind the lineage HEAD"
+
+        # ...and the refused commit already has its answer.
+        assert Task.await(commit, 100) == {:error, :lineage_unknown}
+
+        # ...and a second refused commit does not start a second HEAD.
+        assert Shard.epoch(pid) == {:error, :lineage_unknown}
+        refute_receive {:head_started, _}, 100
+
+        send(head, :release)
+        await_lineage_task(pid)
         assert {:ok, _epoch} = Shard.epoch(pid)
         assert Shard.lineage(pid) == 5
       end

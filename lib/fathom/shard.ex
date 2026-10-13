@@ -839,6 +839,9 @@ defmodule Fathom.Shard do
         # is recorded only in the lock, so a release must keep it (expert review 2026-10-12 #3,
         # `release_clean/1`).
         lineage_stamped?: PromoteOnOpen.etag_of(promoted) != etag1,
+        # The single-flight HEAD that resolves an `:unknown` lineage, or nil (expert review
+        # 2026-10-12 #15) — see start_lineage_resolve/1.
+        lineage_task: nil,
         # The current etag of the remote object (nil = brand-new / no object yet). The flush
         # fence If-Matches it so a stale PUT can't clobber a stealer (finding #15); each
         # successful flush advances it.
@@ -1334,12 +1337,14 @@ defmodule Fathom.Shard do
   # #3 hybrid, by the other door). So the session's epoch read — the gate it already treats as "do
   # not ship" — refuses until a lineage is known, and each refusal re-reads the head. The commit
   # gets a retryable 503 and the client's retry ships once the store answers.
-  def handle_call(:epoch, _from, %{lease: %{epoch: epoch}, lineage: :unknown} = state) do
-    case resolve_unknown_lineage(state) do
-      %{lineage: n} = state when is_integer(n) -> {:reply, {:ok, epoch}, state}
-      state -> {:reply, {:error, :lineage_unknown}, state}
-    end
-  end
+  #
+  # OFF THE MAILBOX (expert review 2026-10-12 #15): the re-read used to run inline here — a
+  # `Task.async` + `yield` of up to 2 s on EVERY refused commit — so during the brownout that made
+  # the open's HEAD fail, checkouts, checkins and DOWN handling queued behind it at the commit rate.
+  # Now the refusal is immediate and starts ONE monitored HEAD (single-flight); its reply sets the
+  # lineage in `handle_info`, and the next commit ships.
+  def handle_call(:epoch, _from, %{lease: %{epoch: _}, lineage: :unknown} = state),
+    do: {:reply, {:error, :lineage_unknown}, start_lineage_resolve(state)}
 
   def handle_call(:epoch, _from, %{lease: %{epoch: epoch}} = state),
     do: {:reply, {:ok, epoch}, state}
@@ -1597,6 +1602,29 @@ defmodule Fathom.Shard do
     Process.demonitor(ref, [:flush])
     apply_lapse_verdict(result, %{state | lapse_revalidate_pending: false})
   end
+
+  # The single-flight lineage HEAD replied (expert review 2026-10-12 #15) — see
+  # start_lineage_resolve/1. Matched before the generic clauses, which would read its monitor as a
+  # stream release.
+  def handle_info({ref, result}, %{lineage_task: %Task{ref: ref}} = state) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, apply_lineage_head(state, result)}
+  end
+
+  def handle_info(
+        {:DOWN, ref, :process, _pid, _reason},
+        %{lineage_task: %Task{ref: ref}} = state
+      ),
+      do: {:noreply, apply_lineage_head(state, :crashed)}
+
+  # The HEAD outlived its bound: kill it so the next refused commit can start a fresh one. A stale
+  # timer (the task already replied, or a later task holds the slot) no-ops.
+  def handle_info({:lineage_task_timeout, ref}, %{lineage_task: %Task{ref: ref} = task} = state) do
+    Task.shutdown(task, :brutal_kill)
+    {:noreply, apply_lineage_head(state, :timeout)}
+  end
+
+  def handle_info({:lineage_task_timeout, _stale}, state), do: {:noreply, state}
 
   # The renewal task crashed: treat as transient and retry on the next tick.
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{renew_task: %Task{ref: ref}} = state) do
@@ -2420,7 +2448,7 @@ defmodule Fathom.Shard do
   end
 
   defp shutdown_orphan_tasks(state) do
-    for key <- [:flush_task, :renew_task, :lapse_revalidate_pending],
+    for key <- [:flush_task, :renew_task, :lapse_revalidate_pending, :lineage_task],
         match?(%Task{}, Map.get(state, key)),
         do: Task.shutdown(Map.fetch!(state, key), :brutal_kill)
 
@@ -3546,11 +3574,14 @@ defmodule Fathom.Shard do
   # the stolen lock body knew, so a takeover whose HEAD fails is refused at acquire instead
   # (`Storage.with_takeover_claim/3`) rather than opened with a claim nobody can recompute.
   #
-  # Inline but BOUNDED, like the open's fork-evidence wait: this is reached only after a failed open
-  # HEAD and only from a commit, and the bound keeps it well under the session's call timeout.
-  defp resolve_unknown_lineage(%{lease: lease} = state) when is_map_key(lease, :claim), do: state
+  # SINGLE-FLIGHT and OFF the coordinator's mailbox (expert review 2026-10-12 #15): at most one HEAD
+  # task at a time, started by a refused `:epoch` and applied by `apply_lineage_head/2` when it
+  # replies. Still bounded: `{:lineage_task_timeout, ref}` kills a HEAD that outlives
+  # `lineage_retry_timeout/0`, so a hung read cannot pin the single flight forever.
+  defp start_lineage_resolve(%{lease: lease} = state) when is_map_key(lease, :claim), do: state
+  defp start_lineage_resolve(%{lineage_task: %Task{}} = state), do: state
 
-  defp resolve_unknown_lineage(state) do
+  defp start_lineage_resolve(state) do
     id = state.id
 
     task =
@@ -3564,11 +3595,15 @@ defmodule Fathom.Shard do
         end
       end)
 
-    case Task.yield(task, lineage_retry_timeout()) || Task.shutdown(task, :brutal_kill) do
-      {:ok, {:ok, head}} -> %{state | lineage: Storage.next_lineage(head)}
-      _ -> state
-    end
+    Process.send_after(self(), {:lineage_task_timeout, task.ref}, lineage_retry_timeout())
+    %{state | lineage_task: task}
   end
+
+  # Only while still `:unknown`: the lineage is read once and never recomputed after that.
+  defp apply_lineage_head(%{lineage: :unknown} = state, {:ok, head}),
+    do: %{state | lineage: Storage.next_lineage(head), lineage_task: nil}
+
+  defp apply_lineage_head(state, _failed_or_settled), do: %{state | lineage_task: nil}
 
   defp lineage_retry_timeout,
     do: Application.get_env(:fathom, :lineage_retry_timeout_ms, 2_000)
