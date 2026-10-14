@@ -69,14 +69,60 @@ defmodule Fathom.Shard.Connection do
 
     case open_handle(path, scope) do
       {:ok, conn, :readonly} ->
-        close_on_error(conn, configure_readonly(conn, tenant?, guard_opts))
+        track_open(close_on_error(conn, configure_readonly(conn, tenant?, guard_opts)))
 
       {:ok, conn, :readwrite} ->
-        close_on_error(conn, configure_readwrite(conn, tenant?, scope, guard_opts, wal?))
+        track_open(
+          close_on_error(conn, configure_readwrite(conn, tenant?, scope, guard_opts, wal?))
+        )
 
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  # --- live-connection gauge (perf review 2026-10-14 #16, gauge half) ---------------------------
+  #
+  # Every open SQLite connection costs ~166 KB of fixed memory that `soft_heap_limit` cannot shed,
+  # and nothing counted them node-wide. The gauge is the size of a public ETS set of handles that
+  # `open/2` returned and `close/1` has not yet released — NOT a bare `:counters` ref, because
+  # `close/1` is documented idempotent and is called from the stream AND the coordinator on the same
+  # handle (shard_executor.ex's checkin paths): a counter would decrement twice, while
+  # `:ets.take/2` makes only the first close count. Cost: two O(1) ETS ops per connection lifetime
+  # against a ~335 us open. Caveat: a handle whose owner died without calling `close/1`
+  # is GC-closed by the NIF resource finalizer and stays counted here (an over-estimate, never an
+  # under-estimate). Without the table (the app not started, e.g. a bare script) tracking is a no-op.
+  @live_table __MODULE__.Live
+
+  @doc false
+  @spec create_live_table() :: :ok
+  def create_live_table do
+    if :ets.whereis(@live_table) == :undefined do
+      :ets.new(@live_table, [:named_table, :public, :set, write_concurrency: true])
+    end
+
+    :ok
+  end
+
+  @doc "Number of connections opened through `open/2` and not yet closed through `close/1`."
+  @spec live_count() :: non_neg_integer()
+  def live_count do
+    case :ets.info(@live_table, :size) do
+      :undefined -> 0
+      n -> n
+    end
+  end
+
+  defp track_open({:ok, conn} = ok) do
+    _ = if :ets.whereis(@live_table) != :undefined, do: :ets.insert(@live_table, {conn})
+    ok
+  end
+
+  defp track_open(other), do: other
+
+  defp track_close(conn) do
+    if :ets.whereis(@live_table) != :undefined, do: :ets.delete(@live_table, conn)
+    :ok
   end
 
   # Close the just-opened handle when configuration fails (expert review 2026-08-31 #25). A `with`
@@ -1495,7 +1541,7 @@ defmodule Fathom.Shard.Connection do
   def close(conn) do
     release_owner_state(conn)
     Sqlite3.close(conn)
-    :ok
+    track_close(conn)
   end
 
   @doc """

@@ -21,6 +21,16 @@ defmodule Fathom.Admin.Measurements do
     :telemetry.execute([:fathom, :node, :memory], %{total: :erlang.memory(:total)}, %{})
   end
 
+  @doc "Live SQLite connections on this node (perf review 2026-10-14 #16)."
+  @spec connections() :: :ok
+  def connections do
+    :telemetry.execute(
+      [:fathom, :node, :connections],
+      %{live: Fathom.Shard.Connection.live_count()},
+      %{}
+    )
+  end
+
   @doc """
   Process- and port-table headroom for this node.
 

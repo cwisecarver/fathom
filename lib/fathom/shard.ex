@@ -654,6 +654,13 @@ defmodule Fathom.Shard do
 
       abandon_open_head(head_task)
       maybe_emit_cold_open(result, shard_id, warm?, open_started)
+
+      # One more full-sweep GC now the open is done (perf review 2026-10-14 #24). The GC at the top
+      # of `open_coordinator` shrinks the init high-water mark, but the lease acquire / pull / state
+      # build after it re-grows the heap: 8,960 B per held coordinator vs 4,049 B after this GC
+      # (-4.9 KB, ~2.5% of served_kb). KEEP the early GC too: removing it measured +53%
+      # fanout_kb_per_shard. Only a successful open holds a long-lived heap worth shrinking.
+      if match?({:noreply, _}, result), do: :erlang.garbage_collect()
       result
     catch
       kind, reason ->

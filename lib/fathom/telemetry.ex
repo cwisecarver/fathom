@@ -37,6 +37,7 @@ defmodule Fathom.Telemetry do
          measurements: [
            {__MODULE__, :measure_active_shards, []},
            {Fathom.Admin.Measurements, :node_memory, []},
+           {Fathom.Admin.Measurements, :connections, []},
            {Fathom.Admin.Measurements, :vm_limits, []},
            {Fathom.Admin.Measurements, :durability, []},
            {Fathom.Admin.Measurements, :disk, []},
@@ -375,6 +376,11 @@ defmodule Fathom.Telemetry do
         tags: [:op],
         unit: :byte,
         description: "Bytes transferred to/from S3 by method"
+      ),
+      last_value("fathom.node.connections.live",
+        event_name: [:fathom, :node, :connections],
+        measurement: :live,
+        description: "Live SQLite connections (opened via Connection.open, not yet closed)"
       ),
       last_value("fathom.node.memory.total",
         event_name: [:fathom, :node, :memory],

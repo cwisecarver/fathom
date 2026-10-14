@@ -35,6 +35,7 @@ defmodule Fathom.Application do
     check_replication_disk!()
     check_replication_flush_interval!()
     check_pool_fd_budget!()
+    check_soft_heap_budget!()
     check_s3_static_credentials!()
     check_throttle_proxy!()
     check_admin_credentials!()
@@ -43,6 +44,7 @@ defmodule Fathom.Application do
     # connection opens ahead of it; process-global, so this one trusted `:memory:` connection covers
     # every connection the node will ever open. Unset (dev/test default) ⇒ untouched.
     _ = Fathom.Shard.Connection.apply_soft_heap_limit()
+    :ok = Fathom.Shard.Connection.create_live_table()
 
     # Grouped into plane sub-supervisors (each with its own restart budget) rather than
     # one flat list, so a control-plane restart-storm (e.g. Repo) is contained to its
@@ -414,6 +416,67 @@ defmodule Fathom.Application do
     end
 
     nil
+  end
+
+  # `soft_heap_limit` is a FIXED 8 GiB whatever the node's RAM (perf review 2026-10-14 #29). It sheds
+  # page cache only; the ~190 KB fixed cost per held shard (connection + coordinator) is not
+  # sheddable. So a node whose RAM budget is below `max_open_shards` x ~190 KB, or whose limit is at
+  # or above its RAM, OOMs before the limit does anything. The RAM budget is the cgroup `memory.max`
+  # (v2) / `memory.limit_in_bytes` (v1): in a container `memsup` reports the HOST's memory
+  # (docs/configuration.md), so the cgroup file is the only honest number; with no cgroup limit the
+  # RAM-side checks are skipped. WARNS, never raises, prod-only like its siblings.
+  @per_shard_fixed_bytes 190 * 1024
+
+  @doc false
+  def check_soft_heap_budget! do
+    if Application.get_env(:fathom, :env) == :prod do
+      for msg <-
+            soft_heap_warnings(
+              Application.get_env(:fathom, :max_open_shards, :infinity),
+              Application.get_env(:fathom, :shard_soft_heap_limit_bytes),
+              cgroup_memory_limit()
+            ),
+          do: Logger.warning(msg)
+    end
+
+    nil
+  end
+
+  @doc false
+  @spec soft_heap_warnings(term(), term(), pos_integer() | nil) :: [String.t()]
+  def soft_heap_warnings(cap, soft, ram) do
+    fixed = if is_integer(cap), do: cap * @per_shard_fixed_bytes, else: nil
+
+    [
+      (is_integer(fixed) and is_integer(soft) and fixed > soft) &&
+        "config warning: :max_open_shards = #{cap} x ~190 KB fixed per shard = #{mib(fixed)} MiB, " <>
+          "above :shard_soft_heap_limit_bytes (#{mib(soft)} MiB). The limit only sheds page cache; " <>
+          "this fixed cost cannot be shed (perf review 2026-10-14 #29).",
+      (is_integer(fixed) and is_integer(ram) and fixed > ram) &&
+        "config warning: :max_open_shards = #{cap} x ~190 KB fixed per shard = #{mib(fixed)} MiB, " <>
+          "above the container memory limit (#{mib(ram)} MiB); the node OOMs before the cap " <>
+          "admits that many shards (perf review 2026-10-14 #29).",
+      (is_integer(soft) and is_integer(ram) and soft >= ram) &&
+        "config warning: :shard_soft_heap_limit_bytes (#{mib(soft)} MiB) is at or above the container " <>
+          "memory limit (#{mib(ram)} MiB), so SQLite never sheds cache before the OOM killer acts. " <>
+          "Set SHARD_SOFT_HEAP_LIMIT_BYTES to well under the limit (perf review 2026-10-14 #29)."
+    ]
+    |> Enum.filter(&is_binary/1)
+  end
+
+  defp mib(bytes), do: div(bytes, 1024 * 1024)
+
+  # The cgroup memory limit in bytes, or nil (no cgroup, unreadable, or "max"/unlimited).
+  defp cgroup_memory_limit do
+    ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]
+    |> Enum.find_value(fn file ->
+      with {:ok, raw} <- File.read(file),
+           {n, _} when n > 0 and n < 1_152_921_504_606_846_976 <- Integer.parse(String.trim(raw)) do
+        n
+      else
+        _ -> nil
+      end
+    end)
   end
 
   # :max_open_shards BOUNDS COORDINATORS, NOT CONNECTIONS (expert review 2026-09-18 #12).
