@@ -112,4 +112,33 @@ defmodule Fathom.ShardExecutorSplitStatementsTest do
       assert Enum.any?(stmts, &(&1 =~ "CREATE TABLE evil"))
     end
   end
+
+  # Expert review 2026-10-13 #33. A Hrana sequence is raw protobuf bytes, and Filo's decode does not
+  # validate UTF-8. `do_split/3` and `quoted/3` matched only `<<c::utf8, _>>`, so one invalid byte
+  # raised FunctionClauseError in the caller's stream. Pre-fix, every test below raised. The
+  # quoted-region case also guards the bypass: an invalid byte inside a string must not desync the
+  # scanner, so the statement after the string is still seen.
+  describe "invalid UTF-8 in a script (expert review 2026-10-13 #33)" do
+    test "an invalid byte at the top level splits without raising, and later statements are seen" do
+      stmts = split(<<"SELECT 1; ", 0xFF, "; PRAGMA synchronous=OFF">>)
+
+      assert List.last(stmts) =~ "synchronous",
+             "the statement after an invalid top-level byte was lost"
+    end
+
+    test "an invalid byte inside a quoted string does not desync the scanner" do
+      stmts = split(<<"INSERT INTO t VALUES ('a", 0xFE, "b'); PRAGMA max_page_count=777">>)
+
+      assert length(stmts) == 2,
+             "an invalid byte inside a string literal hid the statement boundary"
+
+      assert List.last(stmts) =~ "max_page_count"
+    end
+
+    test "an invalid byte inside a double-quoted identifier and a comment is tolerated" do
+      stmts = split(<<"SELECT \"c", 0xC3, "\" FROM t; -- note ", 0xA9, "\nSELECT 2">>)
+
+      assert List.last(stmts) =~ "SELECT 2"
+    end
+  end
 end

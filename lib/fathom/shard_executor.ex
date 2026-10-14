@@ -1107,11 +1107,18 @@ defmodule Fathom.ShardExecutor do
   defp do_split(<<c::utf8, rest::binary>>, acc, out),
     do: do_split(rest, acc <> <<c::utf8>>, out)
 
+  # A sequence arrives as raw protobuf bytes and Filo does not validate UTF-8, so an invalid byte
+  # reaches here (expert review 2026-10-13 #33). Pass it through as a byte, so the scanner keeps its
+  # quote state and the statement after it is still gated.
+  defp do_split(<<c, rest::binary>>, acc, out), do: do_split(rest, acc <> <<c>>, out)
+
   # A doubled quote character is an escaped literal, not a close — the one case that, gotten wrong,
   # leaves the scanner inside-out for the rest of the script and hides every later statement.
   defp quoted(<<q, q, rest::binary>>, q, acc), do: quoted(rest, q, acc <> <<q, q>>)
   defp quoted(<<q, rest::binary>>, q, acc), do: {acc <> <<q>>, rest}
   defp quoted(<<c::utf8, rest::binary>>, q, acc), do: quoted(rest, q, acc <> <<c::utf8>>)
+  # An invalid byte inside a quoted region is kept as a byte (expert review 2026-10-13 #33).
+  defp quoted(<<c, rest::binary>>, q, acc), do: quoted(rest, q, acc <> <<c>>)
   # Unterminated: return what we have. The fragment is still gated, and SQLite will reject it.
   defp quoted(<<>>, _q, acc), do: {acc, <<>>}
 
