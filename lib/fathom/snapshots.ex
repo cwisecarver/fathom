@@ -294,9 +294,11 @@ defmodule Fathom.Snapshots do
   # lapse (expert review 2026-09-05 #24). Each renew_lease fences on the CURRENT lock etag, so the
   # rotated lease is threaded internally; the caller's `after` releases the original, which the 412
   # fallback resolves. On a renew failure (we lost the lock, or a storage hiccup) stop renewing and
-  # wait the copy-back out exactly as the pre-fix synchronous call did — its fenced PUT surfaces the
-  # outcome (:superseded on a real steal); no worse on a hang than before, and unbounded drop/flush
-  # storage under a brownout is the separate #30.
+  # wait the copy-back out for a BOUNDED 3 x ttl (its fenced PUT surfaces the outcome — :superseded
+  # on a real steal), then kill it and return `{:error, :restore_timeout}` (expert review 2026-10-13
+  # #36: this used to be `Task.await(task, :infinity)`, so a hung copy-back after a renew failure
+  # held the caller, and the lock's etag fence, forever). Killing mid-PUT is safe: the promotion is a
+  # single If-Match-fenced PUT, atomic on the store.
   defp renew_while_restoring(id, lease, task) do
     interval = max(div(restore_lease_ttl(), 3), 1)
 
@@ -309,8 +311,15 @@ defmodule Fathom.Snapshots do
 
       nil ->
         case Storage.renew_lease(id, lease, restore_lease_ttl()) do
-          {:ok, lease} -> renew_while_restoring(id, lease, task)
-          {:error, _} -> Task.await(task, :infinity)
+          {:ok, lease} ->
+            renew_while_restoring(id, lease, task)
+
+          {:error, _} ->
+            case Task.yield(task, 3 * restore_lease_ttl()) || Task.shutdown(task, :brutal_kill) do
+              {:ok, result} -> result
+              {:exit, reason} -> {:error, {:restore_task_exit, reason}}
+              nil -> {:error, :restore_timeout}
+            end
         end
     end
   end

@@ -144,6 +144,47 @@ defmodule Fathom.SnapshotsTest do
     assert :ok = Task.await(restore, 5_000)
   end
 
+  # Expert review 2026-10-13 #36. Symptom: after a renew failure `renew_while_restoring` waited on
+  # the copy-back with `Task.await(task, :infinity)`, so a copy-back that never returns hung the
+  # restore (and the caller) forever. Now it waits a bounded 3 x ttl, kills the copy-back, and
+  # returns `{:error, :restore_timeout}`. Pre-fix this call never returns (the Task.async below
+  # times out the test).
+  test "a copy-back that never returns after a renew failure ends with :restore_timeout (#36)",
+       %{shard: shard} do
+    write!(shard, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('v1')"])
+    flush!(shard)
+    assert {:ok, snap_id} = Snapshots.create(shard, label: "before")
+    write!(shard, ["UPDATE t SET v = 'v2'"])
+    flush!(shard)
+
+    prev =
+      for k <- [:shard_lease_ttl_ms, :shard_storage], do: {k, Application.get_env(:fathom, k)}
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_before)
+      Application.delete_env(:fathom, :storage_fault)
+
+      for {k, v} <- prev,
+          do:
+            if(v,
+              do: Application.put_env(:fathom, k, v),
+              else: Application.delete_env(:fathom, k)
+            )
+    end)
+
+    Application.put_env(:fathom, :shard_lease_ttl_ms, 300)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    # Every renew fails, and the copy-back blocks for good.
+    Application.put_env(:fathom, :storage_fault, :renew)
+
+    hook = fn id -> if id == shard, do: Process.sleep(:infinity) end
+    Application.put_env(:fathom, :faulty_before, {:restore_snapshot, hook})
+
+    restore = Task.async(fn -> Snapshots.restore(shard, snap_id) end)
+
+    assert {:error, :restore_timeout} = Task.await(restore, 5_000)
+  end
+
   # The production promotion path: download the snapshot, then the fenced
   # `restore_snapshot_from_file/3`. (The by-id `restore_snapshot/3` this test first pinned had no
   # production caller once restore moved here, and was removed 2026-10-01.)
