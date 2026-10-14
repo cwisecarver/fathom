@@ -292,9 +292,17 @@ defmodule Fathom.Test.FaultyStorage do
            else: Local.object_head(shard_id)
          ) do
       {:ok, head} when is_map(head) ->
-        if fault() == :object_head_moves and bump_head_reads() > 1,
-          do: {:ok, %{head | etag: head.etag <> "-moved"}},
-          else: {:ok, head}
+        cond do
+          fault() == :object_head_moves and bump_head_reads() > 1 ->
+            {:ok, %{head | etag: head.etag <> "-moved"}}
+
+          # The RE-read errors while the first read succeeded (expert review 2026-10-13 N3).
+          fault() == :object_head_reread_fails and bump_head_reads() > 1 ->
+            {:error, :s3_unreachable}
+
+          true ->
+            {:ok, head}
+        end
 
       other ->
         other

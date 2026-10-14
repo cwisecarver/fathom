@@ -209,6 +209,16 @@ defmodule Fathom.Shard.PromoteOnOpen do
          :ok <- recheck_object(shard_id, head, replica, started) do
       promote_replica(shard_id, path, lease, etag, replica, position_of(head), lineage)
     else
+      # THE RE-READ FAILED (expert review 2026-10-13 N3). By here a peer replica was already
+      # chosen as fresher, and used to be DECLINED on this error: the open then proceeded from the
+      # OLDER stored object, with no floor, on exactly the S3 brownout that coincides with the
+      # partition. A re-read error means the decision can no longer be confirmed either way, which
+      # is the same situation as a failed decision HEAD, so it takes the same under-quorum window
+      # (refuse inside it, best-effort after, `:none` with no peers). Declining remains right for a
+      # re-read that SUCCEEDS and shows the object moved.
+      {:head_error, reason} ->
+        refuse_or_etag(Recovery.error_window(shard_id, {:object_head, reason}), path, etag)
+
       # THE DECISION READ FAILED (expert review 2026-10-13 #15). Without the object's stamp the
       # floor cannot be evaluated at all, and this used to fall through to the plain etag: open
       # from the object with no floor, on a HEAD error that coincides with the very S3 brownouts
@@ -314,26 +324,20 @@ defmodule Fathom.Shard.PromoteOnOpen do
   defp position_of(nil), do: nil
   defp position_of(%{position: position}), do: position
 
-  # The re-read. A failure to READ is treated as "moved" — declining is the conservative answer and
-  # this whole path is an optimization over opening from the stored object, so an unreadable store
-  # is a reason to take the ordinary path rather than to promote on a comparison we can no longer
-  # confirm.
+  # The re-read. A re-read that SUCCEEDS and shows the object moved declines the promotion (the
+  # ordinary path then serves the newer object). A re-read that FAILS is `{:head_error, reason}`,
+  # routed by the caller through the recovery error window — NOT treated as "moved" (expert review
+  # 2026-10-13 N3: that opened from the older object after the replica was already pulled).
   defp recheck_object(shard_id, before, replica, started) do
-    now =
-      case Storage.object_head(shard_id) do
-        {:ok, head} -> head
-        {:error, reason} -> {:unreadable, reason}
-      end
-
-    case now do
-      {:unreadable, reason} ->
-        decline_promotion(shard_id, {:object_head_unreadable, reason}, started)
-
-      head ->
+    case Storage.object_head(shard_id) do
+      {:ok, head} ->
         case Recovery.recheck(before, head, replica) do
           :ok -> :ok
           {:error, reason} -> decline_promotion(shard_id, reason, started)
         end
+
+      {:error, reason} ->
+        {:head_error, reason}
     end
   end
 

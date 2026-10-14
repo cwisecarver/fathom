@@ -626,6 +626,77 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
            "the promotion was abandoned but the pre-promotion snapshot was still taken"
   end
 
+  # SYMPTOM (expert review 2026-10-13 N3): the post-transfer RE-read of the object head ERRORED,
+  # and `recheck_object` declined the promotion, so the open proceeded from the OLDER stored object
+  # (rows [1,2,3]) after a fresher peer replica had already been chosen and pulled — with no floor,
+  # on exactly the S3 brownout that accompanies a partition. The invariant: a failed re-read goes
+  # through the SAME recovery error window as a failed decision HEAD (#15): refuse (503) inside it,
+  # best-effort from the object after it. (A re-read that SUCCEEDS and shows a moved object still
+  # declines — the test above.) Peers are configured so `error_window/3` has a floor to apply; with
+  # N = Q = 1 the local replica alone satisfies it, so the decision reaches the re-read.
+  describe "a failed re-read of the object head (N3)" do
+    setup ctx do
+      keys = [
+        :replication_followers,
+        :replication_quorum,
+        :replication_recovery_underquorum_window_ms,
+        :replication_recovery_refusal_ttl_ms
+      ]
+
+      prev = Map.new(keys, &{&1, Application.get_env(:fathom, &1)})
+      prev_running = Fleet.running()
+
+      on_exit(fn ->
+        Fleet.publish(prev_running)
+
+        for {k, v} <- prev do
+          if is_nil(v),
+            do: Application.delete_env(:fathom, k),
+            else: Application.put_env(:fathom, k, v)
+        end
+      end)
+
+      Recovery.init_table()
+      Fleet.publish([])
+      Application.put_env(:fathom, :replication_quorum, 1)
+      Application.put_env(:fathom, :replication_recovery_underquorum_window_ms, 60_000)
+      Application.put_env(:fathom, :replication_recovery_refusal_ttl_ms, 0)
+      Application.put_env(:fathom, :replication_promote_on_open, true)
+      Application.put_env(:fathom, :replication_recover_from_peers, true)
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+      %{id: id} = ctx
+      {conn, coordinator} = build_shard(id, 10, 3)
+      assert {:ok, stamp} = Storage.object_position(id)
+
+      # `wal_ordinal` is required for the replica to be RANKABLE at all (`Promote.fresher?/2`).
+      install_replica(id, %{
+        epoch: stamp.epoch,
+        wal_gen: stamp.wal_gen,
+        wal_ordinal: stamp.wal_ordinal,
+        offset: stamp.offset + 1
+      })
+
+      tear_down_primary(id, conn, coordinator)
+
+      # Peers are configured only NOW: with them present the fixture's own flush would run as a
+      # replicating shard and stamp a different position than the replica installed above.
+      Application.put_env(:fathom, :replication_followers, [{"dead1", "127.0.0.1", 1}])
+      Application.put_env(:fathom, :storage_fault, :object_head_reread_fails)
+      :ok
+    end
+
+    test "refuses inside the window, opens best-effort from the object after it", %{id: id} do
+      assert {:error, %Filo.Error{status: 503}} = ShardExecutor.open(id)
+
+      # Age the episode past the window rather than sleep through it.
+      [{^id, first, last}] = :ets.lookup(Recovery.UnderQuorumWindow, id)
+      :ets.insert(Recovery.UnderQuorumWindow, {id, first - 60_001, last})
+
+      assert open_and_read(id) == [1, 2, 3]
+    end
+  end
+
   # THE COST GATE (2026-08-25), and the only place it is visible.
   #
   # `:replication_recover_from_peers` now defaults ON, and `try_promote_from_fleet/5` opens with
