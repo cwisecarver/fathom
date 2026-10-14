@@ -138,6 +138,12 @@ defmodule Fathom.Telemetry do
         tags: [:result],
         description: "Connection-pool takes on a stream open, by hit/miss"
       ),
+      # Checkins closed instead of pooled because the node-wide idle budget was full (perf review
+      # 2026-10-14 #16). Untagged: shard_id rides the metadata for logs only.
+      counter("fathom.shard.pool_budget_full.count",
+        event_name: [:fathom, :shard, :pool_budget_full],
+        description: "Pooled checkins closed because the node idle-handle budget was full"
+      ),
       counter("fathom.shard.lease.acquired.count",
         description: "Lease acquisitions (steal-on-lapse + first open)"
       ),

@@ -447,6 +447,18 @@ if ms = System.get_env("SHARD_IDLE_MS") do
   config :fathom, :shard_idle_ms, String.to_integer(ms)
 end
 
+# Perf review 2026-10-14 #4: how long an idle shard keeps its pooled SQLite handle after its last
+# stream closes (default 250 ms), so a serial client's next request reuses it. 0 = drain on close.
+if ms = System.get_env("POOL_DRAIN_GRACE_MS") do
+  config :fathom, :connection_pool_opts, drain_grace_ms: String.to_integer(ms)
+end
+
+# Perf review 2026-10-14 #16: node-wide cap on idle pooled handles (default 8192). Over it a checkin
+# is closed instead of pooled; a checkout is never refused.
+if n = System.get_env("POOL_IDLE_BUDGET") do
+  config :fathom, :connection_pool_idle_budget, String.to_integer(n)
+end
+
 # Rollout sweep per-run cap (#19): how many laggards the hourly ReconcileJob enqueues per run.
 # Default 100; raise it (RECONCILE_BATCH_SIZE) to converge a large cold tail faster.
 if n = System.get_env("RECONCILE_BATCH_SIZE") do

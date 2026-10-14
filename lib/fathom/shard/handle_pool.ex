@@ -18,7 +18,8 @@ defmodule Fathom.Shard.HandlePool do
     `-shm` / page cache); when a bucket is over `max_per_scope` the oldest is evicted; a handle idle
     longer than `ttl_ms` is swept. All three hand the removed handle back to be closed.
   - **`drain/1` empties everything** — the coordinator calls it on flush-drop / fence / terminate so
-    no pooled handle can outlive the shard's lease on this node.
+    no pooled handle can outlive the shard's lease on this node, and at the end of the drain grace
+    (or at any barrier inside it) once the shard has gone idle.
   """
 
   @type scope :: :ro | :rw
@@ -28,21 +29,26 @@ defmodule Fathom.Shard.HandlePool do
   @type t :: %__MODULE__{
           idle: %{ro: [entry()], rw: [entry()]},
           max_per_scope: pos_integer(),
-          ttl_ms: pos_integer()
+          ttl_ms: pos_integer(),
+          drain_grace_ms: non_neg_integer()
         }
 
-  defstruct idle: %{ro: [], rw: []}, max_per_scope: 1, ttl_ms: 30_000
+  defstruct idle: %{ro: [], rw: []}, max_per_scope: 1, ttl_ms: 30_000, drain_grace_ms: 250
 
   @doc """
   A new empty pool. `:max_per_scope` caps idle handles held per scope (default 1); `:ttl_ms` is how
-  long an idle handle may sit before `sweep/2` closes it (default 30_000).
+  long an idle handle may sit before `sweep/2` closes it (default 30_000); `:drain_grace_ms` is how
+  long the coordinator keeps the pool after the shard's LAST stream checks in before it drains it
+  (default 250; 0 drains on that checkin, the pre-2026-10-14 behaviour). The grace is the
+  coordinator's to enforce (`Fathom.Shard`); this module only carries the setting.
   """
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
     %__MODULE__{
       idle: %{ro: [], rw: []},
       max_per_scope: Keyword.get(opts, :max_per_scope, 1),
-      ttl_ms: Keyword.get(opts, :ttl_ms, 30_000)
+      ttl_ms: Keyword.get(opts, :ttl_ms, 30_000),
+      drain_grace_ms: Keyword.get(opts, :drain_grace_ms, 250)
     }
   end
 

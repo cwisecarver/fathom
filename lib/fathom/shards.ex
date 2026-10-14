@@ -122,7 +122,8 @@ defmodule Fathom.Shards do
   every other caller keeps `checkout/1`.
   """
   @spec checkout(term(), :ro | :rw) ::
-          {:ok, pid(), reference(), Path.t(), {:reuse, reference()} | :open} | {:error, term()}
+          {:ok, pid(), reference(), Path.t(), {:reuse, Fathom.Shard.Connection.pooled()} | :open}
+          | {:error, term()}
   def checkout(shard_id, scope) when scope in [:ro, :rw] do
     # ONE coordinator round-trip now: the grant and the pool take fold into a single `:checkout`
     # reply (expert review 2026-09-18 #18), instead of `checkout/1` + a separate `pool_take/2`. The

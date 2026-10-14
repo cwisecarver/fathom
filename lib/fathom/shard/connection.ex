@@ -1060,16 +1060,73 @@ defmodule Fathom.Shard.Connection do
   def purge_statements(conn), do: purge_stmt_cache(conn)
 
   defp purge_stmt_cache(conn) do
-    case Process.delete({__MODULE__, :stmt_cache, conn}) do
-      {_seq, cache} ->
-        Enum.each(cache, fn {_sql, {_canonical, stmt, _cols, _stamp, _gen}} ->
-          Sqlite3.release(conn, stmt)
-        end)
-
-      nil ->
-        :ok
-    end
+    release_cache(conn, Process.delete({__MODULE__, :stmt_cache, conn}))
   end
+
+  defp release_cache(conn, {_seq, cache}) do
+    Enum.each(cache, fn {_sql, {_canonical, stmt, _cols, _stamp, _gen}} ->
+      Sqlite3.release(conn, stmt)
+    end)
+  end
+
+  defp release_cache(_conn, nil), do: :ok
+
+  # --- the statement cache travels with a POOLED handle (perf review 2026-10-14 #10) -------------
+  #
+  # A pooled checkin used to purge the stream's cache, so every reused stream re-prepared every
+  # statement: measured 41 vs 24 us for a three-statement Django-shaped stream (purge + re-prepare
+  # vs cache hits, 2026-10-04). The stream now DETACHES its cache at checkin and hands it to the
+  # coordinator with the handle, and the next stream ADOPTS it.
+  #
+  # Safe to carry because: a statement holds no snapshot once it has returned DONE, and every
+  # abandoned one is reset (`do_query/5`); each entry carries the SchemaGen generation it was
+  # prepared under, so a schema change while parked re-prepares on first use (and reset_for_reuse/2
+  # reloads the schema before the adopt); and the pool is per shard and scope, so a cache never
+  # crosses tenants. What must NOT change is the `sqlite3_close_v2` invariant
+  # (`release_owner_state/1`): every path that closes a pooled handle goes through `close_pooled/1`,
+  # which finalizes the carried statements first. If the coordinator dies without closing, the cache
+  # dies with its state and GC finalizes the statements, as it did for the stream before.
+  #
+  # Parked 2026-10-04 because the hand-off cost a serial one-shot client +8% (the release and the
+  # cache message moved onto the coordinator, and the pool was drained on every close anyway). With
+  # the pool drain grace (`Fathom.Shard`, perf review 2026-10-14 #4) that client's next request is a
+  # pool HIT that adopts the cache, so the hand-off buys the prepares back instead of only costing.
+
+  @typedoc "A pooled handle: a bare connection, or one carrying its last stream's statement cache."
+  @type pooled :: reference() | {reference(), term()}
+
+  @doc false
+  # Remove this stream's statement cache WITHOUT releasing it, for handing to the pool.
+  @spec detach_statements(reference()) :: term()
+  def detach_statements(conn), do: Process.delete({__MODULE__, :stmt_cache, conn})
+
+  @doc false
+  # Install a cache a previous stream detached, in THIS stream's dictionary.
+  @spec adopt_statements(reference(), term()) :: :ok
+  def adopt_statements(_conn, nil), do: :ok
+
+  def adopt_statements(conn, cache) do
+    Process.put({__MODULE__, :stmt_cache, conn}, cache)
+    :ok
+  end
+
+  @doc false
+  # Stop this stream's watchdog only (the half of `release_owner_state/1` a pooled checkin still
+  # needs once the statements travel with the handle).
+  @spec release_watchdog(reference()) :: :ok
+  def release_watchdog(conn), do: stop_watchdog(conn)
+
+  @doc """
+  Close a pooled handle: finalize the statement cache it carries, then close. The only way a
+  pooled handle may be closed — see "the statement cache travels with a POOLED handle" above.
+  """
+  @spec close_pooled(pooled()) :: :ok
+  def close_pooled({conn, cache}) do
+    release_cache(conn, cache)
+    close(conn)
+  end
+
+  def close_pooled(conn), do: close(conn)
 
   # Resolve `:query_max_rows` ONCE per query — the old shape re-read the app env inside every
   # collect batch (a 200k-row result did ~4k redundant get_envs in one query's hot loop).
@@ -1631,23 +1688,24 @@ defmodule Fathom.Shard.Connection do
   touches, so a pooled handle carried it into the NEXT stream: a `CREATE TEMP TRIGGER … ON main.t`
   fired on a later request's writes, and a TEMP table named like a main table SHADOWED it for
   unqualified names (which is how Django writes SQL) — reads returned the temp rows, and writes
-  landed in a table that is never flushed. Deliberately a raw prepare/step with no statement cache
-  and no watchdog: it runs at checkin, after the stream's own state is torn down.
+  landed in a table that is never flushed. No watchdog: it runs at checkin, in the stream process.
+
+  THE PROBE STATEMENT IS KEPT (perf review 2026-10-14 #10). It used to be a raw prepare + step +
+  release, three dirty-NIF dispatches on every pooled checkin. It now lives in the stream's
+  statement cache, which travels with the pooled handle, so a reused handle's checkin is ONE step.
+  A `:done` step holds no snapshot. A `:row` (the temp schema is NOT empty) answers `false` and the
+  caller closes the handle, which finalizes the statement with the rest of the cache. Must run
+  BEFORE `detach_statements/1` / `release_owner_state/1`, while the cache is still in this process.
 
   Any failure answers `false`: a handle whose temp schema cannot be read is not pooled.
   """
+  @temp_probe_sql "SELECT 1 FROM temp.sqlite_schema LIMIT 1"
+
   @spec temp_schema_empty?(reference()) :: boolean()
   def temp_schema_empty?(conn) do
-    case Sqlite3.prepare(conn, "SELECT 1 FROM temp.sqlite_schema LIMIT 1") do
-      {:ok, stmt} ->
-        try do
-          Sqlite3.step(conn, stmt) == :done
-        after
-          Sqlite3.release(conn, stmt)
-        end
-
-      {:error, _} ->
-        false
+    case cached_stmt(conn, @temp_probe_sql) do
+      {:ok, stmt, _cols, _refetch?} -> Sqlite3.step(conn, stmt) == :done
+      {:error, _} -> false
     end
   rescue
     _ -> false

@@ -6,9 +6,14 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   The invariant that shapes every test: **an idle shard holds ZERO pooled connections.** A pooled
   handle keeps a SQLite connection open, and the durability / position-stamp / flush-timer machinery
   assumes an idle shard's last stream already checkpointed+unlinked the WAL — so the pool is drained
-  the instant `conns` hits 0 (`release/1`). Pooling therefore serves OVERLAPPING streams: a handle
+  when `conns` hits 0 (`release/1`). Pooling therefore serves OVERLAPPING streams: a handle
   checked in while the shard is still busy is reused by the next stream. The reuse observable is the
   SQLite connection reference itself. Not async — shards are global and file-backed.
+
+  Since perf review 2026-10-14 #4 the drain waits out a short grace (`drain_grace_ms`, default
+  250 ms) so a SERIAL client's next stream is a pool hit too. The tests here that pin the drain
+  itself run with the grace at 0 (`drain_on_close/0`, the pre-grace behaviour, still a supported
+  setting); the grace and the barriers that must drain inside it are `pool_grace_test.exs`.
   """
   use ExUnit.Case, async: false
 
@@ -20,12 +25,14 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   setup do
     prev_pool = Application.get_env(:fathom, :connection_pool)
     prev_idle = Application.get_env(:fathom, :shard_idle_ms)
+    prev_opts = Application.get_env(:fathom, :connection_pool_opts)
     Application.put_env(:fathom, :shard_idle_ms, 60_000)
     shard = "pool_it_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
       restore(:connection_pool, prev_pool)
       restore(:shard_idle_ms, prev_idle)
+      restore(:connection_pool_opts, prev_opts)
 
       for base <- [
             Path.join(Fathom.Shard.data_dir(), "#{shard}.db"),
@@ -42,6 +49,10 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   defp restore(key, val), do: Application.put_env(:fathom, key, val)
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
   defp pool_of(pid), do: :sys.get_state(pid).pool
+
+  # The pre-grace drain-on-close behaviour (`drain_grace_ms: 0`), for the tests that pin the idle
+  # drain itself. Must run before the shard's coordinator starts: the pool reads it at init.
+  defp drain_on_close, do: Application.put_env(:fathom, :connection_pool_opts, drain_grace_ms: 0)
   defp conn_of({_pid, _ref, conn, _id, _sc, _v, _o}), do: conn
   defp pid_of({pid, _ref, _conn, _id, _sc, _v, _o}), do: pid
 
@@ -141,9 +152,12 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
     shard: shard
   } do
     Application.put_env(:fathom, :connection_pool, true)
-    prev_opts = Application.get_env(:fathom, :connection_pool_opts)
-    Application.put_env(:fathom, :connection_pool_opts, max_per_scope: 4, ttl_ms: 20)
-    on_exit(fn -> restore(:connection_pool_opts, prev_opts) end)
+
+    Application.put_env(:fathom, :connection_pool_opts,
+      max_per_scope: 4,
+      ttl_ms: 20,
+      drain_grace_ms: 0
+    )
 
     {:ok, h} = ShardExecutor.open(shard)
     {:ok, %StmtResult{}} = ShardExecutor.execute(h, stmt("SELECT 1"))
@@ -181,6 +195,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   test "pooling ON: the sweep timer is armed while a handle is pooled and cancelled on drain (#35)",
        %{shard: shard} do
     Application.put_env(:fathom, :connection_pool, true)
+    drain_on_close()
 
     {:ok, ha} = ShardExecutor.open(shard)
     {:ok, hb} = ShardExecutor.open(shard)
@@ -392,6 +407,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   test "pooling ON: draining a pooled handle checkpoints+unlinks the WAL (A2 durability invariant)",
        %{shard: shard} do
     Application.put_env(:fathom, :connection_pool, true)
+    drain_on_close()
 
     {:ok, ha} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))
@@ -459,6 +475,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
 
   test "pooling ON: an idle shard drains its pool — the durability invariant", %{shard: shard} do
     Application.put_env(:fathom, :connection_pool, true)
+    drain_on_close()
 
     {:ok, ha} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))

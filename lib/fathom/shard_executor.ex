@@ -130,6 +130,22 @@ defmodule Fathom.ShardExecutor do
   # A reused pooled handle is reset for the new stream; if it will not reset cleanly it is discarded
   # (closed) and a fresh one opened — never served half-reset. `:open` is the fresh-open path, byte
   # for byte what the non-pooled executor did.
+  #
+  # The handle may carry its previous stream's prepared statements (perf review 2026-10-14 #10);
+  # they are adopted into THIS stream only after the reset succeeds, and released with the handle if
+  # it does not.
+  defp obtain_conn({:reuse, {conn, cache} = handle}, path, _scope, opts) do
+    case Connection.reset_for_reuse(conn, opts[:scope]) do
+      :ok ->
+        Connection.adopt_statements(conn, cache)
+        {:ok, conn}
+
+      {:error, _reason} ->
+        Connection.close_pooled(handle)
+        Connection.open(path, opts)
+    end
+  end
+
   defp obtain_conn({:reuse, conn}, path, _scope, opts) do
     case Connection.reset_for_reuse(conn, opts[:scope]) do
       :ok ->
@@ -1266,11 +1282,14 @@ defmodule Fathom.ShardExecutor do
     # fresh, which is exactly the pre-pooling behaviour for that one handle.
     if connection_pool?() and not opts.template? and not session_mutated? and
          Connection.temp_schema_empty?(conn) do
-      # Finalize THIS stream's prepared statements + watchdog in THIS process before handing the
-      # handle off — the coordinator cannot reach them, and an unfinalized statement makes
-      # `sqlite3_close_v2` defer the eventual close, skipping the WAL checkpoint the durability
-      # position stamp depends on (see Connection.release_owner_state/1).
-      Connection.release_owner_state(conn)
+      # Stop THIS stream's watchdog, and DETACH (not release) its prepared statements so they travel
+      # with the handle to the next stream (perf review 2026-10-14 #10: re-preparing them cost 41 vs
+      # 24 us for a three-statement stream). They used to be finalized here because the coordinator
+      # could not reach them; now it holds them with the handle, and every close of a pooled handle
+      # is `Connection.close_pooled/1`, which finalizes them first — the `sqlite3_close_v2` invariant
+      # `Connection.release_owner_state/1` describes still holds.
+      handle = {conn, Connection.detach_statements(conn)}
+      Connection.release_watchdog(conn)
 
       # Roll back any transaction this stream left open BEFORE the handle is pooled (expert review
       # 2026-09-18 #3). reset_for_reuse/2 also rolls back, but LAZILY on the NEXT reuse — so a handle
@@ -1298,11 +1317,11 @@ defmodule Fathom.ShardExecutor do
       # and the process exiting.
       case Connection.rollback_if_open(conn) do
         :ok ->
-          Shard.checkin(pid, ref, conn, scope)
-          unless Process.alive?(pid), do: Connection.close(conn)
+          Shard.checkin(pid, ref, handle, scope)
+          unless Process.alive?(pid), do: Connection.close_pooled(handle)
 
         {:error, _reason} ->
-          Connection.close(conn)
+          Connection.close_pooled(handle)
           Shard.checkin(pid, ref)
       end
     else

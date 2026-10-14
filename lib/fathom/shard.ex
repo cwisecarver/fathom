@@ -65,6 +65,7 @@ defmodule Fathom.Shard do
     Heartbeat,
     Integrity,
     Materializer,
+    PoolBudget,
     Position,
     PromoteOnOpen,
     Provenance,
@@ -215,7 +216,7 @@ defmodule Fathom.Shard do
   Returns `{:ok, ref, path, {:reuse, conn} | :open}`. `:open` when pooling is off / a pool miss.
   """
   @spec checkout(pid(), :ro | :rw) ::
-          {:ok, reference(), Path.t(), {:reuse, reference()} | :open} | {:error, term()}
+          {:ok, reference(), Path.t(), {:reuse, Connection.pooled()} | :open} | {:error, term()}
   def checkout(pid, scope) when is_pid(pid) and scope in [:ro, :rw] do
     do_checkout(pid, make_ref(), scope)
   end
@@ -228,7 +229,7 @@ defmodule Fathom.Shard do
   a SEPARATE call from `checkout/1` so the retry machinery in `Fathom.Shards` stays untouched;
   `checkin/4` returns the handle. Used by the request path (`Fathom.ShardExecutor`).
   """
-  @spec pool_take(pid(), :ro | :rw) :: {:reuse, reference()} | :open
+  @spec pool_take(pid(), :ro | :rw) :: {:reuse, Connection.pooled()} | :open
   def pool_take(pid, scope) when is_pid(pid) and scope in [:ro, :rw] do
     GenServer.call(pid, {:pool_take, scope})
   catch
@@ -290,7 +291,7 @@ defmodule Fathom.Shard do
   it (pooling off, over the per-scope cap, or the shard is draining). The caller must NOT close the
   handle itself after this. Pairs with `checkout/2`.
   """
-  @spec checkin(pid(), reference(), reference(), :ro | :rw) :: :ok
+  @spec checkin(pid(), reference(), Connection.pooled(), :ro | :rw) :: :ok
   def checkin(pid, ref, conn, scope) when is_pid(pid) and scope in [:ro, :rw],
     do: GenServer.cast(pid, {:checkin, ref, conn, scope})
 
@@ -908,6 +909,15 @@ defmodule Fathom.Shard do
         # predecessor, so waiting on the tail waits for every close. See start_close/2 and
         # await_closing/2.
         closing: nil,
+        # The pool DRAIN GRACE timer (perf review 2026-10-14 #4), armed at most once while an idle
+        # shard keeps its pool; coalesced against `idle_since` like the idle timer. See
+        # release_pool_on_idle/1 and THE POOL DRAIN GRACE barrier list above drain_pool/1.
+        pool_grace_timer: nil,
+        # True while a durability flush is waiting for the idle pool's close: the grace is
+        # suspended (every idle transition drains at once, the pre-grace behaviour) until that
+        # flush gets past its close check, so a serial client cannot keep re-filling the pool in
+        # front of it. See drain_idle_pool_for_flush/1.
+        pool_flush_hold: false,
         # Has the open path's plain sidecar write been made durable yet? See sync_sidecar_once/1.
         sidecar_synced?: false,
         idle_ms: idle_ms(),
@@ -1891,12 +1901,35 @@ defmodule Fathom.Shard do
 
   def handle_info(:sweep_pool, %{pool: pool} = state) do
     {pool, expired} = HandlePool.sweep(pool, System.monotonic_time(:millisecond))
-    Enum.each(expired, &Connection.close/1)
+    Enum.each(expired, &Connection.close_pooled/1)
     # cancel_sweep, not just clearing the field: a tick from a timer cancelled by drain_pool can
     # already be in the mailbox when checkin arms a new one, and cancelling here keeps it to ONE
     # live timer instead of two chains.
-    {:noreply, schedule_sweep(cancel_sweep(%{state | pool: pool}))}
+    {:noreply, schedule_sweep(cancel_sweep(put_pool(state, pool)))}
   end
+
+  # The pool drain grace ran out (perf review 2026-10-14 #4; see THE POOL DRAIN GRACE above
+  # drain_pool/1). Coalesced against `idle_since` like `:idle_timeout`: busy again means the next
+  # idle transition re-arms it; a newer idle transition re-arms for the remainder.
+  def handle_info(:pool_grace, %{pool: %HandlePool{drain_grace_ms: grace}} = state) do
+    state = %{state | pool_grace_timer: nil}
+
+    left =
+      if state.idle_since, do: grace - (System.monotonic_time(:millisecond) - state.idle_since)
+
+    cond do
+      map_size(state.conns) > 0 or left == nil ->
+        {:noreply, state}
+
+      left > 0 ->
+        {:noreply, %{state | pool_grace_timer: Process.send_after(self(), :pool_grace, left)}}
+
+      true ->
+        {:noreply, drain_pool(state)}
+    end
+  end
+
+  def handle_info(:pool_grace, state), do: {:noreply, %{state | pool_grace_timer: nil}}
 
   # `FlushWatermark` restarted with an empty table (expert review 2026-08-26 #17). Re-assert this
   # shard's row so the RPO gauge stops under-reporting; without it a shard only re-published after
@@ -2088,7 +2121,13 @@ defmodule Fathom.Shard do
     # It must not be WAITED on here (expert review 2026-10-13 #19): this is the coordinator's
     # mailbox, and a wedged close would hold every checkout/checkin/:DOWN for up to 30 s. A close
     # still running just defers this tick with the short backoff; a finished one is cleared.
-    state = reap_closing(state)
+    #
+    # An idle dirty shard still inside its pool drain grace (perf review 2026-10-14 #4) drains
+    # first, so the close it starts is exactly such a pending close: this tick defers behind it and
+    # the snapshot reads the empty WAL the stamp expects. `pool_flush_hold` keeps the grace off
+    # until a tick gets past the close check, so a serial client cannot re-fill the pool forever.
+    state = state |> drain_idle_pool_for_flush() |> reap_closing()
+    state = if closing_busy?(state), do: state, else: %{state | pool_flush_hold: false}
 
     cond do
       closing_busy?(state) ->
@@ -2480,7 +2519,8 @@ defmodule Fathom.Shard do
 
       HandlePool.new(
         max_per_scope: Keyword.get(cfg, :max_per_scope, 1),
-        ttl_ms: Keyword.get(cfg, :ttl_ms, 30_000)
+        ttl_ms: Keyword.get(cfg, :ttl_ms, 30_000),
+        drain_grace_ms: Keyword.get(cfg, :drain_grace_ms, 250)
       )
     else
       nil
@@ -2538,7 +2578,7 @@ defmodule Fathom.Shard do
     case HandlePool.take(pool, scope) do
       {:hit, conn, pool} ->
         :telemetry.execute([:fathom, :shard, :pool_take], %{count: 1}, %{result: :hit})
-        {{:reuse, conn}, %{state | pool: pool}}
+        {{:reuse, conn}, put_pool(state, pool)}
 
       {:miss, pool} ->
         :telemetry.execute([:fathom, :shard, :pool_take], %{count: 1}, %{result: :miss})
@@ -2577,7 +2617,7 @@ defmodule Fathom.Shard do
 
     for {ref, conn} <- Map.get(state, :lent, %{}),
         not live_holder?(conns, ref),
-        do: Connection.close(conn)
+        do: Connection.close_pooled(conn)
 
     :ok
   end
@@ -2607,10 +2647,24 @@ defmodule Fathom.Shard do
 
   defp pool_checkin(%{draining: true} = state, conn, _scope), do: start_close(state, [conn])
 
+  # Over the node-wide idle budget (perf review 2026-10-14 #16) the handle is closed instead of
+  # pooled, through the same chain as a draining checkin; the checkout itself was never at stake.
+  # See `Fathom.Shard.PoolBudget` for why it is the incoming handle and not the node's oldest.
   defp pool_checkin(%{pool: pool} = state, conn, scope) do
-    {pool, evicted} = HandlePool.put(pool, scope, conn, System.monotonic_time(:millisecond))
-    Enum.each(evicted, &Connection.close/1)
-    schedule_sweep(%{state | pool: pool})
+    if PoolBudget.admit?() do
+      {pool, evicted} = HandlePool.put(pool, scope, conn, System.monotonic_time(:millisecond))
+      Enum.each(evicted, &Connection.close_pooled/1)
+      schedule_sweep(put_pool(state, pool))
+    else
+      :telemetry.execute([:fathom, :shard, :pool_budget_full], %{count: 1}, %{shard_id: state.id})
+      start_close(state, [conn])
+    end
+  end
+
+  # Every change to the pool's SIZE goes through here so the node-wide budget stays exact.
+  defp put_pool(state, pool) do
+    PoolBudget.adjust(self(), HandlePool.count(pool) - HandlePool.count(state.pool))
+    %{state | pool: pool}
   end
 
   # Close every idle pooled handle. Called on EVERY terminate clause — a pooled handle is idle (no
@@ -2638,8 +2692,9 @@ defmodule Fathom.Shard do
 
     case state do
       %{pool: pool} when pool != nil ->
-        {conns, _pool} = HandlePool.drain(pool)
-        Enum.each(conns, &Connection.close/1)
+        {handles, empty} = HandlePool.drain(pool)
+        PoolBudget.adjust(self(), HandlePool.count(empty) - HandlePool.count(pool))
+        Enum.each(handles, &Connection.close_pooled/1)
 
       _ ->
         :ok
@@ -2655,7 +2710,7 @@ defmodule Fathom.Shard do
   defp close_pending_checkins do
     receive do
       {:"$gen_cast", {:checkin, _ref, conn, _scope}} ->
-        Connection.close(conn)
+        Connection.close_pooled(conn)
         close_pending_checkins()
     after
       0 -> :ok
@@ -2709,21 +2764,86 @@ defmodule Fathom.Shard do
         # question (#4). Without this reset a shard that ever wrote would never take the slow
         # cadence again, and the optimisation review 2026-08-01 #42 added would be dead.
         #
-        # DRAIN THE POOL HERE — an idle shard must hold ZERO SQLite connections. Everything
-        # downstream (the empty-WAL position stamp A2 ranks on, the durability snapshot, the
-        # clean→dirty flush-timer edge) assumes the last stream's close checkpointed+unlinked the
-        # WAL; a pooled handle left open would keep the WAL alive and make the next periodic flush
-        # stamp a WAL-content position instead of the empty-WAL over-claim (breaks
-        # `ShardPositionSeedTest` / `ShardDurabilityTest`). So pooling serves OVERLAPPING streams
-        # (`conns` stays > 0 across the reuse) and closes on idle — connection-pooling is a
-        # busy-shard optimisation, never a change to what an idle shard looks like.
-        schedule_idle(drain_pool(%{state | wrote_during_checkout?: false}))
+        # DRAIN THE POOL — after the drain grace. Everything downstream (the empty-WAL position
+        # stamp A2 ranks on, the durability snapshot, the clean→dirty flush-timer edge) assumes an
+        # IDLE shard's last close checkpointed+unlinked the WAL; a pooled handle left open keeps the
+        # WAL alive and makes the next flush stamp a WAL-content position instead of the empty-WAL
+        # over-claim (`ShardPositionSeedTest` / `ShardDurabilityTest`). Until 2026-10-14 the pool was
+        # drained right here, so a serial client (an HTTP SDK, Django's `CONN_MAX_AGE=0`) paid a
+        # fresh open and a close-time checkpoint on every request. It now keeps the pool for
+        # `drain_grace_ms` (perf review 2026-10-14 #4) and every barrier that relies on "idle ⇒ no
+        # SQLite connections" drains it first — see THE POOL DRAIN GRACE above drain_pool/1.
+        schedule_idle(release_pool_on_idle(%{state | wrote_during_checkout?: false}))
     end
   end
 
-  # Close every pooled idle handle now (used on the idle transition; the pool is per-shard, so this
-  # touches only this shard's handles). Distinct from `close_pool/1`, which is the terminate-time
-  # variant — same effect, but this one returns the updated state to thread on.
+  # THE POOL DRAIN GRACE (perf review 2026-10-14 #4). On the idle transition the pool is kept for
+  # `drain_grace_ms` (HandlePool, default 250 ms; 0 is the old drain-on-close), so a serial client's
+  # next request is a pool HIT that skips the open (the `-shm` rebuild was ~176 of the ~230 us) and
+  # adopts the previous stream's statement cache (#10), and the shard takes ONE close-time
+  # checkpoint per idle gap instead of one per request (with A2, one new WAL generation per gap).
+  #
+  # The cost is that an idle shard may now hold a SQLite connection — and its WAL — for up to the
+  # grace. Every barrier that relied on "an idle shard holds no connections" drains the pool FIRST,
+  # and none of them proceeds until that close has finished:
+  #
+  #   1. Durability flush (periodic and `:flush_now`, which carries the position stamp): an idle
+  #      dirty shard's pool is drained and the flush deferred until the close is done
+  #      (drain_idle_pool_for_flush/1 + the `closing_busy?` deferral), and the grace is held off
+  #      until that flush runs (`pool_flush_hold`).
+  #   2. The drop flush + stamp of every stopping path — idle-stop (`:idle_timeout`), migration and
+  #      node drain (`{:drain, …}`, `stop_when_drained`), rebalancer handoff and `Shards.stop`
+  #      (both drain/stop), lease loss / steal (`{:shutdown, :lease_lost}`), the orphan stop —
+  #      all reach terminate/2, whose `close_pool/1` closes the pooled handles INLINE (after the
+  #      close chain) before it flushes, drops, renames or quarantines a file.
+  #   3. The write fence (note_not_valid/1): publishing it drains the pool, so no idle handle sits
+  #      on a shard this node may be about to lose. The lease_lost terminate clause still publishes
+  #      the fence BEFORE close_pool (expert review 2026-10-12 #19).
+  #   4. The next idle transition with the grace at 0 or held: drains at once, as before.
+  #
+  # The close itself still rides the off-coordinator chain (expert review 2026-10-12 #15/#16), so
+  # the grace's own drain never runs a checkpoint inside this mailbox. Tests: pool_grace_test.exs.
+  defp release_pool_on_idle(%{pool: nil} = state), do: state
+
+  defp release_pool_on_idle(%{pool: %HandlePool{drain_grace_ms: grace} = pool} = state) do
+    cond do
+      grace <= 0 or state.pool_flush_hold or HandlePool.count(pool) == 0 ->
+        drain_pool(state)
+
+      # Coalesced like the idle timer: one live timer, compared against `idle_since` when it fires.
+      state.pool_grace_timer != nil ->
+        state
+
+      true ->
+        %{state | pool_grace_timer: Process.send_after(self(), :pool_grace, grace)}
+    end
+  end
+
+  defp cancel_pool_grace(%{pool_grace_timer: nil} = state), do: state
+
+  defp cancel_pool_grace(%{pool_grace_timer: timer} = state) do
+    Process.cancel_timer(timer)
+    %{state | pool_grace_timer: nil}
+  end
+
+  defp cancel_pool_grace(state), do: state
+
+  # Barrier 1 above: an idle, dirty shard about to snapshot drains its pool first. The caller then
+  # sees the close chain busy and defers the flush until the close (the checkpoint) has finished.
+  defp drain_idle_pool_for_flush(
+         %{pool: %HandlePool{} = pool, conns: conns, flush_task: nil} = state
+       )
+       when map_size(conns) == 0 do
+    if HandlePool.count(pool) > 0 and unflushed?(state),
+      do: %{drain_pool(state) | pool_flush_hold: true},
+      else: state
+  end
+
+  defp drain_idle_pool_for_flush(state), do: state
+
+  # Close every pooled idle handle now (the grace's end and the barriers above; the pool is
+  # per-shard, so this touches only this shard's handles). Distinct from `close_pool/1`, which is the
+  # terminate-time variant — same effect, but this one returns the updated state to thread on.
   defp drain_pool(%{pool: nil} = state), do: state
 
   #
@@ -2747,7 +2867,7 @@ defmodule Fathom.Shard do
   # closed their own handles outside this process.
   defp drain_pool(%{pool: pool} = state) do
     {conns, pool} = HandlePool.drain(pool)
-    state = cancel_sweep(%{state | pool: pool})
+    state = state |> put_pool(pool) |> cancel_sweep() |> cancel_pool_grace()
 
     case conns do
       [] -> state
@@ -2776,7 +2896,7 @@ defmodule Fathom.Shard do
     # inline, the pre-#15 behaviour, rather than leak the handles.
     _ ->
       state = await_closing(state)
-      Enum.each(conns, &Connection.close/1)
+      Enum.each(conns, &Connection.close_pooled/1)
       state
   end
 
@@ -2796,15 +2916,20 @@ defmodule Fathom.Shard do
     # process, never in the coordinator.
     hook = Application.get_env(:fathom, :shard_pool_close_hook)
 
-    for conn <- conns do
-      if hook, do: hook.(conn)
-      Connection.close(conn)
+    # Every handle here may be a pooled one carrying a statement cache (perf review 2026-10-14
+    # #10), so it closes through close_pooled/1, which finalizes the carried statements first.
+    for handle <- conns do
+      if hook, do: hook.(bare_conn(handle))
+      Connection.close_pooled(handle)
     end
 
     :ok
   rescue
     e -> Logger.warning("shard #{id}: pooled-handle close crashed (#{Exception.message(e)})")
   end
+
+  defp bare_conn({conn, _cache}), do: conn
+  defp bare_conn(conn), do: conn
 
   # Clear a finished close chain from the state without waiting (expert review 2026-10-13 #19).
   defp reap_closing(%{closing: pid} = state) when is_pid(pid),
@@ -3937,17 +4062,24 @@ defmodule Fathom.Shard do
       now = System.monotonic_time(:millisecond)
       since = state.not_valid_since || now
 
-      if not Fathom.Shard.WriteFence.fenced?(state.id) and
-           now - since >= stealable_after_ms(state) do
-        Fathom.Shard.WriteFence.fence(state.id)
-        :telemetry.execute([:fathom, :shard, :write_fenced], %{count: 1}, %{shard_id: state.id})
+      state =
+        if not Fathom.Shard.WriteFence.fenced?(state.id) and
+             now - since >= stealable_after_ms(state) do
+          Fathom.Shard.WriteFence.fence(state.id)
+          :telemetry.execute([:fathom, :shard, :write_fenced], %{count: 1}, %{shard_id: state.id})
 
-        Logger.warning(
-          "shard #{state.id}: heartbeat not valid for > margin+steal_margin — fencing writes (node " <>
-            "provably stealable); reads still serve. Writes 503 FILO_STALE_LEASE until ownership " <>
-            "is reconfirmed."
-        )
-      end
+          Logger.warning(
+            "shard #{state.id}: heartbeat not valid for > margin+steal_margin — fencing writes (node " <>
+              "provably stealable); reads still serve. Writes 503 FILO_STALE_LEASE until ownership " <>
+              "is reconfirmed."
+          )
+
+          # Barrier 3 of THE POOL DRAIN GRACE (perf review 2026-10-14 #4): no idle pooled handle
+          # stays open on a shard this node may be about to lose. Off-coordinator, like every close.
+          drain_pool(state)
+        else
+          state
+        end
 
       # The FIRST observation of an episode arms the re-check (expert review 2026-10-12 #9).
       if is_nil(state.not_valid_since), do: arm_write_fence_check(state, since)
