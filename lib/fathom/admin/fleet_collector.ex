@@ -39,6 +39,8 @@ defmodule Fathom.Admin.FleetCollector do
   @topic "admin:fleet"
   @page_table :fathom_admin_migrations_page
   @default_page_ttl_ms 10_000
+  @refill_lock_ms 30_000
+  @refill_wait_ms 15_000
 
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -80,18 +82,97 @@ defmodule Fathom.Admin.FleetCollector do
   uncached.
   """
   @spec migrations_page() :: %{mig: map(), oban: list()}
-  def migrations_page do
+  def migrations_page, do: migrations_page(&compute_page/0)
+
+  @doc false
+  # `compute` is a seam so a test can count how many callers actually compute.
+  @spec migrations_page((-> term())) :: term()
+  def migrations_page(compute) when is_function(compute, 0) do
     ttl = Application.get_env(:fathom, :admin_migrations_cache_ms, @default_page_ttl_ms)
     now = System.monotonic_time(:millisecond)
 
     case lookup_page() do
-      {at, page} when now - at < ttl ->
+      {at, page} when now - at < ttl -> page
+      stale -> refill_page(stale, compute)
+    end
+  end
+
+  defp compute_page, do: %{mig: Fleet.migrations(), oban: Fleet.oban_counts()}
+
+  # SINGLE-FLIGHT refill (expert review 2026-10-13 #28). At TTL expiry every open tab's async task
+  # (and every caller) used to recompute at once, so the directory-scale reads behind this page ran
+  # once per caller instead of once per node per TTL. One caller takes the ETS lock and computes;
+  # the others serve the stale page, or, with none yet, wait briefly for the winner's. The lock has
+  # its own expiry so a winner killed mid-compute cannot wedge the page, and a waiter that times out
+  # computes for itself rather than failing.
+  defp refill_page(stale, compute) do
+    now = System.monotonic_time(:millisecond)
+
+    case acquire_refill(now) do
+      :acquired ->
+        try do
+          page = compute.()
+          store_page({System.monotonic_time(:millisecond), page})
+          page
+        after
+          release_refill()
+        end
+
+      :busy ->
+        case stale do
+          {_at, page} -> page
+          nil -> await_page(compute, now + @refill_wait_ms)
+        end
+
+      :no_table ->
+        # Collector not running (dashboard gating off, tests): compute uncached, as before.
+        compute.()
+    end
+  end
+
+  defp acquire_refill(now) do
+    # `insert_new` is the atomic claim. A lock past its expiry belongs to a dead or wedged winner:
+    # take it over (delete-then-insert_new, so two takers still resolve to exactly one winner).
+    case :ets.insert_new(@page_table, {:refill, now + @refill_lock_ms}) do
+      true ->
+        :acquired
+
+      false ->
+        case :ets.lookup(@page_table, :refill) do
+          [{:refill, expires}] when expires <= now ->
+            :ets.delete_object(@page_table, {:refill, expires})
+
+            if :ets.insert_new(@page_table, {:refill, now + @refill_lock_ms}),
+              do: :acquired,
+              else: :busy
+
+          _ ->
+            :busy
+        end
+    end
+  rescue
+    ArgumentError -> :no_table
+  end
+
+  defp release_refill do
+    :ets.delete(@page_table, :refill)
+  rescue
+    ArgumentError -> :ok
+  end
+
+  # A cold start with no stale page: wait for the winner's, bounded, then compute for ourselves.
+  defp await_page(compute, deadline) do
+    case lookup_page() do
+      {_at, page} ->
         page
 
-      _ ->
-        page = %{mig: Fleet.migrations(), oban: Fleet.oban_counts()}
-        store_page({now, page})
-        page
+      nil ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          compute.()
+        else
+          Process.sleep(25)
+          await_page(compute, deadline)
+        end
     end
   end
 

@@ -28,9 +28,19 @@ defmodule Fathom.HranaAuth.Revocations do
   Per-shard TTL expiry made the read rate scale with **shard count** rather than with revocation
   events — `distinct_shards_per_node / ttl`, i.e. thousands of Postgres point-reads per second at
   fleet scale, each taking a repo connection from a stream process. Instead, one bounded query per
-  node per interval (`Fathom.Directory.revoked_floors/0`, served by a partial index; `token_version`
-  defaults to 1, so the set is normally a tiny fraction of the fleet) applies every revoked floor
-  through `put_max/3` and then writes a freshness marker **last**.
+  node per interval applies the revoked floors through `put_max/3` and then writes a freshness
+  marker **last**.
+
+  The interval's read is INCREMENTAL (expert review 2026-10-13 #10): only rows whose
+  `token_version_changed_at` (Postgres clock) is at or after the last successful refresh's cursor
+  minus an overlap, via `Directory.revoked_floors_since/1`. The previous shape re-read every shard
+  ever rotated or revoked on every node every interval, which after a fleet-wide
+  `revoke_issued_before` is the whole fleet. A FULL keyset-paged reload
+  (`Directory.revoked_floors_page/2`) runs at boot and then daily, to cover rows that predate the
+  cursor column and anything an incremental read missed. It runs in a monitored process so this
+  GenServer keeps serving notifications; its pages are applied HERE, so `put_max/3` keeps a single
+  writer. **The marker is written only once a full reload has completed**, and the cursor advances
+  only on a successful read, so the marker still never vouches for data that was not applied.
 
   A lapsed entry is served while that marker is fresh. **The marker extends freshness for entries
   that already exist — never for an absent one.** That asymmetry is load-bearing: absence from the
@@ -53,6 +63,9 @@ defmodule Fathom.HranaAuth.Revocations do
   @table __MODULE__
   @default_ttl_ms 30_000
   @bulk_marker :__bulk_ok__
+  @full_page 5_000
+  @overlap_ms 60_000
+  @default_full_reload_ms 86_400_000
 
   @doc false
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -146,43 +159,54 @@ defmodule Fathom.HranaAuth.Revocations do
     listen_for_revocations()
 
     send(self(), :bulk_refresh)
-    {:ok, %{}}
+
+    # `since`: the incremental cursor (Postgres clock minus overlap), nil until a full reload has
+    # completed. `synced`: a full reload has completed, so incremental reads (and the marker) are
+    # valid. `full`: the in-flight full reload, if any. `last_full`: when the last one finished.
+    {:ok, %{since: nil, synced: false, full: nil, last_full: nil}}
   end
 
   @impl true
-  # One bounded query per node per interval replaces the per-shard TTL read-through, whose rate
-  # scaled with SHARD COUNT rather than with revocation events (expert review 2026-07-24 #5). Rows
-  # go through `put_max/3`, which is already monotonic and grace-preserving, and the freshness
-  # marker is written LAST so it can never vouch for data that has not been applied.
+  # Incremental by default, full at boot and daily (expert review 2026-10-13 #10). Rows go through
+  # `put_max/3`, which is already monotonic and grace-preserving, and the freshness marker is written
+  # LAST so it can never vouch for data that has not been applied.
   #
-  # On failure the marker is simply not advanced: entries expire on their own TTLs and the module
-  # degrades to exactly its previous per-shard behaviour, including the stale-serve fallback.
-  # Fail-safe by construction — no path here can lower a floor or answer a miss.
+  # On failure the marker is simply not advanced and the cursor is not moved: entries expire on their
+  # own TTLs and the module degrades to exactly its previous per-shard behaviour, including the
+  # stale-serve fallback. Fail-safe by construction — no path here can lower a floor or answer a
+  # miss.
   def handle_info(:bulk_refresh, state) do
-    try do
-      rows = Directory.revoked_floors()
-
-      Enum.each(rows, fn {shard_id, version, bumped_at} ->
-        put_max(shard_id, version, bumped_at)
-      end)
-
-      :ets.insert(@table, {@bulk_marker, System.monotonic_time(:millisecond)})
-
-      :telemetry.execute([:fathom, :hrana, :revocation, :bulk], %{revoked: length(rows)}, %{
-        outcome: :ok
-      })
-    rescue
-      e ->
-        Logger.warning("revocation bulk refresh failed: #{Exception.message(e)}")
-        bulk_degraded()
-    catch
-      :exit, reason ->
-        Logger.warning("revocation bulk refresh failed: #{inspect(reason)}")
-        bulk_degraded()
-    end
-
     Process.send_after(self(), :bulk_refresh, ttl_ms())
-    {:noreply, state}
+    {:noreply, refresh(state)}
+  end
+
+  # A page of the full reload, applied here so `put_max/3` keeps a single writer.
+  def handle_info({:full_page, ref, rows}, %{full: %{ref: ref} = full} = state) do
+    apply_rows(rows)
+    {:noreply, %{state | full: %{full | count: full.count + length(rows)}}}
+  end
+
+  def handle_info({:full_done, ref, :ok}, %{full: %{ref: ref} = full} = state) do
+    Process.demonitor(full.mon, [:flush])
+    mark_fresh()
+    bulk_ok(full.count)
+    # `full.cursor` was taken BEFORE the full read began, so an incremental that ran meanwhile (it
+    # only runs once synced) already holds an equal-or-later one: never move it backward.
+    since = state.since || full.cursor
+    {:noreply, %{state | full: nil, synced: true, since: since, last_full: now_ms()}}
+  end
+
+  def handle_info({:full_done, ref, {:error, message}}, %{full: %{ref: ref} = full} = state) do
+    Process.demonitor(full.mon, [:flush])
+    Logger.warning("revocation full reload failed: #{message}")
+    bulk_degraded()
+    {:noreply, %{state | full: nil}}
+  end
+
+  def handle_info({:DOWN, mon, :process, _pid, reason}, %{full: %{mon: mon}} = state) do
+    Logger.warning("revocation full reload died: #{inspect(reason)}")
+    bulk_degraded()
+    {:noreply, %{state | full: nil}}
   end
 
   def handle_info(
@@ -336,6 +360,103 @@ defmodule Fathom.HranaAuth.Revocations do
     end
   rescue
     ArgumentError -> :ok
+  end
+
+  # One refresh tick, public so a test can drive it with a hand-built state.
+  @doc false
+  @spec refresh(map()) :: map()
+  def refresh(%{full: nil} = state) do
+    if not state.synced or full_due?(state), do: start_full(state), else: incremental(state)
+  end
+
+  # A full reload is in flight. Incrementals continue once synced (a long full must not stall
+  # freshness); before the first full completes there is nothing valid to be incremental against.
+  def refresh(%{synced: true} = state), do: incremental(state)
+  def refresh(state), do: state
+
+  defp full_due?(%{last_full: nil}), do: true
+  defp full_due?(%{last_full: at}), do: now_ms() - at >= full_reload_ms()
+
+  defp incremental(%{since: since} = state) do
+    # The cursor is taken BEFORE the read, on the Postgres clock the rows are stamped from, minus an
+    # overlap so a transaction that began earlier but committed later cannot slip below it.
+    next_since = cursor_now()
+    rows = Directory.revoked_floors_since(since)
+    apply_rows(rows)
+    mark_fresh()
+    bulk_ok(length(rows))
+    %{state | since: next_since}
+  rescue
+    e ->
+      Logger.warning("revocation bulk refresh failed: #{Exception.message(e)}")
+      bulk_degraded()
+      state
+  catch
+    :exit, reason ->
+      Logger.warning("revocation bulk refresh failed: #{inspect(reason)}")
+      bulk_degraded()
+      state
+  end
+
+  defp start_full(state) do
+    parent = self()
+    ref = make_ref()
+
+    # The cursor is taken before the first page is read, for the same reason as in `incremental/1`.
+    cursor = safe_cursor_now()
+
+    {pid, mon} =
+      spawn_monitor(fn ->
+        # Ecto's sandbox (tests) resolves the owner through `$callers`.
+        Process.put(:"$callers", [parent])
+        send(parent, {:full_done, ref, full_reload(parent, ref, "")})
+      end)
+
+    %{state | full: %{ref: ref, mon: mon, pid: pid, cursor: cursor, count: 0}}
+  end
+
+  # Pages are sent to the GenServer, not applied here.
+  defp full_reload(parent, ref, after_id) do
+    case Directory.revoked_floors_page(after_id, @full_page) do
+      [] ->
+        :ok
+
+      rows ->
+        send(parent, {:full_page, ref, rows})
+        {last_id, _, _} = List.last(rows)
+        if length(rows) < @full_page, do: :ok, else: full_reload(parent, ref, last_id)
+    end
+  rescue
+    e -> {:error, Exception.message(e)}
+  catch
+    :exit, reason -> {:error, inspect(reason)}
+  end
+
+  defp apply_rows(rows) do
+    Enum.each(rows, fn {shard_id, version, bumped_at} -> put_max(shard_id, version, bumped_at) end)
+  end
+
+  defp mark_fresh, do: :ets.insert(@table, {@bulk_marker, now_ms()})
+
+  defp bulk_ok(n) do
+    :telemetry.execute([:fathom, :hrana, :revocation, :bulk], %{revoked: n}, %{outcome: :ok})
+  end
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
+
+  defp full_reload_ms,
+    do: Application.get_env(:fathom, :hrana_revocation_full_reload_ms, @default_full_reload_ms)
+
+  defp cursor_now, do: DateTime.add(Directory.db_now(), -@overlap_ms, :millisecond)
+
+  # The full reload's cursor must not fail the reload: fall back to the node clock (the overlap and
+  # the next successful incremental re-seed it).
+  defp safe_cursor_now do
+    cursor_now()
+  rescue
+    _ -> DateTime.add(DateTime.utc_now(), -@overlap_ms, :millisecond)
+  catch
+    :exit, _ -> DateTime.add(DateTime.utc_now(), -@overlap_ms, :millisecond)
   end
 
   defp decode_bumped_at(nil), do: nil

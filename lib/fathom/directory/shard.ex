@@ -69,6 +69,7 @@ defmodule Fathom.Directory.Shard do
     # (the default, and what a hard `revoke` resets it to) means "no grace": the previous version
     # is refused immediately.
     field :token_version_bumped_at, :utc_datetime_usec
+    field :token_version_changed_at, :utc_datetime_usec
 
     # When the shard's durable object was last integrity-checked by the RestoreDrillJob (#24), and
     # the outcome ("ok" / "corrupt" / "absent" / "sentinel" / "schema_mismatch" / "error"). NULL =

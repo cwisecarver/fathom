@@ -1019,4 +1019,188 @@ defmodule Fathom.DirectoryTest do
       end
     end
   end
+
+  # Expert review 2026-10-13 #27: sample_for_retention/1 orders by `last_retention_at ASC NULLS FIRST,
+  # last_snapshot_at`, and its only index was a single-column NULLS LAST one, so every run sorted all
+  # active snapshotted rows. Pin the plan on a realistic table: the new composite index serves the
+  # whole ORDER BY (no Sort node).
+  describe "retention rotation index (expert review 2026-10-13 #27)" do
+    test "sample_for_retention/1's query is an ordered index scan with no Sort" do
+      Fathom.Repo.query!("""
+      INSERT INTO shards (shard_id, schema_version, status, last_active_at, inserted_at, updated_at,
+                          last_snapshot_at, last_retention_at)
+      SELECT 'ret_' || g, 1, CASE WHEN g % 10 = 0 THEN 'suspended' ELSE 'active' END,
+             now(), now(), now(),
+             CASE WHEN g % 7 = 0 THEN NULL ELSE now() - (g || ' minutes')::interval END,
+             CASE WHEN g % 3 = 0 THEN NULL ELSE now() - (g || ' seconds')::interval END
+      FROM generate_series(1, 3000) g
+      """)
+
+      Fathom.Repo.query!("ANALYZE shards")
+      Fathom.Repo.query!("SET LOCAL enable_seqscan = off")
+
+      {sql, params} =
+        Fathom.Repo.to_sql(
+          :all,
+          Ecto.Query.from(s in Shard,
+            where: s.status == "active",
+            where: not is_nil(s.last_snapshot_at),
+            order_by: [asc_nulls_first: s.last_retention_at, asc: s.last_snapshot_at],
+            limit: ^10,
+            select: %{shard_id: s.shard_id}
+          )
+        )
+
+      %{rows: rows} = Fathom.Repo.query!("EXPLAIN " <> sql, params)
+      plan = rows |> List.flatten() |> Enum.join("\n")
+
+      assert plan =~ "shards_retention_rotation_active_index", plan
+      refute plan =~ "Sort", "the index must return rows in ORDER BY order. Plan:\n#{plan}"
+
+      # And the function still returns the NULLS-FIRST head, so the new index changed the plan only.
+      assert [%{shard_id: _} | _] = Directory.sample_for_retention(10)
+    end
+
+    test "the replaced single-column index is gone and the new one exists" do
+      names =
+        Fathom.Repo.query!("SELECT indexname FROM pg_indexes WHERE tablename = 'shards'").rows
+        |> List.flatten()
+
+      refute "shards_last_retention_at_active_index" in names
+      assert "shards_retention_rotation_active_index" in names
+    end
+  end
+
+  # Expert review 2026-10-13 #28: laggards/2 sorted every laggard (schema_version < head cannot be
+  # answered in last_active_at order from the (schema_version, last_active_at) index). It now probes
+  # one version at a time, each an ordered backward index walk, and merges.
+  describe "laggards/2 per version (expert review 2026-10-13 #28)" do
+    defp seed_versions do
+      Fathom.Repo.query!("""
+      INSERT INTO shards (shard_id, schema_version, status, last_active_at, inserted_at, updated_at)
+      SELECT 'lag_' || g, CASE WHEN g % 100 < 3 THEN g % 100 + 2 ELSE 6 END, 'active',
+             now() - (g || ' seconds')::interval, now(), now()
+      FROM generate_series(1, 3000) g
+      """)
+
+      Fathom.Repo.query!("ANALYZE shards")
+    end
+
+    test "each per-version probe is an ordered index scan with no Sort" do
+      seed_versions()
+      Fathom.Repo.query!("SET LOCAL enable_seqscan = off")
+
+      {sql, params} = Fathom.Repo.to_sql(:all, Directory.laggards_at_version_query(6, 3, 50))
+
+      %{rows: rows} = Fathom.Repo.query!("EXPLAIN " <> sql, params)
+      plan = rows |> List.flatten() |> Enum.join("\n")
+
+      assert plan =~ "shards_active_schema_version_last_active_at_index", plan
+      refute plan =~ "Sort", "a per-version probe must come back in index order. Plan:\n#{plan}"
+    end
+
+    test "merges across versions, most recently active first, and respects the limit" do
+      seed_versions()
+
+      got = Directory.laggards(6, 25)
+      assert length(got) == 25
+
+      stamps = Enum.map(got, & &1.last_active_at)
+
+      assert stamps == Enum.sort(stamps, {:desc, DateTime}),
+             "versions 2, 3 and 4 interleave by recency, not by version"
+
+      # lag_1 (version 3) is the most recently active laggard overall (1 second ago).
+      assert hd(got).shard_id == "lag_1"
+      assert got |> Enum.map(& &1.schema_version) |> Enum.uniq() |> length() == 3
+
+      # Nothing at or above head is returned.
+      assert Enum.all?(Directory.laggards(4, 50), &(&1.schema_version < 4))
+      assert length(Directory.laggards(6, 1000)) == 90
+    end
+
+    test "no laggards below head returns []" do
+      {:ok, _} = Directory.resolve("fine")
+      {:ok, _} = Directory.cutover("fine", 3)
+      assert Directory.laggards(3, 10) == []
+    end
+  end
+
+  # Expert review 2026-10-13 #10: the Revocations refresh read EVERY ever-raised shard per node per
+  # tick. The incremental cursor is `token_version_changed_at`, stamped by every raising path. NOT
+  # `token_version_bumped_at`: a hard revoke stamps that nil, so filtering on it never sees a revoke.
+  describe "incremental revocation reads (expert review 2026-10-13 #10)" do
+    test "a HARD revoke (bumped_at nil) and a rotate are both visible to revoked_floors_since/1" do
+      {:ok, _} = Directory.resolve("inc_revoke")
+      {:ok, _} = Directory.resolve("inc_rotate")
+      before = Directory.db_now()
+
+      {:ok, 2} = Directory.bump_token_version("inc_revoke")
+      {:ok, 2} = Directory.rotate_token("inc_rotate")
+
+      rows = Directory.revoked_floors_since(before) |> Map.new(fn {id, v, b} -> {id, {v, b}} end)
+
+      assert {2, nil} = rows["inc_revoke"],
+             "a hard revoke has token_version_bumped_at = nil; the cursor column must still see it"
+
+      assert {2, %DateTime{}} = rows["inc_rotate"]
+    end
+
+    test "the DR reconcile's raise_token_version/2 is visible too" do
+      {:ok, _} = Directory.resolve("inc_dr")
+      before = Directory.db_now()
+      assert Directory.raise_token_version("inc_dr", 5) == 1
+
+      assert {"inc_dr", 5, nil} in Directory.revoked_floors_since(before)
+    end
+
+    test "reads only rows changed since the cursor, not the 20k ever-raised ones" do
+      # 20k shards raised long ago (changed_at old or NULL, as every row predating the column is).
+      Fathom.Repo.query!("""
+      INSERT INTO shards (shard_id, schema_version, status, last_active_at, inserted_at, updated_at,
+                          token_version, token_version_changed_at)
+      SELECT 'old_' || g, 1, 'active', now(), now(), now(), 2,
+             CASE WHEN g % 2 = 0 THEN now() - interval '10 days' END
+      FROM generate_series(1, 20000) g
+      """)
+
+      {:ok, _} = Directory.resolve("fresh_one")
+      cursor = Directory.db_now()
+      {:ok, 2} = Directory.bump_token_version("fresh_one")
+
+      assert [{"fresh_one", 2, nil}] = Directory.revoked_floors_since(cursor)
+    end
+
+    test "revoked_floors_since/1 is served by the partial changed_at index" do
+      Fathom.Repo.query!("""
+      INSERT INTO shards (shard_id, schema_version, status, last_active_at, inserted_at, updated_at,
+                          token_version, token_version_changed_at)
+      SELECT 'ix_' || g, 1, 'active', now(), now(), now(),
+             CASE WHEN g % 50 = 0 THEN 2 ELSE 1 END, now() - (g || ' minutes')::interval
+      FROM generate_series(1, 5000) g
+      """)
+
+      Fathom.Repo.query!("ANALYZE shards")
+      Fathom.Repo.query!("SET LOCAL enable_seqscan = off")
+
+      %{rows: rows} =
+        Fathom.Repo.query!(
+          "EXPLAIN SELECT s0.shard_id FROM shards s0 WHERE s0.token_version > 1 " <>
+            "AND s0.token_version_changed_at >= $1",
+          [DateTime.add(DateTime.utc_now(), -600, :second)]
+        )
+
+      plan = rows |> List.flatten() |> Enum.join("\n")
+      assert plan =~ "shards_token_version_changed_at_index", plan
+    end
+
+    test "revoked_floors_page/2 pages by shard_id and returns only raised shards" do
+      for id <- ~w(pg_a pg_b pg_c pg_d), do: {:ok, _} = Directory.resolve(id)
+      for id <- ~w(pg_a pg_b pg_d), do: {:ok, _} = Directory.bump_token_version(id)
+
+      assert [{"pg_a", 2, nil}, {"pg_b", 2, nil}] = Directory.revoked_floors_page("pg_", 2)
+      assert [{"pg_d", 2, nil}] = Directory.revoked_floors_page("pg_b", 10)
+      assert [] = Directory.revoked_floors_page("pg_d", 10)
+    end
+  end
 end

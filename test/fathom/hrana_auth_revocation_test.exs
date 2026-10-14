@@ -437,19 +437,141 @@ defmodule Fathom.HranaAuthRevocationTest do
              "versions only rise — a lower bulk/notify value must not un-revoke"
     end
 
-    test "revoked_floors returns only shards whose floor was raised" do
+    test "the full reload returns only shards whose floor was raised" do
       raised = uniq()
       untouched = uniq()
       {:ok, _} = Directory.resolve(raised)
       {:ok, _} = Directory.resolve(untouched)
       {:ok, _} = Directory.bump_token_version(raised)
 
-      ids = Directory.revoked_floors() |> Enum.map(fn {id, _v, _b} -> id end)
+      ids = Directory.revoked_floors_page("", 100_000) |> Enum.map(fn {id, _v, _b} -> id end)
 
       assert raised in ids
 
       refute untouched in ids,
              "token_version defaults to 1, so an untouched shard stays out of the set"
+    end
+  end
+
+  # Expert review 2026-10-13 #10: the bulk refresh is incremental after a full reload. These drive
+  # `Revocations.refresh/1` and `handle_info/2` directly from the test process (so the SQL sandbox
+  # applies) with a hand-built state; the app singleton's own state is untouched.
+  describe "incremental bulk refresh (expert review 2026-10-13 #10)" do
+    defp fresh_state, do: %{since: nil, synced: false, full: nil, last_full: nil}
+
+    # Drives a started full reload to completion by feeding its messages through handle_info.
+    defp finish_full(state) do
+      %{ref: ref} = state.full
+      assert_receive {:full_done, ^ref, result}, 5_000
+      state = drain_pages(state, ref)
+      {:noreply, state} = Revocations.handle_info({:full_done, ref, result}, state)
+      state
+    end
+
+    defp drain_pages(state, ref) do
+      receive do
+        {:full_page, ^ref, _} = msg ->
+          {:noreply, state} = Revocations.handle_info(msg, state)
+          drain_pages(state, ref)
+      after
+        0 -> state
+      end
+    end
+
+    test "the first tick is a full reload; the marker is written only when it completes" do
+      shard = uniq()
+      {:ok, _} = Directory.resolve(shard)
+      {:ok, 2} = Directory.bump_token_version(shard)
+      :ets.delete(Revocations, shard)
+      :ets.delete(Revocations, :__bulk_ok__)
+
+      state = Revocations.refresh(fresh_state())
+
+      assert %{full: %{}} = state,
+             "an unsynced node starts with a FULL reload, not an incremental"
+
+      assert state.synced == false
+
+      assert :ets.lookup(Revocations, :__bulk_ok__) == [],
+             "the freshness marker must not be written before a full reload has been applied"
+
+      state = finish_full(state)
+      assert state.synced and state.full == nil
+      assert %DateTime{} = state.since
+      assert [{:__bulk_ok__, _}] = :ets.lookup(Revocations, :__bulk_ok__)
+      assert [{^shard, 2, nil, _}] = :ets.lookup(Revocations, shard)
+    end
+
+    test "a synced tick is incremental: it picks up a new revoke and moves the cursor" do
+      state = finish_full(Revocations.refresh(fresh_state()))
+      first_since = state.since
+
+      shard = uniq()
+      {:ok, _} = Directory.resolve(shard)
+      {:ok, 2} = Directory.bump_token_version(shard)
+      :ets.delete(Revocations, shard)
+
+      state = Revocations.refresh(state)
+      assert state.full == nil, "no full reload while one is not due"
+      assert DateTime.compare(state.since, first_since) in [:gt, :eq]
+      assert [{^shard, 2, nil, _}] = :ets.lookup(Revocations, shard)
+    end
+
+    test "an incremental that raises moves neither the cursor nor the marker" do
+      state = %{finish_full(Revocations.refresh(fresh_state())) | since: :not_a_datetime}
+      :ets.insert(Revocations, {:__bulk_ok__, 1})
+
+      log = ExUnit.CaptureLog.capture_log(fn -> assert ^state = Revocations.refresh(state) end)
+      assert log =~ "revocation bulk refresh failed"
+
+      assert [{:__bulk_ok__, 1}] = :ets.lookup(Revocations, :__bulk_ok__),
+             "a failed refresh must leave the marker stale so entries fall back to their own TTLs"
+    end
+
+    test "a full reload is due again after the configured interval" do
+      prev = Application.get_env(:fathom, :hrana_revocation_full_reload_ms)
+      Application.put_env(:fathom, :hrana_revocation_full_reload_ms, 0)
+
+      on_exit(fn ->
+        if is_nil(prev),
+          do: Application.delete_env(:fathom, :hrana_revocation_full_reload_ms),
+          else: Application.put_env(:fathom, :hrana_revocation_full_reload_ms, prev)
+      end)
+
+      state = finish_full(Revocations.refresh(fresh_state()))
+      assert %{full: %{}} = Revocations.refresh(state)
+    end
+
+    test "a dead full-reload process degrades without wedging the refresh" do
+      {pid, mon} = spawn_monitor(fn -> :ok end)
+      assert_receive {:DOWN, ^mon, :process, ^pid, _}, 1_000
+
+      state = %{
+        fresh_state()
+        | full: %{ref: make_ref(), mon: mon, pid: pid, cursor: nil, count: 0}
+      }
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:noreply, state} =
+                   Revocations.handle_info({:DOWN, mon, :process, pid, :killed}, state)
+
+          assert state.full == nil and state.synced == false
+          # And the next tick starts a fresh full reload rather than sitting wedged.
+          assert %{full: %{}} = Revocations.refresh(state)
+        end)
+
+      assert log =~ "revocation full reload died"
+    end
+
+    test "a full reload never lowers a floor a notification already raised" do
+      shard = uniq()
+      {:ok, _} = Directory.resolve(shard)
+      {:ok, 2} = Directory.bump_token_version(shard)
+      Revocations.put(shard, 9)
+
+      finish_full(Revocations.refresh(fresh_state()))
+      assert [{^shard, 9, _, _}] = :ets.lookup(Revocations, shard)
     end
   end
 end

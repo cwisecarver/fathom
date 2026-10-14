@@ -142,6 +142,95 @@ defmodule Fathom.Admin.FleetCollectorTest do
     end
   end
 
+  # Expert review 2026-10-13 #28: at TTL expiry every caller recomputed at once (the directory-scale
+  # reads behind Fleet.migrations/0 ran once PER CALLER). One caller computes; the rest serve the
+  # stale page or wait for the winner's.
+  describe "migrations_page single-flight (expert review 2026-10-13 #28)" do
+    setup do
+      prev = Application.get_env(:fathom, :admin_migrations_cache_ms)
+      Application.put_env(:fathom, :admin_migrations_cache_ms, 1)
+
+      on_exit(fn ->
+        if is_nil(prev),
+          do: Application.delete_env(:fathom, :admin_migrations_cache_ms),
+          else: Application.put_env(:fathom, :admin_migrations_cache_ms, prev)
+      end)
+
+      start_supervised!(FleetCollector)
+      :ok
+    end
+
+    # A compute that parks until released, counting how many callers actually entered it.
+    defp gated_compute(counter, test_pid) do
+      fn ->
+        :counters.add(counter, 1, 1)
+        send(test_pid, {:computing, self()})
+
+        receive do
+          :release -> :fresh_page
+        end
+      end
+    end
+
+    test "N concurrent callers at expiry with a stale page compute once and the rest serve stale" do
+      stale_at = System.monotonic_time(:millisecond) - 60_000
+      :ets.insert(:fathom_admin_migrations_page, {:page, {stale_at, :stale_page}})
+
+      counter = :counters.new(1, [])
+      compute = gated_compute(counter, self())
+
+      me = self()
+
+      for _ <- 1..8 do
+        spawn_link(fn -> send(me, {:result, FleetCollector.migrations_page(compute)}) end)
+      end
+
+      assert_receive {:computing, winner}, 2_000
+
+      # The 7 losers return the stale page while the winner is still computing.
+      for _ <- 1..7, do: assert_receive({:result, :stale_page}, 2_000)
+      refute_receive {:result, _}, 50
+
+      send(winner, :release)
+      assert_receive {:result, :fresh_page}, 2_000
+
+      assert :counters.get(counter, 1) == 1,
+             "only one caller may run the directory-scale compute at expiry"
+
+      refute_receive {:computing, _}, 100
+    end
+
+    test "with no page yet, waiters get the winner's page instead of computing themselves" do
+      :ets.delete(:fathom_admin_migrations_page, :page)
+      counter = :counters.new(1, [])
+      compute = gated_compute(counter, self())
+
+      callers = for _ <- 1..5, do: Task.async(fn -> FleetCollector.migrations_page(compute) end)
+      assert_receive {:computing, winner}, 2_000
+      send(winner, :release)
+
+      assert Enum.map(callers, &Task.await(&1, 5_000)) == List.duplicate(:fresh_page, 5)
+      assert :counters.get(counter, 1) == 1
+    end
+
+    test "a winner that dies mid-compute does not wedge the page past the lock's expiry" do
+      # A lock whose owner is gone (expired) is taken over rather than waited on forever.
+      :ets.insert(
+        :fathom_admin_migrations_page,
+        {:refill, System.monotonic_time(:millisecond) - 1}
+      )
+
+      assert FleetCollector.migrations_page(fn -> :recomputed end) == :recomputed
+      assert :ets.lookup(:fathom_admin_migrations_page, :refill) == []
+    end
+
+    test "a compute that raises releases the lock" do
+      assert_raise RuntimeError, fn -> FleetCollector.migrations_page(fn -> raise "boom" end) end
+      assert :ets.lookup(:fathom_admin_migrations_page, :refill) == []
+      assert FleetCollector.migrations_page(fn -> :ok_now end) == :ok_now
+    end
+  end
+
   test "migrations_page/0 computes uncached when the collector isn't running" do
     refute Process.whereis(FleetCollector)
     assert %{mig: %{head: _}, oban: _} = FleetCollector.migrations_page()

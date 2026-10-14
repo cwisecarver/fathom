@@ -780,8 +780,17 @@ defmodule Fathom.Directory do
 
     {count, _} =
       Repo.update_all(
-        from(s in Shard, where: s.shard_id == ^shard_id and s.token_version < ^floor),
-        set: [token_version: floor, updated_at: now]
+        from(s in Shard,
+          where: s.shard_id == ^shard_id and s.token_version < ^floor,
+          update: [
+            set: [
+              token_version: ^floor,
+              token_version_changed_at: fragment("clock_timestamp()"),
+              updated_at: ^now
+            ]
+          ]
+        ),
+        []
       )
 
     count
@@ -995,12 +1004,56 @@ defmodule Fathom.Directory do
   """
   @spec laggards(non_neg_integer(), pos_integer()) :: [Shard.t()]
   def laggards(head_version, limit) do
+    # PER VERSION (expert review 2026-10-13 #28). One `schema_version < head ORDER BY last_active_at`
+    # query cannot be answered from the `(schema_version, last_active_at)` index in order, so
+    # Postgres sorted every laggard on each sweep. An equality on `schema_version` can: each probe
+    # is a bounded backward index walk, and the merge below is over at most `limit` rows per stale
+    # version (normally two or three versions are live during a rollout).
+    head_version
+    |> stale_versions()
+    |> Enum.flat_map(fn v ->
+      head_version |> laggards_at_version_query(v, limit) |> Repo.all()
+    end)
+    |> Enum.sort_by(& &1.last_active_at, {:desc, DateTime})
+    |> Enum.take(limit)
+  end
+
+  @doc false
+  # The per-version probe `laggards/2` runs; public (undocumented) so a test can EXPLAIN the REAL query.
+  @spec laggards_at_version_query(non_neg_integer(), non_neg_integer(), pos_integer()) ::
+          Ecto.Query.t()
+  def laggards_at_version_query(head_version, version, limit) do
     head_version
     |> laggard_query()
+    |> where([s], s.schema_version == ^version)
     |> without_live_migration_job()
     |> order_by([s], desc: s.last_active_at)
     |> limit(^limit)
-    |> Repo.all()
+  end
+
+  # The distinct active `schema_version`s below `head_version`, via a recursive "loose index scan":
+  # one index probe per DISTINCT version rather than a pass over every laggard row. Postgres has no
+  # skip scan before 18, and a plain SELECT DISTINCT would read each laggard.
+  defp stale_versions(head_version) do
+    %{rows: rows} =
+      Repo.query!(
+        """
+        WITH RECURSIVE t(v) AS (
+          (SELECT schema_version FROM shards
+            WHERE status = 'active' AND schema_version < $1
+            ORDER BY schema_version LIMIT 1)
+          UNION ALL
+          SELECT (SELECT schema_version FROM shards
+                   WHERE status = 'active' AND schema_version > t.v AND schema_version < $1
+                   ORDER BY schema_version LIMIT 1)
+          FROM t WHERE t.v IS NOT NULL
+        )
+        SELECT v FROM t WHERE v IS NOT NULL ORDER BY v DESC
+        """,
+        [head_version]
+      )
+
+    List.flatten(rows)
   end
 
   # Exclude shards that ALREADY have a live ShardMigrationJob from the ROLLOUT SELECTION, not after
@@ -1531,24 +1584,48 @@ defmodule Fathom.Directory do
   end
 
   @doc """
-  Every shard whose Hrana token floor has ever been raised, as `{shard_id, version, bumped_at}`.
+  Every shard whose Hrana token floor has ever been raised, as one keyset page of
+  `{shard_id, version, bumped_at}` after `cursor` (`""` for the first page), ordered by `shard_id`
+  and capped at `limit`.
 
   `token_version` defaults to 1 and only `revoke/1`, `rotate/1`, and the reconcile sweep's
-  `raise_token_version/2` raise it, so this set is normally a tiny fraction of the fleet — one
-  bounded query replaces the per-shard TTL read-through that scaled with SHARD COUNT rather than
-  with revocation events (expert review 2026-07-24 #5). Served by
-  `shards_revoked_token_version_index`.
+  `raise_token_version/2` raise it. The set is normally a tiny fraction of the fleet, but a
+  fleet-wide `revoke_issued_before` makes it the fleet, so the FULL reload (boot, then daily) pages
+  through it rather than materializing it (expert review 2026-10-13 #10); the steady-state refresh
+  is `revoked_floors_since/1`. Served by `shards_revoked_token_version_index`.
 
   Absence from this set is NOT proof a shard is unrevoked — a Postgres PITR can lower
   `token_version`, and only the durable per-shard storage floor catches that. See
   `Fathom.HranaAuth.Revocations`: a shard with no cached entry always takes the full read-through,
   including the storage-floor union.
   """
-  @spec revoked_floors() :: [{String.t(), non_neg_integer(), DateTime.t() | nil}]
-  def revoked_floors do
+  @spec revoked_floors_page(String.t(), pos_integer()) ::
+          [{String.t(), non_neg_integer(), DateTime.t() | nil}]
+  def revoked_floors_page(cursor, limit) when is_binary(cursor) and is_integer(limit) do
     Repo.all(
       from s in Shard,
-        where: s.token_version > 1,
+        where: s.token_version > 1 and s.shard_id > ^cursor,
+        order_by: [asc: s.shard_id],
+        limit: ^limit,
+        select: {s.shard_id, s.token_version, s.token_version_bumped_at}
+    )
+  end
+
+  @doc """
+  The ever-raised shards whose `token_version` changed at or after `since` (expert review
+  2026-10-13 #10): the Revocations steady-state refresh, O(changes) not O(every shard ever rotated).
+
+  Filters on `token_version_changed_at`, stamped on the Postgres clock (`db_now/0`) by every path
+  that raises the version. It is NOT `token_version_bumped_at`: a hard revoke sets that to `nil`, so
+  a filter on it would never see a revoke. Rows raised before that column existed are NULL and
+  appear only in the full reload. Served by `shards_token_version_changed_at_index`.
+  """
+  @spec revoked_floors_since(DateTime.t()) ::
+          [{String.t(), non_neg_integer(), DateTime.t() | nil}]
+  def revoked_floors_since(%DateTime{} = since) do
+    Repo.all(
+      from s in Shard,
+        where: s.token_version > 1 and s.token_version_changed_at >= ^since,
         select: {s.shard_id, s.token_version, s.token_version_bumped_at}
     )
   end
@@ -1595,9 +1672,20 @@ defmodule Fathom.Directory do
       {:ok, _} ->
         {1, [version]} =
           Repo.update_all(
-            from(s in Shard, where: s.shard_id == ^shard_id, select: s.token_version),
-            inc: [token_version: 1],
-            set: [token_version_bumped_at: bumped_at]
+            from(s in Shard,
+              where: s.shard_id == ^shard_id,
+              select: s.token_version,
+              update: [
+                inc: [token_version: 1],
+                set: [
+                  token_version_bumped_at: ^bumped_at,
+                  # The Postgres clock, the Revocations incremental cursor's clock (see
+                  # revoked_floors_since/1). Stamped on revoke AND rotate: bumped_at is nil on a revoke.
+                  token_version_changed_at: fragment("clock_timestamp()")
+                ]
+              ]
+            ),
+            []
           )
 
         {:ok, version}
