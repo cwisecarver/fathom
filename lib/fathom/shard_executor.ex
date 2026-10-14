@@ -341,7 +341,9 @@ defmodule Fathom.ShardExecutor do
     # `Connection.cap_temp/1`).
     if ddl?, do: cap_temp(conn)
 
-    case Connection.query(conn, sql, args, dml?: dml?, deadline: true) do
+    read? = read_verb?(sql)
+
+    case Connection.query(conn, sql, args, dml?: dml?, read?: read?, deadline: true) do
       {:ok, result} ->
         # A write bumps the shard's write counter so the periodic durability flush knows local
         # holds un-flushed changes; a read-only shard stays clean and skips the upload (the
@@ -364,7 +366,7 @@ defmodule Fathom.ShardExecutor do
         # open-shard count"). Gate it on whether this connection actually wrote since BEGIN. The
         # race the unconditional bump existed for is untouched: it needs an in-flight write, which
         # sets the flag. A transaction with no write has nothing uncommitted to lose.
-        wrote? = wrote?(result, sql)
+        wrote? = wrote?(result, sql, read?)
 
         if wrote? or (commit_boundary?(sql) and txn_wrote?(conn)) do
           Fathom.Shard.WriteCounter.bump(shard_id)
@@ -501,11 +503,11 @@ defmodule Fathom.ShardExecutor do
   # A durable pragma that RETURNS a column (`PRAGMA optimize` → cols ["optimize"], and
   # `PRAGMA journal_mode = wal` → cols ["journal_mode"]) must be checked before the `cols != []`
   # clause below, or the "result has columns ⇒ read" rule drops it: expert review 2026-10-10 #24.
-  defp wrote?(%{columns: cols, num_changes: changes}, sql) do
+  defp wrote?(%{columns: cols, num_changes: changes}, sql, read?) do
     cond do
       control_statement?(sql) -> false
       durable_pragma_statement?(sql) -> true
-      cols != [] and read_verb?(sql) -> false
+      cols != [] and read? -> false
       changes > 0 -> true
       cols != [] -> false
       true -> true
@@ -526,9 +528,12 @@ defmodule Fathom.ShardExecutor do
   # committed rows. **Never add `with` here.**
   #
   # Why the set is closed: no top-level SELECT can mutate the file (triggers fire only on
-  # INSERT/UPDATE/DELETE, SQLite has no writing table-valued functions, and `Fathom.Shard.
-  # Connection` registers no UDFs and loads no extensions — a future writing UDF would break this
-  # invariant); VALUES is a pure row constructor; EXPLAIN [QUERY PLAN] compiles and reports, it
+  # INSERT/UPDATE/DELETE, SQLite has no writing table-valued functions, and the one extension
+  # `Fathom.Shard.Connection` loads, `fathom_udf` (Django's missing backend functions, hashes, the
+  # WAL commit/page counters, and the connection-local `fathom_backstop` / `fathom_busy_timeout` /
+  # `fathom_pragma_guard`), registers only functions that are pure or touch connection/process state,
+  # never the database file — a future UDF that wrote the file would break this invariant and must
+  # not be reachable from a read verb); VALUES is a pure row constructor; EXPLAIN [QUERY PLAN] compiles and reports, it
   # does not execute the inner statement's effects.
   #
   # Anything unrecognized — a leading comment, an unusual verb — simply misses the whitelist and

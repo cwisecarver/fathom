@@ -437,14 +437,6 @@ defmodule Fathom.Shard.Connection do
 
   defp configure(conn, wal?) do
     with :ok <- if(wal?, do: enable_wal(conn), else: :ok),
-         # synchronous=FULL fsyncs the WAL on every commit, so a committed write survives a node
-         # crash (per-commit local durability, tightening the local RPO below the S3 flush
-         # interval). It is ~free for fathom's sharded model: throughput is wire/executor-bound,
-         # not commit-bound, and the per-shard fsyncs parallelize across the fan-out — measured
-         # FULL vs NORMAL is within noise (node_tps 4167→4140, TPC-C tpmC unchanged), whereas a
-         # single-DB engine pays ~2–3× for the same guarantee. See
-         # docs/reviews/competitive-oltp-2026-07-10.md.
-         :ok <- Sqlite3.execute(conn, "PRAGMA synchronous=FULL"),
          # NOT `PRAGMA busy_timeout` (expert review 2026-07-24 #1): the pragma routes to
          # sqlite3_busy_timeout(), which REPLACES exqlite's custom busy handler with SQLite's
          # default — a bare sqlite3OsSleep loop observing neither the interrupt flag nor exqlite's
@@ -456,21 +448,56 @@ defmodule Fathom.Shard.Connection do
          # exqlite's handler walks the SAME delay ladder as SQLite's default, so the wait timing
          # is unchanged; it just also polls the cancel flag and the caller's liveness.
          :ok <- Sqlite3.set_busy_timeout(conn, 5000),
-         # Raise the autocheckpoint threshold well above SQLite's 1000-frame (~4 MB) default
-         # (expert review 2026-07-24 #4). An autocheckpoint runs INLINE inside the committing
-         # tenant statement that crosses it — a p99/p999 spike billed to an arbitrary client query,
-         # with a main-database fsync under synchronous=FULL. The coordinator now checkpoints
-         # PASSIVE after each durability snapshot (see Fathom.Shard.snapshot/2), where no client is
-         # waiting, so in steady state it wins the race and no tenant query ever checkpoints.
-         #
-         # Raised, NOT disabled: at 0 a wedged coordinator would let the WAL grow unbounded. This
-         # keeps a backstop at ~4× the default.
-         :ok <- Sqlite3.execute(conn, "PRAGMA wal_autocheckpoint=4000"),
-         :ok <- maybe_journal_size_limit(conn),
-         :ok <- maybe_foreign_keys(conn),
-         :ok <- maybe_cache_size(conn),
+         # ONE BATCH for the fixed per-connection pragmas (perf review 2026-10-14 #21): `synchronous`,
+         # `wal_autocheckpoint`, `journal_size_limit`, `foreign_keys` and `cache_size` were five
+         # separate `execute` calls, i.e. five dirty-IO dispatches per fresh open (`execute` is a
+         # dirty NIF; the reuse path was batched in c969f40, the fresh path was not). Measured on this
+         # tree with `Fathom.Test.NifDispatchCounter`: a tenant `:rw` open 23 -> 19 dispatches.
+         # `sqlite3_exec` runs the statements in order and stops at the first error, which is what
+         # the `with` chain did. `journal_mode=WAL` stays a separate prepare+fetch (it returns the
+         # row that gates the open) and `max_page_count` stays separate (it may need a page_size
+         # read). Everything here still runs BEFORE `load_extension/2`, which is what the
+         # wal_autocheckpoint / wal-hook slot ordering needs (AGENTS.md loud warning).
+         :ok <- Sqlite3.execute(conn, rw_open_sql()),
          :ok <- maybe_max_page_count(conn) do
       :ok
+    end
+  end
+
+  # Built from config (integers and booleans fathom owns, never tenant input). The comments that
+  # used to sit on each separate call:
+  #
+  #   * `synchronous=FULL` fsyncs the WAL on every commit, so a committed write survives a node
+  #     crash (per-commit local durability, tightening the local RPO below the S3 flush interval).
+  #     Measured FULL vs NORMAL within noise (node_tps 4167->4140, TPC-C tpmC unchanged) because
+  #     throughput is wire/executor-bound and per-shard fsyncs parallelize across the fan-out. See
+  #     docs/reviews/competitive-oltp-2026-07-10.md.
+  #   * `wal_autocheckpoint=4000` (expert review 2026-07-24 #4) raises the threshold above SQLite's
+  #     1000-frame default so an autocheckpoint (INLINE in the committing tenant statement, with a
+  #     main-database fsync under synchronous=FULL) does not bill a p99 spike to an arbitrary client
+  #     query. The coordinator checkpoints PASSIVE after each durability snapshot, where no client
+  #     waits. Raised, NOT disabled: at 0 a wedged coordinator would grow the WAL without bound.
+  #   * `journal_size_limit`, `foreign_keys`, `cache_size`: see `journal_size_limit_sql/0`,
+  #     `maybe_foreign_keys/1` and `maybe_cache_size/1`.
+  defp rw_open_sql do
+    IO.iodata_to_binary([
+      "PRAGMA synchronous=FULL;PRAGMA wal_autocheckpoint=4000",
+      journal_size_limit_sql(),
+      foreign_keys_sql(),
+      cache_size_sql()
+    ])
+  end
+
+  defp foreign_keys_sql do
+    if Application.get_env(:fathom, :foreign_keys, true),
+      do: [";PRAGMA foreign_keys=ON"],
+      else: []
+  end
+
+  defp cache_size_sql do
+    case cache_size_kb() do
+      nil -> []
+      kb -> [";PRAGMA cache_size=-#{kb}"]
     end
   end
 
@@ -593,13 +620,10 @@ defmodule Fathom.Shard.Connection do
   #
   # Not a tenant pragma (the executor's allow-list does not admit it), so pooled reuse never sees a
   # changed value and it is not in `pinned_pragmas/0`. A negative value means "no limit".
-  defp maybe_journal_size_limit(conn) do
+  defp journal_size_limit_sql do
     case Application.get_env(:fathom, :journal_size_limit, 64 * 1024 * 1024) do
-      bytes when is_integer(bytes) and bytes >= 0 ->
-        Sqlite3.execute(conn, "PRAGMA journal_size_limit=#{bytes}")
-
-      _ ->
-        :ok
+      bytes when is_integer(bytes) and bytes >= 0 -> [";PRAGMA journal_size_limit=#{bytes}"]
+      _ -> []
     end
   end
 
@@ -712,10 +736,16 @@ defmodule Fathom.Shard.Connection do
 
   `deadline: true` bounds the statement by `:query_timeout_ms`. Only CLIENT SQL passes it — see
   the comment in the body for why fathom's own statements do not.
+
+  `read?: true` is the caller's promise that the statement's leading verb is provably incapable of
+  mutating the database (`ShardExecutor`'s `read_verb?/1` whitelist: select / values / explain).
+  When the statement also returns columns, `sqlite3_changes()` is not fetched (a dirty-NIF
+  dispatch) and `num_changes` is reported as 0; the caller must not need the inherited count.
   """
   @spec query(reference(), String.t(), list(), keyword()) :: {:ok, map()} | {:error, term()}
   def query(conn, sql, args, opts \\ []) do
     dml? = Keyword.get(opts, :dml?, true)
+    read? = Keyword.get(opts, :read?, false)
 
     # Statement deadline (expert review 2026-07-14 #26): when `:query_timeout_ms` is set, a runaway
     # query (missing-index full scan) is interrupted so it can't pin memory and keep the shard busy
@@ -732,30 +762,41 @@ defmodule Fathom.Shard.Connection do
     # it opts in.
     case Keyword.get(opts, :deadline, false) && timeout_ms() do
       falsy when falsy in [nil, false] ->
-        do_query(conn, sql, args, dml?)
+        do_query(conn, sql, args, dml?, read?)
 
       ms when is_integer(ms) and ms > 0 ->
-        with_deadline(conn, ms, fn -> do_query(conn, sql, args, dml?) end)
+        with_deadline(conn, ms, fn -> do_query(conn, sql, args, dml?, read?) end)
 
       _ ->
-        do_query(conn, sql, args, dml?)
+        do_query(conn, sql, args, dml?, read?)
     end
   rescue
     e in ArgumentError -> {:error, Exception.message(e)}
   end
 
-  defp do_query(conn, sql, args, dml?) do
+  defp do_query(conn, sql, args, dml?, read?) do
     # A 4-tuple with a plain pattern, not a 3-tuple plus a guard. A `with` whose pattern carries a
     # guard lets the unmatched value fall through as the function's return, which dialyzer caught
     # as `{:ok, _, _} | {:refresh, reference(), [any()]}` escaping `query/4`'s spec.
     with {:ok, stmt, columns, refresh_columns?} <- cached_stmt(conn, sql) do
-      # The statement is owned by this connection's cache — reset it (not release) when done,
-      # including on a bind/collect error or a row-cap abort. sqlite3_reset ends the statement's
-      # execution (releasing its locks / read-transaction hold, which release/finalize used to
-      # do) while keeping the compiled plan for the next execution of the same SQL.
+      # The statement is owned by this connection's cache and must leave here RESET (sqlite3_reset
+      # ends the execution, releasing its locks / read-transaction hold, while keeping the compiled
+      # plan for the next execution of the same SQL).
+      #
+      # Perf review 2026-10-14 #7: that used to be an unconditional `Sqlite3.reset` in an `after`,
+      # one extra dirty-NIF dispatch on EVERY statement. exqlite 0.42's `multi_step` (the only
+      # thing that steps the statement here) already resets on SQLITE_DONE, SQLITE_BUSY and every
+      # step error (sqlite3_nif.c exqlite_multi_step), so on those paths the statement is already
+      # reset. What is left to reset by hand:
+      #   * a `{:rows, _}` continuation abandoned by the row cap (`:too_many_rows`) — the statement
+      #     is mid-execution and holds its read transaction;
+      #   * an exception or throw/exit unwinding through here (post-step column refresh, a raise from
+      #     the deadline wrapper).
+      # A `bind` failure never steps the statement, so there is nothing to reset. Pinned by
+      # `NifDispatchTest`: a second handle's `wal_checkpoint(TRUNCATE)` after every outcome.
       try do
         with :ok <- Sqlite3.bind(stmt, args),
-             {:ok, rows, row_count} <- collect(conn, stmt, row_cap()) do
+             {:ok, rows, row_count} <- reset_if_abandoned(stmt, collect(conn, stmt, row_cap())) do
           # Post-step column read when the schema moved under this connection (expert review
           # 2026-08-26 #7). Only on the `:refresh` path — a DDL happened somewhere since this
           # statement was cached — so the ordinary hit pays nothing. See `cached_stmt/2` for why
@@ -763,31 +804,51 @@ defmodule Fathom.Shard.Connection do
           columns =
             if refresh_columns?, do: refreshed_columns(conn, stmt, sql, columns), else: columns
 
+          # `sqlite3_changes()` is a dirty-NIF dispatch. `ShardExecutor.wrote?/2` ignores it for a
+          # read-verb statement that returns columns (it answers `false` before looking), and
+          # `to_stmt_result/2` reports 0 affected rows for `cols != [] and not dml?`, which a
+          # read verb always is. So the caller says so with `read?` and the fetch is skipped. Never
+          # set for a `WITH` statement, whose `INSERT … RETURNING` body is only detectable by
+          # `changes > 0`.
+          changes = if read? and columns != [], do: 0, else: changes(conn)
+
           {:ok,
            %{
              columns: columns,
              rows: rows,
              row_count: row_count,
-             num_changes: changes(conn),
+             num_changes: changes,
              # Only fetch the rowid when the caller can actually use it (expert review
-             # 2026-07-24 #18). Sqlite3.last_insert_rowid/1 is ERL_NIF_DIRTY_JOB_IO_BOUND — a full
-             # dirty-scheduler dispatch — and ShardExecutor.to_stmt_result/2 discards it for every
-             # read-only statement, which is the dominant path. Removing it cuts ~25% of the
-             # dirty-IO dispatches on a plain SELECT, against the +SDio pool #2 resized.
-             #
-             # The predicate is exactly to_stmt_result's own `not read_only?`
-             # (`read_only? = cols != [] and not dml?`), so what the caller sees is byte-identical.
-             #
-             # num_changes stays UNCONDITIONAL: wrote?/2 checks `changes > 0` first, and the
-             # durability classifier's deliberate over-dirtying depends on it.
-             last_insert_rowid: if(dml? or columns == [], do: last_rowid(conn))
+             # 2026-07-24 #18; tightened by perf review 2026-10-14 #7). Sqlite3.last_insert_rowid/1
+             # is ERL_NIF_DIRTY_JOB_IO_BOUND — a full dirty-scheduler dispatch — and
+             # ShardExecutor.to_stmt_result/2 reports it only when `not read_only? and changes > 0`
+             # (`read_only? = cols != [] and not dml?`), i.e. `(dml? or cols == []) and changes > 0`.
+             # That is exactly this predicate, so what the caller sees is byte-identical; BEGIN,
+             # COMMIT, SAVEPOINT and no-op statements (changes == 0) no longer pay the dispatch.
+             last_insert_rowid: if(changes > 0 and (dml? or columns == []), do: last_rowid(conn))
            }}
         end
-      after
-        Sqlite3.reset(stmt)
+      rescue
+        e ->
+          _ = Sqlite3.reset(stmt)
+          reraise e, __STACKTRACE__
+      catch
+        kind, reason ->
+          _ = Sqlite3.reset(stmt)
+          :erlang.raise(kind, reason, __STACKTRACE__)
       end
     end
   end
+
+  # The row cap stops `collect/5` while the statement may still be mid-execution (after a
+  # `{:rows, _}` batch), and nothing else will reset it now that `multi_step`'s own resets are the
+  # only ones. After a `{:done, _}` the extra reset is a harmless no-op.
+  defp reset_if_abandoned(stmt, {:error, {:too_many_rows, _}} = err) do
+    _ = Sqlite3.reset(stmt)
+    err
+  end
+
+  defp reset_if_abandoned(_stmt, result), do: result
 
   # Re-read the column list now that the statement has stepped, and correct the cache entry so the
   # next execution takes the ordinary hit path. Falls back to the pre-step list if the read fails —
@@ -1223,7 +1284,7 @@ defmodule Fathom.Shard.Connection do
   #
   # Still blocking until `{:done, ref}`, so the 2026-07-23 #26 guarantee is intact: the
   # watchdog cannot process a NEWER `{:arm, …}` while these cancels are in flight. A retry
-  # issued in the sliver between `Sqlite3.reset/1` and `{:done, ref}` is the same no-op class
+  # issued in the sliver between the statement finishing (`multi_step` returning) and `{:done, ref}` is the same no-op class
   # the single cancel already accepted, not a new hazard.
   defp await_disarm(conn, ref, mon) do
     Sqlite3.cancel(conn)

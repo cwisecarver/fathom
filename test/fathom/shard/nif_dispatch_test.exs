@@ -1,0 +1,382 @@
+defmodule Fathom.Shard.NifDispatchTest do
+  @moduledoc """
+  Pins the number of DIRTY-scheduler NIF dispatches per statement and per fresh open (perf review
+  2026-10-14 #7 and #21), and the invariants the removed dispatches must not break.
+
+  Every `Sqlite3` NIF counted here is a dirty-scheduler hand-off. Before this change a point SELECT
+  cost 3 (`multi_step`, `changes`, `reset`), a write 4 (`multi_step`, `changes`,
+  `last_insert_rowid`, `reset`), a BEGIN/COMMIT 4, and a fresh tenant `:rw` open 23. The counts are
+  DETERMINISTIC, so they are exact assertions rather than timings.
+
+  The skipped calls were redundant for these reasons (each is tested below):
+
+    * `reset`: exqlite's `multi_step` resets on DONE, BUSY and every error. Only a row-cap abort
+      mid-statement and an exception need a manual reset. Proven by a second handle's
+      `wal_checkpoint(TRUNCATE)` after every outcome: a statement left un-reset holds a read mark
+      on the WAL and the TRUNCATE reports busy=1.
+    * `changes` for a read-verb statement that returns columns: `wrote?/3` answers `false` and
+      `to_stmt_result/2` reports 0 before either looks at it.
+    * `last_insert_rowid` when `changes == 0`: `to_stmt_result/2` reports it only for `changes > 0`.
+  """
+  use ExUnit.Case, async: false
+
+  alias Exqlite.Sqlite3
+  alias Fathom.Shard.Connection
+  alias Fathom.ShardExecutor
+  alias Fathom.Test.NifDispatchCounter, as: Counter
+  alias Filo.{Stmt, StmtResult}
+
+  defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
+
+  defp count(fun) do
+    {result, counts} = Counter.measure(fun)
+    {result, counts.total, counts.by_fun}
+  end
+
+  describe "per-statement dispatches through the Hrana executor" do
+    setup do
+      shard = "test_nifd_#{System.unique_integer([:positive])}"
+
+      on_exit(fn ->
+        for base <- [
+              Path.join(Fathom.Shard.data_dir(), "#{shard}.db"),
+              Path.join(Fathom.Shard.Storage.Local.dir(), "#{shard}.db")
+            ],
+            suffix <- ["", "-wal", "-shm"],
+            do: File.rm(base <> suffix)
+      end)
+
+      {:ok, conn} = ShardExecutor.open(shard)
+
+      {:ok, _} =
+        ShardExecutor.execute(
+          conn,
+          stmt("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        )
+
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (1, 'a')"))
+      on_exit(fn -> ShardExecutor.close(conn) end)
+      %{conn: conn, shard: shard}
+    end
+
+    test "a point SELECT is exactly 1 dirty dispatch (was 3)", %{conn: conn} do
+      sel = stmt("SELECT v FROM kv WHERE k = ?", [1])
+      assert {:ok, _} = ShardExecutor.execute(conn, sel)
+
+      {res, total, by_fun} = count(fn -> ShardExecutor.execute(conn, sel) end)
+
+      assert {:ok, %StmtResult{rows: [["a"]], affected_row_count: 0, last_insert_rowid: nil}} =
+               res
+
+      assert {total, by_fun} == {1, %{multi_step: 1}}
+    end
+
+    test "SELECT after a write on the same handle still reports 0 changes / nil rowid", %{
+      conn: conn
+    } do
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (2, 'b')"))
+
+      for sql <- [
+            "SELECT v FROM kv WHERE k = 2",
+            "VALUES (1), (2)",
+            "EXPLAIN SELECT v FROM kv"
+          ] do
+        assert {:ok, %StmtResult{affected_row_count: 0, last_insert_rowid: nil, rows_written: 0}} =
+                 ShardExecutor.execute(conn, stmt(sql))
+      end
+    end
+
+    test "an INSERT is exactly 3 dirty dispatches (was 4) and reports changes + rowid", %{
+      conn: conn
+    } do
+      ins = stmt("INSERT INTO kv VALUES (?, ?)", [2, "b"])
+      # Warm the statement cache so the count is the steady state, not the first prepare.
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (?, ?)", [3, "c"]))
+
+      {res, total, by_fun} = count(fn -> ShardExecutor.execute(conn, ins) end)
+
+      assert {:ok, %StmtResult{affected_row_count: 1, last_insert_rowid: 2, rows_written: 1}} =
+               res
+
+      assert {total, by_fun} == {3, %{multi_step: 1, changes: 1, last_insert_rowid: 1}}
+    end
+
+    test "BEGIN / COMMIT with no inherited changes fetch no rowid (2 dispatches, was 4)", %{
+      shard: shard
+    } do
+      # A FRESH handle: sqlite3_changes() is 0 here. (On the writing handle a BEGIN inherits the
+      # last write's changes()>0 and reports it, exactly as before this change.)
+      {:ok, fresh} = ShardExecutor.open(shard)
+      on_exit(fn -> ShardExecutor.close(fresh) end)
+
+      {:ok, _} = ShardExecutor.execute(fresh, stmt("BEGIN"))
+      {:ok, _} = ShardExecutor.execute(fresh, stmt("COMMIT"))
+
+      {res, total, by_fun} = count(fn -> ShardExecutor.execute(fresh, stmt("BEGIN")) end)
+      assert {:ok, %StmtResult{affected_row_count: 0, last_insert_rowid: nil}} = res
+      assert {total, by_fun} == {2, %{multi_step: 1, changes: 1}}
+
+      {res, total, _} = count(fn -> ShardExecutor.execute(fresh, stmt("COMMIT")) end)
+      assert {:ok, %StmtResult{last_insert_rowid: nil}} = res
+      assert total == 2
+    end
+
+    test "INSERT ... RETURNING keeps affected_row_count and last_insert_rowid", %{conn: conn} do
+      assert {:ok,
+              %StmtResult{
+                cols: ["k"],
+                rows: [[7]],
+                affected_row_count: 1,
+                last_insert_rowid: 7,
+                rows_written: 1
+              }} =
+               ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (7, 'g') RETURNING k"))
+    end
+
+    test "UPSERT (DO UPDATE and DO NOTHING) reports the right counters", %{conn: conn} do
+      assert {:ok, %StmtResult{affected_row_count: 1, last_insert_rowid: 1}} =
+               ShardExecutor.execute(
+                 conn,
+                 stmt(
+                   "INSERT INTO kv VALUES (1, 'z') ON CONFLICT(k) DO UPDATE SET v = excluded.v"
+                 )
+               )
+
+      # DO NOTHING changes no row: 0 affected, and the (discarded) rowid is not fetched at all.
+      # (Run once first so the count is the cached steady state, not the prepare.)
+      {:ok, _} =
+        ShardExecutor.execute(
+          conn,
+          stmt("INSERT INTO kv VALUES (1, 'q') ON CONFLICT(k) DO NOTHING")
+        )
+
+      {res, total, by_fun} =
+        count(fn ->
+          ShardExecutor.execute(
+            conn,
+            stmt("INSERT INTO kv VALUES (1, 'q') ON CONFLICT(k) DO NOTHING")
+          )
+        end)
+
+      assert {:ok, %StmtResult{affected_row_count: 0, last_insert_rowid: nil}} = res
+      assert by_fun == %{multi_step: 1, changes: 1}
+      assert total == 2
+    end
+
+    test "a trigger's writes do not leak into the statement's counters", %{conn: conn} do
+      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE log (id INTEGER PRIMARY KEY)"))
+
+      {:ok, _} =
+        ShardExecutor.execute(
+          conn,
+          stmt(
+            "CREATE TRIGGER kv_ai AFTER INSERT ON kv BEGIN INSERT INTO log VALUES (NULL); " <>
+              "INSERT INTO log VALUES (NULL); END"
+          )
+        )
+
+      assert {:ok, %StmtResult{affected_row_count: 1, last_insert_rowid: 9}} =
+               ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (9, 'i')"))
+    end
+
+    test "WITH ... INSERT ... RETURNING still dirties the shard (changes is not skipped)", %{
+      conn: conn,
+      shard: shard
+    } do
+      before = Fathom.Shard.WriteCounter.count(shard)
+
+      # (affected_row_count is 0 for this shape both before and after this change: `dml?/1` is
+      # leading-keyword only, so to_stmt_result reports a CTE-prefixed write as read-only. The
+      # shard-dirtying classification is what depends on `changes`, and is asserted below.)
+      assert {:ok, %StmtResult{cols: ["k"], rows: [[5]]}} =
+               ShardExecutor.execute(
+                 conn,
+                 stmt(
+                   "WITH src(x) AS (VALUES (5)) INSERT INTO kv SELECT x, 'w' FROM src RETURNING k"
+                 )
+               )
+
+      assert Fathom.Shard.WriteCounter.count(shard) > before,
+             "WITH ... INSERT RETURNING must be classified a write; its only signal is changes > 0"
+    end
+  end
+
+  # Order-of-magnitude ceiling, not an exact latency (other agents load the machine). Measured
+  # 2026-10-14: ~5.8 us -> ~2.7 us of NIF work per prepared point SELECT (100k iterations, median of
+  # 7 alternating runs); the whole Connection.query is far below the 100 us ceiling either way.
+  @tag :bench
+  test "bench: a prepared point SELECT through Connection.query stays under 100 us" do
+    path = Path.join(System.tmp_dir!(), "nifd_bench_#{System.unique_integer([:positive])}.db")
+    {:ok, conn} = Connection.open(path)
+    :ok = Connection.exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+    :ok = Connection.exec(conn, "INSERT INTO t VALUES (1, 'a')")
+    sql = "SELECT v FROM t WHERE id = ?"
+    opts = [dml?: false, read?: true]
+    {:ok, _} = Connection.query(conn, sql, [1], opts)
+
+    n = 20_000
+
+    {us, _} =
+      :timer.tc(fn -> for _ <- 1..n, do: {:ok, _} = Connection.query(conn, sql, [1], opts) end)
+
+    Connection.close(conn)
+    for s <- ["", "-wal", "-shm"], do: File.rm(path <> s)
+    assert us / n < 100, "point SELECT took #{Float.round(us / n, 1)} us"
+  end
+
+  describe "fresh-handle open dispatches" do
+    setup do
+      path = Path.join(System.tmp_dir!(), "nifd_open_#{System.unique_integer([:positive])}.db")
+      on_exit(fn -> for s <- ["", "-wal", "-shm"], do: File.rm(path <> s) end)
+      %{path: path}
+    end
+
+    test "a tenant :rw open is 19 dirty dispatches (was 23)", %{path: path} do
+      {res, total, by_fun} = count(fn -> Connection.open(path, tenant?: true) end)
+      assert {:ok, conn} = res
+      Connection.close(conn)
+
+      # The five fixed PRAGMAs are ONE execute; journal_mode, page_size and the extension's own
+      # setup are untouched.
+      assert total == 19, "open dispatches: #{inspect(by_fun)}"
+    end
+
+    test "the batched PRAGMAs all took effect", %{path: path} do
+      {:ok, conn} = Connection.open(path, tenant?: true)
+      pragma = fn name -> Connection.query(conn, "PRAGMA #{name}", [], dml?: false) end
+
+      assert {:ok, %{rows: [[2]]}} = pragma.("synchronous")
+      # (wal_autocheckpoint reads back 0 on a tenant handle: the extension's own wal hook takes
+      # the same slot, which is why the batch must stay BEFORE load_extension.)
+      assert {:ok, %{rows: [[67_108_864]]}} = pragma.("journal_size_limit")
+      assert {:ok, %{rows: [[1]]}} = pragma.("foreign_keys")
+      assert {:ok, %{rows: [[-2000]]}} = pragma.("cache_size")
+      Connection.close(conn)
+    end
+  end
+
+  # A statement left un-reset keeps its read transaction (a WAL read mark), which blocks a
+  # `wal_checkpoint(TRUNCATE)` from any other handle. After every outcome, the statement must have
+  # released it. (The reset was removed from the hot path: only the abandoned-`{:rows, _}` and the
+  # exception paths reset by hand, everything else relies on `multi_step`'s own resets.)
+  describe "no outcome leaves a statement holding a read transaction" do
+    setup do
+      path = Path.join(System.tmp_dir!(), "nifd_wal_#{System.unique_integer([:positive])}.db")
+      {:ok, a} = Connection.open(path)
+      {:ok, b} = Connection.open(path)
+      :ok = Sqlite3.set_busy_timeout(b, 0)
+      :ok = Connection.exec(a, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+
+      :ok =
+        Connection.exec(a, """
+        WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 1500)
+        INSERT INTO t (id, v) SELECT i, 'row-' || i FROM seq
+        """)
+
+      on_exit(fn ->
+        Application.delete_env(:fathom, :query_max_rows)
+        Application.delete_env(:fathom, :query_timeout_ms)
+        Connection.close(a)
+        Connection.close(b)
+        for s <- ["", "-wal", "-shm"], do: File.rm(path <> s)
+      end)
+
+      %{a: a, b: b}
+    end
+
+    # The observer. busy is the first column of the checkpoint row; the WAL must be non-empty
+    # for a held read mark to matter, which the seed insert above guarantees.
+    defp truncate_busy(b) do
+      assert {:ok, %{rows: [[busy, _log, _ckpt]]}} =
+               Connection.query(b, "PRAGMA wal_checkpoint(TRUNCATE)", [], dml?: false)
+
+      busy
+    end
+
+    # Same opts the executor passes for client SQL.
+    defp client(conn, sql, args \\ []) do
+      Connection.query(conn, sql, args, dml?: false, read?: true, deadline: true)
+    end
+
+    test "the harness discriminates: an un-reset mid-statement DOES block the checkpoint", %{
+      a: a,
+      b: b
+    } do
+      {:ok, st} = Sqlite3.prepare(a, "SELECT id FROM t")
+      assert {:rows, _} = Sqlite3.multi_step(a, st, 10)
+      assert truncate_busy(b) == 1, "precondition: a statement mid-execution must block TRUNCATE"
+      :ok = Sqlite3.release(a, st)
+      assert truncate_busy(b) == 0
+    end
+
+    test "cache hit, then DONE", %{a: a, b: b} do
+      assert {:ok, %{row_count: 1}} = client(a, "SELECT v FROM t WHERE id = ?", [3])
+      assert {:ok, %{row_count: 1}} = client(a, "SELECT v FROM t WHERE id = ?", [4])
+      assert truncate_busy(b) == 0
+    end
+
+    test "a write", %{a: a, b: b} do
+      assert {:ok, %{num_changes: 1}} =
+               Connection.query(a, "INSERT INTO t VALUES (5000, 'x')", [], dml?: true)
+
+      assert truncate_busy(b) == 0
+    end
+
+    test "a bind error", %{a: a, b: b} do
+      assert {:ok, _} = client(a, "SELECT v FROM t WHERE id = ?", [1])
+      assert {:error, _} = client(a, "SELECT v FROM t WHERE id = ?", [%{not: :bindable}])
+      assert {:error, _} = client(a, "SELECT v FROM t WHERE id = ?", [])
+      assert truncate_busy(b) == 0
+      # and the statement is still usable afterwards
+      assert {:ok, %{rows: [["row-1"]]}} = client(a, "SELECT v FROM t WHERE id = ?", [1])
+    end
+
+    test "too_many_rows abandoned mid-statement (the {:rows, _} branch)", %{a: a, b: b} do
+      # 1500 rows > one 500-row multi_step chunk, so the cap trips on a {:rows, _} batch and the
+      # statement is still mid-execution: only the manual reset releases it.
+      Application.put_env(:fathom, :query_max_rows, 100)
+      assert {:error, {:too_many_rows, 100}} = client(a, "SELECT * FROM t")
+      assert truncate_busy(b) == 0
+      Application.delete_env(:fathom, :query_max_rows)
+      assert {:ok, %{row_count: 1500}} = client(a, "SELECT * FROM t")
+    end
+
+    test "too_many_rows on the final {:done, _} batch", %{a: a, b: b} do
+      Application.put_env(:fathom, :query_max_rows, 10)
+      assert {:error, {:too_many_rows, 10}} = client(a, "SELECT * FROM t WHERE id <= 50")
+      assert truncate_busy(b) == 0
+    end
+
+    test "a constraint error", %{a: a, b: b} do
+      assert {:error, _} =
+               Connection.query(a, "INSERT INTO t VALUES (6000, NULL)", [], dml?: true)
+
+      assert truncate_busy(b) == 0
+    end
+
+    test "query_timeout", %{a: a, b: b} do
+      Application.put_env(:fathom, :query_timeout_ms, 20)
+
+      assert {:error, :query_timeout} =
+               client(
+                 a,
+                 "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) " <>
+                   "SELECT count(*) FROM c"
+               )
+
+      Application.delete_env(:fathom, :query_timeout_ms)
+      assert truncate_busy(b) == 0
+    end
+
+    test "busy", %{a: a, b: b} do
+      :ok = Sqlite3.set_busy_timeout(a, 0)
+      :ok = Connection.exec(b, "BEGIN IMMEDIATE")
+
+      assert {:error, :busy} =
+               Connection.query(a, "INSERT INTO t VALUES (7000, 'x')", [], dml?: true)
+
+      :ok = Connection.exec(b, "COMMIT")
+      assert truncate_busy(b) == 0
+    end
+  end
+end
