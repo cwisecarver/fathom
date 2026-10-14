@@ -182,6 +182,24 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # only added a serial round trip (expert review 2026-10-01 perf #3). The RE-read below is a
   # different read on purpose and is never shared.
   defp try_promote_from_fleet(shard_id, path, lease, etag, lineage, prefetched) do
+    # RECOVERY PENDING, DURABLY, BEFORE THE ASK (expert review 2026-10-13 #4). By here the cold pull
+    # has installed the object's bytes at `path` with a MATCHING sidecar, and the cleanup that makes
+    # a retry re-run recovery used to exist only on the refusal path. A node dying during the up-to-2 s
+    # peer ask left file + sidecar == object etag: the next open read `:match`, opened WARM, and a
+    # warm open never recovers — the floor was bypassed behind a restart. The marker is fsynced
+    # before `Recovery.best_replica` and removed after the decision (accept, decline or promote);
+    # `purge_if_recovering/1` (the open path) treats a surviving marker as cold. NOT "delete the
+    # sidecar early": a crash would then read `:no_sidecar`, which quarantines a shard-sized file
+    # and raises the fork alarm. A raise (refusal, failed rename) leaves the marker or removes it
+    # with the files — either way the next open recovers again.
+    mark_recovering(path)
+    before_recovery_ask(path)
+    result = decide_from_fleet(shard_id, path, lease, etag, lineage, prefetched)
+    File.rm(recovering_path(path))
+    result
+  end
+
+  defp decide_from_fleet(shard_id, path, lease, etag, lineage, prefetched) do
     started = System.monotonic_time(:millisecond)
 
     with {:head, {:ok, head}} <- {:head, decision_head(shard_id, prefetched)},
@@ -232,7 +250,62 @@ defmodule Fathom.Shard.PromoteOnOpen do
   defp refuse_open(path, refusal) do
     Enum.each(["", "-wal", "-shm"], &File.rm(path <> &1))
     File.rm(Provenance.sidecar_path(path))
+    File.rm(recovering_path(path))
     raise refusal
+  end
+
+  # Test seam for the crash window between the marker and the peer ask (expert review 2026-10-13
+  # #4). Unset in every real config.
+  defp before_recovery_ask(path) do
+    case Application.get_env(:fathom, :recovery_ask_crash_hook) do
+      nil -> :ok
+      hook -> hook.(path)
+    end
+  end
+
+  @doc "The recovery-pending marker beside a shard's live path (expert review 2026-10-13 #4)."
+  @spec recovering_path(Path.t()) :: Path.t()
+  def recovering_path(path), do: path <> ".recovering"
+
+  # fsynced (a marker lost to a power cut is the same hole as no marker). An empty file: its
+  # existence is the whole signal. A failure to write it is logged and the open continues — the
+  # floor still runs for THIS open, only the crash-safety of the ask is lost.
+  defp mark_recovering(path) do
+    marker = recovering_path(path)
+
+    with {:ok, fd} <- :file.open(marker, [:write, :raw, :binary]),
+         :ok <- :file.sync(fd),
+         :ok <- :file.close(fd) do
+      :ok
+    else
+      other -> Logger.warning("could not write recovery marker #{marker}: #{inspect(other)}")
+    end
+  end
+
+  @doc """
+  Open-path check, called before the warm/cold decision: a surviving `.recovering` marker means a
+  previous open died between installing the pulled object and finishing the peer ask (expert review
+  2026-10-13 #4), so the local file is an unvetted pull and must not be served warm. Removes the db,
+  its `-wal`/`-shm` and the sidecar, then the marker LAST (a crash part-way re-enters here). Returns
+  true when a marker was found. The caller then opens cold, pulling and recovering again.
+  """
+  @spec purge_if_recovering(Path.t()) :: boolean()
+  def purge_if_recovering(path) do
+    marker = recovering_path(path)
+
+    if File.exists?(marker) do
+      Logger.warning(
+        "shard open found #{marker}: a previous open died before peer recovery finished; " <>
+          "discarding the unvetted pull and recovering again"
+      )
+
+      Enum.each(["-wal", "-shm", ""], &File.rm(path <> &1))
+      File.rm(Provenance.sidecar_path(path))
+      File.rm(marker)
+      true
+    else
+      false
+    end
   end
 
   defp decision_head(_shard_id, {:ok, _} = head), do: head
@@ -363,8 +436,9 @@ defmodule Fathom.Shard.PromoteOnOpen do
            # ranked above (`expect:`) — see `Promote.stage/4`.
            :ok <- Promote.stage(follower, shard_id, temp, lineage: lineage, expect: replica),
            {:ok, new_etag, _carried} <-
-             Storage.flush(
+             publish_promoted(
                shard_id,
+               path,
                temp,
                etag,
                Position.flush_position(promoted_stamp_state(lease, temp, lineage, replica)),
@@ -379,12 +453,14 @@ defmodule Fathom.Shard.PromoteOnOpen do
         # that goes first (with its `-wal`/`-shm`, which must never be paired with the promoted
         # bytes). No connection has opened it: this runs inside the open. Removing it loses nothing:
         # the promoted object is already published and a cold open pulls exactly those bytes.
-        Enum.each(["-wal", "-shm", ""], &File.rm(path <> &1))
+        # (The pre-promotion `.db` is already ASIDE — `publish_promoted/6` — so there is nothing
+        # live to remove here; expert review 2026-10-13 #22.)
         Provenance.write(path, new_etag)
         before_promote_rename(path)
 
         case File.rename(temp, path) do
           :ok ->
+            Enum.each(["-wal", "-shm", ""], &File.rm(prepromote(path) <> &1))
             Follower.forget(follower, shard_id)
 
             Logger.warning(
@@ -423,6 +499,78 @@ defmodule Fathom.Shard.PromoteOnOpen do
       end
     after
       Enum.each(["", "-wal", "-shm"], &File.rm(temp <> &1))
+    end
+  end
+
+  # PUBLISH WITH THE PRE-PROMOTION `.db` ASIDE (expert review 2026-10-13 #22). `Storage.flush`
+  # publishes the promoted bytes, and the pulled `.db` used to be removed only AFTER it: a crash in
+  # between left that `.db` with the OLD sidecar against the NEW object etag, which the next open
+  # reads as `:diverged` and quarantines as a fork (a shard-sized `.forked` plus the alarm) though
+  # nothing was lost. Now the file (and its -wal/-shm) is renamed to `<path>.prepromote` before the
+  # PUT, so a crash leaves no live `.db` and the next open is a plain cold pull of the published
+  # object; `TempReaper` sweeps the aside copy. It is renamed BACK when the PUT fails or raises,
+  # because the fallback serves the pulled object. Two other prescriptions are wrong: "delete before
+  # the flush" breaks that fallback, and `pre_put: flush_intent_opts(path)` would record the intent
+  # of the WRONG bytes (the pulled file, not the temp being published). The aside is deleted by the
+  # caller once the sidecar and the rename have landed.
+  defp publish_promoted(shard_id, path, temp, etag, position, lineage_store) do
+    with :ok <- aside_pre_promotion(path) do
+      result =
+        try do
+          Storage.flush(shard_id, temp, etag, position, lineage_store)
+        catch
+          kind, reason ->
+            restore_pre_promotion(path)
+            :erlang.raise(kind, reason, __STACKTRACE__)
+        end
+
+      case result do
+        {:ok, _new_etag, _carried} ->
+          after_promote_publish(path)
+          result
+
+        other ->
+          restore_pre_promotion(path)
+          other
+      end
+    end
+  end
+
+  defp prepromote(path), do: path <> ".prepromote"
+
+  # -wal/-shm first, the db last: a crash part-way leaves a db (still matching its sidecar) rather
+  # than a wal with no db. A missing db (nothing was pulled) is fine; any other failure declines the
+  # promotion before anything is published.
+  defp aside_pre_promotion(path) do
+    Enum.each(["-wal", "-shm"], &File.rename(path <> &1, prepromote(path) <> &1))
+
+    case File.rename(path, prepromote(path)) do
+      :ok ->
+        :ok
+
+      {:error, :enoent} ->
+        :ok
+
+      {:error, reason} ->
+        restore_pre_promotion(path)
+        {:error, {:aside_failed, reason}}
+    end
+  end
+
+  defp restore_pre_promotion(path) do
+    for suffix <- ["", "-wal", "-shm"] do
+      File.rename(prepromote(path) <> suffix, path <> suffix)
+    end
+
+    :ok
+  end
+
+  # Test seam for the crash window between the publish and the sidecar write (expert review
+  # 2026-10-13 #22). Unset in every real config.
+  defp after_promote_publish(path) do
+    case Application.get_env(:fathom, :promote_replica_after_publish_hook) do
+      nil -> :ok
+      hook -> hook.(path)
     end
   end
 

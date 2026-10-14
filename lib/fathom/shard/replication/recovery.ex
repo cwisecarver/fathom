@@ -645,6 +645,60 @@ defmodule Fathom.Shard.Replication.Recovery do
     ArgumentError -> 0
   end
 
+  @doc """
+  A refusal recorded for `shard_id` moments ago, as the `{:refuse, %UnderQuorum{}}` to answer with,
+  or nil (expert review 2026-10-13 #11, the negative-cache half). READ-ONLY: it never writes the
+  window row, so cached answers neither extend the window nor refresh `last`.
+
+  Every refused open had already stolen the lease, touched the object and pulled it whole before the
+  floor could refuse, and each 503 retry repeated all of it. A row whose last refusal is under
+  `:replication_recovery_refusal_ttl_ms` (default 3000) old, and whose window has NOT expired
+  (`now - first < window`), answers the checkout without acquiring anything; refusing is always
+  the safe direction. At `now - first >= window` it returns nil, so the attempt goes through and
+  `underquorum_step/1` takes its `:expired` transition. A tombstone (`{id, :expired, at}`) is never
+  a refusal.
+
+  Cost: one `:ets.info/2` while the table is empty (the whole normal case; on a node with no Fleet
+  the table does not exist and `info` answers `:undefined` without raising), plus one lookup while
+  any shard has a row.
+  """
+  @spec recent_refusal(String.t(), integer()) :: {:refuse, UnderQuorum.t()} | nil
+  def recent_refusal(shard_id, now \\ System.monotonic_time(:millisecond)) do
+    case :ets.info(@underquorum_table, :size) do
+      size when is_integer(size) and size > 0 ->
+        case :ets.lookup(@underquorum_table, shard_id) do
+          [{_, first, last}] when is_integer(first) and is_integer(last) ->
+            if now - last < refusal_ttl_ms() and now - first < underquorum_window_ms() do
+              {:refuse,
+               %UnderQuorum{
+                 shard_id: shard_id,
+                 answered: 0,
+                 needed: floor_needed(),
+                 waited_ms: now - first
+               }}
+            end
+
+          _ ->
+            nil
+        end
+
+      _ ->
+        nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp refusal_ttl_ms,
+    do: Application.get_env(:fathom, :replication_recovery_refusal_ttl_ms, 3_000)
+
+  # Informational only (the struct), so a bad quorum config must not fail the cached refusal.
+  defp floor_needed do
+    max(length(peers()) - quorum() + 1, 1)
+  rescue
+    _ -> 1
+  end
+
   defp clear_underquorum(shard_id) do
     :ets.delete(@underquorum_table, shard_id)
   rescue

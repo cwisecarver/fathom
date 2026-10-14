@@ -1718,7 +1718,7 @@ defmodule Fathom.Shard.Storage do
     # and on node death. One full shard-sized orphan (plus its `-wal`/`-shm`) per killed promotion,
     # on a volume nothing ever swept — it eats the density budget and, via
     # `Fathom.Admin.Measurements.disk/0`, the free-space floor A2 follower seeding backs off against.
-    for tmp <- Path.wildcard(base <> ".{dl,snap,tmp,pull,z,promote}*"),
+    for tmp <- Path.wildcard(base <> ".{dl,snap,tmp,pull,z,promote,prepromote}*"),
         stale_file?(tmp, cutoff),
         reduce: 0 do
       acc ->
@@ -1731,10 +1731,10 @@ defmodule Fathom.Shard.Storage do
 
   # The uniquely-suffixed orphan-temp families `reap_stale_temps/2` globs for. One enumerator so the
   # reaper's single directory listing (`temp_orphan?/1`) cannot drift from the glob above.
-  @temp_orphan_markers [".dl", ".snap", ".tmp", ".pull", ".z", ".promote"]
+  @temp_orphan_markers [".dl", ".snap", ".tmp", ".pull", ".z", ".promote", ".prepromote"]
 
   @doc false
-  # The same predicate as `<dir>/*.{dl,snap,tmp,pull,z,promote}*` over a bare file NAME:
+  # The same predicate as `<dir>/*.{dl,snap,tmp,pull,z,promote,prepromote}*` over a bare file NAME:
   # `Path.wildcard` never matches a dotfile, and the marker may sit anywhere after the first
   # character (expert review 2026-10-10 #P6).
   @spec temp_orphan?(String.t()) :: boolean()

@@ -37,6 +37,7 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
     :replication_followers,
     :replication_quorum,
     :replication_recovery_underquorum_window_ms,
+    :replication_recovery_refusal_ttl_ms,
     :replication_lineage_wire,
     :replication_ordinal_wire
   ]
@@ -72,6 +73,10 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
     Application.put_env(:fathom, :replication_recover_from_peers, true)
     Application.put_env(:fathom, :replication_quorum, 2)
     Application.put_env(:fathom, :replication_recovery_underquorum_window_ms, 60_000)
+    # These tests retry a refusal to watch each attempt reach the floor, so the checkout negative
+    # cache (expert review 2026-10-13 #11, `Recovery.recent_refusal/2`) is off here; it is covered
+    # in `open_crash_safety_test.exs`.
+    Application.put_env(:fathom, :replication_recovery_refusal_ttl_ms, 0)
     Application.put_env(:fathom, :replication_lineage_wire, true)
     Application.put_env(:fathom, :replication_ordinal_wire, true)
 

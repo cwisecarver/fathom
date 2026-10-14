@@ -148,7 +148,7 @@ defmodule Fathom.Shards do
   # retry path stay one shape; `checkout_result/5` drops the reuse for the plain (nil-scope) caller.
   defp do_checkout(shard_id, attempts, held \\ nil, scope \\ nil) do
     with :ok <- maybe_lazy_migrate(shard_id),
-         {:ok, pid} <- ensure(shard_id),
+         {:ok, pid} <- do_ensure(shard_id, true),
          {:ok, ref, path, reuse} <- grant(pid, scope) do
       record_use(shard_id)
       # Per-shard load: the checkout (traffic) signal for the rebalancer. Lock-free
@@ -1119,12 +1119,12 @@ defmodule Fathom.Shards do
     # Cast, not just `valid?` (expert review 2026-10-10 #9): the ETS gates and Registry are keyed
     # lowercase, so an uppercase id must be canonicalized before any of them is consulted.
     case Fathom.ShardId.cast(shard_id) do
-      {:ok, id} -> do_ensure(id)
+      {:ok, id} -> do_ensure(id, false)
       :error -> {:error, :invalid_shard_id}
     end
   end
 
-  defp do_ensure(shard_id) do
+  defp do_ensure(shard_id, refusal_cache?) do
     cond do
       # Lifecycle denies, checked on EVERY checkout (not just a new open) so a deleted or
       # suspended tenant is refused even when a coordinator is still running — closing the
@@ -1146,9 +1146,24 @@ defmodule Fathom.Shards do
           # migration. Refused with the retryable migrating error until the short gate expires.
           # Only on this cold-open branch, so a running shard's checkout never pays for it.
           {:ok, []} ->
-            if Fathom.Shards.MigrationGate.closed?(shard_id),
-              do: {:error, {:shard_migrating, :drained_for_migration}},
-              else: start_if_capacity(shard_id)
+            cond do
+              Fathom.Shards.MigrationGate.closed?(shard_id) ->
+                {:error, {:shard_migrating, :drained_for_migration}}
+
+              # NEGATIVE CACHE for a floor refusal (expert review 2026-10-13 #11). A refused open
+              # had already stolen the lease, touched and pulled the object before refusing, and
+              # every 503 retry repeated all of it. A refusal under a few seconds old answers the
+              # retry here, before any coordinator starts: zero Storage calls. Cold branch only —
+              # a running shard's checkout never reaches it, and a bare `ensure/1` (admin, drain, tests)
+              # is not a request and is never answered from it. See `Recovery.recent_refusal/2`.
+              cached =
+                  refusal_cache? && Fathom.Shard.Replication.Recovery.recent_refusal(shard_id) ->
+                {:refuse, unavailable} = cached
+                {:error, {:open_failed, unavailable}}
+
+              true ->
+                start_if_capacity(shard_id)
+            end
 
           {:error, :unavailable} = unavailable ->
             unavailable

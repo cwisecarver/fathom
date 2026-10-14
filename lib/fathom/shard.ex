@@ -500,6 +500,10 @@ defmodule Fathom.Shard do
     # so every quarantine/adopt branch is unchanged. The rare diverged-warm case now pulls
     # sequentially after the acquire instead of overlapped — the common warm path drops to
     # 2 RTTs (the post-lease re-check stays: it is the release-in-gap authority, round-2 #19).
+    # A surviving `.recovering` marker means the previous open died between installing the pulled
+    # object and finishing the peer ask, so the file on disk is an unvetted pull: purge it and open
+    # COLD, which recovers again (expert review 2026-10-13 #4). One stat per open.
+    _ = PromoteOnOpen.purge_if_recovering(path)
     file? = File.exists?(path)
     # Gathers evidence only — the verdict is `resolve_fork/4`, after the lease is held. See
     # `fork_evidence/2`: this HEAD races the steal-touch that `acquire_lease` performs, so a
