@@ -149,6 +149,7 @@ dependencies = [
  "fancy-regex",
  "md-5",
  "rand",
+ "regex-syntax",
  "rusqlite",
  "serde_json",
  "sha1",

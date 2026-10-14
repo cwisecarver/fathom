@@ -46,6 +46,8 @@ sha2 = "0.10"
 # reached a tenant as an error where Django would have answered. fancy-regex layers a backtracking
 # engine over `regex` and supports them.
 fancy-regex = "0.19"
+# Only to classify a pattern as plain vs backtracking (pyre::needs_backtracking); already in the tree.
+regex-syntax = "0.8"
 uuid = { version = "1", features = ["v4", "v7"] }
 rand = "0.8"
 

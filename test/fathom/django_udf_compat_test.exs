@@ -473,6 +473,25 @@ defmodule Fathom.DjangoUdfCompatTest do
       assert inspect(reason) =~ "limit"
     end
 
+    test "lookaround REGEXP over a subject above 64 KiB errors fast instead of going quadratic",
+         %{conn: conn} do
+      # expert review 2026-10-13 #1: fancy-regex re-runs its delegate from every start position,
+      # so `(?<=a)a*b` over a built-in-statement REPEAT subject ran ~10 s uninterruptibly (the
+      # statement deadline and backstop cannot stop one UDF call). Fancy-path subjects are capped.
+      {us, result} =
+        :timer.tc(fn ->
+          Connection.query(conn, "SELECT REPEAT('a', 300000) REGEXP '(?<=a)a*b'", [])
+        end)
+
+      assert {:error, reason} = result
+      assert inspect(reason) =~ "lookaround"
+      assert us < 1_000_000
+
+      # Small lookaround subjects and large PLAIN-pattern subjects are unaffected.
+      assert one(conn, "SELECT 'ab' REGEXP '(?<=a)b'") == 1
+      assert one(conn, "SELECT REPEAT('a', 300000) REGEXP 'a+$'") == 1
+    end
+
     test "uuid generators return Django's 32-char dashless hex", %{conn: conn} do
       for fun <- ["UUIDV4", "UUIDV7"] do
         value = one(conn, "SELECT #{fun}()")
