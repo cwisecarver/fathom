@@ -448,6 +448,51 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
       assert :ok = Session.commit(id, wal, coordinator)
     end
+
+    # #18 symptom: a CLEAN Heartbeat stop cleared the heartbeat object (the node's keyspace is
+    # stealable at once) and reset the last deadline to the "never published" sentinel, which
+    # `heartbeat_ok` reads as `:ok`, so commits kept being acked. Invariant: a clean stop is a
+    # refusal, distinct from "never published".
+    test "a cleanly stopped Heartbeat refuses the ack (expert review 2026-10-13 #18)", ctx do
+      %{id: id, coordinator: coordinator, conn: conn, wal: wal, hb: hb} = heartbeat_session!(ctx)
+
+      ref = Process.monitor(hb)
+      :ok = GenServer.stop(hb, :normal)
+      assert_receive {:DOWN, ^ref, :process, ^hb, :normal}
+      refute Fathom.Shard.Heartbeat.running?()
+      assert Fathom.Shard.Heartbeat.last_deadline_ms() == :stopped
+
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
+
+      assert {:error, :ownership_unconfirmed} = Session.commit(id, wal, coordinator),
+             "a cleanly stopped Heartbeat (heartbeat object cleared) was read as ownership confirmed"
+    end
+
+    # #18 symptom: the fallback refused only at `now > deadline`, the live check at
+    # `now + margin >= deadline`, so a Heartbeat killed inside the margin acked writes the live
+    # check would have refused. Boundary: deadline = now + margin - 1 must refuse.
+    test "a down Heartbeat inside the safety margin refuses the ack (expert review 2026-10-13 #18)",
+         ctx do
+      %{id: id, coordinator: coordinator, conn: conn, wal: wal, hb: hb} = heartbeat_session!(ctx)
+
+      margin = Fathom.Shard.Heartbeat.margin_ms()
+
+      :sys.replace_state(hb, fn s ->
+        Fathom.Shard.Heartbeat.publish_status(%{
+          s
+          | mono_deadline_ms: System.monotonic_time(:millisecond) + margin - 1
+        })
+      end)
+
+      ref = Process.monitor(hb)
+      Process.exit(hb, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^hb, :killed}
+
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
+
+      assert {:error, :ownership_unconfirmed} = Session.commit(id, wal, coordinator),
+             "the down-Heartbeat fallback ignored the safety margin the live check applies"
+    end
   end
 
   # Expert review 2026-09-18 #4. `with_epoch/1` caches `acquire_gen` ONCE for the session's life
@@ -1245,6 +1290,182 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       # (not merely dead), a DIFFERENT pid was recorded, and the old one was actually killed rather
       # than only forgotten. Liveness of the replacement is a window this fixture does not control,
       # so asserting it was measuring the scheduler, not the sweep.
+    end
+
+    # #35 symptom: `forget_seed/2` is keyed by shipper only, so a `{:seeded, ...}` already in the
+    # mailbox when `expire_seeds/1` killed its task was applied to the REPLACEMENT's entry,
+    # untracking a live seed. Invariant: a result is applied only to the seed that produced it.
+    # (Pre-fix the entry has no `token`, so the first line of this test fails with a KeyError; the
+    # behavioural half is the assertion that the entry survives.)
+    test "a stale seed result does not clear a newer seed's entry (expert review 2026-10-13 #35)",
+         ctx do
+      %{id: id, root: root} = ctx
+
+      live = start_followers!(root, 2)
+      bh_port = seed_black_hole!()
+
+      Application.put_env(:fathom, :replication_enabled, true)
+      Application.put_env(:fathom, :replication_quorum, 1)
+
+      Application.put_env(
+        :fathom,
+        :replication_followers,
+        for({_n, p} <- live, do: {~c"127.0.0.1", p}) ++ [{~c"127.0.0.1", bh_port}]
+      )
+
+      start_supervised!(Fleet)
+
+      {:ok, coordinator, ref, path} = Shards.checkout(id)
+      on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+      {:ok, conn} = Connection.open(path)
+      on_exit(fn -> Connection.close(conn) end)
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
+      for {n, _} <- live, do: preseed_current!(n, id, coordinator)
+
+      assert :ok = Session.commit(id, path <> "-wal", coordinator)
+      [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+      bh = List.last(Fleet.shippers())
+
+      send(session, {:repl_reply, bh, {:reject, id, :unknown_shard, 0}})
+      seeding = await_seeding(session, &(map_size(&1) == 1), "the reject never started a seed")
+      %{token: stale_token} = Map.fetch!(seeding, bh)
+
+      # The replacement seed: same shipper, a different token.
+      fresh_token = make_ref()
+
+      :sys.replace_state(session, fn s ->
+        %{s | seeding: Map.update!(s.seeding, bh, &%{&1 | token: fresh_token})}
+      end)
+
+      send(session, {:seeded, bh, stale_token, {:ok, {0, 0, 0}}})
+      _ = :sys.get_state(session)
+
+      assert %{^bh => %{token: ^fresh_token}} = :sys.get_state(session).seeding,
+             "a stale seed result wiped the tracking of the newer seed to the same follower"
+
+      refute :sys.get_state(session).followers[bh] == {0, 0, 0},
+             "a stale seed result moved the follower's recorded position"
+    end
+
+    # #12 symptom: a seed task that dies without sending (here: a bogus gate wait raises inside
+    # the task) leaves its DOWN in the mailbox where only `handle_info/2` reads it. The commit's
+    # `await_seeds/3` selective receive never matched it, `seeding` stayed non-empty, and the
+    # commit ran to its whole deadline. Invariant: a dead seed ends the wait at once.
+    test "a seed task that dies without answering fails the commit fast (expert review 2026-10-13 #12)",
+         ctx do
+      %{id: id, root: root} = ctx
+
+      Application.put_env(:fathom, :replication_timeout_ms, 4_000)
+      Application.put_env(:fathom, :replication_seed_max_concurrency, 1)
+      Application.put_env(:fathom, :replication_seed_gate_wait_ms, :bogus)
+
+      on_exit(fn ->
+        for k <- [
+              :replication_timeout_ms,
+              :replication_seed_max_concurrency,
+              :replication_seed_gate_wait_ms
+            ],
+            do: Application.delete_env(:fathom, k)
+      end)
+
+      followers = start_followers!(root, 3)
+
+      Application.put_env(:fathom, :replication_enabled, true)
+      Application.put_env(:fathom, :replication_quorum, 2)
+
+      Application.put_env(
+        :fathom,
+        :replication_followers,
+        for({_n, p} <- followers, do: {~c"127.0.0.1", p})
+      )
+
+      start_supervised!(Fleet)
+
+      {:ok, coordinator, ref, path} = Shards.checkout(id)
+      on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+      {:ok, conn} = Connection.open(path)
+      on_exit(fn -> Connection.close(conn) end)
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
+
+      # One current follower, two never seeded: no quorum, and both seeds crash.
+      [{n1, _} | _] = followers
+      preseed_current!(n1, id, coordinator)
+
+      t0 = System.monotonic_time(:millisecond)
+      assert {:error, {:no_quorum, _}} = Session.commit(id, path <> "-wal", coordinator)
+      elapsed = System.monotonic_time(:millisecond) - t0
+
+      assert elapsed < 1_500,
+             "the commit waited #{elapsed} ms on seed tasks that were already dead " <>
+               "(budget #{Session.commit_deadline_budget()} ms)"
+
+      [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+
+      # The post-seed retry re-rejects and starts fresh seeds (which crash too); they are cleared by
+      # `handle_info/2`, so the map empties rather than being empty at the instant of the reply.
+      await_seeding(session, &(map_size(&1) == 0), "dead seed tasks were never forgotten")
+    end
+
+    # #34 symptom: replacing a registered Session of another coordinator ran up to 100 rounds of
+    # a 5 s stop + 5 s DOWN wait OUTSIDE the call timeout, so a predecessor that ignores `stop`
+    # blocked the tenant's commit for minutes. Invariant: the replacement is bounded by one
+    # deadline (the commit budget) and a predecessor that ignores a polite stop is killed.
+    test "a wedged predecessor Session is replaced within the commit budget (expert review 2026-10-13 #34)",
+         ctx do
+      %{id: id, root: root} = ctx
+      Application.put_env(:fathom, :replication_timeout_ms, 4_000)
+      on_exit(fn -> Application.delete_env(:fathom, :replication_timeout_ms) end)
+
+      followers = start_followers!(root, 3)
+
+      Application.put_env(:fathom, :replication_enabled, true)
+      Application.put_env(:fathom, :replication_quorum, 2)
+
+      Application.put_env(
+        :fathom,
+        :replication_followers,
+        for({_n, p} <- followers, do: {~c"127.0.0.1", p})
+      )
+
+      start_supervised!(Fleet)
+
+      {:ok, coordinator, ref, path} = Shards.checkout(id)
+      on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+      {:ok, conn} = Connection.open(path)
+      on_exit(fn -> Connection.close(conn) end)
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
+      for {n, _} <- followers, do: preseed_current!(n, id, coordinator)
+
+      # A registered "Session" of ANOTHER coordinator that never answers system messages, so
+      # `GenServer.stop/3` can only time out.
+      me = self()
+
+      wedged =
+        spawn(fn ->
+          {:ok, _} =
+            Registry.register(
+              Fathom.Shard.Replication.SessionRegistry,
+              id,
+              :some_other_coordinator
+            )
+
+          send(me, :wedged_registered)
+
+          receive do
+            :never -> :ok
+          end
+        end)
+
+      on_exit(fn -> Process.exit(wedged, :kill) end)
+      assert_receive :wedged_registered, 2_000
+
+      task = Task.async(fn -> Session.commit(id, path <> "-wal", coordinator) end)
+
+      assert {:ok, result} = Task.yield(task, 3_500) || Task.shutdown(task, :brutal_kill),
+             "commit/3 was still replacing a wedged predecessor Session after 3.5 s"
+
+      assert result == :ok or match?({:error, _}, result)
+      refute Process.alive?(wedged), "the wedged predecessor was not killed"
     end
 
     test "a stopped session does not leave a seed streaming for a shard it no longer owns", ctx do

@@ -117,12 +117,17 @@ defmodule Fathom.Shard.Heartbeat do
   @status_table __MODULE__.Status
   @last_deadline_key {__MODULE__, :last_deadline_ref}
   @no_deadline -9_223_372_036_854_775_808
+  # A CLEAN stop is not "never published" (expert review 2026-10-13 #18): `terminate/2` has already
+  # cleared this node's heartbeat object, so its keyspace is stealable at once and a reader that
+  # finds the process down must refuse, not ack.
+  @stopped -9_223_372_036_854_775_807
 
   @doc """
-  The last renewal deadline (monotonic ms) this node's heartbeat ever published, or `nil`. Read-only;
-  outlives a crashed Heartbeat process, cleared on a clean stop.
+  The last renewal deadline (monotonic ms) this node's heartbeat ever published, `:stopped` after a
+  clean stop (the heartbeat object is cleared, so the keyspace is stealable), or `nil` if it never
+  published. Read-only; outlives a crashed Heartbeat process.
   """
-  @spec last_deadline_ms() :: integer() | nil
+  @spec last_deadline_ms() :: integer() | :stopped | nil
   def last_deadline_ms do
     case :persistent_term.get(@last_deadline_key, nil) do
       nil ->
@@ -131,6 +136,7 @@ defmodule Fathom.Shard.Heartbeat do
       ref ->
         case :atomics.get(ref, 1) do
           @no_deadline -> nil
+          @stopped -> :stopped
           ms -> ms
         end
     end
@@ -392,13 +398,13 @@ defmodule Fathom.Shard.Heartbeat do
     # Clean shutdown: drop our heartbeat so this node's shards are immediately
     # stealable (fast planned-failover) rather than waiting out the TTL.
     Storage.clear_heartbeat(state.owner)
-    :atomics.put(deadline_ref(), 1, @no_deadline)
+    :atomics.put(deadline_ref(), 1, @stopped)
     :ok
   end
 
   def terminate({:shutdown, _}, state) do
     Storage.clear_heartbeat(state.owner)
-    :atomics.put(deadline_ref(), 1, @no_deadline)
+    :atomics.put(deadline_ref(), 1, @stopped)
     :ok
   end
 

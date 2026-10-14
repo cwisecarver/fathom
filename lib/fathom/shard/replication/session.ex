@@ -88,6 +88,8 @@ defmodule Fathom.Shard.Replication.Session do
   # (or success). The margin covers that head-start + reply delivery; floored at half the timeout so
   # a large margin config can't gut a small timeout.
   @default_reply_margin_ms 100
+  # How long `ensure_started/3` waits for a stale predecessor to stop politely before killing it.
+  @stale_stop_ms 1_000
 
   # ------------------------------------------------------------------------------------------
   # api
@@ -156,18 +158,31 @@ defmodule Fathom.Shard.Replication.Session do
   # client's retry duplicated it. So a Session of a different (or dead) coordinator is stopped
   # SYNCHRONOUSLY and replaced. The Registry drops the entry on the Session's exit, a moment after
   # our DOWN, hence the bounded retry rather than assuming the slot is already free.
-  defp ensure_started(shard_id, coordinator, attempts \\ 100) do
+  #
+  # The WHOLE replacement is bounded by one deadline, `commit_deadline_budget/0` (expert review
+  # 2026-10-13 #34). It used to be up to 100 retries of a 5 s stop plus a 5 s DOWN wait, outside the
+  # caller's call timeout, so a predecessor wedged in a long call blocked a tenant commit for
+  # minutes. A predecessor that ignores a polite stop is KILLED: it belongs to a coordinator that is
+  # gone or replaced, so there is nothing in it worth protecting. Past the deadline the commit fails
+  # retryably with `{:error, :stale_session}`.
+  defp ensure_started(shard_id, coordinator) do
+    deadline = System.monotonic_time(:millisecond) + commit_deadline_budget()
+    ensure_started(shard_id, coordinator, deadline)
+  end
+
+  defp ensure_started(shard_id, coordinator, deadline) do
     case Registry.lookup(@registry, shard_id) do
       [{pid, ^coordinator}] ->
         {:ok, pid}
 
-      [{pid, _other}] when attempts > 0 ->
-        stop_and_wait(pid)
-        Process.sleep(1)
-        ensure_started(shard_id, coordinator, attempts - 1)
-
-      [{_pid, _other}] ->
-        {:error, :stale_session}
+      [{pid, _other}] ->
+        if System.monotonic_time(:millisecond) < deadline do
+          stop_and_wait(pid, deadline)
+          Process.sleep(1)
+          ensure_started(shard_id, coordinator, deadline)
+        else
+          {:error, :stale_session}
+        end
 
       [] ->
         case DynamicSupervisor.start_child(
@@ -177,8 +192,10 @@ defmodule Fathom.Shard.Replication.Session do
           {:ok, pid} ->
             {:ok, pid}
 
-          {:error, {:already_started, _pid}} when attempts > 0 ->
-            ensure_started(shard_id, coordinator, attempts - 1)
+          {:error, {:already_started, _pid}} ->
+            if System.monotonic_time(:millisecond) < deadline,
+              do: ensure_started(shard_id, coordinator, deadline),
+              else: {:error, :stale_session}
 
           {:error, reason} ->
             {:error, reason}
@@ -186,19 +203,22 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
-  defp stop_and_wait(pid) do
+  # A polite stop first (capped well inside the deadline), then a kill. The DOWN of a killed process
+  # is prompt, but the wait is still capped by the deadline so this cannot overrun it.
+  defp stop_and_wait(pid, deadline) do
     ref = Process.monitor(pid)
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
 
     try do
-      GenServer.stop(pid, :normal, 5_000)
+      GenServer.stop(pid, :normal, min(remaining, @stale_stop_ms))
     catch
-      :exit, _ -> :ok
+      :exit, _ -> Process.exit(pid, :kill)
     end
 
     receive do
       {:DOWN, ^ref, :process, ^pid, _} -> :ok
     after
-      5_000 -> Process.demonitor(ref, [:flush])
+      max(deadline - System.monotonic_time(:millisecond), 0) -> Process.demonitor(ref, [:flush])
     end
   end
 
@@ -421,8 +441,8 @@ defmodule Fathom.Shard.Replication.Session do
   #     held and a push in flight when it started describes a position that no longer exists.
   #     Letting that reply land afterwards would overwrite the seed with a stale position.
   @impl true
-  def handle_info({:seeded, shipper, result}, state) do
-    {:noreply, apply_seed_result(state, shipper, result)}
+  def handle_info({:seeded, shipper, token, result}, state) do
+    {:noreply, apply_seed_result(state, shipper, token, result)}
   end
 
   # A follower's reply that arrives while the session is IDLE — which is where almost all of them
@@ -519,20 +539,8 @@ defmodule Fathom.Shard.Replication.Session do
   #
   # `:normal` is the ordinary end of a task that already sent its result and whose entry is
   # therefore gone, so this clause only ever finds something on the failure path.
-  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
-    case Enum.find(state.seeding, fn {_shipper, e} -> e.ref == ref end) do
-      nil ->
-        {:noreply, state}
-
-      {shipper, _entry} ->
-        Logger.warning(
-          "replication seed task for #{state.shard_id} died without answering " <>
-            "(#{inspect(reason)}); the follower may ask again"
-        )
-
-        {:noreply, %{state | seeding: forget_seed(state.seeding, shipper)}}
-    end
-  end
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state),
+    do: {:noreply, apply_seed_down(state, ref, reason)}
 
   def handle_info(_, state), do: {:noreply, state}
 
@@ -713,13 +721,23 @@ defmodule Fathom.Shard.Replication.Session do
   # refused (expert review 2026-10-12 #23). The coordinator's flush fence degrades to the legacy
   # renew PUT, but that proves ownership only on flush ticks, not per commit. No recorded deadline
   # (never published) keeps the old `:ok`.
+  #
+  # Same verdict as the live check (expert review 2026-10-13 #18): refuse at `now + margin >=
+  # deadline` (the live check's inequality, margin from `Heartbeat.margin_ms/0`, which falls back to
+  # the configured value when the process is down), and refuse after a CLEAN stop (`:stopped`), which
+  # has already cleared the heartbeat object so the node's keyspace is stealable.
   defp heartbeat_ok(gen) do
     Fathom.Shard.Heartbeat.valid_for_write?(gen)
   catch
     :exit, _ ->
       case Fathom.Shard.Heartbeat.last_deadline_ms() do
+        :stopped ->
+          :not_valid
+
         deadline when is_integer(deadline) ->
-          if System.monotonic_time(:millisecond) > deadline, do: :not_valid, else: :ok
+          if System.monotonic_time(:millisecond) + Fathom.Shard.Heartbeat.margin_ms() >= deadline,
+            do: :not_valid,
+            else: :ok
 
         nil ->
           :ok
@@ -1232,6 +1250,8 @@ defmodule Fathom.Shard.Replication.Session do
     if map_size(state.inflight) == 0 or free_followers(state) >= quorum() or remaining <= 0 do
       state
     else
+      refs = seed_refs(state)
+
       receive do
         {:repl_reply, from, {:ack, _shard, next}} ->
           state
@@ -1247,9 +1267,14 @@ defmodule Fathom.Shard.Replication.Session do
           |> start_seeds(wal_path, rejects)
           |> await_stragglers_if_short(wal_path, deadline)
 
-        {:seeded, shipper, result} ->
+        {:seeded, shipper, token, result} ->
           state
-          |> apply_seed_result(shipper, result)
+          |> apply_seed_result(shipper, token, result)
+          |> await_stragglers_if_short(wal_path, deadline)
+
+        {:DOWN, ref, :process, _pid, reason} when is_map_key(refs, ref) ->
+          state
+          |> apply_seed_down(ref, reason)
           |> await_stragglers_if_short(wal_path, deadline)
       after
         remaining -> state
@@ -1312,6 +1337,8 @@ defmodule Fathom.Shard.Replication.Session do
       if remaining <= 0 do
         state
       else
+        refs = seed_refs(state)
+
         receive do
           {:repl_reply, from, {:ack, _shard, next}} ->
             state
@@ -1329,9 +1356,14 @@ defmodule Fathom.Shard.Replication.Session do
             |> start_seeds(wal_path, rejects)
             |> settle_inflight(wal_path, deadline)
 
-          {:seeded, shipper, result} ->
+          {:seeded, shipper, token, result} ->
             state
-            |> apply_seed_result(shipper, result)
+            |> apply_seed_result(shipper, token, result)
+            |> settle_inflight(wal_path, deadline)
+
+          {:DOWN, ref, :process, _pid, reason} when is_map_key(refs, ref) ->
+            state
+            |> apply_seed_down(ref, reason)
             |> settle_inflight(wal_path, deadline)
         after
           remaining -> state
@@ -1378,10 +1410,20 @@ defmodule Fathom.Shard.Replication.Session do
       if remaining <= 0 do
         {:timeout, state}
       else
+        refs = seed_refs(state)
+
         receive do
-          {:seeded, shipper, result} ->
+          {:seeded, shipper, token, result} ->
             state
-            |> apply_seed_result(shipper, result)
+            |> apply_seed_result(shipper, token, result)
+            |> await_seeds(deadline, wal_path)
+
+          # A seed task that died WITHOUT answering (expert review 2026-10-13 #12). Only
+          # `handle_info/2` used to consume its DOWN, which cannot run inside this call, so the
+          # entry stayed in `seeding` and this loop ran to the commit deadline.
+          {:DOWN, ref, :process, _pid, reason} when is_map_key(refs, ref) ->
+            state
+            |> apply_seed_down(ref, reason)
             |> await_seeds(deadline, wal_path)
 
           {:repl_reply, from, {:ack, _shard, next}} ->
@@ -1443,7 +1485,23 @@ defmodule Fathom.Shard.Replication.Session do
   # The bookkeeping `handle_info({:seeded, ...})` does, factored out so the in-call wait applies a
   # seed result identically. Divergence between the two would be invisible until a seed happened to
   # land on the path with the older logic.
-  defp apply_seed_result(state, shipper, result) do
+  #
+  # A result carries the TOKEN of the seed that produced it (expert review 2026-10-13 #35). One
+  # already in the mailbox when `expire_seeds/1` killed its task and a replacement started would
+  # otherwise be applied to the REPLACEMENT's entry (`forget_seed/2` is keyed by shipper only),
+  # untracking a live seed and recording a position the replacement is about to overwrite. A result
+  # whose token is not the current entry's is dropped.
+  defp apply_seed_result(state, shipper, token, result) do
+    case state.seeding do
+      %{^shipper => %{token: ^token}} ->
+        apply_current_seed_result(state, shipper, result)
+
+      _ ->
+        state
+    end
+  end
+
+  defp apply_current_seed_result(state, shipper, result) do
     state = %{state | seeding: forget_seed(state.seeding, shipper)}
 
     case result do
@@ -1487,17 +1545,26 @@ defmodule Fathom.Shard.Replication.Session do
       # take down the Session, which holds the shard's serialization point. The `terminate/2`
       # sweep below is what covers the other half the finding asked for (a stopped Session must
       # not leave a task streaming a whole tenant database for a shard this node no longer owns).
+      token = make_ref()
+
       {pid, ref} =
         spawn_monitor(fn ->
           send(
             session,
-            {:seeded, shipper,
+            {:seeded, shipper, token,
              gated_seed(shipper, acc.shard_id, db_path, wal_path, acc.epoch, acc.lineage)}
           )
         end)
 
       watch_session(session, pid)
-      entry = %{ref: ref, pid: pid, started_at: System.monotonic_time(:millisecond)}
+
+      entry = %{
+        ref: ref,
+        token: token,
+        pid: pid,
+        started_at: System.monotonic_time(:millisecond)
+      }
+
       %{acc | seeding: Map.put(acc.seeding, shipper, entry)}
     end)
   end
@@ -1518,6 +1585,28 @@ defmodule Fathom.Shard.Replication.Session do
         {:DOWN, ^task_ref, :process, _, _} -> :ok
       end
     end)
+  end
+
+  # Monitor refs of the seeds in flight, as a map so a `receive` guard can test membership
+  # (`is_map_key/2`): the in-call loops must consume ONLY a seed task's DOWN, never the
+  # coordinator's, which `handle_info/2` needs in order to stop the Session.
+  defp seed_refs(state), do: Map.new(state.seeding, fn {_shipper, e} -> {e.ref, true} end)
+
+  # A seed task died without answering (expert review 2026-08-20 #26): forget its entry so the
+  # follower can be seeded again. Shared by `handle_info/2` and the in-call receive loops.
+  defp apply_seed_down(state, ref, reason) do
+    case Enum.find(state.seeding, fn {_shipper, e} -> e.ref == ref end) do
+      nil ->
+        state
+
+      {shipper, _entry} ->
+        Logger.warning(
+          "replication seed task for #{state.shard_id} died without answering " <>
+            "(#{inspect(reason)}); the follower may ask again"
+        )
+
+        %{state | seeding: forget_seed(state.seeding, shipper)}
+    end
   end
 
   # Drop one shipper's entry and stop watching its task. `demonitor(flush: true)` removes any DOWN
