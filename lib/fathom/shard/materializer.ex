@@ -117,7 +117,7 @@ defmodule Fathom.Shard.Materializer do
   end
 
   def await_pull(task, path, _shard_id) do
-    case Task.yield(task, @pull_timeout) || Task.shutdown(task) do
+    case Task.yield(task, @pull_timeout) || kill_pull(task) do
       {:ok, {:ok, etag}} ->
         promote_pull(path, etag)
 
@@ -229,9 +229,30 @@ defmodule Fathom.Shard.Materializer do
   def abandon_pull(nil, _path), do: :ok
 
   def abandon_pull(task, path) do
-    Task.shutdown(task, :brutal_kill)
+    kill_pull(task)
     rm_pull_temp(path)
     :ok
+  end
+
+  # Kill a pull task AND remove the streaming download temp it was writing (rig 2026-10-14 N4).
+  # `Storage.S3`'s `download` streams to `<temp>.dl.<n>` and removes it in a try/after, but a
+  # brutal kill (and the `:shutdown` exit of `Task.shutdown/1`, since the task does not trap exits)
+  # skips the `after`, so every abandoned pull stranded a shard-sized `<shard>.db.pull.dl.*`: 7-14
+  # per tenant while clients retried against a held lease, 14 GB -> 7.5 GB of free disk over 100
+  # tenants. The task's process dictionary names the temp (`{_backend, :dl_fd, tmp}`, set the
+  # moment the file is created), so read it BEFORE the kill and remove the file after. Only the
+  # abandon path pays for this; a pull that completes never reaches it. A temp created by a
+  # transient-retry attempt between the read and the kill is left to `Fathom.Shard.TempReaper`.
+  defp kill_pull(%Task{pid: pid} = task) do
+    tmps =
+      case Process.info(pid, :dictionary) do
+        {:dictionary, dict} -> for {{_, :dl_fd, tmp}, _} <- dict, is_binary(tmp), do: tmp
+        nil -> []
+      end
+
+    result = Task.shutdown(task, :brutal_kill)
+    Enum.each(tmps, &File.rm/1)
+    result
   end
 
   defp rm_pull_temp(path), do: Enum.each(["", "-wal", "-shm"], &File.rm(pull_temp(path) <> &1))

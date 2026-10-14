@@ -623,9 +623,21 @@ defmodule Fathom.Shard do
         not Fork.resolve(await_fork_evidence(fork_task, shard_id, path), shard_id, path, lease)
 
     pull_task = pull_task || if warm?, do: nil, else: Materializer.start_pull(shard_id, path)
-    result = open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen)
-    maybe_emit_cold_open(result, shard_id, warm?, open_started)
-    result
+
+    # An exception/exit before `await_pull` consumed the task (rig 2026-10-14 N4) must not strand
+    # the in-flight pull: it is linked, so it dies with this coordinator, but the kill skips the
+    # download's `after` and leaves `<shard>.db.pull.dl.*` on disk. Abandoning an already-awaited
+    # task is a no-op, so this costs nothing on the normal path (a try frame only).
+    try do
+      result = open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen)
+      maybe_emit_cold_open(result, shard_id, warm?, open_started)
+      result
+    catch
+      kind, reason ->
+        stacktrace = __STACKTRACE__
+        Materializer.abandon_pull(pull_task, path)
+        :erlang.raise(kind, reason, stacktrace)
+    end
   end
 
   # The lock is ours and the open died before the coordinator could ever hold it in state. Give it
