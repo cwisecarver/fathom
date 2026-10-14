@@ -555,13 +555,24 @@ defmodule Fathom.Shard.Storage.S3 do
         # checksum mismatch, and on an idle drop or drain the local copy was deleted on the PUT's
         # success. zstd decodes several times faster than it encodes, so this costs a fraction of the
         # compress it guards.
-        with {:ok, plain_hex} <- file_md5_hex(local_path),
-             :ok <- between_hash_and_compress(local_path),
-             {:ok, tmp} <- Codec.compress_to_temp(local_path, encoding) do
+        #
+        # ONE READ OF THE PLAINTEXT (perf review 2026-10-14 #6). `compress_to_temp_hashed/2` hashes
+        # the plaintext as it feeds the compressor and the body as it writes it, so the old
+        # hash-read and the body re-hash are gone. What the old hash-then-compress gap (the
+        # `between_hash_and_compress` seam) caught was a file that changed between two reads; with
+        # one read the label cannot disagree with the body that way, so that check is replaced by
+        # stat-before/stat-after around the single read (the `stat_and_md5/1` guard, which also
+        # catches a torn read the old two-read compare would have caught only by luck of timing).
+        # `verify_decodes_to` stays: it still proves the body decodes to the labelled hash.
+        with {:ok, %{size: psize, mtime: pmtime}} <- File.stat(local_path),
+             {:ok, tmp, size, md5, plain_hex} <-
+               Codec.compress_to_temp_hashed(local_path, encoding) do
           try do
-            with :ok <- Codec.verify_decodes_to(tmp, encoding, plain_hex),
-                 {:ok, size, md5, _} <- stat_and_md5(tmp) do
-              fun.(tmp, size, md5, plain_hex, Codec.upload_headers(encoding))
+            with :ok <- after_compress(local_path),
+                 :ok <- source_unchanged(local_path, psize, pmtime),
+                 :ok <- check_single_put(size),
+                 :ok <- Codec.verify_decodes_to(tmp, encoding, plain_hex) do
+              fun.(tmp, size, Base.encode64(md5), plain_hex, Codec.upload_headers(encoding))
             end
           after
             File.rm(tmp)
@@ -570,27 +581,27 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
-  # Test seam for the gap between the two reads of a compressed upload (expert review 2026-10-08
-  # #15): a test sets `:s3_between_hash_and_compress_hook` to change the file there, the race the
-  # decode check exists to catch. Unset in every real config — one env read per compressed flush.
-  defp between_hash_and_compress(path) do
-    case Application.get_env(:fathom, :s3_between_hash_and_compress_hook) do
+  # Test seam: runs after the single compress read, before the source-changed check (the race the
+  # check exists to catch). Unset in every real config — one env read per compressed flush.
+  defp after_compress(path) do
+    case Application.get_env(:fathom, :s3_after_compress_hook) do
       nil -> :ok
       hook -> hook.(path)
     end
   end
 
-  # The file's MD5 in hex, with no size ceiling applied (see with_body/2).
-  defp file_md5_hex(path) do
-    digest =
-      path
-      |> File.stream!(@stream_chunk)
-      |> Enum.reduce(:crypto.hash_init(:md5), &:crypto.hash_update(&2, &1))
-      |> :crypto.hash_final()
+  defp source_unchanged(path, size, mtime) do
+    case File.stat(path) do
+      {:ok, %{size: ^size, mtime: ^mtime}} -> :ok
+      {:ok, _changed} -> {:error, {:source_changed_during_upload, path}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
-    {:ok, Base.encode16(digest, case: :lower)}
-  rescue
-    e in File.Error -> {:error, e.reason}
+  defp check_single_put(size) do
+    if size > Application.get_env(:fathom, :s3_max_single_put, @max_single_put),
+      do: {:error, {:object_too_large, size}},
+      else: :ok
   end
 
   # Steal-time data-object etag invalidation (expert review #3, fixed for real

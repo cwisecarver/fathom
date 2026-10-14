@@ -87,26 +87,56 @@ defmodule Fathom.Shard.Storage.Codec do
 
   @doc """
   Compresses `path` with `encoding` (`:zlib` or `:zstd`) to a sibling temp file, returning
-  `{:ok, tmp_path}`.
+  `{:ok, tmp_path}`. See `compress_to_temp_hashed/2` for the single-pass variant that also
+  returns the digests and size.
+  """
+  @spec compress_to_temp(Path.t(), :zlib | :zstd) :: {:ok, Path.t()} | {:error, term()}
+  def compress_to_temp(path, encoding) do
+    with {:ok, tmp, _size, _body_md5, _plain_hex} <- compress_to_temp_hashed(path, encoding),
+         do: {:ok, tmp}
+  end
+
+  @doc """
+  `compress_to_temp/2` that hashes in the same pass (perf review 2026-10-14 #6).
+
+  Returns `{:ok, tmp_path, body_size, body_md5, plain_md5_hex}`: the size and raw MD5 digest of the
+  compressed file as written (what `content-md5` covers), and the lowercase-hex MD5 of the
+  plaintext chunks exactly as they were fed to the compressor (what `x-amz-meta-fathom-md5`
+  covers). The plaintext is read ONCE and the compressed body is never re-read to hash it; the
+  plaintext hash is of the very bytes compressed, so it cannot disagree with the body because the
+  file changed between a hashing read and a compressing read.
 
   Streamed both ways: a shard object is up to gigabytes and must never be materialized whole in
   the BEAM.
   """
-  @spec compress_to_temp(Path.t(), :zlib | :zstd) :: {:ok, Path.t()} | {:error, term()}
-  def compress_to_temp(path, encoding) do
+  @spec compress_to_temp_hashed(Path.t(), :zlib | :zstd) ::
+          {:ok, Path.t(), non_neg_integer(), binary(), String.t()} | {:error, term()}
+  def compress_to_temp_hashed(path, encoding) do
     tmp = "#{path}.z.#{System.unique_integer([:positive])}"
     ctx = compressor(encoding)
 
     try do
       File.open!(tmp, [:write, :raw, :binary], fn out ->
-        path
-        |> File.stream!(@chunk)
-        |> Enum.each(fn chunk -> :ok = IO.binwrite(out, compress_chunk(ctx, chunk)) end)
+        write = fn piece, {size, md5} ->
+          :ok = IO.binwrite(out, piece)
+          {size + IO.iodata_length(piece), :crypto.hash_update(md5, piece)}
+        end
 
-        :ok = IO.binwrite(out, compress_finish(ctx))
+        {plain, body} =
+          Enum.reduce(
+            File.stream!(path, @chunk),
+            {:crypto.hash_init(:md5), {0, :crypto.hash_init(:md5)}},
+            fn chunk, {plain, body} ->
+              {:crypto.hash_update(plain, chunk), write.(compress_chunk(ctx, chunk), body)}
+            end
+          )
+
+        {size, body_md5} = write.(compress_finish(ctx), body)
+
+        {size, :crypto.hash_final(body_md5),
+         Base.encode16(:crypto.hash_final(plain), case: :lower)}
       end)
-
-      {:ok, tmp}
+      |> then(fn {size, body_md5, plain_hex} -> {:ok, tmp, size, body_md5, plain_hex} end)
     rescue
       e ->
         File.rm(tmp)

@@ -71,12 +71,95 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
     assert header == wire_md5
   end
 
-  # Expert review 2026-10-08 #15: a compressed upload hashes the file in one read and compresses it
-  # in a second, and nothing tied the uploaded body to the hash it is labelled with. A file that
-  # changed between the reads (or a codec defect) became an object every pull refuses — and on an
-  # idle drop the local copy was deleted on the PUT's success. The body must now be proved to
-  # decode to that hash before anything is PUT.
-  test "a compressed body that does not decode to its labelled hash is never PUT", %{dir: dir} do
+  # Perf review 2026-10-14 #6: a compressed flush read the plaintext twice (once to MD5 it, once to
+  # compress it) and the compressed body once more just to MD5 it. The plaintext is now opened
+  # exactly once, and the label (x-amz-meta-fathom-md5) is still the hash of the UNCOMPRESSED file.
+  test "a compressed flush opens the plaintext once and labels it with the plaintext MD5", %{
+    dir: dir
+  } do
+    test_pid = self()
+
+    put_s3_config(fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      send(
+        test_pid,
+        {:put, Plug.Conn.get_req_header(conn, "x-amz-meta-fathom-md5"),
+         Plug.Conn.get_req_header(conn, "content-md5"), body}
+      )
+
+      conn |> Plug.Conn.put_resp_header("etag", md5_etag(body)) |> Plug.Conn.send_resp(200, "")
+    end)
+
+    prev = Application.get_env(:fathom, :shard_object_encoding)
+    Application.put_env(:fathom, :shard_object_encoding, :zstd)
+
+    on_exit(fn ->
+      if prev,
+        do: Application.put_env(:fathom, :shard_object_encoding, prev),
+        else: Application.delete_env(:fathom, :shard_object_encoding)
+    end)
+
+    local = Path.join(dir, "s.db")
+    plain = String.duplicate("row-data-0123456789 ", 50_000)
+    File.write!(local, plain)
+
+    # A process cannot be traced with itself as tracer, so a helper collects the :file.open calls.
+    test_pid = self()
+
+    tracer =
+      spawn(fn ->
+        loop = fn loop ->
+          receive do
+            {:trace, _, :call, {:file, :open, [p, _]}} -> send(test_pid, {:opened, p})
+            :stop -> send(test_pid, :tracer_done)
+            _ -> :ok
+          end
+
+          loop.(loop)
+        end
+
+        loop.(loop)
+      end)
+
+    Code.ensure_loaded(:file)
+    :erlang.trace_pattern({:file, :open, 2}, true, [:local])
+    :erlang.trace(self(), true, [:call, {:tracer, tracer}])
+    assert {:ok, _, _} = S3.flush("s", local, nil)
+    :erlang.trace(self(), false, [:call])
+    :erlang.trace_pattern({:file, :open, 2}, false, [:local])
+    # Trace delivery is asynchronous; trace_delivered/1 waits until every trace message is out.
+    ref = :erlang.trace_delivered(self())
+    assert_receive {:trace_delivered, _, ^ref}
+    send(tracer, :stop)
+    assert_receive :tracer_done
+    opens = collect_opens([], local)
+    assert length(opens) == 1, "plaintext opened #{length(opens)} times, expected 1"
+
+    assert_received {:put, [meta_md5], [content_md5], body}
+    assert meta_md5 == Base.encode16(:crypto.hash(:md5, plain), case: :lower)
+    assert content_md5 == Base.encode64(:crypto.hash(:md5, body))
+    assert :zstd.decompress(body) |> IO.iodata_to_binary() == plain
+  end
+
+  defp collect_opens(acc, path) do
+    receive do
+      {:opened, p} ->
+        collect_opens(if(IO.chardata_to_string(p) == path, do: [p | acc], else: acc), path)
+    after
+      0 -> acc
+    end
+  end
+
+  # Expert review 2026-10-08 #15: a compressed upload whose source changed under it (or a codec
+  # defect) became an object every pull refuses — and on an idle drop the local copy was deleted on
+  # the PUT's success. Perf review 2026-10-14 #6 made the hash and the compress ONE read, so the
+  # old hash-then-compress gap is gone; the same guarantee ("never PUT a body that does not match
+  # its label") now rests on the stat-before/stat-after check around that single read, with
+  # `verify_decodes_to` still proving the body decodes to the labelled hash. This test used to
+  # change the file BETWEEN the two reads (`:s3_after_compress_hook`, removed); it now
+  # changes it right after the single read, which is the race that remains.
+  test "a compressed upload whose source changed during the read is never PUT", %{dir: dir} do
     test_pid = self()
 
     put_s3_config(fn conn ->
@@ -87,12 +170,12 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
     prev = Application.get_env(:fathom, :shard_object_encoding)
     Application.put_env(:fathom, :shard_object_encoding, :zstd)
 
-    Application.put_env(:fathom, :s3_between_hash_and_compress_hook, fn path ->
+    Application.put_env(:fathom, :s3_after_compress_hook, fn path ->
       File.write!(path, "the file changed after it was hashed")
     end)
 
     on_exit(fn ->
-      Application.delete_env(:fathom, :s3_between_hash_and_compress_hook)
+      Application.delete_env(:fathom, :s3_after_compress_hook)
 
       if prev,
         do: Application.put_env(:fathom, :shard_object_encoding, prev),
@@ -102,7 +185,7 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
     local = Path.join(dir, "s.db")
     File.write!(local, @good)
 
-    assert {:error, {:compressed_body_mismatch, _}} = S3.flush("s", local, nil)
+    assert {:error, {:source_changed_during_upload, ^local}} = S3.flush("s", local, nil)
 
     refute_received {:put, "PUT"},
                     "a body labelled with a hash it does not decode to was uploaded"
