@@ -96,9 +96,15 @@ defmodule Fathom.Shards.Lru do
         [{^shard_id, prev}] when stamp - prev < @stamp_granularity ->
           :ok
 
+        # A BUSY shard has no order key by design (see `record_conns/2`); its release re-inserts
+        # one. Re-keying it here would put it straight back in front of the eviction walk.
         [{^shard_id, prev}] ->
-          :ets.delete(@order_table, {prev, shard_id})
-          write_stamp(shard_id, stamp)
+          unless busy?(shard_id) do
+            :ets.delete(@order_table, {prev, shard_id})
+            write_stamp(shard_id, stamp)
+          end
+
+          :ok
 
         _ ->
           write_stamp(shard_id, stamp)
@@ -120,12 +126,38 @@ defmodule Fathom.Shards.Lru do
 
   @doc """
   Publish `shard_id`'s current checked-out-connection count (the coordinator's `map_size(conns)`,
-  set on each grant/release) so `lru_order/1` can skip busy shards (#14). A best-effort hint;
+  published on the 0 <-> 1 edges) so `lru_order/1` can skip busy shards (#14). A best-effort hint;
   skipped when eviction can't fire.
+
+  A BUSY shard is taken OUT of the order table (expert review 2026-10-13 #29): long-lived
+  streams never re-touch, so they sank to the cold end, and every at-capacity admission walked past
+  all of them (an ETS next + 3 lookups each, uncharged against the probe limit). With no key they
+  cost the walk nothing. The release edge (`count == 0`) re-inserts the shard with the RELEASE
+  stamp, which is more correct LRU recency than the checkout stamp. A rotating cursor was
+  rejected: it can starve idle shards that sit behind it.
   """
   @spec record_conns(String.t(), non_neg_integer()) :: :ok
   def record_conns(shard_id, count) do
-    if enabled?(), do: :ets.insert(@busy_table, {shard_id, count})
+    if enabled?() do
+      :ets.insert(@busy_table, {shard_id, count})
+
+      if count > 0 do
+        case :ets.lookup(@table, shard_id) do
+          [{^shard_id, stamp}] -> :ets.delete(@order_table, {stamp, shard_id})
+          _ -> :ok
+        end
+      else
+        stamp = System.monotonic_time()
+
+        case :ets.lookup(@table, shard_id) do
+          [{^shard_id, prev}] -> :ets.delete(@order_table, {prev, shard_id})
+          _ -> :ok
+        end
+
+        write_stamp(shard_id, stamp)
+      end
+    end
+
     :ok
   rescue
     ArgumentError -> :ok
@@ -201,8 +233,11 @@ defmodule Fathom.Shards.Lru do
             forget(id)
             collect_idle(next, limit, acc, live?)
 
-          # Busy keeps its key: still valid recency.
+          # Busy shards normally have no key (`record_conns/2` removes it); one can appear via the
+          # 0 -> 1 race with a concurrent `touch/1`. Drop it (the release edge re-inserts) so each
+          # such key is visited at most once.
           busy?(id) ->
+            :ets.delete(@order_table, key)
             collect_idle(next, limit, acc, live?)
 
           true ->

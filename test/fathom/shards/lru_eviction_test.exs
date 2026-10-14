@@ -319,6 +319,48 @@ defmodule Fathom.Shards.LruEvictionTest do
       assert Lru.lru_order(2, all_live()) == ["idle"]
       assert Lru.lru_order(100, all_live()) == ["idle"]
     end
+
+    # Expert review 2026-10-13 #29: busy shards skipped by the walk were not charged against the
+    # limit, so every at-capacity admission visited ALL of them (long-lived streams never re-touch
+    # and sink to the cold end). Busy shards must be out of the order table, so the walk's cost is
+    # independent of how many are busy. The counting predicate is called once per VISITED live-stamp
+    # entry; pre-fix it is called ~20_000 times.
+    test "the walk does not visit busy shards (#29)" do
+      Application.put_env(:fathom, :max_open_shards, 100_000)
+      Lru.reset()
+
+      for i <- 1..20_000 do
+        id = "busy#{i}"
+        Lru.touch(id)
+        Lru.record_conns(id, 1)
+      end
+
+      idle = for i <- 1..16, do: "idle#{i}"
+
+      for id <- idle do
+        Lru.touch(id)
+        Lru.record_conns(id, 0)
+      end
+
+      visits = :counters.new(1, [])
+
+      live? = fn _id ->
+        :counters.add(visits, 1, 1)
+        true
+      end
+
+      assert Lru.lru_order(16, live?) == idle
+      assert :counters.get(visits, 1) <= 300, "the walk visited busy shards"
+      assert :ets.info(Fathom.Shards.Lru.Order, :size) == 16
+
+      # Release re-inserts the shard at the RELEASE stamp: it is now the warmest candidate.
+      Lru.record_conns("busy1", 0)
+      assert List.last(Lru.lru_order(100, all_live())) == "busy1"
+
+      # A touch of a still-busy shard must not put it back in the order table.
+      Lru.touch("busy2")
+      refute "busy2" in Lru.lru_order(100, all_live())
+    end
   end
 
   # Expert review 2026-07-14 #7 (Reliability): at capacity, admission runs in the checkout
