@@ -1093,6 +1093,12 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     Fathom.Shard.checkin(pid, ref)
     :ok = Fathom.Directory.Recorder.record(shard)
 
+    # Expert review 2026-10-13 #39: the pre-flight no longer flushes the Recorder (the in-lease
+    # re-check does), so it sees only touches already in Postgres, which is every touch older than
+    # the Recorder's ~1 s buffer. Flush here to model that; a touch still inside the buffer is
+    # drained and then refused in-lease (the safe direction, pinned by the test below).
+    Fathom.Directory.Recorder.flush()
+
     assert {:error, {:writes_since_cutover, _}} = ShardMigration.revert(shard, 1)
 
     assert [{^pid, _}] = Registry.lookup(Fathom.ShardRegistry, shard),
@@ -1103,6 +1109,83 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert {:ok, %{from: 2, to: 1}} = ShardMigration.revert(shard, 1, "force-token", force: true)
     :ok = Fathom.Directory.Recorder.record(shard)
     assert :ok = ShardMigration.revert(shard, 1, "retry-token")
+  end
+
+  # Expert review 2026-10-13 #39. Symptom: `preflight_write_age` and `revert_under_lease` both went
+  # through `guard_inputs`, which flushes the Recorder, so every RevertJob did two synchronous
+  # Recorder flushes (a Postgres write over an unbounded buffer on a hot table). The in-lease
+  # re-check is authoritative, so the pre-flight reads the row as-is: an unforced revert flushes
+  # once, and a pre-flight-refused revert never flushes. Counted by tracing calls to
+  # `Recorder.flush/0` from the test process (the revert runs inline in it).
+  defp count_recorder_flushes(fun) do
+    test = self()
+
+    {:ok, _} =
+      :dbg.tracer(
+        :process,
+        {fn
+           {:trace, _pid, :call, {Fathom.Directory.Recorder, :flush, []}}, n ->
+             send(test, :recorder_flush)
+             n + 1
+
+           _msg, n ->
+             n
+         end, 0}
+      )
+
+    {:ok, _} = :dbg.p(self(), [:c])
+    {:ok, _} = :dbg.tpl(Fathom.Directory.Recorder, :flush, 0, [])
+
+    try do
+      result = fun.()
+      Process.sleep(100)
+      {result, count_flush_msgs(0)}
+    after
+      :dbg.stop()
+    end
+  end
+
+  defp count_flush_msgs(n) do
+    receive do
+      :recorder_flush -> count_flush_msgs(n + 1)
+    after
+      0 -> n
+    end
+  end
+
+  test "an unforced revert flushes the Recorder once", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, _} = ShardMigration.run(shard, 2)
+
+    assert {{:ok, %{from: 2, to: 1}}, 1} =
+             count_recorder_flushes(fn -> ShardMigration.revert(shard, 1) end)
+  end
+
+  test "a revert the pre-flight refuses never flushes the Recorder", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, _} = ShardMigration.run(shard, 2)
+
+    :ok = Fathom.Directory.Recorder.record(shard)
+    Fathom.Directory.Recorder.flush()
+
+    assert {{:error, {:writes_since_cutover, _}}, 0} =
+             count_recorder_flushes(fn -> ShardMigration.revert(shard, 1) end)
+  end
+
+  test "a touch still in the Recorder buffer is refused by the in-lease re-check", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+    {:ok, _} = ShardMigration.run(shard, 2)
+
+    # Not flushed: the pre-flight (no flush) under-refuses, the lease path flushes and refuses.
+    :ok = Fathom.Directory.Recorder.record(shard)
+
+    assert {{:error, {:writes_since_cutover, _}}, 1} =
+             count_recorder_flushes(fn -> ShardMigration.revert(shard, 1) end)
+
+    assert %{rows: [[2]]} = query_live!(shard, "PRAGMA user_version")
   end
 
   # Expert review 2026-10-12 #13 (sweep half): `revert_stranded/0` runs hourly and unforced; every

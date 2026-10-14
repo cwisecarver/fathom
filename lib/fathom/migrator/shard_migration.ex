@@ -1170,8 +1170,14 @@ defmodule Fathom.Migrator.ShardMigration do
   # finishes it, and that state needs a crash between restore and cutover.
   defp preflight_write_age(_shard_id, _to_version, true), do: :ok
 
+  # NO Recorder flush here (expert review 2026-10-13 #39): the pre-flight used to flush too, so every
+  # RevertJob flushed the Recorder (a synchronous Postgres write over an unbounded buffer) twice, once
+  # here and once in `revert_under_lease/4`. An unflushed touch can only make this read OLDER than the
+  # truth, i.e. it under-refuses, which is the documented safe direction: a stranded shard touched in
+  # the last ~1 s is drained and then refused by the in-lease re-check, which flushes and is
+  # authoritative. The pre-flight is an optimisation to refuse early, not the gate.
   defp preflight_write_age(shard_id, to_version, false) do
-    case guard_inputs(shard_id) do
+    case current_state(shard_id) do
       {^to_version, _, _} ->
         :ok
 
