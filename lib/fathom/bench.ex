@@ -104,6 +104,7 @@ defmodule Fathom.Bench do
     :hrana_open_rt,
     :hrana_oneshot,
     :hrana_pooled,
+    :hrana_pooled_pipeline,
     :wire_rows,
     :wire_encode,
     :flush,
@@ -201,6 +202,10 @@ defmodule Fathom.Bench do
       # is a pool HIT — the reuse path (`reset_for_reuse`, the temp-schema probe) no other metric
       # reaches (expert review 2026-10-01 perf #19/#24). Watch-only until its variance is measured.
       hrana_pooled_open_rt_us: run_if(only, :hrana_pooled, fn -> hrana_pooled_open_rt(opts) end),
+      # A SERIAL five-statement one-shot on a pooled handle (perf review 2026-10-14 #4/#10): pool
+      # hit through the drain grace AND statement-cache hits, both asserted. Watch-only.
+      hrana_pooled_pipeline_rt_us:
+        run_if(only, :hrana_pooled_pipeline, fn -> hrana_pooled_pipeline_rt_us(opts) end),
       wire_rows_per_s: run_if(only, :wire_rows, fn -> wire_rows(opts) end),
       # The OTHER encoder (#41.7). wire_rows_per_s drives encode_json/1; this drives encode/1,
       # the tagged-map builder Cursor and Protobuf reach, whose own moduledoc says the tagged-map
@@ -1099,6 +1104,123 @@ defmodule Fathom.Bench do
         else: Application.put_env(:fathom, :connection_pool, prev_pool)
     end
   end
+
+  @doc """
+  `hrana_pooled_pipeline_rt_us` — median round trip of a SERIAL one-shot stream running a
+  five-statement pipeline (`[execute x5, close]`), the shape of one ORM request on a pooled handle.
+
+  Perf review 2026-10-14 #4 and #10: with the pool drain grace a serial client's next stream is a
+  pool HIT, and with the statement-cache carry it adopts the previous stream's prepared statements,
+  so a steady-state sample prepares NOTHING. The metric asserts both preconditions: pool hits are the
+  norm (`[:fathom, :shard, :pool_take]`), and `Exqlite.Sqlite3.prepare/2` ran less than once per
+  sample during the timed loop (a global `:call_count` trace pattern, which needs no process trace
+  flags). Either failing raises: the metric would be measuring the fresh-open or re-prepare path.
+  Unlike `hrana_pooled_open_rt_us` there is NO background stream, so the hit depends on the grace.
+  The pool is forced on for this metric only. Watch-only.
+  """
+  @spec hrana_pooled_pipeline_rt_us(keyword()) :: float() | nil
+  def hrana_pooled_pipeline_rt_us(opts \\ []) do
+    samples = Keyword.get(opts, :hrana_rt_samples, @hrana_rt_samples)
+
+    stmts = [
+      "SELECT v FROM kv WHERE k = 1",
+      "SELECT count(*) FROM kv",
+      # READS ONLY, for the reason the seed below gives.
+      "SELECT k FROM kv WHERE v = 'b'",
+      "SELECT k, v FROM kv ORDER BY k LIMIT 5",
+      "SELECT max(k) FROM kv"
+    ]
+
+    requests =
+      Enum.map(stmts, &%{"type" => "execute", "stmt" => %{"sql" => &1, "args" => []}}) ++
+        [%{"type" => "close"}]
+
+    n_req = length(requests)
+    prev_pool = Application.get_env(:fathom, :connection_pool)
+    Application.put_env(:fathom, :connection_pool, true)
+    hits = :counters.new(2, [])
+    handler = "bench-pooled-pipeline-#{System.unique_integer([:positive])}"
+    prepare = {Exqlite.Sqlite3, :prepare, 2}
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shard, :pool_take],
+      fn _event, _m, %{result: result}, _ ->
+        :counters.add(hits, if(result == :hit, do: 1, else: 2), 1)
+      end,
+      nil
+    )
+
+    try do
+      with_wire(opts, "benchpipeline", fn client ->
+        # Seed through the shard's own file, as wire_rows does: no write crosses the wire (the
+        # prod-compiled bench has replication configured on but none of its processes started,
+        # so a wire write raises — first run, 2026-10-14).
+        path = Fathom.Shard.db_path("benchpipeline")
+        drop_db(path)
+        {:ok, db} = Exqlite.Sqlite3.open(path)
+
+        :ok =
+          Exqlite.Sqlite3.execute(
+            db,
+            "CREATE TABLE kv (k INTEGER, v TEXT); INSERT INTO kv VALUES (1, 'a'), (2, 'b')"
+          )
+
+        :ok = Exqlite.Sqlite3.close(db)
+        :ok = Fathom.Shard.stamp_local_provenance("benchpipeline")
+
+        # Warm: one pipeline prepares the five statements and leaves the handle pooled with them.
+        {:ok, warm, client} = Filo.Client.pipeline(%{client | baton: nil}, requests)
+        true = pipeline_ok?(warm, n_req)
+        :counters.put(hits, 1, 0)
+        :counters.put(hits, 2, 0)
+        :erlang.trace_pattern(prepare, true, [:call_count])
+
+        {_client, us} =
+          Enum.reduce(1..samples, {client, []}, fn _, {c, acc} ->
+            c = %{c | baton: nil}
+            {t, result} = :timer.tc(fn -> Filo.Client.pipeline(c, requests) end)
+            {:ok, results, c} = result
+            true = pipeline_ok?(results, n_req)
+            {c, [t | acc]}
+          end)
+
+        prepares =
+          case :erlang.trace_info(prepare, :call_count) do
+            {:call_count, n} when is_integer(n) -> n
+            _ -> 0
+          end
+
+        hit = :counters.get(hits, 1)
+
+        unless hit * 2 >= samples,
+          do:
+            raise(
+              "hrana_pooled_pipeline_rt_us got #{hit} pool hits in #{samples} samples " <>
+                "(#{:counters.get(hits, 2)} misses); the drain grace is not keeping the pool"
+            )
+
+        unless prepares < samples,
+          do:
+            raise(
+              "hrana_pooled_pipeline_rt_us prepared #{prepares} statements in #{samples} " <>
+                "samples; the statement cache is not travelling with the pooled handle"
+            )
+
+        p50(us)
+      end)
+    after
+      :erlang.trace_pattern(prepare, false, [:call_count])
+      :telemetry.detach(handler)
+
+      if is_nil(prev_pool),
+        do: Application.delete_env(:fathom, :connection_pool),
+        else: Application.put_env(:fathom, :connection_pool, prev_pool)
+    end
+  end
+
+  defp pipeline_ok?(results, n),
+    do: length(results) == n and Enum.all?(results, &match?(%{"type" => "ok"}, &1))
 
   @doc """
   `flush_p50_us` — median wall time of one real durability flush.

@@ -152,6 +152,9 @@ defmodule Fathom.Bench.Gate do
     # The pooled-REUSE round trip (expert review 2026-10-01 perf #24). Watch-only until its band is
     # measured, same rule as above.
     {:hrana_pooled_open_rt_us, :higher_worse, :watch},
+    # A serial five-statement pooled request: the drain-grace hit plus the statement-cache carry
+    # (perf review 2026-10-14 #4/#10). Watch-only until its band is measured, same rule as above.
+    {:hrana_pooled_pipeline_rt_us, :higher_worse, :watch},
     # THE TAIL, gated from 2026-08-03 (expert review #41.5). Every metric above is a p50, and
     # `delta/4` is a pure ratio — which AGENTS.md forbids in as many words ("Assert an absolute
     # floor, not only a ratio… The ratio holds while throughput collapses"). A change that leaves
