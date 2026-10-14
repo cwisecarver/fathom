@@ -91,6 +91,81 @@ defmodule Fathom.BootSecurityGuardsTest do
     end
   end
 
+  describe "#9 admin dashboard credentials (prod refuses blank, half-set and weak)" do
+    @admin_keys [:admin_auth, :admin_auth_blank_env, :admin_weak_credentials_ok]
+
+    setup do
+      prev = Map.new(@admin_keys, &{&1, Application.get_env(:fathom, &1)})
+
+      on_exit(fn ->
+        for {k, v} <- prev do
+          if is_nil(v),
+            do: Application.delete_env(:fathom, k),
+            else: Application.put_env(:fathom, k, v)
+        end
+      end)
+
+      Application.put_env(:fathom, :env, :prod)
+      Enum.each(@admin_keys, &Application.delete_env(:fathom, &1))
+      :ok
+    end
+
+    test "prod refuses a password under 16 bytes" do
+      Application.put_env(:fathom, :admin_auth, username: "admin", password: "admin")
+
+      assert_raise RuntimeError, ~r/under 16 bytes/, fn ->
+        Fathom.Application.check_admin_credentials!()
+      end
+    end
+
+    test "prod refuses a password equal to the username, even at 16+ bytes" do
+      user = "operator-account-1"
+      Application.put_env(:fathom, :admin_auth, username: user, password: user)
+
+      assert_raise RuntimeError, ~r/equal to the\s+username/, fn ->
+        Fathom.Application.check_admin_credentials!()
+      end
+    end
+
+    test "prod boots a 16-byte password that differs from the username" do
+      Application.put_env(:fathom, :admin_auth, username: "admin", password: "0123456789abcdef")
+      assert Fathom.Application.check_admin_credentials!() == nil
+    end
+
+    test "the weak-credentials opt-out boots a short password" do
+      Application.put_env(:fathom, :admin_auth, username: "admin", password: "admin")
+      Application.put_env(:fathom, :admin_weak_credentials_ok, true)
+      assert Fathom.Application.check_admin_credentials!() == nil
+    end
+
+    test "prod refuses a blank env value, and the opt-out does not cover it" do
+      Application.put_env(:fathom, :admin_auth_blank_env, true)
+      Application.put_env(:fathom, :admin_weak_credentials_ok, true)
+
+      assert_raise RuntimeError, ~r/blank value/, fn ->
+        Fathom.Application.check_admin_credentials!()
+      end
+    end
+
+    test "prod refuses a half-configured pair" do
+      Application.put_env(:fathom, :admin_auth, username: "admin", password: nil)
+
+      assert_raise RuntimeError, ~r/only one of ADMIN_USER and ADMIN_PASS/, fn ->
+        Fathom.Application.check_admin_credentials!()
+      end
+    end
+
+    test "both unset boots (the dashboard-off posture)" do
+      assert Fathom.Application.check_admin_credentials!() == nil
+    end
+
+    test "dev and test are never refused" do
+      Application.put_env(:fathom, :env, :dev)
+      Application.put_env(:fathom, :admin_auth, username: "admin", password: "admin")
+      assert Fathom.Application.check_admin_credentials!() == nil
+    end
+  end
+
   describe "#27 S3 session-token warning (prod only, warns, never refuses)" do
     test "a session token under S3 storage in prod logs the warning" do
       Application.put_env(:fathom, :env, :prod)

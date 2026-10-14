@@ -30,9 +30,10 @@ x-fathom-env: &fathom-env
   AWS_ACCESS_KEY_ID: fathom
   AWS_SECRET_ACCESS_KEY: fathom-secret
   SHARD_DATA_DIR: /data/shards
-  # Admin dashboard + control-plane API (/api/tenants) BasicAuth. CHANGE THE PASSWORD.
+  # Admin dashboard + control-plane API (/api/tenants) BasicAuth. CHANGE THE PASSWORD. Prod boot
+  # refuses a password under 16 bytes (expert review 2026-10-13 #9), so this default must stay 16+.
   ADMIN_USER: admin
-  ADMIN_PASS: admin
+  ADMIN_PASS: eval-stack-admin-pass
   # Prod boot refuses the shared throttle bucket unless TRUSTED_PROXIES is set (expert review
   # 2026-10-12 #12). This stack has no proxy in front of :4000, so the opt-out is correct here.
   ADMIN_THROTTLE_SHARED_BUCKET_OK: "true"

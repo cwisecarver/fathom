@@ -22,6 +22,17 @@ so the surface is never anonymously reachable; boot only *warns* (a missing dash
 must not take the data plane down). `GET /admin/metrics` (same auth) is the Prometheus scrape target;
 for a merged fleet view scrape every node.
 
+**Credential rules (expert review 2026-10-13 #9):**
+
+- A **blank** `ADMIN_USER` or `ADMIN_PASS` (empty or whitespace) is treated as **unset**: the surface
+  answers 503. It never authenticates `""` credentials (which would accept `:`).
+- **Prod boot refuses** (`Fathom.Application.check_admin_credentials!/0`) when either variable is
+  blank, when only one of the pair is set, or when the password is **under 16 bytes or equal to the
+  username**. Both unset is the intended "dashboard off" posture and boots with a warning.
+- The weak-password refusal is opt-out with `ADMIN_WEAK_CREDENTIALS_OK=true`. Blank and
+  half-configured values are never opted out of.
+- Generate a password with `mix phx.gen.secret` or `openssl rand -base64 24`.
+
 ## Gotchas
 
 ### `mix tailwind` / `mix assets.build` exits with 137 (SIGKILL) on macOS

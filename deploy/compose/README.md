@@ -30,7 +30,7 @@ Sanity-check the node:
 
 ```bash
 curl -sf http://localhost:8081/health   # -> ok    (health port, if you expose it)
-open http://localhost:4000/admin         # dashboard (BasicAuth admin/admin)
+open http://localhost:4000/admin         # dashboard (BasicAuth admin / eval-stack-admin-pass)
 ```
 
 ## 2. Provision a tenant
@@ -38,7 +38,7 @@ open http://localhost:4000/admin         # dashboard (BasicAuth admin/admin)
 Tenants are explicit — create one through the control-plane API (same BasicAuth as the dashboard):
 
 ```bash
-curl -su admin:admin -X POST http://localhost:4000/api/tenants \
+curl -su admin:eval-stack-admin-pass -X POST http://localhost:4000/api/tenants \
   -H 'content-type: application/json' \
   -d '{"shard_id": "acme"}'
 ```
@@ -63,9 +63,9 @@ for HTTP SDKs). `acme.localhost` resolves to `127.0.0.1` on modern OSes.
 List / inspect / delete:
 
 ```bash
-curl -su admin:admin http://localhost:4000/api/tenants
-curl -su admin:admin http://localhost:4000/api/tenants/acme
-curl -su admin:admin -X DELETE http://localhost:4000/api/tenants/acme
+curl -su admin:eval-stack-admin-pass http://localhost:4000/api/tenants
+curl -su admin:eval-stack-admin-pass http://localhost:4000/api/tenants/acme
+curl -su admin:eval-stack-admin-pass -X DELETE http://localhost:4000/api/tenants/acme
 ```
 
 ## 3. Query it

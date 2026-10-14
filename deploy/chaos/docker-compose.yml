@@ -206,7 +206,7 @@ x-fathom-env: &fathom-env
   HRANA_GC_EVERY_N: "${HRANA_GC_EVERY_N:-5}"
   PHX_SERVER: "1"
   ADMIN_USER: admin
-  ADMIN_PASS: admin
+  ADMIN_PASS: chaos-rig-admin-pass
   # Prod boot refuses the shared throttle bucket unless TRUSTED_PROXIES is set (expert review
   # 2026-10-12 #12). The rig has no proxy in front of :4000, so the opt-out is correct here.
   ADMIN_THROTTLE_SHARED_BUCKET_OK: "true"

@@ -1141,6 +1141,25 @@ end
 admin_user = System.get_env("ADMIN_USER")
 admin_pass = System.get_env("ADMIN_PASS")
 
+# A blank value is UNSET (expert review 2026-10-13 #9). `ADMIN_USER=` used to configure "" credentials,
+# which Plug.BasicAuth accepts as ":". Blank values are dropped here, and a prod boot that carried
+# one is refused by Fathom.Application.check_admin_credentials!/0 (the flag below tells it so).
+admin_blank? = fn v -> is_binary(v) and String.trim(v) == "" end
+
+if admin_blank?.(admin_user) or admin_blank?.(admin_pass) do
+  config :fathom, :admin_auth_blank_env, true
+end
+
+admin_user = if admin_blank?.(admin_user), do: nil, else: admin_user
+admin_pass = if admin_blank?.(admin_pass), do: nil, else: admin_pass
+
+# Opt-out for the prod boot guard that refuses a weak dashboard password (under 16 bytes, or equal
+# to the username). Blank and half-configured credentials are never opted out of. See
+# docs/runbooks/admin-dashboard.md.
+if System.get_env("ADMIN_WEAK_CREDENTIALS_OK") in ~w(true 1) do
+  config :fathom, :admin_weak_credentials_ok, true
+end
+
 if is_binary(admin_user) and is_binary(admin_pass) do
   config :fathom, :admin_auth, username: admin_user, password: admin_pass
 end

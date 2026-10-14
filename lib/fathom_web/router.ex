@@ -236,8 +236,9 @@ defmodule FathomWeb.Router do
     user = creds[:username]
     pass = creds[:password]
 
+    # Blank is unset (expert review 2026-10-13 #9): "" credentials would accept ":".
     cond do
-      not (is_binary(user) and is_binary(pass)) ->
+      not (usable_credential?(user) and usable_credential?(pass)) ->
         conn
         |> Plug.Conn.put_resp_content_type("text/plain")
         |> Plug.Conn.send_resp(503, "admin dashboard not configured (set ADMIN_USER/ADMIN_PASS)")
@@ -257,6 +258,8 @@ defmodule FathomWeb.Router do
         |> record_admin_auth_result(bucket)
     end
   end
+
+  defp usable_credential?(value), do: is_binary(value) and String.trim(value) != ""
 
   defp api_key_blocked?(conn) do
     case admin_fail_limit() do

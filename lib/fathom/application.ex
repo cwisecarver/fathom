@@ -37,6 +37,7 @@ defmodule Fathom.Application do
     check_pool_fd_budget!()
     check_s3_static_credentials!()
     check_throttle_proxy!()
+    check_admin_credentials!()
 
     # Node-wide SQLite page-cache bound (expert review 2026-10-08 #8). Before the tree, so no tenant
     # connection opens ahead of it; process-global, so this one trusted `:memory:` connection covers
@@ -586,6 +587,63 @@ defmodule Fathom.Application do
     end
 
     nil
+  end
+
+  @doc """
+  Refuse a prod node whose operator-dashboard credentials are blank, half-configured or weak
+  (expert review 2026-10-13 #9).
+
+  The `/admin` and `/api` BasicAuth gate is one shared password. A blank `ADMIN_USER`/`ADMIN_PASS`
+  is treated as unset at runtime (the surface answers 503), but it is still a misconfiguration, so
+  prod refuses it outright, with no opt-out. A half-configured pair (one set, the other absent) is
+  refused the same way.
+
+  A weak password (under 16 bytes, or equal to the username) is refused unless
+  `ADMIN_WEAK_CREDENTIALS_OK=true`, for a deployment that knowingly runs a short password behind a
+  network boundary. Both credentials unset is the intended "dashboard off" posture and boots (the
+  runtime config warns). Off in dev and test.
+  """
+  @spec check_admin_credentials!() :: nil
+  def check_admin_credentials! do
+    if Application.get_env(:fathom, :env) == :prod do
+      creds = Application.get_env(:fathom, :admin_auth, [])
+      user = creds[:username]
+      pass = creds[:password]
+
+      cond do
+        Application.get_env(:fathom, :admin_auth_blank_env) == true ->
+          raise "config error: ADMIN_USER or ADMIN_PASS is set to a blank value in prod. A blank " <>
+                  "value is treated as unset (the admin dashboard answers 503), so this is a " <>
+                  "misconfiguration. Unset the variable or give it a value. See " <>
+                  "docs/runbooks/admin-dashboard.md."
+
+        is_nil(user) != is_nil(pass) ->
+          raise "config error: only one of ADMIN_USER and ADMIN_PASS is set in prod. Set both, or " <>
+                  "neither (the dashboard then stays off). See docs/runbooks/admin-dashboard.md."
+
+        is_nil(user) ->
+          nil
+
+        weak_admin_password?(user, pass) and
+            Application.get_env(:fathom, :admin_weak_credentials_ok) != true ->
+          raise "config error: the admin dashboard password is under 16 bytes or equal to the " <>
+                  "username. It is the one credential for the whole control plane (every tenant's " <>
+                  "query console, delete and export). Set a password of 16 bytes or more, or, to " <>
+                  "knowingly run a weak one, set ADMIN_WEAK_CREDENTIALS_OK=true. See " <>
+                  "docs/runbooks/admin-dashboard.md."
+
+        true ->
+          nil
+      end
+    end
+
+    nil
+  end
+
+  @admin_min_password_bytes 16
+
+  defp weak_admin_password?(user, pass) do
+    byte_size(pass) < @admin_min_password_bytes or pass == user
   end
 
   @doc """
