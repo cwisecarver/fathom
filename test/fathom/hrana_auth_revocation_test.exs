@@ -177,6 +177,8 @@ defmodule Fathom.HranaAuthRevocationTest do
     on_exit(fn -> :telemetry.detach(handler_id) end)
 
     Revocations.put(shard, 5)
+    # No marker may vouch for the lapsed entry: this test needs the read-through to be reached.
+    :ets.delete(Revocations, :__bulk_ok__)
 
     # The outage: cut this process off from Postgres so the read-through raises.
     Ecto.Adapters.SQL.Sandbox.mode(Fathom.Repo, :manual)
@@ -595,12 +597,18 @@ defmodule Fathom.HranaAuthRevocationTest do
 
     test "an incremental that raises moves neither the cursor nor the marker" do
       state = %{finish_full(Revocations.refresh(fresh_state())) | since: :not_a_datetime}
-      :ets.insert(Revocations, {:__bulk_ok__, 1})
+      # Regression (flaky under --seed 869362): the marker was a bare `1` and was never removed.
+      # System.monotonic_time/1 is NEGATIVE on some hosts, so `1` read as a marker from the FUTURE:
+      # fresh even under TTL 0, which let a later test's "outage" be served from the bulk marker and
+      # never reach the read-through. Use a genuinely stale value and clean up.
+      stale = System.monotonic_time(:millisecond) - 10 * 60_000
+      :ets.insert(Revocations, {:__bulk_ok__, stale})
+      on_exit(fn -> :ets.delete(Revocations, :__bulk_ok__) end)
 
       log = ExUnit.CaptureLog.capture_log(fn -> assert ^state = Revocations.refresh(state) end)
       assert log =~ "revocation bulk refresh failed"
 
-      assert [{:__bulk_ok__, 1}] = :ets.lookup(Revocations, :__bulk_ok__),
+      assert [{:__bulk_ok__, ^stale}] = :ets.lookup(Revocations, :__bulk_ok__),
              "a failed refresh must leave the marker stale so entries fall back to their own TTLs"
     end
 
