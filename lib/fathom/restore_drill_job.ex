@@ -42,6 +42,12 @@ defmodule Fathom.RestoreDrillJob do
   # "no data yet" (absent/sentinel — a brand-new tenant that never flushed).
   @failures [:corrupt, :schema_mismatch, :error]
 
+  # Per-shard drill bounds (expert review 2026-10-13 #26); see `bounded/4`.
+  @drill_concurrency 8
+  @drill_timeout_ms 120_000
+  # A full drill forks (server-side object copy) then pulls both sides, so it gets a longer leash.
+  @full_drill_timeout_ms 600_000
+
   # Bound the run under Lifeline's `rescue_after` (config.exs, 60 min) so a wedged job ends instead
   # of being rescued while its process is still alive (expert review 2026-10-13 #6). Oban's default
   # is :infinity. Pinned by test/fathom/oban_worker_timeout_test.exs.
@@ -78,7 +84,11 @@ defmodule Fathom.RestoreDrillJob do
     # lie — a shard could sit on the same older snapshot forever depending on sample order.
     bump_run_index()
 
-    results = Enum.map(Directory.sample_for_drill(n), &drill_one/1)
+    results =
+      bounded(Directory.sample_for_drill(n), &drill_one/1, @drill_timeout_ms, fn shard ->
+        record_killed(shard.shard_id, [:fathom, :restore_drill, :result])
+      end)
+
     summary = Enum.frequencies(results)
     fails = Enum.count(results, &(&1 in @failures))
 
@@ -89,6 +99,37 @@ defmodule Fathom.RestoreDrillJob do
         Logger.error("restore drill: #{fails} shard(s) FAILED verification (#{inspect(summary)})")
 
     {:ok, summary}
+  end
+
+  # Expert review 2026-10-13 #26. Drills ran one shard at a time with no timeout, so one hung pull
+  # stalled the whole run (and held a :migrations slot to the Oban timeout). Bounded like
+  # ScheduleJob/RetentionJob/Directory.Reconcile (2026-10-01 perf #27): 8 wide, a per-shard
+  # deadline, `:kill_task`. A killed shard is recorded as `:error` (durably, via
+  # `record_verification`, plus telemetry) so it reads as a failed drill rather than vanishing, and
+  # the other shards still verify. `:restore_drill_shard_timeout_ms` overrides both deadlines (tests).
+  defp bounded(items, fun, default_timeout_ms, on_killed) do
+    items
+    |> Task.async_stream(fun,
+      max_concurrency: @drill_concurrency,
+      timeout: Application.get_env(:fathom, :restore_drill_shard_timeout_ms, default_timeout_ms),
+      on_timeout: :kill_task,
+      ordered: true
+    )
+    |> Stream.zip(items)
+    |> Enum.map(fn
+      {{:ok, status}, _item} ->
+        status
+
+      {{:exit, reason}, item} ->
+        Logger.error("restore drill: #{item.shard_id} did not finish (#{inspect(reason)})")
+        on_killed.(item)
+        :error
+    end)
+  end
+
+  defp record_killed(id, telemetry_event) do
+    Directory.record_verification(id, "error")
+    :telemetry.execute(telemetry_event, %{count: 1}, %{status: :error, shard_id: id})
   end
 
   defp drill_one(%{shard_id: id, schema_version: schema_version}) do
@@ -424,7 +465,23 @@ defmodule Fathom.RestoreDrillJob do
   """
   @spec run_full_drill(pos_integer()) :: {:ok, map()}
   def run_full_drill(n) when is_integer(n) and n > 0 do
-    results = Enum.map(Directory.sample_for_drill(n), &restore_one/1)
+    # The scratch id is chosen HERE, not inside the task, so a task killed by the per-shard timeout
+    # leaves a name we can still clean up (otherwise its fork leaks).
+    items =
+      for shard <- Directory.sample_for_drill(n),
+          do:
+            Map.put(
+              shard,
+              :scratch,
+              "#{Directory.scratch_prefix()}#{System.unique_integer([:positive])}"
+            )
+
+    results =
+      bounded(items, &restore_one/1, @full_drill_timeout_ms, fn shard ->
+        drop_scratch(shard.scratch)
+        record_killed(shard.shard_id, [:fathom, :restore_drill, :full_result])
+      end)
+
     summary = Enum.frequencies(results)
     fails = Enum.count(results, &(&1 != :ok))
 
@@ -440,9 +497,7 @@ defmodule Fathom.RestoreDrillJob do
     {:ok, summary}
   end
 
-  defp restore_one(%{shard_id: id}) do
-    # Reserved prefix, owned by Directory so the exclusion (#27) and the naming cannot drift.
-    scratch = "#{Directory.scratch_prefix()}#{System.unique_integer([:positive])}"
+  defp restore_one(%{shard_id: id, scratch: scratch}) do
     status = restore_and_compare(id, scratch)
 
     # Record the verdict DURABLY, not only as telemetry (expert review 2026-09-18 #10). Pre-fix the

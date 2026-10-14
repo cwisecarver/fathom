@@ -489,4 +489,47 @@ defmodule Fathom.RestoreDrillJobTest do
       assert RestoreDrillJob.coverage_runs(1) == 1
     end
   end
+
+  # Expert review 2026-10-13 #26. Symptom: drills ran serially with no per-shard timeout, so ONE
+  # shard whose pull never returns stalled the whole run and no other shard was verified. Now each
+  # shard has a deadline; the hung one is killed, recorded as an error (durably), and the rest are
+  # verified.
+  describe "a hung shard does not stall the drill (expert review 2026-10-13 #26)" do
+    setup do
+      keys = [:shard_storage, :faulty_before, :restore_drill_shard_timeout_ms]
+      prev = for k <- keys, do: {k, Application.get_env(:fathom, k)}
+      on_exit(fn -> for {k, v} <- prev, do: restore(k, v) end)
+    end
+
+    test "the run completes, verifies the others, and records the hung one as :error", %{id: id} do
+      hung = id <> "_hung"
+
+      on_exit(fn ->
+        Shards.drain(hung, 2_000)
+        Storage.purge_shard(hung)
+      end)
+
+      for sid <- [id, hung],
+          do: seed(sid, ["CREATE TABLE kv (v TEXT)", "INSERT INTO kv VALUES ('a')"])
+
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+      Application.put_env(
+        :fathom,
+        :faulty_before,
+        {:pull, fn sid -> if sid == hung, do: Process.sleep(60_000) end}
+      )
+
+      Application.put_env(:fathom, :restore_drill_shard_timeout_ms, 300)
+
+      t0 = System.monotonic_time(:millisecond)
+      assert {:ok, summary} = RestoreDrillJob.run_drill(10)
+      assert System.monotonic_time(:millisecond) - t0 < 5_000
+
+      assert summary[:ok] >= 1, "the healthy shard was not verified: #{inspect(summary)}"
+      assert summary[:error] >= 1, "the hung shard was not reported: #{inspect(summary)}"
+      assert Repo.get_by!(DirShard, shard_id: hung).last_verify_status == "error"
+      assert Repo.get_by!(DirShard, shard_id: id).last_verify_status == "ok"
+    end
+  end
 end
