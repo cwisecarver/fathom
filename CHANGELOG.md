@@ -16,6 +16,40 @@ records the Filo version it was built against. Pin both repos to the listed pair
 
 ## [Unreleased]
 
+### Upgrade notes — read before deploying
+
+Three expert-review rounds (2026-10-12 twice, 2026-10-13) landed on main. These change what a
+prod node needs to boot or run:
+
+- **Prod refuses to boot on weak admin credentials.** A blank `ADMIN_USER`/`ADMIN_PASS` now means
+  "unset" (the dashboard answers 503). A password under 16 bytes, or equal to the user name,
+  refuses boot unless `ADMIN_WEAK_CREDENTIALS_OK=true`. See `docs/configuration.md`.
+- **Prod refuses to boot when the admin throttles are on and `TRUSTED_PROXIES` is empty** (every
+  client would share one lockout bucket). Set `TRUSTED_PROXIES`, or `ADMIN_THROTTLE_SHARED_BUCKET_OK=true`
+  if there is no proxy.
+- **Prod refuses to boot with a replication frame-auth secret under 32 bytes** while signing or
+  requiring frame auth. No opt-out.
+- **S3 credentials need two more permissions:** `s3:ListBucketMultipartUploads` and
+  `s3:AbortMultipartUpload` (tenant purge aborts the shard's leftover multipart uploads). Also add
+  an `AbortIncompleteMultipartUpload` lifecycle rule (1 day) to the shard bucket. See
+  `docs/single-writer.md`.
+- **Raise `POOL_SIZE`** (default 25). Oban's queues can now hold all 25 connections at peak, which
+  leaves none for the control plane; 35 is a reasonable start. See `docs/configuration.md`.
+- **Two new Postgres migrations build indexes `CONCURRENTLY`** (`token_version_changed_at`, the
+  retention index). Run `mix ecto.migrate` as usual; they do not lock the `shards` table.
+- **Client-visible changes:**
+  - A failover open that hears from too few replicas now answers a retryable **503
+    `FILO_RECOVERING`** for up to 60 s (`REPLICATION_RECOVERY_UNDERQUORUM_WINDOW_MS`) instead of
+    opening from an older stored object.
+  - `REGEXP` with lookaround or backreferences refuses subjects over 64 KiB; patterns over 64 KiB
+    are refused outright.
+  - Tenant-facing error messages no longer include internal reasons; details go to the server log.
+- **Failover cost:** taking over a shard under 6 MiB now re-uploads it once (a nonce re-PUT that
+  guarantees a never-seen etag); larger shards pay nothing extra. Measured on the chaos rig: 100
+  tenants of 5 MiB, RTO p50 15.7 s / p99 18.3 s, bound by the lease TTL.
+- **The replication protocol gained a reply code** (torn replica). Upgrade all nodes together;
+  an old node's replies are still read.
+
 ### Changed
 
 - **Filo now comes from Hex** (`{:filo, "~> 0.2.0"}`) instead of a `path: "../filo"`
