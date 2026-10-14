@@ -807,6 +807,8 @@ defmodule Fathom.Application do
       # The post-drain_for_migration re-open gate (expert review 2026-10-12 #23). Before the shard
       # supervisor so `Shards.ensure/1` can consult it from the first open.
       Fathom.Shards.MigrationGate,
+      # Short negative cache for "held by another node" on cold checkouts (expert review 2026-10-14 N4).
+      Fathom.Shards.HeldCache,
       # Owns the per-shard write-counter ETS table (the dirty-flag signal, off the coordinator
       # mailbox — finding #27). Always on (a data-loss invariant), before the shard supervisor.
       Fathom.Shard.WriteCounter,

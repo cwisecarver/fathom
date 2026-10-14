@@ -149,7 +149,7 @@ defmodule Fathom.Shards do
   defp do_checkout(shard_id, attempts, held \\ nil, scope \\ nil) do
     with :ok <- maybe_lazy_migrate(shard_id),
          {:ok, pid} <- do_ensure(shard_id, true),
-         {:ok, ref, path, reuse} <- grant(pid, scope) do
+         {:ok, ref, path, reuse} <- pid |> grant(scope) |> note_held(shard_id) do
       record_use(shard_id)
       # Per-shard load: the checkout (traffic) signal for the rebalancer. Lock-free
       # ETS bump, gated + off by default (see Fathom.ShardLoad).
@@ -189,6 +189,17 @@ defmodule Fathom.Shards do
     end
   end
 
+  # Feeds `HeldCache` from a REAL held answer: the coordinator's open (acquire_lease) ran and said
+  # held, and that surfaces here through the first grant, not through `ensure`. A cached answer
+  # never reaches this (it returns before a coordinator exists), so it cannot refresh its own
+  # window and the ceiling really bounds it. `do_checkout/4` is checkout-only.
+  defp note_held({:error, {:shard_held, owner, at}} = err, shard_id) do
+    Fathom.Shards.HeldCache.put(shard_id, owner, at)
+    err
+  end
+
+  defp note_held(other, _shard_id), do: other
+
   # The grant, normalized to `{:ok, ref, path, reuse}` so `do_checkout/4` and the retry paths stay
   # one shape. nil scope ⇒ the plain `checkout/1` with `reuse: :open`; a scope ⇒ the folded
   # `checkout/2` that carries the pool reuse (#18).
@@ -220,6 +231,10 @@ defmodule Fathom.Shards do
       # instant to aim at — the source releases when its drain finishes, which is not a clock
       # value anyone can read — so this one polls.
       handoff_held_budget_ms() > 0 and handoff_pin_here?(shard_id) ->
+        # The queue polls the real acquire for the source's drain; a cached "held" would only add up
+        # to the cache ceiling of latency to the first post-flip requests (`HeldCache`).
+        Fathom.Shards.HeldCache.clear(shard_id)
+
         start_held_retry(
           shard_id,
           attempts,
@@ -1161,8 +1176,17 @@ defmodule Fathom.Shards do
                 {:refuse, unavailable} = cached
                 {:error, {:open_failed, unavailable}}
 
+              # NEGATIVE CACHE for "held by another node" (expert review 2026-10-14 N4). While a dead
+              # owner's lease is still held, each retry started a coordinator whose overlapped cold
+              # pull was cancelled by the held acquire: the bytes were wasted (~33 MiB per steal for a
+              # 5 MiB object on the rig). A held answer under ~2 s old is replayed here, the SAME
+              # error, zero Storage calls. Checkout-originated only; see `HeldCache` for the decisions
+              # (early release, handoff, this node's own lease).
+              held = refusal_cache? && Fathom.Shards.HeldCache.recent(shard_id) ->
+                {:error, held}
+
               true ->
-                start_if_capacity(shard_id)
+                shard_id |> start_if_capacity() |> note_start(shard_id, refusal_cache?)
             end
 
           {:error, :unavailable} = unavailable ->
@@ -1170,6 +1194,15 @@ defmodule Fathom.Shards do
         end
     end
   end
+
+  # A bare `ensure/1` never reads or writes the held cache, and a coordinator it starts clears the
+  # entry: this node is then the one acquiring the lease, so "held elsewhere" is stale.
+  defp note_start({:ok, _} = ok, shard_id, false) do
+    Fathom.Shards.HeldCache.clear(shard_id)
+    ok
+  end
+
+  defp note_start(other, _shard_id, _refusal_cache?), do: other
 
   # Per-node admission control: only NEW opens are gated — an already-running shard
   # (the branch above) is always checkoutable. At the cap we refuse cleanly with
