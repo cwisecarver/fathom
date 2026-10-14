@@ -19,7 +19,9 @@ defmodule Fathom.Migrator.ReconcileJob do
 
   require Logger
 
-  alias Fathom.{Directory, Migrator}
+  import Ecto.Query, only: [from: 2]
+
+  alias Fathom.{Directory, Migrator, Repo}
 
   # The rollout sweep's per-run cap (expert review 2026-07-18 #19). The default 100 keeps a single
   # hourly run bounded (migration-queue depth + S3 headroom), but at fleet scale a deep cold tail
@@ -69,7 +71,7 @@ defmodule Fathom.Migrator.ReconcileJob do
         Logger.warning("reconcile: cool-off requeue failed (#{inspect(reason)}); continuing")
     end
 
-    {:ok, _count} = Migrator.rollout(batch_size())
+    {:ok, _count} = rollout_to_watermark()
 
     # Converge shards stranded ON a yanked version above HEAD (round-2 #22): a
     # migration completing in the yank-cancel race window cut them over AFTER the
@@ -88,6 +90,44 @@ defmodule Fathom.Migrator.ReconcileJob do
     :ok
   end
 
+  # Perf review 2026-10-14 #14: ONE `rollout(100)` per hourly run drained a cold tail at a flat 100
+  # shards/hour (1M laggards = 417 days). Now the run keeps enqueuing `batch_size`-sized chunks
+  # while the live ShardMigrationJob backlog (the queue itself, so the watermark also counts the
+  # earlier runs' unfinished work) is below `:reconcile_watermark`, and stops at the time budget.
+  # Laggards already holding a live job are excluded by `Directory.laggards/2`, so each chunk is NEW
+  # shards, never the same 100 re-offered. The jobs a run adds are bounded by watermark + one chunk,
+  # so the :migrations queue and S3 headroom (the reason for the old 100 cap) stay bounded.
+  # `:reconcile_watermark <= :reconcile_batch_size` reproduces the old one-chunk behaviour.
+  defp rollout_to_watermark do
+    deadline = System.monotonic_time(:millisecond) + budget_ms()
+    chunk = batch_size()
+    {:ok, rollout_loop(chunk, watermark(), deadline, 0)}
+  end
+
+  defp rollout_loop(chunk, watermark, deadline, total) do
+    # Time never blocks the first chunk (a zero budget must not starve the rollout); the watermark
+    # gates every chunk, so a backlog already at the mark adds nothing.
+    if (total > 0 and System.monotonic_time(:millisecond) >= deadline) or
+         live_migration_jobs() >= watermark do
+      total
+    else
+      {:ok, n} = Migrator.rollout(chunk)
+      if n < chunk, do: total + n, else: rollout_loop(chunk, watermark, deadline, total + n)
+    end
+  end
+
+  # The same live states `Directory.laggards/2` excludes a shard for.
+  defp live_migration_jobs do
+    Repo.aggregate(
+      from(j in "oban_jobs",
+        where:
+          j.worker == "Fathom.Migrator.ShardMigrationJob" and
+            j.state in ["scheduled", "available", "executing", "retryable", "suspended"]
+      ),
+      :count
+    )
+  end
+
   defp safe_retry_cooled do
     Migrator.retry_cooled_failed(failed_cool_off_ms())
   rescue
@@ -100,6 +140,14 @@ defmodule Fathom.Migrator.ReconcileJob do
 
   defp failed_cool_off_ms,
     do: Application.get_env(:fathom, :migration_failed_cool_off_ms, @default_failed_cool_off_ms)
+
+  @default_watermark 1_000
+  @default_rollout_budget_ms :timer.minutes(10)
+
+  defp watermark, do: Application.get_env(:fathom, :reconcile_watermark, @default_watermark)
+
+  defp budget_ms,
+    do: Application.get_env(:fathom, :reconcile_rollout_budget_ms, @default_rollout_budget_ms)
 
   defp batch_size, do: Application.get_env(:fathom, :reconcile_batch_size, @default_batch_size)
 end

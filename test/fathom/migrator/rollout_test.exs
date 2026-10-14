@@ -13,6 +13,17 @@ defmodule Fathom.Migrator.RolloutTest do
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Directory
 
+  defp put_env!(key, value) do
+    prev = Application.get_env(:fathom, key)
+    Application.put_env(:fathom, key, value)
+
+    on_exit(fn ->
+      if prev,
+        do: Application.put_env(:fathom, key, prev),
+        else: Application.delete_env(:fathom, key)
+    end)
+  end
+
   describe "rollout/1" do
     test "enqueues a migration job for each active shard behind HEAD" do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
@@ -62,14 +73,9 @@ defmodule Fathom.Migrator.RolloutTest do
     # deep cold tail took months to converge. The cap is now :reconcile_batch_size (default 100) so
     # an operator can size convergence to the fleet.
     test "the reconcile sweep honors :reconcile_batch_size" do
-      prev = Application.get_env(:fathom, :reconcile_batch_size)
-      Application.put_env(:fathom, :reconcile_batch_size, 2)
-
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:fathom, :reconcile_batch_size, prev),
-          else: Application.delete_env(:fathom, :reconcile_batch_size)
-      end)
+      put_env!(:reconcile_batch_size, 2)
+      # Watermark <= batch size is the pre-2026-10-14 one-chunk-per-run behaviour.
+      put_env!(:reconcile_watermark, 2)
 
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       for id <- ~w(rb_a rb_b rb_c rb_d), do: Directory.resolve(id)
@@ -78,6 +84,43 @@ defmodule Fathom.Migrator.RolloutTest do
 
       # Only the configured 2 are enqueued this run, not all four laggards.
       assert length(all_enqueued(worker: ShardMigrationJob)) == 2
+    end
+
+    # Perf review 2026-10-14 #14: ONE rollout(batch) per hourly run drained the cold tail at a flat
+    # 100/hour. The run now loops chunks while the live migration-job backlog is below the
+    # watermark. Pre-fix this enqueues 2 (one chunk) where the assertion below wants 6.
+    test "the reconcile run loops chunks up to the watermark, then stops" do
+      put_env!(:reconcile_batch_size, 2)
+      put_env!(:reconcile_watermark, 5)
+
+      {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
+      for n <- 1..10, do: Directory.resolve("wm_#{n}")
+
+      assert :ok = perform_job(ReconcileJob, %{})
+
+      # chunks of 2: live 0 -> 2 -> 4 -> 6; the third chunk starts at 4 < 5, then 6 >= 5 stops.
+      # The bound is watermark + one chunk - 1, NOT the 10 laggards.
+      assert length(all_enqueued(worker: ShardMigrationJob)) == 6
+
+      # A backlog at/over the mark adds nothing (the queue is the throttle across runs).
+      assert :ok = perform_job(ReconcileJob, %{})
+      assert length(all_enqueued(worker: ShardMigrationJob)) == 6
+    end
+
+    test "the chunk loop ends when the laggards run out, and the time budget cuts it after chunk 1" do
+      put_env!(:reconcile_batch_size, 2)
+      put_env!(:reconcile_watermark, 1_000)
+      {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
+      for n <- 1..5, do: Directory.resolve("ex_#{n}")
+
+      assert :ok = perform_job(ReconcileJob, %{})
+      assert length(all_enqueued(worker: ShardMigrationJob)) == 5
+
+      for n <- 1..5, do: Directory.resolve("tb_#{n}")
+      put_env!(:reconcile_rollout_budget_ms, 0)
+      assert :ok = perform_job(ReconcileJob, %{})
+      # Budget 0: the first chunk still goes (no starvation), the second is cut.
+      assert length(all_enqueued(worker: ShardMigrationJob)) == 7
     end
 
     # Finding #21: the sweep bulk-enqueues with Oban.insert_all, whose basic-engine variant

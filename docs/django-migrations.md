@@ -123,8 +123,11 @@ A CI gate is just: poll until `converged == true` and `pending_review == []`, th
 
 ### Sizing the rollout
 
-`ReconcileJob` sweeps `:reconcile_batch_size` shards (default 100) on an hourly cron, so the cold
-tail converges at ~2,400/day out of the box — months for a deep fleet. `rate_per_hour` is what you
+`ReconcileJob` enqueues `:reconcile_batch_size`-sized chunks (default 100) on an hourly cron and keeps
+going while the live migration-job backlog is below `RECONCILE_WATERMARK` (default 1000) and inside
+`RECONCILE_ROLLOUT_BUDGET_MS` (default 10 min), so one run adds up to ~watermark + one chunk jobs and
+the queue itself is the throttle (perf review 2026-10-14 #14; it used to be one chunk per run, ~2,400/day
+— months for a deep fleet). Set the watermark `<=` the batch size for the old one-chunk-per-hour pace. `rate_per_hour` is what you
 raise `RECONCILE_BATCH_SIZE` *against*: raise it, watch the rate, and stop when the rate stops
 following. That plateau tells you the ceiling has moved somewhere else — the `migrations` queue
 concurrency, the per-shard S3 round trips, or drain contention with live traffic — and raising the

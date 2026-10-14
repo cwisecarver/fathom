@@ -31,7 +31,7 @@ defmodule Fathom.Directory.Reconcile do
   # Rows reconciled at once. Each is a couple of small ranged reads (expert review 2026-10-12 #19),
   # so this is bounded well under the HTTP pool; the old serial whole-object pull took
   # rows x (RTT + object size / bandwidth) in the one run that has to finish before traffic reopens.
-  @concurrency 16
+  @default_concurrency 16
   # Per row: a ranged GET plus the token-floor read. Never `:infinity`.
   @row_timeout_ms 60_000
 
@@ -44,6 +44,10 @@ defmodule Fathom.Directory.Reconcile do
   @spec run(keyword()) :: [finding()]
   def run(opts \\ []) do
     fix? = Keyword.get(opts, :fix, false)
+    # Perf review 2026-10-14 #31: the DR-completion run is bounded by rows / concurrency x per-row
+    # RTT, and it must finish before traffic reopens, so at 1M+ shards 16 is a floor an operator
+    # needs to raise (`--concurrency N`). Keep it under the HTTP pool.
+    concurrency = max(Keyword.get(opts, :concurrency) || @default_concurrency, 1)
 
     # Stream, don't materialize (expert review 2026-07-24 #15). `Directory.all/0` loaded EVERY row
     # as a struct and `:limit` was then applied in Elixir — so `--limit 100` still pulled the whole
@@ -56,11 +60,11 @@ defmodule Fathom.Directory.Reconcile do
     findings =
       Directory.all_paged()
       |> apply_limit(Keyword.get(opts, :limit))
-      |> Stream.chunk_every(@concurrency * 4)
+      |> Stream.chunk_every(concurrency * 4)
       |> Enum.flat_map(fn rows ->
         rows
         |> Task.async_stream(&reconcile_row(&1, fix?),
-          max_concurrency: @concurrency,
+          max_concurrency: concurrency,
           timeout: @row_timeout_ms,
           on_timeout: :kill_task,
           ordered: true

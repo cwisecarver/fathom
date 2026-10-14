@@ -93,6 +93,10 @@ defmodule Fathom.Directory.Shard do
     # and clears it, so the 14-day expiry no longer depends on the GFS retention job being on.
     field :promotion_snapshot_at, :utc_datetime_usec
 
+    # When `ErasureSweepJob` last found this DELETED row's storage clean (perf review 2026-10-14
+    # #15). Drives the decaying re-probe schedule in `Directory.deleted_page/4`; NULL = never.
+    field :purge_verified_at, :utc_datetime_usec
+
     # When `Directory.mark_failed/1` quarantined the shard (fix-review R3-2). Unlike `updated_at`,
     # nothing else touches it, so the reconcile cool-off measures real time in quarantine even for
     # a hot shard. `requeue_count` counts AUTOMATIC cool-off requeues (capped; reset by a cutover or

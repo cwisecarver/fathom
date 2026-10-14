@@ -24,7 +24,14 @@ defmodule Fathom.Migrator.ErasureSweepJobTest do
 
   setup do
     prev = for k <- [:shard_storage, :faulty_before], do: {k, Application.get_env(:fathom, k)}
-    keys = [:erasure_sweep_page, :erasure_sweep_budget_ms, :erasure_sweep_probe_timeout_ms]
+
+    keys = [
+      :erasure_sweep_page,
+      :erasure_sweep_budget_ms,
+      :erasure_sweep_probe_timeout_ms,
+      :erasure_sweep_clock
+    ]
+
     prev_cfg = for k <- keys, do: {k, Application.get_env(:fathom, k)}
 
     on_exit(fn ->
@@ -158,6 +165,167 @@ defmodule Fathom.Migrator.ErasureSweepJobTest do
       # continuation exists, and it finds the window empty.
       assert %{"cursor_id" => "kc_600"} = final.args
       assert :ok = perform_job(ErasureSweepJob, final.args)
+    end
+  end
+
+  # Perf review 2026-10-14 #15: the sweep re-LISTed EVERY tombstone in the 30-day window every hour
+  # (~720 LISTs per deletion). A clean probe now stamps `purge_verified_at` and the row is due again
+  # only past the 1 h / 6 h / 24 h / 7 d / 29 d checkpoints. The clock is injected, so 30 days of
+  # hourly runs take milliseconds. Pre-fix the first test counts ~720, not <= 6.
+  describe "decaying probe schedule" do
+    setup do
+      t0 = DateTime.utc_now()
+      clock = start_supervised!({Agent, fn -> DateTime.add(t0, 60, :second) end})
+      Application.put_env(:fathom, :erasure_sweep_clock, fn -> Agent.get(clock, & &1) end)
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      {:ok, t0: t0, clock: clock}
+    end
+
+    # Counts LISTs per shard: the hook runs inside the probe's Task, so it reports by message.
+    defp count_lists!(test_pid) do
+      Application.put_env(
+        :fathom,
+        :faulty_before,
+        {:any_shard_object, fn id -> send(test_pid, {:list, id}) end}
+      )
+    end
+
+    defp lists_in_mailbox(acc \\ []) do
+      receive do
+        {:list, id} -> lists_in_mailbox([id | acc])
+      after
+        0 -> Enum.reverse(acc)
+      end
+    end
+
+    defp insert_one!(id, t0) do
+      Fathom.Repo.insert_all(Directory.Shard, [
+        %{
+          shard_id: id,
+          schema_version: 0,
+          status: "deleted",
+          last_active_at: t0,
+          updated_at: t0,
+          inserted_at: t0
+        }
+      ])
+    end
+
+    defp advance!(clock, seconds), do: Agent.update(clock, &DateTime.add(&1, seconds, :second))
+    defp sweep!, do: assert(:ok = perform_job(ErasureSweepJob, %{}))
+
+    test "a clean tombstone is LISTed at most 6 times over its 30-day window, not ~720",
+         %{t0: t0, clock: clock} do
+      insert_one!("ds_clean", t0)
+      count_lists!(self())
+
+      for _hour <- 1..720 do
+        sweep!()
+        advance!(clock, 3_600)
+      end
+
+      lists = lists_in_mailbox()
+      assert length(lists) in 5..6, "expected <= 6 LISTs, got #{length(lists)}"
+      refute_enqueued(worker: DeleteJob)
+    end
+
+    test "stamping purge_verified_at leaves updated_at (the deletion time) alone", %{t0: t0} do
+      insert_one!("ds_stamp", t0)
+      count_lists!(self())
+      sweep!()
+
+      row = Fathom.Repo.get_by!(Directory.Shard, shard_id: "ds_stamp")
+      assert %DateTime{} = row.purge_verified_at
+      assert DateTime.compare(row.updated_at, t0) == :eq
+    end
+
+    test "a row with leftovers is never stamped: it is re-probed and re-driven every run",
+         %{t0: t0, clock: clock} do
+      insert_one!("ds_left", t0)
+      put_object!("ds_left")
+      count_lists!(self())
+
+      for _ <- 1..4 do
+        sweep!()
+        advance!(clock, 3_600)
+      end
+
+      assert lists_in_mailbox() == List.duplicate("ds_left", 4)
+      assert_enqueued(worker: DeleteJob, args: %{shard_id: "ds_left"})
+      assert Fathom.Repo.get_by!(Directory.Shard, shard_id: "ds_left").purge_verified_at == nil
+    end
+
+    test "a probe error stamps nothing, so the row is probed again on the next run",
+         %{t0: t0, clock: clock} do
+      insert_one!("ds_err", t0)
+      test_pid = self()
+
+      Application.put_env(
+        :fathom,
+        :faulty_before,
+        {:any_shard_object,
+         fn id ->
+           send(test_pid, {:list, id})
+           raise "store down"
+         end}
+      )
+
+      sweep!()
+      advance!(clock, 60)
+      sweep!()
+
+      assert lists_in_mailbox() == ["ds_err", "ds_err"]
+    end
+
+    # The GDPR-relevant case: an object that appears AFTER a clean verification (a late stale-writer
+    # flush) is still found, at the next checkpoint, and re-purged.
+    test "an object that appears after a clean probe is re-driven at the next checkpoint",
+         %{t0: t0, clock: clock} do
+      insert_one!("ds_late", t0)
+      count_lists!(self())
+      sweep!()
+      assert lists_in_mailbox() == ["ds_late"]
+
+      put_object!("ds_late")
+
+      # Not yet at the 1 h checkpoint: no LIST, no re-drive.
+      advance!(clock, 600)
+      sweep!()
+      assert lists_in_mailbox() == []
+      refute_enqueued(worker: DeleteJob, args: %{shard_id: "ds_late"})
+
+      # Past 1 h: due again, the object is found, DeleteJob re-enqueued.
+      advance!(clock, 3_600)
+      sweep!()
+      assert lists_in_mailbox() == ["ds_late"]
+      assert_enqueued(worker: DeleteJob, args: %{shard_id: "ds_late"})
+    end
+
+    test "the final probe near the window's end catches an object that appeared after day 7",
+         %{t0: t0, clock: clock} do
+      insert_one!("ds_final", t0)
+      count_lists!(self())
+
+      # Fast-forward through the early checkpoints with a clean store.
+      for secs <- [60, 3_600, 21_600, 86_400, 604_800] do
+        advance!(clock, secs)
+        sweep!()
+      end
+
+      _ = lists_in_mailbox()
+      put_object!("ds_final")
+
+      # Day ~10: not a checkpoint, so no LIST and no re-drive.
+      advance!(clock, 3 * 86_400)
+      sweep!()
+      assert lists_in_mailbox() == []
+      refute_enqueued(worker: DeleteJob, args: %{shard_id: "ds_final"})
+
+      # Past the 29-day checkpoint (still inside the 30-day window): the final probe fires.
+      Agent.update(clock, fn _ -> DateTime.add(t0, 29 * 86_400 + 600, :second) end)
+      sweep!()
+      assert lists_in_mailbox() == ["ds_final"]
+      assert_enqueued(worker: DeleteJob, args: %{shard_id: "ds_final"})
     end
   end
 end

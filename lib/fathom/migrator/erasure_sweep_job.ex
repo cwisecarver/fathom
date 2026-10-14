@@ -28,6 +28,14 @@ defmodule Fathom.Migrator.ErasureSweepJob do
       first, in pages. A run that exhausts its time budget enqueues a CONTINUATION job carrying the
       cursor, so the older ids past the first page are visited rather than the same newest page
       being re-listed forever;
+    * a tombstone is not re-LISTed every hour (perf review 2026-10-14 #15; it used to be ~720 LISTs
+      per deletion). A clean probe stamps `purge_verified_at`, and `Directory.deleted_page/4` then
+      returns the row again only after it ages past a checkpoint of 1 h, 6 h, 24 h, 7 d and 29 d, so
+      at most six LISTs per deletion. A probe that finds leftovers, errors or times out stamps
+      NOTHING: the row stays due every hourly run until a probe comes back clean, so a deletion with
+      objects is still re-driven within the hour. The cost of the schedule is detection latency for
+      an object that appears AFTER a clean probe (a late stale-writer flush): up to the next
+      checkpoint, 7 days at worst, with the 29-day probe as the last chance inside the window;
     * `timeout/1` (50 min) bounds the whole job under Lifeline's 60-minute rescue.
 
   Idempotent: DeleteJob is unique per shard, and the promotion stamp is cleared only if unchanged.
@@ -88,9 +96,10 @@ defmodule Fathom.Migrator.ErasureSweepJob do
     do: %{"cursor_at" => DateTime.to_iso8601(at), "cursor_id" => id}
 
   defp redrive_deletes(cursor) do
-    since = DateTime.add(DateTime.utc_now(), -@window_days * 86_400, :second)
+    now = now()
+    since = DateTime.add(now, -@window_days * 86_400, :second)
     deadline = System.monotonic_time(:millisecond) + budget_ms()
-    walk(since, cursor, deadline, 0)
+    walk(since, now, cursor, deadline, 0)
   rescue
     e -> Logger.warning("erasure sweep: delete re-drive failed (#{inspect(e)}); continuing")
   catch
@@ -98,11 +107,16 @@ defmodule Fathom.Migrator.ErasureSweepJob do
       Logger.warning("erasure sweep: delete re-drive failed (#{inspect(reason)}); continuing")
   end
 
-  defp walk(since, cursor, deadline, total) do
+  defp walk(since, now, cursor, deadline, total) do
     page = page_size()
-    rows = Directory.deleted_page(since, page, cursor)
+    rows = Directory.deleted_page(since, page, cursor, now)
 
-    {leftovers, outcome} = probe_page(Enum.map(rows, &elem(&1, 0)))
+    {leftovers, clean, outcome} = probe_page(Enum.map(rows, &elem(&1, 0)))
+
+    # Perf review 2026-10-14 #15: remember the clean verdicts so the next sweeps skip these rows
+    # until their next checkpoint. ONLY clean probes are stamped; a leftover, an error and a
+    # timeout leave the row due, so a tombstone with objects is re-driven every sweep.
+    Directory.mark_purge_verified(clean, now)
 
     for id <- leftovers do
       {:ok, _} = Oban.insert(DeleteJob.new(%{shard_id: id}))
@@ -142,12 +156,12 @@ defmodule Fathom.Migrator.ErasureSweepJob do
         total
 
       true ->
-        walk(since, {elem(last, 1), elem(last, 0)}, deadline, total)
+        walk(since, now, {elem(last, 1), elem(last, 0)}, deadline, total)
     end
   end
 
-  # Bounded, ordered probe of one page: `{ids_with_leftovers, :ok | :aborted}`. Halting the
-  # reduction kills the in-flight tasks.
+  # Bounded, ordered probe of one page: `{ids_with_leftovers, clean_ids, :ok | :aborted}`. Halting
+  # the reduction kills the in-flight tasks.
   defp probe_page(ids) do
     ids
     |> Task.async_stream(&probe/1,
@@ -157,22 +171,22 @@ defmodule Fathom.Migrator.ErasureSweepJob do
       ordered: true
     )
     |> Stream.zip(ids)
-    |> Enum.reduce_while({[], 0}, fn
-      {{:ok, {:ok, true}}, id}, {acc, _errs} ->
-        {:cont, {[id | acc], 0}}
+    |> Enum.reduce_while({[], [], 0}, fn
+      {{:ok, {:ok, true}}, id}, {left, clean, _errs} ->
+        {:cont, {[id | left], clean, 0}}
 
-      {{:ok, {:ok, false}}, _id}, {acc, _errs} ->
-        {:cont, {acc, 0}}
+      {{:ok, {:ok, false}}, id}, {left, clean, _errs} ->
+        {:cont, {left, [id | clean], 0}}
 
-      {_error_or_timeout, _id}, {acc, errs} when errs + 1 >= @max_consecutive_errors ->
-        {:halt, {acc, :aborted}}
+      {_error_or_timeout, _id}, {left, clean, errs} when errs + 1 >= @max_consecutive_errors ->
+        {:halt, {left, clean, :aborted}}
 
-      {_error_or_timeout, _id}, {acc, errs} ->
-        {:cont, {acc, errs + 1}}
+      {_error_or_timeout, _id}, {left, clean, errs} ->
+        {:cont, {left, clean, errs + 1}}
     end)
     |> case do
-      {acc, :aborted} -> {Enum.reverse(acc), :aborted}
-      {acc, _} -> {Enum.reverse(acc), :ok}
+      {left, clean, :aborted} -> {Enum.reverse(left), Enum.reverse(clean), :aborted}
+      {left, clean, _} -> {Enum.reverse(left), Enum.reverse(clean), :ok}
     end
   end
 
@@ -224,6 +238,10 @@ defmodule Fathom.Migrator.ErasureSweepJob do
         )
     end
   end
+
+  # Injectable clock (perf review 2026-10-14 #15): the probe schedule is a function of time, and the
+  # test advances it rather than sleeping.
+  defp now, do: Application.get_env(:fathom, :erasure_sweep_clock, &DateTime.utc_now/0).()
 
   defp page_size, do: Application.get_env(:fathom, :erasure_sweep_page, @default_page)
 

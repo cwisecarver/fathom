@@ -529,14 +529,18 @@ defmodule Fathom.Directory do
   `recently_deleted_shard_ids/2` re-read the same newest `limit` every hour, so older stuck ids
   past the `limit`th deletion were never revisited).
   """
-  @spec deleted_page(DateTime.t(), pos_integer(), nil | {DateTime.t(), String.t()}) :: [
-          {String.t(), DateTime.t()}
-        ]
-  def deleted_page(%DateTime{} = since, limit, cursor)
+  @spec deleted_page(
+          DateTime.t(),
+          pos_integer(),
+          nil | {DateTime.t(), String.t()},
+          DateTime.t()
+        ) :: [{String.t(), DateTime.t()}]
+  def deleted_page(%DateTime{} = since, limit, cursor, %DateTime{} = now \\ DateTime.utc_now())
       when is_integer(limit) and limit > 0 do
     base =
       from s in Shard,
         where: s.status == "deleted" and s.updated_at >= ^since,
+        where: ^purge_probe_due(now),
         order_by: [desc: s.updated_at, desc: s.shard_id],
         limit: ^limit,
         select: {s.shard_id, s.updated_at}
@@ -551,6 +555,56 @@ defmodule Fathom.Directory do
             where: s.updated_at < ^at or (s.updated_at == ^at and s.shard_id < ^id)
         )
     end
+  end
+
+  # Perf review 2026-10-14 #15: the decaying re-probe schedule, a PURE function of the row. A
+  # tombstone is due for a storage probe when it has never been verified clean, or when its last
+  # clean verification predates the latest checkpoint the row has aged past. Checkpoints, as an age
+  # since the deletion (`updated_at`): 1 h, 6 h, 24 h, 7 d and 29 d (the last is the final probe
+  # before the 30-day window closes). So a clean tombstone is probed at most six times (the first
+  # sweep, then once per checkpoint) instead of ~720. A probe that finds leftovers is never stamped,
+  # so a row with objects stays due every sweep until a probe comes back clean.
+  defp purge_probe_due(%DateTime{} = now) do
+    c = fn secs -> DateTime.add(now, -secs, :second) end
+    {c29, c7, c1d, c6h, c1h} = {c.(2_505_600), c.(604_800), c.(86_400), c.(21_600), c.(3_600)}
+
+    dynamic(
+      [s],
+      is_nil(s.purge_verified_at) or
+        s.purge_verified_at <
+          fragment(
+            "? + make_interval(secs => CASE WHEN ? <= ? THEN 2505600 WHEN ? <= ? THEN 604800 WHEN ? <= ? THEN 86400 WHEN ? <= ? THEN 21600 WHEN ? <= ? THEN 3600 ELSE 0 END)",
+            s.updated_at,
+            s.updated_at,
+            type(^c29, :utc_datetime_usec),
+            s.updated_at,
+            type(^c7, :utc_datetime_usec),
+            s.updated_at,
+            type(^c1d, :utc_datetime_usec),
+            s.updated_at,
+            type(^c6h, :utc_datetime_usec),
+            s.updated_at,
+            type(^c1h, :utc_datetime_usec)
+          )
+    )
+  end
+
+  @doc """
+  Stamps `purge_verified_at` on tombstoned rows whose storage probe came back clean (perf review
+  2026-10-14 #15). Deliberately does NOT touch `updated_at`: that column is the deletion time the
+  sweep window and the probe schedule are measured from. Returns the number of rows stamped.
+  """
+  @spec mark_purge_verified([String.t()], DateTime.t()) :: non_neg_integer()
+  def mark_purge_verified([], _now), do: 0
+
+  def mark_purge_verified(ids, %DateTime{} = now) when is_list(ids) do
+    {n, _} =
+      Repo.update_all(
+        from(s in Shard, where: s.shard_id in ^ids and s.status == "deleted"),
+        set: [purge_verified_at: now]
+      )
+
+    n
   end
 
   @doc """

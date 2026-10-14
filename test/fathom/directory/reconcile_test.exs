@@ -62,6 +62,21 @@ defmodule Fathom.Directory.ReconcileTest do
     assert {:ok, %{schema_version: 5}} = Directory.get(shard)
   end
 
+  # Perf review 2026-10-14 #31: `@concurrency` is now the `:concurrency` option (DR RTO at 1M+ shards).
+  test "the :concurrency option changes the fan-out width, not the findings" do
+    shard = uniq()
+    on_exit(fn -> cleanup(shard) end)
+    {:ok, _} = Directory.resolve(shard)
+    seed_object(shard, 5)
+
+    drift? = fn fs -> Enum.any?(fs, &match?(%{shard_id: ^shard, kind: :schema_drift}, &1)) end
+
+    assert drift?.(Reconcile.run(concurrency: 1))
+    assert drift?.(Reconcile.run(concurrency: 64))
+    # A nonsense width is clamped to 1, not a crash in Task.async_stream.
+    assert drift?.(Reconcile.run(concurrency: 0))
+  end
+
   test "raises token_version to the durable storage floor (#6)" do
     shard = uniq()
     on_exit(fn -> cleanup(shard) end)

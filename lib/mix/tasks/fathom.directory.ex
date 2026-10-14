@@ -3,7 +3,7 @@ defmodule Mix.Tasks.Fathom.Directory do
   @moduledoc """
   Directory operator tooling.
 
-      mix fathom.directory reconcile [--fix] [--limit N]
+      mix fathom.directory reconcile [--fix] [--limit N] [--concurrency N]
 
   **reconcile** — the cross-store DR sweep (expert review #6). Fathom's correctness state spans the
   Postgres directory and object storage; a Postgres point-in-time restore can desync them
@@ -24,7 +24,7 @@ defmodule Mix.Tasks.Fathom.Directory do
   @impl Mix.Task
   def run(argv) do
     {opts, rest, _} =
-      OptionParser.parse(argv, strict: [fix: :boolean, limit: :integer])
+      OptionParser.parse(argv, strict: [fix: :boolean, limit: :integer, concurrency: :integer])
 
     case rest do
       ["reconcile"] -> reconcile(opts)
@@ -34,7 +34,7 @@ defmodule Mix.Tasks.Fathom.Directory do
 
   defp reconcile(opts) do
     fix? = Keyword.get(opts, :fix, false)
-    findings = Reconcile.run(fix: fix?, limit: opts[:limit])
+    findings = Reconcile.run(fix: fix?, limit: opts[:limit], concurrency: opts[:concurrency])
 
     if findings == [] do
       Mix.shell().info("reconcile: directory and storage are coherent — nothing to fix.")
@@ -100,6 +100,8 @@ defmodule Mix.Tasks.Fathom.Directory do
   end
 
   defp usage do
-    Mix.shell().error("usage: mix fathom.directory reconcile [--fix] [--limit N]")
+    Mix.shell().error(
+      "usage: mix fathom.directory reconcile [--fix] [--limit N] [--concurrency N]"
+    )
   end
 end

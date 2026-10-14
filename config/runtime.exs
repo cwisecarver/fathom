@@ -453,6 +453,17 @@ if n = System.get_env("RECONCILE_BATCH_SIZE") do
   config :fathom, :reconcile_batch_size, String.to_integer(n)
 end
 
+# Perf review 2026-10-14 #14: the run keeps enqueuing RECONCILE_BATCH_SIZE chunks while the live
+# migration-job backlog is below RECONCILE_WATERMARK (default 1000), within RECONCILE_ROLLOUT_BUDGET_MS
+# (default 10 min). Set the watermark <= the batch size for the old one-chunk-per-hour behaviour.
+if n = System.get_env("RECONCILE_WATERMARK") do
+  config :fathom, :reconcile_watermark, String.to_integer(n)
+end
+
+if n = System.get_env("RECONCILE_ROLLOUT_BUDGET_MS") do
+  config :fathom, :reconcile_rollout_budget_ms, String.to_integer(n)
+end
+
 # THE PER-SHARD SIZE CAP, and the reason it is a knob at all: past S3's 5 GiB single-PUT ceiling a
 # shard keeps ACKING writes it can never flush, snapshot, fork or retain — permanently, with no
 # operator remedy, because the data is already acknowledged. The cap turns that into an honest
