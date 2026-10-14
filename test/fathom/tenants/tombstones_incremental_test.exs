@@ -50,6 +50,9 @@ defmodule Fathom.Tenants.TombstonesIncrementalTest do
     # Boot: the FULL set. A node coming up must see every tombstone ever, or a stray request for an
     # old deleted subdomain re-mints it as an empty shard.
     assert_receive :full_called, 2_000
+
+    # expert review 2026-10-13 #20: the load now completes in handle_continue, after the loader sent.
+    _ = :sys.get_state(name)
     assert :ets.member(table, "ancient_1")
     assert :ets.member(table, "ancient_2")
 
@@ -68,6 +71,8 @@ defmodule Fathom.Tenants.TombstonesIncrementalTest do
     {name, table} =
       start_isolated(loader: fn -> ["kept"] end, since_loader: fn _ -> raise "boom" end)
 
+    # expert review 2026-10-13 #20: the boot load runs in handle_continue, so sync before asserting.
+    _ = :sys.get_state(name)
     assert :ets.member(table, "kept")
 
     send(name, :refresh)

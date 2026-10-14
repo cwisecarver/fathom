@@ -1985,15 +1985,19 @@ defmodule Fathom.Shard.Storage.S3 do
 
   # Paginated ListObjectsV2 over `<prefix>tombstones/`, stripping the scan prefix to recover each
   # deleted shard id (same shape as purge_shard_page / list_snapshots).
+  #
+  # `acc` is held REVERSED and each page is prepended with `Enum.reverse/2`, then reversed once at the
+  # end. The old `acc ++ ids` copied the whole accumulator on every page, so N pages cost O(N^2) list
+  # cells (expert review 2026-10-13 #20). The result order is unchanged.
   defp tombstoned_ids_page(token, acc) do
     scan_prefix = prefix() <> "tombstones/"
 
     with {:ok, page} <- list_page(scan_prefix, token) do
-      ids = tombstone_ids(page.entries, scan_prefix)
+      acc = Enum.reverse(tombstone_ids(page.entries, scan_prefix), acc)
 
       case page.next do
-        nil -> {:ok, acc ++ ids}
-        next -> tombstoned_ids_page(next, acc ++ ids)
+        nil -> {:ok, Enum.reverse(acc)}
+        next -> tombstoned_ids_page(next, acc)
       end
     end
   end

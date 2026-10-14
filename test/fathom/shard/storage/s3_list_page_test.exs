@@ -177,6 +177,32 @@ defmodule Fathom.Shard.Storage.S3ListPageTest do
       assert {:ok, ["a&b", "c"]} = S3.tombstoned_ids()
     end
 
+    # expert review 2026-10-13 #20: the accumulator is now built by prepending each page's reversed ids
+    # and reversing once. This pins the invariant that matters for the re-mint guard: every id from
+    # every page is returned exactly once, in the listing's own order. The quadratic cost (repeated
+    # `acc ++ ids`) is not observable from a result, so this test does NOT discriminate the old code
+    # from the new; it guards the reordering against regressing the output.
+    test "tombstoned_ids keeps every id from every page, in listing order", %{test_pid: pid} do
+      serve(pid, %{
+        nil =>
+          xml(contents("tombstones/t1", 0) <> contents("tombstones/t2", 0),
+            truncated: true,
+            token: "T1"
+          ),
+        "T1" =>
+          xml(contents("tombstones/t3", 0) <> contents("tombstones/t4", 0),
+            truncated: true,
+            token: "T2"
+          ),
+        "T2" => xml(contents("tombstones/t5", 0), truncated: true, token: "T3"),
+        "T3" => xml(contents("tombstones/t6", 0) <> contents("tombstones/t7", 0))
+      })
+
+      assert {:ok, ["t1", "t2", "t3", "t4", "t5", "t6", "t7"]} = S3.tombstoned_ids()
+      assert_received {:listed, nil}
+      assert_received {:listed, "T3"}
+    end
+
     test "tombstoned_ids errors on a truncated page with no token", %{test_pid: pid} do
       serve(pid, %{nil => xml(contents("tombstones/a", 0), truncated: true)})
       assert {:error, {:s3_list_parse, :list_truncated_without_token}} = S3.tombstoned_ids()

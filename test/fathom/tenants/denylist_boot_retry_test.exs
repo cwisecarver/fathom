@@ -56,21 +56,22 @@ defmodule Fathom.Tenants.DenyListBootRetryTest do
     name = uniq_atom("#{id_tag}_srv")
     table = uniq_atom("#{id_tag}_tab")
 
-    start_supervised!(
-      Supervisor.child_spec(
-        {mod, Keyword.merge([name: name, table: table, retry_ms: 50], opts)},
-        id: {id_tag, name}
+    pid =
+      start_supervised!(
+        Supervisor.child_spec(
+          {mod, Keyword.merge([name: name, table: table, retry_ms: 50], opts)},
+          id: {id_tag, name}
+        )
       )
-    )
 
-    table
+    {pid, table}
   end
 
   test "Tombstones: a failed boot load fast-retries and converges once the directory recovers" do
     id = "tomb_retry_#{System.unique_integer([:positive])}"
     agent = start_supervised!({Agent, fn -> {:down, [id]} end})
 
-    table = start_isolated(Tombstones, :tomb_retry, loader: flaky_loader(agent))
+    {_pid, table} = start_isolated(Tombstones, :tomb_retry, loader: flaky_loader(agent))
 
     # The #33 window: the boot load failed, the re-mint guard is EMPTY, and it signalled degraded.
     assert_receive {:denylist, :degraded, :tombstones}, 1_000
@@ -92,7 +93,7 @@ defmodule Fathom.Tenants.DenyListBootRetryTest do
     id = "susp_retry_#{System.unique_integer([:positive])}"
     agent = start_supervised!({Agent, fn -> {:down, [id]} end})
 
-    table = start_isolated(Suspensions, :susp_retry, loader: flaky_loader(agent))
+    {_pid, table} = start_isolated(Suspensions, :susp_retry, loader: flaky_loader(agent))
 
     assert_receive {:denylist, :degraded, :suspensions}, 1_000
     refute :ets.member(table, id), "a failed boot reconcile leaves the suspend gate empty"
@@ -108,10 +109,41 @@ defmodule Fathom.Tenants.DenyListBootRetryTest do
   test "a successful boot load stays on the normal refresh cadence and never signals degraded" do
     id = "tomb_ok_#{System.unique_integer([:positive])}"
 
-    table = start_isolated(Tombstones, :tomb_ok, loader: fn -> [id] end)
+    {pid, table} = start_isolated(Tombstones, :tomb_ok, loader: fn -> [id] end)
 
-    # init loads synchronously, so the gate is populated the moment start_supervised! returns.
+    # expert review 2026-10-13 #20: the loads run in handle_continue, so start_supervised! can return
+    # before the gate is populated. Sync on the process, which handles its continue first.
+    _ = :sys.get_state(pid)
     assert :ets.member(table, id)
     refute_receive {:denylist, :degraded, _}, 200
+  end
+
+  # expert review 2026-10-13 #20: the storage union ran once in init and its failure was logged and
+  # reported as success, so a storage blip at boot left the DR backstop missing until the next
+  # restart. Pre-fix this test never sees a `:degraded` signal (the failure is swallowed) and fails
+  # at the first assert_receive.
+  test "Tombstones: a failed storage union at boot fast-retries and converges without a restart" do
+    id = "tomb_stor_#{System.unique_integer([:positive])}"
+    storage = start_supervised!({Agent, fn -> :down end})
+
+    storage_loader = fn ->
+      case Agent.get(storage, & &1) do
+        :down -> {:error, :s3_unreachable}
+        :up -> {:ok, [id]}
+      end
+    end
+
+    {_pid, table} =
+      start_isolated(Tombstones, :tomb_stor, loader: fn -> [] end, storage_loader: storage_loader)
+
+    assert_receive {:denylist, :degraded, :tombstones}, 1_000
+    refute :ets.member(table, id), "a failed storage union leaves the storage tombstone unloaded"
+
+    Agent.update(storage, fn _ -> :up end)
+
+    assert_receive {:denylist, :recovered, :tombstones}, 2_000
+
+    assert :ets.member(table, id),
+           "the storage tombstone must reach the gate on retry, with no restart"
   end
 end

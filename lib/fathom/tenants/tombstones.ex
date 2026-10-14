@@ -78,6 +78,7 @@ defmodule Fathom.Tenants.Tombstones do
     table = Keyword.get(opts, :table, @table)
     loader = Keyword.get(opts, :loader, &Directory.deleted_shard_ids/0)
     since_loader = Keyword.get(opts, :since_loader, &Directory.deleted_shard_ids_since/1)
+    storage_loader = Keyword.get(opts, :storage_loader, &Fathom.Shard.Storage.tombstoned_ids/0)
     on_new = Keyword.get(opts, :on_new, &forget_replica/1)
     retry_ms = Keyword.get(opts, :retry_ms, DenyList.initial_retry_ms())
 
@@ -86,42 +87,69 @@ defmodule Fathom.Tenants.Tombstones do
 
     listen()
 
-    # Union in the durable storage tombstones at boot (#6): a Postgres point-in-time restore rolls the
-    # directory back and can un-tombstone a deleted tenant, but storage is not rolled back. This scan
-    # keeps the re-mint guard complete despite a directory restore. Boot-only — the in-memory set is
-    # append-only, so the periodic (directory-only) refresh never drops these; no recurring LIST.
-    # Storage is S3-derived, independent of the Postgres directory, so it also loads (and contributes
-    # deny coverage) during a Postgres outage that fails the directory load below.
-    load_from_storage(table, on_new)
-
+    # expert review 2026-10-13 #20: both loads run in `handle_continue`, not here. Before, the
+    # storage LIST ran synchronously in init, so a slow or down S3 blocked the supervisor's start of
+    # this process (and every process after it in the tree), and a storage failure was logged once
+    # and never retried, leaving the DR backstop missing until the next restart. `attempt_load/1`
+    # retries both loads with the DenyList backoff until each succeeds.
     state = %{
       table: table,
       on_new: on_new,
       loader: loader,
       since_loader: since_loader,
+      storage_loader: storage_loader,
       clock: Keyword.get(opts, :clock, &cursor_now/0),
       retry_ms: retry_ms,
       tick: 0,
-      since: nil
+      since: nil,
+      loaded: false,
+      storage_loaded: false,
+      degraded: false
     }
 
-    case load_from_directory(state) do
-      :ok ->
-        schedule_refresh()
-        # Seed the incremental cursor from the successful FULL boot load, so the very first
-        # periodic refresh is already incremental (review 2026-07-24 #30).
-        {:ok, state |> Map.put(:loaded, true) |> Map.put(:since, now_minus_overlap(state.clock))}
+    {:ok, state, {:continue, :load}}
+  end
 
-      # Expert review #33: a FAILED boot load must not wait the full refresh interval — that
-      # leaves the re-mint guard empty (410 contract broken) for up to 5 min during a Postgres
-      # wobble coincident with this restart. Fast-retry with backoff, and signal degraded so the
-      # window is alertable.
-      {:error, reason} ->
-        DenyList.degraded(:tombstones, reason)
-        schedule_retry(retry_ms)
-        {:ok, Map.put(state, :loaded, false)}
+  @impl true
+  def handle_continue(:load, state), do: {:noreply, attempt_load(state)}
+
+  # One attempt at every load that has not yet succeeded. Each load is independent: the storage union
+  # (#6) and the directory full load both run, and a success is never repeated. The directory's
+  # success seeds the incremental cursor and starts the periodic refresh, exactly once.
+  #
+  # Expert review #33: a FAILED load must not wait the full refresh interval — that leaves the
+  # re-mint guard empty (410 contract broken) for up to 5 min during a Postgres wobble coincident
+  # with this restart. Fast-retry with backoff, and signal degraded so the window is alertable.
+  defp attempt_load(state) do
+    storage = if state.storage_loaded, do: :ok, else: load_from_storage(state)
+    directory = if state.loaded, do: :ok, else: load_from_directory(state)
+
+    state = %{state | storage_loaded: state.storage_loaded or storage == :ok}
+
+    state =
+      if not state.loaded and directory == :ok do
+        schedule_refresh()
+        # Seed the incremental cursor from the successful FULL load, so the very first periodic
+        # refresh is already incremental (review 2026-07-24 #30).
+        %{state | loaded: true, since: now_minus_overlap(state.clock)}
+      else
+        state
+      end
+
+    case {storage, directory} do
+      {:ok, :ok} ->
+        if state.degraded, do: DenyList.recovered(:tombstones)
+        %{state | degraded: false}
+
+      _ ->
+        DenyList.degraded(:tombstones, failure_reason(storage, directory))
+        schedule_retry(state.retry_ms)
+        %{state | degraded: true, retry_ms: DenyList.next_retry_ms(state.retry_ms)}
     end
   end
+
+  defp failure_reason({:error, reason}, _directory), do: {:storage, reason}
+  defp failure_reason(_storage, {:error, reason}), do: {:directory, reason}
 
   @impl true
   def handle_info({:notification, @channel, %{"shard_id" => shard_id}}, state)
@@ -144,23 +172,7 @@ defmodule Fathom.Tenants.Tombstones do
     {:noreply, state}
   end
 
-  def handle_info(:retry_load, %{loaded: false} = state) do
-    case load_from_directory(state) do
-      :ok ->
-        # Recovered — re-attempt the storage backstop (it may have failed at boot too), signal
-        # recovery, and fall back to the normal refresh cadence.
-        load_from_storage(state.table, state.on_new)
-        DenyList.recovered(:tombstones)
-        schedule_refresh()
-        {:noreply, %{state | loaded: true, since: now_minus_overlap(state.clock)}}
-
-      {:error, reason} ->
-        DenyList.degraded(:tombstones, reason)
-        next = DenyList.next_retry_ms(state.retry_ms)
-        schedule_retry(next)
-        {:noreply, %{state | retry_ms: next}}
-    end
-  end
+  def handle_info(:retry_load, state), do: {:noreply, attempt_load(state)}
 
   def handle_info(_msg, state), do: {:noreply, state}
 
@@ -274,21 +286,26 @@ defmodule Fathom.Tenants.Tombstones do
   # Additive union from durable storage (#6) — the DR backstop that survives a directory restore.
   # Best-effort: a storage blip at boot just means the directory-derived set stands until the storage
   # is reachable (a restore is a rare, operator-driven event).
-  defp load_from_storage(table, on_new) do
-    case Fathom.Shard.Storage.tombstoned_ids() do
-      {:ok, ids} -> for id <- ids, do: insert(table, id, on_new)
-      {:error, reason} -> Logger.warning("tombstone storage load failed: #{inspect(reason)}")
-    end
+  # Returns `{:error, reason}` on failure so `attempt_load/1` retries it (expert review 2026-10-13 #20).
+  # Before, a failure here was logged and reported as success, so it was never retried.
+  defp load_from_storage(%{table: table, on_new: on_new, storage_loader: loader}) do
+    case loader.() do
+      {:ok, ids} ->
+        for id <- ids, do: insert(table, id, on_new)
+        :ok
 
-    :ok
+      {:error, reason} ->
+        Logger.warning("tombstone storage load failed: #{inspect(reason)}")
+        {:error, reason}
+    end
   rescue
     e ->
       Logger.warning("tombstone storage load failed: #{Exception.message(e)}")
-      :ok
+      {:error, e}
   catch
     :exit, reason ->
       Logger.warning("tombstone storage load failed: #{inspect(reason)}")
-      :ok
+      {:error, reason}
   end
 
   defp listen do
