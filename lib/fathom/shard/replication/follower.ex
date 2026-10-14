@@ -636,41 +636,72 @@ defmodule Fathom.Shard.Replication.Follower do
   # UPDATE 2026-10-01 #7: that measurement predates the per-shard workers below. The READER still
   # holds one frame at a time, but workers now wait in `receive` with frames in their mailboxes
   # (bounded by `@max_outstanding_bytes`), so the WORKERS are spawned with `fullsweep_after: 0`.
-  defp accept_loop(lsock, name) do
+  defp accept_loop(lsock, name), do: accept_loop(lsock, name, [])
+
+  # `handlers` is the live connection handlers this loop has started. CAPPED (expert review
+  # 2026-10-13 #31): an unauthenticated peer could otherwise open connections without limit and
+  # exhaust the node's file descriptors. Dead handlers are pruned on every accept (pids are local
+  # and accepts are rare), which is robust to a handler that is killed rather than returning, where
+  # a counter decremented by the handler itself would leak.
+  defp accept_loop(lsock, name, handlers) do
     case :gen_tcp.accept(lsock) do
       {:ok, sock} ->
-        # NEITHER OF THESE MAY BE A BARE `=` MATCH (expert review 2026-08-20 #21).
-        #
-        # `:gen_tcp.controlling_process/2` returns `{:error, :closed}` when the accepted socket has
-        # already been reset by the peer — an ORDINARY event, no attacker required. As a MatchError
-        # inside this `spawn_link`ed loop, whose owner does not trap exits, it killed the entire
-        # listener GenServer and took its ETS table with it: every follower connection dropped and
-        # every replicated shard on the node needed a full DATABASE re-seed. Four peer resets in
-        # five seconds then exhausted the supervisor's restart budget and terminated `Fleet` itself.
-        #
-        # Unlinked handler, deliberately: one primary dropping its connection must not take down
-        # the listener, and a malformed frame from one peer must not affect another's shards.
-        {:ok, pid} = Task.start(fn -> serve_connection(sock, name) end)
+        handlers = Enum.filter(handlers, &Process.alive?/1)
 
-        case :gen_tcp.controlling_process(sock, pid) do
-          :ok ->
-            :ok
-
-          {:error, reason} ->
-            # The peer is already gone. Close our end and let the handler find a dead socket.
-            Logger.debug("replication accept: handing off socket failed (#{inspect(reason)})")
-            :gen_tcp.close(sock)
+        if length(handlers) >= max_connections() do
+          Logger.debug("replication accept: connection cap reached; refusing a connection")
+          :gen_tcp.close(sock)
+          accept_loop(lsock, name, handlers)
+        else
+          accept_loop(lsock, name, [hand_off(sock, name) | handlers])
         end
-
-        accept_loop(lsock, name)
 
       {:error, :closed} ->
         :ok
 
       {:error, reason} ->
         Logger.warning("replication accept failed: #{inspect(reason)}")
-        accept_loop(lsock, name)
+        accept_loop(lsock, name, handlers)
     end
+  end
+
+  defp max_connections, do: Application.get_env(:fathom, :replication_max_connections, 256)
+
+  # How long a connection may stay open without delivering ONE frame that decodes (and, with frame
+  # auth on, verifies). Long by default on purpose: a legitimate Shipper connects at boot and sends
+  # nothing until the shard's next replicated write, which on a quiet fleet can be hours. A short
+  # deadline closes that healthy idle link, the Shipper redials after its 500 ms backoff, and a push
+  # landing in that gap is rejected `:disconnected` (two followers in the gap at once fails the
+  # commit). The connection CAP above is what bounds fd exhaustion; this stops one silent connection
+  # holding a slot forever. Lower it only together with a Shipper-side keepalive.
+  defp first_frame_timeout_ms,
+    do: Application.get_env(:fathom, :replication_first_frame_timeout_ms, 600_000)
+
+  defp hand_off(sock, name) do
+    # NEITHER OF THESE MAY BE A BARE `=` MATCH (expert review 2026-08-20 #21).
+    #
+    # `:gen_tcp.controlling_process/2` returns `{:error, :closed}` when the accepted socket has
+    # already been reset by the peer — an ORDINARY event, no attacker required. As a MatchError
+    # inside this `spawn_link`ed loop, whose owner does not trap exits, it killed the entire
+    # listener GenServer and took its ETS table with it: every follower connection dropped and
+    # every replicated shard on the node needed a full DATABASE re-seed. Four peer resets in
+    # five seconds then exhausted the supervisor's restart budget and terminated `Fleet` itself.
+    #
+    # Unlinked handler, deliberately: one primary dropping its connection must not take down
+    # the listener, and a malformed frame from one peer must not affect another's shards.
+    {:ok, pid} = Task.start(fn -> serve_connection(sock, name) end)
+
+    case :gen_tcp.controlling_process(sock, pid) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        # The peer is already gone. Close our end and let the handler find a dead socket.
+        Logger.debug("replication accept: handing off socket failed (#{inspect(reason)})")
+        :gen_tcp.close(sock)
+    end
+
+    pid
   end
 
   # The connection's first exchange (expert review 2026-09-29 #17): with `REPLICATION_CONN_NONCE`
@@ -731,6 +762,9 @@ defmodule Fathom.Shard.Replication.Follower do
       nworkers: max(Application.get_env(:fathom, :replication_follower_workers, 8), 1),
       workers: %{},
       outstanding: 0,
+      # True once ONE frame has decoded (and, with frame auth on, verified): until then the read has
+      # a deadline (expert review 2026-10-13 #31).
+      authed: false,
       # Set by `close_connection/1` before it stops the workers; each worker checks it before
       # taking a frame. See `worker_loop/5`.
       closed: :atomics.new(1, [])
@@ -742,10 +776,14 @@ defmodule Fathom.Shard.Replication.Follower do
   defp read_loop(conn) do
     conn = reap_done(conn)
 
-    case :gen_tcp.recv(conn.sock, 0) do
+    timeout = if conn.authed, do: :infinity, else: first_frame_timeout_ms()
+
+    case :gen_tcp.recv(conn.sock, 0, timeout) do
       {:ok, bytes} ->
         case decode_validated(bytes) do
           {:ok, frame} ->
+            conn = %{conn | authed: true}
+
             case frame_shard_id(frame) do
               nil ->
                 # A follower receiving an ack means someone pointed a primary at a primary.
@@ -762,6 +800,14 @@ defmodule Fathom.Shard.Replication.Follower do
             Logger.error("replication follower closing connection: #{inspect(reason)}")
             close_connection(conn)
         end
+
+      {:error, :timeout} ->
+        Logger.warning(
+          "replication follower closing a connection that sent no valid frame within " <>
+            "#{timeout} ms"
+        )
+
+        close_connection(conn)
 
       {:error, _} ->
         close_connection(conn)
