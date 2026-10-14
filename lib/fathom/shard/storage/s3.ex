@@ -2646,8 +2646,29 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  # A renew rewrites the lock body with only the claim, and the returned lease is what the
+  # coordinator keeps in `state.lease`. The steal's touch keys live ONLY in that in-memory lease
+  # (they are not part of the lock body), so a legacy-mode coordinator that renewed lost them and
+  # `release_clean`'s `Storage.with_clean_touch/1` then attached no provenance: the previous
+  # holder's acked warm copy later read as a fork (expert review 2026-10-13 N2, same class as
+  # 975b80c7). Carried here, in the one place every renew path (renew task, flush fence, lapse
+  # revalidation) goes through. Per-op cost: one three-key `Map.take` on a successful renew.
   @impl true
-  def renew_lease(shard_id, %{owner: owner, epoch: epoch} = lease, ttl_ms) do
+  def renew_lease(shard_id, lease, ttl_ms) do
+    case do_renew_lease(shard_id, lease, ttl_ms) do
+      {:ok, renewed} ->
+        {:ok,
+         Map.merge(
+           renewed,
+           Map.take(lease, [:touch_pre_etag, :touch_post_etag, :touch_origin_etag])
+         )}
+
+      other ->
+        other
+    end
+  end
+
+  defp do_renew_lease(shard_id, %{owner: owner, epoch: epoch} = lease, ttl_ms) do
     now = Storage.now_ms()
 
     # Carries the claim this lease wrote (#3): a renew rewrites the whole lock body, and dropping it

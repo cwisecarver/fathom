@@ -107,8 +107,13 @@ defmodule Fathom.Shard.TouchProvenanceTest do
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
 
-  for mode <- @modes do
-    test "#{mode} mode: A's acked local copy survives B's clean visit", %{shard: shard} do
+  # `renew?` (expert review 2026-10-13 N2): in LEGACY mode B's coordinator renews its lease while
+  # it serves, and the renewed lease used to lose the steal's touch keys, so B's clean release
+  # attached no provenance and A's acked copy read as a fork. Renewal does not exist in heartbeat
+  # mode (no per-shard renew PUTs), so that combination is not a case.
+  for {mode, renew?} <- [{:legacy, false}, {:legacy, true}, {:heartbeat, false}] do
+    test "#{mode} mode#{if renew?, do: ", B renewed its lease"}: A's acked local copy survives B's clean visit",
+         %{shard: shard} do
       base = build_db!(["base"])
 
       # A failed its drop flush: a released marker carrying A's claim (Storage.released_marker/2).
@@ -142,6 +147,15 @@ defmodule Fathom.Shard.TouchProvenanceTest do
         assert_mode!(b, unquote(mode))
         assert :sys.get_state(b).lease[:touch_pre_etag] == e0, "B's steal must touch from E0"
         refute Shard.dirty?(b)
+
+        if unquote(renew?) do
+          assert is_nil(:sys.get_state(b).acquire_gen), "N2 is a legacy-mode defect"
+          before = :sys.get_state(b).lease.lock_etag
+          send(b, :renew_lease)
+          renewed = renewed_lease!(b, before, 200)
+          assert renewed[:touch_post_etag], "a renew must carry the steal's touch keys"
+        end
+
         ref = Process.monitor(b)
         :ok = Shards.drain(shard, 5_000)
         assert_receive {:DOWN, ^ref, :process, ^b, _}, 5_000
@@ -220,6 +234,20 @@ defmodule Fathom.Shard.TouchProvenanceTest do
     end)
 
     assert Path.wildcard(local <> ".forked.*") != []
+  end
+
+  # Poll the coordinator until the renew task's reply has been folded into state.lease.
+  defp renewed_lease!(_b, _before, 0), do: flunk("the renew never landed")
+
+  defp renewed_lease!(b, before, n) do
+    st = :sys.get_state(b)
+
+    if st.renew_task == nil and st.lease.lock_etag != before do
+      st.lease
+    else
+      Process.sleep(10)
+      renewed_lease!(b, before, n - 1)
+    end
   end
 
   defp obj(body), do: %{body: body, form: :single, meta: %{}}
