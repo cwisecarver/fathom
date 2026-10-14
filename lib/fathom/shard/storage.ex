@@ -96,7 +96,10 @@ defmodule Fathom.Shard.Storage do
           optional(:touched_to) => String.t(),
           # A released marker left by a DIRTY release (expert review 2026-10-13 #7): the releaser
           # kept a local copy holding acked-but-unflushed writes. See `with_dirty_release/1`.
-          optional(:dirty) => true
+          optional(:dirty) => true,
+          # The request for that marker, set on the lease by `with_dirty_release/1` and turned
+          # into `:dirty` when the release writes its marker.
+          optional(:dirty_release) => true
         }
 
   @typedoc """
