@@ -117,12 +117,14 @@ defmodule Fathom.Shard.PreTouchEtagFlushTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
-
       test "a net-unchanged flush after the steal-touch does not land back on the pre-touch etag",
            %{shard: shard} do
         store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{}) end})
         use_s3!(store)
+        # Started AFTER the store: start_supervised! stops in reverse order, and the Heartbeat's
+        # terminate clears its object through the store, so the store must outlive it (CI
+        # 2026-10-14 logged a crash of Heartbeat.terminate/2 against a dead store).
+        set_mode!(unquote(mode))
 
         capture_log(fn ->
           e0 = x_flushes_then_dies!(shard, store)
