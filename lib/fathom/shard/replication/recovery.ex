@@ -301,6 +301,24 @@ defmodule Fathom.Shard.Replication.Recovery do
     peers = Keyword.get(opts, :peers) || peers()
     needed = answers_needed(peers, object_stamp, opts)
 
+    # perf review 2026-10-14 #8(b): an UNRANKABLE stamp (a new shard, or an object flushed before
+    # stamping) can never be overridden by any replica (`Promote.fresher?/2` is false for every
+    # one), no answer can be refused for (`answered/2 >= 0` always), and `settle/7` clears the
+    # window only for `needed > 1`. So the outcome is `:none` whatever the peers say, and dialing
+    # them (two-second connect and query timeouts, a socket each) only bought latency. NOT keyed
+    # off `needed == 0`: a rankable stamp with Q = N + 1 also computes 0 and must still search.
+    if rankable_stamp?(object_stamp) do
+      best_replica_ranked(shard_id, object_stamp, local, follower, peers, needed, opts)
+    else
+      :none
+    end
+  rescue
+    e -> error_window(shard_id, {:crashed, Exception.message(e)}, opts)
+  catch
+    kind, reason -> error_window(shard_id, {:exited, {kind, reason}}, opts)
+  end
+
+  defp best_replica_ranked(shard_id, object_stamp, local, follower, peers, needed, opts) do
     # Short-circuit before any socket: a node that already holds a copy ahead of the object has
     # nothing to gain from the fleet — but only when this node's answer alone meets the responder
     # floor. Above it, a local replica ahead of the object can still be BEHIND a peer that acked
@@ -310,10 +328,6 @@ defmodule Fathom.Shard.Replication.Recovery do
     else
       search(shard_id, object_stamp, local, follower, peers, needed, opts)
     end
-  rescue
-    e -> error_window(shard_id, {:crashed, Exception.message(e)}, opts)
-  catch
-    kind, reason -> error_window(shard_id, {:exited, {kind, reason}}, opts)
   end
 
   @doc """
@@ -399,11 +413,17 @@ defmodule Fathom.Shard.Replication.Recovery do
 
   # Mirrors the clauses of `Promote.fresher?/2` that refuse on the STAMP side: nil, lineage 0 and an
   # unstated ordinal answer false for every replica, so no peer's answer could matter.
-  defp rankable_stamp?(%{epoch: e, wal_ordinal: n})
-       when is_integer(e) and e > 0 and is_integer(n) and n > 0,
-       do: true
+  @doc """
+  Could ANY replica be promoted over an object carrying this stamp? False for `nil`, lineage 0 and
+  an unstated ordinal. Pure. `PromoteOnOpen` asks it BEFORE writing the recovery marker, so an open
+  that can never promote pays neither the marker fsync nor the peer ask (perf review 2026-10-14 #8(b)).
+  """
+  @spec rankable_stamp?(term()) :: boolean()
+  def rankable_stamp?(%{epoch: e, wal_ordinal: n})
+      when is_integer(e) and e > 0 and is_integer(n) and n > 0,
+      do: true
 
-  defp rankable_stamp?(_stamp), do: false
+  def rankable_stamp?(_stamp), do: false
 
   defp quorum, do: Application.get_env(:fathom, :replication_quorum, 2)
 
@@ -421,7 +441,7 @@ defmodule Fathom.Shard.Replication.Recovery do
         :none
 
       true ->
-        answers = ask(peers, shard_id, query_timeout_ms(opts), true)
+        answers = ask(peers, shard_id, query_timeout_ms(opts), true, early_exit(needed, opts))
 
         if answered(answers, opts) >= needed do
           settle(shard_id, object_stamp, local, follower, answers, needed, opts)
@@ -456,7 +476,7 @@ defmodule Fathom.Shard.Replication.Recovery do
         # cache. Inside the window the cache keeps each refusal fast (a blackholed peer would cost
         # every retry its full connect timeout) and its 10 s TTL re-dials a recovered peer well
         # within the window; here, one connect timeout is cheap next to losing an acked tail.
-        answers = ask(peers, shard_id, query_timeout_ms(opts), false)
+        answers = ask(peers, shard_id, query_timeout_ms(opts), false, early_exit(needed, opts))
 
         if answered(answers, opts) >= needed do
           settle(shard_id, object_stamp, local, follower, answers, needed, opts)
@@ -736,22 +756,49 @@ defmodule Fathom.Shard.Replication.Recovery do
   # Each peer answers `{:answered, position | nil}` — a definite reply, "nothing" included — or
   # `:silent`, which the responder floor does not count (expert review 2026-10-12 #5). A peer that
   # timed out, refused, crashed or was skipped as unreachable is silent.
-  defp ask(peers, shard_id, timeout_ms, honor_unreachable?) do
-    peers
-    |> Task.async_stream(&ask_one(&1, shard_id, timeout_ms, honor_unreachable?),
-      timeout: timeout_ms + @connect_timeout,
-      on_timeout: :kill_task,
-      max_concurrency: max(length(peers), 1),
-      ordered: false
-    )
-    |> Enum.flat_map(fn
-      {:ok, {endpoint, answer}} -> [{endpoint, answer}]
-      # A peer that timed out, refused, or crashed contributes nothing. NOT an error: the whole
-      # point of a quorum is that some nodes are gone, and a failover is when that is most likely.
-      # It is also not an answer, which is what the responder floor counts.
-      _ -> []
-    end)
+  #
+  # EARLY EXIT (perf review 2026-10-14 #8(a)). With `early` = `{needed, opts}` the stream stops being
+  # consumed the moment `answered/2` (the floor's own count, previous-owner exclusion included) reaches
+  # `needed`; the unconsumed tasks are killed with the stream. Waiting for the last peer cost the
+  # slowest peer's full connect + query timeout (up to 4 s) on EVERY replicating cold open, with the
+  # floor's verdict already fixed. The recovery guarantee holds: a write is acked at Q of N followers
+  # and any `N - Q + 1` answers intersect those Q, so the best offer among the first `needed`
+  # definite answers is at least as fresh as every acked write; a straggler can only add an UNacked
+  # tail. Only for `needed > 1` (see `early_exit/2`).
+  defp ask(peers, shard_id, timeout_ms, honor_unreachable?, early) do
+    stream =
+      Task.async_stream(peers, &ask_one(&1, shard_id, timeout_ms, honor_unreachable?),
+        timeout: timeout_ms + @connect_timeout,
+        on_timeout: :kill_task,
+        max_concurrency: max(length(peers), 1),
+        ordered: false
+      )
+
+    case early do
+      nil ->
+        Enum.flat_map(stream, &collect/1)
+
+      {needed, opts} ->
+        stream
+        |> Enum.reduce_while([], fn item, acc ->
+          acc = Enum.reverse(collect(item), acc)
+          if answered(acc, opts) >= needed, do: {:halt, acc}, else: {:cont, acc}
+        end)
+        |> Enum.reverse()
+    end
   end
+
+  # A peer that timed out, refused, or crashed contributes nothing. NOT an error: the whole
+  # point of a quorum is that some nodes are gone, and a failover is when that is most likely.
+  # It is also not an answer, which is what the responder floor counts.
+  defp collect({:ok, {endpoint, answer}}), do: [{endpoint, answer}]
+  defp collect(_), do: []
+
+  # `needed <= 1` is met by this node's own answer alone, so exiting "early" would skip every peer and
+  # drop offers the old code still honoured (a Q >= N configuration the shipping side refuses at
+  # boot). Keep the full wait there: the floor's decision cannot change, but the offers can.
+  defp early_exit(needed, opts) when needed > 1, do: {needed, opts}
+  defp early_exit(_needed, _opts), do: nil
 
   defp ask_one({_key, host, port} = endpoint, shard_id, timeout_ms, honor_unreachable?) do
     if honor_unreachable? and unreachable?(endpoint) do

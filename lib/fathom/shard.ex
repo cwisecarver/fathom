@@ -601,6 +601,14 @@ defmodule Fathom.Shard do
          acquire_gen,
          open_started
        ) do
+    # The object HEAD this open needs under the lease (lineage, promote decision, and on a warm open
+    # the post-lease authority check) starts NOW, the moment the lease is in hand, so it runs
+    # alongside the fork verdict wait and the pull instead of after them (perf review 2026-10-14
+    # #3). The lease is held, so "we hold the lock, nobody flushed since" (`open_lineage/2`) is the
+    # same invariant it was when the HEAD followed the pull. A HEAD issued BEFORE the lease would
+    # not be (parked: perf #3(b)). `nil` unless replicating and not a takeover claim.
+    head_task = start_open_head(shard_id, lease)
+
     # Consume the overlapped fork-check verdict here — the same pre-serving point the
     # sequential check used. :infinity mirrors the old inline call (the HEAD carries the
     # storage layer's own timeouts). A diverged local copy was quarantined by the task,
@@ -627,14 +635,30 @@ defmodule Fathom.Shard do
     # An exception/exit before `await_pull` consumed the task (rig 2026-10-14 N4) must not strand
     # the in-flight pull: it is linked, so it dies with this coordinator, but the kill skips the
     # download's `after` and leaves `<shard>.db.pull.dl.*` on disk. Abandoning an already-awaited
-    # task is a no-op, so this costs nothing on the normal path (a try frame only).
+    # task is a no-op, so this costs nothing on the normal path (a try frame only). The same frame
+    # kills the head task, which must not outlive an abandoned open (it is linked, so a crash
+    # before this frame cannot leak it either).
     try do
-      result = open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen)
+      result =
+        open_with_lease(
+          shard_id,
+          path,
+          owner,
+          ttl,
+          lease,
+          pull_task,
+          head_task,
+          warm?,
+          acquire_gen
+        )
+
+      abandon_open_head(head_task)
       maybe_emit_cold_open(result, shard_id, warm?, open_started)
       result
     catch
       kind, reason ->
         stacktrace = __STACKTRACE__
+        abandon_open_head(head_task)
         Materializer.abandon_pull(pull_task, path)
         :erlang.raise(kind, reason, stacktrace)
     end
@@ -774,7 +798,17 @@ defmodule Fathom.Shard do
     )
   end
 
-  defp open_with_lease(shard_id, path, owner, ttl, lease, pull_task, warm?, acquire_gen) do
+  defp open_with_lease(
+         shard_id,
+         path,
+         owner,
+         ttl,
+         lease,
+         pull_task,
+         head_task,
+         warm?,
+         acquire_gen
+       ) do
     # The lease is in hand: mark this coordinator's registry entry so the replication follower
     # refuses a deposed owner's pushes/seeds for this shard (expert review 2026-10-10 #1). Set here,
     # BEFORE promote-on-open's `Follower.forget`, so there is no window where the replica row is gone
@@ -782,8 +816,12 @@ defmodule Fathom.Shard do
     _ = Registry.update_value(Fathom.ShardRegistry, shard_id, fn _ -> :lease_held end)
 
     with {:ok, etag0} <- Materializer.await_pull(pull_task, path, shard_id),
+         # Taken here, once, and shared: a warm open's post-lease authority check and the lineage /
+         # promote decision below read the SAME object under the SAME lease (perf review 2026-10-14
+         # #3), so one HEAD serves both. A bare `=` clause allocates no tuple (see the note below).
+         head = await_open_head(head_task),
          {verdict, etag1} when verdict in [:ok, :repulled] <-
-           revalidate_takeover(shard_id, path, lease, etag0, warm?) do
+           revalidate_takeover(shard_id, path, lease, etag0, warm?, head) do
       # NOT a `with` clause, and returning a bare etag rather than `{:ok, etag}`. Both are for the
       # same measured reason: `handle_continue/2` garbage-collects this coordinator early to shrink
       # its init high-water mark, so ANY allocation after that point stays resident for the shard's
@@ -800,7 +838,6 @@ defmodule Fathom.Shard do
       # perf #3): they read the same object back to back under this lease, with nothing served in
       # between. `nil` whenever open_lineage/2 would not have read it, so a non-replicating open
       # allocates nothing here.
-      head = open_head(shard_id, lease)
       lineage = open_lineage(lease, head)
       # `warm?` was decided BEFORE the lease was held. Revalidation can then quarantine that local
       # file and RE-PULL the object (a fork, a moved object), after which the file is an ordinary
@@ -1095,7 +1132,7 @@ defmodule Fathom.Shard do
   # is re-pulled; a warm takeover adopts the post-touch etag (the #1 provenance check
   # already established the local file continues the stored lineage, and the touch
   # moved no bytes).
-  defp revalidate_takeover(shard_id, path, lease, etag, warm?) do
+  defp revalidate_takeover(shard_id, path, lease, etag, warm?, head) do
     cond do
       # Round-2 #19 (merged M15): a NON-takeover warm open must ALSO re-check its
       # provenance AFTER the lease is held. fork_evidence/2's HEAD runs before
@@ -1106,7 +1143,7 @@ defmodule Fathom.Shard do
       # the self-fence). One HEAD on the warm path converts this into an ordinary
       # quarantine. Cold non-takeover opens pay nothing.
       lease[:took_over] != true ->
-        if warm?, do: post_lease_warm_check(shard_id, path, etag), else: {:ok, etag}
+        if warm?, do: post_lease_warm_check(shard_id, path, etag, head), else: {:ok, etag}
 
       # The S3 steal-touch threaded its lineage through the lease (round-2 #6):
       # no extra HEAD (a separate read widened the laundering window), and the
@@ -1255,8 +1292,13 @@ defmodule Fathom.Shard do
 
   # See revalidate_takeover's #19 branch: the post-lease authority check for a
   # warm, non-takeover open.
-  defp post_lease_warm_check(shard_id, path, etag) do
-    case Storage.object_etag(shard_id) do
+  #
+  # `head` is the open's shared object HEAD when it took one (replicating, no takeover claim): its
+  # etag IS `object_etag/1`'s answer (the S3 etag, and for Local the same hash), so a warm open pays
+  # one HEAD for this check AND the lineage instead of two serial ones (perf review 2026-10-14 #3).
+  # `nil` (not replicating, or a claim lease) keeps the dedicated etag read.
+  defp post_lease_warm_check(shard_id, path, etag, head) do
+    case warm_check_etag(shard_id, head) do
       # Unchanged since the pre-lease provenance check — the common warm restart.
       {:ok, ^etag} ->
         {:ok, etag}
@@ -3753,12 +3795,41 @@ defmodule Fathom.Shard do
     do: Application.get_env(:fathom, :lineage_retry_timeout_ms, 2_000)
 
   # The object head open_lineage/2 derives a fresh lock's lineage from, read once and also handed
-  # to promote-on-open as its decision read. `nil` exactly when open_lineage/2 does not need it.
-  defp open_head(shard_id, lease) do
-    if Fleet.replicating?() and not is_map_key(lease, :claim),
-      do: Storage.object_head(shard_id),
-      else: nil
+  # to promote-on-open as its decision read (and to a warm open's post-lease check). `nil` exactly
+  # when open_lineage/2 does not need it. Started as a Task the moment the lease is held, so the
+  # HEAD overlaps the pull instead of following it (perf review 2026-10-14 #3). Rescued like
+  # `start_fork_evidence/2`: a raise in the HEAD is the same `{:error, _}` the inline call surfaced
+  # to open_lineage/2 callers as an error tuple, never an exit in the awaiting coordinator.
+  defp start_open_head(shard_id, lease) do
+    if Fleet.replicating?() and not is_map_key(lease, :claim) do
+      Task.async(fn ->
+        try do
+          Storage.object_head(shard_id)
+        rescue
+          e -> {:error, e}
+        catch
+          :exit, r -> {:error, {:exit, r}}
+        end
+      end)
+    end
   end
+
+  defp await_open_head(nil), do: nil
+  defp await_open_head(task), do: Task.await(task, :infinity)
+
+  # Killing an already-awaited task is a no-op; an un-awaited one (pull failed, open refused, an
+  # exception) must not outlive the open.
+  defp abandon_open_head(nil), do: :ok
+
+  defp abandon_open_head(task) do
+    _ = Task.shutdown(task, :brutal_kill)
+    :ok
+  end
+
+  defp warm_check_etag(shard_id, nil), do: Storage.object_etag(shard_id)
+  defp warm_check_etag(_shard_id, {:ok, nil}), do: {:ok, nil}
+  defp warm_check_etag(_shard_id, {:ok, %{etag: etag}}), do: {:ok, etag}
+  defp warm_check_etag(_shard_id, {:error, _} = error), do: error
 
   # A2 promote-on-open (maybe_promote_replica/7 and its helpers) moved to
   # `Fathom.Shard.PromoteOnOpen` (2026-09-13, Phase 5). It runs after the lease + fork verdict

@@ -181,7 +181,24 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # both read the same object under the same lease with nothing served in between, so a second HEAD
   # only added a serial round trip (expert review 2026-10-01 perf #3). The RE-read below is a
   # different read on purpose and is never shared.
-  defp try_promote_from_fleet(shard_id, path, lease, etag, lineage, prefetched) do
+  defp try_promote_from_fleet(shard_id, path, lease, etag, lineage, {:ok, head} = prefetched) do
+    # perf review 2026-10-14 #8(b): an object whose stamp cannot be ranked (no object, unstamped,
+    # lineage 0) can never be overridden, so `Recovery.best_replica/3` answers `:none` without a
+    # socket and nothing is "pending". Skip the marker's open + fsync + close + rm too — the
+    # marker exists to make the ASK crash-safe, and there is no ask. Only decidable when the
+    # coordinator already holds the decision head; otherwise the marker is written before the HEAD
+    # exactly as before.
+    if Recovery.rankable_stamp?(position_of(head)) do
+      recover_with_marker(shard_id, path, lease, etag, lineage, prefetched)
+    else
+      etag
+    end
+  end
+
+  defp try_promote_from_fleet(shard_id, path, lease, etag, lineage, prefetched),
+    do: recover_with_marker(shard_id, path, lease, etag, lineage, prefetched)
+
+  defp recover_with_marker(shard_id, path, lease, etag, lineage, prefetched) do
     # RECOVERY PENDING, DURABLY, BEFORE THE ASK (expert review 2026-10-13 #4). By here the cold pull
     # has installed the object's bytes at `path` with a MATCHING sidecar, and the cleanup that makes
     # a retry re-run recovery used to exist only on the refusal path. A node dying during the up-to-2 s
