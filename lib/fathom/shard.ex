@@ -2019,9 +2019,16 @@ defmodule Fathom.Shard do
     # The snapshot and its position stamp read the WAL, and assume an idle shard's last close
     # already checkpointed + unlinked it — so a pending idle-transition close must finish first
     # (expert review 2026-10-12 #15). Almost always already done (nil): a close is milliseconds.
-    state = await_closing(state)
+    #
+    # It must not be WAITED on here (expert review 2026-10-13 #19): this is the coordinator's
+    # mailbox, and a wedged close would hold every checkout/checkin/:DOWN for up to 30 s. A close
+    # still running just defers this tick with the short backoff; a finished one is cleared.
+    state = reap_closing(state)
 
     cond do
+      closing_busy?(state) ->
+        {:noreply, schedule_flush_backoff(state)}
+
       # A flush is already in flight — don't stack a second snapshot/PUT; the next
       # interval retries anything the in-flight one doesn't cover.
       state.flush_task != nil ->
@@ -2033,8 +2040,13 @@ defmodule Fathom.Shard do
       # lets the later reply put a STALE `lock_etag` back — and a stale etag on the next flush PUT
       # is a 412 the coordinator reads as a steal (review 2026-08-24 #8). A lapse check is one GET,
       # so deferring one flush tick behind it is the same cost as deferring behind another flush.
+      #
+      # A parked `:flush_now` waiter is re-kicked on the SHORT backoff, not a full interval
+      # (expert review 2026-10-13 #25): neither the lapse verdict nor the renew result re-sends
+      # `:durability_flush`, so `Shards.flush/1` (fork, export, /api) waited out 30-50 s or hit its
+      # 60 s timeout.
       match?(%Task{}, state.lapse_revalidate_pending) ->
-        {:noreply, schedule_flush(state)}
+        {:noreply, defer_flush(state)}
 
       # A legacy-mode lease renewal is in flight (expert review 2026-08-31 #15). Like the lapse
       # guard above, this is a lease-MUTATING operation: in legacy mode the flush's own fence takes
@@ -2045,7 +2057,7 @@ defmodule Fathom.Shard do
       # renew, exactly as the flush/lapse guards do. `renew_task` is always nil in heartbeat mode
       # (no per-shard renewal), so this fires only in legacy mode.
       state.renew_task != nil ->
-        {:noreply, schedule_flush(state)}
+        {:noreply, defer_flush(state)}
 
       # Clean: local == storage, so there's nothing to upload and no clobber risk.
       # Skip entirely (no fence, no PUT) — this is the durability-flush storm fix: at
@@ -2194,7 +2206,7 @@ defmodule Fathom.Shard do
     # is already gone. The fence turns it into a retryable 503. (Why it must be published at all, and
     # why it is only lifted after the quarantine rename, is the long note further down.)
     Fathom.Shard.WriteFence.fence(state.id)
-    close_pool(state)
+    closes = close_pool(state)
 
     # We no longer own the shard; flushing our local copy would clobber the node that took over.
     # But don't DESTROY it: a dirty local holds acked-but-unflushed committed writes — exactly the
@@ -2225,16 +2237,24 @@ defmodule Fathom.Shard do
     Fathom.ShardLoad.forget(state.id)
     Fathom.ShardLatency.forget(state.id)
     Fathom.Shards.Lru.forget(state.id)
-    if unflushed?(state), do: quarantine_fenced!(state), else: drop_local(state.path)
+    #
+    # A close still running past the bounded wait (expert review 2026-10-13 #19) is still
+    # checkpointing into these files, so a clean copy is RENAMED aside too, never unlinked.
+    if unflushed?(state) or closes == :close_timeout,
+      do: quarantine_fenced!(state),
+      else: drop_local(state.path)
+
     # …and lift it only AFTER the rename, for the same reason it was published.
     Fathom.Shard.WriteFence.forget(state.id)
     WriteCounter.forget(state.id)
     FlushWatermark.forget(state.id)
+    # A checkin cast that landed during the settles/rename above (expert review 2026-10-13 #16).
+    close_pending_checkins()
     :ok
   end
 
   def terminate(_reason, %{conns: conns} = state) when map_size(conns) == 0 do
-    close_pool(state)
+    closes = close_pool(state)
 
     # Settle any in-flight flush task FIRST (expert review #27): its conditional PUT
     # may land at any moment, and the drop-flush below fences on the etag — racing
@@ -2260,9 +2280,11 @@ defmodule Fathom.Shard do
     #
     # Tombstone guard shared with the `conns > 0` clause below (review 2026-08-26 #9): this clause
     # is the COMMON state for a tenant delete, and it used to flush unconditionally.
-    flush_and_drop_unless_tombstoned(state)
+    flush_and_drop_unless_tombstoned(state, closes)
     WriteCounter.forget(state.id)
     FlushWatermark.forget(state.id)
+    # A checkin cast that landed during the flush above (expert review 2026-10-13 #16).
+    close_pending_checkins()
     :ok
   end
 
@@ -2299,7 +2321,7 @@ defmodule Fathom.Shard do
     # BEFORE close_pool (expert review 2026-10-12 #19): close_pool/1 can wait on the idle-close
     # chain, and the streams keep committing for that whole wait if the fence is not up yet.
     Fathom.Shard.WriteFence.fence(state.id)
-    close_pool(state)
+    closes = close_pool(state)
 
     # Settle the legacy-mode renew task before the drop-flush's fence-renew + release_lease (expert
     # review 2026-08-31 #15) — an in-flight renew PUT landing after the release would re-write the
@@ -2311,7 +2333,7 @@ defmodule Fathom.Shard do
     Fathom.Shards.Lru.forget(state.id)
     # flush_and_drop reads the write counter (unflushed?/1) to decide whether to upload, so forget
     # the counter AFTER it — forgetting first would zero the count and skip a dirty shard's flush.
-    flush_and_drop_unless_tombstoned(state)
+    flush_and_drop_unless_tombstoned(state, closes)
     # THE FENCE IS NOT LIFTED HERE AT ALL (expert review 2026-08-26 #6).
     #
     # 2026-08-24 #6 moved this `forget` down so the fence covered the checkpoint + VACUUM INTO +
@@ -2335,6 +2357,9 @@ defmodule Fathom.Shard do
     # already-quarantined inode. This clause has no such protection.
     WriteCounter.forget(state.id)
     FlushWatermark.forget(state.id)
+    # Streams are still live in this clause, so a checkin cast can land at any point during the
+    # multi-second flush above; nothing else reads the mailbox again (expert review 2026-10-13 #16).
+    close_pending_checkins()
     :ok
   end
 
@@ -2538,8 +2563,12 @@ defmodule Fathom.Shard do
   # resource is finally garbage collected `sqlite3_close_v2` runs against a path a successor
   # coordinator may by then have recreated. SQLite tracks other connections per inode, so the stale
   # close can unlink the successor's `-wal` by name.
+  #
+  # Returns `:ok`, or `:close_timeout` when the chain was STILL RUNNING after the bounded wait
+  # (expert review 2026-10-13 #19): a close is still checkpointing into the files, so the caller must
+  # not unlink or flush-and-drop them (see `flush_and_drop_unless_tombstoned/2`).
   defp close_pool(state) do
-    _ = await_closing(state, @terminate_close_wait_ms)
+    waited = await_closing(state, terminate_close_wait_ms())
     close_pending_checkins()
 
     case state do
@@ -2551,8 +2580,12 @@ defmodule Fathom.Shard do
         :ok
     end
 
-    :ok
+    if closing_busy?(waited), do: :close_timeout, else: :ok
   end
+
+  # `:shard_terminate_close_wait_ms` is a test seam (a test cannot wait 5 s per case).
+  defp terminate_close_wait_ms,
+    do: Application.get_env(:fathom, :shard_terminate_close_wait_ms, @terminate_close_wait_ms)
 
   defp close_pending_checkins do
     receive do
@@ -2564,8 +2597,25 @@ defmodule Fathom.Shard do
     end
   end
 
-  defp flush_and_drop_unless_tombstoned(state) do
-    unless Fathom.Tenants.Tombstones.tombstoned?(state.id), do: flush_and_drop(state)
+  # A close chain still running past the terminate wait (`:close_timeout`, expert review 2026-10-13
+  # #19) is checkpointing into the very files `flush_and_drop/1` snapshots and then unlinks. Take the
+  # keep-local path instead: leave the files, release the lease, and let the next open's provenance
+  # check arbitrate (the same outcome as a failed drop flush).
+  defp flush_and_drop_unless_tombstoned(state, closes) do
+    cond do
+      Fathom.Tenants.Tombstones.tombstoned?(state.id) ->
+        :ok
+
+      closes == :close_timeout ->
+        keep_local_release_lease(
+          state,
+          "pooled-handle close still running at shutdown",
+          :close_wait_timeout
+        )
+
+      true ->
+        flush_and_drop(state)
+    end
   end
 
   # --- connection tracking ---
@@ -2690,6 +2740,15 @@ defmodule Fathom.Shard do
   rescue
     e -> Logger.warning("shard #{id}: pooled-handle close crashed (#{Exception.message(e)})")
   end
+
+  # Clear a finished close chain from the state without waiting (expert review 2026-10-13 #19).
+  defp reap_closing(%{closing: pid} = state) when is_pid(pid),
+    do: if(Process.alive?(pid), do: state, else: %{state | closing: nil})
+
+  defp reap_closing(state), do: state
+
+  defp closing_busy?(%{closing: pid}) when is_pid(pid), do: true
+  defp closing_busy?(_state), do: false
 
   # Wait for the tail of the close chain (see start_close/2). Bounded: a close is one checkpoint of at
   # most ~16 MiB, so running past the bound means a wedged filesystem. On timeout the chain is left
@@ -3743,6 +3802,17 @@ defmodule Fathom.Shard do
             "until the next flush re-creates it (create-only, If-None-Match)."
         )
 
+      # The free-space preflight refused (expert review 2026-10-12 #26): like `object_too_large`,
+      # retrying cannot help until someone frees space, so the FIRST refusal is an error. Later ones
+      # are not re-logged here (2026-10-13 #30): the telemetry still fires per refusal, and the
+      # consecutive-failure alert below re-logs from its threshold on.
+      {:flush_no_space, need, free} when n == 1 ->
+        Logger.error(
+          "shard #{state.id}: durability flush REFUSED, the data volume has #{free} bytes free and " <>
+            "the flush needs about #{need} (shard size plus margin) for its VACUUM INTO temp. Acked " <>
+            "writes are NOT being made durable until space is freed; the shard stays dirty and retries."
+        )
+
       _ ->
         :ok
     end
@@ -4112,7 +4182,7 @@ defmodule Fathom.Shard do
   @flush_space_margin_bytes 32 * 1024 * 1024
   defp flush_space_preflight(state) do
     with {:ok, free} <- Fathom.Admin.Measurements.data_free_bytes(),
-         need = local_db_bytes(state.path) + flush_space_margin(),
+         need = flush_space_need(state),
          true <- free < need do
       :telemetry.execute(
         [:fathom, :shard, :flush, :no_space],
@@ -4122,16 +4192,23 @@ defmodule Fathom.Shard do
         }
       )
 
-      Logger.error(
-        "shard #{state.id}: durability flush REFUSED, the data volume has #{free} bytes free and " <>
-          "the flush needs about #{need} (shard size plus margin) for its VACUUM INTO temp. Acked " <>
-          "writes are NOT being made durable until space is freed; the shard stays dirty and retries."
-      )
-
+      # The telemetry fires on EVERY refusal; the error log is emitted by `record_flush_failure/2`
+      # only on the transition into failing (expert review 2026-10-13 #30). This runs inside the
+      # flush task, whose state carries no failure count, and the preflight is retried every interval
+      # on every dirty shard of a full volume.
       {:error, {:flush_no_space, need, free}}
     else
       _ -> :ok
     end
+  end
+
+  # The VACUUM INTO temp (db + wal content) plus the margin. A compressing backend writes a SECOND
+  # temp, the encoded body, next to it (`S3.with_body/2`, `Codec.compress_to_temp/2`); at worst it is
+  # about the size of the shard, so add the shard's size again (expert review 2026-10-13 #30).
+  defp flush_space_need(state) do
+    snapshot = local_db_bytes(state.path)
+    encoded = if Fathom.Shard.Storage.Codec.encoding() == :none, do: 0, else: snapshot
+    snapshot + encoded + flush_space_margin()
   end
 
   defp flush_space_margin,
@@ -4991,6 +5068,12 @@ defmodule Fathom.Shard do
         flush_timer_slow?: false
     }
   end
+
+  # A flush deferred behind another lease-touching operation (lapse revalidation, legacy renew): the
+  # normal interval, unless a `:flush_now` caller is parked, which must not wait a whole interval
+  # (expert review 2026-10-13 #25).
+  defp defer_flush(%{flush_waiters: []} = state), do: schedule_flush(state)
+  defp defer_flush(state), do: schedule_flush_backoff(state)
 
   # Decorrelate flush timers across coordinators (expert review #17): a mass re-home phase-aligns
   # their fixed-interval timers, so every interval N snapshots + PUTs fire in lockstep and starve
