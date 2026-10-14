@@ -2439,6 +2439,9 @@ defmodule Fathom.Shard.Storage.S3 do
                       {:ok,
                        lease
                        |> Map.put(:took_over, true)
+                       # Who we stole from, so promote-on-open can exclude that node from the
+                       # recovery responder floor (expert review 2026-10-13 #14).
+                       |> Map.put(:prev_owner, other)
                        |> Map.put(:touch_pre_etag, pre)
                        |> Map.put(:touch_post_etag, post)
                        |> Map.put(:touch_origin_etag, Storage.touch_origin(dead_lock, pre))}

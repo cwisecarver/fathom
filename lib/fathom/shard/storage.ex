@@ -79,6 +79,9 @@ defmodule Fathom.Shard.Storage do
           :epoch => non_neg_integer(),
           :expires_at_ms => integer(),
           optional(:lock_etag) => String.t(),
+          # The owner string this lease was stolen FROM (set with `took_over`; expert review
+          # 2026-10-13 #14), so recovery does not count that node toward its responder floor.
+          optional(:prev_owner) => String.t(),
           # The LINEAGE this owner claimed, written into the lock body so a successor can go
           # strictly above it (expert review 2026-09-29 #3) — see `takeover_claim/2`. Present only
           # on a lock taken over from an EXISTING one (a steal, or a reclaim of our own stale lock)

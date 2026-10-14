@@ -184,15 +184,29 @@ defmodule Fathom.Shard.PromoteOnOpen do
   defp try_promote_from_fleet(shard_id, path, lease, etag, lineage, prefetched) do
     started = System.monotonic_time(:millisecond)
 
-    with {:ok, head} <- decision_head(shard_id, prefetched),
-         {:ok, replica} <- best_replica_or_refuse(shard_id, path, position_of(head)),
+    with {:head, {:ok, head}} <- {:head, decision_head(shard_id, prefetched)},
+         {:ok, replica} <-
+           best_replica_or_refuse(shard_id, path, position_of(head), Map.get(lease, :prev_owner)),
          true <- Promote.fresher?(replica, position_of(head)),
          :ok <- recheck_object(shard_id, head, replica, started) do
       promote_replica(shard_id, path, lease, etag, replica, position_of(head), lineage)
     else
-      _ -> etag
+      # THE DECISION READ FAILED (expert review 2026-10-13 #15). Without the object's stamp the
+      # floor cannot be evaluated at all, and this used to fall through to the plain etag: open
+      # from the object with no floor, on a HEAD error that coincides with the very S3 brownouts
+      # that accompany partitions. Now it goes through the SAME under-quorum window as too few
+      # answers: refuse inside it, best-effort (error-logged) after it. With no peers configured
+      # (a local replica only) `error_window/3` returns :none and the open proceeds as before.
+      {:head, {:error, reason}} ->
+        refuse_or_etag(Recovery.error_window(shard_id, {:object_head, reason}), path, etag)
+
+      _ ->
+        etag
     end
   end
+
+  defp refuse_or_etag({:refuse, refusal}, path, _etag), do: refuse_open(path, refusal)
+  defp refuse_or_etag(_none, _path, etag), do: etag
 
   # TOO FEW PEERS ANSWERED (expert review 2026-10-12 #5): refuse the open, so the client retries
   # while the partition heals, rather than serve — and at the first flush re-stamp over — a view
@@ -205,16 +219,20 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # promotes (`maybe_promote_replica/7`) — so the second attempt would skip recovery and the window
   # entirely and serve the object. Deleting is safe: this is a cold open, so the file is a fresh
   # pull of the stored object (or its re-pull after revalidation) that nothing has served yet.
-  defp best_replica_or_refuse(shard_id, path, stamp) do
-    case Recovery.best_replica(shard_id, stamp) do
-      {:refuse, refusal} ->
-        Enum.each(["", "-wal", "-shm"], &File.rm(path <> &1))
-        File.rm(Provenance.sidecar_path(path))
-        raise refusal
-
-      other ->
-        other
+  #
+  # `prev_owner` is the owner string of the lease we stole (expert review 2026-10-13 #14): that node
+  # is not one of the writer's followers, so its answer is excluded from the responder floor.
+  defp best_replica_or_refuse(shard_id, path, stamp, prev_owner) do
+    case Recovery.best_replica(shard_id, stamp, previous_owner: prev_owner) do
+      {:refuse, refusal} -> refuse_open(path, refusal)
+      other -> other
     end
+  end
+
+  defp refuse_open(path, refusal) do
+    Enum.each(["", "-wal", "-shm"], &File.rm(path <> &1))
+    File.rm(Provenance.sidecar_path(path))
+    raise refusal
   end
 
   defp decision_head(_shard_id, {:ok, _} = head), do: head

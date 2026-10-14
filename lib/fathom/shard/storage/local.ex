@@ -687,7 +687,7 @@ defmodule Fathom.Shard.Storage.Local do
                      Map.get(dead_lock, :claim)
                    ),
                  {:ok, lease} <- write_lock(shard_id, stolen) do
-              {:ok, Map.put(lease, :took_over, true)}
+              {:ok, lease |> Map.put(:took_over, true) |> Map.put(:prev_owner, other)}
             end
 
           # Fail closed: don't steal a possibly-live owner on a heartbeat read blip.

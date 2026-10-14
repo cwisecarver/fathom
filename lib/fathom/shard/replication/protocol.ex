@@ -157,6 +157,21 @@ defmodule Fathom.Shard.Replication.Protocol do
   # state and keeps `@position`.
   @position_ord 16
 
+  # "I HOLD A REPLICA BUT IT IS TORN" (expert review 2026-10-13 #5). A torn replica used to answer
+  # the `have = 0` form of `@position`, i.e. "I hold nothing", and `Recovery` counts "nothing" as a
+  # DEFINITE answer toward the N-Q+1 responder floor. But the floor's intersection argument holds
+  # only for replies that reflect what the follower holds, and a torn replica holds (part of) the
+  # acked tail it is hiding: every primary checkpoint resets the followers' generation, so a primary
+  # dying just after a flush can leave several followers torn at once, and "nothing" answers from
+  # exactly those followers satisfied the floor and let the open serve the object.
+  #
+  # A distinct code (not a flag bit on `@position`) so that an OLD querier, which has no clause for
+  # it, decodes `{:error, :malformed}`, and `Recovery.query/3` maps every non-position reply to
+  # `:silent`. That fails TOWARD refusing: silent counts toward neither `answered` nor offers. A NEW
+  # querier maps the torn reply to `:silent` too. No payload beyond the shard id: a torn replica's
+  # position is not an honest ordering key, which is why it is never offered.
+  @position_torn 20
+
   # THE OWNERSHIP LINEAGE ON THE PUSH (expert review 2026-09-05 #4/#12). The seed already carries
   # lineage (`@seed_begin_lin`); the PUSH did not, so a following replica's lineage froze at seed
   # while the object advanced (#4), and `FollowerLog.decide/2` had only the lock epoch to fence on —
@@ -807,8 +822,15 @@ defmodule Fathom.Shard.Replication.Protocol do
   (`Follower.recover/3`) and a freshly-seeded shard with an empty WAL sits at offset 0. Collapsing
   "nothing" into "the beginning" would let a node with no copy at all win a comparison against an
   unstamped object.
+
+  `:torn` is a third answer, "I hold a replica but it is incoherent", distinct from nothing: see
+  `@position_torn`.
   """
-  @spec encode_position(String.t(), map() | nil) :: iolist()
+  @spec encode_position(String.t(), map() | :torn | nil) :: iolist()
+  def encode_position(shard_id, :torn) do
+    seal([<<@version::8, @position_torn::8, byte_size(shard_id)::16>>, shard_id])
+  end
+
   def encode_position(shard_id, nil) do
     seal([
       <<@version::8, @position::8, 0::8, byte_size(shard_id)::16, 0::64, 0::64, 0::64, 0::64>>,
@@ -883,7 +905,7 @@ defmodule Fathom.Shard.Replication.Protocol do
           | {:ok, {:ack, String.t(), non_neg_integer()}}
           | {:ok, {:reject, String.t(), atom(), non_neg_integer()}}
           | {:ok, {:position_query | :replica_request, String.t()}}
-          | {:ok, {:position, String.t(), map() | nil}}
+          | {:ok, {:position, String.t(), map() | :torn | nil}}
           | {:error, :malformed | :unsupported_version | :unauthenticated}
   def decode(<<@version::8, @signed::8, tlen::8, rest::binary>>)
       when byte_size(rest) > tlen do
@@ -1120,6 +1142,10 @@ defmodule Fathom.Shard.Replication.Protocol do
            shard::binary-size(slen)>>
        ) do
     {:ok, {:position, shard, nil}}
+  end
+
+  defp decode_frame(<<@version::8, @position_torn::8, slen::16, shard::binary-size(slen)>>) do
+    {:ok, {:position, shard, :torn}}
   end
 
   defp decode_frame(<<@version::8, @replica_request::8, slen::16, shard::binary-size(slen)>>) do

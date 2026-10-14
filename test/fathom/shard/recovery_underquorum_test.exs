@@ -24,6 +24,8 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
   alias Fathom.Shard.Replication.Fleet
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Recovery
+  alias Fathom.Shard.PromoteOnOpen
+  alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Recovery.UnderQuorum
   alias Fathom.Shard.Storage
   alias Fathom.ShardExecutor
@@ -96,6 +98,22 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
   end
 
   defp peers!(peers), do: Application.put_env(:fathom, :replication_followers, peers)
+
+  # A real peer whose replica of `id` is TORN: seeded, then fenced for a promotion, which is the
+  # same `torn: true` row a checkpoint-reset leaves behind.
+  defp torn_peer(id) do
+    root = Path.join(System.tmp_dir!(), "underq_torn_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+    name = :"underq_torn_#{System.unique_integer([:positive])}"
+    pid = start_supervised!({Follower, name: name, port: 0, dir: root}, id: name)
+    {:ok, port} = Follower.port(pid)
+    :ok = Follower.seed(name, id, 1, 0, 0, 100, 3)
+    :ok = Follower.note_ordinal(name, id, 5)
+    assert :ok = Follower.fence_for_promotion(name, id, [])
+    assert %{torn: true} = Follower.state_of(name, id), "fixture: the peer is not torn"
+    {"torn_#{name}", "127.0.0.1", port}
+  end
 
   # Three rows, flushed with an ordinal so the stored object's stamp is RANKABLE — the floor only
   # applies against a stamp a replica could be promoted over. Then node loss: coordinator killed,
@@ -215,6 +233,74 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
     end
   end
 
+  describe "window_step/3 — the expiry tombstone (expert review 2026-10-13 #40)" do
+    test "while the tombstone stands, a retry is expired again, not a fresh refusal" do
+      assert {:expired, 10_000} = Recovery.window_step({:expired, 1_000}, 11_000, 60_000)
+      assert {:expired, 60_000} = Recovery.window_step({:expired, 1_000}, 61_000, 60_000)
+    end
+
+    test "one window after the expiry it is a past episode and a new failover starts a window" do
+      assert {:wait, 0, {62_001, 62_001}} =
+               Recovery.window_step({:expired, 1_000}, 62_001, 60_000)
+    end
+  end
+
+  describe "sweep/1 — rows are reclaimed (expert review 2026-10-13 #40)" do
+    test "rows untouched for two windows go, live ones stay, tombstones follow the same rule" do
+      table = Recovery.UnderQuorumWindow
+      :ets.delete_all_objects(table)
+      now = 10_000_000
+
+      for n <- 1..1000, do: :ets.insert(table, {"old_#{n}", now - 500_000, now - 400_000})
+      :ets.insert(table, {"old_tomb", :expired, now - 400_000})
+      :ets.insert(table, {"live", now - 30_000, now - 1_000})
+      :ets.insert(table, {"live_tomb", :expired, now - 30_000})
+
+      assert Recovery.sweep(now) >= 1001
+      assert :ets.info(table, :size) == 2
+      assert [{"live", _, _}] = :ets.lookup(table, "live")
+      assert [{"live_tomb", :expired, _}] = :ets.lookup(table, "live_tomb")
+      :ets.delete_all_objects(table)
+    end
+
+    test "a refusal that inserts a new row sweeps once the table has grown" do
+      table = Recovery.UnderQuorumWindow
+      :ets.delete_all_objects(table)
+      now = System.monotonic_time(:millisecond)
+      for n <- 1..300, do: :ets.insert(table, {"stale_#{n}", now - 900_000, now - 900_000})
+
+      peers = [dead(1), dead(2), dead(3), dead(4)]
+      assert {:refuse, _} = Recovery.best_replica("sweeper", @stamp, peers: peers, quorum: 2)
+
+      assert :ets.info(table, :size) == 1
+      :ets.delete_all_objects(table)
+    end
+
+    test "a failed best-effort open is not re-refused", %{id: id} do
+      peers = [dead(1), dead(2), dead(3), dead(4)]
+      assert {:refuse, _} = Recovery.best_replica(id, @stamp, peers: peers, quorum: 2)
+
+      [{^id, first, last}] = :ets.lookup(Recovery.UnderQuorumWindow, id)
+      :ets.insert(Recovery.UnderQuorumWindow, {id, first - 60_001, last})
+
+      # The window expires and the open proceeds best-effort ...
+      assert :none = Recovery.best_replica(id, @stamp, peers: peers, quorum: 2)
+      # ... and suppose that open FAILED: the retry must not start a fresh 60 s refusal.
+      assert :none = Recovery.best_replica(id, @stamp, peers: peers, quorum: 2)
+    end
+  end
+
+  describe "previous_owner?/2" do
+    test "matches the node name before the incarnation, or the host part of name@host" do
+      assert Recovery.previous_owner?("fathom1#ab12", "fathom1")
+      assert Recovery.previous_owner?("fathom@fathom1#ab12", "fathom1")
+      refute Recovery.previous_owner?("fathom@fathom1#ab12", "fathom2")
+      refute Recovery.previous_owner?("fathom10#ab12", "fathom1")
+      refute Recovery.previous_owner?(nil, "fathom1")
+      refute Recovery.previous_owner?("#ab12", "")
+    end
+  end
+
   # -- best_replica/3 ------------------------------------------------------------------------
 
   describe "best_replica/3 counts definite answers" do
@@ -247,6 +333,128 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
     test "an unrankable stamp is never refused", %{id: id} do
       peers = [dead(1), dead(2), dead(3), dead(4)]
       assert :none = Recovery.best_replica(id, nil, peers: peers, quorum: 2)
+    end
+
+    # SYMPTOM (expert review 2026-10-13 #5): a TORN follower answered "I hold nothing", which the
+    # floor counted as DEFINITE. N=4, Q=2 needs 3 answers; this node plus two torn peers made 3, so
+    # `choose` returned :none and the shard opened from the object while the torn peers held the
+    # acked tail. A torn peer must count toward neither the floor nor the offers.
+    test "torn peers are silent: they do not satisfy the floor", %{id: id} do
+      peers = [torn_peer(id), torn_peer(id), dead(1), dead(2)]
+
+      assert {:refuse, %UnderQuorum{answered: 1, needed: 3}} =
+               Recovery.best_replica(id, @stamp, peers: peers, quorum: 2)
+    end
+
+    test "a peer holding nothing still counts, a torn one next to it does not", %{id: id} do
+      peers = [live(), torn_peer(id), dead(1), dead(2)]
+
+      assert {:refuse, %UnderQuorum{answered: 2, needed: 3}} =
+               Recovery.best_replica(id, @stamp, peers: peers, quorum: 2)
+    end
+
+    # SYMPTOM (expert review 2026-10-13 #14): the node whose lease we stole is in `peers/0`, but it
+    # is not one of the writer's followers. Its "nothing" must not stand in for a follower.
+    test "the previous owner's answer does not count toward the floor", %{id: id} do
+      {p_key, _, _} = p = live()
+      peers = [p, live(), dead(1), dead(2)]
+
+      # Control: without naming the previous owner the floor is met (own + P + A = 3).
+      assert :none = Recovery.best_replica(id, @stamp, peers: peers, quorum: 2)
+      Recovery.init_table()
+      :ets.delete_all_objects(Recovery.UnderQuorumWindow)
+
+      assert {:refuse, %UnderQuorum{answered: 2, needed: 3}} =
+               Recovery.best_replica(id, @stamp,
+                 peers: peers,
+                 quorum: 2,
+                 previous_owner: p_key <> "#a1b2c3d4"
+               )
+    end
+  end
+
+  # -- internal errors go through the window (expert review 2026-10-13 #15) ---------------------
+
+  describe "an internal crash does not fail open" do
+    @describetag :capture_log
+
+    test "refuses inside the window, best-effort after it, with the telemetry", %{id: id} do
+      attach_telemetry(id)
+      peers = [live(), live(), dead(1), dead(2)]
+      # `quorum: :bad` makes the decision crash (ArithmeticError) before any answer is read.
+      opts = [peers: peers, quorum: :bad]
+
+      assert {:refuse, %UnderQuorum{shard_id: ^id}} = Recovery.best_replica(id, @stamp, opts)
+      assert_receive {:underquorum, :skipped_error, _}
+
+      [{^id, first, last}] = :ets.lookup(Recovery.UnderQuorumWindow, id)
+      :ets.insert(Recovery.UnderQuorumWindow, {id, first - 60_001, last})
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert :none = Recovery.best_replica(id, @stamp, opts)
+        end)
+
+      assert log =~ "opening best-effort"
+      assert_receive {:underquorum, :opened_best_effort, _}
+    end
+
+    test "with no peers there is no floor to apply", %{id: id} do
+      assert :none = Recovery.error_window(id, :boom, peers: [], quorum: 2)
+    end
+  end
+
+  describe "a failed decision HEAD does not fail open (try_promote_from_fleet)" do
+    setup %{id: id} do
+      prev_storage = Application.get_env(:fathom, :shard_storage)
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      Application.put_env(:fathom, :storage_fault, :object_head)
+
+      on_exit(fn ->
+        Application.delete_env(:fathom, :storage_fault)
+
+        if prev_storage,
+          do: Application.put_env(:fathom, :shard_storage, prev_storage),
+          else: Application.delete_env(:fathom, :shard_storage)
+      end)
+
+      path = Path.join(System.tmp_dir!(), "headerr_#{id}.db")
+      File.write!(path, "stand-in for the cold-pulled object")
+      on_exit(fn -> for s <- ["", "-wal", "-shm", ".etag"], do: File.rm(path <> s) end)
+      %{path: path}
+    end
+
+    test "refuses inside the window (and drops the cold pull), best-effort after", %{
+      id: id,
+      path: path
+    } do
+      attach_telemetry(id)
+      peers!([live(), dead(1), dead(2), dead(3)])
+      lease = %{owner: "me#1", epoch: 2, expires_at_ms: 0}
+
+      call = fn ->
+        PromoteOnOpen.maybe_promote_replica(id, path, lease, "etag0", 5, false, nil)
+      end
+
+      assert_raise UnderQuorum, call
+      assert_receive {:underquorum, :skipped_error, _}
+      refute File.exists?(path), "the cold-pulled copy must go, or the retry opens warm"
+
+      File.write!(path, "x")
+      [{^id, first, last}] = :ets.lookup(Recovery.UnderQuorumWindow, id)
+      :ets.insert(Recovery.UnderQuorumWindow, {id, first - 60_001, last})
+
+      log = ExUnit.CaptureLog.capture_log(fn -> assert "etag0" = call.() end)
+      assert log =~ "opening best-effort"
+      assert_receive {:underquorum, :opened_best_effort, _}
+    end
+
+    test "with no peers the HEAD error leaves the open unchanged", %{id: id, path: path} do
+      peers!([])
+      lease = %{owner: "me#1", epoch: 2, expires_at_ms: 0}
+
+      assert "etag0" =
+               PromoteOnOpen.maybe_promote_replica(id, path, lease, "etag0", 5, false, nil)
     end
   end
 
@@ -292,7 +500,11 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
     assert read_rows(id) == [1, 2, 3]
     assert_receive {:underquorum, :opened_best_effort, %{answered: 2, needed: 3, waited_ms: w}}
     assert w >= 60_000
-    assert :ets.lookup(Recovery.UnderQuorumWindow, id) == []
+
+    # The row is now a TOMBSTONE, not gone (expert review 2026-10-13 #40). This used to assert `== []`:
+    # that pinned the defect, because deleting the row before the best-effort open meant a failed
+    # open's retry started a fresh 60 s refusal.
+    assert [{^id, :expired, _at}] = :ets.lookup(Recovery.UnderQuorumWindow, id)
   end
 
   test "enough definite answers — 'nothing' included — open on the first try", %{id: id} do
@@ -312,6 +524,31 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
 
     assert read_rows(id) == [1, 2, 3]
     refute_received {:underquorum, _, _}
+  end
+
+  describe "the torn position reply (expert review 2026-10-13 #5)" do
+    test "round-trips, and is distinct from 'nothing' and from a position" do
+      torn = IO.iodata_to_binary(Protocol.encode_position("acme", :torn))
+      nothing = IO.iodata_to_binary(Protocol.encode_position("acme", nil))
+      assert {:ok, {:position, "acme", :torn}} = Protocol.decode(torn)
+      assert {:ok, {:position, "acme", nil}} = Protocol.decode(nothing)
+      assert torn != nothing
+    end
+
+    test "an old-style querier reads it as a non-position frame, which Recovery maps to silent" do
+      # An old decoder has no clause for the new code: it falls to `{:error, :malformed}`, and
+      # `Recovery.query/3` maps every non-position reply to :silent. Simulated with an unknown code.
+      unknown = <<2::8, 99::8, 4::16, "acme">>
+      assert {:error, _} = Protocol.decode(IO.iodata_to_binary(unknown))
+    end
+
+    test "old-style replies still read" do
+      pos = %{epoch: 3, wal_gen: 1, salt1: 7, next_offset: 12, wal_ordinal: 4}
+      frame = IO.iodata_to_binary(Protocol.encode_position("acme", pos))
+
+      assert {:ok, {:position, "acme", %{wal_ordinal: 4, next_offset: 12}}} =
+               Protocol.decode(frame)
+    end
   end
 
   test "with no peers configured, the open path is unchanged", %{id: id} do

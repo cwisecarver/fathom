@@ -159,6 +159,22 @@ best-effort over what answered, with an error log and `[:fathom, :replication, :
 (`outcome: :opened_best_effort`). The floor also gates the local short-circuit: a local replica
 ahead of the object can still be behind a silent peer.
 
+Refinements (expert review 2026-10-13 #5, #14, #15, #40):
+
+- A **torn** follower answers a distinct `torn` position reply (type code 20), not "I hold nothing".
+  The querier reads it as silent, so it counts toward neither the floor nor the offers. An old peer
+  that cannot decode the code also reads as silent, which fails toward refusing.
+- The **previous owner** (the node whose lease was stolen; the lease carries `prev_owner`) is not one
+  of the writer's followers, so its answer does not count toward the floor. Matching is by the owner
+  string's node name (or the host part of `name@host`) against the peer's `node_key`; a deployment
+  where neither matches gets no exclusion.
+- An **internal error** (a crash in `best_replica/3`, or the decision-time object HEAD failing while
+  peers are configured) goes through the same window instead of opening with no floor: refuse inside
+  it (`outcome: :skipped_error`), best-effort with an error log after it.
+- The expiry leaves a **tombstone** for one window, so a best-effort open that fails is not re-refused
+  for a fresh 60 s. Rows untouched for two windows are swept when a refusal inserts a new row and the
+  table has grown past 256.
+
 N and Q are this node's peer set and `REPLICATION_QUORUM`, which assumes a symmetric fleet with one
 quorum. The floor applies only against a rankable object stamp, so a brand-new shard is never
 refused. With no peers or with recovery off, nothing changes. A lone survivor of an N≥2 fleet waits

@@ -1013,11 +1013,18 @@ defmodule Fathom.Shard.Replication.Follower do
     # pulling from. Read-only and cheap on purpose: this is asked of every peer on a cold open, so
     # it must never touch the database or the object store.
     #
-    # A TORN replica offers NOTHING rather than its position — same answer as never having seen the
-    # shard. `Promote.fresher?/2` would refuse it on arrival anyway, but a peer would first pay a
-    # whole database transfer to be told so, and the bytes it pulled would be the incoherent
-    # `.db`/`-wal` pair. Answering "nothing" is both cheaper and honest.
-    reply(sock, Protocol.encode_position(shard, offerable(name, shard)))
+    # A TORN replica never OFFERS its position (`Promote.fresher?/2` would refuse it on arrival, and
+    # a peer would first pay a whole database transfer to be told so), but it must not answer
+    # "nothing" either: that was counted as a DEFINITE answer toward the responder floor while the
+    # torn replica may hold the acked tail (expert review 2026-10-13 #5). It answers `:torn`, which
+    # the querier treats as silent. An old querier cannot decode the code and also reads silent.
+    answer =
+      case state_of(name, shard) do
+        %{torn: true} -> :torn
+        other -> other
+      end
+
+    reply(sock, Protocol.encode_position(shard, answer))
     seeds
   end
 
