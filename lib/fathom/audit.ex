@@ -94,10 +94,14 @@ defmodule Fathom.Audit do
     end
   end
 
-  defp source_ip_of(%{remote_ip: nil}), do: nil
+  # The same client address the throttles key on (expert review 2026-10-13 #24). `conn.remote_ip` is
+  # the proxy's address behind a proxy, so audit rows named the proxy, not the operator. With
+  # TRUSTED_PROXIES set, `ClientIp.resolve/1` honours X-Forwarded-For from a trusted peer only, and
+  # is `remote_ip` otherwise.
+  defp source_ip_of(%Plug.Conn{remote_ip: nil}), do: nil
 
-  defp source_ip_of(%{remote_ip: ip}) do
-    case :inet.ntoa(ip) do
+  defp source_ip_of(%Plug.Conn{} = conn) do
+    case :inet.ntoa(FathomWeb.ClientIp.resolve(conn)) do
       {:error, _} -> nil
       addr -> to_string(addr)
     end
