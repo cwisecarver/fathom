@@ -294,6 +294,43 @@ defmodule Fathom.ShardExecutorTest do
     ShardExecutor.close(conn)
   end
 
+  # Expert review 2026-10-13 #23. The rescue returned `Exception.message(e)` to the tenant, and that
+  # text names module internals and paths. The tenant now gets a fixed message; the detail stays in
+  # the server log. Before the fix the message was the FunctionClauseError text, not this string.
+  test "a raising statement gives the tenant a fixed message and logs the detail", %{shard: shard} do
+    {:ok, conn} = ShardExecutor.open(shard)
+
+    {result, log} =
+      ExUnit.CaptureLog.with_log(fn ->
+        ShardExecutor.execute(conn, %Stmt{sql: "SELECT ?", args: :not_a_list})
+      end)
+
+    assert {:error, %Error{code: "SQLITE_ERROR", message: "internal error executing statement"}} =
+             result
+
+    assert log =~ "execute raised"
+
+    ShardExecutor.close(conn)
+  end
+
+  # Expert review 2026-10-13 #23. A Session exit names the data path and a pid. The FILO_NO_QUORUM
+  # message used to interpolate `inspect(reason)`, so it carried both. Pre-fix the message contained
+  # the "/" of the path, and this test fails on that.
+  test "FILO_NO_QUORUM names no path or pid to the tenant; the reason is logged" do
+    reason =
+      {:session_down,
+       {:timeout, {GenServer, :call, [self(), {:commit, "/var/lib/fathom/acme.db-wal"}, 5_000]}}}
+
+    {error, log} =
+      ExUnit.CaptureLog.with_log(fn -> ShardExecutor.no_quorum_error("acme", reason) end)
+
+    assert %Error{code: "FILO_NO_QUORUM", status: 503, message: message} = error
+    assert message == "write not replicated to a follower quorum"
+    refute message =~ "/"
+    refute message =~ "#PID"
+    assert log =~ "/var/lib/fathom/acme.db-wal"
+  end
+
   test "an invalid shard id fails to open" do
     assert {:error, %Error{code: "FILO_SHARD_OPEN"}} = ShardExecutor.open("bad/../id")
   end

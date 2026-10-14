@@ -163,9 +163,11 @@ defmodule Fathom.ShardExecutor do
     # A statement must never crash the Hrana stream: exqlite/bind/result-mapping can raise
     # (connection.ex only rescues ArgumentError), so convert any raise at the executor
     # boundary to a protocol error the client can see and the stream survives (finding #25).
+    # The tenant gets a fixed message: the exception text carries module internals, paths and
+    # pids (expert review 2026-10-13 #23). The detail goes to the server log.
     e ->
       Logger.warning("shard #{shard_id} execute raised: #{Exception.message(e)}")
-      {:error, %Error{message: Exception.message(e), code: "SQLITE_ERROR"}}
+      {:error, %Error{message: "internal error executing statement", code: "SQLITE_ERROR"}}
   catch
     :exit, reason ->
       Logger.warning("shard #{shard_id} execute exited: #{inspect(reason)}")
@@ -441,7 +443,7 @@ defmodule Fathom.ShardExecutor do
         # Fathom.Shard.Replication.Session on the at-least-once hazard that follows.
         case repl do
           :ok -> {:ok, stmt_result}
-          {:error, reason} -> {:error, no_quorum_error(reason)}
+          {:error, reason} -> {:error, no_quorum_error(shard_id, reason)}
         end
 
       # Per-query resource bounds (expert review 2026-07-14 #26) — distinct, non-SQLITE codes so a
@@ -761,9 +763,17 @@ defmodule Fathom.ShardExecutor do
   # Distinct from a SQLite error, and a 503 rather than a 400: nothing is wrong with the statement,
   # the node could not reach enough followers. A client should retry — accepting the at-least-once
   # hazard the Session moduledoc describes — not rewrite its SQL.
-  defp no_quorum_error(reason) do
+  #
+  # The reason can carry a data path and a pid (a Session call exit names both), so the tenant gets
+  # the fixed message and the reason goes to the server log (expert review 2026-10-13 #23).
+  @doc false
+  def no_quorum_error(shard_id, reason) do
+    Logger.warning(
+      "shard #{shard_id} write not replicated to a follower quorum: #{inspect(reason)}"
+    )
+
     %Error{
-      message: "write not replicated to a follower quorum (#{inspect(reason)})",
+      message: "write not replicated to a follower quorum",
       code: "FILO_NO_QUORUM",
       status: 503
     }
@@ -1003,7 +1013,7 @@ defmodule Fathom.ShardExecutor do
         # quorum-durable write and did not get one, so it gets the 503.
         case maybe_replicate(shard_id, pid, conn, sql, true) do
           :ok -> :ok
-          {:error, reason} -> {:error, no_quorum_error(reason)}
+          {:error, reason} -> {:error, no_quorum_error(shard_id, reason)}
         end
 
       {:error, reason} ->
