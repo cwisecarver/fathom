@@ -305,4 +305,18 @@ defmodule Fathom.BenchTest do
       Fathom.Bench.promote_open_sample(20, 10, 4096)
     end
   end
+
+  # perf review 2026-10-14 #17. The replication-ON density arm asserts its own preconditions
+  # (replication on, shippers connected, one Session per shard, replicas present on every follower)
+  # and raises otherwise; this runs it small and bounds the answer to an order of magnitude. The
+  # replicating shard must cost the primary MORE than the plain served regime's ~220 KiB-ish floor
+  # is not asserted (watch-only metric, no band yet) — only that it is positive and finite.
+  @tag timeout: 300_000
+  test "served_repl measures a replicating fleet and reports both sides" do
+    r = Fathom.Bench.served_repl(served_repl_n: 8, trials: 1)
+    IO.puts("served_repl: #{inspect(r)}")
+    assert r.total_kb > 10 and r.total_kb < 5_000
+    assert r.follower_kb > 0 and r.follower_kb < 5_000
+    refute Fathom.Shard.Replication.Fleet.replicating?(), "the arm left replication on"
+  end
 end
