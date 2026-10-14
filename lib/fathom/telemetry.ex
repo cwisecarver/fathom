@@ -236,6 +236,12 @@ defmodule Fathom.Telemetry do
           "Failover opens whose peer query heard fewer than N-Q+1 definite answers: refused " <>
             "(retryable 503) or, after the window, opened best-effort (possible acked-write loss)"
       ),
+      # One snapshot per seed BATCH (perf review 2026-10-14 #12(a)): a rate near the seed rate
+      # means the shared pin is working; one per follower per seed means it regressed.
+      counter("fathom.replication.seed_pin.open.count",
+        event_name: [:fathom, :replication, :seed_pin, :open],
+        description: "Seed snapshots opened (one per seed batch, shared by its followers)"
+      ),
       counter("fathom.shards.at_capacity.count",
         event_name: [:fathom, :shards, :at_capacity],
         description:
