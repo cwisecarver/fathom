@@ -914,8 +914,9 @@ if ms = env_int.("REPLICATION_RECOVERY_UNDERQUORUM_WINDOW_MS") do
 end
 
 # Bytes per frame when seeding a follower's base copy. Bounds MEMORY on both sides (a seed is a
-# whole database); it does not bound head-of-line blocking, since one socket per follower node
-# carries every shard. Default 4 MiB.
+# whole database) and is the head-of-line unit on a link: one socket per follower node carries
+# every shard, and a seed chunk holds it for chunk/link-rate (docs/configuration.md; perf review
+# 2026-10-14 #18). Default 4 MiB.
 if n = env_int.("REPLICATION_SEED_CHUNK_BYTES") do
   config :fathom, :replication_seed_chunk_bytes, n
 end

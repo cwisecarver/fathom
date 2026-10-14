@@ -42,6 +42,7 @@ defmodule Fathom.Shard.Replication.Session do
   alias Fathom.Shard.Replication.Protocol.Push
   alias Fathom.Shard.Replication.Protocol.SeedBegin
   alias Fathom.Shard.Replication.SeedGate
+  alias Fathom.Shard.Replication.SeedPin
   alias Fathom.Shard.Replication.Shipper
   alias Fathom.Shard.Replication.Wal
 
@@ -1535,38 +1536,58 @@ defmodule Fathom.Shard.Replication.Session do
           not Map.has_key?(state.seeding, shipper),
           do: shipper
 
-    Enum.reduce(needs, state, fn shipper, acc ->
-      session = self()
-      db_path = String.replace_suffix(wal_path, "-wal", "")
+    session = self()
+    db_path = String.replace_suffix(wal_path, "-wal", "")
 
-      # `spawn_monitor`, not `Task.start`: monitoring has to be ATOMIC with the spawn, or a task
-      # that dies in the gap leaves an entry nothing will ever remove — which is the bug being
-      # fixed, reintroduced in a smaller window. Not linked: a raise inside `do_seed/5` must not
-      # take down the Session, which holds the shard's serialization point. The `terminate/2`
-      # sweep below is what covers the other half the finding asked for (a stopped Session must
-      # not leave a task streaming a whole tenant database for a shard this node no longer owns).
-      token = make_ref()
+    # ONE pinned snapshot for the whole batch (perf review 2026-10-14 #12(a)): a reopened shard
+    # re-seeds every follower at once, and each task used to open and pin its own identical
+    # snapshot. See `SeedPin` for why sharing it keeps the pin-before-`Wal.read` ordering.
+    pin =
+      case needs do
+        [] ->
+          nil
 
-      {pid, ref} =
-        spawn_monitor(fn ->
-          send(
-            session,
-            {:seeded, shipper, token,
-             gated_seed(shipper, acc.shard_id, db_path, wal_path, acc.epoch, acc.lineage)}
-          )
-        end)
+        _ ->
+          {:ok, pin} = SeedPin.start(session, db_path)
+          pin
+      end
 
-      watch_session(session, pid)
+    seeded =
+      Enum.reduce(needs, state, fn shipper, acc ->
+        # `spawn_monitor`, not `Task.start`: monitoring has to be ATOMIC with the spawn, or a task
+        # that dies in the gap leaves an entry nothing will ever remove — which is the bug being
+        # fixed, reintroduced in a smaller window. Not linked: a raise inside `do_seed/5` must not
+        # take down the Session, which holds the shard's serialization point. The `terminate/2`
+        # sweep below is what covers the other half the finding asked for (a stopped Session must
+        # not leave a task streaming a whole tenant database for a shard this node no longer owns).
+        token = make_ref()
 
-      entry = %{
-        ref: ref,
-        token: token,
-        pid: pid,
-        started_at: System.monotonic_time(:millisecond)
-      }
+        {pid, ref} =
+          spawn_monitor(fn ->
+            send(
+              session,
+              {:seeded, shipper, token,
+               gated_seed(pin, shipper, acc.shard_id, db_path, wal_path, acc.epoch, acc.lineage)}
+            )
+          end)
 
-      %{acc | seeding: Map.put(acc.seeding, shipper, entry)}
-    end)
+        watch_session(session, pid)
+
+        entry = %{
+          ref: ref,
+          token: token,
+          pid: pid,
+          started_at: System.monotonic_time(:millisecond)
+        }
+
+        %{acc | seeding: Map.put(acc.seeding, shipper, entry)}
+      end)
+
+    if pin do
+      SeedPin.expect(pin, for(shipper <- needs, do: seeded.seeding[shipper].pid))
+    end
+
+    seeded
   end
 
   # A seed task must not outlive its Session (expert review 2026-10-12 #26). The `terminate/2`
@@ -1649,11 +1670,11 @@ defmodule Fathom.Shard.Replication.Session do
   # shard x follower at once, and each holds its follower's single link for the whole transfer. The
   # wait is bounded below `seed_expiry_ms/0`, so a seed that never got a slot gives up on its own
   # rather than being killed as wedged. A killed task's slot is freed by SeedGate's monitor.
-  defp gated_seed(shipper, shard_id, db_path, wal_path, epoch, lineage) do
+  defp gated_seed(pin, shipper, shard_id, db_path, wal_path, epoch, lineage) do
     case SeedGate.acquire(seed_gate_wait_ms()) do
       :ok ->
         try do
-          timed_seed(shipper, shard_id, db_path, wal_path, epoch, lineage)
+          timed_seed(pin, shipper, shard_id, db_path, wal_path, epoch, lineage)
         after
           SeedGate.release()
         end
@@ -1673,10 +1694,15 @@ defmodule Fathom.Shard.Replication.Session do
   # wall time per seed. Neither was observable before: the only trace was a log line with the
   # resulting position. `bytes` is what was DECLARED (db + wal at seed_begin), measured before the
   # stream so a failed seed still reports what it was attempting.
-  defp timed_seed(shipper, shard_id, db_path, wal_path, epoch, lineage) do
+  defp timed_seed(pin, shipper, shard_id, db_path, wal_path, epoch, lineage) do
     bytes = seed_bytes(db_path, wal_path)
     started = System.monotonic_time()
-    result = do_seed(shipper, shard_id, db_path, wal_path, epoch, lineage)
+
+    result =
+      shared_pin(pin, fn ->
+        stream_seed(shipper, shard_id, db_path, wal_path, epoch, lineage)
+      end)
+
     duration = System.monotonic_time() - started
     ms = System.convert_time_unit(duration, :native, :millisecond)
 
@@ -1763,6 +1789,27 @@ defmodule Fathom.Shard.Replication.Session do
     with_pinned_snapshot(db_path, fn ->
       stream_seed(shipper, shard_id, db_path, wal_path, epoch, lineage)
     end)
+  end
+
+  # The batch's shared pin (`SeedPin`) held for the duration of `fun`; attached AFTER the seed gate,
+  # so a seed waiting for a slot never holds a snapshot.
+  defp shared_pin(pin, fun) do
+    case SeedPin.attach(pin) do
+      :ok ->
+        try do
+          fun.()
+        after
+          # The pin process may already be gone (Session died); the claim is then moot.
+          try do
+            SeedPin.detach(pin)
+          catch
+            :exit, _ -> :ok
+          end
+        end
+
+      {:error, _} = err ->
+        err
+    end
   end
 
   # Holds a read transaction on `db_path` for the duration of `fun` — see the note above

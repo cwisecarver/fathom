@@ -912,8 +912,8 @@ cmd_seed_rate() {
   fi
 
   local kib shard home n t0 t1 base_ms trig_ms trig_ok mib i since lines
-  printf '%-9s %-10s %-6s %-22s %-10s %-10s %-9s %s\n' \
-    size_kib db_bytes seeds "seed_ms(min/med/max)" base_ms trig_ms trig_ok MB/s_med
+  printf '%-9s %-10s %-6s %-22s %-10s %-10s %-9s %-9s %s\n' \
+    size_kib db_bytes seeds "seed_ms(min/med/max)" base_ms trig_ms trig_ok MB/s_med small_p50/p99_ms
   for kib in "${sizes[@]}"; do
     shard="seedrate${kib}k"
     sql "$shard" "CREATE TABLE IF NOT EXISTS big (b BLOB)" >/dev/null || { echo "FAIL: create $shard"; return 1; }
@@ -950,6 +950,32 @@ cmd_seed_rate() {
       rpc "$n" 'Fathom.Shard.Replication.Follower.forget(Fathom.Shard.Replication.Follower, "'"$shard"'")' >/dev/null
     done
 
+    # R4 (perf review 2026-10-14 #18): a SMALL-SHARD WRITER on the same home node, running through
+    # the trigger. Seed chunks and pushes share one FIFO per follower link, so a big chunk holds
+    # every other shard's commit behind it; the trigger write's own latency cannot show that. It
+    # needs the same HOME node as the big shard (the link is per node pair), so candidate names are
+    # tried until one is served there. Reported as small_p50/p99 ms. SEED_SMALL_WRITER=0 skips it.
+    local small="" smallf="" smallpid="" cand c
+    if [ "${SEED_SMALL_WRITER:-1}" = "1" ]; then
+      for c in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        cand="seedsmall${kib}k${c}"
+        sql "$cand" "CREATE TABLE IF NOT EXISTS s (b INTEGER)" >/dev/null 2>&1 || continue
+        case "$(rpc "$home" 'IO.puts(Registry.lookup(Fathom.ShardRegistry, "'"$cand"'") != [])')" in
+          *true*) small=$cand; break ;;
+        esac
+      done
+      if [ -n "$small" ]; then
+        smallf=$(mktemp)
+        (
+          while :; do
+            a=$(now_ms); sql "$small" "INSERT INTO s VALUES (1)" >/dev/null 2>&1; b=$(now_ms)
+            echo $((b - a)) >> "$smallf"
+          done
+        ) &
+        smallpid=$!
+      fi
+    fi
+
     # Minus a second: docker stamps log lines with the VM's clock, which can trail the host's.
     since=$(/usr/bin/python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ"))')
     t0=$(now_ms)
@@ -959,6 +985,16 @@ cmd_seed_rate() {
 
     # Let the seeds the quorum did not wait for finish, then read every seed line for this shard.
     sleep 5
+    local small_stats="-/-"
+    if [ -n "$smallpid" ]; then
+      kill "$smallpid" 2>/dev/null; wait "$smallpid" 2>/dev/null
+      small_stats=$(/usr/bin/python3 -c '
+import sys
+v = sorted(int(l) for l in open(sys.argv[1]) if l.strip())
+print("%d/%d" % (v[len(v)//2], v[min(len(v)-1, int(len(v)*0.99))]) if v else "-/-")
+' "$smallf")
+      command rm -f "$smallf"
+    fi
     lines=$(compose logs --since "$since" 2>/dev/null | grep "replication seed ok for $shard " || true)
     local stats
     stats=$(printf '%s\n' "$lines" | /usr/bin/python3 -c '
@@ -978,8 +1014,8 @@ print(len(ms), "%d/%d/%d" % (ms[0], med, ms[-1]), by[0], "%.1f" % rate)
 ')
     local nseeds sms sbytes rate
     read -r nseeds sms sbytes rate <<< "$stats"
-    printf '%-9s %-10s %-6s %-22s %-10s %-10s %-9s %s\n' \
-      "$kib" "$sbytes" "$nseeds" "$sms" "$base_ms" "$trig_ms" "$trig_ok" "$rate"
+    printf '%-9s %-10s %-6s %-22s %-10s %-10s %-9s %-9s %s\n' \
+      "$kib" "$sbytes" "$nseeds" "$sms" "$base_ms" "$trig_ms" "$trig_ok" "$rate" "$small_stats"
   done
   echo
   echo "Projection for 'seed on ownership change': seeds/s per node <= reopens/s x ${#NODES[@]}-1 followers,"

@@ -142,6 +142,9 @@ x-fathom-env: &fathom-env
   # depth: queue depth was FLAT (8,265 -> 8,195) across a doubling of held memory
   # (6,893 -> 15,798 MB) and would have reported success.
   REPLICATION_MAX_PUSH_BYTES: "${REPLICATION_MAX_PUSH_BYTES:-}"
+  # Seed frame size (perf review 2026-10-14 #18): the head-of-line unit on a follower link. Empty =
+  # the application default. R4 compares 4 MiB with 262144 on one image through this switch.
+  REPLICATION_SEED_CHUNK_BYTES: "${REPLICATION_SEED_CHUNK_BYTES:-}"
   REPLICATION_MAX_QUEUE_BYTES: "${REPLICATION_MAX_QUEUE_BYTES:-}"
   # SeedGate's node-wide cap (expert review 2026-10-01 #6). Empty = the default (off).
   REPLICATION_SEED_MAX_CONCURRENCY: "${REPLICATION_SEED_MAX_CONCURRENCY:-}"
