@@ -39,7 +39,7 @@ defmodule Fathom.Shard.Replication.Follower do
 
   require Logger
 
-  alias Fathom.Shard.Connection
+  alias Exqlite.Sqlite3
   alias Fathom.Shard.Replication.FollowerLog
   alias Fathom.Shard.Replication.Wal
   alias Fathom.Shard.Replication.Protocol
@@ -2306,22 +2306,51 @@ defmodule Fathom.Shard.Replication.Follower do
   # is `log == checkpointed`. Same defect class as `Migrator.Copy`'s fold (review #25, 73d95f6).
   @doc false
   @spec checkpoint_into_db(Path.t()) :: :ok | {:error, term()}
+  #
+  # A LEAN HANDLE (perf review 2026-10-14 #13). This used `Connection.open/1` — extension load and
+  # disable, the pragma guard, page_size/max_page_count, WAL enable, five pragmas: 361 us of a 450 us
+  # absorb, inline on the reset push's ack path. Absorbing needs only a handle that recovers the WAL
+  # and checkpoints it, so this opens raw, sets the cancellable busy timeout (NOT the pragma, see
+  # `Connection.configure/2`) and `synchronous=FULL` (unchanged: the absorb fsyncs the `.db` before
+  # the WAL is truncated, so a crash cannot leave a replica short AND unmarked), and runs the
+  # checkpoint. No tenant SQL ever runs here, so no extension, authorizer or tenant configure.
+  #
+  # NO `journal_mode` SET OR CHECK (probed 2026-10-14): `Connection.open/1` enabled WAL and failed
+  # the open on anything else, but the caller only gets here when a non-empty `-wal` exists, and
+  # SQLite opens a database in WAL mode whenever one is present (`pagerOpenWalIfPresent`), whatever
+  # the header says. The only file a raw handle could see as non-WAL is one with no WAL at all,
+  # which the caller never absorbs.
   def checkpoint_into_db(db) do
-    case Connection.open(db) do
+    case Sqlite3.open(db) do
       {:ok, conn} ->
         try do
-          case Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", []) do
-            {:ok, %{rows: [[_busy, log, log]]}} -> :ok
-            {:ok, %{rows: [row]}} -> {:error, {:absorb_incomplete, row}}
-            {:error, reason} -> {:error, {:checkpoint_failed, reason}}
+          with :ok <- Sqlite3.set_busy_timeout(conn, 5000),
+               :ok <- Sqlite3.execute(conn, "PRAGMA synchronous=FULL") do
+            case checkpoint_truncate(conn) do
+              {:ok, [[_busy, log, log]]} -> :ok
+              {:ok, [row]} -> {:error, {:absorb_incomplete, row}}
+              {:error, reason} -> {:error, {:checkpoint_failed, reason}}
+              other -> {:error, {:checkpoint_failed, other}}
+            end
+          else
+            {:error, reason} -> {:error, {:open_failed, reason}}
           end
         after
-          Connection.close(conn)
+          _ = Sqlite3.close(conn)
           File.rm(db <> "-shm")
         end
 
       {:error, reason} ->
         {:error, {:open_failed, reason}}
+    end
+  end
+
+  # `prepare` + `fetch_all`: `Sqlite3.execute/2` discards the result row, and the row is the point.
+  defp checkpoint_truncate(conn) do
+    with {:ok, stmt} <- Sqlite3.prepare(conn, "PRAGMA wal_checkpoint(TRUNCATE)") do
+      result = Sqlite3.fetch_all(conn, stmt)
+      _ = Sqlite3.release(conn, stmt)
+      result
     end
   end
 
@@ -2340,9 +2369,13 @@ defmodule Fathom.Shard.Replication.Follower do
   # primary re-seed it. An append at offset 0 may still create the file: it starts with the WAL
   # header, so what it writes is a valid WAL.
   defp apply_write(name, %Protocol.Push{} = push, new_state, :append) do
-    case append_precondition(name, push.shard_id, push.offset) do
+    # ONE stat per append push (perf review 2026-10-14 #22): the precondition's size check and the
+    # held-fd inode check both read the same path, so the info is taken once here and handed down.
+    stat = :file.read_file_info(wal_path(name, push.shard_id), [:raw])
+
+    case append_precondition(name, push.shard_id, push.offset, stat) do
       :ok ->
-        do_apply_write(name, push, new_state, :append)
+        do_apply_write(name, push, new_state, :append, stat)
 
       :not_followed ->
         Protocol.encode_reject(push.shard_id, :unknown_shard, 0)
@@ -2364,20 +2397,27 @@ defmodule Fathom.Shard.Replication.Follower do
 
   defp apply_write(name, push, new_state, mode), do: do_apply_write(name, push, new_state, mode)
 
-  defp append_precondition(name, shard_id, offset) do
+  # `stat` is `:file.read_file_info(path, [:raw])`; absent or unreadable counts as an empty WAL, as
+  # `wal_bytes/1` did. Size is element 1 of the raw `file_info` record.
+  defp append_precondition(name, shard_id, offset, stat) do
     cond do
       state_of(name, shard_id) == nil -> :not_followed
-      wal_bytes(wal_path(name, shard_id)) < offset -> :wal_missing
+      stat_size(stat) < offset -> :wal_missing
       true -> :ok
     end
   end
 
-  defp do_apply_write(name, %Protocol.Push{} = push, new_state, mode) do
+  defp stat_size({:ok, info}), do: elem(info, 1)
+  defp stat_size(_), do: 0
+
+  defp do_apply_write(name, push, new_state, mode, stat \\ nil)
+
+  defp do_apply_write(name, %Protocol.Push{} = push, new_state, mode, stat) do
     path = wal_path(name, push.shard_id)
 
     written =
       if mode == :append,
-        do: write_held(path, push.offset, push.payload),
+        do: write_held(path, push.offset, push.payload, stat),
         else: write_frame(path, push.offset, push.payload, mode)
 
     case written do
@@ -2465,17 +2505,17 @@ defmodule Fathom.Shard.Replication.Follower do
   defp held_fds_cap,
     do: Application.get_env(:fathom, :replication_held_wal_fds, @default_held_fds_cap)
 
-  defp write_held(path, offset, payload) do
+  defp write_held(path, offset, payload, stat) do
     if held_fds_cap() > 0,
-      do: write_cached(path, offset, payload),
+      do: write_cached(path, offset, payload, stat),
       else: write_frame(path, offset, payload, :append)
   end
 
-  defp write_cached(path, offset, payload) do
+  defp write_cached(path, offset, payload, stat) do
     key = {__MODULE__, :held_fds}
     held = Process.get(key, %{})
 
-    case held_fd(held, path, offset) do
+    case held_fd(held, path, offset, stat) do
       {:ok, fd, held} ->
         with :ok <- :file.pwrite(fd, offset, payload),
              :ok <- maybe_sync(fd) do
@@ -2493,8 +2533,8 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
-  defp held_fd(held, path, offset) do
-    case {Map.get(held, path), :file.read_file_info(path, [:raw])} do
+  defp held_fd(held, path, offset, stat) do
+    case {Map.get(held, path), stat} do
       {{fd, inode, _used}, {:ok, info}} when elem(info, 11) == inode ->
         {:ok, fd, Map.put(held, path, {fd, inode, System.monotonic_time()})}
 
