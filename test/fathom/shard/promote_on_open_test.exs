@@ -609,7 +609,18 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
 
     {conn, coordinator} = build_shard(id, 10, 3)
     assert {:ok, stamp} = Storage.object_position(id)
-    install_replica(id, %{epoch: stamp.epoch, wal_gen: stamp.wal_gen, offset: stamp.offset + 1})
+
+    # `wal_ordinal` makes the replica RANKABLE (`Promote.fresher?/2`). Without it this test never
+    # reached the re-read at all: the unrankable replica was declined up front and the open served
+    # [1, 2, 3] for that reason, so the test passed with the re-read removed (found 2026-10-13 while
+    # fixing N3).
+    install_replica(id, %{
+      epoch: stamp.epoch,
+      wal_gen: stamp.wal_gen,
+      offset: stamp.offset + 1,
+      wal_ordinal: stamp.wal_ordinal
+    })
+
     tear_down_primary(id, conn, coordinator)
 
     Application.put_env(:fathom, :storage_fault, :object_head_moves)
