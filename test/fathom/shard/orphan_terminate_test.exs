@@ -33,6 +33,10 @@ defmodule Fathom.Shard.OrphanTerminateTest do
     Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
 
     on_exit(fn ->
+      # The test kills a Registry partition; the one_for_all restart may still be in flight when
+      # the NEXT test (any file) registers a coordinator, which then stops as an orphan: CI
+      # 2026-10-14 (OTP 29, seed 935568) pre_touch_etag_flush_test and shard_coordinator_open_test.
+      Fathom.Test.RegistryKill.settle()
       Application.delete_env(:fathom, :faulty_before)
       Shards.drain(shard, 2_000)
 
