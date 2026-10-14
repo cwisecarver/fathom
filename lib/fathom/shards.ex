@@ -474,10 +474,17 @@ defmodule Fathom.Shards do
   defp enqueue_migrate_on_touch(shard_id) do
     head = Fathom.Migrator.HeadCache.get()
 
-    if head > 0 and behind?(shard_id, head) do
-      %{shard_id: shard_id, target: head}
-      |> Fathom.Migrator.ShardMigrationJob.new()
-      |> Oban.insert()
+    # One node-local ETS lookup per checkout instead of a directory read (perf review 2026-10-14
+    # #9); see `HeadCache.settled?/2` for the invalidation argument. Settled only after a clean
+    # read/insert, so a Postgres blip is retried on the next touch.
+    if head > 0 and not Fathom.Migrator.HeadCache.settled?(shard_id, head) do
+      if behind?(shard_id, head) do
+        job = Fathom.Migrator.ShardMigrationJob.new(%{shard_id: shard_id, target: head})
+
+        with {:ok, _} <- Oban.insert(job), do: Fathom.Migrator.HeadCache.settle(shard_id, head)
+      else
+        Fathom.Migrator.HeadCache.settle(shard_id, head)
+      end
     end
 
     :ok
@@ -506,9 +513,10 @@ defmodule Fathom.Shards do
 
     cond do
       head == 0 -> :ok
+      Fathom.Migrator.HeadCache.settled?(shard_id, head) -> :ok
       Registry.lookup(@registry, shard_id) != [] -> enqueue_migrate_on_touch(shard_id)
       behind?(shard_id, head) -> run_inline_migration(shard_id, head)
-      true -> :ok
+      true -> Fathom.Migrator.HeadCache.settle(shard_id, head)
     end
   rescue
     e ->

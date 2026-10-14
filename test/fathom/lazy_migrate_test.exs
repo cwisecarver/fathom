@@ -415,5 +415,88 @@ defmodule Fathom.LazyMigrateTest do
     assert {:ok, %{status: "deleted"}} = Directory.get(shard)
   end
 
+  # perf review 2026-10-14 #9: with migrate-on-touch ON and head > 0, EVERY checkout (warm included)
+  # read the shard's directory row (`behind?/2`), and a laggard also ran `Oban.insert` each time.
+  # Postgres reads on the calling process are counted through the Repo query telemetry (the handler
+  # runs in the process that issued the query, so `self()` filters out Oban/Recorder noise).
+  defp count_repo_queries do
+    test_pid = self()
+    ref = make_ref()
+    id = "lazy-q-#{System.unique_integer([:positive])}"
+    {:ok, agent} = Agent.start_link(fn -> 0 end)
+
+    :telemetry.attach(
+      id,
+      [:fathom, :repo, :query],
+      fn _, _, _, _ -> if self() == test_pid, do: Agent.update(agent, &(&1 + 1)) end,
+      ref
+    )
+
+    on_exit(fn -> :telemetry.detach(id) end)
+    fn -> Agent.get(agent, & &1) end
+  end
+
+  defp open_close(shard, n) do
+    for _ <- 1..n do
+      {:ok, conn} = ShardExecutor.open(shard)
+      ShardExecutor.close(conn)
+    end
+  end
+
+  for mode <- [:async, :inline] do
+    test "migrate_on_touch: #{mode} reads the directory once per head, not once per warm checkout",
+         %{shard: shard} do
+      Application.put_env(:fathom, :migrate_on_touch, unquote(mode))
+      seed_v1!(shard)
+      {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+      {:ok, _} = Directory.cutover(shard, 2)
+      Migrator.HeadCache.refresh()
+      assert Migrator.HeadCache.get() == 2
+
+      queries = count_repo_queries()
+      open_close(shard, 1_000)
+
+      # Before the cache: 1,000 (one behind?/2 read each). Now: the first checkout only.
+      assert queries.() <= 1,
+             "expected <= 1 Postgres read per 1,000 warm checkouts, got #{queries.()}"
+    end
+  end
+
+  # The cache must not hide a laggard or a version bump. Invalidation is keyed on HEAD.
+  test "migrate_on_touch: :async enqueues a laggard once per head, and a head bump re-checks",
+       %{shard: shard} do
+    Application.put_env(:fathom, :migrate_on_touch, :async)
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    Migrator.HeadCache.refresh()
+
+    queries = count_repo_queries()
+    open_close(shard, 50)
+    assert_enqueued(worker: ShardMigrationJob, args: %{shard_id: shard, target: 2})
+    first = queries.()
+    # 1 directory read + 1 Oban insert (a transaction) -- a constant, not 50x.
+    assert first <= 10, "laggard touched 50x cost #{first} Postgres statements"
+
+    # A new release: the settled entry is keyed on head 2, so it misses and the shard is re-checked.
+    Fathom.Repo.delete_all(Oban.Job)
+    {:ok, _} = Migrator.release(3, "v3", ["SELECT 1"])
+    Migrator.HeadCache.refresh()
+    open_close(shard, 1)
+    assert_enqueued(worker: ShardMigrationJob, args: %{shard_id: shard, target: 3})
+  end
+
+  test "a shard settled at head N is re-checked after the recheck TTL", %{shard: shard} do
+    Application.put_env(:fathom, :migrate_on_touch, :async)
+    Application.put_env(:fathom, :migrate_on_touch_recheck_ms, 0)
+    on_exit(fn -> Application.delete_env(:fathom, :migrate_on_touch_recheck_ms) end)
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    Migrator.HeadCache.refresh()
+
+    queries = count_repo_queries()
+    open_close(shard, 5)
+    assert queries.() >= 5, "with a 0 ms TTL every checkout re-reads (the cache entry is expired)"
+  end
+
   defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end

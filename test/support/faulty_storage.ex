@@ -538,7 +538,11 @@ defmodule Fathom.Test.FaultyStorage do
   @impl true
   def put_token_floor(shard_id, version), do: Local.put_token_floor(shard_id, version)
   @impl true
-  def read_token_floor(shard_id), do: Local.read_token_floor(shard_id)
+  def read_token_floor(shard_id) do
+    run_before(:read_token_floor, shard_id)
+    Local.read_token_floor(shard_id)
+  end
+
   @impl true
   def pull_snapshot(shard_id, snapshot_id, local_path),
     do: Local.pull_snapshot(shard_id, snapshot_id, local_path)

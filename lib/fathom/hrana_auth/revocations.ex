@@ -63,6 +63,7 @@ defmodule Fathom.HranaAuth.Revocations do
   @table __MODULE__
   @default_ttl_ms 30_000
   @bulk_marker :__bulk_ok__
+  @max_entries 200_000
   @full_page 5_000
   @overlap_ms 60_000
   @default_full_reload_ms 86_400_000
@@ -248,24 +249,35 @@ defmodule Fathom.HranaAuth.Revocations do
   end
 
   defp read_through(shard_id, now) do
-    {dir_version, dir_bumped} = Directory.token_floor_info(shard_id)
-    dir_version = dir_version || 0
+    # On a genuine COLD miss (no cached value) the directory floor and the durable storage floor are
+    # INDEPENDENT reads, so they run concurrently (perf review 2026-10-14 #23): wall time is
+    # max(PG, S3) instead of PG + S3. Both are still always consulted, so the union is unchanged.
+    # A warm-but-lapsed entry never reads storage, as before.
+    stale = stale_floor(shard_id)
+    storage_task = if stale == :none, do: Task.async(fn -> storage_floor(shard_id) end)
 
-    # Monotonic + DR backstop (expert review #6). A Postgres point-in-time restore can LOWER the
-    # directory's token_version, un-revoking tokens. So never drop below what this node already
-    # cached (protects a running node across a restore at zero storage cost — the floor only ever
-    # rises legitimately); and on a genuine COLD miss (empty cache — a node booting after a restore)
-    # union the durable storage floor so the revocation survives. The storage read is cold-miss-only,
-    # so it never touches the TTL-refresh hot path.
-    {version, bumped_at} =
-      case stale_floor(shard_id) do
-        {:ok, {cached, cached_bumped}} when cached >= dir_version -> {cached, cached_bumped}
-        {:ok, _} -> {dir_version, dir_bumped}
-        :none -> {max(dir_version, storage_floor(shard_id)), dir_bumped}
-      end
+    try do
+      {dir_version, dir_bumped} = Directory.token_floor_info(shard_id)
+      dir_version = dir_version || 0
 
-    insert(shard_id, version, bumped_at, now)
-    {version, bumped_at}
+      # Monotonic + DR backstop (expert review #6). A Postgres point-in-time restore can LOWER the
+      # directory's token_version, un-revoking tokens. So never drop below what this node already
+      # cached (protects a running node across a restore at zero storage cost — the floor only ever
+      # rises legitimately); and on a cold miss union the durable storage floor so the revocation
+      # survives.
+      {version, bumped_at} =
+        case stale do
+          {:ok, {cached, cached_bumped}} when cached >= dir_version -> {cached, cached_bumped}
+          {:ok, _} -> {dir_version, dir_bumped}
+          :none -> {max(dir_version, Task.await(storage_task, :infinity)), dir_bumped}
+        end
+
+      insert(shard_id, version, bumped_at, now)
+      {version, bumped_at}
+    after
+      # A directory error must not leave the storage task's reply in the caller's mailbox.
+      if storage_task, do: Task.shutdown(storage_task, :brutal_kill)
+    end
   rescue
     e ->
       Logger.warning("revocation floor read failed for #{shard_id}: #{Exception.message(e)}")
@@ -340,10 +352,27 @@ defmodule Fathom.HranaAuth.Revocations do
   end
 
   defp insert(shard_id, version, bumped_at, now) do
+    evict_unrevoked_at_cap()
     :ets.insert(@table, {shard_id, version, bumped_at, now + ttl_ms()})
   rescue
     ArgumentError -> :ok
   end
+
+  # Bound the table (perf review 2026-10-14 #23): entries were never evicted, so it grew by one row
+  # per shard ever authenticated. At the cap, drop the floor-0 (never revoked) entries in one pass —
+  # a re-read costs one cold-miss read-through, exactly as for a never-seen shard. Revoked entries
+  # (floor > 0) are kept: they are the bulk-loaded set and the stale-serve source, and are bounded
+  # by revocations, not by shard count. The 2-tuple freshness marker never matches the 4-tuple
+  # pattern. Same shape as `Fathom.Shards.KnownShards`.
+  defp evict_unrevoked_at_cap do
+    if :ets.info(@table, :size) >= max_entries() do
+      :ets.match_delete(@table, {:_, 0, :_, :_})
+    end
+  end
+
+  @doc false
+  @spec max_entries() :: pos_integer()
+  def max_entries, do: Application.get_env(:fathom, :hrana_revocation_max_entries, @max_entries)
 
   # A late/duplicate notification must never LOWER the floor below what this node already knows
   # (versions only rise). When the version rises, adopt the incoming bump instant; a stale

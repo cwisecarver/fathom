@@ -361,6 +361,82 @@ defmodule Fathom.HranaAuthRevocationTest do
            "a token below the storage-backed floor stays revoked despite the directory rollback"
   end
 
+  # perf review 2026-10-14 #23: a cold miss read the directory and THEN storage serially (PG + S3).
+  # They are independent, so they now overlap. 60 ms is injected into each (the directory via a Repo
+  # query telemetry handler, which runs in the calling process; storage via the FaultyStorage hook).
+  # Serial would take >= 120 ms; concurrent ~60 ms. Revocation semantics are unchanged: the storage
+  # floor still unions over the directory floor, so the revoked token is still refused.
+  test "a cold miss overlaps the directory and storage reads, and still refuses the revoked token" do
+    shard = uniq()
+    {:ok, _} = Directory.resolve(shard)
+    {:ok, token} = HranaAuth.token_for(shard)
+    test_pid = self()
+
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    Application.put_env(
+      :fathom,
+      :faulty_before,
+      {:read_token_floor,
+       fn
+         ^shard -> Process.sleep(60)
+         _ -> :ok
+       end}
+    )
+
+    handler = "rev-cold-miss-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :repo, :query],
+      fn _, _, _, _ -> if self() == test_pid, do: Process.sleep(60) end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler)
+      Application.delete_env(:fathom, :faulty_before)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+
+      File.rm(Path.join([Fathom.Shard.Storage.Local.dir(), "tokenfloors", shard]))
+    end)
+
+    :ok = Fathom.Shard.Storage.put_token_floor(shard, 9)
+    :ets.delete(Revocations, shard)
+
+    {us, floor} = :timer.tc(fn -> Revocations.floor(shard) end)
+
+    assert floor == 9, "denied: the storage floor still unions over the directory floor"
+    assert {:error, %Filo.Error{status: 401}} = HranaAuth.authorize(shard, token)
+
+    assert us < 110_000,
+           "directory + storage reads must overlap (serial would be >= 120 ms): #{us} us"
+  end
+
+  # perf review 2026-10-14 #23: the cache never evicted. At the cap only never-revoked (floor 0)
+  # entries are dropped; a revoked floor must survive (it is the stale-serve source).
+  test "the table is bounded: at the cap floor-0 entries are evicted, revoked floors are kept" do
+    prev = Application.get_env(:fathom, :hrana_revocation_max_entries)
+    Application.put_env(:fathom, :hrana_revocation_max_entries, :ets.info(Revocations, :size) + 5)
+
+    on_exit(fn ->
+      if prev,
+        do: Application.put_env(:fathom, :hrana_revocation_max_entries, prev),
+        else: Application.delete_env(:fathom, :hrana_revocation_max_entries)
+    end)
+
+    revoked = uniq()
+    Revocations.put(revoked, 4)
+    for _ <- 1..20, do: Revocations.put(uniq(), 0)
+
+    assert :ets.info(Revocations, :size) <= Revocations.max_entries() + 1
+    assert [{^revoked, 4, _, _}] = :ets.lookup(Revocations, revoked)
+  end
+
   # Expert review 2026-07-24 #5. The per-shard TTL read-through scaled with SHARD COUNT rather than
   # revocation events, so it was replaced with one bulk query per node per interval plus a freshness
   # marker. These pin the safety property that makes that swap legitimate.

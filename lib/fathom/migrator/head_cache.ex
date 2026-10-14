@@ -36,6 +36,9 @@ defmodule Fathom.Migrator.HeadCache do
 
   @pt_key {__MODULE__, :head}
   @default_ttl_ms 5_000
+  @settled_table Module.concat(__MODULE__, Settled)
+  @settled_max 200_000
+  @default_settled_ttl_ms 30_000
 
   @doc false
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -49,6 +52,42 @@ defmodule Fathom.Migrator.HeadCache do
   @spec get() :: non_neg_integer()
   def get, do: :persistent_term.get(@pt_key, 0)
 
+  @doc """
+  Whether migrate-on-touch has already settled `shard_id` at fleet HEAD `head` on this node: it was
+  read from the directory and found current, or its migration job was enqueued, within the last
+  `:migrate_on_touch_recheck_ms` (default 30 s). `Fathom.Shards` skips the per-checkout
+  `Directory.get/1` (and the `Oban.insert` for a laggard) while this is true (perf review
+  2026-10-14 #9).
+
+  INVALIDATION: the entry is keyed on `head`, so a release (HEAD rises) or a yank (HEAD drops)
+  misses every entry at once and each shard is re-read on its next touch. The TTL covers what HEAD
+  cannot see (a shard restored to an older version, a suspended shard resumed, a failed job whose
+  retry is due). Never a way to hide a version bump: at worst a laggard is re-checked up to one TTL
+  late after an out-of-band change. `false` when the table is not up.
+  """
+  @spec settled?(String.t(), non_neg_integer()) :: boolean()
+  def settled?(shard_id, head) do
+    case :ets.lookup(@settled_table, shard_id) do
+      [{^shard_id, ^head, expires_at}] -> System.monotonic_time(:millisecond) < expires_at
+      _ -> false
+    end
+  rescue
+    ArgumentError -> false
+  end
+
+  @doc "Records `shard_id` as settled at `head` (see `settled?/2`). Cleared wholesale at the cap."
+  @spec settle(String.t(), non_neg_integer()) :: :ok
+  def settle(shard_id, head) do
+    if :ets.info(@settled_table, :size) >= @settled_max,
+      do: :ets.delete_all_objects(@settled_table)
+
+    ttl = Application.get_env(:fathom, :migrate_on_touch_recheck_ms, @default_settled_ttl_ms)
+    :ets.insert(@settled_table, {shard_id, head, System.monotonic_time(:millisecond) + ttl})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
   @doc "Forces a synchronous refresh from Postgres and returns the new HEAD (tests / ops)."
   @spec refresh() :: non_neg_integer()
   def refresh, do: GenServer.call(__MODULE__, :refresh)
@@ -56,6 +95,15 @@ defmodule Fathom.Migrator.HeadCache do
   @impl true
   def init(opts) do
     :persistent_term.put(@pt_key, 0)
+
+    # Owned here (a boot-time supervised process), not by a request process. See `settled?/2`.
+    :ets.new(@settled_table, [
+      :set,
+      :public,
+      :named_table,
+      read_concurrency: true,
+      write_concurrency: true
+    ])
 
     ttl =
       Keyword.get(
