@@ -53,8 +53,11 @@ defmodule Fathom.Shard.Replication.Shipper do
   # Above `Writer`'s own 30 s `send_now` bound, so the writer's answer always arrives first.
   @seed_chunk_call_ms 60_000
   @reconnect_backoff_ms 500
+  # How long the very first connect may hold the process before going asynchronous (see
+  # `handle_continue/2`).
+  @initial_connect_wait_ms 250
 
-  defstruct [:host, :port, :sock, :writer, :writer_budget, :id, :name, waiters: %{}]
+  defstruct [:host, :port, :sock, :writer, :writer_budget, :id, :name, :connecting, waiters: %{}]
 
   # ------------------------------------------------------------------------------------------
   # api
@@ -208,7 +211,21 @@ defmodule Fathom.Shard.Replication.Shipper do
   end
 
   @impl true
-  def handle_continue(:connect, state), do: {:noreply, connect(state)}
+  def handle_continue(:connect, state) do
+    # The FIRST connect waits briefly for the task, so a healthy peer is connected by the time
+    # `start_link` callers send their first message (a reachable follower connects in a few ms).
+    # A black-holed one is left to finish asynchronously via `handle_info/2` after the bound,
+    # which is the whole point of the task (expert review 2026-10-13 #13).
+    %{connecting: {pid, mon}} = state = start_connect(state)
+
+    receive do
+      {:connect_result, ^pid, result} ->
+        Process.demonitor(mon, [:flush])
+        {:noreply, finish_connect(%{state | connecting: nil}, result)}
+    after
+      @initial_connect_wait_ms -> {:noreply, state}
+    end
+  end
 
   @impl true
   def handle_call(:connected?, _from, state), do: {:reply, state.sock != nil, state}
@@ -438,7 +455,19 @@ defmodule Fathom.Shard.Replication.Shipper do
   def handle_info({:send_failed, writer, reason}, %{writer: writer} = state),
     do: {:noreply, drop(state, reason)}
 
-  def handle_info(:reconnect, state), do: {:noreply, connect(state)}
+  def handle_info(:reconnect, state), do: {:noreply, start_connect(state)}
+
+  # THE ASYNC CONNECT'S RESULT (expert review 2026-10-13 #13). Matched on the task we are waiting
+  # for, so a straggler from a previous attempt (this process never has two) cannot install a socket.
+  def handle_info({:connect_result, pid, result}, %{connecting: {pid, mon}} = state) do
+    Process.demonitor(mon, [:flush])
+    {:noreply, finish_connect(%{state | connecting: nil}, result)}
+  end
+
+  # The connect task died without reporting (killed, or a raise): the same outcome as a failed
+  # connect, so the ordinary backoff and retry apply.
+  def handle_info({:DOWN, mon, :process, pid, reason}, %{connecting: {pid, mon}} = state),
+    do: {:noreply, finish_connect(%{state | connecting: nil}, {:error, {:connect_task, reason}})}
 
   # Stale socket / stale writer events land here on purpose. See the guards above.
   def handle_info(_, state), do: {:noreply, state}
@@ -451,13 +480,50 @@ defmodule Fathom.Shard.Replication.Shipper do
     Budget.forget(state.name)
     Writer.stop(state.writer)
     if state.sock, do: :gen_tcp.close(state.sock)
+    with {pid, _mon} <- state.connecting, do: Process.exit(pid, :kill)
     :ok
   end
 
   # ------------------------------------------------------------------------------------------
 
-  defp connect(state) do
-    host = if is_binary(state.host), do: String.to_charlist(state.host), else: state.host
+  # CONNECT OFF THE GENSERVER LOOP (expert review 2026-10-13 #13). `connect/1` used to block this
+  # process for up to 5 s in `:gen_tcp.connect` plus 5 s in the handshake, and a black-holed peer
+  # (dropped SYNs) re-entered it every 500 ms backoff. While blocked, pushes queued instead of
+  # taking the immediate `sock: nil` reject, `connected?/1` timed out, and the Session waited that
+  # follower out to the deadline instead of subtracting it from the quorum. The dial and the
+  # handshake now run in a short-lived task that hands the (passive) socket and the handshake's
+  # connection binding back; this loop stays responsive and rejects at once while `sock` is nil.
+  defp start_connect(%{connecting: nil} = state) do
+    me = self()
+
+    {pid, mon} =
+      spawn_monitor(fn ->
+        result = dial(state.host, state.port)
+
+        # Hand the socket over BEFORE reporting, from the process that owns it. If the Shipper died
+        # meanwhile this fails, and closing here is what keeps the socket from leaking.
+        result =
+          with {:ok, sock, _binding} <- result do
+            try do
+              :ok = :gen_tcp.controlling_process(sock, me)
+              result
+            catch
+              _, _ ->
+                :gen_tcp.close(sock)
+                {:error, :shipper_gone}
+            end
+          end
+
+        send(me, {:connect_result, self(), result})
+      end)
+
+    %{state | connecting: {pid, mon}}
+  end
+
+  defp start_connect(state), do: state
+
+  defp dial(host, port) do
+    host = if is_binary(host), do: String.to_charlist(host), else: host
 
     # `send_timeout` is what makes the mailbox bound in `overloaded?/1` actually hold. Without it
     # `:gen_tcp.send/2` blocks INDEFINITELY once the peer's receive window fills, and a shipper
@@ -478,7 +544,8 @@ defmodule Fathom.Shard.Replication.Shipper do
       packet_size: Fathom.Shard.Replication.Protocol.max_frame_bytes(),
       # PASSIVE until the #17 handshake completes: the acceptor's `@hello` is read with a plain
       # `recv`, and switching to active first would deliver it as a `{:tcp, …}` message that
-      # `handle_info/2` decodes as a malformed reply. Flipped to active right after.
+      # `handle_info/2` decodes as a malformed reply. Flipped to active by the Shipper once it owns
+      # the socket (`finish_connect/2`).
       active: false,
       # No `delay_send` (perf review 2026-10-01 #28, measured and dropped 2026-10-06). It coalesces
       # writes queued in one scheduling round into one syscall. Rig A/B, 1024 tenants, replication
@@ -490,27 +557,33 @@ defmodule Fathom.Shard.Replication.Shipper do
     ]
 
     # Notice a hard-dead follower in ~60 s, not 2 h (expert review 2026-10-10 #11).
-    connect = fn o -> :gen_tcp.connect(host, state.port, o, @connect_timeout) end
+    connect = fn o -> :gen_tcp.connect(host, port, o, @connect_timeout) end
 
     with {:ok, sock} <- Fathom.Shard.Replication.Keepalive.with_fallback(opts, connect),
          :ok <- handshake(sock) do
-      {:ok, sock}
+      # The handshake bound this connection's nonces in THIS (task) process's dictionary; the
+      # Shipper encodes and decodes every frame, so it adopts the binding (`Protocol.binding/0`).
+      {:ok, sock, Protocol.binding()}
     end
-    |> case do
-      {:ok, sock} ->
-        # ONE WRITER PER SOCKET, not per shipper: a writer is meaningless without the socket it
-        # owns, and tying their lifetimes together is what makes a stale writer's report
-        # distinguishable from the live one's.
-        #
-        # And one budget counter per writer, for the same reason: bytes still queued in a writer
-        # that dies are never sent and never released, and must die with it (see `Budget`).
-        %{
-          state
-          | sock: sock,
-            writer: Writer.start_link(sock, self()),
-            writer_budget: Budget.install_writer(state.name)
-        }
+  end
 
+  defp finish_connect(state, result) do
+    with {:ok, sock, binding} <- result,
+         :ok <- Protocol.adopt_binding(binding),
+         :ok <- activate(sock) do
+      # ONE WRITER PER SOCKET, not per shipper: a writer is meaningless without the socket it
+      # owns, and tying their lifetimes together is what makes a stale writer's report
+      # distinguishable from the live one's.
+      #
+      # And one budget counter per writer, for the same reason: bytes still queued in a writer
+      # that dies are never sent and never released, and must die with it (see `Budget`).
+      %{
+        state
+        | sock: sock,
+          writer: Writer.start_link(sock, self()),
+          writer_budget: Budget.install_writer(state.name)
+      }
+    else
       {:error, reason} ->
         Logger.warning(
           "shipper could not reach #{inspect(state.host)}:#{state.port}: #{inspect(reason)}"
@@ -521,14 +594,23 @@ defmodule Fathom.Shard.Replication.Shipper do
     end
   end
 
-  # Runs in the Shipper process, which is also the one that encodes every frame for this link and
-  # decodes every reply, so the binding the handshake leaves in its process dictionary covers
-  # exactly this connection (a reconnect re-binds). Closes the socket on failure.
+  defp activate(sock) do
+    case :inet.setopts(sock, active: true) do
+      :ok ->
+        :ok
+
+      {:error, _} = error ->
+        :gen_tcp.close(sock)
+        error
+    end
+  end
+
+  # Runs in the connect task, on the still-passive socket. Closes the socket on failure.
   defp handshake(sock) do
-    with :ok <- Protocol.handshake_connect(sock, Protocol.handshake_timeout_ms()),
-         :ok <- :inet.setopts(sock, active: true) do
-      :ok
-    else
+    case Protocol.handshake_connect(sock, Protocol.handshake_timeout_ms()) do
+      :ok ->
+        :ok
+
       {:error, _} = error ->
         :gen_tcp.close(sock)
         error
