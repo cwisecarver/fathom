@@ -102,11 +102,6 @@ defmodule Fathom.Bench.Gate do
     # folding them would hide exactly the regression this is for.
     {:served_kb_per_shard, :higher_worse},
     {:served_binary_kb_per_shard, :higher_worse},
-    # WATCH-ONLY, first numbers (perf review 2026-10-14 #17): the SERVED regime with A2 replication
-    # ON, primary side, and the follower VM per replica. No band has been measured yet, so neither
-    # can gate; promote them once a few runs establish one.
-    {:served_repl_kb_per_shard, :higher_worse, :watch},
-    {:follower_kb_per_shard, :higher_worse, :watch},
     # CONTENTION, gated from 2026-08-03 (#41.4). Every other gated metric is single-threaded, so
     # the concurrency-tuned machinery (write_concurrency on the ETS
     # counters, the Lru CA-tree, +SDio, the per-shard coordinator GenServer.call) had no gate at

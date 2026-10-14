@@ -106,8 +106,7 @@ defmodule Fathom.Bench do
     :hrana_pooled,
     :wire_rows,
     :wire_encode,
-    :flush,
-    :served_repl
+    :flush
   ]
 
   @doc false
@@ -137,11 +136,6 @@ defmodule Fathom.Bench do
     conc = run_if(only, :concurrent, fn -> concurrent_checkout(opts) end)
     cold = run_if(only, :cold_open, fn -> cold_open_stats(opts) end)
     rt = run_if(only, :hrana_rt, fn -> hrana_rt_stats(opts) end)
-
-    # Replication-ON density (perf review 2026-10-14 #17). Runs in its OWN scratch topology (a peer
-    # VM holding the followers, a Fleet started and stopped here), so it cannot change what any other
-    # metric measures. See `served_repl/1`.
-    repl = run_if(only, :served_repl, fn -> served_repl(opts) end)
 
     %{
       cold_open_p50_us: cold && cold.p50_us,
@@ -176,12 +170,6 @@ defmodule Fathom.Bench do
       # in the process heap — one combined number would hide that whole class of regression.
       served_kb_per_shard: served && served.total_kb,
       served_binary_kb_per_shard: served && served.binary_kb,
-      # WATCH-ONLY (perf review 2026-10-14 #17): the SERVED regime with A2 replication ON, which is
-      # what prod runs. Every density number above was measured replication OFF. Primary side
-      # (coordinator + connection + Session + shippers) and, separately, the FOLLOWER side per
-      # replica, measured in a peer VM. See `served_repl/1`.
-      served_repl_kb_per_shard: repl && repl.total_kb,
-      follower_kb_per_shard: repl && repl.follower_kb,
       # CONTENTION (#41.4). Every other metric here is serial, so a change that serialises the
       # ETS counters, the LRU, or the coordinator GenServer.call left all of them flat.
       concurrent_checkout_per_s: conc && conc.spread_per_s,
@@ -1523,205 +1511,6 @@ defmodule Fathom.Bench do
     # this way in the first draft: wrong table, and the match on `{:ok, _}` would have accepted
     # an empty result had the table merely been empty.)
     if got == [], do: raise("served bench read 0 rows — the page/statement caches are cold")
-
-    {id, pid, ref, conn}
-  end
-
-  # --- the SERVED regime with replication ON ---------------------------------
-
-  @served_repl_n 32
-  @repl_followers 2
-
-  @doc """
-  `served_repl_kb_per_shard` and `follower_kb_per_shard` — the `served/1` regime with A2 replication
-  ON (perf review 2026-10-14 #17). WATCH-ONLY.
-
-  Every capacity number in the docs was measured with replication OFF, and prod runs it ON, so the
-  density that actually binds a replicating fleet was unmeasured. This holds N shards each under a
-  live connection that has run a query AND has been replicated to a quorum, and reports per shard:
-
-    * `total_kb` — BEAM memory delta of THIS VM (coordinator + connection + the per-shard `Session`
-      + the shippers' bookkeeping). Compare it with `served_kb_per_shard`; the difference is what
-      replication costs the primary.
-    * `follower_kb` — BEAM memory delta of the FOLLOWER VM, per shard per replica. The followers
-      live in a separate `:peer` VM so their memory is not folded into the primary's number
-      (in-process loopback followers would be counted in `total_kb` and could not be split out).
-
-  It is scoped to its own setup — followers, shippers and a `Fleet` started here and torn down in
-  `after` — and does not touch the shared `setup/1` topology (AGENTS.md: changing it changes every
-  metric). Disk is not counted; this is BEAM memory only, like its siblings.
-
-  PRECONDITIONS are asserted, because a replication arm that silently did not replicate would
-  report the OFF number under a new name: replication is on, every shipper is connected, one
-  `Session` exists per shard, and every shard's replica is present on every follower.
-  """
-  @spec served_repl(keyword()) :: %{total_kb: float(), follower_kb: float()}
-  def served_repl(opts \\ []) do
-    setup(opts)
-    n = Keyword.get(opts, :served_repl_n, @served_repl_n)
-    trials = Keyword.get(opts, :trials, @default_trials)
-    rows = Keyword.get(opts, :served_rows, @served_rows)
-
-    root = Path.join(tmp_dir(), "served_repl_#{System.unique_integer([:positive])}")
-    File.mkdir_p!(root)
-
-    {:ok, peer, _node} =
-      :peer.start(%{
-        connection: :standard_io,
-        wait_boot: 30_000,
-        args: Enum.flat_map(:code.get_path(), fn dir -> [~c"-pa", dir] end)
-      })
-
-    names = for i <- 1..@repl_followers, do: :"bench_rf#{i}_#{System.unique_integer([:positive])}"
-    ports = peer_call(peer, __MODULE__, :start_peer_followers, [names, root])
-
-    keys = [:replication_enabled, :replication_followers, :replication_quorum]
-    prev = Map.new(keys, &{&1, Application.get_env(:fathom, &1)})
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 1)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({port, i} <- Enum.with_index(ports, 1), do: {"bench-f#{i}", ~c"127.0.0.1", port})
-    )
-
-    {:ok, fleet} = Fathom.Shard.Replication.Fleet.start_link([])
-
-    try do
-      await_shippers!()
-      results = times(trials, fn t -> repl_trial(t, n, rows, peer, names) end)
-
-      %{
-        total_kb: results |> Enum.map(&elem(&1, 0)) |> median(),
-        follower_kb: results |> Enum.map(&elem(&1, 1)) |> median()
-      }
-    after
-      Supervisor.stop(fleet)
-      :peer.stop(peer)
-      Enum.each(keys, &restore_env(&1, Map.fetch!(prev, &1)))
-      File.rm_rf(root)
-    end
-  end
-
-  @doc false
-  # Runs INSIDE the peer VM: starts the named followers (unlinked from the short-lived call
-  # process) and returns their ports.
-  def start_peer_followers(names, root) do
-    Enum.map(names, fn name ->
-      {:ok, pid} = Follower.start_link(name: name, port: 0, dir: Path.join(root, to_string(name)))
-      Process.unlink(pid)
-      {:ok, port} = Follower.port(name)
-      port
-    end)
-  end
-
-  @doc false
-  # Peer-side GC + memory read, so the follower delta is taken the same way `collect_all/0` takes
-  # the primary's.
-  def peer_memory_total do
-    collect_all()
-    :erlang.memory(:total)
-  end
-
-  defp peer_call(peer, m, f, a), do: :peer.call(peer, m, f, a, 60_000)
-
-  defp await_shippers! do
-    alias Fathom.Shard.Replication.{Fleet, Shipper}
-    deadline = System.monotonic_time(:millisecond) + 10_000
-
-    ready? = fn ->
-      shippers = Fleet.shippers()
-      length(shippers) == @repl_followers and Enum.all?(shippers, &Shipper.connected?/1)
-    end
-
-    Stream.repeatedly(fn ->
-      cond do
-        ready?.() ->
-          :up
-
-        System.monotonic_time(:millisecond) > deadline ->
-          :timeout
-
-        true ->
-          Process.sleep(20)
-          :wait
-      end
-    end)
-    |> Enum.find(&(&1 != :wait))
-    |> case do
-      :up ->
-        :ok
-
-      :timeout ->
-        raise "served_repl: shippers never connected — this would measure replication OFF"
-    end
-  end
-
-  defp repl_trial(t, n, rows, peer, names) do
-    alias Fathom.Shard.Replication.{Fleet, Session}
-
-    unless Fleet.replicating?(),
-      do: raise("served_repl: replication is not on — measuring nothing")
-
-    collect_all()
-    before_local = :erlang.memory(:total)
-    before_remote = peer_call(peer, __MODULE__, :peer_memory_total, [])
-
-    handles = Enum.map(1..n, fn i -> open_repl_shard(t, i, rows) end)
-    ids = Enum.map(handles, &elem(&1, 0))
-
-    # Preconditions, asserted rather than trusted (the `flush_p50_us` 2 µs lesson).
-    sessions = Registry.count(Fathom.Shard.Replication.SessionRegistry)
-
-    if sessions < n,
-      do: raise("served_repl: #{sessions}/#{n} replication Sessions — measuring nothing")
-
-    for name <- names do
-      held = peer_call(peer, Follower, :replica_shard_ids, [name])
-
-      if ids -- held != [],
-        do:
-          raise("served_repl: follower #{name} holds no replica of #{length(ids -- held)} shards")
-    end
-
-    collect_all()
-    local = :erlang.memory(:total) - before_local
-    remote = peer_call(peer, __MODULE__, :peer_memory_total, []) - before_remote
-
-    Enum.each(handles, fn {id, _pid, _ref, _conn} = h ->
-      Session.stop(id)
-      close_served_shard(h)
-      for name <- names, do: peer_call(peer, Follower, :forget, [name, id])
-    end)
-
-    {local / n / 1024, remote / n / length(names) / 1024}
-  end
-
-  defp open_repl_shard(t, i, rows) do
-    alias Fathom.Shard.Replication.Session
-
-    {id, pid, ref, conn} = open_served_shard(t, i, rows)
-    path = Fathom.Shard.db_path(id)
-    {:ok, _} = Connection.query(conn, "CREATE TABLE IF NOT EXISTS repl_probe (a INTEGER)", [])
-    {:ok, _} = Connection.query(conn, "INSERT INTO repl_probe VALUES (1)", [])
-
-    # The first commit finds the follower unseeded and answers with the seed; keep committing until
-    # a quorum acks (bounded — a stuck seed must fail loudly, not hang the bench).
-    deadline = System.monotonic_time(:millisecond) + 10_000
-
-    Stream.repeatedly(fn ->
-      case Session.commit(id, path <> "-wal", pid) do
-        :ok ->
-          :ok
-
-        _ ->
-          if System.monotonic_time(:millisecond) > deadline,
-            do: raise("served_repl: shard #{id} never reached a replication quorum"),
-            else: Process.sleep(10)
-      end
-    end)
-    |> Enum.find(&(&1 == :ok))
 
     {id, pid, ref, conn}
   end

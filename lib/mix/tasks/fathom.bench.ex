@@ -88,8 +88,7 @@ defmodule Mix.Tasks.Fathom.Bench do
     :hrana_pooled,
     :wire_rows,
     :wire_encode,
-    :flush,
-    :served_repl
+    :flush
   ]
 
   @doc false
@@ -233,10 +232,6 @@ defmodule Mix.Tasks.Fathom.Bench do
        "KiB/shard (SERVED: held connection + one query)"},
       {"served_binary_kb_per_shard", metrics.served_binary_kb_per_shard,
        "KiB/shard (served, :erlang.memory(:binary) only)"},
-      {"served_repl_kb_per_shard", metrics.served_repl_kb_per_shard,
-       "KiB/shard (SERVED with A2 replication ON, primary side; watch-only)"},
-      {"follower_kb_per_shard", metrics.follower_kb_per_shard,
-       "KiB/shard/replica (follower VM, replication ON; watch-only)"},
       {"concurrent_checkout_per_s", metrics.concurrent_checkout_per_s,
        "ops/s  (checkout+checkin, N workers over 64 shards)"},
       {"same_shard_checkout_per_s", metrics.same_shard_checkout_per_s,
