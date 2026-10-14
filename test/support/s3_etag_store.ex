@@ -125,6 +125,11 @@ defmodule Fathom.Test.S3EtagStore do
       conn.method == "GET" and Map.get(query, "list-type") == "2" ->
         list_objects(conn, agent, query)
 
+      # ListMultipartUploads (expert review 2026-10-13 #21): the in-progress uploads ListObjectsV2
+      # cannot see, which `purge_shard/1` must abort.
+      conn.method == "GET" and Map.has_key?(query, "uploads") ->
+        list_uploads(conn, agent, query)
+
       conn.method == "GET" ->
         get(conn, agent, key)
 
@@ -412,9 +417,25 @@ defmodule Fathom.Test.S3EtagStore do
 
   defp complete_upload(conn, agent, key, upload_id, req_body) do
     listed = completed_parts(req_body)
+    if_match = Plug.Conn.get_req_header(conn, "if-match")
 
     Agent.get_and_update(agent, fn s ->
+      current = Map.get(s.objects, key)
+
+      # A conditional Complete (expert review 2026-10-13 #3): S3 evaluates If-Match against the
+      # object currently at the key. A missing key is 404 NoSuchKey, a different etag 412.
+      refused =
+        cond do
+          if_match == [] -> nil
+          current == nil -> 404
+          hd(if_match) != etag(current) -> 412
+          true -> nil
+        end
+
       case Map.get(s.uploads, upload_id) do
+        %{} when refused != nil ->
+          {{refused, nil}, s}
+
         %{parts: parts, meta: meta} ->
           case assemble(listed, parts) do
             {:ok, bodies} ->
@@ -451,9 +472,56 @@ defmodule Fathom.Test.S3EtagStore do
       {400, code} ->
         Plug.Conn.send_resp(conn, 400, "<Error><Code>#{code}</Code></Error>")
 
+      {412, _} ->
+        Plug.Conn.send_resp(conn, 412, "")
+
       {404, _} ->
         Plug.Conn.send_resp(conn, 404, "")
     end
+  end
+
+  # Listing page size for both ListObjectsV2 and ListMultipartUploads.
+  @page_size 3
+
+  @doc "The `{key, upload_id}` of every upload still open (created, never completed or aborted)."
+  def open_uploads(agent) do
+    agent |> Agent.get(& &1.uploads) |> Enum.map(fn {id, up} -> {up.key, id} end) |> Enum.sort()
+  end
+
+  # ListMultipartUploads: `prefix`, and the `key-marker` / `upload-id-marker` paging pair, with a
+  # small page so the marker loop is exercised.
+  defp list_uploads(conn, agent, query) do
+    prefix = Map.get(query, "prefix", "")
+    after_pair = {Map.get(query, "key-marker", ""), Map.get(query, "upload-id-marker", "")}
+
+    all =
+      agent
+      |> open_uploads()
+      |> Enum.filter(fn {k, _} -> String.starts_with?(k, prefix) end)
+      |> Enum.filter(fn pair -> after_pair == {"", ""} or pair > after_pair end)
+
+    {page, rest} = Enum.split(all, @page_size)
+
+    uploads =
+      Enum.map_join(page, "", fn {k, id} ->
+        "<Upload><Key>#{k}</Key><UploadId>#{id}</UploadId></Upload>"
+      end)
+
+    next =
+      case {rest, List.last(page)} do
+        {[], _} ->
+          "<IsTruncated>false</IsTruncated>"
+
+        {_, {k, id}} ->
+          "<IsTruncated>true</IsTruncated><NextKeyMarker>#{k}</NextKeyMarker>" <>
+            "<NextUploadIdMarker>#{id}</NextUploadIdMarker>"
+      end
+
+    Plug.Conn.send_resp(
+      conn,
+      200,
+      "<ListMultipartUploadsResult>#{next}#{uploads}</ListMultipartUploadsResult>"
+    )
   end
 
   # The `<Part><PartNumber>/<ETag>` list of a CompleteMultipartUpload body, parsed with OTP's xmerl.
@@ -527,7 +595,6 @@ defmodule Fathom.Test.S3EtagStore do
   # and `stored_usage/0` send. Keys are returned SORTED so paging is deterministic; the page size
   # is small on purpose so the continuation-token loop is actually exercised rather than always
   # completing in one shot (a one-page fake would leave `next_token/1` untested forever).
-  @page_size 3
 
   defp list_objects(conn, agent, query) do
     prefix = Map.get(query, "prefix", "")

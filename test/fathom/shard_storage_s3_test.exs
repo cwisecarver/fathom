@@ -641,6 +641,72 @@ defmodule Fathom.ShardStorageS3Test do
     assert {:error, _} = S3.restore(shard, 1)
   end
 
+  # ── multipart fence + hygiene on a REAL store (expert review 2026-10-13 #3, #21) ──
+
+  # The doubles can only model what their author knew about the store. The boot probe's new
+  # multipart checks (UploadPartCopy honours x-amz-copy-source-if-match and -range; Complete honours
+  # If-Match) are claims about the deployed store, so they are run against it. MinIO answers a
+  # conditional DELETE 204 (ignoring If-Match), which is what the test-store escape hatch is for.
+  test "the boot self-test, including the multipart fence probe, passes on the real store" do
+    prev = Application.get_env(:fathom, :allow_weak_conditional_delete)
+    Application.put_env(:fathom, :allow_weak_conditional_delete, true)
+
+    on_exit(fn ->
+      if is_nil(prev),
+        do: Application.delete_env(:fathom, :allow_weak_conditional_delete),
+        else: Application.put_env(:fathom, :allow_weak_conditional_delete, prev)
+    end)
+
+    ExUnit.CaptureLog.capture_log(fn -> assert S3.verify_conditional_writes!() == :ok end)
+  end
+
+  # A large steal-touch kill leaves an open upload that ListObjectsV2 cannot see. The test stages
+  # exactly that (create, never complete) and checks the real store's ListMultipartUploads sees it
+  # before purge and not after — and that a sibling id's upload is left alone.
+  test "purge_shard aborts incomplete multipart uploads on the real store",
+       %{shard: shard} = ctx do
+    sibling = shard <> "2"
+
+    for id <- [shard, sibling] do
+      %{status: 200, body: body} =
+        Req.post!(signed_req(ctx), url: object_url(ctx, id <> ".db") <> "?uploads", body: "")
+
+      # A part copied in, as a killed touch leaves it.
+      [_, upload_id] = Regex.run(~r|<UploadId>([^<]+)</UploadId>|, to_string(body))
+
+      %{status: 200} =
+        Req.put!(signed_req(ctx),
+          url: object_url(ctx, id <> ".db") <> "?partNumber=1&uploadId=#{upload_id}",
+          body: "x"
+        )
+    end
+
+    assert length(open_upload_keys(ctx, shard)) == 2
+
+    assert :ok = S3.purge_shard(shard)
+
+    assert open_upload_keys(ctx, shard) == [@prefix <> sibling <> ".db"],
+           "purge must abort the shard's own upload and only that"
+
+    on_exit(fn -> S3.purge_shard(sibling) end)
+  end
+
+  defp open_upload_keys(ctx, shard) do
+    %{status: 200, body: body} =
+      Req.get!(signed_req(ctx),
+        url: "/#{ctx.bucket}",
+        # Unfiltered: MinIO's ListMultipartUploads returns nothing for a partial-key prefix.
+        params: [{"uploads", ""}]
+      )
+
+    {:ok, %{uploads: uploads}} = Fathom.Shard.Storage.S3.UploadsPage.parse(body)
+
+    uploads
+    |> Enum.map(& &1.key)
+    |> Enum.filter(&String.starts_with?(&1, @prefix <> shard))
+    |> Enum.sort()
+  end
+
   # ── helpers ──
 
   defp now_ms, do: System.system_time(:millisecond)

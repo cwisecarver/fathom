@@ -66,8 +66,30 @@ The touch now picks a path by the stored object's size:
   steal now moves the object through the stealer twice (GET + PUT, up to ~6 MiB each way), which
   adds to failover latency; the old touch transferred nothing.
 
+The large path's `CompleteMultipartUpload` carries `If-Match: <the etag being touched>`, as both
+part copies carry `x-amz-copy-source-if-match`. Without it a zombie's `If-Match: E0` flush landing
+after a part was read and before the Complete (E0 is still current, so the store accepts it) would
+be published over by the stale parts at a new etag, erasing an acked flush (expert review
+2026-10-13 #3). A 412 or 404 on the Complete re-runs the touch (it re-HEADs and re-splits against
+the zombie's bytes) and the refused upload is aborted.
+
 The boot self-test (`verify_conditional_writes!/0`) touches its probe object twice and refuses to
-boot unless the three etags are distinct, which catches a store (or a regression) that cycles.
+boot unless the three etags are distinct, which catches a store (or a regression) that cycles. It
+also runs a one-part multipart self-copy on a second probe key (no 6 MiB upload: only non-last parts
+need 5 MiB) and refuses to boot unless the store refuses a bogus `x-amz-copy-source-if-match` and a
+bogus `If-Match` on Complete, and honours `x-amz-copy-source-range`. Verified against MinIO
+(Chainguard build) on 2026-10-13; the store must keep passing it.
+
+**Incomplete multipart uploads.** A node killed between the touch's create and complete leaves an
+open upload holding server-side copies of up to a whole shard, invisible to ListObjectsV2. Two
+backstops (expert review 2026-10-13 #21):
+
+- `purge_shard` lists the shard's uploads (ListMultipartUploads on its data key) and aborts them, so
+  tenant erasure covers them. It fails closed if it cannot list. The data-plane credential needs
+  `s3:ListBucketMultipartUploads` and `s3:AbortMultipartUpload` for this.
+- **Boot checklist:** the shard bucket needs an `AbortIncompleteMultipartUpload` lifecycle rule
+  (`DaysAfterInitiation: 1`), which reaps uploads of shards that are never purged. A touch that fails
+  while the node is alive aborts its own upload and logs a warning if the abort fails.
 
 **3. The heartbeat — liveness that's O(nodes), not O(shards).** The naive design renews every
 shard's lease on a timer — millions of PUTs (the "F1 storm"). Instead, each **node** renews **one**

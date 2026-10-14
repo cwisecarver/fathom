@@ -41,6 +41,7 @@ defmodule Fathom.Shard.Storage.S3 do
   require Logger
 
   alias Fathom.Shard.Storage.S3.ListPage
+  alias Fathom.Shard.Storage.S3.UploadsPage
 
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.Codec
@@ -190,6 +191,11 @@ defmodule Fathom.Shard.Storage.S3 do
     # touches of the identical probe bytes must yield three distinct etags.
     probe_rotation!(key)
 
+    # The large-object touch's own primitives (expert review 2026-10-13 #3): UploadPartCopy must
+    # honour a source If-Match and a source range, and CompleteMultipartUpload must honour If-Match.
+    # A store that ignores any of them makes the fence a silent no-op for exactly the largest shards.
+    probe_multipart_fence!(key)
+
     # The lock-release fence (`release_lease/2`) is a conditional DELETE, and the whole lock-leak
     # fix (`resolve_412_release`, finding #22) rests on the store answering 412 to a stale-etag
     # DELETE. Conditional DELETE support DIFFERS across AWS general-purpose/directory buckets, R2,
@@ -257,8 +263,8 @@ defmodule Fathom.Shard.Storage.S3 do
 
   # The probe object is 18 raw bytes, so this exercises the small-object touch twice: the first
   # re-encodes `:none` -> zstd + nonce, the second replaces the nonce. Two GET+PUTs of a few dozen
-  # bytes. The large-object split touch is NOT probed — that would mean uploading >= 6 MiB per boot;
-  # a store that refused ranged UploadPartCopy fails each such steal closed instead.
+  # bytes. The large-object split touch is not run (that would mean uploading >= 6 MiB per boot);
+  # its primitives are probed by `probe_multipart_fence!/1` with a single 4-byte part instead.
   defp probe_rotation!(key) do
     # The probe deliberately keeps its own HEAD-based verification (it is a boot-time
     # self-test of the STORE, so it must not trust the write response's claimed etag the
@@ -276,6 +282,76 @@ defmodule Fathom.Shard.Storage.S3 do
                 "the object etag to two NEW etags (#{inspect(other)}). On this store the " <>
                 "zombie-flush fence would be a silent no-op — refusing to boot " <>
                 "(expert review round-2 #4, 2026-10-12 N1)."
+    end
+  end
+
+  # Exercises the split touch's primitives WITHOUT a 6 MiB upload: only a non-last part must reach
+  # 5 MiB, so a single 4-byte part copy completes legitimately. Uses its own key so the rotation
+  # probe's object is untouched; always cleaned up (object and any open upload).
+  defp probe_multipart_fence!(probe_key) do
+    key = probe_key <> ".mp"
+    bogus = ~s("fathom-bogus-etag")
+    source = "/" <> fetch!(config(), :bucket) <> "/" <> key
+    probe_status!(key, [], 200..299, "multipart probe seed")
+
+    try do
+      with {:ok, etag} when is_binary(etag) <- head_etag(key),
+           {:ok, upload_id} <- create_multipart(key, []) do
+        try do
+          multipart_fence_checks!(key, upload_id, source, etag, bogus)
+        after
+          abort_multipart(key, upload_id)
+        end
+      else
+        other ->
+          raise "shard storage fence self-test failed (multipart probe setup): " <>
+                  "#{inspect(other)} — refusing to boot (expert review 2026-10-13 #3)."
+      end
+    after
+      _ = Req.delete(req(), url: url_path(key))
+    end
+
+    :ok
+  end
+
+  defp multipart_fence_checks!(key, upload_id, source, etag, bogus) do
+    unless match?(
+             {:error, :touch_precondition},
+             upload_part_copy(key, upload_id, source, bogus, 1, {0, 3})
+           ) do
+      raise "shard storage fence self-test failed (UploadPartCopy x-amz-copy-source-if-match " <>
+              "enforcement): a bogus precondition was not refused. The large-object steal-touch " <>
+              "fence would be a silent no-op — refusing to boot (expert review 2026-10-13 #3)."
+    end
+
+    part_etag =
+      case upload_part_copy(key, upload_id, source, etag, 1, {0, 3}) do
+        {:ok, part_etag} ->
+          part_etag
+
+        other ->
+          raise "shard storage fence self-test failed (UploadPartCopy with a valid source " <>
+                  "range and etag): #{inspect(other)} — refusing to boot (expert review 2026-10-13 #3)."
+      end
+
+    unless match?(
+             {:error, :touch_precondition},
+             complete_multipart(key, upload_id, [{1, part_etag}], bogus)
+           ) do
+      raise "shard storage fence self-test failed (CompleteMultipartUpload If-Match " <>
+              "enforcement): a bogus precondition was not refused. A zombie flush landing " <>
+              "mid-touch would be silently overwritten — refusing to boot " <>
+              "(expert review 2026-10-13 #3)."
+    end
+
+    with {:ok, _} <- complete_multipart(key, upload_id, [{1, part_etag}], etag),
+         {:ok, _, _, _, 4} <- head_sized(key) do
+      :ok
+    else
+      other ->
+        raise "shard storage fence self-test failed (a valid ranged multipart self-copy must " <>
+                "complete to the 4 bytes copied, honouring x-amz-copy-source-range): " <>
+                "#{inspect(other)} — refusing to boot (expert review 2026-10-13 #3)."
     end
   end
 
@@ -892,7 +968,7 @@ defmodule Fathom.Shard.Storage.S3 do
       {:ok, upload_id} ->
         with {:ok, p1} <- upload_part_copy(key, upload_id, source, etag, 1, {0, cut - 1}),
              {:ok, p2} <- upload_part_copy(key, upload_id, source, etag, 2, {cut, size - 1}),
-             {:ok, post} <- complete_multipart(key, upload_id, [{1, p1}, {2, p2}]) do
+             {:ok, post} <- complete_multipart(key, upload_id, [{1, p1}, {2, p2}], etag) do
           {:ok, post}
         else
           {:error, _} = error ->
@@ -988,7 +1064,14 @@ defmodule Fathom.Shard.Storage.S3 do
   # copy_body_ok? guards it like the other copies. Returns `{:ok, new_etag_or_nil}`: the
   # CompleteMultipartUploadResult body carries the completed object's etag (review
   # 2026-07-23 #13 — the caller previously re-fetched it with a confirm HEAD).
-  defp complete_multipart(key, upload_id, parts) do
+  #
+  # `if_match` fences the Complete on the etag the touch started from (expert review 2026-10-13
+  # #3). The part copies are each fenced on it, but a zombie's `If-Match: E0` flush that lands
+  # AFTER a part was read and BEFORE the Complete succeeds (E0 is still current) would otherwise
+  # be published over by the stale bytes at a new etag: the zombie's acked flush erased. With the
+  # precondition the Complete is 412 (the object moved) or 404 (it was deleted), both mapped to
+  # `:touch_precondition`, so `touch_object` re-HEADs and re-splits against the zombie's bytes.
+  defp complete_multipart(key, upload_id, parts, if_match) do
     body =
       "<CompleteMultipartUpload>" <>
         Enum.map_join(parts, "", fn {n, part_etag} ->
@@ -997,7 +1080,8 @@ defmodule Fathom.Shard.Storage.S3 do
 
     case Req.post(req(),
            url: url_path(key) <> "?uploadId=#{URI.encode_www_form(upload_id)}",
-           body: body
+           body: body,
+           headers: [{"if-match", if_match}]
          ) do
       {:ok, %{status: s, body: resp}} when s in 200..299 ->
         resp = to_string(resp)
@@ -1005,6 +1089,9 @@ defmodule Fathom.Shard.Storage.S3 do
         if copy_body_ok?(resp),
           do: {:ok, body_etag(resp)},
           else: {:error, {:s3_touch_error_body, resp}}
+
+      {:ok, %{status: s}} when s in [404, 412] ->
+        {:error, :touch_precondition}
 
       {:ok, %{status: s}} ->
         {:error, {:s3_complete_status, s}}
@@ -1014,10 +1101,27 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  # An abort that fails leaves server-side copies of tenant data behind until the bucket's
+  # AbortIncompleteMultipartUpload lifecycle rule or `purge_shard` reaps them (expert review
+  # 2026-10-13 #21), so a failure is logged rather than swallowed. The caller's own error stands.
   defp abort_multipart(key, upload_id) do
-    _ = Req.delete(req(), url: url_path(key) <> "?uploadId=#{URI.encode_www_form(upload_id)}")
-    :ok
+    case Req.delete(req(), url: url_path(key) <> "?uploadId=#{URI.encode_www_form(upload_id)}") do
+      {:ok, %{status: s}} when s in 200..299 or s == 404 ->
+        :ok
+
+      other ->
+        Logger.warning(
+          "shard storage: could not abort multipart upload #{upload_id} on #{key} " <>
+            "(#{inspect(abort_failure(other))}); it stays until the AbortIncompleteMultipartUpload " <>
+            "lifecycle rule or a purge reaps it"
+        )
+
+        :error
+    end
   end
+
+  defp abort_failure({:ok, %{status: s}}), do: {:status, s}
+  defp abort_failure({:error, reason}), do: reason
 
   # --- brand-new steal sentinel (round-2 #7) ---
 
@@ -1888,7 +1992,68 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   @impl true
-  def purge_shard(shard_id), do: purge_shard_page(shard_id, nil)
+  def purge_shard(shard_id) do
+    with :ok <- purge_shard_page(shard_id, nil), do: abort_shard_uploads(shard_id, nil)
+  end
+
+  # In-progress multipart uploads are invisible to ListObjectsV2, so a steal-touch killed between
+  # create and complete leaves server-side copies of the tenant's data that the purge above never
+  # sees (expert review 2026-10-13 #21). List them, apply the same delimiter rule as objects
+  # (`acme` never aborts `acme2`'s), and abort each. Fail closed: an erasure that could not look is
+  # not an erasure.
+  #
+  # The listing prefix is the shard's EXACT data key, not `<prefix><shard_id>`. The only multipart
+  # upload fathom ever creates is the large-object steal-touch's, at `db_key/1`, so that is complete
+  # coverage; and a broader prefix is not safe to rely on: the live-MinIO test showed MinIO's
+  # ListMultipartUploads returns NOTHING for a partial-key prefix (`leasetest/s3_ab` finds no upload
+  # at `leasetest/s3_ab12.db`; only the whole key matches), which would have made the purge a silent
+  # no-op there. Revisit if another multipart creator is added.
+  defp abort_shard_uploads(shard_id, markers) do
+    with {:ok, page} <- list_uploads(db_key(shard_id), markers),
+         :ok <- abort_uploads(shard_upload_targets(page.uploads, shard_id)) do
+      case page.next do
+        nil -> :ok
+        next -> abort_shard_uploads(shard_id, next)
+      end
+    end
+  end
+
+  defp list_uploads(list_prefix, markers) do
+    params =
+      [{"uploads", ""}, {"prefix", list_prefix}] ++
+        case markers do
+          {key_marker, id_marker} -> [{"key-marker", key_marker}, {"upload-id-marker", id_marker}]
+          nil -> []
+        end
+
+    case Req.get(req(), url: url_path(""), params: params) do
+      {:ok, %{status: 200, body: body}} ->
+        case UploadsPage.parse(body) do
+          {:ok, _page} = ok -> ok
+          {:error, reason} -> {:error, {:s3_list_uploads_parse, reason}}
+        end
+
+      {:ok, %{status: status}} ->
+        {:error, {:s3_list_uploads_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp shard_upload_targets(uploads, shard_id) do
+    for %{key: key, upload_id: id} <- uploads, shard_object_key?(key, shard_id), do: {key, id}
+  end
+
+  defp abort_uploads(targets) do
+    Enum.reduce_while(targets, :ok, fn {key, id}, :ok ->
+      case Req.delete(req(), url: url_path(key) <> "?uploadId=#{URI.encode_www_form(id)}") do
+        {:ok, %{status: status}} when status in 200..299 or status == 404 -> {:cont, :ok}
+        {:ok, %{status: status}} -> {:halt, {:error, {:s3_abort_upload_status, status}}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
 
   # Full tenant erasure (#15): ListObjectsV2 over `<prefix><shard_id>` (a broad
   # prefix that can also surface sibling ids like `<shard_id>2.db`), then delete

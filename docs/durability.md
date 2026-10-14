@@ -246,6 +246,10 @@ One object per shard in one bucket is the durability floor, and S3's 11-nines pr
 `s3:DeleteObject`, or a fat-fingered `aws s3 rm --recursive` (expert review 2026-07-14 #13). Harden
 the bucket underneath the fathom-managed snapshots above:
 
+- **An `AbortIncompleteMultipartUpload` lifecycle rule (`DaysAfterInitiation: 1`).** A large-object
+  steal-touch killed mid-flight leaves an open multipart upload holding server-side copies of the
+  shard; it costs storage and survives until something aborts it (expert review 2026-10-13 #21).
+  See [single-writer.md](single-writer.md).
 - **Versioning on** + a lifecycle policy to expire noncurrent versions — every fenced flush then
   leaves an automatic version trail at zero code cost, a second recovery path beneath the explicit
   snapshots.
