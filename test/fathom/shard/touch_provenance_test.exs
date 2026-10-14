@@ -38,8 +38,6 @@ defmodule Fathom.Shard.TouchProvenanceTest do
   alias Fathom.Test.S3EtagStore
   alias Filo.{Stmt, StmtResult}
 
-  @modes [:legacy, :heartbeat]
-
   setup do
     shard = "touchprov_#{System.unique_integer([:positive])}"
 
