@@ -190,4 +190,63 @@ defmodule Fathom.Shard.TempReaperTest do
 
     assert Shard.quarantine_files(dir) != []
   end
+
+  # expert review 2026-10-13 #37: the scratch volume was the system temp dir, unconfigurable and never
+  # checked for free space before a shard-sized pull. Two pins: the location is configurable (so it can
+  # sit on the data volume), and a scratch pull is refused below the free-space floor.
+  describe "scratch volume (#37)" do
+    # 1 EiB: no real volume has this much free, so the floor always refuses.
+    @impossible_floor 1_152_921_504_606_846_976
+
+    setup do
+      keys = [:fathom_scratch_dir, :scratch_min_free_bytes]
+      prev = Enum.map(keys, &{&1, Application.get_env(:fathom, &1)})
+
+      on_exit(fn ->
+        for {k, v} <- prev,
+            do:
+              if(is_nil(v),
+                do: Application.delete_env(:fathom, k),
+                else: Application.put_env(:fathom, k, v)
+              )
+      end)
+
+      :ok
+    end
+
+    test "scratch_dir/0 honours :fathom_scratch_dir" do
+      dir =
+        Path.join(System.tmp_dir!(), "fathom_scratch_cfg_#{System.unique_integer([:positive])}")
+
+      Application.put_env(:fathom, :fathom_scratch_dir, dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      assert TempReaper.scratch_dir() == dir
+      assert File.dir?(dir)
+    end
+
+    test "a scratch pull is refused when the scratch volume is below the free-space floor" do
+      # A floor no volume can meet: the reading is real, the refusal is the code under test.
+      Application.put_env(:fathom, :scratch_min_free_bytes, @impossible_floor)
+
+      assert {:error, {:scratch_low_disk, free, min}} = TempReaper.check_scratch_headroom()
+      assert min == @impossible_floor
+      assert is_integer(free) and free < min
+    end
+
+    test "the free-space check passes with a zero floor" do
+      Application.put_env(:fathom, :scratch_min_free_bytes, 0)
+      assert :ok = TempReaper.check_scratch_headroom()
+    end
+
+    # The restore path pulls the snapshot into the scratch volume, so the refusal must come before any
+    # storage call. No shard exists here: the headroom check runs after the id casts and before the
+    # download, so this would reach storage (and fail differently) if the check were missing.
+    test "Snapshots.restore refuses before downloading when the scratch volume is short" do
+      Application.put_env(:fathom, :scratch_min_free_bytes, @impossible_floor)
+
+      assert {:error, {:scratch_low_disk, _free, _min}} =
+               Fathom.Snapshots.restore("acme", "20261013-000000-abcd", force: true)
+    end
+  end
 end

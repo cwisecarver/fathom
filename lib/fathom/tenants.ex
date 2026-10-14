@@ -274,6 +274,8 @@ defmodule Fathom.Tenants do
   def export(shard_id, opts \\ []) do
     with {:ok, id} <- cast(shard_id),
          :ok <- refuse_if_erased(id),
+         # expert review 2026-10-13 #37: the export is a full tenant copy in the scratch volume.
+         :ok <- Fathom.Shard.TempReaper.check_scratch_headroom(),
          :ok <- maybe_flush_export(id, opts) do
       dir = export_dir!()
       tmp = Path.join(dir, "#{id}.db")
@@ -627,20 +629,23 @@ defmodule Fathom.Tenants do
   end
 
   defp copied_version_by_pull(dst) do
-    tmp =
-      Path.join(
-        Fathom.Shard.TempReaper.scratch_dir(),
-        "fathom_forkver_#{dst}_#{System.unique_integer([:positive])}.db"
-      )
+    # expert review 2026-10-13 #37: the fallback pulls the whole object into the scratch volume.
+    with :ok <- Fathom.Shard.TempReaper.check_scratch_headroom() do
+      tmp =
+        Path.join(
+          Fathom.Shard.TempReaper.scratch_dir(),
+          "fathom_forkver_#{dst}_#{System.unique_integer([:positive])}.db"
+        )
 
-    try do
-      case Storage.pull(dst, tmp) do
-        {:ok, _etag} -> SqliteHeader.user_version(tmp)
-        {:absent, _} -> {:error, :dst_object_missing}
-        {:error, reason} -> {:error, reason}
+      try do
+        case Storage.pull(dst, tmp) do
+          {:ok, _etag} -> SqliteHeader.user_version(tmp)
+          {:absent, _} -> {:error, :dst_object_missing}
+          {:error, reason} -> {:error, reason}
+        end
+      after
+        File.rm(tmp)
       end
-    after
-      File.rm(tmp)
     end
   end
 

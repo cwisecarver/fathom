@@ -27,6 +27,7 @@ defmodule Fathom.Shard.TempReaper do
 
   require Logger
 
+  alias Fathom.Admin.Measurements
   alias Fathom.Shard
   alias Fathom.Shard.Storage
 
@@ -49,6 +50,8 @@ defmodule Fathom.Shard.TempReaper do
   # held while the file is streamed to the operator) whose mtime does not advance while it is read,
   # and these jobs legitimately run for minutes. An hour is still a bounded leak.
   @scratch_stale_after_ms 3_600_000
+  # Free-space floor for the scratch volume before a scratch pull (expert review 2026-10-13 #37).
+  @default_scratch_min_free_bytes 1024 * 1024 * 1024
 
   @doc """
   The fathom-owned scratch directory for shard-sized temp files outside the shard data dir
@@ -60,12 +63,42 @@ defmodule Fathom.Shard.TempReaper do
   # tenant data in a restore or export temp was world-readable. The mode is set explicitly on every
   # call, not only on create, so a directory left 0755 by an earlier build is tightened on the next
   # use.
+  #
+  # expert review 2026-10-13 #37: the location is `:fathom_scratch_dir` when set (point it at the
+  # data volume, where the free-space budget is watched), and `System.tmp_dir!()` otherwise.
   @spec scratch_dir() :: Path.t()
   def scratch_dir do
-    dir = Path.join(System.tmp_dir!(), "fathom_scratch")
+    dir =
+      Application.get_env(:fathom, :fathom_scratch_dir) ||
+        Path.join(System.tmp_dir!(), "fathom_scratch")
+
     File.mkdir_p!(dir)
     File.chmod!(dir, 0o700)
     dir
+  end
+
+  # expert review 2026-10-13 #37: a scratch pull writes a shard-sized file, and the scratch volume was
+  # never checked. Refuse before a pull when the scratch volume has less than `:scratch_min_free_bytes`
+  # free (default 1 GiB, a floor: the object size is not known before the pull). The reading comes
+  # from `Admin.Measurements.disk_info/1`, not its poller cache: that cache tracks only the data volume,
+  # and the scratch dir is normally on the system temp volume. `disksup` runs `df` per call, which is
+  # acceptable here because scratch pulls are rare admin and DR operations, never the request path.
+  # An unreadable volume fails OPEN: the pull then either succeeds or fails on its own, as before.
+  @spec check_scratch_headroom() :: :ok | {:error, {:scratch_low_disk, integer(), integer()}}
+  def check_scratch_headroom do
+    min = Application.get_env(:fathom, :scratch_min_free_bytes, @default_scratch_min_free_bytes)
+
+    case Measurements.disk_info(scratch_dir()) do
+      {:ok, %{free_bytes: free}} when free < min ->
+        Logger.warning(
+          "scratch volume low on space: #{free} bytes free, floor #{min}; refusing the scratch pull"
+        )
+
+        {:error, {:scratch_low_disk, free, min}}
+
+      _ ->
+        :ok
+    end
   end
 
   @doc "Start the reaper (registered under the module name)."

@@ -133,7 +133,10 @@ defmodule Fathom.Snapshots do
     force? = Keyword.get(opts, :force, false)
 
     with {:ok, id} <- cast(shard_id),
-         {:ok, snapshot_id} <- cast_snapshot_id(snapshot_id) do
+         {:ok, snapshot_id} <- cast_snapshot_id(snapshot_id),
+         # expert review 2026-10-13 #37: the snapshot is pulled into the scratch volume, so refuse
+         # before the download when that volume is short of space.
+         :ok <- Fathom.Shard.TempReaper.check_scratch_headroom() do
       # ONE download for the whole restore (expert review 2026-08-26 #25). The snapshot is pulled
       # to `tmp`, its `PRAGMA user_version` is read from THOSE bytes, and THOSE bytes are what gets
       # promoted. Previously this pulled the snapshot to a temp, read four bytes at offset 60,

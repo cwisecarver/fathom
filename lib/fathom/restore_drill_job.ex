@@ -272,7 +272,7 @@ defmodule Fathom.RestoreDrillJob do
 
     status =
       try do
-        case Storage.pull_snapshot(id, snapshot_id, tmp) do
+        case headroom_pull(fn -> Storage.pull_snapshot(id, snapshot_id, tmp) end) do
           # Same sentinel/absent distinction as `verify/2`: `{:absent, etag}` is a placeholder,
           # `{:absent, nil}` a true absence. The old `{:ok, _}` + missing-temp -> `:absent` branch
           # was dead (sentinels come back `{:absent, etag}`), and BOTH `{:absent, _}` shapes fell
@@ -326,7 +326,7 @@ defmodule Fathom.RestoreDrillJob do
       )
 
     try do
-      case Storage.pull(id, tmp) do
+      case headroom_pull(fn -> Storage.pull(id, tmp) end) do
         # A steal-time brand-new sentinel at the data key: a stealer's `touch_object` planted a
         # placeholder because the shard was never flushed, so the "backup" is not data. S3 maps
         # `{:sentinel, _} -> {:absent, etag}` (s3.ex:299-300), so an etag WITH no bytes written is
@@ -531,6 +531,15 @@ defmodule Fathom.RestoreDrillJob do
   # temp — NOT the live coordinator, whose file carries un-flushed writes a recovery would not see
   # (#14). An absent object is an empty durable state (its fork would be empty too), so `%{}` rather
   # than an error.
+  # expert review 2026-10-13 #37: every drill pull lands in the scratch volume. A short volume is a
+  # failed pull (`{:error, _}`), so each caller takes its existing failure branch.
+  defp headroom_pull(pull_fun) do
+    case Fathom.Shard.TempReaper.check_scratch_headroom() do
+      :ok -> pull_fun.()
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp durable_table_counts(shard_id) do
     tmp =
       Path.join(
@@ -539,7 +548,7 @@ defmodule Fathom.RestoreDrillJob do
       )
 
     try do
-      case Fathom.Shard.Storage.pull(shard_id, tmp) do
+      case headroom_pull(fn -> Fathom.Shard.Storage.pull(shard_id, tmp) end) do
         {:ok, _etag} -> counts_from_file(tmp)
         {:absent, _} -> {:ok, %{}}
         {:error, _} -> :error
