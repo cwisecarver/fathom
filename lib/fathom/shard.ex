@@ -638,17 +638,14 @@ defmodule Fathom.Shard do
       try do
         unmark_lease_held(shard_id)
         # A takeover lease's claim survives the failed open (expert review 2026-10-12 #3).
-        Storage.release_lease(shard_id, lease, lease[:claim])
+        Storage.release_lease(shard_id, refusal_release_lease(lease, reason), lease[:claim])
       rescue
         e -> {:error, e}
       catch
         :exit, r -> {:error, {:exit, r}}
       end
 
-    Logger.error(
-      "shard #{shard_id}: open FAILED after the lease was acquired (#{inspect(reason)}); " <>
-        "lease release: #{inspect(released)}\n" <> Exception.format_stacktrace(stacktrace)
-    )
+    log_open_failed(shard_id, reason, released, stacktrace)
 
     :telemetry.execute(
       [:fathom, :shard, :open, :failed],
@@ -658,6 +655,40 @@ defmodule Fathom.Shard do
 
     {:stop, {:shutdown, {:open_failed, reason}}, state}
   end
+
+  # A floor refusal (`%UnderQuorum{}`, promote-on-open) is the ROUTINE outcome of a partition, repeated
+  # per client retry for up to the window — a warning without a stacktrace (expert review 2026-10-13
+  # #11). Anything else is an open that crashed after taking the lock: never routine, so error.
+  defp log_open_failed(
+         shard_id,
+         %Fathom.Shard.Replication.Recovery.UnderQuorum{} = r,
+         released,
+         _
+       ) do
+    Logger.warning(
+      "shard #{shard_id}: open REFUSED after the lease was acquired (#{inspect(r)}); " <>
+        "lease release: #{inspect(released)}"
+    )
+  end
+
+  defp log_open_failed(shard_id, reason, released, stacktrace) do
+    Logger.error(
+      "shard #{shard_id}: open FAILED after the lease was acquired (#{inspect(reason)}); " <>
+        "lease release: #{inspect(released)}\n" <> Exception.format_stacktrace(stacktrace)
+    )
+  end
+
+  # The lease an `abandon_open` release hands to storage. A floor refusal fires BEFORE this open wrote
+  # or served anything (the cold-pulled copy is deleted first, `PromoteOnOpen.best_replica_or_refuse/3`),
+  # so it is a clean visit exactly like `release_clean/1`: its steal-touch provenance is recorded in the
+  # marker, and the previous holder's warm copy (sidecar E0) is then not read as a fork after the
+  # touches (expert review 2026-10-13 #2). Deliberately a WHITELIST of the refusal and NOT every raise:
+  # a failure after `promote_replica` published an object write is not clean, and forgiving its touch
+  # would let a warm local pre-empt the promoted writes.
+  defp refusal_release_lease(lease, %Fathom.Shard.Replication.Recovery.UnderQuorum{}),
+    do: Storage.with_clean_touch(lease)
+
+  defp refusal_release_lease(lease, _reason), do: lease
 
   # Stop an in-flight overlapped fork check on the no-open paths. Its only side effect
   # (quarantining a diverged copy) is one the sequential pre-lease check also produced
@@ -839,6 +870,10 @@ defmodule Fathom.Shard do
         # is recorded only in the lock, so a release must keep it (expert review 2026-10-12 #3,
         # `release_clean/1`).
         lineage_stamped?: PromoteOnOpen.etag_of(promoted) != etag1,
+        # The etag this open's steal-touch rotated AWAY from (a zombie's late `If-Match` PUT carries
+        # it), kept on the state because a legacy renew replaces `lease` and drops it. A flush that
+        # lands back on it re-touches (`guard_pre_touch/2`, expert review 2026-10-13 #17).
+        touch_pre_etag: lease[:touch_pre_etag],
         # The single-flight HEAD that resolves an `:unknown` lineage, or nil (expert review
         # 2026-10-12 #15) — see start_lineage_resolve/1.
         lineage_task: nil,
@@ -1025,7 +1060,12 @@ defmodule Fathom.Shard do
         # promote-on-open declined the dead holder's replica. A fresh-create lease has no claim and
         # still deletes.
         unmark_lease_held(shard_id)
-        Storage.release_lease(shard_id, lease, lease[:claim])
+
+        # The pull / takeover revalidation failed before this open wrote or served anything: a clean
+        # visit, so the steal-touch's provenance rides the marker like `release_clean/1`'s (expert
+        # review 2026-10-13 #2). Without it the next stealer's touch chain restarts and the previous
+        # holder's warm copy reads as a fork.
+        Storage.release_lease(shard_id, Storage.with_clean_touch(lease), lease[:claim])
         {:stop, {:shutdown, {:pull_failed, reason}}, %{id: shard_id}}
     end
   end
@@ -2082,7 +2122,8 @@ defmodule Fathom.Shard do
                 :lineage,
                 :wal_salt,
                 :wal_ordinal,
-                :carried_lineage
+                :carried_lineage,
+                :touch_pre_etag
               ])
 
             # THE SLOT IS RESERVED BEFORE THE STATE THAT OWNS ITS RELEASE EXISTS (expert review
@@ -2961,7 +3002,12 @@ defmodule Fathom.Shard do
   # replication off (`:disabled`) or no stated lineage (`:unknown`) it is the plain delete.
   defp release_keeping_claim(state) do
     unmark_lease_held(state.id)
-    if is_map(state.lease), do: Storage.release_lease(state.id, state.lease, state.lineage)
+
+    # Every caller releases with acked-but-unflushed writes the object lacks (kept local, quarantined
+    # or lost). The marker says so, so a non-holder node's `Shards.flush/1` fails closed
+    # instead of reading it as "free, the object is current" (expert review 2026-10-13 #7).
+    if is_map(state.lease),
+      do: Storage.release_lease(state.id, Storage.with_dirty_release(state.lease), state.lineage)
   end
 
   # No `is_map(state.lease)` guard: since drop_clean/1 moved to release_clean/1 (expert review
@@ -3270,14 +3316,15 @@ defmodule Fathom.Shard do
       :ok ->
         # The WAL has just been folded into the database, so the object holds everything through
         # the end of `pre`'s generation — see flush_position/2 for why that is claimed as gen + 1.
-        Storage.flush(
-          state.id,
+        state.id
+        |> Storage.flush(
           state.path,
           state.etag,
           Position.flush_position(state, pre),
           Position.lineage_arg(state),
           flush_intent_opts(state.path)
         )
+        |> guard_pre_touch(state)
 
       # Integrity failed (expert review 2026-07-14 #4). The checkpoint-then-raw-upload fast path
       # uploads the bytes as-is, so a locally corrupted db (disk/fs/memory fault, exqlite/OS bug)
@@ -3994,14 +4041,15 @@ defmodule Fathom.Shard do
            :ok <- verify_and_snapshot(state, temp),
            :ok <- recheck_before_put(state),
            {:ok, new_etag, carried} <-
-             Storage.flush(
-               state.id,
+             state.id
+             |> Storage.flush(
                temp,
                state.etag,
                Position.flush_position(state, pre),
                Position.lineage_arg(state),
                flush_intent_opts(state.path)
-             ) do
+             )
+             |> guard_pre_touch(state) do
         {:ok, new_etag, carried}
       else
         {:error, :superseded} = superseded ->
@@ -4018,6 +4066,36 @@ defmodule Fathom.Shard do
       Enum.each(["", "-wal", "-shm"], &File.rm(temp <> &1))
     end
   end
+
+  # A FLUSH THAT RECREATES THE PRE-TOUCH ETAG (expert review 2026-10-13 #17). The steal rotated the
+  # object E0 -> E1 so a zombie's late `If-Match: E0` PUT 412s. But the flush PUT carries no nonce and
+  # VACUUM INTO plus zstd is deterministic, so a stealer whose content is net-unchanged (a write
+  # then its undo) flushes bytes whose etag is E0 again — the zombie's fence etag — and the zombie's
+  # PUT succeeds. Re-touch immediately, fenced on the etag we just wrote (`Storage.retouch/2` only
+  # rotates while the object is still `new_etag`, so it can never launder a zombie's bytes), and adopt
+  # the new etag. Zero cost on the normal path (one binary compare); `:none`/`:zlib` encodings are
+  # covered too, which the panel's "nonce every flush body" was not. A failed re-touch keeps the
+  # durable flush and its etag — failing the flush would only re-flush into the same etag.
+  defp guard_pre_touch({:ok, new_etag, carried}, state) when is_binary(new_etag) do
+    if new_etag == Map.get(state, :touch_pre_etag) do
+      case Storage.retouch(state.id, new_etag) do
+        {:ok, rotated} when is_binary(rotated) ->
+          {:ok, rotated, carried}
+
+        other ->
+          Logger.warning(
+            "shard #{state.id}: flush recreated the pre-steal etag and the re-touch failed " <>
+              "(#{inspect(other)}); a zombie's late PUT is not fenced until the next rotation"
+          )
+
+          {:ok, new_etag, carried}
+      end
+    else
+      {:ok, new_etag, carried}
+    end
+  end
+
+  defp guard_pre_touch(other, _state), do: other
 
   # FREE-SPACE PREFLIGHT (expert review 2026-10-12 #26). `VACUUM INTO` writes a temp about the
   # size of the shard (plus its WAL content) next to the live file, so a near-full volume fails the

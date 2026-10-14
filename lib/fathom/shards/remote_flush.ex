@@ -32,7 +32,7 @@ defmodule Fathom.Shards.RemoteFlush do
   def flush(shard_id) do
     case Storage.lease_holder(shard_id) do
       :free ->
-        :ok
+        free_or_unflushed(shard_id)
 
       {:held, owner} ->
         case remote_node(owner) do
@@ -48,6 +48,19 @@ defmodule Fathom.Shards.RemoteFlush do
     _ -> {:error, :remote_holder_unflushed}
   catch
     :exit, _ -> {:error, :remote_holder_unflushed}
+  end
+
+  # `:free` also covers a RELEASED MARKER, and a DIRTY one (a failed drop flush that kept its local
+  # copy, `Storage.with_dirty_release/1`) means acked writes exist only on a released holder's disk:
+  # the stored object is NOT current, so answering `:ok` made export, keystone fork and `flush: true`
+  # snapshots silently read stale state (expert review 2026-10-13 #7). Fail closed; there is no
+  # cross-node flush command to issue (nobody holds the lease). The error clears when anyone next
+  # opens the shard (the marker is overwritten by their steal) or the releaser's reopen flushes.
+  defp free_or_unflushed(shard_id) do
+    case Storage.released_dirty?(shard_id) do
+      false -> :ok
+      _dirty_or_error -> {:error, :remote_holder_unflushed}
+    end
   end
 
   # A migrator's owner is "migrator@…" and our own node's is "<this node>#<incarnation>": no

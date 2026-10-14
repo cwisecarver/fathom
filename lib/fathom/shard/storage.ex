@@ -90,7 +90,10 @@ defmodule Fathom.Shard.Storage do
           # at `touched_to` holds exactly the bytes the object had at etag `touched_from`, and no
           # owner wrote in between. See `with_clean_touch/1`.
           optional(:touched_from) => String.t(),
-          optional(:touched_to) => String.t()
+          optional(:touched_to) => String.t(),
+          # A released marker left by a DIRTY release (expert review 2026-10-13 #7): the releaser
+          # kept a local copy holding acked-but-unflushed writes. See `with_dirty_release/1`.
+          optional(:dirty) => true
         }
 
   @typedoc """
@@ -526,7 +529,22 @@ defmodule Fathom.Shard.Storage do
   # dispatcher returns `{:error, :unsupported}`. Potentially expensive (an S3 LIST), so callers
   # poll it slowly + cache; at fleet scale prefer S3 Inventory / CloudWatch over a live LIST.
   @callback stored_usage() :: {non_neg_integer(), non_neg_integer()} | {:error, term()}
-  @optional_callbacks stored_usage: 0, flush: 6
+  # Does the lock hold a released marker left by a DIRTY release (expert review 2026-10-13 #7)? A
+  # marker reads as `lease_holder/1 == :free`, so that answer alone cannot tell "nobody is writing,
+  # the object is current" from "the last holder kept acked writes it never flushed". Optional: a
+  # backend that cannot say is treated as clean by `Storage.released_dirty?/1`.
+  @callback released_dirty?(shard_id :: String.t()) :: boolean() | {:error, term()}
+
+  # Rotate the data object's etag AGAIN, but only if it is still `expected_etag` (expert review
+  # 2026-10-13 #17): a flush of byte-identical content can recreate the pre-steal-touch etag, which
+  # is exactly the one a zombie's late `If-Match` PUT carries. `{:ok, new_etag}` on success;
+  # `{:error, :moved}` when the object is no longer `expected_etag` (a write landed, so the etag is
+  # already not the zombie's, and rotating THOSE bytes would launder them). Optional: a backend with
+  # no steal-time touch (`Local`) has no zombie-etag to recreate, and `Storage.retouch/2` answers
+  # `{:ok, expected_etag}` for it.
+  @callback retouch(shard_id :: String.t(), expected_etag :: String.t()) ::
+              {:ok, String.t()} | {:error, term()}
+  @optional_callbacks stored_usage: 0, flush: 6, released_dirty?: 1, retouch: 2
 
   # The cross-store DR backstop (expert review #6): a deleted tenant's re-mint guard is the Postgres
   # directory (loaded into the Tombstones ETS), but a Postgres point-in-time restore rolls the
@@ -869,13 +887,60 @@ defmodule Fathom.Shard.Storage do
   def released_marker(%{epoch: epoch} = lease, claim) when is_integer(claim) and claim > 0 do
     marker = %{owner: @released_owner, epoch: epoch, expires_at_ms: 0, claim: claim}
 
-    case lease do
-      %{clean_touch: {from, to}} when is_binary(from) and is_binary(to) ->
-        Map.merge(marker, %{touched_from: from, touched_to: to})
+    marker =
+      case lease do
+        %{clean_touch: {from, to}} when is_binary(from) and is_binary(to) ->
+          Map.merge(marker, %{touched_from: from, touched_to: to})
 
-      _ ->
-        marker
+        _ ->
+          marker
+      end
+
+    case lease do
+      %{dirty_release: true} -> Map.put(marker, :dirty, true)
+      _ -> marker
     end
+  end
+
+  @doc """
+  Re-rotate the object's etag when a flush landed back on `expected_etag` (expert review
+  2026-10-13 #17). See the `retouch/2` callback.
+  """
+  @spec retouch(String.t(), String.t()) :: {:ok, String.t()} | {:error, term()}
+  def retouch(shard_id, expected_etag) do
+    mod = backend()
+    _ = Code.ensure_loaded(mod)
+
+    if function_exported?(mod, :retouch, 2),
+      do: mod.retouch(shard_id, expected_etag),
+      else: {:ok, expected_etag}
+  end
+
+  @doc """
+  `lease` annotated so the released marker it leaves says "the releaser kept acked-but-unflushed
+  writes" (expert review 2026-10-13 #7). The opposite of `with_clean_touch/1`, and used on the
+  `keep_local_release_lease/3` paths only. `Fathom.Shards.RemoteFlush` reads it
+  (`released_dirty?/1`) so a flush asked of a node that is not the holder fails closed instead of
+  answering `:ok` over a stale stored object. Cleared by whoever next steals the marker and writes
+  its own: the question the flag answers is "is the object missing writes that exist only on a
+  released holder's disk", and the next opener's flush or release decides that afresh.
+  """
+  @spec with_dirty_release(map()) :: map()
+  def with_dirty_release(lease), do: Map.put(lease, :dirty_release, true)
+
+  @doc """
+  Is `shard_id`'s lock a released marker left by a DIRTY release? `true`/`false`, or
+  `{:error, reason}` when the lock cannot be read. A backend without `released_dirty?/1` answers
+  `false`.
+  """
+  @spec released_dirty?(String.t()) :: boolean() | {:error, term()}
+  def released_dirty?(shard_id) do
+    mod = backend()
+    _ = Code.ensure_loaded(mod)
+
+    if function_exported?(mod, :released_dirty?, 1),
+      do: mod.released_dirty?(shard_id),
+      else: false
   end
 
   @doc """
@@ -1176,6 +1241,9 @@ defmodule Fathom.Shard.Storage do
         _ -> base
       end
 
+    # A dirty released marker (expert review 2026-10-13 #7); absent otherwise.
+    base = if Map.get(lease, :dirty) == true, do: Map.put(base, "dirty", true), else: base
+
     # Touch provenance rides only on a released marker (expert review 2026-10-12 #10); absent
     # otherwise, so every other lock body is byte-identical to before.
     case lease do
@@ -1200,6 +1268,8 @@ defmodule Fathom.Shard.Storage do
             claim when is_integer(claim) and claim > 0 -> Map.put(lease, :claim, claim)
             _ -> lease
           end
+
+        lease = if Map.get(m, "dirty") == true, do: Map.put(lease, :dirty, true), else: lease
 
         case m do
           %{"touched_from" => from, "touched_to" => to} when is_binary(from) and is_binary(to) ->

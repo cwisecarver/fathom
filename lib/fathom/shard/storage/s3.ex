@@ -676,6 +676,31 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  # Re-rotate the object's etag when it is STILL `expected` (expert review 2026-10-13 #17, the
+  # `Storage.retouch/2` callback). A flush of byte-identical content (VACUUM INTO plus zstd is
+  # deterministic) can land back on the steal-touch's PRE etag, which is the one a zombie's late
+  # `If-Match` PUT carries — silently reopening the fence the steal closed. Guarded twice so it can
+  # only ever rotate OUR bytes: the HEAD must read `expected`, and the rotation itself is
+  # If-Matched on it, so a zombie PUT that lands in between 412s the touch (`:touch_precondition`)
+  # rather than being laundered into a fresh etag. A sentinel (never-flushed placeholder) is not
+  # something a flush produces, so it is `:moved`.
+  @impl true
+  def retouch(shard_id, expected) when is_binary(expected) do
+    key = db_key(shard_id)
+
+    case head_sized(key) do
+      {:ok, ^expected, false, carry, size} ->
+        with {:ok, post} <- rotate_etag(key, expected, carry, size),
+             do: resolved_post(shard_id, expected, post)
+
+      {:ok, _other, _sentinel?, _carry, _size} ->
+        {:error, :moved}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
   # The post-touch etag, WITHOUT the confirm-rotation HEAD when the touch's own write
   # response already proved it (review 2026-07-23 #13): the sentinel PUT returns the new
   # etag in its response header, and both copy forms return it in their response body —
@@ -2281,6 +2306,18 @@ defmodule Fathom.Shard.Storage.S3 do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  # A released marker left by a DIRTY release (expert review 2026-10-13 #7): see
+  # `Storage.with_dirty_release/1`. A read error is returned, not swallowed, so the caller fails closed.
+  @impl true
+  def released_dirty?(shard_id) do
+    case get_lock(shard_id) do
+      {:ok, %{dirty: true}, _etag} -> true
+      {:ok, _lease, _etag} -> false
+      :not_found -> false
+      {:error, reason} -> {:error, reason}
     end
   end
 

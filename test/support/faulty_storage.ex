@@ -437,6 +437,9 @@ defmodule Fathom.Test.FaultyStorage do
 
   @impl true
   def lease_holder(shard_id), do: Local.lease_holder(shard_id)
+
+  @impl true
+  def released_dirty?(shard_id), do: Local.released_dirty?(shard_id)
   @impl true
   # COUNTED, so a test can prove the round trip is not made (expert review 2026-08-26 #23). The
   # acquire error now carries the steal instant, and `Shards.holder_stealable_at/4` uses it instead

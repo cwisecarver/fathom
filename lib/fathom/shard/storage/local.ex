@@ -845,6 +845,17 @@ defmodule Fathom.Shard.Storage.Local do
     end
   end
 
+  # A released marker left by a DIRTY release (expert review 2026-10-13 #7).
+  @impl true
+  def released_dirty?(shard_id) do
+    case read_lock(shard_id) do
+      {:ok, %{dirty: true}} -> true
+      {:ok, _lease} -> false
+      :enoent -> false
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @impl true
   def check_lease(shard_id, %{owner: owner, epoch: epoch}) do
     # NO mutex here (expert review #28 follow-up): check_lease is the read-only flush
