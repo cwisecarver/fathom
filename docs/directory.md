@@ -27,8 +27,14 @@ round-trip in front of every query — latency on the hot path, and a Postgres o
   checkout.
 - **A re-touch is written at most every 30 s** (`:directory_touch_granularity_s`; perf review
   2026-10-01 #22). Each upsert is a non-HOT update (every index written), so re-recording every
-  touched shard every second cost ~20 MiB/s of WAL at 30k active shards; the `ON CONFLICT … WHERE`
-  guard cut that to ~2.4 MiB/s. The two edges a reader needs exact always land: the first touch
+  touched shard every second cost ~20 MiB/s of WAL at 30k active shards; the write guard cut that
+  to ~2.4 MiB/s. The guard is applied in an `UPDATE … FROM unnest(…)` (then `INSERT … ON CONFLICT
+  DO NOTHING` for unseen shards), **not** `ON CONFLICT DO UPDATE … WHERE`: Postgres locks the
+  conflicting tuple before evaluating that WHERE, so the ~29 of 30 guard-rejected touches still
+  wrote ~59 B of WAL each (160 B after a checkpoint); the UPDATE filters them in the join at ~3 B
+  (perf review 2026-10-14 #1; `test/fathom/directory_wal_bench_test.exs`). The two unread
+  `shards` indexes (`shards_active_last_active_at_index`, `shards_last_snapshot_at_active_index`)
+  were dropped for the same reason: each non-HOT write paid an entry in them (#5). The two edges a reader needs exact always land: the first touch
   after a **cutover** (the revert write-age guard) and the first after a recorded **flush** (the
   loss-window report's dirty test). So `last_active_at` can trail by up to 30 s inside an
   active period, while "used since cutover" and "dirty since flush" stay exact.

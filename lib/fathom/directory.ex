@@ -166,50 +166,76 @@ defmodule Fathom.Directory do
     entries
     |> Enum.chunk_every(@batch_chunk)
     |> Enum.reduce(0, fn chunk, acc ->
-      rows =
-        Enum.map(chunk, fn {shard_id, last_active_at} ->
-          %{
-            shard_id: shard_id,
-            schema_version: 0,
-            status: "active",
-            last_active_at: last_active_at,
-            inserted_at: now,
-            updated_at: now
-          }
-        end)
+      ids = Enum.map(chunk, &elem(&1, 0))
+      ats = Enum.map(chunk, &elem(&1, 1))
 
-      {count, _} =
-        Repo.insert_all(Shard, rows,
-          # GREATEST, not a plain replace: touches are coalesced and flushed later, and two
-          # nodes serving the same shard across a remap can flush out of order, so an
-          # unconditional replace could rewind last_active_at with a stale stamp — corrupting
-          # the recency heuristics (laggard ordering, the revert write-age guard). Keep the
-          # newer of incoming vs stored; updated_at (bookkeeping) always advances.
-          on_conflict:
-            from(s in Shard,
-              update: [
-                set: [
-                  last_active_at:
-                    fragment("GREATEST(EXCLUDED.last_active_at, ?)", s.last_active_at),
-                  updated_at: fragment("EXCLUDED.updated_at")
-                ]
-              ],
-              # The #22 write guard (see @doc). A row the WHERE rejects is not updated at all —
-              # no new tuple, no index entries, no WAL — and does not count in the return value.
-              where:
-                fragment(
-                  "EXCLUDED.last_active_at > ? + make_interval(secs => ?)",
-                  s.last_active_at,
-                  ^granularity_s
-                ) or
-                  fragment("? <= coalesce(?, '-infinity')", s.last_active_at, s.cutover_at) or
-                  fragment("? <= coalesce(?, '-infinity')", s.last_active_at, s.last_flushed_at)
-            ),
-          conflict_target: :shard_id
+      # Step 1: UPDATE the rows that exist AND pass the #22 write guard. A guard-rejected row is
+      # filtered out by the join, so it is never row-locked and writes no WAL (perf review
+      # 2026-10-14 #1). The old `INSERT ... ON CONFLICT DO UPDATE ... WHERE <guard>` locked the
+      # conflicting tuple BEFORE evaluating the WHERE, so the ~29 of every 30 touches the guard
+      # rejects still dirtied the page and wrote a heap-lock record: 59 B/row steady state (160
+      # B/row on the first pass after a checkpoint) vs ~1 B/row here, ~70% of all touch WAL. The
+      # guard is evaluated under the UPDATE's own row lock, so the cutover / last_flushed_at edge
+      # exactness holds with no read-then-write gap.
+      #
+      # GREATEST, not a plain replace: touches are coalesced and flushed later, and two nodes
+      # serving the same shard across a remap can flush out of order, so an unconditional replace
+      # could rewind last_active_at with a stale stamp, corrupting the recency heuristics
+      # (laggard ordering, the revert write-age guard). updated_at (bookkeeping) always advances.
+      {updated, updated_ids} =
+        Repo.update_all(
+          from(s in Shard,
+            join:
+              v in fragment(
+                "SELECT * FROM unnest(?::varchar[], ?::timestamp[]) AS t(shard_id, at)",
+                ^ids,
+                ^ats
+              ),
+            on: s.shard_id == v.shard_id,
+            where:
+              fragment("? > ? + make_interval(secs => ?)", v.at, s.last_active_at, ^granularity_s) or
+                fragment("? <= coalesce(?, '-infinity')", s.last_active_at, s.cutover_at) or
+                fragment("? <= coalesce(?, '-infinity')", s.last_active_at, s.last_flushed_at),
+            update: [
+              set: [
+                last_active_at: fragment("GREATEST(?, ?)", v.at, s.last_active_at),
+                updated_at: ^now
+              ]
+            ],
+            select: s.shard_id
+          ),
+          []
         )
 
-      acc + count
+      # Step 2: register the shards the directory has never seen. What the UPDATE did not return is
+      # absent (inserted here) or present-but-guard-rejected (DO NOTHING, which, unlike DO UPDATE
+      # ... WHERE, takes no tuple lock: ~3 B/row measured on 20k existing rows). A shard another
+      # node inserted between the two statements is skipped; that node's own first-sight insert
+      # carries a stamp from the same moment.
+      updated_set = MapSet.new(updated_ids)
+      inserted = chunk |> Enum.reject(fn {id, _} -> id in updated_set end) |> insert_new(now)
+
+      acc + updated + inserted
     end)
+  end
+
+  defp insert_new([], _now), do: 0
+
+  defp insert_new(entries, now) do
+    rows =
+      Enum.map(entries, fn {shard_id, last_active_at} ->
+        %{
+          shard_id: shard_id,
+          schema_version: 0,
+          status: "active",
+          last_active_at: last_active_at,
+          inserted_at: now,
+          updated_at: now
+        }
+      end)
+
+    {count, _} = Repo.insert_all(Shard, rows, on_conflict: :nothing, conflict_target: :shard_id)
+    count
   end
 
   @doc """
@@ -1816,9 +1842,11 @@ defmodule Fathom.Directory do
   end
 
   # active_recent/1 (the fleet-wide hot set the WarmFollower read cache pre-pulled) was removed
-  # 2026-09-14 with the WarmFollower retirement — it had no other caller. The partial index it used
-  # (shards_active_last_active_at_index) is KEPT; the laggard path relies on the same
-  # status='active' + last_active_at shape.
+  # 2026-09-14 with the WarmFollower retirement — it had no other caller. Its partial index
+  # (shards_active_last_active_at_index) had NO reader after that (`laggards` uses the composite
+  # shards_active_schema_version_last_active_at_index; `flush_lag_report`'s `status != 'deleted'`
+  # does not imply the partial predicate) and was dropped by perf review 2026-10-14 #5: every
+  # touch/flush write is non-HOT, so an unread index is pure per-write WAL.
 
   @max_page 200
   @default_page 50

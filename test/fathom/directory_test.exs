@@ -462,6 +462,27 @@ defmodule Fathom.DirectoryTest do
       assert DateTime.compare(stored("g_basic").last_active_at, later) == :eq
     end
 
+    # Perf review 2026-10-14 #1: record_batch is now UPDATE (existing + guard-passing) then INSERT
+    # DO NOTHING (the rest). One batch mixing all three fates must return exactly the written count,
+    # leave the rejected row untouched, and register the new one with the batch's own stamp.
+    test "a mixed batch: written, guard-rejected and first-seen rows each get their own fate" do
+      {:ok, fresh} = Directory.resolve("mix_reject")
+      {:ok, stale} = Directory.resolve("mix_write")
+      t = fresh.last_active_at
+      new_at = DateTime.add(t, 1, :second)
+
+      assert Directory.record_batch([
+               {"mix_reject", DateTime.add(t, 5, :second)},
+               {"mix_write", DateTime.add(stale.last_active_at, 40, :second)},
+               {"mix_new", new_at}
+             ]) == 2
+
+      assert DateTime.compare(stored("mix_reject").last_active_at, t) == :eq
+      assert DateTime.compare(stored("mix_write").last_active_at, stale.last_active_at) == :gt
+      assert %{schema_version: 0, status: "active"} = stored("mix_new")
+      assert DateTime.compare(stored("mix_new").last_active_at, new_at) == :eq
+    end
+
     # The revert write-age guard (Migrator.ShardMigration) refuses when last_active_at >
     # cutover_at, and cutover stamps both with the same instant. Without this escape a write 5 s
     # after cutover is skipped and a revert would silently discard it.
@@ -495,8 +516,7 @@ defmodule Fathom.DirectoryTest do
   # sequentially scanned the whole shards table — linear in fleet size (millions at target
   # scale). These partial indexes make the status-filtered reads index-bound. Pin their
   # existence + partial predicate so a future migration can't silently drop the fleet back
-  # to full scans. (The active_recent query the index also served was removed 2026-09-14 with
-  # the WarmFollower retirement; the index stays for the laggard path.)
+  # to full scans. (The active_recent query and its index were removed 2026-09-14 / 2026-10-14.)
   describe "status-filtered query indexes (finding #12)" do
     test "partial indexes on active shards exist for the laggard path" do
       defs =
@@ -505,13 +525,53 @@ defmodule Fathom.DirectoryTest do
         ).rows
         |> Map.new(fn [name, definition] -> {name, definition} end)
 
-      active_recent_idx = defs["shards_active_last_active_at_index"]
-      assert active_recent_idx =~ "(last_active_at)"
-      assert active_recent_idx =~ ~r/where.*status.*=.*'active'/i
+      # This test previously ALSO pinned `shards_active_last_active_at_index` (a leftover of the
+      # deleted active_recent/1) as "must exist". Perf review 2026-10-14 #5: nothing reads it and,
+      # on a table whose every touch/flush write is non-HOT, it costs a wasted index entry per
+      # write (-19% touch WAL when dropped). The pin asserted the defect; it now asserts the
+      # index is GONE, and the plan tests below pin that each remaining reader keeps its index.
+      refute Map.has_key?(defs, "shards_active_last_active_at_index")
+      refute Map.has_key?(defs, "shards_last_snapshot_at_active_index")
 
       laggard_idx = defs["shards_active_schema_version_last_active_at_index"]
       assert laggard_idx =~ "(schema_version, last_active_at)"
       assert laggard_idx =~ ~r/where.*status.*=.*'active'/i
+    end
+
+    # The readers whose index the dropped ones might have served must still be index-served.
+    # A REALISTIC TABLE (see the control-plane counts test below): many active rows, few matching.
+    test "laggards, snapshot and retention sampling are served by their own indexes" do
+      Fathom.Repo.query!("""
+      INSERT INTO shards (shard_id, schema_version, status, last_active_at, last_flushed_at,
+                          last_snapshot_at, inserted_at, updated_at)
+      SELECT 'plan5_' || g, CASE WHEN g <= 20 THEN 1 ELSE 2 END, 'active', now(), now(),
+             CASE WHEN g % 2 = 0 THEN now() - interval '1 hour' END, now(), now()
+      FROM generate_series(1, 3000) g
+      """)
+
+      Fathom.Repo.query!("ANALYZE shards")
+      Fathom.Repo.query!("SET LOCAL enable_seqscan = off")
+
+      {laggard_sql, laggard_params} =
+        Ecto.Adapters.SQL.to_sql(:all, Fathom.Repo, Directory.laggards_at_version_query(2, 1, 10))
+
+      for {label, index, sql, params} <- [
+            {"laggards", "shards_active_schema_version_last_active_at_index",
+             "EXPLAIN " <> laggard_sql, laggard_params},
+            {"sample_for_snapshot", "shards_snapshot_rotation_active_index",
+             "EXPLAIN SELECT shard_id FROM shards WHERE status = 'active' AND " <>
+               "last_flushed_at IS NOT NULL AND (last_snapshot_at IS NULL OR " <>
+               "last_flushed_at > last_snapshot_at) ORDER BY last_snapshot_attempt_at ASC " <>
+               "NULLS FIRST, last_snapshot_at ASC NULLS FIRST LIMIT 10", []},
+            {"sample_for_retention", "shards_retention_rotation_active_index",
+             "EXPLAIN SELECT shard_id FROM shards WHERE status = 'active' AND " <>
+               "last_snapshot_at IS NOT NULL ORDER BY last_retention_at ASC NULLS FIRST, " <>
+               "last_snapshot_at ASC LIMIT 10", []}
+          ] do
+        %{rows: rows} = Fathom.Repo.query!(sql, params)
+        plan = rows |> List.flatten() |> Enum.join("\n")
+        assert plan =~ index, "#{label} is not served by #{index}. Plan:\n#{plan}"
+      end
     end
   end
 
@@ -744,7 +804,7 @@ defmodule Fathom.DirectoryTest do
       test "#{label} is served by its partial index" do
         # A REALISTIC TABLE, or the plan is a coin toss (flaked in precommit 2026-10-03, seed
         # 836400). On the near-empty test table every partial `status = 'active'` index costs the
-        # same, and `stamp_drift_checked` came back on `shards_last_snapshot_at_active_index` — a
+        # same, and `stamp_drift_checked` came back on the (since dropped) `shards_last_snapshot_at_active_index` — a
         # full pass over active rows that the assertion rightly rejects. Production has many active
         # rows and few matching ones, which is what makes the narrow index win: seed that shape and
         # ANALYZE it (both roll back with the sandbox transaction).
