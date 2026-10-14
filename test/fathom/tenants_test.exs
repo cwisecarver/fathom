@@ -85,7 +85,7 @@ defmodule Fathom.TenantsTest do
       assert_received {:discarded, %{count: 1}, %{shard_id: "Not Valid!"}}
     end
 
-    test "ReconcileJob re-enqueues a purge for a tombstoned shard whose object survived", %{
+    test "ErasureSweepJob re-enqueues a purge for a tombstoned shard whose object survived", %{
       id: id
     } do
       src = Path.join(System.tmp_dir!(), "#{id}.src")
@@ -95,14 +95,14 @@ defmodule Fathom.TenantsTest do
       {:ok, _} = Directory.tombstone(id)
       refute_enqueued(worker: DeleteJob, args: %{shard_id: id})
 
-      assert :ok = perform_job(Fathom.Migrator.ReconcileJob, %{})
+      assert :ok = perform_job(Fathom.Migrator.ErasureSweepJob, %{})
       assert_enqueued(worker: DeleteJob, args: %{shard_id: id})
     end
 
-    test "ReconcileJob leaves a fully purged tombstoned shard alone", %{id: id} do
+    test "ErasureSweepJob leaves a fully purged tombstoned shard alone", %{id: id} do
       {:ok, _} = Directory.tombstone(id)
 
-      assert :ok = perform_job(Fathom.Migrator.ReconcileJob, %{})
+      assert :ok = perform_job(Fathom.Migrator.ErasureSweepJob, %{})
       refute_enqueued(worker: DeleteJob, args: %{shard_id: id})
     end
   end
@@ -141,7 +141,7 @@ defmodule Fathom.TenantsTest do
       Enum.each(newest, &put_object!/1)
       on_exit(fn -> Enum.each(newest, &Storage.purge_shard/1) end)
 
-      assert :ok = perform_job(Fathom.Migrator.ReconcileJob, %{})
+      assert :ok = perform_job(Fathom.Migrator.ErasureSweepJob, %{})
 
       for id <- newest, do: assert_enqueued(worker: DeleteJob, args: %{shard_id: id})
     end
@@ -156,7 +156,7 @@ defmodule Fathom.TenantsTest do
       assert {:ok, true} = Storage.any_shard_object?(id)
       {:ok, _} = Directory.tombstone(id)
 
-      assert :ok = perform_job(Fathom.Migrator.ReconcileJob, %{})
+      assert :ok = perform_job(Fathom.Migrator.ErasureSweepJob, %{})
       assert_enqueued(worker: DeleteJob, args: %{shard_id: id})
     end
 
@@ -169,8 +169,8 @@ defmodule Fathom.TenantsTest do
 
   # Expert review 2026-10-12 #8. Symptom: the 14-day -promoexp expiry ran only inside RetentionJob
   # (off by default, active+scheduler-snapshotted rows only), so with retention unset every
-  # promotion leaked a full copy forever. ReconcileJob now sweeps rows stamped by PromoteOnOpen.
-  describe "promotion snapshot expiry in ReconcileJob (expert review 2026-10-12 #8)" do
+  # promotion leaked a full copy forever. ErasureSweepJob (split out of ReconcileJob, 2026-10-13 #8) now sweeps rows stamped by PromoteOnOpen.
+  describe "promotion snapshot expiry in ErasureSweepJob (expert review 2026-10-12 #8)" do
     defp aged_promo_snapshot!(id, days) do
       at = DateTime.add(DateTime.utc_now(), -days * 86_400, :second)
       sid = Calendar.strftime(at, "%Y%m%dT%H%M%SZ") <> "-0001-pre-promotion-promoexp"
@@ -193,7 +193,7 @@ defmodule Fathom.TenantsTest do
       {:ok, fresh} = Snapshots.create(id, label: "keep-me", pre_promotion: true)
       assert 1 = Directory.stamp_promotion_snapshot(id, at)
 
-      assert :ok = perform_job(Fathom.Migrator.ReconcileJob, %{})
+      assert :ok = perform_job(Fathom.Migrator.ErasureSweepJob, %{})
 
       left = snapshot_ids(id)
       refute aged in left
@@ -211,7 +211,7 @@ defmodule Fathom.TenantsTest do
       assert 1 =
                Directory.stamp_promotion_snapshot(id, DateTime.add(DateTime.utc_now(), -1, :day))
 
-      assert :ok = perform_job(Fathom.Migrator.ReconcileJob, %{})
+      assert :ok = perform_job(Fathom.Migrator.ErasureSweepJob, %{})
       assert aged in snapshot_ids(id)
     end
 
@@ -222,7 +222,7 @@ defmodule Fathom.TenantsTest do
       {:ok, _} = Directory.tombstone(id)
       assert 1 = Directory.stamp_promotion_snapshot(id, at)
 
-      assert :ok = perform_job(Fathom.Migrator.ReconcileJob, %{})
+      assert :ok = perform_job(Fathom.Migrator.ErasureSweepJob, %{})
       refute aged in snapshot_ids(id)
     end
   end

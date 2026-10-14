@@ -586,7 +586,10 @@ defmodule Fathom.Test.FaultyStorage do
   def purge_shard(shard_id), do: Local.purge_shard(shard_id)
 
   @impl true
-  def any_shard_object?(shard_id), do: Local.any_shard_object?(shard_id)
+  def any_shard_object?(shard_id) do
+    run_before(:any_shard_object, shard_id)
+    Local.any_shard_object?(shard_id)
+  end
 
   @impl true
   def fork_shard(src_id, dst_id), do: Local.fork_shard(src_id, dst_id)

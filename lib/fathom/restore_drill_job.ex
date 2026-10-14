@@ -42,6 +42,12 @@ defmodule Fathom.RestoreDrillJob do
   # "no data yet" (absent/sentinel — a brand-new tenant that never flushed).
   @failures [:corrupt, :schema_mismatch, :error]
 
+  # Bound the run under Lifeline's `rescue_after` (config.exs, 60 min) so a wedged job ends instead
+  # of being rescued while its process is still alive (expert review 2026-10-13 #6). Oban's default
+  # is :infinity. Pinned by test/fathom/oban_worker_timeout_test.exs.
+  @impl Oban.Worker
+  def timeout(_job), do: :timer.minutes(50)
+
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
     case sample_size() do

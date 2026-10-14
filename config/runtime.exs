@@ -1188,7 +1188,7 @@ if config_env() == :prod do
     # ssl: true,
     url: database_url,
     # Expert review 2026-07-24 #21. The phx.new default of 10 sat under a demand floor of ~21 from
-    # Oban ALONE (`queues: [migrations: 10, retirement: 5, rebalance: 3, tenants: 3]`, config.exs),
+    # Oban ALONE (`queues: [migrations: 10, retirement: 5, rebalance: 3, tenants: 3, tokens: 3, erasure: 1]`, config.exs),
     # each executing job holding a connection — and ShardMigrationJob's cutover runs `Oban.insert`
     # inside a transaction, holding one for its full duration. On top of that: the Oban
     # Cron/Pruner/Peer plugins, the endpoint and every admin LiveView, Directory.Recorder,

@@ -523,6 +523,37 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  One page of the tombstone walk, newest deletion first, strictly AFTER `cursor` (a
+  `{updated_at, shard_id}` keyset, or `nil` for the first page). Returns `[{shard_id, updated_at}]`
+  so the caller can carry the last row forward as the next cursor (expert review 2026-10-13 #8:
+  `recently_deleted_shard_ids/2` re-read the same newest `limit` every hour, so older stuck ids
+  past the `limit`th deletion were never revisited).
+  """
+  @spec deleted_page(DateTime.t(), pos_integer(), nil | {DateTime.t(), String.t()}) :: [
+          {String.t(), DateTime.t()}
+        ]
+  def deleted_page(%DateTime{} = since, limit, cursor)
+      when is_integer(limit) and limit > 0 do
+    base =
+      from s in Shard,
+        where: s.status == "deleted" and s.updated_at >= ^since,
+        order_by: [desc: s.updated_at, desc: s.shard_id],
+        limit: ^limit,
+        select: {s.shard_id, s.updated_at}
+
+    case cursor do
+      nil ->
+        Repo.all(base)
+
+      {%DateTime{} = at, id} ->
+        Repo.all(
+          from s in base,
+            where: s.updated_at < ^at or (s.updated_at == ^at and s.shard_id < ^id)
+        )
+    end
+  end
+
+  @doc """
   Records a restore-drill outcome (#24) on the shard's row: stamps `last_verified_at` (drives the
   sampling weight) and `last_verify_status` (queryable durably). Returns how many rows were updated
   (0 if the shard is gone). Best-effort — never raises the caller.
