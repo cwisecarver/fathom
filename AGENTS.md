@@ -134,9 +134,12 @@ itself was not:
 
 - "Set the SQLite authorizer in `Connection.open/1`" — would have broken **every durability flush**,
   because `VACUUM INTO` is implemented as an internal ATTACH. A 30-second probe caught it.
-- "`quick_check` the snapshot temp" — the temp is the post-`VACUUM INTO` file, and VACUUM *rebuilds
-  indexes from table content*, so it repairs exactly the corruption class the gate exists to catch.
-  The gate would have shipped and never fired.
+- "`quick_check` the snapshot temp" — the temp is the post-`VACUUM INTO` file, and VACUUM rewrites
+  every page, so it repairs the page-level corruption class the gate exists to catch. The gate would
+  have shipped and never fired. (Correction, expert review 2026-10-15 #11: VACUUM INTO does **not**
+  rebuild indexes from table content — an index that disagrees with its table is copied verbatim,
+  and `quick_check` cannot see it on either side; only `integrity_check` can. Probe:
+  `test/fathom/shard/vacuum_into_index_test.exs`.)
 - "Delete the lock instead of rolling it back" — makes the next `acquire_lease` a fresh create at
   **epoch 1**, a larger backward jump than the bug being fixed.
 - "Reduce `prev_load` to the shards that moved" — an unmoved shard still needs its baseline, or the
