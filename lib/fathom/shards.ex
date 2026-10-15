@@ -149,7 +149,7 @@ defmodule Fathom.Shards do
   # retry path stay one shape; `checkout_result/5` drops the reuse for the plain (nil-scope) caller.
   defp do_checkout(shard_id, attempts, held \\ nil, scope \\ nil) do
     with :ok <- maybe_lazy_migrate(shard_id),
-         {:ok, pid} <- do_ensure(shard_id, true),
+         {:ok, pid} <- do_ensure(shard_id, true, attempts < 3),
          {:ok, ref, path, reuse} <- pid |> grant(scope) |> note_held(shard_id) do
       record_use(shard_id)
       # Per-shard load: the checkout (traffic) signal for the rebalancer. Lock-free
@@ -1143,12 +1143,15 @@ defmodule Fathom.Shards do
     # Cast, not just `valid?` (expert review 2026-10-10 #9): the ETS gates and Registry are keyed
     # lowercase, so an uppercase id must be canonicalized before any of them is consulted.
     case Fathom.ShardId.cast(shard_id) do
-      {:ok, id} -> do_ensure(id, false)
+      {:ok, id} -> do_ensure(id, false, true)
       :error -> {:error, :invalid_shard_id}
     end
   end
 
-  defp do_ensure(shard_id, refusal_cache?) do
+  # `live?` filters dead registry entries out of the lookup (see `maybe_alive/2`). It is OFF on a
+  # first-attempt checkout (the hot path pays nothing) and ON for the checkout retry and the public
+  # `ensure/1` (admin/bench/tests, never the request path).
+  defp do_ensure(shard_id, refusal_cache?, live?) do
     cond do
       # Lifecycle denies, checked on EVERY checkout (not just a new open) so a deleted or
       # suspended tenant is refused even when a coordinator is still running — closing the
@@ -1161,7 +1164,7 @@ defmodule Fathom.Shards do
         {:error, :shard_suspended}
 
       true ->
-        case registry_lookup(shard_id) do
+        case registry_lookup(shard_id, live?) do
           {:ok, [{pid, _}]} ->
             {:ok, pid}
 
@@ -1556,14 +1559,28 @@ defmodule Fathom.Shards do
   # raise on the dead partition, so an empty `lookup` is re-confirmed with it. Hits (the hot
   # path) cost only the lookup; the confirm runs on a miss, i.e. a cold open or an already-cold
   # drain/stop, which are far heavier than one extra ETS select.
-  defp registry_lookup(shard_id) do
-    case Registry.lookup(@registry, shard_id) do
-      [] -> {:ok, Registry.match(@registry, shard_id, :_)}
+  defp registry_lookup(shard_id, live? \\ false) do
+    case maybe_alive(Registry.lookup(@registry, shard_id), live?) do
+      [] -> {:ok, maybe_alive(Registry.match(@registry, shard_id, :_), live?)}
       found -> {:ok, found}
     end
   rescue
     ArgumentError -> {:error, :unavailable}
   end
+
+  # The Registry partition removes a dead pid's entry ASYNCHRONOUSLY (it handles the EXIT as a
+  # message), and neither `lookup/2` nor `match/3` filters that window: a coordinator that had just
+  # crashed came back from `ensure/1` as a dead pid and the caller's first call exited `:noproc`
+  # (CI 2026-10-15, seed 906875). Filtering EVERY lookup with `Process.alive?/1` was tried (d3e5fc0b)
+  # and reverted (c8298047): liveness of another process is a signal round trip, and it cost
+  # same_shard_checkout_per_s -47%. So the check runs only where the hot path is not: the public
+  # `ensure/1` and the checkout RETRY (a first attempt that hit a dead pid returns `:unavailable`,
+  # which `retry_checkout?/1` retries). A dead entry is "nobody here"; the open that follows
+  # replaces it (`register_name` evicts a dead registrant).
+  defp maybe_alive(entries, false), do: entries
+
+  defp maybe_alive(entries, true),
+    do: Enum.filter(entries, fn {pid, _} -> Process.alive?(pid) end)
 
   # Every `{shard_id, pid}` registered on this node. If a partition is down the select raises, so
   # fall back to the supervisor's children (they ARE the coordinators) with the id resolved lazily
