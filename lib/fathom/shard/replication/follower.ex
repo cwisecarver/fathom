@@ -360,6 +360,7 @@ defmodule Fathom.Shard.Replication.Follower do
     # inherits a quarantine flag from a replica that no longer exists.
     File.rm(torn_path(name, shard_id))
     File.rm(lineage_path(name, shard_id))
+    File.rm(ordinal_path(name, shard_id))
     :ok
   rescue
     ArgumentError -> :ok
@@ -478,6 +479,12 @@ defmodule Fathom.Shard.Replication.Follower do
   def lineage_path(name \\ __MODULE__, shard_id) do
     assert_valid_shard_id!(shard_id)
     Path.join(dir(name), shard_id <> ".db.lineage")
+  end
+
+  @doc false
+  def ordinal_path(name \\ __MODULE__, shard_id) do
+    assert_valid_shard_id!(shard_id)
+    Path.join(dir(name), shard_id <> ".db.ordinal")
   end
 
   defp assert_valid_shard_id!(shard_id) do
@@ -1745,16 +1752,21 @@ defmodule Fathom.Shard.Replication.Follower do
   defp put_state(name, shard_id, state) do
     tab = table(name)
 
-    {was_torn?, was_lineage} =
+    {was_torn?, was_lineage, was_ordinal} =
       case :ets.lookup(tab, shard_id) do
-        [{^shard_id, %{torn: t} = prev}] -> {t, Map.get(prev, :lineage, 0)}
-        _ -> {false, 0}
+        [{^shard_id, %{torn: t} = prev}] ->
+          {t, Map.get(prev, :lineage, 0), {Map.get(prev, :wal_ordinal, 0), prev.salt1}}
+
+        _ ->
+          {false, 0, nil}
       end
 
     # Marker BEFORE the ETS row, so a crash between the two leaves the SAFE state: the marker
     # present and the replica treated as torn, never the reverse.
     if was_torn? != state.torn, do: sync_torn_marker(name, shard_id, state)
     if state.lineage != was_lineage, do: sync_lineage(name, shard_id, state.lineage)
+    ordinal = {Map.get(state, :wal_ordinal, 0), state.salt1}
+    if ordinal != was_ordinal, do: sync_ordinal(name, shard_id, ordinal)
     :ets.insert(tab, {shard_id, state})
     state
   end
@@ -1769,6 +1781,43 @@ defmodule Fathom.Shard.Replication.Follower do
     do: File.write(lineage_path(name, shard_id), Integer.to_string(lineage))
 
   defp sync_lineage(_name, _shard_id, _lineage), do: :ok
+
+  # THE ORDINAL SURVIVES A RESTART TOO (expert review 2026-10-15 #4, default D2). Recovery rebuilt
+  # every replica at `wal_ordinal: 0` ("not stated"), which `Promote.fresher?/2` refuses to rank, so
+  # after a follower restart (every deploy) a replica holding the acked tail was invisible to
+  # failover until its next push, while `Recovery.answered/3` still counted it toward the floor.
+  #
+  # Persisted WITH THE SALT it describes, as `"<ordinal> <salt1>"`: the coordinator assigns one
+  # ordinal per WAL salt (`Fathom.Shard.wal_ordinal/2`), so the pair is a fact about one WAL file.
+  # Recovery adopts the ordinal ONLY when the salt matches the recovered `-wal`'s header, which makes
+  # the write order against the WAL bytes irrelevant: a crash between the two leaves salts that
+  # disagree and recovers 0, the pre-fix answer, never a wrong ordinal on the wrong WAL.
+  #
+  # Written once per WAL generation (a reset push or a seed), not per frame. Losing it to an OS
+  # crash recovers 0, which is safe.
+  defp sync_ordinal(name, shard_id, {ordinal, salt1})
+       when is_integer(ordinal) and ordinal > 0 and is_integer(salt1) do
+    File.write(ordinal_path(name, shard_id), "#{ordinal} #{salt1}")
+  end
+
+  defp sync_ordinal(name, shard_id, _ordinal) do
+    File.rm(ordinal_path(name, shard_id))
+    :ok
+  end
+
+  @doc false
+  # The persisted ordinal for the WAL whose header salt is `salt1`, or 0. Public for the test.
+  @spec recovered_ordinal(atom(), String.t(), non_neg_integer()) :: non_neg_integer()
+  def recovered_ordinal(name \\ __MODULE__, shard_id, salt1) do
+    with {:ok, text} <- File.read(ordinal_path(name, shard_id)),
+         [n, s] <- String.split(String.trim(text), " "),
+         {ordinal, ""} when ordinal > 0 <- Integer.parse(n),
+         {^salt1, ""} <- Integer.parse(s) do
+      ordinal
+    else
+      _ -> 0
+    end
+  end
 
   defp recovered_lineage(name, shard_id) do
     with {:ok, text} <- File.read(lineage_path(name, shard_id)),
@@ -2041,10 +2090,13 @@ defmodule Fathom.Shard.Replication.Follower do
       # thing that remembers the two files were a generation apart when we went down.
       torn? = File.exists?(torn_path(name, shard_id))
       lineage = recovered_lineage(name, shard_id)
+      # Only for the WAL whose salt it was written for (expert review 2026-10-15 #4).
+      ordinal = recovered_ordinal(name, shard_id, salt)
 
       :ets.insert(
         tab,
-        {shard_id, %{FollowerLog.seeded(0, gen, salt, size, lineage) | torn: torn?}}
+        {shard_id,
+         %{FollowerLog.seeded(0, gen, salt, size, lineage) | torn: torn?, wal_ordinal: ordinal}}
       )
 
       true

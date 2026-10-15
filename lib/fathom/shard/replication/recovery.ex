@@ -303,7 +303,7 @@ defmodule Fathom.Shard.Replication.Recovery do
 
     # perf review 2026-10-14 #8(b): an UNRANKABLE stamp (a new shard, or an object flushed before
     # stamping) can never be overridden by any replica (`Promote.fresher?/2` is false for every
-    # one), no answer can be refused for (`answered/2 >= 0` always), and `settle/7` clears the
+    # one), no answer can be refused for (`answered/3 >= 0` always), and `settle/7` clears the
     # window only for `needed > 1`. So the outcome is `:none` whatever the peers say, and dialing
     # them (two-second connect and query timeouts, a socket each) only bought latency. NOT keyed
     # off `needed == 0`: a rankable stamp with Q = N + 1 also computes 0 and must still search.
@@ -441,9 +441,10 @@ defmodule Fathom.Shard.Replication.Recovery do
         :none
 
       true ->
-        answers = ask(peers, shard_id, query_timeout_ms(opts), true, early_exit(needed, opts))
+        answers =
+          ask(peers, shard_id, query_timeout_ms(opts), true, early_exit(needed, local, opts))
 
-        if answered(answers, opts) >= needed do
+        if answered(answers, local, opts) >= needed do
           settle(shard_id, object_stamp, local, follower, answers, needed, opts)
         else
           under_quorum(shard_id, object_stamp, local, follower, peers, needed, answers, opts)
@@ -462,7 +463,7 @@ defmodule Fathom.Shard.Replication.Recovery do
       {:wait, waited} ->
         refusal = %UnderQuorum{
           shard_id: shard_id,
-          answered: answered(answers, opts),
+          answered: answered(answers, local, opts),
           needed: needed,
           waited_ms: waited
         }
@@ -476,14 +477,15 @@ defmodule Fathom.Shard.Replication.Recovery do
         # cache. Inside the window the cache keeps each refusal fast (a blackholed peer would cost
         # every retry its full connect timeout) and its 10 s TTL re-dials a recovered peer well
         # within the window; here, one connect timeout is cheap next to losing an acked tail.
-        answers = ask(peers, shard_id, query_timeout_ms(opts), false, early_exit(needed, opts))
+        answers =
+          ask(peers, shard_id, query_timeout_ms(opts), false, early_exit(needed, local, opts))
 
-        if answered(answers, opts) >= needed do
+        if answered(answers, local, opts) >= needed do
           settle(shard_id, object_stamp, local, follower, answers, needed, opts)
         else
           giving_up = %UnderQuorum{
             shard_id: shard_id,
-            answered: answered(answers, opts),
+            answered: answered(answers, local, opts),
             needed: needed,
             waited_ms: waited
           }
@@ -516,23 +518,75 @@ defmodule Fathom.Shard.Replication.Recovery do
     )
   end
 
-  # This node's own replica table is one definite answer: `search/7` only asks when it is
-  # listening, so a nil there means "I have nothing", not "I could not tell".
-  #
-  # THE PREVIOUS OWNER DOES NOT COUNT (expert review 2026-10-13 #14). `peers/0` is every other node,
-  # so it includes the node whose lease we just stole, but that node is not one of the followers the
-  # writer's quorum was taken over: a lapsed-but-answering P saying "nothing" would otherwise stand
-  # in for a follower and shrink the read to N-Q real followers. Its OFFER (if it holds a position)
-  # is still honoured by `offers/1`; it only stops counting toward the floor. `needed` is unchanged.
-  defp answered(answers, opts) do
-    prev = Keyword.get(opts, :previous_owner)
+  @doc """
+  How many DEFINITE answers recovery holds toward the `N - Q + 1` responder floor: this node's own
+  replica table plus every peer that answered. Pure, for the test.
 
-    1 +
+  An answer is definite when it can be trusted to carry the acked tail if the answerer holds it:
+  "I have nothing" (`nil`) is definite, and so is a position the ranking can use. Three kinds of
+  answer are NOT, and none of them counts:
+
+    * **an UNRANKABLE position** (expert review 2026-10-15 #4) — `wal_ordinal` or `lineage` 0, i.e.
+      "not stated". `Promote.fresher?/2` refuses to rank it, so if it is the one replica that holds
+      the acked tail, the tail is invisible to `choose/3` — counting it toward the floor let the
+      floor be "met" while the only copy was hidden. The canonical source was a follower restart:
+      recovery rebuilt every replica at ordinal 0 until its next push. The follower now persists
+      the ordinal beside the WAL it describes (`Follower`'s `.db.ordinal`), so a restarted replica
+      stays rankable and this clause fires only where no persisted ordinal exists (default D2 of
+      that review: not counting EVERY restarted replica would have refused opens fleet-wide after
+      each rolling deploy);
+    * **a torn local replica** — the peer side already answers `:torn` (silent); the local table
+      counted it;
+    * **this node, when it is the previous owner** (expert review 2026-10-15 #4) — a node that
+      held the lease was never its own follower, so its table cannot hold the tail it wrote, and
+      counting it shrank the floor to `N - Q` real followers. Detected by `node()`, which the owner
+      string carries (`Heartbeat.owner/0` is `"<node()>#<incarnation>"`), so it needs no NODE_KEY.
+
+  A PEER that is the previous owner is excluded too (expert review 2026-10-13 #14), but that
+  comparison is between an owner string and a `node_key` and only works where the two coincide —
+  the NODE_KEY-in-owner change (expert review 2026-10-15 #17) is what closes it.
+  """
+  @spec answered(
+          [{endpoint(), {:answered, position() | nil} | :silent}],
+          position() | nil,
+          keyword()
+        ) ::
+          non_neg_integer()
+  def answered(answers, local, opts) do
+    prev = Keyword.get(opts, :previous_owner)
+    self_name = Keyword.get_lazy(opts, :self_node, fn -> Atom.to_string(node()) end)
+
+    own =
+      if self_previous_owner?(prev, self_name) or not definite?(local), do: 0, else: 1
+
+    own +
       Enum.count(answers, fn
-        {{key, _h, _p}, {:answered, _}} -> not previous_owner?(prev, key)
+        {{key, _h, _p}, {:answered, pos}} -> definite?(pos) and not previous_owner?(prev, key)
         _ -> false
       end)
   end
+
+  # nil is "I hold nothing": definite. A map must be rankable and coherent.
+  defp definite?(nil), do: true
+  defp definite?(%{torn: true}), do: false
+
+  defp definite?(%{} = pos),
+    do: Map.get(pos, :wal_ordinal, 0) != 0 and Map.get(pos, :lineage, 0) != 0
+
+  defp definite?(_), do: false
+
+  @doc """
+  Is the lease `owner` string THIS node, in this or an earlier incarnation? Pure. Compares the name
+  before the `#` with `self_name` (`Atom.to_string(node())`) exactly — the owner string is built
+  from `node()`, so self-identification does not depend on NODE_KEY.
+  """
+  @spec self_previous_owner?(String.t() | nil, String.t()) :: boolean()
+  def self_previous_owner?(owner, self_name) when is_binary(owner) and is_binary(self_name) do
+    [name | _] = String.split(owner, "#", parts: 2)
+    name != "" and name == self_name
+  end
+
+  def self_previous_owner?(_owner, _self_name), do: false
 
   @doc """
   Is `node_key` the node a lease `owner` string (`"<node name>#<incarnation>"`) names? Pure.
@@ -758,7 +812,7 @@ defmodule Fathom.Shard.Replication.Recovery do
   # timed out, refused, crashed or was skipped as unreachable is silent.
   #
   # EARLY EXIT (perf review 2026-10-14 #8(a)). With `early` = `{needed, opts}` the stream stops being
-  # consumed the moment `answered/2` (the floor's own count, previous-owner exclusion included) reaches
+  # consumed the moment `answered/3` (the floor's own count, previous-owner exclusion included) reaches
   # `needed`; the unconsumed tasks are killed with the stream. Waiting for the last peer cost the
   # slowest peer's full connect + query timeout (up to 4 s) on EVERY replicating cold open, with the
   # floor's verdict already fixed. The recovery guarantee holds: a write is acked at Q of N followers
@@ -778,11 +832,11 @@ defmodule Fathom.Shard.Replication.Recovery do
       nil ->
         Enum.flat_map(stream, &collect/1)
 
-      {needed, opts} ->
+      {needed, local, opts} ->
         stream
         |> Enum.reduce_while([], fn item, acc ->
           acc = Enum.reverse(collect(item), acc)
-          if answered(acc, opts) >= needed, do: {:halt, acc}, else: {:cont, acc}
+          if answered(acc, local, opts) >= needed, do: {:halt, acc}, else: {:cont, acc}
         end)
         |> Enum.reverse()
     end
@@ -797,8 +851,8 @@ defmodule Fathom.Shard.Replication.Recovery do
   # `needed <= 1` is met by this node's own answer alone, so exiting "early" would skip every peer and
   # drop offers the old code still honoured (a Q >= N configuration the shipping side refuses at
   # boot). Keep the full wait there: the floor's decision cannot change, but the offers can.
-  defp early_exit(needed, opts) when needed > 1, do: {needed, opts}
-  defp early_exit(_needed, _opts), do: nil
+  defp early_exit(needed, local, opts) when needed > 1, do: {needed, local, opts}
+  defp early_exit(_needed, _local, _opts), do: nil
 
   defp ask_one({_key, host, port} = endpoint, shard_id, timeout_ms, honor_unreachable?) do
     if honor_unreachable? and unreachable?(endpoint) do
