@@ -252,6 +252,19 @@ defmodule Fathom.Shard.Position do
   defp position_after_checkpoint(epoch, _pre, %{wal_ordinal: n}) when is_integer(n) and n > 0,
     do: %{epoch: epoch, wal_gen: 0, offset: 0, wal_ordinal: n + 1}
 
+  # NEVER SHIPPED, UNDER A STATED LINEAGE (expert review 2026-10-15 #7). `wal_ordinal == 0` with an
+  # integer lineage is a replicating coordinator that has not numbered a WAL yet, so no replica holds
+  # a frame of THIS lineage, and nothing is un-folded — the object holds everything. `{lineage, 1,
+  # offset 0}` sits below every frame this coordinator will ever ship (its first WAL is ordinal 1, at
+  # an offset past the 32-byte header) and above every older lineage. This is the stamp the open's
+  # stamping flush writes over an object an out-of-band writer (migrate, revert, restore, fork) left
+  # unstamped; the `nil` below would have left it un-overridable — the window #7 closes. Requires the
+  # `:wal_ordinal` key, so a promote's synthetic state (no key when its replica stated none) and a
+  # non-replicating node (`:disabled`) are unchanged.
+  defp position_after_checkpoint(epoch, _pre, %{wal_ordinal: 0, lineage: lineage})
+       when is_integer(lineage),
+       do: %{epoch: epoch, wal_gen: 0, offset: 0, wal_ordinal: 1}
+
   # Empty before AND after is AMBIGUOUS, and `nil` is the only safe answer. It reads like "a brand
   # new shard at generation 0" — which is one of the two situations — but it is equally a shard
   # whose WAL was truncated and unlinked by an EARLIER cycle, which may sit at any generation with

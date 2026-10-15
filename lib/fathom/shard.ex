@@ -1076,6 +1076,7 @@ defmodule Fathom.Shard do
       }
 
       state = if acquire_gen == nil, do: schedule_renew(state), else: state
+      state = stamp_on_open(state, head, state.lineage_stamped?)
       # Heartbeat mode: subscribe to lapse broadcasts so a steal window is
       # revalidated proactively (expert review #34), not just lazily at the next
       # flush. Legacy mode revalidates via its own per-shard renewals.
@@ -4039,6 +4040,14 @@ defmodule Fathom.Shard do
   # HEAD overlaps the pull instead of following it (perf review 2026-10-14 #3). Rescued like
   # `start_fork_evidence/2`: a raise in the HEAD is the same `{:error, _}` the inline call surfaced
   # to open_lineage/2 callers as an error tuple, never an exit in the awaiting coordinator.
+  #
+  # NOT read for a CLAIM lease, so the open's stamping flush (`stamp_on_open/3`, expert review
+  # 2026-10-15 #7) does not fire there. Tried and backed out: a takeover's clean visit must stay a
+  # visit that WRITES nothing — the released-marker touch provenance (2026-10-12 #10) lets the
+  # previous holder's acked warm copy be adopted only while no write landed since, and a stamping PUT
+  # is a write, so it turned those adoptions into fork quarantines (`TouchProvenanceTest`,
+  # `TakeoverClaimReleaseTest`). The residual window — an out-of-band writer that itself took over a
+  # released marker and released keeping the claim — is parked in the review's progress file.
   defp start_open_head(shard_id, lease) do
     if Fleet.replicating?() and not is_map_key(lease, :claim) do
       Task.async(fn ->
@@ -4052,6 +4061,30 @@ defmodule Fathom.Shard do
       end)
     end
   end
+
+  # THE OPEN'S STAMPING FLUSH (expert review 2026-10-15 #7, user decision Q4 = A). Migrate, revert,
+  # restore and template-fork write the object out of band and ERASE its position stamp — correctly:
+  # the old lineage's replicas must not override the new bytes. But until this coordinator's first
+  # flush stamps it, its OWN quorum-acked writes cannot override the object either (`fresher?(_,
+  # unrankable) == false`), so a crash in that window — up to `SHARD_FLUSH_INTERVAL_MS` — loses them.
+  # One place covers every out-of-band writer, current and future: on a replicating open whose object
+  # exists with no rankable stamp, mark the shard dirty and flush now. One extra PUT, only for such an
+  # open; replication off, no object, an already-rankable stamp, an unreadable HEAD, a promotion
+  # (which stamps its own publish) and an unstated lineage (nothing to stamp) all skip it. Dirty, not
+  # a one-shot flag, so a failed attempt is retried on the interval and the idle drop stamps too.
+  defp stamp_on_open(state, {:ok, %{position: position}}, false = _promoted?)
+       when is_integer(state.lineage) do
+    if Fathom.Shard.Replication.Recovery.rankable_stamp?(position) do
+      state
+    else
+      send(self(), :durability_flush)
+      state = %{state | flushed_through: -1}
+      FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
+      state
+    end
+  end
+
+  defp stamp_on_open(state, _head, _promoted?), do: state
 
   defp await_open_head(nil), do: nil
   defp await_open_head(task), do: Task.await(task, :infinity)
