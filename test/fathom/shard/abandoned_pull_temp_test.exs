@@ -90,6 +90,30 @@ defmodule Fathom.Shard.AbandonedPullTempTest do
     assert File.ls!(dir) == [], "abandoned pull stranded temps: #{inspect(File.ls!(dir))}"
   end
 
+  # The window the test above hits only rarely (2026-10-15, once in a full suite run): S3.download
+  # creates `<pull>.dl.<n>` with File.open and records it in the task's process dictionary a moment
+  # LATER, so a kill in between found no name to remove and the temp survived. Made deterministic
+  # here: the temp exists on disk and the task's dictionary does not name it. Invariant: no
+  # `<pull>.dl.*` survives abandon_pull, whatever the dictionary says.
+  test "abandon_pull removes a download temp the task had not recorded yet", %{
+    path: path,
+    dir: dir
+  } do
+    unrecorded = Materializer.pull_temp(path) <> ".dl.424242"
+    File.write!(unrecorded, "partial body")
+
+    task =
+      Task.async(fn ->
+        receive do
+          :never -> :ok
+        end
+      end)
+
+    :ok = Materializer.abandon_pull(task, path)
+
+    assert File.ls!(dir) == [], "abandoned pull stranded temps: #{inspect(File.ls!(dir))}"
+  end
+
   defp wait_for_dl(dir, tries \\ 100) do
     cond do
       Path.wildcard(Path.join(dir, "shard.db.pull.dl.*")) != [] ->

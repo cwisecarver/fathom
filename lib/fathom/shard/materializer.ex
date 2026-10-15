@@ -255,5 +255,13 @@ defmodule Fathom.Shard.Materializer do
     result
   end
 
-  defp rm_pull_temp(path), do: Enum.each(["", "-wal", "-shm"], &File.rm(pull_temp(path) <> &1))
+  # Also every `<pull temp>.dl.*` streaming temp, by name. `kill_pull/1` removes the temps the task's
+  # process dictionary names, but `S3.download` creates the file (`File.open`) a moment BEFORE it
+  # records it (`Process.put`), so a kill in that window stranded it (seen once in a full suite run,
+  # 2026-10-15). Only this shard's one pull ever writes under its pull-temp name, and every caller
+  # runs after that pull has finished or been killed, so the glob cannot take a live download.
+  defp rm_pull_temp(path) do
+    Enum.each(["", "-wal", "-shm"], &File.rm(pull_temp(path) <> &1))
+    Enum.each(Path.wildcard(pull_temp(path) <> ".dl.*"), &File.rm/1)
+  end
 end
