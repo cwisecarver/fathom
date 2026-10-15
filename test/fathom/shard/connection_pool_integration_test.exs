@@ -18,7 +18,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   use ExUnit.Case, async: false
 
   alias Exqlite.Sqlite3
-  alias Fathom.Shard.HandlePool
+  alias Fathom.Shard.{HandlePool, PoolBudget}
   alias Fathom.{ShardExecutor, Shards}
   alias Filo.{Stmt, StmtResult}
 
@@ -48,6 +48,21 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   defp restore(key, nil), do: Application.delete_env(:fathom, key)
   defp restore(key, val), do: Application.put_env(:fathom, key, val)
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
+  # Put a handle into a live coordinator's pool THROUGH the node-wide idle budget. A bare
+  # `%{s | pool: HandlePool.put(...)}` skips `PoolBudget.adjust/2`, so when the coordinator later
+  # takes/sweeps/drains that handle (which does adjust) it subtracts a share it never added, and
+  # `PoolBudget.total/0` goes negative for the rest of the run. Symptom (full suite, seed 860035):
+  # `pool_grace_test` "node-wide idle budget (#16)" never saw :pool_budget_full, because a total
+  # of -1 is under a budget of 0, so `admit?/0` said yes. The library accounting was right; the
+  # fixtures were not.
+  defp inject_pooled(pid, h, at) do
+    :sys.replace_state(pid, fn s ->
+      {pool, []} = HandlePool.put(s.pool, :rw, h, at)
+      PoolBudget.adjust(self(), 1)
+      %{s | pool: pool}
+    end)
+  end
+
   defp pool_of(pid), do: :sys.get_state(pid).pool
 
   # The pre-grace drain-on-close behaviour (`drain_grace_ms: 0`), for the tests that pin the idle
@@ -96,10 +111,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
     # Inject a pooled :rw handle; the shard stays busy (ref held), so it is not drained.
     {:ok, h} = Fathom.Shard.Connection.open(path)
 
-    :sys.replace_state(pid, fn s ->
-      {pool, []} = HandlePool.put(s.pool, :rw, h, System.monotonic_time(:millisecond))
-      %{s | pool: pool}
-    end)
+    inject_pooled(pid, h, System.monotonic_time(:millisecond))
 
     # The folded grant returns the pooled handle as its 4th element — no separate pool_take call.
     assert {:ok, ref2, ^path, {:reuse, ^h}} = Fathom.Shard.checkout(pid, :rw)
@@ -129,10 +141,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
     {:ok, h} = Fathom.Shard.Connection.open(path)
     now = System.monotonic_time(:millisecond)
 
-    :sys.replace_state(pid, fn s ->
-      {pool, []} = HandlePool.put(s.pool, :rw, h, now - 100_000)
-      %{s | pool: pool}
-    end)
+    inject_pooled(pid, h, now - 100_000)
 
     assert HandlePool.count(pool_of(pid), :rw) == 1
 
@@ -367,10 +376,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
     on_exit(fn -> Fathom.Shard.checkin(pid, ref) end)
     {:ok, h} = Fathom.Shard.Connection.open(path)
 
-    :sys.replace_state(pid, fn s ->
-      {pool, []} = HandlePool.put(s.pool, :rw, h, System.monotonic_time(:millisecond))
-      %{s | pool: pool}
-    end)
+    inject_pooled(pid, h, System.monotonic_time(:millisecond))
 
     {dead, dref} = spawn_monitor(fn -> :ok end)
     assert_receive {:DOWN, ^dref, :process, ^dead, _}

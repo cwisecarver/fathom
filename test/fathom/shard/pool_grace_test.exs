@@ -466,6 +466,11 @@ defmodule Fathom.Shard.PoolGraceTest do
     test "over the budget a checkin is closed, not pooled, and the next checkout still opens", %{
       shard: shard
     } do
+      # A negative total (an earlier test mutated a pool without PoolBudget.adjust) is under ANY
+      # budget, so admit?/0 would say yes here; name that instead of timing out below.
+      assert PoolBudget.total() >= 0,
+             "PoolBudget.total went negative: a test pooled a handle without accounting for it"
+
       Application.put_env(:fathom, :connection_pool_idle_budget, 0)
       test = self()
       handler = "pool-budget-#{System.unique_integer([:positive])}"
