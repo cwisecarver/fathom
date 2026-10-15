@@ -4312,7 +4312,17 @@ defmodule Fathom.Shard do
   #
   # The remaining distance from the first `:not_valid` to stealable is exactly the margin that
   # made it fire early, plus the steal margin.
-  defp stealable_after_ms(_state), do: Heartbeat.margin_ms() + Storage.steal_margin_ms()
+  #
+  # MINUS THE OWNER'S CLOCK SKEW (expert review 2026-10-15 #22). A peer judges the heartbeat's
+  # expiry against the STORE's clock, so an owner whose clock lags the store by `skew` is stealable
+  # `skew` earlier than its own deadline says. The heartbeat tolerates a lag up to its self-lapse
+  # bound (`Heartbeat.skew_forces_lapse?/4`), and inside that bound the breaker used to arm `skew`
+  # late — that many more seconds of acked-then-quarantined writes. `measured_skew_ms/0` is the last
+  # renewal's measured owner-behind-store lag, clamped >= 0 and 0 when unknown or the heartbeat is
+  # down (legacy mode), so an owner ahead of the store or an unmeasured one is unchanged. Floored at
+  # 0: a lag past the whole distance means stealable already.
+  defp stealable_after_ms(_state),
+    do: max(Heartbeat.margin_ms() + Storage.steal_margin_ms() - Heartbeat.measured_skew_ms(), 0)
 
   defp fence_writes_when_stealable?,
     do: Application.get_env(:fathom, :fence_writes_when_stealable, false)
