@@ -257,6 +257,14 @@ defmodule Fathom.Telemetry do
         event_name: [:fathom, :replication, :seed_pin, :open],
         description: "Seed snapshots opened (one per seed batch, shared by its followers)"
       ),
+      # Pinned checkpoints of a replicated WAL run by its Session (expert review 2026-10-15 #1).
+      # `forced` > 0 means a quorum kept failing past the WAL cap and followers will be re-seeded.
+      counter("fathom.replication.checkpoint.count",
+        event_name: [:fathom, :replication, :checkpoint],
+        tags: [:verdict],
+        description:
+          "Session-run checkpoints of a replicated WAL, by verdict (covered | forced past the cap)"
+      ),
       counter("fathom.shards.at_capacity.count",
         event_name: [:fathom, :shards, :at_capacity],
         description:

@@ -49,6 +49,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use rusqlite::functions::{Context, FunctionFlags};
+use rusqlite::types::Value;
 use rusqlite::{ffi, Connection, Error, Result};
 
 /// Commits observed since process start, across every connection in this OS process.
@@ -80,12 +81,29 @@ fn replicated() -> &'static Mutex<HashMap<Vec<u8>, u32>> {
 
 /// The key a path is registered under. SQLite names a database by its full path with symlinks
 /// resolved (`unixFullPathname`), so registration resolves them the same way (`/tmp` is a symlink
-/// on macOS). A path that cannot be resolved — the file is gone — is used as given.
+/// on macOS).
+///
+/// A FILE THAT IS GONE still resolves through its directory (review follow-up 2026-10-15 M1): a
+/// Session releases its registration in `terminate/2`, which can run after the drop path has
+/// unlinked the `.db`. Falling back to the raw path there released a DIFFERENT key whenever a
+/// directory component was a symlink, and the real key stayed registered forever — the hook then
+/// skipped every checkpoint of that file for the life of the node. Callers also release with the
+/// key registration returned (`fathom_wal_replicated(path, 1)` answers it), so this is the second
+/// line of defence, for a directory that is still there.
 fn canonical(path: &[u8]) -> Vec<u8> {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    match std::fs::canonicalize(std::ffi::OsStr::from_bytes(path)) {
-        Ok(c) => c.into_os_string().into_vec(),
-        Err(_) => path.to_vec(),
+    let p = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c.into_os_string().into_vec();
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => {
+            match std::fs::canonicalize(dir) {
+                Ok(d) => d.join(name).into_os_string().into_vec(),
+                Err(_) => path.to_vec(),
+            }
+        }
+        _ => path.to_vec(),
     }
 }
 
@@ -112,20 +130,20 @@ pub unsafe fn db_is_replicated(db: *mut ffi::sqlite3, schema: *const c_char) -> 
     !bytes.is_empty() && is_replicated(bytes)
 }
 
-/// Adjust `path`'s refcount by `delta` and return the new count (0 removes it). Pure bookkeeping,
-/// separate so it is unit-testable without a connection.
-pub fn adjust(path: &[u8], delta: i64) -> i64 {
+/// Adjust `path`'s refcount by `delta`; returns the key it is registered under and the new count
+/// (0 removes it). Pure bookkeeping, separate so it is unit-testable without a connection.
+pub fn adjust(path: &[u8], delta: i64) -> (Vec<u8>, i64) {
     let key = canonical(path);
     let Ok(mut set) = replicated().lock() else {
-        return -1;
+        return (key, -1);
     };
     let now = i64::from(set.get(&key).copied().unwrap_or(0)) + delta;
     if now <= 0 {
         set.remove(&key);
-        0
+        (key, 0)
     } else {
-        set.insert(key, u32::try_from(now).unwrap_or(u32::MAX));
-        now
+        set.insert(key.clone(), u32::try_from(now).unwrap_or(u32::MAX));
+        (key, now)
     }
 }
 
@@ -155,7 +173,10 @@ pub fn install(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn register(ctx: &Context<'_>) -> Result<i64> {
+/// `fathom_wal_replicated(path, delta)`: delta 1 registers and -1 releases, both answering the KEY
+/// the path is registered under (release with that key, see `canonical`); delta 0 answers the
+/// current count without changing it.
+fn register(ctx: &Context<'_>) -> Result<Value> {
     let path: String = ctx.get(0)?;
     let delta: i64 = ctx.get(1)?;
     if path.is_empty() || !(-1..=1).contains(&delta) {
@@ -163,7 +184,12 @@ fn register(ctx: &Context<'_>) -> Result<i64> {
             "fathom_wal_replicated: expected (path, -1 | 0 | 1)".into(),
         ));
     }
-    Ok(adjust(path.as_bytes(), delta))
+    let (key, count) = adjust(path.as_bytes(), delta);
+    Ok(if delta == 0 {
+        Value::Integer(count)
+    } else {
+        Value::Text(String::from_utf8_lossy(&key).into_owned())
+    })
 }
 
 /// Runs inside SQLite's commit path, on the committing tenant's thread.
@@ -257,28 +283,28 @@ mod tests {
     fn registration_is_refcounted_and_removal_is_total() {
         let p = b"/nonexistent/fathom_wal_test_refcount.db";
         assert!(!is_replicated(p));
-        assert_eq!(adjust(p, 1), 1);
-        assert_eq!(adjust(p, 1), 2);
+        assert_eq!(adjust(p, 1).1, 1);
+        assert_eq!(adjust(p, 1).1, 2);
         assert!(is_replicated(p));
-        assert_eq!(adjust(p, -1), 1);
+        assert_eq!(adjust(p, -1).1, 1);
         assert!(
             is_replicated(p),
             "one holder remains, so the WAL is still replicated"
         );
-        assert_eq!(adjust(p, -1), 0);
+        assert_eq!(adjust(p, -1).1, 0);
         assert!(!is_replicated(p));
         // An unbalanced release never goes negative and never resurrects the entry.
-        assert_eq!(adjust(p, -1), 0);
+        assert_eq!(adjust(p, -1).1, 0);
         assert!(!is_replicated(p));
     }
 
     #[test]
     fn delta_zero_reads_the_count() {
         let p = b"/nonexistent/fathom_wal_test_read.db";
-        assert_eq!(adjust(p, 0), 0);
-        assert_eq!(adjust(p, 1), 1);
-        assert_eq!(adjust(p, 0), 1);
-        assert_eq!(adjust(p, -1), 0);
+        assert_eq!(adjust(p, 0).1, 0);
+        assert_eq!(adjust(p, 1).1, 1);
+        assert_eq!(adjust(p, 0).1, 1);
+        assert_eq!(adjust(p, -1).1, 0);
     }
 
     #[test]
@@ -294,10 +320,23 @@ mod tests {
 
         use std::os::unix::ffi::OsStrExt;
         let via_link = link.join("x.db");
-        assert_eq!(adjust(via_link.as_os_str().as_bytes(), 1), 1);
+        let (key, n) = adjust(via_link.as_os_str().as_bytes(), 1);
+        assert_eq!(n, 1);
         let resolved = std::fs::canonicalize(&file).unwrap();
+        assert_eq!(key, resolved.as_os_str().as_bytes());
         assert!(is_replicated(resolved.as_os_str().as_bytes()));
-        assert_eq!(adjust(resolved.as_os_str().as_bytes(), -1), 0);
+        assert_eq!(adjust(resolved.as_os_str().as_bytes(), -1).1, 0);
+
+        // THE LEAK (review follow-up 2026-10-15 M1): register through the symlink, DELETE the
+        // file, then release through the symlink - what a Session's terminate/2 does after the
+        // drop path unlinked the shard. The release must hit the registered key.
+        assert_eq!(adjust(via_link.as_os_str().as_bytes(), 1).1, 1);
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(adjust(via_link.as_os_str().as_bytes(), -1).1, 0);
+        assert!(
+            !is_replicated(resolved.as_os_str().as_bytes()),
+            "the registration leaked: the file stays replicated and is never checkpointed"
+        );
 
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&dir);

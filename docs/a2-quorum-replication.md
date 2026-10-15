@@ -517,6 +517,32 @@ replicated. The hook's real rule is therefore *checkpoint only what has already 
 write quorum*, which makes WAL truncation a **downstream consequence of replication progress**
 rather than an independent timer.
 
+**How the rule is enforced (expert review 2026-10-15 #1).** Until then it was not: the hook's
+4000-frame PASSIVE, the coordinator's post-snapshot PASSIVE and a tenant's own `PRAGMA
+wal_checkpoint` all ran unconditionally. A stream commits *before* it calls `Session.commit`, so a
+checkpoint in between backfilled the commit and the next writer restarted the log in place —
+the commit was acked quorum-durable and existed on no replica. The enforcement uses SQLite's own
+read marks rather than a watermark the checkpoint consults (a watermark check races a commit that
+lands between "all shipped" and the checkpoint):
+
+1. take a read snapshot (the *pin*) first — a PASSIVE checkpoint never backfills past it;
+2. read the WAL header after it — its extent covers everything committed before the pin;
+3. checkpoint only if the followers' ack positions show a write quorum holds that extent, while
+   still pinned. A log restart needs every frame backfilled, so it can only discard quorum-held
+   frames.
+
+Who checkpoints a replicated WAL: the hook steps aside for any file a Session registered
+(`fathom_wal_replicated(path, delta)`, refcounted; denied to tenant handles); the Session takes its
+place at the same threshold (pin before the commit's ship, checkpoint after it in a task that holds
+the pin and a coordinator checkout, off the reply path); the coordinator's flush pins and asks the
+Session `{:covers, header}`; the tenant authorizer refuses `wal_checkpoint` on a registered file.
+Under a quorum that keeps failing, past 4× the threshold the pinned checkpoint runs anyway, and the
+reset's `prev_extent` — which now also counts every extent the Session *read* — marks followers
+lacking those frames short so they are re-seeded. The residual case (a stream that dies between its
+SQLite commit and its `Session.commit`, then an idle close-time checkpoint) is recorded in
+`Fathom.Shard.Replication.Session` under "Checkpoints of a replicated WAL". Tests:
+`test/fathom/shard/replication_unshipped_checkpoint_test.exs`.
+
 Anyone implementing this must also assert the negative: a test that the WAL still gets checkpointed
 with the hook installed. The failure is silent, slow, and looks like someone else's bug.
 

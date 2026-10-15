@@ -284,9 +284,7 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
            "the hook no longer checkpoints a non-replicated WAL"
   end
 
-  # THE BOUND. The hook steps aside for a replicated WAL, so the Session must checkpoint it instead
-  # or the WAL grows without limit. Threshold lowered so a few small commits cross it.
-  test "the Session checkpoints a replicated WAL past the threshold, and the log restarts", ctx do
+  defp low_threshold! do
     prev = Application.get_env(:fathom, :replication_checkpoint_bytes)
     Application.put_env(:fathom, :replication_checkpoint_bytes, 64 * 1024)
 
@@ -295,17 +293,156 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
         do: Application.put_env(:fathom, :replication_checkpoint_bytes, prev),
         else: Application.delete_env(:fathom, :replication_checkpoint_bytes)
     end)
+  end
 
-    s = setup_shard!(ctx)
+  defp attach_checkpoint_events!(id) do
+    test = self()
+    handler = "unshipped-ckpt-#{id}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :replication, :checkpoint],
+      fn
+        _event, _measure, %{shard_id: ^id} = meta, _ -> send(test, {:checkpointed, meta})
+        _event, _measure, _meta, _ -> :ok
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+  end
+
+  defp grow_past_threshold!(ctx, s) do
     blob = :binary.copy(<<1>>, 100 * 1024)
     {:ok, _} = Connection.query(s.c1, "INSERT INTO t1 VALUES (1, ?1)", [blob])
     assert :ok = Session.commit(ctx.id, s.wal, s.coordinator)
     {:ok, grown} = Wal.read(s.wal)
     assert grown.commit_extent >= 64 * 1024
+    grown
+  end
+
+  defp put_env!(key, value) do
+    prev = Application.get_env(:fathom, key)
+    Application.put_env(:fathom, key, value)
+
+    on_exit(fn ->
+      if is_nil(prev),
+        do: Application.delete_env(:fathom, key),
+        else: Application.put_env(:fathom, key, prev)
+    end)
+  end
+
+  defp registry_count(conn, path) do
+    {:ok, %{rows: [[n]]}} = Connection.query(conn, "SELECT fathom_wal_replicated(?1, 0)", [path])
+    n
+  end
+
+  # Review follow-up 2026-10-15 M2. The checkpoint used to run inline, BEFORE the commit's reply:
+  # its PASSIVE backfill and two opens (5 s busy timeout each) were charged to the committer, which
+  # could time out (`{:session_down, :timeout}`, a 503 for a write that had shipped), and every
+  # queued ship of the shard waited behind it. With the checkpoint held open by the test seam, the
+  # committing call AND the next commit's ship must both complete.
+  test "a threshold checkpoint is off the reply path: the commit and the next ship do not wait",
+       ctx do
+    low_threshold!()
+    put_env!(:replication_timeout_ms, 1_000)
+    test = self()
+
+    put_env!(:replication_checkpoint_hook, fn ->
+      send(test, {:in_checkpoint, self()})
+
+      receive do
+        :go -> :ok
+      after
+        10_000 -> :ok
+      end
+    end)
+
+    s = setup_shard!(ctx)
+    attach_checkpoint_events!(ctx.id)
+    grow_past_threshold!(ctx, s)
+
+    {:ok, _} = Connection.query(s.c2, "INSERT INTO t2 VALUES (2)", [])
+    assert :ok = Session.commit(ctx.id, s.wal, s.coordinator)
+    assert_receive {:in_checkpoint, task}, 2_000
+
+    # The checkpoint is still held open; the shard keeps shipping.
+    {:ok, _} = Connection.query(s.c1, "INSERT INTO t1 VALUES (3, NULL)", [])
+    assert :ok = Session.commit(ctx.id, s.wal, s.coordinator)
+
+    send(task, :go)
+    assert_receive {:checkpointed, %{verdict: :covered}}, 5_000
+    assert {:ok, _} = await_rows(s.followers, ctx.id, "t1", [1, 3], ctx.root)
+  end
+
+  # Review follow-up 2026-10-15 (L): the COVERS CHECK alone is a time-of-check gate; what protects a
+  # commit landing after it is the PIN, which bounds the PASSIVE backfill at the snapshot taken
+  # before the check. The seam lands C1 exactly between the check and the PASSIVE.
+  test "a commit landing between the covers check and the PASSIVE is protected by the pin", ctx do
+    s = setup_shard!(ctx)
+    flush_conn = open!(s.path)
+
+    Session.checkpoint_after_snapshot(flush_conn, ctx.id,
+      before_checkpoint: fn ->
+        {:ok, _} = Connection.query(s.c1, "INSERT INTO t1 VALUES (1, NULL)", [])
+      end
+    )
+
+    # If the PASSIVE backfilled C1, this write restarts the log and C1 is gone before its ship.
+    {:ok, _} = Connection.query(s.c2, "INSERT INTO t2 VALUES (2)", [])
+
+    r = %{
+      followers: s.followers,
+      before: nil,
+      after: nil,
+      c1_result: Session.commit(ctx.id, s.wal, s.coordinator),
+      c2_result: Session.commit(ctx.id, s.wal, s.coordinator)
+    }
+
+    assert_c1_replicated!(ctx, r)
+  end
+
+  # Review follow-up 2026-10-15 M1. A Session releases its registration in terminate/2, which can
+  # run after the drop path unlinked the shard. Released by a path that no longer resolves through a
+  # symlinked directory, the -1 used to miss the registered key, and the file stayed "replicated" —
+  # the hook then never checkpointed it again for the life of the node.
+  test "a Session's registration is released even after the files are gone (symlinked dir)",
+       ctx do
+    followers = start_followers!(ctx.root, 3)
+    enable!(followers)
+    {:ok, coordinator, ref, path} = Shards.checkout(ctx.id)
+    on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+    conn = open!(path)
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+
+    link = Path.join(ctx.root, "datalink")
+    File.ln_s!(Path.dirname(path), link)
+    _ = Session.commit(ctx.id, Path.join(link, Path.basename(path) <> "-wal"), coordinator)
+
+    {:ok, %{rows: [[_seq, "main", canonical] | _]}} =
+      Connection.query(conn, "PRAGMA database_list", [])
+
+    assert registry_count(conn, canonical) == 1, "the Session did not register the file"
+
+    for sfx <- ["", "-wal", "-shm"], do: File.rm(path <> sfx)
+    :ok = Session.stop(ctx.id)
+
+    assert registry_count(conn, canonical) == 0,
+           "the registration leaked: the hook will never checkpoint this file again"
+  end
+
+  # THE BOUND. The hook steps aside for a replicated WAL, so the Session must checkpoint it instead
+  # or the WAL grows without limit. Threshold lowered so a few small commits cross it.
+  test "the Session checkpoints a replicated WAL past the threshold, and the log restarts", ctx do
+    low_threshold!()
+    s = setup_shard!(ctx)
+    attach_checkpoint_events!(ctx.id)
+    grown = grow_past_threshold!(ctx, s)
 
     # This commit finds the WAL past the threshold: it pins, ships, and checkpoints under the pin.
     {:ok, _} = Connection.query(s.c2, "INSERT INTO t2 VALUES (2)", [])
     assert :ok = Session.commit(ctx.id, s.wal, s.coordinator)
+    assert_receive {:checkpointed, %{verdict: :covered}}, 5_000
 
     # Everything was shipped and backfilled, so the next writer restarts the log.
     {:ok, _} = Connection.query(s.c1, "INSERT INTO t1 VALUES (3, NULL)", [])
