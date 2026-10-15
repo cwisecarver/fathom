@@ -349,7 +349,7 @@ defmodule Fathom.Shard.Storage do
   @callback release_lease_keeping_claim(
               shard_id :: String.t(),
               lease :: lease(),
-              claim :: pos_integer()
+              claim :: pos_integer() | nil
             ) :: :ok | {:error, term()}
 
   # Read-only fence: confirm `lease` is still the live lock for `shard_id` (owner +
@@ -885,6 +885,25 @@ defmodule Fathom.Shard.Storage do
 
   def release_lease(shard_id, lease, _no_claim), do: release_lease(shard_id, lease)
 
+  @doc """
+  `release_lease/3`, but ALWAYS leaves the released marker — with `claim` when it is a stated
+  lineage, without one otherwise (expert review 2026-10-15 #18).
+
+  For a drop flush whose PUT outcome is AMBIGUOUS (a timeout, an exit, a transport error, a 5xx):
+  the upload may still land after we let go. `release_lease/3` deletes the lock when there is no
+  integer lineage (replication off, or `:unknown`), so the next opener fresh-creates the lock —
+  no steal, so no steal-touch — and its fence etag is the very etag the in-flight PUT `If-Match`es.
+  The late PUT then succeeds over the new owner's open. The marker sends the next acquire down the
+  STEAL path instead, whose touch rotates the object's etag so the late PUT 412s. With no claim the
+  steal's `takeover_claim/2` is `next_lineage(object) + 1` (replicating) or nothing at all (off) —
+  both already handled for an ordinary claimless stolen lock.
+  """
+  @spec release_lease_fenced(String.t(), lease(), term()) :: :ok | {:error, term()}
+  def release_lease_fenced(shard_id, lease, claim) do
+    claim = if is_integer(claim) and claim > 0, do: claim
+    backend().release_lease_keeping_claim(shard_id, lease, claim)
+  end
+
   # Deliberately not a possible `Fathom.Shard.Heartbeat.owner/0` (`<node>#<nonce>`) nor a migrator
   # owner (`migrator@<node>@<token>`): it contains neither `@` nor `#`, so no node ever holds a
   # heartbeat under it and no acquirer can match it as "ours".
@@ -894,9 +913,13 @@ defmodule Fathom.Shard.Storage do
   The lock body `release_lease/3` leaves behind: a sentinel owner, long expired, carrying `claim`.
   Shared so every backend writes the identical marker.
   """
-  @spec released_marker(lease(), pos_integer()) :: lease()
-  def released_marker(%{epoch: epoch} = lease, claim) when is_integer(claim) and claim > 0 do
-    marker = %{owner: @released_owner, epoch: epoch, expires_at_ms: 0, claim: claim}
+  @spec released_marker(lease(), pos_integer() | nil) :: lease()
+  def released_marker(%{epoch: epoch} = lease, claim)
+      when (is_integer(claim) and claim > 0) or is_nil(claim) do
+    # No claim (`release_lease_fenced/3` with no stated lineage, expert review 2026-10-15 #18): the
+    # marker still makes the next acquire a STEAL; it just records no lineage to go above.
+    marker =
+      with_claim(%{owner: @released_owner, epoch: epoch, expires_at_ms: 0}, claim)
 
     marker =
       case lease do

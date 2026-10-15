@@ -3247,9 +3247,23 @@ defmodule Fathom.Shard do
       %{shard_id: state.id, reason: reason}
     )
 
-    release_keeping_claim(state)
+    release_keeping_claim(state, put_outcome_ambiguous?(reason))
     :ok
   end
+
+  # MIGHT A DROP PUT STILL LAND AFTER WE LET GO? (expert review 2026-10-15 #18.) Only a refusal we
+  # can name as definite — the PUT was never sent, or the store answered a client error that applied
+  # nothing — is "no". Everything else (a timeout, an exit, a transport error, a 5xx, a lock re-check
+  # that could not answer, a shape nobody listed) is "maybe", and "maybe" takes the fenced release.
+  # The cost of a wrong "maybe" is one steal path on the next open; of a wrong "no", a late PUT
+  # landing over the next owner's open.
+  defp put_outcome_ambiguous?(:fence_skip), do: false
+  defp put_outcome_ambiguous?(:close_wait_timeout), do: false
+  defp put_outcome_ambiguous?({:object_too_large, _}), do: false
+  defp put_outcome_ambiguous?({:flush_no_space, _, _}), do: false
+  defp put_outcome_ambiguous?({:corrupt_local, _}), do: false
+  defp put_outcome_ambiguous?({:s3_put_status, s}) when s in 400..499 and s != 408, do: false
+  defp put_outcome_ambiguous?(_maybe_landed), do: true
 
   # The release for a drop that did NOT make this coordinator's lineage durable (expert review
   # 2026-10-12 #3). Only a successful flush stamps the lineage onto the object; until one does, a
@@ -3260,14 +3274,24 @@ defmodule Fathom.Shard do
   # replica (`rl >= lineage`), so our quorum-acked writes are not recovered. `Storage.release_lease/3`
   # leaves a released marker carrying the claim instead, which the next acquire steals ABOVE. With
   # replication off (`:disabled`) or no stated lineage (`:unknown`) it is the plain delete.
-  defp release_keeping_claim(state) do
+  #
+  # `put_in_flight?` (expert review 2026-10-15 #18): the drop's PUT outcome is ambiguous, so the
+  # marker is left EVEN WITHOUT a stated lineage — see `Storage.release_lease_fenced/3`. The plain
+  # delete let the next opener fresh-create the lock with no steal-touch, fencing on the exact etag
+  # the in-flight PUT `If-Match`es.
+  defp release_keeping_claim(state, put_in_flight? \\ false) do
     unmark_lease_held(state.id)
 
     # Every caller releases with acked-but-unflushed writes the object lacks (kept local, quarantined
     # or lost). The marker says so, so a non-holder node's `Shards.flush/1` fails closed
     # instead of reading it as "free, the object is current" (expert review 2026-10-13 #7).
-    if is_map(state.lease),
-      do: Storage.release_lease(state.id, Storage.with_dirty_release(state.lease), state.lineage)
+    if is_map(state.lease) do
+      lease = Storage.with_dirty_release(state.lease)
+
+      if put_in_flight?,
+        do: Storage.release_lease_fenced(state.id, lease, state.lineage),
+        else: Storage.release_lease(state.id, lease, state.lineage)
+    end
   end
 
   # No `is_map(state.lease)` guard: since drop_clean/1 moved to release_clean/1 (expert review
