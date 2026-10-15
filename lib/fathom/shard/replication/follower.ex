@@ -1532,6 +1532,10 @@ defmodule Fathom.Shard.Replication.Follower do
         # Carried through the seed so `finish_seed/3` can stamp it (expert review 2026-08-24 #12).
         # 0 when the sender predates the wire field or had none to claim.
         lineage: b.lineage,
+        # The primary's ordinal for the seeded WAL (rig 2026-10-14 B1), stamped by `do_install/3`
+        # under the shard lock. 0 = not stated. A pulled seed's `stamp_seed_ordinal/3` runs after
+        # this and overrides it with the ordinal the offer was ranked on.
+        wal_ordinal: b.wal_ordinal,
         db_fd: db_fd,
         wal_fd: wal_fd,
         db_written: 0,

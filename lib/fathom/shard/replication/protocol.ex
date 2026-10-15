@@ -222,6 +222,25 @@ defmodule Fathom.Shard.Replication.Protocol do
   # upgrade across it sets REPLICATION_COMPRESS=false on the first deploy (fathom is greenfield).
   @push_ord_lin_z 19
   @zstd_push_level 1
+
+  # THE ORDINAL ON THE SEED (rig 2026-10-14 B1). `@push_ord`'s note above says the ordinal "cannot
+  # ride the seed ALONE" — it changes within a lineage on every WAL recreate, so the push must carry
+  # it. True, and it is still carried there. But it must ALSO ride the seed, and the rig lost an acked
+  # write for want of it: a reopen under a new lineage re-seeds every follower, the commit that
+  # triggered the seed has its frames copied INSIDE the seed's `-wal`, the post-seed retry then plans
+  # nothing for any follower, and so no push ever states the ordinal. Every replica sat at
+  # `wal_ordinal: 0` ("unknown"), `Promote.fresher?/2` refused to rank all of them — by design — and
+  # the survivor cold-opened the older object without the quorum-acked write.
+  #
+  # So `@seed_begin_lin` plus a trailing 64-bit ordinal: the ordinal the primary's coordinator
+  # assigned to the WAL the seed ships (keyed by that WAL's salt, the same number a push from it
+  # carries). 0 still means "not stated" — a primary that could not tie the seed's WAL to an ordinal
+  # says nothing rather than guess, and the replica stays unrankable as before.
+  #
+  # Same gate as `@push_ord_lin` (`ordinal_wire?/0`): a peer one deploy behind answers
+  # `{:error, :malformed}` to this code. fathom is greenfield; a future rolling upgrade across it
+  # sets REPLICATION_ORDINAL_WIRE=false on the first deploy, exactly as for the push frame.
+  @seed_begin_ord 21
   @nonce_key {__MODULE__, :conn_nonce}
 
   # Which file a chunk belongs to. Explicit rather than splitting one byte stream at `db_size`,
@@ -265,7 +284,8 @@ defmodule Fathom.Shard.Replication.Protocol do
       :wal_offset,
       :db_size,
       :wal_size,
-      lineage: 0
+      lineage: 0,
+      wal_ordinal: 0
     ]
 
     @typedoc """
@@ -273,6 +293,10 @@ defmodule Fathom.Shard.Replication.Protocol do
     `lineage` is the monotonic ownership counter the stored object's position stamp carries.
     They are different scales and both are needed; see the note on `@seed_begin_lin`. `lineage: 0`
     means "not stated", which is what a peer that predates the field sends.
+
+    `wal_ordinal` is the primary's ordinal for the WAL being shipped (`@seed_begin_ord`, rig
+    2026-10-14 B1); `0` means "not stated", and a replica seeded with it stays unrankable until a
+    push states one.
     """
     @type t :: %__MODULE__{
             shard_id: String.t(),
@@ -282,7 +306,8 @@ defmodule Fathom.Shard.Replication.Protocol do
             wal_offset: non_neg_integer(),
             db_size: non_neg_integer(),
             wal_size: non_neg_integer(),
-            lineage: non_neg_integer()
+            lineage: non_neg_integer(),
+            wal_ordinal: non_neg_integer()
           }
   end
 
@@ -417,20 +442,34 @@ defmodule Fathom.Shard.Replication.Protocol do
     # The shape is chosen by the GATE, not by whether `lineage` happens to be set — the same
     # reasoning `encode_push/1` gives for `prev_extent`: what this node emits should be one
     # operator-visible decision rather than a per-frame property nobody can predict.
-    if lineage_wire?() do
-      seal([
-        <<@version::8, @seed_begin_lin::8, byte_size(s.shard_id)::16, s.epoch::64, s.wal_gen::64,
-          s.salt1::64, s.wal_offset::64, s.db_size::64, s.wal_size::64, s.lineage::64>>,
-        s.shard_id
-      ])
-    else
-      seal([
-        <<@version::8, @seed_begin::8, byte_size(s.shard_id)::16, s.epoch::64, s.wal_gen::64,
-          s.salt1::64, s.wal_offset::64, s.db_size::64, s.wal_size::64>>,
-        s.shard_id
-      ])
+    cond do
+      ordinal_wire?() ->
+        seal([
+          <<@version::8, @seed_begin_ord::8, byte_size(s.shard_id)::16, s.epoch::64,
+            s.wal_gen::64, s.salt1::64, s.wal_offset::64, s.db_size::64, s.wal_size::64,
+            s.lineage::64, seed_ordinal(s)::64>>,
+          s.shard_id
+        ])
+
+      lineage_wire?() ->
+        seal([
+          <<@version::8, @seed_begin_lin::8, byte_size(s.shard_id)::16, s.epoch::64,
+            s.wal_gen::64, s.salt1::64, s.wal_offset::64, s.db_size::64, s.wal_size::64,
+            s.lineage::64>>,
+          s.shard_id
+        ])
+
+      true ->
+        seal([
+          <<@version::8, @seed_begin::8, byte_size(s.shard_id)::16, s.epoch::64, s.wal_gen::64,
+            s.salt1::64, s.wal_offset::64, s.db_size::64, s.wal_size::64>>,
+          s.shard_id
+        ])
     end
   end
+
+  defp seed_ordinal(%SeedBegin{wal_ordinal: n}) when is_integer(n) and n >= 0, do: n
+  defp seed_ordinal(_), do: 0
 
   @doc """
   Whether this node emits the ordinal-carrying push frame (`config :fathom,
@@ -1039,6 +1078,25 @@ defmodule Fathom.Shard.Replication.Protocol do
        salt1: salt,
        offset: off,
        payload: payload
+     }}
+  end
+
+  # `@seed_begin_lin` plus the trailing ordinal (rig 2026-10-14 B1); see the note on the code.
+  defp decode_frame(
+         <<@version::8, @seed_begin_ord::8, slen::16, epoch::64, gen::64, salt::64, off::64,
+           dblen::64, wallen::64, lineage::64, ordinal::64, shard::binary-size(slen)>>
+       ) do
+    {:ok,
+     %SeedBegin{
+       shard_id: shard,
+       epoch: epoch,
+       wal_gen: gen,
+       salt1: salt,
+       wal_offset: off,
+       db_size: dblen,
+       wal_size: wallen,
+       lineage: lineage,
+       wal_ordinal: ordinal
      }}
   end
 

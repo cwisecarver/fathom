@@ -1567,7 +1567,16 @@ defmodule Fathom.Shard.Replication.Session do
             send(
               session,
               {:seeded, shipper, token,
-               gated_seed(pin, shipper, acc.shard_id, db_path, wal_path, acc.epoch, acc.lineage)}
+               gated_seed(
+                 pin,
+                 shipper,
+                 acc.shard_id,
+                 db_path,
+                 wal_path,
+                 acc.epoch,
+                 acc.lineage,
+                 {acc.wal_salt, acc.wal_ordinal}
+               )}
             )
           end)
 
@@ -1670,11 +1679,11 @@ defmodule Fathom.Shard.Replication.Session do
   # shard x follower at once, and each holds its follower's single link for the whole transfer. The
   # wait is bounded below `seed_expiry_ms/0`, so a seed that never got a slot gives up on its own
   # rather than being killed as wedged. A killed task's slot is freed by SeedGate's monitor.
-  defp gated_seed(pin, shipper, shard_id, db_path, wal_path, epoch, lineage) do
+  defp gated_seed(pin, shipper, shard_id, db_path, wal_path, epoch, lineage, known) do
     case SeedGate.acquire(seed_gate_wait_ms()) do
       :ok ->
         try do
-          timed_seed(pin, shipper, shard_id, db_path, wal_path, epoch, lineage)
+          timed_seed(pin, shipper, shard_id, db_path, wal_path, epoch, lineage, known)
         after
           SeedGate.release()
         end
@@ -1694,13 +1703,13 @@ defmodule Fathom.Shard.Replication.Session do
   # wall time per seed. Neither was observable before: the only trace was a log line with the
   # resulting position. `bytes` is what was DECLARED (db + wal at seed_begin), measured before the
   # stream so a failed seed still reports what it was attempting.
-  defp timed_seed(pin, shipper, shard_id, db_path, wal_path, epoch, lineage) do
+  defp timed_seed(pin, shipper, shard_id, db_path, wal_path, epoch, lineage, known) do
     bytes = seed_bytes(db_path, wal_path)
     started = System.monotonic_time()
 
     result =
       shared_pin(pin, fn ->
-        stream_seed(shipper, shard_id, db_path, wal_path, epoch, lineage)
+        stream_seed(shipper, shard_id, db_path, wal_path, epoch, lineage, known)
       end)
 
     duration = System.monotonic_time() - started
@@ -1787,7 +1796,7 @@ defmodule Fathom.Shard.Replication.Session do
           {:ok, map()} | {:error, term()}
   def do_seed(shipper, shard_id, db_path, wal_path, epoch, lineage) do
     with_pinned_snapshot(db_path, fn ->
-      stream_seed(shipper, shard_id, db_path, wal_path, epoch, lineage)
+      stream_seed(shipper, shard_id, db_path, wal_path, epoch, lineage, nil)
     end)
   end
 
@@ -1842,11 +1851,12 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
-  defp stream_seed(shipper, shard_id, db_path, wal_path, epoch, lineage) do
+  defp stream_seed(shipper, shard_id, db_path, wal_path, epoch, lineage, known) do
     with {:ok, before} <- Wal.read(wal_path),
          {:ok, db_size} <- file_size(db_path),
          wal_size = wal_size_of(before),
-         :ok <- open_seed(shipper, shard_id, epoch, before, db_size, wal_size, lineage),
+         ordinal = seed_ordinal(before, known),
+         :ok <- open_seed(shipper, shard_id, epoch, before, db_size, wal_size, lineage, ordinal),
          :ok <- stream_part(shipper, shard_id, :db, db_path, db_size),
          :ok <- stream_part(shipper, shard_id, :wal, wal_path, wal_size),
          {:ok, after_} <- Wal.read(wal_path),
@@ -1867,7 +1877,7 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
-  defp open_seed(shipper, shard_id, epoch, before, db_size, wal_size, lineage) do
+  defp open_seed(shipper, shard_id, epoch, before, db_size, wal_size, lineage, ordinal) do
     Shipper.seed_begin(shipper, %SeedBegin{
       shard_id: shard_id,
       epoch: epoch,
@@ -1876,9 +1886,30 @@ defmodule Fathom.Shard.Replication.Session do
       wal_offset: wal_size,
       db_size: db_size,
       wal_size: wal_size,
-      lineage: lineage
+      lineage: lineage,
+      wal_ordinal: ordinal
     })
   end
+
+  # THE ORDINAL OF THE WAL THIS SEED SHIPS (rig 2026-10-14 B1), or 0 ("not stated").
+  #
+  # Without it a seed left the replica at `wal_ordinal: 0`, which `Promote.fresher?/2` refuses to
+  # rank — and that is not a corner case: a reopen under a new lineage re-seeds every follower from
+  # inside the first write's commit, the seed's `-wal` already holds that write's frames, and the
+  # post-seed retry then plans NOTHING for any follower, so no push states the ordinal either. The
+  # write was acked on the quorum and every replica of it was unrankable; the survivor cold-opened
+  # the older object and the write was gone (`./chaos.sh rpo`, 2026-10-14).
+  #
+  # `known` is the session's cached `{wal_salt, wal_ordinal}` — the coordinator's number for that
+  # salt, the one every push from that WAL carries and the one the object is stamped with. It is
+  # used ONLY when the salt the seed actually read matches; otherwise (a WAL recreate between the
+  # last push and this read) the answer is 0, the pre-fix "unknown", never a number belonging to a
+  # different WAL. Asking the coordinator from here instead is wrong in the other direction: its
+  # counter bumps for any salt it is not standing on, so a stale read would MINT an ordinal.
+  #
+  # No per-commit cost: this runs once per seed, from data already in the session.
+  defp seed_ordinal(%{salt1: salt}, {salt, n}) when is_integer(n) and n > 0, do: n
+  defp seed_ordinal(_before, _known), do: 0
 
   # `before` is nil on the ABORT path, which only drains the abort's answer: an ack there is not a
   # completed seed, whatever produced it, and must not crash the task on `gen_of(nil)`.

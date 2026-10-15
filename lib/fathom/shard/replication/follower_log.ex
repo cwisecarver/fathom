@@ -317,9 +317,11 @@ defmodule Fathom.Shard.Replication.FollowerLog do
       next_offset: wal_bytes,
       torn: false,
       lineage: lineage,
-      # 0 = "not stated". A seed cannot know it: `SeedBegin` carries no ordinal, and inventing one
-      # here would put this replica on a scale the primary never assigned. The first push on the
-      # seeded WAL supplies it, and until then `Promote.fresher?/2` refuses to rank — the object
+      # 0 = "not stated", and never invented here: that would put this replica on a scale the
+      # primary never assigned. The INSTALLER stamps the real one — `SeedBegin.wal_ordinal` from a
+      # pushed seed (rig 2026-10-14 B1: an acked write that reached the followers only inside a
+      # seed was otherwise unrankable on every replica, and lost on failover), or the offer's from
+      # a pulled one. Until something states it, `Promote.fresher?/2` refuses to rank — the object
       # wins, which is the pre-A2 answer and always correct.
       wal_ordinal: 0
     }
