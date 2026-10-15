@@ -2348,6 +2348,8 @@ defmodule Fathom.Shard do
       do: quarantine_fenced!(state),
       else: drop_local(state.path)
 
+    release_if_forked(state)
+
     # …and lift it only AFTER the rename, for the same reason it was published.
     Fathom.Shard.WriteFence.forget(state.id)
     WriteCounter.forget(state.id)
@@ -2996,11 +2998,20 @@ defmodule Fathom.Shard do
   defp flush_and_drop(%{lease_lost: true} = state) do
     unmark_lease_held(state.id)
     if unflushed?(state), do: quarantine_fenced!(state), else: drop_local(state.path)
+    release_if_forked(state)
     :ok
   end
 
   defp flush_and_drop(state) do
     if unflushed?(state), do: flush_then_drop(state), else: drop_clean(state)
+  end
+
+  # A fork self-fence (expert review 2026-10-15 #6) still HOLDS the lock — the reconcile confirmed it
+  # ours. Give it back, keeping the claim and marking the release dirty, AFTER the local copy was
+  # quarantined; a genuine steal (no `:forked?`) has nothing of ours to release.
+  defp release_if_forked(state) do
+    if Map.get(state, :forked?, false), do: release_keeping_claim(state)
+    :ok
   end
 
   defp drop_clean(state) do
@@ -3366,6 +3377,7 @@ defmodule Fathom.Shard do
   defp flush_outcome({:ok, _, _}), do: :uploaded
   defp flush_outcome({:reconciled, _}), do: :reconciled
   defp flush_outcome(:superseded), do: :superseded
+  defp flush_outcome(:forked), do: :forked
   defp flush_outcome({:error, _}), do: :error
 
   # Disambiguate a data-PUT 412 during the periodic durability flush (expert review #2),
@@ -3380,7 +3392,7 @@ defmodule Fathom.Shard do
     case Storage.check_lease(state.id, state.lease) do
       :ok ->
         case Storage.object_etag(state.id) do
-          {:ok, etag} when not is_nil(etag) -> {:reconciled, etag}
+          {:ok, etag} when not is_nil(etag) -> reconcile_moved(state)
           {:ok, nil} -> reconcile_absent(state)
           # UNREADABLE is not ABSENT (expert review 2026-10-12 #4): a transient error, counted as a
           # failed flush and retried, not a silent `{:reconciled, nil}`.
@@ -3392,6 +3404,30 @@ defmodule Fathom.Shard do
 
       {:error, _transient} = error ->
         error
+    end
+  end
+
+  # "LOCK OURS" DOES NOT MEAN "OBJECT OURS" (expert review 2026-10-15 #6). The re-fence below used
+  # to be unconditional: lock still ours ⇒ adopt the object's current etag. That premise holds for
+  # the case this branch was written for — our own earlier PUT landed with its response lost — but
+  # not for a WARM open whose evidence HEADs were unreachable: `post_lease_warm_check/4` keeps
+  # serving the local copy fenced by its sidecar etag on the promise that "a genuinely-forked flush
+  # 412s rather than clobbers". The 412 then arrived HERE, adopted the peer's newer etag, and the
+  # NEXT flush PUT the stale local lineage `If-Match` that etag — silently overwriting the peer's
+  # acked, durable writes with no quarantine copy anywhere.
+  #
+  # The discriminator already existed for the warm-open verdict: the PUT intents this node durably
+  # recorded before each of its uploads (`Fork.put_origin/2`). Object md5 among them ⇒ our own lost
+  # PUT, re-fence as before. Otherwise ⇒ a fork: `:forked`, which self-fences and quarantines the
+  # local copy and releases the lock keeping its claim (review default D3: a false quarantine is
+  # recoverable, a clobber is not). An unreadable HEAD is a transient error — keep dirty, retry —
+  # never a guess in either direction. Costs one HEAD, only on a 412.
+  defp reconcile_moved(state) do
+    case Fork.put_origin(state.id, state.path) do
+      {:own, etag} -> {:reconciled, etag}
+      :fork -> :forked
+      :absent -> {:error, :object_vanished}
+      {:error, _transient} = error -> error
     end
   end
 
@@ -3433,7 +3469,12 @@ defmodule Fathom.Shard do
   # local copy: the next open's provenance check arbitrates recoverably, which is always
   # better than an unrecoverable unlink.
   defp retry_drop_upload(state) do
+    # THE SAME OWNERSHIP QUESTION AS `reconcile_moved/1` (expert review 2026-10-15 #6): re-fencing
+    # onto an object we did not write and re-uploading would clobber a peer's newer lineage. Only an
+    # object that is one of our own recorded PUTs is re-fenced; a fork is quarantined and the lock
+    # released keeping its claim; anything unconfirmable keeps the local copy (the old fallback).
     with {:ok, etag} when not is_nil(etag) <- Storage.object_etag(state.id),
+         {:own, etag} <- Fork.put_origin(state.id, state.path),
          {:ok, new_etag, _carried} <- upload_for_drop(%{state | etag: etag}) do
       Logger.info(
         "shard #{state.id}: flush 412 with lock ours; re-fenced to the object and re-uploaded"
@@ -3444,6 +3485,10 @@ defmodule Fathom.Shard do
       drop_local_unless_serving(state)
       release_plain(state)
     else
+      :fork ->
+        quarantine_fenced!(Map.put(state, :forked?, true))
+        release_keeping_claim(state)
+
       # …and RELEASE THE LOCK while keeping it (expert review 2026-08-24 #10). This branch is
       # reached having just CONFIRMED via `check_lease/2` that the lock is still ours, so simply
       # returning strands it on a live node — `owner_live?` reads this node's fresh heartbeat
@@ -3805,10 +3850,13 @@ defmodule Fathom.Shard do
         unflushed = max(WriteCounter.count(state.id) - state.flushed_through, 0)
 
         Logger.error(
-          "shard #{state.id}: lease superseded with #{unflushed} un-flushed write(s) — quarantined " <>
-            "the local copy to #{dest} instead of dropping it (acked writes preserved for recovery; " <>
-            "within the RPO contract, the stored object is the new owner's)."
+          "shard #{state.id}: #{fence_cause(state)} with #{unflushed} un-flushed write(s) — " <>
+            "quarantined the local copy to #{dest} instead of dropping it (acked writes preserved " <>
+            "for recovery; the stored object is the other lineage's)."
         )
+
+        if Map.get(state, :forked?, false),
+          do: :telemetry.execute([:fathom, :shard, :forked], %{count: 1}, %{shard_id: state.id})
 
         :telemetry.execute(
           [:fathom, :shard, :fenced_quarantine],
@@ -3826,6 +3874,14 @@ defmodule Fathom.Shard do
         drop_local(state.path)
         error
     end
+  end
+
+  defp fence_cause(state) do
+    if Map.get(state, :forked?, false),
+      do:
+        "local copy FORKED from the stored lineage (a flush 412'd with the lock ours, and the " <>
+          "object is not one of this node's recorded PUTs — expert review 2026-10-15 #6)",
+      else: "lease superseded"
   end
 
   # --- A2 lineage -----------------------------------------------------------------------
@@ -4724,8 +4780,9 @@ defmodule Fathom.Shard do
   # correct etag. Cost in the benign case is one extra PUT; cost of the old behaviour in the
   # lossy case was silent, unrecoverable loss that `loss-report` reported as safe.
   #
-  # The sidecar IS advanced: we are the single writer, so our local copy is a descendant of
-  # whatever the object currently holds — same lineage, plus more writes. That is exactly what
+  # The sidecar IS advanced: `reconcile_moved/1` only answers `{:reconciled, etag}` when the object
+  # is one of THIS node's recorded PUTs (expert review 2026-10-15 #6 — "lock ours" alone was not
+  # proof), so our local copy is a descendant of it — same lineage, plus more writes. That is exactly what
   # the provenance check needs to not false-quarantine a fork.
   defp apply_flush_verdict(state, {:reconciled, object_etag}) when is_binary(object_etag) do
     Provenance.write_durable(state.path, object_etag)
@@ -4747,6 +4804,13 @@ defmodule Fathom.Shard do
   end
 
   defp apply_flush_verdict(state, :superseded), do: {:superseded, state}
+
+  # 412, lock ours, and the object is NOT one of our own recorded PUTs (expert review 2026-10-15 #6,
+  # `reconcile_moved/1`): our local copy is a fork of the stored lineage. Self-fence exactly like a
+  # steal — never flush over it — but remember why, because unlike a steal the LOCK IS STILL OURS and
+  # must be released (keeping its claim) after the quarantine, or it strands the shard behind this
+  # node's live heartbeat. `Map.put`, not a new init key: only this rare path ever carries it.
+  defp apply_flush_verdict(state, :forked), do: {:superseded, Map.put(state, :forked?, true)}
 
   # The LIVE db failed quick_check while we are serving it (expert review 2026-08-20 #2).
   #

@@ -207,21 +207,52 @@ defmodule Fathom.Shard.Fork do
   #                  later post-lease checks and the fenced flush still guard the lineage).
   @spec adopt_own_put(String.t(), Path.t()) :: :adopted | :fork | :keep
   defp adopt_own_put(shard_id, path) do
+    case put_origin(shard_id, path) do
+      {:own, etag} -> adopt!(shard_id, path, etag)
+      {:error, _unreachable} -> :keep
+      _fork_or_absent -> :fork
+    end
+  end
+
+  @doc """
+  WHO WROTE THE STORED OBJECT — this node's own recorded PUT, or someone else? Side-effect free.
+
+  Compares the object's `fathom-md5` with the PUT intents `Provenance.record_intent/2` recorded
+  before this node's own uploads (EITHER slot: a retry flush demotes the first flush's intent rather
+  than erasing it, expert review 2026-10-10 R2-1, and the object may be the older one).
+
+    * `{:own, etag}` — the object is a snapshot this node was about to PUT; `etag` is the object's
+      current etag, read in the same HEAD as the md5, so the two describe one version.
+    * `:fork` — no intent recorded, or the object's md5 is not among them: somebody else's bytes.
+    * `:absent` — there is no object.
+    * `{:error, reason}` — the HEAD failed: unknown, never read as either answer.
+
+  Shared by the warm-open verdict (`resolve/4`) and the coordinator's 412-reconcile (expert review
+  2026-10-15 #6), which must not re-fence onto an object it did not write.
+
+  KNOWN FALSE `:fork` — accepted (review 2026-10-15 D3: a false quarantine is recoverable, a clobber
+  is not): the sidecar keeps only TWO intents, so a landed-but-unacked PUT followed by two more
+  flush attempts that each recorded an intent and failed falls out of the window; and a durable flush
+  clears the intents, so a `Storage.retouch/2` whose response was lost (object rotated past our own
+  etag with no intent naming it) also reads as a fork.
+  """
+  @spec put_origin(String.t(), Path.t()) ::
+          {:own, String.t()} | :fork | :absent | {:error, term()}
+  def put_origin(shard_id, path) do
     case Provenance.read_intents(path) do
       [] ->
         :fork
 
       intents ->
-        # EITHER slot: a retry flush demotes the first flush's intent rather than erasing it
-        # (expert review 2026-10-10 R2-1), and the object on the store may be the older one.
-        head = Storage.object_head(shard_id)
-
-        case head do
+        case Storage.object_head(shard_id) do
           {:ok, %{etag: etag, md5: md5}} when is_binary(etag) and is_binary(md5) ->
-            if md5 in intents, do: adopt!(shard_id, path, etag), else: :fork
+            if md5 in intents, do: {:own, etag}, else: :fork
 
-          {:error, _unreachable} ->
-            :keep
+          {:ok, nil} ->
+            :absent
+
+          {:error, _unreachable} = error ->
+            error
 
           _no_match ->
             :fork

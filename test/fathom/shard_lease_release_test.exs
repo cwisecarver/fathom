@@ -154,6 +154,17 @@ defmodule Fathom.ShardLeaseReleaseTest do
 
   defp remote_db(shard), do: Path.join(Fathom.Shard.Storage.Local.dir(), "#{shard}.db")
 
+  # OUR OWN PUT that landed with its response lost. Realistic only if it carries what a real one
+  # does: the PUT INTENT this node durably recorded before uploading (`Provenance.record_intent/2`,
+  # the `:pre_put` hook). Until expert review 2026-10-15 #6 this fixture wrote arbitrary bytes and
+  # nothing else — a state production cannot produce for its OWN put, and exactly the state of a
+  # PEER's write, which the 412-reconcile now (correctly) quarantines as a fork rather than adopts.
+  defp own_landed_put!(shard, bytes) do
+    File.write!(remote_db(shard), bytes)
+    md5 = :crypto.hash(:md5, bytes) |> Base.encode16(case: :lower)
+    :ok = Fathom.Shard.Provenance.record_intent(Fathom.Shard.db_path(shard), md5)
+  end
+
   defp drain_and_wait!(shard, coordinator) do
     ref = Process.monitor(coordinator)
 
@@ -224,7 +235,7 @@ defmodule Fathom.ShardLeaseReleaseTest do
 
         hook = fn ->
           if :counters.get(calls, 1) == 0 do
-            File.write!(remote_db(shard), "moved-by-a-lost-response")
+            own_landed_put!(shard, "moved-by-a-lost-response")
           else
             Application.put_env(:fathom, :storage_fault, :flush)
           end

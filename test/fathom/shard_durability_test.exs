@@ -62,6 +62,17 @@ defmodule Fathom.ShardDurabilityTest do
   defp local_db(shard), do: Path.join(local_dir(), "#{shard}.db")
   defp remote_db(shard), do: Path.join(remote_dir(), "#{shard}.db")
 
+  # OUR OWN PUT that landed with its response lost. Realistic only if it carries what a real one
+  # does: the PUT INTENT this node durably recorded before uploading (`Provenance.record_intent/2`,
+  # the `:pre_put` hook). Until expert review 2026-10-15 #6 this fixture wrote arbitrary bytes and
+  # nothing else — a state production cannot produce for its OWN put, and exactly the state of a
+  # PEER's write, which the 412-reconcile now (correctly) quarantines as a fork rather than adopts.
+  defp own_landed_put!(shard, bytes) do
+    File.write!(remote_db(shard), bytes)
+    md5 = :crypto.hash(:md5, bytes) |> Base.encode16(case: :lower)
+    :ok = Fathom.Shard.Provenance.record_intent(Fathom.Shard.db_path(shard), md5)
+  end
+
   # Pull the shard's stored object to a fresh path and assert it is a valid, quick_check-clean
   # SQLite db holding `expected_rows` rows of table `t` (expert review #41).
   defp assert_stored_object_valid(shard, expected_rows) do
@@ -1514,7 +1525,7 @@ defmodule Fathom.ShardDurabilityTest do
 
     # Our own PUT landed (lost response): the object etag changes under us so the fenced
     # flush 412s — but NO stealer took the lock; it is still ours.
-    own_put = fn -> File.write!(remote_db(shard), "our-own-landed-snapshot") end
+    own_put = fn -> own_landed_put!(shard, "our-own-landed-snapshot") end
     Application.put_env(:fathom, :faulty_before, {:flush, own_put})
 
     on_exit(fn ->
@@ -1668,7 +1679,7 @@ defmodule Fathom.ShardDurabilityTest do
     # 412 with the lock still ours: our own PUT lands (the object etag changes ⇒ the fenced
     # flush 412s) but NO stealer takes the lock ⇒ the reconcile's check_lease returns :ok and
     # the task resolves {:reconciled, etag} (keep serving).
-    own_put = fn -> File.write!(remote_db(shard), "our-own-landed-snapshot") end
+    own_put = fn -> own_landed_put!(shard, "our-own-landed-snapshot") end
 
     # Wedge the reconcile's lock re-check (the S3 GET) mid-flight: signal the moment it
     # starts, then block until released — a slow/flaky check_lease, held deterministically.
