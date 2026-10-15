@@ -154,6 +154,8 @@ what actually shipped (some plan assumptions were superseded).
 - **[runbooks/disaster-recovery.md](runbooks/disaster-recovery.md)** — cross-store (Postgres + S3)
   restore coherence: recovering from a directory point-in-time restore without resurrecting deleted
   tenants or revoked tokens.
+- **[runbooks/lock-repair.md](runbooks/lock-repair.md)** — a shard whose lease lock is undecodable
+  fails closed on both backends; repairing it with `mix fathom.lock.repair` (epoch never moves back).
 
 ## Reviews & run reports
 
