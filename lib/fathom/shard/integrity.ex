@@ -47,6 +47,31 @@ defmodule Fathom.Shard.Integrity do
     end
   end
 
+  # `PRAGMA integrity_check`, the full check, for OFF-the-hot-path callers only (restore drill,
+  # export, snapshot restore). `quick_check` skips the index-vs-table content comparison, and
+  # `VACUUM INTO` copies a divergent index verbatim rather than rebuilding it (probed through
+  # exqlite 2026-10-15, test/fathom/shard/vacuum_into_index_test.exs; expert review 2026-10-15
+  # #11), so a stored object can pass the flush gate and still answer queries wrong through a
+  # stale index. DETECT-ONLY: callers alert; nothing auto-REINDEXes. Never call this on flush —
+  # it is O(rows) and the flush keeps `quick_check`.
+  @spec verify_full(Path.t()) :: :ok | {:error, term()}
+  def verify_full(path) do
+    case Connection.open(path) do
+      {:ok, conn} ->
+        result = Connection.query(conn, "PRAGMA integrity_check", [])
+        Connection.close(conn)
+
+        case result do
+          {:ok, %{rows: [["ok"]]}} -> :ok
+          {:ok, %{rows: rows}} -> {:error, {:integrity_check, rows}}
+          {:error, reason} -> {:error, {:integrity_check_failed, reason}}
+        end
+
+      other ->
+        {:error, {:integrity_check_open_failed, other}}
+    end
+  end
+
   # `quick_check` on an ALREADY-OPEN connection, gated by `:verify_flush_integrity`. Split out so
   # the caller's short-circuit reads as one line and cannot be accidentally reordered past the
   # VACUUM.
