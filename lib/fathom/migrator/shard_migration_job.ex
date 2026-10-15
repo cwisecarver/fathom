@@ -168,6 +168,18 @@ defmodule Fathom.Migrator.ShardMigrationJob do
       # (`Fathom.Migrator.Ledger`). Deterministic — the same bytes give the same verdict on every
       # retry — so quarantine now rather than burn four more attempts reaching the same answer.
       # The shard stays on its current version; `last_verify_status` already says why.
+      # The file is ahead of HEAD on a YANKED release (expert review 2026-10-15 #25). `do_run`
+      # aligned the directory stamp to the file, so the shard is a normal active citizen stranded
+      # above HEAD that `revert_stranded/0` / a forced fleet revert can reach. Quarantining it (the
+      # old `ahead_of_target` outcome) hid it from `shards_at_version` and left no repair path.
+      {:error, {:stranded_on_yanked, version}} ->
+        Logger.warning(
+          "shard #{shard_id}: file is at yanked v#{version}, above HEAD; directory aligned, " <>
+            "awaiting a revert (not quarantined)"
+        )
+
+        {:cancel, :stranded_on_yanked}
+
       {:error, {:ledger_mismatch, _detail}} ->
         Directory.mark_failed(shard_id)
         {:cancel, :ledger_mismatch}

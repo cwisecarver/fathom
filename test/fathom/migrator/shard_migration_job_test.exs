@@ -710,6 +710,30 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     assert {:ok, %{status: "migration_failed"}} = Directory.get(shard)
   end
 
+  # Expert review 2026-10-15 #25. Symptom: a file ahead of the target was ALWAYS quarantined, even
+  # when its version is a yanked release (a migration to it landed in the yank's race window with
+  # the directory stamp lagging) — hidden from shards_at_version, so no revert could reach it. The
+  # test above keeps pinning the non-yanked case (file v3 is no release there) as the old outcome.
+  # Invariant: a file stranded on a YANKED release is cancelled WITHOUT quarantine, its directory
+  # stamp is aligned to the file, and it is therefore visible to the revert machinery.
+  test "a file ahead of HEAD on a yanked release is aligned and left revertible, not quarantined",
+       %{shard: shard} do
+    seed_v1!(shard, 3)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    {:ok, _} = Migrator.release(3, "v3", ["ALTER TABLE app_thing ADD COLUMN note TEXT"])
+    assert :ok = Migrator.yank(3)
+    assert Migrator.head() == 2
+    assert {:ok, %{schema_version: 1}} = Directory.get(shard)
+
+    capture_log(fn ->
+      assert {:cancel, :stranded_on_yanked} =
+               perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2}, attempt: 5)
+    end)
+
+    assert {:ok, %{status: "active", schema_version: 3}} = Directory.get(shard)
+    assert shard in Enum.to_list(Directory.stream_ids_at_version(3, 100))
+  end
+
   # Finding #13: RevertJob must back up the live vN object and schedule its retirement, or the
   # <shard>@vN backup leaks (RetirementJob otherwise only drops the forward `from` version).
   test "revert backs up the live version and schedules its retirement", %{shard: shard} do

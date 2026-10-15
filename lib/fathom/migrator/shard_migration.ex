@@ -682,7 +682,7 @@ defmodule Fathom.Migrator.ShardMigration do
           # something else already moved past): replaying target's statements over
           # a newer schema would corrupt it. Error out; nothing was touched.
           current > target ->
-            {:error, {:ahead_of_target, current}}
+            ahead_of_target(shard_id, current)
 
           true ->
             case ledger_start(shard_id, old, current, target) do
@@ -697,6 +697,39 @@ defmodule Fathom.Migrator.ShardMigration do
     after
       drop_temp(old)
       drop_temp(new)
+    end
+  end
+
+  # A FILE AHEAD OF THE TARGET (expert review 2026-10-15 #25). Used to be quarantined with no repair
+  # path. When the file's version is a YANKED release (the compound event: a migration to it landed
+  # in the yank's race window, the directory stamp lagging), the shard is not damaged — it is
+  # stranded above HEAD, which the revert machinery already knows how to fix, but only for shards
+  # whose DIRECTORY stamp says so. So make the directory truthful via the crash-forward `finalize/2`
+  # (it also records the right retained version and stamps `last_active_at` past `cutover_at`, so the
+  # write-age guard makes the revert need `force`, never discarding writes silently), and return
+  # `:stranded_on_yanked` — the job cancels WITHOUT quarantining, and `revert_stranded/0` (hourly) or
+  # an operator's `Migrator.revert(v, head, force: true)` now reaches the shard. Any other ahead
+  # file (not a yanked release: a review-held version, or an unknown number) still errors as before:
+  # replaying over a newer schema would corrupt it, and there is nothing safe to infer.
+  defp ahead_of_target(shard_id, current) do
+    if yanked_release?(current) do
+      with :ok <- align_directory(shard_id, current) do
+        {:error, {:stranded_on_yanked, current}}
+      end
+    else
+      {:error, {:ahead_of_target, current}}
+    end
+  end
+
+  defp yanked_release?(version) do
+    match?(%Migrator.Release{yanked: true}, Repo.get_by(Migrator.Release, version: version))
+  end
+
+  defp align_directory(shard_id, current) do
+    if current_version(shard_id) == current do
+      :ok
+    else
+      with {:ok, _} <- finalize(shard_id, current), do: :ok
     end
   end
 
