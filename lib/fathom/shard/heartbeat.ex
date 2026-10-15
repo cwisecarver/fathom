@@ -107,7 +107,8 @@ defmodule Fathom.Shard.Heartbeat do
   @doc "Whether the heartbeat process is running (coordinators fall back to the legacy fence if not)."
   def running?, do: Process.whereis(__MODULE__) != nil
 
-  # The status ETS row: {:status, generation, mono_deadline_ms, margin_ms}, written
+  # The status ETS row: {:status, generation, mono_deadline_ms, margin_ms, wall_deadline_ms,
+  # skew_ms}, written
   # by the heartbeat process on every renew/lapse (round-2 #26). Reading it is
   # lock-free from any process — no GenServer call, so a lapse-broadcast fan-out of
   # fence checks can neither flood the heartbeat's mailbox nor time out into the
@@ -161,7 +162,7 @@ defmodule Fathom.Shard.Heartbeat do
   @spec generation() :: non_neg_integer()
   def generation do
     case status() do
-      {gen, _deadline, _margin} -> gen
+      {gen, _deadline, _margin, _wall, _skew} -> gen
       # Down (or booting): the call preserves the old exit-when-down semantics.
       :down -> GenServer.call(__MODULE__, :generation)
     end
@@ -171,7 +172,7 @@ defmodule Fathom.Shard.Heartbeat do
   @spec valid_for_write?(non_neg_integer()) :: :ok | :revalidate | :not_valid
   def valid_for_write?(acquire_gen) do
     case status() do
-      {gen, deadline, margin} ->
+      {gen, deadline, margin, wall_deadline, _skew} ->
         now = System.monotonic_time(:millisecond)
 
         cond do
@@ -179,12 +180,44 @@ defmodule Fathom.Shard.Heartbeat do
           # to) — never write without confirmed liveness. Monotonic, so a
           # wall-clock step can't inflate perceived validity (expert review #21).
           is_nil(deadline) or now + margin >= deadline -> :not_valid
+          # WALL-CLOCK TRIP-WIRE for lock-free readers (expert review 2026-10-15 #16). CLOCK_MONOTONIC
+          # does not advance across a host suspend, so after one the monotonic deadline still reads
+          # valid until the next renew tick (up to renew_ms) while peers, judging our stored
+          # heartbeat on wall time, may already have stolen. The renew-tick trip-wire (do_renew)
+          # cannot help the readers between ticks; this can. It ONLY TRIPS: it is checked after the
+          # monotonic test and can turn :ok/:revalidate into :not_valid, never the reverse, so a wall
+          # step cannot inflate validity (the #21 hazard). A forward step >= margin spuriously trips
+          # (accepted, same as R1-4 / D10); a backward step trips nothing.
+          wall_expired?(wall_deadline, margin) -> :not_valid
           gen != acquire_gen -> :revalidate
           true -> :ok
         end
 
       :down ->
         GenServer.call(__MODULE__, {:valid_for_write, acquire_gen})
+    end
+  end
+
+  # Pure, public for the boundary test. `nil` (no wall deadline published yet) never trips; the
+  # monotonic `is_nil(deadline)` test above already covers "no confirmed renewal".
+  @doc false
+  @spec wall_expired?(integer() | nil, integer()) :: boolean()
+  def wall_expired?(nil, _margin), do: false
+
+  def wall_expired?(wall_deadline, margin),
+    do: System.system_time(:millisecond) + margin >= wall_deadline
+
+  @doc """
+  The last measured owner-behind-store clock skew in ms, clamped to >= 0; `0` when unknown (no
+  renewal yet, the store sent no Date, the owner is AHEAD of the store, or the heartbeat is down).
+  Published in the status row for the write breaker (expert review 2026-10-15 #22), which must
+  subtract it from the steal instant a peer will compute against the store's clock.
+  """
+  @spec measured_skew_ms() :: non_neg_integer()
+  def measured_skew_ms do
+    case status() do
+      {_gen, _deadline, _margin, _wall, skew} -> skew
+      :down -> 0
     end
   end
 
@@ -200,7 +233,7 @@ defmodule Fathom.Shard.Heartbeat do
   @spec margin_ms() :: pos_integer()
   def margin_ms do
     case status() do
-      {_gen, _deadline, margin} ->
+      {_gen, _deadline, margin, _wall, _skew} ->
         margin
 
       :down ->
@@ -210,7 +243,7 @@ defmodule Fathom.Shard.Heartbeat do
 
   defp status do
     case :ets.lookup(@status_table, :status) do
-      [{:status, gen, deadline, margin}] -> {gen, deadline, margin}
+      [{:status, gen, deadline, margin, wall, skew}] -> {gen, deadline, margin, wall, skew}
       [] -> :down
     end
   rescue
@@ -231,7 +264,8 @@ defmodule Fathom.Shard.Heartbeat do
 
     :ets.insert(
       @status_table,
-      {:status, state.generation, state.mono_deadline_ms, state.margin_ms}
+      {:status, state.generation, state.mono_deadline_ms, state.margin_ms,
+       Map.get(state, :wall_deadline_ms), Map.get(state, :skew_ms, 0)}
     )
 
     state
@@ -308,6 +342,11 @@ defmodule Fathom.Shard.Heartbeat do
       # never edge-detecting it, never bumping the generation, and letting flushes
       # skip revalidation against a peer that legitimately stole our shards.
       mono_deadline_ms: nil,
+      # Wall-clock twin of `mono_deadline_ms` (`wall + ttl` at the renew start), published for the
+      # lock-free readers' suspend trip-wire (expert review 2026-10-15 #16). Trips only.
+      wall_deadline_ms: nil,
+      # Last measured owner-behind-store skew, clamped >= 0 (0 = unknown); `measured_skew_ms/0`.
+      skew_ms: 0,
       # The mono/wall instants of the last SUCCESSFUL renew start — read only by the suspend
       # trip-wire (`suspend_forces_lapse?/3`), never to compute validity.
       renewed_mono_ms: nil,
@@ -380,6 +419,9 @@ defmodule Fathom.Shard.Heartbeat do
         # never write without confirmed liveness. Monotonic, so a wall-clock step
         # can't inflate perceived validity (expert review #21).
         is_nil(state.mono_deadline_ms) or now + state.margin_ms >= state.mono_deadline_ms ->
+          :not_valid
+
+        wall_expired?(Map.get(state, :wall_deadline_ms), state.margin_ms) ->
           :not_valid
 
         # A lapse happened since this shard was acquired — re-check ownership first.
@@ -456,6 +498,7 @@ defmodule Fathom.Shard.Heartbeat do
 
           renewed = %{state | expires_at_ms: exp, renewed_mono_ms: now, renewed_wall_ms: wall}
           skew = skew_ms(store_now)
+          renewed = %{renewed | skew_ms: clamp_skew(skew)}
 
           # OWNER-CLOCK SKEW (expert review 2026-09-05 #16). #13 fixed the READER (a stealer compares
           # exp against the store's Date); this is the OWNER, which stamped exp from its own wall
@@ -465,7 +508,7 @@ defmodule Fathom.Shard.Heartbeat do
           # mark_lapse ONLY on the transition, so a persistent skew does not churn the generation
           # every cycle; while it persists we hold the deadline in the past without recovering.
           if skew_forces_lapse?(skew, state.ttl_ms, state.renew_ms, Storage.steal_margin_ms()) do
-            lapsed = %{renewed | mono_deadline_ms: now - 1}
+            lapsed = %{renewed | mono_deadline_ms: now - 1, wall_deadline_ms: wall - 1}
 
             if state.lapsed do
               lapsed
@@ -480,7 +523,25 @@ defmodule Fathom.Shard.Heartbeat do
             end
           else
             # Recovered — fresh expiry, lapse episode over.
-            %{renewed | mono_deadline_ms: now + state.ttl_ms, lapsed: false}
+            #
+            # BUMP THE GENERATION WHEN AN EPISODE ENDS (expert review 2026-10-15 #8). A coordinator
+            # opened while `lapsed` was true, or before the first-ever renewal, sampled the
+            # CURRENT generation: nothing separates it from "no lapse since acquire", so once this
+            # recovery published a valid deadline `valid_for_write?/1` said :ok even though a peer
+            # may have stolen the shard during the episode (it only needs the heartbeat stale for
+            # ttl + steal_margin). Coordinators opened BEFORE the lapse were safe — mark_lapse's bump
+            # makes them :revalidate. Bumping at the END extends that to everyone opened during the
+            # episode, through the existing revalidate herd (one cheap check_lease each).
+            recovered = %{
+              renewed
+              | mono_deadline_ms: now + state.ttl_ms,
+                wall_deadline_ms: wall + state.ttl_ms,
+                lapsed: false
+            }
+
+            if state.lapsed or is_nil(state.mono_deadline_ms),
+              do: end_episode(recovered),
+              else: recovered
           end
 
         {:error, reason} ->
@@ -518,6 +579,9 @@ defmodule Fathom.Shard.Heartbeat do
   # the two are different clocks and must not be diffed.
   defp skew_ms(nil), do: nil
   defp skew_ms(store_now) when is_integer(store_now), do: store_now - Storage.now_ms()
+
+  defp clamp_skew(skew) when is_integer(skew), do: max(skew, 0)
+  defp clamp_skew(_), do: 0
 
   @doc """
   Whether an owner-behind-store clock skew is large enough to self-lapse (expert review #16).
@@ -707,6 +771,16 @@ defmodule Fathom.Shard.Heartbeat do
 
   defp incarnation_file do
     Path.join(Path.dirname(Fathom.Shard.db_path("x")), ".incarnation")
+  end
+
+  # The generation bump that closes an episode (see do_renew/1 #8). Unlike mark_lapse/1 it does not
+  # set `lapsed` (the caller has just cleared it) — it only separates "acquired during the episode"
+  # from "acquired after it", and tells subscribed coordinators to revalidate now.
+  defp end_episode(state) do
+    gen = state.generation + 1
+    :persistent_term.put(gen_key(state.owner), gen)
+    fan_out_lapse(gen)
+    %{state | generation: gen}
   end
 
   defp mark_lapse(state) do

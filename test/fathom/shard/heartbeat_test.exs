@@ -54,14 +54,17 @@ defmodule Fathom.Shard.HeartbeatTest do
     ref
   end
 
-  test "writes a fresh heartbeat on start and reports generation 0", %{owner: owner} do
+  # Generation 1, not 0: the first-ever successful renewal ends the pre-renewal "episode" and bumps
+  # the generation (expert review 2026-10-15 #8), so a coordinator opened before it revalidates.
+  test "writes a fresh heartbeat on start and reports generation 1", %{owner: owner} do
     assert {:ok, %{owner: ^owner, expires_at_ms: exp}} = Storage.read_heartbeat(owner)
     assert exp > System.system_time(:millisecond)
-    assert Heartbeat.generation() == 0
+    assert Heartbeat.generation() == 1
   end
 
   test "valid_for_write? is :ok when fresh and the generation matches" do
-    assert Heartbeat.valid_for_write?(0) == :ok
+    gen = Heartbeat.generation()
+    assert Heartbeat.valid_for_write?(gen) == :ok
     # A generation mismatch (without a lapse here) is treated as needing revalidation.
     assert Heartbeat.valid_for_write?(999) == :revalidate
   end
@@ -78,8 +81,8 @@ defmodule Fathom.Shard.HeartbeatTest do
   end
 
   test "a lapse bumps the generation and makes prior acquirers revalidate", %{pid: pid} do
-    assert Heartbeat.generation() == 0
-    assert Heartbeat.valid_for_write?(0) == :ok
+    assert Heartbeat.generation() == 1
+    assert Heartbeat.valid_for_write?(1) == :ok
 
     # Simulate a missed renewal: the heartbeat expired before the next tick ran.
     :sys.replace_state(pid, fn s ->
@@ -91,12 +94,13 @@ defmodule Fathom.Shard.HeartbeatTest do
       _ = :sys.get_state(pid)
     end)
 
-    # The lapse bumped the generation; the renew recovered a fresh heartbeat.
-    assert Heartbeat.generation() == 1
-    # A coordinator that acquired at generation 0 must now revalidate before flushing.
-    assert Heartbeat.valid_for_write?(0) == :revalidate
-    # A coordinator acquiring now (generation 1) is clean.
-    assert Heartbeat.valid_for_write?(1) == :ok
+    # The lapse bumped the generation (2), and the recovery ended the episode with a second bump
+    # (3, expert review 2026-10-15 #8); the renew recovered a fresh heartbeat.
+    assert Heartbeat.generation() == 3
+    # A coordinator that acquired at generation 1 must now revalidate before flushing.
+    assert Heartbeat.valid_for_write?(1) == :revalidate
+    # A coordinator acquiring now (generation 3) is clean.
+    assert Heartbeat.valid_for_write?(3) == :ok
   end
 
   test "not_valid when the heartbeat is not comfortably valid", %{pid: pid} do
@@ -219,7 +223,8 @@ defmodule Fathom.Shard.HeartbeatTest do
   # Simulated by the state a backward step produces: wall-clock expiry in the future,
   # real (monotonic) deadline already passed.
   test "a backward wall-clock step cannot mask a lapse", %{pid: pid} do
-    assert Heartbeat.valid_for_write?(0) == :ok
+    gen = Heartbeat.generation()
+    assert Heartbeat.valid_for_write?(gen) == :ok
 
     :sys.replace_state(pid, fn s ->
       Heartbeat.publish_status(%{
@@ -229,7 +234,7 @@ defmodule Fathom.Shard.HeartbeatTest do
       })
     end)
 
-    assert Heartbeat.valid_for_write?(0) == :not_valid,
+    assert Heartbeat.valid_for_write?(gen) == :not_valid,
            "a stepped-back wall clock must not make an expired heartbeat look valid"
 
     capture_log(fn ->
@@ -237,10 +242,10 @@ defmodule Fathom.Shard.HeartbeatTest do
       _ = :sys.get_state(pid)
     end)
 
-    assert Heartbeat.generation() == 1,
+    assert Heartbeat.generation() > gen,
            "the lapse must be edge-detected off elapsed (monotonic) time"
 
-    assert Heartbeat.valid_for_write?(0) == :revalidate
+    assert Heartbeat.valid_for_write?(gen) == :revalidate
   end
 
   # Expert review 2026-10-10 #17 (SYMPTOM): a host suspend longer than the TTL (VM pause, live
@@ -269,8 +274,8 @@ defmodule Fathom.Shard.HeartbeatTest do
 
     test "a renew tick after a long suspend lapses, though the monotonic deadline still reads valid",
          %{pid: pid} do
-      assert Heartbeat.generation() == 0
-      assert Heartbeat.valid_for_write?(0) == :ok
+      gen = Heartbeat.generation()
+      assert Heartbeat.valid_for_write?(gen) == :ok
 
       # Forge the state a 60 s suspend leaves: last good renewal was 60 s ago by the WALL clock, but
       # only ~100 ms ago by the monotonic one (which froze), so the mono deadline is still far off.
@@ -278,7 +283,7 @@ defmodule Fathom.Shard.HeartbeatTest do
         %{s | renewed_wall_ms: s.renewed_wall_ms - 60_000}
       end)
 
-      assert Heartbeat.valid_for_write?(0) == :ok,
+      assert Heartbeat.valid_for_write?(gen) == :ok,
              "precondition: the monotonic view alone still says valid (the bug's blind spot)"
 
       capture_log(fn ->
@@ -286,19 +291,21 @@ defmodule Fathom.Shard.HeartbeatTest do
         _ = :sys.get_state(pid)
       end)
 
-      assert Heartbeat.generation() == 1, "the suspend must be edge-detected as a lapse"
-      assert Heartbeat.valid_for_write?(0) == :revalidate
-      assert Heartbeat.valid_for_write?(1) == :ok
+      new_gen = Heartbeat.generation()
+      assert new_gen > gen, "the suspend must be edge-detected as a lapse"
+      assert Heartbeat.valid_for_write?(gen) == :revalidate
+      assert Heartbeat.valid_for_write?(new_gen) == :ok
     end
 
     test "a wall clock stepped BACKWARD never lapses and never extends validity", %{pid: pid} do
       :sys.replace_state(pid, fn s -> %{s | renewed_wall_ms: s.renewed_wall_ms + 3_600_000} end)
 
+      gen = Heartbeat.generation()
       send(pid, :renew)
       _ = :sys.get_state(pid)
 
-      assert Heartbeat.generation() == 0
-      assert Heartbeat.valid_for_write?(0) == :ok
+      assert Heartbeat.generation() == gen
+      assert Heartbeat.valid_for_write?(gen) == :ok
     end
   end
 
@@ -312,13 +319,189 @@ defmodule Fathom.Shard.HeartbeatTest do
   test "fence reads answer while the heartbeat process is unresponsive", %{pid: pid} do
     :ok = :sys.suspend(pid)
 
-    task = Task.async(fn -> {Heartbeat.valid_for_write?(0), Heartbeat.generation()} end)
+    gen = Heartbeat.generation()
+    task = Task.async(fn -> {Heartbeat.valid_for_write?(gen), Heartbeat.generation()} end)
 
     result = Task.await(task, 500)
     :ok = :sys.resume(pid)
 
-    assert {:ok, 0} == result,
+    assert {:ok, gen} == result,
            "fence reads must not block on the heartbeat's mailbox (pre-fix: GenServer.call)"
+  end
+
+  # Expert review 2026-10-15 #8 (SYMPTOM): a coordinator opened while the heartbeat was lapsed (or
+  # before its first-ever renewal) sampled the CURRENT generation, so when the heartbeat recovered
+  # `valid_for_write?/1` said :ok even though a peer may have stolen the shard during the episode.
+  # Only coordinators opened BEFORE the lapse revalidated. Invariant: the generation moves when an
+  # episode ENDS, so everything opened during it revalidates once. Heartbeat mode throughout (the
+  # tests drive `Heartbeat` directly, and assert the generation they hold is a real integer, i.e.
+  # the `acquire_gen` a heartbeat-mode coordinator would carry — never nil).
+  describe "an episode's end revalidates coordinators opened during it (#8)" do
+    setup do
+      prev_storage = Application.get_env(:fathom, :shard_storage)
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+      on_exit(fn ->
+        Application.delete_env(:fathom, :faulty_renew_heartbeat)
+
+        if prev_storage,
+          do: Application.put_env(:fathom, :shard_storage, prev_storage),
+          else: Application.delete_env(:fathom, :shard_storage)
+      end)
+
+      :ok
+    end
+
+    test "acquired while lapsed: revalidates after recovery", %{pid: pid} do
+      Application.put_env(:fathom, :faulty_renew_heartbeat, fn _opts -> {:error, :store_down} end)
+
+      # The deadline passed unnoticed; the next tick edge-detects the lapse, and its renewal FAILS,
+      # so the episode stays open.
+      :sys.replace_state(pid, fn s ->
+        %{s | mono_deadline_ms: System.monotonic_time(:millisecond) - 1_000}
+      end)
+
+      capture_log(fn ->
+        send(pid, :renew)
+        _ = :sys.get_state(pid)
+      end)
+
+      # A coordinator opens now, mid-episode. It records the (already bumped) generation.
+      acquire_gen = Heartbeat.generation()
+      assert is_integer(acquire_gen), "heartbeat mode: acquire_gen is a real generation, not nil"
+      assert Heartbeat.valid_for_write?(acquire_gen) == :not_valid
+
+      # ... a peer steals the shard here ...
+
+      # The store comes back: the episode ends.
+      Application.delete_env(:fathom, :faulty_renew_heartbeat)
+      send(pid, :renew)
+      _ = :sys.get_state(pid)
+
+      assert Heartbeat.valid_for_write?(acquire_gen) == :revalidate,
+             "a coordinator acquired during the lapse episode held the post-lapse generation and " <>
+               "was never revalidated after recovery, so a steal in the gap went unnoticed"
+
+      assert Heartbeat.valid_for_write?(Heartbeat.generation()) == :ok
+    end
+
+    test "acquired before the first-ever renewal: revalidates once it lands" do
+      :ok = stop_supervised(Fathom.Shard.Heartbeat)
+      Application.put_env(:fathom, :faulty_renew_heartbeat, fn _opts -> {:error, :store_down} end)
+
+      owner = "firstboot_#{System.unique_integer([:positive])}@test"
+
+      pid =
+        ExUnit.CaptureLog.with_log(fn ->
+          pid = start_supervised!({Heartbeat, ttl_ms: @ttl, owner: owner}, id: :hb_first_boot)
+          _ = :sys.get_state(pid)
+          pid
+        end)
+        |> elem(0)
+
+      acquire_gen = Heartbeat.generation()
+      assert is_integer(acquire_gen)
+      assert Heartbeat.valid_for_write?(acquire_gen) == :not_valid
+
+      Application.delete_env(:fathom, :faulty_renew_heartbeat)
+      send(pid, :renew)
+      _ = :sys.get_state(pid)
+
+      assert Heartbeat.valid_for_write?(acquire_gen) == :revalidate,
+             "a coordinator opened before the first renewal baselined the pre-renewal generation " <>
+               "and never revalidated"
+    end
+  end
+
+  # Expert review 2026-10-15 #16 (SYMPTOM): the wall-vs-mono trip-wire ran only in `do_renew`, so
+  # lock-free readers trusted the monotonic deadline after a host suspend until the next renew
+  # tick. Invariant: the published WALL deadline can only TRIP `valid_for_write?/1`, never extend it.
+  describe "the published wall deadline trips lock-free readers (#16)" do
+    test "wall_expired?/2 boundary: nil never trips; trips exactly at deadline - margin" do
+      now = System.system_time(:millisecond)
+      refute Heartbeat.wall_expired?(nil, 10_000)
+      refute Heartbeat.wall_expired?(now + 3_600_000, 10_000)
+      assert Heartbeat.wall_expired?(now - 1, 10_000)
+      assert Heartbeat.wall_expired?(now + 5_000, 10_000)
+    end
+
+    test "a passed wall deadline is :not_valid though the monotonic deadline is valid",
+         %{pid: pid} do
+      gen = Heartbeat.generation()
+      assert Heartbeat.valid_for_write?(gen) == :ok
+
+      # The state a suspend leaves: monotonic frozen (deadline far off), wall deadline already past.
+      :sys.replace_state(pid, fn s ->
+        Heartbeat.publish_status(%{
+          s
+          | wall_deadline_ms: System.system_time(:millisecond) - 1_000
+        })
+      end)
+
+      assert Heartbeat.valid_for_write?(gen) == :not_valid,
+             "between renew ticks the lock-free reader trusted the frozen monotonic deadline"
+
+      # The next renew tick republishes a fresh wall deadline and the fence reopens.
+      capture_log(fn ->
+        send(pid, :renew)
+        _ = :sys.get_state(pid)
+      end)
+
+      assert Heartbeat.valid_for_write?(Heartbeat.generation()) == :ok
+    end
+
+    test "a wall deadline far in the future never extends an expired monotonic deadline",
+         %{pid: pid} do
+      gen = Heartbeat.generation()
+
+      :sys.replace_state(pid, fn s ->
+        Heartbeat.publish_status(%{
+          s
+          | wall_deadline_ms: System.system_time(:millisecond) + 3_600_000,
+            mono_deadline_ms: System.monotonic_time(:millisecond) - 1
+        })
+      end)
+
+      assert Heartbeat.valid_for_write?(gen) == :not_valid
+    end
+  end
+
+  # For the write breaker (expert review 2026-10-15 #22): the last measured owner-behind-store skew.
+  describe "measured_skew_ms/0" do
+    setup do
+      prev_storage = Application.get_env(:fathom, :shard_storage)
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+      on_exit(fn ->
+        Application.delete_env(:fathom, :heartbeat_skew_ms)
+
+        if prev_storage,
+          do: Application.put_env(:fathom, :shard_storage, prev_storage),
+          else: Application.delete_env(:fathom, :shard_storage)
+      end)
+
+      :ok
+    end
+
+    test "publishes the owner-behind-store skew, clamped to >= 0", %{pid: pid} do
+      # Below the 15 s self-lapse bound, so the renewal is accepted and the skew recorded.
+      Application.put_env(:fathom, :heartbeat_skew_ms, 7_000)
+      send(pid, :renew)
+      _ = :sys.get_state(pid)
+      skew = Heartbeat.measured_skew_ms()
+      assert skew >= 6_900 and skew <= 7_500
+
+      # Owner AHEAD of the store is not the steal direction: clamped to 0.
+      Application.put_env(:fathom, :heartbeat_skew_ms, -9_000)
+      send(pid, :renew)
+      _ = :sys.get_state(pid)
+      assert Heartbeat.measured_skew_ms() == 0
+    end
+
+    test "is 0 when the heartbeat is down" do
+      :ok = stop_supervised(Fathom.Shard.Heartbeat)
+      assert Heartbeat.measured_skew_ms() == 0
+    end
   end
 
   test "clears its heartbeat on clean shutdown", %{pid: pid, owner: owner} do
@@ -514,8 +697,8 @@ defmodule Fathom.Shard.HeartbeatTest do
   # every re-boot of an already-seen owner counts as a lapse episode.
   test "a heartbeat restart bumps the generation so prior acquirers revalidate",
        %{pid: pid, owner: owner} do
-    assert Heartbeat.generation() == 0
-    assert Heartbeat.valid_for_write?(0) == :ok
+    old_gen = Heartbeat.generation()
+    assert Heartbeat.valid_for_write?(old_gen) == :ok
 
     # Subscribe like a coordinator does (expert review #34), so the restart's
     # broadcast delivery is asserted below.
@@ -529,19 +712,23 @@ defmodule Fathom.Shard.HeartbeatTest do
     pid2 = start_supervised!({Heartbeat, ttl_ms: @ttl, owner: owner}, id: :heartbeat_restarted)
     _ = :sys.get_state(pid2)
 
-    assert Heartbeat.generation() == 1, "a restart must count as a lapse episode"
+    # +1 for the restart itself, +1 more for the restarted process's first-ever renewal (#8).
+    new_gen = Heartbeat.generation()
+    assert new_gen == old_gen + 2, "a restart must count as a lapse episode"
 
-    assert Heartbeat.valid_for_write?(0) == :revalidate,
+    assert Heartbeat.valid_for_write?(old_gen) == :revalidate,
            "a coordinator acquired before the restart must revalidate ownership"
 
-    assert Heartbeat.valid_for_write?(1) == :ok
+    assert Heartbeat.valid_for_write?(new_gen) == :ok
 
     # Expert review round-2 #15: the restart bumped the generation but never
     # BROADCAST it, so subscribed coordinators (the #34 proactive fence) kept stale
     # acquire_gens until their next flush — unboundedly with the periodic flush
     # disabled — while the restart gap is a real steal window. A restart must
     # proactively notify exactly like a lapse.
-    assert_receive {:heartbeat_lapsed, 1},
+    restart_gen = old_gen + 1
+
+    assert_receive {:heartbeat_lapsed, ^restart_gen},
                    1_000,
                    "a heartbeat restart must broadcast the lapse so coordinators revalidate now"
   end
