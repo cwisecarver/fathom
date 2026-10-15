@@ -2216,7 +2216,12 @@ defmodule Fathom.ShardDurabilityTest do
 
     # Tombstone AFTER opening (admission refuses a tombstoned open) — the real delete order, where the
     # coordinator is already serving when `Tenants.delete` tombstones it ahead of the force-stop.
-    Fathom.Tenants.Tombstones.put(shard)
+    #
+    # Insert directly, NOT via `Tombstones.put/1`: since expert review 2026-10-15 #3 `put/1` also stops
+    # the local coordinator and erases its files asynchronously, which races this test's own
+    # `terminate_child` ({:error, :not_found}). The invariant pinned here (terminate skips the flush
+    # for a tombstoned id) is the coordinator's and is unchanged.
+    :ets.insert(Fathom.Tenants.Tombstones, {shard})
     on_exit(fn -> :ets.delete(Fathom.Tenants.Tombstones, shard) end)
 
     refute File.exists?(remote_db(shard)), "nothing flushed before the stop"
