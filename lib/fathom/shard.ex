@@ -4423,18 +4423,19 @@ defmodule Fathom.Shard do
   # shard dirty so the write isn't lost on a later idle-drop).
   # The object POSITION STAMP (what a flush/promote writes to the object's `fathom-pos`
   # metadata) and the flush `lineage` argument now live in `Fathom.Shard.Position` — pure
-  # functions shared by BOTH the durability flush and the A2 promote path. See that module for
-  # the read-after-snapshot / over-claim / seed-on-known-short rationale (moved 2026-09-13).
+  # functions shared by BOTH the durability flush and the A2 promote path. This path stamps
+  # `Position.snapshot_position/2`: the position as of `pre`, read BEFORE the snapshot, so the stamp
+  # under-claims and never over-claims (expert review 2026-10-15 #5, user decision Q3 = A).
 
   defp snapshot_and_upload(state) do
     temp = "#{state.path}.snap.#{System.unique_integer([:positive])}"
 
-    # The generation, captured before anything mutates the WAL (expert review 2026-08-20 #4).
-    # `snapshot/2` is FREQUENTLY the last connection — its own comment says the periodic flush
-    # "fires on any dirty shard, which is routinely one with zero checked-out streams" — and the
-    # last close unlinks `-wal`/`-shm`. Only consulted when the post-snapshot read finds nothing;
-    # the live read still happens after the snapshot and still wins whenever the WAL survives, so
-    # the over-claim rule below is unchanged.
+    # THE POSITION THE STAMP CLAIMS, read BEFORE the snapshot (expert review 2026-10-15 #5, user
+    # decision Q3 = A). Everything committed by now is in the snapshot taken after it, so the stamp
+    # can only under-claim. It used to be read again AFTER the snapshot and claimed the frames
+    # committed during `VACUUM INTO` too — writes the object does not hold, so a replica holding
+    # them (acked) lost to the object on failover. Also the 2026-08-20 #4 capture: the snapshot is
+    # frequently the last connection, and its close unlinks `-wal`.
     pre = Fathom.Shard.Replication.Wal.read(state.path <> "-wal")
 
     try do
@@ -4442,13 +4443,14 @@ defmodule Fathom.Shard do
       # after would spend a full VACUUM on a file we are about to refuse and move aside.
       with :ok <- flush_space_preflight(state),
            :ok <- verify_and_snapshot(state, temp),
+           :ok <- after_snapshot_hook(state),
            :ok <- recheck_before_put(state),
            {:ok, new_etag, carried} <-
              state.id
              |> Storage.flush(
                temp,
                state.etag,
-               Position.flush_position(state, pre),
+               Position.snapshot_position(state, pre),
                Position.lineage_arg(state),
                flush_intent_opts(state.path)
              )
@@ -4468,6 +4470,18 @@ defmodule Fathom.Shard do
     after
       Enum.each(["", "-wal", "-shm"], &File.rm(temp <> &1))
     end
+  end
+
+  # TEST SEAM between the snapshot and the PUT (expert review 2026-10-15 #5): the only way to land a
+  # commit deterministically inside the window the stamp's read order is about. One env read per
+  # flush, beside a full VACUUM INTO and PUT.
+  defp after_snapshot_hook(state) do
+    case Application.get_env(:fathom, :flush_after_snapshot_hook) do
+      fun when is_function(fun, 1) -> fun.(state.id)
+      _ -> :ok
+    end
+
+    :ok
   end
 
   # A FLUSH THAT RECREATES THE PRE-TOUCH ETAG (expert review 2026-10-13 #17). The steal rotated the

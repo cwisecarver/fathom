@@ -13,9 +13,11 @@ defmodule Fathom.Shard.PromoteOnOpen do
   the caller's `etag` unchanged, so the ordinary open path is bit-for-bit what it was — including
   every error, because a failed promotion must never fail an open (the stored-object path is still
   correct, it just recovers less). `Promote.fresher?/2` is what makes it safe: a replica is promoted
-  only when STRICTLY ahead of what the object claims, the object's claim is an over-claim by
-  construction (`Position.flush_position/1`), and an unstamped object is never overridable — so an
-  object written before stamping existed, or by a node not yet upgraded, is left alone.
+  only when STRICTLY ahead of what the object claims, the object's claim never exceeds what it holds
+  (a live flush stamps the position as of BEFORE its snapshot, `Position.snapshot_position/2`, so
+  a replica holding acked writes the object lacks always wins — expert review 2026-10-15 #5; the
+  occasional extra promotion this buys can drop only never-acked writes), and an unstamped object
+  is never overridable — so an object written before stamping existed is left alone.
 
   Holds no coordinator state; every dependency is a sibling module (`Follower`, `Recovery`,
   `Promote`, `Storage`, `Position`, `Provenance`, `Fathom.Snapshots`).

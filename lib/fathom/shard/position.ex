@@ -26,8 +26,10 @@ defmodule Fathom.Shard.Position do
   # THE POST-CHECKPOINT OVER-CLAIM (kept from the original comment). A checkpoint FOLDS the WAL into
   # the database, so an object written after one holds everything through the end of generation
   # `gen`; stamping `gen + 1` with offset 0 is strictly greater than any replica at `{epoch, gen,
-  # ≤N}` and keeps the over-claim direction the callers require. This is not "read before the
-  # snapshot" — the live read still happens after, and still wins whenever the WAL survives.
+  # ≤N}`. `flush_position/1,2` read the live WAL AFTER the bytes were fixed, which is sound ONLY
+  # where no writer can run between the two: the drop path's checkpoint route (`conns == 0`, the
+  # coordinator terminating) and a promote's quiescent temp. A flush that snapshots a LIVE shard
+  # uses `snapshot_position/2` instead — see there for why the direction must flip.
   @spec flush_position(map()) :: map() | nil
   def flush_position(state), do: flush_position(state, {:ok, :empty})
 
@@ -38,6 +40,59 @@ defmodule Fathom.Shard.Position do
       epoch -> flush_position(state, pre, epoch)
     end
   end
+
+  @doc """
+  The stamp for a snapshot of a LIVE shard, computed from `pre` — the WAL header read BEFORE the
+  snapshot was taken — and never from the WAL after it (expert review 2026-10-15 #5, user decision
+  Q3 = A: under-claim).
+
+  The stamp used to be read AFTER `VACUUM INTO`, so it claimed every frame committed while the
+  snapshot ran — frames the object does not contain. `Promote.fresher?/2` is strict, so a replica
+  holding exactly those writes (quorum-ACKED: the ack waits on the replicas) lost to the object, and
+  a primary death before the next flush lost them silently. A WAL restart inside the window was
+  worse: the post-read salt no longer matched, the ordinal was withheld, and the unrankable object
+  beat every replica.
+
+  `pre` is read before the snapshot opens, so everything it describes is IN the snapshot: the stamp
+  can only ever claim LESS than the object holds. The cost is the other direction — a replica past
+  `pre` but short of the snapshot's read point is promoted over the object, dropping writes that were
+  committed locally but never acked. That is the trade Q3 chose: an acked write is the contract.
+
+    * `pre` names a WAL whose salt the coordinator numbered — `{lineage, wal_ordinal: n, offset:
+      commit_extent}` (and its salt), the live position as of `pre`.
+    * `pre` names a WAL the coordinator has NOT numbered yet (it started after this flush's state
+      was captured) on a replicating shard — `{lineage, wal_ordinal: n + 1, offset: 0}`. That WAL
+      will be numbered `n + 1` or later, its predecessor was folded before it began (so the object
+      holds all of it), and offset 0 claims none of the new WAL's frames. Withholding the ordinal
+      instead — the old answer — made the object unrankable, the over-claim this replaces.
+    * `pre` empty — nothing un-folded at `pre`, the same answer the post-checkpoint path gives.
+    * `pre` unreadable — `nil`.
+  """
+  @spec snapshot_position(map(), term()) :: map() | nil
+  def snapshot_position(state, pre) do
+    case stamp_epoch(state) do
+      nil -> nil
+      epoch -> position_at(state, pre, epoch)
+    end
+  end
+
+  defp position_at(state, {:ok, %{ckpt_seq: gen, salt1: salt, commit_extent: extent}}, epoch) do
+    case {Map.get(state, :wal_salt), Map.get(state, :wal_ordinal), Map.get(state, :lineage)} do
+      {^salt, n, _} when is_integer(n) and n > 0 ->
+        %{epoch: epoch, wal_gen: gen, offset: extent, wal_ordinal: n, salt1: salt}
+
+      {_unnumbered, n, lineage} when is_integer(n) and n >= 0 and is_integer(lineage) ->
+        %{epoch: epoch, wal_gen: 0, offset: 0, wal_ordinal: n + 1}
+
+      _ ->
+        %{epoch: epoch, wal_gen: gen, offset: extent}
+    end
+  end
+
+  defp position_at(state, {:ok, :empty} = pre, epoch),
+    do: position_after_checkpoint(epoch, pre, state)
+
+  defp position_at(_state, _unreadable, _epoch), do: nil
 
   # What fills the position stamp's `epoch` slot (expert review 2026-08-20 #8). Three inputs, and
   # the lease is required by ALL of them: no lease means no ownership to order, which is the

@@ -7,27 +7,26 @@ defmodule Fathom.Shard.FlushPositionTest do
   epoch rather than the object's, and comparing wall-clock across nodes is unsound. The stamp is
   what makes that comparison possible, and everything here exists to keep it from lying.
 
-  ## The read order is the whole safety argument
+  ## The read order is the whole safety argument — and it is UNDER-claim
 
-  `Fathom.Shard.flush_position/1` is read **after** the snapshot, so the stamp claims at least as
-  much as the object holds. A replica is promoted only when strictly ahead of the claim, so an
-  over-claim costs at most one flush interval of RPO and can never lose a write.
+  The stamp of a live-shard flush is computed from the WAL header read **before** the snapshot
+  (`Fathom.Shard.Position.snapshot_position/2`), so the object always holds at least what the stamp
+  claims. A replica is promoted only when strictly ahead of the claim, so a replica holding writes
+  the object does not have — in particular quorum-ACKED writes committed while `VACUUM INTO` ran —
+  is promoted rather than lost (expert review 2026-10-15 #5, user decision Q3 = A).
 
-  Reading it *before* the snapshot would under-claim, and a replica sitting between the claim and
-  the truth would then be judged fresher and promoted — dropping exactly the writes that landed
-  during the snapshot.
+  This file used to say the opposite: that the stamp is read AFTER the snapshot, "claims at least
+  as much as the object holds", and so "can never lose a write". That over-claim was the bug — it
+  claimed frames committed during the snapshot that the object never got, and a replica holding
+  them lost to the object. Under-claiming costs the other direction: a replica past the claim but
+  short of the snapshot's read point can be promoted, dropping writes that were committed locally
+  but never ACKED. An acked write is the contract; an unacked one never returned success.
 
-  **`over_claims_never_under_claims` does NOT reproduce that mistake, and it is worth knowing why
-  before trusting it.** The two orderings differ only when a write lands *during* the snapshot, and
-  with no concurrent writer both read the same WAL — so the flipped version passes it. Forcing a
-  write into that window is inherently racy (there is no storage hook between the snapshot and the
-  PUT; `run_before(:flush)` fires inside the backend, after the position is computed either way),
-  and a probabilistic guard on a data-loss path is worse than an honest one.
-
-  So the runtime test is kept as an invariant guard — the stamp must never sit behind the WAL that
-  existed before the flush — and the actual read-order guard is `reads_the_position_after_the_
-  snapshot`, which asserts the call order in the source. That one does fail when the read is
-  hoisted, which is the change being defended against.
+  `the stamp never claims writes the snapshot does not hold` reproduces the window
+  deterministically through a test seam between the snapshot and the PUT
+  (`:flush_after_snapshot_hook`), and fails when the read is moved back after the snapshot. The
+  drop path's checkpoint route still reads after its checkpoint — there are no connections, so no
+  writer can run in between — and its own guards below pin that.
   """
   use ExUnit.Case, async: false
 
@@ -258,11 +257,11 @@ defmodule Fathom.Shard.FlushPositionTest do
       refute second == first, "the stamp did not move across a flush that wrote 20 rows"
     end
 
-    # THE DIRECTION TEST. Everything the stamp is for rests on it claiming at least as much as the
-    # object holds, so this pins it against the WAL state that existed BEFORE the flush ran: the
-    # object cannot contain more than that plus whatever landed during it, and the stamp must not
-    # be behind it.
-    test "over_claims_never_under_claims", ctx do
+    # THE LOWER BOUND. With no concurrent writer the pre-snapshot read IS the WAL that existed
+    # before the flush, and the stamp must cover it: under-claiming is about the snapshot window,
+    # not license to stamp behind writes the object certainly holds. (Named
+    # `over_claims_never_under_claims` until expert review 2026-10-15 #5 reversed the direction.)
+    test "the stamp covers the WAL that existed before the flush", ctx do
       %{id: id, coordinator: coordinator, conn: conn, path: path} = ctx
 
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE t (a INTEGER, b TEXT)"))
@@ -287,53 +286,93 @@ defmodule Fathom.Shard.FlushPositionTest do
                "promoted over bytes the object actually holds"
     end
 
-    # The real read-order guard. Structural rather than behavioural, deliberately: the runtime
-    # difference only appears when a write lands during the snapshot, which cannot be forced
-    # deterministically (see the moduledoc). Hoisting the read above the snapshot is a one-line
-    # change that looks equivalent and silently converts an over-claim into an under-claim, so the
-    # thing worth pinning is where the call sits.
-    test "reads_the_position_after_the_snapshot" do
-      source = File.read!("lib/fathom/shard.ex")
+    # THE READ-ORDER GUARD, now behavioural (expert review 2026-10-15 #5). It replaces a test that
+    # asserted, by reading the source, that the position was read AFTER the snapshot — it pinned the
+    # over-claim the review found loses acked writes. A commit lands in the window between the
+    # snapshot and the PUT through the `:flush_after_snapshot_hook` seam; the object does not hold
+    # it, so the stamp must not claim it.
+    test "the stamp never claims writes the snapshot does not hold", ctx do
+      %{id: id, coordinator: coordinator, conn: conn, path: path} = ctx
+      test_pid = self()
 
-      [_, body] = String.split(source, "defp snapshot_and_upload(state) do", parts: 2)
-      [body, _] = String.split(body, "\n  defp ", parts: 2)
+      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE t (a INTEGER)"))
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (1)"))
+      assert {:ok, %{ckpt_seq: _} = pre} = Wal.read(path <> "-wal")
 
-      # The call was `snapshot(state.path, temp)` until expert review 2026-08-26 #12 folded the
-      # integrity check and the snapshot onto one connection as `verify_and_snapshot/2`. Only the
-      # NAME moved — the ordering invariant this test pins is unchanged, and the snapshot is still
-      # the thing the position read must come after.
-      snapshot_at =
-        case :binary.match(body, "verify_and_snapshot(state, temp)") do
-          {at, _} ->
-            at
+      Application.put_env(:fathom, :flush_after_snapshot_hook, fn sid ->
+        if sid == id do
+          send(test_pid, {:snapshotted, self()})
 
-          :nomatch ->
-            flunk(
-              "could not find the snapshot call in snapshot_and_upload/1. This test pins a " <>
-                "read ORDER by reading the source, so a rename breaks it by design — re-point it " <>
-                "at whatever now performs the snapshot rather than deleting the guard."
-            )
+          receive do
+            :go -> :ok
+          after
+            5_000 -> :ok
+          end
         end
+      end)
 
-      position_at = :binary.match(body, "flush_position(state, pre)") |> elem(0)
+      on_exit(fn -> Application.delete_env(:fathom, :flush_after_snapshot_hook) end)
 
-      assert position_at > snapshot_at,
-             "flush_position is read BEFORE the snapshot in snapshot_and_upload/1. That makes " <>
-               "the stamp UNDER-claim: the object then contains more than it says, and a replica " <>
-               "sitting between the claim and the truth is judged fresher and promoted over it — " <>
-               "silently dropping the writes that landed during the snapshot. Read it after."
+      send(coordinator, :durability_flush)
+      assert_receive {:snapshotted, flush_task}, 5_000
 
-      # The OTHER half of the same invariant (expert review 2026-08-20 #4). The live read above
-      # must stay after the snapshot; the `pre` header it falls back to must be captured BEFORE
-      # anything mutates the WAL, or the fallback is measuring the same destroyed file the live
-      # read already failed on.
-      pre_at = :binary.match(body, "pre = Fathom.Shard.Replication.Wal.read") |> elem(0)
+      # Committed AFTER the snapshot, BEFORE the PUT: the window.
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (2)"))
+      # (The flush may have checkpointed, so this can be a NEW WAL rather than a longer one.)
+      assert {:ok, %{ckpt_seq: _} = post} = Wal.read(path <> "-wal")
 
-      assert pre_at < snapshot_at,
-             "the `pre` WAL header is captured AFTER the snapshot in snapshot_and_upload/1. " <>
-               "snapshot/2 is frequently the last connection and its close unlinks -wal, so a " <>
-               "late capture reads :empty and the stamp collapses to {epoch, 0, 0} — the lowest " <>
-               "position for the epoch, on a complete object. Capture it first."
+      assert {post.salt1, post.commit_extent} != {pre.salt1, pre.commit_extent},
+             "fixture: the in-window commit did not move the WAL"
+
+      send(flush_task, :go)
+      settle(coordinator, 400)
+      Application.delete_env(:fathom, :flush_after_snapshot_hook)
+
+      # Precondition: the object really does lack the in-window write.
+      dst = Path.join(System.tmp_dir!(), "flushpos_obj_#{System.unique_integer([:positive])}.db")
+      assert {:ok, _} = Storage.pull(id, dst)
+      {:ok, c} = Fathom.Shard.Connection.open(dst)
+      {:ok, %{rows: rows}} = Fathom.Shard.Connection.query(c, "SELECT a FROM t ORDER BY a", [])
+      :ok = Fathom.Shard.Connection.close(c)
+      for s <- ["", "-wal", "-shm"], do: File.rm(dst <> s)
+      assert rows == [[1]], "fixture: the snapshot was taken after the in-window commit"
+
+      assert {:ok, pos} = Storage.object_position(id)
+
+      # Replication is off here (no ordinal), so the stamp is exactly the pre-snapshot position.
+      assert {pos.wal_gen, pos.offset} == {pre.ckpt_seq, pre.commit_extent},
+             "the stamp #{inspect(pos)} is not the position as of the snapshot " <>
+               "(#{inspect(pre)}); the in-window commit is at #{inspect(post)} and the object " <>
+               "does not hold it — a replica holding that acked write would lose to the object"
+    end
+
+    # The two pre-snapshot cases that are not a plain header read, pinned as pure functions.
+    test "snapshot_position/2 under-claims an unnumbered WAL and states the numbered one" do
+      alias Fathom.Shard.Position
+
+      state = %{lease: %{epoch: 1}, lineage: 5, wal_salt: 111, wal_ordinal: 3}
+      numbered = {:ok, %{ckpt_seq: 2, salt1: 111, commit_extent: 9_000}}
+      unnumbered = {:ok, %{ckpt_seq: 0, salt1: 222, commit_extent: 9_000}}
+
+      assert Position.snapshot_position(state, numbered) ==
+               %{epoch: 5, wal_gen: 2, offset: 9_000, wal_ordinal: 3, salt1: 111}
+
+      # A WAL that began after this flush's state was captured: the old answer withheld the
+      # ordinal, which made the object UNRANKABLE (it beat every replica). It is numbered 4 or
+      # later, and offset 0 claims none of its frames.
+      stamp = Position.snapshot_position(state, unnumbered)
+      assert stamp == %{epoch: 5, wal_gen: 0, offset: 0, wal_ordinal: 4}
+
+      replica = %{lineage: 5, epoch: 1, wal_gen: 0, wal_ordinal: 4, next_offset: 4_152}
+      assert Promote.fresher?(replica, stamp), "a replica holding the new WAL's frames must win"
+
+      # Replication off (`:disabled`): never an invented ordinal — the bit-for-bit old answer.
+      off = %{state | lineage: :disabled}
+
+      assert Position.snapshot_position(off, unnumbered) ==
+               %{epoch: 1, wal_gen: 0, offset: 9_000}
+
+      assert Position.snapshot_position(state, {:error, :enoent}) == nil
     end
 
     # THE SAME GUARD ON THE OTHER PATH (expert review 2026-08-20 #38). The one above scoped itself
