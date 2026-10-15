@@ -65,6 +65,12 @@ defmodule Fathom.Shard.TombstonedTerminateEraseTest do
 
   defp local_residue(shard), do: Path.wildcard(Path.join(Shard.data_dir(), "#{shard}.db*"))
 
+  # Insert the tombstone directly, NOT via `Tombstones.put/1`: since expert review 2026-10-15 #3
+  # (the Tombstones half) `put/1` also stops the local coordinator and erases its files
+  # asynchronously. That masks the COORDINATOR half these tests pin (and in the self-fence case it
+  # stops the coordinator with :shutdown before the flush can self-fence, so the test timed out).
+  defp tombstone!(shard), do: :ets.insert(Fathom.Tenants.Tombstones, {shard})
+
   # A flushed shard with one more (unflushed) write: dirty, with a local `.db`, `-wal` and `.etag`.
   defp open_written!(shard, mode) do
     set_mode!(mode)
@@ -92,7 +98,7 @@ defmodule Fathom.Shard.TombstonedTerminateEraseTest do
            %{shard: shard, mode: mode} do
         {conn, pid} = open_written!(shard, mode)
         :ok = ShardExecutor.close(conn)
-        Fathom.Tenants.Tombstones.put(shard)
+        tombstone!(shard)
 
         stop!(shard, pid)
 
@@ -104,7 +110,7 @@ defmodule Fathom.Shard.TombstonedTerminateEraseTest do
       test "a busy stop of a tombstoned shard erases its local files",
            %{shard: shard, mode: mode} do
         {conn, pid} = open_written!(shard, mode)
-        Fathom.Tenants.Tombstones.put(shard)
+        tombstone!(shard)
 
         capture_log(fn -> stop!(shard, pid) end)
         _ = ShardExecutor.close(conn)
@@ -120,7 +126,7 @@ defmodule Fathom.Shard.TombstonedTerminateEraseTest do
         :ok = ShardExecutor.close(conn)
 
         # The purge: tombstone, then the stored object goes (it is deleted before the lock).
-        Fathom.Tenants.Tombstones.put(shard)
+        tombstone!(shard)
         File.rm!(Path.join(Storage.Local.dir(), "#{shard}.db"))
         ref = Process.monitor(pid)
 
