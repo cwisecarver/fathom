@@ -539,12 +539,11 @@ defmodule Fathom.Shard.Replication.Recovery do
       counted it;
     * **this node, when it is the previous owner** (expert review 2026-10-15 #4) — a node that
       held the lease was never its own follower, so its table cannot hold the tail it wrote, and
-      counting it shrank the floor to `N - Q` real followers. Detected by `node()`, which the owner
-      string carries (`Heartbeat.owner/0` is `"<node()>#<incarnation>"`), so it needs no NODE_KEY.
+      counting it shrank the floor to `N - Q` real followers. Detected by `Rebalancer.node_key/0`, which the owner
+      string carries (`Heartbeat.owner/0` is `"<node_key>#<incarnation>"`).
 
-  A PEER that is the previous owner is excluded too (expert review 2026-10-13 #14), but that
-  comparison is between an owner string and a `node_key` and only works where the two coincide —
-  the NODE_KEY-in-owner change (expert review 2026-10-15 #17) is what closes it.
+  A PEER that is the previous owner is excluded too (expert review 2026-10-13 #14): an exact
+  comparison of the owner's key with the endpoint key (expert review 2026-10-15 #17).
   """
   @spec answered(
           [{endpoint(), {:answered, position() | nil} | :silent}],
@@ -554,7 +553,7 @@ defmodule Fathom.Shard.Replication.Recovery do
           non_neg_integer()
   def answered(answers, local, opts) do
     prev = Keyword.get(opts, :previous_owner)
-    self_name = Keyword.get_lazy(opts, :self_node, fn -> Atom.to_string(node()) end)
+    self_name = Keyword.get_lazy(opts, :self_node, &Fathom.Rebalancer.node_key/0)
 
     own =
       if self_previous_owner?(prev, self_name) or not definite?(local), do: 0, else: 1
@@ -576,31 +575,21 @@ defmodule Fathom.Shard.Replication.Recovery do
   defp definite?(_), do: false
 
   @doc """
-  Is the lease `owner` string THIS node, in this or an earlier incarnation? Pure. Compares the name
-  before the `#` with `self_name` (`Atom.to_string(node())`) exactly — the owner string is built
-  from `node()`, so self-identification does not depend on NODE_KEY.
+  Is the lease `owner` string THIS node, in this or an earlier incarnation? Pure. Compares the key
+  before the `#` with `self_key` (`Fathom.Rebalancer.node_key/0`) exactly.
   """
   @spec self_previous_owner?(String.t() | nil, String.t()) :: boolean()
-  def self_previous_owner?(owner, self_name) when is_binary(owner) and is_binary(self_name) do
-    [name | _] = String.split(owner, "#", parts: 2)
-    name != "" and name == self_name
-  end
-
-  def self_previous_owner?(_owner, _self_name), do: false
+  def self_previous_owner?(owner, self_key), do: previous_owner?(owner, self_key)
 
   @doc """
-  Is `node_key` the node a lease `owner` string (`"<node name>#<incarnation>"`) names? Pure.
-
-  The codebase's convention for mapping an owner to a fleet node (`RemoteFlush`, `ShardMigration`)
-  is the name before the `#`. A release's `node()` is `name@host`, so the host part is accepted too:
-  with `NODE_KEY` equal to the container hostname the two coincide. A deployment where neither
-  matches simply gets no exclusion, i.e. the pre-fix behaviour.
+  Is `node_key` the node a lease `owner` string (`"<node_key>#<incarnation>"`) names? Pure. An
+  exact comparison: the owner carries the same key the replication endpoints are named by
+  (expert review 2026-10-15 #17; before it carried `node()` and this only matched where NODE_KEY
+  happened to equal the node name or its host part).
   """
   @spec previous_owner?(String.t() | nil, String.t()) :: boolean()
-  def previous_owner?(owner, key) when is_binary(owner) do
-    [name | _] = String.split(owner, "#", parts: 2)
-    name != "" and (name == key or List.last(String.split(name, "@", parts: 2)) == key)
-  end
+  def previous_owner?(owner, key) when is_binary(owner) and is_binary(key),
+    do: Fathom.Rebalancer.owner_node_key(owner) == key
 
   def previous_owner?(_owner, _key), do: false
 

@@ -76,14 +76,16 @@ defmodule Fathom.Shard.Heartbeat do
 
   @doc """
   This node's heartbeat owner string (matches the shard lease `owner`):
-  `node()#<boot nonce>` (expert review #6). The incarnation nonce makes lease
+  `<node_key>#<boot nonce>` (expert review #6; the key — `Fathom.Rebalancer.node_key/0`, NODE_KEY
+  or `node()` — rather than `node()` itself, expert review 2026-10-15 #17: the LB, rebalancer and
+  command channel address nodes by it, and a consumer that RPCs needs `node()` separately). The incarnation nonce makes lease
   ownership boot-scoped — a lock held by a PREVIOUS incarnation of this node name
   is a foreign owner, so it goes through the liveness check and the epoch-bumping
   steal path instead of the silent same-owner/same-epoch reclaim, and a lingering
   same-name zombie (a replaced pod still S3-reachable) renews its OWN per-
   incarnation heartbeat object rather than sharing ours.
   """
-  def owner, do: "#{node()}##{incarnation()}"
+  def owner, do: "#{Fathom.Rebalancer.node_key()}##{incarnation()}"
 
   @doc false
   # The boot nonce, set by Fathom.Application.start before the tree (race-free).

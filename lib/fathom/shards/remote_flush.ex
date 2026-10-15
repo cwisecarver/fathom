@@ -19,10 +19,10 @@ defmodule Fathom.Shards.RemoteFlush do
       poller is off fleet-wide, the holder's heartbeat is not live, the command failed or timed out,
       the lease probe itself failed — is `{:error, :remote_holder_unflushed}`. Never `:ok`.
 
-  Like the migration drain this addresses the node NAME parsed from the lease owner
-  (`"<node>#<incarnation>"`); `Fathom.Rebalancer.CommandPoller` claims commands for both its
-  `:node_key` and its `node()`, so a deployment overriding `:node_key` still reaches the holder
-  (rig 2026-10-14 B2 — before that it waited the full timeout and errored).
+  Like the migration drain this addresses the node KEY parsed from the lease owner
+  (`"<node_key>#<incarnation>"`), which is what `Fathom.Rebalancer.CommandPoller` claims commands
+  for (expert review 2026-10-15 #17; rig 2026-10-14 B2 had worked around the owner carrying
+  `node()` by claiming under both names).
   """
   alias Fathom.Rebalancer.Commands
   alias Fathom.Shard.Storage
@@ -64,12 +64,12 @@ defmodule Fathom.Shards.RemoteFlush do
     end
   end
 
-  # A migrator's owner is "migrator@…" and our own node's is "<this node>#<incarnation>": no
+  # A migrator's owner is "migrator@…" and our own node's is "<this node_key>#<incarnation>": no
   # coordinator on another node to ask.
   defp remote_node(owner) do
     with false <- String.starts_with?(owner, "migrator@"),
-         [node_name, _incarnation] <- String.split(owner, "#", parts: 2),
-         true <- node_name != "" and node_name != to_string(node()) do
+         node_name when is_binary(node_name) <- Fathom.Rebalancer.owner_node_key(owner),
+         true <- node_name != Fathom.Rebalancer.node_key() do
       {:ok, node_name}
     else
       _ -> :local

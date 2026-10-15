@@ -296,10 +296,13 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
   end
 
   describe "previous_owner?/2" do
-    test "matches the node name before the incarnation, or the host part of name@host" do
+    # Expert review 2026-10-15 #17: the owner carries NODE_KEY, so the match is exact. The old
+    # host-part-of-name@host leniency (which asserted "fathom@fathom1#.." matches "fathom1") only
+    # existed to paper over the owner carrying node(); it is gone, and a lookalike must not match.
+    test "matches the node key before the incarnation exactly" do
       assert Recovery.previous_owner?("fathom1#ab12", "fathom1")
-      assert Recovery.previous_owner?("fathom@fathom1#ab12", "fathom1")
-      refute Recovery.previous_owner?("fathom@fathom1#ab12", "fathom2")
+      refute Recovery.previous_owner?("fathom@fathom1#ab12", "fathom1")
+      refute Recovery.previous_owner?("fathom1#ab12", "fathom2")
       refute Recovery.previous_owner?("fathom10#ab12", "fathom1")
       refute Recovery.previous_owner?(nil, "fathom1")
       refute Recovery.previous_owner?("#ab12", "")

@@ -22,6 +22,23 @@ defmodule Fathom.Rebalancer do
   def node_key, do: to_string(Application.get_env(:fathom, :node_key) || node())
 
   @doc """
+  The node key a lease owner string names, or `nil` when it isn't a coordinator's
+  (`"<node_key>#<incarnation>"`, `Fathom.Shard.Heartbeat.owner/0`; a `migrator@…` owner has no `#`
+  nonce shape we claim). The ONE parser of that format (expert review 2026-10-15 #17): the owner
+  carries the same `node_key/0` the LB, the rebalancer and the command channel address nodes by,
+  so every consumer compares keys with keys.
+  """
+  @spec owner_node_key(String.t() | nil) :: String.t() | nil
+  def owner_node_key(owner) when is_binary(owner) do
+    case String.split(owner, "#", parts: 2) do
+      [key, _incarnation] when key != "" -> key
+      _ -> nil
+    end
+  end
+
+  def owner_node_key(_), do: nil
+
+  @doc """
   The LB backend set as `%{node_key => upstream_address}` (e.g. `%{"fathom1" =>
   "fathom1:8080"}`) — how the LB names each node. `:lb_backends`, default empty. The
   policy picks targets from its keys; the map renderer emits a pin-upstream per entry.

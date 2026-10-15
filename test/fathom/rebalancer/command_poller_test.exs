@@ -222,23 +222,22 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     assert Commands.get(cmd.id).status == "pending"
   end
 
-  # rig 2026-10-14 B2: RemoteFlush / the migration drain address the holder by its BEAM node name
-  # (the lease owner is "<node()>#inc"), but the poller only read commands for `:node_key`. With
-  # NODE_KEY != node() (the chaos rig) every such command sat pending for its full await.
-  test "a command addressed to node() is claimed even when :node_key differs", %{shard: shard} do
+  # rig 2026-10-14 B2 once made the poller claim commands under node() as well as :node_key,
+  # because the lease owner carried node(). The owner now carries the key (expert review
+  # 2026-10-15 #17, see owner_node_key_test.exs), so the poller claims the key ONLY: a command
+  # addressed to the BEAM node name when the two differ is someone else's.
+  test "with :node_key != node(), only key-addressed commands are claimed", %{shard: shard} do
     Application.put_env(:fathom, :node_key, "fathom-keyed-#{System.unique_integer([:positive])}")
     on_exit(fn -> Application.delete_env(:fathom, :node_key) end)
     refute Rebalancer.node_key() == to_string(node())
 
     {:ok, by_name} = Commands.issue(shard, to_string(node()), "flush")
     {:ok, by_key} = Commands.issue(shard, Rebalancer.node_key(), "flush")
-    {:ok, other} = Commands.issue(shard, "some_other_node", "flush")
     start_supervised!(CommandPoller)
 
-    assert CommandPoller.poll_now() == 2
-    assert Commands.get(by_name.id).status == "done"
+    assert CommandPoller.poll_now() == 1
     assert Commands.get(by_key.id).status == "done"
-    assert Commands.get(other.id).status == "pending"
+    assert Commands.get(by_name.id).status == "pending"
   end
 
   test "a crashing telemetry handler never wedges a command's completion (#8)", %{node: node} do

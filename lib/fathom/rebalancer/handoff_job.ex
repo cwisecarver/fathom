@@ -158,19 +158,12 @@ defmodule Fathom.Rebalancer.HandoffJob do
     :exit, _ -> false
   end
 
-  # A lease owner is `Heartbeat.owner/0` — `"#{node()}##{incarnation}"` — so this compares the node
-  # PREFIX rather than the whole string, anchored at the separator so `"node1"` cannot match
-  # `"node10#abc"`.
-  #
-  # KNOWN LIMIT, and it fails in the safe direction: the handoff's `to`/`from` are
-  # `Rebalancer.node_key/0`, which is `:node_key || node()`, while the lease owner is built from
-  # `node()` alone. On a deployment that SETS `:node_key` to something other than the node name the
-  # two never match, this returns false, and the job reverts exactly as it did before — no new
-  # hazard, just no benefit there. (`docs/configuration.md` describes `NODE_KEY` as covering the
-  # "heartbeat object", which `Heartbeat.owner/0` does not currently honour; that drift is worth a
-  # look on its own and is deliberately not chased here.)
+  # A lease owner is `Heartbeat.owner/0` = "<node_key>#<incarnation>" and the handoff's `to`/`from`
+  # are `Rebalancer.node_key/0`, so this is an exact key comparison (anchored: "node1" never
+  # matches "node10#abc"). Before expert review 2026-10-15 #17 the owner carried `node()`, so with
+  # NODE_KEY != node() it never matched and a handoff that DID land was reverted (tenant 503s).
   defp owner_is_node?(owner, node_key) when is_binary(owner) and is_binary(node_key),
-    do: owner == node_key or String.starts_with?(owner, node_key <> "#")
+    do: Fathom.Rebalancer.owner_node_key(owner) == node_key
 
   defp owner_is_node?(_, _), do: false
 
