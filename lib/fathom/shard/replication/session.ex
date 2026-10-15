@@ -324,7 +324,17 @@ defmodule Fathom.Shard.Replication.Session do
        catchup_at: 0,
        # Consecutive catch-up rounds that were ALSO refused. Drives the backoff in
        # `retry_delay_ms/2`; reset by any commit that comes back with no rejects.
-       catchup_fails: 0
+       catchup_fails: 0,
+       # CHECKPOINT OWNERSHIP (expert review 2026-10-15 #1) — see "Checkpoints of a replicated WAL"
+       # below. `registered` is the `.db` path this Session told the extension's commit hook to
+       # leave alone (nil until the first commit); `last_header` the most recent WAL header any
+       # read in THIS call returned; `seen` the furthest commit extent this Session has read in
+       # each of the last few WAL generations, as `[{wal_gen, salt1, extent}]`, newest first;
+       # `ckpt_at` the `{salt1, extent}` of the last checkpoint attempt, for rate limiting.
+       registered: nil,
+       last_header: nil,
+       seen: [],
+       ckpt_at: nil
      }}
   end
 
@@ -334,7 +344,40 @@ defmodule Fathom.Shard.Replication.Session do
   # `nil::64` inside a `Task.start`, which swallows it, and the only symptom was followers that
   # were never seeded. Nesting keeps the epoch-bearing state in scope where it is used.
   @impl true
-  def handle_call({:commit, wal_path}, _from, state) do
+  def handle_call({:commit, wal_path}, from, state),
+    do: handle_call({:commit, wal_path, :checkpoint}, from, state)
+
+  # `mode` is `:checkpoint` for a tenant's commit and `:no_checkpoint` for the idle catch-up retry.
+  # A checkpoint opens connections on the shard's files, which is only safe while a stream holds a
+  # checked-out connection (so the coordinator cannot be dropping or unlinking those files); a
+  # tenant's commit always does, the catch-up timer never does.
+  def handle_call({:commit, wal_path, mode}, _from, state) do
+    started = System.monotonic_time(:millisecond)
+    state = ensure_registered(state, wal_path)
+    {pin, state} = if mode == :checkpoint, do: maybe_pin(state, wal_path), else: {nil, state}
+    {:reply, reply, state} = do_commit(wal_path, state)
+
+    # The checkpoint runs BEFORE the reply (the caller's checked-out connection is what makes the
+    # pin's own close safe — see `with_pin/2`), so it must not push the reply past the caller's
+    # call timeout. A commit that has already used half its budget leaves it to the next commit,
+    # which is due again because the attempt mark is cleared.
+    {pin, state} =
+      if pin && System.monotonic_time(:millisecond) - started > div(commit_deadline_budget(), 2) do
+        release_pin(pin)
+        {nil, %{state | ckpt_at: nil}}
+      else
+        {pin, state}
+      end
+
+    {:reply, reply, finish_checkpoint(state, pin, wal_path)}
+  end
+
+  # Whether quorum-acked replicas hold everything up to `header` — the question the coordinator's
+  # flush asks before it checkpoints (`checkpoint_after_snapshot/2`).
+  def handle_call({:covers, header}, _from, state),
+    do: {:reply, covered?(state, header), state}
+
+  defp do_commit(wal_path, state) do
     # One deadline for the whole call, taken before any work: a seed wait that reset the clock
     # could outlive the caller's `GenServer.call` timeout, and a reply nobody is waiting for is
     # worse than a late failure — the caller has already given up and the tenant already has an
@@ -511,7 +554,11 @@ defmodule Fathom.Shard.Replication.Session do
 
   def handle_info(:catch_up, %{commits: n, catchup_at: n} = state) do
     {:reply, _discarded, state} =
-      handle_call({:commit, state.wal_path}, {self(), make_ref()}, %{state | catchup_ref: nil})
+      handle_call(
+        {:commit, state.wal_path, :no_checkpoint},
+        {self(), make_ref()},
+        %{state | catchup_ref: nil}
+      )
 
     {:noreply, state}
   end
@@ -560,12 +607,12 @@ defmodule Fathom.Shard.Replication.Session do
     # process dies, but closing explicitly keeps the fd's lifetime tied to the session's rather
     # than to GC — at a million shards an fd per open session is not a rounding error.
     _ = Wal.close_held(Map.get(state, :wal_fd))
-    :ok
+    unregister(state)
   end
 
   def terminate(_reason, state) do
     _ = Wal.close_held(Map.get(state, :wal_fd))
-    :ok
+    unregister(state)
   end
 
   # A reply cannot exist before the commit that provoked it, so `wal_path` is always set by the time
@@ -803,7 +850,7 @@ defmodule Fathom.Shard.Replication.Session do
   defp ship(state, wal_path, epoch, deadline, seen, first?) do
     case Wal.read_held(state.wal_fd, wal_path) do
       {:ok, header, fd} ->
-        state = %{state | wal_fd: fd}
+        state = %{state | wal_fd: fd} |> note_header(header)
 
         case ship_planned(state, wal_path, epoch, header) do
           # Nothing left to plan. On the first round that means the commit wrote no frames; on a
@@ -1068,14 +1115,30 @@ defmodule Fathom.Shard.Replication.Session do
   # session has no record of any follower and always states 0, so an ownership change is now
   # detected by the follower itself (`FollowerLog.reseed?/2`) and answered with a seed request.
   # A single follower short WITHIN one ownership is still unstated — the remaining limitation.
+  #
+  # AND THE SESSION'S OWN READS (expert review 2026-10-15 #1). Every commit extent this Session has
+  # READ in that generation is evidence too: those frames were committed, so a follower short of
+  # them is short whether or not any peer received them. This is what catches the frames a
+  # checkpoint can still erase after the Session read them but before a quorum held them — commits
+  # that failed their quorum and were then folded away by the close-time checkpoint, or by the
+  # forced checkpoint at the WAL cap (`finish_checkpoint/3`). Frames the Session never read are the
+  # case this CANNOT see, which is why checkpoints of a replicated WAL are pinned instead.
   defp outgoing_extent(state, shipper) do
     case Map.get(state.followers, shipper) do
       %{wal_gen: gen, salt1: salt, offset: own} when is_integer(own) ->
-        state.followers
-        |> Map.values()
-        |> Enum.filter(&match?(%{wal_gen: ^gen, salt1: ^salt, offset: o} when is_integer(o), &1))
-        |> Enum.map(& &1.offset)
-        |> Enum.max(fn -> own end)
+        peers =
+          state.followers
+          |> Map.values()
+          |> Enum.filter(
+            &match?(%{wal_gen: ^gen, salt1: ^salt, offset: o} when is_integer(o), &1)
+          )
+          |> Enum.map(& &1.offset)
+          |> Enum.max(fn -> own end)
+
+        case Enum.find(state.seen, &match?({^gen, ^salt, _}, &1)) do
+          {_, _, read} -> max(peers, read)
+          nil -> peers
+        end
 
       _ ->
         0
@@ -1206,6 +1269,320 @@ defmodule Fathom.Shard.Replication.Session do
   defp read_failed(state, reason) do
     Logger.warning("replication read failed for #{state.shard_id}: #{inspect(reason)}")
     {:error, reason}
+  end
+
+  # ------------------------------------------------------------------------------------------
+  # Checkpoints of a replicated WAL (expert review 2026-10-15 #1)
+  # ------------------------------------------------------------------------------------------
+  #
+  # THE BUG. A stream commits, THEN calls `commit/3`, which reads the WAL itself. A checkpoint in
+  # between that backfills every frame lets the next writer on another stream RESTART the log in
+  # place, and the commit's frames are gone before this Session ever reads them. The Session then
+  # sees a new generation, plans a reset carrying only the new frames, and the followers ack it —
+  # the first commit is acked quorum-durable and exists on no replica, and the frames after it sit
+  # on a base that lacks it. (`replication_unshipped_checkpoint_test.exs` reproduces it.)
+  #
+  # THE RULE (`docs/a2-quorum-replication.md`): checkpoint only what the write quorum has acked.
+  #
+  # THE MECHANISM IS SQLITE'S OWN READ MARKS, not a watermark the checkpoint consults. A watermark
+  # check is a time-of-check race — a commit landing between "everything is shipped" and the
+  # checkpoint is backfilled with the rest. A held read snapshot instead BOUNDS the checkpoint inside
+  # SQLite: a PASSIVE checkpoint never backfills past the oldest reader's mark (a reader on mark 0
+  # blocks backfill altogether), and the log restarts only once everything is backfilled. So:
+  #
+  #   1. take a read snapshot P (the "pin") FIRST;
+  #   2. read the WAL header AFTER it — its extent E covers everything committed before P;
+  #   3. checkpoint only if a quorum holds E, and only while still pinned. The backfill then stops
+  #      at or before P <= E, every backfilled frame is quorum-held, and a restart (which needs all
+  #      frames backfilled) can only discard quorum-held frames.
+  #
+  # Every checkpoint of a replicated WAL that fathom runs while streams are live goes through that:
+  #
+  #   * the 4000-frame commit hook (`native/fathom_udf/src/wal.rs`) STEPS ASIDE for a file this
+  #     Session registered (`ensure_registered/2`), and this Session takes its place at the same
+  #     threshold, pinning BEFORE the commit's ship and checkpointing after it (`maybe_pin/2`,
+  #     `finish_checkpoint/3`) — so it pays the open only on a commit that crosses the threshold;
+  #   * the coordinator's post-snapshot PASSIVE (`Fathom.Shard.do_snapshot/3`) calls
+  #     `checkpoint_after_snapshot/2`, which pins and asks this Session `{:covers, header}`;
+  #   * a tenant's own `PRAGMA wal_checkpoint` is refused on a registered file by the extension's
+  #     authorizer (`pragma_guard.rs`).
+  #
+  # NOT covered, deliberately: the close-time checkpoint of the LAST connection and the drop path's
+  # TRUNCATE. Both run only with no stream checked out, i.e. after every commit's `commit/3` has
+  # returned — so the only unshipped frames they can erase belong to commits that already FAILED
+  # their quorum (a 503). Those frames were read by this Session, and `outgoing_extent/2` now
+  # counts what the Session read, so a follower missing them is marked short at the reset and
+  # re-seeded rather than laundered complete. Also not covered: a node with the extension NOT
+  # loaded, where SQLite's built-in autocheckpoint owns the slot (the extension ships with fathom).
+  #
+  # THE BOUND. A skipped checkpoint must not grow the WAL forever. Under a healthy quorum the pinned
+  # checkpoint is covered as soon as the commit that triggered it ships, so it runs every
+  # `checkpoint_step_bytes/0` past the threshold exactly as often as the hook did. Under a quorum
+  # that keeps failing nothing ships, so past `checkpoint_force_bytes/0` the checkpoint runs
+  # anyway — still pinned, so it backfills only frames this Session has READ, which the
+  # `outgoing_extent/2` rule above turns into a re-seed of every follower that lacks them. That is
+  # the chosen trade: availability of the local WAL bound over keeping replicas incrementally
+  # current through an outage that is already failing every write.
+  #
+  # COST per commit: two map updates (`note_header/2`) and an integer comparison (`checkpoint_due?/1`).
+  # A commit that crosses the threshold additionally opens two connections (~0.4 ms each) and runs
+  # the PASSIVE checkpoint the hook used to run inline — on this Session, so the shard's other
+  # streams' ships wait behind it rather than only the committing stream.
+
+  @frame_bytes 4096 + 24
+  @default_checkpoint_bytes 4000 * @frame_bytes
+  @default_checkpoint_step_bytes 1000 * @frame_bytes
+  @seen_generations 4
+
+  # The hook's 4000-frame threshold at the default 4 KiB page, in bytes because the header is.
+  defp checkpoint_bytes,
+    do: Application.get_env(:fathom, :replication_checkpoint_bytes, @default_checkpoint_bytes)
+
+  # How much further a WAL must grow before a skipped or ineffective attempt is retried.
+  defp checkpoint_step_bytes,
+    do:
+      Application.get_env(
+        :fathom,
+        :replication_checkpoint_step_bytes,
+        @default_checkpoint_step_bytes
+      )
+
+  # Past this, an uncovered checkpoint runs anyway (see THE BOUND above).
+  defp checkpoint_force_bytes,
+    do: Application.get_env(:fathom, :replication_checkpoint_force_bytes, 4 * checkpoint_bytes())
+
+  @doc """
+  The coordinator's post-snapshot checkpoint, on the flush's own connection `conn`.
+
+  Replication off (or no shard id): the unconditional `PRAGMA wal_checkpoint(PASSIVE)` it always
+  was. Replication on: pinned and gated on the quorum holding the WAL — see "Checkpoints of a
+  replicated WAL" above. Never raises; a skipped checkpoint is retried at the next flush.
+  """
+  @spec checkpoint_after_snapshot(reference(), String.t() | nil) ::
+          {:ok, map()} | {:error, term()} | :skipped
+  def checkpoint_after_snapshot(conn, shard_id) do
+    if is_binary(shard_id) and enabled?() do
+      case lookup(shard_id) do
+        # No Session: nothing has shipped for this shard under this coordinator, and the extension
+        # hook has not been told to step aside, so there is nothing to gate on. Skipping is the safe
+        # direction; the WAL stays bounded by the hook and the idle close.
+        nil -> :skipped
+        pid -> pinned_flush_checkpoint(conn, pid, Fathom.Shard.db_path(shard_id))
+      end
+    else
+      Connection.query(conn, "PRAGMA wal_checkpoint(PASSIVE)", [])
+    end
+  end
+
+  defp lookup(shard_id) do
+    case Registry.lookup(@registry, shard_id) do
+      [{pid, _}] -> pid
+      [] -> nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp pinned_flush_checkpoint(conn, session, db_path) do
+    with_pin(db_path, fn ->
+      with {:ok, %{} = header} <- Wal.read(db_path <> "-wal"),
+           true <- GenServer.call(session, {:covers, header}, 1_000) do
+        Connection.query(conn, "PRAGMA wal_checkpoint(PASSIVE)", [])
+      else
+        _ -> :skipped
+      end
+    end)
+  catch
+    :exit, _ -> :skipped
+  end
+
+  # Holds a read snapshot on `db_path` around `fun`. The pin's connection is closed only after
+  # `fun` returns, and every caller holds another connection to the same file across it (a stream's,
+  # or the flush's), so this close is never the LAST one — the close that runs SQLite's close-time
+  # checkpoint and unlinks the WAL.
+  defp with_pin(db_path, fun) do
+    case open_pin(db_path) do
+      {:ok, pin} ->
+        try do
+          fun.()
+        after
+          release_pin(pin)
+        end
+
+      _ ->
+        :skipped
+    end
+  end
+
+  defp open_pin(db_path) do
+    with {:ok, _} <- File.stat(db_path),
+         {:ok, conn} <- Connection.open(db_path, scope: :ro) do
+      case pin_snapshot(conn) do
+        :ok ->
+          {:ok, conn}
+
+        {:error, reason} ->
+          Connection.close(conn)
+          {:error, reason}
+      end
+    end
+  end
+
+  defp release_pin(conn) do
+    _ = Connection.rollback_if_open(conn)
+    Connection.close(conn)
+  end
+
+  # Tell the extension's commit hook to leave this WAL to us. Once per Session, on its first commit
+  # (a stream is checked out, but nothing here touches the shard's files: the registry is
+  # process-wide, reached through a private in-memory connection).
+  defp ensure_registered(%{registered: nil} = state, wal_path) do
+    db_path = String.replace_suffix(wal_path, "-wal", "")
+
+    case wal_registry(db_path, 1) do
+      :ok -> %{state | registered: db_path}
+      _ -> state
+    end
+  end
+
+  defp ensure_registered(state, _wal_path), do: state
+
+  # A Session KILLED (no `terminate/2`) leaves its registration behind: that file's WAL is then
+  # checkpointed only by its next Session (which registers and later releases its own) and the idle
+  # close — never unbounded, and on a fleet with replication on, the state it should be in anyway.
+  defp unregister(%{registered: path}) when is_binary(path) do
+    _ = wal_registry(path, -1)
+    :ok
+  end
+
+  defp unregister(_state), do: :ok
+
+  defp wal_registry(db_path, delta) do
+    with {:ok, conn} <- Exqlite.Sqlite3.open(":memory:") do
+      try do
+        case Fathom.Shard.Extension.load(conn) do
+          :ok -> registry_call(conn, db_path, delta)
+          other -> other
+        end
+      after
+        Exqlite.Sqlite3.close(conn)
+      end
+    end
+  rescue
+    e -> {:error, e}
+  end
+
+  defp registry_call(conn, db_path, delta) do
+    with {:ok, stmt} <- Exqlite.Sqlite3.prepare(conn, "SELECT fathom_wal_replicated(?1, ?2)") do
+      try do
+        with :ok <- Exqlite.Sqlite3.bind(stmt, [db_path, delta]),
+             {:row, _} <- Exqlite.Sqlite3.step(conn, stmt) do
+          :ok
+        else
+          other -> {:error, other}
+        end
+      after
+        Exqlite.Sqlite3.release(conn, stmt)
+      end
+    end
+  end
+
+  # Every header a ship reads: the latest one (for the checkpoint decision) and the furthest extent
+  # read per generation (for `outgoing_extent/2`).
+  defp note_header(state, %{ckpt_seq: gen, salt1: salt, commit_extent: extent} = header) do
+    seen =
+      case state.seen do
+        [{^gen, ^salt, x} | rest] -> [{gen, salt, max(x, extent)} | rest]
+        seen -> Enum.take([{gen, salt, extent} | seen], @seen_generations)
+      end
+
+    %{state | last_header: header, seen: seen}
+  end
+
+  defp note_header(state, _empty), do: state
+
+  defp checkpoint_due?(%{last_header: %{commit_extent: e, salt1: s}, ckpt_at: at}) do
+    e >= checkpoint_bytes() and
+      case at do
+        {^s, last} -> e >= last + checkpoint_step_bytes()
+        _ -> true
+      end
+  end
+
+  defp checkpoint_due?(_state), do: false
+
+  # Pin BEFORE this commit's ship reads the header (step 1 above). `last_header` is cleared so the
+  # decision after the ship uses only a header read under the pin.
+  defp maybe_pin(state, wal_path) do
+    if checkpoint_due?(state) do
+      %{salt1: s, commit_extent: e} = state.last_header
+      state = %{state | ckpt_at: {s, e}, last_header: nil}
+
+      case open_pin(String.replace_suffix(wal_path, "-wal", "")) do
+        {:ok, pin} -> {pin, state}
+        _ -> {nil, state}
+      end
+    else
+      {nil, state}
+    end
+  end
+
+  defp finish_checkpoint(state, nil, _wal_path), do: state
+
+  defp finish_checkpoint(state, pin, wal_path) do
+    case state.last_header do
+      %{commit_extent: e} = header ->
+        cond do
+          covered?(state, header) ->
+            checkpoint(wal_path)
+
+          e >= checkpoint_force_bytes() ->
+            Logger.warning(
+              "shard #{state.shard_id}: WAL at #{e} bytes with frames no quorum holds; " <>
+                "checkpointing anyway, followers missing them will be re-seeded"
+            )
+
+            checkpoint(wal_path)
+
+          true ->
+            :skipped
+        end
+
+      nil ->
+        :skipped
+    end
+
+    state
+  after
+    release_pin(pin)
+  end
+
+  # The checkpoint runs on a connection of its own: SQLite refuses a checkpoint on a connection
+  # with an open transaction, and the pin is one.
+  defp checkpoint(wal_path) do
+    with {:ok, conn} <- Connection.open(String.replace_suffix(wal_path, "-wal", "")) do
+      try do
+        Connection.query(conn, "PRAGMA wal_checkpoint(PASSIVE)", [])
+      after
+        Connection.close(conn)
+      end
+    end
+  end
+
+  # Does a write quorum of followers hold everything up to `header`'s commit extent, in its
+  # generation? Read from the per-follower ack positions, so it means exactly "acked".
+  defp covered?(_state, :empty), do: true
+
+  defp covered?(state, %{ckpt_seq: gen, salt1: salt, commit_extent: extent}) do
+    held =
+      for %{wal_gen: ^gen, salt1: ^salt, offset: o} <- Map.values(state.followers),
+          is_integer(o),
+          do: o
+
+    case Enum.at(Enum.sort(held, :desc), quorum() - 1) do
+      nil -> false
+      o -> o >= extent
+    end
   end
 
   # ------------------------------------------------------------------------------------------

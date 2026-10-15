@@ -23,29 +23,41 @@
 //! (the WAL still truncates) rather than only the positive (the hook fired) — the failure mode is
 //! silent and slow, so a test that only proved the hook ran would pass either way.
 //!
-//! # What changes when A2 lands
+//! # What changed when A2 landed (expert review 2026-10-15 #1)
 //!
-//! A checkpoint **truncates the WAL**, which destroys frames that have not shipped yet. So the
-//! A2 rule is *checkpoint only what the write quorum has already acked*, making truncation a
-//! downstream consequence of replication progress rather than a page-count timer. The
-//! `AUTOCHECKPOINT_PAGES` branch below is the pre-A2 stand-in for exactly that decision.
+//! A checkpoint backfills the WAL into the `.db`, and once EVERYTHING is backfilled the next writer
+//! RESTARTS the log in place (new salt, offset 0) — destroying frames A2 may not have shipped yet.
+//! A stream commits first and calls `Session.commit` second, so a checkpoint landing between the
+//! two erased a commit that was then acked quorum-durable while no replica held it.
+//!
+//! For a WAL under replication the rule is now *checkpoint only what the write quorum has already
+//! acked*, enforced in Elixir (`Fathom.Shard.Replication.Session`), which runs every checkpoint of
+//! a replicated WAL behind a pinned read snapshot no newer than the quorum's extent. This hook's
+//! part is to STEP ASIDE for such a WAL: `fathom_wal_replicated(path, delta)` keeps a refcounted
+//! set of replicated database files, and `on_commit` skips its checkpoint for any file in it. Every
+//! other database — replication off, a migrator's scratch file, a test path — keeps the 4000-frame
+//! PASSIVE checkpoint exactly as before.
+//!
+//! The set is consulted only when a commit crosses the threshold, so a commit below it pays nothing
+//! new. `pragma_guard` also reads it, to refuse a tenant's own `PRAGMA wal_checkpoint` on a
+//! replicated file, and it denies tenant handles the registration function itself.
 
-use std::os::raw::c_int;
+use std::collections::HashMap;
+use std::ffi::{c_void, CStr};
+use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
-use rusqlite::functions::FunctionFlags;
-use rusqlite::hooks::{CheckpointMode, Wal};
-use rusqlite::{Connection, Result};
+use rusqlite::functions::{Context, FunctionFlags};
+use rusqlite::{ffi, Connection, Error, Result};
 
 /// Commits observed since process start, across every connection in this OS process.
 ///
-/// Process-global rather than per-shard because `Connection::wal_hook` takes a bare `fn` pointer,
-/// not a closure — there is nowhere to hang per-connection state, and `Wal` exposes only the
-/// database *name* ("main"), never the path. Sufficient for the gate-1 proof; A2 will carry shard
-/// identity through its own channel rather than through this counter.
+/// Process-global rather than per-shard because the hook carries no per-connection state, and a
+/// probe counter is all this is. A2 carries shard identity through its own channel.
 static COMMITS: AtomicI64 = AtomicI64::new(0);
 
-/// Page count reported by the most recent commit — the number A2's shipper will act on.
+/// Page count reported by the most recent commit.
 static LAST_PAGES: AtomicI64 = AtomicI64::new(0);
 
 /// MUST track `PRAGMA wal_autocheckpoint` in `Fathom.Shard.Connection.configure/1`
@@ -53,11 +65,88 @@ static LAST_PAGES: AtomicI64 = AtomicI64::new(0);
 /// review 2026-07-24 #4 raised it deliberately, because an autocheckpoint runs INLINE inside the
 /// committing tenant's query. Changing one without the other reintroduces that stall (too low) or
 /// grows the WAL past what the coordinator's own checkpoint expects (too high).
+/// `Fathom.Shard.Replication.Session`'s replicated-WAL threshold mirrors it too.
 const AUTOCHECKPOINT_PAGES: c_int = 4000;
 
-/// Install the commit hook, and (only when probing is enabled) the read-back functions.
+/// The registration function's name, shared with `pragma_guard`'s tenant denial.
+pub const REGISTER_FN: &str = "fathom_wal_replicated";
+
+/// Database files whose WAL is under A2 replication, by canonical path, refcounted (an outgoing
+/// and an incoming Session of the same shard can briefly overlap).
+fn replicated() -> &'static Mutex<HashMap<Vec<u8>, u32>> {
+    static SET: OnceLock<Mutex<HashMap<Vec<u8>, u32>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The key a path is registered under. SQLite names a database by its full path with symlinks
+/// resolved (`unixFullPathname`), so registration resolves them the same way (`/tmp` is a symlink
+/// on macOS). A path that cannot be resolved — the file is gone — is used as given.
+fn canonical(path: &[u8]) -> Vec<u8> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    match std::fs::canonicalize(std::ffi::OsStr::from_bytes(path)) {
+        Ok(c) => c.into_os_string().into_vec(),
+        Err(_) => path.to_vec(),
+    }
+}
+
+/// Whether `filename` (SQLite's own name for the database, `sqlite3_db_filename`) is replicated.
+pub fn is_replicated(filename: &[u8]) -> bool {
+    match replicated().lock() {
+        Ok(set) => set.contains_key(filename),
+        // A poisoned lock means a panic mid-update. Fail SAFE — treat it as replicated: the worst
+        // case is a WAL the Session checkpoints instead of the hook.
+        Err(_) => true,
+    }
+}
+
+/// Whether database `schema` of connection `db` is replicated.
+///
+/// # Safety
+/// `db` must be a live connection handle and `schema` a valid NUL-terminated name (or null).
+pub unsafe fn db_is_replicated(db: *mut ffi::sqlite3, schema: *const c_char) -> bool {
+    let name = ffi::sqlite3_db_filename(db, schema);
+    if name.is_null() {
+        return false;
+    }
+    let bytes = CStr::from_ptr(name).to_bytes();
+    !bytes.is_empty() && is_replicated(bytes)
+}
+
+/// Adjust `path`'s refcount by `delta` and return the new count (0 removes it). Pure bookkeeping,
+/// separate so it is unit-testable without a connection.
+pub fn adjust(path: &[u8], delta: i64) -> i64 {
+    let key = canonical(path);
+    let Ok(mut set) = replicated().lock() else {
+        return -1;
+    };
+    let now = i64::from(set.get(&key).copied().unwrap_or(0)) + delta;
+    if now <= 0 {
+        set.remove(&key);
+        0
+    } else {
+        set.insert(key, u32::try_from(now).unwrap_or(u32::MAX));
+        now
+    }
+}
+
+/// Install the commit hook, the registration function, and (only when probing is enabled) the
+/// read-back functions.
 pub fn install(db: &Connection) -> Result<()> {
-    db.wal_hook(Some(on_commit));
+    // Registered through the raw API rather than `Connection::wal_hook`, because that wrapper hides
+    // the `sqlite3*` and the hook needs it to name the database it is about to checkpoint.
+    unsafe {
+        ffi::sqlite3_wal_hook(db.handle(), Some(on_commit), std::ptr::null_mut());
+    }
+
+    // `fathom_wal_replicated(path, delta)`. DIRECTONLY: never from a view, trigger or schema
+    // object. Tenant handles are additionally denied it by `pragma_guard`'s authorizer — a tenant
+    // able to unregister its own file would re-enable the unpinned checkpoint.
+    db.create_scalar_function(
+        REGISTER_FN,
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DIRECTONLY,
+        register,
+    )?;
 
     if probe_enabled() {
         register_probe(db)?;
@@ -66,23 +155,49 @@ pub fn install(db: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn register(ctx: &Context<'_>) -> Result<i64> {
+    let path: String = ctx.get(0)?;
+    let delta: i64 = ctx.get(1)?;
+    if path.is_empty() || !(-1..=1).contains(&delta) {
+        return Err(Error::UserFunctionError(
+            "fathom_wal_replicated: expected (path, -1 | 0 | 1)".into(),
+        ));
+    }
+    Ok(adjust(path.as_bytes(), delta))
+}
+
 /// Runs inside SQLite's commit path, on the committing tenant's thread.
 ///
 /// Two hard rules. It must not block — every microsecond here is added to a tenant's COMMIT. And
-/// it must not return `Err`: the return value propagates into the commit, so a failed checkpoint
+/// it must not return an error: the return value propagates into the commit, so a failed checkpoint
 /// must never fail the transaction that triggered it. SQLite's own autocheckpoint ignores
 /// checkpoint errors for the same reason, so swallowing here is parity, not laziness.
-fn on_commit(wal: &Wal, pages: c_int) -> Result<()> {
+///
+/// A replicated database is skipped (see the module docs): its checkpoints belong to the Session,
+/// which can prove the frames it backfills have shipped. The registry lookup runs only past the
+/// threshold, so the common commit pays two atomic stores, as before.
+unsafe extern "C" fn on_commit(
+    _arg: *mut c_void,
+    db: *mut ffi::sqlite3,
+    db_name: *const c_char,
+    pages: c_int,
+) -> c_int {
     COMMITS.fetch_add(1, Ordering::Relaxed);
     LAST_PAGES.store(i64::from(pages), Ordering::Relaxed);
 
-    if pages >= AUTOCHECKPOINT_PAGES {
+    if pages >= AUTOCHECKPOINT_PAGES && !db_is_replicated(db, db_name) {
         // PASSIVE matches what SQLite's built-in hook does: do as much as possible without
         // blocking readers or writers, and give up rather than wait.
-        let _ = wal.checkpoint_v2(CheckpointMode::PASSIVE);
+        let _ = ffi::sqlite3_wal_checkpoint_v2(
+            db,
+            db_name,
+            ffi::SQLITE_CHECKPOINT_PASSIVE,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
     }
 
-    Ok(())
+    ffi::SQLITE_OK
 }
 
 /// `FATHOM_WAL_PROBE=1`.
@@ -90,8 +205,8 @@ fn on_commit(wal: &Wal, pages: c_int) -> Result<()> {
 /// Gated OFF by default because these functions are visible to **tenant** SQL, and a
 /// process-global commit count is a co-tenancy side channel: it discloses no tenant content, but
 /// it does reveal that other tenants on this node are writing. Enabling it is a debugging choice,
-/// which is why it is not simply always on. A2 will not need it — Elixir will receive frames over
-/// a real channel, not by SELECTing a counter.
+/// which is why it is not simply always on. A2 does not need it — Elixir receives frames over a
+/// real channel, not by SELECTing a counter.
 ///
 /// Read on EVERY install rather than cached in a `OnceLock`. The cache was the first version and
 /// is untestable: `install` runs on every connection open, so the first open in the OS process
@@ -117,7 +232,7 @@ fn register_probe(db: &Connection) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Why there is no #[test] in this file
+// Why the hook itself has no #[test] here
 // ---------------------------------------------------------------------------------------------
 //
 // There CANNOT be one, and the first attempt failed in a way worth recording so nobody spends the
@@ -129,13 +244,62 @@ fn register_probe(db: &Connection) -> Result<()> {
 //     SQLite API not initialized or SQLite feature omitted
 //
 // That is why Cargo.toml says the `rlib` exists so "the in-crate unit tests can link the pure
-// logic directly" — PURE logic. `oracle.rs` and friends test formatting and parsing, which need no
-// connection. Anything connection-shaped, including this hook, is out of reach here by
-// construction.
-//
-// It is also the right outcome rather than a limitation to work around: a normal-linked Rust test
-// would prove the hook fires under a DIFFERENT linkage than the one fathom ships, which is exactly
-// the "the test double can't express the bug" trap AGENTS.md describes. The only test that proves
-// anything is one driven through exqlite → dlopen → api routines → hook.
-//
-// That test is `test/fathom/wal_hook_test.exs`.
+// logic directly" — PURE logic. The registry bookkeeping below is pure and is tested here; the
+// hook, which is connection-shaped, is out of reach by construction. Its tests are
+// `test/fathom/wal_hook_test.exs` and `test/fathom/shard/replication_unshipped_checkpoint_test.exs`,
+// driven through exqlite → dlopen → api routines → hook.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registration_is_refcounted_and_removal_is_total() {
+        let p = b"/nonexistent/fathom_wal_test_refcount.db";
+        assert!(!is_replicated(p));
+        assert_eq!(adjust(p, 1), 1);
+        assert_eq!(adjust(p, 1), 2);
+        assert!(is_replicated(p));
+        assert_eq!(adjust(p, -1), 1);
+        assert!(
+            is_replicated(p),
+            "one holder remains, so the WAL is still replicated"
+        );
+        assert_eq!(adjust(p, -1), 0);
+        assert!(!is_replicated(p));
+        // An unbalanced release never goes negative and never resurrects the entry.
+        assert_eq!(adjust(p, -1), 0);
+        assert!(!is_replicated(p));
+    }
+
+    #[test]
+    fn delta_zero_reads_the_count() {
+        let p = b"/nonexistent/fathom_wal_test_read.db";
+        assert_eq!(adjust(p, 0), 0);
+        assert_eq!(adjust(p, 1), 1);
+        assert_eq!(adjust(p, 0), 1);
+        assert_eq!(adjust(p, -1), 0);
+    }
+
+    #[test]
+    fn paths_are_keyed_by_their_resolved_form() {
+        // The registry must agree with SQLite's own (symlink-resolved) name for the file.
+        let dir = std::env::temp_dir().join(format!("fathom_wal_canon_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("x.db");
+        std::fs::write(&file, b"").unwrap();
+        let link = std::env::temp_dir().join(format!("fathom_wal_link_{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+
+        use std::os::unix::ffi::OsStrExt;
+        let via_link = link.join("x.db");
+        assert_eq!(adjust(via_link.as_os_str().as_bytes(), 1), 1);
+        let resolved = std::fs::canonicalize(&file).unwrap();
+        assert!(is_replicated(resolved.as_os_str().as_bytes()));
+        assert_eq!(adjust(resolved.as_os_str().as_bytes(), -1), 0);
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

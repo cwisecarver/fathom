@@ -4771,7 +4771,7 @@ defmodule Fathom.Shard do
       {:ok, conn} ->
         try do
           with :ok <- Integrity.run_quick_check(conn) do
-            do_snapshot(conn, temp)
+            do_snapshot(conn, temp, state.id)
           end
         after
           Connection.close(conn)
@@ -4989,7 +4989,7 @@ defmodule Fathom.Shard do
   # verify_and_snapshot/2, closes the conn, so the restored `synchronous` can't be observed from
   # there). See shard_snapshot_sync_test.exs.
   @doc false
-  def do_snapshot(conn, dest) do
+  def do_snapshot(conn, dest, shard_id \\ nil) do
     # The snapshot temp inherits this connection's safety_level (SQLite's sqlite3RunVacuum:
     # `pgflags = db->aDb[iDb].safety_level | ...`), so at synchronous=FULL every periodic flush
     # force-fsynced a full shard-sized file that `snapshot_and_upload/1` unlinks seconds later
@@ -5041,8 +5041,13 @@ defmodule Fathom.Shard do
     # normal "readers active" outcome and is ignored; the next interval retries. Runs only after
     # a successful snapshot, i.e. after this connection's read transaction has ended, which is
     # what unblocks the checkpointer in the first place.
+    #
+    # UNDER A2 IT IS PINNED AND QUORUM-GATED (expert review 2026-10-15 #1): an unconditional PASSIVE
+    # here could backfill a commit the replication Session had not shipped, and the next writer's
+    # log restart then erased it before any replica held it. With replication off this is the same
+    # unconditional PASSIVE as before. See "Checkpoints of a replicated WAL" in `Session`.
     if match?({:ok, _}, result),
-      do: Connection.query(conn, "PRAGMA wal_checkpoint(PASSIVE)", [])
+      do: Fathom.Shard.Replication.Session.checkpoint_after_snapshot(conn, shard_id)
 
     case result do
       {:ok, _} -> :ok

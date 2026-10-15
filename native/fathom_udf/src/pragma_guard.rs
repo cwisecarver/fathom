@@ -53,11 +53,13 @@
 //! ## Cost
 //!
 //! An authorizer runs at PREPARE time, once per action the statement contains (each column read,
-//! each table, ...). For every action but a PRAGMA assignment this is one integer comparison.
+//! each table, ...). For every action but a PRAGMA or a function reference this is one integer
+//! comparison; a function reference adds one name comparison (`replication_denies`).
 
 use std::collections::HashSet;
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::{c_char, c_int};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::OnceLock;
 
 use rusqlite::{ffi, Connection, Error, Result};
@@ -157,8 +159,35 @@ fn pragma_assignment_allowed(
     policy.pinned.contains(&key.to_ascii_lowercase())
 }
 
+/// The tenant-handle refusals that exist for A2 (expert review 2026-10-15 #1), as a pure decision.
+///
+/// * The registration function `fathom_wal_replicated` (see `wal.rs`): a tenant that could
+///   unregister its own file would hand its WAL back to the unpinned 4000-frame hook checkpoint.
+/// * ANY `wal_checkpoint` — PASSIVE and the bare form included, which both backfill — on a file
+///   under replication. A tenant checkpoint is exactly the unpinned checkpoint that erases frames
+///   the Session has not shipped; on a non-replicated file the existing PASSIVE-only rule stands.
+pub fn replication_denies(
+    action: c_int,
+    name: Option<&[u8]>,
+    func: Option<&[u8]>,
+    replicated: impl FnOnce() -> bool,
+) -> bool {
+    match action {
+        ffi::SQLITE_FUNCTION => {
+            matches!(func, Some(f) if f.eq_ignore_ascii_case(crate::wal::REGISTER_FN.as_bytes()))
+        }
+        ffi::SQLITE_PRAGMA => {
+            matches!(name, Some(n) if n.eq_ignore_ascii_case(b"wal_checkpoint")) && replicated()
+        }
+        _ => false,
+    }
+}
+
 struct Guard {
     policy: OnceLock<Policy>,
+    /// The connection this guard was installed on, for the replicated-file check. Set before the
+    /// authorizer is installed, so `authorize` never sees it null.
+    db: AtomicPtr<ffi::sqlite3>,
 }
 
 unsafe fn opt_bytes<'a>(p: *const c_char) -> Option<&'a [u8]> {
@@ -177,12 +206,27 @@ unsafe extern "C" fn authorize(
     arg5: *const c_char,
     _arg6: *const c_char,
 ) -> c_int {
+    // A function reference is checked for ONE name (one byte comparison per function in the
+    // statement, at prepare time); see `replication_denies`.
+    if action == ffi::SQLITE_FUNCTION {
+        return if replication_denies(action, None, opt_bytes(arg4), || false) {
+            ffi::SQLITE_DENY
+        } else {
+            ffi::SQLITE_OK
+        };
+    }
     // Every action but these three is allowed without touching the state.
     if action != ffi::SQLITE_PRAGMA && action != ffi::SQLITE_ATTACH && action != ffi::SQLITE_DETACH
     {
         return ffi::SQLITE_OK;
     }
     let guard = &*(ctx as *const Guard);
+    if replication_denies(action, opt_bytes(arg3), None, || {
+        let db = guard.db.load(Ordering::Acquire);
+        !db.is_null() && crate::wal::db_is_replicated(db, c"main".as_ptr())
+    }) {
+        return ffi::SQLITE_DENY;
+    }
     // Installed only after the policy is set, so this is always Some; deny if it somehow is not.
     let Some(policy) = guard.policy.get() else {
         return ffi::SQLITE_DENY;
@@ -243,6 +287,7 @@ unsafe extern "C" fn install_guard(
     }
 
     let db = ffi::sqlite3_context_db_handle(ctx);
+    guard.db.store(db, Ordering::Release);
     let rc = ffi::sqlite3_set_authorizer(db, Some(authorize), guard_ptr);
     if rc != ffi::SQLITE_OK {
         result_error(ctx, "fathom_pragma_guard: sqlite3_set_authorizer failed");
@@ -286,6 +331,7 @@ unsafe extern "C" fn destroy(p: *mut c_void) {
 pub fn install(db: &Connection) -> Result<()> {
     let state = Box::into_raw(Box::new(Guard {
         policy: OnceLock::new(),
+        db: AtomicPtr::new(std::ptr::null_mut()),
     }));
     let name = CString::new("fathom_pragma_guard").expect("static name");
 
@@ -419,6 +465,49 @@ mod tests {
             pragma("max_page_count", Some("1048576"), Some("main")),
             ffi::SQLITE_DENY
         );
+    }
+
+    // Expert review 2026-10-15 #1: on a REPLICATED file a tenant checkpoint is the unpinned
+    // checkpoint that erases unshipped frames, so every form is refused there — PASSIVE and the
+    // bare read included, since both backfill. A non-replicated file keeps the PASSIVE-only rule.
+    #[test]
+    fn a_replicated_file_refuses_every_tenant_checkpoint() {
+        let name = Some(&b"wal_checkpoint"[..]);
+        assert!(replication_denies(ffi::SQLITE_PRAGMA, name, None, || true));
+        assert!(replication_denies(
+            ffi::SQLITE_PRAGMA,
+            Some(&b"WAL_CHECKPOINT"[..]),
+            None,
+            || true
+        ));
+        assert!(!replication_denies(ffi::SQLITE_PRAGMA, name, None, || {
+            false
+        }));
+        // Other pragmas are not this rule's business, replicated or not.
+        assert!(!replication_denies(
+            ffi::SQLITE_PRAGMA,
+            Some(&b"foreign_keys"[..]),
+            None,
+            || true
+        ));
+    }
+
+    #[test]
+    fn the_replication_registration_function_is_denied_to_tenants() {
+        let f = Some(&b"fathom_wal_replicated"[..]);
+        assert!(replication_denies(ffi::SQLITE_FUNCTION, None, f, || false));
+        assert!(replication_denies(
+            ffi::SQLITE_FUNCTION,
+            None,
+            Some(&b"FATHOM_WAL_REPLICATED"[..]),
+            || false
+        ));
+        assert!(!replication_denies(
+            ffi::SQLITE_FUNCTION,
+            None,
+            Some(&b"django_date_extract"[..]),
+            || true
+        ));
     }
 
     #[test]
