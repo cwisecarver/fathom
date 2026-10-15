@@ -351,6 +351,12 @@ defmodule Fathom.Migrator.ShardMigration do
       try do
         with {:ok, etag} <- pull_live(dst, old),
              :ok <- Copy.migrate(old, new, head, []),
+             # The stamp above makes the label HEAD whatever the snapshot is, so the ledger is the
+             # only witness left: a snapshot taken from a template that was not at HEAD (before
+             # `retain_template_head` vetted it) would otherwise birth tenants the rollout
+             # considers converged (expert review 2026-10-15 #10). A refusal drops the dst live
+             # object (below), so the shard is born empty instead.
+             :ok <- Ledger.vet_at_head(new, head, "fork #{dst}"),
              :ok <- fence(dst, lease),
              {:ok, _new_etag, _carried} <- flush_fenced(dst, new, etag) do
           :ok

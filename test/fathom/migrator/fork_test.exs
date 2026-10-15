@@ -138,6 +138,95 @@ defmodule Fathom.Migrator.ForkTest do
     end
   end
 
+  # --- template-head must be provably HEAD (expert review 2026-10-15 #10) -----
+  #
+  # Symptom: `retain_snapshot/2` copied the template's object to `<template>@HEAD` without looking,
+  # and `stamp_fork/3` stamped `user_version = HEAD` on the copy with no ledger check. A template
+  # one version BEHIND birthed tenants the rollout considered converged that never received the
+  # missing DDL (silent); one AHEAD hit "table already exists" on approve. Invariant: a template
+  # whose ledger is not exactly HEAD is refused; releases with no ledger names pass with a warning
+  # (the tests above are exactly that case and still pass).
+
+  @v2_ledger_stmt "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0002_x', 'now')"
+  @v3_ledger_stmt "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0003_y', 'now')"
+
+  # A template whose ledger holds `names` and whose user_version is `label`.
+  defp seed_template_with!(template, names, label) do
+    seed = Path.join(System.tmp_dir!(), "seedw_#{template}.db")
+    {:ok, conn} = Connection.open(seed)
+
+    :ok =
+      Connection.exec(
+        conn,
+        "CREATE TABLE django_migrations (id INTEGER PRIMARY KEY, app TEXT, name TEXT, applied TEXT)"
+      )
+
+    for n <- names do
+      :ok =
+        Connection.exec(
+          conn,
+          "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '#{n}', 'now')"
+        )
+    end
+
+    :ok = Connection.exec(conn, "CREATE TABLE app_user (id INTEGER PRIMARY KEY, name TEXT)")
+    :ok = Connection.exec(conn, "PRAGMA user_version = #{label}")
+    :ok = Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(conn)
+    :ok = Storage.flush(template, seed)
+    for s <- ["", "-wal", "-shm"], do: File.rm(seed <> s)
+    :ok
+  end
+
+  describe "template-head vets the template's schema" do
+    test "a template exactly at HEAD (label + ledger) is retained", %{template: template} do
+      seed_template_with!(template, ["0001_initial", "0002_x"], 2)
+      {:ok, _} = Migrator.release(2, "v2", [@v2_ledger_stmt])
+
+      assert {:ok, 2} = Migrator.retain_template_head()
+      assert File.exists?(Path.join(remote_dir(), "#{template}@2.db"))
+    end
+
+    test "a template BEHIND HEAD is refused and nothing is retained", %{template: template} do
+      seed_template_with!(template, ["0001_initial"], 1)
+      {:ok, _} = Migrator.release(2, "v2", [@v2_ledger_stmt])
+
+      assert {:error, {:template_not_at_head, %{label: 1, head: 2}}} =
+               Migrator.retain_template_head()
+
+      refute File.exists?(Path.join(remote_dir(), "#{template}@2.db"))
+    end
+
+    test "a template AHEAD of HEAD (carries an N+1 ledger row) is refused", %{template: template} do
+      seed_template_with!(template, ["0001_initial", "0002_x", "0003_y"], 3)
+      {:ok, _} = Migrator.release(2, "v2", [@v2_ledger_stmt])
+      {:ok, _} = Migrator.release(3, "v3", [@v3_ledger_stmt])
+      # Walk HEAD back to 2: the template still carries v3's row.
+      Migrator.yank(3)
+
+      assert {:error, {:template_not_at_head, %{label: 3, head: 2}}} =
+               Migrator.retain_template_head()
+
+      refute File.exists?(Path.join(remote_dir(), "#{template}@2.db"))
+    end
+
+    # The fork-side check covers a snapshot retained BEFORE the vetting existed: forge it by
+    # retaining a behind template directly through storage.
+    test "a fork from a snapshot of a template that was not at HEAD is born empty, not at HEAD",
+         %{template: template} do
+      seed_template_with!(template, ["0001_initial"], 1)
+      {:ok, _} = Migrator.release(2, "v2", [@v2_ledger_stmt])
+      :ok = Storage.retain(template, 2)
+
+      tenant = new_tenant()
+
+      assert {:error, {:template_not_at_head, _}} = Migrator.fork_from_template(tenant)
+
+      # Born empty (the dst live object was dropped), never an unverified copy stamped HEAD.
+      refute File.exists?(remote_object(tenant))
+    end
+  end
+
   # --- fork_from_template/1 (the forward path) --------------------------------
 
   describe "fork_from_template/1" do

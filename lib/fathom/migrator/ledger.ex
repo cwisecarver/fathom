@@ -36,6 +36,8 @@ defmodule Fathom.Migrator.Ledger do
       machine — someone ran `migrate` against the shard directly, or bytes were restored wrong.
   """
 
+  require Logger
+
   alias Fathom.Migrator.Capture
   alias Fathom.Migrator.Release
   alias Fathom.Repo
@@ -65,16 +67,93 @@ defmodule Fathom.Migrator.Ledger do
   draft considered only releases up to the migration's target, and a shard carrying a name from a
   release beyond it read that name as unknown baseline and was migrated anyway.)
   """
-  @spec check_file(Path.t()) :: {non_neg_integer(), verdict()}
-  def check_file(path) do
+  @spec check_file(Path.t(), map() | nil) :: {non_neg_integer(), verdict()}
+  def check_file(path, facts \\ nil) do
     {:ok, conn} = Connection.open(path)
 
     try do
       label = user_version(conn)
       {present, count} = shard_ledger(conn)
-      {label, classify(label, present, count, release_facts())}
+      {label, classify(label, present, count, facts || release_facts())}
     after
       Connection.close(conn)
+    end
+  end
+
+  @doc """
+  Is the SQLite file at `path` provably at fleet version `head`? Used to vet a TEMPLATE before it is
+  snapshotted as `template@HEAD` (expert review 2026-10-15 #10): that snapshot, and every fork born
+  from it, used to be stamped HEAD without looking, so a template one version behind birthed tenants
+  the rollout considered converged that never received the missing DDL, and one ahead hit "table
+  already exists" on approve.
+
+    * `:ok` — `PRAGMA user_version` is `head` and the ledger is exactly head's.
+    * `{:unverified, label}` — not provably wrong, but HEAD's release carries no bookkeeping names
+      (hand-authored, or pre-capture), so the ledger is no evidence either way. The caller proceeds
+      with a warning (default D6).
+    * `{:mismatch, detail}` — the label is above `head`, or the ledger disagrees with the label, or
+      names the file as something other than `head`: the caller refuses.
+  """
+  @spec check_at_head(Path.t(), pos_integer()) ::
+          :ok | {:unverified, non_neg_integer()} | {:mismatch, map()}
+  def check_at_head(path, head) do
+    facts = release_facts()
+
+    named? =
+      case facts do
+        %{^head => %{names: names}} -> MapSet.size(names) > 0
+        _ -> false
+      end
+
+    case check_file(path, facts) do
+      {^head, :ok} -> if named?, do: :ok, else: {:unverified, head}
+      {label, :ok} when label < head and not named? -> {:unverified, label}
+      {label, verdict} -> {:mismatch, %{label: label, head: head, verdict: verdict}}
+    end
+  end
+
+  @doc """
+  `check_at_head/2` with the policy applied: `:ok` to proceed (logging a warning when the file is
+  unverifiable, or when `:migration_ledger_check` is `:warn`), `{:error, {:template_not_at_head,
+  detail}}` to refuse. `:migration_ledger_check` `:off` skips the check entirely, as it does for the
+  migrator. `what` names the artifact in the log line.
+  """
+  @spec vet_at_head(Path.t(), pos_integer(), String.t()) ::
+          :ok | {:error, {:template_not_at_head, map()}}
+  def vet_at_head(path, head, what) do
+    mode = Application.get_env(:fathom, :migration_ledger_check, :enforce)
+
+    if mode == :off do
+      :ok
+    else
+      case check_at_head(path, head) do
+        :ok ->
+          :ok
+
+        {:unverified, label} ->
+          Logger.warning(
+            "#{what}: cannot verify the schema is at v#{head} (user_version #{label}; v#{head}'s " <>
+              "release carries no django_migrations names, so the ledger is no evidence); proceeding"
+          )
+
+          :ok
+
+        {:mismatch, detail} when mode == :warn ->
+          Logger.warning(
+            "#{what}: schema is NOT provably at v#{head} (#{inspect(detail)}); proceeding because " <>
+              ":migration_ledger_check is :warn"
+          )
+
+          :ok
+
+        {:mismatch, detail} ->
+          Logger.error(
+            "#{what}: refusing — the schema is not at v#{head} (#{inspect(detail)}). Migrate the " <>
+              "template to HEAD (or fix its ledger) first."
+          )
+
+          {:error, {:template_not_at_head, detail}}
+      end
     end
   end
 

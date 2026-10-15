@@ -1141,11 +1141,36 @@ defmodule Fathom.Migrator do
   end
 
   defp retain_snapshot(template, head) do
-    case Fathom.Shard.Storage.retain(template, head) do
-      :ok -> {:ok, head}
-      # No stored object for the template at all (never flushed): nothing to snapshot.
-      {:error, :enoent} -> {:error, :no_template_object}
-      {:error, reason} -> {:error, reason}
+    # VET BEFORE LABELLING (expert review 2026-10-15 #10): `retain/2` copies whatever the template's
+    # object is to `<template>@<head>` without looking, and every fork born from it is then stamped
+    # HEAD. Pull the object and require its schema to be provably HEAD (`Ledger.vet_at_head/3`).
+    # The drain + free lease above keep the object still between this read and the copy.
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "tmplhead_#{template}_#{System.unique_integer([:positive])}.db"
+      )
+
+    try do
+      case Fathom.Shard.Storage.pull(template, tmp) do
+        {:ok, _etag} ->
+          with :ok <- Fathom.Migrator.Ledger.vet_at_head(tmp, head, "template #{template}") do
+            case Fathom.Shard.Storage.retain(template, head) do
+              :ok -> {:ok, head}
+              {:error, :enoent} -> {:error, :no_template_object}
+              {:error, reason} -> {:error, reason}
+            end
+          end
+
+        # No stored object for the template at all (never flushed): nothing to snapshot.
+        {:absent, _} ->
+          {:error, :no_template_object}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    after
+      for s <- ["", "-wal", "-shm"], do: File.rm(tmp <> s)
     end
   end
 
