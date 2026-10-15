@@ -222,6 +222,25 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     assert Commands.get(cmd.id).status == "pending"
   end
 
+  # rig 2026-10-14 B2: RemoteFlush / the migration drain address the holder by its BEAM node name
+  # (the lease owner is "<node()>#inc"), but the poller only read commands for `:node_key`. With
+  # NODE_KEY != node() (the chaos rig) every such command sat pending for its full await.
+  test "a command addressed to node() is claimed even when :node_key differs", %{shard: shard} do
+    Application.put_env(:fathom, :node_key, "fathom-keyed-#{System.unique_integer([:positive])}")
+    on_exit(fn -> Application.delete_env(:fathom, :node_key) end)
+    refute Rebalancer.node_key() == to_string(node())
+
+    {:ok, by_name} = Commands.issue(shard, to_string(node()), "flush")
+    {:ok, by_key} = Commands.issue(shard, Rebalancer.node_key(), "flush")
+    {:ok, other} = Commands.issue(shard, "some_other_node", "flush")
+    start_supervised!(CommandPoller)
+
+    assert CommandPoller.poll_now() == 2
+    assert Commands.get(by_name.id).status == "done"
+    assert Commands.get(by_key.id).status == "done"
+    assert Commands.get(other.id).status == "pending"
+  end
+
   test "a crashing telemetry handler never wedges a command's completion (#8)", %{node: node} do
     # Pins the safety property: an observability handler that raises must not prevent the
     # durable Commands.complete (telemetry isolates handler crashes, and the emit is after the

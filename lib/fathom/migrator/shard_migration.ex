@@ -491,8 +491,8 @@ defmodule Fathom.Migrator.ShardMigration do
 
   # A coordinator's lease owner is `Heartbeat.owner/0` = "<node>#<incarnation>". A migrator's is
   # "migrator@…" (another operation: just wait). Our own node can't hold a coordinator here (the
-  # local drain just ran). Like HandoffJob, this addresses the node NAME, so a deployment that
-  # overrides `:node_key` gets no benefit and falls back to the snooze.
+  # local drain just ran). Like HandoffJob, this addresses the node NAME; the CommandPoller also
+  # claims commands for its `node()` (rig 2026-10-14 B2), so a `:node_key` override still works.
   defp remote_holder_node(holder) when is_binary(holder) do
     with false <- String.starts_with?(holder, "migrator@"),
          [node_name, _incarnation] <- String.split(holder, "#", parts: 2),

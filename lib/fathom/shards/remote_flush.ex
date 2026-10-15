@@ -20,8 +20,9 @@ defmodule Fathom.Shards.RemoteFlush do
       the lease probe itself failed — is `{:error, :remote_holder_unflushed}`. Never `:ok`.
 
   Like the migration drain this addresses the node NAME parsed from the lease owner
-  (`"<node>#<incarnation>"`), so a deployment overriding `:node_key` gets the error rather than a
-  false `:ok`.
+  (`"<node>#<incarnation>"`); `Fathom.Rebalancer.CommandPoller` claims commands for both its
+  `:node_key` and its `node()`, so a deployment overriding `:node_key` still reaches the holder
+  (rig 2026-10-14 B2 — before that it waited the full timeout and errored).
   """
   alias Fathom.Rebalancer.Commands
   alias Fathom.Shard.Storage

@@ -18,12 +18,14 @@ defmodule Fathom.Rebalancer.Commands do
     |> Repo.insert()
   end
 
-  @doc "Pending commands addressed to `node`, oldest first."
-  @spec pending_for(String.t()) :: [Command.t()]
-  def pending_for(node) do
+  @doc "Pending commands addressed to `node` (one name, or a list of names this node answers to), oldest first."
+  @spec pending_for(String.t() | [String.t()]) :: [Command.t()]
+  def pending_for(nodes) do
+    nodes = List.wrap(nodes)
+
     Repo.all(
       from c in Command,
-        where: c.node == ^node and c.status == "pending",
+        where: c.node in ^nodes and c.status == "pending",
         order_by: [asc: c.inserted_at]
     )
   end

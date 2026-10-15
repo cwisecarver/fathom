@@ -200,7 +200,13 @@ defmodule Fathom.Rebalancer.CommandPoller do
   # Pending commands for this node, minus any a prior tick already dispatched and hasn't
   # cleared yet (still `pending` in Postgres until its task completes) — the anti-re-select gate.
   defp fresh_pending(state) do
-    Rebalancer.node_key()
+    # rig 2026-10-14 B2. A node answers to its `node_key` (the LB/rebalancer name, NODE_KEY) AND its
+    # BEAM node name: the lease owner is "<node()>#<incarnation>", so RemoteFlush and the migration
+    # drain can only address the holder by node(). With NODE_KEY != node() (the chaos rig) every
+    # such command sat unclaimed for its full await. Names are unique per node, so exactly one
+    # poller still claims a given command.
+    [Rebalancer.node_key(), to_string(node())]
+    |> Enum.uniq()
     |> Commands.pending_for()
     |> Enum.reject(&MapSet.member?(state.in_flight, &1.id))
   end
