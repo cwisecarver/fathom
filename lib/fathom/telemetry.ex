@@ -243,6 +243,14 @@ defmodule Fathom.Telemetry do
           "Failover opens whose peer query heard fewer than N-Q+1 definite answers: refused " <>
             "(retryable 503) or, after the window, opened best-effort (possible acked-write loss)"
       ),
+      # Follower fsyncs outside the push path (expert review 2026-10-15 #21), only with
+      # REPLICATION_FSYNC on. `what` is bounded: :seed | :lineage | :ordinal.
+      counter("fathom.replication.follower_state_sync.count",
+        event_name: [:fathom, :replication, :follower_state_sync],
+        tags: [:what],
+        description:
+          "Follower fsyncs of a seed install or a lineage/ordinal state file (REPLICATION_FSYNC on)"
+      ),
       # One snapshot per seed BATCH (perf review 2026-10-14 #12(a)): a rate near the seed rate
       # means the shared pin is working; one per follower per seed means it regressed.
       counter("fathom.replication.seed_pin.open.count",

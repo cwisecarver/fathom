@@ -1778,7 +1778,7 @@ defmodule Fathom.Shard.Replication.Follower do
   # not per frame. Written plainly (no fsync): losing it to an OS crash recovers 0, which is exactly
   # the pre-fix behaviour, never a wrong value.
   defp sync_lineage(name, shard_id, lineage) when is_integer(lineage) and lineage > 0,
-    do: File.write(lineage_path(name, shard_id), Integer.to_string(lineage))
+    do: write_state_file(lineage_path(name, shard_id), Integer.to_string(lineage), :lineage)
 
   defp sync_lineage(_name, _shard_id, _lineage), do: :ok
 
@@ -1797,7 +1797,7 @@ defmodule Fathom.Shard.Replication.Follower do
   # crash recovers 0, which is safe.
   defp sync_ordinal(name, shard_id, {ordinal, salt1})
        when is_integer(ordinal) and ordinal > 0 and is_integer(salt1) do
-    File.write(ordinal_path(name, shard_id), "#{ordinal} #{salt1}")
+    write_state_file(ordinal_path(name, shard_id), "#{ordinal} #{salt1}", :ordinal)
   end
 
   defp sync_ordinal(name, shard_id, _ordinal) do
@@ -1846,18 +1846,30 @@ defmodule Fathom.Shard.Replication.Follower do
   # or push owns the files now — so it removes only its own temps and refuses, which the primary
   # answers with a re-seed. The lock is released on every path, success included.
   defp install(name, shard_id, state) do
+    synced = sync_seed_temps(state)
     :file.close(state.db_fd)
     :file.close(state.wal_fd)
 
-    if owns_lock?(name, shard_id, state.lock) do
-      do_install(name, shard_id, state)
-    else
-      Logger.warning(
-        "replication seed of #{shard_id} lost its replica lock before install; discarding it"
-      )
+    cond do
+      synced != :ok ->
+        Logger.error(
+          "replication seed of #{shard_id} could not be synced before install " <>
+            "(#{inspect(synced)}); discarding it"
+        )
 
-      rm_seed_temps(state)
-      {:error, :lock_lost}
+        rm_seed_temps(state)
+        {:error, {:sync_failed, synced}}
+
+      owns_lock?(name, shard_id, state.lock) ->
+        do_install(name, shard_id, state)
+
+      true ->
+        Logger.warning(
+          "replication seed of #{shard_id} lost its replica lock before install; discarding it"
+        )
+
+        rm_seed_temps(state)
+        {:error, :lock_lost}
     end
   after
     release_reservation(name, shard_id)
@@ -2646,6 +2658,45 @@ defmodule Fathom.Shard.Replication.Follower do
     {path, _} = Enum.min_by(held, fn {_path, {_fd, _inode, used}} -> used end)
     drop_held(held, path)
   end
+
+  # SEED INSTALL AND THE STATE FILES HONOUR `:replication_fsync` (expert review 2026-10-15 #21,
+  # default D13). With fsync on, a push was datasynced before its ack but a SEED was not: its temps
+  # were renamed into place straight from the page cache, so an OS crash could leave a `.db`/`-wal`
+  # that looks whole (the rename survived) over zero-filled pages, and recovery would rank it. The
+  # temps are now datasynced before they are closed and renamed, and the lineage/ordinal files are
+  # written fsync-then-rename. Off (the default) is unchanged: RAM-ack, durability from replica
+  # count.
+  #
+  # NOT DONE: an fsync of the DIRECTORY after the rename. The BEAM cannot open a directory for
+  # fsync portably (`:file.open` on a dir is `eisdir`; see `Storage.with_atomic_temp/2`). Losing a
+  # rename to an OS crash leaves the PREVIOUS file (or none), which recovery treats as an older
+  # replica or no replica — never as torn bytes under a whole-looking name.
+  defp sync_seed_temps(state) do
+    if fsync?() do
+      with :ok <- :file.datasync(state.db_fd),
+           :ok <- :file.datasync(state.wal_fd) do
+        emit_state_sync(:seed)
+      end
+    else
+      :ok
+    end
+  end
+
+  defp write_state_file(path, body, what) do
+    if fsync?() do
+      with :ok <- Fathom.Shard.Storage.atomic_write(path, body), do: emit_state_sync(what)
+    else
+      File.write(path, body)
+    end
+  end
+
+  # An observable for the test: an fsync is otherwise invisible short of an OS crash. Only on the
+  # rare paths above (a seed, a new lineage, a new WAL generation), never per push.
+  defp emit_state_sync(what) do
+    :telemetry.execute([:fathom, :replication, :follower_state_sync], %{count: 1}, %{what: what})
+  end
+
+  defp fsync?, do: Application.get_env(:fathom, :replication_fsync, false) == true
 
   defp maybe_sync(fd) do
     if Application.get_env(:fathom, :replication_fsync, false), do: :file.datasync(fd), else: :ok
