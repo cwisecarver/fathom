@@ -446,14 +446,18 @@ defmodule Fathom.Telemetry do
       # grows from other nodes' traffic and has no retention — is squeezing the disk this node's
       # own durability flushes depend on, and that ends in acked writes that can never be made
       # durable. (Was the counterpart of the warm-cache disk-pressure metric, removed 2026-09-14.)
-      # A lock file that existed but decoded to nothing, recreated at acquire (expert review
-      # 2026-08-20 #31). Not routine: an undecodable lock means a full or failing disk, and it
-      # used to take that tenant permanently offline because `:corrupt_lock` had two producers and
-      # no consumer anywhere. ANY occurrence is worth an operator look, so this is a counter
-      # rather than a gauge — the shard is in the log line beside it.
+      # An UNDECODABLE lock met at acquire (expert review 2026-10-15 #23, D14; supersedes the
+      # 2026-08-20 #31 auto-repair). The shard stays closed on both backends until an operator runs
+      # `mix fathom.lock.repair <shard>`; the shard id is in the log line beside the event. ANY
+      # occurrence is page-worthy (a full or failing disk is the usual cause).
+      counter("fathom.storage.lock_corrupt.count",
+        event_name: [:fathom, :storage, :lock_corrupt],
+        description:
+          "Acquires refused by an undecodable lock (shard stays closed until mix fathom.lock.repair)"
+      ),
       counter("fathom.storage.lock_repaired.count",
         event_name: [:fathom, :storage, :lock_repaired],
-        description: "Undecodable lock files recreated at acquire (investigate the volume)"
+        description: "Undecodable locks repaired by the operator task mix fathom.lock.repair"
       ),
       counter("fathom.replication.disk_pressure.count",
         event_name: [:fathom, :replication, :disk_pressure],

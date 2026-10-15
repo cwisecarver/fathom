@@ -11,10 +11,9 @@ defmodule Fathom.Shard.Storage.LocalLockIntegrityTest do
       of the S3 bug AGENTS.md records at length ("a 412 was reported as `:ok`, collapsing two
       opposite situations"). Here the two are *the lock is someone else's* (a correct no-op) and
       *the lock is ours and the unlink failed* (a leak reported as success).
-    * `:corrupt_lock` had two producers and **no consumer at all**. It propagated out of
-      `acquire_lease` → `handle_continue` → `{:stop, {:shutdown, {:lease_unavailable,
-      :corrupt_lock}}}` → `{:error, _}` at checkout, and the tenant was down permanently with no
-      operator remedy short of deleting a file by hand.
+    * `:corrupt_lock` had two producers and **no consumer at all**: the tenant was down with no
+      operator remedy short of deleting a file by hand. 2026-10-15 #23 answered that with an
+      operator task (`mix fathom.lock.repair`), NOT an automatic repair -- see the describe below.
 
   `Local` is a supported single-node production backend AND the default backend for this entire
   suite, so a contract gap here also hides the class from `mix test`.
@@ -24,8 +23,8 @@ defmodule Fathom.Shard.Storage.LocalLockIntegrityTest do
   There is no portable seam to make `IO.binwrite/2` or `File.close/1` fail — that needs a genuinely
   full or failing volume (Linux's `/dev/full` is not available on macOS, where this is developed).
   So the write-and-close check itself has no discriminating test here. What IS pinned is the STATE
-  it exists to prevent: a lock file that exists but decodes to nothing must be recoverable rather
-  than terminal, which is the consequence that made the dropped result matter.
+  it exists to prevent: a lock file that exists but decodes to nothing is refused loudly (and left
+  for the operator task) rather than silently reset.
   """
   use ExUnit.Case, async: false
 
@@ -54,8 +53,12 @@ defmodule Fathom.Shard.Storage.LocalLockIntegrityTest do
 
   defp lock_path(dir, id), do: Path.join(dir, id <> ".lock")
 
-  describe "a corrupt lock is recoverable, not terminal" do
-    test "acquire_lease repairs an undecodable lock instead of failing the tenant forever", ctx do
+  describe "a corrupt lock fails closed, like S3 (expert review 2026-10-15 #23, D14)" do
+    # These two tests PREVIOUSLY asserted the opposite (2026-08-20 #31): acquire deleted the lock
+    # and recreated it at epoch 1. That dropped the epoch and the A2 claim the lock carried, and
+    # made this double disagree with S3 (`{:error, :corrupt_lock}`), hiding S3's behaviour from the
+    # suite. The recovery is now the operator task `mix fathom.lock.repair` (mix_task test).
+    test "acquire_lease refuses an undecodable lock and leaves it untouched", ctx do
       %{dir: dir, id: id} = ctx
 
       # Exactly what a full disk leaves behind: the file exists and decodes to nothing.
@@ -63,35 +66,30 @@ defmodule Fathom.Shard.Storage.LocalLockIntegrityTest do
       File.mkdir_p!(Path.dirname(path))
       File.write!(path, "")
 
-      assert {:ok, lease} = Local.acquire_lease(id, "node_a", 30_000),
-             "an undecodable lock file made the tenant permanently unopenable. It names no owner " <>
-               "and no epoch, so it fences nothing — nobody can be holding a lease it describes."
+      assert {:error, :corrupt_lock} = Local.acquire_lease(id, "node_a", 30_000),
+             "an undecodable lock must fail closed (S3 parity), not be silently recreated at epoch 1"
 
-      assert lease.owner == "node_a"
-      assert lease.epoch == 1
-
-      # And the repair is real: the lock now round-trips, so the fence can use it.
-      assert :ok = Local.check_lease(id, lease)
+      assert File.read!(path) == "", "acquire must not rewrite or delete the corrupt lock"
     end
 
-    test "garbage bytes are repaired the same way as an empty file", ctx do
+    test "garbage bytes are refused the same way as an empty file", ctx do
       %{dir: dir, id: id} = ctx
       path = lock_path(dir, id)
       File.mkdir_p!(Path.dirname(path))
       File.write!(path, <<0xFF, 0xFE, "not a lease">>)
 
-      assert {:ok, lease} = Local.acquire_lease(id, "node_a", 30_000)
-      assert :ok = Local.check_lease(id, lease)
+      assert {:error, :corrupt_lock} = Local.acquire_lease(id, "node_a", 30_000)
+      assert File.read!(path) == <<0xFF, 0xFE, "not a lease">>
     end
 
-    test "check_lease still FAILS CLOSED on a corrupt lock — repair is acquire-only", ctx do
+    test "check_lease and renew_lease fail closed on a corrupt lock too", ctx do
       %{dir: dir, id: id} = ctx
       {:ok, lease} = Local.acquire_lease(id, "node_a", 30_000)
 
       File.write!(lock_path(dir, id), "")
 
-      # Deliberate: check_lease and renew_lease run while a lease is believed HELD, and repairing
-      # under a holder would be a silent takeover rather than a recovery.
+      # check_lease and renew_lease run while a lease is believed HELD, and repairing under a holder
+      # would be a silent takeover rather than a recovery.
       assert {:error, :corrupt_lock} = Local.check_lease(id, lease)
       assert {:error, :corrupt_lock} = Local.renew_lease(id, lease, 30_000)
     end

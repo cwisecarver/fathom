@@ -698,43 +698,24 @@ defmodule Fathom.Shard.Storage.Local do
       :enoent ->
         create_lock(shard_id, %{owner: owner, epoch: 1, expires_at_ms: now + ttl_ms})
 
-      # A CORRUPT LOCK IS NOT A FENCE, SO IT MUST NOT BE ONE (expert review 2026-08-20 #31).
+      # AN UNDECODABLE LOCK FAILS CLOSED, EXACTLY AS S3 DOES (expert review 2026-10-15 #23, D14).
       #
-      # `:corrupt_lock` had two producers (here and in the S3 backend) and NOT ONE consumer: it
-      # propagated out of `acquire_lease` → `handle_continue` →
-      # `{:stop, {:shutdown, {:lease_unavailable, :corrupt_lock}}}` → `{:error, _}` at checkout,
-      # and the tenant was down permanently with no operator remedy short of deleting a file by
-      # hand. The likeliest way to get one was `create_lock/2` above silently succeeding over a
-      # zero-length file on a full disk.
+      # This branch used to delete the file and recreate it at epoch 1 (review 2026-08-20 #31), on
+      # the reasoning that a lock naming no owner fences nothing. That reasoning is wrong in the
+      # direction that matters: the lock also carries the EPOCH and the `claim` (the A2 lineage a
+      # crashed holder may have shipped under), and a fresh create at epoch 1 drops both -- the same
+      # backward jump AGENTS.md records against "delete the lock instead of rolling it back". It also
+      # made this test double DISAGREE with the production backend (S3 returns
+      # `:corrupt_lock` and the tenant stays down), so a suite that runs Local could never see the
+      # S3 behaviour. Opposite behaviours on one input is the "double must match the real contract"
+      # gap AGENTS.md warns about; the contract is the S3 one.
       #
-      # An undecodable lock carries no owner and no epoch, so it CANNOT be fencing anything —
-      # nobody can be holding a lease it describes, and no `check_lease`/`renew_lease` can match
-      # it. Treating it as absent is therefore safe in the direction that matters, and it is the
-      # only reading that lets the tenant come back.
-      #
-      # Deliberately confined to ACQUIRE. `check_lease/2` and `do_renew_lease/3` still fail closed
-      # on it: those run while a lease is believed HELD, and repairing under a holder would be a
-      # silent takeover rather than a recovery. Loud, because a corrupt lock means a disk problem
-      # that will produce others.
+      # The remedy is an OPERATOR step, `mix fathom.lock.repair <shard>` (`repair_corrupt_lock/2`
+      # below, docs/runbooks/lock-repair.md), which writes a marker at a strictly higher epoch.
+      # Loud on every attempt: a corrupt lock means a disk problem that will produce others.
       {:error, :corrupt_lock} ->
-        Logger.error(
-          "shard #{shard_id}: lock file is undecodable (a full or failing disk is the usual " <>
-            "cause). It names no owner and no epoch, so it fences nothing — recreating it. " <>
-            "Check the volume backing #{lock_path(shard_id)}."
-        )
-
-        :telemetry.execute([:fathom, :storage, :lock_repaired], %{count: 1}, %{shard_id: shard_id})
-
-        case File.rm(lock_path(shard_id)) do
-          ok when ok == :ok ->
-            create_lock(shard_id, %{owner: owner, epoch: 1, expires_at_ms: now + ttl_ms})
-
-          {:error, :enoent} ->
-            create_lock(shard_id, %{owner: owner, epoch: 1, expires_at_ms: now + ttl_ms})
-
-          {:error, reason} ->
-            {:error, reason}
-        end
+        report_corrupt_lock(shard_id)
+        {:error, :corrupt_lock}
 
       {:error, reason} ->
         {:error, reason}
@@ -1066,6 +1047,48 @@ defmodule Fathom.Shard.Storage.Local do
       err -> err
     end
   end
+
+  @doc """
+  Operator repair of an UNDECODABLE lock (`mix fathom.lock.repair`, expert review 2026-10-15 #23).
+
+  `build` receives the raw lock bytes and returns the lease to write (`{:ok, lease}`) or an error.
+  Refuses with `{:error, :lock_not_corrupt}` unless the lock really is undecodable, and
+  `{:error, :no_lock}` when there is none. Runs inside the same per-shard mutex as every other
+  lock mutation, so it cannot interleave with an acquire.
+  """
+  @spec repair_corrupt_lock(String.t(), (binary() -> {:ok, Storage.lease()} | {:error, term()})) ::
+          {:ok, Storage.lease()} | {:error, term()}
+  def repair_corrupt_lock(shard_id, build) do
+    with_lock_mutex(shard_id, fn ->
+      case File.read(lock_path(shard_id)) do
+        {:ok, body} ->
+          with :error <- Storage.decode_lease(body) |> corrupt_or_error(),
+               {:ok, marker} <- build.(body) do
+            write_lock(shard_id, marker)
+          end
+
+        {:error, :enoent} ->
+          {:error, :no_lock}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end)
+  end
+
+  defp report_corrupt_lock(shard_id) do
+    Logger.error(
+      "shard #{shard_id}: lock file #{lock_path(shard_id)} is undecodable (a full or failing disk " <>
+        "is the usual cause) -- the shard stays CLOSED. It is NOT auto-repaired: the lock's epoch " <>
+        "and claim are lost with it. Inspect the volume, then run `mix fathom.lock.repair " <>
+        "#{shard_id}` (docs/runbooks/lock-repair.md)."
+    )
+
+    :telemetry.execute([:fathom, :storage, :lock_corrupt], %{count: 1}, %{shard_id: shard_id})
+  end
+
+  defp corrupt_or_error(:error), do: :error
+  defp corrupt_or_error({:ok, _}), do: {:error, :lock_not_corrupt}
 
   defp read_lock(shard_id) do
     case File.read(lock_path(shard_id)) do

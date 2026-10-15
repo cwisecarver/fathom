@@ -2523,12 +2523,67 @@ defmodule Fathom.Shard.Storage.S3 do
           {:error, _reason} = error -> error
         end
 
+      # AN UNDECODABLE LOCK IS ITS OWN, LOUD ERROR (expert review 2026-10-15 #23, D14). It used to
+      # ride the generic clause below as `{:transient_lookup, :corrupt_lock}`, which reads as "retry
+      # shortly" -- but nothing retried will ever fix a lock body that does not decode, and the
+      # migrator treats `:transient_lookup` as retryable forever. NOT auto-repaired on either backend:
+      # the body carried the epoch and the claim, so a rewrite from here would have to guess them.
+      # The remedy is the operator task `mix fathom.lock.repair` (`repair_corrupt_lock/2`).
+      {:error, :corrupt_lock} ->
+        report_corrupt_lock(shard_id)
+        {:error, :corrupt_lock}
+
       # Fail closed: a transient lookup error must NOT fall through to an
       # unconditional write that would steal a live owner's lease.
       {:error, reason} ->
         {:error, {:transient_lookup, reason}}
     end
   end
+
+  defp report_corrupt_lock(shard_id) do
+    Logger.error(
+      "shard #{shard_id}: lock object #{lock_path(shard_id)} is undecodable -- the shard stays " <>
+        "CLOSED. It is NOT auto-repaired: the lock's epoch and claim are lost with it. Inspect " <>
+        "the bucket, then run `mix fathom.lock.repair #{shard_id}` (docs/runbooks/lock-repair.md)."
+    )
+
+    :telemetry.execute([:fathom, :storage, :lock_corrupt], %{count: 1}, %{shard_id: shard_id})
+  end
+
+  @doc """
+  Operator repair of an UNDECODABLE lock (`mix fathom.lock.repair`, expert review 2026-10-15 #23).
+
+  `build` receives the raw lock bytes and returns the lease to write. The write is `If-Match` the
+  etag of the corrupt body we just read, so a concurrent writer that fixed or replaced the lock wins
+  and the repair reports `{:error, :precondition_failed}` rather than clobbering it. Refuses with
+  `{:error, :lock_not_corrupt}` unless the lock really is undecodable, `{:error, :no_lock}` if absent.
+  """
+  @spec repair_corrupt_lock(String.t(), (binary() -> {:ok, Storage.lease()} | {:error, term()})) ::
+          {:ok, Storage.lease()} | {:error, term()}
+  def repair_corrupt_lock(shard_id, build) do
+    case Req.get(req(), url: lock_path(shard_id), decode_body: false) do
+      {:ok, %{status: 200, body: body, headers: headers}} when is_binary(body) ->
+        with :error <- corrupt_or_error(Storage.decode_lease(body)),
+             {:ok, marker} <- build.(body) do
+          case etag(headers) do
+            etag when is_binary(etag) -> put_lock(shard_id, marker, if_match: etag)
+            _ -> {:error, :no_lock_etag}
+          end
+        end
+
+      {:ok, %{status: 404}} ->
+        {:error, :no_lock}
+
+      {:ok, %{status: status}} ->
+        {:error, {:s3_get_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp corrupt_or_error(:error), do: :error
+  defp corrupt_or_error({:ok, _}), do: {:error, :lock_not_corrupt}
 
   # Is `other` still alive? Its heartbeat object is the primary source of truth. Goes
   # through the Storage dispatch (resolves to this backend in prod) so a faulty
