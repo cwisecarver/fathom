@@ -1472,8 +1472,14 @@ defmodule Fathom.Shard.Replication.Session do
         |> drain_late_replies(wal_path)
         |> ack_if_owned()
 
+      # NOTHING TO SHIP IS NOT PROOF OF OWNERSHIP, here either (expert review 2026-09-29 #7; rig
+      # 2026-10-14 B3). This is the branch a write acked through a re-seed takes (the seed already
+      # carried its frames), so it must be fenced exactly like the primary path's `:nothing`.
+      # NOTHING TO SHIP IS NOT PROOF OF OWNERSHIP, here either (expert review 2026-09-29 #7; rig
+      # 2026-10-14 B3). This is the branch a write acked through a re-seed takes (the seed already
+      # carried its frames), so it must be fenced exactly like the primary path's `:nothing`.
       :nothing ->
-        {:reply, :ok, state}
+        ack_if_owned(state)
 
       {:error, {:no_quorum, _retry_why}, new_state, rejects} ->
         {:reply, {:error, {:no_quorum, why}}, start_seeds(new_state, wal_path, rejects)}

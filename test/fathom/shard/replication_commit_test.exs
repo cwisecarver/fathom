@@ -271,8 +271,9 @@ defmodule Fathom.Shard.ReplicationCommitTest do
 
   # A heartbeat-mode coordinator with a seeded 3-follower quorum and one acked commit, for the ack
   # gate tests below. Asserts the mode took — a legacy-mode run would exercise the ungated path.
-  defp heartbeat_session!(ctx) do
+  defp heartbeat_session!(ctx, opts \\ []) do
     %{id: id, root: root} = ctx
+    unseeded? = Keyword.get(opts, :unseeded, false)
     followers = start_followers!(root, 3)
 
     Application.put_env(:fathom, :replication_enabled, true)
@@ -312,11 +313,15 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
 
     wal = path <> "-wal"
-    for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0, 0)
-
     gen = Fathom.Shard.acquire_gen(coordinator)
     assert is_integer(gen), "the coordinator opened in LEGACY mode — the gate is not exercised"
-    assert :ok = Session.commit(id, wal, coordinator)
+
+    # `unseeded: true` leaves every follower unknown to the shard, so the FIRST commit is answered
+    # `:unknown_shard` and acks only through a re-seed + retry (the rig 2026-10-14 B3 path).
+    unless unseeded? do
+      for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0, 0)
+      assert :ok = Session.commit(id, wal, coordinator)
+    end
 
     %{id: id, coordinator: coordinator, conn: conn, wal: wal, hb: hb, gen: gen}
   end
@@ -381,6 +386,63 @@ defmodule Fathom.Shard.ReplicationCommitTest do
 
       assert {:error, :ownership_unconfirmed} = result,
              "an unreachable coordinator was read as legacy mode and the write acked durable"
+    end
+  end
+
+  describe "the post-seed retry is gated on ownership too (rig 2026-10-14 B3)" do
+    # A write acked through a re-seed (B1's path) plans `:nothing` on the retry: the seed already
+    # carried its frames. `retry_after_seed`'s `:nothing` branch replied `:ok` without
+    # `ack_if_owned/1`, so a deposed owner acked a write it no longer owns, the very hole expert
+    # review 2026-09-29 #7 closed on the primary path. Pre-fix the first assertion reads `:ok`.
+    test "heartbeat mode: a write acked through a re-seed is refused when ownership lapsed",
+         ctx do
+      %{id: id, coordinator: coordinator, wal: wal, hb: hb, gen: gen} =
+        heartbeat_session!(ctx, unseeded: true)
+
+      :sys.replace_state(hb, fn s ->
+        Fathom.Shard.Heartbeat.publish_status(%{
+          s
+          | mono_deadline_ms: System.monotonic_time(:millisecond) - 1
+        })
+      end)
+
+      assert Fathom.Shard.Heartbeat.valid_for_write?(gen) == :not_valid
+
+      assert {:error, :ownership_unconfirmed} = Session.commit(id, wal, coordinator),
+             "a write acked through a re-seed was acked by an owner that cannot confirm the lease"
+    end
+
+    test "heartbeat mode: a valid owner still acks through a re-seed", ctx do
+      %{id: id, coordinator: coordinator, wal: wal, gen: gen} =
+        heartbeat_session!(ctx, unseeded: true)
+
+      assert Fathom.Shard.Heartbeat.valid_for_write?(gen) == :ok
+      assert :ok = Session.commit(id, wal, coordinator)
+    end
+
+    test "legacy mode: the ack stays ungated (deliberate deferral) through a re-seed", ctx do
+      %{id: id, root: root} = ctx
+      followers = start_followers!(root, 3)
+      Application.put_env(:fathom, :replication_enabled, true)
+      Application.put_env(:fathom, :replication_quorum, 2)
+
+      Application.put_env(
+        :fathom,
+        :replication_followers,
+        for({_n, port} <- followers, do: {~c"127.0.0.1", port})
+      )
+
+      start_supervised!(Fleet)
+
+      {:ok, coordinator, ref, path} = Shards.checkout(id)
+      on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+      {:ok, conn} = Connection.open(path)
+      on_exit(fn -> Connection.close(conn) end)
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+
+      assert Fathom.Shard.acquire_gen(coordinator) == nil, "expected legacy mode"
+      assert :ok = Session.commit(id, path <> "-wal", coordinator)
     end
   end
 
