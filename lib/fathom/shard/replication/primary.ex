@@ -94,6 +94,15 @@ defmodule Fathom.Shard.Replication.Primary do
   def plan(nil, %{commit_extent: size}, max) when size > @header_bytes,
     do: {:reset, 0, cap(size, max)}
 
+  # Never shipped, and the WAL holds a header but no COMMITTED frame: `commit_extent` is exactly
+  # `@header_bytes`. Reachable whenever a shard's first push follows a reset whose only frames
+  # belong to a transaction that spilled and then rolled back (or was never committed) — the file
+  # is non-empty, so `Wal.read/1` does not answer `:empty`. There is nothing committed to ship.
+  # Without this clause no head matched (the one above needs `size > @header_bytes`, the catch-all
+  # below needs a map state) and the Session crashed with a FunctionClauseError, 503-ing the
+  # tenant's writes (expert review 2026-10-15 #14).
+  def plan(nil, %{commit_extent: _}, _max), do: :nothing
+
   def plan(%{wal_gen: gen, salt1: salt}, %{ckpt_seq: seq, salt1: s, commit_extent: size}, max)
       when seq != gen or s != salt do
     # Case 2: the WAL was reset. Offsets from the old generation mean nothing now.

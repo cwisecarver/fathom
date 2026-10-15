@@ -206,6 +206,19 @@ defmodule Fathom.Shard.ReplicationPrimaryTest do
       assert Primary.plan(s, h) == Primary.plan(s, h, :infinity)
     end
 
+    # Regression: expert review 2026-10-15 #14. A never-shipped shard whose WAL holds a header and
+    # no committed frame (commit_extent == 32) matched no clause, and the FunctionClauseError
+    # crashed the replication Session — every write to the tenant then answered 503.
+    test "a never-shipped header-only WAL ships nothing — the commit_extent == 32 boundary" do
+      assert :nothing = Primary.plan(nil, header(1, 9, 32))
+      assert :nothing = Primary.plan(nil, header(1, 9, 32), 1024)
+
+      # The file can be far larger than its extent (rolled-back frames); the extent is what counts.
+      assert :nothing = Primary.plan(nil, header(1, 9, 900_000, 32), 0)
+      # And one byte past the header is a real first ship, so the new clause did not swallow it.
+      assert {:reset, 0, 33} = Primary.plan(nil, header(1, 9, 33))
+    end
+
     test "an empty WAL still ships nothing, cap or no cap" do
       assert :nothing = Primary.plan(nil, :empty, 1024)
       assert :nothing = Primary.plan(state(1, 9, 100), :empty, 1024)
@@ -279,6 +292,29 @@ defmodule Fathom.Shard.ReplicationPrimaryTest do
       assert offset == rolled.commit_extent
       assert len == after_commit.commit_extent - rolled.commit_extent
 
+      :ok = Connection.close(conn)
+    end
+
+    # Reachability of expert review 2026-10-15 #14 against a real WAL: after a TRUNCATE checkpoint
+    # the next transaction spills and rolls back, leaving a non-empty WAL with ZERO committed
+    # frames. A Session with no state for this shard (first push, or after a reseed) plans on it.
+    test "a rolled-back first transaction after a reset leaves a header-only extent", ctx do
+      %{path: path, wal: wal} = ctx
+      {:ok, conn} = Connection.open(path)
+      :ok = Sqlite3.execute(conn, "PRAGMA wal_autocheckpoint=0")
+      :ok = Sqlite3.execute(conn, "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+      :ok = Sqlite3.execute(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
+      assert {:ok, :empty} = Wal.read(wal), "the TRUNCATE did not empty the WAL"
+
+      rollback_a_big_transaction(conn)
+      assert {:ok, h} = Wal.read(wal)
+
+      assert h.size > 32,
+             "the rolled-back transaction never spilled; the fixture measures nothing"
+
+      assert h.commit_extent == 32
+
+      assert :nothing = Primary.plan(nil, h, 0)
       :ok = Connection.close(conn)
     end
 
