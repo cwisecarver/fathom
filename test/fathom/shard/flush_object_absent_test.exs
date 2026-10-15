@@ -140,7 +140,12 @@ defmodule Fathom.Shard.FlushObjectAbsentTest do
       } do
         pid = flushed_then_vanished!(shard)
         assert_mode!(pid, unquote(mode))
-        Fathom.Tenants.Tombstones.put(shard)
+
+        # Insert the tombstone WITHOUT the on_new hook. `Tombstones.put/1` now also stops the local
+        # coordinator and erases its files (expert review 2026-10-15 #3), which would pre-empt the
+        # case under test: a coordinator on a node that has NOT yet learned of the delete, whose
+        # flush meets an already-purged object. The self-fence is that cross-node backstop.
+        :ets.insert(Fathom.Tenants.Tombstones, {shard})
         ref = Process.monitor(pid)
 
         capture_log(fn ->

@@ -67,7 +67,7 @@ defmodule Fathom.Tenants.Tombstones do
   @doc "Records `shard_id` as tombstoned locally (called on the deleting node for immediacy)."
   @spec put(String.t()) :: :ok
   def put(shard_id) do
-    insert(@table, shard_id)
+    insert(@table, shard_id, &on_tombstoned/1)
     :ok
   end
 
@@ -79,7 +79,15 @@ defmodule Fathom.Tenants.Tombstones do
     loader = Keyword.get(opts, :loader, &Directory.deleted_shard_ids/0)
     since_loader = Keyword.get(opts, :since_loader, &Directory.deleted_shard_ids_since/1)
     storage_loader = Keyword.get(opts, :storage_loader, &Fathom.Shard.Storage.tombstoned_ids/0)
-    on_new = Keyword.get(opts, :on_new, &forget_replica/1)
+
+    # `on_new` is the per-id hook for a delete learned live (NOTIFY, `put/1`, incremental refresh):
+    # replica erase + LOCAL erase. Bulk loads (boot, daily full reload, storage union) use `bulk_on_new`
+    # (replica erase only) and instead run ONE directory-listing `sweeper` pass — a glob per historical
+    # id against a data dir of millions of files would cost far more than a single listing.
+    # An explicit `:on_new` (test seam) replaces both.
+    on_new = Keyword.get(opts, :on_new, &on_tombstoned/1)
+    bulk_on_new = Keyword.get(opts, :on_new, &forget_replica/1)
+    sweeper = Keyword.get(opts, :sweeper, &sweep_local/0)
     retry_ms = Keyword.get(opts, :retry_ms, DenyList.initial_retry_ms())
 
     # public read_concurrency: admission reads directly from the caller process.
@@ -95,6 +103,8 @@ defmodule Fathom.Tenants.Tombstones do
     state = %{
       table: table,
       on_new: on_new,
+      bulk_on_new: bulk_on_new,
+      sweeper: sweeper,
       loader: loader,
       since_loader: since_loader,
       storage_loader: storage_loader,
@@ -124,6 +134,9 @@ defmodule Fathom.Tenants.Tombstones do
     storage = if state.storage_loaded, do: :ok, else: load_from_storage(state)
     directory = if state.loaded, do: :ok, else: load_from_directory(state)
 
+    newly_loaded =
+      (not state.storage_loaded and storage == :ok) or (not state.loaded and directory == :ok)
+
     state = %{state | storage_loaded: state.storage_loaded or storage == :ok}
 
     state =
@@ -135,6 +148,10 @@ defmodule Fathom.Tenants.Tombstones do
       else
         state
       end
+
+    # Erase local residue of every tombstoned id found on disk (expert review 2026-10-15 #3): a delete
+    # that ran while this node was down, or whose NOTIFY it missed, left the full DB here.
+    if newly_loaded, do: run_async(fn -> state.sweeper.() end)
 
     case {storage, directory} do
       {:ok, :ok} ->
@@ -178,11 +195,63 @@ defmodule Fathom.Tenants.Tombstones do
 
   # `on_new` runs only for an id this node had NOT already tombstoned, so a full reload (which
   # re-reads every id ever deleted) does not re-run it for the whole history.
-  defp insert(table, shard_id, on_new \\ &forget_replica/1) do
+  defp insert(table, shard_id, on_new) do
     if :ets.insert_new(table, {shard_id}), do: on_new.(shard_id)
     :ok
   rescue
     ArgumentError -> :ok
+  end
+
+  # A delete learned live: erase the A2 replica now, and the node-local working files asynchronously
+  # (stopping a coordinator can take its whole shutdown budget, which must not stall this process).
+  #
+  # EXPERT REVIEW 2026-10-15 #3: `Tenants.purge/1` runs on whichever node Oban picks, so on the
+  # shard's LB home (usually a different node) the coordinator and its `<id>.db*` survived the erase:
+  # the tombstoned terminate branch deliberately skips the flush and drop, and nothing else removed
+  # the files. This hook runs on EVERY node. Erasing may destroy `.fenced/.forked/.corrupt` forensic
+  # copies (assumed default D1): erasure outranks forensics.
+  defp on_tombstoned(shard_id) do
+    forget_replica(shard_id)
+    run_async(fn -> Fathom.Tenants.erase_local(shard_id) end)
+    :ok
+  end
+
+  # Boot sweep: one listing of the data dir, erase every file family whose id is tombstoned. Ids carry
+  # no dot (ShardId), so everything before the first ".db" is the id: `<id>.db`, `-wal`, `-shm`,
+  # `.etag`, `.fenced.<ts>`, ... all share it, and a sibling `<id>9.db` yields a different id.
+  @doc false
+  @spec sweep_local() :: :ok
+  def sweep_local do
+    case File.ls(Fathom.Shard.data_dir()) do
+      {:ok, names} ->
+        names
+        |> Enum.flat_map(fn name ->
+          case String.split(name, ".db", parts: 2) do
+            [id, _rest] when id != "" -> [id]
+            _ -> []
+          end
+        end)
+        |> Enum.uniq()
+        |> Enum.filter(&tombstoned?/1)
+        |> Enum.each(&Fathom.Tenants.erase_local/1)
+
+      {:error, _} ->
+        :ok
+    end
+  end
+
+  defp run_async(fun) do
+    Task.start(fn ->
+      try do
+        fun.()
+      rescue
+        e -> Logger.warning("tombstone local erase failed: #{Exception.message(e)}")
+      catch
+        :exit, reason -> Logger.warning("tombstone local erase failed: #{inspect(reason)}")
+      end
+    end)
+
+    :ok
   end
 
   # ERASE THIS NODE'S A2 REPLICA OF A DELETED SHARD (expert review 2026-09-29 #5).
@@ -270,7 +339,7 @@ defmodule Fathom.Tenants.Tombstones do
       {:error, reason}
   end
 
-  defp load_from_directory(%{table: table, loader: loader, on_new: on_new}) do
+  defp load_from_directory(%{table: table, loader: loader, bulk_on_new: on_new}) do
     for id <- loader.(), do: insert(table, id, on_new)
     :ok
   rescue
@@ -288,7 +357,7 @@ defmodule Fathom.Tenants.Tombstones do
   # is reachable (a restore is a rare, operator-driven event).
   # Returns `{:error, reason}` on failure so `attempt_load/1` retries it (expert review 2026-10-13 #20).
   # Before, a failure here was logged and reported as success, so it was never retried.
-  defp load_from_storage(%{table: table, on_new: on_new, storage_loader: loader}) do
+  defp load_from_storage(%{table: table, bulk_on_new: on_new, storage_loader: loader}) do
     case loader.() do
       {:ok, ids} ->
         for id <- ids, do: insert(table, id, on_new)

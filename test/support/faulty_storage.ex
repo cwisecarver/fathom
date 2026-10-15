@@ -610,5 +610,10 @@ defmodule Fathom.Test.FaultyStorage do
   end
 
   @impl true
-  def fork_shard(src_id, dst_id), do: Local.fork_shard(src_id, dst_id)
+  def fork_shard(src_id, dst_id) do
+    # `run_before(:fork_shard, dst_id)` gives a tenant fork a real duration (expert review 2026-10-15
+    # #29: the dst lease must be renewed for the whole copy).
+    run_before(:fork_shard, dst_id)
+    Local.fork_shard(src_id, dst_id)
+  end
 end

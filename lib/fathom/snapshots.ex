@@ -134,6 +134,9 @@ defmodule Fathom.Snapshots do
 
     with {:ok, id} <- cast(shard_id),
          {:ok, snapshot_id} <- cast_snapshot_id(snapshot_id),
+         # expert review 2026-10-15 #13: a restore into an erased tenant would recreate its live
+         # object. Refuse before the download; re-checked under the lease and after the copy-back.
+         :ok <- refuse_tombstoned(id),
          # expert review 2026-10-13 #37: the snapshot is pulled into the scratch volume, so refuse
          # before the download when that volume is short of space.
          :ok <- Fathom.Shard.TempReaper.check_scratch_headroom() do
@@ -151,14 +154,17 @@ defmodule Fathom.Snapshots do
       try do
         do_restore(id, snapshot_id, opts, force?, tmp)
       after
-        for suffix <- ["", "-wal", "-shm"], do: File.rm(tmp <> suffix)
+        for base <- [tmp, check_copy(tmp)],
+            suffix <- ["", "-wal", "-shm"],
+            do: File.rm(base <> suffix)
       end
     end
   end
 
   defp do_restore(id, snapshot_id, opts, force?, tmp) do
     with {:ok, snap_version} <- snapshot_user_version(id, snapshot_id, tmp),
-         :ok <- check_schema_boundary(id, snap_version, force?) do
+         :ok <- check_schema_boundary(id, snap_version, force?),
+         :ok <- check_snapshot_integrity(tmp, Keyword.get(opts, :allow_corrupt, false)) do
       case Shards.drain(id, Keyword.get(opts, :drain_timeout, @drain_timeout)) do
         :ok ->
           # HOLD the lease across the whole restore, do not merely PROBE it (expert review
@@ -188,7 +194,9 @@ defmodule Fathom.Snapshots do
           case Storage.acquire_lease(id, owner, restore_lease_ttl()) do
             {:ok, lease} ->
               try do
-                case Storage.object_etag(id) do
+                # Second tombstone check, UNDER the lease (expert review 2026-10-15 #13): a delete
+                # that landed during the download or drain must not be undone by the copy-back.
+                case tombstone_then_etag(id) do
                   {:ok, etag} ->
                     # HOLD the lease for the WHOLE copy-back, not just its first ttl + steal_margin
                     # (~35 s at defaults) (expert review 2026-09-05 #24). The restore owner has no
@@ -208,7 +216,7 @@ defmodule Fathom.Snapshots do
                         # the schema (#7); a below-head version lets the laggard sweep converge it
                         # forward. Inside the lease, so it lands before anyone can re-open.
                         reconcile_directory_schema(id, snap_version)
-                        :ok
+                        recheck_restore_tombstone(id)
 
                       other ->
                         other
@@ -236,6 +244,66 @@ defmodule Fathom.Snapshots do
         {:error, reason} ->
           {:error, {:shard_busy, reason}}
       end
+    end
+  end
+
+  defp tombstone_then_etag(id) do
+    with :ok <- refuse_tombstoned(id), do: Storage.object_etag(id)
+  end
+
+  # A delete that landed AFTER the second check but before the copy-back finished: the copy-back has
+  # just recreated the live object of an erased tenant. Erase it again (idempotent; the DeleteJob
+  # may already have finished and will not run again) and report the refusal.
+  defp recheck_restore_tombstone(id) do
+    case refuse_tombstoned(id) do
+      :ok ->
+        :ok
+
+      {:error, :tombstoned} = refused ->
+        _ = Storage.purge_shard(id)
+        refused
+    end
+  end
+
+  # Structural check of the snapshot bytes before they are promoted over live (expert review
+  # 2026-10-15 #12). `restore/3` used to verify only the MD5 and `user_version`, so a snapshot
+  # copied from a damaged flush (taken before the flush gate existed, with `verify_flush_integrity`
+  # off, or with index drift quick_check cannot see) replaced a live object with a corrupt one.
+  #
+  # Runs a FULL `integrity_check` (not quick_check: it cross-checks indexes against tables) on a
+  # SIBLING copy of `tmp`: opening a db runs `journal_mode=WAL`, which mutates the file, and `tmp`
+  # must stay byte-identical to what the schema guard read and what gets promoted (#25, #23).
+  # `allow_corrupt: true` is the operator override, deliberately separate from `force` (schema skew).
+  defp check_snapshot_integrity(tmp, allow_corrupt?) do
+    copy = check_copy(tmp)
+
+    try do
+      with :ok <- File.cp(tmp, copy) |> copy_result(),
+           :ok <- integrity_check(copy) do
+        :ok
+      else
+        {:error, {:snapshot_corrupt, _}} = corrupt ->
+          if allow_corrupt? == true, do: :ok, else: corrupt
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    after
+      for suffix <- ["", "-wal", "-shm"], do: File.rm(copy <> suffix)
+    end
+  end
+
+  defp copy_result(:ok), do: :ok
+  defp copy_result({:error, reason}), do: {:error, {:snapshot_check_unavailable, reason}}
+
+  defp check_copy(tmp), do: tmp <> ".check"
+
+  # `Integrity.verify_full/1` (PRAGMA integrity_check). Every failure shape, including an open
+  # failure on badly damaged bytes, is reported as `:snapshot_corrupt`.
+  defp integrity_check(path) do
+    case Fathom.Shard.Integrity.verify_full(path) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:snapshot_corrupt, reason}}
     end
   end
 

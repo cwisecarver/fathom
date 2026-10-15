@@ -871,6 +871,11 @@ defmodule Fathom.Telemetry do
         description:
           "DeleteJobs that exhausted every attempt (expert review 2026-10-12 #10) — a tombstoned tenant's data is STILL in storage; the hourly reconcile re-drives it, but a non-zero count means a long storage outage and an erasure that is overdue"
       ),
+      counter("fathom.tenants.local_erased.count",
+        event_name: [:fathom, :tenants, :local_erased],
+        description:
+          "Per-node local erases of a tombstoned tenant's coordinator and <id>.db* files (expert review 2026-10-15 #3). One per node per delete, plus the boot sweep's finds; a node that never reports one for a delete still holds the tenant's data"
+      ),
       counter("fathom.tenants.purge_while_held.count",
         event_name: [:fathom, :tenants, :purge_while_held],
         description:

@@ -68,6 +68,7 @@ defmodule Fathom.Tenants do
     with {:ok, id} <- cast(shard_id),
          {:ok, _row} <- Directory.tombstone(id) do
       broadcast_deleted(id)
+      write_early_marker(id)
       enqueue_delete(id)
       {:ok, :scheduled}
     end
@@ -128,12 +129,25 @@ defmodule Fathom.Tenants do
          :ok <- refuse_scratch(dst, opts),
          :ok <- refuse_if_taken(dst),
          {:ok, warnings} <- dns_safety(dst),
-         {:ok, _src_row} <- fetch_src(src),
+         {:ok, src_row} <- fetch_src(src),
          :ok <- maybe_flush_source(src, opts),
          :ok <- fork_into_leased_dst(src, dst),
          :ok <- register_fork(dst) do
-      {:ok, tenant_result(dst, warnings, opts)}
+      result = tenant_result(dst, warnings, opts)
+      {:ok, Map.put(result, :source_flushed_at, source_flushed_at(src_row, opts))}
     end
+  end
+
+  # Expert review 2026-10-15 #26: a fork copies the source's LAST DURABLE object, so by default it
+  # silently lags whatever the live coordinator has acked since. The default stays (a forced flush
+  # costs a checkpoint, and fork-from-idle is the common case); the response now says which state
+  # the clone carries. With `flush_source: true` the flush just completed, so the clone is as of now;
+  # otherwise it is the directory's `last_flushed_at` (nil when never flushed / never recorded).
+  # Compare it to the source's `last_active_at` to see whether acked writes were left behind.
+  defp source_flushed_at(row, opts) do
+    if Keyword.get(opts, :flush_source, false),
+      do: DateTime.utc_now(),
+      else: Map.get(row, :last_flushed_at)
   end
 
   # Copy src → dst while HOLDING the dst lease (expert review 2026-07-18 #14). Without it,
@@ -144,7 +158,10 @@ defmodule Fathom.Tenants do
   # `ShardMigration.do_fork`'s guard: drain any local coordinator so THIS node isn't the holder, then
   # `acquire_lease` — an atomic `If-None-Match:*` create on the `.lock` object, so a concurrent
   # open/fork loses the acquire (`{:held, _}`) and is refused instead of racing at the `.db`. A fork
-  # is one object copy, well within the lease TTL, so no renewer is needed (unlike the migration copy).
+  # is ONE object copy, but not necessarily one short one: nothing bounds a multi-GiB multipart copy
+  # to the lease TTL, and the fork owner has no heartbeat object, so a peer judging liveness falls to
+  # the lock's own TTL and steals it mid-copy (expert review 2026-10-15 #29). A renewer therefore
+  # runs for the duration of the copy, the same shape as the migration copy's.
   defp fork_into_leased_dst(src, dst) do
     case Shards.drain(dst, @fork_drain_ms) do
       :ok ->
@@ -152,9 +169,12 @@ defmodule Fathom.Tenants do
 
         case Storage.acquire_lease(dst, owner, fork_lease_ttl()) do
           {:ok, lease} ->
+            renewer = start_fork_renewer(dst, lease)
+
             try do
               Storage.fork_shard(src, dst)
             after
+              stop_fork_renewer(renewer)
               # Keeps a takeover's lineage claim (expert review 2026-10-12 #3).
               Storage.release_lease(dst, lease, lease[:claim])
             end
@@ -173,6 +193,49 @@ defmodule Fathom.Tenants do
 
       {:error, reason} ->
         {:error, {:drain_failed, reason}}
+    end
+  end
+
+  # Renews the fork's dst lease every ttl/3 while the copy runs; linked so a crashed caller tears it
+  # down. Only a real `:superseded` stops it (`ShardMigration.renew_continue?/1`): a transient store
+  # error must not end renewal and lapse the lock.
+  defp start_fork_renewer(dst, lease) do
+    ttl = fork_lease_ttl()
+    spawn_link(fn -> fork_renew_loop(dst, lease, ttl, max(div(ttl, 3), 1)) end)
+  end
+
+  defp stop_fork_renewer(pid) do
+    Process.unlink(pid)
+    send(pid, :stop)
+    :ok
+  end
+
+  defp fork_renew_loop(dst, lease, ttl, interval) do
+    receive do
+      :stop ->
+        :ok
+    after
+      interval ->
+        result =
+          try do
+            Storage.renew_lease(dst, lease, ttl)
+          rescue
+            e -> {:error, e}
+          catch
+            kind, reason -> {:error, {kind, reason}}
+          end
+
+        if Fathom.Migrator.ShardMigration.renew_continue?(result) do
+          next =
+            case result do
+              {:ok, fresh} -> fresh
+              {:error, _transient} -> lease
+            end
+
+          fork_renew_loop(dst, next, ttl, interval)
+        else
+          :ok
+        end
     end
   end
 
@@ -312,9 +375,11 @@ defmodule Fathom.Tenants do
         {:error, :not_stored}
 
       {:ok, _etag} ->
-        case Fathom.Shard.verify_integrity(tmp) do
+        # integrity_check, not quick_check (expert review 2026-10-15 #11): VACUUM INTO copies a
+        # divergent index verbatim and only the full check sees it. Export is off the hot path.
+        case Fathom.Shard.Integrity.verify_full(tmp) do
           :ok ->
-            # verify_integrity opened the temp (WAL mode) for a read-only quick_check; drop any
+            # verify_full opened the temp (WAL mode) for a read-only quick_check; drop any
             # empty WAL siblings it left so the returned file is a self-contained db the caller
             # can read + delete cleanly.
             for s <- ["-wal", "-shm"], do: File.rm(tmp <> s)
@@ -697,6 +762,37 @@ defmodule Fathom.Tenants do
   # HranaAuth's own normalization.
   defp auth_required?, do: Application.get_env(:fathom, :hrana_auth, :disabled) != :disabled
 
+  # Expert review 2026-10-15 #20: the durable storage marker used to be written only AFTER the purge,
+  # so a Postgres PITR inside the DeleteJob's retry horizon (~4.5 h) un-tombstoned an id whose objects
+  # still existed, and the boot union found no marker. Write it before the job is enqueued. Best
+  # effort: the post-purge write in `purge/1` stays and is idempotent, so a failure here only
+  # narrows (not removes) the protection.
+  defp write_early_marker(id) do
+    case Storage.put_tombstone(id) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "tenant #{id}: early durable tombstone marker failed (#{inspect(reason)}); " <>
+            "the post-purge write will retry"
+        )
+
+        :ok
+    end
+  rescue
+    e ->
+      Logger.warning(
+        "tenant #{id}: early durable tombstone marker raised: #{Exception.message(e)}"
+      )
+
+      :ok
+  catch
+    :exit, reason ->
+      Logger.warning("tenant #{id}: early durable tombstone marker exit: #{inspect(reason)}")
+      :ok
+  end
+
   defp enqueue_delete(id) do
     %{shard_id: id}
     |> DeleteJob.new()
@@ -727,6 +823,23 @@ defmodule Fathom.Tenants do
     _ -> {:ok, 0}
   catch
     :exit, _ -> {:ok, 0}
+  end
+
+  @doc """
+  Stops this node's coordinator for a tombstoned `shard_id` and removes every local working file
+  (expert review 2026-10-15 #3). Run on EVERY node by `Fathom.Tenants.Tombstones` when it learns of a
+  delete, and by its boot sweep, not only by `purge/1` on the DeleteJob's node. Idempotent. Refuses
+  (no-op) for an id that is not tombstoned: this is destructive and unfenced.
+  """
+  @spec erase_local(String.t()) :: :ok
+  def erase_local(shard_id) do
+    with {:ok, id} <- cast(shard_id), true <- Tombstones.tombstoned?(id) do
+      Shards.stop(id)
+      rm_local(id)
+      :telemetry.execute([:fathom, :tenants, :local_erased], %{count: 1}, %{shard_id: id})
+    end
+
+    :ok
   end
 
   # Remove every local working file for the shard after the coordinator is stopped: the live

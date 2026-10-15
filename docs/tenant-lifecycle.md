@@ -108,6 +108,16 @@ self-fence path. Only *then* does `purge` delete the storage. `rm_local` additio
 stray `.fenced.*` / `.forked.*` / `.corrupt.*` copies (anchored at `<id>.db` so it can't hit a sibling
 id). Together with the A2 replica erase above, no copy of a deleted tenant is left on disk.
 
+**Every node erases its own local files (expert review 2026-10-15 #3).** `purge` runs on whichever node
+Oban picks, usually not the shard's LB home. `Tombstones` therefore runs `Tenants.erase_local/1` (stop
+the local coordinator, remove `<id>.db*`, including `.fenced/.forked/.corrupt` copies; erasure
+outranks forensics) on EVERY node when it learns of a delete (NOTIFY, `put/1`, incremental refresh),
+and a boot sweep lists the data dir once after the first successful tombstone load and erases the files
+of every tombstoned id found. `delete/1` also writes the durable storage tombstone marker BEFORE
+enqueueing the job (#20); the post-purge write stays and is idempotent. Restore (`Snapshots.restore/3`)
+refuses a tombstoned id up front and again under the lease, and drops the live key if a delete lands
+during the copy-back (#13).
+
 ### Cross-node safety
 
 Deletes are usually issued from a node that isn't the shard's LB home. Purging the storage is safe
@@ -231,6 +241,11 @@ fork(src, dst):
   -> %{shard_id: dst, url, auth_token, auth_required, warnings}   # DNS-safety applies to dst too (#35)
 ```
 
+The response carries `source_flushed_at` (#26): with `flush_source: true`, now; otherwise the directory's
+`last_flushed_at` for `src` (null if never recorded), so a caller can see how stale the clone is. Unlike
+`export`, a plain fork does not flush first. The fork holds the dst lease with a renewer for the whole
+copy (#29).
+
 It reflects `src`'s **last durably-flushed** state and does NOT disrupt `src` (no drain) — snapshot
 or drain `src` first for the very latest. Registering the dst directory row at the source's schema
 version is load-bearing: a fork left at `v0` while its copied `.db` is at `vN` would be swept as a
@@ -250,7 +265,8 @@ The recover/validate/clone commands over the `Storage` behaviour, so recovery is
 `pull`/`inspect` only touch stored objects; `fork` needs the directory + token secret (run it from a
 node console in a running release). A scheduled **fleet** restore-drill (sample N shards/day) is a
 follow-up — `inspect` is the manual per-shard form today. Point-in-time restore is `mix
-fathom.snapshot restore` (#12); a fleet schema revert is the migrator.
+fathom.snapshot restore` (#12); restore runs a full `integrity_check` on a sibling copy of the snapshot and refuses with
+`{:snapshot_corrupt, _}` unless `allow_corrupt: true` (separate from `force`, which is schema skew only); a fleet schema revert is the migrator.
 
 ## Operator runbook
 
