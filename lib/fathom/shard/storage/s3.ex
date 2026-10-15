@@ -1854,6 +1854,19 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  # Same HEAD as version_present?/2, keeping the failure: only a 404 is `:absent`. Anything else (a
+  # 5xx, a throttle, a transport error) is `{:error, _}`, so a DR reconcile never clears a pointer
+  # to a copy it merely could not reach.
+  @impl true
+  def version_state(shard_id, version) do
+    case Req.head(req(), url: url_path(version_key(shard_id, version))) do
+      {:ok, %{status: 200}} -> :present
+      {:ok, %{status: 404}} -> :absent
+      {:ok, %{status: status}} -> {:error, {:s3_head_status, status}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @impl true
   def restore(shard_id, version, expected_etag) do
     # Fenced restore (expert review 2026-07-14 #4): the revert counterpart of the fenced flush/3.

@@ -526,6 +526,9 @@ defmodule Fathom.Test.FaultyStorage do
   def version_present?(shard_id, version), do: Local.version_present?(shard_id, version)
 
   @impl true
+  def version_state(shard_id, version), do: Local.version_state(shard_id, version)
+
+  @impl true
   def put_tombstone(shard_id) do
     # run_before(:put_tombstone, shard_id) fires between purge's first sweep and its marker, which
     # is where a racing migration's retain copy lands (expert review 2026-09-29 #20).

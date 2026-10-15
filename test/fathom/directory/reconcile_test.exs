@@ -102,6 +102,91 @@ defmodule Fathom.Directory.ReconcileTest do
     assert {:ok, %{status: "deleted"}} = Directory.get(shard)
   end
 
+  # Expert review 2026-10-15 #24: a PITR can roll `retained_version` back to a value whose
+  # `<shard>@<version>` copy RetirementJob has since dropped. A revert would then aim at nothing.
+  # Reconcile clears such a pointer, but only on proof of absence: a store error is never a clear.
+  describe "retained_version is reconciled against the stored copy (expert review 2026-10-15 #24)" do
+    test "a pointer to an absent copy is reported, and --fix clears it" do
+      shard = uniq()
+      on_exit(fn -> cleanup(shard) end)
+      {:ok, _} = Directory.resolve(shard)
+      seed_object(shard, 5)
+      {:ok, _} = Directory.cutover(shard, 5, 3)
+
+      # The copy `shard@3` was never written (or was retired): the pointer is stale.
+      findings = Reconcile.run()
+
+      assert Enum.any?(
+               findings,
+               &match?(%{shard_id: ^shard, kind: :retained_drift, version: 3, fixed: false}, &1)
+             )
+
+      assert {:ok, %{retained_version: 3}} = Directory.get(shard),
+             "dry run must not modify the directory"
+
+      fixed = Reconcile.run(fix: true)
+
+      assert Enum.any?(
+               fixed,
+               &match?(%{shard_id: ^shard, kind: :retained_drift, version: 3, fixed: true}, &1)
+             )
+
+      assert {:ok, %{retained_version: nil}} = Directory.get(shard)
+    end
+
+    test "a pointer to a copy that exists is left alone" do
+      shard = uniq()
+      on_exit(fn -> cleanup(shard) end)
+      on_exit(fn -> File.rm(Path.join(remote_dir(), "#{shard}@3.db")) end)
+      {:ok, _} = Directory.resolve(shard)
+      seed_object(shard, 5)
+      :ok = Storage.retain(shard, 3)
+      {:ok, _} = Directory.cutover(shard, 5, 3)
+
+      findings = Reconcile.run(fix: true)
+
+      refute Enum.any?(findings, &(&1[:shard_id] == shard and &1.kind == :retained_drift))
+      assert {:ok, %{retained_version: 3}} = Directory.get(shard)
+    end
+
+    test "a store error reading the copy is :unreadable and never clears the pointer" do
+      shard = uniq()
+      on_exit(fn -> cleanup(shard) end)
+      prev = Application.get_env(:fathom, :shard_storage)
+
+      # Fully qualified: this test sits above the `defmodule StubStorage` it uses, so the bare alias
+      # is not in scope here and would store the atom `StubStorage` as the backend.
+      Application.put_env(:fathom, :shard_storage, __MODULE__.StubStorage)
+
+      on_exit(fn ->
+        Application.delete_env(:fathom, :recon_stub)
+
+        if prev,
+          do: Application.put_env(:fathom, :shard_storage, prev),
+          else: Application.delete_env(:fathom, :shard_storage)
+      end)
+
+      Application.put_env(:fathom, :recon_stub, %{
+        {:uv, shard} => {:ok, 0},
+        {:floor, shard} => {:ok, 0},
+        {:retained, shard} => {:error, :timeout}
+      })
+
+      {:ok, _} = Directory.resolve(shard)
+      {:ok, _} = Directory.cutover(shard, 0, 3)
+
+      findings = Reconcile.run(fix: true)
+
+      assert Enum.any?(
+               findings,
+               &match?(%{shard_id: ^shard, kind: :unreadable, fact: :retained}, &1)
+             )
+
+      refute Enum.any?(findings, &(&1[:shard_id] == shard and &1.kind == :retained_drift))
+      assert {:ok, %{retained_version: 3}} = Directory.get(shard)
+    end
+  end
+
   defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 
   # Expert review 2026-10-12 #6: a storage error (or a killed row task) used to map to `[]`, so a
@@ -116,6 +201,7 @@ defmodule Fathom.Directory.ReconcileTest do
     def object_user_version(shard), do: answer(:uv, shard)
     def read_token_floor(shard), do: answer(:floor, shard)
     def tombstoned_ids, do: {:ok, []}
+    def version_state(shard, _version), do: answer(:retained, shard)
 
     # The full-pull fallback for {:header_unreachable, _}: materialize a v4 file.
     def pull(_shard, path) do
@@ -217,6 +303,39 @@ defmodule Fathom.Directory.ReconcileTest do
           do: Application.put_env(:fathom, S3, prev_s3),
           else: Application.delete_env(:fathom, S3)
       end)
+    end
+
+    # Expert review 2026-10-15 #24: only a 404 may read as an absent retained copy. A 500 or a
+    # throttle is an error, because a reconcile that clears a pointer on a blip discards a revert
+    # target that is still there.
+    test "version_state: only a 404 is :absent; any other failure is an error" do
+      test_pid = self()
+
+      Application.put_env(:fathom, :shard_storage, S3)
+
+      for {status, expected} <- [
+            {200, :present},
+            {404, :absent},
+            {500, {:error, {:s3_head_status, 500}}}
+          ] do
+        plug = fn conn ->
+          send(test_pid, {:head, conn.method, conn.request_path})
+          Plug.Conn.send_resp(conn, status, "")
+        end
+
+        Application.put_env(:fathom, S3,
+          bucket: "b",
+          region: "us-east-1",
+          access_key_id: "k",
+          secret_access_key: "s",
+          endpoint: "https://s3.example",
+          path_style: true,
+          req_plug: plug
+        )
+
+        assert S3.version_state("shard_probe", 3) == expected
+        assert_received {:head, "HEAD", _}
+      end
     end
 
     test "reads user_version with a ranged GET only and reports the drift" do

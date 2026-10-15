@@ -9,7 +9,7 @@ defmodule Fathom.Directory.Reconcile do
 
   This sweep realigns the directory to the authoritative durable facts in storage, and is the
   DR-completion step: **run it (with `--fix`) after a Postgres restore, before reopening traffic.**
-  It reconciles three facts, each already backstopped in storage:
+  It reconciles four facts, each already backstopped in storage:
 
     * **`schema_version`** ← the shard file's `PRAGMA user_version`. The file lives in storage (not
       Postgres), so its version survives a directory restore and is the source of truth.
@@ -17,6 +17,18 @@ defmodule Fathom.Directory.Reconcile do
       never lowered, so a restore can't un-revoke.
     * **deleted status** ← the durable tombstones (`Storage.tombstoned_ids/0`, #6a). A storage
       tombstone with no `deleted` directory row is re-tombstoned.
+    * **`retained_version`** ← the retained `<shard>@<version>` copy. A pointer to a copy storage no
+      longer holds is cleared (the copy's presence is the fact, and a PITR can resurrect a pointer
+      that `RetirementJob` already retired). An unreachable store is reported, never cleared.
+
+  Suspension state is **not** recoverable from a Postgres PITR: a restored directory can show a
+  tenant active that was suspended after the restore point, and nothing here reconciles it. A PITR
+  is not a supported DR path for suspension state (expert review 2026-10-15 #24, decision D15): the
+  operator must re-apply any suspension made after the restore point.
+
+  Storage objects with no directory row (orphans) are not reported yet: finding them needs a
+  paginated listing of every shard object in both backends, which is parked (expert review
+  2026-10-15 #24).
 
   `run/1` returns a list of finding maps; with `fix: true` it applies the corrections. Read-only by
   default (a dry run). `deleted` rows are skipped for the object/version checks (their file is gone).
@@ -95,7 +107,33 @@ defmodule Fathom.Directory.Reconcile do
   # A deleted row's object is purged — nothing to read; it's covered by the tombstone check instead.
   defp reconcile_row(%{status: "deleted"}, _fix?), do: []
 
-  defp reconcile_row(row, fix?), do: reconcile_schema(row, fix?) ++ reconcile_token(row, fix?)
+  defp reconcile_row(row, fix?) do
+    reconcile_schema(row, fix?) ++ reconcile_token(row, fix?) ++ reconcile_retained(row, fix?)
+  end
+
+  # `retained_version` names the retained `<shard>@<version>` copy that a revert restores from. A
+  # Postgres PITR can roll the directory back to a moment when that pointer was still set, after
+  # `RetirementJob` had already dropped the copy from storage, so a revert would aim at an object
+  # that is not there. The copy's presence is the authoritative fact, so a pointer to an absent copy
+  # is cleared (conditionally: `clear_retained_version/2` only clears while the column still names
+  # that version). A store error is `:unreadable`, never a clear: the copy may well be there.
+  defp reconcile_retained(%{retained_version: nil}, _fix?), do: []
+
+  defp reconcile_retained(row, fix?) do
+    version = row.retained_version
+
+    case Storage.version_state(row.shard_id, version) do
+      :present ->
+        []
+
+      :absent ->
+        fixed? = fix? and Directory.clear_retained_version(row.shard_id, version) == :ok
+        [%{shard_id: row.shard_id, kind: :retained_drift, version: version, fixed: fixed?}]
+
+      {:error, reason} ->
+        [%{shard_id: row.shard_id, kind: :unreadable, fact: :retained, reason: reason}]
+    end
+  end
 
   defp reconcile_schema(row, fix?) do
     case stored_user_version(row.shard_id) do

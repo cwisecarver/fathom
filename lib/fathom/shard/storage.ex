@@ -419,6 +419,11 @@ defmodule Fathom.Shard.Storage do
   # the warning never itself fails a release.
   @callback version_present?(shard_id :: String.t(), version :: non_neg_integer()) :: boolean()
 
+  # The same HEAD as `version_present?/2`, but with the failure kept: a DR reconcile must tell "the
+  # retained copy is gone" (clear the directory's pointer) from "the store did not answer" (leave it).
+  @callback version_state(shard_id :: String.t(), version :: non_neg_integer()) ::
+              :present | :absent | {:error, term()}
+
   # Fenced restore (expert review 2026-07-14 #4): copy the shard's `version` object back over
   # live only if the live object still matches `expected_etag` (`If-Match`) — the revert
   # counterpart of the fenced `flush/3`. A revert's read-only `check_lease` fence proves the lock
@@ -1107,6 +1112,10 @@ defmodule Fathom.Shard.Storage do
   @doc "Best-effort: whether a retained `<shard>@<version>` object exists (expert review #11)."
   @spec version_present?(String.t(), non_neg_integer()) :: boolean()
   def version_present?(shard_id, version), do: backend().version_present?(shard_id, version)
+
+  @doc "Whether `<shard>@<version>` exists, distinguishing an absent copy from a store error (see `version_state` callback)."
+  @spec version_state(String.t(), non_neg_integer()) :: :present | :absent | {:error, term()}
+  def version_state(shard_id, version), do: backend().version_state(shard_id, version)
 
   @doc "Copies the shard's `version` object back to live (the revert step)."
   @spec restore(String.t(), non_neg_integer()) :: :ok | {:error, term()}

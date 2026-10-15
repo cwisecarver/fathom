@@ -327,6 +327,11 @@ defmodule Fathom.Shard.Storage.Local do
   def version_present?(shard_id, version), do: File.exists?(version_path(shard_id, version))
 
   @impl true
+  def version_state(shard_id, version) do
+    if File.exists?(version_path(shard_id, version)), do: :present, else: :absent
+  end
+
+  @impl true
   def restore(shard_id, version, expected_etag) do
     # Fenced restore (expert review 2026-07-14 #4): mirror flush/3's emulated conditional write
     # so the revert's copy-back only lands if live still matches the etag the migrator captured
