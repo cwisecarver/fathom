@@ -50,6 +50,28 @@ prod node needs to boot or run:
 - **The replication protocol gained a reply code** (torn replica). Upgrade all nodes together;
   an old node's replies are still read.
 
+From the 2026-10-14 performance round and the bugs its rig run found:
+
+- **Fixed a failover data-loss bug.** A write acknowledged while a shard's followers were being
+  re-seeded (the first write after an idle drop or handoff) left every replica at "unknown" WAL
+  ordinal, so failover recovery skipped them and the write was lost if the node died before its
+  next push. Seeds now carry the ordinal. This adds a seed frame to the replication protocol behind
+  the existing ordinal-wire gate; upgrade all nodes together.
+- **Remote flushes work with `NODE_KEY`.** A flush, export, fork or `flush: true` snapshot sent to a
+  node that does not hold the shard used to wait 15 s and fail when `NODE_KEY` differed from the
+  node name.
+- **Idle database handles now stay open 250 ms** (`POOL_DRAIN_GRACE_MS`, 0 restores the old
+  close-at-once behaviour), capped at `POOL_IDLE_BUDGET` (8,192 per node). One-off requests are
+  about 65% faster (439 → 150 µs); each recently used shard can hold ~170 KB longer.
+- **New env knobs:** `RECONCILE_WATERMARK` (1000) and `RECONCILE_ROLLOUT_BUDGET_MS` (10 min) — the
+  hourly migration sweep now enqueues up to a backlog watermark instead of a fixed 100.
+- **Erasure re-checks decay:** a deleted tenant's storage is probed 6 times over 30 days (1 h, 6 h,
+  24 h, 7 d, 29 d) instead of hourly; an object that reappears late is caught at the next probe.
+- **Three more Postgres migrations** (`purge_verified_at` column and index; dropping two unused
+  `shards` indexes), all `CONCURRENTLY`.
+- **Measured on the chaos rig** (1024 tenants, replication on, 30 s flush): 2,400 → 3,340 txn/s,
+  p99 1.5 s → 0.6 s, errors 50-116 → 2.
+
 ### Changed
 
 - **Filo now comes from Hex** (`{:filo, "~> 0.2.0"}`) instead of a `path: "../filo"`
