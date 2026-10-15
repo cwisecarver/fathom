@@ -4692,10 +4692,9 @@ defmodule Fathom.Shard do
   # object, went straight to the PUT with no check at all.
   #
   # The old justification was that `VACUUM INTO` reads every page so it fails on corruption by
-  # itself. Only partly true, and wrong in the direction that matters: `VACUUM INTO` REBUILDS
-  # indexes from table content, so the classic index/table divergence `quick_check` exists to
-  # catch is silently NORMALISED AWAY rather than detected — and the normalised file is then
-  # uploaded, correctly If-Match-fenced by the legitimate owner, as the new durable truth.
+  # itself. Not true: the probe below shows a structurally corrupt index page coming out of
+  # `VACUUM INTO` with a clean copy, so the evidence never reaches the uploaded file — which is
+  # then uploaded, correctly If-Match-fenced by the legitimate owner, as the new durable truth.
   #
   # Check the SNAPSHOT TEMP, not the live file: it is the artifact about to become the durable
   # object, and it is about to be fully read for the Content-MD5 anyway, so the page reads are
@@ -4704,18 +4703,25 @@ defmodule Fathom.Shard do
   # CHECKS THE LIVE FILE, NOT THE SNAPSHOT TEMP — and that distinction is the whole point.
   #
   # The review recommended checking the temp, on the reasoning that it is about to be read for
-  # the Content-MD5 anyway so the pages are free. Measured before implementing, that is wrong:
-  # `VACUUM INTO` REBUILDS indexes from table content, so it *repairs* index/table divergence on
-  # the way out. Probe on a database with a deliberately corrupted index root page:
+  # the Content-MD5 anyway so the pages are free. Measured before implementing, that is wrong for
+  # STRUCTURAL damage: a database with a deliberately corrupted index root page came out of
+  # `VACUUM INTO` with a copy `quick_check` passes:
   #
   #     quick_check on the live db   -> "Tree 3 page 3 cell 199: Offset 23130 out of range …"
   #     VACUUM INTO                  -> OK
   #     quick_check on the VACUUMed copy -> "ok"      (200 rows intact)
   #
-  # So the temp is clean by construction for exactly the corruption class `quick_check` exists
-  # to catch, and checking it would have shipped a gate that never fires — while the divergence
-  # is silently normalised away and uploaded, correctly If-Match-fenced, as the new durable
-  # truth. The live file is the only place the evidence still exists.
+  # So the temp is clean for exactly the structural class `quick_check` catches, and checking it
+  # would have shipped a gate that never fires. The live file is the only place that evidence
+  # still exists.
+  #
+  # WHAT THIS GATE CANNOT SEE (expert review 2026-10-15 #11, probed on exqlite's bundled SQLite):
+  # an index whose CONTENT disagrees with its table (a stale expression/UDF index after a function
+  # changed behaviour). `VACUUM INTO` does NOT rebuild indexes from table content — the transfer
+  # copies such an index verbatim — and `quick_check` misses it on both the live file and the copy;
+  # only `integrity_check` sees it. That full check is deliberately OFF this hot path: it runs
+  # detect-only in the restore drill (`Integrity.verify_full/1`). This comment used to say VACUUM
+  # "rebuilds indexes from table content" and so normalised such drift away; it does neither.
   #
   # Cost is one full page scan per periodic flush, on a path that already reads the whole file
   # (VACUUM INTO) and the whole temp (MD5 + PUT). Shards are small by fathom's premise, which is
@@ -4745,9 +4751,10 @@ defmodule Fathom.Shard do
   #
   # THE THREE GUARDS THAT MUST SURVIVE ANY FUTURE EDIT HERE:
   #   (a) `quick_check` runs on the LIVE file, never on the VACUUM temp — see the probe above.
+  #       (It does not catch index CONTENT drift on either; see "WHAT THIS GATE CANNOT SEE".)
   #   (b) It SHORT-CIRCUITS before the VACUUM: a corrupt shard must not pay a full snapshot.
   #   (c) The extension stays loaded on this connection (`Connection.open/2` does it): `VACUUM INTO`
-  #       rebuilds indexes and `quick_check` verifies them, so a Django expression index over a UDF
+  #       and `quick_check` both touch the schema's indexes, so a Django expression index over a UDF
   #       would fail "no such function" without it.
   defp verify_and_snapshot(state, temp) do
     case Connection.open(state.path) do
