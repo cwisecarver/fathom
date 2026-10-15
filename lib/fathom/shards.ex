@@ -1557,13 +1557,20 @@ defmodule Fathom.Shards do
   # path) cost only the lookup; the confirm runs on a miss, i.e. a cold open or an already-cold
   # drain/stop, which are far heavier than one extra ETS select.
   defp registry_lookup(shard_id) do
-    case Registry.lookup(@registry, shard_id) do
-      [] -> {:ok, Registry.match(@registry, shard_id, :_)}
+    case alive(Registry.lookup(@registry, shard_id)) do
+      [] -> {:ok, alive(Registry.match(@registry, shard_id, :_))}
       found -> {:ok, found}
     end
   rescue
     ArgumentError -> {:error, :unavailable}
   end
+
+  # The Registry partition removes a dead pid's entry ASYNCHRONOUSLY (it handles the EXIT as a
+  # message), and neither `lookup/2` nor `match/3` filters the window: a coordinator that had just
+  # crashed came back from `ensure/1` as a dead pid, and the caller's first call on it exited
+  # `:noproc` (CI 2026-10-15, seed 906875). A dead entry is "nobody here"; the open that follows
+  # replaces it (`register_name` evicts a dead registrant).
+  defp alive(entries), do: Enum.filter(entries, fn {pid, _} -> Process.alive?(pid) end)
 
   # Every `{shard_id, pid}` registered on this node. If a partition is down the select raises, so
   # fall back to the supervisor's children (they ARE the coordinators) with the id resolved lazily
