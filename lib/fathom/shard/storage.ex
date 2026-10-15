@@ -1487,6 +1487,9 @@ defmodule Fathom.Shard.Storage do
     end
   end
 
+  # (Comment on why ETS: see `quiescence_state/1`.) Defined before its first use.
+  @quiescence_table __MODULE__.Quiescence
+
   @doc """
   Record that `owner` — a previous incarnation of THIS node — was verified dead and
   its heartbeat cleared (expert review round-2 #34; the proof-of-death rules are
@@ -1506,18 +1509,58 @@ defmodule Fathom.Shard.Storage do
     # the exact cost this fast-path exists to erase. The set is tiny (a handful of recent
     # incarnations of THIS node) so it stays bounded and simple. persistent_term writes trigger
     # a global GC, so write ONLY on a genuinely new discovery (membership-check first).
-    dead = dead_incarnations()
+    #
+    # MARKS EXPIRE (expert review 2026-10-15 #28). The set used to grow for the life of the node, and
+    # the `:quiescent` verdict beside it was sticky forever, so a predecessor that came BACK (a
+    # paused VM resumed, a zombie whose Heartbeat process is dead but which renews locks per shard)
+    # stayed fast-stealable indefinitely. Each entry is `owner => monotonic mark time` and is only
+    # honoured for `dead_mark_ttl_ms/0` — the lock-TTL fallback window the fast path exists to skip.
+    # Past it nothing is lost: any lock the dead predecessor held has expired by its own TTL and the
+    # ordinary fallback steals it. A fresh mark also discards the owner's old quiescence verdict, so
+    # a re-proven death is re-probed rather than inheriting a stale `:quiescent`/`:renewing`.
+    now = System.monotonic_time(:millisecond)
+    marks = dead_marks()
 
-    unless MapSet.member?(dead, owner) do
-      :persistent_term.put({__MODULE__, :dead_incarnations}, MapSet.put(dead, owner))
+    unless dead_mark_live?(Map.get(marks, owner), now, dead_mark_ttl_ms()) do
+      live = Map.filter(marks, fn {_o, at} -> dead_mark_live?(at, now, dead_mark_ttl_ms()) end)
+      :persistent_term.put({__MODULE__, :dead_incarnations}, Map.put(live, owner, now))
+      forget_quiescence(owner)
     end
 
     :ok
   end
 
+  @doc false
+  # Pure, for the boundary test: a mark made at `at` is honoured while younger than `ttl`.
+  @spec dead_mark_live?(integer() | nil, integer(), non_neg_integer()) :: boolean()
+  def dead_mark_live?(nil, _now, _ttl), do: false
+  def dead_mark_live?(at, now, ttl), do: now - at < ttl
+
+  # `ttl + steal_margin`: the longest the lock-TTL fallback could have made the restarted node
+  # wait, i.e. everything the fast path can save. Overridable for tests.
+  defp dead_mark_ttl_ms do
+    ttl = Application.get_env(:fathom, :shard_lease_ttl_ms, 30_000)
+    Application.get_env(:fathom, :lease_dead_mark_ttl_ms, ttl + steal_margin_ms())
+  end
+
+  defp dead_marks, do: :persistent_term.get({__MODULE__, :dead_incarnations}, %{})
+
+  defp forget_quiescence(owner) do
+    :ets.delete(@quiescence_table, owner)
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
   @doc "Whether `owner` is a previous incarnation `mark_incarnation_dead/1` proved dead. Exact string match, so migrator/foreign owners can never match."
   @spec incarnation_dead?(String.t()) :: boolean()
-  def incarnation_dead?(owner), do: MapSet.member?(dead_incarnations(), owner)
+  def incarnation_dead?(owner),
+    do:
+      dead_mark_live?(
+        Map.get(dead_marks(), owner),
+        System.monotonic_time(:millisecond),
+        dead_mark_ttl_ms()
+      )
 
   # A heartbeat proof is NOT a proof that the process stopped (expert review 2026-08-20 #10).
   #
@@ -1610,7 +1653,6 @@ defmodule Fathom.Shard.Storage do
   # ETS, not `:persistent_term`: this is written on a sampling path rather than once at boot, and a
   # persistent-term write schedules a literal-area cleanup that scans every process on the node —
   # the cost expert review #36 removed from the shipper budget for the same reason.
-  @quiescence_table __MODULE__.Quiescence
 
   # Lookup-only: a missing table reads as "no sample", which can only delay the fast path, never
   # take it early. The table is created once at boot by `init_quiescence_table/0`, under a
@@ -1671,8 +1713,12 @@ defmodule Fathom.Shard.Storage do
 
   @doc false
   @spec dead_incarnations() :: MapSet.t(String.t())
-  def dead_incarnations,
-    do: :persistent_term.get({__MODULE__, :dead_incarnations}, MapSet.new())
+  def dead_incarnations do
+    now = System.monotonic_time(:millisecond)
+    ttl = dead_mark_ttl_ms()
+
+    for {owner, at} <- dead_marks(), dead_mark_live?(at, now, ttl), into: MapSet.new(), do: owner
+  end
 
   # THE OTHER HALF OF `reset_quiescence/0`, and its absence was a test-isolation hole.
   #

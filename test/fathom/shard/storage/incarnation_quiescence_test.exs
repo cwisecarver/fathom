@@ -162,6 +162,59 @@ defmodule Fathom.Shard.Storage.IncarnationQuiescenceTest do
     end
   end
 
+  # expert review 2026-10-15 #28. `mark_incarnation_dead/1` entries and the sticky `:quiescent`
+  # verdict never expired, so a predecessor that came back (a paused VM resumed, a zombie whose
+  # Heartbeat process is dead but which renews locks per shard) stayed fast-stealable for the life of
+  # the node. A mark is honoured only for the lock-TTL fallback window it exists to skip.
+  describe "dead marks expire (#28)" do
+    setup do
+      Storage.reset_quiescence()
+      Storage.reset_incarnation_deaths()
+
+      prev = Application.get_env(:fathom, :lease_dead_mark_ttl_ms)
+
+      on_exit(fn ->
+        if is_nil(prev),
+          do: Application.delete_env(:fathom, :lease_dead_mark_ttl_ms),
+          else: Application.put_env(:fathom, :lease_dead_mark_ttl_ms, prev)
+
+        Storage.reset_quiescence()
+        Storage.reset_incarnation_deaths()
+      end)
+
+      :ok
+    end
+
+    test "dead_mark_live?/3 boundary: honoured while strictly younger than the ttl" do
+      refute Storage.dead_mark_live?(nil, 100, 50)
+      assert Storage.dead_mark_live?(100, 149, 50)
+      refute Storage.dead_mark_live?(100, 150, 50)
+    end
+
+    test "an aged-out mark stops permitting the steal, and a re-proof is re-probed" do
+      Application.put_env(:fathom, :lease_dead_mark_ttl_ms, 60_000)
+      Storage.mark_incarnation_dead(@owner)
+
+      refute Storage.fast_steal_ok?(@owner, "acme", 5_000, 100)
+      assert Storage.fast_steal_ok?(@owner, "acme", 5_000, 100 + 10_000_000)
+      assert Storage.incarnation_dead?(@owner)
+
+      # The window elapses. Pre-fix the mark (and its sticky :quiescent verdict) lived forever.
+      Application.put_env(:fathom, :lease_dead_mark_ttl_ms, 0)
+      refute Storage.incarnation_dead?(@owner)
+      refute Storage.fast_steal_ok?(@owner, "acme", 5_000, 100 + 20_000_000)
+      assert Storage.dead_incarnations() == MapSet.new()
+
+      # A fresh death proof starts a fresh probe instead of inheriting the old :quiescent.
+      # (Re-marked while still expired, as real elapsed time would have it, then the window reopens.)
+      Storage.mark_incarnation_dead(@owner)
+      Application.put_env(:fathom, :lease_dead_mark_ttl_ms, 60_000)
+
+      refute Storage.fast_steal_ok?(@owner, "acme", 5_000, 100 + 30_000_000),
+             "a re-proven death inherited the previous episode's :quiescent verdict"
+    end
+  end
+
   # expert review 2026-10-12 #17. The quiescence table used to be created lazily by whichever
   # process asked first. After a restart, each open ended in a short-lived coordinator, and that
   # coordinator's exit deleted the table with every sample in it, so no sample ever reached
