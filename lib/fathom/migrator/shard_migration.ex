@@ -993,10 +993,11 @@ defmodule Fathom.Migrator.ShardMigration do
          # path rather than a PITR.
          #
          # The `VACUUM INTO` caveat AGENTS.md records does NOT apply here, and that is why this
-         # check is worth having: the flush path's temp is a VACUUM product, which rebuilds indexes
-         # from table content and therefore repairs the exact divergence a gate would look for.
-         # `Copy.copy_file/2` is a plain `File.cp`, so `new` is a byte copy of the pulled source and
-         # `quick_check` on it is meaningful.
+         # check is worth having: the flush path's temp is a VACUUM product, which rewrites every
+         # page and so repairs the page-level corruption a gate would look for. `Copy.copy_file/2`
+         # is a plain `File.cp`, so `new` is a byte copy of the pulled source and `quick_check` on
+         # it is meaningful. (`quick_check` still cannot see an index that disagrees with its table;
+         # VACUUM copies such an index verbatim too — expert review 2026-10-15 #11.)
          #
          # Placed BEFORE `fence/2` and the flush, so a failure leaves the shard untouched at its old
          # version and the job retries — rather than after, where it would be reporting on bytes
