@@ -54,9 +54,13 @@ defmodule Fathom.Shard.Replication.Promote do
   alias Fathom.Shard
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.Follower
+  alias Fathom.Shard.Replication.Wal
   alias Fathom.Shard.Storage
 
   @lease_ttl_ms 30_000
+
+  # A WAL frame header: pgno, nTruncate, two salts, two checksums (see `Wal`).
+  @frame_header_bytes 24
 
   @typedoc "What a successful promotion did, for the operator and the tests."
   @type result :: %{
@@ -405,23 +409,85 @@ defmodule Fathom.Shard.Replication.Promote do
   # `quick_check` is the gate on serving these bytes at all: they arrived as raw byte ranges
   # appended to a WAL by a process that never opened the database, so this is the first time
   # anything has asked SQLite whether they make sense.
+  #
+  # ## The replayed frame count is checked against the frames the WAL claims (expert review 2026-10-15 #15)
+  #
+  # Push payloads carry no checksum of their own, so a bit flipped past TCP's checksum (a bad NIC
+  # or RAM) lands in the replica's `-wal` unnoticed. SQLite's WAL recovery then validates the
+  # cumulative frame checksums and STOPS at the first bad frame — silently: it replays the prefix,
+  # the checkpoint succeeds, `quick_check` passes (the prefix is a consistent database), and every
+  # acked frame after the flip is dropped. MEASURED on this exqlite: a 59-frame replica with one
+  # byte flipped in frame 21 replayed 20 frames, served 15 of 50 rows, and `quick_check` said "ok".
+  #
+  # The cross-check costs one header scan: `Wal.read/1` finds the committed extent by frame SALTS
+  # and commit markers only (no checksums), so it states how many committed frames the file CLAIMS;
+  # SQLite's `mxFrame` after recovery is how many it actually VALIDATED. They agree on every honest
+  # WAL — including a capped round's partial tail, since both stop at the last commit frame — and
+  # disagree exactly when a checksum broke inside the committed range. A mismatch declines the
+  # promotion, so the caller serves the stored object instead of a silently truncated replica.
+  #
+  # The count comes from a PASSIVE checkpoint, not the TRUNCATE: measured, `wal_checkpoint(TRUNCATE)`
+  # reports `[0, 0, 0]` (it rewinds `mxFrame` before answering), so its result row says nothing
+  # about what was replayed — the review's prescription to read it there would have checked
+  # nothing. PASSIVE on this private temp (no other connection) checkpoints every frame and reports
+  # `[busy, log, checkpointed]`; the TRUNCATE after it then only empties the file.
+  #
+  # Per-push CRC (which would catch the flip at the follower, before the ack) is parked: default D9
+  # of the 2026-10-15 review.
   defp checkpoint_and_verify(path) do
-    case Connection.open(path) do
-      {:ok, conn} ->
-        try do
-          with {:ok, _} <- Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", []),
-               {:ok, %{rows: [["ok"]]}} <- Connection.query(conn, "PRAGMA quick_check", []) do
-            :ok
-          else
-            {:ok, %{rows: rows}} -> {:error, {:quick_check, rows}}
-            {:error, reason} -> {:error, {:checkpoint_failed, reason}}
+    with {:ok, claimed} <- claimed_wal_extent(path) do
+      case Connection.open(path) do
+        {:ok, conn} ->
+          try do
+            verify_open(conn, claimed)
+          after
+            Connection.close(conn)
           end
-        after
-          Connection.close(conn)
-        end
 
-      {:error, reason} ->
-        {:error, {:open_failed, reason}}
+        {:error, reason} ->
+          {:error, {:open_failed, reason}}
+      end
+    end
+  end
+
+  defp verify_open(conn, claimed) do
+    with {:ok, %{rows: [[page]]}} <- Connection.query(conn, "PRAGMA page_size", []),
+         {:ok, %{rows: [[busy, log, ckpt]]}} <-
+           Connection.query(conn, "PRAGMA wal_checkpoint(PASSIVE)", []),
+         :ok <- frames_match(claimed, page, busy, log, ckpt),
+         {:ok, _} <- Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", []),
+         {:ok, %{rows: [["ok"]]}} <- Connection.query(conn, "PRAGMA quick_check", []) do
+      :ok
+    else
+      {:error, {:wal_frames, _, _} = mismatch} -> {:error, mismatch}
+      {:ok, %{rows: rows}} -> {:error, {:quick_check, rows}}
+      {:error, reason} -> {:error, {:checkpoint_failed, reason}}
+    end
+  end
+
+  # How far the staged `-wal` claims its committed frames reach, read BEFORE SQLite opens it (the
+  # open's recovery and the checkpoint rewrite the file). An absent/header-less WAL claims nothing.
+  # A file that is not a WAL is refused: SQLite would ignore it and promote the bare `.db`, dropping
+  # whatever it held — the same silent truncation as a bad checksum.
+  defp claimed_wal_extent(path) do
+    case Wal.read(path <> "-wal") do
+      {:ok, :empty} -> {:ok, Wal.header_bytes()}
+      {:ok, %{commit_extent: extent}} -> {:ok, extent}
+      {:error, reason} -> {:error, {:wal_unreadable, reason}}
+    end
+  end
+
+  @doc false
+  # Pure, for the boundary tests: does SQLite's validated replay equal what the WAL claims?
+  @spec frames_match(non_neg_integer(), pos_integer(), integer(), integer(), integer()) ::
+          :ok | {:error, {:wal_frames, term(), term()}}
+  def frames_match(claimed_extent, page, busy, log, ckpt) do
+    claimed = div(claimed_extent - Wal.header_bytes(), page + @frame_header_bytes)
+
+    if busy == 0 and log == claimed and ckpt == claimed do
+      :ok
+    else
+      {:error, {:wal_frames, %{claimed: claimed}, %{busy: busy, log: log, checkpointed: ckpt}}}
     end
   end
 

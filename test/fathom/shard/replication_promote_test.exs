@@ -310,6 +310,64 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
     Storage.release_lease(id, lease)
   end
 
+  # Expert review 2026-10-15 #15. Push payloads carry no checksum, so a bit flipped past TCP's lands
+  # in the replica's `-wal`. SQLite's WAL recovery stops at the first frame whose cumulative
+  # checksum breaks — SILENTLY: the checkpoint succeeds, `quick_check` passes on the consistent
+  # prefix, and every acked frame after the flip is gone. Promotion must cross-check the frames
+  # SQLite replayed against the frames the WAL claims, and decline on a mismatch.
+  describe "the replayed frame count is verified (2026-10-15 #15)" do
+    test "a flipped byte inside a committed frame declines the promotion", ctx do
+      %{id: id, root: root} = ctx
+      followers = start_followers!(root, 3)
+      enable!(followers, 2)
+
+      :ok = replicate_then_abandon_primary(id, followers, 12)
+      [{name, _} | _] = followers
+      wal = Follower.wal_path(name, id)
+
+      {:ok, h} = Fathom.Shard.Replication.Wal.read(wal)
+      frame = 4096 + 24
+      frames = div(h.commit_extent - 32, frame)
+
+      # Precondition: the replica's WAL holds several committed frames, or flipping a byte in the
+      # middle of one measures nothing.
+      assert frames >= 4, "the replica's WAL holds #{frames} frames; the fixture is too small"
+
+      # Flip one byte in the PAGE BODY of a frame in the middle — not its header — so the salts and
+      # commit markers `Wal.read/1` scans are intact and only the checksum chain breaks.
+      at = 32 + div(frames, 2) * frame + 24 + 100
+      {:ok, fd} = :file.open(wal, [:read, :write, :raw, :binary])
+      {:ok, <<b>>} = :file.pread(fd, at, 1)
+      :ok = :file.pwrite(fd, at, <<Bitwise.bxor(b, 0xFF)>>)
+      :ok = :file.close(fd)
+
+      assert {:error, {:wal_frames, %{claimed: ^frames}, %{log: log}}} =
+               Promote.promote(id, follower: name)
+
+      assert log < frames
+      refute File.exists?(Fathom.Shard.db_path(id)), "a truncated replica was promoted anyway"
+    end
+
+    test "frames_match/5 accepts only an exact, unbusy replay of the claimed frames" do
+      page = 4096
+      extent = fn n -> 32 + n * (page + 24) end
+
+      assert :ok = Promote.frames_match(extent.(59), page, 0, 59, 59)
+      # An empty WAL claims nothing and replays nothing.
+      assert :ok = Promote.frames_match(32, page, 0, 0, 0)
+
+      # The silent truncation: SQLite validated fewer frames than the file claims.
+      assert {:error, {:wal_frames, %{claimed: 59}, %{log: 20}}} =
+               Promote.frames_match(extent.(59), page, 0, 20, 20)
+
+      # Replayed but not all checkpointed, or a busy checkpoint: not a verified standalone file.
+      assert {:error, _} = Promote.frames_match(extent.(59), page, 0, 59, 58)
+      assert {:error, _} = Promote.frames_match(extent.(59), page, 1, 59, 59)
+      # More frames than claimed is just as much a disagreement.
+      assert {:error, _} = Promote.frames_match(extent.(3), page, 0, 4, 4)
+    end
+  end
+
   # Expert review 2026-10-12 #28. `promote/2` renamed the staged replica over whatever was at the
   # live path and never touched a leftover `-wal`/`-shm`. Symptoms: (1) a kept-local `.db` holding
   # acked writes was overwritten with no trace; (2) a stale `-wal` beside an absent `.db` stayed next
