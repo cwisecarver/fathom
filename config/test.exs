@@ -13,7 +13,10 @@ config :fathom, Fathom.Repo,
   hostname: System.get_env("PGHOST") || "localhost",
   database: "fathom_test#{System.get_env("MIX_TEST_PARTITION")}",
   pool: Ecto.Adapters.SQL.Sandbox,
-  pool_size: System.schedulers_online() * 2,
+  # TEST_POOL_SIZE lets several suites share one local Postgres: at the default (2x schedulers)
+  # nine concurrent worktree runs exhausted max_connections (FATAL 53300) on 2026-10-15.
+  pool_size:
+    String.to_integer(System.get_env("TEST_POOL_SIZE") || "#{System.schedulers_online() * 2}"),
   # DBConnection SHEDS LOAD by design: past `queue_target` it starts dropping queued checkouts
   # (default 50ms target / 1000ms interval). That is correct for a production data plane — a
   # dropped checkout is better than an unbounded queue — but it is never what you want in a test
