@@ -2725,8 +2725,14 @@ defmodule Fathom.Shard do
   # check arbitrate (the same outcome as a failed drop flush).
   defp flush_and_drop_unless_tombstoned(state, closes) do
     cond do
+      # ERASE, don't keep (expert review 2026-10-15 #3). This returned `:ok` with NO drop, on the
+      # stated grounds that "purge deletes the object next" — true of the OBJECT, but `purge`'s
+      # `rm_local` runs only on the node that ran DeleteJob (Oban-routed, usually not the LB home),
+      # so on the home node `<id>.db`, `-wal` and `.etag` survived the tenant's erasure forever.
+      # The flush is still skipped (no resurrection); the local files are unlinked.
       Fathom.Tenants.Tombstones.tombstoned?(state.id) ->
-        :ok
+        unmark_lease_held(state.id)
+        drop_local(state.path)
 
       closes == :close_timeout ->
         keep_local_release_lease(
@@ -3863,6 +3869,27 @@ defmodule Fathom.Shard do
   # the un-flushed count so the lost window is enumerable. The loss itself is within the documented
   # RPO contract — this just stops needlessly destroying a healthy-disk copy the store never got.
   defp quarantine_fenced!(state) do
+    # A TOMBSTONED tenant is being erased: the quarantine exists to preserve its acked writes, which
+    # is exactly what an erasure must not do (expert review 2026-10-15 #3, default D1). The purge's
+    # absent-object reconcile self-fences a live remote owner precisely so it lands here, and the
+    # rename turned that "erase" into a `.fenced.<ts>` copy kept 30 days (or forever).
+    if Fathom.Tenants.Tombstones.tombstoned?(state.id),
+      do: erase_fenced!(state),
+      else: rename_fenced!(state)
+  end
+
+  defp erase_fenced!(state) do
+    drop_local(state.path)
+
+    Logger.warning(
+      "shard #{state.id}: self-fenced while TOMBSTONED — erased the local copy instead of " <>
+        "quarantining it (the tenant is being deleted)"
+    )
+
+    :ok
+  end
+
+  defp rename_fenced!(state) do
     dest =
       state.path <>
         ".fenced.#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
