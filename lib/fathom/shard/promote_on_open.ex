@@ -93,6 +93,58 @@ defmodule Fathom.Shard.PromoteOnOpen do
   defp follower_running?, do: Process.whereis(Follower) != nil
 
   @doc """
+  Would a cold open promote a peer/local replica over the stored object right now? A READ-ONLY
+  probe over the same predicate as `maybe_promote_replica/7` (expert review 2026-10-15 #2): same
+  gates, same `Recovery.best_replica/3` decision, same `Promote.fresher?/2` test — but it installs
+  nothing and touches no marker, so the migrator can ask "is a replica ahead of the object?"
+  without becoming a second A2 writer.
+
+    * `:no` — nothing fresher than the object (or A2 promotion is gated off / not applicable),
+      so reading the object is as good as a cold open would be.
+    * `:ahead` — a replica strictly ahead of the object's stamp exists; the object is STALE and
+      anything that reads-modifies-flushes it would permanently drop the acked tail.
+    * `{:unknown, reason}` — the decision could not be made (object HEAD failed, or too few peers
+      answered inside the under-quorum window). Callers that would overwrite the object treat it
+      like `:ahead`: retry later.
+
+  `prev_owner` is the lease owner string that was stolen, if any (its answer is excluded from the
+  responder floor, as on the open path).
+  """
+  @spec replica_ahead?(String.t(), String.t() | nil) :: :no | :ahead | {:unknown, term()}
+  def replica_ahead?(shard_id, prev_owner) do
+    if promote_on_open?() and follower_running?() and not nothing_to_promote?(shard_id) do
+      probe_replica_ahead(shard_id, prev_owner)
+    else
+      :no
+    end
+  end
+
+  defp probe_replica_ahead(shard_id, prev_owner) do
+    case Storage.object_head(shard_id) do
+      {:ok, nil} ->
+        :no
+
+      {:ok, head} ->
+        stamp = position_of(head)
+
+        cond do
+          Recovery.enabled?() ->
+            case Recovery.best_replica(shard_id, stamp, previous_owner: prev_owner) do
+              {:ok, replica} -> if Promote.fresher?(replica, stamp), do: :ahead, else: :no
+              {:refuse, refusal} -> {:unknown, refusal}
+              _ -> :no
+            end
+
+          true ->
+            if Promote.fresher?(replica_state(shard_id), stamp), do: :ahead, else: :no
+        end
+
+      {:error, reason} ->
+        {:unknown, {:object_head, reason}}
+    end
+  end
+
+  @doc """
   The etag to serve from, given what `maybe_promote_replica/7` returned.
 
   A promotion that stated an ordinal answers `{:promoted, etag, seed}`; every other outcome is the

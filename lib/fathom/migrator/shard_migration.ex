@@ -26,7 +26,7 @@ defmodule Fathom.Migrator.ShardMigration do
   require Logger
 
   alias Fathom.Migrator.{Copy, Ledger, RetirementJob}
-  alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Shard.{Connection, PromoteOnOpen, Storage}
   alias Fathom.{Directory, Migrator, Repo, Shards}
   alias Fathom.Shards.MigrationGate
 
@@ -81,7 +81,9 @@ defmodule Fathom.Migrator.ShardMigration do
         case statement_chain(v, target) do
           {:ok, _buildable} ->
             with_lease(shard_id, token, fn lease ->
-              do_run(shard_id, target, lease)
+              with :ok <- refuse_if_replica_ahead(shard_id, lease) do
+                do_run(shard_id, target, lease)
+              end
             end)
 
           {:error, _} = err ->
@@ -121,47 +123,53 @@ defmodule Fathom.Migrator.ShardMigration do
 
   defp revert_under_lease(shard_id, to_version, token, force?) do
     with_lease(shard_id, token, fn lease ->
-      # Push this node's buffered directory touches down before reading the guard's
-      # inputs (expert review #11): a checkout sitting in the Recorder's ≤1s buffer is
-      # otherwise invisible to the write-age guard, letting an unforced revert discard
-      # real post-cutover activity. Best-effort and node-local — another node's buffer
-      # can still lag; the guard remains the safe-direction approximation it documents.
-      {current, last_active, cutover_at} = guard_inputs(shard_id)
-      tmp = temp_path(shard_id, "revert")
-
-      try do
-        # Capture the live object's etag at pull time so the destructive restore can If-Match
-        # on it (expert review 2026-07-14 #4): the revert's read-only fence/2 only proves the
-        # LOCK is ours at that instant, but the migrator can then stall and a coordinator steal +
-        # flush new bytes before the copy-back lands. Threading this etag into restore/3 turns a
-        # mid-window steal into :superseded instead of an unconditional clobber (the forward
-        # flush/3 already does the same — round-2 #5).
-        with {:ok, etag} <- pull_live(shard_id, tmp) do
-          # Round-2 #30 (crash-forward, the OTHER half of #10 below): the cutover
-          # already completed and the job died before acking — the retry must be a
-          # NO-OP. Re-entering the destructive path would retain(current==to_version),
-          # copying live over the retained @to_version backup (destroying the recovery
-          # copy the next revert restores from), or spuriously log "revert REFUSED".
-          if live_version(tmp) == to_version and to_version == current do
-            :ok
-          else
-            do_revert(
-              shard_id,
-              to_version,
-              current,
-              last_active,
-              cutover_at,
-              tmp,
-              lease,
-              force?,
-              etag
-            )
-          end
-        end
-      after
-        drop_temp(tmp)
+      with :ok <- refuse_if_replica_ahead(shard_id, lease) do
+        revert_held(shard_id, to_version, force?, lease)
       end
     end)
+  end
+
+  defp revert_held(shard_id, to_version, force?, lease) do
+    # Push this node's buffered directory touches down before reading the guard's
+    # inputs (expert review #11): a checkout sitting in the Recorder's ≤1s buffer is
+    # otherwise invisible to the write-age guard, letting an unforced revert discard
+    # real post-cutover activity. Best-effort and node-local — another node's buffer
+    # can still lag; the guard remains the safe-direction approximation it documents.
+    {current, last_active, cutover_at} = guard_inputs(shard_id)
+    tmp = temp_path(shard_id, "revert")
+
+    try do
+      # Capture the live object's etag at pull time so the destructive restore can If-Match
+      # on it (expert review 2026-07-14 #4): the revert's read-only fence/2 only proves the
+      # LOCK is ours at that instant, but the migrator can then stall and a coordinator steal +
+      # flush new bytes before the copy-back lands. Threading this etag into restore/3 turns a
+      # mid-window steal into :superseded instead of an unconditional clobber (the forward
+      # flush/3 already does the same — round-2 #5).
+      with {:ok, etag} <- pull_live(shard_id, tmp) do
+        # Round-2 #30 (crash-forward, the OTHER half of #10 below): the cutover
+        # already completed and the job died before acking — the retry must be a
+        # NO-OP. Re-entering the destructive path would retain(current==to_version),
+        # copying live over the retained @to_version backup (destroying the recovery
+        # copy the next revert restores from), or spuriously log "revert REFUSED".
+        if live_version(tmp) == to_version and to_version == current do
+          :ok
+        else
+          do_revert(
+            shard_id,
+            to_version,
+            current,
+            last_active,
+            cutover_at,
+            tmp,
+            lease,
+            force?,
+            etag
+          )
+        end
+      end
+    after
+      drop_temp(tmp)
+    end
   end
 
   defp do_revert(
@@ -1066,6 +1074,39 @@ defmodule Fathom.Migrator.ShardMigration do
   end
 
   # --- helpers ---
+
+  # A2 PEER RECOVERY GUARD (expert review 2026-10-15 #2, user decision Q2 = A). When the owner died
+  # with an acked-but-unflushed tail, followers hold a replica FRESHER than the stored object, and
+  # only a client cold open promotes it (`PromoteOnOpen`). `pull_live/2` goes straight to
+  # `Storage.pull`, so a migration/revert reaching such a shard first would transform the STALE
+  # object and flush it, and — the flush carrying no position stamp — no replica could ever override
+  # it again: the acked tail is gone for good. So, holding the lease and before reading the object,
+  # ask the cold-open predicate (read-only) and, when a replica may be ahead or the question can't
+  # be answered, DEFER: the job snoozes and the next client cold-open runs the one tested promote
+  # (the coordinator's flush then re-stamps, after which this check is a clean `:no`).
+  #
+  # NOT done here: promoting in place (Q2 = B, rejected: a second A2 writer). NOT keyed on
+  # `Fleet.replicating?/0`: that is the SHIP gate; the predicate is the receive side's (a Follower
+  # running and promote-on-open enabled), exactly what decides whether a client open would promote.
+  # Gated off, it answers `:no` and this is a no-op, so single-node and replication-off fleets never
+  # snooze here.
+  defp refuse_if_replica_ahead(shard_id, lease) do
+    case PromoteOnOpen.replica_ahead?(shard_id, lease[:prev_owner]) do
+      :no ->
+        :ok
+
+      :ahead ->
+        Logger.warning(
+          "shard #{shard_id}: a replica is ahead of the stored object; deferring the migration " <>
+            "so a client cold open promotes it first"
+        )
+
+        {:retry, :replica_ahead}
+
+      {:unknown, reason} ->
+        {:retry, {:replica_check_unresolved, reason}}
+    end
+  end
 
   defp pull_live(shard_id, path) do
     # Keep the object etag (round-2 expert review #5): the forward flush If-Matches it so
