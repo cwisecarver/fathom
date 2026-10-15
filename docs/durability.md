@@ -239,6 +239,27 @@ Rehearse a policy before enabling it:
 `Fathom.Snapshots.RetentionJob.run(100, %{hourly: 24, daily: 7}, dry_run: true)` reports exactly
 what it would delete and deletes nothing.
 
+**Parked: retention ignores the restore drill's verdict (expert review 2026-10-15 #27).** `plan/3`
+classifies by time alone. It does not consult whether a snapshot ever passed the restore drill, so
+it can keep an unrestorable snapshot and expire the only verified one of the same period. Pinning the newest verified-ok snapshot needs a **per-snapshot verified marker** (written
+by the drill, read by retention), which is a design item and not a small change. Until then the
+drill's findings are the only evidence of restorability, and retention does not use them.
+
+### Postgres PITR is not a disaster-recovery path for suspension state (expert review 2026-10-15 #24)
+
+The directory (Postgres) holds tenant status, including suspensions, and object storage holds the
+shard bytes, tombstones and token floors. A Postgres point-in-time restore rolls the directory back
+and can desync it from storage. `mix fathom.directory reconcile --fix` realigns four facts
+(`Fathom.Directory.Reconcile`): `schema_version` to the file's `user_version`, `token_version` to the
+storage revocation floor, the deleted status to the storage tombstones, and a `retained_version`
+pointer to a copy storage no longer holds.
+
+It does **not** recover suspension state. A tenant suspended after the restore point comes back
+active, and no sweep notices. A PITR is therefore not a supported DR path for suspension state
+(decision D15): after a restore, re-apply any suspension made after the restore point by hand.
+Storage objects with no directory row (orphans) are also not reported yet. Finding them needs a
+paginated listing of every shard object in both backends, which is parked.
+
 ## Harden the bucket (defense-in-depth beneath snapshots)
 
 One object per shard in one bucket is the durability floor, and S3's 11-nines protects against

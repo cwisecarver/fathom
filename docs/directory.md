@@ -64,6 +64,10 @@ control plane uses — all **without opening shards**:
 - **`status`** (`active` / `migrating` / `retired` / `migration_failed`, plus `deleted` / `suspended`
   from the [tenant lifecycle](tenant-lifecycle.md)) + **`cutover/2`**, **`retire/2`** — the lifecycle
   states: the migration engine flips the first four; `Fathom.Tenants` sets `deleted` / `suspended`.
+- **`retained_version`** — which `<shard>@<version>` copy a revert restores from. A Postgres PITR can
+  roll it back to a copy that has since been retired; `mix fathom.directory reconcile --fix` clears
+  it when storage no longer holds the copy. Suspension state is **not** recovered by a PITR (see
+  [durability](durability.md)).
 
 It's deliberately **decoupled from routing**: the directory is orchestration, not a request-path
 resolve (routing is Host-based today — see [admission](admission.md)). That's why a Postgres blip is

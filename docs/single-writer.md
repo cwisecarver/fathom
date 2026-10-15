@@ -94,10 +94,44 @@ backstops (expert review 2026-10-13 #21):
 **3. The heartbeat — liveness that's O(nodes), not O(shards).** The naive design renews every
 shard's lease on a timer — millions of PUTs (the "F1 storm"). Instead, each **node** renews **one**
 `heartbeat/<node>` object every `ttl/3` (`Fathom.Shard.Heartbeat`), and a shard's owner is **live iff
-its node's heartbeat is fresh**. So the lease's own `expires_at_ms` isn't the liveness signal — the
-owner's heartbeat is. A steal is allowed only if that heartbeat is **missing or expired past
-`steal_margin_ms`** (a clock-skew guard). Liveness cost is O(nodes), and it's read lock-free from an
-ETS status row `{generation, deadline, margin}`.
+its node's heartbeat is fresh** — with one qualification, the steal rule below: the lock's own TTL
+also counts. Liveness cost is O(nodes), and it's read lock-free from an ETS status row
+`{generation, deadline, margin}`.
+
+**The steal rule (the one place the liveness decision lives).** `Fathom.Shard.Storage.S3` and
+`Storage.Local` both compute the instant a held lease becomes stealable in `stealable_at/4`
+(`lib/fathom/shard/storage/s3.ex`, `lib/fathom/shard/storage/local.ex`); `owner_live?` and
+`lease_stealable_at/1` both read that one value, so a caller predicting a steal cannot disagree
+with the code performing it. The cases, as the code has them:
+
+- **Heartbeat present for the owner:** stealable at `max(heartbeat.expires_at_ms, lock.expires_at_ms)
+  + steal_margin_ms`. A lapsed heartbeat alone does not make the owner dead (`s3.ex` `stealable_at`,
+  the `max(exp, lock_expires_at_ms) + margin` clause; the Local backend has the same clause).
+- **Heartbeat present but its body names another owner:** stealable at `lock.expires_at_ms +
+  steal_margin_ms`, the same as a missing heartbeat.
+- **Heartbeat missing:** stealable at `lock.expires_at_ms + steal_margin_ms`, the lock-TTL fallback
+  for owners that run no heartbeat (legacy mode, or a cleared object). The one exception is a
+  **proven-dead previous incarnation of this node**: `Storage.fast_steal_ok?/4` (`storage.ex`)
+  requires both that the owner is in the proven-dead set (`mark_incarnation_dead/1`, written by
+  `Heartbeat`'s restart recheck, `heartbeat.ex` `judge_previous` / `recheck_previous_incarnation`,
+  which clears the heartbeat only once it is stale past `steal_margin_ms` and frozen) **and** that
+  its lock expiry has not moved across a probe window (`lease_quiescence_probe_ms`, default
+  `ttl/2`). Only then is it stealable immediately.
+
+**The lock TTL is not renewed in heartbeat mode.** A coordinator that acquired its lease with a
+live heartbeat arms no per-shard renew timer (`shard.ex`, `if acquire_gen == nil, do:
+schedule_renew/1`), and `Heartbeat` documents that per-shard locks are "never renewed in heartbeat
+mode" (`heartbeat.ex`, `terminate/2` and the recheck notes). So in heartbeat mode the lock's
+`expires_at_ms` is `acquire + ttl` and stays there. Two consequences follow from the rule:
+
+- **Deleting a heartbeat object is a steal lever, not a safe tool.** Once a live owner's heartbeat
+  object is absent, every shard it holds whose lock TTL has long lapsed is stealable at once (the
+  `:not_found` clause, with no fast path for a foreign owner). The owner re-PUTs within `ttl/3`,
+  and the heartbeat read cache (`hb_cache_ttl_ms`, at most 1 s) bounds how stale a verdict can be,
+  but in that window a contender steals and the owner self-fences on its next flush, losing the
+  writes it had not flushed. Do not clear a live node's heartbeat to "force" a failover.
+- **The fallback is what keeps a legacy-mode owner alive.** A `heartbeat_server: false` owner
+  renews its own lock per shard, so its `expires_at_ms` moves and the TTL fallback holds it.
 
 ## Cold-open — acquire and pull, overlapped
 
@@ -105,9 +139,10 @@ On a cold start `Fathom.Shard.init` **overlaps** the lease acquire with the data
 objects — the `.lock` and the `.db`), so cold-open is ~1 S3 round-trip, not two serial ones. The
 pull lands in a **temp file promoted to the real path only once the lease confirms** — a lost lease
 race never leaves a stale local copy, and the shard is only *served* after the lease is held. On an
-acquire conflict, the acquirer consults the current owner's **heartbeat**: fresh ⇒ `{:error,
-{:held, owner}}` (back off, the owner is alive); missing/expired-past-margin ⇒ **steal** with a
-bumped epoch. The coordinator records the heartbeat **generation** at acquire time, which gates its
+acquire conflict, the acquirer applies the steal rule above: not yet stealable ⇒ `{:error,
+{:held, owner, steal_instant}}` (back off, the owner is alive); stealable ⇒ **steal** with a bumped
+epoch. A fresh heartbeat keeps its owner live whatever the lock's age. A lapsed or missing heartbeat
+does not make the owner dead on its own: the lock TTL must have lapsed too (the steal rule above). The coordinator records the heartbeat **generation** at acquire time, which gates its
 flush fence.
 
 ## Steady-state — the fence with no per-shard I/O
@@ -129,8 +164,9 @@ between the last check and idle never produces a clobbering write.
 
 ## Two directions of the same lease
 
-- **Involuntary steal (crash path).** A survivor cold-opens a dead node's shard, finds its heartbeat
-  stale-past-margin, and steals the lease with a bumped epoch. If the dead node was only *frozen*
+- **Involuntary steal (crash path).** A survivor cold-opens a dead node's shard, finds the steal rule
+  satisfied (the heartbeat and the lock TTL both lapsed past the margin), and steals the lease with a
+  bumped epoch. If the dead node was only *frozen*
   (a zombie) and revives, its next flush finds the object superseded (old epoch / etag mismatch) and
   it **self-fences — drops without flushing**. Its un-flushed writes are lost (within RPO); the
   survivor's write stands. This is what `chaos.sh pause-fence` proves (seq=400 survives, the zombie's

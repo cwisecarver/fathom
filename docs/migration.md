@@ -40,10 +40,18 @@ They sit **beside** `converged` rather than inside it on purpose. `last_verify_s
 point-in-time — a shard repaired since its last drill still carries the old status — so folding it
 into the boolean would block deploys on stale evidence. Gate on it explicitly if you want to.
 
-Two gaps remain, both open: nothing *repairs* a divergence without a human running
-`mix fathom.directory` (that sweep pulls every shard's object, so its cadence is a real S3 spend),
-and **nothing compares `django_migrations` against `PRAGMA user_version` at all** — the source of
-truth and the gate are never checked against each other.
+The ledger leg is checked. `Fathom.Migrator.Ledger` compares `django_migrations` against
+`PRAGMA user_version` **by migration name** (not by row count) before and after every replay, on the
+migrate path since 2026-09-30 (`MIGRATION_LEDGER_CHECK`, default `enforce`; see
+`docs/configuration.md`), and in the restore drill since 2026-10-01. A ledger that is provably ahead
+of its label is migrated from the real version; one that cannot be reconciled is refused and
+quarantined as `ledger_mismatch`.
+
+One gap remains open: the directory-vs-storage sweep (`mix fathom.directory`, which reconciles
+`schema_version`, `token_version`, the deleted status and `retained_version`) repairs only when a
+human runs it with `--fix`, and it pulls each shard's header, so its cadence is a real S3 spend. It
+does not look for storage objects that have no directory row. Suspension state is not recovered by
+a Postgres PITR (see `docs/durability.md`).
 
 ## Blue/green, per shard — a pointer flip, never in-place
 
