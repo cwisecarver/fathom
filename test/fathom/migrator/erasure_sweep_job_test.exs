@@ -328,4 +328,47 @@ defmodule Fathom.Migrator.ErasureSweepJobTest do
       assert_enqueued(worker: DeleteJob, args: %{shard_id: "ds_final"})
     end
   end
+
+  # Expert review 2026-10-15 #19. A drill killed between fork and drop leaks a full tenant copy
+  # (objects + an active scratch row) that no tenant delete reaches. The sweep purges stale ones.
+  describe "restore-drill scratch fork GC" do
+    defp insert_row!(id, age_s) do
+      at = DateTime.add(DateTime.utc_now(), -age_s, :second)
+
+      Fathom.Repo.insert_all(Directory.Shard, [
+        %{
+          shard_id: id,
+          schema_version: 0,
+          status: "active",
+          last_active_at: at,
+          updated_at: at,
+          inserted_at: at
+        }
+      ])
+    end
+
+    test "purges objects and row of a scratch fork older than 24h, and nothing else" do
+      stale = "restoredrill1#{System.unique_integer([:positive])}"
+      fresh = "restoredrill2#{System.unique_integer([:positive])}"
+      real_old = "restoredrill-eu-#{System.unique_integer([:positive])}"
+
+      for id <- [stale, fresh, real_old], do: put_object!(id)
+      insert_row!(stale, 25 * 3600)
+      insert_row!(fresh, 3600)
+      insert_row!(real_old, 25 * 3600)
+
+      assert ErasureSweepJob.sweep_scratch_forks() == 1
+
+      refute Fathom.Repo.get_by(Directory.Shard, shard_id: stale)
+      assert {:ok, false} = Storage.any_shard_object?(stale)
+
+      # A fresh scratch may be mid-drill; a non-scratch id that merely shares the prefix is a tenant.
+      assert Fathom.Repo.get_by(Directory.Shard, shard_id: fresh)
+      assert {:ok, true} = Storage.any_shard_object?(fresh)
+      assert Fathom.Repo.get_by(Directory.Shard, shard_id: real_old)
+      assert {:ok, true} = Storage.any_shard_object?(real_old)
+
+      for id <- [fresh, real_old], do: Storage.purge_shard(id)
+    end
+  end
 end

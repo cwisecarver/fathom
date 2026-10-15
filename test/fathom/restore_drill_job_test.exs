@@ -340,13 +340,75 @@ defmodule Fathom.RestoreDrillJobTest do
     assert fetch(id).last_verify_status == "corrupt"
   end
 
-  test "a directory row with no stored object is :absent (not a failure)", %{id: id} do
+  # Expert review 2026-10-15 #9. This test used to pin ANY object-less row as the benign `:absent`,
+  # which also swallowed a shard that HAD flushed and whose durable object then vanished out of
+  # band: no failure, no alert, discovered when the tenant returned. `:absent` is now only the
+  # never-flushed case; a flushed shard with no object is `:lost` (alertable).
+  test "a never-flushed directory row with no stored object is :absent (not a failure)", %{id: id} do
     {:ok, _} = Directory.resolve(id)
 
     ref = attach()
     assert {:ok, %{absent: 1}} = RestoreDrillJob.run_drill(10)
     assert_received {:drill, ^ref, :absent}
     assert fetch(id).last_verify_status == "absent"
+  end
+
+  test "a FLUSHED shard whose stored object vanished is :lost (a failure)", %{id: id} do
+    seed(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
+    # The stamp the flush path writes; `seed` drains through the real flush but a Local-backend
+    # unit run may not have recorded it yet, so make the precondition explicit.
+    Directory.record_flush_batch([{id, DateTime.utc_now()}])
+    assert fetch(id).last_flushed_at, "fixture: the shard must have a last_flushed_at"
+    File.rm!(Path.join(remote_dir(), "#{id}.db"))
+
+    ref = attach()
+    assert {:ok, %{lost: 1}} = RestoreDrillJob.run_drill(10)
+    assert_received {:drill, ^ref, :lost}
+    assert fetch(id).last_verify_status == "lost"
+  end
+
+  test "the full-drill scratch id is digits-only (reserved shape) and not unique_integer-based" do
+    a = RestoreDrillJob.scratch_id()
+    assert Directory.scratch_id?(a)
+    # Wall-clock millis lead, so ids from before a VM restart cannot collide with new ones.
+    assert String.starts_with?(a, Directory.scratch_prefix() <> "1")
+  end
+
+  # Expert review 2026-10-15 #11: VACUUM INTO copies a divergent index verbatim and quick_check
+  # cannot see it; the drill must use integrity_check or a stale stored object reads :ok.
+  test "a stored object with index/table divergence is flagged :corrupt", %{id: id} do
+    seed(id, [
+      "CREATE TABLE t (a INTEGER, b INTEGER)",
+      "CREATE INDEX i ON t (a)",
+      "INSERT INTO t VALUES (1, 2)",
+      "INSERT INTO t VALUES (3, 4)"
+    ])
+
+    path = Path.join(remote_dir(), "#{id}.db")
+    {:ok, conn} = Fathom.Shard.Connection.open(path)
+    :ok = Fathom.Shard.Connection.exec(conn, "PRAGMA writable_schema=ON")
+
+    {:ok, _} =
+      Fathom.Shard.Connection.query(
+        conn,
+        "UPDATE sqlite_master SET sql='CREATE INDEX i ON t (b)' WHERE name='i'",
+        []
+      )
+
+    :ok = Fathom.Shard.Connection.exec(conn, "PRAGMA writable_schema=OFF")
+    Fathom.Shard.Connection.close(conn)
+
+    assert {:ok, [["ok"]]} == quick_check(path), "fixture: quick_check must be blind to it"
+
+    assert {:ok, summary} = RestoreDrillJob.run_drill(10)
+    assert summary[:corrupt] == 1
+  end
+
+  defp quick_check(path) do
+    {:ok, conn} = Fathom.Shard.Connection.open(path)
+    {:ok, %{rows: rows}} = Fathom.Shard.Connection.query(conn, "PRAGMA quick_check", [])
+    Fathom.Shard.Connection.close(conn)
+    {:ok, rows}
   end
 
   # Expert review 2026-09-05 #33. Since expert review 2026-08-01 #24 the S3 backend maps a steal

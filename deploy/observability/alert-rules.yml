@@ -53,8 +53,9 @@ groups:
         # lineage (schema_version mismatch), or unpullable — a bad "backup" that would otherwise
         # surface only when the (possibly-dormant) tenant returns. The durable object is fathom's
         # only copy, so any occurrence is page-worthy. Only fires once the drill is enabled
-        # (:restore_drill_sample); `absent`/`sentinel` (brand-new, no data yet) are excluded.
-        expr: sum by (status) (increase(fathom_restore_drill_result_count{status=~"corrupt|schema_mismatch|error"}[1d])) > 0
+        # (:restore_drill_sample); `absent`/`sentinel` (brand-new, no data yet) are excluded. `lost` = no
+        # object for a shard whose directory row says it HAS flushed (vanished out of band, #9).
+        expr: sum by (status) (increase(fathom_restore_drill_result_count{status=~"corrupt|schema_mismatch|error|lost"}[1d])) > 0
         for: 5m
         labels: {severity: page}
         annotations:

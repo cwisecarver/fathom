@@ -80,9 +80,50 @@ defmodule Fathom.Migrator.ErasureSweepJob do
 
     # A continuation only resumes the tombstone walk; the promotion sweep is one bounded page and
     # already ran in the run that spawned it.
-    if is_nil(cursor), do: sweep_promotion_snapshots()
+    if is_nil(cursor) do
+      sweep_promotion_snapshots()
+      sweep_scratch_forks()
+    end
+
     redrive_deletes(cursor)
     :ok
+  end
+
+  # Expert review 2026-10-15 #19. The restore drill drops its scratch fork in an `after`, which a
+  # kill/deploy/OOM mid-drill skips: the fork (a full tenant copy, plus snapshots) and its directory
+  # row then leak, and no tenant delete ever reaches them. Purge objects first, then the row, so a
+  # failed purge leaves the row to be retried next sweep. Public so tests drive it directly.
+  @scratch_max_age_s 24 * 3600
+  @scratch_max 50
+
+  @doc false
+  @spec sweep_scratch_forks() :: non_neg_integer()
+  def sweep_scratch_forks do
+    cutoff = DateTime.add(now(), -@scratch_max_age_s, :second)
+
+    Directory.stale_scratch_ids(cutoff, @scratch_max)
+    |> Enum.count(fn id ->
+      _ = Fathom.Shards.stop(id)
+
+      case Storage.purge_shard(id) do
+        :ok ->
+          Directory.hard_delete(id)
+          Logger.warning("erasure sweep: purged leaked restore-drill scratch fork #{id}")
+          true
+
+        other ->
+          Logger.warning("erasure sweep: scratch fork #{id} purge failed (#{inspect(other)})")
+          false
+      end
+    end)
+  rescue
+    e ->
+      Logger.warning("erasure sweep: scratch-fork sweep failed (#{inspect(e)}); continuing")
+      0
+  catch
+    :exit, reason ->
+      Logger.warning("erasure sweep: scratch-fork sweep failed (#{inspect(reason)}); continuing")
+      0
   end
 
   defp decode_cursor(%{"cursor_at" => at, "cursor_id" => id}) do

@@ -20,12 +20,15 @@ defmodule Fathom.RestoreDrillJob do
                            version stamp diverged).
     * `:sentinel`        — a steal-time brand-new sentinel sits at the data key (a stealer died
                            before its first flush): the "backup" is a placeholder, not data.
-    * `:absent`          — no stored object at all (a never-flushed brand-new tenant, or a lost object).
+    * `:absent`          — no stored object at all AND the shard never flushed (a brand-new tenant).
+    * `:lost`            — no stored object but the directory says the shard HAS flushed
+                           (`last_flushed_at` set): the durable object vanished out of band (expert
+                           review 2026-10-15 #9). Alertable.
     * `:error`           — the pull failed (transport / reachability).
 
   Each result stamps `last_verified_at` + `last_verify_status` on the row (so the sample rotates and a
   failure is queryable) and emits `[:fathom, :restore_drill, :result]` telemetry (an alert fires on
-  `corrupt` / `schema_mismatch` / `error`). This is also the DR runbook's verification step (#6).
+  `corrupt` / `schema_mismatch` / `error` / `lost`). This is also the DR runbook's verification step (#6).
 
   **Gated + off by default.** Inert unless `:restore_drill_sample` is a positive integer (the per-run
   sample size) — set it (and the daily `Oban` crontab entry's cadence) to size drill coverage to your
@@ -35,12 +38,13 @@ defmodule Fathom.RestoreDrillJob do
 
   require Logger
 
-  alias Fathom.{Directory, Shard}
-  alias Fathom.Shard.{Connection, SqliteHeader, Storage}
+  alias Fathom.Directory
+  alias Fathom.Shard.{Connection, Integrity, SqliteHeader, Storage}
 
   # Outcomes that mean the durable object is bad/unreachable (the alertable set) vs merely
-  # "no data yet" (absent/sentinel — a brand-new tenant that never flushed).
-  @failures [:corrupt, :schema_mismatch, :error]
+  # "no data yet" (absent/sentinel — a brand-new tenant that never flushed). `:lost` is an absent
+  # object for a shard that HAS flushed (expert review 2026-10-15 #9).
+  @failures [:corrupt, :schema_mismatch, :error, :lost]
 
   # Per-shard drill bounds (expert review 2026-10-13 #26); see `bounded/4`.
   @drill_concurrency 8
@@ -132,8 +136,8 @@ defmodule Fathom.RestoreDrillJob do
     :telemetry.execute(telemetry_event, %{count: 1}, %{status: :error, shard_id: id})
   end
 
-  defp drill_one(%{shard_id: id, schema_version: schema_version}) do
-    status = verify(id, schema_version)
+  defp drill_one(%{shard_id: id, schema_version: schema_version} = shard) do
+    status = id |> verify(schema_version) |> classify_absent(Map.get(shard, :last_flushed_at))
 
     # Snapshot verdicts reach the DURABLE column too (expert review 2026-08-26 #37).
     #
@@ -163,6 +167,7 @@ defmodule Fathom.RestoreDrillJob do
   # new status elsewhere can never downgrade it to healthy here.
   @status_rank [
     :corrupt,
+    :lost,
     :restored_mismatch,
     :fork_failed,
     :error,
@@ -170,6 +175,11 @@ defmodule Fathom.RestoreDrillJob do
     :sentinel,
     :absent
   ]
+
+  # Absent object + a flushed-at stamp = the object was lost, not "never written". A missing stamp
+  # can only yield a false negative (stays :absent), never a false :lost (D5).
+  defp classify_absent(:absent, %DateTime{}), do: :lost
+  defp classify_absent(status, _), do: status
 
   defp worst_status(:ok, :ok), do: :ok
   defp worst_status(:ok, other), do: other
@@ -333,7 +343,7 @@ defmodule Fathom.RestoreDrillJob do
             :absent
 
           {:ok, _} ->
-            case Shard.verify_integrity(tmp) do
+            case Integrity.verify_full(tmp) do
               :ok -> :ok
               {:error, _} -> :corrupt
             end
@@ -390,7 +400,7 @@ defmodule Fathom.RestoreDrillJob do
 
         {:ok, _etag} ->
           # `{:ok, etag}` means bytes were written, so the temp exists; no File.exists? guard.
-          case Shard.verify_integrity(tmp) do
+          case Integrity.verify_full(tmp) do
             :ok -> check_schema(id, tmp, schema_version)
             {:error, _reason} -> :corrupt
           end
@@ -473,7 +483,7 @@ defmodule Fathom.RestoreDrillJob do
             Map.put(
               shard,
               :scratch,
-              "#{Directory.scratch_prefix()}#{System.unique_integer([:positive])}"
+              scratch_id()
             )
 
     results =
@@ -495,6 +505,15 @@ defmodule Fathom.RestoreDrillJob do
     end
 
     {:ok, summary}
+  end
+
+  # `System.unique_integer/1` restarts low after a VM restart, so a new run could collide with a
+  # leaked scratch from before the restart (expert review 2026-10-15 #19). Wall-clock millis plus
+  # random digits: digits only, because `Directory.scratch_id?/1` reserves exactly `<prefix><digits>`.
+  @doc false
+  @spec scratch_id() :: String.t()
+  def scratch_id do
+    "#{Directory.scratch_prefix()}#{System.system_time(:millisecond)}#{:rand.uniform(999_999_999)}"
   end
 
   defp restore_one(%{shard_id: id, scratch: scratch}) do

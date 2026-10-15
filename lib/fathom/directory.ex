@@ -331,18 +331,45 @@ defmodule Fathom.Directory do
   *millions* of active shards can add the index then.
   """
   @spec sample_for_drill(pos_integer()) :: [
-          %{shard_id: String.t(), schema_version: non_neg_integer()}
+          %{
+            shard_id: String.t(),
+            schema_version: non_neg_integer(),
+            last_flushed_at: DateTime.t() | nil
+          }
         ]
   def sample_for_drill(n) when is_integer(n) and n > 0 do
     from(s in Shard,
       where: s.status == "active",
       order_by: [asc_nulls_first: s.last_verified_at],
       limit: ^n,
-      select: %{shard_id: s.shard_id, schema_version: s.schema_version}
+      # `last_flushed_at` is the `:lost` discriminator (expert review 2026-10-15 #9): a flushed
+      # shard whose object is absent is a LOST object, a never-flushed one is merely brand new.
+      select: %{
+        shard_id: s.shard_id,
+        schema_version: s.schema_version,
+        last_flushed_at: s.last_flushed_at
+      }
     )
     # Never sample a scratch fork (#27): drilling a throwaway is wasted, and a LEAKED one
     # (never-verified) sorts FIRST under `asc_nulls_first`, so it would be re-drilled every run.
     |> exclude_scratch()
+    |> Repo.all()
+  end
+
+  @doc """
+  Scratch-fork ids (see `scratch_id?/1`) whose directory row is older than `cutoff`, oldest first,
+  at most `limit`. The drill drops its own scratch in an `after`, so a row this old is a LEAK from a
+  kill/deploy/OOM mid-drill: a full tenant copy that no tenant delete will ever reach (expert
+  review 2026-10-15 #19). `ErasureSweepJob` purges them.
+  """
+  @spec stale_scratch_ids(DateTime.t(), pos_integer()) :: [String.t()]
+  def stale_scratch_ids(%DateTime{} = cutoff, limit) when is_integer(limit) and limit > 0 do
+    from(s in Shard,
+      where: s.inserted_at < ^cutoff and fragment("? ~ ?", s.shard_id, ^@scratch_id_pattern),
+      order_by: [asc: s.inserted_at],
+      limit: ^limit,
+      select: s.shard_id
+    )
     |> Repo.all()
   end
 
