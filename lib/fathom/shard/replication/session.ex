@@ -355,7 +355,18 @@ defmodule Fathom.Shard.Replication.Session do
   def handle_call({:commit, wal_path, mode}, _from, state) do
     state = ensure_registered(state, wal_path)
     {pin, state} = if mode == :checkpoint, do: maybe_pin(state, wal_path), else: {nil, state}
+    t0 = System.monotonic_time()
     {:reply, reply, state} = do_commit(wal_path, state)
+
+    # Commit -> quorum-ack latency (admin observability 2026-10-15 P1). ONE execute per commit,
+    # after the ack work and before the checkpoint start so it measures only what the tenant waits
+    # on. The outcome is a bounded 4-value tag; shard_id is deliberately not a tag.
+    :telemetry.execute(
+      [:fathom, :replication, :commit],
+      %{duration: System.monotonic_time() - t0},
+      %{outcome: commit_outcome(reply)}
+    )
+
     {:reply, reply, start_checkpoint(state, pin, wal_path)}
   end
 
@@ -363,6 +374,78 @@ defmodule Fathom.Shard.Replication.Session do
   # flush asks before it checkpoints (`checkpoint_after_snapshot/2`).
   def handle_call({:covers, header}, _from, state),
     do: {:reply, covered?(state, header), state}
+
+  def handle_call(:lag_info, _from, state), do: {:reply, build_lag_info(state), state}
+
+  @doc false
+  @spec commit_outcome(term()) :: :ok | :no_quorum | :timeout | :other
+  def commit_outcome(:ok), do: :ok
+  def commit_outcome({:error, {:no_quorum, :timeout}}), do: :timeout
+  def commit_outcome({:error, {:no_quorum, _}}), do: :no_quorum
+  def commit_outcome({:error, :timeout}), do: :timeout
+  def commit_outcome(_), do: :other
+
+  @type lag_info :: %{
+          shard_id: String.t(),
+          catchup_fails: non_neg_integer(),
+          catching_up?: boolean(),
+          inflight_pushes: non_neg_integer(),
+          seeds_in_flight: non_neg_integer(),
+          behind_followers: non_neg_integer(),
+          unacked_bytes: non_neg_integer()
+        }
+
+  @doc """
+  On-demand lag snapshot of one Session, read from state it already holds (no per-commit
+  bookkeeping). `unacked_bytes` is the largest gap between the newest WAL extent this Session has
+  read and any follower's acknowledged offset in that same generation; a follower in a different
+  generation counts as behind but adds no bytes (the gap is not comparable). Returns `nil` when the
+  Session is gone or does not answer within `timeout` ms: a Session mid-commit is busy, not lagging.
+  """
+  @spec lag_info(String.t() | pid(), timeout()) :: lag_info() | nil
+  def lag_info(shard_or_pid, timeout \\ 1_000)
+
+  def lag_info(pid, timeout) when is_pid(pid) do
+    GenServer.call(pid, :lag_info, timeout)
+  catch
+    :exit, _ -> nil
+  end
+
+  def lag_info(shard_id, timeout) when is_binary(shard_id) do
+    case Registry.lookup(@registry, shard_id) do
+      [{pid, _}] -> lag_info(pid, timeout)
+      [] -> nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp build_lag_info(state) do
+    {behind, bytes} =
+      case state.seen do
+        [{gen, salt, extent} | _] ->
+          Enum.reduce(state.followers, {0, 0}, fn
+            {_, %{wal_gen: ^gen, salt1: ^salt, offset: o}}, {n, b} when is_integer(o) ->
+              if o < extent, do: {n + 1, max(b, extent - o)}, else: {n, b}
+
+            _, {n, b} ->
+              {n + 1, b}
+          end)
+
+        [] ->
+          {0, 0}
+      end
+
+    %{
+      shard_id: state.shard_id,
+      catchup_fails: state.catchup_fails,
+      catching_up?: state.catchup_ref != nil,
+      inflight_pushes: map_size(state.inflight),
+      seeds_in_flight: map_size(state.seeding),
+      behind_followers: behind,
+      unacked_bytes: bytes
+    }
+  end
 
   defp do_commit(wal_path, state) do
     # One deadline for the whole call, taken before any work: a seed wait that reset the clock
@@ -2541,6 +2624,9 @@ defmodule Fathom.Shard.Replication.Session do
         state
 
       ms ->
+        # Armed (not merely failed) catch-ups only; `fails` is the backoff depth. Admin P1.
+        :telemetry.execute([:fathom, :replication, :catchup], %{fails: state.catchup_fails}, %{})
+
         %{
           state
           | catchup_ref: Process.send_after(self(), :catch_up, ms),

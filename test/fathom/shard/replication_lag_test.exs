@@ -1,0 +1,211 @@
+defmodule Fathom.Shard.ReplicationLagTest do
+  @moduledoc """
+  Admin observability 2026-10-15 P1/P2: the per-commit `[:fathom, :replication, :commit]` and
+  `[:fathom, :replication, :catchup]` events, `Session.lag_info/2`, `Fleet.lag_report/1` and the
+  `LagGauge`. Uses the same real-shard, real-follower harness as `replication_commit_test.exs`.
+  """
+  use ExUnit.Case, async: false
+
+  alias Fathom.Shard.Connection
+  alias Fathom.Shard.Replication.{Fleet, Follower, LagGauge, Session}
+  alias Fathom.Shards
+
+  @registry Fathom.Shard.Replication.SessionRegistry
+
+  setup do
+    id = "repl_lag_#{System.unique_integer([:positive])}"
+    root = Path.join(System.tmp_dir!(), "repllag_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+
+    keys = [
+      :replication_enabled,
+      :replication_followers,
+      :replication_quorum,
+      :replication_catchup_ms
+    ]
+
+    prev = for k <- keys, do: {k, Application.get_env(:fathom, k)}
+
+    test_pid = self()
+    hid = "lag-test-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach_many(
+      hid,
+      [
+        [:fathom, :replication, :commit],
+        [:fathom, :replication, :catchup],
+        [:fathom, :replication, :lag]
+      ],
+      fn ev, m, meta, _ -> send(test_pid, {:tel, ev, m, meta}) end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(hid)
+      Session.stop(id)
+
+      for {k, v} <- prev do
+        if is_nil(v),
+          do: Application.delete_env(:fathom, k),
+          else: Application.put_env(:fathom, k, v)
+      end
+
+      File.rm_rf(root)
+      for s <- ["", "-wal", "-shm"], do: File.rm(Fathom.Shard.db_path(id) <> s)
+    end)
+
+    %{id: id, root: root}
+  end
+
+  defp start_followers!(root, n) do
+    for i <- 1..n do
+      name = :"rl_f#{i}_#{System.unique_integer([:positive])}"
+
+      pid =
+        start_supervised!({Follower, name: name, port: 0, dir: Path.join(root, to_string(name))},
+          id: name
+        )
+
+      {:ok, port} = Follower.port(pid)
+      {name, port}
+    end
+  end
+
+  defp configure!(followers, quorum) do
+    Application.put_env(:fathom, :replication_enabled, true)
+    Application.put_env(:fathom, :replication_quorum, quorum)
+
+    Application.put_env(
+      :fathom,
+      :replication_followers,
+      for({_n, p} <- followers, do: {~c"127.0.0.1", p})
+    )
+
+    start_supervised!(Fleet)
+  end
+
+  defp open_shard!(id) do
+    {:ok, coordinator, ref, path} = Shards.checkout(id)
+    on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+    {:ok, conn} = Connection.open(path)
+    on_exit(fn -> Connection.close(conn) end)
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
+    {coordinator, path}
+  end
+
+  test "commit_outcome/1 maps replies onto the four bounded outcomes" do
+    assert Session.commit_outcome(:ok) == :ok
+    assert Session.commit_outcome({:error, {:no_quorum, :impossible}}) == :no_quorum
+    assert Session.commit_outcome({:error, {:no_quorum, :catching_up}}) == :no_quorum
+    assert Session.commit_outcome({:error, {:no_quorum, :timeout}}) == :timeout
+    assert Session.commit_outcome({:error, :timeout}) == :timeout
+    assert Session.commit_outcome({:error, :stale_session}) == :other
+  end
+
+  test "an acked commit emits one commit event (ok, native duration) and lag_info answers", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+    configure!(followers, 2)
+    {coordinator, path} = open_shard!(id)
+    for {n, _} <- followers, do: Follower.seed(n, id, 0, 0, 0, 0)
+
+    assert :ok = Session.commit(id, path <> "-wal", coordinator)
+
+    assert_receive {:tel, [:fathom, :replication, :commit], %{duration: d}, %{outcome: :ok}}
+    assert is_integer(d) and d > 0
+    refute_receive {:tel, [:fathom, :replication, :commit], _, _}, 50
+
+    info = Session.lag_info(id)
+    assert %{shard_id: ^id, catching_up?: false, catchup_fails: 0, unacked_bytes: ub} = info
+    assert is_integer(ub)
+
+    report = Fleet.lag_report()
+    assert report.sessions >= 1 and report.timed_out == 0
+    assert report.answered == report.sessions
+  end
+
+  test "a failed quorum emits outcome no_quorum", ctx do
+    %{id: id, root: root} = ctx
+    [{name, port}] = start_followers!(root, 1)
+    Application.put_env(:fathom, :replication_enabled, true)
+    Application.put_env(:fathom, :replication_quorum, 2)
+
+    Application.put_env(:fathom, :replication_followers, [
+      {~c"127.0.0.1", port},
+      {~c"127.0.0.1", 1},
+      {~c"127.0.0.1", 2}
+    ])
+
+    start_supervised!(Fleet)
+    {coordinator, path} = open_shard!(id)
+    Follower.seed(name, id, 0, 0, 0, 0)
+
+    assert {:error, {:no_quorum, _}} = Session.commit(id, path <> "-wal", coordinator)
+    assert_receive {:tel, [:fathom, :replication, :commit], _, %{outcome: :no_quorum}}
+  end
+
+  test "a reject arms catch-up: catchup event carries fails; lag_info/lag_report/gauge see it",
+       ctx do
+    %{id: id, root: root} = ctx
+    # Long retry so the timer stays armed while we read it.
+    Application.put_env(:fathom, :replication_catchup_ms, 60_000)
+    followers = start_followers!(root, 3)
+    configure!(followers, 1)
+    {coordinator, path} = open_shard!(id)
+
+    {:ok, epoch} = Fathom.Shard.epoch(coordinator)
+    lineage = Fathom.Shard.lineage(coordinator)
+
+    for {n, _} <- Enum.take(followers, 2),
+        do: Follower.seed(n, id, epoch, 0, 0, 0, lineage)
+
+    _ = Session.commit(id, path <> "-wal", coordinator)
+
+    assert_receive {:tel, [:fathom, :replication, :catchup], %{fails: f}, _} when f >= 1, 2_000
+
+    [{session, _}] = Registry.lookup(@registry, id)
+    info = Session.lag_info(session)
+    assert info.catching_up?
+    assert info.catchup_fails >= 1
+
+    report = Fleet.lag_report()
+    assert report.catching_up >= 1
+    assert Enum.any?(report.worst, &(&1.shard_id == id))
+
+    assert :ok = LagGauge.measure()
+    assert_receive {:tel, [:fathom, :replication, :lag], %{catching_up_shards: n}, _}
+    assert n >= 1
+  end
+
+  test "lag_report excludes a Session that does not answer instead of crashing" do
+    start_supervised!(Fleet)
+    parent = self()
+
+    hung =
+      spawn_link(fn ->
+        {:ok, _} =
+          Registry.register(@registry, "hung_#{System.unique_integer([:positive])}", self())
+
+        send(parent, :registered)
+
+        receive do
+          :never -> :ok
+        end
+      end)
+
+    assert_receive :registered
+    assert Session.lag_info(hung, 50) == nil
+
+    report = Fleet.lag_report(timeout: 100)
+    assert report.timed_out >= 1
+    assert report.answered == report.sessions - report.timed_out
+  end
+
+  test "lag_report with no registry (replication off) is an empty report, not a crash" do
+    assert %{sessions: 0, answered: 0, timed_out: 0, catching_up: 0, worst: []} =
+             Fleet.lag_report()
+
+    assert Session.lag_info("nope") == nil
+    assert :ok = LagGauge.measure()
+  end
+end

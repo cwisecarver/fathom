@@ -46,7 +46,8 @@ defmodule Fathom.Telemetry do
            {Fathom.Admin.Measurements, :schedulers, []},
            {Fathom.Admin.Measurements, :memory_breakdown, []},
            {Fathom.Admin.Measurements, :recorder, []},
-           {Fathom.Admin.LeaseHealth, :measure, []}
+           {Fathom.Admin.LeaseHealth, :measure, []},
+           {Fathom.Shard.Replication.LagGauge, :measure, []}
          ],
          period: 10_000,
          name: Fathom.ShardPoller}
@@ -1049,6 +1050,28 @@ defmodule Fathom.Telemetry do
         reporter_options: [buckets: [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000]],
         description:
           "Durability-flush latency by outcome (uploaded / reconciled / skipped / error). Flushes that SUCCEED but crawl grow the RPO exactly like flushes that fail, and nothing measured that — `flush.failed` only counts the ones that error out"
+      ),
+      # A2 commit -> quorum-ack latency, the number the tenant's write actually waits on.
+      distribution("fathom.replication.commit.duration",
+        event_name: [:fathom, :replication, :commit],
+        measurement: :duration,
+        unit: {:native, :millisecond},
+        tags: [:outcome],
+        reporter_options: [buckets: [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]],
+        description:
+          "Replicated-commit latency from commit start to quorum decision, by outcome (ok / no_quorum / timeout / other). Tail growth here is the tenant-visible cost of a slow follower"
+      ),
+      distribution("fathom.replication.catchup.fails",
+        event_name: [:fathom, :replication, :catchup],
+        measurement: :fails,
+        reporter_options: [buckets: [0, 1, 2, 3, 5, 8, 13]],
+        description:
+          "Backoff depth (consecutive refused catch-up rounds) each time a deferred catch-up is armed; sustained high values mean a follower that is not coming back"
+      ),
+      last_value("fathom.replication.lag.catching_up_shards",
+        event_name: [:fathom, :replication, :lag],
+        measurement: :catching_up_shards,
+        description: "Shards whose replication Session has a catch-up retry armed (10 s poll)"
       ),
       counter("fathom.shard.open.failed.count",
         event_name: [:fathom, :shard, :open, :failed],

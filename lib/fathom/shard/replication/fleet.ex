@@ -186,6 +186,62 @@ defmodule Fathom.Shard.Replication.Fleet do
     for {node_key, _host, _port, name} <- running(), do: {node_key, connected?(name)}
   end
 
+  @doc """
+  On-demand replication lag across this node's Sessions (admin observability 2026-10-15 P2).
+
+  Fans out over the Session registry with `Task.async_stream` and a REAL per-session `:timeout`
+  (default 1 s; `:max_concurrency` 16). A Session that does not answer in time is counted in
+  `timed_out` and excluded from the ranking, never a crash. `worst` is the top 20 by unacked bytes,
+  then catch-up backoff depth; only Sessions with something to report (behind, catching up or
+  backing off) qualify. Not for the hot path: a render/UI-cached caller only.
+  """
+  @spec lag_report(keyword()) :: %{
+          sessions: non_neg_integer(),
+          answered: non_neg_integer(),
+          timed_out: non_neg_integer(),
+          catching_up: non_neg_integer(),
+          worst: [Fathom.Shard.Replication.Session.lag_info()]
+        }
+  def lag_report(opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, 1_000)
+
+    # Registry.select's middle slot is the registered PROCESS pid (the value slot holds the
+    # coordinator pid), which is what lag_info wants.
+    sessions =
+      try do
+        Registry.select(@registry, [{{:_, :"$1", :_}, [], [:"$1"]}])
+      rescue
+        ArgumentError -> []
+      end
+
+    infos =
+      sessions
+      |> Task.async_stream(&Fathom.Shard.Replication.Session.lag_info(&1, timeout),
+        timeout: timeout + 500,
+        on_timeout: :kill_task,
+        max_concurrency: 16,
+        ordered: false
+      )
+      |> Enum.flat_map(fn
+        {:ok, %{} = info} -> [info]
+        _ -> []
+      end)
+
+    worst =
+      infos
+      |> Enum.filter(&(&1.catching_up? or &1.behind_followers > 0 or &1.catchup_fails > 0))
+      |> Enum.sort_by(&{&1.unacked_bytes, &1.catchup_fails}, :desc)
+      |> Enum.take(20)
+
+    %{
+      sessions: length(sessions),
+      answered: length(infos),
+      timed_out: length(sessions) - length(infos),
+      catching_up: Enum.count(infos, & &1.catching_up?),
+      worst: worst
+    }
+  end
+
   @doc "The followers actually supervised right now, as `{node_key, host, port, shipper_name}`."
   @spec running() :: [{String.t(), String.t() | charlist(), :inet.port_number(), atom()}]
   def running, do: :persistent_term.get(@running_key, [])
