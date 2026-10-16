@@ -996,7 +996,8 @@ defmodule Fathom.Application do
         do: [
           Fathom.Admin.MetricsCollector,
           Fathom.Admin.FleetCollector,
-          Fathom.Admin.HotShardsCache
+          Fathom.Admin.HotShardsCache,
+          Fathom.Admin.Durability
         ],
         else: []
   end

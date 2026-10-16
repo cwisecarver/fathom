@@ -34,7 +34,14 @@ defmodule FathomWeb.AdminDirectoryLive do
       |> assign(:node_key, Fathom.Rebalancer.node_key())
       |> assign(:statuses, Shard.statuses())
       |> assign(:editable_statuses, Shard.admin_editable_statuses())
-      |> assign(:filter, %{"status" => "", "q" => ""})
+      |> assign(:filter, %{
+        "status" => "",
+        "q" => "",
+        "trouble" => "",
+        "sort" => "",
+        "flushed_min" => "60"
+      })
+      |> assign(:troubles, Directory.trouble_presets())
       |> assign(:offset, 0)
       |> assign(:editing, nil)
       |> assign(:edit_error, nil)
@@ -51,10 +58,20 @@ defmodule FathomWeb.AdminDirectoryLive do
     do: %{rows: [], has_more?: false, total: nil, limit: @page_size, offset: 0}
 
   @impl true
-  def handle_event("filter", %{"f" => %{"status" => status, "q" => q}}, socket) do
+  def handle_event("filter", %{"f" => %{"status" => status, "q" => q} = f}, socket) do
+    # `trouble`/`sort`/`flushed_min` are optional so a form without them (older tests, a stale
+    # client) still filters on status + q alone.
+    filter = %{
+      "status" => status,
+      "q" => q,
+      "trouble" => Map.get(f, "trouble", ""),
+      "sort" => Map.get(f, "sort", ""),
+      "flushed_min" => Map.get(f, "flushed_min", "60")
+    }
+
     {:noreply,
      socket
-     |> assign(:filter, %{"status" => status, "q" => q})
+     |> assign(:filter, filter)
      |> assign(:offset, 0)
      |> assign(:editing, nil)
      |> load()}
@@ -228,6 +245,9 @@ defmodule FathomWeb.AdminDirectoryLive do
       Directory.list_page(
         status: filter["status"],
         q: filter["q"],
+        trouble: parse_trouble(filter["trouble"]),
+        flushed_older_than_s: parse_minutes(filter["flushed_min"]),
+        sort: parse_sort(filter["sort"]),
         limit: @page_size,
         offset: offset,
         # No exact count (#32): this runs on every keystroke of the filter box, and the
@@ -236,6 +256,25 @@ defmodule FathomWeb.AdminDirectoryLive do
       )
 
     assign(socket, :page, page)
+  end
+
+  # Whitelists, not `String.to_atom/1`: both values arrive from the client.
+  defp parse_trouble(value) do
+    Enum.find(Directory.trouble_presets(), &(Atom.to_string(&1) == value))
+  end
+
+  @sorts %{
+    "last_flushed_at" => :last_flushed_at,
+    "last_snapshot_at" => :last_snapshot_at,
+    "verify" => :verify
+  }
+  defp parse_sort(value), do: Map.get(@sorts, value)
+
+  defp parse_minutes(value) do
+    case Integer.parse(to_string(value)) do
+      {n, ""} when n > 0 and n <= 525_600 -> n * 60
+      _ -> nil
+    end
   end
 
   defp parse_retain(""), do: {:ok, nil}
@@ -283,6 +322,54 @@ defmodule FathomWeb.AdminDirectoryLive do
                 class="rounded-lg border border-base-300 bg-base-100 px-2 py-1 text-sm"
               />
             </div>
+            <div>
+              <label class="mb-1 block text-xs font-medium text-base-content/60">Trouble</label>
+              <select
+                id="directory-trouble"
+                name="f[trouble]"
+                class="rounded-lg border border-base-300 bg-base-100 px-2 py-1 text-sm"
+              >
+                <option value="" selected={@filter["trouble"] == ""}>none</option>
+                <option
+                  :for={t <- @troubles}
+                  value={t}
+                  selected={@filter["trouble"] == Atom.to_string(t)}
+                >
+                  {trouble_label(t)}
+                </option>
+              </select>
+            </div>
+            <div :if={@filter["trouble"] == "stale_flush"}>
+              <label class="mb-1 block text-xs font-medium text-base-content/60">
+                Unflushed for (min)
+              </label>
+              <input
+                id="directory-flushed-min"
+                type="number"
+                min="1"
+                name="f[flushed_min]"
+                value={@filter["flushed_min"]}
+                phx-debounce="300"
+                class="w-24 rounded-lg border border-base-300 bg-base-100 px-2 py-1 text-sm"
+              />
+            </div>
+            <div>
+              <label class="mb-1 block text-xs font-medium text-base-content/60">Sort</label>
+              <select
+                id="directory-sort"
+                name="f[sort]"
+                class="rounded-lg border border-base-300 bg-base-100 px-2 py-1 text-sm"
+              >
+                <option value="" selected={@filter["sort"] == ""}>shard id</option>
+                <option value="last_flushed_at" selected={@filter["sort"] == "last_flushed_at"}>
+                  last flushed (oldest first)
+                </option>
+                <option value="last_snapshot_at" selected={@filter["sort"] == "last_snapshot_at"}>
+                  last snapshot (oldest first)
+                </option>
+                <option value="verify" selected={@filter["sort"] == "verify"}>verify status</option>
+              </select>
+            </div>
             <div class="text-xs text-base-content/50">
               {length(@page.rows)}{if @page.has_more?, do: "+"} row(s)
             </div>
@@ -300,6 +387,9 @@ defmodule FathomWeb.AdminDirectoryLive do
                   <th class="py-2 pr-4 text-left font-medium">Status</th>
                   <th class="py-2 pr-4 text-right font-medium">Schema v</th>
                   <th class="py-2 pr-4 text-left font-medium">Last active</th>
+                  <th class="py-2 pr-4 text-left font-medium">Last flushed</th>
+                  <th class="py-2 pr-4 text-left font-medium">Last snapshot</th>
+                  <th class="py-2 pr-4 text-left font-medium">Verify</th>
                   <th class="py-2 pr-4 text-left font-medium">Retain until</th>
                   <th class="py-2 pr-4 text-right font-medium">Token v</th>
                   <th class="py-2 text-right font-medium"></th>
@@ -318,6 +408,17 @@ defmodule FathomWeb.AdminDirectoryLive do
                       {row.schema_version}
                     </td>
                     <td class="num py-1.5 pr-4 text-base-content/60">{fmt_dt(row.last_active_at)}</td>
+                    <td class="num py-1.5 pr-4 text-base-content/60">
+                      {fmt_dt(row.last_flushed_at)}
+                    </td>
+                    <td class="num py-1.5 pr-4 text-base-content/60">
+                      {fmt_dt(row.last_snapshot_at)}
+                    </td>
+                    <td class="num py-1.5 pr-4">
+                      <span class={verify_class(row.last_verify_status)}>
+                        {row.last_verify_status}
+                      </span>
+                    </td>
                     <td class="num py-1.5 pr-4 text-base-content/60">{fmt_dt(row.retain_until)}</td>
                     <td class="num py-1.5 pr-4 text-right text-base-content/60">
                       {row.token_version}
@@ -378,7 +479,7 @@ defmodule FathomWeb.AdminDirectoryLive do
                     </td>
                   </tr>
                   <tr :if={@editing == row.shard_id} id="directory-edit-row" class="bg-base-content/5">
-                    <td colspan="7" class="p-3">
+                    <td colspan="10" class="p-3">
                       <form
                         id="directory-edit-form"
                         phx-submit="save"
@@ -468,6 +569,16 @@ defmodule FathomWeb.AdminDirectoryLive do
   defp status_class("suspended"), do: "num text-warning"
   defp status_class("deleted"), do: "num text-base-content/40"
   defp status_class(_), do: "num text-base-content/60"
+
+  defp verify_class(nil), do: "num text-base-content/40"
+  defp verify_class("ok"), do: "num text-success"
+  defp verify_class(_), do: "num text-error"
+
+  defp trouble_label(:quarantined), do: "quarantined (migration_failed)"
+  defp trouble_label(:verify_bad), do: "verify status not ok"
+  defp trouble_label(:no_snapshot), do: "no snapshot in 24 h"
+  defp trouble_label(:stale_flush), do: "last flushed older than N"
+  defp trouble_label(:requeued), do: "requeue count > 0"
 
   defp fmt_dt(nil), do: ""
   defp fmt_dt(%DateTime{} = dt), do: DateTime.to_iso8601(dt)

@@ -130,6 +130,12 @@ defmodule FathomWeb.Layouts do
               label="Rebalancer"
             />
             <.nav_item
+              navigate={~p"/admin/durability"}
+              active={@active == :durability}
+              icon="hero-shield-check"
+              label="Durability"
+            />
+            <.nav_item
               navigate={~p"/admin/query"}
               active={@active == :query}
               icon="hero-command-line"

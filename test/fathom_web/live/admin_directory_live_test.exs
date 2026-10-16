@@ -12,6 +12,8 @@ defmodule FathomWeb.AdminDirectoryLiveTest do
   alias Fathom.Directory.Shard
   alias Fathom.Repo
 
+  require Ecto.Query
+
   @auth "Basic " <> Base.encode64("admin:secret")
   defp auth(conn), do: Plug.Conn.put_req_header(conn, "authorization", @auth)
 
@@ -223,5 +225,130 @@ defmodule FathomWeb.AdminDirectoryLiveTest do
     assert Enum.all?(events, &(&1.actor == "console:admin"))
     assert Enum.all?(events, &(&1.source_ip == "127.0.0.1"))
     assert Enum.find(events, &(&1.action == "admin_update")).detail["status"] == "retired"
+  end
+
+  # Expert review 2026-10-15 #8: trouble presets + the Last-flushed / Last-snapshot / Verify columns.
+  describe "trouble filters" do
+    defp ago(secs), do: DateTime.add(DateTime.utc_now(), -secs, :second)
+
+    defp patch_shard(shard_id, attrs) do
+      Repo.update_all(
+        Ecto.Query.from(s in Shard, where: s.shard_id == ^shard_id),
+        set: Map.to_list(attrs)
+      )
+    end
+
+    defp seed_trouble do
+      put_shard(%{shard_id: "tr_healthy"})
+
+      patch_shard("tr_healthy", %{
+        last_flushed_at: ago(10),
+        last_snapshot_at: ago(60),
+        last_verify_status: "ok"
+      })
+
+      put_shard(%{shard_id: "tr_quarantined", status: "migration_failed"})
+      put_shard(%{shard_id: "tr_badverify"})
+      patch_shard("tr_badverify", %{last_verify_status: "corrupt", last_snapshot_at: ago(60)})
+      put_shard(%{shard_id: "tr_nosnap"})
+      patch_shard("tr_nosnap", %{last_snapshot_at: ago(3 * 86_400)})
+      put_shard(%{shard_id: "tr_requeued"})
+      patch_shard("tr_requeued", %{requeue_count: 2, last_snapshot_at: ago(60)})
+      put_shard(%{shard_id: "tr_deleted", status: "deleted"})
+    end
+
+    defp apply_filter(view, trouble, extra \\ %{}) do
+      view
+      |> element("#directory-filter")
+      |> render_change(%{
+        "f" => Map.merge(%{"status" => "", "q" => "tr_", "trouble" => trouble}, extra)
+      })
+    end
+
+    test "each preset keeps exactly its trouble rows", %{conn: conn} do
+      seed_trouble()
+      {:ok, view, _} = conn |> auth() |> live("/admin/directory")
+
+      apply_filter(view, "quarantined")
+      assert has_element?(view, "#dir-row-tr_quarantined")
+      refute has_element?(view, "#dir-row-tr_healthy")
+
+      apply_filter(view, "verify_bad")
+      assert has_element?(view, "#dir-row-tr_badverify")
+      refute has_element?(view, "#dir-row-tr_healthy")
+      refute has_element?(view, "#dir-row-tr_requeued")
+
+      # Never snapshotted counts as no snapshot in 24 h; one snapshotted a minute ago does not.
+      apply_filter(view, "no_snapshot")
+      assert has_element?(view, "#dir-row-tr_nosnap")
+      refute has_element?(view, "#dir-row-tr_healthy")
+      refute has_element?(view, "#dir-row-tr_deleted")
+
+      apply_filter(view, "requeued")
+      assert has_element?(view, "#dir-row-tr_requeued")
+      refute has_element?(view, "#dir-row-tr_healthy")
+    end
+
+    test "stale_flush honours the minutes input and excludes recently flushed shards",
+         %{conn: conn} do
+      seed_trouble()
+      patch_shard("tr_nosnap", %{last_flushed_at: ago(2 * 3600)})
+      {:ok, view, _} = conn |> auth() |> live("/admin/directory")
+
+      apply_filter(view, "stale_flush", %{"flushed_min" => "60"})
+      assert has_element?(view, "#dir-row-tr_nosnap")
+      refute has_element?(view, "#dir-row-tr_healthy")
+
+      # With a 5-hour threshold the 2-hour-old flush is no longer stale.
+      apply_filter(view, "stale_flush", %{"flushed_min" => "300"})
+      refute has_element?(view, "#dir-row-tr_nosnap")
+    end
+
+    test "an unknown trouble value is ignored, not an atom or a crash", %{conn: conn} do
+      seed_trouble()
+      {:ok, view, _} = conn |> auth() |> live("/admin/directory")
+
+      apply_filter(view, "definitely_not_a_preset")
+      assert has_element?(view, "#dir-row-tr_healthy")
+    end
+
+    test "the new columns render and sort by last flushed works", %{conn: conn} do
+      seed_trouble()
+      {:ok, view, _} = conn |> auth() |> live("/admin/directory")
+
+      assert has_element?(view, "#directory-table th", "Last flushed")
+      assert has_element?(view, "#directory-table th", "Last snapshot")
+      assert has_element?(view, "#directory-table th", "Verify")
+      assert has_element?(view, "#dir-row-tr_badverify", "corrupt")
+
+      apply_filter(view, "", %{"sort" => "last_flushed_at"})
+      assert has_element?(view, "#dir-row-tr_healthy")
+    end
+  end
+
+  describe "Directory.backup_summary/1" do
+    test "folds one grouped query into totals, never-snapshotted, stale and verify counts" do
+      put_shard(%{shard_id: "bk_ok"})
+
+      Repo.update_all(
+        Ecto.Query.from(s in Shard, where: s.shard_id == "bk_ok"),
+        set: [last_snapshot_at: DateTime.utc_now(), last_verify_status: "ok"]
+      )
+
+      put_shard(%{shard_id: "bk_never"})
+      put_shard(%{shard_id: "bk_gone", status: "deleted"})
+
+      s = Directory.backup_summary(86_400)
+      assert s.total >= 2
+      assert s.never_snapshotted >= 1
+      assert s.stale_snapshot >= s.never_snapshotted
+      assert s.verify["ok"] >= 1
+      assert %DateTime{} = s.last_snapshot_at
+    end
+
+    test "an empty directory is all zeros and a nil newest snapshot" do
+      assert %{total: 0, never_snapshotted: 0, stale_snapshot: 0, last_snapshot_at: nil} =
+               Directory.backup_summary(86_400)
+    end
   end
 end

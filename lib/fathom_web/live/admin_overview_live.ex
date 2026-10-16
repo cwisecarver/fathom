@@ -187,7 +187,7 @@ defmodule FathomWeb.AdminOverviewLive do
             accent="text-warning"
           />
           <.stat_tile
-            label="RPO age"
+            label="Oldest S3-unflushed shard"
             value={fmt_ms(m(@metrics, :oldest_rpo_ms))}
             accent="text-warning"
           />

@@ -1912,7 +1912,7 @@ defmodule Fathom.Directory do
     # limit + 1: the extra row is the has_more? signal, and it is cheaper than any count.
     fetched =
       query
-      |> order_by([s], asc: s.shard_id)
+      |> admin_sort(Keyword.get(opts, :sort))
       |> limit(^(limit + 1))
       |> offset(^offset)
       |> Repo.all()
@@ -1941,14 +1941,124 @@ defmodule Fathom.Directory do
           base
       end
 
-    case Keyword.get(opts, :q) do
-      term when is_binary(term) and term != "" ->
-        from(s in base, where: ilike(s.shard_id, ^("%" <> term <> "%")))
+    base =
+      case Keyword.get(opts, :q) do
+        term when is_binary(term) and term != "" ->
+          from(s in base, where: ilike(s.shard_id, ^("%" <> term <> "%")))
 
-      _ ->
-        base
-    end
+        _ ->
+          base
+      end
+
+    trouble_filter(base, Keyword.get(opts, :trouble), Keyword.get(opts, :flushed_older_than_s))
   end
+
+  @typedoc "A Directory-page trouble preset (expert review 2026-10-15 #8)."
+  @type trouble :: :quarantined | :verify_bad | :no_snapshot | :stale_flush | :requeued
+
+  @doc "The trouble presets `list_page/1` accepts as `:trouble`, in display order."
+  @spec trouble_presets() :: [trouble()]
+  def trouble_presets, do: [:quarantined, :verify_bad, :no_snapshot, :stale_flush, :requeued]
+
+  # `:trouble` presets for the admin Directory page. A DELETED row is never trouble (it is a
+  # tombstone awaiting erase), so every preset except `:quarantined` excludes it. The time cutoffs are
+  # computed here, never taken from user input.
+  defp trouble_filter(q, :quarantined, _), do: from(s in q, where: s.status == "migration_failed")
+
+  defp trouble_filter(q, :verify_bad, _) do
+    from(s in q,
+      where:
+        s.status != "deleted" and not is_nil(s.last_verify_status) and
+          s.last_verify_status != "ok"
+    )
+  end
+
+  defp trouble_filter(q, :no_snapshot, _) do
+    cutoff = DateTime.add(DateTime.utc_now(), -86_400, :second)
+
+    from(s in q,
+      where: s.status == "active" and (is_nil(s.last_snapshot_at) or s.last_snapshot_at < ^cutoff)
+    )
+  end
+
+  defp trouble_filter(q, :stale_flush, older_than_s) do
+    secs = if is_integer(older_than_s) and older_than_s > 0, do: older_than_s, else: 3_600
+    cutoff = DateTime.add(DateTime.utc_now(), -secs, :second)
+
+    from(s in q,
+      where:
+        s.status == "active" and not is_nil(s.last_active_at) and
+          (is_nil(s.last_flushed_at) or s.last_flushed_at < ^cutoff)
+    )
+  end
+
+  defp trouble_filter(q, :requeued, _),
+    do: from(s in q, where: s.status != "deleted" and s.requeue_count > 0)
+
+  defp trouble_filter(q, _none, _), do: q
+
+  defp admin_sort(q, :last_flushed_at),
+    do: order_by(q, [s], asc_nulls_first: s.last_flushed_at, asc: s.shard_id)
+
+  defp admin_sort(q, :last_snapshot_at),
+    do: order_by(q, [s], asc_nulls_first: s.last_snapshot_at, asc: s.shard_id)
+
+  defp admin_sort(q, :verify),
+    do: order_by(q, [s], desc_nulls_last: s.last_verify_status, asc: s.shard_id)
+
+  defp admin_sort(q, _), do: order_by(q, [s], asc: s.shard_id)
+
+  @doc """
+  The Backup & DR roll-up behind the admin Durability page (expert review 2026-10-15 #8): ONE
+  aggregate query, grouped by `last_verify_status`, folded in memory. Deleted rows are excluded.
+
+  `last_snapshot_at` is stamped only on success, so `max(last_snapshot_at)` far in the past while
+  shards exist is the signature of a stuck scheduler. `stale_snapshot` counts shards whose newest
+  snapshot is older than `stale_after_s` or absent.
+  """
+  @spec backup_summary(pos_integer()) :: %{
+          total: non_neg_integer(),
+          last_snapshot_at: DateTime.t() | nil,
+          never_snapshotted: non_neg_integer(),
+          stale_snapshot: non_neg_integer(),
+          verify: %{optional(String.t() | nil) => non_neg_integer()}
+        }
+  def backup_summary(stale_after_s \\ 86_400) do
+    cutoff = DateTime.add(DateTime.utc_now(), -stale_after_s, :second)
+
+    rows =
+      from(s in Shard,
+        where: s.status != "deleted",
+        group_by: s.last_verify_status,
+        select: {
+          s.last_verify_status,
+          count(s.id),
+          max(s.last_snapshot_at),
+          filter(count(s.id), is_nil(s.last_snapshot_at)),
+          filter(count(s.id), is_nil(s.last_snapshot_at) or s.last_snapshot_at < ^cutoff)
+        }
+      )
+      |> Repo.all()
+
+    Enum.reduce(
+      rows,
+      %{total: 0, last_snapshot_at: nil, never_snapshotted: 0, stale_snapshot: 0, verify: %{}},
+      fn {status, n, max_snap, never, stale}, acc ->
+        %{
+          acc
+          | total: acc.total + n,
+            last_snapshot_at: later(acc.last_snapshot_at, max_snap),
+            never_snapshotted: acc.never_snapshotted + never,
+            stale_snapshot: acc.stale_snapshot + stale,
+            verify: Map.put(acc.verify, status, n)
+        }
+      end
+    )
+  end
+
+  defp later(nil, b), do: b
+  defp later(a, nil), do: a
+  defp later(a, b), do: if(DateTime.compare(a, b) == :lt, do: b, else: a)
 
   defp clamp_page(n) when is_integer(n) and n > 0, do: min(n, @max_page)
   defp clamp_page(_), do: @default_page
