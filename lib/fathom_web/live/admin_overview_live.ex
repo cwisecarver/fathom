@@ -12,6 +12,7 @@ defmodule FathomWeb.AdminOverviewLive do
 
   import FathomWeb.AdminComponents
   import FathomWeb.AdminComponents.NodeHealth
+  import FathomWeb.AdminComponents.Errors
 
   alias Fathom.Admin.{Fleet, FleetCollector, MetricsCollector}
 
@@ -181,11 +182,22 @@ defmodule FathomWeb.AdminOverviewLive do
             value={fmt_int(m(@metrics, :dirty_shards))}
             accent="text-warning"
           />
-          <.stat_tile
-            label="Oldest unflushed (S3)"
-            value={fmt_ms(m(@metrics, :oldest_rpo_ms))}
-            accent="text-warning"
-          />
+          <div id="rpo-tile">
+            <.stat_tile
+              label="Oldest unflushed (S3)"
+              value={fmt_ms(m(@metrics, :oldest_rpo_ms))}
+              accent="text-warning"
+            >
+              <.badge :if={m(@metrics, :rpo_under_reporting)} kind={:warn}>
+                <span
+                  id="rpo-under-reporting"
+                  title="Fewer flush-watermark rows than open shards: dirty count and RPO age exclude shards with no published watermark"
+                >
+                  under-reporting {fmt_int(m(@metrics, :rpo_rows))} / {fmt_int(m(@metrics, :rpo_open))}
+                </span>
+              </.badge>
+            </.stat_tile>
+          </div>
         </div>
 
         <%!-- Node health strip + admission pressure + VM (components/admin_components/node_health.ex) --%>
@@ -193,6 +205,12 @@ defmodule FathomWeb.AdminOverviewLive do
         <div class="grid grid-cols-1 gap-6 lg:grid-cols-2">
           <.admission_panel metrics={@metrics} />
           <.vm_panel metrics={@metrics} />
+        </div>
+
+        <%!-- Errors + data-plane auth (components/admin_components/errors.ex) --%>
+        <div class="grid grid-cols-1 gap-6 lg:grid-cols-2">
+          <.errors_panel metrics={@metrics} history={@history} />
+          <.auth_panel metrics={@metrics} />
         </div>
 
         <%!-- Hero charts --%>

@@ -10,20 +10,28 @@ defmodule FathomWeb.AdminClusterLive do
   use FathomWeb, :live_view
 
   import FathomWeb.AdminComponents
+  import FathomWeb.AdminComponents.Errors
 
-  alias Fathom.Admin.{LeaseEvents, LeaseHealth}
+  alias Fathom.Admin.{LeaseEvents, LeaseHealth, MetricsCollector}
 
   @refresh_ms 1_000
   @events_shown 100
 
   @impl true
   def mount(_params, _session, socket) do
-    if connected?(socket), do: Process.send_after(self(), :refresh, @refresh_ms)
+    if connected?(socket) do
+      Process.send_after(self(), :refresh, @refresh_ms)
+      # The 5 min event counts ride the collector's existing broadcast: no second scrape here.
+      Phoenix.PubSub.subscribe(Fathom.PubSub, MetricsCollector.topic())
+    end
+
+    events = (MetricsCollector.snapshot().current || %{}) |> Map.get(:events_5m)
 
     {:ok,
      socket
      |> assign(:page_title, "Cluster")
      |> assign(:node_key, Fathom.Rebalancer.node_key())
+     |> assign(:events_5m, events)
      |> load()}
   end
 
@@ -32,6 +40,9 @@ defmodule FathomWeb.AdminClusterLive do
     Process.send_after(self(), :refresh, @refresh_ms)
     {:noreply, load(socket)}
   end
+
+  def handle_info({:metrics, m}, socket),
+    do: {:noreply, assign(socket, :events_5m, Map.get(m, :events_5m))}
 
   defp load(socket) do
     socket
@@ -44,6 +55,8 @@ defmodule FathomWeb.AdminClusterLive do
     ~H"""
     <Layouts.admin flash={@flash} active={:cluster} node_key={@node_key}>
       <div class="space-y-6">
+        <.events_strip events={@events_5m} />
+
         <.panel title="Lease health" class="">
           <div id="lease-health" class="grid grid-cols-2 gap-4 md:grid-cols-4">
             <div id="lease-mode">

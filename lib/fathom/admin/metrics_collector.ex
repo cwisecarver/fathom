@@ -59,6 +59,24 @@ defmodule Fathom.Admin.MetricsCollector do
   @cold_window_ms 60_000
   @flush_window_ms 30_000
   @admission_recent 20
+
+  # Window behind the Errors / Data-plane auth "in window" counts and the Cluster page's
+  # "Events / 5 min" strip (the Overview scope badge says "5m window"). Cumulative counter totals
+  # are snapshotted each tick and the window is `now - oldest retained`; no second scrape.
+  @events_window_ms 300_000
+  @window_tags [:errors, :no_quorum, :auth, :events]
+  @error_classes ~w(timeout too_large busy sql_error no_quorum other)
+  @auth_reasons ~w(expired invalid wrong_shard revoked missing other)
+  # Cluster-page event counters (summed across tags): key => Prometheus family prefix.
+  @event_counters [
+    flush_failed: "fathom_shard_flush_failed",
+    lease_superseded: "fathom_shard_lease_superseded",
+    fenced_quarantine: "fathom_shard_fenced_quarantine",
+    corrupt_flush: "fathom_shard_corrupt_flush",
+    replication_reject: "fathom_replication_reject",
+    at_capacity: "fathom_shards_at_capacity",
+    heartbeat_lapsed: "fathom_shard_heartbeat_lapsed"
+  ]
   # Cumulative counters (summed across tags) whose per-second rate the Admission panel shows.
   @admission_counters [
     evicted: "fathom_shards_evicted",
@@ -108,6 +126,11 @@ defmodule Fathom.Admin.MetricsCollector do
       # numerically unchanged whether or not the walk re-ran, which made a stamp-based test
       # report the wrong failure.
       rpo_walks: 0,
+      # {FlushWatermark rows, open shards} at the last RPO walk: rows < open means the dirty/RPO
+      # readout under-reports (some open shard has published no watermark). Same 10 s cadence.
+      rpo_cov: {0, 0},
+      # [{mono_ms, %{{tag, key} => cumulative}}] newest first, behind the 5 min event windows.
+      win_hist: [],
       rings: [],
       current: nil
     }
@@ -248,6 +271,11 @@ defmodule Fathom.Admin.MetricsCollector do
 
     {state, {dirty, oldest_rpo}} = rpo_throttled(state)
 
+    {rpo_rows, rpo_open} = state.rpo_cov
+
+    {win, win_hist} =
+      window_counts(state.win_hist, now, window_snapshot(s.counters), @events_window_ms)
+
     cold = cold_open_stats(s.cold_win)
     flush_p99 = PrometheusScrape.percentile_cumulative(Map.get(s.flush_win, "all", []), 99)
 
@@ -268,6 +296,13 @@ defmodule Fathom.Admin.MetricsCollector do
       flush_p99_ms: flush_p99,
       dirty_shards: dirty,
       oldest_rpo_ms: oldest_rpo,
+      rpo_rows: rpo_rows,
+      rpo_open: rpo_open,
+      rpo_under_reporting: rpo_rows < rpo_open,
+      errors: error_summary(s.counter_rates, win),
+      no_quorum: group_summary(s.counter_rates, win, :no_quorum),
+      auth_rejected: group_summary(s.counter_rates, win, :auth),
+      events_5m: group_window(win, :events),
       s3_ops_per_s: s.counter_rates.s3_ops,
       s3_bytes_per_s: s.counter_rates.s3_bytes,
       checkout_per_s: s.counter_rates.checkout,
@@ -292,6 +327,7 @@ defmodule Fathom.Admin.MetricsCollector do
         prev_query_buckets: s.query_buckets,
         prev_counters: s.counters,
         hists: s.hists,
+        win_hist: win_hist,
         prev_latency: latency,
         current: current,
         rings: [ring | state.rings] |> Enum.take(@ring)
@@ -466,7 +502,59 @@ defmodule Fathom.Admin.MetricsCollector do
       checkout: m |> Map.get(:checkout_per_s, %{}) |> Map.values() |> Enum.sum(),
       flush_p99: Map.get(m, :flush_p99_ms),
       cold_p99: Map.get(m, :cold_open_p99_ms),
-      dirty: Map.get(m, :dirty_shards)
+      dirty: Map.get(m, :dirty_shards),
+      err: get_in(m, [:errors, :total_rate]) || 0.0,
+      err_ratio: get_in(m, [:errors, :ratio]) || 0.0
+    }
+  end
+
+  @doc """
+  Windows the cumulative counter totals in `cur` (`%{{tag, key} => total}`) over the last
+  `window_ms`: `{%{{tag, key} => count_in_window}, next_hist}`. Same shape as `window_hist/4`: the
+  window is `cur` minus the OLDEST retained snapshot, empty with no history, clamped at 0 so a
+  counter reset cannot go negative.
+  """
+  @spec window_counts([{integer(), map()}], integer(), map(), pos_integer()) ::
+          {map(), [{integer(), map()}]}
+  def window_counts(hist, now, cur, window_ms) do
+    kept = Enum.filter(hist, fn {t, _} -> now - t <= window_ms end)
+
+    base =
+      case List.last(kept) do
+        nil -> cur
+        {_t, snap} -> snap
+      end
+
+    win = Map.new(cur, fn {k, v} -> {k, max(v - Map.get(base, k, v), 0.0)} end)
+    {win, [{now, cur} | kept]}
+  end
+
+  defp window_snapshot(counters) do
+    Map.filter(counters, fn
+      {{tag, _k}, _v} -> tag in @window_tags
+      _ -> false
+    end)
+  end
+
+  defp group_window(win, tag), do: for({{^tag, k}, v} <- win, into: %{}, do: {k, round(v)})
+
+  defp group_summary(rates, win, tag) do
+    %{rates: Map.get(rates, tag, %{}), window: group_window(win, tag)}
+  end
+
+  # Query errors: per-class rates and window counts, plus the windowed error ratio
+  # errors / (errors + queries) from the same 1 s diff (queries = the latency histogram's count).
+  defp error_summary(rates, win) do
+    er = Map.get(rates, :errors, %{})
+    total = er |> Map.values() |> Enum.sum()
+    q = rates |> Map.get(:queries, %{}) |> Map.get(:total, 0.0)
+
+    %{
+      rates: er,
+      window: group_window(win, :errors),
+      total_rate: total,
+      query_rate: q,
+      ratio: if(total + q > 0, do: total / (total + q), else: 0.0)
     }
   end
 
@@ -623,6 +711,14 @@ defmodule Fathom.Admin.MetricsCollector do
         {k, PrometheusScrape.value(scrape, "fathom_shard_pool_take", %{"result" => r}, 0.0)}
       end)
 
+    queries = %{total: PrometheusScrape.sum(scrape, "fathom_shard_query_duration")}
+    errors = tagged(scrape, "fathom_shard_query_error", "class", @error_classes)
+    auth = tagged(scrape, "fathom_hrana_auth_rejected", "reason", @auth_reasons)
+    no_quorum = tagged(scrape, "fathom_replication_no_quorum", "reason", [])
+
+    events =
+      Map.new(@event_counters, fn {k, prefix} -> {k, PrometheusScrape.sum(scrape, prefix)} end)
+
     health = %{
       flush_gate_refusals:
         PrometheusScrape.value(scrape, "fathom_shard_flush_gate_refusals", %{}, 0.0)
@@ -636,7 +732,12 @@ defmodule Fathom.Admin.MetricsCollector do
           prefixed(checkout, :checkout),
           prefixed(admission, :admission),
           prefixed(pool, :pool),
-          prefixed(health, :health)
+          prefixed(health, :health),
+          prefixed(queries, :queries),
+          prefixed(errors, :errors),
+          prefixed(auth, :auth),
+          prefixed(no_quorum, :no_quorum),
+          prefixed(events, :events)
         ],
         %{},
         &Map.merge/2
@@ -650,7 +751,11 @@ defmodule Fathom.Admin.MetricsCollector do
       s3_bytes: rate_group(s3_bytes, prev, :s3_bytes, window_s),
       checkout: rate_group(checkout, prev, :checkout, window_s),
       admission: Map.merge(rate_group(admission, prev, :admission, window_s), pool_rates),
-      health: rate_group(health, prev, :health, window_s)
+      health: rate_group(health, prev, :health, window_s),
+      queries: rate_group(queries, prev, :queries, window_s),
+      errors: rate_group(errors, prev, :errors, window_s),
+      auth: rate_group(auth, prev, :auth, window_s),
+      no_quorum: rate_group(no_quorum, prev, :no_quorum, window_s)
     }
 
     {cur, rates}
@@ -658,6 +763,12 @@ defmodule Fathom.Admin.MetricsCollector do
 
   defp counter_group(scrape, prefix, label_key, keys) do
     Map.new(keys, fn k -> {k, PrometheusScrape.value(scrape, prefix, %{label_key => k})} end)
+  end
+
+  # A counter by label: the fixed (bounded) label values plus any the scrape shows beyond them.
+  defp tagged(scrape, prefix, label, fixed) do
+    keys = Enum.uniq(fixed ++ PrometheusScrape.label_values(scrape, prefix, label))
+    counter_group(scrape, prefix, label, keys)
   end
 
   defp prefixed(group, tag), do: Map.new(group, fn {k, v} -> {{tag, k}, v} end)
@@ -695,7 +806,9 @@ defmodule Fathom.Admin.MetricsCollector do
 
     if is_nil(at) or now - at >= @rpo_interval_ms do
       fresh = rpo()
-      {%{state | rpo: fresh, rpo_at: now, rpo_walks: state.rpo_walks + 1}, fresh}
+      cov = {FlushWatermark.size(), Fathom.Shards.open_count()}
+
+      {%{state | rpo: fresh, rpo_at: now, rpo_walks: state.rpo_walks + 1, rpo_cov: cov}, fresh}
     else
       {state, cached}
     end
