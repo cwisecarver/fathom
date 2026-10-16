@@ -49,8 +49,10 @@ defmodule FathomWeb.Router do
     live_session :admin, session: {__MODULE__, :admin_live_session, []} do
       live "/", AdminOverviewLive, :index
       live "/shards", AdminShardsLive, :index
+      live "/shards/:id", AdminShardLive, :show
       live "/directory", AdminDirectoryLive, :index
       live "/migrations", AdminMigrationsLive, :index
+      live "/audit", AdminAuditLive, :index
       live "/query", AdminQueryLive, :index
     end
   end

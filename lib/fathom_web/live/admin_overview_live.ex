@@ -231,7 +231,9 @@ defmodule FathomWeb.AdminOverviewLive do
                   :for={s <- hot(@metrics)}
                   class="border-b border-base-300/50 hover:bg-base-content/5"
                 >
-                  <td class="num py-1.5 text-left text-base-content/80">{s.shard_id}</td>
+                  <td class="num py-1.5 text-left text-base-content/80">
+                    <.link navigate={~p"/admin/shards/#{s.shard_id}"} class="link">{s.shard_id}</.link>
+                  </td>
                   <td class="num py-1.5 text-right">{fmt_rate(s.q_per_s)}</td>
                   <td class="num py-1.5 text-right text-base-content/60">
                     {fmt_rate(s.rows_read_per_s)}

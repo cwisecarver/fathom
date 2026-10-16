@@ -72,16 +72,40 @@ defmodule Fathom.Audit do
       :ok
   end
 
-  @doc "Recent audit events, newest first (`:limit`, default 100; `:shard_id` to filter)."
+  @doc "Recent audit events, newest first (`:limit`, default 100; `:offset`; `:shard_id` to filter)."
   @spec list(keyword()) :: [Event.t()]
   def list(opts \\ []) do
     limit = Keyword.get(opts, :limit, 100)
 
     Event
     |> maybe_filter_shard(Keyword.get(opts, :shard_id))
-    |> order_by(desc: :inserted_at)
+    |> order_by(desc: :inserted_at, desc: :id)
     |> limit(^limit)
+    |> offset(^Keyword.get(opts, :offset, 0))
     |> Repo.all()
+  end
+
+  @tracked_credential_actions ~w(mint_token rotate_token revoke_token)
+
+  @doc """
+  Counts of credential mints / rotations / revokes recorded in the last `window_ms` (default 24 h),
+  as `%{"mint_token" => n, ...}` (every tracked action present, zero-filled). Bounded by time on
+  the `inserted_at` index, so it stays cheap however large the table grows.
+  """
+  @spec credential_action_counts(pos_integer()) :: %{String.t() => non_neg_integer()}
+  def credential_action_counts(window_ms \\ 86_400_000) do
+    cutoff = DateTime.add(DateTime.utc_now(), -window_ms, :millisecond)
+
+    counts =
+      Repo.all(
+        from e in Event,
+          where: e.inserted_at >= ^cutoff and e.action in ^@tracked_credential_actions,
+          group_by: e.action,
+          select: {e.action, count(e.id)}
+      )
+      |> Map.new()
+
+    Map.new(@tracked_credential_actions, &{&1, Map.get(counts, &1, 0)})
   end
 
   defp maybe_filter_shard(query, nil), do: query

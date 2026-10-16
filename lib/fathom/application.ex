@@ -990,7 +990,11 @@ defmodule Fathom.Application do
   defp metrics_collector_children do
     [{Task.Supervisor, name: Fathom.Admin.TaskSupervisor}] ++
       if Fathom.Admin.enabled?(),
-        do: [Fathom.Admin.MetricsCollector, Fathom.Admin.FleetCollector],
+        do: [
+          Fathom.Admin.MetricsCollector,
+          Fathom.Admin.FleetCollector,
+          Fathom.Admin.HotShardsCache
+        ],
         else: []
   end
 

@@ -308,7 +308,9 @@ defmodule FathomWeb.AdminDirectoryLive do
               <tbody>
                 <%= for row <- @page.rows do %>
                   <tr id={"dir-row-#{row.shard_id}"} class="border-b border-base-300/50">
-                    <td class="num py-1.5 pr-4 text-base-content/80">{row.shard_id}</td>
+                    <td class="num py-1.5 pr-4 text-base-content/80">
+                      <.link navigate={~p"/admin/shards/#{row.shard_id}"} class="link">{row.shard_id}</.link>
+                    </td>
                     <td class="py-1.5 pr-4">
                       <span class={status_class(row.status)}>{row.status}</span>
                     </td>

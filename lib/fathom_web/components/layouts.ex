@@ -81,7 +81,7 @@ defmodule FathomWeb.Layouts do
 
   attr :active, :atom,
     default: nil,
-    doc: "the active nav item (:overview | :shards | :directory | :migrations | :query)"
+    doc: "the active nav item (:overview | :shards | :directory | :migrations | :query | :audit)"
 
   attr :node_key, :string, default: ""
   slot :actions, doc: "top-bar right-aligned controls (e.g. a time-range picker)"
@@ -127,6 +127,12 @@ defmodule FathomWeb.Layouts do
               active={@active == :query}
               icon="hero-command-line"
               label="Query"
+            />
+            <.nav_item
+              navigate={~p"/admin/audit"}
+              active={@active == :audit}
+              icon="hero-clipboard-document-list"
+              label="Audit"
             />
           </nav>
           <div class="mt-auto border-t border-base-300 p-3 text-[11px] text-base-content/50">

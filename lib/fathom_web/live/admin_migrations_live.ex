@@ -193,7 +193,7 @@ defmodule FathomWeb.AdminMigrationsLive do
               </div>
               <div class="flex flex-wrap gap-1.5">
                 <.badge :for={id <- @mig.failed_shard_ids} kind={:error}>
-                  {id}
+                  <.link navigate={~p"/admin/shards/#{id}"}>{id}</.link>
                 </.badge>
               </div>
             </div>
