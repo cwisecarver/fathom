@@ -42,6 +42,15 @@ defmodule FathomWeb.AdminDurabilityLiveTest do
         quorum: 2,
         slack: 1,
         budget_ratio: 0.25,
+        catching_up_shards: 2,
+        catchup_armed: 3,
+        commit: %{
+          total: 10,
+          p50: 4.0,
+          p95: 40.0,
+          p99: 90.0,
+          outcomes: %{"ok" => 8, "no_quorum" => 1, "timeout" => 1, "other" => 0}
+        },
         followers: [
           %{node_key: "n2", host: "10.0.0.2", port: 7000, connected?: true, alive?: true},
           %{node_key: "n3", host: "10.0.0.3", port: 7000, connected?: false, alive?: :unknown}
@@ -110,6 +119,64 @@ defmodule FathomWeb.AdminDurabilityLiveTest do
     assert has_element?(view, "#alarm-corrupt_flush[data-firing='true']")
     assert has_element?(view, "#alarm-flush_failed[data-firing='false']")
     assert has_element?(view, "#alarm-quarantines[data-firing='true']")
+  end
+
+  test "replication latency tiles, outcomes and a populated lag table linking to shards", %{
+    conn: conn
+  } do
+    {:ok, view, _} = conn |> auth() |> live("/admin/durability")
+    render_async(view)
+
+    lag = %{
+      sessions: 5,
+      answered: 4,
+      timed_out: 1,
+      catching_up: 1,
+      worst: [
+        %{
+          shard_id: "lagshard",
+          catchup_fails: 3,
+          catching_up?: true,
+          inflight_pushes: 1,
+          seeds_in_flight: 0,
+          behind_followers: 1,
+          unacked_bytes: 4096
+        }
+      ]
+    }
+
+    send(
+      view.pid,
+      {:durability_data, %{snapshot: snapshot(%{replication: repl(%{})}), lag: lag}}
+    )
+
+    render(view)
+
+    assert has_element?(view, "#repl-commit-p99", "90 ms")
+    assert has_element?(view, "#repl-commit-no_quorum", "no_quorum 1")
+    assert has_element?(view, "#repl-catching-up", "2")
+    assert has_element?(view, "#repl-lag-table")
+    assert has_element?(view, "#lag-lagshard a[href='/admin/shards/lagshard']")
+    assert has_element?(view, "#repl-lag-partial", "4 answered, 1 timed out")
+    refute has_element?(view, "#repl-lag-empty")
+  end
+
+  test "enabled but nothing lagging says all sessions caught up", %{conn: conn} do
+    {:ok, view, _} = conn |> auth() |> live("/admin/durability")
+    render_async(view)
+
+    lag = %{sessions: 3, answered: 3, timed_out: 0, catching_up: 0, worst: []}
+
+    send(
+      view.pid,
+      {:durability_data, %{snapshot: snapshot(%{replication: repl(%{})}), lag: lag}}
+    )
+
+    render(view)
+
+    assert has_element?(view, "#repl-lag-empty", "All sessions caught up (3 answered)")
+    refute has_element?(view, "#repl-lag-table")
+    refute has_element?(view, "#repl-lag-partial")
   end
 
   test "replication panel: slack, budget, per-follower rows, 5-minute rates", %{conn: conn} do

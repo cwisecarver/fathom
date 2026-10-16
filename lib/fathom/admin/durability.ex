@@ -43,6 +43,9 @@ defmodule Fathom.Admin.Durability do
   @default_backup_ttl_ms 60_000
   @dirty_ttl_ms 10_000
   @dirty_top 20
+  @lag_ttl_ms 10_000
+  @commit_family "fathom_replication_commit_duration"
+  @commit_outcomes ["ok", "no_quorum", "timeout", "other"]
 
   # {key, label, scrape family}. Each is "page-worthy on first occurrence" per its metric's doc.
   @alarms [
@@ -236,15 +239,35 @@ defmodule Fathom.Admin.Durability do
     alarm_counts =
       Map.new(@alarms, fn {key, _label, family} -> {{:alarm, key}, family_sum(scrape, family)} end)
 
-    Enum.reduce(@repl_counters, alarm_counts, fn {key, family, label}, acc ->
-      if label do
-        scrape
-        |> family_by_label(family, label)
-        |> Enum.reduce(acc, fn {lv, n}, a -> Map.put(a, {key, lv}, n) end)
-      else
-        Map.put(acc, {key, nil}, family_sum(scrape, family))
-      end
-    end)
+    counters =
+      Enum.reduce(@repl_counters, alarm_counts, fn {key, family, label}, acc ->
+        if label do
+          scrape
+          |> family_by_label(family, label)
+          |> Enum.reduce(acc, fn {lv, n}, a -> Map.put(a, {key, lv}, n) end)
+        else
+          Map.put(acc, {key, nil}, family_sum(scrape, family))
+        end
+      end)
+
+    # Commit-ack latency: cumulative buckets SUMMED across outcomes (`buckets/3` sums series that
+    # share an `le`, so the tagged histogram does not yield duplicate `le` entries), plus the
+    # per-outcome observation counts. Windowed by the same newest-minus-oldest diff as the rest.
+    counters =
+      scrape
+      |> PrometheusScrape.buckets(@commit_family)
+      |> Enum.reduce(counters, fn {le, n}, a -> Map.put(a, {:commit_bucket, le}, n) end)
+
+    counters =
+      scrape
+      |> family_by_label(@commit_family <> "_count", "outcome")
+      |> Enum.reduce(counters, fn {o, n}, a -> Map.put(a, {:commit_outcome, o}, n) end)
+
+    Map.put(
+      counters,
+      :catchup_fails_armed,
+      family_sum(scrape, "fathom_replication_catchup_fails_count")
+    )
   end
 
   @doc false
@@ -293,8 +316,68 @@ defmodule Fathom.Admin.Durability do
       slack: slack,
       budget_ratio: PrometheusScrape.value(scrape, "fathom_replication_budget_used_ratio"),
       followers: safe(fn -> Fleet.health() end, []),
-      rates: replication_rates(window)
+      rates: replication_rates(window),
+      commit: commit_latency(window),
+      catchup_armed: round(Map.get(window, :catchup_fails_armed, 0)),
+      catching_up_shards:
+        round(PrometheusScrape.value(scrape, "fathom_replication_lag_catching_up_shards"))
     }
+  end
+
+  @doc false
+  # Windowed commit-ack latency from the diffed counters: p50/p95/p99 in ms (nil with no commits
+  # in the window) and the ok/no_quorum/timeout/other counts.
+  @spec commit_latency(counters()) :: %{
+          total: non_neg_integer(),
+          p50: float() | nil,
+          p95: float() | nil,
+          p99: float() | nil,
+          outcomes: %{String.t() => non_neg_integer()}
+        }
+  def commit_latency(window) do
+    cum =
+      Enum.sort_by(
+        for({{:commit_bucket, le}, n} <- window, do: {le, n}),
+        fn {le, _} -> le end,
+        fn
+          :infinity, :infinity -> true
+          :infinity, _ -> false
+          _, :infinity -> true
+          a, b -> a <= b
+        end
+      )
+
+    base =
+      Map.new(@commit_outcomes, fn o -> {o, round(Map.get(window, {:commit_outcome, o}, 0))} end)
+
+    # Any outcome outside the bounded four still counts toward `other`.
+    extra =
+      for {{:commit_outcome, o}, n} <- window, o not in @commit_outcomes, reduce: 0 do
+        acc -> acc + round(n)
+      end
+
+    outcomes = Map.update!(base, "other", &(&1 + extra))
+    total = outcomes |> Map.values() |> Enum.sum()
+
+    pct = fn p -> if total > 0, do: PrometheusScrape.percentile_cumulative(cum, p), else: nil end
+    %{total: total, p50: pct.(50), p95: pct.(95), p99: pct.(99), outcomes: outcomes}
+  end
+
+  @doc """
+  The replication lag report (`Fleet.lag_report/1`), cached 10 s and single-flight so N viewers
+  cause one fan-out per node. `nil` when replication is not running. `opts[:compute]` replaces the
+  report function (test seam). Only ever called while a viewer is mounted.
+  """
+  @spec lag(keyword()) :: map() | nil
+  def lag(opts \\ []) do
+    compute =
+      Keyword.get_lazy(opts, :compute, fn ->
+        fn ->
+          if safe(fn -> Fleet.replicating?() end, false), do: Fleet.lag_report(), else: nil
+        end
+      end)
+
+    cached(:lag, @lag_ttl_ms, compute)
   end
 
   # `%{reject: %{"overloaded" => 3}, seed: %{"ok" => 1}, disk_pressure: 0, ...}` — 5-min counts.

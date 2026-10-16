@@ -58,6 +58,74 @@ defmodule Fathom.Admin.DurabilityTest do
     end
   end
 
+  describe "commit latency window" do
+    defp commit_text(ok_buckets, nq_buckets, ok_n, nq_n) do
+      les = ["10", "100", "+Inf"]
+
+      series = fn outcome, bs ->
+        for {le, n} <- Enum.zip(les, bs) do
+          ~s(fathom_replication_commit_duration_bucket{outcome="#{outcome}",le="#{le}"} #{n}\n)
+        end
+      end
+
+      Enum.join(
+        series.("ok", ok_buckets) ++
+          series.("no_quorum", nq_buckets) ++
+          [
+            ~s(fathom_replication_commit_duration_count{outcome="ok"} #{ok_n}\n),
+            ~s(fathom_replication_commit_duration_count{outcome="no_quorum"} #{nq_n}\n)
+          ]
+      )
+    end
+
+    test "diffs the tagged histogram across outcomes (one entry per le) and counts outcomes" do
+      c0 = Durability.extract_counters(scrape(commit_text([10, 10, 10], [0, 0, 0], 10, 0)))
+      c1 = Durability.extract_counters(scrape(commit_text([110, 110, 110], [0, 5, 5], 110, 5)))
+      {diff, _} = Durability.window_diff([{300_000, c1}, {0, c0}])
+
+      # 100 ok commits all <= 10ms, 5 no_quorum all in (10,100]: summed per le, NOT walked as
+      # duplicate-le series (the tagged-histogram trap).
+      assert diff[{:commit_bucket, 10.0}] == 100
+      assert diff[{:commit_bucket, 100.0}] == 105
+
+      lat = Durability.commit_latency(diff)
+      assert lat.total == 105
+      assert lat.outcomes == %{"ok" => 100, "no_quorum" => 5, "timeout" => 0, "other" => 0}
+      assert lat.p50 <= 10.0
+      assert lat.p99 > 10.0 and lat.p99 <= 100.0
+    end
+
+    test "no commits in the window yields nil percentiles" do
+      c = Durability.extract_counters(scrape(commit_text([3, 3, 3], [0, 0, 0], 3, 0)))
+      {diff, _} = Durability.window_diff([{10_000, c}, {0, c}])
+      lat = Durability.commit_latency(diff)
+      assert lat.total == 0
+      assert lat.p50 == nil and lat.p99 == nil
+    end
+  end
+
+  describe "lag/1" do
+    test "is single-flight cached: N callers inside the TTL compute once" do
+      start_supervised!(Durability)
+      Durability.reset()
+      counter = :counters.new(1, [])
+
+      compute = fn ->
+        :counters.add(counter, 1, 1)
+        %{sessions: 1, answered: 1, timed_out: 0, catching_up: 0, worst: []}
+      end
+
+      for _ <- 1..5, do: assert(%{answered: 1} = Durability.lag(compute: compute))
+      assert :counters.get(counter, 1) == 1
+    end
+
+    test "without replication running there is nothing to report" do
+      start_supervised!(Durability)
+      Durability.reset()
+      assert Durability.lag() == nil
+    end
+  end
+
   describe "snapshot/0" do
     test "without a metrics reporter the snapshot degrades to an empty, non-firing state" do
       start_supervised!(Durability)
