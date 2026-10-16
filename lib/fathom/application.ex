@@ -994,6 +994,7 @@ defmodule Fathom.Application do
     [{Task.Supervisor, name: Fathom.Admin.TaskSupervisor}] ++
       if Fathom.Admin.enabled?(),
         do: [
+          Fathom.Admin.EventRing,
           Fathom.Admin.MetricsCollector,
           Fathom.Admin.FleetCollector,
           Fathom.Admin.HotShardsCache,

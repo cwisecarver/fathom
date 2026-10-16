@@ -100,6 +100,108 @@ defmodule Fathom.Admin.Measurements do
     :ok
   end
 
+  @sched_key {__MODULE__, :scheduler_sample}
+
+  @doc """
+  Run-queue lengths and scheduler utilisation (expert review 2026-10-15 #15).
+
+  Every query runs in an exqlite dirty-IO NIF and `FlushGate` sizes against the dirty-IO pool, yet
+  nothing showed whether that pool, the dirty-CPU pool or the normal schedulers were saturated.
+
+    * Run queues (`[:fathom, :node, :run_queue]`: `normal`, `dirty_cpu`, `dirty_io`) are
+      instantaneous lengths from `:erlang.statistics(:run_queue_lengths_all)` — normal queues
+      first, then the dirty-CPU queue, then the dirty-IO queue.
+    * Utilisation (`[:fathom, :node, :scheduler_util]`, ratios 0..1 averaged per kind) is
+      `:scheduler.utilization/2` between this tick's `:scheduler.sample_all/0` and the previous
+      tick's. The previous sample lives in the calling (poller) process's dictionary — no table,
+      no extra process. The first call has no baseline and emits queues only.
+
+  `scheduler_wall_time` accounting stays enabled once `sample_all` turns it on; its cost was
+  measured before enabling it here (see the commit message for the method and numbers).
+  """
+  @spec schedulers() :: :ok
+  def schedulers do
+    {normal, dirty_cpu, dirty_io} = run_queues()
+
+    :telemetry.execute(
+      [:fathom, :node, :run_queue],
+      %{normal: normal, dirty_cpu: dirty_cpu, dirty_io: dirty_io},
+      %{}
+    )
+
+    cur = :scheduler.sample_all()
+
+    case Process.put(@sched_key, cur) do
+      nil ->
+        :ok
+
+      prev ->
+        utils = scheduler_utils(:scheduler.utilization(prev, cur))
+
+        if utils != %{}, do: :telemetry.execute([:fathom, :node, :scheduler_util], utils, %{})
+    end
+
+    :ok
+  end
+
+  defp run_queues do
+    lengths = :erlang.statistics(:run_queue_lengths_all)
+    n_normal = :erlang.system_info(:schedulers)
+    {normal, rest} = Enum.split(lengths, n_normal)
+
+    case rest do
+      [cpu, io] -> {Enum.sum(normal), cpu, io}
+      [cpu] -> {Enum.sum(normal), cpu, 0}
+      _ -> {Enum.sum(normal), 0, 0}
+    end
+  end
+
+  # `:scheduler.utilization/2` over a `sample_all` pair returns `{:total, u, pct}`,
+  # `{:weighted, u, pct}` and `{kind, id, u, pct}` rows with kind :normal | :cpu | :io. Average the
+  # per-scheduler rows by kind; the whole-VM rows are not needed.
+  @doc false
+  @spec scheduler_utils([tuple()]) :: %{optional(atom()) => float()}
+  def scheduler_utils(rows) do
+    rows
+    |> Enum.flat_map(fn
+      {kind, _id, u, _pct} when kind in [:normal, :cpu, :io] and is_number(u) -> [{kind, u}]
+      _ -> []
+    end)
+    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+    |> Map.new(fn {kind, us} -> {util_key(kind), Enum.sum(us) / length(us)} end)
+  end
+
+  defp util_key(:normal), do: :normal
+  defp util_key(:cpu), do: :dirty_cpu
+  defp util_key(:io), do: :dirty_io
+
+  @doc "The `:erlang.memory/0` breakdown as gauges (processes, binary, ets, code, atom, system)."
+  @spec memory_breakdown() :: :ok
+  def memory_breakdown do
+    mem = :erlang.memory()
+
+    :telemetry.execute(
+      [:fathom, :node, :memory_breakdown],
+      Map.new([:processes, :binary, :ets, :code, :atom, :system], &{&1, Keyword.fetch!(mem, &1)}),
+      %{}
+    )
+  end
+
+  @doc "Directory.Recorder buffer depth and flush freshness (expert review 2026-10-15 #17)."
+  @spec recorder() :: :ok
+  def recorder do
+    s = Fathom.Directory.Recorder.stats()
+
+    measurements = %{buffered: s.buffered, flush_buffered: s.flush_buffered}
+
+    measurements =
+      if s.last_flush_age_ms,
+        do: Map.put(measurements, :last_flush_age_ms, s.last_flush_age_ms),
+        else: measurements
+
+    :telemetry.execute([:fathom, :directory, :recorder], measurements, %{})
+  end
+
   @doc """
   Local-disk headroom for the directories fathom writes to (expert review 2026-08-01 #36).
 

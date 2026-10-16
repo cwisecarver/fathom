@@ -11,6 +11,7 @@ defmodule FathomWeb.AdminOverviewLive do
   use FathomWeb, :live_view
 
   import FathomWeb.AdminComponents
+  import FathomWeb.AdminComponents.NodeHealth
 
   alias Fathom.Admin.{Fleet, FleetCollector, MetricsCollector}
 
@@ -52,13 +53,7 @@ defmodule FathomWeb.AdminOverviewLive do
     # the series stays oldest-first (the sparkline draws left→right and the uPlot initial data needs
     # ascending x), bounded to @ring (300 ≈ 5 min at 1 s) so memory stays flat. Expert review
     # 2026-07-14 #13.
-    point = %{
-      t: m.at_ms,
-      qps: m.node_qps,
-      p50: m.query_p50_ms,
-      p95: m.query_p95_ms,
-      p99: m.query_p99_ms
-    }
+    point = MetricsCollector.ring_point(m)
 
     history = Enum.take(socket.assigns.history ++ [point], -300)
 
@@ -180,7 +175,7 @@ defmodule FathomWeb.AdminOverviewLive do
             <.sparkline values={spark(@history, :p99)} />
           </.stat_tile>
           <.stat_tile label="Open shards" value={fmt_int(m(@metrics, :open_shards))} />
-          <.stat_tile label="Cold-open p50" value={fmt_ms(m(@metrics, :cold_open_p50_ms))} />
+          <.cold_open_tile metrics={@metrics} />
           <.stat_tile
             label="Dirty shards"
             value={fmt_int(m(@metrics, :dirty_shards))}
@@ -191,6 +186,13 @@ defmodule FathomWeb.AdminOverviewLive do
             value={fmt_ms(m(@metrics, :oldest_rpo_ms))}
             accent="text-warning"
           />
+        </div>
+
+        <%!-- Node health strip + admission pressure + VM (components/admin_components/node_health.ex) --%>
+        <.node_health metrics={@metrics} />
+        <div class="grid grid-cols-1 gap-6 lg:grid-cols-2">
+          <.admission_panel metrics={@metrics} />
+          <.vm_panel metrics={@metrics} />
         </div>
 
         <%!-- Hero charts --%>

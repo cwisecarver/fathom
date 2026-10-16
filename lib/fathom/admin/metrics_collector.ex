@@ -51,6 +51,23 @@ defmodule Fathom.Admin.MetricsCollector do
   @ring 300
   @s3_methods ~w(get put head delete post)
 
+  # Cold opens and flushes are sparse (a handful a minute on a warm node), so the 1 s diff used for
+  # query latency reads as 0 almost always. Their percentiles are windowed over a longer sliding
+  # span: the current cumulative histogram minus the oldest retained snapshot (expert review
+  # 2026-10-15 #6). Reading the raw cumulative histogram, as this once did for cold opens, is a
+  # LIFETIME percentile: it flattens after boot and can never show a current S3-pull regression.
+  @cold_window_ms 60_000
+  @flush_window_ms 30_000
+  @admission_recent 20
+  # Cumulative counters (summed across tags) whose per-second rate the Admission panel shows.
+  @admission_counters [
+    evicted: "fathom_shards_evicted",
+    at_capacity: "fathom_shards_at_capacity",
+    novel_rate_limited: "fathom_shards_novel_rate_limited",
+    held_retry: "fathom_shards_held_retry",
+    crash_wait: "fathom_shards_crash_wait"
+  ]
+
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
@@ -74,6 +91,9 @@ defmodule Fathom.Admin.MetricsCollector do
       prev_mono: mono_ms(),
       prev_query_buckets: [],
       prev_counters: %{},
+      # Snapshot history ([{mono_ms, %{key => cumulative_buckets}}], newest first) behind the
+      # sparse-histogram windows (see @cold_window_ms).
+      hists: %{cold: [], flush: []},
       # Per-shard latency histograms from last tick (shard_id → raw count vector), for the reported
       # hot shards only — the windowing baseline (#12). usage_task holds the in-flight storage-usage
       # poll (overlap guard, #22). Both expert review 2026-07-14.
@@ -91,6 +111,11 @@ defmodule Fathom.Admin.MetricsCollector do
       rings: [],
       current: nil
     }
+
+    # Which shard was refused/evicted goes to the bounded EventRing (review 2026-10-15 #10);
+    # the handler fires on those failure branches only. Left attached if this process dies:
+    # `EventRing.push/2` is a no-op without its table, and `attach/0` re-binds idempotently.
+    Fathom.Admin.AdmissionEvents.attach()
 
     schedule(:tick, tick_ms())
     send(self(), :usage_poll)
@@ -181,6 +206,7 @@ defmodule Fathom.Admin.MetricsCollector do
   # --- the tick computation (kept as small pure-ish steps for readability) ---
 
   defp tick(state) do
+    t0_us = System.monotonic_time(:microsecond)
     now = mono_ms()
     window_s = max((now - state.prev_mono) / 1000, 0.001)
 
@@ -202,13 +228,28 @@ defmodule Fathom.Admin.MetricsCollector do
     # lines up with the node-wide 1s-windowed p50/p95/p99 rather than a lifetime figure (#12).
     {hot, latency} = window_latency(hot, state.prev_latency)
 
-    # Scrape-derived windowed series (query-latency percentiles + counter rates + cold-open p50).
-    # On a blank/failed scrape the diff baselines are HELD, not advanced, so recovery never spikes
-    # (#11); see scrape_step/4.
-    scrape = PrometheusScrape.parse(safe_scrape())
-    s = scrape_step(scrape, state.prev_query_buckets, state.prev_counters, window_s)
+    # Scrape-derived windowed series (query-latency percentiles + counter rates + cold-open and
+    # flush percentiles). On a blank/failed scrape the diff baselines are HELD, not advanced, so
+    # recovery never spikes (#11); see scrape_step/6. The scrape is INDEXED once (review
+    # 2026-10-15 #23): every lookup below is a map hit, not a scan of the sample list.
+    samples = PrometheusScrape.parse(safe_scrape())
+    idx = PrometheusScrape.index(samples)
+
+    s =
+      scrape_step(
+        # a blank scrape stays `[]` (the held-baseline clause); otherwise hand over the index
+        if(samples == [], do: [], else: idx),
+        state.prev_query_buckets,
+        state.prev_counters,
+        window_s,
+        state.hists,
+        now
+      )
 
     {state, {dirty, oldest_rpo}} = rpo_throttled(state)
+
+    cold = cold_open_stats(s.cold_win)
+    flush_p99 = PrometheusScrape.percentile_cumulative(Map.get(s.flush_win, "all", []), 99)
 
     current = %{
       node_key: state.node_key,
@@ -219,7 +260,12 @@ defmodule Fathom.Admin.MetricsCollector do
       query_p50_ms: PrometheusScrape.percentile_cumulative(s.win, 50),
       query_p95_ms: PrometheusScrape.percentile_cumulative(s.win, 95),
       query_p99_ms: PrometheusScrape.percentile_cumulative(s.win, 99),
-      cold_open_p50_ms: PrometheusScrape.percentile_cumulative(s.cold_buckets, 50),
+      cold_open_p50_ms: cold.all.p50,
+      cold_open_p95_ms: cold.all.p95,
+      cold_open_p99_ms: cold.all.p99,
+      cold_open_n: cold.all.n,
+      cold_open_by_warm: Map.delete(cold, :all),
+      flush_p99_ms: flush_p99,
       dirty_shards: dirty,
       oldest_rpo_ms: oldest_rpo,
       s3_ops_per_s: s.counter_rates.s3_ops,
@@ -227,16 +273,17 @@ defmodule Fathom.Admin.MetricsCollector do
       checkout_per_s: s.counter_rates.checkout,
       storage_objects: usage_elem(state.usage, 0),
       storage_bytes: usage_elem(state.usage, 1),
-      hot_shards: hot
+      hot_shards: hot,
+      node_health: node_health(idx, Map.get(s.counter_rates, :health, %{})),
+      admission: admission(Map.get(s.counter_rates, :admission, %{})),
+      vm: vm(idx)
     }
 
-    ring = %{
-      t: current.at_ms,
-      qps: node_qps,
-      p50: current.query_p50_ms,
-      p95: current.query_p95_ms,
-      p99: current.query_p99_ms
-    }
+    tick_ms = (System.monotonic_time(:microsecond) - t0_us) / 1000
+    current = Map.put(current, :collector_tick_ms, tick_ms)
+    :telemetry.execute([:fathom, :admin, :collector], %{tick_ms: tick_ms}, %{})
+
+    ring = ring_point(current)
 
     %{
       state
@@ -244,6 +291,7 @@ defmodule Fathom.Admin.MetricsCollector do
         prev_mono: now,
         prev_query_buckets: s.query_buckets,
         prev_counters: s.counters,
+        hists: s.hists,
         prev_latency: latency,
         current: current,
         rings: [ring | state.rings] |> Enum.take(@ring)
@@ -287,28 +335,211 @@ defmodule Fathom.Admin.MetricsCollector do
   # count as one window's worth — `rate(N, 0.0, window) = N` — a huge false spike (same for the
   # query-latency percentiles, which would reflect the lifetime distribution). Expert review
   # 2026-07-14 #11. Returns the emitted values + the next diff baselines.
-  def scrape_step([], prev_query_buckets, prev_counters, _window_s) do
+  #
+  # `hists` carries the snapshot history for the sparse cold-open / flush windows and `now` is a
+  # monotonic ms; both default so a caller that predates them still works.
+  def scrape_step(
+        scrape,
+        prev_query_buckets,
+        prev_counters,
+        window_s,
+        hists \\ %{cold: [], flush: []},
+        now \\ 0
+      )
+
+  def scrape_step([], prev_query_buckets, prev_counters, _window_s, hists, _now) do
     %{
       win: [],
       cold_buckets: [],
+      cold_win: %{},
+      flush_win: %{},
       counter_rates: %{s3_ops: %{}, s3_bytes: %{}, checkout: %{}},
       query_buckets: prev_query_buckets,
-      counters: prev_counters
+      counters: prev_counters,
+      hists: hists
     }
   end
 
-  def scrape_step(scrape, prev_query_buckets, prev_counters, window_s) do
-    query_buckets = PrometheusScrape.buckets(scrape, "fathom_shard_query_duration")
+  def scrape_step(scrape, prev_query_buckets, prev_counters, window_s, hists, now) do
+    idx = PrometheusScrape.index(scrape)
+    query_buckets = PrometheusScrape.buckets(idx, "fathom_shard_query_duration")
     win = PrometheusScrape.diff_buckets(query_buckets, prev_query_buckets)
-    cold_buckets = PrometheusScrape.buckets(scrape, "fathom_shard_cold_open_duration")
-    {counters, counter_rates} = counter_rates(scrape, prev_counters, window_s)
+    {counters, counter_rates} = counter_rates(idx, prev_counters, window_s)
+
+    cold_cur = hist_snapshot(idx, "fathom_shard_cold_open_duration", "warm")
+    flush_cur = hist_snapshot(idx, "fathom_shard_flush_duration", nil)
+    {cold_win, cold_hist} = window_hist(hists.cold, now, cold_cur, @cold_window_ms)
+    {flush_win, flush_hist} = window_hist(hists.flush, now, flush_cur, @flush_window_ms)
 
     %{
       win: win,
-      cold_buckets: cold_buckets,
+      cold_buckets: Map.get(cold_cur, "all", []),
+      cold_win: cold_win,
+      flush_win: flush_win,
       counter_rates: counter_rates,
       query_buckets: query_buckets,
-      counters: counters
+      counters: counters,
+      hists: %{cold: cold_hist, flush: flush_hist}
+    }
+  end
+
+  # `%{"all" => buckets}` plus one entry per value of `split_label` (e.g. warm=true|false).
+  defp hist_snapshot(idx, prefix, split_label) do
+    split =
+      if split_label do
+        Map.new(PrometheusScrape.label_values(idx, prefix, split_label), fn v ->
+          {v, PrometheusScrape.buckets(idx, prefix, %{split_label => v})}
+        end)
+      else
+        %{}
+      end
+
+    Map.put(split, "all", PrometheusScrape.buckets(idx, prefix))
+  end
+
+  @doc """
+  Windows a set of cumulative histograms over the last `window_ms` (expert review 2026-10-15 #6).
+
+  `hist` is `[{mono_ms, %{key => cumulative_buckets}}]`, newest first; `cur` is this tick's
+  `%{key => cumulative_buckets}`. Returns `{%{key => windowed_buckets}, next_hist}`, where the
+  window is `cur` minus the OLDEST retained snapshot. With no history there is no baseline, so the
+  window is empty (zero), never the lifetime distribution. A key first seen mid-window (a new tag
+  value) is diffed against nothing, i.e. counted whole. Per-bucket clamped at 0 so a counter
+  reset cannot go negative.
+  """
+  @spec window_hist([{integer(), map()}], integer(), map(), pos_integer()) ::
+          {map(), [{integer(), map()}]}
+  def window_hist(hist, now, cur, window_ms) do
+    kept = Enum.filter(hist, fn {t, _} -> now - t <= window_ms end)
+
+    base =
+      case List.last(kept) do
+        nil -> cur
+        {_t, snap} -> snap
+      end
+
+    win =
+      Map.new(cur, fn {k, buckets} ->
+        {k, PrometheusScrape.diff_buckets(buckets, Map.get(base, k, []))}
+      end)
+
+    {win, [{now, cur} | kept]}
+  end
+
+  # p50/p95/p99 + sample count per window: `%{all: stats, "true" => stats, "false" => stats}`.
+  defp cold_open_stats(cold_win) do
+    empty = %{p50: 0.0, p95: 0.0, p99: 0.0, n: 0}
+
+    cold_win
+    |> Map.new(fn {k, b} ->
+      n =
+        case List.last(b) do
+          {_, c} -> round(c)
+          nil -> 0
+        end
+
+      {if(k == "all", do: :all, else: k),
+       %{
+         p50: PrometheusScrape.percentile_cumulative(b, 50),
+         p95: PrometheusScrape.percentile_cumulative(b, 95),
+         p99: PrometheusScrape.percentile_cumulative(b, 99),
+         n: n
+       }}
+    end)
+    |> Map.put_new(:all, empty)
+  end
+
+  @doc """
+  The history-ring point for a `current` metrics map (the shape the hero charts and sparklines
+  read). Public so the Overview LiveView folds each broadcast into its local history with the
+  SAME function the collector uses to build the ring, instead of a second copy of the field list.
+  """
+  @spec ring_point(map()) :: map()
+  def ring_point(m) do
+    %{
+      t: m.at_ms,
+      qps: m.node_qps,
+      p50: m.query_p50_ms,
+      p95: m.query_p95_ms,
+      p99: m.query_p99_ms,
+      mem: Map.get(m, :memory_bytes),
+      checkout: m |> Map.get(:checkout_per_s, %{}) |> Map.values() |> Enum.sum(),
+      flush_p99: Map.get(m, :flush_p99_ms),
+      cold_p99: Map.get(m, :cold_open_p99_ms),
+      dirty: Map.get(m, :dirty_shards)
+    }
+  end
+
+  # Node-health strip: the 10 s poller gauges, read from the scrape (nil = gauge absent).
+  defp node_health(idx, rates) do
+    gauge = fn name, labels -> PrometheusScrape.value(idx, name, labels, nil) end
+
+    disks =
+      for dir <- PrometheusScrape.label_values(idx, "fathom_node_disk_used_ratio", "dir"),
+          into: %{} do
+        {dir,
+         %{
+           used_ratio: gauge.("fathom_node_disk_used_ratio", %{"dir" => dir}),
+           free_bytes: gauge.("fathom_node_disk_free_bytes", %{"dir" => dir})
+         }}
+      end
+
+    %{
+      disks: disks,
+      process_used_ratio: gauge.("fathom_node_process_used_ratio", %{}),
+      port_used_ratio: gauge.("fathom_node_port_used_ratio", %{}),
+      connections_live: gauge.("fathom_node_connections_live", %{}),
+      flush_gate: %{
+        in_flight: gauge.("fathom_shard_flush_gate_in_flight", %{}),
+        cap: gauge.("fathom_shard_flush_gate_cap", %{}),
+        refusals_per_s: Map.get(rates, :flush_gate_refusals, 0.0)
+      },
+      recorder: %{
+        buffered: gauge.("fathom_directory_recorder_buffered", %{}),
+        flush_buffered: gauge.("fathom_directory_recorder_flush_buffered", %{}),
+        last_flush_age_ms: gauge.("fathom_directory_recorder_last_flush_age_ms", %{})
+      }
+    }
+  end
+
+  # Admission/pressure panel: open vs the soft cap, refusal/eviction rates, pool hit rate, and the
+  # bounded ring of recent refused/evicted shard ids (`Fathom.Admin.EventRing`).
+  defp admission(rates) do
+    # WINDOWED hit ratio from the 1 s take rates, not the lifetime counters (a lifetime ratio
+    # flattens after boot, same defect as the cold-open tile).
+    hit = Map.get(rates, :pool_hit, 0.0)
+    miss = Map.get(rates, :pool_miss, 0.0)
+
+    %{
+      open: Fathom.Shards.open_count(),
+      cap: max_open_shards(),
+      rates: rates,
+      pool_hit_ratio: if(hit + miss > 0, do: hit / (hit + miss), else: nil),
+      recent: Fathom.Admin.EventRing.recent(:admission, @admission_recent)
+    }
+  end
+
+  defp max_open_shards do
+    case Application.get_env(:fathom, :max_open_shards, :infinity) do
+      n when is_integer(n) and n > 0 -> n
+      _ -> nil
+    end
+  end
+
+  # VM panel: run queues + scheduler utilisation + memory breakdown (10 s poller gauges).
+  defp vm(idx) do
+    group = fn prefix, keys ->
+      Map.new(keys, fn k -> {k, PrometheusScrape.value(idx, "#{prefix}_#{k}", %{}, nil)} end)
+    end
+
+    %{
+      run_queue: group.("fathom_node_run_queue", [:normal, :dirty_cpu, :dirty_io]),
+      util: group.("fathom_node_scheduler_util", [:normal, :dirty_cpu, :dirty_io]),
+      memory:
+        group.("fathom_node_memory_breakdown", [:processes, :binary, :ets, :code, :atom, :system]),
+      schedulers: :erlang.system_info(:schedulers_online),
+      dirty_io_schedulers: :erlang.system_info(:dirty_io_schedulers),
+      dirty_cpu_schedulers: :erlang.system_info(:dirty_cpu_schedulers_online)
     }
   end
 
@@ -372,24 +603,54 @@ defmodule Fathom.Admin.MetricsCollector do
     if q > min_q, do: [entry | List.delete(heap, min)], else: heap
   end
 
-  # Diff the tracked cumulative counters (S3 ops/bytes by method, checkout counts by outcome) into
-  # per-second rates. Returns the fresh cumulative map (next tick's baseline) + the grouped rates.
+  # Diff the tracked cumulative counters (S3 ops/bytes by method, checkout counts by outcome,
+  # admission refusals/evictions, flush-gate refusals) into per-second rates. Returns the fresh
+  # cumulative map (next tick's baseline) + the grouped rates.
   defp counter_rates(scrape, prev, window_s) do
     s3_ops = counter_group(scrape, "fathom_s3_op_count", "op", @s3_methods)
     s3_bytes = counter_group(scrape, "fathom_s3_op_bytes", "op", @s3_methods)
     outcomes = PrometheusScrape.label_values(scrape, "fathom_shards_checkout_stop", "outcome")
     checkout = counter_group(scrape, "fathom_shards_checkout_stop", "outcome", outcomes)
 
+    # Untagged totals (summed across tags): bounded by construction, never per shard.
+    admission =
+      Map.new(@admission_counters, fn {key, prefix} ->
+        {key, PrometheusScrape.sum(scrape, prefix)}
+      end)
+
+    pool =
+      Map.new([hit: "hit", miss: "miss"], fn {k, r} ->
+        {k, PrometheusScrape.value(scrape, "fathom_shard_pool_take", %{"result" => r}, 0.0)}
+      end)
+
+    health = %{
+      flush_gate_refusals:
+        PrometheusScrape.value(scrape, "fathom_shard_flush_gate_refusals", %{}, 0.0)
+    }
+
     cur =
-      Map.merge(
-        Map.merge(prefixed(s3_ops, :s3_ops), prefixed(s3_bytes, :s3_bytes)),
-        prefixed(checkout, :checkout)
+      Enum.reduce(
+        [
+          prefixed(s3_ops, :s3_ops),
+          prefixed(s3_bytes, :s3_bytes),
+          prefixed(checkout, :checkout),
+          prefixed(admission, :admission),
+          prefixed(pool, :pool),
+          prefixed(health, :health)
+        ],
+        %{},
+        &Map.merge/2
       )
+
+    pool_rates =
+      Map.new(rate_group(pool, prev, :pool, window_s), fn {k, v} -> {:"pool_#{k}", v} end)
 
     rates = %{
       s3_ops: rate_group(s3_ops, prev, :s3_ops, window_s),
       s3_bytes: rate_group(s3_bytes, prev, :s3_bytes, window_s),
-      checkout: rate_group(checkout, prev, :checkout, window_s)
+      checkout: rate_group(checkout, prev, :checkout, window_s),
+      admission: Map.merge(rate_group(admission, prev, :admission, window_s), pool_rates),
+      health: rate_group(health, prev, :health, window_s)
     }
 
     {cur, rates}

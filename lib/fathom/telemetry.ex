@@ -42,7 +42,10 @@ defmodule Fathom.Telemetry do
            {Fathom.Admin.Measurements, :durability, []},
            {Fathom.Admin.Measurements, :disk, []},
            {Fathom.Admin.Measurements, :replication, []},
-           {Fathom.Admin.Measurements, :flush_gate, []}
+           {Fathom.Admin.Measurements, :flush_gate, []},
+           {Fathom.Admin.Measurements, :schedulers, []},
+           {Fathom.Admin.Measurements, :memory_breakdown, []},
+           {Fathom.Admin.Measurements, :recorder, []}
          ],
          period: 10_000,
          name: Fathom.ShardPoller}
@@ -1178,6 +1181,104 @@ defmodule Fathom.Telemetry do
         unit: :millisecond,
         description:
           "Seconds since a fleet-singleton cron (reconcile/rebalance) last inserted a job — > 2× its period ⇒ leadership wedged and the cron silently stopped, zero exceptions (#18)"
+      ),
+
+      # Admin observability (expert review 2026-10-15 #10/#15/#17/#23): VM saturation, memory
+      # breakdown, Directory.Recorder depth, and the collector's own cost.
+      last_value("fathom.node.run_queue.normal",
+        event_name: [:fathom, :node, :run_queue],
+        measurement: :normal,
+        description:
+          "Run-queue length (normal); sustained > 0 on dirty_io means the NIF pool is saturated"
+      ),
+      last_value("fathom.node.run_queue.dirty_cpu",
+        event_name: [:fathom, :node, :run_queue],
+        measurement: :dirty_cpu,
+        description:
+          "Run-queue length (dirty_cpu); sustained > 0 on dirty_io means the NIF pool is saturated"
+      ),
+      last_value("fathom.node.run_queue.dirty_io",
+        event_name: [:fathom, :node, :run_queue],
+        measurement: :dirty_io,
+        description:
+          "Run-queue length (dirty_io); sustained > 0 on dirty_io means the NIF pool is saturated"
+      ),
+      last_value("fathom.node.scheduler_util.normal",
+        event_name: [:fathom, :node, :scheduler_util],
+        measurement: :normal,
+        description:
+          "Scheduler utilisation (normal), 0..1, averaged over the schedulers of that kind between polls"
+      ),
+      last_value("fathom.node.scheduler_util.dirty_cpu",
+        event_name: [:fathom, :node, :scheduler_util],
+        measurement: :dirty_cpu,
+        description:
+          "Scheduler utilisation (dirty_cpu), 0..1, averaged over the schedulers of that kind between polls"
+      ),
+      last_value("fathom.node.scheduler_util.dirty_io",
+        event_name: [:fathom, :node, :scheduler_util],
+        measurement: :dirty_io,
+        description:
+          "Scheduler utilisation (dirty_io), 0..1, averaged over the schedulers of that kind between polls"
+      ),
+      last_value("fathom.node.memory_breakdown.processes",
+        event_name: [:fathom, :node, :memory_breakdown],
+        measurement: :processes,
+        unit: :byte,
+        description: ":erlang.memory/0 processes bytes"
+      ),
+      last_value("fathom.node.memory_breakdown.binary",
+        event_name: [:fathom, :node, :memory_breakdown],
+        measurement: :binary,
+        unit: :byte,
+        description: ":erlang.memory/0 binary bytes"
+      ),
+      last_value("fathom.node.memory_breakdown.ets",
+        event_name: [:fathom, :node, :memory_breakdown],
+        measurement: :ets,
+        unit: :byte,
+        description: ":erlang.memory/0 ets bytes"
+      ),
+      last_value("fathom.node.memory_breakdown.code",
+        event_name: [:fathom, :node, :memory_breakdown],
+        measurement: :code,
+        unit: :byte,
+        description: ":erlang.memory/0 code bytes"
+      ),
+      last_value("fathom.node.memory_breakdown.atom",
+        event_name: [:fathom, :node, :memory_breakdown],
+        measurement: :atom,
+        unit: :byte,
+        description: ":erlang.memory/0 atom bytes"
+      ),
+      last_value("fathom.node.memory_breakdown.system",
+        event_name: [:fathom, :node, :memory_breakdown],
+        measurement: :system,
+        unit: :byte,
+        description: ":erlang.memory/0 system bytes"
+      ),
+      last_value("fathom.directory.recorder.buffered",
+        event_name: [:fathom, :directory, :recorder],
+        measurement: :buffered,
+        description:
+          "Shard-access rows buffered in the Directory Recorder awaiting upsert; growing with last_flush_age_ms means Postgres is unreachable"
+      ),
+      last_value("fathom.directory.recorder.flush_buffered",
+        event_name: [:fathom, :directory, :recorder],
+        measurement: :flush_buffered,
+        description: "Durable-flush-time rows buffered in the Directory Recorder awaiting upsert"
+      ),
+      last_value("fathom.directory.recorder.last_flush_age_ms",
+        event_name: [:fathom, :directory, :recorder],
+        measurement: :last_flush_age_ms,
+        unit: :millisecond,
+        description: "Time since the Directory Recorder last completed a flush cycle"
+      ),
+      last_value("fathom.admin.collector.tick_ms",
+        event_name: [:fathom, :admin, :collector],
+        measurement: :tick_ms,
+        unit: :millisecond,
+        description: "Wall time of one admin MetricsCollector tick (scrape + parse + derive)"
       )
     ]
   end

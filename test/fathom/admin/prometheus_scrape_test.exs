@@ -100,4 +100,60 @@ defmodule Fathom.Admin.PrometheusScrapeTest do
     text = "fathom_thing{bogus} 1\n"
     assert [{"fathom_thing", %{}, 1.0}] = PrometheusScrape.parse(text)
   end
+
+  describe "index (expert review 2026-10-15 #23)" do
+    test "every lookup gives the same answer on the index as on the flat list" do
+      samples = PrometheusScrape.parse(@scrape)
+      idx = PrometheusScrape.index(samples)
+
+      assert PrometheusScrape.value(idx, "fathom_s3_op_count", %{"op" => "put"}) == 4.0
+      assert PrometheusScrape.value(idx, "fathom_node_memory_total") == 1_048_576.0
+
+      assert PrometheusScrape.buckets(idx, "fathom_shard_query_duration") ==
+               PrometheusScrape.buckets(samples, "fathom_shard_query_duration")
+
+      assert Enum.sort(PrometheusScrape.label_values(idx, "fathom_s3_op_count", "op")) ==
+               ["get", "put"]
+
+      # idempotent: indexing an index is a no-op
+      assert PrometheusScrape.index(idx) == idx
+    end
+
+    test "an exact family name wins over a longer one sharing the prefix" do
+      idx = PrometheusScrape.index(PrometheusScrape.parse("a_b_total 1\na_b 2\n"))
+      assert PrometheusScrape.value(idx, "a_b") == 2.0
+    end
+
+    test "sum/3 totals every tag value of a family" do
+      text = ~s(fathom_held_count{aimed="true"} 3\nfathom_held_count{aimed="false"} 4\n)
+      assert PrometheusScrape.sum(PrometheusScrape.parse(text), "fathom_held") == 7.0
+
+      assert PrometheusScrape.sum(PrometheusScrape.parse(text), "fathom_held", %{
+               "aimed" => "true"
+             }) == 3.0
+
+      assert PrometheusScrape.sum([], "fathom_held") == 0.0
+    end
+  end
+
+  # A TAGGED histogram scraped without a filter produced one entry per tag value per `le`; walking
+  # that as a single distribution gave nonsense percentiles (review 2026-10-15 #6).
+  test "buckets/3 sums series across tags and can select one tag value" do
+    text = """
+    x_bucket{warm="true",le="1.0"} 4
+    x_bucket{warm="true",le="+Inf"} 4
+    x_bucket{warm="false",le="1.0"} 0
+    x_bucket{warm="false",le="+Inf"} 2
+    """
+
+    s = PrometheusScrape.parse(text)
+    assert PrometheusScrape.buckets(s, "x") == [{1.0, 4.0}, {:infinity, 6.0}]
+
+    assert PrometheusScrape.buckets(s, "x", %{"warm" => "false"}) == [
+             {1.0, 0.0},
+             {:infinity, 2.0}
+           ]
+
+    assert PrometheusScrape.buckets(s, "x", %{"warm" => "nope"}) == []
+  end
 end

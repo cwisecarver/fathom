@@ -26,6 +26,10 @@ defmodule Fathom.Directory.Recorder do
 
   @table __MODULE__
   @flush_table Module.concat(__MODULE__, Flushes)
+  # One row: `{:last_ok_ms, monotonic_ms}`, the last flush cycle that wrote (or had nothing to
+  # write). Read lock-free by `stats/0` for the admin Node-health strip (expert review 2026-10-15
+  # #17).
+  @meta_table Module.concat(__MODULE__, Meta)
   @default_flush_ms 1_000
 
   @doc false
@@ -124,6 +128,8 @@ defmodule Fathom.Directory.Recorder do
     :ets.new(@table, [:set, :public, :named_table, write_concurrency: true])
     # Parallel buffer for durable-flush times (#28), same coalesce/batch shape.
     :ets.new(@flush_table, [:set, :public, :named_table, write_concurrency: true])
+    :ets.new(@meta_table, [:set, :public, :named_table])
+    note_flush_ok()
 
     flush_ms =
       Keyword.get(
@@ -187,6 +193,43 @@ defmodule Fathom.Directory.Recorder do
 
   defp pending, do: table_size(@table) + table_size(@flush_table)
 
+  @doc """
+  Buffer depth and flush freshness, read straight from ETS (no call into the recorder, so a wedged
+  Postgres flush cannot block the 10 s poller that reads this). `buffered` is the shard-access
+  rows awaiting upsert, `flush_buffered` the durable-flush-time rows; `last_flush_age_ms` is how
+  long ago a flush cycle last succeeded (or found nothing to do), `nil` before the first.
+
+  A growing `buffered` with a growing `last_flush_age_ms` is a Postgres outage the recorder is
+  deliberately hiding from the data path (expert review 2026-10-15 #17). Zeros/`nil` when the
+  recorder is not running.
+  """
+  @spec stats() :: %{
+          buffered: non_neg_integer(),
+          flush_buffered: non_neg_integer(),
+          last_flush_age_ms: non_neg_integer() | nil
+        }
+  def stats do
+    age =
+      case :ets.lookup(@meta_table, :last_ok_ms) do
+        [{_, at}] -> max(System.monotonic_time(:millisecond) - at, 0)
+        _ -> nil
+      end
+
+    %{
+      buffered: table_size(@table),
+      flush_buffered: table_size(@flush_table),
+      last_flush_age_ms: age
+    }
+  rescue
+    ArgumentError -> %{buffered: 0, flush_buffered: 0, last_flush_age_ms: nil}
+  end
+
+  defp note_flush_ok do
+    :ets.insert(@meta_table, {:last_ok_ms, System.monotonic_time(:millisecond)})
+  rescue
+    ArgumentError -> :ok
+  end
+
   defp table_size(table) do
     case :ets.info(table, :size) do
       n when is_integer(n) -> n
@@ -233,6 +276,7 @@ defmodule Fathom.Directory.Recorder do
   # upsert would fail in the same outage, and writing node-clock stamps is the bug.
   defp do_flush(deadline \\ :infinity, node_clock \\ &node_clock_us/0) do
     if pending() == 0 do
+      note_flush_ok()
       0
     else
       case db_offset_us(node_clock) do
@@ -333,6 +377,7 @@ defmodule Fathom.Directory.Recorder do
             )
 
           if n > 0, do: :telemetry.execute(event, %{count: n}, %{})
+          note_flush_ok()
           {:ok, n}
         rescue
           e ->
