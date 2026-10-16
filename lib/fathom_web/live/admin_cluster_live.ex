@@ -132,7 +132,13 @@ defmodule FathomWeb.AdminClusterLive do
                 <td class="py-1.5">
                   <.badge kind={kind(e.kind)}>{e.kind}</.badge>
                 </td>
-                <td class="num py-1.5">{e.shard_id || "node"}</td>
+                <td class="num py-1.5">
+                  <%= if e.shard_id do %>
+                    <.link navigate={~p"/admin/shards/#{e.shard_id}"} class="link">{e.shard_id}</.link>
+                  <% else %>
+                    node
+                  <% end %>
+                </td>
                 <td class="py-1.5 text-base-content/70">{e.detail}</td>
               </tr>
             </tbody>

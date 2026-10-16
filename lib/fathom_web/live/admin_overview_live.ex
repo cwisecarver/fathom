@@ -173,14 +173,27 @@ defmodule FathomWeb.AdminOverviewLive do
               unit={if(@reporter_on, do: "none reporting", else: "reporter off")}
             />
           </div>
-          <div id="fleet-oldest-unflushed">
+          <div
+            id="fleet-oldest-unflushed"
+            class="min-w-0 rounded-lg border border-base-300 bg-base-200/40 p-4 transition-colors hover:border-base-content/25"
+          >
             <% fo = fleet_oldest_unflushed(@fleet.nodes) %>
-            <.stat_tile
-              label="Oldest unflushed (fleet)"
-              value={fmt_ms(fo && fo.ms)}
-              unit={if(fo, do: fo.node_key, else: "no node reports it")}
-              accent="text-warning"
-            />
+            <span class="text-[11px] uppercase tracking-wide text-base-content/50">
+              Oldest unflushed (fleet)
+            </span>
+            <div class="mt-1 whitespace-nowrap">
+              <span class="num text-2xl font-medium leading-none">{fmt_ms(fo && fo.ms)}</span>
+            </div>
+            <div
+              :if={fo}
+              class="num mt-1 truncate text-[11px] text-base-content/50"
+              title={fo.node_key}
+            >
+              {fo.node_key}
+            </div>
+            <div :if={!fo} class="num mt-1 text-[11px] text-base-content/50">
+              no node reports it
+            </div>
           </div>
           <.stat_tile
             label="Fleet HEAD"
