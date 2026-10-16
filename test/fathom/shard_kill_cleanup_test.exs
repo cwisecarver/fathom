@@ -216,7 +216,7 @@ defmodule Fathom.ShardKillCleanupTest do
   #     up to 30k shards a node. Clearing on OPEN (the `WriteFence` pattern) would fix the stale
   #     counters too, but it resets the Reporter's baseline on every idle re-open, which is a
   #     change to what the rebalancer measures — not something to do for a cosmetic admin row.
-  #   * `:shard_load` is off by default, so on a default fleet none of this is even recorded.
+  #   * `:shard_load` is off in dev/test (on in prod), so under the test config none of this is recorded.
   #
   # If that trade stops holding — the admin page becomes load-bearing, or the counters get a
   # non-rate consumer — clearing on open is the fix, and it belongs next to the `WriteFence.unfence`

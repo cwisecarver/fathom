@@ -128,11 +128,25 @@ defmodule Fathom.RuntimeConfigTest do
     assert Keyword.get(fathom_config(%{"SHARD_LOAD" => "1"}), :shard_load) == true
   end
 
-  test "SHARD_LOAD unset/false/0 leaves :shard_load off (default)" do
+  test "SHARD_LOAD unset outside prod leaves :shard_load off (module default)" do
     # Unset: the key isn't written, so Application falls back to the false default.
     refute Keyword.has_key?(fathom_config(%{}), :shard_load)
-    refute Keyword.has_key?(fathom_config(%{"SHARD_LOAD" => "false"}), :shard_load)
-    refute Keyword.has_key?(fathom_config(%{"SHARD_LOAD" => "0"}), :shard_load)
+  end
+
+  # 2026-10-15: :shard_load defaults ON in prod (the admin dashboard reads it). The env var is
+  # tri-state so an operator can still turn it off on a prod node: `false|0` writes false, not
+  # "unset", which would silently fall back to the prod default.
+  test "SHARD_LOAD defaults ON in prod; false|0 turns it off there; true|1 is honoured" do
+    assert Keyword.get(prod_config(%{"SHARD_LOAD" => nil}), :shard_load) == true
+    assert Keyword.get(prod_config(%{"SHARD_LOAD" => "true"}), :shard_load) == true
+    assert Keyword.get(prod_config(%{"SHARD_LOAD" => "1"}), :shard_load) == true
+    assert Keyword.get(prod_config(%{"SHARD_LOAD" => "false"}), :shard_load) == false
+    assert Keyword.get(prod_config(%{"SHARD_LOAD" => "0"}), :shard_load) == false
+  end
+
+  test "SHARD_LOAD=false|0 outside prod writes false (explicit off, not unset)" do
+    assert Keyword.get(fathom_config(%{"SHARD_LOAD" => "false"}), :shard_load) == false
+    assert Keyword.get(fathom_config(%{"SHARD_LOAD" => "0"}), :shard_load) == false
   end
 
   test "rebalancer env: node_key, gates, and the hot floor" do

@@ -32,9 +32,9 @@ defmodule Fathom.ShardLoad do
 
   ## Gating
 
-  Off by default (`config :fathom, :shard_load` — a node/deployment opts in), because
-  nothing consumes it until the rebalancer lands, and the hot path shouldn't pay for
-  an unread counter. When off, the `record_*` calls no-op; the read API still works
+  Off by default in the module (`config :fathom, :shard_load`), and ON in prod via
+  `config/runtime.exs` (`SHARD_LOAD=false` opts a node out). Dev/test stay off so the
+  hot path there doesn't pay for an unread counter. When off, the `record_*` calls no-op; the read API still works
   (empty). The table owner is always supervised (an idle owner + empty table is free),
   so the API never depends on the feature being on.
   """
@@ -53,7 +53,7 @@ defmodule Fathom.ShardLoad do
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
-  @doc "Whether per-shard load recording is enabled (`config :fathom, :shard_load`, default off)."
+  @doc "Whether per-shard load recording is enabled (`config :fathom, :shard_load`, module default off; prod sets it on in `config/runtime.exs`)."
   @spec enabled?() :: boolean()
   def enabled?, do: Application.get_env(:fathom, :shard_load, false) == true
 

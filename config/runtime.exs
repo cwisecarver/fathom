@@ -539,12 +539,19 @@ if ms = System.get_env("MIGRATION_STALL_AFTER_MS") do
   config :fathom, :migration_stall_after_ms, String.to_integer(ms)
 end
 
-# Per-shard load counters (`Fathom.ShardLoad`) — the Phase-2 rebalancing input. Off by
-# default so the hot path doesn't pay for an unread counter; a node/deployment opts in
-# (the "turn on :shard_load on a deployed node" knob a rebalancer / hot-spot measurement
-# needs). Read live via `Application.get_env`, so it also gates the record_* calls.
-if System.get_env("SHARD_LOAD") in ~w(true 1) do
-  config :fathom, :shard_load, true
+# Per-shard load counters (`Fathom.ShardLoad`) — the Phase-2 rebalancing input. ON by default
+# in prod (2026-10-15): the admin dashboard reads it, so a prod node should always be measuring.
+# Dev/test stay off (the module default) so the hot path there doesn't pay for an unread counter.
+# SHARD_LOAD=false|0 turns it off in prod; true|1 turns it on anywhere; unset keeps the env default.
+# Read live via `Application.get_env`, so it also gates the record_* calls.
+case env_bool.("SHARD_LOAD") do
+  nil ->
+    if config_env() == :prod do
+      config :fathom, :shard_load, true
+    end
+
+  on? ->
+    config :fathom, :shard_load, on?
 end
 
 # Migrate-on-touch mode (expert review #40): how a checkout handles a shard behind the fleet HEAD

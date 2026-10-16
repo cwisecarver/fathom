@@ -120,7 +120,7 @@ config; diff from it.
 | Var | Default | What it does | Safety consequence |
 |---|---|---|---|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (no-op) | Enables OpenTelemetry OTLP trace export (also honors the standard `OTEL_EXPORTER_OTLP_*` vars). | Off by default; traces contain shard ids — send to a trusted collector. |
-| `SHARD_LOAD` | off | Per-shard load counters (`Fathom.ShardLoad`) — the rebalancer / hot-spot input. | Off so the hot path doesn't pay for an unread counter; turn on where a rebalancer or `--hotspots` reads it. |
+| `SHARD_LOAD` | on in prod, off elsewhere | Per-shard load counters (`Fathom.ShardLoad`) — the rebalancer / hot-spot input and the admin dashboard's load view. | Prod defaults on (2026-10-15). `false`/`0` turns it off on a node that doesn't want the counters; `true`/`1` turns it on anywhere. Dev/test stay off so the hot path doesn't pay for an unread counter. |
 
 ## Cluster / node
 
