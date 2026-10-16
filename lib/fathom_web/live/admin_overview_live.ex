@@ -323,9 +323,34 @@ defmodule FathomWeb.AdminOverviewLive do
               <.stat_row label="S3 GET / s" value={fmt_rate(s3(@metrics, "get"))} />
               <.stat_row label="S3 PUT / s" value={fmt_rate(s3(@metrics, "put"))} />
               <.stat_row label="S3 bytes / s" value={fmt_bytes(s3_bytes(@metrics))} />
+              <.stat_row
+                label="S3 errors / s"
+                value={fmt_rate(proto(@metrics, [:s3, :errors_per_s]))}
+              />
+              <.stat_row label="S3 p99 (ms)" value={fmt_rate(proto(@metrics, [:s3, :p99_ms]))} />
             </dl>
           </.panel>
         </div>
+
+        <%!-- Hrana listener by protocol (Fathom.Telemetry.Protocol) --%>
+        <.panel title="Protocol (Hrana listener)">
+          <dl id="protocol-panel" class="grid grid-cols-2 gap-x-6 gap-y-3 md:grid-cols-4">
+            <.stat_row label="HTTP 2xx / s" value={fmt_rate(proto(@metrics, [:http, :rate, "2xx"]))} />
+            <.stat_row label="HTTP 4xx / s" value={fmt_rate(proto(@metrics, [:http, :rate, "4xx"]))} />
+            <.stat_row label="HTTP 5xx / s" value={fmt_rate(proto(@metrics, [:http, :rate, "5xx"]))} />
+            <.stat_row label="HTTP p99 (ms)" value={fmt_rate(proto(@metrics, [:http, :p99_ms]))} />
+            <.stat_row label="WS opens / s" value={fmt_rate(proto(@metrics, [:ws, :opens_per_s]))} />
+            <.stat_row label="WS closes / s" value={fmt_rate(proto(@metrics, [:ws, :closes_per_s]))} />
+            <.stat_row
+              label="WS error closes / s"
+              value={fmt_rate(proto(@metrics, [:ws, :errors_per_s]))}
+            />
+            <.stat_row
+              label="WS frames in / s"
+              value={fmt_rate(proto(@metrics, [:ws, :frames_per_s]))}
+            />
+          </dl>
+        </.panel>
 
         <%!-- Nodes + migrations (fleet) --%>
         <div :if={@fleet == nil} class="skeleton h-40 rounded-lg"></div>
@@ -464,6 +489,10 @@ defmodule FathomWeb.AdminOverviewLive do
 
   defp s3(nil, _method), do: 0.0
   defp s3(metrics, method), do: metrics |> Map.get(:s3_ops_per_s, %{}) |> Map.get(method, 0.0)
+
+  # Path read into the :protocol stats map (HTTP/WS/S3 breakdown); 0.0 when absent.
+  defp proto(nil, _path), do: 0.0
+  defp proto(metrics, path), do: get_in(metrics, [:protocol | path]) || 0.0
 
   defp s3_bytes(nil), do: 0.0
 

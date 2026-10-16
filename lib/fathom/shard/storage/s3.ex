@@ -3352,7 +3352,9 @@ defmodule Fathom.Shard.Storage.S3 do
         retry_delay: &__MODULE__.retry_delay/1
       ] ++ finch_opt() ++ req_plug_opt(config)
     )
+    |> Req.Request.prepend_request_steps(fathom_s3_start: &__MODULE__.meter_start/1)
     |> Req.Request.append_response_steps(fathom_s3_meter: &__MODULE__.meter/1)
+    |> Req.Request.append_error_steps(fathom_s3_meter_error: &__MODULE__.meter_error/1)
   end
 
   @doc false
@@ -3371,7 +3373,7 @@ defmodule Fathom.Shard.Storage.S3 do
   def meter({request, %Req.Response{} = response}) do
     :telemetry.execute(
       [:fathom, :s3, :op],
-      %{count: 1, bytes: op_bytes(request, response)},
+      Map.put(duration(request), :count, 1) |> Map.put(:bytes, op_bytes(request, response)),
       %{op: request.method, status_class: status_class(response.status)}
     )
 
@@ -3382,8 +3384,35 @@ defmodule Fathom.Shard.Storage.S3 do
 
   def meter({request, other}), do: {request, other}
 
-  # Bounded HTTP status class for the s3.op tag. Req exposes no per-request timing on the
-  # response, so no duration measurement is added (it would need an extra request step).
+  @doc false
+  # Request step: stamp a monotonic start so the response/error steps can emit a duration (Req
+  # exposes no per-request timing). Re-stamped on each retry attempt, so the duration is the
+  # final attempt's. Admin-UI observability review 2026-10-15 #22.
+  def meter_start(request),
+    do: Req.Request.put_private(request, :fathom_s3_t0, System.monotonic_time())
+
+  @doc false
+  # Error step: a transport failure (no response — timeout, closed, refused) was previously
+  # invisible to the meter. Emits `status_class: "error"` with the duration; the exception
+  # passes through untouched so retry/caller behaviour is unchanged.
+  def meter_error({request, exception}) do
+    :telemetry.execute(
+      [:fathom, :s3, :op],
+      Map.put(duration(request), :count, 1) |> Map.put(:bytes, 0),
+      %{op: request.method, status_class: "error"}
+    )
+
+    {request, exception}
+  rescue
+    _ -> {request, exception}
+  end
+
+  defp duration(%{private: %{fathom_s3_t0: t0}}),
+    do: %{duration: System.monotonic_time() - t0}
+
+  defp duration(_), do: %{}
+
+  # Bounded HTTP status class for the s3.op tag.
   defp status_class(s) when s in 200..299, do: "2xx"
   defp status_class(s) when s in 300..399, do: "3xx"
   defp status_class(s) when s in 400..499, do: "4xx"

@@ -109,6 +109,8 @@ defmodule Fathom.Admin.MetricsCollector do
       prev_mono: mono_ms(),
       prev_query_buckets: [],
       prev_counters: %{},
+      # Protocol/S3 counter snapshot behind Fathom.Telemetry.Protocol.window/2.
+      prev_proto: nil,
       # Snapshot history ([{mono_ms, %{key => cumulative_buckets}}], newest first) behind the
       # sparse-histogram windows (see @cold_window_ms).
       hists: %{cold: [], flush: []},
@@ -139,6 +141,7 @@ defmodule Fathom.Admin.MetricsCollector do
     # the handler fires on those failure branches only. Left attached if this process dies:
     # `EventRing.push/2` is a no-op without its table, and `attach/0` re-binds idempotently.
     Fathom.Admin.AdmissionEvents.attach()
+    Fathom.Telemetry.Protocol.attach()
 
     schedule(:tick, tick_ms())
     send(self(), :usage_poll)
@@ -269,6 +272,8 @@ defmodule Fathom.Admin.MetricsCollector do
         now
       )
 
+    {protocol, prev_proto} = Fathom.Telemetry.Protocol.window(state.prev_proto, window_s)
+
     {state, {dirty, oldest_rpo}} = rpo_throttled(state)
 
     {rpo_rows, rpo_open} = state.rpo_cov
@@ -311,7 +316,8 @@ defmodule Fathom.Admin.MetricsCollector do
       hot_shards: hot,
       node_health: node_health(idx, Map.get(s.counter_rates, :health, %{})),
       admission: admission(Map.get(s.counter_rates, :admission, %{})),
-      vm: vm(idx)
+      vm: vm(idx),
+      protocol: protocol
     }
 
     tick_ms = (System.monotonic_time(:microsecond) - t0_us) / 1000
@@ -326,6 +332,7 @@ defmodule Fathom.Admin.MetricsCollector do
         prev_mono: now,
         prev_query_buckets: s.query_buckets,
         prev_counters: s.counters,
+        prev_proto: prev_proto,
         hists: s.hists,
         win_hist: win_hist,
         prev_latency: latency,
