@@ -153,7 +153,8 @@ defmodule FathomWeb.AdminShardLive do
               id="shard-directory"
             >
               <.kv :for={{label, value} <- directory_fields(@cp.directory)} label={label}>
-                {value}
+                <.rel_time :if={match?({:time, _}, value)} at={elem(value, 1)} />
+                <span :if={!match?({:time, _}, value)}>{value}</span>
               </.kv>
             </dl>
           </.panel>
@@ -190,7 +191,7 @@ defmodule FathomWeb.AdminShardLive do
 
           <.panel title="Recent load samples">
             <div :if={@cp.samples == []} id="shard-no-samples" class="text-sm text-base-content/50">
-              No samples. Per-shard load reporting is off (set <span class="num">SHARD_LOAD=true</span>).
+              No samples. <.load_empty_reason />
             </div>
             <table :if={@cp.samples != []} id="shard-samples" class="w-full text-sm">
               <thead class="text-[11px] uppercase tracking-wide text-base-content/50">
@@ -270,22 +271,22 @@ defmodule FathomWeb.AdminShardLive do
 
   defp directory_fields(d) do
     [
-      {"status", d.status},
-      {"schema_version", d.schema_version},
-      {"retained_version", d.retained_version},
-      {"retaining_version", d.retaining_version},
-      {"token_version", d.token_version},
-      {"last_active_at", ts(d.last_active_at)},
-      {"last_flushed_at", ts(d.last_flushed_at)},
-      {"last_verified_at", ts(d.last_verified_at)},
-      {"last_verify_status", d.last_verify_status},
-      {"last_snapshot_at", ts(d.last_snapshot_at)},
-      {"last_retention_at", ts(d.last_retention_at)},
-      {"quarantined_at", ts(d.quarantined_at)},
-      {"requeue_count", d.requeue_count},
-      {"migrating_since", ts(d.migrating_since)},
-      {"cutover_at", ts(d.cutover_at)},
-      {"retain_until", ts(d.retain_until)}
+      {"Status", d.status},
+      {"Schema version", d.schema_version},
+      {"Retained version", d.retained_version},
+      {"Retaining version", d.retaining_version},
+      {"Token version", d.token_version},
+      {"Last active", {:time, d.last_active_at}},
+      {"Last flushed", {:time, d.last_flushed_at}},
+      {"Last verified", {:time, d.last_verified_at}},
+      {"Last verify status", d.last_verify_status},
+      {"Last snapshot", {:time, d.last_snapshot_at}},
+      {"Last retention", {:time, d.last_retention_at}},
+      {"Quarantined at", {:time, d.quarantined_at}},
+      {"Requeue count", d.requeue_count},
+      {"Migrating since", {:time, d.migrating_since}},
+      {"Cutover at", {:time, d.cutover_at}},
+      {"Retain until", {:time, d.retain_until}}
     ]
     |> Enum.map(fn {k, v} -> {k, if(is_nil(v), do: "—", else: v)} end)
   end

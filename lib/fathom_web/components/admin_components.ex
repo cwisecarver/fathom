@@ -33,6 +33,7 @@ defmodule FathomWeb.AdminComponents do
   attr :label, :string, required: true
   attr :value, :string, required: true
   attr :unit, :string, default: nil
+  attr :sub, :string, default: nil
   attr :accent, :string, default: "text-primary"
   slot :inner_block
 
@@ -44,10 +45,64 @@ defmodule FathomWeb.AdminComponents do
         <span class="num text-2xl font-medium leading-none">{@value}</span>
         <span :if={@unit} class="text-xs text-base-content/50">{@unit}</span>
       </div>
+      <div :if={@sub} class="num mt-1 text-[11px] text-base-content/50">{@sub}</div>
       <div :if={@inner_block != []} class={["mt-3 -mb-1 h-7", @accent]}>
         {render_slot(@inner_block)}
       </div>
     </div>
+    """
+  end
+
+  @doc """
+  A timestamp rendered relative (`4s ago`, `3h ago`, `in 2d`), nowrap, with the full UTC ISO-8601
+  value in the `title`. `nil` renders an em dash.
+  """
+  attr :at, :any, required: true
+  attr :id, :string, default: nil
+
+  def rel_time(assigns) do
+    ~H"""
+    <span :if={@at == nil} class="text-base-content/40">—</span>
+    <span :if={@at} id={@id} title={DateTime.to_iso8601(@at)} class="whitespace-nowrap">
+      {fmt_rel(@at)}
+    </span>
+    """
+  end
+
+  @doc """
+  Why a load panel is empty. Per-shard rates need BOTH `SHARD_LOAD` (the counters) and, for the
+  fleet-wide / sampled views, `LOAD_REPORTER` (publishes them to Postgres). Pure on its attrs so
+  tests cover every branch without touching app env.
+  """
+  attr :load, :boolean, default: nil
+  attr :reporter, :boolean, default: nil
+  attr :scope, :atom, default: :fleet, values: [:node, :fleet]
+
+  def load_empty_reason(assigns) do
+    assigns =
+      assigns
+      |> assign(
+        :load,
+        if(is_nil(assigns.load), do: Fathom.ShardLoad.enabled?(), else: assigns.load)
+      )
+      |> assign(
+        :reporter,
+        if(is_nil(assigns.reporter),
+          do: Fathom.Rebalancer.Reporter.enabled?(),
+          else: assigns.reporter
+        )
+      )
+
+    ~H"""
+    <span :if={!@load} id="load-reason-load-off">
+      Per-shard load counters are off on this node. Set <span class="num">SHARD_LOAD=true</span>.
+    </span>
+    <span :if={@load and @scope == :fleet and !@reporter} id="load-reason-reporter-off">
+      Load counters are on, but the load reporter is off, so nothing is published for the fleet. Set <span class="num">LOAD_REPORTER=true</span>.
+    </span>
+    <span :if={@load and (@scope == :node or @reporter)} id="load-reason-no-traffic">
+      No per-shard traffic or samples recorded yet.
+    </span>
     """
   end
 
@@ -188,4 +243,21 @@ defmodule FathomWeb.AdminComponents do
     do: "#{:erlang.float_to_binary(ms / 1, decimals: 1)} ms"
 
   def fmt_ms(ms) when is_number(ms), do: "#{round(ms)} ms"
+
+  @doc "Relative time vs now: `4s ago`, `12m ago`, `3h ago`, `15d ago`; future values `in 2d`."
+  @spec fmt_rel(DateTime.t() | nil, DateTime.t()) :: String.t()
+  def fmt_rel(dt, now \\ DateTime.utc_now())
+  def fmt_rel(nil, _now), do: "—"
+
+  def fmt_rel(%DateTime{} = dt, now) do
+    d = DateTime.diff(now, dt)
+    s = abs(d)
+    span = rel_span(s)
+    if d >= 0, do: "#{span} ago", else: "in #{span}"
+  end
+
+  defp rel_span(s) when s < 60, do: "#{s}s"
+  defp rel_span(s) when s < 3_600, do: "#{div(s, 60)}m"
+  defp rel_span(s) when s < 86_400, do: "#{div(s, 3_600)}h"
+  defp rel_span(s), do: "#{div(s, 86_400)}d"
 end

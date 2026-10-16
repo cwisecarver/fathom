@@ -182,7 +182,7 @@ defmodule FathomWeb.AdminOverviewLive do
             accent="text-warning"
           />
           <.stat_tile
-            label="Oldest S3-unflushed shard"
+            label="Oldest unflushed (S3)"
             value={fmt_ms(m(@metrics, :oldest_rpo_ms))}
             accent="text-warning"
           />
@@ -293,7 +293,7 @@ defmodule FathomWeb.AdminOverviewLive do
                   <th class="py-2 text-left font-medium">Node</th>
                   <th class="py-2 text-right font-medium">q/s</th>
                   <th
-                    class="py-2 text-right font-medium"
+                    class="hidden py-2 text-right font-medium sm:table-cell"
                     title="99th percentile of this node's per-shard q/s (its hottest shards), not a latency"
                   >
                     hot-shard p99 q/s
@@ -304,11 +304,18 @@ defmodule FathomWeb.AdminOverviewLive do
               </thead>
               <tbody>
                 <tr :for={n <- @fleet.nodes} class="border-b border-base-300/50">
-                  <td class="num py-1.5 text-left">{n.node_key}</td>
+                  <td
+                    class="num max-w-[10rem] truncate py-1.5 pr-2 text-left sm:max-w-none"
+                    title={n.node_key}
+                  >
+                    {n.node_key}
+                  </td>
                   <td class="num py-1.5 text-right">
                     {fmt_rate(Map.get(@fleet.node_load, n.node_key, 0))}
                   </td>
-                  <td class="num py-1.5 text-right text-base-content/60">{fmt_rate(n.q_p99)}</td>
+                  <td class="num hidden py-1.5 text-right text-base-content/60 sm:table-cell">
+                    {fmt_rate(n.q_p99)}
+                  </td>
                   <td
                     id={"node-last-seen-#{dom_safe(n.node_key)}"}
                     class="num py-1.5 text-right text-base-content/60"

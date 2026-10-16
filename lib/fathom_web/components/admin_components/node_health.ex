@@ -62,14 +62,13 @@ defmodule FathomWeb.AdminComponents.NodeHealth do
         rec: rec,
         proc: Map.get(h, :process_used_ratio),
         port: Map.get(h, :port_used_ratio),
-        conns: Map.get(h, :connections_live),
-        checkout: checkout_total(assigns.metrics)
+        conns: Map.get(h, :connections_live)
       )
 
     ~H"""
     <section id="node-health" class="rounded-lg border border-base-300 bg-base-200/40 p-3">
       <div class="mb-2 text-[11px] uppercase tracking-wide text-base-content/50">Node health</div>
-      <div class="grid grid-cols-2 gap-3 md:grid-cols-4 lg:grid-cols-8">
+      <div class="grid grid-cols-[repeat(auto-fit,minmax(9.5rem,1fr))] gap-3">
         <.cell
           :for={{dir, d} <- @disks}
           id={"nh-disk-#{dir}"}
@@ -91,14 +90,14 @@ defmodule FathomWeb.AdminComponents.NodeHealth do
           label="Processes"
           state={ratio_state(@proc)}
           value={fmt_pct(@proc)}
-          sub="of +P"
+          sub={used_of(@proc, :process_limit)}
         />
         <.cell
           id="nh-ports"
           label="Ports"
           state={ratio_state(@port)}
           value={fmt_pct(@port)}
-          sub="of +Q"
+          sub={used_of(@port, :port_limit)}
         />
         <.cell
           id="nh-conns"
@@ -116,17 +115,16 @@ defmodule FathomWeb.AdminComponents.NodeHealth do
         />
         <.cell
           id="nh-recorder"
-          label="Dir recorder"
+          label="Recorder buffered"
           state={recorder_state(@rec)}
           value={fmt_int(@rec[:buffered])}
-          sub={"buffered · last flush #{age(@rec[:last_flush_age_ms])}"}
+          sub={"flush #{age(@rec[:last_flush_age_ms])}"}
         />
         <.cell
           id="nh-memory"
           label="BEAM memory"
           state={if(mm(@metrics, :memory_bytes), do: :ok, else: :idle)}
           value={fmt_bytes(mm(@metrics, :memory_bytes))}
-          sub={"#{fmt_rate(@checkout)} checkouts/s"}
         />
       </div>
     </section>
@@ -144,7 +142,7 @@ defmodule FathomWeb.AdminComponents.NodeHealth do
     <div id={@id} data-state={@state} class={["rounded border px-2 py-1.5", cell_class(@state)]}>
       <div class="text-[10px] uppercase tracking-wide text-base-content/50">{@label}</div>
       <div class="num text-lg font-medium leading-tight">{@value}</div>
-      <div :if={@sub} class="num truncate text-[11px] text-base-content/50">{@sub}</div>
+      <div :if={@sub} class="num truncate text-[11px] text-base-content/50" title={@sub}>{@sub}</div>
     </div>
     """
   end
@@ -161,8 +159,14 @@ defmodule FathomWeb.AdminComponents.NodeHealth do
   defp age(nil), do: "—"
   defp age(ms), do: fmt_ms(ms) <> " ago"
 
-  defp checkout_total(nil), do: 0.0
-  defp checkout_total(m), do: m |> Map.get(:checkout_per_s, %{}) |> Map.values() |> Enum.sum()
+  # "count / limit" from the used-ratio and the VM's own limit (the ratio is this node's gauge, and
+  # so is `system_info`, so the pair is consistent). `+P` / `+Q` are the emulator flags that set them.
+  defp used_of(nil, _key), do: "no reading yet"
+
+  defp used_of(ratio, key) do
+    limit = :erlang.system_info(key)
+    "#{fmt_int(round(ratio * limit))} / #{fmt_int(limit)}"
+  end
 
   defp fmt_pct(nil), do: "—"
   defp fmt_pct(r) when is_number(r), do: "#{Float.round(r * 100, 1)}%"
@@ -191,7 +195,7 @@ defmodule FathomWeb.AdminComponents.NodeHealth do
       <.stat_tile
         label="Cold-open p50 · 60 s"
         value={fmt_ms(@p50)}
-        unit={if(@n > 0, do: "p95 #{fmt_ms(@p95)} · p99 #{fmt_ms(@p99)}", else: "no opens in window")}
+        sub={if(@n > 0, do: "p95 #{fmt_ms(@p95)} · p99 #{fmt_ms(@p99)}", else: "no opens in window")}
       >
         <div class="num text-[11px] text-base-content/50">
           <span :for={{warm, s} <- Enum.sort(@by)} id={"cold-open-warm-#{warm}"} class="mr-2">

@@ -326,7 +326,9 @@ defmodule FathomWeb.AdminMigrationsLive do
                   <td class="py-1.5">{q.queue}</td>
                   <td class="num py-1.5 text-right">{fmt_int(q.available)}</td>
                   <td class="num py-1.5 text-right">{fmt_int(q.retryable)}</td>
-                  <td class="num py-1.5 text-right">{fmt_age_s(div(q.oldest_age_ms, 1000))}</td>
+                  <td id={"queue-oldest-#{q.queue}"} class="num py-1.5 text-right">
+                    {if(q.available == 0, do: "—", else: fmt_age_s(div(q.oldest_age_ms, 1000)))}
+                  </td>
                 </tr>
               </tbody>
             </table>

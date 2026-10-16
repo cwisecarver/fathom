@@ -381,17 +381,17 @@ defmodule FathomWeb.AdminDirectoryLive do
 
           <div :if={@page.rows != []} class="overflow-x-auto">
             <table id="directory-table" class="w-full text-sm">
-              <thead class="text-[11px] uppercase tracking-wide text-base-content/50">
+              <thead class="whitespace-nowrap text-[11px] uppercase tracking-wide text-base-content/50">
                 <tr class="border-b border-base-300">
                   <th class="py-2 pr-4 text-left font-medium">Shard</th>
                   <th class="py-2 pr-4 text-left font-medium">Status</th>
-                  <th class="py-2 pr-4 text-right font-medium">Schema v</th>
+                  <th class="py-2 pr-4 text-right font-medium">Schema</th>
                   <th class="py-2 pr-4 text-left font-medium">Last active</th>
                   <th class="py-2 pr-4 text-left font-medium">Last flushed</th>
                   <th class="py-2 pr-4 text-left font-medium">Last snapshot</th>
                   <th class="py-2 pr-4 text-left font-medium">Verify</th>
                   <th class="py-2 pr-4 text-left font-medium">Retain until</th>
-                  <th class="py-2 pr-4 text-right font-medium">Token v</th>
+                  <th class="py-2 pr-4 text-right font-medium">Token</th>
                   <th class="py-2 text-right font-medium"></th>
                 </tr>
               </thead>
@@ -407,19 +407,23 @@ defmodule FathomWeb.AdminDirectoryLive do
                     <td class="num py-1.5 pr-4 text-right text-base-content/60">
                       {row.schema_version}
                     </td>
-                    <td class="num py-1.5 pr-4 text-base-content/60">{fmt_dt(row.last_active_at)}</td>
                     <td class="num py-1.5 pr-4 text-base-content/60">
-                      {fmt_dt(row.last_flushed_at)}
+                      <.rel_time id={"dir-active-#{row.shard_id}"} at={row.last_active_at} />
                     </td>
                     <td class="num py-1.5 pr-4 text-base-content/60">
-                      {fmt_dt(row.last_snapshot_at)}
+                      <.rel_time id={"dir-flushed-#{row.shard_id}"} at={row.last_flushed_at} />
+                    </td>
+                    <td class="num py-1.5 pr-4 text-base-content/60">
+                      <.rel_time id={"dir-snapshot-#{row.shard_id}"} at={row.last_snapshot_at} />
                     </td>
                     <td class="num py-1.5 pr-4">
                       <span class={verify_class(row.last_verify_status)}>
                         {row.last_verify_status}
                       </span>
                     </td>
-                    <td class="num py-1.5 pr-4 text-base-content/60">{fmt_dt(row.retain_until)}</td>
+                    <td class="num py-1.5 pr-4 text-base-content/60">
+                      <.rel_time at={row.retain_until} />
+                    </td>
                     <td class="num py-1.5 pr-4 text-right text-base-content/60">
                       {row.token_version}
                     </td>

@@ -14,6 +14,8 @@ defmodule FathomWeb.AdminShardLiveTest do
   alias Fathom.Rebalancer.{Command, Override}
   alias Fathom.Repo
 
+  require Ecto.Query
+
   @auth "Basic " <> Base.encode64("admin:secret")
   defp auth(conn), do: Plug.Conn.put_req_header(conn, "authorization", @auth)
 
@@ -120,5 +122,32 @@ defmodule FathomWeb.AdminShardLiveTest do
     # The button is disabled when the coordinator is not open, so drive the event directly.
     render_click(view, "probe_mode", %{})
     assert has_element?(view, "#shard-mode", "not open")
+  end
+
+  test "directory row is humanized and timestamps are relative with an ISO title", %{conn: conn} do
+    flushed = DateTime.add(DateTime.utc_now(), -3 * 3600) |> DateTime.truncate(:second)
+    # The column is usec-precision, so the rendered title carries ".000000".
+    flushed = %{flushed | microsecond: {0, 6}}
+    put_shard(%{shard_id: "shard-h1"})
+
+    Repo.update_all(Ecto.Query.from(s in Shard, where: s.shard_id == "shard-h1"),
+      set: [last_flushed_at: flushed]
+    )
+
+    {:ok, view, _} = conn |> auth() |> live("/admin/shards/shard-h1")
+    render_async(view)
+
+    html = view |> element("#shard-directory") |> render()
+    assert html =~ "Last flushed"
+    refute html =~ "last_flushed_at"
+    assert html =~ ~s(title="#{DateTime.to_iso8601(flushed)}")
+    assert html =~ "3h ago"
+  end
+
+  test "empty samples state names a reason (SHARD_LOAD off in test)", %{conn: conn} do
+    put_shard(%{shard_id: "shard-h2"})
+    {:ok, view, _} = conn |> auth() |> live("/admin/shards/shard-h2")
+    render_async(view)
+    assert has_element?(view, "#shard-no-samples #load-reason-load-off")
   end
 end

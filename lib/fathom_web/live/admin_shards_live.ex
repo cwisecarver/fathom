@@ -109,7 +109,7 @@ defmodule FathomWeb.AdminShardsLive do
         <.panel title="Fleet hot set (merged, with serving node)">
           <div :if={@fleet_hot == nil} class="skeleton h-24 rounded"></div>
           <div :if={@fleet_hot == []} class="py-6 text-center text-sm text-base-content/40">
-            No fleet load samples. Per-shard load reporting is off unless SHARD_LOAD=true on the nodes.
+            No fleet load samples. <.load_empty_reason scope={:fleet} />
           </div>
           <table :if={is_list(@fleet_hot) and @fleet_hot != []} class="w-full text-sm">
             <thead class="text-[11px] uppercase tracking-wide text-base-content/50">

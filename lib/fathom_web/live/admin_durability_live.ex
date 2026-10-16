@@ -277,7 +277,11 @@ defmodule FathomWeb.AdminDurabilityLive do
                 id={"dirty-#{row.shard_id}"}
                 class="border-b border-base-300/50"
               >
-                <td class="num py-1.5 pr-4">{row.shard_id}</td>
+                <td class="num py-1.5 pr-4">
+                  <.link navigate={~p"/admin/shards/#{row.shard_id}"} class="link">
+                    {row.shard_id}
+                  </.link>
+                </td>
                 <td class="num py-1.5 pr-4 text-right">{fmt_ms(row.age_ms)}</td>
                 <td class="num py-1.5 text-right">{fmt_int(row.unflushed_writes)}</td>
               </tr>

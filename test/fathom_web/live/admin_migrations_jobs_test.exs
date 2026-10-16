@@ -43,6 +43,8 @@ defmodule FathomWeb.AdminMigrationsJobsTest do
     assert has_element?(view, "#denylist-suspensions")
     assert has_element?(view, "#queue-health")
     assert has_element?(view, "#queue-migrations")
+    # An empty queue has no "oldest available": a dash, not a misleading "0s".
+    assert has_element?(view, "#queue-oldest-migrations", "—")
     assert has_element?(view, "#failed-jobs-empty")
     assert has_element?(view, "#rollout-rate")
     assert has_element?(view, "#version-histogram")

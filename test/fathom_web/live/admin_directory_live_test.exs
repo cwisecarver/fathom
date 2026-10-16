@@ -29,6 +29,25 @@ defmodule FathomWeb.AdminDirectoryLiveTest do
     assert get(conn, "/admin/directory").status == 401
   end
 
+  # Symptom (browser review 2026-10-16): raw ISO timestamps wrapped onto two lines on every row.
+  test "last-flushed renders relative with the full ISO timestamp in a title", %{conn: conn} do
+    flushed = DateTime.add(DateTime.utc_now(), -2 * 86_400) |> DateTime.truncate(:second)
+    # The column is usec-precision, so the rendered title carries ".000000".
+    flushed = %{flushed | microsecond: {0, 6}}
+    put_shard(%{shard_id: "ui_rel"})
+
+    Repo.update_all(Ecto.Query.from(s in Shard, where: s.shard_id == "ui_rel"),
+      set: [last_flushed_at: flushed]
+    )
+
+    {:ok, view, _html} = conn |> auth() |> live("/admin/directory")
+
+    cell = view |> element("#dir-flushed-ui_rel") |> render()
+    assert cell =~ ~s(title="#{DateTime.to_iso8601(flushed)}")
+    assert cell =~ "2d ago"
+    assert cell =~ "whitespace-nowrap"
+  end
+
   test "mounts behind auth and renders directory rows", %{conn: conn} do
     put_shard(%{shard_id: "ui_alpha", status: "active"})
     put_shard(%{shard_id: "ui_beta", status: "retired"})
