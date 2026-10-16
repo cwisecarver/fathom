@@ -244,7 +244,8 @@ defmodule Fathom.Telemetry do
             "(retryable 503) or, after the window, opened best-effort (possible acked-write loss)"
       ),
       # Follower fsyncs outside the push path (expert review 2026-10-15 #21), only with
-      # REPLICATION_FSYNC on. `what` is bounded: :seed | :lineage | :ordinal.
+      # REPLICATION_FSYNC on. `what` is bounded: :seed | :lineage | :ordinal | :db_position (the
+      # `.db`-only position an absorb records, expert review 2026-10-15 #4 follow-up).
       counter("fathom.replication.follower_state_sync.count",
         event_name: [:fathom, :replication, :follower_state_sync],
         tags: [:what],

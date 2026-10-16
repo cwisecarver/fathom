@@ -168,6 +168,15 @@ Refinements (expert review 2026-10-13 #5, #14, #15, #40):
   of the writer's followers, so its answer does not count toward the floor. Matching is by the owner
   string's node name (or the host part of `name@host`) against the peer's `node_key`; a deployment
   where neither matches gets no exclusion.
+- A follower restarted with an **empty or absent `-wal`** (expert review 2026-10-15 #4 follow-up) is
+  not a "nothing": its `.db` can hold the acked tail, absorbed there before a reset whose new
+  generation never reached the disk. Each absorb records what the `.db` alone holds in
+  `<shard>.db.position` (lineage, the absorbed WAL's ordinal, the extent SQLite validated), voided
+  before anything moves the `.db`. Recovery answers that position; with no trustworthy record the
+  replica recovers torn (silent, never ranked, re-seeded on its next push). A peer pulling a
+  `.db`-only replica is offered that position, not the empty WAL's 0. A follower that never held the
+  shard still answers a definite "nothing". Details: component-notes, "A2 follower restart with an
+  empty `-wal`".
 - An **internal error** (a crash in `best_replica/3`, or the decision-time object HEAD failing while
   peers are configured) goes through the same window instead of opening with no floor: refuse inside
   it (`outcome: :skipped_error`), best-effort with an error log after it.

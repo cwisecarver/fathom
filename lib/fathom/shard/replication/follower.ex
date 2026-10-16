@@ -67,6 +67,10 @@ defmodule Fathom.Shard.Replication.Follower do
   @default_table Module.concat(__MODULE__, Shards)
   @default_locks Module.concat(__MODULE__, ShardLocks)
 
+  # A WAL frame header: pgno, nTruncate, two salts, two checksums; and the two header magics (`Wal`).
+  @wal_frame_header_bytes 24
+  @wal_magics [0x377F0682, 0x377F0683]
+
   def table(name \\ __MODULE__)
   def table(__MODULE__), do: @default_table
   def table(name), do: Module.concat(name, Shards)
@@ -361,6 +365,7 @@ defmodule Fathom.Shard.Replication.Follower do
     File.rm(torn_path(name, shard_id))
     File.rm(lineage_path(name, shard_id))
     File.rm(ordinal_path(name, shard_id))
+    File.rm(db_position_path(name, shard_id))
     :ok
   rescue
     ArgumentError -> :ok
@@ -485,6 +490,14 @@ defmodule Fathom.Shard.Replication.Follower do
   def ordinal_path(name \\ __MODULE__, shard_id) do
     assert_valid_shard_id!(shard_id)
     Path.join(dir(name), shard_id <> ".db.ordinal")
+  end
+
+  @doc false
+  # What the `.db` ALONE holds, for a replica whose `-wal` is empty or absent (expert review
+  # 2026-10-15 #4 follow-up). See `record_db_position/5`.
+  def db_position_path(name \\ __MODULE__, shard_id) do
+    assert_valid_shard_id!(shard_id)
+    Path.join(dir(name), shard_id <> ".db.position")
   end
 
   defp assert_valid_shard_id!(shard_id) do
@@ -1179,8 +1192,10 @@ defmodule Fathom.Shard.Replication.Follower do
          wal_gen: gen_of(header),
          salt1: salt_of(header),
          wal_size: size_of(header),
+         wal_offset: offer_offset(header, state),
          db_size: db_size,
-         header: header
+         header: header,
+         state: state
        }}
     else
       nil -> :none
@@ -1197,7 +1212,7 @@ defmodule Fathom.Shard.Replication.Follower do
       epoch: offer.epoch,
       wal_gen: offer.wal_gen,
       salt1: offer.salt1,
-      wal_offset: offer.wal_size,
+      wal_offset: offer.wal_offset,
       db_size: offer.db_size,
       wal_size: offer.wal_size,
       lineage: offer.lineage
@@ -1207,7 +1222,8 @@ defmodule Fathom.Shard.Replication.Follower do
          :ok <- send_part(sock, shard_id, :db, db_path(name, shard_id), offer.db_size),
          :ok <- send_part(sock, shard_id, :wal, wal_path(name, shard_id), offer.wal_size),
          {:ok, after_} <- Wal.read(wal_path(name, shard_id)),
-         :ok <- stable?(offer.header, after_) do
+         :ok <- stable?(offer.header, after_),
+         :ok <- db_only_unchanged(name, shard_id, offer) do
       :gen_tcp.send(sock, Protocol.encode_seed_end(shard_id))
     else
       other ->
@@ -1271,6 +1287,25 @@ defmodule Fathom.Shard.Replication.Follower do
   defp stable?(:empty, :empty), do: :ok
   defp stable?(%{ckpt_seq: g, salt1: s}, %{ckpt_seq: g, salt1: s}), do: :ok
   defp stable?(_, _), do: {:error, :changed_during_pull}
+
+  # A replica whose `-wal` is EMPTY holds everything in its `.db`, so its offset is the position
+  # the `.db` holds (`record_db_position/5`), not the WAL's zero bytes. Offering 0 made the puller
+  # install `{lineage, ordinal, 0}`: below the position it was chosen on and, against an object
+  # stamped mid-generation, below the object too — so the pulled replica was refused at the
+  # recheck and the acked tail it carried was dropped for the stale object (expert review
+  # 2026-10-15 #4 follow-up). A non-empty WAL keeps offering its own size, as before.
+  defp offer_offset(:empty, state), do: state.next_offset
+  defp offer_offset(header, _state), do: size_of(header)
+
+  # `stable?/2` is trivially true for `:empty` on both sides, which cannot tell "nothing moved"
+  # from "a seed with an empty WAL replaced the `.db` mid-stream". The offset streamed above is the
+  # STATE's, so for a `.db`-only offer the state must be unchanged too, or the puller would stamp
+  # the old position on a different database.
+  defp db_only_unchanged(name, shard_id, %{header: :empty, state: state}) do
+    if offerable(name, shard_id) == state, do: :ok, else: {:error, :changed_during_pull}
+  end
+
+  defp db_only_unchanged(_name, _shard_id, _offer), do: :ok
 
   # ------------------------------------------------------------------------------------------
   # streamed seeding
@@ -1880,7 +1915,10 @@ defmodule Fathom.Shard.Replication.Follower do
     db = db_path(name, shard_id)
     wal = wal_path(name, shard_id)
 
-    with :ok <- rm_if_present(wal),
+    # The `.db` is about to be replaced, so whatever the position file said about the old one is
+    # void — invalidated BEFORE the rename, never after.
+    with :ok <- invalidate_db_position(name, shard_id),
+         :ok <- rm_if_present(wal),
          :ok <- File.rename(state.db_temp, db),
          :ok <- File.rename(state.wal_temp, wal) do
       seeded =
@@ -1892,7 +1930,15 @@ defmodule Fathom.Shard.Replication.Follower do
           Map.get(state, :lineage, 0)
         )
 
-      put_state(name, shard_id, %{seeded | wal_ordinal: Map.get(state, :wal_ordinal, 0)})
+      installed =
+        put_state(name, shard_id, %{seeded | wal_ordinal: Map.get(state, :wal_ordinal, 0)})
+
+      # A `.db`-ONLY seed — a pulled replica whose source's WAL was empty (`offer_offset/2`) — has
+      # a known position for the `.db` alone, so it gets the same record an absorb leaves. Any
+      # other seed's `.db` holds an unstated position BEFORE its WAL, so it gets none: if its WAL
+      # is later lost, recovery answers torn, never a guess.
+      if state.wal_size == 0 and state.wal_offset > 0,
+        do: record_db_position(name, shard_id, installed, installed.wal_ordinal, state.wal_offset)
 
       Logger.info(
         "replication seeded #{shard_id}: #{state.db_size}B db + #{state.wal_size}B wal " <>
@@ -2093,8 +2139,7 @@ defmodule Fathom.Shard.Replication.Follower do
     # under this WAL's salts, which a zeroed tail is not. Frames are written POSITIONALLY
     # (`write_frame/4`), so resuming at the lower offset overwrites the junk rather than appending
     # after it.
-    with {:ok, %{ckpt_seq: gen, salt1: salt, commit_extent: size}} <-
-           Wal.read(wal_path(name, shard_id)),
+    with {:ok, header} <- Wal.read(wal_path(name, shard_id)),
          true <- File.exists?(db_path(name, shard_id)) do
       # Carry `torn` across the restart (expert review 2026-08-20 #11b). `FollowerLog.seeded/4`
       # stamps `torn: false` because a real SEED is the one event that rebuilds both files
@@ -2102,18 +2147,47 @@ defmodule Fathom.Shard.Replication.Follower do
       # thing that remembers the two files were a generation apart when we went down.
       torn? = File.exists?(torn_path(name, shard_id))
       lineage = recovered_lineage(name, shard_id)
-      # Only for the WAL whose salt it was written for (expert review 2026-10-15 #4).
-      ordinal = recovered_ordinal(name, shard_id, salt)
-
-      :ets.insert(
-        tab,
-        {shard_id,
-         %{FollowerLog.seeded(0, gen, salt, size, lineage) | torn: torn?, wal_ordinal: ordinal}}
-      )
-
+      :ets.insert(tab, {shard_id, recovered_state(name, shard_id, header, torn?, lineage)})
       true
     else
       _ -> false
+    end
+  end
+
+  defp recovered_state(name, shard_id, %{ckpt_seq: gen, salt1: salt} = header, torn?, lineage) do
+    # Only for the WAL whose salt it was written for (expert review 2026-10-15 #4).
+    ordinal = recovered_ordinal(name, shard_id, salt)
+
+    %{
+      FollowerLog.seeded(0, gen, salt, header.commit_extent, lineage)
+      | torn: torn?,
+        wal_ordinal: ordinal
+    }
+  end
+
+  # AN EMPTY OR ABSENT `-wal` OVER A `.db` (expert review 2026-10-15 #4 follow-up). This used to
+  # recover NOTHING, so the replica answered a definite "nothing" while its `.db` held the acked
+  # writes an absorb (or a `.db`-only pulled seed) put there. Now it recovers the position the `.db`
+  # alone holds (`record_db_position/5`) when that was recorded under the lineage it still has —
+  # or, with no trustworthy record, TORN: unrankable, `:torn` (silent) to a position query, never
+  # counted toward the floor, and re-seeded on its next push, which is what an unrecovered replica's
+  # `:unknown_shard` already asked for. The torn flag is in-memory only; the files decide it again
+  # on every restart. A follower that never held the shard has no `.db` and still answers "nothing".
+  #
+  # Epoch 0 as for every recovered replica, so the first push takes `decide_fresh/2` and resets
+  # from offset 0 — nothing is ever appended to the empty WAL at the recorded offset.
+  defp recovered_state(name, shard_id, :empty, torn?, lineage) do
+    case recovered_db_position(name, shard_id) do
+      {:ok, %{lineage: ^lineage, wal_ordinal: ordinal, next_offset: extent}} ->
+        %{FollowerLog.seeded(0, 0, 0, extent, lineage) | torn: torn?, wal_ordinal: ordinal}
+
+      _ ->
+        Logger.info(
+          "replication follower recovered #{shard_id} with an empty WAL and no position for its " <>
+            ".db; holding it as torn (unrankable) until it is re-seeded"
+        )
+
+        %{FollowerLog.seeded(0, 0, 0, 0, lineage) | torn: true}
     end
   end
 
@@ -2143,7 +2217,8 @@ defmodule Fathom.Shard.Replication.Follower do
     # A checkpointed WAL: our bytes are meaningless now, so the file is replaced rather than
     # extended — but the pages in the WAL we are about to throw away are NOT meaningless, and
     # absorbing them first is what keeps this replica whole.
-    absorbed = absorb_before_reset(name, push.shard_id, new_state, reset_verdict(prev, push))
+    absorbed =
+      absorb_before_reset(name, push.shard_id, prev, new_state, reset_verdict(prev, push))
 
     apply_write(name, push, absorbed, :truncate)
   end
@@ -2309,9 +2384,9 @@ defmodule Fathom.Shard.Replication.Follower do
   # handoff holds a short tail. `prev_extent` cannot help, because a new owner's session has no
   # record of this follower and always states 0. So the replica stays torn (what `decide_fresh/2`
   # set) and waits for a seed instead of becoming a promotable hybrid of two ownerships.
-  defp absorb_before_reset(_name, _shard_id, new_state, :ownership), do: new_state
+  defp absorb_before_reset(_name, _shard_id, _prev, new_state, :ownership), do: new_state
 
-  defp absorb_before_reset(name, shard_id, new_state, verdict) do
+  defp absorb_before_reset(name, shard_id, prev, new_state, verdict) do
     db = db_path(name, shard_id)
     wal = wal_path(name, shard_id)
 
@@ -2320,7 +2395,7 @@ defmodule Fathom.Shard.Replication.Follower do
     # empty WAL over an existing `.db` has nothing to absorb either, but it does NOT make a torn
     # replica whole, so a sticky verdict survives this branch too.
     if File.exists?(db) and wal_bytes(wal) > 0 do
-      case checkpoint_into_db(db) do
+      case absorb_recording_position(name, shard_id, prev, verdict, db, wal) do
         :ok when verdict == :already_torn ->
           # Absorbing is still right — the pages we hold are real — but it cannot clear the flag.
           new_state
@@ -2389,17 +2464,29 @@ defmodule Fathom.Shard.Replication.Follower do
   # the header says. The only file a raw handle could see as non-WAL is one with no WAL at all,
   # which the caller never absorbs.
   def checkpoint_into_db(db) do
+    case absorb_into_db(db) do
+      {:ok, _extent} -> :ok
+      {:error, _} = err -> err
+    end
+  end
+
+  # THE EXTENT THE `.db` NOW HOLDS comes from SQLite, not from the WAL's own claim (expert review
+  # 2026-10-15 #4 follow-up). `absorb_before_reset/5` records it as the `.db`'s position, and
+  # `Wal.read/1`'s commit extent is found by salts and commit markers WITHOUT checksums — a frame
+  # whose checksum broke stops SQLite's replay there (the 2026-10-15 #15 measurement), so the WAL
+  # would claim more than the `.db` received. A PASSIVE checkpoint first reports `[busy, log,
+  # checkpointed]` with `log` = the frames SQLite validated (TRUNCATE rewinds `mxFrame` before it
+  # answers, so its row cannot say this), and the TRUNCATE after it only empties the file: the same
+  # backfill and fsyncs as before, plus one pragma.
+  @doc false
+  @spec absorb_into_db(Path.t()) :: {:ok, pos_integer()} | {:error, term()}
+  def absorb_into_db(db) do
     case Sqlite3.open(db) do
       {:ok, conn} ->
         try do
           with :ok <- Sqlite3.set_busy_timeout(conn, 5000),
                :ok <- Sqlite3.execute(conn, "PRAGMA synchronous=FULL") do
-            case checkpoint_truncate(conn) do
-              {:ok, [[_busy, log, log]]} -> :ok
-              {:ok, [row]} -> {:error, {:absorb_incomplete, row}}
-              {:error, reason} -> {:error, {:checkpoint_failed, reason}}
-              other -> {:error, {:checkpoint_failed, other}}
-            end
+            absorb_checkpoint(conn)
           else
             {:error, reason} -> {:error, {:open_failed, reason}}
           end
@@ -2413,12 +2500,160 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
+  defp absorb_checkpoint(conn) do
+    with {:ok, [[_busy, frames, frames]]} <- pragma_rows(conn, "PRAGMA wal_checkpoint(PASSIVE)"),
+         {:ok, [[page]]} <- pragma_rows(conn, "PRAGMA page_size"),
+         {:ok, [[_busy, log, log]]} <- pragma_rows(conn, "PRAGMA wal_checkpoint(TRUNCATE)") do
+      {:ok, Wal.header_bytes() + frames * (page + @wal_frame_header_bytes)}
+    else
+      {:ok, [row]} -> {:error, {:absorb_incomplete, row}}
+      {:error, reason} -> {:error, {:checkpoint_failed, reason}}
+      other -> {:error, {:checkpoint_failed, other}}
+    end
+  end
+
   # `prepare` + `fetch_all`: `Sqlite3.execute/2` discards the result row, and the row is the point.
-  defp checkpoint_truncate(conn) do
-    with {:ok, stmt} <- Sqlite3.prepare(conn, "PRAGMA wal_checkpoint(TRUNCATE)") do
+  defp pragma_rows(conn, sql) do
+    with {:ok, stmt} <- Sqlite3.prepare(conn, sql) do
       result = Sqlite3.fetch_all(conn, stmt)
       _ = Sqlite3.release(conn, stmt)
       result
+    end
+  end
+
+  # WHAT THE `.db` ALONE HOLDS (expert review 2026-10-15 #4 follow-up). A replica whose `-wal` is
+  # empty or absent at restart was not recovered at all (`Wal.read/1` answers `:empty`), so it
+  # answered a DEFINITE "nothing" — counted toward the recovery floor, and outranked by a staler
+  # peer or the stored object — while its `.db` held quorum-acked writes. The ordinary way to get
+  # there: an absorb (`absorb_before_reset/5`) checkpoints the old generation into the `.db` and
+  # truncates the WAL, and a crash before the new generation's bytes land (or an OS crash that
+  # loses those unsynced bytes; the absorb itself is synchronous=FULL) leaves `.db` + empty WAL.
+  #
+  # So the absorb records `"<lineage> <ordinal> <extent> end"` beside the `.db`: the ordinal of the
+  # WAL it absorbed (only when that WAL's header salt is the one the state's ordinal belongs to)
+  # and the extent SQLite validated (`absorb_into_db/1`). Recovery adopts it ONLY for an empty WAL
+  # and only when the lineage still matches; otherwise an empty-WAL replica recovers TORN
+  # (unrankable, answers `:torn`, re-seeds on its next push) — never a definite "nothing".
+  #
+  # The record is INVALIDATED before anything moves the `.db` (an absorb, a seed install) and
+  # written only after, so a crash in between leaves no record rather than a stale one: a stale
+  # record would UNDER-claim, the dangerous direction (a definite position lower than the `.db`
+  # holds). Invalidated in place (truncate, then a datasync under `:replication_fsync`) rather than
+  # removed, so its ordering against the checkpoint's own fsyncs holds without the directory fsync
+  # the BEAM cannot do. A torn or partial record (an OS crash mid-write) lacks the trailing `end`
+  # and reads as no record.
+  #
+  # COST, measured 2026-10-15 (300 alternating absorbs of a 20-frame WAL, macOS): the PASSIVE count
+  # adds ~10 us to a ~335 us absorb; the first draft's file handling (a `Wal.read/1`, a stat, an
+  # open/close to invalidate, a `File.write` to record) added ~140 us more. So the absorb path holds
+  # ONE descriptor across the checkpoint — opened truncating (the invalidation), written after —
+  # and reads only the 20 header bytes it needs for the salt: ~+80 us in all (335 -> 415 us p50).
+  # Once per WAL generation, on the reset push that already pays a SQLite open and checkpoint; the
+  # append path, i.e. every other push, is untouched.
+  defp absorb_recording_position(name, shard_id, prev, verdict, db, wal) do
+    ordinal = absorbed_ordinal(prev, wal)
+
+    case :file.open(db_position_path(name, shard_id), [:write, :raw, :binary]) do
+      {:ok, fd} ->
+        try do
+          with :ok <- maybe_sync(fd),
+               {:ok, extent} <- absorb_into_db(db) do
+            # From the moment the checkpoint truncates the WAL, the `.db` alone holds every frame
+            # it absorbed, and until the new generation's bytes land it is ALL this replica holds.
+            # Recorded for any non-torn base (a `:short` absorb included: the record states how far
+            # the `.db` got, which is true however short of the primary that is). A failed record
+            # write leaves no record, which recovers torn: safe.
+            _ = if verdict != :already_torn, do: write_db_position(fd, prev, ordinal, extent)
+            :ok
+          end
+        after
+          :file.close(fd)
+        end
+
+      {:error, reason} ->
+        {:error, {:position_file, reason}}
+    end
+  end
+
+  defp write_db_position(fd, %{lineage: lineage}, ordinal, extent)
+       when is_integer(lineage) and lineage > 0 and is_integer(ordinal) and ordinal > 0 do
+    with :ok <- :file.write(fd, db_position_text(lineage, ordinal, extent)) do
+      if fsync?(),
+        do: with(:ok <- :file.datasync(fd), do: emit_state_sync(:db_position)),
+        else: :ok
+    end
+  end
+
+  defp write_db_position(_fd, _prev, _ordinal, _extent), do: :ok
+
+  defp db_position_text(lineage, ordinal, extent), do: "#{lineage} #{ordinal} #{extent} end"
+
+  # The seed-install side of the same record (`do_install/3`): rare, so the plain helpers.
+  defp record_db_position(name, shard_id, %{lineage: lineage}, ordinal, extent)
+       when is_integer(lineage) and lineage > 0 and is_integer(ordinal) and ordinal > 0 do
+    write_state_file(
+      db_position_path(name, shard_id),
+      db_position_text(lineage, ordinal, extent),
+      :db_position
+    )
+  end
+
+  defp record_db_position(_name, _shard_id, _prev, _ordinal, _extent), do: :ok
+
+  defp invalidate_db_position(name, shard_id) do
+    path = db_position_path(name, shard_id)
+
+    if File.regular?(path) do
+      with {:ok, fd} <- :file.open(path, [:write, :raw, :binary]) do
+        synced = maybe_sync(fd)
+        _ = :file.close(fd)
+        synced
+      end
+    else
+      :ok
+    end
+  end
+
+  # The ordinal of the WAL about to be absorbed: the state's, if the file's header is the salt that
+  # ordinal was recorded for; otherwise 0 ("not stated"), and no record is written. A state whose
+  # salt no longer names the file on disk (a reset write that failed part-way) must not lend its
+  # ordinal to whatever the checkpoint finds there.
+  defp absorbed_ordinal(%{salt1: salt, wal_ordinal: n}, wal) when is_integer(n) and n > 0 do
+    if wal_header_salt(wal) == salt, do: n, else: 0
+  end
+
+  defp absorbed_ordinal(_prev, _wal), do: 0
+
+  # Magic (bytes 0..3) and salt-1 (bytes 16..19) of a WAL header; nil if it is not one.
+  defp wal_header_salt(wal) do
+    with {:ok, fd} <- :file.open(wal, [:read, :raw, :binary]) do
+      try do
+        case :file.pread(fd, 0, 20) do
+          {:ok, <<magic::32, _::binary-size(12), salt::32>>} when magic in @wal_magics -> salt
+          _ -> nil
+        end
+      after
+        :file.close(fd)
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  @doc false
+  # The `.db`-only position persisted by `record_db_position/5`, or `:none`. Public for the test.
+  @spec recovered_db_position(atom(), String.t()) ::
+          {:ok, %{lineage: pos_integer(), wal_ordinal: pos_integer(), next_offset: pos_integer()}}
+          | :none
+  def recovered_db_position(name \\ __MODULE__, shard_id) do
+    with {:ok, text} <- File.read(db_position_path(name, shard_id)),
+         [l, n, x, "end"] <- String.split(String.trim(text), " "),
+         {lineage, ""} when lineage > 0 <- Integer.parse(l),
+         {ordinal, ""} when ordinal > 0 <- Integer.parse(n),
+         {extent, ""} when extent > 0 <- Integer.parse(x) do
+      {:ok, %{lineage: lineage, wal_ordinal: ordinal, next_offset: extent}}
+    else
+      _ -> :none
     end
   end
 
