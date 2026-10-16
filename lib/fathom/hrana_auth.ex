@@ -111,7 +111,7 @@ defmodule Fathom.HranaAuth do
     end
   end
 
-  defp verify(_shard_id, nil), do: {:error, @missing}
+  defp verify(_shard_id, nil), do: reject(:missing, @missing)
 
   defp verify(shard_id, token) when is_binary(token) do
     with {:ok, %{"s" => granted, "v" => version} = payload} <-
@@ -130,11 +130,24 @@ defmodule Fathom.HranaAuth do
       # Bad signature/expiry, a token for a different shard, a revoked (stale-version)
       # token, or an id that doesn't cast (defense-in-depth). One opaque refusal for
       # all of them — a probe can't tell a wrong token from a wrong/revoked shard.
-      _ -> {:error, @unauthorized}
+      # The CLASSIFIED reason goes to telemetry only (bounded `reason` tag, never shard_id); the
+      # client still gets the one opaque @unauthorized above.
+      {:error, :expired} -> reject(:expired, @unauthorized)
+      {:error, :invalid} -> reject(:invalid, @unauthorized)
+      {:error, :missing} -> reject(:missing, @unauthorized)
+      {:ok, granted} when is_binary(granted) -> reject(:wrong_shard, @unauthorized)
+      false -> reject(:revoked, @unauthorized)
+      _ -> reject(:other, @unauthorized)
     end
   end
 
-  defp verify(_shard_id, _token), do: {:error, @unauthorized}
+  defp verify(_shard_id, _token), do: reject(:other, @unauthorized)
+
+  # Failure path only: count the rejection by reason, return the unchanged client error.
+  defp reject(reason, error) do
+    :telemetry.execute([:fathom, :hrana, :auth, :rejected], %{count: 1}, %{reason: reason})
+    {:error, error}
+  end
 
   @doc """
   Does a token version still clear `shard_id`'s revocation floor? The per-statement re-check.

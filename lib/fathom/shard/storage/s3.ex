@@ -3372,7 +3372,7 @@ defmodule Fathom.Shard.Storage.S3 do
     :telemetry.execute(
       [:fathom, :s3, :op],
       %{count: 1, bytes: op_bytes(request, response)},
-      %{op: request.method}
+      %{op: request.method, status_class: status_class(response.status)}
     )
 
     {request, response}
@@ -3381,6 +3381,14 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   def meter({request, other}), do: {request, other}
+
+  # Bounded HTTP status class for the s3.op tag. Req exposes no per-request timing on the
+  # response, so no duration measurement is added (it would need an extra request step).
+  defp status_class(s) when s in 200..299, do: "2xx"
+  defp status_class(s) when s in 300..399, do: "3xx"
+  defp status_class(s) when s in 400..499, do: "4xx"
+  defp status_class(s) when s in 500..599, do: "5xx"
+  defp status_class(_), do: "error"
 
   # Payload size in whichever direction the op moved: the response body for a GET, the request
   # body for a PUT/POST. S3's PUT response carries `content-length: 0`, so take the larger of the

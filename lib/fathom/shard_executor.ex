@@ -467,6 +467,8 @@ defmodule Fathom.ShardExecutor do
       # Per-query resource bounds (expert review 2026-07-14 #26) — distinct, non-SQLITE codes so a
       # client can tell "my query was too expensive" from an ordinary SQL error.
       {:error, :query_timeout} ->
+        query_error(:timeout)
+
         {:error,
          %Error{
            message: "query exceeded the statement timeout",
@@ -475,6 +477,8 @@ defmodule Fathom.ShardExecutor do
          }}
 
       {:error, {:too_many_rows, cap}} ->
+        query_error(:too_large)
+
         {:error,
          %Error{
            message: "result exceeded the #{cap}-row cap",
@@ -483,9 +487,15 @@ defmodule Fathom.ShardExecutor do
          }}
 
       {:error, reason} ->
+        query_error(if(reason == :busy, do: :busy, else: :sql_error))
         {:error, %Error{message: reason_to_string(reason), code: sqlite_code(reason)}}
     end
   end
+
+  # Failure-branch-only counter: statement failures by bounded class (never shard_id). No work is
+  # added to the success path.
+  defp query_error(class),
+    do: :telemetry.execute([:fathom, :shard, :query, :error], %{count: 1}, %{class: class})
 
   # Did this statement change the shard file? Check `num_changes` FIRST: an
   # `INSERT/UPDATE/DELETE ... RETURNING` returns columns *and* mutates rows, so the old
@@ -789,6 +799,12 @@ defmodule Fathom.ShardExecutor do
   # the fixed message and the reason goes to the server log (expert review 2026-10-13 #23).
   @doc false
   def no_quorum_error(shard_id, reason) do
+    :telemetry.execute([:fathom, :replication, :no_quorum], %{count: 1}, %{
+      reason: no_quorum_reason(reason)
+    })
+
+    query_error(:no_quorum)
+
     Logger.warning(
       "shard #{shard_id} write not replicated to a follower quorum: #{inspect(reason)}"
     )
@@ -799,6 +815,11 @@ defmodule Fathom.ShardExecutor do
       status: 503
     }
   end
+
+  defp no_quorum_reason({:no_quorum, why}), do: no_quorum_reason(why)
+  defp no_quorum_reason(why) when why in [:impossible, :catching_up, :timeout], do: why
+  defp no_quorum_reason({:session_down, :timeout}), do: :timeout
+  defp no_quorum_reason(_), do: :other
 
   defp begins_transaction?(sql) when is_binary(sql) do
     String.starts_with?(lead(sql, 5), "begin")

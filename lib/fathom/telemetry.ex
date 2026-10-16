@@ -392,7 +392,7 @@ defmodule Fathom.Telemetry do
       ),
       counter("fathom.s3.op.count",
         event_name: [:fathom, :s3, :op],
-        tags: [:op],
+        tags: [:op, :status_class],
         description:
           "S3 operations by HTTP method (get/put/head/delete) — cost + rate-limit headroom"
       ),
@@ -822,6 +822,23 @@ defmodule Fathom.Telemetry do
         event_name: [:fathom, :migrator, :template_drift],
         description:
           "Template/fleet migration drift detected at a revert — the template still carries a version the fleet pointer-flipped away from, so the next `makemigrations` builds on DDL the fleet does not have. Untagged on purpose: the metadata carries version NUMBERS, which are unbounded as labels"
+      ),
+      counter("fathom.shard.query.error.count",
+        event_name: [:fathom, :shard, :query, :error],
+        tags: [:class],
+        description:
+          "Failed statements by bounded class (timeout|too_large|busy|sql_error|no_quorum|other)"
+      ),
+      counter("fathom.replication.no_quorum.count",
+        event_name: [:fathom, :replication, :no_quorum],
+        tags: [:reason],
+        description: "Writes refused for want of a follower quorum, by reason"
+      ),
+      counter("fathom.hrana.auth.rejected.count",
+        event_name: [:fathom, :hrana, :auth, :rejected],
+        tags: [:reason],
+        description:
+          "Hrana auth rejections by classified reason (expired|invalid|wrong_shard|revoked|missing|other); the client sees one opaque 401"
       ),
 
       # Token revocation — degrades to a STALE floor, so a revoked token may still be accepted.
