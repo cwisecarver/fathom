@@ -26,6 +26,11 @@ defmodule Fathom.HealthPlug do
   import Plug.Conn
 
   @draining_key {__MODULE__, :draining}
+  @stats_key {__MODULE__, :stats}
+  # :atomics slots: 1 = /health probes served, 2 = non-200 probes, 3 = unix-ms of the last non-200.
+  @probes 1
+  @non_200 2
+  @last_non_200_ms 3
 
   @doc "Mark this node draining — `/health` returns 503 so the LB deregisters it (#28)."
   @spec begin_draining() :: :ok
@@ -39,6 +44,49 @@ defmodule Fathom.HealthPlug do
   @spec draining?() :: boolean()
   def draining?, do: :persistent_term.get(@draining_key, false)
 
+  @doc """
+  Probe counters for the admin UI: total `/health` probes served, how many were non-200, and the
+  wall-clock time of the last non-200 (`nil` if none). Held in an `:atomics` ref in `persistent_term`
+  (created lazily; a racing first create at worst loses a count) so the probe path stays lock-free.
+  """
+  @spec probe_stats() :: %{
+          probes: non_neg_integer(),
+          non_200: non_neg_integer(),
+          last_non_200_at: DateTime.t() | nil
+        }
+  def probe_stats do
+    ref = stats_ref()
+    last = :atomics.get(ref, @last_non_200_ms)
+
+    %{
+      probes: :atomics.get(ref, @probes),
+      non_200: :atomics.get(ref, @non_200),
+      last_non_200_at: if(last > 0, do: DateTime.from_unix!(last, :millisecond))
+    }
+  end
+
+  defp stats_ref do
+    case :persistent_term.get(@stats_key, nil) do
+      nil ->
+        ref = :atomics.new(3, signed: true)
+        :persistent_term.put(@stats_key, ref)
+        ref
+
+      ref ->
+        ref
+    end
+  end
+
+  defp record_probe(status) do
+    ref = stats_ref()
+    :atomics.add(ref, @probes, 1)
+
+    if status != 200 do
+      :atomics.add(ref, @non_200, 1)
+      :atomics.put(ref, @last_non_200_ms, System.system_time(:millisecond))
+    end
+  end
+
   @impl true
   def init(opts), do: opts
 
@@ -48,6 +96,8 @@ defmodule Fathom.HealthPlug do
     # serving normally, even if this node is cut from S3 (per-shard self-fencing is the right
     # granularity — see the module note).
     {status, body} = if draining?(), do: {503, "draining"}, else: {200, "ok"}
+
+    record_probe(status)
 
     conn
     |> put_resp_content_type("text/plain")

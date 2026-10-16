@@ -39,6 +39,7 @@ defmodule FathomWeb.AdminOverviewLive do
       |> assign(:metrics, snap.current)
       |> assign(:history, snap.history)
       |> assign(:fleet, initial_fleet(connected))
+      |> assign(:draining, Fathom.HealthPlug.draining?())
 
     {:ok, socket}
   end
@@ -65,6 +66,8 @@ defmodule FathomWeb.AdminOverviewLive do
       socket
       |> assign(:metrics, m)
       |> assign(:history, history)
+      # A persistent_term read — cheap on the 1 s metrics tick, and keeps the draining badge live.
+      |> assign(:draining, Fathom.HealthPlug.draining?())
       |> push_event("chart:qps-chart", %{x: m.at_ms / 1000, ys: [m.node_qps]})
       |> push_event("chart:latency-chart", %{
         x: m.at_ms / 1000,
@@ -86,6 +89,20 @@ defmodule FathomWeb.AdminOverviewLive do
   # those cases render permanently-empty panels. It is bounded: one query per tab at mount, versus
   # the old one per tab every 5 s forever. The O(viewers) amplification #13 is about was the
   # recurring poll, and that is gone either way.
+  # "12s ago" for a roster `last_seen_at` — the alive/stale badge's 30 s window made visible.
+  defp last_seen(nil), do: "—"
+
+  defp last_seen(%DateTime{} = at) do
+    case max(DateTime.diff(DateTime.utc_now(), at), 0) do
+      s when s < 120 -> "#{s}s ago"
+      s when s < 7200 -> "#{div(s, 60)}m ago"
+      s -> "#{div(s, 3600)}h ago"
+    end
+  end
+
+  # node_key is `name@host` — `@` and `.` break a CSS id selector, which tests (and hooks) use.
+  defp dom_safe(key), do: String.replace(key, ~r/[^A-Za-z0-9_-]/, "-")
+
   defp initial_fleet(false), do: nil
 
   defp initial_fleet(true) do
@@ -108,7 +125,14 @@ defmodule FathomWeb.AdminOverviewLive do
     ~H"""
     <Layouts.admin flash={@flash} active={:overview} node_key={@node_key}>
       <:actions>
-        <span class="hidden text-xs text-base-content/50 sm:inline">this node · 5m window</span>
+        <%!-- Every tile except the Nodes/Migrations panels is THIS node's view (expert review
+             2026-10-15 #7): shown at all widths, not `hidden sm:inline`. --%>
+        <.badge kind={:info}>
+          <span id="scope-this-node">this node · 5m window</span>
+        </.badge>
+        <.badge :if={@draining} kind={:warn}>
+          <span id="draining-this-node">draining</span>
+        </.badge>
       </:actions>
 
       <div class="space-y-6">
@@ -266,7 +290,13 @@ defmodule FathomWeb.AdminOverviewLive do
                 <tr class="border-b border-base-300">
                   <th class="py-2 text-left font-medium">Node</th>
                   <th class="py-2 text-right font-medium">q/s</th>
-                  <th class="py-2 text-right font-medium">p99</th>
+                  <th
+                    class="py-2 text-right font-medium"
+                    title="99th percentile of this node's per-shard q/s (its hottest shards), not a latency"
+                  >
+                    hot-shard p99 q/s
+                  </th>
+                  <th class="py-2 text-right font-medium">Last seen</th>
                   <th class="py-2 text-right font-medium">Status</th>
                 </tr>
               </thead>
@@ -277,14 +307,26 @@ defmodule FathomWeb.AdminOverviewLive do
                     {fmt_rate(Map.get(@fleet.node_load, n.node_key, 0))}
                   </td>
                   <td class="num py-1.5 text-right text-base-content/60">{fmt_rate(n.q_p99)}</td>
+                  <td
+                    id={"node-last-seen-#{dom_safe(n.node_key)}"}
+                    class="num py-1.5 text-right text-base-content/60"
+                  >
+                    {last_seen(n.last_seen_at)}
+                  </td>
                   <td class="py-1.5 text-right">
                     <.badge kind={if(n.alive, do: :ok, else: :error)}>
                       {if(n.alive, do: "alive", else: "stale")}
                     </.badge>
+                    <.badge
+                      :if={@draining and n.node_key == @node_key}
+                      kind={:warn}
+                    >
+                      draining
+                    </.badge>
                   </td>
                 </tr>
                 <tr :if={@fleet.nodes == []}>
-                  <td colspan="4" class="py-6 text-center text-sm text-base-content/40">
+                  <td colspan="5" class="py-6 text-center text-sm text-base-content/40">
                     No nodes reporting (enable the load reporter).
                   </td>
                 </tr>

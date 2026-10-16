@@ -23,6 +23,7 @@ defmodule Fathom.Rebalancer.RebalanceJob do
 
   alias Fathom.Rebalancer.{
     Commands,
+    DecisionLog,
     HandoffJob,
     LbApply,
     LoadSamples,
@@ -94,12 +95,19 @@ defmodule Fathom.Rebalancer.RebalanceJob do
     # hot shard warm-cached, so a handoff prefers a warm target. Same freshness as liveness.
     warm_locations = WarmLocations.warm_nodes(node_stale_ms())
 
-    case Policy.propose(samples, overrides, backends,
-           ineligible: ineligible_shards(samples),
-           fleet_p99: fleet_p99,
-           warm_locations: warm_locations,
-           alive_nodes: alive
-         ) do
+    {moves, declined} =
+      Policy.propose_traced(samples, overrides, backends,
+        ineligible: ineligible_shards(samples),
+        fleet_p99: fleet_p99,
+        warm_locations: warm_locations,
+        alive_nodes: alive
+      )
+
+    # Observability only (expert review 2026-10-15 #13): the decision above is already made, and
+    # recording never raises, so it cannot change or fail a tick.
+    DecisionLog.record_tick(moves, declined)
+
+    case moves do
       [] ->
         :ok
 

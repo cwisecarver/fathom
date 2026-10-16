@@ -32,7 +32,7 @@ defmodule Fathom.Rebalancer.LbApply do
   """
   require Logger
 
-  alias Fathom.Rebalancer.LbMap
+  alias Fathom.Rebalancer.{DecisionLog, LbMap}
   alias Fathom.Repo
 
   # A fixed application key for the fleet-wide LB-map advisory lock (finding #10) — any
@@ -106,7 +106,7 @@ defmodule Fathom.Rebalancer.LbApply do
             :ok
 
           {:error, _} = err ->
-            emit(reload_outcome(err))
+            emit(reload_outcome(err), err)
             err
         end
 
@@ -132,13 +132,13 @@ defmodule Fathom.Rebalancer.LbApply do
               :ok
 
             {:error, _} = err ->
-              emit(reload_outcome(err))
+              emit(reload_outcome(err), err)
               err
           end
         end
 
       {:error, reason} ->
-        emit(promote_error_outcome(reason))
+        emit(promote_error_outcome(reason), {:error, reason})
         {:error, reason}
 
       :contended ->
@@ -146,7 +146,7 @@ defmodule Fathom.Rebalancer.LbApply do
         # pooled connection on it. The DB override is already committed, so the leader's
         # periodic re-render applies it within a tick and a handoff's own apply! retries;
         # return an error so a handoff doesn't drain against a flip that isn't live yet (#11).
-        emit(:lock_contended)
+        emit(:lock_contended, {:error, :lock_contended})
         {:error, :lock_contended}
     end
   end
@@ -154,8 +154,29 @@ defmodule Fathom.Rebalancer.LbApply do
   # The LB-apply health signal (rebalancer telemetry): a rising :reload_failed /
   # :reload_timeout / :config_test_failed is the fleet-routing-at-risk alert (#3/#11); :noop
   # dominates (the per-tick re-render) and confirms the loop is live; :applied is a real flip.
-  defp emit(outcome) do
+  defp emit(outcome, error \\ nil) do
     :telemetry.execute([:fathom, :rebalancer, :lb_apply], %{count: 1}, %{outcome: outcome})
+    record_status(outcome, error)
+  end
+
+  # Last-apply status for /admin/rebalancer (expert review 2026-10-15 #13): outcome, time, the
+  # sha256 of the map file now ON DISK, its pin-entry count, and the error if the apply failed.
+  # Diagnostics only — never raises (DecisionLog writes are no-ops without the table, and an
+  # unreadable file just leaves hash/entries nil).
+  defp record_status(outcome, error) do
+    {hash, entries} =
+      with path when is_binary(path) <- Application.get_env(:fathom, :lb_map_path),
+           {:ok, content} <- File.read(path) do
+        {content_hash(content), LbMap.entry_count(content)}
+      else
+        _ -> {nil, nil}
+      end
+
+    DecisionLog.record_lb_apply(outcome,
+      error: error && inspect(error, limit: 20, printable_limit: 300),
+      hash: hash,
+      entries: entries
+    )
   end
 
   # Non-blocking advisory lock (finding #10, hardened per review 2026-07-09 #2): pg_TRY, so a

@@ -72,13 +72,46 @@ defmodule Fathom.Rebalancer.Policy do
           reason: String.t()
         }
 
+  @typedoc """
+  A hot candidate the policy did NOT move, with the first guard that declined it (admin
+  observability, expert review 2026-10-15 #13). `guard` is one of `:not_backend`, `:cooldown`,
+  `:ineligible`, `:unconfirmed`, `:no_improving_target`, `:max_moves`.
+  """
+  @type decline :: %{
+          shard_id: String.t(),
+          node_key: String.t(),
+          q_per_s: float(),
+          guard:
+            :not_backend
+            | :cooldown
+            | :ineligible
+            | :unconfirmed
+            | :no_improving_target
+            | :max_moves
+        }
+
   @doc """
   Proposes moves from `samples` (a short recent history), the current `overrides` (for
   cooldown), and the `backends` set (`%{node_key => address}`, the candidate targets).
   Returns `[]` when nothing is safely worth moving.
+
+  Exactly the moves of `propose_traced/4` — that function IS the implementation, so recording
+  declines cannot change a decision.
   """
   @spec propose([map()], [map()], %{optional(String.t()) => String.t()}, keyword()) :: [move()]
   def propose(samples, overrides, backends, opts \\ []) do
+    {moves, _declined} = propose_traced(samples, overrides, backends, opts)
+    moves
+  end
+
+  @doc """
+  `propose/4` plus the hot candidates that were NOT moved, each tagged with the first guard that
+  declined it. Only candidates that cleared the hot bar are reported (a cold shard is not a
+  "decline"). Pure.
+  """
+  @spec propose_traced([map()], [map()], %{optional(String.t()) => String.t()}, keyword()) ::
+          {[move()], [decline()]}
+  def propose_traced(samples, overrides, backends, opts \\ []) do
     floor = Keyword.get(opts, :floor, Application.get_env(:fathom, :rebalance_hot_qps_floor))
     fleet_p99 = Keyword.get(opts, :fleet_p99)
     # Whether the ORCHESTRATOR is driving detection with a fleet p99 (the key is present even
@@ -111,17 +144,36 @@ defmodule Fathom.Rebalancer.Policy do
     # (a hot shard's current node is inherently reporting).
     target_keys = target_keys(backend_keys, alive_nodes)
 
-    latest
-    |> Map.values()
-    |> Enum.filter(&(&1.q_per_s >= threshold and threshold > 0.0))
-    |> Enum.filter(&(&1.node_key in backend_keys))
-    |> Enum.reject(&(&1.shard_id in cooling))
-    |> Enum.reject(&MapSet.member?(ineligible, &1.shard_id))
-    |> Enum.filter(&confirmed_hot?(&1, samples, threshold, confirm))
+    hot =
+      latest
+      |> Map.values()
+      |> Enum.filter(&(&1.q_per_s >= threshold and threshold > 0.0))
+
+    # Each guard is the same pure filter the chain always applied, in the same order; a declined
+    # candidate is recorded against the FIRST guard that rejected it.
+    {candidates, declined} =
+      {hot, []}
+      |> guard(:not_backend, &(&1.node_key in backend_keys))
+      |> guard(:cooldown, &(&1.shard_id not in cooling))
+      |> guard(:ineligible, &(not MapSet.member?(ineligible, &1.shard_id)))
+      |> guard(:unconfirmed, &confirmed_hot?(&1, samples, threshold, confirm))
+
     # Hottest first, tie-broken by shard_id for a canonical (not iteration-order) choice (#18).
-    |> Enum.sort_by(&{-&1.q_per_s, &1.shard_id})
-    |> plan_moves(node_load, target_keys, threshold, max_moves, warm_locations, band)
+    sorted = Enum.sort_by(candidates, &{-&1.q_per_s, &1.shard_id})
+
+    {moves, plan_declined} =
+      plan_moves(sorted, node_load, target_keys, threshold, max_moves, warm_locations, band)
+
+    {moves, Enum.map(declined ++ plan_declined, &decline_entry/1)}
   end
+
+  defp guard({kept, declined}, name, keep?) do
+    {pass, fail} = Enum.split_with(kept, keep?)
+    {pass, declined ++ Enum.map(fail, &{name, &1})}
+  end
+
+  defp decline_entry({guard, s}),
+    do: %{shard_id: s.shard_id, node_key: s.node_key, q_per_s: s.q_per_s, guard: guard}
 
   # The viable target set: reporting nodes only. nil / empty alive ⇒ don't filter (fail-open —
   # the beat mechanism may be nascent, and the reconciler also fails open on an empty alive set).
@@ -135,21 +187,21 @@ defmodule Fathom.Rebalancer.Policy do
 
   # max_moves ≤ 0 means "make no moves" — short-circuit before the reduce, which otherwise
   # appended one move and only then checked the bound (#18).
-  defp plan_moves(_hot, _node_load, _keys, _threshold, max_moves, _warm, _band)
+  defp plan_moves(hot, _node_load, _keys, _threshold, max_moves, _warm, _band)
        when max_moves <= 0,
-       do: []
+       do: {[], Enum.map(hot, &{:max_moves, &1})}
 
   # Walk the hot shards (hottest first), assigning each to the best viable target, updating a
   # running projected node-load so we don't pile several onto one target in a single tick.
   # Stops at max_moves.
   defp plan_moves(hot, node_load, backend_keys, threshold, max_moves, warm_locations, band) do
-    {moves, _load} =
-      Enum.reduce_while(hot, {[], node_load}, fn s, {moves, load} ->
+    {moves, _load, declined} =
+      Enum.reduce_while(hot, {[], node_load, []}, fn s, {moves, load, declined} ->
         warm_nodes = Map.get(warm_locations, s.shard_id, MapSet.new())
 
         case best_target(s, load, backend_keys, warm_nodes, band) do
           nil ->
-            {:cont, {moves, load}}
+            {:cont, {moves, load, [{:no_improving_target, s} | declined]}}
 
           target ->
             move = %{
@@ -172,12 +224,18 @@ defmodule Fathom.Rebalancer.Policy do
             new_moves = [move | moves]
 
             if length(new_moves) >= max_moves,
-              do: {:halt, {new_moves, load}},
-              else: {:cont, {new_moves, load}}
+              do: {:halt, {new_moves, load, declined}},
+              else: {:cont, {new_moves, load, declined}}
         end
       end)
 
-    Enum.reverse(moves)
+    # Hot candidates the walk never reached (halted at max_moves) are declined by that cap.
+    visited =
+      MapSet.new(Enum.map(moves, & &1.shard_id) ++ Enum.map(declined, &elem(&1, 1).shard_id))
+
+    unvisited = for s <- hot, not MapSet.member?(visited, s.shard_id), do: {:max_moves, s}
+
+    {Enum.reverse(moves), Enum.reverse(declined) ++ unvisited}
   end
 
   # Pick a handoff target among the backends other than the source whose POST-move load stays

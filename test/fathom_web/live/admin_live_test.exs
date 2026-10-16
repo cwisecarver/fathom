@@ -165,6 +165,37 @@ defmodule FathomWeb.AdminLiveTest do
       refute has_element?(view, "#nodes-live-tile", "reporter off")
     end
 
+    # Expert review 2026-10-15 #7: the Nodes table's "p99" column is the p99 of per-shard q/s, not a
+    # latency; "alive" hid a 30 s window; draining read as alive; the scope label was hidden on
+    # narrow widths.
+    test "Nodes table is labelled as q/s, shows last-seen, scope and draining", %{conn: conn} do
+      on_exit(fn -> Fathom.HealthPlug.end_draining() end)
+      Fathom.HealthPlug.end_draining()
+      {:ok, view, _html} = conn |> auth() |> live("/admin")
+      me = Fathom.Rebalancer.node_key()
+      seen = DateTime.add(DateTime.utc_now(), -42, :second)
+
+      broadcast_fleet([
+        %{node_key: me, last_seen_at: seen, q_p99: 7.0, sample_count: 1, alive: true},
+        %{node_key: "other@h", last_seen_at: seen, q_p99: 1.0, sample_count: 1, alive: true}
+      ])
+
+      assert render(view) =~ "hot-shard p99 q/s"
+      assert has_element?(view, "#scope-this-node", "this node")
+
+      assert has_element?(
+               view,
+               "#node-last-seen-#{String.replace(me, ~r/[^A-Za-z0-9_-]/, "-")}",
+               "ago"
+             )
+
+      refute has_element?(view, "#draining-this-node")
+
+      Fathom.HealthPlug.begin_draining()
+      send(view.pid, {:metrics, metrics(%{})})
+      assert has_element?(view, "#draining-this-node")
+    end
+
     test "a collector broadcast updates the live KPIs", %{conn: conn} do
       {:ok, view, _html} = conn |> auth() |> live("/admin")
 

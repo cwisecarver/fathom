@@ -194,4 +194,34 @@ defmodule Fathom.Rebalancer.LbApplyTest do
     assert LbApply.apply!() == :ok
     assert File.read!(map_path) =~ "hot_1."
   end
+
+  # Expert review 2026-10-15 #13: the LB-apply outcome was a counter only. Invariant: the last apply's
+  # outcome, the on-disk map hash + pin count, and any error are readable for /admin/rebalancer.
+  test "apply! records the last outcome, map hash and pin count", %{map_path: map_path} do
+    {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
+    assert :ok = LbApply.apply!()
+
+    status = Fathom.Rebalancer.DecisionLog.lb_apply_status()
+    assert status.outcome == :applied
+    assert status.entries == 1
+
+    assert status.hash ==
+             :crypto.hash(:sha256, File.read!(map_path)) |> Base.encode16(case: :lower)
+
+    assert status.error == nil
+
+    assert :ok = LbApply.apply!()
+    assert Fathom.Rebalancer.DecisionLog.lb_apply_status().outcome == :noop
+  end
+
+  test "a rejected candidate records the failure and its error", %{map_path: map_path} do
+    File.write!(map_path, "# last-good map\n")
+    Application.put_env(:fathom, :lb_test_cmd, "false")
+    {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
+    assert {:error, _} = LbApply.apply!()
+
+    status = Fathom.Rebalancer.DecisionLog.lb_apply_status()
+    assert status.outcome == :config_test_failed
+    assert status.error =~ "config_test_failed"
+  end
 end

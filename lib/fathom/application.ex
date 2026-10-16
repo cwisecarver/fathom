@@ -812,7 +812,10 @@ defmodule Fathom.Application do
       # Runs handoff warm/drain commands concurrently off the CommandPoller (finding #8), so
       # a slow drain never head-of-line-blocks a warm the node needs. Unconditional + idle
       # when unused, so the poller (and tests that start_supervised it) can rely on it.
-      {Task.Supervisor, name: Fathom.Rebalancer.TaskSupervisor}
+      {Task.Supervisor, name: Fathom.Rebalancer.TaskSupervisor},
+      # In-memory ring of recent rebalancer decisions + last LB-apply status for /admin/rebalancer
+      # (expert review 2026-10-15 #13). Unconditional: it is an idle ETS table until written.
+      Fathom.Rebalancer.DecisionLog
     ] ++ reporter_children() ++ command_poller_children()
   end
 

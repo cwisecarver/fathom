@@ -300,4 +300,13 @@ defmodule Fathom.Rebalancer.LbMapTest do
            "without this nginx recycles a pooled conn every 1000 requests, re-opening the FIN " <>
              "race that keepalive_timeout closed only for the idle case"
   end
+
+  test "entry_count counts exactly the pin lines render/3 emitted" do
+    backends = %{"n1" => "n1:8080", "n2" => "n2:8080"}
+    pins = fn ids -> Enum.map(ids, &%{shard_id: &1, pinned_node: "n2"}) end
+
+    for ids <- [[], ["a"], ["a", "b", "c"]] do
+      assert LbMap.entry_count(LbMap.render(pins.(ids), backends, "fathom.test")) == length(ids)
+    end
+  end
 end

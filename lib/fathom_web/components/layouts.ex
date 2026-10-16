@@ -81,7 +81,8 @@ defmodule FathomWeb.Layouts do
 
   attr :active, :atom,
     default: nil,
-    doc: "the active nav item (:overview | :shards | :directory | :migrations | :query | :audit)"
+    doc:
+      "the active nav item (:overview | :shards | :directory | :migrations | :durability | :cluster | :rebalancer | :audit | :query)"
 
   attr :node_key, :string, default: ""
   slot :actions, doc: "top-bar right-aligned controls (e.g. a time-range picker)"
@@ -121,6 +122,12 @@ defmodule FathomWeb.Layouts do
               active={@active == :migrations}
               icon="hero-arrow-path"
               label="Migrations"
+            />
+            <.nav_item
+              navigate={~p"/admin/rebalancer"}
+              active={@active == :rebalancer}
+              icon="hero-scale"
+              label="Rebalancer"
             />
             <.nav_item
               navigate={~p"/admin/query"}

@@ -53,6 +53,7 @@ defmodule FathomWeb.Router do
       live "/directory", AdminDirectoryLive, :index
       live "/migrations", AdminMigrationsLive, :index
       live "/audit", AdminAuditLive, :index
+      live "/rebalancer", AdminRebalancerLive, :index
       live "/query", AdminQueryLive, :index
     end
   end

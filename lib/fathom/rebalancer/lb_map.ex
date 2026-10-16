@@ -115,6 +115,21 @@ defmodule Fathom.Rebalancer.LbMap do
     """
   end
 
+  @doc """
+  The number of pin entries in a rendered map (the lines between `default fathom_hrana;` and the
+  closing brace of the `map` block). Counts what `render/3` emits, so the admin page can show
+  "N pins live in the LB" without a second query that could disagree with the file.
+  """
+  @spec entry_count(String.t()) :: non_neg_integer()
+  def entry_count(content) do
+    content
+    |> String.split("\n")
+    |> Enum.drop_while(&(String.trim(&1) != "default fathom_hrana;"))
+    |> Enum.drop(1)
+    |> Enum.take_while(&(String.trim(&1) != "}"))
+    |> Enum.count(&(String.trim(&1) != ""))
+  end
+
   # An nginx upstream name for a node_key: [a-zA-Z0-9_] only (an IP like 10.0.0.12 → a
   # legal identifier), so the same key always renders to the same upstream name.
   @doc false
