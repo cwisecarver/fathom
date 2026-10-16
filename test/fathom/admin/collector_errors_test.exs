@@ -127,10 +127,15 @@ defmodule Fathom.Admin.CollectorErrorsTest do
   end
 
   test "rpo_under_reporting is set when watermark rows < open shards", %{pid: pid} do
+    # The first tick runs the (10 s throttled) RPO walk over the REAL node, where shards other
+    # tests left open may have no watermark row — so seed full coverage explicitly rather than
+    # assume a clean node (CI seed 609064 failed the old `refute` on the first tick).
+    _ = tick(pid)
+    :sys.replace_state(pid, &%{&1 | rpo_cov: {3, 3}})
     m = tick(pid)
     refute m.rpo_under_reporting
 
-    # The coverage is refreshed by the (10 s throttled) RPO walk, not per tick.
+    # The coverage is refreshed by the RPO walk, not per tick.
     :sys.replace_state(pid, &%{&1 | rpo_cov: {1, 3}})
     m = tick(pid)
     assert m.rpo_under_reporting

@@ -81,6 +81,8 @@ defmodule Fathom.Rebalancer.ReporterTest do
 
   # Expert review 2026-10-15 #7: the beat carries this node's health snapshot (jsonb).
   test "each tick publishes this node's health snapshot on the beat" do
+    # The draining flag is node-global; don't inherit it from an earlier test.
+    Fathom.HealthPlug.end_draining()
     pid = start_supervised!(Reporter)
     Ecto.Adapters.SQL.Sandbox.allow(Fathom.Repo, self(), pid)
 

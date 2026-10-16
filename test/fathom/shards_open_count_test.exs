@@ -130,6 +130,10 @@ defmodule Fathom.ShardsOpenCountTest do
       end)
     after
       _ = DynamicSupervisor.terminate_child(Fathom.ShardSupervisor, unreadable)
+      # drain_all/1 marks the node draining (a node-global persistent_term). Left set, every later
+      # test that reads HealthPlug.draining?/0 sees a draining node (it broke reporter_test's
+      # health-snapshot assertion under CI seed 609064).
+      Fathom.HealthPlug.end_draining()
     end
 
     assert_receive {:DOWN, ^ref, :process, ^pid, _}, 5_000
