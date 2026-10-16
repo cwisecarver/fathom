@@ -81,7 +81,7 @@ defmodule Fathom.Admin.FleetCollector do
   data). Without the collector (dashboard gating off, tests) there is no table and it computes
   uncached.
   """
-  @spec migrations_page() :: %{mig: map(), oban: list()}
+  @spec migrations_page() :: %{mig: map(), oban: list(), jobs: map(), lifecycle: map()}
   def migrations_page, do: migrations_page(&compute_page/0)
 
   @doc false
@@ -97,7 +97,18 @@ defmodule Fathom.Admin.FleetCollector do
     end
   end
 
-  defp compute_page, do: %{mig: Fleet.migrations(), oban: Fleet.oban_counts()}
+  defp compute_page do
+    oban = Fleet.oban_counts()
+
+    %{
+      mig: Fleet.migrations(),
+      oban: oban,
+      # Expert review 2026-10-15 #12/#18: the jobs + lifecycle panels ride this same single-flight
+      # cache, so their Postgres reads are once per node per TTL, never per viewer.
+      jobs: %{health: Fleet.oban_health(), failed: Fleet.failed_jobs()},
+      lifecycle: Fleet.lifecycle(oban)
+    }
+  end
 
   # SINGLE-FLIGHT refill (expert review 2026-10-13 #28). At TTL expiry every open tab's async task
   # (and every caller) used to recompute at once, so the directory-scale reads behind this page ran

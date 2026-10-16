@@ -82,6 +82,7 @@ defmodule Fathom.Admin.Fleet do
   @spec migrations() :: map()
   def migrations do
     head = Migrator.head()
+    failed_ids = Directory.failed_shard_ids(@failed_sample)
 
     %{
       head: head,
@@ -95,8 +96,158 @@ defmodule Fathom.Admin.Fleet do
       laggard_count: Directory.count_laggards(head),
       laggards: Directory.laggards(head, 50),
       failed_shard_count: Directory.count_failed(),
-      failed_shard_ids: Directory.failed_shard_ids(@failed_sample)
+      failed_shard_ids: failed_ids
     }
+    |> Map.merge(rollout(head))
+    |> Map.put(:failed_details, failed_details(failed_ids))
+  end
+
+  @doc """
+  The rollout's progress numbers (expert review 2026-10-15 #19): the active-shard
+  `schema_version` histogram, cutovers in the last hour (`Directory.count_cutovers_since/2`, the
+  fleet-wide figure the deploy gate also reads), and an ETA = laggards / rate. `eta_seconds` is
+  `nil` when nothing cut over in the window (no rate to extrapolate), and `0` once converged.
+  """
+  @spec rollout(non_neg_integer() | nil) :: %{
+          histogram: [{non_neg_integer(), non_neg_integer()}],
+          cutovers_last_hour: non_neg_integer(),
+          eta_seconds: non_neg_integer() | nil
+        }
+  def rollout(head) do
+    since = DateTime.add(DateTime.utc_now(), -3_600, :second)
+    cutovers = if head, do: Directory.count_cutovers_since(head, since), else: 0
+    laggards = if head, do: Directory.count_laggards(head), else: 0
+
+    eta =
+      cond do
+        laggards == 0 -> 0
+        cutovers == 0 -> nil
+        true -> round(laggards / cutovers * 3_600)
+      end
+
+    %{
+      histogram: Directory.count_by_schema_version(),
+      cutovers_last_hour: cutovers,
+      eta_seconds: eta
+    }
+  end
+
+  @doc """
+  The last error + attempt for the quarantined shards on screen (expert review 2026-10-15 #19),
+  read from DISCARDED `oban_jobs` filtered to exactly those ids (at most `@failed_sample`), newest
+  discard per shard, never the whole table. `%{shard_id => %{attempt, worker, error}}`.
+  """
+  @spec failed_details([String.t()]) :: %{String.t() => map()}
+  def failed_details([]), do: %{}
+
+  def failed_details(ids) when is_list(ids) do
+    from(j in Oban.Job,
+      where: j.state == "discarded" and fragment("?->>'shard_id' = ANY(?)", j.args, ^ids),
+      order_by: [desc: j.id],
+      limit: 200,
+      select: %{
+        shard_id: fragment("?->>'shard_id'", j.args),
+        worker: j.worker,
+        attempt: j.attempt,
+        errors: j.errors
+      }
+    )
+    |> Repo.all()
+    |> Enum.reduce(%{}, fn row, acc ->
+      Map.put_new(acc, row.shard_id, %{
+        worker: row.worker,
+        attempt: row.attempt,
+        error: last_error_line(row.errors)
+      })
+    end)
+  rescue
+    _ -> %{}
+  end
+
+  @failed_jobs_limit 25
+
+  @doc """
+  The newest discarded jobs for the Failed jobs table (expert review 2026-10-15 #12): worker,
+  `shard_id` arg (if the job has one), attempt, and the first line of the last error. Bounded to
+  #{@failed_jobs_limit} rows on Oban's `state`-leading index.
+  """
+  @spec failed_jobs() :: [map()]
+  def failed_jobs do
+    from(j in Oban.Job,
+      where: j.state == "discarded",
+      order_by: [desc: j.id],
+      limit: @failed_jobs_limit,
+      select: %{
+        id: j.id,
+        worker: j.worker,
+        shard_id: fragment("?->>'shard_id'", j.args),
+        attempt: j.attempt,
+        max_attempts: j.max_attempts,
+        errors: j.errors,
+        discarded_at: j.discarded_at
+      }
+    )
+    |> Repo.all()
+    |> Enum.map(fn r ->
+      r |> Map.delete(:errors) |> Map.put(:error, last_error_line(r.errors))
+    end)
+  rescue
+    _ -> []
+  end
+
+  @doc """
+  First line of the LAST recorded error (`oban_jobs.errors` is a list of `%{"error" => text}`,
+  oldest first), trimmed to 200 chars. `nil` when the job recorded none.
+  """
+  @spec last_error_line(list() | nil) :: String.t() | nil
+  def last_error_line(errors) when is_list(errors) and errors != [] do
+    case List.last(errors) do
+      %{"error" => text} when is_binary(text) ->
+        text |> String.split("\n", parts: 2) |> hd() |> String.slice(0, 200)
+
+      _ ->
+        nil
+    end
+  end
+
+  def last_error_line(_), do: nil
+
+  @delete_worker "Fathom.Tenants.DeleteJob"
+
+  @doc """
+  The Lifecycle panel's Postgres-side numbers (expert review 2026-10-15 #18): the age of the oldest
+  deleted-but-not-purge-verified tombstone (the erasure-overdue signal) and the discarded
+  `DeleteJob` count (summed from the already-fetched `oban_counts/0` rows, no extra query), plus
+  THIS node's deny-set load state. Suspended/deleted counts come from the overview's `by_status`.
+  """
+  @spec lifecycle([map()]) :: map()
+  def lifecycle(oban_rows) do
+    oldest =
+      try do
+        Directory.oldest_unverified_deletion()
+      rescue
+        _ -> nil
+      end
+
+    %{
+      oldest_unverified_deletion_age_s:
+        oldest && max(0, DateTime.diff(DateTime.utc_now(), oldest, :second)),
+      delete_jobs_discarded:
+        for(
+          %{worker: @delete_worker, state: "discarded", count: c} <- oban_rows,
+          reduce: 0,
+          do: (acc -> acc + c)
+        ),
+      denylist: Fathom.Tenants.DenyList.status()
+    }
+  end
+
+  @doc "Queue depth/age and cron freshness for the jobs panel; `nil` fields when Postgres is down."
+  @spec oban_health() :: %{queues: list(), crons: list()}
+  def oban_health do
+    Fathom.Admin.ObanHealth.snapshot()
+  rescue
+    _ -> %{queues: [], crons: []}
   end
 
   @doc "The fleet's currently-hot shards (merged from every node's reported load), hottest first, top 50."
@@ -118,21 +269,26 @@ defmodule Fathom.Admin.Fleet do
   @oban_live_states ~w(available scheduled executing retryable discarded cancelled)
 
   @doc """
-  Oban job counts grouped by `{queue, state}` for the background-jobs panel.
+  Oban job counts grouped by `{queue, worker, state}` for the background-jobs panel (expert review
+  2026-10-15 #12: the per-worker split is what tells a stuck `DeleteJob` from a stuck migration).
 
   Bounded to the actionable states (`#{inspect(@oban_live_states)}`) — see the note above on why
   `completed` is excluded.
   """
-  @spec oban_counts() :: [%{queue: String.t(), state: String.t(), count: non_neg_integer()}]
+  @spec oban_counts() :: [
+          %{queue: String.t(), worker: String.t(), state: String.t(), count: non_neg_integer()}
+        ]
   def oban_counts do
     from(j in Oban.Job,
       where: j.state in ^@oban_live_states,
-      group_by: [j.queue, j.state],
-      select: {j.queue, j.state, count(j.id)}
+      group_by: [j.queue, j.worker, j.state],
+      select: {j.queue, j.worker, j.state, count(j.id)}
     )
     |> Repo.all()
-    |> Enum.map(fn {queue, state, count} -> %{queue: queue, state: state, count: count} end)
-    |> Enum.sort_by(&{&1.queue, &1.state})
+    |> Enum.map(fn {queue, worker, state, count} ->
+      %{queue: queue, worker: worker, state: state, count: count}
+    end)
+    |> Enum.sort_by(&{&1.queue, &1.worker, &1.state})
   rescue
     _ -> []
   end

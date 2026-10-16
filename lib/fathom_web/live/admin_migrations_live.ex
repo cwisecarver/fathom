@@ -35,7 +35,14 @@ defmodule FathomWeb.AdminMigrationsLive do
   @impl true
   def mount(_params, _session, socket) do
     connected = connected?(socket)
-    if connected, do: Process.send_after(self(), :refresh_fleet, @fleet_refresh_ms)
+
+    if connected do
+      Process.send_after(self(), :refresh_fleet, @fleet_refresh_ms)
+      # Suspended/deleted counts for the Lifecycle panel ride the existing per-node FleetCollector
+      # roll-up (`by_status` is already in it) instead of a second directory-scale group-by here.
+      Phoenix.PubSub.subscribe(Fathom.PubSub, FleetCollector.topic())
+      FleetCollector.watch()
+    end
 
     socket =
       socket
@@ -43,9 +50,21 @@ defmodule FathomWeb.AdminMigrationsLive do
       |> assign(:node_key, Fathom.Rebalancer.node_key())
       |> assign(:mig, nil)
       |> assign(:oban, nil)
+      |> assign(:jobs, nil)
+      |> assign(:lifecycle, nil)
+      |> assign(:by_status, initial_by_status(connected))
       |> load_fleet(connected)
 
     {:ok, socket}
+  end
+
+  defp initial_by_status(false), do: nil
+
+  defp initial_by_status(true) do
+    case FleetCollector.snapshot() do
+      %{by_status: by_status} -> by_status
+      _ -> nil
+    end
   end
 
   defp load_fleet(socket, false), do: socket
@@ -60,9 +79,19 @@ defmodule FathomWeb.AdminMigrationsLive do
     {:noreply, load_fleet(socket, true)}
   end
 
+  def handle_info({:fleet, %{by_status: by_status}}, socket),
+    do: {:noreply, assign(socket, :by_status, by_status)}
+
+  def handle_info({:fleet, _}, socket), do: {:noreply, socket}
+
   @impl true
-  def handle_async(:fleet, {:ok, %{mig: mig, oban: oban}}, socket) do
-    {:noreply, socket |> assign(:mig, mig) |> assign(:oban, oban)}
+  def handle_async(:fleet, {:ok, %{mig: mig, oban: oban} = page}, socket) do
+    {:noreply,
+     socket
+     |> assign(:mig, mig)
+     |> assign(:oban, oban)
+     |> assign(:jobs, page.jobs)
+     |> assign(:lifecycle, page.lifecycle)}
   end
 
   # Keep the last-good data if a refresh crashes — a Postgres blip shouldn't blank the page.
@@ -89,6 +118,12 @@ defmodule FathomWeb.AdminMigrationsLive do
             accent="text-error"
           />
           <.stat_tile label="Releases" value={fmt_int(length(@mig.releases))} />
+        </div>
+
+        <div id="rollout-rate" class="grid grid-cols-2 gap-4 lg:grid-cols-3">
+          <.stat_tile label="Cutovers / last hour" value={fmt_int(@mig.cutovers_last_hour)} />
+          <.stat_tile label="ETA to converge" value={fmt_eta(@mig.eta_seconds)} />
+          <.stat_tile label="Schema versions in use" value={fmt_int(length(@mig.histogram))} />
         </div>
 
         <div :if={@mig.review_blocks != []} id="review-blocks">
@@ -187,24 +222,183 @@ defmodule FathomWeb.AdminMigrationsLive do
               active shards are still behind <span class="num">v{@mig.head}</span>
               . The hourly reconcile sweep + lazy migrate converge the cold tail.
             </p>
-            <div :if={@mig.failed_shard_count > 0} class="mt-4 border-t border-base-300 pt-3">
+            <div id="version-histogram" class="mt-4 border-t border-base-300 pt-3">
+              <div class="mb-2 text-[11px] uppercase tracking-wide text-base-content/50">
+                Active shards by schema version
+              </div>
+              <div :if={@mig.histogram == []} class="text-sm text-base-content/40">
+                No active shards.
+              </div>
+              <table :if={@mig.histogram != []} class="w-full text-sm">
+                <tbody>
+                  <tr :for={{v, n} <- @mig.histogram} class="border-b border-base-300/50">
+                    <td class="num py-1">v{v}</td>
+                    <td class="num py-1 text-right">{fmt_int(n)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div
+              :if={@mig.failed_shard_count > 0}
+              id="quarantined"
+              class="mt-4 border-t border-base-300 pt-3"
+            >
               <div class="mb-2 text-[11px] uppercase tracking-wide text-base-content/50">
                 Quarantined shards
               </div>
-              <div class="flex flex-wrap gap-1.5">
-                <.badge :for={id <- @mig.failed_shard_ids} kind={:error}>
-                  <.link navigate={~p"/admin/shards/#{id}"}>{id}</.link>
-                </.badge>
-              </div>
+              <table class="w-full text-sm">
+                <tbody>
+                  <tr
+                    :for={id <- @mig.failed_shard_ids}
+                    id={"quarantined-#{id}"}
+                    class="border-b border-base-300/50 align-top"
+                  >
+                    <td class="py-1.5">
+                      <.link navigate={~p"/admin/shards/#{id}"} class="link">{id}</.link>
+                    </td>
+                    <td class="py-1.5 text-xs text-base-content/70">
+                      <span :if={d = @mig.failed_details[id]}>
+                        attempt {d.attempt} · {d.error || "no error recorded"}
+                      </span>
+                      <span :if={!@mig.failed_details[id]} class="text-base-content/40">
+                        no discarded job on record
+                      </span>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
             </div>
           </.panel>
         </div>
 
+        <.panel title="Tenant lifecycle">
+          <div :if={@lifecycle} id="lifecycle">
+            <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
+              <.stat_tile label="Suspended" value={fmt_int(by_status(@by_status, "suspended"))} />
+              <.stat_tile
+                label="Deleted (tombstones)"
+                value={fmt_int(by_status(@by_status, "deleted"))}
+              />
+              <.stat_tile
+                label="Oldest unverified purge"
+                value={fmt_age_s(@lifecycle.oldest_unverified_deletion_age_s)}
+                accent={if(@lifecycle.oldest_unverified_deletion_age_s, do: "text-warning")}
+              />
+              <.stat_tile
+                label="Discarded delete jobs"
+                value={fmt_int(@lifecycle.delete_jobs_discarded)}
+                accent={if(@lifecycle.delete_jobs_discarded > 0, do: "text-error")}
+              />
+            </div>
+            <div class="mt-3 flex flex-wrap items-center gap-2 text-xs text-base-content/60">
+              This node's deny sets:
+              <span id="denylist-tombstones">
+                <.badge kind={denylist_kind(@lifecycle.denylist.tombstones)}>
+                  tombstones {@lifecycle.denylist.tombstones}
+                </.badge>
+              </span>
+              <span id="denylist-suspensions">
+                <.badge kind={denylist_kind(@lifecycle.denylist.suspensions)}>
+                  suspensions {@lifecycle.denylist.suspensions}
+                </.badge>
+              </span>
+            </div>
+          </div>
+        </.panel>
+
+        <.panel title="Queue health">
+          <div :if={@jobs} id="queue-health">
+            <table class="w-full text-sm">
+              <thead class="text-[11px] uppercase tracking-wide text-base-content/50">
+                <tr class="border-b border-base-300">
+                  <th class="py-2 text-left font-medium">Queue</th>
+                  <th class="py-2 text-right font-medium">Available</th>
+                  <th class="py-2 text-right font-medium">Retryable</th>
+                  <th class="py-2 text-right font-medium">Oldest available</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  :for={q <- @jobs.health.queues}
+                  id={"queue-#{q.queue}"}
+                  class="border-b border-base-300/50"
+                >
+                  <td class="py-1.5">{q.queue}</td>
+                  <td class="num py-1.5 text-right">{fmt_int(q.available)}</td>
+                  <td class="num py-1.5 text-right">{fmt_int(q.retryable)}</td>
+                  <td class="num py-1.5 text-right">{fmt_age_s(div(q.oldest_age_ms, 1000))}</td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="mt-4 border-t border-base-300 pt-3">
+              <div class="mb-2 text-[11px] uppercase tracking-wide text-base-content/50">
+                Cron freshness (last ran)
+              </div>
+              <div :if={@jobs.health.crons == []} class="text-sm text-base-content/40">
+                No cron has inserted a job yet.
+              </div>
+              <div
+                :for={c <- @jobs.health.crons}
+                id={"cron-#{c.worker}"}
+                class="flex justify-between border-b border-base-300/50 py-1 text-sm"
+              >
+                <span class="text-base-content/80">{c.worker}</span>
+                <span class="num">{fmt_age_s(div(c.age_ms, 1000))} ago</span>
+              </div>
+            </div>
+          </div>
+        </.panel>
+
         <.panel title="Background jobs">
           <div :if={@oban == []} class="text-sm text-base-content/40">No jobs.</div>
-          <div class="flex flex-wrap gap-2">
-            <.badge :for={j <- @oban} kind={oban_kind(j.state)}>{j.queue}/{j.state} {j.count}</.badge>
+          <table :if={@oban != []} id="oban-by-worker" class="w-full text-sm">
+            <tbody>
+              <tr :for={j <- @oban} class="border-b border-base-300/50">
+                <td class="py-1.5">{j.queue}</td>
+                <td class="py-1.5 text-base-content/70">{j.worker}</td>
+                <td class="py-1.5">
+                  <.badge kind={oban_kind(j.state)}>{j.state}</.badge>
+                </td>
+                <td class="num py-1.5 text-right">{fmt_int(j.count)}</td>
+              </tr>
+            </tbody>
+          </table>
+        </.panel>
+
+        <.panel title="Failed jobs (newest 25)">
+          <div
+            :if={@jobs && @jobs.failed == []}
+            id="failed-jobs-empty"
+            class="text-sm text-base-content/40"
+          >
+            No discarded jobs.
           </div>
+          <table :if={@jobs && @jobs.failed != []} id="failed-jobs" class="w-full text-sm">
+            <thead class="text-[11px] uppercase tracking-wide text-base-content/50">
+              <tr class="border-b border-base-300">
+                <th class="py-2 text-left font-medium">Worker</th>
+                <th class="py-2 text-left font-medium">Shard</th>
+                <th class="py-2 text-right font-medium">Attempt</th>
+                <th class="py-2 text-left font-medium">Error</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                :for={f <- @jobs.failed}
+                id={"failed-job-#{f.id}"}
+                class="border-b border-base-300/50 align-top"
+              >
+                <td class="py-1.5">{f.worker}</td>
+                <td class="py-1.5">
+                  <.link :if={f.shard_id} navigate={~p"/admin/shards/#{f.shard_id}"} class="link">
+                    {f.shard_id}
+                  </.link>
+                </td>
+                <td class="num py-1.5 text-right">{f.attempt}/{f.max_attempts}</td>
+                <td class="py-1.5 text-xs text-base-content/70">{f.error || "—"}</td>
+              </tr>
+            </tbody>
+          </table>
         </.panel>
       </div>
     </Layouts.admin>
@@ -243,6 +437,25 @@ defmodule FathomWeb.AdminMigrationsLive do
 
   defp detail_gap(%{detail: %{"gap" => g}}) when is_binary(g), do: g
   defp detail_gap(_), do: nil
+
+  # The per-shard page (`/admin/shards/:id`) lands from another team; a plain path (not `~p`) so
+  # this compiles before that route exists and does not warn. Swap to `~p` once it is merged.
+
+  defp by_status(nil, _), do: nil
+  defp by_status(map, key), do: Map.get(map, key, 0)
+
+  defp denylist_kind(:ok), do: :ok
+  defp denylist_kind(_), do: :error
+
+  defp fmt_eta(nil), do: "—"
+  defp fmt_eta(0), do: "converged"
+  defp fmt_eta(s), do: fmt_age_s(s)
+
+  defp fmt_age_s(nil), do: "—"
+  defp fmt_age_s(s) when s < 60, do: "#{s}s"
+  defp fmt_age_s(s) when s < 3_600, do: "#{div(s, 60)}m"
+  defp fmt_age_s(s) when s < 86_400, do: "#{div(s, 3_600)}h #{div(rem(s, 3_600), 60)}m"
+  defp fmt_age_s(s), do: "#{div(s, 86_400)}d #{div(rem(s, 86_400), 3_600)}h"
 
   defp oban_kind("completed"), do: :ok
   defp oban_kind("executing"), do: :info

@@ -1269,6 +1269,41 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  Active shards per `schema_version` — the rollout histogram (expert review 2026-10-15 #19). One
+  group-by served by `shards_active_schema_version_last_active_at_index`; the result is bounded by
+  the number of distinct versions, not shards. `[{version, count}]` ascending by version.
+  """
+  @spec count_by_schema_version() :: [{non_neg_integer(), non_neg_integer()}]
+  def count_by_schema_version do
+    Repo.all(
+      from s in Shard,
+        where: s.status == "active",
+        group_by: s.schema_version,
+        order_by: s.schema_version,
+        select: {s.schema_version, count(s.id)}
+    )
+  end
+
+  @doc """
+  The deletion time of the OLDEST tombstoned shard whose purge has not been verified clean, or
+  `nil` when there is none (expert review 2026-10-15 #18) — the erasure-overdue signal. `updated_at`
+  is the deletion time (`mark_purge_verified/2` deliberately never touches it). Served by the
+  partial `shards_deleted_sweep_index` (`status = 'deleted'`, ordered by `updated_at`, with
+  `purge_verified_at` INCLUDEd): an index-only walk from the oldest tombstone that stops at the first
+  unverified row. It never touches the heap, and only deleted rows (not the fleet) are in the index.
+  """
+  @spec oldest_unverified_deletion() :: DateTime.t() | nil
+  def oldest_unverified_deletion do
+    Repo.one(
+      from s in Shard,
+        where: s.status == "deleted" and is_nil(s.purge_verified_at),
+        order_by: [asc: s.updated_at],
+        limit: 1,
+        select: s.updated_at
+    )
+  end
+
+  @doc """
   How many active shards are at `version` — the aggregate count (#12) for a revert-status gauge,
   without materializing the (potentially millions-large) set — the unbounded `shards_at_version/1`
   this replaced (expert review 2026-07-18 #12) was removed 2026-10-01 as dead code.

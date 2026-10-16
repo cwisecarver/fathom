@@ -38,6 +38,8 @@ defmodule Fathom.Tenants.DenyList do
   @doc "Emit the degraded signal for `kind` (`:tombstones` | `:suspensions`) with the failure `reason`."
   @spec degraded(atom(), term()) :: :ok
   def degraded(kind, reason) do
+    put_status(kind, :degraded)
+
     :telemetry.execute(
       [:fathom, :tenants, :denylist, :degraded],
       %{count: 1},
@@ -48,10 +50,33 @@ defmodule Fathom.Tenants.DenyList do
   @doc "Emit the recovered signal for `kind` when a retry lands the set (pairs with `degraded/2`)."
   @spec recovered(atom()) :: :ok
   def recovered(kind) do
+    put_status(kind, :ok)
+
     :telemetry.execute(
       [:fathom, :tenants, :denylist, :recovered],
       %{count: 1},
       %{kind: kind}
     )
   end
+
+  @doc """
+  This node's deny-set state, for the admin Lifecycle panel (expert review 2026-10-15 #18): `:ok`
+  until a boot load fails (`degraded/2`), `:degraded` until the retry lands (`recovered/1`). A
+  `persistent_term` flag rather than a call into the GenServers: a render must never block on a
+  coordinator that is busy retrying. Only the atom is stored, so a repeated `degraded` is a no-op
+  write (no global GC pass).
+  """
+  @spec status() :: %{tombstones: :ok | :degraded, suspensions: :ok | :degraded}
+  def status do
+    %{
+      tombstones: :persistent_term.get({__MODULE__, :tombstones}, :ok),
+      suspensions: :persistent_term.get({__MODULE__, :suspensions}, :ok)
+    }
+  end
+
+  defp put_status(kind, value) when kind in [:tombstones, :suspensions] do
+    :persistent_term.put({__MODULE__, kind}, value)
+  end
+
+  defp put_status(_kind, _value), do: :ok
 end
