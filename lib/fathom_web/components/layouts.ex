@@ -136,6 +136,12 @@ defmodule FathomWeb.Layouts do
               label="Durability"
             />
             <.nav_item
+              navigate={~p"/admin/cluster"}
+              active={@active == :cluster}
+              icon="hero-server-stack"
+              label="Cluster"
+            />
+            <.nav_item
               navigate={~p"/admin/query"}
               active={@active == :query}
               icon="hero-command-line"

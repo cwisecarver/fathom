@@ -3042,7 +3042,7 @@ defmodule Fathom.Shard do
       # Fence the flush: confirm we still own the shard right before uploading, so a
       # lease lost between acquire and now can't clobber a newer owner. See
       # Fathom.Shard.Fence.
-      case Fence.check(fence_ctx(state)) do
+      case fence_check(fence_ctx(state)) do
         {:ok, updates} ->
           # MERGE the refreshed lease (expert review 2026-08-01 #9). In legacy mode
           # (acquire_gen == nil) Fence.check performs a renew_lease PUT, which ROTATES the
@@ -3369,7 +3369,7 @@ defmodule Fathom.Shard do
   # The fence stays the hard pre-write guard: no upload happens unless it returns `{:ok, _}`, and the
   # 412-reconcile inside flush_and_reconcile is the second guard on the PUT itself.
   defp fenced_flush(fence_ctx, snapshot_state) do
-    case Fence.check(fence_ctx) do
+    case fence_check(fence_ctx) do
       {:ok, updates} ->
         # Flush against the fence-refreshed lease (the 412-reconcile re-checks the lock with it).
         {:fenced, flush_and_reconcile(Map.merge(snapshot_state, updates)), updates}
@@ -3380,6 +3380,28 @@ defmodule Fathom.Shard do
       :skip ->
         :fence_skip
     end
+  end
+
+  # The flush fence's verdict, counted (expert review 2026-10-15 #9). Emitted HERE, at the call
+  # site, never inside `Heartbeat.valid_for_write?/1` (that is read by every writer and the lapse
+  # fan-out; a per-call emit there would be a hot-path tax). One emit per shard per flush. Tags are
+  # bounded: verdict (:ok | :superseded | :skip) x mode (:heartbeat | :legacy).
+  defp fence_check(ctx) do
+    result = Fence.check(ctx)
+
+    verdict =
+      case result do
+        {:ok, _} -> :ok
+        other -> other
+      end
+
+    :telemetry.execute([:fathom, :shard, :fence, :verdict], %{count: 1}, %{
+      shard_id: ctx.id,
+      verdict: verdict,
+      mode: if(ctx.acquire_gen, do: :heartbeat, else: :legacy)
+    })
+
+    result
   end
 
   defp flush_and_reconcile(state) do

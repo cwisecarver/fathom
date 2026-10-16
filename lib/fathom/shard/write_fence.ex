@@ -35,6 +35,16 @@ defmodule Fathom.Shard.WriteFence do
     ArgumentError -> false
   end
 
+  @doc "How many shards on this node are currently write-fenced. Lock-free ETS size read."
+  @spec count() :: non_neg_integer()
+  def count do
+    :ets.info(@table, :size)
+    |> case do
+      n when is_integer(n) -> n
+      :undefined -> 0
+    end
+  end
+
   @doc "Fence writes to `shard_id` (idempotent)."
   @spec fence(String.t()) :: :ok
   def fence(shard_id) do

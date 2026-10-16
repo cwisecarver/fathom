@@ -45,7 +45,8 @@ defmodule Fathom.Telemetry do
            {Fathom.Admin.Measurements, :flush_gate, []},
            {Fathom.Admin.Measurements, :schedulers, []},
            {Fathom.Admin.Measurements, :memory_breakdown, []},
-           {Fathom.Admin.Measurements, :recorder, []}
+           {Fathom.Admin.Measurements, :recorder, []},
+           {Fathom.Admin.LeaseHealth, :measure, []}
          ],
          period: 10_000,
          name: Fathom.ShardPoller}
@@ -158,6 +159,35 @@ defmodule Fathom.Telemetry do
       ),
       counter("fathom.shard.lease.held.count",
         description: "Starts refused against a live foreign lease"
+      ),
+      # Lease/fence health (expert review 2026-10-15 #9). Verdicts are counted at the flush fence
+      # CALL SITES in Fathom.Shard, never inside Heartbeat.valid_for_write?/1. Tags are bounded.
+      counter("fathom.shard.fence.verdict.count",
+        tags: [:verdict, :mode],
+        description:
+          "Flush-fence verdicts (ok | skip | superseded) by liveness mode; a rising skip rate = ownership unconfirmed"
+      ),
+      counter("fathom.shard.heartbeat.skew_lapse.count",
+        description:
+          "Heartbeat self-lapses because this node's clock lags the store; once per episode"
+      ),
+      counter("fathom.shard.heartbeat.renew_failed.count",
+        description: "Failed node-heartbeat renewals"
+      ),
+      last_value("fathom.shard.heartbeat.renewed.renew_ms",
+        description: "Duration of the last successful heartbeat renewal PUT"
+      ),
+      last_value("fathom.node.write_fenced.shards",
+        description: "Shards on this node currently write-fenced (provably stealable)"
+      ),
+      last_value("fathom.node.lease.ms_until_deadline",
+        description: "Ms until the heartbeat renewal deadline (negative = past)"
+      ),
+      last_value("fathom.node.lease.lapsed",
+        description: "1 when the node heartbeat is currently not valid for writes"
+      ),
+      last_value("fathom.node.lease.skew_ms",
+        description: "Measured owner-behind-store clock skew in ms"
       ),
       # Rare and consequential: a cold open served a local replica INSTEAD of the stored object,
       # because the replica was provably ahead of what the object claimed. That is the A2 RPO win

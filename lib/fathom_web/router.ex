@@ -56,6 +56,7 @@ defmodule FathomWeb.Router do
       live "/rebalancer", AdminRebalancerLive, :index
       live "/durability", AdminDurabilityLive, :index
       live "/query", AdminQueryLive, :index
+      live "/cluster", AdminClusterLive, :index
     end
   end
 

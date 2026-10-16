@@ -885,6 +885,8 @@ defmodule Fathom.Application do
       # Always-supervised owner so reads never crash; writes are gated by Fathom.Admin.enabled?.
       # Before the shard supervisor so the table is up before any coordinator publishes/forgets.
       Fathom.Admin.FlushWatermark,
+      # Bounded in-memory ring of recent lease/quarantine events (expert review 2026-10-15 #21).
+      Fathom.Admin.LeaseEvents,
       # Owns the write-fence ETS table (expert review #3): coordinators publish "provably stealable"
       # shards here and ShardExecutor reads it lock-free before each write. Before the shard
       # supervisor so the table is up before any coordinator publishes/forgets.

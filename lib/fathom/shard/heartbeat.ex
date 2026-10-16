@@ -243,6 +243,52 @@ defmodule Fathom.Shard.Heartbeat do
     end
   end
 
+  @doc """
+  A lock-free read of this node's lease health for the admin Cluster page (expert review
+  2026-10-15 #9): the status row only, never a call into the heartbeat process.
+
+    * `mode` - `:heartbeat` when the process (and so its status table) is up, else `:legacy`
+      (coordinators fall back to per-shard renew PUTs).
+    * `ms_until_deadline` - monotonic ms to the confirmed renewal deadline (negative once past);
+      `nil` before the first confirmed renewal or when down.
+    * `lapsed` - `true` when the node would currently be `:not_valid` (no confirmed renewal, or
+      inside the margin of the deadline). Derived from the same row `valid_for_write?/1` reads, so
+      it is also true for a skew self-lapse, whose deadline is pinned in the past.
+  """
+  @spec status_snapshot() :: %{
+          mode: :heartbeat | :legacy,
+          generation: non_neg_integer() | nil,
+          ms_until_deadline: integer() | nil,
+          margin_ms: pos_integer(),
+          skew_ms: non_neg_integer(),
+          lapsed: boolean() | nil
+        }
+  def status_snapshot do
+    case status() do
+      {gen, deadline, margin, _wall, skew} ->
+        now = System.monotonic_time(:millisecond)
+
+        %{
+          mode: :heartbeat,
+          generation: gen,
+          ms_until_deadline: deadline && deadline - now,
+          margin_ms: margin,
+          skew_ms: skew,
+          lapsed: is_nil(deadline) or now + margin >= deadline
+        }
+
+      :down ->
+        %{
+          mode: :legacy,
+          generation: nil,
+          ms_until_deadline: nil,
+          margin_ms: margin_ms(),
+          skew_ms: 0,
+          lapsed: nil
+        }
+    end
+  end
+
   defp status do
     case :ets.lookup(@status_table, :status) do
       [{:status, gen, deadline, margin, wall, skew}] -> {gen, deadline, margin, wall, skew}
@@ -494,7 +540,9 @@ defmodule Fathom.Shard.Heartbeat do
         {:ok, %{expires_at_ms: exp}, store_now} ->
           :telemetry.execute(
             [:fathom, :shard, :heartbeat, :renewed],
-            %{count: 1},
+            # renew_ms: how long the renewal PUT took (expert review 2026-10-15 #9) - the lead
+            # indicator before the deadline margin is eaten.
+            %{count: 1, renew_ms: System.monotonic_time(:millisecond) - now},
             %{owner: state.owner}
           )
 
@@ -519,6 +567,13 @@ defmodule Fathom.Shard.Heartbeat do
                 "heartbeat owner clock lags the store for #{state.owner} by ~#{skew}ms " <>
                   "(> ttl - renew - steal_margin); self-lapsing to arm the write fence before a " <>
                   "peer treats the lease as stealable (expert review 2026-09-05 #16)"
+              )
+
+              # Once per episode (this branch runs only on the lapse transition).
+              :telemetry.execute(
+                [:fathom, :shard, :heartbeat, :skew_lapse],
+                %{count: 1, skew_ms: skew},
+                %{owner: state.owner}
               )
 
               mark_lapse(lapsed)
@@ -548,6 +603,13 @@ defmodule Fathom.Shard.Heartbeat do
 
         {:error, reason} ->
           Logger.warning("heartbeat renew failed for #{state.owner}: #{inspect(reason)}")
+
+          :telemetry.execute(
+            [:fathom, :shard, :heartbeat, :renew_failed],
+            %{count: 1},
+            %{owner: state.owner, reason: inspect(reason, limit: 5, printable_limit: 80)}
+          )
+
           state
       end
 
