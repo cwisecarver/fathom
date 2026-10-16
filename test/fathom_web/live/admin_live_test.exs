@@ -165,6 +165,73 @@ defmodule FathomWeb.AdminLiveTest do
       refute has_element?(view, "#nodes-live-tile", "reporter off")
     end
 
+    # Expert review 2026-10-15 #7 part 2: per-node health on the beat makes the Nodes table the
+    # triage table; the fleet-max unflushed tile names the worst node; an old-release node (no
+    # health) reads as unknown rather than crashing or fabricating a number.
+    test "Nodes table shows per-node health and the fleet-max oldest-unflushed tile", %{
+      conn: conn
+    } do
+      {:ok, view, _html} = conn |> auth() |> live("/admin")
+      now = DateTime.utc_now()
+
+      health = fn unflushed, disk ->
+        %{
+          "dirty_shards" => 4,
+          "oldest_unflushed_ms" => unflushed,
+          "open_shards" => 90,
+          "max_open_shards" => 100,
+          "disk_used_ratio" => disk,
+          "replication_slack" => -1,
+          "query_p99_ms" => 12.0,
+          "draining" => false,
+          "skew_ms" => 6_000
+        }
+      end
+
+      broadcast_fleet([
+        %{
+          node_key: "a@h",
+          last_seen_at: now,
+          q_p99: 1.0,
+          alive: true,
+          health: health.(5_000, 0.5)
+        },
+        %{
+          node_key: "b@h",
+          last_seen_at: now,
+          q_p99: 1.0,
+          alive: true,
+          health: health.(400_000, 0.97)
+        },
+        %{node_key: "old@h", last_seen_at: now, q_p99: 1.0, alive: true, health: nil},
+        # a roster row from before the key existed at all
+        %{node_key: "ancient@h", last_seen_at: now, q_p99: 1.0, alive: true}
+      ])
+
+      assert has_element?(view, "#fleet-oldest-unflushed", "b@h")
+      assert has_element?(view, "#fleet-oldest-unflushed", "Oldest unflushed (fleet)")
+      assert has_element?(view, "#node-b-h-unflushed[data-state=error]")
+      assert has_element?(view, "#node-a-h-unflushed[data-state=ok]")
+      assert has_element?(view, "#node-b-h-disk[data-state=error]")
+      assert has_element?(view, "#node-a-h-disk[data-state=ok]")
+      assert has_element?(view, "#node-a-h-slack[data-state=error]")
+      assert has_element?(view, "#node-a-h-skew[data-state=error]")
+      assert has_element?(view, "#node-old-h-unflushed[data-state=idle]")
+      assert has_element?(view, "#node-ancient-h-slack[data-state=idle]")
+    end
+
+    test "fleet oldest-unflushed tile with no health anywhere says nobody reports it", %{
+      conn: conn
+    } do
+      {:ok, view, _html} = conn |> auth() |> live("/admin")
+
+      broadcast_fleet([
+        %{node_key: "old@h", last_seen_at: DateTime.utc_now(), q_p99: 1.0, alive: true}
+      ])
+
+      assert has_element?(view, "#fleet-oldest-unflushed", "no node reports it")
+    end
+
     # Expert review 2026-10-15 #7: the Nodes table's "p99" column is the p99 of per-shard q/s, not a
     # latency; "alive" hid a 30 s window; draining read as alive; the scope label was hidden on
     # narrow widths.

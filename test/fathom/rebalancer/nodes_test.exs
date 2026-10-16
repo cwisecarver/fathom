@@ -14,6 +14,50 @@ defmodule Fathom.Rebalancer.NodesTest do
     )
   end
 
+  describe "health column (migration 20261016045918; expert review 2026-10-15 #7)" do
+    test "forward: the column exists and a beat writes/reads a health map" do
+      assert %{rows: [["jsonb"]]} =
+               Repo.query!(
+                 "SELECT data_type FROM information_schema.columns " <>
+                   "WHERE table_name = 'rebalancer_nodes' AND column_name = 'health'"
+               )
+
+      :ok = Nodes.beat("h1", health: %{"dirty_shards" => 3, "draining" => true})
+      assert %{"dirty_shards" => 3, "draining" => true} = Repo.get!(NodeBeat, "h1").health
+    end
+
+    test "a liveness-only beat does not erase the published health" do
+      :ok = Nodes.beat("h1", health: %{"dirty_shards" => 3})
+      :ok = Nodes.beat("h1")
+      assert Repo.get!(NodeBeat, "h1").health == %{"dirty_shards" => 3}
+    end
+
+    test "cross-version: an old node's row (NULL health) reads as unknown and rosters fine" do
+      :ok = Nodes.beat("old")
+      assert Repo.get!(NodeBeat, "old").health == nil
+      assert [%{node_key: "old", health: nil}] = Fathom.Admin.Fleet.node_roster()
+      assert Fathom.Rebalancer.NodeHealth.get(nil, "dirty_shards") == nil
+    end
+
+    test "revert: dropping the column and re-adding it keeps old-shape rows and the beat path" do
+      # `change/0` is `add :health, :map`; its reversal is this DROP (DDL is transactional in
+      # Postgres, so the sandbox rolls it back). Rows written before the column read as nil after
+      # a re-add, and the beat path works again.
+      :ok = Nodes.beat("pre", health: %{"x" => 1})
+      Repo.query!("ALTER TABLE rebalancer_nodes DROP COLUMN health")
+
+      Repo.query!(
+        "INSERT INTO rebalancer_nodes (node_key, last_seen_at) VALUES ('legacy', now())"
+      )
+
+      Repo.query!("ALTER TABLE rebalancer_nodes ADD COLUMN health jsonb")
+
+      assert Repo.get!(NodeBeat, "legacy").health == nil
+      assert :ok = Nodes.beat("legacy", health: %{"x" => 2})
+      assert Repo.get!(NodeBeat, "legacy").health == %{"x" => 2}
+    end
+  end
+
   test "beat upserts one row per node_key; alive reflects the window (#1b)" do
     assert :ok = Nodes.beat("n1")
     assert :ok = Nodes.beat("n1")

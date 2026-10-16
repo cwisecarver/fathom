@@ -24,7 +24,7 @@ defmodule Fathom.Rebalancer.Reporter do
   require Logger
 
   alias Fathom.Rebalancer
-  alias Fathom.Rebalancer.{LoadSample, LoadSamples, Nodes, Stats, WarmLocations}
+  alias Fathom.Rebalancer.{LoadSample, LoadSamples, NodeHealth, Nodes, Stats, WarmLocations}
   alias Fathom.Repo
   alias Fathom.Shard.Replication.Follower
   alias Fathom.ShardLoad
@@ -112,7 +112,8 @@ defmodule Fathom.Rebalancer.Reporter do
         q_p99: Stats.percentile(qps, 99),
         sample_count: length(rows),
         q_hist: Stats.histogram(qps),
-        replication_address: Fathom.Shard.Replication.Fleet.advertised_address()
+        replication_address: Fathom.Shard.Replication.Fleet.advertised_address(),
+        health: NodeHealth.snapshot()
       )
 
       publish(Enum.take(rows, top_n()))

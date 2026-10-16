@@ -79,6 +79,26 @@ defmodule Fathom.Rebalancer.ReporterTest do
     assert latest["reset_shard"].q_per_s > 0.0
   end
 
+  # Expert review 2026-10-15 #7: the beat carries this node's health snapshot (jsonb).
+  test "each tick publishes this node's health snapshot on the beat" do
+    pid = start_supervised!(Reporter)
+    Ecto.Adapters.SQL.Sandbox.allow(Fathom.Repo, self(), pid)
+
+    :ok = Reporter.report_now()
+
+    row = Fathom.Repo.get!(Fathom.Rebalancer.NodeBeat, Rebalancer.node_key())
+    assert is_map(row.health)
+
+    for k <- ~w(dirty_shards oldest_unflushed_ms open_shards max_open_shards disk_used_ratio
+                replication_slack query_p99_ms draining skew_ms) do
+      assert Map.has_key?(row.health, k), "health snapshot is missing #{k}"
+    end
+
+    assert row.health["draining"] == false
+    # Replication is off in test: slack is "not applicable" (nil), never a fabricated 0.
+    assert row.health["replication_slack"] == nil
+  end
+
   test "each tick beats this node's liveness for the reconciler (#1b)" do
     pid = start_supervised!(Reporter)
     Ecto.Adapters.SQL.Sandbox.allow(Fathom.Repo, self(), pid)

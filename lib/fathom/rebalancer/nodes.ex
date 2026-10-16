@@ -29,7 +29,7 @@ defmodule Fathom.Rebalancer.Nodes do
     # `:replication_address` joins that list for a sharper version of the same reason: NULLing it
     # does not just lose a gauge, it withdraws the node from A2's membership candidates. A beat
     # that forgot to carry it would silently shrink every shipper's follower set.
-    stats = Keyword.take(opts, [:q_p99, :sample_count, :q_hist, :replication_address])
+    stats = Keyword.take(opts, [:q_p99, :sample_count, :q_hist, :replication_address, :health])
 
     Repo.insert!(
       struct(%NodeBeat{node_key: node_key, last_seen_at: now}, stats),

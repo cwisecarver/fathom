@@ -39,5 +39,8 @@ defmodule Fathom.Rebalancer.NodeBeat do
     # or runs a release that predates the column. `Fathom.Shard.Replication.Fleet` resolves
     # candidates from these; nil means "not a candidate" rather than an endpoint that would refuse.
     field :replication_address, :string
+    # This node's health snapshot (`Fathom.Rebalancer.NodeHealth.snapshot/0`, string-keyed jsonb),
+    # or nil from a node on a release that predates the column. Readers treat nil as "unknown".
+    field :health, :map
   end
 end

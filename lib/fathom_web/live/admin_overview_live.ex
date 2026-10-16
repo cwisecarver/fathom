@@ -153,7 +153,7 @@ defmodule FathomWeb.AdminOverviewLive do
         <div :if={@fleet == nil} class="grid grid-cols-2 gap-4 lg:grid-cols-4">
           <div :for={_ <- 1..4} class="skeleton h-24 rounded-lg"></div>
         </div>
-        <div :if={@fleet} class="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <div :if={@fleet} class="grid grid-cols-2 gap-4 lg:grid-cols-5">
           <.stat_tile label="Total shards" value={fmt_int(@fleet.total_shards)} />
           <.stat_tile label="Active" value={fmt_int(@fleet.by_status["active"] || 0)} />
           <%!-- The roster is written ONLY by the load reporter (LOAD_REPORTER, off by default), so an
@@ -171,6 +171,15 @@ defmodule FathomWeb.AdminOverviewLive do
               label="Nodes live"
               value="—"
               unit={if(@reporter_on, do: "none reporting", else: "reporter off")}
+            />
+          </div>
+          <div id="fleet-oldest-unflushed">
+            <% fo = fleet_oldest_unflushed(@fleet.nodes) %>
+            <.stat_tile
+              label="Oldest unflushed (fleet)"
+              value={fmt_ms(fo && fo.ms)}
+              unit={if(fo, do: fo.node_key, else: "no node reports it")}
+              accent="text-warning"
             />
           </div>
           <.stat_tile
@@ -321,7 +330,7 @@ defmodule FathomWeb.AdminOverviewLive do
         <%!-- Nodes + migrations (fleet) --%>
         <div :if={@fleet == nil} class="skeleton h-40 rounded-lg"></div>
         <div :if={@fleet} class="grid grid-cols-1 gap-6 lg:grid-cols-2">
-          <.panel title="Nodes">
+          <.panel title="Nodes" class="lg:col-span-2">
             <table class="w-full text-sm">
               <thead class="text-[11px] uppercase tracking-wide text-base-content/50">
                 <tr class="border-b border-base-300">
@@ -333,6 +342,25 @@ defmodule FathomWeb.AdminOverviewLive do
                   >
                     hot-shard p99 q/s
                   </th>
+                  <th class="hidden py-2 text-right font-medium sm:table-cell">Dirty</th>
+                  <th class="py-2 text-right font-medium" title="Age of the oldest unflushed write">
+                    Unflushed
+                  </th>
+                  <th class="hidden py-2 text-right font-medium md:table-cell">Open / cap</th>
+                  <th class="hidden py-2 text-right font-medium md:table-cell">Disk</th>
+                  <th
+                    class="hidden py-2 text-right font-medium lg:table-cell"
+                    title="Replication quorum slack (connected - quorum); blank when replication is off"
+                  >
+                    Repl slack
+                  </th>
+                  <th
+                    class="hidden py-2 text-right font-medium sm:table-cell"
+                    title="Query latency p99 (60 s window)"
+                  >
+                    p99 latency
+                  </th>
+                  <th class="hidden py-2 text-right font-medium lg:table-cell">Skew</th>
                   <th class="py-2 text-right font-medium">Last seen</th>
                   <th class="py-2 text-right font-medium">Status</th>
                 </tr>
@@ -351,6 +379,7 @@ defmodule FathomWeb.AdminOverviewLive do
                   <td class="num hidden py-1.5 text-right text-base-content/60 sm:table-cell">
                     {fmt_rate(n.q_p99)}
                   </td>
+                  <.node_health_cells node={n} dom={dom_safe(n.node_key)} />
                   <td
                     id={"node-last-seen-#{dom_safe(n.node_key)}"}
                     class="num py-1.5 text-right text-base-content/60"
@@ -367,10 +396,16 @@ defmodule FathomWeb.AdminOverviewLive do
                     >
                       draining
                     </.badge>
+                    <.badge
+                      :if={(n.node_key != @node_key and Map.get(n, :health)) && n.health["draining"]}
+                      kind={:warn}
+                    >
+                      draining
+                    </.badge>
                   </td>
                 </tr>
                 <tr :if={@fleet.nodes == []}>
-                  <td colspan="5" class="py-6 text-center text-sm text-base-content/40">
+                  <td colspan="13" class="py-6 text-center text-sm text-base-content/40">
                     No nodes reporting (enable the load reporter).
                   </td>
                 </tr>

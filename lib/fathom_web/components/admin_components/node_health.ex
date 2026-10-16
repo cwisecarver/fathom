@@ -409,4 +409,128 @@ defmodule FathomWeb.AdminComponents.NodeHealth do
   defp util_state(u) when is_number(u) and u > 0.9, do: :warn
   defp util_state(nil), do: :idle
   defp util_state(_), do: :ok
+
+  # ───────────────────────── Fleet Nodes table (per-node health) ─────────────────────────
+  #
+  # `health` is the jsonb snapshot each node publishes on its reporter beat
+  # (`Fathom.Rebalancer.NodeHealth`); string keys, `nil` for a node on an older release or one
+  # whose reporter has not beaten since the column existed -> every cell renders "—" (unknown).
+
+  @unflushed_warn_ms 60_000
+  @unflushed_error_ms 300_000
+  @skew_warn_ms 1_000
+  @skew_error_ms 5_000
+
+  @doc "Oldest-unflushed age state: warn past 60 s, error past 5 min, idle when unknown."
+  @spec unflushed_state(number() | nil) :: :ok | :warn | :error | :idle
+  def unflushed_state(nil), do: :idle
+  def unflushed_state(ms) when ms > @unflushed_error_ms, do: :error
+  def unflushed_state(ms) when ms > @unflushed_warn_ms, do: :warn
+  def unflushed_state(_), do: :ok
+
+  @doc "Replication quorum slack: error below 0 (writes failing), warn at 0, idle when off/unknown."
+  @spec slack_state(integer() | nil) :: :ok | :warn | :error | :idle
+  def slack_state(nil), do: :idle
+  def slack_state(s) when s < 0, do: :error
+  def slack_state(0), do: :warn
+  def slack_state(_), do: :ok
+
+  @doc "Clock skew vs the store: warn past 1 s, error past 5 s."
+  @spec skew_state(number() | nil) :: :ok | :warn | :error | :idle
+  def skew_state(nil), do: :idle
+  def skew_state(ms) when ms > @skew_error_ms, do: :error
+  def skew_state(ms) when ms > @skew_warn_ms, do: :warn
+  def skew_state(_), do: :ok
+
+  @doc """
+  The fleet-max oldest-unflushed age over ALIVE nodes that published one, as
+  `%{ms: ms, node_key: key}`, or `nil` when no live node has (old releases / reporter off).
+  """
+  @spec fleet_oldest_unflushed([map()]) :: %{ms: number(), node_key: String.t()} | nil
+  def fleet_oldest_unflushed(nodes) do
+    nodes
+    |> Enum.filter(& &1.alive)
+    |> Enum.flat_map(fn n ->
+      case health_get(n, "oldest_unflushed_ms") do
+        ms when is_number(ms) -> [%{ms: ms, node_key: n.node_key}]
+        _ -> []
+      end
+    end)
+    |> Enum.max_by(& &1.ms, fn -> nil end)
+  end
+
+  defp health_get(n, key), do: Fathom.Rebalancer.NodeHealth.get(Map.get(n, :health), key)
+
+  attr :node, :map, required: true
+  attr :dom, :string, required: true
+
+  @doc "The per-node health `<td>`s of the Nodes table (after hot-shard p99, before Last seen)."
+  def node_health_cells(assigns) do
+    n = assigns.node
+    g = &health_get(n, &1)
+    open = g.("open_shards")
+    cap = g.("max_open_shards")
+    util = if is_number(open) and is_number(cap) and cap > 0, do: open / cap
+
+    assigns =
+      assign(assigns,
+        dirty: g.("dirty_shards"),
+        unflushed: g.("oldest_unflushed_ms"),
+        open: open,
+        cap: cap,
+        util: util,
+        disk: g.("disk_used_ratio"),
+        slack: g.("replication_slack"),
+        p99: g.("query_p99_ms"),
+        skew: g.("skew_ms")
+      )
+
+    ~H"""
+    <td id={"node-#{@dom}-dirty"} class="num hidden py-1.5 text-right sm:table-cell">
+      {fmt_int(@dirty)}
+    </td>
+    <td
+      id={"node-#{@dom}-unflushed"}
+      data-state={unflushed_state(@unflushed)}
+      class={["num py-1.5 text-right", state_text(unflushed_state(@unflushed))]}
+    >
+      {fmt_ms(@unflushed)}
+    </td>
+    <td
+      id={"node-#{@dom}-open"}
+      data-state={ratio_state(@util)}
+      class={["num hidden py-1.5 text-right md:table-cell", state_text(ratio_state(@util))]}
+    >
+      {fmt_int(@open)}{if(@cap, do: " / #{fmt_int(@cap)}", else: "")}
+    </td>
+    <td
+      id={"node-#{@dom}-disk"}
+      data-state={ratio_state(@disk)}
+      class={["num hidden py-1.5 text-right md:table-cell", state_text(ratio_state(@disk))]}
+    >
+      {fmt_pct(@disk)}
+    </td>
+    <td
+      id={"node-#{@dom}-slack"}
+      data-state={slack_state(@slack)}
+      class={["num hidden py-1.5 text-right lg:table-cell", state_text(slack_state(@slack))]}
+    >
+      {if(is_nil(@slack), do: "—", else: @slack)}
+    </td>
+    <td id={"node-#{@dom}-p99"} class="num hidden py-1.5 text-right sm:table-cell">
+      {fmt_ms(@p99)}
+    </td>
+    <td
+      id={"node-#{@dom}-skew"}
+      data-state={skew_state(@skew)}
+      class={["num hidden py-1.5 text-right lg:table-cell", state_text(skew_state(@skew))]}
+    >
+      {fmt_ms(@skew)}
+    </td>
+    """
+  end
+
+  defp state_text(:error), do: "text-error"
+  defp state_text(:warn), do: "text-warning"
+  defp state_text(_), do: nil
 end

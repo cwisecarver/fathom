@@ -60,6 +60,7 @@ defmodule Fathom.Admin.Fleet do
         last_seen_at: n.last_seen_at,
         q_p99: n.q_p99,
         sample_count: n.sample_count,
+        health: n.health,
         alive: MapSet.member?(alive, n.node_key)
       }
     end)
