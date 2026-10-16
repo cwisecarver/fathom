@@ -63,6 +63,19 @@ defmodule Fathom.Admin.PrometheusScrapeTest do
     assert_in_delta PrometheusScrape.percentile_cumulative(b, 99), 9.75, 0.001
   end
 
+  # Invariant (2026-10-15): the query-duration histogram carries 150/750/2500 ms edges, so a
+  # percentile that lands in one of those ranges interpolates inside a narrow bucket. Before the
+  # 750 edge, a p99 of this shape interpolated across 500-1000 and read 950, not 750.
+  test "percentile_cumulative resolves on the new 750 and 2500 ms edges" do
+    # total=100, p99 → target 99. Bucket (500,750] holds 90→99, so the crossing is exactly 750.
+    at_750 = [{500.0, 90.0}, {750.0, 99.0}, {1000.0, 100.0}, {:infinity, 100.0}]
+    assert_in_delta PrometheusScrape.percentile_cumulative(at_750, 99), 750.0, 0.001
+
+    # p99 with 90 below 1000 and 100 below 2500: 1000 + (99-90)/(100-90) * (2500-1000) = 2350.
+    in_2500 = [{1000.0, 90.0}, {2500.0, 100.0}, {5000.0, 100.0}, {:infinity, 100.0}]
+    assert_in_delta PrometheusScrape.percentile_cumulative(in_2500, 99), 2350.0, 0.001
+  end
+
   test "percentile_cumulative is 0.0 for an empty or zero histogram" do
     assert PrometheusScrape.percentile_cumulative([], 99) == 0.0
     assert PrometheusScrape.percentile_cumulative([{1.0, 0.0}, {:infinity, 0.0}], 99) == 0.0

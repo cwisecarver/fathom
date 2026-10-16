@@ -221,4 +221,17 @@ defmodule Fathom.TelemetryTest do
     :telemetry.execute([:oban, :job, :exception], %{duration: 1}, %{queue: "migrations"})
     assert_receive {:telemetry, [:oban, :job, :exception], _, %{queue: "migrations"}}
   end
+
+  # Invariant (2026-10-15): the node-wide query-duration histogram has the 150/750/2500 ms edges,
+  # so the admin dashboard's p99 resolves inside the 100-250, 500-1000 and 1000-5000 ranges. Pins
+  # the configured edges themselves (the reporter's bucket list), in ascending order.
+  test "fathom.shard.query.duration buckets include the 150, 750 and 2500 ms edges" do
+    metric =
+      Enum.find(Fathom.Telemetry.metrics(), &(&1.name == [:fathom, :shard, :query, :duration]))
+
+    buckets = Keyword.fetch!(metric.reporter_options, :buckets)
+
+    for edge <- [150, 750, 2500], do: assert(edge in buckets)
+    assert buckets == Enum.sort(buckets)
+  end
 end

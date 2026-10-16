@@ -387,7 +387,11 @@ defmodule Fathom.Telemetry do
         event_name: [:fathom, :shard, :query],
         measurement: :duration,
         unit: {:native, :millisecond},
-        reporter_options: [buckets: [0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 5000]],
+        # 150, 750 and 2500 ms split the 100-250, 500-1000 and 1000-5000 ranges, so a p99 that
+        # lands in one of them interpolates within a narrower bucket (metrics_collector's p99).
+        reporter_options: [
+          buckets: [0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 150, 250, 500, 750, 1000, 2500, 5000]
+        ],
         description: "Per-statement SQLite query latency (node-wide; deliberately un-tagged)"
       ),
       counter("fathom.s3.op.count",
