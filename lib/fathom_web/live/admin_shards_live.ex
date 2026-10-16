@@ -30,6 +30,8 @@ defmodule FathomWeb.AdminShardsLive do
       |> assign(:node_key, Fathom.Rebalancer.node_key())
       |> assign(:metrics, snap.current)
       |> assign(:fleet_hot, nil)
+      |> assign(:as_of_ms, System.system_time(:millisecond))
+      |> assign(:refresh_failed, false)
       |> assign(:load_enabled?, Fathom.ShardLoad.enabled?())
       |> load_fleet(connected)
 
@@ -53,14 +55,27 @@ defmodule FathomWeb.AdminShardsLive do
 
   @impl true
   def handle_async(:fleet_hot, {:ok, hot}, socket),
-    do: {:noreply, assign(socket, :fleet_hot, hot)}
+    do:
+      {:noreply,
+       socket
+       |> assign(:fleet_hot, hot)
+       |> assign(:as_of_ms, System.system_time(:millisecond))
+       |> assign(:refresh_failed, false)}
 
-  def handle_async(:fleet_hot, {:exit, _reason}, socket), do: {:noreply, socket}
+  def handle_async(:fleet_hot, {:exit, _reason}, socket),
+    do: {:noreply, assign(socket, :refresh_failed, true)}
 
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.admin flash={@flash} active={:shards} node_key={@node_key}>
+    <Layouts.admin
+      flash={@flash}
+      active={:shards}
+      node_key={@node_key}
+      as_of_ms={@as_of_ms}
+      stale_after_ms={15_000}
+      refresh_failed={@refresh_failed}
+    >
       <div class="space-y-6">
         <.panel title="Hottest shards on this node (live)">
           <div :if={hot(@metrics) == []} class="py-6 text-center text-sm text-base-content/40">

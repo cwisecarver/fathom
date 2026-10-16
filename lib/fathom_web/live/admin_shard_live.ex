@@ -28,6 +28,8 @@ defmodule FathomWeb.AdminShardLive do
           |> assign(:node_key, Fathom.Rebalancer.node_key())
           |> assign(:shard_id, id)
           |> assign(:cp, nil)
+          |> assign(:as_of_ms, System.system_time(:millisecond))
+          |> assign(:refresh_failed, false)
           |> assign(:lease, nil)
           |> assign(:mode, nil)
           |> assign(:local, ShardDetail.local_state(id))
@@ -46,17 +48,22 @@ defmodule FathomWeb.AdminShardLive do
     id = socket.assigns.shard_id
 
     socket
+    |> assign(:as_of_ms, System.system_time(:millisecond))
+    |> assign(:refresh_failed, false)
     |> start_async(:cp, fn -> ShardDetail.load_control_plane(id) end)
     |> start_async(:lease, fn -> ShardDetail.lease(id) end)
   end
 
   @impl true
   def handle_async(:cp, {:ok, cp}, socket), do: {:noreply, assign(socket, :cp, cp)}
-  def handle_async(:cp, {:exit, _}, socket), do: {:noreply, assign(socket, :cp, :error)}
+
+  def handle_async(:cp, {:exit, _}, socket),
+    do: {:noreply, socket |> assign(:cp, :error) |> assign(:refresh_failed, true)}
+
   def handle_async(:lease, {:ok, lease}, socket), do: {:noreply, assign(socket, :lease, lease)}
 
   def handle_async(:lease, {:exit, _}, socket),
-    do: {:noreply, assign(socket, :lease, {:error, :exit})}
+    do: {:noreply, socket |> assign(:lease, {:error, :exit}) |> assign(:refresh_failed, true)}
 
   def handle_async(:mode, {:ok, mode}, socket), do: {:noreply, assign(socket, :mode, mode)}
   def handle_async(:mode, {:exit, _}, socket), do: {:noreply, assign(socket, :mode, :unavailable)}
@@ -89,7 +96,14 @@ defmodule FathomWeb.AdminShardLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.admin flash={@flash} active={:shards} node_key={@node_key}>
+    <Layouts.admin
+      flash={@flash}
+      active={:shards}
+      node_key={@node_key}
+      as_of_ms={@as_of_ms}
+      stale_after_ms={3_600_000}
+      refresh_failed={@refresh_failed}
+    >
       <div class="space-y-6" id="shard-detail">
         <div class="flex items-center justify-between">
           <h1 class="num text-lg font-semibold" id="shard-title">{@shard_id}</h1>

@@ -99,6 +99,17 @@ defmodule FathomWeb.AdminOverviewLive do
   # node_key is `name@host` — `@` and `.` break a CSS id selector, which tests (and hooks) use.
   defp dom_safe(key), do: String.replace(key, ~r/[^A-Za-z0-9_-]/, "-")
 
+  # Freshness chip (expert review 2026-10-15 #5): the metrics tick (1 s) is the page's pulse; a fleet
+  # roll-up older than 2 intervals (30 s) overrides it so a frozen FleetCollector also goes amber.
+  @fleet_stale_ms 30_000
+  defp as_of_ms(metrics, fleet) do
+    fleet_at = Map.get(fleet || %{}, :fetched_at_ms)
+
+    if fleet_at && System.system_time(:millisecond) - fleet_at > @fleet_stale_ms,
+      do: fleet_at,
+      else: Map.get(metrics || %{}, :at_ms)
+  end
+
   defp initial_fleet(false), do: nil
 
   defp initial_fleet(true) do
@@ -119,7 +130,13 @@ defmodule FathomWeb.AdminOverviewLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.admin flash={@flash} active={:overview} node_key={@node_key}>
+    <Layouts.admin
+      flash={@flash}
+      active={:overview}
+      node_key={@node_key}
+      as_of_ms={as_of_ms(@metrics, @fleet)}
+      stale_after_ms={4_000}
+    >
       <:actions>
         <%!-- Every tile except the Nodes/Migrations panels is THIS node's view (expert review
              2026-10-15 #7): shown at all widths, not `hidden sm:inline`. --%>

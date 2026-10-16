@@ -48,6 +48,8 @@ defmodule FathomWeb.AdminMigrationsLive do
       socket
       |> assign(:page_title, "Migrations")
       |> assign(:node_key, Fathom.Rebalancer.node_key())
+      |> assign(:as_of_ms, System.system_time(:millisecond))
+      |> assign(:refresh_failed, false)
       |> assign(:mig, nil)
       |> assign(:oban, nil)
       |> assign(:jobs, nil)
@@ -88,6 +90,8 @@ defmodule FathomWeb.AdminMigrationsLive do
   def handle_async(:fleet, {:ok, %{mig: mig, oban: oban} = page}, socket) do
     {:noreply,
      socket
+     |> assign(:as_of_ms, System.system_time(:millisecond))
+     |> assign(:refresh_failed, false)
      |> assign(:mig, mig)
      |> assign(:oban, oban)
      |> assign(:jobs, page.jobs)
@@ -95,12 +99,20 @@ defmodule FathomWeb.AdminMigrationsLive do
   end
 
   # Keep the last-good data if a refresh crashes — a Postgres blip shouldn't blank the page.
-  def handle_async(:fleet, {:exit, _reason}, socket), do: {:noreply, socket}
+  def handle_async(:fleet, {:exit, _reason}, socket),
+    do: {:noreply, assign(socket, :refresh_failed, true)}
 
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.admin flash={@flash} active={:migrations} node_key={@node_key}>
+    <Layouts.admin
+      flash={@flash}
+      active={:migrations}
+      node_key={@node_key}
+      as_of_ms={@as_of_ms}
+      stale_after_ms={15_000}
+      refresh_failed={@refresh_failed}
+    >
       <div :if={@mig == nil} class="skeleton h-40 rounded-lg"></div>
 
       <div :if={@mig} class="space-y-6">

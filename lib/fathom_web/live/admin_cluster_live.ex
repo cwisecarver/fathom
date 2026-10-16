@@ -46,6 +46,7 @@ defmodule FathomWeb.AdminClusterLive do
 
   defp load(socket) do
     socket
+    |> assign(:as_of_ms, System.system_time(:millisecond))
     |> assign(:lease, LeaseHealth.snapshot())
     |> assign(:events, LeaseEvents.recent(@events_shown))
   end
@@ -53,7 +54,13 @@ defmodule FathomWeb.AdminClusterLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.admin flash={@flash} active={:cluster} node_key={@node_key}>
+    <Layouts.admin
+      flash={@flash}
+      active={:cluster}
+      node_key={@node_key}
+      as_of_ms={@as_of_ms}
+      stale_after_ms={4_000}
+    >
       <div class="space-y-6">
         <.events_strip events={@events_5m} />
 

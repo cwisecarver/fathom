@@ -24,6 +24,8 @@ defmodule FathomWeb.AdminDurabilityLive do
      socket
      |> assign(:page_title, "Durability")
      |> assign(:node_key, Fathom.Rebalancer.node_key())
+     |> assign(:as_of_ms, System.system_time(:millisecond))
+     |> assign(:refresh_failed, false)
      |> assign(:snap, nil)
      |> assign(:repl, nil)
      |> assign(:backup, nil)
@@ -56,10 +58,14 @@ defmodule FathomWeb.AdminDurabilityLive do
 
   @impl true
   def handle_async(:durability, {:ok, data}, socket), do: {:noreply, apply_data(socket, data)}
-  def handle_async(:durability, {:exit, _reason}, socket), do: {:noreply, socket}
+
+  def handle_async(:durability, {:exit, _reason}, socket),
+    do: {:noreply, assign(socket, :refresh_failed, true)}
 
   defp apply_data(socket, data) do
     socket
+    |> assign(:as_of_ms, System.system_time(:millisecond))
+    |> assign(:refresh_failed, false)
     |> assign(:snap, Map.get(data, :snapshot, socket.assigns.snap))
     |> assign(:repl, repl_of(Map.get(data, :snapshot, socket.assigns.snap)))
     |> assign(:backup, Map.get(data, :backup, socket.assigns.backup))
@@ -73,7 +79,14 @@ defmodule FathomWeb.AdminDurabilityLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.admin flash={@flash} active={:durability} node_key={@node_key}>
+    <Layouts.admin
+      flash={@flash}
+      active={:durability}
+      node_key={@node_key}
+      as_of_ms={@as_of_ms}
+      stale_after_ms={15_000}
+      refresh_failed={@refresh_failed}
+    >
       <div id="durability-page" class="space-y-6">
         <div :if={@snap == nil} id="durability-loading" class="skeleton h-40 rounded-lg"></div>
 

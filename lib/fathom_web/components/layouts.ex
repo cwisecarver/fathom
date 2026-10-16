@@ -85,6 +85,20 @@ defmodule FathomWeb.Layouts do
       "the active nav item (:overview | :shards | :directory | :migrations | :durability | :cluster | :rebalancer | :audit | :query)"
 
   attr :node_key, :string, default: ""
+
+  attr :as_of_ms, :integer,
+    default: nil,
+    doc:
+      "system-time ms of the page's newest data; when set, the top-bar dot becomes a freshness chip"
+
+  attr :stale_after_ms, :integer,
+    default: 5_000,
+    doc: "age past which the chip turns amber (about 3 metric ticks / 2 fleet intervals)"
+
+  attr :refresh_failed, :boolean,
+    default: false,
+    doc: "the page's last async refresh exited; the chip turns red with \"refresh failed\""
+
   slot :actions, doc: "top-bar right-aligned controls (e.g. a time-range picker)"
   slot :inner_block, required: true
 
@@ -164,9 +178,11 @@ defmodule FathomWeb.Layouts do
             <span class="font-semibold md:hidden">Fathom</span>
             <div class="ml-auto flex items-center gap-4">
               {render_slot(@actions)}
-              <span class="flex items-center gap-1.5 text-xs text-base-content/60">
-                <span class="live-dot inline-block size-2 rounded-full bg-success"></span> live
-              </span>
+              <.freshness_chip
+                as_of_ms={@as_of_ms}
+                stale_after_ms={@stale_after_ms}
+                refresh_failed={@refresh_failed}
+              />
               <.theme_toggle />
             </div>
           </header>
@@ -181,6 +197,83 @@ defmodule FathomWeb.Layouts do
     </div>
     """
   end
+
+  attr :as_of_ms, :integer, default: nil
+  attr :stale_after_ms, :integer, required: true
+  attr :refresh_failed, :boolean, default: false
+
+  # The shared staleness indicator (expert review 2026-10-15 #5). No `as_of_ms` (a page with no
+  # polled data) keeps the plain "live" dot. Otherwise the server renders the state at render time
+  # and a colocated hook keeps the age ticking client-side, so a frozen collector (no re-render
+  # ever arrives) still goes amber/red without a per-viewer server timer. The server sends the AGE,
+  # not the timestamp, so browser/server clock skew cannot fake staleness.
+  defp freshness_chip(%{as_of_ms: nil} = assigns) do
+    ~H"""
+    <span
+      id="freshness-chip"
+      data-state="live"
+      class="flex items-center gap-1.5 text-xs text-base-content/60"
+    >
+      <span class="live-dot inline-block size-2 rounded-full bg-success"></span> live
+    </span>
+    """
+  end
+
+  defp freshness_chip(assigns) do
+    age = max(System.system_time(:millisecond) - assigns.as_of_ms, 0)
+    state = freshness_state(age, assigns.stale_after_ms, assigns.refresh_failed)
+    assigns = assign(assigns, age: age, state: state)
+
+    ~H"""
+    <span
+      id="freshness-chip"
+      phx-hook=".Freshness"
+      data-state={@state}
+      data-age-ms={@age}
+      data-stale-ms={@stale_after_ms}
+      data-failed={to_string(@refresh_failed)}
+      class="group flex items-center gap-1.5 text-xs text-base-content/60 data-[state=stale]:text-warning data-[state=failed]:text-error"
+    >
+      <span class="live-dot inline-block size-2 rounded-full bg-success group-data-[state=stale]:bg-warning group-data-[state=failed]:bg-error"></span>
+      <span id="freshness-label">{freshness_label(@state, @age)}</span>
+    </span>
+    <script :type={Phoenix.LiveView.ColocatedHook} name=".Freshness">
+      export default {
+        mounted() { this.sync(); this.timer = setInterval(() => this.paint(), 1000) },
+        updated() { this.sync() },
+        destroyed() { clearInterval(this.timer) },
+        sync() { this.base = parseInt(this.el.dataset.ageMs, 10) || 0; this.t0 = performance.now(); this.paint() },
+        paint() {
+          const age = this.base + (performance.now() - this.t0)
+          const d = this.el.dataset
+          if (d.failed !== "true") d.state = age > parseInt(d.staleMs, 10) ? "stale" : "fresh"
+          const s = Math.floor(age / 1000)
+          const t = s < 60 ? s + "s" : s < 3600 ? Math.floor(s / 60) + "m" : Math.floor(s / 3600) + "h"
+          const label = this.el.querySelector("#freshness-label")
+          if (label) label.textContent = d.state === "failed" ? "refresh failed · " + t + " ago" : "as of " + t + " ago"
+        }
+      }
+    </script>
+    """
+  end
+
+  @doc """
+  The chip's state for data `age_ms` old: `:failed` (last refresh exited) beats `:stale` (older
+  than `stale_after_ms`) beats `:fresh`.
+  """
+  @spec freshness_state(integer(), integer(), boolean()) :: :fresh | :stale | :failed
+  def freshness_state(_age_ms, _stale_after_ms, true), do: :failed
+  def freshness_state(age_ms, stale_after_ms, false) when age_ms > stale_after_ms, do: :stale
+  def freshness_state(_age_ms, _stale_after_ms, false), do: :fresh
+
+  defp freshness_label(state, age_ms) do
+    t = age_text(div(age_ms, 1000))
+    if state == :failed, do: "refresh failed · #{t} ago", else: "as of #{t} ago"
+  end
+
+  defp age_text(s) when s < 60, do: "#{s}s"
+  defp age_text(s) when s < 3600, do: "#{div(s, 60)}m"
+  defp age_text(s), do: "#{div(s, 3600)}h"
 
   attr :navigate, :string, required: true
   attr :active, :boolean, default: false

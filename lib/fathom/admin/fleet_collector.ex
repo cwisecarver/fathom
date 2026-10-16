@@ -50,6 +50,13 @@ defmodule Fathom.Admin.FleetCollector do
   def topic, do: @topic
 
   @doc """
+  Stamp a roll-up with `:fetched_at_ms` (system time) so the admin UI can show how old it is
+  (expert review 2026-10-15 #5). `MetricsCollector` already carries `at_ms`.
+  """
+  @spec stamp(map()) :: map()
+  def stamp(overview), do: Map.put(overview, :fetched_at_ms, System.system_time(:millisecond))
+
+  @doc """
   Register `pid` (default: the caller) as a viewer. The collector polls only while at least one
   viewer is alive. A no-op when the collector is not running.
   """
@@ -245,6 +252,7 @@ defmodule Fathom.Admin.FleetCollector do
 
   def handle_info({ref, overview}, %{task: %{ref: ref}} = state) do
     Process.demonitor(ref, [:flush])
+    overview = stamp(overview)
     Phoenix.PubSub.broadcast(Fathom.PubSub, @topic, {:fleet, overview})
     {:noreply, schedule(%{state | current: overview, task: nil})}
   end

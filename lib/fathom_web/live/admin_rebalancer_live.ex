@@ -135,7 +135,13 @@ defmodule FathomWeb.AdminRebalancerLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.admin flash={@flash} active={:rebalancer} node_key={@node_key}>
+    <Layouts.admin
+      flash={@flash}
+      active={:rebalancer}
+      node_key={@node_key}
+      as_of_ms={Map.get(@fleet || %{}, :fetched_at_ms)}
+      stale_after_ms={30_000}
+    >
       <:actions>
         <.badge kind={if(@rebalancer_on, do: :ok, else: :neutral)}>
           <span id="rebalancer-gate">{if(@rebalancer_on, do: "rebalancer on", else: "rebalancer off")}</span>
