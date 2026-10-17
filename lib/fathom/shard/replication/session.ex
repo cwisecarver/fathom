@@ -320,11 +320,6 @@ defmodule Fathom.Shard.Replication.Session do
        # at all — an ack advances the follower to this position, and an `:offset_mismatch` keeps the
        # generation and salt from the same record while taking the offset the follower reported.
        inflight: %{},
-       # When each shipper's CURRENT outstanding push was sent (monotonic ms), set only when an entry
-       # is created. Lets `ship_planned/4` skip a follower whose shipper provably still holds this
-       # shard's waiter without trusting an `inflight` entry that outlived its push (expert review
-       # 2026-10-17 #9). Never cleaned: bounded by the follower count, and read only beside `inflight`.
-       inflight_at: %{},
        # Shippers with a seed in flight. A seed can be a whole database, so starting a second one
        # for the same follower because the next commit also saw :unknown_shard would multiply a
        # large transfer by the write rate.
@@ -1047,28 +1042,10 @@ defmodule Fathom.Shard.Replication.Session do
       # the replica stayed torn, its next reply re-requested a seed, and the loop repeated — the
       # rig's dominant 1024-tenant error source. The seed carries everything up to its start, and
       # the frames committed meanwhile follow as an append once its result lands.
-      #
-      # A FOLLOWER WITH A PUSH STILL IN FLIGHT IS SKIPPED THE SAME WAY (expert review 2026-10-17 #9).
-      # Its shipper holds this shard's single waiter, so a new push would be refused locally
-      # `:already_in_flight` (~12% of commits on the rig) — after being read, compressed, charged to
-      # the byte budget and cast, plus a warning inside the commit wait. It counts as the same
-      # up-front refusal the shipper's reply would have been, and the reason is the same one, so
-      # `reconcile/2` (keeps the outstanding expectation), `arm_if_rejected/2` (schedules the retry)
-      # and `@settled_rejects` (absent: the entry stays) behave exactly as for the local refusal.
-      # "In flight" is bounded to `timeout()` since the push was sent: an `inflight` entry can
-      # outlive its push (a local `:overloaded` refusal keeps one), and a follower must not be
-      # skipped forever on that — past the bound it is pushed to as before and the shipper decides.
-      now = System.monotonic_time(:millisecond)
-
       {skipped, sendable} =
-        Enum.split_with(plans, fn {s, _} ->
-          Map.has_key?(state.seeding, s) or in_flight?(state, s, now)
-        end)
+        Enum.split_with(plans, fn {s, _} -> Map.has_key?(state.seeding, s) end)
 
-      skipped =
-        Enum.map(skipped, fn {s, _} ->
-          {s, if(Map.has_key?(state.seeding, s), do: :seeding, else: :already_in_flight)}
-        end)
+      skipped = Enum.map(skipped, &elem(&1, 0))
 
       t_build = System.monotonic_time()
       built = build_pushes(state, wal_path, epoch, header, sendable)
@@ -1082,11 +1059,6 @@ defmodule Fathom.Shard.Replication.Session do
           read_failed(state, reason)
       end
     end
-  end
-
-  defp in_flight?(state, shipper, now) do
-    Map.has_key?(state.inflight, shipper) and
-      now - Map.get(state.inflight_at, shipper, 0) < timeout()
   end
 
   # Did this round hand every follower the whole WAL, or did `Primary.plan/3`'s cap stop short?
@@ -1290,18 +1262,7 @@ defmodule Fathom.Shard.Replication.Session do
     # per shard and a `Session` is per-shard: if `inflight` already has an entry for a shipper,
     # that shipper is still holding this shard's waiter, so the push about to be sent WILL be
     # refused locally and has no expectation to record.
-    now = System.monotonic_time(:millisecond)
-
-    sent_at =
-      for {shipper, _} <- plans, not Map.has_key?(state.inflight, shipper), into: %{} do
-        {shipper, now}
-      end
-
-    state = %{
-      state
-      | inflight: Map.merge(expectations(plans, header), state.inflight),
-        inflight_at: Map.merge(state.inflight_at, sent_at)
-    }
+    state = %{state | inflight: Map.merge(expectations(plans, header), state.inflight)}
 
     case max(quorum() - current, 0) do
       # Followers that are already current carry the quorum on their own. The laggards still get
@@ -1309,11 +1270,7 @@ defmodule Fathom.Shard.Replication.Session do
       # wait for an ack it does not need.
       0 ->
         Replication.ship_async(pushes)
-
-        # A follower skipped for an outstanding push gets no reply to reject, so report the refusal
-        # that reply would have been: it arms the catch-up retry, which is what re-sends to a
-        # laggard on a quiet shard (expert review 2026-10-17 #9). Seeding skips stay silent, as before.
-        {:ok, state, for({s, :already_in_flight} <- skipped, do: {s, :already_in_flight, 0})}
+        {:ok, state, []}
 
       needed ->
         collect(state, pushes, needed, skipped)

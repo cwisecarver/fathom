@@ -79,12 +79,9 @@ defmodule Fathom.Shard.Replication do
           {:ok, [pid()], [{pid(), atom(), non_neg_integer()}]}
           | {:error, {:no_quorum, :impossible | :timeout, [{pid(), atom(), non_neg_integer()}]}}
   def ship_quorum(pushes, q, timeout \\ @default_timeout_ms, opts \\ []) do
-    # `:skip` — `[{shipper, reason}]`: followers that belong to the quorum but are not sent
-    # anything, counted as refusals up front. `:seeding`: a follower mid-seed can only refuse a
-    # push, and pushing to it races the seed for its shipper's per-shard waiter. `:already_in_flight`:
-    # its shipper still holds this shard's single waiter, so the push would be refused locally after
-    # being read, compressed and budget-charged (expert review 2026-10-17 #9). See
-    # `Session.ship_planned/4`.
+    # `:skip` — followers that belong to the quorum but are not sent anything, counted as refusals
+    # up front (reason `:seeding`): a follower mid-seed can only refuse a push, and pushing to it
+    # races the seed for its shipper's per-shard waiter. See `Session.ship_planned/4`.
     skipped = Keyword.get(opts, :skip, [])
     n = length(pushes) + length(skipped)
     # Raises on q >= n. That is intentional and load-bearing — see Quorum.new/2.
@@ -103,12 +100,8 @@ defmodule Fathom.Shard.Replication do
       end)
 
     deadline = System.monotonic_time(:millisecond) + timeout
-    rejects = for {s, reason} <- skipped, do: {s, reason, 0}
-
-    outcome =
-      Enum.reduce(skipped, {:pending, quorum}, fn {s, _reason}, {_, qs} ->
-        Quorum.reject(qs, s)
-      end)
+    rejects = for s <- skipped, do: {s, :seeding, 0}
+    outcome = Enum.reduce(skipped, {:pending, quorum}, fn s, {_, qs} -> Quorum.reject(qs, s) end)
 
     case outcome do
       # Decided before anything is sent: the followers left cannot make the quorum.
@@ -200,12 +193,6 @@ defmodule Fathom.Shard.Replication do
   # still shipping, which is a real event an operator wants to see.
   defp log_reject(_shard_id, :offset_mismatch), do: :ok
   defp log_reject(_shard_id, :unknown_shard), do: :ok
-
-  # `:already_in_flight` is our own shipper's LOCAL refusal and routine (counted by the shipper's
-  # reject telemetry); `Session` now skips such followers before pushing, so what still reaches here
-  # is a race. One warning per occurrence inside the commit wait was pure overhead (expert review
-  # 2026-10-17 #9).
-  defp log_reject(_shard_id, :already_in_flight), do: :ok
 
   defp log_reject(shard_id, reason) do
     Logger.warning("replication rejected for #{shard_id}: #{inspect(reason)}")
