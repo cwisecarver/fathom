@@ -53,7 +53,7 @@ defmodule Fathom.Shard.Replication.Wal do
   """
   @spec read(Path.t()) :: {:ok, header()} | {:ok, :empty} | {:error, term()}
   def read(path) do
-    case File.stat(path) do
+    case stat(path) do
       {:ok, %{size: size}} when size >= @header_bytes ->
         read_header(path, size)
 
@@ -223,7 +223,7 @@ defmodule Fathom.Shard.Replication.Wal do
   @spec read_held(handle(), Path.t()) ::
           {:ok, header(), handle()} | {:ok, :empty, handle()} | {:error, term(), handle()}
   def read_held(handle, path) do
-    case File.stat(path) do
+    case stat(path) do
       {:ok, %{size: size, inode: inode}} when size >= @header_bytes ->
         case ensure_fd(handle, path, inode) do
           {:ok, h} -> header_from(h, size)
@@ -252,7 +252,7 @@ defmodule Fathom.Shard.Replication.Wal do
   def read_delta_held(handle, _path, _offset, 0), do: {:ok, <<>>, handle}
 
   def read_delta_held(handle, path, offset, len) do
-    case File.stat(path) do
+    case stat(path) do
       {:ok, %{inode: inode}} ->
         with {:ok, h} <- ensure_fd(handle, path, inode),
              {:ok, bin} when byte_size(bin) == len <- :file.pread(h.fd, offset, len) do
@@ -267,6 +267,15 @@ defmodule Fathom.Shard.Replication.Wal do
         {:error, :short_read, close_held(handle)}
     end
   end
+
+  # RAW STAT (expert review 2026-10-17 #8). Plain `File.stat/1` is a non-raw `:file` call, which is
+  # routed through the single `file_server_2` process; `[:raw]` does the syscall in the caller.
+  # Measured on OTP 29, macOS APFS: 16.9 us vs 12.8 us single-caller, and 16 concurrent callers
+  # (the shape of N tenants committing at once, 2-3 stats per commit) 15.6 us vs 6.4 us per call
+  # throughput, i.e. the non-raw path serialises on that one process. Same option the follower
+  # already uses for its own stats.
+  @spec stat(Path.t()) :: {:ok, File.Stat.t()} | {:error, File.posix()}
+  defp stat(path), do: File.stat(path, [:raw])
 
   @doc "Closes any held fd. Always returns `nil`, so callers can assign the result directly."
   @spec close_held(handle()) :: nil
