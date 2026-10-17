@@ -192,6 +192,14 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # short-circuits on its own replica before opening a socket), and only that path performs the
   # mid-flight `recheck_object/4`. Routing it to the local path silently dropped the re-read and
   # promoted against a stamp that had moved.
+  #
+  # Do NOT skip the fleet ask for a claim-less lease (expert review 2026-10-17 #7, decided: keep it).
+  # "No :claim ⇒ the previous owner flushed and stamped everything, so no peer can be fresher" is
+  # false on the conns>0 terminate path (rolling deploy / SIGTERM): WriteFence goes up and the drop
+  # snapshot is taken, but a statement that passed the fence check just before can commit after the
+  # snapshot's position stamp was read and be quorum-acked to followers. The drop flush still
+  # succeeds, so `release_plain` deletes the lock with no claim, and the object lacks a write a peer
+  # replica holds. This ask is what recovers it.
   defp try_promote(shard_id, path, lease, etag, lineage, head) do
     cond do
       not Recovery.enabled?() -> try_promote_local(shard_id, path, lease, etag, lineage)
