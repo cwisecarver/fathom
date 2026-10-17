@@ -1113,6 +1113,118 @@ defmodule Fathom.Shard.ReplicationSeedTest do
              "and one wasted payload, at the ~10k :already_in_flight per node AGENTS.md records."
   end
 
+  # EXPERT REVIEW 2026-10-17 #9. A follower whose shipper still holds this shard's single waiter
+  # used to be planned, read, compressed, budget-charged and cast anyway, then refused locally
+  # `:already_in_flight` (~12% of commits on the rig) with a warning inside the commit wait. It is
+  # now skipped up front and counted as the same refusal, so NO push reaches the shipper (no
+  # `:already_in_flight` reject event) while the quorum is still decided correctly.
+  describe "a follower with a push in flight is skipped, not pushed (expert review 2026-10-17 #9)" do
+    setup do
+      test_pid = self()
+      hid = "inflight-skip-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        hid,
+        [:fathom, :replication, :reject],
+        fn _ev, _m, %{reason: reason}, _ -> send(test_pid, {:shipper_reject, reason}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(hid) end)
+      :ok
+    end
+
+    test "quorum still reachable without it: the commit acks and no push is refused", ctx do
+      %{id: id, root: root} = ctx
+      [{a, pa}, {b, pb}, {laggard, plag}] = start_followers!(root, 3)
+      peer = start_supervised!({Fathom.Test.PausablePeer, upstream_port: plag, notify: self()})
+      enable!([{a, pa}, {b, pb}, {laggard, Fathom.Test.PausablePeer.port(peer)}], 2)
+
+      {coordinator, conn, path} = open_shard!(id)
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+      wal = path <> "-wal"
+      for n <- [a, b, laggard], do: Follower.seed(n, id, 0, 0, 0, 0)
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+      assert :ok = Session.commit(id, wal, coordinator)
+      _ = drive_until_converged(conn, wal, coordinator, id, [a, b, laggard])
+
+      [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+      lag_shipper = List.last(Fleet.shippers())
+
+      :ok = Fathom.Test.PausablePeer.pause(peer)
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
+      assert :ok = Session.commit(id, wal, coordinator)
+      await_held!(peer, "the laggard never answered the commit that was supposed to be held")
+      first = :sys.get_state(session).inflight[lag_shipper]
+      assert first
+
+      flush_rejects()
+
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (3)", [])
+      assert :ok = Session.commit(id, wal, coordinator)
+
+      refute_receive {:shipper_reject, :already_in_flight}, 200
+      assert :sys.get_state(session).inflight[lag_shipper] == first
+
+      {:ok, _} = Fathom.Test.PausablePeer.release(peer)
+    end
+
+    test "quorum NOT reachable without them: resolves to no_quorum, still no push", ctx do
+      %{id: id, root: root} = ctx
+      [{a, pa}, {b, pb}, {c, pc}, {d, pd}] = start_followers!(root, 4)
+
+      peer_b =
+        start_supervised!({Fathom.Test.PausablePeer, upstream_port: pb, notify: self()}, id: :pb)
+
+      peer_c =
+        start_supervised!({Fathom.Test.PausablePeer, upstream_port: pc, notify: self()}, id: :pc)
+
+      enable!(
+        [
+          {a, pa},
+          {b, Fathom.Test.PausablePeer.port(peer_b)},
+          {c, Fathom.Test.PausablePeer.port(peer_c)},
+          {d, pd}
+        ],
+        2
+      )
+
+      {coordinator, conn, path} = open_shard!(id)
+      {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+      wal = path <> "-wal"
+      for n <- [a, b, c, d], do: Follower.seed(n, id, 0, 0, 0, 0)
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+      assert :ok = Session.commit(id, wal, coordinator)
+      _ = drive_until_converged(conn, wal, coordinator, id, [a, b, c, d])
+
+      # Hold b and c's answers (their shippers keep the shard's waiter); a and d carry this commit.
+      :ok = Fathom.Test.PausablePeer.pause(peer_b)
+      :ok = Fathom.Test.PausablePeer.pause(peer_c)
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
+      assert :ok = Session.commit(id, wal, coordinator)
+      await_held!(peer_b, "b never answered the commit that was supposed to be held")
+
+      # Now d goes away: with b and c still in flight, only a can ack, and Q=2 is out of reach.
+      :ok = stop_supervised(:"#{d}")
+      flush_rejects()
+
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (3)", [])
+      assert {:error, {:no_quorum, _}} = Session.commit(id, wal, coordinator)
+      refute_receive {:shipper_reject, :already_in_flight}, 200
+
+      {:ok, _} = Fathom.Test.PausablePeer.release(peer_b)
+      {:ok, _} = Fathom.Test.PausablePeer.release(peer_c)
+    end
+  end
+
+  defp flush_rejects do
+    receive do
+      {:shipper_reject, _} -> flush_rejects()
+    after
+      0 -> :ok
+    end
+  end
+
   # Commit until every follower holds the primary's WAL, or give up loudly. Bounded, and each round
   # is a real write — the same thing that makes a strand self-heal in production.
   defp drive_until_converged(conn, wal, coordinator, id, followers, rounds \\ 12) do
