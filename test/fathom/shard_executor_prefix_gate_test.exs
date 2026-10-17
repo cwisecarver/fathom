@@ -500,4 +500,55 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
              ShardExecutor.execute(h, stmt("PRAGMA user_version = 5"))
            )
   end
+
+  # Expert review 2026-10-17 #11: the classifiers now share ONE statement head computed in
+  # `do_execute/2` (40 ASCII-lowercased BYTES of `strip_lead_noise/1`'s output). Pin that the
+  # BOM / `;` prefixes still reach the DDL and user_version gates through that head, and that a
+  # non-ASCII lead (or a head cut mid-codepoint) neither crashes nor matches a keyword.
+  test "BOM- and ;-prefixed CREATE / PRAGMA user_version are refused through the shared head",
+       %{shard: _shard} do
+    prev = Application.get_env(:fathom, :block_tenant_ddl, false)
+    Application.put_env(:fathom, :block_tenant_ddl, true)
+    head_shard = "test_head_#{System.unique_integer([:positive])}"
+    {:ok, h} = ShardExecutor.open(head_shard)
+
+    on_exit(fn ->
+      ShardExecutor.close(h)
+      Application.put_env(:fathom, :block_tenant_ddl, prev)
+      rm_shard_files(head_shard)
+    end)
+
+    for sql <- [
+          "\u{FEFF}CREATE TABLE b1 (x)",
+          ";CREATE TABLE b2 (x)",
+          "\u{FEFF};create table b3 (x)"
+        ] do
+      assert {:error, %Error{code: "FILO_DDL_BLOCKED"}} = ShardExecutor.execute(h, stmt(sql)),
+             "#{inspect(sql)} bypassed :block_tenant_ddl"
+    end
+
+    for sql <- [
+          "\u{FEFF}PRAGMA user_version = 5",
+          ";PRAGMA user_version = 5",
+          "\u{FEFF};pragma USER_VERSION(5)"
+        ] do
+      assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
+               ShardExecutor.execute(h, stmt(sql)),
+             "#{inspect(sql)} forged the stamp"
+    end
+
+    # Non-ASCII leads: an engine syntax error, not a crash ("internal error"), including a head
+    # whose 40-byte cut lands mid-codepoint and a Kelvin sign that Unicode-downcases to "k".
+    for sql <- [
+          String.duplicate("é", 41),
+          "\u{212A}ELECT 1",
+          "\u{130}NSERT INTO t VALUES (1)",
+          "SELECT '" <> String.duplicate("日本", 30) <> "'"
+        ] do
+      res = ShardExecutor.execute(h, stmt(sql))
+
+      refute match?({:error, %Error{message: "internal error executing statement"}}, res),
+             inspect(sql)
+    end
+  end
 end

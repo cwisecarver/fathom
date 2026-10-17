@@ -196,10 +196,15 @@ defmodule Fathom.ShardExecutor do
        ) do
     # Classify the statement ONCE — dml?/ddl? each slice+downcase the statement head, and the old
     # shape recomputed them up to 3× per statement (twice in this cond, again in to_stmt_result).
-    dml? = dml?(sql)
-    ddl? = ddl?(sql)
+    #
+    # The statement HEAD is computed once here (expert review 2026-10-17 #11) and handed to every
+    # pure-prefix classifier below; each used to re-run `lead/2` (strip + slice + Unicode downcase)
+    # ~15-20 times per statement. `head/1` is the single normaliser's only consumer.
+    head = head(sql)
+    dml? = dml?(head)
+    ddl? = ddl?(head)
     write? = dml? or ddl?
-    note_session_state(conn, sql)
+    note_session_state(conn, sql, head)
 
     cond do
       # Statements no tenant may run, regardless of scope or config (expert review 2026-08-01
@@ -207,7 +212,7 @@ defmodule Fathom.ShardExecutor do
       # tenant handle is the real enforcement — this branch exists to return a *diagnosable*
       # error code instead of a bare "not authorized"/"authorization denied" from the engine,
       # and to cover the pragma names the authorizer cannot express per-name.
-      blocked = blocked_statement(sql) ->
+      blocked = blocked_statement(sql, head) ->
         {:error, blocked}
 
       # A read-only token (#24) may only read: refuse any write (DML or DDL) with a distinct 403 so
@@ -261,7 +266,8 @@ defmodule Fathom.ShardExecutor do
 
       # `write_candidate?/1`, NOT `write?` (expert review 2026-08-26 #1). See its definition for
       # why the fence needs a wider, fail-closed predicate than the one driving `read_only?`.
-      write_candidate?(sql) and WriteFence.fenced?(shard_id) ->
+      # Cheap ETS membership first, the head test only when fenced (expert review 2026-10-17 #11).
+      WriteFence.fenced?(shard_id) and write_candidate?(head) ->
         {:error,
          %Error{
            message:
@@ -282,7 +288,7 @@ defmodule Fathom.ShardExecutor do
       # un-ACK, no client wedged); on the terminate fence it is true. ROLLBACK is
       # `commit_boundary?`-false and left alone, so the stream's teardown can still abandon the
       # transaction and the client retries against the successor with nothing acknowledged.
-      commit_boundary?(sql) and txn_wrote?(conn) and WriteFence.fenced?(shard_id) ->
+      WriteFence.fenced?(shard_id) and commit_boundary?(head) and txn_wrote?(conn) ->
         {:error,
          %Error{
            message:
@@ -318,7 +324,7 @@ defmodule Fathom.ShardExecutor do
       # engine — did not cover it. Gate the ASSIGNMENT behind the same lever (the bare READ stays
       # allowed, and the template is exempt as the migration source), so a fleet that locks DDL down
       # has also locked the stamp.
-      opts.block_ddl? and not opts.template? and user_version_write?(sql) ->
+      opts.block_ddl? and not opts.template? and user_version_write?(sql, head) ->
         {:error,
          %Error{
            message:
@@ -329,7 +335,7 @@ defmodule Fathom.ShardExecutor do
          }}
 
       true ->
-        run_statement(handle, stmt, dml?, ddl?)
+        run_statement(handle, stmt, head, dml?, ddl?)
     end
   end
 
@@ -346,6 +352,7 @@ defmodule Fathom.ShardExecutor do
   defp run_statement(
          {pid, _ref, conn, shard_id, _scope, _ver, opts},
          %Stmt{sql: sql, args: args},
+         head,
          dml?,
          ddl?
        ) do
@@ -357,7 +364,7 @@ defmodule Fathom.ShardExecutor do
     # `Connection.cap_temp/1`).
     if ddl?, do: cap_temp(conn)
 
-    read? = read_verb?(sql)
+    read? = read_verb?(head)
 
     case Connection.query(conn, sql, args, dml?: dml?, read?: read?, deadline: true) do
       {:ok, result} ->
@@ -382,9 +389,9 @@ defmodule Fathom.ShardExecutor do
         # open-shard count"). Gate it on whether this connection actually wrote since BEGIN. The
         # race the unconditional bump existed for is untouched: it needs an in-flight write, which
         # sets the flag. A transaction with no write has nothing uncommitted to lose.
-        wrote? = wrote?(result, sql, read?)
+        wrote? = wrote?(result, sql, head, read?)
 
-        if wrote? or (commit_boundary?(sql) and txn_wrote?(conn)) do
+        if wrote? or (commit_boundary?(head) and txn_wrote?(conn)) do
           Fathom.Shard.WriteCounter.bump(shard_id)
           # Tell the coordinator once per checkout that this stream has written (expert review
           # 2026-08-01 #42). A served-but-clean shard polls at a reduced flush cadence; this is
@@ -396,9 +403,9 @@ defmodule Fathom.ShardExecutor do
 
         # A2 quorum replication (off unless :replication_enabled). Computed BEFORE
         # track_txn_write/3, which clears the in-transaction flag this decision reads.
-        repl = maybe_replicate(shard_id, pid, conn, sql, wrote?)
+        repl = maybe_replicate(shard_id, pid, conn, head, wrote?)
 
-        track_txn_write(conn, sql, wrote?)
+        track_txn_write(conn, head, wrote?)
 
         # On the reserved template shard, feed each successful statement to the
         # migration capture so a Django migrate becomes a fleet version.
@@ -529,10 +536,10 @@ defmodule Fathom.ShardExecutor do
   # A durable pragma that RETURNS a column (`PRAGMA optimize` → cols ["optimize"], and
   # `PRAGMA journal_mode = wal` → cols ["journal_mode"]) must be checked before the `cols != []`
   # clause below, or the "result has columns ⇒ read" rule drops it: expert review 2026-10-10 #24.
-  defp wrote?(%{columns: cols, num_changes: changes}, sql, read?) do
+  defp wrote?(%{columns: cols, num_changes: changes}, sql, head, read?) do
     cond do
-      control_statement?(sql) -> false
-      durable_pragma_statement?(sql) -> true
+      control_statement?(sql, head) -> false
+      durable_pragma_statement?(sql, head) -> true
       cols != [] and read? -> false
       changes > 0 -> true
       cols != [] -> false
@@ -576,9 +583,7 @@ defmodule Fathom.ShardExecutor do
   # `is_binary` clause itself, which returns false for an unknown verb. The catch-alls only ever
   # answered the non-binary case, which cannot occur. A future caller that broke that now fails at
   # the dialyzer gate rather than silently classifying a write as a read.
-  defp read_verb?(sql) when is_binary(sql) do
-    Enum.any?(@read_verbs, &String.starts_with?(lead(sql, 7), &1))
-  end
+  defp read_verb?(head), do: Enum.any?(@read_verbs, &String.starts_with?(head, &1))
 
   @control_prefixes ~w(begin commit end rollback savepoint release pragma)
 
@@ -611,14 +616,16 @@ defmodule Fathom.ShardExecutor do
   # ("savepoint"); only a pragma needs the full text (durable_pragma_write? scans the body for
   # `=` and the header-writing names), and pragma statements are short, so the full downcase
   # is confined to that branch.
-  defp control_statement?(sql) when is_binary(sql) do
-    stripped = strip_lead_noise(sql)
-    head = stripped |> String.slice(0, 9) |> String.downcase()
-
+  defp control_statement?(sql, head) do
     cond do
-      String.starts_with?(head, "pragma") -> not durable_pragma_write?(String.downcase(stripped))
-      Enum.any?(@control_prefixes, &String.starts_with?(head, &1)) -> true
-      true -> false
+      String.starts_with?(head, "pragma") ->
+        not durable_pragma_write?(String.downcase(strip_lead_noise(sql)))
+
+      Enum.any?(@control_prefixes, &String.starts_with?(head, &1)) ->
+        true
+
+      true ->
+        false
     end
   end
 
@@ -629,8 +636,7 @@ defmodule Fathom.ShardExecutor do
   # whole statement, so a trigger body's inner `... BEGIN ... END` (the statement starts with
   # CREATE) is never mistaken for a transaction commit. Slice-first for the same per-query
   # reason as control_statement?/1 — this runs on every clean (SELECT) result.
-  defp ends_transaction?(sql) when is_binary(sql) do
-    head = lead(sql, 6)
+  defp ends_transaction?(head) do
     String.starts_with?(head, "commit") or String.starts_with?(head, "end")
   end
 
@@ -678,18 +684,18 @@ defmodule Fathom.ShardExecutor do
   # so a subsequent read-only transaction can't inherit this one's dirtiness. Any write sets it.
   # Order matters: a write is recorded even on a statement that also ends a transaction (there is
   # no such statement in SQLite today, but the ordering makes the flag's meaning unambiguous).
-  defp track_txn_write(conn, sql, wrote?) do
+  defp track_txn_write(conn, head, wrote?) do
     key = {__MODULE__, @txn_wrote_key, conn}
 
     cond do
       # BEGIN first, deliberately: a BEGIN cannot itself write, so it always opens a clean
       # transaction regardless of how the classifier scored it.
-      begins_transaction?(sql) -> Process.put(key, false)
+      begins_transaction?(head) -> Process.put(key, false)
       wrote? -> Process.put(key, true)
       # Only a statement that actually ENDS the transaction may clear the flag. Notably absent:
       # RELEASE (an inner savepoint release commits nothing — the outer COMMIT must still re-bump
       # if a flush straddles it) and `ROLLBACK TO <savepoint>` (see rolls_back?/1).
-      ends_transaction?(sql) or rolls_back?(sql) -> Process.delete(key)
+      ends_transaction?(head) or rolls_back?(head) -> Process.delete(key)
       true -> :ok
     end
 
@@ -718,8 +724,8 @@ defmodule Fathom.ShardExecutor do
 
   @session_mutated_key :session_mutated
 
-  defp note_session_state(conn, sql) do
-    if session_pragma?(sql), do: mark_session_mutated(conn)
+  defp note_session_state(conn, sql, head) do
+    if session_pragma?(sql, head), do: mark_session_mutated(conn)
     :ok
   end
 
@@ -730,9 +736,7 @@ defmodule Fathom.ShardExecutor do
   defp take_session_mutated(conn),
     do: Process.delete({__MODULE__, @session_mutated_key, conn}) == true
 
-  defp session_pragma?(sql) when is_binary(sql) do
-    head = lead(sql, 7)
-
+  defp session_pragma?(sql, head) do
     cond do
       String.starts_with?(head, "pragma") ->
         {name_raw, tail} = pragma_name_and_tail(sql)
@@ -745,7 +749,7 @@ defmodule Fathom.ShardExecutor do
       # `blocked_statement/1` recurses here.
       String.starts_with?(head, "explain") ->
         case explain_inner(sql) do
-          {:ok, inner} -> session_pragma?(inner)
+          {:ok, inner} -> session_pragma?(inner, head(inner))
           :not_explain -> false
         end
 
@@ -754,10 +758,6 @@ defmodule Fathom.ShardExecutor do
     end
   end
 
-  # Kept so the binary guard above does not narrow `do_execute/2`'s type inference for `sql` (which
-  # would mark `write_candidate?/1`'s own non-binary clause unreachable and fail the build).
-  defp session_pragma?(_sql), do: false
-
   # ---------------------------------------------------------------------------------------------
   # A2 quorum replication (expert-reviewed design in docs/a2-quorum-replication.md)
   # ---------------------------------------------------------------------------------------------
@@ -765,8 +765,8 @@ defmodule Fathom.ShardExecutor do
   # Ship this shard's newly committed WAL frames and wait for a follower quorum. Entirely inert
   # unless `:replication_enabled` — the gate is checked before anything else, so a node with the
   # feature off pays one `Application.get_env` per write and nothing more.
-  defp maybe_replicate(shard_id, pid, conn, sql, wrote?) do
-    if Session.enabled?() and ships_now?(conn, sql, wrote?) do
+  defp maybe_replicate(shard_id, pid, conn, head, wrote?) do
+    if Session.enabled?() and ships_now?(conn, head, wrote?) do
       Session.commit(shard_id, Shard.db_path(shard_id) <> "-wal", pid)
     else
       :ok
@@ -787,11 +787,11 @@ defmodule Fathom.ShardExecutor do
   # skip the quorum ship and be ACKED undurable -- on a node where replication is on in prod.
   # The flag now answers only "did this transaction write", for the commit-boundary arm.
   @doc false
-  def ships_now?(conn, sql, wrote?) do
+  def ships_now?(conn, head, wrote?) do
     # Cheap operands first: `autocommit?/1` is a dirty-IO NIF dispatch, and for a read `wrote?` is
     # false and no commit boundary, so evaluating it first paid a second dispatch per SELECT with
     # replication ON (expert review 2026-10-17 #3). Pure boolean reorder, same result.
-    (wrote? or (commit_boundary?(sql) and txn_wrote?(conn))) and Connection.autocommit?(conn)
+    (wrote? or (commit_boundary?(head) and txn_wrote?(conn))) and Connection.autocommit?(conn)
   end
 
   # Distinct from a SQLite error, and a 503 rather than a 400: nothing is wrong with the statement,
@@ -824,9 +824,7 @@ defmodule Fathom.ShardExecutor do
   defp no_quorum_reason({:session_down, :timeout}), do: :timeout
   defp no_quorum_reason(_), do: :other
 
-  defp begins_transaction?(sql) when is_binary(sql) do
-    String.starts_with?(lead(sql, 5), "begin")
-  end
+  defp begins_transaction?(head), do: String.starts_with?(head, "begin")
 
   # Statements at which in-flight writes become durable-able and the shard must be re-dirtied if
   # the transaction wrote: COMMIT/END, plus RELEASE. RELEASE matters because `ends_transaction?`
@@ -835,11 +833,9 @@ defmodule Fathom.ShardExecutor do
   # watermark past the uncommitted rows and the idle drop would lose them. Django opens nested
   # `atomic()` blocks as savepoints, so this is a live shape. An inner RELEASE that commits nothing
   # costs at most one spurious bump (over-dirty, the safe direction).
-  defp commit_boundary?(sql), do: ends_transaction?(sql) or releases_savepoint?(sql)
+  defp commit_boundary?(head), do: ends_transaction?(head) or releases_savepoint?(head)
 
-  defp releases_savepoint?(sql) when is_binary(sql) do
-    String.starts_with?(lead(sql, 7), "release")
-  end
+  defp releases_savepoint?(head), do: String.starts_with?(head, "release")
 
   # A plain `ROLLBACK` [TRANSACTION] discards the whole transaction — nothing is left to flush, so
   # the flag resets. `ROLLBACK [TRANSACTION] TO [SAVEPOINT] name` does NOT end the transaction: it
@@ -847,16 +843,14 @@ defmodule Fathom.ShardExecutor do
   # flag there would drop that write's re-bump at the eventual COMMIT and lose it on idle drop —
   # exactly Django's nested-atomic-raises-then-outer-commit shape. When in doubt, KEEP the flag:
   # keeping over-bumps (safe), clearing loses data.
-  defp rolls_back?(sql) when is_binary(sql) do
-    head = lead(sql, 40)
-
+  defp rolls_back?(head) do
     String.starts_with?(head, "rollback") and not String.contains?(head, " to ")
   end
 
   # The assignment form (`pragma [db.]name = value`) of a header-writing pragma; the
   # bare read form (`pragma user_version`) has no `=` and stays a read.
-  defp durable_pragma_statement?(sql) when is_binary(sql) do
-    String.starts_with?(lead(sql, 6), "pragma") and
+  defp durable_pragma_statement?(sql, head) do
+    String.starts_with?(head, "pragma") and
       durable_pragma_write?(String.downcase(strip_lead_noise(sql)))
   end
 
@@ -1072,7 +1066,7 @@ defmodule Fathom.ShardExecutor do
     |> split_statements()
     |> Enum.find_value(fn stmt ->
       cond do
-        opts.block_ddl? and not opts.template? and ddl?(stmt) ->
+        opts.block_ddl? and not opts.template? and ddl?(head(stmt)) ->
           %Error{
             message:
               "schema changes must go through the migration engine on the template shard, not a " <>
@@ -1084,7 +1078,7 @@ defmodule Fathom.ShardExecutor do
         # The same stamp gate execute/2 applies (expert review 2026-09-05 #21) — without it a
         # Hrana `sequence` carrying `PRAGMA user_version = N` forged the stamp that execute/2
         # refuses (expert review 2026-09-29 #30).
-        opts.block_ddl? and not opts.template? and user_version_write?(stmt) ->
+        opts.block_ddl? and not opts.template? and user_version_write?(stmt, head(stmt)) ->
           %Error{
             message:
               "PRAGMA user_version cannot be set on tenant \"#{shard_id}\"; the schema-version " <>
@@ -1279,7 +1273,7 @@ defmodule Fathom.ShardExecutor do
            params: params,
            cols: cols,
            is_explain: explain?(sql),
-           is_readonly: not (dml?(sql) or ddl?(sql))
+           is_readonly: not (dml?(head(sql)) or ddl?(head(sql)))
          }}
 
       {:error, reason} ->
@@ -1692,13 +1686,7 @@ defmodule Fathom.ShardExecutor do
   # a query. A CTE-prefixed `WITH ... INSERT` is not detected here — Django emits plain
   # `INSERT ... RETURNING "id"`, the case that matters; the CTE-DML edge falls back to the old
   # column-based read classification.
-  defp dml?(sql) when is_binary(sql) do
-    # Only the leading keyword matters — slice + downcase a few chars rather than the whole
-    # statement, since this runs on every query result.
-    Enum.any?(@dml_prefixes, &String.starts_with?(lead(sql, 7), &1))
-  end
-
-  defp dml?(_), do: false
+  defp dml?(head), do: Enum.any?(@dml_prefixes, &String.starts_with?(head, &1))
 
   # THE FENCE'S OWN PREDICATE. Deliberately separate from `dml?/1`, and deliberately FAIL-CLOSED.
   #
@@ -1723,11 +1711,7 @@ defmodule Fathom.ShardExecutor do
   # shard is fenced, a read-only CTE (and any statement whose head this file does not recognise) is
   # also refused — on a node that has already lost its lease and is returning 503s for writes
   # anyway. Refusing a read there is cheap; ACKing a write that will be quarantined is not.
-  defp write_candidate?(sql) when is_binary(sql) do
-    not read_shaped?(sql)
-  end
-
-  defp write_candidate?(_), do: true
+  defp write_candidate?(head), do: not read_shaped?(head)
 
   # The only statement heads that cannot mutate the tenant's data.
   #
@@ -1754,10 +1738,7 @@ defmodule Fathom.ShardExecutor do
   # Derived from the list so a longer verb added later stays covered — do NOT hard-code it back.
   @read_shaped_lead @read_shaped |> Enum.map(&byte_size/1) |> Enum.max()
 
-  defp read_shaped?(sql) do
-    head = lead(sql, @read_shaped_lead)
-    Enum.any?(@read_shaped, &String.starts_with?(head, &1))
-  end
+  defp read_shaped?(head), do: Enum.any?(@read_shaped, &String.starts_with?(head, &1))
 
   # --- statement gate (expert review 2026-08-01 #1, #7, #8) ---------------------------------
   #
@@ -1771,7 +1752,30 @@ defmodule Fathom.ShardExecutor do
   # Hot path: this runs on every statement, so the common case (a statement starting with a
   # letter) costs one extra 2-byte match over the previous `trim_leading`. Only a statement
   # that actually opens with a comment pays the scan.
-  defp lead(sql, n), do: sql |> strip_lead_noise() |> String.slice(0, n) |> String.downcase()
+  #
+  # `head/1` is that normalisation plus a bounded, ASCII-only lowercase of the first @head_bytes
+  # BYTES (expert review 2026-10-17 #11). Every keyword the classifiers match is ASCII and
+  # SQLite's tokenizer folds only ASCII case, so a byte cut and `:ascii` downcase classify exactly
+  # as the old grapheme slice + Unicode downcase did, minus the grapheme walk -- and a Unicode
+  # fold (U+212A KELVIN SIGN -> "k") no longer makes a non-ASCII spelling match a keyword SQLite
+  # would not. A cut mid-codepoint is harmless: nothing compares past an ASCII keyword prefix. It
+  # is computed ONCE per statement in `do_execute/2` and passed to the prefix classifiers.
+  @head_bytes 40
+
+  # The head must reach the end of the longest `@read_shaped` verb or that verb can never match
+  # (the 2026-09-05 ROLLBACK/SAVEPOINT regression); `rolls_back?/1` needs room for " to ".
+  if @head_bytes < @read_shaped_lead,
+    do: raise("@head_bytes shorter than the longest @read_shaped verb")
+
+  defp head(sql) when is_binary(sql) do
+    stripped = strip_lead_noise(sql)
+    stripped |> binary_part(0, min(byte_size(stripped), @head_bytes)) |> String.downcase(:ascii)
+  end
+
+  defp lead(sql, n) do
+    head = head(sql)
+    binary_part(head, 0, min(n, byte_size(head)))
+  end
 
   # Normalize the FRONT of a statement to the first byte SQLite's parser will actually run:
   # strip, in a loop, insignificant leading whitespace, both SQL comment forms, AND empty
@@ -1896,9 +1900,10 @@ defmodule Fathom.ShardExecutor do
 
   defp introspect_pragma?(name), do: name in @tenant_pragma_introspect
 
-  defp blocked_statement(sql) when is_binary(sql) do
-    head = lead(sql, 7)
+  defp blocked_statement(sql) when is_binary(sql), do: blocked_statement(sql, head(sql))
+  defp blocked_statement(_sql), do: nil
 
+  defp blocked_statement(sql, head) do
     cond do
       Enum.any?(@blocked_verbs, &String.starts_with?(head, &1)) ->
         %Error{
@@ -1928,8 +1933,6 @@ defmodule Fathom.ShardExecutor do
         nil
     end
   end
-
-  defp blocked_statement(_sql), do: nil
 
   # Strip a leading `EXPLAIN` (and an optional `QUERY PLAN`), returning `{:ok, inner}`; return
   # `:not_explain` when the head only looks like the keyword (an identifier that starts with
@@ -2160,8 +2163,8 @@ defmodule Fathom.ShardExecutor do
   # A `PRAGMA [schema.]user_version = N` / `(N)` ASSIGNMENT (not the bare read), for the
   # :block_tenant_ddl gate (#21). Reuses the same structural parse as blocked_pragma/1 so a prefix
   # trick (`;`, comments, `schema.`, insignificant whitespace) cannot slip an assignment past it.
-  defp user_version_write?(sql) when is_binary(sql) do
-    if String.starts_with?(lead(sql, 7), "pragma") do
+  defp user_version_write?(sql, head) do
+    if String.starts_with?(head, "pragma") do
       {name_raw, tail} = pragma_name_and_tail(sql)
 
       String.downcase(name_raw) == "user_version" and not bare_read_tail?(tail)
@@ -2207,11 +2210,7 @@ defmodule Fathom.ShardExecutor do
   # Leading-keyword schema-DDL detection (CREATE/ALTER/DROP — table/index/view/trigger). Cheap
   # slice, since this runs on every statement when strict mode is on. Comment-stripped: this
   # gates `:block_tenant_ddl`, which a `/* c */ CREATE TABLE` prefix defeated (#7).
-  defp ddl?(sql) when is_binary(sql) do
-    Enum.any?(@ddl_leads, &String.starts_with?(lead(sql, 6), &1))
-  end
-
-  defp ddl?(_), do: false
+  defp ddl?(head), do: Enum.any?(@ddl_leads, &String.starts_with?(head, &1))
 
   # The main schema's change counter, or nil if it cannot be read. Only ever called for a DDL
   # statement, so it adds two tiny queries to DDL and nothing to anything else.
