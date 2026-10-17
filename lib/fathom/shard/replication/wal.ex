@@ -31,6 +31,9 @@ defmodule Fathom.Shard.Replication.Wal do
   a new generation rather than to append into it.
   """
 
+  require Record
+  Record.defrecordp(:file_info, Record.extract(:file_info, from_lib: "kernel/include/file.hrl"))
+
   @header_bytes 32
   # Frame header: pgno(4) nTruncate(4) salt1(4) salt2(4) checksum1(4) checksum2(4). All big-endian.
   @frame_header_bytes 24
@@ -274,8 +277,16 @@ defmodule Fathom.Shard.Replication.Wal do
   # (the shape of N tenants committing at once, 2-3 stats per commit) 15.6 us vs 6.4 us per call
   # throughput, i.e. the non-raw path serialises on that one process. Same option the follower
   # already uses for its own stats.
-  @spec stat(Path.t()) :: {:ok, File.Stat.t()} | {:error, File.posix()}
-  defp stat(path), do: File.stat(path, [:raw])
+  # (`File.stat/2`'s spec does not admit `:raw`, and passing it made dialyzer drop `read/1`'s
+  # return type and cascade through 100+ callers, so this reads the `file_info` record directly.)
+  @spec stat(Path.t()) ::
+          {:ok, %{size: non_neg_integer(), inode: non_neg_integer()}} | {:error, :file.posix()}
+  defp stat(path) do
+    case :file.read_file_info(path, [:raw]) do
+      {:ok, info} -> {:ok, %{size: file_info(info, :size), inode: file_info(info, :inode)}}
+      {:error, _} = error -> error
+    end
+  end
 
   @doc "Closes any held fd. Always returns `nil`, so callers can assign the result directly."
   @spec close_held(handle()) :: nil
