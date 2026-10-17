@@ -42,7 +42,12 @@ defmodule Fathom.Rebalancer.Reporter do
   def enabled?, do: Application.get_env(:fathom, :load_reporter, false) == true
 
   @spec start_link(keyword()) :: GenServer.on_start()
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  def start_link(opts) do
+    # fullsweep_after: 0 — this process holds N-shard maps (prev/curr snapshots) between 10 s
+    # beats; default generational GC lets the old snapshot linger until the 65535th minor GC
+    # (expert review 2026-10-17 #18; same policy as Fathom.Shard and Replication.Session).
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__, spawn_opt: [fullsweep_after: 0])
+  end
 
   # report_now runs the full window (beat + publish + prune + warm-location publish) inline;
   # a large recent-hot set plus several Postgres round-trips can exceed the default 5s call
@@ -232,14 +237,13 @@ defmodule Fathom.Rebalancer.Reporter do
   # peer-pull/304 rather than a full cold S3 pull — the same win the warm cache gave, from the
   # mechanism that replaced it.
   defp publish_warm_locations do
-    # One ETS scan of this node's replica table, then in-memory membership. A node not running the
-    # follower has an empty set and advertises none.
-    warm_set = MapSet.new(Follower.replica_shard_ids())
-
+    # Hot ids first (bounded by the recent-sample window), then one ETS lookup per id on the
+    # follower table — not a copy of the whole replica table per beat (expert review 2026-10-17
+    # #14). A node not running the follower holds none and advertises none.
     warm_hot =
       @warm_hot_window_ms
       |> LoadSamples.recent_shard_ids()
-      |> Enum.filter(&MapSet.member?(warm_set, &1))
+      |> Follower.replica_shard_ids_among()
 
     WarmLocations.publish(Rebalancer.node_key(), warm_hot)
     WarmLocations.prune(retention_ms())

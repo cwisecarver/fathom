@@ -424,6 +424,31 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   @doc """
+  The subset of `ids` this node holds a coherent (non-torn) A2 replica of — `replica_shard_ids/1`
+  restricted to a caller-supplied set, via one `:ets.lookup/2` per id instead of copying the whole
+  replica table (expert review 2026-10-17 #14: the Reporter intersected ~50 hot ids against a
+  `tab2list` of every replica, every beat). A node with no follower answers `[]`.
+  """
+  @spec replica_shard_ids_among([String.t()], atom()) :: [String.t()]
+  def replica_shard_ids_among(ids, name \\ __MODULE__) when is_list(ids) do
+    if Process.whereis(name) do
+      tab = table(name)
+
+      Enum.filter(ids, fn id ->
+        case :ets.lookup(tab, id) do
+          [{^id, %{torn: true}}] -> false
+          [{^id, _}] -> true
+          [] -> false
+        end
+      end)
+    else
+      []
+    end
+  rescue
+    ArgumentError -> []
+  end
+
+  @doc """
   Where this follower keeps the WAL files it receives.
 
   Per-instance, not global. Four followers sharing one directory would all write the SAME file for
