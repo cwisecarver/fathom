@@ -25,7 +25,7 @@ defmodule FathomWeb.AdminClusterLive do
       Phoenix.PubSub.subscribe(Fathom.PubSub, MetricsCollector.topic())
     end
 
-    events = (MetricsCollector.snapshot().current || %{}) |> Map.get(:events_5m)
+    events = (MetricsCollector.current() || %{}) |> Map.get(:events_5m)
 
     {:ok,
      socket

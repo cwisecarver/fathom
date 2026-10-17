@@ -20,7 +20,10 @@ defmodule Fathom.Admin.PrometheusScrape do
   the index once per scrape with `index/1`; the lookups below take either shape (a list is indexed
   on the spot, which costs about what the old scan did).
   """
-  @type index :: %{optional(String.t()) => [{map(), number() | :infinity}]}
+  @type index :: %{
+          optional(String.t()) => [{map(), number() | :infinity}],
+          optional(:names) => [String.t()]
+        }
 
   @line ~r/^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+(.+)$/
 
@@ -88,16 +91,24 @@ defmodule Fathom.Admin.PrometheusScrape do
     |> Map.new()
   end
 
-  @doc "Index a parsed scrape by metric name, preserving exposition order within a name."
+  @doc """
+  Index a parsed scrape by metric name, preserving exposition order within a name. The index also
+  carries `:names`, the family names sorted ONCE here, so a prefix lookup (`families/2`, about
+  sixty to a hundred a tick) walks a pre-sorted list instead of re-sorting ~200 keys each time
+  (expert review 2026-10-17 #15).
+  """
   @spec index([sample()] | index()) :: index()
   def index(%{} = idx), do: idx
 
   def index(samples) when is_list(samples) do
-    samples
-    |> Enum.reduce(%{}, fn {name, ls, v}, acc ->
-      Map.update(acc, name, [{ls, v}], &[{ls, v} | &1])
-    end)
-    |> Map.new(fn {name, rows} -> {name, Enum.reverse(rows)} end)
+    by_name =
+      samples
+      |> Enum.reduce(%{}, fn {name, ls, v}, acc ->
+        Map.update(acc, name, [{ls, v}], &[{ls, v} | &1])
+      end)
+      |> Map.new(fn {name, rows} -> {name, Enum.reverse(rows)} end)
+
+    Map.put(by_name, :names, by_name |> Map.keys() |> Enum.sort())
   end
 
   @doc """
@@ -148,21 +159,27 @@ defmodule Fathom.Admin.PrometheusScrape do
   # Family names for `prefix`: the exact name first (O(1)), then every name starting with it in
   # name order (so a shorter, more exact name wins deterministically).
   defp families(idx, prefix) do
+    # `:names` is sorted, so every name starting with `prefix` is one contiguous run beginning at
+    # the first name >= prefix: skip to it and stop at the first miss (no per-lookup sort).
     rest =
       idx
-      |> Map.keys()
-      |> Enum.filter(&(String.starts_with?(&1, prefix) and &1 != prefix))
-      |> Enum.sort()
+      |> names()
+      |> Enum.drop_while(&(&1 < prefix))
+      |> Enum.take_while(&String.starts_with?(&1, prefix))
+      |> Enum.reject(&(&1 == prefix))
 
     if Map.has_key?(idx, prefix), do: [prefix | rest], else: rest
   end
+
+  defp names(%{names: names}), do: names
+  defp names(idx), do: idx |> Map.keys() |> Enum.filter(&is_binary/1) |> Enum.sort()
 
   @doc "Distinct values of label `key` across samples in the family named by `prefix`."
   @spec label_values([sample()] | index(), String.t(), String.t()) :: [String.t()]
   def label_values(scrape, prefix, key) do
     scrape
     |> index()
-    |> Enum.filter(fn {name, _} -> String.starts_with?(name, prefix) end)
+    |> Enum.filter(fn {name, _} -> is_binary(name) and String.starts_with?(name, prefix) end)
     |> Enum.flat_map(fn {_name, rows} ->
       for {ls, _v} <- rows, Map.has_key?(ls, key), do: ls[key]
     end)
@@ -183,7 +200,7 @@ defmodule Fathom.Admin.PrometheusScrape do
     scrape
     |> index()
     |> Enum.filter(fn {name, _} ->
-      String.starts_with?(name, prefix) and String.ends_with?(name, "_bucket")
+      is_binary(name) and String.starts_with?(name, prefix) and String.ends_with?(name, "_bucket")
     end)
     |> Enum.flat_map(fn {_name, rows} ->
       for {ls, count} <- rows, Map.has_key?(ls, "le"), labels_match?(ls, labels) do

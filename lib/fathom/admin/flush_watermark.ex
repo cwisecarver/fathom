@@ -36,6 +36,9 @@ defmodule Fathom.Admin.FlushWatermark do
   use GenServer
 
   @table __MODULE__
+  # Tiny side table holding the last RPO walk result, shared by the 10 s poller
+  # (`Measurements.durability/0`) and `MetricsCollector` (expert review 2026-10-17 #16).
+  @rpo_cache Module.concat(__MODULE__, RpoCache)
 
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -100,10 +103,38 @@ defmodule Fathom.Admin.FlushWatermark do
     ArgumentError -> acc
   end
 
+  @doc """
+  The last cached RPO walk result `{dirty_shards, oldest_age_ms}`, or `nil` when none was cached
+  within `ttl_ms` or the table has changed size since (a shard opened or drained — the cached
+  figure no longer describes this fleet). See `Fathom.Admin.Measurements.rpo_snapshot/1`.
+  """
+  @spec cached_rpo(non_neg_integer()) :: {non_neg_integer(), integer()} | nil
+  def cached_rpo(ttl_ms) do
+    case :ets.lookup(@rpo_cache, :rpo) do
+      [{:rpo, at, rows, value}] ->
+        if System.monotonic_time(:millisecond) - at < ttl_ms and rows == size(), do: value
+
+      [] ->
+        nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
+  @doc "Stores an RPO walk result for `cached_rpo/1`."
+  @spec cache_rpo({non_neg_integer(), integer()}) :: :ok
+  def cache_rpo(value) do
+    :ets.insert(@rpo_cache, {:rpo, System.monotonic_time(:millisecond), size(), value})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
   @doc "Clears all rows (test/ops helper)."
   @spec reset() :: :ok
   def reset do
     :ets.delete_all_objects(@table)
+    :ets.delete_all_objects(@rpo_cache)
     :ok
   rescue
     ArgumentError -> :ok
@@ -125,6 +156,8 @@ defmodule Fathom.Admin.FlushWatermark do
       write_concurrency: true,
       read_concurrency: true
     ])
+
+    :ets.new(@rpo_cache, [:set, :public, :named_table, read_concurrency: true])
 
     if gen > 1, do: republish_open_shards()
 

@@ -137,6 +137,22 @@ defmodule Fathom.Admin.PrometheusScrapeTest do
       assert PrometheusScrape.value(idx, "a_b") == 2.0
     end
 
+    # Expert review 2026-10-17 #15: families/2 used to Map.keys + filter + sort ~200 names per
+    # lookup. The index now carries the names sorted once; prefix resolution must be unchanged
+    # (exact wins, then shorter-before-longer by name order) across near-collision names.
+    test "prefix resolution over the pre-sorted names is unchanged" do
+      text = "a_b_total 1\na_b 2\na_bc 3\na_b_count 4\nb_a 5\n"
+      idx = PrometheusScrape.index(PrometheusScrape.parse(text))
+
+      assert idx.names == Enum.sort(idx.names)
+      assert PrometheusScrape.value(idx, "a_b") == 2.0
+      # no exact "a_b_": the first by name order is a_b_count
+      assert PrometheusScrape.value(idx, "a_b_") == 4.0
+      assert PrometheusScrape.value(idx, "a_bc") == 3.0
+      assert PrometheusScrape.value(idx, "zzz") == 0.0
+      assert PrometheusScrape.label_values(idx, "a_b", "op") == []
+    end
+
     test "sum/3 totals every tag value of a family" do
       text = ~s(fathom_held_count{aimed="true"} 3\nfathom_held_count{aimed="false"} 4\n)
       assert PrometheusScrape.sum(PrometheusScrape.parse(text), "fathom_held") == 7.0

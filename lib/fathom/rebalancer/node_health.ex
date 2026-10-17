@@ -41,13 +41,14 @@ defmodule Fathom.Rebalancer.NodeHealth do
   def get(%{} = health, key), do: Map.get(health, key)
   def get(_, _), do: nil
 
+  # Straight ETS read of the collector's last tick: a GenServer.call here queued behind the
+  # collector's mailbox and, past its 5 s timeout (exactly when the node is overloaded), published
+  # an all-nil "unknown" health row (expert review 2026-10-17 #17).
   defp current do
-    case MetricsCollector.snapshot() do
-      %{current: %{} = c} -> c
+    case MetricsCollector.current() do
+      %{} = c -> c
       _ -> %{}
     end
-  catch
-    _, _ -> %{}
   end
 
   # connected - quorum, exactly `Measurements.replication/0`'s figure; nil when A2 is off.

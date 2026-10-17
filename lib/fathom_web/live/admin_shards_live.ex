@@ -22,13 +22,13 @@ defmodule FathomWeb.AdminShardsLive do
       Process.send_after(self(), :refresh_fleet, @fleet_refresh_ms)
     end
 
-    snap = MetricsCollector.snapshot()
+    current = MetricsCollector.current()
 
     socket =
       socket
       |> assign(:page_title, "Shards")
       |> assign(:node_key, Fathom.Rebalancer.node_key())
-      |> assign(:metrics, snap.current)
+      |> assign(:metrics, current)
       |> assign(:fleet_hot, nil)
       |> assign(:as_of_ms, System.system_time(:millisecond))
       |> assign(:refresh_failed, false)

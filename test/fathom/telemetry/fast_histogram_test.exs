@@ -16,6 +16,7 @@ defmodule Fathom.Telemetry.FastHistogramTest do
 
   @query [:fathom, :shard, :query]
   @checkout_stop [:fathom, :shards, :checkout, :stop]
+  @commit [:fathom, :replication, :commit]
 
   defp hot_metrics, do: Enum.filter(Fathom.Telemetry.metrics(), &FastHistogram.handles?/1)
 
@@ -43,6 +44,9 @@ defmodule Fathom.Telemetry.FastHistogramTest do
   defp checkout(v, outcome),
     do: :telemetry.execute(@checkout_stop, %{duration: ms(v)}, %{outcome: outcome})
 
+  defp commit(v, outcome),
+    do: :telemetry.execute(@commit, %{duration: ms(v)}, %{outcome: outcome})
+
   # Bucket and count samples must match exactly; `_sum` is a float Core accumulates from floats
   # and FastHistogram from integer µs, so it is compared to the µs.
   defp normalize(text) do
@@ -66,6 +70,11 @@ defmodule Fathom.Telemetry.FastHistogramTest do
     for {v, outcome} <- [{0.2, :ok}, {3, :ok}, {12, :held}, {6000, :unavailable}, {2, :error}],
         do: checkout(v, outcome)
 
+    # Expert review 2026-10-17 #25: the replicated-commit latency moved onto FastHistogram too; the
+    # Admin Durability page reads its family from the scrape, so the text must be unchanged.
+    for {v, outcome} <- [{0.8, :ok}, {30, :ok}, {2600, :timeout}, {9000, :no_quorum}],
+        do: commit(v, outcome)
+
     core_text = IO.iodata_to_binary(TelemetryMetricsPrometheus.Core.scrape(core))
     fast_text = FastHistogram.render(fast)
 
@@ -75,6 +84,7 @@ defmodule Fathom.Telemetry.FastHistogramTest do
     # Byte-level shape: HELP/TYPE headers and a trailing newline per family, like Core's export.
     assert fast_text =~ "# TYPE fathom_shard_query_duration histogram\n"
     assert fast_text =~ "# TYPE fathom_shards_checkout_stop_duration histogram\n"
+    assert fast_text =~ "# TYPE fathom_replication_commit_duration histogram\n"
     assert String.ends_with?(fast_text, "\n")
   end
 
@@ -176,7 +186,8 @@ defmodule Fathom.Telemetry.FastHistogramTest do
     assert Enum.sort(fast) ==
              Enum.sort([
                [:fathom, :shard, :query, :duration],
-               [:fathom, :shards, :checkout, :stop, :duration]
+               [:fathom, :shards, :checkout, :stop, :duration],
+               [:fathom, :replication, :commit, :duration]
              ])
 
     assert MapSet.disjoint?(MapSet.new(core), MapSet.new(fast))

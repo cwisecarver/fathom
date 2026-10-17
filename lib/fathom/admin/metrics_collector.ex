@@ -9,7 +9,9 @@ defmodule Fathom.Admin.MetricsCollector do
   Two planes, matching the architecture (there is no BEAM cluster):
 
     * **Per-shard + node-direct** (cheap, cardinality-bound): `Fathom.ShardLoad` snapshots diffed
-      into per-shard **query rates** (node QPS = their sum; the hot-shard table = the top N),
+      into per-shard **query rates** for the hot-shard table (top N), on a 10 s cadence rather
+      than every tick (expert review 2026-10-17 #1); node QPS comes from the scrape-derived
+      query rate, not a per-shard sum,
       `Fathom.Admin.FlushWatermark` + `Fathom.Shard.WriteCounter` for **dirty shards / RPO age**,
       `Registry.count/1` for **open shards**, `:erlang.memory/0` for **memory**.
     * **Aggregate metrics** (low cardinality): read from the in-process Prometheus reporter's
@@ -26,11 +28,14 @@ defmodule Fathom.Admin.MetricsCollector do
 
   Gated by `Fathom.Admin.enabled?/0` (off in test). Broadcasts `{:metrics, map}` on
   `"admin:node:" <> node_key`; a LiveView calls `snapshot/0` for the initial paint then subscribes.
+
+  Each tick also publishes `current` to a small public ETS table (`current/0`), so readers that only
+  need the latest map (NodeHealth on the Reporter's beat, LiveView mounts) never queue behind the
+  collector's mailbox (expert review 2026-10-17 #17).
   """
   use GenServer
 
   alias Fathom.Admin.{FlushWatermark, PrometheusScrape}
-  alias Fathom.Shard.WriteCounter
   alias Fathom.ShardLatency
   alias Fathom.ShardLoad
 
@@ -41,6 +46,10 @@ defmodule Fathom.Admin.MetricsCollector do
   # cadence, so the dashboard's number is no staler than the Prometheus gauge derived from the
   # identical reduce.
   @rpo_interval_ms 10_000
+  # The per-shard hot-set pass (a full ShardLoad walk) runs at the Reporter's cadence, not every
+  # tick (expert review 2026-10-17 #1). `:admin_hot_interval_ms` overrides (tests).
+  @default_hot_interval_ms 10_000
+  @current_table Module.concat(__MODULE__, Current)
   @default_usage_ms 60_000
   # Budget for one storage-usage poll (an S3 LIST); a slower one is killed so it can't pin the
   # overlap-guard slot (#22). Comfortably under the 60s poll cadence.
@@ -87,7 +96,11 @@ defmodule Fathom.Admin.MetricsCollector do
   ]
 
   @doc false
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  def start_link(opts) do
+    # fullsweep_after: 0 — the hot-shard baseline map is N-sized and replaced wholesale every pass;
+    # default GC lets the superseded one linger (expert review 2026-10-17 #18).
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__, spawn_opt: [fullsweep_after: 0])
+  end
 
   @doc "PubSub topic this node broadcasts `{:metrics, map}` on."
   @spec topic() :: String.t()
@@ -101,12 +114,37 @@ defmodule Fathom.Admin.MetricsCollector do
     :exit, _ -> %{current: nil, history: []}
   end
 
+  @doc """
+  The latest computed metrics map, read straight from ETS — no `GenServer.call`, so it answers
+  even while the collector is busy mid-tick or suspended (expert review 2026-10-17 #17). `nil`
+  before the first tick or when the collector is not running. Callers that also need the history
+  ring still use `snapshot/0`.
+  """
+  @spec current() :: map() | nil
+  def current do
+    case :ets.lookup(@current_table, :current) do
+      [{:current, c}] -> c
+      [] -> nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
   @impl true
   def init(_opts) do
+    :ets.new(@current_table, [:set, :public, :named_table, read_concurrency: true])
+
     state = %{
       node_key: Fathom.Rebalancer.node_key(),
       prev_load: %{},
       prev_mono: mono_ms(),
+      # Hot-set pass bookkeeping: when it last ran (nil forces a pass on the first tick), the
+      # monotonic ms its `prev_load` baseline was taken, its cached result, and a count of REAL
+      # walks (a seam for asserting the 1 s tick does not walk ShardLoad).
+      hot_at: nil,
+      hot_prev_mono: mono_ms(),
+      hot: [],
+      hot_walks: 0,
       prev_query_buckets: [],
       prev_counters: %{},
       # Protocol/S3 counter snapshot behind Fathom.Telemetry.Protocol.window/2.
@@ -156,6 +194,7 @@ defmodule Fathom.Admin.MetricsCollector do
   @impl true
   def handle_info(:tick, state) do
     state = tick(state)
+    :ets.insert(@current_table, {:current, state.current})
     Phoenix.PubSub.broadcast(Fathom.PubSub, topic(), {:metrics, state.current})
     schedule(:tick, tick_ms())
     {:noreply, state}
@@ -236,23 +275,12 @@ defmodule Fathom.Admin.MetricsCollector do
     now = mono_ms()
     window_s = max((now - state.prev_mono) / 1000, 0.001)
 
-    # BOUNDED selection, not tab2list -> map-per-row -> full sort -> take(20) (expert review
-    # 2026-08-01 #31). This runs EVERY SECOND, on by default, and is O(resident shards) with a
-    # 5-key map allocated per row plus an O(N log N) sort to keep 20 of them — a fixed node-level
-    # tax growing on exactly the axis fathom scales on. The identical O(N) walk in
-    # `Measurements.durability/0` was already recognised as a density hazard and moved behind a
-    # 10-second poller (review 2026-07-23 #30); this ran the same walk 10x more often and did
-    # strictly more on top.
-    #
-    # One fold over the raw tuples now computes the node-wide rate sum AND keeps only the top-N,
-    # so maps are built for ~20 survivors instead of N, and the retained between-tick baseline is
-    # a 3-tuple per shard rather than a 5-key map.
-    {node_qps, hot, load} = hot_shards(state.prev_load, window_s)
-
-    # Per-shard tail latency for the top-N hot shards only (cardinality-bounded: read cost never
-    # scales with resident-shard count). WINDOWED against last tick (see window_latency/2), so it
-    # lines up with the node-wide 1s-windowed p50/p95/p99 rather than a lifetime figure (#12).
-    {hot, latency} = window_latency(hot, state.prev_latency)
+    # The per-shard hot set is a full ShardLoad walk (O(resident shards)), and `:shard_load` is ON
+    # in prod, so it runs on a 10 s cadence, never every tick (expert review 2026-10-17 #1).
+    # Between passes the last hot list is served as-is; the Overview hot-shards table therefore
+    # updates every 10 s. node_qps no longer needs the walk at all: it is the scrape-derived
+    # query rate below.
+    {state, hot} = hot_throttled(state, now)
 
     # Scrape-derived windowed series (query-latency percentiles + counter rates + cold-open and
     # flush percentiles). On a blank/failed scrape the diff baselines are HELD, not advanced, so
@@ -273,6 +301,8 @@ defmodule Fathom.Admin.MetricsCollector do
       )
 
     {protocol, prev_proto} = Fathom.Telemetry.Protocol.window(state.prev_proto, window_s)
+
+    node_qps = s.counter_rates |> Map.get(:queries, %{}) |> Map.get(:total, 0.0)
 
     {state, {dirty, oldest_rpo}} = rpo_throttled(state)
 
@@ -328,14 +358,12 @@ defmodule Fathom.Admin.MetricsCollector do
 
     %{
       state
-      | prev_load: load,
-        prev_mono: now,
+      | prev_mono: now,
         prev_query_buckets: s.query_buckets,
         prev_counters: s.counters,
         prev_proto: prev_proto,
         hists: s.hists,
         win_hist: win_hist,
-        prev_latency: latency,
         current: current,
         rings: [ring | state.rings] |> Enum.take(@ring)
     }
@@ -638,22 +666,48 @@ defmodule Fathom.Admin.MetricsCollector do
     }
   end
 
-  # One pass over the raw ShardLoad tuples: sum the node-wide query rate, keep the top-@hot_n
-  # by rate, and carry forward ONLY the shards that moved as the next tick's baseline.
+  # The throttled hot-set pass: a real ShardLoad walk at most every `hot_interval_ms`, otherwise the
+  # cached result. The rate window is the time since the PREVIOUS pass (not the 1 s tick), and the
+  # per-hot-shard latency baseline advances only with it, so both stay consistent.
+  defp hot_throttled(%{hot_at: at} = state, now) do
+    if is_nil(at) or now - at >= hot_interval_ms() do
+      window_s = max((now - state.hot_prev_mono) / 1000, 0.001)
+      {hot, load} = hot_shards(state.prev_load, window_s)
+
+      # Per-shard tail latency for the top-N hot shards only (cardinality-bounded: read cost never
+      # scales with resident-shard count), windowed against the previous pass (#12).
+      {hot, latency} = window_latency(hot, state.prev_latency)
+
+      {%{
+         state
+         | hot: hot,
+           hot_at: now,
+           hot_prev_mono: now,
+           hot_walks: state.hot_walks + 1,
+           prev_load: load,
+           prev_latency: latency
+       }, hot}
+    else
+      {state, state.hot}
+    end
+  end
+
+  # One pass over the raw ShardLoad tuples: keep the top-@hot_n by rate, and carry forward the
+  # baseline for every resident shard.
   #
-  # Returns `{node_qps, hot_maps, next_prev}`. Maps are allocated for the survivors only —
+  # Returns `{hot_maps, next_prev}`. Maps are allocated for the survivors only —
   # `prev` is `%{shard_id => {queries, rows_read, rows_written}}`, a 3-tuple rather than the
   # 5-key map the old `load_map/0` retained for every resident shard.
   defp hot_shards(prev, window_s) do
-    {qps, heap, next_prev} =
-      Enum.reduce(ShardLoad.snapshot_tuples(), {0.0, [], %{}}, fn
-        {id, _checkouts, queries, rows_read, rows_written}, {qps, heap, next} ->
+    {heap, next_prev} =
+      Enum.reduce(ShardLoad.snapshot_tuples(), {[], %{}}, fn
+        {id, _checkouts, queries, rows_read, rows_written}, {heap, next} ->
           {pq, prr, prw} = Map.get(prev, id, {0, 0, 0})
           q_per_s = rate(queries, pq, window_s)
 
           # EVERY resident shard keeps a baseline, including one that did not move. Dropping
           # unmoved shards (which is the memory reduction the review suggested) is incorrect:
-          # next tick `Map.get(prev, id, {0, 0, 0})` would return zeros and the rate would
+          # next pass `Map.get(prev, id, {0, 0, 0})` would return zeros and the rate would
           # compute as `queries / window` — a large spurious rate for an idle shard, which is
           # exactly the hot-shard signal this feeds. The allocation win is the 3-tuple in place
           # of the old 5-key map, which is per-row and does not depend on the filter.
@@ -670,7 +724,7 @@ defmodule Fathom.Admin.MetricsCollector do
               heap
             end
 
-          {qps + q_per_s, heap, next}
+          {heap, next}
       end)
 
     hot =
@@ -686,7 +740,7 @@ defmodule Fathom.Admin.MetricsCollector do
         }
       end)
 
-    {qps, hot, next_prev}
+    {hot, next_prev}
   end
 
   # A bounded "keep the N largest" list. At most @hot_n elements are ever retained, so the
@@ -798,9 +852,9 @@ defmodule Fathom.Admin.MetricsCollector do
   # the same shape review 2026-08-01 #31 rewrote for the HOT-SHARD half of this very tick — whose
   # comment ("This runs EVERY SECOND, on by default, and is O(resident shards)… a fixed node-level
   # tax growing on exactly the axis fathom scales on") describes this half exactly. The RPO half was
-  # left doing it 10x more often than #30's fix. The hot-shard half is free today only because
-  # `:shard_load` defaults off so `ShardLoad.snapshot_tuples/0` returns `[]`; `FlushWatermark` is
-  # genuinely populated in production.
+  # left doing it 10x more often than #30's fix. (The hot-shard half was once "free" because
+  # `:shard_load` defaulted off; it is ON in prod now, so it is throttled to 10 s as well — expert
+  # review 2026-10-17 #1.)
   #
   # Throttling rather than reading the Prometheus gauge, which was the review's first suggestion:
   # `[:fathom, :durability, :rpo]` is already emitted every 10 s and already scraped on this tick,
@@ -821,21 +875,9 @@ defmodule Fathom.Admin.MetricsCollector do
     end
   end
 
-  # Dirty shards + oldest RPO age, derived from the published watermark exactly as
-  # Fathom.Shard.unflushed?/1 does (matches Fathom.Admin.Measurements.durability/0).
-  defp rpo do
-    now = mono_ms()
-    gen = WriteCounter.generation()
-
-    FlushWatermark.fold({0, 0}, fn
-      {id, flushed_through, counter_gen, flushed_at}, {dirty, oldest} ->
-        if counter_gen != gen or WriteCounter.count(id) > flushed_through do
-          {dirty + 1, max(oldest, now - flushed_at)}
-        else
-          {dirty, oldest}
-        end
-    end)
-  end
+  # Dirty shards + oldest RPO age: the shared ~9 s cached snapshot the 10 s poller also feeds
+  # (`Measurements.rpo_snapshot/0`, expert review 2026-10-17 #16), so the walk runs once per 10 s.
+  defp rpo, do: Fathom.Admin.Measurements.rpo_snapshot()
 
   # A shard's ShardLoad counters are cumulative + monotonic; curr < prev only when the coordinator
   # stopped + reopened (row dropped, recreated at 0) — the routine LRU churn. Clamp that reset to
@@ -859,6 +901,10 @@ defmodule Fathom.Admin.MetricsCollector do
   defp schedule(msg, ms), do: Process.send_after(self(), msg, ms)
 
   defp tick_ms, do: Application.get_env(:fathom, :admin_tick_ms, @default_tick_ms)
+
+  defp hot_interval_ms,
+    do: Application.get_env(:fathom, :admin_hot_interval_ms, @default_hot_interval_ms)
+
   defp usage_ms, do: Application.get_env(:fathom, :admin_usage_ms, @default_usage_ms)
 
   defp usage_timeout_ms,

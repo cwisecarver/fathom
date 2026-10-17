@@ -394,18 +394,10 @@ defmodule Fathom.Admin.Measurements do
   end
 
   defp do_durability do
-    now = System.monotonic_time(:millisecond)
-    gen = WriteCounter.generation()
-
-    {dirty, oldest} =
-      FlushWatermark.fold({0, 0}, fn
-        {id, flushed_through, counter_gen, flushed_at}, {dirty, oldest} ->
-          if counter_gen != gen or WriteCounter.count(id) > flushed_through do
-            {dirty + 1, max(oldest, now - flushed_at)}
-          else
-            {dirty, oldest}
-          end
-      end)
+    # The poller is the authority: it always walks, and publishes the result for the collector to
+    # reuse (expert review 2026-10-17 #16: both used to walk the table independently every 10 s).
+    {dirty, oldest} = rpo_walk()
+    FlushWatermark.cache_rpo({dirty, oldest})
 
     # `watermark_rows` vs `open_shards` is the honesty check (expert review 2026-08-26 #17).
     #
@@ -429,6 +421,41 @@ defmodule Fathom.Admin.Measurements do
       },
       %{}
     )
+  end
+
+  @rpo_ttl_ms 9_000
+
+  @doc """
+  `{dirty_shards, oldest_age_ms}` from the published flush watermarks, behind a ~9 s cache that
+  `durability/0` refreshes every 10 s (expert review 2026-10-17 #16). `MetricsCollector` reads this
+  instead of walking the table itself, so the O(open shards) walk runs once per 10 s, not twice.
+  """
+  @spec rpo_snapshot() :: {non_neg_integer(), integer()}
+  def rpo_snapshot do
+    case FlushWatermark.cached_rpo(@rpo_ttl_ms) do
+      nil ->
+        fresh = rpo_walk()
+        FlushWatermark.cache_rpo(fresh)
+        fresh
+
+      cached ->
+        cached
+    end
+  end
+
+  # Dirtiness derived exactly as `Fathom.Shard.unflushed?/1` does.
+  defp rpo_walk do
+    now = System.monotonic_time(:millisecond)
+    gen = WriteCounter.generation()
+
+    FlushWatermark.fold({0, 0}, fn
+      {id, flushed_through, counter_gen, flushed_at}, {dirty, oldest} ->
+        if counter_gen != gen or WriteCounter.count(id) > flushed_through do
+          {dirty + 1, max(oldest, now - flushed_at)}
+        else
+          {dirty, oldest}
+        end
+    end)
   end
 
   # The poller can run before the shard tree is up (or after it is gone): count zero then.

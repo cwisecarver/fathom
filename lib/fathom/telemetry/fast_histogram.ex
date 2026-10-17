@@ -30,7 +30,10 @@ defmodule Fathom.Telemetry.FastHistogram do
   # The distributions emitted on the request path. Anything not listed stays on Core.
   @hot [
     [:fathom, :shard, :query, :duration],
-    [:fathom, :shards, :checkout, :stop, :duration]
+    [:fathom, :shards, :checkout, :stop, :duration],
+    # One per replicated commit (expert review 2026-10-17 #25): a Core `duplicate_bag` insert per
+    # commit otherwise. Same tag (`outcome`), unit and buckets as declared in telemetry.ex.
+    [:fathom, :replication, :commit, :duration]
   ]
   @sum_scale 1000
 

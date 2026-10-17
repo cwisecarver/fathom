@@ -359,6 +359,98 @@ defmodule Fathom.Admin.MetricsTest do
            "the RPO walk never re-ran after its interval elapsed — this is a freeze, not a throttle"
   end
 
+  # ── expert review 2026-10-17 #1: the per-shard hot-set pass is NOT a per-tick walk ──
+
+  # `:shard_load` is ON in prod, so `ShardLoad.snapshot_tuples/0` is an O(resident shards) copy.
+  # The 1 s tick used to do it every time (and rebuild an N-entry baseline map). It now runs on its
+  # own 10 s interval and the ticks in between serve the cached hot list; node_qps comes from the
+  # scrape-derived query rate. `hot_walks` counts REAL walks (the seam).
+  test "the 1 s tick does not walk ShardLoad; the hot pass runs on its own interval (#1)" do
+    prev_load = Application.get_env(:fathom, :shard_load)
+    prev_tick = Application.get_env(:fathom, :admin_tick_ms)
+    Application.put_env(:fathom, :shard_load, true)
+    Application.put_env(:fathom, :admin_tick_ms, 10)
+    Fathom.ShardLoad.reset()
+
+    on_exit(fn ->
+      Fathom.ShardLoad.reset()
+      restore(:shard_load, prev_load)
+      restore(:admin_tick_ms, prev_tick)
+    end)
+
+    for i <- 1..2_000, do: Fathom.ShardLoad.record_query("hotwalk_#{i}", 1, 0)
+    Fathom.ShardLoad.record_query("hotwalk_1", 1, 0)
+
+    pid = start_supervised!(Fathom.Admin.MetricsCollector)
+
+    assert eventually(fn -> :sys.get_state(pid).hot_walks > 0 end),
+           "the collector never took an initial hot-set pass"
+
+    first = :sys.get_state(pid).hot_walks
+    assert [_ | _] = :sys.get_state(pid).hot, "the first pass should find the seeded shards"
+
+    for _ <- 1..5, do: send(pid, :tick)
+    st = :sys.get_state(pid)
+
+    assert st.hot_walks == first,
+           "the hot-set pass re-walked ShardLoad inside its interval — it is running per tick again"
+
+    assert [_ | _] = st.hot, "between passes the cached hot list must still be served"
+
+    # A throttle, not a freeze: age the stamp past the interval and the next tick walks again.
+    :sys.replace_state(pid, fn st -> %{st | hot_at: st.hot_at - 60_000} end)
+    send(pid, :tick)
+    assert :sys.get_state(pid).hot_walks > first
+  end
+
+  # ── expert review 2026-10-17 #17: readers of the latest metrics never call into the collector ──
+
+  # Symptom: NodeHealth.snapshot/0 did `GenServer.call(MetricsCollector, :snapshot)`; a busy (or
+  # stuck) collector made it time out after 5 s, so the Reporter beat published an all-nil health
+  # row — "unknown" in the Nodes triage table — exactly when the node was overloaded.
+  test "NodeHealth stays populated while the collector is suspended (#17)" do
+    prev_tick = Application.get_env(:fathom, :admin_tick_ms)
+    Application.put_env(:fathom, :admin_tick_ms, 10)
+    on_exit(fn -> restore(:admin_tick_ms, prev_tick) end)
+
+    pid = start_supervised!(Fathom.Admin.MetricsCollector)
+
+    assert eventually(fn -> Fathom.Admin.MetricsCollector.current() != nil end),
+           "the collector never published a current map"
+
+    # Left suspended: the test supervisor's shutdown signal still stops it at test exit.
+    :sys.suspend(pid)
+
+    health = Fathom.Rebalancer.NodeHealth.snapshot()
+    assert is_integer(health["open_shards"]), "health row went blank while the collector was busy"
+    assert Fathom.Admin.MetricsCollector.current().open_shards == health["open_shards"]
+  end
+
+  # ── expert review 2026-10-17 #16: one RPO walk per 10 s, shared by poller and collector ──
+
+  test "rpo_snapshot reuses the poller's walk instead of walking again (#16)" do
+    gen = WriteCounter.generation()
+    id = uniq("rpocache")
+    on_exit(fn -> WriteCounter.forget(id) end)
+
+    WriteCounter.bump(id)
+    FlushWatermark.record(id, WriteCounter.count(id), gen)
+
+    # The poller walks (the shard is clean) and publishes its result.
+    Measurements.durability()
+    assert {0, _} = Measurements.rpo_snapshot()
+
+    # A write lands. No second walk happens inside the TTL: the cached figure is served, which is
+    # what proves the collector is not re-walking the table.
+    WriteCounter.bump(id)
+    assert {0, _} = Measurements.rpo_snapshot(), "rpo_snapshot walked again within its TTL"
+
+    # And it is a cache, not a freeze: a reset invalidates it and the next read walks fresh.
+    FlushWatermark.reset()
+    FlushWatermark.record(id, 0, gen)
+    assert {1, _} = Measurements.rpo_snapshot()
+  end
+
   defp eventually(fun, remaining_ms \\ 2_000)
   defp eventually(_fun, remaining_ms) when remaining_ms <= 0, do: false
 
