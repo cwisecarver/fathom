@@ -76,6 +76,12 @@ defmodule Fathom.Shard do
   alias Fathom.Shard.Replication.Fleet
 
   @default_idle_ms 60_000
+  # Spread each coordinator's idle-stop deadline by ±10% (expert review 2026-10-17 #28), decided once
+  # at init: a mass re-home or a synchronized traffic stop otherwise idle-stops a cohort in lockstep
+  # (N drop flushes + lease releases at the same instant). Not applied below the floor, so a test or
+  # an operator pinning a tiny `:shard_idle_ms` keeps exact timing. 0 disables.
+  @default_idle_jitter_ratio 0.1
+  @idle_jitter_floor_ms 1_000
   @default_lease_ttl_ms 30_000
   # 5s node-loss RPO for busy shards (write-gated — clean shards skip the PUT). Was 30s;
   # the fathom.rpo sweep confirmed p99 loss ≈ interval (docs/durability.md), so 5s trades
@@ -923,7 +929,7 @@ defmodule Fathom.Shard do
         # The off-process first-write sidecar fsync (expert review 2026-10-17 #5); nil when none
         # is in flight. The durability flush defers behind it and terminate settles it.
         sidecar_task: nil,
-        idle_ms: idle_ms(),
+        idle_ms: jitter_idle_ms(idle_ms(), idle_jitter_ratio()),
         timer: nil,
         # Monotonic-ms instant the shard last went idle (all connections checked in), or
         # nil while busy — the coalesced idle-timer's comparison stamp (review 2026-07-23
@@ -5242,6 +5248,22 @@ defmodule Fathom.Shard do
   defp lapse_jitter_ms, do: lapse_spread_ms(Fathom.Shards.open_count())
 
   defp idle_ms, do: Application.get_env(:fathom, :shard_idle_ms, @default_idle_ms)
+
+  defp idle_jitter_ratio,
+    do: Application.get_env(:fathom, :shard_idle_jitter_ratio, @default_idle_jitter_ratio)
+
+  # The idle deadline for ONE coordinator: `base` spread uniformly by ±`ratio` (capped at ±50%).
+  # PURE so the range is testable without waiting out a timer. Identity below the floor, for a
+  # non-positive ratio, or for a non-integer base.
+  @doc false
+  @spec jitter_idle_ms(integer(), number()) :: integer()
+  def jitter_idle_ms(base, ratio)
+      when is_integer(base) and base >= @idle_jitter_floor_ms and is_number(ratio) and ratio > 0 do
+    spread = round(base * min(ratio, 0.5))
+    base - spread + :rand.uniform(2 * spread + 1) - 1
+  end
+
+  def jitter_idle_ms(base, _ratio), do: base
   defp lease_ttl_ms, do: Application.get_env(:fathom, :shard_lease_ttl_ms, @default_lease_ttl_ms)
 
   defp checkout_timeout,

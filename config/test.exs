@@ -55,6 +55,10 @@ config :fathom, heartbeat_server: false
 # (expert review #17). The jitter unit test opts back in explicitly to check the range.
 config :fathom, :shard_flush_jitter_ratio, 0.0
 
+# Same for the idle-stop deadline (expert review 2026-10-17 #28). Its jitter is already inert below
+# 1 s, which is where tests pin :shard_idle_ms; this keeps the longer pinned values exact too.
+config :fathom, :shard_idle_jitter_ratio, 0.0
+
 # Don't run the background orphan-temp reaper in tests (it does periodic disk I/O
 # over the shared shard data dir); the reaper test starts it / drives sweep/0 itself.
 config :fathom, temp_reaper: false
