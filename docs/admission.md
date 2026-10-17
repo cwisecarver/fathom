@@ -50,7 +50,10 @@ tracks recency lock-free; `drain/2` flushes + drops + releases the lease) rather
 because a shard's LB home is *one* node, so a refused open means that tenant is **down**, while an
 idle shard is bottomless-backed and just cold-re-opens elsewhere/later. A **busy** shard (checked-out
 connections) is **never** evicted; if the LRU-coldest handful are all busy the node is genuinely
-saturated and returns **503** (`[:fathom,:shards,:at_capacity]`). Set `:evict_idle_at_capacity` false
+saturated and returns **503** (`[:fathom,:shards,:at_capacity]`). Among the LRU-coldest candidates a
+**clean** one (nothing written since its last flush, an ETS-only check) is evicted before a dirty
+one, so the admitting request rarely waits on someone else's flush + PUT (expert review 2026-10-17
+#6); with no watermark data (`Fathom.Admin` off) it is plain LRU. Set `:evict_idle_at_capacity` false
 for a **hard cap** (503 at the limit). Either way the open count stays bounded by the cap.
 
 **2. `Fathom.Shards.NovelLimiter` — rate-limit how fast *unseen* ids mint new shards.** Gated
