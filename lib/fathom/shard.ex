@@ -3490,11 +3490,15 @@ defmodule Fathom.Shard do
   # sidecar stamp here: an upload, and a 412 reconciled onto one of this node's own recorded PUTs
   # (`reconcile_moved/1`). The verdict reaches `apply_flush_verdict/2` only after this returns, which
   # is how `settle_flush_task/1` (terminate) and the live handler both know it is done.
+  #
+  # NO FSYNC on this stamp (expert review 2026-10-17 #32): the fsynced pre-PUT intent already names
+  # this object's md5, so a stamp lost to an OS crash is recovered by intent adoption —
+  # `Provenance.stamp_after_put/2` has the argument, and `SidecarStampUnsyncedTest` the proof.
   defp stamp_sidecar(state, {:ok, new_etag, _carried}),
-    do: Provenance.write_durable(state.path, new_etag)
+    do: Provenance.stamp_after_put(state.path, new_etag)
 
   defp stamp_sidecar(state, {:reconciled, object_etag}) when is_binary(object_etag),
-    do: Provenance.write_durable(state.path, object_etag)
+    do: Provenance.stamp_after_put(state.path, object_etag)
 
   defp stamp_sidecar(_state, _result), do: :ok
 

@@ -10,12 +10,14 @@ defmodule Fathom.Shard.Provenance do
   newer un-flushed writes); different ⇒ the lineages FORKED (another node wrote and released while
   we were down) and serving or flushing our copy would clobber acknowledged writes.
 
-  Two write paths, deliberately different (the reason each exists is on the function):
+  Three write paths, deliberately different (the reason each exists is on the function):
 
     * `write/2` — a plain `File.write`, for the OPEN paths (single writer, read only at open). Made
       durable by `make_durable/1` on the shard's first write (expert review 2026-09-29 #14).
-    * `write_durable/2` — fsync+rename, for the FLUSH path (the sidecar then names the object the
+    * `write_durable/2` — fsync+rename, for the DROP path (the sidecar then names the object the
       tenant's fsynced commits descend from, and a torn value there is not recoverable).
+    * `stamp_after_put/2` — pwrite WITHOUT fsync, for the PERIODIC flush's post-PUT stamp, which
+      relies on the fsynced pre-PUT intent for crash recovery (expert review 2026-10-17 #32).
 
   `read/1` returns `{:ok, etag} | :no_object | :missing | :corrupt` — a zero-length or unreadable
   sidecar is `:corrupt` (the safe direction: a spurious but recoverable quarantine), an absent one
@@ -123,10 +125,46 @@ defmodule Fathom.Shard.Provenance do
 
   def write_durable(path, etag) do
     test_hook(:write_durable, path)
+    durable_put(path, etag)
+  end
 
+  defp durable_put(path, etag) do
     case put_record(path, etag, nil) do
       :ok -> :ok
       {:error, reason} -> Logger.warning("durable etag sidecar write failed: #{inspect(reason)}")
+    end
+  end
+
+  @doc """
+  The PERIODIC FLUSH's post-PUT stamp: names the new object and clears the intent, with a `pwrite`
+  but NO fsync (expert review 2026-10-17 #32).
+
+  The pre-PUT `record_intent/2` is already fsynced, so after any crash the sidecar on disk is at
+  worst the record the flush wrote BEFORE its PUT: the previous etag plus an intent equal to the md5
+  of the object that PUT stored. `Fork` adopts a stored object whose md5 matches a recorded intent,
+  so a stamp lost to an OS crash is the SAME state the mailbox-gap crash already recovers from —
+  adoption instead of quarantine. A second flush cannot leave the file behind its own PUT either: its
+  intent record is an fsync of the SAME file, which persists whatever the first stamp left in the page
+  cache, and it completes before the second PUT. (A crash-injection proof over two consecutive
+  flushes is `Fathom.Shard.SidecarStampUnsyncedTest`.)
+
+  The fsync is kept where the intent cannot ride: a sidecar that is not already an in-place
+  fixed-width record, or an etag that does not fit one. Those take the durable path unchanged.
+  Used ONLY by the flush task — the drop path, `make_durable/1` and `Fork`'s adoption still fsync.
+  """
+  @spec stamp_after_put(String.t(), String.t() | nil) :: :ok
+  def stamp_after_put(_path, nil), do: :ok
+
+  def stamp_after_put(path, etag) do
+    test_hook(:flush_stamp, path)
+    sidecar = sidecar_path(path)
+
+    with {:ok, record} <- encode_record(etag, nil, nil),
+         true <- in_place_ok?(sidecar),
+         :ok <- pwrite_nosync(sidecar, record) do
+      :ok
+    else
+      _no_record_or_failed -> durable_put(path, etag)
     end
   end
 
@@ -255,7 +293,24 @@ defmodule Fathom.Shard.Provenance do
     case :file.open(sidecar, [:read, :write, :raw, :binary]) do
       {:ok, fd} ->
         try do
-          with :ok <- :file.pwrite(fd, 0, record), do: :file.sync(fd)
+          with :ok <- :file.pwrite(fd, 0, record), :ok <- :file.sync(fd) do
+            # After the fsync: a test records "the durable image" here (see test_hook/2).
+            test_hook(:synced, String.replace_suffix(sidecar, ".etag", ""))
+          end
+        after
+          :file.close(fd)
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp pwrite_nosync(sidecar, record) do
+    case :file.open(sidecar, [:read, :write, :raw, :binary]) do
+      {:ok, fd} ->
+        try do
+          :file.pwrite(fd, 0, record)
         after
           :file.close(fd)
         end
@@ -349,7 +404,9 @@ defmodule Fathom.Shard.Provenance do
   # (the flush task, and the first-write `sidecar_task`), so the only way to prove the coordinator
   # keeps answering while one is in flight is to hold it there. A test sets
   # `:provenance_write_hook` to a function of `(stage, path)`; it runs BEFORE the write and may
-  # block. One env read beside an fsync; unset in every real run.
+  # block. One env read beside an fsync; unset in every real run. Stages: `:write_durable`,
+  # `:make_durable`, `:flush_stamp` (the unsynced post-PUT stamp, which runs AFTER the PUT landed) and
+  # `:synced` (right after an fsync'd in-place write; lets a test capture the durable image).
   defp test_hook(stage, path) do
     case Application.get_env(:fathom, :provenance_write_hook) do
       fun when is_function(fun, 2) -> fun.(stage, path)

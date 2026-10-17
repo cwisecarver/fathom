@@ -139,10 +139,10 @@ defmodule Fathom.Shard.SidecarOffMailboxTest do
     describe "post-PUT stamp (#{mode})" do
       test "runs in the flush task and the coordinator keeps answering meanwhile", %{shard: shard} do
         %{conn: conn, coordinator: coordinator} = open_dirty!(shard, unquote(mode))
-        hold_sidecar_write!(shard, :write_durable)
+        hold_sidecar_write!(shard, :flush_stamp)
 
         send(coordinator, :durability_flush)
-        assert_receive {:sidecar_write, :write_durable, writer}, 5_000
+        assert_receive {:sidecar_write, :flush_stamp, writer}, 5_000
 
         # The invariant under test: the write is NOT in the coordinator's mailbox. Pre-fix the
         # coordinator itself runs it, `writer == coordinator`, and everything below times out.
@@ -182,10 +182,10 @@ defmodule Fathom.Shard.SidecarOffMailboxTest do
            %{shard: shard} do
         %{conn: conn, coordinator: coordinator} = open_dirty!(shard, unquote(mode))
         {:ok, e0} = Storage.object_etag(shard)
-        hold_sidecar_write!(shard, :write_durable)
+        hold_sidecar_write!(shard, :flush_stamp)
 
         send(coordinator, :durability_flush)
-        assert_receive {:sidecar_write, :write_durable, writer}, 5_000
+        assert_receive {:sidecar_write, :flush_stamp, writer}, 5_000
 
         # The PUT has landed (the hook runs after Storage.flush returned) and the sidecar has not
         # learned it: the state a node killed in this window leaves behind.
