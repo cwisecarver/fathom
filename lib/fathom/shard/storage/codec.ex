@@ -114,35 +114,73 @@ defmodule Fathom.Shard.Storage.Codec do
   def compress_to_temp_hashed(path, encoding) do
     tmp = "#{path}.z.#{System.unique_integer([:positive])}"
     ctx = compressor(encoding)
+    dctx = init(encoding)
+    corrupt = Application.get_env(:fathom, :codec_corrupt_hook)
 
     try do
       File.open!(tmp, [:write, :raw, :binary], fn out ->
-        write = fn piece, {size, md5} ->
+        # Every compressed piece does three things in one pass: it goes to disk, into the body
+        # digest (`content-md5`), and into a decoder whose output is hashed. At the end the decoded
+        # digest must equal the plaintext digest, so a body that would not decode to the database
+        # it is labelled as is refused HERE, before anything is PUT (expert review 2026-10-08 #15,
+        # moved inline by 2026-10-17 #20). This decodes the same bytes that are written, so it needs
+        # no second read of the file, and the output is hashed as it arrives, never collected.
+        write = fn piece, {size, md5, dec} ->
+          piece = corrupt_piece(corrupt, piece)
           :ok = IO.binwrite(out, piece)
-          {size + IO.iodata_length(piece), :crypto.hash_update(md5, piece)}
+
+          {size + IO.iodata_length(piece), :crypto.hash_update(md5, piece),
+           decode_piece(dctx, piece, dec)}
         end
 
         {plain, body} =
           Enum.reduce(
             File.stream!(path, @chunk),
-            {:crypto.hash_init(:md5), {0, :crypto.hash_init(:md5)}},
+            {:crypto.hash_init(:md5), {0, :crypto.hash_init(:md5), :crypto.hash_init(:md5)}},
             fn chunk, {plain, body} ->
               {:crypto.hash_update(plain, chunk), write.(compress_chunk(ctx, chunk), body)}
             end
           )
 
-        {size, body_md5} = write.(compress_finish(ctx), body)
+        {size, body_md5, dec} = write.(compress_finish(ctx), body)
+        plain_hex = Base.encode16(:crypto.hash_final(plain), case: :lower)
+        decoded_hex = Base.encode16(:crypto.hash_final(dec), case: :lower)
 
-        {size, :crypto.hash_final(body_md5),
-         Base.encode16(:crypto.hash_final(plain), case: :lower)}
+        if decoded_hex != plain_hex, do: throw({:compressed_body_mismatch, decoded_hex})
+
+        {size, :crypto.hash_final(body_md5), plain_hex}
       end)
       |> then(fn {size, body_md5, plain_hex} -> {:ok, tmp, size, body_md5, plain_hex} end)
     rescue
       e ->
         File.rm(tmp)
         {:error, e}
+    catch
+      {:decode_failed, reason} ->
+        File.rm(tmp)
+        {:error, reason}
+
+      {:compressed_body_mismatch, actual} ->
+        File.rm(tmp)
+        {:error, {:compressed_body_mismatch, actual}}
     after
+      release(dctx)
       compress_close(ctx)
+    end
+  end
+
+  # Test seam (expert review 2026-10-17 #20): a corrupting codec step, applied to each compressed piece
+  # before it is written, hashed or decoded, so the body on disk and the content-md5 agree with each
+  # other and only the decode proof can refuse them. Unset in every real config.
+  defp corrupt_piece(nil, piece), do: piece
+  defp corrupt_piece(hook, piece), do: hook.(piece)
+
+  # One compressed piece through the decoder, its output folded into `dec`. A body that does not decode
+  # is thrown out of the file write, which removes the temp, so nothing is PUT.
+  defp decode_piece(dctx, piece, dec) do
+    case inflate_into(dctx, piece, &:crypto.hash_update(&2, &1), dec) do
+      {:ok, dec} -> dec
+      {:error, reason} -> throw({:decode_failed, reason})
     end
   end
 
@@ -150,8 +188,9 @@ defmodule Fathom.Shard.Storage.Codec do
   Decodes the compressed file at `path` as `encoding` and checks its plaintext MD5 is `expected_hex`.
 
   `:ok`, or `{:error, {:compressed_body_mismatch, actual_hex}}` / `{:error, {:zstd | :zlib, _}}`.
-  The upload path runs it before PUTting a compressed body (expert review 2026-10-08 #15), so a
-  body that would not decode to the database it is labelled as is never stored. Streamed, in
+  The upload path no longer runs this: `compress_to_temp_hashed/2` proves the same property inline,
+  over the pieces as they are produced, so the file is not read a second time (expert review
+  2026-10-17 #20). It stays as the file-level oracle the codec tests check against. Streamed, in
   bounded pieces, like the download path.
   """
   @spec verify_decodes_to(Path.t(), :zlib | :zstd, String.t()) :: :ok | {:error, term()}

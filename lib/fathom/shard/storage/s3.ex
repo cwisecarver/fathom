@@ -563,15 +563,17 @@ defmodule Fathom.Shard.Storage.S3 do
         # one read the label cannot disagree with the body that way, so that check is replaced by
         # stat-before/stat-after around the single read (the `stat_and_md5/1` guard, which also
         # catches a torn read the old two-read compare would have caught only by luck of timing).
-        # `verify_decodes_to` stays: it still proves the body decodes to the labelled hash.
+        # THE DECODE PROOF IS INLINE (expert review 2026-10-17 #20). `compress_to_temp_hashed/2` feeds
+        # each compressed piece to a decoder as it writes it, and refuses the body if the decoded MD5
+        # is not the plaintext MD5. So a body that would not decode to its label never reaches this
+        # `with`, and the temp file is not re-read to prove it.
         with {:ok, %{size: psize, mtime: pmtime}} <- File.stat(local_path),
              {:ok, tmp, size, md5, plain_hex} <-
                Codec.compress_to_temp_hashed(local_path, encoding) do
           try do
             with :ok <- after_compress(local_path),
                  :ok <- source_unchanged(local_path, psize, pmtime),
-                 :ok <- check_single_put(size),
-                 :ok <- Codec.verify_decodes_to(tmp, encoding, plain_hex) do
+                 :ok <- check_single_put(size) do
               fun.(tmp, size, Base.encode64(md5), plain_hex, Codec.upload_headers(encoding))
             end
           after

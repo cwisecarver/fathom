@@ -156,6 +156,58 @@ defmodule Fathom.Shard.Storage.CodecTest do
     end
   end
 
+  # Expert review 2026-10-17 #20: the decode proof is inline in `compress_to_temp_hashed/2`, over the
+  # pieces as they are produced, instead of a second read of the finished file. A codec step that
+  # corrupts the compressed bytes must be refused THERE, with no temp file left behind, and a clean run
+  # must still hand back the body and its digests. The corruption goes in before the bytes are written,
+  # hashed or decoded, so the body on disk and its content-md5 agree, and only the decode can refuse it.
+  for enc <- [:zlib, :zstd] do
+    test "#{enc}: a compressed body that would not decode to its plaintext digest is refused inline" do
+      src = tmp("inline_corrupt")
+      File.write!(src, String.duplicate("row data ", 50_000))
+      on_exit(fn -> File.rm(src) end)
+
+      Application.put_env(:fathom, :codec_corrupt_hook, fn piece ->
+        case IO.iodata_to_binary(piece) do
+          bin when byte_size(bin) < 9 ->
+            bin
+
+          bin ->
+            mid = div(byte_size(bin), 2)
+            <<head::binary-size(mid), b, tail::binary>> = bin
+            <<head::binary, Bitwise.bxor(b, 0xFF), tail::binary>>
+        end
+      end)
+
+      on_exit(fn -> Application.delete_env(:fathom, :codec_corrupt_hook) end)
+
+      assert {:error, _} = Codec.compress_to_temp_hashed(src, unquote(enc))
+
+      leftovers =
+        src
+        |> Path.dirname()
+        |> File.ls!()
+        |> Enum.filter(&String.starts_with?(&1, Path.basename(src) <> ".z."))
+
+      assert leftovers == [], "a refused body left its temp file behind: #{inspect(leftovers)}"
+    end
+
+    test "#{enc}: a clean compress_to_temp_hashed returns a body that decodes to its plaintext digest" do
+      src = tmp("inline_clean")
+      File.write!(src, String.duplicate("row data ", 50_000))
+      on_exit(fn -> File.rm(src) end)
+
+      assert {:ok, z, size, _body_md5, plain_hex} =
+               Codec.compress_to_temp_hashed(src, unquote(enc))
+
+      on_exit(fn -> File.rm(z) end)
+
+      assert plain_hex == Base.encode16(:crypto.hash(:md5, File.read!(src)), case: :lower)
+      assert size == File.stat!(z).size
+      assert :ok = Codec.verify_decodes_to(z, unquote(enc), plain_hex)
+    end
+  end
+
   test "zstd is the default encoding" do
     prev = Application.get_env(:fathom, :shard_object_encoding)
     on_exit(fn -> restore(prev) end)

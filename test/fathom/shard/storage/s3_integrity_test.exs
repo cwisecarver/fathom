@@ -191,6 +191,54 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
                     "a body labelled with a hash it does not decode to was uploaded"
   end
 
+  # Expert review 2026-10-17 #20: the decode proof moved inline into the compress, so it now runs over
+  # the pieces as they are produced. A codec step that corrupts the compressed body must refuse the
+  # flush BEFORE any PUT. The corrupt step is the `:codec_corrupt_hook` seam, applied to each piece
+  # before it is written, hashed or decoded, so the label and the uploaded body agree and only the
+  # decode can catch the mismatch.
+  test "a flush whose compressed body would not decode to its plaintext digest is never PUT", %{
+    dir: dir
+  } do
+    test_pid = self()
+
+    put_s3_config(fn conn ->
+      send(test_pid, {:put, conn.method})
+      Plug.Conn.send_resp(conn, 200, "")
+    end)
+
+    prev = Application.get_env(:fathom, :shard_object_encoding)
+    Application.put_env(:fathom, :shard_object_encoding, :zstd)
+    Application.put_env(:fathom, :codec_corrupt_hook, &corrupt_middle/1)
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :codec_corrupt_hook)
+
+      if prev,
+        do: Application.put_env(:fathom, :shard_object_encoding, prev),
+        else: Application.delete_env(:fathom, :shard_object_encoding)
+    end)
+
+    local = Path.join(dir, "s.db")
+    File.write!(local, String.duplicate(@good, 20_000))
+
+    assert {:error, _} = S3.flush("s", local, nil)
+
+    refute_received {:put, "PUT"},
+                    "a body labelled with a hash it does not decode to was uploaded"
+  end
+
+  defp corrupt_middle(piece) do
+    case IO.iodata_to_binary(piece) do
+      bin when byte_size(bin) < 9 ->
+        bin
+
+      bin ->
+        mid = div(byte_size(bin), 2)
+        <<head::binary-size(mid), b, tail::binary>> = bin
+        <<head::binary, Bitwise.bxor(b, 0xFF), tail::binary>>
+    end
+  end
+
   # Expert review 2026-10-08 #23: with the encoding marker but no plaintext digest, the fallback
   # compared the DECODED bytes' MD5 against the etag — the MD5 of the COMPRESSED bytes — so a
   # single-PUT object failed every pull, and a multipart etag (which `verify_md5/2` skips) was served
