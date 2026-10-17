@@ -171,6 +171,47 @@ defmodule Fathom.Shard.ReplicationBudgetTest do
     end
   end
 
+  # Expert review 2026-10-17 #19: the budget used to be charged `byte_size(p.payload)` -- the
+  # UNCOMPRESSED body -- though the ordinal frame carries (and the writer retains) only the
+  # compressed `zpayload`, overcounting by the compression ratio and tripping `:overloaded` early.
+  describe "Shipper.push/2 charges what the writer retains (#19)" do
+    alias Fathom.Shard.Replication.Protocol.Push
+    alias Fathom.Shard.Replication.Shipper
+
+    defp push(payload, zpayload),
+      do: %Push{
+        shard_id: "s",
+        epoch: 1,
+        wal_gen: 0,
+        salt1: 0,
+        offset: 0,
+        payload: payload,
+        zpayload: zpayload
+      }
+
+    test "a compressed push is charged its compressed size", %{a: a} do
+      raw = :binary.copy(<<0>>, 8_000)
+      z = :binary.copy(<<1>>, 500)
+
+      # `a` has a counter but no process: the cast is a no-op, so the reservation stays visible.
+      assert :ok = Shipper.push(a, push(raw, z))
+      assert Budget.queued(a) == 500
+    end
+
+    test "an uncompressed push is still charged its payload", %{a: a} do
+      raw = :binary.copy(<<0>>, 3_000)
+      assert :ok = Shipper.push(a, push(raw, nil))
+      assert Budget.queued(a) == 3_000
+    end
+
+    test "the cap still refuses a push whose retained size exceeds it", %{a: a} do
+      raw = :binary.copy(<<0>>, @cap + 1)
+      assert :ok = Shipper.push(a, push(raw, nil))
+      assert Budget.queued(a) == 0
+      assert_received {:repl_reply, ^a, {:reject, "s", :overloaded, 0}}
+    end
+  end
+
   # WHERE THE PER-INCARNATION REFS LIVE (expert review 2026-08-20 #36).
   #
   # `install/1` was a `:persistent_term.put` and `forget/1` an `erase` -- ONCE PER SHIPPER

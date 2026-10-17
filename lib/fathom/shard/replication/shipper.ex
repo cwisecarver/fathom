@@ -105,7 +105,11 @@ defmodule Fathom.Shard.Replication.Shipper do
   """
   @spec push(GenServer.server(), Protocol.Push.t()) :: :ok
   def push(shipper, %Protocol.Push{} = p) do
-    case Budget.reserve(shipper, byte_size(p.payload)) do
+    # Charge what the writer will actually RETAIN: the compressed body when there is one (the
+    # ordinal frame carries `zpayload` and not `payload`), else the raw payload. `payload` is one
+    # refc binary shared across a round's followers, so charging it per follower overcounted by up
+    # to N x the compression ratio and tripped `:overloaded` early (expert review 2026-10-17 #19).
+    case Budget.reserve(shipper, byte_size(p.zpayload || p.payload)) do
       {:ok, reserved} ->
         GenServer.cast(shipper, {:push, p, self(), reserved})
 
