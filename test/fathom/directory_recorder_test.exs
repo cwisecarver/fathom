@@ -327,4 +327,135 @@ defmodule Fathom.Directory.RecorderTest do
       refute log =~ "gave up", "the happy path must stay quiet"
     end
   end
+
+  # Expert review 2026-10-17 #21: a shard flushed AND touched in one Recorder tick used to cost two
+  # statements on `shards` (the flush insert, then the touch UPDATE), each a non-HOT row version.
+  # They are one statement now. The stamps are chosen relative to the Postgres clock so the
+  # assertions are about ordering, not about wall time.
+  describe "#21 — a flush and a touch of one shard in one tick are one statement" do
+    setup do
+      test_pid = self()
+      handler = "recorder-stmts-#{System.unique_integer([:positive])}"
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:fathom, :repo, :query],
+          fn _event, _measurements, meta, _config ->
+            if meta[:source] == "shards" and
+                 String.starts_with?(meta[:query] || "", ["UPDATE", "INSERT"]),
+               do: send(test_pid, {:shard_write, meta[:query]})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+      :ok
+    end
+
+    # The shard writes sent since the last call.
+    defp shard_writes(acc \\ []) do
+      receive do
+        {:shard_write, sql} -> shard_writes([sql | acc])
+      after
+        0 -> acc
+      end
+    end
+
+    # The stored state and the buffered stamps are set in terms of `db`, the Postgres clock.
+    defp dirty_shard(id, db, last_active_s_ago, last_flushed_s_ago) do
+      {:ok, _} = Directory.resolve(id)
+
+      {1, _} =
+        Fathom.Repo.update_all(
+          Ecto.Query.from(s in Fathom.Directory.Shard, where: s.shard_id == ^id),
+          set: [
+            last_active_at: DateTime.add(db, -last_active_s_ago, :second),
+            last_flushed_at: DateTime.add(db, -last_flushed_s_ago, :second)
+          ]
+        )
+    end
+
+    defp buffer_flush(id, node_us),
+      do: :ets.insert(Module.concat(Recorder, Flushes), {id, node_us})
+
+    defp buffer_touch(id, node_us), do: :ets.insert(Recorder, {id, node_us})
+
+    test "one statement writes both stamps, and each lands at its own instant" do
+      a = uniq()
+      db = Directory.db_now()
+      dirty_shard(a, db, 10, 20)
+      Recorder.flush()
+      _ = shard_writes()
+
+      # Flushed 5 s ago, touched 2 s ago: both inside one tick, the touch after the flush.
+      node = System.os_time(:microsecond)
+      buffer_flush(a, node - 5_000_000)
+      buffer_touch(a, node - 2_000_000)
+      Recorder.flush()
+
+      assert [_one] = shard_writes(),
+             "a shard flushed and touched in one tick must be written by one statement"
+
+      {:ok, shard} = Directory.get(a)
+      assert_in_delta unix_s(shard.last_flushed_at), unix_s(db) - 5, 1
+      assert_in_delta unix_s(shard.last_active_at), unix_s(db) - 2, 1
+    end
+
+    test "a touch the guard rejects after the flush leaves last_active_at alone" do
+      a = uniq()
+      db = Directory.db_now()
+
+      # Last active 3 s ago, flushed 20 s ago. The flush at 10 s ago is then the watermark, and the
+      # touch 2 s ago is inside the 30 s window of last_active_at, so the guard rejects it.
+      dirty_shard(a, db, 3, 20)
+      Recorder.flush()
+      _ = shard_writes()
+
+      node = System.os_time(:microsecond)
+      buffer_flush(a, node - 10_000_000)
+      buffer_touch(a, node - 2_000_000)
+      Recorder.flush()
+
+      assert [_one] = shard_writes()
+
+      {:ok, shard} = Directory.get(a)
+      assert_in_delta unix_s(shard.last_flushed_at), unix_s(db) - 10, 1
+      assert_in_delta unix_s(shard.last_active_at), unix_s(db) - 3, 1
+    end
+
+    test "a flush-only and a touch-only shard in the same tick are written as before" do
+      flush_only = uniq()
+      touch_only = uniq()
+      db = Directory.db_now()
+      dirty_shard(flush_only, db, 10, 20)
+      # Last active 40 s ago, so a touch 1 s ago clears the 30 s window (no flush to pair with).
+      dirty_shard(touch_only, db, 40, 50)
+      Recorder.flush()
+      _ = shard_writes()
+
+      node = System.os_time(:microsecond)
+      buffer_flush(flush_only, node - 5_000_000)
+      buffer_touch(touch_only, node - 1_000_000)
+      Recorder.flush()
+
+      {:ok, f} = Directory.get(flush_only)
+      assert_in_delta unix_s(f.last_flushed_at), unix_s(db) - 5, 1
+
+      assert_in_delta unix_s(f.last_active_at),
+                      unix_s(db) - 10,
+                      1,
+                      "a flush must not move last_active_at"
+
+      {:ok, t} = Directory.get(touch_only)
+      assert_in_delta unix_s(t.last_active_at), unix_s(db) - 1, 1
+
+      assert_in_delta unix_s(t.last_flushed_at),
+                      unix_s(db) - 50,
+                      1,
+                      "a touch must not move last_flushed_at"
+    end
+
+    defp unix_s(%DateTime{} = dt), do: DateTime.to_unix(dt, :microsecond) / 1_000_000
+  end
 end

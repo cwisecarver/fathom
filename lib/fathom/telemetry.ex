@@ -924,6 +924,12 @@ defmodule Fathom.Telemetry do
         description:
           "Directory rows RE-BUFFERED after a failed batch flush — the recorder is deliberately off the hot path and never fails a checkout, so a Postgres problem shows up only here. Summed rather than counted: one event carries a whole batch"
       ),
+      # Recorder throughput (expert review 2026-10-17 #21): rows written per flush batch, by kind.
+      # Untagged — the shard id stays on the event metadata, never a label.
+      sum("fathom.directory.flush.count", event_name: [:fathom, :directory, :flush]),
+      sum("fathom.directory.flush_recorded.count",
+        event_name: [:fathom, :directory, :flush_recorded]
+      ),
 
       # Security — the control-plane refusals that aren't auth failures.
       counter("fathom.api.csrf_blocked.count",

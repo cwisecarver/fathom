@@ -281,13 +281,7 @@ defmodule Fathom.Directory.Recorder do
     else
       case db_offset_us(node_clock) do
         {:ok, offset} ->
-          flush_table(
-            @flush_table,
-            &Directory.record_flush_batch/1,
-            [:fathom, :directory, :flush_recorded],
-            deadline,
-            offset
-          ) +
+          flush_joint(deadline, offset, 0) +
             flush_table(
               @table,
               &Directory.record_batch/1,
@@ -353,6 +347,104 @@ defmodule Fathom.Directory.Recorder do
       end
     end
   end
+
+  # Expert review 2026-10-17 #21. A shard flushed AND touched in one tick used to cost two statements,
+  # each a non-HOT row version. Drain the flush buffer chunk by chunk; for each flushed shard take its
+  # buffered touch, if there is one (`:ets.take`, atomic per key), and write the pair in ONE statement
+  # via `Directory.record_flush_and_touch_batch/1`. A flush with no buffered touch goes through the
+  # unchanged `record_flush_batch/1`. Touch-only shards stay in the touch buffer for `flush_table/5`.
+  #
+  # This keeps the flush-before-access ordering the comment in `do_flush/2` describes: the joint
+  # statement takes the touch guard against the post-flush watermark itself, so the edge is the same
+  # as the sequential pair.
+  defp flush_joint(deadline, offset, acc) do
+    if past?(deadline) do
+      acc
+    else
+      case drain_chunk(@flush_table) do
+        [] ->
+          acc
+
+        rows ->
+          {both, only} = take_touches(rows)
+
+          case write_joint(both, offset) do
+            {:ok, n} ->
+              case write_flush_only(only, offset) do
+                {:ok, m} -> flush_joint(deadline, offset, acc + n + m)
+                :failed -> acc + n
+              end
+
+            :failed ->
+              # `write_joint/2` re-buffered its own touches and flushes. The rest were drained, so
+              # put them back too, or they wait for a next tick that never sees them.
+              restore(@flush_table, only)
+              acc
+          end
+      end
+    end
+  end
+
+  defp take_touches(rows) do
+    Enum.reduce(rows, {[], []}, fn {id, flushed_us} = row, {both, only} ->
+      case :ets.take(@table, id) do
+        [{^id, touched_us}] -> {[{id, flushed_us, touched_us} | both], only}
+        [] -> {both, [row | only]}
+      end
+    end)
+  end
+
+  defp write_joint([], _offset), do: {:ok, 0}
+
+  defp write_joint(both, offset) do
+    entries =
+      Enum.map(both, fn {id, flushed_us, touched_us} ->
+        {id, to_datetime(flushed_us, offset), to_datetime(touched_us, offset)}
+      end)
+
+    try do
+      n = Directory.record_flush_and_touch_batch(entries)
+
+      if n > 0 do
+        :telemetry.execute([:fathom, :directory, :flush_recorded], %{count: n}, %{})
+        :telemetry.execute([:fathom, :directory, :flush], %{count: n}, %{})
+      end
+
+      note_flush_ok()
+      {:ok, n}
+    rescue
+      e ->
+        Logger.warning("Directory.Recorder flush failed: #{inspect(e)}")
+        restore_joint(both)
+        :failed
+    catch
+      :exit, reason ->
+        Logger.warning("Directory.Recorder flush exited: #{inspect(reason)}")
+        restore_joint(both)
+        :failed
+    end
+  end
+
+  # Re-buffers both halves of a failed joint chunk, with the same `insert_new` semantics as `restore/2`.
+  defp restore_joint(both) do
+    restore(@flush_table, Enum.map(both, fn {id, flushed_us, _} -> {id, flushed_us} end))
+    restore(@table, Enum.map(both, fn {id, _, touched_us} -> {id, touched_us} end))
+  end
+
+  defp write_flush_only([], _offset), do: {:ok, 0}
+
+  defp write_flush_only(rows, offset) do
+    flush_rows(
+      @flush_table,
+      rows,
+      &Directory.record_flush_batch/1,
+      [:fathom, :directory, :flush_recorded],
+      offset
+    )
+  end
+
+  # The same rebase `flush_rows/5` applies: once per distinct shard, on the Postgres clock.
+  defp to_datetime(us, offset), do: DateTime.from_unix!(us + offset, :microsecond)
 
   defp past?(:infinity), do: false
   defp past?(deadline), do: System.monotonic_time(:millisecond) >= deadline

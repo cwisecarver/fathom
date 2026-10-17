@@ -289,6 +289,120 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  Writes the shards that were BOTH flushed and touched in one Recorder tick as ONE statement per
+  chunk (expert review 2026-10-17 #21). `entries` is `{shard_id, flushed_at, touched_at}`, both
+  stamps on the Postgres clock like the other batch APIs.
+
+  Before this, such a shard cost two statements, each a non-HOT row version (`updated_at` and both
+  stamps are indexed or read): `record_flush_batch/1`, then `record_batch/1`. Write-active shards
+  hit that on nearly every flush, because the first touch after a flush must land (the
+  `last_flushed_at` edge below).
+
+  The result is the same as the two calls in flush-then-touch order, which is what the Recorder
+  used to do. The touch guard is evaluated against the POST-flush watermark, `GREATEST(last_flushed_at,
+  flushed_at)`, which is the value the sequential form saw, so the cutover and last-flushed edges stay
+  exact. `last_active_at` is GREATEST-merged only when the touch passes that guard, as in
+  `record_batch/1`. `last_flushed_at` is GREATEST-merged, as in `record_flush_batch/1`. `updated_at`
+  moves once, to the same wall-clock instant both old statements stamped.
+
+  A shard absent from the directory is inserted with `last_active_at = GREATEST(flushed_at,
+  touched_at)` and `last_flushed_at = flushed_at`, which is what the sequential pair produced.
+  Returns the number of distinct shards written.
+  """
+  @spec record_flush_and_touch_batch([{String.t(), DateTime.t(), DateTime.t()}]) ::
+          non_neg_integer()
+  def record_flush_and_touch_batch([]), do: 0
+
+  def record_flush_and_touch_batch(entries) do
+    now = DateTime.utc_now()
+
+    granularity_s =
+      Application.get_env(:fathom, :directory_touch_granularity_s, @default_touch_granularity_s)
+
+    entries
+    |> Enum.chunk_every(@batch_chunk)
+    |> Enum.reduce(0, fn chunk, acc ->
+      ids = Enum.map(chunk, &elem(&1, 0))
+      flushed = Enum.map(chunk, &elem(&1, 1))
+      touched = Enum.map(chunk, &elem(&1, 2))
+
+      # Every entry carries a flush, so every entry is written and there is no WHERE. The touch guard
+      # is the `record_batch/1` guard with the flush edge taken against the POST-flush watermark,
+      # GREATEST(last_flushed_at, flushed_at), which is the value the sequential pair saw. A touch the
+      # guard rejects leaves `last_active_at` unchanged; the row is still written for the flush.
+      {_updated, updated_ids} =
+        Repo.update_all(
+          from(s in Shard,
+            join:
+              v in fragment(
+                "SELECT * FROM unnest(?::varchar[], ?::timestamp[], ?::timestamp[]) AS t(shard_id, flushed_at, touched_at)",
+                ^ids,
+                ^flushed,
+                ^touched
+              ),
+            on: s.shard_id == v.shard_id,
+            update: [
+              set: [
+                last_flushed_at: fragment("GREATEST(?, ?)", v.flushed_at, s.last_flushed_at),
+                last_active_at:
+                  fragment(
+                    "(CASE WHEN ? > ? + make_interval(secs => ?) OR ? <= coalesce(?, '-infinity') OR ? <= GREATEST(coalesce(?, '-infinity'), ?) THEN GREATEST(?, ?) ELSE ? END)",
+                    v.touched_at,
+                    s.last_active_at,
+                    ^granularity_s,
+                    s.last_active_at,
+                    s.cutover_at,
+                    s.last_active_at,
+                    s.last_flushed_at,
+                    v.flushed_at,
+                    v.touched_at,
+                    s.last_active_at,
+                    s.last_active_at
+                  ),
+                updated_at: ^now
+              ]
+            ],
+            select: s.shard_id
+          ),
+          []
+        )
+
+      # Shards the directory has never seen: inserted once, with the value the sequential pair would
+      # have left (flush sets both stamps, the touch then GREATEST-merges into last_active_at).
+      updated_set = MapSet.new(updated_ids)
+
+      inserted =
+        chunk
+        |> Enum.reject(fn {id, _, _} -> id in updated_set end)
+        |> insert_new_joint(now)
+
+      acc + length(updated_ids) + inserted
+    end)
+  end
+
+  defp insert_new_joint([], _now), do: 0
+
+  defp insert_new_joint(entries, now) do
+    rows =
+      Enum.map(entries, fn {shard_id, flushed_at, touched_at} ->
+        %{
+          shard_id: shard_id,
+          schema_version: 0,
+          status: "active",
+          last_active_at: max_stamp(flushed_at, touched_at),
+          last_flushed_at: flushed_at,
+          inserted_at: now,
+          updated_at: now
+        }
+      end)
+
+    {count, _} = Repo.insert_all(Shard, rows, on_conflict: :nothing, conflict_target: :shard_id)
+    count
+  end
+
+  defp max_stamp(a, b), do: if(DateTime.compare(a, b) == :lt, do: b, else: a)
+
+  @doc """
   The post-node-loss loss report (expert review #28): shards that were active since their last
   durable flush — `last_flushed_at` is NULL (never recorded a flush) or `last_active_at >
   last_flushed_at` — i.e. potentially holding writes that didn't reach storage. Most-recently-active
