@@ -1588,18 +1588,23 @@ defmodule Fathom.ShardExecutor do
 
   defp shard_from_host(host) do
     # A multi-label host like "acme.fathom.example" yields "acme"; bare hosts
-    # ("localhost") and IPs are not shards. A single trailing dot (a legal FQDN form
+    # ("localhost") and IPs are not shards. A trailing dot (a legal FQDN form
     # some clients/resolvers emit) is stripped FIRST — pre-fix "localhost." split to
     # ["localhost", ""] and promoted an otherwise-bare hostname to a shard, so the
     # same logical host routed to different shards with vs without the dot (expert
-    # review #35). All remaining labels must be non-empty, so ".."/leading-dot hosts
-    # never resolve.
+    # review #35). The sub-label and every label of the zone must be non-empty, so
+    # ".."/leading-dot hosts never resolve.
+    #
+    # Expert review 2026-10-17 #27: the zone is normalised ONCE (see `serving_zone/0`) and the
+    # host is cut at its first dot, instead of split/all?/join/downcase per request. The routing
+    # outcome is pinned against a copy of the previous implementation in
+    # test/fathom/shard_executor_host_routing_test.exs.
     host = String.trim_trailing(host, ".")
 
     with false <- ip?(host),
-         [sub | rest] when rest != [] <- String.split(host, "."),
-         true <- Enum.all?([sub | rest], &(&1 != "")),
-         true <- zone_matches?(rest),
+         {i, 1} when i > 0 <- :binary.match(host, "."),
+         <<sub::binary-size(^i), ?., rest::binary>> <- host,
+         true <- zone_matches?(rest, serving_zone()),
          true <- Fathom.ShardId.valid?(sub) do
       sub
     else
@@ -1615,24 +1620,55 @@ defmodule Fathom.ShardExecutor do
   # "fathom.example"), the first label is promoted ONLY when the remaining labels
   # equal the serving zone; anything else fails closed to the default-shard chain.
   # nil (the dev/test default) keeps the unanchored behavior for localhost rigs.
-  defp zone_matches?(rest) do
-    case Application.get_env(:fathom, :shard_base_domain) do
-      nil ->
-        true
+  #
+  # `rest` is the host after its first dot (non-empty: a trailing dot was trimmed and the host
+  # has no empty label before it is compared). `{:zone, z}` is the lowercased, dot-trimmed zone.
+  defp zone_matches?(rest, :any), do: rest != "" and not empty_label?(rest)
+  defp zone_matches?(_rest, :none), do: false
+  defp zone_matches?(rest, {:zone, zone}), do: String.downcase(rest) == zone
+
+  # The previous implementation required EVERY label of the host non-empty; for the unanchored
+  # (`:any`) case that still means no ".." and no leading dot in `rest`.
+  defp empty_label?(rest), do: String.starts_with?(rest, ".") or String.contains?(rest, "..")
+
+  # The serving zone, normalised once per distinct `:shard_base_domain` value and memoised in
+  # :persistent_term keyed by that raw value (a config change, e.g. a test's put_env, is a new key,
+  # so there is nothing to invalidate; the set of values a node ever sees is tiny).
+  #
+  #   * `:any`  -- unset (dev/test default), or blank: runtime.exs treats a blank env var as unset
+  #     (round-2 #35) and this is the belt for a blank value arriving through any other path. The
+  #     misconfiguration is logged ONCE, when the value is first normalised (it used to log on every
+  #     request).
+  #   * `:none` -- a zone with an empty INNER label ("a..b"): no host can equal it, because the
+  #     host's labels must all be non-empty. Fails closed, exactly as before.
+  #   * `{:zone, z}` -- compare `String.downcase(rest) == z`.
+  defp serving_zone do
+    raw = Application.get_env(:fathom, :shard_base_domain)
+    key = {__MODULE__, :serving_zone, raw}
+
+    case :persistent_term.get(key, :unset) do
+      :unset ->
+        zone = normalize_zone(raw)
+        :persistent_term.put(key, zone)
+        zone
 
       zone ->
-        # An empty/whitespace zone matches NOTHING — denying all subdomain routing,
-        # and commingling every tenant into :default_shard where that is set.
-        # runtime.exs treats a blank env var as unset (round-2 #35); this is the
-        # belt for a blank value arriving through any other config path.
-        case zone |> String.trim() |> String.trim_leading(".") |> String.trim_trailing(".") do
-          "" ->
-            Logger.warning("shard_base_domain is blank; treating as unset (misconfig)")
-            true
+        zone
+    end
+  end
 
-          normalized ->
-            String.downcase(Enum.join(rest, ".")) == String.downcase(normalized)
-        end
+  defp normalize_zone(nil), do: :any
+
+  defp normalize_zone(raw) do
+    case raw |> String.trim() |> String.trim_leading(".") |> String.trim_trailing(".") do
+      "" ->
+        Logger.warning("shard_base_domain is blank; treating as unset (misconfig)")
+        :any
+
+      normalized ->
+        if "" in String.split(normalized, "."),
+          do: :none,
+          else: {:zone, String.downcase(normalized)}
     end
   end
 
