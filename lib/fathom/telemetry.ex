@@ -1061,6 +1061,26 @@ defmodule Fathom.Telemetry do
         description:
           "Replicated-commit latency from commit start to quorum decision, by outcome (ok / no_quorum / timeout / other). Tail growth here is the tenant-visible cost of a slow follower"
       ),
+      # Caller-side total (includes Session mailbox wait + ensure_started) and the two stages
+      # (expert review 2026-10-17 #10). total - commit.duration = the queue wait.
+      distribution("fathom.replication.commit_total.duration",
+        event_name: [:fathom, :replication, :commit_total],
+        measurement: :duration,
+        unit: {:native, :millisecond},
+        tags: [:outcome],
+        reporter_options: [buckets: [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]],
+        description:
+          "Replicated-commit latency as the CALLER sees it (Session mailbox wait + ensure_started + commit), by outcome. Compare with replication.commit.duration: the gap is queue wait"
+      ),
+      distribution("fathom.replication.commit_stage.duration",
+        event_name: [:fathom, :replication, :commit_stage],
+        measurement: :duration,
+        unit: {:native, :millisecond},
+        tags: [:stage],
+        reporter_options: [buckets: [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]],
+        description:
+          "Per-round commit stage latency: build (WAL read + stability recheck + compress) vs collect (quorum wait)"
+      ),
       distribution("fathom.replication.catchup.fails",
         event_name: [:fathom, :replication, :catchup],
         measurement: :fails,

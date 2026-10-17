@@ -33,6 +33,8 @@ defmodule Fathom.Shard.ReplicationLagTest do
       hid,
       [
         [:fathom, :replication, :commit],
+        [:fathom, :replication, :commit_total],
+        [:fathom, :replication, :commit_stage],
         [:fathom, :replication, :catchup],
         [:fathom, :replication, :lag]
       ],
@@ -115,6 +117,24 @@ defmodule Fathom.Shard.ReplicationLagTest do
     assert is_integer(d) and d > 0
     refute_receive {:tel, [:fathom, :replication, :commit], _, _}, 50
 
+    # Expert review 2026-10-17 #10: the caller-side total covers the in-handler span (it adds the
+    # mailbox wait + ensure_started), and the two stages are bounded-tag events.
+    assert_receive {:tel, [:fathom, :replication, :commit_total], %{duration: total},
+                    %{outcome: :ok}}
+
+    assert total >= d
+
+    stages =
+      for _ <- 1..2 do
+        assert_receive {:tel, [:fathom, :replication, :commit_stage], %{duration: sd},
+                        %{stage: stage}}
+
+        assert is_integer(sd) and sd >= 0
+        stage
+      end
+
+    assert Enum.sort(stages) == [:build, :collect]
+
     info = Session.lag_info(id)
     assert %{shard_id: ^id, catching_up?: false, catchup_fails: 0, unacked_bytes: ub} = info
     assert is_integer(ub)
@@ -172,9 +192,55 @@ defmodule Fathom.Shard.ReplicationLagTest do
     assert report.catching_up >= 1
     assert Enum.any?(report.worst, &(&1.shard_id == id))
 
-    assert :ok = LagGauge.measure()
+    # Expert review 2026-10-17 #2: the gauge must not call Sessions. A SUSPENDED Session answers no
+    # call, so a gauge that still did `GenServer.call(:lag_info)` would block here until timeout (or
+    # miscount); reading the node-level flag returns the right count immediately.
+    :ok = :sys.suspend(session)
+    {us, :ok} = :timer.tc(&LagGauge.measure/0)
+    :ok = :sys.resume(session)
+    assert us < 100_000
     assert_receive {:tel, [:fathom, :replication, :lag], %{catching_up_shards: n}, _}
     assert n >= 1
+    assert LagGauge.count() >= 1
+  end
+
+  test "LagGauge flag follows arm / clear / kill without leaking" do
+    start_supervised!(Fleet)
+    base = LagGauge.count()
+
+    LagGauge.mark(self(), true)
+    assert LagGauge.count() == base + 1
+    LagGauge.mark(self(), true)
+    assert LagGauge.count() == base + 1, "re-arming must not double count"
+    LagGauge.mark(self(), false)
+    assert LagGauge.count() == base
+
+    # A process that dies while flagged (killed: no terminate/2 ran) must not leak +1.
+    pid = spawn(fn -> Process.sleep(:infinity) end)
+    LagGauge.mark(pid, true)
+    assert LagGauge.count() == base + 1
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+    assert LagGauge.count() == base
+  end
+
+  test "a catching-up Session's flag is cleared by terminate", ctx do
+    %{id: id, root: root} = ctx
+    Application.put_env(:fathom, :replication_catchup_ms, 60_000)
+    followers = start_followers!(root, 3)
+    configure!(followers, 1)
+    {coordinator, path} = open_shard!(id)
+    {:ok, epoch} = Fathom.Shard.epoch(coordinator)
+    lineage = Fathom.Shard.lineage(coordinator)
+    for {n, _} <- Enum.take(followers, 2), do: Follower.seed(n, id, epoch, 0, 0, 0, lineage)
+    _ = Session.commit(id, path <> "-wal", coordinator)
+    assert_receive {:tel, [:fathom, :replication, :catchup], %{fails: f}, _} when f >= 1, 2_000
+
+    before = LagGauge.count()
+    assert before >= 1
+    Session.stop(id)
+    assert LagGauge.count() == before - 1
   end
 
   test "lag_report excludes a Session that does not answer instead of crashing" do

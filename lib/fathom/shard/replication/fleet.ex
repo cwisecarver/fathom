@@ -283,6 +283,9 @@ defmodule Fathom.Shard.Replication.Fleet do
     # DynamicSupervisor, so `Shipper.init/1` always finds it; dies with a Fleet restart, so
     # stranded refs go with it for the same reason `publish([])` above clears the name list.
     Fathom.Shard.Replication.Budget.init_table()
+
+    # Catch-up flags the telemetry gauge counts instead of calling every Session (review 2026-10-17 #2).
+    Fathom.Shard.Replication.LagGauge.init_table()
     # Recovery's unreachable-peer marks (expert review 2026-10-01 #3c), same ownership reasoning.
     Fathom.Shard.Replication.Recovery.init_table()
 

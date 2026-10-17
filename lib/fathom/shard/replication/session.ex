@@ -37,6 +37,7 @@ defmodule Fathom.Shard.Replication.Session do
 
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication
+  alias Fathom.Shard.Replication.LagGauge
   alias Fathom.Shard.Replication.Primary
   alias Fathom.Shard.Replication.Protocol, as: ReplProtocol
   alias Fathom.Shard.Replication.Protocol.Push
@@ -108,6 +109,22 @@ defmodule Fathom.Shard.Replication.Session do
   """
   @spec commit(String.t(), Path.t(), pid()) :: :ok | {:error, term()}
   def commit(shard_id, wal_path, coordinator) do
+    # CALLER-SIDE TOTAL SPAN (expert review 2026-10-17 #10). `:replication, :commit` is timed inside
+    # `handle_call`, so it misses the Session-mailbox queue wait and `ensure_started`, both of which
+    # the tenant also waits on. This one covers the whole call; the gap between the two is the queue.
+    t0 = System.monotonic_time()
+    reply = commit_call(shard_id, wal_path, coordinator)
+
+    :telemetry.execute(
+      [:fathom, :replication, :commit_total],
+      %{duration: System.monotonic_time() - t0},
+      %{outcome: commit_outcome(reply)}
+    )
+
+    reply
+  end
+
+  defp commit_call(shard_id, wal_path, coordinator) do
     with {:ok, pid} <- ensure_started(shard_id, coordinator) do
       GenServer.call(pid, {:commit, wal_path}, timeout())
     end
@@ -620,14 +637,14 @@ defmodule Fathom.Shard.Replication.Session do
   # runs on a shard with no traffic, and anything that does arrive queues behind it — which IS the
   # serialization this is staying inside rather than routing around.
   def handle_info(:catch_up, %{wal_path: nil} = state),
-    do: {:noreply, %{state | catchup_ref: nil}}
+    do: {:noreply, clear_catchup(state)}
 
   def handle_info(:catch_up, %{commits: n, catchup_at: n} = state) do
     {:reply, _discarded, state} =
       handle_call(
         {:commit, state.wal_path, :no_checkpoint},
         {self(), make_ref()},
-        %{state | catchup_ref: nil}
+        clear_catchup(state)
       )
 
     {:noreply, state}
@@ -638,7 +655,7 @@ defmodule Fathom.Shard.Replication.Session do
     # the laggard has been re-shipped. Drop the timer rather than duplicate that work: if that commit
     # refused a follower too, its own reject arms a fresh one. This is what keeps the retry free on a
     # busy shard — the first attempt fired regardless, and that alone cost 15% throughput.
-    {:noreply, %{state | catchup_ref: nil}}
+    {:noreply, clear_catchup(state)}
   end
 
   def handle_info({:DOWN, _ref, :process, coordinator, _reason}, %{coordinator: coordinator} = s) do
@@ -671,6 +688,7 @@ defmodule Fathom.Shard.Replication.Session do
   # shard's serialization point), so the cancellation is explicit here instead.
   @impl true
   def terminate(_reason, %{seeding: seeding} = state) do
+    LagGauge.mark(self(), false)
     for {_shipper, %{pid: pid}} <- seeding, do: Process.exit(pid, :kill)
 
     # Release the held WAL read fd (expert review 2026-08-26 #32). The VM would reclaim it when the
@@ -681,6 +699,7 @@ defmodule Fathom.Shard.Replication.Session do
   end
 
   def terminate(_reason, state) do
+    LagGauge.mark(self(), false)
     _ = Wal.close_held(Map.get(state, :wal_fd))
     unregister(state)
   end
@@ -1028,7 +1047,11 @@ defmodule Fathom.Shard.Replication.Session do
 
       skipped = Enum.map(skipped, &elem(&1, 0))
 
-      case build_pushes(state, wal_path, epoch, header, sendable) do
+      t_build = System.monotonic_time()
+      built = build_pushes(state, wal_path, epoch, header, sendable)
+      stage_duration(:build, t_build)
+
+      case built do
         {:ok, pushes, state} ->
           tag(deliver(state, header, sendable, pushes, current, skipped), plans, header)
 
@@ -1254,11 +1277,28 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
+  # Per-round stage timing for the commit path (expert review 2026-10-17 #10): `:build` is the WAL
+  # read + stability re-check + compress, `:collect` is the quorum wait. Bounded `stage` tag.
+  defp stage_duration(stage, t0) do
+    :telemetry.execute(
+      [:fathom, :replication, :commit_stage],
+      %{duration: System.monotonic_time() - t0},
+      %{stage: stage}
+    )
+  end
+
   defp collect(state, pushes, needed, skipped) do
-    case Replication.ship_quorum(pushes, needed, timeout(),
-           skip: skipped,
-           shard_id: state.shard_id
-         ) do
+    t_collect = System.monotonic_time()
+
+    result =
+      Replication.ship_quorum(pushes, needed, timeout(),
+        skip: skipped,
+        shard_id: state.shard_id
+      )
+
+    stage_duration(:collect, t_collect)
+
+    case result do
       {:ok, acked, rejects} ->
         # Advance ONLY the followers that actually ACKED — not everyone the quorum succeeded
         # without. Advancing a rejecter would leave the primary believing it holds bytes it
@@ -2627,12 +2667,22 @@ defmodule Fathom.Shard.Replication.Session do
         # Armed (not merely failed) catch-ups only; `fails` is the backoff depth. Admin P1.
         :telemetry.execute([:fathom, :replication, :catchup], %{fails: state.catchup_fails}, %{})
 
+        LagGauge.mark(self(), true)
+
         %{
           state
           | catchup_ref: Process.send_after(self(), :catch_up, ms),
             catchup_at: state.commits
         }
     end
+  end
+
+  # Every place that disarms the catch-up timer goes through here so the node-level gauge flag
+  # (`LagGauge`, expert review 2026-10-17 #2) cannot drift from `catchup_ref`. `terminate/2` clears
+  # it too; a Session killed without terminate is pruned by the gauge's liveness check.
+  defp clear_catchup(state) do
+    LagGauge.mark(self(), false)
+    %{state | catchup_ref: nil}
   end
 
   # A CLEAN commit is the only thing that clears the failure count. Not tidiness: without it a
