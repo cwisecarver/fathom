@@ -122,6 +122,8 @@ defmodule Fathom.Shard.Provenance do
   def write_durable(_path, nil), do: :ok
 
   def write_durable(path, etag) do
+    test_hook(:write_durable, path)
+
     case put_record(path, etag, nil) do
       :ok -> :ok
       {:error, reason} -> Logger.warning("durable etag sidecar write failed: #{inspect(reason)}")
@@ -334,11 +336,27 @@ defmodule Fathom.Shard.Provenance do
   """
   @spec make_durable(String.t()) :: :ok
   def make_durable(path) do
+    test_hook(:make_durable, path)
+
     case read(path) do
       {:ok, etag} -> write_durable(path, etag)
       :no_object -> write_durable(path, @no_object_sentinel)
       _ -> :ok
     end
+  end
+
+  # TEST SEAM (expert review 2026-10-17 #5): the durable sidecar writes now run OFF the coordinator
+  # (the flush task, and the first-write `sidecar_task`), so the only way to prove the coordinator
+  # keeps answering while one is in flight is to hold it there. A test sets
+  # `:provenance_write_hook` to a function of `(stage, path)`; it runs BEFORE the write and may
+  # block. One env read beside an fsync; unset in every real run.
+  defp test_hook(stage, path) do
+    case Application.get_env(:fathom, :provenance_write_hook) do
+      fun when is_function(fun, 2) -> fun.(stage, path)
+      _ -> :ok
+    end
+
+    :ok
   end
 
   @spec read(String.t()) :: {:ok, String.t()} | :no_object | :missing | :corrupt

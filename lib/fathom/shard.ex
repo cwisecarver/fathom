@@ -920,6 +920,9 @@ defmodule Fathom.Shard do
         pool_flush_hold: false,
         # Has the open path's plain sidecar write been made durable yet? See sync_sidecar_once/1.
         sidecar_synced?: false,
+        # The off-process first-write sidecar fsync (expert review 2026-10-17 #5); nil when none
+        # is in flight. The durability flush defers behind it and terminate settles it.
+        sidecar_task: nil,
         idle_ms: idle_ms(),
         timer: nil,
         # Monotonic-ms instant the shard last went idle (all connections checked in), or
@@ -1751,6 +1754,18 @@ defmodule Fathom.Shard do
 
   def handle_info({:lineage_task_timeout, _stale}, state), do: {:noreply, state}
 
+  # The first-write sidecar fsync finished (expert review 2026-10-17 #5) — see sync_sidecar_once/1.
+  def handle_info({ref, _result}, %{sidecar_task: %Task{ref: ref}} = state) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, %{state | sidecar_task: nil}}
+  end
+
+  # It crashed: the sidecar is not known durable, so let the next `:became_dirty` try again.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{sidecar_task: %Task{ref: ref}} = state) do
+    Logger.warning("shard #{state.id}: first-write sidecar fsync crashed (#{inspect(reason)})")
+    {:noreply, %{state | sidecar_task: nil, sidecar_synced?: false}}
+  end
+
   # The renewal task crashed: treat as transient and retry on the next tick.
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{renew_task: %Task{ref: ref}} = state) do
     Logger.warning("shard #{state.id}: lease renewal task crashed (#{inspect(reason)}); retrying")
@@ -2217,6 +2232,14 @@ defmodule Fathom.Shard do
             # snapshot_state what flush_and_reconcile needs.
             fence_ctx = fence_ctx(state)
 
+            # The first-write sidecar fsync, if still running, is the sidecar's other writer: the
+            # task waits for it before its own record_intent/stamp (expert review 2026-10-17 #5).
+            sidecar_pid =
+              case state.sidecar_task do
+                %Task{pid: pid} -> pid
+                nil -> nil
+              end
+
             # `:lineage` is in this list because the flush STAMPS it (expert review 2026-08-20 #8),
             # and leaving it out is not a subtle failure: `lineage_to_store/1` is reached through a
             # STRICT `state.lineage`, so an omission raises inside the task and every flush stops
@@ -2256,7 +2279,10 @@ defmodule Fathom.Shard do
             # closes the window immediately for the one failure that is synchronous and local.
             task =
               try do
-                Task.async(fn -> fenced_flush(fence_ctx, snapshot_state) end)
+                Task.async(fn ->
+                  await_sidecar_task(sidecar_pid)
+                  fenced_flush(fence_ctx, snapshot_state)
+                end)
               rescue
                 e ->
                   if gate == :ok, do: FlushGate.release()
@@ -2333,7 +2359,13 @@ defmodule Fathom.Shard do
     # worse, `quarantine_fenced!` renames the live file out from under the open fds, so such a write
     # lands in the `.fenced.<ts>` inode and is invisible to the tenant forever. The fence turns that
     # into a retryable 503.
-    state = state |> cancel_renew() |> settle_renew_task() |> settle_flush_task()
+    state =
+      state
+      |> cancel_renew()
+      |> settle_renew_task()
+      |> settle_sidecar_task()
+      |> settle_flush_task()
+
     # Reply to any pending flush_now caller before we exit (expert review 2026-07-18 #4): we
     # self-fenced WITHOUT flushing, so the on-disk state is NOT durable in storage. Without this,
     # the caller's GenServer.call gets a bare :DOWN → Shards.flush catches the exit as :ok → the
@@ -2371,7 +2403,13 @@ defmodule Fathom.Shard do
     # Settle the legacy-mode renew task the same way and FIRST (expert review 2026-08-31 #15): the
     # drop-flush below does a fence-renew + release_lease, and an in-flight renew PUT landing after
     # that release would re-write the lock naming this dead coordinator — a leaked lock.
-    state = state |> cancel_renew() |> settle_renew_task() |> settle_flush_task()
+    state =
+      state
+      |> cancel_renew()
+      |> settle_renew_task()
+      |> settle_sidecar_task()
+      |> settle_flush_task()
+
     # A flush_now caller pending at idle/drain time gets an explicit error rather than a bare
     # exit that Shards.flush would mask as a false :ok (expert review 2026-07-18 #4). The retry
     # is correct: after the drop-flush the shard is cold and Shards.flush returns :ok if storage
@@ -2401,8 +2439,8 @@ defmodule Fathom.Shard do
   # (`Fathom.Shards.stop` force-terminates without draining). Before expert review 2026-07-19 #2 this
   # fell to the catch-all below, which flushed NOTHING: a dirty shard lost up to a full flush interval
   # of acked writes on ephemeral disk (containers), despite trap_exit + the shutdown budget existing
-  # precisely to flush on a clean stop. Settle the in-flight flush task FIRST — its result-fold stamps
-  # the provenance sidecar, closing the window where a killed task's already-landed PUT makes the next
+  # precisely to flush on a clean stop. Settle the in-flight flush task FIRST — the task stamps
+  # the provenance sidecar before it replies (expert review 2026-10-17 #5), closing the window where a killed task's already-landed PUT makes the next
   # warm open read sidecar(old) != object(new) and FALSE-quarantine a fork (the #21 spurious-fork
   # window, here on the shutdown path). Then flush the dirty state via the SAME fenced flush_and_drop
   # the idle-stop clause uses (drops local + releases the lease for a fast planned failover; its
@@ -2433,7 +2471,13 @@ defmodule Fathom.Shard do
     # Settle the legacy-mode renew task before the drop-flush's fence-renew + release_lease (expert
     # review 2026-08-31 #15) — an in-flight renew PUT landing after the release would re-write the
     # lock naming this dead coordinator. No-op in heartbeat mode.
-    state = state |> cancel_renew() |> settle_renew_task() |> settle_flush_task()
+    state =
+      state
+      |> cancel_renew()
+      |> settle_renew_task()
+      |> settle_sidecar_task()
+      |> settle_flush_task()
+
     state = settle_waiters(state, {:error, :coordinator_stopped})
     Fathom.ShardLoad.forget(state.id)
     Fathom.ShardLatency.forget(state.id)
@@ -2633,7 +2677,7 @@ defmodule Fathom.Shard do
   end
 
   defp shutdown_orphan_tasks(state) do
-    for key <- [:flush_task, :renew_task, :lapse_revalidate_pending, :lineage_task],
+    for key <- [:flush_task, :renew_task, :lapse_revalidate_pending, :lineage_task, :sidecar_task],
         match?(%Task{}, Map.get(state, key)),
         do: Task.shutdown(Map.fetch!(state, key), :brutal_kill)
 
@@ -3413,6 +3457,8 @@ defmodule Fathom.Shard do
         other -> other
       end
 
+    stamp_sidecar(state, result)
+
     # Flush-COST telemetry (expert review 2026-07-18 #20 — the cost side of the flush-interval knob,
     # complementing the RPO benefit measured by Fathom.Rpo). The VACUUM INTO snapshot + object PUT
     # ran here in the flush task; emit the duration + outcome so operators can watch the flush RATE
@@ -3426,6 +3472,25 @@ defmodule Fathom.Shard do
 
     result
   end
+
+  # Name the object in the provenance sidecar, IN THE FLUSH TASK, before the verdict is delivered
+  # (expert review 2026-10-17 #5). This was `Provenance.write_durable` inside the coordinator's
+  # `apply_flush_verdict/2` — an open + pwrite + fsync (7-10 ms) in the mailbox every flush interval
+  # of every dirty shard. Doing it here keeps the ordering invariant (the sidecar names the object
+  # before ANY later open can read it) and tightens it: the window between the PUT landing and the
+  # sidecar learning the etag no longer includes the verdict's trip through the mailbox, so it is
+  # now only this call. A kill inside it is the case the PUT INTENT already covers (`Fork`
+  # adopts a stored object whose md5 matches a recorded intent). Both verdicts that advance the
+  # sidecar stamp here: an upload, and a 412 reconciled onto one of this node's own recorded PUTs
+  # (`reconcile_moved/1`). The verdict reaches `apply_flush_verdict/2` only after this returns, which
+  # is how `settle_flush_task/1` (terminate) and the live handler both know it is done.
+  defp stamp_sidecar(state, {:ok, new_etag, _carried}),
+    do: Provenance.write_durable(state.path, new_etag)
+
+  defp stamp_sidecar(state, {:reconciled, object_etag}) when is_binary(object_etag),
+    do: Provenance.write_durable(state.path, object_etag)
+
+  defp stamp_sidecar(_state, _result), do: :ok
 
   defp flush_outcome({:ok, _, _}), do: :uploaded
   defp flush_outcome({:reconciled, _}), do: :reconciled
@@ -4875,10 +4940,9 @@ defmodule Fathom.Shard do
   # Storage I/O already ran in the task — so both the live handler and the terminate-path
   # settle can call it. Returns `{status, state}`.
   defp apply_flush_verdict(state, {:ok, new_etag, carried}) do
-    # Uploaded; advance the fence etag, the provenance sidecar, and the flushed watermark
-    # captured when the task started (clears dirty up to that point).
-    Provenance.write_durable(state.path, new_etag)
-
+    # Uploaded; advance the fence etag and the flushed watermark captured when the task started
+    # (clears dirty up to that point). The provenance sidecar was already stamped by the flush
+    # task (`stamp_sidecar/2`, expert review 2026-10-17 #5) — the verdict's arrival is the proof.
     state = %{
       state
       | flushed_through: state.flush_pending,
@@ -4922,7 +4986,7 @@ defmodule Fathom.Shard do
   # proof), so our local copy is a descendant of it — same lineage, plus more writes. That is exactly what
   # the provenance check needs to not false-quarantine a fork.
   defp apply_flush_verdict(state, {:reconciled, object_etag}) when is_binary(object_etag) do
-    Provenance.write_durable(state.path, object_etag)
+    # (The sidecar stamp for this verdict also ran in the flush task: `stamp_sidecar/2`.)
     # DROP THE LINEAGE CACHE (expert review 2026-08-26 #33). This is the one verdict where the
     # object moved to an etag we did not write — our PUT 412'd — so what its metadata says is no
     # longer something we know. The next flush pays one HEAD and re-learns it, which is the whole
@@ -5459,10 +5523,61 @@ defmodule Fathom.Shard do
   # between the first acked write and this cast being handled — accepted as the trade.
   defp sync_sidecar_once(%{sidecar_synced?: true} = state), do: state
 
+  #
+  # OFF THE COORDINATOR (expert review 2026-10-17 #5): `make_durable` is an open + pwrite + fsync
+  # (F_FULLFSYNC measured 7 ms p50 / 10 ms p99), and this runs in the `:became_dirty` handler, so
+  # every checkout/checkin/:DOWN for the shard queued behind it. It runs in a task instead. The
+  # task is serialised against the sidecar's other writer — the durability flush's pre-PUT intent
+  # record and post-PUT stamp — by the flush task waiting for it first (`await_sidecar_task/1`; NOT
+  # by deferring the flush tick, which would let a `send(:durability_flush)` race the task and
+  # silently not start), and against the drop flush by `settle_sidecar_task/1` in every terminate
+  # clause. Without that, a
+  # slow `make_durable` could re-read the sidecar, lose a race with a flush's `record_intent`, and
+  # write the PRE-intent record back over it. The cast was already asynchronous to the acked write,
+  # so the crash window this leaves (first write acked, sidecar not yet durable) is the one the
+  # comment above already accepts, widened by a task spawn.
   defp sync_sidecar_once(state) do
-    Provenance.make_durable(state.path)
-    %{state | sidecar_synced?: true}
+    path = state.path
+
+    task =
+      try do
+        Task.async(fn -> Provenance.make_durable(path) end)
+      rescue
+        # `:system_limit` (process table full): fall back to the inline fsync, the pre-#5 behaviour.
+        _ ->
+          Provenance.make_durable(path)
+          nil
+      end
+
+    %{state | sidecar_synced?: true, sidecar_task: task}
   end
+
+  # Inside the flush task: block until the first-write sidecar fsync has finished (it exited), so
+  # the flush's intent record and stamp never interleave with `make_durable`'s read-then-write of the
+  # same record. Bounded by the settle budget; a wedged fsync is then raced rather than waited on
+  # forever (the flush has its own fence/PUT bounds). Normally already done: nil or a dead pid.
+  defp await_sidecar_task(nil), do: :ok
+
+  defp await_sidecar_task(pid) do
+    ref = Process.monitor(pid)
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+    after
+      settle_yield_ms() ->
+        Process.demonitor(ref, [:flush])
+        :ok
+    end
+  end
+
+  # Wait out the first-write sidecar fsync (terminate paths): the drop flush rewrites the sidecar,
+  # and two writers on the file is the race `sync_sidecar_once/1` describes.
+  defp settle_sidecar_task(%{sidecar_task: %Task{} = task} = state) do
+    _ = Task.yield(task, settle_yield_ms()) || Task.shutdown(task)
+    %{state | sidecar_task: nil}
+  end
+
+  defp settle_sidecar_task(state), do: state
 
   # Arm the periodic durability flush. A non-positive interval disables it
   # (idle-only durability).

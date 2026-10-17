@@ -79,7 +79,23 @@ defmodule Fathom.Shard.ProvenanceFirstWriteTest do
     |> Enum.sum()
   end
 
-  defp sync(conn), do: _ = :sys.get_state(elem(conn, 0))
+  # The first-write fsync runs in a `sidecar_task` since expert review 2026-10-17 #5, so syncing the
+  # mailbox is not enough: wait for the task too, then sync past its reply.
+  defp sync(conn) do
+    coordinator = elem(conn, 0)
+
+    case :sys.get_state(coordinator).sidecar_task do
+      %Task{pid: pid} ->
+        ref = Process.monitor(pid)
+        assert_receive {:DOWN, ^ref, :process, ^pid, _}, 5_000
+
+      nil ->
+        :ok
+    end
+
+    _ = :sys.get_state(coordinator)
+    :ok
+  end
 
   test "read-only: none; first statement write: exactly one; later writes: none", %{id: id} do
     trace_atomic_writes!()
