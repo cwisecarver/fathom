@@ -71,6 +71,28 @@ defmodule Fathom.Shard.NifDispatchTest do
       assert {total, by_fun} == {1, %{multi_step: 1}}
     end
 
+    # expert review 2026-10-17 #3: with replication ON, `ships_now?/3` evaluated
+    # `Connection.autocommit?/1` (a dirty `transaction_status` NIF) before the cheap
+    # `wrote? or ...` operand, so every read paid a second dispatch in prod (count was 2).
+    test "a point SELECT is still exactly 1 dirty dispatch with replication ON", %{conn: conn} do
+      prev = Application.get_env(:fathom, :replication_enabled)
+      Application.put_env(:fathom, :replication_enabled, true)
+
+      on_exit(fn ->
+        if prev == nil,
+          do: Application.delete_env(:fathom, :replication_enabled),
+          else: Application.put_env(:fathom, :replication_enabled, prev)
+      end)
+
+      sel = stmt("SELECT v FROM kv WHERE k = ?", [1])
+      assert {:ok, _} = ShardExecutor.execute(conn, sel)
+
+      {res, total, by_fun} = count(fn -> ShardExecutor.execute(conn, sel) end)
+
+      assert {:ok, %StmtResult{rows: [["a"]]}} = res
+      assert {total, by_fun} == {1, %{multi_step: 1}}
+    end
+
     test "SELECT after a write on the same handle still reports 0 changes / nil rowid", %{
       conn: conn
     } do

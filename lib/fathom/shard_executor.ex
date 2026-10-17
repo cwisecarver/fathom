@@ -788,7 +788,10 @@ defmodule Fathom.ShardExecutor do
   # The flag now answers only "did this transaction write", for the commit-boundary arm.
   @doc false
   def ships_now?(conn, sql, wrote?) do
-    Connection.autocommit?(conn) and (wrote? or (commit_boundary?(sql) and txn_wrote?(conn)))
+    # Cheap operands first: `autocommit?/1` is a dirty-IO NIF dispatch, and for a read `wrote?` is
+    # false and no commit boundary, so evaluating it first paid a second dispatch per SELECT with
+    # replication ON (expert review 2026-10-17 #3). Pure boolean reorder, same result.
+    (wrote? or (commit_boundary?(sql) and txn_wrote?(conn))) and Connection.autocommit?(conn)
   end
 
   # Distinct from a SQLite error, and a 503 rather than a 400: nothing is wrong with the statement,
