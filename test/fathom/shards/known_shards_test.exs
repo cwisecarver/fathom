@@ -71,4 +71,66 @@ defmodule Fathom.Shards.KnownShardsTest do
     assert KnownShards.known?(id)
     :ok = Fathom.ShardExecutor.close(h)
   end
+
+  # Expert review 2026-10-17 #13: the set used to be cleared wholesale at @max_entries, so every known
+  # shard became unknown at once and a fleet at the cap paid a directory read per shard in one burst.
+  # It is now two generations (current + previous), and a lookup checks both. These pin the two
+  # properties that matter: an id survives one rotation, and the set stays near two generations.
+  describe "two generations (#13)" do
+    # The tables are shared with every other test in the file, so start each one from empty. Direct
+    # ETS, not a new API, so the module's public surface is unchanged.
+    setup do
+      :ets.delete_all_objects(KnownShards)
+      :ets.delete_all_objects(KnownShards.Prev)
+      :ok
+    end
+
+    defp fill(n, prefix) do
+      for i <- 1..n, do: KnownShards.put("#{prefix}#{i}")
+    end
+
+    defp total_size,
+      do: :ets.info(KnownShards, :size) + :ets.info(KnownShards.Prev, :size)
+
+    test "an id from before one rotation is still known; after two it is forgotten" do
+      cap = KnownShards.max_entries()
+
+      KnownShards.put("old")
+      assert KnownShards.known?("old")
+
+      # Fill the current generation to the cap. The next put is the one that rotates.
+      fill(cap - 1, "g1_")
+      KnownShards.put("after_one")
+
+      assert KnownShards.known?("old"),
+             "an id from before one rotation was forgotten, which is the wholesale clear back"
+
+      assert KnownShards.known?("after_one")
+
+      # PRECONDITION: a rotation really happened. The previous generation holds the full first
+      # generation and the current one holds the id put after the rotation. A clear-all would leave 1.
+      assert total_size() == cap + 1, "the fixture never rotated, so the test proved nothing"
+
+      fill(cap - 1, "g2_")
+      KnownShards.put("after_two")
+
+      refute KnownShards.known?("old"), "an id survived two rotations"
+      assert KnownShards.known?("after_one"), "the generation one rotation back was dropped early"
+      assert KnownShards.known?("after_two")
+    end
+
+    test "the set never holds more than about two generations" do
+      cap = KnownShards.max_entries()
+
+      fill(3 * cap, "bulk_")
+
+      total = total_size()
+
+      assert total <= 2 * cap, "the set grew past two generations (#{total} > #{2 * cap})"
+
+      # PRECONDITION: it did rotate, so the bound is the two-generation bound and not a trivially
+      # small table. A clear-all would sit at or below one generation.
+      assert total > cap, "the set never reached two generations, so the bound proved nothing"
+    end
+  end
 end
