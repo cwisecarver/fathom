@@ -363,6 +363,63 @@ defmodule Fathom.Shards.LruEvictionTest do
     end
   end
 
+  # Expert review 2026-10-17 #6 (part a): a CLEAN idle victim is preferred over a colder DIRTY one,
+  # because a clean drop skips the checkpoint + S3 PUT that a dirty drop pays inside the admitting
+  # stream. The symptom: at capacity, the cold-but-dirty shard was evicted first and its flush blocked
+  # the novel open. With all candidates dirty, the choice must stay pure LRU.
+  describe "clean victims are preferred at capacity (#6)" do
+    # Dirtiness is read from the published flush watermark, and that is only published while the
+    # metrics layer is on (`Fathom.Admin.enabled?/0`, on in prod, OFF in config/test.exs). Turn it on
+    # for these fixtures so the shards publish their rows. With it off every candidate reads unknown
+    # and the order is plain LRU, which is the fallback this describe does not exercise.
+    setup do
+      prev = Application.get_env(:fathom, :metrics_collector)
+      Application.put_env(:fathom, :metrics_collector, true)
+      on_exit(fn -> restore(:metrics_collector, prev) end)
+      :ok
+    end
+
+    test "a clean idle shard is evicted before a colder dirty idle shard" do
+      dirty = open_idle_dirty(uniq())
+      clean = open_idle(uniq())
+      _busy = open_held(uniq())
+
+      # PRECONDITION: the fixture really is dirty-then-clean. Without it the test could pass by
+      # accident of LRU order alone.
+      assert Fathom.Shard.dirty?(dirty), "the colder fixture did not read dirty"
+      refute Fathom.Shard.dirty?(clean), "the warmer fixture did not read clean"
+
+      Application.put_env(:fathom, :max_open_shards, 1)
+      dirty_ref = Process.monitor(dirty)
+      clean_ref = Process.monitor(clean)
+
+      assert {:ok, _pid, _r, _p} = Shards.checkout(uniq())
+
+      assert_receive {:DOWN, ^clean_ref, :process, ^clean, _}, 2_000
+      refute_received {:DOWN, ^dirty_ref, :process, ^dirty, _}
+      assert Process.alive?(dirty), "the dirty shard was evicted while a clean one was available"
+    end
+
+    test "when every idle candidate is dirty, the LRU order is kept" do
+      older = open_idle_dirty(uniq())
+      newer = open_idle_dirty(uniq())
+      _busy = open_held(uniq())
+
+      assert Fathom.Shard.dirty?(older), "the colder fixture did not read dirty"
+      assert Fathom.Shard.dirty?(newer), "the warmer fixture did not read dirty"
+
+      Application.put_env(:fathom, :max_open_shards, 1)
+      older_ref = Process.monitor(older)
+      newer_ref = Process.monitor(newer)
+
+      assert {:ok, _pid, _r, _p} = Shards.checkout(uniq())
+
+      assert_receive {:DOWN, ^older_ref, :process, ^older, _}, 5_000
+      refute_received {:DOWN, ^newer_ref, :process, ^newer, _}
+      assert Process.alive?(newer)
+    end
+  end
+
   # Expert review 2026-07-14 #7 (Reliability): at capacity, admission runs in the checkout
   # (Filo stream) process and probed up to @max_evict_probes (16) LRU candidates, calling
   # drain(id, 0) on each — a BLOCKING receive whose only bound was drain_timeout + 30_000.

@@ -1432,8 +1432,12 @@ defmodule Fathom.Shards do
   # freed. Off when `:evict_idle_at_capacity` is false (hard cap). `evict/2` is the atomic
   # evict-if-idle primitive: it stops the coordinator (flush + drop + release lease) iff it
   # has zero checked-out connections, else returns `{:error, :busy}` untouched. Walks
-  # LRU-first, so the first probe — the coldest shard — is almost always idle and evicts in
-  # one call; a dirty idle shard pays one flush, a clean one skips the upload.
+  # Clean candidates are tried before dirty ones (expert review 2026-10-17 #6): a clean victim
+  # drops with no flush, while a dirty one pays a checkpoint + S3 PUT inside the admitting stream.
+  # Within each group the order stays LRU, so with no clean candidate the choice is unchanged.
+  #
+  # Victim choice is a hint, not a correctness decision: `evict/2` still re-checks idleness under
+  # the coordinator, so a stale dirty/clean reading can at worst pick a slightly worse victim.
   #
   # Time-bounded by `:evict_budget_ms` (expert review 2026-07-14 #7): probing stops once
   # the total wait would exceed the budget, and each probe's wait for the coordinator to
@@ -1446,6 +1450,7 @@ defmodule Fathom.Shards do
 
       Fathom.Shards.Lru.lru_order(@max_evict_probes)
       |> Enum.filter(&shard_open?/1)
+      |> prefer_clean()
       |> Enum.reduce_while(false, fn shard_id, _ ->
         remaining = deadline - System.monotonic_time(:millisecond)
 
@@ -1545,6 +1550,30 @@ defmodule Fathom.Shards do
   # `drain/2` on an already-gone shard as having freed a slot.
   # A dead partition reads as "not open": the row is not counted as a freed slot.
   defp shard_open?(shard_id), do: match?({:ok, [_ | _]}, registry_lookup(shard_id))
+
+  # Stable partition: clean candidates first, then the rest, each in LRU order (expert review
+  # 2026-10-17 #6).
+  defp prefer_clean(candidates) do
+    {clean, dirty} = Enum.split_with(candidates, &clean?/1)
+    clean ++ dirty
+  end
+
+  # ETS-only read of "is this shard clean" (no GenServer.call on the admission path). Mirrors the
+  # expression `Fathom.Shard.unflushed?/1` uses: the published flush watermark is current only if
+  # its counter generation matches and the write count has not passed `flushed_through`. A missing
+  # row is unknown, so it is NOT treated as clean.
+  defp clean?(shard_id) do
+    case :ets.lookup(Fathom.Admin.FlushWatermark, shard_id) do
+      [{^shard_id, flushed_through, counter_gen, _flushed_at}] ->
+        counter_gen == Fathom.Shard.WriteCounter.generation() and
+          Fathom.Shard.WriteCounter.count(shard_id) <= flushed_through
+
+      _ ->
+        false
+    end
+  rescue
+    ArgumentError -> false
+  end
 
   # THE ONE REGISTRY READ for the shard-keyed paths (expert review 2026-10-12 #14). While a Registry
   # partition is down its ETS table is gone and `Registry.lookup/2` raises ArgumentError until the
