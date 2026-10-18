@@ -125,6 +125,99 @@ defmodule Fathom.HranaAuthTest do
     :ok = Fathom.ShardExecutor.close(h2)
   end
 
+  # Expert review 2026-10-17 #17: the signature/expiry result is cached per token, but the shard
+  # match and the revocation floor must still be evaluated on EVERY authorize. Each test warms the
+  # cache with an allowed call first, then proves the denied path still denies with the 401 code.
+  describe "verify-result cache (#17)" do
+    setup do
+      require_auth!()
+      :ets.delete_all_objects(HranaAuth.verify_cache_table())
+      %{shard: "vcache_#{System.unique_integer([:positive])}"}
+    end
+
+    test "a successful verify is cached, and the cached answer equals the uncached one", %{
+      shard: shard
+    } do
+      token = token!(shard)
+      first = HranaAuth.authorize(shard, token)
+      assert {:ok, {:rw, _}} = first
+      assert :ets.info(HranaAuth.verify_cache_table(), :size) == 1
+      assert HranaAuth.authorize(shard, token) == first
+    end
+
+    test "revocation is re-checked on a cache hit", %{shard: shard} do
+      token = token!(shard)
+      assert {:ok, {:rw, version}} = HranaAuth.authorize(shard, token)
+      assert {:ok, _} = HranaAuth.authorize(shard, token), "cache not warm"
+
+      Fathom.HranaAuth.Revocations.put(shard, version + 1, nil)
+
+      assert {:error, %Filo.Error{status: 401, code: "AUTH_REQUIRED"}} =
+               HranaAuth.authorize(shard, token),
+             "a revoked token kept authorizing from the verify cache"
+    end
+
+    test "a cached token still cannot open a different shard", %{shard: shard} do
+      token = token!(shard)
+      assert {:ok, _} = HranaAuth.authorize(shard, token)
+
+      assert {:error, %Filo.Error{status: 401, code: "AUTH_REQUIRED"}} =
+               HranaAuth.authorize(shard <> "x", token)
+    end
+
+    test "an expired token is refused even though it was cached while valid", %{shard: shard} do
+      Application.put_env(:fathom, :hrana_token_max_age, 60)
+      # Valid now, with an "e" deadline 2s out: the cache entry must not outlive it.
+      token = token!(shard, signed_at: System.system_time(:second) - 58)
+      assert {:ok, {:rw, {_v, e}}} = HranaAuth.authorize(shard, token)
+      assert {:ok, _} = HranaAuth.authorize(shard, token)
+      [{_key, _payload, until}] = :ets.tab2list(HranaAuth.verify_cache_table())
+      assert until <= e, "cache entry outlives the token's own expiry"
+
+      # Same bytes under a tighter max_age: key includes max_age, so this misses and is refused.
+      Application.put_env(:fathom, :hrana_token_max_age, 10)
+
+      assert {:error, %Filo.Error{status: 401, code: "AUTH_REQUIRED"}} =
+               HranaAuth.authorize(shard, token)
+    end
+
+    test "a token without an \"e\" claim under a finite max_age is never cached", %{shard: shard} do
+      Application.put_env(:fathom, :hrana_token_max_age, 3600)
+
+      secret =
+        Application.get_env(:fathom, :hrana_token_secret) ||
+          Application.get_env(:fathom, FathomWeb.Endpoint)[:secret_key_base]
+
+      legacy =
+        Phoenix.Token.sign(secret, "fathom hrana shard", %{"s" => shard, "v" => 1})
+
+      assert {:ok, _} = HranaAuth.authorize(shard, legacy)
+      assert :ets.info(HranaAuth.verify_cache_table(), :size) == 0
+    end
+
+    test "a signing-secret change misses the cache and refuses the token", %{shard: shard} do
+      prev = Application.get_env(:fathom, :hrana_token_secret)
+      on_exit(fn -> Application.put_env(:fathom, :hrana_token_secret, prev) end)
+
+      token = token!(shard)
+      assert {:ok, _} = HranaAuth.authorize(shard, token)
+
+      Application.put_env(:fathom, :hrana_token_secret, String.duplicate("r", 64))
+
+      assert {:error, %Filo.Error{status: 401, code: "AUTH_REQUIRED"}} =
+               HranaAuth.authorize(shard, token)
+    end
+
+    test "the cache is bounded" do
+      for i <- 1..50 do
+        t = token!("bound_#{i}")
+        HranaAuth.authorize("bound_#{i}", t)
+      end
+
+      assert :ets.info(HranaAuth.verify_cache_table(), :size) <= 10_000
+    end
+  end
+
   test "a nil shard passes through so open(nil) keeps its fail-closed 400 (#26)" do
     require_auth!()
     # {:ok, :rw} — the scope is moot; open(nil, _) refuses with a 400 regardless.

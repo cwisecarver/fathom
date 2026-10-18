@@ -153,6 +153,13 @@ defmodule Fathom.HranaAuth.Revocations do
   def init(_opts) do
     # public read_concurrency: verify/2 runs in the stream process and reads directly.
     :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
+    # Verify-result cache for `HranaAuth` (expert review 2026-10-17 #17); this process owns it.
+    :ets.new(Fathom.HranaAuth.verify_cache_table(), [
+      :set,
+      :public,
+      :named_table,
+      read_concurrency: true
+    ])
 
     # Fleet-wide push (round-2 #24): without it a change lands on every OTHER node only after a
     # full TTL. Fathom has no BEAM cluster, so the one shared channel is Postgres — Oban's

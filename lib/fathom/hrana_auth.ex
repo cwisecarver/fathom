@@ -114,8 +114,7 @@ defmodule Fathom.HranaAuth do
   defp verify(_shard_id, nil), do: reject(:missing, @missing)
 
   defp verify(shard_id, token) when is_binary(token) do
-    with {:ok, %{"s" => granted, "v" => version} = payload} <-
-           Phoenix.Token.verify(secret!(), @salt, token, max_age: max_age()),
+    with {:ok, %{"s" => granted, "v" => version} = payload} <- verify_token(token),
          {:ok, ^granted} <- ShardId.cast(shard_id),
          true <- version_ok?(version, Revocations.floor_info(granted)) do
       # The token's scope flows to the stream open as Filo's authorize context (#24) — no
@@ -142,6 +141,78 @@ defmodule Fathom.HranaAuth do
   end
 
   defp verify(_shard_id, _token), do: reject(:other, @unauthorized)
+
+  # VERIFY-RESULT CACHE (expert review 2026-10-17 #17). `Phoenix.Token.verify/4` (key derivation
+  # lookup, base64 decode, HMAC, `binary_to_term(:safe)`) ran on every authenticated open, and
+  # open-per-request clients open on every request. Only the SIGNATURE+EXPIRY result is cached,
+  # keyed by `{secret, max_age, token}` - so a signing-secret rotation or a `:hrana_token_max_age`
+  # change misses by construction. Everything that can change after minting is still evaluated PER
+  # CALL by `verify/2`: the shard match (`ShardId.cast`) and the revocation floor
+  # (`Revocations.floor_info/1`), so a revoke or rotate takes effect on the very next authorize.
+  # An entry lives until min(the token's own signed expiry "e", now + @verify_cache_ttl_s); a
+  # token without "e" under a finite max_age (minted before 2026-09-29 #23) is never cached,
+  # because its true expiry is not knowable from the payload. Bounded by clearing the table when
+  # it reaches @verify_cache_max (a flood of distinct tokens is the only way to get there). The
+  # table is created by `Revocations.init/1` (the supervised owner); if it is absent (mix tasks,
+  # no supervisor) every call simply verifies.
+  @verify_cache Fathom.HranaAuth.VerifyCache
+  @verify_cache_ttl_s 60
+  @verify_cache_max 10_000
+
+  @doc false
+  @spec verify_cache_table() :: atom()
+  def verify_cache_table, do: @verify_cache
+
+  defp verify_token(token) do
+    secret = secret!()
+    age = max_age()
+    key = {secret, age, token}
+    now = System.system_time(:second)
+
+    case cache_lookup(key) do
+      {:ok, payload, until} when until > now ->
+        {:ok, payload}
+
+      _ ->
+        case Phoenix.Token.verify(secret, @salt, token, max_age: age) do
+          {:ok, payload} = ok ->
+            cache_store(key, payload, age, now)
+            ok
+
+          other ->
+            other
+        end
+    end
+  end
+
+  defp cache_lookup(key) do
+    case :ets.lookup(@verify_cache, key) do
+      [{^key, payload, until}] -> {:ok, payload, until}
+      [] -> :miss
+    end
+  rescue
+    ArgumentError -> :miss
+  end
+
+  defp cache_store(key, payload, age, now) do
+    until =
+      case {Map.get(payload, "e"), age} do
+        {e, _} when is_integer(e) -> min(e, now + @verify_cache_ttl_s)
+        {_, :infinity} -> now + @verify_cache_ttl_s
+        _ -> nil
+      end
+
+    if until do
+      if :ets.info(@verify_cache, :size) >= @verify_cache_max,
+        do: :ets.delete_all_objects(@verify_cache)
+
+      :ets.insert(@verify_cache, {key, payload, until})
+    end
+
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
 
   # Failure path only: count the rejection by reason, return the unchanged client error.
   defp reject(reason, error) do
