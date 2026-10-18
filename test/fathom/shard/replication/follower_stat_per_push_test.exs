@@ -55,18 +55,19 @@ defmodule Fathom.Shard.Replication.FollowerStatPerPushTest do
     decoded
   end
 
-  # Path-level stats of `wal` issued by the worker while `fun` runs.
+  # Path-level stats of `wal` issued by the worker while `fun` runs — or by the task it spawns for
+  # an offset-0 push (`set_on_spawn`; expert review 2026-10-17 #5), which is where a cold append lands.
   defp wal_stats(%{worker: worker, name: name, id: id}, fun) do
     wal = Follower.wal_path(name, id)
     :erlang.trace_pattern({:file, :read_file_info, 2}, true, [:local])
     :erlang.trace_pattern({:file, :read_file_info, 1}, true, [:local])
-    :erlang.trace(worker, true, [:call, {:tracer, self()}])
+    :erlang.trace(worker, true, [:call, :set_on_spawn, {:tracer, self()}])
     fun.()
     :erlang.trace(worker, false, [:call])
 
     receive_all([])
     |> Enum.count(fn
-      {:trace, ^worker, :call, {:file, :read_file_info, [^wal | _]}} -> true
+      {:trace, _pid, :call, {:file, :read_file_info, [^wal | _]}} -> true
       _ -> false
     end)
   end

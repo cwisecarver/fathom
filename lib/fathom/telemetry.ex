@@ -523,6 +523,16 @@ defmodule Fathom.Telemetry do
         description:
           "Replica seeds refused because the replication volume is below its free-space floor"
       ),
+      # Expert review 2026-10-17 #5. Wall time of the follower's WAL-reset absorb (two
+      # synchronous=FULL checkpoints); runs in a per-shard task, off the worker's other shards.
+      distribution("fathom.replication.follower_absorb.duration",
+        event_name: [:fathom, :replication, :follower_absorb],
+        measurement: :duration,
+        unit: {:native, :millisecond},
+        tags: [:result],
+        reporter_options: [buckets: [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]],
+        description: "Follower WAL-reset absorb (checkpoint into the .db) duration, by result"
+      ),
       # Expert review 2026-10-08 #5. A push refused because another connection held the shard's
       # replica lock past the wait. Expected around a primary's reconnect or a promotion; a
       # sustained rate means a lock holder is stuck (e.g. a seed on a half-open connection).

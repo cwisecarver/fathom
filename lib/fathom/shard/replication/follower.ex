@@ -811,7 +811,7 @@ defmodule Fathom.Shard.Replication.Follower do
       # a deadline (expert review 2026-10-13 #31).
       authed: false,
       # Set by `close_connection/1` before it stops the workers; each worker checks it before
-      # taking a frame. See `worker_loop/5`.
+      # taking a frame. See `worker_loop/6`.
       closed: :atomics.new(1, [])
     }
 
@@ -915,7 +915,7 @@ defmodule Fathom.Shard.Replication.Follower do
   # 2026-10-08 #5.
   defp close_connection(conn) do
     # Before the :stop messages, so a worker with frames still queued stops at its next one rather
-    # than applying them all first (see `worker_loop/5`).
+    # than applying them all first (see `worker_loop/6`).
     :atomics.put(conn.closed, 1, 1)
     :gen_tcp.close(conn.sock)
 
@@ -945,7 +945,7 @@ defmodule Fathom.Shard.Replication.Follower do
     # Replies are sealed with this connection's binding, which lives in the process dictionary of
     # whoever encodes them (see `Protocol.seal/1`).
     Protocol.adopt_binding(binding)
-    worker_loop(sock, name, reader, closed, %{})
+    worker_loop(sock, name, reader, closed, %{}, %{})
   end
 
   # A CLOSED CONNECTION'S QUEUED FRAMES ARE DROPPED, NOT APPLIED (expert review 2026-10-08 #5).
@@ -961,19 +961,107 @@ defmodule Fathom.Shard.Replication.Follower do
   # per-shard workers (c61cbe3). The shard lock (`lock_shard/3`, tiers b+c of the same finding)
   # closes the rest: that one frame and the new connection's frame for the same shard can no longer
   # interleave, they run one after the other.
-  defp worker_loop(sock, name, reader, closed, seeds) do
+  #
+  # OFFSET-0 PUSHES RUN IN A PER-SHARD TASK (expert review 2026-10-17 #5). A push at offset 0 is the
+  # only kind that can reset a WAL generation, and a reset absorbs the outgoing WAL into the `.db`
+  # with `synchronous=FULL` (two fsync-bearing checkpoints) inline before its ack — which used to
+  # head-of-line block every OTHER shard hashed to this worker (1/8 of the shards) for the whole
+  # absorb. Now the worker hands that frame to a task and keeps serving other shards; every later
+  # frame for the SAME shard queues behind it in `inflight` and is replayed in arrival order when
+  # the task reports done, so per-shard order — which `FollowerLog.decide/2` depends on — is
+  # unchanged. Durability is untouched: the task replies only after the same apply path returns.
+  # `inflight` is `%{shard_id => {task_pid, queued_frames_reversed}}`.
+  defp worker_loop(sock, name, reader, closed, seeds, inflight) do
     receive do
       {:frame, frame, size} ->
         if :atomics.get(closed, 1) == 1 do
           discard_seeds(seeds)
+          await_tasks(inflight)
         else
-          seeds = handle_frame(sock, name, seeds, frame)
-          send(reader, {:frame_done, size})
-          worker_loop(sock, name, reader, closed, seeds)
+          {seeds, inflight} = run_frame(sock, name, reader, seeds, inflight, frame, size)
+          worker_loop(sock, name, reader, closed, seeds, inflight)
+        end
+
+      {:task_done, shard_id} ->
+        {queued, inflight} = pop_inflight(inflight, shard_id)
+
+        if :atomics.get(closed, 1) == 1 do
+          # The queued frames' replies could never be sent; the primary re-sends them.
+          Enum.each(queued, fn {_frame, size} -> send(reader, {:frame_done, size}) end)
+          discard_seeds(seeds)
+          await_tasks(inflight)
+        else
+          {seeds, inflight} =
+            Enum.reduce(queued, {seeds, inflight}, fn {frame, size}, {seeds, inflight} ->
+              run_frame(sock, name, reader, seeds, inflight, frame, size)
+            end)
+
+          worker_loop(sock, name, reader, closed, seeds, inflight)
         end
 
       :stop ->
         discard_seeds(seeds)
+        await_tasks(inflight)
+    end
+  end
+
+  # Frames for a shard with a task in flight queue behind it (arrival order kept, reversed).
+  defp run_frame(sock, name, reader, seeds, inflight, frame, size) do
+    shard_id = frame_shard_id(frame)
+
+    case inflight do
+      %{^shard_id => {task, queued}} ->
+        {seeds, %{inflight | shard_id => {task, [{frame, size} | queued]}}}
+
+      _ ->
+        case frame do
+          # NOT while this connection has a seed in flight for the shard: that seed holds the shard
+          # lock as THIS process, and a push "during its own seed" must run here, reentrant on it
+          # (`follower_shard_lock_test`), not in a task that would be refused as a second holder.
+          %Protocol.Push{offset: 0} when not is_map_key(seeds, shard_id) ->
+            task = spawn_push_task(sock, name, reader, frame, size)
+            {seeds, Map.put(inflight, shard_id, {task, []})}
+
+          _ ->
+            seeds = handle_frame(sock, name, seeds, frame)
+            send(reader, {:frame_done, size})
+            {seeds, inflight}
+        end
+    end
+  end
+
+  # LINKED to the worker, like the worker is to the connection: a crashing task takes its worker
+  # (and so the connection) down rather than leaving its shard silently unanswered. The shard lock
+  # is taken inside `handle_push/2`, so the TASK is its holder.
+  defp spawn_push_task(sock, name, reader, %Protocol.Push{shard_id: shard_id} = push, size) do
+    worker = self()
+    binding = Protocol.binding()
+
+    :erlang.spawn_opt(
+      fn ->
+        Protocol.adopt_binding(binding)
+        _ = handle_frame(sock, name, %{}, push)
+        send(reader, {:frame_done, size})
+        send(worker, {:task_done, shard_id})
+      end,
+      [:link, fullsweep_after: 0]
+    )
+  end
+
+  defp pop_inflight(inflight, shard_id) do
+    {{_task, queued}, inflight} = Map.pop!(inflight, shard_id)
+    {Enum.reverse(queued), inflight}
+  end
+
+  # A stopping worker finishes the frames its tasks are IN THE MIDDLE OF (the same "one frame"
+  # overlap a stopping worker always had) and drops what queued behind them.
+  defp await_tasks(inflight) when map_size(inflight) == 0, do: :ok
+
+  defp await_tasks(inflight) do
+    receive do
+      {:task_done, shard_id} -> await_tasks(Map.delete(inflight, shard_id))
+      {:frame, _frame, _size} -> await_tasks(inflight)
+      :stop -> await_tasks(inflight)
     end
   end
 
@@ -2582,7 +2670,7 @@ defmodule Fathom.Shard.Replication.Follower do
       {:ok, fd} ->
         try do
           with :ok <- maybe_sync(fd),
-               {:ok, extent} <- absorb_into_db(db) do
+               {:ok, extent} <- timed_absorb(db) do
             # From the moment the checkpoint truncates the WAL, the `.db` alone holds every frame
             # it absorbed, and until the new generation's bytes land it is ALL this replica holds.
             # Recorded for any non-torn base (a `:short` absorb included: the record states how far
@@ -2598,6 +2686,21 @@ defmodule Fathom.Shard.Replication.Follower do
       {:error, reason} ->
         {:error, {:position_file, reason}}
     end
+  end
+
+  # The absorb's wall time (expert review 2026-10-17 #5): it fsyncs inline on the reset push's ack
+  # path, and no follower timing existed to say how long that is on a real filesystem.
+  defp timed_absorb(db) do
+    t0 = System.monotonic_time()
+    result = absorb_into_db(db)
+
+    :telemetry.execute(
+      [:fathom, :replication, :follower_absorb],
+      %{duration: System.monotonic_time() - t0},
+      %{result: if(match?({:ok, _}, result), do: :ok, else: :error)}
+    )
+
+    result
   end
 
   defp write_db_position(fd, %{lineage: lineage}, ordinal, extent)
