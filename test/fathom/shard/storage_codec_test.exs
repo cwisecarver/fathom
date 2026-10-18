@@ -174,7 +174,7 @@ defmodule Fathom.Shard.Storage.CodecTest do
 
           bin ->
             mid = div(byte_size(bin), 2)
-            <<head::binary-size(mid), b, tail::binary>> = bin
+            <<head::binary-size(^mid), b, tail::binary>> = bin
             <<head::binary, Bitwise.bxor(b, 0xFF), tail::binary>>
         end
       end)
