@@ -99,7 +99,11 @@ defmodule Fathom.Shard.Storage do
           optional(:dirty) => true,
           # The request for that marker, set on the lease by `with_dirty_release/1` and turned
           # into `:dirty` when the release writes its marker.
-          optional(:dirty_release) => true
+          optional(:dirty_release) => true,
+          # A fresh create that followed a 412 on a lock which then vanished (S3 `acquire_existing/4`
+          # `:not_found`): a holder released mid-acquire, so the open re-checks its pre-lease pull
+          # (expert review 2026-10-17 #1). Client-side only, never serialized.
+          optional(:recreated) => true
         }
 
   @typedoc """

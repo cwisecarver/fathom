@@ -99,10 +99,25 @@ defmodule Fathom.Test.FaultyStorage do
       {:error, {:transient_lookup, :s3_unreachable}}
     else
       case Local.acquire_lease(shard_id, owner, ttl_ms) do
-        {:ok, lease} -> {:ok, Map.put(lease, :lock_etag, bump_lock_etag(shard_id))}
-        other -> other
+        {:ok, lease} ->
+          {:ok, lease |> Map.put(:lock_etag, bump_lock_etag(shard_id)) |> maybe_recreated()}
+
+        other ->
+          other
       end
     end
+  end
+
+  # `:faulty_acquire_recreated` models S3's `acquire_existing/4` `:not_found` branch (expert review
+  # 2026-10-17 #1): the first create 412'd on a live holder's lock, the holder released, and the lock
+  # was re-created. `Local` acquires atomically and has no such branch, so the double stamps the flag
+  # the S3 backend would; `S3RecreateFlagTest` pins that S3 really sets it. Only a fresh (non-takeover)
+  # lease, which is the only kind that branch produces.
+  defp maybe_recreated(lease) do
+    if Application.get_env(:fathom, :faulty_acquire_recreated) == true and
+         lease[:took_over] != true,
+       do: Map.put(lease, :recreated, true),
+       else: lease
   end
 
   @impl true
@@ -177,9 +192,24 @@ defmodule Fathom.Test.FaultyStorage do
     delay()
     run_before(:pull, shard_id)
 
-    if fault() == :pull,
-      do: {:error, :s3_unreachable},
-      else: Local.pull(shard_id, local_path)
+    if fault() == :pull do
+      {:error, :s3_unreachable}
+    else
+      result = Local.pull(shard_id, local_path)
+      run_after_pull(shard_id, result)
+      result
+    end
+  end
+
+  # `:faulty_after_pull` — a 2-arity fun handed `(shard_id, result)` once the GET has RETURNED, in
+  # the pulling process. `run_before(:pull)` fires before the read, so it cannot stage "the GET was
+  # served, THEN the object moved": the speculative cold pull racing a peer's final flush + release
+  # (expert review 2026-10-17 #1).
+  defp run_after_pull(shard_id, result) do
+    case Application.get_env(:fathom, :faulty_after_pull) do
+      fun when is_function(fun, 2) -> fun.(shard_id, result)
+      _ -> :ok
+    end
   end
 
   # Optional artificial pull latency (ms) so a test can make a cold open slow enough to

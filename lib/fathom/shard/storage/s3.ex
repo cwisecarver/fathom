@@ -2529,7 +2529,12 @@ defmodule Fathom.Shard.Storage.S3 do
 
       :not_found ->
         case create_lock(shard_id, %{owner: owner, epoch: 1, expires_at_ms: now + ttl_ms}) do
-          {:ok, _lease} = ok -> ok
+          # RE-CREATED, and marked so (expert review 2026-10-17 #1): the lock existed when our first
+          # create 412'd and is gone now, so its holder released in between — possibly right after a
+          # final flush that the open's speculative pull (issued before our first create) missed.
+          # The open re-checks the pulled etag for this lease only (`Shard.cold_fresh_check/5`);
+          # the uncontended first-try create stays 1 RTT.
+          {:ok, lease} -> {:ok, Map.put(lease, :recreated, true)}
           # Someone else created it in the gap — they hold it now.
           # Neither owner nor instant is known here: the winner's lock was written in the gap and
           # has not been read. `nil` is "no instant", which routes the caller to its ordinary

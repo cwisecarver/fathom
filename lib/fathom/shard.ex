@@ -1170,11 +1170,14 @@ defmodule Fathom.Shard do
   # confirmed) can capture bytes from before the old owner's final in-flight flush
   # landed — and the steal touched the object's etag, so serving/fencing with the
   # pulled etag would mean stale reads followed by our own first flush self-fencing.
-  # Re-check the current etag once (only on takeovers — a fresh epoch-1 create has no
-  # prior owner, so the cold-open fast path pays nothing): a cold pull that mismatches
-  # is re-pulled; a warm takeover adopts the post-touch etag (the #1 provenance check
-  # already established the local file continues the stored lineage, and the touch
-  # moved no bytes).
+  # Re-check the current etag once on takeovers: a cold pull that mismatches is re-pulled; a warm
+  # takeover adopts the post-touch etag (the #1 provenance check already established the local file
+  # continues the stored lineage, and the touch moved no bytes).
+  #
+  # "A fresh create has no prior owner" is NOT a reason to skip the cold check (expert review
+  # 2026-10-17 #1): a peer that held the shard while we opened can flush and clean-release (which
+  # DELETES the lock) between our speculative GET and our create, so the pull holds the pre-flush
+  # object. See `cold_fresh_check/5` for what that costs and what it still leaves open.
   defp revalidate_takeover(shard_id, path, lease, etag, warm?, head) do
     cond do
       # Round-2 #19 (merged M15): a NON-takeover warm open must ALSO re-check its
@@ -1184,9 +1187,11 @@ defmodule Fathom.Shard do
       # a fresh epoch-1 create with no took_over, and the un-revalidated warm file
       # would serve a STALE lineage (then lose its first-cycle accepted writes at
       # the self-fence). One HEAD on the warm path converts this into an ordinary
-      # quarantine. Cold non-takeover opens pay nothing.
+      # quarantine. A COLD non-takeover open is `cold_fresh_check/5` (expert review 2026-10-17 #1).
       lease[:took_over] != true ->
-        if warm?, do: post_lease_warm_check(shard_id, path, etag, head), else: {:ok, etag}
+        if warm?,
+          do: post_lease_warm_check(shard_id, path, etag, head),
+          else: cold_fresh_check(shard_id, path, lease, etag, head)
 
       # The S3 steal-touch threaded its lineage through the lease (round-2 #6):
       # no extra HEAD (a separate read widened the laundering window), and the
@@ -1283,8 +1288,42 @@ defmodule Fathom.Shard do
     end
   end
 
-  defp legacy_revalidate(shard_id, path, etag, warm?) do
-    case Storage.object_etag(shard_id) do
+  # The cold, NON-takeover open's post-lease check (expert review 2026-10-17 #1). The pull GET was
+  # issued before the lease, so a peer's final flush + clean release can land between it and our
+  # (fresh) lock create, and the pulled bytes are the PRE-flush object. Served, that is stale reads;
+  # fenced on, the first flush 412s into the self-fence and quarantines this owner's first-cycle
+  # writes. `revalidate_against/5` then treats a mismatch exactly like a takeover's cold re-check
+  # (re-pull; a vanished object recreates on the first flush).
+  #
+  #   * Replicating (the prod default), `head` is the open's own post-lease HEAD (`start_open_head/2`,
+  #     already in hand for the lineage), so the check costs NOTHING extra.
+  #   * Not replicating, only a lease the backend marked `recreated` (S3's `:not_found` re-create in
+  #     `acquire_existing/4`: a holder released between our 412 and our re-read) pays one etag read.
+  #     A FIRST-TRY create that straddles a release (the GET served before the peer's PUT, the create
+  #     after its DELETE) is still served stale with replication off: nothing in the acquire tells it
+  #     from an uncontended create, and closing it costs a HEAD on every cold open. Parked
+  #     (`ColdOpenReleaseRaceTest` pins the residual).
+  #   * An unreadable head keeps today's stance (serve, fenced by the pulled etag) unless the lease
+  #     was re-created, which takes the dedicated read and fails closed on an error.
+  defp cold_fresh_check(shard_id, path, lease, etag, head) do
+    cond do
+      match?({:ok, _}, head) ->
+        revalidate_against(shard_id, path, etag, false, warm_check_etag(shard_id, head))
+
+      lease[:recreated] == true ->
+        legacy_revalidate(shard_id, path, etag, false)
+
+      true ->
+        {:ok, etag}
+    end
+  end
+
+  defp legacy_revalidate(shard_id, path, etag, warm?),
+    do: revalidate_against(shard_id, path, etag, warm?, Storage.object_etag(shard_id))
+
+  # `current` is the object's etag read UNDER the lease (`object_etag/1`, or the open's shared head).
+  defp revalidate_against(shard_id, path, etag, warm?, current) do
+    case current do
       {:ok, ^etag} ->
         {:ok, etag}
 
