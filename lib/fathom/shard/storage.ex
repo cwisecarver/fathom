@@ -1347,10 +1347,11 @@ defmodule Fathom.Shard.Storage do
   two crashes in a row safe, where "+1 on steal" alone would collide again. `nil` when replication is
   off (nothing ranks on lineage), `:unknown` when the store cannot be read.
   """
-  @spec takeover_claim(String.t(), pos_integer() | nil) :: pos_integer() | :unknown | nil
-  def takeover_claim(shard_id, previous_claim) do
+  @spec takeover_claim(String.t(), pos_integer() | nil, :read | {:ok, term()} | {:error, term()}) ::
+          pos_integer() | :unknown | nil
+  def takeover_claim(shard_id, previous_claim, head \\ :read) do
     if Fathom.Shard.Replication.Fleet.replicating?() do
-      case object_head(shard_id) do
+      case if(head == :read, do: object_head(shard_id), else: head) do
         {:ok, head} ->
           claim_above(next_lineage(head), previous_claim)
 
@@ -1375,10 +1376,20 @@ defmodule Fathom.Shard.Storage do
   previous lock (and its claim) intact, so the caller's retry, once the store answers, computes the
   claim it should have. The same stance the steal path already takes on a heartbeat read blip.
   """
-  @spec with_takeover_claim(lease(), String.t(), pos_integer() | nil) ::
+  #
+  # `head` is the object head the caller already read for this takeover, or `:read` to read it here.
+  # The S3 steal passes the HEAD its steal-touch also uses, so one request serves both (expert review
+  # 2026-10-17 #14 step 1). It must be read in the same acquire, before the lock write — as the
+  # `:read` here is.
+  @spec with_takeover_claim(
+          lease(),
+          String.t(),
+          pos_integer() | nil,
+          :read | {:ok, term()} | {:error, term()}
+        ) ::
           {:ok, lease()} | {:error, {:transient_lookup, :lineage_unreadable}}
-  def with_takeover_claim(lease, shard_id, previous_claim) do
-    case takeover_claim(shard_id, previous_claim) do
+  def with_takeover_claim(lease, shard_id, previous_claim, head \\ :read) do
+    case takeover_claim(shard_id, previous_claim, head) do
       :unknown -> {:error, {:transient_lookup, :lineage_unreadable}}
       claim -> {:ok, with_claim(lease, claim)}
     end

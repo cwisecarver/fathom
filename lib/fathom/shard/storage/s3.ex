@@ -635,10 +635,13 @@ defmodule Fathom.Shard.Storage.S3 do
   # etag (round-2 #6): the takeover revalidation adopts the post-touch etag for a
   # warm local file ONLY when `pre` equals its provenance sidecar, so a fork
   # laundered through the touch is quarantined instead of clobbered.
-  defp touch_object(shard_id, attempt \\ 1) do
+  #
+  # `sized` is a `head_sized/1` answer already read for this steal (`steal_head/1`), used for the
+  # FIRST attempt only; a retry always re-reads.
+  defp touch_object(shard_id, sized, attempt \\ 1) do
     key = db_key(shard_id)
 
-    case head_sized(key) do
+    case sized || head_sized(key) do
       {:ok, nil, _, _, _} ->
         case create_sentinel(key) do
           {:ok, sentinel_etag} ->
@@ -647,7 +650,7 @@ defmodule Fathom.Shard.Storage.S3 do
           # Lost the create race — a REAL object just landed (the zombie's flush,
           # or a concurrent writer): re-run the touch against it.
           {:error, :sentinel_exists} when attempt < 2 ->
-            touch_object(shard_id, attempt + 1)
+            touch_object(shard_id, nil, attempt + 1)
 
           {:error, _} = error ->
             error
@@ -665,7 +668,7 @@ defmodule Fathom.Shard.Storage.S3 do
                  do: {:ok, %{pre: etag, post: post}}
 
           {:error, :touch_precondition} when attempt < 2 ->
-            touch_object(shard_id, attempt + 1)
+            touch_object(shard_id, nil, attempt + 1)
 
           {:error, _} = error ->
             error
@@ -678,7 +681,7 @@ defmodule Fathom.Shard.Storage.S3 do
                  do: {:ok, %{pre: etag, post: post}}
 
           {:error, :touch_precondition} when attempt < 2 ->
-            touch_object(shard_id, attempt + 1)
+            touch_object(shard_id, nil, attempt + 1)
 
           {:error, _} = error ->
             error
@@ -1715,13 +1718,7 @@ defmodule Fathom.Shard.Storage.S3 do
   def object_head(shard_id) do
     case Req.head(req(), url: object_path(shard_id)) do
       {:ok, %{status: 200, headers: h}} ->
-        {:ok,
-         %{
-           etag: etag(h),
-           position: Storage.parse_position(header_value(h, @pos_meta)),
-           lineage: parse_lineage(header_value(h, @lineage_meta)),
-           md5: meta_md5(h)
-         }}
+        {:ok, head_map(h)}
 
       {:ok, %{status: 404}} ->
         {:ok, nil}
@@ -1733,6 +1730,50 @@ defmodule Fathom.Shard.Storage.S3 do
         {:error, reason}
     end
   end
+
+  defp head_map(h) do
+    %{
+      etag: etag(h),
+      position: Storage.parse_position(header_value(h, @pos_meta)),
+      lineage: parse_lineage(header_value(h, @lineage_meta)),
+      md5: meta_md5(h)
+    }
+  end
+
+  # ONE HEAD for a steal's claim AND its touch (expert review 2026-10-17 #14 step 1). The steal read
+  # the data object twice, serially: `takeover_claim/2`'s `object_head` (for the lineage) and then
+  # `touch_object`'s `head_sized` (for the etag the touch If-Matches) — the same key, a lock PUT
+  # apart. Answers `{object_head_result, head_sized_result}` off one response, or nil when not
+  # replicating (the claim then reads nothing, and the touch HEADs for itself as before).
+  #
+  # Reading the touch's head BEFORE the lock PUT changes no semantics: every touch form is
+  # conditional on the etag it read (sentinel create If-None-Match, refresh/nonce If-Match, part copy
+  # x-amz-copy-source-if-match), so a zombie flush that lands after this HEAD makes the touch 412 and
+  # `touch_object/3` re-runs it with a FRESH head, exactly as a change after the old second HEAD did.
+  defp steal_head(shard_id) do
+    if Fathom.Shard.Replication.Fleet.replicating?() do
+      case Req.head(req(), url: object_path(shard_id)) do
+        {:ok, %{status: 200, headers: h}} ->
+          {{:ok, head_map(h)},
+           {:ok, etag(h), sentinel_response?(h), carry_meta(h), content_length(h)}}
+
+        {:ok, %{status: 404}} ->
+          {{:ok, nil}, {:ok, nil, false, [], nil}}
+
+        {:ok, %{status: s}} ->
+          {{:error, {:s3_head_status, s}}, nil}
+
+        {:error, reason} ->
+          {{:error, reason}, nil}
+      end
+    end
+  end
+
+  defp claim_head(nil), do: :read
+  defp claim_head({claim_head, _touch_head}), do: claim_head
+
+  defp touch_head(nil), do: nil
+  defp touch_head({_claim_head, touch_head}), do: touch_head
 
   # Ranged GET of the object's first @header_range bytes, stream-decoded just far enough to reach
   # the SQLite header (expert review 2026-10-10 R3-5). The fork path used to pull the WHOLE object
@@ -2436,11 +2477,15 @@ defmodule Fathom.Shard.Storage.S3 do
             # owner could have shipped under (expert review 2026-09-29 #3). Read BEFORE the PUT so it
             # rides the steal write itself — no extra lock write per takeover.
             # Fails closed BEFORE the write when the claim is unreadable (2026-10-12 #21).
+            # One HEAD serves the claim and the touch below (expert review 2026-10-17 #14 step 1).
+            steal_head = steal_head(shard_id)
+
             with {:ok, stolen} <-
                    Storage.with_takeover_claim(
                      %{owner: owner, epoch: epoch + 1, expires_at_ms: now + ttl_ms},
                      shard_id,
-                     Map.get(dead_lock, :claim)
+                     Map.get(dead_lock, :claim),
+                     claim_head(steal_head)
                    ) do
               case put_lock(shard_id, stolen, if_match: etag) do
                 {:ok, lease} ->
@@ -2453,7 +2498,7 @@ defmodule Fathom.Shard.Storage.S3 do
                   # our own on the first flush. A conditional self-copy changes the
                   # etag without moving bytes, so the zombie's PUT deterministically
                   # 412s and IT self-fences instead.
-                  case touch_object(shard_id) do
+                  case touch_object(shard_id, touch_head(steal_head)) do
                     {:ok, %{pre: pre, post: post}} ->
                       # Thread the touch's lineage through the lease (round-2 #6):
                       # the takeover revalidation needs the SOURCE etag the touch
