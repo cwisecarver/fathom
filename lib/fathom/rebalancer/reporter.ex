@@ -105,7 +105,7 @@ defmodule Fathom.Rebalancer.Reporter do
       # truncation). The top-N of it is what's published; the whole distribution feeds the
       # fleet hot bar (#2/#4).
       rows = positive_rate_rows(prev, curr, window_s)
-      qps = Enum.map(rows, & &1.q_per_s)
+      qps = Enum.map(rows, &elem(&1, 0))
 
       # Liveness beat for the dead-node reconciler (#1b) — rides this tick so a serving node is
       # a beating node — carrying this node's full-distribution p99 + sample count (observability)
@@ -121,7 +121,10 @@ defmodule Fathom.Rebalancer.Reporter do
         health: NodeHealth.snapshot()
       )
 
-      publish(Enum.take(rows, top_n()))
+      # Insert maps only for the published top-N (expert review 2026-10-17 #27): `rows` is the
+      # whole active set as cheap tuples.
+      sampled_at = DateTime.utc_now()
+      publish(rows |> Enum.take(top_n()) |> Enum.map(&insert_row(&1, window_s, sampled_at)))
       prune()
       # Advertise which fleet-hot shards THIS node holds an A2 replica of (affinity-aware
       # target, #C): the intersection of the recent fleet-hot set and this node's replica set.
@@ -137,16 +140,13 @@ defmodule Fathom.Rebalancer.Reporter do
   end
 
   # Per-shard rates from two cumulative snapshots — every active shard (q_per_s > 0), sorted
-  # hottest first, as insert maps. NOT truncated: the caller takes the top-N to publish but
-  # computes the fleet p99 over the whole set (#2).
+  # hottest first, as `{q_per_s, shard_id, rows_read_per_s, checkouts_per_s}` tuples. NOT
+  # truncated: the caller takes the top-N to publish (and only those become insert maps, via
+  # `insert_row/2`) but computes the fleet p99 over the whole set (#2).
   defp positive_rate_rows(prev, curr, window_s) do
-    node_key = Rebalancer.node_key()
-    sampled_at = DateTime.utc_now()
-
-    # Single reduce building only the positive-rate rows (review 2026-07-23 #29): the old
-    # map-then-reject built an insert map per resident shard — including the idle majority
-    # about to be rejected — per window. The hottest-first sort stays (publish/1 takes the
-    # top-N of it, and it costs far less than the per-shard map churn did).
+    # Single reduce building only the positive-rate rows (review 2026-07-23 #29), and a 4-tuple per
+    # active shard rather than a 8-key insert map (expert review 2026-10-17 #27): at 30k active
+    # shards the maps were built, sorted and then ~99.8% discarded after `Enum.take(top_n)`.
     curr
     |> Enum.reduce([], fn {id, {co, q, rr}}, acc ->
       {p_co, p_q, p_rr} = Map.get(prev, id, {0, 0, 0})
@@ -155,22 +155,23 @@ defmodule Fathom.Rebalancer.Reporter do
       if q_per_s <= 0.0 do
         acc
       else
-        [
-          %{
-            node_key: node_key,
-            shard_id: id,
-            q_per_s: q_per_s,
-            rows_read_per_s: rate(rr, p_rr, window_s),
-            checkouts_per_s: rate(co, p_co, window_s),
-            window_s: window_s,
-            sampled_at: sampled_at,
-            inserted_at: sampled_at
-          }
-          | acc
-        ]
+        [{q_per_s, id, rate(rr, p_rr, window_s), rate(co, p_co, window_s)} | acc]
       end
     end)
-    |> Enum.sort_by(& &1.q_per_s, :desc)
+    |> Enum.sort_by(&elem(&1, 0), :desc)
+  end
+
+  defp insert_row({q_per_s, id, rows_read_per_s, checkouts_per_s}, window_s, sampled_at) do
+    %{
+      node_key: Rebalancer.node_key(),
+      shard_id: id,
+      q_per_s: q_per_s,
+      rows_read_per_s: rows_read_per_s,
+      checkouts_per_s: checkouts_per_s,
+      window_s: window_s,
+      sampled_at: sampled_at,
+      inserted_at: sampled_at
+    }
   end
 
   # A shard's ShardLoad counters are cumulative + monotonic, so curr < prev happens ONLY

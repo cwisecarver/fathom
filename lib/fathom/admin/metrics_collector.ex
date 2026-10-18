@@ -50,10 +50,16 @@ defmodule Fathom.Admin.MetricsCollector do
   # tick (expert review 2026-10-17 #1). `:admin_hot_interval_ms` overrides (tests).
   @default_hot_interval_ms 10_000
   @current_table Module.concat(__MODULE__, Current)
-  @default_usage_ms 60_000
+  # Expert review 2026-10-17 #26: every node LISTs the WHOLE bucket for this one footprint gauge,
+  # so fleet LIST traffic is nodes x keys / cadence (xmerl SAX per 1000-key page; at 1M keys the
+  # old 30 s budget killed the poll before it ever published). 10 min is plenty for a storage
+  # footprint number. Every node still polls, deliberately: the dashboard's "Bytes stored" is
+  # per-node, and leader-only polling would leave it blank on every follower (a fleet-wide share
+  # would need a Postgres row; parked, see the report). The first poll still runs at boot.
+  @default_usage_ms 600_000
   # Budget for one storage-usage poll (an S3 LIST); a slower one is killed so it can't pin the
-  # overlap-guard slot (#22). Comfortably under the 60s poll cadence.
-  @default_usage_timeout_ms 30_000
+  # overlap-guard slot (#22). Comfortably under the 10 min poll cadence.
+  @default_usage_timeout_ms 120_000
   @hot_n 20
   # Bounded ring of recent points for the hero charts, so a freshly-connected LiveView can paint a
   # populated chart from snapshot/0 instead of waiting to accumulate ticks. ~5 min at 1 s.
