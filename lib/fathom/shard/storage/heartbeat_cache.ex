@@ -49,6 +49,85 @@ defmodule Fathom.Shard.Storage.HeartbeatCache do
     ArgumentError -> :miss
   end
 
+  # How long a loser waits for the winner's GET before fetching on its own, and how often it polls
+  # the claim. The wait is the S3 GET's own bound (Req's receive timeout is far longer, so a wedged
+  # winner must not wedge every loser behind it), kept short so a failover burst never queues
+  # behind one slow read for longer than a couple of seconds.
+  @single_flight_wait_ms 2_000
+  @poll_ms 5
+
+  @doc """
+  SINGLE-FLIGHT fetch (expert review 2026-10-17 #29): `get/2`, and on a miss at most ONE caller per
+  owner runs `fun` (the S3 heartbeat GET) while concurrent callers wait for its result instead of
+  each issuing the identical GET -- the TTL memo alone only helps once the first read has landed, so
+  a failover's simultaneous steals all missed together.
+
+  `fun` returns the value to cache or `{:error, _}`, which is returned uncached and releases the
+  claim (the fail-closed no-steal-on-blip behaviour stays per call; a waiter then tries for the
+  claim itself, so errors serialise rather than herd). The claim is dropped in an `after`, and a
+  waiter gives up waiting after `#{@single_flight_wait_ms}` ms and fetches unclaimed, so a dead or
+  wedged winner cannot stall the takeover path. `stealable_at/4` and the TTL semantics are
+  untouched: a waiter receives exactly the entry a later `get/2` would have returned.
+  """
+  @spec fetch(String.t(), non_neg_integer(), (-> term())) :: term()
+  # TTL 0 (memo disabled by a zero margin): a waiter could never hit the winner's entry, so
+  # single-flight would only serialise the GETs. Plain per-call read.
+  def fetch(_owner, ttl_ms, fun) when ttl_ms <= 0, do: fun.()
+
+  def fetch(owner, ttl_ms, fun) do
+    deadline = System.monotonic_time(:millisecond) + @single_flight_wait_ms
+    do_fetch(owner, ttl_ms, fun, deadline)
+  end
+
+  defp do_fetch(owner, ttl_ms, fun, deadline) do
+    case get(owner, ttl_ms) do
+      {:hit, value} ->
+        value
+
+      :miss ->
+        claim = {:inflight, owner}
+
+        cond do
+          claim_table?() and claim(claim) ->
+            try do
+              value = fun.()
+              unless match?({:error, _}, value), do: put(owner, value)
+              value
+            after
+              :ets.delete(@table, claim)
+            end
+
+          claim_table?() and System.monotonic_time(:millisecond) < deadline ->
+            Process.sleep(@poll_ms)
+            do_fetch(owner, ttl_ms, fun, deadline)
+
+          true ->
+            # Table not up (boot/tests), or the winner outlasted our wait: fetch unclaimed.
+            value = fun.()
+            unless match?({:error, _}, value), do: put(owner, value)
+            value
+        end
+    end
+  end
+
+  defp claim_table?, do: :ets.whereis(@table) != :undefined
+
+  # Take the in-flight claim, evicting one a killed winner left behind (its `after` never ran): a
+  # claim older than the wait window has already made every waiter give up, so it is dead weight.
+  defp claim(key) do
+    now = System.monotonic_time(:millisecond)
+
+    :ets.insert_new(@table, {key, self(), now}) or
+      case :ets.lookup(@table, key) do
+        [{^key, _pid, at}] when now - at > @single_flight_wait_ms ->
+          :ets.delete(@table, key)
+          :ets.insert_new(@table, {key, self(), now})
+
+        _ ->
+          false
+      end
+  end
+
   @doc "Store `value` for `owner`, stamped now. Best-effort (no-op when the table isn't up)."
   @spec put(String.t(), term()) :: :ok
   def put(owner, value) do

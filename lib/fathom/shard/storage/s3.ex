@@ -3071,20 +3071,10 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   defp cached_read_heartbeat_dated(owner) do
-    case Fathom.Shard.Storage.HeartbeatCache.get(owner, hb_cache_ttl_ms()) do
-      {:hit, value} ->
-        value
-
-      :miss ->
-        case read_heartbeat_dated(owner) do
-          {:error, _} = error ->
-            error
-
-          value ->
-            Fathom.Shard.Storage.HeartbeatCache.put(owner, value)
-            value
-        end
-    end
+    # Single-flight (expert review 2026-10-17 #29): concurrent steals from one dead owner share one GET.
+    Fathom.Shard.Storage.HeartbeatCache.fetch(owner, hb_cache_ttl_ms(), fn ->
+      read_heartbeat_dated(owner)
+    end)
   end
 
   # read_heartbeat, also returning S3's own clock (its response `Date` header, epoch-ms, or nil if
