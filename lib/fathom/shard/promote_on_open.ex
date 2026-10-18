@@ -8,7 +8,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
   fork verdict are settled (`revalidate_takeover/5`), passing the shard id, live path, lease, the
   fence etag so far, and the lineage.
 
-  `maybe_promote_replica/7` is the only entry point (the coordinator passes `warm?`, and a warm open
+  `maybe_promote_replica/8` is the only decision entry point (the coordinator passes `warm?`, and a warm open
   never promotes — see the head of that function). Every branch that is not a proven win returns
   the caller's `etag` unchanged, so the ordinary open path is bit-for-bit what it was — including
   every error, because a failed promotion must never fail an open (the stored-object path is still
@@ -39,6 +39,9 @@ defmodule Fathom.Shard.PromoteOnOpen do
   (`{:ok, head}` / `{:error, _}`), or `nil` when it read none. When present it is the fleet path's
   decision read, so a replicating cold open pays one HEAD here rather than two back to back
   (expert review 2026-10-01 perf #3).
+
+  `prefetch` is the ask `prefetch_recovery/5` made while the pull ran (`nil`: ask inline, as before).
+  The caller follows this with `finish_prefetch/2`.
   """
   @spec maybe_promote_replica(
           String.t(),
@@ -47,10 +50,11 @@ defmodule Fathom.Shard.PromoteOnOpen do
           String.t() | nil,
           term(),
           boolean(),
-          {:ok, term()} | {:error, term()} | nil
+          {:ok, term()} | {:error, term()} | nil,
+          prefetch()
         ) ::
           String.t() | nil | {:error, term()} | {:promoted, String.t(), pos_integer()}
-  def maybe_promote_replica(shard_id, path, lease, etag, lineage, warm?, head) do
+  def maybe_promote_replica(shard_id, path, lease, etag, lineage, warm?, head, prefetch \\ nil) do
     cond do
       # A WARM open means the coordinator has ALREADY decided this node's local file is the bytes to
       # serve, and promote must not then clobber them (expert review 2026-09-18 #1 — a data-loss
@@ -85,7 +89,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
       # means no replica table to read AND nowhere for a pulled replica to install, so both branches
       # below would have declined anyway — `Recovery.search/5` says so in as many words.
       promote_on_open?() and follower_running?() ->
-        try_promote(shard_id, path, lease, etag, lineage, head)
+        try_promote(shard_id, path, lease, etag, lineage, head, prefetch)
 
       true ->
         etag
@@ -146,8 +150,73 @@ defmodule Fathom.Shard.PromoteOnOpen do
     end
   end
 
+  @typedoc """
+  A fleet recovery ask made while the cold pull ran (`prefetch_recovery/5`): `nil`, or the answer
+  `Recovery.best_replica/3` gave, with the `.recovering` marker already durable.
+  """
+  @type prefetch :: nil | {:asked, term()}
+
   @doc """
-  The etag to serve from, given what `maybe_promote_replica/7` returned.
+  Start the fleet recovery decision EARLY: write the `.recovering` marker and ask the fleet as soon
+  as the open's post-lease head is known, instead of after the pull is installed (expert review
+  2026-10-17 #14 step 2). Called from the coordinator's open-head task, so the marker fsync and the
+  peer round trip run alongside the pull. Returns `nil` (nothing done) or `{:asked, answer}`.
+
+  Only for a cold open with NO local file (`cold?`): a warm or fork-resolved open decides later and
+  takes the inline path, and a marker beside a warm file would make the next open purge it. The
+  remaining gate is the one the inline path reaches the ask through — promote on, a follower running,
+  `Recovery.enabled?/0`, something to promote, a rankable stamp — so a prefetch is never made where
+  the inline path would not ask. Should the gate still change before consumption, the coordinator's
+  `finish_prefetch/2` removes the marker before anything is served.
+
+  The marker is durable before the ask is sent (the 2026-10-13 #4 invariant). It is NOT ordered
+  against the pull's install: when the pull lands first, the installed-but-unmarked window is the
+  one the inline path always had (install, then the head await, then the marker) — no wider, since
+  the head task starts the marker the moment its HEAD returns. Ordering it strictly before the install
+  would make the open await the head before the pull, giving up a failed pull's prompt abort
+  (`ReplicatingOpenRttTest`).
+  """
+  @spec prefetch_recovery(String.t(), Path.t(), map(), term(), boolean()) :: prefetch()
+  def prefetch_recovery(shard_id, path, lease, {:ok, %{} = head}, true = _cold?) do
+    stamp = position_of(head)
+
+    if promote_on_open?() and follower_running?() and Recovery.enabled?() and
+         not nothing_to_promote?(shard_id) and Recovery.rankable_stamp?(stamp) do
+      prefetch_hook(path)
+      mark_recovering(path)
+
+      {:asked,
+       Recovery.best_replica(shard_id, stamp, previous_owner: Map.get(lease, :prev_owner))}
+    end
+  end
+
+  def prefetch_recovery(_shard_id, _path, _lease, _head, _cold?), do: nil
+
+  @doc """
+  Remove a prefetch's marker once the open's promote decision is made (expert review 2026-10-17 #14
+  step 2). Idempotent: the consuming path (`recover_with_marker/7`) already removed it. Only reached
+  on a decided open — an open that FAILS keeps the marker, so the next open purges the unvetted pull.
+  """
+  @spec finish_prefetch(prefetch(), Path.t()) :: :ok
+  def finish_prefetch(nil, _path), do: :ok
+
+  def finish_prefetch({:asked, _}, path) do
+    _ = File.rm(recovering_path(path))
+    :ok
+  end
+
+  # Test seam: runs in the open-head task right before the prefetch's marker (expert review
+  # 2026-10-17 #14 step 2), so a test can see WHEN the ask starts relative to the pull. Unset in
+  # every real config.
+  defp prefetch_hook(path) do
+    case Application.get_env(:fathom, :recovery_prefetch_hook) do
+      nil -> :ok
+      hook -> hook.(path)
+    end
+  end
+
+  @doc """
+  The etag to serve from, given what `maybe_promote_replica/8` returned.
 
   A promotion that stated an ordinal answers `{:promoted, etag, seed}`; every other outcome is the
   etag itself. Unwrapped with two pattern-matching accessors rather than a tuple on every open, so
@@ -200,11 +269,11 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # snapshot's position stamp was read and be quorum-acked to followers. The drop flush still
   # succeeds, so `release_plain` deletes the lock with no claim, and the object lacks a write a peer
   # replica holds. This ask is what recovers it.
-  defp try_promote(shard_id, path, lease, etag, lineage, head) do
+  defp try_promote(shard_id, path, lease, etag, lineage, head, prefetch) do
     cond do
       not Recovery.enabled?() -> try_promote_local(shard_id, path, lease, etag, lineage)
       nothing_to_promote?(shard_id) -> etag
-      true -> try_promote_from_fleet(shard_id, path, lease, etag, lineage, head)
+      true -> try_promote_from_fleet(shard_id, path, lease, etag, lineage, head, prefetch)
     end
   end
 
@@ -243,7 +312,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # both read the same object under the same lease with nothing served in between, so a second HEAD
   # only added a serial round trip (expert review 2026-10-01 perf #3). The RE-read below is a
   # different read on purpose and is never shared.
-  defp try_promote_from_fleet(shard_id, path, lease, etag, lineage, {:ok, head} = prefetched) do
+  defp try_promote_from_fleet(shard_id, path, lease, etag, lineage, {:ok, head} = prefetched, ask) do
     # perf review 2026-10-14 #8(b): an object whose stamp cannot be ranked (no object, unstamped,
     # lineage 0) can never be overridden, so `Recovery.best_replica/3` answers `:none` without a
     # socket and nothing is "pending". Skip the marker's open + fsync + close + rm too — the
@@ -251,16 +320,17 @@ defmodule Fathom.Shard.PromoteOnOpen do
     # coordinator already holds the decision head; otherwise the marker is written before the HEAD
     # exactly as before.
     if Recovery.rankable_stamp?(position_of(head)) do
-      recover_with_marker(shard_id, path, lease, etag, lineage, prefetched)
+      recover_with_marker(shard_id, path, lease, etag, lineage, prefetched, ask)
     else
       etag
     end
   end
 
-  defp try_promote_from_fleet(shard_id, path, lease, etag, lineage, prefetched),
-    do: recover_with_marker(shard_id, path, lease, etag, lineage, prefetched)
+  # A prefetch exists only with an `{:ok, head}` (`prefetch_recovery/5`), so this clause has none.
+  defp try_promote_from_fleet(shard_id, path, lease, etag, lineage, prefetched, _no_ask),
+    do: recover_with_marker(shard_id, path, lease, etag, lineage, prefetched, nil)
 
-  defp recover_with_marker(shard_id, path, lease, etag, lineage, prefetched) do
+  defp recover_with_marker(shard_id, path, lease, etag, lineage, prefetched, ask) do
     # RECOVERY PENDING, DURABLY, BEFORE THE ASK (expert review 2026-10-13 #4). By here the cold pull
     # has installed the object's bytes at `path` with a MATCHING sidecar, and the cleanup that makes
     # a retry re-run recovery used to exist only on the refusal path. A node dying during the up-to-2 s
@@ -271,19 +341,24 @@ defmodule Fathom.Shard.PromoteOnOpen do
     # sidecar early": a crash would then read `:no_sidecar`, which quarantines a shard-sized file
     # and raises the fork alarm. A raise (refusal, failed rename) leaves the marker or removes it
     # with the files — either way the next open recovers again.
-    mark_recovering(path)
+    #
+    # A PREFETCHED ask (`prefetch_recovery/5`, expert review 2026-10-17 #14 step 2) already wrote the
+    # marker -- durably, before it asked -- and asked the fleet while the pull ran; only its answer
+    # is consumed here. `before_recovery_ask/1` stays at this point either way: it is where the node
+    # can die with the pull installed and the answer not yet acted on.
+    if ask == nil, do: mark_recovering(path)
     before_recovery_ask(path)
-    result = decide_from_fleet(shard_id, path, lease, etag, lineage, prefetched)
+    result = decide_from_fleet(shard_id, path, lease, etag, lineage, prefetched, ask)
     File.rm(recovering_path(path))
     result
   end
 
-  defp decide_from_fleet(shard_id, path, lease, etag, lineage, prefetched) do
+  defp decide_from_fleet(shard_id, path, lease, etag, lineage, prefetched, ask) do
     started = System.monotonic_time(:millisecond)
 
     with {:head, {:ok, head}} <- {:head, decision_head(shard_id, prefetched)},
          {:ok, replica} <-
-           best_replica_or_refuse(shard_id, path, position_of(head), Map.get(lease, :prev_owner)),
+           ask_answer(ask, shard_id, path, position_of(head), Map.get(lease, :prev_owner)),
          true <- Promote.fresher?(replica, position_of(head)),
          :ok <- recheck_object(shard_id, head, replica, started) do
       promote_replica(shard_id, path, lease, etag, replica, position_of(head), lineage)
@@ -311,6 +386,17 @@ defmodule Fathom.Shard.PromoteOnOpen do
         etag
     end
   end
+
+  # The prefetched answer was computed against this same head (the coordinator's shared open head),
+  # so it is the answer `best_replica_or_refuse/4` would give here -- including a refusal, which is
+  # raised now, with the pull installed, exactly as an inline one is.
+  defp ask_answer({:asked, {:refuse, refusal}}, _shard_id, path, _stamp, _prev),
+    do: refuse_open(path, refusal)
+
+  defp ask_answer({:asked, answer}, _shard_id, _path, _stamp, _prev), do: answer
+
+  defp ask_answer(nil, shard_id, path, stamp, prev),
+    do: best_replica_or_refuse(shard_id, path, stamp, prev)
 
   defp refuse_or_etag({:refuse, refusal}, path, _etag), do: refuse_open(path, refusal)
   defp refuse_or_etag(_none, _path, etag), do: etag

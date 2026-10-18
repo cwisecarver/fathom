@@ -630,7 +630,7 @@ defmodule Fathom.Shard do
     # #3). The lease is held, so "we hold the lock, nobody flushed since" (`open_lineage/2`) is the
     # same invariant it was when the HEAD followed the pull. A HEAD issued BEFORE the lease would
     # not be (parked: perf #3(b)). `nil` unless replicating and not a takeover claim.
-    head_task = start_open_head(shard_id, lease)
+    head_task = start_open_head(shard_id, lease, path, not file?)
 
     # Consume the overlapped fork-check verdict here — the same pre-serving point the
     # sequential check used. :infinity mirrors the old inline call (the HEAD carries the
@@ -849,7 +849,10 @@ defmodule Fathom.Shard do
          # Taken here, once, and shared: a warm open's post-lease authority check and the lineage /
          # promote decision below read the SAME object under the SAME lease (perf review 2026-10-14
          # #3), so one HEAD serves both. A bare `=` clause allocates no tuple (see the note below).
-         head = await_open_head(head_task),
+         # `prefetch` is the recovery ask the head task made during the pull (expert review
+         # 2026-10-17 #14 step 2), or nil. A FAILED open below drops it with its marker left on disk
+         # (the head task is linked and dies with us), so the next open purges the unvetted pull.
+         {head, prefetch} = await_open_head(head_task),
          {verdict, etag1} when verdict in [:ok, :repulled] <-
            revalidate_takeover(shard_id, path, lease, etag0, warm?, head) do
       # NOT a `with` clause, and returning a bare etag rather than `{:ok, etag}`. Both are for the
@@ -883,9 +886,13 @@ defmodule Fathom.Shard do
           etag1,
           lineage,
           warm? and verdict == :ok,
-          head
+          head,
+          prefetch
         )
 
+      # Before anything is served: a prefetch whose answer the decision did not consume must not
+      # leave its marker beside a file this coordinator is about to serve and write.
+      :ok = PromoteOnOpen.finish_prefetch(prefetch, path)
       etag = PromoteOnOpen.etag_of(promoted)
 
       # Arm the coalesced idle timer at open too (expert review 2026-08-31 #13). It used to be
@@ -4216,16 +4223,35 @@ defmodule Fathom.Shard do
   # is a write, so it turned those adoptions into fork quarantines (`TouchProvenanceTest`,
   # `TakeoverClaimReleaseTest`). The residual window — an out-of-band writer that itself took over a
   # released marker and released keeping the claim — is parked in the review's progress file.
-  defp start_open_head(shard_id, lease) do
+  #
+  # THE RECOVERY ASK RIDES THE SAME TASK (expert review 2026-10-17 #14 step 2). A cold open with no
+  # local file (`cold?`) whose head shows a rankable stamp hands it straight to
+  # `PromoteOnOpen.prefetch_recovery/5`, which writes the `.recovering` marker and asks the fleet
+  # while the pull is still running — both used to wait for the pull. Answers `{head, prefetch}`. A
+  # raise in the prefetch loses only the prefetch (`nil`: the decision asks inline, as before), never
+  # the head.
+  defp start_open_head(shard_id, lease, path, cold?) do
     if Fleet.replicating?() and not is_map_key(lease, :claim) do
       Task.async(fn ->
-        try do
-          Storage.object_head(shard_id)
-        rescue
-          e -> {:error, e}
-        catch
-          :exit, r -> {:error, {:exit, r}}
-        end
+        head =
+          try do
+            Storage.object_head(shard_id)
+          rescue
+            e -> {:error, e}
+          catch
+            :exit, r -> {:error, {:exit, r}}
+          end
+
+        prefetch =
+          try do
+            PromoteOnOpen.prefetch_recovery(shard_id, path, lease, head, cold?)
+          rescue
+            _ -> nil
+          catch
+            :exit, _ -> nil
+          end
+
+        {head, prefetch}
       end)
     end
   end
@@ -4254,7 +4280,7 @@ defmodule Fathom.Shard do
 
   defp stamp_on_open(state, _head, _promoted?), do: state
 
-  defp await_open_head(nil), do: nil
+  defp await_open_head(nil), do: {nil, nil}
   defp await_open_head(task), do: Task.await(task, :infinity)
 
   # Killing an already-awaited task is a no-op; an un-awaited one (pull failed, open refused, an
