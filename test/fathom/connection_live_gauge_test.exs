@@ -63,6 +63,49 @@ defmodule Fathom.ConnectionLiveGaugeTest do
     Connection.close(a)
   end
 
+  # Symptom (expert review 2026-10-17 #2): the live table stored the exqlite resource term itself,
+  # and an ETS row holds a reference, so the NIF resource destructor (which closes the sqlite
+  # handle) could never run for a handle whose owner died without `close/1`: the fd, ~166 KB and
+  # the WAL reader slot leaked until restart. Invariant: the table must not retain the resource.
+  test "a handle orphaned by a killed owner is GC-closed (the table must not retain it)", %{
+    dir: dir
+  } do
+    path = Path.join(dir, "orphan.db")
+    test_pid = self()
+
+    {pid, ref} =
+      spawn_monitor(fn ->
+        {:ok, _conn} = Connection.open(path, tenant?: true)
+        send(test_pid, :opened)
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive :opened, 5_000
+    assert fd_open?(path), "precondition: the handle holds the db file open"
+
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+
+    released? =
+      Enum.reduce_while(1..40, false, fn _, _ ->
+        for p <- Process.list(), do: :erlang.garbage_collect(p)
+
+        if fd_open?(path) do
+          Process.sleep(50)
+          {:cont, false}
+        else
+          {:halt, true}
+        end
+      end)
+
+    assert released?, "orphaned handle was never GC-closed: the live table retains the resource"
+  end
+
+  defp fd_open?(path) do
+    {out, _} = System.cmd("lsof", ["-Fn", "-p", System.pid()], stderr_to_stdout: true)
+    String.contains?(out, Path.basename(path))
+  end
+
   test "soft_heap_warnings: cap x 190 KB vs the limit and vs container RAM" do
     gib = 1024 * 1024 * 1024
     # 50k shards x 190 KB = ~9.1 GiB: over an 8 GiB limit and a 4 GiB container.

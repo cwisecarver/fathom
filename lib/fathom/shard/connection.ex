@@ -90,8 +90,13 @@ defmodule Fathom.Shard.Connection do
   # handle (shard_executor.ex's checkin paths): a counter would decrement twice, while
   # `:ets.take/2` makes only the first close count. Cost: two O(1) ETS ops per connection lifetime
   # against a ~335 us open. Caveat: a handle whose owner died without calling `close/1`
-  # is GC-closed by the NIF resource finalizer and stays counted here (an over-estimate, never an
-  # under-estimate). Without the table (the app not started, e.g. a bare script) tracking is a no-op.
+  # is GC-closed by the NIF resource finalizer and its row stays counted here (an over-estimate,
+  # never an under-estimate).
+  #
+  # The row is keyed by `key/1` (the ref's printed identity), NOT by the resource term: an ETS row
+  # holds a reference, so a row keyed by the exqlite resource itself kept the NIF resource alive and
+  # the finalizer (which closes the sqlite handle: fd, ~166 KB, WAL reader slot) could never run for
+  # an orphaned handle (expert review 2026-10-17 #2). Not `phash2` — collisions would drop rows. Without the table (the app not started, e.g. a bare script) tracking is a no-op.
   @live_table __MODULE__.Live
 
   @doc false
@@ -114,14 +119,16 @@ defmodule Fathom.Shard.Connection do
   end
 
   defp track_open({:ok, conn} = ok) do
-    _ = if :ets.whereis(@live_table) != :undefined, do: :ets.insert(@live_table, {conn})
+    _ = if :ets.whereis(@live_table) != :undefined, do: :ets.insert(@live_table, {live_key(conn)})
     ok
   end
 
   defp track_open(other), do: other
 
+  defp live_key(conn), do: :erlang.ref_to_list(conn)
+
   defp track_close(conn) do
-    if :ets.whereis(@live_table) != :undefined, do: :ets.delete(@live_table, conn)
+    if :ets.whereis(@live_table) != :undefined, do: :ets.delete(@live_table, live_key(conn))
     :ok
   end
 
