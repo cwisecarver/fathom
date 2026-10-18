@@ -59,15 +59,19 @@ defmodule Fathom.Shard.Connection do
     # `checkpoint_and_verify/1` (shard.ex) named this per-open cost and never removed it; nothing
     # measured it because `hrana_open_rt_us` was ratio-gated only. Review #39 added the absolute
     # guard that pins this win.
-    dir = Path.dirname(path)
-    unless File.dir?(dir), do: File.mkdir_p!(dir)
-
+    #
+    # The tenant path now skips even the `File.dir?` (expert review 2026-10-17 #7: ~14.5 us of a
+    # ~285 us open): the directory provably exists (above), and if that ever stops being true the
+    # open fails with an error, on which we `mkdir_p!` and retry exactly once.
     tenant? = Keyword.get(opts, :tenant?, false)
+    dir = Path.dirname(path)
+    unless tenant?, do: ensure_dir(dir)
+
     scope = Keyword.get(opts, :scope, :rw)
     guard_opts = [block_user_version?: Keyword.get(opts, :block_user_version?, false)]
     wal? = Keyword.get(opts, :wal?, true)
 
-    case open_handle(path, scope) do
+    case open_handle_ensuring_dir(path, scope, tenant?, dir) do
       {:ok, conn, :readonly} ->
         track_open(close_on_error(conn, configure_readonly(conn, tenant?, guard_opts)))
 
@@ -80,6 +84,25 @@ defmodule Fathom.Shard.Connection do
         {:error, reason}
     end
   end
+
+  defp ensure_dir(dir), do: unless(File.dir?(dir), do: File.mkdir_p!(dir))
+
+  defp open_handle_ensuring_dir(path, scope, true = _tenant?, dir) do
+    case open_handle(path, scope) do
+      {:error, _} = err ->
+        if File.dir?(dir) do
+          err
+        else
+          File.mkdir_p!(dir)
+          open_handle(path, scope)
+        end
+
+      ok ->
+        ok
+    end
+  end
+
+  defp open_handle_ensuring_dir(path, scope, false, _dir), do: open_handle(path, scope)
 
   # --- live-connection gauge (perf review 2026-10-14 #16, gauge half) ---------------------------
   #

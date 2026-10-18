@@ -79,6 +79,23 @@ defmodule Fathom.Shard.ConnectionTest do
     Connection.close(conn)
   end
 
+  # expert review 2026-10-17 #7: the tenant path no longer stats the directory up front; it must
+  # still recover (mkdir_p + one retry) if the directory is ever absent, for both scopes.
+  for scope <- [:rw, :ro] do
+    test "tenant open (#{scope}) into a missing directory creates it and retries once" do
+      base =
+        Path.join(System.tmp_dir!(), "conn_tenant_mkdir_#{System.unique_integer([:positive])}")
+
+      path = Path.join([base, "nested", "shard.db"])
+      on_exit(fn -> File.rm_rf(base) end)
+      refute File.dir?(Path.dirname(path))
+
+      assert {:ok, conn} = Connection.open(path, tenant?: true, scope: unquote(scope))
+      assert File.dir?(Path.dirname(path))
+      Connection.close(conn)
+    end
+  end
+
   # The other half: reopening into a directory that already exists must behave identically. This
   # is the path the fast branch takes on every stream open, so it is the one carrying the change.
   test "open/2 succeeds against an already-existing directory and leaves it intact" do
