@@ -209,6 +209,68 @@ defmodule Fathom.Shard.PoolCloseLifecycleTest do
            "the off-coordinator close must still checkpoint+unlink the WAL"
   end
 
+  # Expert review 2026-10-17 #19. With K concurrent streams on a shard and a small `max_per_scope`
+  # (default 1), a checkin evicts a pooled handle on nearly every cycle, and the eviction closed
+  # inline in the coordinator (finalize cache + sqlite3_close, a checkpoint when it is the last
+  # connection) while every other checkout/checkin queued behind it. The invariant is WHICH PROCESS
+  # closes it, plus that the shard's close chain (which terminate/flush await) owns it.
+  test "a handle evicted by a full pool bucket is closed off the coordinator (2026-10-17 #19)", %{
+    shard: shard
+  } do
+    {:ok, ha} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, hb} = ShardExecutor.open(shard)
+    {:ok, hc} = ShardExecutor.open(shard)
+    pid = pid_of(ha)
+    conn_a = conn_of(ha)
+    assert :sys.get_state(pid).pool.max_per_scope == 1, "precondition: default bucket cap of 1"
+
+    trace_closes(pid)
+    # A is pooled (the shard is busy). B's checkin overflows the bucket and evicts A.
+    :ok = ShardExecutor.close(ha)
+    refute_receive {:trace, _, :call, {Sqlite3, :close, [^conn_a]}}, 50
+    :ok = ShardExecutor.close(hb)
+
+    assert_receive {:trace, closer, :call, {Sqlite3, :close, [^conn_a]}},
+                   5_000,
+                   "the evicted handle was never closed"
+
+    refute closer == pid,
+           "the coordinator closed an evicted pooled handle inline (expert review 2026-10-17 #19)"
+
+    assert is_pid(:sys.get_state(pid).closing), "the eviction close must ride the close chain"
+    await_closes(pid)
+    :ok = ShardExecutor.close(hc)
+  end
+
+  test "handles shed by the ttl sweep are closed off the coordinator (2026-10-17 #19)", %{
+    shard: shard
+  } do
+    prev_opts = Application.get_env(:fathom, :connection_pool_opts)
+    Application.put_env(:fathom, :connection_pool_opts, ttl_ms: 50)
+    on_exit(fn -> restore(:connection_pool_opts, prev_opts) end)
+
+    {:ok, ha} = ShardExecutor.open(shard)
+    {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, hb} = ShardExecutor.open(shard)
+    pid = pid_of(ha)
+    conn_a = conn_of(ha)
+    assert :sys.get_state(pid).pool.ttl_ms == 50, "precondition: short ttl took"
+
+    trace_closes(pid)
+    :ok = ShardExecutor.close(ha)
+
+    assert_receive {:trace, closer, :call, {Sqlite3, :close, [^conn_a]}},
+                   5_000,
+                   "the expired pooled handle was never swept"
+
+    refute closer == pid,
+           "the coordinator closed a swept pooled handle inline (expert review 2026-10-17 #19)"
+
+    await_closes(pid)
+    :ok = ShardExecutor.close(hb)
+  end
+
   # Expert review 2026-10-12 #19. Two terminate clauses (a lost lease, and a force-stop with streams
   # checked out) called `close_pool/1` BEFORE `WriteFence.fence/1`. Since c2737f4 close_pool waits
   # for the close chain, so the write fence stayed down for the whole wait while streams kept

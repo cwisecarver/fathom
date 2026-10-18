@@ -1923,7 +1923,9 @@ defmodule Fathom.Shard do
 
   def handle_info(:sweep_pool, %{pool: pool} = state) do
     {pool, expired} = HandlePool.sweep(pool, System.monotonic_time(:millisecond))
-    Enum.each(expired, &Connection.close_pooled/1)
+
+    # Off the coordinator, on the close chain (expert review 2026-10-17 #19; see `pool_checkin/3`).
+    state = if expired == [], do: state, else: start_close(state, expired)
     # cancel_sweep, not just clearing the field: a tick from a timer cancelled by drain_pool can
     # already be in the mailbox when checkin arms a new one, and cancelling here keeps it to ONE
     # live timer instead of two chains.
@@ -2706,7 +2708,14 @@ defmodule Fathom.Shard do
   defp pool_checkin(%{pool: pool} = state, conn, scope) do
     if PoolBudget.admit?() do
       {pool, evicted} = HandlePool.put(pool, scope, conn, System.monotonic_time(:millisecond))
-      Enum.each(evicted, &Connection.close_pooled/1)
+      # Evicted handles close OFF the coordinator, on the same chain as the other closes (expert
+      # review 2026-10-17 #19). K concurrent streams on one shard against a small `max_per_scope`
+      # evict a handle on nearly every checkin, and the inline close (finalize the statement cache +
+      # sqlite3_close, a checkpoint when it is the last connection) blocked the mailbox that every
+      # checkout/checkin of the shard queues behind. ON the chain, not a bare `spawn`: terminate and
+      # the periodic flush `await_closing/1` it so no close-time checkpoint races a drop/rename of the
+      # files (see `close_pool/1`); the audit's "plain spawn" would drop that ordering.
+      state = if evicted == [], do: state, else: start_close(state, evicted)
       schedule_sweep(put_pool(state, pool))
     else
       :telemetry.execute([:fathom, :shard, :pool_budget_full], %{count: 1}, %{shard_id: state.id})
