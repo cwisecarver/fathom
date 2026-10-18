@@ -254,6 +254,25 @@ defmodule Fathom.Shard.Replication.Wal do
           {:ok, binary(), handle()} | {:error, term(), handle()}
   def read_delta_held(handle, _path, _offset, 0), do: {:ok, <<>>, handle}
 
+  # NO STAT HERE WHEN THE HANDLE IS FOR THIS PATH (expert review 2026-10-17 #10a). The handle came
+  # from `read_held/2` microseconds earlier in the same commit, which already stat'd the path and
+  # pinned the inode; a second stat per range was one more syscall per commit (17 us single-caller
+  # on macOS APFS) to re-confirm it. The recreate-in-the-window case it used to narrow is caught by
+  # the caller's trailing `read_held/2`: that stats again, sees a different inode, reopens, and
+  # `Session.stable?/3` rejects the round because the new generation's salt differs from the header
+  # the payloads were planned against. A pread on the stale fd returns the OLD generation's bytes,
+  # which are consistent with that old header, and the recheck still refuses to ship them. A shrunk
+  # file (checkpoint truncate) is still caught here: same inode, short pread.
+  def read_delta_held(%{path: path, fd: fd} = handle, path, offset, len) do
+    case :file.pread(fd, offset, len) do
+      {:ok, bin} when byte_size(bin) == len -> {:ok, bin, handle}
+      {:ok, _short} -> {:error, :short_read, handle}
+      :eof -> {:error, :short_read, handle}
+      {:error, reason} -> {:error, reason, close_held(handle)}
+    end
+  end
+
+  # No held fd (or one for another path): the stat-and-open path, which also pins the inode.
   def read_delta_held(handle, path, offset, len) do
     case stat(path) do
       {:ok, %{inode: inode}} ->

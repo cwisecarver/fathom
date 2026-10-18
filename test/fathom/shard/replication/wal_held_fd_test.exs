@@ -91,22 +91,74 @@ defmodule Fathom.Shard.Replication.WalHeldFdTest do
     Wal.close_held(h2)
   end
 
-  test "delta reads revalidate too, not just header reads", %{path: path} do
-    # Both call sites hold the same fd, so both need the check. A delta read that skipped it would
-    # ship OLD bytes with a header the caller read correctly — worse than the reverse, because
-    # nothing downstream would disagree.
+  test "a delta read after a recreate is caught by the trailing header re-read", %{path: path} do
+    # Expert review 2026-10-17 #10a. `read_delta_held/4` no longer stats: the handle's inode was
+    # pinned by the `read_held/2` just before it, so in the recreate window it reads the OLD
+    # generation's bytes through the held fd (consistent with the header the caller holds). What
+    # keeps that from shipping is the commit's trailing `read_held/2`, which stats, sees the new
+    # inode and reports the NEW generation's header — `Session.stable?/3` then refuses the round.
+    # This used to assert the delta read itself reopened ("delta reads revalidate too"); the
+    # revalidation moved to the one place that was always the authority.
     File.write!(path, wal_bytes(7, 111, :binary.copy(<<0xAA>>, 512)))
-    assert {:ok, _h, h1} = Wal.read_held(nil, path)
+    assert {:ok, before, h1} = Wal.read_held(nil, path)
 
     File.rm!(path)
     File.write!(path, wal_bytes(0, 222, :binary.copy(<<0xBB>>, 512)))
 
     assert {:ok, bin, h2} = Wal.read_delta_held(h1, path, 32, 16)
+    assert bin == :binary.copy(<<0xAA>>, 16), "the delta read was expected to stay on the held fd"
 
-    assert bin == :binary.copy(<<0xBB>>, 16),
-           "a delta read through a stale fd returned the DELETED file's bytes"
+    assert {:ok, after_, h3} = Wal.read_held(h2, path)
+    refute h3.fd == h1.fd, "the trailing re-read did not reopen the recreated file"
 
+    assert {before.salt1, before.ckpt_seq} != {after_.salt1, after_.ckpt_seq},
+           "the re-read cannot tell the generations apart, so `stable?/3` would pass a splice"
+
+    Wal.close_held(h3)
+  end
+
+  test "a shrunk file is still a short read without a stat", %{path: path} do
+    File.write!(path, wal_bytes(7, 111, :binary.copy(<<1>>, 512)))
+    assert {:ok, _h, h1} = Wal.read_held(nil, path)
+
+    File.write!(path, wal_bytes(7, 111, <<1, 2, 3>>))
+
+    assert {:error, :short_read, h2} = Wal.read_delta_held(h1, path, 32, 512)
     Wal.close_held(h2)
+  end
+
+  test "the warm delta read issues no stat (expert review 2026-10-17 #10a)", %{path: path} do
+    File.write!(path, wal_bytes(7, 111, :binary.copy(<<1>>, 512)))
+    test = self()
+
+    # The fd must be owned by the process that reads through it, and a process cannot trace itself
+    # into its own mailbox, so the read happens in a helper the test traces.
+    reader =
+      spawn_link(fn ->
+        {:ok, _header, h1} = Wal.read_held(nil, path)
+        send(test, :ready)
+
+        receive do
+          :go -> send(test, {:read, Wal.read_delta_held(h1, path, 32, 16)})
+        end
+
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    assert_receive :ready
+    :erlang.trace_pattern({:file, :read_file_info, 2}, true, [:local])
+    :erlang.trace(reader, true, [:call, {:tracer, self()}])
+    send(reader, :go)
+    assert_receive {:read, {:ok, _bin, _h}}
+    :erlang.trace(reader, false, [:call])
+    ref = :erlang.trace_delivered(reader)
+    assert_receive {:trace_delivered, _, ^ref}
+    send(reader, :done)
+
+    refute_received {:trace, _, :call, {:file, :read_file_info, _}},
+                    "the warm delta read stat'd the WAL again"
   end
 
   test "read shapes still match the un-held versions", %{path: path} do
