@@ -319,4 +319,24 @@ defmodule Fathom.BenchTest do
     assert r.follower_kb > 0 and r.follower_kb < 5_000
     refute Fathom.Shard.Replication.Fleet.replicating?(), "the arm left replication on"
   end
+
+  # expert review 2026-10-17 #8. Both new wire metrics assert their own preconditions and raise
+  # otherwise (a write metric that did not replicate; an auth metric that was not enforcing); this
+  # runs each small and bounds the answer to an order of magnitude, and checks the scoped setup was
+  # torn down (replication off, auth config restored).
+  @tag timeout: 300_000
+  test "hrana_write_rt_us measures a replicated write and restores replication off" do
+    us = Fathom.Bench.hrana_write_rt_us(hrana_rt_samples: 50)
+    IO.puts("hrana_write_rt_us: #{inspect(us)}")
+    assert is_float(us) and us > 20 and us < 1_000_000
+    refute Fathom.Shard.Replication.Fleet.replicating?(), "the arm left replication on"
+  end
+
+  test "hrana_open_auth_rt_us measures an authenticated open and restores the auth config" do
+    prev = Application.get_env(:fathom, :hrana_auth)
+    us = Fathom.Bench.hrana_open_auth_rt_us(hrana_rt_samples: 50)
+    IO.puts("hrana_open_auth_rt_us: #{inspect(us)}")
+    assert is_float(us) and us > 20 and us < 1_000_000
+    assert Application.get_env(:fathom, :hrana_auth) == prev, "the arm left hrana_auth changed"
+  end
 end

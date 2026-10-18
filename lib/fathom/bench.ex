@@ -108,7 +108,9 @@ defmodule Fathom.Bench do
     :wire_rows,
     :wire_encode,
     :flush,
-    :served_repl
+    :served_repl,
+    :hrana_write,
+    :hrana_open_auth
   ]
 
   @doc false
@@ -213,7 +215,16 @@ defmodule Fathom.Bench do
       wire_encode_rows_per_s: run_if(only, :wire_encode, fn -> wire_encode_rows(opts) end),
       # The write path. Before this, NOTHING in the harness executed a line of the durability
       # flush — setup/1 sets :shard_flush_interval_ms to 0 (#41.3).
-      flush_p50_us: run_if(only, :flush, fn -> flush_p50(opts) end)
+      flush_p50_us: run_if(only, :flush, fn -> flush_p50(opts) end),
+      # Placed AFTER every density metric on purpose: these two start helpers in their own scoped
+      # setup (the dirty-flag tables, a Revocations server) that would change what a later
+      # fanout/served reading measures. Keep them last, like flush_p50_us.
+      #
+      # NEW SERIES, GATED (expert review 2026-10-17 #8). The wire write with A2 replication ON, and
+      # the open-per-request round trip with Hrana auth REQUIRED; before these the gate saw
+      # neither a replicated write nor `HranaAuth.authorize/2`.
+      hrana_write_rt_us: run_if(only, :hrana_write, fn -> hrana_write_rt(opts) end),
+      hrana_open_auth_rt_us: run_if(only, :hrana_open_auth, fn -> hrana_open_auth_rt(opts) end)
     }
   end
 
@@ -1402,7 +1413,12 @@ defmodule Fathom.Bench do
   # attempt on `HranaClient.await_upgrade/2` also changed nothing.) Those four are recorded in
   # `.dialyzer_ignore.exs` as the dialyzer limitation they are.
   @spec with_wire(keyword(), String.t(), (term() -> result)) :: result | nil when result: var
-  defp with_wire(opts, shard, fun) do
+  defp with_wire(opts, shard, fun), do: with_wire(opts, shard, fun, [], [])
+
+  # `plug_extra` is merged into the Filo.Plug options (the auth metric adds `:authorize`);
+  # `connect_extra` into `Filo.Client.connect/2` (its `:auth_token`). Both empty for every
+  # pre-existing metric, so their listener and client are exactly what they were.
+  defp with_wire(opts, shard, fun, plug_extra, connect_extra) do
     setup(opts)
     # Route by Host subdomain exactly as the LB does. Pinned rather than inherited so the
     # metric does not depend on whatever SHARD_BASE_DOMAIN happens to be set in the shell.
@@ -1412,10 +1428,13 @@ defmodule Fathom.Bench do
     {:ok, _} = Application.ensure_all_started(:bandit)
     {:ok, _} = Application.ensure_all_started(:mint)
 
-    case start_listener() do
+    case start_listener(plug_extra) do
       {:ok, sup, port} ->
         try do
-          case Filo.Client.connect("http://127.0.0.1:#{port}", authority: "#{shard}.local") do
+          case Filo.Client.connect(
+                 "http://127.0.0.1:#{port}",
+                 [authority: "#{shard}.local"] ++ connect_extra
+               ) do
             {:ok, client} ->
               try do
                 fun.(client)
@@ -1438,16 +1457,18 @@ defmodule Fathom.Bench do
     end
   end
 
-  defp start_listener do
+  defp start_listener(plug_extra) do
     port = free_port()
 
-    plug_opts = [
-      executor: Fathom.ShardExecutor,
-      streams: Fathom.Bench.WireStreams,
-      key: Filo.Baton.new_key(),
-      open_arg: &Fathom.ShardExecutor.shard_from_conn/1
-      # No :authorize — the bench runs with Hrana auth disabled.
-    ]
+    plug_opts =
+      [
+        executor: Fathom.ShardExecutor,
+        streams: Fathom.Bench.WireStreams,
+        key: Filo.Baton.new_key(),
+        open_arg: &Fathom.ShardExecutor.shard_from_conn/1
+        # No :authorize unless `plug_extra` adds one - every metric but `hrana_open_auth_rt_us`
+        # runs with Hrana auth disabled.
+      ] ++ plug_extra
 
     children = [
       {Filo.Streams, name: Fathom.Bench.WireStreams},
@@ -1690,10 +1711,26 @@ defmodule Fathom.Bench do
   """
   @spec served_repl(keyword()) :: %{total_kb: float(), follower_kb: float()}
   def served_repl(opts \\ []) do
-    setup(opts)
     n = Keyword.get(opts, :served_repl_n, @served_repl_n)
     trials = Keyword.get(opts, :trials, @default_trials)
     rows = Keyword.get(opts, :served_rows, @served_rows)
+
+    with_replication(opts, fn peer, names ->
+      results = times(trials, fn t -> repl_trial(t, n, rows, peer, names) end)
+
+      %{
+        total_kb: results |> Enum.map(&elem(&1, 0)) |> median(),
+        follower_kb: results |> Enum.map(&elem(&1, 1)) |> median()
+      }
+    end)
+  end
+
+  # The replication-ON scratch topology shared by `served_repl/1` and `hrana_write_rt_us`: a `:peer`
+  # VM holding the followers, a `Fleet` started here, all torn down in `after`. Calls
+  # `fun.(peer, follower_names)` once every shipper is connected. Extracted unchanged from
+  # `served_repl/1` (expert review 2026-10-17 #8) so the write metric cannot drift from it.
+  defp with_replication(opts, fun) do
+    setup(opts)
 
     root = Path.join(tmp_dir(), "served_repl_#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
@@ -1743,12 +1780,7 @@ defmodule Fathom.Bench do
 
     try do
       await_shippers!()
-      results = times(trials, fn t -> repl_trial(t, n, rows, peer, names) end)
-
-      %{
-        total_kb: results |> Enum.map(&elem(&1, 0)) |> median(),
-        follower_kb: results |> Enum.map(&elem(&1, 1)) |> median()
-      }
+      fun.(peer, names)
     after
       Supervisor.stop(fleet)
       :peer.stop(peer)
@@ -1881,6 +1913,210 @@ defmodule Fathom.Bench do
     |> Enum.find(&(&1 == :ok))
 
     {id, pid, ref, conn}
+  end
+
+  # --- write + auth wire metrics (expert review 2026-10-17 #8) ---------------
+
+  @doc """
+  `hrana_write_rt_us` - median round trip of an autocommit `INSERT ... RETURNING` over real Hrana
+  (a warm stream, like `hrana_rt_us`) with A2 replication ON and a quorum of loopback followers.
+
+  Why it exists (expert review 2026-10-17 #8): `hrana_rt_us`/`hrana_open_rt_us` are `SELECT 1`
+  with replication off, so nothing in the gate executed `maybe_replicate`, the Session commit, the
+  shipper push or the quorum wait - how a ~5% per-write cost survived. Own scoped setup: the
+  followers/Fleet from `with_replication/2` (shared with `served_repl/1`) plus the dirty-flag
+  tables; the shared `setup/1` is untouched.
+
+  PRECONDITIONS are asserted, because a write metric that did not replicate would report the
+  replication-OFF number under a new name: replication is on, and the timed loop produced at least
+  one quorum ship (`[:fathom, :replication, :commit_stage]`, stage `:collect`, fired only when a
+  push round actually ran) for 90% of the samples.
+  """
+  @spec hrana_write_rt_us(keyword()) :: float() | nil
+  def hrana_write_rt_us(opts \\ []), do: hrana_write_rt(opts)
+
+  defp hrana_write_rt(opts) do
+    alias Fathom.Shard.Replication.{Fleet, Session}
+    samples = Keyword.get(opts, :hrana_rt_samples, @hrana_rt_samples)
+    shard = "benchwrite"
+    setup_write_path()
+
+    with_replication(opts, fn _peer, _names ->
+      unless Fleet.replicating?() and Session.enabled?() == true,
+        do: raise("hrana_write_rt_us: replication is not on - it would measure the OFF path")
+
+      ships = :counters.new(1, [])
+      handler = "bench-write-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:fathom, :replication, :commit_stage],
+        fn _event, _m, %{stage: stage}, _ ->
+          if stage == :collect, do: :counters.add(ships, 1, 1)
+        end,
+        nil
+      )
+
+      try do
+        result =
+          with_wire(opts, shard, fn client ->
+            insert = "INSERT INTO bench_w (v) VALUES (1) RETURNING id"
+
+            # The first commits find the follower unseeded and answer 503 until the seed lands
+            # (same as `open_repl_shard/3`); retry, bounded, so a stuck seed fails loudly.
+            {:ok, _, client} =
+              write_with_retry(
+                client,
+                "CREATE TABLE IF NOT EXISTS bench_w (id INTEGER PRIMARY KEY, v INTEGER)"
+              )
+
+            {:ok, _, client} = write_with_retry(client, insert)
+            :counters.put(ships, 1, 0)
+
+            {_client, us} =
+              Enum.reduce(1..samples, {client, []}, fn _, {c, acc} ->
+                {t, result} = :timer.tc(fn -> Filo.Client.execute(c, insert) end)
+                {:ok, _, c} = result
+                {c, [t | acc]}
+              end)
+
+            shipped = :counters.get(ships, 1)
+
+            unless shipped * 10 >= samples * 9,
+              do:
+                raise(
+                  "hrana_write_rt_us: #{shipped} quorum ships in #{samples} writes - " <>
+                    "it is not measuring the replicated write path"
+                )
+
+            p50(us)
+          end)
+
+        Session.stop(shard)
+        result
+      after
+        :telemetry.detach(handler)
+      end
+    end)
+  end
+
+  defp write_with_retry(client, sql, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + 10_000
+
+    case Filo.Client.execute(client, sql) do
+      {:ok, _, _} = ok ->
+        ok
+
+      {:error, _reason, client} ->
+        if System.monotonic_time(:millisecond) > deadline,
+          do: raise("hrana_write_rt_us: the warm-up write never reached a replication quorum")
+
+        Process.sleep(10)
+        write_with_retry(client, sql, deadline)
+    end
+  end
+
+  @doc """
+  `hrana_open_auth_rt_us` - median round trip for a request that must OPEN its stream with Hrana
+  auth REQUIRED (the `hrana_open_rt_us` shape plus `HranaAuth.authorize/2`, which also verifies a
+  `Phoenix.Token`, re-checks the shard grant and reads the revocation floor).
+
+  Why it exists (expert review 2026-10-17 #8/#17): `with_wire` ran with no `:authorize`, so the
+  auth cost paid by every open-per-request client was outside the gate. Own scoped setup: the
+  config, a `Revocations` server with a pre-seeded floor (so no sample reads Postgres), and an
+  `:authorize` wrapper that counts calls, all restored in `after`; the shared `setup/1` and the
+  other wire metrics' listener are untouched.
+
+  PRECONDITIONS asserted: `:required` mode refuses a missing token and a foreign shard's token, the
+  floor stayed a cache hit for the whole loop, and `authorize/2` ran once per timed request.
+  """
+  @spec hrana_open_auth_rt_us(keyword()) :: float() | nil
+  def hrana_open_auth_rt_us(opts \\ []), do: hrana_open_auth_rt(opts)
+
+  defp hrana_open_auth_rt(opts) do
+    alias Fathom.HranaAuth
+    alias Fathom.HranaAuth.Revocations
+
+    samples = Keyword.get(opts, :hrana_rt_samples, @hrana_rt_samples)
+    shard = "benchauth"
+    keys = [:hrana_auth, :hrana_token_max_age, :hrana_token_secret]
+    prev = Map.new(keys, &{&1, Application.get_env(:fathom, &1)})
+
+    Application.put_env(:fathom, :hrana_auth, :required)
+    # Prod REFUSES to boot :required without a finite max_age, so measure the finite-expiry path.
+    Application.put_env(:fathom, :hrana_token_max_age, 3_600)
+
+    if Application.get_env(:fathom, :hrana_token_secret) in [nil, ""],
+      do: Application.put_env(:fathom, :hrana_token_secret, String.duplicate("a", 64))
+
+    revocations =
+      case Revocations.start_link([]) do
+        {:ok, pid} -> pid
+        {:error, {:already_started, _}} -> nil
+      end
+
+    try do
+      # Signed directly (same salt/claims as `HranaAuth.token_for/2`) rather than through it: the
+      # public mint also writes the issuance ledger to Postgres, which a bench must not touch.
+      token =
+        Phoenix.Token.sign(
+          Application.fetch_env!(:fathom, :hrana_token_secret),
+          "fathom hrana shard",
+          %{"s" => shard, "v" => 1, "e" => System.system_time(:second) + 3_600}
+        )
+
+      Revocations.put(shard, 1, nil)
+
+      unless match?({:error, %Filo.Error{status: 401}}, HranaAuth.authorize(shard, nil)) and
+               match?({:error, %Filo.Error{status: 401}}, HranaAuth.authorize("other", token)) and
+               match?({:ok, {:rw, _}}, HranaAuth.authorize(shard, token)),
+             do:
+               raise("hrana_open_auth_rt_us: :required auth is not enforcing - measuring nothing")
+
+      calls = :counters.new(1, [])
+
+      authorize = fn arg, tok ->
+        :counters.add(calls, 1, 1)
+        HranaAuth.authorize(arg, tok)
+      end
+
+      with_wire(
+        opts,
+        shard,
+        fn client ->
+          {:ok, _, client} = Filo.Client.execute(client, "SELECT 1")
+          :counters.put(calls, 1, 0)
+
+          {_client, us} =
+            Enum.reduce(1..samples, {client, []}, fn _, {c, acc} ->
+              # No baton => Filo.Plug authorizes and opens a new stream for this request.
+              c = %{c | baton: nil}
+              {t, result} = :timer.tc(fn -> Filo.Client.execute(c, "SELECT 1") end)
+              {:ok, _, c} = result
+              {c, [t | acc]}
+            end)
+
+          ran = :counters.get(calls, 1)
+
+          unless ran >= samples,
+            do: raise("hrana_open_auth_rt_us: authorize ran #{ran}/#{samples} times")
+
+          # The floor must have stayed a cache hit (its TTL outlives the loop), or the samples
+          # include Postgres read-throughs and measure the wrong thing.
+          now = System.monotonic_time(:millisecond)
+
+          unless match?([{_, 1, nil, exp}] when exp > now, :ets.lookup(Revocations, shard)),
+            do: raise("hrana_open_auth_rt_us: the revocation floor lapsed mid-run")
+
+          p50(us)
+        end,
+        [authorize: authorize],
+        auth_token: token
+      )
+    after
+      if revocations, do: GenServer.stop(revocations)
+      Enum.each(keys, &restore_env(&1, Map.fetch!(prev, &1)))
+    end
   end
 
   # --- contention -----------------------------------------------------------

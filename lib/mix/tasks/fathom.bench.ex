@@ -90,7 +90,9 @@ defmodule Mix.Tasks.Fathom.Bench do
     :wire_rows,
     :wire_encode,
     :flush,
-    :served_repl
+    :served_repl,
+    :hrana_write,
+    :hrana_open_auth
   ]
 
   @doc false
@@ -254,6 +256,10 @@ defmodule Mix.Tasks.Fathom.Bench do
       {"hrana_pooled_pipeline_rt_us", metrics.hrana_pooled_pipeline_rt_us,
        "\u00b5s   (serial 5-statement one-shot: pool hit + statement-cache hits)"},
       {"flush_p50_us", metrics.flush_p50_us, "\u00b5s   (one durability flush, local storage)"},
+      {"hrana_write_rt_us", metrics.hrana_write_rt_us,
+       "\u00b5s   (INSERT RETURNING over Hrana, A2 replication ON, quorum ship asserted)"},
+      {"hrana_open_auth_rt_us", metrics.hrana_open_auth_rt_us,
+       "\u00b5s   (Hrana round trip INCLUDING stream open, auth REQUIRED)"},
       {"wire_rows_per_s", metrics.wire_rows_per_s,
        "rows/s (result-set encode over the wire, keystone rows)"},
       {"wire_encode_rows_per_s", metrics.wire_encode_rows_per_s,
