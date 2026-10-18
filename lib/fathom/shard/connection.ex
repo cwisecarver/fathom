@@ -1704,8 +1704,20 @@ defmodule Fathom.Shard.Connection do
   @ro_reuse_sql "SELECT 1 FROM sqlite_schema LIMIT 0;PRAGMA query_only=ON"
 
   @spec reset_for_reuse(reference(), :ro | :rw) :: :ok | {:error, term()}
-  def reset_for_reuse(conn, scope) when scope in [:ro, :rw] do
-    with :ok <- rollback_if_open(conn) do
+  def reset_for_reuse(conn, scope) when scope in [:ro, :rw],
+    do: reset_for_reuse(conn, scope, :any)
+
+  @doc """
+  `reset_for_reuse/2` for a handle that came out of the POOL: `ShardExecutor.close/1` ran
+  `rollback_if_open/1` on it immediately before pooling it, and nothing runs SQL on an idle pooled
+  handle, so the transaction-state probe is repeated work (one dirty-NIF dispatch per pooled take,
+  expert review 2026-10-17 #31). `:checked_in` skips it; `:any` (what `reset_for_reuse/2` means)
+  keeps it for any caller that cannot vouch for the handle's history.
+  """
+  @spec reset_for_reuse(reference(), :ro | :rw, :any | :checked_in) :: :ok | {:error, term()}
+  def reset_for_reuse(conn, scope, provenance)
+      when scope in [:ro, :rw] and provenance in [:any, :checked_in] do
+    with :ok <- if(provenance == :any, do: rollback_if_open(conn), else: :ok) do
       # `:rw` re-applies the writable-path pragmas (`configure/1`). `:ro` RE-ASSERTS `query_only=ON`
       # (expert review 2026-09-18 #13): a `:ro` handle from the WAL-recovery / new-file fallback is
       # physically READ-WRITE, and its read-only-ness rests SOLELY on `PRAGMA query_only=ON` (see the
