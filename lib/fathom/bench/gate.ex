@@ -145,6 +145,10 @@ defmodule Fathom.Bench.Gate do
     # which would just re-blind the write path.
     {:hrana_open_rt_us, :higher_worse},
     {:flush_p50_us, :higher_worse},
+    # NEW SERIES (expert review 2026-10-17 #8). The replicated wire write (A2 ON, quorum ship
+    # asserted) and the auth-required open-per-request round trip — the gate could see neither.
+    {:hrana_write_rt_us, :higher_worse},
+    {:hrana_open_auth_rt_us, :higher_worse},
     # WATCH-ONLY until its band is measured (expert review 2026-10-01 perf #19), the same rule
     # hrana_open_rt_us and flush_p50_us followed above: variance first, then a threshold. It is
     # the first metric that runs the executor's close and the connection pool at all.
