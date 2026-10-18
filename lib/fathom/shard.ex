@@ -184,14 +184,30 @@ defmodule Fathom.Shard do
   # `max_heap_size` is deliberately ABSENT and must stay absent: a coordinator killed at the heap
   # limit mid-`terminate/2` skips the final fence + checkpoint + PUT + lease release — a durability
   # regression that can also strand a lease.
+  #
+  # FLOORED, NOT FIXED (expert review 2026-10-17 #32): at a flush interval near 30 s (the prod/rig
+  # setting) the fixed 30 s equalled the interval, so a dirty-but-quiet coordinator raced its own
+  # `:durability_flush` tick and about half the time hibernated just before it -- a full-sweep GC plus
+  # a wake every interval for nothing. `hibernate_after_ms/2` raises it above the longest jittered
+  # tick gap; clean idle shards (no timer armed, #10) and clean busy ones (slow-cadence timer, longer
+  # than this) still hibernate. At the 5 s default interval the value stays 30 s.
   @hibernate_after_ms 30_000
+
+  @doc false
+  @spec hibernate_after_ms(term(), term()) :: pos_integer()
+  def hibernate_after_ms(interval, ratio) when is_integer(interval) and interval > 0 do
+    r = if is_number(ratio) and ratio > 0, do: min(ratio, 1.0), else: 0
+    max(@hibernate_after_ms, trunc(interval * (1 + r)) + 1_000)
+  end
+
+  def hibernate_after_ms(_interval, _ratio), do: @hibernate_after_ms
 
   @spec start_link(Fathom.ShardId.t()) :: GenServer.on_start()
   def start_link(shard_id) do
     GenServer.start_link(__MODULE__, shard_id,
       name: via(shard_id),
       spawn_opt: [fullsweep_after: 0],
-      hibernate_after: @hibernate_after_ms
+      hibernate_after: hibernate_after_ms(flush_interval_ms(), flush_jitter_ratio())
     )
   end
 
