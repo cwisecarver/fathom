@@ -14,10 +14,12 @@ defmodule Fathom.Shard.Provenance do
 
     * `write/2` — a plain `File.write`, for the OPEN paths (single writer, read only at open). Made
       durable by `make_durable/1` on the shard's first write (expert review 2026-09-29 #14).
-    * `write_durable/2` — fsync+rename, for the DROP path (the sidecar then names the object the
-      tenant's fsynced commits descend from, and a torn value there is not recoverable).
-    * `stamp_after_put/2` — pwrite WITHOUT fsync, for the PERIODIC flush's post-PUT stamp, which
-      relies on the fsynced pre-PUT intent for crash recovery (expert review 2026-10-17 #32).
+    * `write_durable/2` — fsync+rename, for a stamp NOT preceded by an intent-recording PUT (`Fork`'s
+      adoption, `make_durable/1`): the sidecar then names the object the tenant's fsynced commits
+      descend from, and a torn value there is not recoverable.
+    * `stamp_after_put/2` — pwrite WITHOUT fsync, for the post-PUT stamp of the PERIODIC flush
+      (expert review 2026-10-17 #32) and of the DROP flush (2026-10-17 #13), both of which rely on
+      the fsynced pre-PUT intent for crash recovery.
 
   `read/1` returns `{:ok, etag} | :no_object | :missing | :corrupt` — a zero-length or unreadable
   sidecar is `:corrupt` (the safe direction: a spurious but recoverable quarantine), an absent one
@@ -150,7 +152,9 @@ defmodule Fathom.Shard.Provenance do
 
   The fsync is kept where the intent cannot ride: a sidecar that is not already an in-place
   fixed-width record, or an etag that does not fit one. Those take the durable path unchanged.
-  Used ONLY by the flush task — the drop path, `make_durable/1` and `Fork`'s adoption still fsync.
+  Used by the flush task and, since expert review 2026-10-17 #13, the drop path's two post-PUT
+  stamps (both drop routes record the same fsynced intent). `make_durable/1` and `Fork`'s adoption
+  still fsync: neither follows an intent-recording PUT.
   """
   @spec stamp_after_put(String.t(), String.t() | nil) :: :ok
   def stamp_after_put(_path, nil), do: :ok

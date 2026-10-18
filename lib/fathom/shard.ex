@@ -3188,7 +3188,13 @@ defmodule Fathom.Shard do
               # (a clean crash-recovery of identical bytes). Writing it first closes the
               # window so recovery is an ordinary clean warm restart, matching the
               # periodic-flush, settle, and reconcile sites that already stamp on success.
-              Provenance.write_durable(state.path, new_etag)
+              #
+              # UNSYNCED, like the periodic flush's stamp (expert review 2026-10-17 #13, the
+              # 2026-10-17 #32 pattern): both drop routes record the fsynced pre-PUT intent
+              # (`flush_intent_opts/1`), so an OS crash that loses this stamp leaves the sidecar
+              # naming the landed object by md5 and the reopen ADOPTS it — the same state the
+              # mailbox-gap crash reaches, not a quarantine. `DropStampUnsyncedTest` is the proof.
+              Provenance.stamp_after_put(state.path, new_etag)
               # Record the durable-flush time before we drop + release (#28): the shard's writes
               # reached storage, so it's NOT dirty-at-loss even though its coordinator is gone.
               Fathom.Directory.Recorder.record_flush(state.id)
@@ -3672,7 +3678,8 @@ defmodule Fathom.Shard do
         "shard #{state.id}: flush 412 with lock ours; re-fenced to the object and re-uploaded"
       )
 
-      Provenance.write_durable(state.path, new_etag)
+      # Unsynced: `upload_for_drop/1` recorded the fsynced intent (expert review 2026-10-17 #13).
+      Provenance.stamp_after_put(state.path, new_etag)
       Fathom.Directory.Recorder.record_flush(state.id)
       drop_local_unless_serving(state)
       release_plain(state)
